@@ -36,6 +36,12 @@ pub struct NetlinkSocket {
 }
 
 impl NetlinkSocket {
+    /// Return the kernel-assigned local netlink port identifier.
+    #[must_use]
+    pub fn port_id(&self) -> u32 {
+        self.inner.port_id()
+    }
+
     /// Borrow the underlying Linux file descriptor.
     #[cfg(all(target_os = "linux", not(opc_linux_gtpu_sys_force_unsupported)))]
     pub fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
@@ -122,6 +128,8 @@ pub const NLM_F_MULTI: u16 = 0x0002;
 pub const NLM_F_ACK: u16 = 0x0004;
 /// Netlink echo request flag.
 pub const NLM_F_ECHO: u16 = 0x0008;
+/// Netlink dump was interrupted and its result is inconsistent.
+pub const NLM_F_DUMP_INTR: u16 = 0x0010;
 /// Netlink root dump flag.
 pub const NLM_F_ROOT: u16 = 0x0100;
 /// Netlink match dump flag.
@@ -359,6 +367,7 @@ mod tests {
         assert_eq!(NETLINK_GENERIC, 16);
         assert_eq!(NLM_F_REQUEST, 0x0001);
         assert_eq!(NLM_F_ACK, 0x0004);
+        assert_eq!(NLM_F_DUMP_INTR, 0x0010);
         assert_eq!(NLM_F_DUMP, 0x0300);
         assert_eq!(NLM_F_EXCL, 0x0200);
         assert_eq!(NLM_F_CREATE, 0x0400);

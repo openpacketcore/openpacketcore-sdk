@@ -109,6 +109,7 @@ jobs:
             unshare -n -- bash -euxo pipefail -c '
               ip link set lo up
               cargo test --locked -p opc-gtpu-dataplane --test ebpf_gtpu_privileged -- --ignored --nocapture
+              cargo test --locked -p opc-gtpu-dataplane --lib program_tag_candidates_match_the_running_kernel -- --ignored --nocapture
             '
 
   ebpf-object:
@@ -118,6 +119,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
       - name: Install pinned nightly Rust toolchain
         run: |
@@ -147,6 +150,39 @@ jobs:
               exit 1
             fi
           done
+
+      - name: Verify frozen v2 historical blob and structural rebuild inventory
+        run: |
+          set -euo pipefail
+          source_commit="8fa98f275eea35cd16add149b609992345603c8c"
+          object_path="crates/opc-gtpu-dataplane/bpf/opc-gtpu-datapath-v2.bpf.o"
+          historical_path="crates/opc-gtpu-dataplane/bpf/opc-gtpu-datapath.bpf.o"
+          echo "7d0c1b452ad562d4c8c286bf05a4c5308f6fd5b4c677cc3c2125b194860464a5  ${object_path}" | sha256sum -c -
+          # This exact historical Git blob is the Apache-2.0-licensed byte
+          # authority. The source rebuild below is deliberately only a public
+          # program/map inventory comparison; it is not an exact reproducible-
+          # build assertion for host-sensitive historical linker output.
+          git cat-file blob "${source_commit}:${historical_path}" > "${RUNNER_TEMP}/historical-v2.bpf.o"
+          cmp "${object_path}" "${RUNNER_TEMP}/historical-v2.bpf.o"
+          readelf -sW "${object_path}" | awk '$4 == "FUNC" && $8 ~ /^opc_gtpu_/ {print $8}' | sort > frozen-v2.programs
+          readelf -sW "${object_path}" | awk '$4 == "OBJECT" && $8 ~ /^GTPU_/ {print $8}' | sort > frozen-v2.maps
+          diff -u <(printf '%s\n' opc_gtpu_downlink opc_gtpu_uplink) frozen-v2.programs
+          diff -u <(printf '%s\n' GTPU_CONFIG GTPU_COUNTERS GTPU_DLM_PDR GTPU_DOWNLINK_PDR GTPU_M_OWNER GTPU_ULM_DSCP GTPU_ULM_FAR GTPU_UPLINK_DSCP GTPU_UPLINK_FAR) frozen-v2.maps
+          for endpoint_v3 in GTPU_DL_BIND GTPU_DL_DROP; do
+            if grep -qx "${endpoint_v3}" frozen-v2.maps; then
+              echo "frozen v2 authority unexpectedly contains ${endpoint_v3}" >&2
+              exit 1
+            fi
+          done
+          historical_worktree="${RUNNER_TEMP}/gtpu-v2-source"
+          git worktree add --detach "${historical_worktree}" "${source_commit}"
+          OPC_EBPF_TARGET_DIR="${RUNNER_TEMP}/gtpu-v2-target" "${historical_worktree}/scripts/build-gtpu-ebpf.sh"
+          rebuilt="${RUNNER_TEMP}/gtpu-v2-target/bpfel-unknown-none/release/opc-gtpu-datapath"
+          readelf -sW "${rebuilt}" | awk '$4 == "FUNC" && $8 ~ /^opc_gtpu_/ {print $8}' | sort > rebuilt-v2.programs
+          readelf -sW "${rebuilt}" | awk '$4 == "OBJECT" && $8 ~ /^GTPU_/ {print $8}' | sort > rebuilt-v2.maps
+          diff -u frozen-v2.programs rebuilt-v2.programs
+          diff -u frozen-v2.maps rebuilt-v2.maps
+          git worktree remove --force "${historical_worktree}"
 
       # Rebuild the datapath object from source with the pinned toolchain and
       # fail on structural drift against the committed artifact. A byte-exact

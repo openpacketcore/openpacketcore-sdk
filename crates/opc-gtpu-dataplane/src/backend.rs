@@ -4,9 +4,10 @@ use async_trait::async_trait;
 use std::io;
 
 use crate::model::{
-    CreateGtpDeviceRequest, GtpDevice, GtpPdpContext, GtpuProbe, PdpContextInstallOutcome,
-    PdpContextReadback, PdpContextReconciliationCapabilities, PdpContextRemovalOutcome,
-    PdpContextSelector, RemovePdpContextRequest,
+    CreateGtpDeviceRequest, DrainedV2TeardownOutcome, DrainedV2TeardownRequest, GtpDevice,
+    GtpPdpContext, GtpuProbe, PdpContextInstallOutcome, PdpContextReadback,
+    PdpContextReconciliationCapabilities, PdpContextRemovalOutcome, PdpContextSelector,
+    RemovePdpContextRequest,
 };
 use crate::GtpuError;
 
@@ -25,6 +26,22 @@ pub trait GtpuDataplaneBackend: Send + Sync + std::fmt::Debug {
 
     /// Remove a Linux `gtp` netdevice.
     async fn remove_device(&self, device: &GtpDevice) -> Result<(), GtpuError>;
+
+    /// Remove a positively identified, drained legacy-v2 eBPF pin graph.
+    ///
+    /// This maintenance-only operation is deliberately separate from normal
+    /// device resolution/removal. Implementations must independently prove
+    /// the complete old program/map/hook identity and empty forwarding state,
+    /// then preserve retry evidence across partial cleanup. Existing backend
+    /// implementations inherit an explicit unsupported result.
+    async fn teardown_drained_v2(
+        &self,
+        _request: DrainedV2TeardownRequest,
+    ) -> Result<DrainedV2TeardownOutcome, GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "drained_v2_teardown",
+        })
+    }
 
     /// Install a GTP-U PDP context.
     ///
@@ -175,6 +192,19 @@ mod tests {
             backend.read_pdp_context(selector).await,
             Err(GtpuError::UnsupportedFeature {
                 feature: "pdp_context_readback"
+            })
+        ));
+        let request = crate::DrainedV2TeardownRequest::new(
+            crate::GtpDevice {
+                name: String::from("gtp0"),
+                ifindex: 7,
+            },
+            crate::GtpuV2DrainProof::sessions_and_traffic_drained(),
+        );
+        assert!(matches!(
+            backend.teardown_drained_v2(request).await,
+            Err(GtpuError::UnsupportedFeature {
+                feature: "drained_v2_teardown"
             })
         ));
     }

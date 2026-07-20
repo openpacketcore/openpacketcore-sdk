@@ -28,6 +28,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   composite outcomes report possible residue consistently, and all journal,
   plan, classification, ownership, and error `Debug` surfaces omit keys,
   addresses, selectors, and SPIs.
+- **Identity-safe drained eBPF v2 teardown — `opc-gtpu-dataplane`:** adds the
+  maintenance-only `GtpuDataplaneBackend::teardown_drained_v2` boundary with an
+  explicit caller drain attestation, exact interface identity, typed refusal
+  and partial-progress evidence, and a durable retry proof. The eBPF backend
+  acquires its normal exclusive reconciler lease, proves the complete frozen
+  endpoint-unbound v2 program/map/hook identity, requires both exact hooks before
+  the first proof, independently requires empty forwarding/session state, and
+  revalidates every surviving pin and map before each unlink. Hook absence is
+  accepted only on proof-backed retry; foreign, non-directory, symlink, or
+  indeterminate objects are preserved. State appearing after proof commit stops
+  cleanup with a distinct partial outcome and requires a renewed drain. The
+  proof is removed only after an exact proof-only inventory, so interrupted
+  hook/pin cleanup is idempotently retryable; its presence also fences normal
+  create/adopt until teardown returns removed or already absent. Once both
+  hooks, every recorded map, and the proof are authoritatively absent, cosmetic
+  directory-removal failure remains terminal success rather than creating an
+  unfenced retry state. A parse-only child module exposes only derived tags from
+  the frozen historical v2 artifact to production. Unit failure-injection and an
+  isolated, no-traffic privileged load of the hash-pinned v2 object prove
+  refusal, real program-to-map binding, every partial phase, durable retry,
+  exact hook/pin cleanup, and subsequent fresh endpoint-bound v3 provisioning.
+  The proof is bound to its own kernel map ID and full ABI, and every retry
+  revalidates recorded program tags against the frozen artifact and scans both
+  hook directions for same-name extras or cross-direction legacy programs
+  before mutation. Missing pin
+  state is accepted only when target-bound dumps find no legacy SDK program at
+  any priority or handle, so a historical non-default tc priority cannot be
+  misreported as absent.
+  Hook ownership is accepted only after an uninterrupted, zero-status multipart
+  dump whose sequence, local netlink port ID, interface, clsact parent, and
+  protocol match; overrun, malformed completion, or duplicate owner evidence
+  remains indeterminate.
 - **Validated-provider capability seam — `opc-crypto-provider`:** a new
   standalone crate defining the capability-reporting and key-custody boundary
   requested by #334 (slice 1 of 5). `CryptoCapability` enumerates the

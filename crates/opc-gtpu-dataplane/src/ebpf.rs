@@ -42,9 +42,10 @@ use opc_gtpu_ebpf_common::{
 use crate::backend::error_proves_no_requested_mutation;
 use crate::model::{classify_dual_selector_state, DualSelectorState};
 use crate::{
-    CreateGtpDeviceRequest, GtpAddressFamily, GtpBearerMark, GtpDevice, GtpPdpContext, GtpVersion,
-    GtpuBackendKind, GtpuCapability, GtpuDataplaneBackend, GtpuDownlinkEndpoint, GtpuError,
-    GtpuProbe, PdpContextIndeterminateReason, PdpContextInstallOutcome,
+    CreateGtpDeviceRequest, DrainedV2TeardownOutcome, DrainedV2TeardownRefusal,
+    DrainedV2TeardownRequest, GtpAddressFamily, GtpBearerMark, GtpDevice, GtpPdpContext,
+    GtpVersion, GtpuBackendKind, GtpuCapability, GtpuDataplaneBackend, GtpuDownlinkEndpoint,
+    GtpuError, GtpuProbe, PdpContextIndeterminateReason, PdpContextInstallOutcome,
     PdpContextLocalTeidSelector, PdpContextReadback, PdpContextReconciliationCapabilities,
     PdpContextRemovalOutcome, PdpContextSelector, PdpContextUplinkSelector,
     RemovePdpContextRequest, Teid,
@@ -184,6 +185,16 @@ pub(crate) trait EbpfGtpuRuntime: Send + Sync + fmt::Debug {
         pin_dir: &Path,
         tc_priority: u16,
     ) -> Result<(), GtpuError>;
+
+    /// Remove an exact, empty legacy-v2 program/map graph while retaining
+    /// retry-safe identity evidence across partial cleanup.
+    fn teardown_drained_v2(
+        &self,
+        interface: &str,
+        ifindex: u32,
+        pin_dir: &Path,
+        tc_priority: u16,
+    ) -> Result<DrainedV2TeardownOutcome, GtpuError>;
 
     /// Read an uplink FAR entry.
     fn far_get(
@@ -1012,6 +1023,46 @@ impl EbpfGtpuDataplaneBackend {
         )?;
         devices.remove(&device.ifindex);
         Ok(())
+    }
+
+    fn teardown_drained_v2_sync(
+        &self,
+        request: DrainedV2TeardownRequest,
+    ) -> Result<DrainedV2TeardownOutcome, GtpuError> {
+        let _operation = self.operation_guard()?;
+        let device = request.device();
+        validate_interface_name(&device.name)?;
+        if device.ifindex == 0 {
+            return Err(GtpuError::invalid_config(
+                "device.ifindex",
+                "interface index must be nonzero",
+            ));
+        }
+        let current_ifindex = match self.inner.runtime.ifindex_by_name(&device.name) {
+            Ok(ifindex) => ifindex,
+            Err(GtpuError::NotFound) => {
+                return Ok(DrainedV2TeardownOutcome::Refused(
+                    DrainedV2TeardownRefusal::InterfaceIdentityChanged,
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+        if current_ifindex != device.ifindex {
+            return Ok(DrainedV2TeardownOutcome::Refused(
+                DrainedV2TeardownRefusal::InterfaceIdentityChanged,
+            ));
+        }
+        if self.devices()?.contains_key(&device.ifindex) {
+            return Ok(DrainedV2TeardownOutcome::Refused(
+                DrainedV2TeardownRefusal::ManagedAttachment,
+            ));
+        }
+        self.inner.runtime.teardown_drained_v2(
+            &device.name,
+            device.ifindex,
+            &self.pin_dir(&device.name),
+            self.inner.config.tc_priority,
+        )
     }
 
     fn datapath_snapshot_sync(
@@ -2287,6 +2338,16 @@ impl GtpuDataplaneBackend for EbpfGtpuDataplaneBackend {
         .await
     }
 
+    async fn teardown_drained_v2(
+        &self,
+        request: DrainedV2TeardownRequest,
+    ) -> Result<DrainedV2TeardownOutcome, GtpuError> {
+        self.run_blocking("ebpf_drained_v2_teardown", move |backend| {
+            backend.teardown_drained_v2_sync(request)
+        })
+        .await
+    }
+
     async fn install_pdp_context(&self, request: GtpPdpContext) -> Result<(), GtpuError> {
         self.run_blocking("ebpf_install_pdp_context", move |backend| {
             backend.install_pdp_context_sync(request)
@@ -2453,7 +2514,16 @@ mod aya_runtime {
         loaded_programs, tc, ProgramError, ProgramInfo, SchedClassifier, TcAttachType,
     };
     use aya::{Ebpf, EbpfLoader};
+    use aya_obj::btf::Btf;
+    use aya_obj::generated::{
+        bpf_insn, bpf_map_type, bpf_prog_type, BPF_DW, BPF_IMM, BPF_LD, BPF_PSEUDO_MAP_FD,
+        BPF_PSEUDO_MAP_VALUE,
+    };
+    use aya_obj::maps::PinningType;
+    use aya_obj::{Features as AyaObjectFeatures, Object as AyaObject};
     use opc_linux_gtpu_sys as sys;
+    use sha1::{Digest as Sha1Digest, Sha1};
+    use sha2::{Digest as Sha2Digest, Sha256};
 
     use opc_gtpu_ebpf_common::{
         default_bearer_graph_is_valid, DownlinkEndpointBinding, DownlinkPdr, MarkedBearerOwner,
@@ -2475,7 +2545,9 @@ mod aya_runtime {
     use super::{
         EbpfEnvironment, EbpfGtpuDatapathCounters, EbpfGtpuDatapathSnapshot, EbpfGtpuRuntime,
     };
-    use crate::GtpuError;
+    use crate::{
+        DrainedV2TeardownOutcome, DrainedV2TeardownProgress, DrainedV2TeardownRefusal, GtpuError,
+    };
 
     /// The committed CO-RE datapath object built by
     /// `scripts/build-gtpu-ebpf.sh` from `crates/opc-gtpu-dataplane-ebpf`.
@@ -2489,6 +2561,150 @@ mod aya_runtime {
         env!("CARGO_MANIFEST_DIR"),
         "/bpf/opc-gtpu-datapath-v1.bpf.o"
     ));
+    const LEGACY_V2_OWNER_VALUE_LEN: usize = 20;
+    const LEGACY_V2_TEARDOWN_PROOF_MAP: &str = "GTPU_V2_TEARDOWN";
+    const LEGACY_V2_TEARDOWN_PROOF_LEN: usize = 96;
+    const LEGACY_V2_TEARDOWN_MAGIC: [u8; 8] = *b"OPCV2TD2";
+    const LEGACY_V2_DATAPATH_SHA256: [u8; 32] = [
+        0x7d, 0x0c, 0x1b, 0x45, 0x2a, 0xd5, 0x62, 0xd4, 0xc8, 0xc2, 0x86, 0xbf, 0x05, 0xa4, 0xc5,
+        0x30, 0x8f, 0x6f, 0xd5, 0xb4, 0xc6, 0x77, 0xcc, 0x3c, 0x21, 0x25, 0xb1, 0x94, 0x86, 0x04,
+        0x64, 0xa5,
+    ];
+
+    /// Parse-only authority for the frozen endpoint-unbound bearer-v2 object.
+    ///
+    /// The embedded bytes are private to this child module. Production callers
+    /// can obtain only the derived, provenance-checked program tags, so the
+    /// maintenance runtime has no raw-object value it could pass to a loader.
+    mod legacy_v2_artifact {
+        use super::{AyaGtpuRuntime, GtpuError, LegacyV2ProgramTags};
+
+        const OBJECT: &[u8] = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/bpf/opc-gtpu-datapath-v2.bpf.o"
+        ));
+
+        pub(super) fn program_tags() -> Result<(LegacyV2ProgramTags, LegacyV2ProgramTags), GtpuError>
+        {
+            AyaGtpuRuntime::legacy_v2_artifact_tags_from(OBJECT)
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use sha2::{Digest, Sha256};
+
+            use super::super::{
+                AyaGtpuRuntime, GtpuError, DATAPATH_OBJECT, LEGACY_V2_DATAPATH_SHA256,
+            };
+            use super::OBJECT;
+
+            #[test]
+            fn embedded_object_has_exact_provenance_and_rejects_other_bytes() {
+                assert_eq!(&Sha256::digest(OBJECT)[..], &LEGACY_V2_DATAPATH_SHA256);
+
+                let mut tampered = OBJECT.to_vec();
+                tampered[0] ^= 0xff;
+                assert!(matches!(
+                    AyaGtpuRuntime::legacy_v2_artifact_tags_from(&tampered),
+                    Err(GtpuError::StateIndeterminate {
+                        operation: "ebpf_legacy_v2_object_provenance"
+                    })
+                ));
+                assert!(matches!(
+                    AyaGtpuRuntime::legacy_v2_artifact_tags_from(DATAPATH_OBJECT),
+                    Err(GtpuError::StateIndeterminate {
+                        operation: "ebpf_legacy_v2_object_provenance"
+                    })
+                ));
+            }
+        }
+    }
+    const LEGACY_V2_MAP_NAMES: [&str; 9] = [
+        MAP_UPLINK_FAR,
+        MAP_UPLINK_MARK_FAR,
+        MAP_UPLINK_DSCP,
+        MAP_UPLINK_MARK_DSCP,
+        MAP_DOWNLINK_PDR,
+        MAP_DOWNLINK_MARK_PDR,
+        MAP_MARKED_BEARER_OWNER,
+        MAP_COUNTERS,
+        MAP_CONFIG,
+    ];
+
+    #[derive(Clone, Copy)]
+    struct LegacyV2MapSpec {
+        name: &'static str,
+        map_type: u32,
+        key_size: u32,
+        value_size: u32,
+        max_entries: u32,
+    }
+
+    const LEGACY_V2_MAP_SPECS: [LegacyV2MapSpec; 9] = [
+        LegacyV2MapSpec {
+            name: MAP_UPLINK_FAR,
+            map_type: bpf_map_type::BPF_MAP_TYPE_HASH as u32,
+            key_size: 4,
+            value_size: UPLINK_FAR_VALUE_LEN as u32,
+            max_entries: 65_536,
+        },
+        LegacyV2MapSpec {
+            name: MAP_UPLINK_MARK_FAR,
+            map_type: bpf_map_type::BPF_MAP_TYPE_HASH as u32,
+            key_size: UPLINK_MARK_KEY_LEN as u32,
+            value_size: UPLINK_FAR_VALUE_LEN as u32,
+            max_entries: 65_536,
+        },
+        LegacyV2MapSpec {
+            name: MAP_UPLINK_DSCP,
+            map_type: bpf_map_type::BPF_MAP_TYPE_HASH as u32,
+            key_size: 4,
+            value_size: UPLINK_DSCP_VALUE_LEN as u32,
+            max_entries: 65_536,
+        },
+        LegacyV2MapSpec {
+            name: MAP_UPLINK_MARK_DSCP,
+            map_type: bpf_map_type::BPF_MAP_TYPE_HASH as u32,
+            key_size: UPLINK_MARK_KEY_LEN as u32,
+            value_size: UPLINK_DSCP_VALUE_LEN as u32,
+            max_entries: 65_536,
+        },
+        LegacyV2MapSpec {
+            name: MAP_DOWNLINK_PDR,
+            map_type: bpf_map_type::BPF_MAP_TYPE_HASH as u32,
+            key_size: 4,
+            value_size: DOWNLINK_PDR_VALUE_LEN as u32,
+            max_entries: 65_536,
+        },
+        LegacyV2MapSpec {
+            name: MAP_DOWNLINK_MARK_PDR,
+            map_type: bpf_map_type::BPF_MAP_TYPE_HASH as u32,
+            key_size: 4,
+            value_size: MARKED_DOWNLINK_PDR_VALUE_LEN as u32,
+            max_entries: 65_536,
+        },
+        LegacyV2MapSpec {
+            name: MAP_MARKED_BEARER_OWNER,
+            map_type: bpf_map_type::BPF_MAP_TYPE_HASH as u32,
+            key_size: UPLINK_MARK_KEY_LEN as u32,
+            value_size: LEGACY_V2_OWNER_VALUE_LEN as u32,
+            max_entries: 65_536,
+        },
+        LegacyV2MapSpec {
+            name: MAP_COUNTERS,
+            map_type: bpf_map_type::BPF_MAP_TYPE_PERCPU_ARRAY as u32,
+            key_size: 4,
+            value_size: 8,
+            max_entries: 6,
+        },
+        LegacyV2MapSpec {
+            name: MAP_CONFIG,
+            map_type: bpf_map_type::BPF_MAP_TYPE_ARRAY as u32,
+            key_size: 4,
+            value_size: 4,
+            max_entries: 1,
+        },
+    ];
 
     const TC_HANDLE: TcHandle = TcHandle::new(0, 1);
     const CAP_NET_ADMIN: u32 = 12;
@@ -2566,6 +2782,367 @@ mod aya_runtime {
         counters: u32,
         downlink_binding_counters: u32,
         config: u32,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct LegacyV2DatapathIdentity {
+        uplink: LegacyV2ProgramIdentity,
+        downlink: LegacyV2ProgramIdentity,
+        map_ids: [u32; LEGACY_V2_MAP_NAMES.len()],
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct LegacyV2ProgramIdentity {
+        tags: LegacyV2ProgramTags,
+        map_ids: Vec<u32>,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct LegacyV2ProgramTags {
+        sha1: u64,
+        sha256: u64,
+    }
+
+    impl LegacyV2ProgramTags {
+        fn contains(self, tag: u64) -> bool {
+            tag == self.sha1 || tag == self.sha256
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum LegacyV2IdentityError {
+        Mismatch,
+        Indeterminate,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum LegacyV2ProofCommitError {
+        /// No durable proof publication was observed after the attempted
+        /// operation, so no intentional teardown mutation was committed.
+        BeforePublication,
+        /// Publication succeeded, or may have succeeded, but exact readback
+        /// could not be completed. The proof path must remain a v3 fence.
+        PublicationIndeterminate,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum UnprovenHookAbsence {
+        Absent,
+        Occupied,
+        Indeterminate,
+    }
+
+    fn classify_unproven_hook_absence<T, E>(
+        uplink: Result<Option<T>, E>,
+        downlink: Result<Option<T>, E>,
+    ) -> UnprovenHookAbsence {
+        match (uplink, downlink) {
+            (Err(_), _) | (_, Err(_)) => UnprovenHookAbsence::Indeterminate,
+            (Ok(None), Ok(None)) => UnprovenHookAbsence::Absent,
+            (Ok(_), Ok(_)) => UnprovenHookAbsence::Occupied,
+        }
+    }
+
+    fn classify_path_metadata<T>(
+        result: io::Result<T>,
+        operation: &'static str,
+    ) -> Result<bool, GtpuError> {
+        match result {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(GtpuError::io(operation, error)),
+        }
+    }
+
+    fn legacy_v2_path_is_present(path: &Path, operation: &'static str) -> Result<bool, GtpuError> {
+        classify_path_metadata(fs::symlink_metadata(path), operation)
+    }
+
+    #[derive(Debug, Default)]
+    struct LegacyV2FarObservation {
+        marker: Option<[u8; UPLINK_FAR_VALUE_LEN]>,
+        marker_duplicate: bool,
+        forwarding_state_present: bool,
+    }
+
+    impl LegacyV2FarObservation {
+        fn observe(&mut self, key: [u8; 4], value: [u8; UPLINK_FAR_VALUE_LEN]) {
+            if key == UPLINK_DSCP_SCHEMA_MARKER_KEY {
+                // A kernel hash map cannot expose the same key twice. Preserve
+                // the first observation nevertheless so an impossible duplicate
+                // cannot make a corrupt marker look canonical.
+                if self.marker.is_none() {
+                    self.marker = Some(value);
+                } else {
+                    self.marker_duplicate = true;
+                }
+            } else {
+                self.forwarding_state_present = true;
+            }
+        }
+
+        fn finish(self) -> Result<bool, LegacyV2IdentityError> {
+            if self.marker_duplicate {
+                return Err(LegacyV2IdentityError::Mismatch);
+            }
+            match self.marker {
+                Some(value) if value == UPLINK_BEARER_SCHEMA_MARKER_VALUE => {
+                    Ok(!self.forwarding_state_present)
+                }
+                Some(_) => Err(LegacyV2IdentityError::Mismatch),
+                None => Err(LegacyV2IdentityError::Indeterminate),
+            }
+        }
+    }
+
+    fn validate_legacy_v2_config_identity(local_ip: [u8; 4]) -> Result<(), LegacyV2IdentityError> {
+        if local_ip == [0; 4] {
+            Err(LegacyV2IdentityError::Mismatch)
+        } else {
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct LegacyV2TeardownRecord {
+        ifindex: u32,
+        tc_priority: u16,
+        uplink_program_id: u32,
+        downlink_program_id: u32,
+        uplink_program_tag: u64,
+        downlink_program_tag: u64,
+        map_ids: [u32; LEGACY_V2_MAP_NAMES.len()],
+        proof_map_id: u32,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct LegacyV2TeardownProof {
+        record: LegacyV2TeardownRecord,
+        map_id: u32,
+    }
+
+    impl LegacyV2TeardownRecord {
+        fn from_identity(
+            ifindex: u32,
+            tc_priority: u16,
+            identity: &LegacyV2DatapathIdentity,
+            uplink_program: (u32, u64),
+            downlink_program: (u32, u64),
+        ) -> Self {
+            Self {
+                ifindex,
+                tc_priority,
+                uplink_program_id: uplink_program.0,
+                downlink_program_id: downlink_program.0,
+                uplink_program_tag: uplink_program.1,
+                downlink_program_tag: downlink_program.1,
+                map_ids: identity.map_ids,
+                proof_map_id: 0,
+            }
+        }
+
+        fn bind_to_proof_map(self, proof_map_id: u32) -> Option<Self> {
+            (self.proof_map_id == 0 && proof_map_id != 0).then_some(Self {
+                proof_map_id,
+                ..self
+            })
+        }
+
+        fn matches_unbound(self, unbound: Self) -> bool {
+            unbound.proof_map_id == 0
+                && self
+                    == Self {
+                        proof_map_id: self.proof_map_id,
+                        ..unbound
+                    }
+        }
+
+        fn encode(self) -> [u8; LEGACY_V2_TEARDOWN_PROOF_LEN] {
+            let mut encoded = [0_u8; LEGACY_V2_TEARDOWN_PROOF_LEN];
+            encoded[..8].copy_from_slice(&LEGACY_V2_TEARDOWN_MAGIC);
+            encoded[8..12].copy_from_slice(&self.ifindex.to_ne_bytes());
+            encoded[12..14].copy_from_slice(&self.tc_priority.to_ne_bytes());
+            encoded[16..20].copy_from_slice(&self.uplink_program_id.to_ne_bytes());
+            encoded[20..24].copy_from_slice(&self.downlink_program_id.to_ne_bytes());
+            encoded[24..32].copy_from_slice(&self.uplink_program_tag.to_ne_bytes());
+            encoded[32..40].copy_from_slice(&self.downlink_program_tag.to_ne_bytes());
+            for (index, map_id) in self.map_ids.into_iter().enumerate() {
+                let offset = 40 + index * 4;
+                encoded[offset..offset + 4].copy_from_slice(&map_id.to_ne_bytes());
+            }
+            encoded[76..80].copy_from_slice(&self.proof_map_id.to_ne_bytes());
+            let checksum = teardown_record_checksum(&encoded[..88]);
+            encoded[88..96].copy_from_slice(&checksum.to_ne_bytes());
+            encoded
+        }
+
+        fn decode(encoded: &[u8; LEGACY_V2_TEARDOWN_PROOF_LEN]) -> Option<Self> {
+            let read_u32 = |offset: usize| {
+                encoded
+                    .get(offset..offset + 4)
+                    .and_then(|value| value.try_into().ok())
+                    .map(u32::from_ne_bytes)
+            };
+            let read_u64 = |offset: usize| {
+                encoded
+                    .get(offset..offset + 8)
+                    .and_then(|value| value.try_into().ok())
+                    .map(u64::from_ne_bytes)
+            };
+            if encoded[..8] != LEGACY_V2_TEARDOWN_MAGIC
+                || encoded[14..16] != [0; 2]
+                || encoded[80..88] != [0; 8]
+                || read_u64(88)? != teardown_record_checksum(&encoded[..88])
+            {
+                return None;
+            }
+            let mut map_ids = [0_u32; LEGACY_V2_MAP_NAMES.len()];
+            for (index, map_id) in map_ids.iter_mut().enumerate() {
+                *map_id = read_u32(40 + index * 4)?;
+            }
+            let record = Self {
+                ifindex: read_u32(8)?,
+                tc_priority: u16::from_ne_bytes(encoded[12..14].try_into().ok()?),
+                uplink_program_id: read_u32(16)?,
+                downlink_program_id: read_u32(20)?,
+                uplink_program_tag: read_u64(24)?,
+                downlink_program_tag: read_u64(32)?,
+                map_ids,
+                proof_map_id: read_u32(76)?,
+            };
+            (record.ifindex != 0
+                && record.uplink_program_id != 0
+                && record.downlink_program_id != 0
+                && record.uplink_program_tag != 0
+                && record.downlink_program_tag != 0
+                && record.proof_map_id != 0
+                && record.map_ids.iter().all(|map_id| *map_id != 0))
+            .then_some(record)
+        }
+
+        fn uplink_map_ids(self) -> [u32; 7] {
+            [
+                self.map_ids[0],
+                self.map_ids[1],
+                self.map_ids[2],
+                self.map_ids[3],
+                self.map_ids[6],
+                self.map_ids[7],
+                self.map_ids[8],
+            ]
+        }
+
+        fn downlink_map_ids(self) -> [u32; 4] {
+            [
+                self.map_ids[4],
+                self.map_ids[5],
+                self.map_ids[6],
+                self.map_ids[7],
+            ]
+        }
+    }
+
+    fn teardown_record_checksum(bytes: &[u8]) -> u64 {
+        bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
+    }
+
+    fn legacy_v2_proof_map_abi_is_exact(
+        map_type: u32,
+        key_size: u32,
+        value_size: u32,
+        max_entries: u32,
+        map_flags: u32,
+    ) -> bool {
+        map_type == bpf_map_type::BPF_MAP_TYPE_ARRAY as u32
+            && key_size == 4
+            && value_size == LEGACY_V2_TEARDOWN_PROOF_LEN as u32
+            && max_entries == 1
+            && map_flags == 0
+    }
+
+    fn legacy_v2_proof_record_is_authoritative(
+        record: LegacyV2TeardownRecord,
+        proof_map_id: u32,
+        uplink_tags: LegacyV2ProgramTags,
+        downlink_tags: LegacyV2ProgramTags,
+    ) -> bool {
+        record.proof_map_id == proof_map_id
+            && proof_map_id != 0
+            && uplink_tags.contains(record.uplink_program_tag)
+            && downlink_tags.contains(record.downlink_program_tag)
+    }
+
+    fn legacy_v2_normalized_program_bytes(instructions: &[bpf_insn]) -> Vec<u8> {
+        let mut normalized = Vec::with_capacity(instructions.len().saturating_mul(8));
+        let mut prior_was_map_load = false;
+        for instruction in instructions {
+            let is_map_load = !prior_was_map_load
+                && instruction.code == (BPF_LD | BPF_IMM | BPF_DW) as u8
+                && matches!(
+                    u32::from(instruction.src_reg()),
+                    BPF_PSEUDO_MAP_FD | BPF_PSEUDO_MAP_VALUE
+                );
+            let is_map_load_tail = prior_was_map_load
+                && instruction.code == 0
+                && instruction.dst_reg() == 0
+                && instruction.src_reg() == 0
+                && instruction.off == 0;
+            let immediate = if is_map_load || is_map_load_tail {
+                0
+            } else {
+                instruction.imm
+            };
+            let registers = if cfg!(target_endian = "little") {
+                instruction.dst_reg() | instruction.src_reg() << 4
+            } else {
+                instruction.src_reg() | instruction.dst_reg() << 4
+            };
+            normalized.extend_from_slice(&[instruction.code, registers]);
+            normalized.extend_from_slice(&instruction.off.to_ne_bytes());
+            normalized.extend_from_slice(&immediate.to_ne_bytes());
+            prior_was_map_load = is_map_load;
+        }
+        normalized
+    }
+
+    fn legacy_v2_tags_from_normalized(bytes: &[u8]) -> LegacyV2ProgramTags {
+        let sha1 = Sha1::digest(bytes);
+        let sha256 = Sha256::digest(bytes);
+        let mut sha1_tag = [0_u8; 8];
+        let mut sha256_tag = [0_u8; 8];
+        sha1_tag.copy_from_slice(&sha1[..8]);
+        sha256_tag.copy_from_slice(&sha256[..8]);
+        LegacyV2ProgramTags {
+            sha1: u64::from_be_bytes(sha1_tag),
+            sha256: u64::from_be_bytes(sha256_tag),
+        }
+    }
+
+    fn legacy_v2_program_tags(instructions: &[bpf_insn]) -> LegacyV2ProgramTags {
+        legacy_v2_tags_from_normalized(&legacy_v2_normalized_program_bytes(instructions))
+    }
+
+    fn legacy_v2_object_instructions<'a>(
+        object: &'a AyaObject,
+        name: &str,
+    ) -> Result<&'a [bpf_insn], GtpuError> {
+        let program = object
+            .programs
+            .get(name)
+            .ok_or_else(|| state_indeterminate("ebpf_legacy_v2_object_identity"))?;
+        let function = object
+            .functions
+            .get(&program.function_key())
+            .ok_or_else(|| state_indeterminate("ebpf_legacy_v2_object_identity"))?;
+        Ok(&function.instructions)
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum LegacyV2HookState {
+        Absent,
+        Exact,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2710,6 +3287,265 @@ mod aya_runtime {
                 })
         }
 
+        fn legacy_v2_artifact_tags_from(
+            bytes: &[u8],
+        ) -> Result<(LegacyV2ProgramTags, LegacyV2ProgramTags), GtpuError> {
+            if Sha256::digest(bytes)[..] != LEGACY_V2_DATAPATH_SHA256 {
+                return Err(state_indeterminate("ebpf_legacy_v2_object_provenance"));
+            }
+            let object = AyaObject::parse(bytes).map_err(|_| {
+                GtpuError::io(
+                    "ebpf_legacy_v2_object_parse",
+                    invalid_data("legacy v2 bpf object parse failed"),
+                )
+            })?;
+            if object.maps.len() != LEGACY_V2_MAP_SPECS.len() {
+                return Err(state_indeterminate("ebpf_legacy_v2_object_identity"));
+            }
+            for spec in LEGACY_V2_MAP_SPECS {
+                let map = object
+                    .maps
+                    .get(spec.name)
+                    .ok_or_else(|| state_indeterminate("ebpf_legacy_v2_object_identity"))?;
+                if map.map_type() != spec.map_type
+                    || map.key_size() != spec.key_size
+                    || map.value_size() != spec.value_size
+                    || map.max_entries() != spec.max_entries
+                    || map.map_flags() != 0
+                    || map.pinning() != PinningType::ByName
+                {
+                    return Err(state_indeterminate("ebpf_legacy_v2_object_identity"));
+                }
+            }
+            Self::object_program_tags(object)
+        }
+
+        fn object_program_tags(
+            mut object: AyaObject,
+        ) -> Result<(LegacyV2ProgramTags, LegacyV2ProgramTags), GtpuError> {
+            if object.has_btf_relocations() {
+                let btf = Btf::from_sys_fs()
+                    .map_err(|_| state_indeterminate("ebpf_legacy_v2_object_btf_identity"))?;
+                object
+                    .relocate_btf(&btf)
+                    .map_err(|_| state_indeterminate("ebpf_legacy_v2_object_btf_identity"))?;
+            }
+            let text_sections = object
+                .functions
+                .keys()
+                .map(|(section_index, _)| *section_index)
+                .collect::<HashSet<_>>();
+            let maps = object.maps.clone();
+            object
+                .relocate_maps(
+                    maps.iter()
+                        .enumerate()
+                        .map(|(index, (name, map))| (name.as_str(), (index + 1) as i32, map)),
+                    &text_sections,
+                )
+                .map_err(|_| state_indeterminate("ebpf_legacy_v2_object_map_identity"))?;
+            object
+                .relocate_calls(&text_sections)
+                .map_err(|_| state_indeterminate("ebpf_legacy_v2_object_call_identity"))?;
+            // Aya rewrites a small set of helper calls on older kernels. The
+            // frozen artifact must be tag-stable across both sanitizer modes;
+            // otherwise an offline tag cannot safely identify every kernel's
+            // loaded representation and maintenance must fail closed.
+            let mut legacy_kernel_object = object.clone();
+            legacy_kernel_object.sanitize_functions(&AyaObjectFeatures::default());
+            object.sanitize_functions(&AyaObjectFeatures::new(
+                true, true, true, true, true, true, true, None,
+            ));
+            if object.programs.len() != 2 {
+                return Err(state_indeterminate("ebpf_legacy_v2_object_identity"));
+            }
+            let tags = |name| {
+                let modern = legacy_v2_object_instructions(&object, name)?;
+                let legacy = legacy_v2_object_instructions(&legacy_kernel_object, name)?;
+                if legacy_v2_normalized_program_bytes(modern)
+                    != legacy_v2_normalized_program_bytes(legacy)
+                {
+                    return Err(state_indeterminate(
+                        "ebpf_legacy_v2_object_kernel_portability",
+                    ));
+                }
+                Ok(legacy_v2_program_tags(modern))
+            };
+            Ok((tags(PROG_UPLINK)?, tags(PROG_DOWNLINK)?))
+        }
+
+        fn legacy_v2_artifact_tags() -> Result<(LegacyV2ProgramTags, LegacyV2ProgramTags), GtpuError>
+        {
+            legacy_v2_artifact::program_tags()
+        }
+
+        fn legacy_v2_directory_entries(pin_dir: &Path) -> Result<HashSet<String>, GtpuError> {
+            fs::read_dir(pin_dir)
+                .map_err(|error| GtpuError::io("ebpf_legacy_v2_pin_inventory", error))?
+                .map(|entry| {
+                    let entry = entry
+                        .map_err(|error| GtpuError::io("ebpf_legacy_v2_pin_inventory", error))?;
+                    entry
+                        .file_name()
+                        .into_string()
+                        .map_err(|_| state_indeterminate("ebpf_legacy_v2_pin_inventory"))
+                })
+                .collect()
+        }
+
+        fn legacy_v2_named_map_ids(
+            pin_dir: &Path,
+        ) -> Result<[u32; LEGACY_V2_MAP_NAMES.len()], LegacyV2IdentityError> {
+            let mut ids = [0_u32; LEGACY_V2_MAP_NAMES.len()];
+            for (index, spec) in LEGACY_V2_MAP_SPECS.iter().enumerate() {
+                let info = MapInfo::from_pin(pin_dir.join(spec.name))
+                    .map_err(|_| LegacyV2IdentityError::Indeterminate)?;
+                let map_type = info
+                    .map_type()
+                    .map_err(|_| LegacyV2IdentityError::Indeterminate)?
+                    as u32;
+                if map_type != spec.map_type
+                    || info.key_size() != spec.key_size
+                    || info.value_size() != spec.value_size
+                    || info.max_entries() != spec.max_entries
+                    || info.map_flags() != 0
+                {
+                    return Err(LegacyV2IdentityError::Mismatch);
+                }
+                ids[index] = info.id();
+            }
+            Ok(ids)
+        }
+
+        fn legacy_v2_recorded_pin_count(
+            pin_dir: &Path,
+            record: LegacyV2TeardownRecord,
+        ) -> Result<usize, GtpuError> {
+            let mut present = 0;
+            for (index, spec) in LEGACY_V2_MAP_SPECS.iter().enumerate() {
+                let path = pin_dir.join(spec.name);
+                if !legacy_v2_path_is_present(&path, "ebpf_legacy_v2_pin_identity")? {
+                    continue;
+                }
+                let info = MapInfo::from_pin(&path)
+                    .map_err(|error| map_error("ebpf_legacy_v2_pin_identity", error))?;
+                let map_type = info
+                    .map_type()
+                    .map_err(|error| map_error("ebpf_legacy_v2_pin_identity", error))?
+                    as u32;
+                if info.id() != record.map_ids[index]
+                    || map_type != spec.map_type
+                    || info.key_size() != spec.key_size
+                    || info.value_size() != spec.value_size
+                    || info.max_entries() != spec.max_entries
+                    || info.map_flags() != 0
+                {
+                    return Err(state_indeterminate("ebpf_legacy_v2_pin_identity"));
+                }
+                present += 1;
+            }
+            Ok(present)
+        }
+
+        fn legacy_v2_surviving_maps_are_drained(
+            pin_dir: &Path,
+        ) -> Result<bool, LegacyV2IdentityError> {
+            let open = |name: &str| {
+                let path = pin_dir.join(name);
+                if !legacy_v2_path_is_present(&path, "ebpf_legacy_v2_drain_readback")
+                    .map_err(|_| LegacyV2IdentityError::Indeterminate)?
+                {
+                    return Ok(None);
+                }
+                let data =
+                    MapData::from_pin(path).map_err(|_| LegacyV2IdentityError::Indeterminate)?;
+                Map::from_map_data(data)
+                    .map_err(|_| LegacyV2IdentityError::Indeterminate)
+                    .map(Some)
+            };
+            let mut forwarding_state_present = false;
+            macro_rules! observe_empty {
+                ($map:expr) => {
+                    if $map
+                        .iter()
+                        .next()
+                        .transpose()
+                        .map_err(|_| LegacyV2IdentityError::Indeterminate)?
+                        .is_some()
+                    {
+                        forwarding_state_present = true;
+                    }
+                };
+            }
+
+            if let Some(map) = open(MAP_UPLINK_FAR)? {
+                let far = BpfHashMap::<MapData, [u8; 4], [u8; UPLINK_FAR_VALUE_LEN]>::try_from(map)
+                    .map_err(|_| LegacyV2IdentityError::Indeterminate)?;
+                let mut observation = LegacyV2FarObservation::default();
+                for entry in far.iter() {
+                    let (key, value) = entry.map_err(|_| LegacyV2IdentityError::Indeterminate)?;
+                    observation.observe(key, value);
+                }
+                forwarding_state_present |= !observation.finish()?;
+            }
+            if let Some(map) = open(MAP_UPLINK_MARK_FAR)? {
+                let marked_far = BpfHashMap::<
+                    MapData,
+                    [u8; UPLINK_MARK_KEY_LEN],
+                    [u8; UPLINK_FAR_VALUE_LEN],
+                >::try_from(map)
+                .map_err(|_| LegacyV2IdentityError::Indeterminate)?;
+                observe_empty!(marked_far);
+            }
+            if let Some(map) = open(MAP_UPLINK_DSCP)? {
+                let dscp =
+                    BpfHashMap::<MapData, [u8; 4], [u8; UPLINK_DSCP_VALUE_LEN]>::try_from(map)
+                        .map_err(|_| LegacyV2IdentityError::Indeterminate)?;
+                observe_empty!(dscp);
+            }
+            if let Some(map) = open(MAP_UPLINK_MARK_DSCP)? {
+                let marked_dscp = BpfHashMap::<
+                    MapData,
+                    [u8; UPLINK_MARK_KEY_LEN],
+                    [u8; UPLINK_DSCP_VALUE_LEN],
+                >::try_from(map)
+                .map_err(|_| LegacyV2IdentityError::Indeterminate)?;
+                observe_empty!(marked_dscp);
+            }
+            if let Some(map) = open(MAP_DOWNLINK_PDR)? {
+                let pdr =
+                    BpfHashMap::<MapData, [u8; 4], [u8; DOWNLINK_PDR_VALUE_LEN]>::try_from(map)
+                        .map_err(|_| LegacyV2IdentityError::Indeterminate)?;
+                observe_empty!(pdr);
+            }
+            if let Some(map) = open(MAP_DOWNLINK_MARK_PDR)? {
+                let marked_pdr =
+                    BpfHashMap::<MapData, [u8; 4], [u8; MARKED_DOWNLINK_PDR_VALUE_LEN]>::try_from(
+                        map,
+                    )
+                    .map_err(|_| LegacyV2IdentityError::Indeterminate)?;
+                observe_empty!(marked_pdr);
+            }
+            if let Some(map) = open(MAP_MARKED_BEARER_OWNER)? {
+                let owner = BpfHashMap::<
+                    MapData,
+                    [u8; UPLINK_MARK_KEY_LEN],
+                    [u8; LEGACY_V2_OWNER_VALUE_LEN],
+                >::try_from(map)
+                .map_err(|_| LegacyV2IdentityError::Indeterminate)?;
+                observe_empty!(owner);
+            }
+            if let Some(map) = open(MAP_CONFIG)? {
+                let config = Array::<MapData, [u8; 4]>::try_from(map)
+                    .map_err(|_| LegacyV2IdentityError::Indeterminate)?;
+                let local_ip = config
+                    .get(&0, 0)
+                    .map_err(|_| LegacyV2IdentityError::Indeterminate)?;
+                validate_legacy_v2_config_identity(local_ip)?;
+            }
+            Ok(!forwarding_state_present)
+        }
+
         /// Determine which additive map schema this pin set has committed.
         /// The marker lives in the pre-existing FAR map so it remains
         /// available when a required additive pin is accidentally removed.
@@ -2717,6 +3553,15 @@ mod aya_runtime {
         /// creates a missing pinned-by-name map and conceals durable state
         /// loss.
         fn bearer_schema_preflight(pin_dir: &Path) -> Result<BearerSchemaState, GtpuError> {
+            match fs::symlink_metadata(pin_dir.join(LEGACY_V2_TEARDOWN_PROOF_MAP)) {
+                Ok(_) => {
+                    return Err(state_indeterminate("ebpf_legacy_v2_teardown_pending"));
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(_) => {
+                    return Err(state_indeterminate("ebpf_legacy_v2_teardown_pending"));
+                }
+            }
             let far_pin = pin_dir.join(MAP_UPLINK_FAR);
             if !far_pin
                 .try_exists()
@@ -3174,6 +4019,124 @@ mod aya_runtime {
                 )?,
                 pins: Self::pinned_map_identity(pin_dir)?,
             })
+        }
+
+        fn legacy_v2_datapath_identity(
+            pin_dir: &Path,
+        ) -> Result<LegacyV2DatapathIdentity, LegacyV2IdentityError> {
+            let named = Self::legacy_v2_named_map_ids(pin_dir)?;
+            let (uplink_tags, downlink_tags) = Self::legacy_v2_artifact_tags()
+                .map_err(|_| LegacyV2IdentityError::Indeterminate)?;
+            Ok(LegacyV2DatapathIdentity {
+                uplink: LegacyV2ProgramIdentity {
+                    tags: uplink_tags,
+                    map_ids: [
+                        named[0], named[1], named[2], named[3], named[6], named[7], named[8],
+                    ]
+                    .into(),
+                },
+                downlink: LegacyV2ProgramIdentity {
+                    tags: downlink_tags,
+                    map_ids: [named[4], named[5], named[6], named[7]].into(),
+                },
+                map_ids: named,
+            })
+        }
+
+        fn read_legacy_v2_teardown_proof(
+            pin_dir: &Path,
+        ) -> Result<Option<LegacyV2TeardownProof>, GtpuError> {
+            let path = pin_dir.join(LEGACY_V2_TEARDOWN_PROOF_MAP);
+            if !legacy_v2_path_is_present(&path, "ebpf_legacy_v2_proof_read")? {
+                return Ok(None);
+            }
+            let data = MapData::from_pin(&path)
+                .map_err(|error| map_error("ebpf_legacy_v2_proof_read", error))?;
+            let info = data
+                .info()
+                .map_err(|error| map_error("ebpf_legacy_v2_proof_read", error))?;
+            let map_type = info
+                .map_type()
+                .map_err(|error| map_error("ebpf_legacy_v2_proof_read", error))?
+                as u32;
+            if !legacy_v2_proof_map_abi_is_exact(
+                map_type,
+                info.key_size(),
+                info.value_size(),
+                info.max_entries(),
+                info.map_flags(),
+            ) {
+                return Err(state_indeterminate("ebpf_legacy_v2_proof_read"));
+            }
+            let map_id = info.id();
+            let proof = Array::<_, [u8; LEGACY_V2_TEARDOWN_PROOF_LEN]>::try_from(
+                Map::from_map_data(data)
+                    .map_err(|error| map_error("ebpf_legacy_v2_proof_read", error))?,
+            )
+            .map_err(|error| map_error("ebpf_legacy_v2_proof_read", error))?;
+            let encoded = proof
+                .get(&0, 0)
+                .map_err(|error| map_error("ebpf_legacy_v2_proof_read", error))?;
+            let record = LegacyV2TeardownRecord::decode(&encoded)
+                .ok_or_else(|| state_indeterminate("ebpf_legacy_v2_proof_read"))?;
+            let (uplink_tags, downlink_tags) = Self::legacy_v2_artifact_tags()?;
+            if !legacy_v2_proof_record_is_authoritative(record, map_id, uplink_tags, downlink_tags)
+            {
+                return Err(state_indeterminate("ebpf_legacy_v2_proof_read"));
+            }
+            Ok(Some(LegacyV2TeardownProof { record, map_id }))
+        }
+
+        fn commit_legacy_v2_teardown_proof(
+            pin_dir: &Path,
+            record: LegacyV2TeardownRecord,
+        ) -> Result<LegacyV2TeardownProof, LegacyV2ProofCommitError> {
+            match Self::read_legacy_v2_teardown_proof(pin_dir) {
+                Ok(Some(existing)) if existing.record.matches_unbound(record) => {
+                    return Ok(existing);
+                }
+                Ok(Some(_)) | Err(_) => {
+                    return Err(LegacyV2ProofCommitError::BeforePublication);
+                }
+                Ok(None) => {}
+            }
+            let mut proof = Array::<MapData, [u8; LEGACY_V2_TEARDOWN_PROOF_LEN]>::create(1, 0)
+                .map_err(|_| LegacyV2ProofCommitError::BeforePublication)?;
+            let info = proof
+                .map()
+                .info()
+                .map_err(|_| LegacyV2ProofCommitError::BeforePublication)?;
+            let map_type = info
+                .map_type()
+                .map_err(|_| LegacyV2ProofCommitError::BeforePublication)?
+                as u32;
+            if !legacy_v2_proof_map_abi_is_exact(
+                map_type,
+                info.key_size(),
+                info.value_size(),
+                info.max_entries(),
+                info.map_flags(),
+            ) {
+                return Err(LegacyV2ProofCommitError::BeforePublication);
+            }
+            let record = record
+                .bind_to_proof_map(info.id())
+                .ok_or(LegacyV2ProofCommitError::BeforePublication)?;
+            proof
+                .set(0, record.encode(), 0)
+                .map_err(|_| LegacyV2ProofCommitError::BeforePublication)?;
+            let path = pin_dir.join(LEGACY_V2_TEARDOWN_PROOF_MAP);
+            if proof.pin(&path).is_err() {
+                return match Self::read_legacy_v2_teardown_proof(pin_dir) {
+                    Ok(Some(existing)) if existing.record == record => Ok(existing),
+                    Ok(None) => Err(LegacyV2ProofCommitError::BeforePublication),
+                    Ok(Some(_)) | Err(_) => Err(LegacyV2ProofCommitError::PublicationIndeterminate),
+                };
+            }
+            match Self::read_legacy_v2_teardown_proof(pin_dir) {
+                Ok(Some(existing)) if existing.record == record => Ok(existing),
+                Ok(_) | Err(_) => Err(LegacyV2ProofCommitError::PublicationIndeterminate),
+            }
         }
 
         fn pinned_map_identity(pin_dir: &Path) -> Result<PinnedMapIdentity, GtpuError> {
@@ -3926,6 +4889,72 @@ mod aya_runtime {
             && occupant_map_ids == artifact_map_ids)
     }
 
+    fn owner_matches_legacy_v2_record(
+        owner: &FilterOwner,
+        program_name: &str,
+        expected_program_id: u32,
+        expected_program_tag: u64,
+        expected_map_ids: &[u32],
+    ) -> Result<bool, GtpuError> {
+        if owner.name != program_name || owner.program_id != Some(expected_program_id) {
+            return Ok(false);
+        }
+        let occupant = loaded_programs()
+            .find_map(|result| match result {
+                Ok(info) if info.id() == expected_program_id => Some(Ok(info)),
+                Ok(_) => None,
+                Err(error) => Some(Err(program_error("ebpf_program_info", &error))),
+            })
+            .transpose()?
+            .ok_or_else(|| state_indeterminate("ebpf_legacy_v2_hook_identity"))?;
+        let mut occupant_map_ids = occupant
+            .map_ids()
+            .map_err(|error| program_error("ebpf_program_map_ids", &error))?
+            .ok_or_else(|| state_indeterminate("ebpf_legacy_v2_hook_identity"))?;
+        let mut expected_map_ids = expected_map_ids.to_vec();
+        occupant_map_ids.sort_unstable();
+        expected_map_ids.sort_unstable();
+        Ok(occupant.name() == kernel_program_name(program_name)
+            && occupant.tag() == expected_program_tag
+            && occupant.program_type() == bpf_prog_type::BPF_PROG_TYPE_SCHED_CLS
+            && occupant_map_ids == expected_map_ids)
+    }
+
+    fn legacy_v2_artifact_owner_tag(
+        owner: &FilterOwner,
+        program_name: &str,
+        expected_tags: LegacyV2ProgramTags,
+        expected_map_ids: &[u32],
+    ) -> Result<Option<(u32, u64)>, GtpuError> {
+        let Some(program_id) = owner.program_id else {
+            return Ok(None);
+        };
+        if owner.name != program_name {
+            return Ok(None);
+        }
+        let occupant = loaded_programs()
+            .find_map(|result| match result {
+                Ok(info) if info.id() == program_id => Some(Ok(info)),
+                Ok(_) => None,
+                Err(error) => Some(Err(program_error("ebpf_program_info", &error))),
+            })
+            .transpose()?
+            .ok_or_else(|| state_indeterminate("ebpf_legacy_v2_hook_identity"))?;
+        let mut occupant_map_ids = occupant
+            .map_ids()
+            .map_err(|error| program_error("ebpf_program_map_ids", &error))?
+            .ok_or_else(|| state_indeterminate("ebpf_legacy_v2_hook_identity"))?;
+        let mut expected_map_ids = expected_map_ids.to_vec();
+        occupant_map_ids.sort_unstable();
+        expected_map_ids.sort_unstable();
+        let tag = occupant.tag();
+        Ok((occupant.name() == kernel_program_name(program_name)
+            && expected_tags.contains(tag)
+            && occupant.program_type() == bpf_prog_type::BPF_PROG_TYPE_SCHED_CLS
+            && occupant_map_ids == expected_map_ids)
+            .then_some((program_id, tag)))
+    }
+
     fn kernel_program_name(name: &str) -> &[u8] {
         const BPF_OBJ_NAME_VISIBLE_LEN: usize = 15;
         &name.as_bytes()[..name.len().min(BPF_OBJ_NAME_VISIBLE_LEN)]
@@ -3937,6 +4966,10 @@ mod aya_runtime {
             _ => sys::TC_H_CLSACT_INGRESS,
         }
     }
+
+    // `tc` stores the Ethernet protocol in network byte order in the low half
+    // of `tcm_info`. Aya attaches every SDK classifier with ETH_P_ALL.
+    const TC_PROTOCOL_ALL: u16 = 3_u16.to_be();
 
     /// Return the owner of the tc filter occupying our exact
     /// (hook, priority, handle) slot, or `None` only after a complete dump
@@ -3950,8 +4983,28 @@ mod aya_runtime {
         attach_type: TcAttachType,
         tc_priority: u16,
     ) -> Result<Option<FilterOwner>, GtpuError> {
+        filter_observation(
+            ifindex,
+            attach_type,
+            tc_priority,
+            LegacyV2ProgramScan::Disabled,
+        )
+        .map(|state| state.owner)
+    }
+
+    /// Read a complete, target-bound filter dump. Legacy-v2 teardown callers
+    /// can additionally require every SDK-named legacy program on the hook to
+    /// be absent, or allow only one expected name in the exact recorded slot.
+    fn filter_observation(
+        ifindex: u32,
+        attach_type: TcAttachType,
+        tc_priority: u16,
+        legacy_v2_scan: LegacyV2ProgramScan<'_>,
+    ) -> Result<TfilterDumpState, GtpuError> {
+        const DUMP_SEQUENCE: u32 = 1;
         let socket = sys::open_route_netlink_socket()
             .map_err(|error| GtpuError::io("tc_filter_dump", error))?;
+        let local_port_id = socket.port_id();
 
         // struct tcmsg (20 bytes) + netlink header, RTM_GETTFILTER dump.
         let ifindex = i32::try_from(ifindex).map_err(|_| {
@@ -3961,21 +5014,29 @@ mod aya_runtime {
         request.extend_from_slice(&36_u32.to_ne_bytes()); // nlmsg_len
         request.extend_from_slice(&sys::RTM_GETTFILTER.to_ne_bytes());
         request.extend_from_slice(&(sys::NLM_F_REQUEST | sys::NLM_F_DUMP).to_ne_bytes());
-        request.extend_from_slice(&1_u32.to_ne_bytes()); // sequence
-        request.extend_from_slice(&0_u32.to_ne_bytes()); // port id
+        request.extend_from_slice(&DUMP_SEQUENCE.to_ne_bytes());
+        request.extend_from_slice(&local_port_id.to_ne_bytes());
         request.push(0); // tcm_family = AF_UNSPEC
         request.extend_from_slice(&[0; 3]); // padding
         request.extend_from_slice(&ifindex.to_ne_bytes());
         request.extend_from_slice(&0_u32.to_ne_bytes()); // tcm_handle: all
-        request.extend_from_slice(&clsact_parent(attach_type).to_ne_bytes());
-        request.extend_from_slice(&0_u32.to_ne_bytes()); // tcm_info: all
+        let parent = clsact_parent(attach_type);
+        request.extend_from_slice(&parent.to_ne_bytes());
+        request.extend_from_slice(&u32::from(TC_PROTOCOL_ALL).to_ne_bytes());
 
         sys::send_message(&socket, &request)
             .map_err(|error| GtpuError::io("tc_filter_dump", error))?;
 
         let mut buffer = vec![0_u8; 65536];
+        let mut state = TfilterDumpState::default();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
+            if std::time::Instant::now() >= deadline {
+                return Err(GtpuError::io(
+                    "tc_filter_dump",
+                    io::Error::new(io::ErrorKind::TimedOut, "tc dump timeout"),
+                ));
+            }
             let length = match sys::receive_message(&socket, &mut buffer) {
                 Ok(0) => continue,
                 Ok(length) => length,
@@ -3985,42 +5046,104 @@ mod aya_runtime {
                         io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
                     ) =>
                 {
-                    if std::time::Instant::now() >= deadline {
-                        return Err(GtpuError::io(
-                            "tc_filter_dump",
-                            io::Error::new(io::ErrorKind::TimedOut, "tc dump timeout"),
-                        ));
-                    }
                     std::thread::sleep(std::time::Duration::from_millis(1));
                     continue;
                 }
                 Err(error) => return Err(GtpuError::io("tc_filter_dump", error)),
             };
-            match parse_tfilter_dump(&buffer[..length], tc_priority)? {
-                DumpOutcome::Found(name) => return Ok(Some(name)),
-                DumpOutcome::Done => return Ok(None),
+            match parse_tfilter_dump(
+                &buffer[..length],
+                tc_priority,
+                TfilterDumpExpectation {
+                    sequence: DUMP_SEQUENCE,
+                    port_id: local_port_id,
+                    ifindex,
+                    parent,
+                    protocol: TC_PROTOCOL_ALL,
+                    legacy_v2_scan,
+                },
+                &mut state,
+            )? {
+                DumpOutcome::Done => return Ok(state),
                 DumpOutcome::More => {}
             }
         }
     }
 
+    fn unproven_legacy_v2_hook_occupant(
+        ifindex: u32,
+        attach_type: TcAttachType,
+        tc_priority: u16,
+    ) -> Result<Option<()>, GtpuError> {
+        let observation = filter_observation(
+            ifindex,
+            attach_type,
+            tc_priority,
+            LegacyV2ProgramScan::RequireAbsent,
+        )?;
+        Ok(observation.unexpected_legacy_v2_program_seen.then_some(()))
+    }
+
+    #[derive(Debug)]
     enum DumpOutcome {
-        Found(FilterOwner),
         Done,
         More,
     }
 
-    /// Walk one datagram of an RTM_GETTFILTER dump looking for the filter at
-    /// our handle/priority and return its `TCA_BPF_NAME` when it is a
-    /// cls_bpf filter.
-    fn parse_tfilter_dump(datagram: &[u8], tc_priority: u16) -> Result<DumpOutcome, GtpuError> {
+    #[derive(Default)]
+    struct TfilterDumpState {
+        owner: Option<FilterOwner>,
+        unexpected_legacy_v2_program_seen: bool,
+    }
+
+    #[derive(Clone, Copy)]
+    enum LegacyV2ProgramScan<'a> {
+        Disabled,
+        RequireAbsent,
+        AllowExact(&'a str),
+    }
+
+    #[derive(Clone, Copy)]
+    struct TfilterDumpExpectation<'a> {
+        sequence: u32,
+        port_id: u32,
+        ifindex: i32,
+        parent: u32,
+        protocol: u16,
+        legacy_v2_scan: LegacyV2ProgramScan<'a>,
+    }
+
+    impl TfilterDumpState {
+        fn observe_owner(&mut self, owner: FilterOwner) -> Result<(), GtpuError> {
+            if self.owner.is_some() {
+                return Err(state_indeterminate("ebpf_tc_filter_dump"));
+            }
+            self.owner = Some(owner);
+            Ok(())
+        }
+    }
+
+    /// Validate one datagram from an RTM_GETTFILTER dump and accumulate the
+    /// exact-slot owner as provisional evidence. Absence or ownership becomes
+    /// authoritative only when the caller observes [`DumpOutcome::Done`].
+    fn parse_tfilter_dump(
+        datagram: &[u8],
+        tc_priority: u16,
+        expected: TfilterDumpExpectation<'_>,
+        state: &mut TfilterDumpState,
+    ) -> Result<DumpOutcome, GtpuError> {
         const NL_HDR: usize = 16;
         const TCMSG: usize = 20;
         let malformed =
             || GtpuError::io("tc_filter_dump", invalid_data("malformed tc dump response"));
+        let incomplete = || state_indeterminate("ebpf_tc_filter_dump");
 
         let mut offset = 0;
-        while offset + NL_HDR <= datagram.len() {
+        let mut done = false;
+        while offset < datagram.len() {
+            if datagram.len() - offset < NL_HDR {
+                return Err(malformed());
+            }
             let read_u32 = |at: usize| -> Result<u32, GtpuError> {
                 datagram
                     .get(at..at + 4)
@@ -4038,34 +5161,103 @@ mod aya_runtime {
                 return Err(malformed());
             }
             let message_type = read_u16(offset + 4)?;
+            let flags = read_u16(offset + 6)?;
+            let sequence = read_u32(offset + 8)?;
+            let port_id = read_u32(offset + 12)?;
+            if sequence != expected.sequence || port_id != expected.port_id {
+                return Err(incomplete());
+            }
+            if flags & sys::NLM_F_DUMP_INTR != 0 {
+                return Err(incomplete());
+            }
+            if done && message_type != sys::NLMSG_NOOP {
+                return Err(malformed());
+            }
+            let body = &datagram[offset + NL_HDR..offset + length];
             match message_type {
-                t if t == sys::NLMSG_DONE => return Ok(DumpOutcome::Done),
-                t if t == sys::NLMSG_ERROR => return Err(malformed()),
+                t if t == sys::NLMSG_DONE => {
+                    if flags & sys::NLM_F_MULTI == 0 || body.len() != 4 {
+                        return Err(malformed());
+                    }
+                    let status = i32::from_ne_bytes([body[0], body[1], body[2], body[3]]);
+                    if status != 0 {
+                        return Err(incomplete());
+                    }
+                    done = true;
+                }
+                t if t == sys::NLMSG_ERROR => return Err(incomplete()),
+                t if t == sys::NLMSG_OVERRUN => return Err(incomplete()),
                 t if t == sys::NLMSG_NOOP => {}
-                t if t == sys::RTM_NEWTFILTER && length >= NL_HDR + TCMSG => {
+                t if t == sys::RTM_NEWTFILTER => {
+                    if done || flags & sys::NLM_F_MULTI == 0 || length < NL_HDR + TCMSG {
+                        return Err(malformed());
+                    }
                     let body = offset + NL_HDR;
+                    let family = datagram[body];
+                    let response_ifindex = i32::from_ne_bytes([
+                        datagram[body + 4],
+                        datagram[body + 5],
+                        datagram[body + 6],
+                        datagram[body + 7],
+                    ]);
                     let handle = read_u32(body + 8)?;
+                    let parent = read_u32(body + 12)?;
                     let info = read_u32(body + 16)?;
                     let priority = (info >> 16) as u16;
-                    if handle == u32::from(TC_HANDLE) && priority == tc_priority {
-                        if let Some(owner) =
-                            bpf_filter_owner(&datagram[body + TCMSG..offset + length])
-                        {
-                            return Ok(DumpOutcome::Found(owner));
+                    let protocol = info as u16;
+                    if family != 0
+                        || response_ifindex != expected.ifindex
+                        || parent != expected.parent
+                        || protocol != expected.protocol
+                    {
+                        return Err(incomplete());
+                    }
+                    let owner = bpf_filter_owner(&datagram[body + TCMSG..offset + length]);
+                    if let Some(owner) = &owner {
+                        let name = owner.name.as_bytes();
+                        let is_legacy_v2_name = [PROG_UPLINK, PROG_DOWNLINK]
+                            .into_iter()
+                            .any(|candidate| name == kernel_program_name(candidate));
+                        let allowed = match expected.legacy_v2_scan {
+                            LegacyV2ProgramScan::Disabled => true,
+                            LegacyV2ProgramScan::RequireAbsent => false,
+                            LegacyV2ProgramScan::AllowExact(expected_name) => {
+                                handle == u32::from(TC_HANDLE)
+                                    && priority == tc_priority
+                                    && name == kernel_program_name(expected_name)
+                            }
+                        };
+                        if is_legacy_v2_name && !allowed {
+                            state.unexpected_legacy_v2_program_seen = true;
                         }
-                        // Occupied by a non-BPF filter: report a foreign
-                        // owner so callers refuse to touch the slot.
-                        return Ok(DumpOutcome::Found(FilterOwner {
-                            name: String::from("<non-bpf-filter>"),
-                            program_id: None,
-                        }));
+                    }
+                    if handle == u32::from(TC_HANDLE) && priority == tc_priority {
+                        if let Some(owner) = owner {
+                            state.observe_owner(owner)?;
+                        } else {
+                            // Occupied by a non-BPF filter: report a foreign
+                            // owner so callers refuse to touch the slot.
+                            state.observe_owner(FilterOwner {
+                                name: String::from("<non-bpf-filter>"),
+                                program_id: None,
+                            })?;
+                        }
                     }
                 }
-                _ => {}
+                _ => return Err(malformed()),
             }
-            offset += sys::align_to_netlink(length).ok_or_else(malformed)?;
+            let aligned = sys::align_to_netlink(length).ok_or_else(malformed)?;
+            let aligned_end = offset.checked_add(aligned).ok_or_else(malformed)?;
+            if aligned_end > datagram.len() {
+                return Err(malformed());
+            }
+            offset = aligned_end;
         }
-        Ok(DumpOutcome::More)
+        Ok(if done {
+            DumpOutcome::Done
+        } else {
+            DumpOutcome::More
+        })
     }
 
     /// Extract the BPF name and kernel program ID from a filter message.
@@ -4388,6 +5580,521 @@ mod aya_runtime {
                 },
             );
             Ok(local_ip)
+        }
+
+        fn teardown_drained_v2(
+            &self,
+            interface: &str,
+            ifindex: u32,
+            pin_dir: &Path,
+            tc_priority: u16,
+        ) -> Result<DrainedV2TeardownOutcome, GtpuError> {
+            let parent = pin_dir.parent().ok_or_else(|| {
+                GtpuError::invalid_config("ebpf.bpffs_pin_root", "pin directory must have a parent")
+            })?;
+            fs::create_dir_all(parent)
+                .map_err(|error| GtpuError::io("ebpf_pin_root_create", error))?;
+            let canonical_parent = fs::canonicalize(parent)
+                .map_err(|error| GtpuError::io("ebpf_pin_root_canonicalize", error))?;
+            let name = pin_dir.file_name().ok_or_else(|| {
+                GtpuError::invalid_config(
+                    "device.name",
+                    "interface pin directory must have a final component",
+                )
+            })?;
+            let canonical_pin_dir = canonical_parent.join(name);
+            let _reconciler_ownership =
+                Self::acquire_reconciler_ownership(&canonical_pin_dir, ifindex)?;
+
+            match fs::symlink_metadata(&canonical_pin_dir) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    return match classify_unproven_hook_absence(
+                        unproven_legacy_v2_hook_occupant(
+                            ifindex,
+                            TcAttachType::Egress,
+                            tc_priority,
+                        ),
+                        unproven_legacy_v2_hook_occupant(
+                            ifindex,
+                            TcAttachType::Ingress,
+                            tc_priority,
+                        ),
+                    ) {
+                        UnprovenHookAbsence::Absent => Ok(DrainedV2TeardownOutcome::AlreadyAbsent),
+                        UnprovenHookAbsence::Occupied => Ok(DrainedV2TeardownOutcome::Refused(
+                            DrainedV2TeardownRefusal::IdentityMismatch,
+                        )),
+                        UnprovenHookAbsence::Indeterminate => {
+                            Ok(DrainedV2TeardownOutcome::Refused(
+                                DrainedV2TeardownRefusal::IndeterminateState,
+                            ))
+                        }
+                    };
+                }
+                Err(_) => {
+                    return Ok(DrainedV2TeardownOutcome::Refused(
+                        DrainedV2TeardownRefusal::IndeterminateState,
+                    ));
+                }
+                Ok(metadata)
+                    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() =>
+                {
+                    return Ok(DrainedV2TeardownOutcome::Refused(
+                        DrainedV2TeardownRefusal::IdentityMismatch,
+                    ));
+                }
+                Ok(_) => {}
+            }
+
+            let entries = match Self::legacy_v2_directory_entries(&canonical_pin_dir) {
+                Ok(entries) => entries,
+                Err(_) => {
+                    return Ok(DrainedV2TeardownOutcome::Refused(
+                        DrainedV2TeardownRefusal::IndeterminateState,
+                    ));
+                }
+            };
+            let allowed = LEGACY_V2_MAP_NAMES
+                .into_iter()
+                .chain([LEGACY_V2_TEARDOWN_PROOF_MAP])
+                .collect::<HashSet<_>>();
+            if entries
+                .iter()
+                .any(|entry| !allowed.contains(entry.as_str()))
+            {
+                return Ok(DrainedV2TeardownOutcome::Refused(
+                    DrainedV2TeardownRefusal::IdentityMismatch,
+                ));
+            }
+
+            let existing_proof = match Self::read_legacy_v2_teardown_proof(&canonical_pin_dir) {
+                Ok(proof) => proof,
+                Err(_) => {
+                    return Ok(DrainedV2TeardownOutcome::Refused(
+                        DrainedV2TeardownRefusal::IndeterminateState,
+                    ));
+                }
+            };
+            if entries.is_empty() && existing_proof.is_none() {
+                match classify_unproven_hook_absence(
+                    unproven_legacy_v2_hook_occupant(ifindex, TcAttachType::Egress, tc_priority),
+                    unproven_legacy_v2_hook_occupant(ifindex, TcAttachType::Ingress, tc_priority),
+                ) {
+                    UnprovenHookAbsence::Absent => {}
+                    UnprovenHookAbsence::Occupied => {
+                        return Ok(DrainedV2TeardownOutcome::Refused(
+                            DrainedV2TeardownRefusal::IdentityMismatch,
+                        ));
+                    }
+                    UnprovenHookAbsence::Indeterminate => {
+                        return Ok(DrainedV2TeardownOutcome::Refused(
+                            DrainedV2TeardownRefusal::IndeterminateState,
+                        ));
+                    }
+                }
+                // With no proof, pins, or SDK-named program on either hook,
+                // the directory is only cosmetic. An unlink failure cannot
+                // turn authoritative datapath absence into retryable state.
+                let _ = fs::remove_dir(&canonical_pin_dir);
+                return Ok(DrainedV2TeardownOutcome::AlreadyAbsent);
+            }
+
+            let proof = if let Some(proof) = existing_proof {
+                if proof.record.ifindex != ifindex || proof.record.tc_priority != tc_priority {
+                    return Ok(DrainedV2TeardownOutcome::Refused(
+                        DrainedV2TeardownRefusal::IdentityMismatch,
+                    ));
+                }
+                proof
+            } else {
+                if entries.len() != LEGACY_V2_MAP_NAMES.len()
+                    || LEGACY_V2_MAP_NAMES
+                        .iter()
+                        .any(|name| !entries.contains(*name))
+                {
+                    return Ok(DrainedV2TeardownOutcome::Refused(
+                        DrainedV2TeardownRefusal::NotLegacyV2,
+                    ));
+                }
+                let identity = match Self::legacy_v2_datapath_identity(&canonical_pin_dir) {
+                    Ok(identity) => identity,
+                    Err(LegacyV2IdentityError::Mismatch) => {
+                        return Ok(DrainedV2TeardownOutcome::Refused(
+                            DrainedV2TeardownRefusal::IdentityMismatch,
+                        ));
+                    }
+                    Err(LegacyV2IdentityError::Indeterminate) => {
+                        return Ok(DrainedV2TeardownOutcome::Refused(
+                            DrainedV2TeardownRefusal::IndeterminateState,
+                        ));
+                    }
+                };
+                let uplink_observation = filter_observation(
+                    ifindex,
+                    TcAttachType::Egress,
+                    tc_priority,
+                    LegacyV2ProgramScan::AllowExact(PROG_UPLINK),
+                );
+                let downlink_observation = filter_observation(
+                    ifindex,
+                    TcAttachType::Ingress,
+                    tc_priority,
+                    LegacyV2ProgramScan::AllowExact(PROG_DOWNLINK),
+                );
+                let (uplink_program, downlink_program) =
+                    match (uplink_observation, downlink_observation) {
+                        (Ok(uplink), Ok(downlink))
+                            if !uplink.unexpected_legacy_v2_program_seen
+                                && !downlink.unexpected_legacy_v2_program_seen =>
+                        {
+                            let owner_identity = |owner: Option<FilterOwner>,
+                                                  name: &str,
+                                                  artifact: &LegacyV2ProgramIdentity|
+                             -> Result<(u32, u64), LegacyV2IdentityError> {
+                                match owner {
+                                    None => Err(LegacyV2IdentityError::Mismatch),
+                                    Some(owner) => match legacy_v2_artifact_owner_tag(
+                                        &owner,
+                                        name,
+                                        artifact.tags,
+                                        &artifact.map_ids,
+                                    ) {
+                                        Ok(Some(identity)) => Ok(identity),
+                                        Ok(None) => Err(LegacyV2IdentityError::Mismatch),
+                                        Err(_) => Err(LegacyV2IdentityError::Indeterminate),
+                                    },
+                                }
+                            };
+                            match (
+                                owner_identity(uplink.owner, PROG_UPLINK, &identity.uplink),
+                                owner_identity(downlink.owner, PROG_DOWNLINK, &identity.downlink),
+                            ) {
+                                (Ok(uplink), Ok(downlink)) => (uplink, downlink),
+                                (Err(LegacyV2IdentityError::Mismatch), _)
+                                | (_, Err(LegacyV2IdentityError::Mismatch)) => {
+                                    return Ok(DrainedV2TeardownOutcome::Refused(
+                                        DrainedV2TeardownRefusal::IdentityMismatch,
+                                    ));
+                                }
+                                _ => {
+                                    return Ok(DrainedV2TeardownOutcome::Refused(
+                                        DrainedV2TeardownRefusal::IndeterminateState,
+                                    ));
+                                }
+                            }
+                        }
+                        (Ok(_), Ok(_)) => {
+                            return Ok(DrainedV2TeardownOutcome::Refused(
+                                DrainedV2TeardownRefusal::IdentityMismatch,
+                            ));
+                        }
+                        _ => {
+                            return Ok(DrainedV2TeardownOutcome::Refused(
+                                DrainedV2TeardownRefusal::IndeterminateState,
+                            ));
+                        }
+                    };
+                match Self::legacy_v2_surviving_maps_are_drained(&canonical_pin_dir) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return Ok(DrainedV2TeardownOutcome::Refused(
+                            DrainedV2TeardownRefusal::PopulatedState,
+                        ));
+                    }
+                    Err(LegacyV2IdentityError::Mismatch) => {
+                        return Ok(DrainedV2TeardownOutcome::Refused(
+                            DrainedV2TeardownRefusal::IdentityMismatch,
+                        ));
+                    }
+                    Err(LegacyV2IdentityError::Indeterminate) => {
+                        return Ok(DrainedV2TeardownOutcome::Refused(
+                            DrainedV2TeardownRefusal::IndeterminateState,
+                        ));
+                    }
+                }
+                let record = LegacyV2TeardownRecord::from_identity(
+                    ifindex,
+                    tc_priority,
+                    &identity,
+                    uplink_program,
+                    downlink_program,
+                );
+                match Self::commit_legacy_v2_teardown_proof(&canonical_pin_dir, record) {
+                    Ok(proof) => proof,
+                    Err(LegacyV2ProofCommitError::BeforePublication) => {
+                        return Ok(DrainedV2TeardownOutcome::Refused(
+                            DrainedV2TeardownRefusal::IndeterminateState,
+                        ));
+                    }
+                    Err(LegacyV2ProofCommitError::PublicationIndeterminate) => {
+                        return Ok(DrainedV2TeardownOutcome::Partial(
+                            DrainedV2TeardownProgress::Indeterminate,
+                        ));
+                    }
+                }
+            };
+
+            let recorded_hook_states =
+                || -> Result<(LegacyV2HookState, LegacyV2HookState), GtpuError> {
+                    let uplink = filter_observation(
+                        ifindex,
+                        TcAttachType::Egress,
+                        tc_priority,
+                        LegacyV2ProgramScan::AllowExact(PROG_UPLINK),
+                    )?;
+                    let downlink = filter_observation(
+                        ifindex,
+                        TcAttachType::Ingress,
+                        tc_priority,
+                        LegacyV2ProgramScan::AllowExact(PROG_DOWNLINK),
+                    )?;
+                    if uplink.unexpected_legacy_v2_program_seen
+                        || downlink.unexpected_legacy_v2_program_seen
+                    {
+                        return Err(GtpuError::AlreadyExists);
+                    }
+                    let state = |owner: Option<FilterOwner>,
+                                 name: &str,
+                                 program_id: u32,
+                                 tag: u64,
+                                 map_ids: &[u32]|
+                     -> Result<LegacyV2HookState, GtpuError> {
+                        match owner {
+                            None => Ok(LegacyV2HookState::Absent),
+                            Some(owner)
+                                if owner_matches_legacy_v2_record(
+                                    &owner, name, program_id, tag, map_ids,
+                                )? =>
+                            {
+                                Ok(LegacyV2HookState::Exact)
+                            }
+                            Some(_) => Err(GtpuError::AlreadyExists),
+                        }
+                    };
+                    Ok((
+                        state(
+                            uplink.owner,
+                            PROG_UPLINK,
+                            proof.record.uplink_program_id,
+                            proof.record.uplink_program_tag,
+                            &proof.record.uplink_map_ids(),
+                        )?,
+                        state(
+                            downlink.owner,
+                            PROG_DOWNLINK,
+                            proof.record.downlink_program_id,
+                            proof.record.downlink_program_tag,
+                            &proof.record.downlink_map_ids(),
+                        )?,
+                    ))
+                };
+
+            let (mut uplink, mut downlink) = match recorded_hook_states() {
+                Ok(states) => states,
+                Err(_) => {
+                    return Ok(DrainedV2TeardownOutcome::Partial(
+                        DrainedV2TeardownProgress::Indeterminate,
+                    ));
+                }
+            };
+
+            let present_pin_count =
+                match Self::legacy_v2_recorded_pin_count(&canonical_pin_dir, proof.record) {
+                    Ok(count) => count,
+                    Err(_) => {
+                        return Ok(DrainedV2TeardownOutcome::Partial(
+                            DrainedV2TeardownProgress::Indeterminate,
+                        ));
+                    }
+                };
+            match Self::legacy_v2_surviving_maps_are_drained(&canonical_pin_dir) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Ok(DrainedV2TeardownOutcome::Partial(
+                        DrainedV2TeardownProgress::PopulatedStateObserved,
+                    ));
+                }
+                Err(LegacyV2IdentityError::Mismatch | LegacyV2IdentityError::Indeterminate) => {
+                    return Ok(DrainedV2TeardownOutcome::Partial(
+                        DrainedV2TeardownProgress::Indeterminate,
+                    ));
+                }
+            }
+            if present_pin_count != LEGACY_V2_MAP_NAMES.len()
+                && (uplink != LegacyV2HookState::Absent || downlink != LegacyV2HookState::Absent)
+            {
+                // Pin cleanup is legal only after both recorded hooks are
+                // absent. A missing pin while either program can still run is
+                // an indeterminate partial graph and is never detached.
+                return Ok(DrainedV2TeardownOutcome::Partial(
+                    DrainedV2TeardownProgress::Indeterminate,
+                ));
+            }
+
+            let detach = |attach_type: TcAttachType| {
+                SchedClassifierLink::attached(interface, attach_type, tc_priority, TC_HANDLE, None)
+                    .map_err(|error| GtpuError::io("ebpf_legacy_v2_tc_detach", error))?
+                    .detach()
+                    .map_err(|error| program_error("ebpf_legacy_v2_tc_detach", &error))
+            };
+            if uplink == LegacyV2HookState::Exact {
+                let detached = detach(TcAttachType::Egress);
+                (uplink, downlink) = match recorded_hook_states() {
+                    Ok(states) => states,
+                    Err(_) => {
+                        return Ok(DrainedV2TeardownOutcome::Partial(
+                            DrainedV2TeardownProgress::Indeterminate,
+                        ));
+                    }
+                };
+                if detached.is_err() && uplink == LegacyV2HookState::Exact {
+                    return Ok(DrainedV2TeardownOutcome::Partial(
+                        if downlink == LegacyV2HookState::Absent {
+                            DrainedV2TeardownProgress::OneHookDetached
+                        } else {
+                            DrainedV2TeardownProgress::ProofCommitted
+                        },
+                    ));
+                }
+                if uplink != LegacyV2HookState::Absent {
+                    return Ok(DrainedV2TeardownOutcome::Partial(
+                        DrainedV2TeardownProgress::Indeterminate,
+                    ));
+                }
+            }
+            if downlink == LegacyV2HookState::Exact {
+                let detached = detach(TcAttachType::Ingress);
+                (uplink, downlink) = match recorded_hook_states() {
+                    Ok(states) => states,
+                    Err(_) => {
+                        return Ok(DrainedV2TeardownOutcome::Partial(
+                            DrainedV2TeardownProgress::Indeterminate,
+                        ));
+                    }
+                };
+                if detached.is_err() && downlink == LegacyV2HookState::Exact {
+                    return Ok(DrainedV2TeardownOutcome::Partial(
+                        DrainedV2TeardownProgress::OneHookDetached,
+                    ));
+                }
+                if downlink != LegacyV2HookState::Absent {
+                    return Ok(DrainedV2TeardownOutcome::Partial(
+                        DrainedV2TeardownProgress::Indeterminate,
+                    ));
+                }
+            }
+            if uplink != LegacyV2HookState::Absent || downlink != LegacyV2HookState::Absent {
+                return Ok(DrainedV2TeardownOutcome::Partial(
+                    DrainedV2TeardownProgress::Indeterminate,
+                ));
+            }
+
+            let mut removed_pin = present_pin_count < LEGACY_V2_MAP_NAMES.len();
+            for (index, name) in LEGACY_V2_MAP_NAMES.iter().enumerate() {
+                match Self::legacy_v2_surviving_maps_are_drained(&canonical_pin_dir) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return Ok(DrainedV2TeardownOutcome::Partial(
+                            DrainedV2TeardownProgress::PopulatedStateObserved,
+                        ));
+                    }
+                    Err(LegacyV2IdentityError::Mismatch | LegacyV2IdentityError::Indeterminate) => {
+                        return Ok(DrainedV2TeardownOutcome::Partial(
+                            DrainedV2TeardownProgress::Indeterminate,
+                        ));
+                    }
+                }
+                if !matches!(
+                    recorded_hook_states(),
+                    Ok((LegacyV2HookState::Absent, LegacyV2HookState::Absent))
+                ) {
+                    return Ok(DrainedV2TeardownOutcome::Partial(
+                        DrainedV2TeardownProgress::Indeterminate,
+                    ));
+                }
+                let path = canonical_pin_dir.join(name);
+                match legacy_v2_path_is_present(&path, "ebpf_legacy_v2_pin_identity") {
+                    Ok(false) => continue,
+                    Ok(true) => {}
+                    Err(_) => {
+                        return Ok(DrainedV2TeardownOutcome::Partial(
+                            DrainedV2TeardownProgress::Indeterminate,
+                        ));
+                    }
+                }
+                let current_id = match MapInfo::from_pin(&path) {
+                    Ok(info) => info.id(),
+                    Err(_) => {
+                        return Ok(DrainedV2TeardownOutcome::Partial(
+                            DrainedV2TeardownProgress::Indeterminate,
+                        ));
+                    }
+                };
+                if current_id != proof.record.map_ids[index] {
+                    return Ok(DrainedV2TeardownOutcome::Partial(
+                        DrainedV2TeardownProgress::Indeterminate,
+                    ));
+                }
+                if fs::remove_file(&path).is_err() {
+                    match legacy_v2_path_is_present(&path, "ebpf_legacy_v2_pin_identity") {
+                        Ok(false) => {}
+                        Ok(true) | Err(_) => {
+                            return Ok(DrainedV2TeardownOutcome::Partial(if removed_pin {
+                                DrainedV2TeardownProgress::PinCleanupStarted
+                            } else {
+                                DrainedV2TeardownProgress::HooksDetached
+                            }));
+                        }
+                    }
+                }
+                removed_pin = true;
+            }
+
+            let proof_path = canonical_pin_dir.join(LEGACY_V2_TEARDOWN_PROOF_MAP);
+            let proof_only = match Self::legacy_v2_directory_entries(&canonical_pin_dir) {
+                Ok(entries) => entries.len() == 1 && entries.contains(LEGACY_V2_TEARDOWN_PROOF_MAP),
+                Err(_) => false,
+            };
+            if !proof_only {
+                return Ok(DrainedV2TeardownOutcome::Partial(
+                    DrainedV2TeardownProgress::Indeterminate,
+                ));
+            }
+            let current_proof = match Self::read_legacy_v2_teardown_proof(&canonical_pin_dir) {
+                Ok(Some(current)) if current == proof => current,
+                _ => {
+                    return Ok(DrainedV2TeardownOutcome::Partial(
+                        DrainedV2TeardownProgress::Indeterminate,
+                    ));
+                }
+            };
+            if current_proof.map_id != proof.map_id {
+                return Ok(DrainedV2TeardownOutcome::Partial(
+                    DrainedV2TeardownProgress::Indeterminate,
+                ));
+            }
+            if fs::remove_file(&proof_path).is_err() {
+                match legacy_v2_path_is_present(&proof_path, "ebpf_legacy_v2_proof_remove") {
+                    Ok(false) => {}
+                    Ok(true) | Err(_) => {
+                        return Ok(DrainedV2TeardownOutcome::Partial(
+                            DrainedV2TeardownProgress::PinCleanupStarted,
+                        ));
+                    }
+                }
+            }
+            match fs::remove_dir(&canonical_pin_dir) {
+                Ok(()) => Ok(DrainedV2TeardownOutcome::Removed),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    Ok(DrainedV2TeardownOutcome::Removed)
+                }
+                // Both hooks, all recorded map pins, and the exact proof pin
+                // have been authoritatively observed absent. The directory is
+                // now cosmetic; reporting Partial here would discard the only
+                // durable v3 fence and let a retry misclassify the empty
+                // directory as an unproven fresh state.
+                Err(_) => Ok(DrainedV2TeardownOutcome::Removed),
+            }
         }
 
         fn detach(
@@ -5221,6 +6928,384 @@ mod aya_runtime {
     mod race_tests {
         use super::*;
 
+        fn instruction(code: u8, dst: u8, src: u8, off: i16, imm: i32) -> bpf_insn {
+            bpf_insn {
+                code,
+                _bitfield_align_1: [],
+                _bitfield_1: bpf_insn::new_bitfield_1(dst, src),
+                off,
+                imm,
+            }
+        }
+
+        #[test]
+        fn legacy_v2_program_tag_hashes_match_kernel_known_answers() {
+            // Standard SHA-1/SHA-256 "abc" vectors, truncated to the same
+            // first eight bytes exposed by BPF_OBJ_GET_INFO_BY_FD.
+            assert_eq!(
+                legacy_v2_tags_from_normalized(b"abc"),
+                LegacyV2ProgramTags {
+                    sha1: 0xa999_3e36_4706_816a,
+                    sha256: 0xba78_16bf_8f01_cfea,
+                }
+            );
+        }
+
+        #[test]
+        fn legacy_v2_program_tag_normalization_zeros_both_map_load_immediates() {
+            let instructions = [
+                instruction(0xb7, 1, 0, -2, 0x0102_0304),
+                instruction(
+                    (BPF_LD | BPF_IMM | BPF_DW) as u8,
+                    2,
+                    BPF_PSEUDO_MAP_FD as u8,
+                    0,
+                    0x1122_3344,
+                ),
+                instruction(0, 0, 0, 0, 0x5566_7788),
+                instruction(0x95, 0, 0, 0, 0),
+            ];
+            let normalized = legacy_v2_normalized_program_bytes(&instructions);
+            assert_eq!(normalized.len(), instructions.len() * 8);
+            assert_eq!(&normalized[4..8], &0x0102_0304_i32.to_ne_bytes());
+            assert_eq!(&normalized[12..16], &[0; 4]);
+            assert_eq!(&normalized[20..24], &[0; 4]);
+            assert_eq!(&normalized[28..32], &[0; 4]);
+        }
+
+        #[test]
+        fn legacy_v2_frozen_artifact_exposes_only_derived_tags() {
+            let (uplink, downlink) = AyaGtpuRuntime::legacy_v2_artifact_tags()
+                .expect("the committed artifact must parse");
+            assert_ne!(uplink.sha1, 0);
+            assert_ne!(uplink.sha256, 0);
+            assert_ne!(downlink.sha1, 0);
+            assert_ne!(downlink.sha256, 0);
+        }
+
+        #[test]
+        fn unproven_hook_observation_errors_are_indeterminate() {
+            assert_eq!(
+                classify_unproven_hook_absence::<(), ()>(Ok(None), Ok(None)),
+                UnprovenHookAbsence::Absent
+            );
+            assert_eq!(
+                classify_unproven_hook_absence::<(), ()>(Ok(Some(())), Ok(None)),
+                UnprovenHookAbsence::Occupied
+            );
+            assert_eq!(
+                classify_unproven_hook_absence::<(), ()>(Err(()), Ok(None)),
+                UnprovenHookAbsence::Indeterminate
+            );
+            assert_eq!(
+                classify_unproven_hook_absence::<(), ()>(Ok(None), Err(())),
+                UnprovenHookAbsence::Indeterminate
+            );
+            assert_eq!(
+                classify_unproven_hook_absence::<(), ()>(Err(()), Err(())),
+                UnprovenHookAbsence::Indeterminate
+            );
+            assert_eq!(
+                classify_unproven_hook_absence::<(), ()>(Err(()), Ok(Some(()))),
+                UnprovenHookAbsence::Indeterminate
+            );
+        }
+
+        #[test]
+        fn metadata_errors_are_not_absence() {
+            assert!(classify_path_metadata(Ok(()), "test_path").unwrap());
+            assert!(!classify_path_metadata::<()>(
+                Err(io::Error::from(io::ErrorKind::NotFound)),
+                "test_path",
+            )
+            .unwrap());
+            assert!(classify_path_metadata::<()>(
+                Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+                "test_path",
+            )
+            .is_err());
+        }
+
+        #[test]
+        fn corrupt_v2_marker_dominates_forwarding_population() {
+            let mut exact = LegacyV2FarObservation::default();
+            exact.observe(
+                UPLINK_DSCP_SCHEMA_MARKER_KEY,
+                UPLINK_BEARER_SCHEMA_MARKER_VALUE,
+            );
+            assert_eq!(exact.finish(), Ok(true));
+
+            let data_key = [10, 45, 0, 2];
+            assert_ne!(data_key, UPLINK_DSCP_SCHEMA_MARKER_KEY);
+            let mut populated = LegacyV2FarObservation::default();
+            populated.observe(data_key, [7; UPLINK_FAR_VALUE_LEN]);
+            populated.observe(
+                UPLINK_DSCP_SCHEMA_MARKER_KEY,
+                UPLINK_BEARER_SCHEMA_MARKER_VALUE,
+            );
+            assert_eq!(populated.finish(), Ok(false));
+
+            let mut wrong_identity = LegacyV2FarObservation::default();
+            wrong_identity.observe(data_key, [7; UPLINK_FAR_VALUE_LEN]);
+            wrong_identity.observe(
+                UPLINK_DSCP_SCHEMA_MARKER_KEY,
+                UPLINK_ENDPOINT_SCHEMA_MARKER_VALUE,
+            );
+            assert_eq!(
+                wrong_identity.finish(),
+                Err(LegacyV2IdentityError::Mismatch)
+            );
+            assert_eq!(
+                LegacyV2FarObservation::default().finish(),
+                Err(LegacyV2IdentityError::Indeterminate)
+            );
+
+            assert_eq!(validate_legacy_v2_config_identity([192, 0, 2, 1]), Ok(()));
+            assert_eq!(
+                validate_legacy_v2_config_identity([0; 4]),
+                Err(LegacyV2IdentityError::Mismatch)
+            );
+        }
+
+        #[test]
+        fn dangling_inner_map_and_proof_paths_are_not_absence() {
+            use std::os::unix::fs::symlink;
+
+            let pin_dir = std::env::temp_dir()
+                .join(format!("opc-gtpu-v2-dangling-pins-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&pin_dir);
+            fs::create_dir_all(&pin_dir).expect("create dangling-pin directory");
+
+            let missing = pin_dir.join("missing-target");
+            let map_path = pin_dir.join(MAP_UPLINK_FAR);
+            symlink(&missing, &map_path).expect("create dangling inner-map symlink");
+            assert!(legacy_v2_path_is_present(&map_path, "test_path").unwrap());
+            let record = LegacyV2TeardownRecord {
+                ifindex: 7,
+                tc_priority: 50,
+                uplink_program_id: 1,
+                downlink_program_id: 2,
+                uplink_program_tag: 3,
+                downlink_program_tag: 4,
+                map_ids: [5; LEGACY_V2_MAP_NAMES.len()],
+                proof_map_id: 6,
+            };
+            assert!(AyaGtpuRuntime::legacy_v2_recorded_pin_count(&pin_dir, record).is_err());
+            fs::remove_file(&map_path).expect("remove dangling inner-map symlink");
+
+            let proof_path = pin_dir.join(LEGACY_V2_TEARDOWN_PROOF_MAP);
+            symlink(&missing, &proof_path).expect("create dangling proof symlink");
+            assert!(legacy_v2_path_is_present(&proof_path, "test_path").unwrap());
+            assert!(AyaGtpuRuntime::read_legacy_v2_teardown_proof(&pin_dir).is_err());
+
+            fs::remove_dir_all(&pin_dir).expect("remove dangling-pin directory");
+        }
+
+        #[test]
+        fn pending_v2_teardown_proof_fences_normal_schema_preflight() {
+            let pin_dir = std::env::temp_dir().join(format!(
+                "opc-gtpu-v2-proof-preflight-{}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&pin_dir);
+            fs::create_dir_all(&pin_dir).expect("create proof-only pin directory");
+            fs::write(pin_dir.join(LEGACY_V2_TEARDOWN_PROOF_MAP), b"proof")
+                .expect("create pending proof marker");
+
+            assert!(matches!(
+                AyaGtpuRuntime::bearer_schema_preflight(&pin_dir),
+                Err(GtpuError::StateIndeterminate {
+                    operation: "ebpf_legacy_v2_teardown_pending"
+                })
+            ));
+            fs::remove_dir_all(&pin_dir).expect("remove proof-only pin directory");
+        }
+
+        #[test]
+        fn non_directory_and_symlink_pin_names_are_never_absence() {
+            let root = std::env::temp_dir()
+                .join(format!("opc-gtpu-v2-path-identity-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&root);
+            fs::create_dir_all(&root).expect("create path identity root");
+            let pin_dir = root.join("s2bu");
+            fs::write(&pin_dir, b"foreign").expect("create foreign non-directory occupant");
+
+            let runtime = AyaGtpuRuntime::new();
+            assert_eq!(
+                runtime
+                    .teardown_drained_v2("s2bu", 7, &pin_dir, 50)
+                    .expect("classify non-directory occupant"),
+                DrainedV2TeardownOutcome::Refused(DrainedV2TeardownRefusal::IdentityMismatch)
+            );
+            assert_eq!(
+                fs::read(&pin_dir).expect("foreign occupant must survive"),
+                b"foreign"
+            );
+
+            fs::remove_file(&pin_dir).expect("remove foreign file");
+            let target = root.join("target");
+            fs::create_dir(&target).expect("create symlink target");
+            std::os::unix::fs::symlink(&target, &pin_dir).expect("create foreign symlink");
+            assert_eq!(
+                runtime
+                    .teardown_drained_v2("s2bu", 7, &pin_dir, 50)
+                    .expect("classify symlink occupant"),
+                DrainedV2TeardownOutcome::Refused(DrainedV2TeardownRefusal::IdentityMismatch)
+            );
+            assert!(pin_dir.symlink_metadata().is_ok());
+            assert!(target.is_dir());
+            fs::remove_file(&pin_dir).expect("remove foreign symlink");
+            fs::remove_dir_all(&root).expect("remove path identity root");
+        }
+
+        #[test]
+        #[ignore = "requires CAP_BPF and writable bpffs"]
+        fn program_tag_candidates_match_the_running_kernel() {
+            if std::env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref() != Ok("1") {
+                return;
+            }
+            let pin_dir = std::path::PathBuf::from(format!(
+                "/sys/fs/bpf/opc-gtpu-tag-proof-{}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&pin_dir).expect("create live tag proof pin directory");
+            let object = AyaObject::parse(DATAPATH_OBJECT).expect("parse current datapath object");
+            let (uplink_tags, downlink_tags) = AyaGtpuRuntime::object_program_tags(object)
+                .expect("derive current object tag candidates");
+            let mut ebpf = EbpfLoader::new()
+                .default_map_pin_directory(&pin_dir)
+                .load(DATAPATH_OBJECT)
+                .expect("load current datapath object for live tag proof");
+            for (name, expected) in [(PROG_UPLINK, uplink_tags), (PROG_DOWNLINK, downlink_tags)] {
+                let program: &mut SchedClassifier = ebpf
+                    .program_mut(name)
+                    .expect("current tc program")
+                    .try_into()
+                    .expect("current program is a tc classifier");
+                program.load().expect("load current tc program");
+                let live_tag = program.info().expect("read live program info").tag();
+                assert!(
+                    expected.contains(live_tag),
+                    "running-kernel tag must be one exact normalized candidate"
+                );
+            }
+            drop(ebpf);
+            fs::remove_dir_all(&pin_dir).expect("remove live tag proof pins");
+        }
+
+        #[test]
+        fn legacy_v2_teardown_record_rejects_tamper_and_inconsistent_hook_identity() {
+            let identity = LegacyV2DatapathIdentity {
+                uplink: LegacyV2ProgramIdentity {
+                    tags: LegacyV2ProgramTags { sha1: 1, sha256: 2 },
+                    map_ids: vec![1, 2, 3, 4, 7, 8, 9],
+                },
+                downlink: LegacyV2ProgramIdentity {
+                    tags: LegacyV2ProgramTags { sha1: 3, sha256: 4 },
+                    map_ids: vec![5, 6, 7, 8],
+                },
+                map_ids: [1, 2, 3, 4, 5, 6, 7, 8, 9],
+            };
+            let unbound =
+                LegacyV2TeardownRecord::from_identity(7, 50, &identity, (101, 1), (102, 3));
+            assert_eq!(LegacyV2TeardownRecord::decode(&unbound.encode()), None);
+            let record = unbound.bind_to_proof_map(301).unwrap();
+            let encoded = record.encode();
+            assert_eq!(LegacyV2TeardownRecord::decode(&encoded), Some(record));
+
+            let mut tampered = encoded;
+            tampered[40] ^= 1;
+            assert_eq!(LegacyV2TeardownRecord::decode(&tampered), None);
+
+            let mut inconsistent = record;
+            inconsistent.uplink_program_tag = 0;
+            assert_eq!(LegacyV2TeardownRecord::decode(&inconsistent.encode()), None);
+
+            let mut absent_hook = record;
+            absent_hook.downlink_program_id = 0;
+            absent_hook.downlink_program_tag = 0;
+            assert_eq!(LegacyV2TeardownRecord::decode(&absent_hook.encode()), None);
+
+            assert!(legacy_v2_proof_map_abi_is_exact(
+                bpf_map_type::BPF_MAP_TYPE_ARRAY as u32,
+                4,
+                LEGACY_V2_TEARDOWN_PROOF_LEN as u32,
+                1,
+                0,
+            ));
+            for abi in [
+                (
+                    bpf_map_type::BPF_MAP_TYPE_HASH as u32,
+                    4,
+                    LEGACY_V2_TEARDOWN_PROOF_LEN as u32,
+                    1,
+                    0,
+                ),
+                (
+                    bpf_map_type::BPF_MAP_TYPE_ARRAY as u32,
+                    8,
+                    LEGACY_V2_TEARDOWN_PROOF_LEN as u32,
+                    1,
+                    0,
+                ),
+                (
+                    bpf_map_type::BPF_MAP_TYPE_ARRAY as u32,
+                    4,
+                    LEGACY_V2_TEARDOWN_PROOF_LEN as u32 + 1,
+                    1,
+                    0,
+                ),
+                (
+                    bpf_map_type::BPF_MAP_TYPE_ARRAY as u32,
+                    4,
+                    LEGACY_V2_TEARDOWN_PROOF_LEN as u32,
+                    2,
+                    0,
+                ),
+                (
+                    bpf_map_type::BPF_MAP_TYPE_ARRAY as u32,
+                    4,
+                    LEGACY_V2_TEARDOWN_PROOF_LEN as u32,
+                    1,
+                    1,
+                ),
+            ] {
+                assert!(!legacy_v2_proof_map_abi_is_exact(
+                    abi.0, abi.1, abi.2, abi.3, abi.4,
+                ));
+            }
+            assert!(legacy_v2_proof_record_is_authoritative(
+                record,
+                301,
+                identity.uplink.tags,
+                identity.downlink.tags,
+            ));
+            assert!(!legacy_v2_proof_record_is_authoritative(
+                record,
+                302,
+                identity.uplink.tags,
+                identity.downlink.tags,
+            ));
+            assert!(!legacy_v2_proof_record_is_authoritative(
+                record,
+                301,
+                LegacyV2ProgramTags {
+                    sha1: 999,
+                    sha256: 1_000,
+                },
+                identity.downlink.tags,
+            ));
+            assert!(!legacy_v2_proof_record_is_authoritative(
+                record,
+                301,
+                identity.uplink.tags,
+                LegacyV2ProgramTags {
+                    sha1: 999,
+                    sha256: 1_000,
+                },
+            ));
+        }
+
         #[test]
         fn map_delete_treats_aya_enoent_as_an_idempotent_absence() {
             assert!(!map_delete_result("delete", Err(MapError::KeyNotFound)).unwrap());
@@ -5472,28 +7557,484 @@ mod aya_runtime {
             assert!(!pin_cleanup_preflight_matches(None, None, false));
         }
 
+        const TEST_DUMP_SEQUENCE: u32 = 37;
+        const TEST_DUMP_PORT_ID: u32 = 91;
+        const TEST_DUMP_IFINDEX: i32 = 7;
+        const TEST_DUMP_PARENT: u32 = sys::TC_H_CLSACT_INGRESS;
+
+        fn dump_message(
+            message_type: u16,
+            flags: u16,
+            sequence: u32,
+            port_id: u32,
+            body: &[u8],
+        ) -> Vec<u8> {
+            const NL_HDR: usize = 16;
+            let length = NL_HDR + body.len();
+            let aligned = sys::align_to_netlink(length).unwrap();
+            let mut message = vec![0_u8; aligned];
+            message[..4].copy_from_slice(&(length as u32).to_ne_bytes());
+            message[4..6].copy_from_slice(&message_type.to_ne_bytes());
+            message[6..8].copy_from_slice(&flags.to_ne_bytes());
+            message[8..12].copy_from_slice(&sequence.to_ne_bytes());
+            message[12..16].copy_from_slice(&port_id.to_ne_bytes());
+            message[NL_HDR..length].copy_from_slice(body);
+            message
+        }
+
+        fn dump_attribute(attribute_type: u16, value: &[u8]) -> Vec<u8> {
+            const ATTR_HDR: usize = 4;
+            let length = ATTR_HDR + value.len();
+            let aligned = sys::align_to_netlink(length).unwrap();
+            let mut attribute = vec![0_u8; aligned];
+            attribute[..2].copy_from_slice(&(length as u16).to_ne_bytes());
+            attribute[2..4].copy_from_slice(&attribute_type.to_ne_bytes());
+            attribute[ATTR_HDR..length].copy_from_slice(value);
+            attribute
+        }
+
+        fn filter_dump_message(
+            flags: u16,
+            sequence: u32,
+            port_id: u32,
+            owner: Option<(&str, u32)>,
+        ) -> Vec<u8> {
+            const TCMSG: usize = 20;
+            let mut body = vec![0_u8; TCMSG];
+            body[4..8].copy_from_slice(&TEST_DUMP_IFINDEX.to_ne_bytes());
+            body[8..12].copy_from_slice(&u32::from(TC_HANDLE).to_ne_bytes());
+            body[12..16].copy_from_slice(&TEST_DUMP_PARENT.to_ne_bytes());
+            body[16..20].copy_from_slice(
+                &((u32::from(crate::ebpf::DEFAULT_TC_PRIORITY) << 16) | u32::from(TC_PROTOCOL_ALL))
+                    .to_ne_bytes(),
+            );
+            if let Some((name, program_id)) = owner {
+                body.extend_from_slice(&dump_attribute(sys::TCA_KIND, b"bpf\0"));
+                let mut options = dump_attribute(sys::TCA_BPF_NAME, name.as_bytes());
+                options
+                    .extend_from_slice(&dump_attribute(sys::TCA_BPF_ID, &program_id.to_ne_bytes()));
+                body.extend_from_slice(&dump_attribute(sys::TCA_OPTIONS, &options));
+            }
+            dump_message(sys::RTM_NEWTFILTER, flags, sequence, port_id, &body)
+        }
+
+        fn done_dump_message(flags: u16, sequence: u32, port_id: u32, status: i32) -> Vec<u8> {
+            dump_message(
+                sys::NLMSG_DONE,
+                flags,
+                sequence,
+                port_id,
+                &status.to_ne_bytes(),
+            )
+        }
+
+        fn parse_test_dump(
+            message: &[u8],
+            state: &mut TfilterDumpState,
+        ) -> Result<DumpOutcome, GtpuError> {
+            parse_tfilter_dump(
+                message,
+                crate::ebpf::DEFAULT_TC_PRIORITY,
+                TfilterDumpExpectation {
+                    sequence: TEST_DUMP_SEQUENCE,
+                    port_id: TEST_DUMP_PORT_ID,
+                    ifindex: TEST_DUMP_IFINDEX,
+                    parent: TEST_DUMP_PARENT,
+                    protocol: TC_PROTOCOL_ALL,
+                    legacy_v2_scan: LegacyV2ProgramScan::Disabled,
+                },
+                state,
+            )
+        }
+
+        fn assert_incomplete(error: GtpuError) {
+            assert!(matches!(
+                error,
+                GtpuError::StateIndeterminate {
+                    operation: "ebpf_tc_filter_dump"
+                }
+            ));
+        }
+
         #[test]
         fn exact_slot_non_bpf_filter_is_foreign_not_absent() {
+            let message = filter_dump_message(
+                sys::NLM_F_MULTI,
+                TEST_DUMP_SEQUENCE,
+                TEST_DUMP_PORT_ID,
+                None,
+            );
+            let mut state = TfilterDumpState::default();
+
+            assert!(matches!(
+                parse_test_dump(&message, &mut state).unwrap(),
+                DumpOutcome::More
+            ));
+            let owner = state.owner.expect("exact-slot owner");
+            assert_eq!(owner.name, "<non-bpf-filter>");
+            assert_eq!(owner.program_id, None);
+        }
+
+        #[test]
+        fn clean_dump_proves_owner_or_absence_only_after_done() {
+            let owner_message = filter_dump_message(
+                sys::NLM_F_MULTI,
+                TEST_DUMP_SEQUENCE,
+                TEST_DUMP_PORT_ID,
+                Some(("owned\0", 73)),
+            );
+            let done =
+                done_dump_message(sys::NLM_F_MULTI, TEST_DUMP_SEQUENCE, TEST_DUMP_PORT_ID, 0);
+            let mut owner_state = TfilterDumpState::default();
+            assert!(matches!(
+                parse_test_dump(&owner_message, &mut owner_state).unwrap(),
+                DumpOutcome::More
+            ));
+            assert_eq!(
+                owner_state.owner,
+                Some(FilterOwner {
+                    name: String::from("owned"),
+                    program_id: Some(73),
+                })
+            );
+            assert!(matches!(
+                parse_test_dump(&done, &mut owner_state).unwrap(),
+                DumpOutcome::Done
+            ));
+
+            let mut absent_state = TfilterDumpState::default();
+            assert!(matches!(
+                parse_test_dump(&done, &mut absent_state).unwrap(),
+                DumpOutcome::Done
+            ));
+            assert_eq!(absent_state.owner, None);
+        }
+
+        #[test]
+        fn interrupted_object_or_done_is_not_authoritative() {
+            for message in [
+                filter_dump_message(
+                    sys::NLM_F_MULTI | sys::NLM_F_DUMP_INTR,
+                    TEST_DUMP_SEQUENCE,
+                    TEST_DUMP_PORT_ID,
+                    None,
+                ),
+                done_dump_message(
+                    sys::NLM_F_MULTI | sys::NLM_F_DUMP_INTR,
+                    TEST_DUMP_SEQUENCE,
+                    TEST_DUMP_PORT_ID,
+                    0,
+                ),
+            ] {
+                let mut state = TfilterDumpState::default();
+                assert_incomplete(parse_test_dump(&message, &mut state).unwrap_err());
+            }
+        }
+
+        #[test]
+        fn observed_owner_followed_by_interrupted_done_is_not_authoritative() {
+            let mut datagram = filter_dump_message(
+                sys::NLM_F_MULTI,
+                TEST_DUMP_SEQUENCE,
+                TEST_DUMP_PORT_ID,
+                Some(("owned\0", 73)),
+            );
+            datagram.extend_from_slice(&done_dump_message(
+                sys::NLM_F_MULTI | sys::NLM_F_DUMP_INTR,
+                TEST_DUMP_SEQUENCE,
+                TEST_DUMP_PORT_ID,
+                0,
+            ));
+            let mut state = TfilterDumpState::default();
+            assert_incomplete(parse_test_dump(&datagram, &mut state).unwrap_err());
+        }
+
+        #[test]
+        fn overrun_is_not_authoritative() {
+            let message = dump_message(
+                sys::NLMSG_OVERRUN,
+                sys::NLM_F_MULTI,
+                TEST_DUMP_SEQUENCE,
+                TEST_DUMP_PORT_ID,
+                &[],
+            );
+            let mut state = TfilterDumpState::default();
+            assert_incomplete(parse_test_dump(&message, &mut state).unwrap_err());
+        }
+
+        #[test]
+        fn done_requires_exact_zero_status() {
+            let negative =
+                done_dump_message(sys::NLM_F_MULTI, TEST_DUMP_SEQUENCE, TEST_DUMP_PORT_ID, -4);
+            let mut state = TfilterDumpState::default();
+            assert_incomplete(parse_test_dump(&negative, &mut state).unwrap_err());
+
+            for body in [&[][..], &[0, 0, 0][..], &[0, 0, 0, 0, 0][..]] {
+                let malformed = dump_message(
+                    sys::NLMSG_DONE,
+                    sys::NLM_F_MULTI,
+                    TEST_DUMP_SEQUENCE,
+                    TEST_DUMP_PORT_ID,
+                    body,
+                );
+                let mut state = TfilterDumpState::default();
+                assert!(matches!(
+                    parse_test_dump(&malformed, &mut state).unwrap_err(),
+                    GtpuError::Io {
+                        operation: "tc_filter_dump",
+                        kind: io::ErrorKind::InvalidData,
+                        ..
+                    }
+                ));
+            }
+        }
+
+        #[test]
+        fn every_dump_header_must_match_sequence_and_local_port() {
+            for message in [
+                done_dump_message(
+                    sys::NLM_F_MULTI,
+                    TEST_DUMP_SEQUENCE + 1,
+                    TEST_DUMP_PORT_ID,
+                    0,
+                ),
+                done_dump_message(
+                    sys::NLM_F_MULTI,
+                    TEST_DUMP_SEQUENCE,
+                    TEST_DUMP_PORT_ID + 1,
+                    0,
+                ),
+            ] {
+                let mut state = TfilterDumpState::default();
+                assert_incomplete(parse_test_dump(&message, &mut state).unwrap_err());
+            }
+        }
+
+        #[test]
+        fn every_filter_message_must_match_requested_hook_identity() {
             const NL_HDR: usize = 16;
-            const TCMSG: usize = 20;
-            let length = NL_HDR + TCMSG;
-            let mut message = vec![0_u8; length];
-            message[..4].copy_from_slice(&(length as u32).to_ne_bytes());
-            message[4..6].copy_from_slice(&sys::RTM_NEWTFILTER.to_ne_bytes());
-            let body = NL_HDR;
-            message[body + 8..body + 12].copy_from_slice(&u32::from(TC_HANDLE).to_ne_bytes());
-            message[body + 16..body + 20].copy_from_slice(
-                &(u32::from(crate::ebpf::DEFAULT_TC_PRIORITY) << 16).to_ne_bytes(),
+            let valid = filter_dump_message(
+                sys::NLM_F_MULTI,
+                TEST_DUMP_SEQUENCE,
+                TEST_DUMP_PORT_ID,
+                Some((PROG_UPLINK, 73)),
+            );
+            let mut wrong_family = valid.clone();
+            wrong_family[NL_HDR] = 2;
+            let mut wrong_ifindex = valid.clone();
+            wrong_ifindex[NL_HDR + 4..NL_HDR + 8]
+                .copy_from_slice(&(TEST_DUMP_IFINDEX + 1).to_ne_bytes());
+            let mut wrong_parent = valid.clone();
+            wrong_parent[NL_HDR + 12..NL_HDR + 16]
+                .copy_from_slice(&sys::TC_H_CLSACT_EGRESS.to_ne_bytes());
+            let mut wrong_protocol = valid;
+            let info =
+                u32::from_ne_bytes(wrong_protocol[NL_HDR + 16..NL_HDR + 20].try_into().unwrap());
+            wrong_protocol[NL_HDR + 16..NL_HDR + 20].copy_from_slice(
+                &((info & 0xffff_0000) | u32::from(TC_PROTOCOL_ALL.wrapping_add(1))).to_ne_bytes(),
             );
 
-            match parse_tfilter_dump(&message, crate::ebpf::DEFAULT_TC_PRIORITY).unwrap() {
-                DumpOutcome::Found(owner) => {
-                    assert_eq!(owner.name, "<non-bpf-filter>");
-                    assert_eq!(owner.program_id, None);
-                }
-                DumpOutcome::Done | DumpOutcome::More => {
-                    panic!("an occupied exact slot must not be reported absent")
-                }
+            for message in [wrong_family, wrong_ifindex, wrong_parent, wrong_protocol] {
+                let mut state = TfilterDumpState::default();
+                assert_incomplete(parse_test_dump(&message, &mut state).unwrap_err());
+            }
+        }
+
+        #[test]
+        fn legacy_v2_scan_allows_only_the_expected_exact_slot_program() {
+            const NL_HDR: usize = 16;
+            for (expected_name, observed_name) in [
+                (PROG_UPLINK, PROG_UPLINK),
+                (PROG_UPLINK, PROG_DOWNLINK),
+                (PROG_DOWNLINK, PROG_DOWNLINK),
+                (PROG_DOWNLINK, PROG_UPLINK),
+            ] {
+                let kernel_name = std::str::from_utf8(kernel_program_name(observed_name)).unwrap();
+                let exact = filter_dump_message(
+                    sys::NLM_F_MULTI,
+                    TEST_DUMP_SEQUENCE,
+                    TEST_DUMP_PORT_ID,
+                    Some((kernel_name, 73)),
+                );
+                let mut state = TfilterDumpState::default();
+                assert!(matches!(
+                    parse_tfilter_dump(
+                        &exact,
+                        crate::ebpf::DEFAULT_TC_PRIORITY,
+                        TfilterDumpExpectation {
+                            sequence: TEST_DUMP_SEQUENCE,
+                            port_id: TEST_DUMP_PORT_ID,
+                            ifindex: TEST_DUMP_IFINDEX,
+                            parent: TEST_DUMP_PARENT,
+                            protocol: TC_PROTOCOL_ALL,
+                            legacy_v2_scan: LegacyV2ProgramScan::AllowExact(expected_name),
+                        },
+                        &mut state,
+                    )
+                    .unwrap(),
+                    DumpOutcome::More
+                ));
+                assert_eq!(
+                    state.unexpected_legacy_v2_program_seen,
+                    expected_name != observed_name,
+                    "cross-direction legacy program names must be rejected"
+                );
+
+                let mut message = filter_dump_message(
+                    sys::NLM_F_MULTI,
+                    TEST_DUMP_SEQUENCE,
+                    TEST_DUMP_PORT_ID,
+                    Some((kernel_name, 74)),
+                );
+                let info = ((u32::from(crate::ebpf::DEFAULT_TC_PRIORITY) + 1) << 16)
+                    | u32::from(TC_PROTOCOL_ALL);
+                message[NL_HDR + 16..NL_HDR + 20].copy_from_slice(&info.to_ne_bytes());
+                let mut state = TfilterDumpState::default();
+
+                assert!(matches!(
+                    parse_tfilter_dump(
+                        &message,
+                        crate::ebpf::DEFAULT_TC_PRIORITY,
+                        TfilterDumpExpectation {
+                            sequence: TEST_DUMP_SEQUENCE,
+                            port_id: TEST_DUMP_PORT_ID,
+                            ifindex: TEST_DUMP_IFINDEX,
+                            parent: TEST_DUMP_PARENT,
+                            protocol: TC_PROTOCOL_ALL,
+                            legacy_v2_scan: LegacyV2ProgramScan::AllowExact(expected_name),
+                        },
+                        &mut state,
+                    )
+                    .unwrap(),
+                    DumpOutcome::More
+                ));
+                assert!(state.unexpected_legacy_v2_program_seen);
+                assert!(state.owner.is_none());
+            }
+        }
+
+        #[test]
+        fn exact_legacy_v2_program_plus_same_or_cross_name_extra_is_rejected() {
+            const NL_HDR: usize = 16;
+            let expected_name = std::str::from_utf8(kernel_program_name(PROG_UPLINK)).unwrap();
+            for extra_name in [PROG_UPLINK, PROG_DOWNLINK] {
+                let extra_name = std::str::from_utf8(kernel_program_name(extra_name)).unwrap();
+                let mut datagram = filter_dump_message(
+                    sys::NLM_F_MULTI,
+                    TEST_DUMP_SEQUENCE,
+                    TEST_DUMP_PORT_ID,
+                    Some((expected_name, 73)),
+                );
+                let mut extra = filter_dump_message(
+                    sys::NLM_F_MULTI,
+                    TEST_DUMP_SEQUENCE,
+                    TEST_DUMP_PORT_ID,
+                    Some((extra_name, 74)),
+                );
+                let info = ((u32::from(crate::ebpf::DEFAULT_TC_PRIORITY) + 1) << 16)
+                    | u32::from(TC_PROTOCOL_ALL);
+                extra[NL_HDR + 16..NL_HDR + 20].copy_from_slice(&info.to_ne_bytes());
+                datagram.extend_from_slice(&extra);
+                datagram.extend_from_slice(&done_dump_message(
+                    sys::NLM_F_MULTI,
+                    TEST_DUMP_SEQUENCE,
+                    TEST_DUMP_PORT_ID,
+                    0,
+                ));
+                let mut state = TfilterDumpState::default();
+
+                assert!(matches!(
+                    parse_tfilter_dump(
+                        &datagram,
+                        crate::ebpf::DEFAULT_TC_PRIORITY,
+                        TfilterDumpExpectation {
+                            sequence: TEST_DUMP_SEQUENCE,
+                            port_id: TEST_DUMP_PORT_ID,
+                            ifindex: TEST_DUMP_IFINDEX,
+                            parent: TEST_DUMP_PARENT,
+                            protocol: TC_PROTOCOL_ALL,
+                            legacy_v2_scan: LegacyV2ProgramScan::AllowExact(PROG_UPLINK),
+                        },
+                        &mut state,
+                    )
+                    .unwrap(),
+                    DumpOutcome::Done
+                ));
+                assert_eq!(
+                    state.owner,
+                    Some(FilterOwner {
+                        name: expected_name.into(),
+                        program_id: Some(73),
+                    })
+                );
+                assert!(state.unexpected_legacy_v2_program_seen);
+            }
+        }
+
+        #[test]
+        fn absence_scan_ignores_foreign_names_but_detects_either_legacy_name() {
+            for (name, is_legacy) in [
+                ("foreign", false),
+                (
+                    std::str::from_utf8(kernel_program_name(PROG_UPLINK)).unwrap(),
+                    true,
+                ),
+                (
+                    std::str::from_utf8(kernel_program_name(PROG_DOWNLINK)).unwrap(),
+                    true,
+                ),
+            ] {
+                let message = filter_dump_message(
+                    sys::NLM_F_MULTI,
+                    TEST_DUMP_SEQUENCE,
+                    TEST_DUMP_PORT_ID,
+                    Some((name, 73)),
+                );
+                let mut state = TfilterDumpState::default();
+                assert!(matches!(
+                    parse_tfilter_dump(
+                        &message,
+                        crate::ebpf::DEFAULT_TC_PRIORITY,
+                        TfilterDumpExpectation {
+                            sequence: TEST_DUMP_SEQUENCE,
+                            port_id: TEST_DUMP_PORT_ID,
+                            ifindex: TEST_DUMP_IFINDEX,
+                            parent: TEST_DUMP_PARENT,
+                            protocol: TC_PROTOCOL_ALL,
+                            legacy_v2_scan: LegacyV2ProgramScan::RequireAbsent,
+                        },
+                        &mut state,
+                    )
+                    .unwrap(),
+                    DumpOutcome::More
+                ));
+                assert_eq!(state.unexpected_legacy_v2_program_seen, is_legacy);
+            }
+        }
+
+        #[test]
+        fn duplicate_or_conflicting_exact_slot_owners_are_not_authoritative() {
+            let first = filter_dump_message(
+                sys::NLM_F_MULTI,
+                TEST_DUMP_SEQUENCE,
+                TEST_DUMP_PORT_ID,
+                Some(("first\0", 73)),
+            );
+            let duplicate = first.clone();
+            let conflicting = filter_dump_message(
+                sys::NLM_F_MULTI,
+                TEST_DUMP_SEQUENCE,
+                TEST_DUMP_PORT_ID,
+                Some(("second\0", 74)),
+            );
+
+            for second in [duplicate, conflicting] {
+                let mut state = TfilterDumpState::default();
+                assert!(matches!(
+                    parse_test_dump(&first, &mut state).unwrap(),
+                    DumpOutcome::More
+                ));
+                assert_incomplete(parse_test_dump(&second, &mut state).unwrap_err());
             }
         }
     }
@@ -5508,11 +8049,12 @@ mod tests {
     use opc_gtpu_ebpf_common::default_bearer_graph_is_valid;
 
     use crate::model::{GtpBearerMark, Teid};
-    use crate::GtpAddressFamily;
+    use crate::{DrainedV2TeardownProgress, GtpAddressFamily};
 
     use super::*;
 
     const S2BU_IFINDEX: u32 = 7;
+    const LEGACY_V2_PIN_COUNT: usize = 9;
 
     #[derive(Debug)]
     struct FakeRuntime {
@@ -5549,12 +8091,31 @@ mod tests {
         downlink_filter_ready: HashSet<u32>,
         uplink_filter_foreign: HashSet<u32>,
         downlink_filter_foreign: HashSet<u32>,
+        legacy_v2_extra_hooks: HashSet<(u32, FakeLegacyV2Hook, FakeLegacyV2Program)>,
         pin_identity_invalid: HashSet<u32>,
+        v2_schema_identity_invalid: HashSet<u32>,
         // One durable marker state per pin directory, mirroring the single
         // reserved FAR entry used by production.
         schema: HashMap<PathBuf, FakeSchema>,
+        // Durable legacy-v2 teardown evidence and remaining pin count model
+        // crash/retry boundaries without weakening the production algorithm.
+        v2_teardown_proof: HashSet<PathBuf>,
+        v2_pins_remaining: HashMap<PathBuf, usize>,
+        empty_pin_dirs: HashSet<PathBuf>,
         operations: Vec<&'static str>,
         failures: VecDeque<&'static str>,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    enum FakeLegacyV2Hook {
+        Egress,
+        Ingress,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    enum FakeLegacyV2Program {
+        Uplink,
+        Downlink,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5624,6 +8185,11 @@ mod tests {
             pin_dir: &Path,
             ifindex: u32,
         ) -> Result<(), GtpuError> {
+            if state.v2_teardown_proof.contains(pin_dir) {
+                return Err(GtpuError::StateIndeterminate {
+                    operation: "ebpf_legacy_v2_teardown_pending",
+                });
+            }
             match state.schema.get(pin_dir).copied() {
                 None | Some(FakeSchema::LegacyV0) => Ok(()),
                 Some(FakeSchema::V1Uncommitted | FakeSchema::DscpV1) => {
@@ -5890,11 +8456,11 @@ mod tests {
             if state.attached.contains_key(&ifindex) {
                 return Err(GtpuError::AlreadyExists);
             }
+            Self::validate_schema(&state, pin_dir, ifindex)?;
             let local_ip = *state
                 .pinned_config
                 .get(pin_dir)
                 .ok_or(GtpuError::NotFound)?;
-            Self::validate_schema(&state, pin_dir, ifindex)?;
             Self::rebuild_owner_index(&mut state, ifindex, local_ip)?;
             state.attached.insert(
                 ifindex,
@@ -5942,9 +8508,14 @@ mod tests {
             state.downlink_filter_ready.remove(&ifindex);
             state.uplink_filter_foreign.remove(&ifindex);
             state.downlink_filter_foreign.remove(&ifindex);
+            state
+                .legacy_v2_extra_hooks
+                .retain(|(index, _, _)| *index != ifindex);
             state.pin_identity_invalid.remove(&ifindex);
+            state.v2_schema_identity_invalid.remove(&ifindex);
             state.schema.remove(pin_dir);
             state.pinned_config.remove(pin_dir);
+            state.empty_pin_dirs.remove(pin_dir);
             state.far.retain(|(index, _), _| *index != ifindex);
             state.marked_far.retain(|(index, _), _| *index != ifindex);
             state.dscp.retain(|(index, _), _| *index != ifindex);
@@ -5962,6 +8533,220 @@ mod tests {
                 .default_teid_by_ue
                 .retain(|(index, _), _| *index != ifindex);
             Ok(())
+        }
+
+        fn teardown_drained_v2(
+            &self,
+            _interface: &str,
+            ifindex: u32,
+            pin_dir: &Path,
+            _tc_priority: u16,
+        ) -> Result<DrainedV2TeardownOutcome, GtpuError> {
+            let mut state = self.state();
+            state.operations.push("teardown_drained_v2");
+            let proof_exists = state.v2_teardown_proof.contains(pin_dir);
+            if !proof_exists && !state.schema.contains_key(pin_dir) {
+                let uplink = Self::fail_if_requested(&mut state, "v2_observe_uplink").map(|()| {
+                    (state.uplink_filter_ready.contains(&ifindex)
+                        || state.legacy_v2_extra_hooks.iter().any(|(index, hook, _)| {
+                            *index == ifindex && *hook == FakeLegacyV2Hook::Egress
+                        }))
+                    .then_some(())
+                });
+                let downlink =
+                    Self::fail_if_requested(&mut state, "v2_observe_downlink").map(|()| {
+                        (state.downlink_filter_ready.contains(&ifindex)
+                            || state.legacy_v2_extra_hooks.iter().any(|(index, hook, _)| {
+                                *index == ifindex && *hook == FakeLegacyV2Hook::Ingress
+                            }))
+                        .then_some(())
+                    });
+                return match (uplink, downlink) {
+                    (Err(_), _) | (_, Err(_)) => Ok(DrainedV2TeardownOutcome::Refused(
+                        DrainedV2TeardownRefusal::IndeterminateState,
+                    )),
+                    (Ok(Some(_)), _) | (_, Ok(Some(_))) => Ok(DrainedV2TeardownOutcome::Refused(
+                        DrainedV2TeardownRefusal::IdentityMismatch,
+                    )),
+                    (Ok(None), Ok(None)) if state.pinned_config.contains_key(pin_dir) => {
+                        Ok(DrainedV2TeardownOutcome::Refused(
+                            DrainedV2TeardownRefusal::IdentityMismatch,
+                        ))
+                    }
+                    (Ok(None), Ok(None)) => {
+                        if state.empty_pin_dirs.contains(pin_dir)
+                            && Self::fail_if_requested(&mut state, "v2_pin_dir_remove").is_ok()
+                        {
+                            state.empty_pin_dirs.remove(pin_dir);
+                        }
+                        Ok(DrainedV2TeardownOutcome::AlreadyAbsent)
+                    }
+                };
+            }
+            if !proof_exists && state.schema.get(pin_dir).copied() != Some(FakeSchema::BearerV2) {
+                return Ok(DrainedV2TeardownOutcome::Refused(
+                    DrainedV2TeardownRefusal::NotLegacyV2,
+                ));
+            }
+            if state.pin_identity_invalid.contains(&ifindex)
+                || state.v2_schema_identity_invalid.contains(&ifindex)
+                || state.uplink_filter_foreign.contains(&ifindex)
+                || state.downlink_filter_foreign.contains(&ifindex)
+                || state
+                    .legacy_v2_extra_hooks
+                    .iter()
+                    .any(|(index, _, _)| *index == ifindex)
+            {
+                return Ok(if proof_exists {
+                    DrainedV2TeardownOutcome::Partial(DrainedV2TeardownProgress::Indeterminate)
+                } else {
+                    DrainedV2TeardownOutcome::Refused(DrainedV2TeardownRefusal::IdentityMismatch)
+                });
+            }
+            if !proof_exists
+                && (!state.uplink_filter_ready.contains(&ifindex)
+                    || !state.downlink_filter_ready.contains(&ifindex))
+            {
+                return Ok(DrainedV2TeardownOutcome::Refused(
+                    DrainedV2TeardownRefusal::IdentityMismatch,
+                ));
+            }
+
+            let forwarding_state_present = state.far.keys().any(|(index, _)| *index == ifindex)
+                || state.marked_far.keys().any(|(index, _)| *index == ifindex)
+                || state.dscp.keys().any(|(index, _)| *index == ifindex)
+                || state.marked_dscp.keys().any(|(index, _)| *index == ifindex)
+                || state.pdr.keys().any(|(index, _)| *index == ifindex)
+                || state.marked_pdr.keys().any(|(index, _)| *index == ifindex)
+                || state
+                    .marked_owner
+                    .keys()
+                    .any(|(index, _)| *index == ifindex);
+            if forwarding_state_present {
+                return Ok(if proof_exists {
+                    DrainedV2TeardownOutcome::Partial(
+                        DrainedV2TeardownProgress::PopulatedStateObserved,
+                    )
+                } else {
+                    DrainedV2TeardownOutcome::Refused(DrainedV2TeardownRefusal::PopulatedState)
+                });
+            }
+
+            if !proof_exists {
+                let complete_v2_pins = state
+                    .pinned_config
+                    .get(pin_dir)
+                    .is_some_and(|local_ip| *local_ip != [0; 4])
+                    && state.dscp_map_ready.contains(&ifindex)
+                    && state.marked_far_map_ready.contains(&ifindex)
+                    && state.marked_dscp_map_ready.contains(&ifindex)
+                    && state.marked_pdr_map_ready.contains(&ifindex)
+                    && state.marked_owner_map_ready.contains(&ifindex);
+                if !complete_v2_pins {
+                    return Ok(DrainedV2TeardownOutcome::Refused(
+                        DrainedV2TeardownRefusal::IndeterminateState,
+                    ));
+                }
+                if Self::fail_if_requested(&mut state, "v2_proof_commit").is_err() {
+                    return Ok(DrainedV2TeardownOutcome::Refused(
+                        DrainedV2TeardownRefusal::IndeterminateState,
+                    ));
+                }
+                state.v2_teardown_proof.insert(pin_dir.to_path_buf());
+                state
+                    .v2_pins_remaining
+                    .insert(pin_dir.to_path_buf(), LEGACY_V2_PIN_COUNT);
+                if Self::fail_if_requested(&mut state, "v2_proof_readback").is_err() {
+                    return Ok(DrainedV2TeardownOutcome::Partial(
+                        DrainedV2TeardownProgress::Indeterminate,
+                    ));
+                }
+            }
+
+            if state
+                .v2_pins_remaining
+                .get(pin_dir)
+                .is_some_and(|remaining| *remaining < LEGACY_V2_PIN_COUNT)
+                && (state.uplink_filter_ready.contains(&ifindex)
+                    || state.downlink_filter_ready.contains(&ifindex))
+            {
+                return Ok(DrainedV2TeardownOutcome::Partial(
+                    DrainedV2TeardownProgress::Indeterminate,
+                ));
+            }
+
+            if state.uplink_filter_ready.contains(&ifindex) {
+                if Self::fail_if_requested(&mut state, "v2_detach_uplink").is_err() {
+                    return Ok(DrainedV2TeardownOutcome::Partial(
+                        if state.downlink_filter_ready.contains(&ifindex) {
+                            DrainedV2TeardownProgress::ProofCommitted
+                        } else {
+                            DrainedV2TeardownProgress::OneHookDetached
+                        },
+                    ));
+                }
+                state.uplink_filter_ready.remove(&ifindex);
+            }
+            if state.downlink_filter_ready.contains(&ifindex) {
+                if Self::fail_if_requested(&mut state, "v2_detach_downlink").is_err() {
+                    return Ok(DrainedV2TeardownOutcome::Partial(
+                        DrainedV2TeardownProgress::OneHookDetached,
+                    ));
+                }
+                state.downlink_filter_ready.remove(&ifindex);
+            }
+
+            loop {
+                let remaining = state.v2_pins_remaining.get(pin_dir).copied().unwrap_or(0);
+                if remaining == 0 {
+                    break;
+                }
+                let operation = if remaining + 1 == LEGACY_V2_PIN_COUNT {
+                    "v2_pin_remove_after_one"
+                } else {
+                    "v2_pin_remove"
+                };
+                if Self::fail_if_requested(&mut state, operation).is_err() {
+                    return Ok(DrainedV2TeardownOutcome::Partial(
+                        if remaining == LEGACY_V2_PIN_COUNT {
+                            DrainedV2TeardownProgress::HooksDetached
+                        } else {
+                            DrainedV2TeardownProgress::PinCleanupStarted
+                        },
+                    ));
+                }
+                state
+                    .v2_pins_remaining
+                    .insert(pin_dir.to_path_buf(), remaining - 1);
+            }
+            state.schema.remove(pin_dir);
+            state.pinned_config.remove(pin_dir);
+            state.dscp_map_ready.remove(&ifindex);
+            state.marked_far_map_ready.remove(&ifindex);
+            state.marked_dscp_map_ready.remove(&ifindex);
+            state.marked_pdr_map_ready.remove(&ifindex);
+            state.marked_owner_map_ready.remove(&ifindex);
+            state.v2_schema_identity_invalid.remove(&ifindex);
+            if Self::fail_if_requested(&mut state, "v2_proof_only_inventory").is_err() {
+                return Ok(DrainedV2TeardownOutcome::Partial(
+                    DrainedV2TeardownProgress::Indeterminate,
+                ));
+            }
+            if Self::fail_if_requested(&mut state, "v2_proof_remove").is_err() {
+                return Ok(DrainedV2TeardownOutcome::Partial(
+                    DrainedV2TeardownProgress::PinCleanupStarted,
+                ));
+            }
+            state.v2_teardown_proof.remove(pin_dir);
+            state.v2_pins_remaining.remove(pin_dir);
+            // Once hooks, maps, and proof are gone, directory cleanup is
+            // cosmetic and cannot turn terminal success into retryable state.
+            if Self::fail_if_requested(&mut state, "v2_pin_dir_remove").is_err() {
+                state.empty_pin_dirs.insert(pin_dir.to_path_buf());
+            } else {
+                state.empty_pin_dirs.remove(pin_dir);
+            }
+            Ok(DrainedV2TeardownOutcome::Removed)
         }
 
         fn far_get(
@@ -6584,6 +9369,599 @@ mod tests {
         let runtime = Arc::new(FakeRuntime::new());
         let backend = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
         (backend, runtime)
+    }
+
+    fn seed_drained_v2(runtime: &FakeRuntime) -> PathBuf {
+        let pin_dir = PathBuf::from(DEFAULT_BPFFS_PIN_ROOT).join("s2bu");
+        let mut state = runtime.state();
+        state.schema.insert(pin_dir.clone(), FakeSchema::BearerV2);
+        state.pinned_config.insert(pin_dir.clone(), [192, 0, 2, 1]);
+        state.dscp_map_ready.insert(S2BU_IFINDEX);
+        state.marked_far_map_ready.insert(S2BU_IFINDEX);
+        state.marked_dscp_map_ready.insert(S2BU_IFINDEX);
+        state.marked_pdr_map_ready.insert(S2BU_IFINDEX);
+        state.marked_owner_map_ready.insert(S2BU_IFINDEX);
+        state.uplink_filter_ready.insert(S2BU_IFINDEX);
+        state.downlink_filter_ready.insert(S2BU_IFINDEX);
+        pin_dir
+    }
+
+    fn drained_v2_request(ifindex: u32) -> DrainedV2TeardownRequest {
+        DrainedV2TeardownRequest::new(
+            GtpDevice {
+                name: "s2bu".to_string(),
+                ifindex,
+            },
+            crate::GtpuV2DrainProof::sessions_and_traffic_drained(),
+        )
+    }
+
+    #[tokio::test]
+    async fn drained_v2_teardown_is_idempotent_and_allows_fresh_v3_provisioning() {
+        let (backend, runtime) = backend_with_fake();
+        seed_drained_v2(&runtime);
+
+        assert_eq!(
+            backend
+                .teardown_drained_v2(drained_v2_request(S2BU_IFINDEX))
+                .await
+                .unwrap(),
+            DrainedV2TeardownOutcome::Removed
+        );
+        assert_eq!(
+            backend
+                .teardown_drained_v2(drained_v2_request(S2BU_IFINDEX))
+                .await
+                .unwrap(),
+            DrainedV2TeardownOutcome::AlreadyAbsent
+        );
+        let device = backend.create_device(create_request()).await.unwrap();
+        assert_eq!(device.ifindex, S2BU_IFINDEX);
+        assert_eq!(
+            runtime
+                .state()
+                .schema
+                .get(&PathBuf::from(DEFAULT_BPFFS_PIN_ROOT).join("s2bu")),
+            Some(&FakeSchema::EndpointV3)
+        );
+    }
+
+    #[tokio::test]
+    async fn drained_v2_teardown_reports_hook_observation_errors_as_indeterminate() {
+        for failures in [
+            vec!["v2_observe_uplink"],
+            vec!["v2_observe_downlink"],
+            vec!["v2_observe_uplink", "v2_observe_downlink"],
+        ] {
+            let (backend, runtime) = backend_with_fake();
+            runtime.fail_in_order(failures);
+            assert_eq!(
+                backend
+                    .teardown_drained_v2(drained_v2_request(S2BU_IFINDEX))
+                    .await
+                    .unwrap(),
+                DrainedV2TeardownOutcome::Refused(DrainedV2TeardownRefusal::IndeterminateState)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn drained_v2_teardown_refuses_changed_or_managed_interface_identity() {
+        let (backend, runtime) = backend_with_fake();
+        seed_drained_v2(&runtime);
+        assert_eq!(
+            backend
+                .teardown_drained_v2(drained_v2_request(S2BU_IFINDEX + 1))
+                .await
+                .unwrap(),
+            DrainedV2TeardownOutcome::Refused(DrainedV2TeardownRefusal::InterfaceIdentityChanged)
+        );
+
+        let missing_runtime = Arc::new(FakeRuntime {
+            ifindexes: HashMap::new(),
+            ..FakeRuntime::new()
+        });
+        let missing_backend = EbpfGtpuDataplaneBackend::with_runtime(missing_runtime);
+        assert_eq!(
+            missing_backend
+                .teardown_drained_v2(drained_v2_request(S2BU_IFINDEX))
+                .await
+                .unwrap(),
+            DrainedV2TeardownOutcome::Refused(DrainedV2TeardownRefusal::InterfaceIdentityChanged)
+        );
+
+        let (managed, _runtime) = backend_with_fake();
+        let device = managed.create_device(create_request()).await.unwrap();
+        assert_eq!(
+            managed
+                .teardown_drained_v2(DrainedV2TeardownRequest::new(
+                    device,
+                    crate::GtpuV2DrainProof::sessions_and_traffic_drained(),
+                ))
+                .await
+                .unwrap(),
+            DrainedV2TeardownOutcome::Refused(DrainedV2TeardownRefusal::ManagedAttachment)
+        );
+    }
+
+    #[tokio::test]
+    async fn drained_v2_teardown_refuses_every_populated_forwarding_map_class() {
+        for map_class in 0..7 {
+            let (backend, runtime) = backend_with_fake();
+            seed_drained_v2(&runtime);
+            {
+                let mut state = runtime.state();
+                match map_class {
+                    0 => {
+                        state
+                            .far
+                            .insert((S2BU_IFINDEX, [1; 4]), [2; UPLINK_FAR_VALUE_LEN]);
+                    }
+                    1 => {
+                        state.marked_far.insert(
+                            (S2BU_IFINDEX, [1; UPLINK_MARK_KEY_LEN]),
+                            [2; UPLINK_FAR_VALUE_LEN],
+                        );
+                    }
+                    2 => {
+                        state
+                            .dscp
+                            .insert((S2BU_IFINDEX, [1; 4]), [2; UPLINK_DSCP_VALUE_LEN]);
+                    }
+                    3 => {
+                        state.marked_dscp.insert(
+                            (S2BU_IFINDEX, [1; UPLINK_MARK_KEY_LEN]),
+                            [2; UPLINK_DSCP_VALUE_LEN],
+                        );
+                    }
+                    4 => {
+                        state
+                            .pdr
+                            .insert((S2BU_IFINDEX, [1; 4]), [2; DOWNLINK_PDR_VALUE_LEN]);
+                    }
+                    5 => {
+                        state
+                            .marked_pdr
+                            .insert((S2BU_IFINDEX, [1; 4]), [2; MARKED_DOWNLINK_PDR_VALUE_LEN]);
+                    }
+                    _ => {
+                        state.marked_owner.insert(
+                            (S2BU_IFINDEX, [1; UPLINK_MARK_KEY_LEN]),
+                            [2; MARKED_BEARER_OWNER_VALUE_LEN],
+                        );
+                    }
+                }
+            }
+            assert_eq!(
+                backend
+                    .teardown_drained_v2(drained_v2_request(S2BU_IFINDEX))
+                    .await
+                    .unwrap(),
+                DrainedV2TeardownOutcome::Refused(DrainedV2TeardownRefusal::PopulatedState),
+                "map class {map_class} must fail closed"
+            );
+            let state = runtime.state();
+            assert!(!state
+                .v2_teardown_proof
+                .contains(&PathBuf::from(DEFAULT_BPFFS_PIN_ROOT).join("s2bu")));
+            assert_eq!(
+                state
+                    .schema
+                    .get(&PathBuf::from(DEFAULT_BPFFS_PIN_ROOT).join("s2bu")),
+                Some(&FakeSchema::BearerV2)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn drained_v2_schema_identity_mismatch_dominates_populated_state() {
+        let (backend, runtime) = backend_with_fake();
+        let pin_dir = seed_drained_v2(&runtime);
+        {
+            let mut state = runtime.state();
+            state.v2_schema_identity_invalid.insert(S2BU_IFINDEX);
+            state
+                .pdr
+                .insert((S2BU_IFINDEX, [1; 4]), [2; DOWNLINK_PDR_VALUE_LEN]);
+        }
+
+        assert_eq!(
+            backend
+                .teardown_drained_v2(drained_v2_request(S2BU_IFINDEX))
+                .await
+                .unwrap(),
+            DrainedV2TeardownOutcome::Refused(DrainedV2TeardownRefusal::IdentityMismatch)
+        );
+        let state = runtime.state();
+        assert!(!state.v2_teardown_proof.contains(&pin_dir));
+        assert!(state.pdr.contains_key(&(S2BU_IFINDEX, [1; 4])));
+    }
+
+    #[tokio::test]
+    async fn drained_v2_teardown_refuses_foreign_incomplete_or_non_v2_state() {
+        for mutation in 0..4 {
+            let (backend, runtime) = backend_with_fake();
+            let pin_dir = seed_drained_v2(&runtime);
+            {
+                let mut state = runtime.state();
+                match mutation {
+                    0 => {
+                        state.uplink_filter_foreign.insert(S2BU_IFINDEX);
+                    }
+                    1 => {
+                        state.pin_identity_invalid.insert(S2BU_IFINDEX);
+                    }
+                    2 => {
+                        state.marked_owner_map_ready.remove(&S2BU_IFINDEX);
+                    }
+                    _ => {
+                        state.schema.insert(pin_dir, FakeSchema::EndpointV3);
+                    }
+                }
+            }
+            let outcome = backend
+                .teardown_drained_v2(drained_v2_request(S2BU_IFINDEX))
+                .await
+                .unwrap();
+            assert!(matches!(
+                outcome,
+                DrainedV2TeardownOutcome::Refused(
+                    DrainedV2TeardownRefusal::IdentityMismatch
+                        | DrainedV2TeardownRefusal::IndeterminateState
+                        | DrainedV2TeardownRefusal::NotLegacyV2
+                )
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn drained_v2_teardown_retries_each_partial_boundary_exactly_once() {
+        for (failure, expected) in [
+            (
+                "v2_detach_uplink",
+                DrainedV2TeardownProgress::ProofCommitted,
+            ),
+            (
+                "v2_detach_downlink",
+                DrainedV2TeardownProgress::OneHookDetached,
+            ),
+            ("v2_pin_remove", DrainedV2TeardownProgress::HooksDetached),
+            (
+                "v2_pin_remove_after_one",
+                DrainedV2TeardownProgress::PinCleanupStarted,
+            ),
+            (
+                "v2_proof_remove",
+                DrainedV2TeardownProgress::PinCleanupStarted,
+            ),
+            (
+                "v2_proof_only_inventory",
+                DrainedV2TeardownProgress::Indeterminate,
+            ),
+        ] {
+            let (backend, runtime) = backend_with_fake();
+            seed_drained_v2(&runtime);
+            runtime.fail_in_order([failure]);
+            assert_eq!(
+                backend
+                    .teardown_drained_v2(drained_v2_request(S2BU_IFINDEX))
+                    .await
+                    .unwrap(),
+                DrainedV2TeardownOutcome::Partial(expected),
+                "failure boundary {failure}"
+            );
+            assert_eq!(
+                backend
+                    .teardown_drained_v2(drained_v2_request(S2BU_IFINDEX))
+                    .await
+                    .unwrap(),
+                DrainedV2TeardownOutcome::Removed,
+                "retry boundary {failure}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn published_proof_with_failed_readback_is_partial_and_fences_v3() {
+        let (backend, runtime) = backend_with_fake();
+        let pin_dir = seed_drained_v2(&runtime);
+        runtime.fail_in_order(["v2_proof_readback"]);
+
+        assert_eq!(
+            backend
+                .teardown_drained_v2(drained_v2_request(S2BU_IFINDEX))
+                .await
+                .unwrap(),
+            DrainedV2TeardownOutcome::Partial(DrainedV2TeardownProgress::Indeterminate)
+        );
+        assert!(runtime.state().v2_teardown_proof.contains(&pin_dir));
+        assert!(matches!(
+            backend.create_device(create_request()).await,
+            Err(GtpuError::StateIndeterminate {
+                operation: "ebpf_legacy_v2_teardown_pending"
+            })
+        ));
+        assert_eq!(
+            backend
+                .teardown_drained_v2(drained_v2_request(S2BU_IFINDEX))
+                .await
+                .unwrap(),
+            DrainedV2TeardownOutcome::Removed
+        );
+    }
+
+    #[tokio::test]
+    async fn directory_cleanup_failure_after_proof_removal_is_terminal_success() {
+        let (backend, runtime) = backend_with_fake();
+        let pin_dir = seed_drained_v2(&runtime);
+        runtime.fail_in_order(["v2_pin_dir_remove", "v2_pin_dir_remove"]);
+
+        assert_eq!(
+            backend
+                .teardown_drained_v2(drained_v2_request(S2BU_IFINDEX))
+                .await
+                .unwrap(),
+            DrainedV2TeardownOutcome::Removed
+        );
+        assert!(runtime.state().empty_pin_dirs.contains(&pin_dir));
+        assert_eq!(
+            backend
+                .teardown_drained_v2(drained_v2_request(S2BU_IFINDEX))
+                .await
+                .unwrap(),
+            DrainedV2TeardownOutcome::AlreadyAbsent
+        );
+        assert!(runtime.state().empty_pin_dirs.contains(&pin_dir));
+        let device = backend.create_device(create_request()).await.unwrap();
+        assert_eq!(device.ifindex, S2BU_IFINDEX);
+    }
+
+    #[tokio::test]
+    async fn empty_namespace_is_absent_despite_cosmetic_cleanup_failure_and_foreign_hook() {
+        let (backend, runtime) = backend_with_fake();
+        let pin_dir = PathBuf::from(DEFAULT_BPFFS_PIN_ROOT).join("s2bu");
+        {
+            let mut state = runtime.state();
+            state.empty_pin_dirs.insert(pin_dir.clone());
+            state.uplink_filter_foreign.insert(S2BU_IFINDEX);
+        }
+        runtime.fail_in_order(["v2_pin_dir_remove"]);
+
+        assert_eq!(
+            backend
+                .teardown_drained_v2(drained_v2_request(S2BU_IFINDEX))
+                .await
+                .unwrap(),
+            DrainedV2TeardownOutcome::AlreadyAbsent
+        );
+        let state = runtime.state();
+        assert!(state.empty_pin_dirs.contains(&pin_dir));
+        assert!(state.uplink_filter_foreign.contains(&S2BU_IFINDEX));
+    }
+
+    #[tokio::test]
+    async fn pending_teardown_proof_fences_create_and_adopt_until_exact_retry() {
+        let (backend, runtime) = backend_with_fake();
+        let pin_dir = seed_drained_v2(&runtime);
+        runtime.fail_in_order(["v2_proof_remove"]);
+        assert_eq!(
+            backend
+                .teardown_drained_v2(drained_v2_request(S2BU_IFINDEX))
+                .await
+                .unwrap(),
+            DrainedV2TeardownOutcome::Partial(DrainedV2TeardownProgress::PinCleanupStarted)
+        );
+        assert!(runtime.state().v2_teardown_proof.contains(&pin_dir));
+
+        assert!(matches!(
+            backend.create_device(create_request()).await,
+            Err(GtpuError::StateIndeterminate {
+                operation: "ebpf_legacy_v2_teardown_pending"
+            })
+        ));
+        assert!(matches!(
+            backend.resolve_device("s2bu").await,
+            Err(GtpuError::StateIndeterminate {
+                operation: "ebpf_legacy_v2_teardown_pending"
+            })
+        ));
+
+        assert_eq!(
+            backend
+                .teardown_drained_v2(drained_v2_request(S2BU_IFINDEX))
+                .await
+                .unwrap(),
+            DrainedV2TeardownOutcome::Removed
+        );
+        let device = backend.create_device(create_request()).await.unwrap();
+        backend.remove_device(&device).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn drained_v2_teardown_rejects_unproven_absence_and_preserves_proof_on_conflict() {
+        let (backend, runtime) = backend_with_fake();
+        let pin_dir = seed_drained_v2(&runtime);
+        runtime.state().downlink_filter_ready.remove(&S2BU_IFINDEX);
+        assert_eq!(
+            backend
+                .teardown_drained_v2(drained_v2_request(S2BU_IFINDEX))
+                .await
+                .unwrap(),
+            DrainedV2TeardownOutcome::Refused(DrainedV2TeardownRefusal::IdentityMismatch)
+        );
+        assert!(!runtime.state().v2_teardown_proof.contains(&pin_dir));
+
+        runtime.state().downlink_filter_ready.insert(S2BU_IFINDEX);
+        runtime.fail_in_order(["v2_detach_uplink"]);
+        assert_eq!(
+            backend
+                .teardown_drained_v2(drained_v2_request(S2BU_IFINDEX))
+                .await
+                .unwrap(),
+            DrainedV2TeardownOutcome::Partial(DrainedV2TeardownProgress::ProofCommitted)
+        );
+        runtime.state().uplink_filter_foreign.insert(S2BU_IFINDEX);
+        assert_eq!(
+            backend
+                .teardown_drained_v2(drained_v2_request(S2BU_IFINDEX))
+                .await
+                .unwrap(),
+            DrainedV2TeardownOutcome::Partial(DrainedV2TeardownProgress::Indeterminate)
+        );
+        let state = runtime.state();
+        assert!(state.v2_teardown_proof.contains(&pin_dir));
+        assert_eq!(state.schema.get(&pin_dir), Some(&FakeSchema::BearerV2));
+    }
+
+    #[tokio::test]
+    async fn drained_v2_teardown_preserves_exact_graph_when_any_legacy_program_extra_exists() {
+        for (hook, program) in [
+            (FakeLegacyV2Hook::Egress, FakeLegacyV2Program::Uplink),
+            (FakeLegacyV2Hook::Egress, FakeLegacyV2Program::Downlink),
+            (FakeLegacyV2Hook::Ingress, FakeLegacyV2Program::Downlink),
+            (FakeLegacyV2Hook::Ingress, FakeLegacyV2Program::Uplink),
+        ] {
+            let (backend, runtime) = backend_with_fake();
+            let pin_dir = seed_drained_v2(&runtime);
+            runtime
+                .state()
+                .legacy_v2_extra_hooks
+                .insert((S2BU_IFINDEX, hook, program));
+
+            assert_eq!(
+                backend
+                    .teardown_drained_v2(drained_v2_request(S2BU_IFINDEX))
+                    .await
+                    .unwrap(),
+                DrainedV2TeardownOutcome::Refused(DrainedV2TeardownRefusal::IdentityMismatch)
+            );
+            let state = runtime.state();
+            assert!(!state.v2_teardown_proof.contains(&pin_dir));
+            assert!(state.uplink_filter_ready.contains(&S2BU_IFINDEX));
+            assert!(state.downlink_filter_ready.contains(&S2BU_IFINDEX));
+            assert_eq!(state.schema.get(&pin_dir), Some(&FakeSchema::BearerV2));
+            assert!(state.pinned_config.contains_key(&pin_dir));
+            assert!(state
+                .legacy_v2_extra_hooks
+                .contains(&(S2BU_IFINDEX, hook, program)));
+        }
+    }
+
+    #[tokio::test]
+    async fn proof_retry_preserves_every_hook_and_pin_when_a_legacy_program_extra_appears() {
+        for (hook, program) in [
+            (FakeLegacyV2Hook::Egress, FakeLegacyV2Program::Uplink),
+            (FakeLegacyV2Hook::Egress, FakeLegacyV2Program::Downlink),
+            (FakeLegacyV2Hook::Ingress, FakeLegacyV2Program::Downlink),
+            (FakeLegacyV2Hook::Ingress, FakeLegacyV2Program::Uplink),
+        ] {
+            let (backend, runtime) = backend_with_fake();
+            let pin_dir = seed_drained_v2(&runtime);
+            runtime.fail_in_order(["v2_detach_uplink"]);
+            assert_eq!(
+                backend
+                    .teardown_drained_v2(drained_v2_request(S2BU_IFINDEX))
+                    .await
+                    .unwrap(),
+                DrainedV2TeardownOutcome::Partial(DrainedV2TeardownProgress::ProofCommitted)
+            );
+            runtime
+                .state()
+                .legacy_v2_extra_hooks
+                .insert((S2BU_IFINDEX, hook, program));
+
+            assert_eq!(
+                backend
+                    .teardown_drained_v2(drained_v2_request(S2BU_IFINDEX))
+                    .await
+                    .unwrap(),
+                DrainedV2TeardownOutcome::Partial(DrainedV2TeardownProgress::Indeterminate)
+            );
+            let state = runtime.state();
+            assert!(state.v2_teardown_proof.contains(&pin_dir));
+            assert_eq!(
+                state.v2_pins_remaining.get(&pin_dir),
+                Some(&LEGACY_V2_PIN_COUNT)
+            );
+            assert!(state.uplink_filter_ready.contains(&S2BU_IFINDEX));
+            assert!(state.downlink_filter_ready.contains(&S2BU_IFINDEX));
+            assert!(state
+                .legacy_v2_extra_hooks
+                .contains(&(S2BU_IFINDEX, hook, program)));
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_reports_started_cleanup_when_the_first_remaining_pin_unlink_fails() {
+        let (backend, runtime) = backend_with_fake();
+        let pin_dir = seed_drained_v2(&runtime);
+        {
+            let mut state = runtime.state();
+            state.v2_teardown_proof.insert(pin_dir.clone());
+            state
+                .v2_pins_remaining
+                .insert(pin_dir.clone(), LEGACY_V2_PIN_COUNT - 1);
+            state.uplink_filter_ready.remove(&S2BU_IFINDEX);
+            state.downlink_filter_ready.remove(&S2BU_IFINDEX);
+        }
+        runtime.fail_in_order(["v2_pin_remove_after_one"]);
+
+        assert_eq!(
+            backend
+                .teardown_drained_v2(drained_v2_request(S2BU_IFINDEX))
+                .await
+                .unwrap(),
+            DrainedV2TeardownOutcome::Partial(DrainedV2TeardownProgress::PinCleanupStarted)
+        );
+        let state = runtime.state();
+        assert!(state.v2_teardown_proof.contains(&pin_dir));
+        assert_eq!(
+            state.v2_pins_remaining.get(&pin_dir),
+            Some(&(LEGACY_V2_PIN_COUNT - 1))
+        );
+    }
+
+    #[tokio::test]
+    async fn drained_v2_teardown_refuses_repopulation_after_partial_pin_cleanup() {
+        let (backend, runtime) = backend_with_fake();
+        let pin_dir = seed_drained_v2(&runtime);
+        runtime.fail_in_order(["v2_pin_remove_after_one"]);
+        assert_eq!(
+            backend
+                .teardown_drained_v2(drained_v2_request(S2BU_IFINDEX))
+                .await
+                .unwrap(),
+            DrainedV2TeardownOutcome::Partial(DrainedV2TeardownProgress::PinCleanupStarted)
+        );
+        let remaining_before = runtime.state().v2_pins_remaining.get(&pin_dir).copied();
+        runtime
+            .state()
+            .pdr
+            .insert((S2BU_IFINDEX, [9; 4]), [7; DOWNLINK_PDR_VALUE_LEN]);
+
+        assert_eq!(
+            backend
+                .teardown_drained_v2(drained_v2_request(S2BU_IFINDEX))
+                .await
+                .unwrap(),
+            DrainedV2TeardownOutcome::Partial(DrainedV2TeardownProgress::PopulatedStateObserved)
+        );
+        {
+            let state = runtime.state();
+            assert_eq!(
+                state.v2_pins_remaining.get(&pin_dir).copied(),
+                remaining_before
+            );
+            assert!(state.pdr.contains_key(&(S2BU_IFINDEX, [9; 4])));
+        }
+        runtime.state().pdr.remove(&(S2BU_IFINDEX, [9; 4]));
+        assert_eq!(
+            backend
+                .teardown_drained_v2(drained_v2_request(S2BU_IFINDEX))
+                .await
+                .unwrap(),
+            DrainedV2TeardownOutcome::Removed
+        );
     }
 
     #[tokio::test]

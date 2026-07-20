@@ -14,7 +14,8 @@ defaults.
 
 ## API Shape
 
-- Socket wrappers: `NetlinkSocket` and `GtpuUdpSocket`.
+- Socket wrappers: `NetlinkSocket`, including its kernel-assigned local port
+  identifier for reply correlation, and `GtpuUdpSocket`.
 - Bind model: `GtpuUdpBind` and `GtpuIpAddress`.
 - Functions: `open_route_netlink_socket`, `open_generic_netlink_socket`,
   `open_gtpu_udp_socket`, `ifindex_by_name`, `send_message`, and

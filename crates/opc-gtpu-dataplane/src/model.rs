@@ -143,6 +143,140 @@ pub struct GtpDevice {
     pub ifindex: u32,
 }
 
+/// Explicit caller attestation required before removing a drained legacy v2
+/// eBPF pin graph.
+///
+/// Constructing this value asserts that the application writer is stopped,
+/// every session/PDP context has been drained, and no traffic is expected to
+/// traverse the target attachment. The backend independently proves that all
+/// forwarding maps are empty; this attestation never bypasses kernel-state or
+/// identity validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GtpuV2DrainProof {
+    _private: (),
+}
+
+impl GtpuV2DrainProof {
+    /// Attest that session state and traffic have both been drained.
+    ///
+    /// This is an explicit maintenance acknowledgement, not an observation
+    /// made by the SDK. The teardown operation still refuses populated,
+    /// malformed, foreign, or identity-indeterminate state.
+    #[must_use]
+    pub const fn sessions_and_traffic_drained() -> Self {
+        Self { _private: () }
+    }
+}
+
+/// Request to remove one positively identified drained legacy v2 eBPF pin
+/// graph before provisioning the endpoint-bound v3 schema.
+#[derive(Clone, PartialEq, Eq)]
+pub struct DrainedV2TeardownRequest {
+    device: GtpDevice,
+    drain_proof: GtpuV2DrainProof,
+}
+
+impl DrainedV2TeardownRequest {
+    /// Build a request for an exact interface name/index identity.
+    #[must_use]
+    pub const fn new(device: GtpDevice, drain_proof: GtpuV2DrainProof) -> Self {
+        Self {
+            device,
+            drain_proof,
+        }
+    }
+
+    /// Return the expected interface identity.
+    #[must_use]
+    pub const fn device(&self) -> &GtpDevice {
+        &self.device
+    }
+
+    /// Return the explicit drain attestation.
+    #[must_use]
+    pub const fn drain_proof(&self) -> GtpuV2DrainProof {
+        self.drain_proof
+    }
+}
+
+impl fmt::Debug for DrainedV2TeardownRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DrainedV2TeardownRequest")
+            .field("device", &"<redacted-interface-identity>")
+            .field("drain_proof", &self.drain_proof)
+            .finish()
+    }
+}
+
+/// Stable reason a drained-v2 teardown was refused without intentionally
+/// changing the legacy program/map graph.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DrainedV2TeardownRefusal {
+    /// The interface name no longer resolves to the expected ifindex.
+    InterfaceIdentityChanged,
+    /// This backend instance already manages the attachment through the normal
+    /// device lifecycle.
+    ManagedAttachment,
+    /// The retained state is absent, not schema v2, or not a complete
+    /// committed legacy-v2 graph.
+    NotLegacyV2,
+    /// At least one forwarding/session map still contains state.
+    PopulatedState,
+    /// A named pin or tc hook is foreign, replaced, or no longer has the exact
+    /// SDK-owned legacy identity.
+    IdentityMismatch,
+    /// Complete, stable kernel state or mutation authority could not be
+    /// established.
+    IndeterminateState,
+}
+
+/// Stable progress classification for an incomplete teardown.
+///
+/// Every value is safe to persist as operator evidence. A caller must retry
+/// the exact same request and must not provision v3 until it observes
+/// [`DrainedV2TeardownOutcome::Removed`] or
+/// [`DrainedV2TeardownOutcome::AlreadyAbsent`].
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DrainedV2TeardownProgress {
+    /// A durable SDK-owned teardown proof exists, but both exact legacy hooks
+    /// may still be present.
+    ProofCommitted,
+    /// Exactly one legacy tc hook is confirmed absent.
+    OneHookDetached,
+    /// Both legacy tc hooks are confirmed absent and all legacy pins remain
+    /// identity-bound by the teardown proof.
+    HooksDetached,
+    /// Forwarding/session state appeared in a surviving legacy map after the
+    /// durable teardown proof was committed. No further cleanup is allowed
+    /// until the writer is stopped, state is drained again, and the exact
+    /// request is retried.
+    PopulatedStateObserved,
+    /// Pin removal started; the durable proof preserves the exact remaining
+    /// identities for an idempotent retry.
+    PinCleanupStarted,
+    /// A mutation may have completed, but authoritative readback could not
+    /// classify the final state.
+    Indeterminate,
+}
+
+/// Classified result of an explicit drained legacy-v2 teardown.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DrainedV2TeardownOutcome {
+    /// The exact legacy hooks, pins, and teardown proof were removed.
+    Removed,
+    /// The configured legacy namespace is absent and a complete hook dump
+    /// found no legacy SDK program name at any priority or handle on the exact
+    /// interface.
+    AlreadyAbsent,
+    /// The request was refused before intentional graph mutation.
+    Refused(DrainedV2TeardownRefusal),
+    /// Cleanup is incomplete and the exact request must be retried.
+    Partial(DrainedV2TeardownProgress),
+}
+
 /// Request to create a Linux `gtp` netdevice.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct CreateGtpDeviceRequest {

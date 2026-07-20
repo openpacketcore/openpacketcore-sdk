@@ -7,6 +7,12 @@ pub struct NetlinkSocket {
     _private: (),
 }
 
+impl NetlinkSocket {
+    pub fn port_id(&self) -> u32 {
+        0
+    }
+}
+
 #[derive(Debug)]
 pub struct GtpuUdpSocket {
     _private: (),
