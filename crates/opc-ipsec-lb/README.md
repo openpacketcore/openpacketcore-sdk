@@ -16,6 +16,8 @@ steer layer:
 - stateless IKE cookie helper for edge DoS posture;
 - failover safety guards for IV-counter and replay-window restoration;
 - audited same-SPI re-pin coordination with monotonic ownership fencing;
+- durable session-level multi-SA re-pin progress and fenced terminal
+  retirement with bounded stale-retry tombstones;
 - BGP route-export VIP advertisement through the safe route-steering backend;
 - protocol-neutral VIP ownership reconciliation gated by caller-supplied
   leadership, quorum health, listener health, and a monotonic fence;
@@ -459,6 +461,62 @@ contract. Call `validate_authority` during startup; every read and write repeats
 that check and rejects a capability downgrade or a backend unable to retain the
 maximum bounded checkpoint. `MockSessionRePinJournal` is deterministic test
 support, not durable or split-brain authority.
+
+After an authoritative session teardown has removed every product-owned SA,
+key, and dataplane object, retire the exact terminal journal through
+`SessionRePinCoordinator::retire` (or the journal port directly). Retirement
+accepts only `SessionRePinPhase::Complete` and requires the same
+`SessionRePinSessionId` plus operation-and-plan `SessionRePinIdentity` returned
+by terminal success. It never performs teardown itself. A prepared or
+forward-converging checkpoint, a predecessor identity, a guessed successor,
+or a missing record fails closed. The first call returns
+`SessionRePinRetirementDisposition::Retired`; an exact retry after a lost
+acknowledgement or restart returns `AlreadyRetired` with the original deadline.
+Retries never extend that deadline.
+
+The production journal replaces the terminal checkpoint with a fenced/CAS v2
+tombstone at the same private tenant/NF/session key. It contains only the exact
+session, operation, plan-fingerprint, owner, and retirement/expiry bindings—no
+SA requests, SPIs, fences, or counter inputs—and passes through the same
+`EncryptingSessionBackend` and HKMS/KMS rotation path. Checkpoints remain
+byte-compatible v1 payloads. Decoding dispatches only exact v1 or v2 envelope
+versions, requires the record expiry to equal the authenticated v2 payload
+expiry, and rejects unknown versions or metadata. An older SDK understands
+only v1, so it rejects a v2 tombstone as unsupported/unreadable instead of
+mistaking teardown for an active checkpoint or an absent record.
+
+`SESSION_REPIN_RETIREMENT_RETENTION` is a fixed seven days. During that exact
+horizon the tombstone rejects duplicate `begin`, resume, progress, and
+successor attempts; the session-store per-key TTL then bounds cleanup to the
+deployment's retirement rate over seven days. Once cleanup occurs, no finite
+record can prove that an ancient initial request is stale. Consumers must
+therefore mint a non-reused privacy-preserving stable ID for every logical
+session and keep all teardown/retry queues shorter than seven days. This is an
+explicit bounded guarantee, not indefinite replay history.
+
+Retirement, `begin`, successor admission, and progress writes linearize at the
+session-store generation CAS. A `resume` that already read the terminal
+checkpoint may linearize before an overlapping retirement and finish
+completed-prefix reconciliation afterward. That reconciliation can
+idempotently reinstall each retained steering rule before revalidating its
+fence; because the checkpoint is already terminal, it performs no journal
+write and cannot rewrite or recreate the tombstone. Products must therefore
+serialize authoritative teardown against new transitions and resume work—most
+notably before removing steering—instead of using response order as an
+ownership signal. A terminal outcome is not a lease.
+
+```rust,ignore
+use opc_ipsec_lb::SessionRePinRetirementDisposition;
+
+let terminal = saga.resume(&session_id, identity).await?;
+teardown_session_authoritatively(&terminal).await?; // product-owned effects
+let retired = saga.retire(&session_id, terminal.identity()).await?;
+assert!(matches!(
+    retired.disposition(),
+    SessionRePinRetirementDisposition::Retired
+        | SessionRePinRetirementDisposition::AlreadyRetired
+));
+```
 
 This saga does not satisfy the applied-counter receipt requested by
 [issue #333](https://github.com/openpacketcore/openpacketcore-sdk/issues/333).
