@@ -557,8 +557,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `DiameterSctpAssociation::connect_unprotected_with_config*` APIs make the
   remaining PPID-46 path explicit, while every peer carries the sole typed
   `DiameterSctpProtection::Unprotected` value; PPID-0 compatibility stays
-  bounded and inbound-only. PPID metadata, SCTP readiness, health, and metrics
-  make no DTLS or protected-transport claim. The named
+  bounded, direction-specific, and default-off. PPID metadata, SCTP readiness,
+  health, and metrics make no DTLS or protected-transport claim. The named
   `DIAMETER_DTLS_SCTP_PPID` constant is removed so ordinary
   `SctpAssociation` callers cannot mistake raw PPID-47 metadata for a protected
   Diameter path. Existing callers must replace `new` with `new_unprotected`,
@@ -1202,13 +1202,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `15` lowest). Strict decode accepts valid MP-bearing headers while rejecting
   spare bits and MP/value inconsistency; canonical encode emits the typed
   priority, and raw-preserving encode retains ignored/spare wire bits.
-- `opc-sctp`: an explicit, default-off `DiameterInboundPpidPolicy` escape hatch
-  can accept inbound PPID 0 from a configured legacy clear-text Diameter peer.
-  Standard PPID 46 remains accepted and is always used outbound; the policy
-  cannot enable PPID 47 or provide DTLS. The policy survives single-address and
+- `opc-sctp`: independent, default-off `DiameterInboundPpidPolicy` and
+  `DiameterOutboundPpidPolicy` escape hatches can accept or emit PPID 0 for a
+  configured legacy clear-text Diameter peer. Strict inbound validation and
+  outbound PPID 46 remain the defaults; enabling one direction never enables
+  the other, PPID 47, or DTLS. Both policies survive single-address and
   static-multihoming Diameter construction, while association metrics count
-  accepted legacy messages and a redaction-safe warning is emitted at most
-  once per association.
+  accepted inbound legacy messages and a redaction-safe warning is emitted at
+  most once per association.
 - `opc-sctp`: Linux `SCTP_PEER_ADDR_CHANGE` notifications now decode into
   typed, address-redacted events and update a bounded per-association path
   health snapshot with reachability and primary-path state. An event-capable
