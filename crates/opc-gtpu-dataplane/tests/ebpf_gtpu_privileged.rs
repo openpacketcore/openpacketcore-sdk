@@ -58,9 +58,10 @@ use aya::{Ebpf, EbpfLoader};
 use nix::libc;
 use nix::{setsockopt_impl, sockopt_impl};
 use opc_gtpu_dataplane::{
-    CreateGtpDeviceRequest, DscpCodepoint, EbpfGtpuDataplaneBackend,
+    CreateGtpDeviceRequest, DrainedV2TeardownOutcome, DrainedV2TeardownRefusal,
+    DrainedV2TeardownRequest, DscpCodepoint, EbpfGtpuDataplaneBackend,
     EbpfGtpuDataplaneBackendConfig, GtpBearerMark, GtpDevice, GtpPdpContext, GtpVersion,
-    GtpuCapability, GtpuDataplaneBackend, GtpuError, GtpuSourcePortPolicy,
+    GtpuCapability, GtpuDataplaneBackend, GtpuError, GtpuSourcePortPolicy, GtpuV2DrainProof,
     PdpContextIndeterminateReason, PdpContextInstallOutcome, PdpContextLocalTeidSelector,
     PdpContextReadback, PdpContextRemovalOutcome, PdpContextSelector, PdpContextSelectorOccupancy,
     PdpContextUplinkSelector, RemovePdpContextRequest, Teid,
@@ -76,9 +77,11 @@ use opc_gtpu_ebpf_common::{
     GTPU_MANDATORY_HDR_LEN, IPV4_MIN_HDR_LEN, MAP_CONFIG, MAP_COUNTERS,
     MAP_DOWNLINK_BINDING_COUNTERS, MAP_DOWNLINK_ENDPOINT_BINDING, MAP_DOWNLINK_MARK_PDR,
     MAP_DOWNLINK_PDR, MAP_MARKED_BEARER_OWNER, MAP_UPLINK_DSCP, MAP_UPLINK_FAR,
-    MAP_UPLINK_MARK_DSCP, MAP_UPLINK_MARK_FAR, MARKED_BEARER_OWNER_VALUE_LEN, PROG_DOWNLINK,
-    PROG_UPLINK, UDP_HDR_LEN, UPLINK_DSCP_SCHEMA_MARKER_KEY, UPLINK_DSCP_SCHEMA_MARKER_VALUE,
-    UPLINK_FAR_VALUE_LEN, UPLINK_MARK_KEY_LEN,
+    MAP_UPLINK_MARK_DSCP, MAP_UPLINK_MARK_FAR, MARKED_BEARER_OWNER_VALUE_LEN,
+    MARKED_DOWNLINK_PDR_VALUE_LEN, PROG_DOWNLINK, PROG_UPLINK, UDP_HDR_LEN,
+    UPLINK_BEARER_SCHEMA_MARKER_VALUE, UPLINK_DSCP_SCHEMA_MARKER_KEY,
+    UPLINK_DSCP_SCHEMA_MARKER_VALUE, UPLINK_DSCP_VALUE_LEN, UPLINK_FAR_VALUE_LEN,
+    UPLINK_MARK_KEY_LEN,
 };
 use opc_ipsec_xfrm::{
     Algorithm, AuthAlgorithm, InstallPolicyRequest, InstallSaRequest, IpAddress, KeyMaterial,
@@ -128,7 +131,9 @@ const XFRM_DOWNLINK_DESTINATION_PORT: u16 = 5005;
 const IPPROTO_UDP: u8 = 17;
 const IPPROTO_ESP: u8 = 50;
 const FROZEN_V1_OBJECT: &[u8] = include_bytes!("../bpf/opc-gtpu-datapath-v1.bpf.o");
+const FROZEN_V2_OBJECT: &[u8] = include_bytes!("../bpf/opc-gtpu-datapath-v2.bpf.o");
 const SDK_TC_HANDLE: TcHandle = TcHandle::new(0, 1);
+const LEGACY_V2_OWNER_VALUE_LEN: usize = 20;
 
 fn run(program: &str, args: &[&str]) {
     let output = Command::new(program)
@@ -1805,10 +1810,10 @@ fn drain_datagrams(socket: &UdpSocket) {
         .expect("restore blocking socket mode");
 }
 
-fn attach_frozen_v1_program(ebpf: &mut Ebpf, name: &str, attach_type: TcAttachType) -> u32 {
+fn attach_frozen_program(ebpf: &mut Ebpf, name: &str, attach_type: TcAttachType) -> u32 {
     let program: &mut SchedClassifier = ebpf
         .program_mut(name)
-        .expect("frozen v1 program")
+        .expect("frozen program")
         .try_into()
         .expect("frozen program is a tc classifier");
     program.load().expect("load frozen v1 classifier");
@@ -1882,8 +1887,8 @@ fn install_frozen_v1_datapath(pin_dir: &std::path::Path) -> (u32, u32) {
         )
         .expect("seed v1 PDR");
     }
-    let uplink_id = attach_frozen_v1_program(&mut ebpf, PROG_UPLINK, TcAttachType::Egress);
-    let downlink_id = attach_frozen_v1_program(&mut ebpf, PROG_DOWNLINK, TcAttachType::Ingress);
+    let uplink_id = attach_frozen_program(&mut ebpf, PROG_UPLINK, TcAttachType::Egress);
+    let downlink_id = attach_frozen_program(&mut ebpf, PROG_DOWNLINK, TcAttachType::Ingress);
     drop(ebpf);
     (uplink_id, downlink_id)
 }
@@ -1903,6 +1908,120 @@ fn frozen_v1_map_ids(pin_dir: &std::path::Path) -> Vec<u32> {
             .id()
     })
     .collect()
+}
+
+fn install_drained_frozen_v2_datapath(pin_dir: &std::path::Path) -> (u32, u32) {
+    fs::create_dir_all(pin_dir).expect("create frozen v2 pin directory");
+    let mut ebpf = EbpfLoader::new()
+        .default_map_pin_directory(pin_dir)
+        .load(FROZEN_V2_OBJECT)
+        .expect("load frozen v2 object in isolated qualification netns");
+    {
+        let map = ebpf.map_mut(MAP_CONFIG).expect("v2 config map");
+        let mut config = Array::<_, [u8; 4]>::try_from(map).expect("typed v2 config");
+        config
+            .set(0, EPDG_S2BU_IP.octets(), 0)
+            .expect("seed v2 config");
+    }
+    {
+        let map = ebpf.map_mut(MAP_UPLINK_FAR).expect("v2 FAR map");
+        let mut far = BpfHashMap::<_, [u8; 4], [u8; UPLINK_FAR_VALUE_LEN]>::try_from(map)
+            .expect("typed v2 FAR");
+        far.insert(
+            UPLINK_DSCP_SCHEMA_MARKER_KEY,
+            UPLINK_BEARER_SCHEMA_MARKER_VALUE,
+            0,
+        )
+        .expect("seed committed v2 marker");
+    }
+    let uplink_id = attach_frozen_program(&mut ebpf, PROG_UPLINK, TcAttachType::Egress);
+    let downlink_id = attach_frozen_program(&mut ebpf, PROG_DOWNLINK, TcAttachType::Ingress);
+    drop(ebpf);
+    (uplink_id, downlink_id)
+}
+
+fn create_drained_legacy_v2_pins(pin_dir: &std::path::Path) {
+    fs::create_dir_all(pin_dir).expect("create legacy v2 pin directory");
+
+    let mut far = BpfHashMap::<MapData, [u8; 4], [u8; UPLINK_FAR_VALUE_LEN]>::create(65_536, 0)
+        .expect("create legacy v2 FAR");
+    far.insert(
+        UPLINK_DSCP_SCHEMA_MARKER_KEY,
+        UPLINK_BEARER_SCHEMA_MARKER_VALUE,
+        0,
+    )
+    .expect("seed legacy v2 marker");
+    far.pin(pin_dir.join(MAP_UPLINK_FAR))
+        .expect("pin legacy v2 FAR");
+
+    let marked_far =
+        BpfHashMap::<MapData, [u8; UPLINK_MARK_KEY_LEN], [u8; UPLINK_FAR_VALUE_LEN]>::create(
+            65_536, 0,
+        )
+        .expect("create legacy v2 marked FAR");
+    marked_far
+        .pin(pin_dir.join(MAP_UPLINK_MARK_FAR))
+        .expect("pin legacy v2 marked FAR");
+
+    let dscp = BpfHashMap::<MapData, [u8; 4], [u8; UPLINK_DSCP_VALUE_LEN]>::create(65_536, 0)
+        .expect("create legacy v2 DSCP");
+    dscp.pin(pin_dir.join(MAP_UPLINK_DSCP))
+        .expect("pin legacy v2 DSCP");
+
+    let marked_dscp =
+        BpfHashMap::<MapData, [u8; UPLINK_MARK_KEY_LEN], [u8; UPLINK_DSCP_VALUE_LEN]>::create(
+            65_536, 0,
+        )
+        .expect("create legacy v2 marked DSCP");
+    marked_dscp
+        .pin(pin_dir.join(MAP_UPLINK_MARK_DSCP))
+        .expect("pin legacy v2 marked DSCP");
+
+    let pdr = BpfHashMap::<MapData, [u8; 4], [u8; DOWNLINK_PDR_VALUE_LEN]>::create(65_536, 0)
+        .expect("create legacy v2 PDR");
+    pdr.pin(pin_dir.join(MAP_DOWNLINK_PDR))
+        .expect("pin legacy v2 PDR");
+
+    let marked_pdr =
+        BpfHashMap::<MapData, [u8; 4], [u8; MARKED_DOWNLINK_PDR_VALUE_LEN]>::create(65_536, 0)
+            .expect("create legacy v2 marked PDR");
+    marked_pdr
+        .pin(pin_dir.join(MAP_DOWNLINK_MARK_PDR))
+        .expect("pin legacy v2 marked PDR");
+
+    let owner =
+        BpfHashMap::<MapData, [u8; UPLINK_MARK_KEY_LEN], [u8; LEGACY_V2_OWNER_VALUE_LEN]>::create(
+            65_536, 0,
+        )
+        .expect("create legacy v2 owner journal");
+    owner
+        .pin(pin_dir.join(MAP_MARKED_BEARER_OWNER))
+        .expect("pin legacy v2 owner journal");
+
+    let counters =
+        PerCpuArray::<MapData, u64>::create(6, 0).expect("create legacy v2 counter array");
+    counters
+        .pin(pin_dir.join(MAP_COUNTERS))
+        .expect("pin legacy v2 counter array");
+
+    let mut config =
+        Array::<MapData, [u8; 4]>::create(1, 0).expect("create legacy v2 config array");
+    config
+        .set(0, EPDG_S2BU_IP.octets(), 0)
+        .expect("seed legacy v2 config");
+    config
+        .pin(pin_dir.join(MAP_CONFIG))
+        .expect("pin legacy v2 config array");
+}
+
+fn drained_v2_request(ifindex: u32) -> DrainedV2TeardownRequest {
+    DrainedV2TeardownRequest::new(
+        GtpDevice {
+            name: "s2bu".to_string(),
+            ifindex,
+        },
+        GtpuV2DrainProof::sessions_and_traffic_drained(),
+    )
 }
 
 fn pinned_config(pin_dir: &std::path::Path) -> [u8; 4] {
@@ -3038,6 +3157,181 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
         );
     }
     fs::remove_dir_all(&v1_pin_dir).expect("drain endpoint-unbound v1 pins");
+
+    // --- Explicit drained bearer-v2 teardown before endpoint-v3. ---
+    // A map-only same-shape namespace has no positive program-to-map binding
+    // and must never be accepted as SDK-owned.
+    create_drained_legacy_v2_pins(&v1_pin_dir);
+    let v2_maintenance = EbpfGtpuDataplaneBackend::with_config(EbpfGtpuDataplaneBackendConfig {
+        bpffs_pin_root: net.pin_root.clone(),
+        ..EbpfGtpuDataplaneBackendConfig::default()
+    });
+    assert_eq!(
+        v2_maintenance
+            .teardown_drained_v2(drained_v2_request(adopted.ifindex))
+            .await?,
+        DrainedV2TeardownOutcome::Refused(DrainedV2TeardownRefusal::IdentityMismatch)
+    );
+    assert!(v1_pin_dir.exists(), "unproven pins must survive refusal");
+    assert!(
+        !v1_pin_dir.join("GTPU_V2_TEARDOWN").exists(),
+        "hook identity refusal must precede proof mutation"
+    );
+    fs::remove_dir_all(&v1_pin_dir).expect("remove unproven map-only graph");
+
+    // The exact hash-pinned historical object is loaded only in this isolated
+    // qualification netns. No traffic is sent while either v2 program is
+    // attached. Production parses these bytes solely as identity authority.
+    let (v2_uplink_id, v2_downlink_id) = install_drained_frozen_v2_datapath(&v1_pin_dir);
+    assert_eq!(tc_program_id("egress"), v2_uplink_id);
+    assert_eq!(tc_program_id("ingress"), v2_downlink_id);
+    let replaced_pin = v1_pin_dir.join(MAP_MARKED_BEARER_OWNER);
+    fs::remove_file(&replaced_pin).expect("remove exact owner pin before replacement");
+    let replacement_id = {
+        let replacement = Array::<MapData, [u8; LEGACY_V2_OWNER_VALUE_LEN]>::create(1, 0)
+            .expect("create ABI-incompatible replacement pin");
+        replacement
+            .pin(&replaced_pin)
+            .expect("pin ABI-incompatible replacement");
+        MapInfo::from_pin(&replaced_pin)
+            .expect("replacement pin info")
+            .id()
+    };
+    assert_eq!(
+        v2_maintenance
+            .teardown_drained_v2(drained_v2_request(adopted.ifindex))
+            .await?,
+        DrainedV2TeardownOutcome::Refused(DrainedV2TeardownRefusal::IdentityMismatch)
+    );
+    assert_eq!(
+        MapInfo::from_pin(&replaced_pin)
+            .expect("foreign replacement pin must survive")
+            .id(),
+        replacement_id
+    );
+    assert!(v1_pin_dir.exists(), "refusal must preserve the v2 graph");
+    assert_eq!(tc_program_id("egress"), v2_uplink_id);
+    assert_eq!(tc_program_id("ingress"), v2_downlink_id);
+    for direction in ["egress", "ingress"] {
+        run(
+            "tc",
+            &[
+                "filter", "del", "dev", "s2bu", direction, "handle", "0x1", "pref", "50", "bpf",
+            ],
+        );
+    }
+    fs::remove_dir_all(&v1_pin_dir).expect("remove negative replacement graph");
+
+    let (_v2_uplink_id, v2_downlink_id) = install_drained_frozen_v2_datapath(&v1_pin_dir);
+    run(
+        "tc",
+        &[
+            "filter", "del", "dev", "s2bu", "egress", "handle", "0x1", "pref", "50", "bpf",
+        ],
+    );
+    run(
+        "tc",
+        &[
+            "filter", "add", "dev", "s2bu", "egress", "handle", "0x1", "pref", "50", "protocol",
+            "all", "matchall", "action", "pass",
+        ],
+    );
+    assert_eq!(
+        v2_maintenance
+            .teardown_drained_v2(drained_v2_request(adopted.ifindex))
+            .await?,
+        DrainedV2TeardownOutcome::Refused(DrainedV2TeardownRefusal::IdentityMismatch)
+    );
+    assert!(
+        tc_filters("egress").contains("matchall"),
+        "foreign exact-slot hook must survive v2 teardown refusal"
+    );
+    assert_eq!(tc_program_id("ingress"), v2_downlink_id);
+    assert!(
+        !v1_pin_dir.join("GTPU_V2_TEARDOWN").exists(),
+        "identity refusal must precede teardown-proof mutation"
+    );
+    run(
+        "tc",
+        &[
+            "filter", "del", "dev", "s2bu", "egress", "handle", "0x1", "pref", "50", "protocol",
+            "all", "matchall",
+        ],
+    );
+    run(
+        "tc",
+        &[
+            "filter", "del", "dev", "s2bu", "ingress", "handle", "0x1", "pref", "50", "bpf",
+        ],
+    );
+    fs::remove_dir_all(&v1_pin_dir).expect("remove negative foreign-hook graph");
+
+    let (v2_uplink_id, v2_downlink_id) = install_drained_frozen_v2_datapath(&v1_pin_dir);
+    {
+        let map = Map::from_map_data(
+            MapData::from_pin(v1_pin_dir.join(MAP_UPLINK_FAR))
+                .expect("open legacy v2 FAR for population"),
+        )
+        .expect("identify legacy v2 FAR");
+        let mut far = BpfHashMap::<_, [u8; 4], [u8; UPLINK_FAR_VALUE_LEN]>::try_from(map)
+            .expect("typed legacy v2 FAR");
+        far.insert(UE_PAA.octets(), [0x5a; UPLINK_FAR_VALUE_LEN], 0)
+            .expect("populate legacy v2 FAR");
+    }
+    let v2_maintenance = EbpfGtpuDataplaneBackend::with_config(EbpfGtpuDataplaneBackendConfig {
+        bpffs_pin_root: net.pin_root.clone(),
+        ..EbpfGtpuDataplaneBackendConfig::default()
+    });
+    assert_eq!(
+        v2_maintenance
+            .teardown_drained_v2(drained_v2_request(adopted.ifindex))
+            .await?,
+        DrainedV2TeardownOutcome::Refused(DrainedV2TeardownRefusal::PopulatedState)
+    );
+    {
+        let map = Map::from_map_data(
+            MapData::from_pin(v1_pin_dir.join(MAP_UPLINK_FAR))
+                .expect("reopen populated legacy v2 FAR"),
+        )
+        .expect("identify populated legacy v2 FAR");
+        let mut far = BpfHashMap::<_, [u8; 4], [u8; UPLINK_FAR_VALUE_LEN]>::try_from(map)
+            .expect("typed populated legacy v2 FAR");
+        assert_eq!(
+            far.get(&UE_PAA.octets(), 0)
+                .expect("populated entry must survive refusal"),
+            [0x5a; UPLINK_FAR_VALUE_LEN]
+        );
+        far.remove(&UE_PAA.octets())
+            .expect("drain populated legacy v2 FAR");
+    }
+    assert_eq!(tc_program_id("egress"), v2_uplink_id);
+    assert_eq!(tc_program_id("ingress"), v2_downlink_id);
+
+    assert_eq!(
+        v2_maintenance
+            .teardown_drained_v2(drained_v2_request(adopted.ifindex))
+            .await?,
+        DrainedV2TeardownOutcome::Removed
+    );
+    assert_eq!(
+        v2_maintenance
+            .teardown_drained_v2(drained_v2_request(adopted.ifindex))
+            .await?,
+        DrainedV2TeardownOutcome::AlreadyAbsent
+    );
+    assert!(!v1_pin_dir.exists(), "all v2 pins must be removed");
+    assert!(!tc_filters("egress").contains(PROG_UPLINK));
+    assert!(!tc_filters("ingress").contains(PROG_DOWNLINK));
+
+    let mut v3_request = CreateGtpDeviceRequest::new("s2bu");
+    v3_request.bind_address = IpAddr::V4(EPDG_S2BU_IP);
+    let v3_device = v2_maintenance.create_device(v3_request).await?;
+    assert!(
+        v1_pin_dir.join(MAP_DOWNLINK_ENDPOINT_BINDING).exists(),
+        "fresh provisioning after v2 teardown must create endpoint-v3 pins"
+    );
+    v2_maintenance.remove_device(&v3_device).await?;
+    drop(v2_maintenance);
 
     // --- Static pin-path replacement safety. ---
     // Swap two exact named pin paths while this test is the only writer. The

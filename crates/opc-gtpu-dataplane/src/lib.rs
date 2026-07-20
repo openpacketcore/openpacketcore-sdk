@@ -17,6 +17,12 @@
 //! `GETPDP` inspection but intentionally cannot claim exact removal because the
 //! kernel API has no compare-delete primitive.
 //!
+//! A separate maintenance-only drained-v2 teardown accepts an explicit typed
+//! drain attestation, proves the complete frozen legacy program/map identity,
+//! and retains durable identity evidence until partial hook/pin cleanup is
+//! complete. Normal startup and adoption continue to reject endpoint-unbound
+//! v2 state.
+//!
 //! Raw Linux netlink and socket syscalls stay in [`opc_linux_gtpu_sys`]; this
 //! crate is safe Rust and never performs `unsafe` operations.
 
@@ -42,13 +48,14 @@ pub use mock::{
     MockPdpContextReconciliationOperation,
 };
 pub use model::{
-    CreateGtpDeviceRequest, GtpAddressFamily, GtpBearerMark, GtpDevice, GtpPdpContext, GtpRole,
-    GtpVersion, GtpuBackendKind, GtpuCapability, GtpuDownlinkEndpoint, GtpuProbe,
-    GtpuSourcePortPolicy, GtpuSourcePortRange, PdpContextConflict, PdpContextIndeterminateReason,
-    PdpContextInstallOutcome, PdpContextLocalTeidSelector, PdpContextMismatchField,
-    PdpContextReadback, PdpContextReconciliationCapabilities, PdpContextRemovalOutcome,
-    PdpContextSelector, PdpContextSelectorOccupancy, PdpContextUplinkIdentity,
-    PdpContextUplinkSelector, RemovePdpContextRequest, Teid, GTPU_PORT,
+    CreateGtpDeviceRequest, DrainedV2TeardownOutcome, DrainedV2TeardownProgress,
+    DrainedV2TeardownRefusal, DrainedV2TeardownRequest, GtpAddressFamily, GtpBearerMark, GtpDevice,
+    GtpPdpContext, GtpRole, GtpVersion, GtpuBackendKind, GtpuCapability, GtpuDownlinkEndpoint,
+    GtpuProbe, GtpuSourcePortPolicy, GtpuSourcePortRange, GtpuV2DrainProof, PdpContextConflict,
+    PdpContextIndeterminateReason, PdpContextInstallOutcome, PdpContextLocalTeidSelector,
+    PdpContextMismatchField, PdpContextReadback, PdpContextReconciliationCapabilities,
+    PdpContextRemovalOutcome, PdpContextSelector, PdpContextSelectorOccupancy,
+    PdpContextUplinkIdentity, PdpContextUplinkSelector, RemovePdpContextRequest, Teid, GTPU_PORT,
 };
 pub use opc_types::DscpCodepoint;
 pub use unsupported::UnsupportedGtpuDataplaneBackend;

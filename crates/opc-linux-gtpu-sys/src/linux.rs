@@ -8,11 +8,16 @@ use crate::{GtpuIpAddress, GtpuUdpBind};
 #[derive(Debug)]
 pub struct NetlinkSocket {
     fd: OwnedFd,
+    port_id: u32,
 }
 
 impl NetlinkSocket {
     pub fn as_fd(&self) -> BorrowedFd<'_> {
         self.fd.as_fd()
+    }
+
+    pub fn port_id(&self) -> u32 {
+        self.port_id
     }
 }
 
@@ -56,10 +61,37 @@ pub fn open_netlink_socket(protocol: i32) -> io::Result<NetlinkSocket> {
         )
     };
     if rc < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(NetlinkSocket { fd })
+        return Err(io::Error::last_os_error());
     }
+
+    let mut local = kernel_netlink_addr(0);
+    let mut local_len = mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t;
+    // SAFETY: `local` and `local_len` are initialized writable address
+    // outputs, and `fd` is a live bound netlink descriptor.
+    let rc = unsafe {
+        libc::getsockname(
+            fd.as_raw_fd(),
+            (&mut local as *mut libc::sockaddr_nl).cast::<libc::sockaddr>(),
+            &mut local_len,
+        )
+    };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if local_len != mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t
+        || i32::from(local.nl_family) != libc::AF_NETLINK
+        || local.nl_pid == 0
+        || local.nl_groups != 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid local netlink socket identity",
+        ));
+    }
+    Ok(NetlinkSocket {
+        fd,
+        port_id: local.nl_pid,
+    })
 }
 
 pub fn open_gtpu_udp_socket(bind: GtpuUdpBind) -> io::Result<GtpuUdpSocket> {
@@ -280,6 +312,17 @@ mod tests {
     }
 
     #[test]
+    fn route_socket_reports_kernel_assigned_port_id() {
+        match open_netlink_socket(crate::NETLINK_ROUTE) {
+            Ok(socket) => assert_ne!(socket.port_id(), 0),
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping: netlink socket creation denied by sandbox");
+            }
+            Err(error) => panic!("unexpected netlink socket error: {error}"),
+        }
+    }
+
+    #[test]
     fn sockaddr_in_preserves_wire_octets_and_port() {
         let addr = sockaddr_in([192, 0, 2, 9], 2152);
         assert_eq!(addr.sin_family, libc::AF_INET as libc::sa_family_t);
@@ -379,7 +422,13 @@ mod tests {
         // SAFETY: `fds[1]` is the second fresh descriptor returned by
         // `socketpair` and is not owned anywhere else.
         let peer = unsafe { OwnedFd::from_raw_fd(fds[1]) };
-        Some((NetlinkSocket { fd: local }, peer))
+        Some((
+            NetlinkSocket {
+                fd: local,
+                port_id: 0,
+            },
+            peer,
+        ))
     }
 
     fn try_send_all(peer: &OwnedFd, payload: &[u8]) -> Option<()> {

@@ -441,6 +441,158 @@ any retained PDR/FAR without an exact binding is indeterminate and fails before
 either hook changes. The SDK never invents `Any`, derives a peer from an
 untrusted packet, or labels endpoint-unbound forwarding state production-ready.
 
+#### Drained v2 teardown for v3 reprovisioning
+
+`GtpuDataplaneBackend::teardown_drained_v2` is the only supported SDK path for
+removing a committed endpoint-unbound v2 graph. It is an explicit maintenance
+operation, not part of startup or adoption. Normal `resolve_device` continues
+to reject v2, and consumers must not replace this operation with blind bpffs
+unlinking or ad hoc tc changes.
+
+Before constructing `GtpuV2DrainProof`, the caller must stop every application
+writer for the target attachment, prevent new traffic, drain every PDP/session
+record, and retain the exact interface name and ifindex observed for that
+drain. The attestation does not override the SDK's checks: the eBPF backend
+acquires the same exclusive reconciler lease, resolves the name back to the
+same ifindex, rejects a normally managed attachment, proves the complete v2
+program/map/hook identity, requires both exact legacy hooks before creating the
+first durable teardown proof, rejects same-name duplicates and cross-direction
+legacy SDK programs at every priority and handle, and independently verifies
+that all forwarding and session maps are empty before changing anything. Every
+proof-backed retry repeats both complete hook scans before mutation. An absent
+hook is admissible only while resuming a proof that the SDK committed before
+detaching either hook; map names, ABI, and the schema marker alone are never
+ownership.
+If the configured pin namespace is already absent, `AlreadyAbsent` is returned
+only after complete ingress and egress dumps also prove that neither legacy SDK
+program name exists at any priority or handle on the exact interface. A stale
+hook installed with a historical non-default priority therefore fails closed
+instead of being hidden by the backend's current priority.
+
+The maintenance window must also exclude uncoordinated interface rename or
+deletion, tc mutation, bpffs pin replacement, and any writer that bypasses the
+SDK reconciler lease. The abstract-socket lease serializes cooperating SDK
+backends; it cannot authorize or fence an external privileged process. The
+backend repeats authoritative readback around each destructive step, but this
+exclusive-writer condition is what excludes an external replace-and-restore
+inside the remaining kernel check/use windows.
+
+```rust,no_run
+use opc_gtpu_dataplane::{
+    DrainedV2TeardownOutcome, DrainedV2TeardownProgress,
+    DrainedV2TeardownRequest, GtpDevice, GtpuDataplaneBackend,
+    GtpuV2DrainProof,
+};
+
+# async fn maintenance(
+#     backend: &dyn GtpuDataplaneBackend,
+#     drained_device: GtpDevice,
+# ) -> Result<(), Box<dyn std::error::Error>> {
+let request = DrainedV2TeardownRequest::new(
+    drained_device,
+    GtpuV2DrainProof::sessions_and_traffic_drained(),
+);
+
+loop {
+    match backend.teardown_drained_v2(request.clone()).await? {
+        DrainedV2TeardownOutcome::Removed
+        | DrainedV2TeardownOutcome::AlreadyAbsent => break,
+        DrainedV2TeardownOutcome::Partial(
+            DrainedV2TeardownProgress::PopulatedStateObserved,
+        ) => {
+            // Stop here. Re-establish the drain before retrying this request.
+            return Err(std::io::Error::other(
+                "legacy state appeared after teardown began",
+            )
+            .into());
+        }
+        DrainedV2TeardownOutcome::Partial(_) => {
+            // Persist the progress evidence, then retry this exact request.
+        }
+        DrainedV2TeardownOutcome::Refused(reason) => {
+            // Preserve the graph and resolve the typed refusal operationally.
+            return Err(std::io::Error::other(format!(
+                "drained v2 teardown refused: {reason:?}",
+            ))
+            .into());
+        }
+        _ => {
+            return Err(std::io::Error::other(
+                "unrecognized drained v2 teardown outcome",
+            )
+            .into());
+        }
+    }
+}
+
+// Only now may the caller provision the endpoint-bound v3 attachment.
+# Ok(())
+# }
+```
+
+The first authorized mutation commits a pinned, checksummed teardown proof
+containing the exact interface, hook-program, live-tag, nine-map identities,
+and the proof map's own immutable kernel ID. Every retry revalidates that
+self-ID, the proof map's complete array ABI, and both recorded tags against the
+hash-pinned frozen artifact before trusting the record.
+That proof survives hook and pin cleanup and is removed only after a fresh
+directory inventory proves it is the sole remaining entry. A retry therefore
+continues only against surviving objects with the recorded IDs and ABI. Once
+both hooks, every recorded map, and the exact proof are authoritatively absent,
+failure to remove the now-cosmetic empty directory still returns `Removed`; it
+must not manufacture an unfenced retry state. Before every individual pin
+unlink, every surviving forwarding/session map is checked again for state. If
+state reappears, cleanup stops with
+`Partial(PopulatedStateObserved)`; the caller must stop the writer and drain
+again before submitting the same request. Other `Partial` outcomes are durable
+progress classifications for an exact-request retry. `Refused` means the SDK
+made no intentional graph mutation. The caller may reprovision v3 only after
+`Removed` or `AlreadyAbsent`. While the proof pin remains, normal create and
+adopt preflight returns the typed `ebpf_legacy_v2_teardown_pending`
+indeterminate error instead of treating a proof-only crash state as fresh v3
+state.
+
+Hook ownership readback is authoritative only after an uninterrupted
+multipart rtnetlink dump completes with a zero status. Every data reply must
+match the requested interface, clsact parent, and Ethernet protocol, and every
+reply must match the request sequence and the socket's kernel-assigned local
+port ID;
+interrupted dumps, overruns, malformed completion, and duplicate exact-slot
+owners leave teardown indeterminate and preserve the durable proof.
+
+The identity authority for this path is the frozen
+`bpf/opc-gtpu-datapath-v2.bpf.o` object from commit
+`8fa98f275eea35cd16add149b609992345603c8c`, with SHA-256
+`7d0c1b452ad562d4c8c286bf05a4c5308f6fd5b4c677cc3c2125b194860464a5`.
+Production code parses that object in userspace solely to identify the exact
+legacy programs, maps, relocations, and portable kernel tag candidates. It is
+never loaded, attached, or executed by the production v3 runtime: the frozen
+bytes are private to a parse-only child module whose production API exposes
+only the derived, provenance-checked program tags. The privileged qualification
+test loads and attaches it without traffic in a fresh, ephemeral network
+namespace solely to prove the real frozen tags, program-to-map bindings, exact
+detach, and pin cleanup. CI verifies the committed bytes against the exact
+historical repository blob and separately compares a source rebuild's public
+program/map inventory. The rebuild comparison is structural evidence; it is not
+a byte-for-byte reproducible-build claim because the historical linker output
+is host-sensitive.
+
+The frozen object and its corresponding source are licensed under this
+repository's Apache-2.0 license. The byte-exact authority can be restored from
+the recorded Git object without rebuilding it:
+
+```bash
+git cat-file blob \
+  '8fa98f275eea35cd16add149b609992345603c8c:crates/opc-gtpu-dataplane/bpf/opc-gtpu-datapath.bpf.o' \
+  > crates/opc-gtpu-dataplane/bpf/opc-gtpu-datapath-v2.bpf.o
+echo '7d0c1b452ad562d4c8c286bf05a4c5308f6fd5b4c677cc3c2125b194860464a5  crates/opc-gtpu-dataplane/bpf/opc-gtpu-datapath-v2.bpf.o' \
+  | sha256sum -c -
+```
+
+Rebuilding the historical source with `scripts/build-gtpu-ebpf.sh` is useful
+for program/map inventory review, but exact-byte reproduction is not currently
+supported or claimed.
+
 Empty v0/v1 hook replacement is authorized only by the frozen
 `bpf/opc-gtpu-datapath-v1.bpf.o` fixture. It is the DSCP-generation artifact
 from commit `4fd43cf1465a46b6afa35348b2463fa9c497fce4`, with SHA-256
@@ -460,13 +612,14 @@ commit fails after replacing an existing datapath. Fresh provisioning still
 rolls back a first hook that it created in an originally empty slot.
 
 All mutations through clones of one backend are serialized as one
-reconciliation. Independently constructed backends and processes
+reconciliation. Cooperating independently constructed backends and processes
 cannot own the same `(network namespace, canonical pin directory, interface)`
 at the same time: a kernel-lifetime abstract socket provides exclusive
 ownership and a second live reconciler receives `AlreadyExists`. Process exit
 releases the ownership automatically, allowing a replacement to call
 `resolve_device` and adopt the surviving pins. A rolling handoff must therefore
-stop the old writer before the new writer adopts the interface.
+stop the old writer before the new writer adopts the interface. Privileged
+processes that bypass this lease remain outside the supported mutation model.
 
 The runtime takes both tc links out of Aya loader ownership, so dropping an old
 loader cannot detach a static filter that an external actor subsequently
@@ -507,7 +660,9 @@ and application memory are not read through that operation. The userspace
 `opc-gtpu-dataplane` crate remains entirely safe Rust. Its committed current
 object is embedded from
 `crates/opc-gtpu-dataplane/bpf/opc-gtpu-datapath.bpf.o`; the frozen v1 object is
-retained only for the exact migration proof described above.
+retained only for the exact automatic empty-graph migration proof described
+above, and the frozen v2 object is retained only for the explicit drained
+teardown identity proof. Neither legacy object runs as the v3 datapath.
 
 ## Status And Limits
 

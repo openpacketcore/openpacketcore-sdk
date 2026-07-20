@@ -511,6 +511,58 @@ remain downstream responsibilities.
 
 ---
 
+## Current drained eBPF v2 teardown foundation — 2026-07-19
+
+`opc-gtpu-dataplane` now exposes a maintenance-only, backend-neutral request and
+typed outcome for removing a positively identified, drained endpoint-unbound v2
+eBPF graph before endpoint-bound v3 reprovisioning. The eBPF implementation
+requires an explicit product-owned sessions-and-traffic drain attestation and
+exact interface name/index, then independently acquires the normal reconciler
+lease, requires both exact legacy hooks and their complete program-to-map
+binding before the first proof, rejects same-name extras and cross-direction
+legacy SDK names across complete ingress/egress dumps, and proves empty
+forwarding/session maps. The same two hook-wide scans run on every proof-backed
+retry before mutation. Hook absence is accepted only on a proof-backed retry.
+Normal startup and adoption
+still reject committed v2 state and any proof-only interrupted teardown state.
+
+Before mutation, the implementation commits a durable kernel-pinned proof of
+the exact interface, hook program IDs/live tags, nine map IDs, and the proof
+map's own kernel ID. Proof retries revalidate the full proof-map ABI, its
+self-ID, and both directional tags against the frozen artifact. Both hooks
+are detached with exact readback; every surviving pin is re-opened and checked
+for recorded identity and ABI, and every surviving mutable forwarding/session
+map is re-read before each individual unlink. The proof is removed last.
+Interrupted work therefore returns bounded, redaction-safe progress and can be
+retried with the exact request. State repopulation after proof commit has a
+distinct partial result and stops further cleanup until the product drains the
+writer and traffic again. Foreign hooks, replaced pins, populated state, ABI
+mismatch, and unreadable state fail closed without being relabelled as absent.
+Missing pin state is reported absent only after complete target-bound
+ingress/egress dumps find no legacy SDK program name at any priority or handle.
+
+The production runtime's parse-only child module keeps the frozen v2 bytes
+private and exposes only derived, provenance-checked program tags; production
+loader code cannot receive the embedded object through that module. CI binds
+the exact bytes to the Apache-2.0 historical repository blob and separately
+checks a rebuild's public program/map inventory. That rebuild check is
+structural evidence, not an exact-byte reproducibility claim. A privileged
+fresh-namespace qualification test loads and attaches the exact hash-pinned
+object without traffic solely to prove the live program tags, program-to-map
+binding, exact hook removal, nine-pin cleanup, and subsequent fresh
+endpoint-bound v3 provisioning. Unit tests cover each mutation failure phase,
+acknowledgement loss, idempotent retry, proof-only crash fencing, concurrent
+state reappearance, foreign path shapes, and refusal classifications.
+
+This closes the missing typed SDK maintenance primitive. Stopping all writers,
+preventing traffic, proving product/session drain, persisting operator evidence,
+retry scheduling, and deciding when to reprovision remain downstream/operator
+responsibilities; the SDK does not infer those conditions. The maintenance
+window must also exclude external interface, tc, and bpffs mutation that bypasses
+the cooperating SDK reconciler lease.
+
+---
+
 ## Historical EPC/untrusted-access hardening snapshot — T-8c57ecee (2026-06-28)
 
 This snapshot records the final EPC/untrusted-access SDK readiness pass after
