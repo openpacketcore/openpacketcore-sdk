@@ -236,6 +236,6 @@ jobs:
           inventory "${rebuilt}" > rebuilt.inventory
           cat rebuilt.inventory
           diff -u committed.inventory rebuilt.inventory
-          for symbol in opc_gtpu_uplink opc_gtpu_downlink checksum_loop_chunk authorize_and_decap_downlink parse_downlink pdp_commit_wire_is_valid pdp_commit_wire_authorizes_graph marked_owner_wire_authorizes_uplink pdp_commit_wire_authorizes_downlink marked_owner_wire_authorizes_downlink GTPU_UPLINK_FAR GTPU_ULM_FAR GTPU_UPLINK_DSCP GTPU_ULM_DSCP GTPU_UL_SPORT GTPU_ULM_SPORT GTPU_DOWNLINK_PDR GTPU_DLM_PDR GTPU_DL_BIND GTPU_DL_DROP GTPU_M_OWNER GTPU_COUNTERS GTPU_CONFIG; do
+          for symbol in opc_gtpu_uplink opc_gtpu_downlink checksum_loop_chunk authorize_and_decap_downlink parse_downlink pdp_commit_wire_is_valid pdp_commit_wire_authorizes_graph marked_owner_wire_authorizes_uplink pdp_commit_wire_authorizes_downlink marked_owner_wire_authorizes_downlink GTPU_UPLINK_FAR GTPU_ULM_FAR GTPU_UPLINK_DSCP GTPU_ULM_DSCP GTPU_UL_SPORT GTPU_ULM_SPORT GTPU_PMTU_CFG GTPU_PMTU_DROP GTPU_DOWNLINK_PDR GTPU_DLM_PDR GTPU_DL_BIND GTPU_DL_DROP GTPU_M_OWNER GTPU_COUNTERS GTPU_CONFIG; do
             grep -q " ${symbol}$" committed.inventory
           done

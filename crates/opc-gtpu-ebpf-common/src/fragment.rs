@@ -11,9 +11,7 @@
 //! reassembly memory and time stay bounded by the kernel's configured
 //! limits and are reported through the backend capability surface.
 
-use crate::{
-    classify_gtpu, GtpuClass, GTPU_MANDATORY_HDR_LEN, GTPU_MAX_EXT_HEADERS, GTPU_OPT_LEN,
-};
+use crate::{classify_gtpu, GtpuClass, GTPU_MANDATORY_HDR_LEN, GTPU_MAX_EXT_HEADERS, GTPU_OPT_LEN};
 
 /// Explicit downlink outer-fragment handling contract of a GTP-U backend.
 ///
@@ -197,7 +195,9 @@ mod tests {
 
     fn inner() -> Vec<u8> {
         // Minimum inner IPv4 header plus payload.
-        let mut inner = vec![0x45, 0, 0, 24, 0, 0, 0, 0, 64, 17, 0, 0, 10, 45, 0, 2, 10, 45, 0, 2];
+        let mut inner = vec![
+            0x45, 0, 0, 24, 0, 0, 0, 0, 64, 17, 0, 0, 10, 45, 0, 2, 10, 45, 0, 2,
+        ];
         inner.extend_from_slice(b"data");
         inner
     }
@@ -226,7 +226,7 @@ mod tests {
     #[test]
     fn optional_block_and_bounded_extension_walk_match_the_fast_path() {
         let mut body = vec![0, 1, 0, 0x85]; // optional block, next ext type 0x85
-        // One extension header: two 4-byte units, terminated by type 0.
+                                            // One extension header: two 4-byte units, terminated by type 0.
         body.extend_from_slice(&[2, 0xaa, 0xbb, 0, 0xcc, 0xdd, 0xee, 0]);
         body.extend_from_slice(&inner());
         let message = gpdu([0x10, 0, 0, 2], 0x34, &body);
@@ -236,7 +236,10 @@ mod tests {
 
     #[test]
     fn malformed_messages_fail_closed_with_bounded_reasons() {
-        assert_eq!(parse_gtpu_tpdu(&[0x30; 7]), Err(GtpuTpduError::TruncatedHeader));
+        assert_eq!(
+            parse_gtpu_tpdu(&[0x30; 7]),
+            Err(GtpuTpduError::TruncatedHeader)
+        );
 
         // Declared length disagrees with the message end.
         let mut bad_length = gpdu([0x10, 0, 0, 1], 0x30, &inner());

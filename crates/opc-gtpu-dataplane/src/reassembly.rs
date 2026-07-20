@@ -179,10 +179,7 @@ where
     B: Fn([u8; 4]) -> Option<DownlinkEndpointBinding>,
 {
     /// Construct a consumer over the given PDR and binding lookups.
-    pub fn new(
-        lookup_pdr: P,
-        lookup_binding: B,
-    ) -> Self {
+    pub fn new(lookup_pdr: P, lookup_binding: B) -> Self {
         Self {
             lookup_pdr,
             lookup_binding,
@@ -288,11 +285,21 @@ mod tests {
         .unwrap()
     }
 
+    type PdrLookup = Box<dyn Fn([u8; 4]) -> Option<MarkedDownlinkPdr>>;
+    type BindingLookup = Box<dyn Fn([u8; 4]) -> Option<DownlinkEndpointBinding>>;
+
     fn pdr(mark: [u8; 4]) -> MarkedDownlinkPdr {
         MarkedDownlinkPdr {
             ue_ip: UE.octets(),
             bearer_mark: mark,
         }
+    }
+
+    fn consumer(mark: [u8; 4]) -> GtpuReassemblyConsumer<PdrLookup, BindingLookup> {
+        GtpuReassemblyConsumer::new(
+            Box::new(move |teid| (teid == TEID).then(|| pdr(mark))),
+            Box::new(move |teid| (teid == TEID).then(binding)),
+        )
     }
 
     fn inner_packet(dst: Ipv4Addr) -> Vec<u8> {
@@ -310,18 +317,6 @@ mod tests {
         message[2..4].copy_from_slice(&declared.to_be_bytes());
         message.extend_from_slice(inner);
         message
-    }
-
-    fn consumer(
-        mark: [u8; 4],
-    ) -> GtpuReassemblyConsumer<
-        impl Fn([u8; 4]) -> Option<MarkedDownlinkPdr>,
-        impl Fn([u8; 4]) -> Option<DownlinkEndpointBinding>,
-    > {
-        GtpuReassemblyConsumer::new(
-            move |teid| (teid == TEID).then(|| pdr(mark)),
-            move |teid| (teid == TEID).then(binding),
-        )
     }
 
     #[test]
@@ -362,8 +357,8 @@ mod tests {
             GtpuReassemblyOutcome::Dropped(GtpuReassemblyDrop::UnknownTeid)
         );
         // Wrong outer peer.
-        let wrong_peer = DownlinkOuterProvenance::new(Ipv4Addr::new(192, 0, 2, 11), LOCAL, 7, 2152)
-            .unwrap();
+        let wrong_peer =
+            DownlinkOuterProvenance::new(Ipv4Addr::new(192, 0, 2, 11), LOCAL, 7, 2152).unwrap();
         assert_eq!(
             consumer.process(&gpdu(TEID, &inner_packet(UE)), &wrong_peer),
             GtpuReassemblyOutcome::Dropped(GtpuReassemblyDrop::BindingMismatch(

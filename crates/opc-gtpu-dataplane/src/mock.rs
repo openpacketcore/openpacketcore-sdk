@@ -438,6 +438,11 @@ impl GtpuDataplaneBackend for MockGtpuDataplaneBackend {
                 "name must be nonempty",
             ));
         }
+        if request.uplink_mtu_policy.is_some() {
+            return Err(GtpuError::UnsupportedFeature {
+                feature: "uplink_pmtu_enforcement",
+            });
+        }
         if state.devices.contains_key(&request.name) {
             return Err(GtpuError::AlreadyExists);
         }

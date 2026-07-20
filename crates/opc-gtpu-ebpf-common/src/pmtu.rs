@@ -309,10 +309,7 @@ pub fn apply_uplink_mtu_policy(
 ) -> bool {
     let outer_total = u32::from(u16::from_be_bytes([encap[2], encap[3]]));
     if outer_total > u32::from(policy.effective_link_mtu) {
-        return matches!(
-            policy.fragmentation,
-            GtpuOuterFragmentPolicy::FragmentOuter
-        );
+        return matches!(policy.fragmentation, GtpuOuterFragmentPolicy::FragmentOuter);
     }
     if matches!(
         policy.fragmentation,
@@ -357,10 +354,12 @@ pub fn decide_uplink_encap(
         })
     } else {
         match mtu_policy.fragmentation {
-            GtpuOuterFragmentPolicy::FragmentOuter => Some(UplinkEncapOutcome::EmitOuterFragmented {
-                encap,
-                excess: (outer_total - link_mtu) as u16,
-            }),
+            GtpuOuterFragmentPolicy::FragmentOuter => {
+                Some(UplinkEncapOutcome::EmitOuterFragmented {
+                    encap,
+                    excess: (outer_total - link_mtu) as u16,
+                })
+            }
             GtpuOuterFragmentPolicy::SignalPacketTooBig => Some(UplinkEncapOutcome::RejectTooBig {
                 signal: GtpuPmtuSignal::new(inner_family, mtu_policy.inner_mtu()),
                 encap_overhead: GTPU_ENCAP_LEN as u16,
@@ -393,11 +392,22 @@ mod tests {
 
     #[test]
     fn policy_construction_bounds_and_headroom_accounting() {
-        assert!(GtpuUplinkMtuPolicy::new(MIN_UPLINK_LINK_MTU - 1, GtpuOuterFragmentPolicy::FragmentOuter).is_none());
-        let policy = GtpuUplinkMtuPolicy::new(MIN_UPLINK_LINK_MTU, GtpuOuterFragmentPolicy::FragmentOuter).unwrap();
+        assert!(GtpuUplinkMtuPolicy::new(
+            MIN_UPLINK_LINK_MTU - 1,
+            GtpuOuterFragmentPolicy::FragmentOuter
+        )
+        .is_none());
+        let policy =
+            GtpuUplinkMtuPolicy::new(MIN_UPLINK_LINK_MTU, GtpuOuterFragmentPolicy::FragmentOuter)
+                .unwrap();
         assert_eq!(policy.inner_mtu(), 68);
-        assert_eq!(strict_policy(1500).inner_mtu(), 1500 - GTPU_ENCAP_LEN as u16);
-        assert!(GtpuUplinkMtuPolicy::new(u16::MAX, GtpuOuterFragmentPolicy::FragmentOuter).is_some());
+        assert_eq!(
+            strict_policy(1500).inner_mtu(),
+            1500 - GTPU_ENCAP_LEN as u16
+        );
+        assert!(
+            GtpuUplinkMtuPolicy::new(u16::MAX, GtpuOuterFragmentPolicy::FragmentOuter).is_some()
+        );
     }
 
     #[test]
@@ -499,13 +509,8 @@ mod tests {
         // applies.
         assert_eq!(
             encap,
-            build_uplink_encap_with_dscp_and_source_port(
-                &far(),
-                1400,
-                None,
-                crate::GTPU_UDP_PORT
-            )
-            .unwrap()
+            build_uplink_encap_with_dscp_and_source_port(&far(), 1400, None, crate::GTPU_UDP_PORT)
+                .unwrap()
         );
     }
 
@@ -626,28 +631,21 @@ mod tests {
 
     #[test]
     fn apply_gate_matches_decide_for_both_policies() {
-        let mut encap = build_uplink_encap_with_dscp_and_source_port(
-            &far(),
-            1480,
-            None,
-            crate::GTPU_UDP_PORT,
-        )
-        .unwrap();
+        let mut encap =
+            build_uplink_encap_with_dscp_and_source_port(&far(), 1480, None, crate::GTPU_UDP_PORT)
+                .unwrap();
         assert!(!apply_uplink_mtu_policy(&mut encap, strict_policy(1500)));
         assert_eq!(
             encap[6] & 0x40,
             0,
             "a rejected encapsulation is never DF-stamped or emitted"
         );
-        let fragment = GtpuUplinkMtuPolicy::new(1500, GtpuOuterFragmentPolicy::FragmentOuter).unwrap();
+        let fragment =
+            GtpuUplinkMtuPolicy::new(1500, GtpuOuterFragmentPolicy::FragmentOuter).unwrap();
         assert!(apply_uplink_mtu_policy(&mut encap, fragment));
-        let mut fitting = build_uplink_encap_with_dscp_and_source_port(
-            &far(),
-            1400,
-            None,
-            crate::GTPU_UDP_PORT,
-        )
-        .unwrap();
+        let mut fitting =
+            build_uplink_encap_with_dscp_and_source_port(&far(), 1400, None, crate::GTPU_UDP_PORT)
+                .unwrap();
         assert!(apply_uplink_mtu_policy(&mut fitting, strict_policy(1500)));
         assert_eq!(fitting[6] & 0x40, 0x40);
     }

@@ -52,18 +52,19 @@ pub use model::{
     CreateGtpDeviceRequest, DrainedV2TeardownOutcome, DrainedV2TeardownProgress,
     DrainedV2TeardownRefusal, DrainedV2TeardownRequest, GtpAddressFamily, GtpBearerMark, GtpDevice,
     GtpPdpContext, GtpRole, GtpVersion, GtpuBackendKind, GtpuCapability, GtpuDownlinkEndpoint,
-    GtpuProbe, GtpuSourcePortPolicy, GtpuSourcePortRange, GtpuUplinkSourcePortPolicy,
+    GtpuDownlinkFragmentContract, GtpuOuterFragmentPolicy, GtpuProbe, GtpuReassemblyBounds,
+    GtpuSourcePortPolicy, GtpuSourcePortRange, GtpuUplinkMtuPolicy, GtpuUplinkSourcePortPolicy,
     GtpuV2DrainProof, PdpContextConflict, PdpContextIndeterminateReason, PdpContextInstallOutcome,
     PdpContextLocalTeidSelector, PdpContextMismatchField, PdpContextReadback,
     PdpContextReconciliationCapabilities, PdpContextRemovalOutcome, PdpContextSelector,
     PdpContextSelectorOccupancy, PdpContextUplinkIdentity, PdpContextUplinkSelector,
     RemovePdpContextRequest, Teid, GTPU_PORT,
 };
-pub use reassembly::{
-    DownlinkOuterProvenance, GtpuReassemblyConsumer, GtpuReassemblyCounters,
-    GtpuReassemblyDrop, GtpuReassemblyOutcome,
-};
 pub use opc_types::DscpCodepoint;
+pub use reassembly::{
+    DownlinkOuterProvenance, GtpuReassemblyConsumer, GtpuReassemblyCounters, GtpuReassemblyDrop,
+    GtpuReassemblyOutcome,
+};
 pub use unsupported::UnsupportedGtpuDataplaneBackend;
 
 #[cfg(test)]

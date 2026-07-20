@@ -26,10 +26,11 @@ use crate::backend::error_proves_no_requested_mutation;
 use crate::model::{classify_dual_selector_state, DualSelectorState};
 use crate::{
     CreateGtpDeviceRequest, GtpAddressFamily, GtpDevice, GtpPdpContext, GtpRole, GtpVersion,
-    GtpuBackendKind, GtpuCapability, GtpuDataplaneBackend, GtpuError, GtpuProbe,
-    PdpContextIndeterminateReason, PdpContextInstallOutcome, PdpContextLocalTeidSelector,
-    PdpContextReadback, PdpContextReconciliationCapabilities, PdpContextRemovalOutcome,
-    PdpContextSelector, PdpContextUplinkSelector, RemovePdpContextRequest, Teid, GTPU_PORT,
+    GtpuBackendKind, GtpuCapability, GtpuDataplaneBackend, GtpuDownlinkFragmentContract, GtpuError,
+    GtpuProbe, PdpContextIndeterminateReason, PdpContextInstallOutcome,
+    PdpContextLocalTeidSelector, PdpContextReadback, PdpContextReconciliationCapabilities,
+    PdpContextRemovalOutcome, PdpContextSelector, PdpContextUplinkSelector,
+    RemovePdpContextRequest, Teid, GTPU_PORT,
 };
 
 const NETLINK_HEADER_LEN: usize = 16;
@@ -802,8 +803,37 @@ impl LinuxGtpuTransport for NetlinkGtpuTransport {
             per_bearer_marking: GtpuCapability::Missing,
             downlink_endpoint_binding: GtpuCapability::Missing,
             uplink_source_port_selection: GtpuCapability::Missing,
+            uplink_pmtu_enforcement: GtpuCapability::Missing,
+            // The kernel gtp driver consumes UDP/2152 through a socket the
+            // kernel itself reassembles into, so fragmented outer downlink
+            // packets re-enter the GTP-U consumer exactly once under the
+            // kernel's bounded ipfrag accounting.
+            downlink_outer_fragment_handling: if gtp_module_present {
+                GtpuDownlinkFragmentContract::KernelReassemblyHandoff {
+                    bounds: effective_reassembly_bounds(),
+                }
+            } else {
+                GtpuDownlinkFragmentContract::Unsupported
+            },
             details,
         }
+    }
+}
+
+/// Read the live per-netns IPv4 reassembly bounds, falling back to the
+/// documented kernel defaults when the sysctls are unreadable.
+fn effective_reassembly_bounds() -> crate::GtpuReassemblyBounds {
+    fn read_sysctl_u32(path: &str) -> Option<u32> {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|value| value.trim().parse().ok())
+    }
+    let defaults = opc_gtpu_ebpf_common::LINUX_DEFAULT_REASSEMBLY_BOUNDS;
+    crate::GtpuReassemblyBounds {
+        max_inflight_bytes: read_sysctl_u32("/proc/sys/net/ipv4/ipfrag_high_thresh")
+            .unwrap_or(defaults.max_inflight_bytes),
+        timeout_seconds: read_sysctl_u32("/proc/sys/net/ipv4/ipfrag_time")
+            .unwrap_or(defaults.timeout_seconds),
     }
 }
 
@@ -859,6 +889,15 @@ fn validate_create_device_request(request: &CreateGtpDeviceRequest) -> Result<()
             "device.pdp_hashsize",
             "hash size must be nonzero",
         ));
+    }
+    if request.uplink_mtu_policy.is_some() {
+        // The netlink gtp driver leaves outer fragmentation and MTU handling
+        // to the kernel routing layer; the typed SDK policy is not
+        // implemented by this backend and must fail closed rather than be
+        // silently ignored.
+        return Err(GtpuError::UnsupportedFeature {
+            feature: "uplink_pmtu_enforcement",
+        });
     }
     Ok(())
 }
@@ -1701,6 +1740,11 @@ mod tests {
                     per_bearer_marking: GtpuCapability::Missing,
                     downlink_endpoint_binding: GtpuCapability::Missing,
                     uplink_source_port_selection: GtpuCapability::Missing,
+                    uplink_pmtu_enforcement: GtpuCapability::Missing,
+                    downlink_outer_fragment_handling:
+                        GtpuDownlinkFragmentContract::KernelReassemblyHandoff {
+                            bounds: opc_gtpu_ebpf_common::LINUX_DEFAULT_REASSEMBLY_BOUNDS,
+                        },
                     details: Some("test transport"),
                 },
                 socket_fd: 9,
