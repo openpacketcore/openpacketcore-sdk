@@ -8348,6 +8348,7 @@ mod aya_runtime {
     #[cfg(test)]
     mod race_tests {
         use super::*;
+        use aya_obj::VerifierLog;
 
         fn instruction(code: u8, dst: u8, src: u8, off: i16, imm: i32) -> bpf_insn {
             bpf_insn {
@@ -8370,6 +8371,28 @@ mod aya_runtime {
                     sha256: 0xba78_16bf_8f01_cfea,
                 }
             );
+        }
+
+        #[test]
+        fn verifier_load_error_maps_to_typed_redaction_safe_failure() {
+            let canary = "sensitive-verifier-canary subscriber-material";
+            let source = ProgramError::LoadError {
+                io_error: io::Error::from_raw_os_error(13),
+                verifier_log: VerifierLog::new(canary.to_owned()),
+            };
+
+            let error = program_error("ebpf_program_load", &source);
+            assert!(matches!(
+                error,
+                GtpuError::ProgramLoadRejected {
+                    operation: "ebpf_program_load",
+                    kind: io::ErrorKind::PermissionDenied,
+                    raw_os_error: Some(13),
+                }
+            ));
+            let rendered = format!("{error:?} {error}");
+            assert!(!rendered.contains(canary));
+            assert!(!rendered.contains("subscriber-material"));
         }
 
         #[test]
