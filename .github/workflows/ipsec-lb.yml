@@ -151,6 +151,14 @@ jobs:
       - name: Install pinned bpf-linker
         run: cargo install bpf-linker --version 0.10.3 --locked
 
+      # Rebuild the datapath object from source with the pinned toolchain and
+      # fail on drift against the committed artifact. A whole-file byte-exact
+      # comparison is not possible across build hosts: .debug_* sections and
+      # the symbol tables embed path-derived crate disambiguators. The gate
+      # therefore byte-compares every functional section (program, maps, BTF,
+      # relocations) — byte-identical across checkout paths thanks to the
+      # remap ordering in scripts/build-ipsec-lb-ebpf.sh — plus the symbol
+      # inventory; the privileged job proves the artifact behaviorally.
       - name: Rebuild and compare program/map inventory
         run: |
           set -euo pipefail
@@ -173,7 +181,8 @@ jobs:
           for symbol in opc_ipsec_lb_xdp IPSEC_LB_OWNERS IPSEC_LB_CONFIG IPSEC_LB_FENCE IPSEC_LB_COUNTERS; do
             grep -q " ${symbol}$" committed.inventory
           done
-          # The pinned toolchain and bpf-linker make the build byte-reproducible;
-          # fail on any drift between the committed object and its source.
-          sha256sum "${committed}" "${rebuilt}"
-          test "$(sha256sum < "${committed}" | cut -d' ' -f1)" = "$(sha256sum < "${rebuilt}" | cut -d' ' -f1)"
+          for section in .text xdp maps .BTF .BTF.ext .relxdp .rel.BTF .rel.BTF.ext; do
+            readelf -x "${section}" "${committed}" > committed.hex
+            readelf -x "${section}" "${rebuilt}" > rebuilt.hex
+            diff -u committed.hex rebuilt.hex
+          done

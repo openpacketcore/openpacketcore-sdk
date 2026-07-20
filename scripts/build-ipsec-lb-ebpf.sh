@@ -22,11 +22,17 @@ target_dir="${OPC_EBPF_TARGET_DIR:-${crate_dir}/target}"
 sysroot="$(rustc "+${toolchain}" --print sysroot)"
 cargo_home="${CARGO_HOME:-${HOME}/.cargo}"
 
+# The last matching --remap-path-prefix wins, so the broad catch-alls come
+# first and the specific workspace root comes last. With this order every
+# functional section (program, maps, BTF, relocations) is byte-identical
+# regardless of the checkout path; the .debug_* sections and symbol tables
+# still embed path-derived crate disambiguators, so whole-file byte
+# comparison is not possible across build hosts.
 rustflags=(
-  "--remap-path-prefix=${repo_root}=/opc-sdk"
-  "--remap-path-prefix=${sysroot}=/rust-sysroot"
-  "--remap-path-prefix=${cargo_home}=/cargo-home"
   "--remap-path-prefix=${HOME}=/build-home"
+  "--remap-path-prefix=${cargo_home}=/cargo-home"
+  "--remap-path-prefix=${sysroot}=/rust-sysroot"
+  "--remap-path-prefix=${repo_root}=/opc-sdk"
 )
 
 (
