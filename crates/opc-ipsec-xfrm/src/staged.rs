@@ -1,27 +1,33 @@
-//! Cancellation-safe staged composite XFRM install with a caller-visible
-//! mutation journal.
+//! Cancellation-safe staged composite XFRM installation.
 //!
-//! [`install_sa_policy_with_rollback`](crate::install_sa_policy_with_rollback)
-//! mutates backend state across multiple async awaits. Dropping that future
-//! after an acknowledged backend mutation but before it returns yields no
-//! typed outcome and runs no retained cleanup authority, so a consumer cannot
-//! safely infer what the composite owned at the cancellation point.
+//! [`XfrmStagedInstall`] is affine: calling [`XfrmStagedInstall::run`]
+//! consumes the staged value, so safe Rust cannot start the same mutation
+//! sequence twice. A caller clones [`XfrmInstallJournal`] before starting the
+//! runner. On first poll, the runner moves into an owned Tokio worker; dropping
+//! its observing future cannot cancel an adapter's detached `spawn_blocking`
+//! mutation or make recovery race that mutation. The journal records
+//! acknowledged mutations and unobserved backend results, and remains
+//! available if the observer is dropped.
 //!
-//! [`XfrmStagedInstall`] closes that gap without changing the existing helper:
-//! the caller clones an [`XfrmInstallJournal`] before polling
-//! [`XfrmStagedInstall::run`], and the journal records every acknowledged
-//! backend mutation at the moment it is acknowledged, outside the future. If
-//! the future is dropped at any point, [`XfrmInstallJournal::ownership`]
-//! reports exactly what the operation may own and
-//! [`XfrmInstallJournal::recovery_plan`] hands the caller the exact,
-//! never-broadened removal intents for that residue. The journal never
-//! authorizes deletion of a pre-existing SA or policy: an `AlreadyExists`
-//! failure is definitive backend evidence that the matching mutation was not
-//! acquired by this operation, so it never enters the recovery plan.
+//! Destructive recovery is deliberately explicit. A caller obtains the
+//! current [`XfrmInstallRecoveryPlan`], classifies every exact candidate as
+//! [`XfrmResidueClassification::Owned`], `Absent`, `Foreign`, or
+//! `Indeterminate`, and passes the generation-bound classification to
+//! [`XfrmInstallJournal::recover`]. Recovery is supervised by the same rule:
+//! dropping its observer leaves the owned worker and recovery claim live until
+//! every issued removal returns. Unobserved results never become blind deletion
+//! authority. If either owned worker terminates abnormally, the journal records
+//! supervision loss and permanently disables in-process recovery: a detached
+//! blocking syscall may still complete after the async worker is gone. A fresh
+//! process must re-establish namespace-wide exclusion and authoritative state
+//! before deciding how to handle residue. Classification must be performed
+//! while the caller holds the product's namespace-wide XFRM writer exclusion;
+//! exact readback alone cannot distinguish an identical foreign replacement.
 
 use std::{
     error::Error,
     fmt,
+    future::Future,
     sync::{Arc, Mutex},
 };
 
@@ -30,55 +36,139 @@ use crate::{
     XfrmCompositeInstallRequest, XfrmCompositeOperation, XfrmCompositeOutcome, XfrmError,
 };
 
+/// XFRM object represented by a recovery classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XfrmInstallObject {
+    /// Security Association.
+    Sa,
+    /// Security Policy.
+    Policy,
+}
+
+impl XfrmInstallObject {
+    /// Stable machine-readable object label.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Sa => "sa",
+            Self::Policy => "policy",
+        }
+    }
+}
+
+/// Set of backend operations whose final state was not observed.
+///
+/// The set contains operation labels only and is safe to format in logs.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub struct XfrmIndeterminateOperations {
+    bits: u16,
+}
+
+impl XfrmIndeterminateOperations {
+    const INSTALL_SA: u16 = 1 << 0;
+    const INSTALL_POLICY: u16 = 1 << 1;
+    const ROLLBACK_REMOVE_SA: u16 = 1 << 2;
+    const REMOVE_POLICY: u16 = 1 << 3;
+    const REMOVE_SA: u16 = 1 << 4;
+
+    const fn bit(operation: XfrmCompositeOperation) -> u16 {
+        match operation {
+            XfrmCompositeOperation::InstallSa => Self::INSTALL_SA,
+            XfrmCompositeOperation::InstallPolicy => Self::INSTALL_POLICY,
+            XfrmCompositeOperation::RollbackRemoveSa => Self::ROLLBACK_REMOVE_SA,
+            XfrmCompositeOperation::RemovePolicy => Self::REMOVE_POLICY,
+            XfrmCompositeOperation::RemoveSa => Self::REMOVE_SA,
+            XfrmCompositeOperation::RekeySa | XfrmCompositeOperation::RekeyPolicy => 0,
+        }
+    }
+
+    fn insert(&mut self, operation: XfrmCompositeOperation) {
+        self.bits |= Self::bit(operation);
+    }
+
+    fn clear_sa(&mut self) {
+        self.bits &= !(Self::INSTALL_SA | Self::ROLLBACK_REMOVE_SA | Self::REMOVE_SA);
+    }
+
+    fn clear_policy(&mut self) {
+        self.bits &= !(Self::INSTALL_POLICY | Self::REMOVE_POLICY);
+    }
+
+    /// True when no operation is indeterminate.
+    pub const fn is_empty(self) -> bool {
+        self.bits == 0
+    }
+
+    /// True when `operation` is in the set.
+    pub const fn contains(self, operation: XfrmCompositeOperation) -> bool {
+        self.bits & Self::bit(operation) != 0
+    }
+
+    /// Iterate over the indeterminate operation labels in execution order.
+    pub fn iter(self) -> impl Iterator<Item = XfrmCompositeOperation> {
+        [
+            XfrmCompositeOperation::InstallSa,
+            XfrmCompositeOperation::InstallPolicy,
+            XfrmCompositeOperation::RollbackRemoveSa,
+            XfrmCompositeOperation::RemovePolicy,
+            XfrmCompositeOperation::RemoveSa,
+        ]
+        .into_iter()
+        .filter(move |operation| self.contains(*operation))
+    }
+}
+
+impl fmt::Debug for XfrmIndeterminateOperations {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list()
+            .entries(self.iter().map(XfrmCompositeOperation::as_str))
+            .finish()
+    }
+}
+
 /// Typed mutation ownership of a staged composite install.
 ///
-/// Every variant is redaction-safe: it carries only stable stage labels and
-/// never SA/policy identities, SPIs, addresses, or key material. The exact
-/// removal identities for residue are exposed separately through
-/// [`XfrmInstallRecoveryPlan`].
+/// Variants carry only stable labels. Exact identities remain available from
+/// [`XfrmInstallRecoveryPlan`] and are omitted from its `Debug` output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum XfrmInstallOwnership {
-    /// No backend mutation was acquired by this operation. There is no
-    /// cleanup obligation; a recovery plan in this state is empty. This is
-    /// also the state after a definitive SA install failure, including
-    /// `AlreadyExists`: the pre-existing SA is not owned by this operation
-    /// and must not be removed on its behalf.
+    /// The runner has not acquired or issued a mutation.
     NotStarted,
-    /// The SA install was issued but its outcome was not observed, for
-    /// example because the `run` future was dropped while the SA await was
-    /// in flight. The SA mutation may or may not be applied; exact SA
-    /// removal authority (idempotent on `NotFound`) is retained. This state
-    /// never reads as [`Self::NotStarted`]: an issued-but-unobserved install
-    /// is a cleanup obligation, not proof that nothing was acquired.
+    /// The SA install is currently in flight.
     SaInFlight,
-    /// The SA install was acknowledged and no policy residue is owned: either
-    /// policy install has not been issued yet, or it was definitively
-    /// rejected (including `AlreadyExists`) and the helper's SA rollback
-    /// failed or has not completed. Exact SA removal authority is retained.
+    /// Only SA residue may remain.
     SaAcquired,
-    /// The SA install was acknowledged and the policy install was issued but
-    /// its outcome was not observed, for example because the `run` future was
-    /// dropped while the policy await was in flight. The policy mutation may
-    /// or may not be applied; exact removal authority for both the policy
-    /// (idempotent on `NotFound`) and the SA is retained.
+    /// The policy install is currently in flight after SA acknowledgement.
     PolicyInFlight,
-    /// The complete install (SA plus policy) was acknowledged. Exact removal
-    /// authority for both, in policy-first order, is retained.
+    /// Only policy residue may remain.
+    PolicyAcquired,
+    /// Both SA and policy were acknowledged.
     Complete,
-    /// The helper fully rolled its own mutation back after a definitive
-    /// failure. No residual ownership remains and the recovery plan is empty.
+    /// The runner rolled back every candidate it owned.
     RolledBack,
-    /// Recovery completed: every retained removal intent was applied or
-    /// proven absent (`NotFound`). The journal no longer authorizes removal.
-    Recovered,
-    /// The backend reported [`XfrmError::StateIndeterminate`]: a mutation may
-    /// have been accepted but its final state could not be proven. The exact
-    /// residue candidates remain recoverable through the recovery plan, and
-    /// [`XfrmInstallRecoveryPlan::requires_readback`] recommends a classified
-    /// readback before or alongside destructive recovery.
-    Indeterminate {
-        /// Operation whose final state is indeterminate.
+    /// Classified recovery is currently issuing this removal.
+    Recovering {
+        /// Removal operation in flight.
         operation: XfrmCompositeOperation,
+    },
+    /// Recovery cleared every candidate by exact removal or classification.
+    Recovered,
+    /// The caller committed the acknowledged install and retired every journal
+    /// cleanup authority. Product teardown now owns the installed state.
+    Committed,
+    /// One or more backend results were not observed.
+    Indeterminate {
+        /// Complete set of unobserved operations.
+        operations: XfrmIndeterminateOperations,
+    },
+    /// The owned Tokio worker terminated abnormally while an adapter may still
+    /// have detached blocking work in flight.
+    ///
+    /// This permanently disables in-process recovery for the journal. A fresh
+    /// process must re-establish namespace-wide exclusion and authoritative
+    /// readback before deciding how to handle any residue.
+    SupervisionLost {
+        /// Operation that was in flight when supervision was lost, when known.
+        operation: Option<XfrmCompositeOperation>,
     },
 }
 
@@ -90,97 +180,304 @@ impl XfrmInstallOwnership {
             Self::SaInFlight => "sa_in_flight",
             Self::SaAcquired => "sa_acquired",
             Self::PolicyInFlight => "policy_in_flight",
+            Self::PolicyAcquired => "policy_acquired",
             Self::Complete => "complete",
             Self::RolledBack => "rolled_back",
+            Self::Recovering { .. } => "recovering",
             Self::Recovered => "recovered",
+            Self::Committed => "committed",
             Self::Indeterminate { .. } => "indeterminate",
+            Self::SupervisionLost { .. } => "supervision_lost",
         }
     }
 
-    /// True when this operation may still own backend residue that a
-    /// recovery plan would remove.
+    /// True when this operation may still own backend residue.
     pub const fn has_residue(self) -> bool {
         matches!(
             self,
             Self::SaInFlight
                 | Self::SaAcquired
                 | Self::PolicyInFlight
+                | Self::PolicyAcquired
                 | Self::Complete
+                | Self::Recovering { .. }
                 | Self::Indeterminate { .. }
+                | Self::SupervisionLost { .. }
         )
     }
 }
 
-/// Exact removal intents retained for staged-install residue.
+/// Result of classifying one exact recovery candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XfrmResidueClassification {
+    /// The caller proved that the exact object is owned by this staged install.
+    Owned,
+    /// Exact readback proved that the object is absent.
+    Absent,
+    /// Readback or ownership metadata proved that the object belongs to a
+    /// different operation. Recovery retires the candidate without deleting it.
+    Foreign,
+    /// Ownership remains indeterminate. Recovery fails closed without mutation.
+    Indeterminate,
+}
+
+/// Generation-bound classification for an exact recovery plan.
 ///
-/// Intents are built once from the original
-/// [`XfrmCompositeInstallRequest`] identity and are never broadened: a plan
-/// removes at most the exact SA (`destination`, `protocol`, `spi`, `mark`)
-/// and the exact policy (`selector`, `direction`, `mark`) that this operation
-/// may have acquired. It never contains an intent for state the backend
-/// rejected with `AlreadyExists`, because that state is not owned by this
-/// operation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Construct this value with [`XfrmInstallRecoveryPlan::classification`]. A
+/// classification becomes stale whenever runner or recovery state changes.
+#[derive(Clone)]
+pub struct XfrmInstallRecoveryClassification {
+    generation: Arc<()>,
+    policy: Option<XfrmResidueClassification>,
+    sa: Option<XfrmResidueClassification>,
+}
+
+impl XfrmInstallRecoveryClassification {
+    /// Classify the policy candidate in the originating plan.
+    #[must_use]
+    pub fn with_policy(mut self, classification: XfrmResidueClassification) -> Self {
+        self.policy = Some(classification);
+        self
+    }
+
+    /// Classify the SA candidate in the originating plan.
+    #[must_use]
+    pub fn with_sa(mut self, classification: XfrmResidueClassification) -> Self {
+        self.sa = Some(classification);
+        self
+    }
+}
+
+impl fmt::Debug for XfrmInstallRecoveryClassification {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("XfrmInstallRecoveryClassification")
+            .field("policy", &self.policy)
+            .field("sa", &self.sa)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Exact removal candidates retained for staged-install residue.
+///
+/// `Debug` reports only candidate presence and operation labels; use the
+/// accessors when privileged recovery code needs the exact identity.
+#[derive(Clone)]
 pub struct XfrmInstallRecoveryPlan {
     policy: Option<RemovePolicyRequest>,
     sa: Option<RemoveSaRequest>,
-    requires_readback: bool,
+    uncertainties: XfrmIndeterminateOperations,
+    supervision_lost: bool,
+    generation: Arc<()>,
 }
 
 impl XfrmInstallRecoveryPlan {
-    /// Empty plan: no cleanup obligation.
-    const fn empty() -> Self {
-        Self {
-            policy: None,
-            sa: None,
-            requires_readback: false,
-        }
-    }
-
-    /// True when no removal intent is retained.
+    /// True when no candidate remains.
     pub const fn is_empty(&self) -> bool {
         self.policy.is_none() && self.sa.is_none()
     }
 
-    /// Exact policy removal intent, when policy residue may be owned.
+    /// Exact policy candidate, when one remains.
     pub const fn policy(&self) -> Option<&RemovePolicyRequest> {
         self.policy.as_ref()
     }
 
-    /// Exact SA removal intent, when SA residue may be owned.
+    /// Exact SA candidate, when one remains.
     pub const fn sa(&self) -> Option<&RemoveSaRequest> {
         self.sa.as_ref()
     }
 
-    /// True when the backend reported an indeterminate state and a classified
-    /// readback is recommended before or alongside destructive recovery.
+    /// Operations whose final result was not observed.
+    pub const fn indeterminate_operations(&self) -> XfrmIndeterminateOperations {
+        self.uncertainties
+    }
+
+    /// True when an owned async worker terminated abnormally and in-process
+    /// recovery is permanently disabled for this journal.
+    pub const fn supervision_lost(&self) -> bool {
+        self.supervision_lost
+    }
+
+    /// True when exact readback and writer-fence classification is required
+    /// because at least one backend result was not observed.
     pub const fn requires_readback(&self) -> bool {
-        self.requires_readback
+        self.supervision_lost || !self.uncertainties.is_empty()
+    }
+
+    /// True when recovery requires a classification value.
+    pub const fn requires_classification(&self) -> bool {
+        !self.is_empty()
+    }
+
+    /// Start a generation-bound classification for this exact plan.
+    #[must_use]
+    pub fn classification(&self) -> XfrmInstallRecoveryClassification {
+        XfrmInstallRecoveryClassification {
+            generation: self.generation.clone(),
+            policy: None,
+            sa: None,
+        }
+    }
+}
+
+impl fmt::Debug for XfrmInstallRecoveryPlan {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("XfrmInstallRecoveryPlan")
+            .field("policy_candidate", &self.policy.is_some())
+            .field("sa_candidate", &self.sa.is_some())
+            .field("indeterminate_operations", &self.uncertainties)
+            .field("supervision_lost", &self.supervision_lost)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for XfrmInstallRecoveryPlan {
+    fn eq(&self, other: &Self) -> bool {
+        self.policy == other.policy
+            && self.sa == other.sa
+            && self.uncertainties == other.uncertainties
+            && self.supervision_lost == other.supervision_lost
+            && Arc::ptr_eq(&self.generation, &other.generation)
+    }
+}
+
+impl Eq for XfrmInstallRecoveryPlan {}
+
+/// Error returned by [`XfrmInstallJournal::commit`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XfrmInstallCommitError {
+    /// The runner was never started or remains live.
+    RunnerNotFinished,
+    /// Classified recovery is currently live.
+    RecoveryInProgress,
+    /// The install is not a fully acknowledged SA-plus-policy pair.
+    NotComplete,
+    /// Unobserved backend results must be classified before ownership transfer.
+    Indeterminate,
+    /// Recovery already retired the journal's candidates.
+    AlreadyRecovered,
+}
+
+impl XfrmInstallCommitError {
+    /// Stable machine-readable error code.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RunnerNotFinished => "xfrm_install_commit_runner_not_finished",
+            Self::RecoveryInProgress => "xfrm_install_commit_recovery_in_progress",
+            Self::NotComplete => "xfrm_install_commit_not_complete",
+            Self::Indeterminate => "xfrm_install_commit_indeterminate",
+            Self::AlreadyRecovered => "xfrm_install_commit_already_recovered",
+        }
+    }
+}
+
+impl fmt::Display for XfrmInstallCommitError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Error for XfrmInstallCommitError {}
+
+/// Error returned by the supervised [`XfrmStagedInstall::run`] worker.
+#[derive(Debug, Clone)]
+pub enum XfrmStagedInstallRunError {
+    /// The staged composite operation returned its typed protocol error.
+    Composite {
+        /// Redaction-safe composite error.
+        source: XfrmCompositeInstallError,
+    },
+    /// The future was first polled outside a Tokio runtime.
+    RuntimeUnavailable,
+    /// The supervised worker terminated without returning an operation result.
+    ///
+    /// The journal records permanent supervision loss because adapter-owned
+    /// blocking work may outlive the async worker. In-process recovery remains
+    /// disabled for that journal.
+    WorkerTerminated,
+}
+
+impl XfrmStagedInstallRunError {
+    /// Stable machine-readable error code.
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Composite { source } => source.as_str(),
+            Self::RuntimeUnavailable => "xfrm_staged_install_runtime_unavailable",
+            Self::WorkerTerminated => "xfrm_staged_install_worker_terminated",
+        }
+    }
+
+    /// Composite outcome evidence, when the worker returned an operation
+    /// error rather than terminating unexpectedly.
+    pub const fn outcome(&self) -> Option<XfrmCompositeOutcome> {
+        match self {
+            Self::Composite { source } => Some(source.outcome()),
+            Self::RuntimeUnavailable | Self::WorkerTerminated => None,
+        }
+    }
+}
+
+impl fmt::Display for XfrmStagedInstallRunError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Error for XfrmStagedInstallRunError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Composite { source } => Some(source),
+            Self::RuntimeUnavailable | Self::WorkerTerminated => None,
+        }
+    }
+}
+
+impl From<XfrmCompositeInstallError> for XfrmStagedInstallRunError {
+    fn from(source: XfrmCompositeInstallError) -> Self {
+        Self::Composite { source }
     }
 }
 
 /// Error returned by [`XfrmInstallJournal::recover`].
-///
-/// Variants deliberately carry only the redaction-safe backend error; removal
-/// identities stay in the caller-held [`XfrmInstallRecoveryPlan`].
 #[derive(Debug, Clone)]
 pub enum XfrmInstallRecoveryError {
-    /// Policy removal during recovery failed with a non-`NotFound` error.
+    /// Policy removal failed.
     RemovePolicyFailed {
-        /// Backend error from policy removal.
+        /// Redaction-safe backend error.
         source: XfrmError,
     },
-    /// SA removal during recovery failed with a non-`NotFound` error.
+    /// SA removal failed.
     RemoveSaFailed {
-        /// Backend error from SA removal.
+        /// Redaction-safe backend error.
         source: XfrmError,
     },
-    /// Recovery was requested while the staged install runner had not
-    /// finished: its `run` future is still live, or it was never polled.
-    /// Recovery is rejected because the runner may still acquire further
-    /// mutations that a completed recovery would permanently mask. Retry
-    /// after the `run` future completed or was dropped.
+    /// The install runner was never started or remains live.
     RunnerNotFinished,
+    /// Another recovery future owns the recovery claim.
+    RecoveryInProgress,
+    /// The recovery future was first polled outside a Tokio runtime.
+    RuntimeUnavailable,
+    /// The supervised recovery worker terminated without returning a result.
+    /// In-process recovery remains permanently disabled for this journal.
+    WorkerTerminated,
+    /// The install was committed to product ownership.
+    Committed,
+    /// The classification was created from an older plan generation.
+    StaleClassification,
+    /// A candidate had no classification.
+    MissingClassification {
+        /// Candidate lacking classification.
+        object: XfrmInstallObject,
+    },
+    /// A classification was supplied for an object absent from the plan.
+    UnexpectedClassification {
+        /// Unexpected classified object.
+        object: XfrmInstallObject,
+    },
+    /// The caller reported that ownership remains indeterminate.
+    ClassificationIndeterminate {
+        /// Candidate that remains indeterminate.
+        object: XfrmInstallObject,
+    },
 }
 
 impl XfrmInstallRecoveryError {
@@ -190,6 +487,18 @@ impl XfrmInstallRecoveryError {
             Self::RemovePolicyFailed { .. } => "xfrm_install_recovery_remove_policy_failed",
             Self::RemoveSaFailed { .. } => "xfrm_install_recovery_remove_sa_failed",
             Self::RunnerNotFinished => "xfrm_install_recovery_runner_not_finished",
+            Self::RecoveryInProgress => "xfrm_install_recovery_in_progress",
+            Self::RuntimeUnavailable => "xfrm_install_recovery_runtime_unavailable",
+            Self::WorkerTerminated => "xfrm_install_recovery_worker_terminated",
+            Self::Committed => "xfrm_install_recovery_committed",
+            Self::StaleClassification => "xfrm_install_recovery_stale_classification",
+            Self::MissingClassification { .. } => "xfrm_install_recovery_missing_classification",
+            Self::UnexpectedClassification { .. } => {
+                "xfrm_install_recovery_unexpected_classification"
+            }
+            Self::ClassificationIndeterminate { .. } => {
+                "xfrm_install_recovery_classification_indeterminate"
+            }
         }
     }
 }
@@ -204,163 +513,162 @@ impl Error for XfrmInstallRecoveryError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::RemovePolicyFailed { source } | Self::RemoveSaFailed { source } => Some(source),
-            Self::RunnerNotFinished => None,
+            _ => None,
         }
     }
 }
 
-/// Internal staged-install progress.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Stage {
     NotStarted,
-    SaInFlight,
     SaAcquired,
-    PolicyInFlight,
     Complete,
 }
 
-/// Lifecycle of the staged install runner, tracked so recovery can refuse to
-/// race a runner that may still acquire further mutations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RunLifecycle {
-    /// The `run` future was never polled.
     NotStarted,
-    /// The `run` future was polled and has neither completed nor been
-    /// dropped.
     Running,
-    /// The `run` future completed or was dropped.
     Finished,
 }
 
-/// Guard owned by the `run` future. Creating it marks the runner live;
-/// dropping the future — by completion or by cancellation — drops the guard
-/// and marks the runner finished, so a drop-cancelled install stays
-/// recoverable while a live one rejects recovery.
-#[derive(Debug)]
-struct RunGuard<'a> {
-    journal: &'a XfrmInstallJournal,
-}
-
-impl RunGuard<'_> {
-    fn begin(&self) {
-        self.journal.state().lifecycle = RunLifecycle::Running;
-    }
-}
-
-impl Drop for RunGuard<'_> {
-    fn drop(&mut self) {
-        self.journal.state().lifecycle = RunLifecycle::Finished;
-    }
-}
-
-#[derive(Debug)]
 struct JournalState {
     stage: Stage,
     lifecycle: RunLifecycle,
-    sa_cleared: bool,
-    policy_cleared: bool,
+    runner_inflight: Option<XfrmCompositeOperation>,
+    recovery_inflight: Option<XfrmCompositeOperation>,
+    recovery_running: bool,
+    runner_supervision_lost: bool,
+    recovery_supervision_lost: bool,
+    sa_possible: bool,
+    policy_possible: bool,
     rolled_back: bool,
     recovered: bool,
-    indeterminate: Option<XfrmCompositeOperation>,
+    committed: bool,
+    uncertainties: XfrmIndeterminateOperations,
+    generation: Arc<()>,
 }
 
 impl JournalState {
-    const fn new() -> Self {
+    fn new() -> Self {
         Self {
             stage: Stage::NotStarted,
             lifecycle: RunLifecycle::NotStarted,
-            sa_cleared: false,
-            policy_cleared: false,
+            runner_inflight: None,
+            recovery_inflight: None,
+            recovery_running: false,
+            runner_supervision_lost: false,
+            recovery_supervision_lost: false,
+            sa_possible: false,
+            policy_possible: false,
             rolled_back: false,
             recovered: false,
-            indeterminate: None,
+            committed: false,
+            uncertainties: XfrmIndeterminateOperations::default(),
+            generation: Arc::new(()),
         }
     }
 
+    fn touch(&mut self) {
+        self.generation = Arc::new(());
+    }
+
+    fn mark_indeterminate(&mut self, operation: XfrmCompositeOperation) {
+        self.uncertainties.insert(operation);
+        self.touch();
+    }
+
+    fn clear_sa(&mut self) {
+        self.sa_possible = false;
+        self.uncertainties.clear_sa();
+        self.touch();
+    }
+
+    fn clear_policy(&mut self) {
+        self.policy_possible = false;
+        self.uncertainties.clear_policy();
+        self.touch();
+    }
+
     fn ownership(&self) -> XfrmInstallOwnership {
+        if self.committed {
+            return XfrmInstallOwnership::Committed;
+        }
         if self.recovered {
             return XfrmInstallOwnership::Recovered;
         }
-        if let Some(operation) = self.indeterminate {
-            return XfrmInstallOwnership::Indeterminate { operation };
+        if self.recovery_supervision_lost {
+            return XfrmInstallOwnership::SupervisionLost {
+                operation: self.recovery_inflight,
+            };
         }
-        match self.stage {
-            Stage::Complete => XfrmInstallOwnership::Complete,
-            // A completed helper rollback retires all owned residue.
-            _ if self.rolled_back => XfrmInstallOwnership::RolledBack,
-            Stage::SaInFlight => XfrmInstallOwnership::SaInFlight,
-            Stage::SaAcquired => XfrmInstallOwnership::SaAcquired,
-            Stage::PolicyInFlight => XfrmInstallOwnership::PolicyInFlight,
-            Stage::NotStarted => XfrmInstallOwnership::NotStarted,
+        if self.runner_supervision_lost {
+            return XfrmInstallOwnership::SupervisionLost {
+                operation: self.runner_inflight,
+            };
+        }
+        if let Some(operation) = self.recovery_inflight {
+            return XfrmInstallOwnership::Recovering { operation };
+        }
+        if !self.uncertainties.is_empty() {
+            return XfrmInstallOwnership::Indeterminate {
+                operations: self.uncertainties,
+            };
+        }
+        match self.runner_inflight {
+            Some(XfrmCompositeOperation::InstallSa) => return XfrmInstallOwnership::SaInFlight,
+            Some(XfrmCompositeOperation::InstallPolicy) => {
+                return XfrmInstallOwnership::PolicyInFlight;
+            }
+            _ => {}
+        }
+        match (self.sa_possible, self.policy_possible) {
+            (true, true) => XfrmInstallOwnership::Complete,
+            (true, false) => XfrmInstallOwnership::SaAcquired,
+            (false, true) => XfrmInstallOwnership::PolicyAcquired,
+            (false, false) if self.rolled_back => XfrmInstallOwnership::RolledBack,
+            (false, false) => XfrmInstallOwnership::NotStarted,
         }
     }
 
     fn plan(&self, inner: &JournalInner) -> XfrmInstallRecoveryPlan {
-        if self.recovered {
-            return XfrmInstallRecoveryPlan::empty();
-        }
-        // The SA may be owned once its install was issued without an observed
-        // definitive rejection, acknowledged, or reported indeterminate, until
-        // the helper rollback or a recovery cleared it. Covering the
-        // in-flight stage costs one harmless `NotFound`-idempotent removal
-        // when the SA was never acquired, and covers residue when the backend
-        // applied the SA but the acknowledgement was never observed.
-        let sa_acquired =
-            matches!(
-                self.stage,
-                Stage::SaInFlight | Stage::SaAcquired | Stage::PolicyInFlight | Stage::Complete
-            ) || matches!(self.indeterminate, Some(XfrmCompositeOperation::InstallSa));
-        let sa = if sa_acquired && !self.sa_cleared {
-            Some(inner.remove_sa)
-        } else {
-            None
-        };
-        // The policy may be owned only once its install was issued without a
-        // definitive rejection observed, or reported indeterminate. A
-        // definitive failure (including `AlreadyExists`) resets the stage to
-        // `SaAcquired` before the rollback await, so a pre-existing policy
-        // never enters the plan.
-        let policy_possible = matches!(self.stage, Stage::PolicyInFlight | Stage::Complete)
-            || matches!(
-                self.indeterminate,
-                Some(XfrmCompositeOperation::InstallPolicy)
-            );
-        let policy = if policy_possible && !self.policy_cleared {
-            Some(inner.remove_policy.clone())
-        } else {
-            None
-        };
+        let terminal = self.committed || self.recovered;
         XfrmInstallRecoveryPlan {
-            policy,
-            sa,
-            requires_readback: self.indeterminate.is_some(),
+            policy: (!terminal && self.policy_possible).then(|| inner.remove_policy.clone()),
+            sa: (!terminal && self.sa_possible).then_some(inner.remove_sa),
+            uncertainties: if terminal {
+                XfrmIndeterminateOperations::default()
+            } else {
+                self.uncertainties
+            },
+            supervision_lost: !terminal
+                && (self.runner_supervision_lost || self.recovery_supervision_lost),
+            generation: self.generation.clone(),
         }
     }
 }
 
-#[derive(Debug)]
 struct JournalInner {
     remove_sa: RemoveSaRequest,
     remove_policy: RemovePolicyRequest,
     state: Mutex<JournalState>,
 }
 
-/// Caller-visible mutation journal for a staged composite install.
-///
-/// Clone the journal from [`XfrmStagedInstall::journal`] before polling
-/// [`XfrmStagedInstall::run`]. The handle is cheap to clone, `Send + Sync`,
-/// and shares one authoritative state with the running operation, so it keeps
-/// reporting exact mutation ownership even after the `run` future is dropped
-/// at any await point.
-///
-/// The journal is the only cleanup authority the operation retains: while
-/// [`Self::ownership`] reports residue, the matching
-/// [`Self::recovery_plan`] holds the exact removal intents; once recovery
-/// completes the journal transitions to [`XfrmInstallOwnership::Recovered`]
-/// and stops authorizing removal.
-#[derive(Debug, Clone)]
+/// Caller-visible staged-install mutation journal.
+#[derive(Clone)]
 pub struct XfrmInstallJournal {
     inner: Arc<JournalInner>,
+}
+
+impl fmt::Debug for XfrmInstallJournal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let state = self.state();
+        let plan = state.plan(&self.inner);
+        f.debug_struct("XfrmInstallJournal")
+            .field("ownership", &state.ownership())
+            .field("recovery_plan", &plan)
+            .finish()
+    }
 }
 
 impl XfrmInstallJournal {
@@ -381,118 +689,342 @@ impl XfrmInstallJournal {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Current typed mutation ownership. Safe to call at any time, including
-    /// while the `run` future is paused at an await or after it was dropped.
+    /// Current typed mutation ownership.
     pub fn ownership(&self) -> XfrmInstallOwnership {
         self.state().ownership()
     }
 
-    /// Exact removal intents for the residue this operation may currently
-    /// own. The plan is empty when there is no cleanup obligation and never
-    /// contains identities the backend definitively rejected.
+    /// Current exact, generation-bound recovery plan.
     pub fn recovery_plan(&self) -> XfrmInstallRecoveryPlan {
         self.state().plan(&self.inner)
     }
 
-    /// Apply the current recovery plan against the backend.
+    /// Commit a fully acknowledged install to product ownership.
     ///
-    /// Removal order is policy first, then SA, matching
-    /// [`crate::XFRM_COMPOSITE_REMOVE_ORDER`]. Removal uses exactly the
-    /// identities retained in [`Self::recovery_plan`]; it is never broadened.
-    /// `NotFound` is treated as idempotent success for each intent, so
-    /// retrying recovery after a partial failure or after residue was removed
-    /// externally is safe. When every intent is applied or proven absent the
-    /// journal transitions to [`XfrmInstallOwnership::Recovered`]; a later
-    /// call is then a no-op.
+    /// Every journal clone observes the resulting
+    /// [`XfrmInstallOwnership::Committed`] state, and no clone can subsequently
+    /// invoke journal recovery. Product teardown must use its own authoritative
+    /// installed-object record after this transfer.
+    pub fn commit(&self) -> Result<(), XfrmInstallCommitError> {
+        let mut state = self.state();
+        if state.committed {
+            return Ok(());
+        }
+        if state.lifecycle != RunLifecycle::Finished {
+            return Err(XfrmInstallCommitError::RunnerNotFinished);
+        }
+        if state.runner_supervision_lost || state.recovery_supervision_lost {
+            return Err(XfrmInstallCommitError::Indeterminate);
+        }
+        if state.recovery_running {
+            return Err(XfrmInstallCommitError::RecoveryInProgress);
+        }
+        if state.recovered {
+            return Err(XfrmInstallCommitError::AlreadyRecovered);
+        }
+        if !state.uncertainties.is_empty() {
+            return Err(XfrmInstallCommitError::Indeterminate);
+        }
+        if state.stage != Stage::Complete || !state.sa_possible || !state.policy_possible {
+            return Err(XfrmInstallCommitError::NotComplete);
+        }
+        state.committed = true;
+        state.touch();
+        Ok(())
+    }
+
+    /// Apply a generation-bound, exact recovery classification.
     ///
-    /// When the plan [`XfrmInstallRecoveryPlan::requires_readback`], callers
-    /// should reconcile backend state with a classified readback (for example
-    /// [`XfrmBackend::query_sa`]) before relying on the result; recovery still
-    /// uses only the exact retained identities.
+    /// Every candidate must be classified. `Owned` issues the exact retained
+    /// removal, `Absent` and `Foreign` retire the candidate without mutation,
+    /// and `Indeterminate` fails closed. Classification is evidence supplied by
+    /// the product while holding namespace-wide writer exclusion; callers must
+    /// not infer `Owned` merely from install intent or matching readback.
     ///
-    /// # Lifecycle
-    ///
-    /// Recovery must not race the install runner: a completed recovery
-    /// permanently retires the journal's removal authority, so applying it
-    /// while the runner may still acquire further mutations would orphan
-    /// them. This call therefore fails with
-    /// [`XfrmInstallRecoveryError::RunnerNotFinished`] while the `run` future
-    /// is still live, and also before it was ever polled (the runner may
-    /// still be started afterwards). Call it only after the `run` future
-    /// completed or was dropped; a drop-cancelled runner counts as finished
-    /// and stays recoverable.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`XfrmInstallRecoveryError`] on the first non-`NotFound`
-    /// backend failure. Intents already cleared stay cleared, so a retry
-    /// resumes with the remaining residue only.
-    pub async fn recover<B>(&self, backend: &B) -> Result<(), XfrmInstallRecoveryError>
+    /// Only one recovery worker can run at a time. Once the returned future is
+    /// polled, dropping it detaches only the observer; its owned worker keeps
+    /// the recovery claim until every issued backend removal returns. If the
+    /// worker itself terminates while a removal may be in flight, the journal
+    /// records permanent supervision loss and rejects every later in-process
+    /// recovery attempt.
+    pub fn recover<B>(
+        &self,
+        backend: Arc<B>,
+        classification: XfrmInstallRecoveryClassification,
+    ) -> impl Future<Output = Result<(), XfrmInstallRecoveryError>> + Send + 'static
+    where
+        B: XfrmBackend + ?Sized + 'static,
+    {
+        let journal = self.clone();
+        async move {
+            let runtime = tokio::runtime::Handle::try_current()
+                .map_err(|_| XfrmInstallRecoveryError::RuntimeUnavailable)?;
+            let worker = runtime.spawn(async move {
+                journal
+                    .recover_inner(backend.as_ref(), classification)
+                    .await
+            });
+            match worker.await {
+                Ok(result) => result,
+                Err(_) => Err(XfrmInstallRecoveryError::WorkerTerminated),
+            }
+        }
+    }
+
+    async fn recover_inner<B>(
+        &self,
+        backend: &B,
+        classification: XfrmInstallRecoveryClassification,
+    ) -> Result<(), XfrmInstallRecoveryError>
     where
         B: XfrmBackend + ?Sized,
     {
-        if self.state().lifecycle != RunLifecycle::Finished {
-            return Err(XfrmInstallRecoveryError::RunnerNotFinished);
-        }
-        let plan = self.recovery_plan();
+        let (plan, policy_classification, sa_classification) = {
+            let mut state = self.state();
+            if state.runner_supervision_lost || state.recovery_supervision_lost {
+                return Err(XfrmInstallRecoveryError::WorkerTerminated);
+            }
+            if state.lifecycle != RunLifecycle::Finished {
+                return Err(XfrmInstallRecoveryError::RunnerNotFinished);
+            }
+            if state.committed {
+                return Err(XfrmInstallRecoveryError::Committed);
+            }
+            if state.recovered {
+                return Ok(());
+            }
+            if state.recovery_running {
+                return Err(XfrmInstallRecoveryError::RecoveryInProgress);
+            }
+            if !Arc::ptr_eq(&classification.generation, &state.generation) {
+                return Err(XfrmInstallRecoveryError::StaleClassification);
+            }
+            let plan = state.plan(&self.inner);
+            let policy_classification = validate_classification(
+                plan.policy.is_some(),
+                classification.policy,
+                XfrmInstallObject::Policy,
+            )?;
+            let sa_classification = validate_classification(
+                plan.sa.is_some(),
+                classification.sa,
+                XfrmInstallObject::Sa,
+            )?;
+            state.recovery_running = true;
+            state.touch();
+            (plan, policy_classification, sa_classification)
+        };
 
-        if let Some(policy) = plan.policy() {
-            match backend.remove_policy(policy.clone()).await {
-                Ok(()) | Err(XfrmError::NotFound) => {
-                    self.state().policy_cleared = true;
-                }
-                Err(source) => {
-                    return Err(XfrmInstallRecoveryError::RemovePolicyFailed { source });
+        let mut guard = RecoveryGuard::new(self.clone());
+        let result = async {
+            if let (Some(request), Some(classification)) = (plan.policy, policy_classification) {
+                match classification {
+                    XfrmResidueClassification::Absent | XfrmResidueClassification::Foreign => {
+                        self.state().clear_policy();
+                    }
+                    XfrmResidueClassification::Owned => {
+                        {
+                            let mut state = self.state();
+                            state.uncertainties.clear_policy();
+                            state.recovery_inflight = Some(XfrmCompositeOperation::RemovePolicy);
+                            state.touch();
+                        }
+                        match backend.remove_policy(request).await {
+                            Ok(()) | Err(XfrmError::NotFound) => {
+                                let mut state = self.state();
+                                state.recovery_inflight = None;
+                                state.clear_policy();
+                            }
+                            Err(source) => {
+                                let mut state = self.state();
+                                state.recovery_inflight = None;
+                                if matches!(&source, XfrmError::StateIndeterminate { .. }) {
+                                    state.mark_indeterminate(XfrmCompositeOperation::RemovePolicy);
+                                } else {
+                                    state.touch();
+                                }
+                                return Err(XfrmInstallRecoveryError::RemovePolicyFailed {
+                                    source,
+                                });
+                            }
+                        }
+                    }
+                    XfrmResidueClassification::Indeterminate => {
+                        return Err(XfrmInstallRecoveryError::ClassificationIndeterminate {
+                            object: XfrmInstallObject::Policy,
+                        });
+                    }
                 }
             }
-        }
 
-        if let Some(sa) = plan.sa() {
-            match backend.remove_sa(*sa).await {
-                Ok(()) | Err(XfrmError::NotFound) => {
-                    self.state().sa_cleared = true;
-                }
-                Err(source) => {
-                    return Err(XfrmInstallRecoveryError::RemoveSaFailed { source });
+            if let (Some(request), Some(classification)) = (plan.sa, sa_classification) {
+                match classification {
+                    XfrmResidueClassification::Absent | XfrmResidueClassification::Foreign => {
+                        self.state().clear_sa();
+                    }
+                    XfrmResidueClassification::Owned => {
+                        {
+                            let mut state = self.state();
+                            state.uncertainties.clear_sa();
+                            state.recovery_inflight = Some(XfrmCompositeOperation::RemoveSa);
+                            state.touch();
+                        }
+                        match backend.remove_sa(request).await {
+                            Ok(()) | Err(XfrmError::NotFound) => {
+                                let mut state = self.state();
+                                state.recovery_inflight = None;
+                                state.clear_sa();
+                            }
+                            Err(source) => {
+                                let mut state = self.state();
+                                state.recovery_inflight = None;
+                                if matches!(&source, XfrmError::StateIndeterminate { .. }) {
+                                    state.mark_indeterminate(XfrmCompositeOperation::RemoveSa);
+                                } else {
+                                    state.touch();
+                                }
+                                return Err(XfrmInstallRecoveryError::RemoveSaFailed { source });
+                            }
+                        }
+                    }
+                    XfrmResidueClassification::Indeterminate => {
+                        return Err(XfrmInstallRecoveryError::ClassificationIndeterminate {
+                            object: XfrmInstallObject::Sa,
+                        });
+                    }
                 }
             }
-        }
 
-        self.state().recovered = true;
-        Ok(())
+            Ok(())
+        }
+        .await;
+        guard.finish(result.is_ok());
+        result
     }
 }
 
-/// Cancellation-safe staged SA-plus-policy composite install.
-///
-/// This is the journal-backed counterpart of
-/// [`install_sa_policy_with_rollback`](crate::install_sa_policy_with_rollback):
-/// [`Self::run`] performs the same backend calls in the same order
-/// ([`crate::XFRM_COMPOSITE_INSTALL_ORDER`], with
-/// [`crate::XFRM_COMPOSITE_INSTALL_ROLLBACK_ORDER`] after a policy failure)
-/// and returns the same [`XfrmCompositeOutcome`] /
-/// [`XfrmCompositeInstallError`] evidence. The difference is that every
-/// acknowledged mutation is recorded in the caller-held [`XfrmInstallJournal`]
-/// at the moment it is acknowledged, so dropping the `run` future at any
-/// await point leaves exact, typed ownership behind instead of an opaque
-/// cancellation.
-///
-/// Drive one `run` future per staged install. Cloning the journal is cheap
-/// and intended; polling several `run` futures of the same staged install
-/// concurrently is not. Call [`XfrmInstallJournal::recover`] only after the
-/// `run` future completed or was dropped: recovery while the runner is live
-/// (or before it ever ran) is rejected with
-/// [`XfrmInstallRecoveryError::RunnerNotFinished`] so a completed recovery
-/// cannot orphan mutations the runner may still acquire.
-#[derive(Debug)]
+fn validate_classification(
+    candidate_present: bool,
+    classification: Option<XfrmResidueClassification>,
+    object: XfrmInstallObject,
+) -> Result<Option<XfrmResidueClassification>, XfrmInstallRecoveryError> {
+    match (candidate_present, classification) {
+        (true, None) => Err(XfrmInstallRecoveryError::MissingClassification { object }),
+        (false, Some(_)) => Err(XfrmInstallRecoveryError::UnexpectedClassification { object }),
+        (true, Some(XfrmResidueClassification::Indeterminate)) => {
+            Err(XfrmInstallRecoveryError::ClassificationIndeterminate { object })
+        }
+        (_, classification) => Ok(classification),
+    }
+}
+
+struct RunGuard {
+    journal: XfrmInstallJournal,
+    active: bool,
+}
+
+impl RunGuard {
+    fn begin(journal: XfrmInstallJournal) -> Self {
+        {
+            let mut state = journal.state();
+            // `XfrmStagedInstall::run` consumes the only staged value, so safe
+            // Rust makes this the sole possible transition into `Running`.
+            state.lifecycle = RunLifecycle::Running;
+            state.touch();
+        }
+        Self {
+            journal,
+            active: true,
+        }
+    }
+
+    fn finish(&mut self) {
+        let mut state = self.journal.state();
+        state.lifecycle = RunLifecycle::Finished;
+        state.touch();
+        self.active = false;
+    }
+}
+
+impl Drop for RunGuard {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let mut state = self.journal.state();
+        if let Some(operation) = state.runner_inflight {
+            state.mark_indeterminate(operation);
+        }
+        state.runner_supervision_lost = true;
+        state.lifecycle = RunLifecycle::Finished;
+        state.touch();
+    }
+}
+
+struct RecoveryGuard {
+    journal: XfrmInstallJournal,
+    active: bool,
+}
+
+impl RecoveryGuard {
+    fn new(journal: XfrmInstallJournal) -> Self {
+        Self {
+            journal,
+            active: true,
+        }
+    }
+
+    fn finish(&mut self, recovered: bool) {
+        let mut state = self.journal.state();
+        state.recovery_inflight = None;
+        state.recovery_running = false;
+        state.recovered = recovered;
+        state.touch();
+        self.active = false;
+    }
+}
+
+impl Drop for RecoveryGuard {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let mut state = self.journal.state();
+        if let Some(operation) = state.recovery_inflight {
+            state.mark_indeterminate(operation);
+        }
+        state.recovery_supervision_lost = true;
+        state.recovery_running = false;
+        state.touch();
+    }
+}
+
+/// Affine cancellation-safe SA-plus-policy composite install.
 pub struct XfrmStagedInstall {
     request: XfrmCompositeInstallRequest,
     journal: XfrmInstallJournal,
 }
 
+impl fmt::Debug for XfrmStagedInstall {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("XfrmStagedInstall")
+            .field("ownership", &self.journal.ownership())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for XfrmStagedInstall {
+    fn drop(&mut self) {
+        let mut state = self.journal.state();
+        if state.lifecycle == RunLifecycle::NotStarted {
+            state.lifecycle = RunLifecycle::Finished;
+            state.touch();
+        }
+    }
+}
+
 impl XfrmStagedInstall {
-    /// Stage a composite install. No backend call is made until [`Self::run`]
-    /// is polled.
+    /// Stage a composite install without invoking the backend.
     #[must_use]
     pub fn new(request: XfrmCompositeInstallRequest) -> Self {
         let journal = XfrmInstallJournal::new(
@@ -502,61 +1034,78 @@ impl XfrmStagedInstall {
         Self { request, journal }
     }
 
-    /// Clone the caller-visible mutation journal for this staged install.
+    /// Clone the caller-visible mutation journal.
     pub fn journal(&self) -> XfrmInstallJournal {
         self.journal.clone()
     }
 
-    /// Run the staged install, journaling every acknowledged mutation.
+    /// Consume and supervise this staged install exactly once.
     ///
-    /// # Cancel safety
+    /// Dropping the returned future without polling performs no mutation and
+    /// leaves no cleanup obligation. On its first poll, the future moves the
+    /// operation into an owned Tokio worker. Dropping the observing future
+    /// after that point detaches only the observer: the worker continues to
+    /// drive the backend future and retains the live journal claim until the
+    /// backend result is observed. This matters for adapters that internally
+    /// use `spawn_blocking`, whose work continues after its `JoinHandle` is
+    /// dropped. Recovery therefore cannot race a detached kernel mutation.
     ///
-    /// Dropping the returned future is safe at every await point: the journal
-    /// obtained from [`Self::journal`] keeps the exact
-    /// [`XfrmInstallOwnership`] and recovery authority for any mutation that
-    /// was acknowledged (or, for an in-flight SA or policy install, possibly
-    /// applied) before the drop.
+    /// The consuming receiver is the executable one-run invariant:
     ///
-    /// # Errors
-    ///
-    /// Returns the same [`XfrmCompositeInstallError`] evidence as
-    /// [`install_sa_policy_with_rollback`](crate::install_sa_policy_with_rollback):
-    /// SA failure before any mutation, policy failure with successful
-    /// rollback, or policy failure with rollback failure. A backend
-    /// [`XfrmError::StateIndeterminate`] is additionally recorded in the
-    /// journal as [`XfrmInstallOwnership::Indeterminate`] so it stays
-    /// explicitly recoverable instead of collapsing into a generic error.
+    /// ```compile_fail
+    /// # use std::sync::Arc;
+    /// # use opc_ipsec_xfrm::{XfrmBackend, XfrmStagedInstall};
+    /// # fn staged() -> XfrmStagedInstall { unimplemented!() }
+    /// # async fn cannot_run_twice<B: XfrmBackend + 'static>(backend: Arc<B>) {
+    /// let install = staged();
+    /// let first = install.run(backend.clone());
+    /// let second = install.run(backend);
+    /// # let _ = (first, second);
+    /// # }
+    /// ```
     pub async fn run<B>(
+        self,
+        backend: Arc<B>,
+    ) -> Result<XfrmCompositeOutcome, XfrmStagedInstallRunError>
+    where
+        B: XfrmBackend + ?Sized + 'static,
+    {
+        let runtime = tokio::runtime::Handle::try_current()
+            .map_err(|_| XfrmStagedInstallRunError::RuntimeUnavailable)?;
+        let guard = RunGuard::begin(self.journal.clone());
+        let worker = runtime.spawn(async move {
+            let mut guard = guard;
+            let result = self.run_inner(backend.as_ref()).await;
+            guard.finish();
+            result
+        });
+        match worker.await {
+            Ok(result) => result.map_err(XfrmStagedInstallRunError::from),
+            Err(_) => Err(XfrmStagedInstallRunError::WorkerTerminated),
+        }
+    }
+
+    async fn run_inner<B>(
         &self,
         backend: &B,
     ) -> Result<XfrmCompositeOutcome, XfrmCompositeInstallError>
     where
         B: XfrmBackend + ?Sized,
     {
-        // The guard lives inside this future: it is created on the first poll
-        // and dropped when the future completes or is dropped, so the journal
-        // can tell a finished (recoverable) runner from a live one.
-        let guard = RunGuard {
-            journal: &self.journal,
-        };
-        guard.begin();
-
-        // Record the in-flight SA install synchronously before the await: if
-        // the future is dropped while the install is in flight, the journal
-        // must retain exact SA recovery authority instead of reporting
-        // `NotStarted` while the backend may have applied the SA.
-        self.journal.state().stage = Stage::SaInFlight;
+        {
+            let mut state = self.journal.state();
+            state.sa_possible = true;
+            state.runner_inflight = Some(XfrmCompositeOperation::InstallSa);
+            state.touch();
+        }
         if let Err(source) = backend.install_sa(self.request.sa.clone()).await {
             let indeterminate = matches!(&source, XfrmError::StateIndeterminate { .. });
+            let mut state = self.journal.state();
+            state.runner_inflight = None;
             if indeterminate {
-                // The SA mutation may have been accepted; retain exact
-                // recovery authority for it as possible residue.
-                self.journal.state().indeterminate = Some(XfrmCompositeOperation::InstallSa);
+                state.mark_indeterminate(XfrmCompositeOperation::InstallSa);
             } else {
-                // Definitive rejection (including `AlreadyExists`): this
-                // operation did not acquire the SA and must never remove the
-                // pre-existing one.
-                self.journal.state().stage = Stage::NotStarted;
+                state.clear_sa();
             }
             let outcome = if indeterminate {
                 XfrmCompositeOutcome::indeterminate(XfrmCompositeOperation::InstallSa)
@@ -565,58 +1114,94 @@ impl XfrmStagedInstall {
             };
             return Err(XfrmCompositeInstallError::InstallSaFailed { source, outcome });
         }
-        self.journal.state().stage = Stage::SaAcquired;
+        {
+            let mut state = self.journal.state();
+            state.runner_inflight = None;
+            state.stage = Stage::SaAcquired;
+            state.touch();
+        }
 
-        self.journal.state().stage = Stage::PolicyInFlight;
+        {
+            let mut state = self.journal.state();
+            state.policy_possible = true;
+            state.runner_inflight = Some(XfrmCompositeOperation::InstallPolicy);
+            state.touch();
+        }
         if let Err(source) = backend.install_policy(self.request.policy.clone()).await {
-            let indeterminate = matches!(&source, XfrmError::StateIndeterminate { .. });
+            let policy_indeterminate = matches!(&source, XfrmError::StateIndeterminate { .. });
             {
                 let mut state = self.journal.state();
-                if indeterminate {
-                    // The policy mutation may have been accepted; retain it
-                    // as possible residue alongside the SA.
-                    state.indeterminate = Some(XfrmCompositeOperation::InstallPolicy);
+                state.runner_inflight = None;
+                if policy_indeterminate {
+                    state.mark_indeterminate(XfrmCompositeOperation::InstallPolicy);
                 } else {
-                    // Definitive rejection (including `AlreadyExists`): this
-                    // operation did not acquire the policy and must never
-                    // remove the pre-existing one.
-                    state.stage = Stage::SaAcquired;
+                    state.clear_policy();
                 }
+                state.runner_inflight = Some(XfrmCompositeOperation::RollbackRemoveSa);
+                state.touch();
             }
-            let rollback_request = self.request.rollback_remove_sa();
-            return match backend.remove_sa(rollback_request).await {
-                Ok(()) => {
+
+            let rollback = backend.remove_sa(self.request.rollback_remove_sa()).await;
+            return match rollback {
+                Ok(()) | Err(XfrmError::NotFound) => {
                     let mut state = self.journal.state();
-                    state.sa_cleared = true;
+                    state.runner_inflight = None;
+                    state.clear_sa();
                     state.rolled_back = true;
-                    Err(XfrmCompositeInstallError::PolicyInstallRolledBack {
+                    let outcome = if policy_indeterminate {
+                        rolled_back_with_possible_residue(XfrmCompositeOperation::InstallPolicy)
+                    } else {
+                        XfrmCompositeOutcome::rolled_back(XfrmCompositeOperation::InstallPolicy)
+                    };
+                    Err(XfrmCompositeInstallError::PolicyInstallRolledBack { source, outcome })
+                }
+                Err(rollback) => {
+                    let mut state = self.journal.state();
+                    state.runner_inflight = None;
+                    if matches!(&rollback, XfrmError::StateIndeterminate { .. }) {
+                        state.mark_indeterminate(XfrmCompositeOperation::RollbackRemoveSa);
+                    } else {
+                        state.touch();
+                    }
+                    Err(XfrmCompositeInstallError::PolicyInstallRollbackFailed {
                         source,
-                        outcome: XfrmCompositeOutcome::rolled_back(
+                        rollback,
+                        outcome: XfrmCompositeOutcome::rollback_failed(
                             XfrmCompositeOperation::InstallPolicy,
                         ),
                     })
                 }
-                Err(rollback) => Err(XfrmCompositeInstallError::PolicyInstallRollbackFailed {
-                    source,
-                    rollback,
-                    outcome: XfrmCompositeOutcome::rollback_failed(
-                        XfrmCompositeOperation::InstallPolicy,
-                    ),
-                }),
             };
         }
-        self.journal.state().stage = Stage::Complete;
 
+        {
+            let mut state = self.journal.state();
+            state.runner_inflight = None;
+            state.stage = Stage::Complete;
+            state.touch();
+        }
         Ok(XfrmCompositeOutcome::applied())
+    }
+}
+
+fn rolled_back_with_possible_residue(
+    failed_operation: XfrmCompositeOperation,
+) -> XfrmCompositeOutcome {
+    XfrmCompositeOutcome {
+        applied: false,
+        rolled_back: true,
+        rollback_failed: false,
+        partial_state_possible: true,
+        failed_operation: Some(failed_operation),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex, MutexGuard};
+    use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
     use async_trait::async_trait;
-    use tokio::sync::{oneshot, Notify};
+    use tokio::sync::Notify;
 
     use super::*;
     use crate::{
@@ -625,123 +1210,331 @@ mod tests {
         XfrmAction, XfrmDirection, XfrmId, XfrmMode, XfrmProbe, XfrmSelector, XfrmTemplate,
     };
 
-    /// Where a gate blocks the `install_sa`/`install_policy` mutation.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum GateMode {
-        /// Block before the mutation is applied.
-        BeforeApply,
-        /// Apply the mutation, signal, then block before returning.
-        AfterApply,
+    #[derive(Debug, Default)]
+    struct BackendState {
+        operations: Vec<&'static str>,
+        sa_present: bool,
+        policy_present: bool,
+        removed_sa_requests: Vec<RemoveSaRequest>,
+        removed_policy_requests: Vec<RemovePolicyRequest>,
     }
 
-    /// Stateful fake backend with oneshot gates so tests can drop the staged
-    /// install future at exact cancellation points.
     #[derive(Debug)]
     struct GatedBackend {
-        operations: Mutex<Vec<&'static str>>,
-        sas: Mutex<Vec<RemoveSaRequest>>,
-        policies: Mutex<Vec<RemovePolicyRequest>>,
-        removed_sa_requests: Mutex<Vec<RemoveSaRequest>>,
-        removed_policy_requests: Mutex<Vec<RemovePolicyRequest>>,
+        state: Mutex<BackendState>,
         install_sa_error: Option<XfrmError>,
         install_policy_error: Option<XfrmError>,
         remove_sa_error: Mutex<Option<XfrmError>>,
-        sa_gate: Mutex<Option<oneshot::Receiver<()>>>,
-        policy_gate: Mutex<Option<oneshot::Receiver<()>>>,
-        sa_gate_mode: Option<GateMode>,
-        policy_gate_mode: Option<GateMode>,
-        sa_started: Notify,
-        sa_applied: Notify,
-        policy_started: Notify,
-        policy_applied: Notify,
+        remove_policy_error: Mutex<Option<XfrmError>>,
+        pause_install_sa_result: bool,
+        pause_install_policy_result: bool,
+        pause_remove_sa_result: bool,
+        pause_remove_policy_result: bool,
+        install_sa_decided: Notify,
+        install_policy_decided: Notify,
+        remove_sa_decided: Notify,
+        remove_policy_decided: Notify,
+        install_sa_release: Notify,
+        install_policy_release: Notify,
+        remove_sa_release: Notify,
+        remove_policy_release: Notify,
+    }
+
+    #[derive(Debug, Default)]
+    struct SpawnBlockingState {
+        started: bool,
+        released: bool,
+        sa_present: bool,
+        policy_present: bool,
+        remove_calls: usize,
+    }
+
+    #[derive(Debug, Default)]
+    struct SpawnBlockingBackend {
+        state: Arc<(Mutex<SpawnBlockingState>, Condvar)>,
+    }
+
+    #[derive(Debug, Default)]
+    struct TerminatingBlockingState {
+        install_started: bool,
+        install_released: bool,
+        remove_started: bool,
+        remove_released: bool,
+        sa_present: bool,
+        policy_present: bool,
+        remove_calls: usize,
+    }
+
+    #[derive(Debug)]
+    struct TerminatingBlockingBackend {
+        state: Arc<(Mutex<TerminatingBlockingState>, Condvar)>,
+        panic_install_worker: bool,
+        panic_remove_worker: bool,
+    }
+
+    impl TerminatingBlockingBackend {
+        fn panics_during_install() -> Self {
+            Self {
+                state: Arc::default(),
+                panic_install_worker: true,
+                panic_remove_worker: false,
+            }
+        }
+
+        fn panics_during_remove() -> Self {
+            Self {
+                state: Arc::default(),
+                panic_install_worker: false,
+                panic_remove_worker: true,
+            }
+        }
+
+        fn lock(&self) -> MutexGuard<'_, TerminatingBlockingState> {
+            self.state
+                .0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+
+        async fn wait_for(&self, predicate: impl Fn(&TerminatingBlockingState) -> bool) {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if predicate(&self.lock()) {
+                        return;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("detached blocking mutation starts");
+        }
+
+        async fn wait_until_install_started(&self) {
+            self.wait_for(|state| state.install_started).await;
+        }
+
+        async fn wait_until_remove_started(&self) {
+            self.wait_for(|state| state.remove_started).await;
+        }
+
+        async fn wait_until_sa_present(&self) {
+            self.wait_for(|state| state.sa_present).await;
+        }
+
+        async fn wait_until_policy_absent(&self) {
+            self.wait_for(|state| !state.policy_present).await;
+        }
+
+        fn release_install(&self) {
+            self.lock().install_released = true;
+            self.state.1.notify_all();
+        }
+
+        fn release_remove(&self) {
+            self.lock().remove_released = true;
+            self.state.1.notify_all();
+        }
+
+        fn remove_calls(&self) -> usize {
+            self.lock().remove_calls
+        }
+    }
+
+    impl SpawnBlockingBackend {
+        fn lock(&self) -> MutexGuard<'_, SpawnBlockingState> {
+            self.state
+                .0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+
+        async fn wait_until_started(&self) {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if self.lock().started {
+                        return;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("spawn_blocking mutation starts");
+        }
+
+        fn release(&self) {
+            {
+                self.lock().released = true;
+            }
+            self.state.1.notify_all();
+        }
+
+        fn remove_calls(&self) -> usize {
+            self.lock().remove_calls
+        }
+
+        fn sa_present(&self) -> bool {
+            self.lock().sa_present
+        }
     }
 
     impl GatedBackend {
         fn new() -> Self {
             Self {
-                operations: Mutex::new(Vec::new()),
-                sas: Mutex::new(Vec::new()),
-                policies: Mutex::new(Vec::new()),
-                removed_sa_requests: Mutex::new(Vec::new()),
-                removed_policy_requests: Mutex::new(Vec::new()),
+                state: Mutex::new(BackendState::default()),
                 install_sa_error: None,
                 install_policy_error: None,
                 remove_sa_error: Mutex::new(None),
-                sa_gate: Mutex::new(None),
-                policy_gate: Mutex::new(None),
-                sa_gate_mode: None,
-                policy_gate_mode: None,
-                sa_started: Notify::new(),
-                sa_applied: Notify::new(),
-                policy_started: Notify::new(),
-                policy_applied: Notify::new(),
+                remove_policy_error: Mutex::new(None),
+                pause_install_sa_result: false,
+                pause_install_policy_result: false,
+                pause_remove_sa_result: false,
+                pause_remove_policy_result: false,
+                install_sa_decided: Notify::new(),
+                install_policy_decided: Notify::new(),
+                remove_sa_decided: Notify::new(),
+                remove_policy_decided: Notify::new(),
+                install_sa_release: Notify::new(),
+                install_policy_release: Notify::new(),
+                remove_sa_release: Notify::new(),
+                remove_policy_release: Notify::new(),
             }
         }
 
-        fn lock<'a, T>(mutex: &'a Mutex<T>) -> MutexGuard<'a, T> {
-            mutex
+        fn lock(&self) -> MutexGuard<'_, BackendState> {
+            self.state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
         }
 
-        fn record(&self, operation: &'static str) {
-            Self::lock(&self.operations).push(operation);
+        fn with_preexisting_sa_and_paused_result() -> Self {
+            let backend = Self {
+                pause_install_sa_result: true,
+                ..Self::new()
+            };
+            backend.lock().sa_present = true;
+            backend
+        }
+
+        fn with_preexisting_policy_and_paused_result() -> Self {
+            let backend = Self {
+                pause_install_policy_result: true,
+                ..Self::new()
+            };
+            backend.lock().policy_present = true;
+            backend
+        }
+
+        fn with_paused_sa_success() -> Self {
+            Self {
+                pause_install_sa_result: true,
+                ..Self::new()
+            }
+        }
+
+        fn with_paused_policy_success() -> Self {
+            Self {
+                pause_install_policy_result: true,
+                ..Self::new()
+            }
+        }
+
+        fn with_paused_policy_removal() -> Self {
+            Self {
+                pause_remove_policy_result: true,
+                ..Self::new()
+            }
+        }
+
+        fn with_paused_sa_removal() -> Self {
+            Self {
+                pause_remove_sa_result: true,
+                ..Self::new()
+            }
+        }
+
+        fn with_policy_error(error: XfrmError) -> Self {
+            Self {
+                install_policy_error: Some(error),
+                ..Self::new()
+            }
+        }
+
+        fn with_policy_and_rollback_errors(policy: XfrmError, rollback: XfrmError) -> Self {
+            Self {
+                install_policy_error: Some(policy),
+                remove_sa_error: Mutex::new(Some(rollback)),
+                ..Self::new()
+            }
         }
 
         fn operations(&self) -> Vec<&'static str> {
-            Self::lock(&self.operations).clone()
+            self.lock().operations.clone()
         }
 
-        fn sas(&self) -> Vec<RemoveSaRequest> {
-            Self::lock(&self.sas).clone()
+        fn sa_present(&self) -> bool {
+            self.lock().sa_present
         }
 
-        fn policies(&self) -> Vec<RemovePolicyRequest> {
-            Self::lock(&self.policies).clone()
+        fn policy_present(&self) -> bool {
+            self.lock().policy_present
+        }
+
+        fn set_policy_present(&self, present: bool) {
+            self.lock().policy_present = present;
+        }
+
+        fn set_sa_present(&self, present: bool) {
+            self.lock().sa_present = present;
         }
 
         fn removed_sa_requests(&self) -> Vec<RemoveSaRequest> {
-            Self::lock(&self.removed_sa_requests).clone()
+            self.lock().removed_sa_requests.clone()
         }
 
         fn removed_policy_requests(&self) -> Vec<RemovePolicyRequest> {
-            Self::lock(&self.removed_policy_requests).clone()
-        }
-
-        fn preinstall_sa(&self, identity: RemoveSaRequest) {
-            Self::lock(&self.sas).push(identity);
-        }
-
-        fn preinstall_policy(&self, identity: RemovePolicyRequest) {
-            Self::lock(&self.policies).push(identity);
-        }
-
-        fn gate_sa(&self) -> oneshot::Sender<()> {
-            let (sender, receiver) = oneshot::channel();
-            *Self::lock(&self.sa_gate) = Some(receiver);
-            sender
-        }
-
-        fn gate_policy(&self) -> oneshot::Sender<()> {
-            let (sender, receiver) = oneshot::channel();
-            *Self::lock(&self.policy_gate) = Some(receiver);
-            sender
+            self.lock().removed_policy_requests.clone()
         }
 
         fn fail_remove_sa(&self, error: XfrmError) {
-            *Self::lock(&self.remove_sa_error) = Some(error);
+            *self
+                .remove_sa_error
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error);
         }
 
         fn clear_remove_sa_error(&self) {
-            *Self::lock(&self.remove_sa_error) = None;
+            *self
+                .remove_sa_error
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         }
 
-        fn take_sa_gate(&self) -> Option<oneshot::Receiver<()>> {
-            Self::lock(&self.sa_gate).take()
+        fn fail_remove_policy(&self, error: XfrmError) {
+            *self
+                .remove_policy_error
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error);
         }
 
-        fn take_policy_gate(&self) -> Option<oneshot::Receiver<()>> {
-            Self::lock(&self.policy_gate).take()
+        fn clear_remove_policy_error(&self) {
+            *self
+                .remove_policy_error
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        }
+
+        fn remove_sa_error(&self) -> Option<XfrmError> {
+            self.remove_sa_error
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+
+        fn remove_policy_error(&self) -> Option<XfrmError> {
+            self.remove_policy_error
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
         }
     }
 
@@ -751,128 +1544,263 @@ mod tests {
             &self,
             _request: AllocateSpiRequest,
         ) -> Result<SpiAllocation, XfrmError> {
-            Err(XfrmError::UnsupportedFeature {
-                feature: "test allocate_spi",
-            })
+            Err(XfrmError::UnsupportedFeature { feature: "test" })
         }
 
-        async fn install_sa(&self, request: InstallSaRequest) -> Result<(), XfrmError> {
-            self.record("install_sa");
-            self.sa_started.notify_one();
-            let identity = RemoveSaRequest {
-                destination: request.parameters.id.destination,
-                protocol: request.parameters.id.protocol,
-                spi: request.parameters.id.spi,
-                mark: request.parameters.mark,
+        async fn install_sa(&self, _request: InstallSaRequest) -> Result<(), XfrmError> {
+            let result = {
+                let mut state = self.lock();
+                state.operations.push("install_sa");
+                if let Some(error) = self.install_sa_error.clone() {
+                    Err(error)
+                } else if state.sa_present {
+                    Err(XfrmError::AlreadyExists)
+                } else {
+                    state.sa_present = true;
+                    Ok(())
+                }
             };
-            match self.sa_gate_mode {
-                Some(GateMode::BeforeApply) => {
-                    if let Some(gate) = self.take_sa_gate() {
-                        let _ = gate.await;
-                    }
-                }
-                Some(GateMode::AfterApply) => {
-                    // Apply the mutation, signal, then block the
-                    // acknowledgement: a cancellation here models an applied
-                    // SA whose `Ok` was never observed.
-                    if Self::lock(&self.sas).contains(&identity) {
-                        return Err(XfrmError::AlreadyExists);
-                    }
-                    Self::lock(&self.sas).push(identity);
-                    self.sa_applied.notify_one();
-                    if let Some(gate) = self.take_sa_gate() {
-                        let _ = gate.await;
-                    }
-                    return Ok(());
-                }
-                None => {}
+            if self.pause_install_sa_result {
+                self.install_sa_decided.notify_one();
+                self.install_sa_release.notified().await;
             }
-            if Self::lock(&self.sas).contains(&identity) {
-                return Err(XfrmError::AlreadyExists);
-            }
-            if let Some(error) = self.install_sa_error.clone() {
-                return Err(error);
-            }
-            Self::lock(&self.sas).push(identity);
-            Ok(())
+            result
         }
 
         async fn query_sa(&self, _request: QuerySaRequest) -> Result<SaState, XfrmError> {
-            Err(XfrmError::UnsupportedFeature {
-                feature: "test query_sa",
-            })
+            Err(XfrmError::UnsupportedFeature { feature: "test" })
         }
 
         async fn rekey_sa(&self, _request: RekeySaRequest) -> Result<(), XfrmError> {
-            Err(XfrmError::UnsupportedFeature {
-                feature: "test rekey_sa",
-            })
+            Err(XfrmError::UnsupportedFeature { feature: "test" })
         }
 
         async fn remove_sa(&self, request: RemoveSaRequest) -> Result<(), XfrmError> {
-            self.record("remove_sa");
-            Self::lock(&self.removed_sa_requests).push(request);
-            if let Some(error) = Self::lock(&self.remove_sa_error).clone() {
-                return Err(error);
+            let result = {
+                let mut state = self.lock();
+                state.operations.push("remove_sa");
+                state.removed_sa_requests.push(request);
+                if let Some(error) = self.remove_sa_error() {
+                    Err(error)
+                } else if state.sa_present {
+                    state.sa_present = false;
+                    Ok(())
+                } else {
+                    Err(XfrmError::NotFound)
+                }
+            };
+            if self.pause_remove_sa_result {
+                self.remove_sa_decided.notify_one();
+                self.remove_sa_release.notified().await;
             }
-            let mut sas = Self::lock(&self.sas);
-            if let Some(position) = sas.iter().position(|sa| *sa == request) {
-                sas.remove(position);
+            result
+        }
+
+        async fn install_policy(&self, _request: InstallPolicyRequest) -> Result<(), XfrmError> {
+            let result = {
+                let mut state = self.lock();
+                state.operations.push("install_policy");
+                if let Some(error) = self.install_policy_error.clone() {
+                    Err(error)
+                } else if state.policy_present {
+                    Err(XfrmError::AlreadyExists)
+                } else {
+                    state.policy_present = true;
+                    Ok(())
+                }
+            };
+            if self.pause_install_policy_result {
+                self.install_policy_decided.notify_one();
+                self.install_policy_release.notified().await;
+            }
+            result
+        }
+
+        async fn rekey_policy(&self, _request: RekeyPolicyRequest) -> Result<(), XfrmError> {
+            Err(XfrmError::UnsupportedFeature { feature: "test" })
+        }
+
+        async fn remove_policy(&self, request: RemovePolicyRequest) -> Result<(), XfrmError> {
+            let result = {
+                let mut state = self.lock();
+                state.operations.push("remove_policy");
+                state.removed_policy_requests.push(request);
+                if let Some(error) = self.remove_policy_error() {
+                    Err(error)
+                } else if state.policy_present {
+                    state.policy_present = false;
+                    Ok(())
+                } else {
+                    Err(XfrmError::NotFound)
+                }
+            };
+            if self.pause_remove_policy_result {
+                self.remove_policy_decided.notify_one();
+                self.remove_policy_release.notified().await;
+            }
+            result
+        }
+
+        async fn probe(&self) -> Result<XfrmProbe, XfrmError> {
+            Ok(XfrmProbe::mock())
+        }
+    }
+
+    #[async_trait]
+    impl XfrmBackend for SpawnBlockingBackend {
+        async fn allocate_spi(
+            &self,
+            _request: AllocateSpiRequest,
+        ) -> Result<SpiAllocation, XfrmError> {
+            Err(XfrmError::UnsupportedFeature { feature: "test" })
+        }
+
+        async fn install_sa(&self, _request: InstallSaRequest) -> Result<(), XfrmError> {
+            let state = self.state.clone();
+            let worker = tokio::task::spawn_blocking(move || {
+                let (lock, changed) = &*state;
+                let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                state.started = true;
+                changed.notify_all();
+                while !state.released {
+                    state = changed
+                        .wait(state)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                }
+                state.sa_present = true;
+            });
+            worker.await.map_err(|_| XfrmError::StateIndeterminate {
+                operation: "test_spawn_blocking_install_sa",
+            })
+        }
+
+        async fn query_sa(&self, _request: QuerySaRequest) -> Result<SaState, XfrmError> {
+            Err(XfrmError::UnsupportedFeature { feature: "test" })
+        }
+
+        async fn rekey_sa(&self, _request: RekeySaRequest) -> Result<(), XfrmError> {
+            Err(XfrmError::UnsupportedFeature { feature: "test" })
+        }
+
+        async fn remove_sa(&self, _request: RemoveSaRequest) -> Result<(), XfrmError> {
+            let mut state = self.lock();
+            state.remove_calls += 1;
+            if state.sa_present {
+                state.sa_present = false;
                 Ok(())
             } else {
                 Err(XfrmError::NotFound)
             }
         }
 
-        async fn install_policy(&self, request: InstallPolicyRequest) -> Result<(), XfrmError> {
-            self.record("install_policy");
-            self.policy_started.notify_one();
-            let identity = RemovePolicyRequest {
-                selector: request.parameters.selector.clone(),
-                direction: request.parameters.direction,
-                mark: request.parameters.mark,
-            };
-            match self.policy_gate_mode {
-                Some(GateMode::BeforeApply) => {
-                    if let Some(gate) = self.take_policy_gate() {
-                        let _ = gate.await;
-                    }
-                }
-                Some(GateMode::AfterApply) => {
-                    if Self::lock(&self.policies).contains(&identity) {
-                        return Err(XfrmError::AlreadyExists);
-                    }
-                    Self::lock(&self.policies).push(identity);
-                    self.policy_applied.notify_one();
-                    if let Some(gate) = self.take_policy_gate() {
-                        let _ = gate.await;
-                    }
-                    return Ok(());
-                }
-                None => {}
-            }
-            if Self::lock(&self.policies).contains(&identity) {
-                return Err(XfrmError::AlreadyExists);
-            }
-            if let Some(error) = self.install_policy_error.clone() {
-                return Err(error);
-            }
-            Self::lock(&self.policies).push(identity);
+        async fn install_policy(&self, _request: InstallPolicyRequest) -> Result<(), XfrmError> {
+            self.lock().policy_present = true;
             Ok(())
         }
 
         async fn rekey_policy(&self, _request: RekeyPolicyRequest) -> Result<(), XfrmError> {
-            Err(XfrmError::UnsupportedFeature {
-                feature: "test rekey_policy",
-            })
+            Err(XfrmError::UnsupportedFeature { feature: "test" })
         }
 
-        async fn remove_policy(&self, request: RemovePolicyRequest) -> Result<(), XfrmError> {
-            self.record("remove_policy");
-            Self::lock(&self.removed_policy_requests).push(request.clone());
-            let mut policies = Self::lock(&self.policies);
-            if let Some(position) = policies.iter().position(|policy| *policy == request) {
-                policies.remove(position);
+        async fn remove_policy(&self, _request: RemovePolicyRequest) -> Result<(), XfrmError> {
+            let mut state = self.lock();
+            state.remove_calls += 1;
+            if state.policy_present {
+                state.policy_present = false;
+                Ok(())
+            } else {
+                Err(XfrmError::NotFound)
+            }
+        }
+
+        async fn probe(&self) -> Result<XfrmProbe, XfrmError> {
+            Ok(XfrmProbe::mock())
+        }
+    }
+
+    #[async_trait]
+    impl XfrmBackend for TerminatingBlockingBackend {
+        async fn allocate_spi(
+            &self,
+            _request: AllocateSpiRequest,
+        ) -> Result<SpiAllocation, XfrmError> {
+            Err(XfrmError::UnsupportedFeature { feature: "test" })
+        }
+
+        async fn install_sa(&self, _request: InstallSaRequest) -> Result<(), XfrmError> {
+            if self.panic_install_worker {
+                let state = self.state.clone();
+                let worker = tokio::task::spawn_blocking(move || {
+                    let (lock, changed) = &*state;
+                    let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    state.install_started = true;
+                    changed.notify_all();
+                    while !state.install_released {
+                        state = changed
+                            .wait(state)
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    }
+                    state.sa_present = true;
+                });
+                self.wait_until_install_started().await;
+                drop(worker);
+                panic!("test-only supervised install worker failure");
+            }
+            self.lock().sa_present = true;
+            Ok(())
+        }
+
+        async fn query_sa(&self, _request: QuerySaRequest) -> Result<SaState, XfrmError> {
+            Err(XfrmError::UnsupportedFeature { feature: "test" })
+        }
+
+        async fn rekey_sa(&self, _request: RekeySaRequest) -> Result<(), XfrmError> {
+            Err(XfrmError::UnsupportedFeature { feature: "test" })
+        }
+
+        async fn remove_sa(&self, _request: RemoveSaRequest) -> Result<(), XfrmError> {
+            self.lock().remove_calls += 1;
+            let mut state = self.lock();
+            if state.sa_present {
+                state.sa_present = false;
+                Ok(())
+            } else {
+                Err(XfrmError::NotFound)
+            }
+        }
+
+        async fn install_policy(&self, _request: InstallPolicyRequest) -> Result<(), XfrmError> {
+            self.lock().policy_present = true;
+            Ok(())
+        }
+
+        async fn rekey_policy(&self, _request: RekeyPolicyRequest) -> Result<(), XfrmError> {
+            Err(XfrmError::UnsupportedFeature { feature: "test" })
+        }
+
+        async fn remove_policy(&self, _request: RemovePolicyRequest) -> Result<(), XfrmError> {
+            self.lock().remove_calls += 1;
+            if self.panic_remove_worker {
+                let state = self.state.clone();
+                let worker = tokio::task::spawn_blocking(move || {
+                    let (lock, changed) = &*state;
+                    let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    state.remove_started = true;
+                    changed.notify_all();
+                    while !state.remove_released {
+                        state = changed
+                            .wait(state)
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    }
+                    state.policy_present = false;
+                });
+                self.wait_until_remove_started().await;
+                drop(worker);
+                panic!("test-only supervised recovery worker failure");
+            }
+            let mut state = self.lock();
+            if state.policy_present {
+                state.policy_present = false;
                 Ok(())
             } else {
                 Err(XfrmError::NotFound)
@@ -889,18 +1817,18 @@ mod tests {
     }
 
     fn selector() -> XfrmSelector {
-        XfrmSelector::new(ipv4(10, 0, 0, 1), ipv4(10, 0, 0, 2), 50)
+        XfrmSelector::new(ipv4(10, 77, 88, 99), ipv4(203, 0, 113, 9), 50)
     }
 
     fn sa_parameters() -> SaParameters {
         SaParameters {
             selector: selector(),
             id: XfrmId {
-                destination: ipv4(10, 0, 0, 2),
-                spi: 0x1234_5678,
+                destination: ipv4(203, 0, 113, 9),
+                spi: 0xdead_beef,
                 protocol: 50,
             },
-            source_address: ipv4(10, 0, 0, 1),
+            source_address: ipv4(10, 77, 88, 99),
             request_id: None,
             auth: None,
             crypt: None,
@@ -925,7 +1853,7 @@ mod tests {
             priority: 100,
             templates: vec![XfrmTemplate {
                 id: sa_parameters().id,
-                source_address: ipv4(10, 0, 0, 1),
+                source_address: ipv4(10, 77, 88, 99),
                 request_id: None,
                 mode: XfrmMode::Tunnel,
             }],
@@ -953,602 +1881,908 @@ mod tests {
         install_request().rollback_remove_policy()
     }
 
-    #[tokio::test]
-    async fn cancellation_before_first_mutation_leaves_no_cleanup_obligation() {
-        let backend = GatedBackend::new();
-
-        let staged = XfrmStagedInstall::new(install_request());
-        let journal = staged.journal();
-        // Drop the `run` future before it is ever polled: no backend call is
-        // issued, so no mutation can have been acquired.
-        drop(staged.run(&backend));
-
-        assert!(backend.operations().is_empty());
-        assert_eq!(journal.ownership(), XfrmInstallOwnership::NotStarted);
-        assert!(!journal.ownership().has_residue());
-        assert!(journal.recovery_plan().is_empty());
-
-        // The runner may still be started later, so recovery is rejected
-        // instead of permanently retiring the journal's removal authority.
-        let error = journal
-            .recover(&backend)
-            .await
-            .expect_err("recovery before the runner finished is rejected");
-        assert!(matches!(error, XfrmInstallRecoveryError::RunnerNotFinished));
-        assert_eq!(error.as_str(), "xfrm_install_recovery_runner_not_finished");
-        assert!(backend.removed_sa_requests().is_empty());
-        assert!(backend.removed_policy_requests().is_empty());
-    }
-
-    #[tokio::test]
-    async fn cancellation_during_sa_install_before_apply_keeps_idempotent_sa_recovery() {
-        let backend = GatedBackend {
-            sa_gate_mode: Some(GateMode::BeforeApply),
-            ..GatedBackend::new()
-        };
-        let gate = backend.gate_sa();
-        let backend = Arc::new(backend);
-
-        let staged = XfrmStagedInstall::new(install_request());
-        let journal = staged.journal();
-        let runner = backend.clone();
-        let handle = tokio::spawn(async move { staged.run(runner.as_ref()).await });
-        backend.sa_started.notified().await;
-        handle.abort();
-        assert!(handle.await.is_err());
-        drop(gate);
-
-        // The install was issued but never observed: the journal must not
-        // report `NotStarted` while the SA await was in flight.
-        assert_eq!(journal.ownership(), XfrmInstallOwnership::SaInFlight);
-        assert!(journal.ownership().has_residue());
-        let plan = journal.recovery_plan();
-        assert_eq!(plan.sa(), Some(&expected_remove_sa()));
-        assert_eq!(plan.policy(), None);
-
-        // The SA was never applied: `NotFound` is idempotent success.
-        journal
-            .recover(backend.as_ref())
-            .await
-            .expect("recovery succeeds");
-        assert_eq!(journal.ownership(), XfrmInstallOwnership::Recovered);
-        assert_eq!(backend.operations(), vec!["install_sa", "remove_sa"]);
-        assert_eq!(backend.removed_sa_requests(), vec![expected_remove_sa()]);
-        assert!(backend.sas().is_empty());
-    }
-
-    #[tokio::test]
-    async fn cancellation_after_sa_applied_before_ack_retains_exact_sa_recovery() {
-        let backend = GatedBackend {
-            sa_gate_mode: Some(GateMode::AfterApply),
-            ..GatedBackend::new()
-        };
-        let gate = backend.gate_sa();
-        let backend = Arc::new(backend);
-
-        let staged = XfrmStagedInstall::new(install_request());
-        let journal = staged.journal();
-        let runner = backend.clone();
-        let handle = tokio::spawn(async move { staged.run(runner.as_ref()).await });
-        backend.sa_applied.notified().await;
-        handle.abort();
-        assert!(handle.await.is_err());
-        drop(gate);
-
-        // The backend applied the SA but the acknowledgement was never
-        // observed: exact SA recovery authority must be retained.
-        assert_eq!(journal.ownership(), XfrmInstallOwnership::SaInFlight);
-        let plan = journal.recovery_plan();
-        assert_eq!(plan.sa(), Some(&expected_remove_sa()));
-        assert_eq!(plan.policy(), None);
-
-        journal
-            .recover(backend.as_ref())
-            .await
-            .expect("recovery succeeds");
-        assert_eq!(journal.ownership(), XfrmInstallOwnership::Recovered);
-        assert_eq!(backend.operations(), vec!["install_sa", "remove_sa"]);
-        assert_eq!(backend.removed_sa_requests(), vec![expected_remove_sa()]);
-        assert!(backend.sas().is_empty());
-    }
-
-    #[tokio::test]
-    async fn recover_rejected_while_run_in_flight_then_succeeds_after_abort() {
-        let backend = GatedBackend {
-            policy_gate_mode: Some(GateMode::BeforeApply),
-            ..GatedBackend::new()
-        };
-        let gate = backend.gate_policy();
-        let backend = Arc::new(backend);
-
-        let staged = XfrmStagedInstall::new(install_request());
-        let journal = staged.journal();
-        let runner = backend.clone();
-        let handle = tokio::spawn(async move { staged.run(runner.as_ref()).await });
-        backend.policy_started.notified().await;
-
-        // The runner is still live: recovery must not retire removal
-        // authority the runner may still need.
-        let error = journal
-            .recover(backend.as_ref())
-            .await
-            .expect_err("recovery during a live run is rejected");
-        assert!(matches!(error, XfrmInstallRecoveryError::RunnerNotFinished));
-        assert_eq!(journal.ownership(), XfrmInstallOwnership::PolicyInFlight);
-
-        // Dropping the runner finishes it; recovery then proceeds normally.
-        handle.abort();
-        assert!(handle.await.is_err());
-        drop(gate);
-        journal
-            .recover(backend.as_ref())
-            .await
-            .expect("recovery succeeds after the runner finished");
-        assert_eq!(journal.ownership(), XfrmInstallOwnership::Recovered);
-        assert!(backend.sas().is_empty());
-        assert!(backend.policies().is_empty());
-    }
-
-    #[tokio::test]
-    async fn recover_rejected_before_runner_is_polled() {
-        let backend = GatedBackend::new();
-
-        let staged = XfrmStagedInstall::new(install_request());
-        let journal = staged.journal();
-
-        let error = journal
-            .recover(&backend)
-            .await
-            .expect_err("recovery before the runner started is rejected");
-        assert!(matches!(error, XfrmInstallRecoveryError::RunnerNotFinished));
-        assert_eq!(journal.ownership(), XfrmInstallOwnership::NotStarted);
-        assert!(backend.operations().is_empty());
-    }
-
-    #[tokio::test]
-    async fn cancellation_after_sa_before_policy_completion_retains_exact_recovery() {
-        let backend = GatedBackend {
-            policy_gate_mode: Some(GateMode::BeforeApply),
-            ..GatedBackend::new()
-        };
-        let gate = backend.gate_policy();
-        let backend = Arc::new(backend);
-
-        let staged = XfrmStagedInstall::new(install_request());
-        let journal = staged.journal();
-        let runner = backend.clone();
-        let handle = tokio::spawn(async move { staged.run(runner.as_ref()).await });
-        backend.policy_started.notified().await;
-        handle.abort();
-        assert!(handle.await.is_err());
-        drop(gate);
-
-        // The SA is owned; the policy was issued but never observed, so exact
-        // authority for both is retained.
-        assert_eq!(journal.ownership(), XfrmInstallOwnership::PolicyInFlight);
-        let plan = journal.recovery_plan();
-        assert_eq!(plan.sa(), Some(&expected_remove_sa()));
-        assert_eq!(plan.policy(), Some(&expected_remove_policy()));
-        assert!(!plan.requires_readback());
-
-        journal
-            .recover(backend.as_ref())
-            .await
-            .expect("recovery succeeds");
-        assert_eq!(journal.ownership(), XfrmInstallOwnership::Recovered);
-        // The policy was never applied: `NotFound` is idempotent success.
-        assert_eq!(
-            backend.operations(),
-            vec!["install_sa", "install_policy", "remove_policy", "remove_sa"]
-        );
-        assert_eq!(
-            backend.removed_policy_requests(),
-            vec![expected_remove_policy()]
-        );
-        assert_eq!(backend.removed_sa_requests(), vec![expected_remove_sa()]);
-        assert!(backend.sas().is_empty());
-        assert!(backend.policies().is_empty());
-    }
-
-    #[tokio::test]
-    async fn cancellation_after_policy_applied_before_return_retains_exact_recovery() {
-        let backend = GatedBackend {
-            policy_gate_mode: Some(GateMode::AfterApply),
-            ..GatedBackend::new()
-        };
-        let gate = backend.gate_policy();
-        let backend = Arc::new(backend);
-
-        let staged = XfrmStagedInstall::new(install_request());
-        let journal = staged.journal();
-        let runner = backend.clone();
-        let handle = tokio::spawn(async move { staged.run(runner.as_ref()).await });
-        backend.policy_applied.notified().await;
-        handle.abort();
-        assert!(handle.await.is_err());
-        drop(gate);
-
-        // The backend applied the policy but the acknowledgement was never
-        // observed; the journal still retains exact authority for both.
-        assert_eq!(journal.ownership(), XfrmInstallOwnership::PolicyInFlight);
-        let plan = journal.recovery_plan();
-        assert_eq!(plan.sa(), Some(&expected_remove_sa()));
-        assert_eq!(plan.policy(), Some(&expected_remove_policy()));
-
-        journal
-            .recover(backend.as_ref())
-            .await
-            .expect("recovery succeeds");
-        assert_eq!(journal.ownership(), XfrmInstallOwnership::Recovered);
-        assert_eq!(
-            backend.operations(),
-            vec!["install_sa", "install_policy", "remove_policy", "remove_sa"]
-        );
-        assert!(backend.sas().is_empty());
-        assert!(backend.policies().is_empty());
-    }
-
-    #[tokio::test]
-    async fn already_exists_sa_install_does_not_remove_existing_sa() {
-        let backend = GatedBackend::new();
-        backend.preinstall_sa(expected_remove_sa());
-
-        let staged = XfrmStagedInstall::new(install_request());
-        let journal = staged.journal();
-        let error = staged
-            .run(&backend)
-            .await
-            .expect_err("pre-existing SA fails the install");
-
-        assert!(matches!(
-            error,
-            XfrmCompositeInstallError::InstallSaFailed {
-                source: XfrmError::AlreadyExists,
-                ..
-            }
-        ));
-        assert_eq!(
-            error.outcome(),
-            XfrmCompositeOutcome::not_applied(XfrmCompositeOperation::InstallSa)
-        );
-        assert_eq!(journal.ownership(), XfrmInstallOwnership::NotStarted);
-        assert!(journal.recovery_plan().is_empty());
-
-        journal
-            .recover(&backend)
-            .await
-            .expect("empty recovery succeeds");
-        assert_eq!(backend.operations(), vec!["install_sa"]);
-        // The pre-existing SA is not owned and is never removed.
-        assert_eq!(backend.sas(), vec![expected_remove_sa()]);
-        assert!(backend.removed_sa_requests().is_empty());
-    }
-
-    #[tokio::test]
-    async fn already_exists_policy_install_rolls_back_only_the_new_sa() {
-        let backend = GatedBackend::new();
-        backend.preinstall_policy(expected_remove_policy());
-
-        let staged = XfrmStagedInstall::new(install_request());
-        let journal = staged.journal();
-        let error = staged
-            .run(&backend)
-            .await
-            .expect_err("pre-existing policy fails the install");
-
-        assert!(matches!(
-            error,
-            XfrmCompositeInstallError::PolicyInstallRolledBack {
-                source: XfrmError::AlreadyExists,
-                ..
-            }
-        ));
-        assert_eq!(
-            error.outcome(),
-            XfrmCompositeOutcome::rolled_back(XfrmCompositeOperation::InstallPolicy)
-        );
-        // Only the newly acquired SA was rolled back.
-        assert_eq!(
-            backend.operations(),
-            vec!["install_sa", "install_policy", "remove_sa"]
-        );
-        assert!(backend.sas().is_empty());
-        assert_eq!(backend.policies(), vec![expected_remove_policy()]);
-        assert!(backend.removed_policy_requests().is_empty());
-
-        assert_eq!(journal.ownership(), XfrmInstallOwnership::RolledBack);
-        assert!(journal.recovery_plan().is_empty());
-        journal
-            .recover(&backend)
-            .await
-            .expect("empty recovery succeeds");
-        assert_eq!(backend.policies(), vec![expected_remove_policy()]);
-    }
-
-    #[tokio::test]
-    async fn fully_rolled_back_failure_reports_no_residual_ownership() {
-        let backend = GatedBackend {
-            install_policy_error: Some(XfrmError::Unavailable),
-            ..GatedBackend::new()
-        };
-
-        let staged = XfrmStagedInstall::new(install_request());
-        let journal = staged.journal();
-        let error = staged
-            .run(&backend)
-            .await
-            .expect_err("policy failure rolls back");
-
-        assert_eq!(error.as_str(), "xfrm_composite_policy_install_rolled_back");
-        assert_eq!(journal.ownership(), XfrmInstallOwnership::RolledBack);
-        assert!(!journal.ownership().has_residue());
-        assert!(journal.recovery_plan().is_empty());
-
-        journal
-            .recover(&backend)
-            .await
-            .expect("empty recovery succeeds");
-        assert_eq!(
-            backend.operations(),
-            vec!["install_sa", "install_policy", "remove_sa"]
-        );
-    }
-
-    #[tokio::test]
-    async fn rollback_failure_stays_typed_and_keeps_exact_sa_residue_recoverable() {
-        let backend = GatedBackend {
-            install_policy_error: Some(XfrmError::Unavailable),
-            ..GatedBackend::new()
-        };
-        backend.fail_remove_sa(XfrmError::Unavailable);
-
-        let staged = XfrmStagedInstall::new(install_request());
-        let journal = staged.journal();
-        let error = staged
-            .run(&backend)
-            .await
-            .expect_err("rollback failure is reported");
-
-        // The rollback failure is not collapsed into a generic error.
-        assert_eq!(
-            error.as_str(),
-            "xfrm_composite_policy_install_rollback_failed"
-        );
-        match &error {
-            XfrmCompositeInstallError::PolicyInstallRollbackFailed {
-                source,
-                rollback,
-                outcome,
-            } => {
-                assert!(matches!(source, XfrmError::Unavailable));
-                assert!(matches!(rollback, XfrmError::Unavailable));
-                assert!(outcome.rollback_failed);
-                assert!(outcome.partial_state_possible);
-            }
-            other => panic!("unexpected error variant: {other:?}"),
+    fn classify(
+        plan: &XfrmInstallRecoveryPlan,
+        policy: Option<XfrmResidueClassification>,
+        sa: Option<XfrmResidueClassification>,
+    ) -> XfrmInstallRecoveryClassification {
+        let mut classification = plan.classification();
+        if let Some(policy) = policy {
+            classification = classification.with_policy(policy);
         }
+        if let Some(sa) = sa {
+            classification = classification.with_sa(sa);
+        }
+        classification
+    }
 
-        // Exact SA residue is still owned and recoverable; the definitively
-        // rejected policy is not part of the plan.
-        assert_eq!(journal.ownership(), XfrmInstallOwnership::SaAcquired);
-        let plan = journal.recovery_plan();
-        assert_eq!(plan.sa(), Some(&expected_remove_sa()));
-        assert_eq!(plan.policy(), None);
+    fn classify_all_owned(plan: &XfrmInstallRecoveryPlan) -> XfrmInstallRecoveryClassification {
+        classify(
+            plan,
+            plan.policy().map(|_| XfrmResidueClassification::Owned),
+            plan.sa().map(|_| XfrmResidueClassification::Owned),
+        )
+    }
 
-        backend.clear_remove_sa_error();
-        journal
-            .recover(&backend)
-            .await
-            .expect("recovery retry succeeds");
-        assert_eq!(journal.ownership(), XfrmInstallOwnership::Recovered);
-        assert_eq!(
-            backend.operations(),
-            vec!["install_sa", "install_policy", "remove_sa", "remove_sa"]
-        );
-        assert!(backend.sas().is_empty());
+    fn composite_error(error: XfrmStagedInstallRunError) -> XfrmCompositeInstallError {
+        match error {
+            XfrmStagedInstallRunError::Composite { source } => source,
+            other => panic!("unexpected staged runner error: {other}"),
+        }
+    }
+
+    async fn wait_for_ownership(journal: &XfrmInstallJournal, expected: XfrmInstallOwnership) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if journal.ownership() == expected {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("supervised worker reaches expected ownership");
     }
 
     #[tokio::test]
-    async fn indeterminate_sa_install_stays_explicitly_recoverable() {
-        let backend = GatedBackend {
-            install_sa_error: Some(XfrmError::StateIndeterminate {
-                operation: "install_sa_readback",
-            }),
-            ..GatedBackend::new()
-        };
-
+    async fn successful_install_commits_across_every_journal_clone() {
+        let backend = Arc::new(GatedBackend::new());
         let staged = XfrmStagedInstall::new(install_request());
         let journal = staged.journal();
-        let error = staged
-            .run(&backend)
-            .await
-            .expect_err("indeterminate SA install is reported");
+        let second = journal.clone();
 
-        assert!(matches!(
-            error,
-            XfrmCompositeInstallError::InstallSaFailed {
-                source: XfrmError::StateIndeterminate { .. },
-                ..
-            }
-        ));
-        assert_eq!(
-            error.outcome(),
-            XfrmCompositeOutcome::indeterminate(XfrmCompositeOperation::InstallSa)
-        );
-
-        assert_eq!(
-            journal.ownership(),
-            XfrmInstallOwnership::Indeterminate {
-                operation: XfrmCompositeOperation::InstallSa
-            }
-        );
-        let plan = journal.recovery_plan();
-        assert!(plan.requires_readback());
-        assert_eq!(plan.sa(), Some(&expected_remove_sa()));
-        assert_eq!(plan.policy(), None);
-
-        journal
-            .recover(&backend)
-            .await
-            .expect("classified recovery succeeds");
-        assert_eq!(journal.ownership(), XfrmInstallOwnership::Recovered);
-        assert_eq!(backend.removed_sa_requests(), vec![expected_remove_sa()]);
-    }
-
-    #[tokio::test]
-    async fn indeterminate_policy_install_keeps_policy_residue_recoverable() {
-        let backend = GatedBackend {
-            install_policy_error: Some(XfrmError::StateIndeterminate {
-                operation: "install_policy_readback",
-            }),
-            ..GatedBackend::new()
-        };
-
-        let staged = XfrmStagedInstall::new(install_request());
-        let journal = staged.journal();
-        let error = staged
-            .run(&backend)
-            .await
-            .expect_err("indeterminate policy install is reported");
-
-        assert!(matches!(
-            error,
-            XfrmCompositeInstallError::PolicyInstallRolledBack {
-                source: XfrmError::StateIndeterminate { .. },
-                ..
-            }
-        ));
-
-        // The helper rolled its acknowledged SA back, but the policy mutation
-        // may have been accepted: exact policy residue stays recoverable and
-        // classified as readback-requiring instead of collapsing into a
-        // generic error.
-        assert_eq!(
-            journal.ownership(),
-            XfrmInstallOwnership::Indeterminate {
-                operation: XfrmCompositeOperation::InstallPolicy
-            }
-        );
-        let plan = journal.recovery_plan();
-        assert!(plan.requires_readback());
-        assert_eq!(plan.policy(), Some(&expected_remove_policy()));
-        assert_eq!(plan.sa(), None);
-
-        journal
-            .recover(&backend)
-            .await
-            .expect("classified recovery succeeds");
-        assert_eq!(journal.ownership(), XfrmInstallOwnership::Recovered);
-        assert_eq!(
-            backend.removed_policy_requests(),
-            vec![expected_remove_policy()]
-        );
-    }
-
-    #[tokio::test]
-    async fn recovery_retry_is_idempotent_for_not_found_without_broadening_identity() {
-        let backend = GatedBackend::new();
-
-        let staged = XfrmStagedInstall::new(install_request());
-        let journal = staged.journal();
-        let outcome = staged.run(&backend).await.expect("install applies");
+        let outcome = staged.run(backend.clone()).await.expect("install applies");
         assert_eq!(outcome, XfrmCompositeOutcome::applied());
         assert_eq!(journal.ownership(), XfrmInstallOwnership::Complete);
+        journal.commit().expect("complete install commits");
+        journal.commit().expect("commit retry is idempotent");
 
-        // Residue is removed externally before recovery runs.
-        backend
-            .remove_policy(expected_remove_policy())
+        assert_eq!(journal.ownership(), XfrmInstallOwnership::Committed);
+        assert_eq!(second.ownership(), XfrmInstallOwnership::Committed);
+        assert!(second.recovery_plan().is_empty());
+        let error = second
+            .recover(backend.clone(), second.recovery_plan().classification())
             .await
-            .expect("external policy removal");
-        backend
-            .remove_sa(expected_remove_sa())
-            .await
-            .expect("external SA removal");
-
-        journal
-            .recover(&backend)
-            .await
-            .expect("NotFound is idempotent success");
-        assert_eq!(journal.ownership(), XfrmInstallOwnership::Recovered);
-
-        // Every removal the journal authorized used the exact retained
-        // identity; nothing was broadened.
-        assert_eq!(
-            backend.removed_policy_requests(),
-            vec![expected_remove_policy(), expected_remove_policy()]
-        );
-        assert_eq!(
-            backend.removed_sa_requests(),
-            vec![expected_remove_sa(), expected_remove_sa()]
-        );
-
-        // Retrying a completed recovery is a no-op.
-        let operations_before = backend.operations().len();
-        journal
-            .recover(&backend)
-            .await
-            .expect("recovery retry is a no-op");
-        assert_eq!(backend.operations().len(), operations_before);
+            .expect_err("committed authority cannot recover");
+        assert!(matches!(error, XfrmInstallRecoveryError::Committed));
+        assert_eq!(backend.operations(), vec!["install_sa", "install_policy"]);
     }
 
     #[tokio::test]
-    async fn staged_outcome_error_and_debug_surfaces_are_redaction_safe() {
+    async fn dropping_unpolled_runner_finishes_without_cleanup_obligation() {
+        let backend = Arc::new(GatedBackend::new());
+        let staged = XfrmStagedInstall::new(install_request());
+        let journal = staged.journal();
+        let runner = staged.run(backend.clone());
+
+        let error = journal
+            .recover(backend.clone(), journal.recovery_plan().classification())
+            .await
+            .expect_err("unpolled runner has not finished");
+        assert!(matches!(error, XfrmInstallRecoveryError::RunnerNotFinished));
+        drop(runner);
+
+        assert_eq!(journal.ownership(), XfrmInstallOwnership::NotStarted);
+        assert!(journal.recovery_plan().is_empty());
+        let plan = journal.recovery_plan();
+        let unexpected = plan
+            .classification()
+            .with_sa(XfrmResidueClassification::Owned);
+        let error = journal
+            .recover(backend.clone(), unexpected)
+            .await
+            .expect_err("classification for absent candidate fails closed");
+        assert!(matches!(
+            error,
+            XfrmInstallRecoveryError::UnexpectedClassification {
+                object: XfrmInstallObject::Sa
+            }
+        ));
+        journal
+            .recover(backend.clone(), plan.classification())
+            .await
+            .expect("empty recovery retires the journal");
+        assert_eq!(journal.ownership(), XfrmInstallOwnership::Recovered);
+        assert!(backend.operations().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dropping_staged_value_before_run_finishes_empty_journal() {
+        let backend = Arc::new(GatedBackend::new());
+        let staged = XfrmStagedInstall::new(install_request());
+        let journal = staged.journal();
+        drop(staged);
+
+        assert_eq!(journal.ownership(), XfrmInstallOwnership::NotStarted);
+        let plan = journal.recovery_plan();
+        assert!(plan.is_empty());
+        journal
+            .recover(backend.clone(), plan.classification())
+            .await
+            .expect("dropped unstarted operation has no cleanup obligation");
+        assert_eq!(journal.ownership(), XfrmInstallOwnership::Recovered);
+        assert!(backend.operations().is_empty());
+    }
+
+    #[tokio::test]
+    async fn pending_sa_already_exists_never_authorizes_deleting_preexisting_sa() {
+        let backend = Arc::new(GatedBackend::with_preexisting_sa_and_paused_result());
+        let staged = XfrmStagedInstall::new(install_request());
+        let journal = staged.journal();
+        let runner_backend = backend.clone();
+        let runner = tokio::spawn(staged.run(runner_backend));
+        backend.install_sa_decided.notified().await;
+        runner.abort();
+        assert!(runner.await.is_err());
+
+        let live_plan = journal.recovery_plan();
+        let error = journal
+            .recover(backend.clone(), classify_all_owned(&live_plan))
+            .await
+            .expect_err("detached observer does not cancel supervised install");
+        assert!(matches!(error, XfrmInstallRecoveryError::RunnerNotFinished));
+
+        backend.install_sa_release.notify_one();
+        wait_for_ownership(&journal, XfrmInstallOwnership::NotStarted).await;
+
+        assert!(backend.sa_present());
+        assert!(journal.recovery_plan().is_empty());
+        assert!(backend.removed_sa_requests().is_empty());
+        assert_eq!(backend.operations(), vec!["install_sa"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropped_observer_cannot_race_a_live_spawn_blocking_mutation() {
+        let backend = Arc::new(SpawnBlockingBackend::default());
+        let staged = XfrmStagedInstall::new(install_request());
+        let journal = staged.journal();
+        let observer = tokio::spawn(staged.run(backend.clone()));
+        backend.wait_until_started().await;
+
+        observer.abort();
+        assert!(observer.await.is_err());
+        assert_eq!(journal.ownership(), XfrmInstallOwnership::SaInFlight);
+
+        let live_plan = journal.recovery_plan();
+        let error = journal
+            .recover(backend.clone(), classify_all_owned(&live_plan))
+            .await
+            .expect_err("recovery cannot overtake detached blocking work");
+        assert!(matches!(error, XfrmInstallRecoveryError::RunnerNotFinished));
+        assert_eq!(backend.remove_calls(), 0);
+
+        backend.release();
+        wait_for_ownership(&journal, XfrmInstallOwnership::Complete).await;
+        assert!(backend.sa_present());
+
+        let completed_plan = journal.recovery_plan();
+        journal
+            .recover(backend.clone(), classify_all_owned(&completed_plan))
+            .await
+            .expect("completed blocking mutation is safely recoverable");
+        assert!(!backend.sa_present());
+        assert_eq!(backend.remove_calls(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn panicked_install_worker_permanently_blocks_in_process_recovery() {
+        let backend = Arc::new(TerminatingBlockingBackend::panics_during_install());
+        let staged = XfrmStagedInstall::new(install_request());
+        let journal = staged.journal();
+
+        let error = staged
+            .run(backend.clone())
+            .await
+            .expect_err("supervised worker panic is typed");
+        assert!(matches!(error, XfrmStagedInstallRunError::WorkerTerminated));
+        assert!(matches!(
+            journal.ownership(),
+            XfrmInstallOwnership::SupervisionLost {
+                operation: Some(XfrmCompositeOperation::InstallSa)
+            }
+        ));
+
+        let plan = journal.recovery_plan();
+        assert!(plan.supervision_lost());
+        assert!(plan.requires_readback());
+        let error = journal
+            .recover(backend.clone(), classify_all_owned(&plan))
+            .await
+            .expect_err("detached blocking install permanently poisons recovery");
+        assert!(matches!(error, XfrmInstallRecoveryError::WorkerTerminated));
+        assert_eq!(backend.remove_calls(), 0);
+
+        backend.release_install();
+        backend.wait_until_sa_present().await;
+
+        let plan = journal.recovery_plan();
+        let error = journal
+            .recover(backend.clone(), classify_all_owned(&plan))
+            .await
+            .expect_err("later quiescence cannot forge supervised completion");
+        assert!(matches!(error, XfrmInstallRecoveryError::WorkerTerminated));
+        assert_eq!(backend.remove_calls(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn panicked_recovery_worker_permanently_blocks_overlapping_removal() {
+        let backend = Arc::new(TerminatingBlockingBackend::panics_during_remove());
+        let staged = XfrmStagedInstall::new(install_request());
+        let journal = staged.journal();
+        staged
+            .run(backend.clone())
+            .await
+            .expect("install completes before recovery");
+
+        let plan = journal.recovery_plan();
+        let error = journal
+            .recover(backend.clone(), classify_all_owned(&plan))
+            .await
+            .expect_err("supervised recovery panic is typed");
+        assert!(matches!(error, XfrmInstallRecoveryError::WorkerTerminated));
+        assert!(matches!(
+            journal.ownership(),
+            XfrmInstallOwnership::SupervisionLost {
+                operation: Some(XfrmCompositeOperation::RemovePolicy)
+            }
+        ));
+
+        let plan = journal.recovery_plan();
+        assert!(plan.supervision_lost());
+        assert!(plan.requires_readback());
+        let error = journal
+            .recover(backend.clone(), classify_all_owned(&plan))
+            .await
+            .expect_err("a second recovery cannot overlap detached removal");
+        assert!(matches!(error, XfrmInstallRecoveryError::WorkerTerminated));
+        assert_eq!(backend.remove_calls(), 1);
+
+        backend.release_remove();
+        backend.wait_until_policy_absent().await;
+
+        let plan = journal.recovery_plan();
+        let error = journal
+            .recover(backend.clone(), classify_all_owned(&plan))
+            .await
+            .expect_err("unobserved removal completion cannot restore authority");
+        assert!(matches!(error, XfrmInstallRecoveryError::WorkerTerminated));
+        assert_eq!(backend.remove_calls(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn runtime_shutdown_during_blocking_install_permanently_blocks_recovery() {
+        let backend = Arc::new(SpawnBlockingBackend::default());
+        let staged = XfrmStagedInstall::new(install_request());
+        let journal = staged.journal();
+        let runtime_backend = backend.clone();
+
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .expect("test runtime builds");
+            runtime.block_on(async move {
+                let observer = tokio::spawn(staged.run(runtime_backend.clone()));
+                runtime_backend.wait_until_started().await;
+                drop(observer);
+            });
+            runtime.shutdown_timeout(std::time::Duration::from_millis(25));
+        })
+        .join()
+        .expect("runtime shutdown thread joins");
+
+        assert!(matches!(
+            journal.ownership(),
+            XfrmInstallOwnership::SupervisionLost {
+                operation: Some(XfrmCompositeOperation::InstallSa)
+            }
+        ));
+        let plan = journal.recovery_plan();
+        assert!(plan.supervision_lost());
+        assert!(plan.requires_readback());
+        let error = journal
+            .recover(backend.clone(), classify_all_owned(&plan))
+            .await
+            .expect_err("runtime shutdown cannot expose premature recovery authority");
+        assert!(matches!(error, XfrmInstallRecoveryError::WorkerTerminated));
+        assert_eq!(backend.remove_calls(), 0);
+
+        backend.release();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !backend.sa_present() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached blocking mutation eventually completes");
+
+        let plan = journal.recovery_plan();
+        let error = journal
+            .recover(backend.clone(), classify_all_owned(&plan))
+            .await
+            .expect_err("post-shutdown quiescence remains untrusted");
+        assert!(matches!(error, XfrmInstallRecoveryError::WorkerTerminated));
+        assert_eq!(backend.remove_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn pending_policy_already_exists_removes_only_acknowledged_sa() {
+        let backend = Arc::new(GatedBackend::with_preexisting_policy_and_paused_result());
+        let staged = XfrmStagedInstall::new(install_request());
+        let journal = staged.journal();
+        let runner_backend = backend.clone();
+        let runner = tokio::spawn(staged.run(runner_backend));
+        backend.install_policy_decided.notified().await;
+        runner.abort();
+        assert!(runner.await.is_err());
+
+        let live_plan = journal.recovery_plan();
+        let error = journal
+            .recover(backend.clone(), classify_all_owned(&live_plan))
+            .await
+            .expect_err("supervised policy result remains live");
+        assert!(matches!(error, XfrmInstallRecoveryError::RunnerNotFinished));
+
+        backend.install_policy_release.notify_one();
+        wait_for_ownership(&journal, XfrmInstallOwnership::RolledBack).await;
+
+        assert!(!backend.sa_present());
+        assert!(backend.policy_present());
+        assert!(backend.removed_policy_requests().is_empty());
+        assert_eq!(backend.removed_sa_requests(), vec![expected_remove_sa()]);
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_applied_sa_requires_owned_classification() {
+        let backend = Arc::new(GatedBackend::with_paused_sa_success());
+        let staged = XfrmStagedInstall::new(install_request());
+        let journal = staged.journal();
+        let runner_backend = backend.clone();
+        let runner = tokio::spawn(staged.run(runner_backend));
+        backend.install_sa_decided.notified().await;
+        runner.abort();
+        assert!(runner.await.is_err());
+        assert!(backend.sa_present());
+
+        let live_plan = journal.recovery_plan();
+        let error = journal
+            .recover(backend.clone(), classify_all_owned(&live_plan))
+            .await
+            .expect_err("supervised SA result remains live");
+        assert!(matches!(error, XfrmInstallRecoveryError::RunnerNotFinished));
+
+        backend.install_sa_release.notify_one();
+        wait_for_ownership(&journal, XfrmInstallOwnership::Complete).await;
+        let plan = journal.recovery_plan();
+        journal
+            .recover(backend.clone(), classify_all_owned(&plan))
+            .await
+            .expect("completed supervised install is recoverable");
+        assert!(!backend.sa_present());
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_applied_policy_recovers_policy_before_sa() {
+        let backend = Arc::new(GatedBackend::with_paused_policy_success());
+        let staged = XfrmStagedInstall::new(install_request());
+        let journal = staged.journal();
+        let runner_backend = backend.clone();
+        let runner = tokio::spawn(staged.run(runner_backend));
+        backend.install_policy_decided.notified().await;
+        runner.abort();
+        assert!(runner.await.is_err());
+
+        let live_plan = journal.recovery_plan();
+        let error = journal
+            .recover(backend.clone(), classify_all_owned(&live_plan))
+            .await
+            .expect_err("supervised policy result remains live");
+        assert!(matches!(error, XfrmInstallRecoveryError::RunnerNotFinished));
+
+        backend.install_policy_release.notify_one();
+        wait_for_ownership(&journal, XfrmInstallOwnership::Complete).await;
+        let plan = journal.recovery_plan();
+        journal
+            .recover(backend.clone(), classify_all_owned(&plan))
+            .await
+            .expect("classified complete residue recovers");
+        assert_eq!(
+            backend.operations(),
+            vec!["install_sa", "install_policy", "remove_policy", "remove_sa"]
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_is_rejected_while_runner_is_live() {
+        let backend = Arc::new(GatedBackend::with_paused_policy_success());
+        let staged = XfrmStagedInstall::new(install_request());
+        let journal = staged.journal();
+        let runner_backend = backend.clone();
+        let runner = tokio::spawn(staged.run(runner_backend));
+        backend.install_policy_decided.notified().await;
+
+        let plan = journal.recovery_plan();
+        let error = journal
+            .recover(backend.clone(), classify_all_owned(&plan))
+            .await
+            .expect_err("live runner excludes recovery");
+        assert!(matches!(error, XfrmInstallRecoveryError::RunnerNotFinished));
+        backend.install_policy_release.notify_one();
+        runner
+            .await
+            .expect("observer joins")
+            .expect("supervised install completes");
+    }
+
+    #[tokio::test]
+    async fn concurrent_recovery_is_rejected_without_a_second_backend_call() {
+        let backend = Arc::new(GatedBackend::with_paused_policy_removal());
+        let staged = XfrmStagedInstall::new(install_request());
+        let journal = staged.journal();
+        staged.run(backend.clone()).await.expect("install applies");
+
+        let plan = journal.recovery_plan();
+        let first_classification = classify_all_owned(&plan);
+        let first_journal = journal.clone();
+        let first_backend = backend.clone();
+        let first = tokio::spawn(first_journal.recover(first_backend, first_classification));
+        backend.remove_policy_decided.notified().await;
+
+        let current = journal.recovery_plan();
+        let error = journal
+            .recover(backend.clone(), classify_all_owned(&current))
+            .await
+            .expect_err("recovery claim is exclusive");
+        assert!(matches!(
+            error,
+            XfrmInstallRecoveryError::RecoveryInProgress
+        ));
+        assert_eq!(backend.removed_policy_requests().len(), 1);
+        assert_eq!(
+            journal.commit(),
+            Err(XfrmInstallCommitError::RecoveryInProgress)
+        );
+
+        backend.remove_policy_release.notify_one();
+        first
+            .await
+            .expect("first recovery joins")
+            .expect("first recovery succeeds");
+    }
+
+    #[tokio::test]
+    async fn dropped_policy_recovery_observer_cannot_race_a_replacement() {
+        let backend = Arc::new(GatedBackend::with_paused_policy_removal());
+        let staged = XfrmStagedInstall::new(install_request());
+        let journal = staged.journal();
+        staged.run(backend.clone()).await.expect("install applies");
+
+        let old_plan = journal.recovery_plan();
+        let recovery_journal = journal.clone();
+        let recovery_backend = backend.clone();
+        let classification = classify_all_owned(&old_plan);
+        let recovery = tokio::spawn(recovery_journal.recover(recovery_backend, classification));
+        backend.remove_policy_decided.notified().await;
+        recovery.abort();
+        assert!(recovery.await.is_err());
+
+        let live_plan = journal.recovery_plan();
+        let error = journal
+            .recover(backend.clone(), classify_all_owned(&live_plan))
+            .await
+            .expect_err("supervised removal retains the recovery claim");
+        assert!(matches!(
+            error,
+            XfrmInstallRecoveryError::RecoveryInProgress
+        ));
+
+        backend.remove_policy_release.notify_one();
+        wait_for_ownership(&journal, XfrmInstallOwnership::Recovered).await;
+        backend.set_policy_present(true);
+        journal
+            .recover(backend.clone(), journal.recovery_plan().classification())
+            .await
+            .expect("terminal recovery retry is a no-op");
+
+        assert!(backend.policy_present());
+        assert_eq!(backend.removed_policy_requests().len(), 1);
+        assert!(!backend.sa_present());
+    }
+
+    #[tokio::test]
+    async fn dropped_sa_recovery_observer_cannot_race_a_replacement() {
+        let backend = Arc::new(GatedBackend::with_paused_sa_removal());
+        let staged = XfrmStagedInstall::new(install_request());
+        let journal = staged.journal();
+        staged.run(backend.clone()).await.expect("install applies");
+
+        let old_plan = journal.recovery_plan();
+        let recovery_journal = journal.clone();
+        let recovery_backend = backend.clone();
+        let classification = classify_all_owned(&old_plan);
+        let recovery = tokio::spawn(recovery_journal.recover(recovery_backend, classification));
+        backend.remove_sa_decided.notified().await;
+        recovery.abort();
+        assert!(recovery.await.is_err());
+
+        let live_plan = journal.recovery_plan();
+        let error = journal
+            .recover(backend.clone(), classify_all_owned(&live_plan))
+            .await
+            .expect_err("supervised removal retains the recovery claim");
+        assert!(matches!(
+            error,
+            XfrmInstallRecoveryError::RecoveryInProgress
+        ));
+
+        backend.remove_sa_release.notify_one();
+        wait_for_ownership(&journal, XfrmInstallOwnership::Recovered).await;
+        backend.set_sa_present(true);
+        journal
+            .recover(backend.clone(), journal.recovery_plan().classification())
+            .await
+            .expect("terminal recovery retry is a no-op");
+        assert!(backend.sa_present());
+        assert_eq!(backend.removed_sa_requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn indeterminate_recovery_error_rotates_plan_and_preserves_operation() {
+        let backend = Arc::new(GatedBackend::new());
+        let staged = XfrmStagedInstall::new(install_request());
+        let journal = staged.journal();
+        staged.run(backend.clone()).await.expect("install applies");
+        backend.fail_remove_policy(XfrmError::StateIndeterminate {
+            operation: "test_remove_policy",
+        });
+
+        let old_plan = journal.recovery_plan();
+        let stale = classify_all_owned(&old_plan);
+        let error = journal
+            .recover(backend.clone(), classify_all_owned(&old_plan))
+            .await
+            .expect_err("indeterminate removal is reported");
+        assert!(matches!(
+            error,
+            XfrmInstallRecoveryError::RemovePolicyFailed {
+                source: XfrmError::StateIndeterminate { .. }
+            }
+        ));
+        let current = journal.recovery_plan();
+        assert!(current
+            .indeterminate_operations()
+            .contains(XfrmCompositeOperation::RemovePolicy));
+        let error = journal
+            .recover(backend.clone(), stale)
+            .await
+            .expect_err("classification predating indeterminate result is stale");
+        assert!(matches!(
+            error,
+            XfrmInstallRecoveryError::StaleClassification
+        ));
+
+        backend.clear_remove_policy_error();
+        let classification = classify(
+            &current,
+            Some(XfrmResidueClassification::Absent),
+            Some(XfrmResidueClassification::Owned),
+        );
+        journal
+            .recover(backend.clone(), classification)
+            .await
+            .expect("fresh classification completes recovery");
+    }
+
+    #[tokio::test]
+    async fn observed_already_exists_sa_never_enters_recovery_plan() {
+        let backend = Arc::new(GatedBackend::new());
+        backend.lock().sa_present = true;
+        let staged = XfrmStagedInstall::new(install_request());
+        let journal = staged.journal();
+        let error = composite_error(
+            staged
+                .run(backend.clone())
+                .await
+                .expect_err("pre-existing SA rejects install"),
+        );
+
+        assert!(matches!(
+            error,
+            XfrmCompositeInstallError::InstallSaFailed {
+                source: XfrmError::AlreadyExists,
+                ..
+            }
+        ));
+        assert!(journal.recovery_plan().is_empty());
+        assert!(backend.removed_sa_requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn indeterminate_sa_install_requires_classified_recovery() {
+        let backend = Arc::new(GatedBackend {
+            install_sa_error: Some(XfrmError::StateIndeterminate {
+                operation: "test_install_sa",
+            }),
+            ..GatedBackend::new()
+        });
+        let staged = XfrmStagedInstall::new(install_request());
+        let journal = staged.journal();
+        let error = composite_error(
+            staged
+                .run(backend.clone())
+                .await
+                .expect_err("SA result is indeterminate"),
+        );
+
+        assert!(matches!(
+            error,
+            XfrmCompositeInstallError::InstallSaFailed {
+                source: XfrmError::StateIndeterminate { .. },
+                ..
+            }
+        ));
+        assert!(error.outcome().partial_state_possible);
+        let plan = journal.recovery_plan();
+        assert!(plan.requires_readback());
+        assert!(plan.policy().is_none());
+        assert_eq!(plan.sa(), Some(&expected_remove_sa()));
+        assert!(plan
+            .indeterminate_operations()
+            .contains(XfrmCompositeOperation::InstallSa));
+
+        let classification = classify(&plan, None, Some(XfrmResidueClassification::Absent));
+        journal
+            .recover(backend.clone(), classification)
+            .await
+            .expect("classified absence safely retires the candidate");
+    }
+
+    #[tokio::test]
+    async fn observed_already_exists_policy_rolls_back_only_new_sa() {
+        let backend = Arc::new(GatedBackend::new());
+        backend.lock().policy_present = true;
+        let staged = XfrmStagedInstall::new(install_request());
+        let journal = staged.journal();
+        let error = composite_error(
+            staged
+                .run(backend.clone())
+                .await
+                .expect_err("pre-existing policy rejects install"),
+        );
+
+        assert!(matches!(
+            error,
+            XfrmCompositeInstallError::PolicyInstallRolledBack {
+                source: XfrmError::AlreadyExists,
+                ..
+            }
+        ));
+        assert_eq!(journal.ownership(), XfrmInstallOwnership::RolledBack);
+        assert!(journal.recovery_plan().is_empty());
+        assert!(backend.policy_present());
+        assert!(backend.removed_policy_requests().is_empty());
+        assert_eq!(backend.removed_sa_requests(), vec![expected_remove_sa()]);
+    }
+
+    #[tokio::test]
+    async fn fully_rolled_back_policy_failure_has_no_residual_authority() {
+        let backend = Arc::new(GatedBackend::with_policy_error(XfrmError::Unavailable));
+        let staged = XfrmStagedInstall::new(install_request());
+        let journal = staged.journal();
+        let error = composite_error(
+            staged
+                .run(backend.clone())
+                .await
+                .expect_err("policy failure rolls its SA back"),
+        );
+
+        assert!(matches!(
+            error,
+            XfrmCompositeInstallError::PolicyInstallRolledBack { .. }
+        ));
+        assert!(error.outcome().rolled_back);
+        assert!(!error.outcome().partial_state_possible);
+        assert_eq!(journal.ownership(), XfrmInstallOwnership::RolledBack);
+        assert!(journal.recovery_plan().is_empty());
+    }
+
+    #[tokio::test]
+    async fn rollback_failure_retains_exact_sa_candidate() {
+        let backend = Arc::new(GatedBackend::with_policy_error(XfrmError::Unavailable));
+        backend.fail_remove_sa(XfrmError::Unavailable);
+        let staged = XfrmStagedInstall::new(install_request());
+        let journal = staged.journal();
+        let error = composite_error(
+            staged
+                .run(backend.clone())
+                .await
+                .expect_err("rollback failure is typed"),
+        );
+
+        assert!(matches!(
+            error,
+            XfrmCompositeInstallError::PolicyInstallRollbackFailed { .. }
+        ));
+        assert!(error.outcome().partial_state_possible);
+        assert_eq!(journal.ownership(), XfrmInstallOwnership::SaAcquired);
+        backend.clear_remove_sa_error();
+        let plan = journal.recovery_plan();
+        journal
+            .recover(backend.clone(), classify_all_owned(&plan))
+            .await
+            .expect("retry removes exact SA");
+        assert!(!backend.sa_present());
+    }
+
+    #[tokio::test]
+    async fn indeterminate_rollback_is_explicit_and_requires_readback() {
+        let backend = Arc::new(GatedBackend::with_policy_and_rollback_errors(
+            XfrmError::Unavailable,
+            XfrmError::StateIndeterminate {
+                operation: "test_rollback",
+            },
+        ));
+        let staged = XfrmStagedInstall::new(install_request());
+        let journal = staged.journal();
+        let error = composite_error(
+            staged
+                .run(backend.clone())
+                .await
+                .expect_err("rollback is indeterminate"),
+        );
+
+        assert!(error.outcome().partial_state_possible);
+        let plan = journal.recovery_plan();
+        assert!(plan.requires_readback());
+        assert!(plan
+            .indeterminate_operations()
+            .contains(XfrmCompositeOperation::RollbackRemoveSa));
+    }
+
+    #[tokio::test]
+    async fn policy_and_rollback_uncertainty_are_both_preserved() {
+        let backend = Arc::new(GatedBackend::with_policy_and_rollback_errors(
+            XfrmError::StateIndeterminate {
+                operation: "test_policy",
+            },
+            XfrmError::StateIndeterminate {
+                operation: "test_rollback",
+            },
+        ));
+        let staged = XfrmStagedInstall::new(install_request());
+        let journal = staged.journal();
+        let error = composite_error(
+            staged
+                .run(backend.clone())
+                .await
+                .expect_err("both operations are indeterminate"),
+        );
+
+        assert!(error.outcome().partial_state_possible);
+        let operations = journal.recovery_plan().indeterminate_operations();
+        assert!(operations.contains(XfrmCompositeOperation::InstallPolicy));
+        assert!(operations.contains(XfrmCompositeOperation::RollbackRemoveSa));
+        assert_eq!(operations.iter().count(), 2);
+    }
+
+    #[tokio::test]
+    async fn indeterminate_policy_with_successful_sa_rollback_reports_partial_state() {
+        let backend = Arc::new(GatedBackend::with_policy_error(
+            XfrmError::StateIndeterminate {
+                operation: "test_policy",
+            },
+        ));
+        let staged = XfrmStagedInstall::new(install_request());
+        let journal = staged.journal();
+        let error = composite_error(
+            staged
+                .run(backend.clone())
+                .await
+                .expect_err("policy result is indeterminate"),
+        );
+
+        assert!(error.outcome().rolled_back);
+        assert!(error.outcome().partial_state_possible);
+        assert!(journal.ownership().has_residue());
+        assert_eq!(
+            journal.recovery_plan().policy(),
+            Some(&expected_remove_policy())
+        );
+        assert_eq!(journal.recovery_plan().sa(), None);
+    }
+
+    #[tokio::test]
+    async fn classifications_fail_closed_before_backend_mutation() {
+        let backend = Arc::new(GatedBackend::new());
+        let staged = XfrmStagedInstall::new(install_request());
+        let journal = staged.journal();
+        staged.run(backend.clone()).await.expect("install applies");
+        let before = backend.operations();
+
+        let plan = journal.recovery_plan();
+        let missing = classify(&plan, Some(XfrmResidueClassification::Owned), None);
+        let error = journal
+            .recover(backend.clone(), missing)
+            .await
+            .expect_err("missing SA classification fails closed");
+        assert!(matches!(
+            error,
+            XfrmInstallRecoveryError::MissingClassification {
+                object: XfrmInstallObject::Sa
+            }
+        ));
+
+        let indeterminate = classify(
+            &plan,
+            Some(XfrmResidueClassification::Indeterminate),
+            Some(XfrmResidueClassification::Owned),
+        );
+        let error = journal
+            .recover(backend.clone(), indeterminate)
+            .await
+            .expect_err("indeterminate classification fails closed");
+        assert!(matches!(
+            error,
+            XfrmInstallRecoveryError::ClassificationIndeterminate {
+                object: XfrmInstallObject::Policy
+            }
+        ));
+        assert_eq!(backend.operations(), before);
+    }
+
+    #[tokio::test]
+    async fn not_found_recovery_is_idempotent_and_retry_is_a_noop() {
+        let backend = Arc::new(GatedBackend::new());
+        let staged = XfrmStagedInstall::new(install_request());
+        let journal = staged.journal();
+        staged.run(backend.clone()).await.expect("install applies");
+
+        backend.lock().policy_present = false;
+        backend.lock().sa_present = false;
+        let plan = journal.recovery_plan();
+        journal
+            .recover(backend.clone(), classify_all_owned(&plan))
+            .await
+            .expect("NotFound clears exact candidates");
+        let count = backend.operations().len();
+        journal
+            .recover(backend.clone(), journal.recovery_plan().classification())
+            .await
+            .expect("terminal retry is a no-op");
+        assert_eq!(backend.operations().len(), count);
+    }
+
+    #[test]
+    fn debug_surfaces_redact_keys_addresses_and_spis() {
         let mut request = install_request();
         request.sa.parameters.auth = Some((
             crate::AuthAlgorithm::hmac_sha256(96),
             crate::KeyMaterial::new(vec![0xab; 32]),
         ));
-        request.sa.parameters.crypt = Some((
-            crate::Algorithm::cbc_aes(),
-            crate::KeyMaterial::new(vec![0xcd; 32]),
-        ));
-
-        let backend = GatedBackend {
-            install_policy_error: Some(XfrmError::Unavailable),
-            ..GatedBackend::new()
-        };
-        backend.fail_remove_sa(XfrmError::Unavailable);
-
         let staged = XfrmStagedInstall::new(request);
         let journal = staged.journal();
-        let error = staged
-            .run(&backend)
-            .await
-            .expect_err("rollback failure is reported");
-        let recovery_error = journal
-            .recover(&backend)
-            .await
-            .expect_err("recovery failure is reported");
+        let plan = journal.recovery_plan();
+        let classification = plan.classification();
 
-        let surfaces = [
-            format!("{error:?}"),
-            error.to_string(),
-            format!("{:?}", error.outcome()),
-            format!("{:?}", journal.ownership()),
-            format!("{:?}", journal.recovery_plan()),
-            format!("{journal:?}"),
+        for surface in [
             format!("{staged:?}"),
-            format!("{recovery_error:?}"),
-            recovery_error.to_string(),
-        ];
-        for surface in &surfaces {
+            format!("{journal:?}"),
+            format!("{plan:?}"),
+            format!("{classification:?}"),
+        ] {
             assert!(
-                !surface.contains("171") && !surface.contains("205"),
-                "surface leaked key material: {surface}"
+                !surface.contains("10, 77, 88, 99"),
+                "address leak: {surface}"
             );
             assert!(
-                !surface.contains("0xab") && !surface.contains("0xcd"),
-                "surface leaked key material: {surface}"
+                !surface.contains("203, 0, 113, 9"),
+                "address leak: {surface}"
             );
+            assert!(!surface.contains("3735928559"), "SPI leak: {surface}");
+            assert!(!surface.contains("deadbeef"), "SPI leak: {surface}");
+            assert!(!surface.contains("171"), "key leak: {surface}");
+            assert!(!surface.contains("0xab"), "key leak: {surface}");
         }
-        // Error displays remain stable machine-readable labels only.
-        assert_eq!(
-            error.to_string(),
-            "xfrm_composite_policy_install_rollback_failed"
-        );
-        assert_eq!(
-            recovery_error.to_string(),
-            "xfrm_install_recovery_remove_sa_failed"
-        );
     }
 }

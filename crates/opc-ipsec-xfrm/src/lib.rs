@@ -71,8 +71,10 @@ pub use model::{
 };
 pub use opc_types::DscpCodepoint;
 pub use staged::{
-    XfrmInstallJournal, XfrmInstallOwnership, XfrmInstallRecoveryError, XfrmInstallRecoveryPlan,
-    XfrmStagedInstall,
+    XfrmIndeterminateOperations, XfrmInstallCommitError, XfrmInstallJournal, XfrmInstallObject,
+    XfrmInstallOwnership, XfrmInstallRecoveryClassification, XfrmInstallRecoveryError,
+    XfrmInstallRecoveryPlan, XfrmResidueClassification, XfrmStagedInstall,
+    XfrmStagedInstallRunError,
 };
 pub use unsupported::UnsupportedXfrmBackend;
 
