@@ -3,8 +3,8 @@ use std::net::{IpAddr, Ipv4Addr};
 use async_trait::async_trait;
 use opc_gtpu_dataplane::{
     CreateGtpDeviceRequest, GtpDevice, GtpPdpContext, GtpVersion, GtpuDataplaneBackend, GtpuError,
-    GtpuProbe, GtpuSourcePortPolicy, MockOperation, PdpContextConflict, PdpContextInstallOutcome,
-    PdpContextSelectorOccupancy, RemovePdpContextRequest, Teid,
+    GtpuProbe, GtpuSourcePortPolicy, GtpuUplinkSourcePortPolicy, MockOperation, PdpContextConflict,
+    PdpContextInstallOutcome, PdpContextSelectorOccupancy, RemovePdpContextRequest, Teid,
 };
 
 fn established_mock_operation_kind(operation: &MockOperation) -> &'static str {
@@ -77,6 +77,7 @@ fn context() -> GtpPdpContext {
         gtp_version: GtpVersion::V1,
         bearer_mark: None,
         egress_dscp: None,
+        uplink_source_port_policy: GtpuUplinkSourcePortPolicy::LegacyServicePort,
     }
 }
 

@@ -75,6 +75,8 @@ pub const DOWNLINK_ENDPOINT_BINDING_VALUE_LEN: usize = 44;
 pub const MARKED_BEARER_OWNER_VALUE_LEN: usize = 64;
 /// Byte length of an optional uplink DSCP map value.
 pub const UPLINK_DSCP_VALUE_LEN: usize = 1;
+/// Byte length of an optional selected uplink UDP source-port map value.
+pub const UPLINK_SOURCE_PORT_VALUE_LEN: usize = 2;
 
 /// Reserved impossible UE-PAA key carrying durable DSCP-schema evidence in
 /// the existing uplink FAR map.
@@ -102,6 +104,19 @@ pub const UPLINK_BEARER_SCHEMA_MARKER_VALUE: [u8; UPLINK_FAR_VALUE_LEN] = *b"OPC
 /// both exact current hooks are attached. A v2 marker is endpoint-unbound and
 /// requires explicit drained reprovisioning rather than an implicit policy.
 pub const UPLINK_ENDPOINT_SCHEMA_MARKER_VALUE: [u8; UPLINK_FAR_VALUE_LEN] = *b"OPC-PEER-v3\0";
+/// Current v4 schema marker proving that the additive uplink source-port maps
+/// are pinned and available to the exact current uplink program.
+///
+/// The v3-to-v4 migration is purely additive: the source-port maps are empty
+/// by default and an absent entry selects the legacy 2152 source port, so a
+/// committed v3 pin set can be upgraded in place by creating the maps,
+/// verifying the complete pin graph, attaching the exact current hooks, and
+/// committing this marker. A live previous-generation (v3 object) tc hook
+/// does not match the current artifact and fails closed without mutation; it
+/// must be detached by its owning loader before adoption, exactly like the
+/// pre-v1 object generations. A loader that observes this value fails closed
+/// when either source-port map pin is missing.
+pub const UPLINK_SOURCE_PORT_SCHEMA_MARKER_VALUE: [u8; UPLINK_FAR_VALUE_LEN] = *b"OPC-SPORT-v4";
 
 /// BPF map name: uplink FAR, keyed by UE PAA (IPv4, network order).
 pub const MAP_UPLINK_FAR: &str = "GTPU_UPLINK_FAR";
@@ -117,6 +132,11 @@ pub const MAP_DOWNLINK_ENDPOINT_BINDING: &str = "GTPU_DL_BIND";
 pub const MAP_UPLINK_DSCP: &str = "GTPU_UPLINK_DSCP";
 /// BPF map name: optional uplink DSCP, keyed by `(UE PAA, packet mark)`.
 pub const MAP_UPLINK_MARK_DSCP: &str = "GTPU_ULM_DSCP";
+/// BPF map name: optional selected uplink UDP source port, keyed by UE PAA.
+pub const MAP_UPLINK_SOURCE_PORT: &str = "GTPU_UL_SPORT";
+/// BPF map name: optional selected uplink UDP source port, keyed by
+/// `(UE PAA, packet mark)`.
+pub const MAP_UPLINK_MARK_SOURCE_PORT: &str = "GTPU_ULM_SPORT";
 /// BPF map name: marked-bearer owner journal, keyed by `(UE PAA, mark)`.
 pub const MAP_MARKED_BEARER_OWNER: &str = "GTPU_M_OWNER";
 /// BPF map name: per-CPU datapath counters.
@@ -425,6 +445,84 @@ impl GtpuSourcePortPolicy {
             Self::Exact(port) => (1, port, port),
             Self::InclusiveRange(range) => (2, range.first, range.last),
         }
+    }
+}
+
+/// Explicit uplink GTP-U UDP source-port selection policy.
+///
+/// TS 29.281 section 4.4.2 fixes the destination service port at 2152 and
+/// leaves the source port to be set dynamically. Every uplink PDP context
+/// carries one explicit policy; the pre-feature fixed-2152 behavior remains
+/// available only as [`GtpuUplinkSourcePortPolicy::LegacyServicePort`]. The
+/// granularity is deliberately per PDP/bearer context; a deterministic
+/// inner-flow-hashed mode is a possible future extension of this type.
+///
+/// The selected port is persisted in the additive per-context source-port
+/// maps. An absent map entry encodes the legacy policy, so pre-feature
+/// pinned state upgrades without rewriting session entries. Port zero is
+/// reserved (RFC 768) and rejected at every construction and decode
+/// boundary, so corrupt adopted state fails closed.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum GtpuUplinkSourcePortPolicy {
+    /// Explicit legacy policy: the UDP source port is fixed to 2152, exactly
+    /// the pre-feature behavior.
+    #[default]
+    LegacyServicePort,
+    /// One selected per-PDP/bearer-context UDP source port, stable for every
+    /// packet of the context and across restarts.
+    Selected(u16),
+}
+
+impl core::fmt::Debug for GtpuUplinkSourcePortPolicy {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::LegacyServicePort => f.write_str("LegacyServicePort"),
+            Self::Selected(_) => f.debug_tuple("Selected").field(&"<redacted>").finish(),
+        }
+    }
+}
+
+impl GtpuUplinkSourcePortPolicy {
+    /// Construct a per-context selected-port policy. The reserved port zero
+    /// fails closed with `None`.
+    #[must_use]
+    pub const fn selected(port: u16) -> Option<Self> {
+        if port == 0 {
+            None
+        } else {
+            Some(Self::Selected(port))
+        }
+    }
+
+    /// Return the UDP source port stamped on uplink encapsulation under this
+    /// policy. The legacy policy yields [`GTPU_UDP_PORT`].
+    #[must_use]
+    pub const fn effective_source_port(self) -> u16 {
+        match self {
+            Self::LegacyServicePort => GTPU_UDP_PORT,
+            Self::Selected(port) => port,
+        }
+    }
+
+    /// Return the additive source-port map value for this policy.
+    ///
+    /// The legacy policy is encoded as map absence (`None`), keeping
+    /// pre-feature pinned state valid without rewriting entries. A selected
+    /// port is stored big endian.
+    #[must_use]
+    pub const fn map_value(self) -> Option<[u8; UPLINK_SOURCE_PORT_VALUE_LEN]> {
+        match self {
+            Self::LegacyServicePort => None,
+            Self::Selected(port) => Some(port.to_be_bytes()),
+        }
+    }
+
+    /// Decode an additive source-port map value into the corresponding
+    /// selected-port policy. A reserved zero port is corrupt adopted state
+    /// and fails closed with `None`.
+    #[must_use]
+    pub const fn from_map_value(value: [u8; UPLINK_SOURCE_PORT_VALUE_LEN]) -> Option<Self> {
+        Self::selected(u16::from_be_bytes(value))
     }
 }
 
@@ -1269,7 +1367,29 @@ pub fn build_uplink_encap_with_dscp(
     inner_len: u16,
     dscp: Option<u8>,
 ) -> Option<[u8; GTPU_ENCAP_LEN]> {
+    build_uplink_encap_with_dscp_and_source_port(far, inner_len, dscp, GTPU_UDP_PORT)
+}
+
+/// Build uplink encapsulation with an optional fixed outer DSCP codepoint
+/// and an explicit UDP source port.
+///
+/// The UDP destination port is always [`GTPU_UDP_PORT`] (TS 29.281 section
+/// 4.4.2 fixes the destination service port). `source_port` selects the UDP
+/// source port; the reserved port zero fails closed with `None`. Passing
+/// [`GTPU_UDP_PORT`] is byte-for-byte equivalent to
+/// [`build_uplink_encap_with_dscp`]. DSCP handling matches
+/// [`build_uplink_encap_with_dscp`].
+#[must_use]
+pub fn build_uplink_encap_with_dscp_and_source_port(
+    far: &UplinkFar,
+    inner_len: u16,
+    dscp: Option<u8>,
+    source_port: u16,
+) -> Option<[u8; GTPU_ENCAP_LEN]> {
     const ENCAP: u16 = GTPU_ENCAP_LEN as u16;
+    if source_port == 0 {
+        return None;
+    }
     if dscp.is_some_and(|value| value > 63) {
         return None;
     }
@@ -1293,7 +1413,7 @@ pub fn build_uplink_encap_with_dscp(
     let checksum = ipv4_header_checksum(&ip_header);
     out[10..12].copy_from_slice(&checksum.to_be_bytes());
     // UDP header.
-    out[20..22].copy_from_slice(&GTPU_UDP_PORT.to_be_bytes());
+    out[20..22].copy_from_slice(&source_port.to_be_bytes());
     out[22..24].copy_from_slice(&GTPU_UDP_PORT.to_be_bytes());
     out[24..26].copy_from_slice(&udp_len.to_be_bytes());
     // out[26..28] UDP checksum stays 0.
@@ -1616,6 +1736,8 @@ mod tests {
             MAP_DOWNLINK_ENDPOINT_BINDING,
             MAP_DOWNLINK_BINDING_COUNTERS,
             MAP_MARKED_BEARER_OWNER,
+            MAP_UPLINK_SOURCE_PORT,
+            MAP_UPLINK_MARK_SOURCE_PORT,
         ];
         for name in new_names {
             assert!(name.len() <= BPF_OBJ_NAME_VISIBLE_LEN);
@@ -1625,6 +1747,8 @@ mod tests {
             MAP_UPLINK_MARK_FAR,
             MAP_UPLINK_DSCP,
             MAP_UPLINK_MARK_DSCP,
+            MAP_UPLINK_SOURCE_PORT,
+            MAP_UPLINK_MARK_SOURCE_PORT,
             MAP_DOWNLINK_PDR,
             MAP_DOWNLINK_MARK_PDR,
             MAP_DOWNLINK_ENDPOINT_BINDING,
@@ -1873,6 +1997,63 @@ mod tests {
         );
         assert!(build_uplink_encap_with_dscp(&far(), 60, Some(64)).is_none());
         assert!(build_uplink_encap_with_dscp(&far(), 60, Some(u8::MAX)).is_none());
+    }
+
+    #[test]
+    fn legacy_service_port_policy_preserves_exact_legacy_encapsulation() {
+        assert_eq!(
+            GtpuUplinkSourcePortPolicy::LegacyServicePort.effective_source_port(),
+            GTPU_UDP_PORT
+        );
+        assert_eq!(
+            GtpuUplinkSourcePortPolicy::LegacyServicePort.map_value(),
+            None
+        );
+        // Byte-for-byte regression: the legacy policy emits exactly the
+        // pre-feature source/destination 2152 bytes.
+        assert_eq!(
+            build_uplink_encap(&far(), 60),
+            build_uplink_encap_with_dscp_and_source_port(&far(), 60, None, GTPU_UDP_PORT)
+        );
+        assert_eq!(
+            build_uplink_encap_with_dscp(&far(), 60, Some(46)),
+            build_uplink_encap_with_dscp_and_source_port(&far(), 60, Some(46), GTPU_UDP_PORT)
+        );
+    }
+
+    #[test]
+    fn selected_source_port_is_stamped_and_destination_remains_2152() {
+        let encap = build_uplink_encap_with_dscp_and_source_port(&far(), 60, None, 40_000).unwrap();
+        assert_eq!(u16::from_be_bytes([encap[20], encap[21]]), 40_000);
+        assert_eq!(u16::from_be_bytes([encap[22], encap[23]]), GTPU_UDP_PORT);
+        // The IPv4 header checksum does not cover UDP ports and every other
+        // byte matches the legacy encapsulation except the source port.
+        let legacy = build_uplink_encap(&far(), 60).unwrap();
+        assert_eq!(&encap[..20], &legacy[..20]);
+        assert_eq!(&encap[22..], &legacy[22..]);
+    }
+
+    #[test]
+    fn reserved_zero_source_port_fails_closed_everywhere() {
+        assert!(GtpuUplinkSourcePortPolicy::selected(0).is_none());
+        assert!(GtpuUplinkSourcePortPolicy::from_map_value([0, 0]).is_none());
+        assert!(build_uplink_encap_with_dscp_and_source_port(&far(), 60, None, 0).is_none());
+    }
+
+    #[test]
+    fn source_port_policy_map_value_round_trips_big_endian() {
+        let policy = GtpuUplinkSourcePortPolicy::selected(49_152).unwrap();
+        assert_eq!(policy.map_value(), Some([0xC0, 0x00]));
+        assert_eq!(
+            GtpuUplinkSourcePortPolicy::from_map_value([0xC0, 0x00]),
+            Some(policy)
+        );
+        assert_eq!(policy.effective_source_port(), 49_152);
+        assert_eq!(
+            GtpuUplinkSourcePortPolicy::from_map_value(GTPU_UDP_PORT.to_be_bytes()),
+            Some(GtpuUplinkSourcePortPolicy::Selected(GTPU_UDP_PORT))
+        );
+        assert!(!std::format!("{policy:?}").contains("49152"));
     }
 
     #[test]

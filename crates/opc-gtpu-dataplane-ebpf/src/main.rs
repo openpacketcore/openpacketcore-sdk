@@ -42,7 +42,7 @@ use aya_ebpf::{
     programs::TcContext,
 };
 use opc_gtpu_ebpf_common::{
-    build_uplink_encap_with_dscp, classify_gtpu, classify_udp_checksum,
+    build_uplink_encap_with_dscp_and_source_port, classify_gtpu, classify_udp_checksum,
     internet_checksum_sum_is_valid, marked_owner_wire_authorizes_downlink,
     marked_owner_wire_authorizes_uplink, uplink_non_encapsulation_drops,
     validate_ipv4_downlink_binding_wire, DownlinkBindingMismatch, DownlinkPdr, GtpuClass,
@@ -57,6 +57,7 @@ use opc_gtpu_ebpf_common::{
     GTPU_MANDATORY_HDR_LEN, GTPU_MAX_EXT_HEADERS, GTPU_OPT_LEN, GTPU_UDP_PORT,
     MARKED_BEARER_OWNER_VALUE_LEN, MARKED_DOWNLINK_PDR_VALUE_LEN, UPLINK_DSCP_SCHEMA_MARKER_KEY,
     UPLINK_DSCP_VALUE_LEN, UPLINK_FAR_VALUE_LEN, UPLINK_MARK_KEY_LEN,
+    UPLINK_SOURCE_PORT_VALUE_LEN,
 };
 
 /// Uplink FAR: UE PAA (IPv4, network order) -> encap state.
@@ -75,6 +76,16 @@ static GTPU_UPLINK_DSCP: HashMap<[u8; 4], [u8; UPLINK_DSCP_VALUE_LEN]> = HashMap
 /// Optional fixed outer DSCP: `(UE PAA, skb mark)` -> codepoint.
 #[map]
 static GTPU_ULM_DSCP: HashMap<[u8; UPLINK_MARK_KEY_LEN], [u8; UPLINK_DSCP_VALUE_LEN]> =
+    HashMap::pinned(65536, 0);
+
+/// Optional selected uplink UDP source port: UE PAA -> big-endian port.
+#[map]
+static GTPU_UL_SPORT: HashMap<[u8; 4], [u8; UPLINK_SOURCE_PORT_VALUE_LEN]> =
+    HashMap::pinned(65536, 0);
+
+/// Optional selected uplink UDP source port: `(UE PAA, skb mark)` -> port.
+#[map]
+static GTPU_ULM_SPORT: HashMap<[u8; UPLINK_MARK_KEY_LEN], [u8; UPLINK_SOURCE_PORT_VALUE_LEN]> =
     HashMap::pinned(65536, 0);
 
 /// Legacy/default downlink PDR: local TEID -> UE PAA.
@@ -262,7 +273,27 @@ fn try_uplink(ctx: &mut TcContext, mark: u32) -> Result<i32, ()> {
     } else {
         Some(dscp_wire)
     };
-    let encap = build_uplink_encap_with_dscp(&far, inner_len, dscp).ok_or(())?;
+    let sport_ptr = if mark == 0 {
+        GTPU_UL_SPORT.get_ptr(&inner_src)
+    } else {
+        GTPU_ULM_SPORT.get_ptr(&marked_key)
+    };
+    let source_port = if let Some(sport_ptr) = sport_ptr {
+        // SAFETY: the map value outlives this invocation and is read only.
+        let port = u16::from_be_bytes(unsafe { *sport_ptr });
+        if port == 0 {
+            // Port zero is reserved (RFC 768); a zeroed entry is corrupt
+            // adopted state and must drop rather than emit an invalid
+            // source port or silently fall back to 2152.
+            return Ok(TC_ACT_SHOT as i32);
+        }
+        port
+    } else {
+        // Absence is the explicit legacy policy: fixed source port 2152.
+        GTPU_UDP_PORT
+    };
+    let encap = build_uplink_encap_with_dscp_and_source_port(&far, inner_len, dscp, source_port)
+        .ok_or(())?;
 
     ctx.skb
         .adjust_room(

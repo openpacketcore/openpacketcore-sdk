@@ -62,9 +62,9 @@ use opc_gtpu_dataplane::{
     DrainedV2TeardownRequest, DscpCodepoint, EbpfGtpuDataplaneBackend,
     EbpfGtpuDataplaneBackendConfig, GtpBearerMark, GtpDevice, GtpPdpContext, GtpVersion,
     GtpuCapability, GtpuDataplaneBackend, GtpuError, GtpuSourcePortPolicy, GtpuV2DrainProof,
-    PdpContextIndeterminateReason, PdpContextInstallOutcome, PdpContextLocalTeidSelector,
-    PdpContextReadback, PdpContextRemovalOutcome, PdpContextSelector, PdpContextSelectorOccupancy,
-    PdpContextUplinkSelector, RemovePdpContextRequest, Teid,
+    GtpuUplinkSourcePortPolicy, PdpContextIndeterminateReason, PdpContextInstallOutcome,
+    PdpContextLocalTeidSelector, PdpContextReadback, PdpContextRemovalOutcome, PdpContextSelector,
+    PdpContextSelectorOccupancy, PdpContextUplinkSelector, RemovePdpContextRequest, Teid,
 };
 use opc_gtpu_ebpf_common::{
     internet_checksum, ipv4_header_checksum, udp_ipv4_checksum, DownlinkEndpointBinding,
@@ -518,6 +518,7 @@ fn session_context(link_ifindex: u32) -> GtpPdpContext {
         gtp_version: GtpVersion::V1,
         bearer_mark: None,
         egress_dscp: None,
+        uplink_source_port_policy: GtpuUplinkSourcePortPolicy::LegacyServicePort,
     }
 }
 

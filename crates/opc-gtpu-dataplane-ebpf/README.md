@@ -17,6 +17,9 @@ The crate exposes tc entry points, not a Rust library API:
   additive FAR by `(UE address, mark)` and must match an `Active` owner-journal
   entry before the program prepends `[outer IPv4][UDP][GTPv1-U]`, consumes the
   mark, and redirects toward the peer. Unknown or inactive marked state drops.
+  The UDP destination port is always 2152; the source port comes from the
+  additive `GTPU_UL_SPORT`/`GTPU_ULM_SPORT` maps, where absence selects the
+  legacy 2152 and a reserved zero entry drops fail closed.
 - `opc_gtpu_downlink`: tc ingress program. It matches UDP/2152 GTPv1-U G-PDUs,
   proves the existing outer envelope/checksum boundary, selects exactly one
   downlink PDR by TEID, and then requires a canonical `GTPU_DL_BIND` value that

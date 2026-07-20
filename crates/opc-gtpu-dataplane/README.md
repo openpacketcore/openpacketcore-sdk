@@ -48,8 +48,8 @@ use std::net::{IpAddr, Ipv4Addr};
 
 use opc_gtpu_dataplane::{
     CreateGtpDeviceRequest, GtpPdpContext, GtpVersion, GtpuDataplaneBackend,
-    GtpuSourcePortPolicy, MockGtpuDataplaneBackend, RemovePdpContextRequest,
-    Teid,
+    GtpuSourcePortPolicy, GtpuUplinkSourcePortPolicy, MockGtpuDataplaneBackend,
+    RemovePdpContextRequest, Teid,
 };
 
 #[tokio::main]
@@ -69,6 +69,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         gtp_version: GtpVersion::V1,
         bearer_mark: None,
         egress_dscp: None,
+        uplink_source_port_policy: GtpuUplinkSourcePortPolicy::LegacyServicePort,
     };
 
     backend.install_pdp_context(context.clone()).await?;
@@ -350,9 +351,11 @@ the default entry.
 
 Existing `GtpPdpContext` literals must add `bearer_mark: None` to retain the
 default path, or construct a non-zero `GtpBearerMark` for a dedicated bearer;
-they must also choose an explicit `downlink_source_port_policy`. Code that
-constructs `GtpuProbe` literals must initialize `per_bearer_marking` and
-`downlink_endpoint_binding`. Consumers must gate `bearer_mark: Some(_)` on
+they must also choose an explicit `downlink_source_port_policy` and an explicit
+`uplink_source_port_policy` (`LegacyServicePort` retains prior bytes). Code
+that constructs `GtpuProbe` literals must initialize `per_bearer_marking`,
+`downlink_endpoint_binding`, and `uplink_source_port_selection`. Consumers must
+gate `bearer_mark: Some(_)` on
 `GtpuProbe::per_bearer_marking == GtpuCapability::Available`; it becomes
 available only after both exact live tc programs and every exact v3 map pin
 have been verified. The mainline Linux `gtp`, mock, and unsupported backends
@@ -414,6 +417,36 @@ downlink attachment plus its binding and fixed counter maps. Runtime program or
 map identity loss reports `Missing` and blocks new state publication, while
 identity-safe cleanup remains available under the rule above.
 
+### Uplink UDP source-port selection
+
+TS 29.281 section 4.4.2 fixes the GTP-U destination service port at 2152 and
+leaves the UDP source port dynamic. `GtpPdpContext::uplink_source_port_policy`
+makes that choice explicit per PDP context.
+`GtpuUplinkSourcePortPolicy::LegacyServicePort` is the pre-feature behavior and
+emits exactly the legacy source/destination 2152 bytes.
+`GtpuUplinkSourcePortPolicy::selected(port)` persists one stable per-context
+port; the reserved port zero fails closed at construction, at the userspace map
+boundary, on restart adoption, and in the tc program itself.
+
+The eBPF backend owns additive `GTPU_UL_SPORT` (default bearers) and
+`GTPU_ULM_SPORT` (keyed by `(UE PAA, mark)`) maps holding the selected port
+big endian. An absent entry is the legacy policy, so pre-feature pinned state
+remains valid; the `OPC-SPORT-v4` schema marker proves both maps are pinned,
+and a committed v3 pin set migrates additively on attach or adoption. The
+selected port is staged before uplink routing exactly like DSCP, survives
+process restarts, is returned by PDP read-back, and is reported in conflict
+evidence only as the `UplinkSourcePortPolicy` field name. The uplink selection
+is independent of `downlink_source_port_policy`: the backend never assumes a
+peer returns traffic from the selected port.
+
+Consumers must require
+`GtpuProbe::uplink_source_port_selection == GtpuCapability::Available` before
+installing a non-legacy policy; the capability follows the same
+`Unknown`/`Missing` transitions as DSCP. The Linux `gtp`, mock, and unsupported
+backends report `Missing` and reject a non-legacy policy with
+`UnsupportedFeature`, preserving their exact established behavior for the
+explicit legacy policy.
+
 ### Pinned-map and live-program migration
 
 The endpoint-bound v3 schema keeps the legacy default FAR, DSCP, and PDR
@@ -425,13 +458,17 @@ with endpoint-unbound v2 pins. With an explicit `Any` source-port policy,
 `bearer_mark: None`, and `egress_dscp: None`, uplink wire bytes remain
 byte-for-byte compatible; downlink authorization is deliberately stricter.
 
-The durable `OPC-PEER-v3` value at the reserved impossible-PAA key in the
-legacy FAR map is the schema commit. It is written only after every named map
-identity is verified, the complete map graph is canonical, and both current tc
-programs have been attached and read back by exact program ID. A committed v3
-marker with a missing required pin, an unknown marker, or a foreign tc occupant
-fails closed before Aya can recreate empty state. A positively absent current
-hook may be repaired.
+The durable schema marker at the reserved impossible-PAA key in the legacy
+FAR map is the schema commit. The current `OPC-SPORT-v4` value additionally
+proves the additive source-port maps; the endpoint-bound `OPC-PEER-v3` value
+remains the commit for the provenance schema below it. A marker is written
+only after every named map identity is verified, the complete map graph is
+canonical, and both current tc programs have been attached and read back by
+exact program ID. A committed marker with a missing required pin, an unknown
+marker, or a foreign tc occupant fails closed before Aya can recreate empty
+state. A positively absent current hook may be repaired. The v3-to-v4 step is
+purely additive: absent source-port entries select the legacy 2152 source
+port, so populated v3 session state upgrades in place.
 
 There is no implicit endpoint migration for populated older state. A committed
 v2 pin set is rejected with the redaction-safe `ebpf_endpoint_schema` error and

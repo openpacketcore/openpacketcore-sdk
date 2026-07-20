@@ -32,11 +32,11 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use opc_gtpu_ebpf_common::{
-    DownlinkEndpointBinding, DownlinkPdr, GtpuEndpointAddress, MarkedBearerOwner,
-    MarkedBearerOwnerPhase, MarkedDownlinkPdr, UplinkFar, UplinkFarKey,
+    DownlinkEndpointBinding, DownlinkPdr, GtpuEndpointAddress, GtpuUplinkSourcePortPolicy,
+    MarkedBearerOwner, MarkedBearerOwnerPhase, MarkedDownlinkPdr, UplinkFar, UplinkFarKey,
     DOWNLINK_ENDPOINT_BINDING_VALUE_LEN, DOWNLINK_PDR_VALUE_LEN, MARKED_BEARER_OWNER_VALUE_LEN,
     MARKED_DOWNLINK_PDR_VALUE_LEN, UPLINK_DSCP_VALUE_LEN, UPLINK_FAR_VALUE_LEN,
-    UPLINK_MARK_KEY_LEN,
+    UPLINK_MARK_KEY_LEN, UPLINK_SOURCE_PORT_VALUE_LEN,
 };
 
 use crate::backend::error_proves_no_requested_mutation;
@@ -268,6 +268,45 @@ pub(crate) trait EbpfGtpuRuntime: Send + Sync + fmt::Debug {
         key: [u8; UPLINK_MARK_KEY_LEN],
     ) -> Result<bool, GtpuError>;
 
+    /// Read an optional selected uplink source-port entry.
+    fn sport_get(
+        &self,
+        ifindex: u32,
+        key: [u8; 4],
+    ) -> Result<Option<[u8; UPLINK_SOURCE_PORT_VALUE_LEN]>, GtpuError>;
+    /// Insert or overwrite an optional selected uplink source-port entry.
+    fn sport_insert(
+        &self,
+        ifindex: u32,
+        key: [u8; 4],
+        value: [u8; UPLINK_SOURCE_PORT_VALUE_LEN],
+    ) -> Result<(), GtpuError>;
+    /// Remove an optional selected uplink source-port entry; returns whether
+    /// it existed.
+    fn sport_remove(&self, ifindex: u32, key: [u8; 4]) -> Result<bool, GtpuError>;
+
+    /// Read an optional selected marked-uplink source-port entry.
+    fn marked_sport_get(
+        &self,
+        ifindex: u32,
+        key: [u8; UPLINK_MARK_KEY_LEN],
+    ) -> Result<Option<[u8; UPLINK_SOURCE_PORT_VALUE_LEN]>, GtpuError>;
+    /// Insert or overwrite an optional selected marked-uplink source-port
+    /// entry.
+    fn marked_sport_insert(
+        &self,
+        ifindex: u32,
+        key: [u8; UPLINK_MARK_KEY_LEN],
+        value: [u8; UPLINK_SOURCE_PORT_VALUE_LEN],
+    ) -> Result<(), GtpuError>;
+    /// Remove a selected marked-uplink source-port entry; returns whether it
+    /// existed.
+    fn marked_sport_remove(
+        &self,
+        ifindex: u32,
+        key: [u8; UPLINK_MARK_KEY_LEN],
+    ) -> Result<bool, GtpuError>;
+
     /// Read a downlink PDR entry.
     fn pdr_get(
         &self,
@@ -373,6 +412,10 @@ pub(crate) trait EbpfGtpuRuntime: Send + Sync + fmt::Debug {
     /// loaded program and references the exact pinned DSCP map.
     fn dscp_datapath_usable(&self, ifindex: u32) -> bool;
 
+    /// Return whether the target interface's live uplink filter is the exact
+    /// loaded program and references the exact pinned source-port maps.
+    fn source_port_datapath_usable(&self, ifindex: u32) -> bool;
+
     /// Return whether both live filters are the exact loaded programs and
     /// reference every exact pinned per-bearer mark map.
     fn bearer_mark_datapath_usable(&self, ifindex: u32) -> bool;
@@ -408,6 +451,7 @@ struct MarkedPdpState {
     pdr_value: [u8; MARKED_DOWNLINK_PDR_VALUE_LEN],
     binding_value: [u8; DOWNLINK_ENDPOINT_BINDING_VALUE_LEN],
     dscp_value: Option<[u8; UPLINK_DSCP_VALUE_LEN]>,
+    sport_value: Option<[u8; UPLINK_SOURCE_PORT_VALUE_LEN]>,
 }
 
 struct EbpfGtpuDataplaneBackendInner {
@@ -553,6 +597,22 @@ impl EbpfGtpuDataplaneBackend {
         }
     }
 
+    fn rollback_sport_insert(
+        &self,
+        ifindex: u32,
+        key: [u8; 4],
+        sport_was_inserted: bool,
+        source: GtpuError,
+    ) -> Result<(), GtpuError> {
+        if !sport_was_inserted || self.inner.runtime.sport_remove(ifindex, key).is_ok() {
+            Err(source)
+        } else {
+            Err(GtpuError::StateIndeterminate {
+                operation: "ebpf_install_pdp_context",
+            })
+        }
+    }
+
     fn rollback_default_selector(
         &self,
         ifindex: u32,
@@ -584,6 +644,7 @@ impl EbpfGtpuDataplaneBackend {
             pdr_value,
             binding_value,
             dscp_value,
+            sport_value,
         } = state;
         let owner_dscp = dscp_value.map(|value| value[0]);
         let downlink_binding = DownlinkEndpointBinding::decode(&binding_value);
@@ -671,6 +732,7 @@ impl EbpfGtpuDataplaneBackend {
         let existing_pdr = self.inner.runtime.marked_pdr_get(ifindex, pdr_key)?;
         let existing_binding = self.inner.runtime.downlink_binding_get(ifindex, pdr_key)?;
         let existing_dscp = self.inner.runtime.marked_dscp_get(ifindex, far_key)?;
+        let existing_sport = self.inner.runtime.marked_sport_get(ifindex, far_key)?;
         match existing_owner {
             None => {
                 // This schema has never shipped without the owner journal.
@@ -680,6 +742,7 @@ impl EbpfGtpuDataplaneBackend {
                     || existing_pdr.is_some()
                     || existing_binding.is_some()
                     || existing_dscp.is_some()
+                    || existing_sport.is_some()
                 {
                     return Err(GtpuError::StateIndeterminate {
                         operation: "ebpf_install_pdp_context",
@@ -701,13 +764,14 @@ impl EbpfGtpuDataplaneBackend {
                     let complete = existing_far == Some(old_far)
                         && existing_pdr == Some(pdr_value)
                         && existing_binding == Some(old_binding)
-                        && existing_dscp == old_dscp;
+                        && existing_dscp == old_dscp
+                        && existing_sport.is_none_or(|value| value != [0; 2]);
                     if !complete {
                         return Err(GtpuError::StateIndeterminate {
                             operation: "ebpf_install_pdp_context",
                         });
                     }
-                    if existing_owner == active_owner {
+                    if existing_owner == active_owner && existing_sport == sport_value {
                         return Ok(());
                     }
 
@@ -717,8 +781,12 @@ impl EbpfGtpuDataplaneBackend {
                     // new Active owner last makes the complete new graph
                     // usable. A reported failure restores every changed
                     // resource before returning, so the old peer remains the
-                    // sole authorized identity.
+                    // sole authorized identity. The source-port entry is not
+                    // journal-covered, so its replacement is authorized by
+                    // this same exclusive-writer reconciliation rather than
+                    // by an owner-byte comparison.
                     let mut dscp_changed = false;
+                    let mut sport_changed = false;
                     let mut far_changed = false;
                     let mut binding_changed = false;
                     let replace = (|| {
@@ -734,6 +802,18 @@ impl EbpfGtpuDataplaneBackend {
                             }
                             dscp_changed = true;
                         }
+                        if existing_sport != sport_value {
+                            match sport_value {
+                                Some(value) => self
+                                    .inner
+                                    .runtime
+                                    .marked_sport_insert(ifindex, far_key, value)?,
+                                None => {
+                                    self.inner.runtime.marked_sport_remove(ifindex, far_key)?;
+                                }
+                            }
+                            sport_changed = true;
+                        }
                         if old_far != far_value {
                             self.inner
                                 .runtime
@@ -748,11 +828,14 @@ impl EbpfGtpuDataplaneBackend {
                             )?;
                             binding_changed = true;
                         }
-                        self.inner.runtime.marked_owner_insert(
-                            ifindex,
-                            far_key,
-                            active_owner.encode(),
-                        )
+                        if existing_owner != active_owner {
+                            self.inner.runtime.marked_owner_insert(
+                                ifindex,
+                                far_key,
+                                active_owner.encode(),
+                            )?;
+                        }
+                        Ok(())
                     })();
                     if let Err(source) = replace {
                         let binding_restored = !binding_changed
@@ -780,7 +863,24 @@ impl EbpfGtpuDataplaneBackend {
                                     .marked_dscp_remove(ifindex, far_key)
                                     .is_ok(),
                             };
-                        return if binding_restored && far_restored && dscp_restored {
+                        let sport_restored = !sport_changed
+                            || match existing_sport {
+                                Some(value) => self
+                                    .inner
+                                    .runtime
+                                    .marked_sport_insert(ifindex, far_key, value)
+                                    .is_ok(),
+                                None => self
+                                    .inner
+                                    .runtime
+                                    .marked_sport_remove(ifindex, far_key)
+                                    .is_ok(),
+                            };
+                        return if binding_restored
+                            && far_restored
+                            && dscp_restored
+                            && sport_restored
+                        {
                             Err(source)
                         } else {
                             Err(GtpuError::StateIndeterminate {
@@ -818,6 +918,19 @@ impl EbpfGtpuDataplaneBackend {
                         self.inner
                             .runtime
                             .marked_dscp_insert(ifindex, far_key, value)?;
+                    }
+                }
+            }
+            match existing_sport {
+                Some(existing) if Some(existing) == sport_value => {}
+                Some(_) if sport_value.is_none() => {
+                    self.inner.runtime.marked_sport_remove(ifindex, far_key)?;
+                }
+                _ => {
+                    if let Some(value) = sport_value {
+                        self.inner
+                            .runtime
+                            .marked_sport_insert(ifindex, far_key, value)?;
                     }
                 }
             }
@@ -879,6 +992,7 @@ impl EbpfGtpuDataplaneBackend {
         }
         let far = self.inner.runtime.marked_far_get(ifindex, selector)?;
         let dscp = self.inner.runtime.marked_dscp_get(ifindex, selector)?;
+        let sport = self.inner.runtime.marked_sport_get(ifindex, selector)?;
         let binding = self
             .inner
             .runtime
@@ -886,6 +1000,7 @@ impl EbpfGtpuDataplaneBackend {
         let expected_binding = owner.downlink_binding.encode();
         if far.is_some_and(|value| value != owner.uplink_far.encode())
             || dscp.is_some_and(|value| value[0] > 63)
+            || sport.is_some_and(|value| value == [0; 2])
             || binding.is_some_and(|value| value != expected_binding)
             || owner.phase == MarkedBearerOwnerPhase::Active
                 && (dscp.map(|value| value[0]) != owner.egress_dscp()
@@ -916,6 +1031,11 @@ impl EbpfGtpuDataplaneBackend {
                 .inner
                 .runtime
                 .marked_dscp_remove(ifindex, selector)
+                .is_err()
+            || self
+                .inner
+                .runtime
+                .marked_sport_remove(ifindex, selector)
                 .is_err()
             || self
                 .inner
@@ -1188,6 +1308,12 @@ impl EbpfGtpuDataplaneBackend {
                 .map(Some)?,
             None => None,
         };
+        let uplink_source_port_policy = match self.inner.runtime.sport_get(ifindex, pdr.ue_ip)? {
+            Some(value) => {
+                GtpuUplinkSourcePortPolicy::from_map_value(value).ok_or_else(indeterminate)?
+            }
+            None => GtpuUplinkSourcePortPolicy::LegacyServicePort,
+        };
         let local_teid = Teid::new(u32::from_be_bytes(local_teid)).ok_or_else(indeterminate)?;
         let peer_teid = Teid::new(u32::from_be_bytes(far.o_teid)).ok_or_else(indeterminate)?;
         Ok(GtpPdpContext {
@@ -1200,6 +1326,7 @@ impl EbpfGtpuDataplaneBackend {
             gtp_version: GtpVersion::V1,
             bearer_mark: None,
             egress_dscp,
+            uplink_source_port_policy,
         })
     }
 
@@ -1274,6 +1401,13 @@ impl EbpfGtpuDataplaneBackend {
             Some(value) => Some(crate::DscpCodepoint::new(value).map_err(|_| indeterminate())?),
             None => None,
         };
+        let uplink_source_port_policy =
+            match self.inner.runtime.marked_sport_get(ifindex, selector)? {
+                Some(value) => {
+                    GtpuUplinkSourcePortPolicy::from_map_value(value).ok_or_else(indeterminate)?
+                }
+                None => GtpuUplinkSourcePortPolicy::LegacyServicePort,
+            };
         Ok(GtpPdpContext {
             local_teid,
             peer_teid,
@@ -1284,6 +1418,7 @@ impl EbpfGtpuDataplaneBackend {
             gtp_version: GtpVersion::V1,
             bearer_mark: Some(bearer_mark),
             egress_dscp,
+            uplink_source_port_policy,
         })
     }
 
@@ -1377,9 +1512,13 @@ impl EbpfGtpuDataplaneBackend {
                 .inner
                 .runtime
                 .marked_dscp_get(selector.link_ifindex(), marked_selector)?;
-            return match (owner, far, dscp) {
-                (None, None, None) => Ok(PdpContextReadback::Absent),
-                (Some(_), _, _) => self
+            let sport = self
+                .inner
+                .runtime
+                .marked_sport_get(selector.link_ifindex(), marked_selector)?;
+            return match (owner, far, dscp, sport) {
+                (None, None, None, None) => Ok(PdpContextReadback::Absent),
+                (Some(_), _, _, _) => self
                     .read_marked_context_locked(selector.link_ifindex(), marked_selector, None)
                     .map(PdpContextReadback::Present),
                 _ => Err(GtpuError::StateIndeterminate {
@@ -1396,9 +1535,13 @@ impl EbpfGtpuDataplaneBackend {
             .inner
             .runtime
             .dscp_get(selector.link_ifindex(), ue_ip)?;
-        match (local_teid, far, dscp) {
-            (None, None, None) => Ok(PdpContextReadback::Absent),
-            (Some(local_teid), Some(_), _) => self
+        let sport = self
+            .inner
+            .runtime
+            .sport_get(selector.link_ifindex(), ue_ip)?;
+        match (local_teid, far, dscp, sport) {
+            (None, None, None, None) => Ok(PdpContextReadback::Absent),
+            (Some(local_teid), Some(_), _, _) => self
                 .read_default_context_locked(selector.link_ifindex(), local_teid, Some(ue_ip))
                 .map(PdpContextReadback::Present),
             _ => Err(GtpuError::StateIndeterminate {
@@ -1744,6 +1887,7 @@ impl EbpfGtpuDataplaneBackend {
         .encode();
         let pdr_key = request.local_teid.get().to_be_bytes();
         let dscp_value = request.egress_dscp.map(|value| [value.get()]);
+        let sport_value = request.uplink_source_port_policy.map_value();
         if request.bearer_mark.is_some()
             && !self
                 .inner
@@ -1772,6 +1916,20 @@ impl EbpfGtpuDataplaneBackend {
                 ),
             ));
         }
+        if sport_value.is_some()
+            && !self
+                .inner
+                .runtime
+                .source_port_datapath_usable(request.link_ifindex)
+        {
+            return Err(GtpuError::io(
+                "ebpf_source_port_datapath",
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "live uplink source-port datapath identity is unavailable",
+                ),
+            ));
+        }
 
         if let Some(bearer_mark) = request.bearer_mark {
             let mark_bytes = bearer_mark.get().to_be_bytes();
@@ -1794,6 +1952,7 @@ impl EbpfGtpuDataplaneBackend {
                     pdr_value,
                     binding_value,
                     dscp_value,
+                    sport_value,
                 },
             );
         }
@@ -1827,6 +1986,10 @@ impl EbpfGtpuDataplaneBackend {
             .runtime
             .downlink_binding_get(request.link_ifindex, pdr_key)?;
         let existing_dscp = self.inner.runtime.dscp_get(request.link_ifindex, far_key)?;
+        let existing_sport = self
+            .inner
+            .runtime
+            .sport_get(request.link_ifindex, far_key)?;
         let indexed_teid = self
             .inner
             .runtime
@@ -1852,7 +2015,8 @@ impl EbpfGtpuDataplaneBackend {
                 if far == far_value
                     && pdr == pdr_value
                     && binding == binding_value
-                    && dscp == dscp_value =>
+                    && dscp == dscp_value
+                    && existing_sport == sport_value =>
             {
                 Ok(())
             }
@@ -1876,6 +2040,7 @@ impl EbpfGtpuDataplaneBackend {
                     });
                 }
                 let mut dscp_changed = false;
+                let mut sport_changed = false;
                 let mut far_changed = false;
                 let replace = (|| {
                     if old_dscp != dscp_value {
@@ -1892,6 +2057,21 @@ impl EbpfGtpuDataplaneBackend {
                             }
                         }
                         dscp_changed = true;
+                    }
+                    if existing_sport != sport_value {
+                        match sport_value {
+                            Some(value) => self.inner.runtime.sport_insert(
+                                request.link_ifindex,
+                                far_key,
+                                value,
+                            )?,
+                            None => {
+                                self.inner
+                                    .runtime
+                                    .sport_remove(request.link_ifindex, far_key)?;
+                            }
+                        }
+                        sport_changed = true;
                     }
                     if old_far != far_value {
                         self.inner
@@ -1928,7 +2108,20 @@ impl EbpfGtpuDataplaneBackend {
                                 .dscp_remove(request.link_ifindex, far_key)
                                 .is_ok(),
                         };
-                    return if far_restored && dscp_restored {
+                    let sport_restored = !sport_changed
+                        || match existing_sport {
+                            Some(value) => self
+                                .inner
+                                .runtime
+                                .sport_insert(request.link_ifindex, far_key, value)
+                                .is_ok(),
+                            None => self
+                                .inner
+                                .runtime
+                                .sport_remove(request.link_ifindex, far_key)
+                                .is_ok(),
+                        };
+                    return if far_restored && dscp_restored && sport_restored {
                         Err(source)
                     } else {
                         Err(GtpuError::StateIndeterminate {
@@ -1939,19 +2132,21 @@ impl EbpfGtpuDataplaneBackend {
                 Ok(())
             }
             (None, None, None, existing_dscp) => {
-                // DSCP is published before FAR/PDR so a packet can never see
-                // new routing without its requested marking. A process crash
-                // in that first step can therefore leave a DSCP-only orphan.
-                // With both identity maps absent, that orphan claims no live
-                // session and is safe to reconcile before retrying the exact
-                // install. Any one-sided FAR/PDR state remains ambiguous and
-                // is rejected by the catch-all arm below.
+                // DSCP and the selected source port are published before
+                // FAR/PDR so a packet can never see new routing without its
+                // requested marking or port. A process crash in that first
+                // step can therefore leave a DSCP-only or source-port-only
+                // orphan. With both identity maps absent, such an orphan
+                // claims no live session and is safe to reconcile before
+                // retrying the exact install. Any one-sided FAR/PDR state
+                // remains ambiguous and is rejected by the catch-all arm
+                // below.
                 self.inner.runtime.default_selector_insert(
                     request.link_ifindex,
                     far_key,
                     pdr_key,
                 )?;
-                let dscp_prepare = (|| {
+                let optional_staging = (|| {
                     match (existing_dscp, dscp_value) {
                         (Some(existing), Some(requested)) if existing == requested => {}
                         (_, Some(requested)) => self.inner.runtime.dscp_insert(
@@ -1966,9 +2161,23 @@ impl EbpfGtpuDataplaneBackend {
                         }
                         (None, None) => {}
                     }
+                    match (existing_sport, sport_value) {
+                        (Some(existing), Some(requested)) if existing == requested => {}
+                        (_, Some(requested)) => self.inner.runtime.sport_insert(
+                            request.link_ifindex,
+                            far_key,
+                            requested,
+                        )?,
+                        (Some(_), None) => {
+                            self.inner
+                                .runtime
+                                .sport_remove(request.link_ifindex, far_key)?;
+                        }
+                        (None, None) => {}
+                    }
                     Ok(())
                 })();
-                if let Err(error) = dscp_prepare {
+                if let Err(error) = optional_staging {
                     return self.rollback_default_selector(
                         request.link_ifindex,
                         far_key,
@@ -1981,12 +2190,21 @@ impl EbpfGtpuDataplaneBackend {
                         .runtime
                         .far_insert(request.link_ifindex, far_key, far_value)
                 {
-                    let rollback = self.rollback_dscp_insert(
+                    let rollback = match self.rollback_dscp_insert(
                         request.link_ifindex,
                         far_key,
                         dscp_value.is_some(),
                         error,
-                    );
+                    ) {
+                        Err(source @ GtpuError::StateIndeterminate { .. }) => Err(source),
+                        Err(source) => self.rollback_sport_insert(
+                            request.link_ifindex,
+                            far_key,
+                            sport_value.is_some(),
+                            source,
+                        ),
+                        Ok(()) => Ok(()),
+                    };
                     return match rollback {
                         Err(error @ GtpuError::StateIndeterminate { .. }) => Err(error),
                         Err(source) => self.rollback_default_selector(
@@ -2016,7 +2234,13 @@ impl EbpfGtpuDataplaneBackend {
                             .runtime
                             .dscp_remove(request.link_ifindex, far_key)
                             .is_ok();
-                    return if far_rolled_back && dscp_rolled_back {
+                    let sport_rolled_back = sport_value.is_none()
+                        || self
+                            .inner
+                            .runtime
+                            .sport_remove(request.link_ifindex, far_key)
+                            .is_ok();
+                    return if far_rolled_back && dscp_rolled_back && sport_rolled_back {
                         self.rollback_default_selector(
                             request.link_ifindex,
                             far_key,
@@ -2050,7 +2274,17 @@ impl EbpfGtpuDataplaneBackend {
                             .runtime
                             .dscp_remove(request.link_ifindex, far_key)
                             .is_ok();
-                    return if binding_rolled_back && far_rolled_back && dscp_rolled_back {
+                    let sport_rolled_back = sport_value.is_none()
+                        || self
+                            .inner
+                            .runtime
+                            .sport_remove(request.link_ifindex, far_key)
+                            .is_ok();
+                    return if binding_rolled_back
+                        && far_rolled_back
+                        && dscp_rolled_back
+                        && sport_rolled_back
+                    {
                         self.rollback_default_selector(
                             request.link_ifindex,
                             far_key,
@@ -2167,11 +2401,8 @@ impl EbpfGtpuDataplaneBackend {
                 };
             }
         };
-        let binding_result = self
-            .inner
-            .runtime
-            .downlink_binding_remove(request.link_ifindex, pdr_key);
-        let binding_existed = match binding_result {
+        let sport_result = self.inner.runtime.sport_remove(request.link_ifindex, ue_ip);
+        let sport_existed = match sport_result {
             Ok(existed) => existed,
             Err(error) => {
                 return if far_existed || dscp_existed {
@@ -2183,9 +2414,25 @@ impl EbpfGtpuDataplaneBackend {
                 };
             }
         };
+        let binding_result = self
+            .inner
+            .runtime
+            .downlink_binding_remove(request.link_ifindex, pdr_key);
+        let binding_existed = match binding_result {
+            Ok(existed) => existed,
+            Err(error) => {
+                return if far_existed || dscp_existed || sport_existed {
+                    Err(GtpuError::StateIndeterminate {
+                        operation: "ebpf_remove_pdp_context",
+                    })
+                } else {
+                    Err(error)
+                };
+            }
+        };
         let pdr_result = self.inner.runtime.pdr_remove(request.link_ifindex, pdr_key);
         if let Err(error) = pdr_result {
-            return if far_existed || dscp_existed || binding_existed {
+            return if far_existed || dscp_existed || sport_existed || binding_existed {
                 Err(GtpuError::StateIndeterminate {
                     operation: "ebpf_remove_pdp_context",
                 })
@@ -2210,6 +2457,7 @@ impl EbpfGtpuDataplaneBackend {
         let (
             has_attached_device,
             dscp_datapath_usable,
+            source_port_datapath_usable,
             bearer_mark_datapath_usable,
             endpoint_binding_datapath_usable,
         ) = self
@@ -2223,6 +2471,10 @@ impl EbpfGtpuDataplaneBackend {
                             .all(|ifindex| self.inner.runtime.dscp_datapath_usable(*ifindex)),
                     !devices.is_empty()
                         && devices.keys().all(|ifindex| {
+                            self.inner.runtime.source_port_datapath_usable(*ifindex)
+                        }),
+                    !devices.is_empty()
+                        && devices.keys().all(|ifindex| {
                             self.inner.runtime.bearer_mark_datapath_usable(*ifindex)
                         }),
                     !devices.is_empty()
@@ -2233,7 +2485,7 @@ impl EbpfGtpuDataplaneBackend {
                         }),
                 )
             })
-            .unwrap_or((false, false, false, false));
+            .unwrap_or((false, false, false, false, false));
         let mutation_ready = env.platform_supported
             && env.bpffs_present
             && env.btf_present
@@ -2253,6 +2505,8 @@ impl EbpfGtpuDataplaneBackend {
             Some("eBPF GTP-U datapath ready; bearer-mark datapath awaits exact device attachment")
         } else if !dscp_datapath_usable {
             Some("eBPF GTP-U datapath ready; DSCP datapath awaits exact device attachment")
+        } else if !source_port_datapath_usable {
+            Some("eBPF GTP-U datapath ready; source-port datapath awaits exact device attachment")
         } else {
             Some("eBPF GTP-U datapath mutation ready")
         };
@@ -2306,6 +2560,24 @@ impl EbpfGtpuDataplaneBackend {
             } else if endpoint_binding_datapath_usable {
                 GtpuCapability::Available
             } else {
+                GtpuCapability::Missing
+            },
+            uplink_source_port_selection: if !env.platform_supported
+                || !env.bpffs_present
+                || !env.btf_present
+            {
+                GtpuCapability::Missing
+            } else if !env.net_admin_capable || !env.bpf_capable {
+                GtpuCapability::PermissionDenied
+            } else if !has_attached_device {
+                // The environment can provide source-port selection, but its
+                // per-device maps do not exist until create/adopt provisions
+                // a device.
+                GtpuCapability::Unknown
+            } else if source_port_datapath_usable {
+                GtpuCapability::Available
+            } else {
+                // A managed device lost or cannot access its required maps.
                 GtpuCapability::Missing
             },
             details,
@@ -2536,10 +2808,12 @@ mod aya_runtime {
         DOWNLINK_PDR_VALUE_LEN, MAP_CONFIG, MAP_COUNTERS, MAP_DOWNLINK_BINDING_COUNTERS,
         MAP_DOWNLINK_ENDPOINT_BINDING, MAP_DOWNLINK_MARK_PDR, MAP_DOWNLINK_PDR,
         MAP_MARKED_BEARER_OWNER, MAP_UPLINK_DSCP, MAP_UPLINK_FAR, MAP_UPLINK_MARK_DSCP,
-        MAP_UPLINK_MARK_FAR, MARKED_BEARER_OWNER_VALUE_LEN, MARKED_DOWNLINK_PDR_VALUE_LEN,
-        PROG_DOWNLINK, PROG_UPLINK, UPLINK_BEARER_SCHEMA_MARKER_VALUE,
-        UPLINK_DSCP_SCHEMA_MARKER_KEY, UPLINK_DSCP_SCHEMA_MARKER_VALUE, UPLINK_DSCP_VALUE_LEN,
+        MAP_UPLINK_MARK_FAR, MAP_UPLINK_MARK_SOURCE_PORT, MAP_UPLINK_SOURCE_PORT,
+        MARKED_BEARER_OWNER_VALUE_LEN, MARKED_DOWNLINK_PDR_VALUE_LEN, PROG_DOWNLINK, PROG_UPLINK,
+        UPLINK_BEARER_SCHEMA_MARKER_VALUE, UPLINK_DSCP_SCHEMA_MARKER_KEY,
+        UPLINK_DSCP_SCHEMA_MARKER_VALUE, UPLINK_DSCP_VALUE_LEN,
         UPLINK_ENDPOINT_SCHEMA_MARKER_VALUE, UPLINK_FAR_VALUE_LEN, UPLINK_MARK_KEY_LEN,
+        UPLINK_SOURCE_PORT_SCHEMA_MARKER_VALUE, UPLINK_SOURCE_PORT_VALUE_LEN,
     };
 
     use super::{
@@ -2775,6 +3049,8 @@ mod aya_runtime {
         uplink_mark_far: u32,
         uplink_dscp: u32,
         uplink_mark_dscp: u32,
+        uplink_source_port: u32,
+        uplink_mark_source_port: u32,
         downlink_pdr: u32,
         downlink_mark_pdr: u32,
         downlink_binding: u32,
@@ -3159,6 +3435,8 @@ mod aya_runtime {
         BearerV2,
         /// Every PDR has canonical outer-endpoint provenance state.
         EndpointV3,
+        /// The additive uplink source-port maps were committed.
+        SourcePortV4,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3240,6 +3518,8 @@ mod aya_runtime {
                 MAP_UPLINK_MARK_FAR,
                 MAP_UPLINK_DSCP,
                 MAP_UPLINK_MARK_DSCP,
+                MAP_UPLINK_SOURCE_PORT,
+                MAP_UPLINK_MARK_SOURCE_PORT,
                 MAP_DOWNLINK_PDR,
                 MAP_DOWNLINK_MARK_PDR,
                 MAP_DOWNLINK_ENDPOINT_BINDING,
@@ -3571,6 +3851,8 @@ mod aya_runtime {
                     MAP_UPLINK_DSCP,
                     MAP_UPLINK_MARK_FAR,
                     MAP_UPLINK_MARK_DSCP,
+                    MAP_UPLINK_SOURCE_PORT,
+                    MAP_UPLINK_MARK_SOURCE_PORT,
                     MAP_DOWNLINK_PDR,
                     MAP_DOWNLINK_MARK_PDR,
                     MAP_DOWNLINK_ENDPOINT_BINDING,
@@ -3609,6 +3891,9 @@ mod aya_runtime {
                 }
                 Ok(value) if value == UPLINK_ENDPOINT_SCHEMA_MARKER_VALUE => {
                     BearerSchemaState::EndpointV3
+                }
+                Ok(value) if value == UPLINK_SOURCE_PORT_SCHEMA_MARKER_VALUE => {
+                    BearerSchemaState::SourcePortV4
                 }
                 Ok(_) => {
                     return Err(GtpuError::io(
@@ -3661,6 +3946,20 @@ mod aya_runtime {
                     MAP_DOWNLINK_BINDING_COUNTERS,
                     MAP_CONFIG,
                 ],
+                BearerSchemaState::SourcePortV4 => &[
+                    MAP_UPLINK_DSCP,
+                    MAP_UPLINK_MARK_FAR,
+                    MAP_UPLINK_MARK_DSCP,
+                    MAP_UPLINK_SOURCE_PORT,
+                    MAP_UPLINK_MARK_SOURCE_PORT,
+                    MAP_DOWNLINK_PDR,
+                    MAP_DOWNLINK_MARK_PDR,
+                    MAP_DOWNLINK_ENDPOINT_BINDING,
+                    MAP_MARKED_BEARER_OWNER,
+                    MAP_COUNTERS,
+                    MAP_DOWNLINK_BINDING_COUNTERS,
+                    MAP_CONFIG,
+                ],
             };
             for required_pin in required_pins {
                 if !pin_dir
@@ -3691,7 +3990,7 @@ mod aya_runtime {
                 .map_err(|error| map_error("ebpf_bearer_schema", error))?;
             far.insert(
                 UPLINK_DSCP_SCHEMA_MARKER_KEY,
-                UPLINK_ENDPOINT_SCHEMA_MARKER_VALUE,
+                UPLINK_SOURCE_PORT_SCHEMA_MARKER_VALUE,
                 0,
             )
             .map_err(|error| map_error("ebpf_bearer_schema", error))
@@ -3748,6 +4047,19 @@ mod aya_runtime {
                 ebpf.map(MAP_UPLINK_DSCP).ok_or_else(missing)?,
             )
             .map_err(|error| map_error("ebpf_marked_owner_rebuild", error))?;
+            let marked_sport = BpfHashMap::<
+                _,
+                [u8; UPLINK_MARK_KEY_LEN],
+                [u8; UPLINK_SOURCE_PORT_VALUE_LEN],
+            >::try_from(
+                ebpf.map(MAP_UPLINK_MARK_SOURCE_PORT).ok_or_else(missing)?
+            )
+            .map_err(|error| map_error("ebpf_marked_owner_rebuild", error))?;
+            let legacy_sport =
+                BpfHashMap::<_, [u8; 4], [u8; UPLINK_SOURCE_PORT_VALUE_LEN]>::try_from(
+                    ebpf.map(MAP_UPLINK_SOURCE_PORT).ok_or_else(missing)?,
+                )
+                .map_err(|error| map_error("ebpf_marked_owner_rebuild", error))?;
 
             let mut by_teid = HashMap::new();
             for entry in owners.iter() {
@@ -3787,6 +4099,13 @@ mod aya_runtime {
                         return Err(map_error("ebpf_marked_owner_rebuild", error));
                     }
                 };
+                let sport = match marked_sport.get(&selector, 0) {
+                    Ok(value) => Some(value),
+                    Err(MapError::KeyNotFound) => None,
+                    Err(error) => {
+                        return Err(map_error("ebpf_marked_owner_rebuild", error));
+                    }
+                };
                 let pdr = match marked_pdr.get(&owner.local_teid, 0) {
                     Ok(value) => Some(value),
                     Err(MapError::KeyNotFound) => None,
@@ -3811,6 +4130,7 @@ mod aya_runtime {
                 .encode();
                 let resources_match = far.is_none_or(|value| value == expected_far)
                     && dscp.is_none_or(|value| value[0] <= 63)
+                    && sport.is_none_or(|value| value != [0; 2])
                     && pdr.is_none_or(|value| value == expected_pdr)
                     && binding.is_none_or(|value| value == expected_binding);
                 let complete = far == Some(expected_far)
@@ -3837,6 +4157,17 @@ mod aya_runtime {
                 }
             }
             for entry in marked_dscp.iter() {
+                let (selector, _) =
+                    entry.map_err(|error| map_error("ebpf_marked_owner_rebuild", error))?;
+                match owners.get(&selector, 0) {
+                    Ok(_) => {}
+                    Err(MapError::KeyNotFound) => return Err(invalid()),
+                    Err(error) => {
+                        return Err(map_error("ebpf_marked_owner_rebuild", error));
+                    }
+                }
+            }
+            for entry in marked_sport.iter() {
                 let (selector, _) =
                     entry.map_err(|error| map_error("ebpf_marked_owner_rebuild", error))?;
                 match owners.get(&selector, 0) {
@@ -3896,6 +4227,14 @@ mod aya_runtime {
                         return Err(map_error("ebpf_marked_owner_rebuild", error));
                     }
                 }
+                match legacy_sport.get(&pdr.ue_ip, 0) {
+                    Ok(value) if value != [0; 2] => {}
+                    Ok(_) => return Err(invalid()),
+                    Err(MapError::KeyNotFound) => {}
+                    Err(error) => {
+                        return Err(map_error("ebpf_marked_owner_rebuild", error));
+                    }
+                }
             }
             for entry in legacy_far.iter() {
                 let (ue_ip, _) =
@@ -3913,6 +4252,16 @@ mod aya_runtime {
                 // remains recoverable by the legacy exact retry path. The
                 // strict readback contract classifies it as indeterminate.
                 if value[0] > 63 {
+                    return Err(invalid());
+                }
+            }
+            for entry in legacy_sport.iter() {
+                let (_, value) =
+                    entry.map_err(|error| map_error("ebpf_marked_owner_rebuild", error))?;
+                // A valid source-port-only orphan is recoverable exactly like
+                // a DSCP-only orphan; a reserved zero port is corrupt adopted
+                // state and fails closed.
+                if value == [0; 2] {
                     return Err(invalid());
                 }
             }
@@ -3999,6 +4348,8 @@ mod aya_runtime {
                         MAP_UPLINK_MARK_FAR,
                         MAP_UPLINK_DSCP,
                         MAP_UPLINK_MARK_DSCP,
+                        MAP_UPLINK_SOURCE_PORT,
+                        MAP_UPLINK_MARK_SOURCE_PORT,
                         MAP_MARKED_BEARER_OWNER,
                         MAP_COUNTERS,
                         MAP_CONFIG,
@@ -4150,6 +4501,8 @@ mod aya_runtime {
                 uplink_mark_far: id(MAP_UPLINK_MARK_FAR)?,
                 uplink_dscp: id(MAP_UPLINK_DSCP)?,
                 uplink_mark_dscp: id(MAP_UPLINK_MARK_DSCP)?,
+                uplink_source_port: id(MAP_UPLINK_SOURCE_PORT)?,
+                uplink_mark_source_port: id(MAP_UPLINK_MARK_SOURCE_PORT)?,
                 downlink_pdr: id(MAP_DOWNLINK_PDR)?,
                 downlink_mark_pdr: id(MAP_DOWNLINK_MARK_PDR)?,
                 downlink_binding: id(MAP_DOWNLINK_ENDPOINT_BINDING)?,
@@ -4185,6 +4538,19 @@ mod aya_runtime {
                     ebpf.map(MAP_UPLINK_MARK_DSCP).ok_or_else(missing)?,
                 )
                 .map_err(|error| map_error("ebpf_map_identity", error))?;
+            let uplink_source_port =
+                BpfHashMap::<_, [u8; 4], [u8; UPLINK_SOURCE_PORT_VALUE_LEN]>::try_from(
+                    ebpf.map(MAP_UPLINK_SOURCE_PORT).ok_or_else(missing)?,
+                )
+                .map_err(|error| map_error("ebpf_map_identity", error))?;
+            let uplink_mark_source_port = BpfHashMap::<
+                _,
+                [u8; UPLINK_MARK_KEY_LEN],
+                [u8; UPLINK_SOURCE_PORT_VALUE_LEN],
+            >::try_from(
+                ebpf.map(MAP_UPLINK_MARK_SOURCE_PORT).ok_or_else(missing)?,
+            )
+            .map_err(|error| map_error("ebpf_map_identity", error))?;
             let downlink_pdr = BpfHashMap::<_, [u8; 4], [u8; DOWNLINK_PDR_VALUE_LEN]>::try_from(
                 ebpf.map(MAP_DOWNLINK_PDR).ok_or_else(missing)?,
             )
@@ -4223,6 +4589,8 @@ mod aya_runtime {
                 uplink_mark_far: info_id(uplink_mark_far.map())?,
                 uplink_dscp: info_id(uplink_dscp.map())?,
                 uplink_mark_dscp: info_id(uplink_mark_dscp.map())?,
+                uplink_source_port: info_id(uplink_source_port.map())?,
+                uplink_mark_source_port: info_id(uplink_mark_source_port.map())?,
                 downlink_pdr: info_id(downlink_pdr.map())?,
                 downlink_mark_pdr: info_id(downlink_mark_pdr.map())?,
                 downlink_binding: info_id(downlink_binding.map())?,
@@ -5390,7 +5758,7 @@ mod aya_runtime {
                     tc_priority,
                     schema_state,
                 )?;
-                if schema_state != BearerSchemaState::EndpointV3 {
+                if schema_state != BearerSchemaState::SourcePortV4 {
                     if let Err(error) = Self::write_bearer_schema_marker(&mut ebpf) {
                         if attached.replaced_existing {
                             // Both exact current hooks remain live. Retaining them
@@ -5527,7 +5895,7 @@ mod aya_runtime {
                 tc_priority,
                 schema_state,
             )?;
-            if schema_state != BearerSchemaState::EndpointV3 {
+            if schema_state != BearerSchemaState::SourcePortV4 {
                 if let Err(error) = Self::write_bearer_schema_marker(&mut ebpf) {
                     if attached.replaced_existing {
                         return Err(state_indeterminate("ebpf_schema_marker_commit"));
@@ -6362,6 +6730,137 @@ mod aya_runtime {
             })
         }
 
+        fn sport_get(
+            &self,
+            ifindex: u32,
+            key: [u8; 4],
+        ) -> Result<Option<[u8; UPLINK_SOURCE_PORT_VALUE_LEN]>, GtpuError> {
+            self.with_device(ifindex, "ebpf_sport_get", |device| {
+                let map = device
+                    .ebpf
+                    .map(MAP_UPLINK_SOURCE_PORT)
+                    .ok_or_else(|| GtpuError::io("ebpf_sport_map", invalid_data("map missing")))?;
+                let hash =
+                    BpfHashMap::<_, [u8; 4], [u8; UPLINK_SOURCE_PORT_VALUE_LEN]>::try_from(map)
+                        .map_err(|error| map_error("ebpf_sport_map", error))?;
+                match hash.get(&key, 0) {
+                    Ok(value) => Ok(Some(value)),
+                    Err(MapError::KeyNotFound) => Ok(None),
+                    Err(error) => Err(map_error("ebpf_sport_get", error)),
+                }
+            })
+        }
+
+        fn sport_insert(
+            &self,
+            ifindex: u32,
+            key: [u8; 4],
+            value: [u8; UPLINK_SOURCE_PORT_VALUE_LEN],
+        ) -> Result<(), GtpuError> {
+            self.with_device(ifindex, "ebpf_sport_insert", |device| {
+                if value == [0; 2] {
+                    return Err(state_indeterminate("ebpf_sport_insert"));
+                }
+                let map = device
+                    .ebpf
+                    .map_mut(MAP_UPLINK_SOURCE_PORT)
+                    .ok_or_else(|| GtpuError::io("ebpf_sport_map", invalid_data("map missing")))?;
+                let mut hash =
+                    BpfHashMap::<_, [u8; 4], [u8; UPLINK_SOURCE_PORT_VALUE_LEN]>::try_from(map)
+                        .map_err(|error| map_error("ebpf_sport_map", error))?;
+                hash.insert(key, value, 0)
+                    .map_err(|error| map_error("ebpf_sport_insert", error))
+            })
+        }
+
+        fn sport_remove(&self, ifindex: u32, key: [u8; 4]) -> Result<bool, GtpuError> {
+            self.with_device(ifindex, "ebpf_sport_remove", |device| {
+                let map = device
+                    .ebpf
+                    .map_mut(MAP_UPLINK_SOURCE_PORT)
+                    .ok_or_else(|| GtpuError::io("ebpf_sport_map", invalid_data("map missing")))?;
+                let mut hash =
+                    BpfHashMap::<_, [u8; 4], [u8; UPLINK_SOURCE_PORT_VALUE_LEN]>::try_from(map)
+                        .map_err(|error| map_error("ebpf_sport_map", error))?;
+                map_delete_result("ebpf_sport_remove", hash.remove(&key))
+            })
+        }
+
+        fn marked_sport_get(
+            &self,
+            ifindex: u32,
+            key: [u8; UPLINK_MARK_KEY_LEN],
+        ) -> Result<Option<[u8; UPLINK_SOURCE_PORT_VALUE_LEN]>, GtpuError> {
+            self.with_device(ifindex, "ebpf_marked_sport_get", |device| {
+                let map = device
+                    .ebpf
+                    .map(MAP_UPLINK_MARK_SOURCE_PORT)
+                    .ok_or_else(|| {
+                        GtpuError::io("ebpf_marked_sport_map", invalid_data("map missing"))
+                    })?;
+                let hash = BpfHashMap::<
+                    _,
+                    [u8; UPLINK_MARK_KEY_LEN],
+                    [u8; UPLINK_SOURCE_PORT_VALUE_LEN],
+                >::try_from(map)
+                .map_err(|error| map_error("ebpf_marked_sport_map", error))?;
+                match hash.get(&key, 0) {
+                    Ok(value) => Ok(Some(value)),
+                    Err(MapError::KeyNotFound) => Ok(None),
+                    Err(error) => Err(map_error("ebpf_marked_sport_get", error)),
+                }
+            })
+        }
+
+        fn marked_sport_insert(
+            &self,
+            ifindex: u32,
+            key: [u8; UPLINK_MARK_KEY_LEN],
+            value: [u8; UPLINK_SOURCE_PORT_VALUE_LEN],
+        ) -> Result<(), GtpuError> {
+            self.with_device(ifindex, "ebpf_marked_sport_insert", |device| {
+                if value == [0; 2] {
+                    return Err(state_indeterminate("ebpf_marked_sport_insert"));
+                }
+                let map = device
+                    .ebpf
+                    .map_mut(MAP_UPLINK_MARK_SOURCE_PORT)
+                    .ok_or_else(|| {
+                        GtpuError::io("ebpf_marked_sport_map", invalid_data("map missing"))
+                    })?;
+                let mut hash = BpfHashMap::<
+                    _,
+                    [u8; UPLINK_MARK_KEY_LEN],
+                    [u8; UPLINK_SOURCE_PORT_VALUE_LEN],
+                >::try_from(map)
+                .map_err(|error| map_error("ebpf_marked_sport_map", error))?;
+                hash.insert(key, value, 0)
+                    .map_err(|error| map_error("ebpf_marked_sport_insert", error))
+            })
+        }
+
+        fn marked_sport_remove(
+            &self,
+            ifindex: u32,
+            key: [u8; UPLINK_MARK_KEY_LEN],
+        ) -> Result<bool, GtpuError> {
+            self.with_device(ifindex, "ebpf_marked_sport_remove", |device| {
+                let map = device
+                    .ebpf
+                    .map_mut(MAP_UPLINK_MARK_SOURCE_PORT)
+                    .ok_or_else(|| {
+                        GtpuError::io("ebpf_marked_sport_map", invalid_data("map missing"))
+                    })?;
+                let mut hash = BpfHashMap::<
+                    _,
+                    [u8; UPLINK_MARK_KEY_LEN],
+                    [u8; UPLINK_SOURCE_PORT_VALUE_LEN],
+                >::try_from(map)
+                .map_err(|error| map_error("ebpf_marked_sport_map", error))?;
+                map_delete_result("ebpf_marked_sport_remove", hash.remove(&key))
+            })
+        }
+
         fn pdr_get(
             &self,
             ifindex: u32,
@@ -6816,6 +7315,15 @@ mod aya_runtime {
         }
 
         fn dscp_datapath_usable(&self, ifindex: u32) -> bool {
+            let Ok(devices) = self.devices.lock() else {
+                return false;
+            };
+            devices
+                .get(&ifindex)
+                .is_some_and(|device| Self::loaded_datapath_is_current(ifindex, device))
+        }
+
+        fn source_port_datapath_usable(&self, ifindex: u32) -> bool {
             let Ok(devices) = self.devices.lock() else {
                 return false;
             };
@@ -7523,6 +8031,8 @@ mod aya_runtime {
                 uplink_mark_far: 2,
                 uplink_dscp: 3,
                 uplink_mark_dscp: 4,
+                uplink_source_port: 12,
+                uplink_mark_source_port: 13,
                 downlink_pdr: 5,
                 downlink_mark_pdr: 6,
                 downlink_binding: 7,
@@ -8072,6 +8582,8 @@ mod tests {
         marked_far: HashMap<(u32, [u8; UPLINK_MARK_KEY_LEN]), [u8; UPLINK_FAR_VALUE_LEN]>,
         dscp: HashMap<(u32, [u8; 4]), [u8; UPLINK_DSCP_VALUE_LEN]>,
         marked_dscp: HashMap<(u32, [u8; UPLINK_MARK_KEY_LEN]), [u8; UPLINK_DSCP_VALUE_LEN]>,
+        sport: HashMap<(u32, [u8; 4]), [u8; UPLINK_SOURCE_PORT_VALUE_LEN]>,
+        marked_sport: HashMap<(u32, [u8; UPLINK_MARK_KEY_LEN]), [u8; UPLINK_SOURCE_PORT_VALUE_LEN]>,
         pdr: HashMap<(u32, [u8; 4]), [u8; DOWNLINK_PDR_VALUE_LEN]>,
         marked_pdr: HashMap<(u32, [u8; 4]), [u8; MARKED_DOWNLINK_PDR_VALUE_LEN]>,
         downlink_binding: HashMap<(u32, [u8; 4]), [u8; DOWNLINK_ENDPOINT_BINDING_VALUE_LEN]>,
@@ -8083,6 +8595,8 @@ mod tests {
         dscp_map_ready: HashSet<u32>,
         marked_far_map_ready: HashSet<u32>,
         marked_dscp_map_ready: HashSet<u32>,
+        sport_map_ready: HashSet<u32>,
+        marked_sport_map_ready: HashSet<u32>,
         marked_pdr_map_ready: HashSet<u32>,
         marked_owner_map_ready: HashSet<u32>,
         downlink_binding_map_ready: HashSet<u32>,
@@ -8125,6 +8639,7 @@ mod tests {
         DscpV1,
         BearerV2,
         EndpointV3,
+        SourcePortV4,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -8232,6 +8747,28 @@ mod tests {
                         ))
                     }
                 }
+                Some(FakeSchema::SourcePortV4) => {
+                    if state.dscp_map_ready.contains(&ifindex)
+                        && state.marked_far_map_ready.contains(&ifindex)
+                        && state.marked_dscp_map_ready.contains(&ifindex)
+                        && state.sport_map_ready.contains(&ifindex)
+                        && state.marked_sport_map_ready.contains(&ifindex)
+                        && state.marked_pdr_map_ready.contains(&ifindex)
+                        && state.marked_owner_map_ready.contains(&ifindex)
+                        && state.downlink_binding_map_ready.contains(&ifindex)
+                        && state.downlink_binding_counters_map_ready.contains(&ifindex)
+                    {
+                        Ok(())
+                    } else {
+                        Err(GtpuError::io(
+                            "ebpf_bearer_schema",
+                            io::Error::new(
+                                io::ErrorKind::NotFound,
+                                "adopted source-port map pin is missing",
+                            ),
+                        ))
+                    }
+                }
             }
         }
 
@@ -8273,6 +8810,7 @@ mod tests {
                 .encode();
                 let far = state.marked_far.get(&(ifindex, selector)).copied();
                 let dscp = state.marked_dscp.get(&(ifindex, selector)).copied();
+                let sport = state.marked_sport.get(&(ifindex, selector)).copied();
                 let pdr = state.marked_pdr.get(&(ifindex, owner.local_teid)).copied();
                 let binding = state
                     .downlink_binding
@@ -8281,6 +8819,7 @@ mod tests {
                 let expected_binding = owner.downlink_binding.encode();
                 let resources_match = far.is_none_or(|value| value == expected_far)
                     && dscp.is_none_or(|value| value[0] <= 63)
+                    && sport.is_none_or(|value| value != [0; 2])
                     && pdr.is_none_or(|value| value == expected_pdr)
                     && binding.is_none_or(|value| value == expected_binding);
                 let complete = far == Some(expected_far)
@@ -8298,6 +8837,11 @@ mod tests {
                 }
             }
             for (index, selector) in state.marked_dscp.keys() {
+                if *index == ifindex && !state.marked_owner.contains_key(&(*index, *selector)) {
+                    return Err(invalid());
+                }
+            }
+            for (index, selector) in state.marked_sport.keys() {
                 if *index == ifindex && !state.marked_owner.contains_key(&(*index, *selector)) {
                     return Err(invalid());
                 }
@@ -8355,6 +8899,13 @@ mod tests {
                 {
                     return Err(invalid());
                 }
+                if state
+                    .sport
+                    .get(&(*index, pdr.ue_ip))
+                    .is_some_and(|value| *value == [0; 2])
+                {
+                    return Err(invalid());
+                }
             }
             for (index, ue_ip) in state.far.keys() {
                 if *index == ifindex
@@ -8366,6 +8917,11 @@ mod tests {
             }
             for ((index, _), value) in &state.dscp {
                 if *index == ifindex && value[0] > 63 {
+                    return Err(invalid());
+                }
+            }
+            for ((index, _), value) in &state.sport {
+                if *index == ifindex && *value == [0; 2] {
                     return Err(invalid());
                 }
             }
@@ -8432,6 +8988,8 @@ mod tests {
             state.dscp_map_ready.insert(ifindex);
             state.marked_far_map_ready.insert(ifindex);
             state.marked_dscp_map_ready.insert(ifindex);
+            state.sport_map_ready.insert(ifindex);
+            state.marked_sport_map_ready.insert(ifindex);
             state.marked_pdr_map_ready.insert(ifindex);
             state.marked_owner_map_ready.insert(ifindex);
             state.downlink_binding_map_ready.insert(ifindex);
@@ -8440,7 +8998,7 @@ mod tests {
             state.downlink_filter_ready.insert(ifindex);
             state
                 .schema
-                .insert(pin_dir.to_path_buf(), FakeSchema::EndpointV3);
+                .insert(pin_dir.to_path_buf(), FakeSchema::SourcePortV4);
             Ok(())
         }
 
@@ -8475,6 +9033,8 @@ mod tests {
             state.dscp_map_ready.insert(ifindex);
             state.marked_far_map_ready.insert(ifindex);
             state.marked_dscp_map_ready.insert(ifindex);
+            state.sport_map_ready.insert(ifindex);
+            state.marked_sport_map_ready.insert(ifindex);
             state.marked_pdr_map_ready.insert(ifindex);
             state.marked_owner_map_ready.insert(ifindex);
             state.downlink_binding_map_ready.insert(ifindex);
@@ -8483,7 +9043,7 @@ mod tests {
             state.downlink_filter_ready.insert(ifindex);
             state
                 .schema
-                .insert(pin_dir.to_path_buf(), FakeSchema::EndpointV3);
+                .insert(pin_dir.to_path_buf(), FakeSchema::SourcePortV4);
             Ok(local_ip)
         }
 
@@ -8500,6 +9060,8 @@ mod tests {
             state.dscp_map_ready.remove(&ifindex);
             state.marked_far_map_ready.remove(&ifindex);
             state.marked_dscp_map_ready.remove(&ifindex);
+            state.sport_map_ready.remove(&ifindex);
+            state.marked_sport_map_ready.remove(&ifindex);
             state.marked_pdr_map_ready.remove(&ifindex);
             state.marked_owner_map_ready.remove(&ifindex);
             state.downlink_binding_map_ready.remove(&ifindex);
@@ -8520,6 +9082,8 @@ mod tests {
             state.marked_far.retain(|(index, _), _| *index != ifindex);
             state.dscp.retain(|(index, _), _| *index != ifindex);
             state.marked_dscp.retain(|(index, _), _| *index != ifindex);
+            state.sport.retain(|(index, _), _| *index != ifindex);
+            state.marked_sport.retain(|(index, _), _| *index != ifindex);
             state.pdr.retain(|(index, _), _| *index != ifindex);
             state.marked_pdr.retain(|(index, _), _| *index != ifindex);
             state
@@ -8926,6 +9490,113 @@ mod tests {
             Ok(state.marked_dscp.remove(&(ifindex, key)).is_some())
         }
 
+        fn sport_get(
+            &self,
+            ifindex: u32,
+            key: [u8; 4],
+        ) -> Result<Option<[u8; UPLINK_SOURCE_PORT_VALUE_LEN]>, GtpuError> {
+            let state = self.state();
+            if !state.sport_map_ready.contains(&ifindex) {
+                return Err(GtpuError::io(
+                    "ebpf_sport_map",
+                    io::Error::new(io::ErrorKind::NotFound, "source-port map unavailable"),
+                ));
+            }
+            Ok(state.sport.get(&(ifindex, key)).copied())
+        }
+
+        fn sport_insert(
+            &self,
+            ifindex: u32,
+            key: [u8; 4],
+            value: [u8; UPLINK_SOURCE_PORT_VALUE_LEN],
+        ) -> Result<(), GtpuError> {
+            let mut state = self.state();
+            if !state.sport_map_ready.contains(&ifindex) {
+                return Err(GtpuError::io(
+                    "ebpf_sport_map",
+                    io::Error::new(io::ErrorKind::NotFound, "source-port map unavailable"),
+                ));
+            }
+            state.operations.push("sport_insert");
+            Self::fail_if_requested(&mut state, "sport_insert")?;
+            state.sport.insert((ifindex, key), value);
+            Ok(())
+        }
+
+        fn sport_remove(&self, ifindex: u32, key: [u8; 4]) -> Result<bool, GtpuError> {
+            let mut state = self.state();
+            if !state.sport_map_ready.contains(&ifindex) {
+                return Err(GtpuError::io(
+                    "ebpf_sport_map",
+                    io::Error::new(io::ErrorKind::NotFound, "source-port map unavailable"),
+                ));
+            }
+            state.operations.push("sport_remove");
+            Self::fail_if_requested(&mut state, "sport_remove")?;
+            Ok(state.sport.remove(&(ifindex, key)).is_some())
+        }
+
+        fn marked_sport_get(
+            &self,
+            ifindex: u32,
+            key: [u8; UPLINK_MARK_KEY_LEN],
+        ) -> Result<Option<[u8; UPLINK_SOURCE_PORT_VALUE_LEN]>, GtpuError> {
+            let state = self.state();
+            if !state.marked_sport_map_ready.contains(&ifindex) {
+                return Err(GtpuError::io(
+                    "ebpf_marked_sport_map",
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "marked source-port map unavailable",
+                    ),
+                ));
+            }
+            Ok(state.marked_sport.get(&(ifindex, key)).copied())
+        }
+
+        fn marked_sport_insert(
+            &self,
+            ifindex: u32,
+            key: [u8; UPLINK_MARK_KEY_LEN],
+            value: [u8; UPLINK_SOURCE_PORT_VALUE_LEN],
+        ) -> Result<(), GtpuError> {
+            let mut state = self.state();
+            if !state.marked_sport_map_ready.contains(&ifindex) {
+                return Err(GtpuError::io(
+                    "ebpf_marked_sport_map",
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "marked source-port map unavailable",
+                    ),
+                ));
+            }
+            state.operations.push("marked_sport_insert");
+            Self::fail_if_requested(&mut state, "marked_sport_insert")?;
+            state.marked_sport.insert((ifindex, key), value);
+            Ok(())
+        }
+
+        fn marked_sport_remove(
+            &self,
+            ifindex: u32,
+            key: [u8; UPLINK_MARK_KEY_LEN],
+        ) -> Result<bool, GtpuError> {
+            let mut state = self.state();
+            if !state.marked_sport_map_ready.contains(&ifindex) {
+                return Err(GtpuError::io(
+                    "ebpf_marked_sport_map",
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "marked source-port map unavailable",
+                    ),
+                ));
+            }
+            state.operations.push("marked_sport_remove");
+            Self::fail_if_requested(&mut state, "marked_sport_remove")?;
+            Ok(state.marked_sport.remove(&(ifindex, key)).is_some())
+        }
+
         fn pdr_get(
             &self,
             ifindex: u32,
@@ -9240,6 +9911,8 @@ mod tests {
                 && state.dscp_map_ready.contains(&ifindex)
                 && state.marked_far_map_ready.contains(&ifindex)
                 && state.marked_dscp_map_ready.contains(&ifindex)
+                && state.sport_map_ready.contains(&ifindex)
+                && state.marked_sport_map_ready.contains(&ifindex)
                 && state.marked_pdr_map_ready.contains(&ifindex)
                 && state.marked_owner_map_ready.contains(&ifindex)
                 && state.downlink_binding_map_ready.contains(&ifindex)
@@ -9269,11 +9942,20 @@ mod tests {
                 && state.uplink_filter_ready.contains(&ifindex)
         }
 
+        fn source_port_datapath_usable(&self, ifindex: u32) -> bool {
+            let state = self.state();
+            state.attached.contains_key(&ifindex)
+                && state.sport_map_ready.contains(&ifindex)
+                && state.marked_sport_map_ready.contains(&ifindex)
+                && state.uplink_filter_ready.contains(&ifindex)
+        }
+
         fn bearer_mark_datapath_usable(&self, ifindex: u32) -> bool {
             let state = self.state();
             state.attached.contains_key(&ifindex)
                 && state.marked_far_map_ready.contains(&ifindex)
                 && state.marked_dscp_map_ready.contains(&ifindex)
+                && state.marked_sport_map_ready.contains(&ifindex)
                 && state.marked_pdr_map_ready.contains(&ifindex)
                 && state.marked_owner_map_ready.contains(&ifindex)
                 && state.downlink_binding_map_ready.contains(&ifindex)
@@ -9298,6 +9980,8 @@ mod tests {
                 && state.dscp_map_ready.contains(&ifindex)
                 && state.marked_far_map_ready.contains(&ifindex)
                 && state.marked_dscp_map_ready.contains(&ifindex)
+                && state.sport_map_ready.contains(&ifindex)
+                && state.marked_sport_map_ready.contains(&ifindex)
                 && state.marked_pdr_map_ready.contains(&ifindex)
                 && state.marked_owner_map_ready.contains(&ifindex)
                 && state.downlink_binding_map_ready.contains(&ifindex)
@@ -9315,6 +9999,8 @@ mod tests {
                 && state.dscp_map_ready.contains(&ifindex)
                 && state.marked_far_map_ready.contains(&ifindex)
                 && state.marked_dscp_map_ready.contains(&ifindex)
+                && state.sport_map_ready.contains(&ifindex)
+                && state.marked_sport_map_ready.contains(&ifindex)
                 && state.marked_pdr_map_ready.contains(&ifindex)
                 && state.marked_owner_map_ready.contains(&ifindex)
                 && state.downlink_binding_map_ready.contains(&ifindex)
@@ -9345,6 +10031,7 @@ mod tests {
             gtp_version: GtpVersion::V1,
             bearer_mark: None,
             egress_dscp: None,
+            uplink_source_port_policy: crate::GtpuUplinkSourcePortPolicy::LegacyServicePort,
         }
     }
 
@@ -10546,11 +11233,13 @@ mod tests {
             assert!(state.far.is_empty());
             assert!(state.pdr.is_empty());
             assert!(state.dscp.is_empty());
+            assert!(state.sport.is_empty());
             assert_eq!(
                 state.operations,
                 vec![
                     "far_remove",
                     "dscp_remove",
+                    "sport_remove",
                     "downlink_binding_remove",
                     "pdr_remove"
                 ]
@@ -10773,7 +11462,7 @@ mod tests {
         restarted.install_pdp_context(marked).await.unwrap();
         let state = runtime.state();
         let pin_dir = PathBuf::from(DEFAULT_BPFFS_PIN_ROOT).join("s2bu");
-        assert_eq!(state.schema.get(&pin_dir), Some(&FakeSchema::EndpointV3));
+        assert_eq!(state.schema.get(&pin_dir), Some(&FakeSchema::SourcePortV4));
     }
 
     #[tokio::test]
@@ -11072,7 +11761,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn adopted_v3_required_map_loss_is_not_silently_recreated_on_restart() {
+    async fn adopted_v4_required_map_loss_is_not_silently_recreated_on_restart() {
         let (backend, runtime) = backend_with_fake();
         backend.create_device(create_request()).await.unwrap();
         {
@@ -11083,7 +11772,7 @@ mod tests {
                 state
                     .schema
                     .get(&PathBuf::from(DEFAULT_BPFFS_PIN_ROOT).join("s2bu")),
-                Some(&FakeSchema::EndpointV3)
+                Some(&FakeSchema::SourcePortV4)
             );
         }
 
@@ -12301,5 +12990,342 @@ mod tests {
         let boxed: Box<dyn GtpuDataplaneBackend> = Box::new(backend);
         let probe = boxed.probe().await.unwrap();
         assert_eq!(probe.kind, GtpuBackendKind::LinuxEbpf);
+    }
+
+    fn selected_source_port(port: u16) -> crate::GtpuUplinkSourcePortPolicy {
+        crate::GtpuUplinkSourcePortPolicy::selected(port).unwrap()
+    }
+
+    #[tokio::test]
+    async fn install_persists_selected_source_port_and_reads_back_effective_port() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let mut default = context();
+        default.uplink_source_port_policy = selected_source_port(40_000);
+        backend.install_pdp_context(default.clone()).await.unwrap();
+        {
+            let state = runtime.state();
+            assert_eq!(
+                state.sport.get(&(S2BU_IFINDEX, [10, 45, 0, 2])),
+                Some(&40_000_u16.to_be_bytes())
+            );
+        }
+        // Exact re-install of the same policy is idempotent.
+        backend.install_pdp_context(default.clone()).await.unwrap();
+        assert_eq!(
+            backend
+                .read_pdp_context(PdpContextSelector::LocalTeid(
+                    PdpContextLocalTeidSelector::from_context(&default).unwrap(),
+                ))
+                .await
+                .unwrap(),
+            PdpContextReadback::Present(default.clone())
+        );
+
+        let mut marked = marked_context(0x1001, 0x1000_0002, 0x2000_0002);
+        marked.uplink_source_port_policy = selected_source_port(40_001);
+        backend.install_pdp_context(marked.clone()).await.unwrap();
+        assert_eq!(
+            backend
+                .read_pdp_context(PdpContextSelector::LocalTeid(
+                    PdpContextLocalTeidSelector::from_context(&marked).unwrap(),
+                ))
+                .await
+                .unwrap(),
+            PdpContextReadback::Present(marked.clone())
+        );
+        assert_eq!(
+            backend
+                .read_pdp_context(PdpContextSelector::Uplink(
+                    PdpContextUplinkSelector::from_context(&marked).unwrap(),
+                ))
+                .await
+                .unwrap(),
+            PdpContextReadback::Present(marked)
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_policy_persists_no_source_port_map_entry() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let default = context();
+        backend.install_pdp_context(default.clone()).await.unwrap();
+        let marked = marked_context(0x1001, 0x1000_0002, 0x2000_0002);
+        backend.install_pdp_context(marked).await.unwrap();
+        {
+            let state = runtime.state();
+            assert!(state.sport.is_empty());
+            assert!(state.marked_sport.is_empty());
+        }
+        assert_eq!(
+            backend
+                .read_pdp_context(PdpContextSelector::LocalTeid(
+                    PdpContextLocalTeidSelector::from_context(&default).unwrap(),
+                ))
+                .await
+                .unwrap(),
+            PdpContextReadback::Present(default)
+        );
+    }
+
+    #[tokio::test]
+    async fn source_port_policy_reconciles_exactly_for_default_and_marked_sessions() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let mut desired = context();
+        desired.uplink_source_port_policy = selected_source_port(40_000);
+        backend.install_pdp_context(desired.clone()).await.unwrap();
+
+        // A selected-port-only change reconciles through the exact-session
+        // relocation path without disturbing the downlink identity.
+        desired.uplink_source_port_policy = selected_source_port(40_002);
+        backend.install_pdp_context(desired.clone()).await.unwrap();
+        assert_eq!(
+            runtime.state().sport.get(&(S2BU_IFINDEX, [10, 45, 0, 2])),
+            Some(&40_002_u16.to_be_bytes())
+        );
+        // Returning to the explicit legacy policy removes the additive entry.
+        desired.uplink_source_port_policy = crate::GtpuUplinkSourcePortPolicy::LegacyServicePort;
+        backend.install_pdp_context(desired.clone()).await.unwrap();
+        assert!(runtime.state().sport.is_empty());
+
+        let mut marked = marked_context(0x1001, 0x1000_0002, 0x2000_0002);
+        marked.uplink_source_port_policy = selected_source_port(40_003);
+        backend.install_pdp_context(marked.clone()).await.unwrap();
+        // A selected-port-only change on an Active marked owner reuses the
+        // exact staged replacement without re-publishing the journal.
+        marked.uplink_source_port_policy = selected_source_port(40_004);
+        backend.install_pdp_context(marked.clone()).await.unwrap();
+        assert_eq!(
+            backend
+                .read_pdp_context(PdpContextSelector::LocalTeid(
+                    PdpContextLocalTeidSelector::from_context(&marked).unwrap(),
+                ))
+                .await
+                .unwrap(),
+            PdpContextReadback::Present(marked)
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_deletes_selected_source_port_state() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let mut default = context();
+        default.uplink_source_port_policy = selected_source_port(40_000);
+        backend.install_pdp_context(default).await.unwrap();
+        let mut marked = marked_context(0x1001, 0x1000_0002, 0x2000_0002);
+        marked.uplink_source_port_policy = selected_source_port(40_001);
+        backend.install_pdp_context(marked.clone()).await.unwrap();
+
+        backend.remove_pdp_context(remove_request()).await.unwrap();
+        backend
+            .remove_pdp_context(RemovePdpContextRequest::from_context(&marked))
+            .await
+            .unwrap();
+        {
+            let state = runtime.state();
+            assert!(state.sport.is_empty());
+            assert!(state.marked_sport.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_source_port_capability_fails_closed_and_is_reported() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        assert_eq!(
+            backend.probe().await.unwrap().uplink_source_port_selection,
+            GtpuCapability::Available
+        );
+        runtime.state().sport_map_ready.clear();
+
+        let probe = backend.probe().await.unwrap();
+        assert_eq!(probe.uplink_source_port_selection, GtpuCapability::Missing);
+        let mut selected = context();
+        selected.uplink_source_port_policy = selected_source_port(40_000);
+        // The explicit legacy policy does not require the additive maps, so
+        // it is rejected at the capability boundary rather than the missing
+        // map itself...
+        assert!(matches!(
+            backend.install_pdp_context(selected).await.unwrap_err(),
+            GtpuError::Io {
+                operation: "ebpf_source_port_datapath",
+                ..
+            }
+        ));
+        // ...but a lost map still fails every install closed: the backend
+        // cannot prove the absence of a conflicting persisted entry.
+        assert!(matches!(
+            backend.install_pdp_context(context()).await.unwrap_err(),
+            GtpuError::Io {
+                operation: "ebpf_sport_map",
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn selected_source_port_survives_restart_adoption_and_readback() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let mut default = context();
+        default.uplink_source_port_policy = selected_source_port(40_000);
+        let mut marked = marked_context(0x1001, 0x1000_0002, 0x2000_0002);
+        marked.uplink_source_port_policy = selected_source_port(40_001);
+        for desired in [&default, &marked] {
+            assert_eq!(
+                backend
+                    .install_pdp_context_classified(desired.clone())
+                    .await
+                    .unwrap(),
+                PdpContextInstallOutcome::Installed
+            );
+        }
+        {
+            let mut state = runtime.state();
+            state.attached.clear();
+            state.default_teid_by_ue.clear();
+            state.marked_owner_by_teid.clear();
+        }
+
+        let restarted = EbpfGtpuDataplaneBackend::with_runtime(runtime);
+        restarted.resolve_device("s2bu").await.unwrap();
+        assert_eq!(
+            restarted
+                .probe()
+                .await
+                .unwrap()
+                .uplink_source_port_selection,
+            GtpuCapability::Available
+        );
+        for desired in [&default, &marked] {
+            assert_eq!(
+                restarted
+                    .install_pdp_context_classified(desired.clone())
+                    .await
+                    .unwrap(),
+                PdpContextInstallOutcome::ExactAlreadyPresent
+            );
+            assert_eq!(
+                restarted
+                    .read_pdp_context(PdpContextSelector::LocalTeid(
+                        PdpContextLocalTeidSelector::from_context(desired).unwrap(),
+                    ))
+                    .await
+                    .unwrap(),
+                PdpContextReadback::Present(desired.clone())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn corrupt_zero_source_port_fails_closed_on_adoption_and_readback() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let mut default = context();
+        default.uplink_source_port_policy = selected_source_port(40_000);
+        backend.install_pdp_context(default.clone()).await.unwrap();
+        {
+            let mut state = runtime.state();
+            state.sport.insert((S2BU_IFINDEX, [10, 45, 0, 2]), [0; 2]);
+        }
+        assert!(matches!(
+            backend
+                .read_pdp_context(PdpContextSelector::LocalTeid(
+                    PdpContextLocalTeidSelector::from_context(&default).unwrap(),
+                ))
+                .await
+                .unwrap_err(),
+            GtpuError::StateIndeterminate { .. }
+        ));
+        {
+            let mut state = runtime.state();
+            state.attached.clear();
+            state.default_teid_by_ue.clear();
+            state.marked_owner_by_teid.clear();
+        }
+        let restarted = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
+        assert!(matches!(
+            restarted.resolve_device("s2bu").await.unwrap_err(),
+            GtpuError::StateIndeterminate {
+                operation: "ebpf_marked_owner_rebuild"
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn unowned_marked_source_port_state_fails_closed_on_adoption() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let selector = UplinkFarKey {
+            ue_ip: [10, 45, 0, 2],
+            bearer_mark: 0x1001_u32.to_be_bytes(),
+        }
+        .encode();
+        {
+            let mut state = runtime.state();
+            state
+                .marked_sport
+                .insert((S2BU_IFINDEX, selector), 40_000_u16.to_be_bytes());
+            state.attached.clear();
+            state.default_teid_by_ue.clear();
+            state.marked_owner_by_teid.clear();
+        }
+        let restarted = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
+        assert!(matches!(
+            restarted.resolve_device("s2bu").await.unwrap_err(),
+            GtpuError::StateIndeterminate {
+                operation: "ebpf_marked_owner_rebuild"
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn committed_v3_adopts_to_source_port_v4_and_v4_map_loss_fails_closed() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let pin_dir = PathBuf::from(DEFAULT_BPFFS_PIN_ROOT).join("s2bu");
+        {
+            // A committed v3 pin set has no source-port maps yet; the
+            // additive migration must create them and commit v4.
+            let mut state = runtime.state();
+            state.attached.clear();
+            state.schema.insert(pin_dir.clone(), FakeSchema::EndpointV3);
+            state.sport_map_ready.clear();
+            state.marked_sport_map_ready.clear();
+        }
+        let restarted = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
+        restarted.resolve_device("s2bu").await.unwrap();
+        assert_eq!(
+            restarted
+                .probe()
+                .await
+                .unwrap()
+                .uplink_source_port_selection,
+            GtpuCapability::Available
+        );
+        assert_eq!(
+            runtime.state().schema.get(&pin_dir),
+            Some(&FakeSchema::SourcePortV4)
+        );
+
+        // A committed v4 pin set that loses either source-port map must not
+        // be silently recreated on the next restart.
+        {
+            let mut state = runtime.state();
+            state.attached.clear();
+            state.sport_map_ready.clear();
+        }
+        let restarted = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
+        assert!(matches!(
+            restarted.resolve_device("s2bu").await.unwrap_err(),
+            GtpuError::Io {
+                operation: "ebpf_bearer_schema",
+                ..
+            }
+        ));
+        assert!(!runtime.state().attached.contains_key(&S2BU_IFINDEX));
     }
 }

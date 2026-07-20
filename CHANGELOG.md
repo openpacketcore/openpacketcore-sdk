@@ -96,6 +96,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   expected accepted non-canonical PDU Session Container bytes or extension
   placement to survive `to_bytes` must use the generic raw-preserving boundary
   for byte-exact forwarding.
+- **Configurable stable uplink GTP-U UDP source ports — `opc-gtpu-dataplane`
+  (#346):** `GtpPdpContext::uplink_source_port_policy` selects, per PDP
+  context, the UDP source port stamped by the eBPF uplink encapsulator while
+  the destination remains the TS 29.281 section 4.4.2 service port 2152.
+  `GtpuUplinkSourcePortPolicy::LegacyServicePort` is the explicit pre-feature
+  fixed-2152 behavior with byte-for-byte identical wire bytes;
+  `GtpuUplinkSourcePortPolicy::selected(port)` persists one stable
+  per-context port in the new additive `GTPU_UL_SPORT`/`GTPU_ULM_SPORT` maps
+  (absence encodes the legacy policy, so pre-feature pinned state upgrades in
+  place under the new `OPC-SPORT-v4` schema marker). The reserved port zero
+  fails closed at policy construction, at the userspace map boundary, on
+  restart adoption, and in the tc program itself; the effective port is
+  carried through atomic reconciliation, restart adoption, and PDP read-back,
+  appears in conflict evidence only as the `UplinkSourcePortPolicy` field
+  name, and is redacted from `Debug`. The new
+  `GtpuProbe::uplink_source_port_selection` capability gates non-legacy
+  policies fail-closed; the Linux `gtp`, mock, and unsupported backends
+  report `Missing` and reject them. Downlink peer source-port validation
+   (`downlink_source_port_policy`) remains independently configurable.
 - **Validated-provider capability seam — `opc-crypto-provider`:** a new
   standalone crate defining the capability-reporting and key-custody boundary
   requested by #334 (slice 1 of 5). `CryptoCapability` enumerates the

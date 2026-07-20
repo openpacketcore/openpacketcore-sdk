@@ -801,6 +801,7 @@ impl LinuxGtpuTransport for NetlinkGtpuTransport {
             egress_dscp_marking: GtpuCapability::Missing,
             per_bearer_marking: GtpuCapability::Missing,
             downlink_endpoint_binding: GtpuCapability::Missing,
+            uplink_source_port_selection: GtpuCapability::Missing,
             details,
         }
     }
@@ -882,6 +883,11 @@ fn validate_pdp_context(context: &GtpPdpContext) -> Result<(), GtpuError> {
     if context.downlink_source_port_policy != crate::GtpuSourcePortPolicy::Any {
         return Err(GtpuError::UnsupportedFeature {
             feature: "downlink_source_port_policy",
+        });
+    }
+    if context.uplink_source_port_policy != crate::GtpuUplinkSourcePortPolicy::LegacyServicePort {
+        return Err(GtpuError::UnsupportedFeature {
+            feature: "uplink_source_port_selection",
         });
     }
     validate_ifindex(context.link_ifindex, "pdp.link_ifindex")?;
@@ -1276,6 +1282,7 @@ fn parse_pdp_context_response(
         gtp_version: GtpVersion::V1,
         bearer_mark: None,
         egress_dscp: None,
+        uplink_source_port_policy: crate::GtpuUplinkSourcePortPolicy::LegacyServicePort,
     };
     let selector_matches = match selector {
         PdpContextSelector::LocalTeid(selector) => {
@@ -1693,6 +1700,7 @@ mod tests {
                     egress_dscp_marking: GtpuCapability::Missing,
                     per_bearer_marking: GtpuCapability::Missing,
                     downlink_endpoint_binding: GtpuCapability::Missing,
+                    uplink_source_port_selection: GtpuCapability::Missing,
                     details: Some("test transport"),
                 },
                 socket_fd: 9,
@@ -1779,6 +1787,7 @@ mod tests {
             gtp_version: GtpVersion::V1,
             bearer_mark: None,
             egress_dscp: None,
+            uplink_source_port_policy: crate::GtpuUplinkSourcePortPolicy::LegacyServicePort,
         }
     }
 
@@ -2047,6 +2056,27 @@ mod tests {
                 baseline_bytes
             );
         }
+    }
+
+    #[test]
+    fn kernel_backend_rejects_selected_uplink_source_port_without_sending_it() {
+        let baseline = pdp_context();
+        let baseline_bytes = encode_install_pdp_context(&baseline).unwrap();
+        let mut selected = baseline.clone();
+        selected.uplink_source_port_policy =
+            crate::GtpuUplinkSourcePortPolicy::selected(40_000).unwrap();
+
+        assert!(matches!(
+            validate_pdp_context(&selected).unwrap_err(),
+            GtpuError::UnsupportedFeature {
+                feature: "uplink_source_port_selection"
+            }
+        ));
+        // The explicit legacy policy remains the exact established payload.
+        assert_eq!(
+            encode_install_pdp_context(&baseline).unwrap(),
+            baseline_bytes
+        );
     }
 
     #[test]
