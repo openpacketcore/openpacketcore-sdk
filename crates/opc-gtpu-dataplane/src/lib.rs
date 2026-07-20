@@ -31,6 +31,7 @@
 pub mod backend;
 pub mod ebpf;
 pub mod error;
+pub mod icmp;
 pub mod linux;
 pub mod mock;
 pub mod model;
@@ -43,6 +44,7 @@ pub use ebpf::{
     EbpfGtpuDataplaneBackendConfig, DEFAULT_BPFFS_PIN_ROOT, DEFAULT_TC_PRIORITY,
 };
 pub use error::GtpuError;
+pub use icmp::{build_icmpv4_packet_too_big, build_icmpv6_packet_too_big};
 pub use linux::{LinuxGtpuDataplaneBackend, LinuxGtpuDataplaneBackendConfig};
 pub use mock::{
     MockGtpuDataplaneBackend, MockOperation, MockPdpContextFault,
@@ -61,9 +63,11 @@ pub use model::{
     RemovePdpContextRequest, Teid, GTPU_PORT,
 };
 pub use opc_types::DscpCodepoint;
+#[cfg(target_os = "linux")]
+pub use reassembly::{linux_reassembly_bounds, recv_reassembled_gtpu};
 pub use reassembly::{
     DownlinkOuterProvenance, GtpuReassemblyConsumer, GtpuReassemblyCounters, GtpuReassemblyDrop,
-    GtpuReassemblyOutcome,
+    GtpuReassemblyOutcome, GtpuReassemblyPdr,
 };
 pub use unsupported::UnsupportedGtpuDataplaneBackend;
 

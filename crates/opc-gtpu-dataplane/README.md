@@ -488,8 +488,8 @@ boundary for exact policy values.
 36-byte encapsulation plus the RFC 791 minimum 68-byte inner packet always
 fits) and the outer-fragmentation choice. `inner_mtu()` is the headroom
 accounting: effective link MTU minus the encapsulation overhead. `None`
-preserves the pre-policy behavior exactly — only the IPv4 total-length `u16`
-limit is enforced.
+requests no change: a fresh device gets the legacy total-length-only
+behavior and a device with a persisted policy keeps it.
 
 `decide_uplink_encap` in `opc-gtpu-ebpf-common` is the shared typed decision
 used by host callers and, through `apply_uplink_mtu_policy`, by the tc uplink
@@ -498,22 +498,36 @@ program itself:
 - `Emit` within the effective MTU, with the remaining headroom; under the
   default `SignalPacketTooBig` policy the outer DF bit is stamped and the
   outer checksum refreshed.
-- `EmitOuterFragmented` when the policy permits outer IPv4 fragmentation:
-  the packet is emitted with DF clear and the bounded excess is reported.
-- `RejectTooBig` otherwise: a fail-closed drop carrying typed RFC 1191
-  ICMPv4 / RFC 8200-8201 ICMPv6 Packet-Too-Big guidance advertising the
-  inner-facing MTU. The inner packet is never emitted unencapsulated and the
-  encapsulation never silently exceeds the effective MTU. Generating the
-  ICMP signal itself is the embedding ePDG's control-plane choice; the tc
-  program drops and counts.
+- `EmitOuterFragmented` when the policy permits downstream outer
+  fragmentation: the packet is emitted with DF clear and the bounded excess
+  is reported. Note exactly what this means on the eBPF backend: the tc
+  egress transmits via `bpf_redirect_neigh`, which bypasses the kernel's
+  `ip_fragment` path, so **the ePDG never fragments the outer packet
+  itself** — the oversized frame leaves whole. The policy is safe only when
+  the configured effective MTU is below the egress device's real MTU *and* a
+  fragmenting hop exists downstream; otherwise oversized frames risk silent
+  drops by drivers or MRU-limited receivers.
+- `RejectTooBig` otherwise: a fail-closed, counted drop. On the eBPF tc
+  backend this is *silent* toward the inner source — the kernel datapath
+  emits no ICMP — so operators must size the inner MTU out of band (for
+  example MSS clamping), or consume the typed signal in a host component:
+  `build_icmpv4_packet_too_big` / `build_icmpv6_packet_too_big` turn a
+  `GtpuPmtuSignal` into a wire RFC 1191 / RFC 8201 Packet-Too-Big packet for
+  host callers of `decide_uplink_encap`. The inner packet is never emitted
+  unencapsulated and, under the strict policy, the encapsulation never
+  exceeds the effective MTU.
 
 The eBPF backend persists the policy in the additive single-slot
-`GTPU_PMTU_CFG` map at device creation and rejects a configured policy when
-the loaded datapath cannot honor it. `effective_uplink_mtu_policy` reads the
-effective policy back; corrupt persisted bytes are indeterminate, never a
-silent fallback. Over-MTU and corrupt-policy drops are aggregated into the
-identity-bound snapshot as `uplink_mtu_rejected` from the `GTPU_PMTU_DROP`
-per-CPU counter. The mock and Linux `gtp` backends report
+`GTPU_PMTU_CFG` map at device creation (only when `Some` is requested) and
+rejects a configured policy when the loaded datapath cannot honor it.
+`set_uplink_mtu_policy(device, policy)` is the supported mutation for a live
+device — an atomic slot write converging any out-of-band drift — and
+`effective_uplink_mtu_policy` reads the effective policy back; adoption and
+read-back fail closed (`StateIndeterminate`) on corrupt persisted bytes
+rather than blackholing uplink silently. Over-MTU rejects and corrupt-policy
+drops are separate snapshot counters (`uplink_mtu_rejected` and the
+external-writer canary `uplink_mtu_policy_corrupt`, both from the
+`GTPU_PMTU_DROP` per-CPU map). The mock and Linux `gtp` backends report
 `uplink_pmtu_enforcement` missing and reject a configured policy fail
 closed; the netlink driver leaves outer MTU/fragmentation to the kernel
 routing layer.
@@ -521,34 +535,65 @@ routing layer.
 ### Downlink outer-fragment handling
 
 `GtpuProbe::downlink_outer_fragment_handling` states each backend's contract
-explicitly; there is no implicit behavior. The eBPF backend advertises
-`KernelReassemblyHandoff`: the tc ingress program passes outer IPv4
-fragments to the kernel stack unchanged, the kernel reassembles under its
-bounded `net.ipv4.ipfrag_*` accounting, and exactly one complete UDP/2152
-datagram re-enters the SDK consumer bound on the local S2b-U endpoint —
-`GtpuReassemblyConsumer` in this crate. That consumer applies the same PDR
-lookup, canonical endpoint-binding validation, inner-family, and
-inner-destination checks as the tc fast path (backed by the exact pinned
-map state in production) and returns the decapsulated inner packet with its
-output bearer mark at most once per reassembled datagram. Malformed,
-unknown-TEID, binding-mismatch, destination-mismatch, and oversized inputs
-fail closed into bounded typed counters; non-G-PDU GTP-U is handed to the
-control plane. The SDK never holds a userspace fragment cache, so
-reordered, duplicated, overlapping, incomplete, and timed-out fragment sets
-are bounded by the kernel's configured limits and can never produce a
-duplicate delivery. The Linux `gtp` backend reports the same handoff —
-the kernel gtp driver is itself the post-reassembly UDP consumer — with
-the live ipfrag sysctl bounds; the mock and unsupported backends report
-`Unsupported`.
+explicitly; there is no implicit behavior. The eBPF backend is
+*handoff-capable* (`KernelReassemblyHandoff`): the tc ingress program passes
+outer IPv4 fragments to the kernel stack unchanged, the kernel reassembles
+under its bounded `net.ipv4.ipfrag_*` accounting (reported from the live
+sysctls, absent when unreadable — never fabricated defaults), and exactly
+one complete UDP/2152 datagram is delivered to a socket bound on the
+concrete local S2b-U address. The contract is complete only while the
+operator runs an SDK consumer on that socket: without one, the kernel
+answers each fragment set with ICMP port unreachable toward the PGW and the
+packet is lost.
+
+`GtpuReassemblyConsumer` is that consumer. It mirrors the tc fast path's
+PDR resolution (including dual-map-TEID and reserved-zero-mark corruption,
+which fail closed as malformed), canonical endpoint-binding validation,
+marked-bearer owner-journal authorization (so install, relocation, and
+removal windows cannot deliver through the socket what tc would drop), and
+inner-family/destination checks, returning the decapsulated inner packet
+with its output bearer mark at most once per reassembled datagram.
+Provenance comes from the kernel, not configuration:
+`recv_reassembled_gtpu` extracts the peer, source port, and local
+destination via `IP_PKTINFO`; the ingress ifindex is the managed interface's
+(the kernel reports ifindex 0 for reassembled datagrams, so delivery is
+scoped to the interface by the concrete-address bind and any nonzero kernel
+ifindex is cross-checked). Documented divergences from the tc path: checksum
+verification is the kernel's (socket delivery implies acceptance), and
+envelope padding strictness differs — tc requires `udp_end == ip_end` and
+drops padded envelopes, while the kernel strips layer-2 padding before
+socket delivery, so a padded envelope tc would drop unfragmented is accepted
+after reassembly. Malformed, unknown-TEID, binding-mismatch,
+destination-mismatch, and oversized inputs fail closed into bounded typed
+counters; non-G-PDU GTP-U is handed to the control plane. The SDK never
+holds a userspace fragment cache, so reordered, duplicated, overlapping,
+incomplete, and timed-out fragment sets are bounded by the kernel's
+configured limits and can never produce a duplicate delivery.
+
+The consumer's counters are userspace-side and deliberately *not* part of
+the identity-bound `datapath_snapshot` (which aggregates only the tc
+datapath's per-CPU maps); monitor both. Socket lifecycle guidance for the
+embedding ePDG: size `SO_RCVBUF` for the expected reassembled burst (kernel
+UDP buffer overruns drop silently and are not visible in the consumer
+counters), and shut down in reverse order — detach the tc datapath before
+closing the consumer socket — because fragments arriving after the socket
+closes are answered with ICMP port unreachable toward the PGW. The Linux
+`gtp` backend reports the same handoff — the kernel gtp driver is itself
+the post-reassembly UDP consumer — while the mock and unsupported backends
+report `Unsupported`.
 
 The privileged suite proves the contract end-to-end: a valid two-fragment
 G-PDU, a reordered set, and a set with a duplicated first fragment each
-re-enter the consumer exactly once and decapsulate to the exact original
-inner packet; a conflicting overlapping set never duplicates; an incomplete
-set never re-enters. The uplink suite proves the strict policy drops an
-over-MTU encapsulation with only the drop counter moving, stamps DF on
-fitting packets, and emits the same packet untouched under the
-fragment-permitted policy.
+re-enter the consumer exactly once and decapsulate to a byte-exact original
+inner packet against the pinned PDR/binding/owner state; a conflicting
+overlapping set never duplicates; an incomplete set never re-enters; a
+fragment set from an unauthorized outer peer is reassembled by the kernel
+but rejected by the consumer's binding check. The uplink suite proves the
+strict policy drops an over-MTU encapsulation with only the reject counter
+moving, stamps DF on fitting packets, emits the same oversized packet whole
+with DF clear under the fragment-permitted policy (updated on the live
+device via `set_uplink_mtu_policy`), and routes corrupt policy bytes to the
+canary counter with indeterminate read-back.
 
 ### Pinned-map and live-program migration
 

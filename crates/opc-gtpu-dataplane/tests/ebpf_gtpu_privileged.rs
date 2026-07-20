@@ -63,26 +63,27 @@ use aya::{Ebpf, EbpfLoader};
 use nix::libc;
 use nix::{setsockopt_impl, sockopt_impl};
 use opc_gtpu_dataplane::{
-    CreateGtpDeviceRequest, DownlinkOuterProvenance, DrainedV2TeardownOutcome,
+    recv_reassembled_gtpu, CreateGtpDeviceRequest, DrainedV2TeardownOutcome,
     DrainedV2TeardownRefusal, DrainedV2TeardownRequest, DscpCodepoint, EbpfGtpuDataplaneBackend,
     EbpfGtpuDataplaneBackendConfig, GtpBearerMark, GtpDevice, GtpPdpContext, GtpVersion,
     GtpuCapability, GtpuDataplaneBackend, GtpuError, GtpuOuterFragmentPolicy,
-    GtpuReassemblyConsumer, GtpuReassemblyOutcome, GtpuSourcePortPolicy, GtpuUplinkMtuPolicy,
-    GtpuUplinkSourcePortPolicy, GtpuV2DrainProof, PdpContextIndeterminateReason,
-    PdpContextInstallOutcome, PdpContextLocalTeidSelector, PdpContextReadback,
-    PdpContextRemovalOutcome, PdpContextSelector, PdpContextSelectorOccupancy,
+    GtpuReassemblyConsumer, GtpuReassemblyDrop, GtpuReassemblyOutcome, GtpuReassemblyPdr,
+    GtpuSourcePortPolicy, GtpuUplinkMtuPolicy, GtpuUplinkSourcePortPolicy, GtpuV2DrainProof,
+    PdpContextIndeterminateReason, PdpContextInstallOutcome, PdpContextLocalTeidSelector,
+    PdpContextReadback, PdpContextRemovalOutcome, PdpContextSelector, PdpContextSelectorOccupancy,
     PdpContextUplinkSelector, RemovePdpContextRequest, Teid,
 };
 use opc_gtpu_ebpf_common::{
-    internet_checksum, ipv4_header_checksum, udp_ipv4_checksum, DownlinkEndpointBinding,
-    DownlinkPdr, GtpuEndpointAddress, MarkedBearerOwner, MarkedBearerOwnerPhase, MarkedDownlinkPdr,
-    PdpContextCommit, UplinkFar, UplinkFarKey, COUNTER_DL_BINDING_FAMILY_MISMATCH,
-    COUNTER_DL_BINDING_INGRESS_MISMATCH, COUNTER_DL_BINDING_INVALID,
-    COUNTER_DL_BINDING_LOCAL_MISMATCH, COUNTER_DL_BINDING_PEER_MISMATCH,
-    COUNTER_DL_BINDING_SOURCE_PORT_MISMATCH, COUNTER_DL_DECAP, COUNTER_DL_DST_MISMATCH,
-    COUNTER_DL_MALFORMED, COUNTER_DL_UNKNOWN_TEID, COUNTER_UL_ENCAP, COUNTER_UL_FAR_MISS,
-    COUNTER_UL_MTU_REJECT, DOWNLINK_ENDPOINT_BINDING_VALUE_LEN, DOWNLINK_PDR_VALUE_LEN,
-    ETH_HDR_LEN, GTPU_MANDATORY_HDR_LEN, IPV4_MIN_HDR_LEN, MAP_CONFIG, MAP_COUNTERS,
+    internet_checksum, ipv4_header_checksum, marked_owner_wire_authorizes_downlink,
+    udp_ipv4_checksum, DownlinkEndpointBinding, DownlinkPdr, GtpuEndpointAddress, MarkedBearerOwner,
+    MarkedBearerOwnerPhase, MarkedDownlinkPdr, PdpContextCommit, UplinkFar, UplinkFarKey,
+    COUNTER_DL_BINDING_FAMILY_MISMATCH, COUNTER_DL_BINDING_INGRESS_MISMATCH,
+    COUNTER_DL_BINDING_INVALID, COUNTER_DL_BINDING_LOCAL_MISMATCH,
+    COUNTER_DL_BINDING_PEER_MISMATCH, COUNTER_DL_BINDING_SOURCE_PORT_MISMATCH, COUNTER_DL_DECAP,
+    COUNTER_DL_DST_MISMATCH, COUNTER_DL_MALFORMED, COUNTER_DL_UNKNOWN_TEID, COUNTER_UL_ENCAP,
+    COUNTER_UL_FAR_MISS, COUNTER_UL_MTU_REJECT, COUNTER_UL_PMTU_CORRUPT,
+    DOWNLINK_ENDPOINT_BINDING_VALUE_LEN, DOWNLINK_PDR_VALUE_LEN, ETH_HDR_LEN,
+    GTPU_MANDATORY_HDR_LEN, IPV4_MIN_HDR_LEN, MAP_CONFIG, MAP_COUNTERS,
     MAP_DOWNLINK_BINDING_COUNTERS, MAP_DOWNLINK_ENDPOINT_BINDING, MAP_DOWNLINK_MARK_PDR,
     MAP_DOWNLINK_PDR, MAP_MARKED_BEARER_OWNER, MAP_UPLINK_DSCP, MAP_UPLINK_FAR,
     MAP_UPLINK_MARK_DSCP, MAP_UPLINK_MARK_FAR, MAP_UPLINK_MARK_SOURCE_PORT, MAP_UPLINK_PMTU,
@@ -4097,21 +4098,33 @@ fn pinned_pmtu_drop_counter(pin_dir: &std::path::Path) -> u64 {
         .sum()
 }
 
+fn pinned_pmtu_corrupt_counter(pin_dir: &std::path::Path) -> u64 {
+    let map = Map::from_map_data(
+        MapData::from_pin(pin_dir.join(MAP_UPLINK_PMTU_COUNTERS))
+            .expect("open pinned MTU-drop counters"),
+    )
+    .expect("identify pinned MTU-drop counter map");
+    let counters = PerCpuArray::<_, u64>::try_from(map).expect("typed pinned MTU-drop counters");
+    counters
+        .get(&COUNTER_UL_PMTU_CORRUPT, 0)
+        .expect("read per-CPU corrupt-policy counter")
+        .iter()
+        .copied()
+        .sum()
+}
+
 /// Read the exact pinned default/marked PDR the tc downlink program would
-/// consult for `teid`, normalized to the marked view.
-fn read_pinned_downlink_pdr(pin_dir: &std::path::Path, teid: [u8; 4]) -> Option<MarkedDownlinkPdr> {
+/// consult for `teid`, with the tc path's corruption semantics: a TEID in
+/// both maps is corrupt duplicate ownership, and a marked PDR with the
+/// reserved zero mark is corrupt.
+fn read_pinned_downlink_pdr(pin_dir: &std::path::Path, teid: [u8; 4]) -> Option<GtpuReassemblyPdr> {
     let legacy = Map::from_map_data(
         MapData::from_pin(pin_dir.join(MAP_DOWNLINK_PDR)).expect("open pinned downlink PDR"),
     )
     .expect("identify pinned downlink PDR map");
     let legacy = BpfHashMap::<_, [u8; 4], [u8; DOWNLINK_PDR_VALUE_LEN]>::try_from(legacy)
         .expect("typed pinned downlink PDR map");
-    if let Ok(value) = legacy.get(&teid, 0) {
-        return Some(MarkedDownlinkPdr {
-            ue_ip: DownlinkPdr::decode(&value).ue_ip,
-            bearer_mark: [0; 4],
-        });
-    }
+    let legacy = legacy.get(&teid, 0).ok();
     let marked = Map::from_map_data(
         MapData::from_pin(pin_dir.join(MAP_DOWNLINK_MARK_PDR))
             .expect("open pinned marked downlink PDR"),
@@ -4119,10 +4132,47 @@ fn read_pinned_downlink_pdr(pin_dir: &std::path::Path, teid: [u8; 4]) -> Option<
     .expect("identify pinned marked downlink PDR map");
     let marked = BpfHashMap::<_, [u8; 4], [u8; MARKED_DOWNLINK_PDR_VALUE_LEN]>::try_from(marked)
         .expect("typed pinned marked downlink PDR map");
-    marked
-        .get(&teid, 0)
-        .ok()
-        .map(|value| MarkedDownlinkPdr::decode(&value))
+    let marked = marked.get(&teid, 0).ok();
+    match (legacy, marked) {
+        (Some(_), Some(_)) => Some(GtpuReassemblyPdr::Corrupt),
+        (Some(value), None) => Some(GtpuReassemblyPdr::Configured(MarkedDownlinkPdr {
+            ue_ip: DownlinkPdr::decode(&value).ue_ip,
+            bearer_mark: [0; 4],
+        })),
+        (None, Some(value)) => {
+            let pdr = MarkedDownlinkPdr::decode(&value);
+            if pdr.bearer_mark == [0; 4] {
+                Some(GtpuReassemblyPdr::Corrupt)
+            } else {
+                Some(GtpuReassemblyPdr::Configured(pdr))
+            }
+        }
+        (None, None) => None,
+    }
+}
+
+/// Authorize a marked-bearer delivery against the exact pinned owner
+/// journal, exactly as the tc downlink program does.
+fn pinned_owner_authorizes_downlink(
+    pin_dir: &std::path::Path,
+    teid: [u8; 4],
+    selector: [u8; UPLINK_MARK_KEY_LEN],
+    binding: &DownlinkEndpointBinding,
+) -> bool {
+    let map = Map::from_map_data(
+        MapData::from_pin(pin_dir.join(MAP_MARKED_BEARER_OWNER))
+            .expect("open pinned marked-owner journal"),
+    )
+    .expect("identify pinned marked-owner journal");
+    let owners =
+        BpfHashMap::<_, [u8; UPLINK_MARK_KEY_LEN], [u8; MARKED_BEARER_OWNER_VALUE_LEN]>::try_from(
+            map,
+        )
+        .expect("typed pinned marked-owner journal");
+    let Ok(owner) = owners.get(&selector, 0) else {
+        return false;
+    };
+    marked_owner_wire_authorizes_downlink(&owner, teid, &binding.encode())
 }
 
 /// Read the exact pinned outer-endpoint binding the tc downlink program
@@ -4262,13 +4312,15 @@ async fn ebpf_gtpu_downlink_outer_fragments_reenter_sdk_consumer_exactly_once(
     // to the stack; the kernel reassembles under its bounded ipfrag
     // accounting and delivers one complete datagram here.
     let consumer_socket = UdpSocket::bind((EPDG_S2BU_IP, GTPU_PORT))?;
-    let provenance = DownlinkOuterProvenance::new(PGW_IP, EPDG_S2BU_IP, device.ifindex, GTPU_PORT)
-        .expect("canonical provenance");
-    // The consumer authorizes against the exact pinned PDR/binding state the
-    // tc fast path consults.
+    // The consumer authorizes against the exact pinned PDR/binding/owner
+    // state the tc fast path consults, with the tc path's corruption and
+    // owner-journal semantics.
     let mut consumer = GtpuReassemblyConsumer::new(
         |teid| read_pinned_downlink_pdr(&pin_dir, teid),
         |teid| read_pinned_downlink_binding(&pin_dir, teid),
+        |teid, selector, binding| {
+            pinned_owner_authorizes_downlink(&pin_dir, teid, selector, binding)
+        },
     );
 
     let destination_mac = main_link_address("s2bu");
@@ -4305,16 +4357,19 @@ async fn ebpf_gtpu_downlink_outer_fragments_reenter_sdk_consumer_exactly_once(
             RawChecksumMetadata::Unverified,
         );
     };
-    let expect_decapsulated = |consumer: &mut GtpuReassemblyConsumer<_, _>,
+    let expect_decapsulated = |consumer: &mut GtpuReassemblyConsumer<_, _, _>,
                                buffer: &mut [u8; 2048],
                                expected_inner_payload: &[u8]| {
         consumer_socket
             .set_read_timeout(Some(Duration::from_secs(2)))
             .expect("set consumer receive timeout");
-        let (length, from) = consumer_socket
-            .recv_from(buffer)
+        // Provenance is extracted from IP_PKTINFO, never hardcoded.
+        let (length, provenance) = recv_reassembled_gtpu(&consumer_socket, buffer, device.ifindex)
             .expect("reassembled G-PDU must re-enter the SDK consumer");
-        assert_eq!(from, SocketAddr::from((PGW_IP, GTPU_PORT)));
+        assert_eq!(provenance.peer_address(), PGW_IP);
+        assert_eq!(provenance.local_address(), EPDG_S2BU_IP);
+        assert_eq!(provenance.ingress_ifindex(), device.ifindex);
+        assert_eq!(provenance.source_port(), GTPU_PORT);
         let outcome = consumer.process(&buffer[..length], &provenance);
         let GtpuReassemblyOutcome::Decapsulated {
             inner_packet,
@@ -4324,9 +4379,10 @@ async fn ebpf_gtpu_downlink_outer_fragments_reenter_sdk_consumer_exactly_once(
             panic!("authorized reassembled G-PDU must decapsulate, got {outcome:?}");
         };
         assert_eq!(bearer_mark, None, "default bearer carries no output mark");
-        assert!(
-            inner_packet.ends_with(expected_inner_payload),
-            "decapsulated inner packet must be the exact fragmented original"
+        assert_eq!(
+            inner_packet,
+            build_inner_udp(REMOTE_HOST, UE_PAA, 53, 5000, expected_inner_payload),
+            "decapsulated inner packet must equal the exact fragmented original"
         );
     };
 
@@ -4352,6 +4408,9 @@ async fn ebpf_gtpu_downlink_outer_fragments_reenter_sdk_consumer_exactly_once(
     // A conflicting overlapping second fragment is handled inside the
     // kernel's bounded reassembly: at most one datagram ever re-enters, and
     // any delivered datagram still produces one typed consumer outcome.
+    // Overlap behavior is kernel-version policy (kernels since ~4.17 drop
+    // overlapping IPv4 fragments; older ones keep first-received bytes), so
+    // this case asserts only the at-most-once, fail-closed contract.
     let inner = build_inner_udp(REMOTE_HOST, UE_PAA, 53, 5000, &payload);
     let gpdu = build_gpdu(LOCAL_TEID, None, &inner);
     let frame = build_outer_gtpu_frame(destination_mac, source_mac, &[], &gpdu, true, 0);
@@ -4387,13 +4446,51 @@ async fn ebpf_gtpu_downlink_outer_fragments_reenter_sdk_consumer_exactly_once(
     consumer_socket
         .set_read_timeout(Some(Duration::from_millis(500)))
         .expect("set overlap receive timeout");
-    if let Ok((length, from)) = consumer_socket.recv_from(&mut receive_buffer) {
-        assert_eq!(from, SocketAddr::from((PGW_IP, GTPU_PORT)));
+    if let Ok((length, provenance)) =
+        recv_reassembled_gtpu(&consumer_socket, &mut receive_buffer, device.ifindex)
+    {
         // The typed consumer outcome is total: delivered or dropped, never a
         // duplicate and never a panic.
         let _ = consumer.process(&receive_buffer[..length], &provenance);
     }
     expect_no_datagram(&consumer_socket);
+
+    // A fragment set from an unauthorized outer peer reassembles and reaches
+    // the socket (the kernel does not enforce SDK policy), but the consumer
+    // must reject it against the canonical binding, exactly like the tc
+    // binding-drop path.
+    let mut wrong_peer_frame = frame.clone();
+    let ip = ETH_HDR_LEN;
+    wrong_peer_frame[ip + 12..ip + 16].copy_from_slice(&PGW_ALT_IP.octets());
+    refresh_outer_ipv4_checksum(&mut wrong_peer_frame);
+    refresh_outer_udp_checksum(&mut wrong_peer_frame);
+    let (wrong_first, wrong_second) = build_outer_fragments(&wrong_peer_frame, 32, 0x3455);
+    send_raw_gtpu_frame(
+        &net.pgw_ns,
+        "s2bup",
+        &wrong_first,
+        RawChecksumMetadata::Unverified,
+    );
+    send_raw_gtpu_frame(
+        &net.pgw_ns,
+        "s2bup",
+        &wrong_second,
+        RawChecksumMetadata::Unverified,
+    );
+    consumer_socket
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set wrong-peer receive timeout");
+    let (length, provenance) =
+        recv_reassembled_gtpu(&consumer_socket, &mut receive_buffer, device.ifindex)?;
+    assert_eq!(provenance.peer_address(), PGW_ALT_IP);
+    let binding_drops_before = consumer.counters().binding_drops;
+    assert_eq!(
+        consumer.process(&receive_buffer[..length], &provenance),
+        GtpuReassemblyOutcome::Dropped(GtpuReassemblyDrop::BindingMismatch(
+            opc_gtpu_ebpf_common::DownlinkBindingMismatch::PeerAddress
+        ))
+    );
+    assert_eq!(consumer.counters().binding_drops, binding_drops_before + 1);
 
     // An incomplete fragment set never re-enters the consumer; the kernel
     // retains it only within the documented bounded ipfrag timeout.
@@ -4506,17 +4603,23 @@ async fn ebpf_gtpu_uplink_mtu_policy_enforced_on_the_wire() -> Result<(), Box<dy
         "the strict policy must stamp DF on emitted outer headers"
     );
 
-    // Switch the persisted policy to outer-fragment permission. The same
-    // over-MTU inner packet must now be emitted (the tc program leaves DF
-    // clear so an MTU-enforcing egress may fragment the outer packet; this
-    // veth delivers the frame whole) and must not touch the drop counter.
+    // Switch the policy on the live device through the supported mutation
+    // (no out-of-band map write). The same over-MTU inner packet must now be
+    // emitted with DF clear: the tc egress path transmits via
+    // bpf_redirect_neigh and bypasses the kernel's ip_fragment, so the ePDG
+    // never fragments — the oversized frame leaves whole and this veth
+    // delivers it whole (safe here only because the policy MTU is below the
+    // device MTU; a fragmenting downstream hop is required in general). The
+    // drop counter must not move.
     let fragment = GtpuUplinkMtuPolicy::new(1400, GtpuOuterFragmentPolicy::FragmentOuter)
         .expect("canonical fragment policy");
-    replace_pinned_pmtu_policy(&pin_dir, fragment.map_value());
+    backend
+        .set_uplink_mtu_policy(&device, Some(fragment))
+        .await?;
     assert_eq!(
         backend.effective_uplink_mtu_policy(&device).await?,
         Some(fragment),
-        "read-back must reflect the persisted policy"
+        "read-back must reflect the updated policy"
     );
     let drops_before = pinned_pmtu_drop_counter(&pin_dir);
     let (len, from) = send_until_received(
@@ -4536,6 +4639,32 @@ async fn ebpf_gtpu_uplink_mtu_policy_enforced_on_the_wire() -> Result<(), Box<dy
         0,
         "the fragment-permitted policy must leave DF clear"
     );
+
+    // Corrupt persisted policy bytes (non-SDK mutation): every uplink packet
+    // drops fail closed into the dedicated corrupt-policy canary counter, the
+    // over-MTU reject counter does not move, and read-back is indeterminate.
+    replace_pinned_pmtu_policy(&pin_dir, [0x05, 0x78, 0x02, 0]);
+    assert!(matches!(
+        backend.effective_uplink_mtu_policy(&device).await,
+        Err(GtpuError::StateIndeterminate {
+            operation: "ebpf_pmtu_policy_readback"
+        })
+    ));
+    let corrupt_before = pinned_pmtu_corrupt_counter(&pin_dir);
+    for _ in 0..2 {
+        let _ = ue_socket.send_to(b"opc-corrupt-policy", (REMOTE_HOST, 53));
+    }
+    expect_no_datagram(&pgw_socket);
+    assert_eq!(pinned_pmtu_corrupt_counter(&pin_dir), corrupt_before + 2);
+    assert_eq!(
+        pinned_pmtu_drop_counter(&pin_dir),
+        drops_before,
+        "corrupt policy must not conflate with over-MTU rejects"
+    );
+
+    // The supported mutation restores a canonical policy.
+    backend.set_uplink_mtu_policy(&device, None).await?;
+    assert_eq!(backend.effective_uplink_mtu_policy(&device).await?, None);
 
     drop(net);
     Ok(())

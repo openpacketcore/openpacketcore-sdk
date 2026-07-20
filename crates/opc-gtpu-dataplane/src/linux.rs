@@ -807,33 +807,17 @@ impl LinuxGtpuTransport for NetlinkGtpuTransport {
             // The kernel gtp driver consumes UDP/2152 through a socket the
             // kernel itself reassembles into, so fragmented outer downlink
             // packets re-enter the GTP-U consumer exactly once under the
-            // kernel's bounded ipfrag accounting.
+            // kernel's bounded ipfrag accounting. Bounds come from the live
+            // sysctls and are absent when unreadable, never fabricated.
             downlink_outer_fragment_handling: if gtp_module_present {
                 GtpuDownlinkFragmentContract::KernelReassemblyHandoff {
-                    bounds: effective_reassembly_bounds(),
+                    bounds: crate::reassembly::linux_reassembly_bounds(),
                 }
             } else {
                 GtpuDownlinkFragmentContract::Unsupported
             },
             details,
         }
-    }
-}
-
-/// Read the live per-netns IPv4 reassembly bounds, falling back to the
-/// documented kernel defaults when the sysctls are unreadable.
-fn effective_reassembly_bounds() -> crate::GtpuReassemblyBounds {
-    fn read_sysctl_u32(path: &str) -> Option<u32> {
-        std::fs::read_to_string(path)
-            .ok()
-            .and_then(|value| value.trim().parse().ok())
-    }
-    let defaults = opc_gtpu_ebpf_common::LINUX_DEFAULT_REASSEMBLY_BOUNDS;
-    crate::GtpuReassemblyBounds {
-        max_inflight_bytes: read_sysctl_u32("/proc/sys/net/ipv4/ipfrag_high_thresh")
-            .unwrap_or(defaults.max_inflight_bytes),
-        timeout_seconds: read_sysctl_u32("/proc/sys/net/ipv4/ipfrag_time")
-            .unwrap_or(defaults.timeout_seconds),
     }
 }
 
@@ -1743,7 +1727,7 @@ mod tests {
                     uplink_pmtu_enforcement: GtpuCapability::Missing,
                     downlink_outer_fragment_handling:
                         GtpuDownlinkFragmentContract::KernelReassemblyHandoff {
-                            bounds: opc_gtpu_ebpf_common::LINUX_DEFAULT_REASSEMBLY_BOUNDS,
+                            bounds: Some(opc_gtpu_ebpf_common::LINUX_DEFAULT_REASSEMBLY_BOUNDS),
                         },
                     details: Some("test transport"),
                 },

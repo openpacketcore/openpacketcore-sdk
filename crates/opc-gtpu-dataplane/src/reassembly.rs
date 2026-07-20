@@ -3,37 +3,83 @@
 //! The tc downlink program passes outer IPv4 fragments to the kernel stack
 //! unchanged (`TC_ACT_OK`); the kernel reassembles them under its bounded
 //! `ipfrag` accounting and delivers exactly one complete UDP/2152 datagram to
-//! the socket bound on the local S2b-U endpoint. This module is the SDK
-//! consumer for that re-entry point: [`GtpuReassemblyConsumer::process`]
-//! applies the same PDR lookup, outer-endpoint binding validation, and inner
-//! destination check as the tc fast path and returns the decapsulated inner
-//! packet with its output bearer mark. Non-G-PDU GTP-U (echo, error
+//! the socket bound on the concrete local S2b-U address (never `0.0.0.0`).
+//! This module is the SDK consumer for that re-entry point:
+//! [`GtpuReassemblyConsumer::process`] mirrors the tc fast path's PDR
+//! resolution, endpoint-binding validation, marked-bearer owner-journal
+//! authorization, and inner destination checks, and returns the decapsulated
+//! inner packet with its output bearer mark. Non-G-PDU GTP-U (echo, error
 //! indication) is handed back for the control plane, matching the fast
 //! path's pass-through.
 //!
-//! Reassembly itself stays in the kernel, so fragment memory and time are
-//! bounded by `net.ipv4.ipfrag_*` rather than by any SDK state; the SDK never
-//! holds a userspace fragment cache. Delivery of the decapsulated inner
-//! packet (route/XFRM injection) is the embedding ePDG's choice and is
-//! deliberately out of scope here.
+//! Deliberate, documented divergences from the tc fast path:
+//!
+//! - Checksum verification is the kernel's: socket delivery implies the
+//!   kernel accepted the reassembled datagram, so the consumer performs no
+//!   checksum probes of its own.
+//! - Envelope padding strictness differs: tc requires the UDP end to equal
+//!   the IPv4 end and drops padded envelopes, while the kernel strips layer-2
+//!   padding before socket delivery, so a padded envelope that tc would drop
+//!   unfragmented is accepted here after reassembly.
+//! - The ingress ifindex cannot come from `IP_PKTINFO` on this path — the
+//!   kernel reports ifindex 0 for reassembled datagrams — so it is the
+//!   managed interface's ifindex supplied by the caller (see
+//!   [`recv_reassembled_gtpu`]); delivery is scoped to the right interface
+//!   by the concrete-address bind instead.
+//!
+//! The consumer's counters are userspace-side and deliberately *not* part of
+//! the eBPF backend's identity-bound `datapath_snapshot` counters: the
+//! snapshot aggregates the tc datapath's per-CPU maps, while these count the
+//! post-reassembly socket path. Operators should monitor both.
+//!
+//! Socket lifecycle guidance for the embedding ePDG: size `SO_RCVBUF` for
+//! the expected reassembled burst (kernel UDP buffer overruns drop silently
+//! and are not visible in these counters), and shut down in reverse order —
+//! detach the tc datapath first or close the consumer socket last — because
+//! fragments arriving after the socket closes are answered with ICMP port
+//! unreachable toward the PGW. Reassembly itself stays in the kernel, so
+//! fragment memory and time are bounded by `net.ipv4.ipfrag_*` rather than
+//! by any SDK state; the SDK never holds a userspace fragment cache.
+//! Delivery of the decapsulated inner packet (route/XFRM injection) is the
+//! embedding ePDG's choice and is deliberately out of scope here.
 
 use std::fmt;
 use std::net::Ipv4Addr;
 
 use opc_gtpu_ebpf_common::{
-    parse_gtpu_tpdu, DownlinkBindingMismatch, DownlinkEndpointBinding, MarkedDownlinkPdr,
-    MAX_REASSEMBLED_GTPU_LEN,
+    parse_gtpu_tpdu, DownlinkBindingMismatch, DownlinkEndpointBinding, GtpuReassemblyBounds,
+    MarkedDownlinkPdr, UplinkFarKey, MAX_REASSEMBLED_GTPU_LEN, UPLINK_MARK_KEY_LEN,
 };
 
 use crate::model::GtpBearerMark;
 
+/// Read the live per-netns IPv4 reassembly bounds for capability reporting.
+///
+/// Returns `None` when either sysctl is unreadable; the bounds are never
+/// fabricated from defaults, so a capability report carrying `None` means
+/// "kernel limits unknown", not "kernel defaults".
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn linux_reassembly_bounds() -> Option<GtpuReassemblyBounds> {
+    fn read_sysctl_u32(path: &str) -> Option<u32> {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|value| value.trim().parse().ok())
+    }
+    Some(GtpuReassemblyBounds {
+        max_inflight_bytes: read_sysctl_u32("/proc/sys/net/ipv4/ipfrag_high_thresh")?,
+        timeout_seconds: read_sysctl_u32("/proc/sys/net/ipv4/ipfrag_time")?,
+    })
+}
+
 /// Exact outer provenance of one reassembled downlink GTP-U datagram.
 ///
-/// The consumer receives these values from the delivery socket (peer address
-/// and source port from the datagram source, local address and ingress
-/// ifindex from the bound endpoint or `IP_PKTINFO`). They authorize the
-/// datagram against the same canonical [`DownlinkEndpointBinding`] as the
-/// tc fast path.
+/// The consumer receives these values from the delivery socket: peer address
+/// and source port from the datagram source, the local destination from
+/// `IP_PKTINFO`, and the managed interface's ifindex from the caller (see
+/// [`recv_reassembled_gtpu`] for why `IP_PKTINFO` cannot supply it on this
+/// path). They authorize the datagram against the same canonical
+/// [`DownlinkEndpointBinding`] as the tc fast path.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DownlinkOuterProvenance {
     peer_address: Ipv4Addr,
@@ -99,14 +145,112 @@ impl fmt::Debug for DownlinkOuterProvenance {
     }
 }
 
+/// Receive one reassembled UDP/2152 datagram together with its authoritative
+/// outer provenance via `IP_PKTINFO`.
+///
+/// The returned provenance carries the datagram's source (peer address and
+/// source port) and the kernel-reported local destination address, so the
+/// consumer never hardcodes them. `ingress_ifindex` must be the managed
+/// S2b-U interface's ifindex: the kernel reports ifindex 0 in `IP_PKTINFO`
+/// for reassembled datagrams (and on the loopback receive path), so
+/// per-packet packet-info cannot supply it. What scopes delivery to the
+/// right interface is the concrete-address bind — the socket must be bound
+/// on the interface's own S2b-U address (never `0.0.0.0`), so datagrams
+/// addressed to any other interface never arrive. When the kernel *does*
+/// report a nonzero ifindex, it is cross-checked against `ingress_ifindex`
+/// and a mismatch fails closed. `IP_PKTINFO` is enabled on the socket as a
+/// side effect.
+///
+/// # Errors
+///
+/// Returns the underlying socket error, or `InvalidData` when the kernel
+/// supplied no packet-info control message, a conflicting ifindex, or a
+/// non-canonical provenance.
+#[cfg(target_os = "linux")]
+pub fn recv_reassembled_gtpu(
+    socket: &std::net::UdpSocket,
+    buffer: &mut [u8],
+    ingress_ifindex: u32,
+) -> std::io::Result<(usize, DownlinkOuterProvenance)> {
+    use nix::sys::socket::{
+        recvmsg, setsockopt, sockopt, ControlMessageOwned, MsgFlags, SockaddrIn,
+    };
+    use std::os::fd::AsRawFd;
+
+    setsockopt(socket, sockopt::Ipv4PacketInfo, &true)?;
+    let mut cmsg_space = nix::cmsg_space!(nix::libc::in_pktinfo);
+    let mut iov = [std::io::IoSliceMut::new(buffer)];
+    let message = recvmsg::<SockaddrIn>(
+        socket.as_raw_fd(),
+        &mut iov,
+        Some(&mut cmsg_space),
+        MsgFlags::empty(),
+    )?;
+    let from = std::net::SocketAddr::from(message.address.ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "missing datagram source")
+    })?);
+    let std::net::IpAddr::V4(peer) = from.ip() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "non-IPv4 datagram source",
+        ));
+    };
+    let packet_info = message
+        .cmsgs()
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?
+        .find_map(|control| match control {
+            ControlMessageOwned::Ipv4PacketInfo(info) => Some(info),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "missing IP_PKTINFO control message",
+            )
+        })?;
+    let reported_ifindex = u32::try_from(packet_info.ipi_ifindex).unwrap_or(0);
+    if reported_ifindex != 0 && reported_ifindex != ingress_ifindex {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "kernel ingress ifindex conflicts with the managed interface",
+        ));
+    }
+    let local = Ipv4Addr::from(u32::from_be(packet_info.ipi_addr.s_addr));
+    let provenance = DownlinkOuterProvenance::new(peer, local, ingress_ifindex, from.port())
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "non-canonical provenance")
+        })?;
+    Ok((message.bytes, provenance))
+}
+
+/// Typed resolution of the downlink PDR lookup for one G-PDU TEID.
+///
+/// The lookup closure must return [`GtpuReassemblyPdr::Corrupt`] for every
+/// state the tc fast path drops as malformed: a TEID present in *both* the
+/// legacy and marked PDR maps (externally corrupted duplicate ownership) and
+/// a marked PDR carrying the reserved zero bearer mark. Returning
+/// `Configured` for either would let the socket path deliver packets the tc
+/// path drops fail closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GtpuReassemblyPdr {
+    /// One canonical PDR authorizes the TEID.
+    Configured(MarkedDownlinkPdr),
+    /// The persisted PDR state is corrupt; fail closed.
+    Corrupt,
+}
+
 /// Stable, redaction-safe reason a reassembled datagram was dropped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GtpuReassemblyDrop {
-    /// The reassembled message violates the GTP-U framing invariants.
+    /// The reassembled message violates the GTP-U framing invariants, or the
+    /// persisted PDR state is corrupt (dual-map TEID or reserved zero mark).
     Malformed,
+    /// The datagram exceeds the bounded maximum reassembled length.
+    Oversized,
     /// No PDR exists for the G-PDU TEID.
     UnknownTeid,
-    /// The outer provenance failed the canonical endpoint binding.
+    /// The outer provenance failed the canonical endpoint binding, or the
+    /// marked bearer's owner journal did not authorize the delivery.
     BindingMismatch(DownlinkBindingMismatch),
     /// The inner destination does not match the session's UE PAA.
     DestinationMismatch,
@@ -114,17 +258,23 @@ pub enum GtpuReassemblyDrop {
 
 /// Bounded counters of the post-reassembly consumer, mirroring the
 /// fixed-cardinality datapath counters of the tc fast path.
+///
+/// These are userspace counters for the socket re-entry path and are
+/// intentionally separate from the eBPF backend's `datapath_snapshot`
+/// per-CPU map aggregates.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GtpuReassemblyCounters {
     /// Reassembled G-PDUs decapsulated and handed to the embedding ePDG.
     pub decapsulated: u64,
     /// Messages passed through for the control plane (non-G-PDU GTP-U).
     pub control_plane: u64,
-    /// Reassembled messages dropped as malformed.
+    /// Reassembled messages dropped as malformed, including corrupt PDR
+    /// state (dual-map TEID, reserved zero mark).
     pub malformed: u64,
     /// G-PDUs dropped for an unknown TEID.
     pub unknown_teid: u64,
-    /// G-PDUs dropped by the outer-endpoint binding.
+    /// G-PDUs dropped by the outer-endpoint binding or the marked-bearer
+    /// owner journal.
     pub binding_drops: u64,
     /// G-PDUs dropped because the inner destination is not the session's UE.
     pub destination_mismatches: u64,
@@ -151,21 +301,34 @@ pub enum GtpuReassemblyOutcome {
 }
 
 /// Post-reassembly downlink consumer: the SDK GTP-U consumer that kernel
-/// reassembly re-enters, backed by the caller's authoritative PDR and
-/// endpoint-binding state.
+/// reassembly re-enters, backed by the caller's authoritative PDR,
+/// endpoint-binding, and owner-journal state.
 ///
-/// The lookup closures are the integration seam: they must serve exactly the
-/// state the tc fast path would consult (for the eBPF backend, the pinned
-/// downlink PDR and endpoint-binding maps read back through the backend).
-/// Keeping them caller-supplied makes the consumer backend-neutral and lets
-/// the embedding ePDG decide how read-back state is refreshed.
-pub struct GtpuReassemblyConsumer<P, B> {
+/// The three closures are the integration seam:
+///
+/// - `lookup_pdr` resolves a TEID to a typed [`GtpuReassemblyPdr`]; it must
+///   report `Corrupt` for dual-map TEIDs and reserved zero marks, exactly
+///   the states the tc program drops as malformed.
+/// - `lookup_binding` serves the canonical endpoint binding for the TEID.
+/// - `authorize_marked_owner` decides whether the marked-bearer owner
+///   journal authorizes `(teid, selector, binding)`; production callers back
+///   it with `marked_owner_wire_authorizes_downlink` over the pinned
+///   `GTPU_M_OWNER` map. It is consulted only for marked bearers, mirroring
+///   the tc program's `Active`-journal requirement so install, relocation,
+///   and removal windows cannot deliver through the socket path what the tc
+///   path would drop.
+///
+/// Keeping the state source caller-supplied makes the consumer
+/// backend-neutral and lets the embedding ePDG decide how read-back state is
+/// refreshed.
+pub struct GtpuReassemblyConsumer<P, B, O> {
     lookup_pdr: P,
     lookup_binding: B,
+    authorize_marked_owner: O,
     counters: GtpuReassemblyCounters,
 }
 
-impl<P, B> fmt::Debug for GtpuReassemblyConsumer<P, B> {
+impl<P, B, O> fmt::Debug for GtpuReassemblyConsumer<P, B, O> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("GtpuReassemblyConsumer")
             .field("counters", &self.counters)
@@ -173,16 +336,18 @@ impl<P, B> fmt::Debug for GtpuReassemblyConsumer<P, B> {
     }
 }
 
-impl<P, B> GtpuReassemblyConsumer<P, B>
+impl<P, B, O> GtpuReassemblyConsumer<P, B, O>
 where
-    P: Fn([u8; 4]) -> Option<MarkedDownlinkPdr>,
+    P: Fn([u8; 4]) -> Option<GtpuReassemblyPdr>,
     B: Fn([u8; 4]) -> Option<DownlinkEndpointBinding>,
+    O: Fn([u8; 4], [u8; UPLINK_MARK_KEY_LEN], &DownlinkEndpointBinding) -> bool,
 {
-    /// Construct a consumer over the given PDR and binding lookups.
-    pub fn new(lookup_pdr: P, lookup_binding: B) -> Self {
+    /// Construct a consumer over the given PDR, binding, and owner lookups.
+    pub fn new(lookup_pdr: P, lookup_binding: B, authorize_marked_owner: O) -> Self {
         Self {
             lookup_pdr,
             lookup_binding,
+            authorize_marked_owner,
             counters: GtpuReassemblyCounters::default(),
         }
     }
@@ -208,7 +373,7 @@ where
     ) -> GtpuReassemblyOutcome {
         if message.len() > MAX_REASSEMBLED_GTPU_LEN {
             self.counters.oversized += 1;
-            return GtpuReassemblyOutcome::Dropped(GtpuReassemblyDrop::Malformed);
+            return GtpuReassemblyOutcome::Dropped(GtpuReassemblyDrop::Oversized);
         }
         let tpdu = match parse_gtpu_tpdu(message) {
             Ok(Some(tpdu)) => tpdu,
@@ -221,9 +386,18 @@ where
                 return GtpuReassemblyOutcome::Dropped(GtpuReassemblyDrop::Malformed);
             }
         };
-        let Some(pdr) = (self.lookup_pdr)(tpdu.teid) else {
-            self.counters.unknown_teid += 1;
-            return GtpuReassemblyOutcome::Dropped(GtpuReassemblyDrop::UnknownTeid);
+        let pdr = match (self.lookup_pdr)(tpdu.teid) {
+            None => {
+                self.counters.unknown_teid += 1;
+                return GtpuReassemblyOutcome::Dropped(GtpuReassemblyDrop::UnknownTeid);
+            }
+            Some(GtpuReassemblyPdr::Corrupt) => {
+                // Dual-map TEID or reserved zero mark: the tc program drops
+                // these as malformed, and so does this path.
+                self.counters.malformed += 1;
+                return GtpuReassemblyOutcome::Dropped(GtpuReassemblyDrop::Malformed);
+            }
+            Some(GtpuReassemblyPdr::Configured(pdr)) => pdr,
         };
         let Some(binding) = (self.lookup_binding)(tpdu.teid) else {
             self.counters.binding_drops += 1;
@@ -240,6 +414,23 @@ where
             self.counters.binding_drops += 1;
             return GtpuReassemblyOutcome::Dropped(GtpuReassemblyDrop::BindingMismatch(reason));
         }
+        let output_mark = u32::from_be_bytes(pdr.bearer_mark);
+        if output_mark != 0 {
+            // A marked bearer is delivered only when its owner journal
+            // authorizes this exact TEID and binding, mirroring the tc
+            // program's Active-journal gate.
+            let selector = UplinkFarKey {
+                ue_ip: pdr.ue_ip,
+                bearer_mark: pdr.bearer_mark,
+            }
+            .encode();
+            if !(self.authorize_marked_owner)(tpdu.teid, selector, &binding) {
+                self.counters.binding_drops += 1;
+                return GtpuReassemblyOutcome::Dropped(GtpuReassemblyDrop::BindingMismatch(
+                    DownlinkBindingMismatch::Invalid,
+                ));
+            }
+        }
         // Mirror the fast path: the T-PDU must be an inner IPv4 packet
         // addressed to the session's UE PAA. `parse_gtpu_tpdu` already
         // guarantees at least a minimum inner header.
@@ -251,8 +442,7 @@ where
             self.counters.destination_mismatches += 1;
             return GtpuReassemblyOutcome::Dropped(GtpuReassemblyDrop::DestinationMismatch);
         }
-        let bearer_mark = u32::from_be_bytes(pdr.bearer_mark);
-        let bearer_mark = GtpBearerMark::new(bearer_mark);
+        let bearer_mark = GtpBearerMark::new(output_mark);
         self.counters.decapsulated += 1;
         GtpuReassemblyOutcome::Decapsulated {
             inner_packet: tpdu.payload.to_vec(),
@@ -285,9 +475,6 @@ mod tests {
         .unwrap()
     }
 
-    type PdrLookup = Box<dyn Fn([u8; 4]) -> Option<MarkedDownlinkPdr>>;
-    type BindingLookup = Box<dyn Fn([u8; 4]) -> Option<DownlinkEndpointBinding>>;
-
     fn pdr(mark: [u8; 4]) -> MarkedDownlinkPdr {
         MarkedDownlinkPdr {
             ue_ip: UE.octets(),
@@ -295,10 +482,25 @@ mod tests {
         }
     }
 
-    fn consumer(mark: [u8; 4]) -> GtpuReassemblyConsumer<PdrLookup, BindingLookup> {
+    type PdrLookup = Box<dyn Fn([u8; 4]) -> Option<GtpuReassemblyPdr>>;
+    type BindingLookup = Box<dyn Fn([u8; 4]) -> Option<DownlinkEndpointBinding>>;
+    type OwnerAuthorizer =
+        Box<dyn Fn([u8; 4], [u8; UPLINK_MARK_KEY_LEN], &DownlinkEndpointBinding) -> bool>;
+
+    fn consumer(
+        mark: [u8; 4],
+    ) -> GtpuReassemblyConsumer<PdrLookup, BindingLookup, OwnerAuthorizer> {
+        consumer_with_owner(mark, true)
+    }
+
+    fn consumer_with_owner(
+        mark: [u8; 4],
+        owner_authorized: bool,
+    ) -> GtpuReassemblyConsumer<PdrLookup, BindingLookup, OwnerAuthorizer> {
         GtpuReassemblyConsumer::new(
-            Box::new(move |teid| (teid == TEID).then(|| pdr(mark))),
+            Box::new(move |teid| (teid == TEID).then(|| GtpuReassemblyPdr::Configured(pdr(mark)))),
             Box::new(move |teid| (teid == TEID).then(binding)),
+            Box::new(move |_: [u8; 4], _: [u8; 8], _: &DownlinkEndpointBinding| owner_authorized),
         )
     }
 
@@ -320,7 +522,7 @@ mod tests {
     }
 
     #[test]
-    fn authorized_datagram_decapsulates_exactly_once_with_output_mark() {
+    fn authorized_marked_datagram_decapsulates_with_output_mark() {
         let mut consumer = consumer(0x0102_0304_u32.to_be_bytes());
         let outcome = consumer.process(&gpdu(TEID, &inner_packet(UE)), &provenance());
         let GtpuReassemblyOutcome::Decapsulated {
@@ -336,16 +538,51 @@ mod tests {
     }
 
     #[test]
-    fn default_bearer_decapsulates_without_mark() {
-        let mut consumer = consumer([0; 4]);
+    fn default_bearer_decapsulates_without_mark_or_owner_check() {
+        let mut consumer = consumer_with_owner([0; 4], false);
         let outcome = consumer.process(&gpdu(TEID, &inner_packet(UE)), &provenance());
-        assert!(matches!(
-            outcome,
-            GtpuReassemblyOutcome::Decapsulated {
-                bearer_mark: None,
-                ..
-            }
-        ));
+        assert!(
+            matches!(
+                outcome,
+                GtpuReassemblyOutcome::Decapsulated {
+                    bearer_mark: None,
+                    ..
+                }
+            ),
+            "a default bearer must never consult the owner journal: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn marked_bearer_without_owner_authorization_fails_closed() {
+        let mut consumer = consumer_with_owner(0x0102_0304_u32.to_be_bytes(), false);
+        assert_eq!(
+            consumer.process(&gpdu(TEID, &inner_packet(UE)), &provenance()),
+            GtpuReassemblyOutcome::Dropped(GtpuReassemblyDrop::BindingMismatch(
+                DownlinkBindingMismatch::Invalid
+            ))
+        );
+        let counters = consumer.counters();
+        assert_eq!(counters.binding_drops, 1);
+        assert_eq!(counters.decapsulated, 0);
+    }
+
+    #[test]
+    fn corrupt_pdr_state_fails_closed_like_the_tc_path() {
+        // Dual-map TEID or marked PDR with a reserved zero mark must surface
+        // as Corrupt from the lookup; the consumer drops as malformed.
+        let mut consumer = GtpuReassemblyConsumer::new(
+            Box::new(|_teid| Some(GtpuReassemblyPdr::Corrupt)) as PdrLookup,
+            Box::new(move |teid| (teid == TEID).then(binding)) as BindingLookup,
+            Box::new(|_: [u8; 4], _: [u8; 8], _: &DownlinkEndpointBinding| true) as OwnerAuthorizer,
+        );
+        assert_eq!(
+            consumer.process(&gpdu(TEID, &inner_packet(UE)), &provenance()),
+            GtpuReassemblyOutcome::Dropped(GtpuReassemblyDrop::Malformed)
+        );
+        let counters = consumer.counters();
+        assert_eq!(counters.malformed, 1);
+        assert_eq!(counters.decapsulated, 0);
     }
 
     #[test]
@@ -419,7 +656,7 @@ mod tests {
         let oversized = vec![0x30; MAX_REASSEMBLED_GTPU_LEN + 1];
         assert_eq!(
             consumer.process(&oversized, &provenance()),
-            GtpuReassemblyOutcome::Dropped(GtpuReassemblyDrop::Malformed)
+            GtpuReassemblyOutcome::Dropped(GtpuReassemblyDrop::Oversized)
         );
         assert_eq!(consumer.counters().oversized, 1);
         // The exact bounded maximum is admitted to the parser.
@@ -432,8 +669,10 @@ mod tests {
     #[test]
     fn missing_binding_fails_closed() {
         let mut consumer = GtpuReassemblyConsumer::new(
-            move |teid| (teid == TEID).then(|| pdr([0; 4])),
-            |_teid| None,
+            Box::new(move |teid| (teid == TEID).then(|| GtpuReassemblyPdr::Configured(pdr([0; 4]))))
+                as PdrLookup,
+            Box::new(|_teid| None) as BindingLookup,
+            Box::new(|_: [u8; 4], _: [u8; 8], _: &DownlinkEndpointBinding| true) as OwnerAuthorizer,
         );
         assert_eq!(
             consumer.process(&gpdu(TEID, &inner_packet(UE)), &provenance()),
@@ -451,5 +690,31 @@ mod tests {
         let debug = format!("{:?}", provenance());
         assert!(!debug.contains("192"));
         assert!(!debug.contains("2152"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recv_reassembled_gtpu_extracts_pktinfo_provenance() {
+        use std::net::UdpSocket;
+
+        let receiver = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let receiver_addr = receiver.local_addr().unwrap();
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let sender_port = sender.local_addr().unwrap().port();
+        sender.send_to(b"gtpu-probe", receiver_addr).unwrap();
+
+        receiver
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let mut buffer = [0_u8; 64];
+        // Loopback reports ifindex 0 in IP_PKTINFO (skb_iif is unset on the
+        // loopback receive path), so the managed-interface ifindex passed in
+        // is used; on real interfaces the kernel value is cross-checked.
+        let (len, provenance) = recv_reassembled_gtpu(&receiver, &mut buffer, 1).unwrap();
+        assert_eq!(&buffer[..len], b"gtpu-probe");
+        assert_eq!(provenance.peer_address(), Ipv4Addr::LOCALHOST);
+        assert_eq!(provenance.local_address(), Ipv4Addr::LOCALHOST);
+        assert_eq!(provenance.source_port(), sender_port);
+        assert_eq!(provenance.ingress_ifindex(), 1);
     }
 }
