@@ -1355,6 +1355,26 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn full_socket_backlog_probe_is_immediate_fail_closed_and_fd_bounded() {
+        const CHILD_ENV: &str = "OPC_IPSEC_LB_SOCKET_PROBE_FD_CHILD";
+        const TEST_NAME: &str =
+            "routing::bird_supervisor::tests::full_socket_backlog_probe_is_immediate_fail_closed_and_fd_bounded";
+
+        if std::env::var_os(CHILD_ENV).is_none() {
+            // The workspace runs unit tests concurrently, so a process-wide
+            // descriptor count can otherwise observe unrelated tests opening
+            // or closing descriptors. Re-run only this test in a dedicated
+            // process to make the leak assertion deterministic.
+            let status = Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg(TEST_NAME)
+                .arg("--test-threads=1")
+                .env(CHILD_ENV, "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "isolated socket-probe check failed");
+            return;
+        }
+
         use rustix::net::{
             bind, connect, listen, socket_with, AddressFamily, SocketAddrUnix, SocketFlags,
             SocketType,
@@ -1404,11 +1424,8 @@ mod tests {
             ));
         }
         let after = std::fs::read_dir("/proc/self/fd").unwrap().count();
-        // Other unit tests in this binary may close descriptors concurrently,
-        // so the process-wide count can shrink while this test is probing. A
-        // retained probe descriptor would instead make the count grow.
-        assert!(
-            after <= before,
+        assert_eq!(
+            after, before,
             "socket probes must not retain descriptors: before={before}, after={after}"
         );
 
