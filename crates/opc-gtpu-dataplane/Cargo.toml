@@ -26,6 +26,8 @@ aya = { version = "0.14" }
 aya-obj = { version = "0.3" }
 sha1 = { workspace = true }
 sha2 = { workspace = true }
+# recvmsg/IP_PKTINFO provenance extraction for the reassembly consumer.
+nix = { workspace = true, features = ["net", "socket", "uio"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

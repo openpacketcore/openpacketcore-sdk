@@ -5,7 +5,8 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::num::NonZeroU32;
 
 pub use opc_gtpu_ebpf_common::{
-    GtpuSourcePortPolicy, GtpuSourcePortRange, GtpuUplinkSourcePortPolicy,
+    GtpuDownlinkFragmentContract, GtpuOuterFragmentPolicy, GtpuReassemblyBounds,
+    GtpuSourcePortPolicy, GtpuSourcePortRange, GtpuUplinkMtuPolicy, GtpuUplinkSourcePortPolicy,
 };
 use opc_types::DscpCodepoint;
 
@@ -293,6 +294,24 @@ pub struct CreateGtpDeviceRequest {
     /// Optional PDP hash size. The default request uses
     /// [`DEFAULT_PDP_HASHSIZE`], mirroring libgtpnl examples.
     pub pdp_hashsize: Option<u32>,
+    /// Optional explicit uplink PMTU/outer-fragmentation policy for the
+    /// device's S2b-U link.
+    ///
+    /// `Some` requires the backend either to execute the selected policy or
+    /// reject it during configuration. The tc eBPF backend accepts only
+    /// `SignalPacketTooBig`: every over-MTU encapsulation is a counted drop,
+    /// typed Packet-Too-Big guidance remains available to host callers, and
+    /// neither an oversized encapsulation nor the inner packet is emitted.
+    /// Host implementations may execute `RequireOuterFragmentation` before
+    /// transmission. `None` requests no change: a fresh
+    /// device gets the pre-policy behavior (only the IPv4 total-length
+    /// `u16` limit) and a device with a persisted policy keeps it — use the
+    /// backend's explicit policy-update method to change or clear a
+    /// persisted policy. Backends whose
+    /// [`GtpuProbe::uplink_pmtu_enforcement`] is not
+    /// [`GtpuCapability::Available`] reject `Some` rather than silently
+    /// ignoring it.
+    pub uplink_mtu_policy: Option<GtpuUplinkMtuPolicy>,
 }
 
 impl CreateGtpDeviceRequest {
@@ -305,6 +324,7 @@ impl CreateGtpDeviceRequest {
             bind_address: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             bind_port: GTPU_PORT,
             pdp_hashsize: Some(DEFAULT_PDP_HASHSIZE),
+            uplink_mtu_policy: None,
         }
     }
 }
@@ -317,6 +337,7 @@ impl fmt::Debug for CreateGtpDeviceRequest {
             .field("bind_address", &"<redacted>")
             .field("bind_port", &self.bind_port)
             .field("pdp_hashsize", &self.pdp_hashsize)
+            .field("uplink_mtu_policy", &self.uplink_mtu_policy)
             .finish()
     }
 }
@@ -1066,6 +1087,24 @@ pub struct GtpuProbe {
     /// Ability to stamp a stable per-PDP-context UDP source port on uplink
     /// outer headers while the destination remains the fixed service port.
     pub uplink_source_port_selection: GtpuCapability,
+    /// Ability to enforce a typed uplink PMTU policy. The effective link MTU
+    /// is honored fail closed: over-MTU encapsulations are rejected with a
+    /// counted drop and are never emitted or leaked unencapsulated. The eBPF
+    /// backend emits no ICMP itself; typed Packet-Too-Big guidance is
+    /// available to host callers. The host-only
+    /// `RequireOuterFragmentation` policy is rejected because tc redirect
+    /// cannot execute the required fragmentation.
+    pub uplink_pmtu_enforcement: GtpuCapability,
+    /// The backend's demonstrated contract for fragmented outer downlink
+    /// packets: a bounded kernel-reassembly handoff whose reassembled
+    /// datagrams re-enter the SDK GTP-U consumer exactly once, or an
+    /// explicit unsupported statement. The handoff contract is
+    /// handoff-capable only: it is complete only while the operator runs an
+    /// SDK consumer bound on the concrete local S2b-U address (never
+    /// `0.0.0.0`); without one, reassembled sets are answered with ICMP
+    /// port unreachable and dropped. A backend must never leave this
+    /// implicit.
+    pub downlink_outer_fragment_handling: GtpuDownlinkFragmentContract,
     /// Optional human-readable detail; static so the probe stays `Copy`.
     pub details: Option<&'static str>,
 }
@@ -1086,6 +1125,8 @@ impl GtpuProbe {
             per_bearer_marking: GtpuCapability::Missing,
             downlink_endpoint_binding: GtpuCapability::Missing,
             uplink_source_port_selection: GtpuCapability::Missing,
+            uplink_pmtu_enforcement: GtpuCapability::Missing,
+            downlink_outer_fragment_handling: GtpuDownlinkFragmentContract::Unsupported,
             details: Some("dry-run/mock backend"),
         }
     }
@@ -1105,6 +1146,8 @@ impl GtpuProbe {
             per_bearer_marking: GtpuCapability::Missing,
             downlink_endpoint_binding: GtpuCapability::Missing,
             uplink_source_port_selection: GtpuCapability::Missing,
+            uplink_pmtu_enforcement: GtpuCapability::Missing,
+            downlink_outer_fragment_handling: GtpuDownlinkFragmentContract::Unsupported,
             details: Some("GTP-U dataplane operations are not supported on this platform"),
         }
     }

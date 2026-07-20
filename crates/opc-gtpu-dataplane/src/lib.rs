@@ -31,9 +31,11 @@
 pub mod backend;
 pub mod ebpf;
 pub mod error;
+pub mod icmp;
 pub mod linux;
 pub mod mock;
 pub mod model;
+pub mod reassembly;
 pub mod unsupported;
 
 pub use backend::GtpuDataplaneBackend;
@@ -42,6 +44,7 @@ pub use ebpf::{
     EbpfGtpuDataplaneBackendConfig, DEFAULT_BPFFS_PIN_ROOT, DEFAULT_TC_PRIORITY,
 };
 pub use error::GtpuError;
+pub use icmp::{build_icmpv4_packet_too_big, build_icmpv6_packet_too_big};
 pub use linux::{LinuxGtpuDataplaneBackend, LinuxGtpuDataplaneBackendConfig};
 pub use mock::{
     MockGtpuDataplaneBackend, MockOperation, MockPdpContextFault,
@@ -51,7 +54,8 @@ pub use model::{
     CreateGtpDeviceRequest, DrainedV2TeardownOutcome, DrainedV2TeardownProgress,
     DrainedV2TeardownRefusal, DrainedV2TeardownRequest, GtpAddressFamily, GtpBearerMark, GtpDevice,
     GtpPdpContext, GtpRole, GtpVersion, GtpuBackendKind, GtpuCapability, GtpuDownlinkEndpoint,
-    GtpuProbe, GtpuSourcePortPolicy, GtpuSourcePortRange, GtpuUplinkSourcePortPolicy,
+    GtpuDownlinkFragmentContract, GtpuOuterFragmentPolicy, GtpuProbe, GtpuReassemblyBounds,
+    GtpuSourcePortPolicy, GtpuSourcePortRange, GtpuUplinkMtuPolicy, GtpuUplinkSourcePortPolicy,
     GtpuV2DrainProof, PdpContextConflict, PdpContextIndeterminateReason, PdpContextInstallOutcome,
     PdpContextLocalTeidSelector, PdpContextMismatchField, PdpContextReadback,
     PdpContextReconciliationCapabilities, PdpContextRemovalOutcome, PdpContextSelector,
@@ -59,6 +63,16 @@ pub use model::{
     RemovePdpContextRequest, Teid, GTPU_PORT,
 };
 pub use opc_types::DscpCodepoint;
+#[cfg(target_os = "linux")]
+pub use reassembly::{
+    linux_reassembly_bounds, read_linux_ipv4_reassembly_stats, GtpuKernelIpv4ReassemblyStats,
+    GtpuKernelReassemblyStatsError, GtpuReassemblySocket,
+};
+pub use reassembly::{
+    reassembly_commit_authorizes_graph, DownlinkOuterProvenance, GtpuReassemblyConsumer,
+    GtpuReassemblyCounters, GtpuReassemblyDrop, GtpuReassemblyGraphIdentity, GtpuReassemblyOutcome,
+    GtpuReassemblyPdr, GtpuReassemblySelector,
+};
 pub use unsupported::UnsupportedGtpuDataplaneBackend;
 
 #[cfg(test)]

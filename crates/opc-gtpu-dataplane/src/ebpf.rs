@@ -32,11 +32,12 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use opc_gtpu_ebpf_common::{
-    DownlinkEndpointBinding, DownlinkPdr, GtpuEndpointAddress, MarkedBearerOwner,
-    MarkedBearerOwnerPhase, MarkedDownlinkPdr, PdpContextCommit, UplinkFar, UplinkFarKey,
+    DownlinkEndpointBinding, DownlinkPdr, GtpuEndpointAddress, GtpuOuterFragmentPolicy,
+    GtpuUplinkMtuPolicy, MarkedBearerOwner, MarkedBearerOwnerPhase, MarkedDownlinkPdr,
+    PdpContextCommit, UplinkFar, UplinkFarKey, UplinkMtuMapState,
     DOWNLINK_ENDPOINT_BINDING_VALUE_LEN, DOWNLINK_PDR_VALUE_LEN, MARKED_BEARER_OWNER_VALUE_LEN,
     MARKED_DOWNLINK_PDR_VALUE_LEN, UPLINK_DSCP_VALUE_LEN, UPLINK_FAR_VALUE_LEN,
-    UPLINK_MARK_KEY_LEN, UPLINK_SOURCE_PORT_VALUE_LEN,
+    UPLINK_MARK_KEY_LEN, UPLINK_PMTU_VALUE_LEN, UPLINK_SOURCE_PORT_VALUE_LEN,
 };
 
 use crate::backend::error_proves_no_requested_mutation;
@@ -45,16 +46,40 @@ use crate::{
     CreateGtpDeviceRequest, DrainedV2TeardownOutcome, DrainedV2TeardownRefusal,
     DrainedV2TeardownRequest, GtpAddressFamily, GtpBearerMark, GtpDevice, GtpPdpContext,
     GtpVersion, GtpuBackendKind, GtpuCapability, GtpuDataplaneBackend, GtpuDownlinkEndpoint,
-    GtpuError, GtpuProbe, PdpContextIndeterminateReason, PdpContextInstallOutcome,
-    PdpContextLocalTeidSelector, PdpContextReadback, PdpContextReconciliationCapabilities,
-    PdpContextRemovalOutcome, PdpContextSelector, PdpContextUplinkSelector,
-    RemovePdpContextRequest, Teid,
+    GtpuDownlinkFragmentContract, GtpuError, GtpuProbe, PdpContextIndeterminateReason,
+    PdpContextInstallOutcome, PdpContextLocalTeidSelector, PdpContextReadback,
+    PdpContextReconciliationCapabilities, PdpContextRemovalOutcome, PdpContextSelector,
+    PdpContextUplinkSelector, RemovePdpContextRequest, Teid,
 };
 
 /// Default bpffs directory under which per-interface map pins are created.
 pub const DEFAULT_BPFFS_PIN_ROOT: &str = "/sys/fs/bpf/opc-gtpu";
 /// Default tc filter priority for the datapath programs.
 pub const DEFAULT_TC_PRIORITY: u16 = 50;
+
+fn require_ebpf_executable_pmtu_policy(
+    policy: Option<GtpuUplinkMtuPolicy>,
+) -> Result<(), GtpuError> {
+    if policy.is_some_and(|policy| {
+        policy.fragmentation() == GtpuOuterFragmentPolicy::RequireOuterFragmentation
+    }) {
+        return Err(GtpuError::invalid_config(
+            "device.uplink_mtu_policy.fragmentation",
+            "tc eBPF cannot execute outer fragmentation; use SignalPacketTooBig",
+        ));
+    }
+    Ok(())
+}
+
+fn ebpf_pmtu_map_state_is_executable(state: UplinkMtuMapState) -> bool {
+    match state {
+        UplinkMtuMapState::Unset => true,
+        UplinkMtuMapState::Configured(policy) => {
+            policy.fragmentation() == GtpuOuterFragmentPolicy::SignalPacketTooBig
+        }
+        UplinkMtuMapState::Corrupt => false,
+    }
+}
 
 /// Redaction-safe aggregate of one eBPF GTP-U datapath counter map.
 ///
@@ -88,6 +113,13 @@ pub struct EbpfGtpuDatapathCounters {
     pub downlink_binding_ingress_mismatches: u64,
     /// Downlink G-PDUs dropped by the explicit UDP source-port policy.
     pub downlink_binding_source_port_mismatches: u64,
+    /// Uplink packets rejected fail closed by the effective-MTU policy
+    /// (over-MTU without outer-fragment permission).
+    pub uplink_mtu_rejected: u64,
+    /// Uplink packets dropped because the persisted MTU policy bytes were
+    /// corrupt. A canary for external writers: nonzero always means non-SDK
+    /// mutation of adopted state.
+    pub uplink_mtu_policy_corrupt: u64,
 }
 
 /// Identity-bound diagnostic snapshot for one live eBPF GTP-U datapath.
@@ -145,6 +177,12 @@ pub(crate) struct EbpfEnvironment {
     pub bpf_capable: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EbpfAttachmentDisposition {
+    Fresh,
+    Retained,
+}
+
 /// Narrow synchronous port to the kernel eBPF machinery.
 ///
 /// The production implementation loads the committed CO-RE object with `aya`,
@@ -164,7 +202,7 @@ pub(crate) trait EbpfGtpuRuntime: Send + Sync + fmt::Debug {
         pin_dir: &Path,
         tc_priority: u16,
         local_ip: [u8; 4],
-    ) -> Result<(), GtpuError>;
+    ) -> Result<EbpfAttachmentDisposition, GtpuError>;
 
     /// Adopt a previously provisioned interface: reuse the pinned maps,
     /// (re)attach the programs, and return the recorded local S2b-U IPv4.
@@ -411,6 +449,18 @@ pub(crate) trait EbpfGtpuRuntime: Send + Sync + fmt::Debug {
     /// Read counters only after proving the live hooks and exact named pins.
     fn datapath_snapshot(&self, ifindex: u32) -> Result<EbpfGtpuDatapathSnapshot, GtpuError>;
 
+    /// Read the single-slot uplink MTU policy value for a managed device.
+    fn pmtu_policy_get(&self, ifindex: u32) -> Result<[u8; UPLINK_PMTU_VALUE_LEN], GtpuError>;
+    /// Write the single-slot uplink MTU policy value for a managed device.
+    ///
+    /// The all-zero value is the explicit unset (legacy) state; only
+    /// canonical policy bytes or zeros may be written.
+    fn pmtu_policy_write(
+        &self,
+        ifindex: u32,
+        value: [u8; UPLINK_PMTU_VALUE_LEN],
+    ) -> Result<(), GtpuError>;
+
     /// Probe the environment for eBPF datapath readiness.
     fn probe_environment(&self) -> EbpfEnvironment;
 
@@ -429,6 +479,15 @@ pub(crate) trait EbpfGtpuRuntime: Send + Sync + fmt::Debug {
     /// Return whether the exact live downlink program and both endpoint-
     /// binding maps are present for the managed attachment.
     fn downlink_endpoint_binding_datapath_usable(&self, ifindex: u32) -> bool;
+
+    /// Return whether the exact live uplink program and both MTU policy maps
+    /// are present and the live policy is executable by tc.
+    fn pmtu_datapath_usable(&self, ifindex: u32) -> bool;
+
+    /// Return whether the exact live uplink program and both MTU policy maps
+    /// can accept a canonical policy repair, independent of the current slot
+    /// contents.
+    fn pmtu_datapath_writable(&self, ifindex: u32) -> bool;
 
     /// Return whether readback can trust the exact programs, every named map,
     /// and the held reconciler lease for this managed device.
@@ -530,6 +589,58 @@ impl EbpfGtpuDataplaneBackend {
         let device = device.clone();
         self.run_blocking("ebpf_datapath_snapshot", move |backend| {
             backend.datapath_snapshot_sync(device)
+        })
+        .await
+    }
+
+    /// Read back the effective uplink MTU/outer-fragmentation policy of a
+    /// managed device from its pinned policy map.
+    ///
+    /// `Ok(None)` is the explicit unset state: the datapath enforces only the
+    /// legacy IPv4 total-length limit on uplink encapsulation. The returned
+    /// policy carries the configured effective link MTU and the
+    /// inner-facing MTU (headroom accounting for the fixed encapsulation
+    /// overhead).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GtpuError::NotFound`] when `device` is not managed by this
+    /// backend. A lost policy map, a replaced hook or pin, or corrupt
+    /// persisted policy bytes return [`GtpuError::StateIndeterminate`] so the
+    /// caller reconciles from authoritative state rather than assuming a
+    /// policy.
+    pub async fn effective_uplink_mtu_policy(
+        &self,
+        device: &GtpDevice,
+    ) -> Result<Option<GtpuUplinkMtuPolicy>, GtpuError> {
+        let device = device.clone();
+        self.run_blocking("ebpf_pmtu_policy_readback", move |backend| {
+            backend.uplink_mtu_policy_sync(device)
+        })
+        .await
+    }
+
+    /// Replace the uplink MTU/outer-fragmentation policy of a managed device.
+    ///
+    /// The single-slot policy map write is atomic at the map level and takes
+    /// effect on the next uplink encapsulation. `None` restores the explicit
+    /// unset (legacy total-length-only) state; it is not a deletion. This is
+    /// the supported mutation path — out-of-band writes to the pinned map are
+    /// outside the exclusive-writer contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GtpuError::NotFound`] when `device` is not managed by this
+    /// backend and [`GtpuError::StateIndeterminate`] when the datapath's MTU
+    /// policy maps are not provably the exact held maps.
+    pub async fn set_uplink_mtu_policy(
+        &self,
+        device: &GtpDevice,
+        policy: Option<GtpuUplinkMtuPolicy>,
+    ) -> Result<(), GtpuError> {
+        let device = device.clone();
+        self.run_blocking("ebpf_pmtu_policy_update", move |backend| {
+            backend.set_uplink_mtu_policy_sync(device, policy)
         })
         .await
     }
@@ -1008,6 +1119,7 @@ impl EbpfGtpuDataplaneBackend {
     fn create_device_sync(&self, request: CreateGtpDeviceRequest) -> Result<GtpDevice, GtpuError> {
         let _operation = self.operation_guard()?;
         validate_interface_name(&request.name)?;
+        require_ebpf_executable_pmtu_policy(request.uplink_mtu_policy)?;
         let local_ip = require_ipv4(request.bind_address, "device.bind_address")?;
         if local_ip.is_unspecified() {
             return Err(GtpuError::invalid_config(
@@ -1023,13 +1135,61 @@ impl EbpfGtpuDataplaneBackend {
         if devices.contains_key(&ifindex) {
             return Err(GtpuError::AlreadyExists);
         }
-        self.inner.runtime.attach(
+        let attachment = self.inner.runtime.attach(
             &request.name,
             ifindex,
             &self.pin_dir(&request.name),
             self.inner.config.tc_priority,
             local_ip.octets(),
         )?;
+        // Publish an explicitly requested uplink MTU policy before the device
+        // becomes managed. A policy the loaded datapath cannot honor fails
+        // closed rather than being silently ignored. `None` leaves the
+        // persisted slot untouched: a fresh pin set already carries the
+        // all-zero unset state, and a retained pin set must not lose its
+        // configured policy to an unspecified request.
+        //
+        // A fresh attachment has no PDP graph, so it cannot forward before
+        // this write. A retained attachment can have an Active graph and
+        // continues forwarding under its previously committed policy until
+        // the four-byte array update linearizes; a successful write changes
+        // the slot atomically from the old policy to the new one, never to a
+        // torn policy. This ordinary old-until-new update window is the
+        // intended retained-state contract.
+        if let Some(policy) = request.uplink_mtu_policy {
+            if let Err(error) = self
+                .inner
+                .runtime
+                .pmtu_policy_write(ifindex, policy.map_value())
+            {
+                // The device is attached but not yet managed; roll the
+                // attachment back so a failed policy publication cannot
+                // strand a live datapath outside the managed-device index.
+                if attachment == EbpfAttachmentDisposition::Retained {
+                    // A BPF array value cannot be observed torn, but an error
+                    // is not used as proof of which complete value is now
+                    // authoritative. Preserve the attachment and every
+                    // retained PDP graph, report indeterminate state, and let
+                    // restart/re-adoption reconcile it. Never turn an
+                    // uncertain policy update into destructive teardown.
+                    return Err(GtpuError::StateIndeterminate {
+                        operation: "ebpf_create_device_policy_update",
+                    });
+                }
+                let rollback = self.inner.runtime.detach(
+                    &request.name,
+                    ifindex,
+                    &self.pin_dir(&request.name),
+                    self.inner.config.tc_priority,
+                );
+                return match rollback {
+                    Ok(()) => Err(error),
+                    Err(_) => Err(GtpuError::StateIndeterminate {
+                        operation: "ebpf_create_device",
+                    }),
+                };
+            }
+        }
         devices.insert(
             ifindex,
             ManagedDevice {
@@ -1144,6 +1304,70 @@ impl EbpfGtpuDataplaneBackend {
             return Err(GtpuError::NotFound);
         }
         self.inner.runtime.datapath_snapshot(device.ifindex)
+    }
+
+    fn uplink_mtu_policy_sync(
+        &self,
+        device: GtpDevice,
+    ) -> Result<Option<GtpuUplinkMtuPolicy>, GtpuError> {
+        let _operation = self.operation_guard()?;
+        validate_interface_name(&device.name)?;
+        let devices = self.devices()?;
+        if devices
+            .get(&device.ifindex)
+            .is_none_or(|managed| managed.name != device.name)
+        {
+            return Err(GtpuError::NotFound);
+        }
+        if !self.inner.runtime.pmtu_datapath_usable(device.ifindex) {
+            return Err(GtpuError::StateIndeterminate {
+                operation: "ebpf_pmtu_policy_readback",
+            });
+        }
+        let value = self.inner.runtime.pmtu_policy_get(device.ifindex)?;
+        match GtpuUplinkMtuPolicy::decode_map_value(&value) {
+            UplinkMtuMapState::Unset => Ok(None),
+            UplinkMtuMapState::Configured(policy)
+                if policy.fragmentation() == GtpuOuterFragmentPolicy::SignalPacketTooBig =>
+            {
+                Ok(Some(policy))
+            }
+            // Corrupt or host-only policy state fails closed.
+            UplinkMtuMapState::Configured(_) | UplinkMtuMapState::Corrupt => {
+                Err(GtpuError::StateIndeterminate {
+                    operation: "ebpf_pmtu_policy_readback",
+                })
+            }
+        }
+    }
+
+    fn set_uplink_mtu_policy_sync(
+        &self,
+        device: GtpDevice,
+        policy: Option<GtpuUplinkMtuPolicy>,
+    ) -> Result<(), GtpuError> {
+        let _operation = self.operation_guard()?;
+        validate_interface_name(&device.name)?;
+        require_ebpf_executable_pmtu_policy(policy)?;
+        let devices = self.devices()?;
+        if devices
+            .get(&device.ifindex)
+            .is_none_or(|managed| managed.name != device.name)
+        {
+            return Err(GtpuError::NotFound);
+        }
+        if !self.inner.runtime.pmtu_datapath_writable(device.ifindex) {
+            return Err(GtpuError::StateIndeterminate {
+                operation: "ebpf_pmtu_policy_update",
+            });
+        }
+        // The single-slot write is atomic at the map level; `None` is the
+        // explicit unset (legacy) state, not a deletion.
+        let value = match policy {
+            Some(policy) => policy.map_value(),
+            None => [0; UPLINK_PMTU_VALUE_LEN],
+        };
+        self.inner.runtime.pmtu_policy_write(device.ifindex, value)
     }
 
     fn validate_reconciliation_context_locked(
@@ -2330,6 +2554,7 @@ impl EbpfGtpuDataplaneBackend {
             source_port_datapath_usable,
             bearer_mark_datapath_usable,
             endpoint_binding_datapath_usable,
+            pmtu_datapath_usable,
         ) = self
             .devices()
             .map(|devices| {
@@ -2353,9 +2578,13 @@ impl EbpfGtpuDataplaneBackend {
                                 .runtime
                                 .downlink_endpoint_binding_datapath_usable(*ifindex)
                         }),
+                    !devices.is_empty()
+                        && devices
+                            .keys()
+                            .all(|ifindex| self.inner.runtime.pmtu_datapath_usable(*ifindex)),
                 )
             })
-            .unwrap_or((false, false, false, false, false));
+            .unwrap_or((false, false, false, false, false, false));
         let mutation_ready = env.platform_supported
             && env.bpffs_present
             && env.btf_present
@@ -2449,6 +2678,36 @@ impl EbpfGtpuDataplaneBackend {
             } else {
                 // A managed device lost or cannot access its required maps.
                 GtpuCapability::Missing
+            },
+            uplink_pmtu_enforcement: if !env.platform_supported
+                || !env.bpffs_present
+                || !env.btf_present
+            {
+                GtpuCapability::Missing
+            } else if !env.net_admin_capable || !env.bpf_capable {
+                GtpuCapability::PermissionDenied
+            } else if !has_attached_device {
+                // The environment can provide MTU enforcement, but its
+                // per-device policy map does not exist until create/adopt
+                // provisions a device.
+                GtpuCapability::Unknown
+            } else if pmtu_datapath_usable {
+                GtpuCapability::Available
+            } else {
+                // A managed device lost or cannot access its required maps.
+                GtpuCapability::Missing
+            },
+            // The tc downlink program is handoff-capable: it passes outer
+            // fragments to the kernel stack unchanged. The contract is
+            // complete only while the operator runs the SDK
+            // GtpuReassemblyConsumer on the concrete S2b-U address; bounds
+            // come from the live sysctls and are absent when unreadable.
+            downlink_outer_fragment_handling: if endpoint_binding_datapath_usable {
+                GtpuDownlinkFragmentContract::KernelReassemblyHandoff {
+                    bounds: crate::reassembly::linux_reassembly_bounds(),
+                }
+            } else {
+                GtpuDownlinkFragmentContract::Unsupported
             },
             details,
         }
@@ -2668,26 +2927,30 @@ mod aya_runtime {
     use sha2::{Digest as Sha2Digest, Sha256};
 
     use opc_gtpu_ebpf_common::{
-        default_bearer_graph_is_valid, DownlinkEndpointBinding, DownlinkPdr,
+        default_bearer_graph_is_valid, DownlinkEndpointBinding, DownlinkPdr, GtpuUplinkMtuPolicy,
         GtpuUplinkSourcePortPolicy, MarkedBearerOwner, MarkedBearerOwnerPhase, MarkedDownlinkPdr,
-        PdpContextCommit, UplinkFar, UplinkFarKey, COUNTER_DL_BINDING_FAMILY_MISMATCH,
-        COUNTER_DL_BINDING_INGRESS_MISMATCH, COUNTER_DL_BINDING_INVALID,
-        COUNTER_DL_BINDING_LOCAL_MISMATCH, COUNTER_DL_BINDING_PEER_MISMATCH,
-        COUNTER_DL_BINDING_SOURCE_PORT_MISMATCH, COUNTER_DL_DECAP, COUNTER_DL_DST_MISMATCH,
-        COUNTER_DL_MALFORMED, COUNTER_DL_UNKNOWN_TEID, COUNTER_UL_ENCAP, COUNTER_UL_FAR_MISS,
+        PdpContextCommit, UplinkFar, UplinkFarKey, UplinkMtuMapState,
+        COUNTER_DL_BINDING_FAMILY_MISMATCH, COUNTER_DL_BINDING_INGRESS_MISMATCH,
+        COUNTER_DL_BINDING_INVALID, COUNTER_DL_BINDING_LOCAL_MISMATCH,
+        COUNTER_DL_BINDING_PEER_MISMATCH, COUNTER_DL_BINDING_SOURCE_PORT_MISMATCH,
+        COUNTER_DL_DECAP, COUNTER_DL_DST_MISMATCH, COUNTER_DL_MALFORMED, COUNTER_DL_UNKNOWN_TEID,
+        COUNTER_UL_ENCAP, COUNTER_UL_FAR_MISS, COUNTER_UL_MTU_REJECT, COUNTER_UL_PMTU_CORRUPT,
         DOWNLINK_ENDPOINT_BINDING_VALUE_LEN, DOWNLINK_PDR_VALUE_LEN, MAP_CONFIG, MAP_COUNTERS,
         MAP_DOWNLINK_BINDING_COUNTERS, MAP_DOWNLINK_ENDPOINT_BINDING, MAP_DOWNLINK_MARK_PDR,
         MAP_DOWNLINK_PDR, MAP_MARKED_BEARER_OWNER, MAP_UPLINK_DSCP, MAP_UPLINK_FAR,
-        MAP_UPLINK_MARK_DSCP, MAP_UPLINK_MARK_FAR, MAP_UPLINK_MARK_SOURCE_PORT,
-        MAP_UPLINK_SOURCE_PORT, MARKED_BEARER_OWNER_VALUE_LEN, MARKED_DOWNLINK_PDR_VALUE_LEN,
-        PROG_DOWNLINK, PROG_UPLINK, UPLINK_BEARER_SCHEMA_MARKER_VALUE,
-        UPLINK_DSCP_SCHEMA_MARKER_KEY, UPLINK_DSCP_SCHEMA_MARKER_VALUE, UPLINK_DSCP_VALUE_LEN,
+        MAP_UPLINK_MARK_DSCP, MAP_UPLINK_MARK_FAR, MAP_UPLINK_MARK_SOURCE_PORT, MAP_UPLINK_PMTU,
+        MAP_UPLINK_PMTU_COUNTERS, MAP_UPLINK_SOURCE_PORT, MARKED_BEARER_OWNER_VALUE_LEN,
+        MARKED_DOWNLINK_PDR_VALUE_LEN, PROG_DOWNLINK, PROG_UPLINK,
+        UPLINK_BEARER_SCHEMA_MARKER_VALUE, UPLINK_DSCP_SCHEMA_MARKER_KEY,
+        UPLINK_DSCP_SCHEMA_MARKER_VALUE, UPLINK_DSCP_VALUE_LEN,
         UPLINK_ENDPOINT_SCHEMA_MARKER_VALUE, UPLINK_FAR_VALUE_LEN, UPLINK_MARK_KEY_LEN,
+        UPLINK_PMTU_SCHEMA_MARKER_VALUE, UPLINK_PMTU_VALUE_LEN,
         UPLINK_SOURCE_PORT_SCHEMA_MARKER_VALUE, UPLINK_SOURCE_PORT_VALUE_LEN,
     };
 
     use super::{
-        EbpfEnvironment, EbpfGtpuDatapathCounters, EbpfGtpuDatapathSnapshot, EbpfGtpuRuntime,
+        ebpf_pmtu_map_state_is_executable, EbpfAttachmentDisposition, EbpfEnvironment,
+        EbpfGtpuDatapathCounters, EbpfGtpuDatapathSnapshot, EbpfGtpuRuntime,
     };
     use crate::{
         DrainedV2TeardownOutcome, DrainedV2TeardownProgress, DrainedV2TeardownRefusal, GtpuError,
@@ -2923,6 +3186,8 @@ mod aya_runtime {
         uplink_mark_dscp: u32,
         uplink_source_port: u32,
         uplink_mark_source_port: u32,
+        uplink_pmtu: u32,
+        uplink_pmtu_counters: u32,
         downlink_pdr: u32,
         downlink_mark_pdr: u32,
         downlink_binding: u32,
@@ -3309,6 +3574,8 @@ mod aya_runtime {
         EndpointV3,
         /// The additive uplink source-port maps were committed.
         SourcePortV4,
+        /// The additive uplink MTU policy maps were committed.
+        PmtuV5,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3392,6 +3659,8 @@ mod aya_runtime {
                 MAP_UPLINK_MARK_DSCP,
                 MAP_UPLINK_SOURCE_PORT,
                 MAP_UPLINK_MARK_SOURCE_PORT,
+                MAP_UPLINK_PMTU,
+                MAP_UPLINK_PMTU_COUNTERS,
                 MAP_DOWNLINK_PDR,
                 MAP_DOWNLINK_MARK_PDR,
                 MAP_DOWNLINK_ENDPOINT_BINDING,
@@ -3725,6 +3994,8 @@ mod aya_runtime {
                     MAP_UPLINK_MARK_DSCP,
                     MAP_UPLINK_SOURCE_PORT,
                     MAP_UPLINK_MARK_SOURCE_PORT,
+                    MAP_UPLINK_PMTU,
+                    MAP_UPLINK_PMTU_COUNTERS,
                     MAP_DOWNLINK_PDR,
                     MAP_DOWNLINK_MARK_PDR,
                     MAP_DOWNLINK_ENDPOINT_BINDING,
@@ -3767,6 +4038,7 @@ mod aya_runtime {
                 Ok(value) if value == UPLINK_SOURCE_PORT_SCHEMA_MARKER_VALUE => {
                     BearerSchemaState::SourcePortV4
                 }
+                Ok(value) if value == UPLINK_PMTU_SCHEMA_MARKER_VALUE => BearerSchemaState::PmtuV5,
                 Ok(_) => {
                     return Err(GtpuError::io(
                         "ebpf_bearer_schema",
@@ -3832,6 +4104,22 @@ mod aya_runtime {
                     MAP_DOWNLINK_BINDING_COUNTERS,
                     MAP_CONFIG,
                 ],
+                BearerSchemaState::PmtuV5 => &[
+                    MAP_UPLINK_DSCP,
+                    MAP_UPLINK_MARK_FAR,
+                    MAP_UPLINK_MARK_DSCP,
+                    MAP_UPLINK_SOURCE_PORT,
+                    MAP_UPLINK_MARK_SOURCE_PORT,
+                    MAP_UPLINK_PMTU,
+                    MAP_UPLINK_PMTU_COUNTERS,
+                    MAP_DOWNLINK_PDR,
+                    MAP_DOWNLINK_MARK_PDR,
+                    MAP_DOWNLINK_ENDPOINT_BINDING,
+                    MAP_MARKED_BEARER_OWNER,
+                    MAP_COUNTERS,
+                    MAP_DOWNLINK_BINDING_COUNTERS,
+                    MAP_CONFIG,
+                ],
             };
             for required_pin in required_pins {
                 if !pin_dir
@@ -3862,7 +4150,7 @@ mod aya_runtime {
                 .map_err(|error| map_error("ebpf_bearer_schema", error))?;
             far.insert(
                 UPLINK_DSCP_SCHEMA_MARKER_KEY,
-                UPLINK_SOURCE_PORT_SCHEMA_MARKER_VALUE,
+                UPLINK_PMTU_SCHEMA_MARKER_VALUE,
                 0,
             )
             .map_err(|error| map_error("ebpf_bearer_schema", error))
@@ -4704,6 +4992,8 @@ mod aya_runtime {
                         MAP_UPLINK_MARK_DSCP,
                         MAP_UPLINK_SOURCE_PORT,
                         MAP_UPLINK_MARK_SOURCE_PORT,
+                        MAP_UPLINK_PMTU,
+                        MAP_UPLINK_PMTU_COUNTERS,
                         MAP_DOWNLINK_PDR,
                         MAP_DOWNLINK_MARK_PDR,
                         MAP_DOWNLINK_ENDPOINT_BINDING,
@@ -4866,6 +5156,8 @@ mod aya_runtime {
                 uplink_mark_dscp: id(MAP_UPLINK_MARK_DSCP)?,
                 uplink_source_port: id(MAP_UPLINK_SOURCE_PORT)?,
                 uplink_mark_source_port: id(MAP_UPLINK_MARK_SOURCE_PORT)?,
+                uplink_pmtu: id(MAP_UPLINK_PMTU)?,
+                uplink_pmtu_counters: id(MAP_UPLINK_PMTU_COUNTERS)?,
                 downlink_pdr: id(MAP_DOWNLINK_PDR)?,
                 downlink_mark_pdr: id(MAP_DOWNLINK_MARK_PDR)?,
                 downlink_binding: id(MAP_DOWNLINK_ENDPOINT_BINDING)?,
@@ -4914,6 +5206,14 @@ mod aya_runtime {
                 ebpf.map(MAP_UPLINK_MARK_SOURCE_PORT).ok_or_else(missing)?,
             )
             .map_err(|error| map_error("ebpf_map_identity", error))?;
+            let uplink_pmtu = Array::<_, [u8; UPLINK_PMTU_VALUE_LEN]>::try_from(
+                ebpf.map(MAP_UPLINK_PMTU).ok_or_else(missing)?,
+            )
+            .map_err(|error| map_error("ebpf_map_identity", error))?;
+            let uplink_pmtu_counters = PerCpuArray::<_, u64>::try_from(
+                ebpf.map(MAP_UPLINK_PMTU_COUNTERS).ok_or_else(missing)?,
+            )
+            .map_err(|error| map_error("ebpf_map_identity", error))?;
             let downlink_pdr = BpfHashMap::<_, [u8; 4], [u8; DOWNLINK_PDR_VALUE_LEN]>::try_from(
                 ebpf.map(MAP_DOWNLINK_PDR).ok_or_else(missing)?,
             )
@@ -4954,6 +5254,8 @@ mod aya_runtime {
                 uplink_mark_dscp: info_id(uplink_mark_dscp.map())?,
                 uplink_source_port: info_id(uplink_source_port.map())?,
                 uplink_mark_source_port: info_id(uplink_mark_source_port.map())?,
+                uplink_pmtu: info_id(uplink_pmtu.map())?,
+                uplink_pmtu_counters: info_id(uplink_pmtu_counters.map())?,
                 downlink_pdr: info_id(downlink_pdr.map())?,
                 downlink_mark_pdr: info_id(downlink_mark_pdr.map())?,
                 downlink_binding: info_id(downlink_binding.map())?,
@@ -5254,6 +5556,28 @@ mod aya_runtime {
             array
                 .set(0, local_ip, 0)
                 .map_err(|error| map_error("ebpf_config_write", error))
+        }
+
+        fn pmtu_policy_slot(&self, ebpf: &Ebpf) -> Result<[u8; UPLINK_PMTU_VALUE_LEN], GtpuError> {
+            let map = ebpf
+                .map(MAP_UPLINK_PMTU)
+                .ok_or_else(|| GtpuError::io("ebpf_pmtu_map", invalid_data("map missing")))?;
+            let array = Array::<_, [u8; UPLINK_PMTU_VALUE_LEN]>::try_from(map)
+                .map_err(|error| map_error("ebpf_pmtu_map", error))?;
+            array
+                .get(&0, 0)
+                .map_err(|error| map_error("ebpf_pmtu_policy_read", error))
+        }
+
+        /// Fail closed when retained pins are corrupt or request host-side
+        /// fragmentation that tc cannot execute.
+        fn require_canonical_pmtu_slot(&self, ebpf: &Ebpf) -> Result<(), GtpuError> {
+            if !ebpf_pmtu_map_state_is_executable(GtpuUplinkMtuPolicy::decode_map_value(
+                &self.pmtu_policy_slot(ebpf)?,
+            )) {
+                return Err(state_indeterminate("ebpf_pmtu_policy_adopt"));
+            }
+            Ok(())
         }
     }
 
@@ -6071,7 +6395,7 @@ mod aya_runtime {
             pin_dir: &Path,
             tc_priority: u16,
             local_ip: [u8; 4],
-        ) -> Result<(), GtpuError> {
+        ) -> Result<EbpfAttachmentDisposition, GtpuError> {
             let pins_preexisted = pin_dir.is_dir();
             let canonical_pin_dir = Self::canonical_pin_dir(pin_dir)?;
             let reconciler_ownership =
@@ -6112,7 +6436,11 @@ mod aya_runtime {
                     // address is an ownership conflict.
                     return Err(GtpuError::AlreadyExists);
                 }
-                let indexes = if schema_state == BearerSchemaState::SourcePortV4 {
+                self.require_canonical_pmtu_slot(&ebpf)?;
+                let indexes = if matches!(
+                    schema_state,
+                    BearerSchemaState::SourcePortV4 | BearerSchemaState::PmtuV5
+                ) {
                     Self::recover_incomplete_pdp_commits(&mut ebpf, local_ip, ifindex)?;
                     Self::pdp_host_indexes(&ebpf, local_ip, ifindex, true)?
                 } else {
@@ -6129,7 +6457,7 @@ mod aya_runtime {
                     tc_priority,
                     schema_state,
                 )?;
-                if schema_state != BearerSchemaState::SourcePortV4 {
+                if schema_state != BearerSchemaState::PmtuV5 {
                     if let Err(error) = Self::write_bearer_schema_marker(&mut ebpf) {
                         if attached.replaced_existing {
                             // Both exact current hooks remain live. Retaining them
@@ -6213,7 +6541,11 @@ mod aya_runtime {
                     _reconciler_ownership: reconciler_ownership,
                 },
             );
-            Ok(())
+            Ok(if pins_preexisted {
+                EbpfAttachmentDisposition::Retained
+            } else {
+                EbpfAttachmentDisposition::Fresh
+            })
         }
 
         fn adopt(
@@ -6257,7 +6589,11 @@ mod aya_runtime {
                     Err(error) => Err(error),
                 };
             }
-            let indexes = if schema_state == BearerSchemaState::SourcePortV4 {
+            self.require_canonical_pmtu_slot(&ebpf)?;
+            let indexes = if matches!(
+                schema_state,
+                BearerSchemaState::SourcePortV4 | BearerSchemaState::PmtuV5
+            ) {
                 Self::recover_incomplete_pdp_commits(&mut ebpf, local_ip, ifindex)?;
                 Self::pdp_host_indexes(&ebpf, local_ip, ifindex, true)?
             } else {
@@ -6274,7 +6610,7 @@ mod aya_runtime {
                 tc_priority,
                 schema_state,
             )?;
-            if schema_state != BearerSchemaState::SourcePortV4 {
+            if schema_state != BearerSchemaState::PmtuV5 {
                 if let Err(error) = Self::write_bearer_schema_marker(&mut ebpf) {
                     if attached.replaced_existing {
                         return Err(state_indeterminate("ebpf_schema_marker_commit"));
@@ -7329,6 +7665,51 @@ mod aya_runtime {
             })
         }
 
+        fn pmtu_policy_get(&self, ifindex: u32) -> Result<[u8; UPLINK_PMTU_VALUE_LEN], GtpuError> {
+            self.with_device(ifindex, "ebpf_pmtu_policy_get", |device| {
+                let map = device
+                    .ebpf
+                    .map(MAP_UPLINK_PMTU)
+                    .ok_or_else(|| GtpuError::io("ebpf_pmtu_map", invalid_data("map missing")))?;
+                let array = Array::<_, [u8; UPLINK_PMTU_VALUE_LEN]>::try_from(map)
+                    .map_err(|error| map_error("ebpf_pmtu_map", error))?;
+                array
+                    .get(&0, 0)
+                    .map_err(|error| map_error("ebpf_pmtu_policy_get", error))
+            })
+        }
+
+        fn pmtu_policy_write(
+            &self,
+            ifindex: u32,
+            value: [u8; UPLINK_PMTU_VALUE_LEN],
+        ) -> Result<(), GtpuError> {
+            self.with_device(ifindex, "ebpf_pmtu_policy_write", |device| {
+                if matches!(
+                    GtpuUplinkMtuPolicy::decode_map_value(&value),
+                    UplinkMtuMapState::Corrupt
+                ) {
+                    // Only canonical policy bytes (or the all-zero unset
+                    // state) may cross the userspace map boundary; a corrupt
+                    // caller-supplied value is an invalid argument, not an
+                    // indeterminate datapath state.
+                    return Err(GtpuError::invalid_config(
+                        "device.uplink_mtu_policy",
+                        "non-canonical MTU policy bytes",
+                    ));
+                }
+                let map = device
+                    .ebpf
+                    .map_mut(MAP_UPLINK_PMTU)
+                    .ok_or_else(|| GtpuError::io("ebpf_pmtu_map", invalid_data("map missing")))?;
+                let mut array = Array::<_, [u8; UPLINK_PMTU_VALUE_LEN]>::try_from(map)
+                    .map_err(|error| map_error("ebpf_pmtu_map", error))?;
+                array
+                    .set(0, value, 0)
+                    .map_err(|error| map_error("ebpf_pmtu_policy_write", error))
+            })
+        }
+
         fn pdr_get(
             &self,
             ifindex: u32,
@@ -7747,6 +8128,22 @@ mod aya_runtime {
                     .map_err(|error| map_error("ebpf_datapath_binding_counters", error))?;
                 Ok(values.iter().copied().fold(0_u64, u64::saturating_add))
             };
+            let pmtu_map = device
+                .ebpf
+                .map(MAP_UPLINK_PMTU_COUNTERS)
+                .ok_or_else(indeterminate)?;
+            let pmtu_counters = PerCpuArray::<_, u64>::try_from(pmtu_map).map_err(|_| {
+                GtpuError::io(
+                    "ebpf_datapath_pmtu_counters",
+                    invalid_data("MTU-drop counter map has an unexpected shape"),
+                )
+            })?;
+            let aggregate_pmtu = |index: u32| -> Result<u64, GtpuError> {
+                let values = pmtu_counters
+                    .get(&index, 0)
+                    .map_err(|error| map_error("ebpf_datapath_pmtu_counters", error))?;
+                Ok(values.iter().copied().fold(0_u64, u64::saturating_add))
+            };
             let snapshot = EbpfGtpuDatapathSnapshot {
                 uplink_program_id: device.datapath_identity.uplink.program_id,
                 downlink_program_id: device.datapath_identity.downlink.program_id,
@@ -7778,6 +8175,8 @@ mod aya_runtime {
                     downlink_binding_source_port_mismatches: aggregate_binding(
                         COUNTER_DL_BINDING_SOURCE_PORT_MISMATCH,
                     )?,
+                    uplink_mtu_rejected: aggregate_pmtu(COUNTER_UL_MTU_REJECT)?,
+                    uplink_mtu_policy_corrupt: aggregate_pmtu(COUNTER_UL_PMTU_CORRUPT)?,
                 },
             };
             // Repeat the complete proof after the reads so any hook or pin
@@ -7811,6 +8210,29 @@ mod aya_runtime {
         }
 
         fn source_port_datapath_usable(&self, ifindex: u32) -> bool {
+            let Ok(devices) = self.devices.lock() else {
+                return false;
+            };
+            devices
+                .get(&ifindex)
+                .is_some_and(|device| Self::loaded_datapath_is_current(ifindex, device))
+        }
+
+        fn pmtu_datapath_usable(&self, ifindex: u32) -> bool {
+            let Ok(devices) = self.devices.lock() else {
+                return false;
+            };
+            devices.get(&ifindex).is_some_and(|device| {
+                Self::loaded_datapath_is_current(ifindex, device)
+                    && self.pmtu_policy_slot(&device.ebpf).is_ok_and(|value| {
+                        ebpf_pmtu_map_state_is_executable(GtpuUplinkMtuPolicy::decode_map_value(
+                            &value,
+                        ))
+                    })
+            })
+        }
+
+        fn pmtu_datapath_writable(&self, ifindex: u32) -> bool {
             let Ok(devices) = self.devices.lock() else {
                 return false;
             };
@@ -8520,6 +8942,8 @@ mod aya_runtime {
                 uplink_mark_dscp: 4,
                 uplink_source_port: 12,
                 uplink_mark_source_port: 13,
+                uplink_pmtu: 14,
+                uplink_pmtu_counters: 15,
                 downlink_pdr: 5,
                 downlink_mark_pdr: 6,
                 downlink_binding: 7,
@@ -9071,6 +9495,7 @@ mod tests {
         marked_dscp: HashMap<(u32, [u8; UPLINK_MARK_KEY_LEN]), [u8; UPLINK_DSCP_VALUE_LEN]>,
         sport: HashMap<(u32, [u8; 4]), [u8; UPLINK_SOURCE_PORT_VALUE_LEN]>,
         marked_sport: HashMap<(u32, [u8; UPLINK_MARK_KEY_LEN]), [u8; UPLINK_SOURCE_PORT_VALUE_LEN]>,
+        pmtu_policy: HashMap<u32, [u8; UPLINK_PMTU_VALUE_LEN]>,
         pdr: HashMap<(u32, [u8; 4]), [u8; DOWNLINK_PDR_VALUE_LEN]>,
         marked_pdr: HashMap<(u32, [u8; 4]), [u8; MARKED_DOWNLINK_PDR_VALUE_LEN]>,
         downlink_binding: HashMap<(u32, [u8; 4]), [u8; DOWNLINK_ENDPOINT_BINDING_VALUE_LEN]>,
@@ -9084,6 +9509,8 @@ mod tests {
         marked_dscp_map_ready: HashSet<u32>,
         sport_map_ready: HashSet<u32>,
         marked_sport_map_ready: HashSet<u32>,
+        pmtu_map_ready: HashSet<u32>,
+        pmtu_counters_map_ready: HashSet<u32>,
         marked_pdr_map_ready: HashSet<u32>,
         marked_owner_map_ready: HashSet<u32>,
         downlink_binding_map_ready: HashSet<u32>,
@@ -9128,6 +9555,7 @@ mod tests {
         BearerV2,
         EndpointV3,
         SourcePortV4,
+        PmtuV5,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -9264,6 +9692,30 @@ mod tests {
                             io::Error::new(
                                 io::ErrorKind::NotFound,
                                 "adopted source-port map pin is missing",
+                            ),
+                        ))
+                    }
+                }
+                Some(FakeSchema::PmtuV5) => {
+                    if state.dscp_map_ready.contains(&ifindex)
+                        && state.marked_far_map_ready.contains(&ifindex)
+                        && state.marked_dscp_map_ready.contains(&ifindex)
+                        && state.sport_map_ready.contains(&ifindex)
+                        && state.marked_sport_map_ready.contains(&ifindex)
+                        && state.pmtu_map_ready.contains(&ifindex)
+                        && state.pmtu_counters_map_ready.contains(&ifindex)
+                        && state.marked_pdr_map_ready.contains(&ifindex)
+                        && state.marked_owner_map_ready.contains(&ifindex)
+                        && state.downlink_binding_map_ready.contains(&ifindex)
+                        && state.downlink_binding_counters_map_ready.contains(&ifindex)
+                    {
+                        Ok(())
+                    } else {
+                        Err(GtpuError::io(
+                            "ebpf_bearer_schema",
+                            io::Error::new(
+                                io::ErrorKind::NotFound,
+                                "adopted MTU policy map pin is missing",
                             ),
                         ))
                     }
@@ -9837,15 +10289,24 @@ mod tests {
             pin_dir: &Path,
             tc_priority: u16,
             local_ip: [u8; 4],
-        ) -> Result<(), GtpuError> {
+        ) -> Result<EbpfAttachmentDisposition, GtpuError> {
             let mut state = self.state();
             state.operations.push("attach");
             if state.attached.contains_key(&ifindex) {
                 return Err(GtpuError::AlreadyExists);
             }
+            let disposition = if state.schema.contains_key(pin_dir)
+                || state.pinned_config.contains_key(pin_dir)
+            {
+                EbpfAttachmentDisposition::Retained
+            } else {
+                EbpfAttachmentDisposition::Fresh
+            };
             Self::validate_schema(&state, pin_dir, ifindex)?;
-            let source_port_committed =
-                state.schema.get(pin_dir) == Some(&FakeSchema::SourcePortV4);
+            let source_port_committed = matches!(
+                state.schema.get(pin_dir),
+                Some(&FakeSchema::SourcePortV4 | &FakeSchema::PmtuV5)
+            );
             if source_port_committed {
                 Self::recover_incomplete_pdp_commits(&mut state, ifindex, local_ip)?;
                 Self::rebuild_owner_index(&mut state, ifindex, local_ip, true)?;
@@ -9854,6 +10315,13 @@ mod tests {
                 Self::materialize_legacy_source_port_policies(&mut state, ifindex)?;
                 Self::recover_incomplete_pdp_commits(&mut state, ifindex, local_ip)?;
                 Self::rebuild_owner_index(&mut state, ifindex, local_ip, true)?;
+            }
+            if state.pmtu_policy.get(&ifindex).is_some_and(|value| {
+                !ebpf_pmtu_map_state_is_executable(GtpuUplinkMtuPolicy::decode_map_value(value))
+            }) {
+                return Err(GtpuError::StateIndeterminate {
+                    operation: "ebpf_pmtu_policy_adopt",
+                });
             }
             state.pinned_config.insert(pin_dir.to_path_buf(), local_ip);
             state.attached.insert(
@@ -9873,12 +10341,20 @@ mod tests {
             state.marked_owner_map_ready.insert(ifindex);
             state.downlink_binding_map_ready.insert(ifindex);
             state.downlink_binding_counters_map_ready.insert(ifindex);
+            state.pmtu_map_ready.insert(ifindex);
+            state.pmtu_counters_map_ready.insert(ifindex);
             state.uplink_filter_ready.insert(ifindex);
             state.downlink_filter_ready.insert(ifindex);
+            // The additive MTU policy slot persists across restarts; only a
+            // fresh provisioning initializes the explicit unset state.
+            state
+                .pmtu_policy
+                .entry(ifindex)
+                .or_insert([0; UPLINK_PMTU_VALUE_LEN]);
             state
                 .schema
-                .insert(pin_dir.to_path_buf(), FakeSchema::SourcePortV4);
-            Ok(())
+                .insert(pin_dir.to_path_buf(), FakeSchema::PmtuV5);
+            Ok(disposition)
         }
 
         fn adopt(
@@ -9898,8 +10374,10 @@ mod tests {
                 .pinned_config
                 .get(pin_dir)
                 .ok_or(GtpuError::NotFound)?;
-            let source_port_committed =
-                state.schema.get(pin_dir) == Some(&FakeSchema::SourcePortV4);
+            let source_port_committed = matches!(
+                state.schema.get(pin_dir),
+                Some(&FakeSchema::SourcePortV4 | &FakeSchema::PmtuV5)
+            );
             if source_port_committed {
                 Self::recover_incomplete_pdp_commits(&mut state, ifindex, local_ip)?;
                 Self::rebuild_owner_index(&mut state, ifindex, local_ip, true)?;
@@ -9908,6 +10386,13 @@ mod tests {
                 Self::materialize_legacy_source_port_policies(&mut state, ifindex)?;
                 Self::recover_incomplete_pdp_commits(&mut state, ifindex, local_ip)?;
                 Self::rebuild_owner_index(&mut state, ifindex, local_ip, true)?;
+            }
+            if state.pmtu_policy.get(&ifindex).is_some_and(|value| {
+                !ebpf_pmtu_map_state_is_executable(GtpuUplinkMtuPolicy::decode_map_value(value))
+            }) {
+                return Err(GtpuError::StateIndeterminate {
+                    operation: "ebpf_pmtu_policy_adopt",
+                });
             }
             state.attached.insert(
                 ifindex,
@@ -9928,11 +10413,17 @@ mod tests {
             state.marked_owner_map_ready.insert(ifindex);
             state.downlink_binding_map_ready.insert(ifindex);
             state.downlink_binding_counters_map_ready.insert(ifindex);
+            state.pmtu_map_ready.insert(ifindex);
+            state.pmtu_counters_map_ready.insert(ifindex);
             state.uplink_filter_ready.insert(ifindex);
             state.downlink_filter_ready.insert(ifindex);
             state
+                .pmtu_policy
+                .entry(ifindex)
+                .or_insert([0; UPLINK_PMTU_VALUE_LEN]);
+            state
                 .schema
-                .insert(pin_dir.to_path_buf(), FakeSchema::SourcePortV4);
+                .insert(pin_dir.to_path_buf(), FakeSchema::PmtuV5);
             Ok(local_ip)
         }
 
@@ -9955,6 +10446,8 @@ mod tests {
             state.marked_owner_map_ready.remove(&ifindex);
             state.downlink_binding_map_ready.remove(&ifindex);
             state.downlink_binding_counters_map_ready.remove(&ifindex);
+            state.pmtu_map_ready.remove(&ifindex);
+            state.pmtu_counters_map_ready.remove(&ifindex);
             state.uplink_filter_ready.remove(&ifindex);
             state.downlink_filter_ready.remove(&ifindex);
             state.uplink_filter_foreign.remove(&ifindex);
@@ -9973,6 +10466,7 @@ mod tests {
             state.marked_dscp.retain(|(index, _), _| *index != ifindex);
             state.sport.retain(|(index, _), _| *index != ifindex);
             state.marked_sport.retain(|(index, _), _| *index != ifindex);
+            state.pmtu_policy.remove(&ifindex);
             state.pdr.retain(|(index, _), _| *index != ifindex);
             state.marked_pdr.retain(|(index, _), _| *index != ifindex);
             state
@@ -10963,6 +11457,8 @@ mod tests {
                 && state.marked_dscp_map_ready.contains(&ifindex)
                 && state.sport_map_ready.contains(&ifindex)
                 && state.marked_sport_map_ready.contains(&ifindex)
+                && state.pmtu_map_ready.contains(&ifindex)
+                && state.pmtu_counters_map_ready.contains(&ifindex)
                 && state.marked_pdr_map_ready.contains(&ifindex)
                 && state.marked_owner_map_ready.contains(&ifindex)
                 && state.downlink_binding_map_ready.contains(&ifindex)
@@ -10979,6 +11475,44 @@ mod tests {
             }
             state.operations.push("datapath_snapshot");
             Ok(state.datapath_snapshot)
+        }
+
+        fn pmtu_policy_get(&self, ifindex: u32) -> Result<[u8; UPLINK_PMTU_VALUE_LEN], GtpuError> {
+            let state = self.state();
+            if !state.pmtu_map_ready.contains(&ifindex) {
+                return Err(GtpuError::io(
+                    "ebpf_pmtu_map",
+                    io::Error::new(io::ErrorKind::NotFound, "MTU policy map unavailable"),
+                ));
+            }
+            Ok(state.pmtu_policy.get(&ifindex).copied().unwrap_or([0; 4]))
+        }
+
+        fn pmtu_policy_write(
+            &self,
+            ifindex: u32,
+            value: [u8; UPLINK_PMTU_VALUE_LEN],
+        ) -> Result<(), GtpuError> {
+            let mut state = self.state();
+            if !state.pmtu_map_ready.contains(&ifindex) {
+                return Err(GtpuError::io(
+                    "ebpf_pmtu_map",
+                    io::Error::new(io::ErrorKind::NotFound, "MTU policy map unavailable"),
+                ));
+            }
+            if matches!(
+                GtpuUplinkMtuPolicy::decode_map_value(&value),
+                UplinkMtuMapState::Corrupt
+            ) {
+                return Err(GtpuError::invalid_config(
+                    "device.uplink_mtu_policy",
+                    "non-canonical MTU policy bytes",
+                ));
+            }
+            state.operations.push("pmtu_policy_write");
+            Self::fail_if_requested(&mut state, "pmtu_policy_write")?;
+            state.pmtu_policy.insert(ifindex, value);
+            Ok(())
         }
 
         fn probe_environment(&self) -> EbpfEnvironment {
@@ -10998,6 +11532,27 @@ mod tests {
                 && state.sport_map_ready.contains(&ifindex)
                 && state.marked_sport_map_ready.contains(&ifindex)
                 && state.uplink_filter_ready.contains(&ifindex)
+        }
+
+        fn pmtu_datapath_usable(&self, ifindex: u32) -> bool {
+            let state = self.state();
+            state.attached.contains_key(&ifindex)
+                && state.pmtu_map_ready.contains(&ifindex)
+                && state.pmtu_counters_map_ready.contains(&ifindex)
+                && state.uplink_filter_ready.contains(&ifindex)
+                && state.pmtu_policy.get(&ifindex).is_some_and(|value| {
+                    ebpf_pmtu_map_state_is_executable(GtpuUplinkMtuPolicy::decode_map_value(value))
+                })
+        }
+
+        fn pmtu_datapath_writable(&self, ifindex: u32) -> bool {
+            let state = self.state();
+            state.attached.contains_key(&ifindex)
+                && state.pmtu_map_ready.contains(&ifindex)
+                && state.pmtu_counters_map_ready.contains(&ifindex)
+                && state.uplink_filter_ready.contains(&ifindex)
+                && !state.pin_identity_invalid.contains(&ifindex)
+                && !state.uplink_filter_foreign.contains(&ifindex)
         }
 
         fn bearer_mark_datapath_usable(&self, ifindex: u32) -> bool {
@@ -11189,10 +11744,12 @@ mod tests {
             state
                 .schema
                 .get(&PathBuf::from(DEFAULT_BPFFS_PIN_ROOT).join("s2bu")),
-            Some(&FakeSchema::SourcePortV4)
+            Some(&FakeSchema::PmtuV5)
         );
         assert!(state.sport_map_ready.contains(&S2BU_IFINDEX));
         assert!(state.marked_sport_map_ready.contains(&S2BU_IFINDEX));
+        assert!(state.pmtu_map_ready.contains(&S2BU_IFINDEX));
+        assert!(state.pmtu_counters_map_ready.contains(&S2BU_IFINDEX));
     }
 
     #[tokio::test]
@@ -11781,6 +12338,8 @@ mod tests {
                 downlink_binding_local_mismatches: 20,
                 downlink_binding_ingress_mismatches: 21,
                 downlink_binding_source_port_mismatches: 22,
+                uplink_mtu_rejected: 23,
+                uplink_mtu_policy_corrupt: 24,
             },
         };
         runtime.state().datapath_snapshot = expected;
@@ -12596,7 +13155,7 @@ mod tests {
         restarted.install_pdp_context(marked).await.unwrap();
         let state = runtime.state();
         let pin_dir = PathBuf::from(DEFAULT_BPFFS_PIN_ROOT).join("s2bu");
-        assert_eq!(state.schema.get(&pin_dir), Some(&FakeSchema::SourcePortV4));
+        assert_eq!(state.schema.get(&pin_dir), Some(&FakeSchema::PmtuV5));
     }
 
     #[tokio::test]
@@ -12895,7 +13454,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn adopted_v4_required_map_loss_is_not_silently_recreated_on_restart() {
+    async fn adopted_v5_required_map_loss_is_not_silently_recreated_on_restart() {
         let (backend, runtime) = backend_with_fake();
         backend.create_device(create_request()).await.unwrap();
         {
@@ -12906,7 +13465,7 @@ mod tests {
                 state
                     .schema
                     .get(&PathBuf::from(DEFAULT_BPFFS_PIN_ROOT).join("s2bu")),
-                Some(&FakeSchema::SourcePortV4)
+                Some(&FakeSchema::PmtuV5)
             );
         }
 
@@ -14920,7 +15479,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn committed_v3_adopts_to_source_port_v4_and_v4_map_loss_fails_closed() {
+    async fn committed_v3_adopts_directly_to_pmtu_v5() {
         let (backend, runtime) = backend_with_fake();
         backend.create_device(create_request()).await.unwrap();
         let default = context();
@@ -14929,10 +15488,11 @@ mod tests {
         backend.install_pdp_context(marked.clone()).await.unwrap();
         let pin_dir = PathBuf::from(DEFAULT_BPFFS_PIN_ROOT).join("s2bu");
         {
-            // A committed v3 pin set has no source-port maps yet; the additive
-            // migration must create them, materialize a complete Active commit
-            // with explicit legacy policy for every retained graph, and only
-            // then commit v4.
+            // A committed v3 pin set has neither source-port nor MTU policy
+            // maps; the additive migrations must create the source-port maps,
+            // materialize a complete Active commit with explicit legacy
+            // policy for every retained graph, create the MTU policy maps,
+            // and only then commit v5.
             let mut state = runtime.state();
             state.attached.clear();
             state.schema.insert(pin_dir.clone(), FakeSchema::EndpointV3);
@@ -14942,6 +15502,8 @@ mod tests {
             state.marked_sport_map_ready.clear();
             state.default_teid_by_ue.clear();
             state.marked_owner_by_teid.clear();
+            state.pmtu_map_ready.clear();
+            state.pmtu_counters_map_ready.clear();
         }
         runtime.fail_in_order(["source_port_schema_marked_insert"]);
         let restarted = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
@@ -14966,16 +15528,12 @@ mod tests {
         // and only then publishes the v4 attachment and marker.
         restarted.resolve_device("s2bu").await.unwrap();
         assert_eq!(
-            restarted
-                .probe()
-                .await
-                .unwrap()
-                .uplink_source_port_selection,
+            restarted.probe().await.unwrap().uplink_pmtu_enforcement,
             GtpuCapability::Available
         );
         assert_eq!(
             runtime.state().schema.get(&pin_dir),
-            Some(&FakeSchema::SourcePortV4)
+            Some(&FakeSchema::PmtuV5)
         );
         {
             let state = runtime.state();
@@ -15005,12 +15563,12 @@ mod tests {
             );
         }
 
-        // A committed v4 pin set that loses either source-port map must not
-        // be silently recreated on the next restart.
+        // A committed v5 pin set that loses an MTU policy map must not be
+        // silently recreated on the next restart.
         {
             let mut state = runtime.state();
             state.attached.clear();
-            state.sport_map_ready.clear();
+            state.pmtu_map_ready.clear();
         }
         let restarted = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
         assert!(matches!(
@@ -15068,5 +15626,456 @@ mod tests {
             assert_eq!(state.schema.get(&pin_dir), Some(&FakeSchema::EndpointV3));
             assert!(!state.attached.contains_key(&S2BU_IFINDEX));
         }
+    }
+
+    #[tokio::test]
+    async fn committed_v4_adopts_to_pmtu_v5_and_v5_map_loss_fails_closed() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let pin_dir = PathBuf::from(DEFAULT_BPFFS_PIN_ROOT).join("s2bu");
+        {
+            // A committed v4 pin set has complete source-port commit records
+            // but no MTU policy maps yet; the additive migration must create
+            // them and commit v5.
+            let mut state = runtime.state();
+            state.attached.clear();
+            state
+                .schema
+                .insert(pin_dir.clone(), FakeSchema::SourcePortV4);
+            state.pmtu_map_ready.clear();
+            state.pmtu_counters_map_ready.clear();
+        }
+        let restarted = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
+        restarted.resolve_device("s2bu").await.unwrap();
+        assert_eq!(
+            restarted.probe().await.unwrap().uplink_pmtu_enforcement,
+            GtpuCapability::Available
+        );
+        assert_eq!(
+            runtime.state().schema.get(&pin_dir),
+            Some(&FakeSchema::PmtuV5)
+        );
+
+        // A committed v5 pin set that loses an MTU policy map must not be
+        // silently recreated on the next restart.
+        {
+            let mut state = runtime.state();
+            state.attached.clear();
+            state.pmtu_map_ready.clear();
+        }
+        let restarted = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
+        assert!(matches!(
+            restarted.resolve_device("s2bu").await.unwrap_err(),
+            GtpuError::Io {
+                operation: "ebpf_bearer_schema",
+                ..
+            }
+        ));
+        assert!(!runtime.state().attached.contains_key(&S2BU_IFINDEX));
+    }
+    fn mtu_request(
+        link_mtu: u16,
+        fragmentation: crate::GtpuOuterFragmentPolicy,
+    ) -> CreateGtpDeviceRequest {
+        let mut request = create_request();
+        request.uplink_mtu_policy =
+            Some(GtpuUplinkMtuPolicy::new(link_mtu, fragmentation).unwrap());
+        request
+    }
+
+    #[tokio::test]
+    async fn create_device_persists_uplink_mtu_policy_and_reads_back_effective_policy() {
+        let (backend, runtime) = backend_with_fake();
+        let device = backend
+            .create_device(mtu_request(
+                1400,
+                crate::GtpuOuterFragmentPolicy::SignalPacketTooBig,
+            ))
+            .await
+            .unwrap();
+        let policy =
+            GtpuUplinkMtuPolicy::new(1400, crate::GtpuOuterFragmentPolicy::SignalPacketTooBig)
+                .unwrap();
+        assert_eq!(
+            runtime.state().pmtu_policy.get(&S2BU_IFINDEX),
+            Some(&policy.map_value())
+        );
+        assert_eq!(
+            backend.probe().await.unwrap().uplink_pmtu_enforcement,
+            GtpuCapability::Available
+        );
+        assert_eq!(
+            backend.effective_uplink_mtu_policy(&device).await.unwrap(),
+            Some(policy)
+        );
+        assert_eq!(
+            backend
+                .effective_uplink_mtu_policy(&device)
+                .await
+                .unwrap()
+                .unwrap()
+                .inner_mtu(),
+            1400 - 36
+        );
+    }
+
+    #[tokio::test]
+    async fn device_without_policy_persists_unset_and_reads_back_none() {
+        let (backend, runtime) = backend_with_fake();
+        let device = backend.create_device(create_request()).await.unwrap();
+        assert_eq!(
+            runtime.state().pmtu_policy.get(&S2BU_IFINDEX),
+            Some(&[0; UPLINK_PMTU_VALUE_LEN])
+        );
+        assert_eq!(
+            backend.effective_uplink_mtu_policy(&device).await.unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn mtu_policy_survives_restart_adoption_and_readback() {
+        let (backend, runtime) = backend_with_fake();
+        let device = backend
+            .create_device(mtu_request(
+                1280,
+                crate::GtpuOuterFragmentPolicy::SignalPacketTooBig,
+            ))
+            .await
+            .unwrap();
+        runtime.state().attached.clear();
+
+        let restarted = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
+        let adopted = restarted.resolve_device("s2bu").await.unwrap();
+        assert_eq!(adopted.ifindex, device.ifindex);
+        assert_eq!(
+            restarted
+                .effective_uplink_mtu_policy(&adopted)
+                .await
+                .unwrap(),
+            Some(
+                GtpuUplinkMtuPolicy::new(1280, crate::GtpuOuterFragmentPolicy::SignalPacketTooBig,)
+                    .unwrap()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn ebpf_rejects_host_only_outer_fragmentation_before_attaching() {
+        let (backend, runtime) = backend_with_fake();
+        let result = backend
+            .create_device(mtu_request(
+                1400,
+                GtpuOuterFragmentPolicy::RequireOuterFragmentation,
+            ))
+            .await;
+        assert!(matches!(
+            result,
+            Err(GtpuError::InvalidConfig {
+                field: "device.uplink_mtu_policy.fragmentation",
+                ..
+            })
+        ));
+        let state = runtime.state();
+        assert!(!state.operations.contains(&"attach"));
+        assert!(!state.attached.contains_key(&S2BU_IFINDEX));
+    }
+
+    #[tokio::test]
+    async fn corrupt_pmtu_policy_fails_probe_closed_but_can_be_repaired() {
+        let (backend, runtime) = backend_with_fake();
+        let device = backend
+            .create_device(mtu_request(
+                1400,
+                crate::GtpuOuterFragmentPolicy::SignalPacketTooBig,
+            ))
+            .await
+            .unwrap();
+        // Unknown flag bits are corrupt adopted state.
+        runtime
+            .state()
+            .pmtu_policy
+            .insert(S2BU_IFINDEX, [0x05, 0x78, 0x02, 0]);
+        assert!(matches!(
+            backend.effective_uplink_mtu_policy(&device).await,
+            Err(GtpuError::StateIndeterminate {
+                operation: "ebpf_pmtu_policy_readback"
+            })
+        ));
+        assert_eq!(
+            backend.probe().await.unwrap().uplink_pmtu_enforcement,
+            GtpuCapability::Missing
+        );
+
+        backend.set_uplink_mtu_policy(&device, None).await.unwrap();
+        assert_eq!(
+            backend.probe().await.unwrap().uplink_pmtu_enforcement,
+            GtpuCapability::Available
+        );
+        assert_eq!(
+            backend.effective_uplink_mtu_policy(&device).await.unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn lost_pmtu_map_fails_capability_and_readback_closed() {
+        let (backend, runtime) = backend_with_fake();
+        let device = backend
+            .create_device(mtu_request(
+                1400,
+                crate::GtpuOuterFragmentPolicy::SignalPacketTooBig,
+            ))
+            .await
+            .unwrap();
+        runtime.state().pmtu_map_ready.clear();
+        assert_eq!(
+            backend.probe().await.unwrap().uplink_pmtu_enforcement,
+            GtpuCapability::Missing
+        );
+        assert!(matches!(
+            backend.effective_uplink_mtu_policy(&device).await,
+            Err(GtpuError::StateIndeterminate {
+                operation: "ebpf_pmtu_policy_readback"
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_policy_publication_rolls_back_the_attachment() {
+        let (backend, runtime) = backend_with_fake();
+        runtime.fail_in_order(["pmtu_policy_write"]);
+        assert!(matches!(
+            backend
+                .create_device(mtu_request(
+                    1400,
+                    crate::GtpuOuterFragmentPolicy::SignalPacketTooBig
+                ))
+                .await,
+            Err(GtpuError::Io {
+                operation: "pmtu_policy_write",
+                ..
+            })
+        ));
+        let state = runtime.state();
+        assert!(!state.attached.contains_key(&S2BU_IFINDEX));
+        assert!(state.operations.contains(&"detach"));
+    }
+
+    #[tokio::test]
+    async fn failed_policy_update_on_retained_graph_never_detaches_or_unpins_state() {
+        let (backend, runtime) = backend_with_fake();
+        let original_policy =
+            GtpuUplinkMtuPolicy::new(1500, GtpuOuterFragmentPolicy::SignalPacketTooBig).unwrap();
+        backend
+            .create_device(mtu_request(
+                original_policy.effective_link_mtu(),
+                original_policy.fragmentation(),
+            ))
+            .await
+            .unwrap();
+        let desired = context();
+        backend.install_pdp_context(desired.clone()).await.unwrap();
+        let before = {
+            let mut state = runtime.state();
+            state.attached.clear();
+            (
+                state.far.clone(),
+                state.pdr.clone(),
+                state.downlink_binding.clone(),
+                state.sport.clone(),
+                state.schema.clone(),
+                state.pmtu_policy.clone(),
+            )
+        };
+
+        runtime.fail_in_order(["pmtu_policy_write"]);
+        let restarted = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
+        let result = restarted
+            .create_device(mtu_request(
+                1400,
+                GtpuOuterFragmentPolicy::SignalPacketTooBig,
+            ))
+            .await;
+        assert!(matches!(
+            result,
+            Err(GtpuError::StateIndeterminate {
+                operation: "ebpf_create_device_policy_update"
+            })
+        ));
+
+        let state = runtime.state();
+        assert!(state.attached.contains_key(&S2BU_IFINDEX));
+        assert_eq!(state.far, before.0);
+        assert_eq!(state.pdr, before.1);
+        assert_eq!(state.downlink_binding, before.2);
+        assert_eq!(state.sport, before.3);
+        assert_eq!(state.schema, before.4);
+        assert_eq!(state.pmtu_policy, before.5);
+        assert_eq!(
+            state
+                .operations
+                .iter()
+                .filter(|entry| **entry == "detach")
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn set_policy_updates_live_device_and_converges_drift() {
+        let (backend, runtime) = backend_with_fake();
+        let device = backend
+            .create_device(mtu_request(
+                1400,
+                crate::GtpuOuterFragmentPolicy::SignalPacketTooBig,
+            ))
+            .await
+            .unwrap();
+        let narrower =
+            GtpuUplinkMtuPolicy::new(1280, crate::GtpuOuterFragmentPolicy::SignalPacketTooBig)
+                .unwrap();
+        backend
+            .set_uplink_mtu_policy(&device, Some(narrower))
+            .await
+            .unwrap();
+        assert_eq!(
+            backend.effective_uplink_mtu_policy(&device).await.unwrap(),
+            Some(narrower)
+        );
+
+        let host_only =
+            GtpuUplinkMtuPolicy::new(1280, GtpuOuterFragmentPolicy::RequireOuterFragmentation)
+                .unwrap();
+        assert!(matches!(
+            backend
+                .set_uplink_mtu_policy(&device, Some(host_only))
+                .await,
+            Err(GtpuError::InvalidConfig {
+                field: "device.uplink_mtu_policy.fragmentation",
+                ..
+            })
+        ));
+        assert_eq!(
+            backend.effective_uplink_mtu_policy(&device).await.unwrap(),
+            Some(narrower),
+            "a rejected host-only policy must not mutate the live map"
+        );
+
+        // Out-of-band drift converges through the same supported mutation.
+        runtime.state().pmtu_policy.insert(
+            S2BU_IFINDEX,
+            GtpuUplinkMtuPolicy::new(9000, crate::GtpuOuterFragmentPolicy::SignalPacketTooBig)
+                .unwrap()
+                .map_value(),
+        );
+        let strict =
+            GtpuUplinkMtuPolicy::new(1400, crate::GtpuOuterFragmentPolicy::SignalPacketTooBig)
+                .unwrap();
+        backend
+            .set_uplink_mtu_policy(&device, Some(strict))
+            .await
+            .unwrap();
+        assert_eq!(
+            backend.effective_uplink_mtu_policy(&device).await.unwrap(),
+            Some(strict)
+        );
+
+        // None restores the explicit unset (legacy) state.
+        backend.set_uplink_mtu_policy(&device, None).await.unwrap();
+        assert_eq!(
+            backend.effective_uplink_mtu_policy(&device).await.unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn create_without_policy_preserves_persisted_policy() {
+        let (backend, runtime) = backend_with_fake();
+        backend
+            .create_device(mtu_request(
+                1400,
+                crate::GtpuOuterFragmentPolicy::SignalPacketTooBig,
+            ))
+            .await
+            .unwrap();
+        let strict =
+            GtpuUplinkMtuPolicy::new(1400, crate::GtpuOuterFragmentPolicy::SignalPacketTooBig)
+                .unwrap();
+        runtime.state().attached.clear();
+
+        // A recreate that leaves the policy unspecified must not silently
+        // reset the persisted strict policy to the legacy behavior.
+        let recreated = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
+        let device = recreated.create_device(create_request()).await.unwrap();
+        assert_eq!(
+            recreated
+                .effective_uplink_mtu_policy(&device)
+                .await
+                .unwrap(),
+            Some(strict)
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_policy_fails_adoption_closed() {
+        let (backend, runtime) = backend_with_fake();
+        backend
+            .create_device(mtu_request(
+                1400,
+                crate::GtpuOuterFragmentPolicy::SignalPacketTooBig,
+            ))
+            .await
+            .unwrap();
+        {
+            let mut state = runtime.state();
+            state.attached.clear();
+            state
+                .pmtu_policy
+                .insert(S2BU_IFINDEX, [0x05, 0x78, 0x02, 0]);
+        }
+        let restarted = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
+        assert!(matches!(
+            restarted.resolve_device("s2bu").await,
+            Err(GtpuError::StateIndeterminate {
+                operation: "ebpf_pmtu_policy_adopt"
+            })
+        ));
+        assert!(!runtime.state().attached.contains_key(&S2BU_IFINDEX));
+    }
+
+    #[tokio::test]
+    async fn externally_persisted_host_only_policy_fails_adoption_and_probe_closed() {
+        let (backend, runtime) = backend_with_fake();
+        backend
+            .create_device(mtu_request(
+                1400,
+                GtpuOuterFragmentPolicy::SignalPacketTooBig,
+            ))
+            .await
+            .unwrap();
+        let host_only =
+            GtpuUplinkMtuPolicy::new(1400, GtpuOuterFragmentPolicy::RequireOuterFragmentation)
+                .unwrap();
+        {
+            let mut state = runtime.state();
+            state
+                .pmtu_policy
+                .insert(S2BU_IFINDEX, host_only.map_value());
+        }
+        assert_eq!(
+            backend.probe().await.unwrap().uplink_pmtu_enforcement,
+            GtpuCapability::Missing
+        );
+        runtime.state().attached.clear();
+
+        let restarted = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
+        assert!(matches!(
+            restarted.resolve_device("s2bu").await,
+            Err(GtpuError::StateIndeterminate {
+                operation: "ebpf_pmtu_policy_adopt"
+            })
+        ));
+        assert!(!runtime.state().attached.contains_key(&S2BU_IFINDEX));
     }
 }

@@ -14,11 +14,24 @@
 #![deny(missing_docs)]
 
 mod envelope;
+mod fragment;
+mod pmtu;
 
 pub use envelope::{
     classify_udp_checksum, internet_checksum, internet_checksum_sum_is_valid, udp_ipv4_checksum,
     udp_ipv4_checksum_is_valid, GtpuEnvelopeBounds, GtpuEnvelopeError, Ipv4EnvelopeBounds,
     UdpChecksumDisposition, UdpChecksumEvidence, UdpEnvelopeBounds, IPV4_MAX_HDR_LEN,
+};
+pub use fragment::{
+    parse_gtpu_tpdu, GtpuDownlinkFragmentContract, GtpuReassemblyBounds, GtpuTpdu, GtpuTpduError,
+    LINUX_DEFAULT_REASSEMBLY_BOUNDS, MAX_REASSEMBLED_GTPU_LEN,
+};
+pub use pmtu::{
+    apply_uplink_mtu_policy, decide_uplink_encap, stamp_ipv4_dont_fragment,
+    GtpuOuterFragmentPolicy, GtpuPmtuProtocol, GtpuPmtuSignal, GtpuUplinkMtuPolicy,
+    UplinkEncapOutcome, UplinkMtuMapState, ICMPV4_CODE_FRAGMENTATION_NEEDED_DF_SET,
+    ICMPV4_TYPE_DESTINATION_UNREACHABLE, ICMPV6_TYPE_PACKET_TOO_BIG, MIN_UPLINK_LINK_MTU,
+    UPLINK_PMTU_FLAG_OUTER_FRAGMENT_REQUIRED, UPLINK_PMTU_VALUE_LEN,
 };
 
 /// GTP-U UDP port (TS 29.281 §4.4.2).
@@ -180,6 +193,17 @@ pub const UPLINK_ENDPOINT_SCHEMA_MARKER_VALUE: [u8; UPLINK_FAR_VALUE_LEN] = *b"O
 /// value fails closed when either source-port map pin or any bearer's complete
 /// commit record is missing or inconsistent with its live graph.
 pub const UPLINK_SOURCE_PORT_SCHEMA_MARKER_VALUE: [u8; UPLINK_FAR_VALUE_LEN] = *b"OPC-SPORT-v4";
+/// Current v5 schema marker proving that the additive uplink MTU policy maps
+/// are pinned and available to the exact current uplink program.
+///
+/// The v4-to-v5 migration is purely additive: the single-slot policy map
+/// starts zeroed (the explicit unset state selecting the legacy
+/// total-length-only behavior) and the drop-counter map starts empty, so a
+/// committed v4 pin set upgrades in place by creating the maps, verifying
+/// the complete pin graph, attaching the exact current hooks, and committing
+/// this marker. A loader that observes this value fails closed when either
+/// MTU map pin is missing.
+pub const UPLINK_PMTU_SCHEMA_MARKER_VALUE: [u8; UPLINK_FAR_VALUE_LEN] = *b"OPC-PMTU-v5\0";
 
 /// BPF map name: uplink FAR, keyed by UE PAA (IPv4, network order).
 pub const MAP_UPLINK_FAR: &str = "GTPU_UPLINK_FAR";
@@ -200,6 +224,12 @@ pub const MAP_UPLINK_SOURCE_PORT: &str = "GTPU_UL_SPORT";
 /// BPF map name: marked PDP-context commit record, keyed by
 /// `(UE PAA, packet mark)`.
 pub const MAP_UPLINK_MARK_SOURCE_PORT: &str = "GTPU_ULM_SPORT";
+/// BPF map name: single-slot uplink MTU policy (effective link MTU and
+/// outer-fragmentation flags).
+pub const MAP_UPLINK_PMTU: &str = "GTPU_PMTU_CFG";
+/// BPF map name: per-CPU counter of uplink packets rejected fail closed by
+/// the MTU policy.
+pub const MAP_UPLINK_PMTU_COUNTERS: &str = "GTPU_PMTU_DROP";
 /// BPF map name: marked-bearer owner journal, keyed by `(UE PAA, mark)`.
 pub const MAP_MARKED_BEARER_OWNER: &str = "GTPU_M_OWNER";
 /// BPF map name: per-CPU datapath counters.
@@ -245,6 +275,16 @@ pub const COUNTER_DL_BINDING_INGRESS_MISMATCH: u32 = 4;
 pub const COUNTER_DL_BINDING_SOURCE_PORT_MISMATCH: u32 = 5;
 /// Number of fixed-cardinality downlink binding-drop counters.
 pub const DOWNLINK_BINDING_COUNTER_SLOTS: u32 = 6;
+
+/// MTU-drop counter index: uplink packets rejected fail closed because the
+/// encapsulated packet exceeded the configured effective link MTU.
+pub const COUNTER_UL_MTU_REJECT: u32 = 0;
+/// MTU-drop counter index: uplink packets dropped because the persisted MTU
+/// policy bytes were corrupt. This is a canary for external writers: a
+/// nonzero value always means non-SDK mutation of adopted state.
+pub const COUNTER_UL_PMTU_CORRUPT: u32 = 1;
+/// Number of uplink MTU-drop counters.
+pub const UPLINK_PMTU_COUNTER_SLOTS: u32 = 2;
 
 /// Decide whether an uplink non-encapsulation path must drop rather than pass.
 ///
@@ -2180,6 +2220,8 @@ mod tests {
             MAP_MARKED_BEARER_OWNER,
             MAP_UPLINK_SOURCE_PORT,
             MAP_UPLINK_MARK_SOURCE_PORT,
+            MAP_UPLINK_PMTU,
+            MAP_UPLINK_PMTU_COUNTERS,
         ];
         for name in new_names {
             assert!(name.len() <= BPF_OBJ_NAME_VISIBLE_LEN);
@@ -2191,6 +2233,8 @@ mod tests {
             MAP_UPLINK_MARK_DSCP,
             MAP_UPLINK_SOURCE_PORT,
             MAP_UPLINK_MARK_SOURCE_PORT,
+            MAP_UPLINK_PMTU,
+            MAP_UPLINK_PMTU_COUNTERS,
             MAP_DOWNLINK_PDR,
             MAP_DOWNLINK_MARK_PDR,
             MAP_DOWNLINK_ENDPOINT_BINDING,

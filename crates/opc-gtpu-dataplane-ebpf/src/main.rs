@@ -42,24 +42,28 @@ use aya_ebpf::{
     programs::TcContext,
 };
 use opc_gtpu_ebpf_common::{
-    build_uplink_encap_with_dscp_and_source_port, classify_gtpu, classify_udp_checksum,
-    downlink_frame_end, downlink_parse_ipv4_total_length, downlink_parse_payload_offset,
-    downlink_parse_teid, internet_checksum_sum_is_valid, marked_owner_wire_authorizes_downlink,
-    marked_owner_wire_authorizes_uplink, pack_downlink_parse_result,
-    pdp_commit_wire_authorized_source_port, pdp_commit_wire_authorizes_downlink,
-    pdp_commit_wire_authorizes_graph, uplink_non_encapsulation_drops,
+    apply_uplink_mtu_policy, build_uplink_encap_with_dscp_and_source_port, classify_gtpu,
+    classify_udp_checksum, downlink_frame_end, downlink_parse_ipv4_total_length,
+    downlink_parse_payload_offset, downlink_parse_teid, internet_checksum_sum_is_valid,
+    marked_owner_wire_authorizes_downlink, marked_owner_wire_authorizes_uplink,
+    pack_downlink_parse_result, pdp_commit_wire_authorized_source_port,
+    pdp_commit_wire_authorizes_downlink, pdp_commit_wire_authorizes_graph,
+    uplink_non_encapsulation_drops,
     validate_ipv4_downlink_binding_wire, DownlinkBindingMismatch, DownlinkPdr, GtpuClass,
-    GtpuEnvelopeBounds, Ipv4EnvelopeBounds, MarkedDownlinkPdr, UdpChecksumDisposition,
-    UdpChecksumEvidence, UdpEnvelopeBounds, UplinkFar, UplinkFarKey,
-    COUNTER_DL_BINDING_FAMILY_MISMATCH, COUNTER_DL_BINDING_INGRESS_MISMATCH,
+    GtpuEnvelopeBounds, GtpuOuterFragmentPolicy, GtpuUplinkMtuPolicy, Ipv4EnvelopeBounds,
+    MarkedDownlinkPdr, UdpChecksumDisposition, UdpChecksumEvidence, UdpEnvelopeBounds, UplinkFar,
+    UplinkFarKey, UplinkMtuMapState, COUNTER_DL_BINDING_FAMILY_MISMATCH,
+    COUNTER_DL_BINDING_INGRESS_MISMATCH,
     COUNTER_DL_BINDING_INVALID, COUNTER_DL_BINDING_LOCAL_MISMATCH,
     COUNTER_DL_BINDING_PEER_MISMATCH, COUNTER_DL_BINDING_SOURCE_PORT_MISMATCH, COUNTER_DL_DECAP,
     COUNTER_DL_DST_MISMATCH, COUNTER_DL_MALFORMED, COUNTER_DL_UNKNOWN_TEID, COUNTER_SLOTS,
-    COUNTER_UL_ENCAP, COUNTER_UL_FAR_MISS, DOWNLINK_BINDING_COUNTER_SLOTS,
+    COUNTER_UL_ENCAP, COUNTER_UL_FAR_MISS, COUNTER_UL_MTU_REJECT, COUNTER_UL_PMTU_CORRUPT,
+    DOWNLINK_BINDING_COUNTER_SLOTS,
     DOWNLINK_ENDPOINT_BINDING_VALUE_LEN, DOWNLINK_PDR_VALUE_LEN, ETH_HDR_LEN, ETH_P_IPV4,
     GTPU_MANDATORY_HDR_LEN, GTPU_MAX_EXT_HEADERS, GTPU_OPT_LEN, GTPU_UDP_PORT,
     MARKED_BEARER_OWNER_VALUE_LEN, MARKED_DOWNLINK_PDR_VALUE_LEN, UPLINK_DSCP_SCHEMA_MARKER_KEY,
-    UPLINK_DSCP_VALUE_LEN, UPLINK_FAR_VALUE_LEN, UPLINK_MARK_KEY_LEN, UPLINK_SOURCE_PORT_VALUE_LEN,
+    UPLINK_DSCP_VALUE_LEN, UPLINK_FAR_VALUE_LEN, UPLINK_MARK_KEY_LEN, UPLINK_PMTU_COUNTER_SLOTS,
+    UPLINK_PMTU_VALUE_LEN, UPLINK_SOURCE_PORT_VALUE_LEN,
 };
 
 /// Uplink FAR: UE PAA (IPv4, network order) -> encap state.
@@ -124,6 +128,15 @@ static GTPU_DL_DROP: PerCpuArray<u64> = PerCpuArray::pinned(DOWNLINK_BINDING_COU
 #[map]
 static GTPU_CONFIG: Array<[u8; 4]> = Array::pinned(1, 0);
 
+/// Single-slot uplink MTU policy: effective link MTU, fragmentation flags,
+/// reserved. An all-zero slot is the explicit unset (legacy) state.
+#[map]
+static GTPU_PMTU_CFG: Array<[u8; UPLINK_PMTU_VALUE_LEN]> = Array::pinned(1, 0);
+
+/// Per-CPU counter of uplink packets rejected fail closed by the MTU policy.
+#[map]
+static GTPU_PMTU_DROP: PerCpuArray<u64> = PerCpuArray::pinned(UPLINK_PMTU_COUNTER_SLOTS, 0);
+
 const IPV4_PROTO_UDP: u8 = 17;
 const IPV4_FRAG_MASK: u16 = 0x3FFF; // MF bit + fragment offset
 
@@ -138,6 +151,14 @@ fn count(index: u32) {
 #[inline(always)]
 fn count_binding_drop(index: u32) {
     if let Some(counter) = GTPU_DL_DROP.get_ptr_mut(index) {
+        // SAFETY: per-CPU slot; no concurrent access on the same CPU.
+        unsafe { *counter += 1 };
+    }
+}
+
+#[inline(always)]
+fn count_pmtu_drop(index: u32) {
+    if let Some(counter) = GTPU_PMTU_DROP.get_ptr_mut(index) {
         // SAFETY: per-CPU slot; no concurrent access on the same CPU.
         unsafe { *counter += 1 };
     }
@@ -365,6 +386,43 @@ fn try_uplink(ctx: &mut TcContext, mark: u32) -> Result<i32, ()> {
     let source_port = u16::from_be_bytes([commit[64], commit[65]]);
     let encap = build_uplink_encap_with_dscp_and_source_port(&far, inner_len, dscp, source_port)
         .ok_or(())?;
+    let mut encap = encap;
+    if let Some(pmtu_ptr) = GTPU_PMTU_CFG.get_ptr(0) {
+        // SAFETY: single-slot array value written by the loader before the
+        // device is managed, and later by `set_uplink_mtu_policy` via one
+        // atomic four-byte map write. A single four-byte load (read_unaligned
+        // lowers to one aligned ldw on the BPF target) cannot observe a torn
+        // policy word.
+        let policy_bytes = unsafe { (pmtu_ptr as *const u32).read_unaligned() }.to_ne_bytes();
+        match GtpuUplinkMtuPolicy::decode_map_value(&policy_bytes) {
+            UplinkMtuMapState::Unset => {}
+            UplinkMtuMapState::Corrupt => {
+                // Corrupt adopted policy state must drop rather than emit an
+                // unchecked encapsulation. This counter is a canary for
+                // external writers and never moves in normal operation.
+                count_pmtu_drop(COUNTER_UL_PMTU_CORRUPT);
+                return Ok(TC_ACT_SHOT as i32);
+            }
+            UplinkMtuMapState::Configured(policy)
+                if policy.fragmentation() == GtpuOuterFragmentPolicy::SignalPacketTooBig =>
+            {
+                if !apply_uplink_mtu_policy(&mut encap, policy) {
+                    // Fail closed: the over-MTU inner packet is never emitted
+                    // unencapsulated and the encapsulation never silently
+                    // exceeds the effective link MTU.
+                    count_pmtu_drop(COUNTER_UL_MTU_REJECT);
+                    return Ok(TC_ACT_SHOT as i32);
+                }
+            }
+            UplinkMtuMapState::Configured(_) => {
+                // Canonical for a host fragmenter, but not executable by tc.
+                // Treat an out-of-band writer like corrupt state and drop all
+                // packets until userspace restores an executable policy.
+                count_pmtu_drop(COUNTER_UL_PMTU_CORRUPT);
+                return Ok(TC_ACT_SHOT as i32);
+            }
+        }
+    }
 
     ctx.skb
         .adjust_room(

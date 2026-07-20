@@ -185,13 +185,14 @@ jobs:
           git worktree remove --force "${historical_worktree}"
 
       # Rebuild the datapath object from source with the pinned toolchain and
-      # fail on structural drift against the committed artifact. A byte-exact
-      # comparison is not possible across build hosts (bpf-linker resolves a
-      # host LLVM), so the gate compares the program/map inventory; the
-      # privileged job above proves the committed artifact behaviorally.
-      - name: Rebuild and compare program/map inventory
+      # fail on functional drift against the committed artifact. Whole-object
+      # equality is deliberately avoided because DWARF and BTF can contain
+      # build-host paths. Executable and map-definition section bytes, plus
+      # their semantic relocations, are path-independent and must match.
+      - name: Rebuild and compare functional program/map sections
         run: |
           set -euo pipefail
+          command -v readelf
           committed="${RUNNER_TEMP}/committed-opc-gtpu-datapath.bpf.o"
           cp crates/opc-gtpu-dataplane/bpf/opc-gtpu-datapath.bpf.o "${committed}"
           ./scripts/build-gtpu-ebpf.sh
@@ -236,6 +237,85 @@ jobs:
           inventory "${rebuilt}" > rebuilt.inventory
           cat rebuilt.inventory
           diff -u committed.inventory rebuilt.inventory
-          for symbol in opc_gtpu_uplink opc_gtpu_downlink checksum_loop_chunk authorize_and_decap_downlink parse_downlink pdp_commit_wire_is_valid pdp_commit_wire_authorizes_graph marked_owner_wire_authorizes_uplink pdp_commit_wire_authorizes_downlink marked_owner_wire_authorizes_downlink GTPU_UPLINK_FAR GTPU_ULM_FAR GTPU_UPLINK_DSCP GTPU_ULM_DSCP GTPU_UL_SPORT GTPU_ULM_SPORT GTPU_DOWNLINK_PDR GTPU_DLM_PDR GTPU_DL_BIND GTPU_DL_DROP GTPU_M_OWNER GTPU_COUNTERS GTPU_CONFIG; do
+          for symbol in opc_gtpu_uplink opc_gtpu_downlink checksum_loop_chunk authorize_and_decap_downlink parse_downlink pdp_commit_wire_is_valid pdp_commit_wire_authorizes_graph marked_owner_wire_authorizes_uplink pdp_commit_wire_authorizes_downlink marked_owner_wire_authorizes_downlink GTPU_UPLINK_FAR GTPU_ULM_FAR GTPU_UPLINK_DSCP GTPU_ULM_DSCP GTPU_UL_SPORT GTPU_ULM_SPORT GTPU_PMTU_CFG GTPU_PMTU_DROP GTPU_DOWNLINK_PDR GTPU_DLM_PDR GTPU_DL_BIND GTPU_DL_DROP GTPU_M_OWNER GTPU_COUNTERS GTPU_CONFIG; do
             grep -q " ${symbol}$" committed.inventory
           done
+
+          functional_section_names() {
+            # Strip readelf's variably padded numeric index, then select every
+            # executable PROGBITS section and both map-section spellings used
+            # by Rust eBPF toolchains. Debug/BTF sections stay out of the
+            # comparison because they may contain build-host paths.
+            readelf -SW "$1" \
+              | sed -E 's/^[[:space:]]*\[[[:space:]]*[0-9]+\][[:space:]]+//' \
+              | awk '$2 == "PROGBITS" && ($7 ~ /X/ || $1 == "maps" || $1 == ".maps") {print $1}' \
+              | LC_ALL=C sort
+          }
+
+          functional_section_manifest() {
+            local object="$1"
+            local digest
+            local section
+            while IFS= read -r section; do
+              [[ -n "${section}" ]] || continue
+              # GNU objcopy on the hosted runner does not recognize EM_BPF.
+              # Keep readelf failure visible as an assignment status under
+              # `set -euo pipefail`, then hash its exact section-byte dump.
+              digest="$(readelf --hex-dump="${section}" "${object}" | sha256sum | awk '{print $1}')"
+              printf '%s %s\n' "${section}" "${digest}"
+            done < <(functional_section_names "${object}")
+          }
+
+          functional_relocations() {
+            local object="$1"
+            local sections
+            sections="$(functional_section_names "${object}")"
+            # Omit the symbol-table index (readelf field 2), which is only an
+            # ELF implementation detail. Preserve the relocation section,
+            # instruction/data offset, type, target value/name, and addend.
+            readelf -rW "${object}" | awk -v functional="${sections}" '
+              BEGIN {
+                count = split(functional, names, "\n")
+                for (item = 1; item <= count; item++) {
+                  if (names[item] != "") {
+                    wanted[".rel" names[item]] = 1
+                    wanted[".rela" names[item]] = 1
+                  }
+                }
+              }
+              /^Relocation section / {
+                section = $3
+                gsub(/\047/, "", section)
+                active = section in wanted
+                if (active) {
+                  print "SECTION", section
+                }
+                next
+              }
+              active && $1 ~ /^[[:xdigit:]]+$/ {
+                line = section " " $1
+                for (field = 3; field <= NF; field++) {
+                  line = line " " $field
+                }
+                gsub(/_RNvC[^_]+_17opc_gtpu_datapath/, "_RNvC<crate>_17opc_gtpu_datapath", line)
+                gsub(/_RNvC[^_]+_20opc_gtpu_ebpf_common/, "_RNvC<crate>_20opc_gtpu_ebpf_common", line)
+                print line
+              }
+            '
+          }
+
+          functional_section_names "${committed}" > committed.functional-sections
+          functional_section_names "${rebuilt}" > rebuilt.functional-sections
+          diff -u committed.functional-sections rebuilt.functional-sections
+          for section in .text classifier maps; do
+            grep -Fxq "${section}" committed.functional-sections
+          done
+
+          functional_section_manifest "${committed}" > committed.functional-manifest
+          functional_section_manifest "${rebuilt}" > rebuilt.functional-manifest
+          cat rebuilt.functional-manifest
+          diff -u committed.functional-manifest rebuilt.functional-manifest
+
+          functional_relocations "${committed}" > committed.functional-relocations
+          functional_relocations "${rebuilt}" > rebuilt.functional-relocations
+          diff -u committed.functional-relocations rebuilt.functional-relocations

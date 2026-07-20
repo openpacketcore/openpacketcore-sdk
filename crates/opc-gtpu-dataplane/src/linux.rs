@@ -26,10 +26,11 @@ use crate::backend::error_proves_no_requested_mutation;
 use crate::model::{classify_dual_selector_state, DualSelectorState};
 use crate::{
     CreateGtpDeviceRequest, GtpAddressFamily, GtpDevice, GtpPdpContext, GtpRole, GtpVersion,
-    GtpuBackendKind, GtpuCapability, GtpuDataplaneBackend, GtpuError, GtpuProbe,
-    PdpContextIndeterminateReason, PdpContextInstallOutcome, PdpContextLocalTeidSelector,
-    PdpContextReadback, PdpContextReconciliationCapabilities, PdpContextRemovalOutcome,
-    PdpContextSelector, PdpContextUplinkSelector, RemovePdpContextRequest, Teid, GTPU_PORT,
+    GtpuBackendKind, GtpuCapability, GtpuDataplaneBackend, GtpuDownlinkFragmentContract, GtpuError,
+    GtpuProbe, PdpContextIndeterminateReason, PdpContextInstallOutcome,
+    PdpContextLocalTeidSelector, PdpContextReadback, PdpContextReconciliationCapabilities,
+    PdpContextRemovalOutcome, PdpContextSelector, PdpContextUplinkSelector,
+    RemovePdpContextRequest, Teid, GTPU_PORT,
 };
 
 const NETLINK_HEADER_LEN: usize = 16;
@@ -802,6 +803,12 @@ impl LinuxGtpuTransport for NetlinkGtpuTransport {
             per_bearer_marking: GtpuCapability::Missing,
             downlink_endpoint_binding: GtpuCapability::Missing,
             uplink_source_port_selection: GtpuCapability::Missing,
+            uplink_pmtu_enforcement: GtpuCapability::Missing,
+            // The generic-netlink family probe proves only that the Linux GTP
+            // driver is present. It does not prove fragmented outer packets
+            // re-enter that driver's UDP consumer exactly once, so this
+            // backend must not advertise the stronger handoff contract.
+            downlink_outer_fragment_handling: GtpuDownlinkFragmentContract::Unsupported,
             details,
         }
     }
@@ -859,6 +866,15 @@ fn validate_create_device_request(request: &CreateGtpDeviceRequest) -> Result<()
             "device.pdp_hashsize",
             "hash size must be nonzero",
         ));
+    }
+    if request.uplink_mtu_policy.is_some() {
+        // The netlink gtp driver leaves outer fragmentation and MTU handling
+        // to the kernel routing layer; the typed SDK policy is not
+        // implemented by this backend and must fail closed rather than be
+        // silently ignored.
+        return Err(GtpuError::UnsupportedFeature {
+            feature: "uplink_pmtu_enforcement",
+        });
     }
     Ok(())
 }
@@ -1701,6 +1717,8 @@ mod tests {
                     per_bearer_marking: GtpuCapability::Missing,
                     downlink_endpoint_binding: GtpuCapability::Missing,
                     uplink_source_port_selection: GtpuCapability::Missing,
+                    uplink_pmtu_enforcement: GtpuCapability::Missing,
+                    downlink_outer_fragment_handling: GtpuDownlinkFragmentContract::Unsupported,
                     details: Some("test transport"),
                 },
                 socket_fd: 9,
@@ -1727,6 +1745,23 @@ mod tests {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone()
         }
+    }
+
+    #[test]
+    fn netlink_probe_does_not_claim_unproven_fragment_handoff() {
+        let probe = LinuxGtpuTransport::probe(
+            &NetlinkGtpuTransport,
+            LinuxGtpuDataplaneBackendConfig {
+                receive_attempts: 1,
+                receive_buffer_len: 4096,
+                retry_delay: Duration::ZERO,
+            },
+        );
+
+        assert_eq!(
+            probe.downlink_outer_fragment_handling,
+            GtpuDownlinkFragmentContract::Unsupported
+        );
     }
 
     impl LinuxGtpuTransport for CapturingTransport {

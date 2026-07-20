@@ -21,6 +21,17 @@ The crate exposes tc entry points, not a Rust library API:
   PDP-context commit record, including the explicit source port. The program
   accepts only an `Active` record whose FAR and DSCP match the selected live
   entries exactly; an absent, transitional, malformed, or mixed record drops
+  fail closed. When the single-slot `GTPU_PMTU_CFG` policy map carries a
+  configured effective link MTU, the program applies the shared
+  `apply_uplink_mtu_policy` decision to every encapsulation: over-MTU packets
+  drop fail closed into the `GTPU_PMTU_DROP` per-CPU counter (slot 0). The
+  host-only `RequireOuterFragmentation` policy is not executable because
+  `bpf_redirect_neigh` bypasses the kernel's `ip_fragment`; SDK configuration
+  rejects it, and an out-of-band map writer makes every packet drop into the
+  corrupt-policy canary (slot 1). The program never emits an oversized packet,
+  an inner packet unencapsulated, or ICMP itself. The strict policy stamps DF
+  and refreshes the outer checksum on emitted fitting packets; an all-zero
+  slot is the explicit unset legacy behavior and corrupt policy bytes drop
   fail closed.
 - `opc_gtpu_downlink`: tc ingress program. It matches UDP/2152 GTPv1-U G-PDUs,
   proves the existing outer envelope/checksum boundary, selects exactly one
@@ -32,7 +43,10 @@ The crate exposes tc entry points, not a Rust library API:
   additionally require the compatible owner journal. Only then does it validate
   the inner destination, strip outer headers, write zero for a default bearer
   or the exact dedicated mark, and continue to XFRM policy selection through
-  the stack.
+  the stack. Outer IPv4 fragments are passed to the kernel stack unchanged;
+  the kernel reassembles under bounded `ipfrag` accounting and the SDK's
+  userspace `GtpuReassemblyConsumer` re-applies this same PDR/binding/decap
+  path to the reassembled datagram exactly once.
 
 Map names, counter indexes, program names, and byte layouts are imported from
 `opc-gtpu-ebpf-common`. `GTPU_DL_DROP` is a fixed six-slot per-CPU counter map
