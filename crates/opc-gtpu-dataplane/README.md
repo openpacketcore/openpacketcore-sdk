@@ -39,7 +39,11 @@ route steering, XFRM policy, deployment defaults, or traffic-readiness policy.
   `EbpfGtpuDatapathSnapshot`, `EbpfGtpuDatapathCounters`, `DscpCodepoint`,
   `GtpRole`, `GtpVersion`, `GtpAddressFamily`, and `GTPU_PORT`.
 - `GtpuError` is intentionally redaction-safe; TEIDs and addresses are not
-  emitted by `Debug`/`Display`.
+  emitted by `Debug`/`Display`. Kernel `BPF_PROG_LOAD` rejection is reported as
+  `GtpuError::ProgramLoadRejected`, preserving only its stable operation, I/O
+  kind, and errno. Capability, bpffs, and other I/O failures remain
+  `GtpuError::Io`, so callers can distinguish environment setup from verifier
+  rejection without retaining the verifier log.
 
 ## Usage
 
@@ -894,6 +898,8 @@ teardown identity proof. Neither legacy object runs as the current datapath.
   the bounded `bpf_loop` helper (available in mainline Linux 5.17 and newer)
   to checksum the complete declared UDP range without verifier unrolling; the
   repository's documented production node profile remains Linux 6.8 or newer.
+  CI loads both committed classifiers on exact Linux 6.8.0-134 as a verifier
+  compatibility gate in addition to running the full privileged datapath suite.
 - The ignored privileged eBPF proof additionally requires the `gtp` and
   `wireguard` kernel modules plus `ip`, `tc`, `ethtool`, `nft`, `wg`, and
   Python 3. CI preflights and installs these prerequisites. A platform without

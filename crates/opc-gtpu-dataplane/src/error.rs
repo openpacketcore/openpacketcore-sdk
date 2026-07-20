@@ -38,6 +38,21 @@ pub enum GtpuError {
         /// Raw OS error code (errno), when the source carried one.
         raw_os_error: Option<i32>,
     },
+    /// The kernel rejected an eBPF program at the `BPF_PROG_LOAD` boundary.
+    ///
+    /// Verifier output is deliberately not retained because it can contain
+    /// implementation details. This variant keeps the failure distinct from
+    /// capability and bpffs errors while exposing only redaction-safe I/O
+    /// classification.
+    #[error("GTP-U {operation} was rejected by the kernel eBPF loader{}", .raw_os_error.map(|code| format!(" (os error {code})")).unwrap_or_default())]
+    ProgramLoadRejected {
+        /// Stable operation label.
+        operation: &'static str,
+        /// Captured I/O error kind from `BPF_PROG_LOAD`.
+        kind: io::ErrorKind,
+        /// Raw OS error code (errno), when the syscall carried one.
+        raw_os_error: Option<i32>,
+    },
     /// The requested device or PDP context already exists.
     #[error("GTP-U state already exists")]
     AlreadyExists,
@@ -86,19 +101,32 @@ impl GtpuError {
         }
     }
 
-    /// Return the I/O error kind when this is an `Io` variant.
+    /// Build a redaction-safe eBPF program-load rejection.
+    ///
+    /// The original I/O message and kernel verifier log are not retained.
+    pub(crate) fn program_load_rejected(operation: &'static str, source: &io::Error) -> Self {
+        Self::ProgramLoadRejected {
+            operation,
+            kind: source.kind(),
+            raw_os_error: source.raw_os_error(),
+        }
+    }
+
+    /// Return the I/O error kind carried by an I/O or program-load failure.
     pub fn io_kind(&self) -> Option<io::ErrorKind> {
         match self {
-            Self::Io { kind, .. } => Some(*kind),
+            Self::Io { kind, .. } | Self::ProgramLoadRejected { kind, .. } => Some(*kind),
             _ => None,
         }
     }
 
-    /// Return the raw OS error code (errno) when this is an `Io` variant that
-    /// captured one.
+    /// Return the raw OS error code (errno) carried by an I/O or program-load
+    /// failure.
     pub fn raw_os_error(&self) -> Option<i32> {
         match self {
-            Self::Io { raw_os_error, .. } => *raw_os_error,
+            Self::Io { raw_os_error, .. } | Self::ProgramLoadRejected { raw_os_error, .. } => {
+                *raw_os_error
+            }
             _ => None,
         }
     }
@@ -136,6 +164,39 @@ mod tests {
         assert!(!debug.contains("123456789012345"));
         assert!(!debug.contains("0x12345678"));
         assert!(!debug.contains("10.23.0.2"));
+    }
+
+    #[test]
+    fn program_load_rejection_is_typed_and_redaction_safe() {
+        let sensitive = "subscriber=123456789012345 path=/private/bpffs/node";
+        let source = io::Error::new(io::ErrorKind::PermissionDenied, sensitive);
+        let err = GtpuError::program_load_rejected("ebpf_program_load", &source);
+
+        assert!(matches!(
+            err,
+            GtpuError::ProgramLoadRejected {
+                operation: "ebpf_program_load",
+                kind: io::ErrorKind::PermissionDenied,
+                raw_os_error: None,
+            }
+        ));
+        let rendered = format!("{err:?} {err}");
+        assert!(!rendered.contains("subscriber"));
+        assert!(!rendered.contains("123456789012345"));
+        assert!(!rendered.contains("/private/bpffs/node"));
+    }
+
+    #[test]
+    fn program_load_rejection_preserves_errno_without_source_text() {
+        let source = io::Error::from_raw_os_error(13);
+        let err = GtpuError::program_load_rejected("ebpf_program_load", &source);
+
+        assert_eq!(err.io_kind(), Some(io::ErrorKind::PermissionDenied));
+        assert_eq!(err.raw_os_error(), Some(13));
+        assert_eq!(
+            err.to_string(),
+            "GTP-U ebpf_program_load was rejected by the kernel eBPF loader (os error 13)"
+        );
     }
 
     #[test]

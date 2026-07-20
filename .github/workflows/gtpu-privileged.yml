@@ -112,6 +112,152 @@ jobs:
               cargo test --locked -p opc-gtpu-dataplane --lib program_tag_candidates_match_the_running_kernel -- --ignored --nocapture
             '
 
+  linux-6-8-classifier-load:
+    name: Linux 6.8 committed classifier load
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build output
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build committed-object load test
+        run: |
+          set -euo pipefail
+          export CARGO_TARGET_DIR="${RUNNER_TEMP}/gtpu-linux68-target"
+          cargo test --locked -p opc-gtpu-dataplane --lib --no-run --message-format=json \
+            > "${RUNNER_TEMP}/gtpu-linux68-build.jsonl"
+          test_binary="$(
+            jq -r 'select(.profile.test == true and .target.name == "opc_gtpu_dataplane") | .executable // empty' \
+              "${RUNNER_TEMP}/gtpu-linux68-build.jsonl" | tail -n 1
+          )"
+          test -n "${test_binary}"
+          test -x "${test_binary}"
+          cp "${test_binary}" "${RUNNER_TEMP}/opc-gtpu-linux68-test"
+
+      - name: Load both classifiers on pinned Linux 6.8
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y cloud-image-utils qemu-system-x86 openssh-client
+
+          image="${RUNNER_TEMP}/ubuntu-24.04-linux68.img"
+          curl --fail --location --retry 3 \
+            --output "${image}" \
+            https://cloud-images.ubuntu.com/releases/noble/release-20260705/ubuntu-24.04-server-cloudimg-amd64.img
+          echo "ffe6203da54deeb6db5d2a98a83f9ec8e55f149d3f7ba622e1abe5fa966ee3d6  ${image}" \
+            | sha256sum -c -
+
+          key="${RUNNER_TEMP}/gtpu-linux68-key"
+          ssh-keygen -q -t ed25519 -N '' -C '' -f "${key}"
+          public_key="$(<"${key}.pub")"
+          user_data="${RUNNER_TEMP}/gtpu-linux68-user-data"
+          metadata="${RUNNER_TEMP}/gtpu-linux68-meta-data"
+          printf '%s\n' \
+            '#cloud-config' \
+            'users:' \
+            '  - name: opc' \
+            '    groups: [adm, sudo]' \
+            '    shell: /bin/bash' \
+            '    sudo: ALL=(ALL) NOPASSWD:ALL' \
+            '    lock_passwd: true' \
+            '    ssh_authorized_keys:' \
+            "      - ${public_key}" \
+            'ssh_pwauth: false' \
+            'disable_root: true' \
+            'package_update: false' > "${user_data}"
+          printf '%s\n' \
+            'instance-id: opc-gtpu-linux68' \
+            'local-hostname: opc-gtpu-linux68' > "${metadata}"
+          cloud-localds "${RUNNER_TEMP}/gtpu-linux68-seed.iso" "${user_data}" "${metadata}"
+
+          pid_file="${RUNNER_TEMP}/gtpu-linux68-qemu.pid"
+          cleanup() {
+            if sudo test -s "${pid_file}"; then
+              pid="$(sudo cat "${pid_file}")"
+              sudo kill "${pid}" 2>/dev/null || true
+            fi
+          }
+          trap cleanup EXIT
+
+          if sudo test -c /dev/kvm; then
+            machine='accel=kvm'
+            cpu='host'
+          else
+            machine='accel=tcg'
+            cpu='max'
+          fi
+          sudo qemu-system-x86_64 \
+            -machine "${machine}" \
+            -cpu "${cpu}" \
+            -smp 2 \
+            -m 3072 \
+            -drive "file=${image},format=qcow2,if=virtio,snapshot=on" \
+            -drive "file=${RUNNER_TEMP}/gtpu-linux68-seed.iso,format=raw,media=cdrom,readonly=on" \
+            -netdev user,id=net0,restrict=on,hostfwd=tcp:127.0.0.1:2227-:22 \
+            -device virtio-net-pci,netdev=net0 \
+            -display none \
+            -serial "file:${RUNNER_TEMP}/gtpu-linux68-serial.log" \
+            -daemonize \
+            -pidfile "${pid_file}"
+
+          ssh_options=(
+            -i "${key}"
+            -p 2227
+            -o BatchMode=yes
+            -o ConnectTimeout=2
+            -o IdentitiesOnly=yes
+            -o StrictHostKeyChecking=no
+            -o UserKnownHostsFile=/dev/null
+          )
+          ready=0
+          for _attempt in $(seq 1 120); do
+            if ssh "${ssh_options[@]}" opc@127.0.0.1 true >/dev/null 2>&1; then
+              ready=1
+              break
+            fi
+            sleep 2
+          done
+          if [[ "${ready}" != 1 ]]; then
+            sudo tail -n 200 "${RUNNER_TEMP}/gtpu-linux68-serial.log" || true
+            exit 1
+          fi
+
+          scp \
+            -i "${key}" \
+            -P 2227 \
+            -o BatchMode=yes \
+            -o ConnectTimeout=2 \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            "${RUNNER_TEMP}/opc-gtpu-linux68-test" \
+            opc@127.0.0.1:/tmp/opc-gtpu-linux68-test
+          ssh "${ssh_options[@]}" opc@127.0.0.1 '
+            set -euo pipefail
+            test "$(uname -r)" = "6.8.0-134-generic"
+            test "$(</proc/sys/kernel/osrelease)" = "6.8.0-134-generic"
+            test "$(dpkg-query -W linux-image-6.8.0-134-generic | cut -f2)" = "6.8.0-134.134"
+            case "$(systemd-detect-virt)" in
+              kvm|qemu) ;;
+              *) exit 1 ;;
+            esac
+            sudo mountpoint -q /sys/fs/bpf || sudo mount -t bpf bpf /sys/fs/bpf
+            chmod 0755 /tmp/opc-gtpu-linux68-test
+          '
+          load_output="$(
+            ssh "${ssh_options[@]}" opc@127.0.0.1 \
+              'sudo env OPC_GTPU_RUN_PRIVILEGED=1 /tmp/opc-gtpu-linux68-test --ignored --nocapture program_tag_candidates_match_the_running_kernel' \
+              2>&1
+          )"
+          printf '%s\n' "${load_output}"
+          grep -Fq 'test result: ok. 1 passed; 0 failed;' <<< "${load_output}"
+
   ebpf-object:
     name: eBPF datapath object rebuild
     runs-on: ubuntu-latest

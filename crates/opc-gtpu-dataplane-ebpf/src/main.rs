@@ -470,7 +470,10 @@ fn malformed_downlink() -> i32 {
     TC_ACT_SHOT as i32
 }
 
-const CHECKSUM_CHUNK_LEN: usize = 256;
+// Keep the `bpf_loop` callback frame below the Linux 6.8 cumulative
+// BPF-to-BPF stack limit. The checksum covers the same complete byte range;
+// only the verifier-visible chunk size changes.
+const CHECKSUM_CHUNK_LEN: usize = 192;
 
 #[repr(C)]
 struct ChecksumLoopContext {
@@ -596,7 +599,7 @@ fn checksum_skb_region(
         // SAFETY: the callback is a static BPF subprogram with the signature
         // required by `bpf_loop`. The mutable context lives on this stack for
         // the synchronous helper call, and flags zero is the only supported
-        // mode. The input length caps the loop at 255 fixed iterations.
+        // mode. The input length caps the loop at 341 fixed iterations.
         let performed = unsafe {
             bpf_loop(
                 full_chunks,
@@ -1022,7 +1025,7 @@ fn parse_downlink(ctx: &mut TcContext) -> u64 {
 /// Authorize the complete downlink forwarding identity and perform decap.
 ///
 /// Keep this phase in a verifier-visible BPF subprogram. The envelope and
-/// software-checksum phase uses a bounded 256-byte `bpf_loop` callback stack;
+/// software-checksum phase uses a bounded `bpf_loop` callback stack;
 /// separating the map-graph authorization phase ensures the callback and the
 /// endpoint/owner checks do not share one oversized caller frame.
 #[inline(never)]

@@ -296,6 +296,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `opc-key` custody remain later #334 slices.
 
 ### Fixed
+- **Linux 6.8 GTP-U eBPF verifier compatibility — `opc-gtpu-dataplane`:**
+  reduces the bounded checksum callback frame so the complete downlink call
+  chain remains below Linux 6.8's cumulative 512-byte BPF stack limit without
+  changing checksum coverage, endpoint binding, PDR, commit-record, or owner
+  validation. The committed object is regenerated, both classifiers are
+  load-gated on exact Linux 6.8.0-134 in CI, and `BPF_PROG_LOAD` rejection now
+  maps to the redaction-safe typed `GtpuError::ProgramLoadRejected` rather than
+  an undifferentiated I/O failure (#427).
 - **Table-scoped Linux route readback — `opc-route-steering`:** route
   convergence now classifies only candidates in the requested address family,
   destination prefix, and routing table. An unrelated table's non-unicast or
