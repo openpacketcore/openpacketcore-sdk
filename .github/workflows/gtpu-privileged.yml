@@ -204,11 +204,29 @@ jobs:
             readelf -sW "$1" | awk '
               $4 == "FUNC" || $4 == "OBJECT" {
                 name = $8
-                if (name ~ /checksum_loop_chunk$/) {
+                if (name ~ /^_RNvC[^_]+_17opc_gtpu_datapath19checksum_loop_chunk$/) {
                   name = "checksum_loop_chunk"
                 }
-                if (name ~ /authorize_and_decap_downlink$/) {
+                if (name ~ /^_RNvC[^_]+_17opc_gtpu_datapath28authorize_and_decap_downlink$/) {
                   name = "authorize_and_decap_downlink"
+                }
+                if (name ~ /^_RNvC[^_]+_17opc_gtpu_datapath14parse_downlink$/) {
+                  name = "parse_downlink"
+                }
+                if (name ~ /^_RNvC[^_]+_20opc_gtpu_ebpf_common24pdp_commit_wire_is_valid$/) {
+                  name = "pdp_commit_wire_is_valid"
+                }
+                if (name ~ /^_RNvC[^_]+_20opc_gtpu_ebpf_common32pdp_commit_wire_authorizes_graph$/) {
+                  name = "pdp_commit_wire_authorizes_graph"
+                }
+                if (name ~ /^_RNvC[^_]+_20opc_gtpu_ebpf_common35marked_owner_wire_authorizes_uplink$/) {
+                  name = "marked_owner_wire_authorizes_uplink"
+                }
+                if (name ~ /^_RNvC[^_]+_20opc_gtpu_ebpf_common35pdp_commit_wire_authorizes_downlink$/) {
+                  name = "pdp_commit_wire_authorizes_downlink"
+                }
+                if (name ~ /^_RNvC[^_]+_20opc_gtpu_ebpf_common37marked_owner_wire_authorizes_downlink$/) {
+                  name = "marked_owner_wire_authorizes_downlink"
                 }
                 print $4, name
               }
@@ -218,6 +236,6 @@ jobs:
           inventory "${rebuilt}" > rebuilt.inventory
           cat rebuilt.inventory
           diff -u committed.inventory rebuilt.inventory
-          for symbol in opc_gtpu_uplink opc_gtpu_downlink checksum_loop_chunk authorize_and_decap_downlink GTPU_UPLINK_FAR GTPU_ULM_FAR GTPU_UPLINK_DSCP GTPU_ULM_DSCP GTPU_UL_SPORT GTPU_ULM_SPORT GTPU_DOWNLINK_PDR GTPU_DLM_PDR GTPU_DL_BIND GTPU_DL_DROP GTPU_M_OWNER GTPU_COUNTERS GTPU_CONFIG; do
+          for symbol in opc_gtpu_uplink opc_gtpu_downlink checksum_loop_chunk authorize_and_decap_downlink parse_downlink pdp_commit_wire_is_valid pdp_commit_wire_authorizes_graph marked_owner_wire_authorizes_uplink pdp_commit_wire_authorizes_downlink marked_owner_wire_authorizes_downlink GTPU_UPLINK_FAR GTPU_ULM_FAR GTPU_UPLINK_DSCP GTPU_ULM_DSCP GTPU_UL_SPORT GTPU_ULM_SPORT GTPU_DOWNLINK_PDR GTPU_DLM_PDR GTPU_DL_BIND GTPU_DL_DROP GTPU_M_OWNER GTPU_COUNTERS GTPU_CONFIG; do
             grep -q " ${symbol}$" committed.inventory
           done
