@@ -269,6 +269,9 @@ impl Provision {
 
 impl Drop for Provision {
     fn drop(&mut self) {
+        let _ = Command::new("ip")
+            .args(["link", "del", &self.down_main])
+            .output();
         for namespace in [&self.peer_ns, &self.redir_ns] {
             let _ = Command::new("ip")
                 .args(["netns", "del", namespace])

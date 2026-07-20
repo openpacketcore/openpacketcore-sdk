@@ -35,6 +35,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mode. XDP sends every current IANA-registered IPv6 extension kind except
   direct native ESP to the userspace slow path, and public diagnostics redact
   packet and topology identities.
+- **Interrupted Host-XDP link-state queries — `opc-ipsec-lb`:** graceful XDP
+  handoff now makes up to three bounded retries of the complete `RTM_GETLINK`
+  snapshot when the kernel reports an interrupted or overrun dump. Every retry
+  starts from an empty observation; malformed, contradictory, oversized, or
+  repeatedly interrupted replies remain fail-closed (#436).
 
 ### Added
 - **Admitted IKEv2 CERTREQ authority hashing — `opc-proto-ikev2`:** adds a
