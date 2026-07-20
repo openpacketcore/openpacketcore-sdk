@@ -115,7 +115,10 @@ struct MockRuleResident {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
-struct RouteKernelKey(crate::model::IpPrefix);
+struct RouteKernelKey {
+    destination: crate::model::IpPrefix,
+    table: u32,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
 struct RuleKernelKey {
@@ -131,7 +134,10 @@ struct MockOwnedCollectionState {
 
 impl RouteKernelKey {
     fn from_request(request: &RouteRequest) -> Self {
-        Self(request.destination)
+        Self {
+            destination: request.destination,
+            table: request.table,
+        }
     }
 }
 
@@ -202,7 +208,7 @@ impl MockRouteSteeringBackend {
 
     /// Seed an SDK-owned resident route without recording an installation.
     ///
-    /// Multiple kernel-valid candidates may share the broad destination
+    /// Multiple kernel-valid candidates may share the destination-and-table
     /// readback key. An identical candidate is idempotent.
     pub fn seed_route(&self, route: RouteRequest) -> Result<(), RouteSteeringError> {
         self.seed_route_with_ownership(route, true)
@@ -1864,7 +1870,6 @@ mod tests {
         let backend = MockRouteSteeringBackend::new();
         let mut resident_route = route();
         resident_route.oif_ifindex = 77;
-        resident_route.table = 200;
         resident_route.priority = None;
         backend.seed_route(resident_route.clone()).unwrap();
 
@@ -1878,7 +1883,7 @@ mod tests {
             route_conflict.mismatch(),
             RouteMismatch {
                 output_interface: true,
-                table: true,
+                table: false,
                 priority: true,
                 kernel_semantics: false,
             }
@@ -1904,6 +1909,28 @@ mod tests {
                 table: true,
                 kernel_semantics: false,
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn routes_in_other_tables_are_outside_the_mock_readback_key() {
+        let backend = MockRouteSteeringBackend::new();
+        let mut other_table = route();
+        other_table.table += 1;
+        backend.seed_route(other_table.clone()).unwrap();
+
+        assert_eq!(
+            backend.read_route(&route()).await.unwrap(),
+            RouteReadback::Absent
+        );
+        assert_eq!(
+            backend.converge_route(route()).await.unwrap(),
+            RouteConvergenceOutcome::Installed
+        );
+        backend.remove_converged_route(route()).await.unwrap();
+        assert_eq!(
+            backend.read_route(&other_table).await.unwrap(),
+            RouteReadback::ExactPresent
         );
     }
 

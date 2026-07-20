@@ -5,9 +5,9 @@ use std::process::Command;
 
 use opc_route_steering::{
     FirewallMark, IpPrefix, LinuxRouteSteeringBackend, LinuxRuleProtocolCapability,
-    OwnedRouteRuleScope, OwnedRouteRuleSet, RouteConvergenceOutcome, RouteReadback, RouteRequest,
-    RouteRuleRollback, RouteSteeringBackend, RouteSteeringIpFamily, RuleConvergenceOutcome,
-    RuleReadback, RuleRequest,
+    OwnedRouteRuleScope, OwnedRouteRuleSet, ReadbackIndeterminateReason, RouteConvergenceOutcome,
+    RouteReadback, RouteRequest, RouteRuleRollback, RouteSteeringBackend, RouteSteeringIpFamily,
+    RuleConvergenceOutcome, RuleReadback, RuleRequest,
 };
 
 const OWNED_PROTOCOL: &str = "242";
@@ -46,6 +46,98 @@ async fn live_absent_documentation_rule_readback_completes() {
         backend.read_rule(&request).await.unwrap(),
         RuleReadback::Absent
     );
+}
+
+#[tokio::test]
+#[ignore = "requires CAP_NET_ADMIN in an isolated network namespace"]
+async fn live_default_route_readback_is_table_scoped_and_same_table_fail_closed() {
+    const OWNED_TABLE: u32 = 4_000_000_420;
+    const FOREIGN_TABLE: u32 = 4_000_000_421;
+
+    let backend = LinuxRouteSteeringBackend::new();
+    let route = RouteRequest {
+        destination: IpPrefix::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+        oif_ifindex: 1,
+        table: OWNED_TABLE,
+        priority: None,
+    };
+
+    ip(&[
+        "route",
+        "add",
+        "unreachable",
+        "default",
+        "table",
+        &FOREIGN_TABLE.to_string(),
+        "metric",
+        "42760",
+    ]);
+    assert_eq!(
+        backend.converge_route(route.clone()).await.unwrap(),
+        RouteConvergenceOutcome::Installed
+    );
+    assert_eq!(
+        backend.converge_route(route.clone()).await.unwrap(),
+        RouteConvergenceOutcome::ExactAlreadyPresent
+    );
+    backend.remove_converged_route(route.clone()).await.unwrap();
+    assert_eq!(
+        backend.read_route(&route).await.unwrap(),
+        RouteReadback::Absent
+    );
+
+    let foreign = Command::new("ip")
+        .args([
+            "route",
+            "show",
+            "table",
+            &FOREIGN_TABLE.to_string(),
+            "type",
+            "unreachable",
+        ])
+        .output()
+        .unwrap();
+    assert!(foreign.status.success());
+    assert!(String::from_utf8_lossy(&foreign.stdout).contains("unreachable default"));
+    ip(&[
+        "route",
+        "del",
+        "unreachable",
+        "default",
+        "table",
+        &FOREIGN_TABLE.to_string(),
+        "metric",
+        "42760",
+    ]);
+
+    ip(&[
+        "route",
+        "add",
+        "unreachable",
+        "default",
+        "table",
+        &OWNED_TABLE.to_string(),
+        "metric",
+        "42760",
+    ]);
+    assert_eq!(
+        backend.converge_route(route.clone()).await.unwrap(),
+        RouteConvergenceOutcome::Indeterminate(ReadbackIndeterminateReason::UnrepresentableObject)
+    );
+    assert_eq!(
+        backend.read_route(&route).await.unwrap(),
+        RouteReadback::Indeterminate(ReadbackIndeterminateReason::UnrepresentableObject)
+    );
+    ip(&[
+        "route",
+        "del",
+        "unreachable",
+        "default",
+        "table",
+        &OWNED_TABLE.to_string(),
+        "metric",
+        "42760",
+    ]);
 }
 
 #[tokio::test]
