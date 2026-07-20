@@ -21,7 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`IpsecLbError::XdpKernelFloorNotMet`). The pinned map ABI changed
   (owner map keyed by the canonical ownership key, separate fence map,
   versioned config): pre-existing bpffs pins must be removed before
-  attaching the new object.
+  attaching the new object. The fence generation resets to zero across the
+  v1→v2 pin upgrade; this is benign because owner pins are flushed at
+  attach and the fenced ownership authority re-mints the fence.
 
 ### Added
 - **SWm DER access authorization context — `opc-proto-diameter`:**

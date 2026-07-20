@@ -185,12 +185,15 @@ destination-scoped ownership key, so an entry installed from a
 `SessionOwnershipKey` is exactly the key the datapath derives from a packet.
 Each entry carries the owner shard and an ownership generation; userspace
 updates write the whole value in one map operation (atomic in practice on the
-supported kernels, with a strict flags/reserved-byte decode that fails closed
-if a value is ever read mid-update). Attach adopts pinned maps across process
-restarts but flushes the owner map and rewrites the config before the program
-is attached, and the persisted fence is honored, so a crashed process's
-entries are never re-armed; a stale pinned-map schema fails the load and must
-be recovered by removing the interface's bpffs pin directory.
+supported kernels; a theoretically torn read is not detected — the strict
+decode only rejects structurally invalid values, so the design accepts
+best-effort atomicity bounded by the fence and re-install discipline).
+Attach adopts pinned maps across process restarts but flushes the owner map
+and rewrites the config before the program is attached, and the persisted
+fence is honored, so a crashed process's entries are never re-armed; a stale
+pinned-map schema fails the load or the first map operation against the
+adopted pins and must be recovered by removing the interface's bpffs pin
+directory.
 
 Verdicts are fail-closed and the program never drops a packet:
 

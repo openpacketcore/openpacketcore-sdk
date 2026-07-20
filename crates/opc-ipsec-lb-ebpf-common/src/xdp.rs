@@ -685,14 +685,16 @@ fn encode_bytes(encoded: &mut [u8], cursor: usize, bytes: &[u8]) -> usize {
 ///
 /// A userspace update writes the whole 16-byte value with one
 /// `bpf_map_update_elem` call. On the kernels within the documented feature
-/// floor this replacement is atomic in practice: lookups see the previous or
-/// the new value. That guarantee is architectural, not contractual — the
-/// ABI is therefore designed defensively: the strict decode below rejects
-/// non-zero flags/reserved bytes and zero generations, so a theoretically
-/// torn read is overwhelmingly likely to fail closed to the slow path with
-/// the error counter rather than steer on a corrupted owner/generation
-/// pair. Callers that need hard atomicity should treat this design as
-/// best-effort plus fail-closed, not as a lock.
+/// floor that replacement is atomic in practice, but the guarantee is
+/// architectural, not contractual: a lockless reader could theoretically
+/// observe a torn value mid-update, and nothing in this ABI detects that.
+/// In particular the dangerous mix — an old owner shard with a new
+/// generation — decodes perfectly and is NOT caught by the strict decode
+/// below; that decode only rejects structurally invalid values (non-zero
+/// flags/reserved bytes, zero generation). The design therefore accepts
+/// best-effort atomicity: the fence generation and the fenced ownership
+/// authority's re-install discipline bound how long a stale or mixed value
+/// can steer before the slow path re-validates it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct XdpOwnerValue {
     /// Owner shard identity.

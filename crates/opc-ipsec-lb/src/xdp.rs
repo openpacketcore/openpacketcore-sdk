@@ -35,14 +35,18 @@
 //!   update). Replacement attaches the new program atomically while adopting
 //!   the pinned maps, so there is no window of dropped or mis-verdicted
 //!   traffic; a schema-incompatible pinned map fails the replacement load
-//!   before anything is detached.
+//!   before anything is detached. On the netlink path (5.7–5.8) a failed
+//!   replacement may leave the previous program occupying the hook; recover
+//!   with `ip link set dev <interface> xdp off` and attach again.
 //!
 //! Owner-map updates write the whole 16-byte value with one
 //! `bpf_map_update_elem` call. On the kernels within the floor that
-//! replacement is atomic in practice, but the ABI does not rely on it: the
-//! strict value decode rejects non-zero flags/reserved bytes and zero
-//! generations, so a theoretically torn read fails closed to the slow path
-//! with the error counter rather than steering on a corrupted pair.
+//! replacement is atomic in practice, but nothing in the ABI detects a torn
+//! read: the strict value decode only rejects structurally invalid values
+//! (non-zero flags/reserved bytes, zero generation), not the dangerous
+//! old-owner/new-generation mix. The design accepts best-effort atomicity;
+//! the fence and the ownership authority's re-install discipline bound the
+//! impact.
 //!
 //! The ownership fence generation lives in its own single-slot aligned-`u64`
 //! map, so fence advances are tear-free single stores. Attach adopts pinned
@@ -51,8 +55,10 @@
 //! entries installed by a crashed owner cannot be re-armed.
 //!
 //! A stale pinned-map schema (for example from an older SDK revision) fails
-//! the object load with an `xdp_object_load` I/O error; the recovery path is
-//! to remove the interface's bpffs pin directory and re-attach.
+//! the object load or the first map operation against the adopted pins (an
+//! older config layout may only fail at the first config write); the
+//! recovery path is to remove the interface's bpffs pin directory and
+//! re-attach.
 
 use std::fmt;
 use std::io;
@@ -100,6 +106,11 @@ pub(crate) trait HostXdpRuntime: Send + Sync + fmt::Debug {
     /// Report whether `ifindex` names an existing interface that is
     /// administratively up in the current netns.
     fn link_is_up(&self, ifindex: u32) -> Result<bool, IpsecLbError>;
+
+    /// Kernel id of the XDP program already attached to `ifindex`, when
+    /// any. Used to reject cross-writer attach collisions before any map
+    /// state is touched.
+    fn attached_prog_id(&self, ifindex: u32) -> Result<Option<u32>, IpsecLbError>;
 
     /// Load the pinned maps, write the datapath config, and attach the XDP
     /// program for `interface`.
@@ -391,7 +402,11 @@ impl HostXdpSteeringBackend {
     /// atomically (netlink compare-and-replace or `bpf_link` update), so there
     /// is no window of dropped or mis-verdicted traffic. Requires the
     /// documented replacement kernel floor; a schema-incompatible pinned map
-    /// fails before anything is detached.
+    /// fails before anything is detached. On the netlink replace path
+    /// (Linux 5.7–5.8), a failed replacement may leave the previous program
+    /// occupying the hook; a later attach then reports the interface as
+    /// occupied. Recover with `ip link set dev <interface> xdp off` and
+    /// attach again.
     pub async fn replace(&self) -> Result<(), IpsecLbError> {
         self.run_blocking("host_xdp_replace", |backend| backend.replace_sync())
             .await
@@ -532,6 +547,12 @@ impl HostXdpSteeringBackend {
             ));
         }
         self.validate_handoff_ifindex(ifindex)?;
+        // Reject cross-writer collisions before any map state is touched: if
+        // another writer's program occupies the hook, flushing owners or
+        // writing our config would silently re-configure their datapath.
+        if self.inner.runtime.attached_prog_id(ifindex)?.is_some() {
+            return Err(IpsecLbError::AlreadyExists);
+        }
         // The runtime flushes adopted owner pins and writes the config before
         // attaching the program, so the datapath never verdicts with a
         // previous process's state. The fence map is deliberately not
@@ -813,6 +834,10 @@ impl HostXdpRuntime for UnsupportedHostXdpRuntime {
         Err(IpsecLbError::Unsupported)
     }
 
+    fn attached_prog_id(&self, _ifindex: u32) -> Result<Option<u32>, IpsecLbError> {
+        Err(IpsecLbError::Unsupported)
+    }
+
     fn attach(
         &self,
         _interface: &str,
@@ -1041,6 +1066,10 @@ mod aya_runtime {
 
         fn link_is_up(&self, ifindex: u32) -> Result<bool, IpsecLbError> {
             link_is_up(ifindex)
+        }
+
+        fn attached_prog_id(&self, ifindex: u32) -> Result<Option<u32>, IpsecLbError> {
+            attached_prog_id(ifindex)
         }
 
         fn attach(
@@ -1307,10 +1336,36 @@ mod aya_runtime {
     const IFF_UP: u32 = 0x1;
     const NLMSG_HDR_LEN: usize = 16;
     const IFINFOMSG_LEN: usize = 16;
+    const IFLA_XDP: u16 = 43;
+    const IFLA_XDP_ATTACHED: u16 = 2;
+    const IFLA_XDP_PROG_ID: u16 = 4;
+
+    /// Link state for one interface from an `RTM_GETLINK` dump.
+    #[derive(Debug, Default, Clone, Copy)]
+    struct LinkQuery {
+        /// The interface exists in the current netns.
+        found: bool,
+        /// The interface is administratively up.
+        is_up: bool,
+        /// Kernel id of the attached XDP program, when one is attached.
+        xdp_prog_id: Option<u32>,
+    }
 
     /// Report whether `ifindex` names an existing interface that is
     /// administratively up, via an `RTM_GETLINK` dump in the current netns.
     fn link_is_up(ifindex: u32) -> Result<bool, IpsecLbError> {
+        let query = link_query(ifindex)?;
+        Ok(query.found && query.is_up)
+    }
+
+    /// Kernel id of the XDP program attached to `ifindex`, when any.
+    fn attached_prog_id(ifindex: u32) -> Result<Option<u32>, IpsecLbError> {
+        Ok(link_query(ifindex)?.xdp_prog_id)
+    }
+
+    /// Query link state for `ifindex` via an `RTM_GETLINK` dump in the
+    /// current netns.
+    fn link_query(ifindex: u32) -> Result<LinkQuery, IpsecLbError> {
         let socket = sys::open_route_netlink_socket()
             .map_err(|error| IpsecLbError::io("xdp_link_query_open", error))?;
         let mut request = [0_u8; NLMSG_HDR_LEN + IFINFOMSG_LEN];
@@ -1322,6 +1377,7 @@ mod aya_runtime {
         sys::send_message(&socket, &request)
             .map_err(|error| IpsecLbError::io("xdp_link_query_send", error))?;
 
+        let mut query = LinkQuery::default();
         let mut buffer = [0_u8; 65_536];
         let mut attempts = 0_u32;
         loop {
@@ -1345,7 +1401,7 @@ mod aya_runtime {
                             ));
                         }
                         match msg_type {
-                            NLMSG_DONE => return Ok(false),
+                            NLMSG_DONE => return Ok(query),
                             NLMSG_ERROR => {
                                 return Err(IpsecLbError::io(
                                     "xdp_link_query",
@@ -1353,13 +1409,16 @@ mod aya_runtime {
                                 ));
                             }
                             RTM_NEWLINK if msg_len >= NLMSG_HDR_LEN + IFINFOMSG_LEN => {
-                                let body = &buffer[cursor + NLMSG_HDR_LEN..];
+                                let body = &buffer[cursor + NLMSG_HDR_LEN..cursor + msg_len];
                                 let index =
                                     i32::from_ne_bytes(body[4..8].try_into().unwrap_or([0; 4]));
-                                let flags =
-                                    u32::from_ne_bytes(body[8..12].try_into().unwrap_or([0; 4]));
                                 if index > 0 && index as u32 == ifindex {
-                                    return Ok(flags & IFF_UP != 0);
+                                    query.found = true;
+                                    let flags = u32::from_ne_bytes(
+                                        body[8..12].try_into().unwrap_or([0; 4]),
+                                    );
+                                    query.is_up = flags & IFF_UP != 0;
+                                    query.xdp_prog_id = parse_xdp_prog_id(&body[IFINFOMSG_LEN..]);
                                 }
                             }
                             _ => {}
@@ -1377,6 +1436,55 @@ mod aya_runtime {
                 Err(error) => return Err(IpsecLbError::io("xdp_link_query_recv", error)),
             }
         }
+    }
+
+    /// Parse the nested `IFLA_XDP` program id from a link's attribute area.
+    fn parse_xdp_prog_id(attributes: &[u8]) -> Option<u32> {
+        let mut cursor = 0_usize;
+        while cursor + 4 <= attributes.len() {
+            let rta_len = usize::from(u16::from_ne_bytes(
+                attributes[cursor..cursor + 2].try_into().ok()?,
+            ));
+            let rta_type = u16::from_ne_bytes(attributes[cursor + 2..cursor + 4].try_into().ok()?);
+            if rta_len < 4 || cursor + rta_len > attributes.len() {
+                return None;
+            }
+            if rta_type == IFLA_XDP {
+                return parse_xdp_nested(&attributes[cursor + 4..cursor + rta_len]);
+            }
+            cursor += rta_len.div_ceil(4) * 4;
+        }
+        None
+    }
+
+    /// Parse the program id (or attached flag) inside an `IFLA_XDP` nest.
+    fn parse_xdp_nested(nest: &[u8]) -> Option<u32> {
+        let mut cursor = 0_usize;
+        let mut attached = false;
+        while cursor + 4 <= nest.len() {
+            let rta_len = usize::from(u16::from_ne_bytes(
+                nest[cursor..cursor + 2].try_into().ok()?,
+            ));
+            let rta_type = u16::from_ne_bytes(nest[cursor + 2..cursor + 4].try_into().ok()?);
+            if rta_len < 4 || cursor + rta_len > nest.len() {
+                return None;
+            }
+            match rta_type {
+                IFLA_XDP_PROG_ID if rta_len >= 8 => {
+                    let id = u32::from_ne_bytes(nest[cursor + 4..cursor + 8].try_into().ok()?);
+                    if id != 0 {
+                        return Some(id);
+                    }
+                }
+                IFLA_XDP_ATTACHED if rta_len >= 5 => {
+                    attached = nest[cursor + 4] != 0;
+                }
+                _ => {}
+            }
+            cursor += rta_len.div_ceil(4) * 4;
+        }
+        // Kernels without IFLA_XDP_PROG_ID only report the attached flag.
+        attached.then_some(u32::MAX)
     }
 
     fn effective_capability(capability: u32) -> Result<bool, IpsecLbError> {
@@ -1438,6 +1546,7 @@ mod tests {
         fences: HashMap<u32, u64>,
         fence_writes: Vec<u64>,
         link_up: bool,
+        foreign_prog_attached: bool,
         replace_error: Option<&'static str>,
         counters: [u64; COUNTER_SLOTS as usize],
     }
@@ -1462,6 +1571,7 @@ mod tests {
                 fences: HashMap::new(),
                 fence_writes: Vec::new(),
                 link_up: true,
+                foreign_prog_attached: false,
                 replace_error: None,
                 counters: [0; COUNTER_SLOTS as usize],
             }
@@ -1492,6 +1602,10 @@ mod tests {
 
         fn link_is_up(&self, _ifindex: u32) -> Result<bool, IpsecLbError> {
             Ok(self.state().link_up)
+        }
+
+        fn attached_prog_id(&self, _ifindex: u32) -> Result<Option<u32>, IpsecLbError> {
+            Ok(self.state().foreign_prog_attached.then_some(1))
         }
 
         fn attach(
@@ -1899,6 +2013,23 @@ mod tests {
             })
         ));
         assert!(runtime.state().attached.is_empty());
+    }
+
+    #[tokio::test]
+    async fn attach_on_occupied_interface_conflicts_without_touching_state() {
+        let runtime = Arc::new(TestRuntime::default());
+        runtime.state().foreign_prog_attached = true;
+        let backend =
+            HostXdpSteeringBackend::with_runtime_and_config("swu0", runtime.clone(), config());
+        assert_eq!(backend.attach().await, Err(IpsecLbError::AlreadyExists));
+        let state = runtime.state();
+        assert!(
+            state.attached.is_empty(),
+            "runtime.attach must never run for an occupied interface"
+        );
+        assert!(state.config.is_none(), "no config write may leak through");
+        assert!(state.owners.is_empty(), "no owner flush may leak through");
+        assert!(state.fence_writes.is_empty());
     }
 
     #[tokio::test]

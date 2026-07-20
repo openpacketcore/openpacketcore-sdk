@@ -693,6 +693,55 @@ fn xdp_keyless_classification_and_owner_steering() {
         "pass-through (background ND traffic may add more): {counters:?}"
     );
 
+    // --- Stage A1: a second writer's attach conflicts without touching state. ---
+    // Writer B uses a different self shard: if its config leaked into the
+    // pinned config map, writer A's remote-owned traffic would start
+    // verdicting LOCAL. The attach must fail before any map is touched.
+    let writer_b = HostXdpSteeringBackend::new(
+        provision.pub_main.clone(),
+        HostXdpSteeringBackendConfig {
+            bpffs_pin_root: provision.pin_root.join("writer-b"),
+            self_shard: ShardId::new(REMOTE_SHARD),
+            routing_domain: RoutingDomainTag::new(DOMAIN),
+            redirect_handoff: HostXdpRedirectHandoff::UserspaceRedirector {
+                ifindex: NonZeroU32::new(hand_ifindex).expect("nonzero hand-off ifindex"),
+            },
+            attach_mode: HostXdpAttachMode::Generic,
+        },
+    );
+    assert!(
+        matches!(
+            runtime.block_on(writer_b.attach()),
+            Err(opc_ipsec_lb::IpsecLbError::AlreadyExists)
+        ),
+        "a second writer on an occupied interface must conflict"
+    );
+    assert!(
+        !provision.pin_root.join("writer-b").exists(),
+        "the rejected writer must not create pins"
+    );
+    send_udp(
+        &sender,
+        4500,
+        &esp_packet(SPI_REMOTE_ESP_UDP, 3, &[0x5c; 24]),
+    );
+    std::thread::sleep(Duration::from_millis(200));
+    let captured_a1 = drain_fd(&capture_socket);
+    assert!(
+        captured_a1.iter().any(|frame| {
+            frame
+                .windows(4)
+                .any(|window| window == SPI_REMOTE_ESP_UDP.to_be_bytes())
+        }),
+        "writer A must keep steering remote-owned traffic to the hand-off"
+    );
+    let counters = runtime.block_on(backend.counters()).expect("counters");
+    assert_eq!(
+        counters.local, 4,
+        "the rejected writer's self shard must not leak: {counters:?}"
+    );
+    assert_eq!(counters.redirect, 2, "{counters:?}");
+
     // --- Stage B: atomic per-key update under concurrent traffic. ---
     let atomic_key = esp_udp_key(SPI_ATOMIC_ESP_UDP);
     runtime
@@ -774,7 +823,7 @@ fn xdp_keyless_classification_and_owner_steering() {
     );
     assert_eq!(
         counters.local + counters.redirect + counters.miss + counters.stale,
-        4 + 1 + 1 + 1 + 200,
+        4 + 2 + 1 + 1 + 200,
         "classified verdicts after the atomic stage: {counters:?}"
     );
 
