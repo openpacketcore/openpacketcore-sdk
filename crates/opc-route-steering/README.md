@@ -151,15 +151,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Convergence Contract
 
-- A route's logical collision key is its effective destination network prefix:
-  route convergence, readback, and mock resident state clear IPv4/IPv6 host
-  bits before comparison, matching the Linux FIB. Equality also compares the
-  output interface, table, optional metric, fixed unicast kernel semantics, and
-  namespace ownership protocol emitted by this crate. IPv4 `None`/zero metrics
+- The built-in Linux and mock route collision key is the address family,
+  effective destination network prefix, and routing table. Route convergence,
+  readback, and mock resident state clear IPv4/IPv6 host bits before comparison,
+  matching the Linux FIB. Equality within that key also compares the output
+  interface, optional metric, fixed unicast kernel semantics, and namespace
+  ownership protocol emitted by this crate. IPv4 `None`/zero metrics
   canonicalize to an absent attribute; IPv6 `None`/zero canonicalize to the
-  kernel's effective metric `1024`. This does not canonicalize rule selectors.
-  Legacy Linux route install/remove still emits the caller-supplied destination
-  bytes, and legacy mock mutation operations record the exact caller request.
+  kernel's effective metric `1024`. The public mismatch evidence retains a
+  table field for external backends that use a broader collision key. This does
+  not canonicalize rule selectors. Legacy Linux route install/remove still
+  emits the caller-supplied destination bytes, and legacy mock mutation
+  operations record the exact caller request.
 - A rule's logical collision key is its address family and priority. Equality
   compares source, destination, firewall mark and mask, table, priority, and
   the fixed table-lookup semantics and namespace ownership protocol emitted by
