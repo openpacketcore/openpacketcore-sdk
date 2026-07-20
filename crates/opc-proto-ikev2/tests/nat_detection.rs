@@ -398,6 +398,7 @@ fn collector_rejects_invalid_shape_and_hash_length() {
 
 #[test]
 fn debug_output_redacts_nat_detection_hashes_and_endpoints() {
+    support::ensure_ike_crypto();
     let payloads = Ikev2NatDetectionPayloads::from_notifies([
         natd_notify(IKEV2_NOTIFY_NAT_DETECTION_SOURCE_IP, &IPV4_SOURCE_HASH),
         natd_notify(
@@ -412,7 +413,8 @@ fn debug_output_redacts_nat_detection_hashes_and_endpoints() {
         RESPONDER_SPI,
         ipv4_source().into(),
         ipv4_destination().into(),
-    );
+    )
+    .expect("explicitly admitted NAT-D evaluation computes");
     let payloads_debug = format!("{payloads:?}");
     let evaluation_debug = format!("{evaluation:?}");
     let endpoint_debug = format!(
