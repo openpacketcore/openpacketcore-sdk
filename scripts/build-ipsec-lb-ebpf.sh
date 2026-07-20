@@ -6,6 +6,8 @@
 #   - Rust toolchain: $OPC_EBPF_TOOLCHAIN (default nightly-2026-06-22, needs
 #     the rust-src component for -Z build-std)
 #   - bpf-linker: $OPC_BPF_LINKER or `bpf-linker` on PATH
+#   - build directory: $OPC_EBPF_TARGET_DIR (defaults to the standalone
+#     crate's target directory; worktrees should always override it)
 #   - absolute paths are remapped out of debug info/BTF
 set -euo pipefail
 
@@ -15,7 +17,7 @@ artifact="${repo_root}/crates/opc-ipsec-lb/bpf/opc-ipsec-lb-xdp.bpf.o"
 
 toolchain="${OPC_EBPF_TOOLCHAIN:-nightly-2026-06-22}"
 linker="${OPC_BPF_LINKER:-bpf-linker}"
-target_dir="${crate_dir}/target"
+target_dir="${OPC_EBPF_TARGET_DIR:-${crate_dir}/target}"
 
 sysroot="$(rustc "+${toolchain}" --print sysroot)"
 cargo_home="${CARGO_HOME:-${HOME}/.cargo}"

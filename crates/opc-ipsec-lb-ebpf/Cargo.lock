@@ -120,6 +120,7 @@ name = "opc-ipsec-lb-ebpf"
 version = "0.2.0"
 dependencies = [
  "aya-ebpf",
+ "aya-ebpf-bindings",
  "opc-ipsec-lb-ebpf-common",
 ]
 

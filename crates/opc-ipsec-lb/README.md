@@ -13,6 +13,12 @@ steer layer:
   owner selection for routed, multi-ingress deployments;
 - zero-copy raw IPv4/IPv6 SWu classifier for UDP/500, RFC 3948 UDP/4500,
   native ESP, IKEv2 SKF, fragments, and ICMP/ICMPv6 error quotes;
+- a Host-XDP/eBPF fast path (`opc-ipsec-lb-ebpf`) executing the same keyless
+  classification in the kernel, steering by destination-scoped ownership keys
+  with fenced generations: local pass for self-owned keys, an explicit
+  userspace-redirector hand-off interface for remote-owned keys, and
+  fail-closed slow-path hand-off with per-verdict counters for map miss,
+  stale generation, and unclassifiable candidates (never a silent drop);
 - stateless IKE cookie helper for edge DoS posture;
 - failover safety guards for IV-counter and replay-window restoration;
 - audited same-SPI re-pin coordination with monotonic ownership fencing;
@@ -168,6 +174,40 @@ match verdict {
 }
 # }
 ```
+
+## Host-XDP fast path
+
+`HostXdpSteeringBackend` loads the committed CO-RE XDP object
+(`bpf/opc-ipsec-lb-xdp.bpf.o`) and maintains its pinned owner map. The kernel
+program runs the same branch-bounded classification as the keyless userspace
+classifier and looks each classified packet up by the canonical
+destination-scoped ownership key, so an entry installed from a
+`SessionOwnershipKey` is exactly the key the datapath derives from a packet.
+Each entry carries the owner shard and an ownership generation; userspace
+updates are atomic per key (a reader never observes a torn owner/generation
+pair).
+
+Verdicts are fail-closed and the program never drops a packet:
+
+- owner = self -> `XDP_PASS` to the local stack;
+- owner = remote -> `XDP_REDIRECT` into the configured userspace-redirector
+  hand-off interface. The authenticated steering encapsulation cannot be
+  built in the kernel (AEAD is a userspace concern), so this explicit channel
+  is the kernel/userspace split: the redirector captures the original packet
+  and applies the authenticated transport;
+- map miss, stale generation (older than the fence set with
+  `advance_fence`), unclassifiable candidates, and internal errors ->
+  `XDP_PASS` to the userspace slow path, each with a distinct per-CPU counter
+  exported via `counters()`.
+
+The kernel feature floor is enforced at load with the typed
+`IpsecLbError::XdpKernelFloorNotMet` error: Linux >= 5.4 with kernel BTF,
+bpffs, and XDP for attach; Linux >= 5.7 for graceful atomic program
+replacement via `replace()` (pinned maps are adopted, so counters and owner
+state persist and there is no verdict gap). The default attach mode is
+native; for veth hand-off interfaces without a peer XDP consumer use
+`HostXdpAttachMode::Generic`. See `tests/xdp_privileged.rs` for the gated
+netns/veth proof (`OPC_IPSEC_LB_RUN_PRIVILEGED=1`).
 
 ## Leadership-gated VIP ownership
 

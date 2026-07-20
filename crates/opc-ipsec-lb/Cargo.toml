@@ -41,6 +41,7 @@ zeroize = { workspace = true }
 aya = { version = "0.14" }
 
 [dev-dependencies]
+nix = { workspace = true, features = ["net", "sched", "socket"] }
 opc-identity = { path = "../opc-identity", version = "0.2.0" }
 opc-key = { path = "../opc-key", version = "0.2.0" }
 opc-session-testkit = { path = "../opc-session-testkit", version = "0.2.0" }

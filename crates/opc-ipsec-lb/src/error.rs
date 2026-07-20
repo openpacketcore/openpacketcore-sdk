@@ -104,6 +104,13 @@ pub enum IpsecLbError {
     /// Cookie verification failed.
     #[error("IKE cookie verification failed")]
     CookieRejected,
+    /// The running kernel does not meet the documented XDP datapath feature
+    /// floor (see `opc-ipsec-lb-ebpf-common` for the floor).
+    #[error("IPsec load-balancing XDP kernel feature floor not met: {requirement}")]
+    XdpKernelFloorNotMet {
+        /// Static, redaction-safe requirement label.
+        requirement: &'static str,
+    },
 }
 
 impl IpsecLbError {
@@ -160,6 +167,12 @@ impl IpsecLbError {
     #[must_use]
     pub const fn forwarding_proof_rejected(reason: &'static str) -> Self {
         Self::ForwardingProofRejected { reason }
+    }
+
+    /// Build a redaction-safe XDP kernel-floor rejection.
+    #[must_use]
+    pub const fn xdp_kernel_floor(requirement: &'static str) -> Self {
+        Self::XdpKernelFloorNotMet { requirement }
     }
 }
 

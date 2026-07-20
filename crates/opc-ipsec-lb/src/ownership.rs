@@ -8,30 +8,23 @@
 use std::fmt;
 use std::num::NonZeroU64;
 
+use opc_ipsec_lb_ebpf_common::{
+    canonical_esp_key, canonical_established_ike_key, canonical_initial_ike_key, XdpIpAddress,
+    OWNERSHIP_ADDR_FAMILY_IPV4, OWNERSHIP_ADDR_FAMILY_IPV6, OWNERSHIP_ESP_NATIVE,
+    OWNERSHIP_ESP_UDP_ENCAPSULATED, OWNERSHIP_KEY_MAGIC, OWNERSHIP_KIND_ESP,
+    OWNERSHIP_KIND_ESTABLISHED_IKE, OWNERSHIP_KIND_INITIAL_IKE,
+};
+#[doc(no_inline)]
+pub use opc_ipsec_lb_ebpf_common::{
+    OWNERSHIP_KEY_ENCODING_VERSION, OWNERSHIP_KEY_MAX_ENCODED_BYTES,
+};
 use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::model::{IpAddress, ShardId};
 
-const OWNERSHIP_KEY_MAGIC: [u8; 4] = *b"OPCO";
-const INITIAL_IKE_KIND: u8 = 1;
-const ESTABLISHED_IKE_KIND: u8 = 2;
-const ESP_KIND: u8 = 3;
-const IPV4_FAMILY: u8 = 4;
-const IPV6_FAMILY: u8 = 6;
-const ESP_NATIVE: u8 = 1;
-const ESP_UDP_ENCAPSULATED: u8 = 2;
 const MIN_ALLOCATABLE_ESP_SPI: u32 = 256;
-
-/// Version of the stable canonical ownership-key byte encoding.
-pub const OWNERSHIP_KEY_ENCODING_VERSION: u8 = 1;
-
-/// Maximum number of bytes in one canonical ownership key.
-///
-/// The widest form is an initial-IKE key with IPv6 source and destination
-/// addresses. Decoders reject a larger input before parsing it.
-pub const OWNERSHIP_KEY_MAX_ENCODED_BYTES: usize = 59;
 
 /// Maximum number of members admitted to one deterministic ownership view.
 pub const MAX_ELIGIBLE_OWNERS: usize = 1_024;
@@ -637,39 +630,37 @@ impl SessionOwnershipKey {
     }
 
     /// Encode the versioned, bounded canonical ownership key.
+    ///
+    /// The byte layout is owned by `opc-ipsec-lb-ebpf-common` so the XDP
+    /// datapath derives byte-identical keys from packet headers.
     #[must_use]
     pub fn to_canonical_bytes(self) -> Vec<u8> {
-        let mut encoded = Vec::with_capacity(OWNERSHIP_KEY_MAX_ENCODED_BYTES);
-        encoded.extend_from_slice(&OWNERSHIP_KEY_MAGIC);
-        encoded.push(OWNERSHIP_KEY_ENCODING_VERSION);
-
-        match self {
-            Self::InitialIke(key) => {
-                encoded.push(INITIAL_IKE_KIND);
-                encode_destination(&mut encoded, key.destination);
-                encode_address(&mut encoded, key.outer_source.address);
-                encoded.extend_from_slice(&key.outer_source.port.to_be_bytes());
-                encoded.extend_from_slice(&key.initiator_spi.get().to_be_bytes());
-                encoded.push(key.exchange.get());
-            }
-            Self::EstablishedIke(key) => {
-                encoded.push(ESTABLISHED_IKE_KIND);
-                encode_destination(&mut encoded, key.destination);
-                encoded.extend_from_slice(&key.initiator_spi.get().to_be_bytes());
-                encoded.extend_from_slice(&key.responder_spi.get().to_be_bytes());
-            }
-            Self::Esp(key) => {
-                encoded.push(ESP_KIND);
-                encode_destination(&mut encoded, key.destination);
-                encoded.push(match key.encapsulation {
-                    EspEncapsulationKind::Native => ESP_NATIVE,
-                    EspEncapsulationKind::UdpEncapsulated => ESP_UDP_ENCAPSULATED,
-                });
-                encoded.extend_from_slice(&key.inbound_spi.get().to_be_bytes());
-            }
-        }
-
-        encoded
+        let (encoded, len) = match self {
+            Self::InitialIke(key) => canonical_initial_ike_key(
+                xdp_address(key.destination.address),
+                key.destination.routing_domain.get(),
+                xdp_address(key.outer_source.address),
+                key.outer_source.port,
+                key.initiator_spi.get(),
+                key.exchange.get(),
+            ),
+            Self::EstablishedIke(key) => canonical_established_ike_key(
+                xdp_address(key.destination.address),
+                key.destination.routing_domain.get(),
+                key.initiator_spi.get(),
+                key.responder_spi.get(),
+            ),
+            Self::Esp(key) => canonical_esp_key(
+                xdp_address(key.destination.address),
+                key.destination.routing_domain.get(),
+                match key.encapsulation {
+                    EspEncapsulationKind::Native => OWNERSHIP_ESP_NATIVE,
+                    EspEncapsulationKind::UdpEncapsulated => OWNERSHIP_ESP_UDP_ENCAPSULATED,
+                },
+                key.inbound_spi.get(),
+            ),
+        };
+        encoded[..len].to_vec()
     }
 
     /// Decode one exact canonical ownership key.
@@ -692,7 +683,7 @@ impl SessionOwnershipKey {
         let destination = decode_destination(&mut cursor)?;
 
         let key = match kind {
-            INITIAL_IKE_KIND => {
+            OWNERSHIP_KIND_INITIAL_IKE => {
                 let outer_source =
                     OuterSourceTuple::new(decode_address(&mut cursor)?, cursor.u16()?);
                 let initiator_spi = IkeSpi::new(cursor.u64()?)?;
@@ -704,7 +695,7 @@ impl SessionOwnershipKey {
                     exchange,
                 ))
             }
-            ESTABLISHED_IKE_KIND => {
+            OWNERSHIP_KIND_ESTABLISHED_IKE => {
                 let initiator_spi = IkeSpi::new(cursor.u64()?)?;
                 let responder_spi = IkeSpi::new(cursor.u64()?)?;
                 Self::EstablishedIke(EstablishedIkeOwnershipKey::new(
@@ -713,10 +704,10 @@ impl SessionOwnershipKey {
                     responder_spi,
                 ))
             }
-            ESP_KIND => {
+            OWNERSHIP_KIND_ESP => {
                 let encapsulation = match cursor.u8()? {
-                    ESP_NATIVE => EspEncapsulationKind::Native,
-                    ESP_UDP_ENCAPSULATED => EspEncapsulationKind::UdpEncapsulated,
+                    OWNERSHIP_ESP_NATIVE => EspEncapsulationKind::Native,
+                    OWNERSHIP_ESP_UDP_ENCAPSULATED => EspEncapsulationKind::UdpEncapsulated,
                     _ => return Err(OwnershipKeyError::UnknownEspEncapsulation),
                 };
                 let inbound_spi = EspSpi::new(cursor.u32()?)?;
@@ -1032,21 +1023,10 @@ impl fmt::Debug for OwnerSelection {
     }
 }
 
-fn encode_destination(encoded: &mut Vec<u8>, destination: DestinationContext) {
-    encoded.extend_from_slice(&destination.routing_domain.get().to_be_bytes());
-    encode_address(encoded, destination.address);
-}
-
-fn encode_address(encoded: &mut Vec<u8>, address: IpAddress) {
+const fn xdp_address(address: IpAddress) -> XdpIpAddress {
     match address {
-        IpAddress::V4(octets) => {
-            encoded.push(IPV4_FAMILY);
-            encoded.extend_from_slice(&octets);
-        }
-        IpAddress::V6(octets) => {
-            encoded.push(IPV6_FAMILY);
-            encoded.extend_from_slice(&octets);
-        }
+        IpAddress::V4(octets) => XdpIpAddress::V4(octets),
+        IpAddress::V6(octets) => XdpIpAddress::V6(octets),
     }
 }
 
@@ -1060,8 +1040,8 @@ fn decode_destination(
 
 fn decode_address(cursor: &mut EncodingCursor<'_>) -> Result<IpAddress, OwnershipKeyError> {
     match cursor.u8()? {
-        IPV4_FAMILY => Ok(IpAddress::V4(cursor.take::<4>()?)),
-        IPV6_FAMILY => Ok(IpAddress::V6(cursor.take::<16>()?)),
+        OWNERSHIP_ADDR_FAMILY_IPV4 => Ok(IpAddress::V4(cursor.take::<4>()?)),
+        OWNERSHIP_ADDR_FAMILY_IPV6 => Ok(IpAddress::V6(cursor.take::<16>()?)),
         _ => Err(OwnershipKeyError::UnknownAddressFamily),
     }
 }

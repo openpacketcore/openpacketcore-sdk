@@ -29,12 +29,7 @@ const IPV6_HEADER_LEN: usize = 40;
 const UDP_HEADER_LEN: usize = 8;
 const ICMP_ERROR_HEADER_LEN: usize = 8;
 
-/// Maximum number of IPv6 extension headers inspected by the keyless parser.
-///
-/// The fixed bound keeps attacker-controlled extension chains from turning
-/// classification into an unbounded per-packet loop. A packet exceeding the
-/// bound is unclassifiable rather than partially interpreted.
-pub const MAX_INGRESS_IPV6_EXTENSION_HEADERS: usize = 8;
+pub use opc_ipsec_lb_ebpf_common::MAX_INGRESS_IPV6_EXTENSION_HEADERS;
 
 /// Why a raw ingress packet could not be classified without guessing.
 ///

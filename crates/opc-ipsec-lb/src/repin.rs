@@ -1299,6 +1299,7 @@ fn error_code(error: &IpsecLbError) -> &'static str {
         IpsecLbError::ForwardingProofRejected { .. } => "forwarding_proof_rejected",
         IpsecLbError::UnsafeResume { .. } => "unsafe_resume",
         IpsecLbError::CookieRejected => "cookie_rejected",
+        IpsecLbError::XdpKernelFloorNotMet { .. } => "xdp_kernel_floor_not_met",
     }
 }
 

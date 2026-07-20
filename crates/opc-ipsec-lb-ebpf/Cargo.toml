@@ -10,6 +10,7 @@ publish = false
 
 [dependencies]
 aya-ebpf = "0.2.1"
+aya-ebpf-bindings = "0.2.0"
 opc-ipsec-lb-ebpf-common = { path = "../opc-ipsec-lb-ebpf-common" }
 
 [[bin]]
