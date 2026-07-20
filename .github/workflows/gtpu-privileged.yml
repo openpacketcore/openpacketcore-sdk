@@ -192,7 +192,6 @@ jobs:
       - name: Rebuild and compare functional program/map sections
         run: |
           set -euo pipefail
-          command -v objcopy
           command -v readelf
           committed="${RUNNER_TEMP}/committed-opc-gtpu-datapath.bpf.o"
           cp crates/opc-gtpu-dataplane/bpf/opc-gtpu-datapath.bpf.o "${committed}"
@@ -255,19 +254,15 @@ jobs:
 
           functional_section_manifest() {
             local object="$1"
-            local output_dir="$2"
-            local index=0
+            local digest
             local section
-            local section_bytes
-            mkdir -p "${output_dir}"
             while IFS= read -r section; do
               [[ -n "${section}" ]] || continue
-              index=$((index + 1))
-              section_bytes="${output_dir}/${index}.bin"
-              objcopy --dump-section "${section}=${section_bytes}" "${object}"
-              printf '%s %s\n' \
-                "${section}" \
-                "$(sha256sum "${section_bytes}" | awk '{print $1}')"
+              # GNU objcopy on the hosted runner does not recognize EM_BPF.
+              # Keep readelf failure visible as an assignment status under
+              # `set -euo pipefail`, then hash its exact section-byte dump.
+              digest="$(readelf --hex-dump="${section}" "${object}" | sha256sum | awk '{print $1}')"
+              printf '%s %s\n' "${section}" "${digest}"
             done < <(functional_section_names "${object}")
           }
 
@@ -316,12 +311,8 @@ jobs:
             grep -Fxq "${section}" committed.functional-sections
           done
 
-          functional_section_manifest \
-            "${committed}" "${RUNNER_TEMP}/committed-functional-sections" \
-            > committed.functional-manifest
-          functional_section_manifest \
-            "${rebuilt}" "${RUNNER_TEMP}/rebuilt-functional-sections" \
-            > rebuilt.functional-manifest
+          functional_section_manifest "${committed}" > committed.functional-manifest
+          functional_section_manifest "${rebuilt}" > rebuilt.functional-manifest
           cat rebuilt.functional-manifest
           diff -u committed.functional-manifest rebuilt.functional-manifest
 
