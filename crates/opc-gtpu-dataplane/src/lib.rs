@@ -34,6 +34,7 @@ pub mod error;
 pub mod linux;
 pub mod mock;
 pub mod model;
+pub mod reassembly;
 pub mod unsupported;
 
 pub use backend::GtpuDataplaneBackend;
@@ -57,6 +58,10 @@ pub use model::{
     PdpContextReconciliationCapabilities, PdpContextRemovalOutcome, PdpContextSelector,
     PdpContextSelectorOccupancy, PdpContextUplinkIdentity, PdpContextUplinkSelector,
     RemovePdpContextRequest, Teid, GTPU_PORT,
+};
+pub use reassembly::{
+    DownlinkOuterProvenance, GtpuReassemblyConsumer, GtpuReassemblyCounters,
+    GtpuReassemblyDrop, GtpuReassemblyOutcome,
 };
 pub use opc_types::DscpCodepoint;
 pub use unsupported::UnsupportedGtpuDataplaneBackend;
