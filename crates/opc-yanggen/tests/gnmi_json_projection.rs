@@ -32,6 +32,7 @@ fn build_input() -> CanonicalInput {
                 "/ex:system/ex:dns".to_string(),
                 "/ex:system/ex:interfaces".to_string(),
                 "/ex:system/ex:routes".to_string(),
+                "/ex:system/ex:origins".to_string(),
                 "/ex:system/ex:subscriber".to_string(),
                 "/ex:system/ex:servers".to_string(),
                 "/ex:system/ex:custom-tags".to_string(),
@@ -155,6 +156,39 @@ fn build_input() -> CanonicalInput {
             kind: SchemaNodeKind::Leaf,
             config: true,
             type_ref: Some(TypeRef::Uint32),
+            source: source.clone(),
+            ..Default::default()
+        },
+        SchemaNode {
+            path: "/ex:system/ex:origins".to_string(),
+            module: "example".to_string(),
+            kind: SchemaNodeKind::List,
+            config: true,
+            key_leaves: vec!["origin-host".to_string(), "origin-realm".to_string()],
+            child_paths: vec![
+                "/ex:system/ex:origins/ex:origin-host".to_string(),
+                "/ex:system/ex:origins/ex:origin-realm".to_string(),
+            ],
+            source: source.clone(),
+            ..Default::default()
+        },
+        SchemaNode {
+            path: "/ex:system/ex:origins/ex:origin-host".to_string(),
+            module: "example".to_string(),
+            kind: SchemaNodeKind::Leaf,
+            config: true,
+            type_ref: Some(TypeRef::String),
+            data_class: Some("network-sensitive".to_string()),
+            source: source.clone(),
+            ..Default::default()
+        },
+        SchemaNode {
+            path: "/ex:system/ex:origins/ex:origin-realm".to_string(),
+            module: "example".to_string(),
+            kind: SchemaNodeKind::Leaf,
+            config: true,
+            type_ref: Some(TypeRef::String),
+            data_class: Some("network-sensitive".to_string()),
             source: source.clone(),
             ..Default::default()
         },

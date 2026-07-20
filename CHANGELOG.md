@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Breaking generated key API; fail-closed YANG list keys — `opc-yanggen`:**
+  generated RFC 7951
+  deserialization now rejects incomplete single or composite keys and exact
+  duplicate keys with stable value-free errors instead of defaulting missing
+  leaves or replacing earlier rows. Generated diagnostics redact non-public
+  single and composite map keys by construction while preserving serde,
+  ordering, borrowed lookup, gNMI, NETCONF, and synchronized explicit
+  redaction behavior. Non-public single-key maps now use `SensitiveKey<T>`;
+  callers inserting an owned key wrap it with `.into()` or
+  `SensitiveKey::new`, and both `Debug` and `Display` remain redacted (#434,
+  #435).
 - **Breaking: `opc-ipsec-lb` Host-XDP backend rework (#308):** the Host-XDP
   tier now executes keyless classification and destination-scoped owner
   steering in the kernel instead of SPI-tag steering. `HostXdpTarget`,

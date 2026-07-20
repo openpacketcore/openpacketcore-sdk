@@ -65,6 +65,9 @@ fn get_key_type(
                 let child_name = clean_segment(last_segment(&child.path));
                 if child_name == key_name {
                     key_ty = get_raw_type(child, nodes_by_path);
+                    if is_sensitive_node(child) {
+                        key_ty = quote! { SensitiveKey<#key_ty> };
+                    }
                     break;
                 }
             }
@@ -77,6 +80,25 @@ fn get_key_type(
     }
 }
 
+fn key_leaf_node<'a>(
+    list_node: &SchemaNode,
+    key_name: &str,
+    nodes_by_path: &HashMap<String, &'a SchemaNode>,
+) -> Option<&'a SchemaNode> {
+    list_node.child_paths.iter().find_map(|child_path| {
+        nodes_by_path
+            .get(child_path)
+            .copied()
+            .filter(|child| clean_segment(last_segment(&child.path)) == key_name)
+    })
+}
+
+fn has_sensitive_key(list_node: &SchemaNode, nodes_by_path: &HashMap<String, &SchemaNode>) -> bool {
+    list_node.key_leaves.iter().any(|key_name| {
+        key_leaf_node(list_node, key_name, nodes_by_path).is_some_and(is_sensitive_node)
+    })
+}
+
 fn is_root_path(path: &str) -> bool {
     let trimmed = path.trim_start_matches('/');
     !trimmed.is_empty() && !trimmed.contains('/')
@@ -87,6 +109,106 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
     let mut nodes_by_path = HashMap::new();
     for node in &input.nodes {
         nodes_by_path.insert(node.path.clone(), node);
+    }
+
+    let has_sensitive_single_key = input.nodes.iter().any(|node| {
+        node.kind == SchemaNodeKind::List
+            && node.key_leaves.len() == 1
+            && has_sensitive_key(node, &nodes_by_path)
+    });
+    let has_sensitive_composite_key = input.nodes.iter().any(|node| {
+        node.kind == SchemaNodeKind::List
+            && node.key_leaves.len() > 1
+            && has_sensitive_key(node, &nodes_by_path)
+    });
+
+    if has_sensitive_composite_key {
+        tokens.extend(quote! {
+            struct RedactedKeyFieldDebug;
+
+            impl std::fmt::Debug for RedactedKeyFieldDebug {
+                fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    f.write_str("<REDACTED>")
+                }
+            }
+        });
+    }
+
+    if has_sensitive_single_key {
+        tokens.extend(quote! {
+            /// Ordered single-list key that never exposes its value through `Debug`.
+            #[derive(
+                Clone,
+                Copy,
+                PartialEq,
+                Eq,
+                PartialOrd,
+                Ord,
+                std::hash::Hash,
+                Serialize,
+                Deserialize,
+                Default,
+            )]
+            #[serde(transparent)]
+            pub struct SensitiveKey<T> {
+                inner: T,
+            }
+
+            impl<T> SensitiveKey<T> {
+                /// Wraps a sensitive key value without changing its wire representation.
+                pub fn new(inner: T) -> Self {
+                    Self { inner }
+                }
+
+                /// Returns the key value for explicit protocol and lookup use.
+                pub fn get(&self) -> &T {
+                    &self.inner
+                }
+
+                /// Consumes the wrapper and returns the key value.
+                pub fn into_inner(self) -> T {
+                    self.inner
+                }
+            }
+
+            impl<T> std::fmt::Debug for SensitiveKey<T> {
+                fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    f.write_str("<REDACTED>")
+                }
+            }
+
+            impl<T> std::fmt::Display for SensitiveKey<T> {
+                fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    f.write_str("<REDACTED>")
+                }
+            }
+
+            impl<T> From<T> for SensitiveKey<T> {
+                fn from(inner: T) -> Self {
+                    Self::new(inner)
+                }
+            }
+
+            impl<T> std::ops::Deref for SensitiveKey<T> {
+                type Target = T;
+
+                fn deref(&self) -> &Self::Target {
+                    &self.inner
+                }
+            }
+
+            impl<T> std::borrow::Borrow<T> for SensitiveKey<T> {
+                fn borrow(&self) -> &T {
+                    &self.inner
+                }
+            }
+
+            impl std::borrow::Borrow<str> for SensitiveKey<String> {
+                fn borrow(&self) -> &str {
+                    self.inner.as_str()
+                }
+            }
+        });
     }
 
     // Emit helper types
@@ -474,13 +596,17 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
             if node.kind == SchemaNodeKind::List && node.key_leaves.len() > 1 {
                 let key_struct_ident = format_ident!("{}Key", to_pascal_case(name));
                 let mut key_fields = TokenStream::new();
+                let mut key_debug_fields = TokenStream::new();
+                let mut key_has_sensitive_field = false;
                 for key_name in &node.key_leaves {
                     let mut key_ty = quote! { String };
+                    let mut key_is_sensitive = false;
                     for child_path in &node.child_paths {
                         if let Some(child) = nodes_by_path.get(child_path) {
                             let child_name = clean_segment(last_segment(&child.path));
                             if child_name == key_name {
                                 key_ty = get_raw_type(child, &nodes_by_path);
+                                key_is_sensitive = is_sensitive_node(child);
                                 break;
                             }
                         }
@@ -489,13 +615,40 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                     key_fields.extend(quote! {
                         pub #field_ident: #key_ty,
                     });
-                }
-                tokens.extend(quote! {
-                    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
-                    pub struct #key_struct_ident {
-                        #key_fields
+                    if key_is_sensitive {
+                        key_has_sensitive_field = true;
+                        key_debug_fields.extend(quote! {
+                            debug.field(stringify!(#field_ident), &RedactedKeyFieldDebug);
+                        });
+                    } else {
+                        key_debug_fields.extend(quote! {
+                            debug.field(stringify!(#field_ident), &self.#field_ident);
+                        });
                     }
-                });
+                }
+                if key_has_sensitive_field {
+                    tokens.extend(quote! {
+                        #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
+                        pub struct #key_struct_ident {
+                            #key_fields
+                        }
+
+                        impl std::fmt::Debug for #key_struct_ident {
+                            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                                let mut debug = f.debug_struct(stringify!(#key_struct_ident));
+                                #key_debug_fields
+                                debug.finish()
+                            }
+                        }
+                    });
+                } else {
+                    tokens.extend(quote! {
+                        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
+                        pub struct #key_struct_ident {
+                            #key_fields
+                        }
+                    });
+                }
             }
 
             // Generate ExtractKey trait implementation for list value struct
@@ -516,9 +669,15 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                     let child = child_node.unwrap();
                     let is_sensitive = is_sensitive_node(child);
                     if is_sensitive {
-                        quote! { self.#field_ident.get().as_option().cloned().unwrap_or_default() }
+                        quote! {
+                            self.#field_ident
+                                .get()
+                                .as_option()
+                                .cloned()
+                                .map(SensitiveKey::from)
+                        }
                     } else {
-                        quote! { self.#field_ident.as_option().cloned().unwrap_or_default() }
+                        quote! { self.#field_ident.as_option().cloned() }
                     }
                 } else {
                     let key_struct_ident = format_ident!("{}Key", to_pascal_case(name));
@@ -537,24 +696,24 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                         let is_sensitive = is_sensitive_node(child);
                         let field_ident = format_ident!("{}", to_snake_case(key_field));
                         let val_expr = if is_sensitive {
-                            quote! { self.#field_ident.get().as_option().cloned().unwrap_or_default() }
+                            quote! { self.#field_ident.get().as_option().cloned()? }
                         } else {
-                            quote! { self.#field_ident.as_option().cloned().unwrap_or_default() }
+                            quote! { self.#field_ident.as_option().cloned()? }
                         };
                         key_constructors.extend(quote! {
                             #field_ident: #val_expr,
                         });
                     }
                     quote! {
-                        #key_struct_ident {
+                        Some(#key_struct_ident {
                             #key_constructors
-                        }
+                        })
                     }
                 };
 
                 tokens.extend(quote! {
                     impl super::serde::ExtractKey<#key_ty> for #struct_name {
-                        fn extract_key(&self) -> #key_ty {
+                        fn extract_key(&self) -> Option<#key_ty> {
                             #extract_body
                         }
                     }

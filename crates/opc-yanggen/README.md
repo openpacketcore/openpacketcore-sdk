@@ -50,6 +50,25 @@ The Rust generator can emit:
 - NETCONF XML render and edit support.
 - Stack metadata fixtures.
 
+### Keyed-list boundary guarantees
+
+Generated RFC 7951 deserialization treats YANG list keys as an integrity
+boundary. Every single or composite key leaf must be present, and a repeated
+key is rejected instead of replacing the earlier row in the generated
+`BTreeMap`. Both failures use stable diagnostics that never include key
+values.
+
+Key leaves with a non-public `opc:data-class` remain available to serde,
+ordering, lookup, gNMI, and NETCONF projections, but generated `Debug`
+implementations redact them. A sensitive single key uses the generated
+`SensitiveKey<T>` wrapper; borrowed `String`/`str` lookup remains available,
+while explicit map insertion wraps the owned key with `.into()` or
+`SensitiveKey::new`. Its `Debug` and `Display` implementations are redacted;
+authorized generated protocol/path code accesses the inner value explicitly.
+Composite key diagnostics redact individual sensitive fields. Calling
+`redact_sensitive()` continues to hash the map key and corresponding row leaf
+together.
+
 ## Relationships
 
 - Emits implementations consumed by `opc-config-model`,

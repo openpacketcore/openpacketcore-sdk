@@ -103,7 +103,9 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                         }
                                         if let Some(kn) = find_key_leaf_node {
                                             if super::types::is_sensitive_node(kn) {
-                                                key_redact = quote! { k = k.deterministic_hash(); };
+                                                key_redact = quote! {
+                                                    k = SensitiveKey::new(k.get().deterministic_hash());
+                                                };
                                             }
                                         }
                                     } else {
