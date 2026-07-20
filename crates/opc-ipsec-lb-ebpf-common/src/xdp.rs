@@ -6,9 +6,9 @@
 //!   destination-scoped ownership key (destination address + routing domain +
 //!   encapsulation + SPI context) defined by `opc-ipsec-lb`'s ownership model;
 //! - the single-slot datapath configuration (self shard, routing domain,
-//!   userspace-redirector hand-off interface) and the separate single-slot
-//!   ownership fence generation (an aligned `u64` in its own map so
-//!   generation advances are never torn against a concurrent reader);
+//!   userspace-redirector hand-off interface) and the separate single-entry
+//!   hash-map ownership fence generation (hash-element replacement publishes
+//!   either the old or new generation to a concurrent reader);
 //! - the per-verdict counter indices exported to userspace;
 //! - the branch-bounded transport classification decision procedure and the
 //!   owner-verdict decision, shared verbatim by the eBPF program and the
@@ -19,12 +19,12 @@
 //!
 //! # Kernel feature floor
 //!
-//! - Load/attach: Linux >= 5.4 with kernel BTF (`/sys/kernel/btf/vmlinux`),
-//!   XDP, pinned maps (bpffs), per-CPU arrays, `bpf_redirect`, and
-//!   `bpf_xdp_load_bytes`.
-//! - Atomic program replacement: Linux >= 5.7 (`XDP_FLAGS_REPLACE` with
-//!   `IFLA_XDP_EXPECTED_FD`) or >= 5.9 (`bpf_link_create`/`bpf_link_update`
-//!   for XDP). The userspace loader enforces both floors with a typed error.
+//! - Load/attach: Linux >= 5.18 with kernel BTF
+//!   (`/sys/kernel/btf/vmlinux`), XDP `bpf_link`, pinned maps (bpffs), per-CPU
+//!   arrays, `bpf_redirect`, and `bpf_xdp_load_bytes`.
+//! - Atomic program replacement uses only `bpf_link_update`; legacy netlink
+//!   attachment is rejected at load time. The userspace loader enforces the
+//!   release, helper, capability, and attachment-mode floor with typed errors.
 //!
 //! # Fail-closed contract
 //!
@@ -46,9 +46,12 @@
 //!
 //! - any IP fragmentation (including initial fragments with MF set, which
 //!   the userspace classifier accepts) is unclassifiable here;
-//! - IPv6 extension-header order, duplication, AH alignment, and
-//!   fragment-header reserved-bit validation are not reproduced: the walk
-//!   only skips well-formed extension headers to find the terminal protocol;
+//! - every packet whose IPv6 base header names an extension kind registered
+//!   by IANA is unclassifiable in XDP and goes to that slow path, except direct
+//!   native ESP, which the fast path classifies as a supported transport. This
+//!   includes extension kinds the userspace walker does not interpret, so an
+//!   unwalked extension can never conceal UDP/500, UDP/4500, or ESP from owner
+//!   steering;
 //! - ICMP/ICMPv6 error quotes are not classified (they are ordinary
 //!   pass-through traffic here, exactly where the userspace slow path sees
 //!   them anyway).
@@ -62,17 +65,48 @@ use crate::{
     ESP_HEADER_PREFIX_LEN, IKEV2_EXCHANGE_IKE_SA_INIT, IKEV2_HDR_LEN, IKEV2_MAJOR_VERSION,
     NAT_T_KEEPALIVE, NON_ESP_MARKER, UDP_HDR_LEN, UDP_PORT_IKE, UDP_PORT_IKE_NATT,
 };
+use core::fmt;
 
 /// IPv4 protocol number for UDP.
 pub const IP_PROTOCOL_UDP: u8 = 17;
 /// IPv4/IPv6 protocol number for native ESP (RFC 4303).
 pub const IP_PROTOCOL_ESP: u8 = 50;
 
-/// Maximum number of IPv6 extension headers inspected by the keyless parser.
+/// Return whether `next_header` is currently identified as an IPv6 extension
+/// header in the IANA Protocol Numbers registry.
+///
+/// The XDP path uses this broader predicate to fail closed before treating an
+/// unwalked extension as unrelated traffic. Protocol 50 (ESP) is in the IANA
+/// extension-header set, but a base header that directly names ESP remains a
+/// supported SWu transport and is handled before this predicate is applied.
+#[must_use]
+#[inline(always)]
+pub const fn is_ipv6_extension_header_kind(next_header: u8) -> bool {
+    matches!(
+        next_header,
+        0 | 43 | 44 | 50 | 51 | 60 | 135 | 139 | 140 | 253 | 254
+    )
+}
+
+/// Return whether `next_header` is an IPv6 extension kind whose semantic
+/// chain is supported by the userspace keyless classifier.
+///
+/// This is intentionally narrower than [`is_ipv6_extension_header_kind`].
+/// The userspace parser walks only the kinds whose lengths, ordering, and
+/// duplication rules it validates completely.
+#[must_use]
+#[inline(always)]
+pub const fn is_supported_ipv6_extension_header(next_header: u8) -> bool {
+    matches!(next_header, 0 | 43 | 44 | 51 | 60)
+}
+
+/// Maximum number of IPv6 extension headers inspected by the userspace
+/// keyless parser.
 ///
 /// The fixed bound keeps attacker-controlled extension chains from turning
-/// classification into an unbounded per-packet loop. A packet exceeding the
-/// bound is unclassifiable rather than partially interpreted.
+/// classification into an unbounded per-packet loop. The XDP path does not
+/// walk these supported extension headers at all: every matching packet is
+/// handed to that userspace slow path as unclassifiable.
 pub const MAX_INGRESS_IPV6_EXTENSION_HEADERS: usize = 8;
 
 /// Number of transport-header bytes the XDP program copies for classification.
@@ -87,24 +121,36 @@ pub const MIN_ALLOCATABLE_ESP_SPI: u32 = 256;
 
 /// Minimum kernel release for loading and attaching the XDP datapath.
 ///
-/// Linux 5.4 is the first release exposing kernel BTF at
-/// `/sys/kernel/btf/vmlinux` together with the XDP, map-pinning, per-CPU
-/// array, and `bpf_redirect` features the program relies on.
-pub const XDP_MIN_KERNEL_RELEASE: (u16, u16) = (5, 4);
+/// Linux 5.18 introduced `bpf_xdp_load_bytes`, the newest helper used by the
+/// committed datapath. Load-time probing still verifies helper availability
+/// because vendor kernels can carry partial or disabled BPF feature sets.
+pub const XDP_MIN_KERNEL_RELEASE: (u16, u16) = (5, 18);
 
 /// Minimum kernel release for graceful atomic program replacement.
 ///
-/// Atomic compare-and-replace of an attached XDP program needs
-/// `XDP_FLAGS_REPLACE` with `IFLA_XDP_EXPECTED_FD` (Linux 5.7) or the XDP
-/// `bpf_link` update path (Linux 5.9).
-pub const XDP_MIN_KERNEL_REPLACE_RELEASE: (u16, u16) = (5, 7);
+/// The backend admits only XDP `bpf_link` attachments, introduced in Linux
+/// 5.9. The datapath's stricter load floor therefore also covers replacement.
+pub const XDP_MIN_KERNEL_REPLACE_RELEASE: (u16, u16) = XDP_MIN_KERNEL_RELEASE;
 
 /// BPF map name: destination-scoped owner records.
 pub const MAP_OWNERS: &str = "IPSEC_LB_OWNERS";
-/// BPF map name: single-slot datapath configuration.
+/// BPF map name: single-entry datapath configuration.
 pub const MAP_CONFIG: &str = "IPSEC_LB_CONFIG";
-/// BPF map name: single-slot ownership fence generation.
+/// Reserved key for the single datapath-config entry.
+///
+/// Version 4 publishes config values through ordinary hash-element
+/// replacement. Versions 1 through 3 used array slot zero; the userspace
+/// upgrade adapter recognizes those layouts only while draining an explicit
+/// cross-process handoff.
+pub const CONFIG_KEY: u32 = 0;
+/// BPF map name: single-entry ownership fence generation.
 pub const MAP_FENCE: &str = "IPSEC_LB_FENCE";
+/// Reserved key for the single ownership-fence entry.
+///
+/// A hash-map entry is replaced by publishing a new immutable element. Kernel
+/// readers therefore observe the old or the new `u64`, never bytes being
+/// modified in place.
+pub const FENCE_KEY: u32 = 0;
 /// BPF map name: per-CPU per-verdict counters.
 pub const MAP_COUNTERS: &str = "IPSEC_LB_COUNTERS";
 /// XDP program name.
@@ -121,15 +167,15 @@ pub const OWNER_KEY_LEN: usize = 64;
 pub const OWNER_VALUE_LEN: usize = 16;
 /// Datapath config value byte length.
 pub const CONFIG_VALUE_LEN: usize = 32;
-/// Fence-map value byte length (one aligned `u64`).
+/// Fence-map value byte length (one `u64`).
 pub const FENCE_VALUE_LEN: usize = 8;
 /// Current datapath config ABI version.
 ///
-/// Version 2 moved the ownership fence generation out of the config value
-/// into its own aligned `u64` map (see [`MAP_FENCE`]); v1 configs are
-/// rejected so a stale pinned config fails closed instead of being
-/// misread.
-pub const XDP_CONFIG_ABI_VERSION: u8 = 2;
+/// Version 4 changes [`MAP_CONFIG`] from an array slot to a single-entry hash
+/// map. Both configuration and fence updates now publish immutable old-or-new
+/// hash elements. The userspace upgrade boundary migrates recognized v1-v3
+/// layouts into a fresh v4 namespace before atomically updating the XDP link.
+pub const XDP_CONFIG_ABI_VERSION: u8 = 4;
 
 /// Counter index: packets passed through untouched because they were not SWu
 /// IKE/ESP traffic.
@@ -163,6 +209,25 @@ pub const OWNERSHIP_KEY_ENCODING_VERSION: u8 = 1;
 /// Maximum number of bytes in one canonical ownership key.
 pub const OWNERSHIP_KEY_MAX_ENCODED_BYTES: usize = 59;
 
+/// Failure returned when a caller-provided canonical-key output buffer is too
+/// short for the selected address families and key kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CanonicalKeyWriteError {
+    /// The output buffer cannot hold the complete canonical key.
+    BufferTooSmall,
+}
+
+impl CanonicalKeyWriteError {
+    /// Stable machine-readable error code.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BufferTooSmall => "canonical_key_buffer_too_small",
+        }
+    }
+}
+
 /// Canonical ownership-key kind: initial IKE exchange.
 pub const OWNERSHIP_KIND_INITIAL_IKE: u8 = 1;
 /// Canonical ownership-key kind: established IKE SA.
@@ -179,12 +244,21 @@ pub const OWNERSHIP_ESP_NATIVE: u8 = 1;
 pub const OWNERSHIP_ESP_UDP_ENCAPSULATED: u8 = 2;
 
 /// An IP address observed or configured at the public ingress.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub enum XdpIpAddress {
     /// IPv4 address octets.
     V4([u8; 4]),
     /// IPv6 address octets.
     V6([u8; 16]),
+}
+
+impl fmt::Debug for XdpIpAddress {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::V4(_) => f.debug_tuple("V4").field(&"<redacted>").finish(),
+            Self::V6(_) => f.debug_tuple("V6").field(&"<redacted>").finish(),
+        }
+    }
 }
 
 impl XdpIpAddress {
@@ -214,7 +288,7 @@ impl XdpIpAddress {
 /// This mirrors the direct-ingress outcomes of the userspace classifier in
 /// `opc-ipsec-lb`: the same port/marker/protocol branches produce the same
 /// identity, or fail closed to `Unclassifiable` without guessing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub enum XdpTransportClass {
     /// IKEv2 with a non-zero responder SPI (established SA).
     IkeEstablished {
@@ -243,6 +317,31 @@ pub enum XdpTransportClass {
     NonSwu,
     /// An SWu candidate the bounded parser could not classify safely.
     Unclassifiable,
+}
+
+impl fmt::Debug for XdpTransportClass {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::IkeEstablished { .. } => f
+                .debug_struct("IkeEstablished")
+                .field("initiator_spi", &"<redacted>")
+                .field("responder_spi", &"<redacted>")
+                .finish(),
+            Self::IkeInitial { exchange, .. } => f
+                .debug_struct("IkeInitial")
+                .field("initiator_spi", &"<redacted>")
+                .field("exchange", exchange)
+                .finish(),
+            Self::Esp { encapsulation, .. } => f
+                .debug_struct("Esp")
+                .field("encapsulation", encapsulation)
+                .field("spi", &"<redacted>")
+                .finish(),
+            Self::NatKeepalive => f.write_str("NatKeepalive"),
+            Self::NonSwu => f.write_str("NonSwu"),
+            Self::Unclassifiable => f.write_str("Unclassifiable"),
+        }
+    }
 }
 
 /// Fast-path verdict for one classified packet.
@@ -337,15 +436,22 @@ pub fn classify_transport(
     declared_transport_len: usize,
 ) -> XdpTransportClass {
     match protocol {
-        IP_PROTOCOL_ESP => classify_native_esp(probe, available_len),
+        IP_PROTOCOL_ESP => classify_native_esp(probe, available_len, declared_transport_len),
         IP_PROTOCOL_UDP => classify_udp(probe, available_len, declared_transport_len),
         _ => XdpTransportClass::NonSwu,
     }
 }
 
 #[inline(always)]
-fn classify_native_esp(probe: &[u8], available_len: usize) -> XdpTransportClass {
-    if available_len < ESP_HEADER_PREFIX_LEN || probe.len() < ESP_HEADER_PREFIX_LEN {
+fn classify_native_esp(
+    probe: &[u8],
+    available_len: usize,
+    declared_transport_len: usize,
+) -> XdpTransportClass {
+    if declared_transport_len < ESP_HEADER_PREFIX_LEN
+        || declared_transport_len > available_len
+        || probe.len() < ESP_HEADER_PREFIX_LEN
+    {
         return XdpTransportClass::Unclassifiable;
     }
     let spi = u32::from_be_bytes([probe[0], probe[1], probe[2], probe[3]]);
@@ -491,27 +597,42 @@ pub fn ownership_map_key(
         XdpTransportClass::IkeEstablished {
             initiator_spi,
             responder_spi,
-        } => write_canonical_established_ike(
-            body,
-            destination,
-            routing_domain,
-            initiator_spi,
-            responder_spi,
-        ),
+        } => {
+            let Ok(len) = write_canonical_established_ike(
+                body,
+                destination,
+                routing_domain,
+                initiator_spi,
+                responder_spi,
+            ) else {
+                return None;
+            };
+            len
+        }
         XdpTransportClass::IkeInitial {
             initiator_spi,
             exchange,
-        } => write_canonical_initial_ike(
-            body,
-            destination,
-            routing_domain,
-            source,
-            source_port,
-            initiator_spi,
-            exchange,
-        ),
+        } => {
+            let Ok(len) = write_canonical_initial_ike(
+                body,
+                destination,
+                routing_domain,
+                source,
+                source_port,
+                initiator_spi,
+                exchange,
+            ) else {
+                return None;
+            };
+            len
+        }
         XdpTransportClass::Esp { encapsulation, spi } => {
-            write_canonical_esp(body, destination, routing_domain, encapsulation, spi)
+            let Ok(len) =
+                write_canonical_esp(body, destination, routing_domain, encapsulation, spi)
+            else {
+                return None;
+            };
+            len
         }
         XdpTransportClass::NatKeepalive
         | XdpTransportClass::NonSwu
@@ -537,7 +658,7 @@ pub fn canonical_initial_ike_key(
     exchange: u8,
 ) -> ([u8; OWNERSHIP_KEY_MAX_ENCODED_BYTES], usize) {
     let mut encoded = [0_u8; OWNERSHIP_KEY_MAX_ENCODED_BYTES];
-    let len = write_canonical_initial_ike(
+    let len = write_canonical_initial_ike_unchecked(
         &mut encoded,
         destination,
         routing_domain,
@@ -559,7 +680,7 @@ pub fn canonical_established_ike_key(
     responder_spi: u64,
 ) -> ([u8; OWNERSHIP_KEY_MAX_ENCODED_BYTES], usize) {
     let mut encoded = [0_u8; OWNERSHIP_KEY_MAX_ENCODED_BYTES];
-    let len = write_canonical_established_ike(
+    let len = write_canonical_established_ike_unchecked(
         &mut encoded,
         destination,
         routing_domain,
@@ -579,7 +700,7 @@ pub fn canonical_esp_key(
     spi: u32,
 ) -> ([u8; OWNERSHIP_KEY_MAX_ENCODED_BYTES], usize) {
     let mut encoded = [0_u8; OWNERSHIP_KEY_MAX_ENCODED_BYTES];
-    let len = write_canonical_esp(
+    let len = write_canonical_esp_unchecked(
         &mut encoded,
         destination,
         routing_domain,
@@ -590,11 +711,34 @@ pub fn canonical_esp_key(
 }
 
 /// Write the canonical initial-IKE ownership key into `buf`, returning the
-/// encoded length. `buf` must be at least the variant's fixed width; callers
-/// pass an [`OWNERSHIP_KEY_MAX_ENCODED_BYTES`]-sized buffer (or the owner-map
-/// key body, which is larger).
+/// encoded length.
+///
+/// Returns [`CanonicalKeyWriteError::BufferTooSmall`] before writing anything
+/// when `buf` cannot hold the complete key.
 #[inline(always)]
 pub fn write_canonical_initial_ike(
+    buf: &mut [u8],
+    destination: XdpIpAddress,
+    routing_domain: u64,
+    source: XdpIpAddress,
+    source_port: u16,
+    initiator_spi: u64,
+    exchange: u8,
+) -> Result<usize, CanonicalKeyWriteError> {
+    ensure_canonical_capacity(buf, canonical_initial_ike_len(destination, source))?;
+    Ok(write_canonical_initial_ike_unchecked(
+        buf,
+        destination,
+        routing_domain,
+        source,
+        source_port,
+        initiator_spi,
+        exchange,
+    ))
+}
+
+#[inline(always)]
+fn write_canonical_initial_ike_unchecked(
     buf: &mut [u8],
     destination: XdpIpAddress,
     routing_domain: u64,
@@ -612,8 +756,29 @@ pub fn write_canonical_initial_ike(
 }
 
 /// Write the canonical established-IKE ownership key into `buf`.
+///
+/// Returns [`CanonicalKeyWriteError::BufferTooSmall`] before writing anything
+/// when `buf` cannot hold the complete key.
 #[inline(always)]
 pub fn write_canonical_established_ike(
+    buf: &mut [u8],
+    destination: XdpIpAddress,
+    routing_domain: u64,
+    initiator_spi: u64,
+    responder_spi: u64,
+) -> Result<usize, CanonicalKeyWriteError> {
+    ensure_canonical_capacity(buf, canonical_established_ike_len(destination))?;
+    Ok(write_canonical_established_ike_unchecked(
+        buf,
+        destination,
+        routing_domain,
+        initiator_spi,
+        responder_spi,
+    ))
+}
+
+#[inline(always)]
+fn write_canonical_established_ike_unchecked(
     buf: &mut [u8],
     destination: XdpIpAddress,
     routing_domain: u64,
@@ -627,8 +792,29 @@ pub fn write_canonical_established_ike(
 }
 
 /// Write the canonical inbound-ESP ownership key into `buf`.
+///
+/// Returns [`CanonicalKeyWriteError::BufferTooSmall`] before writing anything
+/// when `buf` cannot hold the complete key.
 #[inline(always)]
 pub fn write_canonical_esp(
+    buf: &mut [u8],
+    destination: XdpIpAddress,
+    routing_domain: u64,
+    encapsulation: u8,
+    spi: u32,
+) -> Result<usize, CanonicalKeyWriteError> {
+    ensure_canonical_capacity(buf, canonical_esp_len(destination))?;
+    Ok(write_canonical_esp_unchecked(
+        buf,
+        destination,
+        routing_domain,
+        encapsulation,
+        spi,
+    ))
+}
+
+#[inline(always)]
+fn write_canonical_esp_unchecked(
     buf: &mut [u8],
     destination: XdpIpAddress,
     routing_domain: u64,
@@ -639,6 +825,37 @@ pub fn write_canonical_esp(
     cursor = encode_destination(buf, cursor, destination, routing_domain);
     cursor = encode_bytes(buf, cursor, &[encapsulation]);
     encode_bytes(buf, cursor, &spi.to_be_bytes())
+}
+
+#[inline(always)]
+fn ensure_canonical_capacity(buf: &[u8], required: usize) -> Result<(), CanonicalKeyWriteError> {
+    if buf.len() < required {
+        return Err(CanonicalKeyWriteError::BufferTooSmall);
+    }
+    Ok(())
+}
+
+#[inline(always)]
+const fn encoded_address_len(address: XdpIpAddress) -> usize {
+    match address {
+        XdpIpAddress::V4(_) => 1 + 4,
+        XdpIpAddress::V6(_) => 1 + 16,
+    }
+}
+
+#[inline(always)]
+const fn canonical_initial_ike_len(destination: XdpIpAddress, source: XdpIpAddress) -> usize {
+    6 + 8 + encoded_address_len(destination) + encoded_address_len(source) + 2 + 8 + 1
+}
+
+#[inline(always)]
+const fn canonical_established_ike_len(destination: XdpIpAddress) -> usize {
+    6 + 8 + encoded_address_len(destination) + 8 + 8
+}
+
+#[inline(always)]
+const fn canonical_esp_len(destination: XdpIpAddress) -> usize {
+    6 + 8 + encoded_address_len(destination) + 1 + 4
 }
 
 #[inline(always)]
@@ -683,24 +900,27 @@ fn encode_bytes(encoded: &mut [u8], cursor: usize, bytes: &[u8]) -> usize {
 /// | 4 | 8 | ownership generation (non-zero) |
 /// | 12 | 4 | reserved (zero) |
 ///
-/// A userspace update writes the whole 16-byte value with one
-/// `bpf_map_update_elem` call. On the kernels within the documented feature
-/// floor that replacement is atomic in practice, but the guarantee is
-/// architectural, not contractual: a lockless reader could theoretically
-/// observe a torn value mid-update, and nothing in this ABI detects that.
-/// In particular the dangerous mix — an old owner shard with a new
-/// generation — decodes perfectly and is NOT caught by the strict decode
-/// below; that decode only rejects structurally invalid values (non-zero
-/// flags/reserved bytes, zero generation). The design therefore accepts
-/// best-effort atomicity: the fence generation and the fenced ownership
-/// authority's re-install discipline bound how long a stale or mixed value
-/// can steer before the slow path re-validates it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `IPSEC_LB_OWNERS` is a kernel hash map. A userspace update publishes one
+/// complete 16-byte replacement element with `bpf_map_update_elem`; concurrent
+/// kernel readers therefore observe either the previous element or the new
+/// element, never a mixed owner/generation value. Strict decoding separately
+/// rejects structurally invalid values (non-zero flags/reserved bytes or a
+/// zero generation), so schema skew still fails closed.
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct XdpOwnerValue {
     /// Owner shard identity.
     pub owner_shard: u16,
     /// Fenced ownership generation for this record.
     pub generation: u64,
+}
+
+impl fmt::Debug for XdpOwnerValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("XdpOwnerValue")
+            .field("owner_shard", &"<redacted>")
+            .field("generation", &"<redacted>")
+            .finish()
+    }
 }
 
 impl XdpOwnerValue {
@@ -756,24 +976,25 @@ impl XdpOwnerValue {
     }
 }
 
-/// Single-slot datapath configuration.
+/// Single-entry datapath configuration.
 ///
 /// Layout (32 bytes, all big-endian):
 ///
 /// | offset | width | field |
 /// | ---: | ---: | --- |
 /// | 0 | 1 | ABI version ([`XDP_CONFIG_ABI_VERSION`]) |
-/// | 1 | 1 | flags (zero in v2) |
+/// | 1 | 1 | flags (zero in v4) |
 /// | 2 | 2 | self shard |
 /// | 4 | 8 | routing-domain tag |
 /// | 12 | 8 | reserved (zero; the v1 fence field moved to [`MAP_FENCE`]) |
 /// | 20 | 4 | userspace-redirector hand-off ifindex (0 = none) |
 /// | 24 | 8 | reserved (zero) |
 ///
-/// The ownership fence generation lives in its own single-slot aligned-`u64`
-/// map (`IPSEC_LB_FENCE`) so an advance is a single tear-free aligned store;
-/// it is deliberately not part of this wider value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// This value and the ownership fence generation live in separate
+/// single-entry hash maps. An update replaces the immutable element so a
+/// reader observes either the old or new value; the fence is deliberately not
+/// part of this wider configuration value.
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct XdpDatapathConfig {
     /// Shard identity of this node.
     pub self_shard: u16,
@@ -783,6 +1004,16 @@ pub struct XdpDatapathConfig {
     /// interface. Zero disables the redirect channel; a remote-owner verdict
     /// then fails closed to the slow path with the error counter.
     pub handoff_ifindex: u32,
+}
+
+impl fmt::Debug for XdpDatapathConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("XdpDatapathConfig")
+            .field("self_shard", &"<redacted>")
+            .field("routing_domain", &"<redacted>")
+            .field("handoff_ifindex", &"<redacted>")
+            .finish()
+    }
 }
 
 impl XdpDatapathConfig {
@@ -910,6 +1141,28 @@ mod tests {
     };
 
     const FENCE: u64 = 5;
+
+    #[test]
+    fn ipv6_extension_header_sets_match_the_declared_contract() {
+        let iana_extension_kinds = [0, 43, 44, 50, 51, 60, 135, 139, 140, 253, 254];
+        let userspace_walked_kinds = [0, 43, 44, 51, 60];
+
+        for value in u8::MIN..=u8::MAX {
+            assert_eq!(
+                is_ipv6_extension_header_kind(value),
+                iana_extension_kinds.contains(&value),
+                "unexpected IANA IPv6 extension-kind classification for {value}"
+            );
+            assert_eq!(
+                is_supported_ipv6_extension_header(value),
+                userspace_walked_kinds.contains(&value),
+                "unexpected userspace IPv6 extension-kind classification for {value}"
+            );
+        }
+
+        assert!(is_ipv6_extension_header_kind(IP_PROTOCOL_ESP));
+        assert!(!is_supported_ipv6_extension_header(IP_PROTOCOL_ESP));
+    }
 
     fn udp_probe(source_port: u16, destination_port: u16, payload: &[u8]) -> Vec<u8> {
         let mut probe = Vec::new();
@@ -1040,6 +1293,17 @@ mod tests {
             XdpTransportClass::Unclassifiable
         );
 
+        // Link-layer padding cannot supply an ESP header that the IP length
+        // declares to be truncated.
+        assert_eq!(
+            classify_transport(IP_PROTOCOL_ESP, &esp, esp.len(), ESP_HEADER_PREFIX_LEN - 1),
+            XdpTransportClass::Unclassifiable
+        );
+        assert_eq!(
+            classify_transport(IP_PROTOCOL_ESP, &esp, ESP_HEADER_PREFIX_LEN - 1, esp.len()),
+            XdpTransportClass::Unclassifiable
+        );
+
         assert_eq!(
             classify_transport(1, &[0; 8], 8, 8),
             XdpTransportClass::NonSwu
@@ -1142,6 +1406,33 @@ mod tests {
         );
         assert_eq!(len, OWNERSHIP_KEY_MAX_ENCODED_BYTES);
         assert_eq!(&key[0..4], b"OPCO");
+    }
+
+    #[test]
+    fn canonical_writers_reject_short_buffers_without_mutation() {
+        let destination = XdpIpAddress::V6([0x20; 16]);
+        let source = XdpIpAddress::V6([0x30; 16]);
+
+        let mut initial = [0xaa; OWNERSHIP_KEY_MAX_ENCODED_BYTES - 1];
+        assert_eq!(
+            write_canonical_initial_ike(&mut initial, destination, 7, source, 4500, 1, 34,),
+            Err(CanonicalKeyWriteError::BufferTooSmall)
+        );
+        assert!(initial.iter().all(|byte| *byte == 0xaa));
+
+        let mut established = [0xbb; 46];
+        assert_eq!(
+            write_canonical_established_ike(&mut established, destination, 7, 1, 2),
+            Err(CanonicalKeyWriteError::BufferTooSmall)
+        );
+        assert!(established.iter().all(|byte| *byte == 0xbb));
+
+        let mut esp = [0xcc; 35];
+        assert_eq!(
+            write_canonical_esp(&mut esp, destination, 7, OWNERSHIP_ESP_NATIVE, 256),
+            Err(CanonicalKeyWriteError::BufferTooSmall)
+        );
+        assert!(esp.iter().all(|byte| *byte == 0xcc));
     }
 
     #[test]
@@ -1305,6 +1596,54 @@ mod tests {
         ];
         for (index, counter) in counters.iter().enumerate() {
             assert!(counters[..index].iter().all(|other| other != counter));
+        }
+    }
+
+    #[test]
+    fn public_debug_implementations_redact_packet_and_topology_identifiers() {
+        let values = [
+            std::format!("{:?}", XdpIpAddress::V4([198, 19, 83, 241])),
+            std::format!(
+                "{:?}",
+                XdpTransportClass::IkeEstablished {
+                    initiator_spi: 8_873_104_991_337,
+                    responder_spi: 7_462_095_188_221,
+                }
+            ),
+            std::format!(
+                "{:?}",
+                XdpOwnerValue {
+                    owner_shard: 61_283,
+                    generation: 9_304_701_823,
+                }
+            ),
+            std::format!(
+                "{:?}",
+                XdpDatapathConfig {
+                    self_shard: 61_283,
+                    routing_domain: 9_304_701_823,
+                    handoff_ifindex: 97_531,
+                }
+            ),
+        ];
+        for debug in values {
+            for secret in [
+                "198",
+                "19",
+                "83",
+                "241",
+                "8873104991337",
+                "7462095188221",
+                "61283",
+                "9304701823",
+                "97531",
+            ] {
+                assert!(
+                    !debug.contains(secret),
+                    "debug output leaked {secret}: {debug}"
+                );
+            }
+            assert!(debug.contains("redacted"));
         }
     }
 }

@@ -2,8 +2,115 @@ use std::ffi::CString;
 use std::io;
 use std::mem;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
 
-use crate::{GtpuIpAddress, GtpuUdpBind};
+use crate::{BpfXdpLinkInfo, GtpuIpAddress, GtpuUdpBind};
+
+const BPF_OBJ_PIN: libc::c_uint = 6;
+const BPF_OBJ_GET: libc::c_uint = 7;
+const BPF_PROG_GET_FD_BY_ID: libc::c_uint = 13;
+const BPF_OBJ_GET_INFO_BY_FD: libc::c_uint = 15;
+const BPF_LINK_UPDATE: libc::c_uint = 29;
+const BPF_LINK_GET_FD_BY_ID: libc::c_uint = 30;
+const BPF_PROG_TYPE_XDP: u32 = 6;
+const BPF_LINK_TYPE_XDP: u32 = 6;
+const BPF_F_REPLACE: u32 = 1 << 2;
+
+#[repr(C)]
+#[derive(Debug, Default)]
+struct BpfGetFdByIdAttr {
+    object_id: u32,
+    next_id: u32,
+    open_flags: u32,
+}
+
+#[repr(C, align(8))]
+#[derive(Debug, Default)]
+struct BpfObjPinAttr {
+    pathname: u64,
+    bpf_fd: u32,
+    file_flags: u32,
+    path_fd: i32,
+    reserved: u32,
+}
+
+#[repr(C, align(8))]
+#[derive(Debug, Default)]
+struct BpfObjGetInfoByFdAttr {
+    bpf_fd: u32,
+    info_len: u32,
+    info: u64,
+}
+
+#[repr(C, align(8))]
+#[derive(Debug, Default)]
+struct BpfLinkUpdateAttr {
+    link_fd: u32,
+    new_program_fd: u32,
+    flags: u32,
+    old_program_fd: u32,
+}
+
+/// Stable prefix of `struct bpf_link_info` through `xdp.ifindex`.
+#[repr(C, align(8))]
+#[derive(Debug, Default)]
+struct BpfXdpLinkInfoRaw {
+    link_type: u32,
+    link_id: u32,
+    program_id: u32,
+    _union_alignment_padding: u32,
+    ifindex: u32,
+    _tail_padding: u32,
+}
+
+/// Stable prefix of `struct bpf_prog_info` through `tag`.
+#[repr(C)]
+#[derive(Debug, Default)]
+struct BpfProgramInfoRaw {
+    program_type: u32,
+    program_id: u32,
+    tag: [u8; 8],
+}
+
+const _: () = {
+    assert!(mem::size_of::<BpfGetFdByIdAttr>() == 12);
+    assert!(mem::align_of::<BpfGetFdByIdAttr>() == 4);
+    assert!(mem::offset_of!(BpfGetFdByIdAttr, object_id) == 0);
+    assert!(mem::offset_of!(BpfGetFdByIdAttr, next_id) == 4);
+    assert!(mem::offset_of!(BpfGetFdByIdAttr, open_flags) == 8);
+    assert!(mem::size_of::<BpfObjPinAttr>() == 24);
+    assert!(mem::align_of::<BpfObjPinAttr>() == 8);
+    assert!(mem::offset_of!(BpfObjPinAttr, pathname) == 0);
+    assert!(mem::offset_of!(BpfObjPinAttr, bpf_fd) == 8);
+    assert!(mem::offset_of!(BpfObjPinAttr, file_flags) == 12);
+    assert!(mem::offset_of!(BpfObjPinAttr, path_fd) == 16);
+    assert!(mem::offset_of!(BpfObjPinAttr, reserved) == 20);
+    assert!(mem::size_of::<BpfObjGetInfoByFdAttr>() == 16);
+    assert!(mem::align_of::<BpfObjGetInfoByFdAttr>() == 8);
+    assert!(mem::offset_of!(BpfObjGetInfoByFdAttr, bpf_fd) == 0);
+    assert!(mem::offset_of!(BpfObjGetInfoByFdAttr, info_len) == 4);
+    assert!(mem::offset_of!(BpfObjGetInfoByFdAttr, info) == 8);
+    assert!(mem::size_of::<BpfLinkUpdateAttr>() == 16);
+    assert!(mem::align_of::<BpfLinkUpdateAttr>() == 8);
+    assert!(mem::offset_of!(BpfLinkUpdateAttr, link_fd) == 0);
+    assert!(mem::offset_of!(BpfLinkUpdateAttr, new_program_fd) == 4);
+    assert!(mem::offset_of!(BpfLinkUpdateAttr, flags) == 8);
+    assert!(mem::offset_of!(BpfLinkUpdateAttr, old_program_fd) == 12);
+    assert!(mem::size_of::<BpfXdpLinkInfoRaw>() == 24);
+    assert!(mem::align_of::<BpfXdpLinkInfoRaw>() == 8);
+    assert!(mem::offset_of!(BpfXdpLinkInfoRaw, link_type) == 0);
+    assert!(mem::offset_of!(BpfXdpLinkInfoRaw, link_id) == 4);
+    assert!(mem::offset_of!(BpfXdpLinkInfoRaw, program_id) == 8);
+    assert!(mem::offset_of!(BpfXdpLinkInfoRaw, _union_alignment_padding) == 12);
+    assert!(mem::offset_of!(BpfXdpLinkInfoRaw, ifindex) == 16);
+    assert!(mem::offset_of!(BpfXdpLinkInfoRaw, _tail_padding) == 20);
+    assert!(mem::size_of::<BpfProgramInfoRaw>() == 16);
+    assert!(mem::align_of::<BpfProgramInfoRaw>() == 4);
+    assert!(mem::offset_of!(BpfProgramInfoRaw, program_type) == 0);
+    assert!(mem::offset_of!(BpfProgramInfoRaw, program_id) == 4);
+    assert!(mem::offset_of!(BpfProgramInfoRaw, tag) == 8);
+};
 
 #[derive(Debug)]
 pub struct NetlinkSocket {
@@ -24,6 +131,63 @@ impl NetlinkSocket {
 #[derive(Debug)]
 pub struct GtpuUdpSocket {
     fd: OwnedFd,
+}
+
+/// Owned descriptor for one exact XDP BPF-link object.
+#[derive(Debug)]
+pub struct BpfXdpLink {
+    fd: OwnedFd,
+}
+
+/// Owned descriptor for one exact XDP BPF program.
+#[derive(Debug)]
+pub struct BpfXdpProgram {
+    fd: OwnedFd,
+}
+
+impl BpfXdpProgram {
+    pub fn program_id(&self) -> io::Result<u32> {
+        xdp_program_id_from_fd(&self.fd)
+    }
+}
+
+impl BpfXdpLink {
+    pub fn info(&self) -> io::Result<BpfXdpLinkInfo> {
+        xdp_link_info_from_fd(&self.fd)
+    }
+
+    pub fn pin_duplicate(&self, path: &Path) -> io::Result<()> {
+        let path = validate_pin_path(path)?;
+        pin_bpf_object(&self.fd, &path)
+    }
+
+    pub fn replace_program(
+        &self,
+        new_program_fd: BorrowedFd<'_>,
+        expected_old_program: &BpfXdpProgram,
+    ) -> io::Result<()> {
+        let attr = BpfLinkUpdateAttr {
+            link_fd: fd_number(self.fd.as_fd())?,
+            new_program_fd: fd_number(new_program_fd)?,
+            flags: BPF_F_REPLACE,
+            old_program_fd: fd_number(expected_old_program.fd.as_fd())?,
+        };
+        // SAFETY: `attr` is the fully initialized BPF_LINK_UPDATE UAPI
+        // structure. All descriptors remain borrowed and live for the call.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_bpf,
+                BPF_LINK_UPDATE,
+                &attr as *const BpfLinkUpdateAttr,
+                mem::size_of::<BpfLinkUpdateAttr>(),
+            )
+        };
+        if result < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
 }
 
 impl GtpuUdpSocket {
@@ -115,6 +279,259 @@ pub fn ifindex_by_name(name: &str) -> io::Result<u32> {
     } else {
         Ok(ifindex)
     }
+}
+
+fn validate_link_id(link_id: u32) -> io::Result<()> {
+    if link_id == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "BPF link id must be non-zero",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_pin_path(path: &Path) -> io::Result<CString> {
+    if !path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "BPF link pin path must be absolute",
+        ));
+    }
+    CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "BPF link pin path contains NUL",
+        )
+    })
+}
+
+fn fd_number(fd: BorrowedFd<'_>) -> io::Result<u32> {
+    u32::try_from(fd.as_raw_fd()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "BPF object descriptor must be non-negative",
+        )
+    })
+}
+
+fn open_bpf_object_by_id(command: libc::c_uint, object_id: u32) -> io::Result<OwnedFd> {
+    if object_id == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "BPF object id must be non-zero",
+        ));
+    }
+    let get_attr = BpfGetFdByIdAttr {
+        object_id,
+        ..BpfGetFdByIdAttr::default()
+    };
+    // SAFETY: `get_attr` is the exact 12-byte *_GET_FD_BY_ID UAPI prefix. The
+    // kernel copies it and retains no pointer.
+    let object_fd = unsafe {
+        libc::syscall(
+            libc::SYS_bpf,
+            command,
+            &get_attr as *const BpfGetFdByIdAttr,
+            mem::size_of::<BpfGetFdByIdAttr>(),
+        )
+    };
+    if object_fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let object_fd = object_fd as libc::c_int;
+    // SAFETY: `object_fd` is a fresh descriptor returned by bpf(2) and is
+    // transferred immediately into `OwnedFd`.
+    let object_fd = unsafe { OwnedFd::from_raw_fd(object_fd) };
+    ensure_cloexec(&object_fd)?;
+    Ok(object_fd)
+}
+
+fn open_bpf_link_by_id(link_id: u32) -> io::Result<OwnedFd> {
+    validate_link_id(link_id)?;
+    open_bpf_object_by_id(BPF_LINK_GET_FD_BY_ID, link_id)
+}
+
+fn open_bpf_link_from_pin(path: &Path) -> io::Result<OwnedFd> {
+    let path = validate_pin_path(path)?;
+    let get_attr = BpfObjPinAttr {
+        pathname: path.as_ptr() as usize as u64,
+        ..BpfObjPinAttr::default()
+    };
+    // SAFETY: `get_attr` has the exact BPF_OBJ_GET UAPI layout and points to a
+    // live NUL-terminated path for the duration of the syscall.
+    let link_fd = unsafe {
+        libc::syscall(
+            libc::SYS_bpf,
+            BPF_OBJ_GET,
+            &get_attr as *const BpfObjPinAttr,
+            mem::size_of::<BpfObjPinAttr>(),
+        )
+    };
+    if link_fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let link_fd = link_fd as libc::c_int;
+    // SAFETY: `link_fd` is a fresh descriptor returned by BPF_OBJ_GET and is
+    // transferred immediately into `OwnedFd`.
+    let link_fd = unsafe { OwnedFd::from_raw_fd(link_fd) };
+    ensure_cloexec(&link_fd)?;
+    Ok(link_fd)
+}
+
+fn ensure_cloexec(fd: &OwnedFd) -> io::Result<()> {
+    // BPF object descriptors are returned close-on-exec by the kernel. Verify
+    // and repair that property defensively before the descriptor can escape
+    // this boundary.
+    // SAFETY: `link_fd` is live, F_GETFD does not require a third argument,
+    // and F_SETFD receives the integer flag word returned by F_GETFD.
+    let descriptor_flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+    if descriptor_flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if descriptor_flags & libc::FD_CLOEXEC == 0 {
+        // SAFETY: `link_fd` is live and `descriptor_flags | FD_CLOEXEC` is a
+        // valid F_SETFD flag word.
+        let set_result = unsafe {
+            libc::fcntl(
+                fd.as_raw_fd(),
+                libc::F_SETFD,
+                descriptor_flags | libc::FD_CLOEXEC,
+            )
+        };
+        if set_result < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+fn pin_bpf_object(fd: &OwnedFd, path: &CString) -> io::Result<()> {
+    let pin_attr = BpfObjPinAttr {
+        pathname: path.as_ptr() as usize as u64,
+        bpf_fd: fd_number(fd.as_fd())?,
+        ..BpfObjPinAttr::default()
+    };
+    // SAFETY: `pin_attr` has the exact BPF_OBJ_PIN UAPI prefix and points to a
+    // live NUL-terminated path for the syscall duration. `fd` remains live.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_bpf,
+            BPF_OBJ_PIN,
+            &pin_attr as *const BpfObjPinAttr,
+            mem::size_of::<BpfObjPinAttr>(),
+        )
+    };
+    if result < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn xdp_link_info_from_fd(link_fd: &OwnedFd) -> io::Result<BpfXdpLinkInfo> {
+    let mut info = BpfXdpLinkInfoRaw::default();
+    let mut info_attr = BpfObjGetInfoByFdAttr {
+        bpf_fd: link_fd.as_raw_fd() as u32,
+        info_len: mem::size_of::<BpfXdpLinkInfoRaw>() as u32,
+        info: (&mut info as *mut BpfXdpLinkInfoRaw) as usize as u64,
+    };
+    // SAFETY: `info_attr` is the exact BPF_OBJ_GET_INFO_BY_FD UAPI layout and
+    // points to a live, writable `BpfXdpLinkInfoRaw` for the syscall duration.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_bpf,
+            BPF_OBJ_GET_INFO_BY_FD,
+            &mut info_attr as *mut BpfObjGetInfoByFdAttr,
+            mem::size_of::<BpfObjGetInfoByFdAttr>(),
+        )
+    };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if info_attr.info_len < mem::size_of::<BpfXdpLinkInfoRaw>() as u32
+        || info.link_type != BPF_LINK_TYPE_XDP
+        || info.link_id == 0
+        || info.program_id == 0
+        || info.ifindex == 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "BPF link is not a complete XDP attachment",
+        ));
+    }
+    Ok(BpfXdpLinkInfo {
+        link_id: info.link_id,
+        program_id: info.program_id,
+        ifindex: info.ifindex,
+    })
+}
+
+fn xdp_program_id_from_fd(program_fd: &OwnedFd) -> io::Result<u32> {
+    let mut info = BpfProgramInfoRaw::default();
+    let mut info_attr = BpfObjGetInfoByFdAttr {
+        bpf_fd: fd_number(program_fd.as_fd())?,
+        info_len: mem::size_of::<BpfProgramInfoRaw>() as u32,
+        info: (&mut info as *mut BpfProgramInfoRaw) as usize as u64,
+    };
+    // SAFETY: `info_attr` is the exact BPF_OBJ_GET_INFO_BY_FD UAPI layout and
+    // points to a live writable `BpfProgramInfoRaw` for the call duration.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_bpf,
+            BPF_OBJ_GET_INFO_BY_FD,
+            &mut info_attr as *mut BpfObjGetInfoByFdAttr,
+            mem::size_of::<BpfObjGetInfoByFdAttr>(),
+        )
+    };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if info_attr.info_len < mem::size_of::<BpfProgramInfoRaw>() as u32
+        || info.program_type != BPF_PROG_TYPE_XDP
+        || info.program_id == 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "BPF object is not a complete XDP program",
+        ));
+    }
+    Ok(info.program_id)
+}
+
+pub fn open_xdp_link_by_id(link_id: u32) -> io::Result<BpfXdpLink> {
+    let link = BpfXdpLink {
+        fd: open_bpf_link_by_id(link_id)?,
+    };
+    let identity = link.info()?;
+    if identity.link_id != link_id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "opened XDP link id does not match the requested object",
+        ));
+    }
+    Ok(link)
+}
+
+pub fn open_xdp_link_from_pin(path: &Path) -> io::Result<BpfXdpLink> {
+    let link = BpfXdpLink {
+        fd: open_bpf_link_from_pin(path)?,
+    };
+    let _ = link.info()?;
+    Ok(link)
+}
+
+pub fn open_xdp_program_by_id(program_id: u32) -> io::Result<BpfXdpProgram> {
+    let program = BpfXdpProgram {
+        fd: open_bpf_object_by_id(BPF_PROG_GET_FD_BY_ID, program_id)?,
+    };
+    if program.program_id()? != program_id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "opened XDP program id does not match the requested object",
+        ));
+    }
+    Ok(program)
 }
 
 fn open_gtpu_udp_socket_v4(octets: [u8; 4], port: u16) -> io::Result<GtpuUdpSocket> {

@@ -8,23 +8,21 @@
 //! (#306 fence execution) is covered by the shared `decide_owner_verdict`
 //! table here and by the backend unit tests in `src/xdp.rs`.
 //!
-//! `simulate_xdp` mirrors only the eBPF program's fixed-header path: it does
-//! NOT reproduce the program's bounded IPv6 extension-header walk, so
-//! fixtures avoid extension headers (the walk is exercised by the gated
-//! privileged test). Deliberate, documented divergences from the userspace
-//! classifier — IP fragmentation and extension-header validation details —
-//! have their own fixtures asserting the expected disagreement, always in
-//! the fail-closed direction.
+//! `simulate_xdp` mirrors the eBPF program's fixed-header path, including its
+//! fail-closed rule that every IPv6 extension-bearing packet goes to the
+//! userspace slow path. Deliberate, documented divergences from the userspace
+//! classifier — IP fragmentation and IPv6 extension handling — have fixtures
+//! asserting the expected disagreement, always in the fail-closed direction.
 
 use opc_ipsec_lb::ownership::{RoutingDomainTag, SessionOwnershipKey};
 use opc_ipsec_lb::{
     classify_keyless_ingress_packet, IngressEncapsulationKind, KeylessIngressClassification,
 };
 use opc_ipsec_lb_ebpf_common::{
-    classify_transport, decide_owner_verdict, ownership_map_key, XdpDatapathConfig, XdpIpAddress,
-    XdpOwnerValue, XdpTransportClass, XdpVerdict, IP_PROTOCOL_ESP, IP_PROTOCOL_UDP,
-    OWNERSHIP_ESP_NATIVE, OWNERSHIP_ESP_UDP_ENCAPSULATED, OWNER_KEY_LEN, UDP_PORT_IKE,
-    UDP_PORT_IKE_NATT,
+    classify_transport, decide_owner_verdict, is_ipv6_extension_header_kind, ownership_map_key,
+    XdpDatapathConfig, XdpIpAddress, XdpOwnerValue, XdpTransportClass, XdpVerdict, IP_PROTOCOL_ESP,
+    IP_PROTOCOL_UDP, OWNERSHIP_ESP_NATIVE, OWNERSHIP_ESP_UDP_ENCAPSULATED, OWNER_KEY_LEN,
+    UDP_PORT_IKE, UDP_PORT_IKE_NATT,
 };
 
 const DOMAIN: u64 = 7;
@@ -43,9 +41,8 @@ enum SimOutcome {
     Unclassifiable,
 }
 
-/// Mirror of the eBPF program's header walk for the fixture packets: IPv4
-/// without options and IPv6 without extension headers, feeding the SHARED
-/// `classify_transport` / `ownership_map_key` decision logic.
+/// Mirror of the eBPF program's header walk for the fixture packets, feeding
+/// the SHARED `classify_transport` / `ownership_map_key` decision logic.
 fn simulate_xdp(packet: &[u8]) -> SimOutcome {
     match packet[0] >> 4 {
         4 => simulate_ipv4(packet),
@@ -89,6 +86,9 @@ fn simulate_ipv6(packet: &[u8]) -> SimOutcome {
         return SimOutcome::Unclassifiable;
     }
     let protocol = packet[6];
+    if protocol != IP_PROTOCOL_ESP && is_ipv6_extension_header_kind(protocol) {
+        return SimOutcome::Unclassifiable;
+    }
     if protocol != IP_PROTOCOL_UDP && protocol != IP_PROTOCOL_ESP {
         return SimOutcome::NonSwu;
     }
@@ -367,6 +367,20 @@ fn native_esp_v4_and_v6_parity() {
 }
 
 #[test]
+fn native_esp_padding_beyond_the_ip_length_is_unclassifiable() {
+    let mut esp = 0x00ca_fe01_u32.to_be_bytes().to_vec();
+    esp.extend_from_slice(&[0, 0, 0, 9]);
+
+    let mut ipv4 = ipv4_packet(IP_PROTOCOL_ESP, PEER4, VIP4, &esp);
+    ipv4[2..4].copy_from_slice(&(24_u16).to_be_bytes());
+    assert_eq!(simulate_xdp(&ipv4), SimOutcome::Unclassifiable);
+
+    let mut ipv6 = ipv6_packet(IP_PROTOCOL_ESP, PEER6, VIP6, &esp);
+    ipv6[4..6].copy_from_slice(&(4_u16).to_be_bytes());
+    assert_eq!(simulate_xdp(&ipv6), SimOutcome::Unclassifiable);
+}
+
+#[test]
 fn natt_keepalive_agrees_with_userspace_classifier() {
     let packet = ipv4_packet(
         IP_PROTOCOL_UDP,
@@ -409,6 +423,86 @@ fn initial_fragments_diverge_deliberately() {
         SimOutcome::Unclassifiable,
         "the XDP fast path deliberately slow-paths any fragment"
     );
+}
+
+#[test]
+fn ipv6_extension_bearing_swu_is_always_slow_pathed_by_xdp() {
+    let ike = ike_header(
+        0x0102_0304_0506_0708,
+        0x1112_1314_1516_1718,
+        35,
+        &[0xaa; 12],
+    );
+    let udp = udp_datagram(45000, UDP_PORT_IKE, &ike);
+    // Hop-by-Hop Options, Hdr Ext Len 0, six Pad1 octets.
+    let mut payload = vec![IP_PROTOCOL_UDP, 0, 0, 0, 0, 0, 0, 0];
+    payload.extend_from_slice(&udp);
+    let packet = ipv6_packet(0, PEER6, VIP6, &payload);
+
+    let classification = classify_keyless_ingress_packet(&packet, RoutingDomainTag::new(DOMAIN));
+    assert!(
+        matches!(classification, KeylessIngressClassification::Classified(_)),
+        "userspace validates and classifies the extension-bearing fixture: {classification:?}"
+    );
+    assert_eq!(
+        simulate_xdp(&packet),
+        SimOutcome::Unclassifiable,
+        "XDP must never fast-path an IPv6 extension chain it does not validate"
+    );
+}
+
+#[test]
+fn every_registered_ipv6_extension_kind_is_slow_pathed_except_direct_esp() {
+    for extension_kind in [0, 43, 44, 51, 60, 135, 139, 140, 253, 254] {
+        let packet = ipv6_packet(extension_kind, PEER6, VIP6, &[]);
+        assert!(matches!(
+            classify_keyless_ingress_packet(&packet, RoutingDomainTag::new(DOMAIN)),
+            KeylessIngressClassification::Unclassifiable { .. }
+        ));
+        assert_eq!(
+            simulate_xdp(&packet),
+            SimOutcome::Unclassifiable,
+            "IANA IPv6 extension kind {extension_kind} must reach the slow path"
+        );
+    }
+
+    // Protocol 50 is also marked as an IPv6 extension kind by IANA, but a
+    // base header that directly names ESP is a supported SWu transport.
+    let mut esp = 0x00ca_fe01_u32.to_be_bytes().to_vec();
+    esp.extend_from_slice(&[0, 0, 0, 9]);
+    assert!(matches!(
+        simulate_xdp(&ipv6_packet(IP_PROTOCOL_ESP, PEER6, VIP6, &esp)),
+        SimOutcome::Identity {
+            class: XdpTransportClass::Esp {
+                encapsulation: OWNERSHIP_ESP_NATIVE,
+                spi: 0x00ca_fe01,
+            },
+            ..
+        }
+    ));
+}
+
+#[test]
+fn shim6_cannot_conceal_swu_transport_from_xdp() {
+    let ike = ike_header(
+        0x0102_0304_0506_0708,
+        0x1112_1314_1516_1718,
+        35,
+        &[0xaa; 12],
+    );
+    let udp = udp_datagram(45000, UDP_PORT_IKE, &ike);
+    // Shim6 uses the IPv6 extension-header convention: Next Header followed
+    // by Hdr Ext Len. The XDP contract must slow-path it before interpreting
+    // the concealed UDP/500 bytes.
+    let mut payload = vec![IP_PROTOCOL_UDP, 0, 0, 0, 0, 0, 0, 0];
+    payload.extend_from_slice(&udp);
+    let packet = ipv6_packet(140, PEER6, VIP6, &payload);
+
+    assert!(matches!(
+        classify_keyless_ingress_packet(&packet, RoutingDomainTag::new(DOMAIN)),
+        KeylessIngressClassification::Unclassifiable { .. }
+    ));
+    assert_eq!(simulate_xdp(&packet), SimOutcome::Unclassifiable);
 }
 
 #[test]

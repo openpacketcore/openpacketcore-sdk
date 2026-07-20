@@ -83,6 +83,22 @@ pub enum IpsecLbError {
     /// Requested state was not found.
     #[error("IPsec load-balancing state not found")]
     NotFound,
+    /// Another process currently owns the Host-XDP lifecycle lease.
+    ///
+    /// This is a retryable conflict. No datapath or pinned-map mutation has
+    /// occurred in the process reporting this error.
+    #[error("IPsec load-balancing XDP lifecycle is busy")]
+    XdpLifecycleBusy,
+    /// A live Host-XDP attachment cannot be upgraded safely until its owner
+    /// explicitly drains it into the handoff state.
+    #[error("IPsec load-balancing XDP upgrade requires an explicit drain")]
+    XdpUpgradeRequiresDrain,
+    /// Host-XDP upgrade state could not be proven safe for automatic action.
+    ///
+    /// Consumers must not retry by detaching or deleting pins blindly; this
+    /// result requires operator reconciliation.
+    #[error("IPsec load-balancing XDP upgrade state is indeterminate")]
+    XdpUpgradeIndeterminate,
     /// Ownership fencing rejected the transition.
     #[error("IPsec load-balancing ownership conflict: {reason}")]
     OwnershipConflict {

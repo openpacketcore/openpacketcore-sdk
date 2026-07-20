@@ -3,9 +3,10 @@
 use std::fmt;
 
 use opc_ipsec_lb_ebpf_common::{
-    bootstrap_tag, ESP_HEADER_PREFIX_LEN, IKEV2_EXCHANGE_IKE_SA_INIT as EXCHANGE_TYPE_IKE_SA_INIT,
-    IKEV2_HDR_LEN as IKE_HEADER_LEN, IKEV2_MAJOR_VERSION, NAT_T_KEEPALIVE as NAT_T_KEEPALIVE_BYTE,
-    NON_ESP_MARKER, UDP_PORT_IKE, UDP_PORT_IKE_NATT,
+    bootstrap_tag, is_supported_ipv6_extension_header, ESP_HEADER_PREFIX_LEN,
+    IKEV2_EXCHANGE_IKE_SA_INIT as EXCHANGE_TYPE_IKE_SA_INIT, IKEV2_HDR_LEN as IKE_HEADER_LEN,
+    IKEV2_MAJOR_VERSION, NAT_T_KEEPALIVE as NAT_T_KEEPALIVE_BYTE, NON_ESP_MARKER, UDP_PORT_IKE,
+    UDP_PORT_IKE_NATT,
 };
 use thiserror::Error;
 
@@ -605,7 +606,7 @@ fn parse_ipv6_packet(
     let mut more_fragments = false;
     let mut extension_order = Ipv6ExtensionOrder::default();
 
-    while is_ipv6_extension_header(next_header) {
+    while is_supported_ipv6_extension_header(next_header) {
         if extension_count == MAX_INGRESS_IPV6_EXTENSION_HEADERS {
             return Err(IngressUnclassifiableReason::Ipv6ExtensionChainTooLong);
         }
@@ -681,10 +682,6 @@ fn parse_ipv6_packet(
     })
 }
 
-const fn is_ipv6_extension_header(next_header: u8) -> bool {
-    matches!(next_header, 0 | 43 | 44 | IP_PROTOCOL_AH | 60)
-}
-
 const fn ipv6_extension_overrun_reason(
     completeness: PacketCompleteness,
     declared_truncated: bool,
@@ -758,7 +755,9 @@ impl Ipv6ExtensionOrder {
                 1
             }
             60 => {
-                if self.seen_final_destination || is_ipv6_extension_header(following_header) {
+                if self.seen_final_destination
+                    || is_supported_ipv6_extension_header(following_header)
+                {
                     return Err(invalid());
                 }
                 self.seen_final_destination = true;

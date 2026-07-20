@@ -19,10 +19,13 @@
 //!   arrive on the hand-off interface, never on the local stack);
 //! - fail-closed slow-path hand-off with distinct counters for map miss,
 //!   stale generation, and unclassifiable candidates (never a silent drop);
-//! - atomic per-key owner updates: a concurrent reader never observes a torn
-//!   owner/generation pair, and no packet is dropped or mis-verdicted;
-//! - graceful program replacement under continuous traffic: counters persist
-//!   through the swap and no verdict gap appears.
+//! - old-or-new hash-map publication for both owner/generation records and the
+//!   ownership fence under concurrent raw map reads and writes;
+//! - graceful process handoff under continuous traffic: fresh map namespaces
+//!   take over atomically and no verdict gap appears;
+//! - killed-process restart: closing the owning process's `bpf_link` detaches
+//!   the hook, while pinned maps remain adoptable, owners are flushed, and the
+//!   persisted fence remains authoritative.
 //!
 //! Run inside a privileged fresh netns with:
 //!
@@ -38,13 +41,17 @@ use std::fs;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::num::NonZeroU32;
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use nix::sys::socket::{recv, sendto, MsgFlags, SockaddrIn};
+use aya::maps::{Array, HashMap as BpfHashMap, Map, MapData};
+use aya::programs::links::FdLink;
+use aya::programs::{Xdp, XdpMode};
+use aya::{Ebpf, EbpfLoader};
+use nix::sys::socket::{recv, recvfrom, sendto, LinkAddr, MsgFlags, SockaddrIn};
 use nix::sys::time::TimeVal;
 use opc_ipsec_lb::model::{IpAddress, ShardId};
 use opc_ipsec_lb::ownership::{
@@ -52,11 +59,19 @@ use opc_ipsec_lb::ownership::{
     IkeSpi, RoutingDomainTag, SessionOwnershipKey,
 };
 use opc_ipsec_lb::{
-    HostXdpAttachMode, HostXdpRedirectHandoff, HostXdpSteeringBackend, HostXdpSteeringBackendConfig,
+    HostXdpAttachMode, HostXdpRedirectHandoff, HostXdpSteeringBackend,
+    HostXdpSteeringBackendConfig, HostXdpUpgradeOutcome,
+};
+use opc_ipsec_lb_ebpf_common::{
+    XdpDatapathConfig, XdpOwnerValue, CONFIG_KEY, CONFIG_VALUE_LEN, FENCE_KEY, MAP_CONFIG,
+    MAP_COUNTERS, MAP_FENCE, MAP_OWNERS, OWNER_KEY_LEN, OWNER_VALUE_LEN, PROG_SWU_XDP,
+    XDP_CONFIG_ABI_VERSION,
 };
 
 const VIP4: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 7);
 const PEER4: [u8; 4] = [203, 0, 113, 9];
+const VIP6: [u8; 16] = [0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7];
+const PEER6: [u8; 16] = [0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9];
 const DOMAIN: u64 = 7;
 const SELF_SHARD: u16 = 1;
 const REMOTE_SHARD: u16 = 2;
@@ -70,6 +85,18 @@ const SPI_UNKNOWN_NATIVE_ESP: u32 = 0x00ca_fe09;
 const SPI_ATOMIC_ESP_UDP: u32 = 0x00ca_fe05;
 const SPI_REPLACE_ESP_UDP: u32 = 0x00ca_fe06;
 const SPI_CRASH_ESP_UDP: u32 = 0x00ca_fe07;
+
+const CRASH_CHILD_ENV: &str = "OPC_IPSEC_LB_XDP_CRASH_CHILD";
+const CRASH_INTERFACE_ENV: &str = "OPC_IPSEC_LB_XDP_CRASH_INTERFACE";
+const CRASH_PIN_ROOT_ENV: &str = "OPC_IPSEC_LB_XDP_CRASH_PIN_ROOT";
+const CRASH_HANDOFF_ENV: &str = "OPC_IPSEC_LB_XDP_CRASH_HANDOFF";
+const CRASH_READY_ENV: &str = "OPC_IPSEC_LB_XDP_CRASH_READY";
+
+const MAP_SLOT_A: &str = "maps-v4-a";
+const MAP_SLOT_B: &str = "maps-v4-b";
+const HANDOFF_LINK: &str = "upgrade-link";
+const FROZEN_XDP_V3: &[u8] = include_bytes!("fixtures/xdp-upgrade/opc-ipsec-lb-xdp-v3.bpf.o");
+const CURRENT_XDP: &[u8] = include_bytes!("../bpf/opc-ipsec-lb-xdp.bpf.o");
 
 static PROVISION_SEQ: AtomicU32 = AtomicU32::new(0);
 
@@ -325,6 +352,67 @@ fn send_esp(socket: &OwnedFd, payload: &[u8]) {
     assert_eq!(sent, packet.len(), "short ESP send");
 }
 
+/// Capture one peer-originated IPv4 UDP frame and its AF_PACKET address so a
+/// synthetic Ethernet fixture can be injected through the same veth.
+fn capture_peer_udp_frame(socket: &OwnedFd, destination_port: u16) -> (Vec<u8>, LinkAddr) {
+    let mut buffer = vec![0_u8; 65_536];
+    for _ in 0..64 {
+        let (length, address) = recvfrom::<LinkAddr>(socket.as_raw_fd(), &mut buffer)
+            .expect("capture peer UDP template frame");
+        let frame = &buffer[..length];
+        if frame.len() < 14 + 20 + 8 || frame[12..14] != [0x08, 0x00] {
+            continue;
+        }
+        let ip = &frame[14..];
+        let header_len = usize::from(ip[0] & 0x0f) * 4;
+        if header_len < 20 || ip.len() < header_len + 8 || ip[9] != 17 {
+            continue;
+        }
+        if u16::from_be_bytes([ip[header_len + 2], ip[header_len + 3]]) != destination_port {
+            continue;
+        }
+        return (
+            frame.to_vec(),
+            address.expect("captured peer frame address"),
+        );
+    }
+    panic!("did not capture peer UDP/{destination_port} template frame")
+}
+
+/// Inject an IPv6 extension-shaped + UDP/500 packet. Its zero UDP checksum is
+/// intentionally irrelevant: XDP must hand the packet to the userspace slow
+/// path based on the base header's extension kind before transport
+/// interpretation.
+fn send_ipv6_extension_frame(
+    socket: &OwnedFd,
+    address: &LinkAddr,
+    ethernet_template: &[u8],
+    extension_kind: u8,
+    ike_payload: &[u8],
+) {
+    let udp_len = 8 + ike_payload.len();
+    let ipv6_payload_len = 8 + udp_len;
+    let mut frame = Vec::with_capacity(14 + 40 + ipv6_payload_len);
+    frame.extend_from_slice(&ethernet_template[..12]);
+    frame.extend_from_slice(&[0x86, 0xdd]);
+    frame.extend_from_slice(&[0x60, 0, 0, 0]);
+    frame.extend_from_slice(&(ipv6_payload_len as u16).to_be_bytes());
+    frame.push(extension_kind);
+    frame.push(64);
+    frame.extend_from_slice(&PEER6);
+    frame.extend_from_slice(&VIP6);
+    frame.extend_from_slice(&[17, 0, 0, 0, 0, 0, 0, 0]); // UDP + six Pad1 octets
+    frame.extend_from_slice(&45_000_u16.to_be_bytes());
+    frame.extend_from_slice(&500_u16.to_be_bytes());
+    frame.extend_from_slice(&(udp_len as u16).to_be_bytes());
+    frame.extend_from_slice(&[0, 0]);
+    frame.extend_from_slice(ike_payload);
+
+    let sent = sendto(socket.as_raw_fd(), &frame, address, MsgFlags::empty())
+        .expect("inject IPv6 extension-bearing frame");
+    assert_eq!(sent, frame.len(), "short AF_PACKET frame send");
+}
+
 fn ipv4_checksum(header: &[u8]) -> u16 {
     let mut sum = 0_u32;
     for pair in header.chunks(2) {
@@ -442,6 +530,190 @@ fn established_ike_key() -> SessionOwnershipKey {
     ))
 }
 
+fn fixed_owner_map_key(key: &SessionOwnershipKey) -> [u8; OWNER_KEY_LEN] {
+    let canonical = key.to_canonical_bytes();
+    assert!(
+        canonical.len() < OWNER_KEY_LEN,
+        "canonical key fits map key"
+    );
+    let mut map_key = [0_u8; OWNER_KEY_LEN];
+    map_key[0] = u8::try_from(canonical.len()).expect("canonical key length fits u8");
+    map_key[1..1 + canonical.len()].copy_from_slice(&canonical);
+    map_key
+}
+
+fn pinned_owner_map(
+    pin_dir: &Path,
+) -> BpfHashMap<MapData, [u8; OWNER_KEY_LEN], [u8; OWNER_VALUE_LEN]> {
+    let map = Map::from_map_data(
+        MapData::from_pin(pin_dir.join(MAP_OWNERS)).expect("open pinned owner map"),
+    )
+    .expect("identify pinned owner map");
+    BpfHashMap::try_from(map).expect("typed pinned owner map")
+}
+
+fn pinned_fence_map(pin_dir: &Path) -> BpfHashMap<MapData, u32, u64> {
+    let map = Map::from_map_data(
+        MapData::from_pin(pin_dir.join(MAP_FENCE)).expect("open pinned fence map"),
+    )
+    .expect("identify pinned fence map");
+    BpfHashMap::try_from(map).expect("typed pinned fence map")
+}
+
+fn backend_config(provision: &Provision, handoff_ifindex: u32) -> HostXdpSteeringBackendConfig {
+    HostXdpSteeringBackendConfig {
+        bpffs_pin_root: provision.pin_root.clone(),
+        self_shard: ShardId::new(SELF_SHARD),
+        routing_domain: RoutingDomainTag::new(DOMAIN),
+        redirect_handoff: HostXdpRedirectHandoff::UserspaceRedirector {
+            ifindex: NonZeroU32::new(handoff_ifindex).expect("nonzero hand-off ifindex"),
+        },
+        attach_mode: HostXdpAttachMode::Generic,
+    }
+}
+
+fn legacy_config_bytes(version: u8, fence: u64, handoff_ifindex: u32) -> [u8; CONFIG_VALUE_LEN] {
+    let mut config = XdpDatapathConfig {
+        self_shard: SELF_SHARD,
+        routing_domain: DOMAIN,
+        handoff_ifindex,
+    }
+    .encode();
+    config[0] = version;
+    if version == 1 {
+        config[12..20].copy_from_slice(&fence.to_be_bytes());
+    }
+    config
+}
+
+fn load_v3_namespace(pin_dir: &Path, version: u8, fence: u64, handoff_ifindex: u32) -> Ebpf {
+    fs::create_dir_all(pin_dir).expect("create frozen-v3 map namespace");
+    let mut ebpf = EbpfLoader::new()
+        .default_map_pin_directory(pin_dir)
+        .load(FROZEN_XDP_V3)
+        .expect("load frozen-v3 XDP object");
+    let mut config = Array::<_, [u8; CONFIG_VALUE_LEN]>::try_from(
+        ebpf.map_mut(MAP_CONFIG).expect("frozen-v3 config map"),
+    )
+    .expect("frozen-v3 config array");
+    config
+        .set(
+            CONFIG_KEY,
+            legacy_config_bytes(version, fence, handoff_ifindex),
+            0,
+        )
+        .expect("initialize frozen-v3 config");
+    let mut fence_map =
+        BpfHashMap::<_, u32, u64>::try_from(ebpf.map_mut(MAP_FENCE).expect("frozen-v3 fence map"))
+            .expect("frozen-v3 fence hash");
+    fence_map
+        .insert(FENCE_KEY, fence, 0)
+        .expect("initialize frozen-v3 fence");
+    ebpf
+}
+
+fn create_v1_namespace(interface_dir: &Path, fence: u64, handoff_ifindex: u32) {
+    let ebpf = load_v3_namespace(interface_dir, 1, fence, handoff_ifindex);
+    drop(ebpf);
+    fs::remove_file(interface_dir.join(MAP_FENCE)).expect("v1 has no separate fence pin");
+}
+
+fn create_v4_namespace(pin_dir: &Path, fence: u64, handoff_ifindex: u32) {
+    fs::create_dir_all(pin_dir).expect("create current map namespace");
+    let mut ebpf = EbpfLoader::new()
+        .default_map_pin_directory(pin_dir)
+        .load(CURRENT_XDP)
+        .expect("load current XDP object");
+    let mut config = BpfHashMap::<_, u32, [u8; CONFIG_VALUE_LEN]>::try_from(
+        ebpf.map_mut(MAP_CONFIG).expect("current config map"),
+    )
+    .expect("current config hash");
+    config
+        .insert(
+            CONFIG_KEY,
+            legacy_config_bytes(XDP_CONFIG_ABI_VERSION, fence, handoff_ifindex),
+            0,
+        )
+        .expect("initialize current config");
+    let mut fence_map =
+        BpfHashMap::<_, u32, u64>::try_from(ebpf.map_mut(MAP_FENCE).expect("current fence map"))
+            .expect("current fence hash");
+    fence_map
+        .insert(FENCE_KEY, fence, 0)
+        .expect("initialize current fence");
+    drop(ebpf);
+}
+
+fn install_frozen_v3_handoff(provision: &Provision, fence: u64, handoff_ifindex: u32) {
+    let interface_dir = provision.pin_root.join(&provision.pub_main);
+    let mut ebpf = load_v3_namespace(&interface_dir, 3, fence, handoff_ifindex);
+    let program: &mut Xdp = ebpf
+        .program_mut(PROG_SWU_XDP)
+        .expect("frozen-v3 XDP program")
+        .try_into()
+        .expect("frozen-v3 program type");
+    program.load().expect("load frozen-v3 program");
+    let aya_link_id = program
+        .attach(&provision.pub_main, XdpMode::Skb)
+        .expect("attach frozen-v3 program");
+    let aya_link = program
+        .take_link(aya_link_id)
+        .expect("take frozen-v3 XDP link");
+    let fd_link = FdLink::try_from(aya_link).expect("kernel must provide an XDP bpf_link");
+    let pinned = fd_link
+        .pin(interface_dir.join(HANDOFF_LINK))
+        .expect("pin frozen-v3 handoff link");
+    drop(pinned);
+    drop(ebpf);
+}
+
+fn assert_preserved_fence(backend: &HostXdpSteeringBackend, fence: u64) {
+    assert!(
+        matches!(
+            block_on(backend.advance_fence(fence)),
+            Err(opc_ipsec_lb::IpsecLbError::OwnershipConflict { .. })
+        ),
+        "restart must reject regression to the recovered fence"
+    );
+    block_on(backend.advance_fence(fence + 1)).expect("advance beyond recovered fence");
+}
+
+fn run_crash_owner_child() {
+    let interface = env::var(CRASH_INTERFACE_ENV).expect("crash child interface");
+    let pin_root = PathBuf::from(env::var_os(CRASH_PIN_ROOT_ENV).expect("crash child pin root"));
+    let handoff_ifindex = env::var(CRASH_HANDOFF_ENV)
+        .expect("crash child hand-off")
+        .parse::<u32>()
+        .expect("numeric crash child hand-off");
+    let ready = PathBuf::from(env::var_os(CRASH_READY_ENV).expect("crash child ready path"));
+    let backend = HostXdpSteeringBackend::new(
+        interface,
+        HostXdpSteeringBackendConfig {
+            bpffs_pin_root: pin_root,
+            self_shard: ShardId::new(SELF_SHARD),
+            routing_domain: RoutingDomainTag::new(DOMAIN),
+            redirect_handoff: HostXdpRedirectHandoff::UserspaceRedirector {
+                ifindex: NonZeroU32::new(handoff_ifindex).expect("nonzero crash hand-off"),
+            },
+            attach_mode: HostXdpAttachMode::Generic,
+        },
+    );
+    block_on(backend.attach()).expect("crash child attach");
+    block_on(backend.install_owner(
+        &esp_udp_key(SPI_CRASH_ESP_UDP),
+        ShardId::new(REMOTE_SHARD),
+        7,
+    ))
+    .expect("crash child owner install");
+    block_on(backend.advance_fence(6)).expect("crash child fence");
+    fs::write(ready, b"ready").expect("publish crash child readiness");
+
+    // The parent must terminate this process with SIGKILL. Keep a bound so a
+    // failed parent cannot leave an orphaned privileged test indefinitely.
+    std::thread::sleep(Duration::from_secs(30));
+    panic!("crash child was not killed by its parent");
+}
+
 /// Drive the async backend API from plain threads.
 fn block_on<F: std::future::Future>(future: F) -> F::Output {
     tokio::runtime::Builder::new_current_thread()
@@ -452,8 +724,213 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
 }
 
 #[test]
-#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+#[ignore = "requires root (CAP_SYS_ADMIN/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+fn xdp_upgrade_crash_recovery_and_v3_handoff() {
+    if env::var("OPC_IPSEC_LB_RUN_PRIVILEGED").as_deref() != Ok("1") {
+        eprintln!("skipping: set OPC_IPSEC_LB_RUN_PRIVILEGED=1 inside a fresh privileged netns");
+        return;
+    }
+
+    // Every SDK-produced v4 cleanup cut must retain a readable fence witness.
+    // A second complete namespace at the same maximum proves recovery never
+    // regresses even when the interrupted namespace is selected for staging.
+    const V4_FENCE: u64 = 41;
+    for cut_after in 1..=4 {
+        let provision = Provision::new();
+        let handoff_ifindex = nix::net::if_::if_nametoindex(provision.hand_main.as_str())
+            .expect("resolve hand-off ifindex");
+        let config = backend_config(&provision, handoff_ifindex);
+        let first = HostXdpSteeringBackend::new(provision.pub_main.clone(), config.clone());
+        block_on(first.attach()).expect("attach first v4 namespace");
+        block_on(first.advance_fence(V4_FENCE)).expect("seed first v4 fence");
+        drop(first);
+
+        let second = HostXdpSteeringBackend::new(provision.pub_main.clone(), config.clone());
+        block_on(second.attach()).expect("stage second complete v4 namespace");
+        drop(second);
+
+        let slot_a = provision
+            .pin_root
+            .join(&provision.pub_main)
+            .join(MAP_SLOT_A);
+        for map_name in [MAP_OWNERS, MAP_COUNTERS, MAP_CONFIG, MAP_FENCE]
+            .into_iter()
+            .take(cut_after)
+        {
+            fs::remove_file(slot_a.join(map_name)).expect("inject v4 cleanup crash cut");
+        }
+
+        let recovered = HostXdpSteeringBackend::new(provision.pub_main.clone(), config);
+        block_on(recovered.attach()).expect("recover interrupted v4 cleanup");
+        assert_preserved_fence(&recovered, V4_FENCE);
+        block_on(recovered.detach()).expect("detach v4 recovery proof");
+    }
+
+    // V1 stores the fence in config, so config must be the final deleted pin.
+    // Exercise a restart after every possible v1 cleanup cut against another
+    // complete namespace carrying the same maximum generation.
+    const V1_FENCE: u64 = 53;
+    for cut_after in 1..=3 {
+        let provision = Provision::new();
+        let handoff_ifindex = nix::net::if_::if_nametoindex(provision.hand_main.as_str())
+            .expect("resolve hand-off ifindex");
+        let interface_dir = provision.pin_root.join(&provision.pub_main);
+        create_v1_namespace(&interface_dir, V1_FENCE, handoff_ifindex);
+
+        let config = backend_config(&provision, handoff_ifindex);
+        let staged = HostXdpSteeringBackend::new(provision.pub_main.clone(), config.clone());
+        block_on(staged.attach()).expect("stage complete v4 namespace beside v1");
+        drop(staged);
+
+        for map_name in [MAP_OWNERS, MAP_COUNTERS, MAP_CONFIG]
+            .into_iter()
+            .take(cut_after)
+        {
+            fs::remove_file(interface_dir.join(map_name)).expect("inject v1 cleanup crash cut");
+        }
+
+        let recovered = HostXdpSteeringBackend::new(provision.pub_main.clone(), config);
+        block_on(recovered.attach()).expect("recover interrupted v1 cleanup");
+        assert_preserved_fence(&recovered, V1_FENCE);
+        block_on(recovered.detach()).expect("detach v1 recovery proof");
+    }
+
+    // A unique maximum that exists only in a partial namespace must never be
+    // erased as the staging target. The replacement namespace receives the
+    // recovered generation before the old witness can be retired.
+    const UNIQUE_MAX_FENCE: u64 = 67;
+    {
+        let provision = Provision::new();
+        let handoff_ifindex = nix::net::if_::if_nametoindex(provision.hand_main.as_str())
+            .expect("resolve hand-off ifindex");
+        let interface_dir = provision.pin_root.join(&provision.pub_main);
+        let slot_a = interface_dir.join(MAP_SLOT_A);
+        let slot_b = interface_dir.join(MAP_SLOT_B);
+        create_v4_namespace(&slot_a, UNIQUE_MAX_FENCE, handoff_ifindex);
+        for map_name in [MAP_OWNERS, MAP_COUNTERS, MAP_CONFIG] {
+            fs::remove_file(slot_a.join(map_name)).expect("create unique-max partial residue");
+        }
+        create_v4_namespace(&slot_b, UNIQUE_MAX_FENCE - 1, handoff_ifindex);
+
+        let recovered = HostXdpSteeringBackend::new(
+            provision.pub_main.clone(),
+            backend_config(&provision, handoff_ifindex),
+        );
+        block_on(recovered.attach()).expect("stage away from unique-max partial namespace");
+        assert!(
+            slot_a.join(MAP_FENCE).exists(),
+            "the unique maximum witness must survive staging"
+        );
+        assert_eq!(
+            pinned_fence_map(&slot_b)
+                .get(&FENCE_KEY, 0)
+                .expect("read replacement fence"),
+            UNIQUE_MAX_FENCE,
+            "the replacement must persist the maximum before old cleanup"
+        );
+        fs::remove_file(slot_a.join(MAP_FENCE)).expect("retire old maximum witness");
+        assert_preserved_fence(&recovered, UNIQUE_MAX_FENCE);
+        block_on(recovered.detach()).expect("detach unique-max proof");
+    }
+
+    // A partial namespace containing an alias of an active program map is not
+    // disjoint crash residue. Adoption must fail before the exact link changes.
+    {
+        let provision = Provision::new();
+        let handoff_ifindex = nix::net::if_::if_nametoindex(provision.hand_main.as_str())
+            .expect("resolve hand-off ifindex");
+        let config = backend_config(&provision, handoff_ifindex);
+        let backend = HostXdpSteeringBackend::new(provision.pub_main.clone(), config.clone());
+        block_on(backend.attach()).expect("attach active intersection proof");
+        block_on(backend.advance_fence(79)).expect("seed active fence");
+        block_on(backend.prepare_upgrade_handoff()).expect("prepare active handoff");
+
+        let interface_dir = provision.pin_root.join(&provision.pub_main);
+        let slot_a = interface_dir.join(MAP_SLOT_A);
+        let slot_b = interface_dir.join(MAP_SLOT_B);
+        fs::create_dir_all(&slot_b).expect("create intersecting partial namespace");
+        MapData::from_pin(slot_a.join(MAP_OWNERS))
+            .expect("open active owners map")
+            .pin(slot_b.join(MAP_OWNERS))
+            .expect("alias active owners map");
+        MapData::from_pin(slot_a.join(MAP_FENCE))
+            .expect("open active fence map")
+            .pin(slot_b.join(MAP_FENCE))
+            .expect("alias active fence map");
+
+        let handoff_path = interface_dir.join(HANDOFF_LINK);
+        let before = opc_linux_gtpu_sys::open_xdp_link_from_pin(&handoff_path)
+            .expect("open handoff link before rejected adoption")
+            .info()
+            .expect("read handoff identity before rejected adoption");
+        let successor = HostXdpSteeringBackend::new(provision.pub_main.clone(), config);
+        assert!(
+            matches!(
+                block_on(successor.adopt_upgrade_handoff()),
+                Err(opc_ipsec_lb::IpsecLbError::XdpUpgradeIndeterminate)
+            ),
+            "an active-map alias in partial residue must fail closed"
+        );
+        let after = opc_linux_gtpu_sys::open_xdp_link_from_pin(&handoff_path)
+            .expect("open handoff link after rejected adoption")
+            .info()
+            .expect("read handoff identity after rejected adoption");
+        assert_eq!(before, after, "rejected adoption must not mutate the link");
+        drop(successor);
+        drop(backend);
+        fs::remove_file(handoff_path).expect("detach rejected handoff proof");
+    }
+
+    // The frozen v3 object is a genuinely distinct artifact (array config)
+    // whose pinned link and maps must migrate to the current v4 hash schema.
+    // A higher disjoint partial generation in the fixed target additionally
+    // proves adoption persists the maximum into the active legacy namespace
+    // before it erases and reconstructs that target.
+    const V3_FENCE: u64 = 83;
+    {
+        let provision = Provision::new();
+        let handoff_ifindex = nix::net::if_::if_nametoindex(provision.hand_main.as_str())
+            .expect("resolve hand-off ifindex");
+        install_frozen_v3_handoff(&provision, V3_FENCE, handoff_ifindex);
+        let legacy_dir = provision.pin_root.join(&provision.pub_main);
+        let retained_active_fence = pinned_fence_map(&legacy_dir);
+        let target = provision
+            .pin_root
+            .join(&provision.pub_main)
+            .join(MAP_SLOT_A);
+        create_v4_namespace(&target, V3_FENCE + 1, handoff_ifindex);
+        for map_name in [MAP_OWNERS, MAP_COUNTERS, MAP_CONFIG] {
+            fs::remove_file(target.join(map_name)).expect("create higher target residue");
+        }
+        let successor = HostXdpSteeringBackend::new(
+            provision.pub_main.clone(),
+            backend_config(&provision, handoff_ifindex),
+        );
+        let outcome =
+            block_on(successor.adopt_upgrade_handoff()).expect("adopt frozen-v3 handoff into v4");
+        assert!(matches!(
+            outcome,
+            HostXdpUpgradeOutcome::Applied | HostXdpUpgradeOutcome::AppliedCleanupPending { .. }
+        ));
+        assert_eq!(
+            retained_active_fence
+                .get(&FENCE_KEY, 0)
+                .expect("read retained legacy fence after migration"),
+            V3_FENCE + 1,
+            "adoption must persist the maximum into the active map before target erasure"
+        );
+        assert_preserved_fence(&successor, V3_FENCE + 1);
+        block_on(successor.detach()).expect("detach v3-to-v4 proof");
+    }
+}
+
+#[test]
+#[ignore = "requires root (CAP_SYS_ADMIN/CAP_NET_ADMIN), a fresh netns, and bpffs"]
 fn xdp_keyless_classification_and_owner_steering() {
+    if env::var(CRASH_CHILD_ENV).as_deref() == Ok("1") {
+        run_crash_owner_child();
+        return;
+    }
     if env::var("OPC_IPSEC_LB_RUN_PRIVILEGED").as_deref() != Ok("1") {
         eprintln!("skipping: set OPC_IPSEC_LB_RUN_PRIVILEGED=1 inside a fresh privileged netns");
         return;
@@ -467,6 +944,7 @@ fn xdp_keyless_classification_and_owner_steering() {
 
     let sender = udp_send_socket(&provision.peer_ns);
     let esp_sender = raw_ip_send_socket(&provision.peer_ns);
+    let frame_injector = packet_capture_socket(&provision.peer_ns);
     let capture_socket = packet_capture_socket(&provision.redir_ns);
     let main_capture = main_capture_socket();
     let hand_ifindex = nix::net::if_::if_nametoindex(provision.hand_main.as_str())
@@ -549,7 +1027,7 @@ fn xdp_keyless_classification_and_owner_steering() {
         "a hand-off equal to the attached interface must reject attach"
     );
 
-    let backend = HostXdpSteeringBackend::new(provision.pub_main.clone(), config);
+    let mut backend = HostXdpSteeringBackend::new(provision.pub_main.clone(), config.clone());
     runtime
         .block_on(backend.attach())
         .expect("attach XDP datapath");
@@ -574,6 +1052,40 @@ fn xdp_keyless_classification_and_owner_steering() {
     // --- Stage A: classification of all three classes and every verdict. ---
     let established_ike = ike_header(IKE_INIT_SPI, IKE_RESP_SPI, 35, &[0xaa; 12]);
     send_udp(&sender, 500, &established_ike);
+    let (ethernet_template, peer_link_address) = capture_peer_udp_frame(&frame_injector, 500);
+    let unclassifiable_before_extension = runtime
+        .block_on(backend.counters())
+        .expect("pre-extension counters")
+        .unclassifiable;
+    send_ipv6_extension_frame(
+        &frame_injector,
+        &peer_link_address,
+        &ethernet_template,
+        0, // Hop-by-Hop Options
+        &established_ike,
+    );
+    send_ipv6_extension_frame(
+        &frame_injector,
+        &peer_link_address,
+        &ethernet_template,
+        140, // Shim6
+        &established_ike,
+    );
+    let extension_deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let observed = runtime
+            .block_on(backend.counters())
+            .expect("extension counters")
+            .unclassifiable;
+        if observed >= unclassifiable_before_extension + 2 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < extension_deadline,
+            "real IPv6 extension-bearing frame did not reach the unclassifiable slow path"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
     let mut marked_ike = vec![0, 0, 0, 0];
     marked_ike.extend_from_slice(&ike_header(IKE_INIT_SPI, IKE_RESP_SPI, 35, &[]));
     send_udp(&sender, 4500, &marked_ike);
@@ -682,9 +1194,9 @@ fn xdp_keyless_classification_and_owner_steering() {
     assert_eq!(counters.redirect, 1, "redirect verdicts: {counters:?}");
     assert_eq!(counters.miss, 1, "miss verdicts: {counters:?}");
     assert_eq!(counters.stale, 1, "stale verdicts: {counters:?}");
-    assert_eq!(
-        counters.unclassifiable, 1,
-        "unclassifiable verdicts: {counters:?}"
+    assert!(
+        counters.unclassifiable >= unclassifiable_before_extension + 3,
+        "the extension-bearing and malformed UDP fixtures must all be unclassifiable: {counters:?}"
     );
     assert_eq!(counters.error, 0, "error verdicts: {counters:?}");
     assert_eq!(counters.natt_keepalive, 1, "keepalives: {counters:?}");
@@ -717,8 +1229,12 @@ fn xdp_keyless_classification_and_owner_steering() {
         "a second writer on an occupied interface must conflict"
     );
     assert!(
-        !provision.pin_root.join("writer-b").exists(),
-        "the rejected writer must not create pins"
+        !provision
+            .pin_root
+            .join("writer-b")
+            .join(&provision.pub_main)
+            .exists(),
+        "the rejected writer may create its empty lock root but must not create map pins"
     );
     send_udp(
         &sender,
@@ -779,7 +1295,7 @@ fn xdp_keyless_classification_and_owner_steering() {
                         || (owner.get() == REMOTE_SHARD && generation >= 2_000);
                     assert!(
                         consistent,
-                        "torn owner/generation pair observed: shard {} generation {}",
+                        "unexpected owner/generation pair observed: shard {} generation {}",
                         owner.get(),
                         generation
                     );
@@ -798,6 +1314,89 @@ fn xdp_keyless_classification_and_owner_steering() {
     stop.store(true, Ordering::Relaxed);
     writer.join().expect("writer thread");
     reader.join().expect("reader thread");
+
+    // Exercise the kernel publication primitive directly, bypassing the
+    // backend's userspace operation gate. Both maps are BPF_MAP_TYPE_HASH:
+    // replacement publishes an immutable element, so every concurrent raw
+    // read must equal one complete old or new value.
+    let pin_dir = provision.pin_root.join(&provision.pub_main);
+    let raw_atomic_key = fixed_owner_map_key(&atomic_key);
+    let owner_a = XdpOwnerValue {
+        owner_shard: SELF_SHARD,
+        generation: 4_000,
+    }
+    .encode();
+    let owner_b = XdpOwnerValue {
+        owner_shard: REMOTE_SHARD,
+        generation: 5_000,
+    }
+    .encode();
+    {
+        let mut owners = pinned_owner_map(&pin_dir);
+        owners
+            .insert(raw_atomic_key, owner_a, 0)
+            .expect("seed owner publication stress");
+        let mut fence = pinned_fence_map(&pin_dir);
+        fence
+            .insert(FENCE_KEY, 5_u64, 0)
+            .expect("seed fence publication stress");
+    }
+    let publication_stop = Arc::new(AtomicBool::new(false));
+    let publication_barrier = Arc::new(std::sync::Barrier::new(2));
+    let publication_writer = std::thread::spawn({
+        let pin_dir = pin_dir.clone();
+        let publication_stop = publication_stop.clone();
+        let publication_barrier = publication_barrier.clone();
+        move || {
+            let mut owners = pinned_owner_map(&pin_dir);
+            let mut fence = pinned_fence_map(&pin_dir);
+            publication_barrier.wait();
+            for round in 0..50_000_u32 {
+                let owner = if round & 1 == 0 { owner_a } else { owner_b };
+                let fence_generation = if round & 1 == 0 { 5_u64 } else { 6_u64 };
+                owners
+                    .insert(raw_atomic_key, owner, 0)
+                    .expect("replace owner element");
+                fence
+                    .insert(FENCE_KEY, fence_generation, 0)
+                    .expect("replace fence element");
+            }
+            publication_stop.store(true, Ordering::Release);
+        }
+    });
+    let publication_reader = std::thread::spawn({
+        let pin_dir = pin_dir.clone();
+        let publication_stop = publication_stop.clone();
+        let publication_barrier = publication_barrier.clone();
+        move || {
+            let owners = pinned_owner_map(&pin_dir);
+            let fence = pinned_fence_map(&pin_dir);
+            let mut observations = 0_u64;
+            publication_barrier.wait();
+            while !publication_stop.load(Ordering::Acquire) || observations < 1_000 {
+                let owner = owners
+                    .get(&raw_atomic_key, 0)
+                    .expect("read owner publication");
+                assert!(
+                    owner == owner_a || owner == owner_b,
+                    "owner hash replacement exposed neither complete published value"
+                );
+                let fence_generation = fence.get(&FENCE_KEY, 0).expect("read fence publication");
+                assert!(
+                    fence_generation == 5 || fence_generation == 6,
+                    "fence hash replacement exposed neither complete published value"
+                );
+                observations += 1;
+            }
+            observations
+        }
+    });
+    publication_writer.join().expect("publication writer");
+    let publication_observations = publication_reader.join().expect("publication reader");
+    assert!(
+        publication_observations >= 1_000,
+        "publication stress must make repeated concurrent observations"
+    );
 
     let udp4500_atomic = drain_udp(&natt4500)
         .into_iter()
@@ -819,7 +1418,7 @@ fn xdp_keyless_classification_and_owner_steering() {
     let counters = runtime.block_on(backend.counters()).expect("counters");
     assert_eq!(
         counters.error, 0,
-        "no torn values may surface: {counters:?}"
+        "valid old-or-new publications must not surface as map errors: {counters:?}"
     );
     assert_eq!(
         counters.local + counters.redirect + counters.miss + counters.stale,
@@ -827,12 +1426,11 @@ fn xdp_keyless_classification_and_owner_steering() {
         "classified verdicts after the atomic stage: {counters:?}"
     );
 
-    // --- Stage C: graceful program replacement under continuous traffic. ---
+    // --- Stage C: graceful process handoff under continuous traffic. ---
     let replace_key = esp_udp_key(SPI_REPLACE_ESP_UDP);
     runtime
         .block_on(backend.install_owner(&replace_key, ShardId::new(SELF_SHARD), 3_000))
         .expect("install replace key");
-    let before = runtime.block_on(backend.counters()).expect("counters");
     let stop_sending = Arc::new(AtomicBool::new(false));
     let sender_thread = std::thread::spawn({
         let stop_sending = stop_sending.clone();
@@ -855,8 +1453,17 @@ fn xdp_keyless_classification_and_owner_steering() {
     std::thread::sleep(Duration::from_millis(100));
     for _ in 0..3 {
         runtime
-            .block_on(backend.replace())
-            .expect("graceful program replacement");
+            .block_on(backend.prepare_upgrade_handoff())
+            .expect("prepare graceful process handoff");
+        let successor = HostXdpSteeringBackend::new(provision.pub_main.clone(), config.clone());
+        let outcome = runtime
+            .block_on(successor.adopt_upgrade_handoff())
+            .expect("adopt graceful process handoff");
+        assert!(matches!(
+            outcome,
+            HostXdpUpgradeOutcome::Applied | HostXdpUpgradeOutcome::AppliedCleanupPending { .. }
+        ));
+        backend = successor;
         std::thread::sleep(Duration::from_millis(20));
     }
     std::thread::sleep(Duration::from_millis(100));
@@ -875,22 +1482,16 @@ fn xdp_keyless_classification_and_owner_steering() {
     let after = runtime.block_on(backend.counters()).expect("counters");
     assert_eq!(after.error, 0, "no errors across replacement: {after:?}");
     assert!(
-        after.local >= before.local + u64::from(sent),
-        "counters persist and keep accumulating across replacement"
+        after.local > 0,
+        "the adopted datapath must count local verdicts"
     );
 
-    // --- Stage D: a process crash never re-arms stale owners. ---
+    // --- Stage D: SIGKILL closes bpf_link; restart adopts only safe state. ---
     let crash_key = esp_udp_key(SPI_CRASH_ESP_UDP);
     runtime
-        .block_on(backend.install_owner(&crash_key, ShardId::new(SELF_SHARD), 5))
-        .expect("install crash key");
-    runtime
-        .block_on(backend.advance_fence(6))
-        .expect("advance fence past the entry");
-    let before_crash = runtime.block_on(backend.counters()).expect("counters");
-
-    // Simulate the crash: drop the backend without detach. The pins persist;
-    // the program is unloaded with the process.
+        .block_on(backend.detach())
+        .expect("detach before crash child");
+    drop(backend);
     let config_template = HostXdpSteeringBackendConfig {
         bpffs_pin_root: provision.pin_root.clone(),
         self_shard: ShardId::new(SELF_SHARD),
@@ -900,15 +1501,113 @@ fn xdp_keyless_classification_and_owner_steering() {
         },
         attach_mode: HostXdpAttachMode::Generic,
     };
-    drop(backend);
+
+    let crash_ready = std::env::temp_dir().join(format!(
+        "opc-xdp-crash-ready-{}-{}",
+        std::process::id(),
+        provision.pub_main
+    ));
+    let _ = fs::remove_file(&crash_ready);
+    let mut crash_child = Command::new(std::env::current_exe().expect("current test executable"))
+        .args([
+            "--exact",
+            "xdp_keyless_classification_and_owner_steering",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(CRASH_CHILD_ENV, "1")
+        .env(CRASH_INTERFACE_ENV, &provision.pub_main)
+        .env(CRASH_PIN_ROOT_ENV, &provision.pin_root)
+        .env(CRASH_HANDOFF_ENV, hand_ifindex.to_string())
+        .env(CRASH_READY_ENV, &crash_ready)
+        .spawn()
+        .expect("spawn crash owner process");
+    let ready_deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while !crash_ready.exists() && std::time::Instant::now() < ready_deadline {
+        if crash_child.try_wait().expect("poll crash child").is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if !crash_ready.exists() {
+        let _ = crash_child.kill();
+        let _ = crash_child.wait();
+        panic!("crash child did not publish readiness");
+    }
+
+    // Prove that the child owns the live bpf_link and that its fresh remote
+    // owner record is executing before termination.
+    send_udp(
+        &sender,
+        4500,
+        &esp_packet(SPI_CRASH_ESP_UDP, 1, &[0x5a; 24]),
+    );
+    std::thread::sleep(Duration::from_millis(200));
+    let before_kill_local = drain_udp(&natt4500)
+        .iter()
+        .any(|payload| payload.starts_with(&SPI_CRASH_ESP_UDP.to_be_bytes()));
+    let before_kill_redirect = drain_fd(&capture_socket).iter().any(|frame| {
+        frame
+            .windows(4)
+            .any(|window| window == SPI_CRASH_ESP_UDP.to_be_bytes())
+    });
+
+    crash_child.kill().expect("SIGKILL crash owner process");
+    let crash_status = crash_child.wait().expect("reap crash owner process");
+    let _ = fs::remove_file(&crash_ready);
+    assert!(
+        !crash_status.success(),
+        "crash proof requires abnormal exit"
+    );
+    assert!(
+        before_kill_redirect,
+        "the child-owned live datapath must execute the remote-owner verdict"
+    );
+    assert!(
+        !before_kill_local,
+        "the child-owned remote record must not pass to the local stack"
+    );
+
+    // SIGKILL closes the unpinned bpf_link but leaves the pinned maps. Verify
+    // the exact crash residue before the replacement process adopts it.
+    let pin_dir = provision.pin_root.join(&provision.pub_main);
+    let raw_crash_key = fixed_owner_map_key(&crash_key);
+    let crash_owner = pinned_owner_map(&pin_dir)
+        .get(&raw_crash_key, 0)
+        .expect("read crash-residue owner");
+    assert_eq!(
+        crash_owner,
+        XdpOwnerValue {
+            owner_shard: REMOTE_SHARD,
+            generation: 7,
+        }
+        .encode(),
+        "the killed process must leave its exact pinned owner record"
+    );
+    assert_eq!(
+        pinned_fence_map(&pin_dir)
+            .get(&FENCE_KEY, 0)
+            .expect("read crash-residue fence"),
+        6,
+        "the killed process must leave its committed fence pinned"
+    );
 
     // The restarted process adopts the pins: owners are flushed and the
-    // persisted fence is honored, so the crashed process's stale entry can
-    // never produce a LOCAL verdict.
+    // persisted fence is honored, so the killed process's owner cannot steer.
     let restarted = HostXdpSteeringBackend::new(provision.pub_main.clone(), config_template);
-    runtime
-        .block_on(restarted.attach())
-        .expect("re-attach after crash");
+    let attach_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match runtime.block_on(restarted.attach()) {
+            Ok(()) => break,
+            Err(opc_ipsec_lb::IpsecLbError::AlreadyExists)
+                if std::time::Instant::now() < attach_deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => panic!("re-attach after killed bpf_link failed: {error}"),
+        }
+    }
     assert_eq!(
         runtime
             .block_on(restarted.owner_record(&crash_key))
@@ -927,7 +1626,7 @@ fn xdp_keyless_classification_and_owner_steering() {
     send_udp(
         &sender,
         4500,
-        &esp_packet(SPI_CRASH_ESP_UDP, 1, &[0x5b; 24]),
+        &esp_packet(SPI_CRASH_ESP_UDP, 2, &[0x5b; 24]),
     );
     std::thread::sleep(Duration::from_millis(200));
     let udp4500_restart = drain_udp(&natt4500);
@@ -937,14 +1636,26 @@ fn xdp_keyless_classification_and_owner_steering() {
             .any(|payload| payload.starts_with(&SPI_CRASH_ESP_UDP.to_be_bytes())),
         "re-attached datapath must fail closed to the slow path"
     );
+    let redirect_after_restart = drain_fd(&capture_socket).iter().any(|frame| {
+        frame
+            .windows(4)
+            .any(|window| window == SPI_CRASH_ESP_UDP.to_be_bytes())
+    });
+    assert!(
+        !redirect_after_restart,
+        "a killed process's flushed owner must never redirect after adoption"
+    );
     let after_restart = runtime.block_on(restarted.counters()).expect("counters");
     assert_eq!(
-        after_restart.local, before_crash.local,
-        "the crashed process's entry must never produce a LOCAL verdict"
+        after_restart.local, 0,
+        "the killed process's entry must never produce a LOCAL verdict"
     );
     assert_eq!(
-        after_restart.miss,
-        before_crash.miss + 1,
+        after_restart.redirect, 1,
+        "the pre-kill remote verdict must remain visible in adopted counters"
+    );
+    assert_eq!(
+        after_restart.miss, 1,
         "flushed owners verdict as map miss (slow path)"
     );
 

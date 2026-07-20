@@ -110,9 +110,15 @@ jobs:
       # ESP-in-UDP, and native ESP; local pass for self-owned keys; explicit
       # userspace-redirector hand-off for remote-owned keys; fail-closed
       # slow-path counters for map miss, stale generation, and
-      # unclassifiable candidates; atomic per-key owner updates under
-      # concurrent traffic; and graceful program replacement under
-      # continuous traffic with no verdict gap.
+      # unclassifiable candidates including real Hop-by-Hop and Shim6
+      # extension-bearing packets; old-or-new owner/fence hash publication
+      # under concurrent raw map access; graceful cross-process bpf-link
+      # handoff under continuous traffic with no verdict gap; and
+      # SIGKILL/restart behavior with owner flushing and persisted-fence
+      # enforcement. It also fault-cuts every v1/v4 map-unlink boundary,
+      # rejects active-map aliases without link mutation, preserves unique
+      # maximum fence evidence, and migrates a frozen v3 link/map artifact to
+      # the current v4 hash-map ABI.
       - name: Run privileged XDP test in a fresh netns
         run: |
           set -euo pipefail

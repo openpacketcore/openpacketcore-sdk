@@ -17,13 +17,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ownership keys and fenced generations the datapath now executes.
   The backend gained an owner-record API (`install_owner`/`remove_owner`/
   `owner_record`), monotonic `advance_fence`, per-verdict `counters`,
-  graceful atomic `replace`, and typed kernel-floor enforcement
+  explicit cross-process prepare/adopt handoff, and typed Linux 5.18
+  kernel-floor enforcement
   (`IpsecLbError::XdpKernelFloorNotMet`). The pinned map ABI changed
   (owner map keyed by the canonical ownership key, separate fence map,
-  versioned config): pre-existing bpffs pins must be removed before
-  attaching the new object. The fence generation resets to zero across the
-  v1→v2 pin upgrade; this is benign because owner pins are flushed at
-  attach and the fenced ownership authority re-mints the fence.
+  versioned config ABI v4). The runtime recognizes strict v1-v4 namespaces,
+  preserves the maximum durable fence, stages fresh bounded A/B namespaces,
+  and atomically updates the exact retained BPF link with expected-old
+  compare-and-replace. Owner pins are emptied and verified before handoff;
+  interrupted evidence-last cleanup remains recoverable without regressing
+  the fence. A permanent per-interface `.control` inode serializes cooperating
+  processes for the full ready lifetime. The loader requires effective
+  `CAP_NET_ADMIN` and `CAP_SYS_ADMIN`, admits only XDP `bpf_link` attachments,
+  and rejects legacy netlink fallback. Readiness validates the configured
+  bpffs pin root and target/redirect interfaces; redirect hand-off is disabled
+  by default; and `Native` truthfully means Aya's kernel-selected zero-flag
+  mode. XDP sends every current IANA-registered IPv6 extension kind except
+  direct native ESP to the userspace slow path, and public diagnostics redact
+  packet and topology identities.
 
 ### Added
 - **SWm DER access authorization context — `opc-proto-diameter`:**

@@ -32,17 +32,17 @@ use aya_ebpf::{
     bindings::xdp_action::XDP_PASS,
     helpers::bpf_redirect,
     macros::{map, xdp},
-    maps::{Array, HashMap, PerCpuArray},
+    maps::{HashMap, PerCpuArray},
     programs::XdpContext,
 };
 use aya_ebpf_bindings::helpers::bpf_xdp_load_bytes;
 use opc_ipsec_lb_ebpf_common::{
-    classify_transport, decide_owner_verdict, ownership_map_key, redirect_outcome, verdict_counter,
-    XdpDatapathConfig, XdpIpAddress, XdpRedirectOutcome, XdpTransportClass, XdpVerdict,
-    CONFIG_VALUE_LEN, COUNTER_ERROR, COUNTER_NATT_KEEPALIVE, COUNTER_PASS_NON_SWU, COUNTER_REDIRECT,
-    COUNTER_SLOTS, COUNTER_UNCLASSIFIABLE, ESP_HEADER_PREFIX_LEN, ETH_HDR_LEN, ETH_P_IPV4,
-    ETH_P_IPV6, IP_PROTOCOL_ESP, IP_PROTOCOL_UDP, MAX_INGRESS_IPV6_EXTENSION_HEADERS, OWNER_KEY_LEN,
-    OWNER_VALUE_LEN, XDP_TRANSPORT_PROBE_LEN,
+    classify_transport, decide_owner_verdict, is_ipv6_extension_header_kind,
+    ownership_map_key, redirect_outcome, verdict_counter, XdpDatapathConfig, XdpIpAddress,
+    XdpRedirectOutcome, XdpTransportClass, XdpVerdict, CONFIG_KEY, CONFIG_VALUE_LEN,
+    COUNTER_ERROR, COUNTER_NATT_KEEPALIVE, COUNTER_PASS_NON_SWU, COUNTER_REDIRECT, COUNTER_SLOTS,
+    COUNTER_UNCLASSIFIABLE, ESP_HEADER_PREFIX_LEN, ETH_HDR_LEN, ETH_P_IPV4, ETH_P_IPV6, FENCE_KEY,
+    IP_PROTOCOL_ESP, IP_PROTOCOL_UDP, OWNER_KEY_LEN, OWNER_VALUE_LEN, XDP_TRANSPORT_PROBE_LEN,
 };
 
 /// Pinned owner map keyed by the canonical destination-scoped ownership key.
@@ -50,18 +50,19 @@ use opc_ipsec_lb_ebpf_common::{
 static IPSEC_LB_OWNERS: HashMap<[u8; OWNER_KEY_LEN], [u8; OWNER_VALUE_LEN]> =
     HashMap::pinned(65536, 0);
 
-/// Single-slot datapath config.
+/// Single-entry datapath config. Hash replacement publishes an immutable old
+/// or new value to lockless readers.
 #[map(name = "IPSEC_LB_CONFIG")]
-static IPSEC_LB_CONFIG: Array<[u8; CONFIG_VALUE_LEN]> = Array::pinned(1, 0);
+static IPSEC_LB_CONFIG: HashMap<u32, [u8; CONFIG_VALUE_LEN]> = HashMap::pinned(1, 0);
 
 /// Per-CPU per-verdict counters.
 #[map(name = "IPSEC_LB_COUNTERS")]
 static IPSEC_LB_COUNTERS: PerCpuArray<u64> = PerCpuArray::pinned(COUNTER_SLOTS, 0);
 
-/// Single-slot ownership fence generation (aligned u64; updates are
-/// tear-free single stores).
+/// Single-entry ownership fence generation. Hash replacement publishes an
+/// immutable old or new value to lockless readers.
 #[map(name = "IPSEC_LB_FENCE")]
-static IPSEC_LB_FENCE: Array<u64> = Array::pinned(1, 0);
+static IPSEC_LB_FENCE: HashMap<u32, u64> = HashMap::pinned(1, 0);
 
 const IPV4_MIN_HDR_LEN: usize = 20;
 const IPV6_HDR_LEN: usize = 40;
@@ -76,13 +77,6 @@ const IPV6_SOURCE_OFFSET: usize = 8;
 const IPV6_DESTINATION_OFFSET: usize = 24;
 const IPV4_FRAG_OFFSET_MASK: u16 = 0x1fff;
 const IPV4_MORE_FRAGMENTS_MASK: u16 = 0x2000;
-const IPV6_NEXT_HEADER_HOP: u8 = 0;
-const IPV6_NEXT_HEADER_ROUTING: u8 = 43;
-const IPV6_NEXT_HEADER_FRAGMENT: u8 = 44;
-const IPV6_NEXT_HEADER_AH: u8 = 51;
-const IPV6_NEXT_HEADER_DEST: u8 = 60;
-const IPV6_FRAGMENT_LEN: usize = 8;
-const IPV6_FRAG_VALUE_MASK: u16 = 0xfff9;
 
 #[xdp]
 pub fn opc_ipsec_lb_xdp(ctx: XdpContext) -> u32 {
@@ -169,29 +163,14 @@ fn steer_ipv6(ctx: &XdpContext) -> u32 {
     if ETH_HDR_LEN + IPV6_HDR_LEN + payload_len > packet_len(ctx) {
         return counted_pass(COUNTER_UNCLASSIFIABLE);
     }
-    let mut protocol = header[ETH_HDR_LEN + IPV6_NEXT_HEADER_OFFSET];
-    let mut cursor = ETH_HDR_LEN + IPV6_HDR_LEN;
-    let packet_end = ETH_HDR_LEN + IPV6_HDR_LEN + payload_len;
-    let mut extension_count = 0usize;
-    while is_ipv6_extension_header(protocol) {
-        if extension_count == MAX_INGRESS_IPV6_EXTENSION_HEADERS {
-            return counted_pass(COUNTER_UNCLASSIFIABLE);
-        }
-        if cursor + IPV6_FRAGMENT_LEN > packet_end {
-            return counted_pass(COUNTER_UNCLASSIFIABLE);
-        }
-        let Some(extension) = read_bytes::<8>(ctx, cursor) else {
-            return counted_pass(COUNTER_UNCLASSIFIABLE);
-        };
-        let Some(extension_len) = extension_header_len(protocol, &extension) else {
-            return counted_pass(COUNTER_UNCLASSIFIABLE);
-        };
-        if cursor + extension_len > packet_end {
-            return counted_pass(COUNTER_UNCLASSIFIABLE);
-        }
-        protocol = extension[0];
-        cursor += extension_len;
-        extension_count += 1;
+    let protocol = header[ETH_HDR_LEN + IPV6_NEXT_HEADER_OFFSET];
+    if protocol != IP_PROTOCOL_ESP && is_ipv6_extension_header_kind(protocol) {
+        // The verifier-friendly fast path does not walk extension headers.
+        // Slow-path every IANA-registered extension kind, including kinds the
+        // userspace parser deliberately rejects, so an extension can never
+        // conceal UDP/500, UDP/4500, or ESP from owner steering. Direct ESP
+        // remains a supported transport and is classified below.
+        return counted_pass(COUNTER_UNCLASSIFIABLE);
     }
     if protocol != IP_PROTOCOL_UDP && protocol != IP_PROTOCOL_ESP {
         return counted_pass(COUNTER_PASS_NON_SWU);
@@ -205,8 +184,8 @@ fn steer_ipv6(ctx: &XdpContext) -> u32 {
     steer_transport(
         ctx,
         protocol,
-        cursor,
-        packet_end - cursor,
+        ETH_HDR_LEN + IPV6_HDR_LEN,
+        payload_len,
         XdpIpAddress::V6(source),
         XdpIpAddress::V6(destination),
     )
@@ -229,61 +208,6 @@ fn read_window<const N: usize>(ctx: &XdpContext) -> Option<[u8; N]> {
     Some(window)
 }
 
-/// Compute one IPv6 extension header's length from its copied 8-byte prefix,
-/// rejecting fragments and malformed AH headers fail-closed.
-#[inline(always)]
-fn extension_header_len(next_header: u8, extension: &[u8; 8]) -> Option<usize> {
-    if next_header == IPV6_NEXT_HEADER_FRAGMENT {
-        let fragment = u16::from_be_bytes([extension[2], extension[3]]);
-        if fragment & IPV6_FRAG_VALUE_MASK != 0 {
-            // Non-initial fragments and incomplete chains go to the slow path.
-            return None;
-        }
-        return Some(IPV6_FRAGMENT_LEN);
-    }
-    let len_octets = extension[1];
-    if next_header == IPV6_NEXT_HEADER_AH {
-        if len_octets < 1 {
-            return None;
-        }
-        return Some((usize::from(len_octets) + 2) * 4);
-    }
-    Some((usize::from(len_octets) + 1) * 8)
-}
-
-/// Copy N packet bytes at `offset` through the `bpf_xdp_load_bytes` helper,
-/// which performs its own bounds enforcement.
-#[inline(always)]
-fn read_bytes<const N: usize>(ctx: &XdpContext, offset: usize) -> Option<[u8; N]> {
-    let mut buffer = [0_u8; N];
-    // SAFETY: the helper validates the packet range and writes at most N
-    // bytes into the stack buffer.
-    let result = unsafe {
-        bpf_xdp_load_bytes(
-            ctx.ctx,
-            offset as u32,
-            buffer.as_mut_ptr().cast(),
-            N as u32,
-        )
-    };
-    if result != 0 {
-        return None;
-    }
-    Some(buffer)
-}
-
-#[inline(always)]
-fn is_ipv6_extension_header(next_header: u8) -> bool {
-    matches!(
-        next_header,
-        IPV6_NEXT_HEADER_HOP
-            | IPV6_NEXT_HEADER_ROUTING
-            | IPV6_NEXT_HEADER_FRAGMENT
-            | IPV6_NEXT_HEADER_AH
-            | IPV6_NEXT_HEADER_DEST
-    )
-}
-
 #[inline(always)]
 fn steer_transport(
     ctx: &XdpContext,
@@ -300,8 +224,8 @@ fn steer_transport(
     if available_len < declared_transport_len {
         return counted_pass(COUNTER_UNCLASSIFIABLE);
     }
-    let probe_len = if available_len < XDP_TRANSPORT_PROBE_LEN {
-        available_len
+    let probe_len = if declared_transport_len < XDP_TRANSPORT_PROBE_LEN {
+        declared_transport_len
     } else {
         XDP_TRANSPORT_PROBE_LEN
     };
@@ -331,7 +255,7 @@ fn steer_transport(
         XdpTransportClass::NatKeepalive => counted_pass(COUNTER_NATT_KEEPALIVE),
         XdpTransportClass::Unclassifiable => counted_pass(COUNTER_UNCLASSIFIABLE),
         identity => {
-            let Some(config_ptr) = IPSEC_LB_CONFIG.get_ptr(0) else {
+            let Some(config_ptr) = IPSEC_LB_CONFIG.get_ptr(&CONFIG_KEY) else {
                 return counted_pass(COUNTER_ERROR);
             };
             // SAFETY: config map value lives for the duration of this program invocation.
@@ -352,12 +276,14 @@ fn steer_transport(
                 // SAFETY: map value lives for the duration of this program invocation.
                 unsafe { *ptr }
             });
-            let Some(fence_ptr) = IPSEC_LB_FENCE.get_ptr(0) else {
-                return counted_pass(COUNTER_ERROR);
-            };
-            // SAFETY: aligned single-slot u64 fence value lives for the
-            // duration of this program invocation.
-            let fence_generation = unsafe { *fence_ptr };
+            let fence_generation = IPSEC_LB_FENCE
+                .get_ptr(&FENCE_KEY)
+                .map(|ptr| {
+                    // SAFETY: the immutable hash-map element lives for the
+                    // duration of this program invocation.
+                    unsafe { *ptr }
+                })
+                .unwrap_or(0);
             let verdict = decide_owner_verdict(entry, &config, fence_generation);
             match verdict {
                 XdpVerdict::RedirectHandoff => {

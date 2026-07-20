@@ -165,7 +165,7 @@ pub use unsupported::{
 pub use vip::{LeadershipFence, VipOwnershipCoordinator, VipOwnershipIntent, VipOwnershipState};
 pub use xdp::{
     HostXdpAttachMode, HostXdpRedirectHandoff, HostXdpSteeringBackend,
-    HostXdpSteeringBackendConfig, XdpVerdictCounters,
+    HostXdpSteeringBackendConfig, HostXdpUpgradeOutcome, XdpVerdictCounters,
 };
 
 #[cfg(test)]

@@ -18,9 +18,13 @@ procedure as the userspace classifier in `opc-ipsec-lb`:
 - anything else -> passed to the normal stack untouched.
 
 Deliberate, fail-closed divergences from the userspace classifier: any IP
-fragmentation (including initial fragments), extension-header
-order/alignment validation details, and ICMP error quotes are handed to the
-slow path rather than classified. 802.1Q VLAN-tagged ingress bypasses
+fragmentation (including initial fragments), every packet whose base IPv6
+header names an IANA-registered extension kind except direct native ESP, and
+ICMP error quotes are handed to the slow path rather than classified. This
+includes extension kinds the userspace walker rejects, preventing an unwalked
+extension from concealing SWu traffic. Userspace performs the complete IPv6
+extension order, duplicate, AH-alignment, and fragment validation for its
+supported subset. 802.1Q VLAN-tagged ingress bypasses
 steering entirely (the ethertype is not IPv4/IPv6), passing untouched —
 consistent with the userspace classifier and never a drop.
 
@@ -41,7 +45,8 @@ the program never returns `XDP_DROP`:
   additionally validates the hand-off interface at attach time (it must
   exist, be up, and differ from the attached interface);
 - map miss, stale ownership generation (entry older than the fence in the
-  `IPSEC_LB_FENCE` map, an aligned `u64` so advances are tear-free),
+  single-entry `IPSEC_LB_FENCE` hash map, whose replacement publishes the old
+  or new `u64` element),
   unclassifiable SWu candidates, and internal errors -> `XDP_PASS` to the
   userspace slow path with a distinct counter each.
 
@@ -51,13 +56,15 @@ keepalive). No map or program section carries IPsec key material.
 
 ## Kernel feature floor
 
-- Load/attach: Linux >= 5.4 with kernel BTF (`/sys/kernel/btf/vmlinux`),
-  XDP, bpffs map pinning, per-CPU arrays, `bpf_redirect`, and
-  `bpf_xdp_load_bytes` (since 4.18).
-- Graceful program replacement: Linux >= 5.7 (netlink `XDP_FLAGS_REPLACE` +
-  `IFLA_XDP_EXPECTED_FD`) or >= 5.9 (XDP `bpf_link` update). Replacement
-  adopts the pinned maps and swaps the program atomically, so there is no
-  window of dropped or mis-verdicted traffic.
+- Load/attach: Linux >= 5.18 with kernel BTF (`/sys/kernel/btf/vmlinux`),
+  XDP `bpf_link`, bpffs map pinning, per-CPU arrays, `bpf_redirect`, and
+  `bpf_xdp_load_bytes`, plus effective `CAP_NET_ADMIN` and `CAP_SYS_ADMIN`.
+  `CAP_BPF` alone is insufficient for the loader's exact object-enumeration
+  and ID-open checks. The loader probes the helper and confirms the attachment
+  produced a BPF link; legacy netlink fallback is detached and rejected.
+- Graceful cross-process handoff stages a fresh versioned map namespace and
+  uses `bpf_link_update` with `BPF_F_REPLACE` and the exact expected old
+  program, so there is no unattached or silently overwritten window.
 
 The `opc-ipsec-lb` loader enforces both floors with the typed
 `IpsecLbError::XdpKernelFloorNotMet` error.
