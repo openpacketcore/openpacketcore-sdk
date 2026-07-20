@@ -170,6 +170,7 @@ pub fn ifindex_by_name(name: &str) -> io::Result<u32> {
 ///
 /// `path` must be absolute and must not contain a NUL byte.
 pub fn open_xdp_link_from_pin(path: &Path) -> io::Result<BpfXdpLink> {
+    validate_xdp_link_pin_path(path)?;
     platform::open_xdp_link_from_pin(path).map(|inner| BpfXdpLink { inner })
 }
 
@@ -178,7 +179,34 @@ pub fn open_xdp_link_from_pin(path: &Path) -> io::Result<BpfXdpLink> {
 ///
 /// Linux gates this operation on effective `CAP_SYS_ADMIN`.
 pub fn open_xdp_link_by_id(link_id: u32) -> io::Result<BpfXdpLink> {
+    validate_xdp_link_id(link_id)?;
     platform::open_xdp_link_by_id(link_id).map(|inner| BpfXdpLink { inner })
+}
+
+fn validate_xdp_link_pin_path(path: &Path) -> io::Result<()> {
+    if !path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "BPF link pin path must be absolute",
+        ));
+    }
+    if path.as_os_str().as_encoded_bytes().contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "BPF link pin path contains NUL",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_xdp_link_id(link_id: u32) -> io::Result<()> {
+    if link_id == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "BPF link id must be non-zero",
+        ));
+    }
+    Ok(())
 }
 
 /// Open and validate one XDP program by kernel object ID as a retained exact
