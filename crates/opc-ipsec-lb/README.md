@@ -13,6 +13,12 @@ steer layer:
   owner selection for routed, multi-ingress deployments;
 - zero-copy raw IPv4/IPv6 SWu classifier for UDP/500, RFC 3948 UDP/4500,
   native ESP, IKEv2 SKF, fragments, and ICMP/ICMPv6 error quotes;
+- a Host-XDP/eBPF fast path (`opc-ipsec-lb-ebpf`) executing the same keyless
+  classification in the kernel, steering by destination-scoped ownership keys
+  with fenced generations: local pass for self-owned keys, an explicit
+  userspace-redirector hand-off interface for remote-owned keys, and
+  fail-closed slow-path hand-off with per-verdict counters for map miss,
+  stale generation, and unclassifiable candidates (never a silent drop);
 - stateless IKE cookie helper for edge DoS posture;
 - failover safety guards for IV-counter and replay-window restoration;
 - audited same-SPI re-pin coordination with monotonic ownership fencing;
@@ -168,6 +174,86 @@ match verdict {
 }
 # }
 ```
+
+## Host-XDP fast path
+
+`HostXdpSteeringBackend` loads the committed CO-RE XDP object
+(`bpf/opc-ipsec-lb-xdp.bpf.o`) and maintains its pinned owner map. The kernel
+program runs the same branch-bounded classification as the keyless userspace
+classifier and looks each classified packet up by the canonical
+destination-scoped ownership key, so an entry installed from a
+`SessionOwnershipKey` is exactly the key the datapath derives from a packet.
+The fail-closed XDP subset sends every packet whose base IPv6 header names an
+IANA-registered extension kind to that slow path, except direct native ESP,
+which is a supported SWu transport. This includes extension kinds the
+userspace walker rejects, so an unwalked extension can never conceal UDP/500,
+UDP/4500, or ESP from owner steering.
+Each entry carries the owner shard and an ownership generation. The owner map
+is a kernel hash map, so one map update publishes either the old or new
+complete element to concurrent readers; an old-owner/new-generation mixture
+is not observable. Strict decoding separately rejects structurally invalid
+values.
+Attach inventories strictly validated complete and interrupted pinned-map
+namespaces, preserves their maximum fence, and stages fresh maps with empty
+owners before the program is attached. A crashed process's entries are never
+re-armed; malformed, identity-skewed, or active-map-intersecting residue fails
+closed without mutating a live link.
+
+Verdicts are fail-closed and the program never drops a packet:
+
+- owner = self -> `XDP_PASS` to the local stack;
+- owner = remote -> `XDP_REDIRECT` into the configured userspace-redirector
+  hand-off interface. The authenticated steering encapsulation cannot be
+  built in the kernel (AEAD is a userspace concern), so this explicit channel
+  is the kernel/userspace split: the redirector captures the original packet
+  and applies the authenticated transport. The hand-off interface is
+  validated at attach (must exist, be up, and differ from the attached
+  interface) and the redirect counter is incremented only for
+  helper-confirmed redirects;
+- map miss, stale generation (older than the fence set with
+  `advance_fence`; the fence lives in its own single-entry hash map, so a
+  replacement publishes the old or new `u64`), unclassifiable candidates,
+  and internal errors ->
+  `XDP_PASS` to the userspace slow path, each with a distinct per-CPU counter
+  exported via `counters()`.
+
+The kernel feature floor and configured topology are enforced at load with the
+typed `IpsecLbError::XdpKernelFloorNotMet` error: Linux >= 5.18 with kernel
+BTF, the configured pin root inside bpffs, `bpf_xdp_load_bytes`, XDP
+`bpf_link`, and effective `CAP_NET_ADMIN` plus `CAP_SYS_ADMIN`. `CAP_BPF`
+alone is not sufficient because exact link/program enumeration and ID opens
+remain `CAP_SYS_ADMIN`-gated. The attachment interface and any redirect
+interface must exist and be up, and the redirect interface must be distinct.
+Legacy netlink attachment is rejected.
+
+Cross-process upgrades use the explicit `prepare_upgrade_handoff()` then
+`adopt_upgrade_handoff()` boundary. Preparation serializes mutations, empties
+and verifies owners, pins the exact live link, and terminalizes the old
+backend. Adoption validates the link's program, target interface, live attach
+mode, maps, and non-regressing fence; stages a fresh ABI-v4 namespace; then
+uses `BPF_LINK_UPDATE` with `BPF_F_REPLACE` and the exact expected old program.
+The old process must keep its userspace slow path available until the new
+product instance reports readiness. If link-pin cleanup is reported, owner
+and fence mutation remains quiesced until
+`complete_upgrade_handoff_cleanup()` succeeds.
+
+The per-interface pin directory and its permanent `control` directory are
+the process-shared lease identity. Never remove or rename either while any
+backend process may live. Use SDK detach/recovery for pin cleanup; manual
+cleanup requires quiescing every backend process first and removing only the
+documented map/link pins. Lease descriptors are close-on-exec, but a raw
+`fork` child that does not immediately `exec` or close inherited descriptors
+retains the lease and is unsupported.
+
+Redirect is disabled by default; production remote-owner steering must
+explicitly select `HostXdpRedirectHandoff::UserspaceRedirector`.
+`HostXdpAttachMode::Native` uses Aya's zero-flag/default request, under which
+the kernel may select driver or generic mode. Explicit `Generic` requires a
+live SKB-mode hook and is the interoperable choice for veth hand-off peers
+without an XDP consumer. See `tests/xdp_privileged.rs` for the gated
+netns/veth proof (`OPC_IPSEC_LB_RUN_PRIVILEGED=1`), including every v1/v4
+cleanup interruption boundary and migration from a frozen v3 program/map
+artifact.
 
 ## Leadership-gated VIP ownership
 

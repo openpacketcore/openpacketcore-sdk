@@ -6,6 +6,8 @@
 #   - Rust toolchain: $OPC_EBPF_TOOLCHAIN (default nightly-2026-06-22, needs
 #     the rust-src component for -Z build-std)
 #   - bpf-linker: $OPC_BPF_LINKER or `bpf-linker` on PATH
+#   - build directory: $OPC_EBPF_TARGET_DIR (defaults to the standalone
+#     crate's target directory; worktrees should always override it)
 #   - absolute paths are remapped out of debug info/BTF
 set -euo pipefail
 
@@ -15,16 +17,22 @@ artifact="${repo_root}/crates/opc-ipsec-lb/bpf/opc-ipsec-lb-xdp.bpf.o"
 
 toolchain="${OPC_EBPF_TOOLCHAIN:-nightly-2026-06-22}"
 linker="${OPC_BPF_LINKER:-bpf-linker}"
-target_dir="${crate_dir}/target"
+target_dir="${OPC_EBPF_TARGET_DIR:-${crate_dir}/target}"
 
 sysroot="$(rustc "+${toolchain}" --print sysroot)"
 cargo_home="${CARGO_HOME:-${HOME}/.cargo}"
 
+# The last matching --remap-path-prefix wins, so the broad catch-alls come
+# first and the specific workspace root comes last. With this order every
+# functional section (program, maps, BTF, relocations) is byte-identical
+# regardless of the checkout path; the .debug_* sections and symbol tables
+# still embed path-derived crate disambiguators, so whole-file byte
+# comparison is not possible across build hosts.
 rustflags=(
-  "--remap-path-prefix=${repo_root}=/opc-sdk"
-  "--remap-path-prefix=${sysroot}=/rust-sysroot"
-  "--remap-path-prefix=${cargo_home}=/cargo-home"
   "--remap-path-prefix=${HOME}=/build-home"
+  "--remap-path-prefix=${cargo_home}=/cargo-home"
+  "--remap-path-prefix=${sysroot}=/rust-sysroot"
+  "--remap-path-prefix=${repo_root}=/opc-sdk"
 )
 
 (

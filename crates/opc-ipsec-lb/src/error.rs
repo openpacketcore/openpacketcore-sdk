@@ -83,6 +83,22 @@ pub enum IpsecLbError {
     /// Requested state was not found.
     #[error("IPsec load-balancing state not found")]
     NotFound,
+    /// Another process currently owns the Host-XDP lifecycle lease.
+    ///
+    /// This is a retryable conflict. No datapath or pinned-map mutation has
+    /// occurred in the process reporting this error.
+    #[error("IPsec load-balancing XDP lifecycle is busy")]
+    XdpLifecycleBusy,
+    /// A live Host-XDP attachment cannot be upgraded safely until its owner
+    /// explicitly drains it into the handoff state.
+    #[error("IPsec load-balancing XDP upgrade requires an explicit drain")]
+    XdpUpgradeRequiresDrain,
+    /// Host-XDP upgrade state could not be proven safe for automatic action.
+    ///
+    /// Consumers must not retry by detaching or deleting pins blindly; this
+    /// result requires operator reconciliation.
+    #[error("IPsec load-balancing XDP upgrade state is indeterminate")]
+    XdpUpgradeIndeterminate,
     /// Ownership fencing rejected the transition.
     #[error("IPsec load-balancing ownership conflict: {reason}")]
     OwnershipConflict {
@@ -104,6 +120,13 @@ pub enum IpsecLbError {
     /// Cookie verification failed.
     #[error("IKE cookie verification failed")]
     CookieRejected,
+    /// The running kernel does not meet the documented XDP datapath feature
+    /// floor (see `opc-ipsec-lb-ebpf-common` for the floor).
+    #[error("IPsec load-balancing XDP kernel feature floor not met: {requirement}")]
+    XdpKernelFloorNotMet {
+        /// Static, redaction-safe requirement label.
+        requirement: &'static str,
+    },
 }
 
 impl IpsecLbError {
@@ -160,6 +183,12 @@ impl IpsecLbError {
     #[must_use]
     pub const fn forwarding_proof_rejected(reason: &'static str) -> Self {
         Self::ForwardingProofRejected { reason }
+    }
+
+    /// Build a redaction-safe XDP kernel-floor rejection.
+    #[must_use]
+    pub const fn xdp_kernel_floor(requirement: &'static str) -> Self {
+        Self::XdpKernelFloorNotMet { requirement }
     }
 }
 

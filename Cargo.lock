@@ -2636,6 +2636,7 @@ dependencies = [
  "aya",
  "bytes",
  "hmac 0.12.1",
+ "nix",
  "opc-identity",
  "opc-ipsec-lb-ebpf-common",
  "opc-key",

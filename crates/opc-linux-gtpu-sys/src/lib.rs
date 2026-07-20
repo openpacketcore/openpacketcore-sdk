@@ -1,15 +1,18 @@
-//! Narrow Linux GTP-U rtnetlink and generic-netlink UAPI boundary.
+//! Narrow Linux GTP-U rtnetlink, generic-netlink, and selected BPF-link UAPI
+//! boundary.
 //!
 //! This crate owns raw Linux socket syscalls and selected UAPI constants needed
-//! by the safe GTP-U dataplane backend. It deliberately does not implement
-//! GTP-U packet encoding, PDP lifecycle policy, route steering, XFRM policy, or
-//! product deployment defaults.
+//! by safe dataplane backends. Its BPF surface is limited to pinning a duplicate
+//! reference to an existing link during an explicit upgrade handoff. It
+//! deliberately does not implement GTP-U packet encoding, PDP lifecycle policy,
+//! route steering, XFRM policy, or product deployment defaults.
 
 #![allow(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(missing_docs)]
 
 use std::io;
+use std::path::Path;
 
 #[cfg(all(target_os = "linux", not(opc_linux_gtpu_sys_force_unsupported)))]
 mod linux;
@@ -72,6 +75,68 @@ pub enum GtpuIpAddress {
     Ipv6([u8; 16]),
 }
 
+/// Kernel identity of one XDP BPF-link attachment.
+///
+/// This contains only kernel object identifiers and an interface index; it
+/// carries no packet, subscriber, or key material.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BpfXdpLinkInfo {
+    /// Kernel BPF-link identifier.
+    pub link_id: u32,
+    /// Kernel BPF-program identifier currently attached through the link.
+    pub program_id: u32,
+    /// Target interface index in the current network namespace.
+    pub ifindex: u32,
+}
+
+/// Owned close-on-exec descriptor for one exact XDP BPF-link object.
+///
+/// Keeping this value alive keeps the unpinned link attached. Dropping the
+/// last descriptor detaches an unpinned link.
+#[derive(Debug)]
+pub struct BpfXdpLink {
+    inner: platform::BpfXdpLink,
+}
+
+/// Owned close-on-exec descriptor for one exact XDP program.
+#[derive(Debug)]
+pub struct BpfXdpProgram {
+    inner: platform::BpfXdpProgram,
+}
+
+impl BpfXdpProgram {
+    /// Read the kernel program identifier from this exact descriptor.
+    pub fn program_id(&self) -> io::Result<u32> {
+        self.inner.program_id()
+    }
+}
+
+impl BpfXdpLink {
+    /// Read the current identity from this exact link descriptor.
+    pub fn info(&self) -> io::Result<BpfXdpLinkInfo> {
+        self.inner.info()
+    }
+
+    /// Pin another reference to this exact link descriptor at `path`.
+    ///
+    /// A failure leaves this owned descriptor and its attachment unchanged.
+    pub fn pin_duplicate(&self, path: &Path) -> io::Result<()> {
+        self.inner.pin_duplicate(path)
+    }
+
+    /// Atomically replace the program on this exact link only if the current
+    /// program still matches `expected_old_program`.
+    #[cfg(target_os = "linux")]
+    pub fn replace_program(
+        &self,
+        new_program_fd: std::os::fd::BorrowedFd<'_>,
+        expected_old_program: &BpfXdpProgram,
+    ) -> io::Result<()> {
+        self.inner
+            .replace_program(new_program_fd, &expected_old_program.inner)
+    }
+}
+
 /// UDP bind request for a GTP-U socket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct GtpuUdpBind {
@@ -99,6 +164,29 @@ pub fn open_gtpu_udp_socket(bind: GtpuUdpBind) -> io::Result<GtpuUdpSocket> {
 /// Return the interface index for `name` in the current network namespace.
 pub fn ifindex_by_name(name: &str) -> io::Result<u32> {
     platform::ifindex_by_name(name)
+}
+
+/// Open and validate one pinned XDP BPF link as a retained exact descriptor.
+///
+/// `path` must be absolute and must not contain a NUL byte.
+pub fn open_xdp_link_from_pin(path: &Path) -> io::Result<BpfXdpLink> {
+    platform::open_xdp_link_from_pin(path).map(|inner| BpfXdpLink { inner })
+}
+
+/// Open and validate one XDP BPF link by kernel object ID as a retained exact
+/// descriptor.
+///
+/// Linux gates this operation on effective `CAP_SYS_ADMIN`.
+pub fn open_xdp_link_by_id(link_id: u32) -> io::Result<BpfXdpLink> {
+    platform::open_xdp_link_by_id(link_id).map(|inner| BpfXdpLink { inner })
+}
+
+/// Open and validate one XDP program by kernel object ID as a retained exact
+/// descriptor.
+///
+/// Linux gates this operation on effective `CAP_SYS_ADMIN`.
+pub fn open_xdp_program_by_id(program_id: u32) -> io::Result<BpfXdpProgram> {
+    platform::open_xdp_program_by_id(program_id).map(|inner| BpfXdpProgram { inner })
 }
 
 /// Send one raw netlink message buffer to the kernel.
@@ -361,6 +449,13 @@ mod tests {
     use super::*;
     use std::mem::{align_of, offset_of, size_of};
 
+    #[cfg(target_os = "linux")]
+    use std::ffi::OsString;
+    #[cfg(target_os = "linux")]
+    use std::os::unix::ffi::OsStringExt;
+    #[cfg(target_os = "linux")]
+    use std::path::PathBuf;
+
     #[test]
     fn constants_cover_gtpu_rtnl_and_genl_values() {
         assert_eq!(NETLINK_ROUTE, 0);
@@ -420,6 +515,21 @@ mod tests {
         assert_eq!(GTPA_PEER_ADDR6, 11);
         assert_eq!(GTPA_MS_ADDR6, 12);
         assert_eq!(GTPA_FAMILY, 13);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bpf_link_open_rejects_invalid_inputs_before_any_syscall() {
+        let error = open_xdp_link_by_id(0).expect_err("zero link id");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+
+        let error =
+            open_xdp_link_from_pin(Path::new("relative/link")).expect_err("relative pin path");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+
+        let nul_path = PathBuf::from(OsString::from_vec(b"/sys/fs/bpf/bad\0link".to_vec()));
+        let error = open_xdp_link_from_pin(&nul_path).expect_err("NUL pin path");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]

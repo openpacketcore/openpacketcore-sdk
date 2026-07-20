@@ -1295,10 +1295,14 @@ fn error_code(error: &IpsecLbError) -> &'static str {
         IpsecLbError::Unsupported => "unsupported",
         IpsecLbError::AlreadyExists => "already_exists",
         IpsecLbError::NotFound => "not_found",
+        IpsecLbError::XdpLifecycleBusy => "xdp_lifecycle_busy",
+        IpsecLbError::XdpUpgradeRequiresDrain => "xdp_upgrade_requires_drain",
+        IpsecLbError::XdpUpgradeIndeterminate => "xdp_upgrade_indeterminate",
         IpsecLbError::OwnershipConflict { .. } => "ownership_conflict",
         IpsecLbError::ForwardingProofRejected { .. } => "forwarding_proof_rejected",
         IpsecLbError::UnsafeResume { .. } => "unsafe_resume",
         IpsecLbError::CookieRejected => "cookie_rejected",
+        IpsecLbError::XdpKernelFloorNotMet { .. } => "xdp_kernel_floor_not_met",
     }
 }
 
