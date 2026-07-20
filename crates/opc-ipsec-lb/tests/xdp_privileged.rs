@@ -95,6 +95,7 @@ const CRASH_READY_ENV: &str = "OPC_IPSEC_LB_XDP_CRASH_READY";
 const MAP_SLOT_A: &str = "maps-v4-a";
 const MAP_SLOT_B: &str = "maps-v4-b";
 const HANDOFF_LINK: &str = "upgrade-link";
+const CONTROL_DIRECTORY: &str = "control";
 const FROZEN_XDP_V3: &[u8] = include_bytes!("fixtures/xdp-upgrade/opc-ipsec-lb-xdp-v3.bpf.o");
 const CURRENT_XDP: &[u8] = include_bytes!("../bpf/opc-ipsec-lb-xdp.bpf.o");
 
@@ -1228,13 +1229,18 @@ fn xdp_keyless_classification_and_owner_steering() {
         ),
         "a second writer on an occupied interface must conflict"
     );
-    assert!(
-        !provision
-            .pin_root
-            .join("writer-b")
-            .join(&provision.pub_main)
-            .exists(),
-        "the rejected writer may create its empty lock root but must not create map pins"
+    let rejected_pin_dir = provision
+        .pin_root
+        .join("writer-b")
+        .join(&provision.pub_main);
+    let rejected_entries = fs::read_dir(&rejected_pin_dir)
+        .expect("read rejected writer pin directory")
+        .map(|entry| entry.expect("read rejected writer pin entry").file_name())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rejected_entries,
+        [CONTROL_DIRECTORY],
+        "the rejected writer may retain only its permanent lifecycle directory"
     );
     send_udp(
         &sender,
@@ -1319,7 +1325,10 @@ fn xdp_keyless_classification_and_owner_steering() {
     // backend's userspace operation gate. Both maps are BPF_MAP_TYPE_HASH:
     // replacement publishes an immutable element, so every concurrent raw
     // read must equal one complete old or new value.
-    let pin_dir = provision.pin_root.join(&provision.pub_main);
+    let pin_dir = provision
+        .pin_root
+        .join(&provision.pub_main)
+        .join(MAP_SLOT_A);
     let raw_atomic_key = fixed_owner_map_key(&atomic_key);
     let owner_a = XdpOwnerValue {
         owner_shard: SELF_SHARD,
@@ -1482,8 +1491,8 @@ fn xdp_keyless_classification_and_owner_steering() {
     let after = runtime.block_on(backend.counters()).expect("counters");
     assert_eq!(after.error, 0, "no errors across replacement: {after:?}");
     assert!(
-        after.local > 0,
-        "the adopted datapath must count local verdicts"
+        after.miss > 0,
+        "the adopted empty-owner datapath must hand traffic to the slow path"
     );
 
     // --- Stage D: SIGKILL closes bpf_link; restart adopts only safe state. ---
@@ -1571,7 +1580,10 @@ fn xdp_keyless_classification_and_owner_steering() {
 
     // SIGKILL closes the unpinned bpf_link but leaves the pinned maps. Verify
     // the exact crash residue before the replacement process adopts it.
-    let pin_dir = provision.pin_root.join(&provision.pub_main);
+    let pin_dir = provision
+        .pin_root
+        .join(&provision.pub_main)
+        .join(MAP_SLOT_A);
     let raw_crash_key = fixed_owner_map_key(&crash_key);
     let crash_owner = pinned_owner_map(&pin_dir)
         .get(&raw_crash_key, 0)
@@ -1651,8 +1663,8 @@ fn xdp_keyless_classification_and_owner_steering() {
         "the killed process's entry must never produce a LOCAL verdict"
     );
     assert_eq!(
-        after_restart.redirect, 1,
-        "the pre-kill remote verdict must remain visible in adopted counters"
+        after_restart.redirect, 0,
+        "a fresh crash-recovery namespace must not inherit the killed program's counters"
     );
     assert_eq!(
         after_restart.miss, 1,

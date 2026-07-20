@@ -1476,7 +1476,9 @@ mod aya_runtime {
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
-    use aya::maps::{Array, HashMap as BpfHashMap, Map, MapData, MapError, MapType, PerCpuArray};
+    use aya::maps::{
+        Array, HashMap as BpfHashMap, Map, MapData, MapError, MapInfo, MapType, PerCpuArray,
+    };
     use aya::programs::links::{LinkError, LinkType};
     use aya::programs::{
         loaded_links, loaded_programs, ProgramError, ProgramInfo, ProgramType, Xdp, XdpMode,
@@ -1508,6 +1510,8 @@ mod aya_runtime {
     const MAP_SLOT_A: &str = "maps-v4-a";
     const MAP_SLOT_B: &str = "maps-v4-b";
     const HANDOFF_LINK: &str = "upgrade-link";
+    const AUXILIARY_RODATA_MAP: &[u8] = b".rodata.cst4";
+    const AUXILIARY_RODATA_FLAGS: u32 = 1 << 7; // Linux UAPI BPF_F_RDONLY_PROG.
 
     #[derive(Debug, Default)]
     pub(super) struct AyaHostXdpRuntime {
@@ -2269,16 +2273,47 @@ mod aya_runtime {
                 .ok_or(IpsecLbError::XdpUpgradeIndeterminate)?
                 .into_iter()
                 .collect::<BTreeSet<_>>();
+            let (active, auxiliary_map_id) =
+                Self::select_active_namespace(namespaces, &program_map_ids)?;
+            let auxiliary = MapInfo::from_id(auxiliary_map_id)
+                .map_err(|error| map_error("xdp_upgrade_auxiliary_map_info", error))?;
+            let auxiliary_type = auxiliary
+                .map_type()
+                .map_err(|error| map_error("xdp_upgrade_auxiliary_map_info", error))?;
+            if !auxiliary_rodata_schema_matches(
+                auxiliary.name(),
+                auxiliary_type,
+                auxiliary.key_size(),
+                auxiliary.value_size(),
+                auxiliary.max_entries(),
+                auxiliary.map_flags(),
+            ) {
+                return Err(IpsecLbError::XdpUpgradeIndeterminate);
+            }
+            Ok(active)
+        }
+
+        fn select_active_namespace<'a>(
+            namespaces: &'a [PinnedMapNamespace],
+            program_map_ids: &BTreeSet<u32>,
+        ) -> Result<(&'a PinnedMapNamespace, u32), IpsecLbError> {
             let mut matching = namespaces
                 .iter()
-                .filter(|namespace| namespace.map_ids == program_map_ids);
+                .filter(|namespace| namespace.map_ids.is_subset(program_map_ids));
             let active = matching
                 .next()
                 .ok_or(IpsecLbError::XdpUpgradeRequiresDrain)?;
             if matching.next().is_some() {
                 return Err(IpsecLbError::XdpUpgradeIndeterminate);
             }
-            Ok(active)
+            let mut auxiliary = program_map_ids.difference(&active.map_ids).copied();
+            let auxiliary_map_id = auxiliary
+                .next()
+                .ok_or(IpsecLbError::XdpUpgradeIndeterminate)?;
+            if auxiliary.next().is_some() {
+                return Err(IpsecLbError::XdpUpgradeIndeterminate);
+            }
+            Ok((active, auxiliary_map_id))
         }
 
         fn program_info(program_id: u32) -> Result<ProgramInfo, IpsecLbError> {
@@ -3524,6 +3559,112 @@ mod aya_runtime {
 
     fn link_error(operation: &'static str, _error: &LinkError) -> IpsecLbError {
         IpsecLbError::io(operation, invalid_data("BPF link operation failed"))
+    }
+
+    fn auxiliary_rodata_schema_matches(
+        name: &[u8],
+        map_type: MapType,
+        key_size: u32,
+        value_size: u32,
+        max_entries: u32,
+        map_flags: u32,
+    ) -> bool {
+        name == AUXILIARY_RODATA_MAP
+            && map_type == MapType::Array
+            && key_size == 4
+            && value_size == 4
+            && max_entries == 1
+            && map_flags == AUXILIARY_RODATA_FLAGS
+    }
+
+    #[cfg(test)]
+    mod namespace_tests {
+        use super::*;
+
+        fn namespace(slot: MapNamespaceSlot, map_ids: &[u32]) -> PinnedMapNamespace {
+            PinnedMapNamespace {
+                slot,
+                version: XDP_CONFIG_ABI_VERSION,
+                config: [0; CONFIG_VALUE_LEN],
+                fence_generation: 0,
+                map_ids: map_ids.iter().copied().collect(),
+            }
+        }
+
+        #[test]
+        fn active_namespace_accepts_exactly_one_auxiliary_map() {
+            let namespaces = [namespace(MapNamespaceSlot::A, &[1, 2, 3, 4])];
+            let program_map_ids = BTreeSet::from([1, 2, 3, 4, 5]);
+
+            let (active, auxiliary) =
+                AyaHostXdpRuntime::select_active_namespace(&namespaces, &program_map_ids)
+                    .expect("select namespace with compiler rodata map");
+
+            assert_eq!(active.slot, MapNamespaceSlot::A);
+            assert_eq!(auxiliary, 5);
+        }
+
+        #[test]
+        fn active_namespace_rejects_missing_multiple_and_ambiguous_auxiliary_maps() {
+            let namespaces = [namespace(MapNamespaceSlot::A, &[1, 2, 3, 4])];
+            for program_map_ids in [
+                BTreeSet::from([1, 2, 3, 4]),
+                BTreeSet::from([1, 2, 3, 4, 5, 6]),
+            ] {
+                assert!(matches!(
+                    AyaHostXdpRuntime::select_active_namespace(&namespaces, &program_map_ids),
+                    Err(IpsecLbError::XdpUpgradeIndeterminate)
+                ));
+            }
+
+            let ambiguous = [
+                namespace(MapNamespaceSlot::A, &[1, 2, 3, 4]),
+                namespace(MapNamespaceSlot::B, &[5, 6, 7, 8]),
+            ];
+            assert!(matches!(
+                AyaHostXdpRuntime::select_active_namespace(
+                    &ambiguous,
+                    &BTreeSet::from([1, 2, 3, 4, 5, 6, 7, 8, 9]),
+                ),
+                Err(IpsecLbError::XdpUpgradeIndeterminate)
+            ));
+        }
+
+        #[test]
+        fn auxiliary_rodata_schema_is_exact() {
+            assert!(auxiliary_rodata_schema_matches(
+                AUXILIARY_RODATA_MAP,
+                MapType::Array,
+                4,
+                4,
+                1,
+                AUXILIARY_RODATA_FLAGS,
+            ));
+            assert!(!auxiliary_rodata_schema_matches(
+                b"other",
+                MapType::Array,
+                4,
+                4,
+                1,
+                AUXILIARY_RODATA_FLAGS,
+            ));
+            assert!(!auxiliary_rodata_schema_matches(
+                AUXILIARY_RODATA_MAP,
+                MapType::Hash,
+                4,
+                4,
+                1,
+                AUXILIARY_RODATA_FLAGS,
+            ));
+            assert!(!auxiliary_rodata_schema_matches(
+                AUXILIARY_RODATA_MAP,
+                MapType::Array,
+                4,
+                4,
+                1,
+                0,
+            ));
+        }
     }
 
     #[cfg(test)]
