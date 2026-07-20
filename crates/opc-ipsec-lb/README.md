@@ -184,8 +184,13 @@ classifier and looks each classified packet up by the canonical
 destination-scoped ownership key, so an entry installed from a
 `SessionOwnershipKey` is exactly the key the datapath derives from a packet.
 Each entry carries the owner shard and an ownership generation; userspace
-updates are atomic per key (a reader never observes a torn owner/generation
-pair).
+updates write the whole value in one map operation (atomic in practice on the
+supported kernels, with a strict flags/reserved-byte decode that fails closed
+if a value is ever read mid-update). Attach adopts pinned maps across process
+restarts but flushes the owner map and rewrites the config before the program
+is attached, and the persisted fence is honored, so a crashed process's
+entries are never re-armed; a stale pinned-map schema fails the load and must
+be recovered by removing the interface's bpffs pin directory.
 
 Verdicts are fail-closed and the program never drops a packet:
 
@@ -194,9 +199,13 @@ Verdicts are fail-closed and the program never drops a packet:
   hand-off interface. The authenticated steering encapsulation cannot be
   built in the kernel (AEAD is a userspace concern), so this explicit channel
   is the kernel/userspace split: the redirector captures the original packet
-  and applies the authenticated transport;
+  and applies the authenticated transport. The hand-off interface is
+  validated at attach (must exist, be up, and differ from the attached
+  interface) and the redirect counter is incremented only for
+  helper-confirmed redirects;
 - map miss, stale generation (older than the fence set with
-  `advance_fence`), unclassifiable candidates, and internal errors ->
+  `advance_fence`; the fence lives in its own aligned-`u64` map so advances
+  are tear-free), unclassifiable candidates, and internal errors ->
   `XDP_PASS` to the userspace slow path, each with a distinct per-CPU counter
   exported via `counters()`.
 

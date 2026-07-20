@@ -6,7 +6,9 @@
 //!   destination-scoped ownership key (destination address + routing domain +
 //!   encapsulation + SPI context) defined by `opc-ipsec-lb`'s ownership model;
 //! - the single-slot datapath configuration (self shard, routing domain,
-//!   ownership fence generation, userspace-redirector hand-off interface);
+//!   userspace-redirector hand-off interface) and the separate single-slot
+//!   ownership fence generation (an aligned `u64` in its own map so
+//!   generation advances are never torn against a concurrent reader);
 //! - the per-verdict counter indices exported to userspace;
 //! - the branch-bounded transport classification decision procedure and the
 //!   owner-verdict decision, shared verbatim by the eBPF program and the
@@ -18,7 +20,8 @@
 //! # Kernel feature floor
 //!
 //! - Load/attach: Linux >= 5.4 with kernel BTF (`/sys/kernel/btf/vmlinux`),
-//!   XDP, pinned maps (bpffs), per-CPU arrays, and `bpf_redirect`.
+//!   XDP, pinned maps (bpffs), per-CPU arrays, `bpf_redirect`, and
+//!   `bpf_xdp_load_bytes`.
 //! - Atomic program replacement: Linux >= 5.7 (`XDP_FLAGS_REPLACE` with
 //!   `IFLA_XDP_EXPECTED_FD`) or >= 5.9 (`bpf_link_create`/`bpf_link_update`
 //!   for XDP). The userspace loader enforces both floors with a typed error.
@@ -27,9 +30,33 @@
 //!
 //! The XDP program never drops a packet. Every verdict is either `XDP_PASS`
 //! (local stack, userspace slow path, or untouched non-SWu traffic) or
-//! `XDP_REDIRECT` into the dedicated userspace-redirector hand-off interface.
-//! Map miss, stale ownership generation, unclassifiable packets, and internal
-//! errors all fall back to the userspace slow path with a distinct counter.
+//! `XDP_REDIRECT` into the dedicated userspace-redirector hand-off interface
+//! (counted only when the helper itself confirms `XDP_REDIRECT`; a redirect
+//! failure fails closed to the slow path with the error counter). Map miss,
+//! stale ownership generation, unclassifiable packets, and internal errors
+//! all fall back to the userspace slow path with a distinct counter.
+//!
+//! # Deliberate divergence from the userspace classifier
+//!
+//! The fast path executes the same branch-bounded decision procedure for
+//! direct, complete, unfragmented packets. It deliberately narrows the
+//! userspace classifier's acceptance set in ways that are always fail-closed
+//! (the packet reaches the same slow path, never a verdict the userspace
+//! path would contradict):
+//!
+//! - any IP fragmentation (including initial fragments with MF set, which
+//!   the userspace classifier accepts) is unclassifiable here;
+//! - IPv6 extension-header order, duplication, AH alignment, and
+//!   fragment-header reserved-bit validation are not reproduced: the walk
+//!   only skips well-formed extension headers to find the terminal protocol;
+//! - ICMP/ICMPv6 error quotes are not classified (they are ordinary
+//!   pass-through traffic here, exactly where the userspace slow path sees
+//!   them anyway).
+//!
+//! Equally deliberate: 802.1Q VLAN-tagged ingress bypasses steering entirely
+//! (`ETH_P_8021Q` is not `ETH_P_IPV4`/`ETH_P_IPV6`), so tagged traffic passes
+//! untouched to the stack — consistent with the userspace classifier, which
+//! starts at the network layer, and never a drop.
 
 use crate::{
     ESP_HEADER_PREFIX_LEN, IKEV2_EXCHANGE_IKE_SA_INIT, IKEV2_HDR_LEN, IKEV2_MAJOR_VERSION,
@@ -76,6 +103,8 @@ pub const XDP_MIN_KERNEL_REPLACE_RELEASE: (u16, u16) = (5, 7);
 pub const MAP_OWNERS: &str = "IPSEC_LB_OWNERS";
 /// BPF map name: single-slot datapath configuration.
 pub const MAP_CONFIG: &str = "IPSEC_LB_CONFIG";
+/// BPF map name: single-slot ownership fence generation.
+pub const MAP_FENCE: &str = "IPSEC_LB_FENCE";
 /// BPF map name: per-CPU per-verdict counters.
 pub const MAP_COUNTERS: &str = "IPSEC_LB_COUNTERS";
 /// XDP program name.
@@ -92,8 +121,15 @@ pub const OWNER_KEY_LEN: usize = 64;
 pub const OWNER_VALUE_LEN: usize = 16;
 /// Datapath config value byte length.
 pub const CONFIG_VALUE_LEN: usize = 32;
+/// Fence-map value byte length (one aligned `u64`).
+pub const FENCE_VALUE_LEN: usize = 8;
 /// Current datapath config ABI version.
-pub const XDP_CONFIG_ABI_VERSION: u8 = 1;
+///
+/// Version 2 moved the ownership fence generation out of the config value
+/// into its own aligned `u64` map (see [`MAP_FENCE`]); v1 configs are
+/// rejected so a stale pinned config fails closed instead of being
+/// misread.
+pub const XDP_CONFIG_ABI_VERSION: u8 = 2;
 
 /// Counter index: packets passed through untouched because they were not SWu
 /// IKE/ESP traffic.
@@ -225,6 +261,39 @@ pub enum XdpVerdict {
     /// Invalid map value or missing redirect channel; fail closed to the
     /// userspace slow path.
     SlowPathError,
+}
+
+/// XDP action code for a successful redirect (`XDP_REDIRECT`).
+pub const XDP_ACTION_REDIRECT: u32 = 4;
+
+/// Outcome of evaluating a `bpf_redirect` helper result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum XdpRedirectOutcome {
+    /// The helper confirmed the redirect; count it and return its action.
+    Redirected,
+    /// The helper rejected the redirect (for example `XDP_ABORTED`); count
+    /// the error and fail closed to the slow path instead of miscounting a
+    /// phantom redirect.
+    SlowPathError,
+}
+
+/// Evaluate a `bpf_redirect` helper return value.
+///
+/// Shared verbatim by the eBPF program and host-side tests. Note that some
+/// kernels defer transmit failures past the helper return: on those the
+/// helper reports `XDP_REDIRECT` even when the frame is later dropped by the
+/// target driver. Attach-time validation of the hand-off interface (exists,
+/// up, and distinct from the attached interface) is the enforceable guard
+/// against that blind spot; this check covers the kernels that do report
+/// synchronously.
+#[must_use]
+#[inline(always)]
+pub const fn redirect_outcome(helper_result: u32) -> XdpRedirectOutcome {
+    if helper_result == XDP_ACTION_REDIRECT {
+        XdpRedirectOutcome::Redirected
+    } else {
+        XdpRedirectOutcome::SlowPathError
+    }
 }
 
 /// Per-verdict counter index for one classified identity's verdict.
@@ -615,9 +684,15 @@ fn encode_bytes(encoded: &mut [u8], cursor: usize, bytes: &[u8]) -> usize {
 /// | 12 | 4 | reserved (zero) |
 ///
 /// A userspace update writes the whole 16-byte value with one
-/// `bpf_map_update_elem` call, which the kernel applies atomically per key: a
-/// concurrent XDP lookup observes either the previous or the new value, never
-/// a torn owner/generation pair.
+/// `bpf_map_update_elem` call. On the kernels within the documented feature
+/// floor this replacement is atomic in practice: lookups see the previous or
+/// the new value. That guarantee is architectural, not contractual — the
+/// ABI is therefore designed defensively: the strict decode below rejects
+/// non-zero flags/reserved bytes and zero generations, so a theoretically
+/// torn read is overwhelmingly likely to fail closed to the slow path with
+/// the error counter rather than steer on a corrupted owner/generation
+/// pair. Callers that need hard atomicity should treat this design as
+/// best-effort plus fail-closed, not as a lock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct XdpOwnerValue {
     /// Owner shard identity.
@@ -686,21 +761,22 @@ impl XdpOwnerValue {
 /// | offset | width | field |
 /// | ---: | ---: | --- |
 /// | 0 | 1 | ABI version ([`XDP_CONFIG_ABI_VERSION`]) |
-/// | 1 | 1 | flags (zero in v1) |
+/// | 1 | 1 | flags (zero in v2) |
 /// | 2 | 2 | self shard |
 /// | 4 | 8 | routing-domain tag |
-/// | 12 | 8 | ownership fence generation |
+/// | 12 | 8 | reserved (zero; the v1 fence field moved to [`MAP_FENCE`]) |
 /// | 20 | 4 | userspace-redirector hand-off ifindex (0 = none) |
 /// | 24 | 8 | reserved (zero) |
+///
+/// The ownership fence generation lives in its own single-slot aligned-`u64`
+/// map (`IPSEC_LB_FENCE`) so an advance is a single tear-free aligned store;
+/// it is deliberately not part of this wider value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct XdpDatapathConfig {
     /// Shard identity of this node.
     pub self_shard: u16,
     /// Opaque routing-domain tag mixed into ownership keys.
     pub routing_domain: u64,
-    /// Minimum live ownership generation. Entries older than this fence are
-    /// stale and handed to the slow path.
-    pub fence_generation: u64,
     /// Interface index of the dedicated userspace-redirector hand-off
     /// interface. Zero disables the redirect channel; a remote-owner verdict
     /// then fails closed to the slow path with the error counter.
@@ -713,7 +789,6 @@ impl XdpDatapathConfig {
     pub const fn encode(&self) -> [u8; CONFIG_VALUE_LEN] {
         let shard = self.self_shard.to_be_bytes();
         let domain = self.routing_domain.to_be_bytes();
-        let fence = self.fence_generation.to_be_bytes();
         let ifindex = self.handoff_ifindex.to_be_bytes();
         [
             XDP_CONFIG_ABI_VERSION,
@@ -728,14 +803,14 @@ impl XdpDatapathConfig {
             domain[5],
             domain[6],
             domain[7],
-            fence[0],
-            fence[1],
-            fence[2],
-            fence[3],
-            fence[4],
-            fence[5],
-            fence[6],
-            fence[7],
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
             ifindex[0],
             ifindex[1],
             ifindex[2],
@@ -759,6 +834,13 @@ impl XdpDatapathConfig {
         if value[0] != XDP_CONFIG_ABI_VERSION || value[1] != 0 {
             return None;
         }
+        let mut index = 12;
+        while index < 20 {
+            if value[index] != 0 {
+                return None;
+            }
+            index += 1;
+        }
         let mut index = 24;
         while index < CONFIG_VALUE_LEN {
             if value[index] != 0 {
@@ -770,10 +852,6 @@ impl XdpDatapathConfig {
             self_shard: u16::from_be_bytes([value[2], value[3]]),
             routing_domain: u64::from_be_bytes([
                 value[4], value[5], value[6], value[7], value[8], value[9], value[10], value[11],
-            ]),
-            fence_generation: u64::from_be_bytes([
-                value[12], value[13], value[14], value[15], value[16], value[17], value[18],
-                value[19],
             ]),
             handoff_ifindex: u32::from_be_bytes([value[20], value[21], value[22], value[23]]),
         })
@@ -795,6 +873,7 @@ impl XdpDatapathConfig {
 pub fn decide_owner_verdict(
     entry: Option<[u8; OWNER_VALUE_LEN]>,
     config: &XdpDatapathConfig,
+    fence_generation: u64,
 ) -> XdpVerdict {
     let Some(raw) = entry else {
         return XdpVerdict::SlowPathMiss;
@@ -802,7 +881,7 @@ pub fn decide_owner_verdict(
     let Some(value) = XdpOwnerValue::decode(&raw) else {
         return XdpVerdict::SlowPathError;
     };
-    if value.generation < config.fence_generation {
+    if value.generation < fence_generation {
         return XdpVerdict::SlowPathStale;
     }
     if value.owner_shard == config.self_shard {
@@ -825,9 +904,10 @@ mod tests {
     const CONFIG: XdpDatapathConfig = XdpDatapathConfig {
         self_shard: 1,
         routing_domain: 7,
-        fence_generation: 5,
         handoff_ifindex: 42,
     };
+
+    const FENCE: u64 = 5;
 
     fn udp_probe(source_port: u16, destination_port: u16, payload: &[u8]) -> Vec<u8> {
         let mut probe = Vec::new();
@@ -1129,7 +1209,7 @@ mod tests {
         assert_eq!(encoded[0], XDP_CONFIG_ABI_VERSION);
         assert_eq!(&encoded[2..4], &1_u16.to_be_bytes());
         assert_eq!(&encoded[4..12], &7_u64.to_be_bytes());
-        assert_eq!(&encoded[12..20], &5_u64.to_be_bytes());
+        assert_eq!(&encoded[12..20], &[0; 8]);
         assert_eq!(&encoded[20..24], &42_u32.to_be_bytes());
         assert_eq!(XdpDatapathConfig::decode(&encoded), Some(CONFIG));
 
@@ -1137,9 +1217,31 @@ mod tests {
         wrong_version[0] = 0;
         assert_eq!(XdpDatapathConfig::decode(&wrong_version), None);
 
+        let mut v1_layout = encoded;
+        v1_layout[0] = 1;
+        v1_layout[12] = 5;
+        assert_eq!(XdpDatapathConfig::decode(&v1_layout), None);
+
         let mut reserved = encoded;
         reserved[31] = 1;
         assert_eq!(XdpDatapathConfig::decode(&reserved), None);
+    }
+
+    #[test]
+    fn redirect_outcome_only_counts_helper_confirmed_redirects() {
+        assert_eq!(
+            redirect_outcome(XDP_ACTION_REDIRECT),
+            XdpRedirectOutcome::Redirected
+        );
+        // XDP_ABORTED (0), XDP_DROP (1), XDP_PASS (2), XDP_TX (3), and
+        // arbitrary garbage fail closed.
+        for result in [0_u32, 1, 2, 3, 5, u32::MAX] {
+            assert_eq!(
+                redirect_outcome(result),
+                XdpRedirectOutcome::SlowPathError,
+                "helper result {result} must fail closed"
+            );
+        }
     }
 
     #[test]
@@ -1161,23 +1263,23 @@ mod tests {
         .encode();
 
         assert_eq!(
-            decide_owner_verdict(None, &CONFIG),
+            decide_owner_verdict(None, &CONFIG, FENCE),
             XdpVerdict::SlowPathMiss
         );
         assert_eq!(
-            decide_owner_verdict(Some(owner_self), &CONFIG),
+            decide_owner_verdict(Some(owner_self), &CONFIG, FENCE),
             XdpVerdict::Local
         );
         assert_eq!(
-            decide_owner_verdict(Some(owner_remote), &CONFIG),
+            decide_owner_verdict(Some(owner_remote), &CONFIG, FENCE),
             XdpVerdict::RedirectHandoff
         );
         assert_eq!(
-            decide_owner_verdict(Some(owner_stale), &CONFIG),
+            decide_owner_verdict(Some(owner_stale), &CONFIG, FENCE),
             XdpVerdict::SlowPathStale
         );
         assert_eq!(
-            decide_owner_verdict(Some([0; OWNER_VALUE_LEN]), &CONFIG),
+            decide_owner_verdict(Some([0; OWNER_VALUE_LEN]), &CONFIG, FENCE),
             XdpVerdict::SlowPathError
         );
 
@@ -1187,7 +1289,7 @@ mod tests {
             ..CONFIG
         };
         assert_eq!(
-            decide_owner_verdict(Some(owner_remote), &no_channel),
+            decide_owner_verdict(Some(owner_remote), &no_channel, FENCE),
             XdpVerdict::SlowPathError
         );
 

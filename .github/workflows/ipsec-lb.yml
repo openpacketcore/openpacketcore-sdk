@@ -96,7 +96,6 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y iproute2
-          sudo unshare -n -- ip link set lo up
 
       - name: Build privileged XDP test
         run: |
@@ -171,6 +170,10 @@ jobs:
           inventory "${rebuilt}" > rebuilt.inventory
           cat rebuilt.inventory
           diff -u committed.inventory rebuilt.inventory
-          for symbol in opc_ipsec_lb_xdp IPSEC_LB_OWNERS IPSEC_LB_CONFIG IPSEC_LB_COUNTERS; do
+          for symbol in opc_ipsec_lb_xdp IPSEC_LB_OWNERS IPSEC_LB_CONFIG IPSEC_LB_FENCE IPSEC_LB_COUNTERS; do
             grep -q " ${symbol}$" committed.inventory
           done
+          # The pinned toolchain and bpf-linker make the build byte-reproducible;
+          # fail on any drift between the committed object and its source.
+          sha256sum "${committed}" "${rebuilt}"
+          test "$(sha256sum < "${committed}" | cut -d' ' -f1)" = "$(sha256sum < "${rebuilt}" | cut -d' ' -f1)"

@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Breaking: `opc-ipsec-lb` Host-XDP backend rework (#308):** the Host-XDP
+  tier now executes keyless classification and destination-scoped owner
+  steering in the kernel instead of SPI-tag steering. `HostXdpTarget`,
+  `HostXdpTagTarget`, and `HostXdpClusterChannelSecurity` were removed, and
+  `HostXdpSteeringBackend` no longer implements the `SteeringBackend` port:
+  SPI-keyed `SteeringRule`s cannot express the destination-scoped
+  ownership keys and fenced generations the datapath now executes.
+  The backend gained an owner-record API (`install_owner`/`remove_owner`/
+  `owner_record`), monotonic `advance_fence`, per-verdict `counters`,
+  graceful atomic `replace`, and typed kernel-floor enforcement
+  (`IpsecLbError::XdpKernelFloorNotMet`). The pinned map ABI changed
+  (owner map keyed by the canonical ownership key, separate fence map,
+  versioned config): pre-existing bpffs pins must be removed before
+  attaching the new object.
+
 ### Added
 - **SWm DER access authorization context — `opc-proto-diameter`:**
   `SwmDiameterEapRequest` can now encode and decode typed `RAT-Type` and

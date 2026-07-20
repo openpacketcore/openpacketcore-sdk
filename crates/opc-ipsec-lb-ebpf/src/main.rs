@@ -12,8 +12,10 @@
 //!
 //! - owner = self -> `XDP_PASS` (local counter);
 //! - owner = remote -> `XDP_REDIRECT` into the dedicated userspace-redirector
-//!   hand-off interface (redirect counter). In-kernel encapsulation of the
-//!   authenticated steering transport is infeasible (AEAD crypto is a
+//!   hand-off interface (redirect counter, incremented only when the
+//!   `bpf_redirect` helper confirms the redirect; a redirect failure falls
+//!   back to the slow path with the error counter). In-kernel encapsulation
+//!   of the authenticated steering transport is infeasible (AEAD crypto is a
 //!   userspace concern), so the kernel/userspace split is this explicit,
 //!   observable channel;
 //! - map miss, stale ownership generation, unclassifiable packets, and
@@ -35,11 +37,11 @@ use aya_ebpf::{
 };
 use aya_ebpf_bindings::helpers::bpf_xdp_load_bytes;
 use opc_ipsec_lb_ebpf_common::{
-    classify_transport, decide_owner_verdict, ownership_map_key, verdict_counter,
-    XdpDatapathConfig, XdpIpAddress, XdpTransportClass, XdpVerdict, CONFIG_VALUE_LEN,
-    COUNTER_ERROR, COUNTER_NATT_KEEPALIVE, COUNTER_PASS_NON_SWU, COUNTER_SLOTS,
-    COUNTER_UNCLASSIFIABLE, ESP_HEADER_PREFIX_LEN, ETH_HDR_LEN, ETH_P_IPV4, ETH_P_IPV6,
-    IP_PROTOCOL_ESP, IP_PROTOCOL_UDP, MAX_INGRESS_IPV6_EXTENSION_HEADERS, OWNER_KEY_LEN,
+    classify_transport, decide_owner_verdict, ownership_map_key, redirect_outcome, verdict_counter,
+    XdpDatapathConfig, XdpIpAddress, XdpRedirectOutcome, XdpTransportClass, XdpVerdict,
+    CONFIG_VALUE_LEN, COUNTER_ERROR, COUNTER_NATT_KEEPALIVE, COUNTER_PASS_NON_SWU, COUNTER_REDIRECT,
+    COUNTER_SLOTS, COUNTER_UNCLASSIFIABLE, ESP_HEADER_PREFIX_LEN, ETH_HDR_LEN, ETH_P_IPV4,
+    ETH_P_IPV6, IP_PROTOCOL_ESP, IP_PROTOCOL_UDP, MAX_INGRESS_IPV6_EXTENSION_HEADERS, OWNER_KEY_LEN,
     OWNER_VALUE_LEN, XDP_TRANSPORT_PROBE_LEN,
 };
 
@@ -55,6 +57,11 @@ static IPSEC_LB_CONFIG: Array<[u8; CONFIG_VALUE_LEN]> = Array::pinned(1, 0);
 /// Per-CPU per-verdict counters.
 #[map(name = "IPSEC_LB_COUNTERS")]
 static IPSEC_LB_COUNTERS: PerCpuArray<u64> = PerCpuArray::pinned(COUNTER_SLOTS, 0);
+
+/// Single-slot ownership fence generation (aligned u64; updates are
+/// tear-free single stores).
+#[map(name = "IPSEC_LB_FENCE")]
+static IPSEC_LB_FENCE: Array<u64> = Array::pinned(1, 0);
 
 const IPV4_MIN_HDR_LEN: usize = 20;
 const IPV6_HDR_LEN: usize = 40;
@@ -345,18 +352,35 @@ fn steer_transport(
                 // SAFETY: map value lives for the duration of this program invocation.
                 unsafe { *ptr }
             });
-            let verdict = decide_owner_verdict(entry, &config);
-            count(verdict_counter(verdict));
+            let Some(fence_ptr) = IPSEC_LB_FENCE.get_ptr(0) else {
+                return counted_pass(COUNTER_ERROR);
+            };
+            // SAFETY: aligned single-slot u64 fence value lives for the
+            // duration of this program invocation.
+            let fence_generation = unsafe { *fence_ptr };
+            let verdict = decide_owner_verdict(entry, &config, fence_generation);
             match verdict {
                 XdpVerdict::RedirectHandoff => {
                     // SAFETY: helper does not dereference pointers; the ifindex
-                    // is a scalar from the validated config.
-                    unsafe { bpf_redirect(config.handoff_ifindex, 0) as u32 }
+                    // is a scalar from the validated config. The redirect
+                    // verdict is counted only when the helper confirms the
+                    // redirect; a failure fails closed to the slow path.
+                    let action = unsafe { bpf_redirect(config.handoff_ifindex, 0) as u32 };
+                    match redirect_outcome(action) {
+                        XdpRedirectOutcome::Redirected => {
+                            count(COUNTER_REDIRECT);
+                            action
+                        }
+                        XdpRedirectOutcome::SlowPathError => counted_pass(COUNTER_ERROR),
+                    }
                 }
                 XdpVerdict::Local
                 | XdpVerdict::SlowPathMiss
                 | XdpVerdict::SlowPathStale
-                | XdpVerdict::SlowPathError => XDP_PASS,
+                | XdpVerdict::SlowPathError => {
+                    count(verdict_counter(verdict));
+                    XDP_PASS
+                }
             }
         }
     }

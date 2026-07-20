@@ -27,7 +27,9 @@
 //! # Kernel feature floor (enforced at load with a typed error)
 //!
 //! - Load/attach: Linux >= 5.4 with kernel BTF (`/sys/kernel/btf/vmlinux`),
-//!   XDP, bpffs map pinning, per-CPU arrays, and `bpf_redirect`.
+//!   XDP, bpffs map pinning, per-CPU arrays, `bpf_redirect`,
+//!   `bpf_xdp_load_bytes`, plus effective `CAP_NET_ADMIN` and
+//!   `CAP_BPF`/`CAP_SYS_ADMIN`.
 //! - Graceful program replacement: Linux >= 5.7 (netlink
 //!   `XDP_FLAGS_REPLACE` + `IFLA_XDP_EXPECTED_FD`) or >= 5.9 (XDP `bpf_link`
 //!   update). Replacement attaches the new program atomically while adopting
@@ -35,9 +37,22 @@
 //!   traffic; a schema-incompatible pinned map fails the replacement load
 //!   before anything is detached.
 //!
-//! Owner-map updates are atomic per key: the kernel applies each 16-byte
-//! value replacement atomically, so a concurrent XDP lookup never observes a
-//! torn owner/generation pair.
+//! Owner-map updates write the whole 16-byte value with one
+//! `bpf_map_update_elem` call. On the kernels within the floor that
+//! replacement is atomic in practice, but the ABI does not rely on it: the
+//! strict value decode rejects non-zero flags/reserved bytes and zero
+//! generations, so a theoretically torn read fails closed to the slow path
+//! with the error counter rather than steering on a corrupted pair.
+//!
+//! The ownership fence generation lives in its own single-slot aligned-`u64`
+//! map, so fence advances are tear-free single stores. Attach adopts pinned
+//! maps across process restarts but flushes the owner map and rewrites the
+//! config before the program is attached; the persisted fence is honored so
+//! entries installed by a crashed owner cannot be re-armed.
+//!
+//! A stale pinned-map schema (for example from an older SDK revision) fails
+//! the object load with an `xdp_object_load` I/O error; the recovery path is
+//! to remove the interface's bpffs pin directory and re-attach.
 
 use std::fmt;
 use std::io;
@@ -48,9 +63,9 @@ use std::sync::{Arc, Mutex};
 use opc_ipsec_lb_ebpf_common::{
     XdpDatapathConfig, XdpOwnerValue, CONFIG_VALUE_LEN, COUNTER_ERROR, COUNTER_LOCAL, COUNTER_MISS,
     COUNTER_NATT_KEEPALIVE, COUNTER_PASS_NON_SWU, COUNTER_REDIRECT, COUNTER_SLOTS, COUNTER_STALE,
-    COUNTER_UNCLASSIFIABLE, MAP_CONFIG, MAP_COUNTERS, MAP_OWNERS, OWNERSHIP_KEY_MAX_ENCODED_BYTES,
-    OWNER_KEY_LEN, OWNER_VALUE_LEN, PROG_SWU_XDP, XDP_MIN_KERNEL_RELEASE,
-    XDP_MIN_KERNEL_REPLACE_RELEASE,
+    COUNTER_UNCLASSIFIABLE, MAP_CONFIG, MAP_COUNTERS, MAP_FENCE, MAP_OWNERS,
+    OWNERSHIP_KEY_MAX_ENCODED_BYTES, OWNER_KEY_LEN, OWNER_VALUE_LEN, PROG_SWU_XDP,
+    XDP_MIN_KERNEL_RELEASE, XDP_MIN_KERNEL_REPLACE_RELEASE,
 };
 
 use crate::error::IpsecLbError;
@@ -82,17 +97,37 @@ pub(crate) trait HostXdpRuntime: Send + Sync + fmt::Debug {
     /// Resolve an interface index by name in the current netns.
     fn ifindex_by_name(&self, name: &str) -> Result<u32, IpsecLbError>;
 
-    /// Load and attach the XDP program and pinned maps for `interface`.
+    /// Report whether `ifindex` names an existing interface that is
+    /// administratively up in the current netns.
+    fn link_is_up(&self, ifindex: u32) -> Result<bool, IpsecLbError>;
+
+    /// Load the pinned maps, write the datapath config, and attach the XDP
+    /// program for `interface`.
+    ///
+    /// Implementations must flush the owner map when adopting pre-existing
+    /// pins and write `config` before the program is attached, so the
+    /// datapath never verdicts with a previous process's state.
     fn attach(
         &self,
         interface: &str,
         ifindex: u32,
         pin_dir: &Path,
         mode: HostXdpAttachMode,
+        config: [u8; CONFIG_VALUE_LEN],
     ) -> Result<(), IpsecLbError>;
 
     /// Atomically replace the attached XDP program, adopting the pinned maps.
-    fn replace(&self, interface: &str, ifindex: u32, pin_dir: &Path) -> Result<(), IpsecLbError>;
+    ///
+    /// On failure the implementation drops its device record so a later
+    /// attach re-establishes the datapath instead of early-Ok-ing on a wedged
+    /// program.
+    fn replace(
+        &self,
+        interface: &str,
+        ifindex: u32,
+        pin_dir: &Path,
+        config: [u8; CONFIG_VALUE_LEN],
+    ) -> Result<(), IpsecLbError>;
 
     /// Detach the XDP program and remove pins owned by this backend.
     fn detach(&self, interface: &str, ifindex: u32, pin_dir: &Path) -> Result<(), IpsecLbError>;
@@ -115,9 +150,11 @@ pub(crate) trait HostXdpRuntime: Send + Sync + fmt::Debug {
     /// Remove an owner-map entry; returns whether it existed.
     fn owner_remove(&self, ifindex: u32, key: [u8; OWNER_KEY_LEN]) -> Result<bool, IpsecLbError>;
 
-    /// Write the single-slot datapath configuration.
-    fn config_write(&self, ifindex: u32, value: [u8; CONFIG_VALUE_LEN])
-        -> Result<(), IpsecLbError>;
+    /// Read the persisted ownership fence generation.
+    fn fence_read(&self, ifindex: u32) -> Result<u64, IpsecLbError>;
+
+    /// Write the ownership fence generation.
+    fn fence_write(&self, ifindex: u32, generation: u64) -> Result<(), IpsecLbError>;
 
     /// Read the aggregated per-CPU per-verdict counters.
     fn counters_read(&self, ifindex: u32) -> Result<[u64; COUNTER_SLOTS as usize], IpsecLbError>;
@@ -160,10 +197,14 @@ impl HostXdpRedirectHandoff {
 /// XDP attach mode for the datapath program.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum HostXdpAttachMode {
-    /// Let the kernel choose: native (driver) mode when the device supports
-    /// it, generic otherwise. Native mode is the line-rate tier but only
-    /// delivers `XDP_REDIRECT` frames into a veth when the peer runs an XDP
-    /// consumer.
+    /// Ask the kernel for native (driver) mode. The kernel falls back to
+    /// generic mode only when the device lacks XDP support entirely; devices
+    /// that support native mode — including veth — are attached natively.
+    /// Native mode is the line-rate tier but only delivers `XDP_REDIRECT`
+    /// frames into a veth when the peer runs an XDP consumer, so a veth
+    /// hand-off interface without a peer program needs
+    /// [`HostXdpAttachMode::Generic`]. No automatic mode downgrade happens
+    /// after attach.
     #[default]
     Native,
     /// Generic (SKB) mode, executed by the kernel network stack. Redirect
@@ -261,6 +302,7 @@ struct HostXdpSteeringBackendInner {
 #[derive(Debug, Default)]
 struct HostXdpState {
     attached_ifindex: Option<u32>,
+    attached_mode: Option<HostXdpAttachMode>,
     current_fence: u64,
 }
 
@@ -450,14 +492,30 @@ impl HostXdpSteeringBackend {
             .map_err(|_| IpsecLbError::io("host_xdp_state", poisoned_lock()))
     }
 
-    fn datapath_config(&self, fence_generation: u64) -> [u8; CONFIG_VALUE_LEN] {
+    fn datapath_config(&self) -> [u8; CONFIG_VALUE_LEN] {
         XdpDatapathConfig {
             self_shard: self.inner.config.self_shard.get(),
             routing_domain: self.inner.config.routing_domain.get(),
-            fence_generation,
             handoff_ifindex: self.inner.config.redirect_handoff.ifindex(),
         }
         .encode()
+    }
+
+    fn validate_handoff_ifindex(&self, attach_ifindex: u32) -> Result<(), IpsecLbError> {
+        let handoff = self.inner.config.redirect_handoff.ifindex();
+        if handoff == attach_ifindex {
+            return Err(IpsecLbError::invalid_config(
+                "redirect_handoff.ifindex",
+                "hand-off interface must differ from the attached interface",
+            ));
+        }
+        if !self.inner.runtime.link_is_up(handoff)? {
+            return Err(IpsecLbError::invalid_config(
+                "redirect_handoff.ifindex",
+                "hand-off interface does not exist or is not up",
+            ));
+        }
+        Ok(())
     }
 
     fn ensure_attached_sync(&self) -> Result<u32, IpsecLbError> {
@@ -473,17 +531,25 @@ impl HostXdpSteeringBackend {
                 "ifindex must be nonzero",
             ));
         }
+        self.validate_handoff_ifindex(ifindex)?;
+        // The runtime flushes adopted owner pins and writes the config before
+        // attaching the program, so the datapath never verdicts with a
+        // previous process's state. The fence map is deliberately not
+        // rewritten: a persisted fence survives process restarts.
         self.inner.runtime.attach(
             &self.inner.interface,
             ifindex,
             &self.pin_dir(),
             self.inner.config.attach_mode,
+            self.datapath_config(),
         )?;
-        let fence = self.state()?.current_fence;
-        self.inner
-            .runtime
-            .config_write(ifindex, self.datapath_config(fence))?;
-        self.state()?.attached_ifindex = Some(ifindex);
+        let persisted_fence = self.inner.runtime.fence_read(ifindex)?;
+        let mut state = self.state()?;
+        if persisted_fence > state.current_fence {
+            state.current_fence = persisted_fence;
+        }
+        state.attached_ifindex = Some(ifindex);
+        state.attached_mode = Some(self.inner.config.attach_mode);
         Ok(ifindex)
     }
 
@@ -495,7 +561,9 @@ impl HostXdpSteeringBackend {
         self.inner
             .runtime
             .detach(&self.inner.interface, ifindex, &self.pin_dir())?;
-        self.state()?.attached_ifindex = None;
+        let mut state = self.state()?;
+        state.attached_ifindex = None;
+        state.attached_mode = None;
         Ok(())
     }
 
@@ -511,14 +579,21 @@ impl HostXdpSteeringBackend {
                 "kernel >= 5.7 for atomic XDP program replacement",
             ));
         }
-        self.inner
-            .runtime
-            .replace(&self.inner.interface, ifindex, &self.pin_dir())?;
-        let fence = self.state()?.current_fence;
-        self.inner
-            .runtime
-            .config_write(ifindex, self.datapath_config(fence))?;
-        Ok(())
+        let result = self.inner.runtime.replace(
+            &self.inner.interface,
+            ifindex,
+            &self.pin_dir(),
+            self.datapath_config(),
+        );
+        if result.is_err() {
+            // The runtime dropped its device record; clear our attach state so
+            // a later attach() re-establishes the datapath instead of
+            // early-Ok-ing on a wedged program.
+            let mut state = self.state()?;
+            state.attached_ifindex = None;
+            state.attached_mode = None;
+        }
+        result
     }
 
     fn install_owner_sync(
@@ -539,6 +614,13 @@ impl HostXdpSteeringBackend {
                 "ownership key routing domain does not match the backend",
             ));
         }
+        let current_fence = self.state()?.current_fence;
+        if generation < current_fence {
+            return Err(IpsecLbError::invalid_config(
+                "ownership.generation",
+                "generation predates the current ownership fence; generations are minted only by the fenced ownership authority",
+            ));
+        }
         let map_key = owner_map_key(key);
         let value = XdpOwnerValue {
             owner_shard: owner.get(),
@@ -550,6 +632,12 @@ impl HostXdpSteeringBackend {
     }
 
     fn remove_owner_sync(&self, key: &SessionOwnershipKey) -> Result<(), IpsecLbError> {
+        if key.destination().routing_domain() != self.inner.config.routing_domain {
+            return Err(IpsecLbError::invalid_config(
+                "ownership.routing_domain",
+                "ownership key routing domain does not match the backend",
+            ));
+        }
         let map_key = owner_map_key(key);
         let ifindex = self.ensure_attached_sync()?;
         if self.inner.runtime.owner_remove(ifindex, map_key)? {
@@ -587,16 +675,18 @@ impl HostXdpSteeringBackend {
             ));
         }
         let ifindex = self.ensure_attached_sync()?;
-        let current = self.state()?.current_fence;
+        // One critical section across the monotonicity check, the kernel
+        // write, and the state store: a concurrent advance can never leave
+        // the kernel fence behind the recorded one.
+        let mut state = self.state()?;
+        let current = state.current_fence;
         if generation <= current {
             return Err(IpsecLbError::ownership_conflict(
                 "fence generation must advance monotonically",
             ));
         }
-        self.inner
-            .runtime
-            .config_write(ifindex, self.datapath_config(generation))?;
-        self.state()?.current_fence = generation;
+        self.inner.runtime.fence_write(ifindex, generation)?;
+        state.current_fence = generation;
         Ok(())
     }
 
@@ -675,6 +765,11 @@ fn enforce_kernel_floor(environment: &HostXdpEnvironment) -> Result<(), IpsecLbE
             "bpffs mounted for pinned maps",
         ));
     }
+    if !environment.net_admin_capable || !environment.bpf_capable {
+        return Err(IpsecLbError::xdp_kernel_floor(
+            "effective CAP_NET_ADMIN and CAP_BPF or CAP_SYS_ADMIN",
+        ));
+    }
     Ok(())
 }
 
@@ -693,10 +788,10 @@ fn validate_interface_name(name: &str) -> Result<(), IpsecLbError> {
             "name must fit Linux IFNAMSIZ",
         ));
     }
-    if name.as_bytes().contains(&0) || name.contains('/') {
+    if name.as_bytes().contains(&0) || name.contains('/') || name == "." || name == ".." {
         return Err(IpsecLbError::invalid_config(
             "interface.name",
-            "name must not contain NUL or path separators",
+            "name must not contain NUL or path separators and must not be . or ..",
         ));
     }
     Ok(())
@@ -714,12 +809,17 @@ impl HostXdpRuntime for UnsupportedHostXdpRuntime {
         Err(IpsecLbError::Unsupported)
     }
 
+    fn link_is_up(&self, _ifindex: u32) -> Result<bool, IpsecLbError> {
+        Err(IpsecLbError::Unsupported)
+    }
+
     fn attach(
         &self,
         _interface: &str,
         _ifindex: u32,
         _pin_dir: &Path,
         _mode: HostXdpAttachMode,
+        _config: [u8; CONFIG_VALUE_LEN],
     ) -> Result<(), IpsecLbError> {
         Err(IpsecLbError::Unsupported)
     }
@@ -729,6 +829,7 @@ impl HostXdpRuntime for UnsupportedHostXdpRuntime {
         _interface: &str,
         _ifindex: u32,
         _pin_dir: &Path,
+        _config: [u8; CONFIG_VALUE_LEN],
     ) -> Result<(), IpsecLbError> {
         Err(IpsecLbError::Unsupported)
     }
@@ -758,11 +859,11 @@ impl HostXdpRuntime for UnsupportedHostXdpRuntime {
         Err(IpsecLbError::Unsupported)
     }
 
-    fn config_write(
-        &self,
-        _ifindex: u32,
-        _value: [u8; CONFIG_VALUE_LEN],
-    ) -> Result<(), IpsecLbError> {
+    fn fence_read(&self, _ifindex: u32) -> Result<u64, IpsecLbError> {
+        Err(IpsecLbError::Unsupported)
+    }
+
+    fn fence_write(&self, _ifindex: u32, _generation: u64) -> Result<(), IpsecLbError> {
         Err(IpsecLbError::Unsupported)
     }
 
@@ -793,7 +894,8 @@ mod aya_runtime {
 
     use super::{
         HostXdpAttachMode, HostXdpEnvironment, HostXdpRuntime, CONFIG_VALUE_LEN, COUNTER_SLOTS,
-        MAP_CONFIG, MAP_COUNTERS, MAP_OWNERS, OWNER_KEY_LEN, OWNER_VALUE_LEN, PROG_SWU_XDP,
+        MAP_CONFIG, MAP_COUNTERS, MAP_FENCE, MAP_OWNERS, OWNER_KEY_LEN, OWNER_VALUE_LEN,
+        PROG_SWU_XDP,
     };
     use crate::IpsecLbError;
 
@@ -815,6 +917,7 @@ mod aya_runtime {
     struct LoadedDevice {
         ebpf: Ebpf,
         link_id: Option<XdpLinkId>,
+        mode: HostXdpAttachMode,
     }
 
     impl AyaHostXdpRuntime {
@@ -829,7 +932,12 @@ mod aya_runtime {
                 .default_map_pin_directory(pin_dir)
                 .load(DATAPATH_OBJECT)
                 .map_err(|_| {
-                    IpsecLbError::io("xdp_object_load", invalid_data("object load failed"))
+                    IpsecLbError::io(
+                        "xdp_object_load",
+                        invalid_data(
+                            "XDP object load failed; a stale pinned-map schema requires removing the interface's bpffs pin directory",
+                        ),
+                    )
                 })
         }
 
@@ -844,8 +952,57 @@ mod aya_runtime {
                 })
         }
 
+        fn owners_map(
+            ebpf: &mut Ebpf,
+        ) -> Result<
+            BpfHashMap<&mut aya::maps::MapData, [u8; OWNER_KEY_LEN], [u8; OWNER_VALUE_LEN]>,
+            IpsecLbError,
+        > {
+            let map = ebpf
+                .map_mut(MAP_OWNERS)
+                .ok_or_else(|| IpsecLbError::io("xdp_owners_map", invalid_data("map missing")))?;
+            BpfHashMap::<_, [u8; OWNER_KEY_LEN], [u8; OWNER_VALUE_LEN]>::try_from(map)
+                .map_err(|error| map_error("xdp_owners_map", error))
+        }
+
+        fn owners_flush_map(ebpf: &mut Ebpf) -> Result<(), IpsecLbError> {
+            let mut hash = Self::owners_map(ebpf)?;
+            let keys: Vec<[u8; OWNER_KEY_LEN]> = hash
+                .keys()
+                .collect::<Result<_, _>>()
+                .map_err(|error| map_error("xdp_owners_flush", error))?;
+            for key in keys {
+                hash.remove(&key)
+                    .map_err(|error| map_error("xdp_owners_flush", error))?;
+            }
+            Ok(())
+        }
+
+        fn config_write_map(
+            ebpf: &mut Ebpf,
+            value: [u8; CONFIG_VALUE_LEN],
+        ) -> Result<(), IpsecLbError> {
+            let map = ebpf
+                .map_mut(MAP_CONFIG)
+                .ok_or_else(|| IpsecLbError::io("xdp_config_map", invalid_data("map missing")))?;
+            let mut array = Array::<_, [u8; CONFIG_VALUE_LEN]>::try_from(map)
+                .map_err(|error| map_error("xdp_config_map", error))?;
+            array
+                .set(0, value, 0)
+                .map_err(|error| map_error("xdp_config_write", error))
+        }
+
+        fn fence_array(
+            ebpf: &mut Ebpf,
+        ) -> Result<Array<&mut aya::maps::MapData, u64>, IpsecLbError> {
+            let map = ebpf
+                .map_mut(MAP_FENCE)
+                .ok_or_else(|| IpsecLbError::io("xdp_fence_map", invalid_data("map missing")))?;
+            Array::<_, u64>::try_from(map).map_err(|error| map_error("xdp_fence_map", error))
+        }
+
         fn unpin(pin_dir: &Path) -> Result<(), IpsecLbError> {
-            for map_name in [MAP_OWNERS, MAP_CONFIG, MAP_COUNTERS] {
+            for map_name in [MAP_OWNERS, MAP_CONFIG, MAP_FENCE, MAP_COUNTERS] {
                 match fs::remove_file(pin_dir.join(map_name)) {
                     Ok(()) => {}
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -882,24 +1039,43 @@ mod aya_runtime {
             })
         }
 
+        fn link_is_up(&self, ifindex: u32) -> Result<bool, IpsecLbError> {
+            link_is_up(ifindex)
+        }
+
         fn attach(
             &self,
             interface: &str,
             ifindex: u32,
             pin_dir: &Path,
             mode: HostXdpAttachMode,
+            config: [u8; CONFIG_VALUE_LEN],
         ) -> Result<(), IpsecLbError> {
-            if self
+            if let Some(device) = self
                 .devices
                 .lock()
                 .map_err(|_| IpsecLbError::io("xdp_attach", super::poisoned_lock()))?
-                .contains_key(&ifindex)
+                .get(&ifindex)
             {
-                return Ok(());
+                return if device.mode == mode {
+                    Ok(())
+                } else {
+                    Err(IpsecLbError::invalid_config(
+                        "interface.attach_mode",
+                        "interface is already attached with a different XDP mode",
+                    ))
+                };
             }
             let pins_preexisted = pin_dir.is_dir();
             let mut ebpf = Self::load_pinned(pin_dir)?;
             let attach_result = (|| {
+                if pins_preexisted {
+                    // Never re-arm a previous process's owners: the fenced
+                    // ownership authority re-installs fresh records.
+                    Self::owners_flush_map(&mut ebpf)?;
+                }
+                // Write the config before the program sees traffic.
+                Self::config_write_map(&mut ebpf, config)?;
                 let program = Self::xdp_program(&mut ebpf)?;
                 program
                     .load()
@@ -930,6 +1106,7 @@ mod aya_runtime {
                     LoadedDevice {
                         ebpf,
                         link_id: Some(link_id),
+                        mode,
                     },
                 );
             Ok(())
@@ -940,6 +1117,7 @@ mod aya_runtime {
             _interface: &str,
             ifindex: u32,
             pin_dir: &Path,
+            config: [u8; CONFIG_VALUE_LEN],
         ) -> Result<(), IpsecLbError> {
             let mut new_ebpf = Self::load_pinned(pin_dir)?;
             let mut devices = self
@@ -947,25 +1125,42 @@ mod aya_runtime {
                 .lock()
                 .map_err(|_| IpsecLbError::io("xdp_replace", super::poisoned_lock()))?;
             let device = devices.get_mut(&ifindex).ok_or(IpsecLbError::NotFound)?;
-            let new_program = Self::xdp_program(&mut new_ebpf)?;
-            new_program
-                .load()
-                .map_err(|error| program_error("xdp_program_load", &error))?;
-            let old_program = Self::xdp_program(&mut device.ebpf)?;
-            let link_id = device
-                .link_id
-                .take()
-                .ok_or_else(|| IpsecLbError::io("xdp_replace", invalid_data("link missing")))?;
-            let link = old_program
-                .take_link(link_id)
-                .map_err(|error| program_error("xdp_link_take", &error))?;
-            device.link_id = Some(
+            let replace_result = (|| {
+                let new_program = Self::xdp_program(&mut new_ebpf)?;
                 new_program
-                    .attach_to_link(link)
-                    .map_err(|error| program_error("xdp_program_replace", &error))?,
-            );
-            device.ebpf = new_ebpf;
-            Ok(())
+                    .load()
+                    .map_err(|error| program_error("xdp_program_load", &error))?;
+                let old_program = Self::xdp_program(&mut device.ebpf)?;
+                let link_id = device
+                    .link_id
+                    .take()
+                    .ok_or_else(|| IpsecLbError::io("xdp_replace", invalid_data("link missing")))?;
+                // On any failure after this point the device record is
+                // dropped below, so the taken link id needs no restoration.
+                let link = old_program
+                    .take_link(link_id)
+                    .map_err(|error| program_error("xdp_link_take", &error))?;
+                match new_program.attach_to_link(link) {
+                    Ok(new_link_id) => {
+                        device.link_id = Some(new_link_id);
+                        Ok(())
+                    }
+                    Err(error) => Err(program_error("xdp_program_replace", &error)),
+                }
+            })();
+            match replace_result {
+                Ok(()) => {
+                    Self::config_write_map(&mut new_ebpf, config)?;
+                    device.ebpf = new_ebpf;
+                    Ok(())
+                }
+                Err(error) => {
+                    // Never wedge on a failed replacement: drop the device
+                    // record so a later attach re-establishes the datapath.
+                    devices.remove(&ifindex);
+                    Err(error)
+                }
+            }
         }
 
         fn detach(
@@ -1041,20 +1236,21 @@ mod aya_runtime {
             })
         }
 
-        fn config_write(
-            &self,
-            ifindex: u32,
-            value: [u8; CONFIG_VALUE_LEN],
-        ) -> Result<(), IpsecLbError> {
-            self.with_device(ifindex, "xdp_config_write", |device| {
-                let map = device.ebpf.map_mut(MAP_CONFIG).ok_or_else(|| {
-                    IpsecLbError::io("xdp_config_map", invalid_data("map missing"))
-                })?;
-                let mut array = Array::<_, [u8; CONFIG_VALUE_LEN]>::try_from(map)
-                    .map_err(|error| map_error("xdp_config_map", error))?;
+        fn fence_read(&self, ifindex: u32) -> Result<u64, IpsecLbError> {
+            self.with_device(ifindex, "xdp_fence_read", |device| {
+                let array = Self::fence_array(&mut device.ebpf)?;
                 array
-                    .set(0, value, 0)
-                    .map_err(|error| map_error("xdp_config_write", error))
+                    .get(&0, 0)
+                    .map_err(|error| map_error("xdp_fence_read", error))
+            })
+        }
+
+        fn fence_write(&self, ifindex: u32, generation: u64) -> Result<(), IpsecLbError> {
+            self.with_device(ifindex, "xdp_fence_write", |device| {
+                let mut array = Self::fence_array(&mut device.ebpf)?;
+                array
+                    .set(0, generation, 0)
+                    .map_err(|error| map_error("xdp_fence_write", error))
             })
         }
 
@@ -1073,7 +1269,9 @@ mod aya_runtime {
                     let values = counters
                         .get(&(slot as u32), 0)
                         .map_err(|error| map_error("xdp_counters_read", error))?;
-                    *total = values.iter().sum();
+                    *total = values
+                        .iter()
+                        .fold(0_u64, |sum, value| sum.saturating_add(*value));
                 }
                 Ok(totals)
             })
@@ -1098,6 +1296,87 @@ mod aya_runtime {
         let major = components.find(|part| !part.is_empty())?.parse().ok()?;
         let minor = components.find(|part| !part.is_empty())?.parse().ok()?;
         Some((major, minor))
+    }
+
+    const RTM_GETLINK: u16 = 18;
+    const RTM_NEWLINK: u16 = 16;
+    const NLMSG_DONE: u16 = 3;
+    const NLMSG_ERROR: u16 = 2;
+    const NLM_F_REQUEST: u16 = 1;
+    const NLM_F_DUMP: u16 = 0x300;
+    const IFF_UP: u32 = 0x1;
+    const NLMSG_HDR_LEN: usize = 16;
+    const IFINFOMSG_LEN: usize = 16;
+
+    /// Report whether `ifindex` names an existing interface that is
+    /// administratively up, via an `RTM_GETLINK` dump in the current netns.
+    fn link_is_up(ifindex: u32) -> Result<bool, IpsecLbError> {
+        let socket = sys::open_route_netlink_socket()
+            .map_err(|error| IpsecLbError::io("xdp_link_query_open", error))?;
+        let mut request = [0_u8; NLMSG_HDR_LEN + IFINFOMSG_LEN];
+        let request_len = request.len() as u32;
+        request[0..4].copy_from_slice(&request_len.to_ne_bytes());
+        request[4..6].copy_from_slice(&RTM_GETLINK.to_ne_bytes());
+        request[6..8].copy_from_slice(&(NLM_F_REQUEST | NLM_F_DUMP).to_ne_bytes());
+        request[8..12].copy_from_slice(&1_u32.to_ne_bytes());
+        sys::send_message(&socket, &request)
+            .map_err(|error| IpsecLbError::io("xdp_link_query_send", error))?;
+
+        let mut buffer = [0_u8; 65_536];
+        let mut attempts = 0_u32;
+        loop {
+            match sys::receive_message(&socket, &mut buffer) {
+                Ok(length) => {
+                    let mut cursor = 0_usize;
+                    while cursor + NLMSG_HDR_LEN <= length {
+                        let header: [u8; NLMSG_HDR_LEN] = buffer[cursor..cursor + NLMSG_HDR_LEN]
+                            .try_into()
+                            .map_err(|_| {
+                                IpsecLbError::io("xdp_link_query", invalid_data("short header"))
+                            })?;
+                        let msg_len =
+                            u32::from_ne_bytes(header[0..4].try_into().unwrap_or([0; 4])) as usize;
+                        let msg_type =
+                            u16::from_ne_bytes(header[4..6].try_into().unwrap_or([0; 2]));
+                        if msg_len < NLMSG_HDR_LEN || cursor + msg_len > length {
+                            return Err(IpsecLbError::io(
+                                "xdp_link_query",
+                                invalid_data("malformed netlink message"),
+                            ));
+                        }
+                        match msg_type {
+                            NLMSG_DONE => return Ok(false),
+                            NLMSG_ERROR => {
+                                return Err(IpsecLbError::io(
+                                    "xdp_link_query",
+                                    invalid_data("netlink link dump failed"),
+                                ));
+                            }
+                            RTM_NEWLINK if msg_len >= NLMSG_HDR_LEN + IFINFOMSG_LEN => {
+                                let body = &buffer[cursor + NLMSG_HDR_LEN..];
+                                let index =
+                                    i32::from_ne_bytes(body[4..8].try_into().unwrap_or([0; 4]));
+                                let flags =
+                                    u32::from_ne_bytes(body[8..12].try_into().unwrap_or([0; 4]));
+                                if index > 0 && index as u32 == ifindex {
+                                    return Ok(flags & IFF_UP != 0);
+                                }
+                            }
+                            _ => {}
+                        }
+                        cursor += msg_len.div_ceil(4) * 4;
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    attempts += 1;
+                    if attempts > 50 {
+                        return Err(IpsecLbError::io("xdp_link_query_recv", error));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                Err(error) => return Err(IpsecLbError::io("xdp_link_query_recv", error)),
+            }
+        }
     }
 
     fn effective_capability(capability: u32) -> Result<bool, IpsecLbError> {
@@ -1156,6 +1435,10 @@ mod tests {
         detached: Vec<(String, u32, PathBuf)>,
         config: Option<[u8; CONFIG_VALUE_LEN]>,
         owners: HashMap<(u32, [u8; OWNER_KEY_LEN]), [u8; OWNER_VALUE_LEN]>,
+        fences: HashMap<u32, u64>,
+        fence_writes: Vec<u64>,
+        link_up: bool,
+        replace_error: Option<&'static str>,
         counters: [u64; COUNTER_SLOTS as usize],
     }
 
@@ -1176,6 +1459,10 @@ mod tests {
                 detached: Vec::new(),
                 config: None,
                 owners: HashMap::new(),
+                fences: HashMap::new(),
+                fence_writes: Vec::new(),
+                link_up: true,
+                replace_error: None,
                 counters: [0; COUNTER_SLOTS as usize],
             }
         }
@@ -1203,16 +1490,23 @@ mod tests {
             Ok(self.state().ifindex)
         }
 
+        fn link_is_up(&self, _ifindex: u32) -> Result<bool, IpsecLbError> {
+            Ok(self.state().link_up)
+        }
+
         fn attach(
             &self,
             interface: &str,
             ifindex: u32,
             pin_dir: &Path,
             _mode: HostXdpAttachMode,
+            config: [u8; CONFIG_VALUE_LEN],
         ) -> Result<(), IpsecLbError> {
-            self.state()
+            let mut state = self.state();
+            state
                 .attached
                 .push((interface.to_owned(), ifindex, pin_dir.to_path_buf()));
+            state.config = Some(config);
             Ok(())
         }
 
@@ -1221,10 +1515,19 @@ mod tests {
             interface: &str,
             ifindex: u32,
             pin_dir: &Path,
+            config: [u8; CONFIG_VALUE_LEN],
         ) -> Result<(), IpsecLbError> {
-            self.state()
+            let mut state = self.state();
+            if let Some(operation) = state.replace_error {
+                return Err(IpsecLbError::io(
+                    operation,
+                    io::Error::new(io::ErrorKind::InvalidData, "injected replace failure"),
+                ));
+            }
+            state
                 .replaced
                 .push((interface.to_owned(), ifindex, pin_dir.to_path_buf()));
+            state.config = Some(config);
             Ok(())
         }
 
@@ -1266,12 +1569,14 @@ mod tests {
             Ok(self.state().owners.remove(&(ifindex, key)).is_some())
         }
 
-        fn config_write(
-            &self,
-            _ifindex: u32,
-            value: [u8; CONFIG_VALUE_LEN],
-        ) -> Result<(), IpsecLbError> {
-            self.state().config = Some(value);
+        fn fence_read(&self, ifindex: u32) -> Result<u64, IpsecLbError> {
+            Ok(self.state().fences.get(&ifindex).copied().unwrap_or(0))
+        }
+
+        fn fence_write(&self, ifindex: u32, generation: u64) -> Result<(), IpsecLbError> {
+            let mut state = self.state();
+            state.fences.insert(ifindex, generation);
+            state.fence_writes.push(generation);
             Ok(())
         }
 
@@ -1326,7 +1631,6 @@ mod tests {
         let decoded = XdpDatapathConfig::decode(&written).expect("valid config encoding");
         assert_eq!(decoded.self_shard, 1);
         assert_eq!(decoded.routing_domain, 7);
-        assert_eq!(decoded.fence_generation, 0);
         assert_eq!(decoded.handoff_ifindex, 42);
 
         backend.detach().await.expect("detach");
@@ -1454,13 +1758,7 @@ mod tests {
         let backend =
             HostXdpSteeringBackend::with_runtime_and_config("swu0", runtime.clone(), config());
         backend.advance_fence(5).await.expect("advance");
-        let written = runtime.state().config.expect("config written");
-        assert_eq!(
-            XdpDatapathConfig::decode(&written)
-                .expect("valid")
-                .fence_generation,
-            5
-        );
+        assert_eq!(runtime.state().fences.get(&7).copied(), Some(5));
         assert!(matches!(
             backend.advance_fence(5).await,
             Err(IpsecLbError::OwnershipConflict { .. })
@@ -1470,6 +1768,171 @@ mod tests {
             Err(IpsecLbError::OwnershipConflict { .. })
         ));
         backend.advance_fence(6).await.expect("advance");
+        assert_eq!(runtime.state().fences.get(&7).copied(), Some(6));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_fence_advances_never_regress_the_kernel_fence() {
+        let runtime = Arc::new(TestRuntime::default());
+        let backend = Arc::new(HostXdpSteeringBackend::with_runtime_and_config(
+            "swu0",
+            runtime.clone(),
+            config(),
+        ));
+        backend.attach().await.expect("attach");
+
+        let mut tasks = Vec::new();
+        for round in 0_u64..16 {
+            let backend = backend.clone();
+            // Interleave high and low candidates so the monotonicity check
+            // races the kernel write on every round.
+            let high = 1_000 + round * 2 + 1;
+            let low = 1_000 + round * 2;
+            tasks.push(tokio::spawn({
+                let backend = backend.clone();
+                async move { backend.advance_fence(high).await }
+            }));
+            tasks.push(tokio::spawn(
+                async move { backend.advance_fence(low).await },
+            ));
+        }
+        let mut advances = 0_u64;
+        for task in tasks {
+            if task.await.expect("fence task").is_ok() {
+                advances += 1;
+            }
+        }
+        assert!(advances >= 1, "at least one advance must succeed");
+
+        // Every fence value the kernel observed is part of a non-decreasing
+        // sequence: no check-then-write race can regress it.
+        let writes = runtime.state().fence_writes.clone();
+        assert!(!writes.is_empty());
+        assert!(
+            writes.windows(2).all(|pair| pair[0] < pair[1]),
+            "kernel fence writes must be strictly increasing: {writes:?}"
+        );
+        assert_eq!(
+            writes.last().copied(),
+            Some(1_000 + 15 * 2 + 1),
+            "the highest candidate always wins"
+        );
+    }
+
+    #[tokio::test]
+    async fn install_owner_rejects_generation_older_than_fence() {
+        let runtime = Arc::new(TestRuntime::default());
+        let backend =
+            HostXdpSteeringBackend::with_runtime_and_config("swu0", runtime.clone(), config());
+        backend.advance_fence(10).await.expect("advance");
+        assert!(matches!(
+            backend
+                .install_owner(&esp_key(0x100), ShardId::new(2), 9)
+                .await,
+            Err(IpsecLbError::InvalidConfig { .. })
+        ));
+        backend
+            .install_owner(&esp_key(0x100), ShardId::new(2), 10)
+            .await
+            .expect("fence-equal generation is fresh");
+    }
+
+    #[tokio::test]
+    async fn attach_adopts_persisted_fence() {
+        let runtime = Arc::new(TestRuntime::default());
+        runtime.state().fences.insert(7, 42);
+        let backend =
+            HostXdpSteeringBackend::with_runtime_and_config("swu0", runtime.clone(), config());
+        backend.attach().await.expect("attach");
+        assert!(matches!(
+            backend.advance_fence(42).await,
+            Err(IpsecLbError::OwnershipConflict { .. })
+        ));
+        backend.advance_fence(43).await.expect("advance");
+    }
+
+    #[tokio::test]
+    async fn failed_replace_clears_state_so_attach_recovers() {
+        let runtime = Arc::new(TestRuntime::default());
+        let backend =
+            HostXdpSteeringBackend::with_runtime_and_config("swu0", runtime.clone(), config());
+        backend.attach().await.expect("attach");
+        assert_eq!(runtime.state().attached.len(), 1);
+
+        runtime.state().replace_error = Some("xdp_program_replace");
+        let error = backend.replace().await.expect_err("injected failure");
+        assert_eq!(error.raw_os_error(), None);
+
+        // The backend must not early-Ok on the wedged state: attach
+        // re-establishes the datapath and a retry succeeds.
+        backend.attach().await.expect("re-attach");
+        assert_eq!(runtime.state().attached.len(), 2);
+        runtime.state().replace_error = None;
+        backend.replace().await.expect("replace retry");
+        assert_eq!(runtime.state().replaced.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn attach_rejects_invalid_handoff_ifindex() {
+        let runtime = Arc::new(TestRuntime::default());
+        runtime.state().link_up = false;
+        let backend =
+            HostXdpSteeringBackend::with_runtime_and_config("swu0", runtime.clone(), config());
+        assert!(matches!(
+            backend.attach().await,
+            Err(IpsecLbError::InvalidConfig {
+                field: "redirect_handoff.ifindex",
+                ..
+            })
+        ));
+        assert!(runtime.state().attached.is_empty());
+
+        let runtime = Arc::new(TestRuntime::default());
+        runtime.state().ifindex = 42;
+        let backend =
+            HostXdpSteeringBackend::with_runtime_and_config("swu0", runtime.clone(), config());
+        assert!(matches!(
+            backend.attach().await,
+            Err(IpsecLbError::InvalidConfig {
+                field: "redirect_handoff.ifindex",
+                ..
+            })
+        ));
+        assert!(runtime.state().attached.is_empty());
+    }
+
+    #[tokio::test]
+    async fn attach_enforces_capability_floor() {
+        let mut env = TestState::default().env;
+        env.net_admin_capable = false;
+        let backend = HostXdpSteeringBackend::with_runtime_and_config(
+            "swu0",
+            Arc::new(TestRuntime::with_env(env)),
+            config(),
+        );
+        assert!(matches!(
+            backend.attach().await,
+            Err(IpsecLbError::XdpKernelFloorNotMet { .. })
+        ));
+
+        let mut env = TestState::default().env;
+        env.bpf_capable = false;
+        let backend = HostXdpSteeringBackend::with_runtime_and_config(
+            "swu0",
+            Arc::new(TestRuntime::with_env(env)),
+            config(),
+        );
+        assert!(matches!(
+            backend.attach().await,
+            Err(IpsecLbError::XdpKernelFloorNotMet { .. })
+        ));
+    }
+
+    #[test]
+    fn interface_name_rejects_dot_segments() {
+        assert!(validate_interface_name(".").is_err());
+        assert!(validate_interface_name("..").is_err());
+        assert!(validate_interface_name("swu0").is_ok());
     }
 
     #[tokio::test]

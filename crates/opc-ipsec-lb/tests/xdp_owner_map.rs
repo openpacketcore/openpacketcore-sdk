@@ -7,6 +7,14 @@
 //! ownership model (#305) produce for the same packets. The verdict decision
 //! (#306 fence execution) is covered by the shared `decide_owner_verdict`
 //! table here and by the backend unit tests in `src/xdp.rs`.
+//!
+//! `simulate_xdp` mirrors only the eBPF program's fixed-header path: it does
+//! NOT reproduce the program's bounded IPv6 extension-header walk, so
+//! fixtures avoid extension headers (the walk is exercised by the gated
+//! privileged test). Deliberate, documented divergences from the userspace
+//! classifier — IP fragmentation and extension-header validation details —
+//! have their own fixtures asserting the expected disagreement, always in
+//! the fail-closed direction.
 
 use opc_ipsec_lb::ownership::{RoutingDomainTag, SessionOwnershipKey};
 use opc_ipsec_lb::{
@@ -375,6 +383,35 @@ fn natt_keepalive_agrees_with_userspace_classifier() {
 }
 
 #[test]
+fn initial_fragments_diverge_deliberately() {
+    // The userspace classifier accepts an initial fragment (MF=1, offset=0)
+    // that still carries the complete discriminator. The XDP fast path
+    // deliberately hands ANY fragment to the slow path: the packet reaches
+    // the same userspace classifier there, never a contradictory verdict.
+    let ike = ike_header(
+        0x0102_0304_0506_0708,
+        0x1112_1314_1516_1718,
+        35,
+        &[0xaa; 12],
+    );
+    let udp = udp_datagram(45000, UDP_PORT_IKE, &ike);
+    let fragment_payload = &udp[..8 + 32];
+    let mut packet = ipv4_packet(IP_PROTOCOL_UDP, PEER4, VIP4, fragment_payload);
+    packet[6] = 0x20; // more-fragments flag, offset 0
+
+    let classification = classify_keyless_ingress_packet(&packet, RoutingDomainTag::new(DOMAIN));
+    assert!(
+        matches!(classification, KeylessIngressClassification::Classified(_)),
+        "userspace classifies a complete-discriminator initial fragment: {classification:?}"
+    );
+    assert_eq!(
+        simulate_xdp(&packet),
+        SimOutcome::Unclassifiable,
+        "the XDP fast path deliberately slow-paths any fragment"
+    );
+}
+
+#[test]
 fn malformed_swu_candidates_fail_closed_on_both_paths() {
     // Reserved ESP SPI in UDP/4500.
     let mut esp = 0x0000_00ff_u32.to_be_bytes().to_vec();
@@ -444,9 +481,9 @@ fn verdict_table_executes_fenced_ownership_decisions() {
     let config = XdpDatapathConfig {
         self_shard: 1,
         routing_domain: DOMAIN,
-        fence_generation: 10,
         handoff_ifindex: 42,
     };
+    let fence_generation = 10_u64;
     let fresh_self = XdpOwnerValue {
         owner_shard: 1,
         generation: 10,
@@ -464,19 +501,19 @@ fn verdict_table_executes_fenced_ownership_decisions() {
     .encode();
 
     assert_eq!(
-        decide_owner_verdict(Some(fresh_self), &config),
+        decide_owner_verdict(Some(fresh_self), &config, fence_generation),
         XdpVerdict::Local
     );
     assert_eq!(
-        decide_owner_verdict(Some(fresh_remote), &config),
+        decide_owner_verdict(Some(fresh_remote), &config, fence_generation),
         XdpVerdict::RedirectHandoff
     );
     assert_eq!(
-        decide_owner_verdict(Some(fenced_out), &config),
+        decide_owner_verdict(Some(fenced_out), &config, fence_generation),
         XdpVerdict::SlowPathStale
     );
     assert_eq!(
-        decide_owner_verdict(None, &config),
+        decide_owner_verdict(None, &config, fence_generation),
         XdpVerdict::SlowPathMiss
     );
 }

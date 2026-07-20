@@ -11,10 +11,12 @@ logic used by both the eBPF program and the host:
   canonical destination-scoped ownership key (`SessionOwnershipKey`'s
   `OPCO` encoding, owned here so kernel and userspace derive byte-identical
   keys), and a 16-byte value with owner identity and ownership generation
-  (atomic per-key updates — a reader never observes a torn pair);
+  (whole-value atomic-per-key updates in practice, with a strict
+  flags/reserved-byte decode that fails closed if a value is ever torn);
 - the versioned single-slot datapath configuration (self shard, routing
-  domain, ownership fence generation, userspace-redirector hand-off
-  ifindex);
+  domain, userspace-redirector hand-off ifindex) and the separate
+  single-slot ownership fence generation, an aligned `u64` in its own map
+  so fence advances are tear-free single stores;
 - the per-verdict counter indices (local, redirect, miss, stale,
   unclassifiable, error, pass-through, NAT-T keepalive);
 - the branch-bounded transport classification decision procedure

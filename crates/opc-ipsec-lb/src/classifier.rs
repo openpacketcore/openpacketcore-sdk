@@ -1201,9 +1201,10 @@ impl IpFragment {
 pub struct SwuClassifierConfig<'a> {
     /// Current shard set used for IKE_SA_INIT bootstrap.
     pub shards: &'a ShardSet,
-    /// Number of high-order routing-tag bits used for IKE responder SPIs. Must
-    /// match the datapath `XdpConfig.ike_tag_bits`, so the userspace and XDP
-    /// bootstrap decisions steer an initial IKE_SA_INIT to the same shard.
+    /// Number of high-order routing-tag bits used for IKE responder SPIs.
+    /// Bootstrap tagging is a userspace slow-path decision; the XDP fast
+    /// path looks initial exchanges up by their canonical ownership key and
+    /// hands misses to this slow path.
     pub bootstrap_tag_bits: u8,
     /// ESP IP-fragment posture.
     pub esp_fragment_posture: EspFragmentPosture,
@@ -1347,9 +1348,11 @@ fn classify_ike(
             };
         }
         // Steer an initial IKE_SA_INIT (no allocated SPI yet) to the shard that
-        // owns its bootstrap tag, using the SAME FNV tag the XDP datapath computes
-        // (`ebpf_common::bootstrap_tag`) and the SAME rendezvous tag->shard mapping
-        // the allocator's `decode` uses — so userspace and datapath agree.
+        // owns its bootstrap tag, using the shared FNV tag
+        // (`ebpf_common::bootstrap_tag`) and the SAME rendezvous tag->shard
+        // mapping the allocator's `decode` uses. This is a userspace slow-path
+        // decision; the XDP fast path looks the exchange up by its canonical
+        // ownership key and hands misses here.
         let tag = match source_ip {
             IpAddress::V4(octets) => {
                 bootstrap_tag(header.initiator_spi, &octets, config.bootstrap_tag_bits)

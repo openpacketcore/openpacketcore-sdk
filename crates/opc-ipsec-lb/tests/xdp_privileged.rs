@@ -69,6 +69,7 @@ const SPI_STALE_ESP_UDP: u32 = 0x00ca_fe03;
 const SPI_UNKNOWN_NATIVE_ESP: u32 = 0x00ca_fe09;
 const SPI_ATOMIC_ESP_UDP: u32 = 0x00ca_fe05;
 const SPI_REPLACE_ESP_UDP: u32 = 0x00ca_fe06;
+const SPI_CRASH_ESP_UDP: u32 = 0x00ca_fe07;
 
 static PROVISION_SEQ: AtomicU32 = AtomicU32::new(0);
 
@@ -104,6 +105,7 @@ struct Provision {
     pub_peer: String,
     hand_main: String,
     hand_peer: String,
+    down_main: String,
     pin_root: PathBuf,
 }
 
@@ -118,6 +120,7 @@ impl Provision {
             pub_peer: format!("xp{seq}b"),
             hand_main: format!("xh{seq}a"),
             hand_peer: format!("xh{seq}b"),
+            down_main: format!("xd{seq}a"),
             pin_root: PathBuf::from(format!("/sys/fs/bpf/opc-xdp308-{pid}-{seq}")),
         };
 
@@ -213,6 +216,22 @@ impl Provision {
                 "set",
                 &provision.hand_peer,
                 "up",
+            ]
+            .as_ref(),
+        );
+        // A deliberately DOWN veth pair used to prove attach-time hand-off
+        // validation rejects unusable redirect channels.
+        run(
+            "ip",
+            [
+                "link",
+                "add",
+                &provision.down_main,
+                "type",
+                "veth",
+                "peer",
+                "name",
+                &format!("xd{seq}b"),
             ]
             .as_ref(),
         );
@@ -486,6 +505,50 @@ fn xdp_keyless_classification_and_owner_steering() {
         // to the peer stack without a peer XDP consumer.
         attach_mode: HostXdpAttachMode::Generic,
     };
+
+    // --- Stage A0: attach-time validation rejects an unusable hand-off. ---
+    // A hand-off interface that is down or is the attached interface itself
+    // must fail attach with a typed error: the helper-level return check
+    // cannot catch every redirect failure (some kernels defer transmit
+    // failures past the helper return), so validation is the enforceable
+    // guard against a silently dropping redirect channel.
+    let down_ifindex =
+        nix::net::if_::if_nametoindex(provision.down_main.as_str()).expect("resolve down ifindex");
+    let rejected = HostXdpSteeringBackend::new(
+        provision.pub_main.clone(),
+        HostXdpSteeringBackendConfig {
+            redirect_handoff: HostXdpRedirectHandoff::UserspaceRedirector {
+                ifindex: NonZeroU32::new(down_ifindex).expect("nonzero ifindex"),
+            },
+            ..config.clone()
+        },
+    );
+    assert!(
+        matches!(
+            runtime.block_on(rejected.attach()),
+            Err(opc_ipsec_lb::IpsecLbError::InvalidConfig { .. })
+        ),
+        "a down hand-off interface must reject attach"
+    );
+    let pub_ifindex =
+        nix::net::if_::if_nametoindex(provision.pub_main.as_str()).expect("resolve public ifindex");
+    let self_rejected = HostXdpSteeringBackend::new(
+        provision.pub_main.clone(),
+        HostXdpSteeringBackendConfig {
+            redirect_handoff: HostXdpRedirectHandoff::UserspaceRedirector {
+                ifindex: NonZeroU32::new(pub_ifindex).expect("nonzero ifindex"),
+            },
+            ..config.clone()
+        },
+    );
+    assert!(
+        matches!(
+            runtime.block_on(self_rejected.attach()),
+            Err(opc_ipsec_lb::IpsecLbError::InvalidConfig { .. })
+        ),
+        "a hand-off equal to the attached interface must reject attach"
+    );
+
     let backend = HostXdpSteeringBackend::new(provision.pub_main.clone(), config);
     runtime
         .block_on(backend.attach())
@@ -767,5 +830,74 @@ fn xdp_keyless_classification_and_owner_steering() {
         "counters persist and keep accumulating across replacement"
     );
 
-    runtime.block_on(backend.detach()).expect("detach");
+    // --- Stage D: a process crash never re-arms stale owners. ---
+    let crash_key = esp_udp_key(SPI_CRASH_ESP_UDP);
+    runtime
+        .block_on(backend.install_owner(&crash_key, ShardId::new(SELF_SHARD), 5))
+        .expect("install crash key");
+    runtime
+        .block_on(backend.advance_fence(6))
+        .expect("advance fence past the entry");
+    let before_crash = runtime.block_on(backend.counters()).expect("counters");
+
+    // Simulate the crash: drop the backend without detach. The pins persist;
+    // the program is unloaded with the process.
+    let config_template = HostXdpSteeringBackendConfig {
+        bpffs_pin_root: provision.pin_root.clone(),
+        self_shard: ShardId::new(SELF_SHARD),
+        routing_domain: RoutingDomainTag::new(DOMAIN),
+        redirect_handoff: HostXdpRedirectHandoff::UserspaceRedirector {
+            ifindex: NonZeroU32::new(hand_ifindex).expect("nonzero hand-off ifindex"),
+        },
+        attach_mode: HostXdpAttachMode::Generic,
+    };
+    drop(backend);
+
+    // The restarted process adopts the pins: owners are flushed and the
+    // persisted fence is honored, so the crashed process's stale entry can
+    // never produce a LOCAL verdict.
+    let restarted = HostXdpSteeringBackend::new(provision.pub_main.clone(), config_template);
+    runtime
+        .block_on(restarted.attach())
+        .expect("re-attach after crash");
+    assert_eq!(
+        runtime
+            .block_on(restarted.owner_record(&crash_key))
+            .expect("readback"),
+        None,
+        "adopted pins must not carry the crashed process's owners"
+    );
+    let fence_regression = runtime.block_on(restarted.advance_fence(6));
+    assert!(
+        matches!(
+            fence_regression,
+            Err(opc_ipsec_lb::IpsecLbError::OwnershipConflict { .. })
+        ),
+        "the persisted fence must survive the restart"
+    );
+    send_udp(
+        &sender,
+        4500,
+        &esp_packet(SPI_CRASH_ESP_UDP, 1, &[0x5b; 24]),
+    );
+    std::thread::sleep(Duration::from_millis(200));
+    let udp4500_restart = drain_udp(&natt4500);
+    assert!(
+        udp4500_restart
+            .iter()
+            .any(|payload| payload.starts_with(&SPI_CRASH_ESP_UDP.to_be_bytes())),
+        "re-attached datapath must fail closed to the slow path"
+    );
+    let after_restart = runtime.block_on(restarted.counters()).expect("counters");
+    assert_eq!(
+        after_restart.local, before_crash.local,
+        "the crashed process's entry must never produce a LOCAL verdict"
+    );
+    assert_eq!(
+        after_restart.miss,
+        before_crash.miss + 1,
+        "flushed owners verdict as map miss (slow path)"
+    );
+
+    runtime.block_on(restarted.detach()).expect("detach");
 }
