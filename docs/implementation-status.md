@@ -432,6 +432,47 @@ qualification remain product and deployment responsibilities.
 
 ---
 
+## Current typed GTP-U control-codec foundation — 2026-07-19
+
+`opc-proto-gtpu` now models the TS 29.281 Release 18 codec boundary for Echo
+Request/Response, Recovery, Error Indication, Supported Extension Headers
+Notification, and End Marker. The typed decoder enforces message flags and
+TEIDs, mandatory/singleton IE cardinality, ascending IE order, exact fixed and
+TLV lengths, IPv4/IPv6 peer-address widths, unique supported-header lists
+(including the specification-permitted empty list), and configured message/IE
+limits. Recovery and receiver-ignored
+sequence values are not promoted into application state; canonical Echo
+Response always emits `Recovery=0`. Unknown TLVs follow the shared
+preserve/drop/reject policy, while unknown TV IEs fail closed because there is
+no safe length boundary. TEIDs, peer addresses, private/unknown values, and raw
+extension data are redacted from typed diagnostics.
+
+Extension-header types expose all four endpoint/intermediate comprehension
+classes. Unsupported endpoint-required types produce a typed, value-free
+failure that a downstream bounded notification planner can consume; optional
+unknown types remain structurally skippable and raw-preserved. Standardized
+G-PDU-only types are rejected as procedure-inapplicable even when their
+comprehension bits are optional. The Error Indication model also covers its
+optional four-octet UDP Port extension. The shared PDU Session Container model
+is explicitly the QFI/PPI/RQI base subset and rejects reserved PDU types or
+presence flags requiring unmodelled conditional fields. Its public encoding and
+typed builders also reject oversized or direction-incompatible caller models;
+semantic decode failures retain a stable reason and offending extension offset.
+Adding an applicable UDP Port or PDU container preserves unrelated optional
+unknown headers from a decoded chain. Typed End Marker canonical encoding
+rebuilds its PDU Session Container from the typed value, clears permitted spare
+bits, and places it first while retaining unrelated optional unknown headers in
+relative order; generic raw-preserving encoding remains byte-exact. Tunnel
+Status remains outside this codec slice.
+
+This is only the codec slice of #341. Backend-neutral control datagram
+receive/send ports, local/remote tuple metadata, Linux/eBPF integration,
+admission and amplification limits, live unknown-TEID response behavior, End
+Marker ordering, and cross-backend tests remain open. This section therefore
+does not close #341 or make a production dataplane claim.
+
+---
+
 ## Current conflict-safe GTP-U reconciliation foundation — 2026-07-18
 
 `opc-gtpu-dataplane` now exposes an additive backend-neutral PDP-context

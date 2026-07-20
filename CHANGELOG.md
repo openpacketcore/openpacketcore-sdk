@@ -60,6 +60,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dump whose sequence, local netlink port ID, interface, clsact parent, and
   protocol match; overrun, malformed completion, or duplicate owner evidence
   remains indeterminate.
+- **Typed GTP-U control-procedure codec foundation — `opc-proto-gtpu`:** adds
+  strict typed Echo Request/Response, canonical receiver-ignored `Recovery=0`,
+  Error Indication with IPv4/IPv6 peer address and optional UDP Port extension,
+  Supported Extension Headers Notification, End Marker, Recovery Time Stamp,
+  repeatable Private Extension, and bounded unknown-TLV handling. Extension
+  types now expose TS 29.281 endpoint/intermediate comprehension semantics;
+  unsupported comprehension-required headers fail with stable value-free
+  diagnostics while optional unknown headers remain skippable/raw-preserved.
+  Standardized but procedure-inapplicable extension types are rejected
+  separately, the supported-header list permits the specification-defined zero
+  count, and the PDU Session Container QFI/PPI/RQI subset rejects reserved
+  types and unmodelled conditional-field flags instead of partially decoding.
+  Its validated DL/UL constructors and now-fallible `encode` reject reserved
+  types, oversized QFI/PPI, and direction-incompatible fields rather than
+  masking or discarding them. Control diagnostics retain typed PDU reasons and
+  the offending extension offset; decoded optional unknown extensions survive
+  UDP Port/PDU Session Container mutation. Typed End Marker canonical encoding
+  rebuilds the container from its semantic value, clears receiver-ignored spare
+  bits, and puts it first while preserving every unrelated optional unknown
+  header in relative order; generic raw-preserving encoding remains byte-exact.
+  Control encoding preflights bounded IE count and exact final wire capacity
+  before serializing payload bytes; canonical Recovery Time Stamp builders can
+  no longer emit arbitrary extension data.
+  TEID, address, private value, and raw packet data remain absent from typed
+  `Debug` and errors. This is the codec-only first slice of #341: backend-
+  neutral datagram ports, Linux/eBPF integration, responder/rate policy, and
+  live parity evidence remain open and no production qualification is claimed.
+  Migration: inactive `GtpuHeader::next_ext_type` is now `None`; use
+  `raw_next_ext_type` for the receiver-ignored octet. Callers must handle the
+  `Result` from `PduSessionContainer::encode` and
+  `GtpuErrorIndication::with_triggering_udp_source_port`. Exhaustive public
+  error matches must include the new reason-bearing PDU/extension-chain and
+  duplicate-container variants. Typed End Marker callers that previously
+  expected accepted non-canonical PDU Session Container bytes or extension
+  placement to survive `to_bytes` must use the generic raw-preserving boundary
+  for byte-exact forwarding.
 - **Validated-provider capability seam — `opc-crypto-provider`:** a new
   standalone crate defining the capability-reporting and key-custody boundary
   requested by #334 (slice 1 of 5). `CryptoCapability` enumerates the

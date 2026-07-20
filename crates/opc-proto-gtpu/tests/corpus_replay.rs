@@ -11,13 +11,27 @@
 //! round-trip invariant, on a known input, this test fails and names it.
 
 use bytes::BytesMut;
-use opc_proto_gtpu::GtpuMessage;
+use opc_proto_gtpu::{GtpuControlCodecErrorCode, GtpuControlMessage, GtpuMessage};
 use opc_protocol::{BorrowDecode, DecodeContext, Encode, EncodeContext, ValidationLevel};
 
 /// Every decode entry point and round-trip invariant the fuzz targets
 /// exercise. Must never panic and never violate a round-trip invariant,
 /// regardless of input. Decode returning `Err` is expected and fine.
 fn exercise(data: &[u8]) {
+    if let Ok((_, control)) = GtpuControlMessage::decode(data, DecodeContext::default()) {
+        let encode_context = EncodeContext::default();
+        if let Ok(canonical) = control.to_bytes(encode_context) {
+            if let Ok((tail, reparsed)) =
+                GtpuControlMessage::decode(&canonical, DecodeContext::default())
+            {
+                assert!(tail.is_empty());
+                if let Ok(second) = reparsed.to_bytes(encode_context) {
+                    assert_eq!(canonical, second);
+                }
+            }
+        }
+    }
+
     // Decode at every validation level.
     let _ = GtpuMessage::decode(data, DecodeContext::default());
 
@@ -87,6 +101,37 @@ fn exercise(data: &[u8]) {
     }
 }
 
+fn decode_hex_seed(input: &[u8]) -> Option<Vec<u8>> {
+    let encoded = input.strip_prefix(b"hex:")?;
+    let mut decoded = Vec::with_capacity(encoded.len() / 2);
+    let mut high = None;
+    for byte in encoded.iter().copied() {
+        if byte.is_ascii_whitespace() {
+            continue;
+        }
+        let nibble = match byte {
+            b'0'..=b'9' => byte - b'0',
+            b'a'..=b'f' => byte - b'a' + 10,
+            b'A'..=b'F' => byte - b'A' + 10,
+            _ => return None,
+        };
+        if let Some(upper) = high.take() {
+            decoded.push((upper << 4) | nibble);
+        } else {
+            high = Some(nibble);
+        }
+    }
+    if high.is_some() {
+        None
+    } else {
+        Some(decoded)
+    }
+}
+
+fn corpus_seed(input: &[u8]) -> Vec<u8> {
+    decode_hex_seed(input).unwrap_or_else(|| input.to_vec())
+}
+
 // --- shared replay harness (kept self-contained per crate) ---------------
 
 /// Read every committed corpus file under `<crate>/fuzz/corpus`, recursively.
@@ -103,7 +148,7 @@ fn corpus_files() -> Vec<(std::path::PathBuf, Vec<u8>)> {
             if path.is_dir() {
                 stack.push(path);
             } else if let Ok(bytes) = std::fs::read(&path) {
-                out.push((path, bytes));
+                out.push((path, corpus_seed(&bytes)));
             }
         }
     }
@@ -126,6 +171,159 @@ fn adversarial_seeds() -> Vec<Vec<u8>> {
         (0..=255u8).collect(),
         vec![0x20, 0x01, 0xFF, 0xFF, 0x00, 0x00],
     ]
+}
+
+#[test]
+fn named_control_corpus_entries_are_valid_and_canonicalize() {
+    const CANONICAL_REQUEST: &[u8] = &[0x32, 0x01, 0, 4, 0, 0, 0, 0, 0x12, 0x34, 0, 0];
+    const CANONICAL_RESPONSE: &[u8] = &[0x32, 0x02, 0, 6, 0, 0, 0, 0, 0x12, 0x34, 0, 0, 14, 0];
+    const ERROR_INDICATION: &[u8] = &[
+        0x36, 0x1a, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0x40, 1, 0x08, 0x68, 0, 16, 0x11, 0x22, 0x33, 0x44,
+        133, 0, 4, 192, 0, 2, 10,
+    ];
+    const SUPPORTED_EXTENSIONS: &[u8] = &[
+        0x32, 0x1f, 0, 9, 0, 0, 0, 0, 0, 0, 0, 0, 141, 0, 2, 0x40, 0x85,
+    ];
+    const END_MARKER: &[u8] = &[
+        0x34, 0xfe, 0, 8, 0x11, 0x22, 0x33, 0x44, 0, 0, 0, 0x85, 1, 0, 9, 0,
+    ];
+    const END_MARKER_WITH_ORDERED_EXTENSIONS: &[u8] = &[
+        0x34, 0xfe, 0, 16, 0xde, 0xad, 0xbe, 0xef, 0, 0, 0, 0x85, 1, 0, 9, 0x07, 1, 0xaa, 0xbb,
+        0x06, 1, 0xcc, 0xdd, 0,
+    ];
+    const UNKNOWN_OPTIONAL: &[u8] = &[
+        0x36, 0x01, 0, 8, 0, 0, 0, 0, 0, 1, 0, 0x07, 1, 0xaa, 0xbb, 0,
+    ];
+    let seeds: [(&str, &[u8], &[u8]); 16] = [
+        (
+            "decode/control_echo_request",
+            include_bytes!("../fuzz/corpus/decode/control_echo_request"),
+            CANONICAL_REQUEST,
+        ),
+        (
+            "decode/control_echo_response",
+            include_bytes!("../fuzz/corpus/decode/control_echo_response"),
+            CANONICAL_RESPONSE,
+        ),
+        (
+            "roundtrip/control_echo_request",
+            include_bytes!("../fuzz/corpus/roundtrip/control_echo_request"),
+            CANONICAL_REQUEST,
+        ),
+        (
+            "roundtrip/control_echo_response",
+            include_bytes!("../fuzz/corpus/roundtrip/control_echo_response"),
+            CANONICAL_RESPONSE,
+        ),
+        (
+            "decode/control_error_indication",
+            include_bytes!("../fuzz/corpus/decode/control_error_indication"),
+            ERROR_INDICATION,
+        ),
+        (
+            "roundtrip/control_error_indication",
+            include_bytes!("../fuzz/corpus/roundtrip/control_error_indication"),
+            ERROR_INDICATION,
+        ),
+        (
+            "decode/control_supported_extensions",
+            include_bytes!("../fuzz/corpus/decode/control_supported_extensions"),
+            SUPPORTED_EXTENSIONS,
+        ),
+        (
+            "roundtrip/control_supported_extensions",
+            include_bytes!("../fuzz/corpus/roundtrip/control_supported_extensions"),
+            SUPPORTED_EXTENSIONS,
+        ),
+        (
+            "decode/control_end_marker_pdu_session",
+            include_bytes!("../fuzz/corpus/decode/control_end_marker_pdu_session"),
+            END_MARKER,
+        ),
+        (
+            "roundtrip/control_end_marker_pdu_session",
+            include_bytes!("../fuzz/corpus/roundtrip/control_end_marker_pdu_session"),
+            END_MARKER,
+        ),
+        (
+            "decode/control_end_marker_noncanonical_psc",
+            include_bytes!("../fuzz/corpus/decode/control_end_marker_noncanonical_psc"),
+            END_MARKER,
+        ),
+        (
+            "roundtrip/control_end_marker_noncanonical_psc",
+            include_bytes!("../fuzz/corpus/roundtrip/control_end_marker_noncanonical_psc"),
+            END_MARKER,
+        ),
+        (
+            "decode/control_end_marker_psc_order",
+            include_bytes!("../fuzz/corpus/decode/control_end_marker_psc_order"),
+            END_MARKER_WITH_ORDERED_EXTENSIONS,
+        ),
+        (
+            "roundtrip/control_end_marker_psc_order",
+            include_bytes!("../fuzz/corpus/roundtrip/control_end_marker_psc_order"),
+            END_MARKER_WITH_ORDERED_EXTENSIONS,
+        ),
+        (
+            "decode/control_unknown_optional_extension",
+            include_bytes!("../fuzz/corpus/decode/control_unknown_optional_extension"),
+            UNKNOWN_OPTIONAL,
+        ),
+        (
+            "roundtrip/control_unknown_optional_extension",
+            include_bytes!("../fuzz/corpus/roundtrip/control_unknown_optional_extension"),
+            UNKNOWN_OPTIONAL,
+        ),
+    ];
+
+    for (name, seed, expected) in seeds {
+        let seed = corpus_seed(seed);
+        let message = GtpuControlMessage::decode_datagram(&seed, DecodeContext::default())
+            .unwrap_or_else(|error| panic!("{name} must be a valid control datagram: {error:?}"));
+        let canonical = message
+            .to_bytes(EncodeContext::default())
+            .unwrap_or_else(|error| panic!("{name} canonical encode failed: {error:?}"));
+        assert_eq!(canonical.as_ref(), expected, "seed: {name}");
+    }
+}
+
+#[test]
+fn named_negative_control_corpus_entries_reach_the_expected_typed_failures() {
+    let seeds = [
+        (
+            "decode/control_malformed_tlv",
+            include_bytes!("../fuzz/corpus/decode/control_malformed_tlv").as_slice(),
+            GtpuControlCodecErrorCode::TruncatedIe,
+        ),
+        (
+            "roundtrip/control_malformed_tlv",
+            include_bytes!("../fuzz/corpus/roundtrip/control_malformed_tlv").as_slice(),
+            GtpuControlCodecErrorCode::TruncatedIe,
+        ),
+        (
+            "decode/control_unknown_required_extension",
+            include_bytes!("../fuzz/corpus/decode/control_unknown_required_extension").as_slice(),
+            GtpuControlCodecErrorCode::UnsupportedRequiredExtension {
+                extension_type: 0x87,
+            },
+        ),
+        (
+            "roundtrip/control_unknown_required_extension",
+            include_bytes!("../fuzz/corpus/roundtrip/control_unknown_required_extension")
+                .as_slice(),
+            GtpuControlCodecErrorCode::UnsupportedRequiredExtension {
+                extension_type: 0x87,
+            },
+        ),
+    ];
+
+    for (name, seed, expected) in seeds {
+        let seed = corpus_seed(seed);
+        let error = GtpuControlMessage::decode_datagram(&seed, DecodeContext::default())
+            .expect_err("negative corpus seed must remain rejected");
+        assert_eq!(error.code(), &expected, "seed: {name}");
+    }
 }
 
 #[test]

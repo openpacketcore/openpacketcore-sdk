@@ -1,11 +1,16 @@
 #![no_main]
 
+mod support;
+
 use bytes::BytesMut;
 use libfuzzer_sys::fuzz_target;
-use opc_proto_gtpu::GtpuMessage;
+use opc_proto_gtpu::{GtpuControlMessage, GtpuMessage};
 use opc_protocol::{BorrowDecode, DecodeContext, Encode, EncodeContext, ValidationLevel};
 
 fuzz_target!(|data: &[u8]| {
+    let decoded_seed = support::decode_hex_seed(data);
+    let data = decoded_seed.as_deref().unwrap_or(data);
+
     // 1. Raw-preserving roundtrip check:
     // Any successfully decoded GTP-U message must encode back to the exact same bytes in raw-preserving mode.
     let ctx = DecodeContext {
@@ -52,6 +57,23 @@ fuzz_target!(|data: &[u8]| {
                     canonical_buf_2.as_ref(),
                     "Canonical roundtrip failed: encode(decode(encode(model))) != encode(model)"
                 );
+            }
+        }
+    }
+
+    // Typed control messages canonicalize receiver-ignored fields. The
+    // received model may retain raw unknown-extension bytes, so canonical
+    // wire stability rather than raw model equality is the invariant.
+    if let Ok((_, message)) = GtpuControlMessage::decode(data, DecodeContext::default()) {
+        let encode_ctx = EncodeContext::default();
+        if let Ok(canonical) = message.to_bytes(encode_ctx) {
+            if let Ok((tail, reparsed)) =
+                GtpuControlMessage::decode(&canonical, DecodeContext::default())
+            {
+                assert!(tail.is_empty());
+                if let Ok(second) = reparsed.to_bytes(encode_ctx) {
+                    assert_eq!(canonical, second);
+                }
             }
         }
     }
