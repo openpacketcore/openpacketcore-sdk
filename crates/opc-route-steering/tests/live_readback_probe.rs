@@ -17,6 +17,12 @@ fn ip(args: &[&str]) {
     assert!(status.success(), "ip command failed");
 }
 
+fn ip_stdout(args: &[&str]) -> String {
+    let output = Command::new("ip").args(args).output().unwrap();
+    assert!(output.status.success(), "ip command failed");
+    String::from_utf8(output.stdout).unwrap()
+}
+
 #[tokio::test]
 async fn live_absent_documentation_prefix_readback_completes() {
     let backend = LinuxRouteSteeringBackend::new();
@@ -54,10 +60,20 @@ async fn live_default_route_readback_is_table_scoped_and_same_table_fail_closed(
     const OWNED_TABLE: u32 = 4_000_000_420;
     const FOREIGN_TABLE: u32 = 4_000_000_421;
 
+    ip(&["link", "add", "up420", "type", "dummy"]);
+    ip(&["link", "set", "up420", "up"]);
+    let ifindex = ip_stdout(&["-o", "link", "show", "dev", "up420"])
+        .split_once(':')
+        .unwrap()
+        .0
+        .trim()
+        .parse::<u32>()
+        .unwrap();
+
     let backend = LinuxRouteSteeringBackend::new();
     let route = RouteRequest {
         destination: IpPrefix::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
-        oif_ifindex: 1,
+        oif_ifindex: ifindex,
         table: OWNED_TABLE,
         priority: None,
     };
@@ -138,6 +154,7 @@ async fn live_default_route_readback_is_table_scoped_and_same_table_fail_closed(
         "metric",
         "42760",
     ]);
+    ip(&["link", "del", "up420"]);
 }
 
 #[tokio::test]

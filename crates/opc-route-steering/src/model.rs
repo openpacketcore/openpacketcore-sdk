@@ -155,6 +155,10 @@ pub struct RouteMismatch {
     /// The output interface differs.
     pub output_interface: bool,
     /// The route table differs.
+    ///
+    /// The built-in Linux and mock adapters include the table in their route
+    /// collision key, so this remains false for their conflicts. External
+    /// adapters with a broader collision key may use this field.
     pub table: bool,
     /// The optional route metric/priority differs.
     pub priority: bool,
@@ -162,7 +166,11 @@ pub struct RouteMismatch {
     pub kernel_semantics: bool,
 }
 
-/// Bounded evidence for resident routes sharing the requested destination key.
+/// Bounded evidence for resident routes sharing the requested route key.
+///
+/// The built-in Linux and mock adapters key routes by address family,
+/// canonical destination prefix, and table. External adapters may use a
+/// broader key and report a table difference through [`RouteMismatch::table`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouteConflict {
     resident: RouteRequest,
@@ -269,11 +277,14 @@ impl RuleConflict {
     }
 }
 
-/// Typed result of reading back a route's logical destination key.
+/// Typed result of reading back a route's logical key.
+///
+/// The built-in Linux and mock adapters key routes by address family,
+/// canonical destination prefix, and table.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RouteReadback {
-    /// No resident route shares the requested destination key.
+    /// No resident route shares the requested route key.
     Absent,
     /// Exactly one fully representable resident route matches every field.
     ExactPresent,
