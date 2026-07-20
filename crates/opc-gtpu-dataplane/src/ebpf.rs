@@ -8295,12 +8295,16 @@ mod aya_runtime {
         Ok(false)
     }
 
-    /// Map aya program errors to redaction-safe I/O errors. Only the
-    /// operation label and any raw OS error survive; aya's error strings
-    /// (which can embed interface names and paths) are dropped.
+    /// Map aya program errors to redaction-safe errors. Program-load
+    /// rejections retain a typed failure class, while verifier output and aya
+    /// error strings (which can embed implementation details, interface
+    /// names, and paths) are dropped.
     fn program_error(operation: &'static str, error: &ProgramError) -> GtpuError {
         match error {
             ProgramError::AlreadyAttached => GtpuError::AlreadyExists,
+            ProgramError::LoadError { io_error, .. } => {
+                GtpuError::program_load_rejected(operation, io_error)
+            }
             ProgramError::SyscallError(error) => GtpuError::io(
                 operation,
                 io::Error::new(error.io_error.kind(), "ebpf syscall failed"),

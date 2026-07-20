@@ -70,10 +70,11 @@ Its values are aggregate and contain no rejected endpoint or session fields.
   bindings fail closed before inner packet delivery. The userspace schema
   exposes IPv4/IPv6 semantics, but this object deliberately rejects a stored
   IPv6 binding as a family mismatch.
-- The downlink envelope path uses a 256-byte bounded checksum callback. The
+- The downlink envelope path uses a 192-byte bounded checksum callback. The
   endpoint/owner authorization and decapsulation phase is a separate BPF
   subprogram so the verified call chains remain below Linux's 512-byte stack
-  limit without weakening either boundary.
+  limit, including Linux 6.8, without weakening either boundary or reducing
+  checksum coverage.
 - The S2b-U boundary owns the complete 32-bit packet mark; masked sharing is
   unsupported. The userspace crate remains safe Rust. Aya exposes a safe mark
   setter but no getter, so the verifier-bound program uses one isolated,
