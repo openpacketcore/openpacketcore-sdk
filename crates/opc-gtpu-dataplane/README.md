@@ -357,8 +357,8 @@ that constructs `GtpuProbe` literals must initialize `per_bearer_marking`,
 `downlink_endpoint_binding`, and `uplink_source_port_selection`. Consumers must
 gate `bearer_mark: Some(_)` on
 `GtpuProbe::per_bearer_marking == GtpuCapability::Available`; it becomes
-available only after both exact live tc programs and every exact v3 map pin
-have been verified. The mainline Linux `gtp`, mock, and unsupported backends
+available only after both exact live tc programs and every exact schema map
+pin have been verified. The mainline Linux `gtp`, mock, and unsupported backends
 report `Missing` and reject marked requests. This API requires no Cargo feature
 and introduces no dependency.
 
@@ -412,7 +412,7 @@ returns `StateIndeterminate` before any cross-map query or mutation.
 `GtpuProbe::downlink_endpoint_binding` report `Unknown` while a capable
 environment awaits its first device attach. DSCP becomes `Available` only when
 the exact uplink path is live; per-bearer marking requires both exact programs
-and all exact v3 map pins; endpoint binding additionally verifies the exact
+and all exact schema map pins; endpoint binding additionally verifies the exact
 downlink attachment plus its binding and fixed counter maps. Runtime program or
 map identity loss reports `Missing` and blocks new state publication, while
 identity-safe cleanup remains available under the rule above.
@@ -446,6 +446,19 @@ installing a non-legacy policy; the capability follows the same
 backends report `Missing` and reject a non-legacy policy with
 `UnsupportedFeature`, preserving their exact established behavior for the
 explicit legacy policy.
+
+One limitation is deliberate: unlike DSCP, the selected port is not embedded
+in the 64-byte marked-bearer owner journal, whose wire layout is frozen. A
+marked-sport entry lost individually (not with its map pin, which the v4
+schema marker proves) is therefore adopted silently and the bearer falls back
+to the spec-compliant legacy 2152 source port until PDP read-back reports the
+drift as an `UplinkSourcePortPolicy` mismatch. This fail-open direction is
+toward the standards-compliant legacy port only — never toward an arbitrary
+or zero port — and matches the default-bearer DSCP posture, where an orphan
+entry is likewise reconciled rather than journal-covered. The exclusive-writer
+boundary documented above remains the integrity boundary for all map state;
+extending the journal to cover the port would be an incompatible map-value
+change and is intentionally out of scope.
 
 ### Pinned-map and live-program migration
 

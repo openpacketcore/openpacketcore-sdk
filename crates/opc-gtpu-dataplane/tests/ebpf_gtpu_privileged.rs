@@ -77,11 +77,11 @@ use opc_gtpu_ebpf_common::{
     GTPU_MANDATORY_HDR_LEN, IPV4_MIN_HDR_LEN, MAP_CONFIG, MAP_COUNTERS,
     MAP_DOWNLINK_BINDING_COUNTERS, MAP_DOWNLINK_ENDPOINT_BINDING, MAP_DOWNLINK_MARK_PDR,
     MAP_DOWNLINK_PDR, MAP_MARKED_BEARER_OWNER, MAP_UPLINK_DSCP, MAP_UPLINK_FAR,
-    MAP_UPLINK_MARK_DSCP, MAP_UPLINK_MARK_FAR, MARKED_BEARER_OWNER_VALUE_LEN,
-    MARKED_DOWNLINK_PDR_VALUE_LEN, PROG_DOWNLINK, PROG_UPLINK, UDP_HDR_LEN,
-    UPLINK_BEARER_SCHEMA_MARKER_VALUE, UPLINK_DSCP_SCHEMA_MARKER_KEY,
-    UPLINK_DSCP_SCHEMA_MARKER_VALUE, UPLINK_DSCP_VALUE_LEN, UPLINK_FAR_VALUE_LEN,
-    UPLINK_MARK_KEY_LEN,
+    MAP_UPLINK_MARK_DSCP, MAP_UPLINK_MARK_FAR, MAP_UPLINK_MARK_SOURCE_PORT,
+    MAP_UPLINK_SOURCE_PORT, MARKED_BEARER_OWNER_VALUE_LEN, MARKED_DOWNLINK_PDR_VALUE_LEN,
+    PROG_DOWNLINK, PROG_UPLINK, UDP_HDR_LEN, UPLINK_BEARER_SCHEMA_MARKER_VALUE,
+    UPLINK_DSCP_SCHEMA_MARKER_KEY, UPLINK_DSCP_SCHEMA_MARKER_VALUE, UPLINK_DSCP_VALUE_LEN,
+    UPLINK_FAR_VALUE_LEN, UPLINK_MARK_KEY_LEN, UPLINK_SOURCE_PORT_VALUE_LEN,
 };
 use opc_ipsec_xfrm::{
     Algorithm, AuthAlgorithm, InstallPolicyRequest, InstallSaRequest, IpAddress, KeyMaterial,
@@ -2155,6 +2155,22 @@ fn take_marked_far(pin_dir: &std::path::Path, mark: u32) -> [u8; UPLINK_FAR_VALU
     value
 }
 
+fn replace_pinned_source_port(
+    pin_dir: &std::path::Path,
+    value: [u8; UPLINK_SOURCE_PORT_VALUE_LEN],
+) {
+    let map = Map::from_map_data(
+        MapData::from_pin(pin_dir.join(MAP_UPLINK_SOURCE_PORT))
+            .expect("open pinned source-port map"),
+    )
+    .expect("identify pinned source-port map");
+    let mut ports = BpfHashMap::<_, [u8; 4], [u8; UPLINK_SOURCE_PORT_VALUE_LEN]>::try_from(map)
+        .expect("typed pinned source-port map");
+    ports
+        .insert(UE_PAA.octets(), value, 0)
+        .expect("replace pinned source-port entry");
+}
+
 fn tc_program_id(direction: &str) -> u32 {
     let filters = tc_filters(direction);
     let fields: Vec<_> = filters.split_whitespace().collect();
@@ -2256,6 +2272,8 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
                 MAP_UPLINK_MARK_FAR,
                 MAP_UPLINK_DSCP,
                 MAP_UPLINK_MARK_DSCP,
+                MAP_UPLINK_SOURCE_PORT,
+                MAP_UPLINK_MARK_SOURCE_PORT,
                 MAP_MARKED_BEARER_OWNER,
                 MAP_COUNTERS,
                 MAP_CONFIG,
@@ -3531,6 +3549,94 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
         !dscp_pin.exists(),
         "failed adoption must not recreate the missing DSCP pin"
     );
+
+    drop(net);
+    Ok(())
+}
+
+const SELECTED_SOURCE_PORT: u16 = 40_000;
+
+#[tokio::test]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn ebpf_gtpu_uplink_selected_source_port_on_the_wire(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref() != Ok("1") {
+        eprintln!("skipping: set OPC_GTPU_RUN_PRIVILEGED=1 inside a fresh privileged netns");
+        return Ok(());
+    }
+
+    let net = TestNet::provision();
+    let backend = EbpfGtpuDataplaneBackend::with_config(EbpfGtpuDataplaneBackendConfig {
+        bpffs_pin_root: net.pin_root.clone(),
+        ..EbpfGtpuDataplaneBackendConfig::default()
+    });
+    let mut request = CreateGtpDeviceRequest::new("s2bu");
+    request.bind_address = IpAddr::V4(EPDG_S2BU_IP);
+    let device = backend.create_device(request).await?;
+    let pin_dir = net.pin_root.join("s2bu");
+    assert_eq!(
+        backend.probe().await?.uplink_source_port_selection,
+        GtpuCapability::Available,
+        "loaded datapath must expose usable source-port maps"
+    );
+
+    let mut selected = session_context(device.ifindex);
+    selected.uplink_source_port_policy =
+        GtpuUplinkSourcePortPolicy::selected(SELECTED_SOURCE_PORT).expect("nonzero selected port");
+    backend.install_pdp_context(selected.clone()).await?;
+
+    // This socket is bound to the fixed TS 29.281 destination service port;
+    // receiving here at all proves the destination stayed 2152.
+    let pgw_socket = in_netns(&net.pgw_ns, || {
+        UdpSocket::bind((PGW_IP, GTPU_PORT)).expect("bind PGW GTP-U socket")
+    });
+    let ue_socket = in_netns(&net.ue_ns, || {
+        UdpSocket::bind((UE_PAA, 5000)).expect("bind UE socket")
+    });
+
+    let mut buffer = [0_u8; 2048];
+    let (len, from) = send_until_received(
+        || {
+            let _ = ue_socket.send_to(b"opc-uplink-sport", (REMOTE_HOST, 53));
+        },
+        &pgw_socket,
+        &mut buffer,
+    )
+    .expect("selected-source-port uplink G-PDU must reach the PGW");
+    assert_eq!(
+        from,
+        SocketAddr::from((EPDG_S2BU_IP, SELECTED_SOURCE_PORT)),
+        "outer UDP source must be the selected per-context port"
+    );
+    assert!(buffer[..len].ends_with(b"opc-uplink-sport"));
+
+    // A persisted zero port is corrupt adopted state: the tc program must
+    // drop fail closed rather than emit port zero or silently fall back to
+    // the legacy 2152 source port.
+    replace_pinned_source_port(&pin_dir, [0; 2]);
+    let encap_before = pinned_counter(&pin_dir, COUNTER_UL_ENCAP);
+    for _ in 0..3 {
+        let _ = ue_socket.send_to(b"opc-uplink-dropped", (REMOTE_HOST, 53));
+    }
+    expect_no_datagram(&pgw_socket);
+    assert_eq!(
+        pinned_counter(&pin_dir, COUNTER_UL_ENCAP),
+        encap_before,
+        "a zero source-port entry must drop before encapsulation accounting"
+    );
+
+    // Exact reconciliation through the backend restores the selected port.
+    backend.install_pdp_context(selected).await?;
+    let (len, from) = send_until_received(
+        || {
+            let _ = ue_socket.send_to(b"opc-uplink-sport-restored", (REMOTE_HOST, 53));
+        },
+        &pgw_socket,
+        &mut buffer,
+    )
+    .expect("reconciled uplink G-PDU must reach the PGW again");
+    assert_eq!(from, SocketAddr::from((EPDG_S2BU_IP, SELECTED_SOURCE_PORT)));
+    assert!(buffer[..len].ends_with(b"opc-uplink-sport-restored"));
 
     drop(net);
     Ok(())
