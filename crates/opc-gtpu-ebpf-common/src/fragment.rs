@@ -51,9 +51,10 @@ pub enum GtpuDownlinkFragmentContract {
 /// Reassembly is performed by the kernel, so these bounds describe the
 /// configured `ipfrag` limits the backend relies on: the maximum bytes held
 /// across all in-flight reassembly contexts and the maximum time an
-/// incomplete fragment set is retained before eviction. Every incomplete,
-/// duplicated, overlapping, or timed-out fragment set is dropped by the
-/// kernel inside these bounds and never reaches the SDK consumer.
+/// incomplete fragment set is retained before eviction. Reordered and
+/// duplicate fragments consume only the kernel's bounded queue; their exact
+/// acceptance policy is kernel-version dependent. Incomplete sets are evicted
+/// within the timeout and never reach the SDK consumer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct GtpuReassemblyBounds {
     /// Maximum total bytes held by in-flight fragment reassembly.
@@ -96,12 +97,24 @@ pub enum GtpuTpduError {
 }
 
 /// One validated G-PDU T-PDU view over a complete reassembled GTP-U message.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Debug` exposes only the payload length; TEIDs and payload bytes are
+/// forwarding identifiers/subscriber traffic and remain redacted.
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct GtpuTpdu<'a> {
     /// TEID exactly as on the wire, network order.
     pub teid: [u8; 4],
     /// The T-PDU (inner packet) bytes.
     pub payload: &'a [u8],
+}
+
+impl core::fmt::Debug for GtpuTpdu<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("GtpuTpdu")
+            .field("teid", &"<redacted>")
+            .field("payload_len", &self.payload.len())
+            .finish()
+    }
 }
 
 /// Parse one complete reassembled GTP-U message (the UDP payload delivered to
@@ -124,21 +137,22 @@ pub fn parse_gtpu_tpdu(message: &[u8]) -> Result<Option<GtpuTpdu<'_>>, GtpuTpduE
     let header: [u8; GTPU_MANDATORY_HDR_LEN] = message[..GTPU_MANDATORY_HDR_LEN]
         .try_into()
         .map_err(|_| GtpuTpduError::TruncatedHeader)?;
-    let (teid, declared_length, has_opt, has_ext) = match classify_gtpu(&header) {
-        GtpuClass::NotGtpV1 | GtpuClass::NotGpdu => return Ok(None),
-        GtpuClass::Gpdu {
-            teid,
-            length,
-            has_opt,
-            has_ext,
-        } => (teid, length, has_opt, has_ext),
-    };
+    let declared_length = u16::from_be_bytes([header[2], header[3]]);
     let gtp_end = GTPU_MANDATORY_HDR_LEN
         .checked_add(usize::from(declared_length))
         .ok_or(GtpuTpduError::InconsistentLength)?;
     if gtp_end != message.len() {
         return Err(GtpuTpduError::InconsistentLength);
     }
+    let (teid, has_opt, has_ext) = match classify_gtpu(&header) {
+        GtpuClass::NotGtpV1 | GtpuClass::NotGpdu => return Ok(None),
+        GtpuClass::Gpdu {
+            teid,
+            has_opt,
+            has_ext,
+            ..
+        } => (teid, has_opt, has_ext),
+    };
 
     let mut payload_offset = GTPU_MANDATORY_HDR_LEN;
     if has_opt {
@@ -230,6 +244,35 @@ mod tests {
         assert_eq!(parse_gtpu_tpdu(&v2), Ok(None));
         v2[0] = 0x20; // PT clear (GTP').
         assert_eq!(parse_gtpu_tpdu(&v2), Ok(None));
+    }
+
+    #[test]
+    fn control_plane_classification_still_requires_an_exact_declared_envelope() {
+        let mut echo = gpdu([0; 4], 0x32, &[0; 4]);
+        echo[1] = 0x01;
+        echo[2..4].copy_from_slice(&u16::MAX.to_be_bytes());
+        assert_eq!(
+            parse_gtpu_tpdu(&echo),
+            Err(GtpuTpduError::InconsistentLength)
+        );
+
+        let mut non_v1 = gpdu([0; 4], 0x48, &inner());
+        non_v1[2..4].copy_from_slice(&0_u16.to_be_bytes());
+        assert_eq!(
+            parse_gtpu_tpdu(&non_v1),
+            Err(GtpuTpduError::InconsistentLength)
+        );
+    }
+
+    #[test]
+    fn tpdu_debug_redacts_forwarding_identity_and_payload() {
+        let message = gpdu([0x10, 0x20, 0x30, 0x40], 0x30, &inner());
+        let tpdu = parse_gtpu_tpdu(&message).unwrap().unwrap();
+        let debug = std::format!("{tpdu:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(debug.contains("payload_len"));
+        assert!(!debug.contains("16, 32, 48, 64"));
+        assert!(!debug.contains("10, 45"));
     }
 
     #[test]

@@ -498,15 +498,11 @@ program itself:
 - `Emit` within the effective MTU, with the remaining headroom; under the
   default `SignalPacketTooBig` policy the outer DF bit is stamped and the
   outer checksum refreshed.
-- `EmitOuterFragmented` when the policy permits downstream outer
-  fragmentation: the packet is emitted with DF clear and the bounded excess
-  is reported. Note exactly what this means on the eBPF backend: the tc
-  egress transmits via `bpf_redirect_neigh`, which bypasses the kernel's
-  `ip_fragment` path, so **the ePDG never fragments the outer packet
-  itself** — the oversized frame leaves whole. The policy is safe only when
-  the configured effective MTU is below the egress device's real MTU *and* a
-  fragmenting hop exists downstream; otherwise oversized frames risk silent
-  drops by drivers or MRU-limited receivers.
+- `RequiresOuterFragmentation` when a host caller selects
+  `RequireOuterFragmentation`: the typed action contains the unfragmented
+  header and bounded excess, but does not claim that the oversized packet was
+  emitted. The caller must fragment the complete outer IPv4 packet before
+  transmission.
 - `RejectTooBig` otherwise: a fail-closed, counted drop. On the eBPF tc
   backend this is *silent* toward the inner source — the kernel datapath
   emits no ICMP — so operators must size the inner MTU out of band (for
@@ -517,7 +513,11 @@ program itself:
   unencapsulated and, under the strict policy, the encapsulation never
   exceeds the effective MTU.
 
-The eBPF backend persists the policy in the additive single-slot
+The eBPF backend rejects `RequireOuterFragmentation`: tc egress transmits via
+`bpf_redirect_neigh`, which bypasses the kernel's `ip_fragment` path, so it
+cannot execute that host action. Consequently, eBPF never emits a packet over
+the configured effective MTU. It persists an executable strict policy in the
+additive single-slot
 `GTPU_PMTU_CFG` map at device creation (only when `Some` is requested) and
 rejects a configured policy when the loaded datapath cannot honor it.
 `set_uplink_mtu_policy(device, policy)` is the supported mutation for a live
@@ -546,54 +546,77 @@ operator runs an SDK consumer on that socket: without one, the kernel
 answers each fragment set with ICMP port unreachable toward the PGW and the
 packet is lost.
 
+The Linux `gtp` backend reports this contract as `Unsupported`: discovering
+the generic-netlink family proves that the driver is present, but does not
+prove that fragmented outer packets re-enter its UDP consumer exactly once.
+That backend must remain fail closed until an equivalent live Linux-`gtp`
+proof is part of its capability probe.
+
 `GtpuReassemblyConsumer` is that consumer. It mirrors the tc fast path's
 PDR resolution (including dual-map-TEID and reserved-zero-mark corruption,
 which fail closed as malformed), canonical endpoint-binding validation,
-marked-bearer owner-journal authorization (so install, relocation, and
-removal windows cannot deliver through the socket what tc would drop), and
+complete commit-authorized PDP graph validation for default and marked
+bearers (one typed selector derived from the current PDR keys the FAR, DSCP,
+marked-owner, and commit reads; component state is read before the
+authoritative `Active` commit is observed last, so old-selector/new-PDR mixes
+and install, relocation, or removal windows cannot deliver through the socket
+what tc would drop), and
 inner-family/destination checks, returning the decapsulated inner packet
 with its output bearer mark at most once per reassembled datagram.
 Provenance comes from the kernel, not configuration:
-`recv_reassembled_gtpu` extracts the peer, source port, and local
-destination via `IP_PKTINFO`; the ingress ifindex is the managed interface's
-(the kernel value for reassembled datagrams is kernel-version-dependent, so
-delivery is scoped to the interface by the concrete-address bind and any
-nonzero kernel ifindex is cross-checked). Documented divergences from the tc path: checksum
-verification is the kernel's (socket delivery implies acceptance), and
+`GtpuReassemblySocket::bind` derives the positive ifindex from an interface
+name, applies `SO_BINDTODEVICE` before binding the concrete IPv4 S2b-U address
+on UDP/2152, enables `IP_PKTINFO`, and verifies exact kernel readback. It
+requires the applicable Linux capability (normally `CAP_NET_RAW`) in the
+network namespace. Each receive checks the sealed device/address identity
+both before and after blocking. A positive packet-info ifindex must match; a
+zero ifindex, which some kernels report after reassembly, is accepted only
+through that kernel-enforced sealed socket identity. Truncated payload/control
+envelopes fail closed before provenance is returned, and no API can wrap an
+ordinary unbound socket as authoritative. Documented divergences from the tc
+path: checksum verification is the kernel's (socket delivery implies
+acceptance), and
 envelope padding strictness differs — tc requires `udp_end == ip_end` and
 drops padded envelopes, while the kernel strips layer-2 padding before
 socket delivery, so a padded envelope tc would drop unfragmented is accepted
 after reassembly. Malformed, unknown-TEID, binding-mismatch,
-destination-mismatch, and oversized inputs fail closed into bounded typed
+destination-mismatch, and oversized inputs fail closed into fixed-cardinality typed
 counters; non-G-PDU GTP-U is handed to the control plane. The SDK never
 holds a userspace fragment cache, so reordered, duplicated, overlapping,
-incomplete, and timed-out fragment sets are bounded by the kernel's
-configured limits and can never produce a duplicate delivery.
+incomplete, and timed-out fragment sets remain bounded by the kernel's
+configured limits. Duplicate-fragment handling is kernel-version-dependent;
+applications receive only complete UDP datagrams and the SDK processes each
+socket delivery once.
 
 The consumer's counters are userspace-side and deliberately *not* part of
 the identity-bound `datapath_snapshot` (which aggregates only the tc
-datapath's per-CPU maps); monitor both. Socket lifecycle guidance for the
-embedding ePDG: size `SO_RCVBUF` for the expected reassembled burst (kernel
+datapath's per-CPU maps); monitor both. On Linux,
+`read_linux_ipv4_reassembly_stats` provides a bounded, strictly parsed
+`/proc/net/snmp` snapshot of received fragments, successful reassemblies,
+timeouts, and aggregate failures. Linux does not split conflicting overlap
+from resource-pressure and other `ReasmFails`, so the API does not invent
+per-cause counters. Socket lifecycle guidance for the
+embedding ePDG: use `GtpuReassemblySocket::set_receive_buffer_size` and retain
+its effective `SO_RCVBUF` readback for the expected reassembled burst (kernel
 UDP buffer overruns drop silently and are not visible in the consumer
 counters), and shut down in reverse order — detach the tc datapath before
 closing the consumer socket — because fragments arriving after the socket
-closes are answered with ICMP port unreachable toward the PGW. The Linux
-`gtp` backend reports the same handoff — the kernel gtp driver is itself
-the post-reassembly UDP consumer — while the mock and unsupported backends
-report `Unsupported`.
+closes are answered with ICMP port unreachable toward the PGW. Linux `gtp`,
+mock, and unsupported backends report `Unsupported`.
 
 The privileged suite proves the contract end-to-end: a valid two-fragment
 G-PDU, a reordered set, and a set with a duplicated first fragment each
 re-enter the consumer exactly once and decapsulate to a byte-exact original
-inner packet against the pinned PDR/binding/owner state; a conflicting
-overlapping set never duplicates; an incomplete set never re-enters; a
-fragment set from an unauthorized outer peer is reassembled by the kernel
+inner packet against the pinned complete graph; a conflicting overlapping
+set is rejected on the qualified kernel; an incomplete set is evicted at the
+configured timeout and its late tail never re-enters; bounded fragment-memory
+pressure causes kernel reassembly failures rather than unbounded growth; and
+a fragment set from an unauthorized outer peer is reassembled by the kernel
 but rejected by the consumer's binding check. The uplink suite proves the
 strict policy drops an over-MTU encapsulation with only the reject counter
-moving, stamps DF on fitting packets, emits the same oversized packet whole
-with DF clear under the fragment-permitted policy (updated on the live
-device via `set_uplink_mtu_policy`), and routes corrupt policy bytes to the
-canary counter with indeterminate read-back.
+moving, stamps DF on fitting packets, rejects the host-only fragmentation
+policy without map drift, and routes corrupt policy bytes to the canary
+counter with indeterminate read-back.
 
 ### Pinned-map and live-program migration
 

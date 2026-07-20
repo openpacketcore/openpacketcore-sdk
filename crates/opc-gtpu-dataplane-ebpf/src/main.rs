@@ -50,9 +50,10 @@ use opc_gtpu_ebpf_common::{
     pdp_commit_wire_authorizes_downlink, pdp_commit_wire_authorizes_graph,
     uplink_non_encapsulation_drops,
     validate_ipv4_downlink_binding_wire, DownlinkBindingMismatch, DownlinkPdr, GtpuClass,
-    GtpuEnvelopeBounds, GtpuUplinkMtuPolicy, Ipv4EnvelopeBounds, MarkedDownlinkPdr,
-    UdpChecksumDisposition, UdpChecksumEvidence, UdpEnvelopeBounds, UplinkFar, UplinkFarKey,
-    UplinkMtuMapState, COUNTER_DL_BINDING_FAMILY_MISMATCH, COUNTER_DL_BINDING_INGRESS_MISMATCH,
+    GtpuEnvelopeBounds, GtpuOuterFragmentPolicy, GtpuUplinkMtuPolicy, Ipv4EnvelopeBounds,
+    MarkedDownlinkPdr, UdpChecksumDisposition, UdpChecksumEvidence, UdpEnvelopeBounds, UplinkFar,
+    UplinkFarKey, UplinkMtuMapState, COUNTER_DL_BINDING_FAMILY_MISMATCH,
+    COUNTER_DL_BINDING_INGRESS_MISMATCH,
     COUNTER_DL_BINDING_INVALID, COUNTER_DL_BINDING_LOCAL_MISMATCH,
     COUNTER_DL_BINDING_PEER_MISMATCH, COUNTER_DL_BINDING_SOURCE_PORT_MISMATCH, COUNTER_DL_DECAP,
     COUNTER_DL_DST_MISMATCH, COUNTER_DL_MALFORMED, COUNTER_DL_UNKNOWN_TEID, COUNTER_SLOTS,
@@ -402,7 +403,9 @@ fn try_uplink(ctx: &mut TcContext, mark: u32) -> Result<i32, ()> {
                 count_pmtu_drop(COUNTER_UL_PMTU_CORRUPT);
                 return Ok(TC_ACT_SHOT as i32);
             }
-            UplinkMtuMapState::Configured(policy) => {
+            UplinkMtuMapState::Configured(policy)
+                if policy.fragmentation() == GtpuOuterFragmentPolicy::SignalPacketTooBig =>
+            {
                 if !apply_uplink_mtu_policy(&mut encap, policy) {
                     // Fail closed: the over-MTU inner packet is never emitted
                     // unencapsulated and the encapsulation never silently
@@ -410,6 +413,13 @@ fn try_uplink(ctx: &mut TcContext, mark: u32) -> Result<i32, ()> {
                     count_pmtu_drop(COUNTER_UL_MTU_REJECT);
                     return Ok(TC_ACT_SHOT as i32);
                 }
+            }
+            UplinkMtuMapState::Configured(_) => {
+                // Canonical for a host fragmenter, but not executable by tc.
+                // Treat an out-of-band writer like corrupt state and drop all
+                // packets until userspace restores an executable policy.
+                count_pmtu_drop(COUNTER_UL_PMTU_CORRUPT);
+                return Ok(TC_ACT_SHOT as i32);
             }
         }
     }

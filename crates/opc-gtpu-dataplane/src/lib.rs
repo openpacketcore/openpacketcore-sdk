@@ -64,10 +64,14 @@ pub use model::{
 };
 pub use opc_types::DscpCodepoint;
 #[cfg(target_os = "linux")]
-pub use reassembly::{linux_reassembly_bounds, recv_reassembled_gtpu};
 pub use reassembly::{
-    DownlinkOuterProvenance, GtpuReassemblyConsumer, GtpuReassemblyCounters, GtpuReassemblyDrop,
-    GtpuReassemblyOutcome, GtpuReassemblyPdr,
+    linux_reassembly_bounds, read_linux_ipv4_reassembly_stats, GtpuKernelIpv4ReassemblyStats,
+    GtpuKernelReassemblyStatsError, GtpuReassemblySocket,
+};
+pub use reassembly::{
+    reassembly_commit_authorizes_graph, DownlinkOuterProvenance, GtpuReassemblyConsumer,
+    GtpuReassemblyCounters, GtpuReassemblyDrop, GtpuReassemblyGraphIdentity, GtpuReassemblyOutcome,
+    GtpuReassemblyPdr, GtpuReassemblySelector,
 };
 pub use unsupported::UnsupportedGtpuDataplaneBackend;
 

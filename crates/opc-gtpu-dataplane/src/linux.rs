@@ -804,18 +804,11 @@ impl LinuxGtpuTransport for NetlinkGtpuTransport {
             downlink_endpoint_binding: GtpuCapability::Missing,
             uplink_source_port_selection: GtpuCapability::Missing,
             uplink_pmtu_enforcement: GtpuCapability::Missing,
-            // The kernel gtp driver consumes UDP/2152 through a socket the
-            // kernel itself reassembles into, so fragmented outer downlink
-            // packets re-enter the GTP-U consumer exactly once under the
-            // kernel's bounded ipfrag accounting. Bounds come from the live
-            // sysctls and are absent when unreadable, never fabricated.
-            downlink_outer_fragment_handling: if gtp_module_present {
-                GtpuDownlinkFragmentContract::KernelReassemblyHandoff {
-                    bounds: crate::reassembly::linux_reassembly_bounds(),
-                }
-            } else {
-                GtpuDownlinkFragmentContract::Unsupported
-            },
+            // The generic-netlink family probe proves only that the Linux GTP
+            // driver is present. It does not prove fragmented outer packets
+            // re-enter that driver's UDP consumer exactly once, so this
+            // backend must not advertise the stronger handoff contract.
+            downlink_outer_fragment_handling: GtpuDownlinkFragmentContract::Unsupported,
             details,
         }
     }
@@ -1725,10 +1718,7 @@ mod tests {
                     downlink_endpoint_binding: GtpuCapability::Missing,
                     uplink_source_port_selection: GtpuCapability::Missing,
                     uplink_pmtu_enforcement: GtpuCapability::Missing,
-                    downlink_outer_fragment_handling:
-                        GtpuDownlinkFragmentContract::KernelReassemblyHandoff {
-                            bounds: Some(opc_gtpu_ebpf_common::LINUX_DEFAULT_REASSEMBLY_BOUNDS),
-                        },
+                    downlink_outer_fragment_handling: GtpuDownlinkFragmentContract::Unsupported,
                     details: Some("test transport"),
                 },
                 socket_fd: 9,
@@ -1755,6 +1745,23 @@ mod tests {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone()
         }
+    }
+
+    #[test]
+    fn netlink_probe_does_not_claim_unproven_fragment_handoff() {
+        let probe = LinuxGtpuTransport::probe(
+            &NetlinkGtpuTransport,
+            LinuxGtpuDataplaneBackendConfig {
+                receive_attempts: 1,
+                receive_buffer_len: 4096,
+                retry_delay: Duration::ZERO,
+            },
+        );
+
+        assert_eq!(
+            probe.downlink_outer_fragment_handling,
+            GtpuDownlinkFragmentContract::Unsupported
+        );
     }
 
     impl LinuxGtpuTransport for CapturingTransport {

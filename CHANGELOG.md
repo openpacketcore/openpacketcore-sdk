@@ -113,13 +113,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `EbpfGtpuDataplaneBackend::set_uplink_mtu_policy` mutates a live device
   atomically. `decide_uplink_encap` in `opc-gtpu-ebpf-common` returns a
   typed outcome — `Emit` with headroom (DF stamped and checksum refreshed
-  under the strict policy), `EmitOuterFragmented` (DF clear, emitted whole:
-  the tc egress bypasses `ip_fragment`, so this relies on a downstream
-  fragmenting hop and requires the effective MTU below the device MTU), or
+  under the strict policy), `RequiresOuterFragmentation` (a host action that
+  does not claim the oversized packet was emitted), or
   fail-closed `RejectTooBig` carrying RFC 1191 ICMPv4 / RFC 8200-8201 ICMPv6
-  Packet-Too-Big guidance. On the eBPF backend `RejectTooBig` is a silent,
-  counted drop (no ICMP from the kernel path — operators size the inner MTU
-  out of band); host callers can generate the wire signal with the new
+  Packet-Too-Big guidance. The eBPF backend rejects the host-only
+  `RequireOuterFragmentation` policy because tc redirect cannot execute it;
+  every configured over-MTU eBPF packet is a silent, counted drop (no ICMP
+  from the kernel path — operators size the inner MTU out of band). Host
+  callers can generate the wire signal with the new
   `build_icmpv4_packet_too_big`/`build_icmpv6_packet_too_big` helpers. The
   tc uplink program enforces the decision from the additive single-slot
   `GTPU_PMTU_CFG` map (committed under the `OPC-PMTU-v5` schema marker; the
@@ -139,12 +140,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unreadable), and the new `GtpuReassemblyConsumer` mirrors the tc PDR
   resolution (dual-map/zero-mark corruption fails closed), binding, and
   marked-owner authorization on the reassembled datagram exactly once,
-  with bounded typed counters, `IP_PKTINFO` provenance extraction
-  (`recv_reassembled_gtpu`), and no userspace fragment cache. `GtpuProbe`
+  with fixed-cardinality typed counters and a sealed `GtpuReassemblySocket`
+  that applies `SO_BINDTODEVICE` before its concrete IPv4 UDP/2152 bind,
+  verifies kernel device/address identity around every receive, and accepts a
+  zero reassembled `IP_PKTINFO` ifindex only through that kernel-enforced
+  identity. The socket also exposes safe `SO_RCVBUF` sizing/readback and has no
+  unbound wrapping path; creation normally requires Linux `CAP_NET_RAW`.
+  Linux also exposes bounded typed `/proc/net/snmp` reassembly stats readback,
+  including timeouts and aggregate overlap/resource failures. `GtpuProbe`
   reports `uplink_pmtu_enforcement` and `downlink_outer_fragment_handling`
-  per backend: the Linux `gtp` backend reports its native reassembly
-  handoff; mock/unsupported report the contracts missing and reject
-  configured policies fail closed.
+  per backend: only the eBPF backend reports its live-proven reassembly
+  handoff; Linux `gtp`, mock, and unsupported backends report the contract
+  missing, and reject configured policies fail closed.
 - **Configurable stable uplink GTP-U UDP source ports — `opc-gtpu-dataplane`
   (#346):** `GtpPdpContext::uplink_source_port_policy` selects, per PDP
   context, the UDP source port stamped by the eBPF uplink encapsulator while

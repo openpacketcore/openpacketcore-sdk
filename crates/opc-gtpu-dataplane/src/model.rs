@@ -297,12 +297,13 @@ pub struct CreateGtpDeviceRequest {
     /// Optional explicit uplink PMTU/outer-fragmentation policy for the
     /// device's S2b-U link.
     ///
-    /// `Some` requires the backend to enforce the effective link MTU fail
-    /// closed: an over-MTU encapsulation is either emitted with DF clear
-    /// (relying on downstream fragmentation — the ePDG egress never
-    /// fragments itself) or rejected with a counted drop and typed
-    /// Packet-Too-Big guidance for host callers, and the inner packet is
-    /// never leaked unencapsulated. `None` requests no change: a fresh
+    /// `Some` requires the backend either to execute the selected policy or
+    /// reject it during configuration. The tc eBPF backend accepts only
+    /// `SignalPacketTooBig`: every over-MTU encapsulation is a counted drop,
+    /// typed Packet-Too-Big guidance remains available to host callers, and
+    /// neither an oversized encapsulation nor the inner packet is emitted.
+    /// Host implementations may execute `RequireOuterFragmentation` before
+    /// transmission. `None` requests no change: a fresh
     /// device gets the pre-policy behavior (only the IPv4 total-length
     /// `u16` limit) and a device with a persisted policy keeps it — use the
     /// backend's explicit policy-update method to change or clear a
@@ -1086,16 +1087,13 @@ pub struct GtpuProbe {
     /// Ability to stamp a stable per-PDP-context UDP source port on uplink
     /// outer headers while the destination remains the fixed service port.
     pub uplink_source_port_selection: GtpuCapability,
-    /// Ability to enforce a typed uplink PMTU/outer-fragmentation policy:
-    /// the effective link MTU is honored fail closed — over-MTU
-    /// encapsulations are rejected with a counted drop (the eBPF backend
-    /// emits no ICMP itself; typed Packet-Too-Big guidance is available to
-    /// host callers) — or emitted with DF clear for downstream
-    /// fragmentation when the policy permits it. The inner packet is never
-    /// leaked unencapsulated. Note the `FragmentOuter` policy emits the
-    /// oversized frame whole: the tc egress path bypasses the kernel's
-    /// `ip_fragment`, so safe use requires the configured effective MTU to
-    /// be below the egress device MTU plus a fragmenting hop downstream.
+    /// Ability to enforce a typed uplink PMTU policy. The effective link MTU
+    /// is honored fail closed: over-MTU encapsulations are rejected with a
+    /// counted drop and are never emitted or leaked unencapsulated. The eBPF
+    /// backend emits no ICMP itself; typed Packet-Too-Big guidance is
+    /// available to host callers. The host-only
+    /// `RequireOuterFragmentation` policy is rejected because tc redirect
+    /// cannot execute the required fragmentation.
     pub uplink_pmtu_enforcement: GtpuCapability,
     /// The backend's demonstrated contract for fragmented outer downlink
     /// packets: a bounded kernel-reassembly handoff whose reassembled

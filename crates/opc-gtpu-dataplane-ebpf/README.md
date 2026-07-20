@@ -23,17 +23,16 @@ The crate exposes tc entry points, not a Rust library API:
   entries exactly; an absent, transitional, malformed, or mixed record drops
   fail closed. When the single-slot `GTPU_PMTU_CFG` policy map carries a
   configured effective link MTU, the program applies the shared
-  `apply_uplink_mtu_policy` decision to every encapsulation: an over-MTU
-  packet is emitted with DF clear only when the policy permits downstream
-  outer fragmentation (the program transmits via `bpf_redirect_neigh`,
-  bypassing the kernel's `ip_fragment`, so the oversized frame leaves whole
-  and relies on a downstream fragmenting hop); otherwise it drops fail
-  closed into the `GTPU_PMTU_DROP` per-CPU counter (slot 0 over-MTU rejects,
-  slot 1 the corrupt-policy canary), never emitting the inner packet
-  unencapsulated and never emitting ICMP itself. The strict policy stamps DF
-  and refreshes the outer checksum on emitted
-  packets; an all-zero slot is the explicit unset legacy behavior and
-  corrupt policy bytes drop fail closed.
+  `apply_uplink_mtu_policy` decision to every encapsulation: over-MTU packets
+  drop fail closed into the `GTPU_PMTU_DROP` per-CPU counter (slot 0). The
+  host-only `RequireOuterFragmentation` policy is not executable because
+  `bpf_redirect_neigh` bypasses the kernel's `ip_fragment`; SDK configuration
+  rejects it, and an out-of-band map writer makes every packet drop into the
+  corrupt-policy canary (slot 1). The program never emits an oversized packet,
+  an inner packet unencapsulated, or ICMP itself. The strict policy stamps DF
+  and refreshes the outer checksum on emitted fitting packets; an all-zero
+  slot is the explicit unset legacy behavior and corrupt policy bytes drop
+  fail closed.
 - `opc_gtpu_downlink`: tc ingress program. It matches UDP/2152 GTPv1-U G-PDUs,
   proves the existing outer envelope/checksum boundary, selects exactly one
   downlink PDR by TEID, and then requires a canonical `GTPU_DL_BIND` value that

@@ -2,9 +2,9 @@
 //! contract.
 //!
 //! The uplink half turns the fixed [`GTPU_ENCAP_LEN`]-byte encapsulation into
-//! a typed action: emit within the effective link MTU, emit oversized with DF
-//! clear when the policy permits downstream outer fragmentation, or fail
-//! closed with typed ICMP Packet-Too-Big guidance. It is pure `no_std` logic
+//! a typed action: emit within the effective link MTU, require a host-side
+//! outer-fragmentation action without emitting, or fail closed with typed ICMP
+//! Packet-Too-Big guidance. It is pure `no_std` logic
 //! shared between host-side callers and the tc uplink program so both enforce
 //! the identical decision table.
 //!
@@ -28,10 +28,10 @@ use crate::{
 /// limit is enforced).
 pub const UPLINK_PMTU_VALUE_LEN: usize = 4;
 
-/// Policy flag: over-MTU encapsulations are emitted with DF clear, permitting
-/// outer IPv4 fragmentation downstream (see
-/// [`GtpuOuterFragmentPolicy::FragmentOuter`] for the exact semantics).
-pub const UPLINK_PMTU_FLAG_FRAGMENT_PERMITTED: u8 = 1;
+/// Policy flag: an over-MTU encapsulation requires an explicit host-side outer
+/// IPv4 fragmentation action (see
+/// [`GtpuOuterFragmentPolicy::RequireOuterFragmentation`]).
+pub const UPLINK_PMTU_FLAG_OUTER_FRAGMENT_REQUIRED: u8 = 1;
 
 /// Minimum acceptable effective link MTU: the fixed encapsulation plus the
 /// IPv4 minimum MTU of 68 (RFC 791 section 3.1), so at least one
@@ -55,23 +55,23 @@ pub enum GtpuOuterFragmentPolicy {
     /// generation helper).
     #[default]
     SignalPacketTooBig,
-    /// Emit over-MTU encapsulations with DF clear, relying on a downstream
-    /// hop to fragment the outer IPv4 packet. The ePDG egress never
-    /// fragments: the tc uplink program transmits via `bpf_redirect_neigh`,
-    /// which bypasses the kernel's `ip_fragment` path, so the oversized
-    /// frame leaves whole. This policy is safe only when the configured
-    /// effective MTU is below the egress device's real MTU (so the emitted
-    /// frame fits the device) *and* a downstream fragmenting hop exists;
-    /// otherwise oversized frames risk silent drops by drivers or MRU-limited
-    /// receivers. The inner packet is never fragmented by this datapath.
-    FragmentOuter,
+    /// Require the caller to fragment an over-MTU outer IPv4 packet before it
+    /// is emitted. [`decide_uplink_encap`] returns a typed
+    /// [`UplinkEncapOutcome::RequiresOuterFragmentation`] action containing the
+    /// unfragmented encapsulation header and bounded excess; it never describes
+    /// the oversized packet as emitted.
+    ///
+    /// The tc eBPF backend rejects this policy during configuration because
+    /// `bpf_redirect_neigh` bypasses the kernel's `ip_fragment` path. A host
+    /// backend may accept it only when it executes the required fragmentation.
+    RequireOuterFragmentation,
 }
 
 impl core::fmt::Debug for GtpuOuterFragmentPolicy {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::SignalPacketTooBig => f.write_str("SignalPacketTooBig"),
-            Self::FragmentOuter => f.write_str("FragmentOuter"),
+            Self::RequireOuterFragmentation => f.write_str("RequireOuterFragmentation"),
         }
     }
 }
@@ -144,7 +144,9 @@ impl GtpuUplinkMtuPolicy {
         let mtu = self.effective_link_mtu.to_be_bytes();
         let flags = match self.fragmentation {
             GtpuOuterFragmentPolicy::SignalPacketTooBig => 0,
-            GtpuOuterFragmentPolicy::FragmentOuter => UPLINK_PMTU_FLAG_FRAGMENT_PERMITTED,
+            GtpuOuterFragmentPolicy::RequireOuterFragmentation => {
+                UPLINK_PMTU_FLAG_OUTER_FRAGMENT_REQUIRED
+            }
         };
         [mtu[0], mtu[1], flags, 0]
     }
@@ -161,13 +163,13 @@ impl GtpuUplinkMtuPolicy {
             }
             return UplinkMtuMapState::Corrupt;
         }
-        if value[3] != 0 || value[2] & !UPLINK_PMTU_FLAG_FRAGMENT_PERMITTED != 0 {
+        if value[3] != 0 || value[2] & !UPLINK_PMTU_FLAG_OUTER_FRAGMENT_REQUIRED != 0 {
             return UplinkMtuMapState::Corrupt;
         }
-        let fragmentation = if value[2] & UPLINK_PMTU_FLAG_FRAGMENT_PERMITTED == 0 {
+        let fragmentation = if value[2] & UPLINK_PMTU_FLAG_OUTER_FRAGMENT_REQUIRED == 0 {
             GtpuOuterFragmentPolicy::SignalPacketTooBig
         } else {
-            GtpuOuterFragmentPolicy::FragmentOuter
+            GtpuOuterFragmentPolicy::RequireOuterFragmentation
         };
         match Self::new(u16::from_be_bytes([value[0], value[1]]), fragmentation) {
             Some(policy) => UplinkMtuMapState::Configured(policy),
@@ -269,13 +271,11 @@ pub enum UplinkEncapOutcome {
         /// Remaining link-MTU headroom after encapsulation.
         headroom: u16,
     },
-    /// The encapsulated packet exceeds the effective link MTU and the policy
-    /// permits downstream outer fragmentation; emit it with DF clear. The
-    /// ePDG egress never fragments itself (see
-    /// [`GtpuOuterFragmentPolicy::FragmentOuter`]); the inner packet is
-    /// delivered unfragmented inside one G-PDU.
-    EmitOuterFragmented {
-        /// Exact encapsulation bytes to prepend (DF clear).
+    /// The encapsulated packet exceeds the effective link MTU and must not be
+    /// emitted until the caller has fragmented the outer IPv4 packet.
+    RequiresOuterFragmentation {
+        /// Exact encapsulation bytes the host fragmenter prepends before
+        /// splitting the resulting outer packet. DF is clear.
         encap: [u8; GTPU_ENCAP_LEN],
         /// Bytes by which the encapsulated packet exceeds the effective MTU.
         excess: u16,
@@ -302,8 +302,8 @@ impl core::fmt::Debug for UplinkEncapOutcome {
                 .field("encap", &"<redacted>")
                 .field("headroom", headroom)
                 .finish(),
-            Self::EmitOuterFragmented { excess, .. } => f
-                .debug_struct("EmitOuterFragmented")
+            Self::RequiresOuterFragmentation { excess, .. } => f
+                .debug_struct("RequiresOuterFragmentation")
                 .field("encap", &"<redacted>")
                 .field("excess", excess)
                 .finish(),
@@ -340,28 +340,27 @@ pub fn stamp_ipv4_dont_fragment(encap: &mut [u8; GTPU_ENCAP_LEN]) {
 /// Apply a configured MTU policy to an already-built encapsulation, stamping
 /// DF when the policy requires it.
 ///
-/// Returns `false` when the encapsulated packet exceeds the effective link
-/// MTU and the policy does not permit outer fragmentation: the caller must
-/// drop fail closed (never emitting the inner packet unencapsulated) and
-/// surface [`UplinkEncapOutcome::RejectTooBig`] guidance where it can.
-/// This is the exact gate the tc uplink program executes; host callers
-/// should prefer [`decide_uplink_encap`], which composes the builder and
-/// this gate into the typed outcome.
+/// Returns `false` whenever the policy requires host-side fragmentation or the
+/// encapsulated packet exceeds the effective link MTU. This function is the
+/// fail-closed tc eBPF gate: that backend cannot execute outer fragmentation
+/// and therefore rejects
+/// [`GtpuOuterFragmentPolicy::RequireOuterFragmentation`] during configuration.
+/// An external map writer cannot make tc execute that policy even for fitting
+/// packets. Host callers should prefer [`decide_uplink_encap`], which composes
+/// the builder and policy into a typed host action.
 #[must_use]
 pub fn apply_uplink_mtu_policy(
     encap: &mut [u8; GTPU_ENCAP_LEN],
     policy: GtpuUplinkMtuPolicy,
 ) -> bool {
+    if policy.fragmentation != GtpuOuterFragmentPolicy::SignalPacketTooBig {
+        return false;
+    }
     let outer_total = u32::from(u16::from_be_bytes([encap[2], encap[3]]));
     if outer_total > u32::from(policy.effective_link_mtu) {
-        return matches!(policy.fragmentation, GtpuOuterFragmentPolicy::FragmentOuter);
+        return false;
     }
-    if matches!(
-        policy.fragmentation,
-        GtpuOuterFragmentPolicy::SignalPacketTooBig
-    ) {
-        stamp_ipv4_dont_fragment(encap);
-    }
+    stamp_ipv4_dont_fragment(encap);
     true
 }
 
@@ -399,8 +398,8 @@ pub fn decide_uplink_encap(
         })
     } else {
         match mtu_policy.fragmentation {
-            GtpuOuterFragmentPolicy::FragmentOuter => {
-                Some(UplinkEncapOutcome::EmitOuterFragmented {
+            GtpuOuterFragmentPolicy::RequireOuterFragmentation => {
+                Some(UplinkEncapOutcome::RequiresOuterFragmentation {
                     encap,
                     excess: (outer_total - link_mtu) as u16,
                 })
@@ -439,20 +438,24 @@ mod tests {
     fn policy_construction_bounds_and_headroom_accounting() {
         assert!(GtpuUplinkMtuPolicy::new(
             MIN_UPLINK_LINK_MTU - 1,
-            GtpuOuterFragmentPolicy::FragmentOuter
+            GtpuOuterFragmentPolicy::RequireOuterFragmentation
         )
         .is_none());
-        let policy =
-            GtpuUplinkMtuPolicy::new(MIN_UPLINK_LINK_MTU, GtpuOuterFragmentPolicy::FragmentOuter)
-                .unwrap();
+        let policy = GtpuUplinkMtuPolicy::new(
+            MIN_UPLINK_LINK_MTU,
+            GtpuOuterFragmentPolicy::RequireOuterFragmentation,
+        )
+        .unwrap();
         assert_eq!(policy.inner_mtu(), 68);
         assert_eq!(
             strict_policy(1500).inner_mtu(),
             1500 - GTPU_ENCAP_LEN as u16
         );
-        assert!(
-            GtpuUplinkMtuPolicy::new(u16::MAX, GtpuOuterFragmentPolicy::FragmentOuter).is_some()
-        );
+        assert!(GtpuUplinkMtuPolicy::new(
+            u16::MAX,
+            GtpuOuterFragmentPolicy::RequireOuterFragmentation,
+        )
+        .is_some());
     }
 
     #[test]
@@ -463,7 +466,7 @@ mod tests {
         );
         for fragmentation in [
             GtpuOuterFragmentPolicy::SignalPacketTooBig,
-            GtpuOuterFragmentPolicy::FragmentOuter,
+            GtpuOuterFragmentPolicy::RequireOuterFragmentation,
         ] {
             let policy = GtpuUplinkMtuPolicy::new(1500, fragmentation).unwrap();
             assert_eq!(
@@ -473,9 +476,10 @@ mod tests {
         }
         let strict = strict_policy(1400).map_value();
         assert_eq!(strict, [0x05, 0x78, 0, 0]);
-        let fragment = GtpuUplinkMtuPolicy::new(1400, GtpuOuterFragmentPolicy::FragmentOuter)
-            .unwrap()
-            .map_value();
+        let fragment =
+            GtpuUplinkMtuPolicy::new(1400, GtpuOuterFragmentPolicy::RequireOuterFragmentation)
+                .unwrap()
+                .map_value();
         assert_eq!(fragment, [0x05, 0x78, 1, 0]);
     }
 
@@ -536,13 +540,14 @@ mod tests {
     }
 
     #[test]
-    fn emit_within_mtu_keeps_df_clear_under_fragment_policy() {
+    fn fitting_host_fragment_policy_keeps_df_clear() {
         let outcome = decide_uplink_encap(
             &far(),
             1400,
             None,
             crate::GTPU_UDP_PORT,
-            GtpuUplinkMtuPolicy::new(1500, GtpuOuterFragmentPolicy::FragmentOuter).unwrap(),
+            GtpuUplinkMtuPolicy::new(1500, GtpuOuterFragmentPolicy::RequireOuterFragmentation)
+                .unwrap(),
             GtpuPmtuProtocol::Icmpv4,
         )
         .unwrap();
@@ -564,7 +569,7 @@ mod tests {
         let inner_len = 1500 - GTPU_ENCAP_LEN as u16;
         for fragmentation in [
             GtpuOuterFragmentPolicy::SignalPacketTooBig,
-            GtpuOuterFragmentPolicy::FragmentOuter,
+            GtpuOuterFragmentPolicy::RequireOuterFragmentation,
         ] {
             let policy = GtpuUplinkMtuPolicy::new(1500, fragmentation).unwrap();
             let outcome = decide_uplink_encap(
@@ -625,18 +630,19 @@ mod tests {
     }
 
     #[test]
-    fn over_mtu_emits_outer_fragmented_only_when_permitted() {
+    fn over_mtu_returns_required_fragmentation_without_claiming_emission() {
         let outcome = decide_uplink_encap(
             &far(),
             1480,
             None,
             crate::GTPU_UDP_PORT,
-            GtpuUplinkMtuPolicy::new(1500, GtpuOuterFragmentPolicy::FragmentOuter).unwrap(),
+            GtpuUplinkMtuPolicy::new(1500, GtpuOuterFragmentPolicy::RequireOuterFragmentation)
+                .unwrap(),
             GtpuPmtuProtocol::Icmpv4,
         )
         .unwrap();
-        let UplinkEncapOutcome::EmitOuterFragmented { encap, excess } = outcome else {
-            panic!("expected EmitOuterFragmented, got {outcome:?}");
+        let UplinkEncapOutcome::RequiresOuterFragmentation { encap, excess } = outcome else {
+            panic!("expected RequiresOuterFragmentation, got {outcome:?}");
         };
         assert_eq!(excess, 16);
         assert_eq!(encap[6] & 0x40, 0, "outer fragmentation requires DF clear");
@@ -668,14 +674,15 @@ mod tests {
             u16::MAX - 35,
             None,
             crate::GTPU_UDP_PORT,
-            GtpuUplinkMtuPolicy::new(u16::MAX, GtpuOuterFragmentPolicy::FragmentOuter).unwrap(),
+            GtpuUplinkMtuPolicy::new(u16::MAX, GtpuOuterFragmentPolicy::RequireOuterFragmentation,)
+                .unwrap(),
             GtpuPmtuProtocol::Icmpv4,
         )
         .is_none());
     }
 
     #[test]
-    fn apply_gate_matches_decide_for_both_policies() {
+    fn tc_apply_gate_never_emits_over_effective_mtu() {
         let mut encap =
             build_uplink_encap_with_dscp_and_source_port(&far(), 1480, None, crate::GTPU_UDP_PORT)
                 .unwrap();
@@ -686,11 +693,16 @@ mod tests {
             "a rejected encapsulation is never DF-stamped or emitted"
         );
         let fragment =
-            GtpuUplinkMtuPolicy::new(1500, GtpuOuterFragmentPolicy::FragmentOuter).unwrap();
-        assert!(apply_uplink_mtu_policy(&mut encap, fragment));
+            GtpuUplinkMtuPolicy::new(1500, GtpuOuterFragmentPolicy::RequireOuterFragmentation)
+                .unwrap();
+        assert!(!apply_uplink_mtu_policy(&mut encap, fragment));
         let mut fitting =
             build_uplink_encap_with_dscp_and_source_port(&far(), 1400, None, crate::GTPU_UDP_PORT)
                 .unwrap();
+        assert!(
+            !apply_uplink_mtu_policy(&mut fitting, fragment),
+            "tc must reject a host-only policy even for a fitting packet"
+        );
         assert!(apply_uplink_mtu_policy(&mut fitting, strict_policy(1500)));
         assert_eq!(fitting[6] & 0x40, 0x40);
     }
@@ -711,7 +723,8 @@ mod tests {
             1480,
             None,
             40_000,
-            GtpuUplinkMtuPolicy::new(1500, GtpuOuterFragmentPolicy::FragmentOuter).unwrap(),
+            GtpuUplinkMtuPolicy::new(1500, GtpuOuterFragmentPolicy::RequireOuterFragmentation)
+                .unwrap(),
             GtpuPmtuProtocol::Icmpv4,
         )
         .unwrap();
