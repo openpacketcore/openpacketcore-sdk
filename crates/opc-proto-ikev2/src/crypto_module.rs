@@ -40,6 +40,7 @@ pub struct Ikev2CryptoRequirements {
     signature_verification: Vec<IkeSignatureAlgorithm>,
     signature_generation: Vec<IkeSignatureAlgorithm>,
     nat_detection: bool,
+    certreq_authority_hash: bool,
 }
 
 impl Ikev2CryptoRequirements {
@@ -54,6 +55,7 @@ impl Ikev2CryptoRequirements {
             signature_verification: Vec::new(),
             signature_generation: Vec::new(),
             nat_detection: false,
+            certreq_authority_hash: false,
         }
     }
 
@@ -101,7 +103,8 @@ impl Ikev2CryptoRequirements {
         requirements.require_signature_verification(IkeSignatureAlgorithm::RsaPkcs1V15Sha2_256);
         #[cfg(feature = "rsa-signing")]
         requirements.require_signature_generation(IkeSignatureAlgorithm::RsaPkcs1V15Sha2_256);
-        requirements.nat_detection = true;
+        requirements.require_nat_detection();
+        requirements.require_certreq_authority_hash();
         requirements
     }
 
@@ -178,6 +181,17 @@ impl Ikev2CryptoRequirements {
         self
     }
 
+    /// Require RFC 7296 section 3.7 CERTREQ Certification Authority hashing.
+    ///
+    /// This requirement is deliberately independent of
+    /// [`Self::require_nat_detection`]. Both operations use SHA-1 through the
+    /// admitted [`CryptoCapability::IkeHash`] capability, but authorizing one
+    /// protocol use does not authorize the other.
+    pub const fn require_certreq_authority_hash(&mut self) -> &mut Self {
+        self.certreq_authority_hash = true;
+        self
+    }
+
     /// Capabilities derived from the configured algorithms.
     #[must_use = "the derived capability set must be included in provider policy"]
     pub fn required_capabilities(&self) -> CapabilitySet {
@@ -185,7 +199,7 @@ impl Ikev2CryptoRequirements {
         if !self.prfs.is_empty() {
             capabilities = capabilities.with(CryptoCapability::IkePrf);
         }
-        if self.nat_detection {
+        if self.nat_detection || self.certreq_authority_hash {
             capabilities = capabilities.with(CryptoCapability::IkeHash);
         }
         if !self.integrities.is_empty() {
@@ -460,6 +474,10 @@ impl ModuleSelection {
     fn nat_detection_admitted(&self) -> bool {
         self.0.requirements.nat_detection
     }
+
+    fn certreq_authority_hash_admitted(&self) -> bool {
+        self.0.requirements.certreq_authority_hash
+    }
 }
 
 /// Probe, preflight, admit, and atomically install the process IKEv2 module.
@@ -572,7 +590,9 @@ fn validate_algorithm_support(
             return Err(unsupported_install(algorithm.as_str()));
         }
     }
-    if requirements.nat_detection && !module.supports_hash(IkeHashAlgorithm::Sha1) {
+    if (requirements.nat_detection || requirements.certreq_authority_hash)
+        && !module.supports_hash(IkeHashAlgorithm::Sha1)
+    {
         return Err(unsupported_install(IkeHashAlgorithm::Sha1.as_str()));
     }
     Ok(())
@@ -938,6 +958,24 @@ pub(crate) fn execute_nat_hash(
     let output = selected
         .module()
         .hash(IkeHashAlgorithm::Sha1, parts)
+        .map_err(|error| Ikev2CryptoModuleError::operation(&error))?;
+    validate_output_len(output.len(), IkeHashAlgorithm::Sha1.output_len())?;
+    Ok(output)
+}
+
+pub(crate) fn execute_certreq_authority_hash(
+    subject_public_key_info_der: &[u8],
+) -> Result<Zeroizing<Vec<u8>>, Ikev2CryptoModuleError> {
+    let selected = select_module(CryptoCapability::IkeHash)?;
+    if !selected.certreq_authority_hash_admitted() {
+        return Err(algorithm_not_admitted());
+    }
+    if !selected.module().supports_hash(IkeHashAlgorithm::Sha1) {
+        return Err(algorithm_unsupported());
+    }
+    let output = selected
+        .module()
+        .hash(IkeHashAlgorithm::Sha1, &[subject_public_key_info_der])
         .map_err(|error| Ikev2CryptoModuleError::operation(&error))?;
     validate_output_len(output.len(), IkeHashAlgorithm::Sha1.output_len())?;
     Ok(output)

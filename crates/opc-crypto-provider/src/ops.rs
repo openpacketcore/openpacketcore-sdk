@@ -161,7 +161,7 @@ impl Error for CryptoOperationError {}
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IkeHashAlgorithm {
-    /// SHA-1 for RFC 7296 NAT detection only.
+    /// SHA-1 for RFC 7296 NAT detection and CERTREQ authority identifiers.
     Sha1,
 }
 

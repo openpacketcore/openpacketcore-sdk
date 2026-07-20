@@ -12,34 +12,68 @@ use std::{
 
 use async_trait::async_trait;
 use opc_crypto_provider::{
-    CapabilitySet, CryptoCapability, CryptoModule, CryptoOperationError, IkeAeadAlgorithm,
-    IkeCbcAlgorithm, IkeCryptoModule, IkeDhGroup, IkeDhKeyPair, IkeDiffieHellmanOperations,
-    IkeEncryptionOperations, IkeEntropyOperations, IkeHashAlgorithm, IkeHashOperations,
-    IkeIntegrityAlgorithm, IkeIntegrityOperations, IkePrfAlgorithm, IkePrfOperations,
-    IkeSignatureAlgorithm, IkeSignatureOperations, IkeSigningKey, ModuleReadiness,
-    ProviderIdentity, ProviderPolicy, SelfTestError, SelfTestOutcome, ValidationState,
+    CapabilitySet, CryptoCapability, CryptoModule, CryptoOperationError, CryptoOperationErrorCode,
+    IkeAeadAlgorithm, IkeCbcAlgorithm, IkeCryptoModule, IkeDhGroup, IkeDhKeyPair,
+    IkeDiffieHellmanOperations, IkeEncryptionOperations, IkeEntropyOperations, IkeHashAlgorithm,
+    IkeHashOperations, IkeIntegrityAlgorithm, IkeIntegrityOperations, IkePrfAlgorithm,
+    IkePrfOperations, IkeSignatureAlgorithm, IkeSignatureOperations, IkeSigningKey,
+    ModuleReadiness, ProviderIdentity, ProviderPolicy, SelfTestError, SelfTestOutcome,
+    ValidationState,
 };
 use opc_proto_ikev2::{
     compute_ike_auth_signature, decrypt_ikev2_sa_init_protected_payload,
     derive_ike_sa_init_key_material, ikev2_aes_cbc_protected_body_len,
-    ikev2_aes_gcm_protected_body_len, ikev2_nat_detection_hash, install_ikev2_crypto_module,
-    seal_ikev2_sa_init_aes_cbc_protected_payload, seal_ikev2_sa_init_protected_payload,
-    verify_ike_auth_signature, Header, HeaderFlags, Ikev2AuthenticationPayload,
-    Ikev2CryptoModuleErrorCode, Ikev2CryptoModuleInstallError, Ikev2CryptoRequirements,
-    Ikev2DhGroup, Ikev2EncryptionAlgorithm, Ikev2EphemeralDhKey, Ikev2IkeAuthPeer,
-    Ikev2IkeAuthSignedOctets, Ikev2IkeAuthVerificationError, Ikev2IntegrityAlgorithm,
-    Ikev2PrfAlgorithm, Ikev2ProtectedPayloadCryptoError, Ikev2ProtectedPayloadDirection,
-    Ikev2SaInitCryptoError, Ikev2SaInitCryptoProfile, Ikev2SignatureAuthKey,
-    Ikev2SignaturePublicKey, Ikev2SoftwareCryptoModule, Ikev2SoftwareCryptoOperations, PayloadType,
-    ProtectedPayloadContext, ProtectedPayloadKind, ProtectedPayloadSealContext,
-    IKEV2_AUTH_METHOD_DIGITAL_SIGNATURE,
+    ikev2_aes_gcm_protected_body_len, ikev2_certreq_authority_key_hash, ikev2_nat_detection_hash,
+    install_ikev2_crypto_module, seal_ikev2_sa_init_aes_cbc_protected_payload,
+    seal_ikev2_sa_init_protected_payload, verify_ike_auth_signature, Header, HeaderFlags,
+    Ikev2AuthenticationPayload, Ikev2CertReqSubjectPublicKeyInfo,
+    Ikev2CertReqSubjectPublicKeyInfoError, Ikev2CryptoModuleErrorCode,
+    Ikev2CryptoModuleInstallError, Ikev2CryptoRequirements, Ikev2DhGroup, Ikev2EncryptionAlgorithm,
+    Ikev2EphemeralDhKey, Ikev2IkeAuthPeer, Ikev2IkeAuthSignedOctets, Ikev2IkeAuthVerificationError,
+    Ikev2IntegrityAlgorithm, Ikev2PrfAlgorithm, Ikev2ProtectedPayloadCryptoError,
+    Ikev2ProtectedPayloadDirection, Ikev2SaInitCryptoError, Ikev2SaInitCryptoProfile,
+    Ikev2SignatureAuthKey, Ikev2SignaturePublicKey, Ikev2SoftwareCryptoModule,
+    Ikev2SoftwareCryptoOperations, PayloadType, ProtectedPayloadContext, ProtectedPayloadKind,
+    ProtectedPayloadSealContext, IKEV2_AUTH_METHOD_DIGITAL_SIGNATURE,
+    IKEV2_CERTREQ_SUBJECT_PUBLIC_KEY_INFO_MAX_LEN,
 };
 use zeroize::Zeroizing;
 
 const P256_PKCS8_DER: &[u8] = include_bytes!("data/p256_pkcs8.der");
 const P256_SPKI_DER: &[u8] = include_bytes!("data/p256_spki.der");
+const P256_CERT_DER: &[u8] = include_bytes!("data/p256_cert.der");
+// Independently computed with OpenSSL 3:
+// `openssl dgst -sha1 tests/data/p256_spki.der`.
+const P256_SPKI_SHA1: [u8; 20] = [
+    0xa2, 0x37, 0x81, 0xbb, 0x75, 0xce, 0x80, 0xc8, 0xfb, 0xf0, 0x6f, 0xcc, 0xcf, 0x4a, 0x6f, 0xc3,
+    0xdb, 0x45, 0x95, 0x72,
+];
+const HOSTILE_PROVIDER_DIAGNOSTIC: &str = "hostile-provider-diagnostic-marker";
+const HOSTILE_PROVIDER_OUTPUT: &[u8] = b"hostile-provider-output-marker";
 #[cfg(feature = "rsa-signing")]
 const RSA2048_PKCS8_DER: &[u8] = include_bytes!("data/rsa2048_pkcs8.der");
+
+fn spki_with_extra_outer_element() -> Vec<u8> {
+    let mut der = P256_SPKI_DER.to_vec();
+    assert_eq!(der.get(1), Some(&0x59), "fixture outer length changed");
+    der[1] = 0x5b;
+    der.extend_from_slice(&[0x05, 0x00]);
+    der
+}
+
+fn spki_with_extra_algorithm_identifier_element() -> Vec<u8> {
+    let mut der = P256_SPKI_DER.to_vec();
+    assert_eq!(der.get(1), Some(&0x59), "fixture outer length changed");
+    assert_eq!(
+        der.get(3),
+        Some(&0x13),
+        "fixture AlgorithmIdentifier length changed"
+    );
+    der[1] = 0x5b;
+    der[3] = 0x15;
+    der.splice(23..23, [0x05, 0x00]);
+    der
+}
 
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -108,10 +142,13 @@ struct CountingModule {
     readiness_reads: AtomicUsize,
     withdraw_extra_after_first_readiness: AtomicBool,
     reject_prf_support: AtomicBool,
+    reject_hash_support: AtomicBool,
+    fail_hash_operation: AtomicBool,
     drift_validation: AtomicBool,
     withdraw_signature_after_next_prf: AtomicBool,
     malformed_output: Arc<AtomicU8>,
     counts: Arc<OperationCounts>,
+    provider_diagnostic: &'static str,
 }
 
 impl CountingModule {
@@ -134,10 +171,13 @@ impl CountingModule {
             readiness_reads: AtomicUsize::new(0),
             withdraw_extra_after_first_readiness: AtomicBool::new(false),
             reject_prf_support: AtomicBool::new(false),
+            reject_hash_support: AtomicBool::new(false),
+            fail_hash_operation: AtomicBool::new(false),
             drift_validation: AtomicBool::new(false),
             withdraw_signature_after_next_prf: AtomicBool::new(false),
             malformed_output: Arc::new(AtomicU8::new(MalformedOutput::None as u8)),
             counts: Arc::new(OperationCounts::default()),
+            provider_diagnostic: HOSTILE_PROVIDER_DIAGNOSTIC,
         }
     }
 
@@ -230,7 +270,7 @@ impl CryptoModule for CountingModule {
 
 impl IkeHashOperations for CountingModule {
     fn supports_hash(&self, algorithm: IkeHashAlgorithm) -> bool {
-        self.operations.supports_hash(algorithm)
+        !self.reject_hash_support.load(Ordering::SeqCst) && self.operations.supports_hash(algorithm)
     }
 
     fn hash(
@@ -239,9 +279,15 @@ impl IkeHashOperations for CountingModule {
         parts: &[&[u8]],
     ) -> Result<Zeroizing<Vec<u8>>, CryptoOperationError> {
         self.counts.hash.fetch_add(1, Ordering::SeqCst);
+        if self.fail_hash_operation.load(Ordering::SeqCst) {
+            let _provider_native_diagnostic = self.provider_diagnostic;
+            return Err(CryptoOperationError::new(
+                CryptoOperationErrorCode::OperationFailed,
+            ));
+        }
         let mut output = self.operations.hash(algorithm, parts)?;
         if self.malformed_output(MalformedOutput::Hash) {
-            output.pop();
+            output = Zeroizing::new(HOSTILE_PROVIDER_OUTPUT.to_vec());
         }
         Ok(output)
     }
@@ -620,6 +666,7 @@ fn requirements(profile: Ikev2SaInitCryptoProfile) -> Ikev2CryptoRequirements {
     #[cfg(feature = "rsa-signing")]
     requirements.require_signature_generation(IkeSignatureAlgorithm::RsaPkcs1V15Sha2_256);
     requirements.require_nat_detection();
+    requirements.require_certreq_authority_hash();
     requirements
 }
 
@@ -652,6 +699,74 @@ fn assert_not_installed() {
         ikev2_nat_detection_hash(1, 2, "192.0.2.10:500".parse().expect("synthetic endpoint"))
             .expect_err("failed admission must leave the slot unset");
     assert_eq!(error.code(), Ikev2CryptoModuleErrorCode::NotInstalled);
+
+    let spki =
+        Ikev2CertReqSubjectPublicKeyInfo::from_der(P256_SPKI_DER).expect("synthetic SPKI is valid");
+    let error = ikev2_certreq_authority_key_hash(spki)
+        .expect_err("failed admission must leave CERTREQ hashing unavailable");
+    assert_eq!(error.code(), Ikev2CryptoModuleErrorCode::NotInstalled);
+}
+
+#[test]
+fn certreq_spki_input_is_exact_bounded_and_redaction_safe() {
+    let valid =
+        Ikev2CertReqSubjectPublicKeyInfo::from_der(P256_SPKI_DER).expect("synthetic SPKI is valid");
+    assert_eq!(valid.len(), P256_SPKI_DER.len());
+    assert!(!valid.is_empty());
+    let debug = format!("{valid:?}");
+    assert_eq!(
+        debug,
+        format!(
+            "Ikev2CertReqSubjectPublicKeyInfo {{ der_len: {} }}",
+            P256_SPKI_DER.len()
+        )
+    );
+
+    let empty =
+        Ikev2CertReqSubjectPublicKeyInfo::from_der(&[]).expect_err("empty SPKI must fail closed");
+    assert_eq!(empty, Ikev2CertReqSubjectPublicKeyInfoError::Empty);
+
+    let hostile = b"hostile-certreq-input-marker";
+    let malformed = Ikev2CertReqSubjectPublicKeyInfo::from_der(hostile)
+        .expect_err("non-DER input must fail closed");
+    assert_eq!(
+        malformed,
+        Ikev2CertReqSubjectPublicKeyInfoError::MalformedDer
+    );
+    assert_eq!(malformed.as_str(), "ike_certreq_spki_malformed_der");
+    assert!(std::error::Error::source(&malformed).is_none());
+    assert!(!format!("{malformed}").contains("hostile-certreq-input-marker"));
+    assert!(!format!("{malformed:?}").contains("hostile-certreq-input-marker"));
+
+    assert!(Ikev2CertReqSubjectPublicKeyInfo::from_der(P256_CERT_DER).is_err());
+    assert!(Ikev2CertReqSubjectPublicKeyInfo::from_der(&P256_SPKI_DER[26..]).is_err());
+
+    for malformed_container in [
+        spki_with_extra_outer_element(),
+        spki_with_extra_algorithm_identifier_element(),
+    ] {
+        let error = Ikev2CertReqSubjectPublicKeyInfo::from_der(&malformed_container)
+            .expect_err("unconsumed DER inside an SPKI container must fail closed");
+        assert_eq!(error, Ikev2CertReqSubjectPublicKeyInfoError::MalformedDer);
+    }
+
+    let mut trailing = P256_SPKI_DER.to_vec();
+    trailing.extend_from_slice(b"hostile-certreq-trailing-marker");
+    let trailing_error = Ikev2CertReqSubjectPublicKeyInfo::from_der(&trailing)
+        .expect_err("trailing input must fail closed");
+    assert_eq!(
+        trailing_error,
+        Ikev2CertReqSubjectPublicKeyInfoError::TrailingData
+    );
+    assert!(!format!("{trailing_error:?}").contains("hostile-certreq-trailing-marker"));
+
+    let overlong = vec![0_u8; IKEV2_CERTREQ_SUBJECT_PUBLIC_KEY_INFO_MAX_LEN + 1];
+    let overlong_error = Ikev2CertReqSubjectPublicKeyInfo::from_der(&overlong)
+        .expect_err("overlong input must fail before DER parsing");
+    assert_eq!(
+        overlong_error,
+        Ikev2CertReqSubjectPublicKeyInfoError::TooLong
+    );
 }
 
 fn protected_prefix(body_len: usize) -> Vec<u8> {
@@ -734,6 +849,20 @@ fn one_admitted_module_handles_every_operation_and_withdrawal_never_falls_back()
     module.reject_prf_support.store(false, Ordering::SeqCst);
     assert_not_installed();
 
+    module.reject_hash_support.store(true, Ordering::SeqCst);
+    let unsupported_hash = block_on(install_ikev2_crypto_module(
+        Arc::clone(&module_object),
+        policy(&requirements),
+        requirements.clone(),
+    ))
+    .expect_err("unsupported configured CERTREQ SHA-1 must fail preflight");
+    assert!(matches!(
+        unsupported_hash,
+        Ikev2CryptoModuleInstallError::AlgorithmUnsupported { algorithm: "sha1" }
+    ));
+    module.reject_hash_support.store(false, Ordering::SeqCst);
+    assert_not_installed();
+
     module.identity_reads.store(0, Ordering::SeqCst);
     module
         .drift_identity_after_first_read
@@ -784,6 +913,24 @@ fn one_admitted_module_handles_every_operation_and_withdrawal_never_falls_back()
 
     ikev2_nat_detection_hash(1, 2, "192.0.2.10:500".parse().expect("synthetic endpoint"))
         .expect("NAT hash routed");
+    let certreq_spki =
+        Ikev2CertReqSubjectPublicKeyInfo::from_der(P256_SPKI_DER).expect("synthetic SPKI is valid");
+    let certreq_hash = ikev2_certreq_authority_key_hash(certreq_spki).expect("CERTREQ hash routed");
+    assert_eq!(certreq_hash.as_bytes(), &P256_SPKI_SHA1);
+    assert_eq!(
+        format!("{certreq_hash:?}"),
+        "Ikev2CertReqAuthorityHash { len: 20 }"
+    );
+    let hash_count = module.counts.hash.load(Ordering::SeqCst);
+    for malformed_container in [
+        spki_with_extra_outer_element(),
+        spki_with_extra_algorithm_identifier_element(),
+    ] {
+        let error = Ikev2CertReqSubjectPublicKeyInfo::from_der(&malformed_container)
+            .expect_err("malformed SPKI must fail before provider dispatch");
+        assert_eq!(error, Ikev2CertReqSubjectPublicKeyInfoError::MalformedDer);
+    }
+    assert_eq!(module.counts.hash.load(Ordering::SeqCst), hash_count);
     let material = derive_ike_sa_init_key_material(
         profile,
         1_u64.to_be_bytes(),
@@ -909,10 +1056,35 @@ fn one_admitted_module_handles_every_operation_and_withdrawal_never_falls_back()
     module.reject_prf_support.store(false, Ordering::SeqCst);
 
     let hash_count = module.counts.hash.load(Ordering::SeqCst);
+    module.reject_hash_support.store(true, Ordering::SeqCst);
+    let unsupported_hash = ikev2_certreq_authority_key_hash(certreq_spki)
+        .expect_err("withdrawn SHA-1 support must fail before dispatch");
+    assert_eq!(
+        unsupported_hash.code(),
+        Ikev2CryptoModuleErrorCode::AlgorithmUnsupported
+    );
+    assert_eq!(module.counts.hash.load(Ordering::SeqCst), hash_count);
+    module.reject_hash_support.store(false, Ordering::SeqCst);
+
+    module.fail_hash_operation.store(true, Ordering::SeqCst);
+    let operation_error = ikev2_certreq_authority_key_hash(certreq_spki)
+        .expect_err("provider hash failure must remain typed and redacted");
+    assert_eq!(
+        operation_error.code(),
+        Ikev2CryptoModuleErrorCode::OperationFailed
+    );
+    assert_eq!(
+        operation_error.operation_code(),
+        Some(CryptoOperationErrorCode::OperationFailed)
+    );
+    assert!(!format!("{operation_error}").contains(module.provider_diagnostic));
+    assert!(!format!("{operation_error:?}").contains(module.provider_diagnostic));
+    module.fail_hash_operation.store(false, Ordering::SeqCst);
+
+    let hash_count = module.counts.hash.load(Ordering::SeqCst);
     module.drift_validation.store(true, Ordering::SeqCst);
-    let validation_error =
-        ikev2_nat_detection_hash(1, 2, "192.0.2.10:500".parse().expect("synthetic endpoint"))
-            .expect_err("validation declaration drift must fail before dispatch");
+    let validation_error = ikev2_certreq_authority_key_hash(certreq_spki)
+        .expect_err("validation declaration drift must fail before dispatch");
     assert_eq!(
         validation_error.code(),
         Ikev2CryptoModuleErrorCode::ValidationChanged
@@ -924,9 +1096,8 @@ fn one_admitted_module_handles_every_operation_and_withdrawal_never_falls_back()
     module
         .drift_identity_after_first_read
         .store(true, Ordering::SeqCst);
-    let identity_error =
-        ikev2_nat_detection_hash(1, 2, "192.0.2.10:500".parse().expect("synthetic endpoint"))
-            .expect_err("module identity drift must fail before dispatch");
+    let identity_error = ikev2_certreq_authority_key_hash(certreq_spki)
+        .expect_err("module identity drift must fail before dispatch");
     assert_eq!(
         identity_error.code(),
         Ikev2CryptoModuleErrorCode::IdentityChanged
@@ -940,10 +1111,11 @@ fn one_admitted_module_handles_every_operation_and_withdrawal_never_falls_back()
     // algorithm-derived width and every opaque-DH shape is rejected at the
     // routed boundary before malformed bytes can reach protocol consumers.
     module.set_malformed_output(MalformedOutput::Hash);
-    let hash_error =
-        ikev2_nat_detection_hash(1, 2, "192.0.2.10:500".parse().expect("synthetic endpoint"))
-            .expect_err("short successful hash output must fail closed");
+    let hash_error = ikev2_certreq_authority_key_hash(certreq_spki)
+        .expect_err("wrong-length successful hash output must fail closed");
     assert_eq!(hash_error.code(), Ikev2CryptoModuleErrorCode::InvalidOutput);
+    assert!(!format!("{hash_error}").contains("hostile-provider-output-marker"));
+    assert!(!format!("{hash_error:?}").contains("hostile-provider-output-marker"));
     module.set_malformed_output(MalformedOutput::None);
 
     module.set_malformed_output(MalformedOutput::Prf);
@@ -1196,9 +1368,8 @@ fn one_admitted_module_handles_every_operation_and_withdrawal_never_falls_back()
 
     module.set_serviceable(all.without(CryptoCapability::SealedKeyStorage));
     let before = module.counts.snapshot();
-    let error =
-        ikev2_nat_detection_hash(1, 2, "192.0.2.10:500".parse().expect("synthetic endpoint"))
-            .expect_err("withdrawn non-IKE policy capability must fail every operation");
+    let error = ikev2_certreq_authority_key_hash(certreq_spki)
+        .expect_err("withdrawn non-IKE policy capability must fail every operation");
     assert_eq!(
         error.code(),
         Ikev2CryptoModuleErrorCode::CapabilityWithdrawn
@@ -1208,9 +1379,8 @@ fn one_admitted_module_handles_every_operation_and_withdrawal_never_falls_back()
 
     module.set_advertised(all.without(CryptoCapability::IkeHash));
     let before = module.counts.snapshot();
-    let error =
-        ikev2_nat_detection_hash(1, 2, "192.0.2.10:500".parse().expect("synthetic endpoint"))
-            .expect_err("withdrawn advertised capability must fail");
+    let error = ikev2_certreq_authority_key_hash(certreq_spki)
+        .expect_err("withdrawn advertised capability must fail");
     assert_eq!(
         error.code(),
         Ikev2CryptoModuleErrorCode::CapabilityWithdrawn

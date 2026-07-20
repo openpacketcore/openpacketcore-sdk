@@ -34,6 +34,9 @@ control-plane stack.
   `Ikev2SaInitProtectedPayloadProvider` or an adapter whose identity is bound
   to their admitted module. Direct caller crypto invalidates SDK admission
   claims rather than gaining them from a slot-presence check.
+- `certreq` validates one bounded, exact DER X.509 `SubjectPublicKeyInfo` and
+  computes its RFC 7296 section 3.7 Certification Authority identifier through
+  the admitted IKE hash operation. The result has redaction-safe `Debug`.
 - `sa_init`, `sa_init_crypto`, and `sa_init_negotiation` provide typed
   SA/KE/Nonce/Notify helpers, SA_INIT response builders, product-neutral
   responder proposal selection, Diffie-Hellman group/profile types, and
@@ -81,7 +84,8 @@ control-plane stack.
 IKEv2 cryptographic operations have no implicit software or `testkit`
 fallback. Before accepting IKE traffic, a process must build
 `Ikev2CryptoRequirements` from every configured IKE-SA profile, NAT-detection
-use, and signature direction, then admit one exact `Arc<dyn IkeCryptoModule>`.
+use, CERTREQ authority hashing use, and signature direction, then admit one
+exact `Arc<dyn IkeCryptoModule>`.
 Admission probes the module, applies `ProviderPolicy`, preflights every named
 algorithm, and sets an immutable process slot only after all checks succeed.
 A failed preflight leaves the slot unset; a successful slot cannot be reset or
@@ -113,6 +117,7 @@ fn security_phases(
         requirements.require_ike_sa_profile(profile)?;
     }
     requirements.require_nat_detection();
+    requirements.require_certreq_authority_hash();
     requirements.require_signature_generation(
         IkeSignatureAlgorithm::EcdsaP256Sha2_256,
     );
@@ -143,6 +148,31 @@ deliberately separate. Default builds can verify RSA peer AUTH but reject RSA
 private-key signing unless the `rsa-signing` feature is compiled. The bundled
 `Ikev2SoftwareCryptoModule` is an explicit RustCrypto-backed choice and reports
 `ValidationState::NotValidated`; selecting it makes no certification claim.
+
+`require_nat_detection` and `require_certreq_authority_hash` are also
+deliberately separate. Both require `IkeHash` and SHA-1, but a configuration
+that admits one protocol use does not authorize the other. To build one X.509
+CERTREQ authority value, pass the complete DER `SubjectPublicKeyInfo` element
+from the configured CA trust anchor—not a whole certificate, PEM, or the bare
+public-key BIT STRING:
+
+```rust
+use opc_proto_ikev2::{
+    ikev2_certreq_authority_key_hash, Ikev2CertReqSubjectPublicKeyInfo,
+};
+
+let spki = Ikev2CertReqSubjectPublicKeyInfo::from_der(configured_ca_spki_der)?;
+let authority = ikev2_certreq_authority_key_hash(spki)?;
+certreq_ca_data.extend_from_slice(authority.as_bytes());
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+The constructor accepts exactly one DER SPKI with no trailing bytes and rejects
+empty, malformed, or over-bounded input before provider selection. Every hash
+call then rechecks module identity, validation declaration, capability
+admission, advertisement/readiness, SHA-1 operation support, provider success,
+and an exact 20-octet output. Neither path has an implicit software/test
+fallback.
 
 Every operation rechecks the complete admitted capability set, current module
 identity and validation declaration, readiness, advertisement, and the exact
@@ -182,6 +212,13 @@ IKEv2 cryptographic operation. `ikev2_nat_detection_hash` and
 `evaluate_ikev2_nat_detection` are now fallible and return
 `Ikev2CryptoModuleError`; callers must propagate or map that error rather than
 assuming NAT-D hashing cannot fail.
+
+Applications that construct X.509 CERTREQ authority values must also call
+`Ikev2CryptoRequirements::require_certreq_authority_hash` during startup,
+validate the configured CA SPKI with
+`Ikev2CertReqSubjectPublicKeyInfo::from_der`, and propagate
+`ikev2_certreq_authority_key_hash` failures. Enabling NAT-D alone is
+intentionally insufficient.
 
 This additive API is source-breaking for downstream exhaustive matches. Add a
 `CryptoModuleFailure { error }` arm to matches over:

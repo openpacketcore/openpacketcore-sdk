@@ -3052,6 +3052,7 @@ dependencies = [
  "sha1",
  "sha2 0.10.9",
  "sha2 0.11.0",
+ "spki 0.7.3",
  "subtle",
  "x509-parser 0.16.0",
  "zeroize",

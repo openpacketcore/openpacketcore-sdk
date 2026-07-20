@@ -289,8 +289,8 @@ impl fmt::Debug for Ikev2CertificatePayload<'_> {
 /// Borrowed typed view of an IKEv2 CERTREQ payload.
 ///
 /// The Certification Authority field may be empty; when present it carries
-/// concatenated SHA-1 hashes of trusted CA SubjectPublicKeyInfo values for
-/// encoding 4.
+/// concatenated SHA-1 hashes of the complete DER `SubjectPublicKeyInfo`
+/// elements from trusted CA certificates for encoding 4.
 ///
 /// @spec IETF RFC7296 3.7
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1199,7 +1199,9 @@ pub fn build_ike_auth_certificate_payload(
 ///
 /// The Certification Authority field is caller-supplied opaque bytes; for
 /// encoding 4 it must be a concatenation of 20-octet SHA-1 hashes of trusted CA
-/// SubjectPublicKeyInfo values, and it may be empty.
+/// complete DER `SubjectPublicKeyInfo` elements, and it may be empty. Use
+/// [`crate::ikev2_certreq_authority_key_hash`] to construct each hash through
+/// the admitted IKEv2 cryptographic module.
 pub fn build_ike_auth_certreq_payload(
     input: &Ikev2CertificateRequestPayloadBuild,
 ) -> Result<Vec<u8>, Ikev2IkeAuthBuildError> {

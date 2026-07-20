@@ -37,6 +37,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   packet and topology identities.
 
 ### Added
+- **Admitted IKEv2 CERTREQ authority hashing — `opc-proto-ikev2`:** adds a
+  bounded exact-DER `SubjectPublicKeyInfo` input and redaction-safe 20-octet
+  RFC 7296 section 3.7 Certification Authority hash. The SHA-1 operation runs
+  only through the installed `IkeCryptoModule`, has its own explicit
+  `Ikev2CryptoRequirements` authorization independent of NAT-D, and rechecks
+  module evidence, readiness, capability, operation support, provider success,
+  and output width on every call with no implicit fallback (#412).
 - **SWm DER access authorization context — `opc-proto-diameter`:**
   `SwmDiameterEapRequest` can now encode and decode typed `RAT-Type` and
   redacted `Service-Selection` fields with their exact 3GPP/IETF vendor, flag,
