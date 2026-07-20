@@ -41,6 +41,7 @@ rsa = { workspace = true }
 sha1 = { workspace = true }
 sha2 = { workspace = true }
 sha2-zeroize = { workspace = true }
+spki = { version = "0.7.3", default-features = false }
 subtle = { workspace = true }
 x509-parser = { workspace = true }
 zeroize = { workspace = true }

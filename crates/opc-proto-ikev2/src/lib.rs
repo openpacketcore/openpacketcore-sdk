@@ -39,12 +39,15 @@
 //! [`CryptoProvider`] boundary cannot establish module identity by itself;
 //! validated deployments use [`Ikev2SaInitProtectedPayloadProvider`] or bind
 //! their adapter to the admitted module. Direct external crypto is outside the
-//! SDK admission evidence.
+//! SDK admission evidence. RFC 7296 CERTREQ authority-key hashing validates an
+//! exact DER `SubjectPublicKeyInfo` and has an explicit requirement independent
+//! of NAT-detection hashing even though both route through admitted SHA-1.
 //!
 //! @spec IETF RFC7296
 //! @req REQ-IETF-RFC7296-IKEV2-SCAFFOLD-001
 //! @conformance experimental-mechanism boundary — see CONFORMANCE.md
 
+pub mod certreq;
 pub mod crypto;
 pub mod crypto_module;
 pub mod dedicated_bearer;
@@ -70,6 +73,11 @@ pub mod software_crypto;
 pub mod testkit;
 pub mod validation;
 
+pub use certreq::{
+    ikev2_certreq_authority_key_hash, Ikev2CertReqAuthorityHash, Ikev2CertReqSubjectPublicKeyInfo,
+    Ikev2CertReqSubjectPublicKeyInfoError, IKEV2_CERTREQ_AUTHORITY_HASH_LEN,
+    IKEV2_CERTREQ_SUBJECT_PUBLIC_KEY_INFO_MAX_LEN,
+};
 pub use crypto::{
     open_protected_payloads, CryptoProvider, OpenedProtectedPayload, ProtectedPayloadContext,
     ProtectedPayloadKind, ProtectedPayloadOpenError, ProtectedPayloadOpenFailure,
