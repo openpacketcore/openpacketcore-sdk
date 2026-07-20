@@ -17,7 +17,8 @@ use opc_ipsec_lb::{
     HostPrefix, IpAddress, IpsecLbError, LeaseGeneration, PathHealth, PeerIdentity,
     PeerObservation, PeerSessionChangeReason, PeerSessionState, PrefixAdvertisementState,
     PrefixAdvertiserConfig, PrefixAdvertiserService, PrefixApplyOutcome, PrefixRejectReason,
-    PrefixWithdrawReason, ReconcileDisposition, RoutingDomainTag, RoutingEventKind,
+    PrefixWithdrawReason, ReconcileDisposition, RecordedStackMutation, RoutingDomainTag,
+    RoutingEventKind,
 };
 
 use proptest::prelude::*;
@@ -742,6 +743,119 @@ async fn cancelled_reconcile_driver_completes_to_consistent_state() {
     assert_eq!(report.disposition, ReconcileDisposition::Retained);
 }
 
+/// The reviewer's F1 probe: abort after the side effect lands, drain, then
+/// release the gate. The stale driver must not re-originate the drained
+/// prefix, and no apply may reach the adapter after the drain's withdrawal.
+#[tokio::test]
+async fn cancel_then_drain_cannot_reoriginate_or_leave_phantom_belief() {
+    let stack = ConformanceFakeRoutingStack::new();
+    let gate = stack.gate_next_apply();
+    let service = Arc::new(service(stack.clone()));
+
+    let task = tokio::spawn({
+        let service = Arc::clone(&service);
+        async move {
+            service
+                .reconcile(domain(DOMAIN_A), prefixes(&[10]), Some(lease(1)))
+                .await
+        }
+    });
+    gate.wait_landed().await;
+    task.abort();
+
+    // The drain queues behind the parked driver on the apply lock; once the
+    // driver finishes, the withdrawal is the last adapter effect.
+    let drain = tokio::spawn({
+        let service = Arc::clone(&service);
+        async move {
+            service
+                .reconcile(domain(DOMAIN_A), BTreeSet::new(), None)
+                .await
+        }
+    });
+    tokio::task::yield_now().await;
+    gate.release();
+    let report = drain.await.unwrap().unwrap();
+
+    assert_eq!(report.disposition, ReconcileDisposition::Withdrawn);
+    assert!(stack.originated(domain(DOMAIN_A)).is_empty());
+    assert_eq!(
+        stack.mutation_log(),
+        vec![
+            RecordedStackMutation::Apply {
+                domain: domain(DOMAIN_A),
+                desired: prefixes(&[10]),
+            },
+            RecordedStackMutation::WithdrawAll {
+                domain: domain(DOMAIN_A),
+            },
+        ],
+        "the drain's withdrawal must be the final adapter effect"
+    );
+    assert!(service
+        .prefix_snapshots(domain(DOMAIN_A))
+        .iter()
+        .all(|snapshot| snapshot.state != PrefixAdvertisementState::Advertised));
+}
+
+/// Two queued drivers plus a drain totally order on the apply lock: the
+/// newer intent overwrites the stale one and the drain wins overall.
+#[tokio::test]
+async fn queued_stale_driver_cannot_overwrite_newer_intent() {
+    let stack = ConformanceFakeRoutingStack::new();
+    let gate = stack.gate_next_apply();
+    let service = Arc::new(service(stack.clone()));
+
+    let task = tokio::spawn({
+        let service = Arc::clone(&service);
+        async move {
+            service
+                .reconcile(domain(DOMAIN_A), prefixes(&[10]), Some(lease(1)))
+                .await
+        }
+    });
+    gate.wait_landed().await;
+    task.abort();
+
+    // A newer intent queues its driver behind the parked stale driver.
+    let newer = tokio::spawn({
+        let service = Arc::clone(&service);
+        async move {
+            service
+                .reconcile(domain(DOMAIN_A), prefixes(&[11]), Some(lease(2)))
+                .await
+        }
+    });
+    tokio::task::yield_now().await;
+    gate.release();
+    let report = newer.await.unwrap().unwrap();
+
+    assert_eq!(report.disposition, ReconcileDisposition::Advertised);
+    assert_eq!(stack.originated(domain(DOMAIN_A)), prefixes(&[11]));
+    assert_eq!(
+        stack.mutation_log(),
+        vec![
+            RecordedStackMutation::Apply {
+                domain: domain(DOMAIN_A),
+                desired: prefixes(&[10]),
+            },
+            RecordedStackMutation::Apply {
+                domain: domain(DOMAIN_A),
+                desired: prefixes(&[11]),
+            },
+        ],
+        "the newer intent must be the last adapter effect"
+    );
+    let snapshot = service
+        .prefix_snapshot(domain(DOMAIN_A), prefix(11))
+        .unwrap();
+    assert_eq!(snapshot.state, PrefixAdvertisementState::Advertised);
+    // The stale driver's prefix left the desired set and was converged out.
+    assert!(service
+        .prefix_snapshot(domain(DOMAIN_A), prefix(10))
+        .is_none_or(|snapshot| snapshot.state != PrefixAdvertisementState::Advertised));
+}
+
 #[tokio::test(start_paused = true)]
 async fn lease_enforcement_attempts_every_expired_domain_despite_errors() {
     let stack = ConformanceFakeRoutingStack::new();
@@ -917,15 +1031,16 @@ async fn telemetry_debug_output_never_prints_prefixes_or_peer_addresses() {
 proptest! {
     /// No call sequence can originate a prefix outside the requested set.
     ///
-    /// Random advertise/drain sequences over two domains must leave the
+    /// Random sequences of fresh advertises, same-generation renewals,
+    /// drains, and ambiguous apply failures over two domains must leave the
     /// fake's originated set equal to the harness-tracked expectation after
     /// every call, and every recorded apply must have originated a subset of
     /// the set the caller requested in that call.
     #[test]
     fn no_prefix_outside_the_requested_set_is_ever_originated(
         operations in prop::collection::vec(
-            (0u8..2, prop::collection::vec(0u8..6, 0..4), any::<bool>()),
-            1..48,
+            (0u8..2, 0u8..4, prop::collection::vec(0u8..6, 0..4)),
+            1..64,
         )
     ) {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -938,27 +1053,80 @@ proptest! {
             let domains = [domain(DOMAIN_A), domain(DOMAIN_B)];
             let mut generation = 0u64;
             let mut expected: [BTreeSet<HostPrefix>; 2] = [BTreeSet::new(), BTreeSet::new()];
+            // Per-domain: last intent (generation, set), live epoch, and
+            // whether the last apply ended ambiguously.
+            let mut intents: [Option<(u64, BTreeSet<HostPrefix>)>; 2] = [None, None];
+            let mut live = [false; 2];
+            let mut ambiguous = [false; 2];
 
-            for (domain_index, members, advertise) in operations {
+            for (domain_index, operation, members) in operations {
                 let index = usize::from(domain_index);
-                if advertise {
-                    generation += 1;
-                    let desired: BTreeSet<HostPrefix> = members
-                        .iter()
-                        .map(|member| prefix(member.saturating_add(10)))
-                        .collect();
-                    let report = service
-                        .reconcile(domains[index], desired.clone(), Some(lease(generation)))
-                        .await
-                        .unwrap();
-                    prop_assert_eq!(report.disposition, ReconcileDisposition::Advertised);
-                    expected[index] = desired;
-                } else {
-                    service
-                        .reconcile(domains[index], BTreeSet::new(), None)
-                        .await
-                        .unwrap();
-                    expected[index] = BTreeSet::new();
+                let subset: BTreeSet<HostPrefix> = members
+                    .iter()
+                    .map(|member| prefix(member.saturating_add(10)))
+                    .collect();
+                match operation {
+                    // Fresh-generation advertise.
+                    0 => {
+                        generation += 1;
+                        let report = service
+                            .reconcile(domains[index], subset.clone(), Some(lease(generation)))
+                            .await
+                            .unwrap();
+                        prop_assert_eq!(report.disposition, ReconcileDisposition::Advertised);
+                        expected[index] = subset.clone();
+                        intents[index] = Some((generation, subset));
+                        live[index] = true;
+                        ambiguous[index] = false;
+                    }
+                    // Drain.
+                    1 => {
+                        let report = service
+                            .reconcile(domains[index], BTreeSet::new(), None)
+                            .await
+                            .unwrap();
+                        prop_assert_eq!(report.disposition, ReconcileDisposition::Withdrawn);
+                        expected[index] = BTreeSet::new();
+                        live[index] = false;
+                        ambiguous[index] = false;
+                    }
+                    // Same-generation renewal of the last intent.
+                    2 => {
+                        let Some((last_generation, last_set)) = intents[index].clone() else {
+                            continue;
+                        };
+                        let report = service
+                            .reconcile(
+                                domains[index],
+                                last_set,
+                                Some(lease(last_generation)),
+                            )
+                            .await
+                            .unwrap();
+                        let expected_disposition = if !live[index] {
+                            ReconcileDisposition::StaleRejected
+                        } else if ambiguous[index] {
+                            ReconcileDisposition::Advertised
+                        } else {
+                            ReconcileDisposition::Retained
+                        };
+                        prop_assert_eq!(report.disposition, expected_disposition);
+                        ambiguous[index] = false;
+                    }
+                    // Advertise with an ambiguous apply-then-disconnect fault.
+                    _ => {
+                        stack.fail_next_apply(FakeApplyFailure::DisconnectAfterFullApply);
+                        generation += 1;
+                        let result = service
+                            .reconcile(domains[index], subset.clone(), Some(lease(generation)))
+                            .await;
+                        prop_assert!(result.is_err());
+                        // The fake applied the full set before failing.
+                        expected[index] = subset.clone();
+                        intents[index] = Some((generation, subset));
+                        live[index] = true;
+                        ambiguous[index] = true;
+                    }
                 }
                 for (slot, expected_set) in expected.iter().enumerate() {
                     prop_assert_eq!(&stack.originated(domains[slot]), expected_set);
@@ -968,6 +1136,11 @@ proptest! {
             for call in stack.apply_calls() {
                 prop_assert!(call.originated_after.is_subset(&call.desired));
                 prop_assert!(call.desired.len() <= 4);
+            }
+            for mutation in stack.mutation_log() {
+                if let RecordedStackMutation::Apply { desired, .. } = mutation {
+                    prop_assert!(desired.len() <= 4);
+                }
             }
             Ok(())
         })?;

@@ -128,8 +128,9 @@ pub use routing::{
     PathHealth, PeerIdentity, PeerObservation, PeerSessionChangeReason, PeerSessionState,
     PrefixAdvertisementState, PrefixAdvertiserConfig, PrefixAdvertiserService, PrefixApplyOutcome,
     PrefixReconcileReport, PrefixRejectReason, PrefixStatusSnapshot, PrefixWithdrawReason,
-    ReconcileDisposition, RecordedAdvertisementApply, RoutingEvent, RoutingEventKind,
-    RoutingStackAdapter, RoutingStackKind, RoutingStackProbe, MAX_ADVERTISED_PREFIXES_PER_DOMAIN,
+    ReconcileDisposition, RecordedAdvertisementApply, RecordedStackMutation, RoutingEvent,
+    RoutingEventKind, RoutingStackAdapter, RoutingStackKind, RoutingStackProbe,
+    MAX_ADVERTISED_PREFIXES_PER_DOMAIN,
 };
 pub use selector::{
     measure_disruption, RendezvousSelector, SelectionKey, ShardDisruption, ShardSet,

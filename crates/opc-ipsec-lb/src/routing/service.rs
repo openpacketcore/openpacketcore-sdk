@@ -172,11 +172,13 @@ struct ServiceState {
 ///   watchdog withdraws any possibly-originated prefixes, and recovery uses
 ///   the same-generation retry above.
 ///
-/// Cancellation safety: adapter applies are driven to completion by an
-/// internal driver task detached from the caller's future, and mutations
-/// serialize on an internal apply lock in intent order. Cancelling the
-/// `reconcile` future can therefore never tear service belief: the driver
-/// still applies the outcomes. Withdrawals instead pre-mark tracks as
+/// Cancellation safety: adapter mutations totally order on the internal
+/// apply lock, applies are driven to completion by a detached driver task,
+/// and the driver re-validates that its intent is still current (same
+/// desired set, same generation, lease still armed) after winning the
+/// lock — a stale driver bails without touching the adapter. Cancelling
+/// the `reconcile` future can therefore never tear service belief or
+/// re-originate a drained prefix. Withdrawals pre-mark tracks as
 /// unconfirmed before the adapter call, so a cancelled or failed withdraw
 /// never leaves phantom `Advertised` state behind.
 ///
@@ -419,14 +421,10 @@ where
         // belief behind. The lease deadline stays armed on error so the
         // watchdog retries the withdrawal on its next tick.
         let now = self.clock.now_utc();
-        let mut pending = Vec::new();
         {
             let mut state = lock_state(&self.state);
             let domain_state = state.domains.entry(domain).or_default();
-            for (prefix, track) in &mut domain_state.prefixes {
-                // Unknown tracks are re-collected so a watchdog retry after
-                // an ambiguous earlier attempt still converges them to a
-                // terminal withdrawn state with its event.
+            for track in domain_state.prefixes.values_mut() {
                 if track.originated
                     || matches!(
                         track.state,
@@ -436,29 +434,44 @@ where
                     track.originated = false;
                     track.state = PrefixAdvertisementState::Unknown;
                     track.last_transition = Some(now);
-                    pending.push(*prefix);
                 }
             }
         }
+        // Adapter mutations totally order with applies on the apply lock: a
+        // queued driver always runs either strictly before or strictly after
+        // this withdrawal, never concurrently with it.
+        let _apply = self.apply_lock.lock().await;
         self.adapter.withdraw_all(domain).await?;
 
         let now = self.clock.now_utc();
         let mut state = lock_state(&self.state);
+        let mut withdrawn = Vec::new();
         {
             let domain_state = state.domains.entry(domain).or_default();
             domain_state.advertised_generation = None;
             domain_state.lease_deadline = None;
             domain_state.desired.clear();
-            for prefix in &pending {
-                if let Some(track) = domain_state.prefixes.get_mut(prefix) {
+            // Re-scan at finalize time: a driver that ran before this
+            // withdrawal may have finalized tracks the pre-mark pass could
+            // not see, and only a current scan converges every non-terminal
+            // track without duplicating events.
+            for (prefix, track) in &mut domain_state.prefixes {
+                if track.originated
+                    || matches!(
+                        track.state,
+                        PrefixAdvertisementState::Advertised | PrefixAdvertisementState::Unknown
+                    )
+                {
+                    track.originated = false;
                     track.state = PrefixAdvertisementState::Withdrawn;
                     track.last_transition = Some(now);
                     track.last_withdraw_reason = Some(reason);
+                    withdrawn.push(*prefix);
                 }
             }
             prune_terminal_tracks(domain_state);
         }
-        for prefix in pending {
+        for prefix in withdrawn {
             emit_locked(
                 &mut state,
                 &self.events,
@@ -730,6 +743,12 @@ where
 /// driver to run is always the last adapter effect and the last belief —
 /// a retried intent queued after a cancelled call can never be overwritten
 /// by the stale driver.
+///
+/// Between being spawned and winning the lock the domain may have moved on
+/// (a drain, or a newer intent): the driver re-validates intent currency
+/// after acquiring the lock and bails without touching the adapter when its
+/// intent is stale, so a cancelled-then-drained apply can never re-originate
+/// a prefix the drain already withdrew.
 #[allow(clippy::too_many_arguments)]
 async fn drive_apply<A>(
     adapter: Arc<A>,
@@ -745,6 +764,11 @@ where
     A: RoutingStackAdapter,
 {
     let _apply = apply_lock.lock().await;
+    if !intent_is_current(&state, domain, &desired, generation) {
+        return Err(IpsecLbError::OwnershipConflict {
+            reason: "advertisement intent superseded before apply",
+        });
+    }
     let outcomes = match adapter.apply_advertisement_set(domain, &desired).await {
         Ok(outcomes) => outcomes,
         Err(error) => {
@@ -1070,4 +1094,70 @@ fn established_peers(state: &ServiceState, domain: RoutingDomainTag) -> BTreeSet
         })
         .map(|(_, track)| track.identity.clone())
         .collect()
+}
+
+/// Check that a queued apply driver's intent is still the domain's current
+/// intent: identical desired set, same generation, lease still armed.
+fn intent_is_current(
+    state: &Arc<Mutex<ServiceState>>,
+    domain: RoutingDomainTag,
+    desired: &BTreeSet<HostPrefix>,
+    generation: LeaseGeneration,
+) -> bool {
+    let state = lock_state(state);
+    state.domains.get(&domain).is_some_and(|domain_state| {
+        domain_state.desired == *desired
+            && domain_state.highest_generation == Some(generation)
+            && domain_state.lease_deadline.is_some()
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::IpAddress;
+    use crate::routing::ConformanceFakeRoutingStack;
+
+    fn prefix(last: u8) -> HostPrefix {
+        HostPrefix::new(IpAddress::V4([203, 0, 113, last]))
+    }
+
+    /// A driver that loses the race against a drain must bail before
+    /// touching the adapter: no apply call, no adapter-side mutation.
+    #[tokio::test]
+    async fn stale_driver_bails_without_touching_the_adapter() {
+        let adapter = Arc::new(ConformanceFakeRoutingStack::new());
+        let apply_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let state = Arc::new(Mutex::new(ServiceState::default()));
+        let (events, _receiver) = broadcast::channel(8);
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let domain = RoutingDomainTag::new(64512);
+        let generation = LeaseGeneration::new(1).unwrap();
+        // Domain state exactly as a completed drain left it.
+        {
+            let mut state = lock_state(&state);
+            let domain_state = state.domains.entry(domain).or_default();
+            domain_state.highest_generation = Some(generation);
+            domain_state.desired.clear();
+            domain_state.lease_deadline = None;
+        }
+
+        let error = drive_apply(
+            adapter.clone(),
+            apply_lock,
+            state,
+            events,
+            clock,
+            domain,
+            [prefix(10)].into_iter().collect(),
+            generation,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, IpsecLbError::OwnershipConflict { .. }));
+        assert!(adapter.apply_calls().is_empty());
+        assert!(adapter.mutation_log().is_empty());
+        assert!(adapter.originated(domain).is_empty());
+    }
 }

@@ -188,13 +188,20 @@ impl BirdCommandError {
 #[derive(Debug, Clone)]
 pub struct BirdControlSocketAdapter {
     config: BirdAdapterConfig,
+    /// Last successfully read BFD health per neighbor. `show bfd sessions`
+    /// failures degrade to the cache instead of flapping every peer to
+    /// `Unknown`, so path-health events fire only on real transitions.
+    bfd_health_cache: std::sync::Arc<std::sync::Mutex<BTreeMap<IpAddress, PathHealth>>>,
 }
 
 impl BirdControlSocketAdapter {
     /// Build an adapter from a validated configuration.
     pub fn new(config: BirdAdapterConfig) -> Result<Self, IpsecLbError> {
         config.validate()?;
-        Ok(Self { config })
+        Ok(Self {
+            config,
+            bfd_health_cache: std::sync::Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+        })
     }
 
     fn binding(&self, domain: RoutingDomainTag) -> Result<&BirdDomainBinding, IpsecLbError> {
@@ -408,36 +415,39 @@ enum ReplyLine {
 
 /// Classify one wire line after CR/LF stripping.
 ///
-/// Handles the two BIRD framing quirks: continuation lines whose repeated
-/// code is collapsed to four spaces, and final replies with empty text
-/// (`0000 `) or no trailing separator at all (bare `0000`).
+/// Handles the BIRD framing quirks: repeated continuation codes are
+/// collapsed to a single space plus the original text (nest/cli.c), and
+/// final replies may carry empty text (`0000 `) or no trailing separator
+/// at all (bare `0000`).
 fn classify_reply_line(line: &str, last_code: &mut u16) -> ReplyLine {
     let bytes = line.as_bytes();
-    let (code, continuation, text) = if bytes.len() >= 5
+    if bytes.len() >= 5
         && bytes[..4].iter().all(u8::is_ascii_digit)
         && matches!(bytes[4], b' ' | b'-')
     {
         let code: u16 = line[..4].parse().unwrap_or(0);
-        (code, bytes[4] == b'-', &line[5..])
-    } else if bytes.len() >= 5
-        && bytes[..4].iter().all(|byte| *byte == b' ')
-        && matches!(bytes[4], b' ' | b'-')
-    {
-        // Code-collapsed continuation of the previous reply line.
-        (*last_code, bytes[4] == b'-', &line[5..])
-    } else if bytes.len() == 4 && bytes.iter().all(u8::is_ascii_digit) {
-        (line.parse().unwrap_or(0), false, "")
-    } else {
-        return ReplyLine::Content(line.to_owned());
-    };
-    *last_code = code;
-    if continuation {
-        ReplyLine::Content(text.to_owned())
-    } else if code == REPLY_READING_CONFIG {
-        ReplyLine::Progress
-    } else {
-        ReplyLine::Final(code, text.to_owned())
+        *last_code = code;
+        if bytes[4] == b'-' {
+            return ReplyLine::Content(line[5..].to_owned());
+        }
+        if code == REPLY_READING_CONFIG {
+            return ReplyLine::Progress;
+        }
+        return ReplyLine::Final(code, line[5..].to_owned());
     }
+    if bytes.first() == Some(&b' ') {
+        // Code-collapsed continuation of the previous reply line: exactly
+        // one space replaces code and separator; final replies always carry
+        // their code explicitly, so this is never a terminator.
+        let _ = last_code;
+        return ReplyLine::Content(line[1..].to_owned());
+    }
+    if bytes.len() == 4 && bytes.iter().all(u8::is_ascii_digit) {
+        let code: u16 = line.parse().unwrap_or(0);
+        *last_code = code;
+        return ReplyLine::Final(code, String::new());
+    }
+    ReplyLine::Content(line.to_owned())
 }
 
 /// Render the `protocol static` fragment for the exact desired set.
@@ -546,9 +556,9 @@ fn parse_show_protocols_all(output: &[String]) -> Vec<ParsedProtocol> {
     protocols
 }
 
-/// Parse `show bfd sessions` output into neighbor-address health rows.
+/// Parse `show bfd sessions` output into per-neighbor path health.
 ///
-/// The real BIRD 2 output is a table per BFD instance:
+/// The real BIRD 2 output is a table per BFD instance (reply code 1020):
 ///
 /// ```text
 /// bfd1:
@@ -556,19 +566,48 @@ fn parse_show_protocols_all(output: &[String]) -> Vec<ParsedProtocol> {
 /// 192.0.2.1                 eth0       Up         10:00:00.000  0.050     0.250
 /// ```
 ///
-/// Lines that do not start with a parseable IP address (instance headers,
-/// the column header) are skipped.
-fn parse_show_bfd_sessions(output: &[String]) -> Vec<(IpAddress, PathHealth)> {
-    output
-        .iter()
-        .filter_map(|line| {
-            let mut tokens = line.split_whitespace();
-            let address = parse_ip_address(tokens.next()?)?;
-            let _interface = tokens.next()?;
-            let state = tokens.next()?;
-            Some((address, parse_bfd_state(state)))
-        })
-        .collect()
+/// Lines that do not start with a parseable neighbor address (instance
+/// headers, the column header) are skipped. Link-local neighbors are
+/// printed with a `%zone` suffix (`fe80::1%eth0`); the zone is dropped for
+/// correlation. Multiple sessions to the same neighbor fold
+/// conservatively: the worst reported state wins (`Down` beats `AdminDown`
+/// beats `Unknown` beats `Up`).
+fn parse_show_bfd_sessions(output: &[String]) -> BTreeMap<IpAddress, PathHealth> {
+    let mut health: BTreeMap<IpAddress, PathHealth> = BTreeMap::new();
+    for line in output {
+        let mut tokens = line.split_whitespace();
+        let Some(address) = tokens.next().and_then(parse_bfd_neighbor) else {
+            continue;
+        };
+        let Some(_interface) = tokens.next() else {
+            continue;
+        };
+        let Some(state) = tokens.next() else {
+            continue;
+        };
+        let state = parse_bfd_state(state);
+        health
+            .entry(address)
+            .and_modify(|current| *current = merge_path_health(*current, state))
+            .or_insert(state);
+    }
+    health
+}
+
+/// Conservative fold of several BFD sessions to one neighbor.
+fn merge_path_health(a: PathHealth, b: PathHealth) -> PathHealth {
+    match (a, b) {
+        (PathHealth::Down, _) | (_, PathHealth::Down) => PathHealth::Down,
+        (PathHealth::AdminDown, _) | (_, PathHealth::AdminDown) => PathHealth::AdminDown,
+        (PathHealth::Unknown, _) | (_, PathHealth::Unknown) => PathHealth::Unknown,
+        _ => PathHealth::Up,
+    }
+}
+
+/// Parse a BFD neighbor address, dropping any `%zone` suffix BIRD prints
+/// for link-local neighbors.
+fn parse_bfd_neighbor(text: &str) -> Option<IpAddress> {
+    parse_ip_address(text.split('%').next()?)
 }
 
 fn parse_ip_address(text: &str) -> Option<IpAddress> {
@@ -695,11 +734,24 @@ impl RoutingStackAdapter for BirdControlSocketAdapter {
                     ),
                 })?;
         // BFD reporting is optional: a daemon without a BFD protocol answers
-        // with an error reply, which must not blind session telemetry.
+        // with an error reply, which must not blind session telemetry. A
+        // failed read degrades to the last successfully read health table
+        // instead of flapping every peer to Unknown.
         let bfd_health: BTreeMap<IpAddress, PathHealth> =
             match self.command("show bfd sessions").await {
-                Ok(reply) => parse_show_bfd_sessions(&reply.lines).into_iter().collect(),
-                Err(_) => BTreeMap::new(),
+                Ok(reply) => {
+                    let fresh = parse_show_bfd_sessions(&reply.lines);
+                    *self
+                        .bfd_health_cache
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = fresh.clone();
+                    fresh
+                }
+                Err(_) => self
+                    .bfd_health_cache
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone(),
             };
         let protocols = parse_show_protocols_all(&protocols_reply.lines);
         let mut observations = Vec::new();
@@ -758,6 +810,7 @@ impl fmt::Display for BirdControlSocketAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
     use tokio::net::UnixListener;
 
     fn binding() -> BirdDomainBinding {
@@ -785,11 +838,28 @@ mod tests {
         }
     }
 
+    type ScriptMap = Arc<Mutex<BTreeMap<String, Vec<String>>>>;
+
+    fn script_map(pairs: &[(&str, &[&str])]) -> ScriptMap {
+        Arc::new(Mutex::new(
+            pairs
+                .iter()
+                .map(|(command, lines)| {
+                    (
+                        (*command).to_owned(),
+                        lines.iter().map(|line| (*line).to_owned()).collect(),
+                    )
+                })
+                .collect(),
+        ))
+    }
+
     /// A minimal BIRD-faithful control-socket server: sends the greeting,
-    /// then answers each read line with the scripted raw reply bytes.
+    /// then answers each read line with the scripted raw reply bytes from
+    /// the shared script map (tests may rewrite scripts between calls).
     async fn spawn_mock_bird(
         socket_path: PathBuf,
-        replies: BTreeMap<String, Vec<String>>,
+        scripts: ScriptMap,
     ) -> tokio::task::JoinHandle<()> {
         let listener = UnixListener::bind(&socket_path).unwrap();
         tokio::spawn(async move {
@@ -797,7 +867,7 @@ mod tests {
                 let Ok((stream, _)) = listener.accept().await else {
                     return;
                 };
-                let replies = replies.clone();
+                let scripts = Arc::clone(&scripts);
                 tokio::spawn(async move {
                     let (read_half, mut write_half) = stream.into_split();
                     let mut reader = BufReader::new(read_half);
@@ -815,7 +885,12 @@ mod tests {
                             return;
                         }
                         let key = command.trim_end().to_owned();
-                        let Some(reply_lines) = replies.get(&key) else {
+                        let reply = scripts
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .get(&key)
+                            .cloned();
+                        let Some(reply_lines) = reply else {
                             write_half
                                 .write_all(b"9002 unimplemented command \n")
                                 .await
@@ -837,17 +912,15 @@ mod tests {
         // Whitespace-trimming readers destroy the separator and hang.
         let dir = test_dir("final-framing");
         std::fs::create_dir_all(dir.join("opc.d")).unwrap();
-        let replies: BTreeMap<String, Vec<String>> = [(
-            "show status".to_owned(),
-            vec![
-                "1000-BIRD 2.13\n".to_owned(),
-                "1011-Router ID is 192.0.2.2\n".to_owned(),
-                "0000 \n".to_owned(),
+        let scripts = script_map(&[(
+            "show status",
+            &[
+                "1000-BIRD 2.13\n",
+                "1011-Router ID is 192.0.2.2\n",
+                "0000 \n",
             ],
-        )]
-        .into_iter()
-        .collect();
-        let _server = spawn_mock_bird(dir.join("bird.ctl"), replies).await;
+        )]);
+        let _server = spawn_mock_bird(dir.join("bird.ctl"), scripts).await;
         let adapter = BirdControlSocketAdapter::new(config(&dir)).unwrap();
 
         let probe = adapter.probe().await.unwrap();
@@ -857,43 +930,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn poll_parses_code_collapsed_real_row_codes() {
-        // Real `show protocols all` rows use codes 2002/1006 with repeated
-        // codes collapsed to four spaces; `show bfd sessions` rows use
-        // table rows keyed by neighbor IP.
+    async fn poll_parses_real_collapsed_framing_and_bfd_rows() {
+        // Real BIRD collapses a repeated continuation code to a single space
+        // plus the original text; `show bfd sessions` rows use code 1020.
         let dir = test_dir("collapsed-rows");
         std::fs::create_dir_all(dir.join("opc.d")).unwrap();
-        let replies: BTreeMap<String, Vec<String>> = [
+        let scripts = script_map(&[
             (
-                "show protocols all".to_owned(),
-                vec![
-                    "2002-Name       Proto      Table      State  Since         Info\n".to_owned(),
-                    "1002-device1    Device     ---        up     2024-01-01\n".to_owned(),
-                    "    -edge_a     BGP        ---        up     10:00:00      Established\n".to_owned(),
-                    "    -  Description:    upstream edge a\n".to_owned(),
-                    "    -  BGP state:          Established\n".to_owned(),
-                    "    -    Neighbor address: 203.0.113.1\n".to_owned(),
-                    "    -    Neighbor AS:      64512\n".to_owned(),
-                    "    -edge_b     BGP        ---        up     10:00:01      Active\n".to_owned(),
-                    "    -    Neighbor address: 203.0.113.2\n".to_owned(),
-                    "    -    Neighbor AS:      64513\n".to_owned(),
-                    "0000 \n".to_owned(),
+                "show protocols all",
+                &[
+                    "2002-Name       Proto      Table      State  Since         Info\n",
+                    "1002-device1    Device     ---        up     2024-01-01\n",
+                    " edge_a     BGP        ---        up     10:00:00      Established\n",
+                    "   Description:    upstream edge a\n",
+                    "   BGP state:          Established\n",
+                    "     Neighbor address: 203.0.113.1\n",
+                    "     Neighbor AS:      64512\n",
+                    " edge_b     BGP        ---        up     10:00:01      Active\n",
+                    "     Neighbor address: 203.0.113.2\n",
+                    "     Neighbor AS:      64513\n",
+                    "0000 \n",
                 ],
             ),
             (
-                "show bfd sessions".to_owned(),
-                vec![
-                    "2002-bfd1:\n".to_owned(),
-                    "1007-IP address                Interface  State      Since         Interval  Timeout\n".to_owned(),
-                    "    -203.0.113.1               eth0       Up         10:00:00.000  0.050     0.250\n".to_owned(),
-                    "    -203.0.113.2               eth0       Down       10:00:00.000  0.050     0.250\n".to_owned(),
-                    "0000 \n".to_owned(),
+                "show bfd sessions",
+                &[
+                    "1020-bfd1:\n",
+                    " IP address                Interface  State      Since         Interval  Timeout\n",
+                    " 203.0.113.1               eth0       Up         10:00:00.000  0.050     0.250\n",
+                    " 203.0.113.2               eth0       Down       10:00:00.000  0.050     0.250\n",
+                    "0000 \n",
                 ],
             ),
-        ]
-        .into_iter()
-        .collect();
-        let _server = spawn_mock_bird(dir.join("bird.ctl"), replies).await;
+        ]);
+        let _server = spawn_mock_bird(dir.join("bird.ctl"), scripts).await;
         let adapter = BirdControlSocketAdapter::new(config(&dir)).unwrap();
 
         let observations = adapter.poll_observations().await.unwrap();
@@ -916,6 +986,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bfd_health_cache_survives_transient_command_failure() {
+        let dir = test_dir("bfd-cache");
+        std::fs::create_dir_all(dir.join("opc.d")).unwrap();
+        let scripts = script_map(&[
+            (
+                "show protocols all",
+                &[
+                    "2002-Name       Proto      Table      State  Since         Info\n",
+                    "1002-edge_a     BGP        ---        up     10:00:00      Established\n",
+                    "     Neighbor address: 203.0.113.1\n",
+                    "0000 \n",
+                ],
+            ),
+            (
+                "show bfd sessions",
+                &[
+                    "1020-bfd1:\n",
+                    " 203.0.113.1               eth0       Up         10:00:00.000  0.050     0.250\n",
+                    "0000 \n",
+                ],
+            ),
+        ]);
+        let _server = spawn_mock_bird(dir.join("bird.ctl"), Arc::clone(&scripts)).await;
+        let adapter = BirdControlSocketAdapter::new(config(&dir)).unwrap();
+
+        let observations = adapter.poll_observations().await.unwrap();
+        assert_eq!(observations[0].path_health, PathHealth::Up);
+
+        // The BFD command now fails (unimplemented): the last known health
+        // is served from the cache instead of flapping to Unknown.
+        scripts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove("show bfd sessions");
+        let observations = adapter.poll_observations().await.unwrap();
+        assert_eq!(observations[0].path_health, PathHealth::Up);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn configure_reply_codes_classify_success_ambiguous_and_refused() {
         let desired: BTreeSet<HostPrefix> = [HostPrefix::new(IpAddress::V4([203, 0, 113, 10]))]
             .into_iter()
@@ -924,27 +1035,21 @@ mod tests {
         // 0003 Reconfigured + show route verifies the prefix: Accepted.
         let dir = test_dir("configure-success");
         std::fs::create_dir_all(dir.join("opc.d")).unwrap();
-        let replies: BTreeMap<String, Vec<String>> = [
+        let scripts = script_map(&[
             (
-                "configure soft".to_owned(),
-                vec![
-                    "0002-Reading configuration\n".to_owned(),
-                    "0003 Reconfigured\n".to_owned(),
-                ],
+                "configure soft",
+                &["0002-Reading configuration\n", "0003 Reconfigured\n"],
             ),
             (
-                "show route protocol opc_adv_64512".to_owned(),
-                vec![
-                    "1008-Table master4:\n".to_owned(),
-                    "    -203.0.113.10/32    blackhole [opc_adv_64512 10:00:00] * (200)\n"
-                        .to_owned(),
-                    "0000 \n".to_owned(),
+                "show route protocol opc_adv_64512",
+                &[
+                    "1008-Table master4:\n",
+                    " 203.0.113.10/32    blackhole [opc_adv_64512 10:00:00] * (200)\n",
+                    "0000 \n",
                 ],
             ),
-        ]
-        .into_iter()
-        .collect();
-        let _server = spawn_mock_bird(dir.join("bird.ctl"), replies).await;
+        ]);
+        let _server = spawn_mock_bird(dir.join("bird.ctl"), scripts).await;
         let adapter = BirdControlSocketAdapter::new(config(&dir)).unwrap();
         let outcomes = adapter
             .apply_advertisement_set(binding().domain, &desired)
@@ -962,13 +1067,8 @@ mod tests {
         // 0004 Reconfiguration in progress: ambiguous, never a rejection.
         let dir = test_dir("configure-queued");
         std::fs::create_dir_all(dir.join("opc.d")).unwrap();
-        let replies: BTreeMap<String, Vec<String>> = [(
-            "configure soft".to_owned(),
-            vec!["0004 Reconfiguration in progress\n".to_owned()],
-        )]
-        .into_iter()
-        .collect();
-        let _server = spawn_mock_bird(dir.join("bird.ctl"), replies).await;
+        let scripts = script_map(&[("configure soft", &["0004 Reconfiguration in progress\n"])]);
+        let _server = spawn_mock_bird(dir.join("bird.ctl"), scripts).await;
         let adapter = BirdControlSocketAdapter::new(config(&dir)).unwrap();
         let outcomes = adapter
             .apply_advertisement_set(binding().domain, &desired)
@@ -983,13 +1083,8 @@ mod tests {
         // 9xxx refusal: the only ConfigureFailed path.
         let dir = test_dir("configure-refused");
         std::fs::create_dir_all(dir.join("opc.d")).unwrap();
-        let replies: BTreeMap<String, Vec<String>> = [(
-            "configure soft".to_owned(),
-            vec!["9001 Parse error\n".to_owned()],
-        )]
-        .into_iter()
-        .collect();
-        let _server = spawn_mock_bird(dir.join("bird.ctl"), replies).await;
+        let scripts = script_map(&[("configure soft", &["9001 Parse error\n"])]);
+        let _server = spawn_mock_bird(dir.join("bird.ctl"), scripts).await;
         let adapter = BirdControlSocketAdapter::new(config(&dir)).unwrap();
         let outcomes = adapter
             .apply_advertisement_set(binding().domain, &desired)
@@ -1055,10 +1150,14 @@ mod tests {
             classify_reply_line("2002-Name       Proto", &mut last_code),
             ReplyLine::Content("Name       Proto".to_owned())
         );
-        // Code-collapsed continuation reattaches the previous code's text.
+        // Real code-collapse: a single space plus the original text.
         assert_eq!(
-            classify_reply_line("    -edge_a     BGP", &mut last_code),
+            classify_reply_line(" edge_a     BGP", &mut last_code),
             ReplyLine::Content("edge_a     BGP".to_owned())
+        );
+        assert_eq!(
+            classify_reply_line("   Description:    upstream", &mut last_code),
+            ReplyLine::Content("  Description:    upstream".to_owned())
         );
         // The real terminator: code, space, empty text.
         assert_eq!(
@@ -1149,12 +1248,47 @@ mod tests {
         .collect();
         let rows = parse_show_bfd_sessions(&output);
         assert_eq!(
-            rows,
-            vec![
-                (IpAddress::V4([203, 0, 113, 1]), PathHealth::Up),
-                (IpAddress::V4([203, 0, 113, 2]), PathHealth::Down),
-            ]
+            rows.get(&IpAddress::V4([203, 0, 113, 1])),
+            Some(&PathHealth::Up)
         );
+        assert_eq!(
+            rows.get(&IpAddress::V4([203, 0, 113, 2])),
+            Some(&PathHealth::Down)
+        );
+    }
+
+    #[test]
+    fn duplicate_bfd_sessions_fold_to_the_worst_state() {
+        let output: Vec<String> = [
+            "203.0.113.1               eth0       Up         10:00:00.000  0.050     0.250",
+            "203.0.113.1               eth1       Down       10:00:00.000  0.050     0.250",
+            "203.0.113.2               eth0       Up         10:00:00.000  0.050     0.250",
+            "203.0.113.2               eth1       Up         10:00:00.000  0.050     0.250",
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        let rows = parse_show_bfd_sessions(&output);
+        assert_eq!(
+            rows.get(&IpAddress::V4([203, 0, 113, 1])),
+            Some(&PathHealth::Down)
+        );
+        assert_eq!(
+            rows.get(&IpAddress::V4([203, 0, 113, 2])),
+            Some(&PathHealth::Up)
+        );
+    }
+
+    #[test]
+    fn link_local_bfd_neighbor_zone_suffix_is_dropped() {
+        let output: Vec<String> =
+            ["fe80::1%eth0                  eth0       Up         10:00:00.000  0.050     0.250"]
+                .iter()
+                .map(ToString::to_string)
+                .collect();
+        let rows = parse_show_bfd_sessions(&output);
+        let link_local = IpAddress::V6([0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        assert_eq!(rows.get(&link_local), Some(&PathHealth::Up));
     }
 
     #[test]

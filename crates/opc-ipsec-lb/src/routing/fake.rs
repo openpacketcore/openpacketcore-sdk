@@ -36,6 +36,28 @@ pub struct RecordedAdvertisementApply {
     pub originated_after: BTreeSet<HostPrefix>,
 }
 
+/// One effective adapter-side mutation, in order.
+///
+/// Only mutations that actually changed the fake's originated state are
+/// recorded, so tests can assert the exact ordering of adapter effects
+/// (for example that no apply lands after a drain's withdrawal).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RecordedStackMutation {
+    /// An apply mutated the originated set.
+    Apply {
+        /// Routing domain of the apply.
+        domain: RoutingDomainTag,
+        /// Exact desired set the service asked for.
+        desired: BTreeSet<HostPrefix>,
+    },
+    /// A withdrawal cleared the domain.
+    WithdrawAll {
+        /// Routing domain withdrawn.
+        domain: RoutingDomainTag,
+    },
+}
+
 /// Scripted ambiguous apply failure, consumed by the next apply call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -75,6 +97,7 @@ struct FakeState {
     originated: BTreeMap<RoutingDomainTag, BTreeSet<HostPrefix>>,
     apply_calls: Vec<RecordedAdvertisementApply>,
     withdraw_all_calls: Vec<RoutingDomainTag>,
+    mutation_log: Vec<RecordedStackMutation>,
     rejected_prefixes: BTreeSet<HostPrefix>,
     unreachable: bool,
     observations: Vec<PeerObservation>,
@@ -166,6 +189,12 @@ impl ConformanceFakeRoutingStack {
         self.lock().withdraw_all_calls.clone()
     }
 
+    /// Return every effective adapter-side mutation in order.
+    #[must_use]
+    pub fn mutation_log(&self) -> Vec<RecordedStackMutation> {
+        self.lock().mutation_log.clone()
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, FakeState> {
         self.state
             .lock()
@@ -226,6 +255,10 @@ impl RoutingStackAdapter for ConformanceFakeRoutingStack {
                         desired: desired.clone(),
                         originated_after: originated,
                     });
+                    state.mutation_log.push(RecordedStackMutation::Apply {
+                        domain,
+                        desired: desired.clone(),
+                    });
                     Scripted::None
                 }
                 Some(FakeApplyFailure::TimeoutBeforeApply) => Scripted::Fail(io_error(
@@ -237,6 +270,10 @@ impl RoutingStackAdapter for ConformanceFakeRoutingStack {
                     let partial: BTreeSet<HostPrefix> =
                         originated.iter().step_by(2).copied().collect();
                     state.originated.insert(domain, partial);
+                    state.mutation_log.push(RecordedStackMutation::Apply {
+                        domain,
+                        desired: desired.clone(),
+                    });
                     Scripted::Fail(io_error(
                         "fake_routing_stack_apply",
                         std::io::ErrorKind::NotConnected,
@@ -245,6 +282,10 @@ impl RoutingStackAdapter for ConformanceFakeRoutingStack {
                 }
                 Some(FakeApplyFailure::DisconnectAfterFullApply) => {
                     state.originated.insert(domain, originated);
+                    state.mutation_log.push(RecordedStackMutation::Apply {
+                        domain,
+                        desired: desired.clone(),
+                    });
                     Scripted::Fail(io_error(
                         "fake_routing_stack_apply",
                         std::io::ErrorKind::NotConnected,
@@ -293,6 +334,9 @@ impl RoutingStackAdapter for ConformanceFakeRoutingStack {
             ));
         }
         state.originated.remove(&domain);
+        state
+            .mutation_log
+            .push(RecordedStackMutation::WithdrawAll { domain });
         Ok(())
     }
 

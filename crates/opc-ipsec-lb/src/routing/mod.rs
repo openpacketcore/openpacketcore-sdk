@@ -30,6 +30,7 @@ pub mod service;
 pub use bird::{BirdAdapterConfig, BirdControlSocketAdapter, BirdDomainBinding};
 pub use fake::{
     ApplyGate, ConformanceFakeRoutingStack, FakeApplyFailure, RecordedAdvertisementApply,
+    RecordedStackMutation,
 };
 pub use service::{
     PrefixAdvertiserConfig, PrefixAdvertiserService, PrefixReconcileReport, ReconcileDisposition,
@@ -613,6 +614,11 @@ pub struct RoutingStackProbe {
 ///   nothing else — no connected or kernel-table redistribution, ever;
 /// - mutations are idempotent: re-applying the same set is a no-op;
 /// - observations are relayed, never synthesized by the adapter itself.
+///
+/// Implementations MUST bound the duration of every call (for example with
+/// a per-command timeout): the advertisement service serializes adapter
+/// mutations on its apply lock, so an unbounded adapter call would stall
+/// lease-expiry withdrawals for every routing domain.
 #[async_trait]
 pub trait RoutingStackAdapter: Send + Sync + std::fmt::Debug {
     /// Reconcile the exact originated host-prefix set for one routing domain.
