@@ -237,7 +237,7 @@ product instance reports readiness. If link-pin cleanup is reported, owner
 and fence mutation remains quiesced until
 `complete_upgrade_handoff_cleanup()` succeeds.
 
-The per-interface pin directory and its permanent `.control` directory are
+The per-interface pin directory and its permanent `control` directory are
 the process-shared lease identity. Never remove or rename either while any
 backend process may live. Use SDK detach/recovery for pin cleanup; manual
 cleanup requires quiescing every backend process first and removing only the

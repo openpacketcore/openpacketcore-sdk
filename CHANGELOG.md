@@ -26,7 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and atomically updates the exact retained BPF link with expected-old
   compare-and-replace. Owner pins are emptied and verified before handoff;
   interrupted evidence-last cleanup remains recoverable without regressing
-  the fence. A permanent per-interface `.control` inode serializes cooperating
+  the fence. A permanent per-interface `control` inode serializes cooperating
   processes for the full ready lifetime. The loader requires effective
   `CAP_NET_ADMIN` and `CAP_SYS_ADMIN`, admits only XDP `bpf_link` attachments,
   and rejects legacy netlink fallback. Readiness validates the configured

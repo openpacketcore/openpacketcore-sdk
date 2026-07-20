@@ -49,7 +49,7 @@
 //! config before the program is attached; the persisted fence is honored so
 //! entries installed by a crashed owner cannot be re-armed.
 //!
-//! The per-interface directory and its `.control` subdirectory are permanent
+//! The per-interface directory and its `control` subdirectory are permanent
 //! lifecycle-lock identity. Operators must never remove or rename either
 //! while any backend process may still be alive: doing so can create two
 //! independently locked inodes. Use SDK detach/recovery to clean documented
@@ -1502,7 +1502,9 @@ mod aya_runtime {
     const CAP_NET_ADMIN: u32 = 12;
     const CAP_SYS_ADMIN: u32 = 21;
     const BPF_FS_MAGIC: u64 = 0xcafe_4a11;
-    const CONTROL_DIRECTORY: &str = ".control";
+    // bpffs rejects dentry names containing `.` with EPERM. Keep this name
+    // deliberately plain so lifecycle locking works on the real filesystem.
+    pub(super) const CONTROL_DIRECTORY: &str = "control";
     const MAP_SLOT_A: &str = "maps-v4-a";
     const MAP_SLOT_B: &str = "maps-v4-b";
     const HANDOFF_LINK: &str = "upgrade-link";
@@ -4847,11 +4849,29 @@ mod tests {
             .block_on(parent_backend.detach())
             .expect("detach parent before harness cleanup");
         assert!(
-            root.join("swu0").join(".control").is_dir(),
+            root.join("swu0")
+                .join(aya_runtime::CONTROL_DIRECTORY)
+                .is_dir(),
             "SDK detach must preserve the permanent lifecycle-lock inode"
         );
         drop(parent_backend);
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn lifecycle_control_directory_name_is_valid_for_bpffs() {
+        let name = aya_runtime::CONTROL_DIRECTORY;
+        assert!(!name.is_empty(), "control directory name must not be empty");
+        assert!(
+            !name.contains('.'),
+            "bpffs reserves dots in directory entry names"
+        );
+        assert!(
+            name.bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-'),
+            "control directory name must remain filesystem-safe"
+        );
     }
 
     #[cfg(target_os = "linux")]
