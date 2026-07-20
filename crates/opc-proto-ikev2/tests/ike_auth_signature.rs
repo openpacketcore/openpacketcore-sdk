@@ -10,6 +10,8 @@ use opc_proto_ikev2::{
     RFC7427_ALGORITHM_IDENTIFIER_ECDSA_SHA2_384, RFC7427_ALGORITHM_IDENTIFIER_RSA_SHA2_256,
 };
 
+mod support;
+
 const RSA_SPKI_DER: &[u8] = include_bytes!("data/rsa2048_spki.der");
 const P256_PKCS8_DER: &[u8] = include_bytes!("data/p256_pkcs8.der");
 const P256_SPKI_DER: &[u8] = include_bytes!("data/p256_spki.der");
@@ -27,6 +29,7 @@ fn profile() -> Ikev2SaInitCryptoProfile {
 }
 
 fn key_material() -> Ikev2SaInitKeyMaterial {
+    support::ensure_ike_crypto();
     derive_ike_sa_init_key_material(
         profile(),
         [0x11; 8],
@@ -40,6 +43,7 @@ fn key_material() -> Ikev2SaInitKeyMaterial {
 }
 
 fn identity_payload_body() -> Vec<u8> {
+    support::ensure_ike_crypto();
     build_ike_auth_identification_payload(&Ikev2IdentificationPayloadBuild {
         id_type: 2,
         id_data: b"epdg.test.openpacketcore".to_vec(),
@@ -290,6 +294,7 @@ fn method_1_payload_with_ec_key_fails_closed() {
 
 #[test]
 fn key_parsing_fails_closed_on_garbage() {
+    support::ensure_ike_crypto();
     assert_eq!(
         Ikev2SignatureAuthKey::ecdsa_p256_pkcs8_der(&[0u8; 16]).expect_err("garbage EC key"),
         Ikev2SignatureKeyError::EcdsaPrivateKeyParse
@@ -384,6 +389,7 @@ fn exact_der_enforcement_preserves_existing_error_classes() {
 
 #[test]
 fn debug_output_redacts_key_material() {
+    support::ensure_ike_crypto();
     let key = Ikev2SignatureAuthKey::ecdsa_p256_pkcs8_der(P256_PKCS8_DER).expect("P-256 key");
     let debug = format!("{key:?}");
     assert!(debug.contains("key_kind"));
@@ -481,6 +487,7 @@ mod rsa_signing {
 
     #[test]
     fn rsa_key_parsing_fails_closed_on_garbage() {
+        support::ensure_ike_crypto();
         assert_eq!(
             Ikev2SignatureAuthKey::rsa_pkcs8_der(
                 Ikev2SignatureAuthMethod::RsaDigitalSignature,
@@ -502,6 +509,7 @@ mod rsa_signing {
 
     #[test]
     fn rsa_debug_output_redacts_key_material() {
+        support::ensure_ike_crypto();
         let key = Ikev2SignatureAuthKey::rsa_pkcs8_der(
             Ikev2SignatureAuthMethod::DigitalSignature,
             RSA_PKCS8_DER,

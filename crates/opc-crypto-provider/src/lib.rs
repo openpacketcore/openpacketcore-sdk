@@ -6,8 +6,8 @@
 //! modules.
 //!
 //! This crate defines the seam through which security-critical operations
-//! (TLS, IKEv2 PRF/integrity/encryption/signature/Diffie-Hellman, entropy,
-//! zeroization, sealed key storage) can later be routed to exactly one
+//! (TLS, IKEv2 hash/PRF/integrity/encryption/signature/Diffie-Hellman, entropy,
+//! zeroization, sealed key storage) can be routed to exactly one
 //! explicitly selected cryptographic module. It contains **no cryptographic
 //! algorithm implementations** and binds to no existing SDK crate; it defines
 //! only the capability model, evidence types, and admission policy that make
@@ -32,10 +32,18 @@
 //!   effective. Rejection is typed and happens before any operation could be
 //!   admitted: [`PolicyAdmission`] is only constructible through
 //!   [`ProviderPolicy::admit`], and there is no fallback path.
-//! - [`CryptoModule`] is the provider trait itself: identity, capabilities,
-//!   self-test, readiness. Later slices bind runtime health gates, IKEv2, TLS,
-//!   and `opc-key` custody to an admitted module; this crate deliberately
-//!   exposes no key or algorithm operations.
+//! - [`CryptoModule`] is the evidence trait: identity, capabilities, self-test,
+//!   and readiness. [`IkeCryptoModule`] composes it with the complete IKEv2
+//!   operation surface so admission and execution use one exact object. TLS
+//!   and `opc-key` custody bindings remain later work.
+//! - The [`ops`] module defines the synchronous, object-safe IKE
+//!   **operation traits** ([`IkeHashOperations`], [`IkeEntropyOperations`],
+//!   [`IkePrfOperations`], [`IkeIntegrityOperations`],
+//!   [`IkeEncryptionOperations`], [`IkeDiffieHellmanOperations`],
+//!   [`IkeSignatureOperations`]) grouped along the capability taxonomy.
+//!   These are contracts only — this crate still implements no cryptography,
+//!   and secret-bearing state stays behind opaque handles
+//!   ([`IkeDhKeyPair`], [`IkeSigningKey`]) or zeroizing buffers.
 //!
 //! # No certification claim
 //!
@@ -47,6 +55,7 @@
 
 pub mod capability;
 pub mod identity;
+pub mod ops;
 pub mod policy;
 pub mod provider;
 pub mod report;
@@ -59,7 +68,14 @@ pub use identity::{
     ProviderIdentity, ProviderLabelError, ProviderName, ProviderVersion, ValidationReference,
     ValidationState,
 };
+pub use ops::{
+    CryptoOperationError, CryptoOperationErrorCode, IkeAeadAlgorithm, IkeCbcAlgorithm,
+    IkeCryptoOperations, IkeDhGroup, IkeDhKeyPair, IkeDiffieHellmanOperations,
+    IkeEncryptionOperations, IkeEntropyOperations, IkeHashAlgorithm, IkeHashOperations,
+    IkeIntegrityAlgorithm, IkeIntegrityOperations, IkePrfAlgorithm, IkePrfOperations,
+    IkeSignatureAlgorithm, IkeSignatureOperations, IkeSigningKey,
+};
 pub use policy::{PolicyAdmission, PolicyError, ProviderPolicy};
-pub use provider::CryptoModule;
+pub use provider::{CryptoModule, IkeCryptoModule};
 pub use report::{probe_capability_report, CapabilityReport};
 pub use selftest::{ModuleReadiness, SelfTestError, SelfTestEvidence, SelfTestOutcome};

@@ -33,6 +33,7 @@ aya = { version = "0.14" }
 opc-linux-gtpu-sys = { path = "../opc-linux-gtpu-sys", version = "0.2.0" }
 
 [dev-dependencies]
+opc-crypto-provider = { path = "../opc-crypto-provider", version = "0.2.0" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]

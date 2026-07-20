@@ -68,10 +68,19 @@ impl fmt::Debug for ProtectedPayloadContext<'_> {
 ///
 /// Implementations must authenticate and decrypt the protected payload body,
 /// validate and remove padding according to their selected transform suite, and
-/// return the cleartext inner payload-chain bytes. This crate intentionally
-/// provides no concrete implementation: null crypto, algorithm negotiation, key
-/// derivation, EAP-AKA, Child SA installation, and 3GPP profile decisions remain
-/// downstream product responsibilities.
+/// return the cleartext inner payload-chain bytes. This generic boundary does
+/// not prove that an arbitrary implementation uses the process-admitted crypto
+/// module. Validated deployments must delegate it to the module-routed
+/// [`crate::Ikev2SaInitProtectedPayloadProvider`] or an adapter whose provider
+/// identity is bound and admitted by the deployment. Direct caller-owned crypto
+/// is outside the SDK's module-admission evidence and invalidates claims based
+/// on that evidence. The SDK does not perform a slot-presence-only check here,
+/// because such a check could not bind an external implementation to the
+/// admitted module.
+///
+/// Null crypto, algorithm negotiation policy, SA/key lookup, EAP-AKA, Child SA
+/// installation, and 3GPP profile decisions remain downstream product
+/// responsibilities.
 ///
 /// @spec IETF RFC7296 3.14
 /// @req REQ-IETF-RFC7296-3.14-CRYPTO-BOUNDARY-004
@@ -262,7 +271,9 @@ impl<E> Error for ProtectedPayloadOpenError<E> {
 /// the decoded payload region before delegating to the provider.
 ///
 /// Transform negotiation, key lookup, padding policy, EAP-AKA, IKE SA state,
-/// and product routing remain outside this crate.
+/// and product routing remain outside this crate. Passing an arbitrary
+/// [`CryptoProvider`] does not establish process-module admission; see the
+/// trait's deployment contract.
 ///
 /// # Errors
 ///

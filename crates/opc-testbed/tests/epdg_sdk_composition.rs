@@ -1,5 +1,6 @@
-use std::error::Error;
+use std::{error::Error, sync::OnceLock};
 
+use opc_crypto_provider::ProviderPolicy;
 use opc_evidence::{
     compute_digest, AttachProcedureEvidence, AttachProcedureResult, AttachStep, AttachStepResult,
     KernelDataplaneEvidence, PacketCoreEvidencePack, PacketCoreMessageDirection,
@@ -28,7 +29,8 @@ use opc_proto_ikev2::{
     build_ike_auth_authentication_payload, build_ike_auth_identification_payload,
     build_ikev2_device_identity_request, build_ikev2_device_identity_response,
     compute_ike_auth_shared_key_mic, decode_ikev2_device_identity_notify,
-    derive_ike_sa_init_key_material, Ikev2AuthenticationPayloadBuild, Ikev2ChildSaNegotiation,
+    derive_ike_sa_init_key_material, install_ikev2_software_crypto_module,
+    Ikev2AuthenticationPayloadBuild, Ikev2ChildSaNegotiation, Ikev2CryptoRequirements,
     Ikev2DeviceIdentity, Ikev2DeviceIdentityNotify, Ikev2DeviceIdentityType, Ikev2DhGroup,
     Ikev2EncryptionAlgorithm, Ikev2IdentificationPayloadBuild, Ikev2IkeAuthPeer,
     Ikev2IkeAuthSignedOctets, Ikev2NotifyPayload, Ikev2PrfAlgorithm, Ikev2SaInitCryptoProfile,
@@ -41,6 +43,20 @@ use opc_testbed::simulators::epc::{
 };
 use opc_types::{Imei, Imei15};
 use time::OffsetDateTime;
+
+fn ensure_ike_crypto() {
+    static INSTALL: OnceLock<Result<(), &'static str>> = OnceLock::new();
+    let result = INSTALL.get_or_init(|| {
+        let requirements = Ikev2CryptoRequirements::all_software_supported();
+        let policy = ProviderPolicy::new().require_all(requirements.required_capabilities());
+        install_ikev2_software_crypto_module(policy, requirements)
+            .map(|_| ())
+            .map_err(|_| "explicit opc-testbed crypto admission failed")
+    });
+    if let Err(message) = result {
+        panic!("{message}");
+    }
+}
 
 struct Gtpv2cS2bView<'a>(S2bMessage<'a>);
 
@@ -333,6 +349,7 @@ async fn epdg_sdk_protocol_xfrm_testbed_and_evidence_components_compose(
 #[test]
 fn epdg_unauthenticated_emergency_identity_recovery_components_compose(
 ) -> Result<(), Box<dyn Error>> {
+    ensure_ike_crypto();
     let imei = Imei15::new("490154203237518")?;
     let emergency_imsi_nai = "0234150999999999@sos.nai.epc.mnc015.mcc234.3gppnetwork.org";
     let eap_identity = build_eap_response_identity(0x17, emergency_imsi_nai.as_bytes())?;

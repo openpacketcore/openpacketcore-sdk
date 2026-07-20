@@ -2492,6 +2492,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]
@@ -2669,6 +2670,7 @@ dependencies = [
  "async-trait",
  "aya",
  "nix",
+ "opc-crypto-provider",
  "opc-ipsec-xfrm-ebpf-common",
  "opc-linux-gtpu-sys",
  "opc-linux-xfrm-sys",
@@ -3026,10 +3028,12 @@ version = "0.2.0"
 dependencies = [
  "aes 0.9.1",
  "aes-gcm",
+ "async-trait",
  "bytes",
  "cbc",
  "crypto-bigint",
  "hmac 0.12.1",
+ "opc-crypto-provider",
  "opc-proto-gtpv2c",
  "opc-proto-ikev2",
  "opc-proto-tft",
@@ -3406,6 +3410,7 @@ dependencies = [
 name = "opc-testbed"
 version = "0.2.0"
 dependencies = [
+ "opc-crypto-provider",
  "opc-evidence",
  "opc-ipsec-xfrm",
  "opc-node-resources",

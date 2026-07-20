@@ -17,6 +17,8 @@ use opc_protocol::{BorrowDecode, DecodeContext};
 use rand::{TryCryptoRng, TryRng};
 use sha2::Sha512;
 
+mod support;
+
 const INITIATOR_SPI: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
 const RESPONDER_SPI: [u8; 8] = [0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18];
 const CBC_IV: [u8; 16] = [
@@ -54,6 +56,7 @@ fn sequence(start: u8, len: usize) -> Vec<u8> {
 }
 
 fn established_material(profile: Ikev2SaInitCryptoProfile) -> Ikev2SaInitKeyMaterial {
+    support::ensure_ike_crypto();
     let prf_len = profile.prf().output_len();
     let integrity_len = profile.integrity_key_len();
     let encryption_len = profile.encryption().key_material_len();

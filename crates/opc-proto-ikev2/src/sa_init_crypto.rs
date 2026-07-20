@@ -16,6 +16,7 @@ use crypto_bigint::{
     modular::{FixedMontyForm, FixedMontyParams},
     Odd, Random, U2048,
 };
+use opc_crypto_provider::{CryptoOperationErrorCode, IkeDhKeyPair};
 use p256::{
     ecdh::EphemeralSecret as P256EphemeralSecret,
     elliptic_curve::{common::Generate, point::PointCompression, sec1::ToSec1Point},
@@ -26,6 +27,10 @@ use p521::{ecdh::EphemeralSecret as P521EphemeralSecret, PublicKey as P521Public
 use zeroize::Zeroizing;
 
 use crate::{
+    crypto_module::{
+        execute_dh_agree, execute_dh_generate, execute_prf, execute_prf_plus,
+        Ikev2CryptoModuleError,
+    },
     hmac_sha2::{hmac_sha2_256, hmac_sha2_384, hmac_sha2_512},
     ike_auth::Ikev2ChildSaNegotiation,
     sa_init::{
@@ -1011,17 +1016,102 @@ impl Ikev2SaInitCryptoProfile {
 pub struct Ikev2EphemeralDhKey {
     group: Ikev2DhGroup,
     public_value: Vec<u8>,
-    secret: Ikev2EphemeralDhSecret,
+    inner: Box<dyn IkeDhKeyPair>,
 }
 
-enum Ikev2EphemeralDhSecret {
+impl Ikev2EphemeralDhKey {
+    /// Generate an ephemeral key pair through the admitted process module.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Ikev2SaInitCryptoError`] when the module admission is absent
+    /// or withdrawn, the group was not preflighted, or generation fails.
+    pub fn generate(group: Ikev2DhGroup) -> Result<Self, Ikev2SaInitCryptoError> {
+        let (inner, public_value) =
+            execute_dh_generate(group).map_err(|error| map_dh_module_error(group, 0, error))?;
+        Ok(Self {
+            group,
+            public_value,
+            inner,
+        })
+    }
+
+    /// DH group for this key pair.
+    pub const fn group(&self) -> Ikev2DhGroup {
+        self.group
+    }
+
+    /// Public value bytes suitable for the IKEv2 Key Exchange payload.
+    pub fn public_value(&self) -> &[u8] {
+        &self.public_value
+    }
+
+    /// Perform agreement after rechecking the original module admission.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Ikev2SaInitCryptoError`] when admission or readiness was
+    /// withdrawn after generation, the peer value is invalid, or agreement
+    /// fails.
+    pub fn agree(
+        &self,
+        peer_public_value: &[u8],
+    ) -> Result<Zeroizing<Vec<u8>>, Ikev2SaInitCryptoError> {
+        execute_dh_agree(
+            self.group,
+            self.inner.as_ref(),
+            &self.public_value,
+            peer_public_value,
+        )
+        .map_err(|error| map_dh_module_error(self.group, peer_public_value.len(), error))
+    }
+}
+
+impl fmt::Debug for Ikev2EphemeralDhKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Ikev2EphemeralDhKey")
+            .field("group", &self.group)
+            .field("public_value_len", &self.public_value.len())
+            .finish_non_exhaustive()
+    }
+}
+
+fn map_dh_module_error(
+    group: Ikev2DhGroup,
+    peer_public_len: usize,
+    error: Ikev2CryptoModuleError,
+) -> Ikev2SaInitCryptoError {
+    match error.operation_code() {
+        Some(CryptoOperationErrorCode::InvalidPeerPublicKey) => {
+            Ikev2SaInitCryptoError::InvalidPeerPublicKey {
+                group,
+                actual_len: peer_public_len,
+            }
+        }
+        Some(CryptoOperationErrorCode::KeyGenerationFailed) => {
+            Ikev2SaInitCryptoError::KeyGenerationFailed { group }
+        }
+        Some(CryptoOperationErrorCode::KeyAgreementFailed) => {
+            Ikev2SaInitCryptoError::KeyAgreementFailed { group }
+        }
+        _ => Ikev2SaInitCryptoError::CryptoModuleFailure { error },
+    }
+}
+
+pub(crate) struct SoftwareEphemeralDhKey {
+    group: Ikev2DhGroup,
+    public_value: Vec<u8>,
+    secret: SoftwareEphemeralDhSecret,
+}
+
+enum SoftwareEphemeralDhSecret {
     Modp2048(Zeroizing<Vec<u8>>),
     Ecp256(P256EphemeralSecret),
     Ecp384(P384EphemeralSecret),
     Ecp521(P521EphemeralSecret),
 }
 
-impl Ikev2EphemeralDhKey {
+impl SoftwareEphemeralDhKey {
     /// Generate an ephemeral key pair for the supplied group.
     ///
     /// # Errors
@@ -1039,7 +1129,7 @@ impl Ikev2EphemeralDhKey {
                 Ok(Self {
                     group,
                     public_value,
-                    secret: Ikev2EphemeralDhSecret::Ecp256(secret),
+                    secret: SoftwareEphemeralDhSecret::Ecp256(secret),
                 })
             }
             Ikev2DhGroup::Ecp384 => {
@@ -1049,7 +1139,7 @@ impl Ikev2EphemeralDhKey {
                 Ok(Self {
                     group,
                     public_value,
-                    secret: Ikev2EphemeralDhSecret::Ecp384(secret),
+                    secret: SoftwareEphemeralDhSecret::Ecp384(secret),
                 })
             }
             Ikev2DhGroup::Ecp521 => {
@@ -1059,15 +1149,10 @@ impl Ikev2EphemeralDhKey {
                 Ok(Self {
                     group,
                     public_value,
-                    secret: Ikev2EphemeralDhSecret::Ecp521(secret),
+                    secret: SoftwareEphemeralDhSecret::Ecp521(secret),
                 })
             }
         }
-    }
-
-    /// DH group for this key pair.
-    pub const fn group(&self) -> Ikev2DhGroup {
-        self.group
     }
 
     /// Public value bytes suitable for the IKEv2 Key Exchange payload.
@@ -1088,17 +1173,19 @@ impl Ikev2EphemeralDhKey {
     ) -> Result<Zeroizing<Vec<u8>>, Ikev2SaInitCryptoError> {
         validate_peer_public_len(self.group, peer_public_value)?;
         match &self.secret {
-            Ikev2EphemeralDhSecret::Modp2048(private) => agree_modp2048(private, peer_public_value),
-            Ikev2EphemeralDhSecret::Ecp256(secret) => agree_ecp256(secret, peer_public_value),
-            Ikev2EphemeralDhSecret::Ecp384(secret) => agree_ecp384(secret, peer_public_value),
-            Ikev2EphemeralDhSecret::Ecp521(secret) => agree_ecp521(secret, peer_public_value),
+            SoftwareEphemeralDhSecret::Modp2048(private) => {
+                agree_modp2048(private, peer_public_value)
+            }
+            SoftwareEphemeralDhSecret::Ecp256(secret) => agree_ecp256(secret, peer_public_value),
+            SoftwareEphemeralDhSecret::Ecp384(secret) => agree_ecp384(secret, peer_public_value),
+            SoftwareEphemeralDhSecret::Ecp521(secret) => agree_ecp521(secret, peer_public_value),
         }
     }
 }
 
-impl fmt::Debug for Ikev2EphemeralDhKey {
+impl fmt::Debug for SoftwareEphemeralDhKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Ikev2EphemeralDhKey")
+        f.debug_struct("SoftwareEphemeralDhKey")
             .field("group", &self.group)
             .field("public_value_len", &self.public_value.len())
             .finish_non_exhaustive()
@@ -1267,6 +1354,8 @@ pub enum Ikev2SaInitCryptoErrorCode {
     IncompleteTransformSet,
     /// Transform set contained incompatible or duplicate transforms.
     InconsistentTransformSet,
+    /// The admitted process crypto module was absent, withdrawn, or failed.
+    CryptoModuleFailure,
 }
 
 impl Ikev2SaInitCryptoErrorCode {
@@ -1296,6 +1385,7 @@ impl Ikev2SaInitCryptoErrorCode {
             Self::KeyMaterialLimitOverflow => "ike_sa_init_crypto_key_material_limit_overflow",
             Self::IncompleteTransformSet => "ike_sa_init_crypto_incomplete_transform_set",
             Self::InconsistentTransformSet => "ike_sa_init_crypto_inconsistent_transform_set",
+            Self::CryptoModuleFailure => "ike_sa_init_crypto_module_failure",
         }
     }
 }
@@ -1376,6 +1466,11 @@ pub enum Ikev2SaInitCryptoError {
     IncompleteTransformSet,
     /// Transform set contained incompatible or duplicate transforms.
     InconsistentTransformSet,
+    /// The admitted process crypto module was absent, withdrawn, or failed.
+    CryptoModuleFailure {
+        /// Stable, redaction-safe module boundary error.
+        error: Ikev2CryptoModuleError,
+    },
 }
 
 impl Ikev2SaInitCryptoError {
@@ -1409,6 +1504,7 @@ impl Ikev2SaInitCryptoError {
             }
             Self::IncompleteTransformSet => Ikev2SaInitCryptoErrorCode::IncompleteTransformSet,
             Self::InconsistentTransformSet => Ikev2SaInitCryptoErrorCode::InconsistentTransformSet,
+            Self::CryptoModuleFailure { .. } => Ikev2SaInitCryptoErrorCode::CryptoModuleFailure,
         }
     }
 
@@ -1481,6 +1577,9 @@ impl fmt::Display for Ikev2SaInitCryptoError {
             }
             Self::IncompleteTransformSet => f.write_str("incomplete IKEv2 transform set"),
             Self::InconsistentTransformSet => f.write_str("inconsistent IKEv2 transform set"),
+            Self::CryptoModuleFailure { error } => {
+                write!(f, "IKEv2 crypto module operation failed: {error}")
+            }
         }
     }
 }
@@ -1803,7 +1902,16 @@ fn validate_dh_shared_secret_len(
     Ok(())
 }
 
-fn prf(
+pub(crate) fn prf(
+    algorithm: Ikev2PrfAlgorithm,
+    key: &[u8],
+    data: &[u8],
+) -> Result<Zeroizing<Vec<u8>>, Ikev2SaInitCryptoError> {
+    execute_prf(algorithm, key, data)
+        .map_err(|error| Ikev2SaInitCryptoError::CryptoModuleFailure { error })
+}
+
+pub(crate) fn software_prf(
     algorithm: Ikev2PrfAlgorithm,
     key: &[u8],
     data: &[u8],
@@ -1821,7 +1929,17 @@ fn prf(
     }
 }
 
-fn prf_plus(
+pub(crate) fn prf_plus(
+    algorithm: Ikev2PrfAlgorithm,
+    key: &[u8],
+    seed: &[u8],
+    output_len: usize,
+) -> Result<Zeroizing<Vec<u8>>, Ikev2SaInitCryptoError> {
+    execute_prf_plus(algorithm, key, seed, output_len)
+        .map_err(|error| Ikev2SaInitCryptoError::CryptoModuleFailure { error })
+}
+
+pub(crate) fn software_prf_plus(
     algorithm: Ikev2PrfAlgorithm,
     key: &[u8],
     seed: &[u8],
@@ -1838,7 +1956,7 @@ fn prf_plus(
         input.extend_from_slice(&previous);
         input.extend_from_slice(seed);
         input.push(counter);
-        previous = prf(algorithm, key, &input)?;
+        previous = software_prf(algorithm, key, &input)?;
         let needed = requested_len - out.len();
         out.extend_from_slice(&previous[..previous.len().min(needed)]);
         counter = counter.wrapping_add(1);
@@ -1908,7 +2026,7 @@ fn transform_build_key_length_bits(
     Ok(key_bits)
 }
 
-fn generate_modp2048_key() -> Result<Ikev2EphemeralDhKey, Ikev2SaInitCryptoError> {
+fn generate_modp2048_key() -> Result<SoftwareEphemeralDhKey, Ikev2SaInitCryptoError> {
     let group = Ikev2DhGroup::Modp2048;
     let prime = modp2048_prime();
     let max_private = prime.wrapping_sub(&U2048::from_u64(2));
@@ -1924,10 +2042,10 @@ fn generate_modp2048_key() -> Result<Ikev2EphemeralDhKey, Ikev2SaInitCryptoError
             .to_be_bytes()
             .as_ref()
             .to_vec();
-        return Ok(Ikev2EphemeralDhKey {
+        return Ok(SoftwareEphemeralDhKey {
             group,
             public_value,
-            secret: Ikev2EphemeralDhSecret::Modp2048(private_bytes),
+            secret: SoftwareEphemeralDhSecret::Modp2048(private_bytes),
         });
     }
 
@@ -1980,6 +2098,41 @@ fn validate_peer_public_len(
             group,
             actual_len: peer_public_value.len(),
         });
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_dh_public_value(
+    group: Ikev2DhGroup,
+    peer_public_value: &[u8],
+) -> Result<(), Ikev2SaInitCryptoError> {
+    validate_peer_public_len(group, peer_public_value)?;
+    let invalid = || Ikev2SaInitCryptoError::InvalidPeerPublicKey {
+        group,
+        actual_len: peer_public_value.len(),
+    };
+    match group {
+        Ikev2DhGroup::Modp2048 => {
+            let peer = U2048::from_be_slice(peer_public_value);
+            let prime = modp2048_prime();
+            let min_public = U2048::from_u64(2);
+            let max_public = prime.wrapping_sub(&U2048::from_u64(2));
+            if peer < min_public || peer > max_public {
+                return Err(invalid());
+            }
+        }
+        Ikev2DhGroup::Ecp256 => {
+            let sec1 = sec1_uncompressed_from_ike(group, peer_public_value)?;
+            P256PublicKey::from_sec1_bytes(&sec1).map_err(|_| invalid())?;
+        }
+        Ikev2DhGroup::Ecp384 => {
+            let sec1 = sec1_uncompressed_from_ike(group, peer_public_value)?;
+            P384PublicKey::from_sec1_bytes(&sec1).map_err(|_| invalid())?;
+        }
+        Ikev2DhGroup::Ecp521 => {
+            let sec1 = sec1_uncompressed_from_ike(group, peer_public_value)?;
+            P521PublicKey::from_sec1_bytes(&sec1).map_err(|_| invalid())?;
+        }
     }
     Ok(())
 }
@@ -2073,6 +2226,7 @@ mod tests {
     };
 
     fn must_ok<T, E: fmt::Debug>(result: Result<T, E>) -> T {
+        crate::test_support::ensure_ike_crypto();
         match result {
             Ok(value) => value,
             Err(error) => panic!("unexpected error: {error:?}"),
@@ -2645,6 +2799,7 @@ mod tests {
 
     #[test]
     fn dh_round_trip_succeeds_for_all_supported_groups() {
+        crate::test_support::ensure_ike_crypto();
         for group in [
             Ikev2DhGroup::Modp2048,
             Ikev2DhGroup::Ecp256,
@@ -2687,6 +2842,7 @@ mod tests {
 
     #[test]
     fn hmac_sha512_matches_rfc4231_test_case_1() {
+        crate::test_support::ensure_ike_crypto();
         let actual = must_ok(prf(
             Ikev2PrfAlgorithm::HmacSha2_512,
             &[0x0b; 20],
@@ -2704,6 +2860,7 @@ mod tests {
 
     #[test]
     fn hmac_sha512_matches_rfc4868_auth512_test_case_1() {
+        crate::test_support::ensure_ike_crypto();
         let actual = must_ok(prf(
             Ikev2PrfAlgorithm::HmacSha2_512,
             &[0x0b; 64],
@@ -3019,6 +3176,7 @@ mod tests {
 
     #[test]
     fn child_sa_keymat_aes_gcm_reference_vector_is_split_directionally() {
+        crate::test_support::ensure_ike_crypto();
         let profile = Ikev2ChildSaCryptoProfile::new_aead(
             Ikev2PrfAlgorithm::HmacSha2_256,
             Ikev2EncryptionAlgorithm::AesGcm16_256,
@@ -3057,6 +3215,7 @@ mod tests {
 
     #[test]
     fn child_sa_keymat_pfs_seed_prepends_new_dh_secret() {
+        crate::test_support::ensure_ike_crypto();
         let profile = Ikev2ChildSaCryptoProfile::new_aead(
             Ikev2PrfAlgorithm::HmacSha2_256,
             Ikev2EncryptionAlgorithm::AesGcm16_256,
@@ -3096,6 +3255,7 @@ mod tests {
 
     #[test]
     fn child_sa_keymat_encrypt_then_mac_splits_encryption_then_integrity() {
+        crate::test_support::ensure_ike_crypto();
         let profile = Ikev2ChildSaCryptoProfile::new_encrypt_then_mac(
             Ikev2PrfAlgorithm::HmacSha2_256,
             Ikev2EncryptionAlgorithm::AesCbc256,
@@ -3132,6 +3292,7 @@ mod tests {
 
     #[test]
     fn child_sa_encr_null_derives_only_independent_integrity_vectors() {
+        crate::test_support::ensure_ike_crypto();
         // Generated independently with OpenSSL 3 HMAC-SHA256 and the RFC 7296
         // section 2.17 PRF+ equations. T1 is i2r A and T2 is r2i A because
         // ENCR_NULL contributes zero E octets in each direction.
@@ -3212,6 +3373,7 @@ mod tests {
 
     #[test]
     fn child_sa_sha512_keymat_matches_independent_vector() {
+        crate::test_support::ensure_ike_crypto();
         // Generated independently with OpenSSL 3 and RFC 7296 section 2.17.
         let profile = Ikev2ChildSaCryptoProfile::new_encrypt_then_mac(
             Ikev2PrfAlgorithm::HmacSha2_512,

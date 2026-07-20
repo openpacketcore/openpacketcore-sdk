@@ -16,6 +16,8 @@ use opc_proto_ikev2::{
 };
 use opc_protocol::{BorrowDecode, DecodeContext, DecodeErrorCode};
 
+mod support;
+
 fn network_context() -> DecodeContext {
     DecodeContext::conservative()
 }
@@ -206,6 +208,7 @@ fn each_typed_ignored_field_has_an_opt_in_sender_canonical_diagnostic() {
 
 #[test]
 fn auth_uses_exact_received_id_body_and_every_transcript_mutation_fails() {
+    support::ensure_ike_crypto();
     let profile = crypto_profile();
     let key_material = derive_ike_sa_init_key_material(
         profile,

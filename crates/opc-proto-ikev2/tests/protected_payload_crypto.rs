@@ -20,6 +20,8 @@ use opc_proto_ikev2::{
 };
 use opc_protocol::{BorrowDecode, DecodeContext, Encode, EncodeContext};
 
+mod support;
+
 const INITIATOR_SPI: u64 = 0x0102_0304_0506_0708;
 const RESPONDER_SPI: u64 = 0x1112_1314_1516_1718;
 const MESSAGE_ID: u32 = 7;
@@ -58,6 +60,7 @@ fn profile_256() -> Ikev2SaInitCryptoProfile {
 }
 
 fn key_material(profile: Ikev2SaInitCryptoProfile) -> opc_proto_ikev2::Ikev2SaInitKeyMaterial {
+    support::ensure_ike_crypto();
     match derive_ike_sa_init_key_material(
         profile,
         INITIATOR_SPI.to_be_bytes(),
