@@ -9,33 +9,9 @@
 //! cargo test -p opc-ipsec-lb --test routing_bird_integration
 //! ```
 //!
-//! Reference `bird.conf` for the gated environment (documentation prefixes
-//! and RFC 6996 private ASNs only):
-//!
-//! ```text
-//! router id 192.0.2.2;
-//! include "/etc/bird/opc.d/*.conf";
-//!
-//! protocol device { scan time 10; }
-//!
-//! protocol bfd bfd1 {
-//!     interface "lo" {
-//!         min rx interval 50 ms;
-//!         min tx interval 50 ms;
-//!         idle tx interval 300 ms;
-//!     };
-//! }
-//!
-//! protocol bgp edge_a {
-//!     local 192.0.2.2 as 64512;
-//!     neighbor 192.0.2.1 as 64513;
-//!     ipv4 {
-//!         import none;
-//!         export where proto = "opc_adv_64512";
-//!     };
-//!     bfd on;
-//! }
-//! ```
+//! The reference `bird.conf` for the gated environment is shipped at
+//! `tests/fixtures/bird_reference.conf` and validated by
+//! [`reference_config_uses_only_documentation_prefixes_and_private_asns`].
 //!
 //! The test advertises and withdraws documentation-prefix host routes and
 //! relays the (unestablished, no live upstream) session state of `edge_a`.
@@ -44,15 +20,18 @@
 //! additionally exercises the advertised-to-peer snapshot.
 
 use std::collections::BTreeSet;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use opc_ipsec_lb::{
     AdvertisementLease, BirdAdapterConfig, BirdControlSocketAdapter, BirdDomainBinding, HostPrefix,
     IpAddress, LeaseGeneration, PeerSessionState, PrefixAdvertiserConfig, PrefixAdvertiserService,
-    ReconcileDisposition, RoutingDomainTag, RoutingEventKind, RoutingStackAdapter,
+    PrefixApplyOutcome, ReconcileDisposition, RoutingDomainTag, RoutingEventKind,
+    RoutingStackAdapter,
 };
+
+const REFERENCE_CONFIG: &str = include_str!("fixtures/bird_reference.conf");
 
 fn gated_config() -> Option<BirdAdapterConfig> {
     if std::env::var("OPC_IPSEC_LB_BIRD_INTEGRATION")
@@ -98,8 +77,8 @@ async fn bird_adapter_advertises_withdraws_and_relays_session_events() {
     let mut events = service.subscribe_events();
 
     let desired: BTreeSet<HostPrefix> = [
-        HostPrefix::new(IpAddress::from(Ipv4Addr::new(203, 0, 113, 10))),
-        HostPrefix::new(IpAddress::from(Ipv4Addr::new(198, 51, 100, 7))),
+        HostPrefix::new(IpAddress::V4([203, 0, 113, 10])),
+        HostPrefix::new(IpAddress::V4([198, 51, 100, 7])),
     ]
     .into_iter()
     .collect();
@@ -112,7 +91,7 @@ async fn bird_adapter_advertises_withdraws_and_relays_session_events() {
     assert!(report
         .outcomes
         .values()
-        .all(|outcome| matches!(outcome, opc_ipsec_lb::PrefixApplyOutcome::Accepted)));
+        .all(|outcome| matches!(outcome, PrefixApplyOutcome::Accepted)));
 
     // Session-state relay: edge_a has no live upstream in the reference
     // environment, so the relayed state must be a non-established transition.
@@ -141,19 +120,45 @@ async fn bird_adapter_advertises_withdraws_and_relays_session_events() {
         .all(|snapshot| snapshot.advertised_to.is_empty()));
 }
 
+/// Parse the shipped reference configuration and prove it stays inside
+/// documentation prefixes and RFC 6996 private ASNs.
 #[test]
-fn gated_reference_config_uses_only_documentation_prefixes_and_private_asns() {
-    // The reference configuration in this file's documentation uses only
-    // 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24 and ASNs 64512-65534.
-    let documentation_v4 = [
-        IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
-        IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)),
-        IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)),
-    ];
-    for address in documentation_v4 {
-        assert!(address.is_ipv4());
+fn reference_config_uses_only_documentation_prefixes_and_private_asns() {
+    let mut saw_bgp = false;
+    let mut saw_bfd = false;
+    let mut previous_token = "";
+    for token in REFERENCE_CONFIG.split(|c: char| !(c.is_ascii_alphanumeric() || c == '.')) {
+        if token.is_empty() {
+            continue;
+        }
+        if let Ok(address) = token.parse::<IpAddr>() {
+            let documentation = match address {
+                IpAddr::V4(v4) => {
+                    let octets = v4.octets();
+                    octets[..3] == [192, 0, 2] || octets[..3] == [198, 51, 100] || {
+                        octets[..3] == [203, 0, 113]
+                    }
+                }
+                IpAddr::V6(v6) => v6.segments()[0] == 0x2001 && v6.segments()[1] == 0x0db8,
+            };
+            assert!(
+                documentation,
+                "non-documentation address {address} in reference config"
+            );
+        }
+        if previous_token == "as" {
+            let asn: u32 = token.parse().expect("ASN after 'as' keyword");
+            assert!(
+                (64512..=65534).contains(&asn),
+                "non-private ASN {asn} in reference config"
+            );
+        }
+        saw_bgp |= token == "bgp";
+        saw_bfd |= token == "bfd";
+        previous_token = token;
     }
-    for asn in [64512u32, 64513] {
-        assert!((64512..=65534).contains(&asn));
-    }
+    assert!(saw_bgp, "reference config must contain a BGP peer");
+    assert!(saw_bfd, "reference config must contain a BFD instance");
+    assert!(REFERENCE_CONFIG.contains("protocol bgp edge_a"));
+    assert!(REFERENCE_CONFIG.contains("opc_adv_64512"));
 }

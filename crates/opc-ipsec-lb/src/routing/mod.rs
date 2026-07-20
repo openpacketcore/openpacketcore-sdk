@@ -28,7 +28,9 @@ pub mod fake;
 pub mod service;
 
 pub use bird::{BirdAdapterConfig, BirdControlSocketAdapter, BirdDomainBinding};
-pub use fake::{ConformanceFakeRoutingStack, RecordedAdvertisementApply};
+pub use fake::{
+    ApplyGate, ConformanceFakeRoutingStack, FakeApplyFailure, RecordedAdvertisementApply,
+};
 pub use service::{
     PrefixAdvertiserConfig, PrefixAdvertiserService, PrefixReconcileReport, ReconcileDisposition,
 };
@@ -225,6 +227,9 @@ pub enum PeerSessionChangeReason {
     SessionClosed,
     /// The stack-reported BFD session went down and forced the session down.
     BfdPathDown,
+    /// The peer appeared in stack observations for the first time in a
+    /// non-established state.
+    PeerObserved,
     /// The peer was administratively disabled in the routing stack.
     AdministrativelyDown,
     /// The routing stack became unobservable, so sessions are presumed closed.
@@ -239,6 +244,7 @@ impl PeerSessionChangeReason {
             Self::SessionEstablished => "session_established",
             Self::SessionClosed => "session_closed",
             Self::BfdPathDown => "bfd_path_down",
+            Self::PeerObserved => "peer_observed",
             Self::AdministrativelyDown => "administratively_down",
             Self::ObservationLost => "observation_lost",
         }
@@ -557,6 +563,17 @@ pub enum RoutingEventKind {
         /// Prefix and routing domain (address redacted in formatted output).
         prefix: AdvertisedPrefix,
         /// Machine-readable withdrawal reason.
+        reason: PrefixWithdrawReason,
+    },
+    /// A prefix's external state became unconfirmed (for example after an
+    /// ambiguous adapter mutation or loss of stack observability).
+    ///
+    /// This is deliberately distinct from [`Self::PrefixWithdrawn`]: the
+    /// prefix may still be originated by the routing stack.
+    PrefixUnconfirmed {
+        /// Prefix and routing domain (address redacted in formatted output).
+        prefix: AdvertisedPrefix,
+        /// Machine-readable cause.
         reason: PrefixWithdrawReason,
     },
 }

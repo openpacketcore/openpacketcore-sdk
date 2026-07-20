@@ -38,6 +38,9 @@ pub struct PrefixAdvertiserConfig {
     pub poll_interval: Duration,
     /// Maximum prefixes admitted to one routing-domain reconcile.
     pub max_prefixes_per_domain: usize,
+    /// How long a peer that vanished from stack observations is retained
+    /// after its session-down transition, in seconds.
+    pub peer_retention_secs: u64,
 }
 
 impl Default for PrefixAdvertiserConfig {
@@ -45,6 +48,7 @@ impl Default for PrefixAdvertiserConfig {
         Self {
             poll_interval: Duration::from_secs(5),
             max_prefixes_per_domain: MAX_ADVERTISED_PREFIXES_PER_DOMAIN,
+            peer_retention_secs: 600,
         }
     }
 }
@@ -138,6 +142,7 @@ struct PeerTrack {
     identity: PeerIdentity,
     session: PeerSessionState,
     path_health: PathHealth,
+    last_seen: Timestamp,
 }
 
 #[derive(Debug, Default)]
@@ -152,25 +157,45 @@ struct ServiceState {
 /// Generation rules mirror [`crate::vip::VipOwnershipCoordinator`]:
 ///
 /// - every supplied lease generation is recorded; history is never erased;
-/// - advertising requires a generation strictly newer than every generation
-///   previously observed, except that repeating the identical intent while
-///   its generation remains advertised and unexpired is an idempotent no-op
-///   that refreshes the lease deadline;
-/// - a stale, equal-after-withdraw, or missing lease fails closed: the domain
-///   is withdrawn and a stale generation can never re-advertise after a newer
-///   drain or fence loss;
-/// - an ambiguous adapter apply consumes the epoch: the lease deadline stays
-///   armed so the watchdog withdraws any possibly-originated prefixes, and
-///   recovery requires a newer generation.
+/// - advertising a new intent requires a generation strictly newer than
+///   every generation previously observed;
+/// - while a generation is current (the greatest observed) and its lease is
+///   unexpired, repeating the identical intent is an idempotent no-op when
+///   every desired prefix is advertised, and a safe declarative re-apply
+///   when any desired track is unconfirmed or rejected — the same-generation
+///   retry survives transient stack failures exactly like #254's retained
+///   retry fence;
+/// - a stale, equal-after-withdraw, expired, or missing lease fails closed:
+///   the domain is withdrawn and a stale generation can never re-advertise
+///   after a newer drain or fence loss;
+/// - an ambiguous adapter apply leaves the lease deadline armed so the
+///   watchdog withdraws any possibly-originated prefixes, and recovery uses
+///   the same-generation retry above.
+///
+/// Cancellation safety: adapter applies are driven to completion by an
+/// internal driver task detached from the caller's future, and mutations
+/// serialize on an internal apply lock in intent order. Cancelling the
+/// `reconcile` future can therefore never tear service belief: the driver
+/// still applies the outcomes. Withdrawals instead pre-mark tracks as
+/// unconfirmed before the adapter call, so a cancelled or failed withdraw
+/// never leaves phantom `Advertised` state behind.
+///
+/// Retention: prefix tracks are kept while the prefix is in the current
+/// desired set or in a non-terminal state (`Advertised`/`Unknown`); terminal
+/// (`Withdrawn`/`Rejected`) tracks are pruned once the prefix leaves the
+/// desired set. Peers that vanish from stack observations transition to
+/// session-down immediately and are pruned after
+/// [`PrefixAdvertiserConfig::peer_retention_secs`].
 ///
 /// Mutating operations are serialized internally; callers may share one
 /// service behind an [`Arc`].
 pub struct PrefixAdvertiserService<A> {
-    adapter: A,
+    adapter: Arc<A>,
     clock: Arc<dyn Clock>,
     config: PrefixAdvertiserConfig,
-    state: Mutex<ServiceState>,
+    state: Arc<Mutex<ServiceState>>,
     op_lock: tokio::sync::Mutex<()>,
+    apply_lock: Arc<tokio::sync::Mutex<()>>,
     events: broadcast::Sender<RoutingEvent>,
 }
 
@@ -179,10 +204,7 @@ where
     A: fmt::Debug,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let state = lock_state(&self.state);
         f.debug_struct("PrefixAdvertiserService")
             .field("adapter", &self.adapter)
             .field("config", &self.config)
@@ -194,7 +216,7 @@ where
 
 impl<A> PrefixAdvertiserService<A>
 where
-    A: RoutingStackAdapter,
+    A: RoutingStackAdapter + 'static,
 {
     /// Build a service on the system clock.
     pub fn new(adapter: A, config: PrefixAdvertiserConfig) -> Result<Self, IpsecLbError> {
@@ -210,11 +232,12 @@ where
         config.validate()?;
         let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         Ok(Self {
-            adapter,
+            adapter: Arc::new(adapter),
             clock,
             config,
-            state: Mutex::new(ServiceState::default()),
+            state: Arc::new(Mutex::new(ServiceState::default())),
             op_lock: tokio::sync::Mutex::new(()),
+            apply_lock: Arc::new(tokio::sync::Mutex::new(())),
             events,
         })
     }
@@ -233,7 +256,8 @@ where
     /// `lease` is the caller's current health evidence: `Some` authorizes
     /// origination of exactly `desired`, `None` drains the domain. The call
     /// is idempotent; the adapter is never asked to originate anything
-    /// outside `desired`.
+    /// outside `desired`. The adapter mutation is driven to completion even
+    /// if the returned future is dropped (see the type-level documentation).
     pub async fn reconcile(
         &self,
         domain: RoutingDomainTag,
@@ -256,7 +280,7 @@ where
         }
 
         let plan = {
-            let mut state = self.lock_state();
+            let mut state = lock_state(&self.state);
             let domain_state = state.domains.entry(domain).or_default();
             let previous_highest = domain_state.highest_generation;
             if let Some(lease) = lease {
@@ -276,21 +300,43 @@ where
                     let lease_expired = domain_state
                         .lease_deadline
                         .is_some_and(|deadline| now >= deadline);
-                    let retained = domain_state.advertised_generation == Some(generation)
-                        && !lease_expired
-                        && domain_state.desired == desired
-                        && domain_state.prefixes.values().all(|track| {
-                            track.originated && track.state == PrefixAdvertisementState::Advertised
-                        });
-                    if retained {
-                        domain_state.lease_deadline = Some(deadline);
-                        Plan::Retained
-                    } else if previous_highest.is_none_or(|highest| generation > highest) {
+                    let fresh_epoch = previous_highest.is_none_or(|highest| generation > highest);
+                    if fresh_epoch {
                         domain_state.lease_deadline = Some(deadline);
                         domain_state.desired.clone_from(&desired);
                         Plan::Apply(generation)
                     } else {
-                        Plan::Withdraw(PrefixWithdrawReason::StaleGeneration)
+                        // Same-generation intents are valid only while the
+                        // generation is current, its lease is unexpired, and
+                        // the intent is byte-identical to the live epoch.
+                        let epoch_live = domain_state.advertised_generation == Some(generation);
+                        let epoch_ambiguous = domain_state.advertised_generation.is_none()
+                            && domain_state.lease_deadline.is_some()
+                            && domain_state.highest_generation == Some(generation);
+                        let same_set = domain_state.desired == desired;
+                        if lease_expired || !same_set || (!epoch_live && !epoch_ambiguous) {
+                            Plan::Withdraw(PrefixWithdrawReason::StaleGeneration)
+                        } else {
+                            domain_state.lease_deadline = Some(deadline);
+                            // Retention is decided against the desired set
+                            // alone: historical tracks of prefixes that left
+                            // the set must not poison renewal.
+                            let all_advertised = epoch_live
+                                && desired.iter().all(|prefix| {
+                                    domain_state.prefixes.get(prefix).is_some_and(|track| {
+                                        track.originated
+                                            && track.state == PrefixAdvertisementState::Advertised
+                                    })
+                                });
+                            if all_advertised {
+                                Plan::Retained
+                            } else {
+                                // Same-generation declarative re-apply:
+                                // unconfirmed or rejected desired tracks get
+                                // a fresh outcome without a new generation.
+                                Plan::Apply(generation)
+                            }
+                        }
                     }
                 }
             }
@@ -341,128 +387,26 @@ where
         desired: BTreeSet<HostPrefix>,
         generation: LeaseGeneration,
     ) -> Result<PrefixReconcileReport, IpsecLbError> {
-        let outcomes = match self.adapter.apply_advertisement_set(domain, &desired).await {
-            Ok(outcomes) => outcomes,
-            Err(error) => {
-                // Ambiguous apply: the lease deadline stays armed so the
-                // watchdog withdraws any possibly-originated prefixes, and
-                // previously advertised prefixes become unconfirmed.
-                let now = self.clock.now_utc();
-                let mut state = self.lock_state();
-                let mut pending = Vec::new();
-                {
-                    let domain_state = state.domains.entry(domain).or_default();
-                    domain_state.advertised_generation = None;
-                    for prefix in &desired {
-                        let track = domain_state.prefixes.entry(*prefix).or_default();
-                        if track.state == PrefixAdvertisementState::Advertised {
-                            track.state = PrefixAdvertisementState::Unknown;
-                            track.last_transition = Some(now);
-                            track.last_withdraw_reason =
-                                Some(PrefixWithdrawReason::RoutingStackUnreachable);
-                            pending.push(RoutingEventKind::PrefixWithdrawn {
-                                prefix: AdvertisedPrefix::new(domain, *prefix),
-                                reason: PrefixWithdrawReason::RoutingStackUnreachable,
-                            });
-                        }
-                    }
-                }
-                for kind in pending {
-                    Self::emit_locked(&mut state, &self.events, now, kind);
-                }
-                return Err(error);
-            }
-        };
-
-        let now = self.clock.now_utc();
-        let mut state = self.lock_state();
-        let established = established_peers(&state, domain).len();
-        let mut pending = Vec::new();
-        {
-            let domain_state = state.domains.entry(domain).or_default();
-            domain_state.advertised_generation = Some(generation);
-            for (prefix, outcome) in &outcomes {
-                let track = domain_state.prefixes.entry(*prefix).or_default();
-                match outcome {
-                    PrefixApplyOutcome::Accepted => {
-                        track.originated = true;
-                        if track.state != PrefixAdvertisementState::Advertised {
-                            track.state = PrefixAdvertisementState::Advertised;
-                            track.last_transition = Some(now);
-                            track.last_withdraw_reason = None;
-                            pending.push(RoutingEventKind::PrefixAdvertised {
-                                prefix: AdvertisedPrefix::new(domain, *prefix),
-                                peers: established,
-                            });
-                        }
-                    }
-                    PrefixApplyOutcome::Rejected(reason) => {
-                        track.originated = false;
-                        if track.state == PrefixAdvertisementState::Advertised {
-                            pending.push(RoutingEventKind::PrefixWithdrawn {
-                                prefix: AdvertisedPrefix::new(domain, *prefix),
-                                reason: PrefixWithdrawReason::AdapterRejected,
-                            });
-                        }
-                        track.state = PrefixAdvertisementState::Rejected;
-                        track.last_transition = Some(now);
-                        track.last_withdraw_reason = Some(match reason {
-                            PrefixRejectReason::StaleGeneration => {
-                                PrefixWithdrawReason::StaleGeneration
-                            }
-                            _ => PrefixWithdrawReason::AdapterRejected,
-                        });
-                    }
-                    PrefixApplyOutcome::Unreachable => {
-                        if track.state == PrefixAdvertisementState::Advertised {
-                            pending.push(RoutingEventKind::PrefixWithdrawn {
-                                prefix: AdvertisedPrefix::new(domain, *prefix),
-                                reason: PrefixWithdrawReason::RoutingStackUnreachable,
-                            });
-                        }
-                        track.state = PrefixAdvertisementState::Unknown;
-                        track.last_transition = Some(now);
-                        track.last_withdraw_reason =
-                            Some(PrefixWithdrawReason::RoutingStackUnreachable);
-                    }
-                }
-            }
-            // Prefixes reconciled out of the desired set are withdrawn by the
-            // adapter's declarative apply; reflect exactly that delta.
-            let mut dropped = Vec::new();
-            for (prefix, track) in &mut domain_state.prefixes {
-                if track.originated && !desired.contains(prefix) {
-                    track.originated = false;
-                    track.state = PrefixAdvertisementState::Withdrawn;
-                    track.last_transition = Some(now);
-                    track.last_withdraw_reason = Some(PrefixWithdrawReason::CallerDrain);
-                    dropped.push(*prefix);
-                }
-            }
-            for prefix in dropped {
-                pending.push(RoutingEventKind::PrefixWithdrawn {
-                    prefix: AdvertisedPrefix::new(domain, prefix),
-                    reason: PrefixWithdrawReason::CallerDrain,
-                });
-            }
-        }
-        for kind in pending {
-            Self::emit_locked(&mut state, &self.events, now, kind);
-        }
-
-        let disposition = if outcomes
-            .values()
-            .all(|outcome| *outcome == PrefixApplyOutcome::Accepted)
-        {
-            ReconcileDisposition::Advertised
-        } else {
-            ReconcileDisposition::PartiallyRejected
-        };
-        Ok(PrefixReconcileReport {
+        // Drive the adapter mutation on a detached task. Cancelling the
+        // caller's future only drops the join handle; the driver still
+        // finishes the adapter call and applies the outcome, so belief can
+        // never tear between "the stack was told" and "the service knows".
+        let driver = tokio::spawn(drive_apply(
+            Arc::clone(&self.adapter),
+            Arc::clone(&self.apply_lock),
+            Arc::clone(&self.state),
+            self.events.clone(),
+            Arc::clone(&self.clock),
             domain,
-            disposition,
-            outcomes,
-        })
+            desired,
+            generation,
+        ));
+        driver.await.map_err(|error| {
+            IpsecLbError::io(
+                "apply_driver",
+                std::io::Error::other(format!("apply driver failed: {error}")),
+            )
+        })?
     }
 
     async fn withdraw_domain(
@@ -470,25 +414,52 @@ where
         domain: RoutingDomainTag,
         reason: PrefixWithdrawReason,
     ) -> Result<(), IpsecLbError> {
-        self.adapter.withdraw_all(domain).await?;
+        // Pre-mark every originated or advertised track as unconfirmed so a
+        // failed or cancelled withdraw can never leave phantom `Advertised`
+        // belief behind. The lease deadline stays armed on error so the
+        // watchdog retries the withdrawal on its next tick.
         let now = self.clock.now_utc();
-        let mut state = self.lock_state();
-        let domain_state = state.domains.entry(domain).or_default();
-        domain_state.advertised_generation = None;
-        domain_state.lease_deadline = None;
-        domain_state.desired.clear();
-        let mut withdrawn = Vec::new();
-        for (prefix, track) in &mut domain_state.prefixes {
-            if track.originated || track.state == PrefixAdvertisementState::Advertised {
-                track.originated = false;
-                track.state = PrefixAdvertisementState::Withdrawn;
-                track.last_transition = Some(now);
-                track.last_withdraw_reason = Some(reason);
-                withdrawn.push(*prefix);
+        let mut pending = Vec::new();
+        {
+            let mut state = lock_state(&self.state);
+            let domain_state = state.domains.entry(domain).or_default();
+            for (prefix, track) in &mut domain_state.prefixes {
+                // Unknown tracks are re-collected so a watchdog retry after
+                // an ambiguous earlier attempt still converges them to a
+                // terminal withdrawn state with its event.
+                if track.originated
+                    || matches!(
+                        track.state,
+                        PrefixAdvertisementState::Advertised | PrefixAdvertisementState::Unknown
+                    )
+                {
+                    track.originated = false;
+                    track.state = PrefixAdvertisementState::Unknown;
+                    track.last_transition = Some(now);
+                    pending.push(*prefix);
+                }
             }
         }
-        for prefix in withdrawn {
-            Self::emit_locked(
+        self.adapter.withdraw_all(domain).await?;
+
+        let now = self.clock.now_utc();
+        let mut state = lock_state(&self.state);
+        {
+            let domain_state = state.domains.entry(domain).or_default();
+            domain_state.advertised_generation = None;
+            domain_state.lease_deadline = None;
+            domain_state.desired.clear();
+            for prefix in &pending {
+                if let Some(track) = domain_state.prefixes.get_mut(prefix) {
+                    track.state = PrefixAdvertisementState::Withdrawn;
+                    track.last_transition = Some(now);
+                    track.last_withdraw_reason = Some(reason);
+                }
+            }
+            prune_terminal_tracks(domain_state);
+        }
+        for prefix in pending {
+            emit_locked(
                 &mut state,
                 &self.events,
                 now,
@@ -504,14 +475,15 @@ where
     /// Enforce lease deadlines once.
     ///
     /// Every domain whose lease deadline has passed is withdrawn and its
-    /// prefixes transition with [`PrefixWithdrawReason::LeaseExpired`]. This
-    /// is the bounded pairing for gating-component death: withdrawal happens
-    /// within one poll interval of expiry when driven by [`Self::run`].
+    /// prefixes transition with [`PrefixWithdrawReason::LeaseExpired`]. A
+    /// failing domain never blocks the others: errors are collected and the
+    /// first one is returned after every expired domain was attempted, so
+    /// the bounded-withdrawal guarantee is not head-of-line blocked.
     pub async fn enforce_lease_once(&self) -> Result<(), IpsecLbError> {
         let _op = self.op_lock.lock().await;
         let now = self.clock.now_utc();
         let expired: Vec<RoutingDomainTag> = {
-            let state = self.lock_state();
+            let state = lock_state(&self.state);
             state
                 .domains
                 .iter()
@@ -523,28 +495,37 @@ where
                 .map(|(domain, _)| *domain)
                 .collect()
         };
+        let mut first_error = None;
         for domain in expired {
-            self.withdraw_domain(domain, PrefixWithdrawReason::LeaseExpired)
-                .await?;
+            if let Err(error) = self
+                .withdraw_domain(domain, PrefixWithdrawReason::LeaseExpired)
+                .await
+            {
+                first_error.get_or_insert(error);
+            }
         }
-        Ok(())
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     /// Poll the routing stack once and relay session and path-health
     /// transitions.
     ///
     /// Ordering guarantee: for one cause, the `PeerSessionChanged` event is
-    /// always emitted before the `PrefixWithdrawn` events it triggers. When
-    /// the stack is unobservable, all sessions are presumed closed (the
+    /// always emitted before the prefix events it triggers. When the stack
+    /// is unobservable, established sessions are presumed closed (the
     /// routing component's death closes its BGP sessions, so upstream
     /// withdraws this instance's paths) and originated prefixes become
-    /// unconfirmed.
+    /// unconfirmed — relayed as `PrefixUnconfirmed`, never as a withdrawal
+    /// the service did not observe.
     pub async fn observe_once(&self) -> Result<(), IpsecLbError> {
         let _op = self.op_lock.lock().await;
         let now = self.clock.now_utc();
         match self.adapter.poll_observations().await {
             Ok(observations) => {
-                let mut state = self.lock_state();
+                let mut state = lock_state(&self.state);
                 let mut seen: BTreeMap<PeerKey, PeerTrack> = BTreeMap::new();
                 for observation in observations {
                     seen.insert(
@@ -556,6 +537,7 @@ where
                             identity: observation.peer,
                             session: observation.session,
                             path_health: observation.path_health,
+                            last_seen: now,
                         },
                     );
                 }
@@ -565,20 +547,31 @@ where
                         let track = PeerTrack {
                             identity: state.peers[&key].identity.clone(),
                             session: PeerSessionState::Down,
-                            path_health: PathHealth::Unknown,
+                            path_health: state.peers[&key].path_health,
+                            last_seen: state.peers[&key].last_seen,
                         };
-                        Self::note_peer_locked(
+                        note_peer_locked(
                             &mut state,
                             &self.events,
                             now,
-                            key,
+                            key.clone(),
                             track,
                             PeerSessionChangeReason::SessionClosed,
                         );
+                        // Prune peers gone beyond the retention bound.
+                        let expired = state.peers.get(&key).is_some_and(|track| {
+                            track
+                                .last_seen
+                                .add_seconds(self.config.peer_retention_secs.cast_signed())
+                                .is_some_and(|deadline| now >= deadline)
+                        });
+                        if expired {
+                            state.peers.remove(&key);
+                        }
                     }
                 }
                 for (key, track) in seen {
-                    Self::note_peer_locked(
+                    note_peer_locked(
                         &mut state,
                         &self.events,
                         now,
@@ -590,26 +583,31 @@ where
                 Ok(())
             }
             Err(_error) => {
-                let mut state = self.lock_state();
+                let mut state = lock_state(&self.state);
                 let keys: Vec<PeerKey> = state.peers.keys().cloned().collect();
                 for key in keys {
-                    let track = PeerTrack {
-                        identity: state.peers[&key].identity.clone(),
-                        session: PeerSessionState::Down,
-                        path_health: PathHealth::Unknown,
+                    let Some(track) = state.peers.get_mut(&key) else {
+                        continue;
                     };
-                    Self::note_peer_locked(
-                        &mut state,
-                        &self.events,
-                        now,
-                        key,
-                        track,
-                        PeerSessionChangeReason::ObservationLost,
-                    );
+                    if track.session == PeerSessionState::Established {
+                        track.session = PeerSessionState::Down;
+                        track.path_health = PathHealth::Unknown;
+                        let identity = track.identity.clone();
+                        emit_locked(
+                            &mut state,
+                            &self.events,
+                            now,
+                            RoutingEventKind::PeerSessionChanged {
+                                peer: identity,
+                                state: PeerSessionState::Down,
+                                reason: PeerSessionChangeReason::ObservationLost,
+                            },
+                        );
+                    }
                 }
                 // Originated prefixes are unconfirmed while the stack is
-                // unreachable; they are not withdrawn locally because the
-                // stack may still originate them after a restart.
+                // unreachable; they are not reported as withdrawn because
+                // the stack may still originate them.
                 let domains: Vec<RoutingDomainTag> = state.domains.keys().copied().collect();
                 for domain in domains {
                     let mut unconfirmed = Vec::new();
@@ -628,11 +626,11 @@ where
                         }
                     }
                     for prefix in unconfirmed {
-                        Self::emit_locked(
+                        emit_locked(
                             &mut state,
                             &self.events,
                             now,
-                            RoutingEventKind::PrefixWithdrawn {
+                            RoutingEventKind::PrefixUnconfirmed {
                                 prefix: AdvertisedPrefix::new(domain, prefix),
                                 reason: PrefixWithdrawReason::RoutingStackUnreachable,
                             },
@@ -641,140 +639,6 @@ where
                 }
                 Ok(())
             }
-        }
-    }
-
-    #[allow(clippy::too_many_lines)]
-    fn note_peer_locked(
-        state: &mut ServiceState,
-        events: &broadcast::Sender<RoutingEvent>,
-        now: Timestamp,
-        key: PeerKey,
-        track: PeerTrack,
-        down_reason: PeerSessionChangeReason,
-    ) {
-        let domain = key.domain;
-        let previous = state.peers.get(&key).cloned();
-        let session_changed = previous
-            .as_ref()
-            .is_none_or(|previous| previous.session != track.session);
-        let health_changed = previous
-            .as_ref()
-            .is_none_or(|previous| previous.path_health != track.path_health);
-        let first_sighting = previous.is_none();
-        state.peers.insert(key, track.clone());
-
-        if session_changed {
-            let reason = match track.session {
-                PeerSessionState::Established => PeerSessionChangeReason::SessionEstablished,
-                PeerSessionState::Connecting => down_reason,
-                PeerSessionState::Down => {
-                    if previous
-                        .as_ref()
-                        .is_some_and(|previous| previous.path_health == PathHealth::Up)
-                        && track.path_health == PathHealth::Down
-                    {
-                        PeerSessionChangeReason::BfdPathDown
-                    } else {
-                        down_reason
-                    }
-                }
-            };
-            // The session transition is always emitted before any
-            // prefix-withdrawn event it causes.
-            Self::emit_locked(
-                state,
-                events,
-                now,
-                RoutingEventKind::PeerSessionChanged {
-                    peer: track.identity.clone(),
-                    state: track.session,
-                    reason,
-                },
-            );
-
-            match track.session {
-                PeerSessionState::Established => {
-                    let mut readvertised = Vec::new();
-                    {
-                        let domain_state = state.domains.entry(domain).or_default();
-                        for (prefix, prefix_track) in &mut domain_state.prefixes {
-                            if prefix_track.originated
-                                && prefix_track.state == PrefixAdvertisementState::Withdrawn
-                                && prefix_track.last_withdraw_reason
-                                    == Some(PrefixWithdrawReason::PeerSessionDown)
-                            {
-                                prefix_track.state = PrefixAdvertisementState::Advertised;
-                                prefix_track.last_transition = Some(now);
-                                prefix_track.last_withdraw_reason = None;
-                                readvertised.push(*prefix);
-                            }
-                        }
-                    }
-                    let peers = established_peers(state, domain).len();
-                    for prefix in readvertised {
-                        Self::emit_locked(
-                            state,
-                            events,
-                            now,
-                            RoutingEventKind::PrefixAdvertised {
-                                prefix: AdvertisedPrefix::new(domain, prefix),
-                                peers,
-                            },
-                        );
-                    }
-                }
-                PeerSessionState::Connecting | PeerSessionState::Down => {
-                    if previous
-                        .as_ref()
-                        .is_some_and(|previous| previous.session == PeerSessionState::Established)
-                        || (first_sighting && track.session == PeerSessionState::Down)
-                    {
-                        let remaining = established_peers(state, domain).len();
-                        if remaining == 0 {
-                            let mut withdrawn = Vec::new();
-                            {
-                                let domain_state = state.domains.entry(domain).or_default();
-                                for (prefix, prefix_track) in &mut domain_state.prefixes {
-                                    if prefix_track.originated
-                                        && prefix_track.state
-                                            == PrefixAdvertisementState::Advertised
-                                    {
-                                        prefix_track.state = PrefixAdvertisementState::Withdrawn;
-                                        prefix_track.last_transition = Some(now);
-                                        prefix_track.last_withdraw_reason =
-                                            Some(PrefixWithdrawReason::PeerSessionDown);
-                                        withdrawn.push(*prefix);
-                                    }
-                                }
-                            }
-                            for prefix in withdrawn {
-                                Self::emit_locked(
-                                    state,
-                                    events,
-                                    now,
-                                    RoutingEventKind::PrefixWithdrawn {
-                                        prefix: AdvertisedPrefix::new(domain, prefix),
-                                        reason: PrefixWithdrawReason::PeerSessionDown,
-                                    },
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if health_changed && (!first_sighting || track.path_health != PathHealth::Up) {
-            Self::emit_locked(
-                state,
-                events,
-                now,
-                RoutingEventKind::PathHealthChanged {
-                    peer: track.identity,
-                    health: track.path_health,
-                },
-            );
         }
     }
 
@@ -809,7 +673,7 @@ where
     pub async fn shutdown(&self) {
         let _op = self.op_lock.lock().await;
         let domains: Vec<RoutingDomainTag> = {
-            let state = self.lock_state();
+            let state = lock_state(&self.state);
             state.domains.keys().copied().collect()
         };
         for domain in domains {
@@ -822,7 +686,7 @@ where
     /// Return the status snapshot for every tracked prefix in one domain.
     #[must_use]
     pub fn prefix_snapshots(&self, domain: RoutingDomainTag) -> Vec<PrefixStatusSnapshot> {
-        let state = self.lock_state();
+        let state = lock_state(&self.state);
         let established = established_peers(&state, domain);
         let Some(domain_state) = state.domains.get(&domain) else {
             return Vec::new();
@@ -857,27 +721,335 @@ where
             .into_iter()
             .find(|snapshot| snapshot.prefix.prefix() == prefix)
     }
+}
 
-    fn lock_state(&self) -> std::sync::MutexGuard<'_, ServiceState> {
-        self.state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+/// Detached apply driver: performs the adapter mutation and applies the
+/// outcome to service state as one serialized unit.
+///
+/// The apply lock serializes adapter mutations in intent order, so the last
+/// driver to run is always the last adapter effect and the last belief —
+/// a retried intent queued after a cancelled call can never be overwritten
+/// by the stale driver.
+#[allow(clippy::too_many_arguments)]
+async fn drive_apply<A>(
+    adapter: Arc<A>,
+    apply_lock: Arc<tokio::sync::Mutex<()>>,
+    state: Arc<Mutex<ServiceState>>,
+    events: broadcast::Sender<RoutingEvent>,
+    clock: Arc<dyn Clock>,
+    domain: RoutingDomainTag,
+    desired: BTreeSet<HostPrefix>,
+    generation: LeaseGeneration,
+) -> Result<PrefixReconcileReport, IpsecLbError>
+where
+    A: RoutingStackAdapter,
+{
+    let _apply = apply_lock.lock().await;
+    let outcomes = match adapter.apply_advertisement_set(domain, &desired).await {
+        Ok(outcomes) => outcomes,
+        Err(error) => {
+            // Ambiguous apply: the lease deadline stays armed so the
+            // watchdog withdraws any possibly-originated prefixes, and
+            // previously advertised prefixes become unconfirmed. The epoch
+            // remains retryable with the same generation while the lease is
+            // unexpired and the intent identical.
+            let now = clock.now_utc();
+            let mut state = lock_state(&state);
+            let mut pending = Vec::new();
+            {
+                let domain_state = state.domains.entry(domain).or_default();
+                domain_state.advertised_generation = None;
+                for prefix in &desired {
+                    let track = domain_state.prefixes.entry(*prefix).or_default();
+                    if track.state == PrefixAdvertisementState::Advertised {
+                        track.state = PrefixAdvertisementState::Unknown;
+                        track.last_transition = Some(now);
+                        track.last_withdraw_reason =
+                            Some(PrefixWithdrawReason::RoutingStackUnreachable);
+                        pending.push(RoutingEventKind::PrefixUnconfirmed {
+                            prefix: AdvertisedPrefix::new(domain, *prefix),
+                            reason: PrefixWithdrawReason::RoutingStackUnreachable,
+                        });
+                    }
+                }
+            }
+            for kind in pending {
+                emit_locked(&mut state, &events, now, kind);
+            }
+            return Err(error);
+        }
+    };
+
+    let now = clock.now_utc();
+    let mut state = lock_state(&state);
+    let established = established_peers(&state, domain).len();
+    let mut pending = Vec::new();
+    {
+        let domain_state = state.domains.entry(domain).or_default();
+        domain_state.advertised_generation = Some(generation);
+        for (prefix, outcome) in &outcomes {
+            let track = domain_state.prefixes.entry(*prefix).or_default();
+            match outcome {
+                PrefixApplyOutcome::Accepted => {
+                    track.originated = true;
+                    if track.state != PrefixAdvertisementState::Advertised {
+                        track.state = PrefixAdvertisementState::Advertised;
+                        track.last_transition = Some(now);
+                        track.last_withdraw_reason = None;
+                        pending.push(RoutingEventKind::PrefixAdvertised {
+                            prefix: AdvertisedPrefix::new(domain, *prefix),
+                            peers: established,
+                        });
+                    }
+                }
+                PrefixApplyOutcome::Rejected(reason) => {
+                    track.originated = false;
+                    if track.state == PrefixAdvertisementState::Advertised {
+                        pending.push(RoutingEventKind::PrefixWithdrawn {
+                            prefix: AdvertisedPrefix::new(domain, *prefix),
+                            reason: PrefixWithdrawReason::AdapterRejected,
+                        });
+                    }
+                    track.state = PrefixAdvertisementState::Rejected;
+                    track.last_transition = Some(now);
+                    track.last_withdraw_reason = Some(match reason {
+                        PrefixRejectReason::StaleGeneration => {
+                            PrefixWithdrawReason::StaleGeneration
+                        }
+                        _ => PrefixWithdrawReason::AdapterRejected,
+                    });
+                }
+                PrefixApplyOutcome::Unreachable => {
+                    if track.state == PrefixAdvertisementState::Advertised {
+                        pending.push(RoutingEventKind::PrefixUnconfirmed {
+                            prefix: AdvertisedPrefix::new(domain, *prefix),
+                            reason: PrefixWithdrawReason::RoutingStackUnreachable,
+                        });
+                    }
+                    track.state = PrefixAdvertisementState::Unknown;
+                    track.last_transition = Some(now);
+                    track.last_withdraw_reason =
+                        Some(PrefixWithdrawReason::RoutingStackUnreachable);
+                }
+            }
+        }
+        // Prefixes reconciled out of the desired set are withdrawn by the
+        // adapter's declarative apply; reflect exactly that delta.
+        let mut dropped = Vec::new();
+        for (prefix, track) in &mut domain_state.prefixes {
+            if track.originated && !desired.contains(prefix) {
+                track.originated = false;
+                track.state = PrefixAdvertisementState::Withdrawn;
+                track.last_transition = Some(now);
+                track.last_withdraw_reason = Some(PrefixWithdrawReason::CallerDrain);
+                dropped.push(*prefix);
+            }
+        }
+        for prefix in dropped {
+            pending.push(RoutingEventKind::PrefixWithdrawn {
+                prefix: AdvertisedPrefix::new(domain, prefix),
+                reason: PrefixWithdrawReason::CallerDrain,
+            });
+        }
+        prune_terminal_tracks(domain_state);
+    }
+    for kind in pending {
+        emit_locked(&mut state, &events, now, kind);
     }
 
-    fn emit_locked(
-        state: &mut ServiceState,
-        events: &broadcast::Sender<RoutingEvent>,
-        now: Timestamp,
-        kind: RoutingEventKind,
-    ) {
-        state.sequence = state.sequence.saturating_add(1);
-        // No subscribers is not an error; telemetry must never block intent.
-        let _ = events.send(RoutingEvent {
-            sequence: state.sequence,
-            at: now,
-            kind,
-        });
+    let disposition = if outcomes
+        .values()
+        .all(|outcome| *outcome == PrefixApplyOutcome::Accepted)
+    {
+        ReconcileDisposition::Advertised
+    } else {
+        ReconcileDisposition::PartiallyRejected
+    };
+    Ok(PrefixReconcileReport {
+        domain,
+        disposition,
+        outcomes,
+    })
+}
+
+/// Relay one peer observation: session transitions first, then the prefix
+/// transitions they cause, then path-health transitions.
+fn note_peer_locked(
+    state: &mut ServiceState,
+    events: &broadcast::Sender<RoutingEvent>,
+    now: Timestamp,
+    key: PeerKey,
+    track: PeerTrack,
+    down_reason: PeerSessionChangeReason,
+) {
+    let domain = key.domain;
+    let previous = state.peers.get(&key).cloned();
+    let first_sighting = previous.is_none();
+    let session_changed = previous
+        .as_ref()
+        .is_none_or(|previous| previous.session != track.session);
+    let health_changed = previous
+        .as_ref()
+        .is_none_or(|previous| previous.path_health != track.path_health);
+    state.peers.insert(key, track.clone());
+
+    if session_changed {
+        let reason = match track.session {
+            PeerSessionState::Established => PeerSessionChangeReason::SessionEstablished,
+            PeerSessionState::Connecting => {
+                if first_sighting {
+                    PeerSessionChangeReason::PeerObserved
+                } else {
+                    down_reason
+                }
+            }
+            PeerSessionState::Down => {
+                if first_sighting {
+                    PeerSessionChangeReason::PeerObserved
+                } else if previous
+                    .as_ref()
+                    .is_some_and(|previous| previous.path_health == PathHealth::Up)
+                    && track.path_health == PathHealth::Down
+                {
+                    PeerSessionChangeReason::BfdPathDown
+                } else {
+                    down_reason
+                }
+            }
+        };
+        // The session transition is always emitted before any
+        // prefix-level event it causes.
+        emit_locked(
+            state,
+            events,
+            now,
+            RoutingEventKind::PeerSessionChanged {
+                peer: track.identity.clone(),
+                state: track.session,
+                reason,
+            },
+        );
+
+        match track.session {
+            PeerSessionState::Established => {
+                let mut readvertised = Vec::new();
+                {
+                    let domain_state = state.domains.entry(domain).or_default();
+                    for (prefix, prefix_track) in &mut domain_state.prefixes {
+                        if prefix_track.originated
+                            && prefix_track.state == PrefixAdvertisementState::Withdrawn
+                            && prefix_track.last_withdraw_reason
+                                == Some(PrefixWithdrawReason::PeerSessionDown)
+                        {
+                            prefix_track.state = PrefixAdvertisementState::Advertised;
+                            prefix_track.last_transition = Some(now);
+                            prefix_track.last_withdraw_reason = None;
+                            readvertised.push(*prefix);
+                        }
+                    }
+                }
+                let peers = established_peers(state, domain).len();
+                for prefix in readvertised {
+                    emit_locked(
+                        state,
+                        events,
+                        now,
+                        RoutingEventKind::PrefixAdvertised {
+                            prefix: AdvertisedPrefix::new(domain, prefix),
+                            peers,
+                        },
+                    );
+                }
+            }
+            PeerSessionState::Connecting | PeerSessionState::Down => {
+                let was_established = previous
+                    .as_ref()
+                    .is_some_and(|previous| previous.session == PeerSessionState::Established);
+                if was_established || (first_sighting && track.session == PeerSessionState::Down) {
+                    let remaining = established_peers(state, domain).len();
+                    if remaining == 0 {
+                        let mut withdrawn = Vec::new();
+                        {
+                            let domain_state = state.domains.entry(domain).or_default();
+                            for (prefix, prefix_track) in &mut domain_state.prefixes {
+                                if prefix_track.originated
+                                    && prefix_track.state == PrefixAdvertisementState::Advertised
+                                {
+                                    prefix_track.state = PrefixAdvertisementState::Withdrawn;
+                                    prefix_track.last_transition = Some(now);
+                                    prefix_track.last_withdraw_reason =
+                                        Some(PrefixWithdrawReason::PeerSessionDown);
+                                    withdrawn.push(*prefix);
+                                }
+                            }
+                        }
+                        for prefix in withdrawn {
+                            emit_locked(
+                                state,
+                                events,
+                                now,
+                                RoutingEventKind::PrefixWithdrawn {
+                                    prefix: AdvertisedPrefix::new(domain, prefix),
+                                    reason: PrefixWithdrawReason::PeerSessionDown,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
+
+    if health_changed && (!first_sighting || track.path_health != PathHealth::Up) {
+        emit_locked(
+            state,
+            events,
+            now,
+            RoutingEventKind::PathHealthChanged {
+                peer: track.identity,
+                health: track.path_health,
+            },
+        );
+    }
+}
+
+/// Remove terminal tracks whose prefix left the desired set.
+///
+/// Retention rule: a track is kept while its prefix is in the current
+/// desired set or in a non-terminal state (`Advertised`/`Unknown`, the
+/// latter still possibly originated by the stack). Terminal
+/// (`Withdrawn`/`Rejected`) tracks outside the desired set are pure history
+/// and pruned here so state cannot grow unboundedly.
+fn prune_terminal_tracks(domain_state: &mut DomainState) {
+    let desired = &domain_state.desired;
+    domain_state.prefixes.retain(|prefix, track| {
+        desired.contains(prefix)
+            || matches!(
+                track.state,
+                PrefixAdvertisementState::Advertised | PrefixAdvertisementState::Unknown
+            )
+    });
+}
+
+fn lock_state(state: &Arc<Mutex<ServiceState>>) -> std::sync::MutexGuard<'_, ServiceState> {
+    state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn emit_locked(
+    state: &mut ServiceState,
+    events: &broadcast::Sender<RoutingEvent>,
+    now: Timestamp,
+    kind: RoutingEventKind,
+) {
+    state.sequence = state.sequence.saturating_add(1);
+    // No subscribers is not an error; telemetry must never block intent.
+    let _ = events.send(RoutingEvent {
+        sequence: state.sequence,
+        at: now,
+        kind,
+    });
 }
 
 fn lease_deadline(now: Timestamp, lease: AdvertisementLease) -> Result<Timestamp, IpsecLbError> {

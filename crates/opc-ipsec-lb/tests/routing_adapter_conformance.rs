@@ -13,11 +13,11 @@ use std::time::Duration;
 use opc_session_store::TokioVirtualClock;
 
 use opc_ipsec_lb::{
-    AdvertisedPrefix, AdvertisementLease, ConformanceFakeRoutingStack, HostPrefix, IpAddress,
-    LeaseGeneration, PathHealth, PeerIdentity, PeerObservation, PeerSessionChangeReason,
-    PeerSessionState, PrefixAdvertisementState, PrefixAdvertiserConfig, PrefixAdvertiserService,
-    PrefixApplyOutcome, PrefixRejectReason, PrefixWithdrawReason, ReconcileDisposition,
-    RoutingDomainTag, RoutingEventKind,
+    AdvertisedPrefix, AdvertisementLease, ConformanceFakeRoutingStack, FakeApplyFailure,
+    HostPrefix, IpAddress, IpsecLbError, LeaseGeneration, PathHealth, PeerIdentity,
+    PeerObservation, PeerSessionChangeReason, PeerSessionState, PrefixAdvertisementState,
+    PrefixAdvertiserConfig, PrefixAdvertiserService, PrefixApplyOutcome, PrefixRejectReason,
+    PrefixWithdrawReason, ReconcileDisposition, RoutingDomainTag, RoutingEventKind,
 };
 
 use proptest::prelude::*;
@@ -573,12 +573,287 @@ async fn routing_stack_death_closes_sessions_and_unconfirms_prefixes() {
             )
         })
         .expect("session-lost event");
-    let withdrawn = events
+    let unconfirmed = events
         .iter()
-        .position(|event| matches!(&event.kind, RoutingEventKind::PrefixWithdrawn { .. }))
-        .expect("prefix-withdrawn event");
-    assert!(session_lost < withdrawn);
-    assert!(events[withdrawn].sequence > events[session_lost].sequence);
+        .position(|event| {
+            matches!(
+                &event.kind,
+                RoutingEventKind::PrefixUnconfirmed {
+                    reason: PrefixWithdrawReason::RoutingStackUnreachable,
+                    ..
+                }
+            )
+        })
+        .expect("prefix-unconfirmed event");
+    assert!(session_lost < unconfirmed);
+    assert!(events[unconfirmed].sequence > events[session_lost].sequence);
+    // Unreachability is not a withdrawal: the snapshot reports the prefix as
+    // unconfirmed, and no PrefixWithdrawn event was emitted for this cause.
+    let snapshot = service
+        .prefix_snapshot(domain(DOMAIN_A), prefix(10))
+        .unwrap();
+    assert_eq!(snapshot.state, PrefixAdvertisementState::Unknown);
+    assert!(!events.iter().any(|event| matches!(
+        &event.kind,
+        RoutingEventKind::PrefixWithdrawn {
+            reason: PrefixWithdrawReason::RoutingStackUnreachable,
+            ..
+        }
+    )));
+}
+
+#[tokio::test]
+async fn renewal_after_shrink_is_an_idempotent_noop() {
+    let stack = ConformanceFakeRoutingStack::new();
+    let service = service(stack.clone());
+
+    service
+        .reconcile(domain(DOMAIN_A), prefixes(&[10, 11]), Some(lease(1)))
+        .await
+        .unwrap();
+    let report = service
+        .reconcile(domain(DOMAIN_A), prefixes(&[11]), Some(lease(2)))
+        .await
+        .unwrap();
+    assert_eq!(report.disposition, ReconcileDisposition::Advertised);
+    assert_eq!(stack.originated(domain(DOMAIN_A)), prefixes(&[11]));
+    assert_eq!(stack.apply_calls().len(), 2);
+
+    // Same-generation renewal of the shrunk set: historical tracks of the
+    // dropped prefix must not poison retention.
+    let report = service
+        .reconcile(domain(DOMAIN_A), prefixes(&[11]), Some(lease(2)))
+        .await
+        .unwrap();
+    assert_eq!(report.disposition, ReconcileDisposition::Retained);
+    assert_eq!(stack.apply_calls().len(), 2);
+    assert_eq!(stack.originated(domain(DOMAIN_A)), prefixes(&[11]));
+    // The dropped prefix's terminal track is pruned; the live one is kept.
+    assert!(service
+        .prefix_snapshot(domain(DOMAIN_A), prefix(10))
+        .is_none());
+    let snapshot = service
+        .prefix_snapshot(domain(DOMAIN_A), prefix(11))
+        .unwrap();
+    assert_eq!(snapshot.state, PrefixAdvertisementState::Advertised);
+}
+
+#[tokio::test]
+async fn renewal_after_partial_rejection_and_shrink_is_an_idempotent_noop() {
+    let stack = ConformanceFakeRoutingStack::new();
+    stack.reject_prefix(prefix(11));
+    let service = service(stack.clone());
+
+    let report = service
+        .reconcile(domain(DOMAIN_A), prefixes(&[10, 11]), Some(lease(1)))
+        .await
+        .unwrap();
+    assert_eq!(report.disposition, ReconcileDisposition::PartiallyRejected);
+    stack.clear_rejections();
+
+    let report = service
+        .reconcile(domain(DOMAIN_A), prefixes(&[10]), Some(lease(2)))
+        .await
+        .unwrap();
+    assert_eq!(report.disposition, ReconcileDisposition::Advertised);
+    assert_eq!(stack.apply_calls().len(), 2);
+
+    // The rejected prefix's historical track must not poison renewal of the
+    // surviving set.
+    let report = service
+        .reconcile(domain(DOMAIN_A), prefixes(&[10]), Some(lease(2)))
+        .await
+        .unwrap();
+    assert_eq!(report.disposition, ReconcileDisposition::Retained);
+    assert_eq!(stack.apply_calls().len(), 2);
+    assert_eq!(stack.originated(domain(DOMAIN_A)), prefixes(&[10]));
+}
+
+#[tokio::test]
+async fn partial_apply_disconnect_retries_with_the_same_generation() {
+    let stack = ConformanceFakeRoutingStack::new();
+    stack.fail_next_apply(FakeApplyFailure::DisconnectAfterPartialApply);
+    let service = service(stack.clone());
+
+    // The apply fails ambiguously after originating only prefix 10.
+    let error = service
+        .reconcile(domain(DOMAIN_A), prefixes(&[10, 11]), Some(lease(1)))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, IpsecLbError::Io { .. }));
+    assert_eq!(stack.originated(domain(DOMAIN_A)), prefixes(&[10]));
+
+    // The generation is current and the lease unexpired: the identical
+    // intent retries declaratively instead of failing closed as stale.
+    let report = service
+        .reconcile(domain(DOMAIN_A), prefixes(&[10, 11]), Some(lease(1)))
+        .await
+        .unwrap();
+    assert_eq!(report.disposition, ReconcileDisposition::Advertised);
+    assert_eq!(stack.originated(domain(DOMAIN_A)), prefixes(&[10, 11]));
+    for last in [10, 11] {
+        let snapshot = service
+            .prefix_snapshot(domain(DOMAIN_A), prefix(last))
+            .unwrap();
+        assert_eq!(snapshot.state, PrefixAdvertisementState::Advertised);
+    }
+}
+
+#[tokio::test]
+async fn cancelled_reconcile_driver_completes_to_consistent_state() {
+    let stack = ConformanceFakeRoutingStack::new();
+    let gate = stack.gate_next_apply();
+    let service = Arc::new(service(stack.clone()));
+
+    let task = tokio::spawn({
+        let service = Arc::clone(&service);
+        async move {
+            service
+                .reconcile(domain(DOMAIN_A), prefixes(&[10]), Some(lease(1)))
+                .await
+        }
+    });
+    // The adapter side effect has landed; the caller is cancelled before
+    // the outcome is applied, yet the detached driver must finish the job.
+    gate.wait_landed().await;
+    task.abort();
+    gate.release();
+
+    let mut advertised = false;
+    for _ in 0..64 {
+        if service
+            .prefix_snapshot(domain(DOMAIN_A), prefix(10))
+            .is_some_and(|snapshot| snapshot.state == PrefixAdvertisementState::Advertised)
+        {
+            advertised = true;
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        advertised,
+        "driver must finalize state after caller cancellation"
+    );
+    assert_eq!(stack.originated(domain(DOMAIN_A)), prefixes(&[10]));
+    let report = service
+        .reconcile(domain(DOMAIN_A), prefixes(&[10]), Some(lease(1)))
+        .await
+        .unwrap();
+    assert_eq!(report.disposition, ReconcileDisposition::Retained);
+}
+
+#[tokio::test(start_paused = true)]
+async fn lease_enforcement_attempts_every_expired_domain_despite_errors() {
+    let stack = ConformanceFakeRoutingStack::new();
+    let clock = Arc::new(TokioVirtualClock::new());
+    let service = PrefixAdvertiserService::with_clock(
+        stack.clone(),
+        PrefixAdvertiserConfig::default(),
+        clock,
+    )
+    .unwrap();
+
+    service
+        .reconcile(domain(DOMAIN_A), prefixes(&[10]), Some(short_lease(1, 1)))
+        .await
+        .unwrap();
+    service
+        .reconcile(domain(DOMAIN_B), prefixes(&[20]), Some(short_lease(1, 1)))
+        .await
+        .unwrap();
+
+    stack.set_unreachable(true);
+    tokio::time::advance(Duration::from_secs(2)).await;
+    let error = service.enforce_lease_once().await.unwrap_err();
+    assert!(matches!(error, IpsecLbError::Io { .. }));
+    // Both expired domains were attempted; the first failure did not block
+    // the second.
+    assert_eq!(
+        stack.withdraw_all_calls(),
+        vec![domain(DOMAIN_A), domain(DOMAIN_B)]
+    );
+    // The lease deadlines stay armed, so recovery retries the withdrawal.
+    stack.set_unreachable(false);
+    service.enforce_lease_once().await.unwrap();
+    assert!(stack.originated(domain(DOMAIN_A)).is_empty());
+    assert!(stack.originated(domain(DOMAIN_B)).is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn vanished_peer_is_pruned_after_retention_and_relearned_as_new() {
+    let stack = ConformanceFakeRoutingStack::new();
+    stack.set_observations(vec![observation(
+        DOMAIN_A,
+        "edge-a",
+        PeerSessionState::Established,
+        PathHealth::Up,
+    )]);
+    let clock = Arc::new(TokioVirtualClock::new());
+    let service = PrefixAdvertiserService::with_clock(
+        stack.clone(),
+        PrefixAdvertiserConfig {
+            peer_retention_secs: 60,
+            ..PrefixAdvertiserConfig::default()
+        },
+        clock,
+    )
+    .unwrap();
+    let mut events = service.subscribe_events();
+
+    service
+        .reconcile(domain(DOMAIN_A), prefixes(&[10]), Some(lease(1)))
+        .await
+        .unwrap();
+    service.observe_once().await.unwrap();
+    stack.set_observations(Vec::new());
+    service.observe_once().await.unwrap();
+
+    // Past the retention bound the peer is pruned.
+    tokio::time::advance(Duration::from_secs(120)).await;
+    service.observe_once().await.unwrap();
+    stack.set_observations(vec![observation(
+        DOMAIN_A,
+        "edge-a",
+        PeerSessionState::Connecting,
+        PathHealth::Unknown,
+    )]);
+    service.observe_once().await.unwrap();
+
+    let events = collect_events(&mut events);
+    let closed = events.iter().any(|event| {
+        matches!(
+            &event.kind,
+            RoutingEventKind::PeerSessionChanged {
+                state: PeerSessionState::Down,
+                reason: PeerSessionChangeReason::SessionClosed,
+                ..
+            }
+        )
+    });
+    assert!(closed, "vanishing peer transitions to session down");
+    // A pruned peer re-sighted in a non-established state is a first
+    // sighting and reports peer_observed, never session_closed.
+    let relearned = events.iter().any(|event| {
+        matches!(
+            &event.kind,
+            RoutingEventKind::PeerSessionChanged {
+                state: PeerSessionState::Connecting,
+                reason: PeerSessionChangeReason::PeerObserved,
+                ..
+            }
+        )
+    });
+    assert!(relearned, "pruned peer is relearned as a fresh observation");
+    assert!(!events.iter().any(|event| {
+        matches!(
+            &event.kind,
+            RoutingEventKind::PeerSessionChanged {
+                state: PeerSessionState::Connecting,
+                reason: PeerSessionChangeReason::SessionClosed,
+                ..
+            }
+        )
+    }));
 }
 
 #[tokio::test]

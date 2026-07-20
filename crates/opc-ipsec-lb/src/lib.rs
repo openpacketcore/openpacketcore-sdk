@@ -123,9 +123,9 @@ pub use repin::{
     SameSpiOutboundIvResume, SameSpiResume,
 };
 pub use routing::{
-    AdvertisedPrefix, AdvertisementLease, BirdAdapterConfig, BirdControlSocketAdapter,
-    BirdDomainBinding, ConformanceFakeRoutingStack, HostPrefix, LeaseGeneration, PathHealth,
-    PeerIdentity, PeerObservation, PeerSessionChangeReason, PeerSessionState,
+    AdvertisedPrefix, AdvertisementLease, ApplyGate, BirdAdapterConfig, BirdControlSocketAdapter,
+    BirdDomainBinding, ConformanceFakeRoutingStack, FakeApplyFailure, HostPrefix, LeaseGeneration,
+    PathHealth, PeerIdentity, PeerObservation, PeerSessionChangeReason, PeerSessionState,
     PrefixAdvertisementState, PrefixAdvertiserConfig, PrefixAdvertiserService, PrefixApplyOutcome,
     PrefixReconcileReport, PrefixRejectReason, PrefixStatusSnapshot, PrefixWithdrawReason,
     ReconcileDisposition, RecordedAdvertisementApply, RoutingEvent, RoutingEventKind,
