@@ -63,10 +63,11 @@ use aya::{Ebpf, EbpfLoader};
 use nix::libc;
 use nix::{setsockopt_impl, sockopt_impl};
 use opc_gtpu_dataplane::{
-    CreateGtpDeviceRequest, DrainedV2TeardownOutcome, DrainedV2TeardownRefusal,
-    DrainedV2TeardownRequest, DscpCodepoint, EbpfGtpuDataplaneBackend,
+    CreateGtpDeviceRequest, DownlinkOuterProvenance, DrainedV2TeardownOutcome,
+    DrainedV2TeardownRefusal, DrainedV2TeardownRequest, DscpCodepoint, EbpfGtpuDataplaneBackend,
     EbpfGtpuDataplaneBackendConfig, GtpBearerMark, GtpDevice, GtpPdpContext, GtpVersion,
-    GtpuCapability, GtpuDataplaneBackend, GtpuError, GtpuSourcePortPolicy,
+    GtpuCapability, GtpuDataplaneBackend, GtpuError, GtpuOuterFragmentPolicy,
+    GtpuReassemblyConsumer, GtpuReassemblyOutcome, GtpuSourcePortPolicy, GtpuUplinkMtuPolicy,
     GtpuUplinkSourcePortPolicy, GtpuV2DrainProof, PdpContextIndeterminateReason,
     PdpContextInstallOutcome, PdpContextLocalTeidSelector, PdpContextReadback,
     PdpContextRemovalOutcome, PdpContextSelector, PdpContextSelectorOccupancy,
@@ -74,21 +75,23 @@ use opc_gtpu_dataplane::{
 };
 use opc_gtpu_ebpf_common::{
     internet_checksum, ipv4_header_checksum, udp_ipv4_checksum, DownlinkEndpointBinding,
-    DownlinkPdr, GtpuEndpointAddress, MarkedBearerOwner, MarkedBearerOwnerPhase, PdpContextCommit,
-    UplinkFar, UplinkFarKey, COUNTER_DL_BINDING_FAMILY_MISMATCH,
+    DownlinkPdr, GtpuEndpointAddress, MarkedBearerOwner, MarkedBearerOwnerPhase, MarkedDownlinkPdr,
+    PdpContextCommit, UplinkFar, UplinkFarKey, COUNTER_DL_BINDING_FAMILY_MISMATCH,
     COUNTER_DL_BINDING_INGRESS_MISMATCH, COUNTER_DL_BINDING_INVALID,
     COUNTER_DL_BINDING_LOCAL_MISMATCH, COUNTER_DL_BINDING_PEER_MISMATCH,
     COUNTER_DL_BINDING_SOURCE_PORT_MISMATCH, COUNTER_DL_DECAP, COUNTER_DL_DST_MISMATCH,
     COUNTER_DL_MALFORMED, COUNTER_DL_UNKNOWN_TEID, COUNTER_UL_ENCAP, COUNTER_UL_FAR_MISS,
-    DOWNLINK_ENDPOINT_BINDING_VALUE_LEN, DOWNLINK_PDR_VALUE_LEN, ETH_HDR_LEN,
-    GTPU_MANDATORY_HDR_LEN, IPV4_MIN_HDR_LEN, MAP_CONFIG, MAP_COUNTERS,
+    COUNTER_UL_MTU_REJECT, DOWNLINK_ENDPOINT_BINDING_VALUE_LEN, DOWNLINK_PDR_VALUE_LEN,
+    ETH_HDR_LEN, GTPU_MANDATORY_HDR_LEN, IPV4_MIN_HDR_LEN, MAP_CONFIG, MAP_COUNTERS,
     MAP_DOWNLINK_BINDING_COUNTERS, MAP_DOWNLINK_ENDPOINT_BINDING, MAP_DOWNLINK_MARK_PDR,
     MAP_DOWNLINK_PDR, MAP_MARKED_BEARER_OWNER, MAP_UPLINK_DSCP, MAP_UPLINK_FAR,
-    MAP_UPLINK_MARK_DSCP, MAP_UPLINK_MARK_FAR, MAP_UPLINK_MARK_SOURCE_PORT, MAP_UPLINK_SOURCE_PORT,
-    MARKED_BEARER_OWNER_VALUE_LEN, MARKED_DOWNLINK_PDR_VALUE_LEN, PROG_DOWNLINK, PROG_UPLINK,
-    UDP_HDR_LEN, UPLINK_BEARER_SCHEMA_MARKER_VALUE, UPLINK_DSCP_SCHEMA_MARKER_KEY,
+    MAP_UPLINK_MARK_DSCP, MAP_UPLINK_MARK_FAR, MAP_UPLINK_MARK_SOURCE_PORT, MAP_UPLINK_PMTU,
+    MAP_UPLINK_PMTU_COUNTERS, MAP_UPLINK_SOURCE_PORT, MARKED_BEARER_OWNER_VALUE_LEN,
+    MARKED_DOWNLINK_PDR_VALUE_LEN, PROG_DOWNLINK, PROG_UPLINK, UDP_HDR_LEN,
+    UPLINK_BEARER_SCHEMA_MARKER_VALUE, UPLINK_DSCP_SCHEMA_MARKER_KEY,
     UPLINK_DSCP_SCHEMA_MARKER_VALUE, UPLINK_DSCP_VALUE_LEN, UPLINK_FAR_VALUE_LEN,
-    UPLINK_MARK_KEY_LEN, UPLINK_SOURCE_PORT_SCHEMA_MARKER_VALUE, UPLINK_SOURCE_PORT_VALUE_LEN,
+    UPLINK_MARK_KEY_LEN, UPLINK_PMTU_SCHEMA_MARKER_VALUE, UPLINK_PMTU_VALUE_LEN,
+    UPLINK_SOURCE_PORT_SCHEMA_MARKER_VALUE, UPLINK_SOURCE_PORT_VALUE_LEN,
 };
 use opc_ipsec_xfrm::{
     Algorithm, AuthAlgorithm, InstallPolicyRequest, InstallSaRequest, IpAddress, KeyMaterial,
@@ -2614,6 +2617,8 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
                 MAP_UPLINK_MARK_DSCP,
                 MAP_UPLINK_SOURCE_PORT,
                 MAP_UPLINK_MARK_SOURCE_PORT,
+                MAP_UPLINK_PMTU,
+                MAP_UPLINK_PMTU_COUNTERS,
                 MAP_DOWNLINK_PDR,
                 MAP_DOWNLINK_MARK_PDR,
                 MAP_DOWNLINK_ENDPOINT_BINDING,
@@ -4052,6 +4057,485 @@ async fn ebpf_gtpu_uplink_selected_source_port_on_the_wire(
     .expect("reconciled uplink G-PDU must reach the PGW again");
     assert_eq!(from, SocketAddr::from((EPDG_S2BU_IP, SELECTED_SOURCE_PORT)));
     assert!(buffer[..len].ends_with(b"opc-uplink-sport-restored"));
+
+    drop(net);
+    Ok(())
+}
+
+fn pinned_pmtu_policy(pin_dir: &std::path::Path) -> [u8; UPLINK_PMTU_VALUE_LEN] {
+    let map = Map::from_map_data(
+        MapData::from_pin(pin_dir.join(MAP_UPLINK_PMTU)).expect("open pinned MTU policy map"),
+    )
+    .expect("identify pinned MTU policy map");
+    let policy = Array::<_, [u8; UPLINK_PMTU_VALUE_LEN]>::try_from(map)
+        .expect("typed pinned MTU policy map");
+    policy.get(&0, 0).expect("read pinned MTU policy")
+}
+
+fn replace_pinned_pmtu_policy(pin_dir: &std::path::Path, value: [u8; UPLINK_PMTU_VALUE_LEN]) {
+    let map = Map::from_map_data(
+        MapData::from_pin(pin_dir.join(MAP_UPLINK_PMTU)).expect("open pinned MTU policy map"),
+    )
+    .expect("identify pinned MTU policy map");
+    let mut policy = Array::<_, [u8; UPLINK_PMTU_VALUE_LEN]>::try_from(map)
+        .expect("typed pinned MTU policy map");
+    policy.set(0, value, 0).expect("replace pinned MTU policy");
+}
+
+fn pinned_pmtu_drop_counter(pin_dir: &std::path::Path) -> u64 {
+    let map = Map::from_map_data(
+        MapData::from_pin(pin_dir.join(MAP_UPLINK_PMTU_COUNTERS))
+            .expect("open pinned MTU-drop counters"),
+    )
+    .expect("identify pinned MTU-drop counter map");
+    let counters = PerCpuArray::<_, u64>::try_from(map).expect("typed pinned MTU-drop counters");
+    counters
+        .get(&COUNTER_UL_MTU_REJECT, 0)
+        .expect("read per-CPU MTU-drop counter")
+        .iter()
+        .copied()
+        .sum()
+}
+
+/// Read the exact pinned default/marked PDR the tc downlink program would
+/// consult for `teid`, normalized to the marked view.
+fn read_pinned_downlink_pdr(pin_dir: &std::path::Path, teid: [u8; 4]) -> Option<MarkedDownlinkPdr> {
+    let legacy = Map::from_map_data(
+        MapData::from_pin(pin_dir.join(MAP_DOWNLINK_PDR)).expect("open pinned downlink PDR"),
+    )
+    .expect("identify pinned downlink PDR map");
+    let legacy = BpfHashMap::<_, [u8; 4], [u8; DOWNLINK_PDR_VALUE_LEN]>::try_from(legacy)
+        .expect("typed pinned downlink PDR map");
+    if let Ok(value) = legacy.get(&teid, 0) {
+        return Some(MarkedDownlinkPdr {
+            ue_ip: DownlinkPdr::decode(&value).ue_ip,
+            bearer_mark: [0; 4],
+        });
+    }
+    let marked = Map::from_map_data(
+        MapData::from_pin(pin_dir.join(MAP_DOWNLINK_MARK_PDR))
+            .expect("open pinned marked downlink PDR"),
+    )
+    .expect("identify pinned marked downlink PDR map");
+    let marked = BpfHashMap::<_, [u8; 4], [u8; MARKED_DOWNLINK_PDR_VALUE_LEN]>::try_from(marked)
+        .expect("typed pinned marked downlink PDR map");
+    marked
+        .get(&teid, 0)
+        .ok()
+        .map(|value| MarkedDownlinkPdr::decode(&value))
+}
+
+/// Read the exact pinned outer-endpoint binding the tc downlink program
+/// would consult for `teid`.
+fn read_pinned_downlink_binding(
+    pin_dir: &std::path::Path,
+    teid: [u8; 4],
+) -> Option<DownlinkEndpointBinding> {
+    let map = Map::from_map_data(
+        MapData::from_pin(pin_dir.join(MAP_DOWNLINK_ENDPOINT_BINDING))
+            .expect("open pinned downlink binding"),
+    )
+    .expect("identify pinned downlink binding map");
+    let bindings =
+        BpfHashMap::<_, [u8; 4], [u8; DOWNLINK_ENDPOINT_BINDING_VALUE_LEN]>::try_from(map)
+            .expect("typed pinned downlink binding map");
+    bindings.get(&teid, 0).ok().map(|value| {
+        let binding = DownlinkEndpointBinding::decode(&value);
+        assert!(binding.is_valid(), "pinned binding must be canonical");
+        binding
+    })
+}
+
+/// Split a complete outer GTP-U frame into two IPv4 fragments at an 8-byte
+/// boundary inside the IPv4 payload, sharing one fragment ID. The first
+/// fragment carries the MF flag; DF is never set on a fragment.
+fn build_outer_fragments(frame: &[u8], first_payload_len: usize, id: u16) -> (Vec<u8>, Vec<u8>) {
+    assert_eq!(first_payload_len % 8, 0);
+    let ip = ETH_HDR_LEN;
+    let ihl = usize::from(frame[ip] & 0x0f) * 4;
+    assert_eq!(
+        ihl, IPV4_MIN_HDR_LEN,
+        "fragment builder needs option-free IPv4"
+    );
+    let total = usize::from(u16::from_be_bytes([frame[ip + 2], frame[ip + 3]]));
+    let payload = &frame[ip + ihl..ip + total];
+    assert!(
+        first_payload_len >= UDP_HDR_LEN + GTPU_MANDATORY_HDR_LEN
+            && first_payload_len < payload.len()
+    );
+    let make_fragment = |fragment_payload: &[u8], offset_units: u16, more_fragments: bool| {
+        let mut fragment = Vec::with_capacity(ip + ihl + fragment_payload.len());
+        fragment.extend_from_slice(&frame[..ETH_HDR_LEN]);
+        let mut header = frame[ip..ip + ihl].to_vec();
+        header[2..4].copy_from_slice(
+            &(u16::try_from(ihl + fragment_payload.len())
+                .unwrap()
+                .to_be_bytes()),
+        );
+        header[4..6].copy_from_slice(&id.to_be_bytes());
+        let flags_offset = (offset_units & 0x1FFF) | (u16::from(more_fragments) * 0x2000);
+        header[6..8].copy_from_slice(&flags_offset.to_be_bytes());
+        header[10..12].fill(0);
+        let checksum = internet_checksum(&header);
+        header[10..12].copy_from_slice(&checksum.to_be_bytes());
+        fragment.extend_from_slice(&header);
+        fragment.extend_from_slice(fragment_payload);
+        fragment
+    };
+    (
+        make_fragment(&payload[..first_payload_len], 0, true),
+        make_fragment(
+            &payload[first_payload_len..],
+            u16::try_from(first_payload_len / 8).unwrap(),
+            false,
+        ),
+    )
+}
+
+/// Receive AF_PACKET frames until the outer GTP-U UDP/2152 packet toward the
+/// PGW arrives; return its IPv4 flags/fragment-offset high byte.
+fn capture_gtpu_outer_flags(capture: &OwnedFd) -> u8 {
+    use nix::sys::socket::{recv, MsgFlags};
+
+    let mut frame = vec![0_u8; 65_536];
+    loop {
+        let length = recv(capture.as_raw_fd(), &mut frame, MsgFlags::empty())
+            .expect("receive emitted uplink frame before timeout");
+        let ip = &frame[14..length];
+        if length < 14 + 20 + 8 || frame[12..14] != [0x08, 0x00] {
+            continue;
+        }
+        let ihl = usize::from(ip[0] & 0x0f) * 4;
+        if ip[0] >> 4 != 4
+            || ihl < 20
+            || ip.len() < ihl + 8
+            || ip[9] != IPPROTO_UDP
+            || ip[16..20] != PGW_IP.octets()
+        {
+            continue;
+        }
+        let udp = &ip[ihl..];
+        if u16::from_be_bytes([udp[2], udp[3]]) != GTPU_PORT {
+            continue;
+        }
+        return ip[6];
+    }
+}
+
+#[tokio::test]
+// The serial guard is deliberately held for the entire test body; see
+// PRIVILEGED_TEST_LOCK.
+#[allow(clippy::await_holding_lock)]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn ebpf_gtpu_downlink_outer_fragments_reenter_sdk_consumer_exactly_once(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref() != Ok("1") {
+        eprintln!("skipping: set OPC_GTPU_RUN_PRIVILEGED=1 inside a fresh privileged netns");
+        return Ok(());
+    }
+
+    let _serial = PRIVILEGED_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let net = TestNet::provision();
+    let backend = EbpfGtpuDataplaneBackend::with_config(EbpfGtpuDataplaneBackendConfig {
+        bpffs_pin_root: net.pin_root.clone(),
+        ..EbpfGtpuDataplaneBackendConfig::default()
+    });
+    let mut request = CreateGtpDeviceRequest::new("s2bu");
+    request.bind_address = IpAddr::V4(EPDG_S2BU_IP);
+    let device = backend.create_device(request).await?;
+    let pin_dir = net.pin_root.join("s2bu");
+    assert!(
+        matches!(
+            backend.probe().await?.downlink_outer_fragment_handling,
+            opc_gtpu_dataplane::GtpuDownlinkFragmentContract::KernelReassemblyHandoff { .. }
+        ),
+        "the eBPF backend must report the kernel-reassembly handoff contract"
+    );
+    backend
+        .install_pdp_context(session_context(device.ifindex))
+        .await?;
+
+    // The SDK post-reassembly consumer: an ordinary UDP socket on the local
+    // S2b-U endpoint in the ePDG (root) netns. tc passes every outer fragment
+    // to the stack; the kernel reassembles under its bounded ipfrag
+    // accounting and delivers one complete datagram here.
+    let consumer_socket = UdpSocket::bind((EPDG_S2BU_IP, GTPU_PORT))?;
+    let provenance = DownlinkOuterProvenance::new(PGW_IP, EPDG_S2BU_IP, device.ifindex, GTPU_PORT)
+        .expect("canonical provenance");
+    // The consumer authorizes against the exact pinned PDR/binding state the
+    // tc fast path consults.
+    let mut consumer = GtpuReassemblyConsumer::new(
+        |teid| read_pinned_downlink_pdr(&pin_dir, teid),
+        |teid| read_pinned_downlink_binding(&pin_dir, teid),
+    );
+
+    let destination_mac = main_link_address("s2bu");
+    let source_mac = net.pgw_link_address("s2bup");
+    let mut receive_buffer = [0_u8; 2048];
+    let send_set = |payload: &[u8; 180], id: u16, reorder: bool, duplicate_first: bool| {
+        let inner = build_inner_udp(REMOTE_HOST, UE_PAA, 53, 5000, payload);
+        let gpdu = build_gpdu(LOCAL_TEID, None, &inner);
+        let frame = build_outer_gtpu_frame(destination_mac, source_mac, &[], &gpdu, true, 0);
+        let (first, second) = build_outer_fragments(&frame, 32, id);
+        let (leading, trailing) = if reorder {
+            (second, first)
+        } else {
+            (first, second)
+        };
+        send_raw_gtpu_frame(
+            &net.pgw_ns,
+            "s2bup",
+            &leading,
+            RawChecksumMetadata::Unverified,
+        );
+        if duplicate_first {
+            send_raw_gtpu_frame(
+                &net.pgw_ns,
+                "s2bup",
+                &leading,
+                RawChecksumMetadata::Unverified,
+            );
+        }
+        send_raw_gtpu_frame(
+            &net.pgw_ns,
+            "s2bup",
+            &trailing,
+            RawChecksumMetadata::Unverified,
+        );
+    };
+    let expect_decapsulated = |consumer: &mut GtpuReassemblyConsumer<_, _>,
+                               buffer: &mut [u8; 2048],
+                               expected_inner_payload: &[u8]| {
+        consumer_socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set consumer receive timeout");
+        let (length, from) = consumer_socket
+            .recv_from(buffer)
+            .expect("reassembled G-PDU must re-enter the SDK consumer");
+        assert_eq!(from, SocketAddr::from((PGW_IP, GTPU_PORT)));
+        let outcome = consumer.process(&buffer[..length], &provenance);
+        let GtpuReassemblyOutcome::Decapsulated {
+            inner_packet,
+            bearer_mark,
+        } = outcome
+        else {
+            panic!("authorized reassembled G-PDU must decapsulate, got {outcome:?}");
+        };
+        assert_eq!(bearer_mark, None, "default bearer carries no output mark");
+        assert!(
+            inner_packet.ends_with(expected_inner_payload),
+            "decapsulated inner packet must be the exact fragmented original"
+        );
+    };
+
+    // A complete valid fragmented downlink packet is delivered exactly once.
+    let mut payload = [b'a'; 180];
+    payload[..8].copy_from_slice(b"in-order");
+    send_set(&payload, 0x3450, false, false);
+    expect_decapsulated(&mut consumer, &mut receive_buffer, &payload);
+    expect_no_datagram(&consumer_socket);
+
+    // Reordered fragments reassemble into the same single delivery.
+    payload[..8].copy_from_slice(b"reordere");
+    send_set(&payload, 0x3451, true, false);
+    expect_decapsulated(&mut consumer, &mut receive_buffer, &payload);
+    expect_no_datagram(&consumer_socket);
+
+    // A duplicated first fragment must not duplicate the delivery.
+    payload[..8].copy_from_slice(b"duplicat");
+    send_set(&payload, 0x3452, false, true);
+    expect_decapsulated(&mut consumer, &mut receive_buffer, &payload);
+    expect_no_datagram(&consumer_socket);
+
+    // A conflicting overlapping second fragment is handled inside the
+    // kernel's bounded reassembly: at most one datagram ever re-enters, and
+    // any delivered datagram still produces one typed consumer outcome.
+    let inner = build_inner_udp(REMOTE_HOST, UE_PAA, 53, 5000, &payload);
+    let gpdu = build_gpdu(LOCAL_TEID, None, &inner);
+    let frame = build_outer_gtpu_frame(destination_mac, source_mac, &[], &gpdu, true, 0);
+    let (first, second) = build_outer_fragments(&frame, 40, 0x3453);
+    // Restart the second fragment 16 bytes earlier so its leading bytes
+    // overlap the first fragment with conflicting content.
+    let overlapping_second = {
+        let ip = ETH_HDR_LEN;
+        let ihl = IPV4_MIN_HDR_LEN;
+        let mut overlap = Vec::with_capacity(second.len() + 16);
+        overlap.extend_from_slice(&second[..ip + ihl]);
+        overlap.extend_from_slice(&frame[ip + ihl + 24..]);
+        let overlap_total = u16::try_from(overlap.len() - ip).unwrap();
+        overlap[ip + 2..ip + 4].copy_from_slice(&overlap_total.to_be_bytes());
+        overlap[ip + 6..ip + 8].copy_from_slice(&(24_u16 / 8).to_be_bytes());
+        overlap[ip + 10..ip + 12].fill(0);
+        let checksum = internet_checksum(&overlap[ip..ip + ihl]);
+        overlap[ip + 10..ip + 12].copy_from_slice(&checksum.to_be_bytes());
+        overlap
+    };
+    send_raw_gtpu_frame(
+        &net.pgw_ns,
+        "s2bup",
+        &first,
+        RawChecksumMetadata::Unverified,
+    );
+    send_raw_gtpu_frame(
+        &net.pgw_ns,
+        "s2bup",
+        &overlapping_second,
+        RawChecksumMetadata::Unverified,
+    );
+    consumer_socket
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .expect("set overlap receive timeout");
+    if let Ok((length, from)) = consumer_socket.recv_from(&mut receive_buffer) {
+        assert_eq!(from, SocketAddr::from((PGW_IP, GTPU_PORT)));
+        // The typed consumer outcome is total: delivered or dropped, never a
+        // duplicate and never a panic.
+        let _ = consumer.process(&receive_buffer[..length], &provenance);
+    }
+    expect_no_datagram(&consumer_socket);
+
+    // An incomplete fragment set never re-enters the consumer; the kernel
+    // retains it only within the documented bounded ipfrag timeout.
+    send_raw_gtpu_frame(
+        &net.pgw_ns,
+        "s2bup",
+        &build_outer_fragments(&frame, 32, 0x3454).0,
+        RawChecksumMetadata::Unverified,
+    );
+    expect_no_datagram(&consumer_socket);
+
+    let counters = consumer.counters();
+    assert_eq!(
+        counters.decapsulated, 3,
+        "exactly the three valid sets decapsulated, once each"
+    );
+    assert_eq!(counters.malformed, 0);
+
+    drop(net);
+    Ok(())
+}
+
+#[tokio::test]
+// The serial guard is deliberately held for the entire test body; see
+// PRIVILEGED_TEST_LOCK.
+#[allow(clippy::await_holding_lock)]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn ebpf_gtpu_uplink_mtu_policy_enforced_on_the_wire() -> Result<(), Box<dyn std::error::Error>>
+{
+    if env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref() != Ok("1") {
+        eprintln!("skipping: set OPC_GTPU_RUN_PRIVILEGED=1 inside a fresh privileged netns");
+        return Ok(());
+    }
+
+    let _serial = PRIVILEGED_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let net = TestNet::provision();
+    let backend = EbpfGtpuDataplaneBackend::with_config(EbpfGtpuDataplaneBackendConfig {
+        bpffs_pin_root: net.pin_root.clone(),
+        ..EbpfGtpuDataplaneBackendConfig::default()
+    });
+    let strict = GtpuUplinkMtuPolicy::new(1400, GtpuOuterFragmentPolicy::SignalPacketTooBig)
+        .expect("canonical strict policy");
+    let mut request = CreateGtpDeviceRequest::new("s2bu");
+    request.bind_address = IpAddr::V4(EPDG_S2BU_IP);
+    request.uplink_mtu_policy = Some(strict);
+    let device = backend.create_device(request).await?;
+    let pin_dir = net.pin_root.join("s2bu");
+    assert_eq!(
+        backend.probe().await?.uplink_pmtu_enforcement,
+        GtpuCapability::Available,
+        "loaded datapath must expose usable MTU policy maps"
+    );
+    assert_eq!(
+        pinned_schema_marker(&pin_dir),
+        UPLINK_PMTU_SCHEMA_MARKER_VALUE
+    );
+    assert_eq!(pinned_pmtu_policy(&pin_dir), strict.map_value());
+    assert_eq!(
+        backend.effective_uplink_mtu_policy(&device).await?,
+        Some(strict),
+        "read-back must return the effective configured policy"
+    );
+    backend
+        .install_pdp_context(session_context(device.ifindex))
+        .await?;
+
+    let pgw_socket = in_netns(&net.pgw_ns, || {
+        UdpSocket::bind((PGW_IP, GTPU_PORT)).expect("bind PGW GTP-U socket")
+    });
+    let ue_socket = in_netns(&net.ue_ns, || {
+        UdpSocket::bind((UE_PAA, 5000)).expect("bind UE socket")
+    });
+    let capture = packet_capture_socket(&net.pgw_ns);
+
+    // Over-MTU under the strict policy: 20+8+1352 = 1380 inner, +36 encap =
+    // 1416 > 1400. The tc program must drop fail closed: nothing reaches the
+    // PGW, nothing leaks unencapsulated, and the bounded drop counter moves.
+    let over_mtu = vec![b'x'; 1352];
+    for _ in 0..3 {
+        let _ = ue_socket.send_to(&over_mtu, (REMOTE_HOST, 53));
+    }
+    expect_no_datagram(&pgw_socket);
+    assert_eq!(pinned_pmtu_drop_counter(&pin_dir), 3);
+    assert_eq!(
+        pinned_counter(&pin_dir, COUNTER_UL_ENCAP),
+        0,
+        "a rejected packet is never accounted as encapsulated"
+    );
+
+    // Fitting under the strict policy: 20+8+1300 = 1328 inner, +36 = 1364 <=
+    // 1400. The packet is emitted with DF stamped on the outer header.
+    let fitting = vec![b'y'; 1300];
+    let mut buffer = [0_u8; 2048];
+    let (len, from) = send_until_received(
+        || {
+            let _ = ue_socket.send_to(&fitting, (REMOTE_HOST, 53));
+        },
+        &pgw_socket,
+        &mut buffer,
+    )
+    .expect("fitting uplink G-PDU must reach the PGW");
+    assert_eq!(from, SocketAddr::from((EPDG_S2BU_IP, GTPU_PORT)));
+    assert!(buffer[..len].ends_with(&fitting));
+    let outer_flags = capture_gtpu_outer_flags(&capture);
+    assert_eq!(
+        outer_flags & 0x40,
+        0x40,
+        "the strict policy must stamp DF on emitted outer headers"
+    );
+
+    // Switch the persisted policy to outer-fragment permission. The same
+    // over-MTU inner packet must now be emitted (the tc program leaves DF
+    // clear so an MTU-enforcing egress may fragment the outer packet; this
+    // veth delivers the frame whole) and must not touch the drop counter.
+    let fragment = GtpuUplinkMtuPolicy::new(1400, GtpuOuterFragmentPolicy::FragmentOuter)
+        .expect("canonical fragment policy");
+    replace_pinned_pmtu_policy(&pin_dir, fragment.map_value());
+    assert_eq!(
+        backend.effective_uplink_mtu_policy(&device).await?,
+        Some(fragment),
+        "read-back must reflect the persisted policy"
+    );
+    let drops_before = pinned_pmtu_drop_counter(&pin_dir);
+    let (len, from) = send_until_received(
+        || {
+            let _ = ue_socket.send_to(&over_mtu, (REMOTE_HOST, 53));
+        },
+        &pgw_socket,
+        &mut buffer,
+    )
+    .expect("fragment-permitted over-MTU G-PDU must reach the PGW");
+    assert_eq!(from, SocketAddr::from((EPDG_S2BU_IP, GTPU_PORT)));
+    assert!(buffer[..len].ends_with(&over_mtu));
+    assert_eq!(pinned_pmtu_drop_counter(&pin_dir), drops_before);
+    let outer_flags = capture_gtpu_outer_flags(&capture);
+    assert_eq!(
+        outer_flags & 0x40,
+        0,
+        "the fragment-permitted policy must leave DF clear"
+    );
 
     drop(net);
     Ok(())

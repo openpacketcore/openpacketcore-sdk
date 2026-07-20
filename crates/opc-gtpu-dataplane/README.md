@@ -224,9 +224,10 @@ After UDP/2152 identifies a candidate, every malformed declaration or
 unverified checksum increments the existing bounded `downlink_malformed`
 counter and drops before TEID/PDR lookup, decapsulation, or inner-destination
 validation. Addresses, TEIDs, lengths, checksum values, and payload bytes are
-not emitted. Non-UDP traffic, other UDP ports, fragments awaiting host-stack
-policy, and structurally valid non-G-PDU GTP-U control traffic retain their
-pass-through behavior.
+not emitted. Non-UDP traffic, other UDP ports, and structurally valid
+non-G-PDU GTP-U control traffic retain their pass-through behavior. Outer
+IPv4 fragments also pass to the stack unchanged; the complete contract for
+them is defined in [Downlink outer-fragment handling](#downlink-outer-fragment-handling).
 
 The privileged proof covers a legal zero `CHECKSUM_NONE` omission, non-zero
 software-verified bytes, authenticated zero and non-zero
@@ -480,6 +481,75 @@ packet processing drop, so a map loss cannot silently change a bearer to legacy
 behavior. The exclusive-writer boundary documented above remains the integrity
 boundary for exact policy values.
 
+### Uplink MTU and outer-fragmentation policy
+
+`CreateGtpDeviceRequest::uplink_mtu_policy` carries an explicit, device-level
+`GtpuUplinkMtuPolicy`: the effective S2b-U link MTU (bounded so the fixed
+36-byte encapsulation plus the RFC 791 minimum 68-byte inner packet always
+fits) and the outer-fragmentation choice. `inner_mtu()` is the headroom
+accounting: effective link MTU minus the encapsulation overhead. `None`
+preserves the pre-policy behavior exactly — only the IPv4 total-length `u16`
+limit is enforced.
+
+`decide_uplink_encap` in `opc-gtpu-ebpf-common` is the shared typed decision
+used by host callers and, through `apply_uplink_mtu_policy`, by the tc uplink
+program itself:
+
+- `Emit` within the effective MTU, with the remaining headroom; under the
+  default `SignalPacketTooBig` policy the outer DF bit is stamped and the
+  outer checksum refreshed.
+- `EmitOuterFragmented` when the policy permits outer IPv4 fragmentation:
+  the packet is emitted with DF clear and the bounded excess is reported.
+- `RejectTooBig` otherwise: a fail-closed drop carrying typed RFC 1191
+  ICMPv4 / RFC 8200-8201 ICMPv6 Packet-Too-Big guidance advertising the
+  inner-facing MTU. The inner packet is never emitted unencapsulated and the
+  encapsulation never silently exceeds the effective MTU. Generating the
+  ICMP signal itself is the embedding ePDG's control-plane choice; the tc
+  program drops and counts.
+
+The eBPF backend persists the policy in the additive single-slot
+`GTPU_PMTU_CFG` map at device creation and rejects a configured policy when
+the loaded datapath cannot honor it. `effective_uplink_mtu_policy` reads the
+effective policy back; corrupt persisted bytes are indeterminate, never a
+silent fallback. Over-MTU and corrupt-policy drops are aggregated into the
+identity-bound snapshot as `uplink_mtu_rejected` from the `GTPU_PMTU_DROP`
+per-CPU counter. The mock and Linux `gtp` backends report
+`uplink_pmtu_enforcement` missing and reject a configured policy fail
+closed; the netlink driver leaves outer MTU/fragmentation to the kernel
+routing layer.
+
+### Downlink outer-fragment handling
+
+`GtpuProbe::downlink_outer_fragment_handling` states each backend's contract
+explicitly; there is no implicit behavior. The eBPF backend advertises
+`KernelReassemblyHandoff`: the tc ingress program passes outer IPv4
+fragments to the kernel stack unchanged, the kernel reassembles under its
+bounded `net.ipv4.ipfrag_*` accounting, and exactly one complete UDP/2152
+datagram re-enters the SDK consumer bound on the local S2b-U endpoint —
+`GtpuReassemblyConsumer` in this crate. That consumer applies the same PDR
+lookup, canonical endpoint-binding validation, inner-family, and
+inner-destination checks as the tc fast path (backed by the exact pinned
+map state in production) and returns the decapsulated inner packet with its
+output bearer mark at most once per reassembled datagram. Malformed,
+unknown-TEID, binding-mismatch, destination-mismatch, and oversized inputs
+fail closed into bounded typed counters; non-G-PDU GTP-U is handed to the
+control plane. The SDK never holds a userspace fragment cache, so
+reordered, duplicated, overlapping, incomplete, and timed-out fragment sets
+are bounded by the kernel's configured limits and can never produce a
+duplicate delivery. The Linux `gtp` backend reports the same handoff —
+the kernel gtp driver is itself the post-reassembly UDP consumer — with
+the live ipfrag sysctl bounds; the mock and unsupported backends report
+`Unsupported`.
+
+The privileged suite proves the contract end-to-end: a valid two-fragment
+G-PDU, a reordered set, and a set with a duplicated first fragment each
+re-enter the consumer exactly once and decapsulate to the exact original
+inner packet; a conflicting overlapping set never duplicates; an incomplete
+set never re-enters. The uplink suite proves the strict policy drops an
+over-MTU encapsulation with only the drop counter moving, stamps DF on
+fitting packets, and emits the same packet untouched under the
+fragment-permitted policy.
+
 ### Pinned-map and live-program migration
 
 The endpoint-bound v3 schema keeps the legacy default FAR, DSCP, and PDR
@@ -492,9 +562,10 @@ with endpoint-unbound v2 pins. With an explicit `Any` source-port policy,
 byte-for-byte compatible; downlink authorization is deliberately stricter.
 
 The durable schema marker at the reserved impossible-PAA key in the legacy
-FAR map is the schema commit. The current `OPC-SPORT-v4` value additionally
-proves the additive source-port maps; the endpoint-bound `OPC-PEER-v3` value
-remains the commit for the provenance schema below it. A marker is written
+FAR map is the schema commit. The current `OPC-PMTU-v5` value additionally
+proves the additive uplink MTU policy maps; the `OPC-SPORT-v4` value remains
+the commit for the source-port schema below it, and the endpoint-bound
+`OPC-PEER-v3` value for the provenance schema below that. A marker is written
 only after every named map identity is verified, the complete map graph is
 canonical, and both current tc programs have been attached and read back by
 exact program ID. A committed marker with a missing required pin, an unknown
@@ -505,7 +576,9 @@ complete `Active` legacy-2152 commit record for every context before attaching
 the v4 program and committing the marker. Any transitional migration record is
 recovered to absence before migration resumes. A partial migration may contain
 only records derived exactly from the validated v3 graph; any selected, zero,
-malformed, orphaned, or mixed record fails closed.
+malformed, orphaned, or mixed record fails closed. The v4-to-v5 step is purely
+additive: an all-zero MTU policy slot selects the legacy total-length-only
+behavior, so populated v4 state upgrades in place.
 
 There is no implicit endpoint migration for populated older state. A committed
 v2 pin set is rejected with the redaction-safe `ebpf_endpoint_schema` error and

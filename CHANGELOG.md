@@ -103,6 +103,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   expected accepted non-canonical PDU Session Container bytes or extension
   placement to survive `to_bytes` must use the generic raw-preserving boundary
   for byte-exact forwarding.
+- **Bounded outer-fragment and uplink PMTU handling — `opc-gtpu-dataplane`
+  (#345):** the eBPF GTP-U dataplane now has a complete contract for
+  fragmented outer packets and uplink MTU growth.
+  `CreateGtpDeviceRequest::uplink_mtu_policy` carries an explicit
+  `GtpuUplinkMtuPolicy` (effective link MTU plus the outer-fragmentation
+  choice) whose `inner_mtu()` accounts the fixed 36-byte encapsulation
+  headroom. `decide_uplink_encap` in `opc-gtpu-ebpf-common` returns a typed
+  outcome — `Emit` with headroom (DF stamped and checksum refreshed under
+  the strict policy), `EmitOuterFragmented` with the bounded excess, or
+  fail-closed `RejectTooBig` carrying RFC 1191 ICMPv4 / RFC 8200-8201 ICMPv6
+  Packet-Too-Big guidance that advertises the inner-facing MTU. The tc
+  uplink program enforces the same decision from the additive single-slot
+  `GTPU_PMTU_CFG` map (committed under the new `OPC-PMTU-v5` schema marker;
+  the all-zero slot is the legacy behavior, so v3/v4 pin sets upgrade in
+  place and a committed v5 set that loses an MTU map fails closed):
+  over-MTU without fragment permission and corrupt policy bytes drop into
+  the new `GTPU_PMTU_DROP` counter, aggregated as `uplink_mtu_rejected` in
+  the identity-bound snapshot. The inner packet is never leaked
+  unencapsulated and the encapsulation never silently exceeds the effective
+  MTU. `effective_uplink_mtu_policy` reads the effective policy back.
+  Downlink outer fragments follow the reported
+  `GtpuDownlinkFragmentContract::KernelReassemblyHandoff`: tc passes them
+  to the stack, the kernel reassembles under bounded `ipfrag` limits, and
+  the new `GtpuReassemblyConsumer` re-applies the same PDR/binding/decap
+  path to the reassembled datagram exactly once, with bounded typed
+  counters and no userspace fragment cache. `GtpuProbe` reports
+  `uplink_pmtu_enforcement` and `downlink_outer_fragment_handling` per
+  backend: the Linux `gtp` backend reports its native reassembly handoff
+  with live ipfrag sysctl bounds; mock/unsupported report the contracts
+  missing and reject configured policies fail closed.
 - **Configurable stable uplink GTP-U UDP source ports — `opc-gtpu-dataplane`
   (#346):** `GtpPdpContext::uplink_source_port_policy` selects, per PDP
   context, the UDP source port stamped by the eBPF uplink encapsulator while
