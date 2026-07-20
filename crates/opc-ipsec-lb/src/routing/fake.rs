@@ -14,6 +14,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::sync::Notify;
@@ -21,9 +22,13 @@ use tokio::sync::Notify;
 use crate::error::IpsecLbError;
 use crate::ownership::RoutingDomainTag;
 use crate::routing::{
-    HostPrefix, PeerObservation, PrefixApplyOutcome, PrefixRejectReason, RoutingStackAdapter,
-    RoutingStackKind, RoutingStackProbe,
+    AdvertisementSetApplyResult, HostPrefix, PeerObservation, PrefixApplyOutcome,
+    PrefixRejectReason, RoutingProcessSupervision, RoutingStackAdapter, RoutingStackKind,
+    RoutingStackProbe, MAX_ADVERTISEMENT_ROUTING_DOMAINS,
 };
+
+static CONFORMANCE_PROCESS_SUPERVISION: RoutingProcessSupervision =
+    RoutingProcessSupervision::conformance();
 
 /// Recorded advertisement-set apply against the fake.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,6 +85,45 @@ pub struct ApplyGate {
     release: Arc<Notify>,
 }
 
+/// Gate that pauses one withdrawal after it has acquired the adapter call but
+/// before its side effect lands.
+#[derive(Debug)]
+pub struct WithdrawGate {
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+/// Gate that pauses one observation after its complete snapshot is captured.
+#[derive(Debug)]
+pub struct ObservationGate {
+    captured: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+impl ObservationGate {
+    /// Wait until the fake captured the old observation snapshot.
+    pub async fn wait_captured(&self) {
+        self.captured.notified().await;
+    }
+
+    /// Allow the captured observation to return.
+    pub fn release(&self) {
+        self.release.notify_one();
+    }
+}
+
+impl WithdrawGate {
+    /// Wait until the gated withdrawal entered the adapter.
+    pub async fn wait_entered(&self) {
+        self.entered.notified().await;
+    }
+
+    /// Allow the gated withdrawal to take effect and return.
+    pub fn release(&self) {
+        self.release.notify_one();
+    }
+}
+
 impl ApplyGate {
     /// Wait until the gated apply's mutation has landed.
     pub async fn wait_landed(&self) {
@@ -94,20 +138,38 @@ impl ApplyGate {
 
 #[derive(Debug, Default)]
 struct FakeState {
+    managed_domains: BTreeSet<RoutingDomainTag>,
     originated: BTreeMap<RoutingDomainTag, BTreeSet<HostPrefix>>,
     apply_calls: Vec<RecordedAdvertisementApply>,
     withdraw_all_calls: Vec<RoutingDomainTag>,
+    withdraw_batch_calls: Vec<BTreeSet<RoutingDomainTag>>,
     mutation_log: Vec<RecordedStackMutation>,
     rejected_prefixes: BTreeSet<HostPrefix>,
     unreachable: bool,
     observations: Vec<PeerObservation>,
     apply_failure: Option<FakeApplyFailure>,
     apply_gate: Option<ApplyGateShared>,
+    withdraw_gate: Option<WithdrawGateShared>,
+    observation_gate: Option<ObservationGateShared>,
+    next_result_override: Option<AdvertisementSetApplyResult>,
 }
 
 #[derive(Debug, Clone)]
 struct ApplyGateShared {
     landed: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+#[derive(Debug, Clone)]
+struct WithdrawGateShared {
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+    after_effect: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ObservationGateShared {
+    captured: Arc<Notify>,
     release: Arc<Notify>,
 }
 
@@ -118,10 +180,21 @@ pub struct ConformanceFakeRoutingStack {
 }
 
 impl ConformanceFakeRoutingStack {
-    /// Build an empty, reachable fake with no scripted rejections or peers.
+    /// Build a reachable fake for the two RFC 6996 conformance domains
+    /// (`64512` and `64513`), with no scripted rejections or peers.
+    ///
+    /// Use [`Self::with_domains`] when a test needs a different exact set.
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self::with_domains([RoutingDomainTag::new(64_512), RoutingDomainTag::new(64_513)])
+    }
+
+    /// Build a fake configured for an exact bounded routing-domain set.
+    #[must_use]
+    pub fn with_domains(domains: impl IntoIterator<Item = RoutingDomainTag>) -> Self {
+        let fake = Self::default();
+        fake.lock().managed_domains.extend(domains);
+        fake
     }
 
     /// Script one prefix to be rejected with
@@ -162,9 +235,71 @@ impl ConformanceFakeRoutingStack {
         }
     }
 
+    /// Pause the next observation after capturing the then-current snapshot.
+    #[must_use]
+    pub fn gate_next_observation(&self) -> ObservationGate {
+        let gate = ObservationGateShared {
+            captured: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+        };
+        self.lock().observation_gate = Some(gate.clone());
+        ObservationGate {
+            captured: gate.captured,
+            release: gate.release,
+        }
+    }
+
+    /// Pause the next withdrawal before its side effect lands.
+    #[must_use]
+    pub fn gate_next_withdraw(&self) -> WithdrawGate {
+        let gate = WithdrawGateShared {
+            entered: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+            after_effect: false,
+        };
+        self.lock().withdraw_gate = Some(gate.clone());
+        WithdrawGate {
+            entered: gate.entered,
+            release: gate.release,
+        }
+    }
+
+    /// Pause the next withdrawal after its side effect landed but before the
+    /// adapter returns its acknowledgement.
+    #[must_use]
+    pub fn gate_next_withdraw_after_effect(&self) -> WithdrawGate {
+        let gate = WithdrawGateShared {
+            entered: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+            after_effect: true,
+        };
+        self.lock().withdraw_gate = Some(gate.clone());
+        WithdrawGate {
+            entered: gate.entered,
+            release: gate.release,
+        }
+    }
+
+    /// Override the next successful adapter response without changing the
+    /// already-applied fake stack state.
+    ///
+    /// This deliberately hostile hook lets service conformance tests prove
+    /// that missing or extra outcome identities fail closed.
+    pub fn override_next_result(&self, result: AdvertisementSetApplyResult) {
+        self.lock().next_result_override = Some(result);
+    }
+
     /// Replace the scripted peer observations returned by the next polls.
     pub fn set_observations(&self, observations: Vec<PeerObservation>) {
         self.lock().observations = observations;
+    }
+
+    /// Seed adapter-side state as if it survived a previous service process.
+    ///
+    /// This is intentionally not recorded as a current-process mutation; it
+    /// exists solely to prove startup known-absence reconciliation.
+    pub fn seed_originated(&self, domain: RoutingDomainTag, prefixes: BTreeSet<HostPrefix>) {
+        self.lock().originated.insert(domain, prefixes);
     }
 
     /// Return the exact set the fake currently originates for one domain.
@@ -187,6 +322,12 @@ impl ConformanceFakeRoutingStack {
     #[must_use]
     pub fn withdraw_all_calls(&self) -> Vec<RoutingDomainTag> {
         self.lock().withdraw_all_calls.clone()
+    }
+
+    /// Return the exact domain set supplied to every batched withdrawal.
+    #[must_use]
+    pub fn withdraw_batch_calls(&self) -> Vec<BTreeSet<RoutingDomainTag>> {
+        self.lock().withdraw_batch_calls.clone()
     }
 
     /// Return every effective adapter-side mutation in order.
@@ -212,23 +353,79 @@ fn io_error(
 
 #[async_trait]
 impl RoutingStackAdapter for ConformanceFakeRoutingStack {
+    fn process_supervision(&self) -> &RoutingProcessSupervision {
+        &CONFORMANCE_PROCESS_SUPERVISION
+    }
+
+    fn managed_domains(&self) -> BTreeSet<RoutingDomainTag> {
+        self.lock().managed_domains.clone()
+    }
+
+    fn maximum_mutation_duration(&self) -> Duration {
+        Duration::from_secs(5)
+    }
+
+    async fn establish_known_absence(&self) -> Result<(), IpsecLbError> {
+        let mut state = self.lock();
+        let domains: BTreeSet<RoutingDomainTag> = state
+            .managed_domains
+            .iter()
+            .copied()
+            .chain(state.originated.keys().copied())
+            .collect();
+        if domains.len() > MAX_ADVERTISEMENT_ROUTING_DOMAINS {
+            return Err(IpsecLbError::invalid_config(
+                "durable_routing_domains",
+                "discovered routing-domain count exceeds the production bound",
+            ));
+        }
+        state.withdraw_all_calls.extend(domains.iter().copied());
+        if state.unreachable {
+            return Err(io_error(
+                "fake_routing_stack_establish_known_absence",
+                std::io::ErrorKind::NotConnected,
+                "scripted unreachable",
+            ));
+        }
+        for domain in domains {
+            if state
+                .originated
+                .remove(&domain)
+                .is_some_and(|prefixes| !prefixes.is_empty())
+            {
+                state
+                    .mutation_log
+                    .push(RecordedStackMutation::WithdrawAll { domain });
+            }
+        }
+        Ok(())
+    }
+
     async fn apply_advertisement_set(
         &self,
         domain: RoutingDomainTag,
         desired: &BTreeSet<HostPrefix>,
-    ) -> Result<BTreeMap<HostPrefix, PrefixApplyOutcome>, IpsecLbError> {
+    ) -> Result<AdvertisementSetApplyResult, IpsecLbError> {
         enum Scripted {
             None,
             Fail(IpsecLbError),
         }
 
-        let (scripted, gate) = {
+        let (scripted, gate, override_result, outcomes) = {
             let mut state = self.lock();
+            if !state.managed_domains.contains(&domain) {
+                return Err(IpsecLbError::invalid_config(
+                    "routing_domain",
+                    "routing domain is not managed by this adapter",
+                ));
+            }
             if state.unreachable {
-                return Ok(desired
-                    .iter()
-                    .map(|prefix| (*prefix, PrefixApplyOutcome::Unreachable))
-                    .collect());
+                return Ok(AdvertisementSetApplyResult::ambiguous(
+                    desired
+                        .iter()
+                        .map(|prefix| (*prefix, PrefixApplyOutcome::Unreachable))
+                        .collect(),
+                ));
             }
             let gate = state.apply_gate.take();
             let failure = state.apply_failure.take();
@@ -293,7 +490,7 @@ impl RoutingStackAdapter for ConformanceFakeRoutingStack {
                     ))
                 }
             };
-            (scripted, gate)
+            (scripted, gate, state.next_result_override.take(), outcomes)
         };
 
         if let Some(gate) = gate {
@@ -302,54 +499,90 @@ impl RoutingStackAdapter for ConformanceFakeRoutingStack {
         }
         match scripted {
             Scripted::None => {
-                let outcomes = desired
-                    .iter()
-                    .map(|prefix| {
-                        if self.lock().rejected_prefixes.contains(prefix) {
-                            (
-                                *prefix,
-                                PrefixApplyOutcome::Rejected(PrefixRejectReason::PolicyDenied),
-                            )
-                        } else {
-                            (*prefix, PrefixApplyOutcome::Accepted)
-                        }
-                    })
-                    .collect();
-                Ok(outcomes)
+                if let Some(result) = override_result {
+                    return Ok(result);
+                }
+                Ok(AdvertisementSetApplyResult::applied(outcomes))
             }
             Scripted::Fail(error) => Err(error),
         }
     }
 
     async fn withdraw_all(&self, domain: RoutingDomainTag) -> Result<(), IpsecLbError> {
-        let mut state = self.lock();
-        // Record the attempt even when it fails so tests can prove the
-        // watchdog is not head-of-line blocked.
-        state.withdraw_all_calls.push(domain);
-        if state.unreachable {
-            return Err(io_error(
-                "fake_routing_stack_withdraw_all",
-                std::io::ErrorKind::NotConnected,
-                "scripted unreachable",
-            ));
+        self.withdraw_domains(&BTreeSet::from([domain])).await
+    }
+
+    async fn withdraw_domains(
+        &self,
+        domains: &BTreeSet<RoutingDomainTag>,
+    ) -> Result<(), IpsecLbError> {
+        let gate = {
+            let mut state = self.lock();
+            if domains.is_empty()
+                || domains
+                    .iter()
+                    .any(|domain| !state.managed_domains.contains(domain))
+            {
+                return Err(IpsecLbError::invalid_config(
+                    "routing_domain",
+                    "withdrawal set is empty or contains an unmanaged domain",
+                ));
+            }
+            // Record the attempt even when it fails so tests can prove the
+            // watchdog is not head-of-line blocked.
+            state.withdraw_all_calls.extend(domains.iter().copied());
+            state.withdraw_batch_calls.push(domains.clone());
+            if state.unreachable {
+                return Err(io_error(
+                    "fake_routing_stack_withdraw_all",
+                    std::io::ErrorKind::NotConnected,
+                    "scripted unreachable",
+                ));
+            }
+            state.withdraw_gate.take()
+        };
+        if let Some(gate) = gate.as_ref().filter(|gate| !gate.after_effect) {
+            gate.entered.notify_one();
+            gate.release.notified().await;
         }
-        state.originated.remove(&domain);
-        state
-            .mutation_log
-            .push(RecordedStackMutation::WithdrawAll { domain });
+        {
+            let mut state = self.lock();
+            for domain in domains {
+                if state
+                    .originated
+                    .remove(domain)
+                    .is_some_and(|prefixes| !prefixes.is_empty())
+                {
+                    state
+                        .mutation_log
+                        .push(RecordedStackMutation::WithdrawAll { domain: *domain });
+                }
+            }
+        }
+        if let Some(gate) = gate.filter(|gate| gate.after_effect) {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
         Ok(())
     }
 
     async fn poll_observations(&self) -> Result<Vec<PeerObservation>, IpsecLbError> {
-        let state = self.lock();
-        if state.unreachable {
-            return Err(io_error(
-                "fake_routing_stack_poll",
-                std::io::ErrorKind::NotConnected,
-                "scripted unreachable",
-            ));
+        let (observations, gate) = {
+            let mut state = self.lock();
+            if state.unreachable {
+                return Err(io_error(
+                    "fake_routing_stack_poll",
+                    std::io::ErrorKind::NotConnected,
+                    "scripted unreachable",
+                ));
+            }
+            (state.observations.clone(), state.observation_gate.take())
+        };
+        if let Some(gate) = gate {
+            gate.captured.notify_one();
+            gate.release.notified().await;
         }
-        Ok(state.observations.clone())
+        Ok(observations)
     }
 
     async fn probe(&self) -> Result<RoutingStackProbe, IpsecLbError> {
@@ -359,6 +592,7 @@ impl RoutingStackAdapter for ConformanceFakeRoutingStack {
             stack_reachable: reachable,
             mutation_ready: reachable,
             details: Some("deterministic conformance fake".to_owned()),
+            process_supervision_ready: false,
         })
     }
 }

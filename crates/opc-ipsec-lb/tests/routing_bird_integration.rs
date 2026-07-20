@@ -4,9 +4,12 @@
 //!
 //! ```sh
 //! OPC_IPSEC_LB_BIRD_INTEGRATION=1 \
-//! OPC_IPSEC_LB_BIRD_SOCKET=/run/bird/bird.ctl \
+//! OPC_IPSEC_LB_BIRD_BIN=/usr/sbin/bird \
+//! OPC_IPSEC_LB_BIRD_CONFIG=/etc/bird/bird.conf \
+//! OPC_IPSEC_LB_BIRD_SOCKET=/run/bird/opc-owned.ctl \
 //! OPC_IPSEC_LB_BIRD_FRAGMENT_DIR=/etc/bird/opc.d \
-//! cargo test -p opc-ipsec-lb --test routing_bird_integration
+//! cargo test -p opc-ipsec-lb --test routing_bird_integration \
+//!   -- --ignored --exact bird_adapter_advertises_withdraws_and_relays_session_events
 //! ```
 //!
 //! The reference `bird.conf` for the gated environment is shipped at
@@ -22,50 +25,67 @@
 use std::collections::BTreeSet;
 use std::net::IpAddr;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use opc_ipsec_lb::{
-    AdvertisementLease, BirdAdapterConfig, BirdControlSocketAdapter, BirdDomainBinding, HostPrefix,
-    IpAddress, LeaseGeneration, PeerSessionState, PrefixAdvertiserConfig, PrefixAdvertiserService,
-    PrefixApplyOutcome, ReconcileDisposition, RoutingDomainTag, RoutingEventKind,
-    RoutingStackAdapter,
+    AdvertisementLease, BirdAdapterConfig, BirdControlSocketAdapter, BirdDomainBinding,
+    BirdProcessConfig, HostPrefix, IpAddress, LeaseGeneration, PeerSessionState,
+    PrefixAdvertiserConfig, PrefixAdvertiserService, PrefixApplyOutcome, ReconcileDisposition,
+    RoutingDomainTag, RoutingEventKind, RoutingStackAdapter,
 };
 
 const REFERENCE_CONFIG: &str = include_str!("fixtures/bird_reference.conf");
 
-fn gated_config() -> Option<BirdAdapterConfig> {
+fn gated_config() -> Result<(BirdAdapterConfig, BirdProcessConfig), &'static str> {
     if std::env::var("OPC_IPSEC_LB_BIRD_INTEGRATION")
         .ok()
         .as_deref()
         != Some("1")
     {
-        return None;
+        return Err("OPC_IPSEC_LB_BIRD_INTEGRATION=1 is required");
     }
-    let socket_path = PathBuf::from(std::env::var("OPC_IPSEC_LB_BIRD_SOCKET").ok()?);
-    let fragment_dir = PathBuf::from(std::env::var("OPC_IPSEC_LB_BIRD_FRAGMENT_DIR").ok()?);
-    Some(BirdAdapterConfig {
-        socket_path,
-        fragment_dir,
-        domains: vec![BirdDomainBinding {
-            domain: RoutingDomainTag::new(64512),
-            static_protocol: "opc_adv_64512".to_owned(),
-            peer_protocols: vec!["edge_a".to_owned()],
-        }],
-        command_timeout: Duration::from_secs(10),
-    })
+    let socket_path = PathBuf::from(
+        std::env::var("OPC_IPSEC_LB_BIRD_SOCKET").map_err(|_| "BIRD socket path is required")?,
+    );
+    let fragment_dir = PathBuf::from(
+        std::env::var("OPC_IPSEC_LB_BIRD_FRAGMENT_DIR")
+            .map_err(|_| "BIRD fragment directory is required")?,
+    );
+    let bird_executable_path = PathBuf::from(
+        std::env::var("OPC_IPSEC_LB_BIRD_BIN").map_err(|_| "BIRD binary path is required")?,
+    );
+    let bird_config_path = PathBuf::from(
+        std::env::var("OPC_IPSEC_LB_BIRD_CONFIG").map_err(|_| "BIRD config path is required")?,
+    );
+    Ok((
+        BirdAdapterConfig {
+            socket_path,
+            fragment_dir,
+            domains: vec![BirdDomainBinding {
+                domain: RoutingDomainTag::new(64512),
+                static_protocol: "opc_adv_64512".to_owned(),
+                peer_protocols: vec!["edge_a".to_owned()],
+            }],
+            command_timeout: Duration::from_secs(10),
+        },
+        BirdProcessConfig {
+            supervisor_helper_path: PathBuf::from(env!("CARGO_BIN_EXE_opc-bird-supervisor")),
+            bird_executable_path,
+            bird_config_path,
+            startup_timeout: Duration::from_secs(20),
+            shutdown_timeout: Duration::from_secs(10),
+        },
+    ))
 }
 
 #[tokio::test]
+#[ignore = "requires an explicitly provisioned, private, SDK-owned live BIRD namespace"]
 async fn bird_adapter_advertises_withdraws_and_relays_session_events() {
-    let Some(config) = gated_config() else {
-        eprintln!(
-            "skipping: set OPC_IPSEC_LB_BIRD_INTEGRATION=1 with OPC_IPSEC_LB_BIRD_SOCKET \
-             and OPC_IPSEC_LB_BIRD_FRAGMENT_DIR to run against a live BIRD"
-        );
-        return;
-    };
+    let (config, process) = gated_config().expect("explicit live-BIRD environment is incomplete");
     let domain = RoutingDomainTag::new(64512);
-    let adapter = BirdControlSocketAdapter::new(config).unwrap();
+    let adapter = BirdControlSocketAdapter::spawn_supervised(config, process)
+        .await
+        .unwrap();
 
     let probe = adapter.probe().await.unwrap();
     assert!(probe.stack_reachable, "BIRD control socket unreachable");
@@ -73,7 +93,8 @@ async fn bird_adapter_advertises_withdraws_and_relays_session_events() {
     // Start from a clean slate so the test is re-runnable.
     adapter.withdraw_all(domain).await.unwrap();
 
-    let service = PrefixAdvertiserService::new(adapter, PrefixAdvertiserConfig::default()).unwrap();
+    let service =
+        PrefixAdvertiserService::new(adapter.clone(), PrefixAdvertiserConfig::default()).unwrap();
     let mut events = service.subscribe_events();
 
     let desired: BTreeSet<HostPrefix> = [
@@ -87,7 +108,7 @@ async fn bird_adapter_advertises_withdraws_and_relays_session_events() {
         .reconcile(domain, desired.clone(), Some(lease))
         .await
         .unwrap();
-    assert_eq!(report.disposition, ReconcileDisposition::Advertised);
+    assert_eq!(report.disposition, ReconcileDisposition::Applied);
     assert!(report
         .outcomes
         .values()
@@ -98,7 +119,14 @@ async fn bird_adapter_advertises_withdraws_and_relays_session_events() {
     service.observe_once().await.unwrap();
     let mut saw_session_event = false;
     while let Ok(event) = events.try_recv() {
-        if let RoutingEventKind::PeerSessionChanged { peer, state, .. } = &event.kind {
+        if let RoutingEventKind::PeerSessionChanged {
+            domain: event_domain,
+            peer,
+            state,
+            ..
+        } = &event.kind
+        {
+            assert_eq!(*event_domain, domain);
             assert_eq!(peer.name(), "edge_a");
             assert_ne!(*state, PeerSessionState::Established);
             saw_session_event = true;
@@ -109,15 +137,31 @@ async fn bird_adapter_advertises_withdraws_and_relays_session_events() {
     let snapshots = service.prefix_snapshots(domain);
     assert_eq!(snapshots.len(), 2);
 
-    let report = service
-        .reconcile(domain, BTreeSet::new(), None)
-        .await
-        .unwrap();
+    // BIRD can answer 0004 while the preceding reconfiguration is still
+    // completing. The adapter deliberately classifies that result as
+    // ambiguous and restores its durable fragment. Prove the caller-visible
+    // retry boundary converges without ever treating 0004 as success.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let report = loop {
+        match service.reconcile(domain, BTreeSet::new(), None).await {
+            Ok(report) => break report,
+            Err(_) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "BIRD withdrawal did not converge within the test bound"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    };
     assert_eq!(report.disposition, ReconcileDisposition::Withdrawn);
     let snapshots = service.prefix_snapshots(domain);
     assert!(snapshots
         .iter()
         .all(|snapshot| snapshot.advertised_to.is_empty()));
+    service.shutdown().await;
+    drop(service);
+    adapter.shutdown_supervised().await.unwrap();
 }
 
 /// Parse the shipped reference configuration and prove it stays inside

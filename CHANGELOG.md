@@ -134,6 +134,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unsupported backends report `Missing` and reject non-legacy policies.
   Downlink peer source-port validation (`downlink_source_port_policy`) remains
   independently configurable.
+- **Typed external routing-stack prefix intent — `opc-ipsec-lb`:** adds a
+  bounded, declarative exact-host-prefix reconcile boundary grouped by opaque
+  routing domain, with per-prefix typed outcomes, injected-clock lease and
+  monotonic-generation gating, ordered session/prefix/BFD observations,
+  redacted snapshots, and a deterministic conformance fake. The concrete BIRD
+  2 adapter atomically owns one exact-set fragment per domain, verifies applied
+  routes and each established peer's exact local export view through the
+  documented control protocol, validates and durably clears stale fragments
+  before child launch, proves configured protocols absent before admitting
+  traffic, and keeps withdrawal intent absent while boundedly confirming a
+  queued reconfiguration or fail-stopping the owned process. It fails
+  closed on refusal, ambiguity, malformed replies, drift, cancellation, or
+  bounded-resource exhaustion. A non-forgeable local-process admission supervises
+  foreground BIRD through the SDK helper's versioned nonce handshake and Linux
+  parent-death signal, so loss of the service/helper boundary terminates the
+  owned local process instead of leaving it detached; the supervisor retains
+  child ownership until kernel wait status is available. Launch artifacts and
+  socket/fragment namespaces are descriptor-pinned. No configured reap deadline
+  or local export view is represented as remote installation evidence. BGP/BFD policy,
+  peer selection, and application-health admission remain product
+  responsibilities. Gated real-BIRD and
+  deterministic adversarial tests cover advertisement, exact withdrawal,
+  session relay, lease expiry, cancellation, durable drift, and process death.
 - **Validated-provider capability seam — `opc-crypto-provider`:** a new
   standalone crate defining the capability-reporting and key-custody boundary
   requested by #334 (slice 1 of 5). `CryptoCapability` enumerates the

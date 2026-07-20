@@ -18,6 +18,11 @@
 //! VIP advertisement is protocol-neutral: callers can gate any management or
 //! dataplane VIP on their own election, quorum, health, and monotonic fence
 //! evidence without coupling that signal to IPsec SA ownership.
+//! Routed ingress deployments can use [`PrefixAdvertiserService`] to carry
+//! bounded exact-host-prefix intent to an established routing stack. The
+//! production [`BirdControlSocketAdapter`] owns a foreground BIRD process
+//! through a fail-closed Linux lifecycle boundary, while BGP/BFD policy and
+//! application-health admission remain product responsibilities.
 //!
 //! Same-SPI re-pin keeps counter-based ESP/IKE AEAD evidence distinct from IKE
 //! encrypt-then-MAC suites that generate a fresh independent CSPRNG IV for each
@@ -123,14 +128,17 @@ pub use repin::{
     SameSpiOutboundIvResume, SameSpiResume,
 };
 pub use routing::{
-    AdvertisedPrefix, AdvertisementLease, ApplyGate, BirdAdapterConfig, BirdControlSocketAdapter,
-    BirdDomainBinding, ConformanceFakeRoutingStack, FakeApplyFailure, HostPrefix, LeaseGeneration,
+    AdvertisedPrefix, AdvertisementLease, AdvertisementSetApplyResult, AdvertisementSetDisposition,
+    ApplyGate, BirdAdapterConfig, BirdControlSocketAdapter, BirdDomainBinding, BirdProcessConfig,
+    ConformanceFakeRoutingStack, FakeApplyFailure, HostPrefix, LeaseGeneration, ObservationGate,
     PathHealth, PeerIdentity, PeerObservation, PeerSessionChangeReason, PeerSessionState,
     PrefixAdvertisementState, PrefixAdvertiserConfig, PrefixAdvertiserService, PrefixApplyOutcome,
     PrefixReconcileReport, PrefixRejectReason, PrefixStatusSnapshot, PrefixWithdrawReason,
     ReconcileDisposition, RecordedAdvertisementApply, RecordedStackMutation, RoutingEvent,
-    RoutingEventKind, RoutingStackAdapter, RoutingStackKind, RoutingStackProbe,
-    MAX_ADVERTISED_PREFIXES_PER_DOMAIN,
+    RoutingEventKind, RoutingProcessSupervision, RoutingStackAdapter, RoutingStackKind,
+    RoutingStackProbe, WithdrawGate, MAX_ADVERTISED_PREFIXES_PER_DOMAIN,
+    MAX_ADVERTISEMENT_ROUTING_DOMAINS, MAX_ROUTING_MUTATION_DURATION, MAX_ROUTING_PEERS_PER_DOMAIN,
+    MAX_ROUTING_PEERS_TOTAL, MAX_ROUTING_PEER_NAME_LEN,
 };
 pub use selector::{
     measure_disruption, RendezvousSelector, SelectionKey, ShardDisruption, ShardSet,

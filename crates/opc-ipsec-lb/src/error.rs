@@ -65,6 +65,15 @@ pub enum IpsecLbError {
         /// Static payload-free reason.
         reason: &'static str,
     },
+    /// A routing adapter violated its typed result contract.
+    ///
+    /// The code is static and payload-free so callers can alert on a stable
+    /// diagnostic without exposing prefixes, peers, or generated config.
+    #[error("routing adapter contract violation: {code}")]
+    AdapterContractViolation {
+        /// Stable machine-readable violation code.
+        code: &'static str,
+    },
     /// Unsupported backend or platform.
     #[error("IPsec load-balancing operation is unsupported")]
     Unsupported,
@@ -108,6 +117,12 @@ impl IpsecLbError {
     #[must_use]
     pub const fn invalid_config(field: &'static str, reason: &'static str) -> Self {
         Self::InvalidConfig { field, reason }
+    }
+
+    /// Build a redaction-safe routing-adapter contract violation.
+    #[must_use]
+    pub const fn adapter_contract_violation(code: &'static str) -> Self {
+        Self::AdapterContractViolation { code }
     }
 
     /// Build a redaction-safe I/O error.
