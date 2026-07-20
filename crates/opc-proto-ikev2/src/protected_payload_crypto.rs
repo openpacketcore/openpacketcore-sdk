@@ -826,10 +826,10 @@ pub fn seal_ikev2_sa_init_aes_cbc_protected_payload_with_iv_for_test_vector(
 }
 
 #[derive(Clone, Copy)]
-struct SelectedProtectedPayloadKeys<'a> {
-    encryption_key: &'a [u8],
-    salt: &'a [u8],
-    integrity_key: &'a [u8],
+pub(crate) struct SelectedProtectedPayloadKeys<'a> {
+    pub(crate) encryption_key: &'a [u8],
+    pub(crate) salt: &'a [u8],
+    pub(crate) integrity_key: &'a [u8],
 }
 
 fn validate_profile(
@@ -1072,7 +1072,7 @@ fn validate_seal_context(
     Ok(())
 }
 
-fn decrypt_aes_gcm(
+pub(crate) fn decrypt_aes_gcm(
     encryption: Ikev2EncryptionAlgorithm,
     keys: SelectedProtectedPayloadKeys<'_>,
     aad: &[u8],
@@ -1164,7 +1164,7 @@ fn decrypt_aes_gcm(
     }
 }
 
-fn encrypt_aes_gcm(
+pub(crate) fn encrypt_aes_gcm(
     encryption: Ikev2EncryptionAlgorithm,
     keys: SelectedProtectedPayloadKeys<'_>,
     aad: &[u8],
@@ -1320,7 +1320,7 @@ fn decrypt_aes_cbc(
     Ok(plaintext)
 }
 
-fn encrypt_aes_cbc(
+pub(crate) fn encrypt_aes_cbc(
     encryption: Ikev2EncryptionAlgorithm,
     encryption_key: &[u8],
     iv: &[u8],
@@ -1403,7 +1403,7 @@ fn encrypt_aes_cbc(
     }
 }
 
-fn decrypt_aes_cbc_in_place(
+pub(crate) fn decrypt_aes_cbc_in_place(
     encryption: Ikev2EncryptionAlgorithm,
     encryption_key: &[u8],
     iv: &[u8],
@@ -1480,7 +1480,7 @@ fn decrypt_aes_cbc_in_place(
     }
 }
 
-fn compute_integrity_checksum(
+pub(crate) fn compute_integrity_checksum(
     integrity: Ikev2IntegrityAlgorithm,
     integrity_key: &[u8],
     first: &[u8],
@@ -1496,7 +1496,7 @@ fn compute_integrity_checksum(
     Ok(checksum)
 }
 
-fn verify_integrity_checksum(
+pub(crate) fn verify_integrity_checksum(
     integrity: Ikev2IntegrityAlgorithm,
     integrity_key: &[u8],
     authenticated_message: &[u8],

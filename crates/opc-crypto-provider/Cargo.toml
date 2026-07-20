@@ -19,6 +19,7 @@ testkit = []
 [dependencies]
 async-trait = { workspace = true }
 serde = { workspace = true }
+zeroize = { workspace = true }
 
 [dev-dependencies]
 opc-crypto-provider = { path = ".", version = "0.2.0", features = ["testkit"] }

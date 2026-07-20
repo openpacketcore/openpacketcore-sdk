@@ -471,7 +471,7 @@ fn split_rfc7427_auth_data(
 }
 
 #[cfg(feature = "rsa-signing")]
-fn rsa_pkcs1v15_sha256_sign(
+pub(crate) fn rsa_pkcs1v15_sha256_sign(
     private: &RsaPrivateKey,
     signed_octets: &[u8],
 ) -> Result<Vec<u8>, Ikev2IkeAuthVerificationError> {
@@ -481,7 +481,7 @@ fn rsa_pkcs1v15_sha256_sign(
         .map_err(|_| Ikev2IkeAuthVerificationError::SignatureComputationFailed)
 }
 
-fn rsa_pkcs1v15_sha256_verify(
+pub(crate) fn rsa_pkcs1v15_sha256_verify(
     public: &RsaPublicKey,
     signed_octets: &[u8],
     signature: &[u8],

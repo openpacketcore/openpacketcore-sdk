@@ -54,6 +54,7 @@ pub mod protected_payload_crypto;
 pub mod sa_init;
 pub mod sa_init_crypto;
 pub mod sa_init_negotiation;
+pub mod software_crypto;
 #[cfg(any(test, feature = "testkit"))]
 pub mod testkit;
 pub mod validation;
@@ -239,4 +240,5 @@ pub use sa_init_negotiation::{
     negotiate_ike_sa_init, Ikev2SaInitNegotiation, Ikev2SaInitNegotiationError,
     Ikev2SaInitNegotiationPolicy,
 };
+pub use software_crypto::Ikev2SoftwareCryptoOperations;
 pub use validation::Ikev2ValidationProfile;

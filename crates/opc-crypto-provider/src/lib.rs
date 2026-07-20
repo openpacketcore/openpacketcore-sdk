@@ -35,7 +35,14 @@
 //! - [`CryptoModule`] is the provider trait itself: identity, capabilities,
 //!   self-test, readiness. Later slices bind runtime health gates, IKEv2, TLS,
 //!   and `opc-key` custody to an admitted module; this crate deliberately
-//!   exposes no key or algorithm operations.
+//!   exposes no key or algorithm operations on it.
+//! - The [`ops`] module defines the synchronous, object-safe IKE
+//!   **operation traits** ([`IkePrfOperations`], [`IkeIntegrityOperations`],
+//!   [`IkeEncryptionOperations`], [`IkeDiffieHellmanOperations`],
+//!   [`IkeSignatureOperations`]) grouped along the capability taxonomy.
+//!   These are contracts only — this crate still implements no cryptography,
+//!   and secret-bearing state stays behind opaque handles
+//!   ([`IkeDhKeyPair`], [`IkeSigningKey`]) or zeroizing buffers.
 //!
 //! # No certification claim
 //!
@@ -47,6 +54,7 @@
 
 pub mod capability;
 pub mod identity;
+pub mod ops;
 pub mod policy;
 pub mod provider;
 pub mod report;
@@ -58,6 +66,12 @@ pub use capability::{CapabilitySet, CryptoCapability};
 pub use identity::{
     ProviderIdentity, ProviderLabelError, ProviderName, ProviderVersion, ValidationReference,
     ValidationState,
+};
+pub use ops::{
+    CryptoOperationError, CryptoOperationErrorCode, IkeAeadAlgorithm, IkeCbcAlgorithm, IkeDhGroup,
+    IkeDhKeyPair, IkeDiffieHellmanOperations, IkeEncryptionOperations, IkeIntegrityAlgorithm,
+    IkeIntegrityOperations, IkePrfAlgorithm, IkePrfOperations, IkeSignatureAlgorithm,
+    IkeSignatureOperations, IkeSigningKey,
 };
 pub use policy::{PolicyAdmission, PolicyError, ProviderPolicy};
 pub use provider::CryptoModule;

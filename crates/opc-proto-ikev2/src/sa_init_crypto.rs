@@ -1803,7 +1803,7 @@ fn validate_dh_shared_secret_len(
     Ok(())
 }
 
-fn prf(
+pub(crate) fn prf(
     algorithm: Ikev2PrfAlgorithm,
     key: &[u8],
     data: &[u8],
@@ -1821,7 +1821,7 @@ fn prf(
     }
 }
 
-fn prf_plus(
+pub(crate) fn prf_plus(
     algorithm: Ikev2PrfAlgorithm,
     key: &[u8],
     seed: &[u8],

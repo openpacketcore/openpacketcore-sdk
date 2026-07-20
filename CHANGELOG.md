@@ -78,6 +78,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   traffic. Absent hook, startup behavior is unchanged. `StartupPhases` gains a
   public field, so construct it with `..Default::default()` rather than an
   exhaustive struct literal.
+- **IKEv2 operation traits and default software binding —
+  `opc-crypto-provider`, `opc-proto-ikev2`:** the new `ops` module defines the
+  synchronous, object-safe cryptographic operation traits requested by #334
+  (slice 3 of 5), grouped along the existing capability taxonomy:
+  `IkePrfOperations` (`prf`/`prf+`), `IkeIntegrityOperations` (truncated
+  checksum compute plus a constant-time-contract verify),
+  `IkeEncryptionOperations` (RFC 5282 AES-GCM seal/open and raw AES-CBC),
+  `IkeDiffieHellmanOperations` with an opaque `IkeDhKeyPair` handle so
+  backend-native private keys never cross the boundary, and
+  `IkeSignatureOperations` with an opaque `IkeSigningKey` handle for RSA
+  PKCS#1 v1.5 SHA-256 and deterministic ECDSA P-256/P-384. Randomness (AEAD
+  explicit IVs, CBC IVs) is always a caller input, keeping entropy routing out
+  of scope and the traits `dyn`-compatible. Secret-bearing outputs are
+  `zeroize::Zeroizing` buffers, and the shared `CryptoOperationError` carries
+  a stable `crypto_op_*` code, a code-only `Display`, and `Error::source`
+  chaining to the underlying typed error. `opc-proto-ikev2` gains the default
+  software implementation, `Ikev2SoftwareCryptoOperations`, which delegates to
+  the crate's existing private algorithm code (introducing the acyclic
+  dependency edge `opc-proto-ikev2 → opc-crypto-provider`); byte-for-byte
+  parity with the pre-existing code paths is pinned against RFC 4868/4231 PRF
+  and AUTH vectors, the independent OpenSSL IKE-SA KDF and AES-CBC/HMAC
+  complete-message vectors, the GCM specification known answers, DH
+  round-trips across all four groups, and deterministic signature
+  comparisons. This slice is purely additive: no existing call site is
+  rerouted, no public signature changes, and nothing gates on
+  `PolicyAdmission` yet — rerouting is a later slice.
 
 ### Fixed
 - **Exact IKEv2 signature trust-material DER parsing:**
