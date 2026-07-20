@@ -19,7 +19,8 @@ use opc_proto_diameter::error_answer::{
     inspect_diameter_request, DiameterRequestFailure, DiameterRequestInspection,
 };
 use opc_proto_diameter::{
-    apps, AvpCode, AvpHeader, AvpKey, Message, OwnedMessage, DIAMETER_HEADER_LEN,
+    apps, AvpCode, AvpFlags, AvpHeader, AvpKey, Message, OwnedMessage, VendorId,
+    DIAMETER_HEADER_LEN,
 };
 use opc_protocol::{
     BorrowDecode, DecodeContext, DecodeErrorCode, DuplicateIePolicy, Encode, EncodeContext,
@@ -1055,6 +1056,7 @@ fn unknown_critical_and_decode_limits_fail_closed() {
 #[test]
 fn failover_and_inbound_str_retransmission_preserve_rfc6733_t_semantics() {
     let mut outbound = parsed_request_envelope(&str_wire());
+    let original = outbound.clone();
     assert!(!outbound.is_potentially_retransmitted());
     let initial = swm::build_swm_session_termination_request(&outbound, EncodeContext::default())
         .expect("initial outbound STR must build");
@@ -1081,6 +1083,40 @@ fn failover_and_inbound_str_retransmission_preserve_rfc6733_t_semantics() {
     assert_eq!(retry.header.hop_by_hop_identifier, FAILOVER_HOP_BY_HOP);
     assert_eq!(retry.header.end_to_end_identifier, END_TO_END);
     assert_eq!(retry.raw_avps, initial.raw_avps);
+    assert!(original.same_replay_payload(&outbound));
+    assert!(outbound.same_replay_payload(&original));
+    assert_ne!(original, outbound);
+
+    let initial_answer = SwmSessionTerminationAnswer::for_request(
+        &original,
+        SwmSessionTerminationResult::Success,
+        "aaa.private.invalid",
+        "private.invalid",
+    );
+    let failover_answer = SwmSessionTerminationAnswer::for_request(
+        &outbound,
+        SwmSessionTerminationResult::Success,
+        "aaa.private.invalid",
+        "private.invalid",
+    );
+    let initial_sta = swm::build_swm_session_termination_answer(
+        &original,
+        &initial_answer,
+        EncodeContext::default(),
+    )
+    .expect("the initial request-bound STA must build");
+    let failover_sta = swm::build_swm_session_termination_answer(
+        &outbound,
+        &failover_answer,
+        EncodeContext::default(),
+    )
+    .expect("the failover request-bound STA must build");
+    assert_eq!(initial_sta.raw_avps, failover_sta.raw_avps);
+    assert_eq!(initial_sta.header.hop_by_hop_identifier, HOP_BY_HOP);
+    assert_eq!(
+        failover_sta.header.hop_by_hop_identifier,
+        FAILOVER_HOP_BY_HOP
+    );
 
     let answer_wire = sta_wire(SESSION_ID, base::RESULT_CODE_DIAMETER_SUCCESS, HOP_BY_HOP);
     let answer_message = decode(&answer_wire);
@@ -1136,6 +1172,287 @@ fn failover_and_inbound_str_retransmission_preserve_rfc6733_t_semantics() {
             .expect("retransmitted STR receives an ordinary correlated STA");
     assert!(!built.header.flags.is_potentially_retransmitted());
     assert!(built.header.flags.is_proxiable());
+}
+
+#[test]
+fn str_replay_payload_ignores_hop_by_hop_change_alone() {
+    let initial = parsed_inbound_request_envelope(&str_wire());
+    let changed_hop = parsed_inbound_request_envelope(&wire_message(
+        0xc0,
+        FAILOVER_HOP_BY_HOP,
+        END_TO_END,
+        str_avps(),
+    ));
+    assert!(initial.same_replay_payload(&changed_hop));
+    assert_ne!(initial, changed_hop);
+}
+
+#[test]
+fn str_replay_payload_ignores_t_bit_change_alone() {
+    let initial = parsed_inbound_request_envelope(&str_wire());
+    let changed_t =
+        parsed_inbound_request_envelope(&wire_message(0xd0, HOP_BY_HOP, END_TO_END, str_avps()));
+    assert!(initial.same_replay_payload(&changed_t));
+    assert_ne!(initial, changed_t);
+}
+
+#[test]
+fn str_replay_payload_ignores_peer_binding_but_requires_end_to_end_id() {
+    let initial = parsed_inbound_request_envelope(&str_wire());
+    let bound = initial
+        .clone()
+        .with_expected_answer_peer(SwmExpectedAnswerPeer::routed(CONNECTION_A));
+    let rebound = initial
+        .clone()
+        .with_expected_answer_peer(SwmExpectedAnswerPeer::routed(CONNECTION_B));
+    assert!(bound.same_replay_payload(&rebound));
+    assert_ne!(bound, rebound);
+
+    let changed_end_to_end_wire =
+        wire_message(0xc0, HOP_BY_HOP, END_TO_END.wrapping_add(1), str_avps());
+    let changed_end_to_end = parsed_inbound_request_envelope(&changed_end_to_end_wire);
+    assert!(!initial.same_replay_payload(&changed_end_to_end));
+}
+
+#[test]
+fn str_replay_payload_matches_outbound_build_parse_roundtrip() {
+    const EXTENSION_CODE: AvpCode = AvpCode::new(10_415);
+    const EXTENSION_VENDOR: VendorId = VendorId::new(10_416);
+    const OTHER_VENDOR: VendorId = VendorId::new(10_417);
+    const EXTENSION_VALUE: &[u8] = b"synthetic-extension-value";
+
+    let mut request = parsed_inbound_request_envelope(&str_wire())
+        .request()
+        .clone();
+    request.additional_avps = vec![SwmAdditionalAvp::new(
+        AvpHeader::vendor(EXTENSION_CODE, EXTENSION_VENDOR, false),
+        EXTENSION_VALUE.to_vec(),
+        EncodeContext::default(),
+    )
+    .expect("public non-empty extension must frame")];
+    let outbound = SwmSessionTerminationRequestEnvelope::for_outbound(
+        request.clone(),
+        SwmDiameterTransaction::new(HOP_BY_HOP, END_TO_END),
+        SwmExpectedAnswerPeer::routed(CONNECTION_A),
+    );
+    let built = swm::build_swm_session_termination_request(&outbound, EncodeContext::default())
+        .expect("outbound STR with a public optional extension must build");
+    let wire = encode(&built);
+    let restored = parsed_inbound_request_envelope(&wire)
+        .with_expected_answer_peer(SwmExpectedAnswerPeer::routed(CONNECTION_A));
+
+    assert!(outbound.same_replay_payload(&restored));
+    assert_ne!(outbound, restored);
+
+    let candidate = |header, value: &[u8]| {
+        let mut changed = request.clone();
+        changed.additional_avps =
+            vec![
+                SwmAdditionalAvp::new(header, value.to_vec(), EncodeContext::default())
+                    .expect("comparison candidate must frame"),
+            ];
+        SwmSessionTerminationRequestEnvelope::for_outbound(
+            changed,
+            SwmDiameterTransaction::new(HOP_BY_HOP, END_TO_END),
+            SwmExpectedAnswerPeer::routed(CONNECTION_A),
+        )
+    };
+
+    let changed_code = candidate(
+        AvpHeader::vendor(
+            AvpCode::new(EXTENSION_CODE.get() + 1),
+            EXTENSION_VENDOR,
+            false,
+        ),
+        EXTENSION_VALUE,
+    );
+    assert!(!outbound.same_replay_payload(&changed_code));
+
+    let changed_flags = candidate(
+        AvpHeader::vendor(EXTENSION_CODE, EXTENSION_VENDOR, false)
+            .with_flags(AvpFlags::new(true, true, false)),
+        EXTENSION_VALUE,
+    );
+    assert!(!outbound.same_replay_payload(&changed_flags));
+
+    let changed_vendor = candidate(
+        AvpHeader::vendor(EXTENSION_CODE, OTHER_VENDOR, false),
+        EXTENSION_VALUE,
+    );
+    assert!(!outbound.same_replay_payload(&changed_vendor));
+
+    let changed_value = candidate(
+        AvpHeader::vendor(EXTENSION_CODE, EXTENSION_VENDOR, false),
+        b"changed-synthetic-extension-value",
+    );
+    assert!(!outbound.same_replay_payload(&changed_value));
+}
+
+#[test]
+fn str_replay_payload_rejects_changed_core_request_facts() {
+    let initial = parsed_inbound_request_envelope(&str_wire());
+    let replacements = [
+        (
+            0,
+            wire_avp(base::AVP_SESSION_ID.get(), 0x40, b"session;private;changed"),
+        ),
+        (1, wire_avp(swm::AVP_DRMP.get(), 0x00, &6_u32.to_be_bytes())),
+        (
+            2,
+            wire_avp(
+                base::AVP_ORIGIN_HOST.get(),
+                0x40,
+                b"changed-epdg.private.invalid",
+            ),
+        ),
+        (
+            3,
+            wire_avp(
+                base::AVP_ORIGIN_REALM.get(),
+                0x40,
+                b"changed-origin.invalid",
+            ),
+        ),
+        (
+            4,
+            wire_avp(
+                base::AVP_DESTINATION_REALM.get(),
+                0x40,
+                b"changed-destination.invalid",
+            ),
+        ),
+        (
+            5,
+            wire_avp(
+                base::AVP_DESTINATION_HOST.get(),
+                0x40,
+                b"changed-dra.private.invalid",
+            ),
+        ),
+        (
+            7,
+            wire_avp(
+                base::AVP_TERMINATION_CAUSE.get(),
+                0x40,
+                &1_u32.to_be_bytes(),
+            ),
+        ),
+        (
+            8,
+            wire_avp(
+                base::AVP_USER_NAME.get(),
+                0x40,
+                b"changed-subscriber@example.invalid",
+            ),
+        ),
+    ];
+
+    for (index, replacement) in replacements {
+        let mut changed_avps = str_avps();
+        changed_avps[index] = replacement;
+        let changed = parsed_inbound_request_envelope(&wire_message(
+            0xc0,
+            HOP_BY_HOP,
+            END_TO_END,
+            changed_avps,
+        ));
+        assert!(
+            !initial.same_replay_payload(&changed),
+            "changed core AVP at fixture index {index} must not replay-match"
+        );
+    }
+
+    let mut destination_host_removed = str_avps();
+    destination_host_removed.remove(5);
+    let destination_host_removed = parsed_inbound_request_envelope(&wire_message(
+        0xc0,
+        HOP_BY_HOP,
+        END_TO_END,
+        destination_host_removed,
+    ));
+    assert!(!initial.same_replay_payload(&destination_host_removed));
+}
+
+#[test]
+fn str_replay_payload_preserves_ordered_proxy_route_and_extension_state() {
+    let initial = parsed_inbound_request_envelope(&str_wire());
+    let changed =
+        |avps| parsed_inbound_request_envelope(&wire_message(0xc0, HOP_BY_HOP, END_TO_END, avps));
+
+    let mut changed_proxy_host = str_avps();
+    changed_proxy_host[9] =
+        proxy_info(b"changed-proxy.private.invalid", b"private-proxy-state-one");
+    assert!(!initial.same_replay_payload(&changed(changed_proxy_host)));
+
+    let mut changed_proxy_state = str_avps();
+    changed_proxy_state[9] =
+        proxy_info(b"proxy-one.private.invalid", b"changed-private-proxy-state");
+    assert!(!initial.same_replay_payload(&changed(changed_proxy_state)));
+
+    let mut reordered_proxy = str_avps();
+    reordered_proxy.swap(9, 10);
+    assert!(!initial.same_replay_payload(&changed(reordered_proxy)));
+
+    let mut changed_route = str_avps();
+    changed_route[11] = wire_avp(
+        base::AVP_ROUTE_RECORD.get(),
+        0x40,
+        b"changed-route.private.invalid",
+    );
+    assert!(!initial.same_replay_payload(&changed(changed_route)));
+
+    let mut reordered_route = str_avps();
+    reordered_route.swap(11, 12);
+    assert!(!initial.same_replay_payload(&changed(reordered_route)));
+
+    let mut changed_extension = str_avps();
+    changed_extension[13] = wire_avp(UNKNOWN_OPTIONAL_AVP, 0x00, b"changed-private-extension");
+    assert!(!initial.same_replay_payload(&changed(changed_extension)));
+
+    let second_extension = wire_avp(UNKNOWN_OPTIONAL_AVP + 1, 0x00, b"second-extension");
+    let mut extensions_in_order = str_avps();
+    extensions_in_order.push(second_extension.clone());
+    let ordered = changed(extensions_in_order.clone());
+    extensions_in_order.swap(13, 14);
+    let reordered = changed(extensions_in_order);
+    assert!(!ordered.same_replay_payload(&reordered));
+
+    let mut implicit_overload_default = str_avps();
+    implicit_overload_default.push(wire_avp(swm::AVP_OC_SUPPORTED_FEATURES.get(), 0x00, &[]));
+    let implicit_overload_default = changed(implicit_overload_default);
+    let mut explicit_overload_default = str_avps();
+    explicit_overload_default.push(wire_avp(
+        swm::AVP_OC_SUPPORTED_FEATURES.get(),
+        0x00,
+        &oc_supported_value(Some(1), 0x00),
+    ));
+    let explicit_overload_default = changed(explicit_overload_default);
+    assert!(!implicit_overload_default.same_replay_payload(&explicit_overload_default));
+}
+
+#[test]
+fn str_replay_payload_result_and_diagnostics_are_redaction_safe() {
+    let initial = parsed_inbound_request_envelope(&str_wire());
+    let mut changed_avps = str_avps();
+    changed_avps[13] = wire_avp(UNKNOWN_OPTIONAL_AVP, 0x00, b"changed-private-extension");
+    let changed =
+        parsed_inbound_request_envelope(&wire_message(0xc0, HOP_BY_HOP, END_TO_END, changed_avps));
+    let same = initial.same_replay_payload(&changed);
+    let diagnostics = format!("initial={initial:?};changed={changed:?};same={same:?}");
+
+    assert!(!same);
+    for sensitive in [
+        SESSION_ID,
+        USER_NAME,
+        "epdg.private.invalid",
+        "proxy-one.private.invalid",
+        "private-proxy-state-one",
+        "route-one.private.invalid",
+        "private-extension-value",
+        "changed-private-extension",
+    ] {
+        assert!(!diagnostics.contains(sensitive), "leaked {sensitive}");
+    }
 }
 
 #[test]

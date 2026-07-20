@@ -390,6 +390,15 @@ Identifier and performs a one-way transition that sets T while preserving the
 End-to-End Identifier and AVP bytes. An answer arriving on the old connection,
 or using the old Hop-by-Hop Identifier on the replacement connection, then
 fails correlation. Ordinary timer retries do not set T.
+`same_replay_payload` adds a stricter typed-payload guard on top of RFC 6733
+duplicate identity. It gives a server-side duplicate cache a redaction-safe
+boolean comparison over the End-to-End Identifier, P bit, every typed request
+fact, ordered Route-Record and extension AVPs, and the exact ordered Proxy-Info
+chain. It ignores the Hop-by-Hop Identifier, T bit, and authenticated
+expected-answer peer binding that may legitimately change across failover. For
+retained AVPs it ignores only the derived header length, which encoding
+recomputes from the value; code, flags, Vendor-Id, and value must match. The
+operation does not expose a digest, raw AVP bytes, or retained values.
 `build_swm_session_termination_answer` can answer only that
 envelope and copies all correlation material and Proxy-Info in wire order.
 `correlate_answer` consumes independently parsed request/answer envelopes and

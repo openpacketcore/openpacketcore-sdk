@@ -642,6 +642,21 @@ impl SwmAdditionalAvp {
     pub fn value_len(&self) -> usize {
         self.value.len()
     }
+
+    fn has_same_replay_value(&self, other: &Self) -> bool {
+        self.header.code == other.header.code
+            && self.header.flags == other.header.flags
+            && self.header.vendor_id == other.header.vendor_id
+            && self.value == other.value
+    }
+}
+
+fn additional_avp_sequences_match(left: &[SwmAdditionalAvp], right: &[SwmAdditionalAvp]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| left.has_same_replay_value(right))
 }
 
 impl fmt::Debug for SwmAdditionalAvp {
@@ -859,6 +874,21 @@ pub struct SwmSessionTerminationRequest {
     pub additional_avps: Vec<SwmAdditionalAvp>,
 }
 
+impl SwmSessionTerminationRequest {
+    fn has_same_replay_fields(&self, other: &Self) -> bool {
+        self.session_id == other.session_id
+            && self.origin_host == other.origin_host
+            && self.origin_realm == other.origin_realm
+            && self.destination_realm == other.destination_realm
+            && self.destination_host == other.destination_host
+            && self.termination_cause == other.termination_cause
+            && self.user_name == other.user_name
+            && self.drmp == other.drmp
+            && self.route_records == other.route_records
+            && additional_avp_sequences_match(&self.additional_avps, &other.additional_avps)
+    }
+}
+
 impl fmt::Debug for SwmSessionTerminationRequest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -1036,6 +1066,28 @@ impl SwmSessionTerminationRequestEnvelope {
     #[must_use]
     pub fn proxy_info_count(&self) -> usize {
         self.proxy_infos.len()
+    }
+
+    /// Return whether `other` carries the same immutable STR replay payload.
+    ///
+    /// RFC 6733 sections 3 and 5.5.4 define duplicate identity and the
+    /// hop-local fields that may change during failover. This SDK operation
+    /// adds a stricter typed-payload guard for duplicate caches. It includes
+    /// the End-to-End Identifier, P bit, every typed request fact, ordered
+    /// Route-Record and extension AVPs, and the exact ordered Proxy-Info chain.
+    /// It deliberately ignores the Hop-by-Hop Identifier, T bit, and
+    /// expected-answer peer binding. Derived AVP length fields are also ignored
+    /// because encoding computes them from the retained value.
+    ///
+    /// The result is only a boolean and exposes no retained AVP value. Active
+    /// session ownership, duplicate-cache lifetime, and replay disposition
+    /// remain consumer policy.
+    #[must_use]
+    pub fn same_replay_payload(&self, other: &Self) -> bool {
+        self.transaction.end_to_end_identifier() == other.transaction.end_to_end_identifier()
+            && self.proxiable == other.proxiable
+            && self.request.has_same_replay_fields(&other.request)
+            && additional_avp_sequences_match(&self.proxy_infos, &other.proxy_infos)
     }
 
     /// Consume and correlate a parsed STA with this exact STR.
@@ -4907,4 +4959,36 @@ fn decode_error(reason: &'static str, offset: usize, section: &'static str) -> D
 fn encode_error(reason: &'static str, section: &'static str) -> EncodeError {
     EncodeError::new(EncodeErrorCode::Structural { reason })
         .with_spec_ref(SpecRef::new("3gpp", "TS29273", section))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replay_payload_requires_the_same_proxiable_bit() {
+        let initial = SwmSessionTerminationRequestEnvelope {
+            transaction: super::super::SwmDiameterTransaction::new(1, 2),
+            proxiable: true,
+            potentially_retransmitted: false,
+            expected_answer_peer: None,
+            request: SwmSessionTerminationRequest {
+                session_id: Sensitive::from("synthetic-session"),
+                origin_host: Redacted::from("epdg.example.invalid"),
+                origin_realm: Redacted::from("example.invalid"),
+                destination_realm: Redacted::from("aaa.invalid"),
+                destination_host: None,
+                termination_cause: SwmTerminationCause::Administrative,
+                user_name: Sensitive::from("synthetic-user@example.invalid"),
+                drmp: None,
+                route_records: Vec::new(),
+                additional_avps: Vec::new(),
+            },
+            proxy_infos: Vec::new(),
+        };
+        let mut changed = initial.clone();
+        changed.proxiable = false;
+
+        assert!(!initial.same_replay_payload(&changed));
+    }
 }
