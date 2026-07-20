@@ -360,6 +360,16 @@ bytes. An ordinary timer retry does not call this transition. Retry timing,
 identifier allocation, connection selection, and pending-request ownership
 remain transport/product responsibilities.
 
+A server-side duplicate cache can compare two retained STR envelopes with
+`initial.same_replay_payload(&candidate)`. On top of RFC 6733 duplicate
+identity, the redaction-safe SDK guard requires the same End-to-End Identifier,
+P bit, typed request facts, ordered Route-Record and extension AVPs, and exact
+ordered Proxy-Info chain. It ignores the Hop-by-Hop Identifier, T bit, and
+authenticated expected-answer peer binding that may change across failover.
+It also ignores only the derived length within each retained AVP header, since
+the encoder recomputes that field from the value. The operation neither exposes
+raw AVP values nor decides duplicate-cache lifetime or active-session ownership.
+
 `SwmExpectedAnswerPeer::routed(connection)` accepts the final logical Origin
 behind a DRA/proxy/relay while still requiring the exact authenticated
 connection generation. `direct(connection, host, realm)` additionally binds
