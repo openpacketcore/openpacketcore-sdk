@@ -267,7 +267,7 @@ fn bird_observation_error(error: BirdCommandError) -> IpsecLbError {
 }
 
 /// Adapter toward a BIRD routing daemon over its control socket.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct BirdControlSocketAdapter {
     config: BirdAdapterConfig,
     lifecycle: Arc<RoutingLifecycleAdmission>,
@@ -279,6 +279,16 @@ pub struct BirdControlSocketAdapter {
     /// observer timeout, through late file I/O and mandatory rollback.
     mutation_lock: Arc<tokio::sync::Mutex<()>>,
     fragment_namespace: Arc<FragmentNamespace>,
+}
+
+impl fmt::Debug for BirdControlSocketAdapter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BirdControlSocketAdapter")
+            .field("domains", &self.config.domains.len())
+            .field("process_supervision_ready", &self.lifecycle.is_live())
+            .field("bfd_health_cache", &"<redacted>")
+            .finish_non_exhaustive()
+    }
 }
 
 impl BirdControlSocketAdapter {
@@ -1692,7 +1702,7 @@ fn parse_show_protocols_all(output: &[String]) -> Vec<ParsedProtocol> {
             let detail = line.trim();
             if let Some(protocol) = protocols.last_mut() {
                 if let Some(address) = detail.strip_prefix("Neighbor address:") {
-                    protocol.neighbor_address = parse_ip_address(address.trim());
+                    protocol.neighbor_address = parse_bird_neighbor(address.trim());
                 }
             }
             continue;
@@ -1729,7 +1739,7 @@ fn parse_show_bfd_sessions(output: &[String]) -> BTreeMap<IpAddress, PathHealth>
     let mut health: BTreeMap<IpAddress, PathHealth> = BTreeMap::new();
     for line in output {
         let mut tokens = line.split_whitespace();
-        let Some(address) = tokens.next().and_then(parse_bfd_neighbor) else {
+        let Some(address) = tokens.next().and_then(parse_bird_neighbor) else {
             continue;
         };
         let Some(_interface) = tokens.next() else {
@@ -1757,9 +1767,9 @@ fn merge_path_health(a: PathHealth, b: PathHealth) -> PathHealth {
     }
 }
 
-/// Parse a BFD neighbor address, dropping any `%zone` suffix BIRD prints
-/// for link-local neighbors.
-fn parse_bfd_neighbor(text: &str) -> Option<IpAddress> {
+/// Parse a BIRD neighbor address, dropping any `%zone` suffix BIRD prints
+/// for link-local BGP and BFD neighbors so both views correlate.
+fn parse_bird_neighbor(text: &str) -> Option<IpAddress> {
     parse_ip_address(text.split('%').next()?)
 }
 
@@ -2415,7 +2425,7 @@ mod tests {
                     " edge_a     BGP        ---        up     10:00:00      Established\n",
                     "   Description:    upstream edge a\n",
                     "   BGP state:          Established\n",
-                    "     Neighbor address: 203.0.113.1\n",
+                    "     Neighbor address: fe80::1%eth0\n",
                     "     Neighbor AS:      64512\n",
                     " edge_b     BGP        ---        up     10:00:01      Active\n",
                     "     Neighbor address: 203.0.113.2\n",
@@ -2428,7 +2438,7 @@ mod tests {
                 &[
                     "1020-bfd1:\n",
                     " IP address                Interface  State      Since         Interval  Timeout\n",
-                    " 203.0.113.1               eth0       Up         10:00:00.000  0.050     0.250\n",
+                    " fe80::1%eth0              eth0       Up         10:00:00.000  0.050     0.250\n",
                     " 203.0.113.2               eth0       Down       10:00:00.000  0.050     0.250\n",
                     "0000 \n",
                 ],
@@ -2461,7 +2471,12 @@ mod tests {
             .unwrap();
         assert_eq!(edge_a.session, PeerSessionState::Established);
         assert_eq!(edge_a.path_health, PathHealth::Up);
-        assert_eq!(edge_a.peer.address(), Some(IpAddress::V4([203, 0, 113, 1])));
+        assert_eq!(
+            edge_a.peer.address(),
+            Some(IpAddress::V6([
+                0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+            ]))
+        );
         assert_eq!(
             edge_a.advertised_prefixes,
             BTreeSet::from([HostPrefix::new(IpAddress::V4([203, 0, 113, 10]))])
@@ -2647,6 +2662,29 @@ mod tests {
             .remove("show bfd sessions");
         let observations = adapter.poll_observations().await.unwrap();
         assert_eq!(observations[0].path_health, PathHealth::Up);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn adapter_debug_redacts_cached_bfd_peer_addresses() {
+        let dir = test_dir("bfd-cache-debug-redaction");
+        std::fs::create_dir_all(dir.join("opc.d")).unwrap();
+        let adapter = BirdControlSocketAdapter::new_for_conformance(config(&dir)).unwrap();
+        adapter
+            .bfd_health_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .replace(
+                BTreeMap::from([(IpAddress::V4([198, 51, 100, 77]), PathHealth::Up)]),
+                Instant::now(),
+            )
+            .unwrap();
+
+        let rendered = format!("{adapter:?}");
+        assert!(rendered.contains("<redacted>"));
+        assert!(!rendered.contains("198.51.100.77"));
+        assert!(!rendered.contains("198, 51, 100, 77"));
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
