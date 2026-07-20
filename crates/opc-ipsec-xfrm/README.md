@@ -32,6 +32,15 @@ management, product SA/SPD policy, or deployment defaults.
 - Composite helpers include `install_sa_policy_with_rollback`,
   `install_bidirectional_sa_policy_with_rollback`, `rekey_sa_policy`, and
   `remove_policy_sa`.
+- `XfrmStagedInstall` is the cancellation-safe counterpart of
+  `install_sa_policy_with_rollback`: its caller-cloned `XfrmInstallJournal`
+  records every acknowledged backend mutation outside the install future, so
+  dropping the future at any await point leaves typed `XfrmInstallOwnership`
+  (no mutation acquired, SA in flight, SA acquired, policy in flight,
+  complete, rolled back, recovered, or indeterminate) plus an exact,
+  never-broadened `XfrmInstallRecoveryPlan`. `XfrmInstallJournal::recover` applies that plan
+  policy-first with `NotFound`-idempotent removal and never authorizes
+  deletion of pre-existing state rejected with `AlreadyExists`.
 - With feature `ikev2`, the crate also exports Child SA KEYMAT and negotiation
   mappers from `opc-proto-ikev2` into explicit XFRM install requests.
 

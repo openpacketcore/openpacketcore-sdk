@@ -33,6 +33,7 @@ pub mod ikev2;
 pub mod linux;
 pub mod mock;
 pub mod model;
+pub mod staged;
 pub mod unsupported;
 
 pub use backend::XfrmBackend;
@@ -69,6 +70,10 @@ pub use model::{
     XFRM_ENCR_CBC_AES, XFRM_ENCR_NULL,
 };
 pub use opc_types::DscpCodepoint;
+pub use staged::{
+    XfrmInstallJournal, XfrmInstallOwnership, XfrmInstallRecoveryError, XfrmInstallRecoveryPlan,
+    XfrmStagedInstall,
+};
 pub use unsupported::UnsupportedXfrmBackend;
 
 #[cfg(test)]

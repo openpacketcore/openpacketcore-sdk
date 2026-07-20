@@ -8,6 +8,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Cancellation-safe staged XFRM composite install — `opc-ipsec-xfrm`:**
+  `XfrmStagedInstall` runs the same SA-then-policy install and rollback
+  sequence as `install_sa_policy_with_rollback`, but records every
+  acknowledged backend mutation in a caller-cloned `XfrmInstallJournal`
+  outside the install future (#402). Dropping the future at any await point
+  now leaves typed `XfrmInstallOwnership` behind — `NotStarted`,
+  `SaInFlight`, `SaAcquired`, `PolicyInFlight`, `Complete`, `RolledBack`,
+  `Recovered`, or `Indeterminate` — instead of an opaque cancellation, and
+  `XfrmInstallJournal::recovery_plan` exposes the exact, never-broadened
+  removal intents for any residue the operation may own.
+  `XfrmInstallJournal::recover` applies those intents policy-first with
+  `NotFound`-idempotent removal, and the journal never authorizes deletion of
+  a pre-existing SA or policy rejected with `AlreadyExists`. Recovery is
+  rejected with `XfrmInstallRecoveryError::RunnerNotFinished` while the
+  install runner is still live or was never polled, so a completed recovery
+  cannot orphan mutations the runner may still acquire; a drop-cancelled
+  runner counts as finished and stays recoverable. Ownership,
+  outcome, and error surfaces carry only stable labels and remain
+  redaction-safe.
 - **Validated-provider capability seam — `opc-crypto-provider`:** a new
   standalone crate defining the capability-reporting and key-custody boundary
   requested by #334 (slice 1 of 5). `CryptoCapability` enumerates the
