@@ -75,9 +75,9 @@ use opc_gtpu_dataplane::{
 };
 use opc_gtpu_ebpf_common::{
     internet_checksum, ipv4_header_checksum, marked_owner_wire_authorizes_downlink,
-    udp_ipv4_checksum, DownlinkEndpointBinding, DownlinkPdr, GtpuEndpointAddress, MarkedBearerOwner,
-    MarkedBearerOwnerPhase, MarkedDownlinkPdr, PdpContextCommit, UplinkFar, UplinkFarKey,
-    COUNTER_DL_BINDING_FAMILY_MISMATCH, COUNTER_DL_BINDING_INGRESS_MISMATCH,
+    udp_ipv4_checksum, DownlinkEndpointBinding, DownlinkPdr, GtpuEndpointAddress,
+    MarkedBearerOwner, MarkedBearerOwnerPhase, MarkedDownlinkPdr, PdpContextCommit, UplinkFar,
+    UplinkFarKey, COUNTER_DL_BINDING_FAMILY_MISMATCH, COUNTER_DL_BINDING_INGRESS_MISMATCH,
     COUNTER_DL_BINDING_INVALID, COUNTER_DL_BINDING_LOCAL_MISMATCH,
     COUNTER_DL_BINDING_PEER_MISMATCH, COUNTER_DL_BINDING_SOURCE_PORT_MISMATCH, COUNTER_DL_DECAP,
     COUNTER_DL_DST_MISMATCH, COUNTER_DL_MALFORMED, COUNTER_DL_UNKNOWN_TEID, COUNTER_UL_ENCAP,
@@ -92,7 +92,7 @@ use opc_gtpu_ebpf_common::{
     UPLINK_BEARER_SCHEMA_MARKER_VALUE, UPLINK_DSCP_SCHEMA_MARKER_KEY,
     UPLINK_DSCP_SCHEMA_MARKER_VALUE, UPLINK_DSCP_VALUE_LEN, UPLINK_FAR_VALUE_LEN,
     UPLINK_MARK_KEY_LEN, UPLINK_PMTU_SCHEMA_MARKER_VALUE, UPLINK_PMTU_VALUE_LEN,
-    UPLINK_SOURCE_PORT_SCHEMA_MARKER_VALUE, UPLINK_SOURCE_PORT_VALUE_LEN,
+    UPLINK_SOURCE_PORT_VALUE_LEN,
 };
 use opc_ipsec_xfrm::{
     Algorithm, AuthAlgorithm, InstallPolicyRequest, InstallSaRequest, IpAddress, KeyMaterial,
@@ -3709,10 +3709,15 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
             && v1_pin_dir.join(MAP_UPLINK_MARK_SOURCE_PORT).exists(),
         "fresh provisioning after v2 teardown must create source-port-v4 pins"
     );
+    assert!(
+        v1_pin_dir.join(MAP_UPLINK_PMTU).exists()
+            && v1_pin_dir.join(MAP_UPLINK_PMTU_COUNTERS).exists(),
+        "fresh provisioning after v2 teardown must create the MTU policy pins"
+    );
     assert_eq!(
         pinned_schema_marker(&v1_pin_dir),
-        UPLINK_SOURCE_PORT_SCHEMA_MARKER_VALUE,
-        "fresh provisioning after v2 teardown must commit source-port-v4"
+        UPLINK_PMTU_SCHEMA_MARKER_VALUE,
+        "fresh provisioning after v2 teardown must commit the current v5 schema"
     );
     v2_maintenance.remove_device(&current_device).await?;
     drop(v2_maintenance);

@@ -387,9 +387,11 @@ fn try_uplink(ctx: &mut TcContext, mark: u32) -> Result<i32, ()> {
         .ok_or(())?;
     let mut encap = encap;
     if let Some(pmtu_ptr) = GTPU_PMTU_CFG.get_ptr(0) {
-        // SAFETY: single-slot array value written only by the loader before
-        // the device is managed. One aligned four-byte load cannot observe a
-        // torn policy word.
+        // SAFETY: single-slot array value written by the loader before the
+        // device is managed, and later by `set_uplink_mtu_policy` via one
+        // atomic four-byte map write. A single four-byte load (read_unaligned
+        // lowers to one aligned ldw on the BPF target) cannot observe a torn
+        // policy word.
         let policy_bytes = unsafe { (pmtu_ptr as *const u32).read_unaligned() }.to_ne_bytes();
         match GtpuUplinkMtuPolicy::decode_map_value(&policy_bytes) {
             UplinkMtuMapState::Unset => {}

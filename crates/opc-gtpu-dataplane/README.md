@@ -556,9 +556,9 @@ with its output bearer mark at most once per reassembled datagram.
 Provenance comes from the kernel, not configuration:
 `recv_reassembled_gtpu` extracts the peer, source port, and local
 destination via `IP_PKTINFO`; the ingress ifindex is the managed interface's
-(the kernel reports ifindex 0 for reassembled datagrams, so delivery is
-scoped to the interface by the concrete-address bind and any nonzero kernel
-ifindex is cross-checked). Documented divergences from the tc path: checksum
+(the kernel value for reassembled datagrams is kernel-version-dependent, so
+delivery is scoped to the interface by the concrete-address bind and any
+nonzero kernel ifindex is cross-checked). Documented divergences from the tc path: checksum
 verification is the kernel's (socket delivery implies acceptance), and
 envelope padding strictness differs — tc requires `udp_end == ip_end` and
 drops padded envelopes, while the kernel strips layer-2 padding before

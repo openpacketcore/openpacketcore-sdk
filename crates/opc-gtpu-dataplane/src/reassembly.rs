@@ -21,10 +21,10 @@
 //!   the IPv4 end and drops padded envelopes, while the kernel strips layer-2
 //!   padding before socket delivery, so a padded envelope that tc would drop
 //!   unfragmented is accepted here after reassembly.
-//! - The ingress ifindex cannot come from `IP_PKTINFO` on this path — the
-//!   kernel reports ifindex 0 for reassembled datagrams — so it is the
-//!   managed interface's ifindex supplied by the caller (see
-//!   [`recv_reassembled_gtpu`]); delivery is scoped to the right interface
+//! - The ingress ifindex is supplied by the caller (the managed interface's
+//!   ifindex — see [`recv_reassembled_gtpu`]): whether the kernel reports a
+//!   nonzero ifindex for reassembled datagrams is kernel-version-dependent,
+//!   so delivery is scoped to the right interface
 //!   by the concrete-address bind instead.
 //!
 //! The consumer's counters are userspace-side and deliberately *not* part of
@@ -151,15 +151,14 @@ impl fmt::Debug for DownlinkOuterProvenance {
 /// The returned provenance carries the datagram's source (peer address and
 /// source port) and the kernel-reported local destination address, so the
 /// consumer never hardcodes them. `ingress_ifindex` must be the managed
-/// S2b-U interface's ifindex: the kernel reports ifindex 0 in `IP_PKTINFO`
-/// for reassembled datagrams (and on the loopback receive path), so
-/// per-packet packet-info cannot supply it. What scopes delivery to the
-/// right interface is the concrete-address bind — the socket must be bound
-/// on the interface's own S2b-U address (never `0.0.0.0`), so datagrams
-/// addressed to any other interface never arrive. When the kernel *does*
-/// report a nonzero ifindex, it is cross-checked against `ingress_ifindex`
-/// and a mismatch fails closed. `IP_PKTINFO` is enabled on the socket as a
-/// side effect.
+/// S2b-U interface's ifindex: what scopes delivery to the right interface is
+/// the concrete-address bind — the socket must be bound on the interface's
+/// own S2b-U address (never `0.0.0.0`), so datagrams addressed to any other
+/// interface never arrive. When the kernel reports a nonzero ifindex (this
+/// is kernel-version-dependent: some kernels report 0 for reassembled
+/// datagrams or on the loopback receive path), it is cross-checked against
+/// `ingress_ifindex` and a mismatch fails closed. `IP_PKTINFO` is enabled
+/// on the socket as a side effect.
 ///
 /// # Errors
 ///
@@ -707,9 +706,10 @@ mod tests {
             .set_read_timeout(Some(std::time::Duration::from_secs(2)))
             .unwrap();
         let mut buffer = [0_u8; 64];
-        // Loopback reports ifindex 0 in IP_PKTINFO (skb_iif is unset on the
-        // loopback receive path), so the managed-interface ifindex passed in
-        // is used; on real interfaces the kernel value is cross-checked.
+        // The ifindex the kernel reports on the loopback receive path is
+        // kernel-version-dependent (some kernels report 0, others the
+        // loopback ifindex), so the managed-interface ifindex passed in is
+        // used; a nonzero kernel value is cross-checked.
         let (len, provenance) = recv_reassembled_gtpu(&receiver, &mut buffer, 1).unwrap();
         assert_eq!(&buffer[..len], b"gtpu-probe");
         assert_eq!(provenance.peer_address(), Ipv4Addr::LOCALHOST);
