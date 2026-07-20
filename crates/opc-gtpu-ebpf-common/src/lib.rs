@@ -14,11 +14,24 @@
 #![deny(missing_docs)]
 
 mod envelope;
+mod fragment;
+mod pmtu;
 
 pub use envelope::{
     classify_udp_checksum, internet_checksum, internet_checksum_sum_is_valid, udp_ipv4_checksum,
     udp_ipv4_checksum_is_valid, GtpuEnvelopeBounds, GtpuEnvelopeError, Ipv4EnvelopeBounds,
     UdpChecksumDisposition, UdpChecksumEvidence, UdpEnvelopeBounds, IPV4_MAX_HDR_LEN,
+};
+pub use fragment::{
+    parse_gtpu_tpdu, GtpuDownlinkFragmentContract, GtpuReassemblyBounds, GtpuTpdu, GtpuTpduError,
+    LINUX_DEFAULT_REASSEMBLY_BOUNDS, MAX_REASSEMBLED_GTPU_LEN,
+};
+pub use pmtu::{
+    apply_uplink_mtu_policy, decide_uplink_encap, stamp_ipv4_dont_fragment,
+    GtpuOuterFragmentPolicy, GtpuPmtuProtocol, GtpuPmtuSignal, GtpuUplinkMtuPolicy,
+    UplinkEncapOutcome, UplinkMtuMapState, ICMPV4_CODE_FRAGMENTATION_NEEDED_DF_SET,
+    ICMPV4_TYPE_DESTINATION_UNREACHABLE, ICMPV6_TYPE_PACKET_TOO_BIG, MIN_UPLINK_LINK_MTU,
+    UPLINK_PMTU_FLAG_FRAGMENT_PERMITTED, UPLINK_PMTU_VALUE_LEN,
 };
 
 /// GTP-U UDP port (TS 29.281 §4.4.2).
