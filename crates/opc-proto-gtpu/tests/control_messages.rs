@@ -2,7 +2,7 @@
 
 use std::{net::IpAddr, num::NonZeroU32};
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use opc_proto_gtpu::{
     GtpuControlCodecErrorCode, GtpuControlMessage, GtpuEchoRequest, GtpuEchoResponse,
     GtpuEndMarker, GtpuErrorIndication, GtpuExtensionChainError, GtpuExtensionHeaderComprehension,
@@ -12,7 +12,8 @@ use opc_proto_gtpu::{
     PduSessionContainerError,
 };
 use opc_protocol::{
-    BorrowDecode, DecodeContext, DecodeErrorCode, EncodeContext, UnknownIePolicy, ValidationLevel,
+    BorrowDecode, DecodeContext, DecodeErrorCode, Encode, EncodeContext, UnknownIePolicy,
+    ValidationLevel,
 };
 
 // Synthetic, specification-authored fixtures derived directly from TS 29.281
@@ -36,6 +37,9 @@ const SUPPORTED_EXTENSION_HEADERS: &[u8] = &[
 const END_MARKER: &[u8] = &[0x30, 0xfe, 0, 0, 0x11, 0x22, 0x33, 0x44];
 const END_MARKER_WITH_PDU_SESSION_CONTAINER: &[u8] = &[
     0x34, 0xfe, 0, 8, 0x11, 0x22, 0x33, 0x44, 0, 0, 0, 0x85, 1, 0, 9, 0,
+];
+const END_MARKER_WITH_RECEIVER_IGNORED_PSC_SPARE: &[u8] = &[
+    0x34, 0xfe, 0, 8, 0x11, 0x22, 0x33, 0x44, 0, 0, 0, 0x85, 1, 1, 9, 0,
 ];
 const ECHO_REQUEST_TIMESTAMP_AND_PRIVATE: &[u8] = &[
     0x32, 0x01, 0x00, 0x13, 0, 0, 0, 0, 0, 7, 0, 0, 0xe7, 0, 6, 1, 2, 3, 4, 0xaa, 0xbb, 0xff, 0, 3,
@@ -516,6 +520,125 @@ fn end_marker_accepts_and_reencodes_pdu_session_container() {
 }
 
 #[test]
+fn typed_end_marker_accepts_psc_spare_but_canonicalizes_sender_output() {
+    let (_, generic) = GtpuMessage::decode(
+        END_MARKER_WITH_RECEIVER_IGNORED_PSC_SPARE,
+        DecodeContext {
+            validation_level: ValidationLevel::Structural,
+            ..DecodeContext::default()
+        },
+    )
+    .expect("receiver-ignored PSC spare bit must decode generically");
+    let mut raw_preserved = BytesMut::new();
+    generic
+        .encode(
+            &mut raw_preserved,
+            EncodeContext {
+                raw_preserving: true,
+                ..EncodeContext::default()
+            },
+        )
+        .expect("generic raw-preserving encode must remain byte exact");
+    assert_eq!(
+        raw_preserved.as_ref(),
+        END_MARKER_WITH_RECEIVER_IGNORED_PSC_SPARE
+    );
+
+    for validation_level in [
+        ValidationLevel::HeaderOnly,
+        ValidationLevel::Structural,
+        ValidationLevel::Strict,
+        ValidationLevel::ProcedureAware,
+    ] {
+        let received = GtpuControlMessage::decode_datagram(
+            END_MARKER_WITH_RECEIVER_IGNORED_PSC_SPARE,
+            DecodeContext {
+                validation_level,
+                ..DecodeContext::conservative()
+            },
+        )
+        .expect("typed receive must ignore the permitted PSC spare bit");
+        assert_eq!(
+            encode(&received).as_ref(),
+            END_MARKER_WITH_PDU_SESSION_CONTAINER
+        );
+    }
+
+    let received = GtpuControlMessage::decode_datagram(
+        END_MARKER_WITH_RECEIVER_IGNORED_PSC_SPARE,
+        DecodeContext::conservative(),
+    )
+    .expect("typed receive must expose the accepted semantic PSC");
+    let marker = match &received {
+        GtpuControlMessage::EndMarker(value) => value,
+        other => panic!("unexpected message: {other:?}"),
+    };
+    let container = marker
+        .extension_chain()
+        .pdu_session_container
+        .as_ref()
+        .expect("received End Marker must expose the semantic PSC");
+    assert_eq!(container.pdu_type, 0);
+    assert_eq!(container.qfi, 9);
+
+    let canonical = encode(&received);
+    assert_eq!(canonical.as_ref(), END_MARKER_WITH_PDU_SESSION_CONTAINER);
+    let reparsed = decode(&canonical);
+    assert_eq!(encode(&reparsed), canonical);
+}
+
+#[test]
+fn end_marker_canonicalization_puts_psc_first_and_retains_unknown_order() {
+    let received_wire = [
+        0x34, 0xfe, 0, 16, 0xde, 0xad, 0xbe, 0xef, 0, 0, 0, 0x07, 1, 0xaa, 0xbb, 0x85, 1, 1, 9,
+        0x06, 1, 0xcc, 0xdd, 0,
+    ];
+    let expected_canonical = [
+        0x34, 0xfe, 0, 16, 0xde, 0xad, 0xbe, 0xef, 0, 0, 0, 0x85, 1, 0, 9, 0x07, 1, 0xaa, 0xbb,
+        0x06, 1, 0xcc, 0xdd, 0,
+    ];
+    let expected_replacement = [
+        0x34, 0xfe, 0, 16, 0xde, 0xad, 0xbe, 0xef, 0, 0, 0, 0x85, 1, 0, 10, 0x07, 1, 0xaa, 0xbb,
+        0x06, 1, 0xcc, 0xdd, 0,
+    ];
+
+    let received = decode(&received_wire);
+    assert_eq!(encode(&received).as_ref(), expected_canonical);
+
+    let marker = match received {
+        GtpuControlMessage::EndMarker(value) => value,
+        other => panic!("unexpected message: {other:?}"),
+    };
+    let replacement =
+        PduSessionContainer::new_downlink(10, None, false).expect("replacement PSC must be valid");
+    let marker = marker
+        .with_pdu_session_container(replacement)
+        .expect("replacement must retain a valid unknown extension chain");
+    assert_eq!(marker.extension_chain().header_count, 3);
+    assert_eq!(marker.extension_chain().first_extension_type, Some(0x85));
+    assert_eq!(
+        marker.extension_chain().raw_headers.as_ref(),
+        &expected_replacement[12..]
+    );
+
+    let message = GtpuControlMessage::EndMarker(marker);
+    assert_eq!(encode(&message).as_ref(), expected_replacement);
+    let debug = format!("{message:?}");
+    assert!(debug.contains("GtpuTunnelEndpointId(<redacted>)"));
+    assert!(!debug.contains("3735928559"));
+    assert!(!debug.contains("[170, 187]"));
+    assert!(!debug.contains("[204, 221]"));
+
+    let error = message
+        .to_bytes(EncodeContext {
+            max_message_len: expected_replacement.len() - 1,
+            ..EncodeContext::default()
+        })
+        .expect_err("canonical extension reordering must retain the output bound");
+    assert_eq!(error.code(), &GtpuControlCodecErrorCode::CapacityExceeded);
+}
+
+#[test]
 fn end_marker_builder_emits_pdu_session_container_fixture() {
     let container = PduSessionContainer::new_downlink(9, None, false)
         .expect("valid PDU Session Container must construct");
@@ -657,10 +780,10 @@ fn control_mutators_retain_unknown_optional_extension_headers() {
         .with_pdu_session_container(container)
         .expect("valid preserved chain must accept PDU mutation");
     assert_eq!(mutated.extension_chain().header_count, 2);
-    assert_eq!(mutated.extension_chain().first_extension_type, Some(0x07));
+    assert_eq!(mutated.extension_chain().first_extension_type, Some(0x85));
     assert_eq!(
         mutated.extension_chain().raw_headers.as_ref(),
-        &[1, 0xcc, 0xdd, 0x85, 1, 0, 9, 0]
+        &[1, 0, 9, 0x07, 1, 0xcc, 0xdd, 0]
     );
     let model = GtpuControlMessage::EndMarker(mutated);
     let wire = encode(&model);

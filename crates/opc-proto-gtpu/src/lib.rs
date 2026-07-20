@@ -1035,7 +1035,18 @@ impl GtpuExtensionChain {
         let content = container
             .encode()
             .map_err(|reason| GtpuExtensionChainError::InvalidPduSessionContainer { reason })?;
-        self.upsert_extension(GTPU_EXT_PDU_SESSION_CONTAINER, &content)
+        self.upsert_leading_extension(GTPU_EXT_PDU_SESSION_CONTAINER, &content)
+    }
+
+    pub(crate) fn canonicalize_pdu_session_container(
+        &self,
+    ) -> Result<Self, GtpuExtensionChainError> {
+        if let Some(container) = &self.pdu_session_container {
+            self.upsert_pdu_session_container(container)
+        } else {
+            self.validate_consistency()?;
+            Ok(self.clone())
+        }
     }
 
     pub(crate) fn upsert_udp_port(&self, port: u16) -> Result<Self, GtpuExtensionChainError> {
@@ -1049,7 +1060,11 @@ impl GtpuExtensionChain {
     ) -> Result<Self, GtpuExtensionChainError> {
         self.validate_consistency()?;
 
-        let mut headers = Vec::with_capacity(self.header_count.saturating_add(1));
+        let capacity = self
+            .header_count
+            .checked_add(1)
+            .ok_or(GtpuExtensionChainError::ExtensionLengthOverflow)?;
+        let mut headers = Vec::with_capacity(capacity);
         let mut replaced = false;
         let first_type = self.first_extension_type.unwrap_or(0);
         for extension in GtpuExtensionHeaderIterator::new(&self.raw_headers, first_type) {
@@ -1070,6 +1085,41 @@ impl GtpuExtensionChain {
             headers.push((extension_type, replacement_content.to_vec()));
         }
 
+        Self::from_extension_parts(&headers)
+    }
+
+    fn upsert_leading_extension(
+        &self,
+        extension_type: u8,
+        replacement_content: &[u8],
+    ) -> Result<Self, GtpuExtensionChainError> {
+        self.validate_consistency()?;
+
+        let capacity = self
+            .header_count
+            .checked_add(1)
+            .ok_or(GtpuExtensionChainError::ExtensionLengthOverflow)?;
+        let mut headers = Vec::with_capacity(capacity);
+        headers.push((extension_type, replacement_content.to_vec()));
+
+        let mut removed = false;
+        let first_type = self.first_extension_type.unwrap_or(0);
+        for extension in GtpuExtensionHeaderIterator::new(&self.raw_headers, first_type) {
+            let extension = extension.map_err(|_| GtpuExtensionChainError::BuiltChainInvalid)?;
+            if extension.ext_type == extension_type {
+                if removed {
+                    return Err(GtpuExtensionChainError::BuiltChainInvalid);
+                }
+                removed = true;
+                continue;
+            }
+            headers.push((extension.ext_type, extension.content.to_vec()));
+        }
+
+        Self::from_extension_parts(&headers)
+    }
+
+    fn from_extension_parts(headers: &[(u8, Vec<u8>)]) -> Result<Self, GtpuExtensionChainError> {
         let first_extension_type = headers.first().map(|(header_type, _)| *header_type);
         let raw_capacity = headers.iter().try_fold(0usize, |total, (_, content)| {
             total

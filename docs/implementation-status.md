@@ -459,8 +459,11 @@ presence flags requiring unmodelled conditional fields. Its public encoding and
 typed builders also reject oversized or direction-incompatible caller models;
 semantic decode failures retain a stable reason and offending extension offset.
 Adding an applicable UDP Port or PDU container preserves unrelated optional
-unknown headers from a decoded chain. Tunnel Status remains outside this codec
-slice.
+unknown headers from a decoded chain. Typed End Marker canonical encoding
+rebuilds its PDU Session Container from the typed value, clears permitted spare
+bits, and places it first while retaining unrelated optional unknown headers in
+relative order; generic raw-preserving encoding remains byte-exact. Tunnel
+Status remains outside this codec slice.
 
 This is only the codec slice of #341. Backend-neutral control datagram
 receive/send ports, local/remote tuple metadata, Linux/eBPF integration,

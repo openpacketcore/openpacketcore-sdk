@@ -76,7 +76,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   types, oversized QFI/PPI, and direction-incompatible fields rather than
   masking or discarding them. Control diagnostics retain typed PDU reasons and
   the offending extension offset; decoded optional unknown extensions survive
-  UDP Port/PDU Session Container mutation.
+  UDP Port/PDU Session Container mutation. Typed End Marker canonical encoding
+  rebuilds the container from its semantic value, clears receiver-ignored spare
+  bits, and puts it first while preserving every unrelated optional unknown
+  header in relative order; generic raw-preserving encoding remains byte-exact.
   Control encoding preflights bounded IE count and exact final wire capacity
   before serializing payload bytes; canonical Recovery Time Stamp builders can
   no longer emit arbitrary extension data.
@@ -89,7 +92,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Result` from `PduSessionContainer::encode` and
   `GtpuErrorIndication::with_triggering_udp_source_port`. Exhaustive public
   error matches must include the new reason-bearing PDU/extension-chain and
-  duplicate-container variants.
+  duplicate-container variants. Typed End Marker callers that previously
+  expected accepted non-canonical PDU Session Container bytes or extension
+  placement to survive `to_bytes` must use the generic raw-preserving boundary
+  for byte-exact forwarding.
 - **Validated-provider capability seam — `opc-crypto-provider`:** a new
   standalone crate defining the capability-reporting and key-custody boundary
   requested by #334 (slice 1 of 5). `CryptoCapability` enumerates the

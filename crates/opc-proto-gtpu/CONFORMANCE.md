@@ -97,7 +97,11 @@ This document defines the conformance of the `opc-proto-gtpu` crate against the 
 - **Mutation preservation**: adding/replacing the applicable UDP Port or PDU
   Session Container extension rebuilds the chain while retaining unrelated
   decoded optional unknown headers; inconsistent retained chains fail
-  explicitly.
+  explicitly. End Marker canonical encoding reconstructs the known PDU Session
+  Container from its typed semantic value, clears receiver-ignored spare bits,
+  and places it first as required by TS 29.281 figure 5.2.1-3 note 4. Unrelated
+  optional unknown headers retain their relative order. Generic raw-preserving
+  encoding continues to retain the accepted bytes exactly.
 - **Explicit exclusion**: Tunnel Status (§7.3.3 and §8.7) is not implemented
   by this codec slice and is rejected as a known procedure-inapplicable IE.
 

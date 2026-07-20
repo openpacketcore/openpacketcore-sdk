@@ -14,6 +14,7 @@
 //! @conformance control-codec-subset
 
 use std::{
+    borrow::Cow,
     error::Error,
     fmt,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
@@ -841,7 +842,10 @@ impl GtpuEndMarker {
     /// applicable 5GS End Marker.
     ///
     /// This typed builder cannot attach the UDP Port extension or arbitrary
-    /// procedure-inapplicable extension headers.
+    /// procedure-inapplicable extension headers. It places the container first
+    /// while retaining unrelated optional unknown headers in their relative
+    /// order, and rebuilds the container from its typed value so sender-spare
+    /// bits are zero.
     ///
     /// # Errors
     ///
@@ -1124,7 +1128,9 @@ impl GtpuControlMessage {
     ///
     /// Canonical Echo Responses always emit `Recovery=0`; Error Indication and
     /// Supported Extension Headers Notification emit zero in their
-    /// receiver-ignored Sequence Number field.
+    /// receiver-ignored Sequence Number field. End Marker rebuilds a known PDU
+    /// Session Container from its typed value, puts it first, and preserves the
+    /// relative order of unrelated optional unknown extension headers.
     ///
     /// # Errors
     ///
@@ -1138,7 +1144,7 @@ impl GtpuControlMessage {
                     GTPU_MESSAGE_ECHO_REQUEST,
                     0,
                     Some(value.sequence_number),
-                    &value.extensions,
+                    Cow::Borrowed(&value.extensions),
                     ie_refs_optional(&value.optional, false),
                 )
             }
@@ -1148,7 +1154,7 @@ impl GtpuControlMessage {
                     GTPU_MESSAGE_ECHO_RESPONSE,
                     0,
                     Some(value.sequence_number),
-                    &value.extensions,
+                    Cow::Borrowed(&value.extensions),
                     ie_refs_optional(&value.optional, true),
                 )
             }
@@ -1164,7 +1170,7 @@ impl GtpuControlMessage {
                     GTPU_MESSAGE_ERROR_INDICATION,
                     0,
                     Some(0),
-                    &value.extensions,
+                    Cow::Borrowed(&value.extensions),
                     ie_refs_error(value),
                 )
             }
@@ -1174,22 +1180,35 @@ impl GtpuControlMessage {
                     GTPU_MESSAGE_SUPPORTED_EXTENSION_HEADERS_NOTIFICATION,
                     0,
                     Some(0),
-                    &value.extensions,
+                    Cow::Borrowed(&value.extensions),
                     ie_refs_supported(value),
                 )
             }
             Self::EndMarker(value) => {
                 ensure_control_ie_count(end_marker_ie_count(value)?)?;
+                let extensions = value
+                    .extensions
+                    .canonicalize_pdu_session_container()
+                    .map_err(|_| {
+                        GtpuControlCodecError::new(GtpuControlCodecErrorCode::InvalidModel, 0)
+                    })?;
                 (
                     GTPU_MESSAGE_END_MARKER,
                     value.teid.value(),
                     None,
-                    &value.extensions,
+                    Cow::Owned(extensions),
                     ie_refs_end_marker(value),
                 )
             }
         };
-        encode_control_frame(message_type, teid, sequence_number, extensions, ies, ctx)
+        encode_control_frame(
+            message_type,
+            teid,
+            sequence_number,
+            extensions.as_ref(),
+            ies,
+            ctx,
+        )
     }
 }
 

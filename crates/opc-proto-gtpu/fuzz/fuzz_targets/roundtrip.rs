@@ -61,8 +61,9 @@ fuzz_target!(|data: &[u8]| {
         }
     }
 
-    // Typed control messages canonicalize receiver-ignored fields. Once
-    // canonicalized, decode/encode must be stable and preserve the typed model.
+    // Typed control messages canonicalize receiver-ignored fields. The
+    // received model may retain raw unknown-extension bytes, so canonical
+    // wire stability rather than raw model equality is the invariant.
     if let Ok((_, message)) = GtpuControlMessage::decode(data, DecodeContext::default()) {
         let encode_ctx = EncodeContext::default();
         if let Ok(canonical) = message.to_bytes(encode_ctx) {
@@ -70,7 +71,6 @@ fuzz_target!(|data: &[u8]| {
                 GtpuControlMessage::decode(&canonical, DecodeContext::default())
             {
                 assert!(tail.is_empty());
-                assert_eq!(message, reparsed);
                 if let Ok(second) = reparsed.to_bytes(encode_ctx) {
                     assert_eq!(canonical, second);
                 }

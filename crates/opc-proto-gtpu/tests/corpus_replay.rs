@@ -25,7 +25,6 @@ fn exercise(data: &[u8]) {
                 GtpuControlMessage::decode(&canonical, DecodeContext::default())
             {
                 assert!(tail.is_empty());
-                assert_eq!(control, reparsed);
                 if let Ok(second) = reparsed.to_bytes(encode_context) {
                     assert_eq!(canonical, second);
                 }
@@ -188,10 +187,14 @@ fn named_control_corpus_entries_are_valid_and_canonicalize() {
     const END_MARKER: &[u8] = &[
         0x34, 0xfe, 0, 8, 0x11, 0x22, 0x33, 0x44, 0, 0, 0, 0x85, 1, 0, 9, 0,
     ];
+    const END_MARKER_WITH_ORDERED_EXTENSIONS: &[u8] = &[
+        0x34, 0xfe, 0, 16, 0xde, 0xad, 0xbe, 0xef, 0, 0, 0, 0x85, 1, 0, 9, 0x07, 1, 0xaa, 0xbb,
+        0x06, 1, 0xcc, 0xdd, 0,
+    ];
     const UNKNOWN_OPTIONAL: &[u8] = &[
         0x36, 0x01, 0, 8, 0, 0, 0, 0, 0, 1, 0, 0x07, 1, 0xaa, 0xbb, 0,
     ];
-    let seeds: [(&str, &[u8], &[u8]); 12] = [
+    let seeds: [(&str, &[u8], &[u8]); 16] = [
         (
             "decode/control_echo_request",
             include_bytes!("../fuzz/corpus/decode/control_echo_request"),
@@ -241,6 +244,26 @@ fn named_control_corpus_entries_are_valid_and_canonicalize() {
             "roundtrip/control_end_marker_pdu_session",
             include_bytes!("../fuzz/corpus/roundtrip/control_end_marker_pdu_session"),
             END_MARKER,
+        ),
+        (
+            "decode/control_end_marker_noncanonical_psc",
+            include_bytes!("../fuzz/corpus/decode/control_end_marker_noncanonical_psc"),
+            END_MARKER,
+        ),
+        (
+            "roundtrip/control_end_marker_noncanonical_psc",
+            include_bytes!("../fuzz/corpus/roundtrip/control_end_marker_noncanonical_psc"),
+            END_MARKER,
+        ),
+        (
+            "decode/control_end_marker_psc_order",
+            include_bytes!("../fuzz/corpus/decode/control_end_marker_psc_order"),
+            END_MARKER_WITH_ORDERED_EXTENSIONS,
+        ),
+        (
+            "roundtrip/control_end_marker_psc_order",
+            include_bytes!("../fuzz/corpus/roundtrip/control_end_marker_psc_order"),
+            END_MARKER_WITH_ORDERED_EXTENSIONS,
         ),
         (
             "decode/control_unknown_optional_extension",

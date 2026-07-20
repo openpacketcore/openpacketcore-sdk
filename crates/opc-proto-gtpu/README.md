@@ -29,7 +29,11 @@ scheduling, or user-plane forwarding policy.
   direction-incompatible fields, and flags requiring unmodelled TS 38.415
   conditional fields fail closed rather than being masked or discarded.
 - `GtpuExtensionChain` summarizes and validates raw extension chains and can
-  build a chain containing a single PDU Session Container.
+  build a chain containing a single PDU Session Container. Generic
+  raw-preserving encode retains accepted extension bytes exactly. Typed End
+  Marker canonical encode instead rebuilds the known container from its typed
+  value, clears its sender-spare bits, places it first, and retains unrelated
+  optional unknown headers in their received relative order.
 - `GtpuExtensionHeaderType` exposes the TS 29.281 comprehension class and
   endpoint/intermediate requirements instead of treating every unknown header
   identically. `first_unsupported_required_extension` provides an
@@ -102,7 +106,10 @@ This codec slice intentionally tightens three public boundaries:
   fallible because it now refuses an inconsistent retained chain rather than
   dropping it. Both that mutator and
   `GtpuEndMarker::with_pdu_session_container` retain unrelated optional unknown
-  extension headers.
+  extension headers. End Marker mutation and typed canonical encode now place
+  the PDU Session Container first and rebuild it from the typed value; callers
+  that require byte-exact forwarding of an accepted non-canonical container
+  must remain on the generic raw-preserving boundary.
 - Public error matches must account for the reason-bearing
   `GtpuExtensionChainMalformedReason::InvalidPduSessionContainer { reason }`,
   `GtpuExtensionChainError::InvalidPduSessionContainer { reason }`, and the new
@@ -154,7 +161,10 @@ typed canonical output always clears it.
   5GS forwarding and remains inspectable through `GtpuExtensionChain`; it is
   rejected on control procedures where it is not applicable.
   `GtpuEndMarker::with_pdu_session_container` provides the corresponding typed,
-  procedure-safe build path.
+  procedure-safe build path. Receive ignores the container's permitted spare
+  bits. Typed canonical encoding clears those bits, places the container first
+  in the extension chain, and preserves all unrelated optional unknown headers
+  deterministically. Generic raw-preserving encoding remains byte-exact.
 - An unsupported comprehension-required extension produces the stable
   `gtpu_control_unsupported_required_extension` error with only its type. This
   is sufficient for a bounded downstream notification plan; the codec does not
