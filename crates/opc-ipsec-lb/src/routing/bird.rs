@@ -826,16 +826,16 @@ where
 
 #[derive(Debug, Default)]
 struct BfdHealthCache {
-    health: BTreeMap<IpAddress, PathHealth>,
+    health: BTreeMap<BirdNeighborKey, PathHealth>,
     refreshed_at: Option<Instant>,
 }
 
 impl BfdHealthCache {
     fn replace(
         &mut self,
-        health: BTreeMap<IpAddress, PathHealth>,
+        health: BTreeMap<BirdNeighborKey, PathHealth>,
         now: Instant,
-    ) -> Result<BTreeMap<IpAddress, PathHealth>, IpsecLbError> {
+    ) -> Result<BTreeMap<BirdNeighborKey, PathHealth>, IpsecLbError> {
         if health.len() > MAX_ROUTING_PEERS_TOTAL {
             return Err(IpsecLbError::invalid_config(
                 "bfd_observations",
@@ -851,7 +851,7 @@ impl BfdHealthCache {
         &mut self,
         now: Instant,
         maximum_age: Duration,
-    ) -> BTreeMap<IpAddress, PathHealth> {
+    ) -> BTreeMap<BirdNeighborKey, PathHealth> {
         if self
             .refreshed_at
             .is_some_and(|refreshed| now.saturating_duration_since(refreshed) <= maximum_age)
@@ -1659,7 +1659,28 @@ fn render_prefix(prefix: HostPrefix) -> String {
 struct ParsedProtocol {
     name: String,
     session: PeerSessionState,
-    neighbor_address: Option<IpAddress>,
+    neighbor: Option<BirdNeighborKey>,
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct BirdNeighborKey {
+    address: IpAddress,
+    scope: Option<String>,
+}
+
+impl BirdNeighborKey {
+    fn address(&self) -> IpAddress {
+        self.address
+    }
+}
+
+impl fmt::Debug for BirdNeighborKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BirdNeighborKey")
+            .field("address", &"<redacted>")
+            .field("scope", &self.scope.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 /// Known BGP session-state keywords BIRD prints in the `Info` column.
@@ -1702,7 +1723,7 @@ fn parse_show_protocols_all(output: &[String]) -> Vec<ParsedProtocol> {
             let detail = line.trim();
             if let Some(protocol) = protocols.last_mut() {
                 if let Some(address) = detail.strip_prefix("Neighbor address:") {
-                    protocol.neighbor_address = parse_bird_neighbor(address.trim());
+                    protocol.neighbor = parse_bgp_neighbor(address.trim());
                 }
             }
             continue;
@@ -1712,7 +1733,7 @@ fn parse_show_protocols_all(output: &[String]) -> Vec<ParsedProtocol> {
             protocols.push(ParsedProtocol {
                 name: tokens[0].to_owned(),
                 session: parse_session_state(tokens[3] == "up", &tokens[4..]),
-                neighbor_address: None,
+                neighbor: None,
             });
         }
     }
@@ -1730,27 +1751,29 @@ fn parse_show_protocols_all(output: &[String]) -> Vec<ParsedProtocol> {
 /// ```
 ///
 /// Lines that do not start with a parseable neighbor address (instance
-/// headers, the column header) are skipped. Link-local neighbors are
-/// printed with a `%zone` suffix (`fe80::1%eth0`); the zone is dropped for
-/// correlation. Multiple sessions to the same neighbor fold
-/// conservatively: the worst reported state wins (`Down` beats `AdminDown`
-/// beats `Unknown` beats `Up`).
-fn parse_show_bfd_sessions(output: &[String]) -> BTreeMap<IpAddress, PathHealth> {
-    let mut health: BTreeMap<IpAddress, PathHealth> = BTreeMap::new();
+/// headers, the column header) are skipped. For link-local neighbors, the
+/// separate interface column becomes part of the correlation key. Multiple
+/// sessions for the same address and interface fold conservatively: the worst
+/// reported state wins (`Down` beats `AdminDown` beats `Unknown` beats `Up`).
+fn parse_show_bfd_sessions(output: &[String]) -> BTreeMap<BirdNeighborKey, PathHealth> {
+    let mut health: BTreeMap<BirdNeighborKey, PathHealth> = BTreeMap::new();
     for line in output {
         let mut tokens = line.split_whitespace();
-        let Some(address) = tokens.next().and_then(parse_bird_neighbor) else {
+        let Some(address) = tokens.next() else {
             continue;
         };
-        let Some(_interface) = tokens.next() else {
+        let Some(interface) = tokens.next() else {
             continue;
         };
         let Some(state) = tokens.next() else {
             continue;
         };
+        let Some(neighbor) = parse_bfd_neighbor(address, interface) else {
+            continue;
+        };
         let state = parse_bfd_state(state);
         health
-            .entry(address)
+            .entry(neighbor)
             .and_modify(|current| *current = merge_path_health(*current, state))
             .or_insert(state);
     }
@@ -1767,16 +1790,69 @@ fn merge_path_health(a: PathHealth, b: PathHealth) -> PathHealth {
     }
 }
 
-/// Parse a BIRD neighbor address, dropping any `%zone` suffix BIRD prints
-/// for link-local BGP and BFD neighbors so both views correlate.
-fn parse_bird_neighbor(text: &str) -> Option<IpAddress> {
-    parse_ip_address(text.split('%').next()?)
+/// Parse the address and interface scope BIRD prints for BGP peers.
+///
+/// Scope is retained in the internal correlation key so equal link-local
+/// addresses on different interfaces cannot inherit each other's health.
+fn parse_bgp_neighbor(text: &str) -> Option<BirdNeighborKey> {
+    let (address, scope) = match text.split_once('%') {
+        Some((address, scope)) => (address, Some(parse_bird_interface_scope(scope)?)),
+        None => (text, None),
+    };
+    let address = IpAddr::from_str(address).ok()?;
+    Some(BirdNeighborKey {
+        address: match address {
+            IpAddr::V4(address) => IpAddress::V4(address.octets()),
+            IpAddr::V6(address) => IpAddress::V6(address.octets()),
+        },
+        scope,
+    })
 }
 
-fn parse_ip_address(text: &str) -> Option<IpAddress> {
-    match IpAddr::from_str(text).ok()? {
-        IpAddr::V4(address) => Some(IpAddress::V4(address.octets())),
-        IpAddr::V6(address) => Some(IpAddress::V6(address.octets())),
+fn parse_bfd_neighbor(address: &str, interface: &str) -> Option<BirdNeighborKey> {
+    let mut neighbor = parse_bgp_neighbor(address)?;
+    match neighbor.scope.as_deref() {
+        Some(scope) if scope != interface => return None,
+        Some(_) => {}
+        None if interface != "---" => {
+            neighbor.scope = Some(parse_bird_interface_scope(interface)?);
+        }
+        None if is_ipv6_link_local(neighbor.address) => return None,
+        None => {}
+    }
+    Some(neighbor)
+}
+
+fn bfd_health_for_neighbor(
+    health: &BTreeMap<BirdNeighborKey, PathHealth>,
+    neighbor: &BirdNeighborKey,
+) -> Option<PathHealth> {
+    if neighbor.scope.is_some() {
+        return health.get(neighbor).copied();
+    }
+    if is_ipv6_link_local(neighbor.address) {
+        return None;
+    }
+    health
+        .iter()
+        .filter(|(candidate, _)| candidate.address == neighbor.address)
+        .map(|(_, state)| *state)
+        .reduce(merge_path_health)
+}
+
+fn parse_bird_interface_scope(scope: &str) -> Option<String> {
+    let valid = scope != "---"
+        && !scope.is_empty()
+        && scope.len() <= MAX_PROTOCOL_NAME_LEN
+        && !scope.contains('%')
+        && scope.chars().all(|character| character.is_ascii_graphic());
+    valid.then(|| scope.to_owned())
+}
+
+fn is_ipv6_link_local(address: IpAddress) -> bool {
+    match address {
+        IpAddress::V6(octets) => Ipv6Addr::from(octets).is_unicast_link_local(),
+        IpAddress::V4(_) => false,
     }
 }
 
@@ -2100,7 +2176,7 @@ impl RoutingStackAdapter for BirdControlSocketAdapter {
         // with an error reply, which must not blind session telemetry. A
         // failed read briefly degrades to the last successfully read health
         // table. The cache then ages out so stale health cannot persist.
-        let bfd_health: BTreeMap<IpAddress, PathHealth> =
+        let bfd_health: BTreeMap<BirdNeighborKey, PathHealth> =
             match self.command("show bfd sessions").await {
                 Ok(reply) => {
                     let fresh = parse_show_bfd_sessions(&reply.lines);
@@ -2125,13 +2201,14 @@ impl RoutingStackAdapter for BirdControlSocketAdapter {
             for peer_name in &binding.peer_protocols {
                 if let Some(protocol) = protocols.iter().find(|p| &p.name == peer_name) {
                     let peer = PeerIdentity::named(protocol.name.clone());
-                    let peer = match protocol.neighbor_address {
-                        Some(address) => peer.with_address(address),
+                    let peer = match protocol.neighbor.as_ref() {
+                        Some(neighbor) => peer.with_address(neighbor.address()),
                         None => peer,
                     };
                     let path_health = protocol
-                        .neighbor_address
-                        .and_then(|address| bfd_health.get(&address).copied())
+                        .neighbor
+                        .as_ref()
+                        .and_then(|neighbor| bfd_health_for_neighbor(&bfd_health, neighbor))
                         .unwrap_or(PathHealth::Unknown);
                     if protocol.session == PeerSessionState::Established {
                         local_readback_domains
@@ -2297,6 +2374,20 @@ mod tests {
         }
     }
 
+    fn neighbor(address: IpAddress) -> BirdNeighborKey {
+        BirdNeighborKey {
+            address,
+            scope: None,
+        }
+    }
+
+    fn scoped_neighbor(address: IpAddress, scope: &str) -> BirdNeighborKey {
+        BirdNeighborKey {
+            address,
+            scope: Some(scope.to_owned()),
+        }
+    }
+
     fn test_dir(tag: &str) -> PathBuf {
         let dir =
             std::env::temp_dir().join(format!("opc-ipsec-lb-bird-{}-{tag}", std::process::id()));
@@ -2428,7 +2519,7 @@ mod tests {
                     "     Neighbor address: fe80::1%eth0\n",
                     "     Neighbor AS:      64512\n",
                     " edge_b     BGP        ---        up     10:00:01      Active\n",
-                    "     Neighbor address: 203.0.113.2\n",
+                    "     Neighbor address: fe80::1%eth1\n",
                     "     Neighbor AS:      64513\n",
                     "0000 \n",
                 ],
@@ -2438,8 +2529,8 @@ mod tests {
                 &[
                     "1020-bfd1:\n",
                     " IP address                Interface  State      Since         Interval  Timeout\n",
-                    " fe80::1%eth0              eth0       Up         10:00:00.000  0.050     0.250\n",
-                    " 203.0.113.2               eth0       Down       10:00:00.000  0.050     0.250\n",
+                    " fe80::1                   eth0       Up         10:00:00.000  0.050     0.250\n",
+                    " fe80::1                   eth1       Down       10:00:00.000  0.050     0.250\n",
                     "0000 \n",
                 ],
             ),
@@ -2487,6 +2578,7 @@ mod tests {
             .unwrap();
         assert_eq!(edge_b.session, PeerSessionState::Connecting);
         assert_eq!(edge_b.path_health, PathHealth::Down);
+        assert_eq!(edge_b.peer.address(), edge_a.peer.address());
         assert!(edge_b.advertised_prefixes.is_empty());
 
         std::fs::remove_dir_all(&dir).unwrap();
@@ -2676,7 +2768,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .replace(
-                BTreeMap::from([(IpAddress::V4([198, 51, 100, 77]), PathHealth::Up)]),
+                BTreeMap::from([(neighbor(IpAddress::V4([198, 51, 100, 77])), PathHealth::Up)]),
                 Instant::now(),
             )
             .unwrap();
@@ -3017,7 +3109,10 @@ mod tests {
         let by_name = |name: &str| protocols.iter().find(|p| p.name == name).unwrap();
         assert_eq!(by_name("edge_a").session, PeerSessionState::Established);
         assert_eq!(
-            by_name("edge_a").neighbor_address,
+            by_name("edge_a")
+                .neighbor
+                .as_ref()
+                .map(BirdNeighborKey::address),
             Some(IpAddress::V4([203, 0, 113, 1]))
         );
         // A space-containing Since column does not break keyword scanning.
@@ -3039,12 +3134,12 @@ mod tests {
         .collect();
         let rows = parse_show_bfd_sessions(&output);
         assert_eq!(
-            rows.get(&IpAddress::V4([203, 0, 113, 1])),
-            Some(&PathHealth::Up)
+            bfd_health_for_neighbor(&rows, &neighbor(IpAddress::V4([203, 0, 113, 1]))),
+            Some(PathHealth::Up)
         );
         assert_eq!(
-            rows.get(&IpAddress::V4([203, 0, 113, 2])),
-            Some(&PathHealth::Down)
+            bfd_health_for_neighbor(&rows, &neighbor(IpAddress::V4([203, 0, 113, 2]))),
+            Some(PathHealth::Down)
         );
     }
 
@@ -3061,48 +3156,88 @@ mod tests {
         .collect();
         let rows = parse_show_bfd_sessions(&output);
         assert_eq!(
-            rows.get(&IpAddress::V4([203, 0, 113, 1])),
-            Some(&PathHealth::Down)
+            bfd_health_for_neighbor(&rows, &neighbor(IpAddress::V4([203, 0, 113, 1]))),
+            Some(PathHealth::Down)
         );
         assert_eq!(
-            rows.get(&IpAddress::V4([203, 0, 113, 2])),
-            Some(&PathHealth::Up)
+            bfd_health_for_neighbor(&rows, &neighbor(IpAddress::V4([203, 0, 113, 2]))),
+            Some(PathHealth::Up)
         );
     }
 
     #[test]
-    fn link_local_bfd_neighbor_zone_suffix_is_dropped() {
+    fn link_local_bfd_neighbor_interface_scope_is_retained() {
         let output: Vec<String> =
-            ["fe80::1%eth0                  eth0       Up         10:00:00.000  0.050     0.250"]
+            ["fe80::1                       eth0       Up         10:00:00.000  0.050     0.250"]
                 .iter()
                 .map(ToString::to_string)
                 .collect();
         let rows = parse_show_bfd_sessions(&output);
         let link_local = IpAddress::V6([0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
-        assert_eq!(rows.get(&link_local), Some(&PathHealth::Up));
+        assert_eq!(
+            rows.get(&scoped_neighbor(link_local, "eth0")),
+            Some(&PathHealth::Up)
+        );
+    }
+
+    #[test]
+    fn equal_link_local_addresses_on_distinct_interfaces_do_not_collide() {
+        let output: Vec<String> = [
+            "fe80::1                       eth0       Up         10:00:00.000  0.050     0.250",
+            "fe80::1                       eth1       Down       10:00:00.000  0.050     0.250",
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        let rows = parse_show_bfd_sessions(&output);
+        let link_local = IpAddress::V6([0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        assert_eq!(
+            rows.get(&scoped_neighbor(link_local, "eth0")),
+            Some(&PathHealth::Up)
+        );
+        assert_eq!(
+            rows.get(&scoped_neighbor(link_local, "eth1")),
+            Some(&PathHealth::Down)
+        );
+    }
+
+    #[test]
+    fn malformed_or_conflicting_neighbor_scopes_fail_closed() {
+        assert!(parse_bgp_neighbor("fe80::1%").is_none());
+        assert!(parse_bgp_neighbor("fe80::1%eth0%extra").is_none());
+        assert!(parse_bgp_neighbor("fe80::1%eth0 trailing").is_none());
+        assert!(parse_bgp_neighbor("192.0.2.1%eth0").is_some());
+        assert!(parse_bgp_neighbor("2001:db8::1%eth0").is_some());
+        assert!(parse_bfd_neighbor("fe80::1%eth0", "eth1").is_none());
+        assert!(parse_bfd_neighbor("fe80::1%eth0", "eth0").is_some());
+        assert!(parse_bfd_neighbor("fe80::1", "---").is_none());
+        assert!(parse_bfd_neighbor("fe80::1%---", "---").is_none());
     }
 
     #[test]
     fn bfd_cache_is_bounded_and_ages_to_unknown() {
         let now = Instant::now();
-        let neighbor = IpAddress::V4([203, 0, 113, 1]);
+        let cached_neighbor = neighbor(IpAddress::V4([203, 0, 113, 1]));
         let mut cache = BfdHealthCache::default();
         cache
-            .replace(BTreeMap::from([(neighbor, PathHealth::Up)]), now)
+            .replace(
+                BTreeMap::from([(cached_neighbor.clone(), PathHealth::Up)]),
+                now,
+            )
             .unwrap();
         assert_eq!(
             cache.usable_or_expire(now + Duration::from_secs(1), Duration::from_secs(2)),
-            BTreeMap::from([(neighbor, PathHealth::Up)])
+            BTreeMap::from([(cached_neighbor, PathHealth::Up)])
         );
         assert!(cache
             .usable_or_expire(now + Duration::from_secs(3), Duration::from_secs(2))
             .is_empty());
 
-        let overflow: BTreeMap<IpAddress, PathHealth> = (0..=MAX_ROUTING_PEERS_TOTAL)
+        let overflow: BTreeMap<BirdNeighborKey, PathHealth> = (0..=MAX_ROUTING_PEERS_TOTAL)
             .map(|index| {
                 let mut octets = [0_u8; 16];
                 octets[8..].copy_from_slice(&(index as u64).to_be_bytes());
-                (IpAddress::V6(octets), PathHealth::Up)
+                (neighbor(IpAddress::V6(octets)), PathHealth::Up)
             })
             .collect();
         assert!(cache.replace(overflow, now).is_err());
