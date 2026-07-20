@@ -24,10 +24,14 @@ The crate exposes tc entry points, not a Rust library API:
   fail closed. When the single-slot `GTPU_PMTU_CFG` policy map carries a
   configured effective link MTU, the program applies the shared
   `apply_uplink_mtu_policy` decision to every encapsulation: an over-MTU
-  packet is emitted only when the policy permits outer fragmentation (DF
-  stays clear); otherwise it drops fail closed into the `GTPU_PMTU_DROP`
-  per-CPU counter, never emitting the inner packet unencapsulated. The
-  strict policy stamps DF and refreshes the outer checksum on emitted
+  packet is emitted with DF clear only when the policy permits downstream
+  outer fragmentation (the program transmits via `bpf_redirect_neigh`,
+  bypassing the kernel's `ip_fragment`, so the oversized frame leaves whole
+  and relies on a downstream fragmenting hop); otherwise it drops fail
+  closed into the `GTPU_PMTU_DROP` per-CPU counter (slot 0 over-MTU rejects,
+  slot 1 the corrupt-policy canary), never emitting the inner packet
+  unencapsulated and never emitting ICMP itself. The strict policy stamps DF
+  and refreshes the outer checksum on emitted
   packets; an all-zero slot is the explicit unset legacy behavior and
   corrupt policy bytes drop fail closed.
 - `opc_gtpu_downlink`: tc ingress program. It matches UDP/2152 GTPv1-U G-PDUs,

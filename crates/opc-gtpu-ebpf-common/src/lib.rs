@@ -277,11 +277,14 @@ pub const COUNTER_DL_BINDING_SOURCE_PORT_MISMATCH: u32 = 5;
 pub const DOWNLINK_BINDING_COUNTER_SLOTS: u32 = 6;
 
 /// MTU-drop counter index: uplink packets rejected fail closed because the
-/// encapsulated packet exceeded the configured effective link MTU (or the
-/// persisted MTU policy was corrupt).
+/// encapsulated packet exceeded the configured effective link MTU.
 pub const COUNTER_UL_MTU_REJECT: u32 = 0;
+/// MTU-drop counter index: uplink packets dropped because the persisted MTU
+/// policy bytes were corrupt. This is a canary for external writers: a
+/// nonzero value always means non-SDK mutation of adopted state.
+pub const COUNTER_UL_PMTU_CORRUPT: u32 = 1;
 /// Number of uplink MTU-drop counters.
-pub const UPLINK_PMTU_COUNTER_SLOTS: u32 = 1;
+pub const UPLINK_PMTU_COUNTER_SLOTS: u32 = 2;
 
 /// Decide whether an uplink non-encapsulation path must drop rather than pass.
 ///

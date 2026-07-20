@@ -2,16 +2,16 @@
 //! contract.
 //!
 //! The uplink half turns the fixed [`GTPU_ENCAP_LEN`]-byte encapsulation into
-//! a typed action: emit within the effective link MTU, emit with outer IPv4
-//! fragmentation when the policy permits it, or fail closed with typed ICMP
-//! Packet-Too-Big guidance. It is pure `no_std` logic shared between host-side
-//! callers and the tc uplink program so both enforce the identical decision
-//! table.
+//! a typed action: emit within the effective link MTU, emit oversized with DF
+//! clear when the policy permits downstream outer fragmentation, or fail
+//! closed with typed ICMP Packet-Too-Big guidance. It is pure `no_std` logic
+//! shared between host-side callers and the tc uplink program so both enforce
+//! the identical decision table.
 //!
 //! The downlink half states the backend-neutral outer-fragment contract: the
 //! tc datapath hands outer fragments to the kernel stack unchanged and the
 //! SDK's post-reassembly consumer feeds the reassembled GTP-U datagram back
-//! into the same PDR/binding/decapsulation path. Reassembly resources stay in
+//! into the SDK PDR/binding/decapsulation path. Reassembly resources stay in
 //! the kernel's bounded `ipfrag` accounting; the SDK never holds an unbounded
 //! userspace fragment cache.
 
@@ -28,8 +28,9 @@ use crate::{
 /// limit is enforced).
 pub const UPLINK_PMTU_VALUE_LEN: usize = 4;
 
-/// Policy flag: outer IPv4 fragmentation of over-MTU encapsulations is
-/// permitted (the DF bit stays clear).
+/// Policy flag: over-MTU encapsulations are emitted with DF clear, permitting
+/// outer IPv4 fragmentation downstream (see
+/// [`GtpuOuterFragmentPolicy::FragmentOuter`] for the exact semantics).
 pub const UPLINK_PMTU_FLAG_FRAGMENT_PERMITTED: u8 = 1;
 
 /// Minimum acceptable effective link MTU: the fixed encapsulation plus the
@@ -40,18 +41,29 @@ pub const MIN_UPLINK_LINK_MTU: u16 = GTPU_ENCAP_LEN as u16 + 68;
 /// Explicit uplink outer-fragmentation policy for one S2b-U link.
 ///
 /// The default is fail closed: an over-MTU encapsulation is rejected with
-/// typed PMTU guidance rather than silently fragmented or leaked.
+/// typed PMTU guidance rather than silently emitted.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum GtpuOuterFragmentPolicy {
     /// Reject over-MTU inner packets with typed Packet-Too-Big guidance. The
     /// DF bit is stamped on every emitted outer IPv4 header so downstream
     /// links report, rather than silently absorb, any residual MTU mismatch.
+    ///
+    /// On the eBPF tc backend this outcome is a silent, counted drop: the
+    /// kernel datapath emits no ICMP itself, so the operator must size the
+    /// inner MTU out of band (e.g. MSS clamping) or run a host component
+    /// that consumes the typed signal (see `opc-gtpu-dataplane`'s PTB
+    /// generation helper).
     #[default]
     SignalPacketTooBig,
-    /// Permit outer IPv4 fragmentation when the encapsulated packet exceeds
-    /// the effective link MTU. The DF bit stays clear so the egress stack and
-    /// downstream routers fragment the outer packet; the inner packet is
-    /// never fragmented by this datapath.
+    /// Emit over-MTU encapsulations with DF clear, relying on a downstream
+    /// hop to fragment the outer IPv4 packet. The ePDG egress never
+    /// fragments: the tc uplink program transmits via `bpf_redirect_neigh`,
+    /// which bypasses the kernel's `ip_fragment` path, so the oversized
+    /// frame leaves whole. This policy is safe only when the configured
+    /// effective MTU is below the egress device's real MTU (so the emitted
+    /// frame fits the device) *and* a downstream fragmenting hop exists;
+    /// otherwise oversized frames risk silent drops by drivers or MRU-limited
+    /// receivers. The inner packet is never fragmented by this datapath.
     FragmentOuter,
 }
 
@@ -189,6 +201,10 @@ pub enum GtpuPmtuProtocol {
 /// ICMPv4 type for Destination Unreachable.
 pub const ICMPV4_TYPE_DESTINATION_UNREACHABLE: u8 = 3;
 /// ICMPv4 code for "fragmentation needed and DF set" (RFC 792, RFC 1191).
+///
+/// This tunnel never fragments inner packets, so the signal is generated for
+/// any over-MTU inner packet regardless of the inner packet's own DF bit —
+/// the inner DF constraint is satisfied vacuously.
 pub const ICMPV4_CODE_FRAGMENTATION_NEEDED_DF_SET: u8 = 4;
 /// ICMPv6 type for Packet Too Big (RFC 8200 section 5).
 pub const ICMPV6_TYPE_PACKET_TOO_BIG: u8 = 2;
@@ -240,10 +256,10 @@ impl GtpuPmtuSignal {
 
 /// Typed outcome of one uplink encapsulation attempt under an MTU policy.
 ///
-/// Variants carry only redaction-safe bounded metadata: the fixed
-/// encapsulation bytes, lengths, and protocol constants. No address, TEID, or
-/// payload byte is retained.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The `encap` bytes in the emit variants contain the outer addresses and
+/// TEID, so `Debug` redacts them exactly like the other wire-carrying types
+/// in this crate; only bounded lengths and protocol constants are shown.
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum UplinkEncapOutcome {
     /// The encapsulated packet fits the effective link MTU; emit it.
     Emit {
@@ -254,9 +270,10 @@ pub enum UplinkEncapOutcome {
         headroom: u16,
     },
     /// The encapsulated packet exceeds the effective link MTU and the policy
-    /// permits outer fragmentation; emit it with DF clear so the egress
-    /// stack fragments the outer packet. The inner packet is delivered
-    /// unfragmented inside one G-PDU.
+    /// permits downstream outer fragmentation; emit it with DF clear. The
+    /// ePDG egress never fragments itself (see
+    /// [`GtpuOuterFragmentPolicy::FragmentOuter`]); the inner packet is
+    /// delivered unfragmented inside one G-PDU.
     EmitOuterFragmented {
         /// Exact encapsulation bytes to prepend (DF clear).
         encap: [u8; GTPU_ENCAP_LEN],
@@ -264,8 +281,9 @@ pub enum UplinkEncapOutcome {
         excess: u16,
     },
     /// Fail-closed rejection: nothing is emitted and the inner packet is
-    /// never leaked unencapsulated. The caller generates the typed
-    /// Packet-Too-Big signal toward the inner source.
+    /// never leaked unencapsulated. On the eBPF tc backend this is a silent,
+    /// counted drop; a host caller generates the typed Packet-Too-Big signal
+    /// toward the inner source.
     RejectTooBig {
         /// ICMP guidance toward the inner source.
         signal: GtpuPmtuSignal,
@@ -274,6 +292,33 @@ pub enum UplinkEncapOutcome {
         /// Encapsulated total length that exceeded the effective link MTU.
         attempted_total: u32,
     },
+}
+
+impl core::fmt::Debug for UplinkEncapOutcome {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Emit { headroom, .. } => f
+                .debug_struct("Emit")
+                .field("encap", &"<redacted>")
+                .field("headroom", headroom)
+                .finish(),
+            Self::EmitOuterFragmented { excess, .. } => f
+                .debug_struct("EmitOuterFragmented")
+                .field("encap", &"<redacted>")
+                .field("excess", excess)
+                .finish(),
+            Self::RejectTooBig {
+                signal,
+                encap_overhead,
+                attempted_total,
+            } => f
+                .debug_struct("RejectTooBig")
+                .field("signal", signal)
+                .field("encap_overhead", encap_overhead)
+                .field("attempted_total", attempted_total)
+                .finish(),
+        }
+    }
 }
 
 /// Stamp the IPv4 DF bit on a built encapsulation and refresh the outer
@@ -651,19 +696,46 @@ mod tests {
     }
 
     #[test]
-    fn outcome_carries_only_bounded_redaction_safe_metadata() {
-        let debug = format!(
-            "{:?}",
-            decide_uplink_encap(
-                &far(),
-                1480,
-                None,
-                crate::GTPU_UDP_PORT,
-                strict_policy(1500),
-                GtpuPmtuProtocol::Icmpv4,
-            )
-        );
-        assert!(!debug.contains("192"));
-        assert!(!debug.contains("536870912"));
+    fn outcome_debug_redacts_encap_bytes_in_every_variant() {
+        let emit = decide_uplink_encap(
+            &far(),
+            1400,
+            Some(46),
+            40_000,
+            strict_policy(1500),
+            GtpuPmtuProtocol::Icmpv4,
+        )
+        .unwrap();
+        let fragmented = decide_uplink_encap(
+            &far(),
+            1480,
+            None,
+            40_000,
+            GtpuUplinkMtuPolicy::new(1500, GtpuOuterFragmentPolicy::FragmentOuter).unwrap(),
+            GtpuPmtuProtocol::Icmpv4,
+        )
+        .unwrap();
+        let rejected = decide_uplink_encap(
+            &far(),
+            1480,
+            None,
+            crate::GTPU_UDP_PORT,
+            strict_policy(1500),
+            GtpuPmtuProtocol::Icmpv4,
+        )
+        .unwrap();
+        for outcome in [emit, fragmented, rejected] {
+            let debug = format!("{outcome:?}");
+            // The outer addresses, TEID, and selected port live in the encap
+            // bytes and must never appear in diagnostics.
+            for forbidden in ["192", "32, 0, 0, 1", "40000", "0x20"] {
+                assert!(!debug.contains(forbidden), "leaked {forbidden} in {debug}");
+            }
+        }
+        let emit_debug = format!("{emit:?}");
+        assert!(emit_debug.contains("<redacted>"));
+        assert!(emit_debug.contains("headroom"));
+        let rejected_debug = format!("{rejected:?}");
+        assert!(rejected_debug.contains("Icmpv4FragmentationNeeded"));
     }
 }

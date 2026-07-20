@@ -56,7 +56,8 @@ use opc_gtpu_ebpf_common::{
     COUNTER_DL_BINDING_INVALID, COUNTER_DL_BINDING_LOCAL_MISMATCH,
     COUNTER_DL_BINDING_PEER_MISMATCH, COUNTER_DL_BINDING_SOURCE_PORT_MISMATCH, COUNTER_DL_DECAP,
     COUNTER_DL_DST_MISMATCH, COUNTER_DL_MALFORMED, COUNTER_DL_UNKNOWN_TEID, COUNTER_SLOTS,
-    COUNTER_UL_ENCAP, COUNTER_UL_FAR_MISS, COUNTER_UL_MTU_REJECT, DOWNLINK_BINDING_COUNTER_SLOTS,
+    COUNTER_UL_ENCAP, COUNTER_UL_FAR_MISS, COUNTER_UL_MTU_REJECT, COUNTER_UL_PMTU_CORRUPT,
+    DOWNLINK_BINDING_COUNTER_SLOTS,
     DOWNLINK_ENDPOINT_BINDING_VALUE_LEN, DOWNLINK_PDR_VALUE_LEN, ETH_HDR_LEN, ETH_P_IPV4,
     GTPU_MANDATORY_HDR_LEN, GTPU_MAX_EXT_HEADERS, GTPU_OPT_LEN, GTPU_UDP_PORT,
     MARKED_BEARER_OWNER_VALUE_LEN, MARKED_DOWNLINK_PDR_VALUE_LEN, UPLINK_DSCP_SCHEMA_MARKER_KEY,
@@ -155,8 +156,8 @@ fn count_binding_drop(index: u32) {
 }
 
 #[inline(always)]
-fn count_pmtu_drop() {
-    if let Some(counter) = GTPU_PMTU_DROP.get_ptr_mut(COUNTER_UL_MTU_REJECT) {
+fn count_pmtu_drop(index: u32) {
+    if let Some(counter) = GTPU_PMTU_DROP.get_ptr_mut(index) {
         // SAFETY: per-CPU slot; no concurrent access on the same CPU.
         unsafe { *counter += 1 };
     }
@@ -386,13 +387,17 @@ fn try_uplink(ctx: &mut TcContext, mark: u32) -> Result<i32, ()> {
         .ok_or(())?;
     let mut encap = encap;
     if let Some(pmtu_ptr) = GTPU_PMTU_CFG.get_ptr(0) {
-        // SAFETY: single-slot array value written only by the loader.
-        match GtpuUplinkMtuPolicy::decode_map_value(unsafe { &*pmtu_ptr }) {
+        // SAFETY: single-slot array value written only by the loader before
+        // the device is managed. One aligned four-byte load cannot observe a
+        // torn policy word.
+        let policy_bytes = unsafe { (pmtu_ptr as *const u32).read_unaligned() }.to_ne_bytes();
+        match GtpuUplinkMtuPolicy::decode_map_value(&policy_bytes) {
             UplinkMtuMapState::Unset => {}
             UplinkMtuMapState::Corrupt => {
                 // Corrupt adopted policy state must drop rather than emit an
-                // unchecked encapsulation.
-                count_pmtu_drop();
+                // unchecked encapsulation. This counter is a canary for
+                // external writers and never moves in normal operation.
+                count_pmtu_drop(COUNTER_UL_PMTU_CORRUPT);
                 return Ok(TC_ACT_SHOT as i32);
             }
             UplinkMtuMapState::Configured(policy) => {
@@ -400,7 +405,7 @@ fn try_uplink(ctx: &mut TcContext, mark: u32) -> Result<i32, ()> {
                     // Fail closed: the over-MTU inner packet is never emitted
                     // unencapsulated and the encapsulation never silently
                     // exceeds the effective link MTU.
-                    count_pmtu_drop();
+                    count_pmtu_drop(COUNTER_UL_MTU_REJECT);
                     return Ok(TC_ACT_SHOT as i32);
                 }
             }

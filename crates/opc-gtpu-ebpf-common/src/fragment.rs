@@ -5,22 +5,28 @@
 //! unchanged (`TC_ACT_OK`). The kernel reassembles them under its bounded
 //! `ipfrag` accounting and delivers exactly one complete UDP/2152 datagram to
 //! the SDK consumer bound on the local S2b-U endpoint. That consumer feeds
-//! the datagram back into the same PDR/binding/decapsulation semantics as the
-//! tc fast path; [`parse_gtpu_tpdu`] is the shared wire parser for that
-//! re-entry point. The SDK never holds a userspace fragment cache, so
-//! reassembly memory and time stay bounded by the kernel's configured
-//! limits and are reported through the backend capability surface.
+//! the datagram back into the SDK's PDR/binding/decapsulation path;
+//! [`parse_gtpu_tpdu`] is the host-side parser for that re-entry point. It
+//! deliberately mirrors the tc program's inline mandatory-header, optional
+//! block, and bounded extension walk; the two implementations must be kept in
+//! lockstep (the privileged end-to-end test exercises both paths over the
+//! same datagrams to pin them against drift). The SDK never holds a userspace
+//! fragment cache, so reassembly memory and time stay bounded by the kernel's
+//! configured limits and are reported through the backend capability surface.
 
 use crate::{classify_gtpu, GtpuClass, GTPU_MANDATORY_HDR_LEN, GTPU_MAX_EXT_HEADERS, GTPU_OPT_LEN};
 
 /// Explicit downlink outer-fragment handling contract of a GTP-U backend.
 ///
-/// `KernelReassemblyHandoff` is the complete contract for fragmented outer
-/// packets: the datapath passes every outer fragment to the kernel stack,
-/// the kernel reassembles under bounded `net.ipv4.ipfrag_*` resources, and
-/// exactly one reassembled GTP-U datagram re-enters the SDK consumer, which
-/// applies the identical PDR/binding/decapsulation path as unfragmented
-/// traffic. A backend that cannot demonstrate that re-entry must report
+/// `KernelReassemblyHandoff` is the handoff-capable contract for fragmented
+/// outer packets: the datapath passes every outer fragment to the kernel
+/// stack, the kernel reassembles under bounded `net.ipv4.ipfrag_*` resources,
+/// and exactly one reassembled GTP-U datagram is delivered to a UDP/2152
+/// socket bound on the *concrete* local S2b-U address (never `0.0.0.0`). The
+/// contract is only complete when the operator actually runs an SDK consumer
+/// on that socket: without one, the kernel answers each fragment set with
+/// ICMP port unreachable and the packet is lost. A backend that cannot
+/// demonstrate that re-entry must report
 /// [`GtpuDownlinkFragmentContract::Unsupported`] rather than silently
 /// dropping or ignoring fragments.
 #[non_exhaustive]
@@ -30,11 +36,13 @@ pub enum GtpuDownlinkFragmentContract {
     #[default]
     Unsupported,
     /// Fragments are handed to the kernel for bounded reassembly and the
-    /// reassembled datagram demonstrably re-enters the SDK GTP-U consumer
-    /// exactly once.
+    /// reassembled datagram demonstrably re-enters an SDK GTP-U consumer
+    /// exactly once, provided the operator runs that consumer.
     KernelReassemblyHandoff {
-        /// Bounded reassembly resource statement in force.
-        bounds: GtpuReassemblyBounds,
+        /// Live bounded reassembly resource statement, or `None` when the
+        /// kernel's configured limits could not be read. The bounds are
+        /// never fabricated from defaults.
+        bounds: Option<GtpuReassemblyBounds>,
     },
 }
 
@@ -55,8 +63,9 @@ pub struct GtpuReassemblyBounds {
 }
 
 /// Linux default reassembly bounds (`net.ipv4.ipfrag_high_thresh` = 4 MiB,
-/// `net.ipv4.ipfrag_time` = 30 s), used when the backend cannot read the
-/// live sysctl values.
+/// `net.ipv4.ipfrag_time` = 30 s), documented for operators. Backends must
+/// read the live sysctls for capability reporting and report absent bounds
+/// rather than falling back to these values.
 pub const LINUX_DEFAULT_REASSEMBLY_BOUNDS: GtpuReassemblyBounds = GtpuReassemblyBounds {
     max_inflight_bytes: 4 * 1024 * 1024,
     timeout_seconds: 30,
@@ -306,11 +315,12 @@ mod tests {
     #[test]
     fn reassembly_bounds_and_contract_are_bounded_and_copyable() {
         let contract = GtpuDownlinkFragmentContract::KernelReassemblyHandoff {
-            bounds: LINUX_DEFAULT_REASSEMBLY_BOUNDS,
+            bounds: Some(LINUX_DEFAULT_REASSEMBLY_BOUNDS),
         };
         let GtpuDownlinkFragmentContract::KernelReassemblyHandoff { bounds } = contract else {
             panic!("expected handoff contract");
         };
+        let bounds = bounds.expect("live bounds");
         assert_eq!(bounds.max_inflight_bytes, 4 * 1024 * 1024);
         assert_eq!(bounds.timeout_seconds, 30);
         assert_eq!(MAX_REASSEMBLED_GTPU_LEN, 65507);
