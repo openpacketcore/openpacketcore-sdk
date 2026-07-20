@@ -4,6 +4,11 @@
 
 //! GTP-U protocol crate for OpenPacketCore.
 //!
+//! In addition to the zero-copy G-PDU framing surface, the crate exposes
+//! typed TS 29.281 path/tunnel-management codecs through
+//! [`GtpuControlMessage`]. Transport tuples, peer admission, rate limiting,
+//! tunnel policy, and dataplane integration remain outside this codec.
+//!
 //! @spec 3GPP TS29281 R18 5.1
 //! @req REQ-3GPP-TS29281-R18-5.1-001
 //! @conformance full
@@ -15,6 +20,17 @@ use opc_protocol::{
     BorrowDecode, DecodeContext, DecodeError, DecodeErrorCode, DecodeResult, Encode, EncodeContext,
     EncodeError, EncodeErrorCode, OwnedDecode, SpecRef, ToOwnedPdu, UnknownIePolicy,
     ValidationLevel,
+};
+
+mod control;
+
+pub use control::{
+    GtpuControlCodecError, GtpuControlCodecErrorCode, GtpuControlMessage, GtpuEchoRequest,
+    GtpuEchoResponse, GtpuEndMarker, GtpuErrorIndication, GtpuExtensionHeaderTypeList,
+    GtpuPeerAddress, GtpuPrivateExtension, GtpuRecovery, GtpuRecoveryTimeStamp,
+    GtpuSupportedExtensionHeadersNotification, GtpuTunnelEndpointId, GtpuUnknownControlIe,
+    GTPU_MESSAGE_ECHO_REQUEST, GTPU_MESSAGE_ECHO_RESPONSE, GTPU_MESSAGE_END_MARKER,
+    GTPU_MESSAGE_ERROR_INDICATION, GTPU_MESSAGE_SUPPORTED_EXTENSION_HEADERS_NOTIFICATION,
 };
 
 fn validation_strictness(level: ValidationLevel) -> u8 {
@@ -29,6 +45,134 @@ fn validation_strictness(level: ValidationLevel) -> u8 {
 /// GTP-U extension header type for the 5G PDU Session Container.
 pub const GTPU_EXT_PDU_SESSION_CONTAINER: u8 = 0x85;
 
+/// GTP-U extension header type carrying the triggering UDP source port.
+pub const GTPU_EXT_UDP_PORT: u8 = 0x40;
+
+/// GTP-U short PDCP PDU Number extension-header type.
+pub const GTPU_EXT_PDCP_PDU_NUMBER: u8 = 0xc0;
+
+/// Recipient role used to interpret extension-header comprehension bits.
+///
+/// @spec 3GPP TS29281 R18 5.2.1
+/// @req REQ-3GPP-TS29281-R18-5.2.1-009
+/// @conformance full
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GtpuExtensionHeaderRecipient {
+    /// The ultimate receiver of the GTP-PDU.
+    Endpoint,
+    /// A GTP-U node forwarding toward another receiver endpoint.
+    Intermediate,
+    /// An SGW receiving a G-PDU, for which TS 29.281 defines the type `0xc0`
+    /// comprehension exception.
+    ServingGatewayReceivingGpdu,
+}
+
+/// Comprehension class encoded in bits 8 and 7 of an extension-header type.
+///
+/// @spec 3GPP TS29281 R18 5.2.1
+/// @req REQ-3GPP-TS29281-R18-5.2.1-010
+/// @conformance full
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GtpuExtensionHeaderComprehension {
+    /// No recipient needs to understand the content; intermediates forward it.
+    NotRequiredForward,
+    /// Comprehension is optional and intermediates remove this header's content.
+    NotRequiredDiscardByIntermediate,
+    /// The endpoint must understand the content; intermediates forward it.
+    RequiredByEndpoint,
+    /// Every recipient, including an intermediate, must understand the content.
+    RequiredByRecipient,
+}
+
+impl GtpuExtensionHeaderComprehension {
+    /// Return whether an unknown header in this class requires comprehension
+    /// by `recipient`.
+    ///
+    /// This class-only helper cannot apply type-specific exceptions. Use
+    /// [`GtpuExtensionHeaderType::unsupported_requires_comprehension_by`] for
+    /// a complete wire decision, including the SGW/G-PDU type `0xc0` rule.
+    #[must_use]
+    pub const fn is_required_by(self, recipient: GtpuExtensionHeaderRecipient) -> bool {
+        match (self, recipient) {
+            (Self::NotRequiredForward | Self::NotRequiredDiscardByIntermediate, _) => false,
+            (Self::RequiredByEndpoint, GtpuExtensionHeaderRecipient::Endpoint) => true,
+            (
+                Self::RequiredByEndpoint,
+                GtpuExtensionHeaderRecipient::Intermediate
+                | GtpuExtensionHeaderRecipient::ServingGatewayReceivingGpdu,
+            ) => false,
+            (Self::RequiredByRecipient, _) => true,
+        }
+    }
+
+    /// Return whether an intermediate must remove an unknown header's content
+    /// while continuing to process the remaining chain.
+    #[must_use]
+    pub const fn intermediate_discards_content(self) -> bool {
+        matches!(self, Self::NotRequiredDiscardByIntermediate)
+    }
+}
+
+/// Typed GTP-U extension-header type with comprehension-bit helpers.
+///
+/// The value is protocol metadata rather than subscriber data and is safe to
+/// expose in diagnostics.
+///
+/// @spec 3GPP TS29281 R18 5.2.1
+/// @req REQ-3GPP-TS29281-R18-5.2.1-011
+/// @conformance full
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GtpuExtensionHeaderType(u8);
+
+impl GtpuExtensionHeaderType {
+    /// Construct a typed extension-header identifier.
+    #[must_use]
+    pub const fn new(value: u8) -> Self {
+        Self(value)
+    }
+
+    /// Return the on-wire identifier.
+    #[must_use]
+    pub const fn value(self) -> u8 {
+        self.0
+    }
+
+    /// Decode the two most-significant comprehension bits.
+    #[must_use]
+    pub const fn comprehension(self) -> GtpuExtensionHeaderComprehension {
+        match self.0 >> 6 {
+            0 => GtpuExtensionHeaderComprehension::NotRequiredForward,
+            1 => GtpuExtensionHeaderComprehension::NotRequiredDiscardByIntermediate,
+            2 => GtpuExtensionHeaderComprehension::RequiredByEndpoint,
+            _ => GtpuExtensionHeaderComprehension::RequiredByRecipient,
+        }
+    }
+
+    /// Return whether this crate has a typed decoder for the extension.
+    #[must_use]
+    pub const fn is_supported_by_codec(self) -> bool {
+        matches!(self.0, GTPU_EXT_UDP_PORT | GTPU_EXT_PDU_SESSION_CONTAINER)
+    }
+
+    /// Return whether an unsupported header requires comprehension by the
+    /// supplied recipient role.
+    #[must_use]
+    pub const fn unsupported_requires_comprehension_by(
+        self,
+        recipient: GtpuExtensionHeaderRecipient,
+    ) -> bool {
+        if self.0 == GTPU_EXT_PDCP_PDU_NUMBER
+            && matches!(
+                recipient,
+                GtpuExtensionHeaderRecipient::ServingGatewayReceivingGpdu
+            )
+        {
+            return false;
+        }
+        !self.is_supported_by_codec() && self.comprehension().is_required_by(recipient)
+    }
+}
+
 /// GTP-U Header fields (TS 29.281 Section 5.1).
 ///
 /// @spec 3GPP TS29281 R18 5.1
@@ -40,7 +184,8 @@ pub struct GtpuHeader {
     pub version: u8,
     /// Protocol type flag (must be true for GTP).
     pub protocol_type: bool,
-    /// Reserved bit (must be 0 in strict mode).
+    /// Spare bit. Generic strict validation requires zero; typed control
+    /// network receive ignores the received value as TS 29.281 requires.
     pub reserved: u8,
     /// Extension header flag.
     pub ext_hdr_flag: bool,
@@ -58,7 +203,7 @@ pub struct GtpuHeader {
     pub sequence_number: Option<u16>,
     /// Parsed N-PDU number, if present.
     pub npdu_number: Option<u8>,
-    /// Type of the next extension header, if any.
+    /// Type of the next extension header when the E flag makes it meaningful.
     pub next_ext_type: Option<u8>,
     /// Raw sequence number before flag interpretation.
     pub raw_sequence_number: Option<u16>,
@@ -92,8 +237,31 @@ impl<'a> GtpuMessage<'a> {
     pub fn extensions(&self) -> GtpuExtensionHeaderIterator<'a> {
         GtpuExtensionHeaderIterator::new(
             self.raw_extension_headers,
-            self.header.next_ext_type.unwrap_or(0),
+            self.header
+                .ext_hdr_flag
+                .then_some(self.header.next_ext_type)
+                .flatten()
+                .unwrap_or(0),
         )
+    }
+
+    /// Return the first unsupported extension that requires comprehension by
+    /// `recipient`.
+    ///
+    /// The scan is allocation-free. A caller acting as an endpoint must not
+    /// decapsulate a message when this returns `Some`; request/G-PDU handling
+    /// can use the type to plan a bounded Supported Extension Headers
+    /// Notification outside this codec.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DecodeError`] if the retained raw extension chain is
+    /// structurally malformed.
+    pub fn first_unsupported_required_extension(
+        &self,
+        recipient: GtpuExtensionHeaderRecipient,
+    ) -> Result<Option<GtpuExtensionHeaderType>, DecodeError> {
+        first_unsupported_required_extension(self.extensions(), recipient)
     }
 }
 
@@ -121,9 +289,56 @@ impl OwnedGtpuMessage {
     pub fn extensions(&self) -> GtpuExtensionHeaderIterator<'_> {
         GtpuExtensionHeaderIterator::new(
             &self.raw_extension_headers,
-            self.header.next_ext_type.unwrap_or(0),
+            self.header
+                .ext_hdr_flag
+                .then_some(self.header.next_ext_type)
+                .flatten()
+                .unwrap_or(0),
         )
     }
+
+    /// Return the first unsupported extension that requires comprehension by
+    /// `recipient` without allocating.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DecodeError`] if the retained raw extension chain is
+    /// structurally malformed.
+    pub fn first_unsupported_required_extension(
+        &self,
+        recipient: GtpuExtensionHeaderRecipient,
+    ) -> Result<Option<GtpuExtensionHeaderType>, DecodeError> {
+        first_unsupported_required_extension(self.extensions(), recipient)
+    }
+}
+
+fn first_unsupported_required_extension<'a>(
+    mut extensions: GtpuExtensionHeaderIterator<'a>,
+    recipient: GtpuExtensionHeaderRecipient,
+) -> Result<Option<GtpuExtensionHeaderType>, DecodeError> {
+    let raw_len = extensions.buffer.len();
+    let mut first_unsupported = None;
+    for extension in extensions.by_ref() {
+        let extension = extension?;
+        let extension_type = GtpuExtensionHeaderType::new(extension.ext_type);
+        if first_unsupported.is_none()
+            && extension_type.unsupported_requires_comprehension_by(recipient)
+        {
+            first_unsupported = Some(extension_type);
+        }
+    }
+
+    if !extensions.buffer.is_empty() {
+        let consumed = raw_len.saturating_sub(extensions.buffer.len());
+        return Err(DecodeError::new(
+            DecodeErrorCode::Structural {
+                reason: "bytes remain after terminal extension header",
+            },
+            consumed,
+        ));
+    }
+
+    Ok(first_unsupported)
 }
 
 /// GTP-U Extension Header representing a single extension header.
@@ -215,11 +430,130 @@ impl<'a> Iterator for GtpuExtensionHeaderIterator<'a> {
     }
 }
 
-/// 5G PDU Session Container (QoS Flow Identifier) extension header.
+/// Stable, redaction-safe PDU Session Container boundary failure.
+///
+/// The variants describe either malformed received content or an invalid
+/// caller-constructed model. They contain no packet values.
+///
+/// @spec 3GPP TS29281 R18 5.2.2.7
+/// @req REQ-3GPP-TS29281-R18-5.2.2.7-004
+/// @conformance qfi-ppi-rqi-subset
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PduSessionContainerError {
+    /// The extension-header type was not the PDU Session Container type.
+    InvalidExtensionType,
+    /// The content ended before the supported base fields were complete.
+    Truncated,
+    /// The content width was not valid for a four-octet extension header.
+    Misaligned,
+    /// The PDU type was outside the supported downlink/uplink values.
+    ReservedPduType,
+    /// A downlink QMP, SNP, or MSNP conditional-field flag was present.
+    UnsupportedDownlinkConditionalFields,
+    /// The PPP flag was set without a Paging Policy Indicator octet.
+    MissingPagingPolicyIndicator,
+    /// Extra downlink fields outside the QFI/PPI/RQI subset were present.
+    UnsupportedDownlinkExtensionFields,
+    /// An uplink conditional-field flag was present.
+    UnsupportedUplinkConditionalFields,
+    /// Extra uplink fields outside the QFI-only subset were present.
+    UnsupportedUplinkExtensionFields,
+    /// A caller-supplied QFI exceeded its six-bit field.
+    QfiOutOfRange,
+    /// A caller-supplied PPI exceeded its three-bit field.
+    PpiOutOfRange,
+    /// A caller supplied a downlink-only PPI on an uplink model.
+    UplinkPagingPolicyIndicator,
+    /// A caller set the downlink-only RQI on an uplink model.
+    UplinkReflectiveQosIndicator,
+}
+
+impl PduSessionContainerError {
+    /// Stable machine-readable reason code.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidExtensionType => "gtpu_pdu_session_container_invalid_extension_type",
+            Self::Truncated => "gtpu_pdu_session_container_truncated",
+            Self::Misaligned => "gtpu_pdu_session_container_misaligned",
+            Self::ReservedPduType => "gtpu_pdu_session_container_reserved_pdu_type",
+            Self::UnsupportedDownlinkConditionalFields => {
+                "gtpu_pdu_session_container_unsupported_downlink_conditionals"
+            }
+            Self::MissingPagingPolicyIndicator => {
+                "gtpu_pdu_session_container_missing_paging_policy_indicator"
+            }
+            Self::UnsupportedDownlinkExtensionFields => {
+                "gtpu_pdu_session_container_unsupported_downlink_fields"
+            }
+            Self::UnsupportedUplinkConditionalFields => {
+                "gtpu_pdu_session_container_unsupported_uplink_conditionals"
+            }
+            Self::UnsupportedUplinkExtensionFields => {
+                "gtpu_pdu_session_container_unsupported_uplink_fields"
+            }
+            Self::QfiOutOfRange => "gtpu_pdu_session_container_qfi_out_of_range",
+            Self::PpiOutOfRange => "gtpu_pdu_session_container_ppi_out_of_range",
+            Self::UplinkPagingPolicyIndicator => {
+                "gtpu_pdu_session_container_uplink_paging_policy_indicator"
+            }
+            Self::UplinkReflectiveQosIndicator => {
+                "gtpu_pdu_session_container_uplink_reflective_qos_indicator"
+            }
+        }
+    }
+
+    const fn decode_reason(self) -> &'static str {
+        match self {
+            Self::InvalidExtensionType => "extension type is not PDU Session Container",
+            Self::Truncated => "PDU Session Container is truncated",
+            Self::Misaligned => "PDU Session Container is not extension-header aligned",
+            Self::ReservedPduType => "reserved PDU Session Container type",
+            Self::UnsupportedDownlinkConditionalFields => {
+                "DL PDU Session Container uses unsupported QMP/SNP/MSNP fields"
+            }
+            Self::MissingPagingPolicyIndicator => {
+                "Paging Policy Indicator missing despite PPP flag"
+            }
+            Self::UnsupportedDownlinkExtensionFields => {
+                "unsupported DL PDU Session Container extension fields"
+            }
+            Self::UnsupportedUplinkConditionalFields => {
+                "UL PDU Session Container uses unsupported conditional fields"
+            }
+            Self::UnsupportedUplinkExtensionFields => {
+                "unsupported UL PDU Session Container extension fields"
+            }
+            Self::QfiOutOfRange => "PDU Session Container QFI exceeds six bits",
+            Self::PpiOutOfRange => "PDU Session Container PPI exceeds three bits",
+            Self::UplinkPagingPolicyIndicator => {
+                "UL PDU Session Container cannot carry Paging Policy Indicator"
+            }
+            Self::UplinkReflectiveQosIndicator => {
+                "UL PDU Session Container cannot carry Reflective QoS Indicator"
+            }
+        }
+    }
+}
+
+impl fmt::Display for PduSessionContainerError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl Error for PduSessionContainerError {}
+
+/// Supported base subset of the 5G PDU Session Container extension header.
+///
+/// This model covers QFI for DL/UL frames plus DL PPI and RQI. Release 18
+/// containers whose presence flags require QoS-monitoring timestamps, QFI or
+/// MBS sequence numbers, delay results, or future-extension fields are rejected
+/// rather than partially decoded into this smaller model.
 ///
 /// @spec 3GPP TS29281 R18 5.2.2.7
 /// @req REQ-3GPP-TS29281-R18-5.2.2.7-001
-/// @conformance full
+/// @conformance qfi-ppi-rqi-subset
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PduSessionContainer {
     /// PDU type: 0 = DL, 1 = UL.
@@ -233,49 +567,158 @@ pub struct PduSessionContainer {
 }
 
 impl PduSessionContainer {
-    /// Decode a PduSessionContainer from a GtpuExtensionHeader.
+    /// Construct a validated downlink QFI/PPI/RQI container.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PduSessionContainerError::QfiOutOfRange`] or
+    /// [`PduSessionContainerError::PpiOutOfRange`] when a field cannot be
+    /// represented without truncation.
+    pub fn new_downlink(
+        qfi: u8,
+        ppi: Option<u8>,
+        rqi: bool,
+    ) -> Result<Self, PduSessionContainerError> {
+        let value = Self {
+            pdu_type: 0,
+            qfi,
+            ppi,
+            rqi,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    /// Construct a validated uplink QFI-only container.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PduSessionContainerError::QfiOutOfRange`] when `qfi` cannot
+    /// be represented without truncation.
+    pub fn new_uplink(qfi: u8) -> Result<Self, PduSessionContainerError> {
+        let value = Self {
+            pdu_type: 1,
+            qfi,
+            ppi: None,
+            rqi: false,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    /// Validate a directly constructed model before it reaches the wire.
+    ///
+    /// Direct struct construction remains available for source compatibility,
+    /// but [`Self::encode`] and all typed builders call this boundary and fail
+    /// closed rather than masking fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable reason when the PDU type, QFI, PPI, or direction-
+    /// specific field combination is not representable by this subset.
+    pub fn validate(&self) -> Result<(), PduSessionContainerError> {
+        match self.pdu_type {
+            0 => {
+                if self.qfi > 0x3f {
+                    return Err(PduSessionContainerError::QfiOutOfRange);
+                }
+                if self.ppi.is_some_and(|ppi| ppi > 0x07) {
+                    return Err(PduSessionContainerError::PpiOutOfRange);
+                }
+            }
+            1 => {
+                if self.qfi > 0x3f {
+                    return Err(PduSessionContainerError::QfiOutOfRange);
+                }
+                if self.ppi.is_some() {
+                    return Err(PduSessionContainerError::UplinkPagingPolicyIndicator);
+                }
+                if self.rqi {
+                    return Err(PduSessionContainerError::UplinkReflectiveQosIndicator);
+                }
+            }
+            _ => return Err(PduSessionContainerError::ReservedPduType),
+        }
+        Ok(())
+    }
+
+    /// Decode the supported base PDU Session Container subset.
+    ///
+    /// Reserved PDU types and any presence flag for an unmodelled conditional
+    /// field fail closed. This prevents callers from treating a partially
+    /// decoded QoS-monitoring or sequence-number container as complete.
     ///
     /// @spec 3GPP TS29281 R18 5.2.2.7
     /// @req REQ-3GPP-TS29281-R18-5.2.2.7-002
-    /// @conformance full
+    /// @conformance qfi-ppi-rqi-subset
     pub fn decode(ext: &GtpuExtensionHeader<'_>) -> Result<Self, DecodeError> {
         let spec_ref = SpecRef::new("3gpp", "TS29281", "5.2.2.7");
-        if ext.ext_type != GTPU_EXT_PDU_SESSION_CONTAINER {
-            return Err(DecodeError::new(
+        Self::decode_with_reason(ext).map_err(|(reason, offset)| {
+            let code = if reason == PduSessionContainerError::Truncated {
+                DecodeErrorCode::Truncated
+            } else {
                 DecodeErrorCode::Structural {
-                    reason: "extension type is not PDU Session Container",
-                },
-                0,
-            )
-            .with_spec_ref(spec_ref));
+                    reason: reason.decode_reason(),
+                }
+            };
+            DecodeError::new(code, offset).with_spec_ref(spec_ref)
+        })
+    }
+
+    pub(crate) fn decode_with_reason(
+        ext: &GtpuExtensionHeader<'_>,
+    ) -> Result<Self, (PduSessionContainerError, usize)> {
+        if ext.ext_type != GTPU_EXT_PDU_SESSION_CONTAINER {
+            return Err((PduSessionContainerError::InvalidExtensionType, 0));
         }
 
         let content = ext.content;
         if content.is_empty() {
-            return Err(DecodeError::new(DecodeErrorCode::Truncated, 0).with_spec_ref(spec_ref));
+            return Err((PduSessionContainerError::Truncated, 0));
+        }
+        if content
+            .len()
+            .checked_add(2)
+            .is_none_or(|total| total % 4 != 0)
+        {
+            return Err((PduSessionContainerError::Misaligned, 0));
         }
 
         let pdu_type = (content[0] >> 4) & 0x0F;
         if pdu_type == 0 {
             // DL PDU Session Information
             if content.len() < 2 {
-                return Err(DecodeError::new(DecodeErrorCode::Truncated, 1).with_spec_ref(spec_ref));
+                return Err((PduSessionContainerError::Truncated, 1));
             }
+            let has_unmodelled_conditionals = (content[0] & 0x0e) != 0;
+            if has_unmodelled_conditionals {
+                return Err((
+                    PduSessionContainerError::UnsupportedDownlinkConditionalFields,
+                    0,
+                ));
+            }
+
             let ppp = (content[1] & 0x80) != 0;
             let rqi = (content[1] & 0x40) != 0;
             let qfi = content[1] & 0x3F;
             let ppi = if ppp {
                 if content.len() < 3 {
-                    return Err(DecodeError::new(
-                        DecodeErrorCode::Structural {
-                            reason: "Paging Policy Indicator missing despite PPP flag",
-                        },
-                        1,
-                    )
-                    .with_spec_ref(spec_ref));
+                    return Err((PduSessionContainerError::MissingPagingPolicyIndicator, 1));
+                }
+                if content.len() != 6 {
+                    return Err((
+                        PduSessionContainerError::UnsupportedDownlinkExtensionFields,
+                        3,
+                    ));
                 }
                 Some(content[2] & 0x07)
             } else {
+                if content.len() != 2 {
+                    return Err((
+                        PduSessionContainerError::UnsupportedDownlinkExtensionFields,
+                        2,
+                    ));
+                }
                 None
             };
             Ok(Self {
@@ -287,7 +730,19 @@ impl PduSessionContainer {
         } else if pdu_type == 1 {
             // UL PDU Session Information
             if content.len() < 2 {
-                return Err(DecodeError::new(DecodeErrorCode::Truncated, 1).with_spec_ref(spec_ref));
+                return Err((PduSessionContainerError::Truncated, 1));
+            }
+            if (content[0] & 0x0f) != 0 || (content[1] & 0xc0) != 0 {
+                return Err((
+                    PduSessionContainerError::UnsupportedUplinkConditionalFields,
+                    0,
+                ));
+            }
+            if content.len() != 2 {
+                return Err((
+                    PduSessionContainerError::UnsupportedUplinkExtensionFields,
+                    2,
+                ));
             }
             let qfi = content[1] & 0x3F;
             Ok(Self {
@@ -297,31 +752,29 @@ impl PduSessionContainer {
                 rqi: false,
             })
         } else {
-            // Other/Unknown PDU Session Container types
-            if content.len() < 2 {
-                return Err(DecodeError::new(DecodeErrorCode::Truncated, 1).with_spec_ref(spec_ref));
-            }
-            let qfi = content[1] & 0x3F;
-            Ok(Self {
-                pdu_type,
-                qfi,
-                ppi: None,
-                rqi: false,
-            })
+            Err((PduSessionContainerError::ReservedPduType, 0))
         }
     }
 
-    /// Encode the PduSessionContainer into standard extension header content bytes.
+    /// Encode this base-subset model into extension-header content bytes.
+    ///
+    /// This method is fallible so direct construction cannot silently truncate
+    /// QFI/PPI or discard direction-incompatible fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same stable reasons as [`Self::validate`].
     ///
     /// @spec 3GPP TS29281 R18 5.2.2.7
     /// @req REQ-3GPP-TS29281-R18-5.2.2.7-003
-    /// @conformance full
-    pub fn encode(&self) -> Vec<u8> {
+    /// @conformance qfi-ppi-rqi-subset
+    pub fn encode(&self) -> Result<Vec<u8>, PduSessionContainerError> {
+        self.validate()?;
         let mut content = Vec::new();
-        let octet2 = (self.pdu_type & 0x0F) << 4;
+        let octet2 = self.pdu_type << 4;
         content.push(octet2);
         if self.pdu_type == 0 {
-            let mut octet3 = self.qfi & 0x3F;
+            let mut octet3 = self.qfi;
             if self.ppi.is_some() {
                 octet3 |= 0x80; // PPP = 1
             }
@@ -330,11 +783,10 @@ impl PduSessionContainer {
             }
             content.push(octet3);
             if let Some(ppi) = self.ppi {
-                content.push(ppi & 0x07);
+                content.push(ppi);
             }
         } else {
-            let octet3 = self.qfi & 0x3F;
-            content.push(octet3);
+            content.push(self.qfi);
         }
 
         // Pad to ensure total size of extension header is multiple of 4 octets.
@@ -344,7 +796,7 @@ impl PduSessionContainer {
             let padding_needed = 4 - rem;
             content.resize(content.len() + padding_needed, 0);
         }
-        content
+        Ok(content)
     }
 }
 
@@ -363,6 +815,11 @@ pub enum GtpuExtensionChainMalformedReason {
     LengthOverflow,
     /// Bytes remained after the terminal Next Extension Header type.
     TrailingBytes,
+    /// A typed PDU Session Container was outside the supported complete subset.
+    InvalidPduSessionContainer {
+        /// Stable semantic reason returned by the PDU container boundary.
+        reason: PduSessionContainerError,
+    },
 }
 
 impl GtpuExtensionChainMalformedReason {
@@ -373,6 +830,9 @@ impl GtpuExtensionChainMalformedReason {
             Self::LengthUnitsZero => "gtpu_extension_chain_length_units_zero",
             Self::LengthOverflow => "gtpu_extension_chain_length_overflow",
             Self::TrailingBytes => "gtpu_extension_chain_trailing_bytes",
+            Self::InvalidPduSessionContainer { .. } => {
+                "gtpu_extension_chain_invalid_pdu_session_container"
+            }
         }
     }
 }
@@ -395,6 +855,11 @@ pub enum GtpuExtensionChainError {
     },
     /// More than one PDU Session Container extension was present.
     DuplicatePduSessionContainer,
+    /// A caller-constructed PDU Session Container was not wire-representable.
+    InvalidPduSessionContainer {
+        /// Stable validation reason.
+        reason: PduSessionContainerError,
+    },
     /// Encoding a typed extension exceeded GTP-U extension header length fields.
     ExtensionLengthOverflow,
     /// Re-decoding a just-built typed extension failed.
@@ -413,6 +878,9 @@ impl GtpuExtensionChainError {
             Self::DuplicatePduSessionContainer => {
                 "gtpu_extension_chain_duplicate_pdu_session_container"
             }
+            Self::InvalidPduSessionContainer { .. } => {
+                "gtpu_extension_chain_invalid_pdu_session_container_model"
+            }
             Self::ExtensionLengthOverflow => "gtpu_extension_chain_length_overflow",
             Self::BuiltChainInvalid => "gtpu_extension_chain_built_chain_invalid",
         }
@@ -422,7 +890,22 @@ impl GtpuExtensionChainError {
 impl fmt::Display for GtpuExtensionChainError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::MalformedRawChain {
+                reason:
+                    reason @ GtpuExtensionChainMalformedReason::InvalidPduSessionContainer {
+                        reason: pdu_reason,
+                    },
+            } => write!(
+                f,
+                "{}: {}: {}",
+                self.as_str(),
+                reason.as_str(),
+                pdu_reason.as_str()
+            ),
             Self::MalformedRawChain { reason } => {
+                write!(f, "{}: {}", self.as_str(), reason.as_str())
+            }
+            Self::InvalidPduSessionContainer { reason } => {
                 write!(f, "{}: {}", self.as_str(), reason.as_str())
             }
             _ => f.write_str(self.as_str()),
@@ -499,8 +982,14 @@ impl GtpuExtensionChain {
     /// Returns [`GtpuExtensionChainError`] when the decoded raw extension bytes
     /// are malformed or inconsistent.
     pub fn from_message(message: &GtpuMessage<'_>) -> Result<Self, GtpuExtensionChainError> {
+        let first_extension_type = message
+            .header
+            .ext_hdr_flag
+            .then_some(message.header.next_ext_type)
+            .flatten()
+            .filter(|value| *value != 0);
         Self::from_raw(
-            message.header.next_ext_type,
+            first_extension_type,
             Bytes::copy_from_slice(message.raw_extension_headers),
         )
     }
@@ -512,29 +1001,91 @@ impl GtpuExtensionChain {
     /// Returns [`GtpuExtensionChainError`] when the decoded raw extension bytes
     /// are malformed or inconsistent.
     pub fn from_owned_message(message: &OwnedGtpuMessage) -> Result<Self, GtpuExtensionChainError> {
-        Self::from_raw(
-            message.header.next_ext_type,
-            message.raw_extension_headers.clone(),
-        )
+        let first_extension_type = message
+            .header
+            .ext_hdr_flag
+            .then_some(message.header.next_ext_type)
+            .flatten()
+            .filter(|value| *value != 0);
+        Self::from_raw(first_extension_type, message.raw_extension_headers.clone())
     }
 
     /// Build a raw extension chain containing one PDU Session Container.
     ///
     /// # Errors
     ///
-    /// Returns [`GtpuExtensionChainError`] if the typed extension cannot be
-    /// encoded into GTP-U extension-header length fields.
+    /// Returns [`GtpuExtensionChainError`] if the container model is invalid or
+    /// the typed extension cannot be encoded into GTP-U extension-header length
+    /// fields.
     pub fn from_pdu_session_container(
         container: PduSessionContainer,
     ) -> Result<Self, GtpuExtensionChainError> {
-        let content = container.encode();
-        let raw_headers = encode_extension_header(content.as_slice(), 0).map(Bytes::from)?;
-        let chain = Self::from_raw(Some(GTPU_EXT_PDU_SESSION_CONTAINER), raw_headers)?;
+        let chain = Self::none().upsert_pdu_session_container(&container)?;
         if chain.pdu_session_container == Some(container) {
             Ok(chain)
         } else {
             Err(GtpuExtensionChainError::BuiltChainInvalid)
         }
+    }
+
+    pub(crate) fn upsert_pdu_session_container(
+        &self,
+        container: &PduSessionContainer,
+    ) -> Result<Self, GtpuExtensionChainError> {
+        let content = container
+            .encode()
+            .map_err(|reason| GtpuExtensionChainError::InvalidPduSessionContainer { reason })?;
+        self.upsert_extension(GTPU_EXT_PDU_SESSION_CONTAINER, &content)
+    }
+
+    pub(crate) fn upsert_udp_port(&self, port: u16) -> Result<Self, GtpuExtensionChainError> {
+        self.upsert_extension(GTPU_EXT_UDP_PORT, &port.to_be_bytes())
+    }
+
+    fn upsert_extension(
+        &self,
+        extension_type: u8,
+        replacement_content: &[u8],
+    ) -> Result<Self, GtpuExtensionChainError> {
+        self.validate_consistency()?;
+
+        let mut headers = Vec::with_capacity(self.header_count.saturating_add(1));
+        let mut replaced = false;
+        let first_type = self.first_extension_type.unwrap_or(0);
+        for extension in GtpuExtensionHeaderIterator::new(&self.raw_headers, first_type) {
+            let extension = extension.map_err(|_| GtpuExtensionChainError::BuiltChainInvalid)?;
+            let content = if extension.ext_type == extension_type {
+                if replaced {
+                    return Err(GtpuExtensionChainError::BuiltChainInvalid);
+                }
+                replaced = true;
+                replacement_content.to_vec()
+            } else {
+                extension.content.to_vec()
+            };
+            headers.push((extension.ext_type, content));
+        }
+
+        if !replaced {
+            headers.push((extension_type, replacement_content.to_vec()));
+        }
+
+        let first_extension_type = headers.first().map(|(header_type, _)| *header_type);
+        let raw_capacity = headers.iter().try_fold(0usize, |total, (_, content)| {
+            total
+                .checked_add(content.len())
+                .and_then(|value| value.checked_add(2))
+                .ok_or(GtpuExtensionChainError::ExtensionLengthOverflow)
+        })?;
+        let mut raw_headers = Vec::with_capacity(raw_capacity);
+        for (index, (_, content)) in headers.iter().enumerate() {
+            let next_extension_type = headers
+                .get(index.saturating_add(1))
+                .map_or(0, |(header_type, _)| *header_type);
+            raw_headers.extend_from_slice(&encode_extension_header(content, next_extension_type)?);
+        }
+
+        Self::from_raw(first_extension_type, Bytes::from(raw_headers))
     }
 
     /// Re-parse and compare this summary with its raw extension bytes.
@@ -604,8 +1155,12 @@ fn summarize_extension_chain(
             if pdu_session_container.is_some() {
                 return Err(GtpuExtensionChainError::DuplicatePduSessionContainer);
             }
-            let container = PduSessionContainer::decode(&extension)
-                .map_err(|_| malformed(GtpuExtensionChainMalformedReason::Truncated))?;
+            let container =
+                PduSessionContainer::decode_with_reason(&extension).map_err(|(reason, _)| {
+                    malformed(
+                        GtpuExtensionChainMalformedReason::InvalidPduSessionContainer { reason },
+                    )
+                })?;
             pdu_session_container = Some(container);
         }
 
@@ -768,7 +1323,9 @@ impl<'a> BorrowDecode<'a> for GtpuMessage<'a> {
 
             let next_ext = packet_bytes[11];
             raw_next_ext_type = Some(next_ext);
-            next_ext_type = Some(next_ext);
+            if ext_hdr_flag {
+                next_ext_type = Some(next_ext);
+            }
 
             if validation_strictness(ctx.validation_level) >= 2 && ext_hdr_flag && next_ext == 0 {
                 return Err(DecodeError::new(
@@ -864,7 +1421,9 @@ impl<'a> BorrowDecode<'a> for GtpuMessage<'a> {
 
                 let next_ext = packet_bytes[next_ext_offset];
 
-                if current_next_ext != GTPU_EXT_PDU_SESSION_CONTAINER
+                let extension_type = GtpuExtensionHeaderType::new(current_next_ext);
+                if extension_type
+                    .unsupported_requires_comprehension_by(GtpuExtensionHeaderRecipient::Endpoint)
                     && matches!(ctx.unknown_ie_policy, UnknownIePolicy::Reject)
                 {
                     return Err(DecodeError::new(

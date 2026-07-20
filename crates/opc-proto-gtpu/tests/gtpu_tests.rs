@@ -1,7 +1,8 @@
 use bytes::{Bytes, BytesMut};
 use opc_proto_gtpu::{
     GtpuExtensionChain, GtpuExtensionChainError, GtpuExtensionChainMalformedReason, GtpuHeader,
-    GtpuMessage, OwnedGtpuMessage, PduSessionContainer, GTPU_EXT_PDU_SESSION_CONTAINER,
+    GtpuMessage, OwnedGtpuMessage, PduSessionContainer, PduSessionContainerError,
+    GTPU_EXT_PDU_SESSION_CONTAINER,
 };
 use opc_protocol::{
     BorrowDecode, DecodeContext, DecodeErrorCode, Encode, EncodeContext, OwnedDecode,
@@ -55,13 +56,63 @@ fn test_decode_with_seq() {
     assert!(tail.is_empty());
     assert_eq!(msg.header.sequence_number, Some(42));
     assert_eq!(msg.header.npdu_number, None); // PN is 0, so npdu_number is None
-    assert_eq!(msg.header.next_ext_type, Some(0));
+    assert_eq!(msg.header.next_ext_type, None);
 
     // Roundtrip encode
     let mut dst = BytesMut::new();
     msg.encode(&mut dst, EncodeContext::default())
         .expect("encode failed");
     assert_eq!(dst.to_vec(), raw);
+}
+
+#[test]
+fn inactive_nonzero_next_extension_type_is_raw_only() {
+    let raw = [0x32, 0x01, 0x00, 0x04, 0, 0, 0, 0, 0x12, 0x34, 0, 0x84];
+    let (tail, borrowed) =
+        GtpuMessage::decode(&raw, DecodeContext::default()).expect("borrowed decode failed");
+    assert!(tail.is_empty());
+    assert!(!borrowed.header.ext_hdr_flag);
+    assert_eq!(borrowed.header.next_ext_type, None);
+    assert_eq!(borrowed.header.raw_next_ext_type, Some(0x84));
+    assert!(borrowed.raw_extension_headers.is_empty());
+    assert!(borrowed.extensions().next().is_none());
+
+    let raw_context = EncodeContext {
+        raw_preserving: true,
+        ..EncodeContext::default()
+    };
+    let mut borrowed_raw = BytesMut::new();
+    borrowed
+        .encode(&mut borrowed_raw, raw_context)
+        .expect("borrowed raw-preserving encode failed");
+    assert_eq!(borrowed_raw.as_ref(), raw);
+
+    let canonical = [0x32, 0x01, 0x00, 0x04, 0, 0, 0, 0, 0x12, 0x34, 0, 0];
+    let mut borrowed_canonical = BytesMut::new();
+    borrowed
+        .encode(&mut borrowed_canonical, EncodeContext::default())
+        .expect("borrowed canonical encode failed");
+    assert_eq!(borrowed_canonical.as_ref(), canonical);
+
+    let owned =
+        OwnedGtpuMessage::decode_owned(Bytes::copy_from_slice(&raw), DecodeContext::default())
+            .expect("owned decode failed");
+    assert_eq!(owned.header.next_ext_type, None);
+    assert_eq!(owned.header.raw_next_ext_type, Some(0x84));
+    assert!(owned.raw_extension_headers.is_empty());
+    assert!(owned.extensions().next().is_none());
+
+    let mut owned_raw = BytesMut::new();
+    owned
+        .encode(&mut owned_raw, raw_context)
+        .expect("owned raw-preserving encode failed");
+    assert_eq!(owned_raw.as_ref(), raw);
+
+    let mut owned_canonical = BytesMut::new();
+    owned
+        .encode(&mut owned_canonical, EncodeContext::default())
+        .expect("owned canonical encode failed");
+    assert_eq!(owned_canonical.as_ref(), canonical);
 }
 
 #[test]
@@ -147,8 +198,163 @@ fn test_pdu_session_container_with_ppi() {
     assert!(psc.rqi);
 
     // Roundtrip encode
-    let encoded = psc.encode();
+    let encoded = psc.encode().expect("valid container must encode");
     assert_eq!(encoded, ext_content);
+}
+
+#[test]
+fn pdu_session_container_encoding_rejects_every_nonrepresentable_public_model() {
+    let cases = [
+        (
+            PduSessionContainer {
+                pdu_type: 2,
+                qfi: 9,
+                ppi: None,
+                rqi: false,
+            },
+            PduSessionContainerError::ReservedPduType,
+        ),
+        (
+            PduSessionContainer {
+                pdu_type: 0,
+                qfi: 64,
+                ppi: None,
+                rqi: false,
+            },
+            PduSessionContainerError::QfiOutOfRange,
+        ),
+        (
+            PduSessionContainer {
+                pdu_type: 1,
+                qfi: 64,
+                ppi: None,
+                rqi: false,
+            },
+            PduSessionContainerError::QfiOutOfRange,
+        ),
+        (
+            PduSessionContainer {
+                pdu_type: 0,
+                qfi: 9,
+                ppi: Some(8),
+                rqi: false,
+            },
+            PduSessionContainerError::PpiOutOfRange,
+        ),
+        (
+            PduSessionContainer {
+                pdu_type: 1,
+                qfi: 9,
+                ppi: Some(1),
+                rqi: false,
+            },
+            PduSessionContainerError::UplinkPagingPolicyIndicator,
+        ),
+        (
+            PduSessionContainer {
+                pdu_type: 1,
+                qfi: 9,
+                ppi: None,
+                rqi: true,
+            },
+            PduSessionContainerError::UplinkReflectiveQosIndicator,
+        ),
+    ];
+
+    for (model, expected) in cases {
+        assert_eq!(model.validate(), Err(expected));
+        assert_eq!(model.encode(), Err(expected));
+        assert_eq!(
+            GtpuExtensionChain::from_pdu_session_container(model),
+            Err(GtpuExtensionChainError::InvalidPduSessionContainer { reason: expected })
+        );
+        assert!(!expected.as_str().is_empty());
+    }
+
+    assert_eq!(
+        PduSessionContainer::new_downlink(64, None, false),
+        Err(PduSessionContainerError::QfiOutOfRange)
+    );
+    assert_eq!(
+        PduSessionContainer::new_downlink(9, Some(8), false),
+        Err(PduSessionContainerError::PpiOutOfRange)
+    );
+    assert_eq!(
+        PduSessionContainer::new_uplink(64),
+        Err(PduSessionContainerError::QfiOutOfRange)
+    );
+    assert!(PduSessionContainer::new_downlink(9, Some(7), true).is_ok());
+    assert!(PduSessionContainer::new_uplink(63).is_ok());
+}
+
+#[test]
+fn pdu_session_container_rejects_reserved_types_and_unmodelled_presence_flags() {
+    let cases: &[(&str, &[u8])] = &[
+        ("reserved PDU type", &[0x20, 0x09]),
+        ("DL QMP without timestamp", &[0x08, 0x09]),
+        ("DL SNP without sequence", &[0x04, 0x09]),
+        ("DL MSNP without MBS sequence", &[0x02, 0x09]),
+        (
+            "DL QMP with fields outside the typed subset",
+            &[0x08, 0x09, 0, 1, 2, 3, 4, 5, 6, 7],
+        ),
+        ("UL QMP without timestamps", &[0x18, 0x09]),
+        ("UL SNP without sequence", &[0x11, 0x09]),
+        ("UL conditional flag without its field", &[0x10, 0x49]),
+        (
+            "unflagged future-extension bytes",
+            &[0x00, 0x09, 0, 0, 0, 0],
+        ),
+    ];
+
+    for (name, content) in cases {
+        let extension = opc_proto_gtpu::GtpuExtensionHeader {
+            ext_type: GTPU_EXT_PDU_SESSION_CONTAINER,
+            content,
+            next_ext_type: 0,
+        };
+        let error = PduSessionContainer::decode(&extension)
+            .expect_err("unsupported container shape must fail closed");
+        assert!(
+            matches!(error.code(), DecodeErrorCode::Structural { .. }),
+            "{name}: {error:?}"
+        );
+    }
+
+    let valid_ul_content = [0x10, 0x09];
+    let valid_ul = opc_proto_gtpu::GtpuExtensionHeader {
+        ext_type: GTPU_EXT_PDU_SESSION_CONTAINER,
+        content: &valid_ul_content,
+        next_ext_type: 0,
+    };
+    let decoded = PduSessionContainer::decode(&valid_ul)
+        .expect("base UL QFI-only container remains supported");
+    assert_eq!(decoded.pdu_type, 1);
+    assert_eq!(decoded.qfi, 9);
+}
+
+#[test]
+fn extension_chain_classifies_invalid_pdu_session_container_without_calling_it_truncated() {
+    let error = GtpuExtensionChain::from_raw(
+        Some(GTPU_EXT_PDU_SESSION_CONTAINER),
+        Bytes::from_static(&[0x01, 0x08, 0x09, 0x00]),
+    )
+    .expect_err("QMP flag without its timestamp must fail chain validation");
+    assert_eq!(
+        error,
+        GtpuExtensionChainError::MalformedRawChain {
+            reason: GtpuExtensionChainMalformedReason::InvalidPduSessionContainer {
+                reason: PduSessionContainerError::UnsupportedDownlinkConditionalFields,
+            },
+        }
+    );
+    assert_eq!(
+        GtpuExtensionChainMalformedReason::InvalidPduSessionContainer {
+            reason: PduSessionContainerError::UnsupportedDownlinkConditionalFields,
+        }
+        .as_str(),
+        "gtpu_extension_chain_invalid_pdu_session_container"
+    );
 }
 
 #[test]
