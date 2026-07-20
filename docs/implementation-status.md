@@ -268,6 +268,56 @@ policy/dataplane behavior.
 
 ---
 
+## Current external routing-stack prefix-intent foundation — 2026-07-20
+
+`opc-ipsec-lb` implements the SDK portion of
+[issue #309](https://github.com/openpacketcore/openpacketcore-sdk/issues/309).
+`PrefixAdvertiserService` accepts bounded exact `/32` and `/128` sets grouped
+by opaque routing domain, enforces injected-clock leases and monotonic
+generations, serializes cancellation-safe adapter mutations, and publishes
+typed, redaction-safe peer-session, prefix, and routing-stack-reported BFD
+events. Startup must establish known absence across both configured domains
+and bounded durable state left by removed domains before an advertisement is
+admitted. A bounded priority scheduler coalesces queued domain intent, gives
+withdrawals priority, and batches simultaneous expiry so the lease bound does
+not scale with routing-domain count. Failed cleanup quarantines the complete
+bounded possibly-affected prefix union as unconfirmed until exact absence.
+
+The production adapter uses BIRD 2's documented control socket rather than
+implementing BGP or BFD. It renders atomic exact-set fragments, classifies
+configure refusal separately from ambiguous completion, reads back originated
+routes and each established peer's exact local Adj-RIB-Out, and removes any
+rejected subset from durable intent. Local export evidence is not represented
+as proof that the remote peer installed a route. Withdrawal keeps durable
+intent absent while boundedly confirming queued configuration; refusal,
+ambiguity, timeout, or surviving protocol state fail-stops owned BIRD. Fragment storage
+uses a private owned descriptor-pinned directory with no-follow reads,
+exclusive unpredictable temporary files, and descriptor-relative inventory,
+rename, and removal. The complete canonical owned namespace is validated and
+durably cleared before child launch. A small SDK helper
+owns foreground BIRD under a versioned nonce handshake, expected-parent check,
+dedicated parent thread, and Linux parent-death signal. The lifecycle admission
+cannot be constructed by a caller; helper or BIRD exit withdraws local mutation
+readiness, requests fail-stop termination, and retains the child until kernel
+wait status is available. The configured shutdown wait is not presented as a
+reap deadline or an upstream route-withdrawal claim. Executables that can clear the
+parent-death contract through set-ID or file capabilities are rejected. Helper,
+BIRD, main-config, control-socket, and fragment authorities are descriptor-pinned;
+the BIRD adapter caps exact export polling to 32 peer protocols in one bounded
+concurrent wave.
+
+Deterministic fake, hostile control-socket, cancellation, clock, durable-drift,
+and local process-death tests cover the generic boundary. An explicitly ignored,
+operator-invoked BIRD 2 integration
+test proves exact advertisement/readback, session-state relay, ambiguous
+reconfiguration retry, and exact withdrawal using documentation prefixes and
+private ASNs. The SDK does not select peers, ASNs, BGP/BFD policy or timers,
+decide application health, program forwarding, or claim an upstream withdrawal
+bound without real peer/BFD evidence. Its private locked socket namespace can
+remove only a proven-dead owned stale socket after an unclean process exit.
+
+---
+
 ## Current durable multi-SA re-pin foundation — 2026-07-18
 
 `opc-ipsec-lb` now implements the SDK portion of

@@ -1291,6 +1291,7 @@ fn error_code(error: &IpsecLbError) -> &'static str {
         IpsecLbError::PacketRejected { .. } => "packet_rejected",
         IpsecLbError::Io { .. } => "io",
         IpsecLbError::InvalidConfig { .. } => "invalid_config",
+        IpsecLbError::AdapterContractViolation { .. } => "adapter_contract_violation",
         IpsecLbError::Unsupported => "unsupported",
         IpsecLbError::AlreadyExists => "already_exists",
         IpsecLbError::NotFound => "not_found",

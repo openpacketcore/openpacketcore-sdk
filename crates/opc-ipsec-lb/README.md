@@ -19,6 +19,11 @@ steer layer:
 - durable session-level multi-SA re-pin progress and fenced terminal
   retirement with bounded stale-retry tombstones;
 - BGP route-export VIP advertisement through the safe route-steering backend;
+- typed prefix advertise/withdraw intent toward an established routing stack
+  (BIRD control socket), with declarative delta-exact reconcile, health-lease
+  gating on an injected clock, per-peer session/BFD path-health telemetry, and
+  a deterministic conformance fake — BGP/BFD wire protocols stay in the
+  routing component;
 - protocol-neutral VIP ownership reconciliation gated by caller-supplied
   leadership, quorum health, listener health, and a monotonic fence;
 - an external-load-balancer advertiser tier that composes with fenced ownership
@@ -225,6 +230,144 @@ supplies delivery. Its advertise and withdraw operations are intentional
 no-ops: it cannot program a local route. The same coordinator can instead own
 any `VipAdvertiser`, including the BGP route-export adapter. The intent contains
 no SA, shard, IKE, ESP, key, or other protocol-specific material.
+
+## External routing-stack prefix intent
+
+`PrefixAdvertiserService` carries declarative exact-host-prefix intent to an
+established routing stack; it does not implement BGP or BFD. Before BIRD is
+started, `spawn_supervised` validates and durably removes the complete
+adapter-owned fragment namespace. Before admitting the first advertisement,
+`initialize` then reconfigures BIRD and proves every adapter-owned protocol
+absent. `reconcile` invokes that second gate automatically, so durable intent
+left by an earlier process cannot be silently adopted or briefly exported at
+startup. Namespace admission, process-path validation, inventory, cleanup,
+helper handshake, and control readiness share the configured startup deadline;
+a timed-out pre-launch worker retains the fragment lock and no child is started.
+A refused or indeterminate whole-set replacement is never
+treated as a successful shrink: the service burns that lease generation and
+drives the complete domain to known absence. Apply and withdrawal drivers
+survive cancellation, exact-check adapter outcome identities, and recheck the
+lease deadline immediately before and after a bounded adapter mutation. A
+bounded priority scheduler coalesces overlapping queued intent, admits
+withdrawals before queued applies, and withdraws simultaneous expired domains
+in one adapter batch after at most the currently active mutation.
+
+```rust,no_run
+use std::collections::BTreeSet;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+use opc_ipsec_lb::{
+    AdvertisementLease, BirdAdapterConfig, BirdControlSocketAdapter,
+    BirdDomainBinding, BirdProcessConfig, HostPrefix, IpAddress,
+    LeaseGeneration, PrefixAdvertiserConfig, PrefixAdvertiserService,
+    RoutingDomainTag,
+};
+
+# async fn configure_routing() -> Result<(), opc_ipsec_lb::IpsecLbError> {
+let domain = RoutingDomainTag::new(64_512);
+let adapter = BirdControlSocketAdapter::spawn_supervised(
+    BirdAdapterConfig {
+        socket_path: PathBuf::from("/run/bird/opc-owned.ctl"),
+        fragment_dir: PathBuf::from("/etc/bird/opc.d"),
+        domains: vec![BirdDomainBinding {
+            domain,
+            static_protocol: "opc_adv_64512".to_owned(),
+            peer_protocols: vec!["edge_a".to_owned()],
+        }],
+        command_timeout: Duration::from_secs(10),
+    },
+    BirdProcessConfig {
+        supervisor_helper_path: PathBuf::from("/usr/libexec/opc-bird-supervisor"),
+        bird_executable_path: PathBuf::from("/usr/sbin/bird"),
+        bird_config_path: PathBuf::from("/etc/bird/bird.conf"),
+        startup_timeout: Duration::from_secs(20),
+        shutdown_timeout: Duration::from_secs(10),
+    },
+).await?;
+let service = Arc::new(PrefixAdvertiserService::new(
+    adapter,
+    PrefixAdvertiserConfig::default(),
+)?);
+service.initialize().await?;
+// Supervise this watchdog independently from the lease-renewing/election task:
+// if that task dies, this task must remain alive to enforce lease expiry.
+let (watchdog_shutdown, watchdog_shutdown_rx) = tokio::sync::watch::channel(false);
+let watchdog = tokio::spawn({
+    let service = Arc::clone(&service);
+    async move { service.run(watchdog_shutdown_rx).await }
+});
+
+let lease = AdvertisementLease::new(LeaseGeneration::new(7)?, 30)?;
+service
+    .reconcile(
+        domain,
+        BTreeSet::from([HostPrefix::new(IpAddress::V4([203, 0, 113, 10]))]),
+        Some(lease),
+    )
+    .await?;
+let lease_expiry_bound = service.lease_enforcement_bound();
+# let _ = lease_expiry_bound;
+# let _ = watchdog_shutdown.send(true);
+# let _ = watchdog.await;
+# Ok(())
+# }
+```
+
+The BIRD adapter writes one bounded, atomic, domain-keyed fragment per
+configured domain, restores previous advertisement intent after a refused or
+indeterminate replacement, and removes readback-rejected routes before it
+reports an authoritative applied subset. Withdrawal never restores old durable
+intent: queued/in-progress configuration is followed by bounded protocol-
+absence readback, while refusal, ambiguity, timeout, or surviving protocol
+state fail-stops the owned BIRD process. Startup boundedly inventories the
+complete reserved fragment namespace, including domains removed by a later
+configuration, clears it before child launch, and proves the configured old
+protocol instances absent before any new advertisement. The fragment directory
+must be absolute, owned by the effective user, and mode `0700`.
+It is pinned by descriptor; inventory, no-follow reads, removals, unpredictable
+exclusive temporary creation, and rename are descriptor-relative. Unknown,
+malformed, symlinked, foreign-owned, or over-limit candidates fail closed.
+
+Peer visibility is read from BIRD's exact local Adj-RIB-Out with
+`show route exported <peer> protocol <static>`. A locally originated route that
+export policy filters out is therefore not reported in `advertised_to`.
+This evidence does not prove that the remote peer installed the route; that
+requires product/network evidence. BIRD configuration is capped at 32 peer
+protocols total so local-origin and per-peer export readbacks fit one bounded
+concurrent poll. BIRD's `export table` option is not required for this command.
+
+Production BIRD is process-owned, not an independently surviving sidecar.
+`opc-bird-supervisor` installs Linux `PDEATHSIG`, checks the expected parent to
+close the fork/exec race, completes a versioned nonce/pipe handshake, and then
+executes exactly `bird -f -c <config> -s <socket>`. There is no arbitrary BIRD
+argument vector and no caller-constructible `RoutingProcessSupervision`. The
+dedicated spawning thread stays alive for the child lifetime; helper/BIRD
+exit immediately invalidates readiness and all mutations. BIRD executables
+with set-ID bits or file capabilities are rejected because Linux clears
+`PDEATHSIG` across those privilege transitions. Run the service/helper/BIRD
+at the desired container identity and ambient/bounding capability set instead
+of asking BIRD to daemonize or change effective credentials. The control-socket
+parent must likewise be a private owned directory. A cross-process lock and
+bounded active-connect check reject a live socket; only a proven-dead owned
+socket is removed before restart.
+
+The helper, BIRD executable, main configuration, and control-socket directory
+are descriptor-pinned before launch. They must be root- or effective-user-owned
+and must not be group/world writable; executable set-ID bits and file
+capabilities are rejected. Because BIRD receives the main configuration through
+`/proc/self/fd`, every include used by that configuration must be absolute.
+
+`shutdown_timeout` bounds how long the explicit shutdown API waits for terminal
+supervisor evidence. It is not a child-reap deadline: after requesting
+`SIGKILL`, the supervisor retains the child until the kernel supplies wait
+status. It also does not assert when an upstream router withdraws a path. A
+consumer may state an upstream withdrawal bound only from actual peer export,
+session, or BFD evidence under its configured routing timers.
+
+Control replies, durable fragments, domains, peers, names, prefix sets,
+process paths, and every service/process timeout have hard ceilings.
 
 It intentionally does not decrypt ESP, derive IPsec keys, open BGP sessions,
 shell out to routing daemons, implement VRRP, or claim packet forwarding.
