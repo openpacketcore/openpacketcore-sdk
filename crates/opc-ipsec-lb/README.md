@@ -232,6 +232,10 @@ and verifies owners, pins the exact live link, and terminalizes the old
 backend. Adoption validates the link's program, target interface, live attach
 mode, maps, and non-regressing fence; stages a fresh ABI-v4 namespace; then
 uses `BPF_LINK_UPDATE` with `BPF_F_REPLACE` and the exact expected old program.
+Kernel-interrupted link-state dumps receive up to three retries (four total
+attempts), each from a fresh, empty snapshot. Partial observations are never
+used for identity decisions, and malformed or repeatedly interrupted replies
+still fail closed.
 The old process must keep its userspace slow path available until the new
 product instance reports readiness. If link-pin cleanup is reported, owner
 and fence mutation remains quiesced until

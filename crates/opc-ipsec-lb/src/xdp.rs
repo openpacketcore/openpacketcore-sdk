@@ -3170,6 +3170,10 @@ mod aya_runtime {
     const MAX_LINK_DUMP_MESSAGES: usize = 8_192;
     const MAX_LINK_DUMP_BYTES: usize = 16 * 1024 * 1024;
     const MAX_LINK_DUMP_EMPTY_ATTEMPTS: u32 = 50;
+    // Four total attempts bound transient kernel inconsistency without turning
+    // sustained link churn into an unbounded lifecycle stall.
+    const MAX_LINK_DUMP_RETRIES: u32 = 3;
+    const LINK_DUMP_RETRY_DELAY_MILLIS: u64 = 2;
     const IFF_UP: u32 = 0x1;
     const NLMSG_HDR_LEN: usize = 16;
     const IFINFOMSG_LEN: usize = 16;
@@ -3189,7 +3193,7 @@ mod aya_runtime {
     }
 
     /// Link state for one interface from an `RTM_GETLINK` dump.
-    #[derive(Debug, Default, Clone, Copy)]
+    #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
     struct LinkQuery {
         /// The interface exists in the current netns.
         found: bool,
@@ -3199,6 +3203,19 @@ mod aya_runtime {
         xdp_prog_id: Option<u32>,
         /// Kernel-reported XDP attachment kind for the program.
         xdp_attach_kind: Option<u8>,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum LinkDumpProgress {
+        More,
+        Done,
+        Interrupted,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum LinkQueryAttempt {
+        Complete(LinkQuery),
+        Interrupted,
     }
 
     /// Report whether `ifindex` names an existing interface that is
@@ -3227,6 +3244,34 @@ mod aya_runtime {
     /// Query link state for `ifindex` via an `RTM_GETLINK` dump in the
     /// current netns.
     fn link_query(ifindex: u32) -> Result<LinkQuery, IpsecLbError> {
+        retry_interrupted_link_query(
+            || link_query_once(ifindex),
+            |retry| {
+                std::thread::sleep(std::time::Duration::from_millis(
+                    LINK_DUMP_RETRY_DELAY_MILLIS.saturating_mul(u64::from(retry)),
+                ));
+            },
+        )
+    }
+
+    fn retry_interrupted_link_query(
+        mut attempt: impl FnMut() -> Result<LinkQueryAttempt, IpsecLbError>,
+        mut wait_before_retry: impl FnMut(u32),
+    ) -> Result<LinkQuery, IpsecLbError> {
+        let mut retries = 0_u32;
+        loop {
+            match attempt()? {
+                LinkQueryAttempt::Complete(query) => return Ok(query),
+                LinkQueryAttempt::Interrupted if retries < MAX_LINK_DUMP_RETRIES => {
+                    retries = retries.saturating_add(1);
+                    wait_before_retry(retries);
+                }
+                LinkQueryAttempt::Interrupted => return Err(incomplete_link_dump()),
+            }
+        }
+    }
+
+    fn link_query_once(ifindex: u32) -> Result<LinkQueryAttempt, IpsecLbError> {
         let socket = sys::open_route_netlink_socket()
             .map_err(|error| IpsecLbError::io("xdp_link_query_open", error))?;
         let local_port_id = socket.port_id();
@@ -3246,6 +3291,17 @@ mod aya_runtime {
             ));
         }
 
+        collect_link_query(LINK_DUMP_SEQUENCE, local_port_id, ifindex, |buffer| {
+            sys::receive_message(&socket, buffer)
+        })
+    }
+
+    fn collect_link_query(
+        expected_sequence: u32,
+        expected_port_id: u32,
+        requested_ifindex: u32,
+        mut receive: impl FnMut(&mut [u8]) -> io::Result<usize>,
+    ) -> Result<LinkQueryAttempt, IpsecLbError> {
         let mut query = LinkQuery::default();
         let mut buffer = [0_u8; 65_536];
         let mut empty_attempts = 0_u32;
@@ -3253,7 +3309,7 @@ mod aya_runtime {
         let mut messages = 0_usize;
         let mut total_bytes = 0_usize;
         loop {
-            match sys::receive_message(&socket, &mut buffer) {
+            match receive(&mut buffer) {
                 Ok(0) => {
                     empty_attempts = empty_attempts.saturating_add(1);
                     if empty_attempts > MAX_LINK_DUMP_EMPTY_ATTEMPTS {
@@ -3270,15 +3326,21 @@ mod aya_runtime {
                     if datagrams > MAX_LINK_DUMP_DATAGRAMS || total_bytes > MAX_LINK_DUMP_BYTES {
                         return Err(link_dump_limit());
                     }
-                    if parse_link_dump_datagram(
+                    match parse_link_dump_datagram(
                         &buffer[..length],
-                        LINK_DUMP_SEQUENCE,
-                        local_port_id,
-                        ifindex,
+                        expected_sequence,
+                        expected_port_id,
+                        requested_ifindex,
                         &mut messages,
                         &mut query,
                     )? {
-                        return Ok(query);
+                        LinkDumpProgress::More => {}
+                        LinkDumpProgress::Done => {
+                            return Ok(LinkQueryAttempt::Complete(query));
+                        }
+                        LinkDumpProgress::Interrupted => {
+                            return Ok(LinkQueryAttempt::Interrupted);
+                        }
                     }
                 }
                 Err(error)
@@ -3305,9 +3367,10 @@ mod aya_runtime {
         requested_ifindex: u32,
         messages: &mut usize,
         query: &mut LinkQuery,
-    ) -> Result<bool, IpsecLbError> {
+    ) -> Result<LinkDumpProgress, IpsecLbError> {
         let mut cursor = 0_usize;
         let mut done = false;
+        let mut interrupted = false;
         while cursor < datagram.len() {
             if done || datagram.len() - cursor < NLMSG_HDR_LEN {
                 return Err(malformed_link_dump());
@@ -3331,7 +3394,7 @@ mod aya_runtime {
                 return Err(incomplete_link_dump());
             }
             if flags & NLM_F_DUMP_INTR != 0 {
-                return Err(incomplete_link_dump());
+                interrupted = true;
             }
             let body = &datagram[cursor + NLMSG_HDR_LEN..msg_end];
             match msg_type {
@@ -3342,7 +3405,13 @@ mod aya_runtime {
                     parse_link_dump_done(body)?;
                     done = true;
                 }
-                NLMSG_ERROR | NLMSG_OVERRUN => return Err(incomplete_link_dump()),
+                NLMSG_ERROR => return Err(incomplete_link_dump()),
+                NLMSG_OVERRUN => {
+                    if !body.is_empty() {
+                        return Err(malformed_link_dump());
+                    }
+                    interrupted = true;
+                }
                 NLMSG_NOOP => {
                     if flags & NLM_F_MULTI == 0 || !body.is_empty() {
                         return Err(malformed_link_dump());
@@ -3381,7 +3450,13 @@ mod aya_runtime {
             }
             cursor = aligned_end;
         }
-        Ok(done)
+        Ok(if interrupted {
+            LinkDumpProgress::Interrupted
+        } else if done {
+            LinkDumpProgress::Done
+        } else {
+            LinkDumpProgress::More
+        })
     }
 
     fn parse_link_dump_done(body: &[u8]) -> Result<(), IpsecLbError> {
@@ -3718,10 +3793,10 @@ mod aya_runtime {
             netlink_message(NLMSG_DONE, NLM_F_MULTI, &body)
         }
 
-        fn parse(datagram: &[u8]) -> Result<(bool, LinkQuery, usize), IpsecLbError> {
+        fn parse(datagram: &[u8]) -> Result<(LinkDumpProgress, LinkQuery, usize), IpsecLbError> {
             let mut messages = 0;
             let mut query = LinkQuery::default();
-            let done = parse_link_dump_datagram(
+            let progress = parse_link_dump_datagram(
                 datagram,
                 SEQUENCE,
                 PORT_ID,
@@ -3729,10 +3804,21 @@ mod aya_runtime {
                 &mut messages,
                 &mut query,
             )?;
-            Ok((done, query, messages))
+            Ok((progress, query, messages))
         }
 
-        fn assert_query_error(result: Result<(bool, LinkQuery, usize), IpsecLbError>) {
+        fn collect(datagrams: Vec<Vec<u8>>) -> Result<LinkQueryAttempt, IpsecLbError> {
+            let mut datagrams = datagrams.into_iter();
+            collect_link_query(SEQUENCE, PORT_ID, IFINDEX, |buffer| {
+                let datagram = datagrams.next().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::UnexpectedEof, "missing test datagram")
+                })?;
+                buffer[..datagram.len()].copy_from_slice(&datagram);
+                Ok(datagram.len())
+            })
+        }
+
+        fn assert_query_error(result: Result<(LinkDumpProgress, LinkQuery, usize), IpsecLbError>) {
             assert!(matches!(
                 result,
                 Err(IpsecLbError::Io {
@@ -3748,8 +3834,8 @@ mod aya_runtime {
             datagram.extend_from_slice(&link_message(IFINDEX + 1, None));
             datagram.extend_from_slice(&done_message(Some(0)));
 
-            let (done, query, messages) = parse(&datagram).expect("complete link dump");
-            assert!(done);
+            let (progress, query, messages) = parse(&datagram).expect("complete link dump");
+            assert_eq!(progress, LinkDumpProgress::Done);
             assert_eq!(messages, 3);
             assert!(query.found);
             assert!(query.is_up);
@@ -3759,8 +3845,8 @@ mod aya_runtime {
         #[test]
         fn dump_without_done_never_yields_an_authoritative_result() {
             let datagram = link_message(IFINDEX, None);
-            let (done, query, messages) = parse(&datagram).expect("valid partial dump");
-            assert!(!done);
+            let (progress, query, messages) = parse(&datagram).expect("valid partial dump");
+            assert_eq!(progress, LinkDumpProgress::More);
             assert!(query.found);
             assert_eq!(messages, 1);
         }
@@ -3777,13 +3863,108 @@ mod aya_runtime {
         }
 
         #[test]
-        fn interrupted_overrun_and_error_dumps_fail_closed() {
+        fn interrupted_and_overrun_dumps_request_a_fresh_snapshot() {
             let mut interrupted = link_message(IFINDEX, None);
             interrupted[6..8].copy_from_slice(&(NLM_F_MULTI | NLM_F_DUMP_INTR).to_ne_bytes());
-            assert_query_error(parse(&interrupted));
+            assert_eq!(
+                parse(&interrupted).expect("classify interrupted dump").0,
+                LinkDumpProgress::Interrupted
+            );
 
-            assert_query_error(parse(&netlink_message(NLMSG_OVERRUN, NLM_F_MULTI, &[])));
+            assert_eq!(
+                parse(&netlink_message(NLMSG_OVERRUN, 0, &[]))
+                    .expect("classify overrun dump")
+                    .0,
+                LinkDumpProgress::Interrupted
+            );
+        }
+
+        #[test]
+        fn interruption_never_masks_malformed_dump_content() {
+            assert_query_error(parse(&netlink_message(
+                0x7fff,
+                NLM_F_MULTI | NLM_F_DUMP_INTR,
+                &[],
+            )));
+            assert_query_error(parse(&netlink_message(NLMSG_DONE, NLM_F_DUMP_INTR, &[])));
+
+            let mut trailing = link_message(IFINDEX, None);
+            trailing[6..8].copy_from_slice(&(NLM_F_MULTI | NLM_F_DUMP_INTR).to_ne_bytes());
+            trailing.extend_from_slice(&[0; 4]);
+            assert_query_error(parse(&trailing));
+        }
+
+        #[test]
+        fn netlink_error_dump_remains_terminal() {
             assert_query_error(parse(&netlink_message(NLMSG_ERROR, NLM_F_MULTI, &[0; 4])));
+        }
+
+        #[test]
+        fn interrupted_query_retries_from_a_fresh_snapshot() {
+            let expected = LinkQuery {
+                found: true,
+                is_up: true,
+                xdp_prog_id: Some(41),
+                xdp_attach_kind: Some(XDP_ATTACHED_DRIVER),
+            };
+            let mut attempts = 0_u32;
+            let mut waits = Vec::new();
+            let mut interrupted_done = done_message(Some(0));
+            interrupted_done[6..8].copy_from_slice(&(NLM_F_MULTI | NLM_F_DUMP_INTR).to_ne_bytes());
+            let first_attempt = vec![link_message(IFINDEX, Some(99)), interrupted_done];
+            let mut complete = link_message(IFINDEX, expected.xdp_prog_id);
+            complete.extend_from_slice(&done_message(Some(0)));
+            let second_attempt = vec![complete];
+            let mut replies = [first_attempt, second_attempt].into_iter();
+
+            let result = retry_interrupted_link_query(
+                || {
+                    attempts = attempts.saturating_add(1);
+                    collect(replies.next().ok_or_else(incomplete_link_dump)?)
+                },
+                |retry| waits.push(retry),
+            )
+            .expect("second complete snapshot");
+
+            assert_eq!(result, expected);
+            assert_eq!(attempts, 2);
+            assert_eq!(waits, vec![1]);
+        }
+
+        #[test]
+        fn interrupted_query_exhaustion_is_bounded_and_fail_closed() {
+            let mut attempts = 0_u32;
+            let mut waits = Vec::new();
+
+            let result = retry_interrupted_link_query(
+                || {
+                    attempts = attempts.saturating_add(1);
+                    Ok(LinkQueryAttempt::Interrupted)
+                },
+                |retry| waits.push(retry),
+            );
+
+            assert_query_error(result.map(|query| (LinkDumpProgress::Done, query, 0)));
+            assert_eq!(attempts, MAX_LINK_DUMP_RETRIES + 1);
+            assert_eq!(waits, (1..=MAX_LINK_DUMP_RETRIES).collect::<Vec<_>>());
+        }
+
+        #[test]
+        fn malformed_query_is_not_retried() {
+            let mut attempts = 0_u32;
+            let mut waits = 0_u32;
+
+            let result = retry_interrupted_link_query(
+                || {
+                    attempts = attempts.saturating_add(1);
+                    Err(malformed_link_dump())
+                },
+                |_| waits = waits.saturating_add(1),
+            );
+
+            assert_query_error(result.map(|query| (LinkDumpProgress::Done, query, 0)));
+            assert_eq!(attempts, 1);
+            assert_eq!(waits, 0);
         }
 
         #[test]
