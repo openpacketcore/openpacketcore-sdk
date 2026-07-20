@@ -19,6 +19,11 @@ steer layer:
 - durable session-level multi-SA re-pin progress and fenced terminal
   retirement with bounded stale-retry tombstones;
 - BGP route-export VIP advertisement through the safe route-steering backend;
+- typed prefix advertise/withdraw intent toward an established routing stack
+  (BIRD control socket), with declarative delta-exact reconcile, health-lease
+  gating on an injected clock, per-peer session/BFD path-health telemetry, and
+  a deterministic conformance fake — BGP/BFD wire protocols stay in the
+  routing component;
 - protocol-neutral VIP ownership reconciliation gated by caller-supplied
   leadership, quorum health, listener health, and a monotonic fence;
 - an external-load-balancer advertiser tier that composes with fenced ownership

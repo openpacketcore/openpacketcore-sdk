@@ -49,6 +49,7 @@ pub mod ownership;
 pub mod ports;
 pub mod redirect;
 pub mod repin;
+pub mod routing;
 pub mod selector;
 pub mod session;
 pub mod session_repin;
@@ -120,6 +121,15 @@ pub use repin::{
     OwnershipTransitionId, RePinAuditEvent, RePinAuditEventKind, RePinCoordinator, RePinError,
     RePinOutcome, RePinPartialFailure, RePinRequest, RePinRetryStage, ResumeKeySource,
     SameSpiOutboundIvResume, SameSpiResume,
+};
+pub use routing::{
+    AdvertisedPrefix, AdvertisementLease, BirdAdapterConfig, BirdControlSocketAdapter,
+    BirdDomainBinding, ConformanceFakeRoutingStack, HostPrefix, LeaseGeneration, PathHealth,
+    PeerIdentity, PeerObservation, PeerSessionChangeReason, PeerSessionState,
+    PrefixAdvertisementState, PrefixAdvertiserConfig, PrefixAdvertiserService, PrefixApplyOutcome,
+    PrefixReconcileReport, PrefixRejectReason, PrefixStatusSnapshot, PrefixWithdrawReason,
+    ReconcileDisposition, RecordedAdvertisementApply, RoutingEvent, RoutingEventKind,
+    RoutingStackAdapter, RoutingStackKind, RoutingStackProbe, MAX_ADVERTISED_PREFIXES_PER_DOMAIN,
 };
 pub use selector::{
     measure_disruption, RendezvousSelector, SelectionKey, ShardDisruption, ShardSet,
