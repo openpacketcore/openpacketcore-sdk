@@ -51,11 +51,12 @@ pub use model::{
     CreateGtpDeviceRequest, DrainedV2TeardownOutcome, DrainedV2TeardownProgress,
     DrainedV2TeardownRefusal, DrainedV2TeardownRequest, GtpAddressFamily, GtpBearerMark, GtpDevice,
     GtpPdpContext, GtpRole, GtpVersion, GtpuBackendKind, GtpuCapability, GtpuDownlinkEndpoint,
-    GtpuProbe, GtpuSourcePortPolicy, GtpuSourcePortRange, GtpuV2DrainProof, PdpContextConflict,
-    PdpContextIndeterminateReason, PdpContextInstallOutcome, PdpContextLocalTeidSelector,
-    PdpContextMismatchField, PdpContextReadback, PdpContextReconciliationCapabilities,
-    PdpContextRemovalOutcome, PdpContextSelector, PdpContextSelectorOccupancy,
-    PdpContextUplinkIdentity, PdpContextUplinkSelector, RemovePdpContextRequest, Teid, GTPU_PORT,
+    GtpuProbe, GtpuSourcePortPolicy, GtpuSourcePortRange, GtpuUplinkSourcePortPolicy,
+    GtpuV2DrainProof, PdpContextConflict, PdpContextIndeterminateReason, PdpContextInstallOutcome,
+    PdpContextLocalTeidSelector, PdpContextMismatchField, PdpContextReadback,
+    PdpContextReconciliationCapabilities, PdpContextRemovalOutcome, PdpContextSelector,
+    PdpContextSelectorOccupancy, PdpContextUplinkIdentity, PdpContextUplinkSelector,
+    RemovePdpContextRequest, Teid, GTPU_PORT,
 };
 pub use opc_types::DscpCodepoint;
 pub use unsupported::UnsupportedGtpuDataplaneBackend;
@@ -81,6 +82,7 @@ mod integration_tests {
             gtp_version: GtpVersion::V1,
             bearer_mark: None,
             egress_dscp: None,
+            uplink_source_port_policy: GtpuUplinkSourcePortPolicy::LegacyServicePort,
         }
     }
 

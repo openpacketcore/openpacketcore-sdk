@@ -61,6 +61,57 @@ pub const GTPU_EXT_NONE: u8 = 0x00;
 /// Upper bound on chained GTP-U extension headers accepted on downlink.
 pub const GTPU_MAX_EXT_HEADERS: usize = 4;
 
+/// Pack the verifier-split downlink parser result passed between eBPF frames.
+///
+/// The high word carries the original IPv4 Total Length rather than the
+/// absolute Ethernet-frame end. IPv4 permits a Total Length of 65,535 bytes,
+/// whose frame end is 65,549 after the Ethernet header is included and cannot
+/// be represented by a `u16`. The caller reconstructs that end with
+/// [`downlink_frame_end`] only after returning to the classifier entry frame.
+#[must_use]
+#[inline(always)]
+pub const fn pack_downlink_parse_result(
+    ipv4_total_length: u16,
+    payload_offset: u16,
+    teid: [u8; 4],
+) -> u64 {
+    ((ipv4_total_length as u64) << 48)
+        | ((payload_offset as u64) << 32)
+        | (u32::from_be_bytes(teid) as u64)
+}
+
+/// Unpack the original IPv4 Total Length from a downlink parser result.
+#[must_use]
+#[inline(always)]
+pub const fn downlink_parse_ipv4_total_length(parsed: u64) -> u16 {
+    (parsed >> 48) as u16
+}
+
+/// Unpack the absolute inner-payload offset from a downlink parser result.
+#[must_use]
+#[inline(always)]
+pub const fn downlink_parse_payload_offset(parsed: u64) -> u16 {
+    ((parsed >> 32) & (u16::MAX as u64)) as u16
+}
+
+/// Unpack the network-order TEID from a downlink parser result.
+#[must_use]
+#[inline(always)]
+pub const fn downlink_parse_teid(parsed: u64) -> [u8; 4] {
+    (parsed as u32).to_be_bytes()
+}
+
+/// Reconstruct the exclusive Ethernet-frame end from IPv4 Total Length.
+///
+/// The checked addition is intentionally shared by host tests and the eBPF
+/// classifier entry frame so the maximum IPv4 packet cannot be truncated at
+/// the parser's compact return boundary.
+#[must_use]
+#[inline(always)]
+pub const fn downlink_frame_end(ipv4_total_length: u16) -> Option<u32> {
+    (ipv4_total_length as u32).checked_add(ETH_HDR_LEN as u32)
+}
+
 /// Byte length of an uplink FAR map value.
 pub const UPLINK_FAR_VALUE_LEN: usize = 12;
 /// Byte length of a marked uplink FAR/DSCP map key.
@@ -75,6 +126,17 @@ pub const DOWNLINK_ENDPOINT_BINDING_VALUE_LEN: usize = 44;
 pub const MARKED_BEARER_OWNER_VALUE_LEN: usize = 64;
 /// Byte length of an optional uplink DSCP map value.
 pub const UPLINK_DSCP_VALUE_LEN: usize = 1;
+/// Byte length of one encoded uplink UDP source-port policy.
+pub const UPLINK_SOURCE_PORT_POLICY_LEN: usize = 2;
+/// Byte length of one durable PDP-context commit record stored in an uplink
+/// source-port map.
+///
+/// The record extends the existing 64-byte marked-owner journal with the
+/// canonical two-byte source-port policy and two reserved bytes. Keeping the
+/// complete FAR, binding, DSCP, local TEID, phase, and source-port policy in
+/// one atomically replaced value gives both tc directions one coherent commit
+/// authority.
+pub const UPLINK_SOURCE_PORT_VALUE_LEN: usize = 68;
 
 /// Reserved impossible UE-PAA key carrying durable DSCP-schema evidence in
 /// the existing uplink FAR map.
@@ -102,6 +164,22 @@ pub const UPLINK_BEARER_SCHEMA_MARKER_VALUE: [u8; UPLINK_FAR_VALUE_LEN] = *b"OPC
 /// both exact current hooks are attached. A v2 marker is endpoint-unbound and
 /// requires explicit drained reprovisioning rather than an implicit policy.
 pub const UPLINK_ENDPOINT_SCHEMA_MARKER_VALUE: [u8; UPLINK_FAR_VALUE_LEN] = *b"OPC-PEER-v3\0";
+/// Current v4 schema marker proving that the additive uplink source-port maps
+/// contain one complete PDP-context commit record for every default and marked
+/// bearer and are available to both exact current tc programs.
+///
+/// The v3-to-v4 migration is additive, but not absence-based: before the v4
+/// program is attached or this marker is committed, userspace materializes an
+/// `Active` complete-graph commit carrying explicit legacy 2152 for every
+/// retained v3 bearer. A committed v4 pin set therefore treats a missing or
+/// inconsistent record as corrupt state and drops rather than silently
+/// changing policy. A live previous-generation (v3 object) tc
+/// hook does not match the current artifact and fails closed without
+/// mutation; it must be detached by its owning loader before adoption,
+/// exactly like the pre-v1 object generations. A loader that observes this
+/// value fails closed when either source-port map pin or any bearer's complete
+/// commit record is missing or inconsistent with its live graph.
+pub const UPLINK_SOURCE_PORT_SCHEMA_MARKER_VALUE: [u8; UPLINK_FAR_VALUE_LEN] = *b"OPC-SPORT-v4";
 
 /// BPF map name: uplink FAR, keyed by UE PAA (IPv4, network order).
 pub const MAP_UPLINK_FAR: &str = "GTPU_UPLINK_FAR";
@@ -117,6 +195,11 @@ pub const MAP_DOWNLINK_ENDPOINT_BINDING: &str = "GTPU_DL_BIND";
 pub const MAP_UPLINK_DSCP: &str = "GTPU_UPLINK_DSCP";
 /// BPF map name: optional uplink DSCP, keyed by `(UE PAA, packet mark)`.
 pub const MAP_UPLINK_MARK_DSCP: &str = "GTPU_ULM_DSCP";
+/// BPF map name: default PDP-context commit record, keyed by UE PAA.
+pub const MAP_UPLINK_SOURCE_PORT: &str = "GTPU_UL_SPORT";
+/// BPF map name: marked PDP-context commit record, keyed by
+/// `(UE PAA, packet mark)`.
+pub const MAP_UPLINK_MARK_SOURCE_PORT: &str = "GTPU_ULM_SPORT";
 /// BPF map name: marked-bearer owner journal, keyed by `(UE PAA, mark)`.
 pub const MAP_MARKED_BEARER_OWNER: &str = "GTPU_M_OWNER";
 /// BPF map name: per-CPU datapath counters.
@@ -428,6 +511,96 @@ impl GtpuSourcePortPolicy {
     }
 }
 
+/// Explicit uplink GTP-U UDP source-port selection policy.
+///
+/// TS 29.281 section 4.4.2 fixes the destination service port at 2152 and
+/// leaves the source port to be set dynamically. Every uplink PDP context
+/// carries one explicit policy; the pre-feature fixed-2152 behavior remains
+/// available only as [`GtpuUplinkSourcePortPolicy::LegacyServicePort`]. The
+/// granularity is deliberately per PDP/bearer context; a deterministic
+/// inner-flow-hashed mode is a possible future extension of this type.
+///
+/// Every policy, including the legacy policy, is persisted as the two-byte
+/// source-port field of an additive per-context [`PdpContextCommit`]. The
+/// legacy policy is encoded as the explicit big-endian value 2152. Port zero
+/// is reserved (RFC 768), and the service port 2152 has the single canonical
+/// meaning `LegacyServicePort`; callers that need that wire value use the
+/// legacy variant rather than constructing a redundant `Selected(2152)`.
+/// Invalid values are rejected at every construction and decode boundary,
+/// while commit-record absence is corrupt committed-v4 state and is handled
+/// fail closed by the host and tc boundaries.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum GtpuUplinkSourcePortPolicy {
+    /// Explicit legacy policy: the UDP source port is fixed to 2152, exactly
+    /// the pre-feature behavior.
+    #[default]
+    LegacyServicePort,
+    /// One selected per-PDP/bearer-context UDP source port, stable for every
+    /// packet of the context and across restarts.
+    Selected(u16),
+}
+
+impl core::fmt::Debug for GtpuUplinkSourcePortPolicy {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::LegacyServicePort => f.write_str("LegacyServicePort"),
+            Self::Selected(_) => f.debug_tuple("Selected").field(&"<redacted>").finish(),
+        }
+    }
+}
+
+impl GtpuUplinkSourcePortPolicy {
+    /// Construct a per-context selected-port policy.
+    ///
+    /// The reserved port zero and the canonical legacy service port 2152 fail
+    /// closed with `None`. Use [`Self::LegacyServicePort`] for fixed 2152.
+    #[must_use]
+    pub const fn selected(port: u16) -> Option<Self> {
+        if port == 0 || port == GTPU_UDP_PORT {
+            None
+        } else {
+            Some(Self::Selected(port))
+        }
+    }
+
+    /// Return the UDP source port stamped on uplink encapsulation under this
+    /// policy. The legacy policy yields [`GTPU_UDP_PORT`].
+    #[must_use]
+    pub const fn effective_source_port(self) -> u16 {
+        match self {
+            Self::LegacyServicePort => GTPU_UDP_PORT,
+            Self::Selected(port) => port,
+        }
+    }
+
+    /// Return the explicit two-byte commit-record field for this policy.
+    ///
+    /// Both variants are stored big endian. `None` is reserved for an enum
+    /// value constructed outside the checked constructor with either port
+    /// zero or the non-canonical `Selected(2152)` representation.
+    #[must_use]
+    pub const fn map_value(self) -> Option<[u8; UPLINK_SOURCE_PORT_POLICY_LEN]> {
+        match self {
+            Self::LegacyServicePort => Some(GTPU_UDP_PORT.to_be_bytes()),
+            Self::Selected(port) if port != 0 && port != GTPU_UDP_PORT => Some(port.to_be_bytes()),
+            Self::Selected(_) => None,
+        }
+    }
+
+    /// Decode an explicit two-byte commit-record field into its canonical policy.
+    /// A reserved zero port is corrupt adopted state and fails closed with
+    /// `None`; the service-port value decodes as the explicit legacy policy.
+    #[must_use]
+    pub const fn from_map_value(value: [u8; UPLINK_SOURCE_PORT_POLICY_LEN]) -> Option<Self> {
+        let port = u16::from_be_bytes(value);
+        if port == GTPU_UDP_PORT {
+            Some(Self::LegacyServicePort)
+        } else {
+            Self::selected(port)
+        }
+    }
+}
+
 /// Fixed-cardinality reason an outer packet failed a downlink binding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DownlinkBindingMismatch {
@@ -707,73 +880,127 @@ impl DownlinkEndpointBinding {
 }
 
 #[inline(always)]
-fn wire_range_is_nonzero(value: &[u8], start: usize, length: usize) -> bool {
-    let mut index = 0;
-    while index < length {
-        if value[start + index] != 0 {
-            return true;
-        }
-        index += 1;
+fn wire_u16<const N: usize>(value: &[u8; N], offset: usize) -> u16 {
+    (u16::from(value[offset]) << 8) | u16::from(value[offset + 1])
+}
+
+#[inline(always)]
+fn wire_u32<const N: usize>(value: &[u8; N], offset: usize) -> u32 {
+    (u32::from(value[offset]) << 24)
+        | (u32::from(value[offset + 1]) << 16)
+        | (u32::from(value[offset + 2]) << 8)
+        | u32::from(value[offset + 3])
+}
+
+#[inline(always)]
+fn wire_ipv6_is_nonzero<const N: usize>(value: &[u8; N], offset: usize) -> bool {
+    if wire_u32(value, offset) != 0 {
+        return true;
     }
-    false
-}
-
-#[inline(always)]
-fn wire_range_is_zero(value: &[u8], start: usize, length: usize) -> bool {
-    !wire_range_is_nonzero(value, start, length)
-}
-
-#[inline(always)]
-fn wire_ranges_equal(
-    left: &[u8],
-    left_start: usize,
-    right: &[u8],
-    right_start: usize,
-    length: usize,
-) -> bool {
-    let mut index = 0;
-    while index < length {
-        if left[left_start + index] != right[right_start + index] {
-            return false;
-        }
-        index += 1;
+    if wire_u32(value, offset + 4) != 0 {
+        return true;
     }
-    true
+    if wire_u32(value, offset + 8) != 0 {
+        return true;
+    }
+    wire_u32(value, offset + 12) != 0
 }
 
 #[inline(always)]
-fn binding_wire_is_valid(value: &[u8], base: usize) -> bool {
-    let family_valid = match value[base + 1] {
-        4 => {
-            wire_range_is_nonzero(value, base + 4, 4)
-                && wire_range_is_nonzero(value, base + 20, 4)
-                && wire_range_is_zero(value, base + 8, 12)
-                && wire_range_is_zero(value, base + 24, 12)
-        }
-        6 => {
-            wire_range_is_nonzero(value, base + 4, 16)
-                && wire_range_is_nonzero(value, base + 20, 16)
-        }
-        _ => false,
-    };
-    let first = u16::from_be_bytes([value[base + 40], value[base + 41]]);
-    let last = u16::from_be_bytes([value[base + 42], value[base + 43]]);
-    let policy_valid = match value[base + 2] {
+fn wire_ipv4_tail_is_zero<const N: usize>(value: &[u8; N], offset: usize) -> bool {
+    if wire_u32(value, offset) != 0 {
+        return false;
+    }
+    if wire_u32(value, offset + 4) != 0 {
+        return false;
+    }
+    wire_u32(value, offset + 8) == 0
+}
+
+#[inline(always)]
+fn binding_policy_wire_is_valid<const N: usize>(value: &[u8; N], base: usize) -> bool {
+    let first = wire_u16(value, base + 40);
+    let last = wire_u16(value, base + 42);
+    match value[base + 2] {
         0 => first == 0 && last == 0,
         1 => first == last,
         2 => first < last,
         _ => false,
+    }
+}
+
+#[inline(always)]
+fn binding_ipv4_wire_is_valid<const N: usize>(value: &[u8; N], base: usize) -> bool {
+    if value[base] != 1 || value[base + 1] != 4 || value[base + 3] != 0 {
+        return false;
+    }
+    if wire_u32(value, base + 4) == 0 || wire_u32(value, base + 20) == 0 {
+        return false;
+    }
+    if !wire_ipv4_tail_is_zero(value, base + 8) || !wire_ipv4_tail_is_zero(value, base + 24) {
+        return false;
+    }
+    if wire_u32(value, base + 36) == 0 {
+        return false;
+    }
+    binding_policy_wire_is_valid(value, base)
+}
+
+#[inline(always)]
+fn binding_wire_is_valid<const N: usize>(value: &[u8; N], base: usize) -> bool {
+    if value[base] != 1 || value[base + 3] != 0 || wire_u32(value, base + 36) == 0 {
+        return false;
+    }
+    let family_valid = match value[base + 1] {
+        4 => {
+            wire_u32(value, base + 4) != 0
+                && wire_u32(value, base + 20) != 0
+                && wire_ipv4_tail_is_zero(value, base + 8)
+                && wire_ipv4_tail_is_zero(value, base + 24)
+        }
+        6 => wire_ipv6_is_nonzero(value, base + 4) && wire_ipv6_is_nonzero(value, base + 20),
+        _ => false,
     };
-    value[base] == 1
-        && value[base + 3] == 0
-        && family_valid
-        && policy_valid
-        && u32::from_be_bytes([
-            value[base + 36],
-            value[base + 37],
-            value[base + 38],
-            value[base + 39],
-        ]) != 0
+    family_valid && binding_policy_wire_is_valid(value, base)
+}
+
+#[inline(always)]
+fn binding_wires_equal<const N: usize>(
+    value: &[u8; N],
+    base: usize,
+    binding: &[u8; DOWNLINK_ENDPOINT_BINDING_VALUE_LEN],
+) -> bool {
+    if wire_u32(value, base) != wire_u32(binding, 0) {
+        return false;
+    }
+    if wire_u32(value, base + 4) != wire_u32(binding, 4) {
+        return false;
+    }
+    if wire_u32(value, base + 8) != wire_u32(binding, 8) {
+        return false;
+    }
+    if wire_u32(value, base + 12) != wire_u32(binding, 12) {
+        return false;
+    }
+    if wire_u32(value, base + 16) != wire_u32(binding, 16) {
+        return false;
+    }
+    if wire_u32(value, base + 20) != wire_u32(binding, 20) {
+        return false;
+    }
+    if wire_u32(value, base + 24) != wire_u32(binding, 24) {
+        return false;
+    }
+    if wire_u32(value, base + 28) != wire_u32(binding, 28) {
+        return false;
+    }
+    if wire_u32(value, base + 32) != wire_u32(binding, 32) {
+        return false;
+    }
+    if wire_u32(value, base + 36) != wire_u32(binding, 36) {
+        return false;
+    }
+    wire_u32(value, base + 40) == wire_u32(binding, 40)
 }
 
 /// Validate an IPv4 packet against a canonical binding wire value.
@@ -796,17 +1023,17 @@ pub fn validate_ipv4_downlink_binding_wire(
     if value[1] != 4 {
         return Err(DownlinkBindingMismatch::AddressFamily);
     }
-    if !wire_ranges_equal(&peer_address, 0, value, 4, 4) {
+    if wire_u32(&peer_address, 0) != wire_u32(value, 4) {
         return Err(DownlinkBindingMismatch::PeerAddress);
     }
-    if !wire_ranges_equal(&local_address, 0, value, 20, 4) {
+    if wire_u32(&local_address, 0) != wire_u32(value, 20) {
         return Err(DownlinkBindingMismatch::LocalAddress);
     }
-    if ingress_ifindex != u32::from_be_bytes([value[36], value[37], value[38], value[39]]) {
+    if ingress_ifindex != wire_u32(value, 36) {
         return Err(DownlinkBindingMismatch::IngressAttachment);
     }
-    let first = u16::from_be_bytes([value[40], value[41]]);
-    let last = u16::from_be_bytes([value[42], value[43]]);
+    let first = wire_u16(value, 40);
+    let last = wire_u16(value, 42);
     let permitted = match value[2] {
         0 => true,
         1 => source_port == first,
@@ -1164,20 +1391,305 @@ impl MarkedBearerOwner {
     }
 }
 
+/// Durable commit authority for one complete PDP-context map graph.
+///
+/// The default and marked source-port maps store this value rather than a
+/// standalone port. A `Pending` or `Removing` record gates both tc directions
+/// fail closed while userspace mutates the component maps. `Active` is
+/// published last and authorizes traffic only when the live FAR, DSCP, local
+/// TEID, and endpoint binding match this same record exactly.
+///
+/// The first 64 bytes intentionally reuse the canonical
+/// [`MarkedBearerOwner`] encoding. Bytes 64..66 contain the explicit big-endian
+/// source port (including legacy 2152); bytes 66..68 are reserved zero. This is
+/// an additive v4-map ABI: pre-v4 pin sets have no source-port maps and are
+/// materialized from their already validated graph before v4 is committed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct PdpContextCommit {
+    owner: MarkedBearerOwner,
+    uplink_source_port_policy: GtpuUplinkSourcePortPolicy,
+    format_valid: bool,
+}
+
+impl core::fmt::Debug for PdpContextCommit {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PdpContextCommit")
+            .field("local_teid", &"<redacted>")
+            .field("uplink_far", &"<redacted>")
+            .field("egress_dscp", &self.egress_dscp())
+            .field("phase", &self.phase())
+            .field("downlink_binding", &"<redacted>")
+            .field("uplink_source_port_policy", &"<redacted>")
+            .field("format_valid", &self.format_valid)
+            .finish()
+    }
+}
+
+impl PdpContextCommit {
+    /// Construct a canonical complete-graph commit record.
+    #[must_use]
+    pub fn new(
+        local_teid: [u8; 4],
+        uplink_far: UplinkFar,
+        egress_dscp: Option<u8>,
+        downlink_binding: DownlinkEndpointBinding,
+        uplink_source_port_policy: GtpuUplinkSourcePortPolicy,
+        phase: MarkedBearerOwnerPhase,
+    ) -> Option<Self> {
+        uplink_source_port_policy.map_value()?;
+        let value = Self {
+            owner: MarkedBearerOwner::new(
+                local_teid,
+                uplink_far,
+                egress_dscp,
+                downlink_binding,
+                phase,
+            ),
+            uplink_source_port_policy,
+            format_valid: true,
+        };
+        value.is_valid().then_some(value)
+    }
+
+    /// Return this record with a different durable transaction phase.
+    #[must_use]
+    pub fn with_phase(self, phase: MarkedBearerOwnerPhase) -> Self {
+        let format_valid = self.is_valid();
+        Self {
+            owner: MarkedBearerOwner::new(
+                self.owner.local_teid,
+                self.owner.uplink_far,
+                self.owner.egress_dscp(),
+                self.owner.downlink_binding,
+                phase,
+            ),
+            uplink_source_port_policy: self.uplink_source_port_policy,
+            // A phase transition must never normalize malformed decoded
+            // state into a record that can later become authoritative.
+            format_valid,
+        }
+    }
+
+    /// Return the local/downlink TEID owned by this transaction.
+    #[must_use]
+    pub const fn local_teid(self) -> [u8; 4] {
+        self.owner.local_teid
+    }
+
+    /// Return the complete uplink FAR owned by this transaction.
+    #[must_use]
+    pub const fn uplink_far(self) -> UplinkFar {
+        self.owner.uplink_far
+    }
+
+    /// Return the optional fixed uplink DSCP.
+    #[must_use]
+    pub fn egress_dscp(&self) -> Option<u8> {
+        self.owner.egress_dscp()
+    }
+
+    /// Return the canonical DSCP wire byte (`0xff` means absent).
+    #[must_use]
+    pub const fn egress_dscp_wire(&self) -> u8 {
+        self.owner.egress_dscp_wire()
+    }
+
+    /// Return the exact downlink endpoint binding owned by this transaction.
+    #[must_use]
+    pub const fn downlink_binding(self) -> DownlinkEndpointBinding {
+        self.owner.downlink_binding
+    }
+
+    /// Return the explicit uplink source-port policy.
+    #[must_use]
+    pub const fn uplink_source_port_policy(self) -> GtpuUplinkSourcePortPolicy {
+        self.uplink_source_port_policy
+    }
+
+    /// Return the durable transaction phase.
+    #[must_use]
+    pub const fn phase(self) -> MarkedBearerOwnerPhase {
+        self.owner.phase
+    }
+
+    /// Return the corresponding marked-bearer owner journal value.
+    #[must_use]
+    pub const fn marked_owner(self) -> MarkedBearerOwner {
+        self.owner
+    }
+
+    /// Return whether every field and reserved byte is canonical.
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        self.format_valid
+            && self.owner.is_valid()
+            && self.uplink_source_port_policy.map_value().is_some()
+    }
+
+    /// Return whether this Active record matches a complete live default graph.
+    #[must_use]
+    pub fn authorizes_graph(
+        &self,
+        local_teid: [u8; 4],
+        far: &UplinkFar,
+        dscp: Option<u8>,
+        binding: &DownlinkEndpointBinding,
+    ) -> bool {
+        self.is_valid()
+            && self.phase() == MarkedBearerOwnerPhase::Active
+            && self.local_teid() == local_teid
+            && self.uplink_far() == *far
+            && self.egress_dscp() == dscp
+            && self.downlink_binding() == *binding
+    }
+
+    /// Encode into the fixed durable commit-record layout.
+    #[must_use]
+    pub const fn encode(self) -> [u8; UPLINK_SOURCE_PORT_VALUE_LEN] {
+        let owner = self.owner.encode();
+        let policy = match self.uplink_source_port_policy.map_value() {
+            Some(value) => value,
+            None => [0; UPLINK_SOURCE_PORT_POLICY_LEN],
+        };
+        let mut encoded = [0_u8; UPLINK_SOURCE_PORT_VALUE_LEN];
+        let mut index = 0;
+        while index < MARKED_BEARER_OWNER_VALUE_LEN {
+            encoded[index] = owner[index];
+            index += 1;
+        }
+        encoded[64] = policy[0];
+        encoded[65] = policy[1];
+        encoded
+    }
+
+    /// Decode a durable record while retaining canonical-format evidence.
+    #[must_use]
+    pub const fn decode(value: &[u8; UPLINK_SOURCE_PORT_VALUE_LEN]) -> Self {
+        let mut owner = [0_u8; MARKED_BEARER_OWNER_VALUE_LEN];
+        let mut index = 0;
+        while index < MARKED_BEARER_OWNER_VALUE_LEN {
+            owner[index] = value[index];
+            index += 1;
+        }
+        let (uplink_source_port_policy, policy_valid) =
+            match GtpuUplinkSourcePortPolicy::from_map_value([value[64], value[65]]) {
+                Some(policy) => (policy, true),
+                None => (GtpuUplinkSourcePortPolicy::LegacyServicePort, false),
+            };
+        Self {
+            owner: MarkedBearerOwner::decode(&owner),
+            uplink_source_port_policy,
+            format_valid: policy_valid && value[66] == 0 && value[67] == 0,
+        }
+    }
+}
+
+#[inline(always)]
+fn bearer_owner_ipv4_wire_is_valid<const N: usize>(value: &[u8; N]) -> bool {
+    if value[17] != 2 || !matches!(value[18], 1..=3) || value[19] != 0 {
+        return false;
+    }
+    if wire_u32(value, 0) == 0
+        || wire_u32(value, 4) == 0
+        || wire_u32(value, 8) == 0
+        || wire_u32(value, 12) == 0
+    {
+        return false;
+    }
+    if value[16] > 63 && value[16] != 0xff {
+        return false;
+    }
+    if !binding_ipv4_wire_is_valid(value, 20) {
+        return false;
+    }
+    if wire_u32(value, 4) != wire_u32(value, 24) {
+        return false;
+    }
+    wire_u32(value, 8) == wire_u32(value, 40)
+}
+
+#[inline(never)]
+fn pdp_commit_wire_is_valid(value: &[u8; UPLINK_SOURCE_PORT_VALUE_LEN]) -> bool {
+    if !bearer_owner_ipv4_wire_is_valid(value) {
+        return false;
+    }
+    wire_u16(value, 64) != 0 && value[66] == 0 && value[67] == 0
+}
+
+/// Return the committed UDP source port when an encoded Active record
+/// authorizes the exact live uplink FAR and DSCP state.
+///
+/// `None` means the record is malformed, transitional, or inconsistent and
+/// the tc program must drop fail closed.
+#[must_use]
+pub fn pdp_commit_wire_authorized_source_port(
+    value: &[u8; UPLINK_SOURCE_PORT_VALUE_LEN],
+    far: &UplinkFar,
+    dscp_wire: u8,
+) -> Option<u16> {
+    if !pdp_commit_wire_is_valid(value)
+        || value[18] != MarkedBearerOwnerPhase::Active as u8
+        || wire_u32(value, 4) != wire_u32(&far.peer_ip, 0)
+        || wire_u32(value, 8) != wire_u32(&far.local_ip, 0)
+        || wire_u32(value, 12) != wire_u32(&far.o_teid, 0)
+        || value[16] != dscp_wire
+    {
+        return None;
+    }
+    Some(wire_u16(value, 64))
+}
+
+/// Return whether an encoded Active record authorizes the exact local TEID and
+/// downlink endpoint binding.
+#[must_use]
+#[inline(never)]
+pub fn pdp_commit_wire_authorizes_downlink(
+    value: &[u8; UPLINK_SOURCE_PORT_VALUE_LEN],
+    local_teid: [u8; 4],
+    binding: &[u8; DOWNLINK_ENDPOINT_BINDING_VALUE_LEN],
+) -> bool {
+    pdp_commit_wire_is_valid(value)
+        && value[18] == MarkedBearerOwnerPhase::Active as u8
+        && wire_u32(value, 0) == wire_u32(&local_teid, 0)
+        && binding_wires_equal(value, 20, binding)
+}
+
+/// Return whether an encoded Active record authorizes the complete live graph
+/// observed by either tc direction.
+///
+/// This combines the exact FAR/DSCP check used for uplink encapsulation with
+/// the exact local-TEID/binding check used before downlink decapsulation. It
+/// prevents either hook from accepting one half of a crash-mixed graph.
+#[must_use]
+#[inline(never)]
+pub fn pdp_commit_wire_authorizes_graph(
+    value: &[u8; UPLINK_SOURCE_PORT_VALUE_LEN],
+    local_teid: [u8; 4],
+    far: &UplinkFar,
+    dscp_wire: u8,
+    binding: &[u8; DOWNLINK_ENDPOINT_BINDING_VALUE_LEN],
+) -> bool {
+    if !pdp_commit_wire_is_valid(value) || value[18] != MarkedBearerOwnerPhase::Active as u8 {
+        return false;
+    }
+    if wire_u32(value, 0) != wire_u32(&local_teid, 0) {
+        return false;
+    }
+    if wire_u32(value, 4) != wire_u32(&far.peer_ip, 0) {
+        return false;
+    }
+    if wire_u32(value, 8) != wire_u32(&far.local_ip, 0) {
+        return false;
+    }
+    if wire_u32(value, 12) != wire_u32(&far.o_teid, 0) || value[16] != dscp_wire {
+        return false;
+    }
+    binding_wires_equal(value, 20, binding)
+}
+
 #[inline(always)]
 fn marked_owner_wire_is_valid(value: &[u8; MARKED_BEARER_OWNER_VALUE_LEN]) -> bool {
-    value[17] == 2
-        && matches!(value[18], 1..=3)
-        && value[19] == 0
-        && wire_range_is_nonzero(value, 0, 4)
-        && wire_range_is_nonzero(value, 4, 4)
-        && wire_range_is_nonzero(value, 8, 4)
-        && wire_range_is_nonzero(value, 12, 4)
-        && (value[16] <= 63 || value[16] == 0xff)
-        && binding_wire_is_valid(value, 20)
-        && value[21] == 4
-        && wire_ranges_equal(value, 4, value, 24, 4)
-        && wire_ranges_equal(value, 8, value, 40, 4)
+    bearer_owner_ipv4_wire_is_valid(value)
 }
 
 /// Return whether an encoded owner journal authorizes exact marked uplink
@@ -1187,17 +1699,22 @@ fn marked_owner_wire_is_valid(value: &[u8; MARKED_BEARER_OWNER_VALUE_LEN]) -> bo
 /// [`MarkedBearerOwner::decode`] followed by
 /// [`MarkedBearerOwner::authorizes_uplink`].
 #[must_use]
+#[inline(never)]
 pub fn marked_owner_wire_authorizes_uplink(
     value: &[u8; MARKED_BEARER_OWNER_VALUE_LEN],
     far: &UplinkFar,
     dscp_wire: u8,
 ) -> bool {
-    marked_owner_wire_is_valid(value)
-        && value[18] == MarkedBearerOwnerPhase::Active as u8
-        && wire_ranges_equal(value, 4, &far.peer_ip, 0, 4)
-        && wire_ranges_equal(value, 8, &far.local_ip, 0, 4)
-        && wire_ranges_equal(value, 12, &far.o_teid, 0, 4)
-        && value[16] == dscp_wire
+    if !marked_owner_wire_is_valid(value) || value[18] != MarkedBearerOwnerPhase::Active as u8 {
+        return false;
+    }
+    if wire_u32(value, 4) != wire_u32(&far.peer_ip, 0) {
+        return false;
+    }
+    if wire_u32(value, 8) != wire_u32(&far.local_ip, 0) {
+        return false;
+    }
+    wire_u32(value, 12) == wire_u32(&far.o_teid, 0) && value[16] == dscp_wire
 }
 
 /// Return whether an encoded owner journal authorizes the exact local TEID
@@ -1207,15 +1724,19 @@ pub fn marked_owner_wire_authorizes_uplink(
 /// [`MarkedBearerOwner::decode`] followed by
 /// [`MarkedBearerOwner::authorizes_downlink`].
 #[must_use]
+#[inline(never)]
 pub fn marked_owner_wire_authorizes_downlink(
     value: &[u8; MARKED_BEARER_OWNER_VALUE_LEN],
     local_teid: [u8; 4],
     binding: &[u8; DOWNLINK_ENDPOINT_BINDING_VALUE_LEN],
 ) -> bool {
-    marked_owner_wire_is_valid(value)
-        && value[18] == MarkedBearerOwnerPhase::Active as u8
-        && wire_ranges_equal(value, 0, &local_teid, 0, 4)
-        && wire_ranges_equal(value, 20, binding, 0, DOWNLINK_ENDPOINT_BINDING_VALUE_LEN)
+    if !marked_owner_wire_is_valid(value) || value[18] != MarkedBearerOwnerPhase::Active as u8 {
+        return false;
+    }
+    if wire_u32(value, 0) != wire_u32(&local_teid, 0) {
+        return false;
+    }
+    binding_wires_equal(value, 20, binding)
 }
 
 /// Compute the IPv4 header checksum over a 20-byte option-free header.
@@ -1269,7 +1790,29 @@ pub fn build_uplink_encap_with_dscp(
     inner_len: u16,
     dscp: Option<u8>,
 ) -> Option<[u8; GTPU_ENCAP_LEN]> {
+    build_uplink_encap_with_dscp_and_source_port(far, inner_len, dscp, GTPU_UDP_PORT)
+}
+
+/// Build uplink encapsulation with an optional fixed outer DSCP codepoint
+/// and an explicit UDP source port.
+///
+/// The UDP destination port is always [`GTPU_UDP_PORT`] (TS 29.281 section
+/// 4.4.2 fixes the destination service port). `source_port` selects the UDP
+/// source port; the reserved port zero fails closed with `None`. Passing
+/// [`GTPU_UDP_PORT`] is byte-for-byte equivalent to
+/// [`build_uplink_encap_with_dscp`]. DSCP handling matches
+/// [`build_uplink_encap_with_dscp`].
+#[must_use]
+pub fn build_uplink_encap_with_dscp_and_source_port(
+    far: &UplinkFar,
+    inner_len: u16,
+    dscp: Option<u8>,
+    source_port: u16,
+) -> Option<[u8; GTPU_ENCAP_LEN]> {
     const ENCAP: u16 = GTPU_ENCAP_LEN as u16;
+    if source_port == 0 {
+        return None;
+    }
     if dscp.is_some_and(|value| value > 63) {
         return None;
     }
@@ -1293,7 +1836,7 @@ pub fn build_uplink_encap_with_dscp(
     let checksum = ipv4_header_checksum(&ip_header);
     out[10..12].copy_from_slice(&checksum.to_be_bytes());
     // UDP header.
-    out[20..22].copy_from_slice(&GTPU_UDP_PORT.to_be_bytes());
+    out[20..22].copy_from_slice(&source_port.to_be_bytes());
     out[22..24].copy_from_slice(&GTPU_UDP_PORT.to_be_bytes());
     out[24..26].copy_from_slice(&udp_len.to_be_bytes());
     // out[26..28] UDP checksum stays 0.
@@ -1358,6 +1901,25 @@ mod tests {
             peer_ip: [192, 0, 2, 10],
             local_ip: [192, 0, 2, 1],
             o_teid: [0x20, 0x00, 0x00, 0x01],
+        }
+    }
+
+    #[test]
+    fn downlink_parse_result_preserves_maximum_ipv4_total_length() {
+        let teid = 0x1020_3040_u32.to_be_bytes();
+        for total_length in [65_521_u16, 65_522, u16::MAX] {
+            let frame_end = downlink_frame_end(total_length).expect("u16 length plus Ethernet");
+            let bounds = Ipv4EnvelopeBounds::parse(frame_end as usize, 0x45, total_length)
+                .expect("boundary IPv4 envelope");
+            let packed = pack_downlink_parse_result(total_length, 4_174, teid);
+            assert_eq!(downlink_parse_ipv4_total_length(packed), total_length);
+            assert_eq!(downlink_parse_payload_offset(packed), 4_174);
+            assert_eq!(downlink_parse_teid(packed), teid);
+            assert_eq!(bounds.ip_end(), frame_end as usize);
+            assert_eq!(
+                downlink_frame_end(downlink_parse_ipv4_total_length(packed)),
+                Some(frame_end)
+            );
         }
     }
 
@@ -1616,6 +2178,8 @@ mod tests {
             MAP_DOWNLINK_ENDPOINT_BINDING,
             MAP_DOWNLINK_BINDING_COUNTERS,
             MAP_MARKED_BEARER_OWNER,
+            MAP_UPLINK_SOURCE_PORT,
+            MAP_UPLINK_MARK_SOURCE_PORT,
         ];
         for name in new_names {
             assert!(name.len() <= BPF_OBJ_NAME_VISIBLE_LEN);
@@ -1625,6 +2189,8 @@ mod tests {
             MAP_UPLINK_MARK_FAR,
             MAP_UPLINK_DSCP,
             MAP_UPLINK_MARK_DSCP,
+            MAP_UPLINK_SOURCE_PORT,
+            MAP_UPLINK_MARK_SOURCE_PORT,
             MAP_DOWNLINK_PDR,
             MAP_DOWNLINK_MARK_PDR,
             MAP_DOWNLINK_ENDPOINT_BINDING,
@@ -1685,6 +2251,149 @@ mod tests {
         assert!(!debug.contains("192"));
         assert!(!debug.contains("268435457"));
         assert!(!debug.contains("536870913"));
+    }
+
+    fn canonical_commit(phase: MarkedBearerOwnerPhase) -> PdpContextCommit {
+        let owner = canonical_owner(phase);
+        PdpContextCommit::new(
+            owner.local_teid,
+            owner.uplink_far,
+            owner.egress_dscp(),
+            owner.downlink_binding,
+            GtpuUplinkSourcePortPolicy::selected(40_000).unwrap(),
+            phase,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn pdp_commit_round_trips_explicit_v4_layout_and_redacts_identity() {
+        let commit = canonical_commit(MarkedBearerOwnerPhase::Active);
+        let encoded = commit.encode();
+        assert_eq!(
+            &encoded[..MARKED_BEARER_OWNER_VALUE_LEN],
+            &commit.marked_owner().encode()
+        );
+        assert_eq!(&encoded[64..], &[0x9c, 0x40, 0, 0]);
+        assert_eq!(PdpContextCommit::decode(&encoded), commit);
+        assert!(commit.is_valid());
+        let debug = std::format!("{commit:?}");
+        for forbidden in ["192", "40000", "268435457", "536870913"] {
+            assert!(!debug.contains(forbidden));
+        }
+    }
+
+    #[test]
+    fn active_pdp_commit_authorizes_only_the_exact_complete_graph() {
+        let commit = canonical_commit(MarkedBearerOwnerPhase::Active);
+        let encoded = commit.encode();
+        let owner = commit.marked_owner();
+        let binding = owner.downlink_binding.encode();
+        assert_eq!(
+            pdp_commit_wire_authorized_source_port(&encoded, &owner.uplink_far, 46),
+            Some(40_000)
+        );
+        assert!(pdp_commit_wire_authorizes_downlink(
+            &encoded,
+            owner.local_teid,
+            &binding
+        ));
+        assert!(pdp_commit_wire_authorizes_graph(
+            &encoded,
+            owner.local_teid,
+            &owner.uplink_far,
+            46,
+            &binding,
+        ));
+
+        let mut wrong_far = owner.uplink_far;
+        wrong_far.o_teid = 0x2000_0002_u32.to_be_bytes();
+        assert!(!pdp_commit_wire_authorizes_graph(
+            &encoded,
+            owner.local_teid,
+            &wrong_far,
+            46,
+            &binding,
+        ));
+        assert!(!pdp_commit_wire_authorizes_graph(
+            &encoded,
+            owner.local_teid,
+            &owner.uplink_far,
+            10,
+            &binding,
+        ));
+        let mut wrong_binding = binding;
+        wrong_binding[4] ^= 1;
+        assert!(!pdp_commit_wire_authorizes_graph(
+            &encoded,
+            owner.local_teid,
+            &owner.uplink_far,
+            46,
+            &wrong_binding,
+        ));
+    }
+
+    #[test]
+    fn transitional_or_malformed_pdp_commit_gates_both_directions() {
+        for phase in [
+            MarkedBearerOwnerPhase::Pending,
+            MarkedBearerOwnerPhase::Removing,
+        ] {
+            let commit = canonical_commit(phase);
+            let owner = commit.marked_owner();
+            let encoded = commit.encode();
+            assert!(
+                pdp_commit_wire_authorized_source_port(&encoded, &owner.uplink_far, 46).is_none()
+            );
+            assert!(!pdp_commit_wire_authorizes_downlink(
+                &encoded,
+                owner.local_teid,
+                &owner.downlink_binding.encode(),
+            ));
+        }
+
+        let commit = canonical_commit(MarkedBearerOwnerPhase::Active);
+        let owner = commit.marked_owner();
+        let mut malformed = commit.encode();
+        malformed[64] = 0;
+        malformed[65] = 0;
+        assert!(!PdpContextCommit::decode(&malformed).is_valid());
+        assert!(!pdp_commit_wire_authorizes_graph(
+            &malformed,
+            owner.local_teid,
+            &owner.uplink_far,
+            46,
+            &owner.downlink_binding.encode(),
+        ));
+        for offset in [66, 67] {
+            let mut malformed = commit.encode();
+            malformed[offset] = 1;
+            let decoded = PdpContextCommit::decode(&malformed);
+            assert!(!decoded.is_valid());
+            assert!(
+                !decoded
+                    .with_phase(MarkedBearerOwnerPhase::Pending)
+                    .is_valid(),
+                "a phase change must not canonicalize malformed input"
+            );
+            assert!(!pdp_commit_wire_authorizes_graph(
+                &malformed,
+                owner.local_teid,
+                &owner.uplink_far,
+                46,
+                &owner.downlink_binding.encode(),
+            ));
+        }
+        let mut malformed_owner = commit.encode();
+        malformed_owner[19] = 1;
+        let decoded = PdpContextCommit::decode(&malformed_owner);
+        assert!(!decoded.is_valid());
+        assert!(
+            !decoded
+                .with_phase(MarkedBearerOwnerPhase::Removing)
+                .is_valid(),
+            "a phase change must preserve malformed owner evidence"
+        );
     }
 
     #[test]
@@ -1873,6 +2582,69 @@ mod tests {
         );
         assert!(build_uplink_encap_with_dscp(&far(), 60, Some(64)).is_none());
         assert!(build_uplink_encap_with_dscp(&far(), 60, Some(u8::MAX)).is_none());
+    }
+
+    #[test]
+    fn legacy_service_port_policy_preserves_exact_legacy_encapsulation() {
+        assert_eq!(
+            GtpuUplinkSourcePortPolicy::LegacyServicePort.effective_source_port(),
+            GTPU_UDP_PORT
+        );
+        assert_eq!(
+            GtpuUplinkSourcePortPolicy::LegacyServicePort.map_value(),
+            Some(GTPU_UDP_PORT.to_be_bytes())
+        );
+        // Byte-for-byte regression: the legacy policy emits exactly the
+        // pre-feature source/destination 2152 bytes.
+        assert_eq!(
+            build_uplink_encap(&far(), 60),
+            build_uplink_encap_with_dscp_and_source_port(&far(), 60, None, GTPU_UDP_PORT)
+        );
+        assert_eq!(
+            build_uplink_encap_with_dscp(&far(), 60, Some(46)),
+            build_uplink_encap_with_dscp_and_source_port(&far(), 60, Some(46), GTPU_UDP_PORT)
+        );
+    }
+
+    #[test]
+    fn selected_source_port_is_stamped_and_destination_remains_2152() {
+        let encap = build_uplink_encap_with_dscp_and_source_port(&far(), 60, None, 40_000).unwrap();
+        assert_eq!(u16::from_be_bytes([encap[20], encap[21]]), 40_000);
+        assert_eq!(u16::from_be_bytes([encap[22], encap[23]]), GTPU_UDP_PORT);
+        // The IPv4 header checksum does not cover UDP ports and every other
+        // byte matches the legacy encapsulation except the source port.
+        let legacy = build_uplink_encap(&far(), 60).unwrap();
+        assert_eq!(&encap[..20], &legacy[..20]);
+        assert_eq!(&encap[22..], &legacy[22..]);
+    }
+
+    #[test]
+    fn reserved_zero_source_port_fails_closed_everywhere() {
+        assert!(GtpuUplinkSourcePortPolicy::selected(0).is_none());
+        assert!(GtpuUplinkSourcePortPolicy::selected(GTPU_UDP_PORT).is_none());
+        assert_eq!(GtpuUplinkSourcePortPolicy::Selected(0).map_value(), None);
+        assert_eq!(
+            GtpuUplinkSourcePortPolicy::Selected(GTPU_UDP_PORT).map_value(),
+            None
+        );
+        assert!(GtpuUplinkSourcePortPolicy::from_map_value([0, 0]).is_none());
+        assert!(build_uplink_encap_with_dscp_and_source_port(&far(), 60, None, 0).is_none());
+    }
+
+    #[test]
+    fn source_port_policy_map_value_round_trips_big_endian() {
+        let policy = GtpuUplinkSourcePortPolicy::selected(49_152).unwrap();
+        assert_eq!(policy.map_value(), Some([0xC0, 0x00]));
+        assert_eq!(
+            GtpuUplinkSourcePortPolicy::from_map_value([0xC0, 0x00]),
+            Some(policy)
+        );
+        assert_eq!(policy.effective_source_port(), 49_152);
+        assert_eq!(
+            GtpuUplinkSourcePortPolicy::from_map_value(GTPU_UDP_PORT.to_be_bytes()),
+            Some(GtpuUplinkSourcePortPolicy::LegacyServicePort)
+        );
+        assert!(!std::format!("{policy:?}").contains("49152"));
     }
 
     #[test]

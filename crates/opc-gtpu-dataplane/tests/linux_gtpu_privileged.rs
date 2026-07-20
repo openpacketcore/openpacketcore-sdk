@@ -36,6 +36,8 @@ async fn create_install_remove_destroy_gtpu_device_in_current_netns(
         gtp_version: GtpVersion::V1,
         bearer_mark: None,
         egress_dscp: None,
+        uplink_source_port_policy:
+            opc_gtpu_dataplane::GtpuUplinkSourcePortPolicy::LegacyServicePort,
     };
 
     let result = async {
@@ -152,6 +154,8 @@ async fn mixed_inner_outer_families_read_back_and_reconcile_in_current_netns(
             gtp_version: GtpVersion::V1,
             bearer_mark: None,
             egress_dscp: None,
+            uplink_source_port_policy:
+                opc_gtpu_dataplane::GtpuUplinkSourcePortPolicy::LegacyServicePort,
         };
 
         let result = async {

@@ -510,6 +510,12 @@ impl GtpuDataplaneBackend for MockGtpuDataplaneBackend {
                 feature: "fixed_outer_dscp",
             });
         }
+        if request.uplink_source_port_policy != crate::GtpuUplinkSourcePortPolicy::LegacyServicePort
+        {
+            return Err(GtpuError::UnsupportedFeature {
+                feature: "uplink_source_port_selection",
+            });
+        }
         if request.link_ifindex == 0 {
             return Err(GtpuError::invalid_config(
                 "pdp.link_ifindex",
@@ -733,6 +739,7 @@ mod tests {
             gtp_version: GtpVersion::V1,
             bearer_mark: None,
             egress_dscp: None,
+            uplink_source_port_policy: crate::GtpuUplinkSourcePortPolicy::LegacyServicePort,
         }
     }
 

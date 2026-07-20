@@ -591,7 +591,7 @@ structural evidence, not an exact-byte reproducibility claim. A privileged
 fresh-namespace qualification test loads and attaches the exact hash-pinned
 object without traffic solely to prove the live program tags, program-to-map
 binding, exact hook removal, nine-pin cleanup, and subsequent fresh
-endpoint-bound v3 provisioning. Unit tests cover each mutation failure phase,
+source-port-v4 provisioning. Unit tests cover each mutation failure phase,
 acknowledgement loss, idempotent retry, proof-only crash fencing, concurrent
 state reappearance, foreign path shapes, and refusal classifications.
 

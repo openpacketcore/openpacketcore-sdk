@@ -4,7 +4,9 @@ use std::fmt;
 use std::net::{IpAddr, Ipv4Addr};
 use std::num::NonZeroU32;
 
-pub use opc_gtpu_ebpf_common::{GtpuSourcePortPolicy, GtpuSourcePortRange};
+pub use opc_gtpu_ebpf_common::{
+    GtpuSourcePortPolicy, GtpuSourcePortRange, GtpuUplinkSourcePortPolicy,
+};
 use opc_types::DscpCodepoint;
 
 /// Default GTP-U UDP port.
@@ -169,7 +171,7 @@ impl GtpuV2DrainProof {
 }
 
 /// Request to remove one positively identified drained legacy v2 eBPF pin
-/// graph before provisioning the endpoint-bound v3 schema.
+/// graph before provisioning the current source-port-v4 schema.
 #[derive(Clone, PartialEq, Eq)]
 pub struct DrainedV2TeardownRequest {
     device: GtpDevice,
@@ -234,7 +236,7 @@ pub enum DrainedV2TeardownRefusal {
 /// Stable progress classification for an incomplete teardown.
 ///
 /// Every value is safe to persist as operator evidence. A caller must retry
-/// the exact same request and must not provision v3 until it observes
+/// the exact same request and must not provision the current schema until it observes
 /// [`DrainedV2TeardownOutcome::Removed`] or
 /// [`DrainedV2TeardownOutcome::AlreadyAbsent`].
 #[non_exhaustive]
@@ -428,6 +430,20 @@ pub struct GtpPdpContext {
     /// map and wire bytes; successful eBPF downlink decapsulation explicitly
     /// clears the complete packet mark to the default-bearer value zero.
     pub bearer_mark: Option<GtpBearerMark>,
+    /// Explicit uplink UDP source-port selection policy.
+    ///
+    /// TS 29.281 section 4.4.2 fixes the destination service port at 2152 and
+    /// leaves the source port dynamic.
+    /// [`GtpuUplinkSourcePortPolicy::LegacyServicePort`] is the explicit
+    /// pre-feature fixed-2152 behavior;
+    /// [`GtpuUplinkSourcePortPolicy::Selected`] persists one stable
+    /// per-context port in the eBPF uplink source-port maps. Backends whose
+    /// [`GtpuProbe::uplink_source_port_selection`] is not
+    /// [`GtpuCapability::Available`] reject a non-legacy policy rather than
+    /// silently falling back to 2152. This uplink selection is independent
+    /// of `downlink_source_port_policy`: a peer is never assumed to return
+    /// traffic from the selected port.
+    pub uplink_source_port_policy: GtpuUplinkSourcePortPolicy,
     /// Optional fixed DSCP stamped on the outer uplink IP header.
     ///
     /// The Linux eBPF backend supports this per PDP context. Backends whose
@@ -449,6 +465,7 @@ impl fmt::Debug for GtpPdpContext {
             .field("gtp_version", &self.gtp_version)
             .field("bearer_mark", &self.bearer_mark)
             .field("egress_dscp", &self.egress_dscp)
+            .field("uplink_source_port_policy", &"<redacted>")
             .finish()
     }
 }
@@ -705,6 +722,8 @@ pub enum PdpContextMismatchField {
     EgressDscp,
     /// Inbound GTP-U source-port policy.
     DownlinkSourcePortPolicy,
+    /// Uplink GTP-U source-port selection policy.
+    UplinkSourcePortPolicy,
 }
 
 /// Selector axes occupied by valid state that conflicts with a request.
@@ -860,7 +879,7 @@ pub(crate) fn pdp_context_mismatches(
     existing: &GtpPdpContext,
     desired: &GtpPdpContext,
 ) -> Vec<PdpContextMismatchField> {
-    let mut fields = Vec::with_capacity(9);
+    let mut fields = Vec::with_capacity(10);
     if existing.local_teid != desired.local_teid {
         fields.push(PdpContextMismatchField::LocalTeid);
     }
@@ -887,6 +906,9 @@ pub(crate) fn pdp_context_mismatches(
     }
     if existing.downlink_source_port_policy != desired.downlink_source_port_policy {
         fields.push(PdpContextMismatchField::DownlinkSourcePortPolicy);
+    }
+    if existing.uplink_source_port_policy != desired.uplink_source_port_policy {
+        fields.push(PdpContextMismatchField::UplinkSourcePortPolicy);
     }
     fields
 }
@@ -1041,6 +1063,9 @@ pub struct GtpuProbe {
     /// Ability to bind every downlink PDR to an exact outer peer/local pair,
     /// ingress attachment, address family, and explicit source-port policy.
     pub downlink_endpoint_binding: GtpuCapability,
+    /// Ability to stamp a stable per-PDP-context UDP source port on uplink
+    /// outer headers while the destination remains the fixed service port.
+    pub uplink_source_port_selection: GtpuCapability,
     /// Optional human-readable detail; static so the probe stays `Copy`.
     pub details: Option<&'static str>,
 }
@@ -1060,6 +1085,7 @@ impl GtpuProbe {
             egress_dscp_marking: GtpuCapability::Missing,
             per_bearer_marking: GtpuCapability::Missing,
             downlink_endpoint_binding: GtpuCapability::Missing,
+            uplink_source_port_selection: GtpuCapability::Missing,
             details: Some("dry-run/mock backend"),
         }
     }
@@ -1078,6 +1104,7 @@ impl GtpuProbe {
             egress_dscp_marking: GtpuCapability::Missing,
             per_bearer_marking: GtpuCapability::Missing,
             downlink_endpoint_binding: GtpuCapability::Missing,
+            uplink_source_port_selection: GtpuCapability::Missing,
             details: Some("GTP-U dataplane operations are not supported on this platform"),
         }
     }
@@ -1099,6 +1126,7 @@ mod tests {
             gtp_version: GtpVersion::V1,
             bearer_mark: Some(GtpBearerMark::new(0x3456_789a).unwrap()),
             egress_dscp: Some(DscpCodepoint::new(46).unwrap()),
+            uplink_source_port_policy: GtpuUplinkSourcePortPolicy::selected(40_000).unwrap(),
         }
     }
 
@@ -1146,6 +1174,7 @@ mod tests {
             gtp_version: GtpVersion::V1,
             bearer_mark: Some(GtpBearerMark::new(0x3456_789a).unwrap()),
             egress_dscp: None,
+            uplink_source_port_policy: GtpuUplinkSourcePortPolicy::selected(40_000).unwrap(),
         };
         let debug = format!("{ctx:?}");
         assert!(!debug.contains("12345678"));
@@ -1154,6 +1183,7 @@ mod tests {
         assert!(!debug.contains("::1"));
         assert!(!debug.contains("3456789a"));
         assert!(!debug.contains("21152"));
+        assert!(!debug.contains("40000"));
     }
 
     #[test]
@@ -1207,6 +1237,7 @@ mod tests {
         existing.bearer_mark = None;
         existing.egress_dscp = None;
         existing.downlink_source_port_policy = GtpuSourcePortPolicy::Any;
+        existing.uplink_source_port_policy = GtpuUplinkSourcePortPolicy::LegacyServicePort;
 
         let conflict = PdpContextConflict::new(
             PdpContextSelectorOccupancy::Both,
@@ -1224,6 +1255,7 @@ mod tests {
                 PdpContextMismatchField::BearerMark,
                 PdpContextMismatchField::EgressDscp,
                 PdpContextMismatchField::DownlinkSourcePortPolicy,
+                PdpContextMismatchField::UplinkSourcePortPolicy,
             ]
         );
         let debug = format!("{conflict:?}");
@@ -1234,6 +1266,7 @@ mod tests {
             "192.0.2.10",
             "3456789a",
             "21152",
+            "40000",
         ] {
             assert!(!debug.contains(sensitive));
         }
@@ -1334,6 +1367,7 @@ mod tests {
             gtp_version: GtpVersion::V1,
             bearer_mark: None,
             egress_dscp: None,
+            uplink_source_port_policy: GtpuUplinkSourcePortPolicy::LegacyServicePort,
         };
         let remove = RemovePdpContextRequest::from_context(&ctx);
         assert_eq!(remove.local_teid, ctx.local_teid);

@@ -16,16 +16,23 @@ The crate exposes tc entry points, not a Rust library API:
   inner UE IPv4 source address. A non-zero complete packet mark selects an
   additive FAR by `(UE address, mark)` and must match an `Active` owner-journal
   entry before the program prepends `[outer IPv4][UDP][GTPv1-U]`, consumes the
-  mark, and redirects toward the peer. Unknown or inactive marked state drops.
+  mark, and redirects toward the peer. The UDP destination port is always
+  2152. The additive `GTPU_UL_SPORT`/`GTPU_ULM_SPORT` map value is a complete
+  PDP-context commit record, including the explicit source port. The program
+  accepts only an `Active` record whose FAR and DSCP match the selected live
+  entries exactly; an absent, transitional, malformed, or mixed record drops
+  fail closed.
 - `opc_gtpu_downlink`: tc ingress program. It matches UDP/2152 GTPv1-U G-PDUs,
   proves the existing outer envelope/checksum boundary, selects exactly one
   downlink PDR by TEID, and then requires a canonical `GTPU_DL_BIND` value that
   matches outer peer, local destination, IPv4 family, current tc attachment,
-  and explicit UDP source-port policy. Marked PDRs additionally require the
-  `Active` owner journal to contain that exact binding. Only then does it
-  validate the inner destination, strip outer headers, write zero for a
-  default bearer or the exact dedicated mark, and continue to XFRM policy
-  selection through the stack.
+  and explicit UDP source-port policy. Before decapsulation, both default and
+  marked paths require an `Active` commit record matching the complete selected
+  FAR, DSCP, local TEID, endpoint binding, and source-port policy; marked PDRs
+  additionally require the compatible owner journal. Only then does it validate
+  the inner destination, strip outer headers, write zero for a default bearer
+  or the exact dedicated mark, and continue to XFRM policy selection through
+  the stack.
 
 Map names, counter indexes, program names, and byte layouts are imported from
 `opc-gtpu-ebpf-common`. `GTPU_DL_DROP` is a fixed six-slot per-CPU counter map
@@ -45,9 +52,10 @@ Its values are aggregate and contain no rejected endpoint or session fields.
 - Unpublished standalone crate (`publish = false`) with its own `Cargo.lock`.
 - Build profile uses `panic = "abort"` and optimized BPF codegen.
 - The datapath is currently IPv4 GTP-U only.
-- Missing, corrupt, or mismatched endpoint bindings fail closed before inner
-  packet delivery. The userspace schema exposes IPv4/IPv6 semantics, but this
-  object deliberately rejects a stored IPv6 binding as a family mismatch.
+- Missing, corrupt, transitional, or mismatched commit records and endpoint
+  bindings fail closed before inner packet delivery. The userspace schema
+  exposes IPv4/IPv6 semantics, but this object deliberately rejects a stored
+  IPv6 binding as a family mismatch.
 - The downlink envelope path uses a 256-byte bounded checksum callback. The
   endpoint/owner authorization and decapsulation phase is a separate BPF
   subprogram so the verified call chains remain below Linux's 512-byte stack
