@@ -215,11 +215,14 @@ impl Ikev2SignaturePublicKey {
     ///
     /// # Errors
     ///
-    /// Returns [`Ikev2SignatureKeyError`] when the SPKI is malformed or uses an
-    /// unsupported algorithm or curve.
+    /// Returns [`Ikev2SignatureKeyError`] when the SPKI is malformed, has
+    /// trailing data, or uses an unsupported algorithm or curve.
     pub fn from_spki_der(spki_der: &[u8]) -> Result<Self, Ikev2SignatureKeyError> {
-        let (_, spki) = SubjectPublicKeyInfo::from_der(spki_der)
+        let (remainder, spki) = SubjectPublicKeyInfo::from_der(spki_der)
             .map_err(|_| Ikev2SignatureKeyError::SpkiParse)?;
+        if !remainder.is_empty() {
+            return Err(Ikev2SignatureKeyError::SpkiTrailingData);
+        }
         Self::from_parsed_spki(spki_der, &spki)
     }
 
@@ -232,11 +235,14 @@ impl Ikev2SignaturePublicKey {
     ///
     /// # Errors
     ///
-    /// Returns [`Ikev2SignatureKeyError`] when the certificate is malformed or
-    /// its public key algorithm or curve is unsupported.
+    /// Returns [`Ikev2SignatureKeyError`] when the certificate is malformed,
+    /// has trailing data, or its public key algorithm or curve is unsupported.
     pub fn from_x509_certificate_der(cert_der: &[u8]) -> Result<Self, Ikev2SignatureKeyError> {
-        let (_, certificate) = X509Certificate::from_der(cert_der)
+        let (remainder, certificate) = X509Certificate::from_der(cert_der)
             .map_err(|_| Ikev2SignatureKeyError::CertificateParse)?;
+        if !remainder.is_empty() {
+            return Err(Ikev2SignatureKeyError::CertificateTrailingData);
+        }
         let spki = certificate.public_key();
         Self::from_parsed_spki(spki.raw, spki)
     }
@@ -495,8 +501,12 @@ pub enum Ikev2SignatureKeyError {
     EcdsaPrivateKeyParse,
     /// SubjectPublicKeyInfo DER was malformed.
     SpkiParse,
+    /// SubjectPublicKeyInfo DER contained bytes after the parsed value.
+    SpkiTrailingData,
     /// X.509 certificate DER was malformed.
     CertificateParse,
+    /// X.509 certificate DER contained bytes after the parsed value.
+    CertificateTrailingData,
     /// SPKI DER was not a valid RSA public key.
     RsaPublicKeyParse,
     /// SPKI point was not a valid ECDSA public key for its named curve.
@@ -514,7 +524,9 @@ impl Ikev2SignatureKeyError {
             Self::RsaPrivateKeyParse => "ike_auth_signature_rsa_private_key_parse",
             Self::EcdsaPrivateKeyParse => "ike_auth_signature_ecdsa_private_key_parse",
             Self::SpkiParse => "ike_auth_signature_spki_parse",
+            Self::SpkiTrailingData => "ike_auth_signature_spki_trailing_data",
             Self::CertificateParse => "ike_auth_signature_certificate_parse",
+            Self::CertificateTrailingData => "ike_auth_signature_certificate_trailing_data",
             Self::RsaPublicKeyParse => "ike_auth_signature_rsa_public_key_parse",
             Self::EcdsaPublicKeyParse => "ike_auth_signature_ecdsa_public_key_parse",
             Self::UnsupportedPublicKeyAlgorithm => {

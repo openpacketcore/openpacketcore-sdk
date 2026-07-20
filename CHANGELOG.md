@@ -60,6 +60,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exhaustive struct literal.
 
 ### Fixed
+- **Exact IKEv2 signature trust-material DER parsing:**
+  `Ikev2SignaturePublicKey` now rejects bytes following an otherwise valid
+  SubjectPublicKeyInfo or X.509 certificate instead of silently ignoring them.
+  The new `SpkiTrailingData` and `CertificateTrailingData` errors provide
+  stable, redaction-safe classification at configuration trust boundaries;
+  exhaustive matches on `Ikev2SignatureKeyError` must add those variants.
 - **Zeroizing retained SWm lifecycle identities — `opc-proto-diameter`:** adds
   the reusable redaction-safe `Sensitive<T>` owner, whose current allocation
   is zeroized on drop and independently protected across clones. Typed STR/STA

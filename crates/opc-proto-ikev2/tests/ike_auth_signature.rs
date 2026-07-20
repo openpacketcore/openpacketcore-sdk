@@ -311,6 +311,78 @@ fn key_parsing_fails_closed_on_garbage() {
 }
 
 #[test]
+fn public_key_der_parsers_require_exact_input() {
+    Ikev2SignaturePublicKey::from_spki_der(P256_SPKI_DER).expect("exact P-256 SPKI");
+    Ikev2SignaturePublicKey::from_x509_certificate_der(P256_CERT_DER)
+        .expect("exact P-256 certificate");
+
+    let mut spki_with_trailing_data = P256_SPKI_DER.to_vec();
+    spki_with_trailing_data.push(0xaa);
+    let spki_error = Ikev2SignaturePublicKey::from_spki_der(&spki_with_trailing_data)
+        .expect_err("SPKI trailing data must fail closed");
+    assert_eq!(spki_error, Ikev2SignatureKeyError::SpkiTrailingData);
+    assert_eq!(spki_error.as_str(), "ike_auth_signature_spki_trailing_data");
+    assert_eq!(format!("{spki_error:?}"), "SpkiTrailingData");
+    assert_eq!(
+        spki_error.to_string(),
+        "ike_auth_signature_spki_trailing_data"
+    );
+    assert!(std::error::Error::source(&spki_error).is_none());
+
+    let mut certificate_with_trailing_data = P256_CERT_DER.to_vec();
+    certificate_with_trailing_data.push(0xbb);
+    let certificate_error =
+        Ikev2SignaturePublicKey::from_x509_certificate_der(&certificate_with_trailing_data)
+            .expect_err("certificate trailing data must fail closed");
+    assert_eq!(
+        certificate_error,
+        Ikev2SignatureKeyError::CertificateTrailingData
+    );
+    assert_eq!(
+        certificate_error.as_str(),
+        "ike_auth_signature_certificate_trailing_data"
+    );
+    assert_eq!(format!("{certificate_error:?}"), "CertificateTrailingData");
+    assert_eq!(
+        certificate_error.to_string(),
+        "ike_auth_signature_certificate_trailing_data"
+    );
+    assert!(std::error::Error::source(&certificate_error).is_none());
+}
+
+#[test]
+fn exact_der_enforcement_preserves_existing_error_classes() {
+    assert_eq!(
+        Ikev2SignaturePublicKey::from_spki_der(&P256_SPKI_DER[..P256_SPKI_DER.len() - 1])
+            .expect_err("truncated SPKI"),
+        Ikev2SignatureKeyError::SpkiParse
+    );
+    assert_eq!(
+        Ikev2SignaturePublicKey::from_x509_certificate_der(
+            &P256_CERT_DER[..P256_CERT_DER.len() - 1],
+        )
+        .expect_err("truncated certificate"),
+        Ikev2SignatureKeyError::CertificateParse
+    );
+
+    // Change only the final arc of id-ecPublicKey to another well-formed OID.
+    // The DER remains structurally valid and must retain the typed algorithm
+    // classification instead of being mistaken for a trailing-data failure.
+    const EC_PUBLIC_KEY_OID_DER: &[u8] = &[0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01];
+    let mut unsupported_algorithm = P256_SPKI_DER.to_vec();
+    let oid_offset = unsupported_algorithm
+        .windows(EC_PUBLIC_KEY_OID_DER.len())
+        .position(|window| window == EC_PUBLIC_KEY_OID_DER)
+        .expect("fixture contains id-ecPublicKey OID");
+    unsupported_algorithm[oid_offset + EC_PUBLIC_KEY_OID_DER.len() - 1] = 0x02;
+    assert_eq!(
+        Ikev2SignaturePublicKey::from_spki_der(&unsupported_algorithm)
+            .expect_err("unsupported public-key algorithm"),
+        Ikev2SignatureKeyError::UnsupportedPublicKeyAlgorithm
+    );
+}
+
+#[test]
 fn debug_output_redacts_key_material() {
     let key = Ikev2SignatureAuthKey::ecdsa_p256_pkcs8_der(P256_PKCS8_DER).expect("P-256 key");
     let debug = format!("{key:?}");
