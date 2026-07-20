@@ -2544,6 +2544,7 @@ fn classify_route_readback(
     bodies: &[Vec<u8>],
 ) -> Result<RouteReadback, RouteSteeringError> {
     let request = canonical_route_request(request);
+    let request_family = encode_family(request.destination.address);
     let mut candidate_count = 0_u16;
     let mut resident: Option<RouteRequest> = None;
     let mut aggregate = RouteMismatch::default();
@@ -2552,7 +2553,10 @@ fn classify_route_readback(
         let Some(candidate) = parse_route_candidate(body)? else {
             continue;
         };
-        if candidate.destination != request.destination {
+        if candidate.family != request_family
+            || candidate.destination != request.destination
+            || candidate.table != request.table
+        {
             continue;
         }
         candidate_count = candidate_count.checked_add(1).ok_or_else(|| {
@@ -4755,7 +4759,6 @@ mod tests {
 
         let mut conflicting_route = route();
         conflicting_route.oif_ifindex = 99;
-        conflicting_route.table = 2000;
         conflicting_route.priority = None;
         let conflict = match classify_route_readback(
             &route(),
@@ -4770,7 +4773,7 @@ mod tests {
             conflict.mismatch(),
             RouteMismatch {
                 output_interface: true,
-                table: true,
+                table: false,
                 priority: true,
                 kernel_semantics: false,
             }
@@ -4858,6 +4861,47 @@ mod tests {
         };
         assert_eq!(rule_conflict.candidate_count().get(), 2);
         assert!(!rule_conflict.mismatch().kernel_semantics);
+    }
+
+    #[test]
+    fn route_readback_scopes_unrepresentable_defaults_to_the_requested_table() {
+        let request = RouteRequest {
+            destination: prefix([0, 0, 0, 0], 0),
+            oif_ifindex: 42,
+            table: 1000,
+            priority: None,
+        };
+        let exact = encode_route_request(&request).unwrap();
+
+        let mut foreign = request.clone();
+        foreign.table = 1043;
+        let foreign_exact = encode_route_request(&foreign).unwrap();
+        let mut foreign_unreachable = foreign_exact.clone();
+        remove_attr(&mut foreign_unreachable, ROUTE_MESSAGE_LEN, RTA_OIF);
+        // Linux RTN_UNREACHABLE. The parser must still validate the complete
+        // body before proving that its table is outside this readback scope.
+        foreign_unreachable[7] = 7;
+
+        assert_eq!(
+            classify_route_readback(
+                &request,
+                &[foreign_unreachable, foreign_exact, exact.clone()],
+            )
+            .unwrap(),
+            RouteReadback::ExactPresent
+        );
+        assert_eq!(
+            classify_route_readback(&request, &[encode_route_request(&foreign).unwrap()]).unwrap(),
+            RouteReadback::Absent
+        );
+
+        let mut same_table_unreachable = exact.clone();
+        remove_attr(&mut same_table_unreachable, ROUTE_MESSAGE_LEN, RTA_OIF);
+        same_table_unreachable[7] = 7;
+        assert_eq!(
+            classify_route_readback(&request, &[same_table_unreachable, exact]).unwrap(),
+            RouteReadback::Indeterminate(ReadbackIndeterminateReason::UnrepresentableObject)
+        );
     }
 
     #[test]

@@ -186,6 +186,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `opc-key` custody remain later #334 slices.
 
 ### Fixed
+- **Table-scoped Linux route readback — `opc-route-steering`:** route
+  convergence now classifies only candidates in the requested address family,
+  destination prefix, and routing table. An unrelated table's non-unicast or
+  otherwise unrepresentable route can no longer make an exact route
+  indeterminate merely because both use the same prefix, including
+  `0.0.0.0/0`; unrepresentable candidates in the requested table remain
+  fail-closed. Unit and privileged network-namespace regressions cover the
+  public-VRF unreachable-default plus uplink-default shape (#420).
 - **Exact IKEv2 signature trust-material DER parsing:**
   `Ikev2SignaturePublicKey` now rejects bytes following an otherwise valid
   SubjectPublicKeyInfo or X.509 certificate instead of silently ignoring them.
