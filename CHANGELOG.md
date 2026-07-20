@@ -8,6 +8,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Cancellation-safe staged XFRM composite install — `opc-ipsec-xfrm`:**
+  `XfrmStagedInstall::run` consumes the staged value, establishing one runner
+  at compile time (#402). On first poll it moves the operation and an `Arc`
+  backend into an owned Tokio worker, so dropping the observing future cannot
+  race recovery against an adapter's still-running `spawn_blocking` mutation.
+  A caller-cloned `XfrmInstallJournal` records every unobserved install or
+  rollback operation and transfers a successful install to product ownership
+  through the shared `Committed` state. Recovery uses an exact, generation-bound
+  `XfrmInstallRecoveryPlan`, requires an explicit `Owned`, `Absent`, `Foreign`,
+  or `Indeterminate` classification for every candidate, runs policy-first,
+  treats `NotFound` as idempotent absence, and serializes recovery across all
+  clones. Recovery itself runs in an owned worker, so dropping its observer
+  cannot let a same-identity replacement overtake an issued removal; actual
+  worker termination records a permanent, typed supervision-loss state and
+  disables in-process recovery because detached blocking work may still
+  complete. A fresh process must re-establish writer exclusion and
+  authoritative readback before acting. Multiple simultaneous uncertainties are retained,
+  composite outcomes report possible residue consistently, and all journal,
+  plan, classification, ownership, and error `Debug` surfaces omit keys,
+  addresses, selectors, and SPIs.
 - **Validated-provider capability seam — `opc-crypto-provider`:** a new
   standalone crate defining the capability-reporting and key-custody boundary
   requested by #334 (slice 1 of 5). `CryptoCapability` enumerates the

@@ -32,6 +32,28 @@ management, product SA/SPD policy, or deployment defaults.
 - Composite helpers include `install_sa_policy_with_rollback`,
   `install_bidirectional_sa_policy_with_rollback`, `rekey_sa_policy`, and
   `remove_policy_sa`.
+- `XfrmStagedInstall` is the cancellation-safe counterpart of
+  `install_sa_policy_with_rollback`. Its consuming `run(self, ...)` receiver
+  makes one runner an affine, compiler-enforced invariant, while a
+  caller-cloned `XfrmInstallJournal` survives cancellation. `run` accepts an
+  `Arc` backend and, on first poll, moves the operation into an owned Tokio
+  worker. Dropping the observing future therefore cannot detach a Linux
+  `spawn_blocking` mutation and race cleanup; the journal remains live until
+  the backend operation actually returns. An acknowledged install can be
+  transferred to product teardown with `journal.commit()`. Otherwise the
+  journal returns a generation-bound
+  `XfrmInstallRecoveryPlan`; recovery requires an explicit `Owned`, `Absent`,
+  `Foreign`, or `Indeterminate` classification for every exact SA/policy
+  candidate and is serialized across journal clones. Recovery also runs in an
+  owned worker, so dropping its observer cannot let a same-identity replacement
+  overtake an issued removal. If either owned worker terminates abnormally, its
+  guard records `SupervisionLost` and permanently rejects in-process recovery:
+  a detached blocking syscall may still complete after the async worker is
+  gone. A fresh process must re-establish namespace-wide XFRM writer exclusion
+  and authoritative readback before deciding how to handle residue. Matching
+  readback alone cannot distinguish an identical foreign replacement. Both
+  supervised APIs require a live Tokio runtime and otherwise return a typed,
+  redaction-safe runtime error.
 - With feature `ikev2`, the crate also exports Child SA KEYMAT and negotiation
   mappers from `opc-proto-ikev2` into explicit XFRM install requests.
 
