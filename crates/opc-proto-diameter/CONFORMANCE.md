@@ -231,6 +231,15 @@ These checks are mechanical message-shape validation only; AAA challenge
 selection, subscriber authorization, local emergency policy, realm routing,
 transport state, and EAP-AKA policy remain downstream product work.
 
+The typed DER surface also carries optional `RAT-Type` and
+`Service-Selection` authorization context. `RAT-Type` uses vendor 10415, code
+1032, a four-octet Enumerated value, and exact V/M/P flag validation;
+`Service-Selection` uses the vendor-neutral RFC 5778 code 493 and requires the
+M bit. Both fields are singleton, empty Service-Selection fails closed, and an
+emergency DER cannot carry Service-Selection. The product remains responsible
+for supplying Service-Selection only from a UE-requested APN and choosing WLAN
+or the TS 29.273 VIRTUAL fallback from trusted access provenance.
+
 The SWm DER parser and transaction-envelope parser have additive provenance-
 aware entry points. Missing Session-Id, Auth-Application-Id, Origin-Host,
 Origin-Realm, Destination-Realm, Auth-Request-Type, or EAP-Payload can therefore

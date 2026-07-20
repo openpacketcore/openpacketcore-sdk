@@ -120,6 +120,8 @@ fn establish_session(
             destination_realm: Redacted::from(AAA_REALM.to_owned()),
             destination_host: Some(Redacted::from(AAA_HOST.to_owned())),
             user_name: Some(Redacted::from(user.to_owned())),
+            rat_type: None,
+            service_selection: None,
             auth_request_type: AuthRequestType::AuthorizeAuthenticate,
             eap_payload: Redacted::from(DER_EAP_PAYLOAD.to_vec()),
             emergency_services: None,

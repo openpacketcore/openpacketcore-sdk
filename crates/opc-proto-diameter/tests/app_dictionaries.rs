@@ -11,7 +11,7 @@ use opc_proto_diameter::apps::swm::{
     SwmDiameterEapAnswerEnvelope, SwmDiameterEapRequest, SwmDiameterEapRequestEnvelope,
     SwmDiameterResult, SwmDiameterTransaction, SwmEmergencyAuthorizationError,
     SwmEmergencyAuthorizationEvidence, SwmEmergencyAuthorizationPath, SwmEmergencyServices,
-    SwmResultCategory, SwmTerminalInformation,
+    SwmRatType, SwmResultCategory, SwmTerminalInformation,
 };
 use opc_proto_diameter::{
     apps, base, ApplicationId, AvpCode, AvpDataType, AvpFlags, AvpHeader, AvpKey, CommandCode,
@@ -350,6 +350,175 @@ fn swm_der_dea_round_trip() {
         apps::swm::parse_swm_diameter_eap_answer(&message, DecodeContext::default())
             .expect("SWm DEA parse must succeed");
     assert_eq!(parsed_answer, answer);
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_der_access_context_has_exact_wire_profile_and_round_trips() {
+    const APN: &str = "ims.mnc001.mcc001.gprs";
+
+    let mut request = sample_swm_request();
+    request.rat_type = Some(SwmRatType::Virtual);
+    request.service_selection = Some(APN.into());
+    let built = apps::swm::build_swm_diameter_eap_request(
+        &request,
+        0x1111_2222,
+        0x3333_4444,
+        EncodeContext::default(),
+    )
+    .expect("SWm DER access context build");
+    let encoded = encode_message(&built);
+    let (tail, decoded) = Message::decode_with_dictionary(
+        &encoded,
+        DecodeContext::conservative(),
+        SWM_BASELINE_DICTIONARIES,
+    )
+    .expect("SWm DER access context dictionary decode");
+    assert!(tail.is_empty());
+
+    let avps = decoded
+        .avps(DecodeContext::conservative())
+        .collect::<Result<Vec<_>, _>>()
+        .expect("valid SWm DER AVPs");
+    let rat_type = avps
+        .iter()
+        .find(|avp| {
+            avp.header.code == apps::swm::AVP_RAT_TYPE
+                && avp.header.vendor_id == Some(apps::VENDOR_ID_3GPP)
+        })
+        .expect("RAT-Type AVP");
+    assert!(rat_type.header.flags.is_vendor_specific());
+    assert!(rat_type.header.flags.is_mandatory());
+    assert!(!rat_type.header.flags.is_protected());
+    assert_eq!(rat_type.value, 1u32.to_be_bytes());
+
+    let service_selection = avps
+        .iter()
+        .find(|avp| avp.header.code == apps::swm::AVP_SERVICE_SELECTION)
+        .expect("Service-Selection AVP");
+    assert_eq!(service_selection.header.vendor_id, None);
+    assert!(service_selection.header.flags.is_mandatory());
+    assert!(!service_selection.header.flags.is_protected());
+    assert_eq!(service_selection.value, APN.as_bytes());
+
+    let parsed = apps::swm::parse_swm_diameter_eap_request(&decoded, DecodeContext::conservative())
+        .expect("SWm DER access context parse");
+    assert_eq!(parsed, request);
+    assert_eq!(parsed.rat_type, Some(SwmRatType::Virtual));
+    assert_eq!(
+        parsed
+            .service_selection
+            .as_ref()
+            .map(|value| value.as_ref().as_str()),
+        Some(APN)
+    );
+    assert!(!format!("{parsed:?}").contains(APN));
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_der_access_context_parser_enforces_flags_cardinality_and_emergency_exclusion() {
+    const APN: &[u8] = b"ims.mnc001.mcc001.gprs";
+    let rat_type = encode_raw_vendor_avp(
+        apps::swm::AVP_RAT_TYPE,
+        apps::VENDOR_ID_3GPP,
+        true,
+        &1u32.to_be_bytes(),
+    );
+    let service_selection = encode_raw_avp(apps::swm::AVP_SERVICE_SELECTION, true, APN);
+
+    let raw = build_raw_swm_der_with_extras(
+        Some(apps::swm::APPLICATION_ID.get()),
+        3,
+        &[0x02, 0x17, 0x00, 0x04],
+        &[rat_type.clone(), service_selection.clone()],
+    );
+    let wire = encode_message(&raw);
+    let parsed = apps::swm::parse_swm_diameter_eap_request(
+        &decode_message(&wire),
+        DecodeContext::conservative(),
+    )
+    .expect("independently encoded access context parses");
+    assert_eq!(parsed.rat_type, Some(SwmRatType::Virtual));
+    assert_eq!(
+        parsed
+            .service_selection
+            .as_ref()
+            .map(|value| value.as_ref().as_str()),
+        Some("ims.mnc001.mcc001.gprs")
+    );
+
+    for extras in [
+        vec![rat_type.clone(), rat_type],
+        vec![service_selection.clone(), service_selection.clone()],
+    ] {
+        let duplicate = build_raw_swm_der_with_extras(
+            Some(apps::swm::APPLICATION_ID.get()),
+            3,
+            &[0x02, 0x17, 0x00, 0x04],
+            &extras,
+        );
+        let duplicate_wire = encode_message(&duplicate);
+        let error = apps::swm::parse_swm_diameter_eap_request(
+            &decode_message(&duplicate_wire),
+            DecodeContext::conservative(),
+        )
+        .expect_err("duplicate access context must fail");
+        assert!(matches!(
+            error.code(),
+            opc_protocol::DecodeErrorCode::DuplicateIe
+        ));
+    }
+
+    let wrong_flags = [
+        encode_raw_vendor_avp(
+            apps::swm::AVP_RAT_TYPE,
+            apps::VENDOR_ID_3GPP,
+            false,
+            &1u32.to_be_bytes(),
+        ),
+        encode_raw_avp(apps::swm::AVP_SERVICE_SELECTION, false, APN),
+    ];
+    for extra in wrong_flags {
+        let invalid = build_raw_swm_der_with_extras(
+            Some(apps::swm::APPLICATION_ID.get()),
+            3,
+            &[0x02, 0x17, 0x00, 0x04],
+            &[extra],
+        );
+        let invalid_wire = encode_message(&invalid);
+        apps::swm::parse_swm_diameter_eap_request(
+            &decode_message(&invalid_wire),
+            DecodeContext::conservative(),
+        )
+        .expect_err("incorrect access-context flags must fail");
+    }
+
+    let emergency = encode_raw_vendor_avp(
+        apps::swm::AVP_EMERGENCY_SERVICES,
+        apps::VENDOR_ID_3GPP,
+        false,
+        &1u32.to_be_bytes(),
+    );
+    let invalid = build_raw_swm_der_with_extras(
+        Some(apps::swm::APPLICATION_ID.get()),
+        3,
+        &[0x02, 0x17, 0x00, 0x04],
+        &[service_selection, emergency],
+    );
+    let invalid_wire = encode_message(&invalid);
+    let error = apps::swm::parse_swm_diameter_eap_request(
+        &decode_message(&invalid_wire),
+        DecodeContext::conservative(),
+    )
+    .expect_err("emergency DER with Service-Selection must fail");
+    assert!(!format!("{error:?}").contains("ims.mnc001.mcc001.gprs"));
+
+    let mut request = sample_swm_request();
+    request.service_selection = Some("ims.mnc001.mcc001.gprs".into());
+    request.emergency_services = Some(SwmEmergencyServices::emergency_indication());
+    apps::swm::build_swm_diameter_eap_request(&request, 1, 2, EncodeContext::default())
+        .expect_err("builder must reject emergency Service-Selection");
 }
 
 #[test]
@@ -1547,6 +1716,8 @@ fn sample_swm_request() -> SwmDiameterEapRequest {
         destination_realm: "home.example".into(),
         destination_host: Some("aaa.home.example".into()),
         user_name: Some("601010123456789@nai.epc.mnc001.mcc001.3gppnetwork.org".into()),
+        rat_type: None,
+        service_selection: None,
         auth_request_type: AuthRequestType::AuthorizeAuthenticate,
         eap_payload: vec![0x02, 0x17, 0x00, 0x08, 0x32, 0x01, 0x02, 0x03].into(),
         emergency_services: None,

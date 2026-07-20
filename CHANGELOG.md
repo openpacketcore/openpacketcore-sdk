@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **SWm DER access authorization context — `opc-proto-diameter`:**
+  `SwmDiameterEapRequest` can now encode and decode typed `RAT-Type` and
+  redacted `Service-Selection` fields with their exact 3GPP/IETF vendor, flag,
+  type, and singleton rules. The request boundary rejects empty APNs,
+  duplicates, malformed values, and Service-Selection on emergency requests;
+  raw-wire tests cover the WLAN/VIRTUAL enum mapping and conditional APN
+  profile (#352).
 - **Cancellation-safe staged XFRM composite install — `opc-ipsec-xfrm`:**
   `XfrmStagedInstall::run` consumes the staged value, establishing one runner
   at compile time (#402). On first poll it moves the operation and an `Arc`

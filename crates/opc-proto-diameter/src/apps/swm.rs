@@ -66,6 +66,8 @@ pub const AVP_EAP_REISSUED_PAYLOAD: AvpCode = AvpCode::new(463);
 pub const AVP_EAP_MASTER_SESSION_KEY: AvpCode = AvpCode::new(464);
 /// Auth-Request-Type AVP code.
 pub const AVP_AUTH_REQUEST_TYPE: AvpCode = AvpCode::new(274);
+/// RAT-Type AVP code (3GPP TS 29.212 section 5.3.31).
+pub const AVP_RAT_TYPE: AvpCode = AvpCode::new(1032);
 /// AAR-Flags AVP code (3GPP TS 29.273 section 7.2.3.5).
 pub const AVP_AAR_FLAGS: AvpCode = AvpCode::new(1539);
 /// UE-Local-IP-Address AVP code (3GPP TS 29.212 section 5.3.96).
@@ -140,7 +142,7 @@ pub const APPLICATION: ApplicationDefinition = ApplicationDefinition::new(
     SpecRef::new("3gpp", "TS29273", "SWm Diameter application"),
 );
 
-static SWM_REQUEST_AVP_RULES: [CommandAvpRule; 5] = [
+static SWM_REQUEST_AVP_RULES: [CommandAvpRule; 7] = [
     CommandAvpRule::new(
         AvpKey::ietf(base::AVP_SESSION_ID),
         AvpCardinality::ZeroOrOne,
@@ -152,6 +154,14 @@ static SWM_REQUEST_AVP_RULES: [CommandAvpRule; 5] = [
     ),
     CommandAvpRule::new(
         AvpKey::vendor(AVP_TERMINAL_INFORMATION, VENDOR_ID_3GPP),
+        AvpCardinality::ZeroOrOne,
+    ),
+    CommandAvpRule::new(
+        AvpKey::vendor(AVP_RAT_TYPE, VENDOR_ID_3GPP),
+        AvpCardinality::ZeroOrOne,
+    ),
+    CommandAvpRule::new(
+        AvpKey::ietf(AVP_SERVICE_SELECTION),
         AvpCardinality::ZeroOrOne,
     ),
     CommandAvpRule::new(
@@ -284,7 +294,7 @@ pub const COMMAND_DIAMETER_EAP_ANSWER_PROJECTED_PROFILE: CommandDefinition =
     )
     .with_avp_rules(&SWM_PROJECTED_PROFILE_ANSWER_AVP_RULES);
 
-const SWM_AVPS: [AvpDefinition; 39] = [
+const SWM_AVPS: [AvpDefinition; 40] = [
     AvpDefinition::new(
         AvpKey::ietf(AVP_EAP_PAYLOAD),
         "EAP-Payload",
@@ -334,6 +344,17 @@ const SWM_AVPS: [AvpDefinition; 39] = [
             FlagRequirement::MustBeUnset,
         ),
         SpecRef::new("3gpp", "TS29212", "5.3.96"),
+    ),
+    AvpDefinition::new(
+        AvpKey::vendor(AVP_RAT_TYPE, VENDOR_ID_3GPP),
+        "RAT-Type",
+        AvpDataType::Enumerated,
+        AvpFlagRules::new(
+            FlagRequirement::MustBeSet,
+            FlagRequirement::MustBeSet,
+            FlagRequirement::MustBeUnset,
+        ),
+        SpecRef::new("3gpp", "TS29212", "5.3.31"),
     ),
     AvpDefinition::new(
         AvpKey::vendor(AVP_HIGH_PRIORITY_ACCESS_INFO, VENDOR_ID_3GPP),
@@ -690,6 +711,42 @@ impl AuthRequestType {
     /// Return true for AUTHORIZE_ONLY.
     pub const fn is_authorize_only(self) -> bool {
         matches!(self, Self::AuthorizeOnly)
+    }
+}
+
+/// Access-network RAT-Type values carried by a SWm DER.
+///
+/// The ePDG uses [`Self::Wlan`] when it knows that the serving access is WLAN
+/// and [`Self::Virtual`] when the access type is not known. Unrecognized values
+/// are retained so a proxy can remain forward-compatible without silently
+/// rewriting peer input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SwmRatType {
+    /// WLAN access.
+    Wlan,
+    /// Unknown access represented by the TS 29.273 `VIRTUAL` value.
+    Virtual,
+    /// Unknown or subsequently assigned value.
+    Other(u32),
+}
+
+impl SwmRatType {
+    /// Return the TS 29.212 wire value.
+    pub const fn value(self) -> u32 {
+        match self {
+            Self::Wlan => 0,
+            Self::Virtual => 1,
+            Self::Other(value) => value,
+        }
+    }
+
+    /// Parse a TS 29.212 wire value without discarding future assignments.
+    pub const fn from_value(value: u32) -> Self {
+        match value {
+            0 => Self::Wlan,
+            1 => Self::Virtual,
+            other => Self::Other(other),
+        }
     }
 }
 
@@ -1425,6 +1482,10 @@ pub struct SwmDiameterEapRequest {
     pub destination_host: Option<Redacted<String>>,
     /// User-Name (redacted in diagnostic output).
     pub user_name: Option<Redacted<String>>,
+    /// Serving access RAT, or `VIRTUAL` when the ePDG does not know it.
+    pub rat_type: Option<SwmRatType>,
+    /// UE-requested APN for a non-emergency attach (redacted in diagnostics).
+    pub service_selection: Option<Redacted<String>>,
     /// Auth-Request-Type.
     pub auth_request_type: AuthRequestType,
     /// EAP-Payload (redacted in diagnostic output).
@@ -1447,6 +1508,8 @@ impl std::fmt::Debug for SwmDiameterEapRequest {
             .field("destination_realm", &self.destination_realm)
             .field("destination_host", &self.destination_host)
             .field("user_name", &self.user_name)
+            .field("rat_type", &self.rat_type)
+            .field("service_selection", &self.service_selection)
             .field("auth_request_type", &self.auth_request_type)
             .field("eap_payload", &self.eap_payload)
             .field("emergency_services", &self.emergency_services)
@@ -1571,6 +1634,23 @@ impl SwmDiameterEapRequest {
                 return Err(encode_structural_error(
                     "SWm DER User-Name must not be empty when present",
                     "DER",
+                ));
+            }
+        }
+        if let Some(service_selection) = self.service_selection.as_ref() {
+            if service_selection.as_ref().is_empty() {
+                return Err(encode_structural_error(
+                    "SWm DER Service-Selection must not be empty when present",
+                    "7.1.2.1.1",
+                ));
+            }
+            if self
+                .emergency_services
+                .is_some_and(SwmEmergencyServices::is_emergency_indicated)
+            {
+                return Err(encode_structural_error(
+                    "SWm DER Service-Selection must be absent for an emergency session",
+                    "7.1.2.1.1",
                 ));
             }
         }
@@ -1825,6 +1905,25 @@ pub fn build_swm_diameter_eap_request(
             ctx,
         )?;
     }
+    if let Some(rat_type) = request.rat_type {
+        builder_helpers::append_vendor_u32_avp(
+            &mut raw_avps,
+            AVP_RAT_TYPE,
+            VENDOR_ID_3GPP,
+            rat_type.value(),
+            true,
+            ctx,
+        )?;
+    }
+    if let Some(service_selection) = request.service_selection.as_ref() {
+        builder_helpers::append_utf8_avp(
+            &mut raw_avps,
+            AVP_SERVICE_SELECTION,
+            service_selection.as_ref(),
+            true,
+            ctx,
+        )?;
+    }
     for state in &request.state_avps {
         builder_helpers::append_octet_string_avp(&mut raw_avps, AVP_STATE, state, false, ctx)?;
     }
@@ -1890,6 +1989,8 @@ pub fn parse_swm_diameter_eap_request_with_provenance(
     let mut destination_realm = None;
     let mut destination_host = None;
     let mut user_name = None;
+    let mut rat_type = None;
+    let mut service_selection = None;
     let mut auth_request_type = None;
     let mut eap_payload = None;
     let mut emergency_services = None;
@@ -1914,6 +2015,16 @@ pub fn parse_swm_diameter_eap_request_with_provenance(
                         SwmEmergencyServices::from_value(value),
                         offset,
                         "7.2.3.4",
+                    )?;
+                } else if code == AVP_RAT_TYPE && vendor_id == VENDOR_ID_3GPP {
+                    validate_3gpp_mandatory_flags(&avp.header, offset, "5.3.31")?;
+                    let value =
+                        builder_helpers::parse_u32_value(avp.value, value_offset, "5.3.31")?;
+                    builder_helpers::set_once(
+                        &mut rat_type,
+                        SwmRatType::from_value(value),
+                        offset,
+                        "5.3.31",
                     )?;
                 } else if code == AVP_TERMINAL_INFORMATION && vendor_id == VENDOR_ID_3GPP {
                     validate_3gpp_mandatory_flags(&avp.header, offset, "7.3.3")?;
@@ -1966,6 +2077,15 @@ pub fn parse_swm_diameter_eap_request_with_provenance(
             } else if code == base::AVP_USER_NAME {
                 let value = builder_helpers::parse_string_value(avp.value, value_offset, "8.14")?;
                 builder_helpers::set_once(&mut user_name, Redacted::from(value), offset, "8.14")?;
+            } else if code == AVP_SERVICE_SELECTION {
+                validate_base_mandatory_flags(&avp.header, offset, "6.2")?;
+                let value = builder_helpers::parse_string_value(avp.value, value_offset, "6.2")?;
+                builder_helpers::set_once(
+                    &mut service_selection,
+                    Redacted::from(value),
+                    offset,
+                    "6.2",
+                )?;
             } else if code == AVP_AUTH_REQUEST_TYPE {
                 let value = builder_helpers::parse_u32_value(avp.value, value_offset, "8.7")?;
                 builder_helpers::set_once(
@@ -2062,6 +2182,8 @@ pub fn parse_swm_diameter_eap_request_with_provenance(
         )?,
         destination_host,
         user_name,
+        rat_type,
+        service_selection,
         auth_request_type: require_swm_request_field(
             auth_request_type,
             "SWm DER requires Auth-Request-Type",
@@ -3113,6 +3235,23 @@ fn validate_decoded_request(request: &SwmDiameterEapRequest) -> Result<(), Decod
             return Err(decode_structural_error(
                 "SWm DER User-Name must not be empty when present",
                 "DER",
+            ));
+        }
+    }
+    if let Some(service_selection) = request.service_selection.as_ref() {
+        if service_selection.as_ref().is_empty() {
+            return Err(decode_structural_error(
+                "SWm DER Service-Selection must not be empty when present",
+                "7.1.2.1.1",
+            ));
+        }
+        if request
+            .emergency_services
+            .is_some_and(SwmEmergencyServices::is_emergency_indicated)
+        {
+            return Err(decode_structural_error(
+                "SWm DER Service-Selection must be absent for an emergency session",
+                "7.1.2.1.1",
             ));
         }
     }
