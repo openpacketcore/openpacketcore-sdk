@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Mandatory SWm Diameter-EAP State encoding — `opc-proto-diameter`:** typed
+  DER and DEA builders now set the RFC 4005 mandatory bit on every ordered,
+  opaque State AVP. The dictionary accepts the RFC-permitted protected bit on
+  receive, while originated messages use the canonical unprotected profile
+  and diagnostics expose only State counts (#442).
 - **Breaking generated key API; fail-closed YANG list keys — `opc-yanggen`:**
   generated RFC 7951
   deserialization now rejects incomplete single or composite keys and exact

@@ -165,6 +165,14 @@ fn swm_dictionary_contains_application_command_and_avps() {
         .expect("EAP-Payload must be present");
     assert_eq!(eap_payload.data_type(), AvpDataType::OctetString);
 
+    let state = dictionary
+        .find_avp(AvpKey::ietf(apps::swm::AVP_STATE))
+        .expect("State must be present");
+    assert_eq!(state.data_type(), AvpDataType::OctetString);
+    assert_eq!(state.flags().vendor(), FlagRequirement::MustBeUnset);
+    assert_eq!(state.flags().mandatory(), FlagRequirement::MustBeSet);
+    assert_eq!(state.flags().protected(), FlagRequirement::MayBeSet);
+
     let emergency_key = AvpKey::vendor(apps::swm::AVP_EMERGENCY_SERVICES, apps::VENDOR_ID_3GPP);
     let emergency = dictionary
         .find_avp(emergency_key)
@@ -2823,6 +2831,67 @@ fn swm_command_cardinality_accepts_repeated_state_conservatively() {
 
 #[test]
 #[cfg(feature = "app-swm")]
+fn swm_der_emits_mandatory_unprotected_state() {
+    const STATE: &[u8] = b"\0synthetic-der-state\xff";
+
+    let mut request = sample_swm_request();
+    request.state_avps = vec![STATE.to_vec()];
+    let built = apps::swm::build_swm_diameter_eap_request(&request, 1, 2, EncodeContext::default())
+        .expect("DER with binary State must encode");
+    let encoded = encode_message(&built);
+    let decoded = decode_message(&encoded);
+    let state = decoded
+        .avps(DecodeContext::default())
+        .collect::<Result<Vec<_>, _>>()
+        .expect("DER AVPs must decode")
+        .into_iter()
+        .find(|avp| avp.header.code == apps::swm::AVP_STATE)
+        .expect("DER must contain State");
+
+    assert_eq!(state.header.vendor_id, None);
+    assert!(state.header.flags.is_mandatory());
+    assert!(!state.header.flags.is_vendor_specific());
+    assert!(!state.header.flags.is_protected());
+    assert_eq!(state.value, STATE);
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_der_state_accepts_rfc_4005_protected_bit() {
+    const STATE: &[u8] = b"\0synthetic-protected-state\xfd";
+
+    let state = RawAvp {
+        header: AvpHeader::ietf(apps::swm::AVP_STATE, true)
+            .with_flags(AvpFlags::new(false, true, true)),
+        value: STATE,
+        padding: &[],
+    };
+    let mut encoded_state = BytesMut::new();
+    state
+        .encode(&mut encoded_state, EncodeContext::default())
+        .expect("protected State AVP must encode");
+    let built = build_raw_swm_der_with_extras(
+        Some(apps::swm::APPLICATION_ID.get()),
+        AuthRequestType::AuthorizeAuthenticate.value(),
+        &[0x02, 0x17, 0x00, 0x04],
+        &[encoded_state],
+    );
+    let encoded = encode_message(&built);
+    let (tail, decoded) = Message::decode_with_dictionary(
+        &encoded,
+        DecodeContext::conservative(),
+        SWM_BASELINE_DICTIONARIES,
+    )
+    .expect("RFC 4005 permits protected State on receive");
+    assert!(tail.is_empty());
+    let parsed = apps::swm::parse_swm_diameter_eap_request(&decoded, DecodeContext::conservative())
+        .expect("typed DER parser must retain protected State opaquely");
+    assert_eq!(parsed.state_avps, vec![STATE]);
+    assert!(!format!("{parsed:?}").contains("synthetic-protected-state"));
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
 fn swm_dea_command_cardinality_accepts_repeated_state_conservatively() {
     let mut answer = sample_swm_answer();
     answer.state_avps = vec![b"state-one".to_vec(), b"state-two".to_vec()];
@@ -2839,6 +2908,90 @@ fn swm_dea_command_cardinality_accepts_repeated_state_conservatively() {
     let parsed = apps::swm::parse_swm_diameter_eap_answer(&decoded, DecodeContext::conservative())
         .expect("typed DEA parser must retain repeated State values");
     assert_eq!(parsed.state_avps, answer.state_avps);
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_dea_emits_mandatory_unprotected_state() {
+    const STATE: &[u8] = b"\0synthetic-dea-state\xfe";
+
+    let mut answer = sample_swm_answer();
+    answer.state_avps = vec![STATE.to_vec()];
+    let built = apps::swm::build_swm_diameter_eap_answer(&answer, 1, 2, EncodeContext::default())
+        .expect("DEA with binary State must encode");
+    let encoded = encode_message(&built);
+    let decoded = decode_message(&encoded);
+    let state = decoded
+        .avps(DecodeContext::default())
+        .collect::<Result<Vec<_>, _>>()
+        .expect("DEA AVPs must decode")
+        .into_iter()
+        .find(|avp| avp.header.code == apps::swm::AVP_STATE)
+        .expect("DEA must contain State");
+
+    assert_eq!(state.header.vendor_id, None);
+    assert!(state.header.flags.is_mandatory());
+    assert!(!state.header.flags.is_vendor_specific());
+    assert!(!state.header.flags.is_protected());
+    assert_eq!(state.value, STATE);
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_dea_state_round_trips_opaquely_into_continuation_der() {
+    const FIRST: &[u8] = b"\0synthetic-state-first\xff";
+    const SECOND: &[u8] = b"\x80synthetic-state-second\0";
+
+    let mut answer = sample_swm_answer();
+    answer.state_avps = vec![FIRST.to_vec(), SECOND.to_vec()];
+    let built_answer =
+        apps::swm::build_swm_diameter_eap_answer(&answer, 1, 2, EncodeContext::default())
+            .expect("multi-round DEA must encode");
+    let encoded_answer = encode_message(&built_answer);
+    let decoded_answer = decode_message(&encoded_answer);
+    let parsed_answer =
+        apps::swm::parse_swm_diameter_eap_answer(&decoded_answer, DecodeContext::conservative())
+            .expect("multi-round DEA must parse");
+    assert_eq!(parsed_answer.state_avps, vec![FIRST, SECOND]);
+
+    let answer_debug = format!("{parsed_answer:?}");
+    assert!(!answer_debug.contains("synthetic-state-first"));
+    assert!(!answer_debug.contains("synthetic-state-second"));
+
+    let mut continuation = sample_swm_request();
+    continuation.state_avps = parsed_answer.state_avps.clone();
+    continuation.eap_payload = vec![0x02, 0x18, 0x00, 0x04].into();
+    let built_continuation =
+        apps::swm::build_swm_diameter_eap_request(&continuation, 3, 4, EncodeContext::default())
+            .expect("continuation DER must encode");
+    let encoded_continuation = encode_message(&built_continuation);
+    let decoded_continuation = decode_message(&encoded_continuation);
+    let states = decoded_continuation
+        .avps(DecodeContext::default())
+        .collect::<Result<Vec<_>, _>>()
+        .expect("continuation DER AVPs must decode")
+        .into_iter()
+        .filter(|avp| avp.header.code == apps::swm::AVP_STATE)
+        .collect::<Vec<_>>();
+
+    assert_eq!(states.len(), 2);
+    assert_eq!(states[0].value, FIRST);
+    assert_eq!(states[1].value, SECOND);
+    assert!(states.iter().all(|state| state.header.vendor_id.is_none()));
+    assert!(states.iter().all(|state| state.header.flags.is_mandatory()));
+
+    let request_debug = format!("{continuation:?}");
+    assert!(!request_debug.contains("synthetic-state-first"));
+    assert!(!request_debug.contains("synthetic-state-second"));
+
+    continuation.eap_payload = Vec::new().into();
+    let error =
+        apps::swm::build_swm_diameter_eap_request(&continuation, 5, 6, EncodeContext::default())
+            .expect_err("invalid continuation must fail without exposing State");
+    for diagnostic in [format!("{error}"), format!("{error:?}")] {
+        assert!(!diagnostic.contains("synthetic-state-first"));
+        assert!(!diagnostic.contains("synthetic-state-second"));
+    }
 }
 
 #[test]

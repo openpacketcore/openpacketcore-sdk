@@ -390,8 +390,8 @@ def main() -> None:
     # 8. SWm DER with two State AVPs. State is repeatable in the command
     #    grammar even under conservative dictionary-aware duplicate rejection.
     repeated_state_der = der_avps
-    repeated_state_der += avp(24, 0x00, b"state-one", None)
-    repeated_state_der += avp(24, 0x00, b"state-two", None)
+    repeated_state_der += avp(24, 0x40, b"state-one", None)
+    repeated_state_der += avp(24, 0x40, b"state-two", None)
     write_corpus(
         msg_dir,
         header(0xC0, 268, 16777264, 0x9999999A, 0xAAAAAAAB, repeated_state_der),
