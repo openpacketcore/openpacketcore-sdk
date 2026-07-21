@@ -230,6 +230,11 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                 } else {
                                     quote! { entry.#key_field_ident = LeafPresence::Explicit(parsed_key.clone()); }
                                 };
+                                let map_key = if key_is_sensitive {
+                                    quote! { SensitiveKey::from(parsed_key.clone()) }
+                                } else {
+                                    quote! { parsed_key.clone() }
+                                };
 
                                 quote! {
                                     #child_name_str => {
@@ -241,7 +246,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                                     self.#field_ident.remove(&parsed_key);
                                                 }
                                                 ConfigOp::Replace | ConfigOp::Update | ConfigOp::Merge => {
-                                                    let entry = self.#field_ident.entry(parsed_key.clone()).or_default();
+                                                    let entry = self.#field_ident.entry(#map_key).or_default();
                                                     if let Some(v) = value {
                                                         let mut parsed_item: #ty_name = serde_json::from_str(v).map_err(|e| config_error("invalid-value", e.to_string()))?;
                                                         #key_assign
@@ -255,7 +260,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                                     entry.apply_patch_segments(op, &segments[1..], value)?;
                                                 }
                                             } else {
-                                                let entry = self.#field_ident.entry(parsed_key.clone()).or_default();
+                                                let entry = self.#field_ident.entry(#map_key).or_default();
                                                 #entry_key_assign
                                                 entry.apply_patch_segments(op, &segments[1..], value)?;
                                             }
@@ -499,8 +504,18 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                             } else {
                                 let key_bracket_construction = if child.key_leaves.len() == 1 {
                                     let key_leaf = &child.key_leaves[0];
+                                    let key_node = child.child_paths.iter().find_map(|path| {
+                                        nodes_by_path.get(path).copied().filter(|node| {
+                                            clean_segment(last_segment(&node.path)) == key_leaf
+                                        })
+                                    });
+                                    let key_value = if key_node.is_some_and(is_sensitive_node) {
+                                        quote! { k.get().to_string() }
+                                    } else {
+                                        quote! { k.to_string() }
+                                    };
                                     quote! {
-                                        let key_bracket_str = format!("[{}='{}']", #key_leaf, escape_key_value(&k.to_string()));
+                                        let key_bracket_str = format!("[{}='{}']", #key_leaf, escape_key_value(&#key_value));
                                     }
                                 } else {
                                     let mut key_bracket_parts = TokenStream::new();

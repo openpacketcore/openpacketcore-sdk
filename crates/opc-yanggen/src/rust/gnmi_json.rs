@@ -699,7 +699,12 @@ fn list_key_type(node: &SchemaNode, nodes_by_path: &HashMap<String, &SchemaNode>
             if let Some(child) = nodes_by_path.get(child_path) {
                 let child_name = clean_segment(last_segment(&child.path));
                 if child_name == key_name {
-                    return leaf_base_type(child, nodes_by_path);
+                    let raw = leaf_base_type(child, nodes_by_path);
+                    return if super::types::is_sensitive_node(child) {
+                        quote! { super::types::SensitiveKey<#raw> }
+                    } else {
+                        raw
+                    };
                 }
             }
         }

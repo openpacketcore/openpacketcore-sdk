@@ -395,6 +395,7 @@ fn apply_list_fn(
     let mut parse_keys = Vec::new();
     let mut key_assigns = Vec::new();
     let mut key_struct_fields = Vec::new();
+    let mut single_key_is_sensitive = false;
 
     if node.key_leaves.len() == 1 {
         let key_leaf = &node.key_leaves[0];
@@ -416,8 +417,9 @@ fn apply_list_fn(
             #parse
         });
         let is_sensitive = is_sensitive_node(key_leaf_node);
+        single_key_is_sensitive = is_sensitive;
         let assign = if is_sensitive {
-            quote! { entry.#key_field_ident = SecretLeaf::new(LeafPresence::Explicit(parsed_key.clone())); }
+            quote! { entry.#key_field_ident = SecretLeaf::new(LeafPresence::Explicit(parsed.clone())); }
         } else {
             quote! { entry.#key_field_ident = LeafPresence::Explicit(parsed_key.clone()); }
         };
@@ -454,7 +456,9 @@ fn apply_list_fn(
         }
     }
 
-    let build_key = if node.key_leaves.len() == 1 {
+    let build_key = if node.key_leaves.len() == 1 && single_key_is_sensitive {
+        quote! { let parsed_key = SensitiveKey::from(parsed.clone()); }
+    } else if node.key_leaves.len() == 1 {
         quote! { let parsed_key = parsed; }
     } else {
         quote! {
@@ -668,7 +672,12 @@ fn list_key_type(
         for child_path in &list_node.child_paths {
             if let Some(child) = nodes_by_path.get(child_path) {
                 if clean_segment(last_segment(&child.path)) == clean_segment(key_name) {
-                    return raw_type(child, nodes_by_path);
+                    let raw = raw_type(child, nodes_by_path);
+                    return if is_sensitive_node(child) {
+                        quote! { SensitiveKey<#raw> }
+                    } else {
+                        raw
+                    };
                 }
             }
         }
