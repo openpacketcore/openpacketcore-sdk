@@ -53,6 +53,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   repeatedly interrupted replies remain fail-closed (#436).
 
 ### Added
+- **Redaction-safe SWm ASR/RAR replay comparison — `opc-proto-diameter`:**
+  `SwmAbortSessionRequestEnvelope` and `SwmReAuthRequestEnvelope` now compare
+  complete immutable request payloads while excluding only Hop-by-Hop, T-bit,
+  and authenticated expected-peer changes permitted across failover (#418).
 - **Admitted IKEv2 CERTREQ authority hashing — `opc-proto-ikev2`:** adds a
   bounded exact-DER `SubjectPublicKeyInfo` input and redaction-safe 20-octet
   RFC 7296 section 3.7 Certification Authority hash. The SHA-1 operation runs

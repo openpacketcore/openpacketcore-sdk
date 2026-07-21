@@ -500,6 +500,18 @@ envelope starts with T clear;
 is only for a queued, unacknowledged ASR resend after link failover or equivalent
 recovery, not an ordinary timer retry.
 
+A server-side duplicate cache can call
+`initial.same_replay_payload(&candidate)` before replaying a committed ASA.
+The redaction-safe boolean requires the same End-to-End Identifier, P bit,
+typed ASR facts (including exact optional `Auth-Session-State` presence),
+ordered Route-Record and retained extension AVPs, and exact ordered Proxy-Info
+chain. It ignores only Hop-by-Hop, T, and the authenticated expected-answer
+peer binding; retained AVP code, flags, Vendor-Id, and value remain exact while
+their encoder-derived length is normalized. RFC 6733 and the SWm ASR grammar
+define no dedicated Abort-Cause field: an abort-cause-like deployment extension
+is retained and compared in `additional_avps`. Cache lifetime, live-session
+authority, and replay disposition remain product policy.
+
 Ordinary E-clear ASAs require Session-Id and correlate it exactly. A received
 generic E-bit answer may omit Session-Id under RFC 6733's error-answer grammar,
 including the permitted permanent-failure fallback; when present it must still
@@ -651,6 +663,15 @@ bit, while RAA and AAA always clear it.
 duplicate-request replay. The consumer still owns duplicate detection, cache
 lifetime, retry timers, session mutation, and when an accepted RAA advances to
 AAR.
+
+Before replaying that committed RAA, a server-side duplicate cache can use
+`initial.same_replay_payload(&candidate)`. The RAR operation applies the same
+redaction-safe contract as ASR/STR: it requires the End-to-End Identifier, P,
+every typed RAR fact (including `Re-Auth-Request-Type`), exact ordered
+Route-Record, retained extension AVPs, and Proxy-Info, while ignoring only
+Hop-by-Hop, T, and expected-answer peer binding. Retained AVP length is
+normalized because the encoder derives it; code, flags, Vendor-Id, order, and
+value are not. It does not choose cache policy or mutate authorization state.
 
 RAR requires `AUTHORIZE_ONLY`, exact Session-Id/User-Name, and the addressed
 Destination-Host used by the procedure. AAR/AAA require

@@ -651,7 +651,10 @@ impl SwmAdditionalAvp {
     }
 }
 
-fn additional_avp_sequences_match(left: &[SwmAdditionalAvp], right: &[SwmAdditionalAvp]) -> bool {
+pub(super) fn additional_avp_sequences_match(
+    left: &[SwmAdditionalAvp],
+    right: &[SwmAdditionalAvp],
+) -> bool {
     left.len() == right.len()
         && left
             .iter()
@@ -1428,6 +1431,20 @@ impl SwmAbortSessionRequest {
             None => SwmAuthSessionState::StateMaintained,
         }
     }
+
+    fn has_same_replay_fields(&self, other: &Self) -> bool {
+        self.session_id == other.session_id
+            && self.origin_host == other.origin_host
+            && self.origin_realm == other.origin_realm
+            && self.destination_realm == other.destination_realm
+            && self.destination_host == other.destination_host
+            && self.user_name == other.user_name
+            && self.auth_session_state == other.auth_session_state
+            && self.origin_state_id == other.origin_state_id
+            && self.drmp == other.drmp
+            && self.route_records == other.route_records
+            && additional_avp_sequences_match(&self.additional_avps, &other.additional_avps)
+    }
 }
 
 impl fmt::Debug for SwmAbortSessionRequest {
@@ -1622,6 +1639,28 @@ impl SwmAbortSessionRequestEnvelope {
     #[must_use]
     pub fn proxy_info_count(&self) -> usize {
         self.proxy_infos.len()
+    }
+
+    /// Return whether `other` carries the same immutable ASR replay payload.
+    ///
+    /// RFC 6733 sections 3 and 5.5.4 define duplicate identity and the
+    /// hop-local fields that may change during failover. This SDK operation
+    /// adds a stricter typed-payload guard for duplicate caches. It includes
+    /// the End-to-End Identifier, P bit, every typed request fact, ordered
+    /// Route-Record and extension AVPs, and the exact ordered Proxy-Info chain.
+    /// It deliberately ignores the Hop-by-Hop Identifier, T bit, and
+    /// expected-answer peer binding. Derived AVP length fields are also ignored
+    /// because encoding computes them from the retained value.
+    ///
+    /// The result is only a boolean and exposes no retained AVP value. Active
+    /// session ownership, duplicate-cache lifetime, and replay disposition
+    /// remain consumer policy.
+    #[must_use]
+    pub fn same_replay_payload(&self, other: &Self) -> bool {
+        self.transaction.end_to_end_identifier() == other.transaction.end_to_end_identifier()
+            && self.proxiable == other.proxiable
+            && self.request.has_same_replay_fields(&other.request)
+            && additional_avp_sequences_match(&self.proxy_infos, &other.proxy_infos)
     }
 
     /// Derive the required follow-on STR after committing an ASA.
@@ -4980,6 +5019,34 @@ mod tests {
                 destination_host: None,
                 termination_cause: SwmTerminationCause::Administrative,
                 user_name: Sensitive::from("synthetic-user@example.invalid"),
+                drmp: None,
+                route_records: Vec::new(),
+                additional_avps: Vec::new(),
+            },
+            proxy_infos: Vec::new(),
+        };
+        let mut changed = initial.clone();
+        changed.proxiable = false;
+
+        assert!(!initial.same_replay_payload(&changed));
+    }
+
+    #[test]
+    fn abort_replay_payload_requires_the_same_proxiable_bit() {
+        let initial = SwmAbortSessionRequestEnvelope {
+            transaction: super::super::SwmDiameterTransaction::new(1, 2),
+            proxiable: true,
+            potentially_retransmitted: false,
+            expected_answer_peer: None,
+            request: SwmAbortSessionRequest {
+                session_id: Redacted::from("synthetic-session.example"),
+                origin_host: Redacted::from("origin-host.example"),
+                origin_realm: Redacted::from("origin-realm.example"),
+                destination_realm: Redacted::from("destination-realm.example"),
+                destination_host: Redacted::from("destination-host.example"),
+                user_name: Redacted::from("synthetic-user@identity.example"),
+                auth_session_state: Some(SwmAuthSessionState::StateMaintained),
+                origin_state_id: Some(1),
                 drmp: None,
                 route_records: Vec::new(),
                 additional_avps: Vec::new(),
