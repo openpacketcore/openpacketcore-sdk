@@ -3668,6 +3668,113 @@ fn swm_terminal_information_missing_imei_maps_nested_bound_5005() {
 }
 
 #[test]
+fn swm_supported_features_missing_children_map_nested_bound_5005() {
+    let vendor = encode_avp(
+        AvpHeader::ietf(AVP_VENDOR_ID, true),
+        &VENDOR_ID_3GPP.get().to_be_bytes(),
+    );
+    let list_id = encode_avp(
+        AvpHeader::vendor(swm::AVP_FEATURE_LIST_ID, VENDOR_ID_3GPP, false),
+        &swm::SWM_FEATURE_LIST_ID.to_be_bytes(),
+    );
+    let list = encode_avp(
+        AvpHeader::vendor(swm::AVP_FEATURE_LIST, VENDOR_ID_3GPP, false),
+        &swm::SWM_FEATURE_LIST.to_be_bytes(),
+    );
+    let cases = [
+        (
+            AvpKey::ietf(AVP_VENDOR_ID),
+            vec![list_id.clone(), list.clone()],
+            AvpFlags::MANDATORY,
+        ),
+        (
+            AvpKey::vendor(swm::AVP_FEATURE_LIST_ID, VENDOR_ID_3GPP),
+            vec![vendor.clone(), list.clone()],
+            AvpFlags::VENDOR,
+        ),
+        (
+            AvpKey::vendor(swm::AVP_FEATURE_LIST, VENDOR_ID_3GPP),
+            vec![vendor.clone(), list_id.clone()],
+            AvpFlags::VENDOR,
+        ),
+    ];
+
+    for (missing_key, children, expected_child_flags) in cases {
+        let grouped_value = children.into_iter().flatten().collect::<Vec<_>>();
+        let supported_features = encode_avp(
+            AvpHeader::vendor(swm::AVP_SUPPORTED_FEATURES, VENDOR_ID_3GPP, true),
+            &grouped_value,
+        );
+        let mut fields = valid_swm_der_fields();
+        fields.push(supported_features);
+        let raw = fields.into_iter().flatten().collect::<Vec<_>>();
+        let request = encode_request(
+            CommandFlags::request(true),
+            swm::COMMAND_DIAMETER_EAP,
+            swm::APPLICATION_ID,
+            &raw,
+        );
+        let message = decode_message(&request);
+        let (parent_offset, parent_avp) = find_avp_at(&message, swm::AVP_SUPPORTED_FEATURES);
+        let error =
+            parse_swm_diameter_eap_request_with_provenance(&message, DecodeContext::conservative())
+                .expect_err("missing Supported-Features child must retain provenance");
+        let legacy = parse_swm_diameter_eap_request(&message, DecodeContext::conservative())
+            .expect_err("legacy parser retains the same nested failure");
+        assert_eq!(&legacy, error.decode_error());
+        assert_eq!(
+            error.decode_error().offset(),
+            parent_offset + parent_avp.header.header_len()
+        );
+        let provenance = error
+            .missing_avp()
+            .expect("missing Supported-Features child provenance");
+        assert_eq!(provenance.key(), missing_key);
+        let parent = provenance.parent().expect("group parent provenance");
+        assert_eq!(
+            parent.key(),
+            AvpKey::vendor(swm::AVP_SUPPORTED_FEATURES, VENDOR_ID_3GPP)
+        );
+        assert_eq!(parent.offset(), parent_offset);
+
+        let request_envelope = envelope(&request);
+        let bound = DiameterRequestFailure::from_parser_error(
+            &request_envelope,
+            &request,
+            &error,
+            DecodeContext::conservative(),
+            APP_DICTIONARIES,
+            EncodeContext::default(),
+        )
+        .expect("sealed Supported-Features omission must bind");
+        assert_eq!(bound.result_code(), RESULT_CODE_DIAMETER_MISSING_AVP);
+        let answer = encode_plan(
+            &request,
+            &request_envelope,
+            &bound,
+            DiameterErrorAnswerGrammar::Application,
+        );
+        let failed_wire = failed_avp_inner_wire(&answer);
+        let (remaining, outer) = RawAvp::decode(&failed_wire, DecodeContext::default())
+            .expect("Supported-Features Failed-AVP parent");
+        assert!(remaining.is_empty());
+        assert_eq!(outer.header.key(), parent.key());
+        assert_eq!(
+            outer.header.flags.bits(),
+            AvpFlags::VENDOR | AvpFlags::MANDATORY
+        );
+        let children = outer
+            .grouped_avps(DecodeContext::default())
+            .collect::<Result<Vec<_>, _>>()
+            .expect("Supported-Features Failed-AVP child");
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].header.key(), missing_key);
+        assert_eq!(children[0].header.flags.bits(), expected_child_flags);
+        assert_eq!(children[0].value, &[0, 0, 0, 0]);
+    }
+}
+
+#[test]
 fn empty_request_provenance_preserves_existing_required_field_order() {
     let cases = [
         (

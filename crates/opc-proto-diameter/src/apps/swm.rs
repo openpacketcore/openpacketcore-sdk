@@ -26,12 +26,12 @@
 use bytes::BytesMut;
 use hmac::{Hmac, Mac};
 use opc_protocol::{
-    DecodeContext, DecodeError, DecodeErrorCode, EncodeContext, EncodeError, EncodeErrorCode,
-    SpecRef,
+    DecodeContext, DecodeError, DecodeErrorCode, DuplicateIePolicy, EncodeContext, EncodeError,
+    EncodeErrorCode, SpecRef, UnknownIePolicy,
 };
 use opc_types::{Imei, Imei15};
 use sha2::Sha256;
-use std::{collections::HashSet, error::Error, fmt};
+use std::{collections::HashSet, error::Error, fmt, net::IpAddr};
 use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -66,6 +66,14 @@ pub const AVP_EAP_REISSUED_PAYLOAD: AvpCode = AvpCode::new(463);
 pub const AVP_EAP_MASTER_SESSION_KEY: AvpCode = AvpCode::new(464);
 /// Auth-Request-Type AVP code.
 pub const AVP_AUTH_REQUEST_TYPE: AvpCode = AvpCode::new(274);
+/// MIP6-Feature-Vector AVP code (RFC 5447 section 4.2.5).
+pub const AVP_MIP6_FEATURE_VECTOR: AvpCode = AvpCode::new(124);
+/// Supported-Features grouped AVP code (3GPP TS 29.229 section 6.3.29).
+pub const AVP_SUPPORTED_FEATURES: AvpCode = AvpCode::new(628);
+/// Feature-List-ID AVP code (3GPP TS 29.229 section 6.3.30).
+pub const AVP_FEATURE_LIST_ID: AvpCode = AvpCode::new(629);
+/// Feature-List AVP code (3GPP TS 29.229 section 6.3.31).
+pub const AVP_FEATURE_LIST: AvpCode = AvpCode::new(630);
 /// RAT-Type AVP code (3GPP TS 29.212 section 5.3.31).
 pub const AVP_RAT_TYPE: AvpCode = AvpCode::new(1032);
 /// AAR-Flags AVP code (3GPP TS 29.273 section 7.2.3.5).
@@ -135,6 +143,13 @@ pub const AUTH_REQUEST_TYPE_AUTHORIZE_AUTHENTICATE: u32 = 3;
 /// Auth-Request-Type value for AUTHORIZE_ONLY.
 pub const AUTH_REQUEST_TYPE_AUTHORIZE_ONLY: u32 = 2;
 
+/// SWm feature-list identifier assigned by 3GPP TS 29.273.
+pub const SWM_FEATURE_LIST_ID: u32 = 1;
+/// SWm feature-list value for TS 29.273 Release 18.
+pub const SWM_FEATURE_LIST: u32 = 0;
+
+const MAX_SWM_SUPPORTED_FEATURES: usize = 128;
+
 /// 3GPP SWm application definition.
 pub const APPLICATION: ApplicationDefinition = ApplicationDefinition::new(
     APPLICATION_ID,
@@ -143,7 +158,7 @@ pub const APPLICATION: ApplicationDefinition = ApplicationDefinition::new(
     SpecRef::new("3gpp", "TS29273", "SWm Diameter application"),
 );
 
-static SWM_REQUEST_AVP_RULES: [CommandAvpRule; 7] = [
+static SWM_REQUEST_AVP_RULES: [CommandAvpRule; 10] = [
     CommandAvpRule::new(
         AvpKey::ietf(base::AVP_SESSION_ID),
         AvpCardinality::ZeroOrOne,
@@ -166,12 +181,24 @@ static SWM_REQUEST_AVP_RULES: [CommandAvpRule; 7] = [
         AvpCardinality::ZeroOrOne,
     ),
     CommandAvpRule::new(
+        AvpKey::ietf(AVP_MIP6_FEATURE_VECTOR),
+        AvpCardinality::ZeroOrOne,
+    ),
+    CommandAvpRule::new(
+        AvpKey::vendor(AVP_SUPPORTED_FEATURES, VENDOR_ID_3GPP),
+        AvpCardinality::ZeroOrMore,
+    ),
+    CommandAvpRule::new(
+        AvpKey::vendor(AVP_UE_LOCAL_IP_ADDRESS, VENDOR_ID_3GPP),
+        AvpCardinality::ZeroOrOne,
+    ),
+    CommandAvpRule::new(
         AvpKey::ietf(base::AVP_RESULT_CODE),
         AvpCardinality::Forbidden,
     ),
 ];
 
-static SWM_ANSWER_AVP_RULES: [CommandAvpRule; 6] = [
+static SWM_ANSWER_AVP_RULES: [CommandAvpRule; 8] = [
     CommandAvpRule::new(AvpKey::ietf(AVP_STATE), AvpCardinality::ZeroOrMore),
     CommandAvpRule::new(
         AvpKey::ietf(base::AVP_RESULT_CODE),
@@ -193,9 +220,17 @@ static SWM_ANSWER_AVP_RULES: [CommandAvpRule; 6] = [
         AvpKey::vendor(AVP_CONTEXT_IDENTIFIER, VENDOR_ID_3GPP),
         AvpCardinality::ZeroOrOne,
     ),
+    CommandAvpRule::new(
+        AvpKey::ietf(AVP_MIP6_FEATURE_VECTOR),
+        AvpCardinality::ZeroOrOne,
+    ),
+    CommandAvpRule::new(
+        AvpKey::vendor(AVP_SUPPORTED_FEATURES, VENDOR_ID_3GPP),
+        AvpCardinality::ZeroOrMore,
+    ),
 ];
 
-static SWM_PROJECTED_PROFILE_ANSWER_AVP_RULES: [CommandAvpRule; 6] = [
+static SWM_PROJECTED_PROFILE_ANSWER_AVP_RULES: [CommandAvpRule; 8] = [
     CommandAvpRule::new(AvpKey::ietf(AVP_STATE), AvpCardinality::ZeroOrMore),
     CommandAvpRule::new(
         AvpKey::ietf(base::AVP_RESULT_CODE),
@@ -217,6 +252,14 @@ static SWM_PROJECTED_PROFILE_ANSWER_AVP_RULES: [CommandAvpRule; 6] = [
         AvpKey::vendor(AVP_CONTEXT_IDENTIFIER, VENDOR_ID_3GPP),
         AvpCardinality::ZeroOrOne,
     ),
+    CommandAvpRule::new(
+        AvpKey::ietf(AVP_MIP6_FEATURE_VECTOR),
+        AvpCardinality::ZeroOrOne,
+    ),
+    CommandAvpRule::new(
+        AvpKey::vendor(AVP_SUPPORTED_FEATURES, VENDOR_ID_3GPP),
+        AvpCardinality::ZeroOrMore,
+    ),
 ];
 
 static TERMINAL_INFORMATION_AVP_RULES: [CommandAvpRule; 2] = [
@@ -226,6 +269,18 @@ static TERMINAL_INFORMATION_AVP_RULES: [CommandAvpRule; 2] = [
     ),
     CommandAvpRule::new(
         AvpKey::vendor(AVP_SOFTWARE_VERSION, VENDOR_ID_3GPP),
+        AvpCardinality::ZeroOrOne,
+    ),
+];
+
+static SUPPORTED_FEATURES_AVP_RULES: [CommandAvpRule; 3] = [
+    CommandAvpRule::new(AvpKey::ietf(base::AVP_VENDOR_ID), AvpCardinality::ZeroOrOne),
+    CommandAvpRule::new(
+        AvpKey::vendor(AVP_FEATURE_LIST_ID, VENDOR_ID_3GPP),
+        AvpCardinality::ZeroOrOne,
+    ),
+    CommandAvpRule::new(
+        AvpKey::vendor(AVP_FEATURE_LIST, VENDOR_ID_3GPP),
         AvpCardinality::ZeroOrOne,
     ),
 ];
@@ -295,7 +350,7 @@ pub const COMMAND_DIAMETER_EAP_ANSWER_PROJECTED_PROFILE: CommandDefinition =
     )
     .with_avp_rules(&SWM_PROJECTED_PROFILE_ANSWER_AVP_RULES);
 
-const SWM_AVPS: [AvpDefinition; 40] = [
+const SWM_AVPS: [AvpDefinition; 44] = [
     AvpDefinition::new(
         AvpKey::ietf(AVP_EAP_PAYLOAD),
         "EAP-Payload",
@@ -325,6 +380,39 @@ const SWM_AVPS: [AvpDefinition; 40] = [
         SpecRef::new("ietf", "RFC6733", "8.7"),
     ),
     AvpDefinition::new(
+        AvpKey::ietf(AVP_MIP6_FEATURE_VECTOR),
+        "MIP6-Feature-Vector",
+        AvpDataType::Unsigned64,
+        AvpFlagRules::base_optional(),
+        SpecRef::new("ietf", "RFC5447", "4.2.5"),
+    ),
+    AvpDefinition::new(
+        AvpKey::vendor(AVP_SUPPORTED_FEATURES, VENDOR_ID_3GPP),
+        "Supported-Features",
+        AvpDataType::Grouped,
+        AvpFlagRules::new(
+            FlagRequirement::MustBeSet,
+            FlagRequirement::MayBeSet,
+            FlagRequirement::MustBeUnset,
+        ),
+        SpecRef::new("3gpp", "TS29229", "6.3.29"),
+    )
+    .with_grouped_avp_rules(&SUPPORTED_FEATURES_AVP_RULES),
+    AvpDefinition::new(
+        AvpKey::vendor(AVP_FEATURE_LIST_ID, VENDOR_ID_3GPP),
+        "Feature-List-ID",
+        AvpDataType::Unsigned32,
+        AvpFlagRules::vendor_specific(),
+        SpecRef::new("3gpp", "TS29229", "6.3.30"),
+    ),
+    AvpDefinition::new(
+        AvpKey::vendor(AVP_FEATURE_LIST, VENDOR_ID_3GPP),
+        "Feature-List",
+        AvpDataType::Unsigned32,
+        AvpFlagRules::vendor_specific(),
+        SpecRef::new("3gpp", "TS29229", "6.3.31"),
+    ),
+    AvpDefinition::new(
         AvpKey::vendor(AVP_AAR_FLAGS, VENDOR_ID_3GPP),
         "AAR-Flags",
         AvpDataType::Unsigned32,
@@ -341,7 +429,7 @@ const SWM_AVPS: [AvpDefinition; 40] = [
         AvpDataType::Address,
         AvpFlagRules::new(
             FlagRequirement::MustBeSet,
-            FlagRequirement::MustBeUnset,
+            FlagRequirement::MayBeSet,
             FlagRequirement::MustBeUnset,
         ),
         SpecRef::new("3gpp", "TS29212", "5.3.96"),
@@ -1381,6 +1469,205 @@ impl SwmAuthorizationOutcome {
     }
 }
 
+/// Typed MIP6-Feature-Vector carried by SWm DER/DEA exchanges.
+///
+/// Despite the legacy name, its GTPv2 bit is independent of bearer IP family
+/// and is not limited to IPv6 bearers.
+///
+/// Unknown bits are retained so a proxy does not erase extensions assigned by
+/// a later specification release. Diagnostic output deliberately omits the
+/// bitmask because it can fingerprint a deployment's mobility capabilities.
+///
+/// @spec IETF RFC5447 4.2.5
+/// @spec 3GPP TS29273 7.2.3.1
+#[derive(Default, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SwmMip6FeatureVector(u64);
+
+impl SwmMip6FeatureVector {
+    /// Integrated MIP6 bootstrap support.
+    pub const MIP6_INTEGRATED: u64 = 0x0000_0000_0000_0001;
+    /// Local Home Agent assignment support.
+    pub const LOCAL_HOME_AGENT_ASSIGNMENT: u64 = 0x0000_0000_0000_0002;
+    /// PMIPv6 support.
+    pub const PMIP6_SUPPORTED: u64 = 0x0000_0100_0000_0000;
+    /// Server selection requiring locally assigned UE addressing.
+    pub const ASSIGN_LOCAL_IP: u64 = 0x0000_0800_0000_0000;
+    /// MIPv4 support.
+    pub const MIP4_SUPPORTED: u64 = 0x0000_1000_0000_0000;
+    /// Optimized idle-mode mobility support.
+    pub const OPTIMIZED_IDLE_MODE_MOBILITY: u64 = 0x0000_2000_0000_0000;
+    /// GTPv2 network-based mobility support.
+    pub const GTPV2_SUPPORTED: u64 = 0x0000_4000_0000_0000;
+
+    const ANSWER_ONLY_BITS: u64 = Self::ASSIGN_LOCAL_IP;
+    const NETWORK_BASED_MOBILITY_BITS: u64 = Self::PMIP6_SUPPORTED | Self::GTPV2_SUPPORTED;
+
+    /// Retain a complete received or configured feature bitmask.
+    pub const fn from_bits_retain(bits: u64) -> Self {
+        Self(bits)
+    }
+
+    /// Construct the exact GTPv2-only capability vector used by an ePDG.
+    pub const fn gtpv2_only() -> Self {
+        Self(Self::GTPV2_SUPPORTED)
+    }
+
+    /// Return the complete wire bitmask, including unknown extension bits.
+    pub const fn bits(self) -> u64 {
+        self.0
+    }
+
+    /// Return whether every supplied bit is present.
+    pub const fn contains(self, bits: u64) -> bool {
+        self.0 & bits == bits
+    }
+
+    const fn valid_request(self) -> bool {
+        self.0 & Self::ANSWER_ONLY_BITS == 0
+    }
+
+    const fn valid_answer(self) -> bool {
+        !self.contains(Self::ASSIGN_LOCAL_IP) || self.0 & Self::NETWORK_BASED_MOBILITY_BITS == 0
+    }
+}
+
+impl fmt::Debug for SwmMip6FeatureVector {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SwmMip6FeatureVector(<redacted>)")
+    }
+}
+
+/// One typed identity/value carried inside a 3GPP Supported-Features AVP.
+///
+/// The `(vendor_id, feature_list_id)` pair is the stable identity used for
+/// duplicate detection. Feature bits remain available through an accessor but
+/// are omitted from diagnostic output.
+///
+/// @spec 3GPP TS29229 6.3.29
+#[derive(Clone, PartialEq, Eq)]
+pub struct SwmSupportedFeatureList {
+    vendor_id: VendorId,
+    feature_list_id: u32,
+    feature_list: u32,
+    additional_avps: Vec<SwmAdditionalAvp>,
+}
+
+impl SwmSupportedFeatureList {
+    /// Construct one vendor/list identity and its feature bitmask.
+    pub const fn new(vendor_id: VendorId, feature_list_id: u32, feature_list: u32) -> Self {
+        Self {
+            vendor_id,
+            feature_list_id,
+            feature_list,
+            additional_avps: Vec::new(),
+        }
+    }
+
+    /// Construct the exact SWm Release 18 list (`vendor=10415`, `id=1`, `value=0`).
+    pub const fn swm() -> Self {
+        Self::new(VENDOR_ID_3GPP, SWM_FEATURE_LIST_ID, SWM_FEATURE_LIST)
+    }
+
+    /// Return the feature-list vendor identity.
+    pub const fn vendor_id(&self) -> VendorId {
+        self.vendor_id
+    }
+
+    /// Return the vendor-scoped Feature-List-ID.
+    pub const fn feature_list_id(&self) -> u32 {
+        self.feature_list_id
+    }
+
+    /// Return the Feature-List bitmask.
+    pub const fn feature_list(&self) -> u32 {
+        self.feature_list
+    }
+
+    /// Return preserved optional extension children in their original order.
+    pub fn additional_avps(&self) -> &[SwmAdditionalAvp] {
+        &self.additional_avps
+    }
+
+    const fn identity(&self) -> (VendorId, u32) {
+        (self.vendor_id, self.feature_list_id)
+    }
+}
+
+impl fmt::Debug for SwmSupportedFeatureList {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SwmSupportedFeatureList")
+            .field("vendor_id", &self.vendor_id)
+            .field("feature_list_id", &self.feature_list_id)
+            .field("feature_list", &"<redacted>")
+            .field("additional_avp_count", &self.additional_avps.len())
+            .finish()
+    }
+}
+
+/// M-bit policy for a Supported-Features AVP in a request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SwmSupportedFeaturesRequirement {
+    /// Set M: an unsupported feature list must fail the request.
+    Required,
+    /// Clear M on a zero-valued list to discover peer support.
+    Discovery,
+}
+
+/// Request-side Supported-Features value with an explicit outer M-bit policy.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SwmRequestedSupportedFeatures {
+    features: SwmSupportedFeatureList,
+    requirement: SwmSupportedFeaturesRequirement,
+}
+
+impl SwmRequestedSupportedFeatures {
+    /// Require support for the supplied feature-list value (outer M bit set).
+    pub const fn required(features: SwmSupportedFeatureList) -> Self {
+        Self {
+            features,
+            requirement: SwmSupportedFeaturesRequirement::Required,
+        }
+    }
+
+    /// Discover support for one vendor/list identity (zero list, outer M clear).
+    pub const fn discovery(vendor_id: VendorId, feature_list_id: u32) -> Self {
+        Self {
+            features: SwmSupportedFeatureList::new(vendor_id, feature_list_id, 0),
+            requirement: SwmSupportedFeaturesRequirement::Discovery,
+        }
+    }
+
+    /// Construct the canonical SWm Release 18 discovery request.
+    pub const fn swm_discovery() -> Self {
+        Self::discovery(VENDOR_ID_3GPP, SWM_FEATURE_LIST_ID)
+    }
+
+    /// Return the typed feature-list value.
+    pub const fn features(&self) -> &SwmSupportedFeatureList {
+        &self.features
+    }
+
+    /// Return the request-side M-bit policy.
+    pub const fn requirement(&self) -> SwmSupportedFeaturesRequirement {
+        self.requirement
+    }
+
+    const fn mandatory(&self) -> bool {
+        matches!(self.requirement, SwmSupportedFeaturesRequirement::Required)
+    }
+}
+
+impl fmt::Debug for SwmRequestedSupportedFeatures {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SwmRequestedSupportedFeatures")
+            .field("features", &self.features)
+            .field("requirement", &self.requirement)
+            .finish()
+    }
+}
+
 /// PDN-Type values (3GPP TS 29.272 §7.3.62).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PdnType {
@@ -1495,6 +1782,12 @@ pub struct SwmDiameterEapRequest {
     /// A present value must use the ASCII, dot-separated DNS label form used
     /// by an APN and must not contain empty or overlong labels.
     pub service_selection: Option<Redacted<String>>,
+    /// Mobility capabilities advertised to the AAA server.
+    pub mip6_feature_vector: Option<SwmMip6FeatureVector>,
+    /// Ordered 3GPP Supported-Features groups offered to the AAA server.
+    pub supported_features: Vec<SwmRequestedSupportedFeatures>,
+    /// UE local address used for this access (presence-only in diagnostics).
+    pub ue_local_ip_address: Option<IpAddr>,
     /// Auth-Request-Type.
     pub auth_request_type: AuthRequestType,
     /// EAP-Payload (redacted in diagnostic output).
@@ -1519,6 +1812,15 @@ impl std::fmt::Debug for SwmDiameterEapRequest {
             .field("user_name", &self.user_name)
             .field("rat_type", &self.rat_type)
             .field("service_selection", &self.service_selection)
+            .field(
+                "mip6_feature_vector",
+                &self.mip6_feature_vector.map(|_| "<redacted>"),
+            )
+            .field("supported_features", &self.supported_features.len())
+            .field(
+                "ue_local_ip_address",
+                &self.ue_local_ip_address.map(|_| "<redacted>"),
+            )
             .field("auth_request_type", &self.auth_request_type)
             .field("eap_payload", &self.eap_payload)
             .field("emergency_services", &self.emergency_services)
@@ -1545,6 +1847,10 @@ pub struct SwmDiameterEapAnswer {
     pub origin_realm: Redacted<String>,
     /// User-Name (redacted in diagnostic output).
     pub user_name: Option<Redacted<String>>,
+    /// Mobility capabilities selected or authorized by the AAA server.
+    pub mip6_feature_vector: Option<SwmMip6FeatureVector>,
+    /// Ordered Supported-Features groups returned by the AAA server.
+    pub supported_features: Vec<SwmSupportedFeatureList>,
     /// Top-level Service-Selection (redacted in diagnostic output).
     ///
     /// This is distinct from the subscription default APN pointer carried by
@@ -1588,6 +1894,11 @@ impl std::fmt::Debug for SwmDiameterEapAnswer {
             .field("origin_host", &self.origin_host)
             .field("origin_realm", &self.origin_realm)
             .field("user_name", &self.user_name)
+            .field(
+                "mip6_feature_vector",
+                &self.mip6_feature_vector.map(|_| "<redacted>"),
+            )
+            .field("supported_features", &self.supported_features.len())
             .field("service_selection", &self.service_selection)
             .field(
                 "default_context_identifier",
@@ -1687,6 +1998,10 @@ impl SwmDiameterEapRequest {
                 "DER",
             ));
         }
+        validate_request_mobility_features(self.mip6_feature_vector)
+            .map_err(|reason| encode_structural_error(reason, "7.2.3.1"))?;
+        validate_requested_supported_features(&self.supported_features)
+            .map_err(|reason| encode_structural_error(reason, "6.3.29"))?;
         if let Some(terminal) = self.terminal_information.as_ref() {
             if let Some(software_version) = terminal.software_version.as_ref() {
                 let value = software_version.as_ref().as_bytes();
@@ -1789,6 +2104,16 @@ impl SwmDiameterEapAnswer {
                 "DEA",
             ));
         }
+        validate_answer_mobility_features(self.mip6_feature_vector)
+            .map_err(|reason| encode_structural_error(reason, "7.2.3.1"))?;
+        if !self.result.is_diameter_success() && self.mip6_feature_vector.is_some() {
+            return Err(encode_structural_error(
+                "non-success SWm DEA must not carry MIP6-Feature-Vector",
+                "7.1.2.1.2",
+            ));
+        }
+        validate_answer_supported_features(&self.supported_features)
+            .map_err(|reason| encode_structural_error(reason, "6.3.29"))?;
         if self.result_category() == SwmResultCategory::Success && !self.carries_eap_material() {
             return Err(encode_structural_error(
                 "SWm DEA success must carry EAP or MSK material",
@@ -1998,6 +2323,33 @@ pub fn build_swm_diameter_eap_request(
             ctx,
         )?;
     }
+    if let Some(features) = request.mip6_feature_vector {
+        builder_helpers::append_u64_avp(
+            &mut raw_avps,
+            AVP_MIP6_FEATURE_VECTOR,
+            features.bits(),
+            true,
+            ctx,
+        )?;
+    }
+    for supported_features in &request.supported_features {
+        append_supported_features_avp(
+            &mut raw_avps,
+            supported_features.features(),
+            supported_features.mandatory(),
+            ctx,
+        )?;
+    }
+    if let Some(address) = request.ue_local_ip_address {
+        let mut value = BytesMut::new();
+        builder_helpers::encode_address_value(&mut value, address);
+        builder_helpers::append_avp(
+            &mut raw_avps,
+            AvpHeader::vendor(AVP_UE_LOCAL_IP_ADDRESS, VENDOR_ID_3GPP, false),
+            &value,
+            ctx,
+        )?;
+    }
     for state in &request.state_avps {
         builder_helpers::append_octet_string_avp(&mut raw_avps, AVP_STATE, state, true, ctx)?;
     }
@@ -2065,12 +2417,16 @@ pub fn parse_swm_diameter_eap_request_with_provenance(
     let mut user_name = None;
     let mut rat_type = None;
     let mut service_selection = None;
+    let mut mip6_feature_vector = None;
+    let mut supported_features = Vec::new();
+    let mut ue_local_ip_address = None;
     let mut auth_request_type = None;
     let mut eap_payload = None;
     let mut emergency_services = None;
     let mut terminal_information = None;
     let mut state_avps = Vec::new();
     let mut terminal_missing_imei = None;
+    let mut supported_features_missing_child = None;
     let parse_result = builder_helpers::for_each_avp(
         message.raw_avps,
         ctx,
@@ -2115,6 +2471,30 @@ pub fn parse_swm_diameter_eap_request_with_provenance(
                         }
                         Err(TerminalInformationParseError::Decode(error)) => return Err(error),
                     }
+                } else if code == AVP_SUPPORTED_FEATURES && vendor_id == VENDOR_ID_3GPP {
+                    if supported_features.len() >= MAX_SWM_SUPPORTED_FEATURES {
+                        return Err(DecodeError::new(DecodeErrorCode::IeCountExceeded, offset)
+                            .with_spec_ref(SpecRef::new("3gpp", "TS29229", "6.3.29")));
+                    }
+                    match parse_requested_supported_features(&avp, ctx, value_offset, 1, offset) {
+                        Ok(features) => supported_features.push(features),
+                        Err(SupportedFeaturesParseError::Missing { error, key }) => {
+                            supported_features_missing_child = Some((error.clone(), key, offset));
+                            return Err(error);
+                        }
+                        Err(SupportedFeaturesParseError::Decode(error)) => return Err(error),
+                    }
+                } else if code == AVP_UE_LOCAL_IP_ADDRESS && vendor_id == VENDOR_ID_3GPP {
+                    validate_3gpp_m_bit_agnostic_flags(&avp.header, offset, "TS29273", "7.2.3.1")?;
+                    let value =
+                        builder_helpers::parse_address_value(avp.value, value_offset, "5.3.96")
+                            .map_err(|error| {
+                                error.with_spec_ref(SpecRef::new("3gpp", "TS29212", "5.3.96"))
+                            })?;
+                    builder_helpers::set_once(&mut ue_local_ip_address, value, offset, "DER")
+                        .map_err(|error| {
+                            error.with_spec_ref(SpecRef::new("3gpp", "TS29212", "5.3.96"))
+                        })?;
                 } else {
                     builder_helpers::handle_unknown_avp(ctx, &avp, offset, "DER")?;
                 }
@@ -2160,6 +2540,15 @@ pub fn parse_swm_diameter_eap_request_with_provenance(
                     offset,
                     "6.2",
                 )?;
+            } else if code == AVP_MIP6_FEATURE_VECTOR {
+                validate_base_m_bit_agnostic_flags(&avp.header, offset, "4.2.5")?;
+                let value = builder_helpers::parse_u64_value(avp.value, value_offset, "4.2.5")?;
+                builder_helpers::set_once(
+                    &mut mip6_feature_vector,
+                    SwmMip6FeatureVector::from_bits_retain(value),
+                    offset,
+                    "4.2.5",
+                )?;
             } else if code == AVP_AUTH_REQUEST_TYPE {
                 let value = builder_helpers::parse_u32_value(avp.value, value_offset, "8.7")?;
                 builder_helpers::set_once(
@@ -2184,6 +2573,27 @@ pub fn parse_swm_diameter_eap_request_with_provenance(
         },
     );
     if let Err(error) = parse_result {
+        if let Some((missing_error, key, parent_offset)) = supported_features_missing_child {
+            let child = base::dictionary()
+                .find_avp(key)
+                .or_else(|| dictionary().find_avp(key));
+            let parent =
+                dictionary().find_avp(AvpKey::vendor(AVP_SUPPORTED_FEATURES, VENDOR_ID_3GPP));
+            return Err(match (child, parent) {
+                (Some(definition), Some(parent_definition)) => {
+                    DiameterParserError::missing_with_parent(
+                        message,
+                        missing_error,
+                        definition,
+                        parent_definition,
+                        parent_offset,
+                        APPLICATION_ID,
+                        COMMAND_DIAMETER_EAP,
+                    )
+                }
+                _ => DiameterParserError::decoded(message, error),
+            });
+        }
         if let Some((missing_error, parent_offset)) = terminal_missing_imei {
             let imei = dictionary().find_avp(AvpKey::vendor(AVP_IMEI, VENDOR_ID_3GPP));
             let parent =
@@ -2258,6 +2668,9 @@ pub fn parse_swm_diameter_eap_request_with_provenance(
         user_name,
         rat_type,
         service_selection,
+        mip6_feature_vector,
+        supported_features,
+        ue_local_ip_address,
         auth_request_type: require_swm_request_field(
             auth_request_type,
             "SWm DER requires Auth-Request-Type",
@@ -2394,6 +2807,18 @@ pub fn build_swm_diameter_eap_answer(
             ctx,
         )?;
     }
+    if let Some(features) = answer.mip6_feature_vector {
+        builder_helpers::append_u64_avp(
+            &mut raw_avps,
+            AVP_MIP6_FEATURE_VECTOR,
+            features.bits(),
+            true,
+            ctx,
+        )?;
+    }
+    for supported_features in &answer.supported_features {
+        append_supported_features_avp(&mut raw_avps, supported_features, false, ctx)?;
+    }
     if let Some(default_context_identifier) = answer.default_context_identifier {
         builder_helpers::append_vendor_u32_avp(
             &mut raw_avps,
@@ -2491,6 +2916,11 @@ pub fn build_swm_diameter_eap_answer_for(
     if request_facts.session_id.as_ref() != answer.session_id.as_ref()
         || request_facts.auth_application_id != answer.auth_application_id
         || request_facts.auth_request_type != answer.auth_request_type
+        || !mobility_answer_matches_offer(
+            request_facts.mip6_feature_vector,
+            answer.mip6_feature_vector,
+            answer.result.is_diameter_success(),
+        )
     {
         return Err(encode_structural_error(
             "SWm DEA does not correlate to the supplied DER",
@@ -2526,6 +2956,8 @@ pub fn parse_swm_diameter_eap_answer(
     let mut origin_host = None;
     let mut origin_realm = None;
     let mut user_name = None;
+    let mut mip6_feature_vector = None;
+    let mut supported_features = Vec::new();
     let mut service_selection = None;
     let mut default_context_identifier = None;
     let mut apn_configurations = Vec::new();
@@ -2561,6 +2993,18 @@ pub fn parse_swm_diameter_eap_answer(
                         ctx,
                         value_offset,
                         1,
+                    )?);
+                } else if code == AVP_SUPPORTED_FEATURES && vendor_id == VENDOR_ID_3GPP {
+                    if supported_features.len() >= MAX_SWM_SUPPORTED_FEATURES {
+                        return Err(DecodeError::new(DecodeErrorCode::IeCountExceeded, offset)
+                            .with_spec_ref(SpecRef::new("3gpp", "TS29229", "6.3.29")));
+                    }
+                    supported_features.push(parse_answer_supported_features(
+                        &avp,
+                        ctx,
+                        value_offset,
+                        1,
+                        offset,
                     )?);
                 } else {
                     builder_helpers::handle_unknown_avp(ctx, &avp, offset, "DEA")?;
@@ -2602,6 +3046,15 @@ pub fn parse_swm_diameter_eap_answer(
             } else if code == base::AVP_USER_NAME {
                 let value = builder_helpers::parse_string_value(avp.value, value_offset, "8.14")?;
                 builder_helpers::set_once(&mut user_name, Redacted::from(value), offset, "8.14")?;
+            } else if code == AVP_MIP6_FEATURE_VECTOR {
+                validate_base_m_bit_agnostic_flags(&avp.header, offset, "4.2.5")?;
+                let value = builder_helpers::parse_u64_value(avp.value, value_offset, "4.2.5")?;
+                builder_helpers::set_once(
+                    &mut mip6_feature_vector,
+                    SwmMip6FeatureVector::from_bits_retain(value),
+                    offset,
+                    "4.2.5",
+                )?;
             } else if code == AVP_SERVICE_SELECTION {
                 let value = builder_helpers::parse_string_value(avp.value, value_offset, "6.2")?;
                 builder_helpers::set_once(
@@ -2713,6 +3166,8 @@ pub fn parse_swm_diameter_eap_answer(
             "DEA",
         )?,
         user_name,
+        mip6_feature_vector,
+        supported_features,
         service_selection,
         default_context_identifier,
         apn_configurations,
@@ -2792,6 +3247,257 @@ fn validate_base_mandatory_flags(
         .with_spec_ref(SpecRef::new("ietf", "RFC6733", section)));
     }
     Ok(())
+}
+
+fn validate_base_m_bit_agnostic_flags(
+    header: &AvpHeader,
+    offset: usize,
+    section: &'static str,
+) -> Result<(), DecodeError> {
+    if header.vendor_id.is_some() || header.flags.is_protected() {
+        return Err(DecodeError::new(
+            DecodeErrorCode::Structural {
+                reason: "understood base AVP must clear V/P",
+            },
+            builder_helpers::offset_add(offset, 4, section)?,
+        )
+        .with_spec_ref(SpecRef::new("ietf", "RFC5447", "4.2.5")));
+    }
+    Ok(())
+}
+
+fn validate_3gpp_m_bit_agnostic_flags(
+    header: &AvpHeader,
+    offset: usize,
+    document: &'static str,
+    section: &'static str,
+) -> Result<(), DecodeError> {
+    if header.vendor_id != Some(VENDOR_ID_3GPP) || header.flags.is_protected() {
+        return Err(DecodeError::new(
+            DecodeErrorCode::Structural {
+                reason: "understood 3GPP AVP must set V and clear P",
+            },
+            builder_helpers::offset_add(offset, 4, section)?,
+        )
+        .with_spec_ref(SpecRef::new("3gpp", document, section)));
+    }
+    Ok(())
+}
+
+fn validate_supported_features_outer_flags(
+    header: &AvpHeader,
+    request: bool,
+    offset: usize,
+) -> Result<SwmSupportedFeaturesRequirement, DecodeError> {
+    if header.vendor_id != Some(VENDOR_ID_3GPP) || header.flags.is_protected() {
+        return Err(DecodeError::new(
+            DecodeErrorCode::Structural {
+                reason: "Supported-Features must set V for 3GPP and clear P",
+            },
+            builder_helpers::offset_add(offset, 4, "6.3.29")?,
+        )
+        .with_spec_ref(SpecRef::new("3gpp", "TS29229", "6.3.29")));
+    }
+    if !request && header.flags.is_mandatory() {
+        return Err(DecodeError::new(
+            DecodeErrorCode::Structural {
+                reason: "Supported-Features answer AVP must clear M",
+            },
+            builder_helpers::offset_add(offset, 4, "6.3.29")?,
+        )
+        .with_spec_ref(SpecRef::new("3gpp", "TS29229", "6.3.29")));
+    }
+    Ok(if header.flags.is_mandatory() {
+        SwmSupportedFeaturesRequirement::Required
+    } else {
+        SwmSupportedFeaturesRequirement::Discovery
+    })
+}
+
+fn append_supported_features_avp(
+    dst: &mut BytesMut,
+    features: &SwmSupportedFeatureList,
+    mandatory: bool,
+    ctx: EncodeContext,
+) -> Result<(), EncodeError> {
+    let mut value = BytesMut::new();
+    builder_helpers::append_u32_avp(
+        &mut value,
+        base::AVP_VENDOR_ID,
+        features.vendor_id().get(),
+        true,
+        ctx,
+    )?;
+    builder_helpers::append_vendor_u32_avp(
+        &mut value,
+        AVP_FEATURE_LIST_ID,
+        VENDOR_ID_3GPP,
+        features.feature_list_id(),
+        false,
+        ctx,
+    )?;
+    builder_helpers::append_vendor_u32_avp(
+        &mut value,
+        AVP_FEATURE_LIST,
+        VENDOR_ID_3GPP,
+        features.feature_list(),
+        false,
+        ctx,
+    )?;
+    for additional in features.additional_avps() {
+        if additional.header().flags.is_mandatory() {
+            return Err(encode_structural_error(
+                "unknown Supported-Features extension child must clear M",
+                "6.3.29",
+            ));
+        }
+        additional.append_to(&mut value, ctx)?;
+    }
+    builder_helpers::append_avp(
+        dst,
+        AvpHeader::vendor(AVP_SUPPORTED_FEATURES, VENDOR_ID_3GPP, mandatory),
+        &value,
+        ctx,
+    )
+}
+
+enum SupportedFeaturesParseError {
+    Decode(DecodeError),
+    Missing { error: DecodeError, key: AvpKey },
+}
+
+impl From<DecodeError> for SupportedFeaturesParseError {
+    fn from(error: DecodeError) -> Self {
+        Self::Decode(error)
+    }
+}
+
+impl SupportedFeaturesParseError {
+    fn into_decode_error(self) -> DecodeError {
+        match self {
+            Self::Decode(error) | Self::Missing { error, .. } => error,
+        }
+    }
+}
+
+fn parse_supported_feature_list(
+    avp: &crate::RawAvp<'_>,
+    ctx: DecodeContext,
+    base_offset: usize,
+    depth: usize,
+) -> Result<SwmSupportedFeatureList, SupportedFeaturesParseError> {
+    let mut vendor_id = None;
+    let mut feature_list_id = None;
+    let mut feature_list = None;
+    let mut additional_avps = Vec::new();
+    let mut additional_keys = HashSet::new();
+    builder_helpers::for_each_avp(avp.value, ctx, base_offset, depth, |offset, child| {
+        let value_offset = builder_helpers::offset_add(offset, child.header.header_len(), "6.3.29")
+            .map_err(|error| error.with_spec_ref(SpecRef::new("3gpp", "TS29229", "6.3.29")))?;
+        let code = child.header.code;
+        if code == base::AVP_VENDOR_ID && child.header.vendor_id.is_none() {
+            validate_base_mandatory_flags(&child.header, offset, "5.3.3")?;
+            let value = builder_helpers::parse_u32_value(child.value, value_offset, "5.3.3")?;
+            builder_helpers::set_once(&mut vendor_id, VendorId::new(value), offset, "6.3.29")
+                .map_err(|error| error.with_spec_ref(SpecRef::new("3gpp", "TS29229", "6.3.29")))?;
+        } else if code == AVP_FEATURE_LIST_ID && child.header.vendor_id == Some(VENDOR_ID_3GPP) {
+            validate_3gpp_m_bit_agnostic_flags(&child.header, offset, "TS29229", "6.3.30")?;
+            let value = builder_helpers::parse_u32_value(child.value, value_offset, "6.3.30")
+                .map_err(|error| error.with_spec_ref(SpecRef::new("3gpp", "TS29229", "6.3.30")))?;
+            builder_helpers::set_once(&mut feature_list_id, value, offset, "6.3.30")
+                .map_err(|error| error.with_spec_ref(SpecRef::new("3gpp", "TS29229", "6.3.30")))?;
+        } else if code == AVP_FEATURE_LIST && child.header.vendor_id == Some(VENDOR_ID_3GPP) {
+            validate_3gpp_m_bit_agnostic_flags(&child.header, offset, "TS29229", "6.3.31")?;
+            let value = builder_helpers::parse_u32_value(child.value, value_offset, "6.3.31")
+                .map_err(|error| error.with_spec_ref(SpecRef::new("3gpp", "TS29229", "6.3.31")))?;
+            builder_helpers::set_once(&mut feature_list, value, offset, "6.3.31")
+                .map_err(|error| error.with_spec_ref(SpecRef::new("3gpp", "TS29229", "6.3.31")))?;
+        } else {
+            if child.header.flags.is_mandatory() || ctx.unknown_ie_policy == UnknownIePolicy::Reject
+            {
+                builder_helpers::handle_unknown_avp(ctx, &child, offset, "6.3.29")?;
+            } else {
+                if ctx.duplicate_ie_policy == DuplicateIePolicy::Reject
+                    && !additional_keys.insert(child.header.key())
+                {
+                    return Err(DecodeError::new(DecodeErrorCode::DuplicateIe, offset)
+                        .with_spec_ref(SpecRef::new("3gpp", "TS29229", "6.3.29")));
+                }
+                if ctx.unknown_ie_policy == UnknownIePolicy::Preserve {
+                    if additional_avps.len() >= MAX_SWM_SUPPORTED_FEATURES {
+                        return Err(DecodeError::new(DecodeErrorCode::IeCountExceeded, offset)
+                            .with_spec_ref(SpecRef::new("3gpp", "TS29229", "6.3.29")));
+                    }
+                    additional_avps.push(SwmAdditionalAvp::from_raw_exact(&child));
+                }
+            }
+        }
+        Ok(())
+    })?;
+    let vendor_id = vendor_id.ok_or_else(|| SupportedFeaturesParseError::Missing {
+        error: missing_child_error(
+            base_offset,
+            "missing Supported-Features Vendor-Id child AVP",
+        ),
+        key: AvpKey::ietf(base::AVP_VENDOR_ID),
+    })?;
+    let feature_list_id = feature_list_id.ok_or_else(|| SupportedFeaturesParseError::Missing {
+        error: missing_child_error(
+            base_offset,
+            "missing Supported-Features Feature-List-ID child AVP",
+        ),
+        key: AvpKey::vendor(AVP_FEATURE_LIST_ID, VENDOR_ID_3GPP),
+    })?;
+    let feature_list = feature_list.ok_or_else(|| SupportedFeaturesParseError::Missing {
+        error: missing_child_error(
+            base_offset,
+            "missing Supported-Features Feature-List child AVP",
+        ),
+        key: AvpKey::vendor(AVP_FEATURE_LIST, VENDOR_ID_3GPP),
+    })?;
+    Ok(SwmSupportedFeatureList {
+        vendor_id,
+        feature_list_id,
+        feature_list,
+        additional_avps,
+    })
+}
+
+fn parse_requested_supported_features(
+    avp: &crate::RawAvp<'_>,
+    ctx: DecodeContext,
+    base_offset: usize,
+    depth: usize,
+    outer_offset: usize,
+) -> Result<SwmRequestedSupportedFeatures, SupportedFeaturesParseError> {
+    let requirement = validate_supported_features_outer_flags(&avp.header, true, outer_offset)?;
+    let features = parse_supported_feature_list(avp, ctx, base_offset, depth)?;
+    if requirement == SwmSupportedFeaturesRequirement::Discovery && features.feature_list() != 0 {
+        return Err(DecodeError::new(
+            DecodeErrorCode::Structural {
+                reason: "M-clear Supported-Features request must carry a zero Feature-List",
+            },
+            outer_offset,
+        )
+        .with_spec_ref(SpecRef::new("3gpp", "TS29229", "6.3.29"))
+        .into());
+    }
+    Ok(SwmRequestedSupportedFeatures {
+        features,
+        requirement,
+    })
+}
+
+fn parse_answer_supported_features(
+    avp: &crate::RawAvp<'_>,
+    ctx: DecodeContext,
+    base_offset: usize,
+    depth: usize,
+    outer_offset: usize,
+) -> Result<SwmSupportedFeatureList, DecodeError> {
+    validate_supported_features_outer_flags(&avp.header, false, outer_offset)?;
+    parse_supported_feature_list(avp, ctx, base_offset, depth)
+        .map_err(SupportedFeaturesParseError::into_decode_error)
 }
 
 pub(super) fn append_experimental_result_avp(
@@ -3286,6 +3992,89 @@ fn valid_service_selection(value: &str) -> bool {
         })
 }
 
+fn validate_request_mobility_features(
+    features: Option<SwmMip6FeatureVector>,
+) -> Result<(), &'static str> {
+    if features.is_some_and(|features| !features.valid_request()) {
+        return Err("SWm DER MIP6-Feature-Vector contains an answer-only selection bit");
+    }
+    Ok(())
+}
+
+fn validate_answer_mobility_features(
+    features: Option<SwmMip6FeatureVector>,
+) -> Result<(), &'static str> {
+    if features.is_some_and(|features| !features.valid_answer()) {
+        return Err(
+            "SWm DEA MIP6-Feature-Vector combines ASSIGN_LOCAL_IP with network-based mobility",
+        );
+    }
+    Ok(())
+}
+
+fn validate_requested_supported_features(
+    entries: &[SwmRequestedSupportedFeatures],
+) -> Result<(), &'static str> {
+    if entries.len() > MAX_SWM_SUPPORTED_FEATURES {
+        return Err("SWm DER contains too many Supported-Features AVPs");
+    }
+    let mut identities = HashSet::with_capacity(entries.len());
+    for entry in entries {
+        if entry.requirement() == SwmSupportedFeaturesRequirement::Discovery
+            && entry.features().feature_list() != 0
+        {
+            return Err("M-clear Supported-Features request must carry a zero Feature-List");
+        }
+        if !identities.insert(entry.features().identity()) {
+            return Err("SWm DER contains duplicate Supported-Features identities");
+        }
+    }
+    Ok(())
+}
+
+fn validate_answer_supported_features(
+    entries: &[SwmSupportedFeatureList],
+) -> Result<(), &'static str> {
+    if entries.len() > MAX_SWM_SUPPORTED_FEATURES {
+        return Err("SWm DEA contains too many Supported-Features AVPs");
+    }
+    let mut identities = HashSet::with_capacity(entries.len());
+    if entries
+        .iter()
+        .any(|entry| !identities.insert(entry.identity()))
+    {
+        return Err("SWm DEA contains duplicate Supported-Features identities");
+    }
+    Ok(())
+}
+
+fn mobility_answer_matches_offer(
+    offered: Option<SwmMip6FeatureVector>,
+    authorized: Option<SwmMip6FeatureVector>,
+    exact_success: bool,
+) -> bool {
+    if !exact_success {
+        return authorized.is_none();
+    }
+    match (offered, authorized) {
+        (None, None) => true,
+        (Some(_), None) => false,
+        (None, Some(_)) => false,
+        (Some(offered), Some(authorized)) => {
+            let offered_nbm = offered.bits() & SwmMip6FeatureVector::NETWORK_BASED_MOBILITY_BITS;
+            let authorized_nbm =
+                authorized.bits() & SwmMip6FeatureVector::NETWORK_BASED_MOBILITY_BITS;
+            let authorized_other = authorized.bits()
+                & !(SwmMip6FeatureVector::NETWORK_BASED_MOBILITY_BITS
+                    | SwmMip6FeatureVector::ANSWER_ONLY_BITS);
+            let offered_other = offered.bits() & !SwmMip6FeatureVector::NETWORK_BASED_MOBILITY_BITS;
+            (authorized_nbm == 0 || offered_nbm != 0)
+                && authorized_other & !offered_other == 0
+                && authorized.valid_answer()
+        }
+    }
+}
+
 fn validate_decoded_request(request: &SwmDiameterEapRequest) -> Result<(), DecodeError> {
     if request.session_id.as_ref().is_empty() {
         return Err(decode_structural_error(
@@ -3362,6 +4151,10 @@ fn validate_decoded_request(request: &SwmDiameterEapRequest) -> Result<(), Decod
             "DER",
         ));
     }
+    validate_request_mobility_features(request.mip6_feature_vector)
+        .map_err(|reason| decode_structural_error(reason, "7.2.3.1"))?;
+    validate_requested_supported_features(&request.supported_features)
+        .map_err(|reason| decode_structural_error(reason, "6.3.29"))?;
     if let Some(terminal) = request.terminal_information.as_ref() {
         if let Some(software_version) = terminal.software_version.as_ref() {
             let value = software_version.as_ref().as_bytes();
@@ -3450,6 +4243,16 @@ fn validate_decoded_answer(answer: &SwmDiameterEapAnswer) -> Result<(), DecodeEr
             "DEA",
         ));
     }
+    validate_answer_mobility_features(answer.mip6_feature_vector)
+        .map_err(|reason| decode_structural_error(reason, "7.2.3.1"))?;
+    if !answer.result.is_diameter_success() && answer.mip6_feature_vector.is_some() {
+        return Err(decode_structural_error(
+            "non-success SWm DEA must not carry MIP6-Feature-Vector",
+            "7.1.2.1.2",
+        ));
+    }
+    validate_answer_supported_features(&answer.supported_features)
+        .map_err(|reason| decode_structural_error(reason, "6.3.29"))?;
     if answer.result_category() == SwmResultCategory::Success && !answer.carries_eap_material() {
         return Err(decode_structural_error(
             "SWm DEA success must carry EAP or MSK material",
@@ -3494,6 +4297,11 @@ fn ensure_correlated_answer(
     ensure_same_session(request, answer)?;
     if request.auth_application_id != answer.auth_application_id
         || request.auth_request_type != answer.auth_request_type
+        || !mobility_answer_matches_offer(
+            request.mip6_feature_vector,
+            answer.mip6_feature_vector,
+            answer.result.is_diameter_success(),
+        )
     {
         return Err(SwmEmergencyAuthorizationError::AnswerRequestMismatch);
     }
@@ -3524,6 +4332,11 @@ fn retry_preserves_initial_request(
         && initial_request.origin_realm == retry_request.origin_realm
         && initial_request.destination_realm == retry_request.destination_realm
         && initial_request.destination_host == retry_request.destination_host
+        && initial_request.rat_type == retry_request.rat_type
+        && initial_request.service_selection == retry_request.service_selection
+        && initial_request.mip6_feature_vector == retry_request.mip6_feature_vector
+        && initial_request.supported_features == retry_request.supported_features
+        && initial_request.ue_local_ip_address == retry_request.ue_local_ip_address
         && initial_request.auth_request_type == retry_request.auth_request_type
         && initial_request.eap_payload == retry_request.eap_payload
         && initial_request.emergency_services == retry_request.emergency_services

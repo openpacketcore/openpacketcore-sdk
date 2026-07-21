@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Breaking: urgent SWm mobility/feature/local-address context — `opc-proto-diameter`:**
+  `SwmDiameterEapRequest` adds optional typed MIP6 mobility capabilities,
+  ordered Supported-Features offers, and a presence-redacted UE local IP;
+  `SwmDiameterEapAnswer` adds typed mobility authorization and ordered
+  Supported-Features responses. The codec enforces the Release 19 M-bit,
+  result-conditioning, collective PMIP6/GTPv2, grouped-child provenance, and
+  unknown-child preservation contracts. Existing struct literals add `None`,
+  `Vec::new()`, and `None` respectively; absent fields retain prior wire bytes
+  (#352). Consumers must carry the request context into every multi-round DER;
+  this focused slice does not complete the broader #352 authorization-context
+  checklist, which remains open.
 - **Mandatory SWm Diameter-EAP State encoding — `opc-proto-diameter`:** typed
   DER and DEA builders now set the RFC 4005 mandatory bit on every ordered,
   opaque State AVP. The dictionary accepts the RFC-permitted protected bit on

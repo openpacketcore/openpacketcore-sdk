@@ -241,6 +241,41 @@ emergency DER cannot carry it. The product remains responsible
 for supplying Service-Selection only from a UE-requested APN and choosing WLAN
 or the TS 29.273 VIRTUAL fallback from trusted access provenance.
 
+The DER/DEA surface models RFC 5447 `MIP6-Feature-Vector` (code 124) as a
+retained typed `Unsigned64`. Builders set M; parsers apply the TS 29.273
+understood-AVP override and accept either M value while requiring V/P clear.
+The exact Release 19 mobility bits are named, including GTPv2
+`0x0000400000000000`. A DER cannot originate the answer-only
+`ASSIGN_LOCAL_IP` selection. A DEA cannot combine that selection with
+PMIP6/GTPv2. Request-bound correlation permits mobility authorization only on
+exact base `DIAMETER_SUCCESS`: success requires presence to match the request,
+non-success forbids the vector, non-NBM bits must be a subset of the offer,
+and an offer containing either PMIP6 or GTPv2 authorizes the TS-defined
+collective NBM response containing either or both bits.
+The codec preserves the exact vector across typed parse/rebuild cycles. Because
+the generic Diameter model does not own the consumer's multi-round EAP state,
+the consumer remains responsible for carrying the initial access context into
+each continuation DER; a regression fixture proves that changing only EAP and
+State data retains the identical vector wire value on the next round.
+
+Repeated vendor-10415 `Supported-Features` (628) groups preserve wire order and
+reject duplicate `(Vendor-Id, Feature-List-ID)` identities. Vendor-Id, 3GPP
+Feature-List-ID (629), and Feature-List (630) are mandatory children with
+exact widths and vendor-aware cardinality. Request entries retain an explicit
+outer-M policy: M-clear discovery is legal only for a zero list; answer groups
+always clear M. The SWm convenience value is `(10415, 1, 0)`. Under Preserve,
+bounded optional extension children retain exact header/value/order and are
+re-emitted; Drop sanitizes them, Reject refuses them, and unknown M-set
+children always fail. Missing required children retain sealed grouped-parent
+provenance for nested request-bound 5005 `Failed-AVP` generation.
+
+DER `UE-Local-IP-Address` (2805) uses the RFC 6733 Address codec for IPv4 and
+IPv6, requires vendor 10415 and P clear, and tolerates either received M value
+for this understood reused AVP while builders emit M clear. It is singleton,
+malformed families/lengths fail closed, and diagnostic output reveals only
+presence. All three additions are optional, so absent fields preserve the
+previous DER/DEA bytes exactly.
+
 The SWm DER parser and transaction-envelope parser have additive provenance-
 aware entry points. Missing Session-Id, Auth-Application-Id, Origin-Host,
 Origin-Realm, Destination-Realm, Auth-Request-Type, or EAP-Payload can therefore
