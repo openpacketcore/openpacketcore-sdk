@@ -9,11 +9,12 @@ use std::process::{Command, Output};
 use std::sync::Arc;
 
 use opc_ipsec_xfrm::{
-    Algorithm, AuthAlgorithm, InstallPolicyRequest, InstallSaRequest, InstalledOutboundSaBinding,
-    IpAddress, KeyMaterial, LifetimeConfig, LinuxXfrmBackend, NamespaceBoundLinuxXfrmBackend,
-    PolicyParameters, QuerySaRequest, RemovePolicyRequest, RemoveSaRequest, SaParameters,
-    XfrmAction, XfrmBackend, XfrmCompositeInstallRequest, XfrmDirection, XfrmId, XfrmMode,
-    XfrmRequestId, XfrmSelector, XfrmStagedInstall, XfrmTemplate,
+    Algorithm, AuthAlgorithm, EspCounterProofRequirement, EspCounterResumeApplyRequest,
+    EspCounterResumeBinding, EspCounterResumeProofSet, InstallPolicyRequest, InstallSaRequest,
+    InstalledOutboundSaBinding, IpAddress, KeyMaterial, LifetimeConfig, LinuxXfrmBackend,
+    NamespaceBoundLinuxXfrmBackend, PolicyParameters, QuerySaRequest, RemovePolicyRequest,
+    RemoveSaRequest, SaParameters, XfrmAction, XfrmBackend, XfrmCompositeInstallRequest,
+    XfrmDirection, XfrmId, XfrmMode, XfrmRequestId, XfrmSelector, XfrmStagedInstall, XfrmTemplate,
 };
 
 const IPPROTO_ESP: u8 = 50;
@@ -301,6 +302,22 @@ async fn outbound_binding_installs_recovers_and_transforms_first_packet(
     };
     assert_eq!(installed.id(), recovered.id());
 
+    const RESUMED_SEND_NEXT: u64 = (1_u64 << 32) + 17;
+    let counter_binding = EspCounterResumeBinding::new(1, 1, recovered.id(), RESUMED_SEND_NEXT)?;
+    let receipt = backend
+        .apply_and_read_back_outbound_esp_counter(
+            &recovered,
+            recovered.id(),
+            EspCounterResumeApplyRequest::new(counter_binding, request.sa.parameters.clone()),
+        )
+        .await?;
+    EspCounterResumeProofSet::single(receipt)
+        .validate_counter_proof(
+            counter_binding,
+            EspCounterProofRequirement::BeforeFirstPublication,
+        )
+        .await?;
+
     // A response is not expected because the dummy link has no peer. The
     // outbound packet must nevertheless cross policy lookup and ESP output.
     let _ = command(
@@ -326,9 +343,15 @@ async fn outbound_binding_installs_recovers_and_transforms_first_packet(
         request.sa.parameters.id.spi,
     );
     let state = backend.query_sa(query).await?;
-    assert!(
-        state.lifetime_current.packets >= 1,
-        "first packet did not traverse the outbound ESP SA"
+    assert_eq!(
+        state.lifetime_current.packets, 1,
+        "exactly one first packet must traverse the outbound ESP SA"
+    );
+    let emitted_sequence = (u64::from(state.replay_state.outbound_sequence_hi) << 32)
+        | u64::from(state.replay_state.outbound_sequence);
+    assert_eq!(
+        emitted_sequence, RESUMED_SEND_NEXT,
+        "Linux stores last assigned oseq, so one packet must advance next - 1 to next"
     );
 
     backend

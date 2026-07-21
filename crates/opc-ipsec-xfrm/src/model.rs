@@ -497,6 +497,20 @@ impl fmt::Debug for SaReplayState {
     }
 }
 
+/// Canonical Linux ESN selection for one SA request.
+//
+// Linux requires ESN for replay windows above 32 even when a malformed
+// caller-provided replay snapshot says otherwise. Validation rejects that
+// contradictory snapshot later, but every binding/fingerprint/parser decision
+// must still use exactly the same flag rule as the encoder.
+pub(crate) fn sa_uses_esn(parameters: &SaParameters) -> bool {
+    parameters.replay_window > 32
+        || parameters
+            .replay_state
+            .as_ref()
+            .is_some_and(|state| state.esn)
+}
+
 fn replay_bitmap_word_len(replay_window: u32) -> usize {
     replay_window.div_ceil(32).max(1) as usize
 }

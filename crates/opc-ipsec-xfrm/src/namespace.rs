@@ -7,8 +7,14 @@ use async_trait::async_trait;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{
+    counter_resume::{
+        map_backend_error, CounterRecoveryActorRequest, CounterResumeActorRequest,
+        EspCounterReceiptRegistry,
+    },
     outbound_binding::{validate_outbound_request, OutboundSaPolicyExpectation},
-    InstalledOutboundSaBinding, OutboundSaBindingError,
+    AppliedEspCounterReceipt, EspCounterProofRequirement, EspCounterResumeApplyRequest,
+    EspCounterResumeBinding, EspCounterResumeError, EspCounterResumeRecoveryRequest,
+    InstalledOutboundSaBinding, OutboundSaBindingError, OutboundSaBindingId,
 };
 use crate::{
     AllocateSpiRequest, InstallPolicyRequest, InstallSaRequest, LinuxXfrmBackend, QuerySaRequest,
@@ -125,7 +131,7 @@ fn bind_with_capacity(
 
     let worker = std::thread::Builder::new()
         .name(String::from("opc-xfrm-netns"))
-        .spawn(move || run_actor(backend, receiver, startup_sender))
+        .spawn(move || run_actor(backend, binding, receiver, startup_sender))
         .map_err(|error| XfrmError::io("network_namespace_actor_spawn", error))?;
 
     let startup = startup_receiver
@@ -144,6 +150,7 @@ fn bind_with_capacity(
 
 fn run_actor(
     backend: LinuxXfrmBackend,
+    binding: NetworkNamespaceBinding,
     mut receiver: mpsc::Receiver<NamespaceCommand>,
     startup: std::sync::mpsc::SyncSender<Result<(), XfrmError>>,
 ) {
@@ -167,10 +174,29 @@ fn run_actor(
     }
 
     runtime.block_on(async move {
+        let mut state = NamespaceActorState::new(binding);
         while let Some(command) = receiver.recv().await {
-            command.execute(&backend).await;
+            command.execute(&backend, &mut state).await;
         }
     });
+}
+
+struct NamespaceActorState {
+    binding: NetworkNamespaceBinding,
+    counter_receipts: EspCounterReceiptRegistry,
+}
+
+impl NamespaceActorState {
+    fn new(binding: NetworkNamespaceBinding) -> Self {
+        Self {
+            binding,
+            counter_receipts: EspCounterReceiptRegistry::default(),
+        }
+    }
+
+    fn invalidate_counter_receipts(&mut self) {
+        self.counter_receipts.invalidate_all();
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -270,6 +296,126 @@ impl NamespaceBoundLinuxXfrmBackend {
             .await?;
         Ok(binding)
     }
+
+    /// Atomically advance and prove the outbound ESP sequence for one opaque
+    /// installed-SA binding.
+    ///
+    /// Direction is not caller-selectable. The dedicated namespace actor
+    /// validates the opaque binding and durable ID, performs exact OUT-policy
+    /// and transient-key readback, reads the current last-assigned sequence,
+    /// applies the dedicated Linux replay-state update only when moving
+    /// forward, and repeats exact readback
+    /// before issuing a key-free receipt. An exact retry is idempotent; a
+    /// request below the live counter fails with
+    /// `esp_counter_already_advanced` and never mutates kernel state.
+    ///
+    /// Once admitted, cancellation cannot cancel the actor command. A caller
+    /// that loses the reply repeats the same request; preflight then recovers
+    /// the already-applied value without a second update.
+    ///
+    /// The successor SA must remain quiescent and unpublished until the
+    /// returned receipt has been validated at the required boundary. This
+    /// preserves the preflight-to-`NEWAE` monotonicity contract; a second raw
+    /// netlink writer or packet source for the same SA violates the backend's
+    /// exclusive-writer contract and invalidates the proof.
+    pub async fn apply_and_read_back_outbound_esp_counter(
+        &self,
+        authority: &InstalledOutboundSaBinding,
+        expected_id: OutboundSaBindingId,
+        request: EspCounterResumeApplyRequest,
+    ) -> Result<AppliedEspCounterReceipt, EspCounterResumeError> {
+        let binding = request.binding();
+        let permit =
+            self.inner
+                .sender
+                .reserve()
+                .await
+                .map_err(|_| EspCounterResumeError::Backend {
+                    code: "esp_counter_backend_unavailable",
+                })?;
+        let (reply_sender, reply_receiver) = oneshot::channel();
+        permit.send(NamespaceCommand::ApplyOutboundEspCounter(
+            Box::new(CounterResumeActorRequest {
+                authority: authority.clone(),
+                expected_id,
+                request,
+            }),
+            reply_sender,
+        ));
+        reply_receiver
+            .await
+            .map_err(|_| EspCounterResumeError::Backend {
+                code: "esp_counter_backend_state_indeterminate",
+            })??;
+        Ok(AppliedEspCounterReceipt::new(binding, self.clone()))
+    }
+
+    pub(crate) async fn validate_outbound_esp_counter_receipt(
+        &self,
+        binding: EspCounterResumeBinding,
+        requirement: EspCounterProofRequirement,
+    ) -> Result<(), EspCounterResumeError> {
+        let permit =
+            self.inner
+                .sender
+                .reserve()
+                .await
+                .map_err(|_| EspCounterResumeError::Backend {
+                    code: "esp_counter_backend_unavailable",
+                })?;
+        let (reply_sender, reply_receiver) = oneshot::channel();
+        permit.send(NamespaceCommand::ValidateOutboundEspCounter(
+            binding,
+            requirement,
+            reply_sender,
+        ));
+        reply_receiver
+            .await
+            .map_err(|_| EspCounterResumeError::Backend {
+                code: "esp_counter_backend_unavailable",
+            })?
+    }
+
+    /// Rebuild a receipt after an already-committed ownership grant survives
+    /// process loss and the live outbound SA may have advanced.
+    ///
+    /// This method is read-only. It performs exact actor-local OUT-policy, SA,
+    /// and transient-key readback and requires the observed sequence to be at
+    /// or above the durable requested floor. The returned receipt is
+    /// structurally capped to
+    /// [`EspCounterProofRequirement::CommittedRecovery`]; it can never
+    /// authorize a new fence or first steering publication.
+    pub async fn recover_committed_outbound_esp_counter(
+        &self,
+        authority: &InstalledOutboundSaBinding,
+        expected_id: OutboundSaBindingId,
+        request: EspCounterResumeRecoveryRequest,
+    ) -> Result<AppliedEspCounterReceipt, EspCounterResumeError> {
+        let binding = request.binding();
+        let permit =
+            self.inner
+                .sender
+                .reserve()
+                .await
+                .map_err(|_| EspCounterResumeError::Backend {
+                    code: "esp_counter_backend_unavailable",
+                })?;
+        let (reply_sender, reply_receiver) = oneshot::channel();
+        permit.send(NamespaceCommand::RecoverCommittedOutboundEspCounter(
+            Box::new(CounterRecoveryActorRequest {
+                authority: authority.clone(),
+                expected_id,
+                request,
+            }),
+            reply_sender,
+        ));
+        reply_receiver
+            .await
+            .map_err(|_| EspCounterResumeError::Backend {
+                code: "esp_counter_backend_unavailable",
+            })??;
+        Ok(AppliedEspCounterReceipt::new(binding, self.clone()))
+    }
 }
 
 enum NamespaceCommand {
@@ -293,12 +439,25 @@ enum NamespaceCommand {
         Box<OutboundBindingValidation>,
         oneshot::Sender<Result<(), OutboundSaBindingError>>,
     ),
+    ApplyOutboundEspCounter(
+        Box<CounterResumeActorRequest>,
+        oneshot::Sender<Result<(), EspCounterResumeError>>,
+    ),
+    RecoverCommittedOutboundEspCounter(
+        Box<CounterRecoveryActorRequest>,
+        oneshot::Sender<Result<(), EspCounterResumeError>>,
+    ),
+    ValidateOutboundEspCounter(
+        EspCounterResumeBinding,
+        EspCounterProofRequirement,
+        oneshot::Sender<Result<(), EspCounterResumeError>>,
+    ),
     Probe(oneshot::Sender<Result<XfrmProbe, XfrmError>>),
     SaRelocationCapability(oneshot::Sender<Result<XfrmCapability, XfrmError>>),
 }
 
 impl NamespaceCommand {
-    async fn execute(self, backend: &LinuxXfrmBackend) {
+    async fn execute(self, backend: &LinuxXfrmBackend, state: &mut NamespaceActorState) {
         if let Err(error) = backend.verify_namespace_actor() {
             self.send_error(error);
             return;
@@ -306,9 +465,11 @@ impl NamespaceCommand {
 
         match self {
             Self::AllocateSpi(request, reply) => {
+                state.invalidate_counter_receipts();
                 let _ = reply.send(backend.allocate_spi(request).await);
             }
             Self::InstallSa(request, reply) => {
+                state.invalidate_counter_receipts();
                 let _ = reply.send(backend.install_sa(request).await);
             }
             Self::QuerySa(request, reply) => {
@@ -318,21 +479,27 @@ impl NamespaceCommand {
                 let _ = reply.send(backend.query_sa_relocation_identity(request).await);
             }
             Self::RekeySa(request, reply) => {
+                state.invalidate_counter_receipts();
                 let _ = reply.send(backend.rekey_sa(request).await);
             }
             Self::RelocateSa(request, reply) => {
+                state.invalidate_counter_receipts();
                 let _ = reply.send(backend.relocate_sa(request).await);
             }
             Self::RemoveSa(request, reply) => {
+                state.invalidate_counter_receipts();
                 let _ = reply.send(backend.remove_sa(request).await);
             }
             Self::InstallPolicy(request, reply) => {
+                state.invalidate_counter_receipts();
                 let _ = reply.send(backend.install_policy(request).await);
             }
             Self::RekeyPolicy(request, reply) => {
+                state.invalidate_counter_receipts();
                 let _ = reply.send(backend.rekey_policy(request).await);
             }
             Self::RemovePolicy(request, reply) => {
+                state.invalidate_counter_receipts();
                 let _ = reply.send(backend.remove_policy(request).await);
             }
             Self::ValidateOutboundBinding(validation, reply) => {
@@ -342,6 +509,30 @@ impl NamespaceCommand {
                             &validation.expectation,
                             &validation.supplied_sa,
                         )
+                        .await,
+                );
+            }
+            Self::ApplyOutboundEspCounter(request, reply) => {
+                let _ = reply.send(
+                    state
+                        .counter_receipts
+                        .apply(backend, state.binding, *request)
+                        .await,
+                );
+            }
+            Self::RecoverCommittedOutboundEspCounter(request, reply) => {
+                let _ = reply.send(
+                    state
+                        .counter_receipts
+                        .recover_committed(backend, state.binding, *request)
+                        .await,
+                );
+            }
+            Self::ValidateOutboundEspCounter(binding, requirement, reply) => {
+                let _ = reply.send(
+                    state
+                        .counter_receipts
+                        .validate(backend, binding, requirement)
                         .await,
                 );
             }
@@ -376,6 +567,11 @@ impl NamespaceCommand {
             }
             Self::ValidateOutboundBinding(_, reply) => {
                 let _ = reply.send(Err(OutboundSaBindingError::Readback { source: error }));
+            }
+            Self::ApplyOutboundEspCounter(_, reply)
+            | Self::RecoverCommittedOutboundEspCounter(_, reply)
+            | Self::ValidateOutboundEspCounter(_, _, reply) => {
+                let _ = reply.send(Err(map_backend_error(error)));
             }
             Self::Probe(reply) => {
                 let _ = reply.send(Err(error));
@@ -499,9 +695,9 @@ mod tests {
     };
     use crate::outbound_binding::validate_outbound_request;
     use crate::{
-        Algorithm, AuthAlgorithm, DscpCodepoint, IpAddress, KeyMaterial, LifetimeConfig,
-        PolicyParameters, SaParameters, SaRelocationDirection, SaRelocationEncap,
-        SaRelocationSelector, XfrmAction, XfrmBackendKind, XfrmDirection, XfrmId,
+        Algorithm, AuthAlgorithm, DscpCodepoint, EspCounterResumeProofSet, IpAddress, KeyMaterial,
+        LifetimeConfig, PolicyParameters, SaParameters, SaRelocationDirection, SaRelocationEncap,
+        SaRelocationSelector, SaReplayState, XfrmAction, XfrmBackendKind, XfrmDirection, XfrmId,
         XfrmInstallOwnership, XfrmMode, XfrmRequestId, XfrmSelector, XfrmStagedInstall,
         XfrmTemplate,
     };
@@ -631,6 +827,54 @@ mod tests {
                 parameters: policy_parameters(),
             },
         }
+    }
+
+    fn outbound_readback_at(
+        request: &XfrmCompositeInstallRequest,
+        last_assigned: u64,
+    ) -> (SensitiveBuffer, SensitiveBuffer) {
+        let mut observed = request.clone();
+        let replay_state = if observed.sa.parameters.replay_window > 32 {
+            let mut state = SaReplayState::fresh(observed.sa.parameters.replay_window);
+            state.outbound_sequence = last_assigned as u32;
+            state.outbound_sequence_hi = (last_assigned >> 32) as u32;
+            state
+        } else {
+            SaReplayState::legacy(last_assigned as u32, 0, 0)
+        };
+        observed.sa.parameters.replay_state = Some(replay_state);
+        crate::linux::test_outbound_binding_readback_bodies(&observed).unwrap()
+    }
+
+    fn counter_binding(
+        backend: &NamespaceBoundLinuxXfrmBackend,
+        request: &XfrmCompositeInstallRequest,
+    ) -> InstalledOutboundSaBinding {
+        InstalledOutboundSaBinding::new(
+            backend.network_namespace_binding(),
+            validate_outbound_request(request).unwrap(),
+        )
+    }
+
+    fn counter_request(
+        binding: &InstalledOutboundSaBinding,
+        request: &XfrmCompositeInstallRequest,
+        operation: u128,
+        generation: u64,
+        requested_next: u64,
+    ) -> EspCounterResumeApplyRequest {
+        EspCounterResumeApplyRequest::new(
+            EspCounterResumeBinding::new(operation, generation, binding.id(), requested_next)
+                .unwrap(),
+            request.sa.parameters.clone(),
+        )
+    }
+
+    fn counter_recovery_request(
+        binding: EspCounterResumeBinding,
+        request: &XfrmCompositeInstallRequest,
+    ) -> EspCounterResumeRecoveryRequest {
+        EspCounterResumeRecoveryRequest::new(binding, request.sa.parameters.clone())
     }
 
     fn relocation_request() -> RelocateSaRequest {
@@ -1038,6 +1282,406 @@ mod tests {
         fn probe(&self, _config: LinuxXfrmBackendConfig) -> XfrmProbe {
             XfrmProbe::unsupported()
         }
+    }
+
+    #[derive(Debug, Clone)]
+    struct BlockingBindingTransport {
+        state: Arc<BlockingState>,
+        responses: Arc<Mutex<VecDeque<BindingResponse>>>,
+        operations: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl BlockingBindingTransport {
+        fn new(
+            state: Arc<BlockingState>,
+            responses: impl IntoIterator<Item = BindingResponse>,
+        ) -> Self {
+            Self {
+                state,
+                responses: Arc::new(Mutex::new(responses.into_iter().collect())),
+                operations: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn operations(&self) -> Vec<&'static str> {
+            self.operations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+    }
+
+    impl LinuxXfrmTransport for BlockingBindingTransport {
+        fn transact(
+            &self,
+            operation: &'static str,
+            _request: &[u8],
+            _expected_sequence: u32,
+            _config: LinuxXfrmBackendConfig,
+        ) -> Result<Option<SensitiveBuffer>, XfrmError> {
+            self.operations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(operation);
+            let call = self.state.calls.fetch_add(1, Ordering::AcqRel);
+            if call == 0 {
+                let mut guard = self
+                    .state
+                    .lock
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                while !self.state.released.load(Ordering::Acquire) {
+                    guard = self
+                        .state
+                        .wake
+                        .wait(guard)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                }
+            }
+            self.responses
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .pop_front()
+                .unwrap_or(Err(XfrmError::Unavailable))
+        }
+
+        fn probe(&self, _config: LinuxXfrmBackendConfig) -> XfrmProbe {
+            XfrmProbe::unsupported()
+        }
+    }
+
+    #[tokio::test]
+    async fn counter_actor_advances_once_then_recovers_exact_retry_without_update() {
+        let request = outbound_install_request();
+        let (pre_policy, pre_sa) = outbound_readback_at(&request, 7);
+        let (applied_policy, applied_sa) = outbound_readback_at(&request, 99);
+        let transport = BindingTransport::new([
+            // First preflight, one NEWAE ACK, and exact post-readback.
+            Ok(Some(pre_policy)),
+            Ok(Some(pre_sa)),
+            Ok(None),
+            Ok(Some(applied_policy.clone())),
+            Ok(Some(applied_sa.clone())),
+            // Receipt revalidation.
+            Ok(Some(applied_policy.clone())),
+            Ok(Some(applied_sa.clone())),
+            // Exact retry preflight and mandatory final readback; no NEWAE.
+            Ok(Some(applied_policy.clone())),
+            Ok(Some(applied_sa.clone())),
+            Ok(Some(applied_policy)),
+            Ok(Some(applied_sa)),
+        ]);
+        let capture = transport.clone();
+        let backend = LinuxXfrmBackend::with_transport(transport)
+            .bind_current_network_namespace()
+            .unwrap();
+        let authority = counter_binding(&backend, &request);
+        let apply = counter_request(&authority, &request, 1, 2, 100);
+        let proof_binding = apply.binding();
+
+        let receipt = backend
+            .apply_and_read_back_outbound_esp_counter(&authority, authority.id(), apply.clone())
+            .await
+            .unwrap();
+        EspCounterResumeProofSet::single(receipt)
+            .validate_counter_proof(
+                proof_binding,
+                EspCounterProofRequirement::BeforeOwnershipCommit,
+            )
+            .await
+            .unwrap();
+        backend
+            .apply_and_read_back_outbound_esp_counter(&authority, authority.id(), apply)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            capture.operations(),
+            vec![
+                "query_outbound_policy_binding",
+                "query_outbound_sa_binding",
+                "update_outbound_sa_replay_state",
+                "query_outbound_policy_binding",
+                "query_outbound_sa_binding",
+                "query_outbound_policy_binding",
+                "query_outbound_sa_binding",
+                "query_outbound_policy_binding",
+                "query_outbound_sa_binding",
+                "query_outbound_policy_binding",
+                "query_outbound_sa_binding",
+            ]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_counter_observer_cannot_cancel_apply_or_cause_reuse_on_retry() {
+        let request = outbound_install_request();
+        let (pre_policy, pre_sa) = outbound_readback_at(&request, 7);
+        let (applied_policy, applied_sa) = outbound_readback_at(&request, 99);
+        let state = Arc::new(BlockingState::new());
+        let transport = BlockingBindingTransport::new(
+            Arc::clone(&state),
+            [
+                Ok(Some(pre_policy)),
+                Ok(Some(pre_sa)),
+                Ok(None),
+                Ok(Some(applied_policy.clone())),
+                Ok(Some(applied_sa.clone())),
+                // Exact retry preflight/final readback.
+                Ok(Some(applied_policy.clone())),
+                Ok(Some(applied_sa.clone())),
+                Ok(Some(applied_policy)),
+                Ok(Some(applied_sa)),
+            ],
+        );
+        let capture = transport.clone();
+        let backend = LinuxXfrmBackend::with_transport(transport)
+            .bind_current_network_namespace()
+            .unwrap();
+        let authority = counter_binding(&backend, &request);
+        let apply = counter_request(&authority, &request, 1, 2, 100);
+        let observer = tokio::spawn({
+            let backend = backend.clone();
+            let authority = authority.clone();
+            let apply = apply.clone();
+            async move {
+                backend
+                    .apply_and_read_back_outbound_esp_counter(&authority, authority.id(), apply)
+                    .await
+            }
+        });
+        wait_until(|| state.calls.load(Ordering::Acquire) == 1).await;
+        observer.abort();
+        let _ = observer.await;
+        state.release();
+        wait_until(|| state.calls.load(Ordering::Acquire) == 5).await;
+
+        backend
+            .apply_and_read_back_outbound_esp_counter(&authority, authority.id(), apply)
+            .await
+            .unwrap();
+        assert_eq!(
+            capture
+                .operations()
+                .iter()
+                .filter(|operation| **operation == "update_outbound_sa_replay_state")
+                .count(),
+            1,
+            "retry after lost receipt must not apply the counter a second time"
+        );
+    }
+
+    #[tokio::test]
+    async fn counter_actor_never_rolls_an_already_advanced_sa_backward() {
+        let request = outbound_install_request();
+        let (policy, sa) = outbound_readback_at(&request, 100);
+        let transport = BindingTransport::new([Ok(Some(policy)), Ok(Some(sa))]);
+        let capture = transport.clone();
+        let backend = LinuxXfrmBackend::with_transport(transport)
+            .bind_current_network_namespace()
+            .unwrap();
+        let authority = counter_binding(&backend, &request);
+
+        let error = backend
+            .apply_and_read_back_outbound_esp_counter(
+                &authority,
+                authority.id(),
+                counter_request(&authority, &request, 1, 2, 50),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "esp_counter_already_advanced");
+        assert_eq!(
+            capture.operations(),
+            vec!["query_outbound_policy_binding", "query_outbound_sa_binding"]
+        );
+    }
+
+    #[tokio::test]
+    async fn committed_counter_recovery_accepts_advanced_state_but_cannot_fence() {
+        let request = outbound_install_request();
+        let (policy, sa) = outbound_readback_at(&request, 100);
+        let transport = BindingTransport::new([
+            Ok(Some(policy.clone())),
+            Ok(Some(sa.clone())),
+            Ok(Some(policy.clone())),
+            Ok(Some(sa.clone())),
+            Ok(Some(policy)),
+            Ok(Some(sa)),
+        ]);
+        let backend = LinuxXfrmBackend::with_transport(transport)
+            .bind_current_network_namespace()
+            .unwrap();
+        let authority = counter_binding(&backend, &request);
+        let binding = EspCounterResumeBinding::new(11, 12, authority.id(), 50).unwrap();
+        let receipt = backend
+            .recover_committed_outbound_esp_counter(
+                &authority,
+                authority.id(),
+                counter_recovery_request(binding, &request),
+            )
+            .await
+            .unwrap();
+        let proofs = EspCounterResumeProofSet::single(receipt);
+        proofs
+            .validate_counter_proof(binding, EspCounterProofRequirement::CommittedRecovery)
+            .await
+            .unwrap();
+        for requirement in [
+            EspCounterProofRequirement::BeforeOwnershipCommit,
+            EspCounterProofRequirement::BeforeFirstPublication,
+        ] {
+            let error = proofs
+                .validate_counter_proof(binding, requirement)
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), "esp_counter_recovered_receipt_cannot_fence");
+        }
+        for mismatched in [
+            EspCounterResumeBinding::new(13, 12, authority.id(), 50).unwrap(),
+            EspCounterResumeBinding::new(11, 13, authority.id(), 50).unwrap(),
+        ] {
+            let error = proofs
+                .validate_counter_proof(mismatched, EspCounterProofRequirement::CommittedRecovery)
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), "esp_counter_receipt_absent_or_stale");
+        }
+
+        let below_floor = EspCounterResumeBinding::new(14, 15, authority.id(), 200).unwrap();
+        let error = backend
+            .recover_committed_outbound_esp_counter(
+                &authority,
+                authority.id(),
+                counter_recovery_request(below_floor, &request),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "esp_counter_committed_recovery_below_floor");
+    }
+
+    #[tokio::test]
+    async fn counter_actor_rejects_wrong_namespace_id_and_sa_before_netlink() {
+        let request = outbound_install_request();
+        let transport = BindingTransport::new([]);
+        let capture = transport.clone();
+        let backend = LinuxXfrmBackend::with_transport(transport)
+            .bind_current_network_namespace()
+            .unwrap();
+        let authority = counter_binding(&backend, &request);
+
+        let current = backend.network_namespace_binding();
+        let foreign = InstalledOutboundSaBinding::new(
+            NetworkNamespaceBinding {
+                device: current.device.wrapping_add(1),
+                inode: current.inode.wrapping_add(1),
+            },
+            validate_outbound_request(&request).unwrap(),
+        );
+        let error = backend
+            .apply_and_read_back_outbound_esp_counter(
+                &foreign,
+                foreign.id(),
+                counter_request(&foreign, &request, 1, 2, 50),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "xfrm_outbound_sa_binding_namespace_mismatch");
+        let recovery_binding = EspCounterResumeBinding::new(9, 10, foreign.id(), 50).unwrap();
+        let error = backend
+            .recover_committed_outbound_esp_counter(
+                &foreign,
+                foreign.id(),
+                counter_recovery_request(recovery_binding, &request),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "xfrm_outbound_sa_binding_namespace_mismatch");
+
+        let wrong_id = OutboundSaBindingId::from_bytes([0x5a; 32]);
+        let error = backend
+            .apply_and_read_back_outbound_esp_counter(
+                &authority,
+                wrong_id,
+                counter_request(&authority, &request, 2, 3, 50),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "esp_counter_binding_id_mismatch");
+
+        let mut wrong_sa = request.sa.parameters.clone();
+        wrong_sa.id.spi = wrong_sa.id.spi.wrapping_add(1);
+        let binding = EspCounterResumeBinding::new(3, 4, authority.id(), 50).unwrap();
+        let error = backend
+            .apply_and_read_back_outbound_esp_counter(
+                &authority,
+                authority.id(),
+                EspCounterResumeApplyRequest::new(binding, wrong_sa),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.code(),
+            "xfrm_outbound_sa_binding_sa_identity_mismatch"
+        );
+        let mut wrong_recovery_sa = request.sa.parameters.clone();
+        wrong_recovery_sa.mark = Some(crate::XfrmMark {
+            value: 1,
+            mask: u32::MAX,
+        });
+        let recovery_binding = EspCounterResumeBinding::new(5, 6, authority.id(), 50).unwrap();
+        let error = backend
+            .recover_committed_outbound_esp_counter(
+                &authority,
+                authority.id(),
+                EspCounterResumeRecoveryRequest::new(recovery_binding, wrong_recovery_sa),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.code(),
+            "xfrm_outbound_sa_binding_sa_identity_mismatch"
+        );
+        assert!(capture.operations().is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_unrelated_actor_mutation_still_invalidates_counter_receipt() {
+        let request = outbound_install_request();
+        let (policy, sa) = outbound_readback_at(&request, 49);
+        let transport = BindingTransport::new([
+            Ok(Some(policy.clone())),
+            Ok(Some(sa.clone())),
+            Ok(Some(policy)),
+            Ok(Some(sa)),
+            // Even a failed generic mutation invalidates before execution.
+            Err(XfrmError::Unavailable),
+        ]);
+        let backend = LinuxXfrmBackend::with_transport(transport)
+            .bind_current_network_namespace()
+            .unwrap();
+        let authority = counter_binding(&backend, &request);
+        let apply = counter_request(&authority, &request, 1, 2, 50);
+        let proof_binding = apply.binding();
+        let receipt = backend
+            .apply_and_read_back_outbound_esp_counter(&authority, authority.id(), apply)
+            .await
+            .unwrap();
+
+        backend
+            .install_sa(InstallSaRequest {
+                parameters: request.sa.parameters,
+            })
+            .await
+            .unwrap_err();
+        let error = EspCounterResumeProofSet::single(receipt)
+            .validate_counter_proof(
+                proof_binding,
+                EspCounterProofRequirement::BeforeFirstPublication,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "esp_counter_receipt_absent_or_stale");
     }
 
     #[tokio::test]

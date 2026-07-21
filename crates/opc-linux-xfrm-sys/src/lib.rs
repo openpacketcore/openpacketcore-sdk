@@ -148,6 +148,8 @@ pub const XFRM_MSG_UPDSA: u16 = XFRM_MSG_BASE + 10;
 pub const XFRM_MSG_FLUSHSA: u16 = XFRM_MSG_BASE + 12;
 /// Flush Security Policies.
 pub const XFRM_MSG_FLUSHPOLICY: u16 = XFRM_MSG_BASE + 13;
+/// Update/query replay and lifetime state for an existing Security Association.
+pub const XFRM_MSG_NEWAE: u16 = XFRM_MSG_BASE + 14;
 /// Relocate one exactly identified Security Association.
 ///
 /// This is the single-state migration UAPI added after the older
@@ -165,6 +167,9 @@ pub const XFRM_POLICY_FWD: u8 = 2;
 pub const XFRM_POLICY_ALLOW: u8 = 0;
 /// XFRM policy blocks matching packets.
 pub const XFRM_POLICY_BLOCK: u8 = 1;
+
+/// XFRM asynchronous-event flag indicating a replay-value update.
+pub const XFRM_AE_RVAL: u32 = 2;
 
 /// XFRM transport mode.
 pub const XFRM_MODE_TRANSPORT: u8 = 0;
@@ -649,7 +654,9 @@ mod tests {
         assert_eq!(XFRM_MSG_UPDSA, 0x1A);
         assert_eq!(XFRM_MSG_FLUSHSA, 0x1C);
         assert_eq!(XFRM_MSG_FLUSHPOLICY, 0x1D);
+        assert_eq!(XFRM_MSG_NEWAE, 0x1E);
         assert_eq!(XFRM_MSG_MIGRATE_STATE, 0x29);
+        assert_eq!(XFRM_AE_RVAL, 2);
         assert_eq!(XFRM_POLICY_IN, 0);
         assert_eq!(XFRM_POLICY_OUT, 1);
         assert_eq!(XFRM_POLICY_FWD, 2);

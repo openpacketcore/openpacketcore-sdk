@@ -4,6 +4,7 @@ use std::{error::Error, fmt};
 
 use sha2::{Digest, Sha256};
 
+use crate::model::sa_uses_esn;
 use crate::namespace::{NamespaceBoundLinuxXfrmBackend, NetworkNamespaceBinding};
 use crate::{
     IpAddress, LifetimeConfig, PolicyParameters, SaParameters, UdpEncap, XfrmAction,
@@ -86,7 +87,20 @@ impl InstalledOutboundSaBinding {
         parameters: &SaParameters,
         expected_id: OutboundSaBindingId,
     ) -> Result<OutboundSaPolicyExpectation, OutboundSaBindingError> {
-        if self.namespace != backend.network_namespace_binding() {
+        self.validated_expectation_for_actor(
+            backend.network_namespace_binding(),
+            parameters,
+            expected_id,
+        )
+    }
+
+    pub(crate) fn validated_expectation_for_actor(
+        &self,
+        actor_namespace: NetworkNamespaceBinding,
+        parameters: &SaParameters,
+        expected_id: OutboundSaBindingId,
+    ) -> Result<OutboundSaPolicyExpectation, OutboundSaBindingError> {
+        if self.namespace != actor_namespace {
             return Err(OutboundSaBindingError::rejected(
                 "xfrm_outbound_sa_binding_namespace_mismatch",
             ));
@@ -230,7 +244,34 @@ pub(crate) struct OutboundSaPolicyFingerprint {
 pub(crate) struct OutboundSaPolicyExpectation {
     sa: SaParameters,
     policy: PolicyParameters,
+    replay_esn: bool,
+    crypto: OutboundSaCryptoExpectation,
     fingerprint: OutboundSaPolicyFingerprint,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct OutboundSaCryptoExpectation {
+    pub(crate) auth: Option<OutboundSaAuthExpectation>,
+    pub(crate) crypt: Option<OutboundSaAlgorithmExpectation>,
+    pub(crate) aead: Option<OutboundSaAeadExpectation>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct OutboundSaAlgorithmExpectation {
+    pub(crate) name: String,
+    pub(crate) key_len: usize,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct OutboundSaAuthExpectation {
+    pub(crate) algorithm: OutboundSaAlgorithmExpectation,
+    pub(crate) truncation_len_bits: u32,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct OutboundSaAeadExpectation {
+    pub(crate) algorithm: OutboundSaAlgorithmExpectation,
+    pub(crate) icv_len_bits: u32,
 }
 
 impl fmt::Debug for OutboundSaPolicyExpectation {
@@ -246,6 +287,14 @@ impl OutboundSaPolicyExpectation {
         digest.update(self.fingerprint.sa);
         digest.update(self.fingerprint.policy);
         OutboundSaBindingId(digest.finalize().into())
+    }
+
+    pub(crate) const fn replay_esn(&self) -> bool {
+        self.replay_esn
+    }
+
+    pub(crate) const fn crypto(&self) -> &OutboundSaCryptoExpectation {
+        &self.crypto
     }
 }
 
@@ -306,6 +355,36 @@ pub(crate) fn validate_outbound_request(
         sa: fingerprint_sa(sa),
         policy: fingerprint_policy(policy),
     };
+    let replay_esn = sa_uses_esn(sa);
+    let crypto = OutboundSaCryptoExpectation {
+        auth: sa
+            .auth
+            .as_ref()
+            .map(|(algorithm, key)| OutboundSaAuthExpectation {
+                algorithm: OutboundSaAlgorithmExpectation {
+                    name: algorithm.name.clone(),
+                    key_len: key.len(),
+                },
+                truncation_len_bits: algorithm.truncation_len_bits,
+            }),
+        crypt: sa
+            .crypt
+            .as_ref()
+            .map(|(algorithm, key)| OutboundSaAlgorithmExpectation {
+                name: algorithm.name.clone(),
+                key_len: key.len(),
+            }),
+        aead: sa
+            .aead
+            .as_ref()
+            .map(|(algorithm, key)| OutboundSaAeadExpectation {
+                algorithm: OutboundSaAlgorithmExpectation {
+                    name: algorithm.name.clone(),
+                    key_len: key.len(),
+                },
+                icv_len_bits: algorithm.icv_len_bits,
+            }),
+    };
     let mut retained_sa = sa.clone();
     retained_sa.auth = None;
     retained_sa.crypt = None;
@@ -314,6 +393,8 @@ pub(crate) fn validate_outbound_request(
     Ok(OutboundSaPolicyExpectation {
         sa: retained_sa,
         policy: policy.clone(),
+        replay_esn,
+        crypto,
         fingerprint,
     })
 }
@@ -353,6 +434,7 @@ fn fingerprint_sa(parameters: &SaParameters) -> [u8; 32] {
     hash_mode(&mut digest, parameters.mode);
     hash_lifetime(&mut digest, parameters.lifetime);
     digest.update(parameters.replay_window.to_be_bytes());
+    digest.update([sa_uses_esn(parameters) as u8]);
     hash_encap(&mut digest, parameters.encap);
     hash_mark(&mut digest, parameters.mark);
     hash_mark(&mut digest, parameters.output_mark);
@@ -710,6 +792,21 @@ mod tests {
             expected.fingerprint.sa,
             fingerprint_sa(&changed_identity.sa.parameters)
         );
+    }
+
+    #[test]
+    fn wide_window_explicit_false_snapshot_uses_canonical_esn_binding_identity() {
+        let base = outbound_request();
+        let base_expectation = validate_outbound_request(&base).unwrap();
+        assert!(base_expectation.replay_esn());
+
+        let mut explicit_false = base.clone();
+        let mut replay_state = crate::SaReplayState::fresh(64);
+        replay_state.esn = false;
+        explicit_false.sa.parameters.replay_state = Some(replay_state);
+        let explicit_expectation = validate_outbound_request(&explicit_false).unwrap();
+        assert!(explicit_expectation.replay_esn());
+        assert_eq!(explicit_expectation.id(), base_expectation.id());
     }
 
     #[test]

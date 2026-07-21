@@ -35,6 +35,17 @@
 //! with `xfrm_outbound_sa_binding_key_readback_unavailable`; algorithm shape is
 //! never accepted as a substitute for exact key proof.
 //!
+//! Same-SPI successor activation uses
+//! [`NamespaceBoundLinuxXfrmBackend::apply_and_read_back_outbound_esp_counter`].
+//! The sealed actor validates the opaque outbound binding, reads the kernel's
+//! last-assigned sequence, advances only through Linux `XFRM_MSG_NEWAE`, and
+//! performs exact post-readback before issuing an opaque, bounded receipt. It
+//! never rolls an already-advanced SA backward. The successor must remain
+//! quiescent and unpublished until the receipt crosses its required proof
+//! boundary. A separate read-only committed-recovery API can rebuild evidence
+//! after process loss, but that evidence cannot authorize a new ownership
+//! fence or first steering publication.
+//!
 //! Raw Linux netlink work stays in [`opc_linux_xfrm_sys`]; this crate is safe
 //! Rust and never performs `unsafe` operations.
 
@@ -42,6 +53,7 @@
 
 pub mod backend;
 pub mod composite;
+mod counter_resume;
 mod dscp;
 pub mod error;
 #[cfg(feature = "ikev2")]
@@ -61,6 +73,12 @@ pub use composite::{
     XfrmBidirectionalInstallOutcome, XfrmCompositeInstallError, XfrmCompositeInstallRequest,
     XfrmCompositeOperation, XfrmCompositeOutcome, XFRM_COMPOSITE_INSTALL_ORDER,
     XFRM_COMPOSITE_INSTALL_ROLLBACK_ORDER, XFRM_COMPOSITE_REKEY_ORDER, XFRM_COMPOSITE_REMOVE_ORDER,
+};
+pub use counter_resume::{
+    AppliedEspCounterReceipt, EspCounterProofRequirement, EspCounterResumeApplyRequest,
+    EspCounterResumeBinding, EspCounterResumeError, EspCounterResumeProofSet,
+    EspCounterResumeRecoveryRequest, ESP_COUNTER_RECEIPT_MAX_AGE, MAX_ESP_COUNTER_PROOF_SET_SIZE,
+    MAX_ESP_COUNTER_RECEIPTS,
 };
 pub use dscp::{
     LinuxXfrmDscpMarkingConfig, DEFAULT_XFRM_DSCP_BPFFS_PIN_ROOT, DEFAULT_XFRM_DSCP_TC_PRIORITY,

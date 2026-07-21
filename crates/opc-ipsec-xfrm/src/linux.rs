@@ -15,19 +15,23 @@ use opc_linux_xfrm_sys::{
     NLM_F_REQUEST, XFRMA_ALG_AEAD, XFRMA_ALG_AUTH, XFRMA_ALG_AUTH_TRUNC, XFRMA_ALG_CRYPT,
     XFRMA_ENCAP, XFRMA_IF_ID, XFRMA_LASTUSED, XFRMA_MARK, XFRMA_PAD, XFRMA_POLICY_TYPE,
     XFRMA_REPLAY_ESN_VAL, XFRMA_REPLAY_VAL, XFRMA_SA_DIR, XFRMA_SET_MARK, XFRMA_SET_MARK_MASK,
-    XFRMA_TMPL, XFRM_MSG_ALLOCSPI, XFRM_MSG_DELPOLICY, XFRM_MSG_DELSA, XFRM_MSG_GETPOLICY,
-    XFRM_MSG_GETSA, XFRM_MSG_MIGRATE_STATE, XFRM_MSG_NEWPOLICY, XFRM_MSG_NEWSA, XFRM_MSG_UPDPOLICY,
-    XFRM_MSG_UPDSA, XFRM_POLICY_ALLOW, XFRM_POLICY_BLOCK, XFRM_POLICY_FWD, XFRM_POLICY_IN,
-    XFRM_POLICY_OUT, XFRM_POLICY_TYPE_MAIN, XFRM_SA_DIR_OUT, XFRM_STATE_ESN,
+    XFRMA_TMPL, XFRM_AE_RVAL, XFRM_MSG_ALLOCSPI, XFRM_MSG_DELPOLICY, XFRM_MSG_DELSA,
+    XFRM_MSG_GETPOLICY, XFRM_MSG_GETSA, XFRM_MSG_MIGRATE_STATE, XFRM_MSG_NEWAE, XFRM_MSG_NEWPOLICY,
+    XFRM_MSG_NEWSA, XFRM_MSG_UPDPOLICY, XFRM_MSG_UPDSA, XFRM_POLICY_ALLOW, XFRM_POLICY_BLOCK,
+    XFRM_POLICY_FWD, XFRM_POLICY_IN, XFRM_POLICY_OUT, XFRM_POLICY_TYPE_MAIN, XFRM_SA_DIR_OUT,
+    XFRM_STATE_ESN,
 };
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 use crate::dscp::{production_runtime, LinuxXfrmDscpMarkingConfig, XfrmDscpRuntime};
-use crate::model::{validate_relocate_sa_request, validate_sa_output_mark, validate_sa_query};
+use crate::model::{
+    sa_uses_esn, validate_relocate_sa_request, validate_sa_output_mark, validate_sa_query,
+};
 use crate::namespace::{self, NamespaceBoundLinuxXfrmBackend, NetworkNamespaceBinding};
 use crate::outbound_binding::{
-    expected_policy, expected_sa, readback_mismatch, OutboundSaPolicyExpectation,
+    expected_policy, expected_sa, readback_mismatch, OutboundSaCryptoExpectation,
+    OutboundSaPolicyExpectation,
 };
 use crate::{
     AllocateSpiRequest, DscpCodepoint, InstallPolicyRequest, InstallSaRequest, IpAddress,
@@ -53,6 +57,7 @@ const XFRM_USER_POLICY_ID_LEN: usize = 64;
 const XFRM_USER_TEMPLATE_LEN: usize = 64;
 const XFRM_USER_SPI_INFO_LEN: usize = 232;
 const XFRM_USER_MIGRATE_STATE_LEN: usize = 132;
+const XFRM_AEVENT_ID_LEN: usize = 48;
 const XFRM_ALG_NAME_LEN: usize = 64;
 const XFRM_ALGO_HEADER_LEN: usize = 68;
 const XFRM_ALGO_AUTH_HEADER_LEN: usize = 72;
@@ -519,11 +524,58 @@ impl LinuxXfrmBackend {
         })
     }
 
+    /// Update only the replay state of an exactly preflighted outbound SA.
+    ///
+    /// `UPDSA` replaces SA configuration and does not restore live replay
+    /// counters on Linux. `NEWAE` is the dedicated replay/lifetime UAPI; its
+    /// kernel handler holds the SA lock while copying the supplied replay
+    /// state. Callers must still perform exact GETSA readback afterward.
+    pub(crate) async fn update_outbound_sa_replay_state(
+        &self,
+        parameters: &SaParameters,
+        replay_state: &SaReplayState,
+    ) -> Result<(), XfrmError> {
+        let body = encode_sa_replay_update(parameters, replay_state)?;
+        self.run_ack(
+            "update_outbound_sa_replay_state",
+            XFRM_MSG_NEWAE,
+            NLM_F_REQUEST | NLM_F_ACK | NLM_F_REPLACE,
+            body,
+        )
+        .await
+    }
+
     pub(crate) async fn validate_outbound_sa_binding(
         &self,
         expectation: &OutboundSaPolicyExpectation,
         supplied_sa: &SaParameters,
     ) -> Result<(), OutboundSaBindingError> {
+        self.read_outbound_sa_binding(expectation, supplied_sa)
+            .await
+            .map(|_| ())
+    }
+
+    pub(crate) async fn read_outbound_sa_binding(
+        &self,
+        expectation: &OutboundSaPolicyExpectation,
+        supplied_sa: &SaParameters,
+    ) -> Result<SaState, OutboundSaBindingError> {
+        self.read_outbound_sa_binding_inner(expectation, Some(supplied_sa))
+            .await
+    }
+
+    pub(crate) async fn read_outbound_sa_binding_metadata(
+        &self,
+        expectation: &OutboundSaPolicyExpectation,
+    ) -> Result<SaState, OutboundSaBindingError> {
+        self.read_outbound_sa_binding_inner(expectation, None).await
+    }
+
+    async fn read_outbound_sa_binding_inner(
+        &self,
+        expectation: &OutboundSaPolicyExpectation,
+        supplied_sa: Option<&SaParameters>,
+    ) -> Result<SaState, OutboundSaBindingError> {
         let expected_policy = expected_policy(expectation);
         let observed_policy = match self
             .query_policy_for_outbound_binding(expected_policy)
@@ -547,17 +599,18 @@ impl LinuxXfrmBackend {
             }
             Err(source) => return Err(OutboundSaBindingError::Readback { source }),
         };
-        let observed_sa = match parse_outbound_sa_binding_snapshot(&observed_sa_body, supplied_sa) {
-            Ok(sa) => sa,
-            Err(XfrmError::UnsupportedFeature {
-                feature: XFRM_KEY_READBACK_REDACTED,
-            }) => {
-                return readback_mismatch("xfrm_outbound_sa_binding_key_readback_unavailable");
-            }
-            Err(_) => {
-                return readback_mismatch("xfrm_outbound_sa_binding_current_sa_mismatch");
-            }
-        };
+        let observed_sa =
+            match parse_outbound_sa_binding_snapshot(&observed_sa_body, expectation, supplied_sa) {
+                Ok(sa) => sa,
+                Err(XfrmError::UnsupportedFeature {
+                    feature: XFRM_KEY_READBACK_REDACTED,
+                }) => {
+                    return readback_mismatch("xfrm_outbound_sa_binding_key_readback_unavailable");
+                }
+                Err(_) => {
+                    return readback_mismatch("xfrm_outbound_sa_binding_current_sa_mismatch");
+                }
+            };
         let dscp_profile = self
             .inner
             .dscp_config
@@ -585,7 +638,7 @@ impl LinuxXfrmBackend {
             return readback_mismatch("xfrm_outbound_sa_binding_current_sa_mismatch");
         }
 
-        Ok(())
+        Ok(observed_sa.state)
     }
 
     async fn reconcile_sa_relocation(
@@ -1353,6 +1406,59 @@ fn encode_sa_id(
     Ok(out)
 }
 
+fn encode_sa_replay_update(
+    parameters: &SaParameters,
+    replay_state: &SaReplayState,
+) -> Result<SensitiveBuffer, XfrmError> {
+    if parameters.id.protocol != IPPROTO_ESP || parameters.id.spi == 0 {
+        return Err(XfrmError::invalid_config(
+            "sa.id",
+            "replay update requires a nonzero ESP SA",
+        ));
+    }
+    validate_replay_state(replay_state, parameters.replay_window)?;
+    if replay_state.esn != sa_uses_esn(parameters) {
+        return Err(XfrmError::invalid_config(
+            "replay_state.esn",
+            "replay mode must match the installed SA",
+        ));
+    }
+
+    let mut out = sensitive_buffer_with_capacity(XFRM_AEVENT_ID_LEN + 128);
+    // struct xfrm_usersa_id
+    encode_address(&mut out, parameters.id.destination);
+    push_u32_be(&mut out, parameters.id.spi);
+    push_u16_ne(&mut out, address_family(parameters.id.destination));
+    push_u8(&mut out, parameters.id.protocol);
+    push_u8(&mut out, 0);
+    // struct xfrm_aevent_id trailing fields
+    encode_address(&mut out, parameters.source_address);
+    push_u32_ne(&mut out, XFRM_AE_RVAL);
+    push_u32_ne(
+        &mut out,
+        parameters.request_id.map_or(0, XfrmRequestId::get),
+    );
+    debug_assert_eq!(out.len(), XFRM_AEVENT_ID_LEN);
+
+    if replay_state.esn {
+        append_attr(
+            &mut out,
+            XFRMA_REPLAY_ESN_VAL,
+            &encode_replay_state_esn(replay_state)?,
+        )?;
+    } else {
+        append_attr(
+            &mut out,
+            XFRMA_REPLAY_VAL,
+            &encode_replay_state_legacy(replay_state)?,
+        )?;
+    }
+    if let Some(mark) = parameters.mark {
+        append_attr(&mut out, XFRMA_MARK, &encode_mark(mark))?;
+    }
+    Ok(out)
+}
+
 fn encode_relocate_sa_request(request: &RelocateSaRequest) -> Result<SensitiveBuffer, XfrmError> {
     validate_relocate_sa_request(request)?;
     let encap_attr_len = match request.encap {
@@ -1668,13 +1774,7 @@ fn encode_udp_encap(encap: UdpEncap) -> SensitiveBuffer {
 }
 
 fn encode_sa_flags(parameters: &SaParameters) -> u8 {
-    if parameters.replay_window > 32
-        || parameters
-            .replay_state
-            .as_ref()
-            .map(|state| state.esn)
-            .unwrap_or(false)
-    {
+    if sa_uses_esn(parameters) {
         XFRM_STATE_ESN
     } else {
         0
@@ -1896,8 +1996,10 @@ fn parse_sa_relocation_snapshot(payload: &[u8]) -> Result<SaRelocationSnapshot, 
 
 fn parse_outbound_sa_binding_snapshot(
     payload: &[u8],
-    expected: &SaParameters,
+    expectation: &OutboundSaPolicyExpectation,
+    supplied_sa: Option<&SaParameters>,
 ) -> Result<SaRelocationSnapshot, XfrmError> {
+    let expected = expected_sa(expectation);
     validate_route_attribute_stream(payload, XFRM_USER_SA_INFO_LEN, "query_outbound_sa_binding")?;
     validate_allowed_route_attributes(
         payload,
@@ -1920,16 +2022,20 @@ fn parse_outbound_sa_binding_snapshot(
         ],
         "query_outbound_sa_binding",
     )?;
-    validate_outbound_sa_fixed_header(payload, expected)?;
+    validate_outbound_sa_fixed_header(payload, expected, expectation.replay_esn())?;
     validate_outbound_sa_dynamic_attributes(payload)?;
-    validate_outbound_sa_replay_attributes(payload, expected)?;
-    validate_outbound_sa_crypto(payload, expected)?;
+    validate_outbound_sa_replay_attributes(payload, expectation.replay_esn())?;
+    match supplied_sa {
+        Some(supplied_sa) => validate_outbound_sa_crypto(payload, supplied_sa)?,
+        None => validate_outbound_sa_crypto_metadata(payload, expectation.crypto())?,
+    }
     parse_sa_relocation_snapshot(payload)
 }
 
 fn validate_outbound_sa_fixed_header(
     payload: &[u8],
     expected: &SaParameters,
+    expected_esn: bool,
 ) -> Result<(), XfrmError> {
     if payload.len() < XFRM_USER_SA_INFO_LEN {
         return Err(XfrmError::io(
@@ -1948,8 +2054,13 @@ fn validate_outbound_sa_fixed_header(
         // both values as zero. They are immutable configuration, not the
         // dynamic lifetime-current timestamps at bytes 160..192.
         || payload[144..160].iter().any(|octet| *octet != 0)
-        || read_u8(payload, 215)? != encode_fixed_replay_window(expected)
-        || read_u8(payload, 216)? != encode_sa_flags(expected)
+        || read_u8(payload, 215)?
+            != if expected_esn {
+                0
+            } else {
+                expected.replay_window.min(u32::from(u8::MAX)) as u8
+            }
+        || read_u8(payload, 216)? != if expected_esn { XFRM_STATE_ESN } else { 0 }
         || payload[217..XFRM_USER_SA_INFO_LEN]
             .iter()
             .any(|octet| *octet != 0)
@@ -2007,7 +2118,7 @@ fn validate_outbound_sa_dynamic_attributes(payload: &[u8]) -> Result<(), XfrmErr
 
 fn validate_outbound_sa_replay_attributes(
     payload: &[u8],
-    expected: &SaParameters,
+    expected_esn: bool,
 ) -> Result<(), XfrmError> {
     let legacy = unique_route_attribute(
         payload,
@@ -2027,7 +2138,7 @@ fn validate_outbound_sa_replay_attributes(
             invalid_data("contradictory SA replay attributes"),
         ));
     }
-    if encode_sa_flags(expected) & XFRM_STATE_ESN != 0 {
+    if expected_esn {
         let esn = esn.ok_or_else(|| {
             XfrmError::io(
                 "query_outbound_sa_binding",
@@ -2164,6 +2275,104 @@ fn validate_outbound_sa_crypto(payload: &[u8], expected: &SaParameters) -> Resul
         return Err(XfrmError::io(
             "query_outbound_sa_binding",
             invalid_data("SA crypto does not match install intent"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_outbound_sa_crypto_metadata(
+    payload: &[u8],
+    expected: &OutboundSaCryptoExpectation,
+) -> Result<(), XfrmError> {
+    let legacy_auth = unique_route_attribute(
+        payload,
+        XFRM_USER_SA_INFO_LEN,
+        XFRMA_ALG_AUTH,
+        "query_outbound_sa_binding",
+    )?
+    .map(|attribute| parse_observed_sa_algorithm(attribute, XFRM_ALGO_HEADER_LEN))
+    .transpose()?;
+    let auth = unique_route_attribute(
+        payload,
+        XFRM_USER_SA_INFO_LEN,
+        XFRMA_ALG_AUTH_TRUNC,
+        "query_outbound_sa_binding",
+    )?
+    .map(parse_observed_sa_auth)
+    .transpose()?;
+    let crypt = unique_route_attribute(
+        payload,
+        XFRM_USER_SA_INFO_LEN,
+        XFRMA_ALG_CRYPT,
+        "query_outbound_sa_binding",
+    )?
+    .map(|attribute| parse_observed_sa_algorithm(attribute, XFRM_ALGO_HEADER_LEN))
+    .transpose()?;
+    let aead = unique_route_attribute(
+        payload,
+        XFRM_USER_SA_INFO_LEN,
+        XFRMA_ALG_AEAD,
+        "query_outbound_sa_binding",
+    )?
+    .map(parse_observed_sa_aead)
+    .transpose()?;
+    if aead.is_some() && (legacy_auth.is_some() || auth.is_some() || crypt.is_some()) {
+        return Err(XfrmError::io(
+            "query_outbound_sa_binding",
+            invalid_data("contradictory SA algorithm attributes"),
+        ));
+    }
+    if legacy_auth
+        .as_ref()
+        .is_some_and(|algorithm| key_is_ambiguous_redaction(algorithm.key))
+        || auth
+            .as_ref()
+            .is_some_and(|algorithm| key_is_ambiguous_redaction(algorithm.algorithm.key))
+        || crypt
+            .as_ref()
+            .is_some_and(|algorithm| key_is_ambiguous_redaction(algorithm.key))
+        || aead
+            .as_ref()
+            .is_some_and(|algorithm| key_is_ambiguous_redaction(algorithm.algorithm.key))
+    {
+        return Err(XfrmError::UnsupportedFeature {
+            feature: XFRM_KEY_READBACK_REDACTED,
+        });
+    }
+
+    let auth_matches = match (legacy_auth, auth, expected.auth.as_ref()) {
+        (Some(legacy), Some(observed), Some(expected)) => {
+            let redundant_keys_match = bool::from(legacy.key.ct_eq(observed.algorithm.key));
+            legacy.name == expected.algorithm.name
+                && legacy.key.len() == expected.algorithm.key_len
+                && observed.algorithm.name == expected.algorithm.name
+                && observed.algorithm.key.len() == expected.algorithm.key_len
+                && observed.truncation_len_bits == expected.truncation_len_bits
+                && redundant_keys_match
+        }
+        (None, None, None) => true,
+        _ => false,
+    };
+    let crypt_matches = match (crypt, expected.crypt.as_ref()) {
+        (Some(observed), Some(expected)) => {
+            observed.name == expected.name && observed.key.len() == expected.key_len
+        }
+        (None, None) => true,
+        _ => false,
+    };
+    let aead_matches = match (aead, expected.aead.as_ref()) {
+        (Some(observed), Some(expected)) => {
+            observed.algorithm.name == expected.algorithm.name
+                && observed.algorithm.key.len() == expected.algorithm.key_len
+                && observed.icv_len_bits == expected.icv_len_bits
+        }
+        (None, None) => true,
+        _ => false,
+    };
+    if !auth_matches || !crypt_matches || !aead_matches {
+        return Err(XfrmError::io(
+            "query_outbound_sa_binding",
+            invalid_data("SA crypto metadata does not match binding"),
         ));
     }
     Ok(())
@@ -3998,14 +4207,19 @@ mod tests {
     #[test]
     fn outbound_binding_parsers_accept_exact_kernel_shape_and_dynamic_counters() {
         let request = outbound_binding_request();
+        let expectation = validate_outbound_request(&request).unwrap();
         let mut sa_body = encode_sa_binding_readback(&request.sa.parameters);
         // GETSA lifetime-current/statistics/sequence fields are mutable and do
         // not weaken the immutable identity proof.
         sa_body[160..208].fill(0x5a);
         append_attr(&mut sa_body, XFRMA_PAD, &[]).unwrap();
         append_attr(&mut sa_body, XFRMA_LASTUSED, &123_u64.to_ne_bytes()).unwrap();
-        let observed =
-            parse_outbound_sa_binding_snapshot(&sa_body, &request.sa.parameters).unwrap();
+        let observed = parse_outbound_sa_binding_snapshot(
+            &sa_body,
+            &expectation,
+            Some(&request.sa.parameters),
+        )
+        .unwrap();
         assert_eq!(observed.identity.id, request.sa.parameters.id);
 
         let mut policy_body = encode_policy_info(&request.policy.parameters).unwrap();
@@ -4024,58 +4238,92 @@ mod tests {
 
     #[test]
     fn outbound_binding_sa_parser_rejects_unmodeled_or_noncanonical_semantics() {
-        let parameters = outbound_binding_request().sa.parameters;
+        let request = outbound_binding_request();
+        let parameters = request.sa.parameters.clone();
+        let expectation = validate_outbound_request(&request).unwrap();
         let clean = encode_sa_binding_readback(&parameters);
 
         let mut unknown = clean.clone();
         append_attr(&mut unknown, 8, &[0; 4]).unwrap(); // XFRMA_SEC_CTX
-        assert!(parse_outbound_sa_binding_snapshot(&unknown, &parameters).is_err());
+        assert!(
+            parse_outbound_sa_binding_snapshot(&unknown, &expectation, Some(&parameters)).is_err()
+        );
 
         let mut unexpected_flag = clean.clone();
         unexpected_flag[216] |= 1; // XFRM_STATE_NOECN
-        assert!(parse_outbound_sa_binding_snapshot(&unexpected_flag, &parameters).is_err());
+        assert!(parse_outbound_sa_binding_snapshot(
+            &unexpected_flag,
+            &expectation,
+            Some(&parameters)
+        )
+        .is_err());
 
         let mut reserved = clean.clone();
         reserved[217] = 1;
-        assert!(parse_outbound_sa_binding_snapshot(&reserved, &parameters).is_err());
+        assert!(
+            parse_outbound_sa_binding_snapshot(&reserved, &expectation, Some(&parameters)).is_err()
+        );
 
         let mut use_expiry = clean.clone();
         use_expiry[144] = 1;
-        assert!(parse_outbound_sa_binding_snapshot(&use_expiry, &parameters).is_err());
+        assert!(
+            parse_outbound_sa_binding_snapshot(&use_expiry, &expectation, Some(&parameters))
+                .is_err()
+        );
 
         let mut inbound = clean.clone();
         let direction =
             route_attr_payload_offset_from(&inbound, XFRM_USER_SA_INFO_LEN, XFRMA_SA_DIR).unwrap();
         inbound[direction] = 1;
-        assert!(parse_outbound_sa_binding_snapshot(&inbound, &parameters).is_err());
+        assert!(
+            parse_outbound_sa_binding_snapshot(&inbound, &expectation, Some(&parameters)).is_err()
+        );
 
         let mut duplicate_direction = clean;
         append_attr(&mut duplicate_direction, XFRMA_SA_DIR, &[XFRM_SA_DIR_OUT]).unwrap();
-        assert!(parse_outbound_sa_binding_snapshot(&duplicate_direction, &parameters).is_err());
+        assert!(parse_outbound_sa_binding_snapshot(
+            &duplicate_direction,
+            &expectation,
+            Some(&parameters),
+        )
+        .is_err());
     }
 
     #[test]
     fn outbound_binding_sa_parser_compares_kernel_keys_to_transient_intent() {
-        let supplied = outbound_binding_request().sa.parameters;
+        let request = outbound_binding_request();
+        let supplied = request.sa.parameters.clone();
+        let expectation = validate_outbound_request(&request).unwrap();
         let kernel_a = encode_sa_binding_readback(&supplied);
-        assert!(parse_outbound_sa_binding_snapshot(&kernel_a, &supplied).is_ok());
+        assert!(
+            parse_outbound_sa_binding_snapshot(&kernel_a, &expectation, Some(&supplied)).is_ok()
+        );
 
         // Installation requests contain AUTH_TRUNC only. A real GETSA also
         // returns the redundant legacy AUTH form; omitting either fails closed.
         let missing_legacy = encode_sa_info(&supplied).unwrap();
-        assert!(parse_outbound_sa_binding_snapshot(&missing_legacy, &supplied).is_err());
+        assert!(
+            parse_outbound_sa_binding_snapshot(&missing_legacy, &expectation, Some(&supplied))
+                .is_err()
+        );
 
         let mut kernel_b_parameters = supplied.clone();
         kernel_b_parameters.auth.as_mut().unwrap().1 = KeyMaterial::new(vec![0x11; 32]);
         let kernel_b = encode_sa_binding_readback(&kernel_b_parameters);
-        assert!(parse_outbound_sa_binding_snapshot(&kernel_b, &supplied).is_err());
+        assert!(
+            parse_outbound_sa_binding_snapshot(&kernel_b, &expectation, Some(&supplied)).is_err()
+        );
 
         let mut ambiguous_zero = supplied.clone();
         ambiguous_zero.auth.as_mut().unwrap().1 = KeyMaterial::new(vec![0; 32]);
         ambiguous_zero.crypt.as_mut().unwrap().1 = KeyMaterial::new(vec![0; 16]);
         let redacted_or_zero = encode_sa_binding_readback(&ambiguous_zero);
         assert!(matches!(
-            parse_outbound_sa_binding_snapshot(&redacted_or_zero, &ambiguous_zero),
+            parse_outbound_sa_binding_snapshot(
+                &redacted_or_zero,
+                &expectation,
+                Some(&ambiguous_zero),
+            ),
             Err(XfrmError::UnsupportedFeature {
                 feature: XFRM_KEY_READBACK_REDACTED
             })
@@ -4090,19 +4338,33 @@ mod tests {
         .unwrap()
             + XFRM_ALGO_HEADER_LEN;
         contradictory_auth[legacy_key] ^= 1;
-        assert!(parse_outbound_sa_binding_snapshot(&contradictory_auth, &supplied).is_err());
+        assert!(parse_outbound_sa_binding_snapshot(
+            &contradictory_auth,
+            &expectation,
+            Some(&supplied),
+        )
+        .is_err());
+        assert!(
+            parse_outbound_sa_binding_snapshot(&contradictory_auth, &expectation, None).is_err(),
+            "key-free receipt validation must still reject contradictory AUTH copies"
+        );
     }
 
     #[test]
     fn outbound_binding_sa_parser_rejects_ambiguous_replay_attributes() {
-        let parameters = outbound_binding_request().sa.parameters;
+        let request = outbound_binding_request();
+        let parameters = request.sa.parameters.clone();
+        let expectation = validate_outbound_request(&request).unwrap();
         let clean = encode_sa_binding_readback(&parameters);
         let legacy = encode_replay_state_legacy(&SaReplayState::fresh(32)).unwrap();
 
         let mut duplicate = clean.clone();
         append_attr(&mut duplicate, XFRMA_REPLAY_VAL, &legacy).unwrap();
         append_attr(&mut duplicate, XFRMA_REPLAY_VAL, &legacy).unwrap();
-        assert!(parse_outbound_sa_binding_snapshot(&duplicate, &parameters).is_err());
+        assert!(
+            parse_outbound_sa_binding_snapshot(&duplicate, &expectation, Some(&parameters))
+                .is_err()
+        );
 
         let mut contradictory = clean;
         append_attr(&mut contradictory, XFRMA_REPLAY_VAL, &legacy).unwrap();
@@ -4110,17 +4372,30 @@ mod tests {
         esn_state.esn = true;
         let esn = encode_replay_state_esn(&esn_state).unwrap();
         append_attr(&mut contradictory, XFRMA_REPLAY_ESN_VAL, &esn).unwrap();
-        assert!(parse_outbound_sa_binding_snapshot(&contradictory, &parameters).is_err());
+        assert!(parse_outbound_sa_binding_snapshot(
+            &contradictory,
+            &expectation,
+            Some(&parameters),
+        )
+        .is_err());
 
         let mut esn_parameters = parameters;
         esn_parameters.replay_window = 64;
+        let mut esn_request = outbound_binding_request();
+        esn_request.sa.parameters = esn_parameters.clone();
+        let esn_expectation = validate_outbound_request(&esn_request).unwrap();
         let mut missing_esn = encode_sa_binding_readback(&esn_parameters);
         remove_route_attr(
             &mut missing_esn,
             XFRM_USER_SA_INFO_LEN,
             XFRMA_REPLAY_ESN_VAL,
         );
-        assert!(parse_outbound_sa_binding_snapshot(&missing_esn, &esn_parameters).is_err());
+        assert!(parse_outbound_sa_binding_snapshot(
+            &missing_esn,
+            &esn_expectation,
+            Some(&esn_parameters),
+        )
+        .is_err());
     }
 
     #[test]
@@ -5472,6 +5747,51 @@ mod tests {
     }
 
     #[test]
+    fn encodes_newae_replay_update_with_exact_identity_mark_and_esn_state() {
+        let mut params = sa_parameters();
+        params.replay_window = 64;
+        params.mark = Some(XfrmMark {
+            value: 0x1234_0000,
+            mask: 0xffff_0000,
+        });
+        let mut replay = SaReplayState::fresh(64);
+        replay.outbound_sequence = 17;
+        replay.outbound_sequence_hi = 1;
+
+        let body = encode_sa_replay_update(&params, &replay).unwrap();
+        assert_eq!(&body[16..20], &params.id.spi.to_be_bytes());
+        assert_eq!(
+            u16::from_ne_bytes(body[20..22].try_into().unwrap()),
+            AF_INET
+        );
+        assert_eq!(body[22], IPPROTO_ESP);
+        assert_eq!(body[23], 0);
+        assert_eq!(
+            u32::from_ne_bytes(body[40..44].try_into().unwrap()),
+            XFRM_AE_RVAL
+        );
+        assert_eq!(
+            u32::from_ne_bytes(body[44..48].try_into().unwrap()),
+            params.request_id.map_or(0, XfrmRequestId::get)
+        );
+        let replay_payload =
+            route_attr_payload_from(&body, XFRM_AEVENT_ID_LEN, XFRMA_REPLAY_ESN_VAL).unwrap();
+        assert_eq!(
+            u32::from_ne_bytes(replay_payload[4..8].try_into().unwrap()),
+            17
+        );
+        assert_eq!(
+            u32::from_ne_bytes(replay_payload[12..16].try_into().unwrap()),
+            1
+        );
+        assert_eq!(
+            route_attr_payload_from(&body, XFRM_AEVENT_ID_LEN, XFRMA_MARK).unwrap(),
+            &encode_mark(params.mark.unwrap())
+        );
+        assert!(route_attr_payload_from(&body, XFRM_AEVENT_ID_LEN, XFRMA_REPLAY_VAL).is_none());
+    }
+
+    #[test]
     fn rejects_inconsistent_replay_state() {
         let mut params = sa_parameters();
         params.replay_window = 64;
@@ -5484,6 +5804,9 @@ mod tests {
             replay_window: 64,
             bitmap: vec![0],
         });
+
+        assert_eq!(encode_sa_flags(&params), XFRM_STATE_ESN);
+        assert_eq!(encode_fixed_replay_window(&params), 0);
 
         let error = encode_sa_info(&params).unwrap_err();
 

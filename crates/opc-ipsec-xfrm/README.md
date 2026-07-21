@@ -170,6 +170,83 @@ Readback rejects mixed, duplicated, or flag-inconsistent replay
 representations. Dynamic counters and last-used timestamps are permitted, but
 unmodeled semantic SA or policy attributes fail closed.
 
+## Sealed outbound ESP counter authority
+
+Same-SPI failover must use
+`NamespaceBoundLinuxXfrmBackend::apply_and_read_back_outbound_esp_counter`.
+The production API accepts only the live `InstalledOutboundSaBinding`, its
+exact `OutboundSaBindingId`, a durable `EspCounterResumeBinding`, and transient
+exact SA parameters. It has no caller-selectable direction and is not exposed
+through `XfrmBackend` or the mock backend.
+
+`EspCounterResumeBinding::new` takes the **next** ESP sequence number the
+successor is allowed to emit. Linux GETSA replay state reports the last
+assigned sequence, so the actor compares and, when necessary, writes
+`requested_next - 1`. Legacy replay accepts the remaining 32-bit sequence
+space; ESN uses the full 64-bit value. Exhausted or ambiguous state fails
+closed. The actor uses the dedicated Linux `XFRM_MSG_NEWAE` replay-state UAPI,
+not a generic SA replacement:
+
+- an observed value above the requested floor returns typed `AlreadyAdvanced`
+  without mutation;
+- an equal value performs exact final readback and returns an idempotent
+  receipt without mutation; and
+- a lower value advances once, then requires exact policy, SA, transient-key,
+  replay-mode, and counter readback before returning a receipt.
+
+The namespace actor drains admitted work even if the observing future is
+dropped. Exact retry after a lost reply therefore recovers the applied value
+without issuing a second update. Receipts have no public constructor, expose
+no topology or counter values, expire after 30 seconds, and are retained in a
+bounded 1,024-entry actor-local registry. Generic SA or policy mutations
+invalidate the registry before they execute, including when the mutation later
+fails.
+
+```rust,no_run
+use opc_ipsec_xfrm::{
+    AppliedEspCounterReceipt, EspCounterResumeApplyRequest,
+    EspCounterResumeBinding, InstalledOutboundSaBinding,
+    NamespaceBoundLinuxXfrmBackend, SaParameters,
+};
+
+async fn apply_counter(
+    backend: &NamespaceBoundLinuxXfrmBackend,
+    authority: &InstalledOutboundSaBinding,
+    operation_id: u128,
+    fence_generation: u64,
+    requested_next: u64,
+    exact_sa: SaParameters,
+) -> Result<AppliedEspCounterReceipt, opc_ipsec_xfrm::EspCounterResumeError> {
+    let binding = EspCounterResumeBinding::new(
+        operation_id,
+        fence_generation,
+        authority.id(),
+        requested_next,
+    )?;
+    backend
+        .apply_and_read_back_outbound_esp_counter(
+            authority,
+            authority.id(),
+            EspCounterResumeApplyRequest::new(binding, exact_sa),
+        )
+        .await
+}
+```
+
+The successor SA must remain quiescent and unpublished until the receipt is
+validated immediately before its required ownership/publication boundary.
+Products must preserve exclusive XFRM writer authority; packet emission or a
+second raw-netlink writer between preflight and receipt validation violates
+this contract.
+
+After process loss and an already-committed ownership grant,
+`recover_committed_outbound_esp_counter` performs read-only exact validation
+and accepts a live counter at or above the durable floor. Its receipt is
+structurally limited to `EspCounterProofRequirement::CommittedRecovery`; it
+cannot authorize a new ownership fence or first successor publication. This
+separation prevents an advanced live SA from being reinterpreted as fresh
+pre-publication authority.
+
 ## Usage
 
 ```rust,no_run
