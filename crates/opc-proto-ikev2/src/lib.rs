@@ -20,7 +20,8 @@
 //! authenticated-only ESP ENCR_NULL profiles and KEYMAT, strict responder and
 //! initiator boundaries for opened IKE-SA rekey `CREATE_CHILD_SA` exchanges, and strict
 //! opened-payload helpers for 3GPP TS 24.302 dedicated-bearer establishment,
-//! modification, and deletion. It does not implement an IKE SA state machine,
+//! modification, deletion, and typed P-CSCF restoration `INFORMATIONAL`
+//! configuration exchange. It does not implement an IKE SA state machine,
 //! EAP-AKA, retransmission policy, cookie policy, Child SA installation, XFRM
 //! programming, or any product-specific 3GPP ePDG policy.
 //!
@@ -64,6 +65,7 @@ pub mod nat_detection;
 pub mod nat_traversal;
 pub mod notify;
 pub mod payload;
+pub mod pcscf_restoration;
 pub mod protected_payload_crypto;
 pub mod sa_init;
 pub mod sa_init_crypto;
@@ -225,6 +227,13 @@ pub use notify::{
 pub use payload::{
     validate_payload_chain, validate_payload_chain_with_profile, PayloadChain, PayloadType,
     RawPayload, RawPayloadIterator, GENERIC_PAYLOAD_HEADER_LEN,
+};
+pub use pcscf_restoration::{
+    build_ikev2_pcscf_restoration_request, decode_ikev2_pcscf_restoration_response,
+    decode_ikev2_pcscf_restoration_response_with_context,
+    validate_ikev2_pcscf_restoration_response_correlation, Ikev2PcscfRestorationAddress,
+    Ikev2PcscfRestorationAddressFamilies, Ikev2PcscfRestorationError, Ikev2PcscfRestorationRequest,
+    Ikev2PcscfRestorationResponse, IKEV2_PCSCF_RESTORATION_MAX_ADDRESSES,
 };
 pub use protected_payload_crypto::{
     decrypt_ikev2_sa_init_protected_payload, ikev2_aes_cbc_padding_len,

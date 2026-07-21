@@ -12,7 +12,10 @@ negotiation intent. It includes a strict responder boundary for opened IKE-SA
 rekey `CREATE_CHILD_SA` requests and exact successful responses. It also
 provides strict opened-payload primitives for the TS 24.302 multiple-bearer
 profile: typed QoS/TFT/AMBR notifications, new non-rekey dedicated-bearer
-Child SA establishment, bearer modification, and bearer deletion.
+Child SA establishment, bearer modification, and bearer deletion. It also
+provides a typed TS 24.302 P-CSCF restoration `INFORMATIONAL` boundary for
+forwarding a bounded valued IPv4/IPv6 address list and accepting only the
+required empty per-family `CFG_REPLY` echoes.
 
 It does not implement an IKE SA state machine, EAP-AKA, retransmission policy,
 cookie policy, Child SA lifecycle, XFRM/IPsec programming, bearer admission or
@@ -76,6 +79,16 @@ control-plane stack.
   canonical `opc-proto-tft` TS 24.008 codec shared with GTPv2-C. Response
   correlation checks the IKE SPIs, Message ID, exchange/flags, selected offered
   proposal/transforms, optional KE group, and traffic-selector narrowing.
+- `pcscf_restoration` builds a canonical single-CP `INFORMATIONAL`
+  `CFG_REQUEST` that preserves every PGW-provided typed IPv4 and IPv6 P-CSCF
+  address in exact order, including repeated entries, and encodes its exact RFC
+  7651 value. Its strict opened-reply decoder rejects absent, repeated, or
+  valued known P-CSCF attributes while retaining unsupported Configuration
+  attributes, Vendor IDs, unfamiliar status Notify payloads, and unknown
+  non-critical payloads. Error-range Notify and unknown critical payloads fail
+  closed. Correlation requires one empty acknowledgement per requested family
+  plus matching IKE SPIs, exchange type, Message ID, and direction. Address and
+  request `Debug` output is redacted.
 - `fragmentation`, `notify`, `nat_detection`, `nat_traversal`, and `exchange`
   expose RFC-specific mechanism helpers without owning product state.
 
@@ -637,6 +650,73 @@ application state. An empty response is accepted only with the explicit
 `SimultaneousDelete` expectation when RFC 7296 crossed Delete requests apply.
 Modification responses remain empty or typed-error INFORMATIONAL responses and
 use their corresponding decoder/correlation helper.
+
+P-CSCF restoration keeps the selected family set with the immutable opened
+request so a decoded reply can be correlated without downstream wire
+constants. The application seals and caches the request, opens the
+authenticated response, and owns retransmission and Update Bearer policy:
+
+```rust
+use std::net::{Ipv4Addr, Ipv6Addr};
+
+use opc_proto_ikev2::{
+    build_ikev2_pcscf_restoration_request,
+    decode_ikev2_pcscf_restoration_response,
+    validate_ikev2_pcscf_restoration_response_correlation, Header,
+    Ikev2PcscfRestorationAddress, Ikev2PcscfRestorationRequest, PayloadType,
+};
+
+fn begin_pcscf_restoration(
+) -> Result<Ikev2PcscfRestorationRequest, Box<dyn std::error::Error>> {
+    let request = build_ikev2_pcscf_restoration_request(
+        &[
+            Ikev2PcscfRestorationAddress::Ipv4(Ipv4Addr::new(192, 0, 2, 10)),
+            Ikev2PcscfRestorationAddress::Ipv6(Ipv6Addr::new(
+                0x2001, 0x0db8, 0, 0, 0, 0, 0, 10,
+            )),
+        ],
+    )?;
+    // Seal request.first_payload()/request.bytes() once and cache both the
+    // complete protected message and this immutable request for correlation.
+    Ok(request)
+}
+
+fn accept_pcscf_restoration_reply(
+    request_header: &Header,
+    request: &Ikev2PcscfRestorationRequest,
+    response_header: &Header,
+    first_payload: PayloadType,
+    opened_response: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let response = decode_ikev2_pcscf_restoration_response(
+        response_header,
+        first_payload,
+        opened_response,
+    )?;
+    validate_ikev2_pcscf_restoration_response_correlation(
+        request_header,
+        response_header,
+        request,
+        &response,
+    )?;
+    Ok(())
+}
+```
+
+TS 23.380 section 5.6.5.2 requires the ePDG to forward the available P-CSCF
+address list received from the PGW, so request attributes carry exact four- or
+sixteen-octet values. TS 24.302 section 7.2.3.2 separately requires the UE's
+reply attributes to be empty acknowledgements; the decoder rejects valued
+known P-CSCF reply attributes. It retains unsupported Configuration
+attributes, Vendor IDs, unfamiliar status Notify payloads, and unknown
+non-critical payloads through redaction-safe borrowed accessors. Unknown
+critical payloads, error-range Notify payloads, and known payloads invalid for
+this procedure fail closed. The explicit-context decoder honors `Drop` for
+unsupported material and normalizes `Reject` to preservation because RFC 7296
+requires those extensions to be ignored rather than rejected; Vendor IDs are
+always retained. IKE SA opening/sealing, APCO interpretation, P-CSCF address
+selection, retransmission, and session policy remain outside this boundary.
+
 The IKE-only establishment-and-deletion flow is in
 [`examples/dedicated_bearer_ikev2.rs`](examples/dedicated_bearer_ikev2.rs).
 The complete SDK composition from a triggered GTPv2-C Create Bearer request,
