@@ -268,7 +268,7 @@ policy/dataplane behavior.
 
 ---
 
-## Current durable multi-SA re-pin foundation — 2026-07-18
+## Current durable multi-SA re-pin and applied ESP counter foundation — 2026-07-20
 
 `opc-ipsec-lb` now implements the SDK portion of
 [issue #365](https://github.com/openpacketcore/openpacketcore-sdk/issues/365).
@@ -357,9 +357,24 @@ This is an SDK recovery foundation, not a product continuity attestation. The
 consumer remains responsible for enumerating the complete live SA set,
 privacy-safe session-ID derivation, operation/transition-ID generation, key
 custody, retry and operator-quarantine policy, and dataplane qualification.
-Issue #333 remains the authority for adapter-issued counter apply/read-back
-evidence: the session saga retains current numeric resume fields exactly but
-does not claim they were applied.
+For counter-based ESP transitions, issue #333 is implemented by
+`XfrmEspCounterResumeAuthority`: complete outbound XFRM replacement and exact
+GETSA identity/ESN readback issue a constructor-private receipt bound to the
+operation, predecessor generation, SA, direction, requested next value,
+network namespace, and authority instance. `RePinCoordinator` requires and
+revalidates that receipt before a new ownership fence and immediately before
+steering; numeric resume fields alone fail closed. Linux stores the
+last-assigned outbound sequence, so the authority proves `oseq + 1 == next` and
+rejects zero, wrap, non-ESN, ambiguous bitmap, foreign, absent, or indeterminate
+state. A privileged namespace test proves the first emitted packet is exactly
+`next` and rejects cross-namespace receipt use.
+
+The session journal still stores no receipt or key material. A consumer builds
+one bounded proof set from applied receipts before `start`; after restart it
+reapplies uncommitted entries and obtains monotonic GETSA recovery receipts
+only for exact v3 grants already known committed. Those recovered receipts
+cannot authorize a new fence. IKE counters remain product-owned. The existing
+encrypted session envelope and HKMS/KMS rotation boundary are unchanged.
 
 ---
 

@@ -15,7 +15,8 @@ steer layer:
   native ESP, IKEv2 SKF, fragments, and ICMP/ICMPv6 error quotes;
 - stateless IKE cookie helper for edge DoS posture;
 - failover safety guards for IV-counter and replay-window restoration;
-- audited same-SPI re-pin coordination with monotonic ownership fencing;
+- audited same-SPI re-pin coordination with monotonic ownership fencing and
+  opaque XFRM-applied ESP counter receipts;
 - durable session-level multi-SA re-pin progress and fenced terminal
   retirement with bounded stale-retry tombstones;
 - BGP route-export VIP advertisement through the safe route-steering backend;
@@ -300,16 +301,72 @@ values that might reopen, including lost bitmap state and post-checkpoint lag;
 the SDK does not invent a deployment policy default. High-watermark rollback,
 exact state not bound to its checkpoint, and a zero reopening bound fail closed.
 
+### Applied ESP counter proof
+
+For `SaId::Esp` plus `SameSpiOutboundIvResume::CounterBased`, validated
+arithmetic is necessary but not sufficient. `RePinCoordinator::new` fails
+closed until it receives an opaque `AppliedEspCounterReceipt` issued by
+`opc-ipsec-xfrm` after the exact outbound SA was updated and read back. The
+coordinator validates the receipt before a new ownership commit and repeats
+GETSA validation after fencing immediately before first steering publication.
+IKE counter and random-IV application remain consumer-owned.
+
+```rust,ignore
+use opc_ipsec_lb::RePinCoordinator;
+use opc_ipsec_xfrm::{
+    EspCounterResumeApplyRequest, EspCounterResumeBinding,
+    EspCounterResumeDirection, XfrmEspCounterResumeAuthority,
+};
+
+let binding = EspCounterResumeBinding::new(
+    request.transition_id.get(),
+    request.previous_fence.get(),
+    outbound_spi,
+    restored_send_iv_next,
+)?;
+let receipt = xfrm_authority
+    .apply_and_read_back(EspCounterResumeApplyRequest {
+        binding,
+        parameters: complete_outbound_sa,
+        direction: EspCounterResumeDirection::Outbound,
+    })
+    .await?;
+let coordinator = RePinCoordinator::new(steering, fencer, ownership, audit)
+    .with_esp_counter_resume_receipt(receipt);
+let outcome = coordinator.repin(request).await?;
+```
+
+The binding must use the request's exact transition ID, predecessor fence,
+ESP SPI, and restored next value. A receipt for another operation, generation,
+SPI, counter, direction, authority instance, network namespace, or evicted SA
+record is rejected before steering. Keep the replacement datapath blocked and
+the namespace XFRM writer serialized while obtaining and consuming the
+receipt; no outbound packet may consume the proved next sequence before the
+fenced publication.
+
+For a bounded session plan, gather every ESP receipt into
+`EspCounterResumeProofSet::new` and use
+`with_esp_counter_resume_proof_set`. The set admits 1 through 64 opaque
+receipts; the IKE entry needs none. Receipts are ephemeral capabilities and are
+not serialized into the session journal. After restart, load the exact
+checkpoint: call `recover_committed_readback` for entries whose v3 ownership
+grant is already committed, and reapply/read back every uncommitted ESP entry.
+A recovered receipt accepts monotonic progress at or above the requested floor
+but is valid only for committed recovery and cannot authorize a new fence.
+Rebuild the proof set before `resume`.
+
 Prepare every re-pin from `OwnershipSource::sa_ownership`, retaining both the
 authoritative owner and its exact fence in `RePinRequest`. Generate one non-zero,
 deployment-unique `OwnershipTransitionId` for that logical transition and reuse
 it only when retrying the identical request; a later transition, including an
 A→B→A owner cycle, requires a new ID. The coordinator computes a canonical
 SHA-256 fingerprint over the complete safety-critical request and verifies that
-the committed grant matches it. Counter-based requests preserve the original
-v1 fingerprint encoding, allowing an already-committed IKE-AEAD or ESP
-transition to recover after a rolling SDK upgrade. Random-IV and unspecified
-evidence use the distinct v2 domain, so they cannot alias the v1 counter mode.
+the committed grant matches it. Counter-based IKE requests retain the original
+v1 fingerprint encoding. Random-IV and unspecified evidence use the distinct
+v2 domain. Counter-based ESP requests use the v3 applied-proof domain, so a
+legacy numeric-only ESP v1 grant cannot be recovered as if kernel proof had
+existed. Finish an in-flight legacy ESP transition with the old SDK or rekey
+and begin a fresh v3 transition; there is no unsafe compatibility conversion.
 Session-store birth records use an empty plaintext metadata payload; successful
 promotions replace it with versioned transition-ID/fingerprint metadata.
 Ownership records with an expiry, an arbitrary payload, or any mismatched
@@ -377,7 +434,8 @@ let journal = SessionStoreRePinJournal::new(
 );
 journal.validate_authority().await?;
 let saga = SessionRePinCoordinator::new(
-    RePinCoordinator::new(steering, fencer, ownership, audit),
+    RePinCoordinator::new(steering, fencer, ownership, audit)
+        .with_esp_counter_resume_proof_set(esp_counter_proofs),
     journal,
 );
 
@@ -518,12 +576,14 @@ assert!(matches!(
 ));
 ```
 
-This saga does not satisfy the applied-counter receipt requested by
-[issue #333](https://github.com/openpacketcore/openpacketcore-sdk/issues/333).
-It retains and revalidates each current `SameSpiResume` byte-for-byte but never
-relabels caller-declared counters as kernel-applied/read-back evidence. When
-that single-SA receipt becomes part of `RePinRequest`, its existing ownership
-fingerprint automatically becomes part of the session plan fingerprint.
+The saga retains each current `SameSpiResume` and its v3 ESP ownership
+fingerprint byte-for-byte, but it deliberately does not persist or fabricate
+an applied-counter receipt. Its embedded `RePinCoordinator` must carry a proof
+set covering every counter-based ESP request. On restart, reconstruct that set
+from exact applied readback for uncommitted entries and committed monotonic
+readback for entries already represented by the journal's authoritative
+ownership progress. Receipt reconstruction uses no journal key material and
+does not alter the existing encrypted-at-rest or HKMS/KMS boundary.
 
 Migration from a sequential consumer loop is additive: build all requests
 before the first mutation, retain one privacy-preserving session ID and one
@@ -532,7 +592,8 @@ after every interruption. Only a terminal `SessionRePinOutcome` authorizes a
 whole-session continuity claim. Retain its plan fingerprint and pass it to
 `new_successor` for the next failover. Products still own SA discovery,
 complete-set membership, transition-ID generation, key custody, counter
-application, dataplane programming, retry scheduling, and operator quarantine
+application and receipt reconstruction, dataplane blocking/programming, retry
+scheduling, and operator quarantine
 policy.
 
 ## Authenticated cross-node ingress redirect

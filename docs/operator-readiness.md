@@ -104,6 +104,33 @@ a product ePDG, EPC core, or carrier-readiness claim.
 | Packet-core evidence packs | `opc-evidence` validates experimental packet-core evidence schemas with schema-version drift guards and redaction checks for IP, IMSI/SUPI-style identifiers, realm/NAI markers, keys, SPIs, and paths. | Packet-core packs require explicit experimental marking and are evidence formatting/validation mechanisms only; carrier-readiness sign-off remains a downstream release decision. |
 | Go operator helpers | `operators/operator-sdk-go` includes product-neutral helpers for runtime gates, UDP/SCTP ports, Multus/SR-IOV annotations, rollout/drain checks, and fake-client tests. | Product CRDs, Helm/RBAC values, Multus `NetworkAttachmentDefinition` objects, XFRM/IPsec privileges, readiness thresholds, and traffic-shift policy stay outside the SDK helper package. |
 
+### XFRM applied-counter publication safety
+
+Counter-based same-SPI ESP failover must use
+`XfrmEspCounterResumeAuthority::apply_and_read_back` before ownership fencing.
+The replacement datapath stays blocked under namespace-wide XFRM writer
+exclusion while the SDK installs `oseq = next - 1`, proves the exact outbound
+SA and ESN state through GETSA, and issues an opaque receipt. Wire that receipt,
+or a bounded session proof set, into `RePinCoordinator`; a numeric
+`restored_send_iv_next` alone now fails closed. The coordinator revalidates
+GETSA immediately before steering publication.
+
+Receipts are process-local, authority-instance- and network-namespace-bound
+capabilities. They are not Kubernetes state, journal data, or readiness
+claims. After restart, the product first reads the authoritative session and
+ownership checkpoint. It may recover a monotonic receipt only for an exact v3
+ESP grant already committed; every uncommitted entry requires complete
+reapplication and exact readback. Operators must keep the datapath blocked
+during either path and quarantine absent, foreign, indeterminate, exhausted,
+or mismatched state. Legacy numeric-only v1 ESP grants do not upgrade in place;
+finish them with the old SDK or rekey into a fresh v3 transition.
+
+This mechanism does not change key custody or persistence: complete XFRM
+parameters continue through the existing product-controlled key path, receipts
+contain no key material and are never persisted, and the encrypted session
+store/HKMS rotation boundary remains unchanged. It also does not prove IKE
+Message-ID or explicit-IV application, which remains product-owned.
+
 ### XFRM relocation cancellation safety
 
 Once polled, `XfrmBackend::relocate_sa` is not cancellation-safe. Its blocking

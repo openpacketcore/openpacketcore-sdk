@@ -54,6 +54,12 @@ management, product SA/SPD policy, or deployment defaults.
   readback alone cannot distinguish an identical foreign replacement. Both
   supervised APIs require a live Tokio runtime and otherwise return a typed,
   redaction-safe runtime error.
+- `XfrmEspCounterResumeAuthority` is the fail-closed same-SPI ESP counter
+  boundary. It replaces one existing outbound SA through `UPDSA`, reads back
+  its exact identity and ESN state, and issues a constructor-private
+  `AppliedEspCounterReceipt`. `EspCounterResumeProofSet` carries one or more
+  such receipts into the fenced re-pin boundary without exposing a forgeable
+  proof trait.
 - With feature `ikev2`, the crate also exports Child SA KEYMAT and negotiation
   mappers from `opc-proto-ikev2` into explicit XFRM install requests.
 
@@ -101,6 +107,81 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+## Applied ESP counter resume proof
+
+A numeric next sequence is not evidence that the kernel will send it. For a
+counter-based same-SPI ESP takeover, keep the replacement datapath blocked and
+hold namespace-wide XFRM writer exclusion while performing this order:
+
+```rust,ignore
+use opc_ipsec_xfrm::{
+    EspCounterResumeApplyRequest, EspCounterResumeBinding,
+    EspCounterResumeDirection, EspCounterResumeProofSet,
+    XfrmEspCounterResumeAuthority,
+};
+
+// `parameters` is the complete existing outbound SA replacement. Its ESN
+// replay state stores last-assigned oseq = restored_send_iv_next - 1.
+let binding = EspCounterResumeBinding::new(
+    transition_id,
+    predecessor_fence,
+    outbound_spi,
+    restored_send_iv_next,
+)?;
+let receipt = authority
+    .apply_and_read_back(EspCounterResumeApplyRequest {
+        binding,
+        parameters,
+        direction: EspCounterResumeDirection::Outbound,
+    })
+    .await?;
+let proofs = EspCounterResumeProofSet::single(receipt);
+```
+
+`apply_and_read_back` accepts only ESP protocol 50, an outbound direction, a
+non-zero next value, and unambiguous 64-bit ESN replay state. The request must
+encode the requested next value as
+`(outbound_sequence_hi << 32 | outbound_sequence) + 1`; zero, arithmetic wrap,
+legacy non-ESN state, a zero window, or an incorrectly sized ESN bitmap fails
+before mutation. After the complete `rekey_sa`/`UPDSA`, the authority performs
+identity readback and GETSA state readback. It checks the exact selector,
+addresses, SPI, request ID, mode, encapsulation, marks/interface identity,
+replay mode/window/state, and requested counter. No receipt exists until both
+reads succeed.
+
+The receipt has private fields and no public constructor or serialization. It
+contains no key material, address, SPI, or counter in `Debug`; it retains a
+private validator for a bounded authority record instead. A receipt is bound
+to the operation ID, predecessor fence generation, SPI, requested next value,
+exact SA identity, direction, network namespace, and issuing authority
+instance. Validation repeats authoritative readback. Reusing the same kernel
+SA for a later attempt invalidates every earlier receipt for that SA, and
+bounded cache eviction makes old receipts fail closed.
+
+On first poll, `apply_and_read_back` moves the complete operation into an owned
+Tokio task. Dropping its observing future does not cancel an in-flight netlink
+worker or release same-authority serialization, and no receipt is delivered to
+the abandoned caller. An exact retry waits for that worker, invalidates any
+unobserved record it completed, then reapplies and reads back the same state.
+Keep the datapath blocked and retain outer writer exclusion until that retry
+returns. Do not send on the replacement SA between apply/readback and fenced
+steering publication: with Linux's pre-increment behavior, storing
+`oseq = next - 1` makes the first emitted ESP packet carry exactly `next`.
+
+After process loss, first prove from the ownership authority that the exact v3
+ESP transition already committed. Then call `recover_committed_readback` with
+the retained binding, exact non-secret SA identity, and originally requested
+replay state. Recovery performs no mutation, accepts an observed outbound
+counter only at or above the applied floor, and produces a receipt usable only
+for committed recovery; it cannot authorize a new fence. For an uncommitted
+transition, reapply the complete state and obtain a fresh applied receipt.
+
+The XFRM request still follows the existing product key-custody path. Receipts
+are ephemeral capabilities and are never added to session persistence, so this
+boundary neither exports keys nor changes encrypted-at-rest or HKMS/KMS
+rotation behavior. IKE Message-ID/explicit-IV application is product-owned and
+does not use this ESP authority.
 
 ## Authenticated-only ESP and ENCR_NULL
 

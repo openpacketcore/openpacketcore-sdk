@@ -49,6 +49,12 @@ mod integration_tests {
         ResumeKeySource, SaId, SameSpiOutboundIvResume, SendIvCounterMode, SendIvForwardJump,
         ShardId, SteerKey, SteeringRule, MIN_SEND_IV_FORWARD_JUMP,
     };
+    use opc_ipsec_xfrm::{
+        AeadAlgorithm, EspCounterResumeApplyRequest, EspCounterResumeBinding,
+        EspCounterResumeDirection, InstallSaRequest, IpAddress, KeyMaterial, LifetimeConfig,
+        MockXfrmBackend, SaParameters, SaReplayState, XfrmBackend, XfrmEspCounterResumeAuthority,
+        XfrmId, XfrmMode, XfrmSelector,
+    };
     use zeroize::Zeroizing;
 
     use super::*;
@@ -83,6 +89,47 @@ mod integration_tests {
         }
     }
 
+    fn xfrm_ip(a: u8, b: u8, c: u8, d: u8) -> IpAddress {
+        IpAddress::Ipv4([a, b, c, d])
+    }
+
+    fn counter_sa_parameters(spi: u32, next: u64) -> SaParameters {
+        let last = next - 1;
+        SaParameters {
+            selector: XfrmSelector::new(xfrm_ip(10, 0, 0, 1), xfrm_ip(10, 0, 0, 2), 17),
+            id: XfrmId {
+                destination: xfrm_ip(192, 0, 2, 2),
+                spi,
+                protocol: 50,
+            },
+            source_address: xfrm_ip(192, 0, 2, 1),
+            request_id: None,
+            auth: None,
+            crypt: None,
+            aead: Some((
+                AeadAlgorithm::rfc4106_gcm_aes(128),
+                KeyMaterial::new(vec![0x5c; 20]),
+            )),
+            mode: XfrmMode::Tunnel,
+            lifetime: LifetimeConfig::default(),
+            replay_window: 64,
+            replay_state: Some(SaReplayState {
+                esn: true,
+                outbound_sequence: last as u32,
+                inbound_sequence: 20,
+                outbound_sequence_hi: (last >> 32) as u32,
+                inbound_sequence_hi: 0,
+                replay_window: 64,
+                bitmap: vec![1, 0],
+            }),
+            encap: None,
+            mark: None,
+            output_mark: None,
+            if_id: None,
+            egress_dscp: None,
+        }
+    }
+
     #[tokio::test]
     async fn fake_mesh_takeover_is_accepted_by_the_fenced_repin_coordinator() {
         let sa = SaId::Esp { spi: 0x7788_99AA };
@@ -107,13 +154,14 @@ mod integration_tests {
         // Owner loss: the standby yields keymat plus validated evidence.
         let takeover = holder.take_for_repin(sa, esp_params()).unwrap();
         assert_eq!(takeover.resume.key_source, ResumeKeySource::LiveMirrored);
-        assert!(matches!(
-            takeover.resume.outbound_iv,
+        let restored_send_iv_next = match takeover.resume.outbound_iv {
             SameSpiOutboundIvResume::CounterBased {
                 checkpointed_send_iv_next: 5_000,
+                restored_send_iv_next,
                 ..
-            }
-        ));
+            } => restored_send_iv_next,
+            _ => panic!("live ESP takeover must carry counter evidence"),
+        };
         assert_eq!(takeover.keymat.expose_secret_bytes(), &[0x5C; 36]);
 
         // The evidence rides an ordinary fenced re-pin; the fencer stays the
@@ -124,12 +172,29 @@ mod integration_tests {
         fencer.set_owner(sa, previous_owner.clone());
         let ownership = MockOwnershipSource::default();
         ownership.set_shard_owner(ShardId::new(2), new_owner.clone());
+        let xfrm = MockXfrmBackend::new();
+        xfrm.install_sa(InstallSaRequest {
+            parameters: counter_sa_parameters(0x7788_99AA, 1),
+        })
+        .await
+        .unwrap();
+        let counter_authority = XfrmEspCounterResumeAuthority::new(xfrm);
+        let counter_receipt = counter_authority
+            .apply_and_read_back(EspCounterResumeApplyRequest {
+                binding: EspCounterResumeBinding::new(1, 1, 0x7788_99AA, restored_send_iv_next)
+                    .unwrap(),
+                parameters: counter_sa_parameters(0x7788_99AA, restored_send_iv_next),
+                direction: EspCounterResumeDirection::Outbound,
+            })
+            .await
+            .unwrap();
         let coordinator = RePinCoordinator::new(
             MockSteeringBackend::new(),
             fencer.clone(),
             ownership,
             MockRePinAuditSink::new(),
-        );
+        )
+        .with_esp_counter_resume_receipt(counter_receipt);
 
         let outcome = coordinator
             .repin(RePinRequest {

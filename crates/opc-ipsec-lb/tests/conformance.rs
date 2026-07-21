@@ -1,6 +1,12 @@
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
 
+use opc_ipsec_xfrm::{
+    AeadAlgorithm, AppliedEspCounterReceipt, EspCounterResumeApplyRequest, EspCounterResumeBinding,
+    EspCounterResumeDirection, InstallSaRequest, IpAddress as XfrmIpAddress, KeyMaterial,
+    LifetimeConfig, MockXfrmBackend, SaParameters, SaReplayState, XfrmBackend,
+    XfrmEspCounterResumeAuthority, XfrmId, XfrmMode, XfrmSelector,
+};
 use opc_route_steering::{IpPrefix, MockOperation, MockRouteSteeringBackend, RouteRequest};
 use opc_session_store::{
     CompareAndSet, CompareAndSetResult, EncryptedSessionPayload, FakeSessionBackend, Generation,
@@ -30,6 +36,89 @@ use opc_ipsec_lb::{
 };
 
 const IKE_HEADER_LEN: usize = 28;
+
+fn xfrm_ip(a: u8, b: u8, c: u8, d: u8) -> XfrmIpAddress {
+    XfrmIpAddress::Ipv4([a, b, c, d])
+}
+
+fn xfrm_counter_parameters(spi: u32, next: u64) -> SaParameters {
+    let last = next - 1;
+    SaParameters {
+        selector: XfrmSelector::new(xfrm_ip(10, 0, 0, 1), xfrm_ip(10, 0, 0, 2), 17),
+        id: XfrmId {
+            destination: xfrm_ip(192, 0, 2, 2),
+            spi,
+            protocol: 50,
+        },
+        source_address: xfrm_ip(192, 0, 2, 1),
+        request_id: None,
+        auth: None,
+        crypt: None,
+        aead: Some((
+            AeadAlgorithm::rfc4106_gcm_aes(128),
+            KeyMaterial::new(vec![0x11; 20]),
+        )),
+        mode: XfrmMode::Tunnel,
+        lifetime: LifetimeConfig::default(),
+        replay_window: 64,
+        replay_state: Some(SaReplayState {
+            esn: true,
+            outbound_sequence: last as u32,
+            inbound_sequence: 5,
+            outbound_sequence_hi: (last >> 32) as u32,
+            inbound_sequence_hi: 0,
+            replay_window: 64,
+            bitmap: vec![1, 0],
+        }),
+        encap: None,
+        mark: None,
+        output_mark: None,
+        if_id: None,
+        egress_dscp: None,
+    }
+}
+
+async fn applied_counter_receipt(spi: u32, next: u64) -> AppliedEspCounterReceipt {
+    applied_counter_receipt_for(1, 1, spi, next).await
+}
+
+async fn applied_counter_receipt_for(
+    operation_id: u128,
+    predecessor_fence_generation: u64,
+    spi: u32,
+    next: u64,
+) -> AppliedEspCounterReceipt {
+    let backend = MockXfrmBackend::new();
+    backend
+        .install_sa(InstallSaRequest {
+            parameters: xfrm_counter_parameters(spi, 1),
+        })
+        .await
+        .unwrap();
+    let authority = XfrmEspCounterResumeAuthority::new(backend);
+    authority
+        .apply_and_read_back(EspCounterResumeApplyRequest {
+            binding: EspCounterResumeBinding::new(
+                operation_id,
+                predecessor_fence_generation,
+                spi,
+                next,
+            )
+            .unwrap(),
+            parameters: xfrm_counter_parameters(spi, next),
+            direction: EspCounterResumeDirection::Outbound,
+        })
+        .await
+        .unwrap()
+}
+
+macro_rules! proof_aware_repin {
+    ($steering:expr, $fencer:expr, $ownership:expr, $audit:expr, $spi:expr, $next:expr $(,)?) => {{
+        let receipt = applied_counter_receipt($spi, $next).await;
+        RePinCoordinator::new($steering, $fencer, $ownership, $audit)
+            .with_esp_counter_resume_receipt(receipt)
+    }};
+}
 
 #[test]
 fn vip_delivered_probe_distinguishes_converged_production_from_mock_steering() {
@@ -734,7 +823,7 @@ async fn session_store_ownership_source_reads_authoritative_sa_owner() {
 }
 
 #[tokio::test]
-async fn persisted_resume_repins_only_after_forward_jump_and_external_forwarding_proof() {
+async fn plausible_numeric_esp_counter_without_applied_receipt_cannot_steer() {
     let steering = MockSteeringBackend::new();
     let fencer = MockOwnershipFencer::new();
     let ownership = MockOwnershipSource::default();
@@ -744,6 +833,112 @@ async fn persisted_resume_repins_only_after_forward_jump_and_external_forwarding
         fencer.clone(),
         ownership.clone(),
         audit.clone(),
+    );
+    let sa = SaId::Esp { spi: 0x1020_3040 };
+    let request = valid_repin_request(sa, SteerKey::EspSpi(0x1020_3040));
+    fencer.set_owner(sa, request.previous_owner.clone());
+    ownership.set_shard_owner(request.rule.owner, request.new_owner.clone());
+
+    assert_eq!(
+        coordinator.repin(request).await.unwrap_err(),
+        RePinError::BeforeOwnershipCommit(IpsecLbError::AppliedCounterProofRejected {
+            code: "esp_counter_proof_authority_not_configured",
+        })
+    );
+    assert!(steering.operations().is_empty());
+    assert!(fencer.operations().is_empty());
+    assert!(audit.events().is_empty());
+    assert_eq!(fencer.owner(sa).unwrap().as_str(), "worker-a");
+}
+
+#[tokio::test]
+async fn stale_operation_generation_spi_or_counter_receipt_never_publishes_steering() {
+    let base_spi = 0x1020_3040;
+    let base_next = 10 + MIN_SEND_IV_FORWARD_JUMP;
+    let request = valid_repin_request(SaId::Esp { spi: base_spi }, SteerKey::EspSpi(base_spi));
+    let mismatched_receipts = [
+        applied_counter_receipt_for(2, 1, base_spi, base_next).await,
+        applied_counter_receipt_for(1, 2, base_spi, base_next).await,
+        applied_counter_receipt_for(1, 1, base_spi + 1, base_next).await,
+        applied_counter_receipt_for(1, 1, base_spi, base_next + 1).await,
+    ];
+
+    for (case, receipt) in mismatched_receipts.into_iter().enumerate() {
+        let steering = MockSteeringBackend::new();
+        let fencer = MockOwnershipFencer::new();
+        let ownership = MockOwnershipSource::default();
+        let audit = MockRePinAuditSink::new();
+        fencer.set_owner(request.sa, request.previous_owner.clone());
+        ownership.set_shard_owner(request.rule.owner, request.new_owner.clone());
+        let coordinator =
+            RePinCoordinator::new(steering.clone(), fencer.clone(), ownership, audit.clone())
+                .with_esp_counter_resume_receipt(receipt);
+
+        let outcome = coordinator.repin(request.clone()).await;
+        assert!(
+            matches!(
+                outcome,
+                Err(RePinError::BeforeOwnershipCommit(
+                    IpsecLbError::AppliedCounterProofRejected {
+                        code: "esp_counter_receipt_absent_or_stale"
+                    }
+                ))
+            ),
+            "mismatch case {case} unexpectedly returned {outcome:?}"
+        );
+        assert!(steering.operations().is_empty());
+        assert!(fencer.operations().is_empty());
+        assert!(audit.events().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn failure_after_counter_readback_before_fencing_reuses_only_the_exact_receipt() {
+    let spi = 0x1828_3848;
+    let next = 10 + MIN_SEND_IV_FORWARD_JUMP;
+    let receipt = applied_counter_receipt(spi, next).await;
+    let steering = MockSteeringBackend::new();
+    let fencer = MockOwnershipFencer::new();
+    let ownership = MockOwnershipSource::default();
+    let audit = MockRePinAuditSink::new();
+    let request = valid_repin_request(SaId::Esp { spi }, SteerKey::EspSpi(spi));
+    fencer.set_owner(request.sa, request.previous_owner.clone());
+    ownership.set_shard_owner(request.rule.owner, request.new_owner.clone());
+    audit.set_failure(IpsecLbError::Unsupported);
+    let coordinator =
+        RePinCoordinator::new(steering.clone(), fencer.clone(), ownership, audit.clone())
+            .with_esp_counter_resume_receipt(receipt);
+
+    assert_eq!(
+        coordinator.repin(request.clone()).await.unwrap_err(),
+        RePinError::BeforeOwnershipCommit(IpsecLbError::Unsupported)
+    );
+    assert!(steering.operations().is_empty());
+    assert!(fencer.operations().is_empty());
+
+    audit.clear_failure();
+    let outcome = coordinator.repin(request.clone()).await.unwrap();
+    assert!(outcome.fence().get() > request.previous_fence.get());
+    assert_eq!(fencer.operations().len(), 1);
+    assert_eq!(
+        steering.operations(),
+        vec![MockSteeringOperation::Install(request.rule)]
+    );
+}
+
+#[tokio::test]
+async fn persisted_resume_repins_only_after_forward_jump_and_external_forwarding_proof() {
+    let steering = MockSteeringBackend::new();
+    let fencer = MockOwnershipFencer::new();
+    let ownership = MockOwnershipSource::default();
+    let audit = MockRePinAuditSink::new();
+    let coordinator = proof_aware_repin!(
+        steering.clone(),
+        fencer.clone(),
+        ownership.clone(),
+        audit.clone(),
+        0x1122_3344,
+        41 + MIN_SEND_IV_FORWARD_JUMP,
     );
 
     let sa = SaId::Esp { spi: 0x1122_3344 };
@@ -813,11 +1008,13 @@ async fn repin_fails_closed_when_audit_or_resume_is_unsafe() {
     let fencer = MockOwnershipFencer::new();
     let ownership = MockOwnershipSource::default();
     let audit = MockRePinAuditSink::new();
-    let coordinator = RePinCoordinator::new(
+    let coordinator = proof_aware_repin!(
         steering.clone(),
         fencer.clone(),
         ownership.clone(),
         audit.clone(),
+        7,
+        10 + MIN_SEND_IV_FORWARD_JUMP,
     );
 
     let sa = SaId::Esp { spi: 7 };
@@ -1011,8 +1208,14 @@ async fn repin_rechecks_target_owner_after_the_sa_fence_before_steering() {
         shard: request.rule.owner,
         replacement: ClusterNode::new("worker-c"),
     };
-    let coordinator =
-        RePinCoordinator::new(steering.clone(), fencer, ownership.clone(), audit.clone());
+    let coordinator = proof_aware_repin!(
+        steering.clone(),
+        fencer,
+        ownership.clone(),
+        audit.clone(),
+        0x2030_4050,
+        10 + MIN_SEND_IV_FORWARD_JUMP,
+    );
 
     let partial = coordinator
         .repin(request.clone())
@@ -1099,7 +1302,14 @@ async fn post_commit_proof_read_failure_preserves_a_retryable_single_use_partial
         inner: inner_fencer.clone(),
         fail_once: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
     };
-    let coordinator = RePinCoordinator::new(steering.clone(), fencer, ownership, audit.clone());
+    let coordinator = proof_aware_repin!(
+        steering.clone(),
+        fencer,
+        ownership,
+        audit.clone(),
+        0x3040_5060,
+        10 + MIN_SEND_IV_FORWARD_JUMP,
+    );
 
     let partial = coordinator
         .repin(request.clone())
@@ -1148,11 +1358,13 @@ async fn replaying_the_same_request_recovers_the_committed_fence_without_refenci
     let fencer = MockOwnershipFencer::new();
     let ownership = MockOwnershipSource::default();
     let audit = MockRePinAuditSink::new();
-    let coordinator = RePinCoordinator::new(
+    let coordinator = proof_aware_repin!(
         steering.clone(),
         fencer.clone(),
         ownership.clone(),
         audit.clone(),
+        0x4050_6070,
+        10 + MIN_SEND_IV_FORWARD_JUMP,
     );
     let sa = SaId::Esp { spi: 0x4050_6070 };
     let request = valid_repin_request(sa, SteerKey::EspSpi(0x4050_6070));
@@ -1312,7 +1524,14 @@ async fn retry_converges_after_steering_applied_but_acknowledgement_failed() {
     let fencer = MockOwnershipFencer::new();
     let ownership = MockOwnershipSource::default();
     let audit = MockRePinAuditSink::new();
-    let coordinator = RePinCoordinator::new(steering, fencer.clone(), ownership.clone(), audit);
+    let coordinator = proof_aware_repin!(
+        steering,
+        fencer.clone(),
+        ownership.clone(),
+        audit,
+        0x5060_7080,
+        10 + MIN_SEND_IV_FORWARD_JUMP,
+    );
     let sa = SaId::Esp { spi: 0x5060_7080 };
     let request = valid_repin_request(sa, SteerKey::EspSpi(0x5060_7080));
     fencer.set_owner(sa, request.previous_owner.clone());
@@ -1367,8 +1586,14 @@ async fn retry_deduplicates_an_audit_event_applied_before_acknowledgement_failed
         inner: recorded.clone(),
         fail_once: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
     };
-    let coordinator =
-        RePinCoordinator::new(steering.clone(), fencer.clone(), ownership.clone(), audit);
+    let coordinator = proof_aware_repin!(
+        steering.clone(),
+        fencer.clone(),
+        ownership.clone(),
+        audit,
+        0x6070_8090,
+        10 + MIN_SEND_IV_FORWARD_JUMP,
+    );
     let sa = SaId::Esp { spi: 0x6070_8090 };
     let request = valid_repin_request(sa, SteerKey::EspSpi(0x6070_8090));
     fencer.set_owner(sa, request.previous_owner.clone());
@@ -1420,11 +1645,13 @@ async fn post_commit_failures_retry_from_the_first_incomplete_stage() {
         let fencer = MockOwnershipFencer::new();
         let ownership = MockOwnershipSource::default();
         let audit = MockRePinAuditSink::new();
-        let coordinator = RePinCoordinator::new(
+        let coordinator = proof_aware_repin!(
             steering.clone(),
             fencer.clone(),
             ownership.clone(),
             audit.clone(),
+            0x3344_5566,
+            10 + MIN_SEND_IV_FORWARD_JUMP,
         );
         let sa = SaId::Esp { spi: 0x3344_5566 };
         let request = valid_repin_request(sa, SteerKey::EspSpi(0x3344_5566));
@@ -1510,11 +1737,13 @@ async fn retry_rejects_a_superseded_fence_before_audit_or_steering() {
     let fencer = MockOwnershipFencer::new();
     let ownership = MockOwnershipSource::default();
     let audit = MockRePinAuditSink::new();
-    let coordinator = RePinCoordinator::new(
+    let coordinator = proof_aware_repin!(
         steering.clone(),
         fencer.clone(),
         ownership.clone(),
         audit.clone(),
+        0x4455_6677,
+        10 + MIN_SEND_IV_FORWARD_JUMP,
     );
     let sa = SaId::Esp { spi: 0x4455_6677 };
     let request = valid_repin_request(sa, SteerKey::EspSpi(0x4455_6677));

@@ -334,17 +334,27 @@ pub struct LiveMirroredTakeover {
 ### 8.1 Normative takeover order
 
 1. `take_for_repin` → validated evidence + keymat in hand.
-2. `RePinCoordinator::repin` → fence commit, audit, steering install.
-3. Install keymat + restored counters into the standby's dataplane
-   (`CounterBased::restored_send_iv_next` MUST be the counter actually
-   installed — the transition fingerprint binds it).
-4. Drop the takeover buffer (zeroize). Inject `ForwardingProof` when observed.
+2. Block the standby's replacement datapath and hold namespace-wide XFRM
+   writer exclusion. Install the complete outbound SA through
+   `XfrmEspCounterResumeAuthority::apply_and_read_back`, with stored
+   `oseq = restored_send_iv_next - 1`, and retain its opaque receipt. Numeric
+   resume evidence or the transition fingerprint alone is not proof.
+3. Build `RePinCoordinator` with that receipt (or the bounded session proof
+   set), then call `repin`. It revalidates exact GETSA state before the fence
+   and immediately before steering publication.
+4. Release the datapath block only after successful fenced publication. The
+   first outbound ESP packet then consumes exactly `restored_send_iv_next`.
+5. Drop the takeover buffer (zeroize). Inject `ForwardingProof` when observed.
 
 A CNF MAY pre-install **receive-side** SA state before step 2 to shrink the
 blackout window, but MUST NOT transmit on the SA before the fence is granted:
 transmission is what consumes outbound IVs, and only the fence proves the
 previous owner is excluded. On re-pin failure the caller still holds the
-keymat and may retry, or drop it (zeroize) and fall back to re-attach.
+keymat and may retry the exact apply/readback and transition, or drop it
+(zeroize) and fall back to re-attach. Dropping the apply observer does not
+cancel its owned worker and delivers no receipt; keep the block and outer
+writer exclusion until an exact retry waits for that worker and completes
+readback/reapplication.
 
 ## 9. Memory-custody controls
 

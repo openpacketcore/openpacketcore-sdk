@@ -3,6 +3,10 @@
 use std::fmt;
 use std::num::{NonZeroU128, NonZeroU64};
 
+use opc_ipsec_xfrm::{
+    AppliedEspCounterReceipt, EspCounterProofRequirement, EspCounterResumeBinding,
+    EspCounterResumeProofSet,
+};
 use sha2::{Digest, Sha256};
 
 use crate::error::IpsecLbError;
@@ -284,19 +288,24 @@ impl RePinRequest {
     /// Hash the complete safety-critical request into a stable transition
     /// fingerprint used by ownership commit and recovery.
     ///
-    /// Counter-based requests retain the original v1 byte encoding so an
-    /// in-flight IKE-AEAD or ESP transition remains recoverable across a
-    /// rolling SDK upgrade. New random-IV and unspecified evidence use the v2
-    /// domain and mode-tagged encoding.
+    /// Counter-based IKE requests retain the original v1 byte encoding. ESP
+    /// counter requests use the v3 domain, which certifies that a grant was
+    /// created only after SDK-issued apply/readback proof became mandatory.
+    /// This intentionally prevents a pre-v3 numeric-only ESP grant from being
+    /// recovered as if it carried kernel evidence. Random-IV and unspecified
+    /// evidence use the v2 domain and mode-tagged encoding.
     #[must_use]
     pub fn ownership_fingerprint(&self) -> OwnershipTransitionFingerprint {
         let mut hasher = Sha256::new();
-        match self.resume.outbound_iv {
-            SameSpiOutboundIvResume::CounterBased {
-                checkpointed_send_iv_next,
-                restored_send_iv_next,
-                forward_jump,
-            } => {
+        match (self.sa, self.resume.outbound_iv) {
+            (
+                SaId::Ike { .. },
+                SameSpiOutboundIvResume::CounterBased {
+                    checkpointed_send_iv_next,
+                    restored_send_iv_next,
+                    forward_jump,
+                },
+            ) => {
                 hasher.update(b"opc-ipsec-lb/repin-transition/v1");
                 hash_request_prefix(&mut hasher, self);
                 hash_counter_resume_v1(
@@ -307,7 +316,28 @@ impl RePinRequest {
                     forward_jump,
                 );
             }
-            SameSpiOutboundIvResume::Unspecified | SameSpiOutboundIvResume::IkeRandomIv { .. } => {
+            (
+                SaId::Esp { .. },
+                SameSpiOutboundIvResume::CounterBased {
+                    checkpointed_send_iv_next,
+                    restored_send_iv_next,
+                    forward_jump,
+                },
+            ) => {
+                hasher.update(b"opc-ipsec-lb/repin-transition/v3-applied-esp-counter");
+                hash_request_prefix(&mut hasher, self);
+                hash_counter_resume_v1(
+                    &mut hasher,
+                    self.resume,
+                    checkpointed_send_iv_next,
+                    restored_send_iv_next,
+                    forward_jump,
+                );
+            }
+            (
+                _,
+                SameSpiOutboundIvResume::Unspecified | SameSpiOutboundIvResume::IkeRandomIv { .. },
+            ) => {
                 hasher.update(b"opc-ipsec-lb/repin-transition/v2");
                 hash_request_prefix(&mut hasher, self);
                 hash_resume_v2(&mut hasher, self.resume);
@@ -765,6 +795,9 @@ pub struct RePinCoordinator<B, F, O, A> {
     fencer: F,
     ownership: O,
     audit: A,
+    esp_counter_proofs: Option<EspCounterResumeProofSet>,
+    #[cfg(test)]
+    accept_test_counter_proof: bool,
 }
 
 impl<B, F, O, A> RePinCoordinator<B, F, O, A>
@@ -775,14 +808,50 @@ where
     A: RePinAuditSink,
 {
     /// Build a coordinator from explicit ports.
+    ///
+    /// Counter-based ESP re-pin is fail-closed until
+    /// [`Self::with_esp_counter_resume_receipt`] installs opaque SDK XFRM
+    /// apply/readback evidence. IKE counter and random-IV evidence remain
+    /// product-owned because this coordinator does not own the IKE state
+    /// machine.
     #[must_use]
-    pub const fn new(steering: B, fencer: F, ownership: O, audit: A) -> Self {
+    pub fn new(steering: B, fencer: F, ownership: O, audit: A) -> Self {
         Self {
             steering,
             fencer,
             ownership,
             audit,
+            esp_counter_proofs: None,
+            #[cfg(test)]
+            accept_test_counter_proof: false,
         }
+    }
+
+    /// Install one opaque receipt for a single counter-based ESP transition.
+    ///
+    /// The receipt must come from
+    /// `XfrmEspCounterResumeAuthority::apply_and_read_back`. After process
+    /// loss, use a receipt returned by `recover_committed_readback` only after
+    /// the exact v3 ownership transition is known committed. A recovered
+    /// receipt cannot authorize a new ownership mutation.
+    #[must_use]
+    pub fn with_esp_counter_resume_receipt(mut self, receipt: AppliedEspCounterReceipt) -> Self {
+        self.esp_counter_proofs = Some(EspCounterResumeProofSet::single(receipt));
+        self
+    }
+
+    /// Install a bounded set of opaque receipts for a session-level plan that
+    /// contains multiple counter-based ESP SAs.
+    #[must_use]
+    pub fn with_esp_counter_resume_proof_set(mut self, proofs: EspCounterResumeProofSet) -> Self {
+        self.esp_counter_proofs = Some(proofs);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_applied_esp_counter_proof(mut self) -> Self {
+        self.accept_test_counter_proof = true;
+        self
     }
 
     /// Validate resume evidence and the target-shard binding, recover or fence
@@ -806,10 +875,23 @@ where
             new_owner: request.new_owner.clone(),
         };
         match self.fencer.recover_fence_grant(&fence_request).await {
-            Ok(Some(grant)) => return self.continue_from_grant(request, grant).await,
+            Ok(Some(grant)) => return self.continue_from_grant(request, grant, true).await,
             Ok(None) => {}
             Err(error) => return Err(RePinError::BeforeOwnershipCommit(error)),
         }
+
+        // A caller-declared ESP value cannot authorize the ownership mutation.
+        // Require an exact SDK adapter receipt and repeat the target-owner read
+        // after that awaited GETSA so no stale shard snapshot reaches fencing.
+        self.validate_esp_counter_proof(
+            &request,
+            EspCounterProofRequirement::BeforeOwnershipCommit,
+        )
+        .await
+        .map_err(RePinError::BeforeOwnershipCommit)?;
+        self.validate_target_owner(&request)
+            .await
+            .map_err(RePinError::BeforeOwnershipCommit)?;
 
         self.audit
             .record_repin(RePinAuditEvent::attempt(&request))
@@ -831,13 +913,14 @@ where
             },
         };
 
-        self.continue_from_grant(request, grant).await
+        self.continue_from_grant(request, grant, false).await
     }
 
     async fn continue_from_grant(
         &self,
         request: RePinRequest,
         grant: OwnershipFenceGrant,
+        recovered: bool,
     ) -> Result<RePinOutcome, RePinError> {
         // Do not trust the fencer port blindly: a grant for a different SA or a
         // different owner would install a steering override toward the wrong
@@ -853,6 +936,21 @@ where
         if let Err(error) = self.fencer.validate_retry_proof(&retry_proof).await {
             return Err(RePinError::AfterOwnershipCommit(Box::new(
                 RePinPartialFailure::new(request, retry_proof, RePinRetryStage::FencedAudit, error),
+            )));
+        }
+        let requirement = if recovered {
+            EspCounterProofRequirement::CommittedRecovery
+        } else {
+            EspCounterProofRequirement::BeforeFirstPublication
+        };
+        if let Err(error) = self.validate_esp_counter_proof(&request, requirement).await {
+            return Err(RePinError::AfterOwnershipCommit(Box::new(
+                RePinPartialFailure::new(
+                    request,
+                    retry_proof,
+                    RePinRetryStage::SteeringInstall,
+                    error,
+                ),
             )));
         }
         self.continue_committed(request, retry_proof, RePinRetryStage::FencedAudit)
@@ -960,6 +1058,8 @@ where
         let proof = OwnershipRetryProof::from_grant(&grant);
         self.fencer.validate_retry_proof(&proof).await?;
         self.validate_target_owner(request).await?;
+        self.validate_esp_counter_proof(request, EspCounterProofRequirement::CommittedRecovery)
+            .await?;
         Ok(RePinOutcome::new(request.sa, grant.fence, request.rule))
     }
 
@@ -980,6 +1080,29 @@ where
                 "steering target shard has no authoritative owner",
             )),
         }
+    }
+
+    async fn validate_esp_counter_proof(
+        &self,
+        request: &RePinRequest,
+        requirement: EspCounterProofRequirement,
+    ) -> Result<(), IpsecLbError> {
+        let Some(binding) = esp_counter_binding(request)? else {
+            return Ok(());
+        };
+        #[cfg(test)]
+        if self.accept_test_counter_proof {
+            return Ok(());
+        }
+        let proofs = self.esp_counter_proofs.as_ref().ok_or_else(|| {
+            IpsecLbError::applied_counter_proof_rejected(
+                "esp_counter_proof_authority_not_configured",
+            )
+        })?;
+        proofs
+            .validate_counter_proof(binding, requirement)
+            .await
+            .map_err(|error| IpsecLbError::applied_counter_proof_rejected(error.code()))
     }
 
     async fn continue_committed(
@@ -1031,6 +1154,19 @@ where
             // before steering. A fence-aware backend is still required for a
             // strict cross-resource atomicity guarantee.
             if let Err(error) = self.validate_target_owner(&request).await {
+                return Err(RePinError::AfterOwnershipCommit(Box::new(
+                    RePinPartialFailure::new(
+                        request,
+                        retry_proof,
+                        RePinRetryStage::SteeringInstall,
+                        error,
+                    ),
+                )));
+            }
+            if let Err(error) = self
+                .validate_esp_counter_proof(&request, EspCounterProofRequirement::CommittedRecovery)
+                .await
+            {
                 return Err(RePinError::AfterOwnershipCommit(Box::new(
                     RePinPartialFailure::new(
                         request,
@@ -1224,6 +1360,29 @@ fn hash_anti_replay_and_key_source(hasher: &mut Sha256, resume: SameSpiResume) {
     }]);
 }
 
+fn esp_counter_binding(
+    request: &RePinRequest,
+) -> Result<Option<EspCounterResumeBinding>, IpsecLbError> {
+    let (
+        SaId::Esp { spi },
+        SameSpiOutboundIvResume::CounterBased {
+            restored_send_iv_next,
+            ..
+        },
+    ) = (request.sa, request.resume.outbound_iv)
+    else {
+        return Ok(None);
+    };
+    EspCounterResumeBinding::new(
+        request.transition_id.get(),
+        request.previous_fence.get(),
+        spi,
+        restored_send_iv_next,
+    )
+    .map(Some)
+    .map_err(|error| IpsecLbError::applied_counter_proof_rejected(error.code()))
+}
+
 pub(crate) fn validate_request(request: &RePinRequest) -> Result<(), IpsecLbError> {
     if request.previous_owner == request.new_owner {
         return Err(IpsecLbError::invalid_config(
@@ -1297,6 +1456,7 @@ fn error_code(error: &IpsecLbError) -> &'static str {
         IpsecLbError::OwnershipConflict { .. } => "ownership_conflict",
         IpsecLbError::ForwardingProofRejected { .. } => "forwarding_proof_rejected",
         IpsecLbError::UnsafeResume { .. } => "unsafe_resume",
+        IpsecLbError::AppliedCounterProofRejected { .. } => "applied_counter_proof_rejected",
         IpsecLbError::CookieRejected => "cookie_rejected",
     }
 }
@@ -1307,10 +1467,15 @@ mod tests {
     use crate::failover::SendIvCounterMode;
 
     const FORWARD_JUMP: u64 = crate::failover::MIN_SEND_IV_FORWARD_JUMP;
-    const FROZEN_COUNTER_V1_FINGERPRINT: [u8; 32] = [
+    const LEGACY_ESP_COUNTER_V1_FINGERPRINT: [u8; 32] = [
         0x7e, 0xeb, 0x23, 0x71, 0xb3, 0xea, 0xbc, 0x7d, 0x94, 0xf9, 0x2e, 0x41, 0x4c, 0xad, 0x9d,
         0xb3, 0x62, 0x2f, 0x10, 0x78, 0xa3, 0x20, 0x32, 0x8e, 0x81, 0xce, 0x8b, 0xd4, 0x09, 0x56,
         0x59, 0xcd,
+    ];
+    const FROZEN_ESP_COUNTER_V3_FINGERPRINT: [u8; 32] = [
+        0xa8, 0xa2, 0x40, 0x82, 0x4a, 0x6d, 0x6f, 0xb8, 0x45, 0x34, 0x64, 0x48, 0x39, 0x69, 0xc3,
+        0xc4, 0xd3, 0x34, 0x92, 0xbb, 0xcb, 0xe8, 0xd9, 0x02, 0x74, 0xc5, 0x4d, 0x6e, 0x54, 0x2d,
+        0x4c, 0x39,
     ];
     const FROZEN_RANDOM_IV_V2_FINGERPRINT: [u8; 32] = [
         0xcb, 0x74, 0x27, 0xfd, 0x0e, 0x4d, 0x66, 0xec, 0x4e, 0xc9, 0xad, 0xfb, 0xdc, 0xe1, 0x0a,
@@ -1442,12 +1607,12 @@ mod tests {
     }
 
     #[test]
-    fn counter_based_ownership_fingerprint_preserves_frozen_v1_encoding() {
+    fn esp_counter_ownership_fingerprint_preserves_frozen_v3_encoding() {
         assert_eq!(
             frozen_counter_v1_request()
                 .ownership_fingerprint()
                 .as_bytes(),
-            FROZEN_COUNTER_V1_FINGERPRINT
+            FROZEN_ESP_COUNTER_V3_FINGERPRINT
         );
     }
 
@@ -1462,7 +1627,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrated_counter_request_recovers_a_v1_committed_transition() {
+    async fn legacy_numeric_only_esp_grant_cannot_recover_as_v3_applied_proof() {
         let request = frozen_counter_v1_request();
         let fencer = crate::mock::MockOwnershipFencer::new();
         fencer.set_owner(request.sa, request.previous_owner.clone());
@@ -1472,7 +1637,7 @@ mod tests {
                 sa: request.sa,
                 transition_id: request.transition_id,
                 fingerprint: OwnershipTransitionFingerprint::from_bytes(
-                    FROZEN_COUNTER_V1_FINGERPRINT,
+                    LEGACY_ESP_COUNTER_V1_FINGERPRINT,
                 ),
                 previous_fence: request.previous_fence,
                 previous_owner: request.previous_owner.clone(),
@@ -1488,25 +1653,17 @@ mod tests {
         let coordinator =
             RePinCoordinator::new(steering.clone(), fencer.clone(), ownership, audit.clone());
 
-        let outcome = coordinator.repin(request.clone()).await.unwrap();
-        assert_eq!(outcome.fence(), committed.fence);
+        assert!(matches!(
+            coordinator.repin(request.clone()).await,
+            Err(RePinError::BeforeOwnershipCommit(
+                IpsecLbError::OwnershipConflict { .. }
+            ))
+        ));
+        assert_ne!(request.ownership_fingerprint(), committed.fingerprint);
         assert_eq!(fencer.operations().len(), 1);
         assert_eq!(fencer.recovery_attempts(), 1);
-        assert_eq!(
-            steering.operations(),
-            vec![crate::mock::MockSteeringOperation::Install(request.rule)]
-        );
-        assert_eq!(
-            audit
-                .events()
-                .iter()
-                .map(|event| event.kind)
-                .collect::<Vec<_>>(),
-            vec![
-                RePinAuditEventKind::Fenced,
-                RePinAuditEventKind::SteeringInstalled,
-            ]
-        );
+        assert!(steering.operations().is_empty());
+        assert!(audit.events().is_empty());
     }
 
     #[test]

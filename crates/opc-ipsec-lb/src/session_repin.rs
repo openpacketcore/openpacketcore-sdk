@@ -2788,6 +2788,12 @@ mod tests {
         OwnershipFenceGrant, OwnershipFenceRequest, OwnershipRetryProof, OwnershipSnapshot,
         OwnershipTransitionFingerprint,
     };
+    macro_rules! test_repin {
+        ($steering:expr, $fencer:expr, $ownership:expr, $audit:expr $(,)?) => {
+            RePinCoordinator::new($steering, $fencer, $ownership, $audit)
+                .with_test_applied_esp_counter_proof()
+        };
+    }
 
     const SESSION_SA_COUNT: usize = 4;
     static NEXT_TEST_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
@@ -3297,7 +3303,7 @@ mod tests {
             MockSessionRePinJournal,
         > {
             SessionRePinCoordinator::new(
-                RePinCoordinator::new(
+                test_repin!(
                     self.steering.clone(),
                     self.fencer.clone(),
                     self.ownership.clone(),
@@ -3342,7 +3348,7 @@ mod tests {
     {
         assert!((1..=harness.plan.len()).contains(&completed));
         let coordinator = SessionRePinCoordinator::new(
-            RePinCoordinator::new(
+            test_repin!(
                 harness.steering.clone(),
                 harness.fencer.clone(),
                 harness.ownership.clone(),
@@ -3392,7 +3398,7 @@ mod tests {
         harness.steering.remove_rule(barrier_rule).await.unwrap();
         let barrier = SelectiveInstallBarrier::new(harness.steering.clone(), barrier_rule);
         let coordinator = SessionRePinCoordinator::new(
-            RePinCoordinator::new(
+            test_repin!(
                 barrier.clone(),
                 harness.fencer.clone(),
                 harness.ownership.clone(),
@@ -3424,7 +3430,7 @@ mod tests {
                 + u128::try_from(barrier_index).unwrap(),
         )
         .unwrap();
-        let direct_per_sa = RePinCoordinator::new(
+        let direct_per_sa = test_repin!(
             harness.steering.clone(),
             harness.fencer.clone(),
             harness.ownership.clone(),
@@ -3547,20 +3553,20 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_v1_encoding_remains_byte_compatible_and_backward_decodable() {
-        // Captured from the unmodified 9be2e01 v1 encoder with this synthetic
-        // plan. Keep this immutable: generating both sides from the current
-        // wire DTO would allow an accidental migration break to self-agree.
-        const LEGACY_V1_SHA256: [u8; 32] = [
-            107, 231, 107, 94, 20, 132, 232, 3, 34, 95, 4, 165, 220, 200, 44, 214, 203, 191, 46,
-            163, 69, 103, 214, 240, 166, 210, 249, 125, 189, 145, 87, 169,
+    fn checkpoint_v1_wire_is_canonical_with_v3_esp_request_fingerprints() {
+        // The journal wire version remains v1, while each ESP transition now
+        // carries the v3 applied-proof fingerprint domain. Keep this synthetic
+        // encoding immutable so a wire DTO change cannot self-agree.
+        const V1_WITH_APPLIED_PROOF_SHA256: [u8; 32] = [
+            222, 6, 16, 185, 114, 33, 249, 132, 178, 7, 183, 255, 233, 203, 90, 175, 156, 161, 165,
+            200, 201, 19, 98, 218, 220, 252, 96, 53, 171, 1, 9, 41,
         ];
         let plan = plan_with(1, 1, 100, 3);
         let checkpoint =
             SessionRePinCheckpoint::from_progress(plan.clone(), Vec::new(), None).unwrap();
         let legacy_v1 = encode_checkpoint(&checkpoint).unwrap();
         let encoded_hash: [u8; 32] = Sha256::digest(legacy_v1.as_bytes()).into();
-        assert_eq!(encoded_hash, LEGACY_V1_SHA256);
+        assert_eq!(encoded_hash, V1_WITH_APPLIED_PROOF_SHA256);
 
         let key = SessionKey {
             tenant: tenant(),
@@ -3695,7 +3701,7 @@ mod tests {
         let steering_attempts = harness.steering.install_attempts();
         let blocking = BlockingJournal::new(harness.journal.clone(), 3);
         let coordinator = SessionRePinCoordinator::new(
-            RePinCoordinator::new(
+            test_repin!(
                 harness.steering.clone(),
                 harness.fencer.clone(),
                 harness.ownership.clone(),
@@ -3776,7 +3782,7 @@ mod tests {
         let fence_operations = harness.fencer.inner.operations().len();
         let steering_attempts = harness.steering.install_attempts();
         let audit_attempts = harness.audit.record_attempts();
-        let repin = RePinCoordinator::new(
+        let repin = test_repin!(
             harness.steering.clone(),
             harness.fencer.clone(),
             harness.ownership.clone(),
@@ -3991,7 +3997,7 @@ mod tests {
         let harness = Harness::new();
         let blocking = BlockingSteering::new(harness.steering.clone());
         let coordinator = SessionRePinCoordinator::new(
-            RePinCoordinator::new(
+            test_repin!(
                 blocking.clone(),
                 harness.fencer.clone(),
                 harness.ownership.clone(),
@@ -4029,7 +4035,7 @@ mod tests {
             let harness = Harness::new();
             let blocking = BlockingJournal::new(harness.journal.clone(), stage);
             let coordinator = SessionRePinCoordinator::new(
-                RePinCoordinator::new(
+                test_repin!(
                     harness.steering.clone(),
                     harness.fencer.clone(),
                     harness.ownership.clone(),
@@ -4448,7 +4454,7 @@ mod tests {
                 let operation_count = harness.fencer.inner.operations().len();
                 let target = harness.plan.requests()[completed - 1].sa;
                 let coordinator = SessionRePinCoordinator::new(
-                    RePinCoordinator::new(
+                    test_repin!(
                         harness.steering.clone(),
                         DivergentCompletedFencer {
                             inner: harness.fencer.clone(),
@@ -4508,7 +4514,7 @@ mod tests {
                 rule: foreign_rule,
                 resume: request.resume,
             };
-            let direct_per_sa = RePinCoordinator::new(
+            let direct_per_sa = test_repin!(
                 harness.steering.clone(),
                 harness.fencer.clone(),
                 harness.ownership.clone(),
@@ -5155,7 +5161,7 @@ mod tests {
         );
         let ports = Harness::new();
         let coordinator = SessionRePinCoordinator::new(
-            RePinCoordinator::new(ports.steering, ports.fencer, ports.ownership, ports.audit),
+            test_repin!(ports.steering, ports.fencer, ports.ownership, ports.audit),
             degraded,
         );
         assert!(matches!(
@@ -5277,7 +5283,7 @@ mod tests {
         journal.begin(&second).await.unwrap();
         let ports = Harness::new();
         let coordinator = SessionRePinCoordinator::new(
-            RePinCoordinator::new(ports.steering, ports.fencer, ports.ownership, ports.audit),
+            test_repin!(ports.steering, ports.fencer, ports.ownership, ports.audit),
             journal,
         );
 

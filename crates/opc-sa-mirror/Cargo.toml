@@ -32,6 +32,7 @@ zeroize = { workspace = true }
 
 [dev-dependencies]
 opc-identity = { path = "../opc-identity", version = "0.2.0" }
+opc-ipsec-xfrm = { path = "../opc-ipsec-xfrm", version = "0.2.0" }
 rcgen = { workspace = true }
 time = { workspace = true }
 tokio = { workspace = true, features = ["net", "rt", "sync", "time", "io-util", "macros", "test-util"] }

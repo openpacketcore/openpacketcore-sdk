@@ -15,6 +15,14 @@
 //! relocation future is not cancellation-safe once polled: callers must keep
 //! safety fences in place and perform exact old/new tuple reconciliation before
 //! retrying or releasing writer exclusion after cancellation or process loss.
+//! Counter-based same-SPI ESP recovery uses the separate
+//! [`XfrmEspCounterResumeAuthority`] boundary. It applies complete outbound SA
+//! state, checks exact identity and ESN state through GETSA, and returns an
+//! opaque [`AppliedEspCounterReceipt`] only when the stored last-assigned
+//! sequence is exactly one below the requested next sequence. Receipts remain
+//! bound to the issuing authority instance, operation, predecessor generation,
+//! SA, direction, and network namespace; caller-declared numbers alone are not
+//! proof. IKE message counters remain outside this crate.
 //! The crate never infers relocation from packet source addresses and deliberately
 //! does not implement IKE, ESP processing, namespace management, or deployment
 //! policy.
@@ -26,6 +34,7 @@
 
 pub mod backend;
 pub mod composite;
+pub mod counter_resume;
 mod dscp;
 pub mod error;
 #[cfg(feature = "ikev2")]
@@ -43,6 +52,12 @@ pub use composite::{
     XfrmBidirectionalInstallOutcome, XfrmCompositeInstallError, XfrmCompositeInstallRequest,
     XfrmCompositeOperation, XfrmCompositeOutcome, XFRM_COMPOSITE_INSTALL_ORDER,
     XFRM_COMPOSITE_INSTALL_ROLLBACK_ORDER, XFRM_COMPOSITE_REKEY_ORDER, XFRM_COMPOSITE_REMOVE_ORDER,
+};
+pub use counter_resume::{
+    AppliedEspCounterReceipt, EspCounterProofRequirement, EspCounterResumeApplyRequest,
+    EspCounterResumeBinding, EspCounterResumeDirection, EspCounterResumeError,
+    EspCounterResumeProofSet, EspCounterResumeRecoveryRequest, XfrmEspCounterResumeAuthority,
+    DEFAULT_ESP_COUNTER_RECEIPT_CAPACITY, MAX_ESP_COUNTER_PROOF_SET_SIZE,
 };
 pub use dscp::{
     LinuxXfrmDscpMarkingConfig, DEFAULT_XFRM_DSCP_BPFFS_PIN_ROOT, DEFAULT_XFRM_DSCP_TC_PRIORITY,

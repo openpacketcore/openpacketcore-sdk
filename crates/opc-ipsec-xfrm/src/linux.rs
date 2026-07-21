@@ -1055,11 +1055,17 @@ fn encode_sa_info_inner(
     );
     push_u16_ne(&mut out, family);
     push_u8(&mut out, encode_mode(parameters.mode));
-    push_u8(
-        &mut out,
-        parameters.replay_window.min(u32::from(u8::MAX)) as u8,
-    );
-    push_u8(&mut out, encode_sa_flags(parameters));
+    let flags = encode_sa_flags(parameters);
+    // Linux rejects an ESN SA when the legacy one-byte replay window is also
+    // populated. The complete window lives exclusively in
+    // XFRMA_REPLAY_ESN_VAL for this mode, matching iproute2's encoding.
+    let legacy_replay_window = if flags & XFRM_STATE_ESN != 0 {
+        0
+    } else {
+        parameters.replay_window.min(u32::from(u8::MAX)) as u8
+    };
+    push_u8(&mut out, legacy_replay_window);
+    push_u8(&mut out, flags);
     out.resize(XFRM_USER_SA_INFO_LEN, 0);
 
     if let Some((auth, key)) = &parameters.auth {
@@ -4258,6 +4264,7 @@ mod tests {
         let body = encode_sa_info(&params).unwrap();
         let payload = route_attr_payload(&body, XFRMA_REPLAY_ESN_VAL).expect("ESN attr");
 
+        assert_eq!(body[215], 0);
         assert_eq!(body[216], XFRM_STATE_ESN);
         assert_eq!(payload.len(), XFRM_REPLAY_STATE_ESN_BASE_LEN + 8);
         assert_eq!(u32::from_ne_bytes(payload[0..4].try_into().unwrap()), 2);

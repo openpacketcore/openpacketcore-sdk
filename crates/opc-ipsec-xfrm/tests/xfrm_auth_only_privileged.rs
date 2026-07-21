@@ -1,7 +1,8 @@
 //! Privileged Linux proof for bidirectional authenticated-only ESP.
 //!
-//! The test captures an SDK-installed ENCR_NULL/HMAC outbound packet before a
-//! peer SA exists, installs the peer inbound SA, injects a tampered copy, and
+//! The test first proves a resumed AES-GCM ESN counter on a real outbound
+//! packet, then replaces that synthetic path with SDK-installed ENCR_NULL/HMAC,
+//! captures a packet before a peer SA exists, injects a tampered copy, and
 //! proves the kernel rejects it without consuming the sequence number. The
 //! original authenticated packet then passes, as does a fresh reverse packet.
 
@@ -20,9 +21,12 @@ use nix::sys::socket::{
 };
 use nix::sys::time::TimeVal;
 use opc_ipsec_xfrm::{
-    Algorithm, AuthAlgorithm, InstallPolicyRequest, InstallSaRequest, IpAddress, KeyMaterial,
-    LifetimeConfig, LinuxXfrmBackend, PolicyParameters, QuerySaRequest, SaParameters, SaState,
-    XfrmAction, XfrmBackend, XfrmDirection, XfrmId, XfrmMode, XfrmSelector, XfrmTemplate,
+    AeadAlgorithm, Algorithm, AuthAlgorithm, EspCounterProofRequirement,
+    EspCounterResumeApplyRequest, EspCounterResumeBinding, EspCounterResumeDirection,
+    EspCounterResumeProofSet, InstallPolicyRequest, InstallSaRequest, IpAddress, KeyMaterial,
+    LifetimeConfig, LinuxXfrmBackend, PolicyParameters, QuerySaRequest, RemoveSaRequest,
+    SaParameters, SaReplayState, SaState, XfrmAction, XfrmBackend, XfrmDirection,
+    XfrmEspCounterResumeAuthority, XfrmId, XfrmMode, XfrmSelector, XfrmTemplate,
 };
 
 const OUTER_LOCAL: [u8; 4] = [192, 0, 2, 1];
@@ -33,10 +37,12 @@ const LOCAL_TO_PEER_SPI: u32 = 0x3320_0001;
 const PEER_TO_LOCAL_SPI: u32 = 0x3320_0002;
 const LOCAL_TO_PEER_KEY: u8 = 0xa1;
 const PEER_TO_LOCAL_KEY: u8 = 0xb2;
+const COUNTER_PROOF_KEY: u8 = 0xc3;
 const TEST_PORT: u16 = 33_200;
 const IPPROTO_UDP: u8 = 17;
 const IPPROTO_ESP: u8 = 50;
 const TEST_PAYLOAD: &[u8] = b"opc-xfrm-auth-only";
+const RESUMED_SEND_NEXT: u64 = 37;
 
 fn run(program: &str, args: &[&str]) {
     let output = Command::new(program)
@@ -265,6 +271,38 @@ fn auth_only_sa(
     }
 }
 
+fn with_esn_state(mut parameters: SaParameters, outbound_last_assigned: u64) -> SaParameters {
+    parameters.replay_window = 64;
+    parameters.replay_state = Some(SaReplayState {
+        esn: true,
+        outbound_sequence: outbound_last_assigned as u32,
+        inbound_sequence: 0,
+        outbound_sequence_hi: (outbound_last_assigned >> 32) as u32,
+        inbound_sequence_hi: 0,
+        replay_window: 64,
+        bitmap: vec![0; 2],
+    });
+    parameters
+}
+
+fn counter_proof_sa() -> SaParameters {
+    let mut parameters = auth_only_sa(
+        OUTER_LOCAL,
+        OUTER_PEER,
+        INNER_LOCAL,
+        INNER_PEER,
+        LOCAL_TO_PEER_SPI,
+        COUNTER_PROOF_KEY,
+    );
+    parameters.auth = None;
+    parameters.crypt = None;
+    parameters.aead = Some((
+        AeadAlgorithm::rfc4106_gcm_aes(128),
+        KeyMaterial::new(vec![COUNTER_PROOF_KEY; 20]),
+    ));
+    parameters
+}
+
 fn policy(
     source_outer: [u8; 4],
     destination_outer: [u8; 4],
@@ -380,7 +418,7 @@ fn wait_for_integrity_failure(peer_ns: &str, baseline: u32) -> SaState {
 
 #[tokio::test]
 #[ignore = "requires CAP_NET_ADMIN, CAP_NET_RAW, XFRM, and a fresh network namespace"]
-async fn bidirectional_authenticated_only_esp_accepts_valid_and_rejects_tampered_packets(
+async fn authenticated_only_esp_proves_counter_resume_and_rejects_tampered_packets(
 ) -> Result<(), Box<dyn std::error::Error>> {
     if env::var("OPC_XFRM_RUN_AUTH_ONLY_PRIVILEGED").as_deref() != Ok("1") {
         eprintln!(
@@ -394,16 +432,10 @@ async fn bidirectional_authenticated_only_esp_accepts_valid_and_rejects_tampered
     let capture = capture_socket();
     let backend = LinuxXfrmBackend::new();
 
+    let initial_local_outbound = with_esn_state(counter_proof_sa(), 0);
     install(
         &backend,
-        auth_only_sa(
-            OUTER_LOCAL,
-            OUTER_PEER,
-            INNER_LOCAL,
-            INNER_PEER,
-            LOCAL_TO_PEER_SPI,
-            LOCAL_TO_PEER_KEY,
-        ),
+        initial_local_outbound,
         policy(
             OUTER_LOCAL,
             OUTER_PEER,
@@ -413,9 +445,124 @@ async fn bidirectional_authenticated_only_esp_accepts_valid_and_rejects_tampered
             XfrmDirection::Out,
         ),
     )
-    .await?;
+    .await
+    .map_err(|error| {
+        std::io::Error::other(format!("initial outbound install failed: {error:?}"))
+    })?;
+
+    let replacement = with_esn_state(counter_proof_sa(), RESUMED_SEND_NEXT - 1);
+    let binding = EspCounterResumeBinding::new(1, 1, LOCAL_TO_PEER_SPI, RESUMED_SEND_NEXT)?;
+    let authority = XfrmEspCounterResumeAuthority::new(backend.clone());
+    let receipt_result = authority
+        .apply_and_read_back(EspCounterResumeApplyRequest {
+            binding,
+            parameters: replacement,
+            direction: EspCounterResumeDirection::Outbound,
+        })
+        .await;
+    if let Err(error) = receipt_result {
+        let observed = backend
+            .query_sa(QuerySaRequest::new(
+                ip(OUTER_PEER),
+                IPPROTO_ESP,
+                LOCAL_TO_PEER_SPI,
+            ))
+            .await?;
+        return Err(std::io::Error::other(format!(
+            "counter proof failed ({error:?}); observed replay state: {:?}, bitmap: {:?}",
+            observed.replay_state, observed.replay_state.bitmap
+        ))
+        .into());
+    }
+    let receipt = receipt_result.expect("checked counter proof result");
+    assert_eq!(
+        format!("{receipt:?}"),
+        "AppliedEspCounterReceipt([redacted])"
+    );
+    let proofs = EspCounterResumeProofSet::single(receipt);
+    proofs
+        .validate_counter_proof(binding, EspCounterProofRequirement::BeforeFirstPublication)
+        .await?;
+    let foreign_namespace_code = {
+        let peer_ns = network.peer_ns.clone();
+        let foreign_proofs = proofs.clone();
+        in_netns(&peer_ns, move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build foreign-netns proof runtime");
+            runtime
+                .block_on(foreign_proofs.validate_counter_proof(
+                    binding,
+                    EspCounterProofRequirement::BeforeFirstPublication,
+                ))
+                .expect_err("receipt must be bound to the applying network namespace")
+                .code()
+        })
+    };
+    assert_eq!(
+        foreign_namespace_code,
+        "esp_counter_network_namespace_mismatch"
+    );
+    let restored = backend
+        .query_sa(QuerySaRequest::new(
+            ip(OUTER_PEER),
+            IPPROTO_ESP,
+            LOCAL_TO_PEER_SPI,
+        ))
+        .await?;
+    assert_eq!(restored.replay_state.outbound_sequence_hi, 0);
+    assert_eq!(
+        u64::from(restored.replay_state.outbound_sequence),
+        RESUMED_SEND_NEXT - 1
+    );
 
     let sender = UdpSocket::bind((Ipv4Addr::from(INNER_LOCAL), 0))?;
+    sender.send_to(TEST_PAYLOAD, (Ipv4Addr::from(INNER_PEER), TEST_PORT))?;
+    let (counter_frame, _) = capture_esp(&capture, LOCAL_TO_PEER_SPI);
+    let ihl = usize::from(counter_frame[14] & 0x0f) * 4;
+    let esp_offset = 14 + ihl;
+    let first_sequence = u32::from_be_bytes(
+        counter_frame[esp_offset + 4..esp_offset + 8]
+            .try_into()
+            .expect("captured ESP sequence field"),
+    );
+    assert_eq!(u64::from(first_sequence), RESUMED_SEND_NEXT);
+    let emitted = backend
+        .query_sa(QuerySaRequest::new(
+            ip(OUTER_PEER),
+            IPPROTO_ESP,
+            LOCAL_TO_PEER_SPI,
+        ))
+        .await?;
+    assert_eq!(emitted.replay_state.outbound_sequence_hi, 0);
+    assert_eq!(
+        u64::from(emitted.replay_state.outbound_sequence),
+        RESUMED_SEND_NEXT
+    );
+    proofs
+        .validate_counter_proof(binding, EspCounterProofRequirement::CommittedRecovery)
+        .await?;
+
+    backend
+        .remove_sa(RemoveSaRequest::new(
+            ip(OUTER_PEER),
+            IPPROTO_ESP,
+            LOCAL_TO_PEER_SPI,
+        ))
+        .await?;
+    backend
+        .install_sa(InstallSaRequest {
+            parameters: auth_only_sa(
+                OUTER_LOCAL,
+                OUTER_PEER,
+                INNER_LOCAL,
+                INNER_PEER,
+                LOCAL_TO_PEER_SPI,
+                LOCAL_TO_PEER_KEY,
+            ),
+        })
+        .await?;
     sender.send_to(TEST_PAYLOAD, (Ipv4Addr::from(INNER_PEER), TEST_PORT))?;
     let (original_frame, address) = capture_esp(&capture, LOCAL_TO_PEER_SPI);
 

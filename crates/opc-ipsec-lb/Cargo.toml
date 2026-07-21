@@ -16,6 +16,7 @@ publish = false
 [dependencies]
 aes-gcm = { workspace = true }
 opc-ipsec-lb-ebpf-common = { path = "../opc-ipsec-lb-ebpf-common", version = "0.2.0" }
+opc-ipsec-xfrm = { path = "../opc-ipsec-xfrm", version = "0.2.0" }
 opc-linux-gtpu-sys = { path = "../opc-linux-gtpu-sys", version = "0.2.0" }
 opc-route-steering = { path = "../opc-route-steering", version = "0.2.0" }
 opc-session-store = { path = "../opc-session-store", version = "0.2.0" }

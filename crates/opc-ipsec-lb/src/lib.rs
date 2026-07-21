@@ -24,12 +24,20 @@
 //! protected message. Random-IV evidence is valid only for IKE and never
 //! carries placeholder counter fields; ownership fencing, key custody, SA
 //! identity, and inbound anti-replay evidence remain mandatory in both modes.
+//! A counter-based ESP transition additionally requires an opaque
+//! [`opc_ipsec_xfrm::AppliedEspCounterReceipt`] from an exact XFRM apply and
+//! GETSA readback. [`RePinCoordinator`] revalidates that receipt before a new
+//! ownership fence and again before first steering publication; a plausible
+//! numeric counter cannot authorize traffic. IKE counter application remains
+//! consumer-owned.
 //! [`SessionRePinCoordinator`] composes those exact single-SA transitions into
 //! one bounded durable IKE/default-ESP/dedicated-ESP saga. It converges forward
 //! after partial monotonic commits and returns whole-session success only after
 //! every ordered SA has durably completed fencing and steering. The session
-//! journal neither proves that caller-declared counters were applied nor
-//! changes the existing encrypted session-payload/HKMS boundary. After
+//! journal persists requests and ownership progress, not opaque receipts or
+//! key material. Consumers rebuild a bounded receipt set from exact apply or
+//! committed GETSA recovery after restart; this does not change the existing
+//! encrypted session-payload/HKMS boundary. After
 //! product-owned teardown, an exact terminal identity can be retired to a
 //! fenced encrypted tombstone that blocks stale recreation for the fixed
 //! seven-day bounded retry horizon.

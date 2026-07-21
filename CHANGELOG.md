@@ -80,6 +80,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exhaustive struct literal.
 
 ### Fixed
+- **BREAKING — applied ESP counter proof before same-SPI publication —
+  `opc-ipsec-xfrm`, `opc-ipsec-lb`:** `XfrmEspCounterResumeAuthority` now
+  replaces an existing outbound ESP SA, performs exact identity and GETSA ESN
+  readback, and issues a constructor-private `AppliedEspCounterReceipt` only
+  when Linux's stored last-assigned sequence maps exactly to the requested next
+  value. Receipts are bounded and bind operation, predecessor generation, SPI,
+  direction, replay state, network namespace, and authority instance; same-SA
+  retries invalidate stale receipts, cancellation never activates an
+  unverified receipt, and committed restart recovery is read-only and cannot
+  authorize a new fence. `RePinCoordinator` now rejects a counter-based ESP
+  request without an exact receipt and revalidates it before ownership commit
+  and immediately before steering. Session plans accept a bounded
+  `EspCounterResumeProofSet`; receipts and keys are not persisted, preserving
+  the existing encrypted-at-rest/HKMS boundary. Counter-based ESP ownership
+  fingerprints move from the legacy numeric-only v1 domain to v3, so an old
+  committed ESP transition must finish on the old SDK or be rekeyed and begun
+  as a fresh v3 transition. IKE counter fingerprints remain v1, IKE random-IV
+  and unspecified fingerprints remain v2, and IKE counter application remains
+  consumer-owned. Privileged XFRM coverage proves `oseq = next - 1`, the first
+  packet sequence exactly `next`, and cross-network-namespace rejection.
 - **Exact IKEv2 signature trust-material DER parsing:**
   `Ikev2SignaturePublicKey` now rejects bytes following an otherwise valid
   SubjectPublicKeyInfo or X.509 certificate instead of silently ignoring them.
@@ -282,8 +302,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `resume` with the same privacy-safe session ID and `SessionRePinIdentity`
   after interruption, retain the
   terminal fingerprint for the next failover, and claim continuity only from a
-  terminal `SessionRePinOutcome`. This does not claim the adapter-issued
-  applied-counter evidence tracked by #333.
+  terminal `SessionRePinOutcome`. Counter-based ESP plans must additionally
+  wire ephemeral adapter-issued receipts into the embedded coordinator; the
+  journal never persists or fabricates that evidence.
 - **Fenced terminal session re-pin retirement — `opc-ipsec-lb`:** the typed
   journal and coordinator retirement boundary now accepts only the exact
   terminal session/operation/plan identity, replaces its byte-compatible v1
@@ -674,11 +695,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `FreshIndependentCsprngIvPerMessage` attestation and no placeholder counters.
   Random-IV evidence is rejected for ESP, while `Unspecified` preserves a
   fail-closed boundary for legacy or ambiguous evidence. Existing
-  counter-based requests retain their byte-identical v1 transition fingerprint
-  so an in-flight transition remains recoverable across a rolling upgrade; new
-  random-IV and unspecified evidence use the v2 domain and bind the outbound
-  mode and attestation. The existing `opc-sa-mirror` wire path remains
-  counter-based and does not infer random-IV mode from legacy counter values.
+  IKE counter-based requests retain their byte-identical v1 transition
+  fingerprint; new random-IV and unspecified evidence use the v2 domain and
+  bind the outbound mode and attestation. ESP counter-based requests now use
+  the v3 applied-proof domain and cannot recover a legacy numeric-only v1 ESP
+  grant. The existing `opc-sa-mirror` wire path remains counter-based and does
+  not infer random-IV mode from legacy counter values.
 - **Atomic candidate-only v5 Kubernetes HA artifacts — `opc-session-testkit`:**
   a separate executable and reusable composition API now preflight a trusted
   Linux output parent and Python interpreter before campaign mutation, run the

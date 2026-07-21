@@ -92,6 +92,12 @@ pub enum IpsecLbError {
         /// Static, redaction-safe reason.
         reason: &'static str,
     },
+    /// Applied ESP counter proof was unavailable, stale, or mismatched.
+    #[error("applied ESP counter proof rejected ({code})")]
+    AppliedCounterProofRejected {
+        /// Stable payload-free diagnostic code.
+        code: &'static str,
+    },
     /// Cookie verification failed.
     #[error("IKE cookie verification failed")]
     CookieRejected,
@@ -133,6 +139,12 @@ impl IpsecLbError {
     #[must_use]
     pub const fn unsafe_resume(reason: &'static str) -> Self {
         Self::UnsafeResume { reason }
+    }
+
+    /// Build a redaction-safe applied-counter proof rejection.
+    #[must_use]
+    pub const fn applied_counter_proof_rejected(code: &'static str) -> Self {
+        Self::AppliedCounterProofRejected { code }
     }
 
     /// Build a redaction-safe ownership conflict.
