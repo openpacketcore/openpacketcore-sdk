@@ -3775,6 +3775,194 @@ fn swm_supported_features_missing_children_map_nested_bound_5005() {
 }
 
 #[test]
+fn swm_qos_profile_template_missing_children_map_nested_bound_5005() {
+    let vendor = encode_avp(
+        AvpHeader::ietf(AVP_VENDOR_ID, true),
+        &VENDOR_ID_3GPP.get().to_be_bytes(),
+    );
+    let profile_id = encode_avp(
+        AvpHeader::ietf(swm::AVP_QOS_PROFILE_ID, true),
+        &7_u32.to_be_bytes(),
+    );
+    let valid_profile_value = [vendor.clone(), profile_id.clone()].concat();
+    let valid_profile = encode_avp(
+        AvpHeader::ietf(swm::AVP_QOS_PROFILE_TEMPLATE, true),
+        &valid_profile_value,
+    );
+    let cases = [
+        (
+            AvpKey::ietf(AVP_VENDOR_ID),
+            vec![valid_profile.clone()],
+            profile_id.clone(),
+        ),
+        (
+            AvpKey::ietf(swm::AVP_QOS_PROFILE_ID),
+            Vec::new(),
+            vendor.clone(),
+        ),
+    ];
+
+    for (missing_key, preceding_profiles, malformed_profile_value) in cases {
+        let malformed_profile = encode_avp(
+            AvpHeader::ietf(swm::AVP_QOS_PROFILE_TEMPLATE, true),
+            &malformed_profile_value,
+        );
+        let preceding_wire_len = preceding_profiles.iter().map(Vec::len).sum::<usize>();
+        let mut qos_value = preceding_profiles.into_iter().flatten().collect::<Vec<_>>();
+        qos_value.extend_from_slice(&malformed_profile);
+        let qos = encode_avp(AvpHeader::ietf(swm::AVP_QOS_CAPABILITY, true), &qos_value);
+        let mut fields = valid_swm_der_fields();
+        fields.push(qos);
+        let raw = fields.into_iter().flatten().collect::<Vec<_>>();
+        let request = encode_request(
+            CommandFlags::request(true),
+            swm::COMMAND_DIAMETER_EAP,
+            swm::APPLICATION_ID,
+            &raw,
+        );
+        let message = decode_message(&request);
+        let (capability_offset, capability_avp) = find_avp_at(&message, swm::AVP_QOS_CAPABILITY);
+        let template_offset =
+            capability_offset + capability_avp.header.header_len() + preceding_wire_len;
+        let error =
+            parse_swm_diameter_eap_request_with_provenance(&message, DecodeContext::conservative())
+                .expect_err("missing QoS profile child must retain provenance");
+        let legacy = parse_swm_diameter_eap_request(&message, DecodeContext::conservative())
+            .expect_err("legacy parser retains the same nested failure");
+        assert_eq!(&legacy, error.decode_error());
+        assert_eq!(
+            error.decode_error().offset(),
+            template_offset + AVP_HEADER_LEN
+        );
+
+        let provenance = error
+            .missing_avp()
+            .expect("missing QoS profile child provenance");
+        assert_eq!(provenance.key(), missing_key);
+        let ancestors = provenance.ancestors();
+        assert_eq!(ancestors.len(), 2);
+        assert_eq!(ancestors[0].key(), AvpKey::ietf(swm::AVP_QOS_CAPABILITY));
+        assert_eq!(ancestors[0].offset(), capability_offset);
+        assert_eq!(
+            ancestors[1].key(),
+            AvpKey::ietf(swm::AVP_QOS_PROFILE_TEMPLATE)
+        );
+        assert_eq!(ancestors[1].offset(), template_offset);
+        assert_eq!(provenance.parent(), Some(ancestors[1]));
+
+        let request_envelope = envelope(&request);
+        let bound = DiameterRequestFailure::from_parser_error(
+            &request_envelope,
+            &request,
+            &error,
+            DecodeContext::conservative(),
+            APP_DICTIONARIES,
+            EncodeContext::default(),
+        )
+        .expect("sealed QoS omission must bind");
+        assert_eq!(bound.result_code(), RESULT_CODE_DIAMETER_MISSING_AVP);
+        let answer = encode_plan(
+            &request,
+            &request_envelope,
+            &bound,
+            DiameterErrorAnswerGrammar::Application,
+        );
+        let failed_wire = failed_avp_inner_wire(&answer);
+        let (remaining, failed_capability) = RawAvp::decode(&failed_wire, DecodeContext::default())
+            .expect("QoS-Capability Failed-AVP parent");
+        assert!(remaining.is_empty());
+        assert_eq!(
+            failed_capability.header.key(),
+            AvpKey::ietf(swm::AVP_QOS_CAPABILITY)
+        );
+        let failed_templates = failed_capability
+            .grouped_avps(DecodeContext::default())
+            .collect::<Result<Vec<_>, _>>()
+            .expect("QoS-Capability Failed-AVP child");
+        assert_eq!(failed_templates.len(), 1);
+        assert_eq!(
+            failed_templates[0].header.key(),
+            AvpKey::ietf(swm::AVP_QOS_PROFILE_TEMPLATE)
+        );
+        let failed_children = failed_templates[0]
+            .grouped_avps(DecodeContext::default())
+            .collect::<Result<Vec<_>, _>>()
+            .expect("QoS-Profile-Template Failed-AVP child");
+        assert_eq!(failed_children.len(), 1);
+        assert_eq!(failed_children[0].header.key(), missing_key);
+        assert_eq!(failed_children[0].header.flags.bits(), AvpFlags::MANDATORY);
+        assert_eq!(failed_children[0].value, &[0, 0, 0, 0]);
+    }
+}
+
+#[test]
+fn swm_empty_qos_capability_maps_missing_profile_template_to_bound_5005() {
+    let qos = encode_avp(AvpHeader::ietf(swm::AVP_QOS_CAPABILITY, true), &[]);
+    let mut fields = valid_swm_der_fields();
+    fields.push(qos);
+    let raw = fields.into_iter().flatten().collect::<Vec<_>>();
+    let request = encode_request(
+        CommandFlags::request(true),
+        swm::COMMAND_DIAMETER_EAP,
+        swm::APPLICATION_ID,
+        &raw,
+    );
+    let message = decode_message(&request);
+    let (capability_offset, capability_avp) = find_avp_at(&message, swm::AVP_QOS_CAPABILITY);
+    let error =
+        parse_swm_diameter_eap_request_with_provenance(&message, DecodeContext::conservative())
+            .expect_err("empty QoS capability must retain missing template provenance");
+    let legacy = parse_swm_diameter_eap_request(&message, DecodeContext::conservative())
+        .expect_err("legacy parser retains the same missing template failure");
+    assert_eq!(&legacy, error.decode_error());
+    assert_eq!(
+        error.decode_error().offset(),
+        capability_offset + capability_avp.header.header_len()
+    );
+    let provenance = error
+        .missing_avp()
+        .expect("missing QoS-Profile-Template provenance");
+    assert_eq!(
+        provenance.key(),
+        AvpKey::ietf(swm::AVP_QOS_PROFILE_TEMPLATE)
+    );
+    let parent = provenance.parent().expect("QoS-Capability parent");
+    assert_eq!(parent.key(), AvpKey::ietf(swm::AVP_QOS_CAPABILITY));
+    assert_eq!(parent.offset(), capability_offset);
+
+    let request_envelope = envelope(&request);
+    let bound = DiameterRequestFailure::from_parser_error(
+        &request_envelope,
+        &request,
+        &error,
+        DecodeContext::conservative(),
+        APP_DICTIONARIES,
+        EncodeContext::default(),
+    )
+    .expect("sealed missing QoS template must bind");
+    assert_eq!(bound.result_code(), RESULT_CODE_DIAMETER_MISSING_AVP);
+    let answer = encode_plan(
+        &request,
+        &request_envelope,
+        &bound,
+        DiameterErrorAnswerGrammar::Application,
+    );
+    let failed_wire = failed_avp_inner_wire(&answer);
+    let (remaining, failed_capability) = RawAvp::decode(&failed_wire, DecodeContext::default())
+        .expect("QoS-Capability Failed-AVP parent");
+    assert!(remaining.is_empty());
+    assert_eq!(failed_capability.header.key(), parent.key());
+    let failed_templates = failed_capability
+        .grouped_avps(DecodeContext::default())
+        .collect::<Result<Vec<_>, _>>()
+        .expect("missing QoS-Profile-Template child");
+    assert_eq!(failed_templates.len(), 1);
+    assert_eq!(failed_templates[0].header.key(), provenance.key());
+    assert_eq!(failed_templates[0].header.flags.bits(), AvpFlags::MANDATORY);
+    assert!(failed_templates[0].value.is_empty());
+}
+
+#[test]
 fn empty_request_provenance_preserves_existing_required_field_order() {
     let cases = [
         (

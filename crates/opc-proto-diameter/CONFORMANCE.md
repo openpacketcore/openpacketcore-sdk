@@ -276,6 +276,46 @@ malformed families/lengths fail closed, and diagnostic output reveals only
 presence. All three additions are optional, so absent fields preserve the
 previous DER/DEA bytes exactly.
 
+The remaining non-overload DER access-context slice is mapped below. Canonical
+builders use the TS 29.273 V19.2.0 flags; receivers enforce V/P and apply table
+7.2.3.1/1 note 2 by ignoring an understood outer M-bit mismatch.
+
+| AVP | TS 29.273 presence | Wire identity and cardinality | Typed SDK field | Positive / negative evidence |
+|:----|:-------------------|:------------------------------|:----------------|:-----------------------------|
+| `QoS-Capability` | Optional capability announcement | IETF 578, Grouped, M set, V/P clear, singleton; contains one or more ordered RFC 5777 `QoS-Profile-Template` 574 groups | `SwmQosCapability` / `SwmQosProfileTemplate` | Multiple profiles and repeated complete identities round trip; empty groups, missing/duplicate required children, wrong widths/flags, excessive counts, and unknown mandatory children fail |
+| `Visited-Network-Identifier` | Conditional: present when the ePDG is outside the UE home network | 3GPP 10415/600, OctetString, V+M set, P clear, singleton | `SwmVisitedNetworkIdentifier` | Two-digit MNC canonicalization and roaming fixture; malformed PLMN domains, vendor, flags, and duplicates fail |
+| `AAA-Failure-Indication` | Optional: only after a previously assigned AAA server is determined unavailable | 3GPP 10415/1518, Unsigned32, V set, M/P clear, singleton | `SwmAaaFailureIndication` | Defined bit zero round trips; a present zero mask and malformed width fail; reserved received bits are discarded and never re-originated as required by §8.2.3.21 |
+| `High-Priority-Access-Info` | Conditional: UE access-priority indication admitted by operator policy | 3GPP 10415/1542, Unsigned32, V set, M/P clear, singleton | reused `SwmHighPriorityAccessInfo` | Configured bit round trips; a present zero mask, malformed width, and invalid provenance fail; reserved received bits are discarded |
+
+`SwmDerAccessContext` is an application-side checked-construction input, not
+wire metadata. `SwmConditionalValue` distinguishes absent, locally configured,
+UE-provided, and AAA-derived values without logging values. The checked
+outbound builder accepts locally configured QoS/visited-PLMN data, an
+AAA-transport-derived server failure, and UE-provided high-priority access.
+Every other source and every prepopulated raw context field fails before
+encoding. It returns a wrapper that creates the typed request, encoded message,
+and an informational source snapshot together and exposes them immutably while
+the wrapper is retained. `into_parts` explicitly consumes that coupling; the
+snapshot then describes only the returned request/message at construction time.
+The ordinary builder remains a source-agnostic wire-validation and parser-replay
+boundary. Diameter does not encode provenance, so decode never guesses it.
+Product code still decides whether roaming, QoS announcement, server failover,
+and operator priority-admission conditions apply.
+
+RFC 5777 grouped values are bounded. Required `Vendor-Id` and
+`QoS-Profile-Id` children are exact singleton Unsigned32 values with strict
+base M/V/P flags. Complete profile templates remain ordered and repeatable as
+the RFC grammar permits. Under Preserve, optional extension children at both
+group levels are retained and re-emitted without a public raw-injection API;
+Drop removes them, Reject refuses them, and unknown M-set children always
+fail. Known grouped occurrence metadata now exempts only explicitly repeatable
+children from conservative duplicate rejection; undeclared nested keys remain
+singleton by default. An empty capability retains typed missing-template
+provenance, and a profile missing either required child retains the exact
+received `QoS-Capability` → `QoS-Profile-Template` path. The request-bound
+error-answer mapper can therefore synthesize the corresponding nested 5005
+`Failed-AVP` without parsing error text or choosing the wrong repeated profile.
+
 The SWm DER parser and transaction-envelope parser have additive provenance-
 aware entry points. Missing Session-Id, Auth-Application-Id, Origin-Host,
 Origin-Realm, Destination-Realm, Auth-Request-Type, or EAP-Payload can therefore
@@ -375,7 +415,7 @@ byte-for-byte and in wire order for a subsequent Diameter-EAP round. The separat
 `SWM_PROJECTED_PROFILE_DICTIONARIES` profile also marks APN-Configuration
 repeatable for explicitly configured peers. `Message::decode_with_dictionary`
 supports both with `DecodeContext::conservative()` while all undeclared,
-unknown, and nested grouped keys retain duplicate rejection. Supplying both
+unknown, and undeclared nested grouped keys retain duplicate rejection. Supplying both
 profiles is ambiguous and fails closed; typed `set_once` checks independently
 protect singleton fields. The opt-in profile remains an interoperability
 extension and is not a baseline SWm cardinality claim.

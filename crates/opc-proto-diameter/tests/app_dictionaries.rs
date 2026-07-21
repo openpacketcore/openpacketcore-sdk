@@ -7,12 +7,15 @@ use opc_proto_diameter::apps::rf::{
 };
 use opc_proto_diameter::apps::swm::{
     AllocationRetentionPriority, Ambr, ApnConfiguration, AuthRequestType, EpsSubscribedQosProfile,
-    PdnType, SwmAuthorizationOutcome, SwmCorrelatedDiameterEapExchange, SwmDiameterEapAnswer,
+    PdnType, SwmAaaFailureIndication, SwmAuthorizationOutcome, SwmConditionalValue,
+    SwmConditionalValueSource, SwmCorrelatedDiameterEapExchange, SwmDerAccessContext,
+    SwmDerAccessContextErrorCode, SwmDerAccessContextField, SwmDiameterEapAnswer,
     SwmDiameterEapAnswerEnvelope, SwmDiameterEapRequest, SwmDiameterEapRequestEnvelope,
     SwmDiameterResult, SwmDiameterTransaction, SwmEmergencyAuthorizationError,
     SwmEmergencyAuthorizationEvidence, SwmEmergencyAuthorizationPath, SwmEmergencyServices,
-    SwmMip6FeatureVector, SwmRatType, SwmRequestedSupportedFeatures, SwmResultCategory,
-    SwmSupportedFeatureList, SwmSupportedFeaturesRequirement, SwmTerminalInformation,
+    SwmHighPriorityAccessInfo, SwmMip6FeatureVector, SwmQosCapability, SwmQosProfileTemplate,
+    SwmRatType, SwmRequestedSupportedFeatures, SwmResultCategory, SwmSupportedFeatureList,
+    SwmSupportedFeaturesRequirement, SwmTerminalInformation, SwmVisitedNetworkIdentifier,
 };
 use opc_proto_diameter::{
     apps, base, ApplicationId, AvpCode, AvpDataType, AvpFlags, AvpHeader, AvpKey, CommandCode,
@@ -192,6 +195,50 @@ fn swm_dictionary_contains_application_command_and_avps() {
     assert_eq!(terminal.data_type(), AvpDataType::Grouped);
     assert!(der.find_avp_rule(terminal_key).is_some());
     assert!(!der.allows_multiple(terminal_key));
+
+    let remaining_access_avps = [
+        (
+            AvpKey::ietf(apps::swm::AVP_QOS_CAPABILITY),
+            AvpDataType::Grouped,
+            FlagRequirement::MustBeUnset,
+            FlagRequirement::MayBeSet,
+        ),
+        (
+            AvpKey::vendor(
+                apps::swm::AVP_VISITED_NETWORK_IDENTIFIER,
+                apps::VENDOR_ID_3GPP,
+            ),
+            AvpDataType::OctetString,
+            FlagRequirement::MustBeSet,
+            FlagRequirement::MayBeSet,
+        ),
+        (
+            AvpKey::vendor(apps::swm::AVP_AAA_FAILURE_INDICATION, apps::VENDOR_ID_3GPP),
+            AvpDataType::Unsigned32,
+            FlagRequirement::MustBeSet,
+            FlagRequirement::MayBeSet,
+        ),
+        (
+            AvpKey::vendor(
+                apps::swm::AVP_HIGH_PRIORITY_ACCESS_INFO,
+                apps::VENDOR_ID_3GPP,
+            ),
+            AvpDataType::Unsigned32,
+            FlagRequirement::MustBeSet,
+            FlagRequirement::MayBeSet,
+        ),
+    ];
+    for (key, data_type, vendor, mandatory) in remaining_access_avps {
+        let definition = dictionary
+            .find_avp(key)
+            .expect("remaining DER access AVP definition");
+        assert_eq!(definition.data_type(), data_type);
+        assert_eq!(definition.flags().vendor(), vendor);
+        assert_eq!(definition.flags().mandatory(), mandatory);
+        assert_eq!(definition.flags().protected(), FlagRequirement::MustBeUnset);
+        assert!(der.find_avp_rule(key).is_some());
+        assert!(!der.allows_multiple(key));
+    }
 
     let dea = dictionary
         .find_command(
@@ -516,6 +563,726 @@ fn swm_der_access_context_has_exact_wire_profile_and_round_trips() {
         Some(APN)
     );
     assert!(!format!("{parsed:?}").contains(APN));
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_der_remaining_access_context_round_trips_with_canonical_wire() {
+    const PROFILE_ID: u32 = 424_242;
+    let visited =
+        SwmVisitedNetworkIdentifier::new("234", "15").expect("synthetic two-digit MNC is valid");
+    assert_eq!(visited.as_str(), "mnc015.mcc234.3gppnetwork.org");
+    let qos = SwmQosCapability::new(vec![
+        SwmQosProfileTemplate::ietf_diameter(),
+        SwmQosProfileTemplate::new(VendorId::new(55_555), PROFILE_ID),
+    ])
+    .expect("distinct synthetic QoS profiles");
+    let context = SwmDerAccessContext {
+        qos_capability: SwmConditionalValue::LocallyConfigured(qos),
+        visited_network_identifier: SwmConditionalValue::LocallyConfigured(visited),
+        aaa_failure_indication: SwmConditionalValue::AaaDerived(
+            SwmAaaFailureIndication::previously_assigned_server_unavailable(),
+        ),
+        high_priority_access_info: SwmConditionalValue::UeProvided(
+            SwmHighPriorityAccessInfo::configured(),
+        ),
+    };
+    assert_eq!(
+        context.qos_capability.source(),
+        Some(SwmConditionalValueSource::LocallyConfigured)
+    );
+    assert_eq!(
+        context.aaa_failure_indication.source(),
+        Some(SwmConditionalValueSource::AaaDerived)
+    );
+    let context_debug = format!("{context:?}");
+    assert!(!context_debug.contains("mnc015"));
+    assert!(!context_debug.contains(&PROFILE_ID.to_string()));
+
+    let base_request = sample_swm_request();
+    let checked = apps::swm::build_swm_diameter_eap_request_with_access_context(
+        &base_request,
+        context,
+        0x1020_3040,
+        0x5060_7080,
+        EncodeContext::default(),
+    )
+    .expect("normative source matrix builds atomically");
+    let snapshot = checked.source_snapshot();
+    assert_eq!(
+        snapshot.qos_capability(),
+        Some(SwmConditionalValueSource::LocallyConfigured)
+    );
+    assert_eq!(
+        snapshot.visited_network_identifier(),
+        Some(SwmConditionalValueSource::LocallyConfigured)
+    );
+    assert_eq!(
+        snapshot.aaa_failure_indication(),
+        Some(SwmConditionalValueSource::AaaDerived)
+    );
+    assert_eq!(
+        snapshot.high_priority_access_info(),
+        Some(SwmConditionalValueSource::UeProvided)
+    );
+    let checked_debug = format!("{checked:?}");
+    assert!(!checked_debug.contains("mnc015"));
+    assert!(!checked_debug.contains(&PROFILE_ID.to_string()));
+    let request = checked.request().clone();
+    let encoded = encode_message(checked.message());
+    let built = apps::swm::build_swm_diameter_eap_request(
+        &request,
+        0x1020_3040,
+        0x5060_7080,
+        EncodeContext::default(),
+    )
+    .expect("remaining DER access context builds");
+    assert_eq!(encoded, encode_message(&built));
+    let (tail, decoded) = Message::decode_with_dictionary(
+        &encoded,
+        DecodeContext::conservative(),
+        SWM_BASELINE_DICTIONARIES,
+    )
+    .expect("dictionary accepts canonical remaining DER access context");
+    assert!(tail.is_empty());
+    let avps = decoded
+        .avps(DecodeContext::conservative())
+        .collect::<Result<Vec<_>, _>>()
+        .expect("canonical DER AVPs");
+
+    let qos_avp = avps
+        .iter()
+        .find(|avp| avp.header.key() == AvpKey::ietf(apps::swm::AVP_QOS_CAPABILITY))
+        .expect("QoS-Capability");
+    assert!(qos_avp.header.flags.is_mandatory());
+    assert!(!qos_avp.header.flags.is_vendor_specific());
+    assert!(!qos_avp.header.flags.is_protected());
+    let templates = qos_avp
+        .grouped_avps(DecodeContext::conservative())
+        .collect::<Result<Vec<_>, _>>()
+        .expect("QoS-Capability children");
+    assert_eq!(templates.len(), 2);
+    assert!(templates.iter().all(|template| {
+        template.header.key() == AvpKey::ietf(apps::swm::AVP_QOS_PROFILE_TEMPLATE)
+            && template.header.flags.is_mandatory()
+            && !template.header.flags.is_vendor_specific()
+            && !template.header.flags.is_protected()
+    }));
+    let second_children = templates[1]
+        .grouped_avps(DecodeContext::conservative())
+        .collect::<Result<Vec<_>, _>>()
+        .expect("QoS profile children");
+    assert_eq!(second_children.len(), 2);
+    assert_eq!(
+        second_children[0].header.key(),
+        AvpKey::ietf(base::AVP_VENDOR_ID)
+    );
+    assert_eq!(
+        second_children[1].header.key(),
+        AvpKey::ietf(apps::swm::AVP_QOS_PROFILE_ID)
+    );
+    assert!(second_children
+        .iter()
+        .all(|child| child.header.flags.is_mandatory()));
+
+    let visited_avp = avps
+        .iter()
+        .find(|avp| {
+            avp.header.key()
+                == AvpKey::vendor(
+                    apps::swm::AVP_VISITED_NETWORK_IDENTIFIER,
+                    apps::VENDOR_ID_3GPP,
+                )
+        })
+        .expect("Visited-Network-Identifier");
+    assert!(visited_avp.header.flags.is_mandatory());
+    assert_eq!(visited_avp.value, b"mnc015.mcc234.3gppnetwork.org");
+
+    for code in [
+        apps::swm::AVP_AAA_FAILURE_INDICATION,
+        apps::swm::AVP_HIGH_PRIORITY_ACCESS_INFO,
+    ] {
+        let avp = avps
+            .iter()
+            .find(|avp| avp.header.key() == AvpKey::vendor(code, apps::VENDOR_ID_3GPP))
+            .expect("defined access-context indication");
+        assert!(!avp.header.flags.is_mandatory());
+        assert!(avp.header.flags.is_vendor_specific());
+        assert!(!avp.header.flags.is_protected());
+        assert_eq!(avp.value, 1u32.to_be_bytes());
+    }
+
+    let parsed = apps::swm::parse_swm_diameter_eap_request(&decoded, DecodeContext::conservative())
+        .expect("remaining DER access context parses");
+    assert_eq!(parsed, request);
+    let debug = format!("{parsed:?}");
+    assert!(!debug.contains("mnc015"));
+    assert!(!debug.contains(&PROFILE_ID.to_string()));
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_der_access_context_provenance_matrix_is_fail_closed_and_atomic() {
+    let visited = SwmVisitedNetworkIdentifier::new("001", "01").expect("synthetic PLMN");
+    let qos = SwmQosCapability::new(vec![SwmQosProfileTemplate::ietf_diameter()])
+        .expect("one required profile");
+    let cases = [
+        (
+            SwmDerAccessContext {
+                qos_capability: SwmConditionalValue::UeProvided(qos.clone()),
+                ..SwmDerAccessContext::default()
+            },
+            SwmDerAccessContextField::QosCapability,
+        ),
+        (
+            SwmDerAccessContext {
+                visited_network_identifier: SwmConditionalValue::AaaDerived(visited.clone()),
+                ..SwmDerAccessContext::default()
+            },
+            SwmDerAccessContextField::VisitedNetworkIdentifier,
+        ),
+        (
+            SwmDerAccessContext {
+                aaa_failure_indication: SwmConditionalValue::LocallyConfigured(
+                    SwmAaaFailureIndication::previously_assigned_server_unavailable(),
+                ),
+                ..SwmDerAccessContext::default()
+            },
+            SwmDerAccessContextField::AaaFailureIndication,
+        ),
+        (
+            SwmDerAccessContext {
+                high_priority_access_info: SwmConditionalValue::LocallyConfigured(
+                    SwmHighPriorityAccessInfo::configured(),
+                ),
+                ..SwmDerAccessContext::default()
+            },
+            SwmDerAccessContextField::HighPriorityAccessInfo,
+        ),
+    ];
+    for (context, expected_field) in cases {
+        let request = sample_swm_request();
+        let error = apps::swm::build_swm_diameter_eap_request_with_access_context(
+            &request,
+            context,
+            1,
+            2,
+            EncodeContext::default(),
+        )
+        .expect_err("invalid provenance must fail closed");
+        let error = error.context_error().expect("context failure");
+        assert_eq!(
+            error.code(),
+            SwmDerAccessContextErrorCode::InvalidProvenance
+        );
+        assert_eq!(error.field(), expected_field);
+        assert!(!format!("{error:?}").contains("mnc001"));
+    }
+    let request = sample_swm_request();
+    let inactive = apps::swm::build_swm_diameter_eap_request_with_access_context(
+        &request,
+        SwmDerAccessContext {
+            high_priority_access_info: SwmConditionalValue::UeProvided(
+                SwmHighPriorityAccessInfo::from_value(0),
+            ),
+            ..SwmDerAccessContext::default()
+        },
+        1,
+        2,
+        EncodeContext::default(),
+    )
+    .expect_err("present HPA without HPA_Configured is contradictory")
+    .context_error()
+    .expect("context failure");
+    assert_eq!(
+        inactive.code(),
+        SwmDerAccessContextErrorCode::InactiveIndication
+    );
+    assert_eq!(
+        inactive.field(),
+        SwmDerAccessContextField::HighPriorityAccessInfo
+    );
+
+    let mut prepopulated_qos = sample_swm_request();
+    prepopulated_qos.qos_capability = Some(qos.clone());
+    let mut prepopulated_visited = sample_swm_request();
+    prepopulated_visited.visited_network_identifier = Some(visited.clone());
+    let mut prepopulated_aaa = sample_swm_request();
+    prepopulated_aaa.aaa_failure_indication =
+        Some(SwmAaaFailureIndication::previously_assigned_server_unavailable());
+    let mut prepopulated_priority = sample_swm_request();
+    prepopulated_priority.high_priority_access_info = Some(SwmHighPriorityAccessInfo::configured());
+    for (prepopulated, expected_field) in [
+        (prepopulated_qos, SwmDerAccessContextField::QosCapability),
+        (
+            prepopulated_visited,
+            SwmDerAccessContextField::VisitedNetworkIdentifier,
+        ),
+        (
+            prepopulated_aaa,
+            SwmDerAccessContextField::AaaFailureIndication,
+        ),
+        (
+            prepopulated_priority,
+            SwmDerAccessContextField::HighPriorityAccessInfo,
+        ),
+    ] {
+        let conflict = apps::swm::build_swm_diameter_eap_request_with_access_context(
+            &prepopulated,
+            SwmDerAccessContext::default(),
+            1,
+            2,
+            EncodeContext::default(),
+        )
+        .expect_err("prepopulated raw context field must fail closed")
+        .context_error()
+        .expect("context failure");
+        assert_eq!(
+            conflict.code(),
+            SwmDerAccessContextErrorCode::PrepopulatedField
+        );
+        assert_eq!(conflict.field(), expected_field);
+    }
+
+    for (mcc, mnc) in [("01", "001"), ("001", "1"), ("0x1", "01")] {
+        let error =
+            SwmVisitedNetworkIdentifier::new(mcc, mnc).expect_err("malformed PLMN component");
+        assert_eq!(
+            error.code(),
+            SwmDerAccessContextErrorCode::InvalidVisitedNetworkIdentifier
+        );
+    }
+    let empty = SwmQosCapability::new(Vec::new()).expect_err("empty capability");
+    assert_eq!(
+        empty.code(),
+        SwmDerAccessContextErrorCode::EmptyQosCapability
+    );
+    let excessive_profiles = SwmQosCapability::new(
+        (0..129)
+            .map(|id| SwmQosProfileTemplate::new(VendorId::new(0), id))
+            .collect(),
+    )
+    .expect_err("profile-template count must remain bounded");
+    assert_eq!(
+        excessive_profiles.code(),
+        SwmDerAccessContextErrorCode::TooManyQosProfiles
+    );
+    let request = sample_swm_request();
+    let before = encode_message(
+        &apps::swm::build_swm_diameter_eap_request(&request, 1, 2, EncodeContext::default())
+            .expect("baseline DER"),
+    );
+    let checked = apps::swm::build_swm_diameter_eap_request_with_access_context(
+        &request,
+        SwmDerAccessContext::default(),
+        1,
+        2,
+        EncodeContext::default(),
+    )
+    .expect("all-absent DER");
+    let absent_snapshot = checked.source_snapshot();
+    assert_eq!(absent_snapshot.qos_capability(), None);
+    assert_eq!(absent_snapshot.visited_network_identifier(), None);
+    assert_eq!(absent_snapshot.aaa_failure_indication(), None);
+    assert_eq!(absent_snapshot.high_priority_access_info(), None);
+    let after = encode_message(checked.message());
+    assert_eq!(after, before, "absent access context is byte-compatible");
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_der_access_context_accepts_known_m_mismatch_and_canonicalizes_reserved_bits() {
+    let profile = encode_qos_profile_template_avp(VendorId::new(0), 0, &[]);
+    let qos = encode_qos_capability_avp(false, &[profile], &[]);
+    let visited = encode_raw_vendor_avp(
+        apps::swm::AVP_VISITED_NETWORK_IDENTIFIER,
+        apps::VENDOR_ID_3GPP,
+        false,
+        b"mnc015.mcc234.3gppnetwork.org",
+    );
+    let aaa_failure = encode_raw_vendor_avp(
+        apps::swm::AVP_AAA_FAILURE_INDICATION,
+        apps::VENDOR_ID_3GPP,
+        true,
+        &3u32.to_be_bytes(),
+    );
+    let high_priority = encode_raw_vendor_avp(
+        apps::swm::AVP_HIGH_PRIORITY_ACCESS_INFO,
+        apps::VENDOR_ID_3GPP,
+        true,
+        &3u32.to_be_bytes(),
+    );
+    let raw = build_raw_swm_der_with_extras(
+        Some(apps::swm::APPLICATION_ID.get()),
+        3,
+        &[0x02, 0x17, 0x00, 0x04],
+        &[qos, visited, aaa_failure, high_priority],
+    );
+    let wire = encode_message(&raw);
+    let (tail, message) =
+        Message::decode_with_dictionary(&wire, DecodeContext::default(), SWM_BASELINE_DICTIONARIES)
+            .expect("known SWm M mismatches are receive-compatible");
+    assert!(tail.is_empty());
+    let parsed = apps::swm::parse_swm_diameter_eap_request(&message, DecodeContext::default())
+        .expect("known SWm M mismatches parse");
+    assert_eq!(
+        parsed
+            .qos_capability
+            .as_ref()
+            .map(|qos| qos.profiles().len()),
+        Some(1)
+    );
+    assert_eq!(
+        parsed
+            .visited_network_identifier
+            .as_ref()
+            .map(SwmVisitedNetworkIdentifier::as_str),
+        Some("mnc015.mcc234.3gppnetwork.org")
+    );
+    assert_eq!(
+        parsed.aaa_failure_indication,
+        Some(SwmAaaFailureIndication::previously_assigned_server_unavailable())
+    );
+    assert_eq!(
+        parsed.high_priority_access_info,
+        Some(SwmHighPriorityAccessInfo::configured())
+    );
+
+    let canonical =
+        apps::swm::build_swm_diameter_eap_request(&parsed, 1, 2, EncodeContext::default())
+            .expect("canonical rebuild");
+    let canonical_wire = encode_message(&canonical);
+    let canonical_message = decode_message(&canonical_wire);
+    let canonical_avps = canonical_message
+        .avps(DecodeContext::default())
+        .collect::<Result<Vec<_>, _>>()
+        .expect("canonical AVPs");
+    let canonical_qos = canonical_avps
+        .iter()
+        .find(|avp| avp.header.code == apps::swm::AVP_QOS_CAPABILITY)
+        .expect("canonical QoS");
+    let canonical_visited = canonical_avps
+        .iter()
+        .find(|avp| avp.header.code == apps::swm::AVP_VISITED_NETWORK_IDENTIFIER)
+        .expect("canonical visited network");
+    assert!(canonical_qos.header.flags.is_mandatory());
+    assert!(canonical_visited.header.flags.is_mandatory());
+    for code in [
+        apps::swm::AVP_AAA_FAILURE_INDICATION,
+        apps::swm::AVP_HIGH_PRIORITY_ACCESS_INFO,
+    ] {
+        let avp = canonical_avps
+            .iter()
+            .find(|avp| avp.header.code == code)
+            .expect("canonical indication");
+        assert!(!avp.header.flags.is_mandatory());
+        assert_eq!(avp.value, 1u32.to_be_bytes());
+    }
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_der_access_context_rejects_malformed_shapes_and_preserves_optional_extensions() {
+    let parse_extra = |extra: &BytesMut, ctx: DecodeContext| {
+        let raw = build_raw_swm_der_with_extras(
+            Some(apps::swm::APPLICATION_ID.get()),
+            3,
+            &[0x02, 0x17, 0x00, 0x04],
+            std::slice::from_ref(extra),
+        );
+        let wire = encode_message(&raw);
+        apps::swm::parse_swm_diameter_eap_request(&decode_message(&wire), ctx)
+    };
+
+    for invalid in [
+        encode_raw_vendor_avp(
+            apps::swm::AVP_AAA_FAILURE_INDICATION,
+            apps::VENDOR_ID_3GPP,
+            false,
+            &0u32.to_be_bytes(),
+        ),
+        encode_raw_vendor_avp(
+            apps::swm::AVP_HIGH_PRIORITY_ACCESS_INFO,
+            apps::VENDOR_ID_3GPP,
+            false,
+            &0u32.to_be_bytes(),
+        ),
+        encode_raw_vendor_avp(
+            apps::swm::AVP_AAA_FAILURE_INDICATION,
+            apps::VENDOR_ID_3GPP,
+            false,
+            &[0, 0, 1],
+        ),
+        encode_raw_vendor_avp(
+            apps::swm::AVP_VISITED_NETWORK_IDENTIFIER,
+            apps::VENDOR_ID_3GPP,
+            true,
+            b"visited.example",
+        ),
+        encode_raw_vendor_avp(
+            apps::swm::AVP_VISITED_NETWORK_IDENTIFIER,
+            VendorId::new(9_999),
+            true,
+            b"mnc015.mcc234.3gppnetwork.org",
+        ),
+    ] {
+        parse_extra(&invalid, DecodeContext::default())
+            .expect_err("malformed access-context AVP must fail closed");
+    }
+
+    let empty_qos = encode_qos_capability_avp(true, &[], &[]);
+    let empty_template = encode_raw_avp(apps::swm::AVP_QOS_PROFILE_TEMPLATE, true, &[]);
+    let qos_with_empty_template = encode_qos_capability_avp(true, &[empty_template], &[]);
+    let vendor_only_template = {
+        let vendor = encode_raw_avp(base::AVP_VENDOR_ID, true, &0u32.to_be_bytes());
+        encode_raw_avp(apps::swm::AVP_QOS_PROFILE_TEMPLATE, true, &vendor)
+    };
+    let qos_missing_profile_id = encode_qos_capability_avp(true, &[vendor_only_template], &[]);
+    let profile_id_only_template = {
+        let profile_id = encode_raw_avp(apps::swm::AVP_QOS_PROFILE_ID, true, &0u32.to_be_bytes());
+        encode_raw_avp(apps::swm::AVP_QOS_PROFILE_TEMPLATE, true, &profile_id)
+    };
+    let qos_missing_vendor_id = encode_qos_capability_avp(true, &[profile_id_only_template], &[]);
+    let malformed_profile_id = {
+        let mut children = BytesMut::new();
+        children.extend_from_slice(&encode_raw_avp(
+            base::AVP_VENDOR_ID,
+            true,
+            &0u32.to_be_bytes(),
+        ));
+        children.extend_from_slice(&encode_raw_avp(
+            apps::swm::AVP_QOS_PROFILE_ID,
+            true,
+            &[0, 0, 0],
+        ));
+        encode_raw_avp(apps::swm::AVP_QOS_PROFILE_TEMPLATE, true, &children)
+    };
+    let qos_malformed_profile_id = encode_qos_capability_avp(true, &[malformed_profile_id], &[]);
+    let duplicated_profile = encode_qos_profile_template_avp(VendorId::new(0), 0, &[]);
+    let middle_profile = encode_qos_profile_template_avp(VendorId::new(55_555), 7, &[]);
+    let qos_repeated_identity = encode_qos_capability_avp(
+        true,
+        &[
+            duplicated_profile.clone(),
+            middle_profile,
+            duplicated_profile,
+        ],
+        &[],
+    );
+    for invalid in [
+        empty_qos,
+        qos_with_empty_template,
+        qos_missing_vendor_id,
+        qos_missing_profile_id,
+        qos_malformed_profile_id,
+    ] {
+        parse_extra(&invalid, DecodeContext::default())
+            .expect_err("invalid QoS grouped cardinality or width must fail closed");
+    }
+    let repeated = parse_extra(&qos_repeated_identity, DecodeContext::default())
+        .expect("RFC 5777 permits repeated complete profile templates");
+    assert_eq!(
+        repeated
+            .qos_capability
+            .as_ref()
+            .map(|capability| capability.profiles().len()),
+        Some(3)
+    );
+    let repeated_raw = build_raw_swm_der_with_extras(
+        Some(apps::swm::APPLICATION_ID.get()),
+        3,
+        &[0x02, 0x17, 0x00, 0x04],
+        &[qos_repeated_identity],
+    );
+    let repeated_wire = encode_message(&repeated_raw);
+    Message::decode_with_dictionary(
+        &repeated_wire,
+        DecodeContext::conservative(),
+        SWM_BASELINE_DICTIONARIES,
+    )
+    .expect("grouped dictionary cardinality permits repeatable profile templates");
+    let repeated_rebuilt =
+        apps::swm::build_swm_diameter_eap_request(&repeated, 1, 2, EncodeContext::default())
+            .expect("repeated QoS profiles rebuild");
+    let repeated_rebuilt_wire = encode_message(&repeated_rebuilt);
+    let repeated_reparsed = apps::swm::parse_swm_diameter_eap_request(
+        &decode_message(&repeated_rebuilt_wire),
+        DecodeContext::default(),
+    )
+    .expect("repeated QoS profiles reparse");
+    let identities = repeated_reparsed
+        .qos_capability
+        .as_ref()
+        .expect("reparsed QoS capability")
+        .profiles()
+        .iter()
+        .map(|profile| (profile.vendor_id(), profile.profile_id()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        identities,
+        vec![
+            (VendorId::new(0), 0),
+            (VendorId::new(55_555), 7),
+            (VendorId::new(0), 0),
+        ],
+        "rebuild must preserve repeated identities and wire order"
+    );
+
+    let vendor = encode_raw_avp(base::AVP_VENDOR_ID, true, &0u32.to_be_bytes());
+    let profile_id = encode_raw_avp(apps::swm::AVP_QOS_PROFILE_ID, true, &0u32.to_be_bytes());
+    let malformed_templates = [
+        {
+            let mut children = BytesMut::new();
+            children.extend_from_slice(&vendor);
+            children.extend_from_slice(&vendor);
+            children.extend_from_slice(&profile_id);
+            encode_raw_avp(apps::swm::AVP_QOS_PROFILE_TEMPLATE, true, &children)
+        },
+        {
+            let mut children = BytesMut::new();
+            children.extend_from_slice(&vendor);
+            children.extend_from_slice(&profile_id);
+            children.extend_from_slice(&profile_id);
+            encode_raw_avp(apps::swm::AVP_QOS_PROFILE_TEMPLATE, true, &children)
+        },
+        encode_raw_avp(
+            apps::swm::AVP_QOS_PROFILE_TEMPLATE,
+            true,
+            &[
+                encode_raw_avp(base::AVP_VENDOR_ID, true, &[0, 0, 0]).as_ref(),
+                profile_id.as_ref(),
+            ]
+            .concat(),
+        ),
+        encode_raw_avp(
+            apps::swm::AVP_QOS_PROFILE_TEMPLATE,
+            false,
+            &[vendor.as_ref(), profile_id.as_ref()].concat(),
+        ),
+        encode_raw_avp_with_header(
+            AvpHeader::vendor(
+                apps::swm::AVP_QOS_PROFILE_TEMPLATE,
+                VendorId::new(9_999),
+                true,
+            ),
+            &[vendor.as_ref(), profile_id.as_ref()].concat(),
+        ),
+        encode_raw_avp_with_header(
+            AvpHeader::ietf(apps::swm::AVP_QOS_PROFILE_TEMPLATE, true).with_flags(
+                AvpFlags::from_bits(AvpFlags::MANDATORY | AvpFlags::PROTECTED),
+            ),
+            &[vendor.as_ref(), profile_id.as_ref()].concat(),
+        ),
+    ];
+    for template in malformed_templates {
+        let qos = encode_qos_capability_avp(true, &[template], &[]);
+        parse_extra(&qos, DecodeContext::default())
+            .expect_err("QoS-Profile-Template requires exact M/V/P flags and cardinality");
+    }
+
+    for invalid_vendor in [
+        encode_raw_avp(base::AVP_VENDOR_ID, false, &0u32.to_be_bytes()),
+        encode_raw_avp_with_header(
+            AvpHeader::vendor(base::AVP_VENDOR_ID, VendorId::new(9_999), true),
+            &0u32.to_be_bytes(),
+        ),
+        encode_raw_avp_with_header(
+            AvpHeader::ietf(base::AVP_VENDOR_ID, true).with_flags(AvpFlags::from_bits(
+                AvpFlags::MANDATORY | AvpFlags::PROTECTED,
+            )),
+            &0u32.to_be_bytes(),
+        ),
+    ] {
+        let template = encode_raw_avp(
+            apps::swm::AVP_QOS_PROFILE_TEMPLATE,
+            true,
+            &[invalid_vendor.as_ref(), profile_id.as_ref()].concat(),
+        );
+        let qos = encode_qos_capability_avp(true, &[template], &[]);
+        parse_extra(&qos, DecodeContext::default())
+            .expect_err("Vendor-Id child requires exact M/V/P flags");
+    }
+
+    for invalid_profile_id in [
+        encode_raw_avp(apps::swm::AVP_QOS_PROFILE_ID, false, &0u32.to_be_bytes()),
+        encode_raw_avp_with_header(
+            AvpHeader::vendor(apps::swm::AVP_QOS_PROFILE_ID, VendorId::new(9_999), true),
+            &0u32.to_be_bytes(),
+        ),
+        encode_raw_avp_with_header(
+            AvpHeader::ietf(apps::swm::AVP_QOS_PROFILE_ID, true).with_flags(AvpFlags::from_bits(
+                AvpFlags::MANDATORY | AvpFlags::PROTECTED,
+            )),
+            &0u32.to_be_bytes(),
+        ),
+    ] {
+        let template = encode_raw_avp(
+            apps::swm::AVP_QOS_PROFILE_TEMPLATE,
+            true,
+            &[vendor.as_ref(), invalid_profile_id.as_ref()].concat(),
+        );
+        let qos = encode_qos_capability_avp(true, &[template], &[]);
+        parse_extra(&qos, DecodeContext::default())
+            .expect_err("QoS-Profile-Id child requires exact M/V/P flags");
+    }
+
+    let bounded_profiles = (0..127)
+        .map(|id| encode_qos_profile_template_avp(VendorId::new(0), id, &[]))
+        .collect::<Vec<_>>();
+    let overflow_extensions = [
+        encode_raw_avp(AvpCode::new(900_010), false, &[]),
+        encode_raw_avp(AvpCode::new(900_011), false, &[]),
+    ];
+    let excessive_total_children =
+        encode_qos_capability_avp(true, &bounded_profiles, &overflow_extensions);
+    parse_extra(
+        &excessive_total_children,
+        DecodeContext {
+            unknown_ie_policy: UnknownIePolicy::Drop,
+            ..DecodeContext::default()
+        },
+    )
+    .expect_err("QoS-Capability total grouped-child bound must include dropped extensions");
+
+    let optional_profile_extension = encode_raw_avp(AvpCode::new(900_001), false, &[0xaa]);
+    let optional_capability_extension = encode_raw_avp(AvpCode::new(900_002), false, &[0xbb]);
+    let profile =
+        encode_qos_profile_template_avp(VendorId::new(0), 0, &[optional_profile_extension]);
+    let qos = encode_qos_capability_avp(true, &[profile], &[optional_capability_extension]);
+    let preserve_ctx = DecodeContext {
+        unknown_ie_policy: UnknownIePolicy::Preserve,
+        ..DecodeContext::default()
+    };
+    let preserved = parse_extra(&qos, preserve_ctx).expect("optional extensions preserve");
+    let preserved_qos = preserved.qos_capability.as_ref().expect("typed QoS");
+    assert_eq!(preserved_qos.additional_avps().len(), 1);
+    assert_eq!(preserved_qos.profiles()[0].additional_avps().len(), 1);
+    let replay =
+        apps::swm::build_swm_diameter_eap_request(&preserved, 1, 2, EncodeContext::default())
+            .expect("preserved extensions replay");
+    let replay_wire = encode_message(&replay);
+    let replay_message = decode_message(&replay_wire);
+    assert_eq!(
+        apps::swm::parse_swm_diameter_eap_request(&replay_message, preserve_ctx)
+            .expect("replayed extensions parse"),
+        preserved
+    );
+
+    let drop_ctx = DecodeContext {
+        unknown_ie_policy: UnknownIePolicy::Drop,
+        ..DecodeContext::default()
+    };
+    let dropped = parse_extra(&qos, drop_ctx).expect("optional extensions drop");
+    let dropped_qos = dropped.qos_capability.as_ref().expect("typed QoS");
+    assert!(dropped_qos.additional_avps().is_empty());
+    assert!(dropped_qos.profiles()[0].additional_avps().is_empty());
+    parse_extra(&qos, DecodeContext::conservative())
+        .expect_err("strict unknown policy rejects optional extensions");
+
+    let mandatory_unknown = encode_raw_avp(AvpCode::new(900_003), true, &[0xcc]);
+    let profile = encode_qos_profile_template_avp(VendorId::new(0), 0, &[]);
+    let qos = encode_qos_capability_avp(true, &[profile], &[mandatory_unknown]);
+    parse_extra(&qos, drop_ctx).expect_err("unknown mandatory extension always fails");
 }
 
 #[test]
@@ -3228,12 +3995,16 @@ fn sample_swm_request() -> SwmDiameterEapRequest {
         rat_type: None,
         service_selection: None,
         mip6_feature_vector: None,
+        qos_capability: None,
+        visited_network_identifier: None,
+        aaa_failure_indication: None,
         supported_features: vec![],
         ue_local_ip_address: None,
         auth_request_type: AuthRequestType::AuthorizeAuthenticate,
         eap_payload: vec![0x02, 0x17, 0x00, 0x08, 0x32, 0x01, 0x02, 0x03].into(),
         emergency_services: None,
         terminal_information: None,
+        high_priority_access_info: None,
         state_avps: vec![b"opaque-state".to_vec()],
     }
 }
@@ -3328,8 +4099,13 @@ fn sample_ims_apn_configuration() -> ApnConfiguration {
 
 #[cfg(feature = "app-rf")]
 fn encode_raw_avp(code: AvpCode, mandatory: bool, value: &[u8]) -> BytesMut {
+    encode_raw_avp_with_header(AvpHeader::ietf(code, mandatory), value)
+}
+
+#[cfg(feature = "app-rf")]
+fn encode_raw_avp_with_header(header: AvpHeader, value: &[u8]) -> BytesMut {
     let avp = RawAvp {
-        header: AvpHeader::ietf(code, mandatory),
+        header,
         value,
         padding: &[],
     };
@@ -3392,6 +4168,45 @@ fn encode_supported_features_avp(
         mandatory,
         &children,
     )
+}
+
+#[cfg(feature = "app-swm")]
+fn encode_qos_profile_template_avp(
+    vendor_id: VendorId,
+    profile_id: u32,
+    extra_children: &[BytesMut],
+) -> BytesMut {
+    let mut children = BytesMut::new();
+    children.extend_from_slice(&encode_raw_avp(
+        base::AVP_VENDOR_ID,
+        true,
+        &vendor_id.get().to_be_bytes(),
+    ));
+    children.extend_from_slice(&encode_raw_avp(
+        apps::swm::AVP_QOS_PROFILE_ID,
+        true,
+        &profile_id.to_be_bytes(),
+    ));
+    for child in extra_children {
+        children.extend_from_slice(child);
+    }
+    encode_raw_avp(apps::swm::AVP_QOS_PROFILE_TEMPLATE, true, &children)
+}
+
+#[cfg(feature = "app-swm")]
+fn encode_qos_capability_avp(
+    mandatory: bool,
+    profiles: &[BytesMut],
+    extra_children: &[BytesMut],
+) -> BytesMut {
+    let mut children = BytesMut::new();
+    for profile in profiles {
+        children.extend_from_slice(profile);
+    }
+    for child in extra_children {
+        children.extend_from_slice(child);
+    }
+    encode_raw_avp(apps::swm::AVP_QOS_CAPABILITY, mandatory, &children)
 }
 
 #[cfg(feature = "app-swm")]

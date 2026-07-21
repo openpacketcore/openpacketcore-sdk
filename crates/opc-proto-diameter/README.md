@@ -104,7 +104,9 @@ charging decisions, watchdog policy, or a carrier-ready EPC/ePDG product claim.
   dictionary decoding recognizes their standard cardinality. The typed surface
   retains repeated `Failed-AVP` but rejects redirect AVPs and result 3006.
   Diameter-EAP DER/DEA also expose typed `MIP6-Feature-Vector` and repeated
-  3GPP `Supported-Features`; DER additionally exposes `UE-Local-IP-Address`.
+  3GPP `Supported-Features`; DER additionally exposes `UE-Local-IP-Address`,
+  RFC 5777 `QoS-Capability`, `Visited-Network-Identifier`,
+  `AAA-Failure-Indication`, and reused `High-Priority-Access-Info`.
   `SwmMip6FeatureVector::gtpv2_only()` emits the exact
   `0x0000400000000000` capability; despite the legacy AVP name, that bit is
   independent of bearer IP family and is not limited to IPv6. Meanwhile,
@@ -113,23 +115,72 @@ charging decisions, watchdog policy, or a carrier-ready EPC/ePDG product claim.
   `DIAMETER_SUCCESS` before a DEA can authorize mobility, accepts the TS
   collective PMIP6/GTPv2 selection, and rejects unoffered non-NBM bits.
   The codec does not own a multi-round EAP procedure state machine: a consumer
-  must carry the same access context into each continuation DER. For example,
-  a GTPv2-only deployment can opt in without constructing raw AVPs:
+  must carry the same access context into each continuation DER. For an attach
+  where all four conditional access-context facts have independently been
+  established, a GTPv2-only deployment can build the request without raw AVPs:
 
   ```rust
   use std::net::IpAddr;
   use opc_proto_diameter::apps::swm::{
-      SwmDiameterEapRequest, SwmMip6FeatureVector,
-      SwmRequestedSupportedFeatures,
+      build_swm_diameter_eap_request_with_access_context,
+      SwmAaaFailureIndication, SwmConditionalValue, SwmDerAccessContext,
+      SwmBuiltDerAccessContextRequest, SwmDiameterEapRequest,
+      SwmHighPriorityAccessInfo, SwmMip6FeatureVector, SwmQosCapability,
+      SwmQosProfileTemplate, SwmRequestedSupportedFeatures,
+      SwmVisitedNetworkIdentifier,
   };
+  use opc_proto_diameter::VendorId;
+  use opc_protocol::EncodeContext;
 
-  fn apply_access_context(request: &mut SwmDiameterEapRequest, ue_ip: IpAddr) {
+  fn build_access_context(
+      request: &mut SwmDiameterEapRequest,
+      ue_ip: IpAddr,
+      hop_by_hop_identifier: u32,
+      end_to_end_identifier: u32,
+  ) -> Result<SwmBuiltDerAccessContextRequest, Box<dyn std::error::Error>> {
       request.mip6_feature_vector = Some(SwmMip6FeatureVector::gtpv2_only());
       request.supported_features =
           vec![SwmRequestedSupportedFeatures::swm_discovery()];
       request.ue_local_ip_address = Some(ue_ip);
+
+      let access_context = SwmDerAccessContext {
+          qos_capability: SwmConditionalValue::LocallyConfigured(
+              SwmQosCapability::new(vec![
+                  SwmQosProfileTemplate::new(VendorId::new(0), 0),
+              ])?,
+          ),
+          visited_network_identifier: SwmConditionalValue::LocallyConfigured(
+              SwmVisitedNetworkIdentifier::new("001", "01")?,
+          ),
+          aaa_failure_indication: SwmConditionalValue::AaaDerived(
+              SwmAaaFailureIndication::previously_assigned_server_unavailable(),
+          ),
+          high_priority_access_info: SwmConditionalValue::UeProvided(
+              SwmHighPriorityAccessInfo::configured(),
+          ),
+      };
+      Ok(build_swm_diameter_eap_request_with_access_context(
+          request,
+          access_context,
+          hop_by_hop_identifier,
+          end_to_end_identifier,
+          EncodeContext::default(),
+      )?)
   }
   ```
+
+  Use `SwmConditionalValue::Absent` for each condition that does not apply;
+  in particular, omit the visited-network identifier at home and omit the AAA
+  failure indication during an ordinary server selection. Provenance is a
+  local construction fact and is intentionally not inferred by the wire
+  parser. The checked builder owns the typed request, encoded message, and an
+  informational source snapshot in one immutable wrapper while it is retained.
+  Consuming `into_parts` ends that coupling. The ordinary typed
+  wire builder remains available for parser replay but cannot attest source.
+  Debug output exposes only source/presence/count metadata. Builders
+  set the current TS 29.273 flags, while understood outer M-bit mismatches are
+  accepted and canonicalized on rebuild. RFC 5777 optional grouped extensions
+  follow `UnknownIePolicy`; unknown mandatory children always fail.
 
   Preserve these fields when replacing the EAP payload and `State` values for
   a subsequent round; parsing and rebuilding a typed request retains the exact
