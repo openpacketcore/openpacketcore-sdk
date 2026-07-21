@@ -7,10 +7,14 @@ use async_trait::async_trait;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{
+    outbound_binding::{validate_outbound_request, OutboundSaPolicyExpectation},
+    InstalledOutboundSaBinding, OutboundSaBindingError,
+};
+use crate::{
     AllocateSpiRequest, InstallPolicyRequest, InstallSaRequest, LinuxXfrmBackend, QuerySaRequest,
     RekeyPolicyRequest, RekeySaRequest, RelocateSaRequest, RemovePolicyRequest, RemoveSaRequest,
-    SaRelocationIdentity, SaState, SpiAllocation, XfrmBackend, XfrmCapability, XfrmError,
-    XfrmProbe,
+    SaParameters, SaRelocationIdentity, SaState, SpiAllocation, XfrmBackend, XfrmCapability,
+    XfrmCompositeInstallRequest, XfrmError, XfrmProbe,
 };
 
 /// Maximum number of admitted Linux XFRM operations waiting for the dedicated
@@ -52,6 +56,11 @@ impl NetworkNamespaceBinding {
                 operation: "network_namespace_binding",
             })
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn for_test(device: u64, inode: u64) -> Self {
+        Self { device, inode }
     }
 }
 
@@ -203,6 +212,64 @@ impl NamespaceBoundLinuxXfrmBackend {
         permit.send(command(reply_sender));
         reply_receiver.await.map_err(|_| lost_reply.error())?
     }
+
+    async fn dispatch_outbound_binding(
+        &self,
+        expectation: OutboundSaPolicyExpectation,
+        supplied_sa: SaParameters,
+    ) -> Result<(), OutboundSaBindingError> {
+        let permit =
+            self.inner
+                .sender
+                .reserve()
+                .await
+                .map_err(|_| OutboundSaBindingError::Readback {
+                    source: XfrmError::Unavailable,
+                })?;
+        let (reply_sender, reply_receiver) = oneshot::channel();
+        permit.send(NamespaceCommand::ValidateOutboundBinding(
+            Box::new(OutboundBindingValidation {
+                expectation,
+                supplied_sa,
+            }),
+            reply_sender,
+        ));
+        reply_receiver
+            .await
+            .map_err(|_| OutboundSaBindingError::Readback {
+                source: XfrmError::Unavailable,
+            })?
+    }
+
+    pub(crate) async fn validate_current_outbound_sa_binding(
+        &self,
+        expectation: OutboundSaPolicyExpectation,
+        supplied_sa: SaParameters,
+    ) -> Result<(), OutboundSaBindingError> {
+        self.dispatch_outbound_binding(expectation, supplied_sa)
+            .await
+    }
+
+    /// Recover an opaque outbound-SA direction binding after process loss.
+    ///
+    /// The caller supplies the retained install intent, but that declaration is
+    /// not authority. The namespace actor performs exact `GETPOLICY` followed
+    /// by `GETSA` readback and validates the kernel policy direction, action,
+    /// selector, mark, interface ID, sole template, ESP identity, source,
+    /// request ID, and mode before issuing a binding. Missing, ambiguous,
+    /// malformed, or mismatched state fails closed.
+    pub async fn recover_installed_outbound_sa_binding(
+        &self,
+        request: XfrmCompositeInstallRequest,
+    ) -> Result<InstalledOutboundSaBinding, OutboundSaBindingError> {
+        let expectation = validate_outbound_request(&request)?;
+        let binding =
+            InstalledOutboundSaBinding::new(self.network_namespace_binding(), expectation);
+        binding
+            .validate_current(self, &request.sa.parameters, binding.id())
+            .await?;
+        Ok(binding)
+    }
 }
 
 enum NamespaceCommand {
@@ -222,6 +289,10 @@ enum NamespaceCommand {
     InstallPolicy(InstallPolicyRequest, oneshot::Sender<Result<(), XfrmError>>),
     RekeyPolicy(RekeyPolicyRequest, oneshot::Sender<Result<(), XfrmError>>),
     RemovePolicy(RemovePolicyRequest, oneshot::Sender<Result<(), XfrmError>>),
+    ValidateOutboundBinding(
+        Box<OutboundBindingValidation>,
+        oneshot::Sender<Result<(), OutboundSaBindingError>>,
+    ),
     Probe(oneshot::Sender<Result<XfrmProbe, XfrmError>>),
     SaRelocationCapability(oneshot::Sender<Result<XfrmCapability, XfrmError>>),
 }
@@ -264,6 +335,16 @@ impl NamespaceCommand {
             Self::RemovePolicy(request, reply) => {
                 let _ = reply.send(backend.remove_policy(request).await);
             }
+            Self::ValidateOutboundBinding(validation, reply) => {
+                let _ = reply.send(
+                    backend
+                        .validate_outbound_sa_binding(
+                            &validation.expectation,
+                            &validation.supplied_sa,
+                        )
+                        .await,
+                );
+            }
             Self::Probe(reply) => {
                 let _ = reply.send(backend.probe().await);
             }
@@ -293,6 +374,9 @@ impl NamespaceCommand {
             Self::QuerySaRelocationIdentity(_, reply) => {
                 let _ = reply.send(Err(error));
             }
+            Self::ValidateOutboundBinding(_, reply) => {
+                let _ = reply.send(Err(OutboundSaBindingError::Readback { source: error }));
+            }
             Self::Probe(reply) => {
                 let _ = reply.send(Err(error));
             }
@@ -301,6 +385,11 @@ impl NamespaceCommand {
             }
         }
     }
+}
+
+struct OutboundBindingValidation {
+    expectation: OutboundSaPolicyExpectation,
+    supplied_sa: SaParameters,
 }
 
 #[async_trait]
@@ -404,12 +493,17 @@ mod tests {
 
     use super::*;
     use crate::dscp::{LinuxXfrmDscpMarkingConfig, XfrmDscpRuntime};
-    use crate::linux::{LinuxXfrmBackendConfig, LinuxXfrmTransport, SensitiveBuffer};
+    use crate::linux::{
+        test_outbound_binding_readback_bodies, LinuxXfrmBackendConfig, LinuxXfrmTransport,
+        SensitiveBuffer,
+    };
+    use crate::outbound_binding::validate_outbound_request;
     use crate::{
         Algorithm, AuthAlgorithm, DscpCodepoint, IpAddress, KeyMaterial, LifetimeConfig,
         PolicyParameters, SaParameters, SaRelocationDirection, SaRelocationEncap,
-        SaRelocationSelector, XfrmAction, XfrmBackendKind, XfrmDirection, XfrmId, XfrmMode,
-        XfrmRequestId, XfrmSelector, XfrmTemplate,
+        SaRelocationSelector, XfrmAction, XfrmBackendKind, XfrmDirection, XfrmId,
+        XfrmInstallOwnership, XfrmMode, XfrmRequestId, XfrmSelector, XfrmStagedInstall,
+        XfrmTemplate,
     };
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -525,6 +619,17 @@ mod tests {
             }],
             mark: None,
             if_id: None,
+        }
+    }
+
+    fn outbound_install_request() -> XfrmCompositeInstallRequest {
+        XfrmCompositeInstallRequest {
+            sa: InstallSaRequest {
+                parameters: sa_parameters(),
+            },
+            policy: InstallPolicyRequest {
+                parameters: policy_parameters(),
+            },
         }
     }
 
@@ -885,6 +990,234 @@ mod tests {
         state.release();
 
         wait_until(|| state.calls.load(Ordering::Acquire) == 2).await;
+    }
+
+    type BindingResponse = Result<Option<SensitiveBuffer>, XfrmError>;
+
+    #[derive(Debug, Clone)]
+    struct BindingTransport {
+        responses: Arc<Mutex<VecDeque<BindingResponse>>>,
+        operations: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl BindingTransport {
+        fn new(responses: impl IntoIterator<Item = BindingResponse>) -> Self {
+            Self {
+                responses: Arc::new(Mutex::new(responses.into_iter().collect())),
+                operations: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn operations(&self) -> Vec<&'static str> {
+            self.operations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+    }
+
+    impl LinuxXfrmTransport for BindingTransport {
+        fn transact(
+            &self,
+            operation: &'static str,
+            _request: &[u8],
+            _expected_sequence: u32,
+            _config: LinuxXfrmBackendConfig,
+        ) -> Result<Option<SensitiveBuffer>, XfrmError> {
+            self.operations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(operation);
+            self.responses
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .pop_front()
+                .unwrap_or(Err(XfrmError::Unavailable))
+        }
+
+        fn probe(&self, _config: LinuxXfrmBackendConfig) -> XfrmProbe {
+            XfrmProbe::unsupported()
+        }
+    }
+
+    #[tokio::test]
+    async fn staged_commit_is_the_only_fresh_outbound_binding_issuance_path() {
+        let request = outbound_install_request();
+        let expected_id = validate_outbound_request(&request).unwrap().id();
+        let (policy, sa) = test_outbound_binding_readback_bodies(&request).unwrap();
+        let transport = BindingTransport::new([Ok(None), Ok(None), Ok(Some(policy)), Ok(Some(sa))]);
+        let capture = transport.clone();
+        let backend = Arc::new(
+            LinuxXfrmBackend::with_transport(transport)
+                .bind_current_network_namespace()
+                .unwrap(),
+        );
+
+        let binding = XfrmStagedInstall::new(request)
+            .run_and_commit_outbound_sa_policy(Arc::clone(&backend))
+            .await
+            .unwrap();
+
+        assert_eq!(binding.id(), expected_id);
+        assert_eq!(binding.namespace(), backend.network_namespace_binding());
+        assert_eq!(
+            capture.operations(),
+            vec![
+                "install_sa",
+                "install_policy",
+                "query_outbound_policy_binding",
+                "query_outbound_sa_binding",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn acknowledged_install_without_exact_readback_never_mints_a_binding() {
+        let transport = BindingTransport::new([Ok(None), Ok(None), Ok(None)]);
+        let capture = transport.clone();
+        let backend = Arc::new(
+            LinuxXfrmBackend::with_transport(transport)
+                .bind_current_network_namespace()
+                .unwrap(),
+        );
+        let staged = XfrmStagedInstall::new(outbound_install_request());
+        let journal = staged.journal();
+
+        let error = staged
+            .run_and_commit_outbound_sa_policy(backend)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, OutboundSaBindingError::Readback { .. }));
+        assert_eq!(journal.ownership(), XfrmInstallOwnership::Complete);
+        assert_eq!(
+            capture.operations(),
+            vec![
+                "install_sa",
+                "install_policy",
+                "query_outbound_policy_binding",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn ambiguous_all_zero_key_readback_fails_closed_before_fresh_mint() {
+        let mut request = outbound_install_request();
+        request.sa.parameters.auth.as_mut().unwrap().1 = KeyMaterial::new(vec![0; 32]);
+        request.sa.parameters.crypt.as_mut().unwrap().1 = KeyMaterial::new(vec![0; 16]);
+        let (policy, sa) = test_outbound_binding_readback_bodies(&request).unwrap();
+        let transport = BindingTransport::new([Ok(None), Ok(None), Ok(Some(policy)), Ok(Some(sa))]);
+        let backend = Arc::new(
+            LinuxXfrmBackend::with_transport(transport)
+                .bind_current_network_namespace()
+                .unwrap(),
+        );
+        let staged = XfrmStagedInstall::new(request);
+        let journal = staged.journal();
+
+        let error = staged
+            .run_and_commit_outbound_sa_policy(backend)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.code(),
+            "xfrm_outbound_sa_binding_key_readback_unavailable"
+        );
+        assert_eq!(
+            format!("{error:?}"),
+            "OutboundSaBindingError { code: \"xfrm_outbound_sa_binding_key_readback_unavailable\" }"
+        );
+        assert_eq!(journal.ownership(), XfrmInstallOwnership::Complete);
+    }
+
+    #[tokio::test]
+    async fn partial_staged_install_never_returns_an_outbound_binding() {
+        let transport = BindingTransport::new([
+            Ok(None),
+            Err(XfrmError::io(
+                "install_policy",
+                std::io::Error::other("test failure"),
+            )),
+            Ok(None),
+        ]);
+        let capture = transport.clone();
+        let backend = Arc::new(
+            LinuxXfrmBackend::with_transport(transport)
+                .bind_current_network_namespace()
+                .unwrap(),
+        );
+
+        let error = XfrmStagedInstall::new(outbound_install_request())
+            .run_and_commit_outbound_sa_policy(backend)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, OutboundSaBindingError::Install { .. }));
+        assert_eq!(
+            capture.operations(),
+            vec!["install_sa", "install_policy", "remove_sa"]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_binding_observer_never_commits_or_returns_authority() {
+        let state = Arc::new(BlockingState::new());
+        let backend = Arc::new(
+            LinuxXfrmBackend::with_transport(BlockingTransport {
+                state: Arc::clone(&state),
+            })
+            .bind_current_network_namespace()
+            .unwrap(),
+        );
+        let staged = XfrmStagedInstall::new(outbound_install_request());
+        let journal = staged.journal();
+        let observer = tokio::spawn(staged.run_and_commit_outbound_sa_policy(backend));
+        wait_until(|| state.calls.load(Ordering::Acquire) == 1).await;
+
+        observer.abort();
+        let _ = observer.await;
+        state.release();
+        wait_until(|| state.calls.load(Ordering::Acquire) == 2).await;
+        wait_until(|| journal.ownership() == XfrmInstallOwnership::Complete).await;
+
+        assert_ne!(journal.ownership(), XfrmInstallOwnership::Committed);
+    }
+
+    #[tokio::test]
+    async fn process_loss_recovery_reproduces_id_only_after_actor_readback() {
+        let request = outbound_install_request();
+        let expected_id = validate_outbound_request(&request).unwrap().id();
+        let (policy, sa) = test_outbound_binding_readback_bodies(&request).unwrap();
+        let transport = BindingTransport::new([
+            Ok(Some(policy.clone())),
+            Ok(Some(sa.clone())),
+            Ok(Some(policy)),
+            Ok(Some(sa)),
+        ]);
+        let capture = transport.clone();
+        let backend = LinuxXfrmBackend::with_transport(transport)
+            .bind_current_network_namespace()
+            .unwrap();
+
+        let binding = backend
+            .recover_installed_outbound_sa_binding(request.clone())
+            .await
+            .unwrap();
+        assert_eq!(binding.id(), expected_id);
+        binding
+            .validate_current(&backend, &request.sa.parameters, expected_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            capture.operations(),
+            vec![
+                "query_outbound_policy_binding",
+                "query_outbound_sa_binding",
+                "query_outbound_policy_binding",
+                "query_outbound_sa_binding",
+            ]
+        );
     }
 
     #[derive(Debug, Clone)]

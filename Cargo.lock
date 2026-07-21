@@ -2680,6 +2680,7 @@ dependencies = [
  "opc-linux-xfrm-sys",
  "opc-proto-ikev2",
  "opc-types",
+ "sha2 0.10.9",
  "subtle",
  "thiserror 2.0.18",
  "tokio",

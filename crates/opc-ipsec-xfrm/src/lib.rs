@@ -21,6 +21,20 @@
 //! can pin backend execution to the calling thread's already-selected network
 //! namespace without exposing its filesystem identity.
 //!
+//! [`XfrmStagedInstall::run_and_commit_outbound_sa_policy`] issues an opaque,
+//! key-free [`InstalledOutboundSaBinding`] only after an exact ESP SA plus sole
+//! outbound allow-policy is acknowledged and committed. After process loss,
+//! [`NamespaceBoundLinuxXfrmBackend::recover_installed_outbound_sa_binding`]
+//! reissues that authority only after actor-local `GETPOLICY` and `GETSA`
+//! validation. [`OutboundSaBindingId`] is safe to persist for correlation but
+//! is never authority. Kernel key bytes stay in zeroizing readback buffers and
+//! are compared in constant time with transient caller-supplied key material;
+//! neither the live binding nor its ID retains keys or key-derived hashes.
+//! Kernel-lockdown GETSA key redaction and intentionally all-zero key material
+//! are indistinguishable, so both fail closed before fresh mint or recovery
+//! with `xfrm_outbound_sa_binding_key_readback_unavailable`; algorithm shape is
+//! never accepted as a substitute for exact key proof.
+//!
 //! Raw Linux netlink work stays in [`opc_linux_xfrm_sys`]; this crate is safe
 //! Rust and never performs `unsafe` operations.
 
@@ -36,6 +50,7 @@ pub mod linux;
 pub mod mock;
 pub mod model;
 mod namespace;
+mod outbound_binding;
 pub mod staged;
 pub mod unsupported;
 
@@ -74,6 +89,9 @@ pub use model::{
 };
 pub use namespace::{NamespaceBoundLinuxXfrmBackend, LINUX_XFRM_NAMESPACE_ACTOR_CAPACITY};
 pub use opc_types::DscpCodepoint;
+pub use outbound_binding::{
+    InstalledOutboundSaBinding, OutboundSaBindingError, OutboundSaBindingId,
+};
 pub use staged::{
     XfrmIndeterminateOperations, XfrmInstallCommitError, XfrmInstallJournal, XfrmInstallObject,
     XfrmInstallOwnership, XfrmInstallRecoveryClassification, XfrmInstallRecoveryError,

@@ -6,11 +6,14 @@ use std::env;
 use std::fs;
 use std::io;
 use std::process::{Command, Output};
+use std::sync::Arc;
 
 use opc_ipsec_xfrm::{
-    Algorithm, AuthAlgorithm, InstallSaRequest, IpAddress, KeyMaterial, LifetimeConfig,
-    LinuxXfrmBackend, NamespaceBoundLinuxXfrmBackend, QuerySaRequest, RemoveSaRequest,
-    SaParameters, XfrmBackend, XfrmId, XfrmMode, XfrmSelector,
+    Algorithm, AuthAlgorithm, InstallPolicyRequest, InstallSaRequest, InstalledOutboundSaBinding,
+    IpAddress, KeyMaterial, LifetimeConfig, LinuxXfrmBackend, NamespaceBoundLinuxXfrmBackend,
+    PolicyParameters, QuerySaRequest, RemovePolicyRequest, RemoveSaRequest, SaParameters,
+    XfrmAction, XfrmBackend, XfrmCompositeInstallRequest, XfrmDirection, XfrmId, XfrmMode,
+    XfrmRequestId, XfrmSelector, XfrmStagedInstall, XfrmTemplate,
 };
 
 const IPPROTO_ESP: u8 = 50;
@@ -89,6 +92,112 @@ fn shared_sa() -> SaParameters {
     }
 }
 
+fn outbound_binding_request() -> XfrmCompositeInstallRequest {
+    let mut sa = shared_sa();
+    sa.selector = XfrmSelector::new(ip([10, 33, 0, 1]), ip([10, 33, 0, 2]), 1);
+    sa.request_id = XfrmRequestId::new(333);
+    sa.replay_window = 64;
+    let policy = PolicyParameters {
+        selector: sa.selector.clone(),
+        direction: XfrmDirection::Out,
+        action: XfrmAction::Allow,
+        priority: 100,
+        templates: vec![XfrmTemplate {
+            id: sa.id,
+            source_address: sa.source_address,
+            request_id: sa.request_id,
+            mode: sa.mode,
+        }],
+        mark: sa.mark,
+        if_id: sa.if_id,
+    };
+    XfrmCompositeInstallRequest {
+        sa: InstallSaRequest { parameters: sa },
+        policy: InstallPolicyRequest { parameters: policy },
+    }
+}
+
+fn configure_packet_path(namespace: &str) -> io::Result<()> {
+    run(
+        "ip",
+        &["netns", "exec", namespace, "ip", "link", "set", "lo", "up"],
+    )?;
+    run(
+        "ip",
+        &[
+            "netns", "exec", namespace, "ip", "link", "add", "opcxfrm0", "type", "dummy",
+        ],
+    )?;
+    run(
+        "ip",
+        &[
+            "netns", "exec", namespace, "ip", "link", "set", "opcxfrm0", "up",
+        ],
+    )?;
+    run(
+        "ip",
+        &[
+            "netns",
+            "exec",
+            namespace,
+            "ip",
+            "address",
+            "add",
+            "192.0.2.1/24",
+            "dev",
+            "opcxfrm0",
+        ],
+    )?;
+    run(
+        "ip",
+        &[
+            "netns",
+            "exec",
+            namespace,
+            "ip",
+            "address",
+            "add",
+            "10.33.0.1/32",
+            "dev",
+            "lo",
+        ],
+    )?;
+    run(
+        "ip",
+        &[
+            "netns",
+            "exec",
+            namespace,
+            "ip",
+            "route",
+            "add",
+            "10.33.0.2/32",
+            "dev",
+            "opcxfrm0",
+            "src",
+            "10.33.0.1",
+        ],
+    )?;
+    run(
+        "ip",
+        &[
+            "netns",
+            "exec",
+            namespace,
+            "ip",
+            "neighbor",
+            "replace",
+            "192.0.2.2",
+            "lladdr",
+            "02:00:00:00:00:02",
+            "nud",
+            "permanent",
+            "dev",
+            "opcxfrm0",
+        ],
+    )
+}
+
 fn install_in_namespace(
     namespace: String,
 ) -> Result<NamespaceBoundLinuxXfrmBackend, Box<dyn std::error::Error + Send + Sync>> {
@@ -104,6 +213,31 @@ fn install_in_namespace(
     })
     .join()
     .map_err(|_| io::Error::other("namespace installer thread failed"))?
+}
+
+type BindingInstall = (
+    Arc<NamespaceBoundLinuxXfrmBackend>,
+    InstalledOutboundSaBinding,
+    XfrmCompositeInstallRequest,
+);
+
+fn install_binding_in_namespace(
+    namespace: String,
+) -> Result<BindingInstall, Box<dyn std::error::Error + Send + Sync>> {
+    std::thread::spawn(move || {
+        let file = fs::File::open(format!("/run/netns/{namespace}"))?;
+        nix::sched::setns(file, nix::sched::CloneFlags::CLONE_NEWNET)?;
+        let backend = Arc::new(LinuxXfrmBackend::new().bind_current_network_namespace()?);
+        let request = outbound_binding_request();
+        let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+        let binding = runtime.block_on(
+            XfrmStagedInstall::new(request.clone())
+                .run_and_commit_outbound_sa_policy(Arc::clone(&backend)),
+        )?;
+        Ok((backend, binding, request))
+    })
+    .join()
+    .map_err(|_| io::Error::other("namespace binding installer thread failed"))?
 }
 
 #[tokio::test]
@@ -134,6 +268,83 @@ async fn identical_sas_remain_isolated_between_namespace_bound_actors(
 
     drop(backend_a);
     drop(backend_b);
+    drop(namespaces);
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires root, CAP_NET_ADMIN, Linux XFRM, iproute2, ping, and named netns support"]
+async fn outbound_binding_installs_recovers_and_transforms_first_packet(
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if env::var("OPC_XFRM_RUN_NAMESPACE_PRIVILEGED").as_deref() != Ok("1") {
+        eprintln!("skipping: set OPC_XFRM_RUN_NAMESPACE_PRIVILEGED=1 on a privileged Linux host");
+        return Ok(());
+    }
+
+    let namespaces = TestNamespaces::provision()?;
+    let namespace = &namespaces.names[0];
+    configure_packet_path(namespace)?;
+    let (backend, installed, request) = install_binding_in_namespace(namespace.clone())?;
+    let recovered = match backend
+        .recover_installed_outbound_sa_binding(request.clone())
+        .await
+    {
+        Ok(binding) => binding,
+        Err(error) => {
+            eprintln!(
+                "binding recovery failed: code={}, source={:?}",
+                error.code(),
+                std::error::Error::source(&error)
+            );
+            return Err(error.into());
+        }
+    };
+    assert_eq!(installed.id(), recovered.id());
+
+    // A response is not expected because the dummy link has no peer. The
+    // outbound packet must nevertheless cross policy lookup and ESP output.
+    let _ = command(
+        "ip",
+        &[
+            "netns",
+            "exec",
+            namespace,
+            "ping",
+            "-c",
+            "1",
+            "-W",
+            "1",
+            "-I",
+            "10.33.0.1",
+            "10.33.0.2",
+        ],
+    )?;
+
+    let query = QuerySaRequest::new(
+        request.sa.parameters.id.destination,
+        request.sa.parameters.id.protocol,
+        request.sa.parameters.id.spi,
+    );
+    let state = backend.query_sa(query).await?;
+    assert!(
+        state.lifetime_current.packets >= 1,
+        "first packet did not traverse the outbound ESP SA"
+    );
+
+    backend
+        .remove_policy(RemovePolicyRequest::new(
+            request.policy.parameters.selector,
+            request.policy.parameters.direction,
+        ))
+        .await?;
+    backend
+        .remove_sa(RemoveSaRequest::new(
+            request.sa.parameters.id.destination,
+            request.sa.parameters.id.protocol,
+            request.sa.parameters.id.spi,
+        ))
+        .await?;
+    drop(backend);
     drop(namespaces);
     Ok(())
 }

@@ -85,8 +85,90 @@ closes the queue and lets the detached actor drain without blocking `Drop`.
   readback alone cannot distinguish an identical foreign replacement. Both
   supervised APIs require a live Tokio runtime and otherwise return a typed,
   redaction-safe runtime error.
+- `InstalledOutboundSaBinding` is an opaque, unforgeable direction authority
+  for one exact ESP SA and its sole outbound allow-policy. The only fresh mint
+  is `XfrmStagedInstall::run_and_commit_outbound_sa_policy`, after both kernel
+  acknowledgements and journal commit. After process loss,
+  `NamespaceBoundLinuxXfrmBackend::recover_installed_outbound_sa_binding`
+  performs actor-local `GETPOLICY` followed by `GETSA` before minting a new
+  binding. Both paths reject inbound/block policies, mismatched selectors,
+  marks or interface IDs, ambiguous templates, and unsupported kernel
+  attributes. A wildcard template SPI is accepted only when the template and
+  SA carry the same nonzero request ID.
 - With feature `ikev2`, the crate also exports Child SA KEYMAT and negotiation
   mappers from `opc-proto-ikev2` into explicit XFRM install requests.
+
+## Opaque outbound-SA binding
+
+Use the binding-returning staged path when later work must prove that an SA is
+the outbound member of an installed SA/policy pair:
+
+```rust,no_run
+use std::sync::Arc;
+
+use opc_ipsec_xfrm::{
+    InstalledOutboundSaBinding, NamespaceBoundLinuxXfrmBackend,
+    OutboundSaBindingError, XfrmCompositeInstallRequest, XfrmStagedInstall,
+};
+
+async fn install_outbound(
+    backend: Arc<NamespaceBoundLinuxXfrmBackend>,
+    request: XfrmCompositeInstallRequest,
+) -> Result<InstalledOutboundSaBinding, OutboundSaBindingError> {
+    XfrmStagedInstall::new(request)
+        .run_and_commit_outbound_sa_policy(backend)
+        .await
+}
+```
+
+Persist `binding.id().to_bytes()` only as a correlation value. An
+`OutboundSaBindingId` is deliberately constructible from persisted bytes and
+is never authority by itself; the live opaque binding and fresh actor-local
+validation remain mandatory. Restart recovery uses retained install intent:
+
+```rust,no_run
+use opc_ipsec_xfrm::{
+    InstalledOutboundSaBinding, NamespaceBoundLinuxXfrmBackend,
+    OutboundSaBindingError, XfrmCompositeInstallRequest,
+};
+
+async fn recover_outbound(
+    backend: &NamespaceBoundLinuxXfrmBackend,
+    request: XfrmCompositeInstallRequest,
+) -> Result<InstalledOutboundSaBinding, OutboundSaBindingError> {
+    backend
+        .recover_installed_outbound_sa_binding(request)
+        .await
+}
+```
+
+The binding and its stable ID are key-free: they retain algorithm identity and
+key lengths, but never key bytes or key-derived hashes. This avoids creating a
+second long-lived key-custody path alongside the product's HKMS integration.
+At every recovery/use boundary, the supplied zeroizing `SaParameters` key
+material is compared in constant time with key bytes from the zeroizing GETSA
+response; those bytes are never copied into the binding, ID, logs, or errors.
+The product remains responsible for key custody and for supplying the intended
+SA parameters.
+
+Linux lockdown can redact every GETSA key byte to zero without marking the
+response. That wire shape is indistinguishable from intentionally configured
+all-zero key material. The SDK therefore never falls back to algorithm shape:
+either case fails closed with
+`xfrm_outbound_sa_binding_key_readback_unavailable`. Fresh staged issuance
+performs exact readback before journal commit or binding mint, so this failure
+leaves a caller-held journal clone in the recoverable `Complete` state and
+returns no authority. Recovery/use fails with the same code. Deployments whose
+kernel lockdown policy redacts XFRM secrets cannot use this exact binding (and
+the counter-repin operations gated by it) unless the platform provides readable
+exact GETSA key material; product startup/readiness should surface this stable
+capability failure.
+
+Linux ESN SAs encode the fixed one-byte replay window as zero, as required by
+the XFRM UAPI, and carry the complete window in `XFRMA_REPLAY_ESN_VAL` only.
+Readback rejects mixed, duplicated, or flag-inconsistent replay
+representations. Dynamic counters and last-used timestamps are permitted, but
+unmodeled semantic SA or policy attributes fail closed.
 
 ## Usage
 
