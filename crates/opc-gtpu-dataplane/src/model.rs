@@ -146,6 +146,193 @@ pub struct GtpDevice {
     pub ifindex: u32,
 }
 
+/// Explicit caller attestation that the prior writer of a persistent eBPF
+/// GTP-U graph has stopped.
+///
+/// This proof is intentionally separate from [`CurrentEbpfGraphDrainProof`]:
+/// stopping the old process authorizes ownership recovery, but it does not by
+/// itself authorize deleting retained forwarding/session entries. The backend
+/// still acquires its own host-global namespace lease and proves the exact
+/// current-schema graph and live-program state before mutation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CurrentEbpfGraphWriterProof {
+    _private: (),
+}
+
+impl CurrentEbpfGraphWriterProof {
+    /// Attest that the process which previously owned the graph is stopped.
+    #[must_use]
+    pub const fn previous_writer_stopped() -> Self {
+        Self { _private: () }
+    }
+}
+
+/// Explicit caller attestation that every session represented by an orphaned
+/// current-schema eBPF graph and all traffic using it have been drained.
+///
+/// Supplying this value authorizes recovery when otherwise-valid forwarding
+/// maps remain populated. It never bypasses schema, pin, program, hook, lease,
+/// or interface-identity validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CurrentEbpfGraphDrainProof {
+    _private: (),
+}
+
+impl CurrentEbpfGraphDrainProof {
+    /// Attest that sessions and traffic represented by the orphan graph are
+    /// drained and its retained forwarding entries may be removed.
+    #[must_use]
+    pub const fn sessions_and_traffic_drained() -> Self {
+        Self { _private: () }
+    }
+}
+
+/// Request to recover one orphaned current-schema eBPF pin graph.
+///
+/// `pin_namespace` selects the stable directory below the configured bpffs
+/// root. An optional `replacement_device` is validated independently in the
+/// caller's current network namespace; its mutable ifindex is deliberately not
+/// part of the persistent graph lease identity. Finalizers may omit it after
+/// both the old and replacement namespaces have gone.
+#[derive(Clone, PartialEq, Eq)]
+pub struct CurrentEbpfGraphRecoveryRequest {
+    pin_namespace: String,
+    replacement_device: Option<GtpDevice>,
+    writer_proof: CurrentEbpfGraphWriterProof,
+    drain_proof: Option<CurrentEbpfGraphDrainProof>,
+}
+
+impl CurrentEbpfGraphRecoveryRequest {
+    /// Build a recovery request which requires every forwarding map to be
+    /// empty.
+    #[must_use]
+    pub fn new(
+        pin_namespace: impl Into<String>,
+        writer_proof: CurrentEbpfGraphWriterProof,
+    ) -> Self {
+        Self {
+            pin_namespace: pin_namespace.into(),
+            replacement_device: None,
+            writer_proof,
+            drain_proof: None,
+        }
+    }
+
+    /// Require the named replacement interface to retain this exact ifindex
+    /// and require both of its SDK tc slots to be empty before recovery.
+    #[must_use]
+    pub fn with_replacement_device(mut self, replacement_device: GtpDevice) -> Self {
+        self.replacement_device = Some(replacement_device);
+        self
+    }
+
+    /// Authorize removal of a validated graph whose forwarding maps remain
+    /// populated after the product has drained all represented sessions.
+    #[must_use]
+    pub const fn with_drain_proof(mut self, drain_proof: CurrentEbpfGraphDrainProof) -> Self {
+        self.drain_proof = Some(drain_proof);
+        self
+    }
+
+    /// Return the stable pin namespace below the backend's configured root.
+    #[must_use]
+    pub fn pin_namespace(&self) -> &str {
+        &self.pin_namespace
+    }
+
+    /// Return the independently validated replacement interface identity.
+    #[must_use]
+    pub const fn replacement_device(&self) -> Option<&GtpDevice> {
+        self.replacement_device.as_ref()
+    }
+
+    /// Return the prior-writer stop attestation.
+    #[must_use]
+    pub const fn writer_proof(&self) -> CurrentEbpfGraphWriterProof {
+        self.writer_proof
+    }
+
+    /// Return the optional populated-graph drain attestation.
+    #[must_use]
+    pub const fn drain_proof(&self) -> Option<CurrentEbpfGraphDrainProof> {
+        self.drain_proof
+    }
+}
+
+impl fmt::Debug for CurrentEbpfGraphRecoveryRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CurrentEbpfGraphRecoveryRequest")
+            .field("pin_namespace", &"<redacted-pin-namespace>")
+            .field(
+                "replacement_device",
+                &self
+                    .replacement_device
+                    .as_ref()
+                    .map(|_| "<redacted-interface-identity>"),
+            )
+            .field("writer_proof", &self.writer_proof)
+            .field("drain_proof", &self.drain_proof)
+            .finish()
+    }
+}
+
+/// Stable reason current-schema orphan recovery was refused before graph
+/// deletion was committed.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CurrentEbpfGraphRecoveryRefusal {
+    /// The replacement interface name no longer resolves to its requested
+    /// ifindex.
+    ReplacementInterfaceIdentityChanged,
+    /// This backend instance already manages the replacement attachment or
+    /// the requested persistent pin namespace.
+    ManagedAttachment,
+    /// Another process holds the host-global lease for this pin namespace.
+    ActiveOwner,
+    /// The graph is not the exact current schema supported by this SDK build.
+    NotCurrentSchema,
+    /// At least one forwarding/session map is populated and no drain proof was
+    /// supplied.
+    PopulatedState,
+    /// A pin, loaded program, or replacement tc hook is foreign or replaced.
+    IdentityMismatch,
+    /// Complete stable kernel state could not be established.
+    IndeterminateState,
+}
+
+/// Stable progress classification for cleanup committed by current-schema
+/// orphan recovery.
+///
+/// A caller must retry the exact request until it observes
+/// [`CurrentEbpfGraphRecoveryOutcome::Removed`] or
+/// [`CurrentEbpfGraphRecoveryOutcome::AlreadyAbsent`].
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CurrentEbpfGraphRecoveryProgress {
+    /// Exact graph identity was durably recorded, but no recorded map pin has
+    /// yet been removed.
+    ProofCommitted,
+    /// At least one recorded map pin has been removed and cleanup is pending.
+    PinCleanupStarted,
+    /// A committed recovery could not classify its exact final state.
+    Indeterminate,
+}
+
+/// Classified result of current-schema orphan graph recovery.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CurrentEbpfGraphRecoveryOutcome {
+    /// The exact orphan graph and its durable cleanup proof were removed.
+    Removed,
+    /// No canonical graph exists and replacement hook slots are
+    /// authoritatively empty.
+    AlreadyAbsent,
+    /// Recovery was refused before graph deletion was committed.
+    Refused(CurrentEbpfGraphRecoveryRefusal),
+    /// Cleanup was committed but is incomplete; retry the exact request.
+    Partial(CurrentEbpfGraphRecoveryProgress),
+}
+
 /// Explicit caller attestation required before removing a drained legacy v2
 /// eBPF pin graph.
 ///
@@ -1416,5 +1603,33 @@ mod tests {
         assert_eq!(remove.local_teid, ctx.local_teid);
         assert_eq!(remove.link_ifindex, 9);
         assert_eq!(remove.address_family, GtpAddressFamily::Ipv6);
+    }
+
+    #[test]
+    fn current_graph_recovery_request_is_typed_and_redacts_deployment_identity() {
+        let request = CurrentEbpfGraphRecoveryRequest::new(
+            "tenant-sensitive-pin",
+            CurrentEbpfGraphWriterProof::previous_writer_stopped(),
+        )
+        .with_replacement_device(GtpDevice {
+            name: "tenant-sensitive-interface".to_string(),
+            ifindex: 41,
+        })
+        .with_drain_proof(CurrentEbpfGraphDrainProof::sessions_and_traffic_drained());
+
+        assert_eq!(request.pin_namespace(), "tenant-sensitive-pin");
+        assert_eq!(
+            request.replacement_device().map(|device| device.ifindex),
+            Some(41)
+        );
+        assert_eq!(
+            request.writer_proof(),
+            CurrentEbpfGraphWriterProof::previous_writer_stopped()
+        );
+        assert!(request.drain_proof().is_some());
+        let debug = format!("{request:?}");
+        assert!(!debug.contains("tenant-sensitive-pin"));
+        assert!(!debug.contains("tenant-sensitive-interface"));
+        assert!(!debug.contains("41"));
     }
 }

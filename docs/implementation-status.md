@@ -676,6 +676,60 @@ remain downstream responsibilities.
 
 ---
 
+## Current-schema orphaned GTP-U eBPF graph recovery — 2026-07-21
+
+`opc-gtpu-dataplane` exposes a typed maintenance operation for recovering a
+current-schema graph left in node-persistent bpffs after its process and old
+interface namespace are gone. Its authority is the canonical configured pin
+root plus validated pin-namespace leaf, not an old or replacement ifindex. A
+permanent bpffs control-directory inode and nonblocking exclusive `flock`
+serialize cooperating SDK processes across network namespaces. Replacement
+interface identity and both configured tc slots are validated separately; a
+finalizer may omit the replacement only when product orchestration has removed
+both namespaces.
+
+The implementation requires an explicit previous-writer-stopped attestation.
+Populated forwarding state additionally requires a separate sessions-and-
+traffic-drained attestation. Before proof publication it validates the exact 15
+current map names, ABIs, schema marker, configuration, PMTU state, and IDs,
+loads and identifies both committed current classifier artifacts against those
+maps, drops those temporary programs, then completely enumerates loaded BPF
+program map references. An exact current program is classified as a live owner;
+a foreign or subset reference is an identity conflict; unavailable program
+map-ID evidence is indeterminate. No program tied to a visible replacement
+hook or an inaccessible old namespace can be treated as absent merely because
+the old interface name is unreachable.
+
+The durable cleanup proof binds the pin-namespace hash, graph filesystem
+device/inode, all exact map IDs, populated-state authorization, and its own
+kernel map ID. Normal current create/adopt rejects the reserved proof. Cleanup
+holds every surviving map and proof FD, removes the proof last, and restores
+the exact same IDs on ordinary map, proof, or final directory-removal failure.
+Those recoverable post-commit failures return typed `Partial` progress; an
+unrestorable proof never permits map republishing. A process crash retains
+proof-backed retry authority; repeated recovery returns typed `AlreadyAbsent`
+after terminal cleanup. Refusal before proof publication
+does not remove any graph pin. Redaction-safe typed outcomes distinguish active
+owner, managed attachment, replacement identity change, non-current schema,
+populated state, foreign identity, indeterminate evidence, committed partial
+progress, removal, and absence.
+
+Unit evidence covers different replacement ifindexes, live and concurrent
+owners, foreign/schema conflicts, drain gating, precommit proof failure,
+ordinary cleanup rollback, interruption/resume, request redaction, committed
+replacement disappearance/rename/reindex and managed-conflict retries, and
+idempotency. An ignored privileged fresh-netns test provisions the real current
+artifact, first proves the held lease fences recovery, then drops that lease
+while retaining the old interface and proves the surviving loaded programs'
+map references still return `ActiveOwner`. It deletes the old interface,
+creates a different-ifindex replacement, removes the exact orphan graph, and
+observes `AlreadyAbsent` on retry. This is SDK graph-ownership
+and cleanup evidence, not product proof that a writer or traffic was drained.
+Writer shutdown, session/traffic drain, out-of-band privileged-writer exclusion,
+finalizer scheduling, and deployment qualification remain downstream.
+
+---
+
 ## Current drained eBPF v2 teardown foundation — 2026-07-19
 
 `opc-gtpu-dataplane` now exposes a maintenance-only, backend-neutral request and

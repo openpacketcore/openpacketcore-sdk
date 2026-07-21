@@ -4,10 +4,10 @@ use async_trait::async_trait;
 use std::io;
 
 use crate::model::{
-    CreateGtpDeviceRequest, DrainedV2TeardownOutcome, DrainedV2TeardownRequest, GtpDevice,
-    GtpPdpContext, GtpuProbe, PdpContextInstallOutcome, PdpContextReadback,
-    PdpContextReconciliationCapabilities, PdpContextRemovalOutcome, PdpContextSelector,
-    RemovePdpContextRequest,
+    CreateGtpDeviceRequest, CurrentEbpfGraphRecoveryOutcome, CurrentEbpfGraphRecoveryRequest,
+    DrainedV2TeardownOutcome, DrainedV2TeardownRequest, GtpDevice, GtpPdpContext, GtpuProbe,
+    PdpContextInstallOutcome, PdpContextReadback, PdpContextReconciliationCapabilities,
+    PdpContextRemovalOutcome, PdpContextSelector, RemovePdpContextRequest,
 };
 use crate::GtpuError;
 
@@ -40,6 +40,23 @@ pub trait GtpuDataplaneBackend: Send + Sync + std::fmt::Debug {
     ) -> Result<DrainedV2TeardownOutcome, GtpuError> {
         Err(GtpuError::UnsupportedFeature {
             feature: "drained_v2_teardown",
+        })
+    }
+
+    /// Recover one orphaned current-schema eBPF graph by its stable pin
+    /// namespace.
+    ///
+    /// Implementations must fence the canonical persistent namespace
+    /// independently of a mutable interface index, validate the replacement
+    /// interface separately, prove that no live program references the graph,
+    /// and preserve retry evidence across committed cleanup. Existing backend
+    /// implementations inherit an explicit unsupported result.
+    async fn recover_orphaned_current_ebpf_graph(
+        &self,
+        _request: CurrentEbpfGraphRecoveryRequest,
+    ) -> Result<CurrentEbpfGraphRecoveryOutcome, GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "current_ebpf_graph_recovery",
         })
     }
 
@@ -205,6 +222,16 @@ mod tests {
             backend.teardown_drained_v2(request).await,
             Err(GtpuError::UnsupportedFeature {
                 feature: "drained_v2_teardown"
+            })
+        ));
+        let request = crate::CurrentEbpfGraphRecoveryRequest::new(
+            "gtp0",
+            crate::CurrentEbpfGraphWriterProof::previous_writer_stopped(),
+        );
+        assert!(matches!(
+            backend.recover_orphaned_current_ebpf_graph(request).await,
+            Err(GtpuError::UnsupportedFeature {
+                feature: "current_ebpf_graph_recovery"
             })
         ));
     }

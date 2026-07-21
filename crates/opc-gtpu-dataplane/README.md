@@ -35,7 +35,10 @@ route steering, XFRM policy, deployment defaults, or traffic-readiness policy.
   `PdpContextSelector`, `PdpContextReadback`, `PdpContextInstallOutcome`,
   `PdpContextRemovalOutcome`, `PdpContextConflict`,
   `PdpContextMismatchField`, `PdpContextIndeterminateReason`, and
-  `PdpContextReconciliationCapabilities`,
+  `PdpContextReconciliationCapabilities`, `CurrentEbpfGraphRecoveryRequest`,
+  `CurrentEbpfGraphWriterProof`, `CurrentEbpfGraphDrainProof`,
+  `CurrentEbpfGraphRecoveryOutcome`, `CurrentEbpfGraphRecoveryRefusal`, and
+  `CurrentEbpfGraphRecoveryProgress`,
   `EbpfGtpuDatapathSnapshot`, `EbpfGtpuDatapathCounters`, `DscpCodepoint`,
   `GtpRole`, `GtpVersion`, `GtpAddressFamily`, and `GTPU_PORT`.
 - `GtpuError` is intentionally redaction-safe; TEIDs and addresses are not
@@ -660,6 +663,112 @@ any retained PDR/FAR without an exact binding is indeterminate and fails before
 either hook changes. The SDK never invents `Any`, derives a peer from an
 untrusted packet, or labels endpoint-unbound forwarding state production-ready.
 
+#### Orphaned current-schema graph recovery
+
+`GtpuDataplaneBackend::recover_orphaned_current_ebpf_graph` is the supported
+maintenance boundary for a current-schema graph whose original process and
+interface namespace are gone while its map graph remains in node-persistent
+bpffs. Product code must not unlink those pins directly. The optional
+replacement interface is validated independently and may have a different
+ifindex; neither the old nor replacement ifindex contributes to the persistent
+graph lease identity.
+
+Before constructing `CurrentEbpfGraphWriterProof`, the caller must establish
+that the prior process cannot write the graph. A graph with retained forwarding
+entries is refused unless the caller additionally supplies
+`CurrentEbpfGraphDrainProof` after draining every represented session and all
+traffic. These attestations do not replace SDK evidence. Before any pin is
+removed, the eBPF backend:
+
+- acquires a nonblocking exclusive `flock` on a permanent control-directory
+  inode keyed only by the validated pin namespace below the canonical shared
+  bpffs root;
+- validates the canonical graph directory and the exact current 15-map names,
+  ABIs, schema markers, configuration, PMTU state, and kernel map IDs;
+- loads the committed current classifier artifacts against those exact maps
+  only after the read-only inventory succeeds, derives their exact program
+  identity, then unloads the temporary programs;
+- enumerates all loaded BPF programs and refuses any exact live SDK program or
+  foreign program that references a graph map; and
+- when a replacement is supplied, proves both of its configured tc slots are
+  empty immediately before proof publication and throughout cleanup.
+
+The loaded-program scan is system-wide rather than tied to the caller's current
+network namespace. It therefore detects a surviving program reference even
+when the old tc hook cannot be named from the replacement namespace. An
+unavailable program map-ID inventory, interrupted hook observation, changed
+pin, foreign object, or inconsistent observation fails closed.
+
+```rust,no_run
+use opc_gtpu_dataplane::{
+    CurrentEbpfGraphDrainProof, CurrentEbpfGraphRecoveryOutcome,
+    CurrentEbpfGraphRecoveryRequest, CurrentEbpfGraphWriterProof, GtpDevice,
+    GtpuDataplaneBackend,
+};
+
+# async fn recover(
+#     backend: &dyn GtpuDataplaneBackend,
+#     replacement: GtpDevice,
+#     drained: bool,
+# ) -> Result<(), Box<dyn std::error::Error>> {
+let mut request = CurrentEbpfGraphRecoveryRequest::new(
+    "s2bu",
+    CurrentEbpfGraphWriterProof::previous_writer_stopped(),
+)
+.with_replacement_device(replacement);
+if drained {
+    request = request.with_drain_proof(
+        CurrentEbpfGraphDrainProof::sessions_and_traffic_drained(),
+    );
+}
+
+loop {
+    match backend
+        .recover_orphaned_current_ebpf_graph(request.clone())
+        .await?
+    {
+        CurrentEbpfGraphRecoveryOutcome::Removed
+        | CurrentEbpfGraphRecoveryOutcome::AlreadyAbsent => break,
+        CurrentEbpfGraphRecoveryOutcome::Partial(_) => {
+            // Preserve the same attestations and retry this exact namespace.
+        }
+        CurrentEbpfGraphRecoveryOutcome::Refused(reason) => {
+            return Err(std::io::Error::other(format!(
+                "current graph recovery refused: {reason:?}",
+            ))
+            .into());
+        }
+        _ => return Err(std::io::Error::other("unknown recovery outcome").into()),
+    }
+}
+# Ok(())
+# }
+```
+
+The first authorized mutation publishes a checksummed proof map bound to the
+namespace hash, canonical graph device/inode, all 15 exact map IDs, populated
+state authorization, and the proof map's own kernel ID. Normal create/adopt
+fences on that reserved proof. Every surviving map and the proof remain open by
+FD during cleanup. An ordinary unlink or final directory-removal failure
+repins and reads back the same kernel objects before returning typed `Partial`
+progress; callers retry the same request instead of handling a post-commit
+transport error. If exact proof restoration cannot be established, recovery
+never republishes an unfenced complete map graph. An abrupt process crash leaves
+the proof pinned and an exact retry continues from the recorded map IDs. The
+proof-aware state machine also keeps a disappeared, renamed, reindexed, or
+newly managed replacement retry in typed `Partial` state after publication;
+those changes cannot turn committed cleanup into terminal refusal. The proof
+pin is removed last. A crash in the final
+proof-to-directory window is idempotently classified as an absent empty graph,
+never as a new graph.
+
+The permanent control directory is intentionally not deleted, avoiding an
+inode-replacement lease split between cooperating processes. The lock cannot
+fence a privileged external actor that ignores the SDK boundary. The
+maintenance window must therefore still exclude out-of-band bpffs and tc
+mutation. Product-owned writer shutdown, session drain, traffic gating,
+finalizer retry policy, and replacement provisioning remain downstream.
+
 #### Drained v2 teardown for current-schema reprovisioning
 
 `GtpuDataplaneBackend::teardown_drained_v2` is the only supported SDK path for
@@ -690,8 +799,9 @@ instead of being hidden by the backend's current priority.
 
 The maintenance window must also exclude uncoordinated interface rename or
 deletion, tc mutation, bpffs pin replacement, and any writer that bypasses the
-SDK reconciler lease. The abstract-socket lease serializes cooperating SDK
-backends; it cannot authorize or fence an external privileged process. The
+SDK reconciler lease. The permanent host-global control-inode lease serializes
+cooperating SDK backends by canonical pin namespace; it cannot authorize or
+fence an external privileged process. The
 backend repeats authoritative readback around each destructive step, but this
 exclusive-writer condition is what excludes an external replace-and-restore
 inside the remaining kernel check/use windows.
@@ -833,13 +943,17 @@ rolls back a first hook that it created in an originally empty slot.
 
 All mutations through clones of one backend are serialized as one
 reconciliation. Cooperating independently constructed backends and processes
-cannot own the same `(network namespace, canonical pin directory, interface)`
-at the same time: a kernel-lifetime abstract socket provides exclusive
-ownership and a second live reconciler receives `AlreadyExists`. Process exit
-releases the ownership automatically, allowing a replacement to call
-`resolve_device` and adopt the surviving pins. A rolling handoff must therefore
-stop the old writer before the new writer adopts the interface. Privileged
-processes that bypass this lease remain outside the supported mutation model.
+cannot own the same canonical pin namespace at the same time: a nonblocking
+exclusive `flock` is held on a permanent control-directory inode below the
+canonical shared bpffs root, keyed only by the validated pin-namespace leaf and
+independent of network namespace, interface name, and ifindex. A second live
+reconciler receives `AlreadyExists`. Process exit closes the lock FD and releases
+ownership automatically; the persistent control directory is not deleted, so
+cooperating processes cannot split the lease through inode replacement. A
+replacement can then call `resolve_device` and adopt the surviving pins. A
+rolling handoff must therefore stop the old writer before the new writer adopts
+the interface. Privileged processes that bypass this lease remain outside the
+supported mutation model.
 
 The runtime takes both tc links out of Aya loader ownership, so dropping an old
 loader cannot detach a static filter that an external actor subsequently
@@ -863,10 +977,11 @@ against concurrent external mutation. Pre-existing pin sets and every
 indeterminate outcome are retained for inspection.
 
 Classic tc netlink deletion and bpffs pathname unlink have no conditional
-delete-by-object-ID primitive. The abstract-socket reconciler lease is therefore
-the safety boundary: every SDK, operator, and maintenance writer of these tc
-slots or pin paths must acquire/observe that exclusive boundary. Uncoordinated
-concurrent `tc` or bpffs mutation is unsupported. During explicit
+delete-by-object-ID primitive. The host-global persistent control-directory
+`flock` is therefore the cooperating-writer safety boundary: every SDK,
+operator, and maintenance writer of these tc slots or pin paths must
+acquire/observe that exclusive boundary. Uncoordinated concurrent `tc` or bpffs
+mutation is unsupported. During explicit
 `remove_device` teardown, a netlink-uncertain first detach, any second-hook
 failure after the first was removed, or any post-detach pin mismatch/unlink
 failure returns `StateIndeterminate`; an operator must then inspect and

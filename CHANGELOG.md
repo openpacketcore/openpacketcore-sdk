@@ -143,6 +143,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   composite outcomes report possible residue consistently, and all journal,
   plan, classification, ownership, and error `Debug` surfaces omit keys,
   addresses, selectors, and SPIs.
+- **Current-schema orphaned eBPF graph recovery — `opc-gtpu-dataplane`:** adds
+  a typed maintenance boundary for a current GTP-U map graph retained in
+  node-persistent bpffs after its process and interface namespace disappear.
+  A permanent host-global control inode leases the canonical pin namespace
+  independently of mutable ifindex. The backend separately validates an
+  optional replacement, the exact 15-map ABI and IDs, the committed current
+  classifier artifacts, empty replacement tc slots, and a complete system-wide
+  loaded-program reference inventory. Explicit previous-writer and optional
+  populated-state drain attestations never bypass those checks. A checksummed
+  self-ID-bound proof fences normal create/adopt and makes proof-last cleanup
+  crash-retryable; exact held map/proof FDs restore the same kernel objects on
+  ordinary unlink or directory-removal failure. Typed refusal, partial,
+  removed, and idempotent already-absent outcomes remain redaction-safe. Unit
+  failure injection and a real fresh-netns different-ifindex recovery proof
+  cover active/concurrent owners, foreign/schema conflicts, drain gating,
+  rollback, restart continuation, and terminal cleanup (#449).
 - **Identity-safe drained eBPF v2 teardown — `opc-gtpu-dataplane`:** adds the
   maintenance-only `GtpuDataplaneBackend::teardown_drained_v2` boundary with an
   explicit caller drain attestation, exact interface identity, typed refusal
