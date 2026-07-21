@@ -1343,17 +1343,20 @@ mod tests {
     #[derive(Debug, Clone)]
     struct BlockingBindingTransport {
         state: Arc<BlockingState>,
+        block_call: usize,
         responses: Arc<Mutex<VecDeque<BindingResponse>>>,
         operations: Arc<Mutex<Vec<&'static str>>>,
     }
 
     impl BlockingBindingTransport {
-        fn new(
+        fn new_at_call(
             state: Arc<BlockingState>,
+            block_call: usize,
             responses: impl IntoIterator<Item = BindingResponse>,
         ) -> Self {
             Self {
                 state,
+                block_call,
                 responses: Arc::new(Mutex::new(responses.into_iter().collect())),
                 operations: Arc::new(Mutex::new(Vec::new())),
             }
@@ -1380,7 +1383,7 @@ mod tests {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .push(operation);
             let call = self.state.calls.fetch_add(1, Ordering::AcqRel);
-            if call == 0 {
+            if call == self.block_call {
                 let mut guard = self
                     .state
                     .lock
@@ -1403,6 +1406,96 @@ mod tests {
 
         fn probe(&self, _config: LinuxXfrmBackendConfig) -> XfrmProbe {
             XfrmProbe::unsupported()
+        }
+    }
+
+    #[tokio::test]
+    async fn applied_counter_survives_post_update_transport_faults_without_reapply() {
+        let request = outbound_install_request();
+        let (pre_policy, pre_sa) = outbound_readback_at(&request, 7);
+        let (applied_policy, applied_sa) = outbound_readback_at(&request, 99);
+
+        for fail_after_policy in [false, true] {
+            let mut responses = vec![
+                Ok(Some(pre_policy.clone())),
+                Ok(Some(pre_sa.clone())),
+                Ok(None),
+            ];
+            if fail_after_policy {
+                responses.push(Ok(Some(applied_policy.clone())));
+            }
+            responses.push(Err(XfrmError::Unavailable));
+            // Exact retry preflight/final readback, applied-receipt proof,
+            // committed recovery, and committed-recovery proof.
+            for _ in 0..5 {
+                responses.push(Ok(Some(applied_policy.clone())));
+                responses.push(Ok(Some(applied_sa.clone())));
+            }
+
+            let transport = BindingTransport::new(responses);
+            let capture = transport.clone();
+            let backend = LinuxXfrmBackend::with_transport(transport)
+                .bind_current_network_namespace()
+                .unwrap();
+            let authority = counter_binding(&backend, &request);
+            let target = authority.outbound_esp_counter_target();
+            let apply = counter_request(&authority, &request, 1, 2, 100);
+            let binding = apply.binding();
+
+            let error = backend
+                .apply_and_read_back_outbound_esp_counter(&authority, authority.id(), apply.clone())
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), "xfrm_outbound_sa_binding_readback_failed");
+
+            let receipt = backend
+                .apply_and_read_back_outbound_esp_counter(&authority, authority.id(), apply)
+                .await
+                .unwrap();
+            EspCounterResumeProofSet::single(receipt)
+                .validate_counter_proof(
+                    &target,
+                    binding,
+                    EspCounterProofRequirement::BeforeOwnershipCommit,
+                )
+                .await
+                .unwrap();
+
+            let recovered = backend
+                .recover_committed_outbound_esp_counter(
+                    &authority,
+                    authority.id(),
+                    counter_recovery_request(binding, &request),
+                )
+                .await
+                .unwrap();
+            let recovered = EspCounterResumeProofSet::single(recovered);
+            recovered
+                .validate_counter_proof(
+                    &target,
+                    binding,
+                    EspCounterProofRequirement::CommittedRecovery,
+                )
+                .await
+                .unwrap();
+            let error = recovered
+                .validate_counter_proof(
+                    &target,
+                    binding,
+                    EspCounterProofRequirement::BeforeFirstPublication,
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), "esp_counter_recovered_receipt_cannot_fence");
+            assert_eq!(
+                capture
+                    .operations()
+                    .iter()
+                    .filter(|operation| **operation == "update_outbound_sa_replay_state")
+                    .count(),
+                1,
+                "readback retry and committed recovery must remain read-only"
+            );
         }
     }
 
@@ -1472,13 +1565,14 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn cancelled_counter_observer_cannot_cancel_apply_or_cause_reuse_on_retry() {
+    async fn cancellation_after_counter_update_cannot_reapply_on_exact_retry() {
         let request = outbound_install_request();
         let (pre_policy, pre_sa) = outbound_readback_at(&request, 7);
         let (applied_policy, applied_sa) = outbound_readback_at(&request, 99);
         let state = Arc::new(BlockingState::new());
-        let transport = BlockingBindingTransport::new(
+        let transport = BlockingBindingTransport::new_at_call(
             Arc::clone(&state),
+            3,
             [
                 Ok(Some(pre_policy)),
                 Ok(Some(pre_sa)),
@@ -1488,6 +1582,9 @@ mod tests {
                 // Exact retry preflight/final readback.
                 Ok(Some(applied_policy.clone())),
                 Ok(Some(applied_sa.clone())),
+                Ok(Some(applied_policy.clone())),
+                Ok(Some(applied_sa.clone())),
+                // Exact receipt validation after the retry.
                 Ok(Some(applied_policy)),
                 Ok(Some(applied_sa)),
             ],
@@ -1498,6 +1595,8 @@ mod tests {
             .unwrap();
         let authority = counter_binding(&backend, &request);
         let apply = counter_request(&authority, &request, 1, 2, 100);
+        let binding = apply.binding();
+        let target = authority.outbound_esp_counter_target();
         let observer = tokio::spawn({
             let backend = backend.clone();
             let authority = authority.clone();
@@ -1508,14 +1607,31 @@ mod tests {
                     .await
             }
         });
-        wait_until(|| state.calls.load(Ordering::Acquire) == 1).await;
+        wait_until(|| state.calls.load(Ordering::Acquire) == 4).await;
+        assert_eq!(
+            capture
+                .operations()
+                .iter()
+                .filter(|operation| **operation == "update_outbound_sa_replay_state")
+                .count(),
+            1,
+            "the observer is cancelled only after the NEWAE update completed"
+        );
         observer.abort();
         let _ = observer.await;
         state.release();
         wait_until(|| state.calls.load(Ordering::Acquire) == 5).await;
 
-        backend
+        let receipt = backend
             .apply_and_read_back_outbound_esp_counter(&authority, authority.id(), apply)
+            .await
+            .unwrap();
+        EspCounterResumeProofSet::single(receipt)
+            .validate_counter_proof(
+                &target,
+                binding,
+                EspCounterProofRequirement::BeforeOwnershipCommit,
+            )
             .await
             .unwrap();
         assert_eq!(

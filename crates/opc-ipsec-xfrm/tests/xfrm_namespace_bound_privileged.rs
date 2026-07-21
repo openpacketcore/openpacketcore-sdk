@@ -4,10 +4,13 @@
 
 use std::env;
 use std::fs;
-use std::io;
-use std::process::{Command, Output};
+use std::io::{self, BufRead, BufReader, Read};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::sync::Arc;
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use opc_ipsec_xfrm::{
     Algorithm, AuthAlgorithm, EspCounterProofRequirement, EspCounterResumeApplyRequest,
@@ -20,6 +23,8 @@ use opc_ipsec_xfrm::{
 
 const IPPROTO_ESP: u8 = 50;
 const SHARED_SPI: u32 = 0x7333_0001;
+const CAPTURE_READY_TIMEOUT: Duration = Duration::from_secs(5);
+const CAPTURE_PACKET_TIMEOUT: Duration = Duration::from_secs(5);
 static NEXT_NAMESPACE_SET: AtomicU64 = AtomicU64::new(1);
 
 fn command(program: &str, args: &[&str]) -> io::Result<Output> {
@@ -33,6 +38,196 @@ fn run(program: &str, args: &[&str]) -> io::Result<()> {
     } else {
         Err(io::Error::other("privileged namespace command failed"))
     }
+}
+
+fn capture_error(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+fn join_capture_thread<T>(handle: JoinHandle<io::Result<T>>) -> io::Result<T> {
+    handle
+        .join()
+        .map_err(|_| io::Error::other("packet capture worker failed"))?
+}
+
+fn wait_for_capture_exit(child: &mut Child, timeout: Duration) -> io::Result<ExitStatus> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "timed out waiting for one outbound ESP packet",
+            ));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+struct EspPacketCapture {
+    child: Option<Child>,
+    bytes: Option<JoinHandle<io::Result<Vec<u8>>>>,
+    diagnostics: Option<JoinHandle<io::Result<()>>>,
+}
+
+impl EspPacketCapture {
+    fn start(namespace: &str) -> io::Result<Self> {
+        let mut child = Command::new("ip")
+            .args([
+                "netns", "exec", namespace, "tcpdump", "-n", "-i", "opcxfrm0", "-c", "1", "-U",
+                "-s", "96", "-y", "EN10MB", "-w", "-", "ip", "proto", "50",
+            ])
+            .env("LC_ALL", "C")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| io::Error::other("packet capture stdout unavailable"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| io::Error::other("packet capture diagnostics unavailable"))?;
+
+        let bytes = thread::spawn(move || {
+            let mut bytes = Vec::new();
+            BufReader::new(stdout).read_to_end(&mut bytes)?;
+            Ok(bytes)
+        });
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let diagnostics = thread::spawn(move || {
+            let mut signalled = false;
+            for line in BufReader::new(stderr).lines() {
+                let line = line?;
+                if !signalled && line.contains("listening on") {
+                    let _ = ready_tx.send(());
+                    signalled = true;
+                }
+            }
+            if signalled {
+                Ok(())
+            } else {
+                Err(io::Error::other("packet capture did not become ready"))
+            }
+        });
+        let capture = Self {
+            child: Some(child),
+            bytes: Some(bytes),
+            diagnostics: Some(diagnostics),
+        };
+        ready_rx
+            .recv_timeout(CAPTURE_READY_TIMEOUT)
+            .map_err(|_| io::Error::other("packet capture readiness timed out"))?;
+        Ok(capture)
+    }
+
+    fn finish(mut self) -> io::Result<Vec<u8>> {
+        let child = self
+            .child
+            .as_mut()
+            .ok_or_else(|| io::Error::other("packet capture process unavailable"))?;
+        let status = wait_for_capture_exit(child, CAPTURE_PACKET_TIMEOUT)?;
+        self.child.take();
+        let bytes = join_capture_thread(
+            self.bytes
+                .take()
+                .ok_or_else(|| io::Error::other("packet capture reader unavailable"))?,
+        )?;
+        join_capture_thread(
+            self.diagnostics
+                .take()
+                .ok_or_else(|| io::Error::other("packet capture monitor unavailable"))?,
+        )?;
+        if !status.success() {
+            return Err(io::Error::other("packet capture command failed"));
+        }
+        Ok(bytes)
+    }
+}
+
+impl Drop for EspPacketCapture {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        if let Some(bytes) = self.bytes.take() {
+            let _ = bytes.join();
+        }
+        if let Some(diagnostics) = self.diagnostics.take() {
+            let _ = diagnostics.join();
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PcapByteOrder {
+    Big,
+    Little,
+}
+
+fn pcap_u32(bytes: &[u8], order: PcapByteOrder) -> io::Result<u32> {
+    let octets: [u8; 4] = bytes
+        .try_into()
+        .map_err(|_| capture_error("truncated packet capture integer"))?;
+    Ok(match order {
+        PcapByteOrder::Big => u32::from_be_bytes(octets),
+        PcapByteOrder::Little => u32::from_le_bytes(octets),
+    })
+}
+
+fn parse_captured_esp_header(capture: &[u8]) -> io::Result<(u32, u32)> {
+    const GLOBAL_HEADER_LEN: usize = 24;
+    const RECORD_HEADER_LEN: usize = 16;
+    const ETHERNET_HEADER_LEN: usize = 14;
+    const DLT_EN10MB: u32 = 1;
+
+    if capture.len() < GLOBAL_HEADER_LEN + RECORD_HEADER_LEN {
+        return Err(capture_error("truncated packet capture"));
+    }
+    let order = match capture[..4] {
+        [0xa1, 0xb2, 0xc3, 0xd4] | [0xa1, 0xb2, 0x3c, 0x4d] => PcapByteOrder::Big,
+        [0xd4, 0xc3, 0xb2, 0xa1] | [0x4d, 0x3c, 0xb2, 0xa1] => PcapByteOrder::Little,
+        _ => return Err(capture_error("unsupported packet capture encoding")),
+    };
+    if pcap_u32(&capture[20..24], order)? != DLT_EN10MB {
+        return Err(capture_error("unexpected packet capture link type"));
+    }
+    let captured_len = pcap_u32(&capture[32..36], order)? as usize;
+    let packet_start = GLOBAL_HEADER_LEN + RECORD_HEADER_LEN;
+    let packet_end = packet_start
+        .checked_add(captured_len)
+        .filter(|end| *end <= capture.len())
+        .ok_or_else(|| capture_error("truncated captured packet"))?;
+    let packet = &capture[packet_start..packet_end];
+    if packet.len() < ETHERNET_HEADER_LEN + 20 || packet[12..14] != [0x08, 0x00] {
+        return Err(capture_error("captured packet is not Ethernet IPv4"));
+    }
+    let ipv4 = &packet[ETHERNET_HEADER_LEN..];
+    if ipv4[0] >> 4 != 4 || ipv4[9] != IPPROTO_ESP {
+        return Err(capture_error("captured packet is not native ESP"));
+    }
+    let header_len = usize::from(ipv4[0] & 0x0f) * 4;
+    if header_len < 20 || ipv4.len() < header_len + 8 {
+        return Err(capture_error("captured ESP header is truncated"));
+    }
+    let esp = &ipv4[header_len..];
+    let spi = u32::from_be_bytes(
+        esp[..4]
+            .try_into()
+            .map_err(|_| capture_error("captured ESP SPI is truncated"))?,
+    );
+    let sequence = u32::from_be_bytes(
+        esp[4..8]
+            .try_into()
+            .map_err(|_| capture_error("captured ESP sequence is truncated"))?,
+    );
+    Ok((spi, sequence))
 }
 
 struct TestNamespaces {
@@ -346,7 +541,7 @@ async fn counter_receipt_from_identical_other_namespace_is_rejected(
 }
 
 #[tokio::test]
-#[ignore = "requires root, CAP_NET_ADMIN, Linux XFRM, iproute2, ping, and named netns support"]
+#[ignore = "requires root, CAP_NET_ADMIN/CAP_NET_RAW, Linux XFRM, iproute2, ping, tcpdump, and named netns support"]
 async fn outbound_binding_installs_recovers_and_transforms_first_packet(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if env::var("OPC_XFRM_RUN_NAMESPACE_PRIVILEGED").as_deref() != Ok("1") {
@@ -392,6 +587,9 @@ async fn outbound_binding_installs_recovers_and_transforms_first_packet(
         )
         .await?;
 
+    // Capture exactly one outbound ESP packet in memory. The capture is never
+    // logged or persisted and only its public ESP header is inspected.
+    let capture = EspPacketCapture::start(namespace)?;
     // A response is not expected because the dummy link has no peer. The
     // outbound packet must nevertheless cross policy lookup and ESP output.
     let _ = command(
@@ -410,6 +608,9 @@ async fn outbound_binding_installs_recovers_and_transforms_first_packet(
             "10.33.0.2",
         ],
     )?;
+    let (wire_spi, wire_sequence) = parse_captured_esp_header(&capture.finish()?)?;
+    assert_eq!(wire_spi, request.sa.parameters.id.spi);
+    assert_eq!(wire_sequence, RESUMED_SEND_NEXT as u32);
 
     let query = QuerySaRequest::new(
         request.sa.parameters.id.destination,

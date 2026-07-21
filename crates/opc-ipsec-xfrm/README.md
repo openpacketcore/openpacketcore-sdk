@@ -644,6 +644,10 @@ excludes the old key material needed for rollback.
 cargo test -p opc-ipsec-xfrm
 cargo test -p opc-ipsec-xfrm --features ikev2
 ./scripts/build-ipsec-xfrm-ebpf.sh
+# Requires named-netns support, iproute2, ping, tcpdump with EN10MB capture,
+# Linux XFRM, and effective CAP_NET_ADMIN/CAP_NET_RAW. The in-memory capture
+# proves the first emitted ESP SPI/sequence and is neither logged nor saved.
+sudo OPC_XFRM_RUN_NAMESPACE_PRIVILEGED=1 cargo test -p opc-ipsec-xfrm --test xfrm_namespace_bound_privileged -- --ignored --nocapture
 sudo unshare -n -- bash -lc 'ip link set lo up && OPC_XFRM_RUN_PRIVILEGED=1 cargo test -p opc-ipsec-xfrm --test xfrm_dscp_privileged -- --ignored --nocapture'
 sudo unshare -n -- bash -lc 'ip link set lo up && OPC_XFRM_RUN_RELOCATION_PRIVILEGED=1 cargo test -p opc-ipsec-xfrm --test xfrm_relocation_privileged -- --ignored --nocapture'
 sudo unshare -n -- bash -lc 'ip link set lo up && OPC_XFRM_RUN_AUTH_ONLY_PRIVILEGED=1 cargo test -p opc-ipsec-xfrm --features ikev2 --test xfrm_auth_only_privileged -- --ignored --nocapture'
