@@ -1698,6 +1698,140 @@ fn swm_answer_eap_material_predicate_requires_non_empty_material() {
 
 #[test]
 #[cfg(feature = "app-swm")]
+fn swm_authorization_outcome_rejects_terminal_eap_failure() {
+    let mut answer = sample_swm_answer();
+    answer.result = SwmDiameterResult::Base(4001);
+    answer.eap_payload = Some(vec![0x04, 0x2a, 0x00, 0x04].into());
+    answer.eap_master_session_key = None;
+
+    let built = apps::swm::build_swm_diameter_eap_answer(
+        &answer,
+        0x4410_0001,
+        0x4410_0002,
+        EncodeContext::default(),
+    )
+    .expect("synthetic authentication-rejected DEA");
+    let encoded = encode_message(&built);
+    let decoded = decode_message(&encoded);
+    let parsed = apps::swm::parse_swm_diameter_eap_answer(&decoded, DecodeContext::conservative())
+        .expect("typed authentication-rejected DEA");
+
+    assert_eq!(
+        parsed.authorization_outcome(),
+        SwmAuthorizationOutcome::NotAuthorized
+    );
+    let diagnostic = format!("{parsed:?}");
+    assert!(diagnostic.contains("eap_payload: Some(REDACTED)"));
+    assert!(!diagnostic.contains("[4, 42, 0, 4]"));
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_authorization_outcome_requires_valid_request_for_multi_round() {
+    const MULTI_ROUND_AUTH: u32 = 1001;
+    const EAP_REQUEST: &[u8] = &[0x01, 0x2a, 0x00, 0x05, 0x01];
+
+    let mut answer = sample_swm_answer();
+    answer.result = SwmDiameterResult::Base(MULTI_ROUND_AUTH);
+    answer.eap_payload = Some(EAP_REQUEST.to_vec().into());
+    answer.eap_master_session_key = None;
+    assert_eq!(
+        answer.authorization_outcome(),
+        SwmAuthorizationOutcome::EapInProgress
+    );
+
+    answer.eap_payload = None;
+    answer.eap_reissued_payload = Some(EAP_REQUEST.to_vec().into());
+    assert_eq!(
+        answer.authorization_outcome(),
+        SwmAuthorizationOutcome::EapInProgress
+    );
+
+    let invalid_packets: &[&[u8]] = &[
+        &[0x02, 0x2a, 0x00, 0x05, 0x01],
+        &[0x03, 0x2a, 0x00, 0x04],
+        &[0x04, 0x2a, 0x00, 0x04],
+        &[0x05, 0x2a, 0x00, 0x05, 0x01],
+        &[0x01, 0x2a, 0x00],
+        &[0x01, 0x2a, 0x00, 0x04],
+        &[0x01, 0x2a, 0x00, 0x06, 0x01],
+        &[0x03, 0x2a, 0x00, 0x05, 0x00],
+        &[0x04, 0x2a, 0x00, 0x05, 0x00],
+    ];
+    for invalid_packet in invalid_packets {
+        answer.eap_payload = Some(invalid_packet.to_vec().into());
+        answer.eap_reissued_payload = None;
+        assert_eq!(
+            answer.authorization_outcome(),
+            SwmAuthorizationOutcome::NotAuthorized
+        );
+    }
+
+    answer.eap_payload = Some(EAP_REQUEST.to_vec().into());
+    answer.eap_reissued_payload = Some(EAP_REQUEST.to_vec().into());
+    assert_eq!(
+        answer.authorization_outcome(),
+        SwmAuthorizationOutcome::NotAuthorized
+    );
+
+    answer.eap_reissued_payload = None;
+    answer.eap_master_session_key = Some(vec![0xaa; 32].into());
+    assert_eq!(
+        answer.authorization_outcome(),
+        SwmAuthorizationOutcome::NotAuthorized
+    );
+
+    answer.eap_master_session_key = Some(Vec::new().into());
+    assert_eq!(
+        answer.authorization_outcome(),
+        SwmAuthorizationOutcome::NotAuthorized
+    );
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_authorization_outcome_requires_consistent_success_material() {
+    let mut answer = sample_swm_answer();
+    answer.eap_master_session_key = None;
+    assert_eq!(
+        answer.authorization_outcome(),
+        SwmAuthorizationOutcome::NotAuthorized
+    );
+
+    answer.eap_master_session_key = Some(vec![0xaa; 32].into());
+    assert_eq!(
+        answer.authorization_outcome(),
+        SwmAuthorizationOutcome::MskBearingSuccess
+    );
+
+    answer.eap_payload = None;
+    assert_eq!(
+        answer.authorization_outcome(),
+        SwmAuthorizationOutcome::MskBearingSuccess
+    );
+
+    for contradictory_packet in [
+        vec![0x01, 0x2a, 0x00, 0x05, 0x01],
+        vec![0x04, 0x2a, 0x00, 0x04],
+        vec![0x03, 0x2a, 0x00, 0x05, 0x00],
+    ] {
+        answer.eap_payload = Some(contradictory_packet.into());
+        assert_eq!(
+            answer.authorization_outcome(),
+            SwmAuthorizationOutcome::NotAuthorized
+        );
+    }
+
+    answer.eap_payload = Some(vec![0x03, 0x2a, 0x00, 0x04].into());
+    answer.eap_reissued_payload = Some(vec![0x01, 0x2a, 0x00, 0x05, 0x01].into());
+    assert_eq!(
+        answer.authorization_outcome(),
+        SwmAuthorizationOutcome::NotAuthorized
+    );
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
 fn swm_der_rejects_invalid_eap_request_semantics_in_builder() {
     let mut request = sample_swm_request();
     request.auth_request_type = AuthRequestType::Other(1);

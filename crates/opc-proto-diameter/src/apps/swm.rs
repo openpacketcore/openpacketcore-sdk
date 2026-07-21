@@ -96,6 +96,7 @@ pub const EMERGENCY_SERVICES_EMERGENCY_INDICATION: u32 = 1 << 0;
 
 /// 3GPP experimental result requesting emergency IMEI recovery.
 pub const DIAMETER_ERROR_USER_UNKNOWN: u32 = 5001;
+const DIAMETER_MULTI_ROUND_AUTH: u32 = 1001;
 /// Width of the TS 33.402 Annex A.4 unauthenticated-emergency MSK.
 pub const UNAUTHENTICATED_EMERGENCY_MSK_LEN: usize = 32;
 /// Largest identity body that fits an RFC 3748 EAP-Response/Identity packet.
@@ -1357,7 +1358,8 @@ impl Error for SwmEmergencyAuthorizationError {}
 /// constructor above and can never be inferred from this answer-local view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SwmAuthorizationOutcome {
-    /// The exchange carries another EAP round but no terminal authorization.
+    /// Exact base `DIAMETER_MULTI_ROUND_AUTH` carries one well-formed EAP
+    /// Request and no MSK.
     EapInProgress,
     /// Exact `DIAMETER_SUCCESS` carries nonempty MSK bytes.
     ///
@@ -1812,21 +1814,57 @@ impl SwmDiameterEapAnswer {
     /// Derive a redaction-safe, fail-closed authorization outcome.
     ///
     /// Only exact base `DIAMETER_SUCCESS` with nonempty MSK can reach the
-    /// terminal success observation. Emergency access requires the separate
-    /// request-correlated evidence constructor.
+    /// terminal success observation. When an EAP packet accompanies that
+    /// result, it must be a well-formed EAP-Success in `EAP-Payload`.
+    /// `EapInProgress` requires exact base `DIAMETER_MULTI_ROUND_AUTH`, no MSK,
+    /// and exactly one well-formed EAP Request in either `EAP-Payload` or
+    /// `EAP-Reissued-Payload`. Malformed packets and contradictory AVP/result
+    /// combinations return `NotAuthorized`; EAP method Type-Data stays opaque.
+    /// Emergency access requires the separate request-correlated evidence
+    /// constructor.
     pub fn authorization_outcome(&self) -> SwmAuthorizationOutcome {
-        if self.result.is_diameter_success()
-            && option_redacted_bytes_has_material(&self.eap_master_session_key)
-        {
-            return SwmAuthorizationOutcome::MskBearingSuccess;
+        let msk_present = option_redacted_bytes_has_material(&self.eap_master_session_key);
+        let eap_payload = self
+            .eap_payload
+            .as_ref()
+            .map(Redacted::as_ref)
+            .map(Vec::as_slice);
+        let reissued_payload = self
+            .eap_reissued_payload
+            .as_ref()
+            .map(Redacted::as_ref)
+            .map(Vec::as_slice);
+
+        if self.result.is_diameter_success() && msk_present && reissued_payload.is_none() {
+            return match eap_payload.map(classify_outer_eap_packet) {
+                None | Some(Some(OuterEapPacketCode::Success)) => {
+                    SwmAuthorizationOutcome::MskBearingSuccess
+                }
+                Some(Some(
+                    OuterEapPacketCode::Request
+                    | OuterEapPacketCode::Response
+                    | OuterEapPacketCode::Failure,
+                ))
+                | Some(None) => SwmAuthorizationOutcome::NotAuthorized,
+            };
         }
-        if option_redacted_bytes_has_material(&self.eap_payload)
-            || option_redacted_bytes_has_material(&self.eap_reissued_payload)
+
+        if self.eap_master_session_key.is_none()
+            && matches!(
+                self.result,
+                SwmDiameterResult::Base(DIAMETER_MULTI_ROUND_AUTH)
+            )
         {
-            SwmAuthorizationOutcome::EapInProgress
-        } else {
-            SwmAuthorizationOutcome::NotAuthorized
+            let ongoing_packet = match (eap_payload, reissued_payload) {
+                (Some(payload), None) | (None, Some(payload)) => classify_outer_eap_packet(payload),
+                (None, None) | (Some(_), Some(_)) => None,
+            };
+            if ongoing_packet == Some(OuterEapPacketCode::Request) {
+                return SwmAuthorizationOutcome::EapInProgress;
+            }
         }
+
+        SwmAuthorizationOutcome::NotAuthorized
     }
 
     /// Resolve the declared subscription default APN configuration.
@@ -1840,6 +1878,35 @@ impl SwmDiameterEapAnswer {
         self.apn_configurations
             .iter()
             .find(|apn| apn.context_identifier == default_context_identifier)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OuterEapPacketCode {
+    Request,
+    Response,
+    Success,
+    Failure,
+}
+
+fn classify_outer_eap_packet(payload: &[u8]) -> Option<OuterEapPacketCode> {
+    const EAP_HEADER_LEN: usize = 4;
+    const EAP_TYPED_PACKET_MIN_LEN: usize = EAP_HEADER_LEN + 1;
+
+    if payload.len() < EAP_HEADER_LEN {
+        return None;
+    }
+    let declared_len = usize::from(u16::from_be_bytes([payload[2], payload[3]]));
+    if declared_len != payload.len() {
+        return None;
+    }
+
+    match payload[0] {
+        1 if payload.len() >= EAP_TYPED_PACKET_MIN_LEN => Some(OuterEapPacketCode::Request),
+        2 if payload.len() >= EAP_TYPED_PACKET_MIN_LEN => Some(OuterEapPacketCode::Response),
+        3 if payload.len() == EAP_HEADER_LEN => Some(OuterEapPacketCode::Success),
+        4 if payload.len() == EAP_HEADER_LEN => Some(OuterEapPacketCode::Failure),
+        _ => None,
     }
 }
 
