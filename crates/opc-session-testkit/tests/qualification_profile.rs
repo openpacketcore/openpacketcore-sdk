@@ -27,7 +27,7 @@ use opc_session_testkit::qualification::{
 };
 use serde_json::Value;
 
-const EVIDENCE_FIXTURE: &str = include_str!("fixtures/session-ha/evidence-fixture-v2.json");
+const EVIDENCE_FIXTURE: &str = include_str!("fixtures/session-ha/evidence-fixture-v6.json");
 const HISTORY_FIXTURE: &str = include_str!("fixtures/session-ha/history-valid.jsonl");
 const SCHEDULE_FIXTURE: &str = include_str!("fixtures/session-ha/schedule-valid.jsonl");
 const OMITTED_HISTORY_FIXTURE: &str =
@@ -42,6 +42,36 @@ const MTLS_CANDIDATE_REMAINING_ACCEPTANCE: [&str; 7] = [
     "certificate_expiry_retirement",
     "bounded_drain_and_reconnect_evidence",
     "platform_and_soak_matrix",
+];
+const CURRENT_SOURCE_BUILD_ONLY: [&str; 28] = [
+    "opc-alarm",
+    "opc-alarm-k8s",
+    "opc-alarm-testkit",
+    "opc-alarm-yang",
+    "opc-amf-lite",
+    "opc-amf-lite-testkit",
+    "opc-config-bus",
+    "opc-config-bus-consensus",
+    "opc-consensus",
+    "opc-gnmi-server",
+    "opc-ipsec-lb",
+    "opc-mgmt-audit-store",
+    "opc-mgmt-authz",
+    "opc-mgmt-transport",
+    "opc-netconf-server",
+    "opc-persist",
+    "opc-runtime",
+    "opc-sa-mirror",
+    "opc-sbi",
+    "opc-sdk",
+    "opc-sdk-integration",
+    "opc-session-cache",
+    "opc-session-net",
+    "opc-session-store",
+    "opc-session-testkit",
+    "operator-controller",
+    "operator-lifecycle",
+    "operator-lifecycle-cli",
 ];
 
 fn run_checker(history: &str) -> Output {
@@ -458,7 +488,7 @@ fn validate_history_shape(history: &str, schema: &Value) -> Result<(), String> {
 }
 
 #[test]
-fn frozen_v2_profile_matches_its_declared_consensus_and_store_contract() {
+fn current_v6_profile_matches_its_declared_consensus_and_store_contract() {
     let profile_value: Value = serde_json::from_str(SESSION_HA_PROFILE_JSON).expect("profile JSON");
     let profile_schema: Value =
         serde_json::from_str(SESSION_HA_PROFILE_SCHEMA_JSON).expect("profile schema JSON");
@@ -467,8 +497,8 @@ fn frozen_v2_profile_matches_its_declared_consensus_and_store_contract() {
     let profile: SessionHaQualificationProfile =
         serde_json::from_value(profile_value).expect("strict typed profile");
 
-    assert_eq!(profile.schema_version, "opc-session-ha-profile/v2");
-    assert_eq!(profile.profile_id, "opc-session-openraft-ha/v2");
+    assert_eq!(profile.schema_version, "opc-session-ha-profile/v6");
+    assert_eq!(profile.profile_id, "opc-session-openraft-ha/v6");
     assert_eq!(profile.maturity, "experimental");
     assert!(!profile.qualification_complete);
     assert_eq!(profile.workspace.version, env!("CARGO_PKG_VERSION"));
@@ -485,34 +515,7 @@ fn frozen_v2_profile_matches_its_declared_consensus_and_store_contract() {
     );
     assert_eq!(
         profile.source_build_gate.affected_workspace_crates,
-        [
-            "opc-alarm",
-            "opc-alarm-k8s",
-            "opc-alarm-testkit",
-            "opc-alarm-yang",
-            "opc-amf-lite",
-            "opc-amf-lite-testkit",
-            "opc-config-bus",
-            "opc-consensus",
-            "opc-gnmi-server",
-            "opc-ipsec-lb",
-            "opc-mgmt-authz",
-            "opc-mgmt-transport",
-            "opc-netconf-server",
-            "opc-persist",
-            "opc-runtime",
-            "opc-sa-mirror",
-            "opc-sbi",
-            "opc-sdk",
-            "opc-sdk-integration",
-            "opc-session-cache",
-            "opc-session-net",
-            "opc-session-store",
-            "opc-session-testkit",
-            "operator-controller",
-            "operator-lifecycle",
-            "operator-lifecycle-cli"
-        ]
+        CURRENT_SOURCE_BUILD_ONLY
     );
     assert_eq!(profile.source_build_gate.crates_io_check_date, "2026-07-13");
     assert!(profile.source_build_gate.crates_io_exact_matches.is_empty());
@@ -765,10 +768,7 @@ fn frozen_v2_profile_matches_its_declared_consensus_and_store_contract() {
         "fixed-memory-provider-synthetic-wrapper-only"
     );
     assert!(!profile.evidence.foundation_counts_for_production_encryption);
-    assert_eq!(
-        profile.evidence.unresolved_dependencies,
-        [143, 158, 163, 164]
-    );
+    assert_eq!(profile.evidence.unresolved_dependencies, [143, 158, 164]);
 
     let exact_artifacts = profile
         .artifacts
@@ -916,37 +916,7 @@ fn cargo_metadata_matches_the_exact_openraft_and_foundation_feature_profile() {
         BTreeSet::from([("openraft", "0.9.24"), ("openraft-macros", "0.9.24")])
     );
 
-    let source_build_only = BTreeSet::from([
-        "opc-alarm",
-        "opc-alarm-k8s",
-        "opc-alarm-testkit",
-        "opc-alarm-yang",
-        "opc-amf-lite",
-        "opc-amf-lite-testkit",
-        "opc-config-bus",
-        "opc-config-bus-consensus",
-        "opc-consensus",
-        "opc-gnmi-server",
-        "opc-ipsec-lb",
-        "opc-mgmt-audit-store",
-        "opc-mgmt-authz",
-        "opc-mgmt-transport",
-        "opc-netconf-server",
-        "opc-persist",
-        "opc-runtime",
-        "opc-sa-mirror",
-        "opc-sbi",
-        "opc-sdk",
-        "opc-sdk-integration",
-        "opc-session-cache",
-        "opc-session-net",
-        "opc-session-store",
-        "opc-session-testkit",
-        "operator-controller",
-        "operator-lifecycle",
-        "operator-lifecycle-cli",
-    ]);
-    assert_eq!(source_build_only.len(), 28);
+    let source_build_only = BTreeSet::from(CURRENT_SOURCE_BUILD_ONLY);
     let mut computed_source_closure =
         BTreeSet::from(["opc-consensus", "opc-persist", "opc-session-store"]);
     loop {

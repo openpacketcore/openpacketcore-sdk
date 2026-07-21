@@ -1,0 +1,360 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openpacketcore.dev/schemas/session-ha-evidence/v6",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "profile_id",
+    "experimental",
+    "qualification_complete",
+    "source_revision",
+    "source_tree_status",
+    "artifact",
+    "environment",
+    "execution",
+    "topology",
+    "payload_protection",
+    "faults",
+    "leader_transition",
+    "history",
+    "checker",
+    "logs",
+    "metrics",
+    "results",
+    "coverage",
+    "remaining_acceptance"
+  ],
+  "properties": {
+    "schema_version": { "const": "opc-session-ha-evidence/v6" },
+    "profile_id": { "const": "opc-session-openraft-ha/v6" },
+    "experimental": { "const": true },
+    "qualification_complete": { "const": false },
+    "source_revision": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "source_tree_status": { "enum": ["clean", "dirty_unqualified"] },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version", "sha256", "cargo_profile", "foundation_feature_overrides"],
+      "properties": {
+        "name": { "const": "opc-session-quorum-node" },
+        "version": { "type": "string", "minLength": 1, "maxLength": 32 },
+        "sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "cargo_profile": { "enum": ["debug", "release"] },
+        "foundation_feature_overrides": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "uniqueItems": true,
+          "items": { "const": "opc-session-net/insecure-test" }
+        }
+      }
+    },
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rustc_version",
+        "cargo_version",
+        "target",
+        "os",
+        "kernel",
+        "container_status",
+        "container_image_digest"
+      ],
+      "properties": {
+        "rustc_version": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "cargo_version": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "target": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "os": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "kernel": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "container_status": { "enum": ["collected", "not_collected_in_foundation"] },
+        "container_image_digest": {
+          "oneOf": [
+            { "const": null },
+            { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+          ]
+        }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "container_status": { "const": "collected" },
+            "container_image_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+          }
+        },
+        {
+          "properties": {
+            "container_status": { "const": "not_collected_in_foundation" },
+            "container_image_digest": { "const": null }
+          }
+        }
+      ]
+    },
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "random_seed",
+        "started_at_utc",
+        "completed_at_utc",
+        "profile_sha256",
+        "configuration_digest_domain",
+        "configuration_sha256",
+        "fault_schedule_digest_domain",
+        "fault_schedule_sha256"
+      ],
+      "properties": {
+        "random_seed": { "type": "integer", "minimum": 0 },
+        "started_at_utc": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$" },
+        "completed_at_utc": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$" },
+        "profile_sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "configuration_digest_domain": { "const": "opc-session-ha/configuration-set/v1" },
+        "configuration_sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "fault_schedule_digest_domain": { "const": "opc-session-ha/fault-schedule-set/v1" },
+        "fault_schedule_sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+      }
+    },
+    "topology": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "members",
+        "independent_processes",
+        "storage_identity_digest_domain",
+        "storage_identity_sha256",
+        "transport_mode",
+        "counts_for_tls_rotation"
+      ],
+      "properties": {
+        "members": { "oneOf": [{ "const": 3 }, { "const": 5 }] },
+        "independent_processes": { "const": true },
+        "storage_identity_digest_domain": { "const": "opc-session-ha/storage-identity/v1" },
+        "storage_identity_sha256": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 5,
+          "uniqueItems": true,
+          "items": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+        },
+        "transport_mode": { "const": "loopback-plaintext-test-only" },
+        "counts_for_tls_rotation": { "const": false }
+      }
+    },
+    "payload_protection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "synthetic_data_only", "counts_for_production_encryption"],
+      "properties": {
+        "mode": { "const": "fixed-memory-provider-synthetic-wrapper-only" },
+        "synthetic_data_only": { "const": true },
+        "counts_for_production_encryption": { "const": false }
+      }
+    },
+    "faults": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 128,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "kind",
+          "target_process",
+          "target_role",
+          "observed_node_id",
+          "observed_leader_id",
+          "observed_term",
+          "bounded"
+        ],
+        "properties": {
+          "kind": { "enum": ["process_stop", "process_restart"] },
+          "target_process": { "type": "string", "pattern": "^node-[0-4]$" },
+          "target_role": { "enum": ["follower", "leader"] },
+          "observed_node_id": { "type": "integer", "minimum": 1 },
+          "observed_leader_id": { "type": "integer", "minimum": 1 },
+          "observed_term": { "type": "integer", "minimum": 1 },
+          "bounded": { "const": true }
+        }
+      }
+    },
+    "leader_transition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "old_leader_process",
+        "old_leader_node_id",
+        "old_term",
+        "new_leader_process",
+        "new_leader_node_id",
+        "new_term",
+        "failover_millis",
+        "old_leader_restart_catchup_millis"
+      ],
+      "properties": {
+        "old_leader_process": { "type": "string", "pattern": "^node-[0-4]$" },
+        "old_leader_node_id": { "type": "integer", "minimum": 1 },
+        "old_term": { "type": "integer", "minimum": 1 },
+        "new_leader_process": { "type": "string", "pattern": "^node-[0-4]$" },
+        "new_leader_node_id": { "type": "integer", "minimum": 1 },
+        "new_term": { "type": "integer", "minimum": 2 },
+        "failover_millis": { "type": "integer", "minimum": 0, "maximum": 30000 },
+        "old_leader_restart_catchup_millis": { "type": "integer", "minimum": 0, "maximum": 120000 }
+      }
+    },
+    "history": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "schedule_schema_version", "schedule_sha256", "sha256"],
+      "properties": {
+        "schema_version": { "const": "opc-session-ha-history/v1" },
+        "schedule_schema_version": { "const": "opc-session-ha-schedule/v1" },
+        "schedule_sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+      }
+    },
+    "checker": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version", "sha256", "exit_code", "status", "output_sha256"],
+      "properties": {
+        "name": { "const": "check-session-ha-history.py" },
+        "version": { "const": "1" },
+        "sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "exit_code": { "const": 0 },
+        "status": { "const": "pass" },
+        "output_sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+      }
+    },
+    "logs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["collection_status", "digests"],
+      "properties": {
+        "collection_status": { "enum": ["collected", "not_collected_in_foundation"] },
+        "digests": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+        }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "collection_status": { "const": "collected" },
+            "digests": { "minItems": 1 }
+          }
+        },
+        {
+          "properties": {
+            "collection_status": { "const": "not_collected_in_foundation" },
+            "digests": { "maxItems": 0 }
+          }
+        }
+      ]
+    },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["collection_status", "digests"],
+      "properties": {
+        "collection_status": { "enum": ["collected", "not_collected_in_foundation"] },
+        "digests": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+        }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "collection_status": { "const": "collected" },
+            "digests": { "minItems": 1 }
+          }
+        },
+        {
+          "properties": {
+            "collection_status": { "const": "not_collected_in_foundation" },
+            "digests": { "maxItems": 0 }
+          }
+        }
+      ]
+    },
+    "results": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "startup_millis",
+        "single_member_stop_service_continuity_millis",
+        "restart_catchup_millis",
+        "leader_failover_millis",
+        "leader_restart_catchup_millis",
+        "leader_outage_store_read_succeeded",
+        "acknowledged_write_loss",
+        "stale_owner_mutation_successes",
+        "history_checker_violations"
+      ],
+      "properties": {
+        "startup_millis": { "type": "integer", "minimum": 0, "maximum": 30000 },
+        "single_member_stop_service_continuity_millis": { "type": "integer", "minimum": 0, "maximum": 30000 },
+        "restart_catchup_millis": { "type": "integer", "minimum": 0, "maximum": 120000 },
+        "leader_failover_millis": { "type": "integer", "minimum": 0, "maximum": 30000 },
+        "leader_restart_catchup_millis": { "type": "integer", "minimum": 0, "maximum": 120000 },
+        "leader_outage_store_read_succeeded": { "const": true },
+        "acknowledged_write_loss": { "const": 0 },
+        "stale_owner_mutation_successes": { "const": 0 },
+        "history_checker_violations": { "const": 0 }
+      }
+    },
+    "coverage": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "schema_fixture",
+          "profile_inventory",
+          "independent_history_checker",
+          "lease_acquire_release",
+          "lease_expiry_reacquire",
+          "compare_and_set",
+          "linearizable_read",
+          "stale_fence_rejection",
+          "multi_process",
+          "real_tcp",
+          "persistent_sqlite",
+          "process_stop_restart",
+          "observed_leader_failover",
+          "three_node",
+          "five_node"
+        ]
+      }
+    },
+    "remaining_acceptance": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "tls_rotation_158_163_164",
+          "kubernetes_3_5_node",
+          "batch_history",
+          "watch_history",
+          "restore_history",
+          "readiness_continuous_gating",
+          "network_partition_faults",
+          "packet_faults",
+          "clock_skew",
+          "leader_follower_crash_matrix",
+          "crash_point_matrix",
+          "version_migration_rollback",
+          "resource_soak",
+          "signed_release_bundle",
+          "distributed_hkms_payload_key_rotation"
+        ]
+      }
+    }
+  }
+}

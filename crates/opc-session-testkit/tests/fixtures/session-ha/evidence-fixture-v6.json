@@ -1,0 +1,152 @@
+{
+  "schema_version": "opc-session-ha-evidence/v6",
+  "profile_id": "opc-session-openraft-ha/v6",
+  "experimental": true,
+  "qualification_complete": false,
+  "source_revision": "0000000000000000000000000000000000000000",
+  "source_tree_status": "clean",
+  "artifact": {
+    "name": "opc-session-quorum-node",
+    "version": "0.2.0",
+    "sha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "cargo_profile": "debug",
+    "foundation_feature_overrides": ["opc-session-net/insecure-test"]
+  },
+  "environment": {
+    "rustc_version": "rustc fixture",
+    "cargo_version": "cargo fixture",
+    "target": "x86_64-unknown-linux-gnu",
+    "os": "linux",
+    "kernel": "not-collected-fixture",
+    "container_status": "not_collected_in_foundation",
+    "container_image_digest": null
+  },
+  "execution": {
+    "random_seed": 1,
+    "started_at_utc": "2026-07-13T00:00:00Z",
+    "completed_at_utc": "2026-07-13T00:00:01Z",
+    "profile_sha256": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "configuration_digest_domain": "opc-session-ha/configuration-set/v1",
+    "configuration_sha256": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "fault_schedule_digest_domain": "opc-session-ha/fault-schedule-set/v1",
+    "fault_schedule_sha256": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+  },
+  "topology": {
+    "members": 3,
+    "independent_processes": true,
+    "storage_identity_digest_domain": "opc-session-ha/storage-identity/v1",
+    "storage_identity_sha256": [
+      "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+      "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+    ],
+    "transport_mode": "loopback-plaintext-test-only",
+    "counts_for_tls_rotation": false
+  },
+  "payload_protection": {
+    "mode": "fixed-memory-provider-synthetic-wrapper-only",
+    "synthetic_data_only": true,
+    "counts_for_production_encryption": false
+  },
+  "faults": [
+    {
+      "kind": "process_stop",
+      "target_process": "node-2",
+      "target_role": "follower",
+      "observed_node_id": 3,
+      "observed_leader_id": 1,
+      "observed_term": 1,
+      "bounded": true
+    },
+    {
+      "kind": "process_restart",
+      "target_process": "node-2",
+      "target_role": "follower",
+      "observed_node_id": 3,
+      "observed_leader_id": 1,
+      "observed_term": 1,
+      "bounded": true
+    },
+    {
+      "kind": "process_stop",
+      "target_process": "node-0",
+      "target_role": "leader",
+      "observed_node_id": 1,
+      "observed_leader_id": 1,
+      "observed_term": 1,
+      "bounded": true
+    },
+    {
+      "kind": "process_restart",
+      "target_process": "node-0",
+      "target_role": "leader",
+      "observed_node_id": 1,
+      "observed_leader_id": 1,
+      "observed_term": 1,
+      "bounded": true
+    }
+  ],
+  "leader_transition": {
+    "old_leader_process": "node-0",
+    "old_leader_node_id": 1,
+    "old_term": 1,
+    "new_leader_process": "node-1",
+    "new_leader_node_id": 2,
+    "new_term": 2,
+    "failover_millis": 1000,
+    "old_leader_restart_catchup_millis": 1000
+  },
+  "history": {
+    "schema_version": "opc-session-ha-history/v1",
+    "schedule_schema_version": "opc-session-ha-schedule/v1",
+    "schedule_sha256": "sha256:0945a97ace03d5b8e9c49e912afc226498e9b439f8a1620d68d01e7d83bfa542",
+    "sha256": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  },
+  "checker": {
+    "name": "check-session-ha-history.py",
+    "version": "1",
+    "sha256": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "exit_code": 0,
+    "status": "pass",
+    "output_sha256": "sha256:9999999999999999999999999999999999999999999999999999999999999999"
+  },
+  "logs": {
+    "collection_status": "not_collected_in_foundation",
+    "digests": []
+  },
+  "metrics": {
+    "collection_status": "not_collected_in_foundation",
+    "digests": []
+  },
+  "results": {
+    "startup_millis": 1000,
+    "single_member_stop_service_continuity_millis": 1000,
+    "restart_catchup_millis": 1000,
+    "leader_failover_millis": 1000,
+    "leader_restart_catchup_millis": 1000,
+    "leader_outage_store_read_succeeded": true,
+    "acknowledged_write_loss": 0,
+    "stale_owner_mutation_successes": 0,
+    "history_checker_violations": 0
+  },
+  "coverage": [
+    "schema_fixture"
+  ],
+  "remaining_acceptance": [
+    "tls_rotation_158_163_164",
+    "kubernetes_3_5_node",
+    "batch_history",
+    "watch_history",
+    "restore_history",
+    "readiness_continuous_gating",
+    "network_partition_faults",
+    "packet_faults",
+    "clock_skew",
+    "leader_follower_crash_matrix",
+    "crash_point_matrix",
+    "version_migration_rollback",
+    "resource_soak",
+    "signed_release_bundle",
+    "distributed_hkms_payload_key_rotation"
+  ]
+}
