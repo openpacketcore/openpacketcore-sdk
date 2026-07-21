@@ -332,7 +332,11 @@ remains `None`; an unresolved or ambiguous profile fails closed, and the
 resolver independently returns `None` for any invalid profile.
 
 The baseline SWm command profile marks `State` repeatable and keeps
-`APN-Configuration` singleton. The separate
+`APN-Configuration` singleton. Its RFC 4005 State definition requires V clear
+and M set while permitting P. Typed DER/DEA builders emit P clear, the canonical
+profile recommended by RFC 6733 while no end-to-end security mechanism is
+specified; parsers accept either P value and retain every opaque State value
+byte-for-byte and in wire order for a subsequent Diameter-EAP round. The separate
 `SWM_PROJECTED_PROFILE_DICTIONARIES` profile also marks APN-Configuration
 repeatable for explicitly configured peers. `Message::decode_with_dictionary`
 supports both with `DecodeContext::conservative()` while all undeclared,

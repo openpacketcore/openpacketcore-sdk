@@ -69,7 +69,9 @@ charging decisions, watchdog policy, or a carrier-ready EPC/ePDG product claim.
 - The `app-rf` feature adds typed Rf accounting helpers.
 - The `app-swm` feature adds typed SWm Diameter-EAP DER/DEA,
   Session-Termination STR/STA, Abort-Session ASR/ASA, Re-Auth RAR/RAA, and AA
-  AAR/AAA helpers. The
+  AAR/AAA helpers. Typed DER and DEA builders emit every ordered, opaque `State`
+  value with the mandatory bit required by RFC 4005 sections 9.3 and 9.3.4;
+  callers return received values byte-for-byte without interpreting them. The
   lifecycle envelopes bind both Diameter identifiers, the P bit, a present
   exact `Session-Id`, and ordered Proxy-Info. Outbound envelopes additionally
   require an authenticated connection-generation token and may apply an

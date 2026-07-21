@@ -74,7 +74,7 @@ pub const AVP_AAR_FLAGS: AvpCode = AvpCode::new(1539);
 pub const AVP_UE_LOCAL_IP_ADDRESS: AvpCode = AvpCode::new(2805);
 /// High-Priority-Access-Info AVP code (3GPP TS 29.273 section 5.2.3.36).
 pub const AVP_HIGH_PRIORITY_ACCESS_INFO: AvpCode = AvpCode::new(1542);
-/// State AVP code.
+/// State AVP code (RFC 4005 section 9.3.4).
 pub const AVP_STATE: AvpCode = AvpCode::new(24);
 /// Reply-Message AVP code (RFC 4005 section 4.9).
 pub const AVP_REPLY_MESSAGE: AvpCode = AvpCode::new(18);
@@ -371,8 +371,12 @@ const SWM_AVPS: [AvpDefinition; 40] = [
         AvpKey::ietf(AVP_STATE),
         "State",
         AvpDataType::OctetString,
-        AvpFlagRules::base_optional(),
-        SpecRef::new("ietf", "RFC6733", "6.38"),
+        AvpFlagRules::new(
+            FlagRequirement::MustBeUnset,
+            FlagRequirement::MustBeSet,
+            FlagRequirement::MayBeSet,
+        ),
+        SpecRef::new("ietf", "RFC4005", "9.3.4"),
     ),
     AvpDefinition::new(
         AvpKey::ietf(AVP_REPLY_MESSAGE),
@@ -1497,7 +1501,7 @@ pub struct SwmDiameterEapRequest {
     pub emergency_services: Option<SwmEmergencyServices>,
     /// Optional device identity forwarded after DEVICE_IDENTITY recovery.
     pub terminal_information: Option<SwmTerminalInformation>,
-    /// State AVP values.
+    /// Ordered opaque State AVP values (only their count appears in diagnostics).
     pub state_avps: Vec<Vec<u8>>,
 }
 
@@ -1566,7 +1570,7 @@ pub struct SwmDiameterEapAnswer {
     pub eap_reissued_payload: Option<Redacted<Vec<u8>>>,
     /// Error-Message.
     pub error_message: Option<String>,
-    /// State AVP values.
+    /// Ordered opaque State AVP values (only their count appears in diagnostics).
     pub state_avps: Vec<Vec<u8>>,
     /// EAP-Master-Session-Key (redacted in diagnostic output).
     pub eap_master_session_key: Option<Redacted<Vec<u8>>>,
@@ -1928,7 +1932,7 @@ pub fn build_swm_diameter_eap_request(
         )?;
     }
     for state in &request.state_avps {
-        builder_helpers::append_octet_string_avp(&mut raw_avps, AVP_STATE, state, false, ctx)?;
+        builder_helpers::append_octet_string_avp(&mut raw_avps, AVP_STATE, state, true, ctx)?;
     }
     if let Some(emergency_services) = request.emergency_services {
         builder_helpers::append_vendor_u32_avp(
@@ -2382,7 +2386,7 @@ pub fn build_swm_diameter_eap_answer(
         )?;
     }
     for state in &answer.state_avps {
-        builder_helpers::append_octet_string_avp(&mut raw_avps, AVP_STATE, state, false, ctx)?;
+        builder_helpers::append_octet_string_avp(&mut raw_avps, AVP_STATE, state, true, ctx)?;
     }
     if let Some(eap_master_session_key) = answer.eap_master_session_key.as_ref() {
         builder_helpers::append_octet_string_avp(

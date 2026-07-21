@@ -1993,7 +1993,7 @@ fn asr_rfc_4005_state_and_reply_message_cardinality_round_trip() {
         .expect("ASR fixture has Class");
     avps.insert(
         class_index,
-        wire_avp(swm::AVP_STATE.get(), 0x00, b"opaque-state"),
+        wire_avp(swm::AVP_STATE.get(), 0x40, b"opaque-state"),
     );
     avps.insert(
         class_index + 1,
@@ -2020,7 +2020,7 @@ fn asr_rfc_4005_state_and_reply_message_cardinality_round_trip() {
         wire
     );
 
-    avps.push(wire_avp(swm::AVP_STATE.get(), 0x00, b"second-state"));
+    avps.push(wire_avp(swm::AVP_STATE.get(), 0x40, b"second-state"));
     let error = Message::decode_with_dictionary(
         &wire_message(0xc0, HOP_BY_HOP, END_TO_END, avps),
         DecodeContext::conservative(),
