@@ -93,6 +93,17 @@ fn proxy_info() -> Vec<u8> {
     avp(base::AVP_PROXY_INFO, 0x40, &children)
 }
 
+fn proxy_info_with(host: &[u8], state: &[u8]) -> Vec<u8> {
+    let children: Vec<u8> = [
+        avp(base::AVP_PROXY_HOST, 0x40, host),
+        avp(base::AVP_PROXY_STATE, 0x40, state),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    avp(base::AVP_PROXY_INFO, 0x40, &children)
+}
+
 fn rar_avps() -> Vec<Vec<u8>> {
     vec![
         avp(base::AVP_SESSION_ID, 0x40, SESSION.as_bytes()),
@@ -398,6 +409,277 @@ fn rar_fixture_round_trips_and_retains_t() {
             .expect("parsed RAR must rebuild");
         assert_eq!(encode(&rebuilt), wire);
     }
+}
+
+#[test]
+fn rar_replay_payload_accepts_only_retransmission_authorized_envelope_changes() {
+    let initial = parsed_re_auth_request(&rar_wire(0xc0));
+
+    let mut failover = initial.clone();
+    failover.mark_for_failover_retransmission(HOP_FAILOVER, expected_re_auth_peer(CONNECTION_B));
+    assert!(initial.same_replay_payload(&failover));
+    assert!(failover.same_replay_payload(&initial));
+    assert_ne!(initial, failover);
+
+    let changed_hop =
+        parsed_re_auth_request(&message(258, 0xc0, HOP_FAILOVER, END_RAR, rar_avps()));
+    assert!(initial.same_replay_payload(&changed_hop));
+    assert_ne!(initial, changed_hop);
+
+    let changed_t = parsed_re_auth_request(&rar_wire(0xd0));
+    assert!(initial.same_replay_payload(&changed_t));
+    assert_ne!(initial, changed_t);
+
+    let changed_binding = parsed_re_auth_request(&rar_wire(0xc0))
+        .with_expected_answer_peer(expected_re_auth_peer(CONNECTION_B));
+    assert!(initial.same_replay_payload(&changed_binding));
+    assert_ne!(initial, changed_binding);
+
+    let changed_end_to_end = parsed_re_auth_request(&message(
+        258,
+        0xc0,
+        HOP_RAR,
+        END_RAR.wrapping_add(1),
+        rar_avps(),
+    ));
+    assert!(!initial.same_replay_payload(&changed_end_to_end));
+}
+
+#[test]
+fn rar_replay_payload_matches_public_build_parse_roundtrip() {
+    let mut request = parsed_re_auth_request(&rar_wire(0xc0)).request().clone();
+    request.additional_avps = vec![SwmAdditionalAvp::new(
+        AvpHeader::ietf(AvpCode::new(10_418), false),
+        b"rar-roundtrip-extension.example".to_vec(),
+        EncodeContext::default(),
+    )
+    .expect("synthetic RAR extension must frame")];
+    let outbound = SwmReAuthRequestEnvelope::for_outbound(
+        request,
+        SwmDiameterTransaction::new(HOP_RAR, END_RAR),
+        expected_re_auth_peer(CONNECTION_A),
+    );
+    let built = swm::build_swm_re_auth_request(&outbound, EncodeContext::default())
+        .expect("public RAR envelope must build");
+    let wire = encode(&built);
+    let restored = parsed_re_auth_request(&wire);
+
+    assert!(outbound.same_replay_payload(&restored));
+    assert!(restored.same_replay_payload(&outbound));
+    assert_ne!(
+        outbound, restored,
+        "derived AVP lengths are not payload facts"
+    );
+}
+
+#[test]
+fn rar_replay_payload_rejects_every_changed_typed_request_fact() {
+    let mut initial_avps = rar_avps();
+    initial_avps.insert(8, avp(swm::AVP_DRMP, 0x00, &5_u32.to_be_bytes()));
+    let initial =
+        parsed_re_auth_request(&message(258, 0xc0, HOP_RAR, END_RAR, initial_avps.clone()));
+    let replacements = [
+        (
+            0,
+            avp(base::AVP_SESSION_ID, 0x40, b"changed-session.example"),
+        ),
+        (
+            1,
+            avp(base::AVP_ORIGIN_HOST, 0x40, b"changed-origin-host.example"),
+        ),
+        (
+            2,
+            avp(
+                base::AVP_ORIGIN_REALM,
+                0x40,
+                b"changed-origin-realm.example",
+            ),
+        ),
+        (
+            3,
+            avp(
+                base::AVP_DESTINATION_REALM,
+                0x40,
+                b"changed-destination-realm.example",
+            ),
+        ),
+        (
+            4,
+            avp(
+                base::AVP_DESTINATION_HOST,
+                0x40,
+                b"changed-destination-host.example",
+            ),
+        ),
+        (
+            7,
+            avp(base::AVP_USER_NAME, 0x40, b"changed-user@identity.example"),
+        ),
+        (8, avp(swm::AVP_DRMP, 0x00, &6_u32.to_be_bytes())),
+    ];
+
+    for (index, replacement) in replacements {
+        let mut changed_avps = initial_avps.clone();
+        changed_avps[index] = replacement;
+        let changed = parsed_re_auth_request(&message(258, 0xc0, HOP_RAR, END_RAR, changed_avps));
+        assert!(
+            !initial.same_replay_payload(&changed),
+            "changed RAR fact at fixture index {index} must not replay-match"
+        );
+    }
+
+    let typed = typed_rar_envelope();
+    let mut changed_request_type = typed.request().clone();
+    changed_request_type.re_auth_request_type = SwmReAuthRequestType::AuthorizeAuthenticate;
+    let changed_request_type = SwmReAuthRequestEnvelope::for_outbound(
+        changed_request_type,
+        typed.transaction(),
+        expected_re_auth_peer(CONNECTION_A),
+    );
+    assert!(
+        !typed.same_replay_payload(&changed_request_type),
+        "Re-Auth-Request-Type is immutable even when the changed typed value cannot encode as SWm"
+    );
+}
+
+#[test]
+fn rar_replay_payload_preserves_proxy_route_and_retained_avp_identity_and_order() {
+    const EXTENSION_VALUE: &[u8] = b"rar-extension-one.example";
+
+    let mut initial_avps = rar_avps();
+    initial_avps[8] = proxy_info_with(b"proxy-one.example", b"proxy-state-one.example");
+    initial_avps.insert(
+        9,
+        proxy_info_with(b"proxy-two.example", b"proxy-state-two.example"),
+    );
+    initial_avps[10] = avp(base::AVP_ROUTE_RECORD, 0x40, b"route-one.example");
+    initial_avps.insert(11, avp(base::AVP_ROUTE_RECORD, 0x40, b"route-two.example"));
+    initial_avps[12] = avp(AvpCode::new(UNKNOWN), 0x00, EXTENSION_VALUE);
+    initial_avps.push(avp(
+        AvpCode::new(UNKNOWN + 1),
+        0x00,
+        b"rar-extension-two.example",
+    ));
+    let initial =
+        parsed_re_auth_request(&message(258, 0xc0, HOP_RAR, END_RAR, initial_avps.clone()));
+    let changed = |avps| parsed_re_auth_request(&message(258, 0xc0, HOP_RAR, END_RAR, avps));
+
+    let mut changed_proxy_host = initial_avps.clone();
+    changed_proxy_host[8] = proxy_info_with(b"changed-proxy.example", b"proxy-state-one.example");
+    assert!(!initial.same_replay_payload(&changed(changed_proxy_host)));
+
+    let mut changed_proxy_state = initial_avps.clone();
+    changed_proxy_state[8] = proxy_info_with(b"proxy-one.example", b"changed-proxy-state.example");
+    assert!(!initial.same_replay_payload(&changed(changed_proxy_state)));
+
+    let mut reordered_proxy = initial_avps.clone();
+    reordered_proxy.swap(8, 9);
+    assert!(!initial.same_replay_payload(&changed(reordered_proxy)));
+
+    let mut changed_route = initial_avps.clone();
+    changed_route[10] = avp(base::AVP_ROUTE_RECORD, 0x40, b"changed-route.example");
+    assert!(!initial.same_replay_payload(&changed(changed_route)));
+
+    let mut reordered_route = initial_avps.clone();
+    reordered_route.swap(10, 11);
+    assert!(!initial.same_replay_payload(&changed(reordered_route)));
+
+    let mut changed_extension_value = initial_avps.clone();
+    changed_extension_value[12] = avp(
+        AvpCode::new(UNKNOWN),
+        0x00,
+        b"changed-rar-extension.example",
+    );
+    assert!(!initial.same_replay_payload(&changed(changed_extension_value)));
+
+    let mut changed_extension_code = initial_avps.clone();
+    changed_extension_code[12] = avp(AvpCode::new(UNKNOWN + 2), 0x00, EXTENSION_VALUE);
+    assert!(!initial.same_replay_payload(&changed(changed_extension_code)));
+
+    let mut changed_extension_flags = initial_avps.clone();
+    changed_extension_flags[12] = avp(AvpCode::new(UNKNOWN), 0x20, EXTENSION_VALUE);
+    assert!(!initial.same_replay_payload(&changed(changed_extension_flags)));
+
+    let mut changed_extension_vendor = initial_avps.clone();
+    changed_extension_vendor[12] = vendor_avp(AvpCode::new(UNKNOWN), 0x00, EXTENSION_VALUE);
+    assert!(!initial.same_replay_payload(&changed(changed_extension_vendor)));
+
+    let mut reordered_extension = initial_avps;
+    reordered_extension.swap(12, 13);
+    assert!(!initial.same_replay_payload(&changed(reordered_extension)));
+}
+
+#[test]
+fn rar_replay_payload_result_and_diagnostics_are_redaction_safe() {
+    let mut initial_avps = rar_avps();
+    initial_avps[0] = avp(base::AVP_SESSION_ID, 0x40, b"secret-session.example");
+    initial_avps[1] = avp(base::AVP_ORIGIN_HOST, 0x40, b"secret-origin-host.example");
+    initial_avps[2] = avp(base::AVP_ORIGIN_REALM, 0x40, b"secret-origin-realm.example");
+    initial_avps[3] = avp(
+        base::AVP_DESTINATION_REALM,
+        0x40,
+        b"secret-destination-realm.example",
+    );
+    initial_avps[4] = avp(
+        base::AVP_DESTINATION_HOST,
+        0x40,
+        b"secret-destination-host.example",
+    );
+    initial_avps[7] = avp(base::AVP_USER_NAME, 0x40, b"secret-user@identity.example");
+    initial_avps[8] = proxy_info_with(b"secret-proxy-host.example", b"secret-proxy-state.example");
+    initial_avps[9] = avp(base::AVP_ROUTE_RECORD, 0x40, b"secret-route.example");
+    initial_avps[10] = avp(AvpCode::new(UNKNOWN), 0x00, b"secret-extension.example");
+    let secret_connection_value = 91_841_800_001_u64;
+    let secret_connection = SwmDiameterConnectionToken::new(
+        NonZeroU64::new(secret_connection_value).expect("synthetic connection token is nonzero"),
+    );
+    let initial = swm::parse_swm_re_auth_request_envelope(
+        &decode(&message(258, 0xc0, HOP_RAR, END_RAR, initial_avps.clone())),
+        DecodeContext::default(),
+    )
+    .expect("redaction fixture must parse")
+    .with_expected_answer_peer(SwmExpectedAnswerPeer::direct(
+        secret_connection,
+        "secret-peer.example",
+        "secret-peer-realm.example",
+    ));
+    initial_avps[10] = avp(
+        AvpCode::new(UNKNOWN),
+        0x00,
+        b"changed-secret-extension.example",
+    );
+    let changed = parsed_re_auth_request(&message(258, 0xc0, HOP_RAR, END_RAR, initial_avps));
+    let same = initial.same_replay_payload(&changed);
+    let extension_display = format!(
+        "{}",
+        initial
+            .request()
+            .additional_avps
+            .last()
+            .expect("fixture retains the synthetic extension")
+    );
+    let diagnostics =
+        format!("initial={initial:?};changed={changed:?};same={same:?};avp={extension_display}");
+
+    assert!(!same);
+    for sensitive in [
+        "secret-session.example",
+        "secret-origin-host.example",
+        "secret-origin-realm.example",
+        "secret-destination-realm.example",
+        "secret-destination-host.example",
+        "secret-user@identity.example",
+        "secret-proxy-host.example",
+        "secret-proxy-state.example",
+        "secret-route.example",
+        "secret-extension.example",
+        "changed-secret-extension.example",
+        "secret-peer.example",
+        "secret-peer-realm.example",
+    ] {
+        assert!(!diagnostics.contains(sensitive), "leaked {sensitive}");
+    }
+    assert!(!diagnostics.contains(&secret_connection_value.to_string()));
 }
 
 #[test]

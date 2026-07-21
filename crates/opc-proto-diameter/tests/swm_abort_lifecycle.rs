@@ -464,6 +464,312 @@ fn retransmission_t_bit_is_retained_and_outbound_failover_resend_is_explicit() {
 }
 
 #[test]
+fn asr_replay_payload_accepts_only_retransmission_authorized_envelope_changes() {
+    let initial =
+        parsed_asr(&asr_wire(Some(0))).with_expected_answer_peer(expected_epdg(EPDG_CONNECTION));
+
+    let mut failover = initial.clone();
+    failover.mark_for_failover_retransmission(
+        HOP_BY_HOP.wrapping_add(1),
+        expected_epdg(EPDG_CONNECTION + 1),
+    );
+    assert!(initial.same_replay_payload(&failover));
+    assert!(failover.same_replay_payload(&initial));
+    assert_ne!(initial, failover);
+
+    let changed_hop = parsed_asr(&wire_message(
+        0xc0,
+        HOP_BY_HOP.wrapping_add(1),
+        END_TO_END,
+        asr_avps(Some(0)),
+    ))
+    .with_expected_answer_peer(expected_epdg(EPDG_CONNECTION));
+    assert!(initial.same_replay_payload(&changed_hop));
+    assert_ne!(initial, changed_hop);
+
+    let changed_t = parsed_asr(&wire_message(
+        0xd0,
+        HOP_BY_HOP,
+        END_TO_END,
+        asr_avps(Some(0)),
+    ))
+    .with_expected_answer_peer(expected_epdg(EPDG_CONNECTION));
+    assert!(initial.same_replay_payload(&changed_t));
+    assert_ne!(initial, changed_t);
+
+    let changed_binding = parsed_asr(&asr_wire(Some(0)))
+        .with_expected_answer_peer(expected_epdg(EPDG_CONNECTION + 1));
+    assert!(initial.same_replay_payload(&changed_binding));
+    assert_ne!(initial, changed_binding);
+
+    let changed_end_to_end = parsed_asr(&wire_message(
+        0xc0,
+        HOP_BY_HOP,
+        END_TO_END.wrapping_add(1),
+        asr_avps(Some(0)),
+    ))
+    .with_expected_answer_peer(expected_epdg(EPDG_CONNECTION));
+    assert!(!initial.same_replay_payload(&changed_end_to_end));
+}
+
+#[test]
+fn asr_replay_payload_matches_public_build_parse_roundtrip() {
+    let mut request = parsed_asr(&asr_wire(Some(0))).request().clone();
+    request.additional_avps = vec![SwmAdditionalAvp::new(
+        AvpHeader::ietf(AvpCode::new(10_418), false),
+        b"asr-roundtrip-extension.example".to_vec(),
+        EncodeContext::default(),
+    )
+    .expect("synthetic ASR extension must frame")];
+    let outbound = SwmAbortSessionRequestEnvelope::for_outbound(
+        request,
+        SwmDiameterTransaction::new(HOP_BY_HOP, END_TO_END),
+        expected_epdg(EPDG_CONNECTION),
+    );
+    let built = swm::build_swm_abort_session_request(&outbound, EncodeContext::default())
+        .expect("public ASR envelope must build");
+    let wire = encode(&built);
+    let restored = parsed_asr(&wire).with_expected_answer_peer(expected_epdg(EPDG_CONNECTION));
+
+    assert!(outbound.same_replay_payload(&restored));
+    assert!(restored.same_replay_payload(&outbound));
+    assert_ne!(
+        outbound, restored,
+        "derived AVP lengths are not payload facts"
+    );
+}
+
+#[test]
+fn asr_replay_payload_rejects_every_changed_typed_request_fact() {
+    let initial = parsed_asr(&asr_wire(Some(0)));
+    let replacements = [
+        (
+            0,
+            wire_avp(base::AVP_SESSION_ID.get(), 0x40, b"changed-session.example"),
+        ),
+        (1, wire_avp(swm::AVP_DRMP.get(), 0x00, &6_u32.to_be_bytes())),
+        (
+            2,
+            wire_avp(
+                base::AVP_ORIGIN_HOST.get(),
+                0x40,
+                b"changed-origin-host.example",
+            ),
+        ),
+        (
+            3,
+            wire_avp(
+                base::AVP_ORIGIN_REALM.get(),
+                0x40,
+                b"changed-origin-realm.example",
+            ),
+        ),
+        (
+            4,
+            wire_avp(
+                base::AVP_DESTINATION_REALM.get(),
+                0x40,
+                b"changed-destination-realm.example",
+            ),
+        ),
+        (
+            5,
+            wire_avp(
+                base::AVP_DESTINATION_HOST.get(),
+                0x40,
+                b"changed-destination-host.example",
+            ),
+        ),
+        (
+            7,
+            wire_avp(
+                base::AVP_USER_NAME.get(),
+                0x40,
+                b"changed-user@identity.example",
+            ),
+        ),
+        (
+            8,
+            wire_avp(
+                base::AVP_AUTH_SESSION_STATE.get(),
+                0x40,
+                &1_u32.to_be_bytes(),
+            ),
+        ),
+        (
+            9,
+            wire_avp(base::AVP_ORIGIN_STATE_ID.get(), 0x40, &78_u32.to_be_bytes()),
+        ),
+    ];
+
+    for (index, replacement) in replacements {
+        let mut changed_avps = asr_avps(Some(0));
+        changed_avps[index] = replacement;
+        let changed = parsed_asr(&wire_message(0xc0, HOP_BY_HOP, END_TO_END, changed_avps));
+        assert!(
+            !initial.same_replay_payload(&changed),
+            "changed ASR fact at fixture index {index} must not replay-match"
+        );
+    }
+
+    let implicit_state = parsed_asr(&asr_wire(None));
+    assert_eq!(
+        initial.request().effective_auth_session_state(),
+        implicit_state.request().effective_auth_session_state()
+    );
+    assert!(
+        !initial.same_replay_payload(&implicit_state),
+        "explicit and omitted Auth-Session-State have different retained payloads"
+    );
+}
+
+#[test]
+fn asr_replay_payload_preserves_proxy_route_and_retained_avp_identity_and_order() {
+    const EXTENSION_VALUE: &[u8] = b"abort-cause-like-extension.example";
+
+    let mut initial_avps = asr_avps(Some(0));
+    initial_avps[10] = proxy_info(b"proxy-one.example", b"proxy-state-one.example");
+    initial_avps[11] = proxy_info(b"proxy-two.example", b"proxy-state-two.example");
+    initial_avps[17] = wire_avp(UNKNOWN_OPTIONAL_AVP, 0x00, EXTENSION_VALUE);
+    let initial = parsed_asr(&wire_message(
+        0xc0,
+        HOP_BY_HOP,
+        END_TO_END,
+        initial_avps.clone(),
+    ));
+    let changed = |avps| parsed_asr(&wire_message(0xc0, HOP_BY_HOP, END_TO_END, avps));
+
+    let mut changed_proxy_host = initial_avps.clone();
+    changed_proxy_host[10] = proxy_info(b"changed-proxy-host.example", b"proxy-state-one.example");
+    assert!(!initial.same_replay_payload(&changed(changed_proxy_host)));
+
+    let mut changed_proxy_state = initial_avps.clone();
+    changed_proxy_state[10] = proxy_info(b"proxy-one.example", b"changed-proxy-state.example");
+    assert!(!initial.same_replay_payload(&changed(changed_proxy_state)));
+
+    let mut reordered_proxy = initial_avps.clone();
+    reordered_proxy.swap(10, 11);
+    assert!(!initial.same_replay_payload(&changed(reordered_proxy)));
+
+    let mut changed_route = initial_avps.clone();
+    changed_route[12] = wire_avp(base::AVP_ROUTE_RECORD.get(), 0x40, b"changed-route.example");
+    assert!(!initial.same_replay_payload(&changed(changed_route)));
+
+    let mut reordered_route = initial_avps.clone();
+    reordered_route.swap(12, 13);
+    assert!(!initial.same_replay_payload(&changed(reordered_route)));
+
+    let mut changed_extension_value = initial_avps.clone();
+    changed_extension_value[17] = wire_avp(
+        UNKNOWN_OPTIONAL_AVP,
+        0x00,
+        b"changed-abort-cause-like-extension.example",
+    );
+    assert!(
+        !initial.same_replay_payload(&changed(changed_extension_value)),
+        "an abort-cause-like retained extension value is immutable replay state"
+    );
+
+    let mut changed_extension_code = initial_avps.clone();
+    changed_extension_code[17] = wire_avp(UNKNOWN_OPTIONAL_AVP + 1, 0x00, EXTENSION_VALUE);
+    assert!(!initial.same_replay_payload(&changed(changed_extension_code)));
+
+    let mut changed_extension_flags = initial_avps.clone();
+    changed_extension_flags[17] = wire_avp(UNKNOWN_OPTIONAL_AVP, 0x20, EXTENSION_VALUE);
+    assert!(!initial.same_replay_payload(&changed(changed_extension_flags)));
+
+    let mut changed_extension_vendor = initial_avps.clone();
+    changed_extension_vendor[17] =
+        wire_vendor_avp(UNKNOWN_OPTIONAL_AVP, 0x00, 10_418, EXTENSION_VALUE);
+    assert!(!initial.same_replay_payload(&changed(changed_extension_vendor)));
+
+    let second_extension = wire_avp(UNKNOWN_OPTIONAL_AVP + 1, 0x00, b"second-extension.example");
+    let mut ordered_extensions = initial_avps.clone();
+    ordered_extensions.push(second_extension);
+    let ordered = changed(ordered_extensions.clone());
+    ordered_extensions.swap(17, 18);
+    let reordered = changed(ordered_extensions);
+    assert!(!ordered.same_replay_payload(&reordered));
+}
+
+#[test]
+fn asr_replay_payload_result_and_diagnostics_are_redaction_safe() {
+    let mut initial_avps = asr_avps(Some(0));
+    initial_avps[0] = wire_avp(base::AVP_SESSION_ID.get(), 0x40, b"secret-session.example");
+    initial_avps[2] = wire_avp(
+        base::AVP_ORIGIN_HOST.get(),
+        0x40,
+        b"secret-origin-host.example",
+    );
+    initial_avps[3] = wire_avp(
+        base::AVP_ORIGIN_REALM.get(),
+        0x40,
+        b"secret-origin-realm.example",
+    );
+    initial_avps[4] = wire_avp(
+        base::AVP_DESTINATION_REALM.get(),
+        0x40,
+        b"secret-destination-realm.example",
+    );
+    initial_avps[5] = wire_avp(
+        base::AVP_DESTINATION_HOST.get(),
+        0x40,
+        b"secret-destination-host.example",
+    );
+    initial_avps[7] = wire_avp(
+        base::AVP_USER_NAME.get(),
+        0x40,
+        b"secret-user@identity.example",
+    );
+    initial_avps[10] = proxy_info(b"secret-proxy-host.example", b"secret-proxy-state.example");
+    initial_avps[12] = wire_avp(base::AVP_ROUTE_RECORD.get(), 0x40, b"secret-route.example");
+    initial_avps[17] = wire_avp(UNKNOWN_OPTIONAL_AVP, 0x00, b"secret-extension.example");
+    let initial = parsed_asr(&wire_message(
+        0xc0,
+        HOP_BY_HOP,
+        END_TO_END,
+        initial_avps.clone(),
+    ))
+    .with_expected_answer_peer(expected_epdg(EPDG_CONNECTION));
+    initial_avps[17] = wire_avp(
+        UNKNOWN_OPTIONAL_AVP,
+        0x00,
+        b"changed-secret-extension.example",
+    );
+    let changed = parsed_asr(&wire_message(0xc0, HOP_BY_HOP, END_TO_END, initial_avps))
+        .with_expected_answer_peer(expected_epdg(EPDG_CONNECTION + 1));
+    let same = initial.same_replay_payload(&changed);
+    let extension_display = format!(
+        "{}",
+        initial
+            .request()
+            .additional_avps
+            .last()
+            .expect("fixture retains the synthetic extension")
+    );
+    let diagnostics =
+        format!("initial={initial:?};changed={changed:?};same={same:?};avp={extension_display}");
+
+    assert!(!same);
+    for sensitive in [
+        "secret-session.example",
+        "secret-origin-host.example",
+        "secret-origin-realm.example",
+        "secret-destination-realm.example",
+        "secret-destination-host.example",
+        "secret-user@identity.example",
+        "secret-proxy-host.example",
+        "secret-proxy-state.example",
+        "secret-route.example",
+        "secret-extension.example",
+        "changed-secret-extension.example",
+    ] {
+        assert!(!diagnostics.contains(sensitive), "leaked {sensitive}");
+    }
+    assert!(!diagnostics.contains(&EPDG_CONNECTION.to_string()));
+}
+
+#[test]
 fn correlation_requires_binding_and_exact_connection_generation() {
     let answer_wire = asa_wire(base::RESULT_CODE_DIAMETER_SUCCESS, 0x40);
     let unbound = parsed_asr(&asr_wire(Some(0)));

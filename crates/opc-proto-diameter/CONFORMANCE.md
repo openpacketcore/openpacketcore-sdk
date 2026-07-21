@@ -537,6 +537,17 @@ realm matching is ASCII case-insensitive. An answer arriving on the old
 connection, or using the old Hop-by-Hop Identifier on the replacement
 connection, fails closed.
 
+`SwmAbortSessionRequestEnvelope::same_replay_payload` provides the stricter
+typed-payload preflight needed before a duplicate cache reuses a committed ASA.
+It requires the End-to-End Identifier, P, every typed request field, exact
+optional-field presence, ordered Route-Record/additional AVPs, and the raw
+ordered Proxy-Info chain. It ignores Hop-by-Hop, T, expected-answer peer
+binding, and only the derived retained-AVP length; retained code, flags,
+Vendor-Id, and value stay exact. The standardized SWm ASR grammar has no
+dedicated Abort-Cause field. `Auth-Session-State` is compared exactly, and any
+abort-cause-like deployment extension remains an opaque additional AVP whose
+header, value, and order are compared without exposing them.
+
 For the same typed ASA, T-clear and same-Hop T-set duplicates rebuild
 byte-identical answer bytes. A failover duplicate with a newly allocated
 Hop-by-Hop Identifier has the same flags, End-to-End Identifier, and AVPs with
@@ -566,7 +577,10 @@ bounded grouped/count behavior,
 and redacted diagnostics. Negative cases cover wrong role/vendor/type/header/
 application, duplicate singletons, peer/session/user/proxy/overload drift,
 malformed OC/Load groups, unknown mandatory AVPs, and the TS-specific Load
-and DRMP receive-tolerant/originate-clear M-bit contract.
+and DRMP receive-tolerant/originate-clear M-bit contract. Public replay-payload
+regressions independently cover failover equality, each authorized exclusion,
+every typed field, retained AVP identity/order, Proxy-Info and Route-Record
+order, encode/parse normalization, and redacted diagnostics.
 
 This is protocol machinery, not a live-session authority. Active-session
 lookup, duplicate/retry timers, transport pending-request consumption,
@@ -637,6 +651,15 @@ transition caches that replacement-bound T-set form and correlates the terminal 
 replay and repeated AAR retrieval are byte-identical within each state.
 Duplicate detection, retry timers, cache lifetime, session lookup, and policy
 mutation remain downstream responsibilities.
+
+`SwmReAuthRequestEnvelope::same_replay_payload` gives a server-side duplicate
+cache the corresponding RAR preflight. It requires the End-to-End Identifier,
+P, every typed request fact including Re-Auth-Request-Type, ordered
+Route-Record/additional AVPs, and the exact Proxy-Info chain. Hop-by-Hop, T,
+expected-answer peer binding, and encoder-derived retained-AVP length are the
+only exclusions; code, flags, Vendor-Id, value, and ordering remain exact. The
+boolean result and diagnostics expose none of those retained values, and the
+operation owns no cache or authorization policy.
 
 Both exchanges correlate the authenticated connection generation, Hop-by-Hop
 and End-to-End identifiers, P, every present Session-Id/User-Name, the ordered

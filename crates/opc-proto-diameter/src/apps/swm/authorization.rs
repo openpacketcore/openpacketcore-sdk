@@ -448,6 +448,24 @@ pub struct SwmReAuthRequest {
     pub additional_avps: Vec<SwmAdditionalAvp>,
 }
 
+impl SwmReAuthRequest {
+    fn has_same_replay_fields(&self, other: &Self) -> bool {
+        self.session_id == other.session_id
+            && self.origin_host == other.origin_host
+            && self.origin_realm == other.origin_realm
+            && self.destination_realm == other.destination_realm
+            && self.destination_host == other.destination_host
+            && self.re_auth_request_type == other.re_auth_request_type
+            && self.user_name == other.user_name
+            && self.drmp == other.drmp
+            && self.route_records == other.route_records
+            && lifecycle::additional_avp_sequences_match(
+                &self.additional_avps,
+                &other.additional_avps,
+            )
+    }
+}
+
 impl fmt::Debug for SwmReAuthRequest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -808,6 +826,28 @@ impl SwmReAuthRequestEnvelope {
     #[must_use]
     pub fn proxy_info_count(&self) -> usize {
         self.proxy_infos.len()
+    }
+
+    /// Return whether `other` carries the same immutable RAR replay payload.
+    ///
+    /// RFC 6733 sections 3 and 5.5.4 define duplicate identity and the
+    /// hop-local fields that may change during failover. This SDK operation
+    /// adds a stricter typed-payload guard for duplicate caches. It includes
+    /// the End-to-End Identifier, P bit, every typed request fact, ordered
+    /// Route-Record and extension AVPs, and the exact ordered Proxy-Info chain.
+    /// It deliberately ignores the Hop-by-Hop Identifier, T bit, and
+    /// expected-answer peer binding. Derived AVP length fields are also ignored
+    /// because encoding computes them from the retained value.
+    ///
+    /// The result is only a boolean and exposes no retained AVP value. Active
+    /// session ownership, duplicate-cache lifetime, and replay disposition
+    /// remain consumer policy.
+    #[must_use]
+    pub fn same_replay_payload(&self, other: &Self) -> bool {
+        self.transaction.end_to_end_identifier() == other.transaction.end_to_end_identifier()
+            && self.proxiable == other.proxiable
+            && self.request.has_same_replay_fields(&other.request)
+            && lifecycle::additional_avp_sequences_match(&self.proxy_infos, &other.proxy_infos)
     }
 
     /// Consume and correlate a parsed RAA with this exact RAR.
@@ -4012,4 +4052,36 @@ fn find_definition(key: AvpKey) -> Option<&'static AvpDefinition> {
 fn encode_error(reason: &'static str, section: &'static str) -> EncodeError {
     EncodeError::new(EncodeErrorCode::Structural { reason })
         .with_spec_ref(SpecRef::new("3gpp", "TS29273", section))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn re_auth_replay_payload_requires_the_same_proxiable_bit() {
+        let initial = SwmReAuthRequestEnvelope {
+            transaction: SwmDiameterTransaction::new(1, 2),
+            proxiable: true,
+            potentially_retransmitted: false,
+            expected_answer_peer: None,
+            request: SwmReAuthRequest {
+                session_id: Redacted::from("synthetic-session.example"),
+                origin_host: Redacted::from("origin-host.example"),
+                origin_realm: Redacted::from("origin-realm.example"),
+                destination_realm: Redacted::from("destination-realm.example"),
+                destination_host: Redacted::from("destination-host.example"),
+                re_auth_request_type: SwmReAuthRequestType::AuthorizeOnly,
+                user_name: Redacted::from("synthetic-user@identity.example"),
+                drmp: None,
+                route_records: Vec::new(),
+                additional_avps: Vec::new(),
+            },
+            proxy_infos: Vec::new(),
+        };
+        let mut changed = initial.clone();
+        changed.proxiable = false;
+
+        assert!(!initial.same_replay_payload(&changed));
+    }
 }
