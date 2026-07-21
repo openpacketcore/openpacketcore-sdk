@@ -11,7 +11,8 @@ use opc_proto_diameter::apps::swm::{
     SwmDiameterEapAnswerEnvelope, SwmDiameterEapRequest, SwmDiameterEapRequestEnvelope,
     SwmDiameterResult, SwmDiameterTransaction, SwmEmergencyAuthorizationError,
     SwmEmergencyAuthorizationEvidence, SwmEmergencyAuthorizationPath, SwmEmergencyServices,
-    SwmRatType, SwmResultCategory, SwmTerminalInformation,
+    SwmMip6FeatureVector, SwmRatType, SwmRequestedSupportedFeatures, SwmResultCategory,
+    SwmSupportedFeatureList, SwmSupportedFeaturesRequirement, SwmTerminalInformation,
 };
 use opc_proto_diameter::{
     apps, base, ApplicationId, AvpCode, AvpDataType, AvpFlags, AvpHeader, AvpKey, CommandCode,
@@ -362,6 +363,100 @@ fn swm_der_dea_round_trip() {
 
 #[test]
 #[cfg(feature = "app-swm")]
+fn swm_new_access_fields_are_wire_compatible_when_absent() {
+    let request = sample_swm_request();
+    let built_request = apps::swm::build_swm_diameter_eap_request(
+        &request,
+        0x1111_2222,
+        0x3333_4444,
+        EncodeContext::default(),
+    )
+    .expect("legacy-shaped DER");
+    let mut expected_request_avps = BytesMut::new();
+    for avp in [
+        encode_raw_avp(base::AVP_SESSION_ID, true, b"sess;swm;001"),
+        encode_raw_avp(
+            base::AVP_AUTH_APPLICATION_ID,
+            true,
+            &apps::swm::APPLICATION_ID.get().to_be_bytes(),
+        ),
+        encode_raw_avp(base::AVP_ORIGIN_HOST, true, b"epdg.example"),
+        encode_raw_avp(base::AVP_ORIGIN_REALM, true, b"visited.example"),
+        encode_raw_avp(base::AVP_DESTINATION_REALM, true, b"home.example"),
+        encode_raw_avp(base::AVP_DESTINATION_HOST, true, b"aaa.home.example"),
+        encode_raw_avp(apps::swm::AVP_AUTH_REQUEST_TYPE, true, &3u32.to_be_bytes()),
+        encode_raw_avp(
+            base::AVP_USER_NAME,
+            true,
+            b"601010123456789@nai.epc.mnc001.mcc001.3gppnetwork.org",
+        ),
+        encode_raw_avp(apps::swm::AVP_STATE, true, b"opaque-state"),
+        encode_raw_avp(
+            apps::swm::AVP_EAP_PAYLOAD,
+            true,
+            &[0x02, 0x17, 0x00, 0x08, 0x32, 0x01, 0x02, 0x03],
+        ),
+    ] {
+        expected_request_avps.extend_from_slice(&avp);
+    }
+    let expected_request = OwnedMessage {
+        header: Header::new(
+            CommandFlags::request(true),
+            apps::swm::COMMAND_DIAMETER_EAP,
+            apps::swm::APPLICATION_ID,
+            0x1111_2222,
+            0x3333_4444,
+        ),
+        raw_avps: expected_request_avps.freeze(),
+    };
+    assert_eq!(
+        encode_message(&built_request),
+        encode_message(&expected_request)
+    );
+
+    let answer = sample_swm_answer();
+    let built_answer = apps::swm::build_swm_diameter_eap_answer(
+        &answer,
+        0x5555_6666,
+        0x7777_8888,
+        EncodeContext::default(),
+    )
+    .expect("legacy-shaped DEA");
+    let mut expected_answer_avps = BytesMut::new();
+    for avp in [
+        encode_raw_avp(base::AVP_SESSION_ID, true, b"sess;swm;001"),
+        encode_raw_avp(
+            base::AVP_AUTH_APPLICATION_ID,
+            true,
+            &apps::swm::APPLICATION_ID.get().to_be_bytes(),
+        ),
+        encode_raw_avp(apps::swm::AVP_AUTH_REQUEST_TYPE, true, &3u32.to_be_bytes()),
+        encode_raw_avp(base::AVP_RESULT_CODE, true, &2001u32.to_be_bytes()),
+        encode_raw_avp(base::AVP_ORIGIN_HOST, true, b"aaa.home.example"),
+        encode_raw_avp(base::AVP_ORIGIN_REALM, true, b"home.example"),
+        encode_raw_avp(apps::swm::AVP_EAP_PAYLOAD, true, &[0x03, 0x18, 0x00, 0x04]),
+        encode_raw_avp(apps::swm::AVP_EAP_MASTER_SESSION_KEY, false, &[0xaa; 32]),
+    ] {
+        expected_answer_avps.extend_from_slice(&avp);
+    }
+    let expected_answer = OwnedMessage {
+        header: Header::new(
+            CommandFlags::answer(true, false),
+            apps::swm::COMMAND_DIAMETER_EAP,
+            apps::swm::APPLICATION_ID,
+            0x5555_6666,
+            0x7777_8888,
+        ),
+        raw_avps: expected_answer_avps.freeze(),
+    };
+    assert_eq!(
+        encode_message(&built_answer),
+        encode_message(&expected_answer)
+    );
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
 fn swm_der_access_context_has_exact_wire_profile_and_round_trips() {
     const APN: &str = "ims.mnc001.mcc001.gprs";
 
@@ -421,6 +516,1120 @@ fn swm_der_access_context_has_exact_wire_profile_and_round_trips() {
         Some(APN)
     );
     assert!(!format!("{parsed:?}").contains(APN));
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_mobility_supported_features_and_ue_ip_round_trip_with_exact_flags() {
+    let second_list = SwmSupportedFeatureList::new(VendorId::new(55_555), 9, 0x0000_0005);
+    let mut request = sample_swm_request();
+    request.mip6_feature_vector = Some(SwmMip6FeatureVector::gtpv2_only());
+    request.supported_features = vec![
+        SwmRequestedSupportedFeatures::swm_discovery(),
+        SwmRequestedSupportedFeatures::required(second_list.clone()),
+    ];
+    request.ue_local_ip_address = Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)));
+
+    let built = apps::swm::build_swm_diameter_eap_request(
+        &request,
+        0x1020_3040,
+        0x5060_7080,
+        EncodeContext::default(),
+    )
+    .expect("typed mobility DER build");
+    let encoded = encode_message(&built);
+    let (tail, decoded) = Message::decode_with_dictionary(
+        &encoded,
+        DecodeContext::default(),
+        SWM_BASELINE_DICTIONARIES,
+    )
+    .expect("dictionary validates typed mobility DER");
+    assert!(tail.is_empty());
+
+    let avps = decoded
+        .avps(DecodeContext::default())
+        .collect::<Result<Vec<_>, _>>()
+        .expect("typed mobility AVPs");
+    let mip6 = avps
+        .iter()
+        .find(|avp| avp.header.code == apps::swm::AVP_MIP6_FEATURE_VECTOR)
+        .expect("MIP6-Feature-Vector");
+    assert_eq!(mip6.header.vendor_id, None);
+    assert!(mip6.header.flags.is_mandatory());
+    assert!(!mip6.header.flags.is_protected());
+    assert_eq!(
+        mip6.value,
+        &[0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00]
+    );
+
+    let supported = avps
+        .iter()
+        .filter(|avp| avp.header.code == apps::swm::AVP_SUPPORTED_FEATURES)
+        .collect::<Vec<_>>();
+    assert_eq!(supported.len(), 2);
+    assert!(!supported[0].header.flags.is_mandatory());
+    assert!(supported[1].header.flags.is_mandatory());
+
+    let ue_ip = avps
+        .iter()
+        .find(|avp| avp.header.code == apps::swm::AVP_UE_LOCAL_IP_ADDRESS)
+        .expect("UE-Local-IP-Address");
+    assert_eq!(ue_ip.header.vendor_id, Some(apps::VENDOR_ID_3GPP));
+    assert!(!ue_ip.header.flags.is_mandatory());
+    assert!(!ue_ip.header.flags.is_protected());
+    assert_eq!(ue_ip.value, &[0x00, 0x01, 198, 51, 100, 7]);
+
+    let parsed = apps::swm::parse_swm_diameter_eap_request(&decoded, DecodeContext::default())
+        .expect("typed mobility DER parse");
+    assert_eq!(parsed, request);
+    let debug = format!("{parsed:?}");
+    assert!(!debug.contains("198.51.100.7"));
+    assert!(!debug.contains("18014398509481984"));
+
+    let mut answer = sample_swm_answer();
+    answer.mip6_feature_vector = Some(SwmMip6FeatureVector::from_bits_retain(
+        SwmMip6FeatureVector::PMIP6_SUPPORTED | SwmMip6FeatureVector::GTPV2_SUPPORTED,
+    ));
+    answer.supported_features = vec![SwmSupportedFeatureList::swm(), second_list];
+    let answer_built = apps::swm::build_swm_diameter_eap_answer_for(
+        &request_envelope(&request, 0x1020_3040, 0x5060_7080),
+        &answer,
+        EncodeContext::default(),
+    )
+    .expect("GTPv2-only offer authorizes the collective NBM answer");
+    let answer_encoded = encode_message(&answer_built);
+    let answer_decoded = decode_message(&answer_encoded);
+    let answer_avps = answer_decoded
+        .avps(DecodeContext::default())
+        .collect::<Result<Vec<_>, _>>()
+        .expect("typed mobility DEA AVPs");
+    assert!(answer_avps
+        .iter()
+        .filter(|avp| avp.header.code == apps::swm::AVP_SUPPORTED_FEATURES)
+        .all(|avp| !avp.header.flags.is_mandatory()));
+    assert_eq!(
+        apps::swm::parse_swm_diameter_eap_answer(&answer_decoded, DecodeContext::default())
+            .expect("typed mobility DEA parse"),
+        answer
+    );
+    correlate_exchange(&request, &answer, 0x1020_3040, 0x5060_7080)
+        .expect("collective NBM selection correlates to GTPv2-only offer");
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_understood_m_bits_are_interoperable_and_encoding_is_canonical() {
+    let mip6_m_clear = encode_raw_avp(
+        apps::swm::AVP_MIP6_FEATURE_VECTOR,
+        false,
+        &SwmMip6FeatureVector::GTPV2_SUPPORTED.to_be_bytes(),
+    );
+    let ue_ip_m_set = encode_raw_vendor_avp(
+        apps::swm::AVP_UE_LOCAL_IP_ADDRESS,
+        apps::VENDOR_ID_3GPP,
+        true,
+        &[0x00, 0x01, 192, 0, 2, 10],
+    );
+
+    for child_mandatory in [false, true] {
+        let mut children = BytesMut::new();
+        children.extend_from_slice(&encode_raw_avp(
+            base::AVP_VENDOR_ID,
+            true,
+            &apps::VENDOR_ID_3GPP.get().to_be_bytes(),
+        ));
+        children.extend_from_slice(&encode_raw_vendor_avp(
+            apps::swm::AVP_FEATURE_LIST_ID,
+            apps::VENDOR_ID_3GPP,
+            child_mandatory,
+            &apps::swm::SWM_FEATURE_LIST_ID.to_be_bytes(),
+        ));
+        children.extend_from_slice(&encode_raw_vendor_avp(
+            apps::swm::AVP_FEATURE_LIST,
+            apps::VENDOR_ID_3GPP,
+            child_mandatory,
+            &apps::swm::SWM_FEATURE_LIST.to_be_bytes(),
+        ));
+        let supported = encode_raw_vendor_avp(
+            apps::swm::AVP_SUPPORTED_FEATURES,
+            apps::VENDOR_ID_3GPP,
+            false,
+            &children,
+        );
+        let raw = build_raw_swm_der_with_extras(
+            Some(apps::swm::APPLICATION_ID.get()),
+            3,
+            &[0x02, 0x17, 0x00, 0x04],
+            &[mip6_m_clear.clone(), ue_ip_m_set.clone(), supported],
+        );
+        let wire = encode_message(&raw);
+        let (tail, dictionary_decoded) = Message::decode_with_dictionary(
+            &wire,
+            DecodeContext::default(),
+            SWM_BASELINE_DICTIONARIES,
+        )
+        .expect("dictionary accepts understood M-bit variants");
+        assert!(tail.is_empty());
+        let parsed = apps::swm::parse_swm_diameter_eap_request(
+            &dictionary_decoded,
+            DecodeContext::default(),
+        )
+        .expect("typed parser accepts understood M-bit variants");
+        assert_eq!(
+            parsed.mip6_feature_vector,
+            Some(SwmMip6FeatureVector::gtpv2_only())
+        );
+        assert_eq!(
+            parsed.ue_local_ip_address,
+            Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)))
+        );
+        assert_eq!(
+            parsed.supported_features[0].requirement(),
+            SwmSupportedFeaturesRequirement::Discovery
+        );
+
+        let canonical =
+            apps::swm::build_swm_diameter_eap_request(&parsed, 1, 2, EncodeContext::default())
+                .expect("canonical DER rebuild");
+        let canonical_wire = encode_message(&canonical);
+        let canonical_message = decode_message(&canonical_wire);
+        let canonical_avps = canonical_message
+            .avps(DecodeContext::default())
+            .collect::<Result<Vec<_>, _>>()
+            .expect("canonical DER AVPs");
+        assert!(canonical_avps
+            .iter()
+            .find(|avp| avp.header.code == apps::swm::AVP_MIP6_FEATURE_VECTOR)
+            .expect("canonical MIP6")
+            .header
+            .flags
+            .is_mandatory());
+        assert!(!canonical_avps
+            .iter()
+            .find(|avp| avp.header.code == apps::swm::AVP_UE_LOCAL_IP_ADDRESS)
+            .expect("canonical UE IP")
+            .header
+            .flags
+            .is_mandatory());
+    }
+
+    let raw_answer = build_raw_swm_dea_with_extras(&[mip6_m_clear]);
+    let answer_wire = encode_message(&raw_answer);
+    let (tail, answer_message) = Message::decode_with_dictionary(
+        &answer_wire,
+        DecodeContext::default(),
+        SWM_BASELINE_DICTIONARIES,
+    )
+    .expect("dictionary accepts M-clear MIP6 in DEA");
+    assert!(tail.is_empty());
+    assert_eq!(
+        apps::swm::parse_swm_diameter_eap_answer(&answer_message, DecodeContext::default())
+            .expect("typed parser accepts M-clear MIP6 in DEA")
+            .mip6_feature_vector,
+        Some(SwmMip6FeatureVector::gtpv2_only())
+    );
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_mip6_feature_vector_rejects_malformed_and_uncorrelated_values() {
+    let encode_with_header = |header: AvpHeader, value: &[u8]| {
+        let mut encoded = BytesMut::new();
+        RawAvp {
+            header,
+            value,
+            padding: &[],
+        }
+        .encode(&mut encoded, EncodeContext::default())
+        .expect("synthetic MIP6 AVP");
+        encoded
+    };
+    let valid = encode_raw_avp(
+        apps::swm::AVP_MIP6_FEATURE_VECTOR,
+        true,
+        &SwmMip6FeatureVector::GTPV2_SUPPORTED.to_be_bytes(),
+    );
+    let vendor_collision = encode_raw_vendor_avp(
+        apps::swm::AVP_MIP6_FEATURE_VECTOR,
+        apps::VENDOR_ID_3GPP,
+        false,
+        &SwmMip6FeatureVector::GTPV2_SUPPORTED.to_be_bytes(),
+    );
+    let invalid = [
+        encode_with_header(
+            AvpHeader::ietf(apps::swm::AVP_MIP6_FEATURE_VECTOR, true)
+                .with_flags(AvpFlags::new(false, true, true)),
+            &SwmMip6FeatureVector::GTPV2_SUPPORTED.to_be_bytes(),
+        ),
+        encode_raw_avp(apps::swm::AVP_MIP6_FEATURE_VECTOR, true, &[0x00; 7]),
+        encode_raw_avp(apps::swm::AVP_MIP6_FEATURE_VECTOR, true, &[0x00; 9]),
+    ];
+    for invalid_avp in invalid {
+        let raw = build_raw_swm_der_with_extras(
+            Some(apps::swm::APPLICATION_ID.get()),
+            3,
+            &[0x02, 0x17, 0x00, 0x04],
+            &[invalid_avp],
+        );
+        let wire = encode_message(&raw);
+        apps::swm::parse_swm_diameter_eap_request(&decode_message(&wire), DecodeContext::default())
+            .expect_err("malformed MIP6-Feature-Vector must fail");
+    }
+
+    let collision = build_raw_swm_der_with_extras(
+        Some(apps::swm::APPLICATION_ID.get()),
+        3,
+        &[0x02, 0x17, 0x00, 0x04],
+        std::slice::from_ref(&vendor_collision),
+    );
+    let collision_wire = encode_message(&collision);
+    assert_eq!(
+        apps::swm::parse_swm_diameter_eap_request(
+            &decode_message(&collision_wire),
+            DecodeContext {
+                unknown_ie_policy: UnknownIePolicy::Drop,
+                ..DecodeContext::default()
+            },
+        )
+        .expect("M-clear numeric collision follows Drop policy")
+        .mip6_feature_vector,
+        None
+    );
+    apps::swm::parse_swm_diameter_eap_request(
+        &decode_message(&collision_wire),
+        DecodeContext::conservative(),
+    )
+    .expect_err("strict unknown policy rejects a numeric collision");
+    let critical_collision = build_raw_swm_der_with_extras(
+        Some(apps::swm::APPLICATION_ID.get()),
+        3,
+        &[0x02, 0x17, 0x00, 0x04],
+        &[encode_raw_vendor_avp(
+            apps::swm::AVP_MIP6_FEATURE_VECTOR,
+            apps::VENDOR_ID_3GPP,
+            true,
+            &SwmMip6FeatureVector::GTPV2_SUPPORTED.to_be_bytes(),
+        )],
+    );
+    let critical_collision_wire = encode_message(&critical_collision);
+    apps::swm::parse_swm_diameter_eap_request(
+        &decode_message(&critical_collision_wire),
+        DecodeContext {
+            unknown_ie_policy: UnknownIePolicy::Drop,
+            ..DecodeContext::default()
+        },
+    )
+    .expect_err("M-set numeric collision remains critical");
+
+    let duplicate = build_raw_swm_der_with_extras(
+        Some(apps::swm::APPLICATION_ID.get()),
+        3,
+        &[0x02, 0x17, 0x00, 0x04],
+        &[valid.clone(), valid],
+    );
+    let duplicate_wire = encode_message(&duplicate);
+    assert!(matches!(
+        apps::swm::parse_swm_diameter_eap_request(
+            &decode_message(&duplicate_wire),
+            DecodeContext::default(),
+        )
+        .expect_err("duplicate MIP6 vector")
+        .code(),
+        opc_protocol::DecodeErrorCode::DuplicateIe
+    ));
+
+    let mut invalid_request = sample_swm_request();
+    invalid_request.mip6_feature_vector = Some(SwmMip6FeatureVector::from_bits_retain(
+        SwmMip6FeatureVector::ASSIGN_LOCAL_IP,
+    ));
+    apps::swm::build_swm_diameter_eap_request(&invalid_request, 1, 2, EncodeContext::default())
+        .expect_err("DER cannot advertise answer-only ASSIGN_LOCAL_IP");
+
+    let request = sample_swm_request();
+    let mut answer = sample_swm_answer();
+    answer.mip6_feature_vector = Some(SwmMip6FeatureVector::gtpv2_only());
+    assert!(matches!(
+        correlate_exchange(&request, &answer, 1, 2),
+        Err(SwmEmergencyAuthorizationError::AnswerRequestMismatch)
+    ));
+
+    let mut request = sample_swm_request();
+    request.mip6_feature_vector = Some(SwmMip6FeatureVector::from_bits_retain(
+        SwmMip6FeatureVector::MIP6_INTEGRATED,
+    ));
+    assert!(matches!(
+        correlate_exchange(&request, &answer, 1, 2),
+        Err(SwmEmergencyAuthorizationError::AnswerRequestMismatch)
+    ));
+
+    answer.mip6_feature_vector = Some(SwmMip6FeatureVector::from_bits_retain(
+        SwmMip6FeatureVector::LOCAL_HOME_AGENT_ASSIGNMENT,
+    ));
+    assert!(matches!(
+        correlate_exchange(&request, &answer, 1, 2),
+        Err(SwmEmergencyAuthorizationError::AnswerRequestMismatch)
+    ));
+
+    answer.mip6_feature_vector = Some(SwmMip6FeatureVector::from_bits_retain(
+        SwmMip6FeatureVector::ASSIGN_LOCAL_IP | SwmMip6FeatureVector::GTPV2_SUPPORTED,
+    ));
+    apps::swm::build_swm_diameter_eap_answer(&answer, 1, 2, EncodeContext::default())
+        .expect_err("ASSIGN_LOCAL_IP and NBM are mutually exclusive");
+    let conflicting_answer = build_raw_swm_dea_with_extras(&[encode_raw_avp(
+        apps::swm::AVP_MIP6_FEATURE_VECTOR,
+        true,
+        &(SwmMip6FeatureVector::ASSIGN_LOCAL_IP | SwmMip6FeatureVector::GTPV2_SUPPORTED)
+            .to_be_bytes(),
+    )]);
+    let conflicting_wire = encode_message(&conflicting_answer);
+    apps::swm::parse_swm_diameter_eap_answer(
+        &decode_message(&conflicting_wire),
+        DecodeContext::default(),
+    )
+    .expect_err("received ASSIGN_LOCAL_IP and NBM combination fails");
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_mip6_authorization_is_exact_success_and_request_conditioned() {
+    let mut offered_request = sample_swm_request();
+    offered_request.mip6_feature_vector = Some(SwmMip6FeatureVector::gtpv2_only());
+
+    let success_without_vector = sample_swm_answer();
+    assert!(matches!(
+        correlate_exchange(&offered_request, &success_without_vector, 1, 2),
+        Err(SwmEmergencyAuthorizationError::AnswerRequestMismatch)
+    ));
+
+    let mut success_with_vector = sample_swm_answer();
+    success_with_vector.mip6_feature_vector = Some(SwmMip6FeatureVector::gtpv2_only());
+    correlate_exchange(&offered_request, &success_with_vector, 1, 2)
+        .expect("exact success returns authorization for an offered vector");
+
+    let mut unoffered_request = sample_swm_request();
+    unoffered_request.mip6_feature_vector = None;
+    assert!(matches!(
+        correlate_exchange(&unoffered_request, &success_with_vector, 1, 2),
+        Err(SwmEmergencyAuthorizationError::AnswerRequestMismatch)
+    ));
+
+    let mut multi_round = sample_swm_answer();
+    multi_round.result = SwmDiameterResult::Base(1001);
+    multi_round.eap_payload = Some(vec![0x01, 0x18, 0x00, 0x05, 0x01].into());
+    multi_round.eap_master_session_key = None;
+    correlate_exchange(&offered_request, &multi_round, 1, 2)
+        .expect("non-success response omits authorization while EAP continues");
+
+    multi_round.mip6_feature_vector = Some(SwmMip6FeatureVector::gtpv2_only());
+    apps::swm::build_swm_diameter_eap_answer(&multi_round, 1, 2, EncodeContext::default())
+        .expect_err("multi-round answer cannot carry mobility authorization");
+
+    let raw_multi_round = build_raw_swm_dea_with_result_and_extras(
+        1001,
+        &[encode_raw_avp(
+            apps::swm::AVP_MIP6_FEATURE_VECTOR,
+            true,
+            &SwmMip6FeatureVector::GTPV2_SUPPORTED.to_be_bytes(),
+        )],
+    );
+    let raw_multi_round_wire = encode_message(&raw_multi_round);
+    apps::swm::parse_swm_diameter_eap_answer(
+        &decode_message(&raw_multi_round_wire),
+        DecodeContext::default(),
+    )
+    .expect_err("received non-success answer cannot carry mobility authorization");
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_supported_features_wire_fixture_enforces_group_semantics() {
+    let discovery = encode_supported_features_avp(
+        false,
+        apps::VENDOR_ID_3GPP,
+        apps::swm::SWM_FEATURE_LIST_ID,
+        0,
+        &[],
+    );
+    let raw = build_raw_swm_der_with_extras(
+        Some(apps::swm::APPLICATION_ID.get()),
+        3,
+        &[0x02, 0x17, 0x00, 0x04],
+        std::slice::from_ref(&discovery),
+    );
+    let wire = encode_message(&raw);
+    let parsed =
+        apps::swm::parse_swm_diameter_eap_request(&decode_message(&wire), DecodeContext::default())
+            .expect("independent SWm Supported-Features request fixture");
+    assert_eq!(
+        parsed.supported_features,
+        vec![SwmRequestedSupportedFeatures::swm_discovery()]
+    );
+
+    let answer = build_raw_swm_dea_with_extras(std::slice::from_ref(&discovery));
+    let answer_wire = encode_message(&answer);
+    assert_eq!(
+        apps::swm::parse_swm_diameter_eap_answer(
+            &decode_message(&answer_wire),
+            DecodeContext::default(),
+        )
+        .expect("independent SWm Supported-Features answer fixture")
+        .supported_features,
+        vec![SwmSupportedFeatureList::swm()]
+    );
+
+    let invalid_discovery = encode_supported_features_avp(
+        false,
+        apps::VENDOR_ID_3GPP,
+        apps::swm::SWM_FEATURE_LIST_ID,
+        1,
+        &[],
+    );
+    let mandatory_answer = encode_supported_features_avp(
+        true,
+        apps::VENDOR_ID_3GPP,
+        apps::swm::SWM_FEATURE_LIST_ID,
+        0,
+        &[],
+    );
+    let wrong_child_vendor = encode_supported_features_avp(
+        false,
+        apps::VENDOR_ID_3GPP,
+        apps::swm::SWM_FEATURE_LIST_ID,
+        0,
+        &[encode_raw_vendor_avp(
+            apps::swm::AVP_FEATURE_LIST_ID,
+            VendorId::new(9_999),
+            false,
+            &1u32.to_be_bytes(),
+        )],
+    );
+    let wrong_child_v = encode_supported_features_avp(
+        false,
+        apps::VENDOR_ID_3GPP,
+        apps::swm::SWM_FEATURE_LIST_ID,
+        0,
+        &[encode_raw_avp(
+            apps::swm::AVP_FEATURE_LIST_ID,
+            false,
+            &1u32.to_be_bytes(),
+        )],
+    );
+    let mut protected_child = BytesMut::new();
+    RawAvp {
+        header: AvpHeader::vendor(apps::swm::AVP_FEATURE_LIST, apps::VENDOR_ID_3GPP, false)
+            .with_flags(AvpFlags::new(true, false, true)),
+        value: &0u32.to_be_bytes(),
+        padding: &[],
+    }
+    .encode(&mut protected_child, EncodeContext::default())
+    .expect("protected Feature-List fixture");
+    let wrong_child_p = encode_supported_features_avp(
+        false,
+        apps::VENDOR_ID_3GPP,
+        apps::swm::SWM_FEATURE_LIST_ID,
+        0,
+        &[protected_child],
+    );
+    let wrong_child_length = encode_supported_features_avp(
+        false,
+        apps::VENDOR_ID_3GPP,
+        apps::swm::SWM_FEATURE_LIST_ID,
+        0,
+        &[encode_raw_vendor_avp(
+            apps::swm::AVP_FEATURE_LIST,
+            apps::VENDOR_ID_3GPP,
+            false,
+            &[0, 0, 0],
+        )],
+    );
+    let wrong_list_id_length = encode_supported_features_avp(
+        false,
+        apps::VENDOR_ID_3GPP,
+        apps::swm::SWM_FEATURE_LIST_ID,
+        0,
+        &[encode_raw_vendor_avp(
+            apps::swm::AVP_FEATURE_LIST_ID,
+            apps::VENDOR_ID_3GPP,
+            false,
+            &[0, 0, 0],
+        )],
+    );
+    let wrong_vendor_id_length = encode_supported_features_avp(
+        false,
+        apps::VENDOR_ID_3GPP,
+        apps::swm::SWM_FEATURE_LIST_ID,
+        0,
+        &[encode_raw_avp(base::AVP_VENDOR_ID, true, &[0, 0, 0])],
+    );
+    let mut missing_children = BytesMut::new();
+    missing_children.extend_from_slice(&encode_raw_avp(
+        base::AVP_VENDOR_ID,
+        true,
+        &apps::VENDOR_ID_3GPP.get().to_be_bytes(),
+    ));
+    let missing_feature_list = encode_raw_vendor_avp(
+        apps::swm::AVP_SUPPORTED_FEATURES,
+        apps::VENDOR_ID_3GPP,
+        false,
+        &missing_children,
+    );
+
+    for (index, invalid_group) in [
+        invalid_discovery,
+        wrong_child_p,
+        wrong_child_length,
+        wrong_list_id_length,
+        wrong_vendor_id_length,
+        missing_feature_list,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let invalid = build_raw_swm_der_with_extras(
+            Some(apps::swm::APPLICATION_ID.get()),
+            3,
+            &[0x02, 0x17, 0x00, 0x04],
+            &[invalid_group],
+        );
+        let invalid_wire = encode_message(&invalid);
+        let error = apps::swm::parse_swm_diameter_eap_request(
+            &decode_message(&invalid_wire),
+            DecodeContext::default(),
+        )
+        .expect_err("malformed Supported-Features request must fail");
+        if index == 2 || index == 3 {
+            let spec_ref = error
+                .spec_ref()
+                .expect("Feature-List width error must cite its defining specification");
+            assert_eq!(spec_ref.doc(), "TS29229");
+            assert_eq!(
+                spec_ref.section(),
+                if index == 2 { "6.3.31" } else { "6.3.30" }
+            );
+        }
+    }
+
+    for collision in [wrong_child_vendor, wrong_child_v] {
+        let raw = build_raw_swm_der_with_extras(
+            Some(apps::swm::APPLICATION_ID.get()),
+            3,
+            &[0x02, 0x17, 0x00, 0x04],
+            std::slice::from_ref(&collision),
+        );
+        let wire = encode_message(&raw);
+        assert_eq!(
+            apps::swm::parse_swm_diameter_eap_request(
+                &decode_message(&wire),
+                DecodeContext::default(),
+            )
+            .expect("M-clear child numeric collision is preserved")
+            .supported_features[0]
+                .features()
+                .additional_avps()
+                .len(),
+            1
+        );
+        apps::swm::parse_swm_diameter_eap_request(
+            &decode_message(&wire),
+            DecodeContext::conservative(),
+        )
+        .expect_err("strict unknown policy rejects child numeric collision");
+    }
+
+    let invalid_answer = build_raw_swm_dea_with_extras(&[mandatory_answer]);
+    let invalid_answer_wire = encode_message(&invalid_answer);
+    apps::swm::parse_swm_diameter_eap_answer(
+        &decode_message(&invalid_answer_wire),
+        DecodeContext::default(),
+    )
+    .expect_err("Supported-Features answer must clear M");
+
+    let duplicate = build_raw_swm_der_with_extras(
+        Some(apps::swm::APPLICATION_ID.get()),
+        3,
+        &[0x02, 0x17, 0x00, 0x04],
+        &[discovery.clone(), discovery.clone()],
+    );
+    let duplicate_wire = encode_message(&duplicate);
+    apps::swm::parse_swm_diameter_eap_request(
+        &decode_message(&duplicate_wire),
+        DecodeContext::default(),
+    )
+    .expect_err("duplicate Supported-Features identity must fail");
+
+    let duplicate_child_groups = [
+        encode_supported_features_avp(
+            false,
+            apps::VENDOR_ID_3GPP,
+            apps::swm::SWM_FEATURE_LIST_ID,
+            0,
+            &[encode_raw_avp(
+                base::AVP_VENDOR_ID,
+                true,
+                &apps::VENDOR_ID_3GPP.get().to_be_bytes(),
+            )],
+        ),
+        encode_supported_features_avp(
+            false,
+            apps::VENDOR_ID_3GPP,
+            apps::swm::SWM_FEATURE_LIST_ID,
+            0,
+            &[encode_raw_vendor_avp(
+                apps::swm::AVP_FEATURE_LIST_ID,
+                apps::VENDOR_ID_3GPP,
+                false,
+                &apps::swm::SWM_FEATURE_LIST_ID.to_be_bytes(),
+            )],
+        ),
+        encode_supported_features_avp(
+            false,
+            apps::VENDOR_ID_3GPP,
+            apps::swm::SWM_FEATURE_LIST_ID,
+            0,
+            &[encode_raw_vendor_avp(
+                apps::swm::AVP_FEATURE_LIST,
+                apps::VENDOR_ID_3GPP,
+                false,
+                &apps::swm::SWM_FEATURE_LIST.to_be_bytes(),
+            )],
+        ),
+    ];
+    for (index, duplicate_children) in duplicate_child_groups.into_iter().enumerate() {
+        let raw = build_raw_swm_der_with_extras(
+            Some(apps::swm::APPLICATION_ID.get()),
+            3,
+            &[0x02, 0x17, 0x00, 0x04],
+            &[duplicate_children],
+        );
+        let wire = encode_message(&raw);
+        let error = apps::swm::parse_swm_diameter_eap_request(
+            &decode_message(&wire),
+            DecodeContext::default(),
+        )
+        .expect_err("each required Supported-Features child is singleton");
+        assert!(matches!(
+            error.code(),
+            opc_protocol::DecodeErrorCode::DuplicateIe
+        ));
+        let spec_ref = error
+            .spec_ref()
+            .expect("Supported-Features duplicate must cite its defining specification");
+        assert_eq!(spec_ref.doc(), "TS29229");
+        assert_eq!(spec_ref.section(), ["6.3.29", "6.3.30", "6.3.31"][index]);
+    }
+
+    let (_, discovery_avp) = RawAvp::decode(&discovery, DecodeContext::default())
+        .expect("synthetic Supported-Features fixture");
+    let wrong_outer_vendor = encode_raw_vendor_avp(
+        apps::swm::AVP_SUPPORTED_FEATURES,
+        VendorId::new(9_999),
+        false,
+        discovery_avp.value,
+    );
+    let wrong_outer_v = encode_raw_avp(
+        apps::swm::AVP_SUPPORTED_FEATURES,
+        false,
+        discovery_avp.value,
+    );
+    for collision in [wrong_outer_vendor, wrong_outer_v] {
+        let raw = build_raw_swm_der_with_extras(
+            Some(apps::swm::APPLICATION_ID.get()),
+            3,
+            &[0x02, 0x17, 0x00, 0x04],
+            std::slice::from_ref(&collision),
+        );
+        let wire = encode_message(&raw);
+        assert!(apps::swm::parse_swm_diameter_eap_request(
+            &decode_message(&wire),
+            DecodeContext {
+                unknown_ie_policy: UnknownIePolicy::Drop,
+                ..DecodeContext::default()
+            },
+        )
+        .expect("M-clear outer numeric collision follows Drop policy")
+        .supported_features
+        .is_empty());
+        apps::swm::parse_swm_diameter_eap_request(
+            &decode_message(&wire),
+            DecodeContext::conservative(),
+        )
+        .expect_err("strict unknown policy rejects outer numeric collision");
+    }
+
+    let optional_unknown = encode_raw_vendor_avp(
+        AvpCode::new(65_000),
+        apps::VENDOR_ID_3GPP,
+        false,
+        b"synthetic-extension",
+    );
+    let with_optional_unknown = encode_supported_features_avp(
+        false,
+        apps::VENDOR_ID_3GPP,
+        apps::swm::SWM_FEATURE_LIST_ID,
+        0,
+        std::slice::from_ref(&optional_unknown),
+    );
+    let unknown_raw = build_raw_swm_der_with_extras(
+        Some(apps::swm::APPLICATION_ID.get()),
+        3,
+        &[0x02, 0x17, 0x00, 0x04],
+        std::slice::from_ref(&with_optional_unknown),
+    );
+    let unknown_wire = encode_message(&unknown_raw);
+    let preserved = apps::swm::parse_swm_diameter_eap_request(
+        &decode_message(&unknown_wire),
+        DecodeContext::default(),
+    )
+    .expect("Preserve retains optional Supported-Features extension");
+    assert_eq!(
+        preserved.supported_features[0]
+            .features()
+            .additional_avps()
+            .len(),
+        1
+    );
+    assert!(!format!("{preserved:?}").contains("synthetic-extension"));
+    let preserved_rebuild =
+        apps::swm::build_swm_diameter_eap_request(&preserved, 1, 2, EncodeContext::default())
+            .expect("preserved Supported-Features rebuild");
+    let preserved_wire = encode_message(&preserved_rebuild);
+    let preserved_message = decode_message(&preserved_wire);
+    let preserved_group = preserved_message
+        .avps(DecodeContext::default())
+        .map(|avp| avp.expect("preserved DER AVP"))
+        .find(|avp| {
+            avp.header.key()
+                == AvpKey::vendor(apps::swm::AVP_SUPPORTED_FEATURES, apps::VENDOR_ID_3GPP)
+        })
+        .expect("preserved Supported-Features group");
+    let mut preserved_group_wire = BytesMut::new();
+    preserved_group
+        .encode(&mut preserved_group_wire, EncodeContext::default())
+        .expect("preserved group encoding");
+    assert_eq!(preserved_group_wire, with_optional_unknown);
+
+    let dropped = apps::swm::parse_swm_diameter_eap_request(
+        &decode_message(&unknown_wire),
+        DecodeContext {
+            unknown_ie_policy: UnknownIePolicy::Drop,
+            ..DecodeContext::default()
+        },
+    )
+    .expect("bounded optional Supported-Features extension is ignored by policy");
+    assert!(dropped.supported_features[0]
+        .features()
+        .additional_avps()
+        .is_empty());
+    apps::swm::parse_swm_diameter_eap_request(
+        &decode_message(&unknown_wire),
+        DecodeContext {
+            unknown_ie_policy: UnknownIePolicy::Reject,
+            ..DecodeContext::default()
+        },
+    )
+    .expect_err("Reject policy refuses optional unknown Supported-Features child");
+
+    let mandatory_unknown = encode_raw_vendor_avp(
+        AvpCode::new(65_000),
+        apps::VENDOR_ID_3GPP,
+        true,
+        b"synthetic-extension",
+    );
+    let with_mandatory_unknown = encode_supported_features_avp(
+        false,
+        apps::VENDOR_ID_3GPP,
+        apps::swm::SWM_FEATURE_LIST_ID,
+        0,
+        &[mandatory_unknown],
+    );
+    let unknown_raw = build_raw_swm_der_with_extras(
+        Some(apps::swm::APPLICATION_ID.get()),
+        3,
+        &[0x02, 0x17, 0x00, 0x04],
+        &[with_mandatory_unknown],
+    );
+    let unknown_wire = encode_message(&unknown_raw);
+    apps::swm::parse_swm_diameter_eap_request(
+        &decode_message(&unknown_wire),
+        DecodeContext {
+            unknown_ie_policy: UnknownIePolicy::Drop,
+            ..DecodeContext::default()
+        },
+    )
+    .expect_err("mandatory unknown Supported-Features child fails closed");
+
+    let duplicate_unknown = encode_supported_features_avp(
+        false,
+        apps::VENDOR_ID_3GPP,
+        apps::swm::SWM_FEATURE_LIST_ID,
+        0,
+        &[optional_unknown.clone(), optional_unknown.clone()],
+    );
+    let duplicate_unknown_raw = build_raw_swm_der_with_extras(
+        Some(apps::swm::APPLICATION_ID.get()),
+        3,
+        &[0x02, 0x17, 0x00, 0x04],
+        &[duplicate_unknown],
+    );
+    let duplicate_unknown_wire = encode_message(&duplicate_unknown_raw);
+    for unknown_ie_policy in [UnknownIePolicy::Preserve, UnknownIePolicy::Drop] {
+        apps::swm::parse_swm_diameter_eap_request(
+            &decode_message(&duplicate_unknown_wire),
+            DecodeContext {
+                unknown_ie_policy,
+                duplicate_ie_policy: DuplicateIePolicy::Reject,
+                ..DecodeContext::default()
+            },
+        )
+        .expect_err("duplicate unknown child key is rejected before preserve/drop policy");
+    }
+
+    let other_vendor_unknown = encode_raw_vendor_avp(
+        AvpCode::new(65_000),
+        VendorId::new(77_777),
+        false,
+        b"synthetic-extension-2",
+    );
+    let distinct_vendor_keys = encode_supported_features_avp(
+        false,
+        apps::VENDOR_ID_3GPP,
+        apps::swm::SWM_FEATURE_LIST_ID,
+        0,
+        &[optional_unknown, other_vendor_unknown],
+    );
+    let distinct_vendor_raw = build_raw_swm_der_with_extras(
+        Some(apps::swm::APPLICATION_ID.get()),
+        3,
+        &[0x02, 0x17, 0x00, 0x04],
+        &[distinct_vendor_keys],
+    );
+    let distinct_vendor_wire = encode_message(&distinct_vendor_raw);
+    for (unknown_ie_policy, retained) in
+        [(UnknownIePolicy::Preserve, 2), (UnknownIePolicy::Drop, 0)]
+    {
+        assert_eq!(
+            apps::swm::parse_swm_diameter_eap_request(
+                &decode_message(&distinct_vendor_wire),
+                DecodeContext {
+                    unknown_ie_policy,
+                    duplicate_ie_policy: DuplicateIePolicy::Reject,
+                    ..DecodeContext::default()
+                },
+            )
+            .expect("same numeric child code under distinct vendors is not duplicate")
+            .supported_features[0]
+                .features()
+                .additional_avps()
+                .len(),
+            retained
+        );
+    }
+
+    let many_unknown = (0..11)
+        .map(|index| {
+            encode_raw_vendor_avp(
+                AvpCode::new(64_000 + index),
+                apps::VENDOR_ID_3GPP,
+                false,
+                &[],
+            )
+        })
+        .collect::<Vec<_>>();
+    let oversized_group = encode_supported_features_avp(
+        false,
+        apps::VENDOR_ID_3GPP,
+        apps::swm::SWM_FEATURE_LIST_ID,
+        0,
+        &many_unknown,
+    );
+    let oversized = build_raw_swm_der_with_extras(
+        Some(apps::swm::APPLICATION_ID.get()),
+        3,
+        &[0x02, 0x17, 0x00, 0x04],
+        &[oversized_group],
+    );
+    let oversized_wire = encode_message(&oversized);
+    apps::swm::parse_swm_diameter_eap_request(
+        &decode_message(&oversized_wire),
+        DecodeContext {
+            max_ies: 10,
+            unknown_ie_policy: UnknownIePolicy::Drop,
+            ..DecodeContext::default()
+        },
+    )
+    .expect_err("Supported-Features child count is bounded");
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_der_ue_local_ip_fixture_enforces_address_vendor_and_cardinality() {
+    for address in [
+        IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5)),
+        IpAddr::V6("2001:db8::5".parse().expect("synthetic IPv6")),
+    ] {
+        let mut request = sample_swm_request();
+        request.ue_local_ip_address = Some(address);
+        let built =
+            apps::swm::build_swm_diameter_eap_request(&request, 1, 2, EncodeContext::default())
+                .expect("UE local address DER build");
+        let wire = encode_message(&built);
+        assert_eq!(
+            apps::swm::parse_swm_diameter_eap_request(
+                &decode_message(&wire),
+                DecodeContext::default(),
+            )
+            .expect("UE local address DER parse")
+            .ue_local_ip_address,
+            Some(address)
+        );
+    }
+
+    let valid = encode_raw_vendor_avp(
+        apps::swm::AVP_UE_LOCAL_IP_ADDRESS,
+        apps::VENDOR_ID_3GPP,
+        false,
+        &[0x00, 0x01, 192, 0, 2, 1],
+    );
+    let vendor_collision = encode_raw_vendor_avp(
+        apps::swm::AVP_UE_LOCAL_IP_ADDRESS,
+        VendorId::new(9_999),
+        false,
+        &[0x00, 0x01, 192, 0, 2, 1],
+    );
+    let mut protected = BytesMut::new();
+    RawAvp {
+        header: AvpHeader::vendor(
+            apps::swm::AVP_UE_LOCAL_IP_ADDRESS,
+            apps::VENDOR_ID_3GPP,
+            false,
+        )
+        .with_flags(AvpFlags::new(true, false, true)),
+        value: &[0x00, 0x01, 192, 0, 2, 1],
+        padding: &[],
+    }
+    .encode(&mut protected, EncodeContext::default())
+    .expect("protected UE IP fixture");
+    let invalid = [
+        protected,
+        encode_raw_vendor_avp(
+            apps::swm::AVP_UE_LOCAL_IP_ADDRESS,
+            apps::VENDOR_ID_3GPP,
+            false,
+            &[0x00, 0x01, 192, 0, 2],
+        ),
+        encode_raw_vendor_avp(
+            apps::swm::AVP_UE_LOCAL_IP_ADDRESS,
+            apps::VENDOR_ID_3GPP,
+            false,
+            &[0x00, 0x01, 192, 0, 2, 1, 9],
+        ),
+        encode_raw_vendor_avp(
+            apps::swm::AVP_UE_LOCAL_IP_ADDRESS,
+            apps::VENDOR_ID_3GPP,
+            false,
+            &[0x00, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        ),
+        encode_raw_vendor_avp(
+            apps::swm::AVP_UE_LOCAL_IP_ADDRESS,
+            apps::VENDOR_ID_3GPP,
+            false,
+            &[
+                0x00, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            ],
+        ),
+        encode_raw_vendor_avp(
+            apps::swm::AVP_UE_LOCAL_IP_ADDRESS,
+            apps::VENDOR_ID_3GPP,
+            false,
+            &[0x00, 0x03, 192, 0, 2, 1],
+        ),
+    ];
+    for (index, invalid_avp) in invalid.into_iter().enumerate() {
+        let raw = build_raw_swm_der_with_extras(
+            Some(apps::swm::APPLICATION_ID.get()),
+            3,
+            &[0x02, 0x17, 0x00, 0x04],
+            &[invalid_avp],
+        );
+        let wire = encode_message(&raw);
+        let error = apps::swm::parse_swm_diameter_eap_request(
+            &decode_message(&wire),
+            DecodeContext::default(),
+        )
+        .expect_err("invalid UE-Local-IP-Address must fail");
+        if index > 0 {
+            let spec_ref = error
+                .spec_ref()
+                .expect("UE address error must cite its defining specification");
+            assert_eq!(spec_ref.doc(), "TS29212");
+            assert_eq!(spec_ref.section(), "5.3.96");
+        }
+    }
+    let collision = build_raw_swm_der_with_extras(
+        Some(apps::swm::APPLICATION_ID.get()),
+        3,
+        &[0x02, 0x17, 0x00, 0x04],
+        std::slice::from_ref(&vendor_collision),
+    );
+    let collision_wire = encode_message(&collision);
+    assert_eq!(
+        apps::swm::parse_swm_diameter_eap_request(
+            &decode_message(&collision_wire),
+            DecodeContext {
+                unknown_ie_policy: UnknownIePolicy::Drop,
+                ..DecodeContext::default()
+            },
+        )
+        .expect("M-clear UE-IP numeric collision follows Drop policy")
+        .ue_local_ip_address,
+        None
+    );
+    apps::swm::parse_swm_diameter_eap_request(
+        &decode_message(&collision_wire),
+        DecodeContext::conservative(),
+    )
+    .expect_err("strict unknown policy rejects UE-IP numeric collision");
+    let critical_collision = build_raw_swm_der_with_extras(
+        Some(apps::swm::APPLICATION_ID.get()),
+        3,
+        &[0x02, 0x17, 0x00, 0x04],
+        &[encode_raw_vendor_avp(
+            apps::swm::AVP_UE_LOCAL_IP_ADDRESS,
+            VendorId::new(9_999),
+            true,
+            &[0x00, 0x01, 192, 0, 2, 1],
+        )],
+    );
+    let critical_collision_wire = encode_message(&critical_collision);
+    apps::swm::parse_swm_diameter_eap_request(
+        &decode_message(&critical_collision_wire),
+        DecodeContext {
+            unknown_ie_policy: UnknownIePolicy::Drop,
+            ..DecodeContext::default()
+        },
+    )
+    .expect_err("M-set UE-IP numeric collision remains critical");
+    let duplicate = build_raw_swm_der_with_extras(
+        Some(apps::swm::APPLICATION_ID.get()),
+        3,
+        &[0x02, 0x17, 0x00, 0x04],
+        &[valid.clone(), valid],
+    );
+    let duplicate_wire = encode_message(&duplicate);
+    let duplicate_error = apps::swm::parse_swm_diameter_eap_request(
+        &decode_message(&duplicate_wire),
+        DecodeContext::default(),
+    )
+    .expect_err("duplicate UE-Local-IP-Address");
+    assert!(matches!(
+        duplicate_error.code(),
+        opc_protocol::DecodeErrorCode::DuplicateIe
+    ));
+    let spec_ref = duplicate_error
+        .spec_ref()
+        .expect("UE duplicate error must cite its defining specification");
+    assert_eq!(spec_ref.doc(), "TS29212");
+    assert_eq!(spec_ref.section(), "5.3.96");
 }
 
 #[test]
@@ -1668,6 +2877,8 @@ fn swm_answer_result_category_is_classified() {
         origin_host: "aaa.home.example".into(),
         origin_realm: "home.example".into(),
         user_name: None,
+        mip6_feature_vector: None,
+        supported_features: vec![],
         service_selection: None,
         default_context_identifier: None,
         apn_configurations: vec![],
@@ -2016,6 +3227,9 @@ fn sample_swm_request() -> SwmDiameterEapRequest {
         user_name: Some("601010123456789@nai.epc.mnc001.mcc001.3gppnetwork.org".into()),
         rat_type: None,
         service_selection: None,
+        mip6_feature_vector: None,
+        supported_features: vec![],
+        ue_local_ip_address: None,
         auth_request_type: AuthRequestType::AuthorizeAuthenticate,
         eap_payload: vec![0x02, 0x17, 0x00, 0x08, 0x32, 0x01, 0x02, 0x03].into(),
         emergency_services: None,
@@ -2034,6 +3248,8 @@ fn sample_swm_answer() -> SwmDiameterEapAnswer {
         origin_host: "aaa.home.example".into(),
         origin_realm: "home.example".into(),
         user_name: None,
+        mip6_feature_vector: None,
+        supported_features: vec![],
         service_selection: None,
         default_context_identifier: None,
         apn_configurations: vec![],
@@ -2139,6 +3355,43 @@ fn encode_raw_vendor_avp(
     avp.encode(&mut dst, EncodeContext::default())
         .expect("raw vendor AVP encode must succeed");
     dst
+}
+
+#[cfg(feature = "app-swm")]
+fn encode_supported_features_avp(
+    mandatory: bool,
+    vendor_id: VendorId,
+    feature_list_id: u32,
+    feature_list: u32,
+    extra_children: &[BytesMut],
+) -> BytesMut {
+    let mut children = BytesMut::new();
+    children.extend_from_slice(&encode_raw_avp(
+        base::AVP_VENDOR_ID,
+        true,
+        &vendor_id.get().to_be_bytes(),
+    ));
+    children.extend_from_slice(&encode_raw_vendor_avp(
+        apps::swm::AVP_FEATURE_LIST_ID,
+        apps::VENDOR_ID_3GPP,
+        false,
+        &feature_list_id.to_be_bytes(),
+    ));
+    children.extend_from_slice(&encode_raw_vendor_avp(
+        apps::swm::AVP_FEATURE_LIST,
+        apps::VENDOR_ID_3GPP,
+        false,
+        &feature_list.to_be_bytes(),
+    ));
+    for child in extra_children {
+        children.extend_from_slice(child);
+    }
+    encode_raw_vendor_avp(
+        apps::swm::AVP_SUPPORTED_FEATURES,
+        apps::VENDOR_ID_3GPP,
+        mandatory,
+        &children,
+    )
 }
 
 #[cfg(feature = "app-swm")]
@@ -3126,6 +4379,78 @@ fn swm_dea_state_round_trips_opaquely_into_continuation_der() {
         assert!(!diagnostic.contains("synthetic-state-first"));
         assert!(!diagnostic.contains("synthetic-state-second"));
     }
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_mip6_feature_vector_is_stable_across_continuation_der_rounds() {
+    let mut initial = sample_swm_request();
+    initial.mip6_feature_vector = Some(SwmMip6FeatureVector::gtpv2_only());
+
+    let initial_wire = encode_message(
+        &apps::swm::build_swm_diameter_eap_request(
+            &initial,
+            0x0102_0304,
+            0x0506_0708,
+            EncodeContext::default(),
+        )
+        .expect("initial DER must encode"),
+    );
+    let parsed_initial = apps::swm::parse_swm_diameter_eap_request(
+        &decode_message(&initial_wire),
+        DecodeContext::conservative(),
+    )
+    .expect("initial DER must parse");
+
+    let mut challenge = sample_swm_answer();
+    challenge.result = SwmDiameterResult::Base(1001);
+    challenge.eap_payload = Some(vec![0x01, 0x20, 0x00, 0x05, 0x01].into());
+    challenge.eap_master_session_key = None;
+    challenge.state_avps = vec![b"synthetic-continuation-state".to_vec()];
+    let challenge_wire = encode_message(
+        &apps::swm::build_swm_diameter_eap_answer(
+            &challenge,
+            0x0102_0304,
+            0x0506_0708,
+            EncodeContext::default(),
+        )
+        .expect("multi-round DEA must encode"),
+    );
+    let parsed_challenge = apps::swm::parse_swm_diameter_eap_answer(
+        &decode_message(&challenge_wire),
+        DecodeContext::conservative(),
+    )
+    .expect("multi-round DEA must parse");
+
+    let mut continuation = parsed_initial;
+    continuation.eap_payload = vec![0x02, 0x20, 0x00, 0x04].into();
+    continuation.state_avps = parsed_challenge.state_avps;
+    let continuation_wire = encode_message(
+        &apps::swm::build_swm_diameter_eap_request(
+            &continuation,
+            0x1112_1314,
+            0x1516_1718,
+            EncodeContext::default(),
+        )
+        .expect("continuation DER must encode"),
+    );
+
+    let mip6_value = |wire: &[u8]| {
+        decode_message(wire)
+            .avps(DecodeContext::default())
+            .collect::<Result<Vec<_>, _>>()
+            .expect("DER AVPs must decode")
+            .into_iter()
+            .find(|avp| avp.header.code == apps::swm::AVP_MIP6_FEATURE_VECTOR)
+            .expect("DER must carry MIP6-Feature-Vector")
+            .value
+            .to_vec()
+    };
+    assert_eq!(mip6_value(&initial_wire), mip6_value(&continuation_wire));
+    assert_eq!(
+        mip6_value(&continuation_wire),
+        SwmMip6FeatureVector::GTPV2_SUPPORTED.to_be_bytes()
+    );
 }
 
 #[test]

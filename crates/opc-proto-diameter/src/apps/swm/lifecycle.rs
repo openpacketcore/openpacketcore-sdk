@@ -596,15 +596,20 @@ impl SwmAdditionalAvp {
     }
 
     pub(super) fn from_raw(avp: &RawAvp<'_>) -> Self {
-        let mut header = avp.header.clone();
+        let mut retained = Self::from_raw_exact(avp);
+        let header = &mut retained.header;
         if header.key() == AvpKey::ietf(AVP_LOAD) {
             // TS 29.273 requires known received Load M-bit mismatches to be
             // ignored. Retain the value but canonicalize the receive-only
             // mismatch here so it can never be re-originated.
             header.flags = AvpFlags::from_bits(header.flags.bits() & !AvpFlags::MANDATORY);
         }
+        retained
+    }
+
+    pub(super) fn from_raw_exact(avp: &RawAvp<'_>) -> Self {
         Self {
-            header,
+            header: avp.header.clone(),
             value: Bytes::copy_from_slice(avp.value),
         }
     }

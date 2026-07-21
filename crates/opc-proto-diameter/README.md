@@ -103,6 +103,37 @@ charging decisions, watchdog policy, or a carrier-ready EPC/ePDG product claim.
   declares repeated ASA `Redirect-Host` and `Failed-AVP` fields, so conservative
   dictionary decoding recognizes their standard cardinality. The typed surface
   retains repeated `Failed-AVP` but rejects redirect AVPs and result 3006.
+  Diameter-EAP DER/DEA also expose typed `MIP6-Feature-Vector` and repeated
+  3GPP `Supported-Features`; DER additionally exposes `UE-Local-IP-Address`.
+  `SwmMip6FeatureVector::gtpv2_only()` emits the exact
+  `0x0000400000000000` capability; despite the legacy AVP name, that bit is
+  independent of bearer IP family and is not limited to IPv6. Meanwhile,
+  `SwmRequestedSupportedFeatures::swm_discovery()` emits SWm list identity
+  `(10415, 1)` with value zero and request M clear. Correlation requires exact
+  `DIAMETER_SUCCESS` before a DEA can authorize mobility, accepts the TS
+  collective PMIP6/GTPv2 selection, and rejects unoffered non-NBM bits.
+  The codec does not own a multi-round EAP procedure state machine: a consumer
+  must carry the same access context into each continuation DER. For example,
+  a GTPv2-only deployment can opt in without constructing raw AVPs:
+
+  ```rust
+  use std::net::IpAddr;
+  use opc_proto_diameter::apps::swm::{
+      SwmDiameterEapRequest, SwmMip6FeatureVector,
+      SwmRequestedSupportedFeatures,
+  };
+
+  fn apply_access_context(request: &mut SwmDiameterEapRequest, ue_ip: IpAddr) {
+      request.mip6_feature_vector = Some(SwmMip6FeatureVector::gtpv2_only());
+      request.supported_features =
+          vec![SwmRequestedSupportedFeatures::swm_discovery()];
+      request.ue_local_ip_address = Some(ue_ip);
+  }
+  ```
+
+  Preserve these fields when replacing the EAP payload and `State` values for
+  a subsequent round; parsing and rebuilding a typed request retains the exact
+  vector value.
   `Redirect-Host-Usage` and `Redirect-Max-Cache-Time` remain singleton, and an
   undeclared wildcard extension never gains repeatability implicitly. Missing
   required STR and ASR fields retain sealed 5005 provenance for the generic RFC
@@ -262,6 +293,9 @@ when both are present, 5009 contains only those exact received children in wire
 order. An optional-present SWm `Terminal-Information` without mandatory IMEI
 similarly produces a nested vendor-correct minimum IMEI and never reflects its
 Software-Version sibling.
+Missing Vendor-Id, Feature-List-ID, or Feature-List inside a DER
+Supported-Features group uses the same sealed nested provenance and produces a
+vendor-correct minimum child inside the exact received group header.
 
 Migration note: `DiameterRequestFailure` now includes
 `MutuallyExclusiveAvps(DiameterFailedAvp)`. Exhaustive downstream matches must
