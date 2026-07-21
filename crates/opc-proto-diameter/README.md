@@ -109,6 +109,21 @@ charging decisions, watchdog policy, or a carrier-ready EPC/ePDG product claim.
   `AAA-Failure-Indication`, reused `High-Priority-Access-Info`, and the RFC
   7683 baseline overload offer. DEA exposes the correlated loss-algorithm
   selection/report and ordered RFC 8583 Load reports.
+  DER and DEA also expose distinct, sealed parser-populated `extensions`
+  collections for the trailing command wildcard. `UnknownIePolicy::Preserve`
+  retains at most 128 command-unmodeled optional M-clear AVPs in received
+  order, `Drop` accepts and discards them, and `Reject` or an unknown M-bit AVP
+  fails closed. The
+  collections expose only by-value code, vendor, flags, and length metadata;
+  neither `SwmAdditionalAvp` wrappers nor values are directly exposed by that
+  metadata API. Parser-retained values can only be replayed through the
+  same-role typed builder. There is no public nonempty constructor or mutation
+  API. Use `Default::default()` for
+  originated struct literals. Rebuilding a parsed typed endpoint message moves retained
+  extensions to the trailing wildcard and canonicalizes framing, so an exact
+  relay or proxy must continue forwarding the raw `Message` bytes instead.
+  Typed handling for M-set routing AVPs such as `Proxy-Info` and `Route-Record`
+  is outside these optional-extension collections.
   `SwmMip6FeatureVector::gtpv2_only()` emits the exact
   `0x0000400000000000` capability; despite the legacy AVP name, that bit is
   independent of bearer IP family and is not limited to IPv6. Meanwhile,

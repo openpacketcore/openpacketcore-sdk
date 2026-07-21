@@ -49,7 +49,9 @@ use crate::dictionary::{
     CommandAvpRule, CommandDefinition, CommandKind, Dictionary, FlagRequirement,
 };
 use crate::parser_error::DiameterParserError;
-use crate::{ApplicationId, AvpCode, AvpHeader, CommandCode, Message, OwnedMessage, VendorId};
+use crate::{
+    ApplicationId, AvpCode, AvpHeader, CommandCode, Message, OwnedMessage, RawAvp, VendorId,
+};
 
 mod authorization;
 mod lifecycle;
@@ -62,6 +64,8 @@ pub const APPLICATION_ID: ApplicationId = ApplicationId::new(16_777_264);
 
 /// Diameter-EAP command code (RFC 4072).
 pub const COMMAND_DIAMETER_EAP: CommandCode = CommandCode::new(268);
+
+const MAX_SWM_DIAMETER_EAP_EXTENSIONS: usize = 128;
 
 /// EAP-Payload AVP code (RFC 4072).
 pub const AVP_EAP_PAYLOAD: AvpCode = AvpCode::new(462);
@@ -2561,6 +2565,158 @@ pub struct ApnConfiguration {
     pub ambr: Option<Ambr>,
 }
 
+/// Copy-only, value-free metadata for one parser-retained SWm DER/DEA AVP.
+///
+/// The opaque value and its owning [`SwmAdditionalAvp`] wrapper are never
+/// exposed by the sealed Diameter-EAP extension collections.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SwmDiameterEapExtensionMetadata {
+    code: AvpCode,
+    vendor_id: Option<VendorId>,
+    flags: crate::AvpFlags,
+    value_len: usize,
+}
+
+impl SwmDiameterEapExtensionMetadata {
+    fn from_retained(avp: &SwmAdditionalAvp) -> Self {
+        Self {
+            code: avp.code(),
+            vendor_id: avp.vendor_id(),
+            flags: avp.header().flags,
+            value_len: avp.value_len(),
+        }
+    }
+
+    /// Return the AVP code.
+    #[must_use]
+    pub const fn code(self) -> AvpCode {
+        self.code
+    }
+
+    /// Return the optional Vendor-Id.
+    #[must_use]
+    pub const fn vendor_id(self) -> Option<VendorId> {
+        self.vendor_id
+    }
+
+    /// Return the received AVP flags.
+    #[must_use]
+    pub const fn flags(self) -> crate::AvpFlags {
+        self.flags
+    }
+
+    /// Return the opaque value length in octets.
+    #[must_use]
+    pub const fn value_len(self) -> usize {
+        self.value_len
+    }
+}
+
+/// Parser-retained optional top-level AVPs from a SWm DER.
+///
+/// The collection is sealed against raw outbound intake: locally originated
+/// requests use [`Default::default`], while the DER parser alone can populate
+/// entries. Callers may inspect copy-only, redaction-safe metadata through
+/// [`Self::metadata`] and may clone a parsed collection when rebuilding that
+/// endpoint message.
+/// Typed rebuilding canonicalizes retained extensions to the trailing command
+/// wildcard; use [`Message`] directly when an exact relay/proxy byte stream is
+/// required.
+///
+/// ```compile_fail
+/// use opc_proto_diameter::apps::swm::SwmDiameterEapRequestExtensions;
+///
+/// let extensions = SwmDiameterEapRequestExtensions::default();
+/// let _raw_wrappers = extensions.avps();
+/// ```
+#[derive(Default, Clone, PartialEq, Eq)]
+pub struct SwmDiameterEapRequestExtensions {
+    avps: Vec<SwmAdditionalAvp>,
+}
+
+impl SwmDiameterEapRequestExtensions {
+    /// Iterate over ordered copy-only metadata without exposing retained values.
+    pub fn metadata(&self) -> impl ExactSizeIterator<Item = SwmDiameterEapExtensionMetadata> + '_ {
+        self.avps
+            .iter()
+            .map(SwmDiameterEapExtensionMetadata::from_retained)
+    }
+
+    /// Return the number of retained AVPs.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.avps.len()
+    }
+
+    /// Return whether no optional AVPs were retained.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.avps.is_empty()
+    }
+
+    fn retained_avps(&self) -> &[SwmAdditionalAvp] {
+        &self.avps
+    }
+}
+
+impl fmt::Debug for SwmDiameterEapRequestExtensions {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SwmDiameterEapRequestExtensions")
+            .field("avp_count", &self.avps.len())
+            .finish()
+    }
+}
+
+/// Parser-retained optional top-level AVPs from a SWm DEA.
+///
+/// The collection is sealed against raw outbound intake: locally originated
+/// answers use [`Default::default`], while the DEA parser alone can populate
+/// entries. Callers may inspect copy-only, redaction-safe metadata through
+/// [`Self::metadata`] and may clone a parsed collection when rebuilding that
+/// endpoint message.
+/// Typed rebuilding canonicalizes retained extensions to the trailing command
+/// wildcard; use [`Message`] directly when an exact relay/proxy byte stream is
+/// required.
+#[derive(Default, Clone, PartialEq, Eq)]
+pub struct SwmDiameterEapAnswerExtensions {
+    avps: Vec<SwmAdditionalAvp>,
+}
+
+impl SwmDiameterEapAnswerExtensions {
+    /// Iterate over ordered copy-only metadata without exposing retained values.
+    pub fn metadata(&self) -> impl ExactSizeIterator<Item = SwmDiameterEapExtensionMetadata> + '_ {
+        self.avps
+            .iter()
+            .map(SwmDiameterEapExtensionMetadata::from_retained)
+    }
+
+    /// Return the number of retained AVPs.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.avps.len()
+    }
+
+    /// Return whether no optional AVPs were retained.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.avps.is_empty()
+    }
+
+    fn retained_avps(&self) -> &[SwmAdditionalAvp] {
+        &self.avps
+    }
+}
+
+impl fmt::Debug for SwmDiameterEapAnswerExtensions {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SwmDiameterEapAnswerExtensions")
+            .field("avp_count", &self.avps.len())
+            .finish()
+    }
+}
+
 /// A SWm Diameter-EAP-Request (DER).
 #[derive(Clone, PartialEq, Eq)]
 pub struct SwmDiameterEapRequest {
@@ -2614,6 +2770,11 @@ pub struct SwmDiameterEapRequest {
     pub high_priority_access_info: Option<SwmHighPriorityAccessInfo>,
     /// Ordered opaque State AVP values (only their count appears in diagnostics).
     pub state_avps: Vec<Vec<u8>>,
+    /// Parser-retained optional AVPs from the trailing DER extension wildcard.
+    ///
+    /// Use the empty default for locally originated requests. Nonempty values
+    /// can only originate from a successful typed DER parse.
+    pub extensions: SwmDiameterEapRequestExtensions,
 }
 
 impl std::fmt::Debug for SwmDiameterEapRequest {
@@ -2656,6 +2817,7 @@ impl std::fmt::Debug for SwmDiameterEapRequest {
             .field("terminal_information", &self.terminal_information)
             .field("high_priority_access_info", &self.high_priority_access_info)
             .field("state_avps", &self.state_avps.len())
+            .field("extensions", &self.extensions)
             .finish()
     }
 }
@@ -2718,6 +2880,11 @@ pub struct SwmDiameterEapAnswer {
     pub state_avps: Vec<Vec<u8>>,
     /// EAP-Master-Session-Key (redacted in diagnostic output).
     pub eap_master_session_key: Option<Redacted<Vec<u8>>>,
+    /// Parser-retained optional AVPs from the trailing DEA extension wildcard.
+    ///
+    /// Use the empty default for locally originated answers. Nonempty values
+    /// can only originate from a successful typed DEA parse.
+    pub extensions: SwmDiameterEapAnswerExtensions,
 }
 
 impl std::fmt::Debug for SwmDiameterEapAnswer {
@@ -2750,6 +2917,7 @@ impl std::fmt::Debug for SwmDiameterEapAnswer {
             .field("error_message", &self.error_message)
             .field("state_avps", &self.state_avps.len())
             .field("eap_master_session_key", &self.eap_master_session_key)
+            .field("extensions", &self.extensions)
             .finish()
     }
 }
@@ -3162,6 +3330,81 @@ fn classify_outer_eap_packet(payload: &[u8]) -> Option<OuterEapPacketCode> {
     }
 }
 
+fn retain_diameter_eap_extension(
+    ctx: DecodeContext,
+    avp: &RawAvp<'_>,
+    offset: usize,
+    section: &'static str,
+    seen_keys: &mut HashSet<AvpKey>,
+    retained_bytes: &mut usize,
+    retained: &mut Vec<SwmAdditionalAvp>,
+) -> Result<(), DecodeError> {
+    builder_helpers::handle_unknown_avp(ctx, avp, offset, section)?;
+
+    let key = avp.header.key();
+    if ctx.duplicate_ie_policy == DuplicateIePolicy::Reject && !seen_keys.insert(key) {
+        return Err(DecodeError::new(DecodeErrorCode::DuplicateIe, offset)
+            .with_spec_ref(SpecRef::new("ietf", "RFC6733", "4.1")));
+    }
+
+    if ctx.unknown_ie_policy != UnknownIePolicy::Preserve {
+        return Ok(());
+    }
+    if retained.len() >= MAX_SWM_DIAMETER_EAP_EXTENSIONS {
+        return Err(DecodeError::new(DecodeErrorCode::IeCountExceeded, offset)
+            .with_spec_ref(SpecRef::new("3gpp", "TS29273", section)));
+    }
+    let retained_avp_bytes = avp
+        .header
+        .header_len()
+        .checked_add(avp.value.len())
+        .and_then(|len| len.checked_add(avp.padding.len()))
+        .ok_or_else(|| {
+            DecodeError::new(DecodeErrorCode::LengthOverflow, offset)
+                .with_spec_ref(SpecRef::new("ietf", "RFC6733", "4"))
+        })?;
+    let next_retained_bytes = retained_bytes
+        .checked_add(retained_avp_bytes)
+        .ok_or_else(|| {
+            DecodeError::new(DecodeErrorCode::LengthOverflow, offset)
+                .with_spec_ref(SpecRef::new("ietf", "RFC6733", "4"))
+        })?;
+    if next_retained_bytes > ctx.max_message_len {
+        return Err(
+            DecodeError::new(DecodeErrorCode::MessageLengthExceeded, offset)
+                .with_spec_ref(SpecRef::new("ietf", "RFC6733", "3")),
+        );
+    }
+
+    *retained_bytes = next_retained_bytes;
+    retained.push(SwmAdditionalAvp::from_raw_exact(avp));
+    Ok(())
+}
+
+fn append_diameter_eap_extensions(
+    dst: &mut BytesMut,
+    extensions: &[SwmAdditionalAvp],
+    ctx: EncodeContext,
+    section: &'static str,
+) -> Result<(), EncodeError> {
+    if extensions.len() > MAX_SWM_DIAMETER_EAP_EXTENSIONS {
+        return Err(encode_structural_error(
+            "SWm Diameter-EAP extension count exceeds its bound",
+            section,
+        ));
+    }
+    for extension in extensions {
+        if extension.header().flags.is_mandatory() {
+            return Err(encode_structural_error(
+                "SWm Diameter-EAP retained extension must clear the M bit",
+                section,
+            ));
+        }
+        extension.append_to(dst, ctx)?;
+    }
+    Ok(())
+}
+
 /// Build a SWm Diameter-EAP-Request message from its typed wire model.
 ///
 /// This compatibility and parser-replay boundary validates wire semantics but
@@ -3343,6 +3586,12 @@ pub fn build_swm_diameter_eap_request(
         true,
         ctx,
     )?;
+    append_diameter_eap_extensions(
+        &mut raw_avps,
+        request.extensions.retained_avps(),
+        ctx,
+        "DER",
+    )?;
     builder_helpers::build_message(
         builder_helpers::app_request_flags(),
         COMMAND_DIAMETER_EAP,
@@ -3431,6 +3680,9 @@ pub fn parse_swm_diameter_eap_request_with_provenance(
     let mut terminal_missing_imei = None;
     let mut supported_features_missing_child = None;
     let mut qos_missing_child = None;
+    let mut extensions = Vec::new();
+    let mut extension_keys = HashSet::new();
+    let mut retained_extension_bytes = 0_usize;
     let parse_result = builder_helpers::for_each_avp(
         message.raw_avps,
         ctx,
@@ -3553,7 +3805,15 @@ pub fn parse_swm_diameter_eap_request_with_provenance(
                         "5.2.3.36",
                     )?;
                 } else {
-                    builder_helpers::handle_unknown_avp(ctx, &avp, offset, "DER")?;
+                    retain_diameter_eap_extension(
+                        ctx,
+                        &avp,
+                        offset,
+                        "DER",
+                        &mut extension_keys,
+                        &mut retained_extension_bytes,
+                        &mut extensions,
+                    )?;
                 }
                 return Ok(());
             }
@@ -3662,7 +3922,15 @@ pub fn parse_swm_diameter_eap_request_with_provenance(
             } else if code == AVP_STATE {
                 state_avps.push(avp.value.to_vec());
             } else {
-                builder_helpers::handle_unknown_avp(ctx, &avp, offset, "DER")?;
+                retain_diameter_eap_extension(
+                    ctx,
+                    &avp,
+                    offset,
+                    "DER",
+                    &mut extension_keys,
+                    &mut retained_extension_bytes,
+                    &mut extensions,
+                )?;
             }
             Ok(())
         },
@@ -3825,6 +4093,7 @@ pub fn parse_swm_diameter_eap_request_with_provenance(
         terminal_information,
         high_priority_access_info,
         state_avps,
+        extensions: SwmDiameterEapRequestExtensions { avps: extensions },
     };
     validate_decoded_request(&request)
         .map_err(|error| DiameterParserError::decoded(message, error))?;
@@ -4069,6 +4338,7 @@ fn build_swm_diameter_eap_answer_internal(
             ctx,
         )?;
     }
+    append_diameter_eap_extensions(&mut raw_avps, answer.extensions.retained_avps(), ctx, "DEA")?;
     builder_helpers::build_message(
         builder_helpers::app_answer_flags(builder_helpers::result_code_requires_error_bit(
             answer.result.code(),
@@ -4157,6 +4427,9 @@ pub fn parse_swm_diameter_eap_answer(
     let mut error_message = None;
     let mut state_avps = Vec::new();
     let mut eap_master_session_key = None;
+    let mut extensions = Vec::new();
+    let mut extension_keys = HashSet::new();
+    let mut retained_extension_bytes = 0_usize;
     builder_helpers::for_each_avp(
         message.raw_avps,
         ctx,
@@ -4197,7 +4470,15 @@ pub fn parse_swm_diameter_eap_answer(
                         offset,
                     )?);
                 } else {
-                    builder_helpers::handle_unknown_avp(ctx, &avp, offset, "DEA")?;
+                    retain_diameter_eap_extension(
+                        ctx,
+                        &avp,
+                        offset,
+                        "DEA",
+                        &mut extension_keys,
+                        &mut retained_extension_bytes,
+                        &mut extensions,
+                    )?;
                 }
                 return Ok(());
             }
@@ -4325,7 +4606,15 @@ pub fn parse_swm_diameter_eap_answer(
                     "4.3",
                 )?;
             } else {
-                builder_helpers::handle_unknown_avp(ctx, &avp, offset, "DEA")?;
+                retain_diameter_eap_extension(
+                    ctx,
+                    &avp,
+                    offset,
+                    "DEA",
+                    &mut extension_keys,
+                    &mut retained_extension_bytes,
+                    &mut extensions,
+                )?;
             }
             Ok(())
         },
@@ -4406,6 +4695,7 @@ pub fn parse_swm_diameter_eap_answer(
         error_message,
         state_avps,
         eap_master_session_key,
+        extensions: SwmDiameterEapAnswerExtensions { avps: extensions },
     };
     lifecycle::validate_diameter_eap_answer_overload_control(
         answer.oc_supported_features.as_ref(),
@@ -5874,13 +6164,18 @@ fn retry_preserves_initial_request(
         && initial_request.rat_type == retry_request.rat_type
         && initial_request.service_selection == retry_request.service_selection
         && initial_request.mip6_feature_vector == retry_request.mip6_feature_vector
+        && initial_request.qos_capability == retry_request.qos_capability
+        && initial_request.visited_network_identifier == retry_request.visited_network_identifier
+        && initial_request.aaa_failure_indication == retry_request.aaa_failure_indication
         && initial_request.supported_features == retry_request.supported_features
         && initial_request.ue_local_ip_address == retry_request.ue_local_ip_address
         && initial_request.oc_supported_features == retry_request.oc_supported_features
         && initial_request.auth_request_type == retry_request.auth_request_type
         && initial_request.eap_payload == retry_request.eap_payload
         && initial_request.emergency_services == retry_request.emergency_services
+        && initial_request.high_priority_access_info == retry_request.high_priority_access_info
         && initial_request.state_avps == retry_request.state_avps
+        && initial_request.extensions == retry_request.extensions
 }
 
 fn verify_final_emergency_answer(

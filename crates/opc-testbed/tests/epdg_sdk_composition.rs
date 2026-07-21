@@ -189,6 +189,7 @@ async fn epdg_sdk_protocol_xfrm_testbed_and_evidence_components_compose(
             terminal_information: None,
             high_priority_access_info: None,
             state_avps: vec![b"opaque-redacted-state".to_vec()],
+            extensions: Default::default(),
         },
         0x1111_2222,
         0x3333_4444,
@@ -386,6 +387,7 @@ fn epdg_unauthenticated_emergency_identity_recovery_components_compose(
         terminal_information: None,
         high_priority_access_info: None,
         state_avps: Vec::new(),
+        extensions: Default::default(),
     };
     let initial_owned = build_swm_diameter_eap_request(
         &initial_request,
@@ -427,6 +429,7 @@ fn epdg_unauthenticated_emergency_identity_recovery_components_compose(
         error_message: None,
         state_avps: Vec::new(),
         eap_master_session_key: None,
+        extensions: Default::default(),
     };
     let identity_owned = build_swm_diameter_eap_answer_for(
         &initial_request_envelope,
@@ -503,6 +506,7 @@ fn epdg_unauthenticated_emergency_identity_recovery_components_compose(
         error_message: None,
         state_avps: Vec::new(),
         eap_master_session_key: Some(derived_msk.as_bytes().to_vec().into()),
+        extensions: Default::default(),
     };
     let final_owned = build_swm_diameter_eap_answer_for(
         &retry_request_envelope,

@@ -8,6 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Breaking: sealed SWm DER/DEA top-level extension retention —
+  `opc-proto-diameter`:** `SwmDiameterEapRequest` and
+  `SwmDiameterEapAnswer` add role-specific `extensions` collections; existing
+  locally originated struct literals initialize them with `Default::default()`.
+  `UnknownIePolicy::Preserve` now retains up to 128 well-formed,
+  command-unmodeled optional top-level wildcard AVPs in wire order, while
+  `Drop` discards them and
+  `Reject` or an unknown M-bit AVP fails closed. The public collections expose
+  only redaction-safe metadata and have no raw-value intake or mutation API.
+  Typed parser rebuilds canonicalize retained AVPs to the trailing command
+  wildcard; exact relay/proxy forwarding remains the raw `Message` path.
+  Vendor-aware duplicate rejection, retained-byte limits, and emergency-retry
+  identity include the extension surface. Retry identity also now covers every
+  typed DER access-context field. Typed M-set routing AVPs remain outside this
+  focused extension surface (#352).
 - **Breaking: typed SWm Diameter-EAP overload and Load context —
   `opc-proto-diameter`:** `SwmDiameterEapRequest` adds optional typed RFC 7683
   `oc_supported_features`; `SwmDiameterEapAnswer` adds the request-conditioned

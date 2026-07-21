@@ -193,9 +193,10 @@ Peer helpers include:
   byte-for-byte equivalent `DecodeError` values.
 - Unknown AVP handling in typed peer/application parsers: mandatory unknown
   AVPs are rejected; `Reject` also rejects non-mandatory unknown AVPs. `Drop`
-  and `Preserve` both accept non-mandatory unknown AVPs, but typed projections
-  do not retain those opaque AVPs. Use the raw AVP iterators for lossless
-  preserve/forward behavior.
+  and `Preserve` both accept non-mandatory unknown AVPs. Most typed projections
+  do not retain those opaque AVPs; the SWm DER/DEA endpoint exception is
+  documented below. Use the raw AVP iterators for lossless preserve/forward
+  behavior.
 
 The trusted CER and CEA command profiles mark only the six explicitly
 repeatable RFC 6733 capability fields as repeatable: Host-IP-Address,
@@ -230,6 +231,27 @@ authorization additionally requires the correlated evidence described below.
 These checks are mechanical message-shape validation only; AAA challenge
 selection, subscriber authorization, local emergency policy, realm routing,
 transport state, and EAP-AKA policy remain downstream product work.
+
+SWm DER and DEA each carry a role-specific sealed collection for
+command-unmodeled optional AVPs at the trailing command wildcard. Under
+`Preserve`, the typed parser retains at most 128 well-formed M-clear AVPs and
+no more cumulative bytes than
+`DecodeContext::max_message_len`, using checked arithmetic before copying.
+`Drop` discards them, while `Reject` and unknown M-bit AVPs return the existing
+unknown-critical failure at the offending offset. Vendor-aware duplicate keys
+remain subject to `DuplicateIePolicy::Reject` even under `Drop`; `First` and
+`Last` retain wildcard repetitions in received order because the ABNF wildcard
+does not assign value-selection semantics. Exact keys modeled by the DER/DEA
+parser never enter the collection; a foreign-vendor AVP with the same numeric
+code remains command-unmodeled. Public access reveals only redaction-safe
+header/length metadata; raw values can only be replayed by the typed builder
+and cannot be injected through
+the public collection API. Endpoint rebuilds canonicalize these AVPs to the
+trailing wildcard. This is not a byte-preserving relay/proxy contract; exact
+forwarding uses the raw `Message` path.
+Typed handling for M-set routing AVPs such as `Proxy-Info` and `Route-Record`
+is outside this focused optional-extension surface; no handling claim is made
+for them here.
 
 The typed DER surface also carries optional `RAT-Type` and
 `Service-Selection` authorization context. `RAT-Type` uses vendor 10415, code

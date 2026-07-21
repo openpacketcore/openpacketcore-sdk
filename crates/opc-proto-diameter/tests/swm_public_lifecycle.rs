@@ -135,6 +135,7 @@ fn establish_session(
             terminal_information: None,
             high_priority_access_info: None,
             state_avps: Vec::new(),
+            extensions: Default::default(),
         },
         transaction,
     );
@@ -199,6 +200,7 @@ fn establish_session(
         error_message: None,
         state_avps: Vec::new(),
         eap_master_session_key: Some(Redacted::from(DEA_MSK.to_vec())),
+        extensions: Default::default(),
     };
     let dea = swm::build_swm_diameter_eap_answer_for(&inbound, &answer, EncodeContext::default())
         .expect("AAA boundary must build the request-bound DEA");
