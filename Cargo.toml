@@ -43,7 +43,7 @@ sha2-zeroize = { package = "sha2", version = "0.11", features = ["zeroize"] }
 sha1 = "0.11"
 rand = "0.10"
 aes = { version = "0.9.1", features = ["zeroize"] }
-aes-gcm = { version = "0.11.0-rc.4", default-features = false, features = ["aes", "alloc", "zeroize"] }
+aes-gcm = { version = "0.11.0", default-features = false, features = ["aes", "alloc", "zeroize"] }
 aes-gcm-siv = "0.11"
 cbc = { version = "0.2.1", default-features = false, features = ["block-padding", "zeroize"] }
 hkdf = "0.12"
