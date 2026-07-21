@@ -8,7 +8,8 @@
 //! authorization-information update sequence, the non-overload DER access
 //! context (QoS capabilities, visited PLMN, AAA failover, and priority), a
 //! typed request-conditioned RFC 7683 baseline loss-overload offer/report,
-//! ordered RFC 8583 Diameter Load context, and a bounded
+//! ordered RFC 8583 Diameter Load context, typed successful-session timer
+//! context, and a bounded
 //! subscription-profile extension surface for APN-Configuration, its default
 //! Context-Identifier, Service-Selection, and the TS 29.273 emergency attach
 //! sequence. The top-level default pointer is accepted under the DEA
@@ -277,7 +278,7 @@ static SWM_REQUEST_AVP_RULES: [CommandAvpRule; 25] = [
     ),
 ];
 
-static SWM_ANSWER_AVP_RULES: [CommandAvpRule; 19] = [
+static SWM_ANSWER_AVP_RULES: [CommandAvpRule; 24] = [
     CommandAvpRule::new(AvpKey::ietf(AVP_STATE), AvpCardinality::ZeroOrMore),
     CommandAvpRule::new(
         AvpKey::ietf(base::AVP_RESULT_CODE),
@@ -302,6 +303,26 @@ static SWM_ANSWER_AVP_RULES: [CommandAvpRule; 19] = [
     CommandAvpRule::new(
         AvpKey::ietf(AVP_MIP6_FEATURE_VECTOR),
         AvpCardinality::ZeroOrOne,
+    ),
+    CommandAvpRule::new(
+        AvpKey::ietf(base::AVP_SESSION_TIMEOUT),
+        AvpCardinality::ZeroOrOne,
+    ),
+    CommandAvpRule::new(
+        AvpKey::ietf(base::AVP_AUTHORIZATION_LIFETIME),
+        AvpCardinality::ZeroOrOne,
+    ),
+    CommandAvpRule::new(
+        AvpKey::ietf(base::AVP_RE_AUTH_REQUEST_TYPE),
+        AvpCardinality::ZeroOrOne,
+    ),
+    CommandAvpRule::new(
+        AvpKey::ietf(base::AVP_AUTH_GRACE_PERIOD),
+        AvpCardinality::ZeroOrOne,
+    ),
+    CommandAvpRule::new(
+        AvpKey::ietf(base::AVP_AUTH_SESSION_STATE),
+        AvpCardinality::Forbidden,
     ),
     CommandAvpRule::new(
         AvpKey::vendor(AVP_SUPPORTED_FEATURES, VENDOR_ID_3GPP),
@@ -335,7 +356,7 @@ static SWM_ANSWER_AVP_RULES: [CommandAvpRule; 19] = [
     CommandAvpRule::new(AvpKey::ietf(AVP_SOURCE_ID), AvpCardinality::Forbidden),
 ];
 
-static SWM_PROJECTED_PROFILE_ANSWER_AVP_RULES: [CommandAvpRule; 19] = [
+static SWM_PROJECTED_PROFILE_ANSWER_AVP_RULES: [CommandAvpRule; 24] = [
     CommandAvpRule::new(AvpKey::ietf(AVP_STATE), AvpCardinality::ZeroOrMore),
     CommandAvpRule::new(
         AvpKey::ietf(base::AVP_RESULT_CODE),
@@ -360,6 +381,26 @@ static SWM_PROJECTED_PROFILE_ANSWER_AVP_RULES: [CommandAvpRule; 19] = [
     CommandAvpRule::new(
         AvpKey::ietf(AVP_MIP6_FEATURE_VECTOR),
         AvpCardinality::ZeroOrOne,
+    ),
+    CommandAvpRule::new(
+        AvpKey::ietf(base::AVP_SESSION_TIMEOUT),
+        AvpCardinality::ZeroOrOne,
+    ),
+    CommandAvpRule::new(
+        AvpKey::ietf(base::AVP_AUTHORIZATION_LIFETIME),
+        AvpCardinality::ZeroOrOne,
+    ),
+    CommandAvpRule::new(
+        AvpKey::ietf(base::AVP_RE_AUTH_REQUEST_TYPE),
+        AvpCardinality::ZeroOrOne,
+    ),
+    CommandAvpRule::new(
+        AvpKey::ietf(base::AVP_AUTH_GRACE_PERIOD),
+        AvpCardinality::ZeroOrOne,
+    ),
+    CommandAvpRule::new(
+        AvpKey::ietf(base::AVP_AUTH_SESSION_STATE),
+        AvpCardinality::Forbidden,
     ),
     CommandAvpRule::new(
         AvpKey::vendor(AVP_SUPPORTED_FEATURES, VENDOR_ID_3GPP),
@@ -1108,6 +1149,50 @@ impl SwmDiameterResult {
                 code: DIAMETER_ERROR_USER_UNKNOWN,
             }
         )
+    }
+}
+
+/// Maximum service lifetime carried by a successful SWm DEA.
+///
+/// `Session-Timeout` is an RFC 6733 `Unsigned32` measured in seconds. A zero
+/// value explicitly means an unlimited session, while absence of the
+/// surrounding [`Option`] means the AAA server supplied no timeout. The value
+/// is omitted from diagnostic output because it reflects subscriber policy.
+///
+/// @spec IETF RFC6733 8.13
+/// @spec 3GPP TS29273 7.1.2.1.2
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SwmSessionTimeout(u32);
+
+impl SwmSessionTimeout {
+    /// Construct a timeout from its exact wire value in seconds.
+    #[must_use]
+    pub const fn from_seconds(seconds: u32) -> Self {
+        Self(seconds)
+    }
+
+    /// Construct the explicit RFC 6733 unlimited-session value.
+    #[must_use]
+    pub const fn unlimited() -> Self {
+        Self(0)
+    }
+
+    /// Return the exact `Unsigned32` wire value in seconds.
+    #[must_use]
+    pub const fn seconds(self) -> u32 {
+        self.0
+    }
+
+    /// Return whether this is the explicit unlimited-session value.
+    #[must_use]
+    pub const fn is_unlimited(self) -> bool {
+        self.0 == 0
+    }
+}
+
+impl fmt::Debug for SwmSessionTimeout {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SwmSessionTimeout(<redacted>)")
     }
 }
 
@@ -2870,6 +2955,24 @@ pub struct SwmDiameterEapAnswer {
     pub apn_configurations: Vec<ApnConfiguration>,
     /// Permanent identity returned as Mobile-Node-Identifier.
     pub mobile_node_identifier: Option<Redacted<String>>,
+    /// Maximum authorized service lifetime for exact base `DIAMETER_SUCCESS`.
+    ///
+    /// `None` preserves compatibility with peers that omit the conditional
+    /// field. An explicit `SwmSessionTimeout::unlimited()` preserves the RFC
+    /// 6733 zero value.
+    pub session_timeout: Option<SwmSessionTimeout>,
+    /// Optional RFC 6733 authorization lifetime, in seconds.
+    ///
+    /// A positive value requires [`SwmReAuthRequestType`]. Diagnostics expose
+    /// only presence, not the policy value.
+    pub authorization_lifetime: Option<u32>,
+    /// Optional RFC 6733 grace period, in seconds.
+    ///
+    /// This value is reported without inventing a relationship to the other
+    /// timers. Diagnostics expose only presence.
+    pub auth_grace_period: Option<u32>,
+    /// Re-authorization action associated with a positive lifetime.
+    pub re_auth_request_type: Option<SwmReAuthRequestType>,
     /// EAP-Payload (redacted in diagnostic output).
     pub eap_payload: Option<Redacted<Vec<u8>>>,
     /// EAP-Reissued-Payload (redacted in diagnostic output).
@@ -2912,6 +3015,22 @@ impl std::fmt::Debug for SwmDiameterEapAnswer {
             )
             .field("apn_configurations", &self.apn_configurations.len())
             .field("mobile_node_identifier", &self.mobile_node_identifier)
+            .field(
+                "session_timeout",
+                &self.session_timeout.map(|_| "<redacted>"),
+            )
+            .field(
+                "authorization_lifetime_present",
+                &self.authorization_lifetime.is_some(),
+            )
+            .field(
+                "auth_grace_period_present",
+                &self.auth_grace_period.is_some(),
+            )
+            .field(
+                "re_auth_request_type_present",
+                &self.re_auth_request_type.is_some(),
+            )
             .field("eap_payload", &self.eap_payload)
             .field("eap_reissued_payload", &self.eap_reissued_payload)
             .field("error_message", &self.error_message)
@@ -3209,6 +3328,7 @@ impl SwmDiameterEapAnswer {
                 "RFC8583-6.1",
             ));
         }
+        validate_dea_timers(self).map_err(|reason| encode_structural_error(reason, "7.2.2.1.2"))?;
         if self.result_category() == SwmResultCategory::Success && !self.carries_eap_material() {
             return Err(encode_structural_error(
                 "SWm DEA success must carry EAP or MSK material",
@@ -4299,6 +4419,42 @@ fn build_swm_diameter_eap_answer_internal(
             ctx,
         )?;
     }
+    if let Some(session_timeout) = answer.session_timeout {
+        builder_helpers::append_u32_avp(
+            &mut raw_avps,
+            base::AVP_SESSION_TIMEOUT,
+            session_timeout.seconds(),
+            true,
+            ctx,
+        )?;
+    }
+    if let Some(re_auth_request_type) = answer.re_auth_request_type {
+        builder_helpers::append_u32_avp(
+            &mut raw_avps,
+            base::AVP_RE_AUTH_REQUEST_TYPE,
+            re_auth_request_type.value(),
+            true,
+            ctx,
+        )?;
+    }
+    if let Some(authorization_lifetime) = answer.authorization_lifetime {
+        builder_helpers::append_u32_avp(
+            &mut raw_avps,
+            base::AVP_AUTHORIZATION_LIFETIME,
+            authorization_lifetime,
+            true,
+            ctx,
+        )?;
+    }
+    if let Some(auth_grace_period) = answer.auth_grace_period {
+        builder_helpers::append_u32_avp(
+            &mut raw_avps,
+            base::AVP_AUTH_GRACE_PERIOD,
+            auth_grace_period,
+            true,
+            ctx,
+        )?;
+    }
     if let Some(eap_payload) = answer.eap_payload.as_ref() {
         builder_helpers::append_octet_string_avp(
             &mut raw_avps,
@@ -4422,6 +4578,10 @@ pub fn parse_swm_diameter_eap_answer(
     let mut default_context_identifier = None;
     let mut apn_configurations = Vec::new();
     let mut mobile_node_identifier = None;
+    let mut session_timeout = None;
+    let mut authorization_lifetime = None;
+    let mut auth_grace_period = None;
+    let mut re_auth_request_type = None;
     let mut eap_payload = None;
     let mut eap_reissued_payload = None;
     let mut error_message = None;
@@ -4441,6 +4601,15 @@ pub fn parse_swm_diameter_eap_answer(
             // Vendor-specific AVPs are matched by (vendor-id, code); only
             // genuinely unknown ones fall through to the unknown-AVP policy.
             if let Some(vendor_id) = avp.header.vendor_id {
+                if vendor_id.get() == 0 {
+                    return Err(DecodeError::new(
+                        DecodeErrorCode::Structural {
+                            reason: "SWm DEA Vendor-Id field must not contain zero",
+                        },
+                        offset,
+                    )
+                    .with_spec_ref(SpecRef::new("ietf", "RFC6733", "4.1.1")));
+                }
                 if code == AVP_CONTEXT_IDENTIFIER && vendor_id == VENDOR_ID_3GPP {
                     let value =
                         builder_helpers::parse_u32_value(avp.value, value_offset, "7.3.27")?;
@@ -4579,6 +4748,43 @@ pub fn parse_swm_diameter_eap_answer(
                     offset,
                     "5.6",
                 )?;
+            } else if code == base::AVP_SESSION_TIMEOUT {
+                validate_base_mandatory_flags(&avp.header, offset, "8.13")?;
+                let value = builder_helpers::parse_u32_value(avp.value, value_offset, "8.13")?;
+                builder_helpers::set_once(
+                    &mut session_timeout,
+                    SwmSessionTimeout::from_seconds(value),
+                    offset,
+                    "8.13",
+                )?;
+            } else if code == base::AVP_AUTHORIZATION_LIFETIME {
+                validate_base_mandatory_flags(&avp.header, offset, "8.9")?;
+                let value = builder_helpers::parse_u32_value(avp.value, value_offset, "8.9")?;
+                builder_helpers::set_once(&mut authorization_lifetime, value, offset, "8.9")?;
+            } else if code == base::AVP_AUTH_GRACE_PERIOD {
+                validate_base_mandatory_flags(&avp.header, offset, "8.10")?;
+                let value = builder_helpers::parse_u32_value(avp.value, value_offset, "8.10")?;
+                builder_helpers::set_once(&mut auth_grace_period, value, offset, "8.10")?;
+            } else if code == base::AVP_RE_AUTH_REQUEST_TYPE {
+                validate_base_mandatory_flags(&avp.header, offset, "8.12")?;
+                let value = builder_helpers::parse_u32_value(avp.value, value_offset, "8.12")?;
+                let typed = SwmReAuthRequestType::from_value(value).ok_or_else(|| {
+                    DecodeError::new(
+                        DecodeErrorCode::InvalidEnumValue {
+                            field: "Re-Auth-Request-Type",
+                            value: u64::from(value),
+                        },
+                        value_offset,
+                    )
+                    .with_spec_ref(SpecRef::new("ietf", "RFC6733", "8.12"))
+                })?;
+                builder_helpers::set_once(&mut re_auth_request_type, typed, offset, "8.12")?;
+            } else if code == base::AVP_AUTH_SESSION_STATE {
+                return Err(decode_structural_error_at(
+                    "SWm DEA must omit Auth-Session-State",
+                    offset,
+                    "7.2.4",
+                ));
             } else if code == AVP_EAP_PAYLOAD {
                 builder_helpers::set_once(
                     &mut eap_payload,
@@ -4690,6 +4896,10 @@ pub fn parse_swm_diameter_eap_answer(
         default_context_identifier,
         apn_configurations,
         mobile_node_identifier,
+        session_timeout,
+        authorization_lifetime,
+        auth_grace_period,
+        re_auth_request_type,
         eap_payload,
         eap_reissued_payload,
         error_message,
@@ -6074,6 +6284,7 @@ fn validate_decoded_answer(answer: &SwmDiameterEapAnswer) -> Result<(), DecodeEr
     }
     validate_answer_supported_features(&answer.supported_features)
         .map_err(|reason| decode_structural_error(reason, "6.3.29"))?;
+    validate_dea_timers(answer).map_err(|reason| decode_structural_error(reason, "7.2.2.1.2"))?;
     if answer.result_category() == SwmResultCategory::Success && !answer.carries_eap_material() {
         return Err(decode_structural_error(
             "SWm DEA success must carry EAP or MSK material",
@@ -6411,6 +6622,17 @@ fn validate_apn_profile(answer: &SwmDiameterEapAnswer) -> Result<(), &'static st
     Ok(())
 }
 
+fn validate_dea_timers(answer: &SwmDiameterEapAnswer) -> Result<(), &'static str> {
+    if answer.session_timeout.is_some() && !answer.result.is_diameter_success() {
+        return Err("SWm DEA Session-Timeout requires base DIAMETER_SUCCESS");
+    }
+    authorization::validate_answer_timer_values(
+        answer.authorization_lifetime,
+        answer.session_timeout.map(SwmSessionTimeout::seconds),
+        answer.re_auth_request_type,
+    )
+}
+
 fn option_redacted_bytes_is_empty(value: &Option<Redacted<Vec<u8>>>) -> bool {
     value
         .as_ref()
@@ -6431,4 +6653,13 @@ fn decode_structural_error(reason: &'static str, section: &'static str) -> Decod
         crate::DIAMETER_HEADER_LEN,
     )
     .with_spec_ref(SpecRef::new("3gpp", "TS29273", section))
+}
+
+fn decode_structural_error_at(
+    reason: &'static str,
+    offset: usize,
+    section: &'static str,
+) -> DecodeError {
+    DecodeError::new(DecodeErrorCode::Structural { reason }, offset)
+        .with_spec_ref(SpecRef::new("3gpp", "TS29273", section))
 }

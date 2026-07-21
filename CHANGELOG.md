@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Breaking: typed SWm DEA authorization timers — `opc-proto-diameter`:**
+  `SwmDiameterEapAnswer` adds `session_timeout`, `authorization_lifetime`,
+  `auth_grace_period`, and `re_auth_request_type`. Existing literals initialize
+  them with `None`, preserving prior encoded bytes. `SwmSessionTimeout`
+  distinguishes absence from explicit zero (unlimited); when present it is
+  accepted only with exact base `DIAMETER_SUCCESS`. Positive
+  `Authorization-Lifetime` requires `Re-Auth-Request-Type`, and a finite
+  `Session-Timeout` cannot be shorter. `Auth-Session-State` is rejected as
+  required by the SWm profile. Diagnostics expose presence only. Redirect
+  handling is not part of this focused slice and remains open under #352.
 - **Breaking: sealed SWm DER/DEA top-level extension retention —
   `opc-proto-diameter`:** `SwmDiameterEapRequest` and
   `SwmDiameterEapAnswer` add role-specific `extensions` collections; existing

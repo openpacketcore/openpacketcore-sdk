@@ -3724,7 +3724,7 @@ fn validate_answer_timers_decode(
     .map_err(|reason| decode_error(reason, DIAMETER_HEADER_LEN, section))
 }
 
-fn validate_answer_timer_values(
+pub(super) fn validate_answer_timer_values(
     authorization_lifetime: Option<u32>,
     session_timeout: Option<u32>,
     re_auth_request_type: Option<SwmReAuthRequestType>,

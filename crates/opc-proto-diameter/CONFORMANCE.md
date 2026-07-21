@@ -253,6 +253,27 @@ Typed handling for M-set routing AVPs such as `Proxy-Info` and `Route-Record`
 is outside this focused optional-extension surface; no handling claim is made
 for them here.
 
+The finite DEA authorization-timer rows are modeled as follows. Every field
+remains absent by default, preserving prior canonical message bytes.
+
+| AVP | TS 29.273 presence | Wire identity and cardinality | Typed SDK field | Positive / negative evidence |
+|:----|:-------------------|:------------------------------|:----------------|:-----------------------------|
+| `Session-Timeout` | Conditional on successful authentication and authorization | IETF 27, `Unsigned32`, V/P clear and M set, singleton | `SwmDiameterEapAnswer::session_timeout` / `SwmSessionTimeout` | Absent, zero/unlimited, nonzero, and `u32::MAX` round trip. Invalid IETF flags/width, duplicates, and every result other than exact base `DIAMETER_SUCCESS` fail. A nonzero-vendor code collision is a distinct unknown AVP governed by `UnknownIePolicy`; M-set unknown AVPs still fail. Diagnostics omit the value. |
+| `Authorization-Lifetime` | Optional authorization lifetime | IETF 291, `Unsigned32`, V/P clear and M set, singleton | `SwmDiameterEapAnswer::authorization_lifetime` | Zero and positive values round trip. A positive value without `Re-Auth-Request-Type`, duplicates, invalid IETF flags/width, and a finite value larger than finite `Session-Timeout` fail. Nonzero-vendor code collisions follow the unknown-AVP policy. |
+| `Auth-Grace-Period` | Optional | IETF 276, `Unsigned32`, V/P clear and M set, singleton | `SwmDiameterEapAnswer::auth_grace_period` | Zero and `u32::MAX` round trip independently. No relationship to another timer is invented. Invalid IETF flags/width and duplicates fail; nonzero-vendor code collisions follow the unknown-AVP policy. |
+| `Re-Auth-Request-Type` | Conditional with positive authorization lifetime | IETF 285, `Enumerated`, V/P clear and M set, singleton | `SwmDiameterEapAnswer::re_auth_request_type` / `SwmReAuthRequestType` | Both assigned values round trip; unknown enum values, invalid IETF flags/width, and duplicates fail. Nonzero-vendor code collisions follow the unknown-AVP policy. |
+| `Auth-Session-State` | Shall be omitted on SWm | IETF 277 | no field | Both command dictionaries mark it forbidden and the typed parser rejects the exact IETF key for M-clear/M-set under every unknown-AVP policy. A nonzero-vendor code collision remains a distinct unknown AVP governed by `UnknownIePolicy`; M-set unknown AVPs still fail. |
+
+The RFC 6733 base grammar permits an absent `Session-Timeout`; the codec keeps
+that established inbound and origination compatibility instead of changing
+the bytes of existing typed answers. Deployments applying TS 29.273's strict
+initial-authorization condition should require the field at their policy
+boundary. Explicit zero means unlimited and is therefore not smaller than a
+positive `Authorization-Lifetime`. Timeout enforcement, re-authorization
+scheduling, and teardown remain product policy. Redirect handling is not
+included in this slice and remains part of the open SWm authorization-context
+work.
+
 The typed DER surface also carries optional `RAT-Type` and
 `Service-Selection` authorization context. `RAT-Type` uses vendor 10415, code
 1032, a four-octet Enumerated value, and exact V/M/P flag validation;
