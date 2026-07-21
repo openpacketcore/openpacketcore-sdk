@@ -186,6 +186,16 @@ fn fake_bird_child_entrypoint() {
     }
 }
 
+/// Ignored subprocess entry point that leaves behind a closed control socket.
+#[test]
+#[ignore]
+fn create_stale_bird_socket_entrypoint() {
+    let socket = PathBuf::from(std::env::var_os("OPC_STALE_BIRD_SOCKET").unwrap());
+    let listener = UnixListener::bind(&socket).unwrap();
+    drop(listener);
+    assert!(socket.exists());
+}
+
 /// Ignored subprocess entry point that proves abrupt whole-process death.
 #[test]
 #[ignore]
@@ -303,8 +313,23 @@ async fn active_control_socket_is_never_unlinked_or_replaced() {
 #[tokio::test]
 async fn dead_owned_control_socket_is_reclaimed_before_spawn() {
     let fixture = Fixture::new("dead-socket");
-    let listener = UnixListener::bind(&fixture.socket).unwrap();
-    drop(listener);
+    // The parent test process runs other spawn-heavy tests concurrently. If
+    // it owns this listener, any child between fork and exec can transiently
+    // inherit the descriptor and make the production liveness probe correctly
+    // classify the socket as active. Create the stale inode in an exact child
+    // that exits before the recovery path begins instead.
+    let status = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "create_stale_bird_socket_entrypoint",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("OPC_STALE_BIRD_SOCKET", &fixture.socket)
+        .status()
+        .unwrap();
+    assert!(status.success(), "stale-socket child must exit cleanly");
     assert!(fixture.socket.exists());
 
     let adapter = BirdControlSocketAdapter::spawn_supervised(
