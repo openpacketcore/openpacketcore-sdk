@@ -23,6 +23,14 @@
 //! complete. Normal startup and adoption continue to reject endpoint-unbound
 //! v2 state.
 //!
+//! Current-schema eBPF graphs orphaned after process and interface-namespace
+//! loss have a separate typed recovery boundary. It leases the stable
+//! canonical pin namespace independently of ifindex, validates the exact
+//! current map and program graph, rejects live or foreign references, and
+//! requires explicit prior-writer and populated-state drain attestations.
+//! Durable proof-last cleanup is idempotently retryable; product code never
+//! receives raw pin-deletion authority.
+//!
 //! Raw Linux netlink and socket syscalls stay in [`opc_linux_gtpu_sys`]; this
 //! crate is safe Rust and never performs `unsafe` operations.
 
@@ -51,12 +59,15 @@ pub use mock::{
     MockPdpContextReconciliationOperation,
 };
 pub use model::{
-    CreateGtpDeviceRequest, DrainedV2TeardownOutcome, DrainedV2TeardownProgress,
-    DrainedV2TeardownRefusal, DrainedV2TeardownRequest, GtpAddressFamily, GtpBearerMark, GtpDevice,
-    GtpPdpContext, GtpRole, GtpVersion, GtpuBackendKind, GtpuCapability, GtpuDownlinkEndpoint,
-    GtpuDownlinkFragmentContract, GtpuOuterFragmentPolicy, GtpuProbe, GtpuReassemblyBounds,
-    GtpuSourcePortPolicy, GtpuSourcePortRange, GtpuUplinkMtuPolicy, GtpuUplinkSourcePortPolicy,
-    GtpuV2DrainProof, PdpContextConflict, PdpContextIndeterminateReason, PdpContextInstallOutcome,
+    CreateGtpDeviceRequest, CurrentEbpfGraphDrainProof, CurrentEbpfGraphRecoveryOutcome,
+    CurrentEbpfGraphRecoveryProgress, CurrentEbpfGraphRecoveryRefusal,
+    CurrentEbpfGraphRecoveryRequest, CurrentEbpfGraphWriterProof, DrainedV2TeardownOutcome,
+    DrainedV2TeardownProgress, DrainedV2TeardownRefusal, DrainedV2TeardownRequest,
+    GtpAddressFamily, GtpBearerMark, GtpDevice, GtpPdpContext, GtpRole, GtpVersion,
+    GtpuBackendKind, GtpuCapability, GtpuDownlinkEndpoint, GtpuDownlinkFragmentContract,
+    GtpuOuterFragmentPolicy, GtpuProbe, GtpuReassemblyBounds, GtpuSourcePortPolicy,
+    GtpuSourcePortRange, GtpuUplinkMtuPolicy, GtpuUplinkSourcePortPolicy, GtpuV2DrainProof,
+    PdpContextConflict, PdpContextIndeterminateReason, PdpContextInstallOutcome,
     PdpContextLocalTeidSelector, PdpContextMismatchField, PdpContextReadback,
     PdpContextReconciliationCapabilities, PdpContextRemovalOutcome, PdpContextSelector,
     PdpContextSelectorOccupancy, PdpContextUplinkIdentity, PdpContextUplinkSelector,

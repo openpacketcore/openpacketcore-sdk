@@ -63,16 +63,17 @@ use aya::{Ebpf, EbpfLoader};
 use nix::libc;
 use nix::{setsockopt_impl, sockopt_impl};
 use opc_gtpu_dataplane::{
-    reassembly_commit_authorizes_graph, CreateGtpDeviceRequest, DrainedV2TeardownOutcome,
-    DrainedV2TeardownRefusal, DrainedV2TeardownRequest, DscpCodepoint, EbpfGtpuDataplaneBackend,
-    EbpfGtpuDataplaneBackendConfig, GtpBearerMark, GtpDevice, GtpPdpContext, GtpVersion,
-    GtpuCapability, GtpuDataplaneBackend, GtpuError, GtpuOuterFragmentPolicy,
-    GtpuReassemblyConsumer, GtpuReassemblyDrop, GtpuReassemblyGraphIdentity, GtpuReassemblyOutcome,
-    GtpuReassemblyPdr, GtpuReassemblySelector, GtpuReassemblySocket, GtpuSourcePortPolicy,
-    GtpuUplinkMtuPolicy, GtpuUplinkSourcePortPolicy, GtpuV2DrainProof,
-    PdpContextIndeterminateReason, PdpContextInstallOutcome, PdpContextLocalTeidSelector,
-    PdpContextReadback, PdpContextRemovalOutcome, PdpContextSelector, PdpContextSelectorOccupancy,
-    PdpContextUplinkSelector, RemovePdpContextRequest, Teid,
+    reassembly_commit_authorizes_graph, CreateGtpDeviceRequest, CurrentEbpfGraphRecoveryOutcome,
+    CurrentEbpfGraphRecoveryRefusal, CurrentEbpfGraphRecoveryRequest, CurrentEbpfGraphWriterProof,
+    DrainedV2TeardownOutcome, DrainedV2TeardownRefusal, DrainedV2TeardownRequest, DscpCodepoint,
+    EbpfGtpuDataplaneBackend, EbpfGtpuDataplaneBackendConfig, GtpBearerMark, GtpDevice,
+    GtpPdpContext, GtpVersion, GtpuCapability, GtpuDataplaneBackend, GtpuError,
+    GtpuOuterFragmentPolicy, GtpuReassemblyConsumer, GtpuReassemblyDrop,
+    GtpuReassemblyGraphIdentity, GtpuReassemblyOutcome, GtpuReassemblyPdr, GtpuReassemblySelector,
+    GtpuReassemblySocket, GtpuSourcePortPolicy, GtpuUplinkMtuPolicy, GtpuUplinkSourcePortPolicy,
+    GtpuV2DrainProof, PdpContextIndeterminateReason, PdpContextInstallOutcome,
+    PdpContextLocalTeidSelector, PdpContextReadback, PdpContextRemovalOutcome, PdpContextSelector,
+    PdpContextSelectorOccupancy, PdpContextUplinkSelector, RemovePdpContextRequest, Teid,
 };
 use opc_gtpu_ebpf_common::{
     internet_checksum, ipv4_header_checksum, udp_ipv4_checksum, DownlinkEndpointBinding,
@@ -3041,8 +3042,9 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
     }
 
     // A second live reconciler must not interleave map operations with the
-    // current owner. Kernel-owned abstract socket lifetime makes this work
-    // across independent backend instances and processes.
+    // current owner. The host-global persistent control-directory flock,
+    // keyed by canonical pin namespace, makes this work across independent
+    // backend instances and processes.
     let competing = EbpfGtpuDataplaneBackend::with_config(EbpfGtpuDataplaneBackendConfig {
         bpffs_pin_root: net.pin_root.clone(),
         ..EbpfGtpuDataplaneBackendConfig::default()
@@ -5167,6 +5169,113 @@ async fn ebpf_gtpu_uplink_mtu_policy_enforced_on_the_wire() -> Result<(), Box<dy
     // The supported mutation restores a canonical policy.
     backend.set_uplink_mtu_policy(&device, None).await?;
     assert_eq!(backend.effective_uplink_mtu_policy(&device).await?, None);
+
+    drop(net);
+    Ok(())
+}
+
+#[tokio::test]
+// The serial guard is deliberately held for the entire test body; see
+// PRIVILEGED_TEST_LOCK.
+#[allow(clippy::await_holding_lock)]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn current_graph_recovery_fences_live_owner_and_recovers_after_interface_loss(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref() != Ok("1") {
+        eprintln!("skipping: set OPC_GTPU_RUN_PRIVILEGED=1 inside a fresh privileged netns");
+        return Ok(());
+    }
+
+    let _serial = PRIVILEGED_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let net = TestNet::provision();
+    let config = EbpfGtpuDataplaneBackendConfig {
+        bpffs_pin_root: net.pin_root.clone(),
+        ..EbpfGtpuDataplaneBackendConfig::default()
+    };
+    let owner = EbpfGtpuDataplaneBackend::with_config(config.clone());
+    let mut create = CreateGtpDeviceRequest::new("s2bu");
+    create.bind_address = IpAddr::V4(EPDG_S2BU_IP);
+    let old_device = owner.create_device(create).await?;
+    let pin_dir = net.pin_root.join("s2bu");
+    let recovery = EbpfGtpuDataplaneBackend::with_config(config.clone());
+    let request = CurrentEbpfGraphRecoveryRequest::new(
+        "s2bu",
+        CurrentEbpfGraphWriterProof::previous_writer_stopped(),
+    )
+    .with_replacement_device(old_device.clone());
+
+    assert_eq!(
+        recovery
+            .recover_orphaned_current_ebpf_graph(request)
+            .await?,
+        CurrentEbpfGraphRecoveryOutcome::Refused(CurrentEbpfGraphRecoveryRefusal::ActiveOwner),
+        "the live backend's host-global namespace lease must fence recovery"
+    );
+    assert!(
+        pin_dir.is_dir(),
+        "a refused recovery must preserve every pin"
+    );
+
+    // Releasing the stable namespace lease is not sufficient while the old
+    // interface still holds the loaded tc programs. This call has no
+    // replacement, so ActiveOwner is proven by the complete loaded-program
+    // map-reference scan rather than by the lease or replacement hook check.
+    drop(owner);
+    assert_eq!(
+        recovery
+            .recover_orphaned_current_ebpf_graph(CurrentEbpfGraphRecoveryRequest::new(
+                "s2bu",
+                CurrentEbpfGraphWriterProof::previous_writer_stopped(),
+            ))
+            .await?,
+        CurrentEbpfGraphRecoveryOutcome::Refused(CurrentEbpfGraphRecoveryRefusal::ActiveOwner),
+        "surviving loaded programs that reference the pinned graph must fence recovery"
+    );
+    assert!(pin_dir.is_dir(), "program-reference refusal preserves pins");
+
+    // Model abrupt pod/netns loss: deleting the old interface removes both tc
+    // hooks while the bpffs graph survives. The replacement deliberately
+    // receives a new ifindex and is validated separately from the persistent
+    // pin namespace.
+    run("ip", &["link", "del", "s2bu"]);
+    run("ip", &["link", "add", "s2bu-repl", "type", "dummy"]);
+    struct LinkCleanup(&'static str);
+    impl Drop for LinkCleanup {
+        fn drop(&mut self) {
+            let _ = Command::new("ip").args(["link", "del", self.0]).output();
+        }
+    }
+    let _replacement_cleanup = LinkCleanup("s2bu-repl");
+    run("ip", &["link", "set", "s2bu-repl", "up"]);
+    let replacement_ifindex = nix::net::if_::if_nametoindex("s2bu-repl")?;
+    assert_ne!(replacement_ifindex, old_device.ifindex);
+    let replacement = GtpDevice {
+        name: "s2bu-repl".to_string(),
+        ifindex: replacement_ifindex,
+    };
+    let request = || {
+        CurrentEbpfGraphRecoveryRequest::new(
+            "s2bu",
+            CurrentEbpfGraphWriterProof::previous_writer_stopped(),
+        )
+        .with_replacement_device(replacement.clone())
+    };
+
+    assert_eq!(
+        recovery
+            .recover_orphaned_current_ebpf_graph(request())
+            .await?,
+        CurrentEbpfGraphRecoveryOutcome::Removed
+    );
+    assert!(!pin_dir.exists());
+    assert_eq!(
+        recovery
+            .recover_orphaned_current_ebpf_graph(request())
+            .await?,
+        CurrentEbpfGraphRecoveryOutcome::AlreadyAbsent
+    );
 
     drop(net);
     Ok(())

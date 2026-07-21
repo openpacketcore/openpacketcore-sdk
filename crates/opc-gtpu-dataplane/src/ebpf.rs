@@ -43,13 +43,13 @@ use opc_gtpu_ebpf_common::{
 use crate::backend::error_proves_no_requested_mutation;
 use crate::model::{classify_dual_selector_state, DualSelectorState};
 use crate::{
-    CreateGtpDeviceRequest, DrainedV2TeardownOutcome, DrainedV2TeardownRefusal,
-    DrainedV2TeardownRequest, GtpAddressFamily, GtpBearerMark, GtpDevice, GtpPdpContext,
-    GtpVersion, GtpuBackendKind, GtpuCapability, GtpuDataplaneBackend, GtpuDownlinkEndpoint,
-    GtpuDownlinkFragmentContract, GtpuError, GtpuProbe, PdpContextIndeterminateReason,
-    PdpContextInstallOutcome, PdpContextLocalTeidSelector, PdpContextReadback,
-    PdpContextReconciliationCapabilities, PdpContextRemovalOutcome, PdpContextSelector,
-    PdpContextUplinkSelector, RemovePdpContextRequest, Teid,
+    CreateGtpDeviceRequest, CurrentEbpfGraphRecoveryOutcome, CurrentEbpfGraphRecoveryRequest,
+    DrainedV2TeardownOutcome, DrainedV2TeardownRefusal, DrainedV2TeardownRequest, GtpAddressFamily,
+    GtpBearerMark, GtpDevice, GtpPdpContext, GtpVersion, GtpuBackendKind, GtpuCapability,
+    GtpuDataplaneBackend, GtpuDownlinkEndpoint, GtpuDownlinkFragmentContract, GtpuError, GtpuProbe,
+    PdpContextIndeterminateReason, PdpContextInstallOutcome, PdpContextLocalTeidSelector,
+    PdpContextReadback, PdpContextReconciliationCapabilities, PdpContextRemovalOutcome,
+    PdpContextSelector, PdpContextUplinkSelector, RemovePdpContextRequest, Teid,
 };
 
 /// Default bpffs directory under which per-interface map pins are created.
@@ -183,6 +183,13 @@ pub(crate) enum EbpfAttachmentDisposition {
     Retained,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CurrentRecoveryManagedState {
+    Clear,
+    Conflict,
+    Indeterminate,
+}
+
 /// Narrow synchronous port to the kernel eBPF machinery.
 ///
 /// The production implementation loads the committed CO-RE object with `aya`,
@@ -233,6 +240,17 @@ pub(crate) trait EbpfGtpuRuntime: Send + Sync + fmt::Debug {
         pin_dir: &Path,
         tc_priority: u16,
     ) -> Result<DrainedV2TeardownOutcome, GtpuError>;
+
+    /// Recover an orphaned exact current-schema graph under a host-global
+    /// pin-namespace lease.
+    fn recover_orphaned_current_graph(
+        &self,
+        replacement: Option<(&str, u32)>,
+        pin_dir: &Path,
+        tc_priority: u16,
+        allow_populated: bool,
+        managed_state: CurrentRecoveryManagedState,
+    ) -> Result<CurrentEbpfGraphRecoveryOutcome, GtpuError>;
 
     /// Read an uplink FAR entry.
     fn far_get(
@@ -1287,6 +1305,46 @@ impl EbpfGtpuDataplaneBackend {
             device.ifindex,
             &self.pin_dir(&device.name),
             self.inner.config.tc_priority,
+        )
+    }
+
+    fn recover_orphaned_current_graph_sync(
+        &self,
+        request: CurrentEbpfGraphRecoveryRequest,
+    ) -> Result<CurrentEbpfGraphRecoveryOutcome, GtpuError> {
+        let _operation = self.operation_guard()?;
+        validate_linux_name(request.pin_namespace(), "pin_namespace")?;
+        if let Some(replacement) = request.replacement_device() {
+            validate_linux_name(&replacement.name, "replacement_device.name")?;
+            if replacement.ifindex == 0 {
+                return Err(GtpuError::invalid_config(
+                    "replacement_device.ifindex",
+                    "interface index must be nonzero",
+                ));
+            }
+        }
+        let managed_state = match self.devices() {
+            Ok(devices)
+                if devices.iter().any(|(ifindex, managed)| {
+                    request.replacement_device().is_some_and(|replacement| {
+                        *ifindex == replacement.ifindex || managed.name == replacement.name
+                    }) || managed.name == request.pin_namespace()
+                }) =>
+            {
+                CurrentRecoveryManagedState::Conflict
+            }
+            Ok(_) => CurrentRecoveryManagedState::Clear,
+            Err(_) => CurrentRecoveryManagedState::Indeterminate,
+        };
+        let replacement = request
+            .replacement_device()
+            .map(|device| (device.name.as_str(), device.ifindex));
+        self.inner.runtime.recover_orphaned_current_graph(
+            replacement,
+            &self.pin_dir(request.pin_namespace()),
+            self.inner.config.tc_priority,
+            request.drain_proof().is_some(),
+            managed_state,
         )
     }
 
@@ -2749,6 +2807,16 @@ impl GtpuDataplaneBackend for EbpfGtpuDataplaneBackend {
         .await
     }
 
+    async fn recover_orphaned_current_ebpf_graph(
+        &self,
+        request: CurrentEbpfGraphRecoveryRequest,
+    ) -> Result<CurrentEbpfGraphRecoveryOutcome, GtpuError> {
+        self.run_blocking("ebpf_current_graph_recovery", move |backend| {
+            backend.recover_orphaned_current_graph_sync(request)
+        })
+        .await
+    }
+
     async fn install_pdp_context(&self, request: GtpPdpContext) -> Result<(), GtpuError> {
         self.run_blocking("ebpf_install_pdp_context", move |backend| {
             backend.install_pdp_context_sync(request)
@@ -2828,22 +2896,23 @@ impl GtpuDataplaneBackend for EbpfGtpuDataplaneBackend {
 const IFNAMSIZ: usize = 16;
 
 fn validate_interface_name(name: &str) -> Result<(), GtpuError> {
+    validate_linux_name(name, "device.name")
+}
+
+fn validate_linux_name(name: &str, field: &'static str) -> Result<(), GtpuError> {
     if name.is_empty() {
-        return Err(GtpuError::invalid_config(
-            "device.name",
-            "name must be nonempty",
-        ));
+        return Err(GtpuError::invalid_config(field, "name must be nonempty"));
     }
     if name.len() >= IFNAMSIZ {
         return Err(GtpuError::invalid_config(
-            "device.name",
+            field,
             "name must fit Linux IFNAMSIZ",
         ));
     }
-    if name.as_bytes().contains(&0) || name.contains('/') {
+    if name == "." || name == ".." || name.as_bytes().contains(&0) || name.contains('/') {
         return Err(GtpuError::invalid_config(
-            "device.name",
-            "name must not contain NUL or path separators",
+            field,
+            "name must not be a reserved path component or contain NUL or path separators",
         ));
     }
     Ok(())
@@ -2897,13 +2966,12 @@ mod aya_runtime {
     //! tc clsact filters, and performs pinned BPF map operations.
 
     use std::collections::{HashMap, HashSet};
-    use std::fs;
+    use std::fs::{self, File};
     use std::io;
     use std::mem::ManuallyDrop;
-    use std::os::linux::net::SocketAddrExt;
     use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::net::{SocketAddr, UnixDatagram};
-    use std::path::Path;
+    use std::os::unix::fs::MetadataExt;
+    use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
     use aya::maps::{
@@ -2934,7 +3002,8 @@ mod aya_runtime {
         COUNTER_DL_BINDING_INVALID, COUNTER_DL_BINDING_LOCAL_MISMATCH,
         COUNTER_DL_BINDING_PEER_MISMATCH, COUNTER_DL_BINDING_SOURCE_PORT_MISMATCH,
         COUNTER_DL_DECAP, COUNTER_DL_DST_MISMATCH, COUNTER_DL_MALFORMED, COUNTER_DL_UNKNOWN_TEID,
-        COUNTER_UL_ENCAP, COUNTER_UL_FAR_MISS, COUNTER_UL_MTU_REJECT, COUNTER_UL_PMTU_CORRUPT,
+        COUNTER_SLOTS, COUNTER_UL_ENCAP, COUNTER_UL_FAR_MISS, COUNTER_UL_MTU_REJECT,
+        COUNTER_UL_PMTU_CORRUPT, DOWNLINK_BINDING_COUNTER_SLOTS,
         DOWNLINK_ENDPOINT_BINDING_VALUE_LEN, DOWNLINK_PDR_VALUE_LEN, MAP_CONFIG, MAP_COUNTERS,
         MAP_DOWNLINK_BINDING_COUNTERS, MAP_DOWNLINK_ENDPOINT_BINDING, MAP_DOWNLINK_MARK_PDR,
         MAP_DOWNLINK_PDR, MAP_MARKED_BEARER_OWNER, MAP_UPLINK_DSCP, MAP_UPLINK_FAR,
@@ -2944,16 +3013,18 @@ mod aya_runtime {
         UPLINK_BEARER_SCHEMA_MARKER_VALUE, UPLINK_DSCP_SCHEMA_MARKER_KEY,
         UPLINK_DSCP_SCHEMA_MARKER_VALUE, UPLINK_DSCP_VALUE_LEN,
         UPLINK_ENDPOINT_SCHEMA_MARKER_VALUE, UPLINK_FAR_VALUE_LEN, UPLINK_MARK_KEY_LEN,
-        UPLINK_PMTU_SCHEMA_MARKER_VALUE, UPLINK_PMTU_VALUE_LEN,
+        UPLINK_PMTU_COUNTER_SLOTS, UPLINK_PMTU_SCHEMA_MARKER_VALUE, UPLINK_PMTU_VALUE_LEN,
         UPLINK_SOURCE_PORT_SCHEMA_MARKER_VALUE, UPLINK_SOURCE_PORT_VALUE_LEN,
     };
 
     use super::{
-        ebpf_pmtu_map_state_is_executable, EbpfAttachmentDisposition, EbpfEnvironment,
-        EbpfGtpuDatapathCounters, EbpfGtpuDatapathSnapshot, EbpfGtpuRuntime,
+        ebpf_pmtu_map_state_is_executable, CurrentRecoveryManagedState, EbpfAttachmentDisposition,
+        EbpfEnvironment, EbpfGtpuDatapathCounters, EbpfGtpuDatapathSnapshot, EbpfGtpuRuntime,
     };
     use crate::{
-        DrainedV2TeardownOutcome, DrainedV2TeardownProgress, DrainedV2TeardownRefusal, GtpuError,
+        CurrentEbpfGraphRecoveryOutcome, CurrentEbpfGraphRecoveryProgress,
+        CurrentEbpfGraphRecoveryRefusal, DrainedV2TeardownOutcome, DrainedV2TeardownProgress,
+        DrainedV2TeardownRefusal, GtpuError,
     };
 
     /// The committed CO-RE datapath object built by
@@ -3113,7 +3184,146 @@ mod aya_runtime {
         },
     ];
 
+    const CURRENT_MAP_NAMES: [&str; 15] = [
+        MAP_UPLINK_FAR,
+        MAP_UPLINK_MARK_FAR,
+        MAP_UPLINK_DSCP,
+        MAP_UPLINK_MARK_DSCP,
+        MAP_UPLINK_SOURCE_PORT,
+        MAP_UPLINK_MARK_SOURCE_PORT,
+        MAP_UPLINK_PMTU,
+        MAP_UPLINK_PMTU_COUNTERS,
+        MAP_DOWNLINK_PDR,
+        MAP_DOWNLINK_MARK_PDR,
+        MAP_DOWNLINK_ENDPOINT_BINDING,
+        MAP_MARKED_BEARER_OWNER,
+        MAP_COUNTERS,
+        MAP_DOWNLINK_BINDING_COUNTERS,
+        MAP_CONFIG,
+    ];
+
+    #[derive(Clone, Copy)]
+    struct CurrentMapSpec {
+        name: &'static str,
+        map_type: u32,
+        key_size: u32,
+        value_size: u32,
+        max_entries: u32,
+    }
+
+    const CURRENT_MAP_SPECS: [CurrentMapSpec; CURRENT_MAP_NAMES.len()] = [
+        CurrentMapSpec {
+            name: MAP_UPLINK_FAR,
+            map_type: bpf_map_type::BPF_MAP_TYPE_HASH as u32,
+            key_size: 4,
+            value_size: UPLINK_FAR_VALUE_LEN as u32,
+            max_entries: 65_536,
+        },
+        CurrentMapSpec {
+            name: MAP_UPLINK_MARK_FAR,
+            map_type: bpf_map_type::BPF_MAP_TYPE_HASH as u32,
+            key_size: UPLINK_MARK_KEY_LEN as u32,
+            value_size: UPLINK_FAR_VALUE_LEN as u32,
+            max_entries: 65_536,
+        },
+        CurrentMapSpec {
+            name: MAP_UPLINK_DSCP,
+            map_type: bpf_map_type::BPF_MAP_TYPE_HASH as u32,
+            key_size: 4,
+            value_size: UPLINK_DSCP_VALUE_LEN as u32,
+            max_entries: 65_536,
+        },
+        CurrentMapSpec {
+            name: MAP_UPLINK_MARK_DSCP,
+            map_type: bpf_map_type::BPF_MAP_TYPE_HASH as u32,
+            key_size: UPLINK_MARK_KEY_LEN as u32,
+            value_size: UPLINK_DSCP_VALUE_LEN as u32,
+            max_entries: 65_536,
+        },
+        CurrentMapSpec {
+            name: MAP_UPLINK_SOURCE_PORT,
+            map_type: bpf_map_type::BPF_MAP_TYPE_HASH as u32,
+            key_size: 4,
+            value_size: UPLINK_SOURCE_PORT_VALUE_LEN as u32,
+            max_entries: 65_536,
+        },
+        CurrentMapSpec {
+            name: MAP_UPLINK_MARK_SOURCE_PORT,
+            map_type: bpf_map_type::BPF_MAP_TYPE_HASH as u32,
+            key_size: UPLINK_MARK_KEY_LEN as u32,
+            value_size: UPLINK_SOURCE_PORT_VALUE_LEN as u32,
+            max_entries: 65_536,
+        },
+        CurrentMapSpec {
+            name: MAP_UPLINK_PMTU,
+            map_type: bpf_map_type::BPF_MAP_TYPE_ARRAY as u32,
+            key_size: 4,
+            value_size: UPLINK_PMTU_VALUE_LEN as u32,
+            max_entries: 1,
+        },
+        CurrentMapSpec {
+            name: MAP_UPLINK_PMTU_COUNTERS,
+            map_type: bpf_map_type::BPF_MAP_TYPE_PERCPU_ARRAY as u32,
+            key_size: 4,
+            value_size: 8,
+            max_entries: UPLINK_PMTU_COUNTER_SLOTS,
+        },
+        CurrentMapSpec {
+            name: MAP_DOWNLINK_PDR,
+            map_type: bpf_map_type::BPF_MAP_TYPE_HASH as u32,
+            key_size: 4,
+            value_size: DOWNLINK_PDR_VALUE_LEN as u32,
+            max_entries: 65_536,
+        },
+        CurrentMapSpec {
+            name: MAP_DOWNLINK_MARK_PDR,
+            map_type: bpf_map_type::BPF_MAP_TYPE_HASH as u32,
+            key_size: 4,
+            value_size: MARKED_DOWNLINK_PDR_VALUE_LEN as u32,
+            max_entries: 65_536,
+        },
+        CurrentMapSpec {
+            name: MAP_DOWNLINK_ENDPOINT_BINDING,
+            map_type: bpf_map_type::BPF_MAP_TYPE_HASH as u32,
+            key_size: 4,
+            value_size: DOWNLINK_ENDPOINT_BINDING_VALUE_LEN as u32,
+            max_entries: 65_536,
+        },
+        CurrentMapSpec {
+            name: MAP_MARKED_BEARER_OWNER,
+            map_type: bpf_map_type::BPF_MAP_TYPE_HASH as u32,
+            key_size: UPLINK_MARK_KEY_LEN as u32,
+            value_size: MARKED_BEARER_OWNER_VALUE_LEN as u32,
+            max_entries: 65_536,
+        },
+        CurrentMapSpec {
+            name: MAP_COUNTERS,
+            map_type: bpf_map_type::BPF_MAP_TYPE_PERCPU_ARRAY as u32,
+            key_size: 4,
+            value_size: 8,
+            max_entries: COUNTER_SLOTS,
+        },
+        CurrentMapSpec {
+            name: MAP_DOWNLINK_BINDING_COUNTERS,
+            map_type: bpf_map_type::BPF_MAP_TYPE_PERCPU_ARRAY as u32,
+            key_size: 4,
+            value_size: 8,
+            max_entries: DOWNLINK_BINDING_COUNTER_SLOTS,
+        },
+        CurrentMapSpec {
+            name: MAP_CONFIG,
+            map_type: bpf_map_type::BPF_MAP_TYPE_ARRAY as u32,
+            key_size: 4,
+            value_size: 4,
+            max_entries: 1,
+        },
+    ];
+
+    const CURRENT_RECOVERY_PROOF_LEN: usize = 136;
+    const CURRENT_RECOVERY_MAGIC: [u8; 8] = *b"OPCCURR1";
+
     const TC_HANDLE: TcHandle = TcHandle::new(0, 1);
+    const RECONCILER_CONTROL_DIRECTORY: &str = "GTPU_RECONCILER_LOCKS";
     const CAP_NET_ADMIN: u32 = 12;
     const CAP_SYS_ADMIN: u32 = 21;
     const CAP_BPF: u32 = 39;
@@ -3121,6 +3331,22 @@ mod aya_runtime {
     #[derive(Debug, Default)]
     pub(super) struct AyaGtpuRuntime {
         devices: Mutex<HashMap<u32, LoadedDevice>>,
+    }
+
+    struct ReconcilerOwnership {
+        _lock: File,
+        _control_dir: PathBuf,
+        canonical_pin_dir: PathBuf,
+        namespace_hash: [u8; 32],
+    }
+
+    impl std::fmt::Debug for ReconcilerOwnership {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("ReconcilerOwnership")
+                .field("held", &true)
+                .finish()
+        }
     }
 
     struct LoadedDevice {
@@ -3134,12 +3360,11 @@ mod aya_runtime {
         pin_dir: std::path::PathBuf,
         tc_priority: u16,
         datapath_identity: DatapathIdentity,
-        // An abstract AF_UNIX address is exclusive within the current network
-        // namespace and is released by the kernel on process exit. Holding
-        // this socket prevents independently constructed backends/processes
-        // from concurrently reconciling the same pin/interface state while
-        // still permitting crash/restart adoption.
-        _reconciler_ownership: UnixDatagram,
+        // A flock on a permanent control-directory inode below the persistent
+        // pin root is host-global across pod network namespaces and released
+        // by the kernel on process exit. The lock identity depends only on the
+        // canonical pin namespace, never on a mutable interface index.
+        _reconciler_ownership: ReconcilerOwnership,
     }
 
     impl std::fmt::Debug for LoadedDevice {
@@ -3229,6 +3454,25 @@ mod aya_runtime {
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum CurrentIdentityError {
+        Mismatch,
+        Indeterminate,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum CurrentProgramReference {
+        Absent,
+        ExactSdkProgram,
+        Foreign,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ReplacementHookObservationError {
+        IdentityChanged,
+        Indeterminate,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum LegacyV2ProofCommitError {
         /// No durable proof publication was observed after the attempted
         /// operation, so no intentional teardown mutation was committed.
@@ -3236,6 +3480,26 @@ mod aya_runtime {
         /// Publication succeeded, or may have succeeded, but exact readback
         /// could not be completed. The proof path must remain a current-schema fence.
         PublicationIndeterminate,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum CurrentProofCommitError {
+        /// No proof publication was observed after a failed prepublication
+        /// operation, so the graph remains uncommitted.
+        BeforePublication,
+        /// Proof publication succeeded or may have succeeded, but exact
+        /// readback did not complete. The reserved path remains a fence when
+        /// present and the exact request must be retried.
+        PublicationIndeterminate,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum CurrentProofFenceState {
+        Exact,
+        /// A reserved-path object or unreadable path still makes normal
+        /// create/adopt fail closed, but exact continuation is unavailable.
+        FencedUnknown,
+        Absent,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3332,6 +3596,118 @@ mod aya_runtime {
     struct LegacyV2TeardownProof {
         record: LegacyV2TeardownRecord,
         map_id: u32,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct CurrentRecoveryRecord {
+        namespace_hash: [u8; 32],
+        allow_populated: bool,
+        map_ids: [u32; CURRENT_MAP_NAMES.len()],
+        graph_device: u64,
+        graph_inode: u64,
+        proof_map_id: u32,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct CurrentRecoveryProof {
+        record: CurrentRecoveryRecord,
+        map_id: u32,
+    }
+
+    struct HeldCurrentPin {
+        index: usize,
+        data: MapData,
+    }
+
+    impl CurrentRecoveryRecord {
+        fn unbound(
+            namespace_hash: [u8; 32],
+            allow_populated: bool,
+            map_ids: [u32; CURRENT_MAP_NAMES.len()],
+            graph_device: u64,
+            graph_inode: u64,
+        ) -> Self {
+            Self {
+                namespace_hash,
+                allow_populated,
+                map_ids,
+                graph_device,
+                graph_inode,
+                proof_map_id: 0,
+            }
+        }
+
+        fn bind_to_proof_map(self, proof_map_id: u32) -> Option<Self> {
+            (self.proof_map_id == 0 && proof_map_id != 0).then_some(Self {
+                proof_map_id,
+                ..self
+            })
+        }
+
+        fn matches_unbound(self, unbound: Self) -> bool {
+            unbound.proof_map_id == 0
+                && self
+                    == Self {
+                        proof_map_id: self.proof_map_id,
+                        ..unbound
+                    }
+        }
+
+        fn encode(self) -> [u8; CURRENT_RECOVERY_PROOF_LEN] {
+            let mut encoded = [0_u8; CURRENT_RECOVERY_PROOF_LEN];
+            encoded[..8].copy_from_slice(&CURRENT_RECOVERY_MAGIC);
+            encoded[8] = 1;
+            encoded[9] = u8::from(self.allow_populated);
+            encoded[16..48].copy_from_slice(&self.namespace_hash);
+            for (index, map_id) in self.map_ids.into_iter().enumerate() {
+                let offset = 48 + index * 4;
+                encoded[offset..offset + 4].copy_from_slice(&map_id.to_ne_bytes());
+            }
+            encoded[108..112].copy_from_slice(&self.proof_map_id.to_ne_bytes());
+            encoded[112..120].copy_from_slice(&self.graph_device.to_ne_bytes());
+            encoded[120..128].copy_from_slice(&self.graph_inode.to_ne_bytes());
+            let checksum = teardown_record_checksum(&encoded[..128]);
+            encoded[128..136].copy_from_slice(&checksum.to_ne_bytes());
+            encoded
+        }
+
+        fn decode(encoded: &[u8; CURRENT_RECOVERY_PROOF_LEN]) -> Option<Self> {
+            let read_u32 = |offset: usize| {
+                encoded
+                    .get(offset..offset + 4)
+                    .and_then(|value| value.try_into().ok())
+                    .map(u32::from_ne_bytes)
+            };
+            if encoded[..8] != CURRENT_RECOVERY_MAGIC
+                || encoded[8] != 1
+                || encoded[9] > 1
+                || encoded[10..16] != [0; 6]
+                || u64::from_ne_bytes(encoded[128..136].try_into().ok()?)
+                    != teardown_record_checksum(&encoded[..128])
+            {
+                return None;
+            }
+            let mut namespace_hash = [0_u8; 32];
+            namespace_hash.copy_from_slice(&encoded[16..48]);
+            let mut map_ids = [0_u32; CURRENT_MAP_NAMES.len()];
+            for (index, map_id) in map_ids.iter_mut().enumerate() {
+                *map_id = read_u32(48 + index * 4)?;
+            }
+            let record = Self {
+                namespace_hash,
+                allow_populated: encoded[9] == 1,
+                map_ids,
+                graph_device: u64::from_ne_bytes(encoded[112..120].try_into().ok()?),
+                graph_inode: u64::from_ne_bytes(encoded[120..128].try_into().ok()?),
+                proof_map_id: read_u32(108)?,
+            };
+            (record.namespace_hash != [0; 32]
+                && record.proof_map_id != 0
+                && record.graph_device != 0
+                && record.graph_inode != 0
+                && record.map_ids.iter().all(|id| *id != 0))
+            .then_some(record)
+        }
     }
 
     impl LegacyV2TeardownRecord {
@@ -3613,34 +3989,105 @@ mod aya_runtime {
             Self::default()
         }
 
-        fn acquire_reconciler_ownership(
-            pin_dir: &Path,
-            ifindex: u32,
-        ) -> Result<UnixDatagram, GtpuError> {
-            // A deterministic FNV-1a digest keeps the abstract address below
-            // sockaddr_un's length limit without exposing the configured
-            // filesystem path in errors or process listings.
-            let mut digest = 0xcbf2_9ce4_8422_2325_u64;
-            for byte in pin_dir
-                .as_os_str()
-                .as_bytes()
-                .iter()
-                .copied()
-                .chain(ifindex.to_ne_bytes())
-            {
-                digest ^= u64::from(byte);
-                digest = digest.wrapping_mul(0x0000_0100_0000_01b3);
+        fn acquire_reconciler_ownership(pin_dir: &Path) -> Result<ReconcilerOwnership, GtpuError> {
+            let parent = pin_dir.parent().ok_or_else(|| {
+                GtpuError::invalid_config("ebpf.bpffs_pin_root", "pin directory must have a parent")
+            })?;
+            let leaf = pin_dir.file_name().ok_or_else(|| {
+                GtpuError::invalid_config(
+                    "pin_namespace",
+                    "pin namespace must have one final component",
+                )
+            })?;
+            fs::create_dir_all(parent)
+                .map_err(|error| GtpuError::io("ebpf_pin_root_create", error))?;
+            let canonical_parent = fs::canonicalize(parent)
+                .map_err(|error| GtpuError::io("ebpf_pin_root_canonicalize", error))?;
+            let canonical_pin_dir = canonical_parent.join(leaf);
+            // The shared control-root inode already scopes the persistent
+            // bpffs root. Hash only the validated leaf so bind-mount aliases
+            // of that same root converge on the same lock child.
+            let namespace_hash: [u8; 32] = Sha256::digest(leaf.as_bytes()).into();
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            let mut digest_name = String::with_capacity(64);
+            for byte in namespace_hash {
+                digest_name.push(char::from(HEX[usize::from(byte >> 4)]));
+                digest_name.push(char::from(HEX[usize::from(byte & 0x0f)]));
             }
-            let name = format!("opc-gtpu-reconciler-{digest:016x}");
-            let address = SocketAddr::from_abstract_name(name.as_bytes())
-                .map_err(|error| GtpuError::io("ebpf_reconciler_ownership", error))?;
-            UnixDatagram::bind_addr(&address).map_err(|error| {
-                if error.kind() == io::ErrorKind::AddrInUse {
-                    GtpuError::AlreadyExists
-                } else {
-                    GtpuError::io("ebpf_reconciler_ownership", error)
+            let control_root = canonical_parent.join(RECONCILER_CONTROL_DIRECTORY);
+            Self::ensure_control_directory(&control_root)?;
+            let control_dir = control_root.join(digest_name);
+            Self::ensure_control_directory(&control_dir)?;
+
+            let descriptor = rustix::fs::open(
+                &control_dir,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .map(File::from)
+            .map_err(|error| GtpuError::io("ebpf_reconciler_ownership_open", error.into()))?;
+            let opened = descriptor
+                .metadata()
+                .map_err(|error| GtpuError::io("ebpf_reconciler_ownership_stat", error))?;
+            let named = fs::symlink_metadata(&control_dir)
+                .map_err(|error| GtpuError::io("ebpf_reconciler_ownership_stat", error))?;
+            if !named.file_type().is_dir()
+                || opened.dev() != named.dev()
+                || opened.ino() != named.ino()
+            {
+                return Err(state_indeterminate("ebpf_reconciler_ownership"));
+            }
+            match rustix::fs::flock(
+                &descriptor,
+                rustix::fs::FlockOperation::NonBlockingLockExclusive,
+            ) {
+                Ok(()) => {}
+                Err(rustix::io::Errno::AGAIN) => return Err(GtpuError::AlreadyExists),
+                Err(error) => {
+                    return Err(GtpuError::io(
+                        "ebpf_reconciler_ownership_lock",
+                        error.into(),
+                    ));
                 }
+            }
+            let locked = fs::symlink_metadata(&control_dir)
+                .map_err(|error| GtpuError::io("ebpf_reconciler_ownership_recheck", error))?;
+            if !locked.file_type().is_dir()
+                || opened.dev() != locked.dev()
+                || opened.ino() != locked.ino()
+            {
+                return Err(state_indeterminate("ebpf_reconciler_ownership"));
+            }
+            Ok(ReconcilerOwnership {
+                _lock: descriptor,
+                _control_dir: control_dir,
+                canonical_pin_dir,
+                namespace_hash,
             })
+        }
+
+        fn ensure_control_directory(path: &Path) -> Result<(), GtpuError> {
+            match fs::create_dir(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    return Err(GtpuError::io("ebpf_reconciler_control_create", error));
+                }
+            }
+            let metadata = fs::symlink_metadata(path)
+                .map_err(|error| GtpuError::io("ebpf_reconciler_control_stat", error))?;
+            if !metadata.file_type().is_dir() {
+                return Err(state_indeterminate("ebpf_reconciler_control_identity"));
+            }
+            let canonical = fs::canonicalize(path)
+                .map_err(|error| GtpuError::io("ebpf_reconciler_control_canonicalize", error))?;
+            if canonical != path {
+                return Err(state_indeterminate("ebpf_reconciler_control_identity"));
+            }
+            Ok(())
         }
 
         fn canonical_pin_dir(pin_dir: &Path) -> Result<std::path::PathBuf, GtpuError> {
@@ -3826,6 +4273,7 @@ mod aya_runtime {
                     .map_err(|_| LegacyV2IdentityError::Indeterminate)?
                     as u32;
                 if map_type != spec.map_type
+                    || info.name() != kernel_program_name(spec.name)
                     || info.key_size() != spec.key_size
                     || info.value_size() != spec.value_size
                     || info.max_entries() != spec.max_entries
@@ -3836,6 +4284,211 @@ mod aya_runtime {
                 ids[index] = info.id();
             }
             Ok(ids)
+        }
+
+        fn current_directory_entries(pin_dir: &Path) -> Result<HashSet<String>, GtpuError> {
+            fs::read_dir(pin_dir)
+                .map_err(|error| GtpuError::io("ebpf_current_pin_inventory", error))?
+                .map(|entry| {
+                    let entry = entry
+                        .map_err(|error| GtpuError::io("ebpf_current_pin_inventory", error))?;
+                    entry
+                        .file_name()
+                        .into_string()
+                        .map_err(|_| state_indeterminate("ebpf_current_pin_inventory"))
+                })
+                .collect()
+        }
+
+        fn current_named_map_ids(
+            pin_dir: &Path,
+        ) -> Result<[u32; CURRENT_MAP_NAMES.len()], CurrentIdentityError> {
+            let entries = Self::current_directory_entries(pin_dir)
+                .map_err(|_| CurrentIdentityError::Indeterminate)?;
+            if entries.len() != CURRENT_MAP_NAMES.len()
+                || CURRENT_MAP_NAMES
+                    .iter()
+                    .any(|name| !entries.contains(*name))
+            {
+                return Err(CurrentIdentityError::Mismatch);
+            }
+            let mut ids = [0_u32; CURRENT_MAP_NAMES.len()];
+            for (index, spec) in CURRENT_MAP_SPECS.iter().enumerate() {
+                let metadata = fs::symlink_metadata(pin_dir.join(spec.name))
+                    .map_err(|_| CurrentIdentityError::Indeterminate)?;
+                if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+                    return Err(CurrentIdentityError::Mismatch);
+                }
+                let info = MapInfo::from_pin(pin_dir.join(spec.name))
+                    .map_err(|_| CurrentIdentityError::Indeterminate)?;
+                let map_type = info
+                    .map_type()
+                    .map_err(|_| CurrentIdentityError::Indeterminate)?
+                    as u32;
+                if map_type != spec.map_type
+                    || info.name() != kernel_program_name(spec.name)
+                    || info.key_size() != spec.key_size
+                    || info.value_size() != spec.value_size
+                    || info.max_entries() != spec.max_entries
+                    || info.map_flags() != 0
+                {
+                    return Err(CurrentIdentityError::Mismatch);
+                }
+                ids[index] = info.id();
+            }
+            Ok(ids)
+        }
+
+        fn current_recorded_pin_count(
+            pin_dir: &Path,
+            record: CurrentRecoveryRecord,
+        ) -> Result<usize, GtpuError> {
+            let entries = Self::current_directory_entries(pin_dir)?;
+            if entries.iter().any(|entry| {
+                !CURRENT_MAP_NAMES.contains(&entry.as_str())
+                    && entry != LEGACY_V2_TEARDOWN_PROOF_MAP
+            }) {
+                return Err(state_indeterminate("ebpf_current_pin_identity"));
+            }
+            let mut present = 0;
+            for (index, spec) in CURRENT_MAP_SPECS.iter().enumerate() {
+                let path = pin_dir.join(spec.name);
+                let metadata = match fs::symlink_metadata(&path) {
+                    Ok(metadata) => metadata,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(_) => return Err(state_indeterminate("ebpf_current_pin_identity")),
+                };
+                if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+                    return Err(state_indeterminate("ebpf_current_pin_identity"));
+                }
+                let info = MapInfo::from_pin(&path)
+                    .map_err(|_| state_indeterminate("ebpf_current_pin_identity"))?;
+                let map_type = info
+                    .map_type()
+                    .map_err(|_| state_indeterminate("ebpf_current_pin_identity"))?
+                    as u32;
+                if info.id() != record.map_ids[index]
+                    || map_type != spec.map_type
+                    || info.name() != kernel_program_name(spec.name)
+                    || info.key_size() != spec.key_size
+                    || info.value_size() != spec.value_size
+                    || info.max_entries() != spec.max_entries
+                    || info.map_flags() != 0
+                {
+                    return Err(state_indeterminate("ebpf_current_pin_identity"));
+                }
+                present += 1;
+            }
+            Ok(present)
+        }
+
+        fn current_map(pin_dir: &Path, name: &str) -> Result<Map, CurrentIdentityError> {
+            let data = MapData::from_pin(pin_dir.join(name))
+                .map_err(|_| CurrentIdentityError::Indeterminate)?;
+            Map::from_map_data(data).map_err(|_| CurrentIdentityError::Indeterminate)
+        }
+
+        fn current_graph_forwarding_populated(
+            pin_dir: &Path,
+        ) -> Result<bool, CurrentIdentityError> {
+            let mut populated = false;
+            let far = BpfHashMap::<MapData, [u8; 4], [u8; UPLINK_FAR_VALUE_LEN]>::try_from(
+                Self::current_map(pin_dir, MAP_UPLINK_FAR)?,
+            )
+            .map_err(|_| CurrentIdentityError::Mismatch)?;
+            let mut marker_seen = false;
+            for entry in far.iter() {
+                let (key, value) = entry.map_err(|_| CurrentIdentityError::Indeterminate)?;
+                if key == UPLINK_DSCP_SCHEMA_MARKER_KEY {
+                    if marker_seen || value != UPLINK_PMTU_SCHEMA_MARKER_VALUE {
+                        return Err(CurrentIdentityError::Mismatch);
+                    }
+                    marker_seen = true;
+                } else {
+                    populated = true;
+                }
+            }
+            if !marker_seen {
+                return Err(CurrentIdentityError::Mismatch);
+            }
+
+            macro_rules! observe_hash {
+                ($name:expr, $key:ty, $value:ty) => {{
+                    let map = BpfHashMap::<MapData, $key, $value>::try_from(Self::current_map(
+                        pin_dir, $name,
+                    )?)
+                    .map_err(|_| CurrentIdentityError::Mismatch)?;
+                    if map
+                        .iter()
+                        .next()
+                        .transpose()
+                        .map_err(|_| CurrentIdentityError::Indeterminate)?
+                        .is_some()
+                    {
+                        populated = true;
+                    }
+                }};
+            }
+            observe_hash!(
+                MAP_UPLINK_MARK_FAR,
+                [u8; UPLINK_MARK_KEY_LEN],
+                [u8; UPLINK_FAR_VALUE_LEN]
+            );
+            observe_hash!(MAP_UPLINK_DSCP, [u8; 4], [u8; UPLINK_DSCP_VALUE_LEN]);
+            observe_hash!(
+                MAP_UPLINK_MARK_DSCP,
+                [u8; UPLINK_MARK_KEY_LEN],
+                [u8; UPLINK_DSCP_VALUE_LEN]
+            );
+            observe_hash!(
+                MAP_UPLINK_SOURCE_PORT,
+                [u8; 4],
+                [u8; UPLINK_SOURCE_PORT_VALUE_LEN]
+            );
+            observe_hash!(
+                MAP_UPLINK_MARK_SOURCE_PORT,
+                [u8; UPLINK_MARK_KEY_LEN],
+                [u8; UPLINK_SOURCE_PORT_VALUE_LEN]
+            );
+            observe_hash!(MAP_DOWNLINK_PDR, [u8; 4], [u8; DOWNLINK_PDR_VALUE_LEN]);
+            observe_hash!(
+                MAP_DOWNLINK_MARK_PDR,
+                [u8; 4],
+                [u8; MARKED_DOWNLINK_PDR_VALUE_LEN]
+            );
+            observe_hash!(
+                MAP_DOWNLINK_ENDPOINT_BINDING,
+                [u8; 4],
+                [u8; DOWNLINK_ENDPOINT_BINDING_VALUE_LEN]
+            );
+            observe_hash!(
+                MAP_MARKED_BEARER_OWNER,
+                [u8; UPLINK_MARK_KEY_LEN],
+                [u8; MARKED_BEARER_OWNER_VALUE_LEN]
+            );
+
+            let config =
+                Array::<MapData, [u8; 4]>::try_from(Self::current_map(pin_dir, MAP_CONFIG)?)
+                    .map_err(|_| CurrentIdentityError::Mismatch)?;
+            if config
+                .get(&0, 0)
+                .map_err(|_| CurrentIdentityError::Indeterminate)?
+                == [0; 4]
+            {
+                return Err(CurrentIdentityError::Mismatch);
+            }
+            let pmtu = Array::<MapData, [u8; UPLINK_PMTU_VALUE_LEN]>::try_from(Self::current_map(
+                pin_dir,
+                MAP_UPLINK_PMTU,
+            )?)
+            .map_err(|_| CurrentIdentityError::Mismatch)?;
+            let pmtu = pmtu
+                .get(&0, 0)
+                .map_err(|_| CurrentIdentityError::Indeterminate)?;
+            if !ebpf_pmtu_map_state_is_executable(GtpuUplinkMtuPolicy::decode_map_value(&pmtu)) {
+                return Err(CurrentIdentityError::Mismatch);
+            }
+            Ok(populated)
         }
 
         fn legacy_v2_recorded_pin_count(
@@ -5143,6 +5796,764 @@ mod aya_runtime {
             }
         }
 
+        fn current_recovery_proof_path(ownership: &ReconcilerOwnership) -> PathBuf {
+            ownership
+                .canonical_pin_dir
+                .join(LEGACY_V2_TEARDOWN_PROOF_MAP)
+        }
+
+        fn read_current_recovery_proof(
+            ownership: &ReconcilerOwnership,
+        ) -> Result<Option<CurrentRecoveryProof>, GtpuError> {
+            let path = Self::current_recovery_proof_path(ownership);
+            match fs::symlink_metadata(&path) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(_) => return Err(state_indeterminate("ebpf_current_recovery_proof")),
+                Ok(metadata)
+                    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() =>
+                {
+                    return Err(state_indeterminate("ebpf_current_recovery_proof"));
+                }
+                Ok(_) => {}
+            }
+            let data = MapData::from_pin(&path)
+                .map_err(|_| state_indeterminate("ebpf_current_recovery_proof"))?;
+            let info = data
+                .info()
+                .map_err(|_| state_indeterminate("ebpf_current_recovery_proof"))?;
+            let map_type = info
+                .map_type()
+                .map_err(|_| state_indeterminate("ebpf_current_recovery_proof"))?
+                as u32;
+            if map_type != bpf_map_type::BPF_MAP_TYPE_ARRAY as u32
+                || info.key_size() != 4
+                || info.value_size() != CURRENT_RECOVERY_PROOF_LEN as u32
+                || info.max_entries() != 1
+                || info.map_flags() != 0
+            {
+                return Err(state_indeterminate("ebpf_current_recovery_proof"));
+            }
+            let map_id = info.id();
+            let proof = Array::<_, [u8; CURRENT_RECOVERY_PROOF_LEN]>::try_from(
+                Map::from_map_data(data)
+                    .map_err(|_| state_indeterminate("ebpf_current_recovery_proof"))?,
+            )
+            .map_err(|_| state_indeterminate("ebpf_current_recovery_proof"))?;
+            let encoded = proof
+                .get(&0, 0)
+                .map_err(|_| state_indeterminate("ebpf_current_recovery_proof"))?;
+            let record = CurrentRecoveryRecord::decode(&encoded)
+                .ok_or_else(|| state_indeterminate("ebpf_current_recovery_proof"))?;
+            if record.namespace_hash != ownership.namespace_hash || record.proof_map_id != map_id {
+                return Err(state_indeterminate("ebpf_current_recovery_proof"));
+            }
+            Ok(Some(CurrentRecoveryProof { record, map_id }))
+        }
+
+        fn current_proof_fence_state(
+            ownership: &ReconcilerOwnership,
+            expected: CurrentRecoveryProof,
+        ) -> CurrentProofFenceState {
+            match Self::read_current_recovery_proof(ownership) {
+                Ok(Some(proof)) if proof == expected => CurrentProofFenceState::Exact,
+                Ok(Some(_)) => CurrentProofFenceState::FencedUnknown,
+                Ok(None) => CurrentProofFenceState::Absent,
+                Err(_) => {
+                    match fs::symlink_metadata(Self::current_recovery_proof_path(ownership)) {
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                            CurrentProofFenceState::Absent
+                        }
+                        Ok(_) | Err(_) => CurrentProofFenceState::FencedUnknown,
+                    }
+                }
+            }
+        }
+
+        fn commit_current_recovery_proof(
+            ownership: &ReconcilerOwnership,
+            record: CurrentRecoveryRecord,
+        ) -> Result<CurrentRecoveryProof, CurrentProofCommitError> {
+            let before_publication = || match Self::read_current_recovery_proof(ownership) {
+                Ok(None) => CurrentProofCommitError::BeforePublication,
+                Ok(Some(_)) | Err(_) => CurrentProofCommitError::PublicationIndeterminate,
+            };
+            match Self::read_current_recovery_proof(ownership) {
+                Err(_) => return Err(CurrentProofCommitError::PublicationIndeterminate),
+                Ok(Some(existing)) if existing.record.matches_unbound(record) => {
+                    return Ok(existing);
+                }
+                Ok(Some(_)) => return Err(CurrentProofCommitError::PublicationIndeterminate),
+                Ok(None) => {}
+            }
+            let mut proof = Array::<MapData, [u8; CURRENT_RECOVERY_PROOF_LEN]>::create(1, 0)
+                .map_err(|_| before_publication())?;
+            let info = proof.map().info().map_err(|_| before_publication())?;
+            let map_type = info.map_type().map_err(|_| before_publication())? as u32;
+            if map_type != bpf_map_type::BPF_MAP_TYPE_ARRAY as u32
+                || info.key_size() != 4
+                || info.value_size() != CURRENT_RECOVERY_PROOF_LEN as u32
+                || info.max_entries() != 1
+                || info.map_flags() != 0
+            {
+                return Err(before_publication());
+            }
+            let record = record
+                .bind_to_proof_map(info.id())
+                .ok_or_else(before_publication)?;
+            proof
+                .set(0, record.encode(), 0)
+                .map_err(|_| before_publication())?;
+            let path = Self::current_recovery_proof_path(ownership);
+            if proof.pin(&path).is_err() {
+                return match Self::read_current_recovery_proof(ownership) {
+                    Ok(Some(existing)) if existing.record == record => Ok(existing),
+                    Ok(None) => Err(CurrentProofCommitError::BeforePublication),
+                    Ok(Some(_)) | Err(_) => Err(CurrentProofCommitError::PublicationIndeterminate),
+                };
+            }
+            match Self::read_current_recovery_proof(ownership) {
+                Ok(Some(existing)) if existing.record == record => Ok(existing),
+                Ok(_) | Err(_) => Err(CurrentProofCommitError::PublicationIndeterminate),
+            }
+        }
+
+        fn ensure_no_current_recovery_proof(
+            ownership: &ReconcilerOwnership,
+        ) -> Result<(), GtpuError> {
+            match Self::read_current_recovery_proof(ownership) {
+                Ok(None) => Ok(()),
+                Ok(Some(_)) | Err(_) => Err(state_indeterminate("ebpf_current_recovery_pending")),
+            }
+        }
+
+        fn hold_current_recovery_proof(
+            ownership: &ReconcilerOwnership,
+            expected: CurrentRecoveryProof,
+        ) -> Result<MapData, GtpuError> {
+            if Self::read_current_recovery_proof(ownership)? != Some(expected) {
+                return Err(state_indeterminate("ebpf_current_recovery_proof"));
+            }
+            let data = MapData::from_pin(Self::current_recovery_proof_path(ownership))
+                .map_err(|_| state_indeterminate("ebpf_current_recovery_proof"))?;
+            let info = data
+                .info()
+                .map_err(|_| state_indeterminate("ebpf_current_recovery_proof"))?;
+            if info.id() != expected.map_id {
+                return Err(state_indeterminate("ebpf_current_recovery_proof"));
+            }
+            Ok(data)
+        }
+
+        fn hold_current_map_pins(
+            ownership: &ReconcilerOwnership,
+            proof: CurrentRecoveryProof,
+        ) -> Result<Vec<HeldCurrentPin>, GtpuError> {
+            let mut held = Vec::with_capacity(CURRENT_MAP_NAMES.len());
+            for (index, spec) in CURRENT_MAP_SPECS.iter().enumerate() {
+                let path = ownership.canonical_pin_dir.join(spec.name);
+                match fs::symlink_metadata(&path) {
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(_) => return Err(state_indeterminate("ebpf_current_pin_identity")),
+                    Ok(metadata)
+                        if metadata.file_type().is_symlink() || !metadata.file_type().is_file() =>
+                    {
+                        return Err(state_indeterminate("ebpf_current_pin_identity"));
+                    }
+                    Ok(_) => {}
+                }
+                let data = MapData::from_pin(&path)
+                    .map_err(|_| state_indeterminate("ebpf_current_pin_identity"))?;
+                let info = data
+                    .info()
+                    .map_err(|_| state_indeterminate("ebpf_current_pin_identity"))?;
+                let map_type = info
+                    .map_type()
+                    .map_err(|_| state_indeterminate("ebpf_current_pin_identity"))?
+                    as u32;
+                if info.id() != proof.record.map_ids[index]
+                    || map_type != spec.map_type
+                    || info.name() != kernel_program_name(spec.name)
+                    || info.key_size() != spec.key_size
+                    || info.value_size() != spec.value_size
+                    || info.max_entries() != spec.max_entries
+                    || info.map_flags() != 0
+                {
+                    return Err(state_indeterminate("ebpf_current_pin_identity"));
+                }
+                held.push(HeldCurrentPin { index, data });
+            }
+            if Self::read_current_recovery_proof(ownership)? != Some(proof)
+                || Self::current_recorded_pin_count(&ownership.canonical_pin_dir, proof.record)?
+                    != held.len()
+            {
+                return Err(state_indeterminate("ebpf_current_pin_identity"));
+            }
+            Ok(held)
+        }
+
+        fn restore_current_map_pins(
+            ownership: &ReconcilerOwnership,
+            proof: CurrentRecoveryProof,
+            held: &[HeldCurrentPin],
+            removed: &[usize],
+        ) -> bool {
+            if Self::current_proof_fence_state(ownership, proof) != CurrentProofFenceState::Exact
+                || !matches!(
+                    Self::current_graph_directory_matches(ownership, proof.record),
+                    Ok(true)
+                )
+            {
+                return false;
+            }
+            for removed_index in removed {
+                let Some(pin) = held.get(*removed_index) else {
+                    return false;
+                };
+                let path = ownership
+                    .canonical_pin_dir
+                    .join(CURRENT_MAP_NAMES[pin.index]);
+                match MapInfo::from_pin(&path) {
+                    Ok(info) if info.id() == proof.record.map_ids[pin.index] => {}
+                    Err(_) => {
+                        if pin.data.pin(&path).is_err() {
+                            return false;
+                        }
+                    }
+                    Ok(_) => return false,
+                }
+                match MapInfo::from_pin(&path) {
+                    Ok(info) if info.id() == proof.record.map_ids[pin.index] => {}
+                    Ok(_) | Err(_) => return false,
+                }
+            }
+            Self::current_proof_fence_state(ownership, proof) == CurrentProofFenceState::Exact
+                && matches!(
+                    Self::current_recorded_pin_count(&ownership.canonical_pin_dir, proof.record),
+                    Ok(count) if count == held.len()
+                )
+        }
+
+        fn remove_current_recorded_map_pins(
+            ownership: &ReconcilerOwnership,
+            proof: CurrentRecoveryProof,
+        ) -> bool {
+            if !matches!(
+                Self::current_program_references(&proof.record.map_ids, None),
+                Ok(CurrentProgramReference::Absent)
+            ) {
+                return false;
+            }
+            match fs::symlink_metadata(&ownership.canonical_pin_dir) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return true,
+                Ok(metadata)
+                    if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {}
+                Ok(_) | Err(_) => return false,
+            }
+            for (index, name) in CURRENT_MAP_NAMES.iter().enumerate() {
+                let path = ownership.canonical_pin_dir.join(name);
+                match fs::symlink_metadata(&path) {
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(_) => return false,
+                    Ok(metadata)
+                        if metadata.file_type().is_symlink() || !metadata.file_type().is_file() =>
+                    {
+                        return false;
+                    }
+                    Ok(_) => {}
+                }
+                if !matches!(
+                    MapInfo::from_pin(&path),
+                    Ok(info) if info.id() == proof.record.map_ids[index]
+                ) {
+                    return false;
+                }
+                if let Err(error) = fs::remove_file(&path) {
+                    if error.kind() != io::ErrorKind::NotFound
+                        && !matches!(
+                            fs::symlink_metadata(&path),
+                            Err(ref metadata_error)
+                                if metadata_error.kind() == io::ErrorKind::NotFound
+                        )
+                    {
+                        return false;
+                    }
+                }
+            }
+            matches!(
+                Self::current_recorded_pin_count(&ownership.canonical_pin_dir, proof.record),
+                Ok(0)
+            )
+        }
+
+        fn current_cleanup_failure_outcome(
+            ownership: &ReconcilerOwnership,
+            proof: CurrentRecoveryProof,
+            proof_data: &MapData,
+            held: &[HeldCurrentPin],
+            removed: &[usize],
+            rollback_progress: CurrentEbpfGraphRecoveryProgress,
+        ) -> CurrentEbpfGraphRecoveryOutcome {
+            let fence = Self::ensure_current_recovery_fence(ownership, proof, proof_data);
+            match fence {
+                CurrentProofFenceState::Exact => {
+                    if Self::restore_current_map_pins(ownership, proof, held, removed) {
+                        CurrentEbpfGraphRecoveryOutcome::Partial(rollback_progress)
+                    } else {
+                        CurrentEbpfGraphRecoveryOutcome::Partial(
+                            CurrentEbpfGraphRecoveryProgress::Indeterminate,
+                        )
+                    }
+                }
+                CurrentProofFenceState::FencedUnknown => CurrentEbpfGraphRecoveryOutcome::Partial(
+                    CurrentEbpfGraphRecoveryProgress::Indeterminate,
+                ),
+                CurrentProofFenceState::Absent => {
+                    // Never republish an adoptable graph without the exact
+                    // durable proof. If proof restoration is impossible, make
+                    // the recorded graph terminally absent instead.
+                    if Self::remove_current_recorded_map_pins(ownership, proof)
+                        && Self::current_proof_fence_state(ownership, proof)
+                            == CurrentProofFenceState::Absent
+                    {
+                        CurrentEbpfGraphRecoveryOutcome::Removed
+                    } else {
+                        CurrentEbpfGraphRecoveryOutcome::Partial(
+                            CurrentEbpfGraphRecoveryProgress::Indeterminate,
+                        )
+                    }
+                }
+            }
+        }
+
+        fn current_unmodified_failure_outcome(
+            ownership: &ReconcilerOwnership,
+            proof: CurrentRecoveryProof,
+            proof_data: &MapData,
+            progress: CurrentEbpfGraphRecoveryProgress,
+        ) -> CurrentEbpfGraphRecoveryOutcome {
+            match Self::ensure_current_recovery_fence(ownership, proof, proof_data) {
+                CurrentProofFenceState::Exact => CurrentEbpfGraphRecoveryOutcome::Partial(progress),
+                CurrentProofFenceState::FencedUnknown => CurrentEbpfGraphRecoveryOutcome::Partial(
+                    CurrentEbpfGraphRecoveryProgress::Indeterminate,
+                ),
+                CurrentProofFenceState::Absent => {
+                    if Self::remove_current_recorded_map_pins(ownership, proof)
+                        && Self::current_proof_fence_state(ownership, proof)
+                            == CurrentProofFenceState::Absent
+                    {
+                        CurrentEbpfGraphRecoveryOutcome::Removed
+                    } else {
+                        CurrentEbpfGraphRecoveryOutcome::Partial(
+                            CurrentEbpfGraphRecoveryProgress::Indeterminate,
+                        )
+                    }
+                }
+            }
+        }
+
+        fn ensure_current_recovery_fence(
+            ownership: &ReconcilerOwnership,
+            proof: CurrentRecoveryProof,
+            proof_data: &MapData,
+        ) -> CurrentProofFenceState {
+            let fence = Self::current_proof_fence_state(ownership, proof);
+            if fence == CurrentProofFenceState::Absent
+                && Self::restore_current_recovery_proof(ownership, proof, proof_data)
+            {
+                CurrentProofFenceState::Exact
+            } else {
+                fence
+            }
+        }
+
+        fn restore_current_recovery_proof(
+            ownership: &ReconcilerOwnership,
+            expected: CurrentRecoveryProof,
+            data: &MapData,
+        ) -> bool {
+            if !matches!(
+                Self::current_graph_directory_matches(ownership, expected.record),
+                Ok(true)
+            ) {
+                return false;
+            }
+            let path = Self::current_recovery_proof_path(ownership);
+            match MapInfo::from_pin(&path) {
+                Ok(info) if info.id() == expected.map_id => {}
+                Err(_) => {
+                    if data.pin(&path).is_err() {
+                        return false;
+                    }
+                }
+                Ok(_) => return false,
+            }
+            matches!(Self::read_current_recovery_proof(ownership), Ok(Some(proof)) if proof == expected)
+        }
+
+        fn current_program_references(
+            map_ids: &[u32; CURRENT_MAP_NAMES.len()],
+            artifact: Option<&DatapathIdentity>,
+        ) -> Result<CurrentProgramReference, GtpuError> {
+            let graph_ids = map_ids.iter().copied().collect::<HashSet<_>>();
+            let mut exact_seen = false;
+            let mut foreign_seen = false;
+            for result in loaded_programs() {
+                let info =
+                    result.map_err(|error| program_error("ebpf_current_program_scan", &error))?;
+                let mut referenced = info
+                    .map_ids()
+                    .map_err(|error| program_error("ebpf_current_program_scan", &error))?
+                    .ok_or_else(|| state_indeterminate("ebpf_current_program_scan"))?;
+                if !referenced.iter().any(|id| graph_ids.contains(id)) {
+                    continue;
+                }
+                referenced.sort_unstable();
+                let exact = artifact.is_some_and(|artifact| {
+                    let matches_expected = |name: &str, expected: &ProgramIdentity| {
+                        let mut expected_ids = expected.map_ids.clone();
+                        expected_ids.sort_unstable();
+                        info.name() == kernel_program_name(name)
+                            && info.tag() == expected.program_tag
+                            && info.program_type() == bpf_prog_type::BPF_PROG_TYPE_SCHED_CLS
+                            && referenced == expected_ids
+                    };
+                    matches_expected(PROG_UPLINK, &artifact.uplink)
+                        || matches_expected(PROG_DOWNLINK, &artifact.downlink)
+                });
+                if exact {
+                    exact_seen = true;
+                } else {
+                    foreign_seen = true;
+                }
+            }
+            Ok(if foreign_seen {
+                CurrentProgramReference::Foreign
+            } else if exact_seen {
+                CurrentProgramReference::ExactSdkProgram
+            } else {
+                CurrentProgramReference::Absent
+            })
+        }
+
+        fn validate_replacement_identity(
+            name: &str,
+            expected_ifindex: u32,
+        ) -> Result<(), ReplacementHookObservationError> {
+            match sys::ifindex_by_name(name) {
+                Ok(ifindex) if ifindex == expected_ifindex => Ok(()),
+                Ok(_) => Err(ReplacementHookObservationError::IdentityChanged),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    Err(ReplacementHookObservationError::IdentityChanged)
+                }
+                Err(_) => Err(ReplacementHookObservationError::Indeterminate),
+            }
+        }
+
+        fn replacement_hook_slots_empty(
+            replacement: (&str, u32),
+            tc_priority: u16,
+        ) -> Result<bool, ReplacementHookObservationError> {
+            let (name, ifindex) = replacement;
+            Self::validate_replacement_identity(name, ifindex)?;
+            let uplink = slot_owner(ifindex, TcAttachType::Egress, tc_priority)
+                .map_err(|_| ReplacementHookObservationError::Indeterminate)?;
+            Self::validate_replacement_identity(name, ifindex)?;
+            let downlink = slot_owner(ifindex, TcAttachType::Ingress, tc_priority)
+                .map_err(|_| ReplacementHookObservationError::Indeterminate)?;
+            Self::validate_replacement_identity(name, ifindex)?;
+            Ok(uplink.is_none() && downlink.is_none())
+        }
+
+        fn current_graph_directory_matches(
+            ownership: &ReconcilerOwnership,
+            record: CurrentRecoveryRecord,
+        ) -> Result<bool, GtpuError> {
+            let metadata = fs::symlink_metadata(&ownership.canonical_pin_dir)
+                .map_err(|_| state_indeterminate("ebpf_current_graph_identity"))?;
+            Ok(metadata.file_type().is_dir()
+                && !metadata.file_type().is_symlink()
+                && metadata.dev() == record.graph_device
+                && metadata.ino() == record.graph_inode)
+        }
+
+        fn continue_current_recovery(
+            ownership: &ReconcilerOwnership,
+            proof: CurrentRecoveryProof,
+            replacement: Option<(&str, u32)>,
+            tc_priority: u16,
+            allow_populated: bool,
+            managed_state: CurrentRecoveryManagedState,
+        ) -> Result<CurrentEbpfGraphRecoveryOutcome, GtpuError> {
+            let partial = |progress| Ok(CurrentEbpfGraphRecoveryOutcome::Partial(progress));
+            let proof_data = match Self::hold_current_recovery_proof(ownership, proof) {
+                Ok(data) => data,
+                Err(_) => {
+                    return match Self::current_proof_fence_state(ownership, proof) {
+                        CurrentProofFenceState::Exact | CurrentProofFenceState::FencedUnknown => {
+                            partial(CurrentEbpfGraphRecoveryProgress::Indeterminate)
+                        }
+                        CurrentProofFenceState::Absent
+                            if Self::remove_current_recorded_map_pins(ownership, proof)
+                                && Self::current_proof_fence_state(ownership, proof)
+                                    == CurrentProofFenceState::Absent =>
+                        {
+                            Ok(CurrentEbpfGraphRecoveryOutcome::Removed)
+                        }
+                        CurrentProofFenceState::Absent => {
+                            partial(CurrentEbpfGraphRecoveryProgress::Indeterminate)
+                        }
+                    };
+                }
+            };
+            if !matches!(
+                Self::current_graph_directory_matches(ownership, proof.record),
+                Ok(true)
+            ) {
+                return Ok(Self::current_unmodified_failure_outcome(
+                    ownership,
+                    proof,
+                    &proof_data,
+                    CurrentEbpfGraphRecoveryProgress::Indeterminate,
+                ));
+            }
+            let present = match Self::current_recorded_pin_count(
+                &ownership.canonical_pin_dir,
+                proof.record,
+            ) {
+                Ok(count) => count,
+                Err(_) => {
+                    return Ok(Self::current_unmodified_failure_outcome(
+                        ownership,
+                        proof,
+                        &proof_data,
+                        CurrentEbpfGraphRecoveryProgress::Indeterminate,
+                    ));
+                }
+            };
+            let rollback_progress = if present < CURRENT_MAP_NAMES.len() {
+                CurrentEbpfGraphRecoveryProgress::PinCleanupStarted
+            } else {
+                CurrentEbpfGraphRecoveryProgress::ProofCommitted
+            };
+            if managed_state != CurrentRecoveryManagedState::Clear {
+                return Ok(Self::current_unmodified_failure_outcome(
+                    ownership,
+                    proof,
+                    &proof_data,
+                    CurrentEbpfGraphRecoveryProgress::Indeterminate,
+                ));
+            }
+            if proof.record.allow_populated && !allow_populated {
+                return Ok(Self::current_unmodified_failure_outcome(
+                    ownership,
+                    proof,
+                    &proof_data,
+                    rollback_progress,
+                ));
+            }
+            if present == CURRENT_MAP_NAMES.len() && !proof.record.allow_populated {
+                match Self::current_graph_forwarding_populated(&ownership.canonical_pin_dir) {
+                    Ok(false) => {}
+                    Ok(true) | Err(_) => {
+                        return Ok(Self::current_unmodified_failure_outcome(
+                            ownership,
+                            proof,
+                            &proof_data,
+                            CurrentEbpfGraphRecoveryProgress::Indeterminate,
+                        ));
+                    }
+                }
+            }
+            if !matches!(
+                Self::current_program_references(&proof.record.map_ids, None),
+                Ok(CurrentProgramReference::Absent)
+            ) {
+                return Ok(Self::current_unmodified_failure_outcome(
+                    ownership,
+                    proof,
+                    &proof_data,
+                    CurrentEbpfGraphRecoveryProgress::Indeterminate,
+                ));
+            }
+            if let Some(replacement) = replacement {
+                if !matches!(
+                    Self::replacement_hook_slots_empty(replacement, tc_priority),
+                    Ok(true)
+                ) {
+                    return Ok(Self::current_unmodified_failure_outcome(
+                        ownership,
+                        proof,
+                        &proof_data,
+                        CurrentEbpfGraphRecoveryProgress::Indeterminate,
+                    ));
+                }
+            }
+
+            // Hold every surviving map and the proof open for the complete
+            // cleanup attempt. An ordinary unlink failure can therefore
+            // restore the exact same kernel objects rather than publishing a
+            // partly deleted graph. A process crash remains resumable because
+            // the proof pin is removed last.
+            let held = match Self::hold_current_map_pins(ownership, proof) {
+                Ok(held) if held.len() == present => held,
+                Ok(_) | Err(_) => {
+                    return Ok(Self::current_unmodified_failure_outcome(
+                        ownership,
+                        proof,
+                        &proof_data,
+                        CurrentEbpfGraphRecoveryProgress::Indeterminate,
+                    ));
+                }
+            };
+            let mut removed = Vec::with_capacity(held.len());
+
+            for (held_index, pin) in held.iter().enumerate() {
+                let replacement_hooks_empty = match replacement {
+                    Some(replacement) => matches!(
+                        Self::replacement_hook_slots_empty(replacement, tc_priority),
+                        Ok(true)
+                    ),
+                    None => true,
+                };
+                let expected_present = held.len().saturating_sub(removed.len());
+                let invariant_holds = matches!(
+                    Self::read_current_recovery_proof(ownership),
+                    Ok(Some(current)) if current == proof
+                ) && matches!(
+                    Self::current_graph_directory_matches(ownership, proof.record),
+                    Ok(true)
+                ) && matches!(
+                    Self::current_program_references(&proof.record.map_ids, None),
+                    Ok(CurrentProgramReference::Absent)
+                ) && matches!(
+                    Self::current_recorded_pin_count(
+                        &ownership.canonical_pin_dir,
+                        proof.record,
+                    ),
+                    Ok(count) if count == expected_present
+                ) && replacement_hooks_empty;
+                if !invariant_holds {
+                    return Ok(Self::current_cleanup_failure_outcome(
+                        ownership,
+                        proof,
+                        &proof_data,
+                        &held,
+                        &removed,
+                        rollback_progress,
+                    ));
+                }
+                let path = ownership
+                    .canonical_pin_dir
+                    .join(CURRENT_MAP_NAMES[pin.index]);
+                let pin_identity_matches = matches!(
+                    MapInfo::from_pin(&path),
+                    Ok(info) if info.id() == proof.record.map_ids[pin.index]
+                );
+                if !pin_identity_matches {
+                    return Ok(Self::current_cleanup_failure_outcome(
+                        ownership,
+                        proof,
+                        &proof_data,
+                        &held,
+                        &removed,
+                        rollback_progress,
+                    ));
+                }
+                match fs::remove_file(&path) {
+                    Ok(()) => removed.push(held_index),
+                    Err(error) => {
+                        let disappeared = matches!(
+                            fs::symlink_metadata(&path),
+                            Err(ref metadata_error)
+                                if metadata_error.kind() == io::ErrorKind::NotFound
+                        );
+                        if disappeared {
+                            removed.push(held_index);
+                            continue;
+                        }
+                        let _ = error;
+                        return Ok(Self::current_cleanup_failure_outcome(
+                            ownership,
+                            proof,
+                            &proof_data,
+                            &held,
+                            &removed,
+                            rollback_progress,
+                        ));
+                    }
+                }
+            }
+
+            let replacement_hooks_empty = match replacement {
+                Some(replacement) => matches!(
+                    Self::replacement_hook_slots_empty(replacement, tc_priority),
+                    Ok(true)
+                ),
+                None => true,
+            };
+            let cleanup_ready = matches!(
+                Self::current_recorded_pin_count(&ownership.canonical_pin_dir, proof.record),
+                Ok(0)
+            ) && matches!(
+                Self::current_program_references(&proof.record.map_ids, None),
+                Ok(CurrentProgramReference::Absent)
+            ) && replacement_hooks_empty
+                && matches!(
+                    Self::current_directory_entries(&ownership.canonical_pin_dir),
+                    Ok(entries)
+                        if entries.len() == 1
+                            && entries.contains(LEGACY_V2_TEARDOWN_PROOF_MAP)
+                )
+                && matches!(
+                    Self::read_current_recovery_proof(ownership),
+                    Ok(Some(current)) if current == proof
+                );
+            if !cleanup_ready {
+                return Ok(Self::current_cleanup_failure_outcome(
+                    ownership,
+                    proof,
+                    &proof_data,
+                    &held,
+                    &removed,
+                    rollback_progress,
+                ));
+            }
+
+            let proof_path = Self::current_recovery_proof_path(ownership);
+            if let Err(error) = fs::remove_file(&proof_path) {
+                let disappeared = matches!(
+                    fs::symlink_metadata(&proof_path),
+                    Err(ref metadata_error)
+                        if metadata_error.kind() == io::ErrorKind::NotFound
+                );
+                if !disappeared {
+                    let _ = error;
+                    return Ok(Self::current_cleanup_failure_outcome(
+                        ownership,
+                        proof,
+                        &proof_data,
+                        &held,
+                        &removed,
+                        rollback_progress,
+                    ));
+                }
+            }
+            match fs::remove_dir(&ownership.canonical_pin_dir) {
+                Ok(()) => Ok(CurrentEbpfGraphRecoveryOutcome::Removed),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    Ok(CurrentEbpfGraphRecoveryOutcome::Removed)
+                }
+                Err(_) => Ok(Self::current_cleanup_failure_outcome(
+                    ownership,
+                    proof,
+                    &proof_data,
+                    &held,
+                    &removed,
+                    rollback_progress,
+                )),
+            }
+        }
+
         fn pinned_map_identity(pin_dir: &Path) -> Result<PinnedMapIdentity, GtpuError> {
             let id = |name: &str| {
                 MapInfo::from_pin(pin_dir.join(name))
@@ -5166,6 +6577,26 @@ mod aya_runtime {
                 downlink_binding_counters: id(MAP_DOWNLINK_BINDING_COUNTERS)?,
                 config: id(MAP_CONFIG)?,
             })
+        }
+
+        fn pinned_map_ids(identity: &PinnedMapIdentity) -> [u32; CURRENT_MAP_NAMES.len()] {
+            [
+                identity.uplink_far,
+                identity.uplink_mark_far,
+                identity.uplink_dscp,
+                identity.uplink_mark_dscp,
+                identity.uplink_source_port,
+                identity.uplink_mark_source_port,
+                identity.uplink_pmtu,
+                identity.uplink_pmtu_counters,
+                identity.downlink_pdr,
+                identity.downlink_mark_pdr,
+                identity.downlink_binding,
+                identity.marked_owner,
+                identity.counters,
+                identity.downlink_binding_counters,
+                identity.config,
+            ]
         }
 
         fn held_map_identity(ebpf: &Ebpf) -> Result<PinnedMapIdentity, GtpuError> {
@@ -6396,10 +7827,14 @@ mod aya_runtime {
             tc_priority: u16,
             local_ip: [u8; 4],
         ) -> Result<EbpfAttachmentDisposition, GtpuError> {
-            let pins_preexisted = pin_dir.is_dir();
-            let canonical_pin_dir = Self::canonical_pin_dir(pin_dir)?;
-            let reconciler_ownership =
-                Self::acquire_reconciler_ownership(&canonical_pin_dir, ifindex)?;
+            let reconciler_ownership = Self::acquire_reconciler_ownership(pin_dir)?;
+            Self::ensure_no_current_recovery_proof(&reconciler_ownership)?;
+            let pins_preexisted = reconciler_ownership.canonical_pin_dir.is_dir();
+            let canonical_pin_dir =
+                Self::canonical_pin_dir(&reconciler_ownership.canonical_pin_dir)?;
+            if canonical_pin_dir != reconciler_ownership.canonical_pin_dir {
+                return Err(state_indeterminate("ebpf_pin_dir_identity"));
+            }
             let schema_state = Self::bearer_schema_preflight(&canonical_pin_dir)?;
             let mut ebpf = match self.load_pinned(&canonical_pin_dir) {
                 Ok(ebpf) => ebpf,
@@ -6555,13 +7990,16 @@ mod aya_runtime {
             pin_dir: &Path,
             tc_priority: u16,
         ) -> Result<[u8; 4], GtpuError> {
-            if !pin_dir.is_dir() {
+            let reconciler_ownership = Self::acquire_reconciler_ownership(pin_dir)?;
+            Self::ensure_no_current_recovery_proof(&reconciler_ownership)?;
+            if !reconciler_ownership.canonical_pin_dir.is_dir() {
                 return Err(GtpuError::NotFound);
             }
-            let canonical_pin_dir = fs::canonicalize(pin_dir)
+            let canonical_pin_dir = fs::canonicalize(&reconciler_ownership.canonical_pin_dir)
                 .map_err(|error| GtpuError::io("ebpf_pin_dir_canonicalize", error))?;
-            let reconciler_ownership =
-                Self::acquire_reconciler_ownership(&canonical_pin_dir, ifindex)?;
+            if canonical_pin_dir != reconciler_ownership.canonical_pin_dir {
+                return Err(state_indeterminate("ebpf_pin_dir_identity"));
+            }
             let schema_state = Self::bearer_schema_preflight(&canonical_pin_dir)?;
             let mut ebpf = self.load_pinned(&canonical_pin_dir)?;
             let expected_pins = Self::held_map_identity(&ebpf)
@@ -6672,22 +8110,8 @@ mod aya_runtime {
             pin_dir: &Path,
             tc_priority: u16,
         ) -> Result<DrainedV2TeardownOutcome, GtpuError> {
-            let parent = pin_dir.parent().ok_or_else(|| {
-                GtpuError::invalid_config("ebpf.bpffs_pin_root", "pin directory must have a parent")
-            })?;
-            fs::create_dir_all(parent)
-                .map_err(|error| GtpuError::io("ebpf_pin_root_create", error))?;
-            let canonical_parent = fs::canonicalize(parent)
-                .map_err(|error| GtpuError::io("ebpf_pin_root_canonicalize", error))?;
-            let name = pin_dir.file_name().ok_or_else(|| {
-                GtpuError::invalid_config(
-                    "device.name",
-                    "interface pin directory must have a final component",
-                )
-            })?;
-            let canonical_pin_dir = canonical_parent.join(name);
-            let _reconciler_ownership =
-                Self::acquire_reconciler_ownership(&canonical_pin_dir, ifindex)?;
+            let reconciler_ownership = Self::acquire_reconciler_ownership(pin_dir)?;
+            let canonical_pin_dir = reconciler_ownership.canonical_pin_dir.clone();
 
             match fs::symlink_metadata(&canonical_pin_dir) {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -7178,6 +8602,302 @@ mod aya_runtime {
                 // directory as an unproven fresh state.
                 Err(_) => Ok(DrainedV2TeardownOutcome::Removed),
             }
+        }
+
+        fn recover_orphaned_current_graph(
+            &self,
+            replacement: Option<(&str, u32)>,
+            pin_dir: &Path,
+            tc_priority: u16,
+            allow_populated: bool,
+            managed_state: CurrentRecoveryManagedState,
+        ) -> Result<CurrentEbpfGraphRecoveryOutcome, GtpuError> {
+            let ownership = match Self::acquire_reconciler_ownership(pin_dir) {
+                Ok(ownership) => ownership,
+                Err(GtpuError::AlreadyExists) => {
+                    return Ok(CurrentEbpfGraphRecoveryOutcome::Refused(
+                        CurrentEbpfGraphRecoveryRefusal::ActiveOwner,
+                    ));
+                }
+                Err(error) => return Err(error),
+            };
+            let refused = |reason| Ok(CurrentEbpfGraphRecoveryOutcome::Refused(reason));
+            let existing_proof = match Self::read_current_recovery_proof(&ownership) {
+                Ok(proof) => proof,
+                Err(_) => {
+                    if matches!(
+                        Self::read_legacy_v2_teardown_proof(&ownership.canonical_pin_dir),
+                        Ok(Some(_))
+                    ) {
+                        return refused(CurrentEbpfGraphRecoveryRefusal::NotCurrentSchema);
+                    }
+                    match fs::symlink_metadata(Self::current_recovery_proof_path(&ownership)) {
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                        Ok(_) | Err(_) => {
+                            return Ok(CurrentEbpfGraphRecoveryOutcome::Partial(
+                                CurrentEbpfGraphRecoveryProgress::Indeterminate,
+                            ));
+                        }
+                    }
+                }
+            };
+            if let Some(proof) = existing_proof {
+                return Self::continue_current_recovery(
+                    &ownership,
+                    proof,
+                    replacement,
+                    tc_priority,
+                    allow_populated,
+                    managed_state,
+                );
+            }
+            match managed_state {
+                CurrentRecoveryManagedState::Clear => {}
+                CurrentRecoveryManagedState::Conflict => {
+                    return refused(CurrentEbpfGraphRecoveryRefusal::ManagedAttachment);
+                }
+                CurrentRecoveryManagedState::Indeterminate => {
+                    return refused(CurrentEbpfGraphRecoveryRefusal::IndeterminateState);
+                }
+            }
+
+            let metadata = match fs::symlink_metadata(&ownership.canonical_pin_dir) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    if let Some(replacement) = replacement {
+                        return match Self::replacement_hook_slots_empty(replacement, tc_priority) {
+                            Ok(true) => Ok(CurrentEbpfGraphRecoveryOutcome::AlreadyAbsent),
+                            Ok(false) => refused(CurrentEbpfGraphRecoveryRefusal::IdentityMismatch),
+                            Err(ReplacementHookObservationError::IdentityChanged) => refused(
+                                CurrentEbpfGraphRecoveryRefusal::ReplacementInterfaceIdentityChanged,
+                            ),
+                            Err(ReplacementHookObservationError::Indeterminate) => {
+                                refused(CurrentEbpfGraphRecoveryRefusal::IndeterminateState)
+                            }
+                        };
+                    }
+                    return Ok(CurrentEbpfGraphRecoveryOutcome::AlreadyAbsent);
+                }
+                Err(_) => {
+                    return refused(CurrentEbpfGraphRecoveryRefusal::IndeterminateState);
+                }
+                Ok(metadata) => metadata,
+            };
+            if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+                return refused(CurrentEbpfGraphRecoveryRefusal::IdentityMismatch);
+            }
+            let canonical = match fs::canonicalize(&ownership.canonical_pin_dir) {
+                Ok(path) => path,
+                Err(_) => {
+                    return refused(CurrentEbpfGraphRecoveryRefusal::IndeterminateState);
+                }
+            };
+            if canonical != ownership.canonical_pin_dir {
+                return refused(CurrentEbpfGraphRecoveryRefusal::IdentityMismatch);
+            }
+            if let Some(replacement) = replacement {
+                match Self::replacement_hook_slots_empty(replacement, tc_priority) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return refused(CurrentEbpfGraphRecoveryRefusal::IdentityMismatch);
+                    }
+                    Err(ReplacementHookObservationError::IdentityChanged) => {
+                        return refused(
+                            CurrentEbpfGraphRecoveryRefusal::ReplacementInterfaceIdentityChanged,
+                        );
+                    }
+                    Err(ReplacementHookObservationError::Indeterminate) => {
+                        return refused(CurrentEbpfGraphRecoveryRefusal::IndeterminateState);
+                    }
+                }
+            }
+
+            let entries = match Self::current_directory_entries(&ownership.canonical_pin_dir) {
+                Ok(entries) => entries,
+                Err(_) => {
+                    return refused(CurrentEbpfGraphRecoveryRefusal::IndeterminateState);
+                }
+            };
+            if entries.is_empty() {
+                let identity_unchanged = fs::symlink_metadata(&ownership.canonical_pin_dir)
+                    .is_ok_and(|current| {
+                        current.file_type().is_dir()
+                            && !current.file_type().is_symlink()
+                            && current.dev() == metadata.dev()
+                            && current.ino() == metadata.ino()
+                    });
+                if !identity_unchanged {
+                    return refused(CurrentEbpfGraphRecoveryRefusal::IndeterminateState);
+                }
+                if let Some(replacement) = replacement {
+                    match Self::replacement_hook_slots_empty(replacement, tc_priority) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            return refused(CurrentEbpfGraphRecoveryRefusal::IdentityMismatch);
+                        }
+                        Err(ReplacementHookObservationError::IdentityChanged) => {
+                            return refused(
+                                CurrentEbpfGraphRecoveryRefusal::ReplacementInterfaceIdentityChanged,
+                            );
+                        }
+                        Err(ReplacementHookObservationError::Indeterminate) => {
+                            return refused(CurrentEbpfGraphRecoveryRefusal::IndeterminateState);
+                        }
+                    }
+                }
+                return match fs::remove_dir(&ownership.canonical_pin_dir) {
+                    Ok(()) => Ok(CurrentEbpfGraphRecoveryOutcome::AlreadyAbsent),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        Ok(CurrentEbpfGraphRecoveryOutcome::AlreadyAbsent)
+                    }
+                    Err(_) => refused(CurrentEbpfGraphRecoveryRefusal::IndeterminateState),
+                };
+            }
+            if entries
+                .iter()
+                .any(|entry| !CURRENT_MAP_NAMES.contains(&entry.as_str()))
+            {
+                return refused(CurrentEbpfGraphRecoveryRefusal::IdentityMismatch);
+            }
+            if entries.len() != CURRENT_MAP_NAMES.len()
+                || CURRENT_MAP_NAMES
+                    .iter()
+                    .any(|name| !entries.contains(*name))
+            {
+                return refused(CurrentEbpfGraphRecoveryRefusal::NotCurrentSchema);
+            }
+            let map_ids = match Self::current_named_map_ids(&ownership.canonical_pin_dir) {
+                Ok(ids) => ids,
+                Err(CurrentIdentityError::Mismatch) => {
+                    return refused(CurrentEbpfGraphRecoveryRefusal::IdentityMismatch);
+                }
+                Err(CurrentIdentityError::Indeterminate) => {
+                    return refused(CurrentEbpfGraphRecoveryRefusal::IndeterminateState);
+                }
+            };
+            let populated =
+                match Self::current_graph_forwarding_populated(&ownership.canonical_pin_dir) {
+                    Ok(populated) => populated,
+                    Err(CurrentIdentityError::Mismatch) => {
+                        return refused(CurrentEbpfGraphRecoveryRefusal::NotCurrentSchema);
+                    }
+                    Err(CurrentIdentityError::Indeterminate) => {
+                        return refused(CurrentEbpfGraphRecoveryRefusal::IndeterminateState);
+                    }
+                };
+            if populated && !allow_populated {
+                return refused(CurrentEbpfGraphRecoveryRefusal::PopulatedState);
+            }
+
+            // Loading occurs only after the complete read-only pin/ABI/schema
+            // preflight. No missing pinned-by-name map can be created here.
+            let mut ebpf = match self.load_pinned(&ownership.canonical_pin_dir) {
+                Ok(ebpf) => ebpf,
+                Err(_) => {
+                    return refused(CurrentEbpfGraphRecoveryRefusal::IndeterminateState);
+                }
+            };
+            let held = match Self::held_map_identity(&ebpf) {
+                Ok(identity) => identity,
+                Err(_) => {
+                    return refused(CurrentEbpfGraphRecoveryRefusal::IdentityMismatch);
+                }
+            };
+            if Self::pinned_map_ids(&held) != map_ids {
+                return refused(CurrentEbpfGraphRecoveryRefusal::IdentityMismatch);
+            }
+            if load_program(&mut ebpf, PROG_UPLINK).is_err()
+                || load_program(&mut ebpf, PROG_DOWNLINK).is_err()
+            {
+                return refused(CurrentEbpfGraphRecoveryRefusal::IndeterminateState);
+            }
+            let artifact = match Self::datapath_identity(&ebpf, &ownership.canonical_pin_dir) {
+                Ok(identity) => identity,
+                Err(_) => {
+                    return refused(CurrentEbpfGraphRecoveryRefusal::IndeterminateState);
+                }
+            };
+            drop(ebpf);
+            match Self::current_program_references(&map_ids, Some(&artifact)) {
+                Ok(CurrentProgramReference::Absent) => {}
+                Ok(CurrentProgramReference::ExactSdkProgram) => {
+                    return refused(CurrentEbpfGraphRecoveryRefusal::ActiveOwner);
+                }
+                Ok(CurrentProgramReference::Foreign) => {
+                    return refused(CurrentEbpfGraphRecoveryRefusal::IdentityMismatch);
+                }
+                Err(_) => {
+                    return refused(CurrentEbpfGraphRecoveryRefusal::IndeterminateState);
+                }
+            }
+
+            // Repeat every mutable observation under the host-global lease as
+            // closely as possible to durable proof publication. A foreign
+            // writer that ignores the lease remains fail-closed.
+            let repeat_population_safe = matches!(
+                Self::current_graph_forwarding_populated(&ownership.canonical_pin_dir),
+                Ok(is_populated) if allow_populated || !is_populated
+            );
+            let replacement_hooks_empty = match replacement {
+                Some(replacement) => {
+                    match Self::replacement_hook_slots_empty(replacement, tc_priority) {
+                        Ok(empty) => empty,
+                        Err(ReplacementHookObservationError::IdentityChanged) => {
+                            return refused(
+                                CurrentEbpfGraphRecoveryRefusal::ReplacementInterfaceIdentityChanged,
+                            );
+                        }
+                        Err(ReplacementHookObservationError::Indeterminate) => {
+                            return refused(CurrentEbpfGraphRecoveryRefusal::IndeterminateState);
+                        }
+                    }
+                }
+                None => true,
+            };
+            let programs_absent = matches!(
+                Self::current_program_references(&map_ids, Some(&artifact)),
+                Ok(CurrentProgramReference::Absent)
+            );
+            if Self::current_named_map_ids(&ownership.canonical_pin_dir) != Ok(map_ids)
+                || !repeat_population_safe
+                || !programs_absent
+                || !replacement_hooks_empty
+            {
+                return refused(CurrentEbpfGraphRecoveryRefusal::IndeterminateState);
+            }
+            let current_metadata = fs::symlink_metadata(&ownership.canonical_pin_dir)
+                .map_err(|_| state_indeterminate("ebpf_current_graph_identity"))?;
+            if !current_metadata.file_type().is_dir()
+                || current_metadata.dev() != metadata.dev()
+                || current_metadata.ino() != metadata.ino()
+            {
+                return refused(CurrentEbpfGraphRecoveryRefusal::IndeterminateState);
+            }
+            let record = CurrentRecoveryRecord::unbound(
+                ownership.namespace_hash,
+                allow_populated,
+                map_ids,
+                metadata.dev(),
+                metadata.ino(),
+            );
+            let proof = match Self::commit_current_recovery_proof(&ownership, record) {
+                Ok(proof) => proof,
+                Err(CurrentProofCommitError::BeforePublication) => {
+                    return refused(CurrentEbpfGraphRecoveryRefusal::IndeterminateState);
+                }
+                Err(CurrentProofCommitError::PublicationIndeterminate) => {
+                    return Ok(CurrentEbpfGraphRecoveryOutcome::Partial(
+                        CurrentEbpfGraphRecoveryProgress::Indeterminate,
+                    ));
+                }
+            };
+            Self::continue_current_recovery(
+                &ownership,
+                proof,
+                replacement,
+                tc_priority,
+                allow_populated,
+                managed_state,
+            )
         }
 
         fn detach(
@@ -8350,6 +10070,44 @@ mod aya_runtime {
         use super::*;
         use aya_obj::VerifierLog;
 
+        #[test]
+        fn current_recovery_record_round_trips_and_rejects_tampering() {
+            let record = CurrentRecoveryRecord::unbound(
+                [0x11; 32],
+                true,
+                [73; CURRENT_MAP_NAMES.len()],
+                41,
+                42,
+            )
+            .bind_to_proof_map(99)
+            .unwrap();
+            let encoded = record.encode();
+            assert_eq!(CurrentRecoveryRecord::decode(&encoded), Some(record));
+
+            for offset in [0, 8, 9, 10, 16, 48, 108, 112, 120, 128] {
+                let mut tampered = encoded;
+                tampered[offset] ^= 1;
+                assert_eq!(
+                    CurrentRecoveryRecord::decode(&tampered),
+                    None,
+                    "tamper offset {offset}"
+                );
+            }
+            assert_eq!(
+                CurrentRecoveryRecord::decode(
+                    &CurrentRecoveryRecord::unbound(
+                        [0x11; 32],
+                        false,
+                        [73; CURRENT_MAP_NAMES.len()],
+                        41,
+                        42,
+                    )
+                    .encode(),
+                ),
+                None
+            );
+        }
+
         fn instruction(code: u8, dst: u8, src: u8, off: i16, imm: i32) -> bpf_insn {
             bpf_insn {
                 code,
@@ -9497,12 +11255,17 @@ mod tests {
     use opc_gtpu_ebpf_common::default_bearer_graph_is_valid;
 
     use crate::model::{GtpBearerMark, Teid};
-    use crate::{DrainedV2TeardownProgress, GtpAddressFamily};
+    use crate::{
+        CurrentEbpfGraphRecoveryProgress, CurrentEbpfGraphRecoveryRefusal,
+        DrainedV2TeardownProgress, GtpAddressFamily,
+    };
 
     use super::*;
 
     const S2BU_IFINDEX: u32 = 7;
+    const REPLACEMENT_IFINDEX: u32 = 19;
     const LEGACY_V2_PIN_COUNT: usize = 9;
+    const CURRENT_PIN_COUNT: usize = 15;
 
     #[derive(Debug)]
     struct FakeRuntime {
@@ -9556,6 +11319,9 @@ mod tests {
         // crash/retry boundaries without weakening the production algorithm.
         v2_teardown_proof: HashSet<PathBuf>,
         v2_pins_remaining: HashMap<PathBuf, usize>,
+        current_graphs: HashMap<PathBuf, FakeCurrentGraph>,
+        current_recovery_busy: HashSet<PathBuf>,
+        replacement_identity: FakeReplacementIdentity,
         empty_pin_dirs: HashSet<PathBuf>,
         operations: Vec<&'static str>,
         failures: VecDeque<&'static str>,
@@ -9585,6 +11351,40 @@ mod tests {
         PmtuV5,
     }
 
+    #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+    enum FakeReplacementIdentity {
+        #[default]
+        Exact,
+        Disappeared,
+        Renamed,
+        IfindexChanged,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct FakeCurrentGraph {
+        schema_exact: bool,
+        active_owner: bool,
+        foreign_identity: bool,
+        populated: bool,
+        proof_committed: bool,
+        proof_allows_populated: bool,
+        pins_remaining: usize,
+    }
+
+    impl Default for FakeCurrentGraph {
+        fn default() -> Self {
+            Self {
+                schema_exact: true,
+                active_owner: false,
+                foreign_identity: false,
+                populated: false,
+                proof_committed: false,
+                proof_allows_populated: false,
+                pins_remaining: CURRENT_PIN_COUNT,
+            }
+        }
+    }
+
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct FakeAttachment {
         interface: String,
@@ -9595,7 +11395,10 @@ mod tests {
     impl FakeRuntime {
         fn new() -> Self {
             Self {
-                ifindexes: HashMap::from([("s2bu".to_string(), S2BU_IFINDEX)]),
+                ifindexes: HashMap::from([
+                    ("s2bu".to_string(), S2BU_IFINDEX),
+                    ("s2bu-new".to_string(), REPLACEMENT_IFINDEX),
+                ]),
                 state: Mutex::new(FakeState::default()),
                 environment: EbpfEnvironment {
                     platform_supported: true,
@@ -9649,6 +11452,27 @@ mod tests {
             }
         }
 
+        fn current_proof_disappeared(
+            state: &mut FakeState,
+            pin_dir: &Path,
+            pins_before: usize,
+            rollback_progress: CurrentEbpfGraphRecoveryProgress,
+        ) -> CurrentEbpfGraphRecoveryOutcome {
+            if let Some(graph) = state.current_graphs.get_mut(pin_dir) {
+                graph.proof_committed = false;
+            }
+            if Self::fail_if_requested(state, "current_proof_restore").is_err() {
+                state.current_graphs.remove(pin_dir);
+                CurrentEbpfGraphRecoveryOutcome::Removed
+            } else {
+                if let Some(graph) = state.current_graphs.get_mut(pin_dir) {
+                    graph.proof_committed = true;
+                    graph.pins_remaining = pins_before;
+                }
+                CurrentEbpfGraphRecoveryOutcome::Partial(rollback_progress)
+            }
+        }
+
         fn validate_schema(
             state: &FakeState,
             pin_dir: &Path,
@@ -9657,6 +11481,15 @@ mod tests {
             if state.v2_teardown_proof.contains(pin_dir) {
                 return Err(GtpuError::StateIndeterminate {
                     operation: "ebpf_legacy_v2_teardown_pending",
+                });
+            }
+            if state
+                .current_graphs
+                .get(pin_dir)
+                .is_some_and(|graph| graph.proof_committed)
+            {
+                return Err(GtpuError::StateIndeterminate {
+                    operation: "ebpf_current_recovery_pending",
                 });
             }
             match state.schema.get(pin_dir).copied() {
@@ -10452,6 +12285,206 @@ mod tests {
                 .schema
                 .insert(pin_dir.to_path_buf(), FakeSchema::PmtuV5);
             Ok(local_ip)
+        }
+
+        fn recover_orphaned_current_graph(
+            &self,
+            replacement: Option<(&str, u32)>,
+            pin_dir: &Path,
+            _tc_priority: u16,
+            allow_populated: bool,
+            managed_state: CurrentRecoveryManagedState,
+        ) -> Result<CurrentEbpfGraphRecoveryOutcome, GtpuError> {
+            let mut state = self.state();
+            state.operations.push("recover_orphaned_current_graph");
+            if state.current_recovery_busy.contains(pin_dir) {
+                return Ok(CurrentEbpfGraphRecoveryOutcome::Refused(
+                    CurrentEbpfGraphRecoveryRefusal::ActiveOwner,
+                ));
+            }
+            let graph = state.current_graphs.get(pin_dir).copied();
+            if managed_state != CurrentRecoveryManagedState::Clear {
+                return Ok(if graph.is_some_and(|graph| graph.proof_committed) {
+                    CurrentEbpfGraphRecoveryOutcome::Partial(
+                        CurrentEbpfGraphRecoveryProgress::Indeterminate,
+                    )
+                } else {
+                    let refusal = if managed_state == CurrentRecoveryManagedState::Conflict {
+                        CurrentEbpfGraphRecoveryRefusal::ManagedAttachment
+                    } else {
+                        CurrentEbpfGraphRecoveryRefusal::IndeterminateState
+                    };
+                    CurrentEbpfGraphRecoveryOutcome::Refused(refusal)
+                });
+            }
+            if state.replacement_identity != FakeReplacementIdentity::Exact {
+                return Ok(if graph.is_some_and(|graph| graph.proof_committed) {
+                    CurrentEbpfGraphRecoveryOutcome::Partial(
+                        CurrentEbpfGraphRecoveryProgress::Indeterminate,
+                    )
+                } else {
+                    CurrentEbpfGraphRecoveryOutcome::Refused(
+                        CurrentEbpfGraphRecoveryRefusal::ReplacementInterfaceIdentityChanged,
+                    )
+                });
+            }
+            if let Some((_, ifindex)) = replacement {
+                if state.uplink_filter_ready.contains(&ifindex)
+                    || state.downlink_filter_ready.contains(&ifindex)
+                    || state.uplink_filter_foreign.contains(&ifindex)
+                    || state.downlink_filter_foreign.contains(&ifindex)
+                {
+                    return Ok(CurrentEbpfGraphRecoveryOutcome::Refused(
+                        CurrentEbpfGraphRecoveryRefusal::IdentityMismatch,
+                    ));
+                }
+            }
+            let Some(graph) = graph else {
+                return Ok(CurrentEbpfGraphRecoveryOutcome::AlreadyAbsent);
+            };
+            if graph.proof_committed
+                && Self::fail_if_requested(&mut state, "current_proof_entry_read").is_err()
+            {
+                return Ok(CurrentEbpfGraphRecoveryOutcome::Partial(
+                    CurrentEbpfGraphRecoveryProgress::Indeterminate,
+                ));
+            }
+            let committed_conflict = |reason| {
+                if graph.proof_committed {
+                    CurrentEbpfGraphRecoveryOutcome::Partial(
+                        CurrentEbpfGraphRecoveryProgress::Indeterminate,
+                    )
+                } else {
+                    CurrentEbpfGraphRecoveryOutcome::Refused(reason)
+                }
+            };
+            if graph.active_owner {
+                return Ok(committed_conflict(
+                    CurrentEbpfGraphRecoveryRefusal::ActiveOwner,
+                ));
+            }
+            if graph.foreign_identity {
+                return Ok(committed_conflict(
+                    CurrentEbpfGraphRecoveryRefusal::IdentityMismatch,
+                ));
+            }
+            if !graph.schema_exact {
+                return Ok(committed_conflict(
+                    CurrentEbpfGraphRecoveryRefusal::NotCurrentSchema,
+                ));
+            }
+            let rollback_progress = if graph.pins_remaining < CURRENT_PIN_COUNT {
+                CurrentEbpfGraphRecoveryProgress::PinCleanupStarted
+            } else {
+                CurrentEbpfGraphRecoveryProgress::ProofCommitted
+            };
+            if graph.proof_committed && graph.proof_allows_populated && !allow_populated {
+                return Ok(CurrentEbpfGraphRecoveryOutcome::Partial(rollback_progress));
+            }
+            if graph.populated && !allow_populated && !graph.proof_committed {
+                return Ok(CurrentEbpfGraphRecoveryOutcome::Refused(
+                    CurrentEbpfGraphRecoveryRefusal::PopulatedState,
+                ));
+            }
+            if !graph.proof_committed {
+                if Self::fail_if_requested(&mut state, "current_proof_commit").is_err() {
+                    return Ok(CurrentEbpfGraphRecoveryOutcome::Refused(
+                        CurrentEbpfGraphRecoveryRefusal::IndeterminateState,
+                    ));
+                }
+                if let Some(graph) = state.current_graphs.get_mut(pin_dir) {
+                    graph.proof_committed = true;
+                    graph.proof_allows_populated = allow_populated;
+                }
+                if Self::fail_if_requested(&mut state, "current_proof_readback").is_err() {
+                    return Ok(CurrentEbpfGraphRecoveryOutcome::Partial(
+                        CurrentEbpfGraphRecoveryProgress::Indeterminate,
+                    ));
+                }
+            }
+            if Self::fail_if_requested(&mut state, "current_replacement_recheck").is_err() {
+                return Ok(CurrentEbpfGraphRecoveryOutcome::Partial(
+                    CurrentEbpfGraphRecoveryProgress::Indeterminate,
+                ));
+            }
+
+            let pins_before = state
+                .current_graphs
+                .get(pin_dir)
+                .map_or(0, |graph| graph.pins_remaining);
+            if Self::fail_if_requested(&mut state, "current_proof_disappear_before_cleanup")
+                .is_err()
+            {
+                return Ok(Self::current_proof_disappeared(
+                    &mut state,
+                    pin_dir,
+                    pins_before,
+                    rollback_progress,
+                ));
+            }
+            if Self::fail_if_requested(&mut state, "current_map_unpin").is_err() {
+                // Model the production exact-FD rollback: an ordinary cleanup
+                // failure restores every pin removed by this invocation.
+                if let Some(graph) = state.current_graphs.get_mut(pin_dir) {
+                    graph.pins_remaining = pins_before;
+                }
+                return Ok(CurrentEbpfGraphRecoveryOutcome::Partial(rollback_progress));
+            }
+            if Self::fail_if_requested(&mut state, "current_cleanup_interrupted").is_err() {
+                if let Some(graph) = state.current_graphs.get_mut(pin_dir) {
+                    graph.pins_remaining = graph.pins_remaining.saturating_sub(1);
+                }
+                return Ok(CurrentEbpfGraphRecoveryOutcome::Partial(
+                    CurrentEbpfGraphRecoveryProgress::PinCleanupStarted,
+                ));
+            }
+            if Self::fail_if_requested(&mut state, "current_proof_disappear_during_cleanup")
+                .is_err()
+            {
+                if let Some(graph) = state.current_graphs.get_mut(pin_dir) {
+                    graph.pins_remaining = graph.pins_remaining.saturating_sub(1);
+                }
+                return Ok(Self::current_proof_disappeared(
+                    &mut state,
+                    pin_dir,
+                    pins_before,
+                    rollback_progress,
+                ));
+            }
+            if let Some(graph) = state.current_graphs.get_mut(pin_dir) {
+                graph.pins_remaining = 0;
+            }
+            if Self::fail_if_requested(&mut state, "current_proof_disappear_before_finalization")
+                .is_err()
+            {
+                return Ok(Self::current_proof_disappeared(
+                    &mut state,
+                    pin_dir,
+                    pins_before,
+                    rollback_progress,
+                ));
+            }
+            for operation in ["current_proof_unpin", "current_pin_dir_remove"] {
+                if Self::fail_if_requested(&mut state, operation).is_err() {
+                    if operation == "current_pin_dir_remove"
+                        && Self::fail_if_requested(&mut state, "current_proof_restore").is_err()
+                    {
+                        // Production never republishes the maps when proof
+                        // restoration is not authoritative. Model terminal
+                        // graph absence rather than an unfenced complete map
+                        // set.
+                        state.current_graphs.remove(pin_dir);
+                        return Ok(CurrentEbpfGraphRecoveryOutcome::Removed);
+                    }
+                    if let Some(graph) = state.current_graphs.get_mut(pin_dir) {
+                        graph.proof_committed = true;
+                        graph.pins_remaining = pins_before;
+                    }
+                    return Ok(CurrentEbpfGraphRecoveryOutcome::Partial(rollback_progress));
+                }
+            }
+            state.current_graphs.remove(pin_dir);
+            Ok(CurrentEbpfGraphRecoveryOutcome::Removed)
         }
 
         fn detach(
@@ -11743,6 +13776,498 @@ mod tests {
             },
             crate::GtpuV2DrainProof::sessions_and_traffic_drained(),
         )
+    }
+
+    fn seed_current_orphan(runtime: &FakeRuntime, populated: bool) -> PathBuf {
+        let pin_dir = PathBuf::from(DEFAULT_BPFFS_PIN_ROOT).join("s2bu-old");
+        runtime.state().current_graphs.insert(
+            pin_dir.clone(),
+            FakeCurrentGraph {
+                populated,
+                ..FakeCurrentGraph::default()
+            },
+        );
+        pin_dir
+    }
+
+    fn current_recovery_request(with_replacement: bool) -> CurrentEbpfGraphRecoveryRequest {
+        let request = CurrentEbpfGraphRecoveryRequest::new(
+            "s2bu-old",
+            crate::CurrentEbpfGraphWriterProof::previous_writer_stopped(),
+        );
+        if with_replacement {
+            request.with_replacement_device(GtpDevice {
+                name: "s2bu-new".to_string(),
+                ifindex: REPLACEMENT_IFINDEX,
+            })
+        } else {
+            request
+        }
+    }
+
+    #[tokio::test]
+    async fn current_orphan_recovery_accepts_a_different_replacement_ifindex_and_is_idempotent() {
+        let (backend, runtime) = backend_with_fake();
+        let pin_dir = seed_current_orphan(&runtime, false);
+
+        assert_eq!(
+            backend
+                .recover_orphaned_current_ebpf_graph(current_recovery_request(true))
+                .await
+                .unwrap(),
+            CurrentEbpfGraphRecoveryOutcome::Removed
+        );
+        assert!(!runtime.state().current_graphs.contains_key(&pin_dir));
+        assert_eq!(
+            backend
+                .recover_orphaned_current_ebpf_graph(current_recovery_request(true))
+                .await
+                .unwrap(),
+            CurrentEbpfGraphRecoveryOutcome::AlreadyAbsent
+        );
+    }
+
+    #[tokio::test]
+    async fn current_orphan_recovery_rejects_reserved_pin_path_components() {
+        let (backend, _runtime) = backend_with_fake();
+        for namespace in [".", ".."] {
+            let request = CurrentEbpfGraphRecoveryRequest::new(
+                namespace,
+                crate::CurrentEbpfGraphWriterProof::previous_writer_stopped(),
+            );
+            assert!(matches!(
+                backend.recover_orphaned_current_ebpf_graph(request).await,
+                Err(GtpuError::InvalidConfig {
+                    field: "pin_namespace",
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn current_orphan_recovery_refuses_live_and_concurrent_owners_without_mutation() {
+        for busy_lease in [false, true] {
+            let (backend, runtime) = backend_with_fake();
+            let pin_dir = seed_current_orphan(&runtime, false);
+            {
+                let mut state = runtime.state();
+                if busy_lease {
+                    state.current_recovery_busy.insert(pin_dir.clone());
+                } else if let Some(graph) = state.current_graphs.get_mut(&pin_dir) {
+                    graph.active_owner = true;
+                }
+            }
+            let before = runtime.state().current_graphs[&pin_dir];
+
+            assert_eq!(
+                backend
+                    .recover_orphaned_current_ebpf_graph(current_recovery_request(true))
+                    .await
+                    .unwrap(),
+                CurrentEbpfGraphRecoveryOutcome::Refused(
+                    CurrentEbpfGraphRecoveryRefusal::ActiveOwner
+                )
+            );
+            assert_eq!(runtime.state().current_graphs[&pin_dir], before);
+        }
+    }
+
+    #[tokio::test]
+    async fn current_orphan_recovery_revalidates_replacement_identity_at_every_phase() {
+        let (backend, runtime) = backend_with_fake();
+        let pin_dir = seed_current_orphan(&runtime, false);
+        let before = runtime.state().current_graphs[&pin_dir];
+        runtime.state().replacement_identity = FakeReplacementIdentity::IfindexChanged;
+        assert_eq!(
+            backend
+                .recover_orphaned_current_ebpf_graph(current_recovery_request(true))
+                .await
+                .unwrap(),
+            CurrentEbpfGraphRecoveryOutcome::Refused(
+                CurrentEbpfGraphRecoveryRefusal::ReplacementInterfaceIdentityChanged
+            )
+        );
+        assert_eq!(runtime.state().current_graphs[&pin_dir], before);
+
+        runtime.state().replacement_identity = FakeReplacementIdentity::Exact;
+        runtime.fail_in_order(["current_replacement_recheck"]);
+        assert_eq!(
+            backend
+                .recover_orphaned_current_ebpf_graph(current_recovery_request(true))
+                .await
+                .unwrap(),
+            CurrentEbpfGraphRecoveryOutcome::Partial(
+                CurrentEbpfGraphRecoveryProgress::Indeterminate
+            )
+        );
+        let graph = runtime.state().current_graphs[&pin_dir];
+        assert!(graph.proof_committed);
+        assert_eq!(graph.pins_remaining, CURRENT_PIN_COUNT);
+    }
+
+    #[tokio::test]
+    async fn committed_recovery_keeps_replacement_identity_retry_failures_partial() {
+        for identity in [
+            FakeReplacementIdentity::Disappeared,
+            FakeReplacementIdentity::Renamed,
+            FakeReplacementIdentity::IfindexChanged,
+        ] {
+            let (backend, runtime) = backend_with_fake();
+            let pin_dir = seed_current_orphan(&runtime, false);
+            runtime.fail_in_order(["current_replacement_recheck"]);
+            assert_eq!(
+                backend
+                    .recover_orphaned_current_ebpf_graph(current_recovery_request(true))
+                    .await
+                    .unwrap(),
+                CurrentEbpfGraphRecoveryOutcome::Partial(
+                    CurrentEbpfGraphRecoveryProgress::Indeterminate
+                )
+            );
+
+            runtime.state().replacement_identity = identity;
+            assert_eq!(
+                backend
+                    .recover_orphaned_current_ebpf_graph(current_recovery_request(true))
+                    .await
+                    .unwrap(),
+                CurrentEbpfGraphRecoveryOutcome::Partial(
+                    CurrentEbpfGraphRecoveryProgress::Indeterminate
+                ),
+                "committed retry identity {identity:?}"
+            );
+            let graph = runtime.state().current_graphs[&pin_dir];
+            assert!(
+                graph.proof_committed,
+                "committed retry identity {identity:?}"
+            );
+            assert_eq!(
+                graph.pins_remaining, CURRENT_PIN_COUNT,
+                "committed retry identity {identity:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn committed_recovery_keeps_managed_replacement_conflict_partial() {
+        let (backend, runtime) = backend_with_fake();
+        let pin_dir = seed_current_orphan(&runtime, false);
+        runtime.fail_in_order(["current_replacement_recheck"]);
+        assert!(matches!(
+            backend
+                .recover_orphaned_current_ebpf_graph(current_recovery_request(true))
+                .await
+                .unwrap(),
+            CurrentEbpfGraphRecoveryOutcome::Partial(_)
+        ));
+        backend.inner.devices.lock().unwrap().insert(
+            REPLACEMENT_IFINDEX,
+            ManagedDevice {
+                name: "s2bu-new".to_string(),
+                local_ip: Ipv4Addr::new(192, 0, 2, 99),
+            },
+        );
+
+        assert_eq!(
+            backend
+                .recover_orphaned_current_ebpf_graph(current_recovery_request(true))
+                .await
+                .unwrap(),
+            CurrentEbpfGraphRecoveryOutcome::Partial(
+                CurrentEbpfGraphRecoveryProgress::Indeterminate
+            )
+        );
+        let graph = runtime.state().current_graphs[&pin_dir];
+        assert!(graph.proof_committed);
+        assert_eq!(graph.pins_remaining, CURRENT_PIN_COUNT);
+    }
+
+    #[tokio::test]
+    async fn current_orphan_recovery_refuses_foreign_or_noncurrent_graphs_without_mutation() {
+        for kind in 0..2 {
+            let (backend, runtime) = backend_with_fake();
+            let pin_dir = seed_current_orphan(&runtime, false);
+            {
+                let mut state = runtime.state();
+                let graph = state.current_graphs.get_mut(&pin_dir).unwrap();
+                if kind == 0 {
+                    graph.schema_exact = false;
+                } else {
+                    graph.foreign_identity = true;
+                }
+            }
+            let before = runtime.state().current_graphs[&pin_dir];
+            let expected = if kind == 0 {
+                CurrentEbpfGraphRecoveryRefusal::NotCurrentSchema
+            } else {
+                CurrentEbpfGraphRecoveryRefusal::IdentityMismatch
+            };
+
+            assert_eq!(
+                backend
+                    .recover_orphaned_current_ebpf_graph(current_recovery_request(false))
+                    .await
+                    .unwrap(),
+                CurrentEbpfGraphRecoveryOutcome::Refused(expected)
+            );
+            assert_eq!(runtime.state().current_graphs[&pin_dir], before);
+        }
+    }
+
+    #[tokio::test]
+    async fn current_orphan_recovery_requires_drain_proof_for_populated_state() {
+        let (backend, runtime) = backend_with_fake();
+        let pin_dir = seed_current_orphan(&runtime, true);
+        let before = runtime.state().current_graphs[&pin_dir];
+
+        assert_eq!(
+            backend
+                .recover_orphaned_current_ebpf_graph(current_recovery_request(false))
+                .await
+                .unwrap(),
+            CurrentEbpfGraphRecoveryOutcome::Refused(
+                CurrentEbpfGraphRecoveryRefusal::PopulatedState
+            )
+        );
+        assert_eq!(runtime.state().current_graphs[&pin_dir], before);
+        assert_eq!(
+            backend
+                .recover_orphaned_current_ebpf_graph(
+                    current_recovery_request(false).with_drain_proof(
+                        crate::CurrentEbpfGraphDrainProof::sessions_and_traffic_drained(),
+                    ),
+                )
+                .await
+                .unwrap(),
+            CurrentEbpfGraphRecoveryOutcome::Removed
+        );
+    }
+
+    #[tokio::test]
+    async fn committed_populated_retry_reports_surviving_pin_progress_before_authorization() {
+        let (backend, runtime) = backend_with_fake();
+        let pin_dir = seed_current_orphan(&runtime, true);
+        {
+            let mut state = runtime.state();
+            let graph = state.current_graphs.get_mut(&pin_dir).unwrap();
+            graph.proof_committed = true;
+            graph.proof_allows_populated = true;
+            graph.pins_remaining = CURRENT_PIN_COUNT - 1;
+        }
+
+        assert_eq!(
+            backend
+                .recover_orphaned_current_ebpf_graph(current_recovery_request(false))
+                .await
+                .unwrap(),
+            CurrentEbpfGraphRecoveryOutcome::Partial(
+                CurrentEbpfGraphRecoveryProgress::PinCleanupStarted
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn current_orphan_recovery_rolls_back_ordinary_cleanup_failures() {
+        for failure in [
+            "current_map_unpin",
+            "current_proof_unpin",
+            "current_pin_dir_remove",
+        ] {
+            let (backend, runtime) = backend_with_fake();
+            let pin_dir = seed_current_orphan(&runtime, false);
+            runtime.fail_in_order([failure]);
+
+            assert_eq!(
+                backend
+                    .recover_orphaned_current_ebpf_graph(current_recovery_request(false))
+                    .await
+                    .unwrap(),
+                CurrentEbpfGraphRecoveryOutcome::Partial(
+                    CurrentEbpfGraphRecoveryProgress::ProofCommitted
+                ),
+                "failure boundary {failure}"
+            );
+            let graph = runtime.state().current_graphs[&pin_dir];
+            assert!(graph.proof_committed, "failure boundary {failure}");
+            assert_eq!(
+                graph.pins_remaining, CURRENT_PIN_COUNT,
+                "failure boundary {failure}"
+            );
+            assert_eq!(
+                backend
+                    .recover_orphaned_current_ebpf_graph(current_recovery_request(false))
+                    .await
+                    .unwrap(),
+                CurrentEbpfGraphRecoveryOutcome::Removed,
+                "failure boundary {failure}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_proof_restore_never_republishes_an_unfenced_map_graph() {
+        let (backend, runtime) = backend_with_fake();
+        let pin_dir = seed_current_orphan(&runtime, false);
+        runtime.fail_in_order(["current_pin_dir_remove", "current_proof_restore"]);
+
+        assert_eq!(
+            backend
+                .recover_orphaned_current_ebpf_graph(current_recovery_request(false))
+                .await
+                .unwrap(),
+            CurrentEbpfGraphRecoveryOutcome::Removed
+        );
+        assert!(
+            !runtime.state().current_graphs.contains_key(&pin_dir),
+            "map pins must remain terminally absent when proof restoration fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn unreadable_committed_proof_is_retryable_and_remains_fenced() {
+        let (backend, runtime) = backend_with_fake();
+        let pin_dir = seed_current_orphan(&runtime, false);
+        runtime
+            .state()
+            .current_graphs
+            .get_mut(&pin_dir)
+            .unwrap()
+            .proof_committed = true;
+        runtime.fail_in_order(["current_proof_entry_read"]);
+
+        assert_eq!(
+            backend
+                .recover_orphaned_current_ebpf_graph(current_recovery_request(false))
+                .await
+                .unwrap(),
+            CurrentEbpfGraphRecoveryOutcome::Partial(
+                CurrentEbpfGraphRecoveryProgress::Indeterminate
+            )
+        );
+        let graph = runtime.state().current_graphs[&pin_dir];
+        assert!(graph.proof_committed);
+        assert_eq!(graph.pins_remaining, CURRENT_PIN_COUNT);
+    }
+
+    #[tokio::test]
+    async fn proof_disappearance_at_each_cleanup_stage_restores_the_exact_fence() {
+        for failure in [
+            "current_proof_disappear_before_cleanup",
+            "current_proof_disappear_during_cleanup",
+            "current_proof_disappear_before_finalization",
+        ] {
+            let (backend, runtime) = backend_with_fake();
+            let pin_dir = seed_current_orphan(&runtime, false);
+            runtime.fail_in_order([failure]);
+
+            assert_eq!(
+                backend
+                    .recover_orphaned_current_ebpf_graph(current_recovery_request(false))
+                    .await
+                    .unwrap(),
+                CurrentEbpfGraphRecoveryOutcome::Partial(
+                    CurrentEbpfGraphRecoveryProgress::ProofCommitted
+                ),
+                "failure boundary {failure}"
+            );
+            let graph = runtime.state().current_graphs[&pin_dir];
+            assert!(graph.proof_committed, "failure boundary {failure}");
+            assert_eq!(
+                graph.pins_remaining, CURRENT_PIN_COUNT,
+                "failure boundary {failure}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_proof_restore_at_each_cleanup_stage_never_leaves_an_unfenced_graph() {
+        for failure in [
+            "current_proof_disappear_before_cleanup",
+            "current_proof_disappear_during_cleanup",
+            "current_proof_disappear_before_finalization",
+        ] {
+            let (backend, runtime) = backend_with_fake();
+            let pin_dir = seed_current_orphan(&runtime, false);
+            runtime.fail_in_order([failure, "current_proof_restore"]);
+
+            assert_eq!(
+                backend
+                    .recover_orphaned_current_ebpf_graph(current_recovery_request(false))
+                    .await
+                    .unwrap(),
+                CurrentEbpfGraphRecoveryOutcome::Removed,
+                "failure boundary {failure}"
+            );
+            assert!(
+                !runtime.state().current_graphs.contains_key(&pin_dir),
+                "failure boundary {failure}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn post_publication_proof_readback_failure_is_partial_and_retryable() {
+        let (backend, runtime) = backend_with_fake();
+        let pin_dir = seed_current_orphan(&runtime, false);
+        runtime.fail_in_order(["current_proof_readback"]);
+
+        assert_eq!(
+            backend
+                .recover_orphaned_current_ebpf_graph(current_recovery_request(false))
+                .await
+                .unwrap(),
+            CurrentEbpfGraphRecoveryOutcome::Partial(
+                CurrentEbpfGraphRecoveryProgress::Indeterminate
+            )
+        );
+        let graph = runtime.state().current_graphs[&pin_dir];
+        assert!(graph.proof_committed);
+        assert_eq!(graph.pins_remaining, CURRENT_PIN_COUNT);
+        assert_eq!(
+            backend
+                .recover_orphaned_current_ebpf_graph(current_recovery_request(false))
+                .await
+                .unwrap(),
+            CurrentEbpfGraphRecoveryOutcome::Removed
+        );
+    }
+
+    #[tokio::test]
+    async fn current_orphan_recovery_proof_failure_is_precommit_and_interruption_resumes() {
+        let (backend, runtime) = backend_with_fake();
+        let pin_dir = seed_current_orphan(&runtime, false);
+        let before = runtime.state().current_graphs[&pin_dir];
+        runtime.fail_in_order(["current_proof_commit"]);
+        assert_eq!(
+            backend
+                .recover_orphaned_current_ebpf_graph(current_recovery_request(false))
+                .await
+                .unwrap(),
+            CurrentEbpfGraphRecoveryOutcome::Refused(
+                CurrentEbpfGraphRecoveryRefusal::IndeterminateState
+            )
+        );
+        assert_eq!(runtime.state().current_graphs[&pin_dir], before);
+
+        runtime.fail_in_order(["current_cleanup_interrupted"]);
+        assert_eq!(
+            backend
+                .recover_orphaned_current_ebpf_graph(current_recovery_request(false))
+                .await
+                .unwrap(),
+            CurrentEbpfGraphRecoveryOutcome::Partial(
+                CurrentEbpfGraphRecoveryProgress::PinCleanupStarted
+            )
+        );
+        assert!(runtime.state().current_graphs[&pin_dir].proof_committed);
+        assert_eq!(
+            backend
+                .recover_orphaned_current_ebpf_graph(current_recovery_request(false))
+                .await
+                .unwrap(),
+            CurrentEbpfGraphRecoveryOutcome::Removed
+        );
     }
 
     #[tokio::test]
