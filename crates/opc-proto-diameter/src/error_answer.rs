@@ -970,24 +970,62 @@ impl DiameterRequestFailure {
             )?;
             let definition =
                 resolve_parser_definition(dictionaries, missing.key(), missing.definition())?;
-            let failed = if let Some(parent) = missing.parent() {
-                let located = locate_exact_top_level_avp(request, parent.offset(), parent.key())?;
-                let parent_definition =
-                    resolve_parser_definition(dictionaries, parent.key(), parent.definition())?;
-                if parent_definition.data_type() != AvpDataType::Grouped
-                    || error.decode_error().offset()
-                        != parent
-                            .offset()
-                            .checked_add(located.avp.header.header_len())
-                            .ok_or(DiameterFailureMappingError::ParserProvenanceMismatch)?
+            let failed = if let Some(outermost) = missing.ancestors().first() {
+                if missing.ancestors().len() > MAX_FAILED_AVP_HIERARCHY_DEPTH {
+                    return Err(DiameterFailureMappingError::ParserProvenanceMismatch);
+                }
+                let mut located_ancestors = Vec::with_capacity(missing.ancestors().len());
+                let located =
+                    locate_exact_top_level_avp(request, outermost.offset(), outermost.key())?;
+                let outer_definition = resolve_parser_definition(
+                    dictionaries,
+                    outermost.key(),
+                    outermost.definition(),
+                )?;
+                if outer_definition.data_type() != AvpDataType::Grouped {
+                    return Err(DiameterFailureMappingError::ParserProvenanceMismatch);
+                }
+                located_ancestors.push(located);
+
+                for ancestor in &missing.ancestors()[1..] {
+                    let definition = resolve_parser_definition(
+                        dictionaries,
+                        ancestor.key(),
+                        ancestor.definition(),
+                    )?;
+                    if definition.data_type() != AvpDataType::Grouped {
+                        return Err(DiameterFailureMappingError::ParserProvenanceMismatch);
+                    }
+                    let parent = located_ancestors
+                        .last()
+                        .ok_or(DiameterFailureMappingError::ParserProvenanceMismatch)?;
+                    located_ancestors.push(locate_exact_direct_grouped_child(
+                        &parent.avp,
+                        parent.offset,
+                        ancestor.offset(),
+                        ancestor.key(),
+                    )?);
+                }
+
+                let immediate = located_ancestors
+                    .last()
+                    .ok_or(DiameterFailureMappingError::ParserProvenanceMismatch)?;
+                if error.decode_error().offset()
+                    != immediate
+                        .offset
+                        .checked_add(immediate.avp.header.header_len())
+                        .ok_or(DiameterFailureMappingError::ParserProvenanceMismatch)?
                 {
                     return Err(DiameterFailureMappingError::ParserProvenanceMismatch);
                 }
-                DiameterFailedAvp::missing_for_definition(definition, encode_ctx)
-                    .and_then(|failed| {
-                        failed.within_group(&located.avp, located.offset, encode_ctx)
-                    })
-                    .map_err(DiameterFailureMappingError::FailedAvpEncoding)?
+                let mut failed = DiameterFailedAvp::missing_for_definition(definition, encode_ctx)
+                    .map_err(DiameterFailureMappingError::FailedAvpEncoding)?;
+                for located in located_ancestors.iter().rev() {
+                    failed = failed
+                        .within_group(&located.avp, located.offset, encode_ctx)
+                        .map_err(DiameterFailureMappingError::FailedAvpEncoding)?;
+                }
+                failed
             } else {
                 if error.decode_error().offset() != DIAMETER_HEADER_LEN {
                     return Err(DiameterFailureMappingError::ParserProvenanceMismatch);
@@ -2613,6 +2651,42 @@ fn locate_exact_top_level_avp<'a>(
                 Err(DiameterFailureMappingError::ParserProvenanceMismatch)
             };
         }
+    }
+    Err(DiameterFailureMappingError::ParserProvenanceMismatch)
+}
+
+fn locate_exact_direct_grouped_child<'a>(
+    parent: &RawAvp<'a>,
+    parent_offset: usize,
+    expected_offset: usize,
+    expected_key: AvpKey,
+) -> Result<LocatedAvp<'a>, DiameterFailureMappingError> {
+    let mut remaining = parent.value;
+    let mut offset = parent_offset
+        .checked_add(parent.header.header_len())
+        .ok_or(DiameterFailureMappingError::ParserProvenanceMismatch)?;
+    while !remaining.is_empty() {
+        let before = remaining.len();
+        let (next, child) = RawAvp::decode(remaining, mapping_decode_context())
+            .map_err(|_| DiameterFailureMappingError::RequestAvpFramingInvalid)?;
+        if offset > expected_offset {
+            break;
+        }
+        if offset == expected_offset {
+            return if child.header.key() == expected_key {
+                Ok(LocatedAvp { offset, avp: child })
+            } else {
+                Err(DiameterFailureMappingError::ParserProvenanceMismatch)
+            };
+        }
+        let consumed = before
+            .checked_sub(next.len())
+            .filter(|consumed| *consumed != 0)
+            .ok_or(DiameterFailureMappingError::RequestAvpFramingInvalid)?;
+        offset = offset
+            .checked_add(consumed)
+            .ok_or(DiameterFailureMappingError::ParserProvenanceMismatch)?;
+        remaining = next;
     }
     Err(DiameterFailureMappingError::ParserProvenanceMismatch)
 }

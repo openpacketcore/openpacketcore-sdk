@@ -8,6 +8,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Breaking: SWm DER non-overload access context — `opc-proto-diameter`:**
+  `SwmDiameterEapRequest` adds optional typed RFC 5777 `QoS-Capability`,
+  `Visited-Network-Identifier`, `AAA-Failure-Indication`, and reused
+  `High-Priority-Access-Info` fields. Existing struct literals initialize four
+  additional `None` values. `SwmDerAccessContext`, the redaction-safe
+  `SwmConditionalValue`, and the checked outbound builder distinguish absent,
+  local, UE, and AAA inputs without pretending provenance exists on the
+  Diameter wire. Its immutable result owns the typed request, encoded message,
+  and informational source snapshot; the ordinary builder remains
+  source-agnostic for compatibility and parser replay. QoS
+  profile templates are bounded, ordered, repeat-preserving, and retain
+  optional extensions under the configured unknown-AVP policy. Canonical
+  encoding uses TS 29.273 V19.2 flags; known receive-side M mismatches and
+  reserved indication bits are normalized exactly as the specification
+  requires. Missing QoS templates and required template children retain their
+  exact grouped hierarchy for request-bound 5005 generation.
+  Dictionary-aware conservative validation now honors explicitly
+  repeatable children inside known Grouped AVPs while undeclared children
+  remain singleton (#352). This focused DER slice excludes overload control
+  and does not close the remaining DEA/APN authorization-context work.
 - **Breaking: urgent SWm mobility/feature/local-address context — `opc-proto-diameter`:**
   `SwmDiameterEapRequest` adds optional typed MIP6 mobility capabilities,
   ordered Supported-Features offers, and a presence-redacted UE local IP;

@@ -5,7 +5,9 @@
 //! Session-Termination STR/STA and Abort-Session ASR/ASA lifecycle exchanges,
 //! including the deterministic successful-ASA transition to an administrative
 //! STR when Diameter session state is maintained, and the RAR/RAA then AAR/AAA
-//! authorization-information update sequence, plus a bounded
+//! authorization-information update sequence, the non-overload DER access
+//! context (QoS capabilities, visited PLMN, AAA failover, and priority), plus a
+//! bounded
 //! subscription-profile extension surface for APN-Configuration, its default
 //! Context-Identifier, Service-Selection, and the TS 29.273 emergency attach
 //! sequence. The top-level default pointer is accepted under the DEA
@@ -68,6 +70,12 @@ pub const AVP_EAP_MASTER_SESSION_KEY: AvpCode = AvpCode::new(464);
 pub const AVP_AUTH_REQUEST_TYPE: AvpCode = AvpCode::new(274);
 /// MIP6-Feature-Vector AVP code (RFC 5447 section 4.2.5).
 pub const AVP_MIP6_FEATURE_VECTOR: AvpCode = AvpCode::new(124);
+/// QoS-Capability grouped AVP code (RFC 5777 section 6).
+pub const AVP_QOS_CAPABILITY: AvpCode = AvpCode::new(578);
+/// QoS-Profile-Template grouped AVP code (RFC 5777 section 5.3).
+pub const AVP_QOS_PROFILE_TEMPLATE: AvpCode = AvpCode::new(574);
+/// QoS-Profile-Id AVP code (RFC 5777 section 5.2).
+pub const AVP_QOS_PROFILE_ID: AvpCode = AvpCode::new(573);
 /// Supported-Features grouped AVP code (3GPP TS 29.229 section 6.3.29).
 pub const AVP_SUPPORTED_FEATURES: AvpCode = AvpCode::new(628);
 /// Feature-List-ID AVP code (3GPP TS 29.229 section 6.3.30).
@@ -82,6 +90,10 @@ pub const AVP_AAR_FLAGS: AvpCode = AvpCode::new(1539);
 pub const AVP_UE_LOCAL_IP_ADDRESS: AvpCode = AvpCode::new(2805);
 /// High-Priority-Access-Info AVP code (3GPP TS 29.273 section 5.2.3.36).
 pub const AVP_HIGH_PRIORITY_ACCESS_INFO: AvpCode = AvpCode::new(1542);
+/// Visited-Network-Identifier AVP code (3GPP TS 29.273 section 9.2.3.1.2).
+pub const AVP_VISITED_NETWORK_IDENTIFIER: AvpCode = AvpCode::new(600);
+/// AAA-Failure-Indication AVP code (3GPP TS 29.273 section 8.2.3.21).
+pub const AVP_AAA_FAILURE_INDICATION: AvpCode = AvpCode::new(1518);
 /// State AVP code (RFC 4005 section 9.3.4).
 pub const AVP_STATE: AvpCode = AvpCode::new(24);
 /// Reply-Message AVP code (RFC 4005 section 4.9).
@@ -149,6 +161,8 @@ pub const SWM_FEATURE_LIST_ID: u32 = 1;
 pub const SWM_FEATURE_LIST: u32 = 0;
 
 const MAX_SWM_SUPPORTED_FEATURES: usize = 128;
+const MAX_SWM_QOS_PROFILE_TEMPLATES: usize = 128;
+const MAX_SWM_QOS_GROUP_CHILDREN: usize = 128;
 
 /// 3GPP SWm application definition.
 pub const APPLICATION: ApplicationDefinition = ApplicationDefinition::new(
@@ -158,7 +172,7 @@ pub const APPLICATION: ApplicationDefinition = ApplicationDefinition::new(
     SpecRef::new("3gpp", "TS29273", "SWm Diameter application"),
 );
 
-static SWM_REQUEST_AVP_RULES: [CommandAvpRule; 10] = [
+static SWM_REQUEST_AVP_RULES: [CommandAvpRule; 14] = [
     CommandAvpRule::new(
         AvpKey::ietf(base::AVP_SESSION_ID),
         AvpCardinality::ZeroOrOne,
@@ -184,12 +198,25 @@ static SWM_REQUEST_AVP_RULES: [CommandAvpRule; 10] = [
         AvpKey::ietf(AVP_MIP6_FEATURE_VECTOR),
         AvpCardinality::ZeroOrOne,
     ),
+    CommandAvpRule::new(AvpKey::ietf(AVP_QOS_CAPABILITY), AvpCardinality::ZeroOrOne),
+    CommandAvpRule::new(
+        AvpKey::vendor(AVP_VISITED_NETWORK_IDENTIFIER, VENDOR_ID_3GPP),
+        AvpCardinality::ZeroOrOne,
+    ),
+    CommandAvpRule::new(
+        AvpKey::vendor(AVP_AAA_FAILURE_INDICATION, VENDOR_ID_3GPP),
+        AvpCardinality::ZeroOrOne,
+    ),
     CommandAvpRule::new(
         AvpKey::vendor(AVP_SUPPORTED_FEATURES, VENDOR_ID_3GPP),
         AvpCardinality::ZeroOrMore,
     ),
     CommandAvpRule::new(
         AvpKey::vendor(AVP_UE_LOCAL_IP_ADDRESS, VENDOR_ID_3GPP),
+        AvpCardinality::ZeroOrOne,
+    ),
+    CommandAvpRule::new(
+        AvpKey::vendor(AVP_HIGH_PRIORITY_ACCESS_INFO, VENDOR_ID_3GPP),
         AvpCardinality::ZeroOrOne,
     ),
     CommandAvpRule::new(
@@ -285,6 +312,16 @@ static SUPPORTED_FEATURES_AVP_RULES: [CommandAvpRule; 3] = [
     ),
 ];
 
+static QOS_CAPABILITY_AVP_RULES: [CommandAvpRule; 1] = [CommandAvpRule::new(
+    AvpKey::ietf(AVP_QOS_PROFILE_TEMPLATE),
+    AvpCardinality::ZeroOrMore,
+)];
+
+static QOS_PROFILE_TEMPLATE_AVP_RULES: [CommandAvpRule; 2] = [
+    CommandAvpRule::new(AvpKey::ietf(base::AVP_VENDOR_ID), AvpCardinality::ZeroOrOne),
+    CommandAvpRule::new(AvpKey::ietf(AVP_QOS_PROFILE_ID), AvpCardinality::ZeroOrOne),
+];
+
 static OC_SUPPORTED_FEATURES_AVP_RULES: [CommandAvpRule; 1] = [CommandAvpRule::new(
     AvpKey::ietf(AVP_OC_FEATURE_VECTOR),
     AvpCardinality::ZeroOrOne,
@@ -350,7 +387,7 @@ pub const COMMAND_DIAMETER_EAP_ANSWER_PROJECTED_PROFILE: CommandDefinition =
     )
     .with_avp_rules(&SWM_PROJECTED_PROFILE_ANSWER_AVP_RULES);
 
-const SWM_AVPS: [AvpDefinition; 44] = [
+const SWM_AVPS: [AvpDefinition; 49] = [
     AvpDefinition::new(
         AvpKey::ietf(AVP_EAP_PAYLOAD),
         "EAP-Payload",
@@ -385,6 +422,31 @@ const SWM_AVPS: [AvpDefinition; 44] = [
         AvpDataType::Unsigned64,
         AvpFlagRules::base_optional(),
         SpecRef::new("ietf", "RFC5447", "4.2.5"),
+    ),
+    AvpDefinition::new(
+        AvpKey::ietf(AVP_QOS_CAPABILITY),
+        "QoS-Capability",
+        AvpDataType::Grouped,
+        // TS 29.273 requires canonical senders to set M, but table
+        // 7.2.3.1/1 note 2 requires receivers to ignore a known M mismatch.
+        AvpFlagRules::base_optional(),
+        SpecRef::new("ietf", "RFC5777", "6"),
+    )
+    .with_grouped_avp_rules(&QOS_CAPABILITY_AVP_RULES),
+    AvpDefinition::new(
+        AvpKey::ietf(AVP_QOS_PROFILE_TEMPLATE),
+        "QoS-Profile-Template",
+        AvpDataType::Grouped,
+        AvpFlagRules::base_mandatory(),
+        SpecRef::new("ietf", "RFC5777", "5.3"),
+    )
+    .with_grouped_avp_rules(&QOS_PROFILE_TEMPLATE_AVP_RULES),
+    AvpDefinition::new(
+        AvpKey::ietf(AVP_QOS_PROFILE_ID),
+        "QoS-Profile-Id",
+        AvpDataType::Unsigned32,
+        AvpFlagRules::base_mandatory(),
+        SpecRef::new("ietf", "RFC5777", "5.2"),
     ),
     AvpDefinition::new(
         AvpKey::vendor(AVP_SUPPORTED_FEATURES, VENDOR_ID_3GPP),
@@ -451,10 +513,32 @@ const SWM_AVPS: [AvpDefinition; 44] = [
         AvpDataType::Unsigned32,
         AvpFlagRules::new(
             FlagRequirement::MustBeSet,
-            FlagRequirement::MustBeUnset,
+            FlagRequirement::MayBeSet,
             FlagRequirement::MustBeUnset,
         ),
         SpecRef::new("3gpp", "TS29273", "5.2.3.36"),
+    ),
+    AvpDefinition::new(
+        AvpKey::vendor(AVP_VISITED_NETWORK_IDENTIFIER, VENDOR_ID_3GPP),
+        "Visited-Network-Identifier",
+        AvpDataType::OctetString,
+        AvpFlagRules::new(
+            FlagRequirement::MustBeSet,
+            FlagRequirement::MayBeSet,
+            FlagRequirement::MustBeUnset,
+        ),
+        SpecRef::new("3gpp", "TS29273", "9.2.3.1.2"),
+    ),
+    AvpDefinition::new(
+        AvpKey::vendor(AVP_AAA_FAILURE_INDICATION, VENDOR_ID_3GPP),
+        "AAA-Failure-Indication",
+        AvpDataType::Unsigned32,
+        AvpFlagRules::new(
+            FlagRequirement::MustBeSet,
+            FlagRequirement::MayBeSet,
+            FlagRequirement::MustBeUnset,
+        ),
+        SpecRef::new("3gpp", "TS29273", "8.2.3.21"),
     ),
     AvpDefinition::new(
         AvpKey::ietf(AVP_STATE),
@@ -1668,6 +1752,617 @@ impl fmt::Debug for SwmRequestedSupportedFeatures {
     }
 }
 
+/// Origin of one conditional value supplied at the DER construction boundary.
+///
+/// This provenance is application-side metadata. Diameter does not encode it,
+/// so the parser deliberately does not invent or reconstruct it from wire
+/// bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SwmConditionalValueSource {
+    /// Derived from trusted local configuration or local node capabilities.
+    LocallyConfigured,
+    /// Supplied by, or directly observed from, the UE-facing access boundary.
+    UeProvided,
+    /// Derived from authenticated AAA state or an AAA transport outcome.
+    AaaDerived,
+}
+
+/// One optional conditional value with explicit application-side provenance.
+///
+/// `Debug` reports only presence and source; the value is always redacted.
+#[derive(Clone, PartialEq, Eq, Default)]
+pub enum SwmConditionalValue<T> {
+    /// The condition does not apply or the value is unavailable.
+    #[default]
+    Absent,
+    /// A trusted local configuration or capability value.
+    LocallyConfigured(T),
+    /// A value supplied by, or directly observed from, the UE.
+    UeProvided(T),
+    /// A value derived from authenticated AAA state or a transport outcome.
+    AaaDerived(T),
+}
+
+impl<T> SwmConditionalValue<T> {
+    /// Return the provenance when a value is present.
+    #[must_use]
+    pub const fn source(&self) -> Option<SwmConditionalValueSource> {
+        match self {
+            Self::Absent => None,
+            Self::LocallyConfigured(_) => Some(SwmConditionalValueSource::LocallyConfigured),
+            Self::UeProvided(_) => Some(SwmConditionalValueSource::UeProvided),
+            Self::AaaDerived(_) => Some(SwmConditionalValueSource::AaaDerived),
+        }
+    }
+
+    /// Borrow the value without discarding its provenance.
+    #[must_use]
+    pub const fn value(&self) -> Option<&T> {
+        match self {
+            Self::Absent => None,
+            Self::LocallyConfigured(value) | Self::UeProvided(value) | Self::AaaDerived(value) => {
+                Some(value)
+            }
+        }
+    }
+}
+
+impl<T> fmt::Debug for SwmConditionalValue<T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Absent => formatter.write_str("Absent"),
+            Self::LocallyConfigured(_) => formatter.write_str("LocallyConfigured(<redacted>)"),
+            Self::UeProvided(_) => formatter.write_str("UeProvided(<redacted>)"),
+            Self::AaaDerived(_) => formatter.write_str("AaaDerived(<redacted>)"),
+        }
+    }
+}
+
+/// Field identifying a redaction-safe DER access-context validation failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SwmDerAccessContextField {
+    /// QoS-Capability.
+    QosCapability,
+    /// Visited-Network-Identifier.
+    VisitedNetworkIdentifier,
+    /// AAA-Failure-Indication.
+    AaaFailureIndication,
+    /// High-Priority-Access-Info.
+    HighPriorityAccessInfo,
+}
+
+/// Stable failure classes for DER access-context construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SwmDerAccessContextErrorCode {
+    /// A checked build was given a request with an already populated context field.
+    PrepopulatedField,
+    /// A field was supplied from a source prohibited by its 3GPP condition.
+    InvalidProvenance,
+    /// A PLMN-derived visited-network identifier is malformed.
+    InvalidVisitedNetworkIdentifier,
+    /// QoS-Capability contains no profile template.
+    EmptyQosCapability,
+    /// QoS-Capability exceeds the defensive profile-template bound.
+    TooManyQosProfiles,
+    /// A presence-significant indication is present without its defined bit.
+    InactiveIndication,
+}
+
+/// Redaction-safe DER access-context construction failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SwmDerAccessContextError {
+    code: SwmDerAccessContextErrorCode,
+    field: SwmDerAccessContextField,
+}
+
+impl SwmDerAccessContextError {
+    const fn new(code: SwmDerAccessContextErrorCode, field: SwmDerAccessContextField) -> Self {
+        Self { code, field }
+    }
+
+    /// Return the stable failure class.
+    #[must_use]
+    pub const fn code(self) -> SwmDerAccessContextErrorCode {
+        self.code
+    }
+
+    /// Return the field that failed validation.
+    #[must_use]
+    pub const fn field(self) -> SwmDerAccessContextField {
+        self.field
+    }
+}
+
+impl fmt::Display for SwmDerAccessContextError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "invalid SWm DER access context ({:?}, {:?})",
+            self.field, self.code
+        )
+    }
+}
+
+impl Error for SwmDerAccessContextError {}
+
+/// Canonical TS 29.273 visited-network domain derived from a PLMN.
+///
+/// The wire value is sensitive topology context and is redacted from `Debug`.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct SwmVisitedNetworkIdentifier(String);
+
+impl SwmVisitedNetworkIdentifier {
+    /// Construct `mnc<MNC>.mcc<MCC>.3gppnetwork.org` from decimal PLMN parts.
+    ///
+    /// MCC must contain three digits. MNC may contain two or three digits; a
+    /// two-digit MNC is canonicalized with the required leading zero.
+    pub fn new(mcc: &str, mnc: &str) -> Result<Self, SwmDerAccessContextError> {
+        let valid_mcc = mcc.len() == 3 && mcc.as_bytes().iter().all(u8::is_ascii_digit);
+        let valid_mnc = matches!(mnc.len(), 2 | 3) && mnc.as_bytes().iter().all(u8::is_ascii_digit);
+        if !valid_mcc || !valid_mnc {
+            return Err(SwmDerAccessContextError::new(
+                SwmDerAccessContextErrorCode::InvalidVisitedNetworkIdentifier,
+                SwmDerAccessContextField::VisitedNetworkIdentifier,
+            ));
+        }
+        let normalized_mnc = if mnc.len() == 2 {
+            format!("0{mnc}")
+        } else {
+            mnc.to_owned()
+        };
+        Ok(Self(format!(
+            "mnc{normalized_mnc}.mcc{mcc}.3gppnetwork.org"
+        )))
+    }
+
+    /// Return the canonical wire value.
+    ///
+    /// Callers must treat this as sensitive network-topology data.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    fn from_wire(value: &[u8], value_offset: usize) -> Result<Self, DecodeError> {
+        const WIRE_LEN: usize = 29;
+        let valid = value.len() == WIRE_LEN
+            && &value[0..3] == b"mnc"
+            && value[3..6].iter().all(u8::is_ascii_digit)
+            && value[6] == b'.'
+            && &value[7..10] == b"mcc"
+            && value[10..13].iter().all(u8::is_ascii_digit)
+            && value[13] == b'.'
+            && &value[14..] == b"3gppnetwork.org";
+        if !valid {
+            return Err(DecodeError::new(
+                DecodeErrorCode::Structural {
+                    reason:
+                        "Visited-Network-Identifier must use the canonical 3GPP PLMN domain form",
+                },
+                value_offset,
+            )
+            .with_spec_ref(SpecRef::new("3gpp", "TS29273", "9.2.3.1.2")));
+        }
+        let value = std::str::from_utf8(value).map_err(|_| {
+            DecodeError::new(
+                DecodeErrorCode::Structural {
+                    reason: "Visited-Network-Identifier must contain ASCII",
+                },
+                value_offset,
+            )
+            .with_spec_ref(SpecRef::new("3gpp", "TS29273", "9.2.3.1.2"))
+        })?;
+        Ok(Self(value.to_owned()))
+    }
+}
+
+impl fmt::Debug for SwmVisitedNetworkIdentifier {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SwmVisitedNetworkIdentifier(<redacted>)")
+    }
+}
+
+/// Typed AAA-Failure-Indication asserting that an assigned AAA server failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SwmAaaFailureIndication;
+
+impl SwmAaaFailureIndication {
+    /// Construct the defined `AAA Failure` indication (bit zero).
+    #[must_use]
+    pub const fn previously_assigned_server_unavailable() -> Self {
+        Self
+    }
+
+    const fn value(self) -> u32 {
+        1
+    }
+}
+
+/// One `(Vendor-Id, QoS-Profile-Id)` capability template.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SwmQosProfileTemplate {
+    vendor_id: VendorId,
+    profile_id: u32,
+    additional_avps: Vec<SwmAdditionalAvp>,
+}
+
+impl SwmQosProfileTemplate {
+    /// Construct a profile-template identity without extension children.
+    #[must_use]
+    pub const fn new(vendor_id: VendorId, profile_id: u32) -> Self {
+        Self {
+            vendor_id,
+            profile_id,
+            additional_avps: Vec::new(),
+        }
+    }
+
+    /// Construct the IETF Diameter QoS profile defined by RFC 5624.
+    #[must_use]
+    pub const fn ietf_diameter() -> Self {
+        Self::new(VendorId::new(0), 0)
+    }
+
+    /// Return the profile namespace.
+    #[must_use]
+    pub const fn vendor_id(&self) -> VendorId {
+        self.vendor_id
+    }
+
+    /// Return the profile identifier within its vendor namespace.
+    #[must_use]
+    pub const fn profile_id(&self) -> u32 {
+        self.profile_id
+    }
+
+    /// Return preserved optional extension children in wire order.
+    #[must_use]
+    pub fn additional_avps(&self) -> &[SwmAdditionalAvp] {
+        &self.additional_avps
+    }
+}
+
+impl fmt::Debug for SwmQosProfileTemplate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SwmQosProfileTemplate")
+            .field("vendor_id", &self.vendor_id)
+            .field("profile_id", &"<redacted>")
+            .field("additional_avp_count", &self.additional_avps.len())
+            .finish()
+    }
+}
+
+/// Bounded ordered QoS profile capabilities carried by a DER.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SwmQosCapability {
+    profiles: Vec<SwmQosProfileTemplate>,
+    additional_avps: Vec<SwmAdditionalAvp>,
+}
+
+impl SwmQosCapability {
+    /// Construct a non-empty, bounded QoS capability list.
+    pub fn new(profiles: Vec<SwmQosProfileTemplate>) -> Result<Self, SwmDerAccessContextError> {
+        validate_qos_profiles(&profiles)?;
+        Ok(Self {
+            profiles,
+            additional_avps: Vec::new(),
+        })
+    }
+
+    /// Return ordered profile templates.
+    #[must_use]
+    pub fn profiles(&self) -> &[SwmQosProfileTemplate] {
+        &self.profiles
+    }
+
+    /// Return preserved optional extension children in wire order.
+    #[must_use]
+    pub fn additional_avps(&self) -> &[SwmAdditionalAvp] {
+        &self.additional_avps
+    }
+}
+
+impl fmt::Debug for SwmQosCapability {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SwmQosCapability")
+            .field("profile_count", &self.profiles.len())
+            .field("additional_avp_count", &self.additional_avps.len())
+            .finish()
+    }
+}
+
+/// Informational source snapshot retained by a checked outbound DER build.
+///
+/// Diameter does not carry this metadata. The parser therefore returns only
+/// the typed wire values and cannot create this snapshot. This type has no
+/// public constructor; it is produced together with the exact encoded request
+/// by [`build_swm_diameter_eap_request_with_access_context`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SwmDerAccessContextSourceSnapshot {
+    qos_capability: Option<SwmConditionalValueSource>,
+    visited_network_identifier: Option<SwmConditionalValueSource>,
+    aaa_failure_indication: Option<SwmConditionalValueSource>,
+    high_priority_access_info: Option<SwmConditionalValueSource>,
+}
+
+impl SwmDerAccessContextSourceSnapshot {
+    /// Return the QoS-Capability source, or `None` when absent.
+    #[must_use]
+    pub const fn qos_capability(self) -> Option<SwmConditionalValueSource> {
+        self.qos_capability
+    }
+
+    /// Return the Visited-Network-Identifier source, or `None` when absent.
+    #[must_use]
+    pub const fn visited_network_identifier(self) -> Option<SwmConditionalValueSource> {
+        self.visited_network_identifier
+    }
+
+    /// Return the AAA-Failure-Indication source, or `None` when absent.
+    #[must_use]
+    pub const fn aaa_failure_indication(self) -> Option<SwmConditionalValueSource> {
+        self.aaa_failure_indication
+    }
+
+    /// Return the High-Priority-Access-Info source, or `None` when absent.
+    #[must_use]
+    pub const fn high_priority_access_info(self) -> Option<SwmConditionalValueSource> {
+        self.high_priority_access_info
+    }
+}
+
+/// Product-neutral application-side inputs for conditional DER access AVPs.
+///
+/// The checked outbound builder accepts locally configured QoS and PLMN
+/// context, AAA-derived server-failure state, and UE-provided priority state.
+/// It rejects every other source before encoding. The request's public wire
+/// fields remain directly accessible for parser replay and API compatibility;
+/// direct assignment is source-agnostic and produces no source snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SwmDerAccessContext {
+    /// Locally configured QoS profile capabilities.
+    pub qos_capability: SwmConditionalValue<SwmQosCapability>,
+    /// Locally configured visited PLMN identity; absent for home access.
+    pub visited_network_identifier: SwmConditionalValue<SwmVisitedNetworkIdentifier>,
+    /// AAA-derived evidence that the previously assigned server is unavailable.
+    pub aaa_failure_indication: SwmConditionalValue<SwmAaaFailureIndication>,
+    /// UE-provided access-priority indication admitted by local policy.
+    pub high_priority_access_info: SwmConditionalValue<SwmHighPriorityAccessInfo>,
+}
+
+impl SwmDerAccessContext {
+    fn apply_to(
+        self,
+        request: &mut SwmDiameterEapRequest,
+    ) -> Result<SwmDerAccessContextSourceSnapshot, SwmDerAccessContextError> {
+        for (present, field) in [
+            (
+                request.qos_capability.is_some(),
+                SwmDerAccessContextField::QosCapability,
+            ),
+            (
+                request.visited_network_identifier.is_some(),
+                SwmDerAccessContextField::VisitedNetworkIdentifier,
+            ),
+            (
+                request.aaa_failure_indication.is_some(),
+                SwmDerAccessContextField::AaaFailureIndication,
+            ),
+            (
+                request.high_priority_access_info.is_some(),
+                SwmDerAccessContextField::HighPriorityAccessInfo,
+            ),
+        ] {
+            if present {
+                return Err(SwmDerAccessContextError::new(
+                    SwmDerAccessContextErrorCode::PrepopulatedField,
+                    field,
+                ));
+            }
+        }
+
+        let source_snapshot = SwmDerAccessContextSourceSnapshot {
+            qos_capability: self.qos_capability.source(),
+            visited_network_identifier: self.visited_network_identifier.source(),
+            aaa_failure_indication: self.aaa_failure_indication.source(),
+            high_priority_access_info: self.high_priority_access_info.source(),
+        };
+        let qos_capability = value_from_expected_source(
+            self.qos_capability,
+            SwmConditionalValueSource::LocallyConfigured,
+            SwmDerAccessContextField::QosCapability,
+        )?;
+        if let Some(capability) = qos_capability.as_ref() {
+            validate_qos_profiles(capability.profiles())?;
+        }
+        let visited_network_identifier = value_from_expected_source(
+            self.visited_network_identifier,
+            SwmConditionalValueSource::LocallyConfigured,
+            SwmDerAccessContextField::VisitedNetworkIdentifier,
+        )?;
+        let aaa_failure_indication = value_from_expected_source(
+            self.aaa_failure_indication,
+            SwmConditionalValueSource::AaaDerived,
+            SwmDerAccessContextField::AaaFailureIndication,
+        )?;
+        let high_priority_access_info = value_from_expected_source(
+            self.high_priority_access_info,
+            SwmConditionalValueSource::UeProvided,
+            SwmDerAccessContextField::HighPriorityAccessInfo,
+        )?;
+        if high_priority_access_info.is_some_and(|information| !information.is_configured()) {
+            return Err(SwmDerAccessContextError::new(
+                SwmDerAccessContextErrorCode::InactiveIndication,
+                SwmDerAccessContextField::HighPriorityAccessInfo,
+            ));
+        }
+
+        request.qos_capability = qos_capability;
+        request.visited_network_identifier = visited_network_identifier;
+        request.aaa_failure_indication = aaa_failure_indication;
+        request.high_priority_access_info = high_priority_access_info;
+        Ok(source_snapshot)
+    }
+}
+
+/// Checked outbound DER request with its informational source snapshot.
+///
+/// The typed request, encoded message, and source snapshot are created in one
+/// operation and exposed immutably while this wrapper is retained.
+pub struct SwmBuiltDerAccessContextRequest {
+    request: SwmDiameterEapRequest,
+    message: OwnedMessage,
+    source_snapshot: SwmDerAccessContextSourceSnapshot,
+}
+
+impl SwmBuiltDerAccessContextRequest {
+    /// Borrow the exact typed request that was encoded.
+    #[must_use]
+    pub const fn request(&self) -> &SwmDiameterEapRequest {
+        &self.request
+    }
+
+    /// Borrow the exact encoded Diameter request.
+    #[must_use]
+    pub const fn message(&self) -> &OwnedMessage {
+        &self.message
+    }
+
+    /// Return the informational source snapshot captured during construction.
+    #[must_use]
+    pub const fn source_snapshot(&self) -> SwmDerAccessContextSourceSnapshot {
+        self.source_snapshot
+    }
+
+    /// Consume the wrapper and recover its original construction outputs.
+    ///
+    /// After separation, the SDK can no longer keep later request mutations
+    /// coupled to the snapshot; the snapshot describes only the returned
+    /// encoded message and request at construction time.
+    #[must_use]
+    pub fn into_parts(
+        self,
+    ) -> (
+        SwmDiameterEapRequest,
+        OwnedMessage,
+        SwmDerAccessContextSourceSnapshot,
+    ) {
+        (self.request, self.message, self.source_snapshot)
+    }
+}
+
+impl fmt::Debug for SwmBuiltDerAccessContextRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SwmBuiltDerAccessContextRequest")
+            .field("request", &"<redacted>")
+            .field("message", &"<redacted>")
+            .field("source_snapshot", &self.source_snapshot)
+            .finish()
+    }
+}
+
+/// Failure from checked outbound DER access-context construction.
+#[derive(Debug)]
+pub enum SwmDerAccessContextBuildError {
+    /// The conditional values or their source metadata were invalid.
+    Context(SwmDerAccessContextError),
+    /// The resulting typed request could not be encoded.
+    Encode(EncodeError),
+}
+
+impl SwmDerAccessContextBuildError {
+    /// Borrow the access-context error, when validation failed before encoding.
+    #[must_use]
+    pub const fn context_error(&self) -> Option<SwmDerAccessContextError> {
+        match self {
+            Self::Context(error) => Some(*error),
+            Self::Encode(_) => None,
+        }
+    }
+}
+
+impl fmt::Display for SwmDerAccessContextBuildError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Context(error) => error.fmt(formatter),
+            Self::Encode(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl Error for SwmDerAccessContextBuildError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Context(error) => Some(error),
+            Self::Encode(error) => Some(error),
+        }
+    }
+}
+
+impl From<SwmDerAccessContextError> for SwmDerAccessContextBuildError {
+    fn from(error: SwmDerAccessContextError) -> Self {
+        Self::Context(error)
+    }
+}
+
+impl From<EncodeError> for SwmDerAccessContextBuildError {
+    fn from(error: EncodeError) -> Self {
+        Self::Encode(error)
+    }
+}
+
+fn value_from_expected_source<T>(
+    value: SwmConditionalValue<T>,
+    expected: SwmConditionalValueSource,
+    field: SwmDerAccessContextField,
+) -> Result<Option<T>, SwmDerAccessContextError> {
+    match value {
+        SwmConditionalValue::Absent => Ok(None),
+        SwmConditionalValue::LocallyConfigured(value)
+            if expected == SwmConditionalValueSource::LocallyConfigured =>
+        {
+            Ok(Some(value))
+        }
+        SwmConditionalValue::UeProvided(value)
+            if expected == SwmConditionalValueSource::UeProvided =>
+        {
+            Ok(Some(value))
+        }
+        SwmConditionalValue::AaaDerived(value)
+            if expected == SwmConditionalValueSource::AaaDerived =>
+        {
+            Ok(Some(value))
+        }
+        SwmConditionalValue::LocallyConfigured(_)
+        | SwmConditionalValue::UeProvided(_)
+        | SwmConditionalValue::AaaDerived(_) => Err(SwmDerAccessContextError::new(
+            SwmDerAccessContextErrorCode::InvalidProvenance,
+            field,
+        )),
+    }
+}
+
+fn validate_qos_profiles(
+    profiles: &[SwmQosProfileTemplate],
+) -> Result<(), SwmDerAccessContextError> {
+    if profiles.is_empty() {
+        return Err(SwmDerAccessContextError::new(
+            SwmDerAccessContextErrorCode::EmptyQosCapability,
+            SwmDerAccessContextField::QosCapability,
+        ));
+    }
+    if profiles.len() > MAX_SWM_QOS_PROFILE_TEMPLATES {
+        return Err(SwmDerAccessContextError::new(
+            SwmDerAccessContextErrorCode::TooManyQosProfiles,
+            SwmDerAccessContextField::QosCapability,
+        ));
+    }
+    Ok(())
+}
+
 /// PDN-Type values (3GPP TS 29.272 §7.3.62).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PdnType {
@@ -1784,6 +2479,12 @@ pub struct SwmDiameterEapRequest {
     pub service_selection: Option<Redacted<String>>,
     /// Mobility capabilities advertised to the AAA server.
     pub mip6_feature_vector: Option<SwmMip6FeatureVector>,
+    /// Ordered QoS profile templates supported by this ePDG.
+    pub qos_capability: Option<SwmQosCapability>,
+    /// Visited PLMN identifier; present only for roaming access.
+    pub visited_network_identifier: Option<SwmVisitedNetworkIdentifier>,
+    /// Indication that a previously assigned AAA server is unavailable.
+    pub aaa_failure_indication: Option<SwmAaaFailureIndication>,
     /// Ordered 3GPP Supported-Features groups offered to the AAA server.
     pub supported_features: Vec<SwmRequestedSupportedFeatures>,
     /// UE local address used for this access (presence-only in diagnostics).
@@ -1796,6 +2497,8 @@ pub struct SwmDiameterEapRequest {
     pub emergency_services: Option<SwmEmergencyServices>,
     /// Optional device identity forwarded after DEVICE_IDENTITY recovery.
     pub terminal_information: Option<SwmTerminalInformation>,
+    /// UE access-priority indication admitted by local policy.
+    pub high_priority_access_info: Option<SwmHighPriorityAccessInfo>,
     /// Ordered opaque State AVP values (only their count appears in diagnostics).
     pub state_avps: Vec<Vec<u8>>,
 }
@@ -1816,6 +2519,18 @@ impl std::fmt::Debug for SwmDiameterEapRequest {
                 "mip6_feature_vector",
                 &self.mip6_feature_vector.map(|_| "<redacted>"),
             )
+            .field(
+                "qos_capability",
+                &self.qos_capability.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "visited_network_identifier",
+                &self
+                    .visited_network_identifier
+                    .as_ref()
+                    .map(|_| "<redacted>"),
+            )
+            .field("aaa_failure_indication", &self.aaa_failure_indication)
             .field("supported_features", &self.supported_features.len())
             .field(
                 "ue_local_ip_address",
@@ -1825,6 +2540,7 @@ impl std::fmt::Debug for SwmDiameterEapRequest {
             .field("eap_payload", &self.eap_payload)
             .field("emergency_services", &self.emergency_services)
             .field("terminal_information", &self.terminal_information)
+            .field("high_priority_access_info", &self.high_priority_access_info)
             .field("state_avps", &self.state_avps.len())
             .finish()
     }
@@ -2000,8 +2716,38 @@ impl SwmDiameterEapRequest {
         }
         validate_request_mobility_features(self.mip6_feature_vector)
             .map_err(|reason| encode_structural_error(reason, "7.2.3.1"))?;
+        if let Some(qos_capability) = self.qos_capability.as_ref() {
+            validate_qos_profiles(qos_capability.profiles()).map_err(|error| {
+                let reason = match error.code() {
+                    SwmDerAccessContextErrorCode::EmptyQosCapability => {
+                        "SWm DER QoS-Capability requires at least one profile template"
+                    }
+                    SwmDerAccessContextErrorCode::TooManyQosProfiles => {
+                        "SWm DER QoS-Capability contains too many profile templates"
+                    }
+                    SwmDerAccessContextErrorCode::InactiveIndication => {
+                        "SWm DER QoS-Capability is invalid"
+                    }
+                    SwmDerAccessContextErrorCode::PrepopulatedField
+                    | SwmDerAccessContextErrorCode::InvalidProvenance
+                    | SwmDerAccessContextErrorCode::InvalidVisitedNetworkIdentifier => {
+                        "SWm DER QoS-Capability is invalid"
+                    }
+                };
+                encode_structural_error(reason, "6")
+            })?;
+        }
         validate_requested_supported_features(&self.supported_features)
             .map_err(|reason| encode_structural_error(reason, "6.3.29"))?;
+        if self
+            .high_priority_access_info
+            .is_some_and(|info| !info.is_configured())
+        {
+            return Err(encode_structural_error(
+                "SWm DER High-Priority-Access-Info must set HPA_Configured when present",
+                "5.2.3.36",
+            ));
+        }
         if let Some(terminal) = self.terminal_information.as_ref() {
             if let Some(software_version) = terminal.software_version.as_ref() {
                 let value = software_version.as_ref().as_bytes();
@@ -2235,7 +2981,12 @@ fn classify_outer_eap_packet(payload: &[u8]) -> Option<OuterEapPacketCode> {
     }
 }
 
-/// Build a SWm Diameter-EAP-Request message.
+/// Build a SWm Diameter-EAP-Request message from its typed wire model.
+///
+/// This compatibility and parser-replay boundary validates wire semantics but
+/// has no knowledge of where conditional access-context values originated.
+/// New outbound integrations that supply those values should use
+/// [`build_swm_diameter_eap_request_with_access_context`] instead.
 pub fn build_swm_diameter_eap_request(
     request: &SwmDiameterEapRequest,
     hop_by_hop_identifier: u32,
@@ -2332,6 +3083,27 @@ pub fn build_swm_diameter_eap_request(
             ctx,
         )?;
     }
+    if let Some(qos_capability) = request.qos_capability.as_ref() {
+        append_qos_capability_avp(&mut raw_avps, qos_capability, ctx)?;
+    }
+    if let Some(visited_network_identifier) = request.visited_network_identifier.as_ref() {
+        builder_helpers::append_avp(
+            &mut raw_avps,
+            AvpHeader::vendor(AVP_VISITED_NETWORK_IDENTIFIER, VENDOR_ID_3GPP, true),
+            visited_network_identifier.as_str().as_bytes(),
+            ctx,
+        )?;
+    }
+    if let Some(aaa_failure_indication) = request.aaa_failure_indication {
+        builder_helpers::append_vendor_u32_avp(
+            &mut raw_avps,
+            AVP_AAA_FAILURE_INDICATION,
+            VENDOR_ID_3GPP,
+            aaa_failure_indication.value(),
+            false,
+            ctx,
+        )?;
+    }
     for supported_features in &request.supported_features {
         append_supported_features_avp(
             &mut raw_avps,
@@ -2366,6 +3138,16 @@ pub fn build_swm_diameter_eap_request(
     if let Some(terminal_information) = request.terminal_information.as_ref() {
         append_terminal_information_avp(&mut raw_avps, terminal_information, ctx)?;
     }
+    if let Some(high_priority_access_info) = request.high_priority_access_info {
+        builder_helpers::append_vendor_u32_avp(
+            &mut raw_avps,
+            AVP_HIGH_PRIORITY_ACCESS_INFO,
+            VENDOR_ID_3GPP,
+            high_priority_access_info.value(),
+            false,
+            ctx,
+        )?;
+    }
     builder_helpers::append_octet_string_avp(
         &mut raw_avps,
         AVP_EAP_PAYLOAD,
@@ -2383,6 +3165,34 @@ pub fn build_swm_diameter_eap_request(
         ctx,
         "DER",
     )
+}
+
+/// Validate conditional access-context sources and build one outbound DER.
+///
+/// The four raw context fields on `request` must initially be absent. This
+/// prevents checked context from being silently combined with independently
+/// populated wire fields. Validation and application happen on a clone, so a
+/// failure never modifies the caller's request.
+pub fn build_swm_diameter_eap_request_with_access_context(
+    request: &SwmDiameterEapRequest,
+    access_context: SwmDerAccessContext,
+    hop_by_hop_identifier: u32,
+    end_to_end_identifier: u32,
+    ctx: EncodeContext,
+) -> Result<SwmBuiltDerAccessContextRequest, SwmDerAccessContextBuildError> {
+    let mut request = request.clone();
+    let source_snapshot = access_context.apply_to(&mut request)?;
+    let message = build_swm_diameter_eap_request(
+        &request,
+        hop_by_hop_identifier,
+        end_to_end_identifier,
+        ctx,
+    )?;
+    Ok(SwmBuiltDerAccessContextRequest {
+        request,
+        message,
+        source_snapshot,
+    })
 }
 
 /// Parse a SWm Diameter-EAP-Request message.
@@ -2418,15 +3228,20 @@ pub fn parse_swm_diameter_eap_request_with_provenance(
     let mut rat_type = None;
     let mut service_selection = None;
     let mut mip6_feature_vector = None;
+    let mut qos_capability = None;
+    let mut visited_network_identifier = None;
+    let mut aaa_failure_indication = None;
     let mut supported_features = Vec::new();
     let mut ue_local_ip_address = None;
     let mut auth_request_type = None;
     let mut eap_payload = None;
     let mut emergency_services = None;
     let mut terminal_information = None;
+    let mut high_priority_access_info = None;
     let mut state_avps = Vec::new();
     let mut terminal_missing_imei = None;
     let mut supported_features_missing_child = None;
+    let mut qos_missing_child = None;
     let parse_result = builder_helpers::for_each_avp(
         message.raw_avps,
         ctx,
@@ -2455,6 +3270,40 @@ pub fn parse_swm_diameter_eap_request_with_provenance(
                         SwmRatType::from_value(value),
                         offset,
                         "5.3.31",
+                    )?;
+                } else if code == AVP_VISITED_NETWORK_IDENTIFIER && vendor_id == VENDOR_ID_3GPP {
+                    validate_3gpp_m_bit_agnostic_flags(
+                        &avp.header,
+                        offset,
+                        "TS29273",
+                        "9.2.3.1.2",
+                    )?;
+                    let value = SwmVisitedNetworkIdentifier::from_wire(avp.value, value_offset)?;
+                    builder_helpers::set_once(
+                        &mut visited_network_identifier,
+                        value,
+                        offset,
+                        "9.2.3.1.2",
+                    )?;
+                } else if code == AVP_AAA_FAILURE_INDICATION && vendor_id == VENDOR_ID_3GPP {
+                    validate_3gpp_m_bit_agnostic_flags(&avp.header, offset, "TS29273", "8.2.3.21")?;
+                    let value =
+                        builder_helpers::parse_u32_value(avp.value, value_offset, "8.2.3.21")?;
+                    if value & 1 == 0 {
+                        return Err(DecodeError::new(
+                            DecodeErrorCode::Structural {
+                                reason:
+                                    "AAA-Failure-Indication must set the defined AAA Failure bit",
+                            },
+                            value_offset,
+                        )
+                        .with_spec_ref(SpecRef::new("3gpp", "TS29273", "8.2.3.21")));
+                    }
+                    builder_helpers::set_once(
+                        &mut aaa_failure_indication,
+                        SwmAaaFailureIndication::previously_assigned_server_unavailable(),
+                        offset,
+                        "8.2.3.21",
                     )?;
                 } else if code == AVP_TERMINAL_INFORMATION && vendor_id == VENDOR_ID_3GPP {
                     validate_3gpp_mandatory_flags(&avp.header, offset, "7.3.3")?;
@@ -2495,6 +3344,25 @@ pub fn parse_swm_diameter_eap_request_with_provenance(
                         .map_err(|error| {
                             error.with_spec_ref(SpecRef::new("3gpp", "TS29212", "5.3.96"))
                         })?;
+                } else if code == AVP_HIGH_PRIORITY_ACCESS_INFO && vendor_id == VENDOR_ID_3GPP {
+                    validate_3gpp_m_bit_agnostic_flags(&avp.header, offset, "TS29273", "5.2.3.36")?;
+                    let value =
+                        builder_helpers::parse_u32_value(avp.value, value_offset, "5.2.3.36")?;
+                    if value & 1 == 0 {
+                        return Err(DecodeError::new(
+                            DecodeErrorCode::Structural {
+                                reason: "High-Priority-Access-Info must set HPA_Configured when present",
+                            },
+                            value_offset,
+                        )
+                        .with_spec_ref(SpecRef::new("3gpp", "TS29273", "5.2.3.36")));
+                    }
+                    builder_helpers::set_once(
+                        &mut high_priority_access_info,
+                        SwmHighPriorityAccessInfo::from_value(value),
+                        offset,
+                        "5.2.3.36",
+                    )?;
                 } else {
                     builder_helpers::handle_unknown_avp(ctx, &avp, offset, "DER")?;
                 }
@@ -2549,6 +3417,23 @@ pub fn parse_swm_diameter_eap_request_with_provenance(
                     offset,
                     "4.2.5",
                 )?;
+            } else if code == AVP_QOS_CAPABILITY {
+                validate_base_m_bit_agnostic_flags_for(&avp.header, offset, "RFC5777", "6")?;
+                match parse_qos_capability(avp.value, ctx, value_offset, 1) {
+                    Ok(value) => {
+                        builder_helpers::set_once(&mut qos_capability, value, offset, "6")?
+                    }
+                    Err(QosCapabilityParseError::Missing {
+                        error,
+                        key,
+                        profile_offset,
+                    }) => {
+                        let error = *error;
+                        qos_missing_child = Some((error.clone(), key, offset, profile_offset));
+                        return Err(error);
+                    }
+                    Err(QosCapabilityParseError::Decode(error)) => return Err(error),
+                }
             } else if code == AVP_AUTH_REQUEST_TYPE {
                 let value = builder_helpers::parse_u32_value(avp.value, value_offset, "8.7")?;
                 builder_helpers::set_once(
@@ -2573,6 +3458,43 @@ pub fn parse_swm_diameter_eap_request_with_provenance(
         },
     );
     if let Err(error) = parse_result {
+        if let Some((missing_error, key, capability_offset, profile_offset)) = qos_missing_child {
+            let child = base::dictionary()
+                .find_avp(key)
+                .or_else(|| dictionary().find_avp(key));
+            let capability = dictionary().find_avp(AvpKey::ietf(AVP_QOS_CAPABILITY));
+            let profile = dictionary().find_avp(AvpKey::ietf(AVP_QOS_PROFILE_TEMPLATE));
+            return Err(match (child, capability, profile_offset, profile) {
+                (
+                    Some(definition),
+                    Some(capability_definition),
+                    Some(profile_offset),
+                    Some(profile_definition),
+                ) => DiameterParserError::missing_with_ancestors(
+                    message,
+                    missing_error,
+                    definition,
+                    &[
+                        (capability_definition, capability_offset),
+                        (profile_definition, profile_offset),
+                    ],
+                    APPLICATION_ID,
+                    COMMAND_DIAMETER_EAP,
+                ),
+                (Some(definition), Some(capability_definition), None, _) => {
+                    DiameterParserError::missing_with_parent(
+                        message,
+                        missing_error,
+                        definition,
+                        capability_definition,
+                        capability_offset,
+                        APPLICATION_ID,
+                        COMMAND_DIAMETER_EAP,
+                    )
+                }
+                _ => DiameterParserError::decoded(message, error),
+            });
+        }
         if let Some((missing_error, key, parent_offset)) = supported_features_missing_child {
             let child = base::dictionary()
                 .find_avp(key)
@@ -2669,6 +3591,9 @@ pub fn parse_swm_diameter_eap_request_with_provenance(
         rat_type,
         service_selection,
         mip6_feature_vector,
+        qos_capability,
+        visited_network_identifier,
+        aaa_failure_indication,
         supported_features,
         ue_local_ip_address,
         auth_request_type: require_swm_request_field(
@@ -2687,6 +3612,7 @@ pub fn parse_swm_diameter_eap_request_with_provenance(
         )?,
         emergency_services,
         terminal_information,
+        high_priority_access_info,
         state_avps,
     };
     validate_decoded_request(&request)
@@ -3237,6 +4163,15 @@ fn validate_base_mandatory_flags(
     offset: usize,
     section: &'static str,
 ) -> Result<(), DecodeError> {
+    validate_base_mandatory_flags_for(header, offset, "RFC6733", section)
+}
+
+fn validate_base_mandatory_flags_for(
+    header: &AvpHeader,
+    offset: usize,
+    document: &'static str,
+    section: &'static str,
+) -> Result<(), DecodeError> {
     if header.vendor_id.is_some() || !header.flags.is_mandatory() || header.flags.is_protected() {
         return Err(DecodeError::new(
             DecodeErrorCode::Structural {
@@ -3244,7 +4179,7 @@ fn validate_base_mandatory_flags(
             },
             builder_helpers::offset_add(offset, 4, section)?,
         )
-        .with_spec_ref(SpecRef::new("ietf", "RFC6733", section)));
+        .with_spec_ref(SpecRef::new("ietf", document, section)));
     }
     Ok(())
 }
@@ -3254,6 +4189,15 @@ fn validate_base_m_bit_agnostic_flags(
     offset: usize,
     section: &'static str,
 ) -> Result<(), DecodeError> {
+    validate_base_m_bit_agnostic_flags_for(header, offset, "RFC5447", section)
+}
+
+fn validate_base_m_bit_agnostic_flags_for(
+    header: &AvpHeader,
+    offset: usize,
+    document: &'static str,
+    section: &'static str,
+) -> Result<(), DecodeError> {
     if header.vendor_id.is_some() || header.flags.is_protected() {
         return Err(DecodeError::new(
             DecodeErrorCode::Structural {
@@ -3261,7 +4205,7 @@ fn validate_base_m_bit_agnostic_flags(
             },
             builder_helpers::offset_add(offset, 4, section)?,
         )
-        .with_spec_ref(SpecRef::new("ietf", "RFC5447", "4.2.5")));
+        .with_spec_ref(SpecRef::new("ietf", document, section)));
     }
     Ok(())
 }
@@ -3311,6 +4255,255 @@ fn validate_supported_features_outer_flags(
         SwmSupportedFeaturesRequirement::Required
     } else {
         SwmSupportedFeaturesRequirement::Discovery
+    })
+}
+
+fn append_qos_capability_avp(
+    dst: &mut BytesMut,
+    capability: &SwmQosCapability,
+    ctx: EncodeContext,
+) -> Result<(), EncodeError> {
+    let mut value = BytesMut::new();
+    for profile in capability.profiles() {
+        let mut profile_value = BytesMut::new();
+        builder_helpers::append_u32_avp(
+            &mut profile_value,
+            base::AVP_VENDOR_ID,
+            profile.vendor_id().get(),
+            true,
+            ctx,
+        )?;
+        builder_helpers::append_u32_avp(
+            &mut profile_value,
+            AVP_QOS_PROFILE_ID,
+            profile.profile_id(),
+            true,
+            ctx,
+        )?;
+        for additional in profile.additional_avps() {
+            if additional.header().flags.is_mandatory() {
+                return Err(encode_structural_error(
+                    "unknown QoS-Profile-Template extension child must clear M",
+                    "5.3",
+                ));
+            }
+            additional.append_to(&mut profile_value, ctx)?;
+        }
+        builder_helpers::append_avp(
+            &mut value,
+            AvpHeader::ietf(AVP_QOS_PROFILE_TEMPLATE, true),
+            &profile_value,
+            ctx,
+        )?;
+    }
+    for additional in capability.additional_avps() {
+        if additional.header().flags.is_mandatory() {
+            return Err(encode_structural_error(
+                "unknown QoS-Capability extension child must clear M",
+                "6",
+            ));
+        }
+        additional.append_to(&mut value, ctx)?;
+    }
+    builder_helpers::append_avp(dst, AvpHeader::ietf(AVP_QOS_CAPABILITY, true), &value, ctx)
+}
+
+enum QosProfileTemplateParseError {
+    Decode(DecodeError),
+    Missing { error: DecodeError, key: AvpKey },
+}
+
+impl From<DecodeError> for QosProfileTemplateParseError {
+    fn from(error: DecodeError) -> Self {
+        Self::Decode(error)
+    }
+}
+
+enum QosCapabilityParseError {
+    Decode(DecodeError),
+    Missing {
+        error: Box<DecodeError>,
+        key: AvpKey,
+        profile_offset: Option<usize>,
+    },
+}
+
+impl From<DecodeError> for QosCapabilityParseError {
+    fn from(error: DecodeError) -> Self {
+        Self::Decode(error)
+    }
+}
+
+fn parse_qos_capability(
+    value: &[u8],
+    ctx: DecodeContext,
+    base_offset: usize,
+    depth: usize,
+) -> Result<SwmQosCapability, QosCapabilityParseError> {
+    let mut profiles = Vec::new();
+    let mut additional_avps = Vec::new();
+    let mut additional_keys = HashSet::new();
+    let mut child_count = 0usize;
+    let mut missing_child = None;
+    let parse_result =
+        builder_helpers::for_each_avp(value, ctx, base_offset, depth, |offset, child| {
+            if child_count >= MAX_SWM_QOS_GROUP_CHILDREN {
+                return Err(DecodeError::new(DecodeErrorCode::IeCountExceeded, offset)
+                    .with_spec_ref(SpecRef::new("ietf", "RFC5777", "6")));
+            }
+            child_count += 1;
+            let child_value_offset =
+                builder_helpers::offset_add(offset, child.header.header_len(), "6")?;
+            if child.header.code == AVP_QOS_PROFILE_TEMPLATE && child.header.vendor_id.is_none() {
+                validate_base_mandatory_flags_for(&child.header, offset, "RFC5777", "5.3")?;
+                if profiles.len() >= MAX_SWM_QOS_PROFILE_TEMPLATES {
+                    return Err(DecodeError::new(DecodeErrorCode::IeCountExceeded, offset)
+                        .with_spec_ref(SpecRef::new("ietf", "RFC5777", "6")));
+                }
+                match parse_qos_profile_template(child.value, ctx, child_value_offset, depth + 1) {
+                    Ok(profile) => profiles.push(profile),
+                    Err(QosProfileTemplateParseError::Missing { error, key }) => {
+                        missing_child = Some((error.clone(), key, offset));
+                        return Err(error);
+                    }
+                    Err(QosProfileTemplateParseError::Decode(error)) => return Err(error),
+                }
+            } else if child.header.flags.is_mandatory()
+                || ctx.unknown_ie_policy == UnknownIePolicy::Reject
+            {
+                builder_helpers::handle_unknown_avp(ctx, &child, offset, "6")?;
+            } else {
+                if ctx.duplicate_ie_policy == DuplicateIePolicy::Reject
+                    && !additional_keys.insert(child.header.key())
+                {
+                    return Err(DecodeError::new(DecodeErrorCode::DuplicateIe, offset)
+                        .with_spec_ref(SpecRef::new("ietf", "RFC5777", "6")));
+                }
+                if ctx.unknown_ie_policy == UnknownIePolicy::Preserve {
+                    if additional_avps.len() >= MAX_SWM_QOS_GROUP_CHILDREN {
+                        return Err(DecodeError::new(DecodeErrorCode::IeCountExceeded, offset)
+                            .with_spec_ref(SpecRef::new("ietf", "RFC5777", "6")));
+                    }
+                    additional_avps.push(SwmAdditionalAvp::from_raw_exact(&child));
+                }
+            }
+            Ok(())
+        });
+    if let Err(error) = parse_result {
+        return Err(if let Some((error, key, profile_offset)) = missing_child {
+            QosCapabilityParseError::Missing {
+                error: Box::new(error),
+                key,
+                profile_offset: Some(profile_offset),
+            }
+        } else {
+            QosCapabilityParseError::Decode(error)
+        });
+    }
+    if profiles.is_empty() {
+        return Err(QosCapabilityParseError::Missing {
+            error: Box::new(
+                missing_child_error(base_offset, "missing QoS-Profile-Template child AVP")
+                    .with_spec_ref(SpecRef::new("ietf", "RFC5777", "6")),
+            ),
+            key: AvpKey::ietf(AVP_QOS_PROFILE_TEMPLATE),
+            profile_offset: None,
+        });
+    }
+    validate_qos_profiles(&profiles).map_err(|error| {
+        let reason = match error.code() {
+            SwmDerAccessContextErrorCode::EmptyQosCapability => {
+                "QoS-Capability requires at least one QoS-Profile-Template"
+            }
+            SwmDerAccessContextErrorCode::TooManyQosProfiles => {
+                "QoS-Capability contains too many profile templates"
+            }
+            SwmDerAccessContextErrorCode::InactiveIndication => "QoS-Capability is invalid",
+            SwmDerAccessContextErrorCode::PrepopulatedField
+            | SwmDerAccessContextErrorCode::InvalidProvenance
+            | SwmDerAccessContextErrorCode::InvalidVisitedNetworkIdentifier => {
+                "QoS-Capability is invalid"
+            }
+        };
+        QosCapabilityParseError::Decode(
+            DecodeError::new(DecodeErrorCode::Structural { reason }, base_offset)
+                .with_spec_ref(SpecRef::new("ietf", "RFC5777", "6")),
+        )
+    })?;
+    Ok(SwmQosCapability {
+        profiles,
+        additional_avps,
+    })
+}
+
+fn parse_qos_profile_template(
+    value: &[u8],
+    ctx: DecodeContext,
+    base_offset: usize,
+    depth: usize,
+) -> Result<SwmQosProfileTemplate, QosProfileTemplateParseError> {
+    let mut vendor_id = None;
+    let mut profile_id = None;
+    let mut additional_avps = Vec::new();
+    let mut additional_keys = HashSet::new();
+    let mut child_count = 0usize;
+    builder_helpers::for_each_avp(value, ctx, base_offset, depth, |offset, child| {
+        if child_count >= MAX_SWM_QOS_GROUP_CHILDREN {
+            return Err(DecodeError::new(DecodeErrorCode::IeCountExceeded, offset)
+                .with_spec_ref(SpecRef::new("ietf", "RFC5777", "5.3")));
+        }
+        child_count += 1;
+        let child_value_offset =
+            builder_helpers::offset_add(offset, child.header.header_len(), "5.3")?;
+        if child.header.code == base::AVP_VENDOR_ID && child.header.vendor_id.is_none() {
+            validate_base_mandatory_flags_for(&child.header, offset, "RFC5777", "5.3")?;
+            let value = builder_helpers::parse_u32_value(child.value, child_value_offset, "5.3")?;
+            builder_helpers::set_once(&mut vendor_id, VendorId::new(value), offset, "5.3")?;
+        } else if child.header.code == AVP_QOS_PROFILE_ID && child.header.vendor_id.is_none() {
+            validate_base_mandatory_flags_for(&child.header, offset, "RFC5777", "5.2")?;
+            let value = builder_helpers::parse_u32_value(child.value, child_value_offset, "5.2")?;
+            builder_helpers::set_once(&mut profile_id, value, offset, "5.2")?;
+        } else if child.header.flags.is_mandatory()
+            || ctx.unknown_ie_policy == UnknownIePolicy::Reject
+        {
+            builder_helpers::handle_unknown_avp(ctx, &child, offset, "5.3")?;
+        } else {
+            if ctx.duplicate_ie_policy == DuplicateIePolicy::Reject
+                && !additional_keys.insert(child.header.key())
+            {
+                return Err(DecodeError::new(DecodeErrorCode::DuplicateIe, offset)
+                    .with_spec_ref(SpecRef::new("ietf", "RFC5777", "5.3")));
+            }
+            if ctx.unknown_ie_policy == UnknownIePolicy::Preserve {
+                if additional_avps.len() >= MAX_SWM_QOS_GROUP_CHILDREN {
+                    return Err(DecodeError::new(DecodeErrorCode::IeCountExceeded, offset)
+                        .with_spec_ref(SpecRef::new("ietf", "RFC5777", "5.3")));
+                }
+                additional_avps.push(SwmAdditionalAvp::from_raw_exact(&child));
+            }
+        }
+        Ok(())
+    })?;
+    let vendor_id = vendor_id.ok_or_else(|| QosProfileTemplateParseError::Missing {
+        error: missing_child_error(
+            base_offset,
+            "missing QoS-Profile-Template Vendor-Id child AVP",
+        )
+        .with_spec_ref(SpecRef::new("ietf", "RFC5777", "5.3")),
+        key: AvpKey::ietf(base::AVP_VENDOR_ID),
+    })?;
+    let profile_id = profile_id.ok_or_else(|| QosProfileTemplateParseError::Missing {
+        error: missing_child_error(
+            base_offset,
+            "missing QoS-Profile-Template QoS-Profile-Id child AVP",
+        )
+        .with_spec_ref(SpecRef::new("ietf", "RFC5777", "5.3")),
+        key: AvpKey::ietf(AVP_QOS_PROFILE_ID),
+    })?;
+    Ok(SwmQosProfileTemplate {
+        vendor_id,
+        profile_id,
+        additional_avps,
     })
 }
 
@@ -4153,8 +5346,38 @@ fn validate_decoded_request(request: &SwmDiameterEapRequest) -> Result<(), Decod
     }
     validate_request_mobility_features(request.mip6_feature_vector)
         .map_err(|reason| decode_structural_error(reason, "7.2.3.1"))?;
+    if let Some(qos_capability) = request.qos_capability.as_ref() {
+        validate_qos_profiles(qos_capability.profiles()).map_err(|error| {
+            let reason = match error.code() {
+                SwmDerAccessContextErrorCode::EmptyQosCapability => {
+                    "SWm DER QoS-Capability requires at least one profile template"
+                }
+                SwmDerAccessContextErrorCode::TooManyQosProfiles => {
+                    "SWm DER QoS-Capability contains too many profile templates"
+                }
+                SwmDerAccessContextErrorCode::InactiveIndication => {
+                    "SWm DER QoS-Capability is invalid"
+                }
+                SwmDerAccessContextErrorCode::PrepopulatedField
+                | SwmDerAccessContextErrorCode::InvalidProvenance
+                | SwmDerAccessContextErrorCode::InvalidVisitedNetworkIdentifier => {
+                    "SWm DER QoS-Capability is invalid"
+                }
+            };
+            decode_structural_error(reason, "6")
+        })?;
+    }
     validate_requested_supported_features(&request.supported_features)
         .map_err(|reason| decode_structural_error(reason, "6.3.29"))?;
+    if request
+        .high_priority_access_info
+        .is_some_and(|info| !info.is_configured())
+    {
+        return Err(decode_structural_error(
+            "SWm DER High-Priority-Access-Info must set HPA_Configured when present",
+            "5.2.3.36",
+        ));
+    }
     if let Some(terminal) = request.terminal_information.as_ref() {
         if let Some(software_version) = terminal.software_version.as_ref() {
             let value = software_version.as_ref().as_bytes();

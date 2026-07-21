@@ -552,7 +552,8 @@ impl<'a> Message<'a> {
     ///
     /// Error offsets are relative to the Diameter message start. Only
     /// top-level AVPs explicitly declared repeatable by the resolved command
-    /// may repeat; nested grouped regions retain reject-all duplicate behavior.
+    /// may repeat. Within a known Grouped AVP, only children explicitly
+    /// declared repeatable by that grouped definition may repeat.
     pub fn validate_command_avps_with_dictionary(
         &self,
         ctx: DecodeContext,
@@ -565,7 +566,7 @@ impl<'a> Message<'a> {
             DIAMETER_HEADER_LEN,
             0,
             Some(dictionaries),
-            Some(command),
+            Some(command.avp_rules()),
         )
     }
 
@@ -1120,7 +1121,7 @@ fn validate_avp_region_at(
     base_offset: usize,
     depth: usize,
     dictionaries: Option<DictionarySet<'_>>,
-    command: Option<&CommandDefinition>,
+    occurrence_rules: Option<&[CommandAvpRule]>,
 ) -> Result<(), DecodeError> {
     let spec_ref = SpecRef::new("ietf", "RFC6733", "4");
     // This catches public grouped-value entry points (which start at depth 1)
@@ -1158,8 +1159,8 @@ fn validate_avp_region_at(
         };
 
         let key = avp.header.key();
-        if command
-            .and_then(|definition| definition.find_avp_rule(key))
+        if occurrence_rules
+            .and_then(|rules| rules.iter().find(|rule| rule.key() == key))
             .is_some_and(|rule| rule.cardinality().is_forbidden())
         {
             return Err(DecodeError::new(DecodeErrorCode::UnknownCriticalIe, offset)
@@ -1168,8 +1169,9 @@ fn validate_avp_region_at(
 
         if ctx.duplicate_ie_policy == DuplicateIePolicy::Reject {
             let repeated = !seen_keys.get_or_insert_with(HashSet::new).insert(key);
-            let repeatable = command
-                .map(|definition| definition.allows_multiple(key))
+            let repeatable = occurrence_rules
+                .and_then(|rules| rules.iter().find(|rule| rule.key() == key))
+                .map(|rule| rule.cardinality().allows_multiple())
                 .unwrap_or(false);
             if repeated && !repeatable {
                 return Err(
@@ -1178,7 +1180,7 @@ fn validate_avp_region_at(
             }
         }
 
-        if dictionary_marks_grouped(&avp, dictionaries) {
+        if let Some(grouped_rules) = dictionary_grouped_avp_rules(&avp, dictionaries) {
             let child_depth = depth.saturating_add(1);
             // The entry-level guard catches depth violations from direct callers;
             // this early check gives an offset pointing to the grouping AVP rather
@@ -1191,7 +1193,14 @@ fn validate_avp_region_at(
                 DecodeError::new(DecodeErrorCode::LengthOverflow, offset)
                     .with_spec_ref(spec_ref.clone())
             })?;
-            validate_avp_region_at(avp.value, ctx, child_base, child_depth, dictionaries, None)?;
+            validate_avp_region_at(
+                avp.value,
+                ctx,
+                child_base,
+                child_depth,
+                dictionaries,
+                Some(grouped_rules),
+            )?;
         }
 
         let consumed = before.checked_sub(next.len()).ok_or_else(|| {
@@ -1208,14 +1217,15 @@ fn validate_avp_region_at(
     Ok(())
 }
 
-fn dictionary_marks_grouped(avp: &RawAvp<'_>, dictionaries: Option<DictionarySet<'_>>) -> bool {
-    let Some(dictionaries) = dictionaries else {
-        return false;
-    };
+fn dictionary_grouped_avp_rules<'dictionary>(
+    avp: &RawAvp<'_>,
+    dictionaries: Option<DictionarySet<'dictionary>>,
+) -> Option<&'dictionary [CommandAvpRule]> {
+    let dictionaries = dictionaries?;
     dictionaries
         .find_avp(avp.header.key())
-        .map(|definition| definition.data_type() == AvpDataType::Grouped)
-        .unwrap_or(false)
+        .filter(|definition| definition.data_type() == AvpDataType::Grouped)
+        .map(AvpDefinition::grouped_avp_rules)
 }
 
 fn shift_decode_error(error: DecodeError, base_offset: usize) -> DecodeError {

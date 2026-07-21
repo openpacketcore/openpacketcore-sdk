@@ -103,6 +103,8 @@ impl fmt::Debug for DiameterGroupedAvpProvenance {
 pub struct DiameterMissingAvpProvenance {
     definition: &'static AvpDefinition,
     parent: Option<DiameterGroupedAvpProvenance>,
+    /// Received grouped ancestors in outermost-to-innermost order.
+    ancestors: Box<[DiameterGroupedAvpProvenance]>,
     application_id: ApplicationId,
     command_code: CommandCode,
     command_kind: CommandKind,
@@ -110,7 +112,7 @@ pub struct DiameterMissingAvpProvenance {
 
 impl DiameterMissingAvpProvenance {
     #[cfg(any(test, feature = "peer", feature = "app-swm"))]
-    const fn new(
+    fn new(
         definition: &'static AvpDefinition,
         parent: Option<DiameterGroupedAvpProvenance>,
         application_id: ApplicationId,
@@ -120,6 +122,7 @@ impl DiameterMissingAvpProvenance {
         Self {
             definition,
             parent,
+            ancestors: parent.into_iter().collect(),
             application_id,
             command_code,
             command_kind,
@@ -168,6 +171,12 @@ impl DiameterMissingAvpProvenance {
         self.parent
     }
 
+    /// Return received grouped ancestors from outermost to immediate parent.
+    #[must_use]
+    pub fn ancestors(&self) -> &[DiameterGroupedAvpProvenance] {
+        &self.ancestors
+    }
+
     /// Return the application identifier of the requiring parser grammar.
     #[must_use]
     pub const fn application_id(&self) -> ApplicationId {
@@ -195,7 +204,7 @@ impl fmt::Debug for DiameterMissingAvpProvenance {
             .field("vendor_id", &self.vendor_id().map(crate::VendorId::get))
             .field("data_type", &self.data_type())
             .field("flag_rules", &self.flag_rules())
-            .field("parent", &self.parent)
+            .field("ancestors", &self.ancestors)
             .field("application_id", &self.application_id.get())
             .field("command_code", &self.command_code.get())
             .field("command_kind", &self.command_kind)
@@ -380,6 +389,39 @@ impl DiameterParserError {
                 command_code,
                 CommandKind::Request,
             ))),
+            grouped_avp_set: None,
+            request_wire_len,
+            request_digest,
+        }
+    }
+
+    #[cfg(feature = "app-swm")]
+    pub(crate) fn missing_with_ancestors(
+        message: &Message<'_>,
+        decode_error: DecodeError,
+        definition: &'static AvpDefinition,
+        ancestors: &[(&'static AvpDefinition, usize)],
+        application_id: ApplicationId,
+        command_code: CommandCode,
+    ) -> Self {
+        let (request_wire_len, request_digest) = fingerprint_message(message);
+        Self {
+            decode_error: Box::new(decode_error),
+            missing_avp: Some(Box::new(DiameterMissingAvpProvenance {
+                definition,
+                parent: ancestors.last().map(|(definition, offset)| {
+                    DiameterGroupedAvpProvenance::new(definition, *offset)
+                }),
+                ancestors: ancestors
+                    .iter()
+                    .map(|(definition, offset)| {
+                        DiameterGroupedAvpProvenance::new(definition, *offset)
+                    })
+                    .collect(),
+                application_id,
+                command_code,
+                command_kind: CommandKind::Request,
+            })),
             grouped_avp_set: None,
             request_wire_len,
             request_digest,
