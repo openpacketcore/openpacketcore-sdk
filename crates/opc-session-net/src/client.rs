@@ -918,7 +918,8 @@ fn discard_replication_payloads_from_response(response: Response) {
 enum StoreResponseClass {
     Read,
     CompareAndSet,
-    Mutation,
+    ApplicationMutation,
+    ReplicationMutation,
     RecordExpiryPreflight,
 }
 
@@ -928,8 +929,15 @@ fn store_error_matches_class(error: &StoreError, class: StoreResponseClass) -> b
             matches!(class, StoreResponseClass::CompareAndSet)
         }
         StoreError::BackendOperationOutcomeUnavailable => {
-            matches!(class, StoreResponseClass::Mutation)
+            matches!(
+                class,
+                StoreResponseClass::ApplicationMutation | StoreResponseClass::ReplicationMutation
+            )
         }
+        StoreError::TopologyAuthorityRevoked => matches!(
+            class,
+            StoreResponseClass::CompareAndSet | StoreResponseClass::ApplicationMutation
+        ),
         _ => true,
     }
 }
@@ -962,7 +970,7 @@ fn batch_response_matches_request(ops: &[SessionOp], results: &[SessionOpResult]
             }
             (SessionOp::DeleteFenced { .. }, SessionOpResult::DeleteFenced(result))
             | (SessionOp::RefreshTtl { .. }, SessionOpResult::RefreshTtl(result)) => {
-                store_result_matches_class(result, StoreResponseClass::Mutation)
+                store_result_matches_class(result, StoreResponseClass::ApplicationMutation)
             }
             _ => false,
         })
@@ -981,7 +989,7 @@ fn response_matches_request(request: &Request, response: &Response) -> bool {
         }
         (Request::DeleteFenced { .. }, Response::DeleteFenced(result))
         | (Request::RefreshTtl { .. }, Response::RefreshTtl(result)) => {
-            store_result_matches_class(result, StoreResponseClass::Mutation)
+            store_result_matches_class(result, StoreResponseClass::ApplicationMutation)
         }
         (Request::RecordExpiryPreflight { .. }, Response::RecordExpiryPreflight(result)) => {
             store_result_matches_class(result, StoreResponseClass::RecordExpiryPreflight)
@@ -991,7 +999,7 @@ fn response_matches_request(request: &Request, response: &Response) -> bool {
         }
         (Request::Batch { ops }, Response::Batch(Err(error))) => {
             let class = if ops.iter().any(|op| !matches!(op, SessionOp::Get { .. })) {
-                StoreResponseClass::Mutation
+                StoreResponseClass::ApplicationMutation
             } else {
                 StoreResponseClass::Read
             };
@@ -1021,7 +1029,7 @@ fn response_matches_request(request: &Request, response: &Response) -> bool {
         }
         (Request::ReplicateEntry { .. }, Response::ReplicateEntry(result))
         | (Request::RebuildReplicationState { .. }, Response::RebuildReplicationState(result)) => {
-            store_result_matches_class(result, StoreResponseClass::Mutation)
+            store_result_matches_class(result, StoreResponseClass::ReplicationMutation)
         }
         (Request::Watch { .. }, Response::WatchStream) => true,
         (Request::Watch { .. }, Response::WatchEntry(Err(error))) => {
@@ -5913,6 +5921,28 @@ mod tests {
             ))],
         )
         .await;
+    }
+
+    #[test]
+    fn topology_authority_revocation_matches_only_mutation_responses() {
+        let error = StoreError::TopologyAuthorityRevoked;
+        assert!(store_error_matches_class(
+            &error,
+            StoreResponseClass::CompareAndSet
+        ));
+        assert!(store_error_matches_class(
+            &error,
+            StoreResponseClass::ApplicationMutation
+        ));
+        assert!(!store_error_matches_class(
+            &error,
+            StoreResponseClass::ReplicationMutation
+        ));
+        assert!(!store_error_matches_class(&error, StoreResponseClass::Read));
+        assert!(!store_error_matches_class(
+            &error,
+            StoreResponseClass::RecordExpiryPreflight
+        ));
     }
 
     #[tokio::test]

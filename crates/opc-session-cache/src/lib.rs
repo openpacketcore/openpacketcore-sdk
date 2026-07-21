@@ -698,6 +698,7 @@ fn store_error_kind(err: &StoreError) -> &'static str {
         StoreError::CasIdempotencyConflict => "cas_idempotency_conflict",
         StoreError::CasIdempotencyOutcomeUnavailable => "cas_idempotency_outcome_unavailable",
         StoreError::BackendOperationOutcomeUnavailable => "backend_operation_outcome_unavailable",
+        StoreError::TopologyAuthorityRevoked => "topology_authority_revoked",
         StoreError::CapabilityNotSupported(_) => "capability_not_supported",
         StoreError::BackendUnavailable(_) => "backend_unavailable",
         StoreError::InvalidKey(_) => "invalid_key",
@@ -747,6 +748,14 @@ mod tests {
         fn now_utc(&self) -> Timestamp {
             self.0
         }
+    }
+
+    #[test]
+    fn topology_authority_revocation_has_stable_error_kind() {
+        assert_eq!(
+            store_error_kind(&StoreError::TopologyAuthorityRevoked),
+            "topology_authority_revoked"
+        );
     }
 
     struct ScriptedWatchBackend {

@@ -9984,6 +9984,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn revoked_application_authority_commits_typed_no_effect_outcome() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.lock().await;
+        let storage_identity = identity();
+        let current = members(&[7, 8, 9]);
+        let desired = members(&[7, 8, 9, 10, 11]);
+        let desired_identity = identity_at(2, 0x5c);
+        let transition_id = [0xB4; MEMBERSHIP_TRANSITION_ID_BYTES];
+        let transition_digest = [0xC4; 32];
+        initialize_schema(&conn, storage_identity, &current).expect("consensus schema");
+        let initial = membership_entry_at(0, vec![current.clone()], current.clone());
+        append_logs_sync(&conn, storage_identity, std::slice::from_ref(&initial))
+            .expect("append current membership");
+        apply_entries_sync(&conn, storage_identity, &backend.caps, vec![initial])
+            .expect("apply current membership");
+        stage_membership_scope_sync(
+            &conn,
+            storage_identity,
+            transition_id,
+            transition_digest,
+            desired_identity,
+            &desired,
+        )
+        .expect("stage desired authority");
+        let learners = membership_entry_at(1, vec![current], desired);
+        let ready = topology_entry_at(
+            2,
+            0xB4,
+            SessionMutationIntent::MarkTopologyLearnersReady {
+                transition_id,
+                request_digest: transition_digest,
+            },
+        );
+        append_logs_sync(&conn, storage_identity, &[learners.clone(), ready.clone()])
+            .expect("append learner readiness");
+        apply_entries_sync(
+            &conn,
+            storage_identity,
+            &backend.caps,
+            vec![learners, ready],
+        )
+        .expect("apply learner readiness");
+        fence_application_authority_sync(&conn, storage_identity, transition_id, transition_digest)
+            .expect("fence predecessor authority");
+
+        let revoked = apply_entries_sync(
+            &conn,
+            storage_identity,
+            &backend.caps,
+            vec![authorized_acquire_entry(
+                3,
+                [0xB5; 16],
+                node_id(),
+                storage_identity,
+            )],
+        )
+        .expect("commit deterministic authority rejection");
+        assert!(matches!(
+            revoked.responses.last(),
+            Some(SessionConsensusResponse {
+                result: Err(StoreError::TopologyAuthorityRevoked),
+                ..
+            })
+        ));
+        assert_eq!(
+            0_i64,
+            conn.query_row("SELECT COUNT(*) FROM leases", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("count unchanged leases")
+        );
+        assert_eq!(
+            Some(log_id(3)),
+            read_applied_sync(&conn, storage_identity).expect("rejection is durably applied")
+        );
+    }
+
+    #[tokio::test]
     async fn idempotent_outcome_does_not_cross_topology_authority_epoch() {
         let backend = SqliteSessionBackend::in_memory().expect("backend");
         let conn = backend.conn.lock().await;

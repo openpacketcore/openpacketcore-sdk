@@ -977,7 +977,9 @@ fn map_lease_error(error: LeaseError) -> FencedOwnershipError {
 
 fn map_store_error(error: StoreError) -> FencedOwnershipError {
     match error {
-        StoreError::StaleFence => FencedOwnershipError::StaleFence,
+        StoreError::StaleFence | StoreError::TopologyAuthorityRevoked => {
+            FencedOwnershipError::StaleFence
+        }
         StoreError::CasConflict => FencedOwnershipError::Conflict,
         StoreError::CasIdempotencyConflict => FencedOwnershipError::IdempotencyConflict,
         StoreError::CasIdempotencyOutcomeUnavailable
@@ -2240,4 +2242,17 @@ fn saturating_increment(counter: &AtomicU64) {
     let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
         Some(value.saturating_add(1))
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn topology_authority_revocation_is_a_stale_ownership_fence() {
+        assert_eq!(
+            map_store_error(StoreError::TopologyAuthorityRevoked),
+            FencedOwnershipError::StaleFence
+        );
+    }
 }

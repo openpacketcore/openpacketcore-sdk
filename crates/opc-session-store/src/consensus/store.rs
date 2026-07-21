@@ -2137,6 +2137,20 @@ fn rejected_error_matches_intent(intent: &SessionMutationIntent, error: &StoreEr
 }
 
 fn committed_error_matches_intent(intent: &SessionMutationIntent, error: &StoreError) -> bool {
+    // Application-authority revocation is a deterministic committed outcome
+    // for every user mutation. The response is matched against the original
+    // unwrapped intent, not the state-machine-only `Authorized` envelope.
+    if matches!(error, StoreError::TopologyAuthorityRevoked) {
+        return matches!(
+            intent,
+            SessionMutationIntent::CompareAndSet(_)
+                | SessionMutationIntent::DeleteFenced(_)
+                | SessionMutationIntent::RefreshTtl { .. }
+                | SessionMutationIntent::AcquireLease { .. }
+                | SessionMutationIntent::RenewLease { .. }
+                | SessionMutationIntent::ReleaseLease(_)
+        );
+    }
     match intent {
         SessionMutationIntent::AdvanceLogicalTime => false,
         SessionMutationIntent::CompareAndSet(_) => matches!(
@@ -3052,6 +3066,26 @@ mod membership_tests {
             lease: lease_a.clone(),
             ttl,
         };
+        for revoked_intent in [
+            cas_intent.clone(),
+            SessionMutationIntent::DeleteFenced(lease_a.clone()),
+            SessionMutationIntent::RefreshTtl {
+                lease: lease_a.clone(),
+                ttl,
+            },
+            acquire.clone(),
+            renew.clone(),
+            SessionMutationIntent::ReleaseLease(lease_a.clone()),
+        ] {
+            assert!(committed_response_matches_intent(
+                &revoked_intent,
+                &committed(Err(StoreError::TopologyAuthorityRevoked)),
+            ));
+        }
+        assert!(!committed_response_matches_intent(
+            &SessionMutationIntent::AdvanceLogicalTime,
+            &committed(Err(StoreError::TopologyAuthorityRevoked)),
+        ));
         assert!(committed_response_matches_intent(
             &renew,
             &committed(Ok(SessionMutationOutcome::Lease(lease_a.clone())))

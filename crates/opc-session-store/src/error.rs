@@ -236,6 +236,7 @@ impl From<StoreError> for LeaseError {
             StoreError::LeaseHeld => LeaseError::AlreadyHeld,
             StoreError::LeaseExpired => LeaseError::Expired,
             StoreError::StaleFence => LeaseError::StaleFence,
+            StoreError::TopologyAuthorityRevoked => LeaseError::StaleFence,
             StoreError::NotFound => LeaseError::NotFound,
             StoreError::InvalidSessionTtl => LeaseError::InvalidSessionTtl,
             StoreError::BackendOperationOutcomeUnavailable => {
@@ -261,4 +262,17 @@ pub enum CapabilityError {
         /// for this profile.
         missing: Vec<&'static str>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn topology_authority_revocation_is_permanent_lease_loss() {
+        assert_eq!(
+            LeaseError::from(StoreError::TopologyAuthorityRevoked),
+            LeaseError::StaleFence
+        );
+    }
 }

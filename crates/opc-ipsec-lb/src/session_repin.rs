@@ -2706,6 +2706,9 @@ fn map_store_error(error: StoreError) -> IpsecLbError {
         | StoreError::CasConflict => {
             IpsecLbError::ownership_conflict("session re-pin journal write is contended")
         }
+        StoreError::TopologyAuthorityRevoked => IpsecLbError::ownership_conflict(
+            "session re-pin journal topology authority was revoked",
+        ),
         StoreError::InvalidKey(_) => IpsecLbError::invalid_config(
             "session_repin.key",
             "session re-pin journal key was rejected",
@@ -2784,10 +2787,19 @@ mod tests {
         MockOwnershipFencer, MockOwnershipSource, MockRePinAuditSink, MockSteeringBackend,
         MockSteeringOperation,
     };
+
     use crate::repin::{
         OwnershipFenceGrant, OwnershipFenceRequest, OwnershipRetryProof, OwnershipSnapshot,
         OwnershipTransitionFingerprint,
     };
+
+    #[test]
+    fn topology_authority_revocation_maps_to_ownership_conflict() {
+        assert!(matches!(
+            map_store_error(StoreError::TopologyAuthorityRevoked),
+            IpsecLbError::OwnershipConflict { .. }
+        ));
+    }
 
     const SESSION_SA_COUNT: usize = 4;
     static NEXT_TEST_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
