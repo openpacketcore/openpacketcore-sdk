@@ -9257,15 +9257,45 @@ mod tests {
         let lease = runtime
             .lifecycle_lock(&interface_dir)
             .expect("acquire initial lease");
+        let exec_marker = root.join("child-exec-complete");
         let mut child = Command::new("sh")
-            .args(["-c", "sleep 2"])
+            .args([
+                "-c",
+                "printf ready > \"$OPC_XDP_EXEC_MARKER\"; exec sleep 5",
+            ])
+            .env("OPC_XDP_EXEC_MARKER", &exec_marker)
             .spawn()
             .expect("spawn exec child");
 
+        let exec_deadline = Instant::now() + Duration::from_secs(5);
+        while !exec_marker.exists() && Instant::now() < exec_deadline {
+            if child.try_wait().expect("poll exec child").is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            exec_marker.exists(),
+            "child must prove it reached the post-exec image"
+        );
+
         drop(lease);
-        let replacement = runtime
-            .lifecycle_lock(&interface_dir)
-            .expect("exec child must not retain close-on-exec lease");
+        // Another test thread can be between `fork` and `exec` while this
+        // process owns the lease. Such a child transiently shares the flock
+        // even though every descriptor is close-on-exec. Retry only that
+        // fail-closed outcome for a window far shorter than this child's
+        // lifetime: a descriptor inherited through exec would remain busy and
+        // still fail the test.
+        let reacquire_deadline = Instant::now() + Duration::from_secs(1);
+        let replacement = loop {
+            match runtime.lifecycle_lock(&interface_dir) {
+                Ok(replacement) => break replacement,
+                Err(IpsecLbError::XdpLifecycleBusy) if Instant::now() < reacquire_deadline => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("exec child must not retain close-on-exec lease: {error}"),
+            }
+        };
         assert!(
             child.try_wait().expect("poll exec child").is_none(),
             "the replacement lease must be acquired while the exec child remains alive"
