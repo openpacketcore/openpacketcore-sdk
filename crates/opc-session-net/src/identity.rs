@@ -343,6 +343,19 @@ impl SessionReplicationManifest {
             })
         })
     }
+
+    pub(crate) fn transition_member_aliases_are_unique(&self, successor: &Self) -> bool {
+        self.members.iter().all(|(current_id, current)| {
+            successor.members.iter().all(|(successor_id, next)| {
+                if current_id == successor_id {
+                    return true;
+                }
+                current.descriptor.endpoint() != next.descriptor.endpoint()
+                    && current.descriptor.tls_identity() != next.descriptor.tls_identity()
+                    && current.descriptor.backing_identity() != next.descriptor.backing_identity()
+            })
+        })
+    }
 }
 
 impl fmt::Debug for SessionReplicationManifest {

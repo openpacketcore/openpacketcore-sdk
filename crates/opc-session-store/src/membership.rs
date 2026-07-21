@@ -838,6 +838,251 @@ impl fmt::Debug for SessionTopologyTransitionStatus {
     }
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct SessionTopologyAdmissionProofScope {
+    transition_id: SessionTopologyTransitionId,
+    cluster_id: SessionConsensusClusterId,
+    expected_epoch: SessionConsensusConfigurationEpoch,
+    desired_epoch: SessionConsensusConfigurationEpoch,
+    desired_configuration_id: SessionConsensusConfigurationId,
+    request_digest: SessionTopologyTransitionDigest,
+    desired_member_count: usize,
+}
+
+impl SessionTopologyAdmissionProofScope {
+    fn from_request(request: &SessionTopologyTransitionRequest) -> Self {
+        Self {
+            transition_id: request.transition_id,
+            cluster_id: request.cluster_id,
+            expected_epoch: request.expected_epoch,
+            desired_epoch: request.desired_epoch,
+            desired_configuration_id: request.desired_configuration_id,
+            request_digest: request.request_digest,
+            desired_member_count: request.desired_members.len(),
+        }
+    }
+
+    fn matches_request(&self, request: &SessionTopologyTransitionRequest) -> bool {
+        self.transition_id == request.transition_id
+            && self.cluster_id == request.cluster_id
+            && self.expected_epoch == request.expected_epoch
+            && self.desired_epoch == request.desired_epoch
+            && self.desired_configuration_id == request.desired_configuration_id
+            && self.request_digest == request.request_digest
+            && self.desired_member_count == request.desired_members.len()
+    }
+
+    fn validate_status(
+        request: &SessionTopologyTransitionRequest,
+        status: &SessionTopologyTransitionStatus,
+    ) -> Result<(), SessionTopologyTransitionError> {
+        if status.transition_id != request.transition_id
+            || status.evidence.request_digest != request.request_digest
+        {
+            return Err(SessionTopologyTransitionError::IdempotencyConflict);
+        }
+        if status.evidence.expected_epoch != request.expected_epoch
+            || status.evidence.desired_epoch != request.desired_epoch
+            || status.evidence.desired_configuration_id != request.desired_configuration_id
+            || status.evidence.desired_member_count != request.desired_members.len()
+        {
+            return Err(SessionTopologyTransitionError::InvalidEvidenceState);
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for SessionTopologyAdmissionProofScope {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionTopologyAdmissionProofScope")
+            .field("transition_id", &self.transition_id)
+            .field("cluster_id", &self.cluster_id)
+            .field("expected_epoch", &self.expected_epoch)
+            .field("desired_epoch", &self.desired_epoch)
+            .field("desired_configuration_id", &self.desired_configuration_id)
+            .field("request_digest", &self.request_digest)
+            .field("desired_member_count", &self.desired_member_count)
+            .finish()
+    }
+}
+
+macro_rules! impl_admission_proof_scope {
+    ($proof:ident) => {
+        impl $proof {
+            /// Caller-owned transition identity bound into this proof.
+            #[must_use]
+            pub const fn transition_id(&self) -> SessionTopologyTransitionId {
+                self.scope.transition_id
+            }
+
+            /// Exact validated request digest bound into this proof.
+            #[must_use]
+            pub const fn request_digest(&self) -> SessionTopologyTransitionDigest {
+                self.scope.request_digest
+            }
+
+            /// Expected topology epoch bound into this proof.
+            #[must_use]
+            pub const fn expected_epoch(&self) -> SessionConsensusConfigurationEpoch {
+                self.scope.expected_epoch
+            }
+
+            /// Desired topology epoch bound into this proof.
+            #[must_use]
+            pub const fn desired_epoch(&self) -> SessionConsensusConfigurationEpoch {
+                self.scope.desired_epoch
+            }
+
+            /// Exact desired configuration identity bound into this proof.
+            #[must_use]
+            pub const fn desired_configuration_id(&self) -> SessionConsensusConfigurationId {
+                self.scope.desired_configuration_id
+            }
+
+            /// Number of desired voters bound into this proof.
+            #[must_use]
+            pub const fn desired_member_count(&self) -> usize {
+                self.scope.desired_member_count
+            }
+
+            /// Verify that this store-issued proof names the exact request.
+            #[must_use]
+            pub fn validates_request(&self, request: &SessionTopologyTransitionRequest) -> bool {
+                self.scope.matches_request(request)
+            }
+        }
+    };
+}
+
+/// Store-issued proof that every added learner is identity-admitted and caught up.
+///
+/// Only the session-store coordinator can construct this token. Transport code
+/// may inspect its redaction-safe fixed-width scope, but callers cannot assert
+/// learner readiness themselves.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SessionTopologyLearnersReadyAdmissionProof {
+    scope: SessionTopologyAdmissionProofScope,
+}
+
+impl SessionTopologyLearnersReadyAdmissionProof {
+    /// Mint proof after the coordinator has verified every exact added learner.
+    #[allow(
+        dead_code,
+        reason = "used by the dynamic-membership coordinator in the complete cross-crate integration"
+    )]
+    pub(crate) fn from_caught_up_request(request: &SessionTopologyTransitionRequest) -> Self {
+        Self {
+            scope: SessionTopologyAdmissionProofScope::from_request(request),
+        }
+    }
+}
+
+impl_admission_proof_scope!(SessionTopologyLearnersReadyAdmissionProof);
+
+impl fmt::Debug for SessionTopologyLearnersReadyAdmissionProof {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionTopologyLearnersReadyAdmissionProof")
+            .field("scope", &self.scope)
+            .finish()
+    }
+}
+
+/// Store-issued proof that a pre-joint transition durably aborted.
+///
+/// This token can only be minted from exact durable `Aborted/Aborted` status.
+/// It authorizes transport to remove the staged successor without describing a
+/// joint or uniform membership commit as roll-backable.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SessionTopologyAbortAdmissionProof {
+    scope: SessionTopologyAdmissionProofScope,
+}
+
+impl SessionTopologyAbortAdmissionProof {
+    /// Mint proof from exact durable terminal-abort status.
+    #[allow(
+        dead_code,
+        reason = "used by the dynamic-membership coordinator in the complete cross-crate integration"
+    )]
+    pub(crate) fn try_from_status(
+        request: &SessionTopologyTransitionRequest,
+        status: &SessionTopologyTransitionStatus,
+    ) -> Result<Self, SessionTopologyTransitionError> {
+        SessionTopologyAdmissionProofScope::validate_status(request, status)?;
+        if status.phase() != SessionTopologyTransitionPhase::Aborted
+            || status.outcome() != SessionTopologyTransitionOutcome::Aborted
+            || status.evidence.committed_epoch != request.expected_epoch
+            || status.log_indexes() != SessionTopologyTransitionLogIndexes::default()
+        {
+            return Err(SessionTopologyTransitionError::InvalidEvidenceState);
+        }
+        Ok(Self {
+            scope: SessionTopologyAdmissionProofScope::from_request(request),
+        })
+    }
+}
+
+impl_admission_proof_scope!(SessionTopologyAbortAdmissionProof);
+
+impl fmt::Debug for SessionTopologyAbortAdmissionProof {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionTopologyAbortAdmissionProof")
+            .field("scope", &self.scope)
+            .finish()
+    }
+}
+
+/// Store-issued proof that the desired uniform membership is durably committed.
+///
+/// The token is available for `UniformCommitted`, `Finalizing`, and terminal
+/// `Completed` status only. Transport finalization therefore cannot precede the
+/// Openraft uniform-configuration commit.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SessionTopologyUniformCommitAdmissionProof {
+    scope: SessionTopologyAdmissionProofScope,
+}
+
+impl SessionTopologyUniformCommitAdmissionProof {
+    /// Mint proof from exact durable uniform-or-later status.
+    #[allow(
+        dead_code,
+        reason = "used by the dynamic-membership coordinator in the complete cross-crate integration"
+    )]
+    pub(crate) fn try_from_status(
+        request: &SessionTopologyTransitionRequest,
+        status: &SessionTopologyTransitionStatus,
+    ) -> Result<Self, SessionTopologyTransitionError> {
+        SessionTopologyAdmissionProofScope::validate_status(request, status)?;
+        if !matches!(
+            status.phase(),
+            SessionTopologyTransitionPhase::UniformCommitted
+                | SessionTopologyTransitionPhase::Finalizing
+                | SessionTopologyTransitionPhase::Completed
+        ) || status.evidence.committed_epoch != request.desired_epoch
+            || status.log_indexes().joint().is_none()
+            || status.log_indexes().uniform().is_none()
+        {
+            return Err(SessionTopologyTransitionError::InvalidEvidenceState);
+        }
+        Ok(Self {
+            scope: SessionTopologyAdmissionProofScope::from_request(request),
+        })
+    }
+}
+
+impl_admission_proof_scope!(SessionTopologyUniformCommitAdmissionProof);
+
+impl fmt::Debug for SessionTopologyUniformCommitAdmissionProof {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionTopologyUniformCommitAdmissionProof")
+            .field("scope", &self.scope)
+            .finish()
+    }
+}
+
 fn reason_is_valid_for_state(
     reason: SessionTopologyTransitionReason,
     outcome: SessionTopologyTransitionOutcome,
@@ -996,4 +1241,103 @@ fn calculate_request_digest(
     hasher.update(operation_timeout.as_secs().to_be_bytes());
     hasher.update(operation_timeout.subsec_nanos().to_be_bytes());
     SessionTopologyTransitionDigest::from_bytes(hasher.finalize().into())
+}
+
+#[cfg(test)]
+mod admission_proof_tests {
+    use super::*;
+    use crate::topology::{
+        ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain, ReplicaId,
+        ReplicaTlsIdentity,
+    };
+
+    fn descriptor(index: u16) -> QuorumReplicaDescriptor {
+        QuorumReplicaDescriptor::new(
+            ReplicaId::new(format!("proof-replica-{index}")).expect("replica ID"),
+            ReplicaEndpoint::new(format!("proof-{index}.test.invalid"), 7443).expect("endpoint"),
+            ReplicaTlsIdentity::new(format!(
+                "spiffe://proof.test/tenant/test/ns/default/sa/session/nf/smf/instance/{index}"
+            ))
+            .expect("TLS identity"),
+            ReplicaFailureDomain::new(format!("proof-zone-{index}")).expect("failure domain"),
+            ReplicaBackingIdentity::new(format!("proof-disk-{index}")).expect("backing identity"),
+        )
+    }
+
+    fn transition_request(id: u8, timeout: Duration) -> SessionTopologyTransitionRequest {
+        SessionTopologyTransitionRequest::try_new(
+            SessionTopologyTransitionId::from_bytes([id; 16]),
+            SessionConsensusClusterId::new("membership-proof-test").expect("cluster"),
+            SessionConsensusConfigurationEpoch::new(7).expect("expected epoch"),
+            SessionConsensusConfigurationEpoch::new(8).expect("desired epoch"),
+            (1..=5).map(descriptor).collect(),
+            timeout,
+        )
+        .expect("transition request")
+    }
+
+    #[test]
+    fn admission_proofs_bind_exact_request_and_only_durable_legal_phases() {
+        let request = transition_request(51, Duration::from_secs(10));
+        let conflicting = transition_request(51, Duration::from_secs(11));
+        let learners = SessionTopologyLearnersReadyAdmissionProof::from_caught_up_request(&request);
+        assert!(learners.validates_request(&request));
+        assert!(!learners.validates_request(&conflicting));
+
+        let aborted = SessionTopologyTransitionStatus::try_from_request(
+            &request,
+            3,
+            request.expected_epoch(),
+            SessionTopologyTransitionPhase::Aborted,
+            SessionTopologyTransitionOutcome::Aborted,
+            SessionTopologyTransitionReason::AbortedByCaller,
+            SessionTopologyTransitionLogIndexes::default(),
+        )
+        .expect("durable abort status");
+        let abort_proof = SessionTopologyAbortAdmissionProof::try_from_status(&request, &aborted)
+            .expect("abort proof");
+        assert!(abort_proof.validates_request(&request));
+
+        let joint = SessionTopologyTransitionStatus::try_from_request(
+            &request,
+            3,
+            request.expected_epoch(),
+            SessionTopologyTransitionPhase::JointCommitted,
+            SessionTopologyTransitionOutcome::InProgress,
+            SessionTopologyTransitionReason::Progressing,
+            SessionTopologyTransitionLogIndexes::new(Some(10), None, None),
+        )
+        .expect("joint status");
+        assert_eq!(
+            SessionTopologyAbortAdmissionProof::try_from_status(&request, &joint),
+            Err(SessionTopologyTransitionError::InvalidEvidenceState),
+            "a joint commit is not roll-backable transport-abort proof"
+        );
+        assert_eq!(
+            SessionTopologyUniformCommitAdmissionProof::try_from_status(&request, &joint),
+            Err(SessionTopologyTransitionError::InvalidEvidenceState),
+            "a joint commit cannot prematurely finalize transport admission"
+        );
+
+        let uniform = SessionTopologyTransitionStatus::try_from_request(
+            &request,
+            3,
+            request.desired_epoch(),
+            SessionTopologyTransitionPhase::UniformCommitted,
+            SessionTopologyTransitionOutcome::InProgress,
+            SessionTopologyTransitionReason::Progressing,
+            SessionTopologyTransitionLogIndexes::new(Some(10), Some(11), None),
+        )
+        .expect("uniform status");
+        let uniform_proof =
+            SessionTopologyUniformCommitAdmissionProof::try_from_status(&request, &uniform)
+                .expect("uniform proof");
+        assert!(uniform_proof.validates_request(&request));
+        assert!(!uniform_proof.validates_request(&conflicting));
+
+        let debug = format!("{learners:?} {abort_proof:?} {uniform_proof:?}");
+        assert!(!debug.contains("spiffe://"));
+        assert!(!debug.contains("proof-replica"));
+        assert!(!debug.contains("33333333333333333333333333333333"));
+    }
 }

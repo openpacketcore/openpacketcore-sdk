@@ -114,19 +114,35 @@ This is not a rolling mixed-profile transition.
 `SessionTopologyTransitionRequest`. Staging requires the request's exact
 cluster, next epoch, configuration digest, and member count to match the
 successor manifest. A retained logical replica must keep its complete endpoint,
-SPIFFE, failure-domain, and backing binding; replacing one requires a distinct
-replica identity. While staged, current-manifest connections retain the
-normal RPC surface; successor-manifest connections initially may send only
+SPIFFE, failure-domain, and backing binding. Distinct removed and added replica
+IDs may not alias one endpoint, SPIFFE identity, or backing identity across the
+joint old/new admission window. While staged, current-manifest connections
+retain the normal RPC surface; successor-manifest connections initially may send only
 Raft `AppendEntries` and `InstallSnapshot` traffic needed to join and catch up.
-The coordinator explicitly calls `admit_successor_voting_after_catch_up` after
-verifying learner progress before successor-scoped `Vote` RPCs are admitted.
+The coordinator passes a store-issued
+`SessionTopologyLearnersReadyAdmissionProof` to
+`admit_successor_voting_after_catch_up` after verifying learner progress before
+successor-scoped `Vote` RPCs are admitted.
 `ForwardMutation` and `ReadBarrier` remain current-authority-only.
 Finalization takes an exclusive admission lease, waits for already-admitted
 handler calls to finish, and then removes the old identity atomically. Every
 request on an existing connection is revalidated, so a cached old connection
 cannot dispatch after finalization returns. A pre-commit abort removes the
-successor instead. Only one successor and one fixed-width completed-operation
-record are retained, so repeated or hostile staging cannot grow memory.
+successor instead. Abort and finalization require unforgeable store-issued
+proofs of durable `Aborted` and uniform-or-later state respectively; a caller
+cannot assert those phases through generic status values. Only one successor
+and one fixed-width completed-operation record are retained, so repeated or
+hostile staging cannot grow memory.
+
+If the transport deadline expires after a handler has queued work into the
+consensus core, the SDK returns a bounded timeout but does not pretend that
+dropping the waiter cancelled the operation. A detached handler task retains an
+owned admission lease and execution permit until actual core completion.
+Detached and active handler work share the configured connection-count bound,
+so repeated timeouts cannot grow retained tasks without limit. Finalization
+waits for these leases. Listener shutdown cancels connections but does not
+manufacture cancellation of already-queued core work; callers that require
+core quiescence must use the session-store barrier.
 
 Transport admission does not decide when an Openraft joint or uniform
 configuration is committed. The session-store coordinator owns that order and
@@ -170,9 +186,10 @@ mutation or rebuild authority beside Openraft.
   current-to-successor admission window. `stage_successor` consumes the shared
   validated `SessionTopologyTransitionRequest`;
   `admit_successor_voting_after_catch_up`, `finalize_successor`, and
-  `abort_successor` require and idempotently bind both its transition ID and
-  deterministic request digest. Existing single-manifest server constructors
-  wrap the immutable binding unchanged.
+  `abort_successor` require store-issued learner-ready, uniform-commit, and
+  durable-abort proof tokens. Every token binds the transition ID, request
+  digest, epochs, and desired configuration. Existing single-manifest server
+  constructors wrap the immutable binding unchanged.
 - `RemoteSessionConsensusPeer::consensus_identity` and
   `local_consensus_node_id` expose redaction-safe exact binding evidence for a
   dynamic peer directory. A node ID alone is not sufficient staging proof.

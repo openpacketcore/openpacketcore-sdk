@@ -1853,6 +1853,10 @@ impl SessionConsensusPeer for RemoteSessionConsensusPeer {
         self.binding.remote_consensus_node_id()
     }
 
+    fn scope_identity(&self) -> Option<ConsensusIdentity> {
+        Some(self.binding.consensus_identity())
+    }
+
     async fn call(
         &self,
         request: SessionConsensusWireRequest,
@@ -1974,7 +1978,8 @@ impl SessionConsensusServer {
         self
     }
 
-    /// Set the maximum number of concurrently accepted connections.
+    /// Set the maximum number of concurrently accepted connections and handler
+    /// executions retained after a transport timeout.
     #[must_use]
     pub fn with_max_connections(mut self, max_connections: usize) -> Self {
         self.max_connections = max_connections;
@@ -2073,6 +2078,7 @@ impl SessionConsensusServer {
             handles: Vec::new(),
         }));
         let sem = Arc::new(Semaphore::new(self.max_connections));
+        let handler_executions = Arc::new(Semaphore::new(self.max_connections));
         let handler = self.handler;
         let tls_config = self.tls_config;
         let membership = self.membership;
@@ -2104,6 +2110,7 @@ impl SessionConsensusServer {
                 let handler = handler.clone();
                 let tls_config = tls_config.clone();
                 let membership = membership.clone();
+                let handler_executions = Arc::clone(&handler_executions);
                 let cancellation = accept_cancellation.clone();
                 let shutdown_rx = shutdown_rx.clone();
                 let reauthentication = reauthentication.clone();
@@ -2115,6 +2122,7 @@ impl SessionConsensusServer {
                         tls_config,
                         membership,
                         handler,
+                        handler_executions,
                         max_frame_size,
                         idle_timeout,
                         rpc_timeout,
@@ -2160,6 +2168,10 @@ pub struct SessionConsensusServerHandle {
 
 impl SessionConsensusServerHandle {
     /// Schedule immediate cancellation of the listener and all connections.
+    ///
+    /// A handler that already queued cancellation-unsafe consensus work is not
+    /// cancelled: it remains bounded by the server execution budget and keeps
+    /// its membership lease until the underlying operation completes.
     pub fn abort(&self) {
         self.cancellation.store(true, Ordering::Release);
         self.shutdown_tx.send_replace(true);
@@ -2175,6 +2187,10 @@ impl SessionConsensusServerHandle {
     }
 
     /// Cancel and await the listener and every registered connection.
+    ///
+    /// This does not manufacture cancellation of already-queued consensus-core
+    /// work. Such work may complete after this connection barrier while holding
+    /// its bounded execution permit and membership lease.
     pub async fn abort_and_wait(mut self) {
         self.abort();
         let _ = (&mut self.accept_handle).await;
@@ -2362,6 +2378,7 @@ async fn handle_consensus_connection(
     tls_config: Option<opc_tls::AuthenticatedServerConfig>,
     membership: SessionMembershipAdmission,
     handler: Arc<dyn SessionConsensusRpcHandler>,
+    handler_executions: Arc<Semaphore>,
     max_frame_size: usize,
     idle_timeout: Duration,
     rpc_timeout: Duration,
@@ -2419,6 +2436,7 @@ async fn handle_consensus_connection(
             },
             membership,
             handler,
+            handler_executions,
             max_frame_size,
             idle_timeout,
             rpc_timeout,
@@ -2437,6 +2455,7 @@ async fn handle_consensus_connection(
             PendingConsensusLifecycle::insecure(reauthentication.generation()),
             membership,
             handler,
+            handler_executions,
             max_frame_size,
             idle_timeout,
             rpc_timeout,
@@ -2504,6 +2523,36 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
+async fn write_consensus_call_response<W>(
+    writer: &mut W,
+    call_id: uuid::Uuid,
+    response: SessionConsensusWireResponse,
+    max_frame_size: usize,
+    timeout: Duration,
+    cancellation: &AtomicBool,
+    hard_rx: &mut tokio::sync::watch::Receiver<bool>,
+) -> Result<(), ProtocolError>
+where
+    W: AsyncWrite + Unpin,
+{
+    let deadline = tokio::time::Instant::now()
+        .checked_add(timeout)
+        .ok_or(ProtocolError::InvalidWireValue)?;
+    let outbound = SessionConsensusTransportResponse::Call { call_id, response };
+    tokio::select! {
+        biased;
+        _ = hard_rx.changed() => Ok(()),
+        result = write_frame_bounded_until_cancellable(
+            writer,
+            &outbound,
+            max_frame_size,
+            deadline,
+            cancellation,
+        ) => result,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_consensus<R, W>(
     reader: &mut R,
     writer: &mut W,
@@ -2511,6 +2560,7 @@ async fn dispatch_consensus<R, W>(
     pending_lifecycle: PendingConsensusLifecycle,
     membership: SessionMembershipAdmission,
     handler: Arc<dyn SessionConsensusRpcHandler>,
+    handler_executions: Arc<Semaphore>,
     max_frame_size: usize,
     idle_timeout: Duration,
     rpc_timeout: Duration,
@@ -2875,37 +2925,84 @@ where
                 result: Err(SessionConsensusPeerError::Protocol),
             }
         } else {
-            match membership
-                .revalidate_engine_scope(
+            let handler_deadline = tokio::time::Instant::now()
+                .checked_add(rpc_timeout)
+                .ok_or(ProtocolError::InvalidWireValue)?;
+            let execution_permit = tokio::select! {
+                biased;
+                _ = hard_rx.changed() => return Ok(()),
+                permit = tokio::time::timeout_at(
+                    handler_deadline,
+                    Arc::clone(&handler_executions).acquire_owned(),
+                ) => match permit {
+                    Ok(Ok(permit)) => Some(permit),
+                    Ok(Err(_)) | Err(_) => None,
+                },
+            };
+            let Some(execution_permit) = execution_permit else {
+                return write_consensus_call_response(
+                    writer,
+                    call_id,
+                    SessionConsensusWireResponse {
+                        result: Err(SessionConsensusPeerError::Timeout),
+                    },
+                    effective_response_frame_size,
+                    idle_timeout,
+                    connection_cancellation,
+                    &mut hard_rx,
+                )
+                .await;
+            };
+            let scope_admission = tokio::time::timeout_at(
+                handler_deadline,
+                membership.revalidate_engine_scope(
                     &membership_scope,
                     request.identity,
                     request.sender,
                     request.family,
-                )
-                .await
-            {
-                Err(error) => SessionConsensusWireResponse { result: Err(error) },
-                Ok(membership_lease) => {
+                ),
+            )
+            .await;
+            match scope_admission {
+                Ok(Err(error)) => SessionConsensusWireResponse { result: Err(error) },
+                Err(_) => SessionConsensusWireResponse {
+                    result: Err(SessionConsensusPeerError::Timeout),
+                },
+                Ok(Ok(membership_lease)) => {
+                    let handler = Arc::clone(&handler);
+                    let authenticated_sender = hello.sender_node_id;
+                    let mut handler_task = tokio::spawn(async move {
+                        let _membership_lease = membership_lease;
+                        let _execution_permit = execution_permit;
+                        handler.handle(authenticated_sender, request).await
+                    });
                     let handled = tokio::select! {
                         biased;
                         _ = hard_rx.changed() => None,
-                        handled = tokio::time::timeout(
-                            rpc_timeout,
-                            handler.handle(hello.sender_node_id, request),
-                        ) => Some(handled),
+                        handled = tokio::time::timeout_at(handler_deadline, &mut handler_task) => {
+                            Some(handled)
+                        },
                     };
-                    let response = match handled {
-                        None => return Ok(()),
-                        Some(Ok(response)) if response.validate().is_ok() => response,
-                        Some(Ok(_)) => SessionConsensusWireResponse {
+                    match handled {
+                        None => {
+                            drop(handler_task);
+                            return Ok(());
+                        }
+                        Some(Ok(Ok(response))) if response.validate().is_ok() => response,
+                        Some(Ok(Ok(_))) | Some(Ok(Err(_))) => SessionConsensusWireResponse {
                             result: Err(SessionConsensusPeerError::Protocol),
                         },
-                        Some(Err(_)) => SessionConsensusWireResponse {
-                            result: Err(SessionConsensusPeerError::Timeout),
-                        },
-                    };
-                    drop(membership_lease);
-                    response
+                        Some(Err(_)) => {
+                            // Dropping a JoinHandle detaches rather than cancels the task.
+                            // The bounded execution permit and owned membership lease remain
+                            // held until the handler (and any queued RaftCore call it awaits)
+                            // reaches an actual terminal result.
+                            drop(handler_task);
+                            SessionConsensusWireResponse {
+                                result: Err(SessionConsensusPeerError::Timeout),
+                            }
+                        }
+                    }
                 }
             }
         };
@@ -2962,6 +3059,49 @@ mod tests {
             SessionConsensusWireResponse {
                 result: Ok(request.payload),
             }
+        }
+    }
+
+    #[derive(Debug)]
+    struct CancellationUnsafeQueuedHandler {
+        queued: Arc<Notify>,
+        release_core: Arc<Notify>,
+        core_completed: Arc<Notify>,
+    }
+
+    impl CancellationUnsafeQueuedHandler {
+        fn new() -> Self {
+            Self {
+                queued: Arc::new(Notify::new()),
+                release_core: Arc::new(Notify::new()),
+                core_completed: Arc::new(Notify::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl SessionConsensusRpcHandler for CancellationUnsafeQueuedHandler {
+        async fn handle(
+            &self,
+            _authenticated_sender: SessionConsensusNodeId,
+            request: SessionConsensusWireRequest,
+        ) -> SessionConsensusWireResponse {
+            let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+            let queued = Arc::clone(&self.queued);
+            let release_core = Arc::clone(&self.release_core);
+            let core_completed = Arc::clone(&self.core_completed);
+            tokio::spawn(async move {
+                let release = release_core.notified();
+                queued.notify_one();
+                release.await;
+                core_completed.notify_one();
+                let _ = completion_tx.send(SessionConsensusWireResponse {
+                    result: Ok(request.payload),
+                });
+            });
+            completion_rx.await.unwrap_or(SessionConsensusWireResponse {
+                result: Err(SessionConsensusPeerError::Unavailable),
+            })
         }
     }
 
@@ -3840,6 +3980,7 @@ mod tests {
             pending,
             SessionMembershipAdmission::from_current_binding(server_binding),
             Arc::new(CountingHandler(AtomicUsize::new(0))),
+            Arc::new(Semaphore::new(1)),
             MAX_NEGOTIATED_FRAME_SIZE,
             Duration::from_millis(20),
             Duration::from_secs(1),
@@ -3913,6 +4054,7 @@ mod tests {
             pending,
             SessionMembershipAdmission::from_current_binding(server_binding),
             Arc::new(CountingHandler(AtomicUsize::new(0))),
+            Arc::new(Semaphore::new(1)),
             MAX_NEGOTIATED_FRAME_SIZE,
             Duration::from_millis(20),
             Duration::from_secs(1),
@@ -3956,6 +4098,7 @@ mod tests {
             pending,
             SessionMembershipAdmission::from_current_binding(server_binding),
             handler.clone(),
+            Arc::new(Semaphore::new(1)),
             MAX_NEGOTIATED_FRAME_SIZE,
             Duration::from_secs(1),
             Duration::from_secs(1),
@@ -4022,6 +4165,7 @@ mod tests {
             pending,
             SessionMembershipAdmission::from_current_binding(server_binding),
             handler.clone(),
+            Arc::new(Semaphore::new(1)),
             MAX_NEGOTIATED_FRAME_SIZE,
             Duration::from_secs(1),
             Duration::from_secs(1),
@@ -4125,6 +4269,7 @@ mod tests {
             pending,
             SessionMembershipAdmission::from_current_binding(server_binding),
             handler.clone(),
+            Arc::new(Semaphore::new(1)),
             MAX_NEGOTIATED_FRAME_SIZE,
             Duration::from_secs(1),
             Duration::from_secs(1),
@@ -4596,7 +4741,7 @@ mod tests {
             })
         );
         membership
-            .admit_successor_voting_after_catch_up(&request)
+            .admit_successor_voting_after_catch_up_for_test(&request)
             .await
             .expect("admit successor voting after catch-up");
         assert_eq!(
@@ -4625,7 +4770,7 @@ mod tests {
         );
 
         membership
-            .finalize_successor(&request)
+            .finalize_successor_for_test(&request)
             .await
             .expect("finalize successor");
         assert_eq!(
@@ -4654,6 +4799,95 @@ mod tests {
             })
         );
         assert_eq!(handler.0.load(Ordering::Relaxed), 4);
+        handle.abort_and_wait().await;
+    }
+
+    #[tokio::test]
+    async fn timed_out_cancellation_unsafe_handler_keeps_old_scope_leased_until_core_completion() {
+        let current = membership_manifest(1, &[1, 2, 3]);
+        let successor = membership_manifest(2, &[1, 2, 3, 4, 5]);
+        let client_binding = current
+            .bind_local(ReplicaId::new("replica-1").expect("client ID"))
+            .expect("client binding")
+            .bind_remote(ReplicaId::new("replica-3").expect("server ID"))
+            .expect("remote binding");
+        let server_binding = current
+            .bind_local(ReplicaId::new("replica-3").expect("server ID"))
+            .expect("server binding");
+        let membership = SessionMembershipAdmission::from_current_binding(server_binding);
+        let request = membership_transition_request(
+            SessionTopologyTransitionId::from_bytes([32; 16]),
+            1,
+            2,
+            &[1, 2, 3, 4, 5],
+        );
+        membership
+            .stage_successor(&request, successor)
+            .await
+            .expect("stage successor");
+        membership
+            .admit_successor_voting_after_catch_up_for_test(&request)
+            .await
+            .expect("admit successor voting");
+
+        let handler = Arc::new(CancellationUnsafeQueuedHandler::new());
+        let server = SessionConsensusServer::new_insecure_with_membership_admission(
+            handler.clone(),
+            membership.clone(),
+        )
+        .with_rpc_timeout(Duration::from_millis(20));
+        let (handle, addr) = server
+            .listen("127.0.0.1:0".parse().expect("listen address"))
+            .await
+            .expect("listen");
+        let peer = RemoteSessionConsensusPeer::new_insecure(
+            client_binding.clone(),
+            addr,
+            Some(Duration::from_secs(1)),
+        );
+        let wire_request = SessionConsensusWireRequest::try_new(
+            client_binding.consensus_identity(),
+            client_binding.local_consensus_node_id(),
+            SessionConsensusRpcFamily::AppendEntries,
+            b"queued-old-scope-call".to_vec(),
+        )
+        .expect("wire request");
+        let call = tokio::spawn(async move { peer.call(wire_request).await });
+        tokio::time::timeout(Duration::from_secs(1), handler.queued.notified())
+            .await
+            .expect("handler must queue its cancellation-unsafe core operation");
+        assert_eq!(
+            call.await.expect("call task"),
+            Ok(SessionConsensusWireResponse {
+                result: Err(SessionConsensusPeerError::Timeout),
+            })
+        );
+
+        let finalizer_membership = membership.clone();
+        let finalizer_request = request.clone();
+        let finalizer = tokio::spawn(async move {
+            finalizer_membership
+                .finalize_successor_for_test(&finalizer_request)
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !finalizer.is_finished(),
+            "transport timeout must not release the old-scope lease while queued core work runs"
+        );
+
+        let core_completed = handler.core_completed.notified();
+        handler.release_core.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(1), core_completed)
+            .await
+            .expect("queued core operation must complete after release");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), finalizer)
+                .await
+                .expect("finalization must resume after actual core completion")
+                .expect("finalizer task"),
+            Ok(crate::membership::SessionMembershipTransitionResult::Finalized)
+        );
         handle.abort_and_wait().await;
     }
 

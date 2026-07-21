@@ -97,12 +97,13 @@ pub use handover::{
 };
 pub use lease::{LeaseGuard, SessionLeaseManager};
 pub use membership::{
+    SessionTopologyAbortAdmissionProof, SessionTopologyLearnersReadyAdmissionProof,
     SessionTopologyTransitionDigest, SessionTopologyTransitionError,
     SessionTopologyTransitionEvidence, SessionTopologyTransitionId,
     SessionTopologyTransitionLogIndexes, SessionTopologyTransitionOutcome,
     SessionTopologyTransitionPhase, SessionTopologyTransitionReason,
     SessionTopologyTransitionRequest, SessionTopologyTransitionStatus,
-    SESSION_TOPOLOGY_TRANSITION_MAX_OPERATION_TIMEOUT,
+    SessionTopologyUniformCommitAdmissionProof, SESSION_TOPOLOGY_TRANSITION_MAX_OPERATION_TIMEOUT,
 };
 pub use model::{
     CustomSessionKeyType, FenceToken, Generation, HandoverPhase, HandoverTxId, OwnerId, SessionKey,

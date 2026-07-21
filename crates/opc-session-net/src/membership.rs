@@ -8,14 +8,17 @@ use std::fmt;
 use std::sync::Arc;
 
 use opc_consensus::{ConsensusIdentity, ConsensusNodeId, ConsensusRpcFamily};
-pub use opc_session_store::SessionTopologyTransitionId;
 use opc_session_store::{
     ReplicaId, SessionConsensusPeerError, SessionTopologyTransitionDigest,
     SessionTopologyTransitionError, SessionTopologyTransitionRequest,
 };
+pub use opc_session_store::{
+    SessionTopologyAbortAdmissionProof, SessionTopologyLearnersReadyAdmissionProof,
+    SessionTopologyTransitionId, SessionTopologyUniformCommitAdmissionProof,
+};
 use opc_types::SpiffeId;
 use thiserror::Error;
-use tokio::sync::{RwLock, RwLockReadGuard};
+use tokio::sync::{OwnedRwLockReadGuard, RwLock};
 
 use crate::identity::{LocalReplicaBinding, SessionConfigurationEpoch, SessionReplicationManifest};
 
@@ -51,6 +54,12 @@ pub enum SessionMembershipAdmissionError {
     /// The immutable successor does not exactly encode the validated request.
     #[error("session membership successor does not match the validated transition")]
     SuccessorManifestMismatch,
+    /// The request cluster does not match the listener's current authority.
+    #[error("session membership current manifest does not match the validated transition")]
+    CurrentManifestMismatch,
+    /// Distinct old/new members alias one authenticated or physical identity.
+    #[error("session membership joint manifests contain an identity alias")]
+    JointManifestIdentityConflict,
     /// The local replica is absent from both sides of the transition.
     #[error("local replica is absent from the membership transition")]
     MissingLocalReplica,
@@ -68,6 +77,10 @@ impl SessionMembershipAdmissionError {
         match self {
             Self::Topology(error) => error.reason_code(),
             Self::SuccessorManifestMismatch => "session_membership_successor_manifest_mismatch",
+            Self::CurrentManifestMismatch => "session_membership_current_manifest_mismatch",
+            Self::JointManifestIdentityConflict => {
+                "session_membership_joint_manifest_identity_conflict"
+            }
             Self::MissingLocalReplica => "session_membership_missing_local_replica",
             Self::TransitionNotStaged => "session_membership_transition_not_staged",
             Self::SuccessorNotReady => "session_membership_successor_not_ready",
@@ -233,6 +246,9 @@ impl SessionMembershipAdmission {
         {
             return Err(SessionMembershipAdmissionError::SuccessorManifestMismatch);
         }
+        if state.current.consensus_identity().cluster_id() != request.cluster_id() {
+            return Err(SessionMembershipAdmissionError::CurrentManifestMismatch);
+        }
 
         if let Some(pending) = &state.pending {
             if pending.transition_id == transition_id
@@ -285,6 +301,12 @@ impl SessionMembershipAdmission {
         if !state.current.retained_member_bindings_match(&successor) {
             return Err(SessionMembershipAdmissionError::SuccessorManifestMismatch);
         }
+        if !state
+            .current
+            .transition_member_aliases_are_unique(&successor)
+        {
+            return Err(SessionMembershipAdmissionError::JointManifestIdentityConflict);
+        }
         if state
             .current
             .consensus_node_id(&self.local_replica_id)
@@ -312,9 +334,22 @@ impl SessionMembershipAdmission {
     /// every added learner is caught up and identity-admitted. The transport
     /// cannot inspect Openraft replication progress; before this explicit
     /// promotion it admits only AppendEntries and snapshot catch-up traffic
-    /// under the successor identity. Both the transition ID and deterministic
-    /// request digest must match the staged request.
+    /// under the successor identity. `proof` is minted only by the session-store
+    /// coordinator after exact learner progress is verified. Its transition ID,
+    /// epochs, desired configuration, and request digest must match the staged
+    /// request.
     pub async fn admit_successor_voting_after_catch_up(
+        &self,
+        request: &SessionTopologyTransitionRequest,
+        proof: &SessionTopologyLearnersReadyAdmissionProof,
+    ) -> Result<SessionMembershipTransitionResult, SessionMembershipAdmissionError> {
+        if !proof.validates_request(request) {
+            return Err(SessionTopologyTransitionError::IdempotencyConflict.into());
+        }
+        self.admit_successor_voting_validated(request).await
+    }
+
+    async fn admit_successor_voting_validated(
         &self,
         request: &SessionTopologyTransitionRequest,
     ) -> Result<SessionMembershipTransitionResult, SessionMembershipAdmissionError> {
@@ -361,8 +396,20 @@ impl SessionMembershipAdmission {
     ///
     /// The exclusive update waits for already-admitted handler calls to finish.
     /// After it returns, no old connection can start another handler call.
-    /// Both the transition ID and deterministic request digest must match.
+    /// `proof` is minted only after the desired uniform Openraft membership is
+    /// durably committed. Its exact transition scope must match the request.
     pub async fn finalize_successor(
+        &self,
+        request: &SessionTopologyTransitionRequest,
+        proof: &SessionTopologyUniformCommitAdmissionProof,
+    ) -> Result<SessionMembershipTransitionResult, SessionMembershipAdmissionError> {
+        if !proof.validates_request(request) {
+            return Err(SessionTopologyTransitionError::IdempotencyConflict.into());
+        }
+        self.finalize_successor_validated(request).await
+    }
+
+    async fn finalize_successor_validated(
         &self,
         request: &SessionTopologyTransitionRequest,
     ) -> Result<SessionMembershipTransitionResult, SessionMembershipAdmissionError> {
@@ -413,9 +460,21 @@ impl SessionMembershipAdmission {
         Ok(SessionMembershipTransitionResult::Finalized)
     }
 
-    /// Atomically remove a staged successor before the consensus commit point.
-    /// Both the transition ID and deterministic request digest must match.
+    /// Atomically remove a staged successor after a pre-joint abort is durable.
+    /// `proof` cannot be constructed for a joint-or-later transition and its
+    /// exact transition scope must match the request.
     pub async fn abort_successor(
+        &self,
+        request: &SessionTopologyTransitionRequest,
+        proof: &SessionTopologyAbortAdmissionProof,
+    ) -> Result<SessionMembershipTransitionResult, SessionMembershipAdmissionError> {
+        if !proof.validates_request(request) {
+            return Err(SessionTopologyTransitionError::IdempotencyConflict.into());
+        }
+        self.abort_successor_validated(request).await
+    }
+
+    async fn abort_successor_validated(
         &self,
         request: &SessionTopologyTransitionRequest,
     ) -> Result<SessionMembershipTransitionResult, SessionMembershipAdmissionError> {
@@ -457,6 +516,30 @@ impl SessionMembershipAdmission {
             to_epoch,
         });
         Ok(SessionMembershipTransitionResult::Aborted)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn admit_successor_voting_after_catch_up_for_test(
+        &self,
+        request: &SessionTopologyTransitionRequest,
+    ) -> Result<SessionMembershipTransitionResult, SessionMembershipAdmissionError> {
+        self.admit_successor_voting_validated(request).await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn finalize_successor_for_test(
+        &self,
+        request: &SessionTopologyTransitionRequest,
+    ) -> Result<SessionMembershipTransitionResult, SessionMembershipAdmissionError> {
+        self.finalize_successor_validated(request).await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn abort_successor_for_test(
+        &self,
+        request: &SessionTopologyTransitionRequest,
+    ) -> Result<SessionMembershipTransitionResult, SessionMembershipAdmissionError> {
+        self.abort_successor_validated(request).await
     }
 
     /// Capture bounded, redaction-safe admission evidence.
@@ -530,14 +613,14 @@ impl SessionMembershipAdmission {
         Err(SessionConsensusPeerError::ScopeMismatch)
     }
 
-    pub(crate) async fn revalidate_engine_scope<'a>(
-        &'a self,
+    pub(crate) async fn revalidate_engine_scope(
+        &self,
         scope: &SessionMembershipEngineScope,
         identity: ConsensusIdentity,
         sender_node_id: ConsensusNodeId,
         family: ConsensusRpcFamily,
-    ) -> Result<SessionMembershipEngineLease<'a>, SessionConsensusPeerError> {
-        let state = self.state.read().await;
+    ) -> Result<SessionMembershipEngineLease, SessionConsensusPeerError> {
+        let state = Arc::clone(&self.state).read_owned().await;
         if identity != scope.binding.consensus_identity() || sender_node_id != scope.sender_node_id
         {
             return Err(SessionConsensusPeerError::ScopeMismatch);
@@ -563,11 +646,11 @@ impl SessionMembershipAdmission {
         Ok(SessionMembershipEngineLease { _state: state })
     }
 
-    pub(crate) async fn revalidate_bootstrap_scope<'a>(
-        &'a self,
+    pub(crate) async fn revalidate_bootstrap_scope(
+        &self,
         scope: &SessionMembershipEngineScope,
-    ) -> Result<SessionMembershipEngineLease<'a>, SessionConsensusPeerError> {
-        let state = self.state.read().await;
+    ) -> Result<SessionMembershipEngineLease, SessionConsensusPeerError> {
+        let state = Arc::clone(&self.state).read_owned().await;
         let admitted = manifest_matches_scope(&state.current, scope, &self.local_replica_id)
             || state.pending.as_ref().is_some_and(|pending| {
                 manifest_matches_scope(&pending.manifest, scope, &self.local_replica_id)
@@ -600,8 +683,8 @@ impl SessionMembershipEngineScope {
     }
 }
 
-pub(crate) struct SessionMembershipEngineLease<'a> {
-    _state: RwLockReadGuard<'a, MembershipAdmissionState>,
+pub(crate) struct SessionMembershipEngineLease {
+    _state: OwnedRwLockReadGuard<MembershipAdmissionState>,
 }
 
 fn manifest_matches_scope(
@@ -668,9 +751,17 @@ mod tests {
         epoch: u64,
         descriptors: Vec<QuorumReplicaDescriptor>,
     ) -> Arc<SessionReplicationManifest> {
+        manifest_in_cluster("membership-test", epoch, descriptors)
+    }
+
+    fn manifest_in_cluster(
+        cluster: &str,
+        epoch: u64,
+        descriptors: Vec<QuorumReplicaDescriptor>,
+    ) -> Arc<SessionReplicationManifest> {
         Arc::new(
             SessionReplicationManifest::try_new_with_epoch(
-                SessionClusterId::new("membership-test").expect("test cluster"),
+                SessionClusterId::new(cluster).expect("test cluster"),
                 SessionConfigurationGeneration::new("legacy-test").expect("test generation"),
                 SessionConfigurationEpoch::new(epoch).expect("test epoch"),
                 descriptors,
@@ -780,13 +871,13 @@ mod tests {
         );
         assert_eq!(
             admission
-                .admit_successor_voting_after_catch_up(&expand_request)
+                .admit_successor_voting_after_catch_up_for_test(&expand_request)
                 .await,
             Ok(SessionMembershipTransitionResult::VotingAdmitted)
         );
         assert_eq!(
             admission
-                .admit_successor_voting_after_catch_up(&expand_request)
+                .admit_successor_voting_after_catch_up_for_test(&expand_request)
                 .await,
             Ok(SessionMembershipTransitionResult::AlreadyVotingAdmitted)
         );
@@ -815,7 +906,7 @@ mod tests {
         );
 
         assert_eq!(
-            admission.finalize_successor(&expand_request).await,
+            admission.finalize_successor_for_test(&expand_request).await,
             Ok(SessionMembershipTransitionResult::Finalized)
         );
         assert_eq!(
@@ -862,7 +953,7 @@ mod tests {
             .await
             .is_ok());
         assert_eq!(
-            admission.finalize_successor(&shrink_request).await,
+            admission.finalize_successor_for_test(&shrink_request).await,
             Err(SessionMembershipAdmissionError::SuccessorNotReady),
             "a staged learner cannot become current before catch-up admission"
         );
@@ -874,12 +965,12 @@ mod tests {
         assert!(!not_ready.pending_voting_admitted());
         assert_eq!(
             admission
-                .admit_successor_voting_after_catch_up(&shrink_request)
+                .admit_successor_voting_after_catch_up_for_test(&shrink_request)
                 .await,
             Ok(SessionMembershipTransitionResult::VotingAdmitted)
         );
         assert_eq!(
-            admission.finalize_successor(&shrink_request).await,
+            admission.finalize_successor_for_test(&shrink_request).await,
             Ok(SessionMembershipTransitionResult::Finalized)
         );
         assert_eq!(admission.snapshot().await.current_members(), 3);
@@ -902,11 +993,11 @@ mod tests {
             .expect("pending bootstrap before abort");
 
         assert_eq!(
-            admission.abort_successor(&request).await,
+            admission.abort_successor_for_test(&request).await,
             Ok(SessionMembershipTransitionResult::Aborted)
         );
         assert_eq!(
-            admission.abort_successor(&request).await,
+            admission.abort_successor_for_test(&request).await,
             Ok(SessionMembershipTransitionResult::AlreadyAborted)
         );
         assert_eq!(
@@ -978,6 +1069,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stage_rejects_rebinding_the_current_listener_to_another_cluster() {
+        let current = manifest_in_cluster(
+            "current-membership-cluster",
+            1,
+            (1..=3).map(descriptor).collect(),
+        );
+        let successor = manifest_in_cluster(
+            "different-membership-cluster",
+            2,
+            (1..=5).map(descriptor).collect(),
+        );
+        let request = SessionTopologyTransitionRequest::try_new(
+            SessionTopologyTransitionId::from_bytes([41; 16]),
+            SessionConsensusClusterId::new("different-membership-cluster")
+                .expect("different cluster"),
+            SessionConfigurationEpoch::new(1).expect("expected epoch"),
+            SessionConfigurationEpoch::new(2).expect("desired epoch"),
+            (1..=5).map(descriptor).collect(),
+            Duration::from_secs(10),
+        )
+        .expect("cross-cluster-shaped request");
+        let admission = SessionMembershipAdmission::new(current, replica_id(2));
+
+        assert_eq!(
+            admission.stage_successor(&request, successor).await,
+            Err(SessionMembershipAdmissionError::CurrentManifestMismatch)
+        );
+        assert_eq!(
+            admission.snapshot().await.pending_identity(),
+            None,
+            "a cluster-rebinding request must leave no staged admission"
+        );
+    }
+
+    #[derive(Clone, Copy)]
+    enum CrossManifestAlias {
+        Endpoint,
+        TlsIdentity,
+        BackingIdentity,
+    }
+
+    fn aliased_replacement_descriptor(alias: CrossManifestAlias) -> QuorumReplicaDescriptor {
+        let removed = descriptor(1);
+        let replacement = descriptor(4);
+        QuorumReplicaDescriptor::new(
+            replacement.replica_id().clone(),
+            match alias {
+                CrossManifestAlias::Endpoint => removed.endpoint().clone(),
+                CrossManifestAlias::TlsIdentity | CrossManifestAlias::BackingIdentity => {
+                    replacement.endpoint().clone()
+                }
+            },
+            match alias {
+                CrossManifestAlias::TlsIdentity => removed.tls_identity().clone(),
+                CrossManifestAlias::Endpoint | CrossManifestAlias::BackingIdentity => {
+                    replacement.tls_identity().clone()
+                }
+            },
+            replacement.failure_domain().clone(),
+            match alias {
+                CrossManifestAlias::BackingIdentity => removed.backing_identity().clone(),
+                CrossManifestAlias::Endpoint | CrossManifestAlias::TlsIdentity => {
+                    replacement.backing_identity().clone()
+                }
+            },
+        )
+    }
+
+    async fn assert_cross_manifest_alias_rejected(alias: CrossManifestAlias) {
+        let current = manifest(1, &[1, 2, 3]);
+        let desired = vec![
+            descriptor(2),
+            descriptor(3),
+            aliased_replacement_descriptor(alias),
+        ];
+        let successor = manifest_with_descriptors(2, desired.clone());
+        let request = SessionTopologyTransitionRequest::try_new(
+            SessionTopologyTransitionId::from_bytes([42; 16]),
+            SessionConsensusClusterId::new("membership-test").expect("test cluster"),
+            SessionConfigurationEpoch::new(1).expect("expected epoch"),
+            SessionConfigurationEpoch::new(2).expect("desired epoch"),
+            desired,
+            Duration::from_secs(10),
+        )
+        .expect("individually valid successor request");
+        let admission = SessionMembershipAdmission::new(current, replica_id(2));
+
+        assert_eq!(
+            admission.stage_successor(&request, successor).await,
+            Err(SessionMembershipAdmissionError::JointManifestIdentityConflict)
+        );
+        assert!(admission.snapshot().await.pending_identity().is_none());
+    }
+
+    #[tokio::test]
+    async fn stage_rejects_endpoint_tls_and_backing_aliases_across_joint_manifests() {
+        assert_cross_manifest_alias_rejected(CrossManifestAlias::Endpoint).await;
+        assert_cross_manifest_alias_rejected(CrossManifestAlias::TlsIdentity).await;
+        assert_cross_manifest_alias_rejected(CrossManifestAlias::BackingIdentity).await;
+    }
+
+    #[tokio::test]
     async fn joining_local_replica_is_closed_until_its_successor_is_staged() {
         let current = manifest(1, &[1, 2, 3]);
         let pending = manifest(2, &[1, 2, 3, 4, 5]);
@@ -1017,7 +1210,7 @@ mod tests {
             .await
             .expect("stage successor");
         admission
-            .admit_successor_voting_after_catch_up(&request)
+            .admit_successor_voting_after_catch_up_for_test(&request)
             .await
             .expect("admit successor voting after catch-up");
         let old_scope = bootstrap(&admission, &current, 1, 3, Some(&spiffe(1)))
@@ -1037,7 +1230,7 @@ mod tests {
         let finalizer_request = request.clone();
         let finalizer = tokio::spawn(async move {
             finalizer_admission
-                .finalize_successor(&finalizer_request)
+                .finalize_successor_for_test(&finalizer_request)
                 .await
         });
         tokio::task::yield_now().await;
@@ -1100,7 +1293,7 @@ mod tests {
         .expect("conflicting retry request");
         assert_eq!(
             admission
-                .finalize_successor(&same_id_different_digest)
+                .finalize_successor_for_test(&same_id_different_digest)
                 .await,
             Err(SessionMembershipAdmissionError::Topology(
                 SessionTopologyTransitionError::IdempotencyConflict
@@ -1116,17 +1309,17 @@ mod tests {
             ))
         );
         assert_eq!(
-            admission.finalize_successor(&other_request).await,
+            admission.finalize_successor_for_test(&other_request).await,
             Err(SessionMembershipAdmissionError::Topology(
                 SessionTopologyTransitionError::IdempotencyConflict
             ))
         );
         admission
-            .admit_successor_voting_after_catch_up(&request)
+            .admit_successor_voting_after_catch_up_for_test(&request)
             .await
             .expect("admit successor voting after catch-up");
         admission
-            .finalize_successor(&request)
+            .finalize_successor_for_test(&request)
             .await
             .expect("finalize successor");
         assert_eq!(
