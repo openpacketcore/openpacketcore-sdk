@@ -8,7 +8,36 @@ state, algorithms, key material, Linux backends, mocks, unsupported backends,
 and rollback-aware composite operations.
 
 The crate does not implement IKE negotiation, ESP packet processing, namespace
-management, product SA/SPD policy, or deployment defaults.
+creation/switching, product SA/SPD policy, or deployment defaults. It can bind
+backend execution to a calling thread's already-selected Linux network
+namespace.
+
+## Network-namespace binding
+
+`LinuxXfrmBackend::bind_current_network_namespace` captures the calling
+thread's current network namespace as an opaque device/inode identity and
+starts a dedicated actor thread that inherits it. Invoke the binding method on
+the thread that has already entered the intended namespace; the SDK does not
+call `setns(2)` or select a namespace path.
+
+```rust,no_run
+use opc_ipsec_xfrm::{LinuxXfrmBackend, XfrmBackend};
+
+# async fn example() -> Result<(), opc_ipsec_xfrm::XfrmError> {
+let backend = LinuxXfrmBackend::new().bind_current_network_namespace()?;
+let capability = backend.probe().await?;
+# let _ = capability;
+# Ok(())
+# }
+```
+
+All SA, policy, capability-probe, relocation, and fixed-DSCP work then runs on
+that actor. The 64-entry queue applies bounded backpressure. Cancellation while
+waiting for queue admission submits nothing; after admission, the actor drains
+the operation even when the caller drops its future. Losing the reply to an
+admitted mutation is reported as `StateIndeterminate` (`ALLOCSPI` included),
+while a lost read/probe reply is `Unavailable`. Dropping the final backend clone
+closes the queue and lets the detached actor drain without blocking `Drop`.
 
 ## API Shape
 
@@ -17,6 +46,8 @@ management, product SA/SPD policy, or deployment defaults.
   capability probing.
 - `LinuxXfrmBackend`: safe adapter over `NETLINK_XFRM` through
   `opc-linux-xfrm-sys`.
+- `NamespaceBoundLinuxXfrmBackend`: cloneable bounded actor that keeps every
+  Linux XFRM operation in one captured network namespace.
 - `MockXfrmBackend`: deterministic in-memory backend with operation capture,
   a source-compatible separate `MockSaRelocation` log, and failure injection.
 - `UnsupportedXfrmBackend`: trait-compatible unsupported backend.

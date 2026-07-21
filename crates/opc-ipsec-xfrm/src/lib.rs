@@ -16,8 +16,10 @@
 //! safety fences in place and perform exact old/new tuple reconciliation before
 //! retrying or releasing writer exclusion after cancellation or process loss.
 //! The crate never infers relocation from packet source addresses and deliberately
-//! does not implement IKE, ESP processing, namespace management, or deployment
-//! policy.
+//! does not implement IKE, ESP processing, namespace creation/switching, or
+//! deployment policy. [`LinuxXfrmBackend::bind_current_network_namespace`]
+//! can pin backend execution to the calling thread's already-selected network
+//! namespace without exposing its filesystem identity.
 //!
 //! Raw Linux netlink work stays in [`opc_linux_xfrm_sys`]; this crate is safe
 //! Rust and never performs `unsafe` operations.
@@ -33,6 +35,7 @@ pub mod ikev2;
 pub mod linux;
 pub mod mock;
 pub mod model;
+mod namespace;
 pub mod staged;
 pub mod unsupported;
 
@@ -69,6 +72,7 @@ pub use model::{
     XFRM_AEAD_RFC4106_GCM_AES, XFRM_AUTH_HMAC_SHA256, XFRM_AUTH_HMAC_SHA384, XFRM_AUTH_HMAC_SHA512,
     XFRM_ENCR_CBC_AES, XFRM_ENCR_NULL,
 };
+pub use namespace::{NamespaceBoundLinuxXfrmBackend, LINUX_XFRM_NAMESPACE_ACTOR_CAPACITY};
 pub use opc_types::DscpCodepoint;
 pub use staged::{
     XfrmIndeterminateOperations, XfrmInstallCommitError, XfrmInstallJournal, XfrmInstallObject,

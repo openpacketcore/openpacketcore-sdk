@@ -22,6 +22,7 @@ use zeroize::Zeroizing;
 
 use crate::dscp::{production_runtime, LinuxXfrmDscpMarkingConfig, XfrmDscpRuntime};
 use crate::model::{validate_relocate_sa_request, validate_sa_output_mark, validate_sa_query};
+use crate::namespace::{self, NamespaceBoundLinuxXfrmBackend, NetworkNamespaceBinding};
 use crate::{
     AllocateSpiRequest, DscpCodepoint, InstallPolicyRequest, InstallSaRequest, IpAddress,
     LifetimeConfig, LifetimeCurrent, PolicyParameters, QuerySaRequest, RekeyPolicyRequest,
@@ -67,7 +68,7 @@ const RELOCATION_CAPABILITY_AVAILABLE: u8 = 1;
 const RELOCATION_CAPABILITY_MISSING: u8 = 2;
 const SA_RELOCATION_PROBE_SPI: u32 = 0xffff_fffe;
 
-type SensitiveBuffer = Zeroizing<Vec<u8>>;
+pub(crate) type SensitiveBuffer = Zeroizing<Vec<u8>>;
 
 /// Runtime behavior for the safe Linux XFRM backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,6 +110,7 @@ struct LinuxXfrmBackendInner {
     dscp_runtime: Arc<dyn XfrmDscpRuntime>,
     dscp_xfrm_attributes_verified: AtomicBool,
     sa_relocation_capability: AtomicU8,
+    namespace_binding: Option<NetworkNamespaceBinding>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,6 +153,7 @@ impl LinuxXfrmBackend {
                 dscp_runtime: production_runtime(),
                 dscp_xfrm_attributes_verified: AtomicBool::new(false),
                 sa_relocation_capability: AtomicU8::new(RELOCATION_CAPABILITY_UNKNOWN),
+                namespace_binding: None,
             }),
         }
     }
@@ -181,12 +184,13 @@ impl LinuxXfrmBackend {
                 dscp_runtime: runtime,
                 dscp_xfrm_attributes_verified: AtomicBool::new(false),
                 sa_relocation_capability: AtomicU8::new(RELOCATION_CAPABILITY_UNKNOWN),
+                namespace_binding: None,
             }),
         })
     }
 
     #[cfg(test)]
-    fn with_transport<T>(transport: T) -> Self
+    pub(crate) fn with_transport<T>(transport: T) -> Self
     where
         T: LinuxXfrmTransport + 'static,
     {
@@ -203,12 +207,13 @@ impl LinuxXfrmBackend {
                 dscp_runtime: production_runtime(),
                 dscp_xfrm_attributes_verified: AtomicBool::new(false),
                 sa_relocation_capability: AtomicU8::new(RELOCATION_CAPABILITY_UNKNOWN),
+                namespace_binding: None,
             }),
         }
     }
 
     #[cfg(test)]
-    fn with_transport_and_dscp_runtime<T, R>(
+    pub(crate) fn with_transport_and_dscp_runtime<T, R>(
         transport: T,
         dscp_config: LinuxXfrmDscpMarkingConfig,
         dscp_runtime: R,
@@ -232,8 +237,69 @@ impl LinuxXfrmBackend {
                 dscp_runtime: Arc::new(dscp_runtime),
                 dscp_xfrm_attributes_verified: AtomicBool::new(false),
                 sa_relocation_capability: AtomicU8::new(RELOCATION_CAPABILITY_UNKNOWN),
+                namespace_binding: None,
             }),
         })
+    }
+
+    /// Bind this backend to the calling thread's current Linux network
+    /// namespace.
+    ///
+    /// The returned backend owns a bounded actor on a dedicated OS thread that
+    /// inherits the caller's namespace. Every XFRM and fixed-DSCP operation is
+    /// executed on that thread and cross-checks the opaque namespace identity
+    /// before opening a socket or touching the DSCP companion.
+    ///
+    /// Waiting for queue admission is cancellation-safe: dropping the future
+    /// before admission performs no operation. Once admitted, an operation is
+    /// always drained by the actor even if its caller goes away. A lost reply
+    /// from an admitted mutation is reported as
+    /// [`XfrmError::StateIndeterminate`].
+    pub fn bind_current_network_namespace(
+        self,
+    ) -> Result<NamespaceBoundLinuxXfrmBackend, XfrmError> {
+        namespace::bind_current_network_namespace(self)
+    }
+
+    pub(crate) fn for_namespace_actor(self, binding: NetworkNamespaceBinding) -> Self {
+        let inner = self.inner;
+        Self {
+            inner: Arc::new(LinuxXfrmBackendInner {
+                transport: Arc::clone(&inner.transport),
+                next_sequence: AtomicU32::new(inner.next_sequence.load(Ordering::Acquire)),
+                config: inner.config,
+                dscp_config: inner.dscp_config.clone(),
+                dscp_runtime: inner.dscp_runtime.fresh_namespace_runtime(),
+                // Both observations were made through the source backend's
+                // execution context. They are not authority in a newly bound
+                // namespace, even when the underlying kernel is shared.
+                dscp_xfrm_attributes_verified: AtomicBool::new(false),
+                sa_relocation_capability: AtomicU8::new(RELOCATION_CAPABILITY_UNKNOWN),
+                namespace_binding: Some(binding),
+            }),
+        }
+    }
+
+    pub(crate) fn prepare_namespace_actor(&self) -> Result<(), XfrmError> {
+        self.ensure_namespace_binding()?;
+        if let Some(config) = &self.inner.dscp_config {
+            // DSCP program/map adoption is namespace-scoped too. Repeat the
+            // identity check immediately before entering that runtime.
+            self.ensure_namespace_binding()?;
+            self.inner.dscp_runtime.ensure_ready(config)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn verify_namespace_actor(&self) -> Result<(), XfrmError> {
+        self.ensure_namespace_binding()
+    }
+
+    fn ensure_namespace_binding(&self) -> Result<(), XfrmError> {
+        match self.inner.namespace_binding {
+            Some(binding) => binding.ensure_current(),
+            None => Ok(()),
+        }
     }
 
     fn prepare_dscp(&self, parameters: &SaParameters) -> Result<Option<MarkProfile>, XfrmError> {
@@ -251,6 +317,7 @@ impl LinuxXfrmBackend {
         validate_fixed_outer_dscp(parameters, profile, dscp)?;
         // Revalidate actual map/filter ownership for every marked mutation so
         // runtime readiness loss is repaired or reported before XFRM ACK.
+        self.ensure_namespace_binding()?;
         self.inner.dscp_runtime.ensure_ready(config)?;
         Ok(Some(profile))
     }
@@ -290,6 +357,9 @@ impl LinuxXfrmBackend {
         flags: u16,
         body: SensitiveBuffer,
     ) -> Result<Option<SensitiveBuffer>, XfrmError> {
+        // Keep the identity check adjacent to transport socket creation. A
+        // namespace-bound backend calls this inline on its actor thread.
+        self.ensure_namespace_binding()?;
         let sequence = self.next_sequence();
         let request = encode_netlink_message(message_type, flags, sequence, &body)?;
         self.inner
@@ -304,6 +374,9 @@ impl LinuxXfrmBackend {
         flags: u16,
         body: SensitiveBuffer,
     ) -> Result<Option<SensitiveBuffer>, XfrmError> {
+        if self.inner.namespace_binding.is_some() {
+            return self.transact(operation, message_type, flags, body);
+        }
         let backend = self.clone();
         tokio::task::spawn_blocking(move || backend.transact(operation, message_type, flags, body))
             .await
@@ -683,6 +756,7 @@ impl XfrmBackend for LinuxXfrmBackend {
     }
 
     async fn probe(&self) -> Result<XfrmProbe, XfrmError> {
+        self.ensure_namespace_binding()?;
         let mut probe = self.inner.transport.probe(self.inner.config);
         probe.egress_dscp_marking =
             self.inner
@@ -705,6 +779,7 @@ impl XfrmBackend for LinuxXfrmBackend {
     }
 
     async fn sa_relocation_capability(&self) -> Result<XfrmCapability, XfrmError> {
+        self.ensure_namespace_binding()?;
         let probe = self.inner.transport.probe(self.inner.config);
         if !probe.platform_supported {
             return Ok(XfrmCapability::Missing);
@@ -745,7 +820,7 @@ impl XfrmBackend for LinuxXfrmBackend {
     }
 }
 
-trait LinuxXfrmTransport: Send + Sync + fmt::Debug {
+pub(crate) trait LinuxXfrmTransport: Send + Sync + fmt::Debug {
     fn transact(
         &self,
         operation: &'static str,
@@ -2719,6 +2794,10 @@ mod tests {
     }
 
     impl XfrmDscpRuntime for FakeDscpRuntime {
+        fn fresh_namespace_runtime(&self) -> Arc<dyn XfrmDscpRuntime> {
+            Arc::new(self.clone())
+        }
+
         fn ensure_ready(&self, _config: &LinuxXfrmDscpMarkingConfig) -> Result<(), XfrmError> {
             let mut state = self
                 .state
@@ -5185,6 +5264,27 @@ mod tests {
 
         assert_eq!(probe.kind, XfrmBackendKind::LinuxKernel);
         assert!(probe.kernel_reachable);
+    }
+
+    #[test]
+    fn namespace_actor_discards_source_namespace_capability_proofs() {
+        let backend = LinuxXfrmBackend::with_transport(CapturingTransport::default());
+        backend
+            .inner
+            .dscp_xfrm_attributes_verified
+            .store(true, Ordering::Release);
+        backend.record_sa_relocation_capability(XfrmCapability::Available);
+
+        let actor = backend.for_namespace_actor(NetworkNamespaceBinding::capture().unwrap());
+
+        assert!(!actor
+            .inner
+            .dscp_xfrm_attributes_verified
+            .load(Ordering::Acquire));
+        assert_eq!(
+            actor.current_sa_relocation_capability(),
+            XfrmCapability::UnknownUntilUse
+        );
     }
 
     fn futures_probe(backend: &LinuxXfrmBackend) -> XfrmProbe {
