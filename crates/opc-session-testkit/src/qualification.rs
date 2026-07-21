@@ -38,21 +38,24 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-/// Exact profile inventory consumed by qualification tooling.
-pub const SESSION_HA_PROFILE_JSON: &str =
+const FROZEN_SESSION_HA_PROFILE_V2_JSON: &str =
     include_str!("../qualification/v2/session-ha-profile.json");
-/// JSON Schema for the exact experimental profile inventory.
+
+/// Exact current profile inventory consumed by qualification tooling.
+pub const SESSION_HA_PROFILE_JSON: &str =
+    include_str!("../qualification/v6/session-ha-profile.json");
+/// JSON Schema for the exact current experimental profile inventory.
 pub const SESSION_HA_PROFILE_SCHEMA_JSON: &str =
-    include_str!("../qualification/v2/session-ha-profile.schema.json");
+    include_str!("../qualification/v6/session-ha-profile.schema.json");
 /// JSON Schema for one independent history-checker input operation.
 pub const SESSION_HA_HISTORY_SCHEMA_JSON: &str =
     include_str!("../qualification/v1/session-ha-history.schema.json");
 /// JSON Schema for one immutable qualification workload invocation.
 pub const SESSION_HA_SCHEDULE_SCHEMA_JSON: &str =
     include_str!("../qualification/v1/session-ha-schedule.schema.json");
-/// JSON Schema for one experimental qualification evidence record.
+/// JSON Schema for one current experimental qualification evidence record.
 pub const SESSION_HA_EVIDENCE_SCHEMA_JSON: &str =
-    include_str!("../qualification/v2/session-ha-evidence.schema.json");
+    include_str!("../qualification/v6/session-ha-evidence.schema.json");
 /// Closed schema for one bounded concurrent batch/watch/restore/readiness
 /// history. This v3 candidate contract does not graduate the experimental HA
 /// profile.
@@ -1450,8 +1453,9 @@ impl SessionHaCandidateQualificationProfileV4 {
         {
             return Err(QualificationCandidateContractError::UnsupportedClaim);
         }
-        let baseline: SessionHaQualificationProfile = serde_json::from_str(SESSION_HA_PROFILE_JSON)
-            .map_err(|_| QualificationCandidateContractError::InvalidProfile)?;
+        let baseline: SessionHaQualificationProfile =
+            serde_json::from_str(FROZEN_SESSION_HA_PROFILE_V2_JSON)
+                .map_err(|_| QualificationCandidateContractError::InvalidProfile)?;
         if self.workspace != baseline.workspace
             || self.source_build_gate != baseline.source_build_gate
             || self.artifacts != baseline.artifacts
@@ -1588,8 +1592,9 @@ impl SessionHaCandidateQualificationProfileV5 {
         {
             return Err(QualificationCandidateContractError::UnsupportedClaim);
         }
-        let baseline: SessionHaQualificationProfile = serde_json::from_str(SESSION_HA_PROFILE_JSON)
-            .map_err(|_| QualificationCandidateContractError::InvalidProfile)?;
+        let baseline: SessionHaQualificationProfile =
+            serde_json::from_str(FROZEN_SESSION_HA_PROFILE_V2_JSON)
+                .map_err(|_| QualificationCandidateContractError::InvalidProfile)?;
         if self.workspace != baseline.workspace
             || self.source_build_gate != baseline.source_build_gate
             || self.artifacts != baseline.artifacts

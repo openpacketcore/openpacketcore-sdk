@@ -156,6 +156,18 @@ def main() -> int:
         errors.append("session HA profile crates.io check date drifted")
     if source_gate.get("crates_io_exact_matches") != []:
         errors.append("session HA profile must not claim an exact crates.io match")
+
+    current_profile_path = Path(
+        "crates/opc-session-testkit/qualification/v6/session-ha-profile.json"
+    )
+    current_profile = json.loads(current_profile_path.read_text(encoding="utf-8"))
+    current_source_gate = current_profile.get("source_build_gate", {})
+    if (
+        set(current_source_gate.get("affected_workspace_crates", []))
+        != SOURCE_BUILD_ONLY
+    ):
+        errors.append("current v6 session HA profile source-build crate closure drifted")
+
     profiled_publish = {
         artifact.get("crate_name"): artifact.get("publish")
         for artifact in profile.get("artifacts", [])

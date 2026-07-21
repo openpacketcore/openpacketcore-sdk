@@ -9,7 +9,6 @@ use opc_session_testkit::qualification::{
     SESSION_HA_CANDIDATE_PROFILE_V4_JSON, SESSION_HA_CANDIDATE_PROFILE_V4_MAX_BYTES,
     SESSION_HA_CANDIDATE_PROFILE_V4_SCHEMA_JSON, SESSION_HA_CANDIDATE_PROFILE_V5_JSON,
     SESSION_HA_CANDIDATE_PROFILE_V5_MAX_BYTES, SESSION_HA_CANDIDATE_PROFILE_V5_SCHEMA_JSON,
-    SESSION_HA_PROFILE_JSON,
 };
 use opc_session_testkit::qualification_kubernetes_concurrent_v5_artifacts::QUALIFICATION_KUBERNETES_CONCURRENT_V5_ARTIFACT_SUMMARY_SCHEMA;
 use serde_json::{json, Value};
@@ -159,7 +158,9 @@ fn v4_profile_is_an_additive_frozen_candidate_contract() {
         SESSION_HA_CANDIDATE_ACCEPTANCE_GATES_V4
     );
 
-    let baseline: Value = serde_json::from_str(SESSION_HA_PROFILE_JSON).expect("v2 profile");
+    let baseline: Value =
+        serde_json::from_str(include_str!("../qualification/v2/session-ha-profile.json"))
+            .expect("v2 profile");
     for field in [
         "workspace",
         "source_build_gate",
@@ -222,7 +223,9 @@ fn v5_profile_closes_the_deployed_collector_inventory_without_graduating_it() {
         SESSION_HA_CANDIDATE_ACCEPTANCE_GATES_V5
     );
 
-    let baseline: Value = serde_json::from_str(SESSION_HA_PROFILE_JSON).expect("v2 profile");
+    let baseline: Value =
+        serde_json::from_str(include_str!("../qualification/v2/session-ha-profile.json"))
+            .expect("v2 profile");
     for field in [
         "workspace",
         "source_build_gate",

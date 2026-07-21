@@ -2478,11 +2478,11 @@ fn run_foundation(member_count: usize) -> Result<(), HarnessError> {
     let started_at = OffsetDateTime::now_utc();
     let manifest_directory = Path::new(env!("CARGO_MANIFEST_DIR"));
     let repository = manifest_directory.join("../..");
-    let profile_path = manifest_directory.join("qualification/v2/session-ha-profile.json");
+    let profile_path = manifest_directory.join("qualification/v6/session-ha-profile.json");
     let profile_schema_path =
-        manifest_directory.join("qualification/v2/session-ha-profile.schema.json");
+        manifest_directory.join("qualification/v6/session-ha-profile.schema.json");
     let evidence_schema_path =
-        manifest_directory.join("qualification/v2/session-ha-evidence.schema.json");
+        manifest_directory.join("qualification/v6/session-ha-evidence.schema.json");
     let schedule_schema_path =
         manifest_directory.join("qualification/v1/session-ha-schedule.schema.json");
     let history_schema_path =
@@ -2989,8 +2989,8 @@ fn run_foundation(member_count: usize) -> Result<(), HarnessError> {
         "five_node"
     };
     let evidence = json!({
-        "schema_version": "opc-session-ha-evidence/v2",
-        "profile_id": "opc-session-openraft-ha/v2",
+        "schema_version": "opc-session-ha-evidence/v6",
+        "profile_id": "opc-session-openraft-ha/v6",
         "experimental": true,
         "qualification_complete": false,
         "source_revision": source_revision,
