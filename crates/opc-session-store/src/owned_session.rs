@@ -368,7 +368,7 @@ fn validate_owned_record(
 impl OwnedSessionMutationError {
     fn from_store_error(error: StoreError) -> Self {
         match error {
-            StoreError::LeaseExpired => Self::LeaseLost,
+            StoreError::LeaseExpired | StoreError::TopologyAuthorityRevoked => Self::LeaseLost,
             StoreError::StaleFence => Self::StaleFence,
             StoreError::BackendUnavailable(_) => Self::BackendUnavailable,
             StoreError::PayloadTooLarge { actual, max } => Self::PayloadTooLarge { actual, max },
@@ -718,5 +718,13 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(err.code(), "lease-lost");
+    }
+
+    #[test]
+    fn topology_authority_revocation_reports_lost_lease() {
+        assert_eq!(
+            OwnedSessionMutationError::from_store_error(StoreError::TopologyAuthorityRevoked),
+            OwnedSessionMutationError::LeaseLost
+        );
     }
 }

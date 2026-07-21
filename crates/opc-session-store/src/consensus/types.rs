@@ -1,5 +1,8 @@
 //! Session state-machine commands built on the shared consensus substrate.
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -26,6 +29,58 @@ pub const SESSION_CONSENSUS_CLUSTER_ID_MAX_BYTES: usize =
     opc_consensus::CONSENSUS_CLUSTER_ID_MAX_BYTES;
 
 const COMMAND_DIGEST_DOMAIN: &[u8] = b"openpacketcore/session-consensus/command/v1\0";
+
+/// Redacted fixed-width binding of one topology member's admitted identities.
+///
+/// The SDK persists only domain-separated fingerprints. Raw endpoints, TLS
+/// identities, and backing-store identities never enter transition evidence
+/// or diagnostic rendering.
+#[doc(hidden)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionTopologyMemberBinding {
+    descriptor: [u8; 32],
+    endpoint: [u8; 32],
+    tls_identity: [u8; 32],
+    backing_identity: [u8; 32],
+}
+
+impl SessionTopologyMemberBinding {
+    pub(crate) const fn new(
+        descriptor: [u8; 32],
+        endpoint: [u8; 32],
+        tls_identity: [u8; 32],
+        backing_identity: [u8; 32],
+    ) -> Self {
+        Self {
+            descriptor,
+            endpoint,
+            tls_identity,
+            backing_identity,
+        }
+    }
+
+    pub(crate) const fn descriptor(self) -> [u8; 32] {
+        self.descriptor
+    }
+
+    pub(crate) const fn endpoint(self) -> [u8; 32] {
+        self.endpoint
+    }
+
+    pub(crate) const fn tls_identity(self) -> [u8; 32] {
+        self.tls_identity
+    }
+
+    pub(crate) const fn backing_identity(self) -> [u8; 32] {
+        self.backing_identity
+    }
+}
+
+impl fmt::Debug for SessionTopologyMemberBinding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SessionTopologyMemberBinding(<redacted>)")
+    }
+}
 
 /// High-level mutation submitted to the current consensus leader.
 ///
@@ -81,6 +136,67 @@ pub enum SessionMutationIntent {
         fence_high_water: u64,
         /// Highest credential ID observed across every inspected replica.
         credential_high_water: u64,
+    },
+    /// SDK-internal durable preparation for one exact topology transition.
+    #[doc(hidden)]
+    PrepareTopologyTransition {
+        /// Opaque caller-owned transition identity.
+        transition_id: [u8; 16],
+        /// Digest of the complete validated transition request.
+        request_digest: [u8; 32],
+        /// Exact successor cluster/configuration/epoch identity.
+        desired_identity: SessionConsensusIdentity,
+        /// Exact successor voter IDs.
+        desired_members: BTreeSet<SessionConsensusNodeId>,
+        /// Redacted exact descriptor and uniqueness bindings by voter ID.
+        desired_bindings: BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
+    },
+    /// SDK-internal durable proof that every added learner caught up.
+    #[doc(hidden)]
+    MarkTopologyLearnersReady {
+        /// Opaque caller-owned transition identity.
+        transition_id: [u8; 16],
+        /// Digest of the complete validated transition request.
+        request_digest: [u8; 32],
+    },
+    /// SDK-internal authority cutover committed before joint consensus.
+    #[doc(hidden)]
+    FenceTopologyAuthority {
+        /// Opaque caller-owned transition identity.
+        transition_id: [u8; 16],
+        /// Digest of the complete validated transition request.
+        request_digest: [u8; 32],
+    },
+    /// SDK-internal rollback of a transition that never committed joint state.
+    #[doc(hidden)]
+    AbortTopologyTransition {
+        /// Opaque caller-owned transition identity.
+        transition_id: [u8; 16],
+        /// Digest of the complete validated transition request.
+        request_digest: [u8; 32],
+    },
+    /// SDK-internal terminal marker after the desired uniform epoch commits.
+    #[doc(hidden)]
+    FinalizeTopologyTransition {
+        /// Opaque caller-owned transition identity.
+        transition_id: [u8; 16],
+        /// Digest of the complete validated transition request.
+        request_digest: [u8; 32],
+    },
+    /// SDK-internal authenticated application-authority envelope.
+    ///
+    /// The consensus store constructs this only after authenticating the
+    /// forwarding replica. Callers submit the enclosed mutation directly and
+    /// cannot assert their own topology authority.
+    #[doc(hidden)]
+    Authorized {
+        /// Authenticated logical origin of the application mutation.
+        origin: SessionConsensusNodeId,
+        /// Exact cluster/configuration/epoch authority that admitted `origin`.
+        authority_identity: SessionConsensusIdentity,
+        /// Original caller mutation. Nested authority or topology-control
+        /// intents are rejected by the state machine.
+        mutation: Box<SessionMutationIntent>,
     },
 }
 

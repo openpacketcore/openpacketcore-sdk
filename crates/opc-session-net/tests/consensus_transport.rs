@@ -2292,6 +2292,7 @@ async fn profiled_long_rpc_families_are_not_truncated_by_the_append_deadline() {
         SessionConsensusRpcFamily::InstallSnapshot,
         SessionConsensusRpcFamily::ForwardMutation,
         SessionConsensusRpcFamily::ReadBarrier,
+        SessionConsensusRpcFamily::TopologyAdmissionBarrier,
     ] {
         let payload = family.as_str().as_bytes().to_vec();
         assert_eq!(

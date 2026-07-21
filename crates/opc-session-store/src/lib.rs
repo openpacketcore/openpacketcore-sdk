@@ -14,6 +14,7 @@
 //! | [`capability`] | Backend capability declarations |
 //! | [`backend`] | Storage API trait, CAS, batch operations |
 //! | [`lease`] | Lease manager and fencing rules |
+//! | [`membership`] | Typed topology-epoch transition requests and evidence |
 //! | [`ownership`] | Generic CAS-backed ownership leases and bounded local cache |
 //! | [`record`] | Stored record format and encrypted payloads |
 //! | [`topology`] | Validated quorum membership and replica identity |
@@ -36,6 +37,7 @@ pub mod fake;
 pub mod handover;
 mod hex;
 pub mod lease;
+pub mod membership;
 pub mod model;
 pub mod owned_session;
 pub mod ownership;
@@ -81,8 +83,10 @@ pub use consensus::{
     SessionConsensusNodeId, SessionConsensusPeer, SessionConsensusPeerError,
     SessionConsensusRequestId, SessionConsensusResponse, SessionConsensusRpc,
     SessionConsensusRpcFamily, SessionConsensusRpcHandler, SessionConsensusStatus,
-    SessionConsensusWireRequest, SessionConsensusWireResponse, SessionMutationIntent,
-    SessionMutationOutcome, DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
+    SessionConsensusStorageAnchor, SessionConsensusWireRequest, SessionConsensusWireResponse,
+    SessionMutationIntent, SessionMutationOutcome, SessionTopologyCandidateBootstrap,
+    SessionTopologyTransitionPeers, SessionTopologyTransportAdmission,
+    SessionTopologyTransportAdmissionError, DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
     SESSION_CONSENSUS_CLUSTER_ID_MAX_BYTES, SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES,
     SESSION_CONSENSUS_SCHEMA_VERSION,
 };
@@ -94,6 +98,16 @@ pub use handover::{
     HANDOVER_PHASE_HEADER_MAX_BYTES,
 };
 pub use lease::{LeaseGuard, SessionLeaseManager};
+pub use membership::{
+    SessionTopologyAbortAdmissionProof, SessionTopologyCandidateRetirementProof,
+    SessionTopologyJointCommitAdmissionProof, SessionTopologyLearnersReadyAdmissionProof,
+    SessionTopologyPrePrepareUnstageProof, SessionTopologyTransitionDigest,
+    SessionTopologyTransitionError, SessionTopologyTransitionEvidence, SessionTopologyTransitionId,
+    SessionTopologyTransitionLogIndexes, SessionTopologyTransitionOutcome,
+    SessionTopologyTransitionPhase, SessionTopologyTransitionReason,
+    SessionTopologyTransitionRequest, SessionTopologyTransitionStatus,
+    SessionTopologyUniformCommitAdmissionProof, SESSION_TOPOLOGY_TRANSITION_MAX_OPERATION_TIMEOUT,
+};
 pub use model::{
     CustomSessionKeyType, FenceToken, Generation, HandoverPhase, HandoverTxId, OwnerId, SessionKey,
     SessionKeyType, StableId, StableIdError, StateClass, StateType, OWNER_ID_MAX_BYTES,

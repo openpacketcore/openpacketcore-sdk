@@ -668,6 +668,9 @@ fn map_store_error(error: StoreError) -> IpsecLbError {
         StoreError::StaleFence | StoreError::LeaseHeld | StoreError::LeaseExpired => {
             IpsecLbError::ownership_conflict("session-store ownership fence is not held")
         }
+        StoreError::TopologyAuthorityRevoked => {
+            IpsecLbError::ownership_conflict("session-store topology authority was revoked")
+        }
         StoreError::CasConflict => {
             IpsecLbError::ownership_conflict("session-store ownership generation changed")
         }
@@ -2032,6 +2035,7 @@ mod tests {
             StoreError::StaleFence,
             StoreError::LeaseHeld,
             StoreError::CasConflict,
+            StoreError::TopologyAuthorityRevoked,
         ] {
             assert!(matches!(
                 map_store_error(error),

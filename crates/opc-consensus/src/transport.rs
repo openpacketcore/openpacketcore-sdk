@@ -27,6 +27,9 @@ pub enum ConsensusRpcFamily {
     ForwardMutation,
     /// Ask the leader for a linearizable read barrier.
     ReadBarrier,
+    /// Prove that a staged membership candidate applied a durable transition
+    /// marker before successor Vote traffic is admitted.
+    TopologyAdmissionBarrier,
 }
 
 impl ConsensusRpcFamily {
@@ -38,6 +41,7 @@ impl ConsensusRpcFamily {
             Self::InstallSnapshot => "install_snapshot",
             Self::ForwardMutation => "forward_mutation",
             Self::ReadBarrier => "read_barrier",
+            Self::TopologyAdmissionBarrier => "topology_admission_barrier",
         }
     }
 }
@@ -138,6 +142,15 @@ impl ConsensusWireResponse {
 pub trait ConsensusPeer: Send + Sync + std::fmt::Debug {
     /// Canonical ordinal expected for the authenticated remote peer.
     fn node_id(&self) -> ConsensusNodeId;
+
+    /// Exact authenticated cluster/configuration/epoch scope of this peer.
+    ///
+    /// Fixed-topology compatibility adapters may leave this absent. Dynamic
+    /// peer directories must reject `None` rather than treating a caller-
+    /// supplied node ordinal as sufficient identity evidence.
+    fn scope_identity(&self) -> Option<ConsensusIdentity> {
+        None
+    }
 
     /// Send one scoped call under one complete logical deadline.
     async fn call(

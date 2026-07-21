@@ -642,7 +642,7 @@ fn legacy_reset_requires_exact_confirmation_and_preserves_quarantine() {
             crate::sqlite::ops::read_restore_scan_state_sync(&target)
                 .expect("read recovered restore incarnation");
         restore_incarnations.insert((restore_epoch, *restore_key));
-        assert_eq!(objects.len(), 17);
+        assert_eq!(objects.len(), 21);
         assert!(objects.iter().all(|(kind, _)| kind == "table"));
     }
     assert_eq!(restore_incarnations.len(), replicas.len());
@@ -1253,14 +1253,13 @@ fn claim_current_replica(
         log_id,
         payload: EntryPayload::Membership(membership),
     };
-    consensus::append_logs_sync(&conn, identity(), members, std::slice::from_ref(&entry))
+    consensus::append_logs_sync(&conn, identity(), std::slice::from_ref(&entry))
         .expect("append membership entry");
     consensus::save_committed_sync(&conn, identity(), Some(log_id))
         .expect("save committed membership");
     consensus::apply_entries_sync(
         &conn,
         identity(),
-        members,
         &BackendCapabilities::all_enabled(),
         vec![entry],
     )
@@ -2303,7 +2302,10 @@ async fn recovered_legacy_voter_set_forms_openraft_and_finalizes_as_one_campaign
         if let Some(report) = completed {
             break report;
         }
-        assert!(Instant::now() < deadline, "campaign did not elect a leader");
+        assert!(
+            Instant::now() < deadline,
+            "campaign recovery finalization did not converge"
+        );
         tokio::time::sleep(Duration::from_millis(25)).await;
     };
     assert_eq!(report.state(), RecoveryExecutionState::Rejoined);
@@ -2591,6 +2593,9 @@ async fn finalization_failpoints_resume_before_after_epoch_and_rejoin() {
     );
     drop(before);
 
+    // Regression: the locally authorized recovery control must remain a raw
+    // control intent; wrapping it as application authority revokes it in the
+    // state machine before this durable epoch commit can occur.
     assert_eq!(
         manager
             .finalize_with_failpoint(

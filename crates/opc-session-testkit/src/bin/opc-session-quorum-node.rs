@@ -587,6 +587,7 @@ fn qualification_store_error_class(error: &StoreError) -> QualificationTrafficEr
         }
         StoreError::NotFound
         | StoreError::StaleFence
+        | StoreError::TopologyAuthorityRevoked
         | StoreError::InvalidKey(_)
         | StoreError::InvalidSessionTtl
         | StoreError::LeaseHeld
@@ -4974,6 +4975,10 @@ mod tests {
         );
         assert_eq!(
             qualification_store_error_class(&StoreError::StaleFence),
+            QualificationTrafficErrorClass::LeaseLostOrInvalid
+        );
+        assert_eq!(
+            qualification_store_error_class(&StoreError::TopologyAuthorityRevoked),
             QualificationTrafficErrorClass::LeaseLostOrInvalid
         );
         assert_eq!(
