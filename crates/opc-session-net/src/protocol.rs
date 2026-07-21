@@ -73,7 +73,7 @@ pub const SESSION_NET_ALPN: &[u8] = b"opc-session-net/5";
 /// Dedicated ALPN for the least-authority consensus-only transport.
 pub const SESSION_CONSENSUS_ALPN: &[u8] = b"opc-session-consensus/2";
 /// Fixed revision of the consensus-only bootstrap and operation DTOs.
-pub const SESSION_CONSENSUS_TRANSPORT_REVISION: u16 = 2;
+pub const SESSION_CONSENSUS_TRANSPORT_REVISION: u16 = 3;
 
 /// Exact resource and semantic profile for consensus-only connections.
 ///
@@ -111,14 +111,14 @@ impl SessionConsensusContractProfile {
 pub const CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE: SessionConsensusContractProfile =
     SessionConsensusContractProfile {
         wire_schema_revision: SESSION_CONSENSUS_TRANSPORT_REVISION,
-        error_set_revision: 4,
+        error_set_revision: 5,
         max_rpc_payload_bytes: SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES as u32,
         min_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE as u32,
         max_frame_size: MAX_NEGOTIATED_FRAME_SIZE as u32,
     };
 
 const WIRE_SCHEMA_REVISION: u16 = 6;
-const ERROR_SET_REVISION: u16 = 8;
+const ERROR_SET_REVISION: u16 = 9;
 
 /// Exact semantic and resource-bound contract required by protocol v5.
 ///
@@ -1388,6 +1388,7 @@ enum WireStoreError {
     CasIdempotencyConflict,
     CasIdempotencyOutcomeUnavailable,
     BackendOperationOutcomeUnavailable,
+    TopologyAuthorityRevoked,
     CapabilityNotSupported(String),
     BackendUnavailable(String),
     InvalidKey(String),
@@ -1423,6 +1424,7 @@ enum WireStoreErrorRef<'a> {
     CasIdempotencyConflict,
     CasIdempotencyOutcomeUnavailable,
     BackendOperationOutcomeUnavailable,
+    TopologyAuthorityRevoked,
     CapabilityNotSupported(&'a str),
     BackendUnavailable(&'a str),
     InvalidKey(&'a str),
@@ -1476,6 +1478,7 @@ impl<'a> TryFrom<&'a StoreError> for WireStoreErrorRef<'a> {
             StoreError::BackendOperationOutcomeUnavailable => {
                 Self::BackendOperationOutcomeUnavailable
             }
+            StoreError::TopologyAuthorityRevoked => Self::TopologyAuthorityRevoked,
             StoreError::CapabilityNotSupported(message) => {
                 Self::CapabilityNotSupported(safe_capability_name(message))
             }
@@ -1561,6 +1564,7 @@ impl TryFrom<WireStoreError> for StoreError {
             WireStoreError::BackendOperationOutcomeUnavailable => {
                 Self::BackendOperationOutcomeUnavailable
             }
+            WireStoreError::TopologyAuthorityRevoked => Self::TopologyAuthorityRevoked,
             WireStoreError::CapabilityNotSupported(message) => {
                 Self::CapabilityNotSupported(safe_capability_name(&message).to_string())
             }
@@ -4048,10 +4052,10 @@ mod tests {
         assert!(CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE.is_current());
         assert_eq!(
             CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE.error_set_revision,
-            4
+            5
         );
         assert_eq!(SESSION_CONSENSUS_ALPN, b"opc-session-consensus/2");
-        assert_eq!(SESSION_CONSENSUS_TRANSPORT_REVISION, 2);
+        assert_eq!(SESSION_CONSENSUS_TRANSPORT_REVISION, 3);
         let mut previous_error_set = CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE;
         previous_error_set.error_set_revision = 1;
         assert!(!previous_error_set.is_current());
@@ -4095,7 +4099,7 @@ mod tests {
         assert_eq!(SESSION_NET_ALPN, b"opc-session-net/5");
         assert!(CURRENT_CONTRACT_PROFILE.is_current());
         assert_eq!(CURRENT_CONTRACT_PROFILE.wire_schema_revision, 6);
-        assert_eq!(CURRENT_CONTRACT_PROFILE.error_set_revision, 8);
+        assert_eq!(CURRENT_CONTRACT_PROFILE.error_set_revision, 9);
         assert_eq!(CURRENT_CONTRACT_PROFILE.max_frame_size, 16_777_216);
         assert_eq!(CURRENT_CONTRACT_PROFILE.max_session_ttl_seconds, 31_536_000);
 
@@ -4104,7 +4108,7 @@ mod tests {
             profile,
             serde_json::json!({
                 "wire_schema_revision": 6,
-                "error_set_revision": 8,
+                "error_set_revision": 9,
                 "max_restore_scan_page_records": 1024,
                 "max_restore_scan_page_payload_bytes": 4194304,
                 "max_restore_scan_page_retained_bytes": 8388608,
@@ -4287,6 +4291,7 @@ mod tests {
             StoreError::CasIdempotencyConflict,
             StoreError::CasIdempotencyOutcomeUnavailable,
             StoreError::BackendOperationOutcomeUnavailable,
+            StoreError::TopologyAuthorityRevoked,
             StoreError::CapabilityNotSupported("capability".to_string()),
             StoreError::BackendUnavailable("backend".to_string()),
             StoreError::InvalidKey("invalid".to_string()),

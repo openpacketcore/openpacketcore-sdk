@@ -83,10 +83,10 @@ pub use consensus::{
     SessionConsensusNodeId, SessionConsensusPeer, SessionConsensusPeerError,
     SessionConsensusRequestId, SessionConsensusResponse, SessionConsensusRpc,
     SessionConsensusRpcFamily, SessionConsensusRpcHandler, SessionConsensusStatus,
-    SessionConsensusWireRequest, SessionConsensusWireResponse, SessionMutationIntent,
-    SessionMutationOutcome, SessionTopologyTransportAdmission,
-    SessionTopologyTransportAdmissionError, SessionTopologyTransitionPeers,
-    DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
+    SessionConsensusStorageAnchor, SessionConsensusWireRequest, SessionConsensusWireResponse,
+    SessionMutationIntent, SessionMutationOutcome, SessionTopologyCandidateBootstrap,
+    SessionTopologyTransitionPeers, SessionTopologyTransportAdmission,
+    SessionTopologyTransportAdmissionError, DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
     SESSION_CONSENSUS_CLUSTER_ID_MAX_BYTES, SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES,
     SESSION_CONSENSUS_SCHEMA_VERSION,
 };
@@ -99,10 +99,10 @@ pub use handover::{
 };
 pub use lease::{LeaseGuard, SessionLeaseManager};
 pub use membership::{
-    SessionTopologyAbortAdmissionProof, SessionTopologyJointCommitAdmissionProof,
-    SessionTopologyLearnersReadyAdmissionProof, SessionTopologyTransitionDigest,
-    SessionTopologyTransitionError,
-    SessionTopologyTransitionEvidence, SessionTopologyTransitionId,
+    SessionTopologyAbortAdmissionProof, SessionTopologyCandidateRetirementProof,
+    SessionTopologyJointCommitAdmissionProof, SessionTopologyLearnersReadyAdmissionProof,
+    SessionTopologyPrePrepareUnstageProof, SessionTopologyTransitionDigest,
+    SessionTopologyTransitionError, SessionTopologyTransitionEvidence, SessionTopologyTransitionId,
     SessionTopologyTransitionLogIndexes, SessionTopologyTransitionOutcome,
     SessionTopologyTransitionPhase, SessionTopologyTransitionReason,
     SessionTopologyTransitionRequest, SessionTopologyTransitionStatus,

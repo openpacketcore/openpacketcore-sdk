@@ -172,7 +172,7 @@ evidence.
   `max_value_bytes`, and
   size-bearing store errors; checked conversion at both domain boundaries; and
   independent 256-batch, 1,024-restore, 65,536-log, and 65,536-rebuild limits.
-  Its profile pins wire-schema revision 6, error-set revision 8,
+  Its profile pins wire-schema revision 6, error-set revision 9,
   `max_restore_scan_examined_rows = 4096`,
   `max_restore_scan_page_retained_bytes = 8388608`,
   `max_restore_scan_examined_metadata_bytes = 8388608`, `min_frame_size = 8192`,
@@ -497,10 +497,10 @@ cluster, configuration digest, epoch, peer role, and fresh challenge must all
 agree before an Openraft RPC is dispatched. Resolver or DNS aliases change
 only the dial address; a bare self ID such as `epdg-app-0` can correctly name
 the member whose route is an FQDN because the SDK never compares those strings.
-The exact consensus contract uses transport/wire-schema revision 2 and
-error-set revision 4. The wire adds the bounded payload-free expiry-authority
-preflight, and the error set adds `RecordExpiryPreflightLimitExceeded`.
-Revision 1/error revision 3 or older fails before dispatch. Drain traffic and
+The exact consensus contract uses transport/wire-schema revision 3 and
+error-set revision 5. Revision 3 adds the bounded topology-admission barrier,
+and error revision 5 adds `TopologyAuthorityRevoked`.
+Revision 2/error revision 4 or older fails before dispatch. Drain traffic and
 writers, then stop and upgrade every consensus member together; mixed-profile
 rolling operation is unsupported.
 
@@ -669,13 +669,32 @@ uniform configuration, retires predecessor transport admission, and commits a
 separate finalization record. A returned `Completed` status therefore cannot
 be inferred from an in-memory route change or an uncommitted membership view.
 
+When the local state machine applies that exact uniform membership, the engine
+admission boundary drains every already-admitted predecessor Vote,
+AppendEntries, and snapshot RPC before atomically promoting the successor
+routes. Cached predecessor connections are revalidated and cannot start new
+engine RPCs after the cutover. If a restored uniform membership is observed
+before its exact successor routes are staged, engine admission remains closed
+until those routes arrive; a node removed from the uniform membership retains
+no engine authority. This apply-time fence is limited to the membership entry:
+normal state-machine entries do not take it. Application `ForwardMutation` and
+`ReadBarrier` authority remains separately fail-closed behind durable authority
+and process/transport finalization.
+
 Dropping or timing out either future never means rollback. The caller retries
 the same request ID/digest and consults `topology_transition_status`; accepted
 Openraft work retains the exclusive proposal-drain guard until its actual
 terminal result. `abort_topology_transition` is explicit and succeeds only
-before joint membership can have committed. It removes added learners and
-verifies the exact old uniform membership before recording durable abort.
-After joint commit, recovery always resumes forward.
+before joint membership can have committed. It first commits an abort decision
+while added learners and candidate control routes remain reachable. Every
+actual learner must apply that decision and every never-admitted candidate must
+persist an exact cancellation tombstone before the coordinator commits a newer
+cleanup proof. When learners exist, their exact node-removal entry is the
+proof; when none were admitted, the current-term cleanup control is sufficient.
+Only then is the transition reported as
+`Aborted`; process-local transport retirement is idempotent cleanup derived
+from that durable decision, so a lost cleanup response or restart cannot revive
+the candidate. After joint commit, recovery always resumes forward.
 
 The SQLite database keeps one immutable storage/genesis identity while the
 active application authority advances by exact configuration epoch. Transition
@@ -686,6 +705,15 @@ described below. A process's original topology-attestation summary is not
 silently reinterpreted as evidence for new descriptors: production readiness
 remains closed until the desired epoch is reopened or explicitly supplied with
 fresh exact topology evidence.
+
+SQLite also retains one current terminal outcome plus a bounded ledger of at
+most 4,096 historical outcomes, covering both promoted and aborted
+transitions. Before a later transition can replace the singleton terminal slot,
+the prior outcome and all status log indexes are recorded atomically. Exact
+retries therefore recover the same `Completed` or `Aborted` result after later
+transitions, snapshots, and restart; reuse of the transition ID with another
+digest fails closed. Reaching the historical bound rejects another transition
+as compaction-required rather than silently evicting idempotency evidence.
 
 Each node uses the shared fixed eight-slot proposal admission pool. Normal
 mutations and finite-expiry logical-time-floor proposals acquire from that same
@@ -826,8 +854,8 @@ envelopes, AAD, provider/HKMS placement, or encryption-at-rest composition.
 The replication-log range outcomes were introduced in quarantined session-net
 v4 error-set revision 4. Historical v4 revisions 5 through 7 added non-CAS
 backend/lease ambiguity, bounded-watch catch-up, and absolute-record-expiry
-rejection. Current v5 error revision 8 adds the bounded expiry-preflight limit
-outcome and uses a distinct ALPN. Drain and upgrade all
+rejection. Current v5 error revision 9 retains the bounded expiry-preflight
+limit and adds topology-authority revocation; it uses a distinct ALPN. Drain and upgrade all
 compatibility participants together before restoring traffic.
 
 ### Replication-watch cursor and handoff contract
@@ -913,8 +941,8 @@ fail closed.
 
 This is a compatibility boundary. The public error enums gain variants, so
 external exhaustive matches must add arms. Protocol v4 introduced the TTL
-fixed-width DTOs in error revision 1; current v5 error revision 8 retains those
-encodings and adds the bounded expiry-preflight outcome. An error-revision-7 or
+fixed-width DTOs in error revision 1; current v5 error revision 9 retains those
+encodings and adds bounded expiry-preflight and topology-authority outcomes. An error-revision-8 or
 older peer is not admitted. Before upgrading a store created by an older SDK, audit
 its persisted replication log for TTL-bearing
 operations above 365 days. Such legacy entries now fail closed during replay or

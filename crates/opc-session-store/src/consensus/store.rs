@@ -35,11 +35,11 @@ use super::raft_adapter::{
 use super::storage::{self, SessionConsensusStorageError};
 use super::{
     SessionConsensusCommand, SessionConsensusConfigurationEpoch, SessionConsensusIdentity,
-    SessionConsensusNodeId, SessionConsensusPeer,
-    SessionConsensusPeerError, SessionConsensusRequestId, SessionConsensusResponse,
-    SessionConsensusRpcFamily, SessionConsensusRpcHandler, SessionConsensusWireRequest,
-    SessionConsensusWireResponse, SessionMutationIntent, SessionMutationOutcome, SessionRaft,
-    SessionRaftTypeConfig, SessionTopologyMemberBinding, SESSION_CONSENSUS_SCHEMA_VERSION,
+    SessionConsensusNodeId, SessionConsensusPeer, SessionConsensusPeerError,
+    SessionConsensusRequestId, SessionConsensusResponse, SessionConsensusRpcFamily,
+    SessionConsensusRpcHandler, SessionConsensusWireRequest, SessionConsensusWireResponse,
+    SessionMutationIntent, SessionMutationOutcome, SessionRaft, SessionRaftTypeConfig,
+    SessionTopologyMemberBinding, SESSION_CONSENSUS_SCHEMA_VERSION,
 };
 use crate::backend::{
     record_expiry_preflights, validate_record_expiry_preflights_at,
@@ -71,11 +71,12 @@ use crate::ttl::{
 
 mod membership;
 
-pub use membership::{
-    SessionTopologyTransportAdmission, SessionTopologyTransportAdmissionError,
-    SessionTopologyTransitionPeers,
-};
 use membership::SessionTopologyCoordinatorState;
+pub use membership::{
+    SessionConsensusStorageAnchor, SessionTopologyCandidateBootstrap,
+    SessionTopologyTransitionPeers, SessionTopologyTransportAdmission,
+    SessionTopologyTransportAdmissionError,
+};
 
 /// Default complete client-operation deadline, including leader discovery,
 /// forwarding, quorum confirmation, commit, and local apply.
@@ -159,6 +160,9 @@ pub enum ConsensusSessionStoreOpenError {
     /// Cluster formation or exact live voter admission did not converge.
     #[error("session consensus cluster formation or membership admission was rejected")]
     ClusterFormationRejected,
+    /// This exact joining-candidate transition was durably cancelled.
+    #[error("session consensus candidate transition was cancelled")]
+    CandidateTransitionCancelled,
 }
 
 /// Redaction-safe current Openraft observation for readiness and operations.
@@ -298,6 +302,12 @@ enum ForwardMutationReply {
 enum ConsensusPeerCallFailure {
     BeforeTransmission,
     AfterTransmission,
+}
+
+#[derive(Clone, Copy)]
+struct LocalProposalAuthority {
+    origin: SessionConsensusNodeId,
+    allows_operator_recovery: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -468,8 +478,16 @@ impl ConsensusSessionStore {
             identity,
             members.clone(),
             bindings,
+            peer_directory.clone(),
         )
         .await?;
+        let (membership_scope, _) = backend
+            .consensus_membership_scope_snapshot(storage_identity)
+            .await
+            .map_err(|_| ConsensusSessionStoreOpenError::StorageUnavailable)?;
+        topology_coordinator
+            .load_retained_transitions(&membership_scope)
+            .map_err(|_| ConsensusSessionStoreOpenError::StorageUnavailable)?;
         let config = Arc::new(session_raft_config()?);
         let raft = SessionRaft::new(local_node_id, config, network, log_store, state_machine)
             .await
@@ -579,25 +597,25 @@ impl ConsensusSessionStore {
             .map(|(_, members)| members)
             .unwrap_or_default();
         let metrics = self.inner.raft.metrics();
-        let (term, leader_id, last_log_index, applied_index, live_membership_is_exact) = {
+        let (term, leader_id, last_log_index, applied_index, engine_running) = {
             let current = metrics.borrow();
             (
                 current.current_term,
                 current.current_leader,
                 current.last_log_index,
                 current.last_applied.as_ref().map(|log_id| log_id.index),
-                current.running_state.is_ok()
-                    && current_members.contains(&self.inner.local_node_id)
-                    && exact_uniform_voter_membership(
-                        current.membership_config.as_ref(),
-                        &current_members,
-                    ),
+                current.running_state.is_ok(),
             )
         };
-        let admitted = self.inner.admitted.load(Ordering::Acquire) && live_membership_is_exact;
-        if !admitted {
-            self.inner.admitted.store(false, Ordering::Release);
-        }
+        // `membership_config` is Openraft's effective proposal state, not the
+        // applied membership authority. It may remain joint or otherwise lead
+        // the state machine after a completed change, so it must neither grant
+        // nor veto application authority. The latch is set only after the
+        // exact durable applied scope is proven; engine failure and local
+        // removal remain live vetoes.
+        let admitted = self.inner.admitted.load(Ordering::Acquire)
+            && engine_running
+            && current_members.contains(&self.inner.local_node_id);
         SessionConsensusStatus {
             node_id: self.inner.local_node_id,
             term,
@@ -694,31 +712,57 @@ impl ConsensusSessionStore {
     ) -> Result<(), ConsensusSessionStoreOpenError> {
         let mut metrics = self.inner.raft.metrics();
         loop {
-            {
+            let effective_membership_is_exact = {
                 let current = metrics.borrow();
                 if current.running_state.is_err() {
                     return Err(ConsensusSessionStoreOpenError::EngineUnavailable);
                 }
-                if exact_uniform_voter_membership(
+                exact_uniform_voter_membership(
                     current.membership_config.as_ref(),
                     &self.inner.bootstrap_members,
-                ) {
-                    return Ok(());
-                }
+                )
+            };
+            if effective_membership_is_exact && self.durable_uniform_scope_is_admitted().await? {
+                return Ok(());
             }
-            match tokio::time::timeout_at(deadline, metrics.changed()).await {
-                Ok(Ok(())) => {}
-                Ok(Err(_)) => {
-                    return Err(ConsensusSessionStoreOpenError::EngineUnavailable);
+            tokio::select! {
+                changed = metrics.changed() => {
+                    if changed.is_err() {
+                        return Err(ConsensusSessionStoreOpenError::EngineUnavailable);
+                    }
                 }
-                Err(_) => {
+                () = tokio::time::sleep(Duration::from_millis(25)) => {}
+                () = tokio::time::sleep_until(deadline) => {
                     return Err(ConsensusSessionStoreOpenError::ClusterFormationRejected);
                 }
             }
         }
     }
 
-    fn live_membership_is_exact(&self) -> bool {
+    async fn durable_uniform_scope_is_admitted(
+        &self,
+    ) -> Result<bool, ConsensusSessionStoreOpenError> {
+        let (scope, applied_membership) = self
+            .inner
+            .backend
+            .consensus_membership_scope_snapshot(self.inner.storage_identity)
+            .await
+            .map_err(|_| ConsensusSessionStoreOpenError::StorageUnavailable)?;
+        let (current_identity, current_members) = self
+            .inner
+            .peer_directory
+            .current_scope()
+            .map_err(|_| ConsensusSessionStoreOpenError::ClusterFormationRejected)?;
+        Ok(scope.current_identity == current_identity
+            && scope.current_members == current_members
+            && scope.application_authority_epoch == current_identity.configuration_epoch()
+            && scope.application_authority_members == current_members
+            && scope.pending.is_none()
+            && current_members.contains(&self.inner.local_node_id)
+            && exact_uniform_voter_membership(&applied_membership, &current_members))
+    }
+
+    fn engine_is_running_in_local_scope(&self) -> bool {
         let Ok((_, current_members)) = self.current_scope() else {
             return false;
         };
@@ -728,19 +772,10 @@ impl ConsensusSessionStore {
         let metrics = self.inner.raft.metrics();
         let current = metrics.borrow();
         current.running_state.is_ok()
-            && exact_uniform_voter_membership(current.membership_config.as_ref(), &current_members)
     }
 
     fn exact_membership_is_admitted(&self) -> bool {
-        if !self.inner.admitted.load(Ordering::Acquire) {
-            return false;
-        }
-        if self.live_membership_is_exact() {
-            true
-        } else {
-            self.inner.admitted.store(false, Ordering::Release);
-            false
-        }
+        self.inner.admitted.load(Ordering::Acquire) && self.engine_is_running_in_local_scope()
     }
 
     fn current_application_scope_matches(
@@ -1368,12 +1403,11 @@ impl ConsensusSessionStore {
         // transition driver drain every already-admitted application write
         // before it commits learner-ready/fencing evidence.
         let operation_gate = self.inner.topology_coordinator.operation_gate();
-        let operation_guard = match tokio::time::timeout_at(deadline, operation_gate.read_owned())
-            .await
-        {
-            Ok(guard) => guard,
-            Err(_) => return ForwardMutationReply::Unavailable,
-        };
+        let operation_guard =
+            match tokio::time::timeout_at(deadline, operation_gate.read_owned()).await {
+                Ok(guard) => guard,
+                Err(_) => return ForwardMutationReply::Unavailable,
+            };
         if self.require_exact_membership_admission().is_err() {
             return ForwardMutationReply::Unavailable;
         }
@@ -1448,7 +1482,10 @@ impl ConsensusSessionStore {
         };
         self.propose_on_local_leader(
             request,
-            origin,
+            LocalProposalAuthority {
+                origin,
+                allows_operator_recovery: allow_operator_recovery,
+            },
             logical_time,
             proposal_permit,
             operation_guard,
@@ -1460,7 +1497,7 @@ impl ConsensusSessionStore {
     async fn propose_on_local_leader(
         &self,
         request: ForwardMutationRequest,
-        origin: SessionConsensusNodeId,
+        authority: LocalProposalAuthority,
         logical_time: Timestamp,
         proposal_permit: tokio::sync::OwnedSemaphorePermit,
         operation_guard: tokio::sync::OwnedRwLockReadGuard<()>,
@@ -1470,16 +1507,24 @@ impl ConsensusSessionStore {
         let Ok((identity, _)) = self.current_scope() else {
             return ForwardMutationReply::Unavailable;
         };
+        let intent = match request.intent {
+            intent @ SessionMutationIntent::FinalizeOperatorRecovery { .. }
+                if authority.allows_operator_recovery =>
+            {
+                intent
+            }
+            mutation => SessionMutationIntent::Authorized {
+                origin: authority.origin,
+                authority_identity: identity,
+                mutation: Box::new(mutation),
+            },
+        };
         let command = super::SessionConsensusCommand {
             schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
             identity: self.inner.storage_identity,
             request_id: request.request_id,
             logical_time,
-            intent: SessionMutationIntent::Authorized {
-                origin,
-                authority_identity: identity,
-                mutation: Box::new(request.intent),
-            },
+            intent,
         };
         if let Err(error) = validate_consensus_command_preproposal(&command) {
             return ForwardMutationReply::Applied(Box::new(SessionConsensusResponse::rejected(
@@ -1554,12 +1599,11 @@ impl ConsensusSessionStore {
             return ForwardMutationReply::RecordExpiryPreflight(Err(error));
         }
         let operation_gate = self.inner.topology_coordinator.operation_gate();
-        let operation_guard = match tokio::time::timeout_at(deadline, operation_gate.read_owned())
-            .await
-        {
-            Ok(guard) => guard,
-            Err(_) => return ForwardMutationReply::Unavailable,
-        };
+        let operation_guard =
+            match tokio::time::timeout_at(deadline, operation_gate.read_owned()).await {
+                Ok(guard) => guard,
+                Err(_) => return ForwardMutationReply::Unavailable,
+            };
         if self.require_exact_membership_admission().is_err() {
             return ForwardMutationReply::Unavailable;
         }
@@ -1645,7 +1689,10 @@ impl ConsensusSessionStore {
                     request_id: SessionConsensusRequestId::new(),
                     intent: intent.clone(),
                 },
-                origin,
+                LocalProposalAuthority {
+                    origin,
+                    allows_operator_recovery: false,
+                },
                 authority_time,
                 proposal_permit,
                 operation_guard,
@@ -2663,6 +2710,25 @@ mod membership_tests {
         .expect("singleton topology")
     }
 
+    fn forged_operator_recovery_intent(seed: u8) -> SessionMutationIntent {
+        SessionMutationIntent::FinalizeOperatorRecovery {
+            recovery_epoch: 1,
+            plan_digest: [seed; 32],
+            fence_high_water: 7,
+            credential_high_water: 9,
+        }
+    }
+
+    fn durable_recovery_epoch(
+        database: &std::path::Path,
+        identity: SessionConsensusIdentity,
+    ) -> u64 {
+        let connection = rusqlite::Connection::open(database).expect("open recovery state");
+        crate::sqlite::consensus::read_operator_recovery_sync(&connection, identity)
+            .expect("read recovery state")
+            .recovery_epoch
+    }
+
     #[test]
     fn exact_membership_requires_one_uniform_config_and_no_learners() {
         let configured = [node(1), node(2), node(3)]
@@ -3070,6 +3136,119 @@ mod membership_tests {
         assert_eq!(
             initialized.recovery_progress().state(),
             DurableRecoveryState::Synchronized
+        );
+    }
+
+    #[tokio::test]
+    async fn local_raw_operator_recovery_intent_cannot_bypass_admin_authority() {
+        let directory = tempfile::tempdir().expect("operator recovery spoof directory");
+        let database = directory.path().join("local.sqlite");
+        let backend =
+            SqliteSessionBackend::open(&database).expect("operator recovery spoof backend");
+        let store = ConsensusSessionStore::open(
+            singleton_topology(),
+            backend,
+            directory.path().join("local-snapshots"),
+            BTreeMap::new(),
+        )
+        .await
+        .expect("open operator recovery spoof store");
+        store
+            .initialize_cluster()
+            .await
+            .expect("initialize operator recovery spoof store");
+
+        let before_log = store.inner.raft.metrics().borrow().last_log_index;
+        assert_eq!(
+            durable_recovery_epoch(&database, store.inner.storage_identity),
+            0
+        );
+        let result = store
+            .submit_intent(forged_operator_recovery_intent(0xA1))
+            .await;
+        assert!(matches!(
+            result,
+            Err(StoreError::CapabilityNotSupported(reason))
+                if reason == "operator_recovery_requires_local_admin_authority"
+        ));
+        assert_eq!(
+            store.inner.raft.metrics().borrow().last_log_index,
+            before_log,
+            "rejected local recovery forgery reached the Raft log"
+        );
+        assert_eq!(
+            durable_recovery_epoch(&database, store.inner.storage_identity),
+            0,
+            "rejected local recovery forgery advanced the durable epoch"
+        );
+    }
+
+    #[tokio::test]
+    async fn forwarded_raw_operator_recovery_intent_cannot_spoof_admin_authority() {
+        let directory = tempfile::tempdir().expect("forwarded recovery spoof directory");
+        let database = directory.path().join("forwarded.sqlite");
+        let backend =
+            SqliteSessionBackend::open(&database).expect("forwarded recovery spoof backend");
+        let store = ConsensusSessionStore::open(
+            singleton_topology(),
+            backend,
+            directory.path().join("forwarded-snapshots"),
+            BTreeMap::new(),
+        )
+        .await
+        .expect("open forwarded recovery spoof store");
+        store
+            .initialize_cluster()
+            .await
+            .expect("initialize forwarded recovery spoof store");
+
+        let before_log = store.inner.raft.metrics().borrow().last_log_index;
+        assert_eq!(
+            durable_recovery_epoch(&database, store.inner.storage_identity),
+            0
+        );
+        let payload = encode_bounded(&ForwardRequest::Mutation(ForwardMutationRequest {
+            request_id: SessionConsensusRequestId::new(),
+            intent: forged_operator_recovery_intent(0xB2),
+        }))
+        .expect("encode forged forwarded recovery request");
+        let request = SessionConsensusWireRequest::try_new(
+            store.inner.storage_identity,
+            store.inner.local_node_id,
+            SessionConsensusRpcFamily::ForwardMutation,
+            payload,
+        )
+        .expect("bind forged request to an authenticated current member");
+        let response = store
+            .rpc_handler()
+            .handle(store.inner.local_node_id, request)
+            .await;
+        response.validate().expect("valid rejection response");
+        let payload = response.result.expect("encoded forwarded rejection");
+        let reply: ForwardMutationReply =
+            decode_bounded(&payload).expect("decode forwarded rejection");
+        assert!(matches!(
+            reply,
+            ForwardMutationReply::Applied(response)
+                if matches!(
+                    &response.result,
+                    Err(StoreError::CapabilityNotSupported(reason))
+                        if reason == "operator_recovery_requires_local_admin_authority"
+                )
+                    && response.sequence == 0
+                    && response.digest.is_none()
+                    && response.logical_time.is_none()
+                    && response.raft_log_index == 0
+        ));
+        assert_eq!(
+            store.inner.raft.metrics().borrow().last_log_index,
+            before_log,
+            "rejected forwarded recovery forgery reached the Raft log"
+        );
+        assert_eq!(
+            durable_recovery_epoch(&database, store.inner.storage_identity),
+            0,
+            "rejected forwarded recovery forgery advanced the durable epoch"
         );
     }
 

@@ -109,10 +109,10 @@ sender, server profile, and fresh challenge. DNS/FQDN/IP aliases remain routing
 inputs only. The legacy writable backend protocol is not a production HA
 authority and is isolated behind an explicit compatibility surface.
 
-The exact consensus profile is transport/wire-schema revision 2 and error-set
-revision 4. It carries the bounded payload-free expiry-authority preflight;
-error revision 4 adds `RecordExpiryPreflightLimitExceeded`. Older profiles
-fail before engine dispatch and require a drained full-membership upgrade.
+The exact consensus profile is transport/wire-schema revision 3 and error-set
+revision 5. Revision 3 adds the bounded topology-admission barrier family;
+error revision 5 adds `TopologyAuthorityRevoked`. Older profiles fail before
+engine dispatch and require a drained full-membership upgrade.
 
 Each directed peer retains a fixed primary/overflow pool of at most two
 authenticated connections after correlated validated successes or typed
@@ -242,7 +242,7 @@ backend dispatch or caller exposure. It omits restore `loaded_count` and
 `complete` and recomputes them after decode. Independent limits admit 256 batch
 operations, 1,024 restore records, 65,536 replication-log entries, and 65,536
 rebuild entries, in addition to the configured frame-size bound. The exact
-profile pins wire-schema revision 6, error-set revision 8, a 4 MiB restore
+profile pins wire-schema revision 6, error-set revision 9, a 4 MiB restore
 payload bound, 8 MiB retained-page and examined key/filter-metadata bounds,
 `max_restore_scan_examined_rows = 4096`, 128-byte
 owner/custom-key/state-type bounds, depth-16/256-node replication trees, and the
@@ -284,8 +284,8 @@ independent request-frame size. Each is a checked `u32` between
 `MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE` aliases that same minimum.
 This makes unequal client/server limits explicit. The directional fields were
 introduced by wire-schema revision 2 and are retained by the current
-wire-schema revision 6/error-set revision 8 profile. Older exact profiles,
-including wire revision 4/error revision 7 or older, are incompatible; the
+wire-schema revision 6/error-set revision 9 profile. Older exact profiles,
+including error revision 8 or older, are incompatible; the
 current ALPN is `opc-session-net/5`.
 
 Every response and watch item is fully bounded-encoded before any frame prefix

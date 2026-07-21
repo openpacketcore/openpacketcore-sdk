@@ -292,6 +292,7 @@ pub(crate) struct MembershipValidationScope {
     pub(crate) application_authority_members: BTreeSet<SessionConsensusNodeId>,
     pub(crate) predecessor: Option<MembershipPredecessorScope>,
     pub(crate) history: Vec<MembershipPredecessorScope>,
+    pub(crate) terminal_history: Vec<RetainedTerminalMembershipTransition>,
     pub(crate) pending: Option<PendingMembershipScope>,
     pub(crate) terminal: Option<TerminalMembershipTransition>,
 }
@@ -319,6 +320,7 @@ impl fmt::Debug for MembershipValidationScope {
                     .map(|scope| scope.identity.configuration_epoch()),
             )
             .field("history_depth", &self.history.len())
+            .field("terminal_history_depth", &self.terminal_history.len())
             .field(
                 "pending_epoch",
                 &self
@@ -409,6 +411,40 @@ pub(crate) enum TerminalMembershipOutcome {
     Promoted,
 }
 
+/// Durable proof needed to retire learners after an abort decision.
+///
+/// The abort command is committed while the learners are still reachable, so
+/// every learner can apply the same terminal decision. The exact learner set
+/// is retained until a later committed cleanup step proves terminality: an
+/// Openraft node-removal entry when learners exist, or the current-term cleanup
+/// control entry when no learner was ever admitted.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct AbortedMembershipCleanup {
+    pub(crate) desired_identity: SessionConsensusIdentity,
+    pub(crate) desired_members: BTreeSet<SessionConsensusNodeId>,
+    pub(crate) desired_bindings: BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
+    pub(crate) learners: BTreeSet<SessionConsensusNodeId>,
+    pub(crate) decision_log_index: u64,
+    pub(crate) cleanup_log_index: Option<u64>,
+}
+
+impl fmt::Debug for AbortedMembershipCleanup {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AbortedMembershipCleanup")
+            .field(
+                "desired_epoch",
+                &self.desired_identity.configuration_epoch(),
+            )
+            .field("desired_member_count", &self.desired_members.len())
+            .field("desired_binding_count", &self.desired_bindings.len())
+            .field("learner_count", &self.learners.len())
+            .field("decision_log_index", &self.decision_log_index)
+            .field("cleanup_log_index", &self.cleanup_log_index)
+            .finish()
+    }
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct TerminalMembershipTransition {
     pub(crate) transition_id: [u8; MEMBERSHIP_TRANSITION_ID_BYTES],
@@ -420,6 +456,45 @@ pub(crate) struct TerminalMembershipTransition {
     pub(crate) uniform_membership_log_index: Option<u64>,
     pub(crate) cutover_log_index: Option<u64>,
     pub(crate) finalization_log_index: Option<u64>,
+    pub(crate) abort_cleanup: Option<AbortedMembershipCleanup>,
+}
+
+/// Complete terminal transition evidence retained after the singleton
+/// terminal slot advances to a later transition.
+///
+/// Unlike membership lineage, this record covers both promoted and aborted
+/// outcomes and retains every index needed to answer an exact idempotent
+/// status lookup after restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RetainedTerminalMembershipTransition {
+    pub(crate) transition_id: [u8; MEMBERSHIP_TRANSITION_ID_BYTES],
+    pub(crate) transition_digest: [u8; 32],
+    pub(crate) outcome: TerminalMembershipOutcome,
+    pub(crate) expected_member_count: usize,
+    pub(crate) transition_start_log_index: u64,
+    pub(crate) learners_ready_log_index: Option<u64>,
+    pub(crate) joint_membership_log_index: Option<u64>,
+    pub(crate) uniform_membership_log_index: Option<u64>,
+    pub(crate) cutover_log_index: Option<u64>,
+    pub(crate) finalization_log_index: Option<u64>,
+    pub(crate) abort_decision_log_index: Option<u64>,
+    pub(crate) abort_cleanup_log_index: Option<u64>,
+}
+
+impl RetainedTerminalMembershipTransition {
+    fn evidence(self) -> MembershipTransitionEvidence {
+        MembershipTransitionEvidence {
+            outcome: Some(self.outcome),
+            transition_start_log_index: self.transition_start_log_index,
+            learners_ready_log_index: self.learners_ready_log_index,
+            joint_membership_log_index: self.joint_membership_log_index,
+            uniform_membership_log_index: self.uniform_membership_log_index,
+            cutover_log_index: self.cutover_log_index,
+            finalization_log_index: self.finalization_log_index,
+            abort_decision_log_index: self.abort_decision_log_index,
+            abort_cleanup_log_index: self.abort_cleanup_log_index,
+        }
+    }
 }
 
 impl fmt::Debug for TerminalMembershipTransition {
@@ -444,6 +519,7 @@ impl fmt::Debug for TerminalMembershipTransition {
             )
             .field("cutover_log_index", &self.cutover_log_index)
             .field("finalization_log_index", &self.finalization_log_index)
+            .field("abort_cleanup", &self.abort_cleanup)
             .finish()
     }
 }
@@ -461,6 +537,49 @@ pub(crate) struct MembershipTransitionEvidence {
     pub(crate) uniform_membership_log_index: Option<u64>,
     pub(crate) cutover_log_index: Option<u64>,
     pub(crate) finalization_log_index: Option<u64>,
+    pub(crate) abort_decision_log_index: Option<u64>,
+    pub(crate) abort_cleanup_log_index: Option<u64>,
+}
+
+fn retained_transition_digest(
+    scope: &MembershipValidationScope,
+    transition_id: [u8; MEMBERSHIP_TRANSITION_ID_BYTES],
+) -> io::Result<Option<[u8; 32]>> {
+    let mut retained = None;
+    for (candidate_id, candidate_digest) in scope
+        .terminal
+        .iter()
+        .map(|terminal| (terminal.transition_id, terminal.transition_digest))
+        .chain(
+            scope
+                .terminal_history
+                .iter()
+                .map(|terminal| (terminal.transition_id, terminal.transition_digest)),
+        )
+        .chain(
+            scope
+                .predecessor
+                .iter()
+                .map(|predecessor| (predecessor.transition_id, predecessor.transition_digest)),
+        )
+        .chain(
+            scope
+                .history
+                .iter()
+                .map(|predecessor| (predecessor.transition_id, predecessor.transition_digest)),
+        )
+    {
+        if candidate_id != transition_id {
+            continue;
+        }
+        if retained.is_some_and(|digest| digest != candidate_digest) {
+            return Err(invalid_data(
+                "session consensus transition ID history conflicts",
+            ));
+        }
+        retained = Some(candidate_digest);
+    }
+    Ok(retained)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -479,6 +598,7 @@ pub(crate) enum MembershipScopeMutationError {
     CorruptState,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DroppedMembershipPredecessor {
     /// Snapshot metadata invalidated by the compaction proof. The caller owns
@@ -624,6 +744,30 @@ CREATE TABLE consensus_membership_scope (
     terminal_finalization_index INTEGER CHECK (
         terminal_finalization_index IS NULL OR terminal_finalization_index >= 0
     ),
+    terminal_desired_configuration_id BLOB CHECK (
+        terminal_desired_configuration_id IS NULL
+        OR length(terminal_desired_configuration_id) = 32
+    ),
+    terminal_desired_configuration_epoch INTEGER,
+    terminal_desired_members_json BLOB CHECK (
+        terminal_desired_members_json IS NULL
+        OR length(terminal_desired_members_json) BETWEEN 2 AND 1024
+    ),
+    terminal_desired_bindings_json BLOB CHECK (
+        terminal_desired_bindings_json IS NULL
+        OR length(terminal_desired_bindings_json) BETWEEN 2 AND 32768
+    ),
+    terminal_abort_learners_json BLOB CHECK (
+        terminal_abort_learners_json IS NULL
+        OR length(terminal_abort_learners_json) BETWEEN 2 AND 1024
+    ),
+    terminal_abort_decision_index INTEGER CHECK (
+        terminal_abort_decision_index IS NULL OR terminal_abort_decision_index >= 0
+    ),
+    terminal_abort_cleanup_membership_index INTEGER CHECK (
+        terminal_abort_cleanup_membership_index IS NULL
+        OR terminal_abort_cleanup_membership_index >= 0
+    ),
     CHECK (
         (predecessor_configuration_id IS NULL
          AND predecessor_transition_id IS NULL
@@ -686,7 +830,14 @@ CREATE TABLE consensus_membership_scope (
          AND terminal_joint_membership_index IS NULL
          AND terminal_uniform_membership_index IS NULL
          AND terminal_cutover_index IS NULL
-         AND terminal_finalization_index IS NULL)
+         AND terminal_finalization_index IS NULL
+         AND terminal_desired_configuration_id IS NULL
+         AND terminal_desired_configuration_epoch IS NULL
+         AND terminal_desired_members_json IS NULL
+         AND terminal_desired_bindings_json IS NULL
+         AND terminal_abort_learners_json IS NULL
+         AND terminal_abort_decision_index IS NULL
+         AND terminal_abort_cleanup_membership_index IS NULL)
         OR
         (terminal_transition_id IS NOT NULL
          AND terminal_transition_digest IS NOT NULL
@@ -704,13 +855,31 @@ CREATE TABLE consensus_membership_scope (
                AND terminal_joint_membership_index IS NULL
                AND terminal_uniform_membership_index IS NULL
                AND terminal_cutover_index IS NULL
-               AND terminal_finalization_index IS NULL)
+               AND terminal_finalization_index IS NULL
+               AND terminal_desired_configuration_id IS NOT NULL
+               AND terminal_desired_configuration_epoch = current_configuration_epoch + 1
+               AND terminal_desired_members_json IS NOT NULL
+               AND terminal_desired_bindings_json IS NOT NULL
+               AND terminal_abort_learners_json IS NOT NULL
+               AND terminal_abort_decision_index IS NOT NULL
+               AND terminal_abort_decision_index > terminal_transition_start_index
+               AND (terminal_learners_ready_index IS NULL
+                    OR terminal_abort_decision_index > terminal_learners_ready_index)
+               AND (terminal_abort_cleanup_membership_index IS NULL
+                    OR terminal_abort_cleanup_membership_index > terminal_abort_decision_index))
               OR (terminal_transition_outcome = 2
                   AND terminal_uniform_membership_index IS NOT NULL
                   AND terminal_cutover_index IS NOT NULL
                   AND terminal_cutover_index >= terminal_uniform_membership_index
                   AND (terminal_finalization_index IS NULL
-                       OR terminal_finalization_index > terminal_cutover_index))))
+                       OR terminal_finalization_index > terminal_cutover_index)
+                  AND terminal_desired_configuration_id IS NULL
+                  AND terminal_desired_configuration_epoch IS NULL
+                  AND terminal_desired_members_json IS NULL
+                  AND terminal_desired_bindings_json IS NULL
+                  AND terminal_abort_learners_json IS NULL
+                  AND terminal_abort_decision_index IS NULL
+                  AND terminal_abort_cleanup_membership_index IS NULL)))
     ),
     FOREIGN KEY(storage_configuration_epoch)
         REFERENCES consensus_identity(configuration_epoch)
@@ -727,6 +896,75 @@ CREATE TABLE consensus_membership_history (
     cutover_index INTEGER NOT NULL CHECK (
         cutover_index >= transition_start_index
     ),
+    FOREIGN KEY(storage_configuration_epoch)
+        REFERENCES consensus_identity(configuration_epoch)
+);
+
+CREATE TABLE consensus_membership_terminal_history (
+    transition_id BLOB PRIMARY KEY CHECK (length(transition_id) = 16),
+    storage_configuration_epoch INTEGER NOT NULL CHECK (storage_configuration_epoch > 0),
+    transition_digest BLOB NOT NULL CHECK (length(transition_digest) = 32),
+    outcome INTEGER NOT NULL CHECK (outcome IN (1, 2)),
+    expected_member_count INTEGER NOT NULL CHECK (expected_member_count > 0),
+    transition_start_index INTEGER NOT NULL CHECK (transition_start_index >= 0),
+    learners_ready_index INTEGER CHECK (
+        learners_ready_index IS NULL OR learners_ready_index > transition_start_index
+    ),
+    joint_membership_index INTEGER CHECK (
+        joint_membership_index IS NULL
+        OR (learners_ready_index IS NOT NULL
+            AND joint_membership_index > learners_ready_index)
+    ),
+    uniform_membership_index INTEGER CHECK (
+        uniform_membership_index IS NULL
+        OR (joint_membership_index IS NOT NULL
+            AND uniform_membership_index > joint_membership_index)
+    ),
+    cutover_index INTEGER CHECK (
+        cutover_index IS NULL
+        OR (uniform_membership_index IS NOT NULL
+            AND cutover_index >= uniform_membership_index)
+    ),
+    finalization_index INTEGER CHECK (
+        finalization_index IS NULL
+        OR (cutover_index IS NOT NULL AND finalization_index > cutover_index)
+    ),
+    abort_decision_index INTEGER CHECK (
+        abort_decision_index IS NULL OR abort_decision_index > transition_start_index
+    ),
+    abort_cleanup_membership_index INTEGER CHECK (
+        abort_cleanup_membership_index IS NULL
+        OR (abort_decision_index IS NOT NULL
+            AND abort_cleanup_membership_index > abort_decision_index)
+    ),
+    CHECK (
+        (outcome = 1
+         AND joint_membership_index IS NULL
+         AND uniform_membership_index IS NULL
+         AND cutover_index IS NULL
+         AND finalization_index IS NULL
+         AND abort_decision_index IS NOT NULL
+         AND abort_cleanup_membership_index IS NOT NULL)
+        OR
+        (outcome = 2
+         AND joint_membership_index IS NOT NULL
+         AND uniform_membership_index IS NOT NULL
+         AND cutover_index IS NOT NULL
+         AND finalization_index IS NOT NULL
+         AND abort_decision_index IS NULL
+         AND abort_cleanup_membership_index IS NULL)
+    ),
+    FOREIGN KEY(storage_configuration_epoch)
+        REFERENCES consensus_identity(configuration_epoch)
+);
+
+CREATE TABLE consensus_candidate_bootstrap (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    storage_configuration_epoch INTEGER NOT NULL CHECK (storage_configuration_epoch > 0),
+    local_candidate_node_id INTEGER NOT NULL CHECK (local_candidate_node_id > 0),
+    transition_id BLOB NOT NULL CHECK (length(transition_id) = 16),
+    transition_digest BLOB NOT NULL CHECK (length(transition_digest) = 32),
+    state INTEGER NOT NULL CHECK (state IN (1, 2)),
     FOREIGN KEY(storage_configuration_epoch)
         REFERENCES consensus_identity(configuration_epoch)
 );
@@ -971,6 +1209,7 @@ impl SqliteConsensusCore {
 
 #[derive(Clone, Copy)]
 pub(crate) struct PendingMembershipBootstrap<'a> {
+    pub(crate) local_candidate_node_id: Option<SessionConsensusNodeId>,
     pub(crate) transition_id: [u8; MEMBERSHIP_TRANSITION_ID_BYTES],
     pub(crate) transition_digest: [u8; 32],
     pub(crate) desired_identity: SessionConsensusIdentity,
@@ -978,6 +1217,100 @@ pub(crate) struct PendingMembershipBootstrap<'a> {
     pub(crate) desired_bindings: &'a BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CandidateBootstrapState {
+    Active,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CandidateBootstrapMarker {
+    local_candidate_node_id: SessionConsensusNodeId,
+    transition_id: [u8; MEMBERSHIP_TRANSITION_ID_BYTES],
+    transition_digest: [u8; 32],
+    state: CandidateBootstrapState,
+}
+
+type CandidateBootstrapRow = (i64, i64, Vec<u8>, Vec<u8>, i64);
+
+fn read_candidate_bootstrap_marker_sync(
+    conn: &Connection,
+    storage_identity: SessionConsensusIdentity,
+) -> io::Result<Option<CandidateBootstrapMarker>> {
+    if !table_exists(conn, "consensus_candidate_bootstrap").map_err(db_error)? {
+        return Ok(None);
+    }
+    let row: Option<CandidateBootstrapRow> = conn
+        .query_row(
+            "SELECT storage_configuration_epoch, local_candidate_node_id, transition_id, transition_digest, state FROM consensus_candidate_bootstrap WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )
+        .optional()
+        .map_err(db_error)?;
+    let Some((storage_epoch, node_id, transition_id, transition_digest, state)) = row else {
+        return Ok(None);
+    };
+    validate_epoch(storage_epoch, storage_identity)?;
+    let node_id = SessionConsensusNodeId::new(checked_positive_u64(node_id)?)
+        .map_err(|_| invalid_data("session consensus candidate node ID is invalid"))?;
+    let transition_id = transition_id
+        .try_into()
+        .map_err(|_| invalid_data("session consensus candidate transition ID is invalid"))?;
+    let transition_digest = transition_digest
+        .try_into()
+        .map_err(|_| invalid_data("session consensus candidate transition digest is invalid"))?;
+    let state = match state {
+        1 => CandidateBootstrapState::Active,
+        2 => CandidateBootstrapState::Cancelled,
+        _ => {
+            return Err(invalid_data(
+                "session consensus candidate bootstrap state is invalid",
+            ));
+        }
+    };
+    Ok(Some(CandidateBootstrapMarker {
+        local_candidate_node_id: node_id,
+        transition_id,
+        transition_digest,
+        state,
+    }))
+}
+
+fn record_active_candidate_bootstrap_sync(
+    conn: &Connection,
+    storage_identity: SessionConsensusIdentity,
+    local_candidate_node_id: SessionConsensusNodeId,
+    transition_id: [u8; MEMBERSHIP_TRANSITION_ID_BYTES],
+    transition_digest: [u8; 32],
+) -> Result<(), SessionConsensusStorageError> {
+    if read_candidate_bootstrap_marker_sync(conn, storage_identity)
+        .map_err(|_| SessionConsensusStorageError::CorruptState)?
+        .is_some_and(|marker| {
+            marker.local_candidate_node_id != local_candidate_node_id
+                || (marker.transition_id == transition_id
+                    && (marker.transition_digest != transition_digest
+                        || marker.state == CandidateBootstrapState::Cancelled))
+        })
+    {
+        return Err(SessionConsensusStorageError::RecoveryRequired);
+    }
+    conn.execute(
+        "INSERT INTO consensus_candidate_bootstrap (singleton, storage_configuration_epoch, local_candidate_node_id, transition_id, transition_digest, state) VALUES (1, ?1, ?2, ?3, ?4, 1) ON CONFLICT(singleton) DO UPDATE SET local_candidate_node_id = excluded.local_candidate_node_id, transition_id = excluded.transition_id, transition_digest = excluded.transition_digest, state = 1",
+        params![
+            epoch_i64(storage_identity)
+                .map_err(|_| SessionConsensusStorageError::CorruptState)?,
+            checked_positive_i64(local_candidate_node_id.get())
+                .map_err(|_| SessionConsensusStorageError::InvalidIdentity)?,
+            transition_id.as_slice(),
+            transition_digest.as_slice(),
+        ],
+    )
+    .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
+    Ok(())
+}
+
+#[cfg(test)]
 fn initialize_schema_with_bindings(
     conn: &Connection,
     requested_identity: SessionConsensusIdentity,
@@ -993,6 +1326,7 @@ fn initialize_schema_with_bindings(
     )
 }
 
+#[cfg(test)]
 fn initialize_schema_with_pending_and_bindings(
     conn: &Connection,
     requested_identity: SessionConsensusIdentity,
@@ -1076,6 +1410,12 @@ fn initialize_schema_with_storage_anchor_and_pending_and_bindings(
     if storage_identity.cluster_id() != requested_identity.cluster_id() {
         return Err(SessionConsensusStorageError::IdentityMismatch);
     }
+    if storage_identity.configuration_epoch() > requested_identity.configuration_epoch()
+        || (storage_identity.configuration_epoch() == requested_identity.configuration_epoch()
+            && storage_identity.configuration_id() != requested_identity.configuration_id())
+    {
+        return Err(SessionConsensusStorageError::IdentityMismatch);
+    }
     ensure_operator_recovery_schema_sync(&tx, storage_identity)
         .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
     ensure_membership_scope_schema_sync(
@@ -1099,16 +1439,76 @@ fn initialize_schema_with_storage_anchor_and_pending_and_bindings(
         return Err(SessionConsensusStorageError::IdentityMismatch);
     }
     if let Some(pending) = pending {
-        let transition_start = last_log_sync(&tx, storage_identity)
-            .map_err(|_| SessionConsensusStorageError::CorruptState)?
-            .map(|log_id| {
-                log_id
-                    .index
-                    .checked_add(1)
-                    .ok_or(SessionConsensusStorageError::InvalidIdentity)
-            })
-            .transpose()?
-            .unwrap_or(0);
+        let transition_start =
+            if let Some(local_candidate_node_id) = pending.local_candidate_node_id {
+                if scope.current_members.contains(&local_candidate_node_id)
+                    || !pending.desired_members.contains(&local_candidate_node_id)
+                {
+                    return Err(SessionConsensusStorageError::InvalidIdentity);
+                }
+                let membership = read_membership_unchecked_sync(&tx, storage_identity)
+                    .map_err(|_| SessionConsensusStorageError::CorruptState)?;
+                let pristine_candidate = is_pristine_membership(&membership)
+                    && read_applied_sync(&tx, storage_identity)
+                        .map_err(|_| SessionConsensusStorageError::CorruptState)?
+                        .is_none()
+                    && scope.pending.is_none()
+                    && scope.terminal.is_none();
+                let exact_pending_candidate = scope.pending.as_ref().is_some_and(|existing| {
+                    existing.transition_id == pending.transition_id
+                        && existing.transition_digest == pending.transition_digest
+                        && existing.desired_identity == pending.desired_identity
+                        && existing.desired_members == *pending.desired_members
+                        && existing.desired_bindings == *pending.desired_bindings
+                });
+                let durably_aborted_candidate = scope
+                    .terminal
+                    .as_ref()
+                    .filter(|terminal| terminal.outcome == TerminalMembershipOutcome::Aborted)
+                    .and_then(|terminal| {
+                        (terminal.transition_id != pending.transition_id)
+                            .then_some(terminal)
+                            .and_then(|terminal| terminal.abort_cleanup.as_ref())
+                    })
+                    .is_some_and(|cleanup| cleanup.learners.contains(&local_candidate_node_id));
+                let marker = read_candidate_bootstrap_marker_sync(&tx, storage_identity)
+                    .map_err(|_| SessionConsensusStorageError::CorruptState)?;
+                let marker_allows = marker.is_none_or(|marker| {
+                    let same_node = marker.local_candidate_node_id == local_candidate_node_id;
+                    let same_transition_id = marker.transition_id == pending.transition_id;
+                    let exact = same_node
+                        && same_transition_id
+                        && marker.transition_digest == pending.transition_digest;
+                    same_node
+                        && match marker.state {
+                            CandidateBootstrapState::Active => {
+                                (exact && exact_pending_candidate)
+                                    || (!same_transition_id && durably_aborted_candidate)
+                            }
+                            CandidateBootstrapState::Cancelled => !same_transition_id,
+                        }
+                });
+                if (!pristine_candidate && !exact_pending_candidate && !durably_aborted_candidate)
+                    || !marker_allows
+                {
+                    return Err(SessionConsensusStorageError::RecoveryRequired);
+                }
+                // A candidate has no authority to invent the source Prepare index.
+                // Zero remains provisional until an exact committed Prepare entry
+                // or authoritative snapshot supplies the real index.
+                0
+            } else {
+                last_log_sync(&tx, storage_identity)
+                    .map_err(|_| SessionConsensusStorageError::CorruptState)?
+                    .map(|log_id| {
+                        log_id
+                            .index
+                            .checked_add(1)
+                            .ok_or(SessionConsensusStorageError::InvalidIdentity)
+                    })
+                    .transpose()?
+                    .unwrap_or(0)
+            };
         stage_membership_scope_in_tx(
             &tx,
             storage_identity,
@@ -1133,6 +1533,15 @@ fn initialize_schema_with_storage_anchor_and_pending_and_bindings(
                 SessionConsensusStorageError::CorruptState
             }
         })?;
+        if let Some(local_candidate_node_id) = pending.local_candidate_node_id {
+            record_active_candidate_bootstrap_sync(
+                &tx,
+                storage_identity,
+                local_candidate_node_id,
+                pending.transition_id,
+                pending.transition_digest,
+            )?;
+        }
     }
     validate_persisted_membership_sync(&tx, storage_identity)
         .map_err(|_| SessionConsensusStorageError::CorruptState)?;
@@ -1300,6 +1709,42 @@ fn install_membership_history_schema_sync(conn: &Connection) -> io::Result<()> {
     conn.execute_batch(&ddl).map_err(db_error)
 }
 
+fn install_membership_terminal_history_schema_sync(conn: &Connection) -> io::Result<()> {
+    if table_exists(conn, "consensus_membership_terminal_history").map_err(db_error)? {
+        return Ok(());
+    }
+    let canonical = Connection::open_in_memory().map_err(db_error)?;
+    canonical
+        .execute_batch(CONSENSUS_SCHEMA)
+        .map_err(db_error)?;
+    let ddl: String = canonical
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'consensus_membership_terminal_history'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+    conn.execute_batch(&ddl).map_err(db_error)
+}
+
+fn install_candidate_bootstrap_schema_sync(conn: &Connection) -> io::Result<()> {
+    if table_exists(conn, "consensus_candidate_bootstrap").map_err(db_error)? {
+        return Ok(());
+    }
+    let canonical = Connection::open_in_memory().map_err(db_error)?;
+    canonical
+        .execute_batch(CONSENSUS_SCHEMA)
+        .map_err(db_error)?;
+    let ddl: String = canonical
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'consensus_candidate_bootstrap'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+    conn.execute_batch(&ddl).map_err(db_error)
+}
+
 fn encode_members(
     members: &BTreeSet<SessionConsensusNodeId>,
     transition: bool,
@@ -1344,6 +1789,35 @@ fn decode_members(
     let members = decode_json(&encoded)?;
     validate_member_set(&members, transition)?;
     Ok(members)
+}
+
+fn encode_node_subset(nodes: &BTreeSet<SessionConsensusNodeId>) -> io::Result<Vec<u8>> {
+    if nodes.len() > crate::topology::QUORUM_TOPOLOGY_MAX_MEMBERS {
+        return Err(invalid_data(
+            "session consensus membership subset exceeds storage bounds",
+        ));
+    }
+    for node in nodes {
+        checked_positive_i64(node.get())?;
+    }
+    let encoded = encode_json(nodes)?;
+    if encoded.len() < 2 || encoded.len() > MEMBERSHIP_SCOPE_MEMBERS_MAX_BYTES {
+        return Err(invalid_data(
+            "session consensus membership subset exceeds storage bounds",
+        ));
+    }
+    Ok(encoded)
+}
+
+fn decode_node_subset(encoded: Vec<u8>) -> io::Result<BTreeSet<SessionConsensusNodeId>> {
+    if encoded.len() < 2 || encoded.len() > MEMBERSHIP_SCOPE_MEMBERS_MAX_BYTES {
+        return Err(invalid_data(
+            "session consensus membership subset exceeds storage bounds",
+        ));
+    }
+    let nodes = decode_json(&encoded)?;
+    encode_node_subset(&nodes)?;
+    Ok(nodes)
 }
 
 fn validate_member_bindings(
@@ -1461,6 +1935,20 @@ fn decode_bindings(
     Ok(bindings)
 }
 
+fn decode_current_bindings(
+    encoded: Vec<u8>,
+    members: &BTreeSet<SessionConsensusNodeId>,
+) -> io::Result<BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>> {
+    // Fixed-topology recovery checkpoints predate routable member bindings
+    // and use exactly the canonical empty JSON array. A writable production
+    // open replaces this sentinel atomically from the caller-validated
+    // topology before any dynamic transition can be staged.
+    if encoded == b"[]" {
+        return Ok(BTreeMap::new());
+    }
+    decode_bindings(encoded, members)
+}
+
 fn exact_successor_epoch(
     current: SessionConsensusIdentity,
     desired: SessionConsensusIdentity,
@@ -1486,6 +1974,8 @@ fn ensure_membership_scope_schema_sync(
         validate_member_bindings(expected_members, expected_bindings)?;
     }
     install_membership_history_schema_sync(conn)?;
+    install_membership_terminal_history_schema_sync(conn)?;
+    install_candidate_bootstrap_schema_sync(conn)?;
     if storage_identity.cluster_id() != requested_current_identity.cluster_id()
         || storage_identity.configuration_epoch().get()
             > requested_current_identity.configuration_epoch().get()
@@ -1608,6 +2098,13 @@ type MembershipScopeRow = (
     Option<i64>,
     Vec<u8>,
     Option<Vec<u8>>,
+    Option<Vec<u8>>,
+    Option<i64>,
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+    Option<i64>,
+    Option<i64>,
 );
 
 fn read_membership_history_sync(
@@ -1673,6 +2170,146 @@ fn read_membership_history_sync(
     Ok(history)
 }
 
+fn read_membership_terminal_history_sync(
+    conn: &Connection,
+    storage_identity: SessionConsensusIdentity,
+) -> io::Result<Vec<RetainedTerminalMembershipTransition>> {
+    if !table_exists(conn, "consensus_membership_terminal_history").map_err(db_error)? {
+        return Ok(Vec::new());
+    }
+    let mut statement = conn
+        .prepare(
+            "SELECT storage_configuration_epoch, transition_id, transition_digest, outcome, expected_member_count, transition_start_index, learners_ready_index, joint_membership_index, uniform_membership_index, cutover_index, finalization_index, abort_decision_index, abort_cleanup_membership_index FROM consensus_membership_terminal_history ORDER BY transition_start_index ASC, transition_id ASC",
+        )
+        .map_err(db_error)?;
+    let mut rows = statement.query([]).map_err(db_error)?;
+    let mut history = Vec::new();
+    while let Some(row) = rows.next().map_err(db_error)? {
+        if history.len() >= MEMBERSHIP_HISTORY_MAX_ENTRIES {
+            return Err(invalid_data(
+                "session consensus terminal history exceeds storage bounds",
+            ));
+        }
+        let stored_epoch: i64 = row.get(0).map_err(db_error)?;
+        validate_epoch(stored_epoch, storage_identity)?;
+        let transition_id: Vec<u8> = row.get(1).map_err(db_error)?;
+        let transition_id = transition_id
+            .try_into()
+            .map_err(|_| invalid_data("session consensus terminal history ID is invalid"))?;
+        let transition_digest: Vec<u8> = row.get(2).map_err(db_error)?;
+        let transition_digest = transition_digest
+            .try_into()
+            .map_err(|_| invalid_data("session consensus terminal history digest is invalid"))?;
+        let outcome = match row.get::<_, i64>(3).map_err(db_error)? {
+            1 => TerminalMembershipOutcome::Aborted,
+            2 => TerminalMembershipOutcome::Promoted,
+            _ => {
+                return Err(invalid_data(
+                    "session consensus terminal history outcome is invalid",
+                ));
+            }
+        };
+        let expected_member_count = usize::try_from(checked_positive_u64(
+            row.get::<_, i64>(4).map_err(db_error)?,
+        )?)
+        .map_err(|_| invalid_data("session consensus terminal history member count is invalid"))?;
+        if expected_member_count > crate::topology::QUORUM_TOPOLOGY_MAX_MEMBERS {
+            return Err(invalid_data(
+                "session consensus terminal history member count is invalid",
+            ));
+        }
+        let transition_start_log_index = checked_u64(row.get(5).map_err(db_error)?)?;
+        let learners_ready_log_index = row
+            .get::<_, Option<i64>>(6)
+            .map_err(db_error)?
+            .map(checked_u64)
+            .transpose()?;
+        let joint_membership_log_index = row
+            .get::<_, Option<i64>>(7)
+            .map_err(db_error)?
+            .map(checked_u64)
+            .transpose()?;
+        let uniform_membership_log_index = row
+            .get::<_, Option<i64>>(8)
+            .map_err(db_error)?
+            .map(checked_u64)
+            .transpose()?;
+        let cutover_log_index = row
+            .get::<_, Option<i64>>(9)
+            .map_err(db_error)?
+            .map(checked_u64)
+            .transpose()?;
+        let finalization_log_index = row
+            .get::<_, Option<i64>>(10)
+            .map_err(db_error)?
+            .map(checked_u64)
+            .transpose()?;
+        let abort_decision_log_index = row
+            .get::<_, Option<i64>>(11)
+            .map_err(db_error)?
+            .map(checked_u64)
+            .transpose()?;
+        let abort_cleanup_log_index = row
+            .get::<_, Option<i64>>(12)
+            .map_err(db_error)?
+            .map(checked_u64)
+            .transpose()?;
+
+        let index_order_is_valid = learners_ready_log_index
+            .is_none_or(|ready| ready > transition_start_log_index)
+            && joint_membership_log_index
+                .is_none_or(|joint| learners_ready_log_index.is_some_and(|ready| joint > ready))
+            && uniform_membership_log_index.is_none_or(|uniform| {
+                joint_membership_log_index.is_some_and(|joint| uniform > joint)
+            });
+        let outcome_is_valid = match outcome {
+            TerminalMembershipOutcome::Aborted => {
+                joint_membership_log_index.is_none()
+                    && uniform_membership_log_index.is_none()
+                    && cutover_log_index.is_none()
+                    && finalization_log_index.is_none()
+                    && abort_decision_log_index
+                        .is_some_and(|decision| decision > transition_start_log_index)
+                    && abort_cleanup_log_index.is_some_and(|cleanup| {
+                        abort_decision_log_index.is_some_and(|decision| cleanup > decision)
+                    })
+            }
+            TerminalMembershipOutcome::Promoted => {
+                joint_membership_log_index.is_some()
+                    && uniform_membership_log_index.is_some()
+                    && cutover_log_index.is_some_and(|cutover| {
+                        uniform_membership_log_index.is_some_and(|uniform| cutover >= uniform)
+                    })
+                    && finalization_log_index.is_some_and(|finalization| {
+                        cutover_log_index.is_some_and(|cutover| finalization > cutover)
+                    })
+                    && abort_decision_log_index.is_none()
+                    && abort_cleanup_log_index.is_none()
+            }
+        };
+        if !index_order_is_valid || !outcome_is_valid {
+            return Err(invalid_data(
+                "session consensus terminal history evidence is inconsistent",
+            ));
+        }
+        history.push(RetainedTerminalMembershipTransition {
+            transition_id,
+            transition_digest,
+            outcome,
+            expected_member_count,
+            transition_start_log_index,
+            learners_ready_log_index,
+            joint_membership_log_index,
+            uniform_membership_log_index,
+            cutover_log_index,
+            finalization_log_index,
+            abort_decision_log_index,
+            abort_cleanup_log_index,
+        });
+    }
+    Ok(history)
+}
+
 fn validate_membership_history_chain(
     history: &[MembershipPredecessorScope],
     predecessor: Option<&MembershipPredecessorScope>,
@@ -1729,13 +2366,14 @@ pub(crate) fn read_membership_scope_sync(
             application_authority_members: members,
             predecessor: None,
             history: Vec::new(),
+            terminal_history: Vec::new(),
             pending: None,
             terminal: None,
         });
     }
     let row: MembershipScopeRow = conn
         .query_row(
-            "SELECT storage_configuration_epoch, current_configuration_id, current_configuration_epoch, current_members_json, application_authority_epoch, application_authority_members_json, predecessor_configuration_id, predecessor_transition_id, predecessor_transition_digest, predecessor_configuration_epoch, predecessor_members_json, predecessor_transition_start_index, predecessor_cutover_index, pending_transition_id, pending_transition_digest, desired_configuration_id, desired_configuration_epoch, desired_members_json, pending_transition_start_index, pending_joint_membership_index, pending_uniform_membership_index, terminal_transition_id, terminal_transition_digest, terminal_transition_outcome, terminal_transition_start_index, terminal_joint_membership_index, terminal_uniform_membership_index, terminal_cutover_index, terminal_finalization_index, pending_learners_ready_index, terminal_learners_ready_index, current_bindings_json, desired_bindings_json FROM consensus_membership_scope WHERE singleton = 1",
+            "SELECT storage_configuration_epoch, current_configuration_id, current_configuration_epoch, current_members_json, application_authority_epoch, application_authority_members_json, predecessor_configuration_id, predecessor_transition_id, predecessor_transition_digest, predecessor_configuration_epoch, predecessor_members_json, predecessor_transition_start_index, predecessor_cutover_index, pending_transition_id, pending_transition_digest, desired_configuration_id, desired_configuration_epoch, desired_members_json, pending_transition_start_index, pending_joint_membership_index, pending_uniform_membership_index, terminal_transition_id, terminal_transition_digest, terminal_transition_outcome, terminal_transition_start_index, terminal_joint_membership_index, terminal_uniform_membership_index, terminal_cutover_index, terminal_finalization_index, pending_learners_ready_index, terminal_learners_ready_index, current_bindings_json, desired_bindings_json, terminal_desired_configuration_id, terminal_desired_configuration_epoch, terminal_desired_members_json, terminal_desired_bindings_json, terminal_abort_learners_json, terminal_abort_decision_index, terminal_abort_cleanup_membership_index FROM consensus_membership_scope WHERE singleton = 1",
             [],
             |row| {
                 Ok((
@@ -1745,7 +2383,8 @@ pub(crate) fn read_membership_scope_sync(
                     row.get(15)?, row.get(16)?, row.get(17)?, row.get(18)?, row.get(19)?,
                     row.get(20)?, row.get(21)?, row.get(22)?, row.get(23)?, row.get(24)?,
                     row.get(25)?, row.get(26)?, row.get(27)?, row.get(28)?, row.get(29)?,
-                    row.get(30)?, row.get(31)?, row.get(32)?,
+                    row.get(30)?, row.get(31)?, row.get(32)?, row.get(33)?, row.get(34)?,
+                    row.get(35)?, row.get(36)?, row.get(37)?, row.get(38)?, row.get(39)?,
                 ))
             },
         )
@@ -1763,7 +2402,7 @@ pub(crate) fn read_membership_scope_sync(
         current_epoch,
     );
     let current_members = decode_members(row.3, false)?;
-    let current_bindings = decode_bindings(row.31, &current_members)?;
+    let current_bindings = decode_current_bindings(row.31, &current_members)?;
     let desired_bindings_encoded = row.32.clone();
 
     let application_authority_epoch =
@@ -1917,6 +2556,13 @@ pub(crate) fn read_membership_scope_sync(
                 || row.27.is_some()
                 || row.28.is_some()
                 || row.30.is_some()
+                || row.33.is_some()
+                || row.34.is_some()
+                || row.35.is_some()
+                || row.36.is_some()
+                || row.37.is_some()
+                || row.38.is_some()
+                || row.39.is_some()
             {
                 return Err(invalid_data(
                     "session consensus terminal transition scope is incomplete",
@@ -1946,6 +2592,88 @@ pub(crate) fn read_membership_scope_sync(
             let uniform = row.26.map(checked_u64).transpose()?;
             let cutover = row.27.map(checked_u64).transpose()?;
             let finalization = row.28.map(checked_u64).transpose()?;
+            let abort_cleanup = match outcome {
+                TerminalMembershipOutcome::Aborted => {
+                    let (
+                        Some(configuration),
+                        Some(epoch),
+                        Some(members),
+                        Some(bindings),
+                        Some(learners),
+                        Some(decision),
+                    ) = (row.33, row.34, row.35, row.36, row.37, row.38)
+                    else {
+                        return Err(invalid_data(
+                            "session consensus abort cleanup scope is incomplete",
+                        ));
+                    };
+                    let configuration: [u8; 32] = configuration.try_into().map_err(|_| {
+                        invalid_data(
+                            "session consensus aborted desired configuration ID is invalid",
+                        )
+                    })?;
+                    let epoch =
+                        SessionConsensusConfigurationEpoch::new(checked_positive_u64(epoch)?)
+                            .map_err(|_| {
+                                invalid_data(
+                            "session consensus aborted desired configuration epoch is invalid",
+                        )
+                            })?;
+                    let desired_identity = SessionConsensusIdentity::new(
+                        storage_identity.cluster_id(),
+                        SessionConsensusConfigurationId::from_bytes(configuration),
+                        epoch,
+                    );
+                    let desired_members = decode_members(members, true)?;
+                    let desired_bindings = decode_bindings(bindings, &desired_members)?;
+                    validate_transition_bindings(
+                        &current_members,
+                        &current_bindings,
+                        &desired_members,
+                        &desired_bindings,
+                    )?;
+                    let learners = decode_node_subset(learners)?;
+                    let additions = desired_members
+                        .difference(&current_members)
+                        .copied()
+                        .collect::<BTreeSet<_>>();
+                    let decision = checked_u64(decision)?;
+                    let cleanup = row.39.map(checked_u64).transpose()?;
+                    if !exact_successor_epoch(current_identity, desired_identity)
+                        || !learners.is_subset(&additions)
+                        || decision <= start
+                        || learners_ready.is_some_and(|ready| decision <= ready)
+                        || cleanup.is_some_and(|cleanup| cleanup <= decision)
+                    {
+                        return Err(invalid_data(
+                            "session consensus abort cleanup scope is inconsistent",
+                        ));
+                    }
+                    Some(AbortedMembershipCleanup {
+                        desired_identity,
+                        desired_members,
+                        desired_bindings,
+                        learners,
+                        decision_log_index: decision,
+                        cleanup_log_index: cleanup,
+                    })
+                }
+                TerminalMembershipOutcome::Promoted => {
+                    if row.33.is_some()
+                        || row.34.is_some()
+                        || row.35.is_some()
+                        || row.36.is_some()
+                        || row.37.is_some()
+                        || row.38.is_some()
+                        || row.39.is_some()
+                    {
+                        return Err(invalid_data(
+                            "session consensus promoted transition has abort cleanup scope",
+                        ));
+                    }
+                    None
+                }
+            };
             if learners_ready.is_some_and(|index| index <= start)
                 || joint.is_some_and(|index| {
                     learners_ready.is_none_or(|learners_ready| index <= learners_ready)
@@ -1981,6 +2709,7 @@ pub(crate) fn read_membership_scope_sync(
                 uniform_membership_log_index: uniform,
                 cutover_log_index: cutover,
                 finalization_log_index: finalization,
+                abort_cleanup,
             })
         }
         _ => {
@@ -2002,15 +2731,25 @@ pub(crate) fn read_membership_scope_sync(
             "session consensus application authority scope is inconsistent",
         ));
     }
+    let terminal_history = read_membership_terminal_history_sync(conn, storage_identity)?;
     if let Some(predecessor) = &predecessor {
-        let terminal_matches = terminal.as_ref().is_some_and(|terminal| {
+        let current_terminal_matches = terminal.as_ref().is_some_and(|terminal| {
             terminal.transition_id == predecessor.transition_id
                 && terminal.transition_digest == predecessor.transition_digest
                 && terminal.outcome == TerminalMembershipOutcome::Promoted
                 && terminal.transition_start_log_index == predecessor.transition_start_log_index
                 && terminal.cutover_log_index == Some(predecessor.cutover_log_index)
         });
-        if !terminal_matches {
+        let retained_terminal_matches = terminal_history.iter().any(|terminal| {
+            terminal.transition_id == predecessor.transition_id
+                && terminal.transition_digest == predecessor.transition_digest
+                && terminal.outcome == TerminalMembershipOutcome::Promoted
+                && terminal.expected_member_count == predecessor.members.len()
+                && terminal.transition_start_log_index == predecessor.transition_start_log_index
+                && terminal.cutover_log_index == Some(predecessor.cutover_log_index)
+                && terminal.finalization_log_index.is_some()
+        });
+        if !current_terminal_matches && !retained_terminal_matches {
             return Err(invalid_data(
                 "session consensus predecessor evidence is inconsistent",
             ));
@@ -2019,8 +2758,7 @@ pub(crate) fn read_membership_scope_sync(
 
     let history = read_membership_history_sync(conn, storage_identity)?;
     validate_membership_history_chain(&history, predecessor.as_ref(), current_identity)?;
-
-    Ok(MembershipValidationScope {
+    let scope = MembershipValidationScope {
         current_identity,
         current_members,
         current_bindings,
@@ -2028,9 +2766,54 @@ pub(crate) fn read_membership_scope_sync(
         application_authority_members,
         predecessor,
         history,
+        terminal_history,
         pending,
         terminal,
-    })
+    };
+    if let Some(pending) = scope.pending.as_ref() {
+        if retained_transition_digest(&scope, pending.transition_id)?.is_some() {
+            return Err(invalid_data(
+                "session consensus pending transition reuses retained evidence",
+            ));
+        }
+    }
+    if let Some(current) = scope.terminal.as_ref() {
+        if let Some(retained) = scope
+            .terminal_history
+            .iter()
+            .find(|retained| retained.transition_id == current.transition_id)
+        {
+            let completed = completed_terminal_from_scope(&scope).map_err(|_| {
+                invalid_data("session consensus current terminal history is incomplete")
+            })?;
+            if completed.as_ref() != Some(retained) {
+                return Err(invalid_data(
+                    "session consensus current terminal history conflicts",
+                ));
+            }
+        }
+    }
+    for transition_id in scope
+        .terminal_history
+        .iter()
+        .map(|terminal| terminal.transition_id)
+        .chain(scope.terminal.iter().map(|terminal| terminal.transition_id))
+        .chain(
+            scope
+                .predecessor
+                .iter()
+                .map(|predecessor| predecessor.transition_id),
+        )
+        .chain(
+            scope
+                .history
+                .iter()
+                .map(|predecessor| predecessor.transition_id),
+        )
+    {
+        retained_transition_digest(&scope, transition_id)?;
+    }
+    Ok(scope)
 }
 
 fn membership_transaction(
@@ -2048,7 +2831,128 @@ fn read_scope_for_mutation(
         .map_err(|_| MembershipScopeMutationError::CorruptState)
 }
 
-pub(crate) fn stage_membership_scope_sync_with_bindings(
+fn completed_terminal_from_scope(
+    scope: &MembershipValidationScope,
+) -> Result<Option<RetainedTerminalMembershipTransition>, MembershipScopeMutationError> {
+    let Some(terminal) = scope.terminal.as_ref() else {
+        return Ok(None);
+    };
+    let (expected_member_count, abort_decision_log_index, abort_cleanup_log_index) =
+        match terminal.outcome {
+            TerminalMembershipOutcome::Aborted => {
+                let cleanup = terminal
+                    .abort_cleanup
+                    .as_ref()
+                    .ok_or(MembershipScopeMutationError::CorruptState)?;
+                let cleanup_index = cleanup
+                    .cleanup_log_index
+                    .ok_or(MembershipScopeMutationError::TransitionNotQuiescent)?;
+                (
+                    scope.current_members.len(),
+                    Some(cleanup.decision_log_index),
+                    Some(cleanup_index),
+                )
+            }
+            TerminalMembershipOutcome::Promoted => {
+                if terminal.finalization_log_index.is_none() {
+                    return Err(MembershipScopeMutationError::TransitionNotQuiescent);
+                }
+                let expected_member_count = scope
+                    .predecessor
+                    .iter()
+                    .chain(scope.history.iter())
+                    .find(|predecessor| {
+                        predecessor.transition_id == terminal.transition_id
+                            && predecessor.transition_digest == terminal.transition_digest
+                    })
+                    .map(|predecessor| predecessor.members.len())
+                    .ok_or(MembershipScopeMutationError::CorruptState)?;
+                (expected_member_count, None, None)
+            }
+        };
+    Ok(Some(RetainedTerminalMembershipTransition {
+        transition_id: terminal.transition_id,
+        transition_digest: terminal.transition_digest,
+        outcome: terminal.outcome,
+        expected_member_count,
+        transition_start_log_index: terminal.transition_start_log_index,
+        learners_ready_log_index: terminal.learners_ready_log_index,
+        joint_membership_log_index: terminal.joint_membership_log_index,
+        uniform_membership_log_index: terminal.uniform_membership_log_index,
+        cutover_log_index: terminal.cutover_log_index,
+        finalization_log_index: terminal.finalization_log_index,
+        abort_decision_log_index,
+        abort_cleanup_log_index,
+    }))
+}
+
+fn retain_completed_terminal_in_tx(
+    conn: &Connection,
+    storage_identity: SessionConsensusIdentity,
+    scope: &MembershipValidationScope,
+) -> Result<(), MembershipScopeMutationError> {
+    let Some(retained) = completed_terminal_from_scope(scope)? else {
+        return Ok(());
+    };
+    if let Some(existing) = scope
+        .terminal_history
+        .iter()
+        .find(|existing| existing.transition_id == retained.transition_id)
+    {
+        return if existing == &retained {
+            Ok(())
+        } else {
+            Err(MembershipScopeMutationError::CorruptState)
+        };
+    }
+    if scope.terminal_history.len() >= MEMBERSHIP_HISTORY_MAX_ENTRIES {
+        return Err(MembershipScopeMutationError::CompactionRequired);
+    }
+    let optional_index = |index: Option<u64>| {
+        index
+            .map(checked_i64)
+            .transpose()
+            .map_err(|_| MembershipScopeMutationError::CorruptState)
+    };
+    conn.execute(
+        "INSERT INTO consensus_membership_terminal_history (transition_id, storage_configuration_epoch, transition_digest, outcome, expected_member_count, transition_start_index, learners_ready_index, joint_membership_index, uniform_membership_index, cutover_index, finalization_index, abort_decision_index, abort_cleanup_membership_index) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        params![
+            retained.transition_id.as_slice(),
+            epoch_i64(storage_identity)
+                .map_err(|_| MembershipScopeMutationError::CorruptState)?,
+            retained.transition_digest.as_slice(),
+            match retained.outcome {
+                TerminalMembershipOutcome::Aborted => 1_i64,
+                TerminalMembershipOutcome::Promoted => 2_i64,
+            },
+            checked_positive_i64(
+                u64::try_from(retained.expected_member_count)
+                    .map_err(|_| MembershipScopeMutationError::CorruptState)?,
+            )
+            .map_err(|_| MembershipScopeMutationError::CorruptState)?,
+            checked_i64(retained.transition_start_log_index)
+                .map_err(|_| MembershipScopeMutationError::CorruptState)?,
+            optional_index(retained.learners_ready_log_index)?,
+            optional_index(retained.joint_membership_log_index)?,
+            optional_index(retained.uniform_membership_log_index)?,
+            optional_index(retained.cutover_log_index)?,
+            optional_index(retained.finalization_log_index)?,
+            optional_index(retained.abort_decision_log_index)?,
+            optional_index(retained.abort_cleanup_log_index)?,
+        ],
+    )
+    .map_err(|error| {
+        if error.sqlite_error_code() == Some(rusqlite::ErrorCode::ConstraintViolation) {
+            MembershipScopeMutationError::CorruptState
+        } else {
+            MembershipScopeMutationError::BackendUnavailable
+        }
+    })?;
+    Ok(())
+}
+
+#[cfg(test)]
+fn stage_membership_scope_sync_with_bindings(
     conn: &Connection,
     storage_identity: SessionConsensusIdentity,
     transition_id: [u8; MEMBERSHIP_TRANSITION_ID_BYTES],
@@ -2103,6 +3007,7 @@ fn stage_membership_scope_sync(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn stage_membership_scope_in_tx(
     conn: &Connection,
     storage_identity: SessionConsensusIdentity,
@@ -2117,6 +3022,24 @@ pub(crate) fn stage_membership_scope_in_tx(
         return Err(MembershipScopeMutationError::InvalidScope);
     }
     let scope = read_scope_for_mutation(conn, storage_identity)?;
+    if read_candidate_bootstrap_marker_sync(conn, storage_identity)
+        .map_err(|_| MembershipScopeMutationError::CorruptState)?
+        .is_some_and(|marker| {
+            marker.state == CandidateBootstrapState::Cancelled
+                && marker.transition_id == transition_id
+        })
+    {
+        return Err(MembershipScopeMutationError::ConflictingTransition);
+    }
+    if let Some(retained_digest) = retained_transition_digest(&scope, transition_id)
+        .map_err(|_| MembershipScopeMutationError::CorruptState)?
+    {
+        return if retained_digest == transition_digest {
+            Ok(MembershipScopeMutation::Idempotent)
+        } else {
+            Err(MembershipScopeMutationError::ConflictingTransition)
+        };
+    }
     if !exact_successor_epoch(scope.current_identity, desired_identity)
         || validate_member_set(&scope.current_members, true).is_err()
         || (scope.predecessor.is_some() && scope.history.len() >= MEMBERSHIP_HISTORY_MAX_ENTRIES)
@@ -2130,16 +3053,7 @@ pub(crate) fn stage_membership_scope_in_tx(
     {
         return Err(MembershipScopeMutationError::InvalidScope);
     }
-    if let Some(terminal) = &scope.terminal {
-        if terminal.transition_id == transition_id {
-            return if terminal.transition_digest == transition_digest {
-                Ok(MembershipScopeMutation::Idempotent)
-            } else {
-                Err(MembershipScopeMutationError::ConflictingTransition)
-            };
-        }
-    }
-    if let Some(pending) = scope.pending {
+    if let Some(pending) = scope.pending.as_ref() {
         if pending.transition_id == transition_id
             && pending.transition_digest == transition_digest
             && pending.desired_identity == desired_identity
@@ -2180,6 +3094,7 @@ pub(crate) fn stage_membership_scope_in_tx(
         }
         return Err(MembershipScopeMutationError::ConflictingTransition);
     }
+    retain_completed_terminal_in_tx(conn, storage_identity, &scope)?;
     let changed = conn
         .execute(
             "UPDATE consensus_membership_scope SET pending_transition_id = ?1, pending_transition_digest = ?2, desired_configuration_id = ?3, desired_configuration_epoch = ?4, desired_members_json = ?5, desired_bindings_json = ?6, pending_transition_start_index = ?7 WHERE singleton = 1 AND storage_configuration_epoch = ?8",
@@ -2227,6 +3142,8 @@ pub(crate) fn read_membership_transition_evidence_sync(
                 uniform_membership_log_index: pending.uniform_membership_log_index,
                 cutover_log_index: None,
                 finalization_log_index: None,
+                abort_decision_log_index: None,
+                abort_cleanup_log_index: None,
             }));
         }
     }
@@ -2243,13 +3160,78 @@ pub(crate) fn read_membership_transition_evidence_sync(
                 uniform_membership_log_index: terminal.uniform_membership_log_index,
                 cutover_log_index: terminal.cutover_log_index,
                 finalization_log_index: terminal.finalization_log_index,
+                abort_decision_log_index: terminal
+                    .abort_cleanup
+                    .as_ref()
+                    .map(|cleanup| cleanup.decision_log_index),
+                abort_cleanup_log_index: terminal
+                    .abort_cleanup
+                    .as_ref()
+                    .and_then(|cleanup| cleanup.cleanup_log_index),
             }));
         }
+    }
+    if let Some(retained) = scope
+        .terminal_history
+        .iter()
+        .find(|retained| retained.transition_id == transition_id)
+    {
+        if retained.transition_digest != transition_digest {
+            return Err(MembershipScopeMutationError::ConflictingTransition);
+        }
+        return Ok(Some(retained.evidence()));
+    }
+    if let Some(retained_digest) = retained_transition_digest(&scope, transition_id)
+        .map_err(|_| MembershipScopeMutationError::CorruptState)?
+    {
+        if retained_digest != transition_digest {
+            return Err(MembershipScopeMutationError::ConflictingTransition);
+        }
+        // Predecessor/history rows retain the exact request binding and
+        // cutover, but not every joint/finalization index required to mint a
+        // public terminal status. Exact historical lookup therefore remains
+        // collision-safe without fabricating evidence.
+        return Ok(None);
     }
     Ok(None)
 }
 
 impl SqliteSessionBackend {
+    pub(crate) async fn provisional_consensus_candidate_is_cancelled(
+        &self,
+        storage_identity: SessionConsensusIdentity,
+        local_candidate_node_id: SessionConsensusNodeId,
+        transition_id: [u8; MEMBERSHIP_TRANSITION_ID_BYTES],
+        transition_digest: [u8; 32],
+    ) -> Result<bool, MembershipScopeMutationError> {
+        let conn = self.conn.lock().await;
+        let marker = read_candidate_bootstrap_marker_sync(&conn, storage_identity)
+            .map_err(|_| MembershipScopeMutationError::CorruptState)?;
+        Ok(marker.is_some_and(|marker| {
+            marker.local_candidate_node_id == local_candidate_node_id
+                && marker.transition_id == transition_id
+                && marker.transition_digest == transition_digest
+                && marker.state == CandidateBootstrapState::Cancelled
+        }))
+    }
+
+    pub(crate) async fn cancel_provisional_consensus_candidate(
+        &self,
+        storage_identity: SessionConsensusIdentity,
+        local_candidate_node_id: SessionConsensusNodeId,
+        transition_id: [u8; MEMBERSHIP_TRANSITION_ID_BYTES],
+        transition_digest: [u8; 32],
+    ) -> Result<MembershipScopeMutation, MembershipScopeMutationError> {
+        let conn = self.conn.lock().await;
+        cancel_provisional_candidate_membership_scope_sync(
+            &conn,
+            storage_identity,
+            local_candidate_node_id,
+            transition_id,
+            transition_digest,
+        )
+    }
+
     pub(crate) async fn consensus_membership_scope_snapshot(
         &self,
         storage_identity: SessionConsensusIdentity,
@@ -2302,13 +3284,44 @@ fn record_membership_transition_evidence_in_tx(
     membership: &StoredMembership<SessionConsensusNodeId, opc_consensus::engine::EmptyNode>,
 ) -> io::Result<()> {
     let scope = read_membership_scope_sync(conn, storage_identity)?;
-    let Some(pending) = scope.pending else {
-        return Ok(());
-    };
     let log_index = membership
         .log_id()
         .ok_or_else(|| invalid_data("session consensus membership log identity is missing"))?
         .index;
+    let Some(pending) = scope.pending else {
+        if let Some(cleanup) = scope
+            .terminal
+            .as_ref()
+            .filter(|terminal| terminal.outcome == TerminalMembershipOutcome::Aborted)
+            .and_then(|terminal| terminal.abort_cleanup.as_ref())
+        {
+            if log_index <= cleanup.decision_log_index {
+                return Ok(());
+            }
+            validate_uniform_membership(membership, &scope.current_members)?;
+            if cleanup.cleanup_log_index == Some(log_index) {
+                return Ok(());
+            }
+            if cleanup.cleanup_log_index.is_some() {
+                return Err(invalid_data(
+                    "session consensus abort cleanup membership evidence conflicts",
+                ));
+            }
+            let changed = conn
+                .execute(
+                    "UPDATE consensus_membership_scope SET terminal_abort_cleanup_membership_index = ?1 WHERE singleton = 1 AND terminal_transition_outcome = 1 AND terminal_abort_decision_index < ?1 AND terminal_abort_cleanup_membership_index IS NULL",
+                    params![checked_i64(log_index)?],
+                )
+                .map_err(db_error)?;
+            if changed != 1 {
+                return Err(invalid_data(
+                    "session consensus abort cleanup membership evidence conflicts",
+                ));
+            }
+            read_membership_scope_sync(conn, storage_identity)?;
+        }
+        return Ok(());
+    };
     let shape = classify_transition_membership(
         membership,
         &scope.current_members,
@@ -2428,7 +3441,8 @@ pub(crate) fn mark_membership_learners_ready_in_tx(
     Ok(MembershipScopeMutation::Applied)
 }
 
-pub(crate) fn fence_application_authority_sync(
+#[cfg(test)]
+fn fence_application_authority_sync(
     conn: &Connection,
     storage_identity: SessionConsensusIdentity,
     transition_id: [u8; MEMBERSHIP_TRANSITION_ID_BYTES],
@@ -2516,11 +3530,13 @@ pub(crate) fn validate_application_authority_sync(
     Ok(())
 }
 
-pub(crate) fn abort_membership_scope_sync(
+#[cfg(test)]
+fn abort_membership_scope_sync(
     conn: &Connection,
     storage_identity: SessionConsensusIdentity,
     transition_id: [u8; MEMBERSHIP_TRANSITION_ID_BYTES],
     transition_digest: [u8; 32],
+    abort_decision_log_index: u64,
 ) -> Result<MembershipScopeMutation, MembershipScopeMutationError> {
     let tx = membership_transaction(conn)?;
     let result = restore_and_abort_membership_scope_in_tx(
@@ -2528,6 +3544,7 @@ pub(crate) fn abort_membership_scope_sync(
         storage_identity,
         transition_id,
         transition_digest,
+        abort_decision_log_index,
     )?;
     tx.commit()
         .map_err(|_| MembershipScopeMutationError::BackendUnavailable)?;
@@ -2539,19 +3556,47 @@ pub(crate) fn restore_and_abort_membership_scope_in_tx(
     storage_identity: SessionConsensusIdentity,
     transition_id: [u8; MEMBERSHIP_TRANSITION_ID_BYTES],
     transition_digest: [u8; 32],
+    abort_decision_log_index: u64,
 ) -> Result<MembershipScopeMutation, MembershipScopeMutationError> {
     let scope = read_scope_for_mutation(conn, storage_identity)?;
     let Some(pending) = scope.pending.as_ref() else {
-        return match scope.terminal {
-            Some(terminal)
-                if terminal.transition_id == transition_id
+        let cleanup = scope
+            .terminal
+            .as_ref()
+            .filter(|terminal| {
+                terminal.transition_id == transition_id
                     && terminal.transition_digest == transition_digest
-                    && terminal.outcome == TerminalMembershipOutcome::Aborted =>
-            {
-                Ok(MembershipScopeMutation::Idempotent)
+                    && terminal.outcome == TerminalMembershipOutcome::Aborted
+            })
+            .and_then(|terminal| terminal.abort_cleanup.as_ref())
+            .ok_or(MembershipScopeMutationError::ConflictingTransition)?;
+        if abort_decision_log_index < cleanup.decision_log_index {
+            return Err(MembershipScopeMutationError::ConflictingTransition);
+        }
+        if cleanup.learners.is_empty()
+            && cleanup.cleanup_log_index.is_none()
+            && abort_decision_log_index > cleanup.decision_log_index
+        {
+            let changed = conn
+                .execute(
+                    "UPDATE consensus_membership_scope SET terminal_abort_cleanup_membership_index = ?1 WHERE singleton = 1 AND terminal_transition_id = ?2 AND terminal_transition_digest = ?3 AND terminal_transition_outcome = 1 AND terminal_abort_learners_json = ?4 AND terminal_abort_decision_index < ?1 AND terminal_abort_cleanup_membership_index IS NULL",
+                    params![
+                        checked_i64(abort_decision_log_index)
+                            .map_err(|_| MembershipScopeMutationError::InvalidScope)?,
+                        transition_id.as_slice(),
+                        transition_digest.as_slice(),
+                        encode_node_subset(&BTreeSet::new())
+                            .map_err(|_| MembershipScopeMutationError::CorruptState)?,
+                    ],
+                )
+                .map_err(|_| MembershipScopeMutationError::BackendUnavailable)?;
+            if changed != 1 {
+                return Err(MembershipScopeMutationError::ConflictingTransition);
             }
-            _ => Err(MembershipScopeMutationError::ConflictingTransition),
-        };
+            read_scope_for_mutation(conn, storage_identity)?;
+            return Ok(MembershipScopeMutation::Applied);
+        }
+        return Ok(MembershipScopeMutation::Idempotent);
     };
     if pending.transition_id != transition_id || pending.transition_digest != transition_digest {
         return Err(MembershipScopeMutationError::ConflictingTransition);
@@ -2563,45 +3608,150 @@ pub(crate) fn restore_and_abort_membership_scope_in_tx(
     }
     let membership = read_membership_unchecked_sync(conn, storage_identity)
         .map_err(|_| MembershipScopeMutationError::CorruptState)?;
-    if validate_uniform_membership(&membership, &scope.current_members).is_err() {
+    let learners = match abort_learners_from_membership(
+        &membership,
+        &scope.current_members,
+        &pending.desired_members,
+    ) {
+        Ok(learners) => learners,
+        Err(_) => return Err(MembershipScopeMutationError::TransitionNotQuiescent),
+    };
+    if abort_decision_log_index <= pending.transition_start_log_index
+        || pending
+            .learners_ready_log_index
+            .is_some_and(|ready| abort_decision_log_index <= ready)
+    {
         return Err(MembershipScopeMutationError::TransitionNotQuiescent);
     }
+    retain_completed_terminal_in_tx(conn, storage_identity, &scope)?;
     let changed = conn
         .execute(
-            "UPDATE consensus_membership_scope SET application_authority_epoch = current_configuration_epoch, application_authority_members_json = current_members_json, terminal_transition_id = ?1, terminal_transition_digest = ?2, terminal_transition_outcome = 1, terminal_transition_start_index = pending_transition_start_index, terminal_learners_ready_index = pending_learners_ready_index, terminal_joint_membership_index = pending_joint_membership_index, terminal_uniform_membership_index = pending_uniform_membership_index, terminal_cutover_index = NULL, terminal_finalization_index = NULL, pending_transition_id = NULL, pending_transition_digest = NULL, desired_configuration_id = NULL, desired_configuration_epoch = NULL, desired_members_json = NULL, desired_bindings_json = NULL, pending_transition_start_index = NULL, pending_learners_ready_index = NULL, pending_joint_membership_index = NULL, pending_uniform_membership_index = NULL WHERE singleton = 1 AND pending_transition_id = ?1 AND pending_transition_digest = ?2",
+            "UPDATE consensus_membership_scope SET application_authority_epoch = current_configuration_epoch, application_authority_members_json = current_members_json, terminal_transition_id = ?1, terminal_transition_digest = ?2, terminal_transition_outcome = 1, terminal_transition_start_index = pending_transition_start_index, terminal_learners_ready_index = pending_learners_ready_index, terminal_joint_membership_index = NULL, terminal_uniform_membership_index = NULL, terminal_cutover_index = NULL, terminal_finalization_index = NULL, terminal_desired_configuration_id = desired_configuration_id, terminal_desired_configuration_epoch = desired_configuration_epoch, terminal_desired_members_json = desired_members_json, terminal_desired_bindings_json = desired_bindings_json, terminal_abort_learners_json = ?3, terminal_abort_decision_index = ?4, terminal_abort_cleanup_membership_index = NULL, pending_transition_id = NULL, pending_transition_digest = NULL, desired_configuration_id = NULL, desired_configuration_epoch = NULL, desired_members_json = NULL, desired_bindings_json = NULL, pending_transition_start_index = NULL, pending_learners_ready_index = NULL, pending_joint_membership_index = NULL, pending_uniform_membership_index = NULL WHERE singleton = 1 AND pending_transition_id = ?1 AND pending_transition_digest = ?2",
+            params![
+                transition_id.as_slice(),
+                transition_digest.as_slice(),
+                encode_node_subset(&learners)
+                    .map_err(|_| MembershipScopeMutationError::InvalidScope)?,
+                checked_i64(abort_decision_log_index)
+                    .map_err(|_| MembershipScopeMutationError::InvalidScope)?,
+            ],
+        )
+        .map_err(|_| MembershipScopeMutationError::BackendUnavailable)?;
+    if changed != 1 {
+        return Err(MembershipScopeMutationError::ConflictingTransition);
+    }
+    conn.execute(
+        "UPDATE consensus_candidate_bootstrap SET state = 2 WHERE singleton = 1 AND transition_id = ?1 AND transition_digest = ?2 AND state = 1",
+        params![transition_id.as_slice(), transition_digest.as_slice()],
+    )
+    .map_err(|_| MembershipScopeMutationError::BackendUnavailable)?;
+    read_scope_for_mutation(conn, storage_identity)?;
+    Ok(MembershipScopeMutation::Applied)
+}
+
+/// Cancel a locally opened candidate that never entered Openraft membership.
+///
+/// This is deliberately not a replacement for the replicated abort command.
+/// It accepts only the exact provisional bootstrap (`start = 0`) before any
+/// committed transition evidence exists. A durable local tombstone makes
+/// authenticated retries idempotent and prevents another request from
+/// blindly clearing or replacing the candidate scope.
+pub(crate) fn cancel_provisional_candidate_membership_scope_sync(
+    conn: &Connection,
+    storage_identity: SessionConsensusIdentity,
+    local_candidate_node_id: SessionConsensusNodeId,
+    transition_id: [u8; MEMBERSHIP_TRANSITION_ID_BYTES],
+    transition_digest: [u8; 32],
+) -> Result<MembershipScopeMutation, MembershipScopeMutationError> {
+    let tx = membership_transaction(conn)?;
+    let marker = read_candidate_bootstrap_marker_sync(&tx, storage_identity)
+        .map_err(|_| MembershipScopeMutationError::CorruptState)?
+        .ok_or(MembershipScopeMutationError::ConflictingTransition)?;
+    let exact_marker = marker.local_candidate_node_id == local_candidate_node_id
+        && marker.transition_id == transition_id
+        && marker.transition_digest == transition_digest;
+    if !exact_marker {
+        return Err(MembershipScopeMutationError::ConflictingTransition);
+    }
+    if marker.state == CandidateBootstrapState::Cancelled {
+        let scope = read_scope_for_mutation(&tx, storage_identity)?;
+        if scope.pending.is_some() {
+            return Err(MembershipScopeMutationError::CorruptState);
+        }
+        tx.commit()
+            .map_err(|_| MembershipScopeMutationError::BackendUnavailable)?;
+        return Ok(MembershipScopeMutation::Idempotent);
+    }
+
+    let scope = read_scope_for_mutation(&tx, storage_identity)?;
+    let pending = scope
+        .pending
+        .as_ref()
+        .ok_or(MembershipScopeMutationError::ConflictingTransition)?;
+    if pending.transition_id != transition_id
+        || pending.transition_digest != transition_digest
+        || pending.transition_start_log_index != 0
+        || pending.learners_ready_log_index.is_some()
+        || pending.joint_membership_log_index.is_some()
+        || pending.uniform_membership_log_index.is_some()
+        || scope.application_authority_epoch != scope.current_identity.configuration_epoch()
+        || scope.application_authority_members != scope.current_members
+    {
+        return Err(MembershipScopeMutationError::TransitionNotQuiescent);
+    }
+
+    let membership = read_membership_unchecked_sync(&tx, storage_identity)
+        .map_err(|_| MembershipScopeMutationError::CorruptState)?;
+    let pristine = is_pristine_membership(&membership)
+        && read_applied_sync(&tx, storage_identity)
+            .map_err(|_| MembershipScopeMutationError::CorruptState)?
+            .is_none();
+    let mut scope_without_provisional = scope.clone();
+    scope_without_provisional.pending = None;
+    let prior_abort_proves_local_reuse = scope_without_provisional
+        .terminal
+        .as_ref()
+        .filter(|terminal| terminal.outcome == TerminalMembershipOutcome::Aborted)
+        .and_then(|terminal| terminal.abort_cleanup.as_ref())
+        .is_some_and(|cleanup| cleanup.learners.contains(&local_candidate_node_id));
+    let prior_state_is_valid = membership.log_id().is_some_and(|log_id| {
+        prior_abort_proves_local_reuse
+            && validate_membership_for_log(&membership, &scope_without_provisional, log_id.index)
+                .is_ok()
+    });
+    if !pristine && !prior_state_is_valid {
+        return Err(MembershipScopeMutationError::TransitionNotQuiescent);
+    }
+
+    let changed = tx
+        .execute(
+            "UPDATE consensus_membership_scope SET pending_transition_id = NULL, pending_transition_digest = NULL, desired_configuration_id = NULL, desired_configuration_epoch = NULL, desired_members_json = NULL, desired_bindings_json = NULL, pending_transition_start_index = NULL, pending_learners_ready_index = NULL, pending_joint_membership_index = NULL, pending_uniform_membership_index = NULL WHERE singleton = 1 AND pending_transition_id = ?1 AND pending_transition_digest = ?2 AND pending_transition_start_index = 0 AND pending_learners_ready_index IS NULL AND pending_joint_membership_index IS NULL AND pending_uniform_membership_index IS NULL",
             params![transition_id.as_slice(), transition_digest.as_slice()],
         )
         .map_err(|_| MembershipScopeMutationError::BackendUnavailable)?;
     if changed != 1 {
         return Err(MembershipScopeMutationError::ConflictingTransition);
     }
-    read_scope_for_mutation(conn, storage_identity)?;
-    Ok(MembershipScopeMutation::Applied)
-}
-
-pub(crate) fn promote_membership_scope_sync(
-    conn: &Connection,
-    storage_identity: SessionConsensusIdentity,
-    transition_id: [u8; MEMBERSHIP_TRANSITION_ID_BYTES],
-    transition_digest: [u8; 32],
-) -> Result<MembershipScopeMutation, MembershipScopeMutationError> {
-    let tx = membership_transaction(conn)?;
-    let membership = read_membership_unchecked_sync(&tx, storage_identity)
+    let marker_changed = tx
+        .execute(
+            "UPDATE consensus_candidate_bootstrap SET state = 2 WHERE singleton = 1 AND local_candidate_node_id = ?1 AND transition_id = ?2 AND transition_digest = ?3 AND state = 1",
+            params![
+                checked_positive_i64(local_candidate_node_id.get())
+                    .map_err(|_| MembershipScopeMutationError::InvalidScope)?,
+                transition_id.as_slice(),
+                transition_digest.as_slice(),
+            ],
+        )
+        .map_err(|_| MembershipScopeMutationError::BackendUnavailable)?;
+    if marker_changed != 1 {
+        return Err(MembershipScopeMutationError::ConflictingTransition);
+    }
+    read_scope_for_mutation(&tx, storage_identity)?;
+    validate_persisted_membership_sync(&tx, storage_identity)
         .map_err(|_| MembershipScopeMutationError::CorruptState)?;
-    let cutover_log_index = membership
-        .log_id()
-        .ok_or(MembershipScopeMutationError::TransitionNotQuiescent)?
-        .index;
-    let result = promote_membership_scope_at_in_tx(
-        &tx,
-        storage_identity,
-        transition_id,
-        transition_digest,
-        cutover_log_index,
-    )?;
     tx.commit()
         .map_err(|_| MembershipScopeMutationError::BackendUnavailable)?;
-    Ok(result)
+    Ok(MembershipScopeMutation::Applied)
 }
 
 fn promote_membership_scope_at_in_tx(
@@ -2652,6 +3802,7 @@ fn promote_membership_scope_at_in_tx(
     {
         return Err(MembershipScopeMutationError::CorruptState);
     }
+    retain_completed_terminal_in_tx(conn, storage_identity, &scope)?;
     if let Some(predecessor) = &scope.predecessor {
         conn.execute(
             "INSERT INTO consensus_membership_history (configuration_epoch, storage_configuration_epoch, configuration_id, members_json, transition_id, transition_digest, transition_start_index, cutover_index) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -2675,7 +3826,7 @@ fn promote_membership_scope_at_in_tx(
     }
     let changed = conn
         .execute(
-            "UPDATE consensus_membership_scope SET predecessor_configuration_id = current_configuration_id, predecessor_transition_id = pending_transition_id, predecessor_transition_digest = pending_transition_digest, predecessor_configuration_epoch = current_configuration_epoch, predecessor_members_json = current_members_json, predecessor_transition_start_index = pending_transition_start_index, predecessor_cutover_index = ?1, current_configuration_id = desired_configuration_id, current_configuration_epoch = desired_configuration_epoch, current_members_json = desired_members_json, current_bindings_json = desired_bindings_json, terminal_transition_id = ?2, terminal_transition_digest = ?3, terminal_transition_outcome = 2, terminal_transition_start_index = pending_transition_start_index, terminal_learners_ready_index = pending_learners_ready_index, terminal_joint_membership_index = pending_joint_membership_index, terminal_uniform_membership_index = pending_uniform_membership_index, terminal_cutover_index = ?1, terminal_finalization_index = NULL, pending_transition_id = NULL, pending_transition_digest = NULL, desired_configuration_id = NULL, desired_configuration_epoch = NULL, desired_members_json = NULL, desired_bindings_json = NULL, pending_transition_start_index = NULL, pending_learners_ready_index = NULL, pending_joint_membership_index = NULL, pending_uniform_membership_index = NULL WHERE singleton = 1 AND pending_transition_id = ?2 AND pending_transition_digest = ?3",
+            "UPDATE consensus_membership_scope SET predecessor_configuration_id = current_configuration_id, predecessor_transition_id = pending_transition_id, predecessor_transition_digest = pending_transition_digest, predecessor_configuration_epoch = current_configuration_epoch, predecessor_members_json = current_members_json, predecessor_transition_start_index = pending_transition_start_index, predecessor_cutover_index = ?1, current_configuration_id = desired_configuration_id, current_configuration_epoch = desired_configuration_epoch, current_members_json = desired_members_json, current_bindings_json = desired_bindings_json, terminal_transition_id = ?2, terminal_transition_digest = ?3, terminal_transition_outcome = 2, terminal_transition_start_index = pending_transition_start_index, terminal_learners_ready_index = pending_learners_ready_index, terminal_joint_membership_index = pending_joint_membership_index, terminal_uniform_membership_index = pending_uniform_membership_index, terminal_cutover_index = ?1, terminal_finalization_index = NULL, terminal_desired_configuration_id = NULL, terminal_desired_configuration_epoch = NULL, terminal_desired_members_json = NULL, terminal_desired_bindings_json = NULL, terminal_abort_learners_json = NULL, terminal_abort_decision_index = NULL, terminal_abort_cleanup_membership_index = NULL, pending_transition_id = NULL, pending_transition_digest = NULL, desired_configuration_id = NULL, desired_configuration_epoch = NULL, desired_members_json = NULL, desired_bindings_json = NULL, pending_transition_start_index = NULL, pending_learners_ready_index = NULL, pending_joint_membership_index = NULL, pending_uniform_membership_index = NULL WHERE singleton = 1 AND pending_transition_id = ?2 AND pending_transition_digest = ?3",
             params![
                 checked_i64(cutover_log_index)
                     .map_err(|_| MembershipScopeMutationError::InvalidScope)?,
@@ -2687,6 +3838,11 @@ fn promote_membership_scope_at_in_tx(
     if changed != 1 {
         return Err(MembershipScopeMutationError::ConflictingTransition);
     }
+    conn.execute(
+        "DELETE FROM consensus_candidate_bootstrap WHERE singleton = 1 AND transition_id = ?1 AND transition_digest = ?2",
+        params![transition_id.as_slice(), transition_digest.as_slice()],
+    )
+    .map_err(|_| MembershipScopeMutationError::BackendUnavailable)?;
     read_scope_for_mutation(conn, storage_identity)?;
     Ok(MembershipScopeMutation::Applied)
 }
@@ -2772,7 +3928,8 @@ pub(crate) fn finalize_membership_transition_in_tx(
     Ok(MembershipScopeMutation::Applied)
 }
 
-pub(crate) fn drop_compacted_membership_predecessor_sync(
+#[cfg(test)]
+fn drop_compacted_membership_predecessor_sync(
     conn: &Connection,
     storage_identity: SessionConsensusIdentity,
 ) -> Result<DroppedMembershipPredecessor, MembershipScopeMutationError> {
@@ -2876,6 +4033,8 @@ fn validate_existing_schema(
         "consensus_identity",
         "consensus_membership_scope",
         "consensus_membership_history",
+        "consensus_membership_terminal_history",
+        "consensus_candidate_bootstrap",
         "consensus_vote",
         "consensus_committed",
         "consensus_purged",
@@ -3521,6 +4680,22 @@ impl MembershipLogProjection {
                         }
                         MembershipShape::CurrentUniform | MembershipShape::LearnersCatchingUp => {}
                     }
+                } else if let Some(cleanup) = self
+                    .scope
+                    .terminal
+                    .as_mut()
+                    .filter(|terminal| terminal.outcome == TerminalMembershipOutcome::Aborted)
+                    .and_then(|terminal| terminal.abort_cleanup.as_mut())
+                {
+                    if entry.log_id.index > cleanup.decision_log_index {
+                        validate_uniform_membership(&stored, &self.scope.current_members)?;
+                        if cleanup.cleanup_log_index.is_some() {
+                            return Err(invalid_data(
+                                "projected session consensus abort cleanup evidence conflicts",
+                            ));
+                        }
+                        cleanup.cleanup_log_index = Some(entry.log_id.index);
+                    }
                 }
                 self.membership = stored;
                 if promote {
@@ -3557,7 +4732,41 @@ impl MembershipLogProjection {
         }
     }
 
+    fn retain_current_terminal(&mut self) -> io::Result<()> {
+        let retained = completed_terminal_from_scope(&self.scope).map_err(|error| match error {
+            MembershipScopeMutationError::TransitionNotQuiescent => invalid_data(
+                "projected session consensus prior terminal transition is not quiescent",
+            ),
+            _ => invalid_data("projected session consensus terminal evidence is invalid"),
+        })?;
+        let Some(retained) = retained else {
+            return Ok(());
+        };
+        if let Some(existing) = self
+            .scope
+            .terminal_history
+            .iter()
+            .find(|existing| existing.transition_id == retained.transition_id)
+        {
+            return if existing == &retained {
+                Ok(())
+            } else {
+                Err(invalid_data(
+                    "projected session consensus terminal history conflicts",
+                ))
+            };
+        }
+        if self.scope.terminal_history.len() >= MEMBERSHIP_HISTORY_MAX_ENTRIES {
+            return Err(invalid_data(
+                "projected session consensus terminal history is full",
+            ));
+        }
+        self.scope.terminal_history.push(retained);
+        Ok(())
+    }
+
     fn promote_at(&mut self, cutover_log_index: u64) -> io::Result<()> {
+        self.retain_current_terminal()?;
         let pending = self.scope.pending.take().ok_or_else(|| {
             invalid_data("projected session consensus promotion has no transition")
         })?;
@@ -3604,6 +4813,7 @@ impl MembershipLogProjection {
             uniform_membership_log_index: pending.uniform_membership_log_index,
             cutover_log_index: Some(cutover_log_index),
             finalization_log_index: None,
+            abort_cleanup: None,
         });
         Ok(())
     }
@@ -3617,6 +4827,17 @@ impl MembershipLogProjection {
                 desired_members,
                 desired_bindings,
             } => {
+                if let Some(retained_digest) =
+                    retained_transition_digest(&self.scope, *transition_id)?
+                {
+                    return if retained_digest == *request_digest {
+                        Ok(())
+                    } else {
+                        Err(invalid_data(
+                            "projected session consensus transition ID was reused",
+                        ))
+                    };
+                }
                 validate_member_set(desired_members, true)?;
                 validate_transition_bindings(
                     &self.scope.current_members,
@@ -3651,15 +4872,12 @@ impl MembershipLogProjection {
                 if !exact_successor_epoch(self.scope.current_identity, *desired_identity)
                     || (self.scope.predecessor.is_some()
                         && self.scope.history.len() >= MEMBERSHIP_HISTORY_MAX_ENTRIES)
-                    || self.scope.terminal.as_ref().is_some_and(|terminal| {
-                        terminal.transition_id == *transition_id
-                            && terminal.transition_digest != *request_digest
-                    })
                 {
                     return Err(invalid_data(
                         "projected session consensus successor scope is invalid",
                     ));
                 }
+                self.retain_current_terminal()?;
                 self.scope.pending = Some(PendingMembershipScope {
                     transition_id: *transition_id,
                     transition_digest: *request_digest,
@@ -3722,15 +4940,48 @@ impl MembershipLogProjection {
                 transition_id,
                 request_digest,
             } => {
+                if let Some(cleanup) = self
+                    .scope
+                    .terminal
+                    .as_mut()
+                    .filter(|terminal| {
+                        terminal.transition_id == *transition_id
+                            && terminal.transition_digest == *request_digest
+                            && terminal.outcome == TerminalMembershipOutcome::Aborted
+                    })
+                    .and_then(|terminal| terminal.abort_cleanup.as_mut())
+                {
+                    if log_index < cleanup.decision_log_index {
+                        return Err(invalid_data(
+                            "projected session consensus abort evidence regressed",
+                        ));
+                    }
+                    if cleanup.learners.is_empty()
+                        && cleanup.cleanup_log_index.is_none()
+                        && log_index > cleanup.decision_log_index
+                    {
+                        cleanup.cleanup_log_index = Some(log_index);
+                    }
+                    return Ok(());
+                }
+                self.retain_current_terminal()?;
                 let pending = self.scope.pending.take().ok_or_else(|| {
                     invalid_data("projected session consensus transition is missing")
                 })?;
+                let learners = abort_learners_from_membership(
+                    &self.membership,
+                    &self.scope.current_members,
+                    &pending.desired_members,
+                );
                 if pending.transition_id != *transition_id
                     || pending.transition_digest != *request_digest
                     || pending.joint_membership_log_index.is_some()
                     || pending.uniform_membership_log_index.is_some()
-                    || validate_uniform_membership(&self.membership, &self.scope.current_members)
-                        .is_err()
+                    || log_index <= pending.transition_start_log_index
+                    || pending
+                        .learners_ready_log_index
+                        .is_some_and(|ready| log_index <= ready)
+                    || learners.is_err()
                 {
                     self.scope.pending = Some(pending);
                     return Err(invalid_data("projected session consensus abort is invalid"));
@@ -3738,6 +4989,7 @@ impl MembershipLogProjection {
                 self.scope.application_authority_epoch =
                     self.scope.current_identity.configuration_epoch();
                 self.scope.application_authority_members = self.scope.current_members.clone();
+                let learners = learners?;
                 self.scope.terminal = Some(TerminalMembershipTransition {
                     transition_id: pending.transition_id,
                     transition_digest: pending.transition_digest,
@@ -3748,6 +5000,14 @@ impl MembershipLogProjection {
                     uniform_membership_log_index: None,
                     cutover_log_index: None,
                     finalization_log_index: None,
+                    abort_cleanup: Some(AbortedMembershipCleanup {
+                        desired_identity: pending.desired_identity,
+                        desired_members: pending.desired_members,
+                        desired_bindings: pending.desired_bindings,
+                        learners,
+                        decision_log_index: log_index,
+                        cleanup_log_index: None,
+                    }),
                 });
                 Ok(())
             }
@@ -4416,6 +5676,53 @@ fn validate_all_added_learners_present(
     Ok(())
 }
 
+fn abort_learners_from_membership(
+    membership: &StoredMembership<SessionConsensusNodeId, opc_consensus::engine::EmptyNode>,
+    current_members: &BTreeSet<SessionConsensusNodeId>,
+    desired_members: &BTreeSet<SessionConsensusNodeId>,
+) -> io::Result<BTreeSet<SessionConsensusNodeId>> {
+    match classify_transition_membership(membership, current_members, desired_members)? {
+        MembershipShape::CurrentUniform => Ok(BTreeSet::new()),
+        MembershipShape::LearnersCatchingUp => Ok(membership
+            .membership()
+            .learner_ids()
+            .collect::<BTreeSet<_>>()),
+        MembershipShape::Joint | MembershipShape::DesiredUniform => Err(invalid_data(
+            "session consensus abort followed an irreversible membership change",
+        )),
+    }
+}
+
+fn validate_aborted_membership_before_cleanup(
+    membership: &StoredMembership<SessionConsensusNodeId, opc_consensus::engine::EmptyNode>,
+    current_members: &BTreeSet<SessionConsensusNodeId>,
+    learners: &BTreeSet<SessionConsensusNodeId>,
+) -> io::Result<()> {
+    let configs = membership.membership().get_joint_config();
+    let nodes = membership
+        .nodes()
+        .map(|(node_id, _)| *node_id)
+        .collect::<BTreeSet<_>>();
+    let stored_learners = membership
+        .membership()
+        .learner_ids()
+        .collect::<BTreeSet<_>>();
+    let expected_nodes = current_members
+        .union(learners)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if configs.len() != 1
+        || configs.first() != Some(current_members)
+        || nodes != expected_nodes
+        || stored_learners != *learners
+    {
+        return Err(invalid_data(
+            "session consensus membership does not match the durable abort decision",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_membership_for_log(
     membership: &StoredMembership<SessionConsensusNodeId, opc_consensus::engine::EmptyNode>,
     scope: &MembershipValidationScope,
@@ -4461,6 +5768,35 @@ fn validate_membership_for_log(
         {
             return Err(invalid_data(
                 "session consensus membership transition predates its durable scope",
+            ));
+        }
+        return Ok(());
+    }
+    if let Some(cleanup) = scope
+        .terminal
+        .as_ref()
+        .filter(|terminal| terminal.outcome == TerminalMembershipOutcome::Aborted)
+        .and_then(|terminal| terminal.abort_cleanup.as_ref())
+    {
+        if log_index < cleanup.decision_log_index {
+            return validate_aborted_membership_before_cleanup(
+                membership,
+                &scope.current_members,
+                &cleanup.learners,
+            );
+        }
+        if log_index == cleanup.decision_log_index {
+            return Err(invalid_data(
+                "session consensus membership collides with abort decision index",
+            ));
+        }
+        validate_uniform_membership(membership, &scope.current_members)?;
+        if cleanup
+            .cleanup_log_index
+            .is_some_and(|recorded| recorded != log_index)
+        {
+            return Err(invalid_data(
+                "session consensus abort cleanup membership evidence conflicts",
             ));
         }
         return Ok(());
@@ -4526,12 +5862,23 @@ fn payload_digest(command: &SessionConsensusCommand) -> io::Result<[u8; 32]> {
     // Idempotency binds caller-owned semantics, not leader-owned sequence,
     // predecessor, or logical-time metadata. A retry after a committed
     // response is lost will be proposed by a new leader with new metadata but
-    // must still recover the original durable outcome.
-    let semantic_intent = match &command.intent {
-        SessionMutationIntent::Authorized { mutation, .. } => mutation.as_ref(),
-        intent => intent,
+    // must still recover the original durable outcome. The authenticated
+    // origin may change across that retry, but its exact admitted topology
+    // authority may not: carrying a request ID into a new epoch must conflict
+    // instead of recovering an outcome authorized by the old epoch.
+    let encoded = match &command.intent {
+        SessionMutationIntent::Authorized {
+            authority_identity,
+            mutation,
+            ..
+        } => encode_json(&(
+            command.schema_version,
+            command.identity,
+            authority_identity,
+            mutation.as_ref(),
+        ))?,
+        intent => encode_json(&(command.schema_version, command.identity, intent))?,
     };
-    let encoded = encode_json(&(command.schema_version, command.identity, semantic_intent))?;
     let mut hasher = Sha256::new();
     hasher.update(OUTCOME_DIGEST_DOMAIN);
     hasher.update(encoded);
@@ -4941,6 +6288,7 @@ fn execute_intent_sync(
             storage_identity,
             *transition_id,
             *request_digest,
+            log_index,
         )
         .map_err(membership_mutation_store_error)
         .map(|_| (SessionMutationOutcome::Unit, None)),
@@ -5494,6 +6842,7 @@ fn pending_transition_is_not_behind(
         && local.transition_digest == incoming.transition_digest
         && local.desired_identity == incoming.desired_identity
         && local.desired_members == incoming.desired_members
+        && local.desired_bindings == incoming.desired_bindings
         && transition_start_is_compatible(
             local.transition_start_log_index,
             incoming.transition_start_log_index,
@@ -5516,8 +6865,19 @@ fn terminal_matches_pending_progress(
     local: &PendingMembershipScope,
     terminal: &TerminalMembershipTransition,
 ) -> bool {
+    let abort_scope_matches = match terminal.outcome {
+        TerminalMembershipOutcome::Aborted => {
+            terminal.abort_cleanup.as_ref().is_some_and(|cleanup| {
+                cleanup.desired_identity == local.desired_identity
+                    && cleanup.desired_members == local.desired_members
+                    && cleanup.desired_bindings == local.desired_bindings
+            })
+        }
+        TerminalMembershipOutcome::Promoted => terminal.abort_cleanup.is_none(),
+    };
     local.transition_id == terminal.transition_id
         && local.transition_digest == terminal.transition_digest
+        && abort_scope_matches
         && transition_start_is_compatible(
             local.transition_start_log_index,
             terminal.transition_start_log_index,
@@ -5540,6 +6900,19 @@ fn finalized_terminal_is_not_behind(
     local: &TerminalMembershipTransition,
     incoming: &TerminalMembershipTransition,
 ) -> bool {
+    let abort_cleanup_is_not_behind = match (&local.abort_cleanup, &incoming.abort_cleanup) {
+        (None, None) => true,
+        (Some(local), Some(incoming)) => {
+            local.desired_identity == incoming.desired_identity
+                && local.desired_members == incoming.desired_members
+                && local.desired_bindings == incoming.desired_bindings
+                && local.learners == incoming.learners
+                && local.decision_log_index == incoming.decision_log_index
+                && (local.cleanup_log_index.is_none()
+                    || local.cleanup_log_index == incoming.cleanup_log_index)
+        }
+        (None, Some(_)) | (Some(_), None) => false,
+    };
     local.transition_id == incoming.transition_id
         && local.transition_digest == incoming.transition_digest
         && local.outcome == incoming.outcome
@@ -5548,6 +6921,7 @@ fn finalized_terminal_is_not_behind(
         && local.joint_membership_log_index == incoming.joint_membership_log_index
         && local.uniform_membership_log_index == incoming.uniform_membership_log_index
         && local.cutover_log_index == incoming.cutover_log_index
+        && abort_cleanup_is_not_behind
         && (local.finalization_log_index.is_none()
             || local.finalization_log_index == incoming.finalization_log_index)
 }
@@ -5565,6 +6939,40 @@ fn retained_lineage_is_not_behind(
         .chain(local_predecessor)
         .eq(incoming_history.iter().chain(incoming_predecessor));
     local_is_empty || incoming_is_compacted || exact_lineage
+}
+
+fn retained_terminal_history_is_not_behind(
+    local: &[RetainedTerminalMembershipTransition],
+    incoming: &[RetainedTerminalMembershipTransition],
+) -> bool {
+    local.iter().all(|local_terminal| {
+        incoming
+            .iter()
+            .any(|incoming_terminal| incoming_terminal == local_terminal)
+    })
+}
+
+fn retained_terminal_state_is_not_behind(
+    local: &MembershipValidationScope,
+    incoming: &MembershipValidationScope,
+) -> bool {
+    let Some(local_terminal) = local.terminal.as_ref() else {
+        return true;
+    };
+    if incoming.terminal.as_ref().is_some_and(|incoming_terminal| {
+        finalized_terminal_is_not_behind(local_terminal, incoming_terminal)
+    }) {
+        return true;
+    }
+    completed_terminal_from_scope(local)
+        .ok()
+        .flatten()
+        .is_some_and(|local_terminal| {
+            incoming
+                .terminal_history
+                .iter()
+                .any(|incoming_terminal| incoming_terminal == &local_terminal)
+        })
 }
 
 fn incoming_lineage_contains_current_scope(
@@ -5623,6 +7031,13 @@ fn validate_incoming_membership_scope(
             "session consensus snapshot membership cluster mismatch",
         ));
     }
+    if !retained_terminal_history_is_not_behind(&local.terminal_history, &incoming.terminal_history)
+        || !retained_terminal_state_is_not_behind(local, incoming)
+    {
+        return Err(invalid_data(
+            "session consensus snapshot terminal history regressed or diverged",
+        ));
+    }
 
     if local.pending.is_none()
         && incoming.pending.is_none()
@@ -5630,13 +7045,6 @@ fn validate_incoming_membership_scope(
         && local.current_members == incoming.current_members
         && local.application_authority_epoch == incoming.application_authority_epoch
         && local.application_authority_members == incoming.application_authority_members
-        && local
-            .terminal
-            .as_ref()
-            .zip(incoming.terminal.as_ref())
-            .is_some_and(|(local_terminal, incoming_terminal)| {
-                finalized_terminal_is_not_behind(local_terminal, incoming_terminal)
-            })
         && retained_lineage_is_not_behind(
             &local.history,
             local.predecessor.as_ref(),
@@ -5657,10 +7065,6 @@ fn validate_incoming_membership_scope(
             &incoming.history,
             incoming.predecessor.as_ref(),
         )
-        && local
-            .terminal
-            .as_ref()
-            .is_none_or(|terminal| incoming.terminal.as_ref() == Some(terminal))
     {
         return Ok(());
     }
@@ -5701,13 +7105,8 @@ fn validate_incoming_membership_scope(
             || (incoming.application_authority_epoch
                 == local_pending.desired_identity.configuration_epoch()
                 && incoming.application_authority_members == local_pending.desired_members);
-        let retained_terminal_not_behind = local
-            .terminal
-            .as_ref()
-            .is_none_or(|terminal| incoming.terminal.as_ref() == Some(terminal));
         if same_current
             && authority_not_behind
-            && retained_terminal_not_behind
             && pending_transition_is_not_behind(local_pending, incoming_pending)
         {
             return Ok(());
@@ -5782,6 +7181,7 @@ fn validate_snapshot_database_sync(
     path: &std::path::Path,
     identity: SessionConsensusIdentity,
     expected_scope: &MembershipValidationScope,
+    local_candidate_marker: Option<CandidateBootstrapMarker>,
     meta: &opc_consensus::engine::SnapshotMeta<
         SessionConsensusNodeId,
         opc_consensus::engine::EmptyNode,
@@ -5813,6 +7213,17 @@ fn validate_snapshot_database_sync(
     validate_existing_schema(&conn, identity)
         .map_err(|_| invalid_data("session consensus snapshot identity is invalid"))?;
     let incoming_scope = read_membership_scope_sync(&conn, identity)?;
+    if local_candidate_marker.is_some_and(|marker| {
+        marker.state == CandidateBootstrapState::Cancelled
+            && incoming_scope.pending.as_ref().is_some_and(|pending| {
+                pending.transition_id == marker.transition_id
+                    && pending.transition_digest == marker.transition_digest
+            })
+    }) {
+        return Err(invalid_data(
+            "session consensus snapshot attempted to revive a cancelled candidate",
+        ));
+    }
     validate_incoming_membership_scope(expected_scope, &incoming_scope)?;
     ops::read_restore_scan_state_sync(&conn)
         .map_err(|_| invalid_data("session consensus snapshot restore metadata is invalid"))?;
@@ -5865,7 +7276,14 @@ pub(crate) fn install_snapshot_database_sync(
     let incoming_last_log_id = meta.last_log_id.as_ref();
     validate_snapshot_floor(conn, identity, incoming_last_log_id)?;
     let expected_scope = read_membership_scope_sync(conn, identity)?;
-    validate_snapshot_database_sync(snapshot_db_path, identity, &expected_scope, meta)?;
+    let local_candidate_marker = read_candidate_bootstrap_marker_sync(conn, identity)?;
+    validate_snapshot_database_sync(
+        snapshot_db_path,
+        identity,
+        &expected_scope,
+        local_candidate_marker,
+        meta,
+    )?;
     if final_file_name.is_empty()
         || final_file_name.contains('/')
         || final_file_name.contains('\\')
@@ -5920,11 +7338,15 @@ pub(crate) fn install_snapshot_database_sync(
             ),
             (
                 "consensus_membership_scope",
-                "singleton, storage_configuration_epoch, current_configuration_id, current_configuration_epoch, current_members_json, current_bindings_json, application_authority_epoch, application_authority_members_json, predecessor_configuration_id, predecessor_transition_id, predecessor_transition_digest, predecessor_configuration_epoch, predecessor_members_json, predecessor_transition_start_index, predecessor_cutover_index, pending_transition_id, pending_transition_digest, desired_configuration_id, desired_configuration_epoch, desired_members_json, desired_bindings_json, pending_transition_start_index, pending_learners_ready_index, pending_joint_membership_index, pending_uniform_membership_index, terminal_transition_id, terminal_transition_digest, terminal_transition_outcome, terminal_transition_start_index, terminal_learners_ready_index, terminal_joint_membership_index, terminal_uniform_membership_index, terminal_cutover_index, terminal_finalization_index",
+                "singleton, storage_configuration_epoch, current_configuration_id, current_configuration_epoch, current_members_json, current_bindings_json, application_authority_epoch, application_authority_members_json, predecessor_configuration_id, predecessor_transition_id, predecessor_transition_digest, predecessor_configuration_epoch, predecessor_members_json, predecessor_transition_start_index, predecessor_cutover_index, pending_transition_id, pending_transition_digest, desired_configuration_id, desired_configuration_epoch, desired_members_json, desired_bindings_json, pending_transition_start_index, pending_learners_ready_index, pending_joint_membership_index, pending_uniform_membership_index, terminal_transition_id, terminal_transition_digest, terminal_transition_outcome, terminal_transition_start_index, terminal_learners_ready_index, terminal_joint_membership_index, terminal_uniform_membership_index, terminal_cutover_index, terminal_finalization_index, terminal_desired_configuration_id, terminal_desired_configuration_epoch, terminal_desired_members_json, terminal_desired_bindings_json, terminal_abort_learners_json, terminal_abort_decision_index, terminal_abort_cleanup_membership_index",
             ),
             (
                 "consensus_membership_history",
                 "configuration_epoch, storage_configuration_epoch, configuration_id, members_json, transition_id, transition_digest, transition_start_index, cutover_index",
+            ),
+            (
+                "consensus_membership_terminal_history",
+                "transition_id, storage_configuration_epoch, transition_digest, outcome, expected_member_count, transition_start_index, learners_ready_index, joint_membership_index, uniform_membership_index, cutover_index, finalization_index, abort_decision_index, abort_cleanup_membership_index",
             ),
             (
                 "consensus_applied",
@@ -6279,6 +7701,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn origin_main_fixed_membership_reopens_into_final_scope_without_rewriting_state() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.lock().await;
+        let identity = identity();
+        let members = expected_members();
+        initialize_schema(&conn, identity, &members).expect("initial consensus schema");
+
+        let entries = vec![
+            membership_entry(),
+            acquire_entry(1, [0x91; 16], "owner-before-upgrade"),
+        ];
+        append_logs_sync(&conn, identity, &entries).expect("append pre-upgrade state");
+        apply_entries_sync(&conn, identity, &backend.caps, entries)
+            .expect("apply pre-upgrade state");
+        let before: (Vec<u8>, Vec<u8>, i64, i64) = conn
+            .query_row(
+                "SELECT m.membership_json, a.log_id_json, machine.application_sequence, (SELECT COUNT(*) FROM leases) FROM consensus_membership AS m JOIN consensus_applied AS a ON a.singleton = m.singleton JOIN consensus_machine AS machine ON machine.singleton = m.singleton WHERE m.singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("capture pre-upgrade authority state");
+
+        // These four tables do not exist on origin/main. Removing them from
+        // an otherwise current fixture proves the production upgrade path
+        // without admitting any unpublished intermediate schema shape.
+        conn.execute_batch(
+            "DROP TABLE consensus_candidate_bootstrap; DROP TABLE consensus_membership_terminal_history; DROP TABLE consensus_membership_history; DROP TABLE consensus_membership_scope;",
+        )
+        .expect("restore origin/main fixed-membership shape");
+        let legacy_scope =
+            read_membership_scope_sync(&conn, identity).expect("read origin/main fixed membership");
+        assert_eq!(identity, legacy_scope.current_identity);
+        assert_eq!(members, legacy_scope.current_members);
+        assert!(legacy_scope.current_bindings.is_empty());
+
+        initialize_schema(&conn, identity, &members).expect("upgrade fixed membership schema");
+        let after: (Vec<u8>, Vec<u8>, i64, i64) = conn
+            .query_row(
+                "SELECT m.membership_json, a.log_id_json, machine.application_sequence, (SELECT COUNT(*) FROM leases) FROM consensus_membership AS m JOIN consensus_applied AS a ON a.singleton = m.singleton JOIN consensus_machine AS machine ON machine.singleton = m.singleton WHERE m.singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("capture upgraded authority state");
+        assert_eq!(
+            before, after,
+            "upgrade must not rewrite consensus application state"
+        );
+
+        let upgraded_scope =
+            read_membership_scope_sync(&conn, identity).expect("read upgraded membership scope");
+        assert_eq!(identity, upgraded_scope.current_identity);
+        assert_eq!(members, upgraded_scope.current_members);
+        assert_eq!(
+            test_member_bindings(&members),
+            upgraded_scope.current_bindings
+        );
+        for table in [
+            "consensus_membership_scope",
+            "consensus_membership_history",
+            "consensus_membership_terminal_history",
+            "consensus_candidate_bootstrap",
+        ] {
+            assert!(table_exists(&conn, table).expect("read upgraded table shape"));
+        }
+    }
+
+    #[tokio::test]
     async fn limited_log_read_rejects_a_missing_leading_row() {
         let backend = backend_with_blank_logs(2).await;
         let conn = backend.conn.lock().await;
@@ -6360,6 +7849,32 @@ mod tests {
                     key: key(),
                     owner: OwnerId::new(owner).expect("owner"),
                     ttl: Duration::from_secs(300),
+                },
+            }),
+        }
+    }
+
+    fn authorized_acquire_entry(
+        index: u64,
+        request_id: [u8; 16],
+        origin: SessionConsensusNodeId,
+        authority_identity: SessionConsensusIdentity,
+    ) -> Entry<SessionRaftTypeConfig> {
+        Entry {
+            log_id: log_id(index),
+            payload: EntryPayload::Normal(SessionConsensusCommand {
+                schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+                identity: identity(),
+                request_id: SessionConsensusRequestId::from_bytes(request_id),
+                logical_time: timestamp(u8::try_from(index).expect("test index fits timestamp")),
+                intent: SessionMutationIntent::Authorized {
+                    origin,
+                    authority_identity,
+                    mutation: Box::new(SessionMutationIntent::AcquireLease {
+                        key: key(),
+                        owner: OwnerId::new("authority-owner").expect("owner"),
+                        ttl: Duration::from_secs(300),
+                    }),
                 },
             }),
         }
@@ -6649,6 +8164,34 @@ mod tests {
         assert_eq!(Some(4), evidence.uniform_membership_log_index);
         assert_eq!(Some(4), evidence.cutover_log_index);
         assert_eq!(
+            MembershipScopeMutationError::TransitionNotQuiescent,
+            stage_membership_scope_sync(
+                &conn,
+                storage_identity,
+                second_id,
+                second_digest,
+                final_identity,
+                &final_three,
+            )
+            .expect_err("a finalizing transition must block its successor")
+        );
+        let finalize_first = topology_entry_at(
+            5,
+            0x8a,
+            SessionMutationIntent::FinalizeTopologyTransition {
+                transition_id: first_id,
+                request_digest: first_digest,
+            },
+        );
+        append_logs_sync(
+            &conn,
+            storage_identity,
+            std::slice::from_ref(&finalize_first),
+        )
+        .expect("append first finalization");
+        apply_entries_sync(&conn, storage_identity, &backend.caps, vec![finalize_first])
+            .expect("apply first finalization");
+        assert_eq!(
             MembershipScopeMutation::Applied,
             stage_membership_scope_sync(
                 &conn,
@@ -6668,7 +8211,8 @@ mod tests {
         let staged = read_membership_scope_sync(&conn, storage_identity).expect("staged scope");
         assert!(staged.predecessor.is_some());
         assert!(staged.pending.is_some());
-        let transition_floor = blank_entry(5);
+        assert_eq!(1, staged.terminal_history.len());
+        let transition_floor = blank_entry(6);
         append_logs_sync(
             &conn,
             storage_identity,
@@ -6683,7 +8227,7 @@ mod tests {
         )
         .expect("apply second transition floor");
         let ready = topology_entry_at(
-            6,
+            7,
             0x82,
             SessionMutationIntent::MarkTopologyLearnersReady {
                 transition_id: second_id,
@@ -6696,14 +8240,35 @@ mod tests {
             .expect("apply second readiness");
         fence_application_authority_sync(&conn, storage_identity, second_id, second_digest)
             .expect("fence second authority");
-        let joint = membership_entry_at(7, vec![five.clone(), final_three.clone()], five.clone());
-        let uniform = membership_entry_at(8, vec![final_three.clone()], final_three.clone());
+        let joint = membership_entry_at(8, vec![five.clone(), final_three.clone()], five.clone());
+        let uniform = membership_entry_at(9, vec![final_three.clone()], final_three.clone());
         append_logs_sync(&conn, storage_identity, &[joint.clone(), uniform.clone()])
             .expect("append second transition memberships");
         save_committed_sync(&conn, storage_identity, Some(uniform.log_id))
             .expect("commit second transition");
         apply_entries_sync(&conn, storage_identity, &backend.caps, vec![joint, uniform])
             .expect("apply and auto-promote second transition");
+        let finalize_second = topology_entry_at(
+            10,
+            0x8b,
+            SessionMutationIntent::FinalizeTopologyTransition {
+                transition_id: second_id,
+                request_digest: second_digest,
+            },
+        );
+        append_logs_sync(
+            &conn,
+            storage_identity,
+            std::slice::from_ref(&finalize_second),
+        )
+        .expect("append second finalization");
+        apply_entries_sync(
+            &conn,
+            storage_identity,
+            &backend.caps,
+            vec![finalize_second],
+        )
+        .expect("apply second finalization");
 
         let scope = read_membership_scope_sync(&conn, storage_identity)
             .expect("read final membership scope");
@@ -6727,15 +8292,29 @@ mod tests {
         )
         .expect("read second transition evidence")
         .expect("second transition evidence");
-        assert_eq!(Some(6), evidence.learners_ready_log_index);
-        assert_eq!(Some(7), evidence.joint_membership_log_index);
-        assert_eq!(Some(8), evidence.uniform_membership_log_index);
-        assert_eq!(Some(8), evidence.cutover_log_index);
+        assert_eq!(Some(7), evidence.learners_ready_log_index);
+        assert_eq!(Some(8), evidence.joint_membership_log_index);
+        assert_eq!(Some(9), evidence.uniform_membership_log_index);
+        assert_eq!(Some(9), evidence.cutover_log_index);
+        assert_eq!(Some(10), evidence.finalization_log_index);
+        let first_retained = read_membership_transition_evidence_sync(
+            &conn,
+            storage_identity,
+            first_id,
+            first_digest,
+        )
+        .expect("read retained first transition")
+        .expect("retained first transition evidence");
+        assert_eq!(
+            Some(TerminalMembershipOutcome::Promoted),
+            first_retained.outcome
+        );
+        assert_eq!(Some(5), first_retained.finalization_log_index);
 
         let final_membership =
             read_membership_sync(&conn, storage_identity).expect("read final membership");
         let snapshot_meta = opc_consensus::engine::SnapshotMeta {
-            last_log_id: Some(log_id(8)),
+            last_log_id: Some(log_id(10)),
             last_membership: final_membership,
             snapshot_id: "membership-transition-two".into(),
         };
@@ -6748,7 +8327,7 @@ mod tests {
             1,
         )
         .expect("save compaction snapshot metadata");
-        purge_logs_sync(&conn, storage_identity, &log_id(8)).expect("purge transition history");
+        purge_logs_sync(&conn, storage_identity, &log_id(10)).expect("purge transition history");
         drop_compacted_membership_predecessor_sync(&conn, storage_identity)
             .expect("drop all compacted predecessor history");
         let compacted =
@@ -6758,6 +8337,42 @@ mod tests {
         assert!(read_current_snapshot_sync(&conn, storage_identity)
             .expect("retained snapshot")
             .is_some());
+
+        assert_eq!(
+            MembershipScopeMutationError::ConflictingTransition,
+            read_membership_transition_evidence_sync(
+                &conn,
+                storage_identity,
+                first_id,
+                [0x31; 32],
+            )
+            .expect_err("retained transition ID with another digest must conflict")
+        );
+        let reused = topology_entry_at(
+            11,
+            0x89,
+            SessionMutationIntent::PrepareTopologyTransition {
+                transition_id: first_id,
+                request_digest: [0x31; 32],
+                desired_identity: identity_at(4, 0x54),
+                desired_members: five.clone(),
+                desired_bindings: test_member_bindings(&five),
+            },
+        );
+        assert!(append_logs_sync(&conn, storage_identity, std::slice::from_ref(&reused)).is_err());
+        let rejected = apply_entries_sync(&conn, storage_identity, &backend.caps, vec![reused])
+            .expect("committed conflicting Prepare has a deterministic rejection");
+        assert!(matches!(
+            rejected.responses.as_slice(),
+            [SessionConsensusResponse {
+                result: Err(StoreError::InvalidKey(code)),
+                ..
+            }] if code == "topology_transition_rejected"
+        ));
+        assert!(read_membership_scope_sync(&conn, storage_identity)
+            .expect("conflicting Prepare left scope intact")
+            .pending
+            .is_none());
     }
 
     #[tokio::test]
@@ -6808,21 +8423,28 @@ mod tests {
             .expect("apply readiness");
         fence_application_authority_sync(&conn, storage_identity, transition_id, transition_digest)
             .expect("fence authority");
-        let restored = membership_entry_at(3, vec![current.clone()], current.clone());
-        append_logs_sync(&conn, storage_identity, std::slice::from_ref(&restored))
-            .expect("append restored membership");
-        apply_entries_sync(&conn, storage_identity, &backend.caps, vec![restored])
-            .expect("apply restored membership");
-
-        assert_eq!(
-            MembershipScopeMutation::Applied,
-            abort_membership_scope_sync(&conn, storage_identity, transition_id, transition_digest,)
-                .expect("atomically abort")
+        let abort = topology_entry_at(
+            3,
+            0x84,
+            SessionMutationIntent::AbortTopologyTransition {
+                transition_id,
+                request_digest: transition_digest,
+            },
         );
+        append_logs_sync(&conn, storage_identity, std::slice::from_ref(&abort))
+            .expect("append abort decision");
+        apply_entries_sync(&conn, storage_identity, &backend.caps, vec![abort])
+            .expect("apply abort decision while learner remains reachable");
         assert_eq!(
             MembershipScopeMutation::Idempotent,
-            abort_membership_scope_sync(&conn, storage_identity, transition_id, transition_digest,)
-                .expect("retry abort")
+            abort_membership_scope_sync(
+                &conn,
+                storage_identity,
+                transition_id,
+                transition_digest,
+                3,
+            )
+            .expect("retry abort")
         );
         validate_application_authority_sync(&conn, storage_identity, member(7), storage_identity)
             .expect("current authority restored with abort");
@@ -6833,8 +8455,17 @@ mod tests {
             desired_identity,
         )
         .is_err());
-        let scope = read_membership_scope_sync(&conn, storage_identity).expect("scope");
-        assert!(scope.pending.is_none());
+        let aborting_scope =
+            read_membership_scope_sync(&conn, storage_identity).expect("aborting scope");
+        assert!(aborting_scope.pending.is_none());
+        let cleanup = aborting_scope
+            .terminal
+            .as_ref()
+            .and_then(|terminal| terminal.abort_cleanup.as_ref())
+            .expect("durable abort cleanup scope");
+        assert_eq!(members(&[10]), cleanup.learners);
+        assert_eq!(3, cleanup.decision_log_index);
+        assert_eq!(None, cleanup.cleanup_log_index);
         let evidence = read_membership_transition_evidence_sync(
             &conn,
             storage_identity,
@@ -6847,6 +8478,444 @@ mod tests {
         assert_eq!(None, evidence.joint_membership_log_index);
         assert_eq!(None, evidence.uniform_membership_log_index);
         assert_eq!(None, evidence.cutover_log_index);
+        assert_eq!(Some(3), evidence.abort_decision_log_index);
+        assert_eq!(None, evidence.abort_cleanup_log_index);
+        assert_eq!(
+            MembershipScopeMutationError::TransitionNotQuiescent,
+            stage_membership_scope_sync(
+                &conn,
+                storage_identity,
+                [0x43; MEMBERSHIP_TRANSITION_ID_BYTES],
+                [0x44; 32],
+                identity_at(2, 0x63),
+                &desired,
+            )
+            .expect_err("an aborting transition must block its successor")
+        );
+        assert!(read_membership_scope_sync(&conn, storage_identity)
+            .expect("rejected successor left abort scope intact")
+            .pending
+            .is_none());
+
+        let restored = membership_entry_at(4, vec![current.clone()], current.clone());
+        let current_term_abort = topology_entry_at(
+            5,
+            0x85,
+            SessionMutationIntent::AbortTopologyTransition {
+                transition_id,
+                request_digest: transition_digest,
+            },
+        );
+        append_logs_sync(
+            &conn,
+            storage_identity,
+            &[restored.clone(), current_term_abort.clone()],
+        )
+        .expect("project cleanup followed by an exact current-term abort control");
+        apply_entries_sync(
+            &conn,
+            storage_identity,
+            &backend.caps,
+            vec![restored, current_term_abort],
+        )
+        .expect("apply cleanup and exact current-term abort control");
+        let evidence = read_membership_transition_evidence_sync(
+            &conn,
+            storage_identity,
+            transition_id,
+            transition_digest,
+        )
+        .expect("read cleanup evidence")
+        .expect("cleanup evidence");
+        assert_eq!(Some(3), evidence.abort_decision_log_index);
+        assert_eq!(Some(4), evidence.abort_cleanup_log_index);
+        let cleaned_scope =
+            read_membership_scope_sync(&conn, storage_identity).expect("cleaned scope");
+        validate_incoming_membership_scope(&aborting_scope, &cleaned_scope)
+            .expect("cleanup snapshot progress is monotonic");
+        assert!(validate_incoming_membership_scope(&cleaned_scope, &aborting_scope).is_err());
+    }
+
+    #[tokio::test]
+    async fn retained_only_abort_accepts_exact_promoted_predecessor_history() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.lock().await;
+        let storage_identity = identity();
+        let initial_three = members(&[7, 8, 9]);
+        let expanded_five = members(&[7, 8, 9, 10, 11]);
+        let retained_three = members(&[7, 8, 9]);
+        let expanded_identity = identity_at(2, 0x72);
+        let retained_identity = identity_at(3, 0x73);
+        let expand_id = [0x71; MEMBERSHIP_TRANSITION_ID_BYTES];
+        let expand_digest = [0x72; 32];
+        let remove_id = [0x73; MEMBERSHIP_TRANSITION_ID_BYTES];
+        let remove_digest = [0x74; 32];
+
+        initialize_schema(&conn, storage_identity, &initial_three).expect("initialize scope");
+        let initial = membership_entry_at(0, vec![initial_three.clone()], initial_three.clone());
+        append_logs_sync(&conn, storage_identity, std::slice::from_ref(&initial))
+            .expect("append initial membership");
+        apply_entries_sync(&conn, storage_identity, &backend.caps, vec![initial])
+            .expect("apply initial membership");
+
+        stage_membership_scope_sync(
+            &conn,
+            storage_identity,
+            expand_id,
+            expand_digest,
+            expanded_identity,
+            &expanded_five,
+        )
+        .expect("stage expansion");
+        let learners = membership_entry_at(1, vec![initial_three.clone()], expanded_five.clone());
+        let ready = topology_entry_at(
+            2,
+            0xb1,
+            SessionMutationIntent::MarkTopologyLearnersReady {
+                transition_id: expand_id,
+                request_digest: expand_digest,
+            },
+        );
+        append_logs_sync(&conn, storage_identity, &[learners.clone(), ready.clone()])
+            .expect("append expansion learners and readiness");
+        apply_entries_sync(
+            &conn,
+            storage_identity,
+            &backend.caps,
+            vec![learners, ready],
+        )
+        .expect("apply expansion learners and readiness");
+        fence_application_authority_sync(&conn, storage_identity, expand_id, expand_digest)
+            .expect("fence expansion authority");
+        let joint = membership_entry_at(
+            3,
+            vec![initial_three.clone(), expanded_five.clone()],
+            expanded_five.clone(),
+        );
+        let uniform = membership_entry_at(4, vec![expanded_five.clone()], expanded_five.clone());
+        append_logs_sync(&conn, storage_identity, &[joint.clone(), uniform.clone()])
+            .expect("append expansion membership");
+        apply_entries_sync(&conn, storage_identity, &backend.caps, vec![joint, uniform])
+            .expect("apply expansion membership");
+        let finalize = topology_entry_at(
+            5,
+            0xb2,
+            SessionMutationIntent::FinalizeTopologyTransition {
+                transition_id: expand_id,
+                request_digest: expand_digest,
+            },
+        );
+        append_logs_sync(&conn, storage_identity, std::slice::from_ref(&finalize))
+            .expect("append expansion finalization");
+        apply_entries_sync(&conn, storage_identity, &backend.caps, vec![finalize])
+            .expect("apply expansion finalization");
+
+        stage_membership_scope_sync(
+            &conn,
+            storage_identity,
+            remove_id,
+            remove_digest,
+            retained_identity,
+            &retained_three,
+        )
+        .expect("stage retained-only removal");
+        let prepare = topology_entry_at(
+            6,
+            0xb3,
+            SessionMutationIntent::PrepareTopologyTransition {
+                transition_id: remove_id,
+                request_digest: remove_digest,
+                desired_identity: retained_identity,
+                desired_members: retained_three.clone(),
+                desired_bindings: test_member_bindings(&retained_three),
+            },
+        );
+        let ready = topology_entry_at(
+            7,
+            0xb4,
+            SessionMutationIntent::MarkTopologyLearnersReady {
+                transition_id: remove_id,
+                request_digest: remove_digest,
+            },
+        );
+        let abort = topology_entry_at(
+            8,
+            0xb5,
+            SessionMutationIntent::AbortTopologyTransition {
+                transition_id: remove_id,
+                request_digest: remove_digest,
+            },
+        );
+        let cleanup = topology_entry_at(
+            9,
+            0xb6,
+            SessionMutationIntent::AbortTopologyTransition {
+                transition_id: remove_id,
+                request_digest: remove_digest,
+            },
+        );
+        append_logs_sync(
+            &conn,
+            storage_identity,
+            &[
+                prepare.clone(),
+                ready.clone(),
+                abort.clone(),
+                cleanup.clone(),
+            ],
+        )
+        .expect("append retained-only abort controls");
+        apply_entries_sync(
+            &conn,
+            storage_identity,
+            &backend.caps,
+            vec![prepare, ready, abort, cleanup],
+        )
+        .expect("apply retained-only abort without a membership entry");
+
+        let scope = read_membership_scope_sync(&conn, storage_identity)
+            .expect("exact retained promoted history validates the aborted successor");
+        assert_eq!(expanded_identity, scope.current_identity);
+        assert_eq!(expanded_five, scope.current_members);
+        assert_eq!(1, scope.terminal_history.len());
+        assert_eq!(expand_id, scope.terminal_history[0].transition_id);
+        let terminal = scope.terminal.expect("retained-only abort terminal");
+        let abort_cleanup = terminal.abort_cleanup.expect("retained-only cleanup proof");
+        assert!(abort_cleanup.learners.is_empty());
+        assert_eq!(8, abort_cleanup.decision_log_index);
+        assert_eq!(Some(9), abort_cleanup.cleanup_log_index);
+        assert_eq!(
+            MembershipScopeMutation::Idempotent,
+            abort_membership_scope_sync(&conn, storage_identity, remove_id, remove_digest, 9,)
+                .expect("exact retained-only abort retry")
+        );
+
+        conn.execute(
+            "UPDATE consensus_membership_terminal_history SET expected_member_count = 4 WHERE transition_id = ?1",
+            params![expand_id.as_slice()],
+        )
+        .expect("corrupt retained promoted member count");
+        assert!(
+            read_membership_scope_sync(&conn, storage_identity).is_err(),
+            "mismatched retained terminal evidence must not authorize the predecessor"
+        );
+    }
+
+    #[tokio::test]
+    async fn sequential_aborts_retain_exact_terminal_evidence_across_restart() {
+        let directory = tempfile::tempdir().expect("directory");
+        let database = directory.path().join("terminal-history.sqlite");
+        let snapshot = directory.path().join("terminal-history-snapshot.sqlite");
+        let regressed_snapshot = directory.path().join("terminal-history-regressed.sqlite");
+        let storage_identity = identity();
+        let current = members(&[7, 8, 9]);
+        let first_desired = members(&[7, 8, 9, 10, 11]);
+        let second_desired = members(&[7, 8, 9, 12, 13]);
+        let first_id = [0xa1; MEMBERSHIP_TRANSITION_ID_BYTES];
+        let first_digest = [0xb1; 32];
+        let second_id = [0xa2; MEMBERSHIP_TRANSITION_ID_BYTES];
+        let second_digest = [0xb2; 32];
+        let first_identity = identity_at(2, 0xa1);
+        let second_identity = identity_at(2, 0xa2);
+
+        let backend = SqliteSessionBackend::open(&database).expect("backend");
+        let (snapshot_last_log, snapshot_membership) = {
+            let conn = backend.conn.lock().await;
+            initialize_schema(&conn, storage_identity, &current).expect("initialize scope");
+            let initial = membership_entry_at(0, vec![current.clone()], current.clone());
+            append_logs_sync(&conn, storage_identity, std::slice::from_ref(&initial))
+                .expect("append initial membership");
+            apply_entries_sync(&conn, storage_identity, &backend.caps, vec![initial])
+                .expect("apply initial membership");
+
+            stage_membership_scope_sync(
+                &conn,
+                storage_identity,
+                first_id,
+                first_digest,
+                first_identity,
+                &first_desired,
+            )
+            .expect("stage first abort");
+            let first_learners =
+                membership_entry_at(1, vec![current.clone()], first_desired.clone());
+            let first_abort = topology_entry_at(
+                2,
+                0xa3,
+                SessionMutationIntent::AbortTopologyTransition {
+                    transition_id: first_id,
+                    request_digest: first_digest,
+                },
+            );
+            let first_cleanup = membership_entry_at(3, vec![current.clone()], current.clone());
+            append_logs_sync(
+                &conn,
+                storage_identity,
+                &[
+                    first_learners.clone(),
+                    first_abort.clone(),
+                    first_cleanup.clone(),
+                ],
+            )
+            .expect("append first abort");
+            apply_entries_sync(
+                &conn,
+                storage_identity,
+                &backend.caps,
+                vec![first_learners, first_abort, first_cleanup],
+            )
+            .expect("apply first abort");
+
+            stage_membership_scope_sync(
+                &conn,
+                storage_identity,
+                second_id,
+                second_digest,
+                second_identity,
+                &second_desired,
+            )
+            .expect("stage second abort after exact first cleanup");
+            let staged = read_membership_scope_sync(&conn, storage_identity)
+                .expect("read staged second abort");
+            assert_eq!(1, staged.terminal_history.len());
+            assert_eq!(first_id, staged.terminal_history[0].transition_id);
+
+            let second_learners =
+                membership_entry_at(4, vec![current.clone()], second_desired.clone());
+            let second_abort = topology_entry_at(
+                5,
+                0xa4,
+                SessionMutationIntent::AbortTopologyTransition {
+                    transition_id: second_id,
+                    request_digest: second_digest,
+                },
+            );
+            let second_cleanup = membership_entry_at(6, vec![current.clone()], current.clone());
+            append_logs_sync(
+                &conn,
+                storage_identity,
+                &[
+                    second_learners.clone(),
+                    second_abort.clone(),
+                    second_cleanup.clone(),
+                ],
+            )
+            .expect("append second abort");
+            apply_entries_sync(
+                &conn,
+                storage_identity,
+                &backend.caps,
+                vec![second_learners, second_abort, second_cleanup],
+            )
+            .expect("apply second abort");
+            build_snapshot_database_sync(&conn, storage_identity, &snapshot)
+                .expect("build terminal-history snapshot")
+        };
+        drop(backend);
+
+        let reopened = SqliteSessionBackend::open(&database).expect("reopen backend");
+        let conn = reopened.conn.lock().await;
+        initialize_schema(&conn, storage_identity, &current).expect("validate reopened scope");
+        let first_evidence = read_membership_transition_evidence_sync(
+            &conn,
+            storage_identity,
+            first_id,
+            first_digest,
+        )
+        .expect("read retained first abort")
+        .expect("retained first abort evidence");
+        assert_eq!(
+            Some(TerminalMembershipOutcome::Aborted),
+            first_evidence.outcome
+        );
+        assert_eq!(Some(2), first_evidence.abort_decision_log_index);
+        assert_eq!(Some(3), first_evidence.abort_cleanup_log_index);
+        assert_eq!(
+            MembershipScopeMutation::Idempotent,
+            stage_membership_scope_sync(
+                &conn,
+                storage_identity,
+                first_id,
+                first_digest,
+                first_identity,
+                &first_desired,
+            )
+            .expect("exact retained abort retry is idempotent")
+        );
+        assert_eq!(
+            MembershipScopeMutationError::ConflictingTransition,
+            read_membership_transition_evidence_sync(
+                &conn,
+                storage_identity,
+                first_id,
+                [0xc1; 32],
+            )
+            .expect_err("retained abort ID with another digest must conflict")
+        );
+        let scope = read_membership_scope_sync(&conn, storage_identity).expect("reopened scope");
+        assert!(scope.pending.is_none());
+        assert_eq!(1, scope.terminal_history.len());
+        assert_eq!(
+            second_id,
+            scope
+                .terminal
+                .expect("current second terminal")
+                .transition_id
+        );
+
+        let snapshot_meta = opc_consensus::engine::SnapshotMeta {
+            last_log_id: snapshot_last_log,
+            last_membership: snapshot_membership,
+            snapshot_id: "terminal-history".into(),
+        };
+        let snapshot_bytes = std::fs::metadata(&snapshot)
+            .expect("snapshot metadata")
+            .len();
+        let target = SqliteSessionBackend::in_memory().expect("snapshot target");
+        let target_conn = target.conn.lock().await;
+        initialize_schema(&target_conn, storage_identity, &current)
+            .expect("initialize snapshot target");
+        install_snapshot_database_sync(
+            &target_conn,
+            storage_identity,
+            &snapshot,
+            &snapshot_meta,
+            "terminal-history.opc",
+            [0xd1; 32],
+            snapshot_bytes,
+        )
+        .expect("install terminal-history snapshot");
+        let installed = read_membership_transition_evidence_sync(
+            &target_conn,
+            storage_identity,
+            first_id,
+            first_digest,
+        )
+        .expect("read installed terminal history")
+        .expect("installed terminal evidence");
+        assert_eq!(Some(TerminalMembershipOutcome::Aborted), installed.outcome);
+        assert_eq!(Some(3), installed.abort_cleanup_log_index);
+
+        std::fs::copy(&snapshot, &regressed_snapshot).expect("copy regressed snapshot fixture");
+        let regressed = Connection::open(&regressed_snapshot).expect("open regressed snapshot");
+        regressed
+            .execute("DELETE FROM consensus_membership_terminal_history", [])
+            .expect("remove terminal history from regressed snapshot");
+        drop(regressed);
+        let regressed_bytes = std::fs::metadata(&regressed_snapshot)
+            .expect("regressed snapshot metadata")
+            .len();
+        let error = install_snapshot_database_sync(
+            &target_conn,
+            storage_identity,
+            &regressed_snapshot,
+            &snapshot_meta,
+            "terminal-history-regressed.opc",
+            [0xd2; 32],
+            regressed_bytes,
+        )
+        .expect_err("snapshot install must not discard retained terminal outcomes");
+        assert_eq!(io::ErrorKind::InvalidData, error.kind());
     }
 
     #[tokio::test]
@@ -6909,8 +8978,14 @@ mod tests {
 
         assert_eq!(
             MembershipScopeMutationError::TransitionNotQuiescent,
-            abort_membership_scope_sync(&conn, storage_identity, transition_id, transition_digest,)
-                .expect_err("committed joint state is an irreversible transition boundary")
+            abort_membership_scope_sync(
+                &conn,
+                storage_identity,
+                transition_id,
+                transition_digest,
+                5,
+            )
+            .expect_err("committed joint state is an irreversible transition boundary")
         );
         let evidence = read_membership_transition_evidence_sync(
             &conn,
@@ -6922,6 +8997,216 @@ mod tests {
         .expect("pending transition evidence");
         assert_eq!(None, evidence.outcome);
         assert_eq!(Some(3), evidence.joint_membership_log_index);
+    }
+
+    #[tokio::test]
+    async fn aborted_candidate_reuse_requires_exact_durable_abort_proof() {
+        let directory = tempfile::tempdir().expect("directory");
+        let database = directory.path().join("aborted-candidate.sqlite");
+        let storage_identity = identity();
+        let current = members(&[7, 8, 9]);
+        let desired = members(&[7, 8, 9, 10, 11]);
+        let desired_bindings = test_member_bindings(&desired);
+        let aborted_identity = identity_at(2, 0x65);
+        let aborted_id = [0x45; MEMBERSHIP_TRANSITION_ID_BYTES];
+        let aborted_digest = [0x46; 32];
+
+        let provisional = SqliteSessionBackend::in_memory().expect("provisional backend");
+        {
+            let conn = provisional.conn.lock().await;
+            initialize_schema_with_pending(
+                &conn,
+                storage_identity,
+                &current,
+                Some(PendingMembershipBootstrap {
+                    local_candidate_node_id: Some(member(10)),
+                    transition_id: aborted_id,
+                    transition_digest: aborted_digest,
+                    desired_identity: aborted_identity,
+                    desired_members: &desired,
+                    desired_bindings: &desired_bindings,
+                }),
+            )
+            .expect("open provisional candidate");
+            assert_eq!(
+                MembershipScopeMutation::Applied,
+                cancel_provisional_candidate_membership_scope_sync(
+                    &conn,
+                    storage_identity,
+                    member(10),
+                    aborted_id,
+                    aborted_digest,
+                )
+                .expect("cancel never-admitted candidate")
+            );
+            assert_eq!(
+                MembershipScopeMutation::Idempotent,
+                cancel_provisional_candidate_membership_scope_sync(
+                    &conn,
+                    storage_identity,
+                    member(10),
+                    aborted_id,
+                    aborted_digest,
+                )
+                .expect("retry candidate cancellation")
+            );
+            assert!(read_membership_scope_sync(&conn, storage_identity)
+                .expect("cancelled candidate scope")
+                .pending
+                .is_none());
+            assert_eq!(
+                MembershipScopeMutationError::ConflictingTransition,
+                cancel_provisional_candidate_membership_scope_sync(
+                    &conn,
+                    storage_identity,
+                    member(10),
+                    [0x4b; MEMBERSHIP_TRANSITION_ID_BYTES],
+                    aborted_digest,
+                )
+                .expect_err("another transition cannot reuse the cancellation tombstone")
+            );
+            assert_eq!(
+                SessionConsensusStorageError::RecoveryRequired,
+                initialize_schema_with_pending(
+                    &conn,
+                    storage_identity,
+                    &current,
+                    Some(PendingMembershipBootstrap {
+                        local_candidate_node_id: Some(member(10)),
+                        transition_id: aborted_id,
+                        transition_digest: [0x4c; 32],
+                        desired_identity: aborted_identity,
+                        desired_members: &desired,
+                        desired_bindings: &desired_bindings,
+                    }),
+                )
+                .expect_err("a cancelled transition ID cannot be revived with another digest")
+            );
+            assert_eq!(
+                Some(CandidateBootstrapMarker {
+                    local_candidate_node_id: member(10),
+                    transition_id: aborted_id,
+                    transition_digest: aborted_digest,
+                    state: CandidateBootstrapState::Cancelled,
+                }),
+                read_candidate_bootstrap_marker_sync(&conn, storage_identity)
+                    .expect("cancelled marker remains durable")
+            );
+        }
+
+        let backend = SqliteSessionBackend::open(&database).expect("backend");
+        {
+            let conn = backend.conn.lock().await;
+            initialize_schema(&conn, storage_identity, &current).expect("initialize scope");
+            let initial = membership_entry_at(0, vec![current.clone()], current.clone());
+            append_logs_sync(&conn, storage_identity, std::slice::from_ref(&initial))
+                .expect("append current membership");
+            apply_entries_sync(&conn, storage_identity, &backend.caps, vec![initial])
+                .expect("apply current membership");
+            stage_membership_scope_sync(
+                &conn,
+                storage_identity,
+                aborted_id,
+                aborted_digest,
+                aborted_identity,
+                &desired,
+            )
+            .expect("stage transition");
+            let learners = membership_entry_at(1, vec![current.clone()], desired.clone());
+            append_logs_sync(&conn, storage_identity, std::slice::from_ref(&learners))
+                .expect("append learners");
+            apply_entries_sync(&conn, storage_identity, &backend.caps, vec![learners])
+                .expect("apply learners");
+            let abort = topology_entry_at(
+                2,
+                0x87,
+                SessionMutationIntent::AbortTopologyTransition {
+                    transition_id: aborted_id,
+                    request_digest: aborted_digest,
+                },
+            );
+            append_logs_sync(&conn, storage_identity, std::slice::from_ref(&abort))
+                .expect("append abort");
+            apply_entries_sync(&conn, storage_identity, &backend.caps, vec![abort])
+                .expect("apply abort");
+            let cleanup = membership_entry_at(3, vec![current.clone()], current.clone());
+            append_logs_sync(&conn, storage_identity, std::slice::from_ref(&cleanup))
+                .expect("append exact abort cleanup");
+            apply_entries_sync(&conn, storage_identity, &backend.caps, vec![cleanup])
+                .expect("apply exact abort cleanup");
+        }
+        drop(backend);
+
+        let reopened = SqliteSessionBackend::open(&database).expect("reopen candidate");
+        let conn = reopened.conn.lock().await;
+        let same_aborted = PendingMembershipBootstrap {
+            local_candidate_node_id: Some(member(10)),
+            transition_id: aborted_id,
+            transition_digest: aborted_digest,
+            desired_identity: aborted_identity,
+            desired_members: &desired,
+            desired_bindings: &desired_bindings,
+        };
+        assert_eq!(
+            SessionConsensusStorageError::RecoveryRequired,
+            initialize_schema_with_pending(&conn, storage_identity, &current, Some(same_aborted),)
+                .expect_err("an aborted transition cannot be reopened blindly")
+        );
+
+        let successor = PendingMembershipBootstrap {
+            local_candidate_node_id: Some(member(10)),
+            transition_id: [0x47; MEMBERSHIP_TRANSITION_ID_BYTES],
+            transition_digest: [0x48; 32],
+            desired_identity: identity_at(2, 0x66),
+            desired_members: &desired,
+            desired_bindings: &desired_bindings,
+        };
+        initialize_schema_with_pending(&conn, storage_identity, &current, Some(successor))
+            .expect("durably aborted learner may stage a distinct successor");
+        let scope = read_membership_scope_sync(&conn, storage_identity).expect("reused scope");
+        assert_eq!(
+            0,
+            scope
+                .pending
+                .expect("new candidate transition")
+                .transition_start_log_index
+        );
+
+        let unproven = SqliteSessionBackend::in_memory().expect("unproven backend");
+        let unproven_conn = unproven.conn.lock().await;
+        initialize_schema(&unproven_conn, storage_identity, &current)
+            .expect("initialize unproven scope");
+        let initial = membership_entry_at(0, vec![current.clone()], current.clone());
+        append_logs_sync(
+            &unproven_conn,
+            storage_identity,
+            std::slice::from_ref(&initial),
+        )
+        .expect("append unproven membership");
+        apply_entries_sync(
+            &unproven_conn,
+            storage_identity,
+            &unproven.caps,
+            vec![initial],
+        )
+        .expect("apply unproven membership");
+        assert_eq!(
+            SessionConsensusStorageError::RecoveryRequired,
+            initialize_schema_with_pending(
+                &unproven_conn,
+                storage_identity,
+                &current,
+                Some(PendingMembershipBootstrap {
+                    local_candidate_node_id: Some(member(10)),
+                    transition_id: [0x49; MEMBERSHIP_TRANSITION_ID_BYTES],
+                    transition_digest: [0x4a; 32],
+                    desired_identity: identity_at(2, 0x67),
+                    desired_members: &desired,
+                    desired_bindings: &desired_bindings,
+                }),
+            )
+            .expect_err("candidate reuse without durable abort proof must fail closed")
+        );
     }
 
     #[tokio::test]
@@ -6937,6 +9222,7 @@ mod tests {
         let transition_id = [0x51; MEMBERSHIP_TRANSITION_ID_BYTES];
         let transition_digest = [0x52; 32];
         let pending = PendingMembershipBootstrap {
+            local_candidate_node_id: Some(member(10)),
             transition_id,
             transition_digest,
             desired_identity,
@@ -7016,6 +9302,8 @@ mod tests {
                     uniform_membership_log_index: None,
                     cutover_log_index: None,
                     finalization_log_index: None,
+                    abort_decision_log_index: None,
+                    abort_cleanup_log_index: None,
                 }),
                 read_membership_transition_evidence_sync(
                     &conn,
@@ -7097,6 +9385,7 @@ mod tests {
                 storage_identity,
                 &current,
                 Some(PendingMembershipBootstrap {
+                    local_candidate_node_id: Some(member(10)),
                     transition_id: [0x61; MEMBERSHIP_TRANSITION_ID_BYTES],
                     transition_digest: [0x62; 32],
                     desired_identity: identity_at(2, 0x73),
@@ -7188,6 +9477,18 @@ mod tests {
                 .expect("commit first transition");
             apply_entries_sync(&conn, storage_identity, &source.caps, vec![joint, uniform])
                 .expect("promote first transition");
+            let finalize = topology_entry_at(
+                5,
+                0x88,
+                SessionMutationIntent::FinalizeTopologyTransition {
+                    transition_id: first_id,
+                    request_digest: first_digest,
+                },
+            );
+            append_logs_sync(&conn, storage_identity, std::slice::from_ref(&finalize))
+                .expect("append first finalization");
+            apply_entries_sync(&conn, storage_identity, &source.caps, vec![finalize])
+                .expect("finalize first transition");
 
             let (compacted_log, compacted_membership) =
                 build_snapshot_database_sync(&conn, storage_identity, &compaction_path)
@@ -7206,7 +9507,7 @@ mod tests {
                 1,
             )
             .expect("record compaction snapshot");
-            purge_logs_sync(&conn, storage_identity, &log_id(4)).expect("purge first history");
+            purge_logs_sync(&conn, storage_identity, &log_id(5)).expect("purge first history");
             drop_compacted_membership_predecessor_sync(&conn, storage_identity)
                 .expect("drop first predecessor");
 
@@ -7219,7 +9520,7 @@ mod tests {
                 &desired_members,
             )
             .expect("stage successor from epoch two");
-            let transition_floor = blank_entry(5);
+            let transition_floor = blank_entry(6);
             append_logs_sync(
                 &conn,
                 storage_identity,
@@ -7234,7 +9535,7 @@ mod tests {
             )
             .expect("apply successor floor");
             let ready = topology_entry_at(
-                6,
+                7,
                 0x87,
                 SessionMutationIntent::MarkTopologyLearnersReady {
                     transition_id: second_id,
@@ -7268,6 +9569,7 @@ mod tests {
             current_identity,
             &current_members,
             Some(PendingMembershipBootstrap {
+                local_candidate_node_id: None,
                 transition_id: second_id,
                 transition_digest: second_digest,
                 desired_identity,
@@ -7679,5 +9981,54 @@ mod tests {
             .map(|(_, response)| response.result),
             Some(Err(StoreError::LeaseHeld))
         ));
+    }
+
+    #[tokio::test]
+    async fn idempotent_outcome_does_not_cross_topology_authority_epoch() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.lock().await;
+        let storage_identity = identity();
+        initialize_schema(&conn, storage_identity, &expected_members()).expect("consensus schema");
+
+        let request_id = [0xB3; 16];
+        let first = apply_entries_sync(
+            &conn,
+            storage_identity,
+            &backend.caps,
+            vec![
+                membership_entry(),
+                authorized_acquire_entry(1, request_id, node_id(), storage_identity),
+            ],
+        )
+        .expect("current-authority request applies");
+        assert!(matches!(
+            first.responses.last(),
+            Some(SessionConsensusResponse {
+                result: Ok(SessionMutationOutcome::Lease(_)),
+                ..
+            })
+        ));
+
+        let error = apply_entries_sync(
+            &conn,
+            storage_identity,
+            &backend.caps,
+            vec![authorized_acquire_entry(
+                2,
+                request_id,
+                node_id(),
+                identity_at(2, 0x5c),
+            )],
+        )
+        .expect_err("a new authority epoch must not recover the old outcome");
+        assert_eq!(io::ErrorKind::InvalidData, error.kind());
+        assert_eq!(
+            "session consensus request ID was reused with another payload",
+            error.to_string()
+        );
+        assert_eq!(
+            Some(log_id(1)),
+            read_applied_sync(&conn, storage_identity).expect("applied index remains fenced")
+        );
     }
 }

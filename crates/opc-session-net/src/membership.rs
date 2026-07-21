@@ -14,8 +14,9 @@ use opc_session_store::{
     SessionTopologyTransportAdmission, SessionTopologyTransportAdmissionError,
 };
 pub use opc_session_store::{
-    SessionTopologyAbortAdmissionProof, SessionTopologyJointCommitAdmissionProof,
-    SessionTopologyLearnersReadyAdmissionProof, SessionTopologyTransitionId,
+    SessionTopologyAbortAdmissionProof, SessionTopologyCandidateRetirementProof,
+    SessionTopologyJointCommitAdmissionProof, SessionTopologyLearnersReadyAdmissionProof,
+    SessionTopologyPrePrepareUnstageProof, SessionTopologyTransitionId,
     SessionTopologyUniformCommitAdmissionProof,
 };
 use opc_types::SpiffeId;
@@ -44,6 +45,10 @@ pub enum SessionMembershipTransitionResult {
     Aborted,
     /// The exact transition had already been aborted.
     AlreadyAborted,
+    /// Process-local successor staging was removed before durable Prepare.
+    Unstaged,
+    /// The exact successor was already absent before durable Prepare.
+    AlreadyUnstaged,
 }
 
 /// Redaction-safe membership-admission failure.
@@ -328,6 +333,62 @@ impl SessionMembershipAdmission {
             voting_admitted: false,
         });
         Ok(SessionMembershipTransitionResult::Staged)
+    }
+
+    /// Remove exact process-local successor admission before durable Prepare.
+    ///
+    /// The store-issued proof is only available after the membership driver
+    /// verifies durable absence while holding its operation fence. Unlike a
+    /// durable abort, this operation records no terminal transition and the
+    /// same request may be staged again later.
+    pub async fn unstage_successor_before_prepare(
+        &self,
+        request: &SessionTopologyTransitionRequest,
+        proof: &SessionTopologyPrePrepareUnstageProof,
+    ) -> Result<SessionMembershipTransitionResult, SessionMembershipAdmissionError> {
+        if !proof.validates_request(request) {
+            return Err(SessionTopologyTransitionError::IdempotencyConflict.into());
+        }
+        let mut state = self.state.write().await;
+        let transition_id = request.transition_id();
+        let request_digest = request.request_digest();
+        let Some(pending) = state.pending.take() else {
+            if state.last_completed.is_some_and(|completed| {
+                completed.transition_id() == transition_id
+                    && completed.request_digest() == request_digest
+            }) {
+                return Err(SessionTopologyTransitionError::CancellationTooLate.into());
+            }
+            if state.current.consensus_identity().cluster_id() != request.cluster_id()
+                || state.current.configuration_epoch() != request.expected_epoch()
+            {
+                return Err(SessionTopologyTransitionError::StaleEpoch.into());
+            }
+            return Ok(SessionMembershipTransitionResult::AlreadyUnstaged);
+        };
+        if pending.transition_id != transition_id || pending.request_digest != request_digest {
+            state.pending = Some(pending);
+            return Err(SessionTopologyTransitionError::IdempotencyConflict.into());
+        }
+        if pending.voting_admitted {
+            state.pending = Some(pending);
+            return Err(SessionTopologyTransitionError::CancellationTooLate.into());
+        }
+        Ok(SessionMembershipTransitionResult::Unstaged)
+    }
+
+    /// Retire candidate transport admission after terminal abort cleanup.
+    pub async fn retire_aborted_candidate(
+        &self,
+        request: &SessionTopologyTransitionRequest,
+        proof: &SessionTopologyCandidateRetirementProof,
+    ) -> Result<SessionMembershipTransitionResult, SessionMembershipAdmissionError> {
+        if !proof.validates_request(request)
+            || proof.abort_cleanup_log_index() <= proof.abort_decision_log_index()
+        {
+            return Err(SessionTopologyTransitionError::IdempotencyConflict.into());
+        }
+        self.abort_successor_validated(request).await
     }
 
     /// Admit `Vote` RPCs under the staged successor after joint commit.
@@ -641,7 +702,20 @@ impl SessionMembershipAdmission {
             ConsensusRpcFamily::ForwardMutation | ConsensusRpcFamily::ReadBarrier => false,
             _ => false,
         };
-        if !(current_matches || pending_matches && pending_engine_catchup) {
+        // Once joint membership is durably committed, the predecessor
+        // manifest must no longer authorize application reads or mutations.
+        // Keep its engine and topology-barrier routes admitted until uniform
+        // membership commits: Openraft may still need both sides of the joint
+        // configuration to exchange Vote, AppendEntries, and snapshot traffic.
+        // This check runs for every call, so an already-authenticated cached
+        // predecessor connection is fenced without waiting for reconnect.
+        let predecessor_application_authority_revoked = pending_voting_admitted
+            && matches!(
+                family,
+                ConsensusRpcFamily::ForwardMutation | ConsensusRpcFamily::ReadBarrier
+            );
+        let current_admitted = current_matches && !predecessor_application_authority_revoked;
+        if !(current_admitted || pending_matches && pending_engine_catchup) {
             return Err(SessionConsensusPeerError::ScopeMismatch);
         }
         // The topology barrier handler performs the proof-gated write on this
@@ -673,17 +747,37 @@ impl SessionMembershipAdmission {
 
 #[async_trait::async_trait]
 impl SessionTopologyTransportAdmission for SessionMembershipAdmission {
+    async fn unstage_successor_before_prepare(
+        &self,
+        request: &SessionTopologyTransitionRequest,
+        proof: &SessionTopologyPrePrepareUnstageProof,
+    ) -> Result<(), SessionTopologyTransportAdmissionError> {
+        SessionMembershipAdmission::unstage_successor_before_prepare(self, request, proof)
+            .await
+            .map(|_| ())
+            .map_err(|_| SessionTopologyTransportAdmissionError::Rejected)
+    }
+
+    async fn retire_aborted_candidate(
+        &self,
+        request: &SessionTopologyTransitionRequest,
+        proof: &SessionTopologyCandidateRetirementProof,
+    ) -> Result<(), SessionTopologyTransportAdmissionError> {
+        SessionMembershipAdmission::retire_aborted_candidate(self, request, proof)
+            .await
+            .map(|_| ())
+            .map_err(|_| SessionTopologyTransportAdmissionError::Rejected)
+    }
+
     async fn admit_successor_voting(
         &self,
         request: &SessionTopologyTransitionRequest,
         proof: &SessionTopologyJointCommitAdmissionProof,
     ) -> Result<(), SessionTopologyTransportAdmissionError> {
-        SessionMembershipAdmission::admit_successor_voting_after_joint_commit(
-            self, request, proof,
-        )
-        .await
-        .map(|_| ())
-        .map_err(|_| SessionTopologyTransportAdmissionError::Rejected)
+        SessionMembershipAdmission::admit_successor_voting_after_joint_commit(self, request, proof)
+            .await
+            .map(|_| ())
+            .map_err(|_| SessionTopologyTransportAdmissionError::Rejected)
     }
 
     async fn finalize_successor(
@@ -960,6 +1054,43 @@ mod tests {
             Err(SessionConsensusPeerError::ScopeMismatch),
             "a learner may catch up but cannot acquire application authority"
         );
+        for family in [
+            ConsensusRpcFamily::ForwardMutation,
+            ConsensusRpcFamily::ReadBarrier,
+        ] {
+            assert_eq!(
+                admission
+                    .revalidate_engine_scope(
+                        &current_scope,
+                        three.consensus_identity(),
+                        current_scope.sender_node_id,
+                        family,
+                    )
+                    .await
+                    .map(|_| ()),
+                Err(SessionConsensusPeerError::ScopeMismatch),
+                "joint proof must fence predecessor application authority"
+            );
+        }
+        for family in [
+            ConsensusRpcFamily::Vote,
+            ConsensusRpcFamily::AppendEntries,
+            ConsensusRpcFamily::InstallSnapshot,
+            ConsensusRpcFamily::TopologyAdmissionBarrier,
+        ] {
+            assert!(
+                admission
+                    .revalidate_engine_scope(
+                        &current_scope,
+                        three.consensus_identity(),
+                        current_scope.sender_node_id,
+                        family,
+                    )
+                    .await
+                    .is_ok(),
+                "joint membership must retain predecessor engine and barrier traffic"
+            );
+        }
 
         assert_eq!(
             admission.finalize_successor_for_test(&expand_request).await,

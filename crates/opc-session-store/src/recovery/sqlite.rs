@@ -40,7 +40,8 @@ const FILE_IDENTITY_DOMAIN: &[u8] = b"openpacketcore/session-recovery/file-ident
 const LOGICAL_STATE_DOMAIN: &[u8] = b"openpacketcore/session-recovery/logical-state/v1\0";
 const FILE_DIGEST_DOMAIN: &[u8] = b"openpacketcore/session-recovery/file/v1\0";
 const WORKFLOW_VERSION: u16 = 2;
-const MAX_CURRENT_SCHEMA_OBJECTS: usize = 19;
+// Six base SQLite objects plus fifteen bounded consensus/recovery objects.
+const MAX_CURRENT_SCHEMA_OBJECTS: usize = 21;
 const MAX_SCHEMA_SQL_BYTES: usize = 16_384;
 
 pub(super) struct InspectionInput<'a> {
@@ -533,6 +534,27 @@ fn preflight_current_tables(
             return Err(RecoveryError::WorkLimitExceeded);
         }
     }
+    if table_exists(conn, "consensus_membership_terminal_history")? {
+        let (count, maximum, total): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(MAX(length(transition_id) + length(transition_digest)), 0), COALESCE(SUM(length(transition_id) + length(transition_digest)), 0) FROM consensus_membership_terminal_history",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(|error| inspection_sql_error(error, budget))?;
+        let count = u64::try_from(count).map_err(|_| RecoveryError::CorruptReplica)?;
+        let maximum = u64::try_from(maximum).map_err(|_| RecoveryError::CorruptReplica)?;
+        let total = u64::try_from(total).map_err(|_| RecoveryError::CorruptReplica)?;
+        total_bytes = total_bytes
+            .checked_add(total)
+            .ok_or(RecoveryError::WorkLimitExceeded)?;
+        if count > 4_096
+            || maximum > budget.limits.max_value_bytes()
+            || total_bytes > budget.limits.max_total_value_bytes()
+        {
+            return Err(RecoveryError::WorkLimitExceeded);
+        }
+    }
     Ok(())
 }
 
@@ -682,6 +704,16 @@ fn hash_current_checkpoint(
         );
         hasher.update(query.as_bytes());
         hash_query_rows(conn, query, budget, hasher)?;
+    }
+    let terminal_history_query = "SELECT * FROM consensus_membership_terminal_history ORDER BY transition_start_index, transition_id";
+    hasher.update(
+        u64::try_from(terminal_history_query.len())
+            .map_err(|_| RecoveryError::WorkLimitExceeded)?
+            .to_be_bytes(),
+    );
+    hasher.update(terminal_history_query.as_bytes());
+    if table_exists(conn, "consensus_membership_terminal_history")? {
+        hash_query_rows(conn, terminal_history_query, budget, hasher)?;
     }
     Ok(())
 }
@@ -958,6 +990,12 @@ fn validate_exact_recovery_schema(
     let canonical_membership_history = expected
         .remove("consensus_membership_history")
         .ok_or(RecoveryError::DatabaseUnavailable)?;
+    let canonical_membership_terminal_history = expected
+        .remove("consensus_membership_terminal_history")
+        .ok_or(RecoveryError::DatabaseUnavailable)?;
+    let canonical_candidate_bootstrap = expected
+        .remove("consensus_candidate_bootstrap")
+        .ok_or(RecoveryError::DatabaseUnavailable)?;
     expected
         .remove("restore_scan_state")
         .ok_or(RecoveryError::DatabaseUnavailable)?;
@@ -1001,6 +1039,21 @@ fn validate_exact_recovery_schema(
     match observed.remove("consensus_membership_history") {
         Some(sql) if sql == canonical_membership_history => {}
         Some(_) => return Err(RecoveryError::CorruptReplica),
+        None => {}
+    }
+    match observed.remove("consensus_membership_terminal_history") {
+        Some(sql) if sql == canonical_membership_terminal_history => {}
+        Some(_) => return Err(RecoveryError::CorruptReplica),
+        // Terminal outcome history is a bounded add-on installed on the next
+        // writable consensus open. Read-only recovery must still inspect
+        // replicas created before this feature.
+        None => {}
+    }
+    match observed.remove("consensus_candidate_bootstrap") {
+        Some(sql) if sql == canonical_candidate_bootstrap => {}
+        Some(_) => return Err(RecoveryError::CorruptReplica),
+        // The candidate tombstone is a new bounded add-on and is installed
+        // transactionally on the next writable consensus open.
         None => {}
     }
     if observed != expected {
@@ -3740,4 +3793,59 @@ fn open_directory(path: &Path) -> std::io::Result<File> {
         options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_DIRECTORY);
     }
     options.open(path)
+}
+
+#[cfg(test)]
+mod terminal_history_digest_tests {
+    use super::*;
+
+    fn current_checkpoint_digest(conn: &Connection) -> [u8; 32] {
+        let mut budget = InspectionBudget::new(RecoveryLimits::default());
+        let mut hasher = Sha256::new();
+        hash_current_checkpoint(conn, &mut budget, &mut hasher).expect("hash current checkpoint");
+        hasher.finalize().into()
+    }
+
+    #[test]
+    fn terminal_history_changes_the_recovery_branch_digest() {
+        let missing_history = crate::sqlite::SqliteSessionBackend::canonical_schema_connection()
+            .expect("canonical database");
+        let without_history = crate::sqlite::SqliteSessionBackend::canonical_schema_connection()
+            .expect("canonical database");
+        let with_history = crate::sqlite::SqliteSessionBackend::canonical_schema_connection()
+            .expect("canonical database");
+        for conn in [&missing_history, &without_history, &with_history] {
+            consensus::install_recovery_validation_schema_sync(conn, false)
+                .expect("install consensus schema");
+            conn.execute(
+                "INSERT INTO consensus_identity (singleton, schema_version, cluster_id, configuration_id, configuration_epoch) VALUES (1, ?1, ?2, ?3, 1)",
+                rusqlite::params![
+                    i64::from(SESSION_CONSENSUS_SCHEMA_VERSION),
+                    [0x31_u8; 32].as_slice(),
+                    [0x32_u8; 32].as_slice(),
+                ],
+            )
+            .expect("insert storage identity");
+        }
+        missing_history
+            .execute_batch("DROP TABLE consensus_membership_terminal_history")
+            .expect("remove optional terminal history table");
+        with_history
+            .execute(
+                "INSERT INTO consensus_membership_terminal_history (transition_id, storage_configuration_epoch, transition_digest, outcome, expected_member_count, transition_start_index, learners_ready_index, joint_membership_index, uniform_membership_index, cutover_index, finalization_index, abort_decision_index, abort_cleanup_membership_index) VALUES (?1, 1, ?2, 1, 3, 1, NULL, NULL, NULL, NULL, NULL, 2, 3)",
+                rusqlite::params![[0x41_u8; 16].as_slice(), [0x42_u8; 32].as_slice()],
+            )
+            .expect("insert retained terminal outcome");
+
+        assert_ne!(
+            current_checkpoint_digest(&without_history),
+            current_checkpoint_digest(&with_history),
+            "recovery quorum voting must distinguish divergent terminal ledgers"
+        );
+        assert_eq!(
+            current_checkpoint_digest(&missing_history),
+            current_checkpoint_digest(&without_history),
+            "a pre-feature replica must match an explicitly empty terminal ledger"
+        );
+    }
 }

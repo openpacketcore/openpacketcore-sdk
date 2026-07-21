@@ -1173,7 +1173,7 @@ live candidates per page, 65,536 log entries, and 65,536 rebuild entries; the
 configured frame bound remains
 separate. #159 now enforces that negotiated bound and one
 absolute write deadline across every ordinary response/watch item. The profile
-pins wire-schema revision 6, error-set revision 8,
+pins wire-schema revision 6, error-set revision 9,
 `max_restore_scan_examined_rows = 4096`,
 `min_frame_size = 8192`, `max_frame_size = 16777216`, 128-byte
 owner/custom-key/state-type bounds,
@@ -1429,10 +1429,10 @@ The standard SQLite-backed config and session store profiles (`SqliteBackend` an
   `probe_durable_readiness` uses an Openraft linearizable barrier and local-apply
   wait, not bind or cached capability evidence; only attested topology plus
   `probe_production_durable_readiness` may gate production traffic. Its exact
-  profile uses transport/wire-schema revision 2
-  and error-set revision 4, including the bounded payload-free expiry
-  authority preflight and `RecordExpiryPreflightLimitExceeded`.
-  Revision-1/error-revision-3-or-older peers fail before dispatch and all
+  profile uses transport/wire-schema revision 3
+  and error-set revision 5, including the bounded topology-admission barrier
+  and `TopologyAuthorityRevoked`.
+  Revision-2/error-revision-4-or-older peers fail before dispatch and all
   consensus members must be upgraded together while traffic is drained.
 - **Fault Coverage**: Tests cover concurrent pristine formation, cross-node
   lease/CAS visibility, follower linearizable reads, partition-bounded failure

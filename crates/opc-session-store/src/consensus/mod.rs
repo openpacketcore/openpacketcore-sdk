@@ -19,8 +19,9 @@ pub use network::{
 pub(crate) use store::OperatorRecoveryCommitError;
 pub use store::{
     ConsensusSessionStore, ConsensusSessionStoreOpenError, SessionConsensusStatus,
-    SessionTopologyTransportAdmission, SessionTopologyTransportAdmissionError,
-    SessionTopologyTransitionPeers, DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
+    SessionConsensusStorageAnchor, SessionTopologyCandidateBootstrap,
+    SessionTopologyTransitionPeers, SessionTopologyTransportAdmission,
+    SessionTopologyTransportAdmissionError, DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
 };
 
 pub use types::{

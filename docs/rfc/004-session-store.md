@@ -397,8 +397,8 @@ fail closed even if an outer layer omitted validation.
 
 The new errors are public enum variants, so external exhaustive matches MUST be
 updated. Protocol v4 introduced their private fixed-width DTOs in error
-revision 1; current v5 error revision 8 retains those encodings and adds the
-bounded expiry-preflight outcome. An error-revision-7 or older decoder is rejected
+revision 1; current v5 error revision 9 retains those encodings and adds
+bounded expiry-preflight and topology-authority outcomes. An error-revision-8 or older decoder is rejected
 during the exact handshake;
 deployments MUST use the coordinated v5 rollout in §12.3.
 
@@ -1258,7 +1258,7 @@ or traffic admission. A cache MUST be keyed by the exact profile and negotiated
 directional limits and cleared when a successful reconnect changes either
 limit. Callers MUST use fresh bounded quorum evidence.
 
-The transition to v5 wire-schema revision 6 and error-set revision 8 is a
+The transition to v5 wire-schema revision 6 and error-set revision 9 is a
 coordinated stop/upgrade/start boundary, not a rolling deployment. Operators
 MUST drain traffic and writers; run the #135 identity
 audit; inventory every retained record, replication log, snapshot, restore
@@ -1364,10 +1364,10 @@ replication append, or rebuild request. The consensus ALPN and legacy
 `opc-session-net/5` ALPN MUST NOT be multiplexed as equivalent authority on one
 production listener.
 
-The exact consensus contract profile MUST use transport/wire-schema revision 2
-and error-set revision 4. The wire adds the bounded payload-free authority
-preflight; the error set adds `RecordExpiryPreflightLimitExceeded`. Revision
-1/error revision 3 or older MUST fail before engine dispatch.
+The exact consensus contract profile MUST use transport/wire-schema revision 3
+and error-set revision 5. Revision 3 adds the bounded topology-admission
+barrier family; error revision 5 adds `TopologyAuthorityRevoked`. Revision
+2/error revision 4 or older MUST fail before engine dispatch.
 Operators MUST drain traffic and writers, stop every consensus member, upgrade
 the full membership together, verify exact-profile handshakes, and only then
 restore traffic. Mixed-profile rolling operation is unsupported.

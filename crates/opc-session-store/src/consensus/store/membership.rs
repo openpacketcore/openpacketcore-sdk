@@ -13,15 +13,16 @@ use std::sync::{Arc, OnceLock, RwLock};
 use async_trait::async_trait;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use opc_consensus::engine::error::{ClientWriteError, RaftError};
-use opc_consensus::engine::{EmptyNode, StoredMembership};
+use opc_consensus::engine::{ChangeMembers, EmptyNode, StoredMembership};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use super::*;
 use crate::membership::{
-    SessionTopologyAbortAdmissionProof, SessionTopologyJointCommitAdmissionProof,
-    SessionTopologyLearnersReadyAdmissionProof, SessionTopologyTransitionError,
+    SessionTopologyAbortAdmissionProof, SessionTopologyCandidateRetirementProof,
+    SessionTopologyJointCommitAdmissionProof, SessionTopologyLearnersReadyAdmissionProof,
+    SessionTopologyPrePrepareUnstageProof, SessionTopologyTransitionError,
     SessionTopologyTransitionLogIndexes, SessionTopologyTransitionOutcome,
     SessionTopologyTransitionPhase, SessionTopologyTransitionReason,
     SessionTopologyTransitionRequest, SessionTopologyTransitionStatus,
@@ -31,10 +32,11 @@ use crate::sqlite::consensus::{
     MembershipScopeMutationError, MembershipTransitionEvidence, MembershipValidationScope,
     TerminalMembershipOutcome,
 };
-use crate::topology::QuorumReplicaDescriptor;
+use crate::topology::{QuorumReplicaDescriptor, QuorumTopologyConfig};
 
 const TRANSITION_REQUEST_ID_DOMAIN: &[u8] =
     b"openpacketcore/session-store/topology-transition-command/v1\0";
+const TRANSITION_ENGINE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Exact authenticated remote-peer set for a desired topology epoch.
 ///
@@ -43,6 +45,131 @@ const TRANSITION_REQUEST_ID_DOMAIN: &[u8] =
 /// desired consensus identity as its scope.
 pub type SessionTopologyTransitionPeers =
     BTreeMap<SessionConsensusNodeId, Arc<dyn SessionConsensusPeer>>;
+
+/// Immutable database-incarnation identity for joining-node bootstrap.
+///
+/// This value is redaction-safe identity metadata, not an authorization token
+/// or secret. A consumer may serialize it for delivery over its authenticated
+/// control plane. Candidate storage, topology, mTLS peer admission, and Raft
+/// catch-up independently reject a mismatched or stale anchor.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SessionConsensusStorageAnchor(SessionConsensusIdentity);
+
+impl fmt::Debug for SessionConsensusStorageAnchor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionConsensusStorageAnchor")
+            .field("identity", &self.0)
+            .finish()
+    }
+}
+
+/// Validated predecessor/successor manifest used to open one joining learner.
+///
+/// Unlike [`ValidatedQuorumTopology`], this value does not pretend that the
+/// candidate is a member of the predecessor topology and does not require the
+/// caller to nominate an irrelevant predecessor-local replica. Construction
+/// validates both exact descriptor sets, the one-epoch transition, retained
+/// descriptor bindings, candidate absence/presence, and immutable anchor
+/// cluster scope.
+#[derive(Clone)]
+pub struct SessionTopologyCandidateBootstrap {
+    storage_anchor: SessionConsensusStorageAnchor,
+    current_topology: ValidatedQuorumTopology,
+    request: SessionTopologyTransitionRequest,
+    local_candidate: QuorumReplicaDescriptor,
+}
+
+impl SessionTopologyCandidateBootstrap {
+    /// Validate one joining candidate bootstrap manifest.
+    pub fn try_new(
+        storage_anchor: SessionConsensusStorageAnchor,
+        current_identity: SessionConsensusIdentity,
+        current_members: Vec<QuorumReplicaDescriptor>,
+        request: SessionTopologyTransitionRequest,
+        local_candidate: QuorumReplicaDescriptor,
+    ) -> Result<Self, SessionTopologyTransitionError> {
+        let validation_local = current_members
+            .first()
+            .map(|member| member.replica_id().clone())
+            .ok_or(SessionTopologyTransitionError::InvalidTransitionBindings)?;
+        let current_topology =
+            ValidatedQuorumTopology::try_from(QuorumTopologyConfig::new_consensus(
+                validation_local,
+                current_members,
+                current_identity,
+            ))
+            .map_err(|_| SessionTopologyTransitionError::InvalidTransitionBindings)?;
+        if current_identity.cluster_id() != request.cluster_id()
+            || current_identity.configuration_epoch() != request.expected_epoch()
+            || storage_anchor.0.cluster_id() != request.cluster_id()
+            || current_topology
+                .members()
+                .iter()
+                .any(|member| member.replica_id() == local_candidate.replica_id())
+        {
+            return Err(SessionTopologyTransitionError::InvalidTransitionBindings);
+        }
+        let desired_descriptor = request
+            .desired_members()
+            .iter()
+            .find(|member| member.replica_id() == local_candidate.replica_id())
+            .ok_or(SessionTopologyTransitionError::InvalidTransitionBindings)?;
+        if desired_descriptor != &local_candidate {
+            return Err(SessionTopologyTransitionError::InvalidTransitionBindings);
+        }
+        let current_descriptors =
+            descriptors_by_node_id(current_identity, current_topology.members())
+                .ok_or(SessionTopologyTransitionError::InvalidTransitionBindings)?;
+        let desired_descriptors =
+            descriptors_by_node_id(request.desired_identity(), request.desired_members())
+                .ok_or(SessionTopologyTransitionError::InvalidTransitionBindings)?;
+        validate_transition_descriptor_bindings(&current_descriptors, &desired_descriptors)?;
+        let current_ids = current_descriptors.keys().copied().collect::<BTreeSet<_>>();
+        let desired_ids = desired_descriptors.keys().copied().collect::<BTreeSet<_>>();
+        let retained = current_ids.intersection(&desired_ids).count();
+        if retained < (current_ids.len() / 2) + 1 || retained < (desired_ids.len() / 2) + 1 {
+            return Err(SessionTopologyTransitionError::QuorumLosingChange);
+        }
+        Ok(Self {
+            storage_anchor,
+            current_topology,
+            request,
+            local_candidate,
+        })
+    }
+
+    /// Exact validated transition request staged by this candidate.
+    pub const fn request(&self) -> &SessionTopologyTransitionRequest {
+        &self.request
+    }
+
+    /// Candidate logical descriptor in the desired manifest.
+    #[must_use]
+    pub const fn local_candidate(&self) -> &QuorumReplicaDescriptor {
+        &self.local_candidate
+    }
+}
+
+impl fmt::Debug for SessionTopologyCandidateBootstrap {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionTopologyCandidateBootstrap")
+            .field("storage_anchor", &self.storage_anchor)
+            .field(
+                "current_identity",
+                &self.current_topology.consensus_identity(),
+            )
+            .field(
+                "current_member_count",
+                &self.current_topology.members().len(),
+            )
+            .field("request", &self.request)
+            .field("candidate_descriptor", &"<redacted>")
+            .finish()
+    }
+}
 
 /// Redaction-safe failure at the store-owned transport-admission boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -75,6 +202,20 @@ impl SessionTopologyTransportAdmissionError {
 /// before a durable pre-joint abort.
 #[async_trait]
 pub trait SessionTopologyTransportAdmission: Send + Sync + 'static {
+    /// Discard exact process-local staging before any durable Prepare exists.
+    async fn unstage_successor_before_prepare(
+        &self,
+        request: &SessionTopologyTransitionRequest,
+        proof: &SessionTopologyPrePrepareUnstageProof,
+    ) -> Result<(), SessionTopologyTransportAdmissionError>;
+
+    /// Retire an aborted candidate after terminal current-uniform cleanup.
+    async fn retire_aborted_candidate(
+        &self,
+        request: &SessionTopologyTransitionRequest,
+        proof: &SessionTopologyCandidateRetirementProof,
+    ) -> Result<(), SessionTopologyTransportAdmissionError>;
+
     /// Admit successor-scoped Vote RPCs after exact joint membership applies.
     async fn admit_successor_voting(
         &self,
@@ -113,6 +254,91 @@ struct TopologyBindingState {
     current_identity: SessionConsensusIdentity,
     current_descriptors: BTreeMap<SessionConsensusNodeId, QuorumReplicaDescriptor>,
     staged: Option<StagedTopologyBindings>,
+    // Maximum replicated log index represented by the last accepted scope.
+    // This orders async SQLite observations without clocks or task ordering.
+    last_scope_progress_index: Option<u64>,
+    blocking_terminal: Option<(
+        crate::membership::SessionTopologyTransitionId,
+        crate::membership::SessionTopologyTransitionDigest,
+    )>,
+    retained_transitions: BTreeMap<
+        crate::membership::SessionTopologyTransitionId,
+        crate::membership::SessionTopologyTransitionDigest,
+    >,
+}
+
+fn membership_scope_progress_index(scope: &MembershipValidationScope) -> u64 {
+    let mut progress = 0_u64;
+    let mut observe = |index: u64| progress = progress.max(index);
+
+    for predecessor in scope.history.iter().chain(scope.predecessor.iter()) {
+        observe(predecessor.transition_start_log_index);
+        observe(predecessor.cutover_log_index);
+    }
+    for terminal in &scope.terminal_history {
+        observe(terminal.transition_start_log_index);
+        for index in [
+            terminal.learners_ready_log_index,
+            terminal.joint_membership_log_index,
+            terminal.uniform_membership_log_index,
+            terminal.cutover_log_index,
+            terminal.finalization_log_index,
+            terminal.abort_decision_log_index,
+            terminal.abort_cleanup_log_index,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            observe(index);
+        }
+    }
+    if let Some(pending) = &scope.pending {
+        observe(pending.transition_start_log_index);
+        for index in [
+            pending.learners_ready_log_index,
+            pending.joint_membership_log_index,
+            pending.uniform_membership_log_index,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            observe(index);
+        }
+    }
+    if let Some(terminal) = &scope.terminal {
+        observe(terminal.transition_start_log_index);
+        for index in [
+            terminal.learners_ready_log_index,
+            terminal.joint_membership_log_index,
+            terminal.uniform_membership_log_index,
+            terminal.cutover_log_index,
+            terminal.finalization_log_index,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            observe(index);
+        }
+        if let Some(cleanup) = &terminal.abort_cleanup {
+            observe(cleanup.decision_log_index);
+            if let Some(index) = cleanup.cleanup_log_index {
+                observe(index);
+            }
+        }
+    }
+    progress
+}
+
+fn terminal_membership_is_complete(
+    terminal: &crate::sqlite::consensus::TerminalMembershipTransition,
+) -> bool {
+    match terminal.outcome {
+        TerminalMembershipOutcome::Aborted => terminal
+            .abort_cleanup
+            .as_ref()
+            .is_some_and(|cleanup| cleanup.cleanup_log_index.is_some()),
+        TerminalMembershipOutcome::Promoted => terminal.finalization_log_index.is_some(),
+    }
 }
 
 /// Process-local coordination state retained by every store clone.
@@ -136,7 +362,11 @@ impl fmt::Debug for SessionTopologyCoordinatorState {
                 debug
                     .field("current_identity", &bindings.current_identity)
                     .field("current_member_count", &bindings.current_descriptors.len())
-                    .field("transition_staged", &bindings.staged.is_some());
+                    .field("transition_staged", &bindings.staged.is_some())
+                    .field(
+                        "terminal_transition_blocking",
+                        &bindings.blocking_terminal.is_some(),
+                    );
             }
             Err(_) => {
                 debug.field("state", &"<unavailable>");
@@ -163,6 +393,9 @@ impl SessionTopologyCoordinatorState {
                 current_identity: identity,
                 current_descriptors: descriptors,
                 staged: None,
+                last_scope_progress_index: None,
+                blocking_terminal: None,
+                retained_transitions: BTreeMap::new(),
             }),
             transport: OnceLock::new(),
             supervisor_started: AtomicBool::new(false),
@@ -172,6 +405,95 @@ impl SessionTopologyCoordinatorState {
 
     pub(super) fn operation_gate(&self) -> Arc<tokio::sync::RwLock<()>> {
         Arc::clone(&self.operation_gate)
+    }
+
+    pub(super) fn load_retained_transitions(
+        &self,
+        scope: &MembershipValidationScope,
+    ) -> Result<(), SessionTopologyTransitionError> {
+        let mut retained = BTreeMap::new();
+        for (transition_id, request_digest) in
+            scope
+                .terminal
+                .iter()
+                .filter(|terminal| terminal_membership_is_complete(terminal))
+                .map(|terminal| (terminal.transition_id, terminal.transition_digest))
+                .chain(
+                    scope
+                        .terminal_history
+                        .iter()
+                        .map(|terminal| (terminal.transition_id, terminal.transition_digest)),
+                )
+                .chain(
+                    scope.predecessor.iter().map(|predecessor| {
+                        (predecessor.transition_id, predecessor.transition_digest)
+                    }),
+                )
+                .chain(
+                    scope.history.iter().map(|predecessor| {
+                        (predecessor.transition_id, predecessor.transition_digest)
+                    }),
+                )
+        {
+            let transition_id =
+                crate::membership::SessionTopologyTransitionId::from_bytes(transition_id);
+            let request_digest =
+                crate::membership::SessionTopologyTransitionDigest::from_bytes(request_digest);
+            if retained
+                .insert(transition_id, request_digest)
+                .is_some_and(|existing| existing != request_digest)
+            {
+                return Err(SessionTopologyTransitionError::InvalidEvidenceState);
+            }
+        }
+        // A promoted transition is also the current predecessor lineage.
+        // Until its terminal finalize applies, its exact ID remains resumable
+        // rather than becoming an immutable history tombstone. Its terminal
+        // blocker still rejects every other ID and every conflicting digest.
+        if let Some(terminal) = scope
+            .terminal
+            .as_ref()
+            .filter(|terminal| !terminal_membership_is_complete(terminal))
+        {
+            retained.remove(&crate::membership::SessionTopologyTransitionId::from_bytes(
+                terminal.transition_id,
+            ));
+        }
+        let blocking_terminal = scope.terminal.as_ref().and_then(|terminal| {
+            (!terminal_membership_is_complete(terminal)).then_some((
+                crate::membership::SessionTopologyTransitionId::from_bytes(terminal.transition_id),
+                crate::membership::SessionTopologyTransitionDigest::from_bytes(
+                    terminal.transition_digest,
+                ),
+            ))
+        });
+        let progress_index = membership_scope_progress_index(scope);
+        let mut state = self
+            .bindings
+            .write()
+            .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+        // Terminal creation/completion and terminal-history rotation each
+        // carry their committing log index. A delayed older read must not
+        // clear a newer blocker or retained transition-ID binding. Equal
+        // progress with different derived authority is inconsistent and
+        // therefore fails closed.
+        if let Some(observed) = state.last_scope_progress_index {
+            match progress_index.cmp(&observed) {
+                std::cmp::Ordering::Less => return Ok(()),
+                std::cmp::Ordering::Equal
+                    if state.retained_transitions != retained
+                        || state.blocking_terminal != blocking_terminal =>
+                {
+                    return Err(SessionTopologyTransitionError::InvalidEvidenceState);
+                }
+                std::cmp::Ordering::Equal => return Ok(()),
+                std::cmp::Ordering::Greater => {}
+            }
+        }
+        state.retained_transitions = retained;
+        state.blocking_terminal = blocking_terminal;
+        state.last_scope_progress_index = Some(progress_index);
+        Ok(())
     }
 
     fn bind_transport(
@@ -209,7 +531,7 @@ impl SessionTopologyCoordinatorState {
         &self,
         request: &SessionTopologyTransitionRequest,
         desired_peers: &SessionTopologyTransitionPeers,
-    ) -> Result<(), SessionTopologyTransitionError> {
+    ) -> Result<bool, SessionTopologyTransitionError> {
         let desired_members = request.desired_consensus_node_ids();
         let desired_descriptors =
             descriptors_by_node_id(request.desired_identity(), request.desired_members())
@@ -224,6 +546,25 @@ impl SessionTopologyCoordinatorState {
             .bindings
             .write()
             .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+        if let Some((blocking_id, blocking_digest)) = state.blocking_terminal {
+            if blocking_id != request.transition_id() {
+                return Err(SessionTopologyTransitionError::TransitionInProgress);
+            }
+            if blocking_digest != request.request_digest() {
+                return Err(SessionTopologyTransitionError::IdempotencyConflict);
+            }
+        }
+        if let Some(retained_digest) = state.retained_transitions.get(&request.transition_id()) {
+            if *retained_digest != request.request_digest() {
+                return Err(SessionTopologyTransitionError::IdempotencyConflict);
+            }
+            if state.current_identity == request.desired_identity()
+                && state.current_descriptors == desired_descriptors
+            {
+                return Ok(false);
+            }
+            return Err(SessionTopologyTransitionError::IdempotencyConflict);
+        }
         if state.current_identity == request.desired_identity() {
             if state.current_descriptors != desired_descriptors {
                 return Err(SessionTopologyTransitionError::InvalidTransitionBindings);
@@ -236,7 +577,7 @@ impl SessionTopologyCoordinatorState {
                         && staged.desired_descriptors == desired_descriptors
                         && same_peer_bindings(&staged.desired_peers, desired_peers) =>
                 {
-                    Ok(())
+                    Ok(false)
                 }
                 Some(staged) if staged.transition_id == request.transition_id() => {
                     Err(SessionTopologyTransitionError::IdempotencyConflict)
@@ -253,7 +594,7 @@ impl SessionTopologyCoordinatorState {
                         desired_descriptors,
                         desired_peers: desired_peers.clone(),
                     });
-                    Ok(())
+                    Ok(true)
                 }
             };
         }
@@ -294,7 +635,7 @@ impl SessionTopologyCoordinatorState {
                     && staged.desired_descriptors == desired_descriptors
                     && same_peer_bindings(&staged.desired_peers, desired_peers) =>
             {
-                Ok(())
+                Ok(false)
             }
             Some(staged) if staged.transition_id == request.transition_id() => {
                 Err(SessionTopologyTransitionError::IdempotencyConflict)
@@ -311,7 +652,7 @@ impl SessionTopologyCoordinatorState {
                     desired_descriptors,
                     desired_peers: desired_peers.clone(),
                 });
-                Ok(())
+                Ok(true)
             }
         }
     }
@@ -365,7 +706,7 @@ impl SessionTopologyCoordinatorState {
         Ok(())
     }
 
-    fn abort_bindings(
+    fn drop_staged_bindings(
         &self,
         transition_id: crate::membership::SessionTopologyTransitionId,
         request_digest: crate::membership::SessionTopologyTransitionDigest,
@@ -491,6 +832,47 @@ impl SessionTopologyCoordinatorState {
         Ok(current_member || desired_member)
     }
 
+    fn current_members(
+        &self,
+    ) -> Result<BTreeSet<SessionConsensusNodeId>, SessionTopologyTransitionError> {
+        self.bindings
+            .read()
+            .map(|state| state.current_descriptors.keys().copied().collect())
+            .map_err(|_| SessionTopologyTransitionError::Unavailable)
+    }
+
+    fn has_exact_staged_request(
+        &self,
+        request: &SessionTopologyTransitionRequest,
+    ) -> Result<bool, SessionTopologyTransitionError> {
+        let state = self
+            .bindings
+            .read()
+            .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+        match state.staged.as_ref() {
+            None => Ok(false),
+            Some(staged)
+                if staged.transition_id == request.transition_id()
+                    && staged.request_digest == request.request_digest() =>
+            {
+                Ok(true)
+            }
+            Some(_) => Err(SessionTopologyTransitionError::TransitionInProgress),
+        }
+    }
+
+    fn is_current_expected_epoch(
+        &self,
+        request: &SessionTopologyTransitionRequest,
+    ) -> Result<bool, SessionTopologyTransitionError> {
+        let state = self
+            .bindings
+            .read()
+            .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+        Ok(state.current_identity.cluster_id() == request.cluster_id()
+            && state.current_identity.configuration_epoch() == request.expected_epoch())
+    }
+
     fn staged_peers(
         &self,
         request: &SessionTopologyTransitionRequest,
@@ -589,6 +971,7 @@ enum TransitionControlKind {
     Fence = 3,
     Abort = 4,
     Finalize = 5,
+    AbortCleanup = 6,
 }
 
 fn transition_request_id(
@@ -604,6 +987,16 @@ fn transition_request_id(
     let mut request_id = [0_u8; 16];
     request_id.copy_from_slice(&digest[..16]);
     SessionConsensusRequestId::from_bytes(request_id)
+}
+
+fn transition_engine_attempt_deadline(
+    operation_deadline: tokio::time::Instant,
+) -> tokio::time::Instant {
+    tokio::time::Instant::now()
+        .checked_add(TRANSITION_ENGINE_ATTEMPT_TIMEOUT)
+        .map_or(operation_deadline, |attempt| {
+            attempt.min(operation_deadline)
+        })
 }
 
 fn validate_desired_peer_map(
@@ -651,8 +1044,18 @@ pub(super) struct TopologyAdmissionBarrierRequest {
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum TopologyAdmissionBarrierAction {
     ConfirmStaged,
-    AppliedLearnerMarker { log_index: u64 },
+    AppliedLearnerMarker {
+        log_index: u64,
+    },
     AdmitJointVoting,
+    AppliedAbortDecision {
+        log_index: u64,
+    },
+    CancelProvisionalCandidate,
+    FinalizeAbortedCandidate {
+        abort_decision_log_index: u64,
+        abort_cleanup_log_index: u64,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -747,6 +1150,188 @@ fn map_membership_storage_error(
 }
 
 impl ConsensusSessionStore {
+    /// Open a joining learner that is absent from the current voter topology.
+    ///
+    /// `bootstrap` contains the immutable database anchor, exact predecessor
+    /// descriptor set, transition request, and local successor descriptor. The
+    /// desired peer map contains every desired member except the candidate. A
+    /// candidate installs no predecessor-scope outbound routes; it only accepts
+    /// inbound learner replication until the successor scope is committed.
+    ///
+    /// The returned node is application- and Vote-fenced. Callers install its
+    /// RPC handler, bind the topology transport admission adapter, and leave
+    /// cluster initialization to the existing voters. Only replicated learner
+    /// catch-up followed by committed joint membership can admit voting.
+    pub async fn open_membership_candidate(
+        bootstrap: SessionTopologyCandidateBootstrap,
+        backend: SqliteSessionBackend,
+        snapshot_dir: impl Into<PathBuf>,
+        desired_peers: SessionTopologyTransitionPeers,
+    ) -> Result<Self, ConsensusSessionStoreOpenError> {
+        let SessionTopologyCandidateBootstrap {
+            storage_anchor,
+            current_topology,
+            request,
+            local_candidate,
+        } = bootstrap;
+        let current_identity = current_topology
+            .consensus_identity()
+            .ok_or(ConsensusSessionStoreOpenError::InvalidTopology)?;
+        if !matches!(
+            current_topology.summary().mode(),
+            QuorumTopologyMode::ValidatedHa | QuorumTopologyMode::AttestedHa
+        ) || current_identity.cluster_id() != request.cluster_id()
+            || current_identity.configuration_epoch() != request.expected_epoch()
+            || storage_anchor.0.cluster_id() != request.cluster_id()
+            || current_topology
+                .members()
+                .iter()
+                .any(|member| member.replica_id() == local_candidate.replica_id())
+        {
+            return Err(ConsensusSessionStoreOpenError::InvalidTopology);
+        }
+        let desired_descriptor = request
+            .desired_members()
+            .iter()
+            .find(|member| member.replica_id() == local_candidate.replica_id())
+            .ok_or(ConsensusSessionStoreOpenError::InvalidTopology)?;
+        if desired_descriptor != &local_candidate {
+            return Err(ConsensusSessionStoreOpenError::InvalidTopology);
+        }
+        let desired_topology =
+            ValidatedQuorumTopology::try_from(QuorumTopologyConfig::new_consensus(
+                local_candidate.replica_id().clone(),
+                request.desired_members().to_vec(),
+                request.desired_identity(),
+            ))
+            .map_err(|_| ConsensusSessionStoreOpenError::InvalidTopology)?;
+        let local_node_id = desired_topology
+            .local_consensus_node_id()
+            .ok_or(ConsensusSessionStoreOpenError::InvalidTopology)?;
+        let current_members = current_topology
+            .members()
+            .iter()
+            .map(|descriptor| {
+                current_topology
+                    .consensus_node_id(descriptor.replica_id())
+                    .ok_or(ConsensusSessionStoreOpenError::InvalidTopology)
+            })
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        if current_members.contains(&local_node_id) {
+            return Err(ConsensusSessionStoreOpenError::InvalidTopology);
+        }
+        validate_desired_peer_map(local_node_id, &request, &desired_peers)
+            .map_err(|_| ConsensusSessionStoreOpenError::PeerSetMismatch)?;
+        let cancelled = backend
+            .provisional_consensus_candidate_is_cancelled(
+                storage_anchor.0,
+                local_node_id,
+                request.transition_id().as_bytes(),
+                request.request_digest().as_bytes(),
+            )
+            .await
+            .map_err(|_| ConsensusSessionStoreOpenError::StorageUnavailable)?;
+        if cancelled {
+            // No process-local routes or transport admission have been
+            // published by this fresh handle yet. Refusing construction is
+            // the idempotent restart cleanup boundary and prevents the exact
+            // tombstoned candidate scope from being revived.
+            return Err(ConsensusSessionStoreOpenError::CandidateTransitionCancelled);
+        }
+
+        let topology_coordinator = Arc::new(SessionTopologyCoordinatorState::try_from_topology(
+            &current_topology,
+        )?);
+        let network = SessionRaftNetworkFactory::try_new_candidate(
+            current_identity,
+            local_node_id,
+            current_members.clone(),
+        )?;
+        let peer_directory = network.peer_directory();
+        let current_bindings = topology_node_bindings(&current_topology);
+        let desired_members = request.desired_consensus_node_ids();
+        let desired_bindings = request.desired_node_bindings();
+        let (log_store, state_machine, storage_identity) = storage::open_with_pending_membership(
+            &backend,
+            snapshot_dir,
+            storage_anchor.0,
+            current_identity,
+            current_members.clone(),
+            current_bindings,
+            local_node_id,
+            request.transition_id().as_bytes(),
+            request.request_digest().as_bytes(),
+            request.desired_identity(),
+            &desired_members,
+            &desired_bindings,
+            peer_directory.clone(),
+        )
+        .await?;
+        let (membership_scope, _) = backend
+            .consensus_membership_scope_snapshot(storage_identity)
+            .await
+            .map_err(|_| ConsensusSessionStoreOpenError::StorageUnavailable)?;
+        topology_coordinator
+            .load_retained_transitions(&membership_scope)
+            .map_err(|_| ConsensusSessionStoreOpenError::StorageUnavailable)?;
+        let config = Arc::new(session_raft_config()?);
+        let raft = SessionRaft::new(local_node_id, config, network, log_store, state_machine)
+            .await
+            .map_err(|_| ConsensusSessionStoreOpenError::EngineUnavailable)?;
+        let raft_handler =
+            SessionRaftRpcHandler::new(raft.clone(), peer_directory.clone(), local_node_id);
+        let linearizability = EnsureLinearizableSupervisor::new(raft.clone());
+        let read_barrier = LinearizableReadBarrier::new(
+            local_node_id,
+            linearizability.clone(),
+            raft.metrics(),
+            LinearizableReadLease::Disabled,
+        );
+        let topology_summary = desired_topology.summary().clone();
+        let topology_attestation_time_high_water = topology_summary
+            .attestation_admission()
+            .production_verified_at()
+            .map(TopologyAttestationTime::unix_seconds)
+            .unwrap_or(0);
+        let store = Self {
+            inner: Arc::new(ConsensusSessionStoreInner {
+                raft,
+                raft_handler,
+                backend,
+                storage_identity,
+                local_node_id,
+                peer_directory,
+                topology_coordinator,
+                bootstrap_members: current_members,
+                topology: topology_summary,
+                clock: Arc::new(SystemClock),
+                operation_timeout: DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
+                admitted: AtomicBool::new(false),
+                topology_attestation_time_high_water: AtomicU64::new(
+                    topology_attestation_time_high_water,
+                ),
+                linearizability,
+                read_barrier,
+                proposal_admission: Arc::new(tokio::sync::Semaphore::new(
+                    DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
+                )),
+            }),
+        };
+        store
+            .stage_topology_transition_peers(&request, desired_peers)
+            .map_err(|_| ConsensusSessionStoreOpenError::PeerSetMismatch)?;
+        Ok(store)
+    }
+
+    /// Return this database's immutable candidate-bootstrap anchor.
+    ///
+    /// The value is safe to expose through a consumer-authenticated control
+    /// plane. It grants no authority by itself.
+    #[must_use]
+    pub fn storage_anchor(&self) -> SessionConsensusStorageAnchor {
+        SessionConsensusStorageAnchor(self.inner.storage_identity)
+    }
+
     /// Bind the one local transport-admission adapter used by topology changes.
     ///
     /// Binding is set-once for the process lifetime. Dynamic membership APIs
@@ -774,46 +1359,126 @@ impl ConsensusSessionStore {
     ) -> Result<(), SessionTopologyTransitionError> {
         let desired_members =
             validate_desired_peer_map(self.inner.local_node_id, request, &desired_peers)?;
-        self.inner
+        let inserted_bindings = self
+            .inner
             .topology_coordinator
             .stage_bindings(request, &desired_peers)?;
-
-        let (current_identity, current_members) = self
-            .inner
-            .peer_directory
-            .current_scope()
-            .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
-        if current_identity == request.desired_identity() && current_members == desired_members {
+        let mut peer_routes_staged = false;
+        let result = (|| {
+            let (current_identity, current_members) = self
+                .inner
+                .peer_directory
+                .current_scope()
+                .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+            if current_identity == request.desired_identity() && current_members == desired_members
+            {
+                self.ensure_topology_reconciliation_supervisor()?;
+                self.inner.topology_coordinator.notify_supervisor();
+                return Ok(());
+            }
+            if current_identity.cluster_id() != request.cluster_id()
+                || current_identity.configuration_epoch() != request.expected_epoch()
+            {
+                return Err(SessionTopologyTransitionError::StaleEpoch);
+            }
+            if current_members
+                .intersection(&desired_members)
+                .next()
+                .is_none()
+            {
+                return Err(SessionTopologyTransitionError::InvalidTransitionBindings);
+            }
+            self.inner
+                .peer_directory
+                .stage(
+                    request.transition_id(),
+                    request.request_digest(),
+                    request.expected_epoch(),
+                    request.desired_identity(),
+                    desired_members,
+                    desired_peers,
+                )
+                .map_err(|_| SessionTopologyTransitionError::InvalidTransitionBindings)?;
+            peer_routes_staged = true;
             self.ensure_topology_reconciliation_supervisor()?;
             self.inner.topology_coordinator.notify_supervisor();
-            return Ok(());
+            Ok(())
+        })();
+        if result.is_err() && inserted_bindings {
+            if peer_routes_staged {
+                let _ = self.inner.peer_directory.unstage_before_prepare(
+                    request.transition_id(),
+                    request.request_digest(),
+                    request.expected_epoch(),
+                );
+            }
+            let _ = self
+                .inner
+                .topology_coordinator
+                .drop_staged_bindings(request.transition_id(), request.request_digest());
         }
-        if current_identity.cluster_id() != request.cluster_id()
-            || current_identity.configuration_epoch() != request.expected_epoch()
+        result
+    }
+
+    /// Discard one exact process-local staging operation before durable Prepare.
+    ///
+    /// This operation is cancellation-safe and idempotent. It holds the same
+    /// transition fence as Prepare, proves that no durable pending command for
+    /// this request exists, then removes transport admission, engine routes,
+    /// and descriptor bindings in that order. Once Prepare exists, callers
+    /// must use [`Self::abort_topology_transition`] instead.
+    pub async fn unstage_topology_transition_peers(
+        &self,
+        request: &SessionTopologyTransitionRequest,
+    ) -> Result<(), SessionTopologyTransitionError> {
+        let deadline = transition_deadline(request)?;
+        let operation_gate = self.inner.topology_coordinator.operation_gate();
+        let operation_guard = tokio::time::timeout_at(deadline, operation_gate.write_owned())
+            .await
+            .map_err(|_| SessionTopologyTransitionError::DeadlineExceededResumable)?;
+        let durable = self.read_transition_state_before(request, deadline).await?;
+        if let Some(pending) = durable.scope.pending.as_ref() {
+            if pending.transition_id == request.transition_id().as_bytes() {
+                return Err(SessionTopologyTransitionError::CancellationTooLate);
+            }
+            return Err(SessionTopologyTransitionError::TransitionInProgress);
+        }
+        if durable.evidence.is_some() {
+            return Err(SessionTopologyTransitionError::CancellationTooLate);
+        }
+        if durable.scope.current_identity.cluster_id() != request.cluster_id()
+            || durable.scope.current_identity.configuration_epoch() != request.expected_epoch()
         {
             return Err(SessionTopologyTransitionError::StaleEpoch);
         }
-        if !current_members
-            .intersection(&desired_members)
-            .next()
-            .is_some()
-        {
-            return Err(SessionTopologyTransitionError::InvalidTransitionBindings);
-        }
-        self.inner
-            .peer_directory
-            .stage(
-                request.transition_id(),
-                request.request_digest(),
-                request.expected_epoch(),
-                request.desired_identity(),
-                desired_members,
-                desired_peers,
-            )
-            .map_err(|_| SessionTopologyTransitionError::InvalidTransitionBindings)?;
-        self.ensure_topology_reconciliation_supervisor()?;
-        self.inner.topology_coordinator.notify_supervisor();
-        Ok(())
+
+        let proof = SessionTopologyPrePrepareUnstageProof::from_unprepared_request(request);
+        let transport = self.inner.topology_coordinator.transport()?;
+        let peer_directory = self.inner.peer_directory.clone();
+        let topology_coordinator = Arc::clone(&self.inner.topology_coordinator);
+        let request = request.clone();
+        let supervisor = tokio::spawn(async move {
+            let _operation_guard = operation_guard;
+            transport
+                .unstage_successor_before_prepare(&request, &proof)
+                .await
+                .map_err(map_transport_error)?;
+            peer_directory
+                .unstage_before_prepare(
+                    request.transition_id(),
+                    request.request_digest(),
+                    request.expected_epoch(),
+                )
+                .map_err(|_| SessionTopologyTransitionError::InvalidTransitionBindings)?;
+            topology_coordinator
+                .drop_staged_bindings(request.transition_id(), request.request_digest())?;
+            topology_coordinator.notify_supervisor();
+            Ok::<_, SessionTopologyTransitionError>(())
+        });
+        tokio::time::timeout_at(deadline, supervisor)
+            .await
+            .map_err(|_| SessionTopologyTransitionError::DeadlineExceededResumable)?
+            .map_err(|_| SessionTopologyTransitionError::Unavailable)?
     }
 
     fn ensure_topology_reconciliation_supervisor(
@@ -873,6 +1538,13 @@ impl ConsensusSessionStore {
         request: &SessionTopologyTransitionRequest,
     ) -> Result<(), SessionTopologyTransitionError> {
         let deadline = transition_deadline(request)?;
+        let operation_gate = self.inner.topology_coordinator.operation_gate();
+        let _operation_guard = tokio::time::timeout_at(deadline, operation_gate.write_owned())
+            .await
+            .map_err(|_| SessionTopologyTransitionError::DeadlineExceededResumable)?;
+        // Read only after acquiring the fence. A pre-lock snapshot may become
+        // terminal while waiting behind commit and must never re-fence a node
+        // that the terminal path just admitted.
         let durable = self.read_transition_state_before(request, deadline).await?;
         let Some(status) = status_from_durable(request, &durable)? else {
             return Ok(());
@@ -881,11 +1553,6 @@ impl ConsensusSessionStore {
         // Once Prepare applies, application authority remains closed until an
         // exact uniform successor or durable pre-joint abort is reconciled.
         self.inner.admitted.store(false, Ordering::Release);
-        let operation_gate = self.inner.topology_coordinator.operation_gate();
-        let _operation_guard =
-            tokio::time::timeout_at(deadline, operation_gate.write_owned())
-                .await
-                .map_err(|_| SessionTopologyTransitionError::DeadlineExceededResumable)?;
 
         match status.phase() {
             SessionTopologyTransitionPhase::Prepared
@@ -929,36 +1596,62 @@ impl ConsensusSessionStore {
             SessionTopologyTransitionPhase::Aborted => {
                 self.finish_local_abort_admission(request, &status, deadline)
                     .await?;
-                self.inner.admitted.store(true, Ordering::Release);
                 Ok(())
             }
+            SessionTopologyTransitionPhase::Aborting => Ok(()),
         }
     }
 
     /// Durably prepare one transition and catch every added learner up through
     /// a replicated exact-application marker.
     ///
-    /// Openraft's blocking learner API permits bounded lag, so its return is
-    /// never used as readiness proof. The coordinator commits a learner marker
-    /// and then obtains an exact applied-index admission acknowledgement from
-    /// every desired member before returning the unforgeable proof.
+    /// Openraft learner admission is deliberately nonblocking. The coordinator
+    /// commits a learner marker and then obtains an exact applied-index
+    /// acknowledgement from every added member before returning the
+    /// unforgeable proof.
     pub async fn prepare_topology_transition(
         &self,
         request: &SessionTopologyTransitionRequest,
         desired_peers: SessionTopologyTransitionPeers,
     ) -> Result<SessionTopologyLearnersReadyAdmissionProof, SessionTopologyTransitionError> {
         let deadline = transition_deadline(request)?;
-        self.stage_topology_transition_peers(request, desired_peers)?;
-        self.await_current_staging_barrier(request, deadline).await?;
         let operation_gate = self.inner.topology_coordinator.operation_gate();
         let mut operation_guard = tokio::time::timeout_at(deadline, operation_gate.write_owned())
             .await
             .map_err(|_| SessionTopologyTransitionError::DeadlineExceededResumable)?;
 
         let mut durable = self.read_transition_state_before(request, deadline).await?;
-        if let Some(status) = status_from_durable(request, &durable)? {
+        let initial_status = status_from_durable(request, &durable)?;
+        if nonquiescent_prior_terminal(request, &durable) {
+            return Err(SessionTopologyTransitionError::TransitionInProgress);
+        }
+        if retained_terminal_evidence(request, &durable) {
+            return match initial_status {
+                Some(status) if status.phase() == SessionTopologyTransitionPhase::Completed => {
+                    Ok(SessionTopologyLearnersReadyAdmissionProof::from_caught_up_request(request))
+                }
+                Some(status) if status.phase() == SessionTopologyTransitionPhase::Aborted => {
+                    Err(SessionTopologyTransitionError::IdempotencyConflict)
+                }
+                _ => Err(SessionTopologyTransitionError::InvalidEvidenceState),
+            };
+        }
+        if initial_status.as_ref().is_some_and(|status| {
+            matches!(
+                status.phase(),
+                SessionTopologyTransitionPhase::Aborting | SessionTopologyTransitionPhase::Aborted
+            )
+        }) {
+            return Err(SessionTopologyTransitionError::IdempotencyConflict);
+        }
+        // Staging is process-local and occurs under the transition fence only
+        // after terminal-abort retries have been rejected. This prevents an
+        // exact aborted retry from poisoning later transition admission.
+        self.stage_topology_transition_peers(request, desired_peers)?;
+        if let Some(status) = initial_status {
             match status.phase() {
-                SessionTopologyTransitionPhase::Aborted => {
+                SessionTopologyTransitionPhase::Aborting
+                | SessionTopologyTransitionPhase::Aborted => {
                     return Err(SessionTopologyTransitionError::IdempotencyConflict);
                 }
                 SessionTopologyTransitionPhase::Completed
@@ -971,11 +1664,14 @@ impl ConsensusSessionStore {
                     );
                 }
                 SessionTopologyTransitionPhase::Prepared
-                | SessionTopologyTransitionPhase::LearnersCatchingUp => {}
+                | SessionTopologyTransitionPhase::LearnersCatchingUp
+                | SessionTopologyTransitionPhase::LearnersReady => {}
             }
         } else {
-            self.require_local_transition_leader(request, &durable)
-                .await?;
+            // A still-current leader may safely prepare learners even when it
+            // will not belong to the successor. Retained leadership is only
+            // required before successor authority/joint progression.
+            self.require_local_current_leader(&durable).await?;
             let (returned_guard, _) = self
                 .propose_transition_control(
                     request,
@@ -995,7 +1691,15 @@ impl ConsensusSessionStore {
             durable = self.read_transition_state_before(request, deadline).await?;
         }
 
+        self.await_current_staging_barrier(request, deadline)
+            .await?;
         self.inner.admitted.store(false, Ordering::Release);
+        // A removed incumbent may commit Prepare to the old voter set, but it
+        // cannot authenticate candidate traffic under the desired manifest.
+        // Require a retained desired member before learner replication and
+        // every desired-scoped marker barrier.
+        self.require_local_transition_leader(request, &durable, deadline)
+            .await?;
         let current_members = durable.scope.current_members.clone();
         let desired_members = request.desired_consensus_node_ids();
         for learner in desired_members.difference(&current_members).copied() {
@@ -1033,6 +1737,7 @@ impl ConsensusSessionStore {
             .and_then(|evidence| evidence.learners_ready_log_index)
             .ok_or(SessionTopologyTransitionError::InvalidEvidenceState)?;
         let proof = SessionTopologyLearnersReadyAdmissionProof::from_caught_up_request(request);
+        let _operation_guard_is_held = &operation_guard;
         self.await_desired_transition_barrier(
             request,
             TopologyAdmissionBarrierAction::AppliedLearnerMarker { log_index: marker },
@@ -1061,12 +1766,24 @@ impl ConsensusSessionStore {
         let mut operation_guard = tokio::time::timeout_at(deadline, operation_gate.write_owned())
             .await
             .map_err(|_| SessionTopologyTransitionError::DeadlineExceededResumable)?;
-        self.inner.admitted.store(false, Ordering::Release);
 
         let mut durable = self.read_transition_state_before(request, deadline).await?;
         let mut status = status_from_durable(request, &durable)?
             .ok_or(SessionTopologyTransitionError::InvalidEvidenceState)?;
-        if status.phase() == SessionTopologyTransitionPhase::Aborted {
+        if retained_terminal_evidence(request, &durable) {
+            return match status.phase() {
+                SessionTopologyTransitionPhase::Completed => Ok(status),
+                SessionTopologyTransitionPhase::Aborted => {
+                    Err(SessionTopologyTransitionError::IdempotencyConflict)
+                }
+                _ => Err(SessionTopologyTransitionError::InvalidEvidenceState),
+            };
+        }
+        self.inner.admitted.store(false, Ordering::Release);
+        if matches!(
+            status.phase(),
+            SessionTopologyTransitionPhase::Aborting | SessionTopologyTransitionPhase::Aborted
+        ) {
             return Err(SessionTopologyTransitionError::IdempotencyConflict);
         }
         if status.phase() == SessionTopologyTransitionPhase::Completed {
@@ -1079,6 +1796,7 @@ impl ConsensusSessionStore {
             status.phase(),
             SessionTopologyTransitionPhase::Prepared
                 | SessionTopologyTransitionPhase::LearnersCatchingUp
+                | SessionTopologyTransitionPhase::LearnersReady
                 | SessionTopologyTransitionPhase::AuthorityFenced
         ) {
             let marker = durable
@@ -1112,16 +1830,15 @@ impl ConsensusSessionStore {
             SessionTopologyTransitionPhase::UniformCommitted
                 | SessionTopologyTransitionPhase::Finalizing
         ) {
-            self.inner
-                .topology_coordinator
-                .finalize_staged_successor_transport(request, &status, deadline)
+            self.finish_local_successor_admission(request, &status, deadline)
                 .await?;
-            self.inner.topology_coordinator.finalize_bindings(request)?;
         }
-        self.require_local_transition_leader(request, &durable)
+        self.require_local_transition_leader(request, &durable, deadline)
             .await?;
 
-        if durable.scope.application_authority_identity != request.desired_identity() {
+        if durable.scope.application_authority_epoch != request.desired_epoch()
+            || durable.scope.application_authority_members != request.desired_consensus_node_ids()
+        {
             let (returned_guard, _) = self
                 .propose_transition_control(
                     request,
@@ -1185,8 +1902,7 @@ impl ConsensusSessionStore {
 
         // A leader removed by the new uniform set cannot manufacture terminal
         // success. A retained successor leader retries this exact request.
-        self.require_local_transition_leader(request, &durable)
-            .await?;
+        self.require_local_current_leader(&durable).await?;
         let (returned_guard, _) = self
             .propose_transition_control(
                 request,
@@ -1199,7 +1915,7 @@ impl ConsensusSessionStore {
                 deadline,
             )
             .await?;
-        operation_guard = returned_guard;
+        let _operation_guard = returned_guard;
         durable = self.read_transition_state_before(request, deadline).await?;
         status = status_from_durable(request, &durable)?
             .ok_or(SessionTopologyTransitionError::InvalidEvidenceState)?;
@@ -1223,9 +1939,13 @@ impl ConsensusSessionStore {
 
     /// Explicitly abort a transition only while durable pre-joint rollback is safe.
     ///
-    /// Learners are first removed by a committed Openraft membership operation
-    /// while pending scope remains durable. The old exact uniform membership is
-    /// then re-read from the applied state machine before Abort is proposed.
+    /// Abort is committed while every admitted learner remains reachable. The
+    /// retained successor leader then proves that exact decision on all actual
+    /// learners, tombstones every provisional candidate that was never added,
+    /// and finally commits an exact cleanup proof. When learners exist, that
+    /// proof is their Openraft node-removal entry; otherwise the current-term
+    /// cleanup control itself is sufficient. Public `Aborted` status and
+    /// transport teardown are impossible before that last proof.
     pub async fn abort_topology_transition(
         &self,
         request: &SessionTopologyTransitionRequest,
@@ -1236,9 +1956,20 @@ impl ConsensusSessionStore {
             .await
             .map_err(|_| SessionTopologyTransitionError::DeadlineExceededResumable)?;
         let mut durable = self.read_transition_state_before(request, deadline).await?;
-        let status = status_from_durable(request, &durable)?
+        let mut status = status_from_durable(request, &durable)?
             .ok_or(SessionTopologyTransitionError::InvalidEvidenceState)?;
+        if retained_terminal_evidence(request, &durable) {
+            return match status.phase() {
+                SessionTopologyTransitionPhase::Aborted => Ok(status),
+                SessionTopologyTransitionPhase::Completed => {
+                    Err(SessionTopologyTransitionError::CancellationTooLate)
+                }
+                _ => Err(SessionTopologyTransitionError::InvalidEvidenceState),
+            };
+        }
         if status.phase() == SessionTopologyTransitionPhase::Aborted {
+            self.redispatch_terminal_abort_candidate_cleanup(request, &durable, &status, deadline)
+                .await;
             self.finish_local_abort_admission(request, &status, deadline)
                 .await?;
             return Ok(status);
@@ -1252,32 +1983,108 @@ impl ConsensusSessionStore {
         ) {
             return Err(SessionTopologyTransitionError::CancellationTooLate);
         }
-        self.require_local_transition_leader(request, &durable)
-            .await?;
-        let current_members = durable.scope.current_members.clone();
-        if classify_applied_membership(
-            &durable.applied_membership,
-            &current_members,
-            &request.desired_consensus_node_ids(),
-        ) != AppliedMembershipShape::CurrentUniform
-        {
-            operation_guard = self
-                .change_membership_before(current_members.clone(), operation_guard, deadline)
+
+        if status.phase() != SessionTopologyTransitionPhase::Aborting {
+            let effective_shape = {
+                let metrics = self.inner.raft.metrics();
+                let current = metrics.borrow();
+                classify_applied_membership(
+                    current.membership_config.as_ref(),
+                    &durable.scope.current_members,
+                    &request.desired_consensus_node_ids(),
+                )
+            };
+            if matches!(
+                effective_shape,
+                AppliedMembershipShape::Joint | AppliedMembershipShape::DesiredUniform
+            ) {
+                return Err(SessionTopologyTransitionError::CancellationTooLate);
+            }
+            self.require_local_current_leader(&durable).await?;
+            let (returned_guard, _) = self
+                .propose_transition_control(
+                    request,
+                    TransitionControlKind::Abort,
+                    SessionMutationIntent::AbortTopologyTransition {
+                        transition_id: request.transition_id().as_bytes(),
+                        request_digest: request.request_digest().as_bytes(),
+                    },
+                    operation_guard,
+                    deadline,
+                )
                 .await?;
+            operation_guard = returned_guard;
             durable = self.read_transition_state_before(request, deadline).await?;
+            status = status_from_durable(request, &durable)?
+                .ok_or(SessionTopologyTransitionError::InvalidEvidenceState)?;
         }
-        if classify_applied_membership(
-            &durable.applied_membership,
-            &current_members,
-            &request.desired_consensus_node_ids(),
-        ) != AppliedMembershipShape::CurrentUniform
-        {
-            return Err(SessionTopologyTransitionError::DeadlineExceededResumable);
+        if status.phase() == SessionTopologyTransitionPhase::Aborted {
+            self.redispatch_terminal_abort_candidate_cleanup(request, &durable, &status, deadline)
+                .await;
+            self.finish_local_abort_admission(request, &status, deadline)
+                .await?;
+            return Ok(status);
         }
+        if status.phase() != SessionTopologyTransitionPhase::Aborting {
+            return Err(SessionTopologyTransitionError::InvalidEvidenceState);
+        }
+
+        let cleanup = durable
+            .scope
+            .terminal
+            .as_ref()
+            .filter(|terminal| {
+                terminal.transition_id == request.transition_id().as_bytes()
+                    && terminal.transition_digest == request.request_digest().as_bytes()
+                    && terminal.outcome == TerminalMembershipOutcome::Aborted
+            })
+            .and_then(|terminal| terminal.abort_cleanup.as_ref())
+            .ok_or(SessionTopologyTransitionError::InvalidEvidenceState)?;
+        let decision_log_index = cleanup.decision_log_index;
+        let actual_learners = cleanup.learners.clone();
+        let current_members = durable.scope.current_members.clone();
+        let added_members = request
+            .desired_consensus_node_ids()
+            .difference(&current_members)
+            .copied()
+            .collect::<BTreeSet<_>>();
+        if !actual_learners.is_subset(&added_members) {
+            return Err(SessionTopologyTransitionError::InvalidEvidenceState);
+        }
+        let provisional_candidates = added_members
+            .difference(&actual_learners)
+            .copied()
+            .collect::<BTreeSet<_>>();
+
+        // From this point every candidate-facing action must originate from a
+        // retained member admitted by both exact manifests.
+        self.require_local_transition_leader(request, &durable, deadline)
+            .await?;
+        self.await_exact_member_barrier(
+            request,
+            TopologyAdmissionBarrierAction::AppliedAbortDecision {
+                log_index: decision_log_index,
+            },
+            &actual_learners,
+            deadline,
+        )
+        .await?;
+        self.await_exact_member_barrier(
+            request,
+            TopologyAdmissionBarrierAction::CancelProvisionalCandidate,
+            &provisional_candidates,
+            deadline,
+        )
+        .await?;
+
+        // Commit a deterministic current-term cleanup proof. With no admitted
+        // learners this is terminal by itself; otherwise it first advances
+        // any prior-term abort decision before the exact node-removal entry.
+        // Repeated request IDs are idempotent in the durable state machine.
         let (returned_guard, _) = self
             .propose_transition_control(
                 request,
-                TransitionControlKind::Abort,
+                TransitionControlKind::AbortCleanup,
                 SessionMutationIntent::AbortTopologyTransition {
                     transition_id: request.transition_id().as_bytes(),
                     request_digest: request.request_digest().as_bytes(),
@@ -1288,14 +2095,39 @@ impl ConsensusSessionStore {
             .await?;
         operation_guard = returned_guard;
         durable = self.read_transition_state_before(request, deadline).await?;
-        let status = status_from_durable(request, &durable)?
+        status = status_from_durable(request, &durable)?
             .ok_or(SessionTopologyTransitionError::InvalidEvidenceState)?;
-        if status.phase() != SessionTopologyTransitionPhase::Aborted {
+        if status.phase() == SessionTopologyTransitionPhase::Aborted {
+            self.redispatch_terminal_abort_candidate_cleanup(request, &durable, &status, deadline)
+                .await;
+            self.finish_local_abort_admission(request, &status, deadline)
+                .await?;
+            return Ok(status);
+        }
+
+        // Remove only the learners proven by the durable abort decision.
+        // Replacing the already-current voter set does not remove Openraft
+        // learner nodes and can append a redundant membership entry instead.
+        operation_guard = self
+            .remove_learners_before(actual_learners, operation_guard, deadline)
+            .await?;
+        let _operation_guard = &operation_guard;
+        durable = self.read_transition_state_before(request, deadline).await?;
+        status = status_from_durable(request, &durable)?
+            .ok_or(SessionTopologyTransitionError::InvalidEvidenceState)?;
+        if status.phase() != SessionTopologyTransitionPhase::Aborted
+            || classify_applied_membership(
+                &durable.applied_membership,
+                &current_members,
+                &request.desired_consensus_node_ids(),
+            ) != AppliedMembershipShape::CurrentUniform
+        {
             return Err(SessionTopologyTransitionError::DeadlineExceededResumable);
         }
+        self.redispatch_terminal_abort_candidate_cleanup(request, &durable, &status, deadline)
+            .await;
         self.finish_local_abort_admission(request, &status, deadline)
             .await?;
-        self.inner.admitted.store(true, Ordering::Release);
         Ok(status)
     }
 
@@ -1315,6 +2147,9 @@ impl ConsensusSessionStore {
         .await
         .map_err(|_| SessionTopologyTransitionError::DeadlineExceededResumable)?
         .map_err(map_membership_storage_error)?;
+        self.inner
+            .topology_coordinator
+            .load_retained_transitions(&scope)?;
         Ok(DurableTransitionState {
             scope,
             evidence,
@@ -1326,6 +2161,7 @@ impl ConsensusSessionStore {
         &self,
         request: &SessionTopologyTransitionRequest,
         durable: &DurableTransitionState,
+        deadline: tokio::time::Instant,
     ) -> Result<(), SessionTopologyTransitionError> {
         let leader = self.inner.raft.current_leader().await;
         if leader == Some(self.inner.local_node_id) {
@@ -1356,8 +2192,38 @@ impl ConsensusSessionStore {
                 .elect()
                 .await
                 .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+            loop {
+                let observed = self.inner.raft.current_leader().await;
+                if observed == Some(self.inner.local_node_id) {
+                    return Ok(());
+                }
+                if observed
+                    .is_some_and(|node_id| request.desired_consensus_node_ids().contains(&node_id))
+                {
+                    return Err(SessionTopologyTransitionError::NotLeader);
+                }
+                tokio::time::timeout_at(deadline, tokio::time::sleep(Duration::from_millis(25)))
+                    .await
+                    .map_err(|_| SessionTopologyTransitionError::DeadlineExceededResumable)?;
+            }
         }
         Err(SessionTopologyTransitionError::NotLeader)
+    }
+
+    async fn require_local_current_leader(
+        &self,
+        durable: &DurableTransitionState,
+    ) -> Result<(), SessionTopologyTransitionError> {
+        if self.inner.raft.current_leader().await == Some(self.inner.local_node_id)
+            && durable
+                .scope
+                .current_members
+                .contains(&self.inner.local_node_id)
+        {
+            Ok(())
+        } else {
+            Err(SessionTopologyTransitionError::NotLeader)
+        }
     }
 
     async fn propose_transition_control(
@@ -1380,8 +2246,9 @@ impl ConsensusSessionStore {
         };
         encode_bounded(&command).map_err(|_| SessionTopologyTransitionError::Unavailable)?;
         let raft = self.inner.raft.clone();
-        let supervisor = tokio::spawn(async move {
-            let result = async move {
+        let attempt_deadline = transition_engine_attempt_deadline(deadline);
+        let mut supervisor = tokio::spawn(async move {
+            let result = match tokio::time::timeout_at(attempt_deadline, async move {
                 let receiver = raft
                     .client_write_ff(command)
                     .await
@@ -1403,14 +2270,23 @@ impl ConsensusSessionStore {
                         Err(SessionTopologyTransitionError::Unavailable)
                     }
                 }
-            }
-            .await;
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(SessionTopologyTransitionError::DeadlineExceededResumable),
+            };
             (operation_guard, result)
         });
-        let (operation_guard, result) = tokio::time::timeout_at(deadline, supervisor)
-            .await
-            .map_err(|_| SessionTopologyTransitionError::DeadlineExceededResumable)?
-            .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+        let (operation_guard, result) =
+            match tokio::time::timeout_at(attempt_deadline, &mut supervisor).await {
+                Ok(result) => result.map_err(|_| SessionTopologyTransitionError::Unavailable)?,
+                Err(_) => {
+                    supervisor.abort();
+                    let _ = supervisor.await;
+                    return Err(SessionTopologyTransitionError::DeadlineExceededResumable);
+                }
+            };
         result.map(|index| (operation_guard, index))
     }
 
@@ -1421,15 +2297,33 @@ impl ConsensusSessionStore {
         deadline: tokio::time::Instant,
     ) -> Result<tokio::sync::OwnedRwLockWriteGuard<()>, SessionTopologyTransitionError> {
         let raft = self.inner.raft.clone();
-        let supervisor = tokio::spawn(async move {
-            let result = raft.add_learner(learner, EmptyNode::default(), true).await;
+        let attempt_deadline = transition_engine_attempt_deadline(deadline);
+        let mut supervisor = tokio::spawn(async move {
+            // Nonblocking admission commits the learner entry without letting
+            // an unreachable candidate hold the global proposal fence forever.
+            // Exact catch-up is proven separately by the replicated marker and
+            // per-added-node applied barrier before any voting promotion.
+            let result = match tokio::time::timeout_at(
+                attempt_deadline,
+                raft.add_learner(learner, EmptyNode::default(), false),
+            )
+            .await
+            {
+                Ok(result) => map_membership_change_result(result),
+                Err(_) => Err(SessionTopologyTransitionError::DeadlineExceededResumable),
+            };
             (operation_guard, result)
         });
-        let (operation_guard, result) = tokio::time::timeout_at(deadline, supervisor)
-            .await
-            .map_err(|_| SessionTopologyTransitionError::DeadlineExceededResumable)?
-            .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
-        map_membership_change_result(result)?;
+        let (operation_guard, result) =
+            match tokio::time::timeout_at(attempt_deadline, &mut supervisor).await {
+                Ok(result) => result.map_err(|_| SessionTopologyTransitionError::Unavailable)?,
+                Err(_) => {
+                    supervisor.abort();
+                    let _ = supervisor.await;
+                    return Err(SessionTopologyTransitionError::DeadlineExceededResumable);
+                }
+            };
+        result?;
         Ok(operation_guard)
     }
 
@@ -1440,15 +2334,62 @@ impl ConsensusSessionStore {
         deadline: tokio::time::Instant,
     ) -> Result<tokio::sync::OwnedRwLockWriteGuard<()>, SessionTopologyTransitionError> {
         let raft = self.inner.raft.clone();
-        let supervisor = tokio::spawn(async move {
-            let result = raft.change_membership(members, false).await;
+        let attempt_deadline = transition_engine_attempt_deadline(deadline);
+        let mut supervisor = tokio::spawn(async move {
+            let result = match tokio::time::timeout_at(
+                attempt_deadline,
+                raft.change_membership(members, false),
+            )
+            .await
+            {
+                Ok(result) => map_membership_change_result(result),
+                Err(_) => Err(SessionTopologyTransitionError::DeadlineExceededResumable),
+            };
             (operation_guard, result)
         });
-        let (operation_guard, result) = tokio::time::timeout_at(deadline, supervisor)
+        let (operation_guard, result) =
+            match tokio::time::timeout_at(attempt_deadline, &mut supervisor).await {
+                Ok(result) => result.map_err(|_| SessionTopologyTransitionError::Unavailable)?,
+                Err(_) => {
+                    supervisor.abort();
+                    let _ = supervisor.await;
+                    return Err(SessionTopologyTransitionError::DeadlineExceededResumable);
+                }
+            };
+        result?;
+        Ok(operation_guard)
+    }
+
+    async fn remove_learners_before(
+        &self,
+        learners: BTreeSet<SessionConsensusNodeId>,
+        operation_guard: tokio::sync::OwnedRwLockWriteGuard<()>,
+        deadline: tokio::time::Instant,
+    ) -> Result<tokio::sync::OwnedRwLockWriteGuard<()>, SessionTopologyTransitionError> {
+        let raft = self.inner.raft.clone();
+        let attempt_deadline = transition_engine_attempt_deadline(deadline);
+        let mut supervisor = tokio::spawn(async move {
+            let result = match tokio::time::timeout_at(
+                attempt_deadline,
+                raft.change_membership(ChangeMembers::RemoveNodes(learners), false),
+            )
             .await
-            .map_err(|_| SessionTopologyTransitionError::DeadlineExceededResumable)?
-            .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
-        map_membership_change_result(result)?;
+            {
+                Ok(result) => map_membership_change_result(result),
+                Err(_) => Err(SessionTopologyTransitionError::DeadlineExceededResumable),
+            };
+            (operation_guard, result)
+        });
+        let (operation_guard, result) =
+            match tokio::time::timeout_at(attempt_deadline, &mut supervisor).await {
+                Ok(result) => result.map_err(|_| SessionTopologyTransitionError::Unavailable)?,
+                Err(_) => {
+                    supervisor.abort();
+                    let _ = supervisor.await;
+                    return Err(SessionTopologyTransitionError::DeadlineExceededResumable);
+                }
+            };
+        result?;
         Ok(operation_guard)
     }
 
@@ -1462,6 +2403,18 @@ impl ConsensusSessionStore {
             .peer_directory
             .current_peers()
             .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+        let current_members = self.inner.topology_coordinator.current_members()?;
+        if identity == request.desired_identity()
+            && current_members == request.desired_consensus_node_ids()
+        {
+            return self
+                .apply_local_transition_barrier(
+                    request,
+                    TopologyAdmissionBarrierAction::ConfirmStaged,
+                    deadline,
+                )
+                .await;
+        }
         if identity.cluster_id() != request.cluster_id()
             || identity.configuration_epoch() != request.expected_epoch()
         {
@@ -1474,14 +2427,32 @@ impl ConsensusSessionStore {
             action,
         })
         .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+        let current_quorum = (current_members.len() / 2) + 1;
 
         loop {
-            let mut ready = self
-                .apply_local_transition_barrier(request, action, deadline)
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Err(SessionTopologyTransitionError::DeadlineExceededResumable);
+            }
+            let attempt_deadline = now
+                .checked_add(Duration::from_secs(2))
+                .map_or(deadline, |candidate| candidate.min(deadline));
+            let mut ready_members = BTreeSet::new();
+            match self
+                .apply_local_transition_barrier(request, action, attempt_deadline)
                 .await
-                .is_ok();
+            {
+                Ok(()) => {
+                    ready_members.insert(self.inner.local_node_id);
+                }
+                Err(
+                    SessionTopologyTransitionError::Unavailable
+                    | SessionTopologyTransitionError::DeadlineExceededResumable,
+                ) => {}
+                Err(error) => return Err(error),
+            }
             let mut calls = FuturesUnordered::new();
-            for peer in peers.values().cloned() {
+            for (node_id, peer) in &peers {
                 let wire = SessionConsensusWireRequest::try_new(
                     identity,
                     self.inner.local_node_id,
@@ -1489,26 +2460,51 @@ impl ConsensusSessionStore {
                     payload.clone(),
                 )
                 .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+                let node_id = *node_id;
+                let peer = Arc::clone(peer);
                 calls.push(async move {
-                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-                    tokio::time::timeout_at(deadline, peer.call_with_timeout(wire, remaining)).await
+                    let remaining =
+                        attempt_deadline.saturating_duration_since(tokio::time::Instant::now());
+                    (
+                        node_id,
+                        tokio::time::timeout_at(
+                            attempt_deadline,
+                            peer.call_with_timeout(wire, remaining),
+                        )
+                        .await,
+                    )
                 });
             }
-            while let Some(result) = calls.next().await {
-                let response = result
-                    .map_err(|_| SessionTopologyTransitionError::DeadlineExceededResumable)?
-                    .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+            while let Some((node_id, result)) = calls.next().await {
+                let response = match result {
+                    Err(_)
+                    | Ok(Err(
+                        SessionConsensusPeerError::Unavailable | SessionConsensusPeerError::Timeout,
+                    )) => continue,
+                    Ok(Err(_)) => {
+                        return Err(SessionTopologyTransitionError::InvalidTransitionBindings)
+                    }
+                    Ok(Ok(response)) => response,
+                };
                 response
                     .validate()
-                    .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
-                let response_payload = response
-                    .result
-                    .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+                    .map_err(|_| SessionTopologyTransitionError::InvalidTransitionBindings)?;
+                let response_payload = match response.result {
+                    Err(
+                        SessionConsensusPeerError::Unavailable | SessionConsensusPeerError::Timeout,
+                    ) => continue,
+                    Err(_) => {
+                        return Err(SessionTopologyTransitionError::InvalidTransitionBindings)
+                    }
+                    Ok(payload) => payload,
+                };
                 let reply: TopologyAdmissionBarrierReply = decode_bounded(&response_payload)
-                    .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
-                ready &= reply == TopologyAdmissionBarrierReply::Ready;
+                    .map_err(|_| SessionTopologyTransitionError::InvalidTransitionBindings)?;
+                if reply == TopologyAdmissionBarrierReply::Ready {
+                    ready_members.insert(node_id);
+                }
             }
-            if ready {
+            if ready_members.intersection(&current_members).count() >= current_quorum {
                 return Ok(());
             }
             tokio::time::timeout_at(deadline, tokio::time::sleep(Duration::from_millis(25)))
@@ -1533,6 +2529,13 @@ impl ConsensusSessionStore {
                 .await;
         }
         let peers = self.inner.topology_coordinator.staged_peers(request)?;
+        let current_members = self.inner.topology_coordinator.current_members()?;
+        let desired_members = request.desired_consensus_node_ids();
+        let added_members = desired_members
+            .difference(&current_members)
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let desired_quorum = (desired_members.len() / 2) + 1;
         let payload = encode_bounded(&TopologyAdmissionBarrierRequest {
             transition_id: request.transition_id().as_bytes(),
             request_digest: request.request_digest().as_bytes(),
@@ -1541,12 +2544,29 @@ impl ConsensusSessionStore {
         .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
 
         loop {
-            let mut ready = self
-                .apply_local_transition_barrier(request, action, deadline)
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Err(SessionTopologyTransitionError::DeadlineExceededResumable);
+            }
+            let attempt_deadline = now
+                .checked_add(Duration::from_secs(2))
+                .map_or(deadline, |candidate| candidate.min(deadline));
+            let mut ready_members = BTreeSet::new();
+            match self
+                .apply_local_transition_barrier(request, action, attempt_deadline)
                 .await
-                .is_ok();
+            {
+                Ok(()) => {
+                    ready_members.insert(self.inner.local_node_id);
+                }
+                Err(
+                    SessionTopologyTransitionError::Unavailable
+                    | SessionTopologyTransitionError::DeadlineExceededResumable,
+                ) => {}
+                Err(error) => return Err(error),
+            }
             let mut calls = FuturesUnordered::new();
-            for peer in peers.values().cloned() {
+            for (node_id, peer) in &peers {
                 let wire = SessionConsensusWireRequest::try_new(
                     request.desired_identity(),
                     self.inner.local_node_id,
@@ -1554,32 +2574,257 @@ impl ConsensusSessionStore {
                     payload.clone(),
                 )
                 .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+                let node_id = *node_id;
+                let peer = Arc::clone(peer);
                 calls.push(async move {
-                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-                    tokio::time::timeout_at(deadline, peer.call_with_timeout(wire, remaining)).await
+                    let remaining =
+                        attempt_deadline.saturating_duration_since(tokio::time::Instant::now());
+                    (
+                        node_id,
+                        tokio::time::timeout_at(
+                            attempt_deadline,
+                            peer.call_with_timeout(wire, remaining),
+                        )
+                        .await,
+                    )
                 });
             }
-            while let Some(result) = calls.next().await {
-                let response = result
-                    .map_err(|_| SessionTopologyTransitionError::DeadlineExceededResumable)?
-                    .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+            while let Some((node_id, result)) = calls.next().await {
+                let response = match result {
+                    Err(_)
+                    | Ok(Err(
+                        SessionConsensusPeerError::Unavailable | SessionConsensusPeerError::Timeout,
+                    )) => continue,
+                    Ok(Err(_)) => {
+                        return Err(SessionTopologyTransitionError::InvalidTransitionBindings)
+                    }
+                    Ok(Ok(response)) => response,
+                };
                 response
                     .validate()
-                    .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
-                let response_payload = response
-                    .result
-                    .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+                    .map_err(|_| SessionTopologyTransitionError::InvalidTransitionBindings)?;
+                let response_payload = match response.result {
+                    Err(
+                        SessionConsensusPeerError::Unavailable | SessionConsensusPeerError::Timeout,
+                    ) => continue,
+                    Err(_) => {
+                        return Err(SessionTopologyTransitionError::InvalidTransitionBindings)
+                    }
+                    Ok(payload) => payload,
+                };
                 let reply: TopologyAdmissionBarrierReply = decode_bounded(&response_payload)
-                    .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
-                ready &= reply == TopologyAdmissionBarrierReply::Ready;
+                    .map_err(|_| SessionTopologyTransitionError::InvalidTransitionBindings)?;
+                if reply == TopologyAdmissionBarrierReply::Ready {
+                    ready_members.insert(node_id);
+                }
             }
-            if ready {
+            let desired_ready = ready_members.intersection(&desired_members).count();
+            let additions_ready = !matches!(
+                action,
+                TopologyAdmissionBarrierAction::AppliedLearnerMarker { .. }
+            ) || added_members.is_subset(&ready_members);
+            if additions_ready && desired_ready >= desired_quorum {
                 return Ok(());
             }
             tokio::time::timeout_at(deadline, tokio::time::sleep(Duration::from_millis(25)))
                 .await
                 .map_err(|_| SessionTopologyTransitionError::DeadlineExceededResumable)?;
         }
+    }
+
+    async fn await_exact_member_barrier(
+        &self,
+        request: &SessionTopologyTransitionRequest,
+        action: TopologyAdmissionBarrierAction,
+        required_members: &BTreeSet<SessionConsensusNodeId>,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), SessionTopologyTransitionError> {
+        if required_members.is_empty() {
+            return Ok(());
+        }
+        let desired_members = request.desired_consensus_node_ids();
+        if !required_members.is_subset(&desired_members) {
+            return Err(SessionTopologyTransitionError::InvalidEvidenceState);
+        }
+        let peers = self.inner.topology_coordinator.staged_peers(request)?;
+        let payload = encode_bounded(&TopologyAdmissionBarrierRequest {
+            transition_id: request.transition_id().as_bytes(),
+            request_digest: request.request_digest().as_bytes(),
+            action,
+        })
+        .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+
+        loop {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Err(SessionTopologyTransitionError::DeadlineExceededResumable);
+            }
+            let attempt_deadline = now
+                .checked_add(Duration::from_secs(2))
+                .map_or(deadline, |candidate| candidate.min(deadline));
+            let mut ready_members = BTreeSet::new();
+            if required_members.contains(&self.inner.local_node_id) {
+                match self
+                    .apply_local_transition_barrier(request, action, attempt_deadline)
+                    .await
+                {
+                    Ok(()) => {
+                        ready_members.insert(self.inner.local_node_id);
+                    }
+                    Err(
+                        SessionTopologyTransitionError::Unavailable
+                        | SessionTopologyTransitionError::DeadlineExceededResumable,
+                    ) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            let mut calls = FuturesUnordered::new();
+            for node_id in required_members
+                .iter()
+                .filter(|node_id| **node_id != self.inner.local_node_id)
+            {
+                let peer = peers
+                    .get(node_id)
+                    .ok_or(SessionTopologyTransitionError::InvalidTransitionBindings)?;
+                let wire = SessionConsensusWireRequest::try_new(
+                    request.desired_identity(),
+                    self.inner.local_node_id,
+                    SessionConsensusRpcFamily::TopologyAdmissionBarrier,
+                    payload.clone(),
+                )
+                .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+                let node_id = *node_id;
+                let peer = Arc::clone(peer);
+                calls.push(async move {
+                    let remaining =
+                        attempt_deadline.saturating_duration_since(tokio::time::Instant::now());
+                    (
+                        node_id,
+                        tokio::time::timeout_at(
+                            attempt_deadline,
+                            peer.call_with_timeout(wire, remaining),
+                        )
+                        .await,
+                    )
+                });
+            }
+            while let Some((node_id, result)) = calls.next().await {
+                let response = match result {
+                    Err(_)
+                    | Ok(Err(
+                        SessionConsensusPeerError::Unavailable | SessionConsensusPeerError::Timeout,
+                    )) => continue,
+                    Ok(Err(_)) => {
+                        return Err(SessionTopologyTransitionError::InvalidTransitionBindings)
+                    }
+                    Ok(Ok(response)) => response,
+                };
+                response
+                    .validate()
+                    .map_err(|_| SessionTopologyTransitionError::InvalidTransitionBindings)?;
+                let response_payload = match response.result {
+                    Err(
+                        SessionConsensusPeerError::Unavailable | SessionConsensusPeerError::Timeout,
+                    ) => continue,
+                    Err(_) => {
+                        return Err(SessionTopologyTransitionError::InvalidTransitionBindings)
+                    }
+                    Ok(payload) => payload,
+                };
+                let reply: TopologyAdmissionBarrierReply = decode_bounded(&response_payload)
+                    .map_err(|_| SessionTopologyTransitionError::InvalidTransitionBindings)?;
+                if reply == TopologyAdmissionBarrierReply::Ready {
+                    ready_members.insert(node_id);
+                }
+            }
+            if required_members.is_subset(&ready_members) {
+                return Ok(());
+            }
+            tokio::time::timeout_at(deadline, tokio::time::sleep(Duration::from_millis(25)))
+                .await
+                .map_err(|_| SessionTopologyTransitionError::DeadlineExceededResumable)?;
+        }
+    }
+
+    async fn redispatch_terminal_abort_candidate_cleanup(
+        &self,
+        request: &SessionTopologyTransitionRequest,
+        durable: &DurableTransitionState,
+        status: &SessionTopologyTransitionStatus,
+        deadline: tokio::time::Instant,
+    ) {
+        let Some(cleanup) = durable
+            .scope
+            .terminal
+            .as_ref()
+            .filter(|terminal| terminal.outcome == TerminalMembershipOutcome::Aborted)
+            .and_then(|terminal| terminal.abort_cleanup.as_ref())
+        else {
+            return;
+        };
+        let Some(cleanup_log_index) = status.log_indexes().abort_cleanup() else {
+            return;
+        };
+        let added_members = request
+            .desired_consensus_node_ids()
+            .difference(&durable.scope.current_members)
+            .copied()
+            .collect::<BTreeSet<_>>();
+        self.dispatch_aborted_candidate_cleanup(
+            request,
+            &added_members,
+            cleanup.decision_log_index,
+            cleanup_log_index,
+            deadline,
+        )
+        .await;
+    }
+
+    async fn dispatch_aborted_candidate_cleanup(
+        &self,
+        request: &SessionTopologyTransitionRequest,
+        added_members: &BTreeSet<SessionConsensusNodeId>,
+        abort_decision_log_index: u64,
+        abort_cleanup_log_index: u64,
+        deadline: tokio::time::Instant,
+    ) {
+        if added_members.is_empty() {
+            return;
+        }
+        let Ok(peers) = self.inner.topology_coordinator.staged_peers(request) else {
+            return;
+        };
+        let Ok(payload) = encode_bounded(&TopologyAdmissionBarrierRequest {
+            transition_id: request.transition_id().as_bytes(),
+            request_digest: request.request_digest().as_bytes(),
+            action: TopologyAdmissionBarrierAction::FinalizeAbortedCandidate {
+                abort_decision_log_index,
+                abort_cleanup_log_index,
+            },
+        }) else {
+            return;
+        };
+        let mut calls = FuturesUnordered::new();
+        for node_id in added_members {
+            let Some(peer) = peers.get(node_id) else {
+                continue;
+            };
+            let Ok(wire) = SessionConsensusWireRequest::try_new(
+                request.desired_identity(),
+                self.inner.local_node_id,
+                SessionConsensusRpcFamily::TopologyAdmissionBarrier,
+                payload.clone(),
+            ) else {
+                continue;
+            };
+            let peer = Arc::clone(peer);
+            calls.push(async move {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                let _ = tokio::time::timeout_at(deadline, peer.call_with_timeout(wire, remaining))
+                    .await;
+            });
+        }
+        while calls.next().await.is_some() {}
     }
 
     async fn apply_local_transition_barrier(
@@ -1590,7 +2835,8 @@ impl ConsensusSessionStore {
     ) -> Result<(), SessionTopologyTransitionError> {
         if action == TopologyAdmissionBarrierAction::ConfirmStaged {
             self.inner.topology_coordinator.transport()?;
-            self.inner
+            let _staged_request = self
+                .inner
                 .topology_coordinator
                 .staged_request(request.transition_id(), request.request_digest())?;
             return Ok(());
@@ -1663,6 +2909,111 @@ impl ConsensusSessionStore {
                 self.inner.admitted.store(false, Ordering::Release);
                 Ok(())
             }
+            TopologyAdmissionBarrierAction::AppliedAbortDecision { log_index } => {
+                let observed_decision = durable
+                    .evidence
+                    .as_ref()
+                    .filter(|evidence| evidence.outcome == Some(TerminalMembershipOutcome::Aborted))
+                    .and_then(|evidence| evidence.abort_decision_log_index);
+                if observed_decision != Some(log_index) {
+                    return Err(SessionTopologyTransitionError::Unavailable);
+                }
+                self.inner.admitted.store(false, Ordering::Release);
+                Ok(())
+            }
+            TopologyAdmissionBarrierAction::CancelProvisionalCandidate => {
+                let current_members = self.inner.topology_coordinator.current_members()?;
+                if current_members.contains(&self.inner.local_node_id)
+                    || !request
+                        .desired_consensus_node_ids()
+                        .contains(&self.inner.local_node_id)
+                {
+                    return Err(SessionTopologyTransitionError::InvalidTransitionBindings);
+                }
+                tokio::time::timeout_at(
+                    deadline,
+                    self.inner.backend.cancel_provisional_consensus_candidate(
+                        self.inner.storage_identity,
+                        self.inner.local_node_id,
+                        request.transition_id().as_bytes(),
+                        request.request_digest().as_bytes(),
+                    ),
+                )
+                .await
+                .map_err(|_| SessionTopologyTransitionError::DeadlineExceededResumable)?
+                .map_err(map_membership_storage_error)?;
+                // Retain the exact control-plane route until the leader has
+                // observed every durable cancellation acknowledgement. If a
+                // Ready response is lost, this action remains retryable.
+                self.inner.admitted.store(false, Ordering::Release);
+                Ok(())
+            }
+            TopologyAdmissionBarrierAction::FinalizeAbortedCandidate {
+                abort_decision_log_index,
+                abort_cleanup_log_index,
+            } => {
+                let current_members = self.inner.topology_coordinator.current_members()?;
+                if current_members.contains(&self.inner.local_node_id)
+                    || !request
+                        .desired_consensus_node_ids()
+                        .contains(&self.inner.local_node_id)
+                {
+                    return Err(SessionTopologyTransitionError::InvalidTransitionBindings);
+                }
+                let replicated_abort_applied = durable.evidence.as_ref().is_some_and(|evidence| {
+                    evidence.outcome == Some(TerminalMembershipOutcome::Aborted)
+                        && evidence.abort_decision_log_index == Some(abort_decision_log_index)
+                });
+                let cancelled_provisional = if replicated_abort_applied {
+                    false
+                } else {
+                    tokio::time::timeout_at(
+                        deadline,
+                        self.inner
+                            .backend
+                            .provisional_consensus_candidate_is_cancelled(
+                                self.inner.storage_identity,
+                                self.inner.local_node_id,
+                                request.transition_id().as_bytes(),
+                                request.request_digest().as_bytes(),
+                            ),
+                    )
+                    .await
+                    .map_err(|_| SessionTopologyTransitionError::DeadlineExceededResumable)?
+                    .map_err(map_membership_storage_error)?
+                };
+                if !replicated_abort_applied && !cancelled_provisional {
+                    return Err(SessionTopologyTransitionError::InvalidEvidenceState);
+                }
+                let proof = SessionTopologyCandidateRetirementProof::try_from_remote_cleanup(
+                    request,
+                    abort_decision_log_index,
+                    abort_cleanup_log_index,
+                )?;
+                tokio::time::timeout_at(
+                    deadline,
+                    self.inner
+                        .topology_coordinator
+                        .transport()?
+                        .retire_aborted_candidate(request, &proof),
+                )
+                .await
+                .map_err(|_| SessionTopologyTransitionError::DeadlineExceededResumable)?
+                .map_err(map_transport_error)?;
+                self.inner
+                    .peer_directory
+                    .abort_staged(
+                        request.transition_id(),
+                        request.request_digest(),
+                        request.expected_epoch(),
+                    )
+                    .map_err(|_| SessionTopologyTransitionError::InvalidTransitionBindings)?;
+                self.inner
+                    .topology_coordinator
+                    .drop_staged_bindings(request.transition_id(), request.request_digest())?;
+                self.inner.admitted.store(false, Ordering::Release);
+                Ok(())
+            }
         }
     }
 
@@ -1702,6 +3053,21 @@ impl ConsensusSessionStore {
                     .authorizes_staged_sender(&request, authenticated_sender)
                     .unwrap_or(false),
             ),
+            TopologyAdmissionBarrierAction::AppliedAbortDecision { .. }
+            | TopologyAdmissionBarrierAction::CancelProvisionalCandidate
+            | TopologyAdmissionBarrierAction::FinalizeAbortedCandidate { .. } => {
+                let current_members = match self.inner.topology_coordinator.current_members() {
+                    Ok(members) => members,
+                    Err(_) => return TopologyAdmissionBarrierReply::NotReady,
+                };
+                (
+                    request.desired_identity(),
+                    current_members.contains(&authenticated_sender)
+                        && request
+                            .desired_consensus_node_ids()
+                            .contains(&authenticated_sender),
+                )
+            }
         };
         if identity != expected_identity || !sender_admitted {
             return TopologyAdmissionBarrierReply::NotReady;
@@ -1760,6 +3126,27 @@ impl ConsensusSessionStore {
         status: &SessionTopologyTransitionStatus,
         deadline: tokio::time::Instant,
     ) -> Result<(), SessionTopologyTransitionError> {
+        if !self
+            .inner
+            .topology_coordinator
+            .has_exact_staged_request(request)?
+        {
+            if !self
+                .inner
+                .topology_coordinator
+                .is_current_expected_epoch(request)?
+            {
+                return Err(SessionTopologyTransitionError::InvalidTransitionBindings);
+            }
+            self.inner.admitted.store(
+                self.inner
+                    .topology_coordinator
+                    .current_members()?
+                    .contains(&self.inner.local_node_id),
+                Ordering::Release,
+            );
+            return Ok(());
+        }
         self.inner
             .topology_coordinator
             .abort_staged_successor_transport(request, status, deadline)
@@ -1774,7 +3161,15 @@ impl ConsensusSessionStore {
             .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
         self.inner
             .topology_coordinator
-            .abort_bindings(request.transition_id(), request.request_digest())
+            .drop_staged_bindings(request.transition_id(), request.request_digest())?;
+        self.inner.admitted.store(
+            self.inner
+                .topology_coordinator
+                .current_members()?
+                .contains(&self.inner.local_node_id),
+            Ordering::Release,
+        );
+        Ok(())
     }
 }
 
@@ -1804,21 +3199,35 @@ fn status_from_durable(
         return Ok(None);
     };
     let expected_member_count = match evidence.outcome {
-        Some(TerminalMembershipOutcome::Promoted) => durable
+        Some(_) => durable
             .scope
-            .predecessor
-            .as_ref()
-            .filter(|predecessor| {
-                predecessor.transition_id == request.transition_id().as_bytes()
-                    && predecessor.transition_digest == request.request_digest().as_bytes()
+            .terminal_history
+            .iter()
+            .find(|terminal| {
+                terminal.transition_id == request.transition_id().as_bytes()
+                    && terminal.transition_digest == request.request_digest().as_bytes()
             })
-            .map_or(durable.scope.current_members.len(), |predecessor| {
-                predecessor.members.len()
-            }),
-        Some(TerminalMembershipOutcome::Aborted) | None => durable.scope.current_members.len(),
+            .map(|terminal| terminal.expected_member_count)
+            .or_else(|| {
+                durable
+                    .scope
+                    .predecessor
+                    .iter()
+                    .chain(durable.scope.history.iter())
+                    .find(|predecessor| {
+                        predecessor.transition_id == request.transition_id().as_bytes()
+                            && predecessor.transition_digest == request.request_digest().as_bytes()
+                    })
+                    .map(|predecessor| predecessor.members.len())
+            })
+            .unwrap_or(durable.scope.current_members.len()),
+        None => durable.scope.current_members.len(),
     };
     let phase = match evidence.outcome {
-        Some(TerminalMembershipOutcome::Aborted) => SessionTopologyTransitionPhase::Aborted,
+        Some(TerminalMembershipOutcome::Aborted) if evidence.abort_cleanup_log_index.is_some() => {
+            SessionTopologyTransitionPhase::Aborted
+        }
+        Some(TerminalMembershipOutcome::Aborted) => SessionTopologyTransitionPhase::Aborting,
         Some(TerminalMembershipOutcome::Promoted) if evidence.finalization_log_index.is_some() => {
             SessionTopologyTransitionPhase::Completed
         }
@@ -1829,7 +3238,10 @@ fn status_from_durable(
         None if evidence.joint_membership_log_index.is_some() => {
             SessionTopologyTransitionPhase::JointCommitted
         }
-        None if durable.scope.application_authority_identity == request.desired_identity() => {
+        None if durable.scope.application_authority_epoch == request.desired_epoch()
+            && durable.scope.application_authority_members
+                == request.desired_consensus_node_ids() =>
+        {
             SessionTopologyTransitionPhase::AuthorityFenced
         }
         None if evidence.learners_ready_log_index.is_some()
@@ -1867,11 +3279,23 @@ fn status_from_durable(
     } else {
         request.expected_epoch()
     };
-    let log_indexes = SessionTopologyTransitionLogIndexes::new(
-        evidence.joint_membership_log_index,
-        evidence.uniform_membership_log_index,
-        evidence.finalization_log_index,
-    );
+    let log_indexes = if matches!(
+        phase,
+        SessionTopologyTransitionPhase::Aborting | SessionTopologyTransitionPhase::Aborted
+    ) {
+        SessionTopologyTransitionLogIndexes::aborted(
+            evidence
+                .abort_decision_log_index
+                .ok_or(SessionTopologyTransitionError::InvalidEvidenceState)?,
+            evidence.abort_cleanup_log_index,
+        )
+    } else {
+        SessionTopologyTransitionLogIndexes::new(
+            evidence.joint_membership_log_index,
+            evidence.uniform_membership_log_index,
+            evidence.finalization_log_index,
+        )
+    };
     SessionTopologyTransitionStatus::try_from_request(
         request,
         expected_member_count,
@@ -1882,4 +3306,376 @@ fn status_from_durable(
         log_indexes,
     )
     .map(Some)
+}
+
+fn retained_terminal_evidence(
+    request: &SessionTopologyTransitionRequest,
+    durable: &DurableTransitionState,
+) -> bool {
+    durable.scope.terminal_history.iter().any(|terminal| {
+        terminal.transition_id == request.transition_id().as_bytes()
+            && terminal.transition_digest == request.request_digest().as_bytes()
+    })
+}
+
+fn nonquiescent_prior_terminal(
+    request: &SessionTopologyTransitionRequest,
+    durable: &DurableTransitionState,
+) -> bool {
+    durable.scope.terminal.as_ref().is_some_and(|terminal| {
+        terminal.transition_id != request.transition_id().as_bytes()
+            && match terminal.outcome {
+                TerminalMembershipOutcome::Aborted => terminal
+                    .abort_cleanup
+                    .as_ref()
+                    .is_none_or(|cleanup| cleanup.cleanup_log_index.is_none()),
+                TerminalMembershipOutcome::Promoted => terminal.finalization_log_index.is_none(),
+            }
+    })
+}
+
+#[cfg(test)]
+mod scope_refresh_tests {
+    use super::*;
+    use crate::consensus::{SessionConsensusClusterId, SessionConsensusConfigurationId};
+    use crate::membership::{SessionTopologyTransitionDigest, SessionTopologyTransitionId};
+    use crate::sqlite::consensus::{
+        AbortedMembershipCleanup, MembershipPredecessorScope, PendingMembershipScope,
+        TerminalMembershipTransition,
+    };
+    use crate::topology::{
+        ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain, ReplicaId,
+        ReplicaTlsIdentity,
+    };
+
+    fn identity(epoch: u64, configuration: u8) -> SessionConsensusIdentity {
+        SessionConsensusIdentity::new(
+            SessionConsensusClusterId::new("scope-refresh-tests").expect("cluster ID"),
+            SessionConsensusConfigurationId::from_bytes([configuration; 32]),
+            SessionConsensusConfigurationEpoch::new(epoch).expect("configuration epoch"),
+        )
+    }
+
+    fn coordinator(current_identity: SessionConsensusIdentity) -> SessionTopologyCoordinatorState {
+        SessionTopologyCoordinatorState {
+            operation_gate: Arc::new(tokio::sync::RwLock::new(())),
+            bindings: RwLock::new(TopologyBindingState {
+                current_identity,
+                current_descriptors: BTreeMap::new(),
+                staged: None,
+                last_scope_progress_index: None,
+                blocking_terminal: None,
+                retained_transitions: BTreeMap::new(),
+            }),
+            transport: OnceLock::new(),
+            supervisor_started: AtomicBool::new(false),
+            supervisor_notify: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    fn descriptor(index: usize) -> QuorumReplicaDescriptor {
+        QuorumReplicaDescriptor::new(
+            ReplicaId::new(format!("scope-refresh-{index}")).expect("replica ID"),
+            ReplicaEndpoint::new(format!("scope-refresh-{index}.invalid"), 7443)
+                .expect("replica endpoint"),
+            ReplicaTlsIdentity::new(format!("spiffe://test/scope-refresh/{index}"))
+                .expect("TLS identity"),
+            ReplicaFailureDomain::new(format!("scope-refresh-zone-{index}"))
+                .expect("failure domain"),
+            ReplicaBackingIdentity::new(format!("scope-refresh-disk-{index}"))
+                .expect("backing identity"),
+        )
+    }
+
+    fn transition_fixture() -> (
+        ValidatedQuorumTopology,
+        ValidatedQuorumTopology,
+        SessionTopologyTransitionRequest,
+    ) {
+        let members = (0..5).map(descriptor).collect::<Vec<_>>();
+        let cluster =
+            SessionConsensusClusterId::new("scope-refresh-transitions").expect("cluster ID");
+        let current_epoch = SessionConsensusConfigurationEpoch::new(1).expect("current epoch");
+        let current_configuration = opc_consensus::derive_configuration_id(
+            cluster,
+            current_epoch,
+            &members[..3]
+                .iter()
+                .map(QuorumReplicaDescriptor::configuration_fingerprint)
+                .collect::<Vec<_>>(),
+        );
+        let current_identity =
+            SessionConsensusIdentity::new(cluster, current_configuration, current_epoch);
+        let request = SessionTopologyTransitionRequest::try_new(
+            SessionTopologyTransitionId::from_bytes([0x71; 16]),
+            cluster,
+            current_epoch,
+            SessionConsensusConfigurationEpoch::new(2).expect("desired epoch"),
+            members.clone(),
+            Duration::from_secs(30),
+        )
+        .expect("transition request");
+        let current = ValidatedQuorumTopology::try_from(QuorumTopologyConfig::new_consensus(
+            members[0].replica_id().clone(),
+            members[..3].to_vec(),
+            current_identity,
+        ))
+        .expect("current topology");
+        let desired = ValidatedQuorumTopology::try_from(QuorumTopologyConfig::new_consensus(
+            members[0].replica_id().clone(),
+            members,
+            request.desired_identity(),
+        ))
+        .expect("desired topology");
+        (current, desired, request)
+    }
+
+    fn base_scope(current_identity: SessionConsensusIdentity) -> MembershipValidationScope {
+        MembershipValidationScope {
+            current_identity,
+            current_members: BTreeSet::new(),
+            current_bindings: BTreeMap::new(),
+            application_authority_epoch: current_identity.configuration_epoch(),
+            application_authority_members: BTreeSet::new(),
+            predecessor: None,
+            history: Vec::new(),
+            terminal_history: Vec::new(),
+            pending: None,
+            terminal: None,
+        }
+    }
+
+    fn pending_scope(
+        current_identity: SessionConsensusIdentity,
+        desired_identity: SessionConsensusIdentity,
+        transition_id: [u8; 16],
+        transition_digest: [u8; 32],
+    ) -> MembershipValidationScope {
+        let mut scope = base_scope(current_identity);
+        scope.pending = Some(PendingMembershipScope {
+            transition_id,
+            transition_digest,
+            desired_identity,
+            desired_members: BTreeSet::new(),
+            desired_bindings: BTreeMap::new(),
+            transition_start_log_index: 10,
+            learners_ready_log_index: Some(11),
+            joint_membership_log_index: Some(12),
+            uniform_membership_log_index: None,
+        });
+        scope
+    }
+
+    fn terminal_scope(
+        current_identity: SessionConsensusIdentity,
+        transition_id: [u8; 16],
+        transition_digest: [u8; 32],
+        finalization_log_index: Option<u64>,
+    ) -> MembershipValidationScope {
+        let mut scope = base_scope(current_identity);
+        let predecessor_epoch = current_identity
+            .configuration_epoch()
+            .get()
+            .checked_sub(1)
+            .and_then(|epoch| SessionConsensusConfigurationEpoch::new(epoch).ok())
+            .expect("terminal predecessor epoch");
+        scope.predecessor = Some(MembershipPredecessorScope {
+            transition_id,
+            transition_digest,
+            identity: SessionConsensusIdentity::new(
+                current_identity.cluster_id(),
+                SessionConsensusConfigurationId::from_bytes([0x30; 32]),
+                predecessor_epoch,
+            ),
+            members: BTreeSet::new(),
+            transition_start_log_index: 10,
+            cutover_log_index: 13,
+        });
+        scope.terminal = Some(TerminalMembershipTransition {
+            transition_id,
+            transition_digest,
+            outcome: TerminalMembershipOutcome::Promoted,
+            transition_start_log_index: 10,
+            learners_ready_log_index: Some(11),
+            joint_membership_log_index: Some(12),
+            uniform_membership_log_index: Some(13),
+            cutover_log_index: Some(13),
+            finalization_log_index,
+            abort_cleanup: None,
+        });
+        scope
+    }
+
+    #[test]
+    fn stale_scope_refresh_cannot_reopen_terminal_staging() {
+        let predecessor = identity(1, 0x31);
+        let successor = identity(2, 0x32);
+        let transition_id = [0x41; 16];
+        let transition_digest = [0x42; 32];
+        let transition = SessionTopologyTransitionId::from_bytes(transition_id);
+        let digest = SessionTopologyTransitionDigest::from_bytes(transition_digest);
+        let coordinator = coordinator(predecessor);
+        let stale_pending = pending_scope(predecessor, successor, transition_id, transition_digest);
+        let finalizing = terminal_scope(successor, transition_id, transition_digest, None);
+        let completed = terminal_scope(successor, transition_id, transition_digest, Some(14));
+
+        coordinator
+            .load_retained_transitions(&finalizing)
+            .expect("observe terminal cutover");
+        coordinator
+            .load_retained_transitions(&stale_pending)
+            .expect("ignore delayed pre-terminal observation");
+        {
+            let state = coordinator.bindings.read().expect("coordinator bindings");
+            assert_eq!(Some((transition, digest)), state.blocking_terminal);
+            assert_eq!(None, state.retained_transitions.get(&transition));
+            assert_eq!(Some(13), state.last_scope_progress_index);
+        }
+
+        coordinator
+            .load_retained_transitions(&completed)
+            .expect("observe exact terminal completion");
+        coordinator
+            .load_retained_transitions(&finalizing)
+            .expect("ignore delayed incomplete terminal observation");
+        coordinator
+            .load_retained_transitions(&stale_pending)
+            .expect("ignore delayed pre-terminal observation after completion");
+        let state = coordinator.bindings.read().expect("coordinator bindings");
+        assert_eq!(None, state.blocking_terminal);
+        assert_eq!(Some(&digest), state.retained_transitions.get(&transition));
+        assert_eq!(Some(14), state.last_scope_progress_index);
+    }
+
+    #[test]
+    fn equal_progress_scope_disagreement_fails_closed() {
+        let successor = identity(2, 0x32);
+        let coordinator = coordinator(successor);
+        let first = terminal_scope(successor, [0x51; 16], [0x52; 32], None);
+        let conflicting = terminal_scope(successor, [0x61; 16], [0x62; 32], None);
+
+        coordinator
+            .load_retained_transitions(&first)
+            .expect("observe first terminal");
+        assert_eq!(
+            Err(SessionTopologyTransitionError::InvalidEvidenceState),
+            coordinator.load_retained_transitions(&conflicting)
+        );
+    }
+
+    #[test]
+    fn incomplete_terminal_reopen_reconstructs_exact_staging() {
+        let (current, desired, request) = transition_fixture();
+        let transition_id = request.transition_id().as_bytes();
+        let transition_digest = request.request_digest().as_bytes();
+
+        let aborting = {
+            let mut scope = base_scope(
+                current
+                    .consensus_identity()
+                    .expect("current consensus identity"),
+            );
+            scope.current_members = request
+                .desired_consensus_node_ids()
+                .iter()
+                .copied()
+                .take(3)
+                .collect();
+            scope.terminal = Some(TerminalMembershipTransition {
+                transition_id,
+                transition_digest,
+                outcome: TerminalMembershipOutcome::Aborted,
+                transition_start_log_index: 10,
+                learners_ready_log_index: Some(11),
+                joint_membership_log_index: None,
+                uniform_membership_log_index: None,
+                cutover_log_index: None,
+                finalization_log_index: None,
+                abort_cleanup: Some(AbortedMembershipCleanup {
+                    desired_identity: request.desired_identity(),
+                    desired_members: request.desired_consensus_node_ids(),
+                    desired_bindings: request.desired_node_bindings(),
+                    learners: BTreeSet::new(),
+                    decision_log_index: 12,
+                    cleanup_log_index: None,
+                }),
+            });
+            scope
+        };
+        let reopened_abort = SessionTopologyCoordinatorState::try_from_topology(&current)
+            .expect("reopen current topology");
+        reopened_abort
+            .load_retained_transitions(&aborting)
+            .expect("load incomplete abort");
+        assert_eq!(
+            Ok(true),
+            reopened_abort.stage_bindings(&request, &BTreeMap::new()),
+            "exact abort retry must reconstruct process-local staging"
+        );
+
+        let finalizing = terminal_scope(
+            request.desired_identity(),
+            transition_id,
+            transition_digest,
+            None,
+        );
+        let reopened_finalize = SessionTopologyCoordinatorState::try_from_topology(&desired)
+            .expect("reopen desired topology");
+        reopened_finalize
+            .load_retained_transitions(&finalizing)
+            .expect("load incomplete finalization");
+        assert_eq!(
+            Ok(true),
+            reopened_finalize.stage_bindings(&request, &BTreeMap::new()),
+            "exact finalization retry must reconstruct process-local staging"
+        );
+    }
+
+    #[test]
+    fn local_unstage_does_not_create_durable_retention_or_grow_state() {
+        let (current, _, request) = transition_fixture();
+        let coordinator = SessionTopologyCoordinatorState::try_from_topology(&current)
+            .expect("current coordinator");
+        let scope = base_scope(
+            current
+                .consensus_identity()
+                .expect("current consensus identity"),
+        );
+        coordinator
+            .load_retained_transitions(&scope)
+            .expect("load initial scope");
+        assert_eq!(
+            Ok(true),
+            coordinator.stage_bindings(&request, &BTreeMap::new())
+        );
+        coordinator
+            .drop_staged_bindings(request.transition_id(), request.request_digest())
+            .expect("drop failed local stage");
+        coordinator
+            .load_retained_transitions(&scope)
+            .expect("same durable scope remains authoritative");
+        assert_eq!(
+            Ok(true),
+            coordinator.stage_bindings(&request, &BTreeMap::new()),
+            "exact retry after local unstage must remain admissible"
+        );
+        coordinator
+            .drop_staged_bindings(request.transition_id(), request.request_digest())
+            .expect("drop exact retry");
+
+        for seed in 0_u16..5_000 {
+            let mut transition_id = [0_u8; 16];
+            transition_id[..2].copy_from_slice(&seed.to_be_bytes());
+            coordinator
+                .drop_staged_bindings(
+                    SessionTopologyTransitionId::from_bytes(transition_id),
+                    SessionTopologyTransitionDigest::from_bytes([0x91; 32]),
+                )
+                .expect("idempotent local drop");
+        }
+        let state = coordinator.bindings.read().expect("coordinator bindings");
+        assert!(state.staged.is_none());
+        assert!(state.retained_transitions.is_empty());
+        assert_eq!(Some(0), state.last_scope_progress_index);
+    }
 }

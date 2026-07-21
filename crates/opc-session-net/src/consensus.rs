@@ -4649,7 +4649,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_server_stages_catchup_then_fences_cached_old_connection_on_finalize() {
+    async fn live_server_fences_cached_predecessor_application_calls_at_joint_proof() {
         let current = membership_manifest(1, &[1, 2, 3]);
         let successor = membership_manifest(2, &[1, 2, 3, 4, 5]);
         let current_client_binding = current
@@ -4768,6 +4768,37 @@ mod tests {
                 result: Err(SessionConsensusPeerError::ScopeMismatch),
             })
         );
+        for family in [
+            SessionConsensusRpcFamily::ForwardMutation,
+            SessionConsensusRpcFamily::ReadBarrier,
+        ] {
+            assert_eq!(
+                current_peer
+                    .call(wire_request(
+                        &current_client_binding,
+                        family,
+                        b"joint-fenced-application-authority",
+                    ))
+                    .await,
+                Ok(SessionConsensusWireResponse {
+                    result: Err(SessionConsensusPeerError::ScopeMismatch),
+                }),
+                "the cached predecessor connection must lose application authority at joint proof"
+            );
+        }
+        assert_eq!(
+            current_peer
+                .call(wire_request(
+                    &current_client_binding,
+                    SessionConsensusRpcFamily::AppendEntries,
+                    b"joint-engine-traffic",
+                ))
+                .await,
+            Ok(SessionConsensusWireResponse {
+                result: Ok(b"joint-engine-traffic".to_vec()),
+            }),
+            "joint membership must keep predecessor engine traffic admitted"
+        );
 
         membership
             .finalize_successor_for_test(&request)
@@ -4798,7 +4829,7 @@ mod tests {
                 result: Ok(b"successor-authority".to_vec()),
             })
         );
-        assert_eq!(handler.0.load(Ordering::Relaxed), 4);
+        assert_eq!(handler.0.load(Ordering::Relaxed), 5);
         handle.abort_and_wait().await;
     }
 

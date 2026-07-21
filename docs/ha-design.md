@@ -203,11 +203,10 @@ attestor supplies that provenance; the CNF chooses and configures the
 Kubernetes/cloud/CSI/TPM/SPIFFE adapter and must still map each logical voter
 to exactly one durable backing volume.
 
-The exact consensus contract is transport/wire-schema revision 2 and error-set
-revision 4. It carries only the bounded payload-free expiry-authority
-preflight plus the existing Openraft RPC families; error revision 4 adds
-`RecordExpiryPreflightLimitExceeded`. Older exact profiles fail before engine
-dispatch and require a drained full-membership upgrade.
+The exact consensus contract is transport/wire-schema revision 3 and error-set
+revision 5. Revision 3 adds the bounded topology-admission barrier family;
+error revision 5 adds `TopologyAuthorityRevoked`. Older exact profiles fail
+before engine dispatch and require a drained full-membership upgrade.
 
 ### Structural identity and legacy persistence admission
 
@@ -341,9 +340,9 @@ application/backend mutation or provider work: clients reject before
 resolution/dialing, while servers reject after request receipt but before
 backend dispatch and may return the typed response. The new public error
 variants require external exhaustive matches. Protocol v4 introduced their
-private fixed-width DTOs in error revision 1; current v5 error revision 8
-retains those encodings and adds the bounded expiry-preflight outcome. It
-rejects error-revision-7 or older peers during the exact
+private fixed-width DTOs in error revision 1; current v5 error revision 9
+retains those encodings and adds bounded expiry-preflight and
+topology-authority outcomes. It rejects error-revision-8 or older peers during the exact
 handshake. Operators must audit legacy
 persisted logs before upgrade because a TTL-bearing entry
 above the bound now fails closed during replay/rebuild rather than being
@@ -498,7 +497,7 @@ response budget, a confidential authenticated strictly bounded restore cursor, a
 `complete` are omitted and recomputed after decode. Independent work limits
 admit 256 batch operations, 1,024 restore records, 65,536 log entries, and
 65,536 rebuild entries; the configured frame bound remains separate. The exact
-profile pins wire-schema revision 6, error-set revision 8, a 4 MiB restore
+profile pins wire-schema revision 6, error-set revision 9, a 4 MiB restore
 payload bound, `max_restore_scan_examined_rows = 4096`, 128-byte
 owner/custom-key/state-type bounds, the
 31,536,000-second TTL maximum, and

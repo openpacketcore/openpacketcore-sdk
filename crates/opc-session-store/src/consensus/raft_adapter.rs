@@ -16,7 +16,7 @@ use opc_consensus::engine::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
     VoteRequest, VoteResponse,
 };
-use opc_consensus::engine::{EmptyNode, StoredMembership, Vote};
+use opc_consensus::engine::{EmptyNode, Membership, StoredMembership, Vote};
 use opc_consensus::{decode_bounded, encode_bounded, ConsensusCodecError};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -33,6 +33,10 @@ use crate::topology::QUORUM_TOPOLOGY_MAX_MEMBERS;
 
 type EngineRpcError<E = opc_consensus::engine::error::Infallible> =
     RPCError<SessionConsensusNodeId, EmptyNode, RaftError<SessionConsensusNodeId, E>>;
+type SessionCurrentPeerSnapshot = (
+    SessionConsensusIdentity,
+    BTreeMap<SessionConsensusNodeId, Arc<dyn SessionConsensusPeer>>,
+);
 
 /// Fail-closed construction error for the private Openraft network factory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -80,8 +84,8 @@ struct SessionRaftStagedPeers {
     desired_identity: SessionConsensusIdentity,
     desired_members: BTreeSet<SessionConsensusNodeId>,
     routes: BTreeMap<SessionConsensusNodeId, SessionRaftPeerRoute>,
-    /// Vote traffic is forbidden until the replicated learner-ready marker is
-    /// applied and every added learner proves application through that marker.
+    /// Vote traffic is forbidden until the exact joint membership is durably
+    /// applied and the store issues its bound joint-commit proof.
     voting_admitted: bool,
 }
 
@@ -106,6 +110,8 @@ struct SessionRaftPeerDirectoryState {
     active: BTreeMap<SessionConsensusNodeId, SessionRaftPeerRoute>,
     staged: Option<SessionRaftStagedPeers>,
     terminal: Option<SessionRaftPeerTransitionTerminal>,
+    last_applied_membership: Option<StoredMembership<SessionConsensusNodeId, EmptyNode>>,
+    engine_admission_suspended: bool,
 }
 
 /// Bounded peer routing shared by all Openraft clients created for one node.
@@ -119,6 +125,7 @@ struct SessionRaftPeerDirectoryState {
 pub(crate) struct SessionRaftPeerDirectory {
     local_node_id: SessionConsensusNodeId,
     state: Arc<RwLock<SessionRaftPeerDirectoryState>>,
+    membership_apply_fence: Arc<tokio::sync::RwLock<()>>,
 }
 
 impl SessionRaftPeerDirectory {
@@ -143,7 +150,34 @@ impl SessionRaftPeerDirectory {
                 active,
                 staged: None,
                 terminal: None,
+                last_applied_membership: None,
+                engine_admission_suspended: false,
             })),
+            membership_apply_fence: Arc::new(tokio::sync::RwLock::new(())),
+        })
+    }
+
+    fn try_new_candidate(
+        identity: SessionConsensusIdentity,
+        local_node_id: SessionConsensusNodeId,
+        current_members: BTreeSet<SessionConsensusNodeId>,
+    ) -> Result<Self, SessionRaftAdapterError> {
+        if current_members.contains(&local_node_id) {
+            return Err(SessionRaftAdapterError::InvalidPeerTransitionScope);
+        }
+        validate_peer_count(current_members.len())?;
+        Ok(Self {
+            local_node_id,
+            state: Arc::new(RwLock::new(SessionRaftPeerDirectoryState {
+                current_identity: identity,
+                current_members,
+                active: BTreeMap::new(),
+                staged: None,
+                terminal: None,
+                last_applied_membership: None,
+                engine_admission_suspended: false,
+            })),
+            membership_apply_fence: Arc::new(tokio::sync::RwLock::new(())),
         })
     }
 
@@ -175,6 +209,9 @@ impl SessionRaftPeerDirectory {
             .write()
             .map_err(|_| SessionRaftAdapterError::PeerDirectoryUnavailable)?;
         validate_peer_transition_scope(state.current_identity, expected_epoch, desired_identity)?;
+        if state.current_members == desired_members {
+            return Err(SessionRaftAdapterError::InvalidPeerTransitionScope);
+        }
 
         if let Some(terminal) = state.terminal.as_ref() {
             if transition_matches(
@@ -226,15 +263,52 @@ impl SessionRaftPeerDirectory {
                 });
             }
         }
+        promote_applied_uniform_membership(&mut state);
         Ok(())
     }
 
-    /// Admit staged successor Vote RPCs after durable learner catch-up proof.
+    /// Remove exact process-local routes before a durable Prepare exists.
+    ///
+    /// This is deliberately distinct from `abort_staged`: it records no
+    /// terminal outcome and refuses to remove routes after successor voting
+    /// admission. The store coordinator supplies the durable-absence proof.
+    pub(crate) fn unstage_before_prepare(
+        &self,
+        transition_id: SessionTopologyTransitionId,
+        request_digest: SessionTopologyTransitionDigest,
+        expected_epoch: opc_consensus::ConsensusConfigurationEpoch,
+    ) -> Result<(), SessionRaftAdapterError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| SessionRaftAdapterError::PeerDirectoryUnavailable)?;
+        if state.terminal.as_ref().is_some_and(|terminal| {
+            terminal.transition_id == transition_id
+                && terminal.request_digest == request_digest
+                && terminal.expected_epoch == expected_epoch
+        }) {
+            return Err(SessionRaftAdapterError::PeerTransitionConflict);
+        }
+        let Some(staged) = state.staged.take() else {
+            return Ok(());
+        };
+        if staged.transition_id != transition_id
+            || staged.request_digest != request_digest
+            || staged.expected_epoch != expected_epoch
+            || staged.voting_admitted
+        {
+            state.staged = Some(staged);
+            return Err(SessionRaftAdapterError::PeerTransitionConflict);
+        }
+        Ok(())
+    }
+
+    /// Admit staged successor Vote RPCs after exact durable joint membership.
     ///
     /// Staging alone deliberately permits only log replication and snapshot
     /// installation. The membership coordinator calls this method only after
-    /// the replicated learner-ready marker and exact applied-index barriers
-    /// have completed for every added learner.
+    /// consuming a store-issued proof bound to the exact applied joint
+    /// membership.
     pub(crate) fn admit_staged_voting(
         &self,
         transition_id: SessionTopologyTransitionId,
@@ -359,19 +433,7 @@ impl SessionRaftPeerDirectory {
             state.staged = Some(staged);
             return Err(SessionRaftAdapterError::PeerTransitionConflict);
         }
-        let desired_identity = staged.desired_identity;
-        let desired = staged.routes;
-        state.current_identity = staged.desired_identity;
-        state.current_members = staged.desired_members.clone();
-        state.active = desired;
-        state.terminal = Some(SessionRaftPeerTransitionTerminal {
-            transition_id,
-            request_digest,
-            expected_epoch,
-            desired_identity,
-            desired_members: desired_members.clone(),
-            kind: SessionRaftPeerTransitionTerminalKind::Finalized,
-        });
+        publish_staged_successor(&mut state, staged);
         Ok(())
     }
 
@@ -391,6 +453,9 @@ impl SessionRaftPeerDirectory {
             .state
             .read()
             .map_err(|_| SessionRaftAdapterError::PeerDirectoryUnavailable)?;
+        if state.engine_admission_suspended {
+            return Ok(None);
+        }
         let active = state.active.get(&target);
         let staged = state
             .staged
@@ -400,7 +465,10 @@ impl SessionRaftPeerDirectory {
         let route = if state.current_members.contains(&self.local_node_id) {
             active.or(staged)
         } else {
-            staged.or(active)
+            // A joining candidate may use staged successor routes before it
+            // becomes a voter. Once uniform promotion removes the local node,
+            // `staged` is consumed and no active route remains authoritative.
+            staged
         };
         Ok(route
             .filter(|route| route.peer.node_id() == target)
@@ -414,16 +482,17 @@ impl SessionRaftPeerDirectory {
         family: SessionConsensusRpcFamily,
     ) -> bool {
         self.state.read().is_ok_and(|state| {
-            state
-                .active
-                .get(&sender)
-                .is_some_and(|route| route.identity == identity && route.peer.node_id() == sender)
-                || state.staged.as_ref().is_some_and(|staged| {
-                    (family != SessionConsensusRpcFamily::Vote || staged.voting_admitted)
-                        && staged.routes.get(&sender).is_some_and(|route| {
-                            route.identity == identity && route.peer.node_id() == sender
-                        })
-                })
+            !state.engine_admission_suspended
+                && ((state.current_members.contains(&self.local_node_id)
+                    && state.active.get(&sender).is_some_and(|route| {
+                        route.identity == identity && route.peer.node_id() == sender
+                    }))
+                    || state.staged.as_ref().is_some_and(|staged| {
+                        (family != SessionConsensusRpcFamily::Vote || staged.voting_admitted)
+                            && staged.routes.get(&sender).is_some_and(|route| {
+                                route.identity == identity && route.peer.node_id() == sender
+                            })
+                    }))
         })
     }
 
@@ -443,13 +512,7 @@ impl SessionRaftPeerDirectory {
     /// voters staged the same transition and can later fence their transport.
     pub(crate) fn current_peers(
         &self,
-    ) -> Result<
-        (
-            SessionConsensusIdentity,
-            BTreeMap<SessionConsensusNodeId, Arc<dyn SessionConsensusPeer>>,
-        ),
-        SessionRaftAdapterError,
-    > {
+    ) -> Result<SessionCurrentPeerSnapshot, SessionRaftAdapterError> {
         let state = self
             .state
             .read()
@@ -497,51 +560,61 @@ impl SessionRaftPeerDirectory {
         Ok((route.identity, Arc::clone(&route.peer)))
     }
 
-    /// Publish a staged successor only after Openraft reports its exact
-    /// uniform voter set. This is safe to call before and after every engine
-    /// RPC and makes follower-side route retirement follow the durable
-    /// membership commit rather than a process-local coordinator callback.
-    pub(crate) fn reconcile_committed_membership(
+    /// Reconcile engine routing with the membership applied by the local
+    /// Openraft state machine.
+    ///
+    /// Exact desired-uniform application atomically publishes staged routes
+    /// and retires predecessor routes. The state-machine adapter invokes this
+    /// before reporting application complete, so a delayed process-level
+    /// transport-finalization callback cannot leave cached predecessor engine
+    /// RPCs admitted. Remembering the last applied membership also closes the
+    /// startup ordering where Openraft restores state before durable staged
+    /// routes are reconstructed.
+    pub(crate) fn observe_applied_membership(
         &self,
         membership: &StoredMembership<SessionConsensusNodeId, EmptyNode>,
     ) -> Result<(), SessionRaftAdapterError> {
-        let staged = {
-            let state = self
-                .state
-                .read()
-                .map_err(|_| SessionRaftAdapterError::PeerDirectoryUnavailable)?;
-            state.staged.as_ref().map(|staged| {
-                (
-                    staged.transition_id,
-                    staged.request_digest,
-                    staged.expected_epoch,
-                    staged.desired_members.clone(),
-                )
-            })
-        };
-        let Some((transition_id, request_digest, expected_epoch, desired_members)) = staged else {
-            return Ok(());
-        };
-        let configured = membership.membership().get_joint_config();
-        let nodes = membership
-            .membership()
-            .nodes()
-            .map(|(node_id, _)| *node_id)
-            .collect::<BTreeSet<_>>();
-        if membership.log_id().is_some()
-            && configured.len() == 1
-            && configured.first() == Some(&desired_members)
-            && membership.membership().learner_ids().next().is_none()
-            && nodes == desired_members
-        {
-            self.finalize(
-                transition_id,
-                request_digest,
-                expected_epoch,
-                &desired_members,
-            )?;
-        }
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| SessionRaftAdapterError::PeerDirectoryUnavailable)?;
+        state.last_applied_membership = Some(membership.clone());
+        state.engine_admission_suspended = membership.log_id().is_some()
+            && is_uniform_membership_different_from(
+                membership.membership(),
+                &state.current_members,
+            );
+        promote_applied_uniform_membership(&mut state);
         Ok(())
+    }
+
+    /// Serialize one durable membership apply against per-RPC engine
+    /// authorization and cached outbound route resolution.
+    ///
+    /// The state-machine adapter acquires this guard before locking SQLite and
+    /// beginning the synchronous apply transaction. That lock order lets the
+    /// writer drain engine RPCs that may still be waiting on SQLite without
+    /// deadlocking the apply path. It promotes exact desired-uniform routes
+    /// before releasing the guard, so every engine RPC is ordered either before
+    /// the durable cutover or after predecessor revocation.
+    pub(crate) async fn begin_membership_apply(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+        Arc::clone(&self.membership_apply_fence).write_owned().await
+    }
+
+    async fn begin_engine_rpc(&self) -> tokio::sync::OwnedRwLockReadGuard<()> {
+        Arc::clone(&self.membership_apply_fence).read_owned().await
+    }
+
+    pub(crate) fn requires_uniform_membership_fence(
+        &self,
+        membership: &Membership<SessionConsensusNodeId, EmptyNode>,
+    ) -> bool {
+        self.state.read().is_ok_and(|state| {
+            is_uniform_membership_different_from(membership, &state.current_members)
+                || state.staged.as_ref().is_some_and(|staged| {
+                    is_exact_uniform_membership(membership, &staged.desired_members)
+                })
+        })
     }
 
     fn summary(&self) -> Option<(SessionConsensusIdentity, usize, usize)> {
@@ -556,6 +629,70 @@ impl SessionRaftPeerDirectory {
             )
         })
     }
+}
+
+fn promote_applied_uniform_membership(state: &mut SessionRaftPeerDirectoryState) {
+    let Some(staged) = state.staged.as_ref() else {
+        return;
+    };
+    let Some(membership) = state.last_applied_membership.as_ref() else {
+        return;
+    };
+    let is_exact_uniform = membership.log_id().is_some()
+        && is_exact_uniform_membership(membership.membership(), &staged.desired_members);
+    if !is_exact_uniform {
+        return;
+    }
+
+    if let Some(staged) = state.staged.take() {
+        publish_staged_successor(state, staged);
+    }
+}
+
+fn is_exact_uniform_membership(
+    membership: &Membership<SessionConsensusNodeId, EmptyNode>,
+    desired_members: &BTreeSet<SessionConsensusNodeId>,
+) -> bool {
+    let configured = membership.get_joint_config();
+    let nodes = membership
+        .nodes()
+        .map(|(node_id, _)| *node_id)
+        .collect::<BTreeSet<_>>();
+    configured.len() == 1
+        && configured.first() == Some(desired_members)
+        && membership.learner_ids().next().is_none()
+        && nodes == *desired_members
+}
+
+fn is_uniform_membership_different_from(
+    membership: &Membership<SessionConsensusNodeId, EmptyNode>,
+    current_members: &BTreeSet<SessionConsensusNodeId>,
+) -> bool {
+    let configured = membership.get_joint_config();
+    configured.len() == 1
+        && membership.learner_ids().next().is_none()
+        && configured
+            .first()
+            .is_some_and(|voters| voters != current_members)
+}
+
+fn publish_staged_successor(
+    state: &mut SessionRaftPeerDirectoryState,
+    staged: SessionRaftStagedPeers,
+) {
+    let terminal = SessionRaftPeerTransitionTerminal {
+        transition_id: staged.transition_id,
+        request_digest: staged.request_digest,
+        expected_epoch: staged.expected_epoch,
+        desired_identity: staged.desired_identity,
+        desired_members: staged.desired_members.clone(),
+        kind: SessionRaftPeerTransitionTerminalKind::Finalized,
+    };
+    state.current_identity = staged.desired_identity;
+    state.current_members = staged.desired_members;
+    state.active = staged.routes;
+    state.terminal = Some(terminal);
+    state.engine_admission_suspended = false;
 }
 
 impl fmt::Debug for SessionRaftPeerDirectory {
@@ -690,6 +827,23 @@ impl SessionRaftNetworkFactory {
         })
     }
 
+    /// Bind a joining learner to predecessor metadata without granting it any
+    /// predecessor-scope outbound route.
+    pub(crate) fn try_new_candidate(
+        current_identity: SessionConsensusIdentity,
+        local_node_id: SessionConsensusNodeId,
+        current_members: BTreeSet<SessionConsensusNodeId>,
+    ) -> Result<Self, SessionRaftAdapterError> {
+        Ok(Self {
+            local_node_id,
+            peer_directory: SessionRaftPeerDirectory::try_new_candidate(
+                current_identity,
+                local_node_id,
+                current_members,
+            )?,
+        })
+    }
+
     /// Shared dynamic directory used by the membership transition driver.
     pub(crate) fn peer_directory(&self) -> SessionRaftPeerDirectory {
         self.peer_directory.clone()
@@ -758,6 +912,10 @@ impl SessionRaftNetwork {
         Resp: DeserializeOwned,
         E: std::error::Error + DeserializeOwned,
     {
+        // Keep the route-generation permit for the complete peer call. A
+        // uniform apply waits for all predecessor-scoped calls already in
+        // flight before publishing successor routes.
+        let _engine_rpc = self.peer_directory.begin_engine_rpc().await;
         let route = self
             .peer_directory
             .resolve_engine_for(self.target, family)
@@ -921,7 +1079,6 @@ impl SessionRaftRpcHandler {
             local_node_id,
         }
     }
-
 }
 
 impl fmt::Debug for SessionRaftRpcHandler {
@@ -943,6 +1100,12 @@ impl SessionConsensusRpcHandler for SessionRaftRpcHandler {
         if let Err(error) = validate_envelope(authenticated_sender, &request) {
             return rejected_response(error);
         }
+        // Vote and AppendEntries keep this permit through the Openraft
+        // response. The pinned engine emits an AppendEntries response before
+        // applying commit-index state-machine work, so uniform apply cannot
+        // self-deadlock. The final snapshot cutover carrier is released in its
+        // arm below because snapshot response follows state-machine install.
+        let mut engine_rpc = Some(self.peer_directory.begin_engine_rpc().await);
         if !self.peer_directory.authorizes_engine(
             authenticated_sender,
             request.identity,
@@ -983,6 +1146,19 @@ impl SessionConsensusRpcHandler for SessionRaftRpcHandler {
                     Ok(rpc) => rpc,
                     Err(error) => return rejected_response(error),
                 };
+                if rpc.done
+                    && self
+                        .peer_directory
+                        .requires_uniform_membership_fence(rpc.meta.last_membership.membership())
+                {
+                    // This final chunk carries metadata for a prospective
+                    // exact-uniform cutover. Release its own permit so a valid
+                    // state-machine install can drain every other predecessor
+                    // RPC and atomically publish successor admission. A chunk
+                    // rejected by Openraft or storage never reaches that
+                    // publication point.
+                    drop(engine_rpc.take());
+                }
                 encode_engine_result(&self.raft.install_snapshot(rpc).await)
             }
             SessionConsensusRpcFamily::ForwardMutation | SessionConsensusRpcFamily::ReadBarrier => {
@@ -993,6 +1169,7 @@ impl SessionConsensusRpcHandler for SessionRaftRpcHandler {
             }
             _ => return rejected_response(SessionConsensusPeerError::Rejected),
         };
+        drop(engine_rpc);
 
         match result {
             Ok(payload) => SessionConsensusWireResponse {
@@ -1091,18 +1268,25 @@ struct CodecTransportError(#[source] ConsensusCodecError);
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
     use std::sync::Mutex;
     use std::time::Duration;
 
     use bytes::Bytes;
-    use opc_consensus::engine::{CommittedLeaderId, LogId, Membership};
+    use opc_consensus::engine::storage::{RaftSnapshotBuilder, RaftStateMachine};
+    use opc_consensus::engine::{CommittedLeaderId, Entry, EntryPayload, LogId, Membership};
+    use opc_consensus::{durable_openraft_config, DurableOpenraftDomain};
+    use opc_types::Timestamp;
     use tokio::sync::Notify;
 
     use super::*;
     use crate::consensus::{
-        SessionConsensusClusterId, SessionConsensusConfigurationEpoch,
-        SessionConsensusConfigurationId,
+        storage, SessionConsensusClusterId, SessionConsensusCommand,
+        SessionConsensusConfigurationEpoch, SessionConsensusConfigurationId,
+        SessionConsensusRequestId, SessionMutationIntent, SessionTopologyMemberBinding,
+        SESSION_CONSENSUS_SCHEMA_VERSION,
     };
+    use crate::sqlite::SqliteSessionBackend;
 
     #[derive(Debug)]
     struct MockPeer {
@@ -1244,6 +1428,676 @@ mod tests {
         )
     }
 
+    struct RealFollowerFixture {
+        _temp: tempfile::TempDir,
+        backend: SqliteSessionBackend,
+        raft: SessionRaft,
+        state_machine: storage::SqliteConsensusStateMachine,
+        handler: SessionRaftRpcHandler,
+        directory: SessionRaftPeerDirectory,
+        current: SessionConsensusIdentity,
+        desired: SessionConsensusIdentity,
+        current_members: BTreeSet<SessionConsensusNodeId>,
+        desired_members: BTreeSet<SessionConsensusNodeId>,
+        leader: SessionConsensusNodeId,
+        local: SessionConsensusNodeId,
+        transition: SessionTopologyTransitionId,
+        digest: SessionTopologyTransitionDigest,
+    }
+
+    fn member_binding(node: SessionConsensusNodeId) -> SessionTopologyMemberBinding {
+        let seed = u8::try_from(node.get()).expect("small test node ID");
+        SessionTopologyMemberBinding::new(
+            [seed; 32],
+            [seed.wrapping_add(0x20); 32],
+            [seed.wrapping_add(0x40); 32],
+            [seed.wrapping_add(0x60); 32],
+        )
+    }
+
+    fn member_bindings(
+        members: &BTreeSet<SessionConsensusNodeId>,
+    ) -> BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding> {
+        members
+            .iter()
+            .copied()
+            .map(|node| (node, member_binding(node)))
+            .collect()
+    }
+
+    fn scope_peers(
+        local: SessionConsensusNodeId,
+        members: &BTreeSet<SessionConsensusNodeId>,
+        scope: SessionConsensusIdentity,
+    ) -> BTreeMap<SessionConsensusNodeId, Arc<dyn SessionConsensusPeer>> {
+        members
+            .iter()
+            .copied()
+            .filter(|node| *node != local)
+            .map(|node| {
+                let peer: Arc<dyn SessionConsensusPeer> = Arc::new(ScopeCheckingPeer {
+                    node_id: node,
+                    expected_identity: scope,
+                    response: rejected_response(SessionConsensusPeerError::Rejected),
+                });
+                (node, peer)
+            })
+            .collect()
+    }
+
+    fn transition_command_entry(
+        leader: SessionConsensusNodeId,
+        index: u64,
+        identity: SessionConsensusIdentity,
+        request_seed: u8,
+        intent: SessionMutationIntent,
+    ) -> Entry<SessionRaftTypeConfig> {
+        Entry {
+            log_id: LogId::new(CommittedLeaderId::new(1, leader), index),
+            payload: EntryPayload::Normal(SessionConsensusCommand {
+                schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+                identity,
+                request_id: SessionConsensusRequestId::from_bytes([request_seed; 16]),
+                logical_time: Timestamp::from_str("2026-07-21T00:00:00Z").expect("test timestamp"),
+                intent,
+            }),
+        }
+    }
+
+    fn membership_entry(
+        leader: SessionConsensusNodeId,
+        index: u64,
+        configs: Vec<BTreeSet<SessionConsensusNodeId>>,
+        nodes: BTreeSet<SessionConsensusNodeId>,
+    ) -> Entry<SessionRaftTypeConfig> {
+        Entry {
+            log_id: LogId::new(CommittedLeaderId::new(1, leader), index),
+            payload: EntryPayload::Membership(Membership::new(configs, nodes)),
+        }
+    }
+
+    fn append_request(
+        fixture: &RealFollowerFixture,
+        prev_log_id: Option<LogId<SessionConsensusNodeId>>,
+        entries: Vec<Entry<SessionRaftTypeConfig>>,
+        leader_commit: Option<LogId<SessionConsensusNodeId>>,
+    ) -> AppendEntriesRequest<SessionRaftTypeConfig> {
+        AppendEntriesRequest {
+            vote: Vote::new_committed(1, fixture.leader),
+            prev_log_id,
+            leader_commit,
+            entries,
+        }
+    }
+
+    async fn call_append_handler(
+        fixture: &RealFollowerFixture,
+        identity: SessionConsensusIdentity,
+        rpc: AppendEntriesRequest<SessionRaftTypeConfig>,
+    ) -> SessionConsensusWireResponse {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            fixture
+                .handler
+                .handle(fixture.leader, append_wire(fixture, identity, &rpc)),
+        )
+        .await
+        .expect("AppendEntries handler completes within test deadline")
+    }
+
+    fn append_wire(
+        fixture: &RealFollowerFixture,
+        identity: SessionConsensusIdentity,
+        rpc: &AppendEntriesRequest<SessionRaftTypeConfig>,
+    ) -> SessionConsensusWireRequest {
+        let payload = encode_bounded(rpc).expect("bounded append request");
+        SessionConsensusWireRequest::try_new(
+            identity,
+            fixture.leader,
+            SessionConsensusRpcFamily::AppendEntries,
+            payload,
+        )
+        .expect("valid append envelope")
+    }
+
+    fn assert_append_success(response: SessionConsensusWireResponse) {
+        let payload = response.result.expect("append transport accepted");
+        let result: Result<
+            AppendEntriesResponse<SessionConsensusNodeId>,
+            RaftError<SessionConsensusNodeId>,
+        > = decode_bounded(&payload).expect("append response decodes");
+        assert_eq!(result, Ok(AppendEntriesResponse::Success));
+    }
+
+    fn snapshot_wire(
+        fixture: &RealFollowerFixture,
+        identity: SessionConsensusIdentity,
+        rpc: &InstallSnapshotRequest<SessionRaftTypeConfig>,
+    ) -> SessionConsensusWireRequest {
+        let payload = encode_bounded(rpc).expect("bounded snapshot request");
+        SessionConsensusWireRequest::try_new(
+            identity,
+            fixture.leader,
+            SessionConsensusRpcFamily::InstallSnapshot,
+            payload,
+        )
+        .expect("valid snapshot envelope")
+    }
+
+    fn decode_snapshot_response(
+        response: SessionConsensusWireResponse,
+    ) -> InstallSnapshotResponse<SessionConsensusNodeId> {
+        let payload = response.result.expect("snapshot transport accepted");
+        let result: Result<
+            InstallSnapshotResponse<SessionConsensusNodeId>,
+            RaftError<SessionConsensusNodeId, InstallSnapshotError>,
+        > = decode_bounded(&payload).expect("snapshot response decodes");
+        result.expect("snapshot engine accepted")
+    }
+
+    async fn real_follower_fixture() -> RealFollowerFixture {
+        let temp = tempfile::tempdir().expect("follower tempdir");
+        let backend = SqliteSessionBackend::open(temp.path().join("sessions.sqlite"))
+            .expect("follower backend");
+        let current = identity(0x71);
+        let desired = successor_identity(current, 0x73);
+        let leader = node_id(1);
+        let local = node_id(2);
+        let current_members = BTreeSet::from([leader, local, node_id(3)]);
+        let desired_members = BTreeSet::from([leader, local, node_id(4)]);
+        let network = SessionRaftNetworkFactory::try_new(
+            current,
+            local,
+            current_members.clone(),
+            scope_peers(local, &current_members, current),
+        )
+        .expect("follower network");
+        let directory = network.peer_directory();
+        let (log_store, state_machine, _) = storage::open_with_member_bindings(
+            &backend,
+            temp.path().join("snapshots"),
+            current,
+            current_members.clone(),
+            member_bindings(&current_members),
+            directory.clone(),
+        )
+        .await
+        .expect("follower storage");
+        let config = Arc::new(
+            durable_openraft_config(DurableOpenraftDomain::SessionState)
+                .expect("durable test Raft config"),
+        );
+        let snapshot_state_machine = state_machine.clone();
+        let raft = SessionRaft::new(local, config, network, log_store, state_machine)
+            .await
+            .expect("follower Raft");
+        let handler = SessionRaftRpcHandler::new(raft.clone(), directory.clone(), local);
+        RealFollowerFixture {
+            _temp: temp,
+            backend,
+            raft,
+            state_machine: snapshot_state_machine,
+            handler,
+            directory,
+            current,
+            desired,
+            current_members,
+            desired_members,
+            leader,
+            local,
+            transition: transition_id(0x74),
+            digest: transition_digest(0x75),
+        }
+    }
+
+    async fn apply_through_joint(fixture: &RealFollowerFixture) {
+        let all_nodes = fixture
+            .current_members
+            .union(&fixture.desired_members)
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let transition_id = fixture.transition.as_bytes();
+        let request_digest = fixture.digest.as_bytes();
+        let entries = vec![
+            membership_entry(
+                fixture.leader,
+                0,
+                vec![fixture.current_members.clone()],
+                fixture.current_members.clone(),
+            ),
+            transition_command_entry(
+                fixture.leader,
+                1,
+                fixture.current,
+                0x11,
+                SessionMutationIntent::PrepareTopologyTransition {
+                    transition_id,
+                    request_digest,
+                    desired_identity: fixture.desired,
+                    desired_members: fixture.desired_members.clone(),
+                    desired_bindings: member_bindings(&fixture.desired_members),
+                },
+            ),
+            membership_entry(
+                fixture.leader,
+                2,
+                vec![fixture.current_members.clone()],
+                all_nodes.clone(),
+            ),
+            transition_command_entry(
+                fixture.leader,
+                3,
+                fixture.current,
+                0x12,
+                SessionMutationIntent::MarkTopologyLearnersReady {
+                    transition_id,
+                    request_digest,
+                },
+            ),
+            transition_command_entry(
+                fixture.leader,
+                4,
+                fixture.current,
+                0x13,
+                SessionMutationIntent::FenceTopologyAuthority {
+                    transition_id,
+                    request_digest,
+                },
+            ),
+            membership_entry(
+                fixture.leader,
+                5,
+                vec![
+                    fixture.current_members.clone(),
+                    fixture.desired_members.clone(),
+                ],
+                all_nodes,
+            ),
+        ];
+        let committed = entries.last().map(|entry| entry.log_id);
+        assert_append_success(
+            call_append_handler(
+                fixture,
+                fixture.current,
+                append_request(fixture, None, entries, committed),
+            )
+            .await,
+        );
+        fixture
+            .raft
+            .wait(Some(Duration::from_secs(5)))
+            .applied_index(
+                committed.map(|log_id| log_id.index),
+                "pre-uniform transition entries apply",
+            )
+            .await
+            .expect("pre-uniform entries applied");
+        fixture
+            .directory
+            .stage(
+                fixture.transition,
+                fixture.digest,
+                fixture.current.configuration_epoch(),
+                fixture.desired,
+                fixture.desired_members.clone(),
+                scope_peers(fixture.local, &fixture.desired_members, fixture.desired),
+            )
+            .expect("stage desired routes before uniform apply");
+        fixture
+            .directory
+            .admit_staged_voting(
+                fixture.transition,
+                fixture.digest,
+                fixture.current.configuration_epoch(),
+            )
+            .expect("admit desired voting after joint proof");
+    }
+
+    async fn wait_for_membership_writer(directory: &SessionRaftPeerDirectory) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            match tokio::time::timeout(Duration::from_millis(5), directory.begin_engine_rpc()).await
+            {
+                Ok(probe) => drop(probe),
+                Err(_) => return,
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "membership apply writer did not queue behind predecessor RPC"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn inbound_append_uniform_responds_before_apply_then_fences_predecessor() {
+        let fixture = real_follower_fixture().await;
+        apply_through_joint(&fixture).await;
+        let final_log_id = LogId::new(CommittedLeaderId::new(1, fixture.leader), 6);
+        let uniform = membership_entry(
+            fixture.leader,
+            6,
+            vec![fixture.desired_members.clone()],
+            fixture.desired_members.clone(),
+        );
+        let final_rpc = append_request(
+            &fixture,
+            Some(LogId::new(CommittedLeaderId::new(1, fixture.leader), 5)),
+            vec![uniform],
+            Some(final_log_id),
+        );
+        let held_apply = Arc::clone(&fixture.backend.consensus_apply_gate)
+            .acquire_owned()
+            .await
+            .expect("hold state-machine apply");
+        let handler = fixture.handler.clone();
+        let leader = fixture.leader;
+        let wire = append_wire(&fixture, fixture.current, &final_rpc);
+        let response = tokio::time::timeout(Duration::from_secs(2), async move {
+            handler.handle(leader, wire).await
+        })
+        .await
+        .expect("AppendEntries responds before committed state-machine apply");
+        assert_append_success(response);
+        assert_eq!(
+            fixture.directory.current_scope().expect("pre-apply scope"),
+            (fixture.current, fixture.current_members.clone()),
+            "uniform routing changed before state-machine apply"
+        );
+
+        let predecessor_rpc = fixture.directory.begin_engine_rpc().await;
+        drop(held_apply);
+        wait_for_membership_writer(&fixture.directory).await;
+        assert_eq!(
+            fixture
+                .directory
+                .current_scope()
+                .expect("scope while predecessor RPC remains active")
+                .0,
+            fixture.current,
+            "uniform apply crossed an already-admitted predecessor RPC"
+        );
+        drop(predecessor_rpc);
+        fixture
+            .raft
+            .wait(Some(Duration::from_secs(5)))
+            .applied_index(Some(final_log_id.index), "uniform membership apply")
+            .await
+            .expect("uniform membership applied after predecessor RPC drained");
+        assert_eq!(
+            fixture.directory.current_scope().expect("post-apply scope"),
+            (fixture.desired, fixture.desired_members.clone())
+        );
+
+        let stale_heartbeat =
+            append_request(&fixture, Some(final_log_id), Vec::new(), Some(final_log_id));
+        assert_eq!(
+            call_append_handler(&fixture, fixture.current, stale_heartbeat)
+                .await
+                .result,
+            Err(SessionConsensusPeerError::ScopeMismatch),
+            "predecessor-scoped AppendEntries remained admitted after uniform apply"
+        );
+        fixture.raft.shutdown().await.expect("shutdown test Raft");
+    }
+
+    #[tokio::test]
+    async fn inbound_final_snapshot_releases_own_permit_and_fences_predecessor() {
+        let source = real_follower_fixture().await;
+        apply_through_joint(&source).await;
+        let uniform_log_id = LogId::new(CommittedLeaderId::new(1, source.leader), 6);
+        assert_append_success(
+            call_append_handler(
+                &source,
+                source.current,
+                append_request(
+                    &source,
+                    Some(LogId::new(CommittedLeaderId::new(1, source.leader), 5)),
+                    vec![membership_entry(
+                        source.leader,
+                        6,
+                        vec![source.desired_members.clone()],
+                        source.desired_members.clone(),
+                    )],
+                    Some(uniform_log_id),
+                ),
+            )
+            .await,
+        );
+        source
+            .raft
+            .wait(Some(Duration::from_secs(5)))
+            .applied_index(Some(uniform_log_id.index), "snapshot source uniform apply")
+            .await
+            .expect("snapshot source reaches desired uniform");
+        let mut snapshot_state_machine = source.state_machine.clone();
+        let mut builder = snapshot_state_machine.get_snapshot_builder().await;
+        let snapshot = builder
+            .build_snapshot()
+            .await
+            .expect("build source snapshot");
+        let snapshot_meta = snapshot.meta.clone();
+        let snapshot_bytes = tokio::fs::read(snapshot.snapshot.path())
+            .await
+            .expect("read source snapshot envelope");
+
+        let target = real_follower_fixture().await;
+        apply_through_joint(&target).await;
+        let held_predecessor_rpc = target.directory.begin_engine_rpc().await;
+        let final_chunk = InstallSnapshotRequest {
+            vote: Vote::new_committed(1, target.leader),
+            meta: snapshot_meta.clone(),
+            offset: 0,
+            data: snapshot_bytes.clone(),
+            done: true,
+        };
+        let handler = target.handler.clone();
+        let leader = target.leader;
+        let wire = snapshot_wire(&target, target.current, &final_chunk);
+        let mut install = tokio::spawn(async move { handler.handle(leader, wire).await });
+        wait_for_membership_writer(&target.directory).await;
+        assert!(
+            !install.is_finished(),
+            "final snapshot crossed another admitted predecessor RPC"
+        );
+        assert_eq!(
+            target
+                .directory
+                .current_scope()
+                .expect("pre-install scope")
+                .0,
+            target.current
+        );
+        drop(held_predecessor_rpc);
+        let response = tokio::time::timeout(Duration::from_secs(5), &mut install)
+            .await
+            .expect("final snapshot does not self-deadlock")
+            .expect("snapshot handler task remains live");
+        let _ = decode_snapshot_response(response);
+        target
+            .raft
+            .wait(Some(Duration::from_secs(5)))
+            .applied_index(
+                Some(uniform_log_id.index),
+                "snapshot target uniform install",
+            )
+            .await
+            .expect("snapshot target reaches desired uniform");
+        assert_eq!(
+            target
+                .directory
+                .current_scope()
+                .expect("post-snapshot scope"),
+            (target.desired, target.desired_members.clone())
+        );
+        let stale_heartbeat = append_request(
+            &target,
+            Some(uniform_log_id),
+            Vec::new(),
+            Some(uniform_log_id),
+        );
+        assert_eq!(
+            call_append_handler(&target, target.current, stale_heartbeat)
+                .await
+                .result,
+            Err(SessionConsensusPeerError::ScopeMismatch)
+        );
+
+        let cancelled = real_follower_fixture().await;
+        apply_through_joint(&cancelled).await;
+        let held_cancelled_predecessor = cancelled.directory.begin_engine_rpc().await;
+        let cancelled_chunk = InstallSnapshotRequest {
+            vote: Vote::new_committed(1, cancelled.leader),
+            meta: snapshot_meta.clone(),
+            offset: 0,
+            data: snapshot_bytes.clone(),
+            done: true,
+        };
+        let handler = cancelled.handler.clone();
+        let leader = cancelled.leader;
+        let wire = snapshot_wire(&cancelled, cancelled.current, &cancelled_chunk);
+        let cancelled_install = tokio::spawn(async move { handler.handle(leader, wire).await });
+        wait_for_membership_writer(&cancelled.directory).await;
+        cancelled_install.abort();
+        let cancelled_error = tokio::time::timeout(Duration::from_secs(1), cancelled_install)
+            .await
+            .expect("cancelled snapshot handler task terminates")
+            .expect_err("snapshot handler task was cancelled");
+        assert!(cancelled_error.is_cancelled());
+        drop(held_cancelled_predecessor);
+        cancelled
+            .raft
+            .wait(Some(Duration::from_secs(5)))
+            .applied_index(
+                Some(uniform_log_id.index),
+                "cancelled caller snapshot finishes safely",
+            )
+            .await
+            .expect("snapshot install survives caller cancellation");
+        assert_eq!(
+            cancelled
+                .directory
+                .current_scope()
+                .expect("post-cancellation snapshot scope"),
+            (cancelled.desired, cancelled.desired_members.clone())
+        );
+
+        let malformed = real_follower_fixture().await;
+        apply_through_joint(&malformed).await;
+        let mut malformed_state_machine = malformed.state_machine.clone();
+        let (_, durable_before_malformed) = malformed_state_machine
+            .applied_state()
+            .await
+            .expect("read durable membership before malformed snapshot");
+        let malformed_wire = SessionConsensusWireRequest::try_new(
+            malformed.current,
+            malformed.leader,
+            SessionConsensusRpcFamily::InstallSnapshot,
+            vec![0xA5; 32],
+        )
+        .expect("bounded malformed snapshot envelope");
+        let malformed_response = tokio::time::timeout(
+            Duration::from_secs(5),
+            malformed.handler.handle(malformed.leader, malformed_wire),
+        )
+        .await
+        .expect("malformed snapshot wire is rejected within test deadline");
+        assert_eq!(
+            malformed_response.result,
+            Err(SessionConsensusPeerError::Protocol)
+        );
+
+        let stale_vote = Vote::new_committed(0, malformed.leader);
+        let rejected_chunk = InstallSnapshotRequest {
+            vote: stale_vote,
+            meta: snapshot_meta,
+            offset: 0,
+            data: snapshot_bytes,
+            done: true,
+        };
+        let rejected_response = tokio::time::timeout(
+            Duration::from_secs(5),
+            malformed.handler.handle(
+                malformed.leader,
+                snapshot_wire(&malformed, malformed.current, &rejected_chunk),
+            ),
+        )
+        .await
+        .expect("stale-vote final snapshot is rejected within test deadline");
+        let engine_response = decode_snapshot_response(rejected_response);
+        assert_ne!(
+            engine_response.vote, stale_vote,
+            "stale-vote final snapshot was unexpectedly accepted"
+        );
+        assert_eq!(
+            malformed
+                .directory
+                .current_scope()
+                .expect("malformed snapshot scope"),
+            (malformed.current, malformed.current_members.clone())
+        );
+        let (_, durable_after_malformed) = malformed_state_machine
+            .applied_state()
+            .await
+            .expect("read durable membership after malformed snapshot");
+        assert_eq!(
+            durable_after_malformed, durable_before_malformed,
+            "malformed final snapshot changed durable SQLite membership"
+        );
+        assert!(malformed.directory.authorizes_engine(
+            malformed.leader,
+            malformed.current,
+            SessionConsensusRpcFamily::AppendEntries,
+        ));
+
+        tokio::time::timeout(Duration::from_secs(5), source.raft.shutdown())
+            .await
+            .expect("snapshot source shutdown completes")
+            .expect("shutdown snapshot source");
+        tokio::time::timeout(Duration::from_secs(5), target.raft.shutdown())
+            .await
+            .expect("snapshot target shutdown completes")
+            .expect("shutdown snapshot target");
+        tokio::time::timeout(Duration::from_secs(5), cancelled.raft.shutdown())
+            .await
+            .expect("cancelled snapshot target shutdown completes")
+            .expect("shutdown cancelled snapshot target");
+        let _ = tokio::time::timeout(Duration::from_secs(5), malformed.raft.shutdown()).await;
+    }
+
+    #[test]
+    fn joining_candidate_has_no_predecessor_scope_routes() {
+        let current_identity = identity(0x31);
+        let current_members = BTreeSet::from([node_id(1), node_id(2), node_id(3)]);
+        let local_candidate = node_id(4);
+        let factory = SessionRaftNetworkFactory::try_new_candidate(
+            current_identity,
+            local_candidate,
+            current_members.clone(),
+        )
+        .expect("candidate peer directory");
+        let directory = factory.peer_directory();
+
+        assert_eq!(
+            directory.current_scope().expect("candidate scope"),
+            (current_identity, current_members.clone())
+        );
+        for current_member in current_members {
+            assert!(
+                directory
+                    .resolve_engine(current_member)
+                    .expect("candidate directory remains available")
+                    .is_none(),
+                "a joining candidate must not receive predecessor-scope outbound authority"
+            );
+            assert!(!directory.authorizes_engine(
+                current_member,
+                current_identity,
+                SessionConsensusRpcFamily::AppendEntries,
+            ));
+        }
+    }
+
     fn vote_request(sender: SessionConsensusNodeId) -> VoteRequest<SessionConsensusNodeId> {
         VoteRequest::new(Vote::new(7, sender), None)
     }
@@ -1348,9 +2202,9 @@ mod tests {
             "fixed-topology clients must retain their exact admitted scope"
         );
 
-        // Directory retirement stops future routing, but deliberately cannot
-        // revoke an already authenticated in-flight call. The membership
-        // driver must commit its inbound authority fence before finalization.
+        // Exact uniform apply drains the complete already-admitted RPC before
+        // publishing successor routes. This exercises the actual cached
+        // network-call lifetime rather than only a route lookup.
         let transition = transition_id(0xa1);
         let digest = transition_digest(0xa1);
         let desired = successor_identity(current_identity, 9);
@@ -1366,14 +2220,21 @@ mod tests {
                 desired_peers,
             )
             .expect("stage removal while call is blocked");
-        directory
-            .finalize(
-                transition,
-                digest,
-                current_identity.configuration_epoch(),
-                &desired_members,
-            )
-            .expect("finalize removal while call is blocked");
+        let cutover_directory = directory.clone();
+        let applied_uniform =
+            stored_membership(vec![desired_members.clone()], desired_members.clone());
+        let mut cutover = tokio::spawn(async move {
+            let _apply_guard = cutover_directory.begin_membership_apply().await;
+            cutover_directory
+                .observe_applied_membership(&applied_uniform)
+                .expect("apply exact uniform membership");
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut cutover)
+                .await
+                .is_err(),
+            "uniform apply crossed an active cached engine RPC"
+        );
 
         tokio::time::advance(hard_ttl + Duration::from_secs(1)).await;
         tokio::task::yield_now().await;
@@ -1384,6 +2245,16 @@ mod tests {
 
         peer.release.notify_one();
         assert_eq!(call.await.expect("adapter task"), Ok(7));
+        cutover.await.expect("uniform cutover after RPC drain");
+
+        directory
+            .finalize(
+                transition,
+                digest,
+                current_identity.configuration_epoch(),
+                &desired_members,
+            )
+            .expect("delayed process finalization remains idempotent");
 
         let retired = SessionRaftNetwork {
             local_node_id: node_id(1),
@@ -1730,14 +2601,16 @@ mod tests {
             .is_none());
     }
 
-    #[test]
-    fn peer_directory_retires_old_scope_only_after_exact_uniform_commit() {
+    #[tokio::test]
+    async fn applied_uniform_fences_cached_predecessor_engine_rpcs_before_process_finalize() {
         let local = node_id(1);
         let removed = node_id(2);
         let retained = node_id(3);
         let added = node_id(4);
         let current = identity(1);
         let desired = successor_identity(current, 9);
+        let transition = transition_id(0xa1);
+        let digest = transition_digest(0xa1);
         let current_members = BTreeSet::from([local, removed, retained]);
         let desired_members = BTreeSet::from([local, retained, added]);
         let current_peers = rejecting_peer_map(2, 2, None);
@@ -1768,8 +2641,8 @@ mod tests {
         .expect("current routes");
         directory
             .stage(
-                transition_id(0xa1),
-                transition_digest(0xa1),
+                transition,
+                digest,
                 current.configuration_epoch(),
                 desired,
                 desired_members.clone(),
@@ -1777,12 +2650,25 @@ mod tests {
             )
             .expect("successor routes");
 
+        let cached_predecessor_families = [
+            SessionConsensusRpcFamily::Vote,
+            SessionConsensusRpcFamily::AppendEntries,
+            SessionConsensusRpcFamily::InstallSnapshot,
+        ];
+        for family in cached_predecessor_families {
+            assert!(directory.authorizes_engine(removed, current, family));
+            assert!(directory
+                .resolve_engine_for(removed, family)
+                .expect("predecessor route remains available before joint")
+                .is_some());
+        }
+
         let joint_nodes = current_members
             .union(&desired_members)
             .copied()
             .collect::<BTreeSet<_>>();
         directory
-            .reconcile_committed_membership(&stored_membership(
+            .observe_applied_membership(&stored_membership(
                 vec![current_members, desired_members.clone()],
                 joint_nodes,
             ))
@@ -1796,21 +2682,276 @@ mod tests {
             .resolve_engine(removed)
             .expect("old route remains")
             .is_some());
+        for family in cached_predecessor_families {
+            assert!(
+                directory.authorizes_engine(removed, current, family),
+                "joint application prematurely fenced predecessor {family:?}"
+            );
+        }
 
-        directory
-            .reconcile_committed_membership(&stored_membership(
-                vec![desired_members.clone()],
-                desired_members.clone(),
-            ))
-            .expect("uniform successor commit");
+        let release_calls = Arc::new(tokio::sync::Semaphore::new(0));
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::channel(3);
+        let mut cached_calls = Vec::new();
+        for family in cached_predecessor_families {
+            let cached_directory = directory.clone();
+            let release = Arc::clone(&release_calls);
+            let entered = entered_tx.clone();
+            cached_calls.push(tokio::spawn(async move {
+                let _full_rpc_lifetime = cached_directory.begin_engine_rpc().await;
+                assert!(cached_directory.authorizes_engine(removed, current, family));
+                assert!(cached_directory
+                    .resolve_engine_for(removed, family)
+                    .expect("cached directory remains available")
+                    .is_some());
+                entered.send(family).await.expect("report entered RPC");
+                release
+                    .acquire()
+                    .await
+                    .expect("release cached RPC")
+                    .forget();
+            }));
+        }
+        drop(entered_tx);
+        for _ in cached_predecessor_families {
+            entered_rx.recv().await.expect("all cached RPCs entered");
+        }
+
+        let apply_directory = directory.clone();
+        let applied_uniform =
+            stored_membership(vec![desired_members.clone()], desired_members.clone());
+        let mut apply = tokio::spawn(async move {
+            let _apply_guard = apply_directory.begin_membership_apply().await;
+            apply_directory
+                .observe_applied_membership(&applied_uniform)
+                .expect("uniform successor commit");
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut apply)
+                .await
+                .is_err(),
+            "uniform cutover did not drain full predecessor RPC lifetimes"
+        );
+        release_calls.add_permits(cached_predecessor_families.len());
+        for call in cached_calls {
+            call.await.expect("cached RPC completes before cutover");
+        }
+        apply
+            .await
+            .expect("uniform apply completes after RPC drain");
         assert_eq!(
             directory.current_scope().expect("desired scope"),
-            (desired, desired_members)
+            (desired, desired_members.clone())
         );
         assert!(directory
             .resolve_engine(removed)
             .expect("directory remains available")
             .is_none());
+        for family in cached_predecessor_families {
+            assert!(
+                !directory.authorizes_engine(removed, current, family),
+                "cached predecessor {family:?} remained authorized after local uniform apply"
+            );
+            assert!(
+                directory
+                    .resolve_engine_for(removed, family)
+                    .expect("uniform-applied directory remains available")
+                    .is_none(),
+                "cached predecessor {family:?} retained an outbound route"
+            );
+        }
+        assert!(directory.authorizes_engine(
+            retained,
+            desired,
+            SessionConsensusRpcFamily::AppendEntries,
+        ));
+
+        // Model an arbitrarily delayed process-level transport callback. The
+        // apply-driven fence above is already authoritative, and the callback
+        // remains an exact idempotent cleanup operation.
+        directory
+            .finalize(
+                transition,
+                digest,
+                current.configuration_epoch(),
+                &desired_members,
+            )
+            .expect("delayed finalization remains idempotent");
+    }
+
+    #[test]
+    fn same_voter_set_epoch_cannot_promote_from_stale_applied_membership() {
+        let local = node_id(1);
+        let remote = node_id(2);
+        let current = identity(1);
+        let desired = successor_identity(current, 9);
+        let members = BTreeSet::from([local, remote]);
+        let directory = SessionRaftPeerDirectory::try_new(
+            current,
+            local,
+            members.clone(),
+            rejecting_peer_map(2, 1, None),
+        )
+        .expect("current routes");
+        directory
+            .observe_applied_membership(&stored_membership(vec![members.clone()], members.clone()))
+            .expect("restore current applied membership");
+
+        assert_eq!(
+            directory.stage(
+                transition_id(0xa2),
+                transition_digest(0xa2),
+                current.configuration_epoch(),
+                desired,
+                members.clone(),
+                rejecting_peer_map(2, 1, Some(desired)),
+            ),
+            Err(SessionRaftAdapterError::InvalidPeerTransitionScope),
+            "a node-set-only epoch change could reuse stale uniform evidence"
+        );
+        assert_eq!(
+            directory.current_scope().expect("current scope remains"),
+            (current, members)
+        );
+    }
+
+    #[test]
+    fn restored_uniform_before_route_stage_fails_closed_then_promotes_exact_successor() {
+        let local = node_id(1);
+        let removed = node_id(2);
+        let retained = node_id(3);
+        let added = node_id(4);
+        let current = identity(1);
+        let desired = successor_identity(current, 9);
+        let current_members = BTreeSet::from([local, removed, retained]);
+        let desired_members = BTreeSet::from([local, retained, added]);
+        let directory = SessionRaftPeerDirectory::try_new(
+            current,
+            local,
+            current_members.clone(),
+            rejecting_peer_map(2, 2, None),
+        )
+        .expect("current routes");
+
+        directory
+            .observe_applied_membership(&stored_membership(
+                vec![desired_members.clone()],
+                desired_members.clone(),
+            ))
+            .expect("restore desired uniform membership");
+        for family in [
+            SessionConsensusRpcFamily::Vote,
+            SessionConsensusRpcFamily::AppendEntries,
+            SessionConsensusRpcFamily::InstallSnapshot,
+        ] {
+            assert!(!directory.authorizes_engine(removed, current, family));
+            assert!(directory
+                .resolve_engine_for(removed, family)
+                .expect("suspended directory remains available")
+                .is_none());
+        }
+        assert_eq!(
+            directory.current_scope().expect("staging scope retained"),
+            (current, current_members)
+        );
+
+        let desired_peers = BTreeMap::from([
+            (
+                retained,
+                Arc::new(ScopeCheckingPeer {
+                    node_id: retained,
+                    expected_identity: desired,
+                    response: rejected_response(SessionConsensusPeerError::Rejected),
+                }) as Arc<dyn SessionConsensusPeer>,
+            ),
+            (
+                added,
+                Arc::new(ScopeCheckingPeer {
+                    node_id: added,
+                    expected_identity: desired,
+                    response: rejected_response(SessionConsensusPeerError::Rejected),
+                }) as Arc<dyn SessionConsensusPeer>,
+            ),
+        ]);
+        directory
+            .stage(
+                transition_id(0xa3),
+                transition_digest(0xa3),
+                current.configuration_epoch(),
+                desired,
+                desired_members.clone(),
+                desired_peers,
+            )
+            .expect("stage exact restored successor routes");
+        assert_eq!(
+            directory.current_scope().expect("restored successor scope"),
+            (desired, desired_members)
+        );
+        assert!(directory.authorizes_engine(
+            retained,
+            desired,
+            SessionConsensusRpcFamily::AppendEntries,
+        ));
+    }
+
+    #[test]
+    fn uniform_promotion_gives_removed_local_node_zero_engine_authority() {
+        let local = node_id(1);
+        let retained_a = node_id(2);
+        let retained_b = node_id(3);
+        let added = node_id(4);
+        let current = identity(1);
+        let desired = successor_identity(current, 9);
+        let transition = transition_id(0xa4);
+        let digest = transition_digest(0xa4);
+        let current_members = BTreeSet::from([local, retained_a, retained_b]);
+        let desired_members = BTreeSet::from([retained_a, retained_b, added]);
+        let directory = SessionRaftPeerDirectory::try_new(
+            current,
+            local,
+            current_members,
+            rejecting_peer_map(2, 2, None),
+        )
+        .expect("current routes");
+        directory
+            .stage(
+                transition,
+                digest,
+                current.configuration_epoch(),
+                desired,
+                desired_members.clone(),
+                rejecting_peer_map(2, 3, Some(desired)),
+            )
+            .expect("stage successor excluding local node");
+        directory
+            .admit_staged_voting(transition, digest, current.configuration_epoch())
+            .expect("admit successor voting before uniform");
+        assert!(directory.authorizes_engine(retained_a, desired, SessionConsensusRpcFamily::Vote,));
+
+        directory
+            .observe_applied_membership(&stored_membership(
+                vec![desired_members.clone()],
+                desired_members,
+            ))
+            .expect("apply uniform membership excluding local node");
+        for family in [
+            SessionConsensusRpcFamily::Vote,
+            SessionConsensusRpcFamily::AppendEntries,
+            SessionConsensusRpcFamily::InstallSnapshot,
+        ] {
+            for sender in [retained_a, retained_b, added] {
+                assert!(
+                    !directory.authorizes_engine(sender, desired, family),
+                    "removed local node accepted inbound {family:?} from successor"
+                );
+                assert!(
+                    directory
+                        .resolve_engine_for(sender, family)
+                        .expect("removed directory remains available")
+                        .is_none(),
+                    "removed local node retained outbound {family:?} routing"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -1853,10 +2994,17 @@ mod tests {
                 digest_a,
                 current.configuration_epoch(),
                 desired,
-                BTreeSet::from([target]),
+                BTreeSet::from([local, target]),
                 BTreeMap::from([(target, peer.clone())]),
             )
             .expect("stage learner peer");
+        assert!(matches!(
+            call_test_network(&network).await,
+            Err(EngineRpcError::Unreachable(_))
+        ));
+        directory
+            .admit_staged_voting(transition_a, digest_a, current.configuration_epoch())
+            .expect("joint proof admits staged Vote routing");
         assert_eq!(call_test_network(&network).await, Ok(7));
 
         directory
@@ -1875,7 +3023,7 @@ mod tests {
                 digest_b,
                 current.configuration_epoch(),
                 desired,
-                BTreeSet::from([target]),
+                BTreeSet::from([local, target]),
                 BTreeMap::from([(target, peer)]),
             )
             .expect("restage learner peer");
@@ -1884,7 +3032,7 @@ mod tests {
                 transition_b,
                 digest_b,
                 current.configuration_epoch(),
-                &BTreeSet::from([target]),
+                &BTreeSet::from([local, target]),
             )
             .expect("promote staged peer");
         directory
@@ -1892,7 +3040,7 @@ mod tests {
                 transition_b,
                 digest_b,
                 current.configuration_epoch(),
-                &BTreeSet::from([target]),
+                &BTreeSet::from([local, target]),
             )
             .expect("exact finalization retry is idempotent");
         assert_eq!(call_test_network(&network).await, Ok(7));
@@ -1915,7 +3063,7 @@ mod tests {
                 transition_b,
                 digest_b,
                 current.configuration_epoch(),
-                &BTreeSet::from([target]),
+                &BTreeSet::from([local, target]),
             ),
             Ok(()),
             "a completed transition retry must not disturb its staged successor"
@@ -1952,22 +3100,9 @@ mod tests {
         let current_members = BTreeSet::from([node_id(1), node_id(2), node_id(3)]);
         let desired_members =
             BTreeSet::from([node_id(1), node_id(2), node_id(3), local, node_id(5)]);
-        let encoded_current: Result<
-            u64,
-            RaftError<SessionConsensusNodeId, opc_consensus::engine::error::Infallible>,
-        > = Ok(1);
-        let current_peer: Arc<dyn SessionConsensusPeer> = Arc::new(ScopeCheckingPeer {
-            node_id: target,
-            expected_identity: current,
-            response: SessionConsensusWireResponse {
-                result: Ok(encode_bounded(&encoded_current).expect("bounded current response")),
-            },
-        });
-        let mut current_peers = rejecting_peer_map(1, 3, Some(current));
-        current_peers.insert(target, current_peer);
         let mut factory =
-            SessionRaftNetworkFactory::try_new(current, local, current_members, current_peers)
-                .expect("joining node current routing");
+            SessionRaftNetworkFactory::try_new_candidate(current, local, current_members)
+                .expect("joining candidate has no predecessor routes");
         let directory = factory.peer_directory();
         let encoded_desired: Result<
             u64,
@@ -1995,6 +3130,17 @@ mod tests {
             .expect("stage joining-node successor routes");
 
         let network = factory.new_client(target, &EmptyNode::default()).await;
+        assert!(matches!(
+            call_test_network(&network).await,
+            Err(EngineRpcError::Unreachable(_))
+        ));
+        directory
+            .admit_staged_voting(
+                transition_id(0xa1),
+                transition_digest(0xa1),
+                current.configuration_epoch(),
+            )
+            .expect("joint proof admits successor Vote routing");
         assert_eq!(
             call_test_network(&network).await,
             Ok(2),

@@ -11,14 +11,15 @@ use std::path::{Path, PathBuf};
 
 use opc_consensus::engine::storage::{LogFlushed, RaftLogStorage, RaftStateMachine};
 use opc_consensus::engine::{
-    Entry, ErrorSubject, ErrorVerb, LogId, LogState, RaftLogReader, RaftSnapshotBuilder, Snapshot,
-    SnapshotMeta, StorageError, StoredMembership, Vote,
+    Entry, EntryPayload, ErrorSubject, ErrorVerb, LogId, LogState, RaftLogReader,
+    RaftSnapshotBuilder, Snapshot, SnapshotMeta, StorageError, StoredMembership, Vote,
 };
 use opc_consensus::DURABLE_OPENRAFT_MAX_PAYLOAD_ENTRIES;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
+use super::raft_adapter::{SessionRaftAdapterError, SessionRaftPeerDirectory};
 use super::snapshot::SessionSnapshotFile;
 use super::{
     SessionConsensusIdentity, SessionConsensusNodeId, SessionRaftTypeConfig,
@@ -69,9 +70,27 @@ pub(crate) struct SqliteConsensusLogStore {
 #[derive(Clone)]
 pub(crate) struct SqliteConsensusStateMachine {
     core: SqliteConsensusCore,
+    membership_admission: Option<SessionRaftPeerDirectory>,
 }
 
 impl SqliteConsensusStateMachine {
+    async fn begin_membership_apply(&self) -> Option<tokio::sync::OwnedRwLockWriteGuard<()>> {
+        match self.membership_admission.as_ref() {
+            Some(admission) => Some(admission.begin_membership_apply().await),
+            None => None,
+        }
+    }
+
+    fn observe_applied_membership(
+        &self,
+        membership: &StoredMembership<SessionConsensusNodeId, opc_consensus::engine::EmptyNode>,
+    ) -> Result<(), SessionRaftAdapterError> {
+        let Some(admission) = self.membership_admission.as_ref() else {
+            return Ok(());
+        };
+        admission.observe_applied_membership(membership)
+    }
+
     /// Read the durable application chain head for storage qualification.
     #[cfg(test)]
     pub(crate) async fn proposal_state(
@@ -102,6 +121,7 @@ pub(crate) async fn open_with_member_bindings(
     identity: SessionConsensusIdentity,
     expected_members: BTreeSet<SessionConsensusNodeId>,
     expected_bindings: BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
+    membership_admission: SessionRaftPeerDirectory,
 ) -> Result<
     (
         SqliteConsensusLogStore,
@@ -122,7 +142,10 @@ pub(crate) async fn open_with_member_bindings(
     let storage_identity = core.storage_identity;
     Ok((
         SqliteConsensusLogStore { core: core.clone() },
-        SqliteConsensusStateMachine { core },
+        SqliteConsensusStateMachine {
+            core,
+            membership_admission: Some(membership_admission),
+        },
         storage_identity,
     ))
 }
@@ -152,10 +175,22 @@ async fn open(
             )
         })
         .collect();
-    let (log_store, state_machine, _) =
-        open_with_member_bindings(backend, snapshot_dir, identity, expected_members, bindings)
-            .await?;
-    Ok((log_store, state_machine))
+    let core = SqliteConsensusCore::initialize(
+        backend,
+        snapshot_dir.into(),
+        identity,
+        expected_members,
+        bindings,
+    )
+    .await?;
+    validate_and_clean_snapshot_directory(&core).await?;
+    Ok((
+        SqliteConsensusLogStore { core: core.clone() },
+        SqliteConsensusStateMachine {
+            core,
+            membership_admission: None,
+        },
+    ))
 }
 
 /// Open a pristine or restarted candidate with one exact successor scope
@@ -172,11 +207,13 @@ pub(crate) async fn open_with_pending_membership(
     current_identity: SessionConsensusIdentity,
     current_members: BTreeSet<SessionConsensusNodeId>,
     current_bindings: BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
+    local_candidate_node_id: SessionConsensusNodeId,
     transition_id: [u8; 16],
     transition_digest: [u8; 32],
     desired_identity: SessionConsensusIdentity,
     desired_members: &BTreeSet<SessionConsensusNodeId>,
     desired_bindings: &BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
+    membership_admission: SessionRaftPeerDirectory,
 ) -> Result<
     (
         SqliteConsensusLogStore,
@@ -193,6 +230,7 @@ pub(crate) async fn open_with_pending_membership(
         current_members,
         current_bindings,
         consensus::PendingMembershipBootstrap {
+            local_candidate_node_id: Some(local_candidate_node_id),
             transition_id,
             transition_digest,
             desired_identity,
@@ -205,7 +243,10 @@ pub(crate) async fn open_with_pending_membership(
     let storage_identity = core.storage_identity;
     Ok((
         SqliteConsensusLogStore { core: core.clone() },
-        SqliteConsensusStateMachine { core },
+        SqliteConsensusStateMachine {
+            core,
+            membership_admission: Some(membership_admission),
+        },
         storage_identity,
     ))
 }
@@ -295,6 +336,16 @@ fn storage_error(
     error: io::Error,
 ) -> StorageError<SessionConsensusNodeId> {
     StorageError::from_io_error(subject, verb, error)
+}
+
+fn membership_admission_storage_error(
+    _error: SessionRaftAdapterError,
+) -> StorageError<SessionConsensusNodeId> {
+    storage_error(
+        ErrorSubject::StateMachine,
+        ErrorVerb::Write,
+        io::Error::other("session consensus membership admission is unavailable"),
+    )
 }
 
 fn range_to_half_open<R: RangeBounds<u64>>(range: &R) -> io::Result<(u64, Option<u64>)> {
@@ -475,11 +526,20 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
         ),
         StorageError<SessionConsensusNodeId>,
     > {
-        let conn = self.core.conn.lock().await;
-        let applied = consensus::read_applied_sync(&conn, self.core.storage_identity)
-            .map_err(|error| storage_error(ErrorSubject::StateMachine, ErrorVerb::Read, error))?;
-        let membership = consensus::read_membership_sync(&conn, self.core.storage_identity)
-            .map_err(|error| storage_error(ErrorSubject::StateMachine, ErrorVerb::Read, error))?;
+        let (applied, membership) = {
+            let _membership_apply = self.begin_membership_apply().await;
+            let conn = self.core.conn.lock().await;
+            let applied = consensus::read_applied_sync(&conn, self.core.storage_identity).map_err(
+                |error| storage_error(ErrorSubject::StateMachine, ErrorVerb::Read, error),
+            )?;
+            let membership = consensus::read_membership_sync(&conn, self.core.storage_identity)
+                .map_err(|error| {
+                    storage_error(ErrorSubject::StateMachine, ErrorVerb::Read, error)
+                })?;
+            self.observe_applied_membership(&membership)
+                .map_err(membership_admission_storage_error)?;
+            (applied, membership)
+        };
         Ok((applied, membership))
     }
 
@@ -500,16 +560,41 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
             )
         })?;
         let entries: Vec<_> = entries.into_iter().collect();
+        let applies_membership = entries
+            .iter()
+            .any(|entry| matches!(&entry.payload, EntryPayload::Membership(_)));
+        let applies_uniform_cutover = self.membership_admission.as_ref().is_some_and(|admission| {
+            entries.iter().any(|entry| {
+                let EntryPayload::Membership(membership) = &entry.payload else {
+                    return false;
+                };
+                admission.requires_uniform_membership_fence(membership)
+            })
+        });
         let last_applied = entries.last().map(|entry| entry.log_id);
         let applied = {
+            let _membership_apply = if applies_uniform_cutover {
+                self.begin_membership_apply().await
+            } else {
+                None
+            };
             let conn = self.core.conn.lock().await;
-            consensus::apply_entries_sync(
+            let applied = consensus::apply_entries_sync(
                 &conn,
                 self.core.storage_identity,
                 &self.core.caps,
                 entries,
             )
-            .map_err(|error| storage_error(ErrorSubject::StateMachine, ErrorVerb::Write, error))?
+            .map_err(|error| storage_error(ErrorSubject::StateMachine, ErrorVerb::Write, error))?;
+            if applies_membership {
+                let membership = consensus::read_membership_sync(&conn, self.core.storage_identity)
+                    .map_err(|error| {
+                        storage_error(ErrorSubject::StateMachine, ErrorVerb::Read, error)
+                    })?;
+                self.observe_applied_membership(&membership)
+                    .map_err(membership_admission_storage_error)?;
+            }
+            applied
         };
         if let Some(last_applied) = last_applied {
             self.core.applied_progress.send_replace(Some(last_applied));
@@ -591,7 +676,16 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
             ));
         }
 
-        let previous = {
+        let installs_uniform_cutover =
+            self.membership_admission.as_ref().is_some_and(|admission| {
+                admission.requires_uniform_membership_fence(meta.last_membership.membership())
+            });
+        let install_result = {
+            let _membership_apply = if installs_uniform_cutover {
+                self.begin_membership_apply().await
+            } else {
+                None
+            };
             let conn = self.core.conn.lock().await;
             let previous = consensus::read_current_snapshot_sync(&conn, self.core.storage_identity)
                 .map_err(|error| {
@@ -601,7 +695,7 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
                         error,
                     )
                 })?;
-            if let Err(error) = consensus::install_snapshot_database_sync(
+            match consensus::install_snapshot_database_sync(
                 &conn,
                 self.core.storage_identity,
                 &raw_path,
@@ -610,15 +704,25 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
                 checksum,
                 total_length,
             ) {
-                let _ = tokio::fs::remove_file(&final_path).await;
-                let _ = tokio::fs::remove_file(&raw_path).await;
-                return Err(storage_error(
+                Err(error) => Err(storage_error(
                     ErrorSubject::Snapshot(Some(meta.signature())),
                     ErrorVerb::Write,
                     error,
-                ));
+                )),
+                Ok(()) => {
+                    self.observe_applied_membership(&meta.last_membership)
+                        .map_err(membership_admission_storage_error)?;
+                    Ok(previous)
+                }
             }
-            previous
+        };
+        let previous = match install_result {
+            Ok(previous) => previous,
+            Err(error) => {
+                let _ = tokio::fs::remove_file(&final_path).await;
+                let _ = tokio::fs::remove_file(&raw_path).await;
+                return Err(error);
+            }
         };
         self.core.applied_progress.send_replace(meta.last_log_id);
         let _ = tokio::fs::remove_file(&raw_path).await;

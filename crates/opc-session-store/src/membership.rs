@@ -409,20 +409,6 @@ fn member_binding(descriptor: &QuorumReplicaDescriptor) -> SessionTopologyMember
     )
 }
 
-pub(crate) fn topology_node_bindings(
-    topology: &ValidatedQuorumTopology,
-) -> BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding> {
-    topology
-        .members()
-        .iter()
-        .filter_map(|descriptor| {
-            topology
-                .consensus_node_id(descriptor.replica_id())
-                .map(|node_id| (node_id, member_binding(descriptor)))
-        })
-        .collect()
-}
-
 impl fmt::Debug for SessionTopologyTransitionRequest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -459,6 +445,8 @@ pub enum SessionTopologyTransitionPhase {
     Finalizing,
     /// The desired epoch and terminal success evidence are committed.
     Completed,
+    /// A pre-joint abort decision is durable while learner cleanup is pending.
+    Aborting,
     /// Pre-joint work was safely aborted while the expected epoch remained current.
     Aborted,
 }
@@ -476,6 +464,7 @@ impl SessionTopologyTransitionPhase {
             Self::UniformCommitted => "uniform_committed",
             Self::Finalizing => "finalizing",
             Self::Completed => "completed",
+            Self::Aborting => "aborting",
             Self::Aborted => "aborted",
         }
     }
@@ -576,6 +565,8 @@ pub struct SessionTopologyTransitionLogIndexes {
     joint: Option<u64>,
     uniform: Option<u64>,
     finalization: Option<u64>,
+    abort_decision: Option<u64>,
+    abort_cleanup: Option<u64>,
 }
 
 impl SessionTopologyTransitionLogIndexes {
@@ -586,6 +577,20 @@ impl SessionTopologyTransitionLogIndexes {
             joint,
             uniform,
             finalization,
+            abort_decision: None,
+            abort_cleanup: None,
+        }
+    }
+
+    /// Construct abort decision and cleanup evidence.
+    #[must_use]
+    pub const fn aborted(abort_decision: u64, abort_cleanup: Option<u64>) -> Self {
+        Self {
+            joint: None,
+            uniform: None,
+            finalization: None,
+            abort_decision: Some(abort_decision),
+            abort_cleanup,
         }
     }
 
@@ -605,6 +610,18 @@ impl SessionTopologyTransitionLogIndexes {
     #[must_use]
     pub const fn finalization(self) -> Option<u64> {
         self.finalization
+    }
+
+    /// Log index that committed the pre-joint abort decision.
+    #[must_use]
+    pub const fn abort_decision(self) -> Option<u64> {
+        self.abort_decision
+    }
+
+    /// Membership log index that proved exact current-uniform cleanup.
+    #[must_use]
+    pub const fn abort_cleanup(self) -> Option<u64> {
+        self.abort_cleanup
     }
 }
 
@@ -630,8 +647,9 @@ impl SessionTopologyTransitionEvidence {
     /// Build evidence from a validated request and a self-consistent state.
     ///
     /// Phases before uniform commit retain the expected epoch. Uniform commit
-    /// and later phases report the desired epoch. Only `Completed/Succeeded`
-    /// and `Aborted/Aborted` are terminal combinations.
+    /// and later phases report the desired epoch. `Aborting` remains
+    /// in-progress until exact current-uniform cleanup is durable; only
+    /// `Completed/Succeeded` and `Aborted/Aborted` are terminal combinations.
     pub fn try_from_request(
         request: &SessionTopologyTransitionRequest,
         current_member_count: usize,
@@ -1046,6 +1064,92 @@ impl fmt::Debug for SessionTopologyLearnersReadyAdmissionProof {
     }
 }
 
+/// Store-issued proof that no durable transition exists for one staged request.
+///
+/// Only the session-store coordinator can construct this token, while holding
+/// its transition-operation fence and after reading exact durable state. It
+/// permits transport code to discard process-local successor staging without
+/// falsely recording a durable abort.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SessionTopologyPrePrepareUnstageProof {
+    scope: SessionTopologyAdmissionProofScope,
+}
+
+impl SessionTopologyPrePrepareUnstageProof {
+    /// Mint proof after exact durable absence was verified under the operation fence.
+    pub(crate) fn from_unprepared_request(request: &SessionTopologyTransitionRequest) -> Self {
+        Self {
+            scope: SessionTopologyAdmissionProofScope::from_request(request),
+        }
+    }
+}
+
+impl_admission_proof_scope!(SessionTopologyPrePrepareUnstageProof);
+
+impl fmt::Debug for SessionTopologyPrePrepareUnstageProof {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionTopologyPrePrepareUnstageProof")
+            .field("scope", &self.scope)
+            .finish()
+    }
+}
+
+/// Store-issued proof that an aborted candidate may retire process-local admission.
+///
+/// The coordinator mints this only after the terminal current-uniform cleanup
+/// index is newer than the durable abort decision. Candidate handlers also
+/// verify either their replicated abort decision or exact cancellation
+/// tombstone before accepting the retirement action.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SessionTopologyCandidateRetirementProof {
+    scope: SessionTopologyAdmissionProofScope,
+    abort_decision_log_index: u64,
+    abort_cleanup_log_index: u64,
+}
+
+impl SessionTopologyCandidateRetirementProof {
+    pub(crate) fn try_from_remote_cleanup(
+        request: &SessionTopologyTransitionRequest,
+        abort_decision_log_index: u64,
+        abort_cleanup_log_index: u64,
+    ) -> Result<Self, SessionTopologyTransitionError> {
+        if abort_decision_log_index == 0 || abort_cleanup_log_index <= abort_decision_log_index {
+            return Err(SessionTopologyTransitionError::InvalidEvidenceState);
+        }
+        Ok(Self {
+            scope: SessionTopologyAdmissionProofScope::from_request(request),
+            abort_decision_log_index,
+            abort_cleanup_log_index,
+        })
+    }
+
+    /// Log index of the durable pre-joint abort decision.
+    #[must_use]
+    pub const fn abort_decision_log_index(&self) -> u64 {
+        self.abort_decision_log_index
+    }
+
+    /// Newer membership index proving exact current-uniform cleanup.
+    #[must_use]
+    pub const fn abort_cleanup_log_index(&self) -> u64 {
+        self.abort_cleanup_log_index
+    }
+}
+
+impl_admission_proof_scope!(SessionTopologyCandidateRetirementProof);
+
+impl fmt::Debug for SessionTopologyCandidateRetirementProof {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionTopologyCandidateRetirementProof")
+            .field("scope", &self.scope)
+            .field("abort_decision_log_index", &self.abort_decision_log_index)
+            .field("abort_cleanup_log_index", &self.abort_cleanup_log_index)
+            .finish()
+    }
+}
+
 /// Store-issued proof that a pre-joint transition durably aborted.
 ///
 /// This token can only be minted from exact durable `Aborted/Aborted` status.
@@ -1070,7 +1174,11 @@ impl SessionTopologyAbortAdmissionProof {
         if status.phase() != SessionTopologyTransitionPhase::Aborted
             || status.outcome() != SessionTopologyTransitionOutcome::Aborted
             || status.evidence.committed_epoch != request.expected_epoch
-            || status.log_indexes() != SessionTopologyTransitionLogIndexes::default()
+            || status.log_indexes().joint().is_some()
+            || status.log_indexes().uniform().is_some()
+            || status.log_indexes().finalization().is_some()
+            || status.log_indexes().abort_decision().is_none()
+            || status.log_indexes().abort_cleanup().is_none()
         {
             return Err(SessionTopologyTransitionError::InvalidEvidenceState);
         }
@@ -1231,10 +1339,16 @@ fn log_indexes_are_valid_for_phase(
     indexes: SessionTopologyTransitionLogIndexes,
     phase: SessionTopologyTransitionPhase,
 ) -> bool {
-    let values_are_nonzero = [indexes.joint, indexes.uniform, indexes.finalization]
-        .into_iter()
-        .flatten()
-        .all(|index| index != 0);
+    let values_are_nonzero = [
+        indexes.joint,
+        indexes.uniform,
+        indexes.finalization,
+        indexes.abort_decision,
+        indexes.abort_cleanup,
+    ]
+    .into_iter()
+    .flatten()
+    .all(|index| index != 0);
     let values_are_ordered = indexes
         .joint
         .zip(indexes.uniform)
@@ -1242,7 +1356,11 @@ fn log_indexes_are_valid_for_phase(
         && indexes
             .uniform
             .zip(indexes.finalization)
-            .is_none_or(|(uniform, finalization)| uniform < finalization);
+            .is_none_or(|(uniform, finalization)| uniform < finalization)
+        && indexes
+            .abort_decision
+            .zip(indexes.abort_cleanup)
+            .is_none_or(|(decision, cleanup)| decision < cleanup);
     if !values_are_nonzero || !values_are_ordered {
         return false;
     }
@@ -1251,9 +1369,22 @@ fn log_indexes_are_valid_for_phase(
         SessionTopologyTransitionPhase::Prepared
         | SessionTopologyTransitionPhase::LearnersCatchingUp
         | SessionTopologyTransitionPhase::LearnersReady
-        | SessionTopologyTransitionPhase::AuthorityFenced
-        | SessionTopologyTransitionPhase::Aborted => {
+        | SessionTopologyTransitionPhase::AuthorityFenced => {
             indexes == SessionTopologyTransitionLogIndexes::default()
+        }
+        SessionTopologyTransitionPhase::Aborting => {
+            indexes.joint.is_none()
+                && indexes.uniform.is_none()
+                && indexes.finalization.is_none()
+                && indexes.abort_decision.is_some()
+                && indexes.abort_cleanup.is_none()
+        }
+        SessionTopologyTransitionPhase::Aborted => {
+            indexes.joint.is_none()
+                && indexes.uniform.is_none()
+                && indexes.finalization.is_none()
+                && indexes.abort_decision.is_some()
+                && indexes.abort_cleanup.is_some()
         }
         SessionTopologyTransitionPhase::JointCommitted => {
             indexes.joint.is_some() && indexes.uniform.is_none() && indexes.finalization.is_none()
@@ -1400,7 +1531,7 @@ mod admission_proof_tests {
             SessionTopologyTransitionPhase::Aborted,
             SessionTopologyTransitionOutcome::Aborted,
             SessionTopologyTransitionReason::AbortedByCaller,
-            SessionTopologyTransitionLogIndexes::default(),
+            SessionTopologyTransitionLogIndexes::aborted(10, Some(11)),
         )
         .expect("durable abort status");
         let abort_proof = SessionTopologyAbortAdmissionProof::try_from_status(&request, &aborted)

@@ -103,11 +103,10 @@ cap of 128 rather than that planning estimate.
 
 The election range is `[5,000 ms, 8,000 ms)`, the session/config operation
 default is 10,000 ms, and listener idle/handler ceilings are 30,000 ms.
-The exact consensus contract is transport/wire-schema revision 2 and error-set
-revision 4. Revision 2 carries the payload-free bounded expiry-authority
-preflight used before wrapper/provider work; error revision 4 adds the typed
-`RecordExpiryPreflightLimitExceeded` bound. Revision 1/error revision 3 or
-older peers fail before dispatch;
+The exact consensus contract is transport/wire-schema revision 3 and error-set
+revision 5. Revision 3 adds the bounded topology-admission barrier family;
+error revision 5 adds the typed `TopologyAuthorityRevoked` rejection. Revision
+2/error revision 4 or older peers fail before dispatch;
 upgrade every consensus member together while traffic and writers are drained.
 This is not a rolling mixed-profile transition.
 
@@ -117,26 +116,36 @@ cluster, next epoch, configuration digest, and member count to match the
 successor manifest. A retained logical replica must keep its complete endpoint,
 SPIFFE, failure-domain, and backing binding. Distinct removed and added replica
 IDs may not alias one endpoint, SPIFFE identity, or backing identity across the
-joint old/new admission window. While staged, current-manifest connections
-retain the normal RPC surface; successor-manifest connections initially may send only
-Raft `AppendEntries`, `InstallSnapshot`, and the payload-free topology marker
-barrier needed to join and prove exact application. Learner catch-up alone
+joint old/new admission window. Before exact joint proof, current-manifest
+connections retain the normal RPC surface; successor-manifest connections may
+send only Raft `AppendEntries`, `InstallSnapshot`, and the payload-free topology
+marker barrier needed to join and prove exact application. Learner catch-up alone
 does not admit voting: Openraft can process a higher-term Vote even when its
 sender is not yet a committed voter. The coordinator therefore passes a
 store-issued `SessionTopologyJointCommitAdmissionProof` to
 `admit_successor_voting_after_joint_commit` only after exact joint membership
 is durably applied. Before that proof, successor-scoped `Vote` RPCs fail
-closed.
-`ForwardMutation` and `ReadBarrier` remain current-authority-only.
+closed. At that exact proof, predecessor-manifest `ForwardMutation` and
+`ReadBarrier` calls are fenced. Predecessor Vote, AppendEntries, snapshot, and
+topology-barrier traffic remains admitted while Openraft still has a joint
+configuration; successor normal calls remain fenced until uniform finalization.
 Finalization takes an exclusive admission lease, waits for already-admitted
 handler calls to finish, and then removes the old identity atomically. Every
-request on an existing connection is revalidated, so a cached old connection
-cannot dispatch after finalization returns. A pre-commit abort removes the
-successor instead. Abort and finalization require unforgeable store-issued
-proofs of durable `Aborted` and uniform-or-later state respectively; a caller
-cannot assert those phases through generic status values. Only one successor
-and one fixed-width completed-operation record are retained, so repeated or
-hostile staging cannot grow memory.
+request on an existing connection is revalidated, so a cached predecessor
+connection loses normal authority at joint proof and all admission after
+finalization. A pre-commit abort first keeps the
+successor route available long enough to acknowledge the replicated abort
+decision or persist an exact cancellation tombstone. A separate store-issued
+retirement proof is available only after a newer committed cleanup proof (the
+exact learner-removal entry when learners exist, or the current-term cleanup
+control when none were admitted);
+it makes later process-local route removal restart-safe and idempotent. Abort,
+retirement, and successful finalization use distinct unforgeable proofs, so a
+caller cannot assert those phases through generic status values. Only one
+successor can be staged. The directory retains one current terminal binding
+plus at most 4,096 fixed-width historical terminal transition bindings from the
+durable store. Repeated or hostile staging therefore cannot grow memory beyond
+that fail-closed bound.
 
 If the transport deadline expires after a handler has queued work into the
 consensus core, the SDK returns a bounded timeout but does not pretend that
@@ -189,11 +198,12 @@ mutation or rebuild authority beside Openraft.
   `SessionConsensusServer::new_with_membership_admission` enable one bounded
   current-to-successor admission window. `stage_successor` consumes the shared
   validated `SessionTopologyTransitionRequest`;
-  `admit_successor_voting_after_catch_up`, `finalize_successor`, and
-  `abort_successor` require store-issued learner-ready, uniform-commit, and
-  durable-abort proof tokens. Every token binds the transition ID, request
-  digest, epochs, and desired configuration. Existing single-manifest server
-  constructors wrap the immutable binding unchanged.
+  `admit_successor_voting_after_joint_commit`, `finalize_successor`,
+  `abort_successor`, and `retire_aborted_candidate` require store-issued
+  joint-commit, uniform-commit, durable-abort, and terminal-cleanup proof
+  tokens. Every token binds the transition ID, request digest, epochs, and
+  desired configuration. Existing single-manifest server constructors wrap
+  the immutable binding unchanged.
 - `RemoteSessionConsensusPeer::consensus_identity` and
   `local_consensus_node_id` expose redaction-safe exact binding evidence for a
   dynamic peer directory. A node ID alone is not sufficient staging proof.
@@ -338,7 +348,8 @@ application request only after decoding that complete authenticated frame.
 EOF, an incomplete frame, and a partially written acknowledgement remain
 fail-closed; the server does not append a retirement frame after a partial
 acknowledgement.
-The error-set revision is 8. Directional budgets are part of the exact
+The error-set revision is 9; it adds the typed, fieldless
+`TopologyAuthorityRevoked` rejection. Directional budgets are part of the exact
 handshake. `requested_response_frame_size`,
 `accepted_response_frame_size`, and `server_request_frame_size` are public
 `Option<u32>` bootstrap fields so an older decoder can classify an otherwise
@@ -823,7 +834,7 @@ endpoint, SPIFFE ID, certificate, key, transaction, or payload text.
   adds public `ContractProfile::max_frame_size`, so external profile struct
   literals and exhaustive destructuring must be updated in the same
   coordinated change.
-- The v5 profile pins wire-schema revision 6 and error-set revision 8;
+- The v5 profile pins wire-schema revision 6 and error-set revision 9;
   `max_restore_scan_page_payload_bytes = 4194304`;
   `max_restore_scan_examined_rows = 4096`;
   `min_frame_size = 8192`; `max_frame_size = 16777216`; the 128-byte
@@ -847,7 +858,7 @@ endpoint, SPIFFE ID, certificate, key, transaction, or payload text.
   that a new peer rejects before dispatch, so unchanged valid JSON shape is not
   a rolling-compatibility claim.
 - Treat every v5 exact-profile migration through wire-schema revision 6 and
-  error-set revision 8 as a
+  error-set revision 9 as a
   coordinated stop/upgrade/start boundary. Drain
   traffic and writers, audit every persisted SQLite replica with the count-only
   `opc-session-store-audit identity-invariants` command, and separately
