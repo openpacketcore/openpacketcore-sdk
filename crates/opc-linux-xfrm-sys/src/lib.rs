@@ -148,6 +148,8 @@ pub const XFRM_MSG_UPDSA: u16 = XFRM_MSG_BASE + 10;
 pub const XFRM_MSG_FLUSHSA: u16 = XFRM_MSG_BASE + 12;
 /// Flush Security Policies.
 pub const XFRM_MSG_FLUSHPOLICY: u16 = XFRM_MSG_BASE + 13;
+/// Update/query replay and lifetime state for an existing Security Association.
+pub const XFRM_MSG_NEWAE: u16 = XFRM_MSG_BASE + 14;
 /// Relocate one exactly identified Security Association.
 ///
 /// This is the single-state migration UAPI added after the older
@@ -165,6 +167,9 @@ pub const XFRM_POLICY_FWD: u8 = 2;
 pub const XFRM_POLICY_ALLOW: u8 = 0;
 /// XFRM policy blocks matching packets.
 pub const XFRM_POLICY_BLOCK: u8 = 1;
+
+/// XFRM asynchronous-event flag indicating a replay-value update.
+pub const XFRM_AE_RVAL: u32 = 2;
 
 /// XFRM transport mode.
 pub const XFRM_MODE_TRANSPORT: u8 = 0;
@@ -191,6 +196,10 @@ pub const XFRMA_TMPL: u16 = 5;
 pub const XFRMA_REPLAY_VAL: u16 = 10;
 /// XFRM optional source address attribute.
 pub const XFRMA_SRCADDR: u16 = 13;
+/// Dynamic last-use timestamp attribute emitted by GETSA.
+pub const XFRMA_LASTUSED: u16 = 15;
+/// XFRM policy-type attribute.
+pub const XFRMA_POLICY_TYPE: u16 = 16;
 /// XFRM optional combined-mode AEAD algorithm attribute.
 pub const XFRMA_ALG_AEAD: u16 = 18;
 /// XFRM optional authentication algorithm with truncation attribute.
@@ -199,12 +208,21 @@ pub const XFRMA_ALG_AUTH_TRUNC: u16 = 20;
 pub const XFRMA_MARK: u16 = 21;
 /// XFRM ESN replay sequence/bitmap attribute.
 pub const XFRMA_REPLAY_ESN_VAL: u16 = 23;
+/// Empty netlink alignment attribute.
+pub const XFRMA_PAD: u16 = 27;
 /// XFRM post-transform output skb-mark value attribute.
 pub const XFRMA_SET_MARK: u16 = 29;
 /// XFRM post-transform output skb-mark mask attribute.
 pub const XFRMA_SET_MARK_MASK: u16 = 30;
 /// XFRM optional interface identifier attribute.
 pub const XFRMA_IF_ID: u16 = 31;
+/// Optional Security Association direction attribute.
+pub const XFRMA_SA_DIR: u16 = 34;
+
+/// Main Security Policy Database policy type.
+pub const XFRM_POLICY_TYPE_MAIN: u8 = 0;
+/// Outbound Security Association direction.
+pub const XFRM_SA_DIR_OUT: u8 = 2;
 
 /// XFRM state uses Extended Sequence Numbers.
 pub const XFRM_STATE_ESN: u8 = 0x80;
@@ -636,7 +654,9 @@ mod tests {
         assert_eq!(XFRM_MSG_UPDSA, 0x1A);
         assert_eq!(XFRM_MSG_FLUSHSA, 0x1C);
         assert_eq!(XFRM_MSG_FLUSHPOLICY, 0x1D);
+        assert_eq!(XFRM_MSG_NEWAE, 0x1E);
         assert_eq!(XFRM_MSG_MIGRATE_STATE, 0x29);
+        assert_eq!(XFRM_AE_RVAL, 2);
         assert_eq!(XFRM_POLICY_IN, 0);
         assert_eq!(XFRM_POLICY_OUT, 1);
         assert_eq!(XFRM_POLICY_FWD, 2);
@@ -654,14 +674,20 @@ mod tests {
         assert_eq!(XFRMA_TMPL, 5);
         assert_eq!(XFRMA_REPLAY_VAL, 10);
         assert_eq!(XFRMA_SRCADDR, 13);
+        assert_eq!(XFRMA_LASTUSED, 15);
+        assert_eq!(XFRMA_POLICY_TYPE, 16);
         assert_eq!(XFRMA_ALG_AEAD, 18);
         assert_eq!(XFRMA_ALG_AUTH_TRUNC, 20);
         assert_eq!(XFRMA_MARK, 21);
         assert_eq!(XFRMA_REPLAY_ESN_VAL, 23);
+        assert_eq!(XFRMA_PAD, 27);
         assert_eq!(XFRMA_IF_ID, 31);
+        assert_eq!(XFRMA_SA_DIR, 34);
         assert_eq!(XFRMA_SET_MARK, 29);
         assert_eq!(XFRMA_SET_MARK_MASK, 30);
         assert_eq!(XFRM_STATE_ESN, 0x80);
+        assert_eq!(XFRM_POLICY_TYPE_MAIN, 0);
+        assert_eq!(XFRM_SA_DIR_OUT, 2);
         assert_eq!(XFRM_MIGRATE_STATE_CLEAR_OFFLOAD, 1);
         assert_eq!(XFRM_MIGRATE_STATE_UPDATE_H2H_SEL, 2);
         assert_eq!(XFRM_MIGRATE_STATE_KNOWN_FLAGS, 3);

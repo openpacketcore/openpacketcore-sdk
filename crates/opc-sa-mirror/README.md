@@ -8,9 +8,13 @@ SA keys **never persist** (RFC 015).
 An SA owner mirrors freshly derived keymat to a designated standby over mTLS;
 the standby holds it exclusively in zeroizing memory and, on owner loss, yields
 it together with validated `opc_ipsec_lb::SameSpiResume` evidence
-(`ResumeKeySource::LiveMirrored`) for the fenced re-pin. Nothing on this path
-can reach a persistence layer: the crate has no store dependency and the keymat
-type is deliberately not serializable.
+(`ResumeKeySource::LiveMirrored`) for the fenced re-pin. For ESP, mirror
+evidence alone cannot authorize steering: the consumer installs the yielded
+keymat through `opc-ipsec-xfrm`, applies and reads back the restored outbound
+counter, and supplies the resulting live receipt/target pair to
+`RePinCoordinator`. Nothing on this path can reach a persistence layer: the
+crate has no store dependency and the keymat type is deliberately not
+serializable.
 
 ## API Shape
 

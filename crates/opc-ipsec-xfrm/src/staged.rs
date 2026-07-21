@@ -32,6 +32,8 @@ use std::{
 };
 
 use crate::{
+    outbound_binding::{validate_outbound_request, OutboundSaPolicyExpectation},
+    InstalledOutboundSaBinding, NamespaceBoundLinuxXfrmBackend, OutboundSaBindingError,
     RemovePolicyRequest, RemoveSaRequest, XfrmBackend, XfrmCompositeInstallError,
     XfrmCompositeInstallRequest, XfrmCompositeOperation, XfrmCompositeOutcome, XfrmError,
 };
@@ -733,6 +735,22 @@ impl XfrmInstallJournal {
         Ok(())
     }
 
+    fn issue_outbound_binding(
+        &self,
+        backend: &NamespaceBoundLinuxXfrmBackend,
+        expectation: OutboundSaPolicyExpectation,
+    ) -> Result<InstalledOutboundSaBinding, OutboundSaBindingError> {
+        if self.ownership() != XfrmInstallOwnership::Committed {
+            return Err(OutboundSaBindingError::Commit {
+                source: XfrmInstallCommitError::NotComplete,
+            });
+        }
+        Ok(InstalledOutboundSaBinding::new(
+            backend.namespace_actor_binding(),
+            expectation,
+        ))
+    }
+
     /// Apply a generation-bound, exact recovery classification.
     ///
     /// Every candidate must be classified. `Owned` issues the exact retained
@@ -1037,6 +1055,44 @@ impl XfrmStagedInstall {
     /// Clone the caller-visible mutation journal.
     pub fn journal(&self) -> XfrmInstallJournal {
         self.journal.clone()
+    }
+
+    /// Run and commit an exact outbound ESP SA plus allow-policy install, then
+    /// return an opaque direction binding.
+    ///
+    /// This is the only fresh-install path that can mint
+    /// [`InstalledOutboundSaBinding`]. It accepts only the namespace-bound
+    /// production Linux actor, validates an unambiguous outbound allow policy
+    /// before mutation, reuses the affine/cancellation-safe staged runner, and
+    /// issues the binding only after both kernel ACKs, actor-local exact
+    /// `GETPOLICY`/`GETSA` readback (including key comparison), and journal
+    /// commit.
+    /// Generic [`Self::run`] remains source-compatible but cannot mint this
+    /// authority, regardless of which [`XfrmBackend`] it executes against.
+    ///
+    /// Clone [`Self::journal`] before starting if the caller needs to reconcile
+    /// an observer cancellation. Cancellation can leave an acknowledged staged
+    /// install for explicit recovery, but it never returns a binding or commits
+    /// cleanup authority implicitly. Exact-readback failure likewise leaves the
+    /// journal `Complete` and uncommitted so a caller-held clone retains cleanup
+    /// authority; it never mints a binding from ACKs alone.
+    pub async fn run_and_commit_outbound_sa_policy(
+        self,
+        backend: Arc<NamespaceBoundLinuxXfrmBackend>,
+    ) -> Result<InstalledOutboundSaBinding, OutboundSaBindingError> {
+        let expectation = validate_outbound_request(&self.request)?;
+        let supplied_sa = self.request.sa.parameters.clone();
+        let journal = self.journal();
+        self.run(Arc::clone(&backend))
+            .await
+            .map_err(|source| OutboundSaBindingError::Install { source })?;
+        backend
+            .validate_current_outbound_sa_binding(expectation.clone(), supplied_sa)
+            .await?;
+        journal
+            .commit()
+            .map_err(|source| OutboundSaBindingError::Commit { source })?;
+        journal.issue_outbound_binding(backend.as_ref(), expectation)
     }
 
     /// Consume and supervise this staged install exactly once.

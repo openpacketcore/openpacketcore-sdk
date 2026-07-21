@@ -6,7 +6,11 @@
 //! loss it yields the keymat together with validated
 //! [`opc_ipsec_lb::SameSpiResume`] evidence
 //! ([`opc_ipsec_lb::ResumeKeySource::LiveMirrored`]) for the ordinary fenced
-//! re-pin. See RFC 015 (`docs/rfc/015-live-sa-mirror.md`).
+//! re-pin. For ESP, that evidence is necessary but not sufficient: the
+//! consumer must install the yielded keymat through `opc-ipsec-xfrm`, apply
+//! and read back the restored outbound counter, and give the re-pin
+//! coordinator the resulting live receipt/target pair. See RFC 015
+//! (`docs/rfc/015-live-sa-mirror.md`).
 //!
 //! The custody invariant is structural: this crate has no persistence
 //! dependency, the keymat type is not serializable, key bytes live only in
@@ -44,9 +48,11 @@ mod integration_tests {
     use std::time::Duration;
 
     use opc_ipsec_lb::{
-        ClusterNode, MockOwnershipFencer, MockOwnershipSource, MockRePinAuditSink,
-        MockSteeringBackend, OwnershipFence, OwnershipTransitionId, RePinCoordinator, RePinRequest,
-        ResumeKeySource, SaId, SameSpiOutboundIvResume, SendIvCounterMode, SendIvForwardJump,
+        ClusterNode, DestinationContext, EspEncapsulationKind, EspOwnershipKey, EspSpi, IpAddress,
+        IpsecLbError, MockOwnershipFencer, MockOwnershipSource, MockRePinAuditSink,
+        MockSteeringBackend, OutboundSaBindingId, OwnershipFence, OwnershipTransitionId,
+        RePinCoordinator, RePinError, RePinRequest, ResumeKeySource, RoutingDomainTag, SaId,
+        SameSpiOutboundIvResume, SendIvCounterMode, SendIvForwardJump, SessionOwnershipKey,
         ShardId, SteerKey, SteeringRule, MIN_SEND_IV_FORWARD_JUMP,
     };
     use zeroize::Zeroizing;
@@ -84,7 +90,7 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    async fn fake_mesh_takeover_is_accepted_by_the_fenced_repin_coordinator() {
+    async fn fake_mesh_takeover_requires_applied_xfrm_proof_before_fenced_repin() {
         let sa = SaId::Esp { spi: 0x7788_99AA };
         let holder = Arc::new(InMemoryStandbyHolder::new());
         let producer = InProcessMirrorProducer::new(holder.clone());
@@ -116,12 +122,19 @@ mod integration_tests {
         ));
         assert_eq!(takeover.keymat.expose_secret_bytes(), &[0x5C; 36]);
 
-        // The evidence rides an ordinary fenced re-pin; the fencer stays the
-        // only split-brain authority.
+        // Mirror evidence can populate an ordinary fenced re-pin request, but
+        // it cannot replace the SDK XFRM apply/readback receipt. Without that
+        // independent live-kernel proof the coordinator fails before fencing.
         let previous_owner = ClusterNode::new("worker-a");
         let new_owner = ClusterNode::new("worker-b");
+        let ownership_key = SessionOwnershipKey::Esp(EspOwnershipKey::new(
+            DestinationContext::new(IpAddress::V4([192, 0, 2, 20]), RoutingDomainTag::new(7)),
+            EspEncapsulationKind::UdpEncapsulated,
+            EspSpi::new(0x7788_99AA).unwrap(),
+        ));
+        let outbound_sa_binding_id = OutboundSaBindingId::from_bytes([0x55; 32]);
         let fencer = MockOwnershipFencer::new();
-        fencer.set_owner(sa, previous_owner.clone());
+        fencer.set_owner(ownership_key, previous_owner.clone());
         let ownership = MockOwnershipSource::default();
         ownership.set_shard_owner(ShardId::new(2), new_owner.clone());
         let coordinator = RePinCoordinator::new(
@@ -131,24 +144,30 @@ mod integration_tests {
             MockRePinAuditSink::new(),
         );
 
-        let outcome = coordinator
-            .repin(RePinRequest {
-                sa,
-                transition_id: OwnershipTransitionId::new(1).unwrap(),
-                previous_fence: OwnershipFence::new(1).unwrap(),
-                previous_owner,
-                new_owner: new_owner.clone(),
-                rule: SteeringRule {
-                    shard: ShardId::new(1),
-                    owner: ShardId::new(2),
-                    key: SteerKey::EspSpi(0x7788_99AA),
-                },
-                resume: takeover.resume,
+        let request = RePinRequest::new_esp(
+            0x7788_99AA,
+            outbound_sa_binding_id,
+            OwnershipTransitionId::new(1).unwrap(),
+            OwnershipFence::new(1).unwrap(),
+            previous_owner.clone(),
+            new_owner,
+            SteeringRule {
+                shard: ShardId::new(1),
+                owner: ShardId::new(2),
+                key: SteerKey::EspSpi(0x7788_99AA),
+            },
+            ownership_key,
+            takeover.resume,
+        )
+        .unwrap();
+        assert_eq!(
+            coordinator.repin(request).await.unwrap_err(),
+            RePinError::BeforeOwnershipCommit(IpsecLbError::AppliedCounterProofRejected {
+                code: "esp_counter_proof_authority_not_configured",
             })
-            .await
-            .unwrap();
-        assert!(outcome.fence().get() > 1);
-        assert_eq!(fencer.owner(sa), Some(new_owner));
+        );
+        assert_eq!(fencer.owner(ownership_key), Some(previous_owner));
+        assert!(fencer.operations().is_empty());
 
         // Keymat is installed by the CNF adapter, then dropped => zeroized.
         drop(takeover);

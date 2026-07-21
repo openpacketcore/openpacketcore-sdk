@@ -44,9 +44,13 @@ the program never returns `XDP_DROP`:
   Some kernels defer transmit failures past the helper return, so the loader
   additionally validates the hand-off interface at attach time (it must
   exist, be up, and differ from the attached interface);
-- map miss, stale ownership generation (entry older than the fence in the
-  single-entry `IPSEC_LB_FENCE` hash map, whose replacement publishes the old
-  or new `u64` element),
+- map miss, absent destination-scoped fence, or stale ownership generation ->
+  slow path. ABI v5 selects the fence domain through `IPSEC_LB_CONFIG`:
+  legacy/global operation reads the single-entry `IPSEC_LB_FENCE` map, while
+  production re-pin reads the same canonical key from
+  `IPSEC_LB_KEY_FENCES`. An owner is live only when its generation exactly
+  equals the selected nonzero fence; owner-first/fence-last publication and
+  fence-first retirement therefore remain fail-closed at every crash cut;
   unclassifiable SWu candidates, and internal errors -> `XDP_PASS` to the
   userspace slow path with a distinct counter each.
 

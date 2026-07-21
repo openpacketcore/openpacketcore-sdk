@@ -15,15 +15,17 @@ logic used by both the eBPF program and the host:
   concurrent readers, while strict flags/reserved-byte decoding makes schema
   skew fail closed;
 - the versioned single-slot datapath configuration (self shard, routing
-  domain, userspace-redirector hand-off ifindex) and the separate
-  single-entry ownership fence generation in its own hash map, so replacement
-  publishes the old or new `u64` element to concurrent readers;
+  domain, userspace-redirector hand-off ifindex, and fence-domain mode), the
+  global single-entry ownership floor, and ABI-v5 destination-scoped keyed
+  fences. A keyed owner is live only when its generation exactly matches the
+  nonzero fence stored under the same canonical key;
 - the per-verdict counter indices (local, redirect, miss, stale,
   unclassifiable, error, pass-through, NAT-T keepalive);
 - the branch-bounded transport classification decision procedure
   (`classify_transport`), owner-map key derivation (`ownership_map_key`), and
-  owner-verdict decision (`decide_owner_verdict`), shared verbatim by the
-  eBPF program and host-side tests;
+  owner-verdict decisions (`decide_owner_verdict` and
+  `decide_owner_verdict_with_keyed_fence`), shared verbatim by the eBPF
+  program and host-side tests;
 - the fail-closed split for IPv6 extensions: XDP slow-paths every current
   IANA-registered extension kind except direct native ESP, while userspace
   performs a complete semantic walk for its supported subset and rejects the

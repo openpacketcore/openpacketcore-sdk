@@ -134,6 +134,11 @@ fn validate_interface_name(name: &str) -> Result<(), XfrmError> {
 }
 
 pub(crate) trait XfrmDscpRuntime: Send + Sync + std::fmt::Debug {
+    /// Create an empty runtime instance for a newly bound network namespace.
+    ///
+    /// Namespace-local interface and attachment handles must never be shared
+    /// with a backend actor bound in another namespace.
+    fn fresh_namespace_runtime(&self) -> Arc<dyn XfrmDscpRuntime>;
     fn ensure_ready(&self, config: &LinuxXfrmDscpMarkingConfig) -> Result<(), XfrmError>;
     fn capability(&self, config: &LinuxXfrmDscpMarkingConfig) -> XfrmCapability;
 }
@@ -155,6 +160,10 @@ struct UnsupportedDscpRuntime;
 
 #[cfg(not(target_os = "linux"))]
 impl XfrmDscpRuntime for UnsupportedDscpRuntime {
+    fn fresh_namespace_runtime(&self) -> Arc<dyn XfrmDscpRuntime> {
+        Arc::new(Self)
+    }
+
     fn ensure_ready(&self, _config: &LinuxXfrmDscpMarkingConfig) -> Result<(), XfrmError> {
         Err(XfrmError::UnsupportedFeature {
             feature: "fixed_outer_dscp",
@@ -173,7 +182,7 @@ mod aya_runtime {
     use std::io;
     use std::mem::ManuallyDrop;
     use std::path::{Path, PathBuf};
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     use aya::maps::{Array, IterableMap, MapInfo};
     use aya::pin::PinError;
@@ -577,6 +586,10 @@ mod aya_runtime {
     }
 
     impl XfrmDscpRuntime for AyaXfrmDscpRuntime {
+        fn fresh_namespace_runtime(&self) -> Arc<dyn XfrmDscpRuntime> {
+            Arc::new(Self::new())
+        }
+
         fn ensure_ready(&self, config: &LinuxXfrmDscpMarkingConfig) -> Result<(), XfrmError> {
             config.validate()?;
             match Self::environment_capability() {

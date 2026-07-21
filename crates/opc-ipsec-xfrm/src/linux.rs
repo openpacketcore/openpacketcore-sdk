@@ -2,6 +2,7 @@
 
 use std::fmt;
 use std::io;
+use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,23 +12,33 @@ use opc_ipsec_xfrm_ebpf_common::{MarkProfile, IPPROTO_ESP};
 use opc_linux_xfrm_sys::{
     align_to_netlink, open_netlink_socket, receive_message, send_message, LINUX_EINVAL,
     LINUX_ENOPROTOOPT, NLMSG_DONE, NLMSG_ERROR, NLM_F_ACK, NLM_F_CREATE, NLM_F_EXCL, NLM_F_REPLACE,
-    NLM_F_REQUEST, XFRMA_ALG_AEAD, XFRMA_ALG_AUTH_TRUNC, XFRMA_ALG_CRYPT, XFRMA_ENCAP, XFRMA_IF_ID,
-    XFRMA_MARK, XFRMA_REPLAY_ESN_VAL, XFRMA_REPLAY_VAL, XFRMA_SET_MARK, XFRMA_SET_MARK_MASK,
-    XFRMA_TMPL, XFRM_MSG_ALLOCSPI, XFRM_MSG_DELPOLICY, XFRM_MSG_DELSA, XFRM_MSG_GETSA,
-    XFRM_MSG_MIGRATE_STATE, XFRM_MSG_NEWPOLICY, XFRM_MSG_NEWSA, XFRM_MSG_UPDPOLICY, XFRM_MSG_UPDSA,
-    XFRM_POLICY_ALLOW, XFRM_POLICY_BLOCK, XFRM_POLICY_FWD, XFRM_POLICY_IN, XFRM_POLICY_OUT,
+    NLM_F_REQUEST, XFRMA_ALG_AEAD, XFRMA_ALG_AUTH, XFRMA_ALG_AUTH_TRUNC, XFRMA_ALG_CRYPT,
+    XFRMA_ENCAP, XFRMA_IF_ID, XFRMA_LASTUSED, XFRMA_MARK, XFRMA_PAD, XFRMA_POLICY_TYPE,
+    XFRMA_REPLAY_ESN_VAL, XFRMA_REPLAY_VAL, XFRMA_SA_DIR, XFRMA_SET_MARK, XFRMA_SET_MARK_MASK,
+    XFRMA_TMPL, XFRM_AE_RVAL, XFRM_MSG_ALLOCSPI, XFRM_MSG_DELPOLICY, XFRM_MSG_DELSA,
+    XFRM_MSG_GETPOLICY, XFRM_MSG_GETSA, XFRM_MSG_MIGRATE_STATE, XFRM_MSG_NEWAE, XFRM_MSG_NEWPOLICY,
+    XFRM_MSG_NEWSA, XFRM_MSG_UPDPOLICY, XFRM_MSG_UPDSA, XFRM_POLICY_ALLOW, XFRM_POLICY_BLOCK,
+    XFRM_POLICY_FWD, XFRM_POLICY_IN, XFRM_POLICY_OUT, XFRM_POLICY_TYPE_MAIN, XFRM_SA_DIR_OUT,
     XFRM_STATE_ESN,
 };
+use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 use crate::dscp::{production_runtime, LinuxXfrmDscpMarkingConfig, XfrmDscpRuntime};
-use crate::model::{validate_relocate_sa_request, validate_sa_output_mark, validate_sa_query};
+use crate::model::{
+    sa_uses_esn, validate_relocate_sa_request, validate_sa_output_mark, validate_sa_query,
+};
+use crate::namespace::{self, NamespaceBoundLinuxXfrmBackend, NetworkNamespaceBinding};
+use crate::outbound_binding::{
+    expected_policy, expected_sa, readback_mismatch, OutboundSaCryptoExpectation,
+    OutboundSaPolicyExpectation,
+};
 use crate::{
     AllocateSpiRequest, DscpCodepoint, InstallPolicyRequest, InstallSaRequest, IpAddress,
-    LifetimeConfig, LifetimeCurrent, PolicyParameters, QuerySaRequest, RekeyPolicyRequest,
-    RekeySaRequest, RelocateSaRequest, RemovePolicyRequest, RemoveSaRequest, SaParameters,
-    SaRelocationEncap, SaRelocationIdentity, SaRelocationSelector, SaReplayState, SaState,
-    SaStatistics, SpiAllocation, UdpEncap, XfrmAction, XfrmBackend, XfrmBackendKind,
+    LifetimeConfig, LifetimeCurrent, OutboundSaBindingError, PolicyParameters, QuerySaRequest,
+    RekeyPolicyRequest, RekeySaRequest, RelocateSaRequest, RemovePolicyRequest, RemoveSaRequest,
+    SaParameters, SaRelocationEncap, SaRelocationIdentity, SaRelocationSelector, SaReplayState,
+    SaState, SaStatistics, SpiAllocation, UdpEncap, XfrmAction, XfrmBackend, XfrmBackendKind,
     XfrmCapability, XfrmDirection, XfrmError, XfrmId, XfrmMark, XfrmMode, XfrmProbe, XfrmRequestId,
     XfrmSelector, XfrmTemplate, XFRM_AEAD_RFC4106_GCM_AES,
 };
@@ -46,6 +57,7 @@ const XFRM_USER_POLICY_ID_LEN: usize = 64;
 const XFRM_USER_TEMPLATE_LEN: usize = 64;
 const XFRM_USER_SPI_INFO_LEN: usize = 232;
 const XFRM_USER_MIGRATE_STATE_LEN: usize = 132;
+const XFRM_AEVENT_ID_LEN: usize = 48;
 const XFRM_ALG_NAME_LEN: usize = 64;
 const XFRM_ALGO_HEADER_LEN: usize = 68;
 const XFRM_ALGO_AUTH_HEADER_LEN: usize = 72;
@@ -66,8 +78,9 @@ const RELOCATION_CAPABILITY_UNKNOWN: u8 = 0;
 const RELOCATION_CAPABILITY_AVAILABLE: u8 = 1;
 const RELOCATION_CAPABILITY_MISSING: u8 = 2;
 const SA_RELOCATION_PROBE_SPI: u32 = 0xffff_fffe;
+const XFRM_KEY_READBACK_REDACTED: &str = "xfrm_key_readback_redacted";
 
-type SensitiveBuffer = Zeroizing<Vec<u8>>;
+pub(crate) type SensitiveBuffer = Zeroizing<Vec<u8>>;
 
 /// Runtime behavior for the safe Linux XFRM backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,12 +122,18 @@ struct LinuxXfrmBackendInner {
     dscp_runtime: Arc<dyn XfrmDscpRuntime>,
     dscp_xfrm_attributes_verified: AtomicBool,
     sa_relocation_capability: AtomicU8,
+    namespace_binding: Option<NetworkNamespaceBinding>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SaRelocationSnapshot {
     state: SaState,
     identity: SaRelocationIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PolicyState {
+    parameters: PolicyParameters,
 }
 
 impl fmt::Debug for LinuxXfrmBackend {
@@ -151,6 +170,7 @@ impl LinuxXfrmBackend {
                 dscp_runtime: production_runtime(),
                 dscp_xfrm_attributes_verified: AtomicBool::new(false),
                 sa_relocation_capability: AtomicU8::new(RELOCATION_CAPABILITY_UNKNOWN),
+                namespace_binding: None,
             }),
         }
     }
@@ -181,12 +201,13 @@ impl LinuxXfrmBackend {
                 dscp_runtime: runtime,
                 dscp_xfrm_attributes_verified: AtomicBool::new(false),
                 sa_relocation_capability: AtomicU8::new(RELOCATION_CAPABILITY_UNKNOWN),
+                namespace_binding: None,
             }),
         })
     }
 
     #[cfg(test)]
-    fn with_transport<T>(transport: T) -> Self
+    pub(crate) fn with_transport<T>(transport: T) -> Self
     where
         T: LinuxXfrmTransport + 'static,
     {
@@ -203,12 +224,13 @@ impl LinuxXfrmBackend {
                 dscp_runtime: production_runtime(),
                 dscp_xfrm_attributes_verified: AtomicBool::new(false),
                 sa_relocation_capability: AtomicU8::new(RELOCATION_CAPABILITY_UNKNOWN),
+                namespace_binding: None,
             }),
         }
     }
 
     #[cfg(test)]
-    fn with_transport_and_dscp_runtime<T, R>(
+    pub(crate) fn with_transport_and_dscp_runtime<T, R>(
         transport: T,
         dscp_config: LinuxXfrmDscpMarkingConfig,
         dscp_runtime: R,
@@ -232,8 +254,69 @@ impl LinuxXfrmBackend {
                 dscp_runtime: Arc::new(dscp_runtime),
                 dscp_xfrm_attributes_verified: AtomicBool::new(false),
                 sa_relocation_capability: AtomicU8::new(RELOCATION_CAPABILITY_UNKNOWN),
+                namespace_binding: None,
             }),
         })
+    }
+
+    /// Bind this backend to the calling thread's current Linux network
+    /// namespace.
+    ///
+    /// The returned backend owns a bounded actor on a dedicated OS thread that
+    /// inherits the caller's namespace. Every XFRM and fixed-DSCP operation is
+    /// executed on that thread and cross-checks the opaque namespace identity
+    /// before opening a socket or touching the DSCP companion.
+    ///
+    /// Waiting for queue admission is cancellation-safe: dropping the future
+    /// before admission performs no operation. Once admitted, an operation is
+    /// always drained by the actor even if its caller goes away. A lost reply
+    /// from an admitted mutation is reported as
+    /// [`XfrmError::StateIndeterminate`].
+    pub fn bind_current_network_namespace(
+        self,
+    ) -> Result<NamespaceBoundLinuxXfrmBackend, XfrmError> {
+        namespace::bind_current_network_namespace(self)
+    }
+
+    pub(crate) fn for_namespace_actor(self, binding: NetworkNamespaceBinding) -> Self {
+        let inner = self.inner;
+        Self {
+            inner: Arc::new(LinuxXfrmBackendInner {
+                transport: Arc::clone(&inner.transport),
+                next_sequence: AtomicU32::new(inner.next_sequence.load(Ordering::Acquire)),
+                config: inner.config,
+                dscp_config: inner.dscp_config.clone(),
+                dscp_runtime: inner.dscp_runtime.fresh_namespace_runtime(),
+                // Both observations were made through the source backend's
+                // execution context. They are not authority in a newly bound
+                // namespace, even when the underlying kernel is shared.
+                dscp_xfrm_attributes_verified: AtomicBool::new(false),
+                sa_relocation_capability: AtomicU8::new(RELOCATION_CAPABILITY_UNKNOWN),
+                namespace_binding: Some(binding),
+            }),
+        }
+    }
+
+    pub(crate) fn prepare_namespace_actor(&self) -> Result<(), XfrmError> {
+        self.ensure_namespace_binding()?;
+        if let Some(config) = &self.inner.dscp_config {
+            // DSCP program/map adoption is namespace-scoped too. Repeat the
+            // identity check immediately before entering that runtime.
+            self.ensure_namespace_binding()?;
+            self.inner.dscp_runtime.ensure_ready(config)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn verify_namespace_actor(&self) -> Result<(), XfrmError> {
+        self.ensure_namespace_binding()
+    }
+
+    fn ensure_namespace_binding(&self) -> Result<(), XfrmError> {
+        match self.inner.namespace_binding {
+            Some(binding) => binding.ensure_current(),
+            None => Ok(()),
+        }
     }
 
     fn prepare_dscp(&self, parameters: &SaParameters) -> Result<Option<MarkProfile>, XfrmError> {
@@ -251,6 +334,7 @@ impl LinuxXfrmBackend {
         validate_fixed_outer_dscp(parameters, profile, dscp)?;
         // Revalidate actual map/filter ownership for every marked mutation so
         // runtime readiness loss is repaired or reported before XFRM ACK.
+        self.ensure_namespace_binding()?;
         self.inner.dscp_runtime.ensure_ready(config)?;
         Ok(Some(profile))
     }
@@ -290,6 +374,9 @@ impl LinuxXfrmBackend {
         flags: u16,
         body: SensitiveBuffer,
     ) -> Result<Option<SensitiveBuffer>, XfrmError> {
+        // Keep the identity check adjacent to transport socket creation. A
+        // namespace-bound backend calls this inline on its actor thread.
+        self.ensure_namespace_binding()?;
         let sequence = self.next_sequence();
         let request = encode_netlink_message(message_type, flags, sequence, &body)?;
         self.inner
@@ -304,6 +391,9 @@ impl LinuxXfrmBackend {
         flags: u16,
         body: SensitiveBuffer,
     ) -> Result<Option<SensitiveBuffer>, XfrmError> {
+        if self.inner.namespace_binding.is_some() {
+            return self.transact(operation, message_type, flags, body);
+        }
         let backend = self.clone();
         tokio::task::spawn_blocking(move || backend.transact(operation, message_type, flags, body))
             .await
@@ -385,6 +475,170 @@ impl LinuxXfrmBackend {
             .await?
             .ok_or_else(|| XfrmError::io(operation, invalid_data("missing getsa response")))?;
         parse_sa_relocation_snapshot(&response)
+    }
+
+    async fn query_policy_for_outbound_binding(
+        &self,
+        parameters: &PolicyParameters,
+    ) -> Result<PolicyState, XfrmError> {
+        let body = encode_policy_query(parameters)?;
+        let response = self
+            .transact_blocking(
+                "query_outbound_policy_binding",
+                XFRM_MSG_GETPOLICY,
+                NLM_F_REQUEST | NLM_F_ACK,
+                body,
+            )
+            .await?
+            .ok_or_else(|| {
+                XfrmError::io(
+                    "query_outbound_policy_binding",
+                    invalid_data("missing getpolicy response"),
+                )
+            })?;
+        parse_policy_state(&response)
+    }
+
+    async fn query_sa_for_outbound_binding(
+        &self,
+        parameters: &SaParameters,
+    ) -> Result<SensitiveBuffer, XfrmError> {
+        let body = encode_sa_id(
+            parameters.id.destination,
+            parameters.id.protocol,
+            parameters.id.spi,
+            parameters.mark,
+        )?;
+        self.transact_blocking(
+            "query_outbound_sa_binding",
+            XFRM_MSG_GETSA,
+            NLM_F_REQUEST | NLM_F_ACK,
+            body,
+        )
+        .await?
+        .ok_or_else(|| {
+            XfrmError::io(
+                "query_outbound_sa_binding",
+                invalid_data("missing getsa response"),
+            )
+        })
+    }
+
+    /// Update only the replay state of an exactly preflighted outbound SA.
+    ///
+    /// `UPDSA` replaces SA configuration and does not restore live replay
+    /// counters on Linux. `NEWAE` is the dedicated replay/lifetime UAPI; its
+    /// kernel handler holds the SA lock while copying the supplied replay
+    /// state. Callers must still perform exact GETSA readback afterward.
+    pub(crate) async fn update_outbound_sa_replay_state(
+        &self,
+        parameters: &SaParameters,
+        replay_state: &SaReplayState,
+    ) -> Result<(), XfrmError> {
+        let body = encode_sa_replay_update(parameters, replay_state)?;
+        self.run_ack(
+            "update_outbound_sa_replay_state",
+            XFRM_MSG_NEWAE,
+            NLM_F_REQUEST | NLM_F_ACK | NLM_F_REPLACE,
+            body,
+        )
+        .await
+    }
+
+    pub(crate) async fn validate_outbound_sa_binding(
+        &self,
+        expectation: &OutboundSaPolicyExpectation,
+        supplied_sa: &SaParameters,
+    ) -> Result<(), OutboundSaBindingError> {
+        self.read_outbound_sa_binding(expectation, supplied_sa)
+            .await
+            .map(|_| ())
+    }
+
+    pub(crate) async fn read_outbound_sa_binding(
+        &self,
+        expectation: &OutboundSaPolicyExpectation,
+        supplied_sa: &SaParameters,
+    ) -> Result<SaState, OutboundSaBindingError> {
+        self.read_outbound_sa_binding_inner(expectation, Some(supplied_sa))
+            .await
+    }
+
+    pub(crate) async fn read_outbound_sa_binding_metadata(
+        &self,
+        expectation: &OutboundSaPolicyExpectation,
+    ) -> Result<SaState, OutboundSaBindingError> {
+        self.read_outbound_sa_binding_inner(expectation, None).await
+    }
+
+    async fn read_outbound_sa_binding_inner(
+        &self,
+        expectation: &OutboundSaPolicyExpectation,
+        supplied_sa: Option<&SaParameters>,
+    ) -> Result<SaState, OutboundSaBindingError> {
+        let expected_policy = expected_policy(expectation);
+        let observed_policy = match self
+            .query_policy_for_outbound_binding(expected_policy)
+            .await
+        {
+            Ok(policy) => policy,
+            Err(XfrmError::NotFound) => {
+                return readback_mismatch("xfrm_outbound_sa_binding_current_policy_missing")
+            }
+            Err(source) => return Err(OutboundSaBindingError::Readback { source }),
+        };
+        if observed_policy.parameters != *expected_policy {
+            return readback_mismatch("xfrm_outbound_sa_binding_current_policy_mismatch");
+        }
+
+        let expected_sa = expected_sa(expectation);
+        let observed_sa_body = match self.query_sa_for_outbound_binding(expected_sa).await {
+            Ok(body) => body,
+            Err(XfrmError::NotFound) => {
+                return readback_mismatch("xfrm_outbound_sa_binding_current_sa_missing")
+            }
+            Err(source) => return Err(OutboundSaBindingError::Readback { source }),
+        };
+        let observed_sa =
+            match parse_outbound_sa_binding_snapshot(&observed_sa_body, expectation, supplied_sa) {
+                Ok(sa) => sa,
+                Err(XfrmError::UnsupportedFeature {
+                    feature: XFRM_KEY_READBACK_REDACTED,
+                }) => {
+                    return readback_mismatch("xfrm_outbound_sa_binding_key_readback_unavailable");
+                }
+                Err(_) => {
+                    return readback_mismatch("xfrm_outbound_sa_binding_current_sa_mismatch");
+                }
+            };
+        let dscp_profile = self
+            .inner
+            .dscp_config
+            .as_ref()
+            .map(LinuxXfrmDscpMarkingConfig::profile)
+            .transpose()
+            .map_err(|source| OutboundSaBindingError::Readback { source })?;
+        let expected_output_mark = compose_output_mark(expected_sa, dscp_profile)
+            .map_err(|source| OutboundSaBindingError::Readback { source })?;
+        let expected_identity = SaRelocationIdentity {
+            selector: SaRelocationSelector::from_selector(&expected_sa.selector),
+            id: expected_sa.id,
+            source_address: expected_sa.source_address,
+            request_id: expected_sa.request_id,
+            mode: expected_sa.mode,
+            encap: expected_sa.encap,
+            mark: expected_sa.mark,
+            if_id: expected_sa.if_id,
+            output_mark: expected_output_mark,
+        };
+        if observed_sa.identity != expected_identity
+            || observed_sa.state.lifetime_config != expected_sa.lifetime
+            || observed_sa.state.replay_window != expected_sa.replay_window
+        {
+            return readback_mismatch("xfrm_outbound_sa_binding_current_sa_mismatch");
+        }
+
+        Ok(observed_sa.state)
     }
 
     async fn reconcile_sa_relocation(
@@ -683,6 +937,7 @@ impl XfrmBackend for LinuxXfrmBackend {
     }
 
     async fn probe(&self) -> Result<XfrmProbe, XfrmError> {
+        self.ensure_namespace_binding()?;
         let mut probe = self.inner.transport.probe(self.inner.config);
         probe.egress_dscp_marking =
             self.inner
@@ -705,6 +960,7 @@ impl XfrmBackend for LinuxXfrmBackend {
     }
 
     async fn sa_relocation_capability(&self) -> Result<XfrmCapability, XfrmError> {
+        self.ensure_namespace_binding()?;
         let probe = self.inner.transport.probe(self.inner.config);
         if !probe.platform_supported {
             return Ok(XfrmCapability::Missing);
@@ -745,7 +1001,7 @@ impl XfrmBackend for LinuxXfrmBackend {
     }
 }
 
-trait LinuxXfrmTransport: Send + Sync + fmt::Debug {
+pub(crate) trait LinuxXfrmTransport: Send + Sync + fmt::Debug {
     fn transact(
         &self,
         operation: &'static str,
@@ -1055,11 +1311,13 @@ fn encode_sa_info_inner(
     );
     push_u16_ne(&mut out, family);
     push_u8(&mut out, encode_mode(parameters.mode));
-    push_u8(
-        &mut out,
-        parameters.replay_window.min(u32::from(u8::MAX)) as u8,
-    );
-    push_u8(&mut out, encode_sa_flags(parameters));
+    let flags = encode_sa_flags(parameters);
+    // Linux requires the legacy one-byte replay window to be zero whenever
+    // ESN is selected. The complete window belongs exclusively to
+    // XFRMA_REPLAY_ESN_VAL in that profile.
+    let fixed_replay_window = encode_fixed_replay_window(parameters);
+    push_u8(&mut out, fixed_replay_window);
+    push_u8(&mut out, flags);
     out.resize(XFRM_USER_SA_INFO_LEN, 0);
 
     if let Some((auth, key)) = &parameters.auth {
@@ -1143,6 +1401,59 @@ fn encode_sa_id(
     push_u8(&mut out, protocol);
     out.resize(XFRM_USER_SA_ID_LEN, 0);
     if let Some(mark) = mark {
+        append_attr(&mut out, XFRMA_MARK, &encode_mark(mark))?;
+    }
+    Ok(out)
+}
+
+fn encode_sa_replay_update(
+    parameters: &SaParameters,
+    replay_state: &SaReplayState,
+) -> Result<SensitiveBuffer, XfrmError> {
+    if parameters.id.protocol != IPPROTO_ESP || parameters.id.spi == 0 {
+        return Err(XfrmError::invalid_config(
+            "sa.id",
+            "replay update requires a nonzero ESP SA",
+        ));
+    }
+    validate_replay_state(replay_state, parameters.replay_window)?;
+    if replay_state.esn != sa_uses_esn(parameters) {
+        return Err(XfrmError::invalid_config(
+            "replay_state.esn",
+            "replay mode must match the installed SA",
+        ));
+    }
+
+    let mut out = sensitive_buffer_with_capacity(XFRM_AEVENT_ID_LEN + 128);
+    // struct xfrm_usersa_id
+    encode_address(&mut out, parameters.id.destination);
+    push_u32_be(&mut out, parameters.id.spi);
+    push_u16_ne(&mut out, address_family(parameters.id.destination));
+    push_u8(&mut out, parameters.id.protocol);
+    push_u8(&mut out, 0);
+    // struct xfrm_aevent_id trailing fields
+    encode_address(&mut out, parameters.source_address);
+    push_u32_ne(&mut out, XFRM_AE_RVAL);
+    push_u32_ne(
+        &mut out,
+        parameters.request_id.map_or(0, XfrmRequestId::get),
+    );
+    debug_assert_eq!(out.len(), XFRM_AEVENT_ID_LEN);
+
+    if replay_state.esn {
+        append_attr(
+            &mut out,
+            XFRMA_REPLAY_ESN_VAL,
+            &encode_replay_state_esn(replay_state)?,
+        )?;
+    } else {
+        append_attr(
+            &mut out,
+            XFRMA_REPLAY_VAL,
+            &encode_replay_state_legacy(replay_state)?,
+        )?;
+    }
+    if let Some(mark) = parameters.mark {
         append_attr(&mut out, XFRMA_MARK, &encode_mark(mark))?;
     }
     Ok(out)
@@ -1272,6 +1583,25 @@ fn encode_policy_id(
     push_u8(&mut out, encode_direction(direction));
     out.resize(XFRM_USER_POLICY_ID_LEN, 0);
     append_common_attrs(&mut out, mark, None)?;
+    Ok(out)
+}
+
+fn encode_policy_query(parameters: &PolicyParameters) -> Result<SensitiveBuffer, XfrmError> {
+    validate_selector_family(&parameters.selector)?;
+    let mut out = sensitive_buffer_with_capacity(
+        XFRM_USER_POLICY_ID_LEN
+            + parameters
+                .mark
+                .map_or(0, |_| ROUTE_ATTRIBUTE_HEADER_LEN + XFRM_MARK_LEN)
+            + parameters
+                .if_id
+                .map_or(0, |_| ROUTE_ATTRIBUTE_HEADER_LEN + 4),
+    );
+    encode_selector(&mut out, &parameters.selector)?;
+    push_u32_ne(&mut out, 0);
+    push_u8(&mut out, encode_direction(parameters.direction));
+    out.resize(XFRM_USER_POLICY_ID_LEN, 0);
+    append_common_attrs(&mut out, parameters.mark, parameters.if_id)?;
     Ok(out)
 }
 
@@ -1444,16 +1774,18 @@ fn encode_udp_encap(encap: UdpEncap) -> SensitiveBuffer {
 }
 
 fn encode_sa_flags(parameters: &SaParameters) -> u8 {
-    if parameters.replay_window > 32
-        || parameters
-            .replay_state
-            .as_ref()
-            .map(|state| state.esn)
-            .unwrap_or(false)
-    {
+    if sa_uses_esn(parameters) {
         XFRM_STATE_ESN
     } else {
         0
+    }
+}
+
+fn encode_fixed_replay_window(parameters: &SaParameters) -> u8 {
+    if encode_sa_flags(parameters) & XFRM_STATE_ESN != 0 {
+        0
+    } else {
+        parameters.replay_window.min(u32::from(u8::MAX)) as u8
     }
 }
 
@@ -1642,6 +1974,11 @@ fn parse_sa_state(payload: &[u8], dscp_profile: Option<MarkProfile>) -> Result<S
 }
 
 fn parse_sa_relocation_snapshot(payload: &[u8]) -> Result<SaRelocationSnapshot, XfrmError> {
+    validate_route_attribute_stream(
+        payload,
+        XFRM_USER_SA_INFO_LEN,
+        "query_sa_relocation_identity",
+    )?;
     let state = parse_sa_state(payload, None)?;
     let identity = SaRelocationIdentity {
         selector: decode_sa_relocation_selector(payload, 0)?,
@@ -1655,6 +1992,667 @@ fn parse_sa_relocation_snapshot(payload: &[u8]) -> Result<SaRelocationSnapshot, 
         output_mark: state.output_mark,
     };
     Ok(SaRelocationSnapshot { state, identity })
+}
+
+fn parse_outbound_sa_binding_snapshot(
+    payload: &[u8],
+    expectation: &OutboundSaPolicyExpectation,
+    supplied_sa: Option<&SaParameters>,
+) -> Result<SaRelocationSnapshot, XfrmError> {
+    let expected = expected_sa(expectation);
+    validate_route_attribute_stream(payload, XFRM_USER_SA_INFO_LEN, "query_outbound_sa_binding")?;
+    validate_allowed_route_attributes(
+        payload,
+        XFRM_USER_SA_INFO_LEN,
+        &[
+            XFRMA_ALG_AUTH,
+            XFRMA_ALG_AUTH_TRUNC,
+            XFRMA_ALG_CRYPT,
+            XFRMA_ENCAP,
+            XFRMA_REPLAY_VAL,
+            XFRMA_LASTUSED,
+            XFRMA_ALG_AEAD,
+            XFRMA_MARK,
+            XFRMA_REPLAY_ESN_VAL,
+            XFRMA_PAD,
+            XFRMA_SET_MARK,
+            XFRMA_SET_MARK_MASK,
+            XFRMA_IF_ID,
+            XFRMA_SA_DIR,
+        ],
+        "query_outbound_sa_binding",
+    )?;
+    validate_outbound_sa_fixed_header(payload, expected, expectation.replay_esn())?;
+    validate_outbound_sa_dynamic_attributes(payload)?;
+    validate_outbound_sa_replay_attributes(payload, expectation.replay_esn())?;
+    match supplied_sa {
+        Some(supplied_sa) => validate_outbound_sa_crypto(payload, supplied_sa)?,
+        None => validate_outbound_sa_crypto_metadata(payload, expectation.crypto())?,
+    }
+    parse_sa_relocation_snapshot(payload)
+}
+
+fn validate_outbound_sa_fixed_header(
+    payload: &[u8],
+    expected: &SaParameters,
+    expected_esn: bool,
+) -> Result<(), XfrmError> {
+    if payload.len() < XFRM_USER_SA_INFO_LEN {
+        return Err(XfrmError::io(
+            "query_outbound_sa_binding",
+            invalid_data("short getsa response"),
+        ));
+    }
+    let family = read_u16_ne(payload, 212)?;
+    let noncanonical_ipv4 = family == AF_INET
+        && (payload[60..72].iter().any(|octet| *octet != 0)
+            || payload[84..96].iter().any(|octet| *octet != 0));
+    if family != address_family(expected.id.destination)
+        || noncanonical_ipv4
+        || payload[77..80].iter().any(|octet| *octet != 0)
+        // The SDK does not model soft/hard use-time expiry and always installs
+        // both values as zero. They are immutable configuration, not the
+        // dynamic lifetime-current timestamps at bytes 160..192.
+        || payload[144..160].iter().any(|octet| *octet != 0)
+        || read_u8(payload, 215)?
+            != if expected_esn {
+                0
+            } else {
+                expected.replay_window.min(u32::from(u8::MAX)) as u8
+            }
+        || read_u8(payload, 216)? != if expected_esn { XFRM_STATE_ESN } else { 0 }
+        || payload[217..XFRM_USER_SA_INFO_LEN]
+            .iter()
+            .any(|octet| *octet != 0)
+    {
+        return Err(XfrmError::io(
+            "query_outbound_sa_binding",
+            invalid_data("unsupported SA metadata"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_outbound_sa_dynamic_attributes(payload: &[u8]) -> Result<(), XfrmError> {
+    if let Some(last_used) = unique_route_attribute(
+        payload,
+        XFRM_USER_SA_INFO_LEN,
+        XFRMA_LASTUSED,
+        "query_outbound_sa_binding",
+    )? {
+        if last_used.len() != size_of::<u64>() {
+            return Err(XfrmError::io(
+                "query_outbound_sa_binding",
+                invalid_data("invalid last-used attribute length"),
+            ));
+        }
+    }
+    if let Some(pad) = unique_route_attribute(
+        payload,
+        XFRM_USER_SA_INFO_LEN,
+        XFRMA_PAD,
+        "query_outbound_sa_binding",
+    )? {
+        if !pad.is_empty() {
+            return Err(XfrmError::io(
+                "query_outbound_sa_binding",
+                invalid_data("invalid netlink alignment attribute"),
+            ));
+        }
+    }
+    if let Some(direction) = unique_route_attribute(
+        payload,
+        XFRM_USER_SA_INFO_LEN,
+        XFRMA_SA_DIR,
+        "query_outbound_sa_binding",
+    )? {
+        if direction != [XFRM_SA_DIR_OUT] {
+            return Err(XfrmError::io(
+                "query_outbound_sa_binding",
+                invalid_data("SA direction is not outbound"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_outbound_sa_replay_attributes(
+    payload: &[u8],
+    expected_esn: bool,
+) -> Result<(), XfrmError> {
+    let legacy = unique_route_attribute(
+        payload,
+        XFRM_USER_SA_INFO_LEN,
+        XFRMA_REPLAY_VAL,
+        "query_outbound_sa_binding",
+    )?;
+    let esn = unique_route_attribute(
+        payload,
+        XFRM_USER_SA_INFO_LEN,
+        XFRMA_REPLAY_ESN_VAL,
+        "query_outbound_sa_binding",
+    )?;
+    if legacy.is_some() && esn.is_some() {
+        return Err(XfrmError::io(
+            "query_outbound_sa_binding",
+            invalid_data("contradictory SA replay attributes"),
+        ));
+    }
+    if expected_esn {
+        let esn = esn.ok_or_else(|| {
+            XfrmError::io(
+                "query_outbound_sa_binding",
+                invalid_data("missing ESN replay attribute"),
+            )
+        })?;
+        let _ = decode_replay_state_esn(esn)?;
+    } else {
+        if esn.is_some() {
+            return Err(XfrmError::io(
+                "query_outbound_sa_binding",
+                invalid_data("unexpected ESN replay attribute"),
+            ));
+        }
+        if let Some(legacy) = legacy {
+            let _ = decode_replay_state_legacy(legacy, u32::from(read_u8(payload, 215)?))?;
+        }
+    }
+    Ok(())
+}
+
+struct ObservedSaAlgorithm<'a> {
+    name: &'a str,
+    key: &'a [u8],
+}
+
+struct ObservedSaAuth<'a> {
+    algorithm: ObservedSaAlgorithm<'a>,
+    truncation_len_bits: u32,
+}
+
+struct ObservedSaAead<'a> {
+    algorithm: ObservedSaAlgorithm<'a>,
+    icv_len_bits: u32,
+}
+
+fn validate_outbound_sa_crypto(payload: &[u8], expected: &SaParameters) -> Result<(), XfrmError> {
+    // Linux GETSA emits both authentication encodings for an installed
+    // truncation-aware algorithm. Treat them as one redundant assertion and
+    // require both copies to match the transient zeroizing install intent.
+    let legacy_auth = unique_route_attribute(
+        payload,
+        XFRM_USER_SA_INFO_LEN,
+        XFRMA_ALG_AUTH,
+        "query_outbound_sa_binding",
+    )?
+    .map(|attribute| parse_observed_sa_algorithm(attribute, XFRM_ALGO_HEADER_LEN))
+    .transpose()?;
+    let auth = unique_route_attribute(
+        payload,
+        XFRM_USER_SA_INFO_LEN,
+        XFRMA_ALG_AUTH_TRUNC,
+        "query_outbound_sa_binding",
+    )?
+    .map(parse_observed_sa_auth)
+    .transpose()?;
+    let crypt = unique_route_attribute(
+        payload,
+        XFRM_USER_SA_INFO_LEN,
+        XFRMA_ALG_CRYPT,
+        "query_outbound_sa_binding",
+    )?
+    .map(|attribute| parse_observed_sa_algorithm(attribute, XFRM_ALGO_HEADER_LEN))
+    .transpose()?;
+    let aead = unique_route_attribute(
+        payload,
+        XFRM_USER_SA_INFO_LEN,
+        XFRMA_ALG_AEAD,
+        "query_outbound_sa_binding",
+    )?
+    .map(parse_observed_sa_aead)
+    .transpose()?;
+    if aead.is_some() && (legacy_auth.is_some() || auth.is_some() || crypt.is_some()) {
+        return Err(XfrmError::io(
+            "query_outbound_sa_binding",
+            invalid_data("contradictory SA algorithm attributes"),
+        ));
+    }
+    // Lockdown's `xfrm_redact()` preserves algorithm metadata but replaces
+    // every nonempty key with zero octets. Netlink does not mark the response
+    // as redacted, so an all-zero key is intrinsically ambiguous (including a
+    // genuinely configured all-zero key). Fail closed with a stable capability
+    // result instead of treating those bytes as an exact key proof.
+    if legacy_auth
+        .as_ref()
+        .is_some_and(|algorithm| key_is_ambiguous_redaction(algorithm.key))
+        || auth
+            .as_ref()
+            .is_some_and(|algorithm| key_is_ambiguous_redaction(algorithm.algorithm.key))
+        || crypt
+            .as_ref()
+            .is_some_and(|algorithm| key_is_ambiguous_redaction(algorithm.key))
+        || aead
+            .as_ref()
+            .is_some_and(|algorithm| key_is_ambiguous_redaction(algorithm.algorithm.key))
+    {
+        return Err(XfrmError::UnsupportedFeature {
+            feature: XFRM_KEY_READBACK_REDACTED,
+        });
+    }
+
+    let auth_matches = match (legacy_auth, auth, expected.auth.as_ref()) {
+        (Some(legacy), Some(observed), Some((algorithm, key))) => {
+            let legacy_key_matches = bool::from(legacy.key.ct_eq(key.as_bytes()));
+            let trunc_key_matches = bool::from(observed.algorithm.key.ct_eq(key.as_bytes()));
+            legacy.name == algorithm.name
+                && legacy_key_matches
+                && observed.algorithm.name == algorithm.name
+                && observed.truncation_len_bits == algorithm.truncation_len_bits
+                && trunc_key_matches
+        }
+        (None, None, None) => true,
+        _ => false,
+    };
+    let crypt_matches = match (crypt, expected.crypt.as_ref()) {
+        (Some(observed), Some((algorithm, key))) => {
+            let key_matches = bool::from(observed.key.ct_eq(key.as_bytes()));
+            observed.name == algorithm.name && key_matches
+        }
+        (None, None) => true,
+        _ => false,
+    };
+    let aead_matches = match (aead, expected.aead.as_ref()) {
+        (Some(observed), Some((algorithm, key))) => {
+            let key_matches = bool::from(observed.algorithm.key.ct_eq(key.as_bytes()));
+            observed.algorithm.name == algorithm.name
+                && observed.icv_len_bits == algorithm.icv_len_bits
+                && key_matches
+        }
+        (None, None) => true,
+        _ => false,
+    };
+    if !auth_matches || !crypt_matches || !aead_matches {
+        return Err(XfrmError::io(
+            "query_outbound_sa_binding",
+            invalid_data("SA crypto does not match install intent"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_outbound_sa_crypto_metadata(
+    payload: &[u8],
+    expected: &OutboundSaCryptoExpectation,
+) -> Result<(), XfrmError> {
+    let legacy_auth = unique_route_attribute(
+        payload,
+        XFRM_USER_SA_INFO_LEN,
+        XFRMA_ALG_AUTH,
+        "query_outbound_sa_binding",
+    )?
+    .map(|attribute| parse_observed_sa_algorithm(attribute, XFRM_ALGO_HEADER_LEN))
+    .transpose()?;
+    let auth = unique_route_attribute(
+        payload,
+        XFRM_USER_SA_INFO_LEN,
+        XFRMA_ALG_AUTH_TRUNC,
+        "query_outbound_sa_binding",
+    )?
+    .map(parse_observed_sa_auth)
+    .transpose()?;
+    let crypt = unique_route_attribute(
+        payload,
+        XFRM_USER_SA_INFO_LEN,
+        XFRMA_ALG_CRYPT,
+        "query_outbound_sa_binding",
+    )?
+    .map(|attribute| parse_observed_sa_algorithm(attribute, XFRM_ALGO_HEADER_LEN))
+    .transpose()?;
+    let aead = unique_route_attribute(
+        payload,
+        XFRM_USER_SA_INFO_LEN,
+        XFRMA_ALG_AEAD,
+        "query_outbound_sa_binding",
+    )?
+    .map(parse_observed_sa_aead)
+    .transpose()?;
+    if aead.is_some() && (legacy_auth.is_some() || auth.is_some() || crypt.is_some()) {
+        return Err(XfrmError::io(
+            "query_outbound_sa_binding",
+            invalid_data("contradictory SA algorithm attributes"),
+        ));
+    }
+    if legacy_auth
+        .as_ref()
+        .is_some_and(|algorithm| key_is_ambiguous_redaction(algorithm.key))
+        || auth
+            .as_ref()
+            .is_some_and(|algorithm| key_is_ambiguous_redaction(algorithm.algorithm.key))
+        || crypt
+            .as_ref()
+            .is_some_and(|algorithm| key_is_ambiguous_redaction(algorithm.key))
+        || aead
+            .as_ref()
+            .is_some_and(|algorithm| key_is_ambiguous_redaction(algorithm.algorithm.key))
+    {
+        return Err(XfrmError::UnsupportedFeature {
+            feature: XFRM_KEY_READBACK_REDACTED,
+        });
+    }
+
+    let auth_matches = match (legacy_auth, auth, expected.auth.as_ref()) {
+        (Some(legacy), Some(observed), Some(expected)) => {
+            let redundant_keys_match = bool::from(legacy.key.ct_eq(observed.algorithm.key));
+            legacy.name == expected.algorithm.name
+                && legacy.key.len() == expected.algorithm.key_len
+                && observed.algorithm.name == expected.algorithm.name
+                && observed.algorithm.key.len() == expected.algorithm.key_len
+                && observed.truncation_len_bits == expected.truncation_len_bits
+                && redundant_keys_match
+        }
+        (None, None, None) => true,
+        _ => false,
+    };
+    let crypt_matches = match (crypt, expected.crypt.as_ref()) {
+        (Some(observed), Some(expected)) => {
+            observed.name == expected.name && observed.key.len() == expected.key_len
+        }
+        (None, None) => true,
+        _ => false,
+    };
+    let aead_matches = match (aead, expected.aead.as_ref()) {
+        (Some(observed), Some(expected)) => {
+            observed.algorithm.name == expected.algorithm.name
+                && observed.algorithm.key.len() == expected.algorithm.key_len
+                && observed.icv_len_bits == expected.icv_len_bits
+        }
+        (None, None) => true,
+        _ => false,
+    };
+    if !auth_matches || !crypt_matches || !aead_matches {
+        return Err(XfrmError::io(
+            "query_outbound_sa_binding",
+            invalid_data("SA crypto metadata does not match binding"),
+        ));
+    }
+    Ok(())
+}
+
+fn key_is_ambiguous_redaction(key: &[u8]) -> bool {
+    !key.is_empty() && key.iter().all(|octet| *octet == 0)
+}
+
+fn parse_observed_sa_auth(payload: &[u8]) -> Result<ObservedSaAuth<'_>, XfrmError> {
+    Ok(ObservedSaAuth {
+        algorithm: parse_observed_sa_algorithm(payload, XFRM_ALGO_AUTH_HEADER_LEN)?,
+        truncation_len_bits: read_u32_ne(payload, XFRM_ALG_NAME_LEN + 4)?,
+    })
+}
+
+fn parse_observed_sa_algorithm(
+    payload: &[u8],
+    header_len: usize,
+) -> Result<ObservedSaAlgorithm<'_>, XfrmError> {
+    let key_len = parse_algorithm_key_len(payload, header_len)?;
+    Ok(ObservedSaAlgorithm {
+        name: parse_algorithm_name(payload)?,
+        key: &payload[header_len..header_len + key_len],
+    })
+}
+
+fn parse_observed_sa_aead(payload: &[u8]) -> Result<ObservedSaAead<'_>, XfrmError> {
+    Ok(ObservedSaAead {
+        algorithm: parse_observed_sa_algorithm(payload, XFRM_ALGO_AEAD_HEADER_LEN)?,
+        icv_len_bits: read_u32_ne(payload, XFRM_ALG_NAME_LEN + 4)?,
+    })
+}
+
+fn parse_algorithm_key_len(payload: &[u8], header_len: usize) -> Result<usize, XfrmError> {
+    if payload.len() < header_len {
+        return Err(XfrmError::io(
+            "query_outbound_sa_binding",
+            invalid_data("short SA algorithm attribute"),
+        ));
+    }
+    let key_len_bits = read_u32_ne(payload, XFRM_ALG_NAME_LEN)?;
+    if key_len_bits % 8 != 0 {
+        return Err(XfrmError::io(
+            "query_outbound_sa_binding",
+            invalid_data("non-octet SA key length"),
+        ));
+    }
+    let key_len = usize::try_from(key_len_bits / 8).map_err(|_| {
+        XfrmError::io(
+            "query_outbound_sa_binding",
+            invalid_data("SA key length overflow"),
+        )
+    })?;
+    let expected_len = header_len.checked_add(key_len).ok_or_else(|| {
+        XfrmError::io(
+            "query_outbound_sa_binding",
+            invalid_data("SA algorithm attribute length overflow"),
+        )
+    })?;
+    if payload.len() != expected_len {
+        return Err(XfrmError::io(
+            "query_outbound_sa_binding",
+            invalid_data("invalid SA algorithm attribute length"),
+        ));
+    }
+    Ok(key_len)
+}
+
+fn parse_algorithm_name(payload: &[u8]) -> Result<&str, XfrmError> {
+    let name = payload.get(..XFRM_ALG_NAME_LEN).ok_or_else(|| {
+        XfrmError::io(
+            "query_outbound_sa_binding",
+            invalid_data("short SA algorithm name"),
+        )
+    })?;
+    let end = name.iter().position(|octet| *octet == 0).ok_or_else(|| {
+        XfrmError::io(
+            "query_outbound_sa_binding",
+            invalid_data("unterminated SA algorithm name"),
+        )
+    })?;
+    if end == 0 || name[end + 1..].iter().any(|octet| *octet != 0) {
+        return Err(XfrmError::io(
+            "query_outbound_sa_binding",
+            invalid_data("noncanonical SA algorithm name"),
+        ));
+    }
+    std::str::from_utf8(&name[..end]).map_err(|_| {
+        XfrmError::io(
+            "query_outbound_sa_binding",
+            invalid_data("invalid SA algorithm name"),
+        )
+    })
+}
+
+fn parse_policy_state(payload: &[u8]) -> Result<PolicyState, XfrmError> {
+    if payload.len() < XFRM_USER_POLICY_INFO_LEN {
+        return Err(XfrmError::io(
+            "query_outbound_policy_binding",
+            invalid_data("short getpolicy response"),
+        ));
+    }
+    validate_route_attribute_stream(
+        payload,
+        XFRM_USER_POLICY_INFO_LEN,
+        "query_outbound_policy_binding",
+    )?;
+    validate_allowed_route_attributes(
+        payload,
+        XFRM_USER_POLICY_INFO_LEN,
+        &[XFRMA_TMPL, XFRMA_POLICY_TYPE, XFRMA_MARK, XFRMA_IF_ID],
+        "query_outbound_policy_binding",
+    )?;
+    if decode_lifetime_config(payload, XFRM_SELECTOR_LEN)? != LifetimeConfig::default()
+        || payload[104..120].iter().any(|octet| *octet != 0)
+        || read_u8(payload, 162)? != 0
+        || read_u8(payload, 163)? != 0
+        || payload[164..XFRM_USER_POLICY_INFO_LEN]
+            .iter()
+            .any(|octet| *octet != 0)
+    {
+        return Err(XfrmError::io(
+            "query_outbound_policy_binding",
+            invalid_data("unsupported policy metadata"),
+        ));
+    }
+    let exact_selector = decode_sa_relocation_selector(payload, 0)?;
+    let selector = exact_selector.selector();
+    if exact_selector != SaRelocationSelector::from_selector(&selector) {
+        return Err(XfrmError::io(
+            "query_outbound_policy_binding",
+            invalid_data("noncanonical or unsupported policy selector"),
+        ));
+    }
+    let templates = unique_route_attribute(
+        payload,
+        XFRM_USER_POLICY_INFO_LEN,
+        XFRMA_TMPL,
+        "query_outbound_policy_binding",
+    )?
+    .ok_or_else(|| {
+        XfrmError::io(
+            "query_outbound_policy_binding",
+            invalid_data("missing policy template"),
+        )
+    })?;
+    if templates.len() != XFRM_USER_TEMPLATE_LEN {
+        return Err(XfrmError::io(
+            "query_outbound_policy_binding",
+            invalid_data("policy must contain exactly one template"),
+        ));
+    }
+    let template = decode_exact_template(templates)?;
+    let mark = parse_exact_mark_attribute(
+        payload,
+        XFRM_USER_POLICY_INFO_LEN,
+        "query_outbound_policy_binding",
+    )?;
+    let if_id = parse_exact_if_id_attribute(
+        payload,
+        XFRM_USER_POLICY_INFO_LEN,
+        "query_outbound_policy_binding",
+    )?;
+    if let Some(policy_type) = unique_route_attribute(
+        payload,
+        XFRM_USER_POLICY_INFO_LEN,
+        XFRMA_POLICY_TYPE,
+        "query_outbound_policy_binding",
+    )? {
+        // C layout is six bytes: type, one alignment byte, reserved1 (u16),
+        // reserved2, and one tail-alignment byte. MAIN is therefore the
+        // all-zero canonical payload.
+        if policy_type != [XFRM_POLICY_TYPE_MAIN, 0, 0, 0, 0, 0] {
+            return Err(XfrmError::io(
+                "query_outbound_policy_binding",
+                invalid_data("unsupported policy type"),
+            ));
+        }
+    }
+    Ok(PolicyState {
+        parameters: PolicyParameters {
+            selector,
+            direction: decode_policy_direction(read_u8(payload, 160)?)?,
+            action: decode_policy_action(read_u8(payload, 161)?)?,
+            priority: read_u32_ne(payload, 152)?,
+            templates: vec![template],
+            mark,
+            if_id,
+        },
+    })
+}
+
+fn decode_exact_template(payload: &[u8]) -> Result<XfrmTemplate, XfrmError> {
+    if payload.len() != XFRM_USER_TEMPLATE_LEN {
+        return Err(XfrmError::io(
+            "query_outbound_policy_binding",
+            invalid_data("invalid policy template length"),
+        ));
+    }
+    let family = read_u16_ne(payload, 24)?;
+    let template = XfrmTemplate {
+        id: XfrmId {
+            destination: decode_address(payload, 0, family)?,
+            spi: read_u32_be(payload, 16)?,
+            protocol: read_u8(payload, 20)?,
+        },
+        source_address: decode_address(payload, 28, family)?,
+        request_id: XfrmRequestId::new(read_u32_ne(payload, 44)?),
+        mode: decode_mode(read_u8(payload, 48)?)?,
+    };
+    let mut canonical = Vec::with_capacity(XFRM_USER_TEMPLATE_LEN);
+    encode_template(&mut canonical, &template)?;
+    if canonical != payload {
+        return Err(XfrmError::io(
+            "query_outbound_policy_binding",
+            invalid_data("noncanonical policy template"),
+        ));
+    }
+    Ok(template)
+}
+
+fn decode_policy_direction(direction: u8) -> Result<XfrmDirection, XfrmError> {
+    match direction {
+        XFRM_POLICY_IN => Ok(XfrmDirection::In),
+        XFRM_POLICY_OUT => Ok(XfrmDirection::Out),
+        XFRM_POLICY_FWD => Ok(XfrmDirection::Forward),
+        _ => Err(XfrmError::io(
+            "query_outbound_policy_binding",
+            invalid_data("unsupported policy direction"),
+        )),
+    }
+}
+
+fn decode_policy_action(action: u8) -> Result<XfrmAction, XfrmError> {
+    match action {
+        XFRM_POLICY_ALLOW => Ok(XfrmAction::Allow),
+        XFRM_POLICY_BLOCK => Ok(XfrmAction::Block),
+        _ => Err(XfrmError::io(
+            "query_outbound_policy_binding",
+            invalid_data("unsupported policy action"),
+        )),
+    }
+}
+
+fn parse_exact_mark_attribute(
+    payload: &[u8],
+    base_len: usize,
+    operation: &'static str,
+) -> Result<Option<XfrmMark>, XfrmError> {
+    let Some(mark) = unique_route_attribute(payload, base_len, XFRMA_MARK, operation)? else {
+        return Ok(None);
+    };
+    if mark.len() != XFRM_MARK_LEN {
+        return Err(XfrmError::io(
+            operation,
+            invalid_data("invalid lookup-mark attribute length"),
+        ));
+    }
+    Ok(Some(XfrmMark {
+        value: read_u32_ne(mark, 0)?,
+        mask: read_u32_ne(mark, 4)?,
+    }))
+}
+
+fn parse_exact_if_id_attribute(
+    payload: &[u8],
+    base_len: usize,
+    operation: &'static str,
+) -> Result<Option<u32>, XfrmError> {
+    let Some(if_id) = unique_route_attribute(payload, base_len, XFRMA_IF_ID, operation)? else {
+        return Ok(None);
+    };
+    if if_id.len() != 4 {
+        return Err(XfrmError::io(
+            operation,
+            invalid_data("invalid interface-id attribute length"),
+        ));
+    }
+    Ok(Some(read_u32_ne(if_id, 0)?))
 }
 
 fn parse_udp_encap_attr(payload: &[u8]) -> Result<Option<UdpEncap>, XfrmError> {
@@ -1935,6 +2933,118 @@ fn find_unique_attr_payload<'a>(
         })?;
     }
     Ok(found)
+}
+
+fn validate_route_attribute_stream(
+    body: &[u8],
+    mut offset: usize,
+    operation: &'static str,
+) -> Result<(), XfrmError> {
+    if offset > body.len() {
+        return Err(XfrmError::io(
+            operation,
+            invalid_data("route attribute offset exceeds response"),
+        ));
+    }
+    while offset < body.len() {
+        let remaining = body.len() - offset;
+        if remaining < ROUTE_ATTRIBUTE_HEADER_LEN {
+            return Err(XfrmError::io(
+                operation,
+                invalid_data("trailing route attribute bytes"),
+            ));
+        }
+        let len = usize::from(read_u16_ne(body, offset)?);
+        if len < ROUTE_ATTRIBUTE_HEADER_LEN {
+            return Err(XfrmError::io(
+                operation,
+                invalid_data("invalid route attribute length"),
+            ));
+        }
+        let aligned = align_to_netlink(len).ok_or_else(|| {
+            XfrmError::io(
+                operation,
+                invalid_data("route attribute alignment overflow"),
+            )
+        })?;
+        if aligned > remaining {
+            return Err(XfrmError::io(
+                operation,
+                invalid_data("truncated route attribute"),
+            ));
+        }
+        let payload_end = offset + len;
+        let aligned_end = offset + aligned;
+        if body[payload_end..aligned_end]
+            .iter()
+            .any(|octet| *octet != 0)
+        {
+            return Err(XfrmError::io(
+                operation,
+                invalid_data("noncanonical route attribute padding"),
+            ));
+        }
+        offset = aligned_end;
+    }
+    Ok(())
+}
+
+fn unique_route_attribute<'a>(
+    body: &'a [u8],
+    base_len: usize,
+    attr_type: u16,
+    operation: &'static str,
+) -> Result<Option<&'a [u8]>, XfrmError> {
+    validate_route_attribute_stream(body, base_len, operation)?;
+    let mut offset = base_len;
+    let mut found = None;
+    while offset < body.len() {
+        let len = usize::from(read_u16_ne(body, offset)?);
+        let found_type = read_u16_ne(body, offset + 2)?;
+        if found_type == attr_type {
+            if found.is_some() {
+                return Err(XfrmError::io(
+                    operation,
+                    invalid_data("duplicate route attribute"),
+                ));
+            }
+            found = Some(&body[offset + ROUTE_ATTRIBUTE_HEADER_LEN..offset + len]);
+        }
+        offset += align_to_netlink(len).ok_or_else(|| {
+            XfrmError::io(
+                operation,
+                invalid_data("route attribute alignment overflow"),
+            )
+        })?;
+    }
+    Ok(found)
+}
+
+fn validate_allowed_route_attributes(
+    body: &[u8],
+    base_len: usize,
+    allowed: &[u16],
+    operation: &'static str,
+) -> Result<(), XfrmError> {
+    validate_route_attribute_stream(body, base_len, operation)?;
+    let mut offset = base_len;
+    while offset < body.len() {
+        let len = usize::from(read_u16_ne(body, offset)?);
+        let attr_type = read_u16_ne(body, offset + 2)?;
+        if !allowed.contains(&attr_type) {
+            return Err(XfrmError::io(
+                operation,
+                invalid_data("unsupported route attribute"),
+            ));
+        }
+        offset += align_to_netlink(len).ok_or_else(|| {
+            XfrmError::io(
+                operation,
+                invalid_data("route attribute alignment overflow"),
+            )
+        })?;
+    }
+    Ok(())
 }
 
 fn validate_sa_parameters(
@@ -2549,15 +3659,39 @@ fn invalid_data(message: &'static str) -> io::Error {
 }
 
 #[cfg(test)]
+pub(crate) fn test_outbound_binding_readback_bodies(
+    request: &crate::XfrmCompositeInstallRequest,
+) -> Result<(SensitiveBuffer, SensitiveBuffer), XfrmError> {
+    let mut policy = encode_policy_info(&request.policy.parameters)?;
+    append_attr(
+        &mut policy,
+        XFRMA_POLICY_TYPE,
+        &[XFRM_POLICY_TYPE_MAIN, 0, 0, 0, 0, 0],
+    )?;
+
+    let mut sa = encode_sa_info(&request.sa.parameters)?;
+    if let Some((algorithm, key)) = request.sa.parameters.auth.as_ref() {
+        let mut legacy = sensitive_buffer_with_capacity(XFRM_ALGO_HEADER_LEN + key.len());
+        legacy.extend_from_slice(&encode_algorithm_name(&algorithm.name)?);
+        push_u32_ne(&mut legacy, key_len_bits(key.as_bytes())?);
+        legacy.extend_from_slice(key.as_bytes());
+        append_attr(&mut sa, XFRMA_ALG_AUTH, &legacy)?;
+    }
+    append_attr(&mut sa, XFRMA_SA_DIR, &[XFRM_SA_DIR_OUT])?;
+    Ok((policy, sa))
+}
+
+#[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
 
     use super::*;
+    use crate::outbound_binding::validate_outbound_request;
     use crate::{
         AeadAlgorithm, Algorithm, AuthAlgorithm, InstallSaRequest, KeyMaterial,
-        SaRelocationDirection, UDP_ENCAP_ESPINUDP, XFRM_AUTH_HMAC_SHA256, XFRM_ENCR_CBC_AES,
-        XFRM_ENCR_NULL,
+        SaRelocationDirection, XfrmCompositeInstallRequest, UDP_ENCAP_ESPINUDP,
+        XFRM_AUTH_HMAC_SHA256, XFRM_ENCR_CBC_AES, XFRM_ENCR_NULL,
     };
 
     #[derive(Debug, Default, Clone)]
@@ -2719,6 +3853,10 @@ mod tests {
     }
 
     impl XfrmDscpRuntime for FakeDscpRuntime {
+        fn fresh_namespace_runtime(&self) -> Arc<dyn XfrmDscpRuntime> {
+            Arc::new(self.clone())
+        }
+
         fn ensure_ready(&self, _config: &LinuxXfrmDscpMarkingConfig) -> Result<(), XfrmError> {
             let mut state = self
                 .state
@@ -2862,6 +4000,40 @@ mod tests {
         }
     }
 
+    fn outbound_binding_request() -> XfrmCompositeInstallRequest {
+        let sa = relocation_parameters();
+        let policy = PolicyParameters {
+            selector: sa.selector.clone(),
+            direction: XfrmDirection::Out,
+            action: XfrmAction::Allow,
+            priority: 100,
+            templates: vec![XfrmTemplate {
+                id: sa.id,
+                source_address: sa.source_address,
+                request_id: sa.request_id,
+                mode: sa.mode,
+            }],
+            mark: sa.mark,
+            if_id: sa.if_id,
+        };
+        XfrmCompositeInstallRequest {
+            sa: InstallSaRequest { parameters: sa },
+            policy: InstallPolicyRequest { parameters: policy },
+        }
+    }
+
+    fn encode_sa_binding_readback(parameters: &SaParameters) -> SensitiveBuffer {
+        let request = XfrmCompositeInstallRequest {
+            sa: InstallSaRequest {
+                parameters: parameters.clone(),
+            },
+            policy: InstallPolicyRequest {
+                parameters: policy_parameters(),
+            },
+        };
+        test_outbound_binding_readback_bodies(&request).unwrap().1
+    }
+
     fn dscp_config() -> LinuxXfrmDscpMarkingConfig {
         let mut config = LinuxXfrmDscpMarkingConfig::new([String::from("eth0")], 25).unwrap();
         config.bpffs_pin_root = "/sys/fs/bpf/opc-ipsec-xfrm-dscp-test".into();
@@ -2922,6 +4094,17 @@ mod tests {
             offset += align_to_netlink(len)?;
         }
         None
+    }
+
+    fn remove_route_attr(body: &mut SensitiveBuffer, base_len: usize, attr_type: u16) {
+        let payload_offset = route_attr_payload_offset_from(body, base_len, attr_type).unwrap();
+        let header_offset = payload_offset - ROUTE_ATTRIBUTE_HEADER_LEN;
+        let len = usize::from(u16::from_ne_bytes([
+            body[header_offset],
+            body[header_offset + 1],
+        ]));
+        let aligned = align_to_netlink(len).unwrap();
+        body.drain(header_offset..header_offset + aligned);
     }
 
     fn assert_sensitive_buffer(_buffer: &SensitiveBuffer) {}
@@ -3019,6 +4202,300 @@ mod tests {
         assert_eq!(snapshot.identity.if_id, parameters.if_id);
         assert_eq!(snapshot.identity.output_mark, parameters.output_mark);
         assert_eq!(snapshot.identity.id, parameters.id);
+    }
+
+    #[test]
+    fn outbound_binding_parsers_accept_exact_kernel_shape_and_dynamic_counters() {
+        let request = outbound_binding_request();
+        let expectation = validate_outbound_request(&request).unwrap();
+        let mut sa_body = encode_sa_binding_readback(&request.sa.parameters);
+        // GETSA lifetime-current/statistics/sequence fields are mutable and do
+        // not weaken the immutable identity proof.
+        sa_body[160..208].fill(0x5a);
+        append_attr(&mut sa_body, XFRMA_PAD, &[]).unwrap();
+        append_attr(&mut sa_body, XFRMA_LASTUSED, &123_u64.to_ne_bytes()).unwrap();
+        let observed = parse_outbound_sa_binding_snapshot(
+            &sa_body,
+            &expectation,
+            Some(&request.sa.parameters),
+        )
+        .unwrap();
+        assert_eq!(observed.identity.id, request.sa.parameters.id);
+
+        let mut policy_body = encode_policy_info(&request.policy.parameters).unwrap();
+        // Lifetime-current and the kernel-assigned policy index are dynamic.
+        policy_body[120..152].fill(0xa5);
+        policy_body[156..160].copy_from_slice(&42_u32.to_ne_bytes());
+        append_attr(
+            &mut policy_body,
+            XFRMA_POLICY_TYPE,
+            &[XFRM_POLICY_TYPE_MAIN, 0, 0, 0, 0, 0],
+        )
+        .unwrap();
+        let observed = parse_policy_state(&policy_body).unwrap();
+        assert_eq!(observed.parameters, request.policy.parameters);
+    }
+
+    #[test]
+    fn outbound_binding_sa_parser_rejects_unmodeled_or_noncanonical_semantics() {
+        let request = outbound_binding_request();
+        let parameters = request.sa.parameters.clone();
+        let expectation = validate_outbound_request(&request).unwrap();
+        let clean = encode_sa_binding_readback(&parameters);
+
+        let mut unknown = clean.clone();
+        append_attr(&mut unknown, 8, &[0; 4]).unwrap(); // XFRMA_SEC_CTX
+        assert!(
+            parse_outbound_sa_binding_snapshot(&unknown, &expectation, Some(&parameters)).is_err()
+        );
+
+        let mut unexpected_flag = clean.clone();
+        unexpected_flag[216] |= 1; // XFRM_STATE_NOECN
+        assert!(parse_outbound_sa_binding_snapshot(
+            &unexpected_flag,
+            &expectation,
+            Some(&parameters)
+        )
+        .is_err());
+
+        let mut reserved = clean.clone();
+        reserved[217] = 1;
+        assert!(
+            parse_outbound_sa_binding_snapshot(&reserved, &expectation, Some(&parameters)).is_err()
+        );
+
+        let mut use_expiry = clean.clone();
+        use_expiry[144] = 1;
+        assert!(
+            parse_outbound_sa_binding_snapshot(&use_expiry, &expectation, Some(&parameters))
+                .is_err()
+        );
+
+        let mut inbound = clean.clone();
+        let direction =
+            route_attr_payload_offset_from(&inbound, XFRM_USER_SA_INFO_LEN, XFRMA_SA_DIR).unwrap();
+        inbound[direction] = 1;
+        assert!(
+            parse_outbound_sa_binding_snapshot(&inbound, &expectation, Some(&parameters)).is_err()
+        );
+
+        let mut duplicate_direction = clean;
+        append_attr(&mut duplicate_direction, XFRMA_SA_DIR, &[XFRM_SA_DIR_OUT]).unwrap();
+        assert!(parse_outbound_sa_binding_snapshot(
+            &duplicate_direction,
+            &expectation,
+            Some(&parameters),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn outbound_binding_sa_parser_compares_kernel_keys_to_transient_intent() {
+        let request = outbound_binding_request();
+        let supplied = request.sa.parameters.clone();
+        let expectation = validate_outbound_request(&request).unwrap();
+        let kernel_a = encode_sa_binding_readback(&supplied);
+        assert!(
+            parse_outbound_sa_binding_snapshot(&kernel_a, &expectation, Some(&supplied)).is_ok()
+        );
+
+        // Installation requests contain AUTH_TRUNC only. A real GETSA also
+        // returns the redundant legacy AUTH form; omitting either fails closed.
+        let missing_legacy = encode_sa_info(&supplied).unwrap();
+        assert!(
+            parse_outbound_sa_binding_snapshot(&missing_legacy, &expectation, Some(&supplied))
+                .is_err()
+        );
+
+        let mut kernel_b_parameters = supplied.clone();
+        kernel_b_parameters.auth.as_mut().unwrap().1 = KeyMaterial::new(vec![0x11; 32]);
+        let kernel_b = encode_sa_binding_readback(&kernel_b_parameters);
+        assert!(
+            parse_outbound_sa_binding_snapshot(&kernel_b, &expectation, Some(&supplied)).is_err()
+        );
+
+        let mut ambiguous_zero = supplied.clone();
+        ambiguous_zero.auth.as_mut().unwrap().1 = KeyMaterial::new(vec![0; 32]);
+        ambiguous_zero.crypt.as_mut().unwrap().1 = KeyMaterial::new(vec![0; 16]);
+        let redacted_or_zero = encode_sa_binding_readback(&ambiguous_zero);
+        assert!(matches!(
+            parse_outbound_sa_binding_snapshot(
+                &redacted_or_zero,
+                &expectation,
+                Some(&ambiguous_zero),
+            ),
+            Err(XfrmError::UnsupportedFeature {
+                feature: XFRM_KEY_READBACK_REDACTED
+            })
+        ));
+
+        let mut contradictory_auth = kernel_a;
+        let legacy_key = route_attr_payload_offset_from(
+            &contradictory_auth,
+            XFRM_USER_SA_INFO_LEN,
+            XFRMA_ALG_AUTH,
+        )
+        .unwrap()
+            + XFRM_ALGO_HEADER_LEN;
+        contradictory_auth[legacy_key] ^= 1;
+        assert!(parse_outbound_sa_binding_snapshot(
+            &contradictory_auth,
+            &expectation,
+            Some(&supplied),
+        )
+        .is_err());
+        assert!(
+            parse_outbound_sa_binding_snapshot(&contradictory_auth, &expectation, None).is_err(),
+            "key-free receipt validation must still reject contradictory AUTH copies"
+        );
+    }
+
+    #[test]
+    fn outbound_binding_sa_parser_rejects_ambiguous_replay_attributes() {
+        let request = outbound_binding_request();
+        let parameters = request.sa.parameters.clone();
+        let expectation = validate_outbound_request(&request).unwrap();
+        let clean = encode_sa_binding_readback(&parameters);
+        let legacy = encode_replay_state_legacy(&SaReplayState::fresh(32)).unwrap();
+
+        let mut duplicate = clean.clone();
+        append_attr(&mut duplicate, XFRMA_REPLAY_VAL, &legacy).unwrap();
+        append_attr(&mut duplicate, XFRMA_REPLAY_VAL, &legacy).unwrap();
+        assert!(
+            parse_outbound_sa_binding_snapshot(&duplicate, &expectation, Some(&parameters))
+                .is_err()
+        );
+
+        let mut contradictory = clean;
+        append_attr(&mut contradictory, XFRMA_REPLAY_VAL, &legacy).unwrap();
+        let mut esn_state = SaReplayState::fresh(64);
+        esn_state.esn = true;
+        let esn = encode_replay_state_esn(&esn_state).unwrap();
+        append_attr(&mut contradictory, XFRMA_REPLAY_ESN_VAL, &esn).unwrap();
+        assert!(parse_outbound_sa_binding_snapshot(
+            &contradictory,
+            &expectation,
+            Some(&parameters),
+        )
+        .is_err());
+
+        let mut esn_parameters = parameters;
+        esn_parameters.replay_window = 64;
+        let mut esn_request = outbound_binding_request();
+        esn_request.sa.parameters = esn_parameters.clone();
+        let esn_expectation = validate_outbound_request(&esn_request).unwrap();
+        let mut missing_esn = encode_sa_binding_readback(&esn_parameters);
+        remove_route_attr(
+            &mut missing_esn,
+            XFRM_USER_SA_INFO_LEN,
+            XFRMA_REPLAY_ESN_VAL,
+        );
+        assert!(parse_outbound_sa_binding_snapshot(
+            &missing_esn,
+            &esn_expectation,
+            Some(&esn_parameters),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn outbound_binding_policy_parser_rejects_unknown_duplicate_and_sub_policy_attrs() {
+        let parameters = outbound_binding_request().policy.parameters;
+        let clean = encode_policy_info(&parameters).unwrap();
+
+        let mut unknown = clean.clone();
+        append_attr(&mut unknown, 8, &[0; 4]).unwrap(); // XFRMA_SEC_CTX
+        assert!(parse_policy_state(&unknown).is_err());
+
+        let mut sub_policy = clean.clone();
+        append_attr(&mut sub_policy, XFRMA_POLICY_TYPE, &[1, 0, 0, 0, 0, 0]).unwrap();
+        assert!(parse_policy_state(&sub_policy).is_err());
+
+        let mut short = clean.clone();
+        append_attr(&mut short, XFRMA_POLICY_TYPE, &[0; 4]).unwrap();
+        assert!(parse_policy_state(&short).is_err());
+
+        for offset in 1..6 {
+            let mut noncanonical = clean.clone();
+            let mut policy_type = [0; 6];
+            policy_type[offset] = 1;
+            append_attr(&mut noncanonical, XFRMA_POLICY_TYPE, &policy_type).unwrap();
+            assert!(parse_policy_state(&noncanonical).is_err());
+        }
+
+        let mut duplicate = clean;
+        append_attr(
+            &mut duplicate,
+            XFRMA_POLICY_TYPE,
+            &[XFRM_POLICY_TYPE_MAIN, 0, 0, 0, 0, 0],
+        )
+        .unwrap();
+        append_attr(
+            &mut duplicate,
+            XFRMA_POLICY_TYPE,
+            &[XFRM_POLICY_TYPE_MAIN, 0, 0, 0, 0, 0],
+        )
+        .unwrap();
+        assert!(parse_policy_state(&duplicate).is_err());
+    }
+
+    #[tokio::test]
+    async fn outbound_binding_backend_reads_policy_then_sa_and_rejects_key_substitution() {
+        let request = outbound_binding_request();
+        let expectation = validate_outbound_request(&request).unwrap();
+        let mut policy_body = encode_policy_info(&request.policy.parameters).unwrap();
+        append_attr(
+            &mut policy_body,
+            XFRMA_POLICY_TYPE,
+            &[XFRM_POLICY_TYPE_MAIN, 0, 0, 0, 0, 0],
+        )
+        .unwrap();
+        let sa_body = encode_sa_binding_readback(&request.sa.parameters);
+        let transport = ScriptedTransport::new(vec![
+            Ok(Some(policy_body.to_vec())),
+            Ok(Some(sa_body.to_vec())),
+        ]);
+        let capture = transport.clone();
+        let backend = LinuxXfrmBackend::with_transport(transport);
+
+        backend
+            .validate_outbound_sa_binding(&expectation, &request.sa.parameters)
+            .await
+            .unwrap();
+        let requests = capture.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(netlink_message_type(&requests[0]), XFRM_MSG_GETPOLICY);
+        assert_eq!(netlink_message_type(&requests[1]), XFRM_MSG_GETSA);
+
+        let mut kernel_b = request.sa.parameters.clone();
+        kernel_b.auth.as_mut().unwrap().1 = KeyMaterial::new(vec![0x11; 32]);
+        let transport = ScriptedTransport::new(vec![
+            Ok(Some(policy_body.to_vec())),
+            Ok(Some(encode_sa_binding_readback(&kernel_b).to_vec())),
+        ]);
+        let backend = LinuxXfrmBackend::with_transport(transport);
+        let error = backend
+            .validate_outbound_sa_binding(&expectation, &request.sa.parameters)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "xfrm_outbound_sa_binding_current_sa_mismatch");
+
+        let mut redacted = request.sa.parameters.clone();
+        redacted.auth.as_mut().unwrap().1 = KeyMaterial::new(vec![0; 32]);
+        redacted.crypt.as_mut().unwrap().1 = KeyMaterial::new(vec![0; 16]);
+        let transport = ScriptedTransport::new(vec![
+            Ok(Some(policy_body.to_vec())),
+            Ok(Some(encode_sa_binding_readback(&redacted).to_vec())),
+        ]);
+        let backend = LinuxXfrmBackend::with_transport(transport);
+        let error = backend
+            .validate_outbound_sa_binding(&expectation, &request.sa.parameters)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.code(),
+            "xfrm_outbound_sa_binding_key_readback_unavailable"
+        );
     }
 
     #[test]
@@ -4258,6 +5735,7 @@ mod tests {
         let body = encode_sa_info(&params).unwrap();
         let payload = route_attr_payload(&body, XFRMA_REPLAY_ESN_VAL).expect("ESN attr");
 
+        assert_eq!(body[215], 0);
         assert_eq!(body[216], XFRM_STATE_ESN);
         assert_eq!(payload.len(), XFRM_REPLAY_STATE_ESN_BASE_LEN + 8);
         assert_eq!(u32::from_ne_bytes(payload[0..4].try_into().unwrap()), 2);
@@ -4266,6 +5744,51 @@ mod tests {
         assert_eq!(u32::from_ne_bytes(payload[12..16].try_into().unwrap()), 1);
         assert_eq!(u32::from_ne_bytes(payload[16..20].try_into().unwrap()), 2);
         assert_eq!(u32::from_ne_bytes(payload[20..24].try_into().unwrap()), 64);
+    }
+
+    #[test]
+    fn encodes_newae_replay_update_with_exact_identity_mark_and_esn_state() {
+        let mut params = sa_parameters();
+        params.replay_window = 64;
+        params.mark = Some(XfrmMark {
+            value: 0x1234_0000,
+            mask: 0xffff_0000,
+        });
+        let mut replay = SaReplayState::fresh(64);
+        replay.outbound_sequence = 17;
+        replay.outbound_sequence_hi = 1;
+
+        let body = encode_sa_replay_update(&params, &replay).unwrap();
+        assert_eq!(&body[16..20], &params.id.spi.to_be_bytes());
+        assert_eq!(
+            u16::from_ne_bytes(body[20..22].try_into().unwrap()),
+            AF_INET
+        );
+        assert_eq!(body[22], IPPROTO_ESP);
+        assert_eq!(body[23], 0);
+        assert_eq!(
+            u32::from_ne_bytes(body[40..44].try_into().unwrap()),
+            XFRM_AE_RVAL
+        );
+        assert_eq!(
+            u32::from_ne_bytes(body[44..48].try_into().unwrap()),
+            params.request_id.map_or(0, XfrmRequestId::get)
+        );
+        let replay_payload =
+            route_attr_payload_from(&body, XFRM_AEVENT_ID_LEN, XFRMA_REPLAY_ESN_VAL).unwrap();
+        assert_eq!(
+            u32::from_ne_bytes(replay_payload[4..8].try_into().unwrap()),
+            17
+        );
+        assert_eq!(
+            u32::from_ne_bytes(replay_payload[12..16].try_into().unwrap()),
+            1
+        );
+        assert_eq!(
+            route_attr_payload_from(&body, XFRM_AEVENT_ID_LEN, XFRMA_MARK).unwrap(),
+            &encode_mark(params.mark.unwrap())
+        );
+        assert!(route_attr_payload_from(&body, XFRM_AEVENT_ID_LEN, XFRMA_REPLAY_VAL).is_none());
     }
 
     #[test]
@@ -4281,6 +5804,9 @@ mod tests {
             replay_window: 64,
             bitmap: vec![0],
         });
+
+        assert_eq!(encode_sa_flags(&params), XFRM_STATE_ESN);
+        assert_eq!(encode_fixed_replay_window(&params), 0);
 
         let error = encode_sa_info(&params).unwrap_err();
 
@@ -5185,6 +6711,27 @@ mod tests {
 
         assert_eq!(probe.kind, XfrmBackendKind::LinuxKernel);
         assert!(probe.kernel_reachable);
+    }
+
+    #[test]
+    fn namespace_actor_discards_source_namespace_capability_proofs() {
+        let backend = LinuxXfrmBackend::with_transport(CapturingTransport::default());
+        backend
+            .inner
+            .dscp_xfrm_attributes_verified
+            .store(true, Ordering::Release);
+        backend.record_sa_relocation_capability(XfrmCapability::Available);
+
+        let actor = backend.for_namespace_actor(NetworkNamespaceBinding::capture().unwrap());
+
+        assert!(!actor
+            .inner
+            .dscp_xfrm_attributes_verified
+            .load(Ordering::Acquire));
+        assert_eq!(
+            actor.current_sa_relocation_capability(),
+            XfrmCapability::UnknownUntilUse
+        );
     }
 
     fn futures_probe(backend: &LinuxXfrmBackend) -> XfrmProbe {

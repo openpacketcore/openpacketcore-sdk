@@ -145,6 +145,12 @@ pub const MAP_CONFIG: &str = "IPSEC_LB_CONFIG";
 pub const CONFIG_KEY: u32 = 0;
 /// BPF map name: single-entry ownership fence generation.
 pub const MAP_FENCE: &str = "IPSEC_LB_FENCE";
+/// BPF map name: destination-scoped ownership fence generations.
+///
+/// A keyed fence is removed before its corresponding owner replacement. The
+/// replacement is staged and read back while absence keeps the datapath stale;
+/// writing the exact fence last activates only that key.
+pub const MAP_KEY_FENCES: &str = "IPSEC_LB_KEY_FENCES";
 /// Reserved key for the single ownership-fence entry.
 ///
 /// A hash-map entry is replaced by publishing a new immutable element. Kernel
@@ -171,11 +177,12 @@ pub const CONFIG_VALUE_LEN: usize = 32;
 pub const FENCE_VALUE_LEN: usize = 8;
 /// Current datapath config ABI version.
 ///
-/// Version 4 changes [`MAP_CONFIG`] from an array slot to a single-entry hash
-/// map. Both configuration and fence updates now publish immutable old-or-new
-/// hash elements. The userspace upgrade boundary migrates recognized v1-v3
-/// layouts into a fresh v4 namespace before atomically updating the XDP link.
-pub const XDP_CONFIG_ABI_VERSION: u8 = 4;
+/// Version 5 adds [`MAP_KEY_FENCES`]. Version 4 changed [`MAP_CONFIG`] from an
+/// array slot to a single-entry hash map. Configuration and fence updates
+/// publish immutable old-or-new hash elements. The userspace upgrade boundary
+/// migrates recognized v1-v4 layouts into a fresh v5 namespace before
+/// atomically updating the XDP link.
+pub const XDP_CONFIG_ABI_VERSION: u8 = 5;
 
 /// Counter index: packets passed through untouched because they were not SWu
 /// IKE/ESP traffic.
@@ -983,7 +990,7 @@ impl XdpOwnerValue {
 /// | offset | width | field |
 /// | ---: | ---: | --- |
 /// | 0 | 1 | ABI version ([`XDP_CONFIG_ABI_VERSION`]) |
-/// | 1 | 1 | flags (zero in v4) |
+/// | 1 | 1 | ownership fence mode |
 /// | 2 | 2 | self shard |
 /// | 4 | 8 | routing-domain tag |
 /// | 12 | 8 | reserved (zero; the v1 fence field moved to [`MAP_FENCE`]) |
@@ -996,6 +1003,8 @@ impl XdpOwnerValue {
 /// part of this wider configuration value.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct XdpDatapathConfig {
+    /// Ownership fence domain enforced by the datapath.
+    pub fence_mode: XdpFenceMode,
     /// Shard identity of this node.
     pub self_shard: u16,
     /// Opaque routing-domain tag mixed into ownership keys.
@@ -1009,6 +1018,7 @@ pub struct XdpDatapathConfig {
 impl fmt::Debug for XdpDatapathConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("XdpDatapathConfig")
+            .field("fence_mode", &self.fence_mode)
             .field("self_shard", &"<redacted>")
             .field("routing_domain", &"<redacted>")
             .field("handoff_ifindex", &"<redacted>")
@@ -1025,7 +1035,7 @@ impl XdpDatapathConfig {
         let ifindex = self.handoff_ifindex.to_be_bytes();
         [
             XDP_CONFIG_ABI_VERSION,
-            0,
+            self.fence_mode as u8,
             shard[0],
             shard[1],
             domain[0],
@@ -1064,9 +1074,14 @@ impl XdpDatapathConfig {
     #[must_use]
     #[inline(always)]
     pub const fn decode(value: &[u8; CONFIG_VALUE_LEN]) -> Option<Self> {
-        if value[0] != XDP_CONFIG_ABI_VERSION || value[1] != 0 {
+        if value[0] != XDP_CONFIG_ABI_VERSION {
             return None;
         }
+        let fence_mode = match value[1] {
+            0 => XdpFenceMode::Global,
+            1 => XdpFenceMode::PerOwnershipKey,
+            _ => return None,
+        };
         let mut index = 12;
         while index < 20 {
             if value[index] != 0 {
@@ -1082,6 +1097,7 @@ impl XdpDatapathConfig {
             index += 1;
         }
         Some(Self {
+            fence_mode,
             self_shard: u16::from_be_bytes([value[2], value[3]]),
             routing_domain: u64::from_be_bytes([
                 value[4], value[5], value[6], value[7], value[8], value[9], value[10], value[11],
@@ -1089,6 +1105,16 @@ impl XdpDatapathConfig {
             handoff_ifindex: u32::from_be_bytes([value[20], value[21], value[22], value[23]]),
         })
     }
+}
+
+/// Ownership-fence domain enforced for owner lookups.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XdpFenceMode {
+    /// Compare owner generations against the legacy deployment-wide floor.
+    Global = 0,
+    /// Require a present, non-zero, exactly matching destination-scoped fence.
+    PerOwnershipKey = 1,
 }
 
 /// Decide the fast-path verdict for one owner-map lookup.
@@ -1108,14 +1134,40 @@ pub fn decide_owner_verdict(
     config: &XdpDatapathConfig,
     fence_generation: u64,
 ) -> XdpVerdict {
+    decide_owner_verdict_with_keyed_fence(entry, config, fence_generation, None)
+}
+
+/// Decide the fast-path verdict with an optional destination-scoped fence.
+///
+/// When `keyed_fence_generation` is present, the owner generation must match
+/// it exactly. This is deliberately stronger than the legacy global-floor
+/// comparison: fence absence keeps exactly one ownership key fail closed while
+/// its new owner is staged; publishing the matching fence activates it last.
+#[must_use]
+#[inline(always)]
+pub fn decide_owner_verdict_with_keyed_fence(
+    entry: Option<[u8; OWNER_VALUE_LEN]>,
+    config: &XdpDatapathConfig,
+    fence_generation: u64,
+    keyed_fence_generation: Option<u64>,
+) -> XdpVerdict {
     let Some(raw) = entry else {
         return XdpVerdict::SlowPathMiss;
     };
     let Some(value) = XdpOwnerValue::decode(&raw) else {
         return XdpVerdict::SlowPathError;
     };
-    if value.generation < fence_generation {
-        return XdpVerdict::SlowPathStale;
+    match config.fence_mode {
+        XdpFenceMode::Global => {
+            if value.generation < fence_generation {
+                return XdpVerdict::SlowPathStale;
+            }
+        }
+        XdpFenceMode::PerOwnershipKey => match keyed_fence_generation {
+            Some(0) => return XdpVerdict::SlowPathError,
+            Some(keyed_generation) if value.generation == keyed_generation => {}
+            Some(_) | None => return XdpVerdict::SlowPathStale,
+        },
     }
     if value.owner_shard == config.self_shard {
         return XdpVerdict::Local;
@@ -1135,6 +1187,7 @@ mod tests {
     use super::*;
 
     const CONFIG: XdpDatapathConfig = XdpDatapathConfig {
+        fence_mode: XdpFenceMode::Global,
         self_shard: 1,
         routing_domain: 7,
         handoff_ifindex: 42,
@@ -1600,6 +1653,60 @@ mod tests {
     }
 
     #[test]
+    fn per_key_fence_requires_present_nonzero_exact_generation() {
+        let config = XdpDatapathConfig {
+            fence_mode: XdpFenceMode::PerOwnershipKey,
+            ..CONFIG
+        };
+        let local = XdpOwnerValue {
+            owner_shard: config.self_shard,
+            generation: 9,
+        }
+        .encode();
+        let remote = XdpOwnerValue {
+            owner_shard: config.self_shard.saturating_add(1),
+            generation: 2,
+        }
+        .encode();
+
+        for keyed_fence in [None, Some(8), Some(10)] {
+            assert_eq!(
+                decide_owner_verdict_with_keyed_fence(Some(local), &config, u64::MAX, keyed_fence),
+                XdpVerdict::SlowPathStale
+            );
+        }
+        assert_eq!(
+            decide_owner_verdict_with_keyed_fence(Some(local), &config, u64::MAX, Some(0)),
+            XdpVerdict::SlowPathError
+        );
+        assert_eq!(
+            decide_owner_verdict_with_keyed_fence(Some(local), &config, u64::MAX, Some(9)),
+            XdpVerdict::Local
+        );
+        assert_eq!(
+            decide_owner_verdict_with_keyed_fence(Some(remote), &config, u64::MAX, Some(2)),
+            XdpVerdict::RedirectHandoff
+        );
+        assert_eq!(
+            decide_owner_verdict_with_keyed_fence(None, &config, u64::MAX, Some(9)),
+            XdpVerdict::SlowPathMiss
+        );
+
+        let global = XdpDatapathConfig {
+            fence_mode: XdpFenceMode::Global,
+            ..CONFIG
+        };
+        assert_eq!(
+            decide_owner_verdict_with_keyed_fence(Some(local), &global, 5, None),
+            XdpVerdict::Local
+        );
+        assert_eq!(
+            decide_owner_verdict_with_keyed_fence(Some(local), &global, 10, Some(9)),
+            XdpVerdict::SlowPathStale
+        );
+    }
+
+    #[test]
     fn public_debug_implementations_redact_packet_and_topology_identifiers() {
         let values = [
             std::format!("{:?}", XdpIpAddress::V4([198, 19, 83, 241])),
@@ -1620,6 +1727,7 @@ mod tests {
             std::format!(
                 "{:?}",
                 XdpDatapathConfig {
+                    fence_mode: XdpFenceMode::Global,
                     self_shard: 61_283,
                     routing_domain: 9_304_701_823,
                     handoff_ifindex: 97_531,

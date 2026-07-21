@@ -20,9 +20,9 @@ use opc_ipsec_lb::{
 };
 use opc_ipsec_lb_ebpf_common::{
     classify_transport, decide_owner_verdict, is_ipv6_extension_header_kind, ownership_map_key,
-    XdpDatapathConfig, XdpIpAddress, XdpOwnerValue, XdpTransportClass, XdpVerdict, IP_PROTOCOL_ESP,
-    IP_PROTOCOL_UDP, OWNERSHIP_ESP_NATIVE, OWNERSHIP_ESP_UDP_ENCAPSULATED, OWNER_KEY_LEN,
-    UDP_PORT_IKE, UDP_PORT_IKE_NATT,
+    XdpDatapathConfig, XdpFenceMode, XdpIpAddress, XdpOwnerValue, XdpTransportClass, XdpVerdict,
+    IP_PROTOCOL_ESP, IP_PROTOCOL_UDP, OWNERSHIP_ESP_NATIVE, OWNERSHIP_ESP_UDP_ENCAPSULATED,
+    OWNER_KEY_LEN, UDP_PORT_IKE, UDP_PORT_IKE_NATT,
 };
 
 const DOMAIN: u64 = 7;
@@ -573,6 +573,7 @@ fn non_swu_traffic_passes_untouched() {
 #[test]
 fn verdict_table_executes_fenced_ownership_decisions() {
     let config = XdpDatapathConfig {
+        fence_mode: XdpFenceMode::Global,
         self_shard: 1,
         routing_domain: DOMAIN,
         handoff_ifindex: 42,

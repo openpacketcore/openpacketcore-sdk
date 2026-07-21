@@ -11,17 +11,19 @@ use opc_types::{NetworkFunctionKind, TenantId};
 
 use opc_ipsec_lb::{
     classify_swu_packet, measure_disruption, AntiReplayResume, BgpRouteVipAdvertiser,
-    BgpRouteVipAdvertiserConfig, ClusterNode, CookieKey, CookieSlot, EspFragmentPosture,
+    BgpRouteVipAdvertiserConfig, ClusterNode, CookieKey, CookieSlot, DestinationContext,
+    EspEncapsulationKind, EspFragmentPosture, EspOwnershipKey, EspSpi, EstablishedIkeOwnershipKey,
     ExternalLbVipAdvertiser, FixedEntropy, ForwardingProof, IkeCookie, IkeCookieDecision,
-    IkeCookieGate, IkeCookiePolicy, IkeCookieRequest, IpAddress, IpFragment, IpsecLbError,
+    IkeCookieGate, IkeCookiePolicy, IkeCookieRequest, IkeSpi, IpAddress, IpFragment, IpsecLbError,
     IvResumeDecision, LeadershipFence, MockOwnershipFencer, MockOwnershipSource,
     MockRePinAuditSink, MockSteeringBackend, MockSteeringOperation, MockVipAdvertiser,
-    MockVipOperation, NicOffloadSecurityPosture, OwnershipFenceGrant, OwnershipFenceRequest,
-    OwnershipFencer, OwnershipRetryProof, OwnershipSource, OwnershipTransitionFingerprint,
-    OwnershipTransitionId, RePinAuditEvent, RePinAuditEventKind, RePinAuditSink, RePinCoordinator,
-    RePinError, RePinRequest, RePinRetryStage, RekeyRequest, RendezvousSelector, ResumeKeySource,
-    SaId, SameSpiOutboundIvResume, SameSpiResume, SelectionKey, SendIvCounter, SendIvCounterMode,
-    SendIvForwardJump, SessionOwnershipKeyResolver, SessionOwnershipKeyspace,
+    MockVipOperation, NicOffloadSecurityPosture, OutboundSaBindingId, OwnershipFence,
+    OwnershipFenceGrant, OwnershipFenceRequest, OwnershipFencer, OwnershipRetryProof,
+    OwnershipSource, OwnershipTransitionFingerprint, OwnershipTransitionId, RePinAuditEvent,
+    RePinAuditEventKind, RePinAuditSink, RePinCoordinator, RePinError, RePinRequest,
+    RePinRetryStage, RekeyRequest, RendezvousSelector, ResumeKeySource, RoutingDomainTag, SaId,
+    SameSpiOutboundIvResume, SameSpiResume, SelectionKey, SendIvCounter, SendIvCounterMode,
+    SendIvForwardJump, SessionOwnershipKey, SessionOwnershipKeyResolver, SessionOwnershipKeyspace,
     SessionStoreOwnershipSource, ShardId, ShardSet, SpiAllocationRequest, SpiAllocator, SpiKind,
     SteerKey, SteeringBackend, SteeringBackendKind, SteeringProbe, SteeringRule, SwuClassification,
     SwuClassifierConfig, SwuPacket, TaggedSpiAllocator, TaggedSpiLayout, VipAdvertisement,
@@ -30,6 +32,17 @@ use opc_ipsec_lb::{
 };
 
 const IKE_HEADER_LEN: usize = 28;
+
+// Generic coordinator state-machine conformance uses IKE random-IV requests:
+// it exercises no ESP counter authority and therefore cannot mint or fake the
+// constructor-private XFRM receipt/target pair. ESP counter authorization is
+// covered by opc-ipsec-xfrm's actor-bound unit and privileged tests below the
+// sealed production issuance boundary.
+macro_rules! generic_repin {
+    ($steering:expr, $fencer:expr, $ownership:expr, $audit:expr $(, $ignored:expr)* $(,)?) => {{
+        RePinCoordinator::new($steering, $fencer, $ownership, $audit)
+    }};
+}
 
 #[test]
 fn vip_delivered_probe_distinguishes_converged_production_from_mock_steering() {
@@ -225,11 +238,20 @@ fn shards(count: u16) -> ShardSet {
 }
 
 fn valid_repin_request(sa: SaId, key: SteerKey) -> RePinRequest {
-    let counter_mode = match sa {
-        SaId::Esp { .. } => SendIvCounterMode::EspExtendedSequenceNumbers {
-            max_peer_sequence_lag: 0,
+    let outbound_iv = match sa {
+        SaId::Esp { .. } => SameSpiOutboundIvResume::CounterBased {
+            checkpointed_send_iv_next: 10,
+            restored_send_iv_next: 10 + MIN_SEND_IV_FORWARD_JUMP,
+            forward_jump: Some(SendIvForwardJump {
+                forward_jump: MIN_SEND_IV_FORWARD_JUMP,
+                counter_mode: SendIvCounterMode::EspExtendedSequenceNumbers {
+                    max_peer_sequence_lag: 0,
+                },
+            }),
         },
-        SaId::Ike { .. } => SendIvCounterMode::IkeAeadExplicitIv64,
+        SaId::Ike { .. } => SameSpiOutboundIvResume::IkeRandomIv {
+            attestation: opc_ipsec_lb::IkeRandomIvAttestation::FreshIndependentCsprngIvPerMessage,
+        },
     };
     RePinRequest {
         sa,
@@ -242,23 +264,55 @@ fn valid_repin_request(sa: SaId, key: SteerKey) -> RePinRequest {
             owner: ShardId::new(2),
             key,
         },
+        ownership_key: ownership_key(sa),
+        outbound_sa_binding_id: outbound_sa_binding_id(sa),
         resume: SameSpiResume {
             previous_sa: sa,
             resumed_sa: sa,
-            outbound_iv: SameSpiOutboundIvResume::CounterBased {
-                checkpointed_send_iv_next: 10,
-                restored_send_iv_next: 10 + MIN_SEND_IV_FORWARD_JUMP,
-                forward_jump: Some(SendIvForwardJump {
-                    forward_jump: MIN_SEND_IV_FORWARD_JUMP,
-                    counter_mode,
-                }),
-            },
+            outbound_iv,
             anti_replay: AntiReplayResume::ExactWindowRestore {
                 checkpoint_highest_accepted: 5,
                 restored_highest_accepted: 5,
             },
             key_source: ResumeKeySource::LiveMirrored,
         },
+    }
+}
+
+fn valid_ike_repin_request(responder_spi: u64) -> RePinRequest {
+    valid_repin_request(
+        SaId::Ike { responder_spi },
+        SteerKey::IkeResponderSpi(responder_spi),
+    )
+}
+
+fn ownership_key(sa: SaId) -> SessionOwnershipKey {
+    let destination =
+        DestinationContext::new(IpAddress::V4([192, 0, 2, 20]), RoutingDomainTag::new(7));
+    match sa {
+        SaId::Esp { spi } => SessionOwnershipKey::Esp(EspOwnershipKey::new(
+            destination,
+            EspEncapsulationKind::UdpEncapsulated,
+            EspSpi::new(spi).unwrap(),
+        )),
+        SaId::Ike { responder_spi } => {
+            SessionOwnershipKey::EstablishedIke(EstablishedIkeOwnershipKey::new(
+                destination,
+                IkeSpi::new(17).unwrap(),
+                IkeSpi::new(responder_spi).unwrap(),
+            ))
+        }
+    }
+}
+
+fn outbound_sa_binding_id(sa: SaId) -> Option<OutboundSaBindingId> {
+    match sa {
+        SaId::Esp { spi } => {
+            let mut bytes = [0x55; 32];
+            bytes[..4].copy_from_slice(&spi.to_be_bytes());
+            Some(OutboundSaBindingId::from_bytes(bytes))
+        }
+        SaId::Ike { .. } => None,
     }
 }
 
@@ -734,7 +788,7 @@ async fn session_store_ownership_source_reads_authoritative_sa_owner() {
 }
 
 #[tokio::test]
-async fn persisted_resume_repins_only_after_forward_jump_and_external_forwarding_proof() {
+async fn plausible_numeric_esp_counter_without_applied_receipt_cannot_steer() {
     let steering = MockSteeringBackend::new();
     let fencer = MockOwnershipFencer::new();
     let ownership = MockOwnershipSource::default();
@@ -745,17 +799,52 @@ async fn persisted_resume_repins_only_after_forward_jump_and_external_forwarding
         ownership.clone(),
         audit.clone(),
     );
+    let sa = SaId::Esp { spi: 0x1020_3040 };
+    let request = valid_repin_request(sa, SteerKey::EspSpi(0x1020_3040));
+    let scoped_key = request.ownership_key;
+    fencer.set_owner(scoped_key, request.previous_owner.clone());
+    ownership.set_shard_owner(request.rule.owner, request.new_owner.clone());
 
-    let sa = SaId::Esp { spi: 0x1122_3344 };
+    assert_eq!(
+        coordinator.repin(request).await.unwrap_err(),
+        RePinError::BeforeOwnershipCommit(IpsecLbError::AppliedCounterProofRejected {
+            code: "esp_counter_proof_authority_not_configured",
+        })
+    );
+    assert!(steering.operations().is_empty());
+    assert!(fencer.operations().is_empty());
+    assert!(audit.events().is_empty());
+    assert_eq!(fencer.owner(scoped_key).unwrap().as_str(), "worker-a");
+}
+
+#[tokio::test]
+async fn persisted_random_iv_ike_resume_requires_external_forwarding_proof() {
+    let steering = MockSteeringBackend::new();
+    let fencer = MockOwnershipFencer::new();
+    let ownership = MockOwnershipSource::default();
+    let audit = MockRePinAuditSink::new();
+    let coordinator = generic_repin!(
+        steering.clone(),
+        fencer.clone(),
+        ownership.clone(),
+        audit.clone(),
+        0x1122_3344,
+        41 + MIN_SEND_IV_FORWARD_JUMP,
+    );
+
+    let sa = SaId::Ike {
+        responder_spi: 0x1122_3344,
+    };
     let previous_owner = ClusterNode::new("worker-a");
     let new_owner = ClusterNode::new("worker-b");
-    fencer.set_owner(sa, previous_owner.clone());
+    let scoped_key = ownership_key(sa);
+    fencer.set_owner(scoped_key, previous_owner.clone());
     ownership.set_shard_owner(ShardId::new(2), new_owner.clone());
 
     let rule = SteeringRule {
         shard: ShardId::new(1),
         owner: ShardId::new(2),
-        key: SteerKey::EspSpi(0x1122_3344),
+        key: SteerKey::IkeResponderSpi(0x1122_3344),
     };
     let outcome = coordinator
         .repin(RePinRequest {
@@ -765,18 +854,14 @@ async fn persisted_resume_repins_only_after_forward_jump_and_external_forwarding
             previous_owner: previous_owner.clone(),
             new_owner: new_owner.clone(),
             rule,
+            ownership_key: scoped_key,
+            outbound_sa_binding_id: None,
             resume: SameSpiResume {
                 previous_sa: sa,
                 resumed_sa: sa,
-                outbound_iv: SameSpiOutboundIvResume::CounterBased {
-                    checkpointed_send_iv_next: 41,
-                    restored_send_iv_next: 41 + MIN_SEND_IV_FORWARD_JUMP,
-                    forward_jump: Some(SendIvForwardJump {
-                        forward_jump: MIN_SEND_IV_FORWARD_JUMP,
-                        counter_mode: SendIvCounterMode::EspExtendedSequenceNumbers {
-                            max_peer_sequence_lag: 40,
-                        },
-                    }),
+                outbound_iv: SameSpiOutboundIvResume::IkeRandomIv {
+                    attestation:
+                        opc_ipsec_lb::IkeRandomIvAttestation::FreshIndependentCsprngIvPerMessage,
                 },
                 anti_replay: AntiReplayResume::BoundedReopening {
                     checkpoint_highest_accepted: 100,
@@ -793,7 +878,7 @@ async fn persisted_resume_repins_only_after_forward_jump_and_external_forwarding
         steering.operations(),
         vec![MockSteeringOperation::Install(rule)]
     );
-    assert_eq!(fencer.owner(sa).unwrap().as_str(), "worker-b");
+    assert_eq!(fencer.owner(scoped_key).unwrap().as_str(), "worker-b");
     assert!(!outcome.forwarding_proven());
 
     let events = audit.events();
@@ -813,24 +898,29 @@ async fn repin_fails_closed_when_audit_or_resume_is_unsafe() {
     let fencer = MockOwnershipFencer::new();
     let ownership = MockOwnershipSource::default();
     let audit = MockRePinAuditSink::new();
-    let coordinator = RePinCoordinator::new(
+    let coordinator = generic_repin!(
         steering.clone(),
         fencer.clone(),
         ownership.clone(),
         audit.clone(),
+        0x700,
+        10 + MIN_SEND_IV_FORWARD_JUMP,
     );
 
-    let sa = SaId::Esp { spi: 7 };
+    let sa = SaId::Ike {
+        responder_spi: 0x700,
+    };
     let previous_owner = ClusterNode::new("worker-a");
     let new_owner = ClusterNode::new("worker-b");
-    fencer.set_owner(sa, previous_owner.clone());
+    let scoped_key = ownership_key(sa);
+    fencer.set_owner(scoped_key, previous_owner.clone());
     ownership.set_shard_owner(ShardId::new(2), new_owner.clone());
     audit.set_failure(IpsecLbError::Unsupported);
 
     let rule = SteeringRule {
         shard: ShardId::new(1),
         owner: ShardId::new(2),
-        key: SteerKey::EspSpi(7),
+        key: SteerKey::IkeResponderSpi(0x700),
     };
     let request = RePinRequest {
         sa,
@@ -839,18 +929,14 @@ async fn repin_fails_closed_when_audit_or_resume_is_unsafe() {
         previous_owner: previous_owner.clone(),
         new_owner: new_owner.clone(),
         rule,
+        ownership_key: scoped_key,
+        outbound_sa_binding_id: None,
         resume: SameSpiResume {
             previous_sa: sa,
             resumed_sa: sa,
-            outbound_iv: SameSpiOutboundIvResume::CounterBased {
-                checkpointed_send_iv_next: 10,
-                restored_send_iv_next: 10 + MIN_SEND_IV_FORWARD_JUMP,
-                forward_jump: Some(SendIvForwardJump {
-                    forward_jump: MIN_SEND_IV_FORWARD_JUMP,
-                    counter_mode: SendIvCounterMode::EspExtendedSequenceNumbers {
-                        max_peer_sequence_lag: 0,
-                    },
-                }),
+            outbound_iv: SameSpiOutboundIvResume::IkeRandomIv {
+                attestation:
+                    opc_ipsec_lb::IkeRandomIvAttestation::FreshIndependentCsprngIvPerMessage,
             },
             anti_replay: AntiReplayResume::ExactWindowRestore {
                 checkpoint_highest_accepted: 5,
@@ -864,22 +950,18 @@ async fn repin_fails_closed_when_audit_or_resume_is_unsafe() {
         RePinError::BeforeOwnershipCommit(IpsecLbError::Unsupported)
     );
     assert!(steering.operations().is_empty());
-    assert_eq!(fencer.owner(sa).unwrap().as_str(), "worker-a");
+    assert_eq!(fencer.owner(scoped_key).unwrap().as_str(), "worker-a");
 
     audit.clear_failure();
     let unsafe_request = RePinRequest {
         resume: SameSpiResume {
             previous_sa: sa,
-            resumed_sa: SaId::Esp { spi: 8 },
-            outbound_iv: SameSpiOutboundIvResume::CounterBased {
-                checkpointed_send_iv_next: 10,
-                restored_send_iv_next: 10 + MIN_SEND_IV_FORWARD_JUMP,
-                forward_jump: Some(SendIvForwardJump {
-                    forward_jump: MIN_SEND_IV_FORWARD_JUMP,
-                    counter_mode: SendIvCounterMode::EspExtendedSequenceNumbers {
-                        max_peer_sequence_lag: 0,
-                    },
-                }),
+            resumed_sa: SaId::Ike {
+                responder_spi: 0x701,
+            },
+            outbound_iv: SameSpiOutboundIvResume::IkeRandomIv {
+                attestation:
+                    opc_ipsec_lb::IkeRandomIvAttestation::FreshIndependentCsprngIvPerMessage,
             },
             anti_replay: AntiReplayResume::ExactWindowRestore {
                 checkpoint_highest_accepted: 5,
@@ -894,7 +976,7 @@ async fn repin_fails_closed_when_audit_or_resume_is_unsafe() {
         RePinError::BeforeOwnershipCommit(IpsecLbError::UnsafeResume { .. })
     ));
     assert!(steering.operations().is_empty());
-    assert_eq!(fencer.owner(sa).unwrap().as_str(), "worker-a");
+    assert_eq!(fencer.owner(scoped_key).unwrap().as_str(), "worker-a");
 }
 
 #[tokio::test]
@@ -913,8 +995,20 @@ async fn repin_rejects_zero_sa_identifiers_before_any_side_effect() {
             ownership.clone(),
             audit.clone(),
         );
-        let request = valid_repin_request(sa, key);
-        fencer.set_owner(sa, request.previous_owner.clone());
+        let mut request = match sa {
+            SaId::Esp { .. } => {
+                valid_repin_request(SaId::Esp { spi: 0x100 }, SteerKey::EspSpi(0x100))
+            }
+            SaId::Ike { .. } => {
+                valid_repin_request(SaId::Ike { responder_spi: 1 }, SteerKey::IkeResponderSpi(1))
+            }
+        };
+        request.sa = sa;
+        request.rule.key = key;
+        request.resume.previous_sa = sa;
+        request.resume.resumed_sa = sa;
+        let scoped_key = request.ownership_key;
+        fencer.set_owner(scoped_key, request.previous_owner.clone());
         ownership.set_shard_owner(request.rule.owner, request.new_owner.clone());
 
         assert!(matches!(
@@ -924,7 +1018,7 @@ async fn repin_rejects_zero_sa_identifiers_before_any_side_effect() {
         assert!(audit.events().is_empty());
         assert!(fencer.operations().is_empty());
         assert!(steering.operations().is_empty());
-        assert_eq!(fencer.owner(sa).unwrap().as_str(), "worker-a");
+        assert_eq!(fencer.owner(scoped_key).unwrap().as_str(), "worker-a");
     }
 }
 
@@ -942,7 +1036,8 @@ async fn repin_requires_target_shard_to_resolve_to_the_new_owner_without_side_ef
     );
     let sa = SaId::Esp { spi: 0x1020_3040 };
     let request = valid_repin_request(sa, SteerKey::EspSpi(0x1020_3040));
-    fencer.set_owner(sa, request.previous_owner.clone());
+    let scoped_key = request.ownership_key;
+    fencer.set_owner(scoped_key, request.previous_owner.clone());
 
     assert!(matches!(
         coordinator.repin(request.clone()).await.unwrap_err(),
@@ -957,7 +1052,7 @@ async fn repin_requires_target_shard_to_resolve_to_the_new_owner_without_side_ef
     assert!(audit.events().is_empty());
     assert!(fencer.operations().is_empty());
     assert!(steering.operations().is_empty());
-    assert_eq!(fencer.owner(sa).unwrap().as_str(), "worker-a");
+    assert_eq!(fencer.owner(scoped_key).unwrap().as_str(), "worker-a");
 }
 
 #[tokio::test]
@@ -1001,9 +1096,8 @@ async fn repin_rechecks_target_owner_after_the_sa_fence_before_steering() {
     let inner_fencer = MockOwnershipFencer::new();
     let ownership = MockOwnershipSource::default();
     let audit = MockRePinAuditSink::new();
-    let sa = SaId::Esp { spi: 0x2030_4050 };
-    let request = valid_repin_request(sa, SteerKey::EspSpi(0x2030_4050));
-    inner_fencer.set_owner(sa, request.previous_owner.clone());
+    let request = valid_ike_repin_request(0x2030_4050);
+    inner_fencer.set_owner(request.ownership_key, request.previous_owner.clone());
     ownership.set_shard_owner(request.rule.owner, request.new_owner.clone());
     let fencer = ShardChangingFencer {
         inner: inner_fencer,
@@ -1011,8 +1105,14 @@ async fn repin_rechecks_target_owner_after_the_sa_fence_before_steering() {
         shard: request.rule.owner,
         replacement: ClusterNode::new("worker-c"),
     };
-    let coordinator =
-        RePinCoordinator::new(steering.clone(), fencer, ownership.clone(), audit.clone());
+    let coordinator = generic_repin!(
+        steering.clone(),
+        fencer,
+        ownership.clone(),
+        audit.clone(),
+        0x2030_4050,
+        10 + MIN_SEND_IV_FORWARD_JUMP,
+    );
 
     let partial = coordinator
         .repin(request.clone())
@@ -1041,6 +1141,107 @@ async fn repin_rechecks_target_owner_after_the_sa_fence_before_steering() {
         steering.operations(),
         vec![MockSteeringOperation::Install(request.rule)]
     );
+}
+
+#[tokio::test]
+async fn non_monotonic_grants_are_rejected_on_initial_and_recovered_paths() {
+    #[derive(Debug, Clone, Copy)]
+    enum GrantPath {
+        Initial,
+        Recovered,
+    }
+
+    #[derive(Debug, Clone)]
+    struct NonMonotonicFencer {
+        path: GrantPath,
+        fence: OwnershipFence,
+        fence_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl NonMonotonicFencer {
+        fn grant(&self, request: &OwnershipFenceRequest) -> OwnershipFenceGrant {
+            OwnershipFenceGrant {
+                sa: request.sa,
+                ownership_key: request.ownership_key,
+                transition_id: request.transition_id,
+                fingerprint: request.fingerprint,
+                owner: request.new_owner.clone(),
+                fence: self.fence,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl OwnershipFencer for NonMonotonicFencer {
+        async fn recover_fence_grant(
+            &self,
+            request: &OwnershipFenceRequest,
+        ) -> Result<Option<OwnershipFenceGrant>, IpsecLbError> {
+            Ok(match self.path {
+                GrantPath::Initial => None,
+                GrantPath::Recovered => Some(self.grant(request)),
+            })
+        }
+
+        async fn fence_sa_owner(
+            &self,
+            request: OwnershipFenceRequest,
+        ) -> Result<OwnershipFenceGrant, IpsecLbError> {
+            self.fence_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self.grant(&request))
+        }
+
+        async fn validate_retry_proof(
+            &self,
+            _proof: &OwnershipRetryProof,
+        ) -> Result<(), IpsecLbError> {
+            Err(IpsecLbError::adapter_contract_violation(
+                "non_monotonic_grant_reached_retry_validation",
+            ))
+        }
+    }
+
+    for path in [GrantPath::Initial, GrantPath::Recovered] {
+        for granted_fence in [1, 2] {
+            let steering = MockSteeringBackend::new();
+            let ownership = MockOwnershipSource::default();
+            let audit = MockRePinAuditSink::new();
+            let mut request = valid_ike_repin_request(0x3050_6070 + granted_fence);
+            request.previous_fence = OwnershipFence::new(2).unwrap();
+            ownership.set_shard_owner(request.rule.owner, request.new_owner.clone());
+            let fence_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let coordinator = RePinCoordinator::new(
+                steering.clone(),
+                NonMonotonicFencer {
+                    path,
+                    fence: OwnershipFence::new(granted_fence).unwrap(),
+                    fence_calls: std::sync::Arc::clone(&fence_calls),
+                },
+                ownership,
+                audit.clone(),
+            );
+
+            assert!(matches!(
+                coordinator.repin(request).await,
+                Err(RePinError::BeforeOwnershipCommit(
+                    IpsecLbError::OwnershipConflict { .. }
+                ))
+            ));
+            assert!(steering.operations().is_empty());
+            let event_kinds: Vec<_> = audit.events().iter().map(|event| event.kind).collect();
+            match path {
+                GrantPath::Initial => {
+                    assert_eq!(event_kinds, vec![RePinAuditEventKind::Attempt]);
+                    assert_eq!(fence_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+                }
+                GrantPath::Recovered => {
+                    assert!(event_kinds.is_empty());
+                    assert_eq!(fence_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+                }
+            }
+        }
+    }
 }
 
 #[tokio::test]
@@ -1091,15 +1292,21 @@ async fn post_commit_proof_read_failure_preserves_a_retryable_single_use_partial
     let inner_fencer = MockOwnershipFencer::new();
     let ownership = MockOwnershipSource::default();
     let audit = MockRePinAuditSink::new();
-    let sa = SaId::Esp { spi: 0x3040_5060 };
-    let request = valid_repin_request(sa, SteerKey::EspSpi(0x3040_5060));
-    inner_fencer.set_owner(sa, request.previous_owner.clone());
+    let request = valid_ike_repin_request(0x3040_5060);
+    inner_fencer.set_owner(request.ownership_key, request.previous_owner.clone());
     ownership.set_shard_owner(request.rule.owner, request.new_owner.clone());
     let fencer = ValidationFailOnceFencer {
         inner: inner_fencer.clone(),
         fail_once: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
     };
-    let coordinator = RePinCoordinator::new(steering.clone(), fencer, ownership, audit.clone());
+    let coordinator = generic_repin!(
+        steering.clone(),
+        fencer,
+        ownership,
+        audit.clone(),
+        0x3040_5060,
+        10 + MIN_SEND_IV_FORWARD_JUMP,
+    );
 
     let partial = coordinator
         .repin(request.clone())
@@ -1109,7 +1316,10 @@ async fn post_commit_proof_read_failure_preserves_a_retryable_single_use_partial
         .expect("a successful fencer grant is post-commit state");
     assert_eq!(partial.resume_at(), RePinRetryStage::FencedAudit);
     assert!(matches!(partial.cause(), IpsecLbError::Io { .. }));
-    assert_eq!(inner_fencer.owner(sa).unwrap().as_str(), "worker-b");
+    assert_eq!(
+        inner_fencer.owner(request.ownership_key).unwrap().as_str(),
+        "worker-b"
+    );
     assert_eq!(
         audit
             .events()
@@ -1148,15 +1358,16 @@ async fn replaying_the_same_request_recovers_the_committed_fence_without_refenci
     let fencer = MockOwnershipFencer::new();
     let ownership = MockOwnershipSource::default();
     let audit = MockRePinAuditSink::new();
-    let coordinator = RePinCoordinator::new(
+    let coordinator = generic_repin!(
         steering.clone(),
         fencer.clone(),
         ownership.clone(),
         audit.clone(),
+        0x4050_6070,
+        10 + MIN_SEND_IV_FORWARD_JUMP,
     );
-    let sa = SaId::Esp { spi: 0x4050_6070 };
-    let request = valid_repin_request(sa, SteerKey::EspSpi(0x4050_6070));
-    fencer.set_owner(sa, request.previous_owner.clone());
+    let request = valid_ike_repin_request(0x4050_6070);
+    fencer.set_owner(request.ownership_key, request.previous_owner.clone());
     ownership.set_shard_owner(request.rule.owner, request.new_owner.clone());
 
     let partial = coordinator
@@ -1171,15 +1382,9 @@ async fn replaying_the_same_request_recovers_the_committed_fence_without_refenci
 
     let altered_resume = RePinRequest {
         resume: SameSpiResume {
-            outbound_iv: SameSpiOutboundIvResume::CounterBased {
-                checkpointed_send_iv_next: 11,
-                restored_send_iv_next: 11 + MIN_SEND_IV_FORWARD_JUMP,
-                forward_jump: Some(SendIvForwardJump {
-                    forward_jump: MIN_SEND_IV_FORWARD_JUMP,
-                    counter_mode: SendIvCounterMode::EspExtendedSequenceNumbers {
-                        max_peer_sequence_lag: 0,
-                    },
-                }),
+            anti_replay: AntiReplayResume::ExactWindowRestore {
+                checkpoint_highest_accepted: 6,
+                restored_highest_accepted: 6,
             },
             ..request.resume
         },
@@ -1230,9 +1435,11 @@ async fn replaying_the_same_request_recovers_the_committed_fence_without_refenci
 async fn stale_transition_cannot_recover_or_refence_after_a_full_aba_owner_cycle() {
     let fencer = MockOwnershipFencer::new();
     let sa = SaId::Esp { spi: 0x4151_6171 };
-    fencer.set_owner(sa, ClusterNode::new("worker-a"));
+    let scoped_key = ownership_key(sa);
+    fencer.set_owner(scoped_key, ClusterNode::new("worker-a"));
     let old = OwnershipFenceRequest {
         sa,
+        ownership_key: scoped_key,
         transition_id: OwnershipTransitionId::new(1).unwrap(),
         fingerprint: OwnershipTransitionFingerprint::from_bytes([1; 32]),
         previous_fence: opc_ipsec_lb::OwnershipFence::new(1).unwrap(),
@@ -1243,6 +1450,7 @@ async fn stale_transition_cannot_recover_or_refence_after_a_full_aba_owner_cycle
     let second = fencer
         .fence_sa_owner(OwnershipFenceRequest {
             sa,
+            ownership_key: scoped_key,
             transition_id: OwnershipTransitionId::new(2).unwrap(),
             fingerprint: OwnershipTransitionFingerprint::from_bytes([2; 32]),
             previous_fence: first.fence,
@@ -1254,6 +1462,7 @@ async fn stale_transition_cannot_recover_or_refence_after_a_full_aba_owner_cycle
     fencer
         .fence_sa_owner(OwnershipFenceRequest {
             sa,
+            ownership_key: scoped_key,
             transition_id: OwnershipTransitionId::new(3).unwrap(),
             fingerprint: OwnershipTransitionFingerprint::from_bytes([3; 32]),
             previous_fence: second.fence,
@@ -1312,10 +1521,16 @@ async fn retry_converges_after_steering_applied_but_acknowledgement_failed() {
     let fencer = MockOwnershipFencer::new();
     let ownership = MockOwnershipSource::default();
     let audit = MockRePinAuditSink::new();
-    let coordinator = RePinCoordinator::new(steering, fencer.clone(), ownership.clone(), audit);
-    let sa = SaId::Esp { spi: 0x5060_7080 };
-    let request = valid_repin_request(sa, SteerKey::EspSpi(0x5060_7080));
-    fencer.set_owner(sa, request.previous_owner.clone());
+    let coordinator = generic_repin!(
+        opc_ipsec_lb::LegacySpiRuleRePinAdapter::new(steering),
+        fencer.clone(),
+        ownership.clone(),
+        audit,
+        0x5060_7080,
+        10 + MIN_SEND_IV_FORWARD_JUMP,
+    );
+    let request = valid_ike_repin_request(0x5060_7080);
+    fencer.set_owner(request.ownership_key, request.previous_owner.clone());
     ownership.set_shard_owner(request.rule.owner, request.new_owner.clone());
 
     let partial = coordinator
@@ -1367,11 +1582,16 @@ async fn retry_deduplicates_an_audit_event_applied_before_acknowledgement_failed
         inner: recorded.clone(),
         fail_once: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
     };
-    let coordinator =
-        RePinCoordinator::new(steering.clone(), fencer.clone(), ownership.clone(), audit);
-    let sa = SaId::Esp { spi: 0x6070_8090 };
-    let request = valid_repin_request(sa, SteerKey::EspSpi(0x6070_8090));
-    fencer.set_owner(sa, request.previous_owner.clone());
+    let coordinator = generic_repin!(
+        steering.clone(),
+        fencer.clone(),
+        ownership.clone(),
+        audit,
+        0x6070_8090,
+        10 + MIN_SEND_IV_FORWARD_JUMP,
+    );
+    let request = valid_ike_repin_request(0x6070_8090);
+    fencer.set_owner(request.ownership_key, request.previous_owner.clone());
     ownership.set_shard_owner(request.rule.owner, request.new_owner.clone());
 
     let partial = coordinator
@@ -1420,15 +1640,16 @@ async fn post_commit_failures_retry_from_the_first_incomplete_stage() {
         let fencer = MockOwnershipFencer::new();
         let ownership = MockOwnershipSource::default();
         let audit = MockRePinAuditSink::new();
-        let coordinator = RePinCoordinator::new(
+        let coordinator = generic_repin!(
             steering.clone(),
             fencer.clone(),
             ownership.clone(),
             audit.clone(),
+            0x3344_5566,
+            10 + MIN_SEND_IV_FORWARD_JUMP,
         );
-        let sa = SaId::Esp { spi: 0x3344_5566 };
-        let request = valid_repin_request(sa, SteerKey::EspSpi(0x3344_5566));
-        fencer.set_owner(sa, request.previous_owner.clone());
+        let request = valid_ike_repin_request(0x3344_5566);
+        fencer.set_owner(request.ownership_key, request.previous_owner.clone());
         ownership.set_shard_owner(request.rule.owner, request.new_owner.clone());
 
         match failure_point {
@@ -1450,7 +1671,10 @@ async fn post_commit_failures_retry_from_the_first_incomplete_stage() {
         assert_eq!(partial.resume_at(), expected_stage);
         assert_eq!(partial.cause(), &IpsecLbError::Unsupported);
         assert_eq!(partial.fence().get(), 2);
-        assert_eq!(fencer.owner(sa).unwrap().as_str(), "worker-b");
+        assert_eq!(
+            fencer.owner(request.ownership_key).unwrap().as_str(),
+            "worker-b"
+        );
 
         let outcome = coordinator.retry(partial).await.unwrap();
         assert_eq!(outcome.fence().get(), 2);
@@ -1510,15 +1734,19 @@ async fn retry_rejects_a_superseded_fence_before_audit_or_steering() {
     let fencer = MockOwnershipFencer::new();
     let ownership = MockOwnershipSource::default();
     let audit = MockRePinAuditSink::new();
-    let coordinator = RePinCoordinator::new(
+    let coordinator = generic_repin!(
         steering.clone(),
         fencer.clone(),
         ownership.clone(),
         audit.clone(),
+        0x4455_6677,
+        10 + MIN_SEND_IV_FORWARD_JUMP,
     );
-    let sa = SaId::Esp { spi: 0x4455_6677 };
-    let request = valid_repin_request(sa, SteerKey::EspSpi(0x4455_6677));
-    fencer.set_owner(sa, request.previous_owner.clone());
+    let sa = SaId::Ike {
+        responder_spi: 0x4455_6677,
+    };
+    let request = valid_ike_repin_request(0x4455_6677);
+    fencer.set_owner(request.ownership_key, request.previous_owner.clone());
     ownership.set_shard_owner(request.rule.owner, request.new_owner.clone());
 
     let partial = coordinator
@@ -1530,6 +1758,7 @@ async fn retry_rejects_a_superseded_fence_before_audit_or_steering() {
     fencer
         .fence_sa_owner(OwnershipFenceRequest {
             sa,
+            ownership_key: request.ownership_key,
             transition_id: OwnershipTransitionId::new(2).unwrap(),
             fingerprint: OwnershipTransitionFingerprint::from_bytes([2; 32]),
             previous_fence: opc_ipsec_lb::OwnershipFence::new(2).unwrap(),

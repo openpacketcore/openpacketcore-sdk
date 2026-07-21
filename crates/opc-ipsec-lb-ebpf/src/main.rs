@@ -37,7 +37,7 @@ use aya_ebpf::{
 };
 use aya_ebpf_bindings::helpers::bpf_xdp_load_bytes;
 use opc_ipsec_lb_ebpf_common::{
-    classify_transport, decide_owner_verdict, is_ipv6_extension_header_kind,
+    classify_transport, decide_owner_verdict_with_keyed_fence, is_ipv6_extension_header_kind,
     ownership_map_key, redirect_outcome, verdict_counter, XdpDatapathConfig, XdpIpAddress,
     XdpRedirectOutcome, XdpTransportClass, XdpVerdict, CONFIG_KEY, CONFIG_VALUE_LEN,
     COUNTER_ERROR, COUNTER_NATT_KEEPALIVE, COUNTER_PASS_NON_SWU, COUNTER_REDIRECT, COUNTER_SLOTS,
@@ -63,6 +63,11 @@ static IPSEC_LB_COUNTERS: PerCpuArray<u64> = PerCpuArray::pinned(COUNTER_SLOTS, 
 /// immutable old or new value to lockless readers.
 #[map(name = "IPSEC_LB_FENCE")]
 static IPSEC_LB_FENCE: HashMap<u32, u64> = HashMap::pinned(1, 0);
+
+/// Destination-scoped ownership fences. Activation stages and reads back the
+/// owner while this entry is absent, then publishes the exact fence last.
+#[map(name = "IPSEC_LB_KEY_FENCES")]
+static IPSEC_LB_KEY_FENCES: HashMap<[u8; OWNER_KEY_LEN], u64> = HashMap::pinned(65536, 0);
 
 const IPV4_MIN_HDR_LEN: usize = 20;
 const IPV6_HDR_LEN: usize = 40;
@@ -284,7 +289,17 @@ fn steer_transport(
                     unsafe { *ptr }
                 })
                 .unwrap_or(0);
-            let verdict = decide_owner_verdict(entry, &config, fence_generation);
+            let keyed_fence_generation = IPSEC_LB_KEY_FENCES.get_ptr(&key).map(|ptr| {
+                // SAFETY: the immutable hash-map element lives for the
+                // duration of this program invocation.
+                unsafe { *ptr }
+            });
+            let verdict = decide_owner_verdict_with_keyed_fence(
+                entry,
+                &config,
+                fence_generation,
+                keyed_fence_generation,
+            );
             match verdict {
                 XdpVerdict::RedirectHandoff => {
                     // SAFETY: helper does not dereference pointers; the ifindex

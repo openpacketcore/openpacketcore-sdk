@@ -1,9 +1,10 @@
 # opc-ipsec-lb
 
-Pure SWu IKE/IPsec load-balancing primitives for OpenPacketCore CNFs.
+Safe SWu IKE/IPsec load-balancing and Host-XDP steering primitives for
+OpenPacketCore CNFs.
 
-This crate is the kernel-independent foundation for an ePDG/N3IWF/TWIF
-steer layer:
+This crate provides the ownership, recovery, and production Host-XDP datapath
+boundaries for an ePDG/N3IWF/TWIF steer layer:
 
 - tagged SPI layout and allocation policy;
 - clone-shared tagged-SPI reservations for excluding HA-restored live SAs from
@@ -21,7 +22,8 @@ steer layer:
   stale generation, and unclassifiable candidates (never a silent drop);
 - stateless IKE cookie helper for edge DoS posture;
 - failover safety guards for IV-counter and replay-window restoration;
-- audited same-SPI re-pin coordination with monotonic ownership fencing;
+- audited same-SPI re-pin coordination with monotonic ownership fencing and
+  opaque XFRM-applied ESP counter receipts;
 - durable session-level multi-SA re-pin progress and fenced terminal
   retirement with bounded stale-retry tombstones;
 - BGP route-export VIP advertisement through the safe route-steering backend;
@@ -188,11 +190,14 @@ IANA-registered extension kind to that slow path, except direct native ESP,
 which is a supported SWu transport. This includes extension kinds the
 userspace walker rejects, so an unwalked extension can never conceal UDP/500,
 UDP/4500, or ESP from owner steering.
-Each entry carries the owner shard and an ownership generation. The owner map
-is a kernel hash map, so one map update publishes either the old or new
-complete element to concurrent readers; an old-owner/new-generation mixture
-is not observable. Strict decoding separately rejects structurally invalid
-values.
+Each entry carries the owner shard and an ownership generation. ABI v5 keeps
+the destination-scoped owner in `IPSEC_LB_OWNERS` and its authoritative
+generation in the separate `IPSEC_LB_KEY_FENCES` map. Destination-scoped mode
+passes or redirects a packet only when both entries exist and their non-zero
+generations match exactly; an absent, malformed, or mismatched keyed fence is
+stale and goes to the slow path. Each hash-map update publishes an old or new
+complete element to concurrent readers, and strict decoding rejects
+structurally invalid values.
 Attach inventories strictly validated complete and interrupted pinned-map
 namespaces, preserves their maximum fence, and stages fresh maps with empty
 owners before the program is attached. A crashed process's entries are never
@@ -210,12 +215,19 @@ Verdicts are fail-closed and the program never drops a packet:
   validated at attach (must exist, be up, and differ from the attached
   interface) and the redirect counter is incremented only for
   helper-confirmed redirects;
-- map miss, stale generation (older than the fence set with
-  `advance_fence`; the fence lives in its own single-entry hash map, so a
-  replacement publishes the old or new `u64`), unclassifiable candidates,
-  and internal errors ->
+- map miss, stale or missing destination-scoped fence, unclassifiable
+  candidates, and internal errors ->
   `XDP_PASS` to the userspace slow path, each with a distinct per-CPU counter
   exported via `counters()`.
+
+Destination-scoped activation is fence-last. The backend first removes and
+reads back the keyed fence, clears the old owner, stages and reads back the new
+owner while it remains unreachable, and only then publishes and reads back the
+exact authoritative keyed fence. Retirement advances durable ownership first,
+then removes and reads back the exact owner and keyed fence. If either path
+cannot prove its final state, the backend attempts a per-key stale cut, removes
+the CONFIG activation, and detaches; readiness is restored only after detach
+and a fresh pin-feasibility check are both proven.
 
 The kernel feature floor and configured topology are enforced at load with the
 typed `IpsecLbError::XdpKernelFloorNotMet` error: Linux >= 5.18 with kernel
@@ -230,7 +242,7 @@ Cross-process upgrades use the explicit `prepare_upgrade_handoff()` then
 `adopt_upgrade_handoff()` boundary. Preparation serializes mutations, empties
 and verifies owners, pins the exact live link, and terminalizes the old
 backend. Adoption validates the link's program, target interface, live attach
-mode, maps, and non-regressing fence; stages a fresh ABI-v4 namespace; then
+mode, maps, and non-regressing fence; stages a fresh ABI-v5 namespace; then
 uses `BPF_LINK_UPDATE` with `BPF_F_REPLACE` and the exact expected old program.
 Kernel-interrupted link-state dumps receive up to three retries (four total
 attempts), each from a fresh, empty snapshot. Partial observations are never
@@ -255,9 +267,9 @@ explicitly select `HostXdpRedirectHandoff::UserspaceRedirector`.
 the kernel may select driver or generic mode. Explicit `Generic` requires a
 live SKB-mode hook and is the interoperable choice for veth hand-off peers
 without an XDP consumer. See `tests/xdp_privileged.rs` for the gated
-netns/veth proof (`OPC_IPSEC_LB_RUN_PRIVILEGED=1`), including every v1/v4
-cleanup interruption boundary and migration from a frozen v3 program/map
-artifact.
+netns/veth proof (`OPC_IPSEC_LB_RUN_PRIVILEGED=1`), including legacy ABI
+migration, v5 keyed-fence activation and retirement, and cleanup interruption
+boundaries.
 
 ## Leadership-gated VIP ownership
 
@@ -533,16 +545,112 @@ values that might reopen, including lost bitmap state and post-checkpoint lag;
 the SDK does not invent a deployment policy default. High-watermark rollback,
 exact state not bound to its checkpoint, and a zero reopening bound fail closed.
 
+### Applied ESP counter proof
+
+For `SaId::Esp` plus `SameSpiOutboundIvResume::CounterBased`, validated
+arithmetic is necessary but not sufficient. `RePinCoordinator::new` fails
+closed until it receives an opaque `AppliedEspCounterReceipt` issued by
+`opc-ipsec-xfrm` after the exact outbound SA was updated and read back. The
+coordinator validates the receipt before a new ownership commit and repeats
+GETSA validation after fencing immediately before first steering publication.
+IKE counter and random-IV application remain consumer-owned.
+
+```rust,ignore
+use std::sync::Arc;
+
+use opc_ipsec_lb::{RePinCoordinator, RePinRequest};
+use opc_ipsec_xfrm::{
+    EspCounterResumeApplyRequest, EspCounterResumeBinding,
+};
+
+// `staged_install` contains the complete outbound SA plus its sole outbound
+// allow policy. Only this acknowledged, read-back, committed path can mint the
+// live authority; recovery uses `recover_installed_outbound_sa_binding`.
+let installed = staged_install
+    .run_and_commit_outbound_sa_policy(Arc::clone(&xfrm))
+    .await?;
+let outbound_sa_binding_id = installed.id();
+
+let request = RePinRequest::new_esp(
+    inbound_spi,
+    outbound_sa_binding_id,
+    transition_id,
+    previous_fence,
+    previous_owner,
+    new_owner,
+    rule,
+    ownership_key,
+    resume,
+)?;
+let counter_binding = EspCounterResumeBinding::new(
+    request.transition_id.get(),
+    request.previous_fence.get(),
+    outbound_sa_binding_id,
+    restored_send_iv_next,
+)?;
+let receipt = xfrm
+    .apply_and_read_back_outbound_esp_counter(
+        &installed,
+        outbound_sa_binding_id,
+        EspCounterResumeApplyRequest::new(counter_binding, complete_outbound_sa),
+    )
+    .await?;
+let live_target = installed.outbound_esp_counter_target();
+let coordinator = RePinCoordinator::new(steering, fencer, ownership, audit)
+    .with_esp_counter_resume_receipt(receipt, live_target);
+let outcome = coordinator.repin(request).await?;
+```
+
+`RePinRequest::new_esp` carries the inbound SPI used for ingress ownership and
+the distinct key-free `OutboundSaBindingId` issued for the outbound SA/policy.
+That ID is safe to persist for correlation but is not authority. The
+constructor-private `InstalledOutboundSaBinding`, its independently derived
+process-local `OutboundEspCounterTarget`, and the opaque receipt bind the live
+namespace actor and exact SA/policy without exposing namespace identity or key
+material. A receipt for another operation, fence, binding, counter, actor, or
+evicted SA is rejected before steering.
+
+The successor must remain quiescent while evidence is obtained and consumed;
+packet-driven sequence advancement is not serialized by product intent alone.
+For a fresh activation, the XFRM actor revalidates the exact requested next
+sequence at both the ownership boundary and the final publication boundary.
+At the latter boundary it holds a short-lived actor guard while Host-XDP makes
+the keyed-fence-last publication synchronously. An external
+`RePinSteeringBackend` must consume the opaque operation permit with
+`publish_with_esp_counter_guard` at its exact synchronous externally visible
+publication cut and return the same permit. Returning an unconsumed guard or
+publishing after the closure fails closed. `LegacySpiRuleRePinAdapter` rejects
+guarded ESP publication and is not a production counter-resume path.
+
+For a bounded session plan, gather every ESP receipt into
+`EspCounterResumeProofSet::new`, gather each binding's live target into
+`OutboundEspCounterTargetSet::new`, and pass both sets to
+`with_esp_counter_resume_proof_set(proofs, targets)`. Each set admits 1 through
+64 unique outbound bindings; the IKE entry needs neither. Receipts and live
+targets are ephemeral capabilities and are not serialized into the session
+journal. After restart, recover each `InstalledOutboundSaBinding` by exact
+kernel readback. Reapply/read back every uncommitted ESP entry. Only for an
+entry whose exact ownership grant was already committed may the caller use
+`recover_committed_outbound_esp_counter` and its distinct
+`EspCounterResumeRecoveryRequest`. That read-only receipt accepts monotonic
+progress at or above the requested floor when it is issued, then rejects any
+later readback below that issuance watermark. It is capped to committed
+recovery and cannot authorize a new fence. Rebuild both bounded sets before
+`resume`.
+
 Prepare every re-pin from `OwnershipSource::sa_ownership`, retaining both the
 authoritative owner and its exact fence in `RePinRequest`. Generate one non-zero,
 deployment-unique `OwnershipTransitionId` for that logical transition and reuse
 it only when retrying the identical request; a later transition, including an
 A→B→A owner cycle, requires a new ID. The coordinator computes a canonical
 SHA-256 fingerprint over the complete safety-critical request and verifies that
-the committed grant matches it. Counter-based requests preserve the original
-v1 fingerprint encoding, allowing an already-committed IKE-AEAD or ESP
-transition to recover after a rolling SDK upgrade. Random-IV and unspecified
-evidence use the distinct v2 domain, so they cannot alias the v1 counter mode.
+the committed grant matches it. Destination-scoped IKE and non-counter
+requests retain the frozen v4 domain. Counter-based ESP requests use the v5
+domain, which additionally binds the `OutboundSaBindingId`; an older SPI-only
+or numeric-only grant cannot be recovered as if it carried destination and
+kernel-counter authority. Finish an in-flight legacy transition with the old
+SDK or rekey and begin a fresh transition; there is no unsafe compatibility
+conversion.
 Session-store birth records use an empty plaintext metadata payload; successful
 promotions replace it with versioned transition-ID/fingerprint metadata.
 Ownership records with an expiry, an arbitrary payload, or any mismatched
@@ -556,10 +664,13 @@ before `retry`) when the future can be cancelled: replay performs a read-only
 exact-fence recovery before it considers another ownership mutation. Steering
 and audit ports must treat identical inputs idempotently so apply-then-error
 outcomes converge. The coordinator revalidates the exact SA fence and takes a
-final target-shard owner snapshot immediately before installing steering.
-Those separate reads cannot make the current `SteeringBackend` mutation atomic
-or order repeated A→B→C failovers; fence-aware steering replacement is tracked in
-[issue #103](https://github.com/openpacketcore/openpacketcore-sdk/issues/103).
+final target-shard owner snapshot immediately before installing steering. A
+`RePinSteeringBackend` operation permit is acquired before those reads and is
+retained through ownership fencing and the fenced steering write. The Host-XDP
+implementation binds that permit to one backend, exact canonical ownership
+key, and operation stripe; a different backend or key cannot consume it. The
+private `RePinSteeringUpdate` separately binds the target owner shard and
+authoritative generation derived by the coordinator.
 
 ### Durable session-level re-pin
 
@@ -588,8 +699,10 @@ post-commit fence. It never derives a replacement request after restart.
 
 ```rust,ignore
 use opc_ipsec_lb::{
-    RePinCoordinator, SessionRePinCoordinator, SessionRePinOperationId,
-    SessionRePinPlan, SessionRePinSessionId, SessionStoreRePinJournal,
+    HostXdpSteeringBackend, HostXdpSteeringBackendConfig, RePinCoordinator,
+    SessionOwnershipKeyspace, SessionRePinCoordinator, SessionRePinOperationId,
+    SessionRePinPlan, SessionRePinSessionId, SessionStoreOwnershipFencer,
+    SessionStoreOwnershipSource, SessionStoreRePinJournal,
 };
 
 // `stable_id` is a tenant-keyed digest, never a raw SUPI/IMSI. `requests` is
@@ -603,14 +716,35 @@ let plan = SessionRePinPlan::new(
     requests,
 )?;
 let identity = plan.identity();
+let ownership_keys = SessionOwnershipKeyspace::new(tenant.clone(), nf_kind.clone());
+let ownership = SessionStoreOwnershipSource::new(
+    encrypted_quorum_backend.clone(),
+    ownership_keys.clone(),
+);
+let fencer = SessionStoreOwnershipFencer::new(
+    encrypted_quorum_backend.clone(),
+    ownership_keys,
+);
 let journal = SessionStoreRePinJournal::new(
     encrypted_quorum_backend,
     tenant,
     nf_kind,
 );
 journal.validate_authority().await?;
+let steering = HostXdpSteeringBackend::new(
+    "swu0",
+    HostXdpSteeringBackendConfig {
+        routing_domain,
+        ..HostXdpSteeringBackendConfig::default()
+    }
+    .for_destination_scoped_repin(),
+);
+if !steering.probe_repin().await?.mutation_ready {
+    return Err("Host-XDP re-pin is not mutation-ready".into());
+}
 let saga = SessionRePinCoordinator::new(
-    RePinCoordinator::new(steering, fencer, ownership, audit),
+    RePinCoordinator::new(steering, fencer, ownership, audit)
+        .with_esp_counter_resume_proof_set(esp_counter_proofs, esp_counter_targets),
     journal,
 );
 
@@ -632,6 +766,12 @@ let next_plan = SessionRePinPlan::new_successor(
     next_requests,
 )?;
 ```
+
+This Host-XDP path is not a compatibility wrapper: the coordinator carries the
+exact destination-scoped key and fenced generation into its private update.
+An existing SPI-only backend that still implements `SteeringBackend` must opt
+in explicitly with `LegacySpiRuleRePinAdapter::new(legacy_backend)` before it
+is passed to `RePinCoordinator`. Do not use that lossy adapter for Host-XDP.
 
 The snippet names product wiring values rather than defining them; the public
 constructor signatures above are the integration contract. `start` first
@@ -658,8 +798,9 @@ IDs, owner/peer names, SAs, SPIs, counters, rules, and fences.
 
 Before the saga mutates the next SA, and again before it returns terminal
 success, it uses two deliberately separate phases. Phase one reconciles the
-exact steering rule for every completed entry under the `SteeringBackend`
-idempotency contract. Only after all repairs finish does phase two perform a
+exact steering rule for every completed entry under the typed
+`RePinSteeringBackend` permit and idempotency contract. Only after all repairs
+finish does phase two perform a
 global mutation-free sweep that revalidates every authoritative owner, fence,
 transition ID, complete request fingerprint, retry proof, and target shard
 owner. Monotonic fences cannot ABA back to a retained value, so a successful
@@ -678,11 +819,12 @@ journal progress without rerunning convergence validation; it is not live
 ownership or steering authority.
 
 Supported SDK ownership changes go through `RePinCoordinator` and fence before
-steering. A consumer that retains a raw `SteeringBackend` and mutates a rule
-outside that boundary can create post-validation steering drift without an
-ownership-fence change; such direct mutation is out of contract and cannot be
-made linearizable by this saga. Callers must not expose that raw mutation path
-or treat the session journal alone as live ownership/steering authority.
+steering. Host-XDP destination-scoped mode implements only the typed re-pin
+port; its legacy raw steering mutation path is unavailable. A downstream
+adapter that bypasses the permit and mutates an owner record can still create
+post-validation drift without an ownership-fence change and is out of contract.
+Callers must not introduce that escape or treat the session journal alone as
+live ownership/steering authority.
 
 Production HA must wire `SessionStoreRePinJournal` to the majority-committed
 session store and wrap that caller-facing backend with
@@ -690,33 +832,62 @@ session store and wrap that caller-facing backend with
 encryption path. Exact recovery metadata is plaintext only above the existing
 payload-protection boundary and is an authenticated envelope at the durable
 backend, preserving the configured HKMS/KMS key lifecycle and encrypted-at-rest
-contract. Call `validate_authority` during startup; every read and write repeats
-that check and rejects a capability downgrade or a backend unable to retain the
-maximum bounded checkpoint. `MockSessionRePinJournal` is deterministic test
-support, not durable or split-brain authority.
+contract. It persists only the key-free `OutboundSaBindingId` and request
+metadata. It never persists `InstalledOutboundSaBinding`,
+`AppliedEspCounterReceipt`, `OutboundEspCounterTarget`, namespace-actor
+identity, or SA key material. No HKMS API, key wrapping, DEK rotation, or
+at-rest encryption boundary changes in this flow. Call `validate_authority`
+during startup; every read and write repeats that check and rejects a
+capability downgrade or a backend unable to retain the maximum bounded
+checkpoint. `MockSessionRePinJournal` is deterministic test support, not
+durable or split-brain authority.
 
-After an authoritative session teardown has removed every product-owned SA,
-key, and dataplane object, retire the exact terminal journal through
-`SessionRePinCoordinator::retire` (or the journal port directly). Retirement
-accepts only `SessionRePinPhase::Complete` and requires the same
-`SessionRePinSessionId` plus operation-and-plan `SessionRePinIdentity` returned
-by terminal success. It never performs teardown itself. A prepared or
-forward-converging checkpoint, a predecessor identity, a guessed successor,
-or a missing record fails closed. The first call returns
-`SessionRePinRetirementDisposition::Retired`; an exact retry after a lost
-acknowledgement or restart returns `AlreadyRetired` with the original deadline.
-Retries never extend that deadline.
+First quiesce new product transitions and remove product-owned IKE/XFRM SAs,
+keys, and other dataplane state. Do not directly remove Host-XDP owner/fence
+entries or durable ownership records. Retire the exact terminal session only
+through `SessionRePinCoordinator::retire`; the journal port deliberately has no
+direct Active-to-retired-tombstone completion operation. Its lower-level
+transition and progress methods accept only coordinator-created opaque proofs
+and exist for recovery adapters, not as a supported teardown shortcut.
+Retirement accepts only
+`SessionRePinPhase::Complete` and requires the same `SessionRePinSessionId`
+plus operation-and-plan `SessionRePinIdentity` returned by terminal success. A
+prepared or forward-converging checkpoint, predecessor identity, guessed
+successor, or missing record fails closed.
 
-The production journal replaces the terminal checkpoint with a fenced/CAS v2
-tombstone at the same private tenant/NF/session key. It contains only the exact
-session, operation, plan-fingerprint, owner, and retirement/expiry bindings—no
-SA requests, SPIs, fences, or counter inputs—and passes through the same
-`EncryptingSessionBackend` and HKMS/KMS rotation path. Checkpoints remain
-byte-compatible v1 payloads. Decoding dispatches only exact v1 or v2 envelope
-versions, requires the record expiry to equal the authenticated v2 payload
-expiry, and rejects unknown versions or metadata. An older SDK understands
-only v1, so it rejects a v2 tombstone as unsupported/unreadable instead of
-mistaking teardown for an active checkpoint or an absent record.
+The coordinator acquires one bounded, deadlock-free Host operation batch for
+the complete session, rechecks the terminal checkpoint and every exact active
+ownership grant under that batch, then stores non-expiring v4 `Retiring`
+progress. For each ordered SA it advances the durable ownership record to a
+higher retirement fence, removes and reads back the exact Host owner and keyed
+fence, persists `CleanupComplete`, and only then fenced-deletes ownership. A
+strictly newer, different ownership lineage is recorded as `Superseded` and is
+never touched in Host. Same-lineage or unbound states fail closed. An
+indeterminate authority outcome poisons the affected bounded Host operation
+stripe, and `probe_repin` reports not ready until process restart. The next
+keyed operation still classifies authoritative store state fail-closed.
+
+Only after every v4 marker is ownership-finalized does the journal write the
+fenced/CAS v2 tombstone at the same private tenant/NF/session key. It contains
+only the exact session, operation, plan fingerprint, owner, and
+retirement/expiry bindings—no SA requests, SPIs, fences, or counter inputs—and
+passes through the same `EncryptingSessionBackend` and HKMS/KMS rotation path.
+Active checkpoints use v3, in-progress retirement uses v4 without TTL, and the
+bounded retired tombstone uses v2. Exact version dispatch rejects every unknown
+version or metadata shape; a peer that does not understand one of these shapes
+fails closed rather than treating it as absent state. The first completed call
+returns `Retired`; an exact retry after a lost acknowledgement or restart
+returns `AlreadyRetired` with the original deadline, which retries never
+extend.
+
+Upgrade existing deployments deliberately. The old Active v1 checkpoint is
+numeric/SPI-only and cannot prove the v3 request, destination, outbound
+binding, or live actor authority, so this SDK rejects it instead of rewriting
+it. Drain or finish that Active transition on the old SDK before upgrading, or
+rekey and start a new v3 transition. The existing exact Retired v2 tombstone
+remains readable and continues to fence stale retries; v2 is not treated as an
+Active checkpoint. Never delete or relabel an undecodable Active record to
+force progress.
 
 `SESSION_REPIN_RETIREMENT_RETENTION` is a fixed seven days. During that exact
 horizon the tombstone rejects duplicate `begin`, resume, progress, and
@@ -728,21 +899,23 @@ session and keep all teardown/retry queues shorter than seven days. This is an
 explicit bounded guarantee, not indefinite replay history.
 
 Retirement, `begin`, successor admission, and progress writes linearize at the
-session-store generation CAS. A `resume` that already read the terminal
-checkpoint may linearize before an overlapping retirement and finish
-completed-prefix reconciliation afterward. That reconciliation can
-idempotently reinstall each retained steering rule before revalidating its
-fence; because the checkpoint is already terminal, it performs no journal
-write and cannot rewrite or recreate the tombstone. Products must therefore
-serialize authoritative teardown against new transitions and resume work—most
-notably before removing steering—instead of using response order as an
-ownership signal. A terminal outcome is not a lease.
+session-store generation CAS. Activation and retirement use the same bounded
+Host operation stripes. Retirement acquires the full batch before changing the
+terminal journal; restart recovery acquires the unfinalized suffix and re-reads
+v4 progress under the batch. Consequently an activation ownership CAS or Host
+publication cannot cross the retirement cut for the same key. The admitted
+retirement runs in an owned task over a bounded session batch, so dropping the
+observer future does not cancel a store CAS, Host cleanup, or durable marker write. Products must
+still quiesce their own transition entry points before deleting product-owned
+state; a terminal outcome is not a lease.
 
 ```rust,ignore
 use opc_ipsec_lb::SessionRePinRetirementDisposition;
 
 let terminal = saga.resume(&session_id, identity).await?;
-teardown_session_authoritatively(&terminal).await?; // product-owned effects
+quiesce_product_transitions(&terminal).await?;
+remove_product_owned_ike_xfrm_keys(&terminal).await?;
+// Do not remove Host owner/fence entries or session-store ownership directly.
 let retired = saga.retire(&session_id, terminal.identity()).await?;
 assert!(matches!(
     retired.disposition(),
@@ -751,12 +924,14 @@ assert!(matches!(
 ));
 ```
 
-This saga does not satisfy the applied-counter receipt requested by
-[issue #333](https://github.com/openpacketcore/openpacketcore-sdk/issues/333).
-It retains and revalidates each current `SameSpiResume` byte-for-byte but never
-relabels caller-declared counters as kernel-applied/read-back evidence. When
-that single-SA receipt becomes part of `RePinRequest`, its existing ownership
-fingerprint automatically becomes part of the session plan fingerprint.
+The saga retains each current `SameSpiResume` and its v3 ESP ownership
+fingerprint byte-for-byte, but it deliberately does not persist or fabricate
+an applied-counter receipt. Its embedded `RePinCoordinator` must carry a proof
+set covering every counter-based ESP request. On restart, reconstruct that set
+from exact applied readback for uncommitted entries and committed monotonic
+readback for entries already represented by the journal's authoritative
+ownership progress. Receipt reconstruction uses no journal key material and
+does not alter the existing encrypted-at-rest or HKMS/KMS boundary.
 
 Migration from a sequential consumer loop is additive: build all requests
 before the first mutation, retain one privacy-preserving session ID and one
@@ -765,7 +940,8 @@ after every interruption. Only a terminal `SessionRePinOutcome` authorizes a
 whole-session continuity claim. Retain its plan fingerprint and pass it to
 `new_successor` for the next failover. Products still own SA discovery,
 complete-set membership, transition-ID generation, key custody, counter
-application, dataplane programming, retry scheduling, and operator quarantine
+application and receipt reconstruction, dataplane blocking/programming, retry
+scheduling, and operator quarantine
 policy.
 
 ## Authenticated cross-node ingress redirect

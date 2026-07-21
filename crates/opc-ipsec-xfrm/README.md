@@ -8,7 +8,36 @@ state, algorithms, key material, Linux backends, mocks, unsupported backends,
 and rollback-aware composite operations.
 
 The crate does not implement IKE negotiation, ESP packet processing, namespace
-management, product SA/SPD policy, or deployment defaults.
+creation/switching, product SA/SPD policy, or deployment defaults. It can bind
+backend execution to a calling thread's already-selected Linux network
+namespace.
+
+## Network-namespace binding
+
+`LinuxXfrmBackend::bind_current_network_namespace` captures the calling
+thread's current network namespace as an opaque device/inode identity and
+starts a dedicated actor thread that inherits it. Invoke the binding method on
+the thread that has already entered the intended namespace; the SDK does not
+call `setns(2)` or select a namespace path.
+
+```rust,no_run
+use opc_ipsec_xfrm::{LinuxXfrmBackend, XfrmBackend};
+
+# async fn example() -> Result<(), opc_ipsec_xfrm::XfrmError> {
+let backend = LinuxXfrmBackend::new().bind_current_network_namespace()?;
+let capability = backend.probe().await?;
+# let _ = capability;
+# Ok(())
+# }
+```
+
+All SA, policy, capability-probe, relocation, and fixed-DSCP work then runs on
+that actor. The 64-entry queue applies bounded backpressure. Cancellation while
+waiting for queue admission submits nothing; after admission, the actor drains
+the operation even when the caller drops its future. Losing the reply to an
+admitted mutation is reported as `StateIndeterminate` (`ALLOCSPI` included),
+while a lost read/probe reply is `Unavailable`. Dropping the final backend clone
+closes the queue and lets the detached actor drain without blocking `Drop`.
 
 ## API Shape
 
@@ -17,6 +46,8 @@ management, product SA/SPD policy, or deployment defaults.
   capability probing.
 - `LinuxXfrmBackend`: safe adapter over `NETLINK_XFRM` through
   `opc-linux-xfrm-sys`.
+- `NamespaceBoundLinuxXfrmBackend`: cloneable bounded actor that keeps every
+  Linux XFRM operation in one captured network namespace.
 - `MockXfrmBackend`: deterministic in-memory backend with operation capture,
   a source-compatible separate `MockSaRelocation` log, and failure injection.
 - `UnsupportedXfrmBackend`: trait-compatible unsupported backend.
@@ -54,8 +85,182 @@ management, product SA/SPD policy, or deployment defaults.
   readback alone cannot distinguish an identical foreign replacement. Both
   supervised APIs require a live Tokio runtime and otherwise return a typed,
   redaction-safe runtime error.
+- `InstalledOutboundSaBinding` is an opaque, unforgeable direction authority
+  for one exact ESP SA and its sole outbound allow-policy. The only fresh mint
+  is `XfrmStagedInstall::run_and_commit_outbound_sa_policy`, after both kernel
+  acknowledgements and journal commit. After process loss,
+  `NamespaceBoundLinuxXfrmBackend::recover_installed_outbound_sa_binding`
+  performs actor-local `GETPOLICY` followed by `GETSA` before minting a new
+  binding. Both paths reject inbound/block policies, mismatched selectors,
+  marks or interface IDs, ambiguous templates, and unsupported kernel
+  attributes. A wildcard template SPI is accepted only when the template and
+  SA carry the same nonzero request ID.
 - With feature `ikev2`, the crate also exports Child SA KEYMAT and negotiation
   mappers from `opc-proto-ikev2` into explicit XFRM install requests.
+
+## Opaque outbound-SA binding
+
+Use the binding-returning staged path when later work must prove that an SA is
+the outbound member of an installed SA/policy pair:
+
+```rust,no_run
+use std::sync::Arc;
+
+use opc_ipsec_xfrm::{
+    InstalledOutboundSaBinding, NamespaceBoundLinuxXfrmBackend,
+    OutboundSaBindingError, XfrmCompositeInstallRequest, XfrmStagedInstall,
+};
+
+async fn install_outbound(
+    backend: Arc<NamespaceBoundLinuxXfrmBackend>,
+    request: XfrmCompositeInstallRequest,
+) -> Result<InstalledOutboundSaBinding, OutboundSaBindingError> {
+    XfrmStagedInstall::new(request)
+        .run_and_commit_outbound_sa_policy(backend)
+        .await
+}
+```
+
+Persist `binding.id().to_bytes()` only as a correlation value. An
+`OutboundSaBindingId` is deliberately constructible from persisted bytes and
+is never authority by itself; the live opaque binding and fresh actor-local
+validation remain mandatory. Restart recovery uses retained install intent:
+
+```rust,no_run
+use opc_ipsec_xfrm::{
+    InstalledOutboundSaBinding, NamespaceBoundLinuxXfrmBackend,
+    OutboundSaBindingError, XfrmCompositeInstallRequest,
+};
+
+async fn recover_outbound(
+    backend: &NamespaceBoundLinuxXfrmBackend,
+    request: XfrmCompositeInstallRequest,
+) -> Result<InstalledOutboundSaBinding, OutboundSaBindingError> {
+    backend
+        .recover_installed_outbound_sa_binding(request)
+        .await
+}
+```
+
+The binding and its stable ID are key-free: they retain algorithm identity and
+key lengths, but never key bytes or key-derived hashes. This avoids creating a
+second long-lived key-custody path alongside the product's HKMS integration.
+At every recovery/use boundary, the supplied zeroizing `SaParameters` key
+material is compared in constant time with key bytes from the zeroizing GETSA
+response; those bytes are never copied into the binding, ID, logs, or errors.
+The product remains responsible for key custody and for supplying the intended
+SA parameters.
+
+Linux lockdown can redact every GETSA key byte to zero without marking the
+response. That wire shape is indistinguishable from intentionally configured
+all-zero key material. The SDK therefore never falls back to algorithm shape:
+either case fails closed with
+`xfrm_outbound_sa_binding_key_readback_unavailable`. Fresh staged issuance
+performs exact readback before journal commit or binding mint, so this failure
+leaves a caller-held journal clone in the recoverable `Complete` state and
+returns no authority. Recovery/use fails with the same code. Deployments whose
+kernel lockdown policy redacts XFRM secrets cannot use this exact binding (and
+the counter-repin operations gated by it) unless the platform provides readable
+exact GETSA key material; product startup/readiness should surface this stable
+capability failure.
+
+Linux ESN SAs encode the fixed one-byte replay window as zero, as required by
+the XFRM UAPI, and carry the complete window in `XFRMA_REPLAY_ESN_VAL` only.
+Readback rejects mixed, duplicated, or flag-inconsistent replay
+representations. Dynamic counters and last-used timestamps are permitted, but
+unmodeled semantic SA or policy attributes fail closed.
+
+## Sealed outbound ESP counter authority
+
+Same-SPI failover must use
+`NamespaceBoundLinuxXfrmBackend::apply_and_read_back_outbound_esp_counter`.
+The production API accepts only the live `InstalledOutboundSaBinding`, its
+exact `OutboundSaBindingId`, a durable `EspCounterResumeBinding`, and transient
+exact SA parameters. It has no caller-selectable direction and is not exposed
+through `XfrmBackend` or the mock backend. The durable ID intentionally remains
+stable when identical state is recovered in another namespace. Before using a
+receipt, the coordinator must therefore derive an `OutboundEspCounterTarget`
+from its intended live binding and supply that opaque, process-local target to
+proof validation. A receipt from another actor or network namespace is rejected
+before the foreign backend is queried, even when every durable field is equal.
+
+`EspCounterResumeBinding::new` takes the **next** ESP sequence number the
+successor is allowed to emit. Linux GETSA replay state reports the last
+assigned sequence, so the actor compares and, when necessary, writes
+`requested_next - 1`. Legacy replay accepts the remaining 32-bit sequence
+space; ESN uses the full 64-bit value. Exhausted or ambiguous state fails
+closed. The actor uses the dedicated Linux `XFRM_MSG_NEWAE` replay-state UAPI,
+not a generic SA replacement:
+
+- an observed value above the requested floor returns typed `AlreadyAdvanced`
+  without mutation;
+- an equal value performs exact final readback and returns an idempotent
+  receipt without mutation; and
+- a lower value advances once, then requires exact policy, SA, transient-key,
+  replay-mode, and counter readback before returning a receipt.
+
+The namespace actor drains admitted work even if the observing future is
+dropped. Exact retry after a lost reply therefore recovers the applied value
+without issuing a second update. Receipts have no public constructor, expose
+no topology or counter values, expire after 30 seconds, and are retained in a
+bounded 1,024-entry actor-local registry. Generic SA or policy mutations
+invalidate the registry before they execute, including when the mutation later
+fails.
+
+```rust,no_run
+use opc_ipsec_xfrm::{
+    EspCounterProofRequirement, EspCounterResumeApplyRequest,
+    EspCounterResumeBinding, EspCounterResumeProofSet,
+    InstalledOutboundSaBinding, NamespaceBoundLinuxXfrmBackend, SaParameters,
+};
+
+async fn apply_counter(
+    backend: &NamespaceBoundLinuxXfrmBackend,
+    authority: &InstalledOutboundSaBinding,
+    operation_id: u128,
+    fence_generation: u64,
+    requested_next: u64,
+    exact_sa: SaParameters,
+) -> Result<(), opc_ipsec_xfrm::EspCounterResumeError> {
+    let target = authority.outbound_esp_counter_target();
+    let binding = EspCounterResumeBinding::new(
+        operation_id,
+        fence_generation,
+        authority.id(),
+        requested_next,
+    )?;
+    let receipt = backend
+        .apply_and_read_back_outbound_esp_counter(
+            authority,
+            authority.id(),
+            EspCounterResumeApplyRequest::new(binding, exact_sa),
+        )
+        .await?;
+    EspCounterResumeProofSet::single(receipt)
+        .validate_counter_proof(
+            &target,
+            binding,
+            EspCounterProofRequirement::BeforeOwnershipCommit,
+        )
+        .await
+}
+```
+
+The successor SA must remain quiescent and unpublished until the receipt is
+validated immediately before its required ownership/publication boundary.
+Products must preserve exclusive XFRM writer authority; packet emission or a
+second raw-netlink writer between preflight and receipt validation violates
+this contract.
+
+After process loss and an already-committed ownership grant,
+`recover_committed_outbound_esp_counter` performs read-only exact validation
+and accepts a live counter at or above the durable floor. Its receipt is
+structurally limited to `EspCounterProofRequirement::CommittedRecovery`; it
+cannot authorize a new ownership fence. A product may use that proof while
+resuming publication only after it independently proves that the exact
+ownership fence was committed before process loss. This separation prevents an
+advanced live SA from being reinterpreted as fresh pre-commit authority while
+retaining crash recovery after fencing but before steering.
 
 ## Usage
 
@@ -439,6 +644,10 @@ excludes the old key material needed for rollback.
 cargo test -p opc-ipsec-xfrm
 cargo test -p opc-ipsec-xfrm --features ikev2
 ./scripts/build-ipsec-xfrm-ebpf.sh
+# Requires named-netns support, iproute2, ping, tcpdump with EN10MB capture,
+# Linux XFRM, and effective CAP_NET_ADMIN/CAP_NET_RAW. The in-memory capture
+# proves the first emitted ESP SPI/sequence and is neither logged nor saved.
+sudo OPC_XFRM_RUN_NAMESPACE_PRIVILEGED=1 cargo test -p opc-ipsec-xfrm --test xfrm_namespace_bound_privileged -- --ignored --nocapture
 sudo unshare -n -- bash -lc 'ip link set lo up && OPC_XFRM_RUN_PRIVILEGED=1 cargo test -p opc-ipsec-xfrm --test xfrm_dscp_privileged -- --ignored --nocapture'
 sudo unshare -n -- bash -lc 'ip link set lo up && OPC_XFRM_RUN_RELOCATION_PRIVILEGED=1 cargo test -p opc-ipsec-xfrm --test xfrm_relocation_privileged -- --ignored --nocapture'
 sudo unshare -n -- bash -lc 'ip link set lo up && OPC_XFRM_RUN_AUTH_ONLY_PRIVILEGED=1 cargo test -p opc-ipsec-xfrm --features ikev2 --test xfrm_auth_only_privileged -- --ignored --nocapture'

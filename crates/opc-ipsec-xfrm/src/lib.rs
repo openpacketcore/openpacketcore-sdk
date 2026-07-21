@@ -16,8 +16,39 @@
 //! safety fences in place and perform exact old/new tuple reconciliation before
 //! retrying or releasing writer exclusion after cancellation or process loss.
 //! The crate never infers relocation from packet source addresses and deliberately
-//! does not implement IKE, ESP processing, namespace management, or deployment
-//! policy.
+//! does not implement IKE, ESP processing, namespace creation/switching, or
+//! deployment policy. [`LinuxXfrmBackend::bind_current_network_namespace`]
+//! can pin backend execution to the calling thread's already-selected network
+//! namespace without exposing its filesystem identity.
+//!
+//! [`XfrmStagedInstall::run_and_commit_outbound_sa_policy`] issues an opaque,
+//! key-free [`InstalledOutboundSaBinding`] only after an exact ESP SA plus sole
+//! outbound allow-policy is acknowledged and committed. After process loss,
+//! [`NamespaceBoundLinuxXfrmBackend::recover_installed_outbound_sa_binding`]
+//! reissues that authority only after actor-local `GETPOLICY` and `GETSA`
+//! validation. [`OutboundSaBindingId`] is safe to persist for correlation but
+//! is never authority. Kernel key bytes stay in zeroizing readback buffers and
+//! are compared in constant time with transient caller-supplied key material;
+//! neither the live binding nor its ID retains keys or key-derived hashes.
+//! Kernel-lockdown GETSA key redaction and intentionally all-zero key material
+//! are indistinguishable, so both fail closed before fresh mint or recovery
+//! with `xfrm_outbound_sa_binding_key_readback_unavailable`; algorithm shape is
+//! never accepted as a substitute for exact key proof.
+//!
+//! Same-SPI successor activation uses
+//! [`NamespaceBoundLinuxXfrmBackend::apply_and_read_back_outbound_esp_counter`].
+//! The sealed actor validates the opaque outbound binding, reads the kernel's
+//! last-assigned sequence, advances only through Linux `XFRM_MSG_NEWAE`, and
+//! performs exact post-readback before issuing an opaque, bounded receipt. It
+//! never rolls an already-advanced SA backward. The successor must remain
+//! quiescent and unpublished until the receipt crosses its required proof
+//! boundary. Proof validation additionally requires an opaque process-local
+//! target derived from the intended live binding, so an otherwise identical
+//! receipt from another actor or network namespace cannot satisfy the
+//! boundary. A separate read-only committed-recovery API can rebuild evidence
+//! after process loss. That evidence cannot authorize a new ownership fence;
+//! resuming publication also requires independent proof that the exact fence
+//! was already committed before process loss.
 //!
 //! Raw Linux netlink work stays in [`opc_linux_xfrm_sys`]; this crate is safe
 //! Rust and never performs `unsafe` operations.
@@ -26,6 +57,7 @@
 
 pub mod backend;
 pub mod composite;
+mod counter_resume;
 mod dscp;
 pub mod error;
 #[cfg(feature = "ikev2")]
@@ -33,6 +65,8 @@ pub mod ikev2;
 pub mod linux;
 pub mod mock;
 pub mod model;
+mod namespace;
+mod outbound_binding;
 pub mod staged;
 pub mod unsupported;
 
@@ -43,6 +77,13 @@ pub use composite::{
     XfrmBidirectionalInstallOutcome, XfrmCompositeInstallError, XfrmCompositeInstallRequest,
     XfrmCompositeOperation, XfrmCompositeOutcome, XFRM_COMPOSITE_INSTALL_ORDER,
     XFRM_COMPOSITE_INSTALL_ROLLBACK_ORDER, XFRM_COMPOSITE_REKEY_ORDER, XFRM_COMPOSITE_REMOVE_ORDER,
+};
+pub use counter_resume::{
+    AppliedEspCounterReceipt, EspCounterProofRequirement, EspCounterPublicationGuard,
+    EspCounterResumeApplyRequest, EspCounterResumeBinding, EspCounterResumeError,
+    EspCounterResumeProofSet, EspCounterResumeRecoveryRequest, OutboundEspCounterTarget,
+    OutboundEspCounterTargetSet, ESP_COUNTER_RECEIPT_MAX_AGE, MAX_ESP_COUNTER_PROOF_SET_SIZE,
+    MAX_ESP_COUNTER_RECEIPTS, MAX_ESP_COUNTER_TARGET_SET_SIZE,
 };
 pub use dscp::{
     LinuxXfrmDscpMarkingConfig, DEFAULT_XFRM_DSCP_BPFFS_PIN_ROOT, DEFAULT_XFRM_DSCP_TC_PRIORITY,
@@ -69,7 +110,11 @@ pub use model::{
     XFRM_AEAD_RFC4106_GCM_AES, XFRM_AUTH_HMAC_SHA256, XFRM_AUTH_HMAC_SHA384, XFRM_AUTH_HMAC_SHA512,
     XFRM_ENCR_CBC_AES, XFRM_ENCR_NULL,
 };
+pub use namespace::{NamespaceBoundLinuxXfrmBackend, LINUX_XFRM_NAMESPACE_ACTOR_CAPACITY};
 pub use opc_types::DscpCodepoint;
+pub use outbound_binding::{
+    InstalledOutboundSaBinding, OutboundSaBindingError, OutboundSaBindingId,
+};
 pub use staged::{
     XfrmIndeterminateOperations, XfrmInstallCommitError, XfrmInstallJournal, XfrmInstallObject,
     XfrmInstallOwnership, XfrmInstallRecoveryClassification, XfrmInstallRecoveryError,

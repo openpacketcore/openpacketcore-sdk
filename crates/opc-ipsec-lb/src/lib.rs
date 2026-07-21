@@ -29,15 +29,25 @@
 //! protected message. Random-IV evidence is valid only for IKE and never
 //! carries placeholder counter fields; ownership fencing, key custody, SA
 //! identity, and inbound anti-replay evidence remain mandatory in both modes.
+//! A counter-based ESP transition additionally requires an opaque
+//! [`opc_ipsec_xfrm::AppliedEspCounterReceipt`] from an exact XFRM apply and
+//! GETSA readback. [`RePinCoordinator`] revalidates that receipt before a new
+//! ownership fence and again before first steering publication; a plausible
+//! numeric counter cannot authorize traffic. IKE counter application remains
+//! consumer-owned.
 //! [`SessionRePinCoordinator`] composes those exact single-SA transitions into
 //! one bounded durable IKE/default-ESP/dedicated-ESP saga. It converges forward
 //! after partial monotonic commits and returns whole-session success only after
 //! every ordered SA has durably completed fencing and steering. The session
-//! journal neither proves that caller-declared counters were applied nor
-//! changes the existing encrypted session-payload/HKMS boundary. After
-//! product-owned teardown, an exact terminal identity can be retired to a
-//! fenced encrypted tombstone that blocks stale recreation for the fixed
-//! seven-day bounded retry horizon.
+//! journal persists requests and ownership progress, not opaque receipts or
+//! key material. Consumers rebuild a bounded receipt set from exact apply or
+//! committed GETSA recovery after restart; this does not change the existing
+//! encrypted session-payload/HKMS boundary. After product-owned IKE/XFRM/key
+//! teardown, [`SessionRePinCoordinator::retire`] orders exact Host owner/fence
+//! cleanup and durable ownership deletion before it writes a fenced encrypted
+//! tombstone. That tombstone blocks stale recreation for the fixed seven-day
+//! bounded retry horizon; the journal port cannot bypass the proof-gated
+//! cleanup sequence.
 
 #![forbid(unsafe_code)]
 
@@ -90,6 +100,7 @@ pub use model::{
     SteeringProbe, SteeringRule, VipAdvertisement, VipAdvertiserKind, VipProbe,
 };
 pub use offload::NicOffloadSecurityPosture;
+pub use opc_ipsec_xfrm::OutboundSaBindingId;
 pub use ownership::{
     DestinationContext, EligibleOwnershipMembers, EspEncapsulationKind, EspOwnershipKey, EspSpi,
     EstablishedIkeOwnershipKey, IkeSpi, InitialExchangeDiscriminator, InitialIkeOwnershipKey,
@@ -99,7 +110,9 @@ pub use ownership::{
     OWNERSHIP_KEY_MAX_ENCODED_BYTES,
 };
 pub use ports::{
-    OwnershipFencer, OwnershipSource, RePinAuditSink, SpiAllocator, SteeringBackend, VipAdvertiser,
+    LegacySpiRuleRePinAdapter, OwnershipFencer, OwnershipRetirementAuthority, OwnershipSource,
+    RePinAuditSink, RePinSteeringBackend, RePinSteeringRetirementBackend, SpiAllocator,
+    SteeringBackend, VipAdvertiser,
 };
 pub use redirect::{
     establish_ingress_redirect_client, establish_ingress_redirect_server,
@@ -121,11 +134,14 @@ pub use redirect::{
     INGRESS_REDIRECT_CONTROL_ALPN,
 };
 pub use repin::{
-    ForwardingProof, IkeRandomIvAttestation, OwnershipFence, OwnershipFenceGrant,
-    OwnershipFenceRequest, OwnershipRetryProof, OwnershipSnapshot, OwnershipTransitionFingerprint,
-    OwnershipTransitionId, RePinAuditEvent, RePinAuditEventKind, RePinCoordinator, RePinError,
-    RePinOutcome, RePinPartialFailure, RePinRequest, RePinRetryStage, ResumeKeySource,
-    SameSpiOutboundIvResume, SameSpiResume,
+    ForwardingProof, IkeRandomIvAttestation, OwnershipCleanupCompleteProof, OwnershipFence,
+    OwnershipFenceGrant, OwnershipFenceRequest, OwnershipRetirementAdmission,
+    OwnershipRetirementFinalization, OwnershipRetirementFinalizedProof, OwnershipRetirementGrant,
+    OwnershipRetirementRequest, OwnershipRetirementSupersededProof, OwnershipRetryProof,
+    OwnershipSnapshot, OwnershipTransitionFingerprint, OwnershipTransitionId, RePinAuditEvent,
+    RePinAuditEventKind, RePinCoordinator, RePinError, RePinOutcome, RePinPartialFailure,
+    RePinRequest, RePinRetryStage, RePinSteeringOperationPermit, RePinSteeringUpdate,
+    ResumeKeySource, SameSpiOutboundIvResume, SameSpiResume,
 };
 pub use routing::{
     AdvertisedPrefix, AdvertisementLease, AdvertisementSetApplyResult, AdvertisementSetDisposition,
@@ -151,9 +167,10 @@ pub use session_repin::{
     MockSessionRePinJournal, SessionRePinCheckpoint, SessionRePinCoordinator, SessionRePinError,
     SessionRePinIdentity, SessionRePinJournal, SessionRePinOperationId, SessionRePinOutcome,
     SessionRePinPhase, SessionRePinPlan, SessionRePinPlanFingerprint,
-    SessionRePinRetirementDisposition, SessionRePinRetirementOutcome, SessionRePinSessionId,
-    SessionRePinStatus, SessionStoreRePinJournal, MAX_SESSION_REPIN_SAS, MIN_SESSION_REPIN_SAS,
-    SESSION_REPIN_JOURNAL_MAX_BYTES, SESSION_REPIN_RETIREMENT_RETENTION,
+    SessionRePinRetirementDisposition, SessionRePinRetirementOutcome,
+    SessionRePinRetirementProgress, SessionRePinRetirementResume, SessionRePinRetirementStatus,
+    SessionRePinSessionId, SessionRePinStatus, SessionStoreRePinJournal, MAX_SESSION_REPIN_SAS,
+    MIN_SESSION_REPIN_SAS, SESSION_REPIN_JOURNAL_MAX_BYTES, SESSION_REPIN_RETIREMENT_RETENTION,
 };
 pub use spi::{
     EntropySource, FixedEntropy, RekeyRequest, SpiAllocationRequest, SpiKind, SystemEntropy,
@@ -164,7 +181,7 @@ pub use unsupported::{
 };
 pub use vip::{LeadershipFence, VipOwnershipCoordinator, VipOwnershipIntent, VipOwnershipState};
 pub use xdp::{
-    HostXdpAttachMode, HostXdpRedirectHandoff, HostXdpSteeringBackend,
+    HostXdpAttachMode, HostXdpFenceDomain, HostXdpRedirectHandoff, HostXdpSteeringBackend,
     HostXdpSteeringBackendConfig, HostXdpUpgradeOutcome, XdpVerdictCounters,
 };
 

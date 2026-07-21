@@ -1,14 +1,24 @@
 //! Kernel-independent re-pin coordination primitives.
 
+use std::any::Any;
 use std::fmt;
 use std::num::{NonZeroU128, NonZeroU64};
 
+use opc_ipsec_xfrm::{
+    AppliedEspCounterReceipt, EspCounterProofRequirement, EspCounterPublicationGuard,
+    EspCounterResumeBinding, EspCounterResumeProofSet, OutboundEspCounterTarget,
+    OutboundEspCounterTargetSet, OutboundSaBindingId,
+};
 use sha2::{Digest, Sha256};
 
 use crate::error::IpsecLbError;
 use crate::failover::{AntiReplayResume, SendIvCounterMode, SendIvForwardJump};
 use crate::model::{ClusterNode, IpAddress, SaId, SteerKey, SteeringRule};
-use crate::ports::{OwnershipFencer, OwnershipSource, RePinAuditSink, SteeringBackend};
+use crate::ownership::SessionOwnershipKey;
+use crate::ports::{
+    OwnershipFencer, OwnershipRetirementAuthority, OwnershipSource, RePinAuditSink,
+    RePinSteeringBackend, RePinSteeringRetirementBackend,
+};
 
 /// Monotonic ownership fence token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
@@ -261,7 +271,7 @@ impl SameSpiResume {
 }
 
 /// Request to fence ownership and install a steer override for a resumed SA.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct RePinRequest {
     /// SA being re-pinned.
     pub sa: SaId,
@@ -276,29 +286,119 @@ pub struct RePinRequest {
     pub new_owner: ClusterNode,
     /// Steering override to install after fencing.
     pub rule: SteeringRule,
+    /// Exact destination-scoped key programmed by ownership-aware datapaths.
+    ///
+    /// The key's protocol and SPI must match both `sa` and `rule`. Its public
+    /// destination and routing domain are retained verbatim; the coordinator
+    /// never guesses either value from the SPI-only legacy rule.
+    pub ownership_key: SessionOwnershipKey,
+    /// Durable, key-free identity of the exact outbound XFRM SA and policy.
+    ///
+    /// This is mandatory for an ESP request and prohibited for an IKE
+    /// request. It is correlation only: the live target and opaque receipt are
+    /// supplied separately and are never persisted in this request.
+    pub outbound_sa_binding_id: Option<OutboundSaBindingId>,
     /// Same-SPI resume evidence.
     pub resume: SameSpiResume,
 }
 
 impl RePinRequest {
+    /// Construct and validate an IKE same-SPI re-pin request.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_ike(
+        responder_spi: u64,
+        transition_id: OwnershipTransitionId,
+        previous_fence: OwnershipFence,
+        previous_owner: ClusterNode,
+        new_owner: ClusterNode,
+        rule: SteeringRule,
+        ownership_key: SessionOwnershipKey,
+        resume: SameSpiResume,
+    ) -> Result<Self, IpsecLbError> {
+        let request = Self {
+            sa: SaId::Ike { responder_spi },
+            transition_id,
+            previous_fence,
+            previous_owner,
+            new_owner,
+            rule,
+            ownership_key,
+            outbound_sa_binding_id: None,
+            resume,
+        };
+        validate_request(&request)?;
+        request.resume.validate_for_repin(request.sa)?;
+        Ok(request)
+    }
+
+    /// Construct and validate an ESP same-SPI re-pin request.
+    ///
+    /// `inbound_spi` is the peer-to-local SPI used for ingress ownership and
+    /// steering. `outbound_sa_binding_id` identifies the distinct
+    /// local-to-peer SA and policy that were installed through
+    /// `opc-ipsec-xfrm`; it is never inferred from the inbound SPI.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_esp(
+        inbound_spi: u32,
+        outbound_sa_binding_id: OutboundSaBindingId,
+        transition_id: OwnershipTransitionId,
+        previous_fence: OwnershipFence,
+        previous_owner: ClusterNode,
+        new_owner: ClusterNode,
+        rule: SteeringRule,
+        ownership_key: SessionOwnershipKey,
+        resume: SameSpiResume,
+    ) -> Result<Self, IpsecLbError> {
+        let request = Self {
+            sa: SaId::Esp { spi: inbound_spi },
+            transition_id,
+            previous_fence,
+            previous_owner,
+            new_owner,
+            rule,
+            ownership_key,
+            outbound_sa_binding_id: Some(outbound_sa_binding_id),
+            resume,
+        };
+        validate_request(&request)?;
+        request.resume.validate_for_repin(request.sa)?;
+        Ok(request)
+    }
+
     /// Hash the complete safety-critical request into a stable transition
     /// fingerprint used by ownership commit and recovery.
     ///
-    /// Counter-based requests retain the original v1 byte encoding so an
-    /// in-flight IKE-AEAD or ESP transition remains recoverable across a
-    /// rolling SDK upgrade. New random-IV and unspecified evidence use the v2
-    /// domain and mode-tagged encoding.
+    /// Destination-scoped requests use the v4 domain. It binds the canonical
+    /// Host-XDP ownership key in addition to the complete legacy rule and, for
+    /// ESP counter resumes, certifies that SDK-issued apply/readback proof was
+    /// mandatory. Older SPI-only grants therefore cannot be recovered as if
+    /// they carried destination or kernel-counter authority.
     #[must_use]
     pub fn ownership_fingerprint(&self) -> OwnershipTransitionFingerprint {
         let mut hasher = Sha256::new();
-        match self.resume.outbound_iv {
-            SameSpiOutboundIvResume::CounterBased {
-                checkpointed_send_iv_next,
-                restored_send_iv_next,
-                forward_jump,
-            } => {
-                hasher.update(b"opc-ipsec-lb/repin-transition/v1");
-                hash_request_prefix(&mut hasher, self);
+        if matches!(
+            (self.sa, self.resume.outbound_iv),
+            (
+                SaId::Esp { .. },
+                SameSpiOutboundIvResume::CounterBased { .. }
+            )
+        ) {
+            hasher.update(b"opc-ipsec-lb/repin-transition/v5-destination-scoped-esp-binding");
+        } else {
+            // Preserve the frozen IKE and non-counter request fingerprint.
+            hasher.update(b"opc-ipsec-lb/repin-transition/v4-destination-scoped");
+        }
+        hash_request_prefix(&mut hasher, self);
+        match (self.sa, self.resume.outbound_iv) {
+            (
+                SaId::Ike { .. },
+                SameSpiOutboundIvResume::CounterBased {
+                    checkpointed_send_iv_next,
+                    restored_send_iv_next,
+                    forward_jump,
+                },
+            ) => {
+                hasher.update([1]);
                 hash_counter_resume_v1(
                     &mut hasher,
                     self.resume,
@@ -307,13 +407,38 @@ impl RePinRequest {
                     forward_jump,
                 );
             }
-            SameSpiOutboundIvResume::Unspecified | SameSpiOutboundIvResume::IkeRandomIv { .. } => {
-                hasher.update(b"opc-ipsec-lb/repin-transition/v2");
-                hash_request_prefix(&mut hasher, self);
+            (
+                SaId::Esp { .. },
+                SameSpiOutboundIvResume::CounterBased {
+                    checkpointed_send_iv_next,
+                    restored_send_iv_next,
+                    forward_jump,
+                },
+            ) => {
+                hasher.update([2]);
+                hash_counter_resume_v1(
+                    &mut hasher,
+                    self.resume,
+                    checkpointed_send_iv_next,
+                    restored_send_iv_next,
+                    forward_jump,
+                );
+            }
+            (
+                _,
+                SameSpiOutboundIvResume::Unspecified | SameSpiOutboundIvResume::IkeRandomIv { .. },
+            ) => {
+                hasher.update([3]);
                 hash_resume_v2(&mut hasher, self.resume);
             }
         }
         OwnershipTransitionFingerprint(hasher.finalize().into())
+    }
+}
+
+impl fmt::Debug for RePinRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("RePinRequest([redacted])")
     }
 }
 
@@ -326,13 +451,266 @@ fn hash_request_prefix(hasher: &mut Sha256, request: &RePinRequest) {
     hasher.update(request.rule.shard.get().to_be_bytes());
     hasher.update(request.rule.owner.get().to_be_bytes());
     hash_steer_key(hasher, request.rule.key);
+    hash_bytes(hasher, &request.ownership_key.to_canonical_bytes());
+    match request.outbound_sa_binding_id {
+        Some(id) => {
+            hasher.update([1]);
+            hasher.update(id.to_bytes());
+        }
+        None => hasher.update([0]),
+    }
+}
+
+/// Exact fenced owner update passed to a re-pin steering backend.
+///
+/// Construction is private to the coordinator so a backend never receives a
+/// caller-invented generation. The owner and generation come from the
+/// validated rule and authoritative ownership-fence grant respectively.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct RePinSteeringUpdate {
+    ownership_key: SessionOwnershipKey,
+    rule: SteeringRule,
+    generation: OwnershipFence,
+}
+
+/// Single-use serialization permit for one exact steering ownership key.
+///
+/// Coordinators acquire this permit before their final authoritative store
+/// validation and move it into the steering mutation. Host-XDP binds it to one
+/// backend instance and canonical key, then retains it inside the blocking
+/// mutation even if the awaiting task is cancelled. The internals are opaque
+/// so callers cannot forge, clone, or retarget an already-authorized operation.
+#[must_use = "dropping a steering permit abandons the serialized operation"]
+pub struct RePinSteeringOperationPermit {
+    ownership_key: SessionOwnershipKey,
+    evidence: Option<Box<dyn Any + Send + Sync>>,
+    esp_counter_publication_guard: Option<EspCounterPublicationGuard>,
+    publication_state: RePinPublicationState,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RePinPublicationState {
+    NotRequired,
+    Armed,
+    Authorized,
+    Rejected,
+}
+
+impl RePinSteeringOperationPermit {
+    pub(crate) fn unguarded(ownership_key: SessionOwnershipKey) -> Self {
+        Self {
+            ownership_key,
+            evidence: None,
+            esp_counter_publication_guard: None,
+            publication_state: RePinPublicationState::NotRequired,
+        }
+    }
+
+    pub(crate) fn guarded<T>(ownership_key: SessionOwnershipKey, evidence: T) -> Self
+    where
+        T: Any + Send + Sync,
+    {
+        Self {
+            ownership_key,
+            evidence: Some(Box::new(evidence)),
+            esp_counter_publication_guard: None,
+            publication_state: RePinPublicationState::NotRequired,
+        }
+    }
+
+    pub(crate) fn guarded_after_counter_publication<T>(
+        ownership_key: SessionOwnershipKey,
+        evidence: T,
+    ) -> Self
+    where
+        T: Any + Send + Sync,
+    {
+        Self {
+            ownership_key,
+            evidence: Some(Box::new(evidence)),
+            esp_counter_publication_guard: None,
+            publication_state: RePinPublicationState::Authorized,
+        }
+    }
+
+    fn bind_esp_counter_publication_guard(
+        mut self,
+        guard: EspCounterPublicationGuard,
+    ) -> Result<Self, IpsecLbError> {
+        if self.publication_state != RePinPublicationState::NotRequired {
+            return Err(IpsecLbError::adapter_contract_violation(
+                "repin_operation_permit_counter_guard_duplicate",
+            ));
+        }
+        if self.esp_counter_publication_guard.replace(guard).is_some() {
+            return Err(IpsecLbError::adapter_contract_violation(
+                "repin_operation_permit_counter_guard_duplicate",
+            ));
+        }
+        self.publication_state = RePinPublicationState::Armed;
+        Ok(self)
+    }
+
+    pub(crate) const fn has_esp_counter_publication_guard(&self) -> bool {
+        matches!(self.publication_state, RePinPublicationState::Armed)
+            && self.esp_counter_publication_guard.is_some()
+    }
+
+    pub(crate) const fn counter_publication_authorized(&self) -> bool {
+        matches!(self.publication_state, RePinPublicationState::Authorized)
+    }
+
+    /// Execute one concrete synchronous publication while any bound ESP
+    /// counter guard keeps its XFRM actor frozen.
+    ///
+    /// Backends other than Host-XDP must call this at their exact externally
+    /// visible publication cut and return this same permit afterwards. The
+    /// closure's output is structurally restricted to a concrete `Result`, so
+    /// an unpolled future cannot escape after the guard is released. The call
+    /// consumes publication authority on every success and failure path;
+    /// invoking it again rejects without executing the closure.
+    pub fn publish_with_esp_counter_guard<E>(
+        &mut self,
+        publication: impl FnOnce() -> Result<(), E>,
+    ) -> Result<Result<(), E>, IpsecLbError> {
+        if matches!(
+            self.publication_state,
+            RePinPublicationState::Authorized | RePinPublicationState::Rejected
+        ) {
+            return Err(IpsecLbError::adapter_contract_violation(
+                "repin_operation_permit_publication_already_consumed",
+            ));
+        }
+        // Mark rejected before invoking either the guard or publication. Only
+        // an exact successful cut upgrades the terminal state to Authorized;
+        // expiry and every inner/outer error stay terminal and fail closed.
+        self.publication_state = RePinPublicationState::Rejected;
+        let result = match self.esp_counter_publication_guard.take() {
+            Some(guard) => guard
+                .publish(publication)
+                .map_err(|error| IpsecLbError::applied_counter_proof_rejected(error.code())),
+            None => Ok(publication()),
+        };
+        if matches!(&result, Ok(Ok(()))) {
+            self.publication_state = RePinPublicationState::Authorized;
+        }
+        result
+    }
+
+    pub(crate) fn into_guarded<T>(self) -> Result<T, IpsecLbError>
+    where
+        T: Any + Send + Sync,
+    {
+        if self.publication_state != RePinPublicationState::NotRequired
+            || self.esp_counter_publication_guard.is_some()
+        {
+            return Err(IpsecLbError::adapter_contract_violation(
+                "repin_operation_permit_counter_guard_unconsumed",
+            ));
+        }
+        self.evidence
+            .ok_or_else(|| {
+                IpsecLbError::adapter_contract_violation("repin_operation_permit_missing")
+            })?
+            .downcast::<T>()
+            .map(|value| *value)
+            .map_err(|_| {
+                IpsecLbError::adapter_contract_violation("repin_operation_permit_mismatched")
+            })
+    }
+
+    pub(crate) fn into_guarded_with_esp_counter_publication<T>(
+        self,
+    ) -> Result<(T, Option<EspCounterPublicationGuard>), IpsecLbError>
+    where
+        T: Any + Send + Sync,
+    {
+        if !matches!(
+            self.publication_state,
+            RePinPublicationState::NotRequired | RePinPublicationState::Armed
+        ) {
+            return Err(IpsecLbError::adapter_contract_violation(
+                "repin_operation_permit_publication_already_consumed",
+            ));
+        }
+        let evidence = self
+            .evidence
+            .ok_or_else(|| {
+                IpsecLbError::adapter_contract_violation("repin_operation_permit_missing")
+            })?
+            .downcast::<T>()
+            .map(|value| *value)
+            .map_err(|_| {
+                IpsecLbError::adapter_contract_violation("repin_operation_permit_mismatched")
+            })?;
+        Ok((evidence, self.esp_counter_publication_guard))
+    }
+
+    /// Return the exact destination-scoped key serialized by this permit.
+    #[must_use]
+    pub const fn ownership_key(&self) -> SessionOwnershipKey {
+        self.ownership_key
+    }
+}
+
+impl fmt::Debug for RePinSteeringOperationPermit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("RePinSteeringOperationPermit([redacted])")
+    }
+}
+
+impl RePinSteeringUpdate {
+    const fn new(request: &RePinRequest, generation: OwnershipFence) -> Self {
+        Self {
+            ownership_key: request.ownership_key,
+            rule: request.rule,
+            generation,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn for_test(request: &RePinRequest, generation: OwnershipFence) -> Self {
+        Self::new(request, generation)
+    }
+
+    /// Return the exact destination-scoped ownership key.
+    #[must_use]
+    pub const fn ownership_key(self) -> SessionOwnershipKey {
+        self.ownership_key
+    }
+
+    /// Return the legacy steering rule retained for non-Host-XDP backends.
+    #[must_use]
+    pub const fn rule(self) -> SteeringRule {
+        self.rule
+    }
+
+    /// Return the target owner shard.
+    #[must_use]
+    pub const fn owner(self) -> crate::ShardId {
+        self.rule.owner
+    }
+
+    /// Return the authoritative ownership generation.
+    #[must_use]
+    pub const fn generation(self) -> OwnershipFence {
+        self.generation
+    }
+}
+
+impl fmt::Debug for RePinSteeringUpdate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("RePinSteeringUpdate([redacted])")
+    }
 }
 
 /// Ownership fence mutation request.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct OwnershipFenceRequest {
     /// SA being fenced.
     pub sa: SaId,
+    /// Exact destination-scoped authoritative ownership key.
+    pub ownership_key: SessionOwnershipKey,
     /// Stable identity reused only for retries of this transition.
     pub transition_id: OwnershipTransitionId,
     /// Canonical binding to the complete re-pin request.
@@ -345,11 +723,19 @@ pub struct OwnershipFenceRequest {
     pub new_owner: ClusterNode,
 }
 
+impl fmt::Debug for OwnershipFenceRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("OwnershipFenceRequest([redacted])")
+    }
+}
+
 /// Successful ownership fence grant.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct OwnershipFenceGrant {
     /// SA that was fenced.
     pub sa: SaId,
+    /// Exact destination-scoped authoritative ownership key.
+    pub ownership_key: SessionOwnershipKey,
     /// Transition identity committed with the ownership record.
     pub transition_id: OwnershipTransitionId,
     /// Fingerprint committed with the transition.
@@ -360,25 +746,358 @@ pub struct OwnershipFenceGrant {
     pub fence: OwnershipFence,
 }
 
+impl fmt::Debug for OwnershipFenceGrant {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("OwnershipFenceGrant([redacted])")
+    }
+}
+
+/// Exact committed activation whose ownership and Host-XDP state may retire.
+///
+/// Construction is private to [`RePinCoordinator`]. The request binds the full
+/// activation transition and destination-scoped key, not merely an SPI.
+#[derive(Clone, PartialEq, Eq)]
+pub struct OwnershipRetirementRequest {
+    sa: SaId,
+    ownership_key: SessionOwnershipKey,
+    transition_id: OwnershipTransitionId,
+    fingerprint: OwnershipTransitionFingerprint,
+    owner: ClusterNode,
+    active_fence: OwnershipFence,
+    map_owner: crate::ShardId,
+}
+
+impl OwnershipRetirementRequest {
+    pub(crate) fn from_committed(request: &RePinRequest, active_fence: OwnershipFence) -> Self {
+        Self {
+            sa: request.sa,
+            ownership_key: request.ownership_key,
+            transition_id: request.transition_id,
+            fingerprint: request.ownership_fingerprint(),
+            owner: request.new_owner.clone(),
+            active_fence,
+            map_owner: request.rule.owner,
+        }
+    }
+
+    /// Return the exact SA being retired.
+    #[must_use]
+    pub const fn sa(&self) -> SaId {
+        self.sa
+    }
+
+    /// Return the destination-scoped ownership key being retired.
+    #[must_use]
+    pub const fn ownership_key(&self) -> SessionOwnershipKey {
+        self.ownership_key
+    }
+
+    /// Return the activation transition being retired.
+    #[must_use]
+    pub const fn transition_id(&self) -> OwnershipTransitionId {
+        self.transition_id
+    }
+
+    /// Return the exact activation request fingerprint.
+    #[must_use]
+    pub const fn fingerprint(&self) -> OwnershipTransitionFingerprint {
+        self.fingerprint
+    }
+
+    /// Return the store owner that committed the activation.
+    #[must_use]
+    pub const fn owner(&self) -> &ClusterNode {
+        &self.owner
+    }
+
+    /// Return the completed activation fence.
+    #[must_use]
+    pub const fn active_fence(&self) -> OwnershipFence {
+        self.active_fence
+    }
+
+    /// Return the owner shard encoded in the active Host-XDP record.
+    #[must_use]
+    pub const fn map_owner(&self) -> crate::ShardId {
+        self.map_owner
+    }
+}
+
+impl fmt::Debug for OwnershipRetirementRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("OwnershipRetirementRequest([redacted])")
+    }
+}
+
+/// Opaque durable authority for retiring one exact active ownership record.
+///
+/// Only an SDK ownership authority can construct this grant. It carries the
+/// higher store fence that revoked ordinary activation retry proofs and the
+/// exact lower generation that Host-XDP is allowed to remove.
+#[derive(Clone, PartialEq, Eq)]
+pub struct OwnershipRetirementGrant {
+    request: OwnershipRetirementRequest,
+    retirement_fence: OwnershipFence,
+}
+
+/// Typed result of beginning one durable ownership retirement.
+///
+/// A strictly newer authoritative record supersedes the retired session's
+/// activation. In that case the old saga must leave Host steering untouched
+/// and durably record the opaque proof as finalized. This is what lets a
+/// `Retiring` session converge after process loss between the session-level
+/// cut and a later per-key retirement CAS.
+#[derive(Clone, PartialEq, Eq)]
+pub enum OwnershipRetirementAdmission {
+    /// The exact active lineage is durably reserved under a higher fence and
+    /// may proceed through Host cleanup.
+    Granted(OwnershipRetirementGrant),
+    /// A strictly newer authoritative ownership record won the key and must
+    /// be left untouched.
+    Superseded(OwnershipRetirementSupersededProof),
+}
+
+impl fmt::Debug for OwnershipRetirementAdmission {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Granted(_) => f.write_str("OwnershipRetirementAdmission::Granted([redacted])"),
+            Self::Superseded(_) => {
+                f.write_str("OwnershipRetirementAdmission::Superseded([redacted])")
+            }
+        }
+    }
+}
+
+/// Opaque proof that a strictly newer authoritative record superseded an old
+/// session retirement before Host cleanup began.
+///
+/// Only an ownership authority can construct this value. The exact request and
+/// observed fence remain private so callers cannot forge a skip-cleanup
+/// verdict or leak correlation material through diagnostics.
+#[derive(Clone, PartialEq, Eq)]
+pub struct OwnershipRetirementSupersededProof {
+    request: OwnershipRetirementRequest,
+    authoritative_fence: OwnershipFence,
+}
+
+impl OwnershipRetirementSupersededProof {
+    pub(crate) const fn new(
+        request: OwnershipRetirementRequest,
+        authoritative_fence: OwnershipFence,
+    ) -> Self {
+        Self {
+            request,
+            authoritative_fence,
+        }
+    }
+
+    pub(crate) const fn request(&self) -> &OwnershipRetirementRequest {
+        &self.request
+    }
+
+    pub(crate) const fn authoritative_fence(&self) -> OwnershipFence {
+        self.authoritative_fence
+    }
+}
+
+impl fmt::Debug for OwnershipRetirementSupersededProof {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("OwnershipRetirementSupersededProof([redacted])")
+    }
+}
+
+/// Opaque durable proof that Host cleanup completed before ownership deletion.
+///
+/// Only the SDK session journal can construct this proof, and only after its
+/// exact ordered `CleanupComplete` marker is majority-authoritatively stored.
+/// Possessing a retirement grant alone is deliberately insufficient to delete
+/// ownership authority.
+#[derive(Clone, PartialEq, Eq)]
+pub struct OwnershipCleanupCompleteProof {
+    grant: OwnershipRetirementGrant,
+}
+
+impl OwnershipCleanupCompleteProof {
+    pub(crate) const fn new(grant: OwnershipRetirementGrant) -> Self {
+        Self { grant }
+    }
+
+    /// Borrow the exact durable retirement grant covered by this marker.
+    #[must_use]
+    pub const fn grant(&self) -> &OwnershipRetirementGrant {
+        &self.grant
+    }
+}
+
+impl fmt::Debug for OwnershipCleanupCompleteProof {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("OwnershipCleanupCompleteProof([redacted])")
+    }
+}
+
+impl OwnershipRetirementGrant {
+    pub(crate) const fn new(
+        request: OwnershipRetirementRequest,
+        retirement_fence: OwnershipFence,
+    ) -> Self {
+        Self {
+            request,
+            retirement_fence,
+        }
+    }
+
+    /// Borrow the exact activation being retired.
+    #[must_use]
+    pub const fn request(&self) -> &OwnershipRetirementRequest {
+        &self.request
+    }
+
+    /// Return the higher durable store fence that revoked activation.
+    #[must_use]
+    pub const fn retirement_fence(&self) -> OwnershipFence {
+        self.retirement_fence
+    }
+}
+
+impl fmt::Debug for OwnershipRetirementGrant {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("OwnershipRetirementGrant([redacted])")
+    }
+}
+
+/// Result of finalizing a cleanup-complete ownership retirement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OwnershipRetirementFinalization {
+    /// The exact durable `Retiring` record was fenced-deleted by this call.
+    Deleted,
+    /// The exact record had already been deleted by an earlier ambiguous call.
+    AlreadyDeleted,
+    /// A strictly newer activation now owns the key and was left untouched.
+    Superseded,
+}
+
+/// Opaque proof that cleanup-complete ownership finalization was attempted.
+///
+/// The SDK coordinator issues this only after the retirement authority returns
+/// a typed deleted, already-deleted, or strictly-superseded verdict.
+#[derive(Clone, PartialEq, Eq)]
+pub struct OwnershipRetirementFinalizedProof {
+    cleanup: OwnershipCleanupCompleteProof,
+    disposition: OwnershipRetirementFinalization,
+}
+
+impl OwnershipRetirementFinalizedProof {
+    fn new(
+        cleanup: OwnershipCleanupCompleteProof,
+        disposition: OwnershipRetirementFinalization,
+    ) -> Self {
+        Self {
+            cleanup,
+            disposition,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        cleanup: OwnershipCleanupCompleteProof,
+        disposition: OwnershipRetirementFinalization,
+    ) -> Self {
+        Self::new(cleanup, disposition)
+    }
+
+    /// Borrow the exact cleanup marker that authorized finalization.
+    #[must_use]
+    pub const fn cleanup(&self) -> &OwnershipCleanupCompleteProof {
+        &self.cleanup
+    }
+
+    /// Return the typed finalization verdict.
+    #[must_use]
+    pub const fn disposition(&self) -> OwnershipRetirementFinalization {
+        self.disposition
+    }
+}
+
+impl fmt::Debug for OwnershipRetirementFinalizedProof {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OwnershipRetirementFinalizedProof")
+            .field("disposition", &self.disposition)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Host-cleaned retirement awaiting durable `CleanupComplete` publication.
+///
+/// This value is non-clone and has no public constructor. It retains the exact
+/// Host operation permit until the journal marker and ownership finalization
+/// complete, preventing a delayed activation from crossing the cleanup cut.
+#[must_use = "pending retirement must be journaled or safely retried"]
+pub struct PendingOwnershipRetirement {
+    grant: OwnershipRetirementGrant,
+    _permit: RePinSteeringOperationPermit,
+}
+
+impl PendingOwnershipRetirement {
+    fn new(grant: OwnershipRetirementGrant, permit: RePinSteeringOperationPermit) -> Self {
+        Self {
+            grant,
+            _permit: permit,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        grant: OwnershipRetirementGrant,
+        permit: RePinSteeringOperationPermit,
+    ) -> Self {
+        Self::new(grant, permit)
+    }
+
+    /// Borrow the exact retirement grant proven clean in Host-XDP.
+    #[must_use]
+    pub const fn grant(&self) -> &OwnershipRetirementGrant {
+        &self.grant
+    }
+}
+
+impl fmt::Debug for PendingOwnershipRetirement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PendingOwnershipRetirement([redacted])")
+    }
+}
+
+pub(crate) enum OwnershipRetirementStep {
+    CleanupPending(PendingOwnershipRetirement),
+    Superseded(OwnershipRetirementSupersededProof),
+}
+
 /// Evidence presented when resuming work after ownership was committed.
 ///
 /// The fields are construction-private because only a coordinator that has
 /// checked a matching fence grant may issue this proof. The proof is still
 /// treated as untrusted on retry: [`OwnershipFencer::validate_retry_proof`]
 /// must match its SA, owner, and exact fence against authoritative state.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct OwnershipRetryProof {
     sa: SaId,
+    ownership_key: SessionOwnershipKey,
     transition_id: OwnershipTransitionId,
     fingerprint: OwnershipTransitionFingerprint,
     owner: ClusterNode,
     fence: OwnershipFence,
 }
 
+impl fmt::Debug for OwnershipRetryProof {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("OwnershipRetryProof([redacted])")
+    }
+}
+
 impl OwnershipRetryProof {
     pub(crate) fn from_grant(grant: &OwnershipFenceGrant) -> Self {
         Self {
             sa: grant.sa,
+            ownership_key: grant.ownership_key,
             transition_id: grant.transition_id,
             fingerprint: grant.fingerprint,
             owner: grant.owner.clone(),
@@ -390,6 +1109,12 @@ impl OwnershipRetryProof {
     #[must_use]
     pub const fn sa(&self) -> SaId {
         self.sa
+    }
+
+    /// Return the destination-scoped ownership key covered by this proof.
+    #[must_use]
+    pub const fn ownership_key(&self) -> SessionOwnershipKey {
+        self.ownership_key
     }
 
     /// Return the ownership transition covered by this proof.
@@ -426,6 +1151,8 @@ pub enum RePinAuditEventKind {
     Fenced,
     /// Steering override was installed.
     SteeringInstalled,
+    /// Exact destination-scoped steering was durably retired.
+    SteeringRetired,
     /// Re-pin failed before a verified ownership grant was available.
     ///
     /// Recoverable post-commit failures are returned immediately as
@@ -510,6 +1237,20 @@ impl RePinAuditEvent {
             previous_owner: request.previous_owner.clone(),
             new_owner: request.new_owner.clone(),
             fence: Some(fence),
+            forwarding_proven: false,
+            failure_code: None,
+        }
+    }
+
+    fn steering_retired(grant: &OwnershipRetirementGrant) -> Self {
+        let request = grant.request();
+        Self {
+            kind: RePinAuditEventKind::SteeringRetired,
+            sa: request.sa(),
+            transition_id: request.transition_id(),
+            previous_owner: request.owner().clone(),
+            new_owner: request.owner().clone(),
+            fence: Some(grant.retirement_fence()),
             forwarding_proven: false,
             failure_code: None,
         }
@@ -631,8 +1372,8 @@ impl RePinOutcome {
 
 /// First incomplete operation after an authoritative ownership commit.
 ///
-/// Retry resumes at this exact stage. Earlier successful stages are never
-/// repeated, so a final audit retry cannot reinstall an already-active rule.
+/// Retry resumes at this exact stage and never repeats an earlier successful
+/// stage. In particular, a final audit retry cannot reinstall steering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RePinRetryStage {
     /// Record the audit event that ownership was fenced.
@@ -655,12 +1396,22 @@ pub enum RePinRetryStage {
 /// request through [`RePinCoordinator::repin`] recovers the exact current
 /// ownership grant before attempting another fence.
 #[must_use]
-#[derive(Debug, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub struct RePinPartialFailure {
     request: RePinRequest,
     retry_proof: OwnershipRetryProof,
     resume_at: RePinRetryStage,
+    publication_requirement: EspCounterProofRequirement,
     cause: IpsecLbError,
+}
+
+impl fmt::Debug for RePinPartialFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RePinPartialFailure")
+            .field("resume_at", &self.resume_at)
+            .field("cause", &self.cause)
+            .finish_non_exhaustive()
+    }
 }
 
 impl RePinPartialFailure {
@@ -668,12 +1419,14 @@ impl RePinPartialFailure {
         request: RePinRequest,
         retry_proof: OwnershipRetryProof,
         resume_at: RePinRetryStage,
+        publication_requirement: EspCounterProofRequirement,
         cause: IpsecLbError,
     ) -> Self {
         Self {
             request,
             retry_proof,
             resume_at,
+            publication_requirement,
             cause,
         }
     }
@@ -765,24 +1518,117 @@ pub struct RePinCoordinator<B, F, O, A> {
     fencer: F,
     ownership: O,
     audit: A,
+    esp_counter_authority: Option<EspCounterResumeAuthority>,
+    #[cfg(test)]
+    accept_test_counter_proof: bool,
+    #[cfg(test)]
+    reject_test_first_publication_guard: bool,
+    #[cfg(test)]
+    reject_test_first_publication_validation_once: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// In-memory proof material for one coordinator lifetime.
+///
+/// Keeping the proof set and independently derived live targets together
+/// prevents a partially configured coordinator from treating a durable SA ID
+/// as authority. Neither member is serialized by the session journal.
+#[derive(Clone)]
+struct EspCounterResumeAuthority {
+    proofs: EspCounterResumeProofSet,
+    targets: OutboundEspCounterTargetSet,
+}
+
+impl fmt::Debug for EspCounterResumeAuthority {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("EspCounterResumeAuthority(<redacted>)")
+    }
 }
 
 impl<B, F, O, A> RePinCoordinator<B, F, O, A>
 where
-    B: SteeringBackend,
+    B: RePinSteeringBackend,
     F: OwnershipFencer,
     O: OwnershipSource,
     A: RePinAuditSink,
 {
     /// Build a coordinator from explicit ports.
+    ///
+    /// Counter-based ESP re-pin is fail-closed until
+    /// [`Self::with_esp_counter_resume_receipt`] installs both opaque SDK XFRM
+    /// apply/readback evidence and the independently derived live actor target.
+    /// IKE counter and random-IV evidence remain product-owned because this
+    /// coordinator does not own the IKE state machine.
     #[must_use]
-    pub const fn new(steering: B, fencer: F, ownership: O, audit: A) -> Self {
+    pub fn new(steering: B, fencer: F, ownership: O, audit: A) -> Self {
         Self {
             steering,
             fencer,
             ownership,
             audit,
+            esp_counter_authority: None,
+            #[cfg(test)]
+            accept_test_counter_proof: false,
+            #[cfg(test)]
+            reject_test_first_publication_guard: false,
+            #[cfg(test)]
+            reject_test_first_publication_validation_once: std::sync::Arc::new(
+                std::sync::atomic::AtomicBool::new(false),
+            ),
         }
+    }
+
+    /// Install one opaque receipt and live target for one ESP transition.
+    ///
+    /// Both values must be produced from the same intended
+    /// `InstalledOutboundSaBinding`: the receipt comes from the namespace-bound
+    /// apply/readback operation, while the target is derived independently
+    /// from that live binding. A recovered receipt cannot authorize a new
+    /// ownership mutation.
+    #[must_use]
+    pub fn with_esp_counter_resume_receipt(
+        mut self,
+        receipt: AppliedEspCounterReceipt,
+        target: OutboundEspCounterTarget,
+    ) -> Self {
+        self.esp_counter_authority = Some(EspCounterResumeAuthority {
+            proofs: EspCounterResumeProofSet::single(receipt),
+            targets: OutboundEspCounterTargetSet::single(target),
+        });
+        self
+    }
+
+    /// Install bounded proof and live-target sets for a multi-SA session plan.
+    ///
+    /// Construction of each set rejects duplicate durable bindings. Validation
+    /// also requires an exact target lookup for every counter-based ESP request
+    /// before consulting its receipt.
+    #[must_use]
+    pub fn with_esp_counter_resume_proof_set(
+        mut self,
+        proofs: EspCounterResumeProofSet,
+        targets: OutboundEspCounterTargetSet,
+    ) -> Self {
+        self.esp_counter_authority = Some(EspCounterResumeAuthority { proofs, targets });
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_applied_esp_counter_proof(mut self) -> Self {
+        self.accept_test_counter_proof = true;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_counter_advance_before_first_publication(mut self) -> Self {
+        self.reject_test_first_publication_guard = true;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_transient_first_publication_validation_failure(self) -> Self {
+        self.reject_test_first_publication_validation_once
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self
     }
 
     /// Validate resume evidence and the target-shard binding, recover or fence
@@ -793,12 +1639,23 @@ where
     /// a committed grant. A recovered transition resumes at the fenced-audit
     /// stage with the exact current fence.
     pub async fn repin(&self, request: RePinRequest) -> Result<RePinOutcome, RePinError> {
-        self.validate_pre_commit(&request)
+        validate_request(&request).map_err(RePinError::BeforeOwnershipCommit)?;
+        request
+            .resume
+            .validate_for_repin(request.sa)
+            .map_err(RePinError::BeforeOwnershipCommit)?;
+        let permit = self
+            .steering
+            .acquire_repin_permit(request.ownership_key)
+            .await
+            .map_err(RePinError::BeforeOwnershipCommit)?;
+        self.validate_target_owner(&request)
             .await
             .map_err(RePinError::BeforeOwnershipCommit)?;
 
         let fence_request = OwnershipFenceRequest {
             sa: request.sa,
+            ownership_key: request.ownership_key,
             transition_id: request.transition_id,
             fingerprint: request.ownership_fingerprint(),
             previous_fence: request.previous_fence,
@@ -806,10 +1663,25 @@ where
             new_owner: request.new_owner.clone(),
         };
         match self.fencer.recover_fence_grant(&fence_request).await {
-            Ok(Some(grant)) => return self.continue_from_grant(request, grant).await,
+            Ok(Some(grant)) => {
+                return self.continue_from_grant(request, grant, true, permit).await;
+            }
             Ok(None) => {}
             Err(error) => return Err(RePinError::BeforeOwnershipCommit(error)),
         }
+
+        // A caller-declared ESP value cannot authorize the ownership mutation.
+        // Require an exact SDK adapter receipt and repeat the target-owner read
+        // after that awaited GETSA so no stale shard snapshot reaches fencing.
+        self.validate_esp_counter_proof(
+            &request,
+            EspCounterProofRequirement::BeforeOwnershipCommit,
+        )
+        .await
+        .map_err(RePinError::BeforeOwnershipCommit)?;
+        self.validate_target_owner(&request)
+            .await
+            .map_err(RePinError::BeforeOwnershipCommit)?;
 
         self.audit
             .record_repin(RePinAuditEvent::attempt(&request))
@@ -831,13 +1703,16 @@ where
             },
         };
 
-        self.continue_from_grant(request, grant).await
+        self.continue_from_grant(request, grant, false, permit)
+            .await
     }
 
     async fn continue_from_grant(
         &self,
         request: RePinRequest,
         grant: OwnershipFenceGrant,
+        recovered: bool,
+        permit: RePinSteeringOperationPermit,
     ) -> Result<RePinOutcome, RePinError> {
         // Do not trust the fencer port blindly: a grant for a different SA or a
         // different owner would install a steering override toward the wrong
@@ -845,6 +1720,11 @@ where
         validate_grant_matches(&request, &grant).map_err(RePinError::BeforeOwnershipCommit)?;
 
         let retry_proof = OwnershipRetryProof::from_grant(&grant);
+        let publication_requirement = if recovered {
+            EspCounterProofRequirement::CommittedRecovery
+        } else {
+            EspCounterProofRequirement::BeforeFirstPublication
+        };
         // A shape-matching successful grant is post-commit by the fencer port
         // contract, but it is not enough to emit an authoritative Fenced audit
         // event. Confirm its exact store-backed fence first. Preserve the
@@ -852,11 +1732,37 @@ where
         // again before any side effect, while a forged proof remains inert.
         if let Err(error) = self.fencer.validate_retry_proof(&retry_proof).await {
             return Err(RePinError::AfterOwnershipCommit(Box::new(
-                RePinPartialFailure::new(request, retry_proof, RePinRetryStage::FencedAudit, error),
+                RePinPartialFailure::new(
+                    request,
+                    retry_proof,
+                    RePinRetryStage::FencedAudit,
+                    publication_requirement,
+                    error,
+                ),
             )));
         }
-        self.continue_committed(request, retry_proof, RePinRetryStage::FencedAudit)
+        if let Err(error) = self
+            .validate_esp_counter_proof(&request, publication_requirement)
             .await
+        {
+            return Err(RePinError::AfterOwnershipCommit(Box::new(
+                RePinPartialFailure::new(
+                    request,
+                    retry_proof,
+                    RePinRetryStage::FencedAudit,
+                    publication_requirement,
+                    error,
+                ),
+            )));
+        }
+        self.continue_committed(
+            request,
+            retry_proof,
+            RePinRetryStage::FencedAudit,
+            publication_requirement,
+            permit,
+        )
+        .await
     }
 
     /// Resume a re-pin that stopped after ownership was authoritatively
@@ -873,6 +1779,7 @@ where
         }
 
         if partial.retry_proof.sa != partial.request.sa
+            || partial.retry_proof.ownership_key != partial.request.ownership_key
             || partial.retry_proof.transition_id != partial.request.transition_id
             || partial.retry_proof.fingerprint != partial.request.ownership_fingerprint()
             || partial.retry_proof.owner != partial.request.new_owner
@@ -884,19 +1791,30 @@ where
             )));
         }
 
-        // Steering-install resumes validate the proof immediately beside that
-        // mutation below. The audit stages need validation here so no audit
-        // side effect can occur under a stale or forged proof.
-        if partial.resume_at != RePinRetryStage::SteeringInstall {
-            if let Err(error) = self.fencer.validate_retry_proof(&partial.retry_proof).await {
+        let permit = match self
+            .steering
+            .acquire_repin_permit(partial.request.ownership_key)
+            .await
+        {
+            Ok(permit) => permit,
+            Err(error) => {
                 return Err(RePinError::AfterOwnershipCommit(Box::new(
                     partial.with_cause(error),
                 )));
             }
-        }
+        };
 
-        self.continue_committed(partial.request, partial.retry_proof, partial.resume_at)
-            .await
+        // `continue_committed` performs the one authoritative proof read before
+        // any resumed side effect. Do not pre-read here: fault-point contracts
+        // and store-backed authorities must observe exactly one validation.
+        self.continue_committed(
+            partial.request,
+            partial.retry_proof,
+            partial.resume_at,
+            partial.publication_requirement,
+            permit,
+        )
+        .await
     }
 
     /// Revalidate and idempotently reconcile one previously completed re-pin.
@@ -914,8 +1832,41 @@ where
         request: &RePinRequest,
         expected_fence: OwnershipFence,
     ) -> Result<RePinOutcome, IpsecLbError> {
-        let outcome = self.validate_committed(request, expected_fence).await?;
-        self.steering.install_rule(request.rule).await?;
+        let permit = self
+            .steering
+            .acquire_repin_permit(request.ownership_key)
+            .await?;
+        let outcome = self
+            .validate_committed_under_permit(request, expected_fence)
+            .await?;
+        let counter_guard = self
+            .acquire_esp_counter_publication_guard(
+                request,
+                EspCounterProofRequirement::CommittedRecovery,
+            )
+            .await?;
+        let counter_publication_required = counter_guard.is_some();
+        // Keep the actor mutation gate live across the final ownership read so
+        // neither authority can drift before the cancellation-safe Host cut.
+        self.validate_target_owner(request).await?;
+        let permit = match counter_guard {
+            Some(guard) => permit.bind_esp_counter_publication_guard(guard)?,
+            None => permit,
+        };
+        let permit = self
+            .steering
+            .apply_fenced_repin(RePinSteeringUpdate::new(request, expected_fence), permit)
+            .await?;
+        if permit.has_esp_counter_publication_guard() {
+            return Err(IpsecLbError::adapter_contract_violation(
+                "repin_backend_returned_unconsumed_counter_guard",
+            ));
+        }
+        if counter_publication_required && !permit.counter_publication_authorized() {
+            return Err(IpsecLbError::adapter_contract_violation(
+                "repin_backend_returned_unauthorized_counter_publication",
+            ));
+        }
         Ok(outcome)
     }
 
@@ -933,9 +1884,23 @@ where
         request: &RePinRequest,
         expected_fence: OwnershipFence,
     ) -> Result<RePinOutcome, IpsecLbError> {
+        let _permit = self
+            .steering
+            .acquire_repin_permit(request.ownership_key)
+            .await?;
+        self.validate_committed_under_permit(request, expected_fence)
+            .await
+    }
+
+    async fn validate_committed_under_permit(
+        &self,
+        request: &RePinRequest,
+        expected_fence: OwnershipFence,
+    ) -> Result<RePinOutcome, IpsecLbError> {
         self.validate_pre_commit(request).await?;
         let fence_request = OwnershipFenceRequest {
             sa: request.sa,
+            ownership_key: request.ownership_key,
             transition_id: request.transition_id,
             fingerprint: request.ownership_fingerprint(),
             previous_fence: request.previous_fence,
@@ -960,7 +1925,143 @@ where
         let proof = OwnershipRetryProof::from_grant(&grant);
         self.fencer.validate_retry_proof(&proof).await?;
         self.validate_target_owner(request).await?;
+        self.validate_esp_counter_proof(request, EspCounterProofRequirement::CommittedRecovery)
+            .await?;
         Ok(RePinOutcome::new(request.sa, grant.fence, request.rule))
+    }
+
+    pub(crate) async fn acquire_retirement_permits(
+        &self,
+        requests: &[RePinRequest],
+    ) -> Result<Vec<RePinSteeringOperationPermit>, IpsecLbError>
+    where
+        B: RePinSteeringRetirementBackend,
+    {
+        for request in requests {
+            validate_request(request)?;
+        }
+        let keys = requests
+            .iter()
+            .map(|request| request.ownership_key)
+            .collect();
+        let permits = self.steering.acquire_repin_retirement_permits(keys).await?;
+        if permits.len() != requests.len()
+            || permits
+                .iter()
+                .zip(requests)
+                .any(|(permit, request)| permit.ownership_key() != request.ownership_key)
+        {
+            return Err(IpsecLbError::adapter_contract_violation(
+                "repin_retirement_permit_batch_mismatch",
+            ));
+        }
+        Ok(permits)
+    }
+
+    pub(crate) async fn validate_retirement_admission(
+        &self,
+        request: &RePinRequest,
+        expected_fence: OwnershipFence,
+        permit: &RePinSteeringOperationPermit,
+    ) -> Result<(), IpsecLbError>
+    where
+        B: RePinSteeringRetirementBackend,
+    {
+        if permit.ownership_key() != request.ownership_key {
+            return Err(IpsecLbError::adapter_contract_violation(
+                "repin_retirement_permit_key_mismatch",
+            ));
+        }
+        self.validate_pre_commit(request).await?;
+        let fence_request = OwnershipFenceRequest {
+            sa: request.sa,
+            ownership_key: request.ownership_key,
+            transition_id: request.transition_id,
+            fingerprint: request.ownership_fingerprint(),
+            previous_fence: request.previous_fence,
+            previous_owner: request.previous_owner.clone(),
+            new_owner: request.new_owner.clone(),
+        };
+        let grant = self
+            .fencer
+            .recover_fence_grant(&fence_request)
+            .await?
+            .ok_or_else(|| {
+                IpsecLbError::ownership_conflict(
+                    "retirement admission has no exact active ownership grant",
+                )
+            })?;
+        validate_grant_matches(request, &grant)?;
+        if grant.fence != expected_fence {
+            return Err(IpsecLbError::ownership_conflict(
+                "retirement admission fence does not match durable progress",
+            ));
+        }
+        self.fencer
+            .validate_retry_proof(&OwnershipRetryProof::from_grant(&grant))
+            .await
+    }
+
+    pub(crate) async fn cleanup_committed_for_retirement(
+        &self,
+        request: &RePinRequest,
+        active_fence: OwnershipFence,
+        permit: RePinSteeringOperationPermit,
+    ) -> Result<OwnershipRetirementStep, IpsecLbError>
+    where
+        B: RePinSteeringRetirementBackend,
+        F: OwnershipRetirementAuthority,
+    {
+        validate_request(request)?;
+        if permit.ownership_key() != request.ownership_key {
+            return Err(IpsecLbError::adapter_contract_violation(
+                "repin_retirement_permit_key_mismatch",
+            ));
+        }
+        let permit = self.steering.arm_repin_retirement_permit(permit)?;
+        let retirement_request = OwnershipRetirementRequest::from_committed(request, active_fence);
+        let admission = match self
+            .fencer
+            .begin_ownership_retirement(retirement_request)
+            .await
+        {
+            Ok(admission) => admission,
+            Err(error @ IpsecLbError::OwnershipRetirementIndeterminate) => {
+                drop(permit);
+                return Err(error);
+            }
+            Err(error) => {
+                self.steering
+                    .release_classified_repin_retirement_permit(permit)?;
+                return Err(error);
+            }
+        };
+        let grant = match admission {
+            OwnershipRetirementAdmission::Granted(grant) => grant,
+            OwnershipRetirementAdmission::Superseded(proof) => {
+                self.steering
+                    .release_classified_repin_retirement_permit(permit)?;
+                return Ok(OwnershipRetirementStep::Superseded(proof));
+            }
+        };
+        let permit = self.steering.retire_fenced_repin(&grant, permit).await?;
+        self.audit
+            .record_repin(RePinAuditEvent::steering_retired(&grant))
+            .await?;
+        Ok(OwnershipRetirementStep::CleanupPending(
+            PendingOwnershipRetirement::new(grant, permit),
+        ))
+    }
+
+    pub(crate) async fn finalize_retirement_cleanup(
+        &self,
+        cleanup: OwnershipCleanupCompleteProof,
+    ) -> Result<OwnershipRetirementFinalizedProof, IpsecLbError>
+    where
+        F: OwnershipRetirementAuthority,
+    {
+        let disposition = self.fencer.finalize_ownership_retirement(&cleanup).await?;
+        Ok(OwnershipRetirementFinalizedProof::new(cleanup, disposition))
     }
 
     async fn validate_pre_commit(&self, request: &RePinRequest) -> Result<(), IpsecLbError> {
@@ -982,13 +2083,134 @@ where
         }
     }
 
+    async fn validate_esp_counter_proof(
+        &self,
+        request: &RePinRequest,
+        requirement: EspCounterProofRequirement,
+    ) -> Result<(), IpsecLbError> {
+        let Some(binding) = esp_counter_binding(request)? else {
+            return Ok(());
+        };
+        #[cfg(test)]
+        if self.accept_test_counter_proof {
+            if requirement == EspCounterProofRequirement::BeforeFirstPublication
+                && self
+                    .reject_test_first_publication_validation_once
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(IpsecLbError::applied_counter_proof_rejected(
+                    "esp_counter_receipt_exact_state_changed",
+                ));
+            }
+            return Ok(());
+        }
+        let authority = self.esp_counter_authority.as_ref().ok_or_else(|| {
+            IpsecLbError::applied_counter_proof_rejected(
+                "esp_counter_proof_authority_not_configured",
+            )
+        })?;
+        let target = authority
+            .targets
+            .get(&binding.outbound_sa_binding_id())
+            .ok_or_else(|| {
+                IpsecLbError::applied_counter_proof_rejected("esp_counter_target_absent_or_stale")
+            })?;
+        authority
+            .proofs
+            .validate_counter_proof(target, binding, requirement)
+            .await
+            .map_err(|error| IpsecLbError::applied_counter_proof_rejected(error.code()))
+    }
+
+    async fn acquire_esp_counter_publication_guard(
+        &self,
+        request: &RePinRequest,
+        requirement: EspCounterProofRequirement,
+    ) -> Result<Option<EspCounterPublicationGuard>, IpsecLbError> {
+        let Some(binding) = esp_counter_binding(request)? else {
+            return Ok(None);
+        };
+        #[cfg(test)]
+        if self.accept_test_counter_proof {
+            if self.reject_test_first_publication_guard
+                && requirement == EspCounterProofRequirement::BeforeFirstPublication
+            {
+                return Err(IpsecLbError::applied_counter_proof_rejected(
+                    "esp_counter_receipt_exact_state_changed",
+                ));
+            }
+            return Ok(None);
+        }
+        let authority = self.esp_counter_authority.as_ref().ok_or_else(|| {
+            IpsecLbError::applied_counter_proof_rejected(
+                "esp_counter_proof_authority_not_configured",
+            )
+        })?;
+        let target = authority
+            .targets
+            .get(&binding.outbound_sa_binding_id())
+            .ok_or_else(|| {
+                IpsecLbError::applied_counter_proof_rejected("esp_counter_target_absent_or_stale")
+            })?;
+        authority
+            .proofs
+            .acquire_publication_guard(target, binding, requirement)
+            .await
+            .map(Some)
+            .map_err(|error| IpsecLbError::applied_counter_proof_rejected(error.code()))
+    }
+
     async fn continue_committed(
         &self,
         request: RePinRequest,
         retry_proof: OwnershipRetryProof,
         resume_at: RePinRetryStage,
+        publication_requirement: EspCounterProofRequirement,
+        permit: RePinSteeringOperationPermit,
     ) -> Result<RePinOutcome, RePinError> {
         let fence = retry_proof.fence;
+        let validation_stage = resume_at;
+
+        if let Err(error) = self.fencer.validate_retry_proof(&retry_proof).await {
+            return Err(RePinError::AfterOwnershipCommit(Box::new(
+                RePinPartialFailure::new(
+                    request,
+                    retry_proof,
+                    validation_stage,
+                    publication_requirement,
+                    error,
+                ),
+            )));
+        }
+        if resume_at == RePinRetryStage::SteeringAudit {
+            if let Err(error) = self.validate_target_owner(&request).await {
+                return Err(RePinError::AfterOwnershipCommit(Box::new(
+                    RePinPartialFailure::new(
+                        request,
+                        retry_proof,
+                        validation_stage,
+                        publication_requirement,
+                        error,
+                    ),
+                )));
+            }
+        }
+        if resume_at == RePinRetryStage::SteeringAudit {
+            if let Err(error) = self
+                .validate_esp_counter_proof(&request, EspCounterProofRequirement::CommittedRecovery)
+                .await
+            {
+                return Err(RePinError::AfterOwnershipCommit(Box::new(
+                    RePinPartialFailure::new(
+                        request,
+                        retry_proof,
+                        validation_stage,
+                        publication_requirement,
+                        error,
+                    ),
+                )));
+            }
+        }
 
         if resume_at == RePinRetryStage::FencedAudit {
             if let Err(error) = self
@@ -1001,56 +2223,109 @@ where
                         request,
                         retry_proof,
                         RePinRetryStage::FencedAudit,
+                        publication_requirement,
                         error,
                     ),
                 )));
             }
         }
 
-        if matches!(
-            resume_at,
-            RePinRetryStage::FencedAudit | RePinRetryStage::SteeringInstall
-        ) {
-            // The initial target-owner read precedes multiple awaited effects.
-            // Re-read it and the exact SA fence as late as the current ports
-            // permit so a change during fencing/audit fails closed before the
-            // steering mutation. Atomic cross-resource ordering still belongs
-            // in a fence-aware steering backend.
-            if let Err(error) = self.fencer.validate_retry_proof(&retry_proof).await {
-                return Err(RePinError::AfterOwnershipCommit(Box::new(
-                    RePinPartialFailure::new(
-                        request,
-                        retry_proof,
-                        RePinRetryStage::SteeringInstall,
-                        error,
-                    ),
-                )));
-            }
-            // The ownership port cannot atomically bind shard and SA records,
-            // so leave the target-owner snapshot as the last awaited check
-            // before steering. A fence-aware backend is still required for a
-            // strict cross-resource atomicity guarantee.
+        let _permit = if resume_at != RePinRetryStage::SteeringAudit {
+            // The Fenced event is durable evidence that ownership committed,
+            // so preserve it even if the target shard drifts afterwards. The
+            // actor-issued ESP guard freezes receipt-invalidating XFRM
+            // commands across the final owner read and cancellation-safe Host
+            // publication. Drift resumes at SteeringInstall.
+            let counter_guard = match self
+                .acquire_esp_counter_publication_guard(&request, publication_requirement)
+                .await
+            {
+                Ok(guard) => guard,
+                Err(error) => {
+                    return Err(RePinError::AfterOwnershipCommit(Box::new(
+                        RePinPartialFailure::new(
+                            request,
+                            retry_proof,
+                            RePinRetryStage::SteeringInstall,
+                            publication_requirement,
+                            error,
+                        ),
+                    )))
+                }
+            };
+            let counter_publication_required = counter_guard.is_some();
             if let Err(error) = self.validate_target_owner(&request).await {
                 return Err(RePinError::AfterOwnershipCommit(Box::new(
                     RePinPartialFailure::new(
                         request,
                         retry_proof,
                         RePinRetryStage::SteeringInstall,
+                        publication_requirement,
                         error,
                     ),
                 )));
             }
-            if let Err(error) = self.steering.install_rule(request.rule).await {
-                return Err(RePinError::AfterOwnershipCommit(Box::new(
-                    RePinPartialFailure::new(
-                        request,
-                        retry_proof,
-                        RePinRetryStage::SteeringInstall,
-                        error,
-                    ),
-                )));
+            let permit = match counter_guard {
+                Some(guard) => match permit.bind_esp_counter_publication_guard(guard) {
+                    Ok(permit) => permit,
+                    Err(error) => {
+                        return Err(RePinError::AfterOwnershipCommit(Box::new(
+                            RePinPartialFailure::new(
+                                request,
+                                retry_proof,
+                                RePinRetryStage::SteeringInstall,
+                                publication_requirement,
+                                error,
+                            ),
+                        )))
+                    }
+                },
+                None => permit,
+            };
+            match self
+                .steering
+                .apply_fenced_repin(RePinSteeringUpdate::new(&request, fence), permit)
+                .await
+            {
+                Ok(permit)
+                    if !permit.has_esp_counter_publication_guard()
+                        && (!counter_publication_required
+                            || permit.counter_publication_authorized()) =>
+                {
+                    permit
+                }
+                Ok(permit) => {
+                    let code = if permit.has_esp_counter_publication_guard() {
+                        "repin_backend_returned_unconsumed_counter_guard"
+                    } else {
+                        "repin_backend_returned_unauthorized_counter_publication"
+                    };
+                    let error = IpsecLbError::adapter_contract_violation(code);
+                    return Err(RePinError::AfterOwnershipCommit(Box::new(
+                        RePinPartialFailure::new(
+                            request,
+                            retry_proof,
+                            RePinRetryStage::SteeringInstall,
+                            EspCounterProofRequirement::CommittedRecovery,
+                            error,
+                        ),
+                    )));
+                }
+                Err(error) => {
+                    return Err(RePinError::AfterOwnershipCommit(Box::new(
+                        RePinPartialFailure::new(
+                            request,
+                            retry_proof,
+                            RePinRetryStage::SteeringInstall,
+                            EspCounterProofRequirement::CommittedRecovery,
+                            error,
+                        ),
+                    )))
+                }
             }
-        }
+        } else {
+            permit
+        };
 
         if let Err(error) = self
             .audit
@@ -1062,6 +2337,7 @@ where
                     request,
                     retry_proof,
                     RePinRetryStage::SteeringAudit,
+                    EspCounterProofRequirement::CommittedRecovery,
                     error,
                 ),
             )));
@@ -1076,12 +2352,18 @@ fn validate_grant_matches(
     grant: &OwnershipFenceGrant,
 ) -> Result<(), IpsecLbError> {
     if grant.sa != request.sa
+        || grant.ownership_key != request.ownership_key
         || grant.transition_id != request.transition_id
         || grant.fingerprint != request.ownership_fingerprint()
         || grant.owner != request.new_owner
     {
         return Err(IpsecLbError::ownership_conflict(
             "fence grant does not match the requested SA and new owner",
+        ));
+    }
+    if grant.fence <= request.previous_fence {
+        return Err(IpsecLbError::ownership_conflict(
+            "fence grant did not advance beyond the previous fence",
         ));
     }
     Ok(())
@@ -1224,6 +2506,32 @@ fn hash_anti_replay_and_key_source(hasher: &mut Sha256, resume: SameSpiResume) {
     }]);
 }
 
+fn esp_counter_binding(
+    request: &RePinRequest,
+) -> Result<Option<EspCounterResumeBinding>, IpsecLbError> {
+    let (
+        SaId::Esp { .. },
+        SameSpiOutboundIvResume::CounterBased {
+            restored_send_iv_next,
+            ..
+        },
+    ) = (request.sa, request.resume.outbound_iv)
+    else {
+        return Ok(None);
+    };
+    let outbound_sa_binding_id = request.outbound_sa_binding_id.ok_or_else(|| {
+        IpsecLbError::applied_counter_proof_rejected("esp_counter_outbound_sa_binding_missing")
+    })?;
+    EspCounterResumeBinding::new(
+        request.transition_id.get(),
+        request.previous_fence.get(),
+        outbound_sa_binding_id,
+        restored_send_iv_next,
+    )
+    .map(Some)
+    .map_err(|error| IpsecLbError::applied_counter_proof_rejected(error.code()))
+}
+
 pub(crate) fn validate_request(request: &RePinRequest) -> Result<(), IpsecLbError> {
     if request.previous_owner == request.new_owner {
         return Err(IpsecLbError::invalid_config(
@@ -1243,7 +2551,58 @@ pub(crate) fn validate_request(request: &RePinRequest) -> Result<(), IpsecLbErro
             ));
         }
     }
+    validate_ownership_key_matches_sa(request.sa, request.ownership_key)?;
+    match (request.sa, request.rule.key, request.ownership_key) {
+        (SaId::Esp { spi }, SteerKey::EspSpi(rule_spi), SessionOwnershipKey::Esp(key))
+            if spi == rule_spi && key.inbound_spi().get() == spi => {}
+        (
+            SaId::Ike { responder_spi },
+            SteerKey::IkeResponderSpi(rule_responder_spi),
+            SessionOwnershipKey::EstablishedIke(key),
+        ) if responder_spi == rule_responder_spi && key.responder_spi().get() == responder_spi => {}
+        _ => {
+            return Err(IpsecLbError::invalid_config(
+                "ownership_key",
+                "destination-scoped ownership key must match the fenced SA protocol and SPI",
+            ));
+        }
+    }
+    match (request.sa, request.outbound_sa_binding_id) {
+        (SaId::Esp { .. }, Some(_)) | (SaId::Ike { .. }, None) => {}
+        (SaId::Esp { .. }, None) => {
+            return Err(IpsecLbError::invalid_config(
+                "outbound_sa_binding_id",
+                "ESP re-pin requires the exact outbound SA binding ID",
+            ));
+        }
+        (SaId::Ike { .. }, Some(_)) => {
+            return Err(IpsecLbError::invalid_config(
+                "outbound_sa_binding_id",
+                "IKE re-pin cannot carry an outbound ESP SA binding ID",
+            ));
+        }
+    }
     Ok(())
+}
+
+pub(crate) fn validate_ownership_key_matches_sa(
+    sa: SaId,
+    ownership_key: SessionOwnershipKey,
+) -> Result<(), IpsecLbError> {
+    match (sa, ownership_key) {
+        (SaId::Esp { spi }, SessionOwnershipKey::Esp(key)) if key.inbound_spi().get() == spi => {
+            Ok(())
+        }
+        (SaId::Ike { responder_spi }, SessionOwnershipKey::EstablishedIke(key))
+            if key.responder_spi().get() == responder_spi =>
+        {
+            Ok(())
+        }
+        _ => Err(IpsecLbError::invalid_config(
+            "ownership_key",
+            "ownership key must match the fenced SA protocol and SPI",
+        )),
+    }
 }
 
 pub(crate) fn validate_sa_identifier(sa: SaId) -> Result<(), IpsecLbError> {
@@ -1299,8 +2658,10 @@ fn error_code(error: &IpsecLbError) -> &'static str {
         IpsecLbError::XdpUpgradeRequiresDrain => "xdp_upgrade_requires_drain",
         IpsecLbError::XdpUpgradeIndeterminate => "xdp_upgrade_indeterminate",
         IpsecLbError::OwnershipConflict { .. } => "ownership_conflict",
+        IpsecLbError::OwnershipRetirementIndeterminate => "ownership_retirement_indeterminate",
         IpsecLbError::ForwardingProofRejected { .. } => "forwarding_proof_rejected",
         IpsecLbError::UnsafeResume { .. } => "unsafe_resume",
+        IpsecLbError::AppliedCounterProofRejected { .. } => "applied_counter_proof_rejected",
         IpsecLbError::CookieRejected => "cookie_rejected",
         IpsecLbError::XdpKernelFloorNotMet { .. } => "xdp_kernel_floor_not_met",
     }
@@ -1310,18 +2671,107 @@ fn error_code(error: &IpsecLbError) -> &'static str {
 mod tests {
     use super::*;
     use crate::failover::SendIvCounterMode;
+    use crate::ownership::{
+        DestinationContext, EspEncapsulationKind, EspOwnershipKey, EspSpi,
+        EstablishedIkeOwnershipKey, IkeSpi, RoutingDomainTag,
+    };
 
     const FORWARD_JUMP: u64 = crate::failover::MIN_SEND_IV_FORWARD_JUMP;
-    const FROZEN_COUNTER_V1_FINGERPRINT: [u8; 32] = [
+    const LEGACY_ESP_COUNTER_V1_FINGERPRINT: [u8; 32] = [
         0x7e, 0xeb, 0x23, 0x71, 0xb3, 0xea, 0xbc, 0x7d, 0x94, 0xf9, 0x2e, 0x41, 0x4c, 0xad, 0x9d,
         0xb3, 0x62, 0x2f, 0x10, 0x78, 0xa3, 0x20, 0x32, 0x8e, 0x81, 0xce, 0x8b, 0xd4, 0x09, 0x56,
         0x59, 0xcd,
     ];
-    const FROZEN_RANDOM_IV_V2_FINGERPRINT: [u8; 32] = [
-        0xcb, 0x74, 0x27, 0xfd, 0x0e, 0x4d, 0x66, 0xec, 0x4e, 0xc9, 0xad, 0xfb, 0xdc, 0xe1, 0x0a,
-        0x18, 0xcf, 0x2f, 0xf2, 0x77, 0x5d, 0x13, 0x8b, 0x56, 0x1e, 0x80, 0x9c, 0xd9, 0x96, 0xfe,
-        0xec, 0x48,
+    const FROZEN_ESP_COUNTER_V5_FINGERPRINT: [u8; 32] = [
+        0xd2, 0xc6, 0xe5, 0x4d, 0x11, 0xd9, 0xbe, 0x2a, 0x2e, 0x2f, 0xb5, 0x5c, 0x07, 0x9b, 0x21,
+        0xeb, 0xc8, 0x1a, 0x5c, 0x7e, 0x94, 0x78, 0x71, 0xf6, 0x4a, 0x86, 0x36, 0x59, 0x60, 0x9c,
+        0x8e, 0x3c,
     ];
+    const FROZEN_RANDOM_IV_V4_FINGERPRINT: [u8; 32] = [
+        0x49, 0x1f, 0x33, 0x17, 0x3a, 0x7d, 0xb0, 0x69, 0x33, 0x32, 0x74, 0x0d, 0x00, 0x07, 0x31,
+        0x06, 0x40, 0x10, 0xf8, 0x68, 0x13, 0x42, 0x6d, 0xb4, 0x76, 0x28, 0xdd, 0x9c, 0xd5, 0x87,
+        0x26, 0xb4,
+    ];
+
+    fn ownership_key(sa: SaId) -> SessionOwnershipKey {
+        let destination =
+            DestinationContext::new(IpAddress::V4([192, 0, 2, 10]), RoutingDomainTag::new(7));
+        match sa {
+            SaId::Esp { spi } => SessionOwnershipKey::Esp(EspOwnershipKey::new(
+                destination,
+                EspEncapsulationKind::UdpEncapsulated,
+                EspSpi::new(spi).unwrap(),
+            )),
+            SaId::Ike { responder_spi } => {
+                SessionOwnershipKey::EstablishedIke(EstablishedIkeOwnershipKey::new(
+                    destination,
+                    IkeSpi::new(11).unwrap(),
+                    IkeSpi::new(responder_spi).unwrap(),
+                ))
+            }
+        }
+    }
+
+    #[test]
+    fn steering_publication_permit_is_exactly_once_after_success() {
+        let mut permit =
+            RePinSteeringOperationPermit::unguarded(ownership_key(SaId::Ike { responder_spi: 7 }));
+        let calls = std::cell::Cell::new(0_u8);
+        permit
+            .publish_with_esp_counter_guard(|| {
+                calls.set(calls.get() + 1);
+                Ok::<(), ()>(())
+            })
+            .unwrap()
+            .unwrap();
+        assert!(permit.counter_publication_authorized());
+        let error = permit
+            .publish_with_esp_counter_guard(|| {
+                calls.set(calls.get() + 1);
+                Ok::<(), ()>(())
+            })
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            IpsecLbError::AdapterContractViolation {
+                code: "repin_operation_permit_publication_already_consumed"
+            }
+        ));
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn steering_publication_permit_is_exactly_once_after_failure() {
+        let mut permit =
+            RePinSteeringOperationPermit::unguarded(ownership_key(SaId::Ike { responder_spi: 7 }));
+        let calls = std::cell::Cell::new(0_u8);
+        let first = permit
+            .publish_with_esp_counter_guard(|| {
+                calls.set(calls.get() + 1);
+                Err::<(), _>("injected publication failure")
+            })
+            .unwrap();
+        assert_eq!(first, Err("injected publication failure"));
+        assert!(!permit.counter_publication_authorized());
+        assert!(permit
+            .publish_with_esp_counter_guard(|| {
+                calls.set(calls.get() + 1);
+                Ok::<(), ()>(())
+            })
+            .is_err());
+        assert_eq!(calls.get(), 1);
+    }
+
+    fn outbound_sa_binding_id(sa: SaId) -> Option<OutboundSaBindingId> {
+        match sa {
+            SaId::Esp { spi } => {
+                let mut bytes = [0x33; 32];
+                bytes[..4].copy_from_slice(&spi.to_be_bytes());
+                Some(OutboundSaBindingId::from_bytes(bytes))
+            }
+            SaId::Ike { .. } => None,
+        }
+    }
 
     fn valid_forward_jump(sa: SaId) -> SendIvForwardJump {
         SendIvForwardJump {
@@ -1376,8 +2826,8 @@ mod tests {
         }
     }
 
-    fn frozen_counter_v1_request() -> RePinRequest {
-        let sa = SaId::Esp { spi: 7 };
+    fn frozen_counter_v5_request() -> RePinRequest {
+        let sa = SaId::Esp { spi: 0x0107 };
         RePinRequest {
             sa,
             transition_id: OwnershipTransitionId::new(7).unwrap(),
@@ -1387,13 +2837,15 @@ mod tests {
             rule: SteeringRule {
                 shard: crate::model::ShardId::new(1),
                 owner: crate::model::ShardId::new(2),
-                key: SteerKey::EspSpi(7),
+                key: SteerKey::EspSpi(0x0107),
             },
+            ownership_key: ownership_key(sa),
+            outbound_sa_binding_id: outbound_sa_binding_id(sa),
             resume: valid_resume(sa, ResumeKeySource::LiveMirrored),
         }
     }
 
-    fn frozen_random_iv_v2_request() -> RePinRequest {
+    fn frozen_random_iv_v4_request() -> RePinRequest {
         let sa = SaId::Ike { responder_spi: 7 };
         RePinRequest {
             sa,
@@ -1406,6 +2858,8 @@ mod tests {
                 owner: crate::model::ShardId::new(2),
                 key: SteerKey::IkeResponderSpi(7),
             },
+            ownership_key: ownership_key(sa),
+            outbound_sa_binding_id: outbound_sa_binding_id(sa),
             resume: SameSpiResume {
                 previous_sa: sa,
                 resumed_sa: sa,
@@ -1447,37 +2901,38 @@ mod tests {
     }
 
     #[test]
-    fn counter_based_ownership_fingerprint_preserves_frozen_v1_encoding() {
+    fn esp_counter_ownership_fingerprint_preserves_frozen_v5_encoding() {
         assert_eq!(
-            frozen_counter_v1_request()
+            frozen_counter_v5_request()
                 .ownership_fingerprint()
                 .as_bytes(),
-            FROZEN_COUNTER_V1_FINGERPRINT
+            FROZEN_ESP_COUNTER_V5_FINGERPRINT
         );
     }
 
     #[test]
-    fn random_iv_ownership_fingerprint_preserves_frozen_v2_encoding() {
-        let request = frozen_random_iv_v2_request();
+    fn random_iv_ownership_fingerprint_preserves_frozen_v4_encoding() {
+        let request = frozen_random_iv_v4_request();
         validate_request(&request).unwrap();
         assert_eq!(
             request.ownership_fingerprint().as_bytes(),
-            FROZEN_RANDOM_IV_V2_FINGERPRINT
+            FROZEN_RANDOM_IV_V4_FINGERPRINT
         );
     }
 
     #[tokio::test]
-    async fn migrated_counter_request_recovers_a_v1_committed_transition() {
-        let request = frozen_counter_v1_request();
+    async fn legacy_numeric_only_esp_grant_cannot_recover_as_v5_destination_proof() {
+        let request = frozen_counter_v5_request();
         let fencer = crate::mock::MockOwnershipFencer::new();
-        fencer.set_owner(request.sa, request.previous_owner.clone());
+        fencer.set_owner(request.ownership_key, request.previous_owner.clone());
 
         let committed = fencer
             .fence_sa_owner(OwnershipFenceRequest {
                 sa: request.sa,
+                ownership_key: request.ownership_key,
                 transition_id: request.transition_id,
                 fingerprint: OwnershipTransitionFingerprint::from_bytes(
-                    FROZEN_COUNTER_V1_FINGERPRINT,
+                    LEGACY_ESP_COUNTER_V1_FINGERPRINT,
                 ),
                 previous_fence: request.previous_fence,
                 previous_owner: request.previous_owner.clone(),
@@ -1493,37 +2948,29 @@ mod tests {
         let coordinator =
             RePinCoordinator::new(steering.clone(), fencer.clone(), ownership, audit.clone());
 
-        let outcome = coordinator.repin(request.clone()).await.unwrap();
-        assert_eq!(outcome.fence(), committed.fence);
+        assert!(matches!(
+            coordinator.repin(request.clone()).await,
+            Err(RePinError::BeforeOwnershipCommit(
+                IpsecLbError::OwnershipConflict { .. }
+            ))
+        ));
+        assert_ne!(request.ownership_fingerprint(), committed.fingerprint);
         assert_eq!(fencer.operations().len(), 1);
         assert_eq!(fencer.recovery_attempts(), 1);
-        assert_eq!(
-            steering.operations(),
-            vec![crate::mock::MockSteeringOperation::Install(request.rule)]
-        );
-        assert_eq!(
-            audit
-                .events()
-                .iter()
-                .map(|event| event.kind)
-                .collect::<Vec<_>>(),
-            vec![
-                RePinAuditEventKind::Fenced,
-                RePinAuditEventKind::SteeringInstalled,
-            ]
-        );
+        assert!(steering.operations().is_empty());
+        assert!(audit.events().is_empty());
     }
 
     #[test]
     fn ownership_fingerprint_binds_every_safety_critical_request_component() {
-        let sa = SaId::Esp { spi: 7 };
-        let base = frozen_counter_v1_request();
+        let sa = SaId::Esp { spi: 0x0107 };
+        let base = frozen_counter_v5_request();
         let expected = base.ownership_fingerprint();
         assert_eq!(expected, base.clone().ownership_fingerprint());
 
         let mutations = [
             RePinRequest {
-                sa: SaId::Esp { spi: 8 },
+                sa: SaId::Esp { spi: 0x0108 },
                 ..base.clone()
             },
             RePinRequest {
@@ -1558,21 +3005,21 @@ mod tests {
             },
             RePinRequest {
                 rule: SteeringRule {
-                    key: SteerKey::EspSpi(8),
+                    key: SteerKey::EspSpi(0x0108),
                     ..base.rule
                 },
                 ..base.clone()
             },
             RePinRequest {
                 resume: SameSpiResume {
-                    previous_sa: SaId::Esp { spi: 8 },
+                    previous_sa: SaId::Esp { spi: 0x0108 },
                     ..base.resume
                 },
                 ..base.clone()
             },
             RePinRequest {
                 resume: SameSpiResume {
-                    resumed_sa: SaId::Esp { spi: 8 },
+                    resumed_sa: SaId::Esp { spi: 0x0108 },
                     ..base.resume
                 },
                 ..base.clone()
@@ -1706,6 +3153,8 @@ mod tests {
                 owner: crate::model::ShardId::new(2),
                 key: SteerKey::IkeResponderSpi(1),
             },
+            ownership_key: ownership_key(sa),
+            outbound_sa_binding_id: outbound_sa_binding_id(sa),
             resume: valid_resume(sa, ResumeKeySource::PersistedKeyMaterial),
         };
         let random_iv = RePinRequest {
@@ -1744,7 +3193,7 @@ mod tests {
 
     #[test]
     fn same_spi_resume_rejects_every_malformed_forward_jump_shape() {
-        let sa = SaId::Esp { spi: 1 };
+        let sa = SaId::Esp { spi: 0x0101 };
 
         for key_source in [
             ResumeKeySource::LiveMirrored,
@@ -1965,7 +3414,7 @@ mod tests {
 
     #[test]
     fn repin_request_requires_rule_key_to_match_fenced_sa_protocol_and_spi() {
-        let sa = SaId::Esp { spi: 1 };
+        let sa = SaId::Esp { spi: 0x0101 };
         let base = RePinRequest {
             sa,
             transition_id: OwnershipTransitionId::new(1).unwrap(),
@@ -1975,15 +3424,17 @@ mod tests {
             rule: SteeringRule {
                 shard: crate::model::ShardId::new(1),
                 owner: crate::model::ShardId::new(2),
-                key: SteerKey::EspSpi(1),
+                key: SteerKey::EspSpi(0x0101),
             },
+            ownership_key: ownership_key(sa),
+            outbound_sa_binding_id: outbound_sa_binding_id(sa),
             resume: valid_resume(sa, ResumeKeySource::LiveMirrored),
         };
         validate_request(&base).unwrap();
 
         let wrong_spi = RePinRequest {
             rule: SteeringRule {
-                key: SteerKey::EspSpi(2),
+                key: SteerKey::EspSpi(0x0102),
                 ..base.rule
             },
             ..base.clone()
@@ -2017,6 +3468,8 @@ mod tests {
                 owner: crate::model::ShardId::new(2),
                 key: SteerKey::IkeResponderSpi(7),
             },
+            ownership_key: ownership_key(ike_sa),
+            outbound_sa_binding_id: outbound_sa_binding_id(ike_sa),
             resume: valid_resume(ike_sa, ResumeKeySource::LiveMirrored),
         };
         validate_request(&ike_request).unwrap();
