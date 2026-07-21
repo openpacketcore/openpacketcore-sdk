@@ -81,8 +81,9 @@ pub use composite::{
 pub use counter_resume::{
     AppliedEspCounterReceipt, EspCounterProofRequirement, EspCounterResumeApplyRequest,
     EspCounterResumeBinding, EspCounterResumeError, EspCounterResumeProofSet,
-    EspCounterResumeRecoveryRequest, OutboundEspCounterTarget, ESP_COUNTER_RECEIPT_MAX_AGE,
-    MAX_ESP_COUNTER_PROOF_SET_SIZE, MAX_ESP_COUNTER_RECEIPTS,
+    EspCounterResumeRecoveryRequest, OutboundEspCounterTarget, OutboundEspCounterTargetSet,
+    ESP_COUNTER_RECEIPT_MAX_AGE, MAX_ESP_COUNTER_PROOF_SET_SIZE, MAX_ESP_COUNTER_RECEIPTS,
+    MAX_ESP_COUNTER_TARGET_SET_SIZE,
 };
 pub use dscp::{
     LinuxXfrmDscpMarkingConfig, DEFAULT_XFRM_DSCP_BPFFS_PIN_ROOT, DEFAULT_XFRM_DSCP_TC_PRIORITY,

@@ -43,6 +43,9 @@ pub const ESP_COUNTER_RECEIPT_MAX_AGE: Duration = Duration::from_secs(30);
 /// Maximum number of counter receipts accepted by one bounded proof set.
 pub const MAX_ESP_COUNTER_PROOF_SET_SIZE: usize = 64;
 
+/// Maximum number of live outbound-SA targets accepted by one bounded set.
+pub const MAX_ESP_COUNTER_TARGET_SET_SIZE: usize = MAX_ESP_COUNTER_PROOF_SET_SIZE;
+
 /// Durable, key-free correlation for one outbound ESP counter operation.
 //
 // This value is not evidence. Only an [`AppliedEspCounterReceipt`] returned by
@@ -140,6 +143,72 @@ impl OutboundEspCounterTarget {
 impl fmt::Debug for OutboundEspCounterTarget {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("OutboundEspCounterTarget(<redacted>)")
+    }
+}
+
+/// Bounded collection of live outbound-SA counter targets.
+///
+/// Targets are keyed by their durable [`OutboundSaBindingId`], while each
+/// value retains the opaque process-local actor identity needed for proof
+/// validation. Construction rejects duplicate durable IDs even when the
+/// targets came from different actors, preventing an ambiguous lookup from
+/// selecting one of two live authorities. The set is not serializable and
+/// cannot create targets; callers must derive every member from an
+/// [`InstalledOutboundSaBinding`].
+#[derive(Clone)]
+pub struct OutboundEspCounterTargetSet {
+    targets: HashMap<OutboundSaBindingId, OutboundEspCounterTarget>,
+}
+
+impl OutboundEspCounterTargetSet {
+    /// Build a bounded, nonempty target set without duplicate durable SA IDs.
+    pub fn new(
+        targets: impl IntoIterator<Item = OutboundEspCounterTarget>,
+    ) -> Result<Self, EspCounterResumeError> {
+        let mut collected = HashMap::new();
+        for target in targets {
+            if collected.len() >= MAX_ESP_COUNTER_TARGET_SET_SIZE {
+                return Err(EspCounterResumeError::InvalidRequest {
+                    code: "esp_counter_target_set_too_large",
+                });
+            }
+            if collected
+                .insert(target.outbound_sa_binding_id(), target)
+                .is_some()
+            {
+                return Err(EspCounterResumeError::InvalidRequest {
+                    code: "esp_counter_target_set_duplicate_outbound_sa",
+                });
+            }
+        }
+        if collected.is_empty() {
+            return Err(EspCounterResumeError::InvalidRequest {
+                code: "esp_counter_target_set_empty",
+            });
+        }
+        Ok(Self { targets: collected })
+    }
+
+    /// Build a one-target set.
+    #[must_use]
+    pub fn single(target: OutboundEspCounterTarget) -> Self {
+        let mut targets = HashMap::new();
+        targets.insert(target.outbound_sa_binding_id(), target);
+        Self { targets }
+    }
+
+    /// Borrow the live target for an exact durable outbound-SA correlation.
+    #[must_use]
+    pub fn get(&self, outbound_sa: &OutboundSaBindingId) -> Option<&OutboundEspCounterTarget> {
+        self.targets.get(outbound_sa)
+    }
+}
+
+impl fmt::Debug for OutboundEspCounterTargetSet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OutboundEspCounterTargetSet")
+            .field("target_count", &self.targets.len())
+            .finish_non_exhaustive()
     }
 }
 
@@ -934,6 +1003,7 @@ mod tests {
         test_outbound_binding_readback_bodies, LinuxXfrmBackendConfig, LinuxXfrmTransport,
         SensitiveBuffer,
     };
+    use crate::namespace::NetworkNamespaceBinding;
     use crate::outbound_binding::{tests_support::outbound_request, validate_outbound_request};
     use crate::{
         IpAddress, LifetimeConfig, LifetimeCurrent, SaStatistics, XfrmId, XfrmMode, XfrmProbe,
@@ -1026,6 +1096,78 @@ mod tests {
             statistics: SaStatistics::default(),
             output_mark: None,
             egress_dscp: None,
+        }
+    }
+
+    fn counter_target(id_byte: u8, actor_id: u64) -> OutboundEspCounterTarget {
+        OutboundEspCounterTarget {
+            actor: NamespaceActorBinding::new(NetworkNamespaceBinding::for_test(
+                actor_id,
+                actor_id + 1,
+            )),
+            outbound_sa: OutboundSaBindingId::from_bytes([id_byte; 32]),
+        }
+    }
+
+    #[test]
+    fn target_set_rejects_empty_input() {
+        let error = OutboundEspCounterTargetSet::new(Vec::new()).unwrap_err();
+        assert_eq!(error.code(), "esp_counter_target_set_empty");
+    }
+
+    #[test]
+    fn target_set_rejects_more_than_the_bound() {
+        let targets = (0..=MAX_ESP_COUNTER_TARGET_SET_SIZE)
+            .map(|index| counter_target(index as u8, index as u64 + 1));
+        let error = OutboundEspCounterTargetSet::new(targets).unwrap_err();
+        assert_eq!(error.code(), "esp_counter_target_set_too_large");
+    }
+
+    #[test]
+    fn target_set_rejects_duplicate_durable_id_across_actors() {
+        let error =
+            OutboundEspCounterTargetSet::new([counter_target(0x31, 1), counter_target(0x31, 9)])
+                .unwrap_err();
+        assert_eq!(error.code(), "esp_counter_target_set_duplicate_outbound_sa");
+    }
+
+    #[test]
+    fn target_set_indexes_distinct_ids_and_single_target() {
+        let first = counter_target(0x41, 1);
+        let first_id = first.outbound_sa_binding_id();
+        let second = counter_target(0x42, 2);
+        let second_id = second.outbound_sa_binding_id();
+        let set = OutboundEspCounterTargetSet::new([first.clone(), second.clone()]).unwrap();
+
+        assert!(set
+            .get(&first_id)
+            .is_some_and(|found| found.matches(&first)));
+        assert!(set
+            .get(&second_id)
+            .is_some_and(|found| found.matches(&second)));
+        assert!(set
+            .get(&OutboundSaBindingId::from_bytes([0x43; 32]))
+            .is_none());
+
+        let single = OutboundEspCounterTargetSet::single(first.clone());
+        assert!(single
+            .get(&first_id)
+            .is_some_and(|found| found.matches(&first)));
+        assert!(single.get(&second_id).is_none());
+    }
+
+    #[test]
+    fn target_set_debug_exposes_only_cardinality() {
+        let set = OutboundEspCounterTargetSet::new([
+            counter_target(0x51, 123_456_789),
+            counter_target(0x52, 987_654_321),
+        ])
+        .unwrap();
+        let debug = format!("{set:?}");
+
+        assert_eq!(debug, "OutboundEspCounterTargetSet { target_count: 2, .. }");
+        for marker in ["51", "52", "123456789", "987654321"] {
+            assert!(!debug.contains(marker));
         }
     }
 
