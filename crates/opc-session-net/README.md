@@ -99,6 +99,7 @@ cap of 128 rather than that planning estimate.
 | InstallSnapshot | 10,000 ms |
 | ForwardMutation | 10,000 ms |
 | Consumer ReadBarrier | 10,000 ms |
+| TopologyAdmissionBarrier | 10,000 ms |
 
 The election range is `[5,000 ms, 8,000 ms)`, the session/config operation
 default is 10,000 ms, and listener idle/handler ceilings are 30,000 ms.
@@ -118,11 +119,14 @@ SPIFFE, failure-domain, and backing binding. Distinct removed and added replica
 IDs may not alias one endpoint, SPIFFE identity, or backing identity across the
 joint old/new admission window. While staged, current-manifest connections
 retain the normal RPC surface; successor-manifest connections initially may send only
-Raft `AppendEntries` and `InstallSnapshot` traffic needed to join and catch up.
-The coordinator passes a store-issued
-`SessionTopologyLearnersReadyAdmissionProof` to
-`admit_successor_voting_after_catch_up` after verifying learner progress before
-successor-scoped `Vote` RPCs are admitted.
+Raft `AppendEntries`, `InstallSnapshot`, and the payload-free topology marker
+barrier needed to join and prove exact application. Learner catch-up alone
+does not admit voting: Openraft can process a higher-term Vote even when its
+sender is not yet a committed voter. The coordinator therefore passes a
+store-issued `SessionTopologyJointCommitAdmissionProof` to
+`admit_successor_voting_after_joint_commit` only after exact joint membership
+is durably applied. Before that proof, successor-scoped `Vote` RPCs fail
+closed.
 `ForwardMutation` and `ReadBarrier` remain current-authority-only.
 Finalization takes an exclusive admission lease, waits for already-admitted
 handler calls to finish, and then removes the old identity atomically. Every

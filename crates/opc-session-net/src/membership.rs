@@ -11,10 +11,12 @@ use opc_consensus::{ConsensusIdentity, ConsensusNodeId, ConsensusRpcFamily};
 use opc_session_store::{
     ReplicaId, SessionConsensusPeerError, SessionTopologyTransitionDigest,
     SessionTopologyTransitionError, SessionTopologyTransitionRequest,
+    SessionTopologyTransportAdmission, SessionTopologyTransportAdmissionError,
 };
 pub use opc_session_store::{
-    SessionTopologyAbortAdmissionProof, SessionTopologyLearnersReadyAdmissionProof,
-    SessionTopologyTransitionId, SessionTopologyUniformCommitAdmissionProof,
+    SessionTopologyAbortAdmissionProof, SessionTopologyJointCommitAdmissionProof,
+    SessionTopologyLearnersReadyAdmissionProof, SessionTopologyTransitionId,
+    SessionTopologyUniformCommitAdmissionProof,
 };
 use opc_types::SpiffeId;
 use thiserror::Error;
@@ -30,7 +32,7 @@ pub enum SessionMembershipTransitionResult {
     Staged,
     /// The exact successor was already staged by this transition.
     AlreadyStaged,
-    /// Successor voting was admitted after caller-verified learner catch-up.
+    /// Successor voting was admitted after a store-verified joint commit.
     VotingAdmitted,
     /// Successor voting had already been admitted for this transition.
     AlreadyVotingAdmitted,
@@ -328,20 +330,17 @@ impl SessionMembershipAdmission {
         Ok(SessionMembershipTransitionResult::Staged)
     }
 
-    /// Admit `Vote` RPCs under the staged successor after learner catch-up.
+    /// Admit `Vote` RPCs under the staged successor after joint commit.
     ///
-    /// The topology coordinator must call this only after it has verified that
-    /// every added learner is caught up and identity-admitted. The transport
-    /// cannot inspect Openraft replication progress; before this explicit
-    /// promotion it admits only AppendEntries and snapshot catch-up traffic
-    /// under the successor identity. `proof` is minted only by the session-store
-    /// coordinator after exact learner progress is verified. Its transition ID,
-    /// epochs, desired configuration, and request digest must match the staged
-    /// request.
-    pub async fn admit_successor_voting_after_catch_up(
+    /// Learner catch-up alone does not grant voting authority. The transport
+    /// admits only AppendEntries and snapshot traffic under the successor
+    /// identity until the session-store supplies an unforgeable exact joint-
+    /// commit proof. Its transition ID, epochs, desired configuration, and
+    /// request digest must match the staged request.
+    pub async fn admit_successor_voting_after_joint_commit(
         &self,
         request: &SessionTopologyTransitionRequest,
-        proof: &SessionTopologyLearnersReadyAdmissionProof,
+        proof: &SessionTopologyJointCommitAdmissionProof,
     ) -> Result<SessionMembershipTransitionResult, SessionMembershipAdmissionError> {
         if !proof.validates_request(request) {
             return Err(SessionTopologyTransitionError::IdempotencyConflict.into());
@@ -391,7 +390,7 @@ impl SessionMembershipAdmission {
     /// Atomically make the staged successor the sole admitted manifest.
     ///
     /// Finalization fails closed until
-    /// [`Self::admit_successor_voting_after_catch_up`] has admitted voting for
+    /// [`Self::admit_successor_voting_after_joint_commit`] has admitted voting for
     /// the exact staged transition.
     ///
     /// The exclusive update waits for already-admitted handler calls to finish.
@@ -636,13 +635,21 @@ impl SessionMembershipAdmission {
             });
         let pending_engine_catchup = match family {
             ConsensusRpcFamily::Vote => pending_voting_admitted,
-            ConsensusRpcFamily::AppendEntries | ConsensusRpcFamily::InstallSnapshot => true,
+            ConsensusRpcFamily::AppendEntries
+            | ConsensusRpcFamily::InstallSnapshot
+            | ConsensusRpcFamily::TopologyAdmissionBarrier => true,
             ConsensusRpcFamily::ForwardMutation | ConsensusRpcFamily::ReadBarrier => false,
             _ => false,
         };
         if !(current_matches || pending_matches && pending_engine_catchup) {
             return Err(SessionConsensusPeerError::ScopeMismatch);
         }
+        // The topology barrier handler performs the proof-gated write on this
+        // same admission object. Retaining the read lease across that control
+        // call would self-deadlock. The handler revalidates the exact durable
+        // transition before mutating admission; all ordinary engine calls keep
+        // the read lease until their handler completes.
+        let state = (family != ConsensusRpcFamily::TopologyAdmissionBarrier).then_some(state);
         Ok(SessionMembershipEngineLease { _state: state })
     }
 
@@ -658,7 +665,47 @@ impl SessionMembershipAdmission {
         if !admitted {
             return Err(SessionConsensusPeerError::ScopeMismatch);
         }
-        Ok(SessionMembershipEngineLease { _state: state })
+        Ok(SessionMembershipEngineLease {
+            _state: Some(state),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl SessionTopologyTransportAdmission for SessionMembershipAdmission {
+    async fn admit_successor_voting(
+        &self,
+        request: &SessionTopologyTransitionRequest,
+        proof: &SessionTopologyJointCommitAdmissionProof,
+    ) -> Result<(), SessionTopologyTransportAdmissionError> {
+        SessionMembershipAdmission::admit_successor_voting_after_joint_commit(
+            self, request, proof,
+        )
+        .await
+        .map(|_| ())
+        .map_err(|_| SessionTopologyTransportAdmissionError::Rejected)
+    }
+
+    async fn finalize_successor(
+        &self,
+        request: &SessionTopologyTransitionRequest,
+        proof: &SessionTopologyUniformCommitAdmissionProof,
+    ) -> Result<(), SessionTopologyTransportAdmissionError> {
+        SessionMembershipAdmission::finalize_successor(self, request, proof)
+            .await
+            .map(|_| ())
+            .map_err(|_| SessionTopologyTransportAdmissionError::Rejected)
+    }
+
+    async fn abort_successor(
+        &self,
+        request: &SessionTopologyTransitionRequest,
+        proof: &SessionTopologyAbortAdmissionProof,
+    ) -> Result<(), SessionTopologyTransportAdmissionError> {
+        SessionMembershipAdmission::abort_successor(self, request, proof)
+            .await
+            .map(|_| ())
+            .map_err(|_| SessionTopologyTransportAdmissionError::Rejected)
     }
 }
 
@@ -684,7 +731,7 @@ impl SessionMembershipEngineScope {
 }
 
 pub(crate) struct SessionMembershipEngineLease {
-    _state: OwnedRwLockReadGuard<MembershipAdmissionState>,
+    _state: Option<OwnedRwLockReadGuard<MembershipAdmissionState>>,
 }
 
 fn manifest_matches_scope(
@@ -856,6 +903,15 @@ mod tests {
             )
             .await
             .is_ok());
+        assert!(admission
+            .revalidate_engine_scope(
+                &pending_scope,
+                five.consensus_identity(),
+                pending_scope.sender_node_id,
+                ConsensusRpcFamily::TopologyAdmissionBarrier,
+            )
+            .await
+            .is_ok());
         assert_eq!(
             admission
                 .revalidate_engine_scope(
@@ -975,6 +1031,46 @@ mod tests {
         );
         assert_eq!(admission.snapshot().await.current_members(), 3);
         assert_eq!(admission.snapshot().await.current_epoch().get(), 3);
+    }
+
+    #[tokio::test]
+    async fn topology_barrier_releases_scope_lease_before_admission_write() {
+        let current = manifest(1, &[1, 2, 3]);
+        let pending = manifest(2, &[1, 2, 3, 4, 5]);
+        let admission = SessionMembershipAdmission::new(Arc::clone(&current), replica_id(3));
+        let request = transition_request(
+            SessionTopologyTransitionId::from_bytes([0x51; 16]),
+            1,
+            2,
+            &[1, 2, 3, 4, 5],
+        );
+        admission
+            .stage_successor(&request, Arc::clone(&pending))
+            .await
+            .expect("stage successor");
+        let pending_scope = bootstrap(&admission, &pending, 4, 3, Some(&spiffe(4)))
+            .await
+            .expect("pending bootstrap");
+        let barrier_lease = admission
+            .revalidate_engine_scope(
+                &pending_scope,
+                pending.consensus_identity(),
+                pending_scope.sender_node_id,
+                ConsensusRpcFamily::TopologyAdmissionBarrier,
+            )
+            .await
+            .expect("barrier scope");
+
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                admission.admit_successor_voting_after_catch_up_for_test(&request),
+            )
+            .await
+            .expect("barrier admission must not self-deadlock"),
+            Ok(SessionMembershipTransitionResult::VotingAdmitted)
+        );
+        drop(barrier_lease);
     }
 
     #[tokio::test]

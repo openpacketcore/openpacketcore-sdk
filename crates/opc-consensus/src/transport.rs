@@ -27,6 +27,9 @@ pub enum ConsensusRpcFamily {
     ForwardMutation,
     /// Ask the leader for a linearizable read barrier.
     ReadBarrier,
+    /// Prove that a staged membership candidate applied a durable transition
+    /// marker before successor Vote traffic is admitted.
+    TopologyAdmissionBarrier,
 }
 
 impl ConsensusRpcFamily {
@@ -38,6 +41,7 @@ impl ConsensusRpcFamily {
             Self::InstallSnapshot => "install_snapshot",
             Self::ForwardMutation => "forward_mutation",
             Self::ReadBarrier => "read_barrier",
+            Self::TopologyAdmissionBarrier => "topology_admission_barrier",
         }
     }
 }

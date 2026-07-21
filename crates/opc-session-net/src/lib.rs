@@ -73,8 +73,9 @@ pub use lifecycle::{
 pub use membership::{
     SessionMembershipAdmission, SessionMembershipAdmissionError,
     SessionMembershipAdmissionSnapshot, SessionMembershipTransitionResult,
-    SessionTopologyAbortAdmissionProof, SessionTopologyLearnersReadyAdmissionProof,
-    SessionTopologyTransitionId, SessionTopologyUniformCommitAdmissionProof,
+    SessionTopologyAbortAdmissionProof, SessionTopologyJointCommitAdmissionProof,
+    SessionTopologyLearnersReadyAdmissionProof, SessionTopologyTransitionId,
+    SessionTopologyUniformCommitAdmissionProof,
 };
 pub use opc_consensus::{
     ConsensusClusterId, ConsensusConfigurationEpoch, ConsensusConfigurationId, ConsensusIdentity,

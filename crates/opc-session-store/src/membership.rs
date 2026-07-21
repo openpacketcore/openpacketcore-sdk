@@ -15,7 +15,7 @@ use thiserror::Error;
 
 use crate::consensus::{
     SessionConsensusClusterId, SessionConsensusConfigurationEpoch, SessionConsensusConfigurationId,
-    SessionConsensusIdentity, SessionConsensusNodeId,
+    SessionConsensusIdentity, SessionConsensusNodeId, SessionTopologyMemberBinding,
 };
 use crate::topology::{
     QuorumReplicaDescriptor, QuorumTopologyConfig, QuorumTopologyError, ReplicaId,
@@ -24,6 +24,12 @@ use crate::topology::{
 
 const TRANSITION_REQUEST_DIGEST_DOMAIN: &[u8] =
     b"openpacketcore/session-store/topology-transition-request/v1\0";
+const TRANSITION_ENDPOINT_BINDING_DOMAIN: &[u8] =
+    b"openpacketcore/session-store/topology-endpoint-binding/v1\0";
+const TRANSITION_TLS_BINDING_DOMAIN: &[u8] =
+    b"openpacketcore/session-store/topology-tls-binding/v1\0";
+const TRANSITION_BACKING_BINDING_DOMAIN: &[u8] =
+    b"openpacketcore/session-store/topology-backing-binding/v1\0";
 
 /// Maximum complete operation timeout admitted for one topology transition.
 ///
@@ -128,6 +134,12 @@ pub enum SessionTopologyTransitionError {
     /// The requested transition cannot preserve the required quorum.
     #[error("session topology transition would lose quorum")]
     QuorumLosingChange,
+    /// The desired membership is identical to the current voter set.
+    #[error("session topology transition does not change membership")]
+    NoMembershipChange,
+    /// Retained or replacement members violate cross-epoch identity bindings.
+    #[error("session topology transition member bindings are invalid")]
+    InvalidTransitionBindings,
     /// Another nonterminal transition already owns the cluster scope.
     #[error("session topology transition is already in progress")]
     TransitionInProgress,
@@ -164,6 +176,8 @@ impl SessionTopologyTransitionError {
             Self::IdempotencyConflict => "session_topology_transition_idempotency_conflict",
             Self::StaleEpoch => "session_topology_transition_stale_epoch",
             Self::QuorumLosingChange => "session_topology_transition_quorum_losing_change",
+            Self::NoMembershipChange => "session_topology_transition_no_membership_change",
+            Self::InvalidTransitionBindings => "session_topology_transition_invalid_bindings",
             Self::TransitionInProgress => "session_topology_transition_in_progress",
             Self::DeadlineExceededResumable => {
                 "session_topology_transition_deadline_exceeded_resumable"
@@ -328,12 +342,14 @@ impl SessionTopologyTransitionRequest {
             .collect()
     }
 
-    pub(crate) fn desired_node_bindings(&self) -> BTreeMap<SessionConsensusNodeId, [u8; 32]> {
+    pub(crate) fn desired_node_bindings(
+        &self,
+    ) -> BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding> {
         self.desired_members
             .iter()
             .filter_map(|descriptor| {
                 self.desired_consensus_node_id(descriptor.replica_id())
-                    .map(|node_id| (node_id, descriptor.configuration_fingerprint()))
+                    .map(|node_id| (node_id, member_binding(descriptor)))
             })
             .collect()
     }
@@ -369,6 +385,44 @@ impl SessionTopologyTransitionRequest {
     }
 }
 
+fn member_binding(descriptor: &QuorumReplicaDescriptor) -> SessionTopologyMemberBinding {
+    let mut endpoint = Sha256::new();
+    endpoint.update(TRANSITION_ENDPOINT_BINDING_DOMAIN);
+    endpoint.update(Sha256::digest(descriptor.endpoint().host().as_bytes()));
+    endpoint.update(descriptor.endpoint().port().to_be_bytes());
+
+    let mut tls_identity = Sha256::new();
+    tls_identity.update(TRANSITION_TLS_BINDING_DOMAIN);
+    tls_identity.update(Sha256::digest(
+        descriptor.tls_identity().as_str().as_bytes(),
+    ));
+
+    let mut backing_identity = Sha256::new();
+    backing_identity.update(TRANSITION_BACKING_BINDING_DOMAIN);
+    backing_identity.update(descriptor.backing_identity().fingerprint());
+
+    SessionTopologyMemberBinding::new(
+        descriptor.configuration_fingerprint(),
+        endpoint.finalize().into(),
+        tls_identity.finalize().into(),
+        backing_identity.finalize().into(),
+    )
+}
+
+pub(crate) fn topology_node_bindings(
+    topology: &ValidatedQuorumTopology,
+) -> BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding> {
+    topology
+        .members()
+        .iter()
+        .filter_map(|descriptor| {
+            topology
+                .consensus_node_id(descriptor.replica_id())
+                .map(|node_id| (node_id, member_binding(descriptor)))
+        })
+        .collect()
+}
+
 impl fmt::Debug for SessionTopologyTransitionRequest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -393,6 +447,8 @@ pub enum SessionTopologyTransitionPhase {
     Prepared,
     /// Added members are admitted only as learners and are catching up.
     LearnersCatchingUp,
+    /// Every added learner is caught up and successor voting transport is admitted.
+    LearnersReady,
     /// Removed origins are fenced from authoritative application mutations.
     AuthorityFenced,
     /// Openraft durably committed a joint old/new voter configuration.
@@ -414,6 +470,7 @@ impl SessionTopologyTransitionPhase {
         match self {
             Self::Prepared => "prepared",
             Self::LearnersCatchingUp => "learners_catching_up",
+            Self::LearnersReady => "learners_ready",
             Self::AuthorityFenced => "authority_fenced",
             Self::JointCommitted => "joint_committed",
             Self::UniformCommitted => "uniform_committed",
@@ -1034,6 +1091,57 @@ impl fmt::Debug for SessionTopologyAbortAdmissionProof {
     }
 }
 
+/// Store-issued proof that exact joint membership is durably applied.
+///
+/// Successor Vote traffic is forbidden before this token exists. Learner
+/// catch-up alone is insufficient because a higher-term Vote from a node that
+/// is not yet a committed voter can still perturb the Raft term.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SessionTopologyJointCommitAdmissionProof {
+    scope: SessionTopologyAdmissionProofScope,
+}
+
+impl SessionTopologyJointCommitAdmissionProof {
+    /// Mint proof from exact durable joint-or-later status.
+    pub(crate) fn try_from_status(
+        request: &SessionTopologyTransitionRequest,
+        status: &SessionTopologyTransitionStatus,
+    ) -> Result<Self, SessionTopologyTransitionError> {
+        SessionTopologyAdmissionProofScope::validate_status(request, status)?;
+        let phase = status.phase();
+        let committed_epoch = if phase == SessionTopologyTransitionPhase::JointCommitted {
+            request.expected_epoch
+        } else {
+            request.desired_epoch
+        };
+        if !matches!(
+            phase,
+            SessionTopologyTransitionPhase::JointCommitted
+                | SessionTopologyTransitionPhase::UniformCommitted
+                | SessionTopologyTransitionPhase::Finalizing
+                | SessionTopologyTransitionPhase::Completed
+        ) || status.evidence.committed_epoch != committed_epoch
+            || status.log_indexes().joint().is_none()
+        {
+            return Err(SessionTopologyTransitionError::InvalidEvidenceState);
+        }
+        Ok(Self {
+            scope: SessionTopologyAdmissionProofScope::from_request(request),
+        })
+    }
+}
+
+impl_admission_proof_scope!(SessionTopologyJointCommitAdmissionProof);
+
+impl fmt::Debug for SessionTopologyJointCommitAdmissionProof {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionTopologyJointCommitAdmissionProof")
+            .field("scope", &self.scope)
+            .finish()
+    }
+}
+
 /// Store-issued proof that the desired uniform membership is durably committed.
 ///
 /// The token is available for `UniformCommitted`, `Finalizing`, and terminal
@@ -1142,6 +1250,7 @@ fn log_indexes_are_valid_for_phase(
     match phase {
         SessionTopologyTransitionPhase::Prepared
         | SessionTopologyTransitionPhase::LearnersCatchingUp
+        | SessionTopologyTransitionPhase::LearnersReady
         | SessionTopologyTransitionPhase::AuthorityFenced
         | SessionTopologyTransitionPhase::Aborted => {
             indexes == SessionTopologyTransitionLogIndexes::default()

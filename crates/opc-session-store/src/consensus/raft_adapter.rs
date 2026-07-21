@@ -80,6 +80,9 @@ struct SessionRaftStagedPeers {
     desired_identity: SessionConsensusIdentity,
     desired_members: BTreeSet<SessionConsensusNodeId>,
     routes: BTreeMap<SessionConsensusNodeId, SessionRaftPeerRoute>,
+    /// Vote traffic is forbidden until the replicated learner-ready marker is
+    /// applied and every added learner proves application through that marker.
+    voting_admitted: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -219,9 +222,48 @@ impl SessionRaftPeerDirectory {
                     desired_identity,
                     desired_members,
                     routes,
+                    voting_admitted: false,
                 });
             }
         }
+        Ok(())
+    }
+
+    /// Admit staged successor Vote RPCs after durable learner catch-up proof.
+    ///
+    /// Staging alone deliberately permits only log replication and snapshot
+    /// installation. The membership coordinator calls this method only after
+    /// the replicated learner-ready marker and exact applied-index barriers
+    /// have completed for every added learner.
+    pub(crate) fn admit_staged_voting(
+        &self,
+        transition_id: SessionTopologyTransitionId,
+        request_digest: SessionTopologyTransitionDigest,
+        expected_epoch: opc_consensus::ConsensusConfigurationEpoch,
+    ) -> Result<(), SessionRaftAdapterError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| SessionRaftAdapterError::PeerDirectoryUnavailable)?;
+        if state.terminal.as_ref().is_some_and(|terminal| {
+            terminal.transition_id == transition_id
+                && terminal.request_digest == request_digest
+                && terminal.expected_epoch == expected_epoch
+                && terminal.kind == SessionRaftPeerTransitionTerminalKind::Finalized
+        }) {
+            return Ok(());
+        }
+        let staged = state
+            .staged
+            .as_mut()
+            .ok_or(SessionRaftAdapterError::PeerTransitionConflict)?;
+        if staged.transition_id != transition_id
+            || staged.request_digest != request_digest
+            || staged.expected_epoch != expected_epoch
+        {
+            return Err(SessionRaftAdapterError::PeerTransitionConflict);
+        }
+        staged.voting_admitted = true;
         Ok(())
     }
 
@@ -337,6 +379,14 @@ impl SessionRaftPeerDirectory {
         &self,
         target: SessionConsensusNodeId,
     ) -> Result<Option<SessionRaftPeerRoute>, SessionRaftAdapterError> {
+        self.resolve_engine_for(target, SessionConsensusRpcFamily::AppendEntries)
+    }
+
+    fn resolve_engine_for(
+        &self,
+        target: SessionConsensusNodeId,
+        family: SessionConsensusRpcFamily,
+    ) -> Result<Option<SessionRaftPeerRoute>, SessionRaftAdapterError> {
         let state = self
             .state
             .read()
@@ -345,6 +395,7 @@ impl SessionRaftPeerDirectory {
         let staged = state
             .staged
             .as_ref()
+            .filter(|staged| family != SessionConsensusRpcFamily::Vote || staged.voting_admitted)
             .and_then(|staged| staged.routes.get(&target));
         let route = if state.current_members.contains(&self.local_node_id) {
             active.or(staged)
@@ -360,6 +411,7 @@ impl SessionRaftPeerDirectory {
         &self,
         sender: SessionConsensusNodeId,
         identity: SessionConsensusIdentity,
+        family: SessionConsensusRpcFamily,
     ) -> bool {
         self.state.read().is_ok_and(|state| {
             state
@@ -367,9 +419,10 @@ impl SessionRaftPeerDirectory {
                 .get(&sender)
                 .is_some_and(|route| route.identity == identity && route.peer.node_id() == sender)
                 || state.staged.as_ref().is_some_and(|staged| {
-                    staged.routes.get(&sender).is_some_and(|route| {
-                        route.identity == identity && route.peer.node_id() == sender
-                    })
+                    (family != SessionConsensusRpcFamily::Vote || staged.voting_admitted)
+                        && staged.routes.get(&sender).is_some_and(|route| {
+                            route.identity == identity && route.peer.node_id() == sender
+                        })
                 })
         })
     }
@@ -383,6 +436,41 @@ impl SessionRaftPeerDirectory {
             .read()
             .map_err(|_| SessionRaftAdapterError::PeerDirectoryUnavailable)?;
         Ok((state.current_identity, state.current_members.clone()))
+    }
+
+    /// Snapshot every exact current-scope remote route for a bounded control
+    /// barrier. This is used before Prepare to prove that removed-only current
+    /// voters staged the same transition and can later fence their transport.
+    pub(crate) fn current_peers(
+        &self,
+    ) -> Result<
+        (
+            SessionConsensusIdentity,
+            BTreeMap<SessionConsensusNodeId, Arc<dyn SessionConsensusPeer>>,
+        ),
+        SessionRaftAdapterError,
+    > {
+        let state = self
+            .state
+            .read()
+            .map_err(|_| SessionRaftAdapterError::PeerDirectoryUnavailable)?;
+        let peers = state
+            .current_members
+            .iter()
+            .copied()
+            .filter(|node_id| *node_id != self.local_node_id)
+            .map(|node_id| {
+                let route = state
+                    .active
+                    .get(&node_id)
+                    .filter(|route| {
+                        route.identity == state.current_identity && route.peer.node_id() == node_id
+                    })
+                    .ok_or(SessionRaftAdapterError::DesiredPeerMissing)?;
+                Ok((node_id, Arc::clone(&route.peer)))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        Ok((state.current_identity, peers))
     }
 
     pub(crate) fn resolve_application(
@@ -672,7 +760,7 @@ impl SessionRaftNetwork {
     {
         let route = self
             .peer_directory
-            .resolve_engine(self.target)
+            .resolve_engine_for(self.target, family)
             .map_err(|_| EngineRpcError::Unreachable(Unreachable::new(&PeerDirectoryUnavailable)))?
             .ok_or_else(|| EngineRpcError::Unreachable(Unreachable::new(&MissingConsensusPeer)))?;
         let peer = route.peer;
@@ -834,12 +922,6 @@ impl SessionRaftRpcHandler {
         }
     }
 
-    fn reconcile_committed_membership(&self) -> Result<(), SessionRaftAdapterError> {
-        let metrics = self.raft.metrics();
-        let metrics = metrics.borrow();
-        self.peer_directory
-            .reconcile_committed_membership(metrics.membership_config.as_ref())
-    }
 }
 
 impl fmt::Debug for SessionRaftRpcHandler {
@@ -858,16 +940,14 @@ impl SessionConsensusRpcHandler for SessionRaftRpcHandler {
         authenticated_sender: SessionConsensusNodeId,
         request: SessionConsensusWireRequest,
     ) -> SessionConsensusWireResponse {
-        if self.reconcile_committed_membership().is_err() {
-            return rejected_response(SessionConsensusPeerError::Unavailable);
-        }
         if let Err(error) = validate_envelope(authenticated_sender, &request) {
             return rejected_response(error);
         }
-        if !self
-            .peer_directory
-            .authorizes_engine(authenticated_sender, request.identity)
-        {
+        if !self.peer_directory.authorizes_engine(
+            authenticated_sender,
+            request.identity,
+            request.family,
+        ) {
             return rejected_response(SessionConsensusPeerError::ScopeMismatch);
         }
         if !is_engine_rpc_family(request.family) {
@@ -908,12 +988,12 @@ impl SessionConsensusRpcHandler for SessionRaftRpcHandler {
             SessionConsensusRpcFamily::ForwardMutation | SessionConsensusRpcFamily::ReadBarrier => {
                 return rejected_response(SessionConsensusPeerError::Rejected);
             }
+            SessionConsensusRpcFamily::TopologyAdmissionBarrier => {
+                return rejected_response(SessionConsensusPeerError::Rejected);
+            }
             _ => return rejected_response(SessionConsensusPeerError::Rejected),
         };
 
-        if self.reconcile_committed_membership().is_err() {
-            return rejected_response(SessionConsensusPeerError::Unavailable);
-        }
         match result {
             Ok(payload) => SessionConsensusWireResponse {
                 result: Ok(payload),
@@ -1519,6 +1599,82 @@ mod tests {
     }
 
     #[test]
+    fn staged_peer_vote_is_proof_gated_in_both_directions() {
+        let local = node_id(1);
+        let added = node_id(2);
+        let current = identity(1);
+        let desired = successor_identity(current, 9);
+        let transition = transition_id(0xa1);
+        let digest = transition_digest(0xb2);
+        let peer: Arc<dyn SessionConsensusPeer> = Arc::new(ScopeCheckingPeer {
+            node_id: added,
+            expected_identity: desired,
+            response: rejected_response(SessionConsensusPeerError::Rejected),
+        });
+        let directory = SessionRaftPeerDirectory::try_new(
+            current,
+            local,
+            BTreeSet::from([local]),
+            BTreeMap::new(),
+        )
+        .expect("current directory");
+        directory
+            .stage(
+                transition,
+                digest,
+                current.configuration_epoch(),
+                desired,
+                BTreeSet::from([local, added]),
+                BTreeMap::from([(added, peer)]),
+            )
+            .expect("stage added learner");
+
+        assert!(directory
+            .resolve_engine_for(added, SessionConsensusRpcFamily::AppendEntries)
+            .expect("append route lookup")
+            .is_some());
+        assert!(directory
+            .resolve_engine_for(added, SessionConsensusRpcFamily::InstallSnapshot)
+            .expect("snapshot route lookup")
+            .is_some());
+        assert!(directory
+            .resolve_engine_for(added, SessionConsensusRpcFamily::Vote)
+            .expect("vote route lookup")
+            .is_none());
+        assert!(directory.authorizes_engine(
+            added,
+            desired,
+            SessionConsensusRpcFamily::AppendEntries
+        ));
+        assert!(directory.authorizes_engine(
+            added,
+            desired,
+            SessionConsensusRpcFamily::InstallSnapshot
+        ));
+        assert!(!directory.authorizes_engine(added, desired, SessionConsensusRpcFamily::Vote));
+        assert_eq!(
+            directory.admit_staged_voting(
+                transition_id(0xff),
+                digest,
+                current.configuration_epoch(),
+            ),
+            Err(SessionRaftAdapterError::PeerTransitionConflict)
+        );
+
+        directory
+            .admit_staged_voting(transition, digest, current.configuration_epoch())
+            .expect("exact durable proof admits voting");
+        directory
+            .admit_staged_voting(transition, digest, current.configuration_epoch())
+            .expect("exact voting admission retry is idempotent");
+        assert!(directory
+            .resolve_engine_for(added, SessionConsensusRpcFamily::Vote)
+            .expect("vote route lookup after admission")
+            .is_some());
+        assert!(directory.authorizes_engine(added, desired, SessionConsensusRpcFamily::Vote));
+    }
+
+    #[test]
     fn peer_directory_bounds_each_legal_topology_without_bounding_the_union_to_one_set() {
         let local = node_id(1);
         let current = identity(1);
@@ -1964,6 +2120,9 @@ mod tests {
         ));
         assert!(!is_engine_rpc_family(
             SessionConsensusRpcFamily::ReadBarrier
+        ));
+        assert!(!is_engine_rpc_family(
+            SessionConsensusRpcFamily::TopologyAdmissionBarrier
         ));
     }
 

@@ -95,6 +95,7 @@ impl DurableConsensusTimingProfile {
             ConsensusRpcFamily::InstallSnapshot => self.install_snapshot_timeout_millis,
             ConsensusRpcFamily::ForwardMutation => self.forward_mutation_timeout_millis,
             ConsensusRpcFamily::ReadBarrier => self.read_barrier_timeout_millis,
+            ConsensusRpcFamily::TopologyAdmissionBarrier => self.read_barrier_timeout_millis,
         })
     }
 
@@ -313,6 +314,7 @@ mod tests {
             ConsensusRpcFamily::InstallSnapshot,
             ConsensusRpcFamily::ForwardMutation,
             ConsensusRpcFamily::ReadBarrier,
+            ConsensusRpcFamily::TopologyAdmissionBarrier,
         ] {
             assert_eq!(profile.rpc_timeout(family), Duration::from_millis(10_000));
         }

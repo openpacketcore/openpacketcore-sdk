@@ -650,6 +650,43 @@ idempotent request outcomes, bounded snapshots, and watch cursors. Raw
 are rejected by the production consensus adapter; those are not alternate
 ways to establish authority.
 
+### Live topology-epoch transitions
+
+`ConsensusSessionStore` supports one bounded, sequential topology transition
+at a time. Construct a `SessionTopologyTransitionRequest` from the exact
+expected epoch and desired descriptors, bind a
+`SessionTopologyTransportAdmission`, and stage the desired peer map on every
+current member and joining candidate. Staging grants only replication,
+snapshot, and marker-barrier traffic; it grants neither application authority
+nor voting authority.
+
+`prepare_topology_transition` durably records the request, adds the exact new
+learners, and proves every desired member applied the replicated learner-ready
+marker. `commit_topology_transition` then fences application proposals, uses
+Openraft's joint-consensus membership change, admits successor Vote traffic
+only after exact joint membership is durably applied, commits the desired
+uniform configuration, retires predecessor transport admission, and commits a
+separate finalization record. A returned `Completed` status therefore cannot
+be inferred from an in-memory route change or an uncommitted membership view.
+
+Dropping or timing out either future never means rollback. The caller retries
+the same request ID/digest and consults `topology_transition_status`; accepted
+Openraft work retains the exclusive proposal-drain guard until its actual
+terminal result. `abort_topology_transition` is explicit and succeeds only
+before joint membership can have committed. It removes added learners and
+verifies the exact old uniform membership before recording durable abort.
+After joint commit, recovery always resumes forward.
+
+The SQLite database keeps one immutable storage/genesis identity while the
+active application authority advances by exact configuration epoch. Transition
+evidence stores fixed-width digests, counts, phases, outcomes, and log indexes;
+it never stores raw endpoints, TLS identities, backing identities, session
+payloads, or key material. Payload sealing and HKMS remain outside Openraft as
+described below. A process's original topology-attestation summary is not
+silently reinterpreted as evidence for new descriptors: production readiness
+remains closed until the desired epoch is reopened or explicitly supplied with
+fresh exact topology evidence.
+
 Each node uses the shared fixed eight-slot proposal admission pool. Normal
 mutations and finite-expiry logical-time-floor proposals acquire from that same
 pool within the operation's existing absolute deadline. After

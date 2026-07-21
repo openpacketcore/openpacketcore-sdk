@@ -58,6 +58,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   repeatedly interrupted replies remain fail-closed (#436).
 
 ### Added
+- **Epoch-bound live session-consensus membership — `opc-session-store`,
+  `opc-session-net`:** adds restart-safe, idempotent 3→5→3 topology transitions
+  with exact descriptor binding, learner catch-up markers, joint-consensus
+  sequencing, pre-joint explicit abort, forward-only post-joint recovery,
+  replicated application-authority fencing, and redaction-safe durable
+  evidence. Successor transport admits replication before joint commit but
+  keeps Vote and application traffic closed until their distinct committed
+  authority proofs (#353).
 - **Redaction-safe SWm ASR/RAR replay comparison — `opc-proto-diameter`:**
   `SwmAbortSessionRequestEnvelope` and `SwmReAuthRequestEnvelope` now compare
   complete immutable request payloads while excluding only Hop-by-Hop, T-bit,

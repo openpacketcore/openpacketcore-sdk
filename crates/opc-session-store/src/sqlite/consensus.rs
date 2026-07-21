@@ -1979,6 +1979,14 @@ fn execute_intent_sync(
                 "operator_recovery_epoch_rejected".into(),
             )),
         },
+        SessionMutationIntent::PrepareTopologyTransition { .. }
+        | SessionMutationIntent::MarkTopologyLearnersReady { .. }
+        | SessionMutationIntent::FenceTopologyAuthority { .. }
+        | SessionMutationIntent::AbortTopologyTransition { .. }
+        | SessionMutationIntent::FinalizeTopologyTransition { .. }
+        | SessionMutationIntent::Authorized { .. } => Err(StoreError::BackendUnavailable(
+            "session topology transition storage is unavailable".into(),
+        )),
     }
 }
 

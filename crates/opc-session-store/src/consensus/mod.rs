@@ -19,7 +19,8 @@ pub use network::{
 pub(crate) use store::OperatorRecoveryCommitError;
 pub use store::{
     ConsensusSessionStore, ConsensusSessionStoreOpenError, SessionConsensusStatus,
-    DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
+    SessionTopologyTransportAdmission, SessionTopologyTransportAdmissionError,
+    SessionTopologyTransitionPeers, DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
 };
 
 pub use types::{
@@ -27,7 +28,8 @@ pub use types::{
     SessionConsensusConfigurationId, SessionConsensusEntryDigest, SessionConsensusIdentity,
     SessionConsensusIdentityError, SessionConsensusNodeId, SessionConsensusRequestId,
     SessionConsensusResponse, SessionConsensusRpc, SessionMutationIntent, SessionMutationOutcome,
-    SESSION_CONSENSUS_CLUSTER_ID_MAX_BYTES, SESSION_CONSENSUS_SCHEMA_VERSION,
+    SessionTopologyMemberBinding, SESSION_CONSENSUS_CLUSTER_ID_MAX_BYTES,
+    SESSION_CONSENSUS_SCHEMA_VERSION,
 };
 
 opc_consensus::engine::declare_raft_types!(

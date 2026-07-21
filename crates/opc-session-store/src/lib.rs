@@ -84,7 +84,9 @@ pub use consensus::{
     SessionConsensusRequestId, SessionConsensusResponse, SessionConsensusRpc,
     SessionConsensusRpcFamily, SessionConsensusRpcHandler, SessionConsensusStatus,
     SessionConsensusWireRequest, SessionConsensusWireResponse, SessionMutationIntent,
-    SessionMutationOutcome, DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
+    SessionMutationOutcome, SessionTopologyTransportAdmission,
+    SessionTopologyTransportAdmissionError, SessionTopologyTransitionPeers,
+    DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
     SESSION_CONSENSUS_CLUSTER_ID_MAX_BYTES, SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES,
     SESSION_CONSENSUS_SCHEMA_VERSION,
 };
@@ -97,8 +99,9 @@ pub use handover::{
 };
 pub use lease::{LeaseGuard, SessionLeaseManager};
 pub use membership::{
-    SessionTopologyAbortAdmissionProof, SessionTopologyLearnersReadyAdmissionProof,
-    SessionTopologyTransitionDigest, SessionTopologyTransitionError,
+    SessionTopologyAbortAdmissionProof, SessionTopologyJointCommitAdmissionProof,
+    SessionTopologyLearnersReadyAdmissionProof, SessionTopologyTransitionDigest,
+    SessionTopologyTransitionError,
     SessionTopologyTransitionEvidence, SessionTopologyTransitionId,
     SessionTopologyTransitionLogIndexes, SessionTopologyTransitionOutcome,
     SessionTopologyTransitionPhase, SessionTopologyTransitionReason,
