@@ -330,6 +330,19 @@ impl SessionReplicationManifest {
     fn member(&self, replica_id: &ReplicaId) -> Option<&ManifestMember> {
         self.members.get(replica_id)
     }
+
+    pub(crate) fn member_spiffe_id(&self, replica_id: &ReplicaId) -> Option<&SpiffeId> {
+        self.member(replica_id).map(|member| &member.spiffe_id)
+    }
+
+    pub(crate) fn retained_member_bindings_match(&self, successor: &Self) -> bool {
+        self.members.iter().all(|(replica_id, current)| {
+            successor.member(replica_id).is_none_or(|next| {
+                current.descriptor.configuration_fingerprint()
+                    == next.descriptor.configuration_fingerprint()
+            })
+        })
+    }
 }
 
 impl fmt::Debug for SessionReplicationManifest {
@@ -351,6 +364,10 @@ pub struct LocalReplicaBinding {
 }
 
 impl LocalReplicaBinding {
+    pub(crate) fn manifest(&self) -> &Arc<SessionReplicationManifest> {
+        &self.manifest
+    }
+
     pub fn local_replica_id(&self) -> &ReplicaId {
         &self.local_replica_id
     }

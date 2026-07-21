@@ -12,6 +12,10 @@
 //! replica IDs and manifest scope to the canonical SPIFFE identities extracted
 //! from the live mutual-TLS connection, and prove the exact same
 //! [`SessionConsensusContractProfile`] before an operation is dispatched.
+//! [`SessionMembershipAdmission`] may additionally stage one exact validated
+//! successor for Raft catch-up. It revalidates every request and atomically
+//! removes stale scopes on finalize or abort; existing immutable bindings and
+//! constructors retain their single-manifest behavior.
 //!
 //! Every authenticated direct and consensus connection also has one finite
 //! [`ConnectionLifecyclePolicy`]. The transport records the completed
@@ -39,6 +43,7 @@ pub mod consensus;
 pub mod error;
 pub mod identity;
 mod lifecycle;
+pub mod membership;
 #[cfg(not(feature = "legacy-session-net-compat"))]
 mod protocol;
 #[cfg(feature = "legacy-session-net-compat")]
@@ -64,6 +69,11 @@ pub use lifecycle::{
     ConnectionLifecycleError, ConnectionLifecyclePolicy, SessionReauthenticationControl,
     DEFAULT_MAX_AUTHENTICATION_AGE, DEFAULT_RECONNECT_BACKOFF_MAX, DEFAULT_RECONNECT_BACKOFF_MIN,
     DEFAULT_ROTATION_DRAIN_WINDOW, DEFAULT_ROTATION_JITTER,
+};
+pub use membership::{
+    SessionMembershipAdmission, SessionMembershipAdmissionError,
+    SessionMembershipAdmissionSnapshot, SessionMembershipTransitionResult,
+    SessionTopologyTransitionId,
 };
 pub use opc_consensus::{
     ConsensusClusterId, ConsensusConfigurationEpoch, ConsensusConfigurationId, ConsensusIdentity,

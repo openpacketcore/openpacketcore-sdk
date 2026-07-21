@@ -8,8 +8,10 @@ session-backend networking is retained only as an opt-in migration surface.
 The default crate surface exposes `RemoteSessionConsensusPeer` and
 `SessionConsensusServer`. It does not expose a client, listener, or public wire
 DTO capable of direct session mutation, raw replication-log append, or rebuild.
-Every production connection is bound to one authenticated member of one
-immutable replication manifest.
+Every production connection is bound to one authenticated member of an exact
+immutable replication manifest. A bounded membership-transition admission
+object can temporarily admit one validated successor manifest for Raft engine
+catch-up without granting that successor consumer mutation/read authority.
 
 ## Consensus production profile
 
@@ -108,6 +110,31 @@ older peers fail before dispatch;
 upgrade every consensus member together while traffic and writers are drained.
 This is not a rolling mixed-profile transition.
 
+`SessionMembershipAdmission` provides the transport boundary for one
+`SessionTopologyTransitionRequest`. Staging requires the request's exact
+cluster, next epoch, configuration digest, and member count to match the
+successor manifest. A retained logical replica must keep its complete endpoint,
+SPIFFE, failure-domain, and backing binding; replacing one requires a distinct
+replica identity. While staged, current-manifest connections retain the
+normal RPC surface; successor-manifest connections initially may send only
+Raft `AppendEntries` and `InstallSnapshot` traffic needed to join and catch up.
+The coordinator explicitly calls `admit_successor_voting_after_catch_up` after
+verifying learner progress before successor-scoped `Vote` RPCs are admitted.
+`ForwardMutation` and `ReadBarrier` remain current-authority-only.
+Finalization takes an exclusive admission lease, waits for already-admitted
+handler calls to finish, and then removes the old identity atomically. Every
+request on an existing connection is revalidated, so a cached old connection
+cannot dispatch after finalization returns. A pre-commit abort removes the
+successor instead. Only one successor and one fixed-width completed-operation
+record are retained, so repeated or hostile staging cannot grow memory.
+
+Transport admission does not decide when an Openraft joint or uniform
+configuration is committed. The session-store coordinator owns that order and
+must finalize transport admission only after the new committed authority is
+durable. Application commands embedded inside Raft log entries still require
+the session-store's replicated origin/epoch fence; transport admission is not
+a substitute for that deterministic state-machine check.
+
 The consensus profile accepts encoded frame budgets from 9 MiB through 16 MiB.
 The 9 MiB minimum is proven to hold the worst JSON expansion of the shared
 2 MiB opaque RPC ceiling plus its bounded envelope. Private Openraft RPCs are
@@ -138,6 +165,17 @@ mutation or rebuild authority beside Openraft.
 - `SessionConsensusServer::new` accepts only an
   `Arc<dyn SessionConsensusRpcHandler>` and serves only the dedicated consensus
   ALPN.
+- `SessionMembershipAdmission::new` and
+  `SessionConsensusServer::new_with_membership_admission` enable one bounded
+  current-to-successor admission window. `stage_successor` consumes the shared
+  validated `SessionTopologyTransitionRequest`;
+  `admit_successor_voting_after_catch_up`, `finalize_successor`, and
+  `abort_successor` require and idempotently bind both its transition ID and
+  deterministic request digest. Existing single-manifest server constructors
+  wrap the immutable binding unchanged.
+- `RemoteSessionConsensusPeer::consensus_identity` and
+  `local_consensus_node_id` expose redaction-safe exact binding evidence for a
+  dynamic peer directory. A node ID alone is not sufficient staging proof.
 
 ### Legacy compatibility API (`legacy-session-net-compat` only)
 
