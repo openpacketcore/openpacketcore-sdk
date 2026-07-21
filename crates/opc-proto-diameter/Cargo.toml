@@ -68,5 +68,10 @@ name = "swm_public_lifecycle"
 path = "tests/swm_public_lifecycle.rs"
 required-features = ["app-swm"]
 
+[[test]]
+name = "swm_diameter_eap_overload"
+path = "tests/swm_diameter_eap_overload.rs"
+required-features = ["app-swm"]
+
 [lints]
 workspace = true

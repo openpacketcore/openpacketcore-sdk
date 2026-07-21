@@ -54,32 +54,380 @@ pub const AVP_LOAD_TYPE: AvpCode = AvpCode::new(651);
 /// Load-Value AVP code (RFC 8583 section 7.3).
 pub const AVP_LOAD_VALUE: AvpCode = AvpCode::new(652);
 
-const OC_DEFAULT_ALGORITHM: u64 = 1;
+/// RFC 7683 loss-abatement algorithm bit.
+pub const SWM_OC_LOSS_ALGORITHM: u64 = 1;
+const OC_VALIDITY_DURATION_MAX: u32 = 86_400;
 const LOAD_VALUE_MAX: u64 = 65_535;
 const RESULT_CODE_DIAMETER_REDIRECT_INDICATION: u32 = 3006;
 
+/// Stable reason code returned by typed SWm overload constructors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct OcSupportedFeatures {
-    feature_vector: Option<u64>,
+#[non_exhaustive]
+pub enum SwmOverloadControlErrorCode {
+    /// OC-Validity-Duration exceeds the RFC 7683 originated-value limit.
+    ValidityDurationOutOfRange,
+    /// OC-Reduction-Percentage exceeds 100 percent.
+    ReductionPercentageOutOfRange,
+    /// SourceID is not a nonempty ASCII DiameterIdentity.
+    InvalidSourceId,
 }
 
-impl OcSupportedFeatures {
-    const fn effective_vector(self) -> u64 {
-        match self.feature_vector {
-            Some(value) => value,
-            None => OC_DEFAULT_ALGORITHM,
+/// Redaction-safe typed SWm overload model construction failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SwmOverloadControlError {
+    code: SwmOverloadControlErrorCode,
+}
+
+impl SwmOverloadControlError {
+    const fn new(code: SwmOverloadControlErrorCode) -> Self {
+        Self { code }
+    }
+
+    /// Return the stable machine-readable failure code.
+    pub const fn code(&self) -> SwmOverloadControlErrorCode {
+        self.code
+    }
+}
+
+impl fmt::Display for SwmOverloadControlError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self.code {
+            SwmOverloadControlErrorCode::ValidityDurationOutOfRange => {
+                "OC-Validity-Duration exceeds the supported range"
+            }
+            SwmOverloadControlErrorCode::ReductionPercentageOutOfRange => {
+                "OC-Reduction-Percentage exceeds 100"
+            }
+            SwmOverloadControlErrorCode::InvalidSourceId => {
+                "SourceID must be a nonempty ASCII DiameterIdentity"
+            }
+        };
+        f.write_str(message)
+    }
+}
+
+impl Error for SwmOverloadControlError {}
+
+/// Typed RFC 7683 overload-control capability or algorithm selection.
+///
+/// An absent OC-Feature-Vector selects the RFC 7683 default loss algorithm.
+/// The SDK currently originates only that algorithm, while decoded request
+/// values retain nonzero extension bits for capability inspection. RFC 8581's
+/// peer-overload extension is preserved only as unknown optional grouped data;
+/// it is not an executable selection in this baseline profile.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SwmOcSupportedFeatures {
+    feature_vector: Option<u64>,
+    additional_avps: Vec<SwmAdditionalAvp>,
+}
+
+impl SwmOcSupportedFeatures {
+    /// Construct the canonical default loss-algorithm representation.
+    pub const fn loss() -> Self {
+        Self {
+            feature_vector: None,
+            additional_avps: Vec::new(),
         }
     }
 
-    const fn selects_default_algorithm(self) -> bool {
-        self.effective_vector() & OC_DEFAULT_ALGORITHM != 0
+    /// Construct an explicit default loss-algorithm vector.
+    pub const fn explicit_loss() -> Self {
+        Self {
+            feature_vector: Some(SWM_OC_LOSS_ALGORITHM),
+            additional_avps: Vec::new(),
+        }
+    }
+
+    /// Return the explicitly encoded vector, or `None` for the default.
+    pub const fn feature_vector(&self) -> Option<u64> {
+        self.feature_vector
+    }
+
+    /// Return the effective feature vector after applying RFC 7683 defaults.
+    pub const fn effective_feature_vector(&self) -> u64 {
+        match self.feature_vector {
+            Some(value) => value,
+            None => SWM_OC_LOSS_ALGORITHM,
+        }
+    }
+
+    /// Return whether the default loss-abatement algorithm is selected.
+    pub const fn selects_loss(&self) -> bool {
+        self.effective_feature_vector() & SWM_OC_LOSS_ALGORITHM != 0
+    }
+
+    /// Return the number of preserved unknown optional grouped children.
+    pub fn extension_count(&self) -> usize {
+        self.additional_avps.len()
     }
 }
 
+impl fmt::Debug for SwmOcSupportedFeatures {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SwmOcSupportedFeatures")
+            .field("feature_vector_present", &self.feature_vector.is_some())
+            .field("selects_loss", &self.selects_loss())
+            .field("extension_count", &self.additional_avps.len())
+            .finish()
+    }
+}
+
+/// Scope of an RFC 7683 overload report.
+///
+/// RFC 8581's later peer report type is intentionally outside this baseline
+/// loss profile and is rejected as an unsupported Enumerated value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct OcOlrFacts {
+#[non_exhaustive]
+pub enum SwmOcReportType {
+    /// The report applies to the Diameter host identified by Origin-Host.
+    Host,
+    /// The report applies to the Diameter realm identified by Origin-Realm.
+    Realm,
+}
+
+impl SwmOcReportType {
+    /// Return the RFC 7683 Enumerated value.
+    pub const fn value(self) -> u32 {
+        match self {
+            Self::Host => 0,
+            Self::Realm => 1,
+        }
+    }
+
+    const fn from_value(value: u32) -> Option<Self> {
+        match value {
+            0 => Some(Self::Host),
+            1 => Some(Self::Realm),
+            _ => None,
+        }
+    }
+}
+
+/// Typed RFC 7683 overload report carried in a SWm answer.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SwmOcOlr {
+    sequence_number: u64,
+    report_type: SwmOcReportType,
     validity_duration: Option<u32>,
     reduction_percentage: Option<u32>,
+    additional_avps: Vec<SwmAdditionalAvp>,
+}
+
+impl SwmOcOlr {
+    /// Construct an originated RFC 7683 loss-algorithm overload report.
+    pub fn new_loss(
+        sequence_number: u64,
+        report_type: SwmOcReportType,
+        validity_duration: Option<u32>,
+        reduction_percentage: u8,
+    ) -> Result<Self, SwmOverloadControlError> {
+        if matches!(validity_duration, Some(value) if value > OC_VALIDITY_DURATION_MAX) {
+            return Err(SwmOverloadControlError::new(
+                SwmOverloadControlErrorCode::ValidityDurationOutOfRange,
+            ));
+        }
+        if reduction_percentage > 100 {
+            return Err(SwmOverloadControlError::new(
+                SwmOverloadControlErrorCode::ReductionPercentageOutOfRange,
+            ));
+        }
+        Ok(Self {
+            sequence_number,
+            report_type,
+            validity_duration,
+            reduction_percentage: Some(u32::from(reduction_percentage)),
+            additional_avps: Vec::new(),
+        })
+    }
+
+    /// Return the monotonically changing reporting-node sequence number.
+    pub const fn sequence_number(&self) -> u64 {
+        self.sequence_number
+    }
+
+    /// Return the host or realm report scope.
+    pub const fn report_type(&self) -> SwmOcReportType {
+        self.report_type
+    }
+
+    /// Return the exact optional validity duration received on the wire.
+    ///
+    /// Consumers applying overload state should prefer
+    /// [`Self::effective_validity_duration`].
+    pub const fn wire_validity_duration(&self) -> Option<u32> {
+        self.validity_duration
+    }
+
+    /// Return the RFC 7683 validity duration after applying its 30-second
+    /// default to absent and out-of-range received values.
+    pub const fn effective_validity_duration(&self) -> u32 {
+        match self.validity_duration {
+            Some(value) if value <= OC_VALIDITY_DURATION_MAX => value,
+            _ => 30,
+        }
+    }
+
+    /// Return the exact optional reduction percentage received on the wire.
+    ///
+    /// Consumers applying overload state should prefer
+    /// [`Self::effective_reduction_percentage`].
+    pub const fn wire_reduction_percentage(&self) -> Option<u32> {
+        self.reduction_percentage
+    }
+
+    /// Return a usable reduction percentage, ignoring values above 100 as
+    /// required by RFC 7683.
+    pub const fn effective_reduction_percentage(&self) -> Option<u8> {
+        match self.reduction_percentage {
+            Some(value) if value <= 100 => Some(value as u8),
+            _ => None,
+        }
+    }
+
+    /// Return the number of preserved unknown optional grouped children.
+    pub fn extension_count(&self) -> usize {
+        self.additional_avps.len()
+    }
+}
+
+impl fmt::Debug for SwmOcOlr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SwmOcOlr")
+            .field("sequence_number", &self.sequence_number)
+            .field("report_type", &self.report_type)
+            .field("wire_validity_duration", &self.validity_duration)
+            .field("wire_reduction_percentage", &self.reduction_percentage)
+            .field("extension_count", &self.additional_avps.len())
+            .finish()
+    }
+}
+
+/// Origin of an RFC 8583 Diameter load report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SwmLoadType {
+    /// Load reported for an endpoint host.
+    Host,
+    /// Load reported by the immediate peer Diameter agent.
+    Peer,
+}
+
+impl SwmLoadType {
+    /// Return the RFC 8583 Enumerated value.
+    pub const fn value(self) -> u32 {
+        match self {
+            Self::Host => 0,
+            Self::Peer => 1,
+        }
+    }
+
+    const fn from_value(value: u32) -> Option<Self> {
+        match value {
+            0 => Some(Self::Host),
+            1 => Some(Self::Peer),
+            _ => None,
+        }
+    }
+}
+
+/// Typed RFC 8583 Diameter load report.
+///
+/// Decoding preserves syntactically valid legacy reports that omit one of the
+/// optional grouped children. Newly originated reports constructed with
+/// [`Self::new`] always contain the complete RFC 8583 reporting-node tuple.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SwmLoad {
+    load_type: Option<SwmLoadType>,
+    load_value: Option<u16>,
+    source_id: Option<Redacted<String>>,
+    additional_avps: Vec<SwmAdditionalAvp>,
+}
+
+impl SwmLoad {
+    /// Construct a complete originated load report.
+    pub fn new(
+        load_type: SwmLoadType,
+        load_value: u16,
+        source_id: impl Into<Redacted<String>>,
+    ) -> Result<Self, SwmOverloadControlError> {
+        let source_id = source_id.into();
+        if source_id.as_ref().is_empty() || !source_id.as_ref().is_ascii() {
+            return Err(SwmOverloadControlError::new(
+                SwmOverloadControlErrorCode::InvalidSourceId,
+            ));
+        }
+        Ok(Self {
+            load_type: Some(load_type),
+            load_value: Some(load_value),
+            source_id: Some(source_id),
+            additional_avps: Vec::new(),
+        })
+    }
+
+    /// Return the report type when present on the wire.
+    pub const fn load_type(&self) -> Option<SwmLoadType> {
+        self.load_type
+    }
+
+    /// Return the RFC 8583 inverse-load value when present.
+    pub const fn load_value(&self) -> Option<u16> {
+        self.load_value
+    }
+
+    /// Return the reporting Diameter identity when present.
+    pub fn source_id(&self) -> Option<&str> {
+        self.source_id
+            .as_ref()
+            .map(|source_id| source_id.as_ref().as_str())
+    }
+
+    /// Return the complete report tuple, or `None` when a valid received
+    /// grouped AVP omitted one of its optional children.
+    ///
+    /// Completeness alone does not authenticate a `PEER` report. Consumers
+    /// making routing decisions should use [`Self::actionable_for_peer`].
+    pub fn complete_tuple(&self) -> Option<(SwmLoadType, u16, &str)> {
+        Some((self.load_type?, self.load_value?, self.source_id()?))
+    }
+
+    /// Return a report that is safe to apply for an authenticated Diameter
+    /// transport peer.
+    ///
+    /// RFC 8583 requires a `PEER` report's SourceID to equal the identity of
+    /// the peer that sent or relayed the answer. DiameterIdentity comparison is
+    /// ASCII case-insensitive. `HOST` reports are returned unchanged because
+    /// their SourceID identifies the selected endpoint, not necessarily the
+    /// immediate transport peer.
+    pub fn actionable_for_peer(
+        &self,
+        authenticated_peer_id: &str,
+    ) -> Option<(SwmLoadType, u16, &str)> {
+        let report = self.complete_tuple()?;
+        if report.0 == SwmLoadType::Peer && !report.2.eq_ignore_ascii_case(authenticated_peer_id) {
+            return None;
+        }
+        Some(report)
+    }
+
+    /// Return the number of preserved unknown optional grouped children.
+    pub fn extension_count(&self) -> usize {
+        self.additional_avps.len()
+    }
+
+    const fn complete(&self) -> bool {
+        self.load_type.is_some() && self.load_value.is_some() && self.source_id.is_some()
+    }
+}
+
+impl fmt::Debug for SwmLoad {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SwmLoad")
+            .field("load_type", &self.load_type)
+            .field("load_value", &self.load_value)
+            .field("source_id", &self.source_id)
+            .field("extension_count", &self.additional_avps.len())
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3728,7 +4076,7 @@ fn validate_known_value(
             let features = parse_oc_supported_features(avp, ctx, value_offset, role)?;
             if purpose == ValueValidationPurpose::Encode
                 && role.is_request()
-                && features.effective_vector() != OC_DEFAULT_ALGORITHM
+                && features.effective_feature_vector() != SWM_OC_LOSS_ALGORITHM
             {
                 return Err(forbidden_rfc_error(
                     value_offset,
@@ -3746,7 +4094,9 @@ fn validate_known_value(
             }
             Ok(())
         }
-        key if key == AvpKey::ietf(AVP_LOAD) => validate_load(avp, ctx, value_offset, purpose),
+        key if key == AvpKey::ietf(AVP_LOAD) => {
+            parse_load(avp, ctx, value_offset, purpose).map(|_| ())
+        }
         key if key == AvpKey::ietf(base::AVP_EXPERIMENTAL_RESULT) => {
             if purpose == ValueValidationPurpose::Encode {
                 return Err(forbidden_error_at(
@@ -3895,8 +4245,9 @@ fn parse_oc_supported_features(
     ctx: DecodeContext,
     value_offset: usize,
     role: LifecycleRole,
-) -> Result<OcSupportedFeatures, DecodeError> {
+) -> Result<SwmOcSupportedFeatures, DecodeError> {
     let mut feature_vector = None;
+    let mut additional_avps = Vec::new();
     builder_helpers::for_each_avp(avp.value, ctx, value_offset, 1, |offset, child| {
         let child_value_offset =
             builder_helpers::offset_add(offset, child.header.header_len(), "RFC7683-7.1")?;
@@ -3906,7 +4257,7 @@ fn parse_oc_supported_features(
                 builder_helpers::parse_u64_value(child.value, child_value_offset, "RFC7683-7.2")?;
             builder_helpers::set_once(&mut feature_vector, value, offset, "RFC7683-7.1")?;
         } else {
-            builder_helpers::handle_unknown_avp(ctx, &child, offset, "RFC7683-7.1")?;
+            retain_unknown_grouped_child(&mut additional_avps, &child, ctx, offset, "RFC7683-7.1")?;
         }
         Ok(())
     })?;
@@ -3923,7 +4274,7 @@ fn parse_oc_supported_features(
             .with_spec_ref(SpecRef::new("ietf", "RFC7683", "7.2")));
         }
         match role {
-            role if role.is_request() && value & OC_DEFAULT_ALGORITHM == 0 => {
+            role if role.is_request() && value & SWM_OC_LOSS_ALGORITHM == 0 => {
                 return Err(forbidden_rfc_error(
                     value_offset,
                     "request OC-Feature-Vector must advertise the loss algorithm",
@@ -3931,7 +4282,7 @@ fn parse_oc_supported_features(
                     "5.1.1",
                 ));
             }
-            role if role.is_answer() && value != OC_DEFAULT_ALGORITHM => {
+            role if role.is_answer() && value != SWM_OC_LOSS_ALGORITHM => {
                 return Err(forbidden_rfc_error(
                     value_offset,
                     "typed SWm lifecycle answers support only the RFC 7683 loss algorithm",
@@ -3943,18 +4294,22 @@ fn parse_oc_supported_features(
         }
     }
 
-    Ok(OcSupportedFeatures { feature_vector })
+    Ok(SwmOcSupportedFeatures {
+        feature_vector,
+        additional_avps,
+    })
 }
 
 fn parse_oc_olr(
     avp: &RawAvp<'_>,
     ctx: DecodeContext,
     value_offset: usize,
-) -> Result<OcOlrFacts, DecodeError> {
+) -> Result<SwmOcOlr, DecodeError> {
     let mut sequence_number = None;
     let mut validity_duration = None;
     let mut report_type = None;
     let mut reduction_percentage = None;
+    let mut additional_avps = Vec::new();
     builder_helpers::for_each_avp(avp.value, ctx, value_offset, 1, |offset, child| {
         let child_value_offset =
             builder_helpers::offset_add(offset, child.header.header_len(), "RFC7683-7.3")?;
@@ -3990,32 +4345,45 @@ fn parse_oc_olr(
                 builder_helpers::parse_u32_value(child.value, child_value_offset, "RFC7683-7.7")?;
             builder_helpers::set_once(&mut reduction_percentage, value, offset, "RFC7683-7.3")?;
         } else {
-            builder_helpers::handle_unknown_avp(ctx, &child, offset, "RFC7683-7.3")?;
+            retain_unknown_grouped_child(&mut additional_avps, &child, ctx, offset, "RFC7683-7.3")?;
         }
         Ok(())
     })?;
 
-    require_grouped_field(
+    let sequence_number = require_grouped_field(
         sequence_number,
         value_offset,
         "OC-OLR requires OC-Sequence-Number",
         "RFC7683",
         "7.3",
     )?;
-    require_grouped_field(
+    let report_type = require_grouped_field(
         report_type,
         value_offset,
         "OC-OLR requires OC-Report-Type",
         "RFC7683",
         "7.3",
     )?;
-    Ok(OcOlrFacts {
+    let report_type = SwmOcReportType::from_value(report_type).ok_or_else(|| {
+        DecodeError::new(
+            DecodeErrorCode::InvalidEnumValue {
+                field: "OC-Report-Type",
+                value: u64::from(report_type),
+            },
+            value_offset,
+        )
+        .with_spec_ref(SpecRef::new("ietf", "RFC7683", "7.6"))
+    })?;
+    Ok(SwmOcOlr {
+        sequence_number,
+        report_type,
         validity_duration,
         reduction_percentage,
+        additional_avps,
     })
 }
 
-fn validate_originated_oc_olr_values(facts: OcOlrFacts, offset: usize) -> Result<(), DecodeError> {
+fn validate_originated_oc_olr_values(facts: SwmOcOlr, offset: usize) -> Result<(), DecodeError> {
     if facts.validity_duration.is_some_and(|value| value > 86_400) {
         return Err(forbidden_rfc_error(
             offset,
@@ -4035,15 +4403,16 @@ fn validate_originated_oc_olr_values(facts: OcOlrFacts, offset: usize) -> Result
     Ok(())
 }
 
-fn validate_load(
+fn parse_load(
     avp: &RawAvp<'_>,
     ctx: DecodeContext,
     value_offset: usize,
     purpose: ValueValidationPurpose,
-) -> Result<(), DecodeError> {
+) -> Result<SwmLoad, DecodeError> {
     let mut load_type = None;
     let mut load_value = None;
     let mut source_id = None;
+    let mut additional_avps = Vec::new();
     builder_helpers::for_each_avp(avp.value, ctx, value_offset, 1, |offset, child| {
         let child_value_offset =
             builder_helpers::offset_add(offset, child.header.header_len(), "RFC8583-7.1")?;
@@ -4052,17 +4421,17 @@ fn validate_load(
             validate_known_child(&child, offset, child_value_offset, ctx, "RFC8583-7.2")?;
             let value =
                 builder_helpers::parse_u32_value(child.value, child_value_offset, "RFC8583-7.2")?;
-            if value > 1 {
-                return Err(DecodeError::new(
+            let parsed_load_type = SwmLoadType::from_value(value).ok_or_else(|| {
+                DecodeError::new(
                     DecodeErrorCode::InvalidEnumValue {
                         field: "Load-Type",
                         value: u64::from(value),
                     },
                     child_value_offset,
                 )
-                .with_spec_ref(SpecRef::new("ietf", "RFC8583", "7.2")));
-            }
-            builder_helpers::set_once(&mut load_type, value, offset, "RFC8583-7.1")?;
+                .with_spec_ref(SpecRef::new("ietf", "RFC8583", "7.2"))
+            })?;
+            builder_helpers::set_once(&mut load_type, parsed_load_type, offset, "RFC8583-7.1")?;
         } else if key == AvpKey::ietf(AVP_LOAD_VALUE) {
             validate_known_child(&child, offset, child_value_offset, ctx, "RFC8583-7.3")?;
             let value =
@@ -4077,40 +4446,298 @@ fn validate_load(
                 )
                 .with_spec_ref(SpecRef::new("ietf", "RFC8583", "7.3")));
             }
-            builder_helpers::set_once(&mut load_value, value, offset, "RFC8583-7.1")?;
+            let parsed_load_value = u16::try_from(value).map_err(|_| {
+                DecodeError::new(
+                    DecodeErrorCode::InvalidEnumValue {
+                        field: "Load-Value",
+                        value,
+                    },
+                    child_value_offset,
+                )
+                .with_spec_ref(SpecRef::new("ietf", "RFC8583", "7.3"))
+            })?;
+            builder_helpers::set_once(&mut load_value, parsed_load_value, offset, "RFC8583-7.1")?;
         } else if key == AvpKey::ietf(AVP_SOURCE_ID) {
             validate_known_child(&child, offset, child_value_offset, ctx, "RFC8581-7.3")?;
-            builder_helpers::set_once(&mut source_id, (), offset, "RFC8583-7.1")?;
+            let value = builder_helpers::parse_string_value(
+                child.value,
+                child_value_offset,
+                "RFC8581-7.3",
+            )?;
+            builder_helpers::set_once(
+                &mut source_id,
+                Redacted::from(value),
+                offset,
+                "RFC8583-7.1",
+            )?;
         } else {
-            builder_helpers::handle_unknown_avp(ctx, &child, offset, "RFC8583-7.1")?;
+            retain_unknown_grouped_child(&mut additional_avps, &child, ctx, offset, "RFC8583-7.1")?;
         }
         Ok(())
     })?;
 
     if purpose == ValueValidationPurpose::Encode {
-        require_grouped_field(
-            load_type,
-            value_offset,
-            "originated Load requires Load-Type",
-            "RFC8583",
-            "6.1",
-        )?;
-        require_grouped_field(
-            load_value,
-            value_offset,
-            "originated Load requires Load-Value",
-            "RFC8583",
-            "6.1",
-        )?;
-        require_grouped_field(
-            source_id,
-            value_offset,
-            "originated Load requires SourceID",
-            "RFC8583",
-            "6.1",
+        if load_type.is_none() {
+            return Err(forbidden_rfc_error(
+                value_offset,
+                "originated Load requires Load-Type",
+                "RFC8583",
+                "6.1",
+            ));
+        }
+        if load_value.is_none() {
+            return Err(forbidden_rfc_error(
+                value_offset,
+                "originated Load requires Load-Value",
+                "RFC8583",
+                "6.1",
+            ));
+        }
+        if source_id.is_none() {
+            return Err(forbidden_rfc_error(
+                value_offset,
+                "originated Load requires SourceID",
+                "RFC8583",
+                "6.1",
+            ));
+        }
+    }
+    Ok(SwmLoad {
+        load_type,
+        load_value,
+        source_id,
+        additional_avps,
+    })
+}
+
+fn retain_unknown_grouped_child(
+    retained: &mut Vec<SwmAdditionalAvp>,
+    child: &RawAvp<'_>,
+    ctx: DecodeContext,
+    offset: usize,
+    section: &'static str,
+) -> Result<(), DecodeError> {
+    builder_helpers::handle_unknown_avp(ctx, child, offset, section)?;
+    if ctx.unknown_ie_policy != UnknownIePolicy::Preserve {
+        return Ok(());
+    }
+    if retained.len() >= MAX_ADDITIONAL_AVPS {
+        return Err(DecodeError::new(DecodeErrorCode::IeCountExceeded, offset)
+            .with_spec_ref(SpecRef::new("ietf", "RFC6733", "4.4")));
+    }
+    retained.push(SwmAdditionalAvp::from_raw_exact(child));
+    Ok(())
+}
+
+pub(super) fn parse_diameter_eap_request_oc_supported_features(
+    avp: &RawAvp<'_>,
+    ctx: DecodeContext,
+    offset: usize,
+    value_offset: usize,
+) -> Result<SwmOcSupportedFeatures, DecodeError> {
+    validate_flags(
+        &avp.header,
+        AvpFlagRules::base_optional(),
+        offset,
+        "RFC7683-7.1",
+    )?;
+    parse_oc_supported_features(avp, ctx, value_offset, LifecycleRole::TerminationRequest)
+}
+
+pub(super) fn parse_diameter_eap_answer_oc_supported_features(
+    avp: &RawAvp<'_>,
+    ctx: DecodeContext,
+    offset: usize,
+    value_offset: usize,
+) -> Result<SwmOcSupportedFeatures, DecodeError> {
+    validate_flags(
+        &avp.header,
+        AvpFlagRules::base_optional(),
+        offset,
+        "RFC7683-7.1",
+    )?;
+    parse_oc_supported_features(avp, ctx, value_offset, LifecycleRole::TerminationAnswer)
+}
+
+pub(super) fn parse_diameter_eap_answer_oc_olr(
+    avp: &RawAvp<'_>,
+    ctx: DecodeContext,
+    offset: usize,
+    value_offset: usize,
+) -> Result<SwmOcOlr, DecodeError> {
+    validate_flags(
+        &avp.header,
+        AvpFlagRules::base_optional(),
+        offset,
+        "RFC7683-7.3",
+    )?;
+    parse_oc_olr(avp, ctx, value_offset)
+}
+
+pub(super) fn parse_diameter_eap_answer_load(
+    avp: &RawAvp<'_>,
+    ctx: DecodeContext,
+    offset: usize,
+    value_offset: usize,
+) -> Result<SwmLoad, DecodeError> {
+    // TS 29.273 section 7.2.3.1, table 2 note 2 requires a receiver that
+    // understands Load to ignore an M-bit mismatch.
+    validate_flags_ignoring_m(
+        &avp.header,
+        AvpFlagRules::base_optional(),
+        offset,
+        "RFC8583-7.1",
+    )?;
+    parse_load(avp, ctx, value_offset, ValueValidationPurpose::Decode)
+}
+
+pub(super) fn append_request_oc_supported_features(
+    dst: &mut BytesMut,
+    features: SwmOcSupportedFeatures,
+    ctx: EncodeContext,
+) -> Result<(), EncodeError> {
+    if features.effective_feature_vector() != SWM_OC_LOSS_ALGORITHM {
+        return Err(encode_error(
+            "originated OC-Supported-Features request may advertise only the executable loss algorithm",
+            "RFC7683-5.1.1",
+        ));
+    }
+    append_oc_supported_features(dst, features, ctx)
+}
+
+pub(super) fn append_answer_oc_supported_features(
+    dst: &mut BytesMut,
+    features: SwmOcSupportedFeatures,
+    ctx: EncodeContext,
+) -> Result<(), EncodeError> {
+    if features.effective_feature_vector() != SWM_OC_LOSS_ALGORITHM {
+        return Err(encode_error(
+            "originated OC-Supported-Features answer may select only the executable loss algorithm",
+            "RFC7683-5.1.2",
+        ));
+    }
+    append_oc_supported_features(dst, features, ctx)
+}
+
+fn append_oc_supported_features(
+    dst: &mut BytesMut,
+    features: SwmOcSupportedFeatures,
+    ctx: EncodeContext,
+) -> Result<(), EncodeError> {
+    let mut value = BytesMut::new();
+    if let Some(feature_vector) = features.feature_vector() {
+        builder_helpers::append_u64_avp(
+            &mut value,
+            AVP_OC_FEATURE_VECTOR,
+            feature_vector,
+            false,
+            ctx,
         )?;
     }
-    Ok(())
+    for additional in &features.additional_avps {
+        additional.append_to(&mut value, ctx)?;
+    }
+    builder_helpers::append_avp(
+        dst,
+        AvpHeader::ietf(AVP_OC_SUPPORTED_FEATURES, false),
+        &value,
+        ctx,
+    )
+}
+
+pub(super) fn append_oc_olr(
+    dst: &mut BytesMut,
+    olr: SwmOcOlr,
+    ctx: EncodeContext,
+) -> Result<(), EncodeError> {
+    if olr
+        .wire_validity_duration()
+        .is_some_and(|value| value > OC_VALIDITY_DURATION_MAX)
+    {
+        return Err(encode_error(
+            "originated OC-Validity-Duration exceeds the RFC 7683 maximum",
+            "RFC7683-7.5",
+        ));
+    }
+    if olr
+        .wire_reduction_percentage()
+        .is_some_and(|value| value > 100)
+    {
+        return Err(encode_error(
+            "originated OC-Reduction-Percentage exceeds 100",
+            "RFC7683-7.7",
+        ));
+    }
+    let mut value = BytesMut::new();
+    builder_helpers::append_u64_avp(
+        &mut value,
+        AVP_OC_SEQUENCE_NUMBER,
+        olr.sequence_number(),
+        false,
+        ctx,
+    )?;
+    builder_helpers::append_u32_avp(
+        &mut value,
+        AVP_OC_REPORT_TYPE,
+        olr.report_type().value(),
+        false,
+        ctx,
+    )?;
+    if let Some(reduction_percentage) = olr.wire_reduction_percentage() {
+        builder_helpers::append_u32_avp(
+            &mut value,
+            AVP_OC_REDUCTION_PERCENTAGE,
+            reduction_percentage,
+            false,
+            ctx,
+        )?;
+    }
+    if let Some(validity_duration) = olr.wire_validity_duration() {
+        builder_helpers::append_u32_avp(
+            &mut value,
+            AVP_OC_VALIDITY_DURATION,
+            validity_duration,
+            false,
+            ctx,
+        )?;
+    }
+    for additional in &olr.additional_avps {
+        additional.append_to(&mut value, ctx)?;
+    }
+    builder_helpers::append_avp(dst, AvpHeader::ietf(AVP_OC_OLR, false), &value, ctx)
+}
+
+pub(super) fn append_load(
+    dst: &mut BytesMut,
+    load: &SwmLoad,
+    ctx: EncodeContext,
+) -> Result<(), EncodeError> {
+    if !load.complete() {
+        return Err(encode_error(
+            "originated Load requires Load-Type, Load-Value, and SourceID",
+            "RFC8583-6.1",
+        ));
+    }
+    let mut value = BytesMut::new();
+    if let Some(load_type) = load.load_type() {
+        builder_helpers::append_u32_avp(&mut value, AVP_LOAD_TYPE, load_type.value(), false, ctx)?;
+    }
+    if let Some(load_value) = load.load_value() {
+        builder_helpers::append_u64_avp(
+            &mut value,
+            AVP_LOAD_VALUE,
+            u64::from(load_value),
+            false,
+            ctx,
+        )?;
+    }
+    if let Some(source_id) = load.source_id() {
+        builder_helpers::append_utf8_avp(&mut value, AVP_SOURCE_ID, source_id, false, ctx)?;
+    }
+    for additional in &load.additional_avps {
+        additional.append_to(&mut value, ctx)?;
+    }
+    builder_helpers::append_avp(dst, AvpHeader::ietf(AVP_LOAD, false), &value, ctx)
 }
 
 fn validate_known_child(
@@ -4166,7 +4793,7 @@ fn find_oc_supported_features(
     avps: &[SwmAdditionalAvp],
     ctx: DecodeContext,
     role: LifecycleRole,
-) -> Result<Option<OcSupportedFeatures>, DecodeError> {
+) -> Result<Option<SwmOcSupportedFeatures>, DecodeError> {
     let mut retained = None;
     for avp in avps {
         if avp.header.key() != AvpKey::ietf(AVP_OC_SUPPORTED_FEATURES) {
@@ -4186,7 +4813,7 @@ fn find_oc_supported_features(
 fn find_oc_olr(
     avps: &[SwmAdditionalAvp],
     ctx: DecodeContext,
-) -> Result<Option<OcOlrFacts>, DecodeError> {
+) -> Result<Option<SwmOcOlr>, DecodeError> {
     let mut retained = None;
     for avp in avps {
         if avp.header.key() != AvpKey::ietf(AVP_OC_OLR) {
@@ -4209,7 +4836,7 @@ pub(super) fn validate_answer_overload_control_decode(
 ) -> Result<(), DecodeError> {
     let answer = find_oc_supported_features(answer_avps, ctx, LifecycleRole::TerminationAnswer)?;
     let olr = find_oc_olr(answer_avps, ctx)?;
-    validate_answer_olr_presence(answer, olr)
+    validate_answer_olr_presence(answer.as_ref(), olr.as_ref())
 }
 
 fn validate_abort_answer_overload_control_decode(
@@ -4218,7 +4845,7 @@ fn validate_abort_answer_overload_control_decode(
 ) -> Result<(), DecodeError> {
     let answer = find_oc_supported_features(answer_avps, ctx, LifecycleRole::AbortAnswer)?;
     let olr = find_oc_olr(answer_avps, ctx)?;
-    validate_answer_olr_presence(answer, olr)
+    validate_answer_olr_presence(answer.as_ref(), olr.as_ref())
 }
 
 fn validate_answer_overload_control_encode(
@@ -4277,6 +4904,30 @@ fn validate_offered_overload_control_for_roles(
     let request = find_oc_supported_features(request_avps, ctx, request_role)?;
     let answer = find_oc_supported_features(answer_avps, ctx, answer_role)?;
     let olr = find_oc_olr(answer_avps, ctx)?;
+    validate_typed_offered_overload_control(request.as_ref(), answer.as_ref(), olr.as_ref())
+}
+
+pub(super) fn validate_diameter_eap_answer_overload_control(
+    answer: Option<&SwmOcSupportedFeatures>,
+    olr: Option<&SwmOcOlr>,
+) -> Result<(), DecodeError> {
+    validate_answer_olr_presence(answer, olr)?;
+    validate_originated_loss_olr(answer, olr)
+}
+
+pub(super) fn validate_diameter_eap_answer_overload_control_for_request(
+    request: Option<&SwmOcSupportedFeatures>,
+    answer: Option<&SwmOcSupportedFeatures>,
+    olr: Option<&SwmOcOlr>,
+) -> Result<(), DecodeError> {
+    validate_typed_offered_overload_control(request, answer, olr)
+}
+
+fn validate_typed_offered_overload_control(
+    request: Option<&SwmOcSupportedFeatures>,
+    answer: Option<&SwmOcSupportedFeatures>,
+    olr: Option<&SwmOcOlr>,
+) -> Result<(), DecodeError> {
     validate_answer_olr_presence(answer, olr)?;
 
     match (request, answer) {
@@ -4292,7 +4943,7 @@ fn validate_offered_overload_control_for_roles(
         // not a failed echo.
         (Some(_), None) => Ok(()),
         (Some(request), Some(answer)) => {
-            if answer.effective_vector() & !request.effective_vector() != 0 {
+            if answer.effective_feature_vector() & !request.effective_feature_vector() != 0 {
                 return Err(forbidden_rfc_error(
                     0,
                     "answer selected an overload feature not offered by the request",
@@ -4306,8 +4957,8 @@ fn validate_offered_overload_control_for_roles(
 }
 
 fn validate_answer_olr_presence(
-    answer: Option<OcSupportedFeatures>,
-    olr: Option<OcOlrFacts>,
+    answer: Option<&SwmOcSupportedFeatures>,
+    olr: Option<&SwmOcOlr>,
 ) -> Result<(), DecodeError> {
     if olr.is_none() {
         return Ok(());
@@ -4323,13 +4974,13 @@ fn validate_answer_olr_presence(
 }
 
 fn validate_originated_loss_olr(
-    answer: Option<OcSupportedFeatures>,
-    olr: Option<OcOlrFacts>,
+    answer: Option<&SwmOcSupportedFeatures>,
+    olr: Option<&SwmOcOlr>,
 ) -> Result<(), DecodeError> {
     let (Some(answer), Some(olr)) = (answer, olr) else {
         return Ok(());
     };
-    if answer.selects_default_algorithm() && olr.reduction_percentage.is_none() {
+    if answer.selects_loss() && olr.reduction_percentage.is_none() {
         return Err(forbidden_rfc_error(
             0,
             "loss-algorithm OC-OLR requires OC-Reduction-Percentage",
@@ -4352,7 +5003,7 @@ fn validate_correlated_overload_control(
     let olr = find_oc_olr(answer_avps, ctx)
         .map_err(|_| SwmSessionTerminationCorrelationError::MalformedOverloadControl)?;
 
-    validate_answer_olr_presence(answer, olr)
+    validate_answer_olr_presence(answer.as_ref(), olr.as_ref())
         .map_err(|_| SwmSessionTerminationCorrelationError::MalformedOverloadControl)?;
 
     match (request, answer) {
@@ -4360,7 +5011,7 @@ fn validate_correlated_overload_control(
         (None, _) => Err(SwmSessionTerminationCorrelationError::UnsolicitedOverloadControl),
         (Some(_), None) => Ok(()),
         (Some(request), Some(answer)) => {
-            if answer.effective_vector() & !request.effective_vector() != 0 {
+            if answer.effective_feature_vector() & !request.effective_feature_vector() != 0 {
                 return Err(SwmSessionTerminationCorrelationError::IncompatibleOverloadControl);
             }
             Ok(())
@@ -4379,7 +5030,7 @@ fn validate_abort_correlated_overload_control(
         .map_err(|_| SwmAbortSessionCorrelationError::MalformedOverloadControl)?;
     let olr = find_oc_olr(answer_avps, ctx)
         .map_err(|_| SwmAbortSessionCorrelationError::MalformedOverloadControl)?;
-    validate_answer_olr_presence(answer, olr)
+    validate_answer_olr_presence(answer.as_ref(), olr.as_ref())
         .map_err(|_| SwmAbortSessionCorrelationError::MalformedOverloadControl)?;
 
     match (request, answer) {
@@ -4387,7 +5038,7 @@ fn validate_abort_correlated_overload_control(
         (None, _) => Err(SwmAbortSessionCorrelationError::UnsolicitedOverloadControl),
         (Some(_), None) => Ok(()),
         (Some(request), Some(answer)) => {
-            if answer.effective_vector() & !request.effective_vector() != 0 {
+            if answer.effective_feature_vector() & !request.effective_feature_vector() != 0 {
                 return Err(SwmAbortSessionCorrelationError::IncompatibleOverloadControl);
             }
             Ok(())

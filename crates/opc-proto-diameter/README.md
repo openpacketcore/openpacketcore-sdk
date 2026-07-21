@@ -106,7 +106,9 @@ charging decisions, watchdog policy, or a carrier-ready EPC/ePDG product claim.
   Diameter-EAP DER/DEA also expose typed `MIP6-Feature-Vector` and repeated
   3GPP `Supported-Features`; DER additionally exposes `UE-Local-IP-Address`,
   RFC 5777 `QoS-Capability`, `Visited-Network-Identifier`,
-  `AAA-Failure-Indication`, and reused `High-Priority-Access-Info`.
+  `AAA-Failure-Indication`, reused `High-Priority-Access-Info`, and the RFC
+  7683 baseline overload offer. DEA exposes the correlated loss-algorithm
+  selection/report and ordered RFC 8583 Load reports.
   `SwmMip6FeatureVector::gtpv2_only()` emits the exact
   `0x0000400000000000` capability; despite the legacy AVP name, that bit is
   independent of bearer IP family and is not limited to IPv6. Meanwhile,
@@ -392,6 +394,84 @@ the wrapper's ownership and must be governed separately.
 
 Use `CONFORMANCE.md` for the precise fixture provenance, fuzz target status,
 application dictionary status, and typed helper gaps.
+
+### SWm Diameter-EAP overload and load context
+
+`SwmDiameterEapRequest::oc_supported_features` carries the optional RFC 7683
+reacting-node offer. `SwmDiameterEapAnswer::{oc_supported_features, oc_olr}`
+carry the reporting-node selection and loss report, and `load_reports` retains
+bounded RFC 8583 Load AVPs in wire order. All four new request/answer fields
+remain optional, so initializing them as `None`, `None`, `None`, and
+`Vec::new()` preserves the earlier DER/DEA wire shape. Grouped unknown optional
+children are retained privately under
+`UnknownIePolicy::Preserve`; callers cannot inject raw overload children.
+
+This surface deliberately implements the RFC 7683 baseline loss algorithm for
+SWm. The later RFC 8581 peer-overload report extension (`OC_PEER_REPORT`, peer
+report type, `OC-Peer-Algo`, and overload `SourceID`) is not an executable
+selection in this slice. Received request capability vectors may retain
+extension bits for inspection, but builders reject re-originating any vector
+other than loss. Do not describe this as complete/current DOIC support.
+
+Overload response AVPs are strictly request-conditioned. The answer-local
+`build_swm_diameter_eap_answer` rejects `OC-Supported-Features` and `OC-OLR`;
+use `build_swm_diameter_eap_answer_for` so the SDK proves that the DER offered
+the selected algorithm. The same validation applies when request and answer
+envelopes are correlated. An offered request may receive no selection from a
+non-reporting node. Load is independent of that negotiation and can be encoded
+at the answer-local boundary.
+
+```rust
+use opc_proto_diameter::apps::swm::{
+    build_swm_diameter_eap_answer_for, SwmDiameterEapAnswer,
+    SwmDiameterEapRequestEnvelope, SwmLoad, SwmLoadType, SwmOcOlr,
+    SwmOcReportType, SwmOcSupportedFeatures,
+};
+use opc_protocol::EncodeContext;
+
+fn add_overload_context(
+    request: &SwmDiameterEapRequestEnvelope,
+    answer: &mut SwmDiameterEapAnswer,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // The corresponding DER set request.oc_supported_features to loss().
+    answer.oc_supported_features = Some(SwmOcSupportedFeatures::loss());
+    answer.oc_olr = Some(SwmOcOlr::new_loss(
+        7,
+        SwmOcReportType::Host,
+        Some(60),
+        25,
+    )?);
+    answer.load_reports.push(SwmLoad::new(
+        SwmLoadType::Host,
+        50_000,
+        "aaa.example.invalid",
+    )?);
+    let _message = build_swm_diameter_eap_answer_for(
+        request,
+        answer,
+        EncodeContext::default(),
+    )?;
+    Ok(())
+}
+```
+
+`SwmOcOlr` exposes both exact wire values and safe effective values. An absent
+or greater-than-86400 validity duration yields the RFC default of 30 seconds;
+a reduction percentage greater than 100 is exposed as non-actionable. Such
+received values parse for standards-compatible observation but cannot be
+re-originated. A received Load group may omit its individually optional
+children; `complete_tuple()` then returns `None`, and builders reject it.
+Before applying a `PEER` Load report, call `actionable_for_peer` with the
+authenticated connection's DiameterIdentity; a mismatched SourceID is ignored
+as RFC 8583 requires. Consumers still own overload state, expiry timers,
+routing decisions, and authenticated transport identity.
+
+OC AVPs accept the application-controlled M bit and require V/P clear. Builders
+emit M clear. Load builders also emit M clear, while received Load ignores a
+known M mismatch under TS 29.273 table 7.2.3.1/2 note 2. Use
+`Message::decode_with_dictionary` with the SWm dictionary when conservative
+duplicate rejection is enabled so only declared repeated Load AVPs bypass the
+blanket duplicate pre-scan.
 
 ### SWm Session-Termination
 

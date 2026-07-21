@@ -276,6 +276,26 @@ malformed families/lengths fail closed, and diagnostic output reveals only
 presence. All three additions are optional, so absent fields preserve the
 previous DER/DEA bytes exactly.
 
+The Diameter-EAP overload/load slice completes the finite TS 29.273 V19.2
+rows below without exposing a raw additional-AVP field. Its public model and
+codec are shared with the established SWm lifecycle commands.
+
+| AVP | TS 29.273 presence | Wire identity and cardinality | Typed SDK field | Positive / negative evidence |
+|:----|:-------------------|:------------------------------|:----------------|:-----------------------------|
+| DER `OC-Supported-Features` | Optional reacting-node capability | IETF 621, Grouped, singleton, V/P clear and application-controlled M; optional singleton IETF 622 `Unsigned64` child | `SwmDiameterEapRequest::oc_supported_features` / `SwmOcSupportedFeatures` | Absent, implicit loss, explicit loss, M-set/M-clear, and extension-bit request fixtures parse; zero, missing-loss, duplicate, wrong V/P/vendor/type/length, and unknown mandatory children fail. Extension-bearing received offers cannot be re-originated. |
+| DEA `OC-Supported-Features` | Conditional on the DER offer | Same IETF 621 group and flags, singleton | `SwmDiameterEapAnswer::oc_supported_features` | Request-bound build and envelope correlation reject unsolicited or unoffered selections; an offer may receive no selection. The executable profile selects only RFC 7683 loss. |
+| DEA `OC-OLR` | Optional report from a reporting node | IETF 623, Grouped, singleton, V/P clear; required sequence/report-type and optional reduction/validity children | `SwmDiameterEapAnswer::oc_olr` / `SwmOcOlr` | Loss requires same-answer support plus Reduction-Percentage. Host/realm reports round trip; missing/duplicate required children, invalid type/width/flags, and unknown mandatory children fail. Received validity above 86400 maps to effective 30 seconds and reduction above 100 becomes non-actionable; neither can be originated. |
+| DEA `Load` | Optional and repeatable | IETF 650, Grouped, bounded ordered `*`; V/P clear, application M accepted and canonical origin M clear; optional singleton type/value/source children | `SwmDiameterEapAnswer::load_reports` / `SwmLoad` | Multiple host/peer reports preserve order; the 129th fails. Received incomplete groups are retained but non-complete and cannot be originated. Type, 0..65535 value, nonempty ASCII SourceID, duplicate child, flags, and unknown-child policy are tested. `actionable_for_peer` enforces authenticated-peer SourceID equality for peer reports. |
+
+This is an explicitly bounded RFC 7683 baseline loss profile. RFC 8581's
+peer-overload extension (`OC_PEER_REPORT`, report type 2, `OC-Peer-Algo`, and
+overload `SourceID`) is not executable here; unknown optional children remain
+retained as typed-endpoint rebuild metadata, but this is not a byte-preserving
+Diameter relay boundary and the SDK does not claim complete current DOIC.
+RFC 8583 Load is supported independently. Overload state storage, timer
+application, traffic abatement, transport authentication, and routing policy
+remain consumer responsibilities.
+
 The remaining non-overload DER access-context slice is mapped below. Canonical
 builders use the TS 29.273 V19.2.0 flags; receivers enforce V/P and apply table
 7.2.3.1/1 note 2 by ignoring an understood outer M-bit mismatch.
