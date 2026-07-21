@@ -40,7 +40,7 @@ const FILE_IDENTITY_DOMAIN: &[u8] = b"openpacketcore/session-recovery/file-ident
 const LOGICAL_STATE_DOMAIN: &[u8] = b"openpacketcore/session-recovery/logical-state/v1\0";
 const FILE_DIGEST_DOMAIN: &[u8] = b"openpacketcore/session-recovery/file/v1\0";
 const WORKFLOW_VERSION: u16 = 2;
-const MAX_CURRENT_SCHEMA_OBJECTS: usize = 17;
+const MAX_CURRENT_SCHEMA_OBJECTS: usize = 19;
 const MAX_SCHEMA_SQL_BYTES: usize = 16_384;
 
 pub(super) struct InspectionInput<'a> {
@@ -339,24 +339,31 @@ fn inspect_current(
         .ok()
         .and_then(|value| SessionConsensusConfigurationEpoch::new(value).ok())
         .ok_or(RecoveryError::CorruptReplica)?;
-    let stored_identity = SessionConsensusIdentity::new(
+    let storage_identity = SessionConsensusIdentity::new(
         crate::consensus::SessionConsensusClusterId::from_bytes(cluster),
         SessionConsensusConfigurationId::from_bytes(configuration),
         epoch,
     );
-    if stored_identity != input.identity {
+    if storage_identity.cluster_id() != input.identity.cluster_id() {
         return Err(RecoveryError::WrongCluster);
     }
-    consensus::read_membership_sync(conn, stored_identity, input.expected_members)
+    let membership_scope = consensus::read_membership_scope_sync(conn, storage_identity)
+        .map_err(|_| RecoveryError::CorruptReplica)?;
+    if membership_scope.current_identity != input.identity
+        || membership_scope.current_members != *input.expected_members
+    {
+        return Err(RecoveryError::WrongCluster);
+    }
+    consensus::read_membership_sync(conn, storage_identity)
         .map_err(|_| RecoveryError::CorruptReplica)?;
     validate_sealed_records(conn, budget)?;
-    let committed = consensus::read_committed_sync(conn, stored_identity)
+    let committed = consensus::read_committed_sync(conn, storage_identity)
         .map_err(|_| RecoveryError::CorruptReplica)?;
-    let applied = consensus::read_applied_sync(conn, stored_identity)
+    let applied = consensus::read_applied_sync(conn, storage_identity)
         .map_err(|_| RecoveryError::CorruptReplica)?;
-    let purged = consensus::read_purged_sync(conn, stored_identity)
+    let purged = consensus::read_purged_sync(conn, storage_identity)
         .map_err(|_| RecoveryError::CorruptReplica)?;
-    let last_log = consensus::last_log_sync(conn, stored_identity)
+    let last_log = consensus::last_log_sync(conn, storage_identity)
         .map_err(|_| RecoveryError::CorruptReplica)?;
     validate_log_floors(
         committed.as_ref(),
@@ -364,7 +371,7 @@ fn inspect_current(
         purged.as_ref(),
         last_log.as_ref(),
     )?;
-    let recovery = consensus::read_operator_recovery_sync(conn, stored_identity)
+    let recovery = consensus::read_operator_recovery_sync(conn, storage_identity)
         .map_err(|_| RecoveryError::CorruptReplica)?;
     let replication_head = validate_replication_sequence_domain(
         conn,
@@ -387,8 +394,7 @@ fn inspect_current(
     }
     let branch_digest = committed_branch_digest(
         conn,
-        stored_identity,
-        input.expected_members,
+        storage_identity,
         committed.as_ref(),
         &paths.snapshots,
         budget,
@@ -410,8 +416,10 @@ fn inspect_current(
         file_identity,
         format: RecoveryReplicaFormat::Openraft,
         cluster_digest: Some(RecoveryDigest::from_bytes(cluster)),
-        configuration_digest: Some(RecoveryDigest::from_bytes(configuration)),
-        configuration_epoch: Some(epoch.get()),
+        configuration_digest: Some(RecoveryDigest::from_bytes(
+            *input.identity.configuration_id().as_bytes(),
+        )),
+        configuration_epoch: Some(input.identity.configuration_epoch().get()),
         recovery_epoch: recovery.recovery_epoch,
         pending_recovery_epoch: recovery.pending_epoch,
         pending_plan_digest: recovery.pending_plan_digest.map(RecoveryDigest::from_bytes),
@@ -483,6 +491,48 @@ fn preflight_current_tables(
             return Err(RecoveryError::WorkLimitExceeded);
         }
     }
+    if table_exists(conn, "consensus_membership_scope")? {
+        let (count, maximum, total): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(MAX(MAX(length(current_members_json), length(application_authority_members_json), COALESCE(length(predecessor_members_json), 0), COALESCE(length(desired_members_json), 0))), 0), COALESCE(SUM(length(current_members_json) + length(application_authority_members_json) + COALESCE(length(predecessor_members_json), 0) + COALESCE(length(desired_members_json), 0)), 0) FROM consensus_membership_scope",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(|error| inspection_sql_error(error, budget))?;
+        let count = u64::try_from(count).map_err(|_| RecoveryError::CorruptReplica)?;
+        let maximum = u64::try_from(maximum).map_err(|_| RecoveryError::CorruptReplica)?;
+        let total = u64::try_from(total).map_err(|_| RecoveryError::CorruptReplica)?;
+        total_bytes = total_bytes
+            .checked_add(total)
+            .ok_or(RecoveryError::WorkLimitExceeded)?;
+        if count > 1
+            || maximum > budget.limits.max_value_bytes()
+            || total_bytes > budget.limits.max_total_value_bytes()
+        {
+            return Err(RecoveryError::WorkLimitExceeded);
+        }
+    }
+    if table_exists(conn, "consensus_membership_history")? {
+        let (count, maximum, total): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(MAX(length(members_json)), 0), COALESCE(SUM(length(members_json)), 0) FROM consensus_membership_history",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(|error| inspection_sql_error(error, budget))?;
+        let count = u64::try_from(count).map_err(|_| RecoveryError::CorruptReplica)?;
+        let maximum = u64::try_from(maximum).map_err(|_| RecoveryError::CorruptReplica)?;
+        let total = u64::try_from(total).map_err(|_| RecoveryError::CorruptReplica)?;
+        total_bytes = total_bytes
+            .checked_add(total)
+            .ok_or(RecoveryError::WorkLimitExceeded)?;
+        if count > 4_096
+            || maximum > budget.limits.max_value_bytes()
+            || total_bytes > budget.limits.max_total_value_bytes()
+        {
+            return Err(RecoveryError::WorkLimitExceeded);
+        }
+    }
     Ok(())
 }
 
@@ -519,7 +569,6 @@ fn validate_log_floors(
 fn committed_branch_digest(
     conn: &Connection,
     identity: SessionConsensusIdentity,
-    expected_members: &BTreeSet<SessionConsensusNodeId>,
     committed: Option<&LogId<SessionConsensusNodeId>>,
     snapshot_dir: &Path,
     budget: &mut InspectionBudget,
@@ -555,15 +604,9 @@ fn committed_branch_digest(
         .index
         .checked_add(1)
         .ok_or(RecoveryError::CorruptReplica)?;
-    let entries = consensus::read_log_range_sync(
-        conn,
-        identity,
-        expected_members,
-        committed.index,
-        Some(end),
-        Some(1),
-    )
-    .map_err(|_| RecoveryError::CorruptReplica)?;
+    let entries =
+        consensus::read_log_range_sync(conn, identity, committed.index, Some(end), Some(1))
+            .map_err(|_| RecoveryError::CorruptReplica)?;
     if let Some(entry) = entries.first() {
         if entry.log_id != *committed {
             return Err(RecoveryError::CorruptReplica);
@@ -573,7 +616,7 @@ fn committed_branch_digest(
         hash_current_checkpoint(conn, budget, &mut hasher)?;
         return Ok(RecoveryDigest::from_bytes(hasher.finalize().into()));
     }
-    let snapshot = consensus::read_current_snapshot_sync(conn, identity, expected_members)
+    let snapshot = consensus::read_current_snapshot_sync(conn, identity)
         .map_err(|_| RecoveryError::CorruptReplica)?
         .ok_or(RecoveryError::CorruptReplica)?;
     if snapshot.0.last_log_id.as_ref() != Some(committed) {
@@ -612,6 +655,26 @@ fn hash_current_checkpoint(
         "SELECT * FROM consensus_applied ORDER BY singleton",
         "SELECT * FROM consensus_request_outcomes ORDER BY request_id",
     ] {
+        hasher.update(
+            u64::try_from(query.len())
+                .map_err(|_| RecoveryError::WorkLimitExceeded)?
+                .to_be_bytes(),
+        );
+        hasher.update(query.as_bytes());
+        hash_query_rows(conn, query, budget, hasher)?;
+    }
+    if table_exists(conn, "consensus_membership_scope")? {
+        let query = "SELECT * FROM consensus_membership_scope ORDER BY singleton";
+        hasher.update(
+            u64::try_from(query.len())
+                .map_err(|_| RecoveryError::WorkLimitExceeded)?
+                .to_be_bytes(),
+        );
+        hasher.update(query.as_bytes());
+        hash_query_rows(conn, query, budget, hasher)?;
+    }
+    if table_exists(conn, "consensus_membership_history")? {
+        let query = "SELECT * FROM consensus_membership_history ORDER BY configuration_epoch";
         hasher.update(
             u64::try_from(query.len())
                 .map_err(|_| RecoveryError::WorkLimitExceeded)?
@@ -889,6 +952,12 @@ fn validate_exact_recovery_schema(
     let canonical_operator = expected
         .remove("consensus_operator_recovery")
         .ok_or(RecoveryError::DatabaseUnavailable)?;
+    let canonical_membership_scope = expected
+        .remove("consensus_membership_scope")
+        .ok_or(RecoveryError::DatabaseUnavailable)?;
+    let canonical_membership_history = expected
+        .remove("consensus_membership_history")
+        .ok_or(RecoveryError::DatabaseUnavailable)?;
     expected
         .remove("restore_scan_state")
         .ok_or(RecoveryError::DatabaseUnavailable)?;
@@ -920,6 +989,18 @@ fn validate_exact_recovery_schema(
             if sql == canonical_operator || sql == add_on_operator || sql == migrated_operator => {}
         Some(_) => return Err(RecoveryError::CorruptReplica),
         None if require_recovery_table => return Err(RecoveryError::CorruptReplica),
+        None => {}
+    }
+    match observed.remove("consensus_membership_scope") {
+        Some(sql) if sql == canonical_membership_scope => {}
+        Some(_) => return Err(RecoveryError::CorruptReplica),
+        // The fixed-membership predecessor schema is migrated transactionally
+        // on the next writable consensus open.
+        None => {}
+    }
+    match observed.remove("consensus_membership_history") {
+        Some(sql) if sql == canonical_membership_history => {}
+        Some(_) => return Err(RecoveryError::CorruptReplica),
         None => {}
     }
     if observed != expected {
@@ -1949,7 +2030,6 @@ fn ensure_target_backup(
     if let Some(snapshot) = current_snapshot_reference(
         &paths.database,
         plan.body.identity,
-        &plan.body.expected_members,
         &paths.snapshots,
         limits,
     )? {
@@ -2154,7 +2234,6 @@ fn create_checkpoint(
     let snapshot = current_snapshot_reference(
         &source_paths.database,
         plan.body.identity,
-        &plan.body.expected_members,
         &source_paths.snapshots,
         limits,
     )?;
@@ -2303,6 +2382,8 @@ fn stage_source(
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|_| RecoveryError::FileOperationFailed)?;
+            let storage_identity = consensus::read_storage_identity_sync(&tx)
+                .map_err(|_| RecoveryError::CorruptReplica)?;
             let committed: Option<i64> = tx
                 .query_row(
                     "SELECT log_index FROM consensus_committed WHERE singleton = 1",
@@ -2328,7 +2409,7 @@ fn stage_source(
                 .map_err(|_| RecoveryError::FileOperationFailed)?;
             consensus::mark_operator_recovery_pending_sync(
                 &tx,
-                plan.body.identity,
+                storage_identity,
                 plan.body.next_recovery_epoch,
                 plan.plan_digest.as_bytes(),
             )
@@ -2375,13 +2456,8 @@ fn stage_source(
         .and_then(|file| file.sync_all())
         .map_err(|_| RecoveryError::FileOperationFailed)?;
 
-    let snapshot = current_snapshot_reference(
-        staged,
-        plan.body.identity,
-        &plan.body.expected_members,
-        &paths.snapshots,
-        limits,
-    )?;
+    let snapshot =
+        current_snapshot_reference(staged, plan.body.identity, &paths.snapshots, limits)?;
     let source_snapshot_name = if let Some(snapshot) = snapshot {
         copy_file_bounded(&snapshot.path, staged_snapshot, limits.max_snapshot_bytes())?;
         Some(snapshot.file_name)
@@ -2553,7 +2629,6 @@ fn verify_staged_source(
             let reference = current_snapshot_reference(
                 staged,
                 plan.body.identity,
-                &plan.body.expected_members,
                 &checkpoint.snapshot_directory,
                 limits,
             )?
@@ -3191,7 +3266,6 @@ struct SnapshotReference {
 fn current_snapshot_reference(
     database: &Path,
     identity: SessionConsensusIdentity,
-    expected_members: &BTreeSet<SessionConsensusNodeId>,
     snapshot_dir: &Path,
     limits: RecoveryLimits,
 ) -> Result<Option<SnapshotReference>, RecoveryError> {
@@ -3199,7 +3273,14 @@ fn current_snapshot_reference(
     if !table_exists(&conn, "consensus_identity")? {
         return Ok(None);
     }
-    let snapshot = consensus::read_current_snapshot_sync(&conn, identity, expected_members)
+    let storage_identity =
+        consensus::read_storage_identity_sync(&conn).map_err(|_| RecoveryError::CorruptReplica)?;
+    let scope = consensus::read_membership_scope_sync(&conn, storage_identity)
+        .map_err(|_| RecoveryError::CorruptReplica)?;
+    if scope.current_identity != identity {
+        return Err(RecoveryError::WrongCluster);
+    }
+    let snapshot = consensus::read_current_snapshot_sync(&conn, storage_identity)
         .map_err(|_| RecoveryError::CorruptReplica)?;
     let Some((_, file_name, expected_checksum, expected_length)) = snapshot else {
         return Ok(None);

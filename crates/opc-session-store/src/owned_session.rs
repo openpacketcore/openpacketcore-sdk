@@ -413,6 +413,9 @@ impl OwnedSessionMutationError {
             StoreError::BackendOperationOutcomeUnavailable => Self::StoreRejected {
                 code: "backend-operation-outcome-unavailable",
             },
+            StoreError::TopologyAuthorityRevoked => Self::StoreRejected {
+                code: "topology-authority-revoked",
+            },
             StoreError::CapabilityNotSupported(_) => Self::StoreRejected {
                 code: "capability-not-supported",
             },

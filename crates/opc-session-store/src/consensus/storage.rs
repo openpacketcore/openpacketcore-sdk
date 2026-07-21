@@ -4,7 +4,7 @@
 //! adapter only provides serialized durable I/O and deterministic application
 //! of entries Openraft has already committed.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::ops::{Bound, RangeBounds};
 use std::path::{Path, PathBuf};
@@ -20,7 +20,10 @@ use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use super::snapshot::SessionSnapshotFile;
-use super::{SessionConsensusIdentity, SessionConsensusNodeId, SessionRaftTypeConfig};
+use super::{
+    SessionConsensusIdentity, SessionConsensusNodeId, SessionRaftTypeConfig,
+    SessionTopologyMemberBinding,
+};
 use crate::backend::ReplicationEntry;
 use crate::sqlite::consensus::{self, SqliteConsensusCore};
 use crate::sqlite::SqliteSessionBackend;
@@ -82,7 +85,7 @@ impl SqliteConsensusStateMachine {
         SessionConsensusStorageError,
     > {
         let conn = self.core.conn.lock().await;
-        consensus::proposal_state_sync(&conn, self.core.identity)
+        consensus::proposal_state_sync(&conn, self.core.storage_identity)
             .map_err(|_| SessionConsensusStorageError::CorruptState)
     }
 }
@@ -93,19 +96,117 @@ pub(crate) struct SqliteConsensusSnapshotBuilder {
     core: SqliteConsensusCore,
 }
 
-pub(crate) async fn open(
+pub(crate) async fn open_with_member_bindings(
+    backend: &SqliteSessionBackend,
+    snapshot_dir: impl Into<PathBuf>,
+    identity: SessionConsensusIdentity,
+    expected_members: BTreeSet<SessionConsensusNodeId>,
+    expected_bindings: BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
+) -> Result<
+    (
+        SqliteConsensusLogStore,
+        SqliteConsensusStateMachine,
+        SessionConsensusIdentity,
+    ),
+    SessionConsensusStorageError,
+> {
+    let core = SqliteConsensusCore::initialize(
+        backend,
+        snapshot_dir.into(),
+        identity,
+        expected_members,
+        expected_bindings,
+    )
+    .await?;
+    validate_and_clean_snapshot_directory(&core).await?;
+    let storage_identity = core.storage_identity;
+    Ok((
+        SqliteConsensusLogStore { core: core.clone() },
+        SqliteConsensusStateMachine { core },
+        storage_identity,
+    ))
+}
+
+#[cfg(test)]
+async fn open(
     backend: &SqliteSessionBackend,
     snapshot_dir: impl Into<PathBuf>,
     identity: SessionConsensusIdentity,
     expected_members: BTreeSet<SessionConsensusNodeId>,
 ) -> Result<(SqliteConsensusLogStore, SqliteConsensusStateMachine), SessionConsensusStorageError> {
-    let core =
-        SqliteConsensusCore::initialize(backend, snapshot_dir.into(), identity, expected_members)
+    let bindings = expected_members
+        .iter()
+        .copied()
+        .map(|node| {
+            let mut descriptor = [0x11; 32];
+            descriptor[..8].copy_from_slice(&node.get().to_be_bytes());
+            let mut endpoint = [0x22; 32];
+            endpoint[..8].copy_from_slice(&node.get().to_be_bytes());
+            let mut tls = [0x33; 32];
+            tls[..8].copy_from_slice(&node.get().to_be_bytes());
+            let mut backing = [0x44; 32];
+            backing[..8].copy_from_slice(&node.get().to_be_bytes());
+            (
+                node,
+                SessionTopologyMemberBinding::new(descriptor, endpoint, tls, backing),
+            )
+        })
+        .collect();
+    let (log_store, state_machine, _) =
+        open_with_member_bindings(backend, snapshot_dir, identity, expected_members, bindings)
             .await?;
+    Ok((log_store, state_machine))
+}
+
+/// Open a pristine or restarted candidate with one exact successor scope
+/// durably staged in the same SQLite transaction as schema admission.
+///
+/// The candidate's node may be absent from `expected_members`; membership and
+/// transport admission remain driver responsibilities. Snapshot installation
+/// subsequently requires the source to carry this exact pending scope.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn open_with_pending_membership(
+    backend: &SqliteSessionBackend,
+    snapshot_dir: impl Into<PathBuf>,
+    storage_identity: SessionConsensusIdentity,
+    current_identity: SessionConsensusIdentity,
+    current_members: BTreeSet<SessionConsensusNodeId>,
+    current_bindings: BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
+    transition_id: [u8; 16],
+    transition_digest: [u8; 32],
+    desired_identity: SessionConsensusIdentity,
+    desired_members: &BTreeSet<SessionConsensusNodeId>,
+    desired_bindings: &BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
+) -> Result<
+    (
+        SqliteConsensusLogStore,
+        SqliteConsensusStateMachine,
+        SessionConsensusIdentity,
+    ),
+    SessionConsensusStorageError,
+> {
+    let core = SqliteConsensusCore::initialize_with_pending(
+        backend,
+        snapshot_dir.into(),
+        storage_identity,
+        current_identity,
+        current_members,
+        current_bindings,
+        consensus::PendingMembershipBootstrap {
+            transition_id,
+            transition_digest,
+            desired_identity,
+            desired_members,
+            desired_bindings,
+        },
+    )
+    .await?;
     validate_and_clean_snapshot_directory(&core).await?;
+    let storage_identity = core.storage_identity;
     Ok((
         SqliteConsensusLogStore { core: core.clone() },
         SqliteConsensusStateMachine { core },
+        storage_identity,
     ))
 }
 
@@ -114,7 +215,7 @@ async fn validate_and_clean_snapshot_directory(
 ) -> Result<(), SessionConsensusStorageError> {
     let current = {
         let conn = core.conn.lock().await;
-        consensus::read_current_snapshot_sync(&conn, core.identity, &core.expected_members)
+        consensus::read_current_snapshot_sync(&conn, core.storage_identity)
             .map_err(|_| SessionConsensusStorageError::CorruptState)?
     };
     let current_file_name = current
@@ -227,15 +328,8 @@ impl RaftLogReader<SessionRaftTypeConfig> for SqliteConsensusLogStore {
             return Ok(Vec::new());
         }
         let conn = self.core.conn.lock().await;
-        consensus::read_log_range_sync(
-            &conn,
-            self.core.identity,
-            &self.core.expected_members,
-            start,
-            end,
-            None,
-        )
-        .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Read, error))
+        consensus::read_log_range_sync(&conn, self.core.storage_identity, start, end, None)
+            .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Read, error))
     }
 
     async fn limited_get_log_entries(
@@ -249,8 +343,7 @@ impl RaftLogReader<SessionRaftTypeConfig> for SqliteConsensusLogStore {
         let conn = self.core.conn.lock().await;
         let entries = consensus::read_limited_log_range_sync(
             &conn,
-            self.core.identity,
-            &self.core.expected_members,
+            self.core.storage_identity,
             start,
             end,
             DURABLE_OPENRAFT_MAX_PAYLOAD_ENTRIES,
@@ -276,9 +369,9 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
         &mut self,
     ) -> Result<LogState<SessionRaftTypeConfig>, StorageError<SessionConsensusNodeId>> {
         let conn = self.core.conn.lock().await;
-        let last_purged_log_id = consensus::read_purged_sync(&conn, self.core.identity)
+        let last_purged_log_id = consensus::read_purged_sync(&conn, self.core.storage_identity)
             .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Read, error))?;
-        let last_log_id = consensus::last_log_sync(&conn, self.core.identity)
+        let last_log_id = consensus::last_log_sync(&conn, self.core.storage_identity)
             .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Read, error))?;
         Ok(LogState {
             last_purged_log_id,
@@ -295,7 +388,7 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
         vote: &Vote<SessionConsensusNodeId>,
     ) -> Result<(), StorageError<SessionConsensusNodeId>> {
         let conn = self.core.conn.lock().await;
-        consensus::save_vote_sync(&conn, self.core.identity, vote)
+        consensus::save_vote_sync(&conn, self.core.storage_identity, vote)
             .map_err(|error| storage_error(ErrorSubject::Vote, ErrorVerb::Write, error))
     }
 
@@ -303,7 +396,7 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
         &mut self,
     ) -> Result<Option<Vote<SessionConsensusNodeId>>, StorageError<SessionConsensusNodeId>> {
         let conn = self.core.conn.lock().await;
-        consensus::read_vote_sync(&conn, self.core.identity)
+        consensus::read_vote_sync(&conn, self.core.storage_identity)
             .map_err(|error| storage_error(ErrorSubject::Vote, ErrorVerb::Read, error))
     }
 
@@ -312,7 +405,7 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
         committed: Option<LogId<SessionConsensusNodeId>>,
     ) -> Result<(), StorageError<SessionConsensusNodeId>> {
         let conn = self.core.conn.lock().await;
-        consensus::save_committed_sync(&conn, self.core.identity, committed)
+        consensus::save_committed_sync(&conn, self.core.storage_identity, committed)
             .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Write, error))
     }
 
@@ -320,7 +413,7 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
         &mut self,
     ) -> Result<Option<LogId<SessionConsensusNodeId>>, StorageError<SessionConsensusNodeId>> {
         let conn = self.core.conn.lock().await;
-        consensus::read_committed_sync(&conn, self.core.identity)
+        consensus::read_committed_sync(&conn, self.core.storage_identity)
             .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Read, error))
     }
 
@@ -335,12 +428,7 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
     {
         let entries: Vec<_> = entries.into_iter().collect();
         let conn = self.core.conn.lock().await;
-        match consensus::append_logs_sync(
-            &conn,
-            self.core.identity,
-            &self.core.expected_members,
-            &entries,
-        ) {
+        match consensus::append_logs_sync(&conn, self.core.storage_identity, &entries) {
             Ok(()) => {
                 callback.log_io_completed(Ok(()));
                 Ok(())
@@ -358,7 +446,7 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
         log_id: LogId<SessionConsensusNodeId>,
     ) -> Result<(), StorageError<SessionConsensusNodeId>> {
         let conn = self.core.conn.lock().await;
-        consensus::truncate_logs_sync(&conn, self.core.identity, &log_id)
+        consensus::truncate_logs_sync(&conn, self.core.storage_identity, &log_id)
             .map_err(|error| storage_error(ErrorSubject::Log(log_id), ErrorVerb::Delete, error))
     }
 
@@ -370,7 +458,7 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
             .await
             .map_err(|error| storage_error(ErrorSubject::Log(log_id), ErrorVerb::Delete, error))?;
         let conn = self.core.conn.lock().await;
-        consensus::purge_logs_sync(&conn, self.core.identity, &log_id)
+        consensus::purge_logs_sync(&conn, self.core.storage_identity, &log_id)
             .map_err(|error| storage_error(ErrorSubject::Log(log_id), ErrorVerb::Delete, error))
     }
 }
@@ -388,13 +476,10 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
         StorageError<SessionConsensusNodeId>,
     > {
         let conn = self.core.conn.lock().await;
-        let applied = consensus::read_applied_sync(&conn, self.core.identity)
+        let applied = consensus::read_applied_sync(&conn, self.core.storage_identity)
             .map_err(|error| storage_error(ErrorSubject::StateMachine, ErrorVerb::Read, error))?;
-        let membership =
-            consensus::read_membership_sync(&conn, self.core.identity, &self.core.expected_members)
-                .map_err(|error| {
-                    storage_error(ErrorSubject::StateMachine, ErrorVerb::Read, error)
-                })?;
+        let membership = consensus::read_membership_sync(&conn, self.core.storage_identity)
+            .map_err(|error| storage_error(ErrorSubject::StateMachine, ErrorVerb::Read, error))?;
         Ok((applied, membership))
     }
 
@@ -420,8 +505,7 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
             let conn = self.core.conn.lock().await;
             consensus::apply_entries_sync(
                 &conn,
-                self.core.identity,
-                &self.core.expected_members,
+                self.core.storage_identity,
                 &self.core.caps,
                 entries,
             )
@@ -509,22 +593,17 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
 
         let previous = {
             let conn = self.core.conn.lock().await;
-            let previous = consensus::read_current_snapshot_sync(
-                &conn,
-                self.core.identity,
-                &self.core.expected_members,
-            )
-            .map_err(|error| {
-                storage_error(
-                    ErrorSubject::Snapshot(Some(meta.signature())),
-                    ErrorVerb::Read,
-                    error,
-                )
-            })?;
+            let previous = consensus::read_current_snapshot_sync(&conn, self.core.storage_identity)
+                .map_err(|error| {
+                    storage_error(
+                        ErrorSubject::Snapshot(Some(meta.signature())),
+                        ErrorVerb::Read,
+                        error,
+                    )
+                })?;
             if let Err(error) = consensus::install_snapshot_database_sync(
                 &conn,
-                self.core.identity,
-                &self.core.expected_members,
+                self.core.storage_identity,
                 &raw_path,
                 meta,
                 &file_name,
@@ -553,12 +632,9 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
     ) -> Result<Option<Snapshot<SessionRaftTypeConfig>>, StorageError<SessionConsensusNodeId>> {
         let current = {
             let conn = self.core.conn.lock().await;
-            consensus::read_current_snapshot_sync(
-                &conn,
-                self.core.identity,
-                &self.core.expected_members,
-            )
-            .map_err(|error| storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Read, error))?
+            consensus::read_current_snapshot_sync(&conn, self.core.storage_identity).map_err(
+                |error| storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Read, error),
+            )?
         };
         let Some((meta, file_name, expected_checksum, expected_length)) = current else {
             return Ok(None);
@@ -637,13 +713,10 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
             .join(format!("build-{}.sqlite", uuid::Uuid::new_v4()));
         let (last_log_id, last_membership) = {
             let conn = self.core.conn.lock().await;
-            consensus::build_snapshot_database_sync(
-                &conn,
-                self.core.identity,
-                &self.core.expected_members,
-                &raw_path,
-            )
-            .map_err(|error| storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error))?
+            consensus::build_snapshot_database_sync(&conn, self.core.storage_identity, &raw_path)
+                .map_err(|error| {
+                    storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
+                })?
         };
         let file_name = format!("snapshot-{}.opc", uuid::Uuid::new_v4());
         let final_path = self.core.snapshot_dir.join(&file_name);
@@ -672,22 +745,17 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
         };
         let previous = {
             let conn = self.core.conn.lock().await;
-            let previous = consensus::read_current_snapshot_sync(
-                &conn,
-                self.core.identity,
-                &self.core.expected_members,
-            )
-            .map_err(|error| {
-                storage_error(
-                    ErrorSubject::Snapshot(Some(meta.signature())),
-                    ErrorVerb::Read,
-                    error,
-                )
-            })?;
+            let previous = consensus::read_current_snapshot_sync(&conn, self.core.storage_identity)
+                .map_err(|error| {
+                    storage_error(
+                        ErrorSubject::Snapshot(Some(meta.signature())),
+                        ErrorVerb::Read,
+                        error,
+                    )
+                })?;
             consensus::save_current_snapshot_sync(
                 &conn,
-                self.core.identity,
-                &self.core.expected_members,
+                self.core.storage_identity,
                 &meta,
                 &file_name,
                 checksum,
@@ -1124,7 +1192,7 @@ mod tests {
         ];
         {
             let conn = log_store.core.conn.lock().await;
-            consensus::append_logs_sync(&conn, identity(1), &expected_members(), &entries)
+            consensus::append_logs_sync(&conn, identity(1), &entries)
                 .expect("append bounded-read fixtures");
         }
 
@@ -1260,13 +1328,8 @@ mod tests {
         let command = normal_entry(1, advance_time_command(identity(1), 16, 1));
         {
             let conn = state_machine.core.conn.lock().await;
-            consensus::append_logs_sync(
-                &conn,
-                identity(1),
-                &expected_members(),
-                &[membership.clone(), command.clone()],
-            )
-            .expect("append snapshot-covered logs");
+            consensus::append_logs_sync(&conn, identity(1), &[membership.clone(), command.clone()])
+                .expect("append snapshot-covered logs");
         }
 
         let purge = tokio::spawn(async move { log_store.purge(log_id(1)).await });
@@ -1313,14 +1376,12 @@ mod tests {
             consensus::append_logs_sync(
                 &conn,
                 identity(1),
-                &expected_members(),
                 &[initial_membership_entry(), normal_entry(1, acquire.clone())],
             )
             .expect("initial and first application logs");
             let gap = consensus::append_logs_sync(
                 &conn,
                 identity(1),
-                &expected_members(),
                 &[normal_entry(3, acquire.clone())],
             );
             assert!(gap.is_err());
@@ -1353,12 +1414,8 @@ mod tests {
                 })),
                 ..acquire
             };
-            let rejected = consensus::append_logs_sync(
-                &conn,
-                identity(1),
-                &expected_members(),
-                &[normal_entry(2, unsealed)],
-            );
+            let rejected =
+                consensus::append_logs_sync(&conn, identity(1), &[normal_entry(2, unsealed)]);
             assert!(rejected.is_err());
             assert_eq!(
                 2_i64,
@@ -1511,7 +1568,6 @@ mod tests {
             consensus::append_logs_sync(
                 &conn,
                 identity(1),
-                &expected_members(),
                 &[membership.clone(), committed.clone(), first_tail],
             )
             .expect("append committed prefix and first uncommitted tail");
@@ -1538,24 +1594,14 @@ mod tests {
                 .expect("truncate only the uncommitted tail");
             let second_tail =
                 normal_entry_with_term(2, 2, advance_time_command(identity(1), 13, 3));
-            consensus::append_logs_sync(
-                &conn,
-                identity(1),
-                &expected_members(),
-                std::slice::from_ref(&second_tail),
-            )
-            .expect("append second branch at the same index");
+            consensus::append_logs_sync(&conn, identity(1), std::slice::from_ref(&second_tail))
+                .expect("append second branch at the same index");
 
             consensus::truncate_logs_sync(&conn, identity(1), &second_tail.log_id)
                 .expect("replace a second uncommitted branch");
             let third_tail = normal_entry_with_term(3, 2, advance_time_command(identity(1), 14, 4));
-            consensus::append_logs_sync(
-                &conn,
-                identity(1),
-                &expected_members(),
-                std::slice::from_ref(&third_tail),
-            )
-            .expect("append authoritative replacement tail");
+            consensus::append_logs_sync(&conn, identity(1), std::slice::from_ref(&third_tail))
+                .expect("append authoritative replacement tail");
 
             assert_eq!(
                 Some(committed.log_id),
@@ -1565,15 +1611,8 @@ mod tests {
                 Some(committed.log_id),
                 consensus::read_applied_sync(&conn, identity(1)).expect("applied pointer")
             );
-            let logs = consensus::read_log_range_sync(
-                &conn,
-                identity(1),
-                &expected_members(),
-                0,
-                Some(3),
-                None,
-            )
-            .expect("read repaired log");
+            let logs = consensus::read_log_range_sync(&conn, identity(1), 0, Some(3), None)
+                .expect("read repaired log");
             assert_eq!(3, logs.len());
             assert_eq!(committed.log_id, logs[1].log_id);
             assert_eq!(third_tail.log_id, logs[2].log_id);
@@ -1608,15 +1647,8 @@ mod tests {
             Some(committed.log_id),
             consensus::read_committed_sync(&conn, identity(1)).expect("restarted commit proof")
         );
-        let restarted_logs = consensus::read_log_range_sync(
-            &conn,
-            identity(1),
-            &expected_members(),
-            0,
-            Some(3),
-            None,
-        )
-        .expect("restarted repaired log");
+        let restarted_logs = consensus::read_log_range_sync(&conn, identity(1), 0, Some(3), None)
+            .expect("restarted repaired log");
         assert_eq!(log_id_with_term(3, 2), restarted_logs[2].log_id);
     }
 

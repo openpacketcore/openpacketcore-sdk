@@ -642,7 +642,7 @@ fn legacy_reset_requires_exact_confirmation_and_preserves_quarantine() {
             crate::sqlite::ops::read_restore_scan_state_sync(&target)
                 .expect("read recovered restore incarnation");
         restore_incarnations.insert((restore_epoch, *restore_key));
-        assert_eq!(objects.len(), 17);
+        assert_eq!(objects.len(), 19);
         assert!(objects.iter().all(|(kind, _)| kind == "table"));
     }
     assert_eq!(restore_incarnations.len(), replicas.len());
@@ -1253,14 +1253,13 @@ fn claim_current_replica(
         log_id,
         payload: EntryPayload::Membership(membership),
     };
-    consensus::append_logs_sync(&conn, identity(), members, std::slice::from_ref(&entry))
+    consensus::append_logs_sync(&conn, identity(), std::slice::from_ref(&entry))
         .expect("append membership entry");
     consensus::save_committed_sync(&conn, identity(), Some(log_id))
         .expect("save committed membership");
     consensus::apply_entries_sync(
         &conn,
         identity(),
-        members,
         &BackendCapabilities::all_enabled(),
         vec![entry],
     )

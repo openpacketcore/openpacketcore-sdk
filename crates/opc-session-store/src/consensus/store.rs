@@ -25,6 +25,7 @@ use opc_consensus::{
 use opc_types::Timestamp;
 use serde::de::{SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use super::raft_adapter::{
@@ -38,7 +39,7 @@ use super::{
     SessionConsensusPeerError, SessionConsensusRequestId, SessionConsensusResponse,
     SessionConsensusRpcFamily, SessionConsensusRpcHandler, SessionConsensusWireRequest,
     SessionConsensusWireResponse, SessionMutationIntent, SessionMutationOutcome, SessionRaft,
-    SessionRaftTypeConfig, SESSION_CONSENSUS_SCHEMA_VERSION,
+    SessionRaftTypeConfig, SessionTopologyMemberBinding, SESSION_CONSENSUS_SCHEMA_VERSION,
 };
 use crate::backend::{
     record_expiry_preflights, validate_record_expiry_preflights_at,
@@ -82,6 +83,45 @@ pub const DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT: Duration =
     DURABLE_CONSENSUS_OPERATION_TIMEOUT;
 
 const SESSION_CONSENSUS_ROUTE_RETRY_BACKOFF: Duration = Duration::from_millis(50);
+const TOPOLOGY_ENDPOINT_BINDING_DOMAIN: &[u8] =
+    b"openpacketcore/session-store/topology-endpoint-binding/v1\0";
+const TOPOLOGY_TLS_BINDING_DOMAIN: &[u8] =
+    b"openpacketcore/session-store/topology-tls-binding/v1\0";
+const TOPOLOGY_BACKING_BINDING_DOMAIN: &[u8] =
+    b"openpacketcore/session-store/topology-backing-binding/v1\0";
+
+fn topology_node_bindings(
+    topology: &ValidatedQuorumTopology,
+) -> BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding> {
+    topology
+        .members()
+        .iter()
+        .filter_map(|descriptor| {
+            let node_id = topology.consensus_node_id(descriptor.replica_id())?;
+            let mut endpoint = Sha256::new();
+            endpoint.update(TOPOLOGY_ENDPOINT_BINDING_DOMAIN);
+            endpoint.update(Sha256::digest(descriptor.endpoint().host().as_bytes()));
+            endpoint.update(descriptor.endpoint().port().to_be_bytes());
+            let mut tls = Sha256::new();
+            tls.update(TOPOLOGY_TLS_BINDING_DOMAIN);
+            tls.update(Sha256::digest(
+                descriptor.tls_identity().as_str().as_bytes(),
+            ));
+            let mut backing = Sha256::new();
+            backing.update(TOPOLOGY_BACKING_BINDING_DOMAIN);
+            backing.update(descriptor.backing_identity().fingerprint());
+            Some((
+                node_id,
+                SessionTopologyMemberBinding::new(
+                    descriptor.configuration_fingerprint(),
+                    endpoint.finalize().into(),
+                    tls.finalize().into(),
+                    backing.finalize().into(),
+                ),
+            ))
+        })
+        .collect()
+}
 
 fn attestation_deadline_from_verification_start(
     verification_started_at: tokio::time::Instant,
@@ -421,8 +461,15 @@ impl ConsensusSessionStore {
             peers.clone(),
         )?;
         let peer_directory = network.peer_directory();
-        let (log_store, state_machine) =
-            storage::open(&backend, snapshot_dir, identity, members.clone()).await?;
+        let bindings = topology_node_bindings(&topology);
+        let (log_store, state_machine, storage_identity) = storage::open_with_member_bindings(
+            &backend,
+            snapshot_dir,
+            identity,
+            members.clone(),
+            bindings,
+        )
+        .await?;
         let config = Arc::new(session_raft_config()?);
         let raft = SessionRaft::new(local_node_id, config, network, log_store, state_machine)
             .await
@@ -448,7 +495,7 @@ impl ConsensusSessionStore {
                 raft,
                 raft_handler,
                 backend,
-                storage_identity: identity,
+                storage_identity,
                 local_node_id,
                 peer_directory,
                 topology_coordinator,

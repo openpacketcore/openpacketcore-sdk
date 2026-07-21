@@ -45,6 +45,11 @@ pub enum StoreError {
     /// any next mutation from that observation.
     #[error("backend mutation outcome is unavailable")]
     BackendOperationOutcomeUnavailable,
+    /// The committed topology authority no longer admits this mutation's
+    /// authenticated origin/configuration binding. The state machine records
+    /// this deterministic rejection without applying the enclosed mutation.
+    #[error("session topology mutation authority was revoked")]
+    TopologyAuthorityRevoked,
     /// The operation requires a capability (named in the payload) that this
     /// backend did not declare in its `BackendCapabilities`. Retrying cannot
     /// succeed; choose a backend that satisfies the required profile.
