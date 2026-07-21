@@ -593,6 +593,20 @@ impl EspCounterReceiptRegistry {
         binding: EspCounterResumeBinding,
         requirement: EspCounterProofRequirement,
     ) -> Result<(), EspCounterResumeError> {
+        self.validate_with_clock(backend, binding, requirement, Instant::now)
+            .await
+    }
+
+    async fn validate_with_clock<C>(
+        &mut self,
+        backend: &LinuxXfrmBackend,
+        binding: EspCounterResumeBinding,
+        requirement: EspCounterProofRequirement,
+        now: C,
+    ) -> Result<(), EspCounterResumeError>
+    where
+        C: Fn() -> Instant,
+    {
         let record =
             self.records
                 .get(&binding)
@@ -600,7 +614,7 @@ impl EspCounterReceiptRegistry {
                 .ok_or(EspCounterResumeError::ProofUnavailable {
                     code: "esp_counter_receipt_absent_or_stale",
                 })?;
-        if Instant::now() > record.expires_at
+        if now() >= record.expires_at
             || record.fingerprint
                 != receipt_fingerprint(binding, record.observed_last, record.esn, record.authority)
         {
@@ -618,10 +632,20 @@ impl EspCounterReceiptRegistry {
         }
 
         let result = validate_receipt_readback(backend, &record, requirement).await;
-        if result.is_err() {
-            self.remove_binding(binding);
+        let expired = now() >= record.expires_at;
+        match result {
+            Err(error) => {
+                self.remove_binding(binding);
+                Err(error)
+            }
+            Ok(()) if expired => {
+                self.remove_binding(binding);
+                Err(EspCounterResumeError::ProofUnavailable {
+                    code: "esp_counter_receipt_absent_or_stale",
+                })
+            }
+            Ok(()) => Ok(()),
         }
-        result
     }
 
     fn activate(&mut self, record: CounterReceiptRecord) {
@@ -901,12 +925,84 @@ pub(crate) fn map_backend_error(error: XfrmError) -> EspCounterResumeError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Condvar, Mutex};
+
     use super::*;
-    use crate::outbound_binding::tests_support::outbound_request;
-    use crate::{
-        IpAddress, LifetimeConfig, LifetimeCurrent, SaStatistics, XfrmId, XfrmMode, XfrmRequestId,
-        XfrmSelector,
+    use crate::linux::{
+        test_outbound_binding_readback_bodies, LinuxXfrmBackendConfig, LinuxXfrmTransport,
+        SensitiveBuffer,
     };
+    use crate::outbound_binding::{tests_support::outbound_request, validate_outbound_request};
+    use crate::{
+        IpAddress, LifetimeConfig, LifetimeCurrent, SaStatistics, XfrmId, XfrmMode, XfrmProbe,
+        XfrmRequestId, XfrmSelector,
+    };
+
+    type ReadbackResponse = Result<Option<SensitiveBuffer>, XfrmError>;
+
+    #[derive(Clone)]
+    struct BlockingReadbackTransport {
+        responses: Arc<Mutex<VecDeque<ReadbackResponse>>>,
+        calls: Arc<AtomicUsize>,
+        readback_blocked: Arc<AtomicBool>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl BlockingReadbackTransport {
+        fn new(responses: impl IntoIterator<Item = ReadbackResponse>) -> Self {
+            Self {
+                responses: Arc::new(Mutex::new(responses.into_iter().collect())),
+                calls: Arc::new(AtomicUsize::new(0)),
+                readback_blocked: Arc::new(AtomicBool::new(false)),
+                release: Arc::new((Mutex::new(false), Condvar::new())),
+            }
+        }
+
+        fn release_readback(&self) {
+            let (lock, wake) = &*self.release;
+            *lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+            wake.notify_all();
+        }
+    }
+
+    impl fmt::Debug for BlockingReadbackTransport {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("BlockingReadbackTransport(<redacted>)")
+        }
+    }
+
+    impl LinuxXfrmTransport for BlockingReadbackTransport {
+        fn transact(
+            &self,
+            _operation: &'static str,
+            _request: &[u8],
+            _expected_sequence: u32,
+            _config: LinuxXfrmBackendConfig,
+        ) -> ReadbackResponse {
+            let call = self.calls.fetch_add(1, Ordering::AcqRel);
+            if call == 1 {
+                self.readback_blocked.store(true, Ordering::Release);
+                let (lock, wake) = &*self.release;
+                let mut released = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                while !*released {
+                    released = wake
+                        .wait(released)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                }
+            }
+            self.responses
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .pop_front()
+                .unwrap_or(Err(XfrmError::Unavailable))
+        }
+
+        fn probe(&self, _config: LinuxXfrmBackendConfig) -> XfrmProbe {
+            XfrmProbe::unsupported()
+        }
+    }
 
     fn state(replay_state: SaReplayState) -> SaState {
         SaState {
@@ -1051,5 +1147,88 @@ mod tests {
             parameters,
         );
         assert!(validate_requested_counter(&request, true).is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn receipt_expiring_during_readback_cannot_authorize_the_boundary() {
+        let request = outbound_request();
+        let expectation = validate_outbound_request(&request).unwrap();
+        let binding = EspCounterResumeBinding::new(1, 2, expectation.id(), 50).unwrap();
+        let before_expiry = Instant::now();
+        let expires_at = before_expiry + Duration::from_secs(1);
+        let after_expiry = expires_at + Duration::from_secs(1);
+        let authority = ReceiptAuthority::Applied;
+        let record = CounterReceiptRecord {
+            binding,
+            expectation,
+            requested_last: 49,
+            observed_last: 49,
+            esn: true,
+            authority,
+            fingerprint: receipt_fingerprint(binding, 49, true, authority),
+            expires_at,
+        };
+        let mut registry = EspCounterReceiptRegistry::default();
+        registry.activate(record);
+
+        let mut observed = request;
+        let mut replay = SaReplayState::fresh(64);
+        replay.outbound_sequence = 49;
+        observed.sa.parameters.replay_state = Some(replay);
+        let (policy, sa) = test_outbound_binding_readback_bodies(&observed).unwrap();
+        let transport = BlockingReadbackTransport::new([Ok(Some(policy)), Ok(Some(sa))]);
+        let capture = transport.clone();
+        let backend = LinuxXfrmBackend::with_transport(transport);
+        let expired = Arc::new(AtomicBool::new(false));
+
+        let validation = tokio::spawn({
+            let expired = Arc::clone(&expired);
+            async move {
+                let first = registry
+                    .validate_with_clock(
+                        &backend,
+                        binding,
+                        EspCounterProofRequirement::BeforeFirstPublication,
+                        move || {
+                            if expired.load(Ordering::Acquire) {
+                                after_expiry
+                            } else {
+                                before_expiry
+                            }
+                        },
+                    )
+                    .await
+                    .unwrap_err();
+                let second = registry
+                    .validate_with_clock(
+                        &backend,
+                        binding,
+                        EspCounterProofRequirement::BeforeFirstPublication,
+                        || after_expiry,
+                    )
+                    .await
+                    .unwrap_err();
+                (first.code(), second.code())
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !capture.readback_blocked.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("validation reaches the blocked final readback");
+        expired.store(true, Ordering::Release);
+        capture.release_readback();
+
+        assert_eq!(
+            validation.await.unwrap(),
+            (
+                "esp_counter_receipt_absent_or_stale",
+                "esp_counter_receipt_absent_or_stale"
+            )
+        );
+        assert_eq!(capture.calls.load(Ordering::Acquire), 2);
     }
 }
