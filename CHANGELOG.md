@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Breaking: typed SWm Diameter-EAP overload and Load context —
+  `opc-proto-diameter`:** `SwmDiameterEapRequest` adds optional typed RFC 7683
+  `oc_supported_features`; `SwmDiameterEapAnswer` adds the request-conditioned
+  selection, typed loss `oc_olr`, and bounded ordered RFC 8583 `load_reports`.
+  Existing struct literals initialize `None`, `None`, `None`, and `Vec::new()`.
+  DER/DEA reuse the lifecycle codec's constants, grouped validation, safe RFC
+  defaults, unknown-child policy, and offer/selection correlation. Standalone
+  DEA encoding rejects OC response AVPs; request-bound build and envelope
+  correlation prove the offer. Load remains independent, canonicalizes its
+  received M-bit mismatch, and requires authenticated-peer SourceID matching
+  before a peer report is actionable. This is the RFC 7683 baseline loss
+  profile, not RFC 8581 peer-overload support, and it does not close the
+  remaining #352 DEA/APN context.
 - **Breaking: SWm DER non-overload access context — `opc-proto-diameter`:**
   `SwmDiameterEapRequest` adds optional typed RFC 5777 `QoS-Capability`,
   `Visited-Network-Identifier`, `AAA-Failure-Indication`, and reused

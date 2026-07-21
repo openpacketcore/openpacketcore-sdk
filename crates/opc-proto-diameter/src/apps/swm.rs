@@ -6,8 +6,9 @@
 //! including the deterministic successful-ASA transition to an administrative
 //! STR when Diameter session state is maintained, and the RAR/RAA then AAR/AAA
 //! authorization-information update sequence, the non-overload DER access
-//! context (QoS capabilities, visited PLMN, AAA failover, and priority), plus a
-//! bounded
+//! context (QoS capabilities, visited PLMN, AAA failover, and priority), a
+//! typed request-conditioned RFC 7683 baseline loss-overload offer/report,
+//! ordered RFC 8583 Diameter Load context, and a bounded
 //! subscription-profile extension surface for APN-Configuration, its default
 //! Context-Identifier, Service-Selection, and the TS 29.273 emergency attach
 //! sequence. The top-level default pointer is accepted under the DEA
@@ -23,6 +24,8 @@
 //! @spec 3GPP TS29272 7.3
 //! @spec IETF RFC4072
 //! @spec IETF RFC5778
+//! @spec IETF RFC7683
+//! @spec IETF RFC8583
 //! @conformance scaffold — see CONFORMANCE.md
 
 use bytes::BytesMut;
@@ -163,6 +166,25 @@ pub const SWM_FEATURE_LIST: u32 = 0;
 const MAX_SWM_SUPPORTED_FEATURES: usize = 128;
 const MAX_SWM_QOS_PROFILE_TEMPLATES: usize = 128;
 const MAX_SWM_QOS_GROUP_CHILDREN: usize = 128;
+const MAX_SWM_LOAD_REPORTS: usize = 128;
+
+const fn is_overload_grouped_child(code: AvpCode) -> bool {
+    matches!(
+        code,
+        AVP_OC_FEATURE_VECTOR
+            | AVP_OC_SEQUENCE_NUMBER
+            | AVP_OC_VALIDITY_DURATION
+            | AVP_OC_REPORT_TYPE
+            | AVP_OC_REDUCTION_PERCENTAGE
+            | AVP_LOAD_TYPE
+            | AVP_LOAD_VALUE
+            | AVP_SOURCE_ID
+    )
+}
+
+fn is_forbidden_der_overload_avp(code: AvpCode) -> bool {
+    code == AVP_OC_OLR || code == AVP_LOAD || is_overload_grouped_child(code)
+}
 
 /// 3GPP SWm application definition.
 pub const APPLICATION: ApplicationDefinition = ApplicationDefinition::new(
@@ -172,7 +194,7 @@ pub const APPLICATION: ApplicationDefinition = ApplicationDefinition::new(
     SpecRef::new("3gpp", "TS29273", "SWm Diameter application"),
 );
 
-static SWM_REQUEST_AVP_RULES: [CommandAvpRule; 14] = [
+static SWM_REQUEST_AVP_RULES: [CommandAvpRule; 25] = [
     CommandAvpRule::new(
         AvpKey::ietf(base::AVP_SESSION_ID),
         AvpCardinality::ZeroOrOne,
@@ -220,12 +242,38 @@ static SWM_REQUEST_AVP_RULES: [CommandAvpRule; 14] = [
         AvpCardinality::ZeroOrOne,
     ),
     CommandAvpRule::new(
+        AvpKey::ietf(AVP_OC_SUPPORTED_FEATURES),
+        AvpCardinality::ZeroOrOne,
+    ),
+    CommandAvpRule::new(
+        AvpKey::ietf(AVP_OC_FEATURE_VECTOR),
+        AvpCardinality::Forbidden,
+    ),
+    CommandAvpRule::new(AvpKey::ietf(AVP_OC_OLR), AvpCardinality::Forbidden),
+    CommandAvpRule::new(
+        AvpKey::ietf(AVP_OC_SEQUENCE_NUMBER),
+        AvpCardinality::Forbidden,
+    ),
+    CommandAvpRule::new(
+        AvpKey::ietf(AVP_OC_VALIDITY_DURATION),
+        AvpCardinality::Forbidden,
+    ),
+    CommandAvpRule::new(AvpKey::ietf(AVP_OC_REPORT_TYPE), AvpCardinality::Forbidden),
+    CommandAvpRule::new(
+        AvpKey::ietf(AVP_OC_REDUCTION_PERCENTAGE),
+        AvpCardinality::Forbidden,
+    ),
+    CommandAvpRule::new(AvpKey::ietf(AVP_LOAD), AvpCardinality::Forbidden),
+    CommandAvpRule::new(AvpKey::ietf(AVP_LOAD_TYPE), AvpCardinality::Forbidden),
+    CommandAvpRule::new(AvpKey::ietf(AVP_LOAD_VALUE), AvpCardinality::Forbidden),
+    CommandAvpRule::new(AvpKey::ietf(AVP_SOURCE_ID), AvpCardinality::Forbidden),
+    CommandAvpRule::new(
         AvpKey::ietf(base::AVP_RESULT_CODE),
         AvpCardinality::Forbidden,
     ),
 ];
 
-static SWM_ANSWER_AVP_RULES: [CommandAvpRule; 8] = [
+static SWM_ANSWER_AVP_RULES: [CommandAvpRule; 19] = [
     CommandAvpRule::new(AvpKey::ietf(AVP_STATE), AvpCardinality::ZeroOrMore),
     CommandAvpRule::new(
         AvpKey::ietf(base::AVP_RESULT_CODE),
@@ -255,9 +303,35 @@ static SWM_ANSWER_AVP_RULES: [CommandAvpRule; 8] = [
         AvpKey::vendor(AVP_SUPPORTED_FEATURES, VENDOR_ID_3GPP),
         AvpCardinality::ZeroOrMore,
     ),
+    CommandAvpRule::new(
+        AvpKey::ietf(AVP_OC_SUPPORTED_FEATURES),
+        AvpCardinality::ZeroOrOne,
+    ),
+    CommandAvpRule::new(AvpKey::ietf(AVP_OC_OLR), AvpCardinality::ZeroOrOne),
+    CommandAvpRule::new(AvpKey::ietf(AVP_LOAD), AvpCardinality::ZeroOrMore),
+    CommandAvpRule::new(
+        AvpKey::ietf(AVP_OC_FEATURE_VECTOR),
+        AvpCardinality::Forbidden,
+    ),
+    CommandAvpRule::new(
+        AvpKey::ietf(AVP_OC_SEQUENCE_NUMBER),
+        AvpCardinality::Forbidden,
+    ),
+    CommandAvpRule::new(
+        AvpKey::ietf(AVP_OC_VALIDITY_DURATION),
+        AvpCardinality::Forbidden,
+    ),
+    CommandAvpRule::new(AvpKey::ietf(AVP_OC_REPORT_TYPE), AvpCardinality::Forbidden),
+    CommandAvpRule::new(
+        AvpKey::ietf(AVP_OC_REDUCTION_PERCENTAGE),
+        AvpCardinality::Forbidden,
+    ),
+    CommandAvpRule::new(AvpKey::ietf(AVP_LOAD_TYPE), AvpCardinality::Forbidden),
+    CommandAvpRule::new(AvpKey::ietf(AVP_LOAD_VALUE), AvpCardinality::Forbidden),
+    CommandAvpRule::new(AvpKey::ietf(AVP_SOURCE_ID), AvpCardinality::Forbidden),
 ];
 
-static SWM_PROJECTED_PROFILE_ANSWER_AVP_RULES: [CommandAvpRule; 8] = [
+static SWM_PROJECTED_PROFILE_ANSWER_AVP_RULES: [CommandAvpRule; 19] = [
     CommandAvpRule::new(AvpKey::ietf(AVP_STATE), AvpCardinality::ZeroOrMore),
     CommandAvpRule::new(
         AvpKey::ietf(base::AVP_RESULT_CODE),
@@ -287,6 +361,32 @@ static SWM_PROJECTED_PROFILE_ANSWER_AVP_RULES: [CommandAvpRule; 8] = [
         AvpKey::vendor(AVP_SUPPORTED_FEATURES, VENDOR_ID_3GPP),
         AvpCardinality::ZeroOrMore,
     ),
+    CommandAvpRule::new(
+        AvpKey::ietf(AVP_OC_SUPPORTED_FEATURES),
+        AvpCardinality::ZeroOrOne,
+    ),
+    CommandAvpRule::new(AvpKey::ietf(AVP_OC_OLR), AvpCardinality::ZeroOrOne),
+    CommandAvpRule::new(AvpKey::ietf(AVP_LOAD), AvpCardinality::ZeroOrMore),
+    CommandAvpRule::new(
+        AvpKey::ietf(AVP_OC_FEATURE_VECTOR),
+        AvpCardinality::Forbidden,
+    ),
+    CommandAvpRule::new(
+        AvpKey::ietf(AVP_OC_SEQUENCE_NUMBER),
+        AvpCardinality::Forbidden,
+    ),
+    CommandAvpRule::new(
+        AvpKey::ietf(AVP_OC_VALIDITY_DURATION),
+        AvpCardinality::Forbidden,
+    ),
+    CommandAvpRule::new(AvpKey::ietf(AVP_OC_REPORT_TYPE), AvpCardinality::Forbidden),
+    CommandAvpRule::new(
+        AvpKey::ietf(AVP_OC_REDUCTION_PERCENTAGE),
+        AvpCardinality::Forbidden,
+    ),
+    CommandAvpRule::new(AvpKey::ietf(AVP_LOAD_TYPE), AvpCardinality::Forbidden),
+    CommandAvpRule::new(AvpKey::ietf(AVP_LOAD_VALUE), AvpCardinality::Forbidden),
+    CommandAvpRule::new(AvpKey::ietf(AVP_SOURCE_ID), AvpCardinality::Forbidden),
 ];
 
 static TERMINAL_INFORMATION_AVP_RULES: [CommandAvpRule; 2] = [
@@ -1206,6 +1306,13 @@ impl fmt::Debug for SwmDiameterEapRequestEnvelope {
 pub struct SwmDiameterEapAnswerEnvelope {
     transaction: SwmDiameterTransaction,
     answer: SwmDiameterEapAnswer,
+    provenance: SwmDiameterEapAnswerEnvelopeProvenance,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SwmDiameterEapAnswerEnvelopeProvenance {
+    Parsed,
+    Outbound,
 }
 
 /// Opaque request/answer pair with all SWm and Diameter correlation checked.
@@ -1252,6 +1359,7 @@ impl SwmDiameterEapAnswerEnvelope {
         Self {
             transaction,
             answer,
+            provenance: SwmDiameterEapAnswerEnvelopeProvenance::Outbound,
         }
     }
 
@@ -2489,6 +2597,11 @@ pub struct SwmDiameterEapRequest {
     pub supported_features: Vec<SwmRequestedSupportedFeatures>,
     /// UE local address used for this access (presence-only in diagnostics).
     pub ue_local_ip_address: Option<IpAddr>,
+    /// RFC 7683 overload-control capability offered for this transaction.
+    ///
+    /// Absence remains wire-compatible with peers that do not use DOIC. The
+    /// SDK currently originates only the default loss algorithm.
+    pub oc_supported_features: Option<SwmOcSupportedFeatures>,
     /// Auth-Request-Type.
     pub auth_request_type: AuthRequestType,
     /// EAP-Payload (redacted in diagnostic output).
@@ -2536,6 +2649,7 @@ impl std::fmt::Debug for SwmDiameterEapRequest {
                 "ue_local_ip_address",
                 &self.ue_local_ip_address.map(|_| "<redacted>"),
             )
+            .field("oc_supported_features", &self.oc_supported_features)
             .field("auth_request_type", &self.auth_request_type)
             .field("eap_payload", &self.eap_payload)
             .field("emergency_services", &self.emergency_services)
@@ -2567,6 +2681,12 @@ pub struct SwmDiameterEapAnswer {
     pub mip6_feature_vector: Option<SwmMip6FeatureVector>,
     /// Ordered Supported-Features groups returned by the AAA server.
     pub supported_features: Vec<SwmSupportedFeatureList>,
+    /// RFC 7683 overload-control algorithm selected by the AAA server.
+    pub oc_supported_features: Option<SwmOcSupportedFeatures>,
+    /// Optional RFC 7683 overload report.
+    pub oc_olr: Option<SwmOcOlr>,
+    /// Ordered, bounded RFC 8583 load reports.
+    pub load_reports: Vec<SwmLoad>,
     /// Top-level Service-Selection (redacted in diagnostic output).
     ///
     /// This is distinct from the subscription default APN pointer carried by
@@ -2615,6 +2735,9 @@ impl std::fmt::Debug for SwmDiameterEapAnswer {
                 &self.mip6_feature_vector.map(|_| "<redacted>"),
             )
             .field("supported_features", &self.supported_features.len())
+            .field("oc_supported_features", &self.oc_supported_features)
+            .field("oc_olr", &self.oc_olr)
+            .field("load_reports", &self.load_reports.len())
             .field("service_selection", &self.service_selection)
             .field(
                 "default_context_identifier",
@@ -2740,6 +2863,16 @@ impl SwmDiameterEapRequest {
         validate_requested_supported_features(&self.supported_features)
             .map_err(|reason| encode_structural_error(reason, "6.3.29"))?;
         if self
+            .oc_supported_features
+            .as_ref()
+            .is_some_and(|features| features.effective_feature_vector() != SWM_OC_LOSS_ALGORITHM)
+        {
+            return Err(encode_structural_error(
+                "SWm DER OC-Supported-Features may advertise only the executable loss algorithm",
+                "RFC7683-5.1.1",
+            ));
+        }
+        if self
             .high_priority_access_info
             .is_some_and(|info| !info.is_configured())
         {
@@ -2771,6 +2904,17 @@ impl SwmDiameterEapRequest {
 
 impl SwmDiameterEapAnswer {
     fn validate_for_encode(&self) -> Result<(), EncodeError> {
+        self.validate_with_load_purpose(true)
+    }
+
+    fn validate_for_correlation(&self) -> Result<(), EncodeError> {
+        self.validate_with_load_purpose(false)
+    }
+
+    fn validate_with_load_purpose(
+        &self,
+        require_complete_originated_loads: bool,
+    ) -> Result<(), EncodeError> {
         if self.session_id.as_ref().is_empty() {
             return Err(encode_structural_error(
                 "SWm DEA Session-Id must not be empty",
@@ -2860,6 +3004,43 @@ impl SwmDiameterEapAnswer {
         }
         validate_answer_supported_features(&self.supported_features)
             .map_err(|reason| encode_structural_error(reason, "6.3.29"))?;
+        if self
+            .oc_supported_features
+            .as_ref()
+            .is_some_and(|features| features.effective_feature_vector() != SWM_OC_LOSS_ALGORITHM)
+        {
+            return Err(encode_structural_error(
+                "SWm DEA OC-Supported-Features may select only the executable loss algorithm",
+                "RFC7683-5.1.2",
+            ));
+        }
+        lifecycle::validate_diameter_eap_answer_overload_control(
+            self.oc_supported_features.as_ref(),
+            self.oc_olr.as_ref(),
+        )
+        .map_err(|_| {
+            encode_structural_error(
+                "SWm DEA overload-control values are internally inconsistent",
+                "RFC7683-5.1.2",
+            )
+        })?;
+        if self.load_reports.len() > MAX_SWM_LOAD_REPORTS {
+            return Err(encode_structural_error(
+                "SWm DEA contains too many Load AVPs",
+                "RFC8583-7.1",
+            ));
+        }
+        if require_complete_originated_loads
+            && self
+                .load_reports
+                .iter()
+                .any(|load| load.complete_tuple().is_none())
+        {
+            return Err(encode_structural_error(
+                "originated SWm DEA Load requires Load-Type, Load-Value, and SourceID",
+                "RFC8583-6.1",
+            ));
+        }
         if self.result_category() == SwmResultCategory::Success && !self.carries_eap_material() {
             return Err(encode_structural_error(
                 "SWm DEA success must carry EAP or MSK material",
@@ -3112,6 +3293,13 @@ pub fn build_swm_diameter_eap_request(
             ctx,
         )?;
     }
+    if let Some(oc_supported_features) = request.oc_supported_features.as_ref() {
+        lifecycle::append_request_oc_supported_features(
+            &mut raw_avps,
+            oc_supported_features.clone(),
+            ctx,
+        )?;
+    }
     if let Some(address) = request.ue_local_ip_address {
         let mut value = BytesMut::new();
         builder_helpers::encode_address_value(&mut value, address);
@@ -3233,6 +3421,7 @@ pub fn parse_swm_diameter_eap_request_with_provenance(
     let mut aaa_failure_indication = None;
     let mut supported_features = Vec::new();
     let mut ue_local_ip_address = None;
+    let mut oc_supported_features = None;
     let mut auth_request_type = None;
     let mut eap_payload = None;
     let mut emergency_services = None;
@@ -3434,6 +3623,27 @@ pub fn parse_swm_diameter_eap_request_with_provenance(
                     }
                     Err(QosCapabilityParseError::Decode(error)) => return Err(error),
                 }
+            } else if code == AVP_OC_SUPPORTED_FEATURES {
+                let value = lifecycle::parse_diameter_eap_request_oc_supported_features(
+                    &avp,
+                    ctx,
+                    offset,
+                    value_offset,
+                )?;
+                builder_helpers::set_once(
+                    &mut oc_supported_features,
+                    value,
+                    offset,
+                    "RFC7683-7.1",
+                )?;
+            } else if is_forbidden_der_overload_avp(code) {
+                return Err(DecodeError::new(
+                    DecodeErrorCode::Structural {
+                        reason: "answer-only or grouped overload AVP appears at DER top level",
+                    },
+                    offset,
+                )
+                .with_spec_ref(SpecRef::new("3gpp", "TS29273", "7.2.2.1.1")));
             } else if code == AVP_AUTH_REQUEST_TYPE {
                 let value = builder_helpers::parse_u32_value(avp.value, value_offset, "8.7")?;
                 builder_helpers::set_once(
@@ -3596,6 +3806,7 @@ pub fn parse_swm_diameter_eap_request_with_provenance(
         aaa_failure_indication,
         supported_features,
         ue_local_ip_address,
+        oc_supported_features,
         auth_request_type: require_swm_request_field(
             auth_request_type,
             "SWm DER requires Auth-Request-Type",
@@ -3673,13 +3884,43 @@ pub fn parse_swm_diameter_eap_request_envelope_with_provenance(
 }
 
 /// Build a SWm Diameter-EAP-Answer message.
+///
+/// RFC 7683 overload-control response AVPs are request-conditioned and are
+/// therefore rejected at this answer-local compatibility boundary. Use
+/// [`build_swm_diameter_eap_answer_for`] when `oc_supported_features` or
+/// `oc_olr` is present. RFC 8583 Load reports are independent and remain
+/// available here.
 pub fn build_swm_diameter_eap_answer(
     answer: &SwmDiameterEapAnswer,
     hop_by_hop_identifier: u32,
     end_to_end_identifier: u32,
     ctx: EncodeContext,
 ) -> Result<OwnedMessage, EncodeError> {
+    build_swm_diameter_eap_answer_internal(
+        answer,
+        hop_by_hop_identifier,
+        end_to_end_identifier,
+        false,
+        ctx,
+    )
+}
+
+fn build_swm_diameter_eap_answer_internal(
+    answer: &SwmDiameterEapAnswer,
+    hop_by_hop_identifier: u32,
+    end_to_end_identifier: u32,
+    overload_request_conditioned: bool,
+    ctx: EncodeContext,
+) -> Result<OwnedMessage, EncodeError> {
     answer.validate_for_encode()?;
+    if !overload_request_conditioned
+        && (answer.oc_supported_features.is_some() || answer.oc_olr.is_some())
+    {
+        return Err(encode_structural_error(
+            "SWm DEA overload-control response requires a correlated DER capability offer",
+            "RFC7683-5.1.2",
+        ));
+    }
     let mut raw_avps = BytesMut::new();
     builder_helpers::append_utf8_avp(
         &mut raw_avps,
@@ -3744,6 +3985,19 @@ pub fn build_swm_diameter_eap_answer(
     }
     for supported_features in &answer.supported_features {
         append_supported_features_avp(&mut raw_avps, supported_features, false, ctx)?;
+    }
+    if let Some(oc_supported_features) = answer.oc_supported_features.as_ref() {
+        lifecycle::append_answer_oc_supported_features(
+            &mut raw_avps,
+            oc_supported_features.clone(),
+            ctx,
+        )?;
+    }
+    if let Some(oc_olr) = answer.oc_olr.as_ref() {
+        lifecycle::append_oc_olr(&mut raw_avps, oc_olr.clone(), ctx)?;
+    }
+    for load in &answer.load_reports {
+        lifecycle::append_load(&mut raw_avps, load, ctx)?;
     }
     if let Some(default_context_identifier) = answer.default_context_identifier {
         builder_helpers::append_vendor_u32_avp(
@@ -3847,6 +4101,12 @@ pub fn build_swm_diameter_eap_answer_for(
             answer.mip6_feature_vector,
             answer.result.is_diameter_success(),
         )
+        || lifecycle::validate_diameter_eap_answer_overload_control_for_request(
+            request_facts.oc_supported_features.as_ref(),
+            answer.oc_supported_features.as_ref(),
+            answer.oc_olr.as_ref(),
+        )
+        .is_err()
     {
         return Err(encode_structural_error(
             "SWm DEA does not correlate to the supplied DER",
@@ -3854,10 +4114,11 @@ pub fn build_swm_diameter_eap_answer_for(
         ));
     }
     let transaction = request.transaction();
-    build_swm_diameter_eap_answer(
+    build_swm_diameter_eap_answer_internal(
         answer,
         transaction.hop_by_hop_identifier(),
         transaction.end_to_end_identifier(),
+        true,
         ctx,
     )
 }
@@ -3884,6 +4145,9 @@ pub fn parse_swm_diameter_eap_answer(
     let mut user_name = None;
     let mut mip6_feature_vector = None;
     let mut supported_features = Vec::new();
+    let mut oc_supported_features = None;
+    let mut oc_olr = None;
+    let mut load_reports = Vec::new();
     let mut service_selection = None;
     let mut default_context_identifier = None;
     let mut apn_configurations = Vec::new();
@@ -3981,6 +4245,42 @@ pub fn parse_swm_diameter_eap_answer(
                     offset,
                     "4.2.5",
                 )?;
+            } else if code == AVP_OC_SUPPORTED_FEATURES {
+                let value = lifecycle::parse_diameter_eap_answer_oc_supported_features(
+                    &avp,
+                    ctx,
+                    offset,
+                    value_offset,
+                )?;
+                builder_helpers::set_once(
+                    &mut oc_supported_features,
+                    value,
+                    offset,
+                    "RFC7683-7.1",
+                )?;
+            } else if code == AVP_OC_OLR {
+                let value =
+                    lifecycle::parse_diameter_eap_answer_oc_olr(&avp, ctx, offset, value_offset)?;
+                builder_helpers::set_once(&mut oc_olr, value, offset, "RFC7683-7.3")?;
+            } else if code == AVP_LOAD {
+                if load_reports.len() >= MAX_SWM_LOAD_REPORTS {
+                    return Err(DecodeError::new(DecodeErrorCode::IeCountExceeded, offset)
+                        .with_spec_ref(SpecRef::new("ietf", "RFC8583", "7.1")));
+                }
+                load_reports.push(lifecycle::parse_diameter_eap_answer_load(
+                    &avp,
+                    ctx,
+                    offset,
+                    value_offset,
+                )?);
+            } else if is_overload_grouped_child(code) {
+                return Err(DecodeError::new(
+                    DecodeErrorCode::Structural {
+                        reason: "grouped overload child AVP appears at DEA top level",
+                    },
+                    offset,
+                )
+                .with_spec_ref(SpecRef::new("3gpp", "TS29273", "7.2.2.1.2")));
             } else if code == AVP_SERVICE_SELECTION {
                 let value = builder_helpers::parse_string_value(avp.value, value_offset, "6.2")?;
                 builder_helpers::set_once(
@@ -4094,6 +4394,9 @@ pub fn parse_swm_diameter_eap_answer(
         user_name,
         mip6_feature_vector,
         supported_features,
+        oc_supported_features,
+        oc_olr,
+        load_reports,
         service_selection,
         default_context_identifier,
         apn_configurations,
@@ -4104,6 +4407,10 @@ pub fn parse_swm_diameter_eap_answer(
         state_avps,
         eap_master_session_key,
     };
+    lifecycle::validate_diameter_eap_answer_overload_control(
+        answer.oc_supported_features.as_ref(),
+        answer.oc_olr.as_ref(),
+    )?;
     validate_decoded_answer(&answer)?;
     Ok(answer)
 }
@@ -4121,6 +4428,7 @@ pub fn parse_swm_diameter_eap_answer_envelope(
     Ok(SwmDiameterEapAnswerEnvelope {
         transaction,
         answer,
+        provenance: SwmDiameterEapAnswerEnvelopeProvenance::Parsed,
     })
 }
 
@@ -5525,12 +5833,20 @@ fn ensure_correlated_answer(
             answer.mip6_feature_vector,
             answer.result.is_diameter_success(),
         )
+        || lifecycle::validate_diameter_eap_answer_overload_control_for_request(
+            request.oc_supported_features.as_ref(),
+            answer.oc_supported_features.as_ref(),
+            answer.oc_olr.as_ref(),
+        )
+        .is_err()
     {
         return Err(SwmEmergencyAuthorizationError::AnswerRequestMismatch);
     }
-    answer
-        .validate_for_encode()
-        .map_err(|_| SwmEmergencyAuthorizationError::AnswerInvalid)?;
+    match answer_envelope.provenance {
+        SwmDiameterEapAnswerEnvelopeProvenance::Parsed => answer.validate_for_correlation(),
+        SwmDiameterEapAnswerEnvelopeProvenance::Outbound => answer.validate_for_encode(),
+    }
+    .map_err(|_| SwmEmergencyAuthorizationError::AnswerInvalid)?;
     Ok(())
 }
 
@@ -5560,6 +5876,7 @@ fn retry_preserves_initial_request(
         && initial_request.mip6_feature_vector == retry_request.mip6_feature_vector
         && initial_request.supported_features == retry_request.supported_features
         && initial_request.ue_local_ip_address == retry_request.ue_local_ip_address
+        && initial_request.oc_supported_features == retry_request.oc_supported_features
         && initial_request.auth_request_type == retry_request.auth_request_type
         && initial_request.eap_payload == retry_request.eap_payload
         && initial_request.emergency_services == retry_request.emergency_services
