@@ -318,7 +318,7 @@ remove only a proven-dead owned stale socket after an unclean process exit.
 
 ---
 
-## Current durable multi-SA re-pin foundation — 2026-07-18
+## Current durable multi-SA re-pin and applied ESP counter foundation — 2026-07-21
 
 `opc-ipsec-lb` now implements the SDK portion of
 [issue #365](https://github.com/openpacketcore/openpacketcore-sdk/issues/365).
@@ -346,9 +346,22 @@ a separate global mutation-free sweep of every owner, fence, transition ID,
 complete request fingerprint, retry proof, and target shard owner. Monotonic
 non-ABA fences make a successful second sweep the prefix linearization point.
 A supported direct per-SA transition that displaces an earlier entry while a
-later repair waits therefore fails closed before a later mutation. Raw
-`SteeringBackend` mutation outside `RePinCoordinator` is explicitly outside the
-contract because it can drift without advancing an ownership fence.
+later repair waits therefore fails closed before a later mutation. Every
+activation acquires an exact non-cloneable `RePinSteeringBackend` permit before
+its final reads and retains it through the ownership CAS and Host publication.
+Host-XDP binds the permit to its backend, canonical ownership key, and fixed
+operation stripe; the private update separately binds target owner and
+authoritative generation.
+Host-XDP destination-scoped mode has no legacy raw `SteeringBackend` mutation
+path; downstream adapters that bypass the permit remain explicitly outside the
+contract because they can drift without advancing an ownership fence.
+Its ABI v5 datapath requires an exact non-zero generation match between the
+destination-scoped `IPSEC_LB_OWNERS` entry and `IPSEC_LB_KEY_FENCES` entry.
+Activation clears the keyed fence, stages and reads back the owner while it is
+stale, and performs the keyed-fence write/readback last. Retirement advances
+durable authority before removing and reading back both entries. Ambiguous
+cleanup triggers a per-key stale cut, CONFIG removal, and detach; a detached
+backend is mutation-ready again only if fresh pins are also proven feasible.
 
 Successful `start` or `resume` proves one whole-prefix convergence point during
 that invocation. It is not an ownership or steering lease and does not
@@ -360,27 +373,54 @@ without rerunning convergence validation; it is not live ownership or steering
 authority.
 
 The production journal adapter uses the existing session-store lease/CAS
-authority, bounded v1 payload envelope, tenant/NF/session key scope, and
+authority, bounded v3 Active payload envelope, tenant/NF/session key scope, and
 `AuthoritativeSession` record profile. Competing plans cannot replace active
 progress, while identical helpers converge idempotently. With the normal
 `EncryptingSessionBackend` over the quorum store, exact request metadata is
 sealed before persistence and follows the existing HKMS/KMS rotation path; no
 second encryption or consensus implementation was added. Startup and every
 read/write validate the complete lease/CAS authority capability set and fixed
-checkpoint budget, so a downgraded backend cannot replay terminal success.
+checkpoint budget, so a downgraded backend cannot replay terminal success. The
+journal persists the key-free `OutboundSaBindingId`, not live
+`InstalledOutboundSaBinding`, receipt, target, namespace-actor identity, or SA
+key material. The existing HKMS API, wrapping and rotation behavior, and
+encrypted-at-rest boundary are unchanged.
 
-An authoritative teardown can call the typed terminal retirement boundary
-with the exact session and operation-plus-plan identity. The journal admits it
-only from `Complete`, then replaces the v1 checkpoint through the same fenced
-CAS with an encrypted v2 tombstone. Exact retries are idempotent across lost
-acknowledgements and restart; prepared/forward progress, stale predecessors,
-stale successors, and concurrent losing generations conflict without
-discarding a known ownership commit. The v2 payload binds `retired_at` and
-`expires_at`; record expiry must match it exactly and the interval must equal
-the fixed seven-day `SESSION_REPIN_RETIREMENT_RETENTION`. Checkpoint writes stay
-byte-compatible v1, decoder dispatch accepts only exact v1/v2, and older
-v1-only SDKs fail closed on a v2 tombstone rather than interpreting another
-shape.
+After quiescing product transitions and removing product-owned IKE/XFRM SAs,
+keys, and other dataplane objects, a consumer can call only the typed
+`SessionRePinCoordinator::retire` boundary with the exact terminal session and
+operation-plus-plan identity. The low-level journal exposes no direct
+Active-to-retired-tombstone completion operation; its granular transition and
+progress methods are proof-gated recovery primitives, not a supported teardown
+shortcut. While the session is still Active, the coordinator
+acquires the complete bounded Host operation batch, rechecks every exact
+ownership grant, and writes non-expiring v4 `Retiring` progress. It then
+advances each ownership record to a higher retirement fence, removes and reads
+back the exact Host owner and keyed fence, durably records `CleanupComplete`,
+and only then fenced-deletes ownership. A strictly newer different lineage is
+recorded as finalized `Superseded` without Host mutation; same-lineage and
+unbound states fail closed.
+
+Only fully finalized v4 progress becomes the encrypted fenced-CAS v2 tombstone.
+Exact retries are idempotent across lost acknowledgements, cancellation, and
+restart; the admitted worker is owned so cancellation cannot abandon a CAS,
+Host cleanup, or marker write. Activation and retirement share fixed keyed Host
+operation stripes; an indeterminate authority outcome poisons its stripe and
+makes re-pin readiness false until restart. Prepared/forward progress, stale
+predecessors, stale successors, and concurrent losing generations conflict
+without discarding known ownership progress. The v2 payload binds `retired_at`
+and `expires_at`; record expiry must match it exactly and the interval must equal
+the fixed seven-day `SESSION_REPIN_RETIREMENT_RETENTION`. Decoder dispatch
+accepts only exact Active v3, Retiring v4, and Retired v2 envelopes and rejects
+unknown versions and fields instead of interpreting another shape.
+
+There is intentionally no unsafe Active-v1-to-v3 conversion. The old v1
+numeric/SPI-only checkpoint does not contain the destination, outbound binding,
+or live actor proof now required by issue #333, so it fails closed. Operators
+must drain or complete an Active v1 transition on the old SDK before upgrade,
+or rekey and begin a fresh v3 transition. Exact Retired v2 tombstones remain
+valid and continue fencing stale retries; they are not interpreted as Active
+state.
 
 Tombstone storage is bounded by retirement rate over seven days and is cleaned
 through the session store's already-required per-key TTL capability. Stale
@@ -391,25 +431,59 @@ tombstone uses the existing private tenant/NF/session key and
 `EncryptingSessionBackend`, so the configured encryption-at-rest and HKMS/KMS
 rotation boundary is unchanged.
 
-Tests cover failures
-before ownership, immediately after commit, during steering, and at all three
-audit positions for every SA position; restart from prepared, committed,
-completed-prefix, and terminal stages; exact-helper races; foreign-plan
-rejection; successor identity reuse; stale resume/status identities; completed
-prefix owner/fence/transition/fingerprint and steering conflicts; direct
-single-SA displacement; deterministic earlier/later repair interleavings on
-both mock and session-store journals; codec corruption; encrypted raw storage;
-terminal retirement races; lost-acknowledgement restart; exact tombstone TTL
-cleanup; v1/v2 codec and metadata corruption; encrypted raw storage; and
-redaction.
+Tests cover failures before ownership, immediately after commit, during
+steering, and at all three audit positions for every SA position; restart from
+prepared, committed, completed-prefix, and terminal stages; exact-helper races;
+foreign-plan rejection; successor identity reuse; stale resume/status
+identities; completed-prefix owner/fence/transition/fingerprint and steering
+conflicts; direct single-SA displacement; deterministic earlier/later repair
+interleavings on both mock and session-store journals; cancellation at the
+session cut, Host cleanup, and marker write; activation/retirement ordering;
+every Host partial-cleanup acknowledgement cut; foreign Host state with zero
+mutation; malformed or missing ambiguous ownership readback and Host-stripe
+poisoning; more than 65,536 activation/retirement cycles returning both Host
+maps to baseline while the store fence floor survives deletion; v4 maximum-plan
+`CleanupComplete`/`Superseded` restart and tamper rejection;
+lost-acknowledgement restart; exact v2 tombstone TTL cleanup;
+encrypted raw storage; and redaction.
 
 This is an SDK recovery foundation, not a product continuity attestation. The
 consumer remains responsible for enumerating the complete live SA set,
 privacy-safe session-ID derivation, operation/transition-ID generation, key
 custody, retry and operator-quarantine policy, and dataplane qualification.
-Issue #333 remains the authority for adapter-issued counter apply/read-back
-evidence: the session saga retains current numeric resume fields exactly but
-does not claim they were applied.
+For counter-based ESP transitions, issue #333 (including the Host-XDP
+keyed-fence regression tracked by issue #444) is implemented by the public
+`InstalledOutboundSaBinding` flow. A fully acknowledged, exact-readback,
+committed outbound SA/policy install issues the constructor-private live
+binding and its key-free durable ID. The namespace actor accepts that binding,
+the same ID, and `EspCounterResumeApplyRequest`, advances only through Linux
+`XFRM_MSG_NEWAE`, then returns an opaque `AppliedEspCounterReceipt`. The caller
+independently derives the process-local `OutboundEspCounterTarget` from the
+same installed binding. `RePinRequest::new_esp` carries the ID; the coordinator
+receives the receipt and live target, rejecting numeric resume fields alone.
+
+Linux exposes the last-assigned outbound sequence, so fresh proof requires
+`oseq + 1 == next` and rejects zero, wrap, non-ESN, ambiguous bitmap, foreign,
+absent, or indeterminate state. The actor revalidates that exact next value at
+the ownership boundary and again under a short-lived guard at the first
+publication boundary. Host-XDP consumes the guard around its synchronous
+keyed-fence-last cut. Other `RePinSteeringBackend` implementations must call
+`RePinSteeringOperationPermit::publish_with_esp_counter_guard` at their exact
+synchronous externally visible cut and return the permit; the legacy SPI-only
+adapter rejects this guarded ESP path. Already-committed restart recovery uses
+the distinct read-only `recover_committed_outbound_esp_counter` boundary and
+may issue proof only for a value at or above the durable floor. Later proof
+checks also reject rollback below the observed issuance watermark; committed
+recovery cannot authorize a new fence.
+
+The session journal stores neither receipts, live targets, bindings, actor
+identity, nor key material. A consumer builds bounded receipt and target sets
+before `start`; after restart it recovers the live installed binding by exact
+kernel readback, reapplies uncommitted entries, and uses committed recovery
+only for an exact v3 ownership grant already known committed. IKE counters
+remain product-owned. Privileged tests cover the exact first emitted sequence,
+cross-namespace rejection, destination-scoped v5 packet verdicts, and
+fence-last activation/retirement containment.
 
 ---
 

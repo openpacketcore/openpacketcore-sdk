@@ -44,7 +44,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use aya::maps::{Array, HashMap as BpfHashMap, Map, MapData};
@@ -59,13 +59,13 @@ use opc_ipsec_lb::ownership::{
     IkeSpi, RoutingDomainTag, SessionOwnershipKey,
 };
 use opc_ipsec_lb::{
-    HostXdpAttachMode, HostXdpRedirectHandoff, HostXdpSteeringBackend,
+    HostXdpAttachMode, HostXdpFenceDomain, HostXdpRedirectHandoff, HostXdpSteeringBackend,
     HostXdpSteeringBackendConfig, HostXdpUpgradeOutcome,
 };
 use opc_ipsec_lb_ebpf_common::{
-    XdpDatapathConfig, XdpOwnerValue, CONFIG_KEY, CONFIG_VALUE_LEN, FENCE_KEY, MAP_CONFIG,
-    MAP_COUNTERS, MAP_FENCE, MAP_OWNERS, OWNER_KEY_LEN, OWNER_VALUE_LEN, PROG_SWU_XDP,
-    XDP_CONFIG_ABI_VERSION,
+    XdpDatapathConfig, XdpFenceMode, XdpOwnerValue, CONFIG_KEY, CONFIG_VALUE_LEN, FENCE_KEY,
+    MAP_CONFIG, MAP_COUNTERS, MAP_FENCE, MAP_KEY_FENCES, MAP_OWNERS, OWNER_KEY_LEN,
+    OWNER_VALUE_LEN, PROG_SWU_XDP, XDP_CONFIG_ABI_VERSION,
 };
 
 const VIP4: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 7);
@@ -100,6 +100,14 @@ const FROZEN_XDP_V3: &[u8] = include_bytes!("fixtures/xdp-upgrade/opc-ipsec-lb-x
 const CURRENT_XDP: &[u8] = include_bytes!("../bpf/opc-ipsec-lb-xdp.bpf.o");
 
 static PROVISION_SEQ: AtomicU32 = AtomicU32::new(0);
+static PRIVILEGED_PORT_GUARD: Mutex<()> = Mutex::new(());
+
+fn lock_privileged_test_ports() -> MutexGuard<'static, ()> {
+    match PRIVILEGED_PORT_GUARD.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
 
 fn run(program: &str, args: &[&str]) {
     let output = Command::new(program)
@@ -564,11 +572,20 @@ fn pinned_fence_map(pin_dir: &Path) -> BpfHashMap<MapData, u32, u64> {
     BpfHashMap::try_from(map).expect("typed pinned fence map")
 }
 
+fn pinned_key_fence_map(pin_dir: &Path) -> BpfHashMap<MapData, [u8; OWNER_KEY_LEN], u64> {
+    let map = Map::from_map_data(
+        MapData::from_pin(pin_dir.join(MAP_KEY_FENCES)).expect("open pinned key-fence map"),
+    )
+    .expect("identify pinned key-fence map");
+    BpfHashMap::try_from(map).expect("typed pinned key-fence map")
+}
+
 fn backend_config(provision: &Provision, handoff_ifindex: u32) -> HostXdpSteeringBackendConfig {
     HostXdpSteeringBackendConfig {
         bpffs_pin_root: provision.pin_root.clone(),
         self_shard: ShardId::new(SELF_SHARD),
         routing_domain: RoutingDomainTag::new(DOMAIN),
+        fence_domain: HostXdpFenceDomain::Global,
         redirect_handoff: HostXdpRedirectHandoff::UserspaceRedirector {
             ifindex: NonZeroU32::new(handoff_ifindex).expect("nonzero hand-off ifindex"),
         },
@@ -576,8 +593,19 @@ fn backend_config(provision: &Provision, handoff_ifindex: u32) -> HostXdpSteerin
     }
 }
 
+fn destination_scoped_backend_config(
+    provision: &Provision,
+    handoff_ifindex: u32,
+) -> HostXdpSteeringBackendConfig {
+    HostXdpSteeringBackendConfig {
+        fence_domain: HostXdpFenceDomain::PerOwnershipKey,
+        ..backend_config(provision, handoff_ifindex)
+    }
+}
+
 fn legacy_config_bytes(version: u8, fence: u64, handoff_ifindex: u32) -> [u8; CONFIG_VALUE_LEN] {
     let mut config = XdpDatapathConfig {
+        fence_mode: XdpFenceMode::Global,
         self_shard: SELF_SHARD,
         routing_domain: DOMAIN,
         handoff_ifindex,
@@ -622,7 +650,7 @@ fn create_v1_namespace(interface_dir: &Path, fence: u64, handoff_ifindex: u32) {
     fs::remove_file(interface_dir.join(MAP_FENCE)).expect("v1 has no separate fence pin");
 }
 
-fn create_v4_namespace(pin_dir: &Path, fence: u64, handoff_ifindex: u32) {
+fn create_current_namespace(pin_dir: &Path, fence: u64, handoff_ifindex: u32) {
     fs::create_dir_all(pin_dir).expect("create current map namespace");
     let mut ebpf = EbpfLoader::new()
         .default_map_pin_directory(pin_dir)
@@ -696,6 +724,7 @@ fn run_crash_owner_child() {
             bpffs_pin_root: pin_root,
             self_shard: ShardId::new(SELF_SHARD),
             routing_domain: RoutingDomainTag::new(DOMAIN),
+            fence_domain: HostXdpFenceDomain::Global,
             redirect_handoff: HostXdpRedirectHandoff::UserspaceRedirector {
                 ifindex: NonZeroU32::new(handoff_ifindex).expect("nonzero crash hand-off"),
             },
@@ -734,40 +763,173 @@ fn xdp_upgrade_crash_recovery_and_v3_handoff() {
         eprintln!("skipping: set OPC_IPSEC_LB_RUN_PRIVILEGED=1 inside a fresh privileged netns");
         return;
     }
+    let _port_guard = lock_privileged_test_ports();
 
-    // Every SDK-produced v4 cleanup cut must retain a readable fence witness.
+    // Every SDK-produced current-schema/global cleanup cut must retain a
+    // readable scalar-fence witness.
     // A second complete namespace at the same maximum proves recovery never
     // regresses even when the interrupted namespace is selected for staging.
-    const V4_FENCE: u64 = 41;
-    for cut_after in 1..=4 {
+    const CURRENT_GLOBAL_FENCE: u64 = 41;
+    for cut_after in 1..=5 {
         let provision = Provision::new();
         let handoff_ifindex = nix::net::if_::if_nametoindex(provision.hand_main.as_str())
             .expect("resolve hand-off ifindex");
         let config = backend_config(&provision, handoff_ifindex);
         let first = HostXdpSteeringBackend::new(provision.pub_main.clone(), config.clone());
-        block_on(first.attach()).expect("attach first v4 namespace");
-        block_on(first.advance_fence(V4_FENCE)).expect("seed first v4 fence");
+        block_on(first.attach()).expect("attach first current namespace");
+        block_on(first.advance_fence(CURRENT_GLOBAL_FENCE)).expect("seed first current fence");
         drop(first);
 
         let second = HostXdpSteeringBackend::new(provision.pub_main.clone(), config.clone());
-        block_on(second.attach()).expect("stage second complete v4 namespace");
+        block_on(second.attach()).expect("stage second complete current namespace");
         drop(second);
 
         let slot_a = provision
             .pin_root
             .join(&provision.pub_main)
             .join(MAP_SLOT_A);
-        for map_name in [MAP_OWNERS, MAP_COUNTERS, MAP_CONFIG, MAP_FENCE]
-            .into_iter()
-            .take(cut_after)
+        for map_name in [
+            MAP_OWNERS,
+            MAP_COUNTERS,
+            MAP_KEY_FENCES,
+            MAP_CONFIG,
+            MAP_FENCE,
+        ]
+        .into_iter()
+        .take(cut_after)
         {
-            fs::remove_file(slot_a.join(map_name)).expect("inject v4 cleanup crash cut");
+            fs::remove_file(slot_a.join(map_name)).expect("inject current cleanup crash cut");
         }
 
         let recovered = HostXdpSteeringBackend::new(provision.pub_main.clone(), config);
-        block_on(recovered.attach()).expect("recover interrupted v4 cleanup");
-        assert_preserved_fence(&recovered, V4_FENCE);
-        block_on(recovered.detach()).expect("detach v4 recovery proof");
+        block_on(recovered.attach()).expect("recover interrupted current cleanup");
+        assert_preserved_fence(&recovered, CURRENT_GLOBAL_FENCE);
+        block_on(recovered.detach()).expect("detach current recovery proof");
+    }
+
+    // Destination-scoped v5 cleanup removes the owner before its keyed fence,
+    // then retains CONFIG and the nonzero carried scalar floor until the final
+    // two cuts. Restart after every cut must preserve all remaining evidence
+    // without rearming a stale owner.
+    const V5_OWNER_GENERATION: u64 = 47;
+    const V5_CARRIED_GLOBAL_FLOOR: u64 = 59;
+    // The fifth removal is the completed cleanup, not an interruptible cut:
+    // after deleting the final scalar FENCE there is no remaining namespace
+    // evidence from which a crash recovery could reconstruct its value.
+    for cut_after in 0..=4 {
+        let provision = Provision::new();
+        let handoff_ifindex = nix::net::if_::if_nametoindex(provision.hand_main.as_str())
+            .expect("resolve hand-off ifindex");
+        let config = destination_scoped_backend_config(&provision, handoff_ifindex);
+        let first = HostXdpSteeringBackend::new(provision.pub_main.clone(), config.clone());
+        block_on(first.attach()).expect("attach destination-scoped v5 namespace");
+
+        let interface_dir = provision.pin_root.join(&provision.pub_main);
+        let slot_a = interface_dir.join(MAP_SLOT_A);
+        let slot_b = interface_dir.join(MAP_SLOT_B);
+        let key = esp_udp_key(SPI_CRASH_ESP_UDP);
+        let map_key = fixed_owner_map_key(&key);
+        let raw_owner = XdpOwnerValue {
+            owner_shard: REMOTE_SHARD,
+            generation: V5_OWNER_GENERATION,
+        }
+        .encode();
+        pinned_owner_map(&slot_a)
+            .insert(map_key, raw_owner, 0)
+            .expect("seed v5 owner witness");
+        pinned_key_fence_map(&slot_a)
+            .insert(map_key, V5_OWNER_GENERATION, 0)
+            .expect("seed v5 keyed-fence witness");
+        pinned_fence_map(&slot_a)
+            .insert(FENCE_KEY, V5_CARRIED_GLOBAL_FLOOR, 0)
+            .expect("seed v5 carried scalar floor");
+
+        let packet_io = (cut_after <= 1).then(|| {
+            let sender = udp_send_socket(&provision.peer_ns);
+            let capture = packet_capture_socket(&provision.redir_ns);
+            let local = UdpSocket::bind("0.0.0.0:4500").expect("bind keyed-v5 UDP/4500");
+            local
+                .set_read_timeout(Some(Duration::from_millis(200)))
+                .expect("set keyed-v5 local timeout");
+            (sender, capture, local)
+        });
+        if let Some((sender, capture, local)) = packet_io.as_ref() {
+            send_udp(sender, 4500, &esp_packet(SPI_CRASH_ESP_UDP, 1, &[0x6a; 24]));
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(drain_udp(local).is_empty());
+            assert!(drain_fd(capture).iter().any(|frame| {
+                frame
+                    .windows(4)
+                    .any(|window| window == SPI_CRASH_ESP_UDP.to_be_bytes())
+            }));
+        }
+
+        // Keep the unpinned bpf_link owner alive through the live-packet
+        // assertion. Dropping it is the simulated process crash that detaches
+        // XDP while leaving the pinned map namespace for recovery.
+        drop(first);
+
+        for map_name in [
+            MAP_OWNERS,
+            MAP_COUNTERS,
+            MAP_KEY_FENCES,
+            MAP_CONFIG,
+            MAP_FENCE,
+        ]
+        .into_iter()
+        .take(cut_after)
+        {
+            fs::remove_file(slot_a.join(map_name)).expect("inject keyed-v5 cleanup crash cut");
+        }
+
+        let recovered = HostXdpSteeringBackend::new(provision.pub_main.clone(), config);
+        block_on(recovered.attach()).expect("recover interrupted keyed-v5 cleanup");
+        let active_slot = &slot_b;
+        assert_eq!(
+            pinned_fence_map(active_slot)
+                .get(&FENCE_KEY, 0)
+                .expect("read recovered carried scalar floor"),
+            V5_CARRIED_GLOBAL_FLOOR
+        );
+        let recovered_owner = pinned_owner_map(active_slot).get(&map_key, 0);
+        let recovered_key_fence = pinned_key_fence_map(active_slot).get(&map_key, 0);
+        match cut_after {
+            0 => {
+                assert_eq!(recovered_owner.expect("read recovered owner"), raw_owner);
+                assert!(recovered_key_fence.is_err());
+            }
+            1 | 2 => {
+                assert!(recovered_owner.is_err());
+                assert_eq!(
+                    recovered_key_fence.expect("read recovered keyed fence"),
+                    V5_OWNER_GENERATION
+                );
+            }
+            3..=4 => {
+                assert!(recovered_owner.is_err());
+                assert!(recovered_key_fence.is_err());
+            }
+            _ => unreachable!("bounded cleanup cut"),
+        }
+        if let Some((sender, capture, local)) = packet_io.as_ref() {
+            send_udp(sender, 4500, &esp_packet(SPI_CRASH_ESP_UDP, 2, &[0x6b; 24]));
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(
+                drain_udp(local)
+                    .iter()
+                    .any(|payload| payload.starts_with(&SPI_CRASH_ESP_UDP.to_be_bytes())),
+                "owner-only and fence-only recovery states must use the local slow path"
+            );
+            assert!(
+                !drain_fd(capture).iter().any(|frame| {
+                    frame
+                        .windows(4)
+                        .any(|window| window == SPI_CRASH_ESP_UDP.to_be_bytes())
+                }),
+                "recovered partial keyed state must never redirect"
+            );
+        }
+        block_on(recovered.detach()).expect("detach keyed-v5 recovery proof");
     }
 
     // V1 stores the fence in config, so config must be the final deleted pin.
@@ -783,7 +945,7 @@ fn xdp_upgrade_crash_recovery_and_v3_handoff() {
 
         let config = backend_config(&provision, handoff_ifindex);
         let staged = HostXdpSteeringBackend::new(provision.pub_main.clone(), config.clone());
-        block_on(staged.attach()).expect("stage complete v4 namespace beside v1");
+        block_on(staged.attach()).expect("stage complete v5 namespace beside v1");
         drop(staged);
 
         for map_name in [MAP_OWNERS, MAP_COUNTERS, MAP_CONFIG]
@@ -810,11 +972,11 @@ fn xdp_upgrade_crash_recovery_and_v3_handoff() {
         let interface_dir = provision.pin_root.join(&provision.pub_main);
         let slot_a = interface_dir.join(MAP_SLOT_A);
         let slot_b = interface_dir.join(MAP_SLOT_B);
-        create_v4_namespace(&slot_a, UNIQUE_MAX_FENCE, handoff_ifindex);
-        for map_name in [MAP_OWNERS, MAP_COUNTERS, MAP_CONFIG] {
+        create_current_namespace(&slot_a, UNIQUE_MAX_FENCE, handoff_ifindex);
+        for map_name in [MAP_OWNERS, MAP_COUNTERS, MAP_KEY_FENCES, MAP_CONFIG] {
             fs::remove_file(slot_a.join(map_name)).expect("create unique-max partial residue");
         }
-        create_v4_namespace(&slot_b, UNIQUE_MAX_FENCE - 1, handoff_ifindex);
+        create_current_namespace(&slot_b, UNIQUE_MAX_FENCE - 1, handoff_ifindex);
 
         let recovered = HostXdpSteeringBackend::new(
             provision.pub_main.clone(),
@@ -886,7 +1048,7 @@ fn xdp_upgrade_crash_recovery_and_v3_handoff() {
     }
 
     // The frozen v3 object is a genuinely distinct artifact (array config)
-    // whose pinned link and maps must migrate to the current v4 hash schema.
+    // whose pinned link and maps must migrate to the current v5 hash schema.
     // A higher disjoint partial generation in the fixed target additionally
     // proves adoption persists the maximum into the active legacy namespace
     // before it erases and reconstructs that target.
@@ -902,8 +1064,8 @@ fn xdp_upgrade_crash_recovery_and_v3_handoff() {
             .pin_root
             .join(&provision.pub_main)
             .join(MAP_SLOT_A);
-        create_v4_namespace(&target, V3_FENCE + 1, handoff_ifindex);
-        for map_name in [MAP_OWNERS, MAP_COUNTERS, MAP_CONFIG] {
+        create_current_namespace(&target, V3_FENCE + 1, handoff_ifindex);
+        for map_name in [MAP_OWNERS, MAP_COUNTERS, MAP_KEY_FENCES, MAP_CONFIG] {
             fs::remove_file(target.join(map_name)).expect("create higher target residue");
         }
         let successor = HostXdpSteeringBackend::new(
@@ -911,7 +1073,7 @@ fn xdp_upgrade_crash_recovery_and_v3_handoff() {
             backend_config(&provision, handoff_ifindex),
         );
         let outcome =
-            block_on(successor.adopt_upgrade_handoff()).expect("adopt frozen-v3 handoff into v4");
+            block_on(successor.adopt_upgrade_handoff()).expect("adopt frozen-v3 handoff into v5");
         assert!(matches!(
             outcome,
             HostXdpUpgradeOutcome::Applied | HostXdpUpgradeOutcome::AppliedCleanupPending { .. }
@@ -924,7 +1086,7 @@ fn xdp_upgrade_crash_recovery_and_v3_handoff() {
             "adoption must persist the maximum into the active map before target erasure"
         );
         assert_preserved_fence(&successor, V3_FENCE + 1);
-        block_on(successor.detach()).expect("detach v3-to-v4 proof");
+        block_on(successor.detach()).expect("detach v3-to-v5 proof");
     }
 }
 
@@ -939,6 +1101,7 @@ fn xdp_keyless_classification_and_owner_steering() {
         eprintln!("skipping: set OPC_IPSEC_LB_RUN_PRIVILEGED=1 inside a fresh privileged netns");
         return;
     }
+    let _port_guard = lock_privileged_test_ports();
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -980,6 +1143,7 @@ fn xdp_keyless_classification_and_owner_steering() {
         bpffs_pin_root: provision.pin_root.clone(),
         self_shard: ShardId::new(SELF_SHARD),
         routing_domain: RoutingDomainTag::new(DOMAIN),
+        fence_domain: HostXdpFenceDomain::Global,
         redirect_handoff: HostXdpRedirectHandoff::UserspaceRedirector {
             ifindex: NonZeroU32::new(hand_ifindex).expect("nonzero hand-off ifindex"),
         },
@@ -1219,6 +1383,7 @@ fn xdp_keyless_classification_and_owner_steering() {
             bpffs_pin_root: provision.pin_root.join("writer-b"),
             self_shard: ShardId::new(REMOTE_SHARD),
             routing_domain: RoutingDomainTag::new(DOMAIN),
+            fence_domain: HostXdpFenceDomain::Global,
             redirect_handoff: HostXdpRedirectHandoff::UserspaceRedirector {
                 ifindex: NonZeroU32::new(hand_ifindex).expect("nonzero hand-off ifindex"),
             },
@@ -1508,6 +1673,7 @@ fn xdp_keyless_classification_and_owner_steering() {
         bpffs_pin_root: provision.pin_root.clone(),
         self_shard: ShardId::new(SELF_SHARD),
         routing_domain: RoutingDomainTag::new(DOMAIN),
+        fence_domain: HostXdpFenceDomain::Global,
         redirect_handoff: HostXdpRedirectHandoff::UserspaceRedirector {
             ifindex: NonZeroU32::new(hand_ifindex).expect("nonzero hand-off ifindex"),
         },

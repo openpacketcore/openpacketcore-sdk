@@ -2,6 +2,7 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::time::Instant;
 
 use async_trait::async_trait;
 use tokio::sync::{mpsc, oneshot};
@@ -427,6 +428,38 @@ impl NamespaceBoundLinuxXfrmBackend {
             })?
     }
 
+    pub(crate) async fn acquire_outbound_esp_counter_publication_guard(
+        &self,
+        binding: EspCounterResumeBinding,
+        requirement: EspCounterProofRequirement,
+    ) -> Result<crate::EspCounterPublicationGuard, EspCounterResumeError> {
+        let permit =
+            self.inner
+                .sender
+                .reserve()
+                .await
+                .map_err(|_| EspCounterResumeError::Backend {
+                    code: "esp_counter_backend_unavailable",
+                })?;
+        let (reply_sender, reply_receiver) = oneshot::channel();
+        let (release_sender, release_receiver) = oneshot::channel();
+        permit.send(NamespaceCommand::AcquireOutboundEspCounterPublicationGuard(
+            binding,
+            requirement,
+            reply_sender,
+            release_receiver,
+        ));
+        let expires_at = reply_receiver
+            .await
+            .map_err(|_| EspCounterResumeError::Backend {
+                code: "esp_counter_backend_unavailable",
+            })??;
+        Ok(crate::EspCounterPublicationGuard::new(
+            release_sender,
+            expires_at,
+        ))
+    }
+
     /// Rebuild a receipt after an already-committed ownership grant survives
     /// process loss and the live outbound SA may have advanced.
     ///
@@ -505,6 +538,12 @@ enum NamespaceCommand {
         EspCounterResumeBinding,
         EspCounterProofRequirement,
         oneshot::Sender<Result<(), EspCounterResumeError>>,
+    ),
+    AcquireOutboundEspCounterPublicationGuard(
+        EspCounterResumeBinding,
+        EspCounterProofRequirement,
+        oneshot::Sender<Result<Instant, EspCounterResumeError>>,
+        oneshot::Receiver<()>,
     ),
     Probe(oneshot::Sender<Result<XfrmProbe, XfrmError>>),
     SaRelocationCapability(oneshot::Sender<Result<XfrmCapability, XfrmError>>),
@@ -590,6 +629,26 @@ impl NamespaceCommand {
                         .await,
                 );
             }
+            Self::AcquireOutboundEspCounterPublicationGuard(
+                binding,
+                requirement,
+                reply,
+                release,
+            ) => {
+                let result = state
+                    .counter_receipts
+                    .validate_for_publication(backend, binding, requirement)
+                    .await;
+                let acquired = result.is_ok();
+                let _ = reply.send(result);
+                if acquired {
+                    // Deliberately keep the actor command in flight until the
+                    // publication owner drops its opaque guard. Subsequent
+                    // mutations remain queued and therefore cannot invalidate
+                    // the just-validated receipt during Host publication.
+                    let _ = release.await;
+                }
+            }
             Self::Probe(reply) => {
                 let _ = reply.send(backend.probe().await);
             }
@@ -625,6 +684,9 @@ impl NamespaceCommand {
             Self::ApplyOutboundEspCounter(_, reply)
             | Self::RecoverCommittedOutboundEspCounter(_, reply)
             | Self::ValidateOutboundEspCounter(_, _, reply) => {
+                let _ = reply.send(Err(map_backend_error(error)));
+            }
+            Self::AcquireOutboundEspCounterPublicationGuard(_, _, reply, _) => {
                 let _ = reply.send(Err(map_backend_error(error)));
             }
             Self::Probe(reply) => {
@@ -1799,6 +1861,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn committed_counter_recovery_never_regresses_below_issuance_watermark() {
+        for (current_last, expected_error) in [
+            (50, Some("esp_counter_receipt_below_issuance_watermark")),
+            (101, None),
+        ] {
+            let request = outbound_install_request();
+            let (recovery_policy, recovery_sa) = outbound_readback_at(&request, 100);
+            let (current_policy, current_sa) = outbound_readback_at(&request, current_last);
+            let transport = BindingTransport::new([
+                Ok(Some(recovery_policy)),
+                Ok(Some(recovery_sa)),
+                Ok(Some(current_policy)),
+                Ok(Some(current_sa)),
+            ]);
+            let backend = LinuxXfrmBackend::with_transport(transport)
+                .bind_current_network_namespace()
+                .unwrap();
+            let authority = counter_binding(&backend, &request);
+            let target = authority.outbound_esp_counter_target();
+            let binding = EspCounterResumeBinding::new(21, 22, authority.id(), 50).unwrap();
+            let receipt = backend
+                .recover_committed_outbound_esp_counter(
+                    &authority,
+                    authority.id(),
+                    counter_recovery_request(binding, &request),
+                )
+                .await
+                .unwrap();
+            let result = EspCounterResumeProofSet::single(receipt)
+                .validate_counter_proof(
+                    &target,
+                    binding,
+                    EspCounterProofRequirement::CommittedRecovery,
+                )
+                .await;
+            match expected_error {
+                Some(code) => assert_eq!(result.unwrap_err().code(), code),
+                None => result.expect("state above the issuance watermark remains valid"),
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn counter_actor_rejects_wrong_namespace_id_and_sa_before_netlink() {
         let request = outbound_install_request();
         let transport = BindingTransport::new([]);
@@ -1922,6 +2027,106 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.code(), "esp_counter_receipt_absent_or_stale");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn publication_guard_queues_invalidating_mutation_until_drop() {
+        let request = outbound_install_request();
+        let (policy, sa) = outbound_readback_at(&request, 49);
+        let transport = BindingTransport::new([
+            Ok(Some(policy.clone())),
+            Ok(Some(sa.clone())),
+            Ok(Some(policy.clone())),
+            Ok(Some(sa.clone())),
+            // Guard acquisition performs final exact policy/SA readback.
+            Ok(Some(policy)),
+            Ok(Some(sa)),
+            // The queued mutation runs only after guard release.
+            Err(XfrmError::Unavailable),
+        ]);
+        let capture = transport.clone();
+        let backend = LinuxXfrmBackend::with_transport(transport)
+            .bind_current_network_namespace()
+            .unwrap();
+        let authority = counter_binding(&backend, &request);
+        let target = authority.outbound_esp_counter_target();
+        let apply = counter_request(&authority, &request, 1, 2, 50);
+        let binding = apply.binding();
+        let receipt = backend
+            .apply_and_read_back_outbound_esp_counter(&authority, authority.id(), apply)
+            .await
+            .unwrap();
+        let proofs = EspCounterResumeProofSet::single(receipt);
+        let guard = proofs
+            .acquire_publication_guard(
+                &target,
+                binding,
+                EspCounterProofRequirement::BeforeFirstPublication,
+            )
+            .await
+            .unwrap();
+
+        let mutation = tokio::spawn({
+            let backend = backend.clone();
+            let parameters = request.sa.parameters.clone();
+            async move { backend.install_sa(InstallSaRequest { parameters }).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!mutation.is_finished());
+        assert_eq!(capture.operations().len(), 6);
+
+        drop(guard);
+        mutation
+            .await
+            .expect("queued mutation task")
+            .expect_err("injected mutation failure");
+        assert_eq!(capture.operations().len(), 7);
+        let error = proofs
+            .validate_counter_proof(
+                &target,
+                binding,
+                EspCounterProofRequirement::BeforeFirstPublication,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "esp_counter_receipt_absent_or_stale");
+    }
+
+    #[tokio::test]
+    async fn first_publication_guard_rejects_counter_advance_after_exact_apply() {
+        let request = outbound_install_request();
+        let (policy_49, sa_49) = outbound_readback_at(&request, 49);
+        let (policy_50, sa_50) = outbound_readback_at(&request, 50);
+        let transport = BindingTransport::new([
+            Ok(Some(policy_49.clone())),
+            Ok(Some(sa_49.clone())),
+            Ok(Some(policy_49)),
+            Ok(Some(sa_49)),
+            // Final guard acquisition observes a packet assigned after the
+            // exact receipt check and must not mint a publication lease.
+            Ok(Some(policy_50)),
+            Ok(Some(sa_50)),
+        ]);
+        let backend = LinuxXfrmBackend::with_transport(transport)
+            .bind_current_network_namespace()
+            .unwrap();
+        let authority = counter_binding(&backend, &request);
+        let target = authority.outbound_esp_counter_target();
+        let apply = counter_request(&authority, &request, 1, 2, 50);
+        let binding = apply.binding();
+        let receipt = backend
+            .apply_and_read_back_outbound_esp_counter(&authority, authority.id(), apply)
+            .await
+            .unwrap();
+        let error = EspCounterResumeProofSet::single(receipt)
+            .acquire_publication_guard(
+                &target,
+                binding,
+                EspCounterProofRequirement::BeforeFirstPublication,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "esp_counter_receipt_exact_state_changed");
     }
 
     #[tokio::test]

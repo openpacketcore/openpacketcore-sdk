@@ -18,9 +18,10 @@ UE re-attach, and without any key ever touching a store.
 
 This is the producer + transport + standby-custody half of the "live mirror"
 continuity tier whose consumer half already exists in `opc-ipsec-lb`
-(`ResumeKeySource::LiveMirrored` is accepted by the re-pin coordinator, and the
-mandatory outbound-IV forward-jump applies to mirrored counters exactly as to
-persisted ones).
+(`ResumeKeySource::LiveMirrored` supplies the resume input, while an ESP
+consumer must also install the exact outbound SA and obtain an opaque
+apply/readback counter receipt from `opc-ipsec-xfrm` before the re-pin
+coordinator can publish steering).
 
 ## 2. Motivation
 
@@ -109,9 +110,11 @@ kernel install (owner XFRM)                      │ SaMirrorProducer::mirror_ch
 StandbyKeymatSource::take_for_repin
         │  yields MirroredSaKeymat + validated SameSpiResume{LiveMirrored}
         ▼
-RePinCoordinator::repin (fence → audit → steer)   [unchanged, authoritative]
+namespace-bound XFRM install → counter apply/readback receipt (quiescent)
         ▼
-kernel install on standby, keymat buffer dropped ⇒ zeroized
+RePinCoordinator::repin (validate → fence → audit → guarded steer)
+        ▼
+keymat buffer dropped ⇒ zeroized
 ```
 
 ### 5.1 Where the producer obtains keymat — normative
@@ -329,22 +332,31 @@ pub struct LiveMirroredTakeover {
   `OwnershipFencer` (monotonic fence, fingerprint-bound transitions) exactly
   as before. This crate adds no bypass: the takeover output is an ordinary
   `SameSpiResume` that must ride an ordinary `RePinRequest` through
-  `RePinCoordinator::repin`.
+  `RePinCoordinator::repin`. For ESP, `SameSpiResume` is not counter-application
+  authority: the consumer must pair the request with the opaque receipt and
+  independently derived live target from the exact namespace-bound outbound
+  XFRM installation. Numeric mirror checkpoints alone fail before fencing.
 
 ### 8.1 Normative takeover order
 
 1. `take_for_repin` → validated evidence + keymat in hand.
-2. `RePinCoordinator::repin` → fence commit, audit, steering install.
-3. Install keymat + restored counters into the standby's dataplane
-   (`CounterBased::restored_send_iv_next` MUST be the counter actually
-   installed — the transition fingerprint binds it).
-4. Drop the takeover buffer (zeroize). Inject `ForwardingProof` when observed.
+2. Install the complete outbound SA and its sole outbound policy through a
+   namespace-bound `opc-ipsec-xfrm` actor, while the successor remains
+   quiescent.
+3. Apply `CounterBased::restored_send_iv_next` through that live actor and
+   obtain its exact GETSA-validated `AppliedEspCounterReceipt` plus
+   independently derived `OutboundEspCounterTarget`.
+4. Configure `RePinCoordinator` with that receipt/target pair and call
+   `repin` → receipt validation, fence commit, audit, and steering publication
+   under the actor-held final counter guard.
+5. Drop the takeover buffer (zeroize). Inject `ForwardingProof` when observed.
 
-A CNF MAY pre-install **receive-side** SA state before step 2 to shrink the
-blackout window, but MUST NOT transmit on the SA before the fence is granted:
-transmission is what consumes outbound IVs, and only the fence proves the
-previous owner is excluded. On re-pin failure the caller still holds the
-keymat and may retry, or drop it (zeroize) and fall back to re-attach.
+A CNF MUST NOT transmit on the successor SA before guarded steering
+publication: transmission consumes outbound sequence space, while the live
+actor guard proves the applied counter did not advance between final
+validation and publication. On re-pin failure, the product must keep the
+successor quiescent and either retry with still-live authority or remove the
+staged state, drop the keymat (zeroize), and fall back to rekey/re-attach.
 
 ## 9. Memory-custody controls
 
@@ -377,7 +389,8 @@ Shipped with the crate (`cargo test -p opc-sa-mirror`):
 - Holder: epoch rollback, equivocation, capacity, monotonic counter merge,
   withdraw idempotency, ESP zero-sequence rejection, take-once semantics.
 - Takeover evidence validates under `SameSpiResume::validate_for_repin` and is
-  accepted end-to-end by `RePinCoordinator` with mock steering/fencer/audit.
+  accepted by `RePinRequest::new_esp`, but a coordinator without the required
+  live XFRM receipt/target rejects it before fencing.
 - Keymat: `Debug` redaction, zeroize-on-drop (`ZeroizeOnDrop` bound +
   observable wipe), non-serializability (`compile_fail`).
 - Full producer → mTLS → sink → takeover path over loopback with SPIFFE SVIDs.

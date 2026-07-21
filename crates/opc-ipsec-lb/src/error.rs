@@ -105,6 +105,12 @@ pub enum IpsecLbError {
         /// Static, redaction-safe reason.
         reason: &'static str,
     },
+    /// A retirement CAS may have committed, but authoritative readback could
+    /// not classify its outcome. Host-XDP poisons the affected process-local
+    /// operation stripe until process restart; the next keyed operation still
+    /// classifies authoritative store state fail-closed.
+    #[error("IPsec load-balancing ownership retirement outcome is indeterminate")]
+    OwnershipRetirementIndeterminate,
     /// Forwarding proof did not match the re-pin outcome.
     #[error("IPsec load-balancing forwarding proof rejected: {reason}")]
     ForwardingProofRejected {
@@ -116,6 +122,12 @@ pub enum IpsecLbError {
     UnsafeResume {
         /// Static, redaction-safe reason.
         reason: &'static str,
+    },
+    /// Applied ESP counter proof was unavailable, stale, or mismatched.
+    #[error("applied ESP counter proof rejected ({code})")]
+    AppliedCounterProofRejected {
+        /// Stable payload-free diagnostic code.
+        code: &'static str,
     },
     /// Cookie verification failed.
     #[error("IKE cookie verification failed")]
@@ -171,6 +183,12 @@ impl IpsecLbError {
     #[must_use]
     pub const fn unsafe_resume(reason: &'static str) -> Self {
         Self::UnsafeResume { reason }
+    }
+
+    /// Build a redaction-safe applied-counter proof rejection.
+    #[must_use]
+    pub const fn applied_counter_proof_rejected(code: &'static str) -> Self {
+        Self::AppliedCounterProofRejected { code }
     }
 
     /// Build a redaction-safe ownership conflict.

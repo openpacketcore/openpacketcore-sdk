@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use opc_ipsec_xfrm::OutboundSaBindingId;
 use opc_session_store::{
     decode_json_payload, decode_session_payload_envelope, encode_json_payload,
     ttl::checked_session_deadline, BackendCapabilities, Clock, CompareAndSet, CompareAndSetResult,
@@ -33,11 +34,17 @@ use sha2::{Digest, Sha256};
 use crate::error::IpsecLbError;
 use crate::failover::{AntiReplayResume, SendIvCounterMode, SendIvForwardJump};
 use crate::model::{ClusterNode, SaId, ShardId, SteerKey, SteeringRule};
-use crate::ports::{OwnershipFencer, OwnershipSource, RePinAuditSink, SteeringBackend};
+use crate::ownership::SessionOwnershipKey;
+use crate::ports::{
+    OwnershipFencer, OwnershipRetirementAuthority, OwnershipSource, RePinAuditSink,
+    RePinSteeringBackend, RePinSteeringRetirementBackend,
+};
 use crate::repin::{
-    validate_request, IkeRandomIvAttestation, OwnershipFence, OwnershipTransitionId,
-    RePinCoordinator, RePinError, RePinRequest, ResumeKeySource, SameSpiOutboundIvResume,
-    SameSpiResume,
+    validate_request, IkeRandomIvAttestation, OwnershipCleanupCompleteProof, OwnershipFence,
+    OwnershipRetirementFinalizedProof, OwnershipRetirementGrant, OwnershipRetirementRequest,
+    OwnershipRetirementStep, OwnershipRetirementSupersededProof, OwnershipTransitionId,
+    PendingOwnershipRetirement, RePinCoordinator, RePinError, RePinRequest, ResumeKeySource,
+    SameSpiOutboundIvResume, SameSpiResume,
 };
 
 /// Minimum canonical session batch: one IKE SA plus one default ESP SA.
@@ -52,8 +59,9 @@ pub const MAX_SESSION_REPIN_SAS: usize = 64;
 
 const SESSION_REPIN_KEY_TYPE: &str = "ipsec-lb-session-repin";
 const SESSION_REPIN_PAYLOAD_FORMAT: &str = "openpacketcore/ipsec-lb/session-repin";
-const SESSION_REPIN_CHECKPOINT_PAYLOAD_VERSION: u16 = 1;
+const SESSION_REPIN_CHECKPOINT_PAYLOAD_VERSION: u16 = 3;
 const SESSION_REPIN_RETIREMENT_PAYLOAD_VERSION: u16 = 2;
+const SESSION_REPIN_RETIRING_PAYLOAD_VERSION: u16 = 4;
 /// Maximum encoded durable checkpoint size admitted by the session saga.
 ///
 /// This includes the SDK session-payload envelope as well as the complete exact
@@ -359,7 +367,8 @@ fn validate_plan_requests(requests: &[RePinRequest]) -> Result<(), IpsecLbError>
     let first = &requests[0];
     validate_owner(&first.previous_owner)?;
     validate_owner(&first.new_owner)?;
-    let mut sas = BTreeSet::new();
+    let mut ownership_keys = BTreeSet::new();
+    let mut outbound_sa_bindings = BTreeSet::new();
     let mut transitions = BTreeSet::new();
     for request in requests {
         validate_request(request)?;
@@ -376,11 +385,19 @@ fn validate_plan_requests(requests: &[RePinRequest]) -> Result<(), IpsecLbError>
                 "every request must bind the same owners and steering shards",
             ));
         }
-        if !sas.insert(request.sa) {
+        if !ownership_keys.insert(request.ownership_key) {
             return Err(IpsecLbError::invalid_config(
                 "session_repin.requests",
-                "session re-pin contains a duplicate SA",
+                "session re-pin contains a duplicate destination-scoped SA",
             ));
+        }
+        if let Some(id) = request.outbound_sa_binding_id {
+            if !outbound_sa_bindings.insert(id.to_bytes()) {
+                return Err(IpsecLbError::invalid_config(
+                    "session_repin.requests",
+                    "session re-pin contains a duplicate outbound SA binding ID",
+                ));
+            }
         }
         if !transitions.insert(request.transition_id) {
             return Err(IpsecLbError::invalid_config(
@@ -737,6 +754,279 @@ impl fmt::Debug for SessionRePinRetirementOutcome {
     }
 }
 
+/// Redaction-safe durable progress of authoritative Host steering retirement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SessionRePinRetirementStatus {
+    total_sa_count: usize,
+    cleanup_complete_count: usize,
+    ownership_finalized_count: usize,
+}
+
+impl SessionRePinRetirementStatus {
+    /// Return the fixed number of SAs in the terminal plan.
+    #[must_use]
+    pub const fn total_sa_count(self) -> usize {
+        self.total_sa_count
+    }
+
+    /// Return how many ordered Host cleanups are durably marked complete.
+    #[must_use]
+    pub const fn cleanup_complete_count(self) -> usize {
+        self.cleanup_complete_count
+    }
+
+    /// Return how many ordered ownership records are finalized.
+    #[must_use]
+    pub const fn ownership_finalized_count(self) -> usize {
+        self.ownership_finalized_count
+    }
+}
+
+/// Durable, non-expiring retirement work retained until every SA is clean.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SessionRePinRetirementProgress {
+    checkpoint: SessionRePinCheckpoint,
+    retirement_markers: Vec<OwnershipRetirementMarker>,
+    ownership_finalized_count: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OwnershipRetirementMarker {
+    CleanupComplete(OwnershipFence),
+    Superseded(OwnershipFence),
+}
+
+impl SessionRePinRetirementProgress {
+    fn from_terminal(checkpoint: SessionRePinCheckpoint) -> Result<Self, IpsecLbError> {
+        let progress = Self {
+            checkpoint,
+            retirement_markers: Vec::new(),
+            ownership_finalized_count: 0,
+        };
+        progress.validate()?;
+        Ok(progress)
+    }
+
+    fn from_progress(
+        checkpoint: SessionRePinCheckpoint,
+        retirement_markers: Vec<OwnershipRetirementMarker>,
+        ownership_finalized_count: usize,
+    ) -> Result<Self, IpsecLbError> {
+        let progress = Self {
+            checkpoint,
+            retirement_markers,
+            ownership_finalized_count,
+        };
+        progress.validate()?;
+        Ok(progress)
+    }
+
+    fn validate(&self) -> Result<(), IpsecLbError> {
+        if !self.checkpoint.is_complete()
+            || self.retirement_markers.len() > self.checkpoint.plan().len()
+            || self.ownership_finalized_count > self.retirement_markers.len()
+            || self.retirement_markers.len() - self.ownership_finalized_count > 1
+        {
+            return Err(progress_conflict());
+        }
+        if self.retirement_markers.len() > self.ownership_finalized_count
+            && !matches!(
+                self.retirement_markers.last(),
+                Some(OwnershipRetirementMarker::CleanupComplete(_))
+            )
+        {
+            return Err(progress_conflict());
+        }
+        for (index, marker) in self.retirement_markers.iter().enumerate() {
+            let active_fence = self
+                .checkpoint
+                .completed_fence(index)
+                .ok_or_else(progress_conflict)?;
+            let authoritative_fence = match marker {
+                OwnershipRetirementMarker::CleanupComplete(fence)
+                | OwnershipRetirementMarker::Superseded(fence) => *fence,
+            };
+            if authoritative_fence <= active_fence {
+                return Err(progress_conflict());
+            }
+        }
+        Ok(())
+    }
+
+    fn exact_identity(
+        &self,
+        session_id: &SessionRePinSessionId,
+        identity: SessionRePinIdentity,
+    ) -> bool {
+        self.checkpoint.plan().session_id() == session_id
+            && self.checkpoint.plan().identity() == identity
+    }
+
+    fn grant(&self, index: usize) -> Result<OwnershipRetirementGrant, IpsecLbError> {
+        let request = self
+            .checkpoint
+            .plan()
+            .requests()
+            .get(index)
+            .ok_or_else(progress_conflict)?;
+        let active_fence = self
+            .checkpoint
+            .completed_fence(index)
+            .ok_or_else(progress_conflict)?;
+        let retirement_fence = self
+            .retirement_markers
+            .get(index)
+            .and_then(|marker| match marker {
+                OwnershipRetirementMarker::CleanupComplete(fence) => Some(*fence),
+                OwnershipRetirementMarker::Superseded(_) => None,
+            })
+            .ok_or_else(progress_conflict)?;
+        Ok(OwnershipRetirementGrant::new(
+            OwnershipRetirementRequest::from_committed(request, active_fence),
+            retirement_fence,
+        ))
+    }
+
+    fn with_cleanup_complete(
+        &self,
+        pending: &PendingOwnershipRetirement,
+    ) -> Result<Self, IpsecLbError> {
+        let index = self.retirement_markers.len();
+        if index != self.ownership_finalized_count || index >= self.checkpoint.plan().len() {
+            return Err(progress_conflict());
+        }
+        let request = &self.checkpoint.plan().requests()[index];
+        let active_fence = self
+            .checkpoint
+            .completed_fence(index)
+            .ok_or_else(progress_conflict)?;
+        let expected = OwnershipRetirementRequest::from_committed(request, active_fence);
+        if pending.grant().request() != &expected
+            || pending.grant().retirement_fence() <= active_fence
+        {
+            return Err(progress_conflict());
+        }
+        let mut markers = self.retirement_markers.clone();
+        markers.push(OwnershipRetirementMarker::CleanupComplete(
+            pending.grant().retirement_fence(),
+        ));
+        Self::from_progress(
+            self.checkpoint.clone(),
+            markers,
+            self.ownership_finalized_count,
+        )
+    }
+
+    fn with_superseded(
+        &self,
+        proof: &OwnershipRetirementSupersededProof,
+    ) -> Result<Self, IpsecLbError> {
+        let index = self.ownership_finalized_count;
+        if self.retirement_markers.len() != index || index >= self.checkpoint.plan().len() {
+            return Err(progress_conflict());
+        }
+        let request = &self.checkpoint.plan().requests()[index];
+        let active_fence = self
+            .checkpoint
+            .completed_fence(index)
+            .ok_or_else(progress_conflict)?;
+        let expected = OwnershipRetirementRequest::from_committed(request, active_fence);
+        if proof.request() != &expected || proof.authoritative_fence() <= active_fence {
+            return Err(progress_conflict());
+        }
+        let mut markers = self.retirement_markers.clone();
+        markers.push(OwnershipRetirementMarker::Superseded(
+            proof.authoritative_fence(),
+        ));
+        Self::from_progress(self.checkpoint.clone(), markers, index + 1)
+    }
+
+    fn with_ownership_finalized(
+        &self,
+        finalized: &OwnershipRetirementFinalizedProof,
+    ) -> Result<Self, IpsecLbError> {
+        let index = self.ownership_finalized_count;
+        if index >= self.retirement_markers.len()
+            || self.grant(index)? != *finalized.cleanup().grant()
+        {
+            return Err(progress_conflict());
+        }
+        Self::from_progress(
+            self.checkpoint.clone(),
+            self.retirement_markers.clone(),
+            index + 1,
+        )
+    }
+
+    fn is_complete(&self) -> bool {
+        self.ownership_finalized_count == self.checkpoint.plan().len()
+    }
+
+    fn strictly_advances(&self, previous: &Self) -> bool {
+        self.validate().is_ok()
+            && previous.validate().is_ok()
+            && self.checkpoint == previous.checkpoint
+            && self
+                .retirement_markers
+                .starts_with(&previous.retirement_markers)
+            && self.ownership_finalized_count >= previous.ownership_finalized_count
+            && (self.retirement_markers.len() > previous.retirement_markers.len()
+                || self.ownership_finalized_count > previous.ownership_finalized_count)
+    }
+
+    /// Return the exact retained terminal session identity.
+    #[must_use]
+    pub const fn identity(&self) -> SessionRePinIdentity {
+        self.checkpoint.plan().identity()
+    }
+
+    /// Return redaction-safe ordered cleanup progress.
+    #[must_use]
+    pub fn status(&self) -> SessionRePinRetirementStatus {
+        SessionRePinRetirementStatus {
+            total_sa_count: self.checkpoint.plan().len(),
+            cleanup_complete_count: self
+                .retirement_markers
+                .iter()
+                .filter(|marker| matches!(marker, OwnershipRetirementMarker::CleanupComplete(_)))
+                .count(),
+            ownership_finalized_count: self.ownership_finalized_count,
+        }
+    }
+}
+
+impl fmt::Debug for SessionRePinRetirementProgress {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SessionRePinRetirementProgress")
+            .field("status", &self.status())
+            .finish()
+    }
+}
+
+/// Exact result of beginning or recovering durable session retirement.
+#[derive(Clone, PartialEq, Eq)]
+pub enum SessionRePinRetirementResume {
+    /// Cleanup remains in progress and ordinary session resume is revoked.
+    InProgress(SessionRePinRetirementProgress),
+    /// The exact bounded session tombstone was already committed.
+    Retired(SessionRePinRetirementOutcome),
+}
+
+impl fmt::Debug for SessionRePinRetirementResume {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InProgress(progress) => f
+                .debug_tuple("SessionRePinRetirementResume::InProgress")
+                .field(&progress.status())
+                .finish(),
+            Self::Retired(outcome) => f
+                .debug_tuple("SessionRePinRetirementResume::Retired")
+                .field(outcome)
+                .finish(),
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Eq)]
 struct SessionRePinRetirementTombstone {
     session_id: SessionRePinSessionId,
@@ -853,9 +1143,10 @@ fn fingerprint_retirement(
 /// predecessor. Rejection must preserve the terminal checkpoint. It must
 /// conflict with a prepared, forward-converging, unbound, or stale plan.
 /// Progress can advance only in order and may never discard a retained
-/// ownership commit. Retirement is permitted only for the exact terminal
-/// identity. Its retained tombstone conflicts with every new or stale plan
-/// until [`SESSION_REPIN_RETIREMENT_RETENTION`] elapses.
+/// ownership commit. This low-level port exposes proof-gated retirement
+/// recovery primitives, but no direct Active-to-retired-tombstone completion:
+/// callers must use [`SessionRePinCoordinator::retire`] so Host cleanup and
+/// ownership finalization precede the retained tombstone.
 #[async_trait]
 pub trait SessionRePinJournal: Send + Sync + fmt::Debug {
     /// Create the exact plan or load its existing durable progress.
@@ -883,16 +1174,54 @@ pub trait SessionRePinJournal: Send + Sync + fmt::Debug {
         fence: OwnershipFence,
     ) -> Result<SessionRePinCheckpoint, IpsecLbError>;
 
-    /// Retire the exact terminal checkpoint after authoritative teardown.
-    ///
-    /// An exact retry is idempotent. Prepared, forward-converging, stale, or
-    /// missing identities fail closed. The default preserves source
-    /// compatibility for external journal implementations while explicitly
-    /// reporting that durable retirement is unavailable.
-    async fn retire(
+    /// Atomically revoke ordinary resume for one exact complete session.
+    async fn begin_steering_retirement(
         &self,
         _session_id: &SessionRePinSessionId,
         _identity: SessionRePinIdentity,
+    ) -> Result<SessionRePinRetirementResume, IpsecLbError> {
+        Err(IpsecLbError::Unsupported)
+    }
+
+    /// Persist ordered Host cleanup before ownership may be deleted.
+    async fn record_cleanup_complete(
+        &self,
+        _progress: &SessionRePinRetirementProgress,
+        _pending: &PendingOwnershipRetirement,
+    ) -> Result<
+        (
+            SessionRePinRetirementProgress,
+            OwnershipCleanupCompleteProof,
+        ),
+        IpsecLbError,
+    > {
+        Err(IpsecLbError::Unsupported)
+    }
+
+    /// Persist that a strictly newer authoritative owner superseded this old
+    /// key before Host cleanup. Implementations must append and finalize this
+    /// ordered disposition atomically; it never authorizes a Host mutation.
+    async fn record_ownership_superseded(
+        &self,
+        _progress: &SessionRePinRetirementProgress,
+        _proof: &OwnershipRetirementSupersededProof,
+    ) -> Result<SessionRePinRetirementProgress, IpsecLbError> {
+        Err(IpsecLbError::Unsupported)
+    }
+
+    /// Persist that cleanup-complete ownership was deleted or superseded.
+    async fn record_ownership_finalized(
+        &self,
+        _progress: &SessionRePinRetirementProgress,
+        _finalized: &OwnershipRetirementFinalizedProof,
+    ) -> Result<SessionRePinRetirementProgress, IpsecLbError> {
+        Err(IpsecLbError::Unsupported)
+    }
+
+    /// Convert fully finalized progress into the bounded session tombstone.
+    async fn finish_steering_retirement(
+        &self,
+        _progress: &SessionRePinRetirementProgress,
     ) -> Result<SessionRePinRetirementOutcome, IpsecLbError> {
         Err(IpsecLbError::Unsupported)
     }
@@ -913,6 +1242,7 @@ struct MockJournalState {
 
 enum MockJournalEntry {
     Active(SessionRePinCheckpoint),
+    Retiring(SessionRePinRetirementProgress),
     Retired(SessionRePinRetirementTombstone),
 }
 
@@ -973,6 +1303,7 @@ impl MockSessionRePinJournal {
             .ok_or(IpsecLbError::NotFound)?
         {
             MockJournalEntry::Active(checkpoint) => checkpoint,
+            MockJournalEntry::Retiring(_) => return Err(progress_conflict()),
             MockJournalEntry::Retired(_) => return Err(progress_conflict()),
         };
         if checkpoint.plan() != plan {
@@ -985,87 +1316,8 @@ impl MockSessionRePinJournal {
         );
         Ok(next)
     }
-}
 
-fn prune_mock_retirement(
-    state: &mut MockJournalState,
-    session_id: &SessionRePinSessionId,
-    now: Timestamp,
-) {
-    let expired = matches!(
-        state.entries.get(session_id),
-        Some(MockJournalEntry::Retired(tombstone)) if tombstone.retained_until <= now
-    );
-    if expired {
-        state.entries.remove(session_id);
-    }
-}
-
-#[async_trait]
-impl SessionRePinJournal for MockSessionRePinJournal {
-    async fn begin(&self, plan: &SessionRePinPlan) -> Result<SessionRePinCheckpoint, IpsecLbError> {
-        let mut state = lock_unpoisoned(&self.state);
-        if let Some(error) = &state.failure {
-            return Err(error.clone());
-        }
-        prune_mock_retirement(&mut state, plan.session_id(), self.clock.now_utc());
-        if let Some(existing) = state.entries.get(plan.session_id()) {
-            match existing {
-                MockJournalEntry::Active(checkpoint) if checkpoint.plan() == plan => {
-                    return Ok(checkpoint.clone());
-                }
-                MockJournalEntry::Active(_) | MockJournalEntry::Retired(_) => {}
-            }
-        }
-        let existing = match state.entries.get(plan.session_id()) {
-            Some(MockJournalEntry::Active(checkpoint)) => Some(checkpoint),
-            Some(MockJournalEntry::Retired(_)) => return Err(progress_conflict()),
-            None => None,
-        };
-        validate_plan_succession(existing, plan)?;
-        let checkpoint = SessionRePinCheckpoint::from_progress(plan.clone(), Vec::new(), None)?;
-        state.entries.insert(
-            plan.session_id().clone(),
-            MockJournalEntry::Active(checkpoint.clone()),
-        );
-        Ok(checkpoint)
-    }
-
-    async fn load(
-        &self,
-        session_id: &SessionRePinSessionId,
-    ) -> Result<Option<SessionRePinCheckpoint>, IpsecLbError> {
-        let mut state = lock_unpoisoned(&self.state);
-        if let Some(error) = &state.failure {
-            return Err(error.clone());
-        }
-        prune_mock_retirement(&mut state, session_id, self.clock.now_utc());
-        Ok(match state.entries.get(session_id) {
-            Some(MockJournalEntry::Active(checkpoint)) => Some(checkpoint.clone()),
-            Some(MockJournalEntry::Retired(_)) | None => None,
-        })
-    }
-
-    async fn record_ownership_committed(
-        &self,
-        plan: &SessionRePinPlan,
-        index: usize,
-        fence: OwnershipFence,
-    ) -> Result<SessionRePinCheckpoint, IpsecLbError> {
-        self.mutate(plan, |checkpoint| {
-            checkpoint.with_ownership_commit(index, fence)
-        })
-    }
-
-    async fn record_sa_complete(
-        &self,
-        plan: &SessionRePinPlan,
-        index: usize,
-        fence: OwnershipFence,
-    ) -> Result<SessionRePinCheckpoint, IpsecLbError> {
-        self.mutate(plan, |checkpoint| checkpoint.with_sa_complete(index, fence))
-    }
-
+    #[cfg(test)]
     async fn retire(
         &self,
         session_id: &SessionRePinSessionId,
@@ -1110,6 +1362,259 @@ impl SessionRePinJournal for MockSessionRePinJournal {
                 Ok(tombstone.outcome(SessionRePinRetirementDisposition::AlreadyRetired))
             }
             Some(MockJournalEntry::Retired(_)) => Err(progress_conflict()),
+            Some(MockJournalEntry::Retiring(_)) => Err(progress_conflict()),
+            None => Err(IpsecLbError::NotFound),
+        }
+    }
+}
+
+fn prune_mock_retirement(
+    state: &mut MockJournalState,
+    session_id: &SessionRePinSessionId,
+    now: Timestamp,
+) {
+    let expired = matches!(
+        state.entries.get(session_id),
+        Some(MockJournalEntry::Retired(tombstone)) if tombstone.retained_until <= now
+    );
+    if expired {
+        state.entries.remove(session_id);
+    }
+}
+
+#[async_trait]
+impl SessionRePinJournal for MockSessionRePinJournal {
+    async fn begin(&self, plan: &SessionRePinPlan) -> Result<SessionRePinCheckpoint, IpsecLbError> {
+        let mut state = lock_unpoisoned(&self.state);
+        if let Some(error) = &state.failure {
+            return Err(error.clone());
+        }
+        prune_mock_retirement(&mut state, plan.session_id(), self.clock.now_utc());
+        if let Some(existing) = state.entries.get(plan.session_id()) {
+            match existing {
+                MockJournalEntry::Active(checkpoint) if checkpoint.plan() == plan => {
+                    return Ok(checkpoint.clone());
+                }
+                MockJournalEntry::Active(_) | MockJournalEntry::Retired(_) => {}
+                MockJournalEntry::Retiring(_) => {}
+            }
+        }
+        let existing = match state.entries.get(plan.session_id()) {
+            Some(MockJournalEntry::Active(checkpoint)) => Some(checkpoint),
+            Some(MockJournalEntry::Retiring(_)) => return Err(progress_conflict()),
+            Some(MockJournalEntry::Retired(_)) => return Err(progress_conflict()),
+            None => None,
+        };
+        validate_plan_succession(existing, plan)?;
+        let checkpoint = SessionRePinCheckpoint::from_progress(plan.clone(), Vec::new(), None)?;
+        state.entries.insert(
+            plan.session_id().clone(),
+            MockJournalEntry::Active(checkpoint.clone()),
+        );
+        Ok(checkpoint)
+    }
+
+    async fn load(
+        &self,
+        session_id: &SessionRePinSessionId,
+    ) -> Result<Option<SessionRePinCheckpoint>, IpsecLbError> {
+        let mut state = lock_unpoisoned(&self.state);
+        if let Some(error) = &state.failure {
+            return Err(error.clone());
+        }
+        prune_mock_retirement(&mut state, session_id, self.clock.now_utc());
+        Ok(match state.entries.get(session_id) {
+            Some(MockJournalEntry::Active(checkpoint)) => Some(checkpoint.clone()),
+            Some(MockJournalEntry::Retiring(_) | MockJournalEntry::Retired(_)) | None => None,
+        })
+    }
+
+    async fn record_ownership_committed(
+        &self,
+        plan: &SessionRePinPlan,
+        index: usize,
+        fence: OwnershipFence,
+    ) -> Result<SessionRePinCheckpoint, IpsecLbError> {
+        self.mutate(plan, |checkpoint| {
+            checkpoint.with_ownership_commit(index, fence)
+        })
+    }
+
+    async fn record_sa_complete(
+        &self,
+        plan: &SessionRePinPlan,
+        index: usize,
+        fence: OwnershipFence,
+    ) -> Result<SessionRePinCheckpoint, IpsecLbError> {
+        self.mutate(plan, |checkpoint| checkpoint.with_sa_complete(index, fence))
+    }
+
+    async fn begin_steering_retirement(
+        &self,
+        session_id: &SessionRePinSessionId,
+        identity: SessionRePinIdentity,
+    ) -> Result<SessionRePinRetirementResume, IpsecLbError> {
+        let mut state = lock_unpoisoned(&self.state);
+        if let Some(error) = &state.failure {
+            return Err(error.clone());
+        }
+        let now = self.clock.now_utc();
+        prune_mock_retirement(&mut state, session_id, now);
+        match state.entries.get(session_id) {
+            Some(MockJournalEntry::Active(checkpoint))
+                if checkpoint.plan().identity() == identity && checkpoint.is_complete() =>
+            {
+                let progress = SessionRePinRetirementProgress::from_terminal(checkpoint.clone())?;
+                state.entries.insert(
+                    session_id.clone(),
+                    MockJournalEntry::Retiring(progress.clone()),
+                );
+                Ok(SessionRePinRetirementResume::InProgress(progress))
+            }
+            Some(MockJournalEntry::Retiring(progress))
+                if progress.exact_identity(session_id, identity) =>
+            {
+                progress.validate()?;
+                Ok(SessionRePinRetirementResume::InProgress(progress.clone()))
+            }
+            Some(MockJournalEntry::Retired(tombstone))
+                if tombstone.exact_identity(session_id, identity) =>
+            {
+                tombstone.validate()?;
+                Ok(SessionRePinRetirementResume::Retired(tombstone.outcome(
+                    SessionRePinRetirementDisposition::AlreadyRetired,
+                )))
+            }
+            Some(_) => Err(progress_conflict()),
+            None => Err(IpsecLbError::NotFound),
+        }
+    }
+
+    async fn record_cleanup_complete(
+        &self,
+        progress: &SessionRePinRetirementProgress,
+        pending: &PendingOwnershipRetirement,
+    ) -> Result<
+        (
+            SessionRePinRetirementProgress,
+            OwnershipCleanupCompleteProof,
+        ),
+        IpsecLbError,
+    > {
+        let mut state = lock_unpoisoned(&self.state);
+        if let Some(error) = &state.failure {
+            return Err(error.clone());
+        }
+        let session_id = progress.checkpoint.plan().session_id();
+        let Some(MockJournalEntry::Retiring(current)) = state.entries.get(session_id) else {
+            return Err(progress_conflict());
+        };
+        if current != progress {
+            return Err(progress_conflict());
+        }
+        let desired = current.with_cleanup_complete(pending)?;
+        let proof = OwnershipCleanupCompleteProof::new(pending.grant().clone());
+        state.entries.insert(
+            session_id.clone(),
+            MockJournalEntry::Retiring(desired.clone()),
+        );
+        Ok((desired, proof))
+    }
+
+    async fn record_ownership_superseded(
+        &self,
+        progress: &SessionRePinRetirementProgress,
+        proof: &OwnershipRetirementSupersededProof,
+    ) -> Result<SessionRePinRetirementProgress, IpsecLbError> {
+        let mut state = lock_unpoisoned(&self.state);
+        if let Some(error) = &state.failure {
+            return Err(error.clone());
+        }
+        let session_id = progress.checkpoint.plan().session_id();
+        let Some(MockJournalEntry::Retiring(current)) = state.entries.get(session_id) else {
+            return Err(progress_conflict());
+        };
+        if current != progress {
+            return Err(progress_conflict());
+        }
+        let desired = current.with_superseded(proof)?;
+        state.entries.insert(
+            session_id.clone(),
+            MockJournalEntry::Retiring(desired.clone()),
+        );
+        Ok(desired)
+    }
+
+    async fn record_ownership_finalized(
+        &self,
+        progress: &SessionRePinRetirementProgress,
+        finalized: &OwnershipRetirementFinalizedProof,
+    ) -> Result<SessionRePinRetirementProgress, IpsecLbError> {
+        let mut state = lock_unpoisoned(&self.state);
+        if let Some(error) = &state.failure {
+            return Err(error.clone());
+        }
+        let session_id = progress.checkpoint.plan().session_id();
+        let Some(MockJournalEntry::Retiring(current)) = state.entries.get(session_id) else {
+            return Err(progress_conflict());
+        };
+        let desired = progress.with_ownership_finalized(finalized)?;
+        if current == &desired {
+            return Ok(current.clone());
+        }
+        if current != progress {
+            return Err(progress_conflict());
+        }
+        state.entries.insert(
+            session_id.clone(),
+            MockJournalEntry::Retiring(desired.clone()),
+        );
+        Ok(desired)
+    }
+
+    async fn finish_steering_retirement(
+        &self,
+        progress: &SessionRePinRetirementProgress,
+    ) -> Result<SessionRePinRetirementOutcome, IpsecLbError> {
+        let mut state = lock_unpoisoned(&self.state);
+        if let Some(error) = &state.failure {
+            return Err(error.clone());
+        }
+        let session_id = progress.checkpoint.plan().session_id();
+        match state.entries.get(session_id) {
+            Some(MockJournalEntry::Retiring(current)) if current == progress => {
+                if !current.is_complete() {
+                    return Err(progress_conflict());
+                }
+                let retired_at = self.clock.now_utc();
+                let retained_until =
+                    checked_session_deadline(retired_at, SESSION_REPIN_RETIREMENT_RETENTION)
+                        .map_err(map_store_error)?;
+                let owner =
+                    OwnerId::new(current.checkpoint.plan().new_owner().as_str()).map_err(|_| {
+                        IpsecLbError::invalid_config(
+                            "session_repin.owner",
+                            "session re-pin owner is invalid",
+                        )
+                    })?;
+                let tombstone = SessionRePinRetirementTombstone::from_terminal(
+                    &current.checkpoint,
+                    owner,
+                    retired_at,
+                    retained_until,
+                )?;
+                let outcome = tombstone.outcome(SessionRePinRetirementDisposition::Retired);
+                state
+                    .entries
+                    .insert(session_id.clone(), MockJournalEntry::Retired(tombstone));
+                Ok(outcome)
+            }
+            Some(MockJournalEntry::Retired(tombstone))
+                if tombstone.exact_identity(session_id, progress.identity()) =>
+            {
+                Ok(tombstone.outcome(SessionRePinRetirementDisposition::AlreadyRetired))
+            }
+            Some(_) => Err(progress_conflict()),
             None => Err(IpsecLbError::NotFound),
         }
     }
@@ -1193,6 +1698,15 @@ pub enum SessionRePinError {
         #[source]
         cause: IpsecLbError,
     },
+    /// Durable retirement began and must converge before activation can resume.
+    #[error("session re-pin retirement requires forward convergence")]
+    RetirementConvergenceRequired {
+        /// Redaction-safe ordered retirement progress.
+        status: SessionRePinRetirementStatus,
+        /// Underlying redaction-safe port or journal failure.
+        #[source]
+        cause: IpsecLbError,
+    },
 }
 
 impl SessionRePinError {
@@ -1203,6 +1717,9 @@ impl SessionRePinError {
             Self::Journal(_) => "session_repin_journal",
             Self::Quarantined { .. } => "session_repin_quarantined_before_commit",
             Self::ForwardConvergenceRequired { .. } => "session_repin_forward_convergence_required",
+            Self::RetirementConvergenceRequired { .. } => {
+                "session_repin_retirement_convergence_required"
+            }
         }
     }
 
@@ -1212,7 +1729,8 @@ impl SessionRePinError {
         match self {
             Self::Journal(cause)
             | Self::Quarantined { cause, .. }
-            | Self::ForwardConvergenceRequired { cause, .. } => cause,
+            | Self::ForwardConvergenceRequired { cause, .. }
+            | Self::RetirementConvergenceRequired { cause, .. } => cause,
         }
     }
 
@@ -1224,6 +1742,18 @@ impl SessionRePinError {
             Self::Quarantined { status, .. } | Self::ForwardConvergenceRequired { status, .. } => {
                 Some(*status)
             }
+            Self::RetirementConvergenceRequired { .. } => None,
+        }
+    }
+
+    /// Return durable retirement progress, when retirement already began.
+    #[must_use]
+    pub const fn retirement_status(&self) -> Option<SessionRePinRetirementStatus> {
+        match self {
+            Self::RetirementConvergenceRequired { status, .. } => Some(*status),
+            Self::Journal(_)
+            | Self::Quarantined { .. }
+            | Self::ForwardConvergenceRequired { .. } => None,
         }
     }
 }
@@ -1238,7 +1768,7 @@ pub struct SessionRePinCoordinator<B, F, O, A, J> {
 
 impl<B, F, O, A, J> SessionRePinCoordinator<B, F, O, A, J>
 where
-    B: SteeringBackend,
+    B: RePinSteeringBackend,
     F: OwnershipFencer,
     O: OwnershipSource,
     A: RePinAuditSink,
@@ -1306,23 +1836,6 @@ where
             Some(_) => Err(SessionRePinError::Journal(progress_conflict())),
             None => Ok(None),
         }
-    }
-
-    /// Retire the exact terminal journal after the product proves teardown.
-    ///
-    /// This method performs no SA, steering, or key teardown itself. The
-    /// consumer owns that ordering and may invoke retirement only after those
-    /// effects are authoritatively complete. A retained tombstone prevents
-    /// stale restart or successor calls from recreating journal authority.
-    pub async fn retire(
-        &self,
-        session_id: &SessionRePinSessionId,
-        identity: SessionRePinIdentity,
-    ) -> Result<SessionRePinRetirementOutcome, SessionRePinError> {
-        self.journal
-            .retire(session_id, identity)
-            .await
-            .map_err(SessionRePinError::Journal)
     }
 
     async fn drive(
@@ -1498,6 +2011,369 @@ where
     }
 }
 
+impl<B, F, O, A, J> SessionRePinCoordinator<B, F, O, A, J>
+where
+    B: RePinSteeringRetirementBackend + Clone + 'static,
+    F: OwnershipFencer + OwnershipRetirementAuthority + Clone + 'static,
+    O: OwnershipSource + Clone + 'static,
+    A: RePinAuditSink + Clone + 'static,
+    J: SessionRePinJournal + Clone + 'static,
+{
+    /// Durably retire every exact destination-scoped owner in this session.
+    ///
+    /// The entire operation runs in an owned supervised task. Dropping the
+    /// observer future does not cancel an admitted ownership CAS, Host cleanup,
+    /// or `CleanupComplete` write. Exact retries resume the non-expiring
+    /// `Retiring` journal and never touch Host maps again for an already-marked
+    /// key. The bounded session tombstone is written only after all ownership
+    /// records are deleted or proven strictly superseded.
+    pub async fn retire(
+        &self,
+        session_id: &SessionRePinSessionId,
+        identity: SessionRePinIdentity,
+    ) -> Result<SessionRePinRetirementOutcome, SessionRePinError> {
+        let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
+            SessionRePinError::Journal(IpsecLbError::invalid_config(
+                "session_repin.runtime",
+                "session re-pin retirement requires a Tokio runtime",
+            ))
+        })?;
+        let worker = Self {
+            repin: self.repin.clone(),
+            journal: self.journal.clone(),
+        };
+        let session_id = session_id.clone();
+        runtime
+            .spawn(async move { worker.retire_owned(session_id, identity).await })
+            .await
+            .map_err(|_| {
+                SessionRePinError::Journal(IpsecLbError::io(
+                    "session_repin_retirement_worker",
+                    io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "session re-pin retirement worker failed",
+                    ),
+                ))
+            })?
+    }
+
+    async fn adopt_concurrent_retirement_progress(
+        &self,
+        session_id: &SessionRePinSessionId,
+        identity: SessionRePinIdentity,
+        previous: &SessionRePinRetirementProgress,
+        cause: IpsecLbError,
+    ) -> Result<SessionRePinRetirementResume, SessionRePinError> {
+        match self
+            .journal
+            .begin_steering_retirement(session_id, identity)
+            .await
+        {
+            Ok(SessionRePinRetirementResume::InProgress(current))
+                if current.strictly_advances(previous) =>
+            {
+                Ok(SessionRePinRetirementResume::InProgress(current))
+            }
+            Ok(SessionRePinRetirementResume::Retired(outcome)) => {
+                Ok(SessionRePinRetirementResume::Retired(outcome))
+            }
+            Ok(SessionRePinRetirementResume::InProgress(_)) | Err(_) => {
+                Err(SessionRePinError::RetirementConvergenceRequired {
+                    status: previous.status(),
+                    cause,
+                })
+            }
+        }
+    }
+
+    async fn retire_owned(
+        &self,
+        session_id: SessionRePinSessionId,
+        identity: SessionRePinIdentity,
+    ) -> Result<SessionRePinRetirementOutcome, SessionRePinError> {
+        let mut permits = Vec::new();
+        // Admission happens while the session is still Active. Once the
+        // journal reaches Retiring, recovery must not depend on the old shard
+        // owner because legitimate teardown/failover may already have moved it.
+        if let Some(checkpoint) = self
+            .journal
+            .load(&session_id)
+            .await
+            .map_err(SessionRePinError::Journal)?
+        {
+            if checkpoint.plan().identity() != identity || !checkpoint.is_complete() {
+                return Err(SessionRePinError::Journal(progress_conflict()));
+            }
+            let acquired = self
+                .repin
+                .acquire_retirement_permits(checkpoint.plan().requests())
+                .await
+                .map_err(SessionRePinError::Journal)?;
+            if let Some(rechecked) = self
+                .journal
+                .load(&session_id)
+                .await
+                .map_err(SessionRePinError::Journal)?
+            {
+                if rechecked != checkpoint {
+                    return Err(SessionRePinError::Journal(progress_conflict()));
+                }
+                for (index, (request, permit)) in rechecked
+                    .plan()
+                    .requests()
+                    .iter()
+                    .zip(&acquired)
+                    .enumerate()
+                {
+                    let fence = rechecked
+                        .completed_fence(index)
+                        .ok_or_else(|| SessionRePinError::Journal(progress_conflict()))?;
+                    self.repin
+                        .validate_retirement_admission(request, fence, permit)
+                        .await
+                        .map_err(SessionRePinError::Journal)?;
+                }
+            }
+            permits = acquired.into_iter().map(Some).collect();
+        }
+
+        let mut progress = match self
+            .journal
+            .begin_steering_retirement(&session_id, identity)
+            .await
+            .map_err(SessionRePinError::Journal)?
+        {
+            SessionRePinRetirementResume::InProgress(progress) => progress,
+            SessionRePinRetirementResume::Retired(outcome) => return Ok(outcome),
+        };
+
+        loop {
+            progress.validate().map_err(|cause| {
+                SessionRePinError::RetirementConvergenceRequired {
+                    status: progress.status(),
+                    cause,
+                }
+            })?;
+            if progress.is_complete() {
+                return match self.journal.finish_steering_retirement(&progress).await {
+                    Ok(outcome) => Ok(outcome),
+                    Err(cause) => match self
+                        .adopt_concurrent_retirement_progress(
+                            &session_id,
+                            identity,
+                            &progress,
+                            cause,
+                        )
+                        .await?
+                    {
+                        SessionRePinRetirementResume::Retired(outcome) => Ok(outcome),
+                        SessionRePinRetirementResume::InProgress(_) => {
+                            Err(SessionRePinError::RetirementConvergenceRequired {
+                                status: progress.status(),
+                                cause: progress_conflict(),
+                            })
+                        }
+                    },
+                };
+            }
+
+            let index = progress.ownership_finalized_count;
+            if progress.retirement_markers.len() > index {
+                let cleanup =
+                    OwnershipCleanupCompleteProof::new(progress.grant(index).map_err(|cause| {
+                        SessionRePinError::RetirementConvergenceRequired {
+                            status: progress.status(),
+                            cause,
+                        }
+                    })?);
+                let finalized = self
+                    .repin
+                    .finalize_retirement_cleanup(cleanup)
+                    .await
+                    .map_err(|cause| SessionRePinError::RetirementConvergenceRequired {
+                        status: progress.status(),
+                        cause,
+                    })?;
+                progress = match self
+                    .journal
+                    .record_ownership_finalized(&progress, &finalized)
+                    .await
+                {
+                    Ok(next) => next,
+                    Err(cause) => match self
+                        .adopt_concurrent_retirement_progress(
+                            &session_id,
+                            identity,
+                            &progress,
+                            cause,
+                        )
+                        .await?
+                    {
+                        SessionRePinRetirementResume::InProgress(next) => next,
+                        SessionRePinRetirementResume::Retired(outcome) => return Ok(outcome),
+                    },
+                };
+                continue;
+            }
+
+            if permits.is_empty() {
+                let suffix = &progress.checkpoint.plan().requests()[index..];
+                let acquired = self
+                    .repin
+                    .acquire_retirement_permits(suffix)
+                    .await
+                    .map_err(|cause| SessionRePinError::RetirementConvergenceRequired {
+                        status: progress.status(),
+                        cause,
+                    })?;
+                let refreshed = match self
+                    .journal
+                    .begin_steering_retirement(&session_id, identity)
+                    .await
+                    .map_err(|cause| SessionRePinError::RetirementConvergenceRequired {
+                        status: progress.status(),
+                        cause,
+                    })? {
+                    SessionRePinRetirementResume::InProgress(progress) => progress,
+                    SessionRePinRetirementResume::Retired(outcome) => return Ok(outcome),
+                };
+                if refreshed != progress {
+                    progress = refreshed;
+                    drop(acquired);
+                    continue;
+                }
+                permits = std::iter::repeat_with(|| None)
+                    .take(index)
+                    .chain(acquired.into_iter().map(Some))
+                    .collect();
+            }
+
+            let request = progress.checkpoint.plan().requests()[index].clone();
+            let active_fence = progress.checkpoint.completed_fence(index).ok_or_else(|| {
+                SessionRePinError::RetirementConvergenceRequired {
+                    status: progress.status(),
+                    cause: progress_conflict(),
+                }
+            })?;
+            let permit = permits
+                .get_mut(index)
+                .and_then(Option::take)
+                .ok_or_else(|| SessionRePinError::RetirementConvergenceRequired {
+                    status: progress.status(),
+                    cause: IpsecLbError::adapter_contract_violation(
+                        "session_repin_retirement_permit_missing",
+                    ),
+                })?;
+            let step = self
+                .repin
+                .cleanup_committed_for_retirement(&request, active_fence, permit)
+                .await
+                .map_err(|cause| SessionRePinError::RetirementConvergenceRequired {
+                    status: progress.status(),
+                    cause,
+                })?;
+            match step {
+                OwnershipRetirementStep::CleanupPending(pending) => {
+                    let (cleanup_progress, cleanup) = match self
+                        .journal
+                        .record_cleanup_complete(&progress, &pending)
+                        .await
+                    {
+                        Ok(value) => value,
+                        Err(cause) => {
+                            let resume = self
+                                .adopt_concurrent_retirement_progress(
+                                    &session_id,
+                                    identity,
+                                    &progress,
+                                    cause,
+                                )
+                                .await?;
+                            drop(pending);
+                            match resume {
+                                SessionRePinRetirementResume::InProgress(next) => {
+                                    progress = next;
+                                    continue;
+                                }
+                                SessionRePinRetirementResume::Retired(outcome) => {
+                                    return Ok(outcome);
+                                }
+                            }
+                        }
+                    };
+                    let finalized = match self.repin.finalize_retirement_cleanup(cleanup).await {
+                        Ok(finalized) => finalized,
+                        Err(cause) => {
+                            let resume = self
+                                .adopt_concurrent_retirement_progress(
+                                    &session_id,
+                                    identity,
+                                    &cleanup_progress,
+                                    cause,
+                                )
+                                .await?;
+                            drop(pending);
+                            match resume {
+                                SessionRePinRetirementResume::InProgress(next) => {
+                                    progress = next;
+                                    continue;
+                                }
+                                SessionRePinRetirementResume::Retired(outcome) => {
+                                    return Ok(outcome);
+                                }
+                            }
+                        }
+                    };
+                    progress = match self
+                        .journal
+                        .record_ownership_finalized(&cleanup_progress, &finalized)
+                        .await
+                    {
+                        Ok(next) => next,
+                        Err(cause) => match self
+                            .adopt_concurrent_retirement_progress(
+                                &session_id,
+                                identity,
+                                &cleanup_progress,
+                                cause,
+                            )
+                            .await?
+                        {
+                            SessionRePinRetirementResume::InProgress(next) => next,
+                            SessionRePinRetirementResume::Retired(outcome) => {
+                                drop(pending);
+                                return Ok(outcome);
+                            }
+                        },
+                    };
+                    drop(pending);
+                }
+                OwnershipRetirementStep::Superseded(proof) => {
+                    progress = match self
+                        .journal
+                        .record_ownership_superseded(&progress, &proof)
+                        .await
+                    {
+                        Ok(next) => next,
+                        Err(cause) => match self
+                            .adopt_concurrent_retirement_progress(
+                                &session_id,
+                                identity,
+                                &progress,
+                                cause,
+                            )
+                            .await?
+                        {
+                            SessionRePinRetirementResume::InProgress(next) => next,
+                            SessionRePinRetirementResume::Retired(outcome) => return Ok(outcome),
+                        },
+                    };
+                }
+            }
+        }
+    }
+}
+
 fn validate_exact_checkpoint(
     checkpoint: &SessionRePinCheckpoint,
     plan: &SessionRePinPlan,
@@ -1527,6 +2403,7 @@ fn known_committed_status(checkpoint: &SessionRePinCheckpoint) -> SessionRePinSt
 #[derive(Clone, PartialEq, Eq)]
 enum SessionRePinJournalEntry {
     Active(SessionRePinCheckpoint),
+    Retiring(SessionRePinRetirementProgress),
     Retired(SessionRePinRetirementTombstone),
 }
 
@@ -1534,6 +2411,7 @@ impl SessionRePinJournalEntry {
     fn session_id(&self) -> &SessionRePinSessionId {
         match self {
             Self::Active(checkpoint) => checkpoint.plan().session_id(),
+            Self::Retiring(progress) => progress.checkpoint.plan().session_id(),
             Self::Retired(tombstone) => &tombstone.session_id,
         }
     }
@@ -1547,6 +2425,14 @@ impl SessionRePinJournalEntry {
                         "session re-pin owner is invalid",
                     )
                 }),
+            Self::Retiring(progress) => {
+                OwnerId::new(progress.checkpoint.plan().new_owner().as_str()).map_err(|_| {
+                    IpsecLbError::invalid_config(
+                        "session_repin.owner",
+                        "session re-pin owner is invalid",
+                    )
+                })
+            }
             Self::Retired(tombstone) => Ok(tombstone.owner.clone()),
         }
     }
@@ -1554,6 +2440,7 @@ impl SessionRePinJournalEntry {
     const fn expires_at(&self) -> Option<Timestamp> {
         match self {
             Self::Active(_) => None,
+            Self::Retiring(_) => None,
             Self::Retired(tombstone) => Some(tombstone.retained_until),
         }
     }
@@ -1666,12 +2553,15 @@ where
                         return Ok(checkpoint.clone());
                     }
                     SessionRePinJournalEntry::Retired(_) => return Err(progress_conflict()),
+                    SessionRePinJournalEntry::Retiring(_) => return Err(progress_conflict()),
                     SessionRePinJournalEntry::Active(_) => {}
                 }
             }
             let existing = current.as_ref().and_then(|value| match &value.1 {
                 SessionRePinJournalEntry::Active(checkpoint) => Some(checkpoint),
-                SessionRePinJournalEntry::Retired(_) => None,
+                SessionRePinJournalEntry::Retiring(_) | SessionRePinJournalEntry::Retired(_) => {
+                    None
+                }
             });
             validate_plan_succession(existing, plan)?;
             let desired = SessionRePinCheckpoint::from_progress(plan.clone(), Vec::new(), None)?;
@@ -1686,6 +2576,9 @@ where
                     return Ok(checkpoint);
                 }
                 JournalWrite::Committed(SessionRePinJournalEntry::Retired(_)) => {
+                    return Err(progress_conflict());
+                }
+                JournalWrite::Committed(SessionRePinJournalEntry::Retiring(_)) => {
                     return Err(progress_conflict());
                 }
                 JournalWrite::Conflict => continue,
@@ -1732,6 +2625,9 @@ where
                 JournalWrite::Committed(SessionRePinJournalEntry::Retired(_)) => {
                     return Err(progress_conflict());
                 }
+                JournalWrite::Committed(SessionRePinJournalEntry::Retiring(_)) => {
+                    return Err(progress_conflict());
+                }
                 JournalWrite::Conflict => continue,
             }
         }
@@ -1740,7 +2636,213 @@ where
         ))
     }
 
-    async fn retire_inner(
+    async fn begin_steering_retirement_inner(
+        &self,
+        session_id: &SessionRePinSessionId,
+        identity: SessionRePinIdentity,
+    ) -> Result<SessionRePinRetirementResume, IpsecLbError> {
+        for _ in 0..SESSION_REPIN_MAX_CAS_ATTEMPTS {
+            let Some((record, entry)) = self.read_entry(session_id).await? else {
+                return Err(IpsecLbError::NotFound);
+            };
+            let progress = match entry {
+                SessionRePinJournalEntry::Active(checkpoint) => {
+                    if checkpoint.plan().identity() != identity || !checkpoint.is_complete() {
+                        return Err(progress_conflict());
+                    }
+                    SessionRePinRetirementProgress::from_terminal(checkpoint)?
+                }
+                SessionRePinJournalEntry::Retiring(progress) => {
+                    if !progress.exact_identity(session_id, identity) {
+                        return Err(progress_conflict());
+                    }
+                    progress.validate()?;
+                    return Ok(SessionRePinRetirementResume::InProgress(progress));
+                }
+                SessionRePinJournalEntry::Retired(tombstone) => {
+                    if !tombstone.exact_identity(session_id, identity) {
+                        return Err(progress_conflict());
+                    }
+                    tombstone.validate()?;
+                    return Ok(SessionRePinRetirementResume::Retired(
+                        tombstone.outcome(SessionRePinRetirementDisposition::AlreadyRetired),
+                    ));
+                }
+            };
+            match self
+                .write_entry(Some(&record), &SessionRePinJournalEntry::Retiring(progress))
+                .await?
+            {
+                JournalWrite::Committed(SessionRePinJournalEntry::Retiring(progress)) => {
+                    return Ok(SessionRePinRetirementResume::InProgress(progress));
+                }
+                JournalWrite::Committed(_) => return Err(progress_conflict()),
+                JournalWrite::Conflict => continue,
+            }
+        }
+        Err(IpsecLbError::ownership_conflict(
+            "session re-pin retirement journal CAS attempts exhausted",
+        ))
+    }
+
+    async fn record_cleanup_complete_inner(
+        &self,
+        expected: &SessionRePinRetirementProgress,
+        pending: &PendingOwnershipRetirement,
+    ) -> Result<SessionRePinRetirementProgress, IpsecLbError> {
+        for _ in 0..SESSION_REPIN_MAX_CAS_ATTEMPTS {
+            let session_id = expected.checkpoint.plan().session_id();
+            let Some((record, entry)) = self.read_entry(session_id).await? else {
+                return Err(IpsecLbError::NotFound);
+            };
+            let SessionRePinJournalEntry::Retiring(current) = entry else {
+                return Err(progress_conflict());
+            };
+            if current != *expected {
+                return Err(progress_conflict());
+            }
+            let desired = current.with_cleanup_complete(pending)?;
+            match self
+                .write_entry(Some(&record), &SessionRePinJournalEntry::Retiring(desired))
+                .await?
+            {
+                JournalWrite::Committed(SessionRePinJournalEntry::Retiring(progress)) => {
+                    return Ok(progress);
+                }
+                JournalWrite::Committed(_) => return Err(progress_conflict()),
+                JournalWrite::Conflict => continue,
+            }
+        }
+        Err(IpsecLbError::ownership_conflict(
+            "session re-pin retirement journal CAS attempts exhausted",
+        ))
+    }
+
+    async fn record_ownership_finalized_inner(
+        &self,
+        expected: &SessionRePinRetirementProgress,
+        finalized: &OwnershipRetirementFinalizedProof,
+    ) -> Result<SessionRePinRetirementProgress, IpsecLbError> {
+        let desired = expected.with_ownership_finalized(finalized)?;
+        for _ in 0..SESSION_REPIN_MAX_CAS_ATTEMPTS {
+            let session_id = expected.checkpoint.plan().session_id();
+            let Some((record, entry)) = self.read_entry(session_id).await? else {
+                return Err(IpsecLbError::NotFound);
+            };
+            let SessionRePinJournalEntry::Retiring(current) = entry else {
+                return Err(progress_conflict());
+            };
+            if current == desired {
+                return Ok(current);
+            }
+            if current != *expected {
+                return Err(progress_conflict());
+            }
+            match self
+                .write_entry(
+                    Some(&record),
+                    &SessionRePinJournalEntry::Retiring(desired.clone()),
+                )
+                .await?
+            {
+                JournalWrite::Committed(SessionRePinJournalEntry::Retiring(progress)) => {
+                    return Ok(progress);
+                }
+                JournalWrite::Committed(_) => return Err(progress_conflict()),
+                JournalWrite::Conflict => continue,
+            }
+        }
+        Err(IpsecLbError::ownership_conflict(
+            "session re-pin retirement journal CAS attempts exhausted",
+        ))
+    }
+
+    async fn record_ownership_superseded_inner(
+        &self,
+        expected: &SessionRePinRetirementProgress,
+        proof: &OwnershipRetirementSupersededProof,
+    ) -> Result<SessionRePinRetirementProgress, IpsecLbError> {
+        for _ in 0..SESSION_REPIN_MAX_CAS_ATTEMPTS {
+            let session_id = expected.checkpoint.plan().session_id();
+            let Some((record, entry)) = self.read_entry(session_id).await? else {
+                return Err(IpsecLbError::NotFound);
+            };
+            let SessionRePinJournalEntry::Retiring(current) = entry else {
+                return Err(progress_conflict());
+            };
+            if current != *expected {
+                return Err(progress_conflict());
+            }
+            let desired = current.with_superseded(proof)?;
+            match self
+                .write_entry(Some(&record), &SessionRePinJournalEntry::Retiring(desired))
+                .await?
+            {
+                JournalWrite::Committed(SessionRePinJournalEntry::Retiring(progress)) => {
+                    return Ok(progress);
+                }
+                JournalWrite::Committed(_) => return Err(progress_conflict()),
+                JournalWrite::Conflict => continue,
+            }
+        }
+        Err(IpsecLbError::ownership_conflict(
+            "session re-pin retirement journal CAS attempts exhausted",
+        ))
+    }
+
+    async fn finish_steering_retirement_inner(
+        &self,
+        expected: &SessionRePinRetirementProgress,
+    ) -> Result<SessionRePinRetirementOutcome, IpsecLbError> {
+        expected.validate()?;
+        if !expected.is_complete() {
+            return Err(progress_conflict());
+        }
+        for _ in 0..SESSION_REPIN_MAX_CAS_ATTEMPTS {
+            let session_id = expected.checkpoint.plan().session_id();
+            let Some((record, entry)) = self.read_entry(session_id).await? else {
+                return Err(IpsecLbError::NotFound);
+            };
+            match entry {
+                SessionRePinJournalEntry::Retired(tombstone)
+                    if tombstone.exact_identity(session_id, expected.identity()) =>
+                {
+                    tombstone.validate()?;
+                    return Ok(tombstone.outcome(SessionRePinRetirementDisposition::AlreadyRetired));
+                }
+                SessionRePinJournalEntry::Retiring(current) if current == *expected => {}
+                SessionRePinJournalEntry::Active(_)
+                | SessionRePinJournalEntry::Retiring(_)
+                | SessionRePinJournalEntry::Retired(_) => return Err(progress_conflict()),
+            }
+            let retired_at = self.clock.now_utc();
+            let retained_until =
+                checked_session_deadline(retired_at, SESSION_REPIN_RETIREMENT_RETENTION)
+                    .map_err(map_store_error)?;
+            let tombstone = SessionRePinRetirementTombstone::from_terminal(
+                &expected.checkpoint,
+                record.owner.clone(),
+                retired_at,
+                retained_until,
+            )?;
+            match self
+                .write_entry(Some(&record), &SessionRePinJournalEntry::Retired(tombstone))
+                .await?
+            {
+                JournalWrite::Committed(SessionRePinJournalEntry::Retired(tombstone)) => {
+                    return Ok(tombstone.outcome(SessionRePinRetirementDisposition::Retired));
+                }
+                JournalWrite::Committed(_) => return Err(progress_conflict()),
+                JournalWrite::Conflict => continue,
+            }
+        }
+        Err(IpsecLbError::ownership_conflict(
+            "session re-pin retirement journal CAS attempts exhausted",
+        ))
+    }
+
+    #[cfg(test)]
+    async fn retire(
         &self,
         session_id: &SessionRePinSessionId,
         identity: SessionRePinIdentity,
@@ -1751,6 +2853,7 @@ where
             };
             let checkpoint = match entry {
                 SessionRePinJournalEntry::Active(checkpoint) => checkpoint,
+                SessionRePinJournalEntry::Retiring(_) => return Err(progress_conflict()),
                 SessionRePinJournalEntry::Retired(tombstone) => {
                     if tombstone.exact_identity(session_id, identity) {
                         tombstone.validate()?;
@@ -1783,6 +2886,9 @@ where
                 JournalWrite::Committed(SessionRePinJournalEntry::Active(_)) => {
                     return Err(progress_conflict());
                 }
+                JournalWrite::Committed(SessionRePinJournalEntry::Retiring(_)) => {
+                    return Err(progress_conflict());
+                }
                 JournalWrite::Conflict => continue,
             }
         }
@@ -1812,6 +2918,7 @@ where
         let owner = desired.owner()?;
         let payload = match desired {
             SessionRePinJournalEntry::Active(checkpoint) => encode_checkpoint(checkpoint)?,
+            SessionRePinJournalEntry::Retiring(progress) => encode_retiring(progress)?,
             SessionRePinJournalEntry::Retired(tombstone) => encode_retirement(tombstone)?,
         };
         let capabilities = self.backend.capabilities().await;
@@ -1938,7 +3045,9 @@ where
         self.read_entry(session_id).await.map(|record| {
             record.and_then(|value| match value.1 {
                 SessionRePinJournalEntry::Active(checkpoint) => Some(checkpoint),
-                SessionRePinJournalEntry::Retired(_) => None,
+                SessionRePinJournalEntry::Retiring(_) | SessionRePinJournalEntry::Retired(_) => {
+                    None
+                }
             })
         })
     }
@@ -1963,12 +3072,58 @@ where
             .await
     }
 
-    async fn retire(
+    async fn begin_steering_retirement(
         &self,
         session_id: &SessionRePinSessionId,
         identity: SessionRePinIdentity,
+    ) -> Result<SessionRePinRetirementResume, IpsecLbError> {
+        self.begin_steering_retirement_inner(session_id, identity)
+            .await
+    }
+
+    async fn record_cleanup_complete(
+        &self,
+        progress: &SessionRePinRetirementProgress,
+        pending: &PendingOwnershipRetirement,
+    ) -> Result<
+        (
+            SessionRePinRetirementProgress,
+            OwnershipCleanupCompleteProof,
+        ),
+        IpsecLbError,
+    > {
+        let updated = self
+            .record_cleanup_complete_inner(progress, pending)
+            .await?;
+        Ok((
+            updated,
+            OwnershipCleanupCompleteProof::new(pending.grant().clone()),
+        ))
+    }
+
+    async fn record_ownership_finalized(
+        &self,
+        progress: &SessionRePinRetirementProgress,
+        finalized: &OwnershipRetirementFinalizedProof,
+    ) -> Result<SessionRePinRetirementProgress, IpsecLbError> {
+        self.record_ownership_finalized_inner(progress, finalized)
+            .await
+    }
+
+    async fn record_ownership_superseded(
+        &self,
+        progress: &SessionRePinRetirementProgress,
+        proof: &OwnershipRetirementSupersededProof,
+    ) -> Result<SessionRePinRetirementProgress, IpsecLbError> {
+        self.record_ownership_superseded_inner(progress, proof)
+            .await
+    }
+
+    async fn finish_steering_retirement(
+        &self,
+        progress: &SessionRePinRetirementProgress,
     ) -> Result<SessionRePinRetirementOutcome, IpsecLbError> {
-        self.retire_inner(session_id, identity).await
+        self.finish_steering_retirement_inner(progress).await
     }
 }
 
@@ -1978,6 +3133,9 @@ enum JournalMutation {
     SaComplete { index: usize, fence: OwnershipFence },
 }
 
+// Writes normally commit an entry, so retain it inline instead of allocating on
+// every journal transition merely to shrink the uncommon conflict variant.
+#[allow(clippy::large_enum_variant)]
 enum JournalWrite {
     Committed(SessionRePinJournalEntry),
     Conflict,
@@ -2113,6 +3271,25 @@ fn encode_retirement(
     })
 }
 
+fn encode_retiring(
+    progress: &SessionRePinRetirementProgress,
+) -> Result<EncryptedSessionPayload, IpsecLbError> {
+    progress.validate()?;
+    let wire = RetiringWire::from_progress(progress);
+    encode_json_payload(
+        &journal_payload_format()?,
+        SessionPayloadVersion::new(SESSION_REPIN_RETIRING_PAYLOAD_VERSION),
+        &wire,
+        Some(SESSION_REPIN_JOURNAL_MAX_BYTES),
+    )
+    .map_err(|_| {
+        IpsecLbError::invalid_config(
+            "session_repin.payload",
+            "session re-pin retiring progress encoding failed",
+        )
+    })
+}
+
 fn decode_journal_record(
     record: &StoredSessionRecord,
     expected_key: &SessionKey,
@@ -2161,6 +3338,25 @@ fn decode_journal_record(
             }
             Ok(SessionRePinJournalEntry::Active(checkpoint))
         }
+        SESSION_REPIN_RETIRING_PAYLOAD_VERSION => {
+            if record.expires_at.is_some() {
+                return Err(invalid_journal_metadata());
+            }
+            let wire: RetiringWire = decode_json_payload(
+                &record.payload,
+                &format,
+                SessionPayloadVersion::new(SESSION_REPIN_RETIRING_PAYLOAD_VERSION),
+                Some(SESSION_REPIN_JOURNAL_MAX_BYTES),
+            )
+            .map_err(|_| unreadable_journal_payload())?;
+            let progress = wire.into_progress()?;
+            if progress.checkpoint.plan().session_id() != expected_session_id
+                || record.owner.as_str() != progress.checkpoint.plan().new_owner().as_str()
+            {
+                return Err(progress_conflict());
+            }
+            Ok(SessionRePinJournalEntry::Retiring(progress))
+        }
         SESSION_REPIN_RETIREMENT_PAYLOAD_VERSION => {
             let wire: RetirementWire = decode_json_payload(
                 &record.payload,
@@ -2207,6 +3403,72 @@ struct JournalWire {
     requests: Vec<RequestWire>,
     completed_fences: Vec<u64>,
     current_fence: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetiringWire {
+    checkpoint: JournalWire,
+    retirement_markers: Vec<RetirementMarkerWire>,
+    ownership_finalized_count: usize,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "disposition", rename_all = "snake_case", deny_unknown_fields)]
+enum RetirementMarkerWire {
+    CleanupComplete { authoritative_fence: u64 },
+    Superseded { authoritative_fence: u64 },
+}
+
+impl RetiringWire {
+    fn from_progress(progress: &SessionRePinRetirementProgress) -> Self {
+        Self {
+            checkpoint: JournalWire::from_checkpoint(&progress.checkpoint),
+            retirement_markers: progress
+                .retirement_markers
+                .iter()
+                .map(|marker| match marker {
+                    OwnershipRetirementMarker::CleanupComplete(fence) => {
+                        RetirementMarkerWire::CleanupComplete {
+                            authoritative_fence: fence.get(),
+                        }
+                    }
+                    OwnershipRetirementMarker::Superseded(fence) => {
+                        RetirementMarkerWire::Superseded {
+                            authoritative_fence: fence.get(),
+                        }
+                    }
+                })
+                .collect(),
+            ownership_finalized_count: progress.ownership_finalized_count,
+        }
+    }
+
+    fn into_progress(self) -> Result<SessionRePinRetirementProgress, IpsecLbError> {
+        if self.retirement_markers.len() > MAX_SESSION_REPIN_SAS {
+            return Err(progress_conflict());
+        }
+        let checkpoint = self.checkpoint.into_checkpoint()?;
+        let markers = self
+            .retirement_markers
+            .into_iter()
+            .map(|marker| match marker {
+                RetirementMarkerWire::CleanupComplete {
+                    authoritative_fence,
+                } => OwnershipFence::new(authoritative_fence)
+                    .map(OwnershipRetirementMarker::CleanupComplete),
+                RetirementMarkerWire::Superseded {
+                    authoritative_fence,
+                } => OwnershipFence::new(authoritative_fence)
+                    .map(OwnershipRetirementMarker::Superseded),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        SessionRePinRetirementProgress::from_progress(
+            checkpoint,
+            markers,
+            self.ownership_finalized_count,
+        )
+    }
 }
 
 impl JournalWire {
@@ -2345,6 +3607,8 @@ struct RequestWire {
     previous_owner: String,
     new_owner: String,
     rule: RuleWire,
+    ownership_key: Vec<u8>,
+    outbound_sa_binding_id: Option<[u8; 32]>,
     resume: ResumeWire,
 }
 
@@ -2357,6 +3621,10 @@ impl RequestWire {
             previous_owner: request.previous_owner.as_str().to_owned(),
             new_owner: request.new_owner.as_str().to_owned(),
             rule: RuleWire::from_rule(request.rule),
+            ownership_key: request.ownership_key.to_canonical_bytes(),
+            outbound_sa_binding_id: request
+                .outbound_sa_binding_id
+                .map(OutboundSaBindingId::to_bytes),
             resume: ResumeWire::from_resume(request.resume),
         }
     }
@@ -2369,6 +3637,11 @@ impl RequestWire {
             previous_owner: ClusterNode::new(self.previous_owner),
             new_owner: ClusterNode::new(self.new_owner),
             rule: self.rule.into_rule()?,
+            ownership_key: SessionOwnershipKey::from_canonical_bytes(&self.ownership_key)
+                .map_err(|_| invalid_wire())?,
+            outbound_sa_binding_id: self
+                .outbound_sa_binding_id
+                .map(OutboundSaBindingId::from_bytes),
             resume: self.resume.into_resume()?,
         })
     }
@@ -2787,11 +4060,22 @@ mod tests {
         MockOwnershipFencer, MockOwnershipSource, MockRePinAuditSink, MockSteeringBackend,
         MockSteeringOperation,
     };
+    use crate::ownership::{
+        DestinationContext, EspEncapsulationKind, EspOwnershipKey, EspSpi,
+        EstablishedIkeOwnershipKey, IkeSpi, RoutingDomainTag,
+    };
+    use crate::ports::SteeringBackend;
 
     use crate::repin::{
         OwnershipFenceGrant, OwnershipFenceRequest, OwnershipRetryProof, OwnershipSnapshot,
         OwnershipTransitionFingerprint,
     };
+    macro_rules! test_repin {
+        ($steering:expr, $fencer:expr, $ownership:expr, $audit:expr $(,)?) => {
+            RePinCoordinator::new($steering, $fencer, $ownership, $audit)
+                .with_test_applied_esp_counter_proof()
+        };
+    }
 
     #[test]
     fn topology_authority_revocation_maps_to_ownership_conflict() {
@@ -2864,6 +4148,38 @@ mod tests {
         }
     }
 
+    fn ownership_key(sa: SaId) -> SessionOwnershipKey {
+        let destination = DestinationContext::new(
+            crate::IpAddress::V4([192, 0, 2, 30]),
+            RoutingDomainTag::new(7),
+        );
+        match sa {
+            SaId::Esp { spi } => SessionOwnershipKey::Esp(EspOwnershipKey::new(
+                destination,
+                EspEncapsulationKind::UdpEncapsulated,
+                EspSpi::new(spi).unwrap(),
+            )),
+            SaId::Ike { responder_spi } => {
+                SessionOwnershipKey::EstablishedIke(EstablishedIkeOwnershipKey::new(
+                    destination,
+                    IkeSpi::new(21).unwrap(),
+                    IkeSpi::new(responder_spi).unwrap(),
+                ))
+            }
+        }
+    }
+
+    fn outbound_sa_binding_id(sa: SaId) -> Option<OutboundSaBindingId> {
+        match sa {
+            SaId::Esp { spi } => {
+                let mut bytes = [0x44; 32];
+                bytes[..4].copy_from_slice(&spi.to_be_bytes());
+                Some(OutboundSaBindingId::from_bytes(bytes))
+            }
+            SaId::Ike { .. } => None,
+        }
+    }
+
     fn request(index: usize, transition_offset: u128) -> RePinRequest {
         let sa = sa_for(index);
         let outbound_iv = match sa {
@@ -2895,6 +4211,8 @@ mod tests {
                     SaId::Esp { spi } => SteerKey::EspSpi(spi),
                 },
             },
+            ownership_key: ownership_key(sa),
+            outbound_sa_binding_id: outbound_sa_binding_id(sa),
             resume: SameSpiResume {
                 previous_sa: sa,
                 resumed_sa: sa,
@@ -3125,21 +4443,17 @@ mod tests {
     }
 
     #[async_trait]
-    impl SteeringBackend for BlockingSteering {
-        async fn install_rule(&self, rule: SteeringRule) -> Result<(), IpsecLbError> {
+    impl RePinSteeringBackend for BlockingSteering {
+        async fn apply_fenced_repin(
+            &self,
+            update: crate::RePinSteeringUpdate,
+            permit: crate::RePinSteeringOperationPermit,
+        ) -> Result<crate::RePinSteeringOperationPermit, IpsecLbError> {
             if self.block.load(Ordering::SeqCst) {
                 self.entered.store(true, Ordering::SeqCst);
                 self.release.notified().await;
             }
-            self.inner.install_rule(rule).await
-        }
-
-        async fn remove_rule(&self, rule: SteeringRule) -> Result<(), IpsecLbError> {
-            self.inner.remove_rule(rule).await
-        }
-
-        async fn probe(&self) -> Result<crate::model::SteeringProbe, IpsecLbError> {
-            self.inner.probe().await
+            self.inner.apply_fenced_repin(update, permit).await
         }
     }
 
@@ -3169,21 +4483,18 @@ mod tests {
     }
 
     #[async_trait]
-    impl SteeringBackend for SelectiveInstallBarrier {
-        async fn install_rule(&self, rule: SteeringRule) -> Result<(), IpsecLbError> {
+    impl RePinSteeringBackend for SelectiveInstallBarrier {
+        async fn apply_fenced_repin(
+            &self,
+            update: crate::RePinSteeringUpdate,
+            permit: crate::RePinSteeringOperationPermit,
+        ) -> Result<crate::RePinSteeringOperationPermit, IpsecLbError> {
+            let rule = update.rule();
             if rule == self.rule && self.armed.swap(false, Ordering::SeqCst) {
                 self.entered.store(true, Ordering::SeqCst);
                 self.release.notified().await;
             }
-            self.inner.install_rule(rule).await
-        }
-
-        async fn remove_rule(&self, rule: SteeringRule) -> Result<(), IpsecLbError> {
-            self.inner.remove_rule(rule).await
-        }
-
-        async fn probe(&self) -> Result<crate::model::SteeringProbe, IpsecLbError> {
-            self.inner.probe().await
+            self.inner.apply_fenced_repin(update, permit).await
         }
     }
 
@@ -3259,6 +4570,549 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone)]
+    struct RetirementTestAuthority {
+        states: Arc<Mutex<BTreeMap<SessionOwnershipKey, RetirementAuthorityState>>>,
+        begin_calls: Arc<AtomicUsize>,
+        finalize_calls: Arc<AtomicUsize>,
+        fence_calls: Arc<AtomicUsize>,
+        fail_begin_on_call: Arc<Mutex<Option<usize>>>,
+        fail_finalize_on_call: Arc<Mutex<Option<usize>>>,
+    }
+
+    #[derive(Debug, Clone)]
+    enum RetirementAuthorityState {
+        Active(OwnershipFenceGrant),
+        Retiring(OwnershipRetirementGrant),
+        Deleted,
+    }
+
+    impl RetirementTestAuthority {
+        fn from_plan(plan: &SessionRePinPlan, fence: OwnershipFence) -> Self {
+            let states = plan
+                .requests()
+                .iter()
+                .map(|request| {
+                    (
+                        request.ownership_key,
+                        RetirementAuthorityState::Active(OwnershipFenceGrant {
+                            sa: request.sa,
+                            ownership_key: request.ownership_key,
+                            transition_id: request.transition_id,
+                            fingerprint: request.ownership_fingerprint(),
+                            owner: request.new_owner.clone(),
+                            fence,
+                        }),
+                    )
+                })
+                .collect();
+            Self {
+                states: Arc::new(Mutex::new(states)),
+                begin_calls: Arc::new(AtomicUsize::new(0)),
+                finalize_calls: Arc::new(AtomicUsize::new(0)),
+                fence_calls: Arc::new(AtomicUsize::new(0)),
+                fail_begin_on_call: Arc::new(Mutex::new(None)),
+                fail_finalize_on_call: Arc::new(Mutex::new(None)),
+            }
+        }
+
+        fn fail_begin_on_call(&self, call: usize) {
+            *lock_unpoisoned(&self.fail_begin_on_call) = Some(call);
+        }
+
+        fn fail_finalize_on_call(&self, call: usize) {
+            *lock_unpoisoned(&self.fail_finalize_on_call) = Some(call);
+        }
+
+        fn install_successor(&self, request: &RePinRequest, fence: OwnershipFence) {
+            let mut fingerprint = request.ownership_fingerprint().as_bytes();
+            fingerprint[0] ^= 0x80;
+            lock_unpoisoned(&self.states).insert(
+                request.ownership_key,
+                RetirementAuthorityState::Active(OwnershipFenceGrant {
+                    sa: request.sa,
+                    ownership_key: request.ownership_key,
+                    transition_id: OwnershipTransitionId::new(request.transition_id.get() + 10_000)
+                        .expect("nonzero"),
+                    fingerprint: OwnershipTransitionFingerprint::from_bytes(fingerprint),
+                    owner: ClusterNode::new("newer-owner"),
+                    fence,
+                }),
+            );
+        }
+
+        fn grant_matches_request(
+            grant: &OwnershipFenceGrant,
+            request: &OwnershipFenceRequest,
+        ) -> bool {
+            grant.sa == request.sa
+                && grant.ownership_key == request.ownership_key
+                && grant.transition_id == request.transition_id
+                && grant.fingerprint == request.fingerprint
+                && grant.owner == request.new_owner
+        }
+    }
+
+    #[async_trait]
+    impl OwnershipFencer for RetirementTestAuthority {
+        async fn recover_fence_grant(
+            &self,
+            request: &OwnershipFenceRequest,
+        ) -> Result<Option<OwnershipFenceGrant>, IpsecLbError> {
+            match lock_unpoisoned(&self.states).get(&request.ownership_key) {
+                Some(RetirementAuthorityState::Active(grant))
+                    if Self::grant_matches_request(grant, request) =>
+                {
+                    Ok(Some(grant.clone()))
+                }
+                Some(RetirementAuthorityState::Active(_)) => Err(IpsecLbError::ownership_conflict(
+                    "test authority contains a different active lineage",
+                )),
+                Some(RetirementAuthorityState::Retiring(_)) => Err(
+                    IpsecLbError::ownership_conflict("test authority is retiring"),
+                ),
+                Some(RetirementAuthorityState::Deleted) | None => Err(IpsecLbError::NotFound),
+            }
+        }
+
+        async fn fence_sa_owner(
+            &self,
+            request: OwnershipFenceRequest,
+        ) -> Result<OwnershipFenceGrant, IpsecLbError> {
+            self.fence_calls.fetch_add(1, Ordering::SeqCst);
+            let mut states = lock_unpoisoned(&self.states);
+            let Some(RetirementAuthorityState::Active(current)) =
+                states.get(&request.ownership_key)
+            else {
+                return Err(IpsecLbError::NotFound);
+            };
+            if current.owner != request.previous_owner || current.fence != request.previous_fence {
+                return Err(IpsecLbError::ownership_conflict(
+                    "test activation predecessor changed",
+                ));
+            }
+            let grant = OwnershipFenceGrant {
+                sa: request.sa,
+                ownership_key: request.ownership_key,
+                transition_id: request.transition_id,
+                fingerprint: request.fingerprint,
+                owner: request.new_owner,
+                fence: OwnershipFence::new(current.fence.get() + 1)?,
+            };
+            states.insert(
+                request.ownership_key,
+                RetirementAuthorityState::Active(grant.clone()),
+            );
+            Ok(grant)
+        }
+
+        async fn validate_retry_proof(
+            &self,
+            proof: &OwnershipRetryProof,
+        ) -> Result<(), IpsecLbError> {
+            match lock_unpoisoned(&self.states).get(&proof.ownership_key()) {
+                Some(RetirementAuthorityState::Active(grant))
+                    if grant.sa == proof.sa()
+                        && grant.ownership_key == proof.ownership_key()
+                        && grant.transition_id == proof.transition_id()
+                        && grant.fingerprint == proof.fingerprint()
+                        && grant.owner == *proof.owner()
+                        && grant.fence == proof.fence() =>
+                {
+                    Ok(())
+                }
+                _ => Err(IpsecLbError::ownership_conflict(
+                    "test retry proof is no longer active",
+                )),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl OwnershipRetirementAuthority for RetirementTestAuthority {
+        async fn begin_ownership_retirement(
+            &self,
+            request: OwnershipRetirementRequest,
+        ) -> Result<crate::OwnershipRetirementAdmission, IpsecLbError> {
+            let call = self.begin_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if *lock_unpoisoned(&self.fail_begin_on_call) == Some(call) {
+                *lock_unpoisoned(&self.fail_begin_on_call) = None;
+                return Err(IpsecLbError::Unsupported);
+            }
+            let mut states = lock_unpoisoned(&self.states);
+            match states.get(&request.ownership_key()).cloned() {
+                Some(RetirementAuthorityState::Active(grant))
+                    if grant.sa == request.sa()
+                        && grant.transition_id == request.transition_id()
+                        && grant.fingerprint == request.fingerprint()
+                        && grant.owner == *request.owner()
+                        && grant.fence == request.active_fence() =>
+                {
+                    let retired = OwnershipRetirementGrant::new(
+                        request.clone(),
+                        OwnershipFence::new(request.active_fence().get() + 1)?,
+                    );
+                    states.insert(
+                        request.ownership_key(),
+                        RetirementAuthorityState::Retiring(retired.clone()),
+                    );
+                    Ok(crate::OwnershipRetirementAdmission::Granted(retired))
+                }
+                Some(RetirementAuthorityState::Retiring(grant)) if grant.request() == &request => {
+                    Ok(crate::OwnershipRetirementAdmission::Granted(grant))
+                }
+                Some(RetirementAuthorityState::Active(grant))
+                    if grant.fence > request.active_fence()
+                        && (grant.transition_id != request.transition_id()
+                            || grant.fingerprint != request.fingerprint()) =>
+                {
+                    Ok(crate::OwnershipRetirementAdmission::Superseded(
+                        OwnershipRetirementSupersededProof::new(request, grant.fence),
+                    ))
+                }
+                Some(RetirementAuthorityState::Deleted) | None => Err(IpsecLbError::NotFound),
+                _ => Err(IpsecLbError::ownership_conflict(
+                    "test retirement request does not match authority",
+                )),
+            }
+        }
+
+        async fn finalize_ownership_retirement(
+            &self,
+            cleanup: &OwnershipCleanupCompleteProof,
+        ) -> Result<crate::OwnershipRetirementFinalization, IpsecLbError> {
+            let call = self.finalize_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if *lock_unpoisoned(&self.fail_finalize_on_call) == Some(call) {
+                *lock_unpoisoned(&self.fail_finalize_on_call) = None;
+                return Err(IpsecLbError::Unsupported);
+            }
+            let key = cleanup.grant().request().ownership_key();
+            let mut states = lock_unpoisoned(&self.states);
+            match states.get(&key) {
+                Some(RetirementAuthorityState::Retiring(grant)) if grant == cleanup.grant() => {
+                    states.insert(key, RetirementAuthorityState::Deleted);
+                    Ok(crate::OwnershipRetirementFinalization::Deleted)
+                }
+                Some(RetirementAuthorityState::Deleted) | None => {
+                    Ok(crate::OwnershipRetirementFinalization::AlreadyDeleted)
+                }
+                Some(RetirementAuthorityState::Active(grant))
+                    if grant.fence > cleanup.grant().retirement_fence() =>
+                {
+                    Ok(crate::OwnershipRetirementFinalization::Superseded)
+                }
+                _ => Err(IpsecLbError::ownership_conflict(
+                    "test cleanup proof does not match authority",
+                )),
+            }
+        }
+    }
+
+    struct RetirementTestGuard {
+        _guard: tokio::sync::OwnedMutexGuard<()>,
+    }
+
+    #[derive(Debug, Clone)]
+    struct RetirementTestSteering {
+        gate: Arc<tokio::sync::Mutex<()>>,
+        batch_acquires: Arc<AtomicUsize>,
+        host_calls: Arc<AtomicUsize>,
+        fail_acquire: Arc<AtomicBool>,
+        block_host: Arc<AtomicBool>,
+        host_entered: Arc<AtomicBool>,
+        host_release: Arc<Notify>,
+    }
+
+    impl RetirementTestSteering {
+        fn new() -> Self {
+            Self {
+                gate: Arc::new(tokio::sync::Mutex::new(())),
+                batch_acquires: Arc::new(AtomicUsize::new(0)),
+                host_calls: Arc::new(AtomicUsize::new(0)),
+                fail_acquire: Arc::new(AtomicBool::new(false)),
+                block_host: Arc::new(AtomicBool::new(false)),
+                host_entered: Arc::new(AtomicBool::new(false)),
+                host_release: Arc::new(Notify::new()),
+            }
+        }
+
+        fn block_host(&self) {
+            self.block_host.store(true, Ordering::SeqCst);
+        }
+
+        fn release_host(&self) {
+            self.block_host.store(false, Ordering::SeqCst);
+            self.host_release.notify_waiters();
+        }
+    }
+
+    #[async_trait]
+    impl RePinSteeringBackend for RetirementTestSteering {
+        async fn acquire_repin_permit(
+            &self,
+            key: SessionOwnershipKey,
+        ) -> Result<crate::RePinSteeringOperationPermit, IpsecLbError> {
+            if self.fail_acquire.load(Ordering::SeqCst) {
+                return Err(IpsecLbError::Unsupported);
+            }
+            let guard = Arc::clone(&self.gate).lock_owned().await;
+            Ok(crate::RePinSteeringOperationPermit::guarded(
+                key,
+                RetirementTestGuard { _guard: guard },
+            ))
+        }
+
+        async fn apply_fenced_repin(
+            &self,
+            update: crate::RePinSteeringUpdate,
+            permit: crate::RePinSteeringOperationPermit,
+        ) -> Result<crate::RePinSteeringOperationPermit, IpsecLbError> {
+            if permit.ownership_key() != update.ownership_key() {
+                return Err(IpsecLbError::adapter_contract_violation(
+                    "test permit key mismatch",
+                ));
+            }
+            Ok(permit)
+        }
+    }
+
+    #[async_trait]
+    impl RePinSteeringRetirementBackend for RetirementTestSteering {
+        async fn acquire_repin_retirement_permits(
+            &self,
+            keys: Vec<SessionOwnershipKey>,
+        ) -> Result<Vec<crate::RePinSteeringOperationPermit>, IpsecLbError> {
+            if self.fail_acquire.load(Ordering::SeqCst) || keys.is_empty() {
+                return Err(IpsecLbError::Unsupported);
+            }
+            self.batch_acquires.fetch_add(1, Ordering::SeqCst);
+            let guard = Arc::new(RetirementTestGuard {
+                _guard: Arc::clone(&self.gate).lock_owned().await,
+            });
+            Ok(keys
+                .into_iter()
+                .map(|key| crate::RePinSteeringOperationPermit::guarded(key, Arc::clone(&guard)))
+                .collect())
+        }
+
+        fn arm_repin_retirement_permit(
+            &self,
+            permit: crate::RePinSteeringOperationPermit,
+        ) -> Result<crate::RePinSteeringOperationPermit, IpsecLbError> {
+            Ok(permit)
+        }
+
+        fn release_classified_repin_retirement_permit(
+            &self,
+            _permit: crate::RePinSteeringOperationPermit,
+        ) -> Result<(), IpsecLbError> {
+            Ok(())
+        }
+
+        async fn retire_fenced_repin(
+            &self,
+            grant: &OwnershipRetirementGrant,
+            permit: crate::RePinSteeringOperationPermit,
+        ) -> Result<crate::RePinSteeringOperationPermit, IpsecLbError> {
+            if permit.ownership_key() != grant.request().ownership_key() {
+                return Err(IpsecLbError::adapter_contract_violation(
+                    "test retirement permit key mismatch",
+                ));
+            }
+            self.host_calls.fetch_add(1, Ordering::SeqCst);
+            if self.block_host.load(Ordering::SeqCst) {
+                self.host_entered.store(true, Ordering::SeqCst);
+                self.host_release.notified().await;
+            }
+            Ok(permit)
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct RetirementBlockingJournal {
+        inner: MockSessionRePinJournal,
+        block_stage: Arc<AtomicUsize>,
+        entered: Arc<AtomicBool>,
+        release: Arc<Notify>,
+    }
+
+    impl RetirementBlockingJournal {
+        fn new(inner: MockSessionRePinJournal, stage: usize) -> Self {
+            Self {
+                inner,
+                block_stage: Arc::new(AtomicUsize::new(stage)),
+                entered: Arc::new(AtomicBool::new(false)),
+                release: Arc::new(Notify::new()),
+            }
+        }
+
+        async fn maybe_block(&self, stage: usize) {
+            if self
+                .block_stage
+                .compare_exchange(stage, 0, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                self.entered.store(true, Ordering::SeqCst);
+                self.release.notified().await;
+            }
+        }
+
+        fn unblock(&self) {
+            self.release.notify_waiters();
+        }
+    }
+
+    #[async_trait]
+    impl SessionRePinJournal for RetirementBlockingJournal {
+        async fn begin(
+            &self,
+            plan: &SessionRePinPlan,
+        ) -> Result<SessionRePinCheckpoint, IpsecLbError> {
+            self.inner.begin(plan).await
+        }
+
+        async fn load(
+            &self,
+            session_id: &SessionRePinSessionId,
+        ) -> Result<Option<SessionRePinCheckpoint>, IpsecLbError> {
+            self.inner.load(session_id).await
+        }
+
+        async fn record_ownership_committed(
+            &self,
+            plan: &SessionRePinPlan,
+            index: usize,
+            fence: OwnershipFence,
+        ) -> Result<SessionRePinCheckpoint, IpsecLbError> {
+            self.inner
+                .record_ownership_committed(plan, index, fence)
+                .await
+        }
+
+        async fn record_sa_complete(
+            &self,
+            plan: &SessionRePinPlan,
+            index: usize,
+            fence: OwnershipFence,
+        ) -> Result<SessionRePinCheckpoint, IpsecLbError> {
+            self.inner.record_sa_complete(plan, index, fence).await
+        }
+
+        async fn begin_steering_retirement(
+            &self,
+            session_id: &SessionRePinSessionId,
+            identity: SessionRePinIdentity,
+        ) -> Result<SessionRePinRetirementResume, IpsecLbError> {
+            self.maybe_block(1).await;
+            self.inner
+                .begin_steering_retirement(session_id, identity)
+                .await
+        }
+
+        async fn record_cleanup_complete(
+            &self,
+            progress: &SessionRePinRetirementProgress,
+            pending: &PendingOwnershipRetirement,
+        ) -> Result<
+            (
+                SessionRePinRetirementProgress,
+                OwnershipCleanupCompleteProof,
+            ),
+            IpsecLbError,
+        > {
+            self.maybe_block(2).await;
+            self.inner.record_cleanup_complete(progress, pending).await
+        }
+
+        async fn record_ownership_superseded(
+            &self,
+            progress: &SessionRePinRetirementProgress,
+            proof: &OwnershipRetirementSupersededProof,
+        ) -> Result<SessionRePinRetirementProgress, IpsecLbError> {
+            self.inner
+                .record_ownership_superseded(progress, proof)
+                .await
+        }
+
+        async fn record_ownership_finalized(
+            &self,
+            progress: &SessionRePinRetirementProgress,
+            finalized: &OwnershipRetirementFinalizedProof,
+        ) -> Result<SessionRePinRetirementProgress, IpsecLbError> {
+            self.inner
+                .record_ownership_finalized(progress, finalized)
+                .await
+        }
+
+        async fn finish_steering_retirement(
+            &self,
+            progress: &SessionRePinRetirementProgress,
+        ) -> Result<SessionRePinRetirementOutcome, IpsecLbError> {
+            self.inner.finish_steering_retirement(progress).await
+        }
+    }
+
+    async fn retirement_test_components() -> (
+        SessionRePinPlan,
+        MockSessionRePinJournal,
+        RetirementTestAuthority,
+        RetirementTestSteering,
+        MockOwnershipSource,
+        MockRePinAuditSink,
+    ) {
+        let plan = plan_with(91, 91, 9_100, MIN_SESSION_REPIN_SAS);
+        let journal = MockSessionRePinJournal::default();
+        complete_journal_plan(&journal, &plan, 10).await;
+        let authority =
+            RetirementTestAuthority::from_plan(&plan, OwnershipFence::new(10).expect("nonzero"));
+        let steering = RetirementTestSteering::new();
+        let ownership = MockOwnershipSource::default();
+        ownership.set_shard_owner(plan.requests()[0].rule.owner, plan.new_owner().clone());
+        (
+            plan,
+            journal,
+            authority,
+            steering,
+            ownership,
+            MockRePinAuditSink::new(),
+        )
+    }
+
+    fn retirement_test_coordinator<J>(
+        journal: J,
+        authority: RetirementTestAuthority,
+        steering: RetirementTestSteering,
+        ownership: MockOwnershipSource,
+        audit: MockRePinAuditSink,
+    ) -> SessionRePinCoordinator<
+        RetirementTestSteering,
+        RetirementTestAuthority,
+        MockOwnershipSource,
+        MockRePinAuditSink,
+        J,
+    >
+    where
+        J: SessionRePinJournal,
+    {
+        SessionRePinCoordinator::new(test_repin!(steering, authority, ownership, audit), journal)
+    }
+
+    fn assert_one_retired_one_already(
+        left: &SessionRePinRetirementOutcome,
+        right: &SessionRePinRetirementOutcome,
+    ) {
+        assert!(matches!(
+            (left.disposition(), right.disposition()),
+            (
+                SessionRePinRetirementDisposition::Retired,
+                SessionRePinRetirementDisposition::AlreadyRetired
+            ) | (
+                SessionRePinRetirementDisposition::AlreadyRetired,
+                SessionRePinRetirementDisposition::Retired
+            )
+        ));
+    }
+
     async fn wait_until_entered(entered: &AtomicBool) {
         for _ in 0..1_000 {
             if entered.load(Ordering::SeqCst) {
@@ -3275,7 +5129,7 @@ mod tests {
             let steering = MockSteeringBackend::new();
             let inner_fencer = MockOwnershipFencer::new();
             for request in plan.requests() {
-                inner_fencer.set_owner(request.sa, request.previous_owner.clone());
+                inner_fencer.set_owner(request.ownership_key, request.previous_owner.clone());
             }
             let fencer = InjectedFencer::new(inner_fencer);
             let ownership = MockOwnershipSource::default();
@@ -3309,7 +5163,7 @@ mod tests {
             MockSessionRePinJournal,
         > {
             SessionRePinCoordinator::new(
-                RePinCoordinator::new(
+                test_repin!(
                     self.steering.clone(),
                     self.fencer.clone(),
                     self.ownership.clone(),
@@ -3354,7 +5208,7 @@ mod tests {
     {
         assert!((1..=harness.plan.len()).contains(&completed));
         let coordinator = SessionRePinCoordinator::new(
-            RePinCoordinator::new(
+            test_repin!(
                 harness.steering.clone(),
                 harness.fencer.clone(),
                 harness.ownership.clone(),
@@ -3404,7 +5258,7 @@ mod tests {
         harness.steering.remove_rule(barrier_rule).await.unwrap();
         let barrier = SelectiveInstallBarrier::new(harness.steering.clone(), barrier_rule);
         let coordinator = SessionRePinCoordinator::new(
-            RePinCoordinator::new(
+            test_repin!(
                 barrier.clone(),
                 harness.fencer.clone(),
                 harness.ownership.clone(),
@@ -3436,7 +5290,7 @@ mod tests {
                 + u128::try_from(barrier_index).unwrap(),
         )
         .unwrap();
-        let direct_per_sa = RePinCoordinator::new(
+        let direct_per_sa = test_repin!(
             harness.steering.clone(),
             harness.fencer.clone(),
             harness.ownership.clone(),
@@ -3451,6 +5305,8 @@ mod tests {
                     previous_owner: displaced.new_owner.clone(),
                     new_owner: foreign_owner,
                     rule: foreign_rule,
+                    ownership_key: displaced.ownership_key,
+                    outbound_sa_binding_id: displaced.outbound_sa_binding_id,
                     resume: displaced.resume,
                 })
                 .await,
@@ -3517,6 +5373,39 @@ mod tests {
         duplicate_sa[3].transition_id = OwnershipTransitionId::new(99).unwrap();
         assert!(SessionRePinPlan::new(session_id(1), operation_id(3), duplicate_sa).is_err());
 
+        let mut same_spi_in_distinct_scopes = valid.requests().to_vec();
+        let shared_sa = same_spi_in_distinct_scopes[1].sa;
+        same_spi_in_distinct_scopes[2].sa = shared_sa;
+        same_spi_in_distinct_scopes[2].rule.key = same_spi_in_distinct_scopes[1].rule.key;
+        same_spi_in_distinct_scopes[2].resume.previous_sa = shared_sa;
+        same_spi_in_distinct_scopes[2].resume.resumed_sa = shared_sa;
+        let SaId::Esp { spi } = shared_sa else {
+            panic!("second request is an ESP SA")
+        };
+        same_spi_in_distinct_scopes[2].ownership_key =
+            SessionOwnershipKey::Esp(EspOwnershipKey::new(
+                DestinationContext::new(
+                    crate::IpAddress::V4([198, 51, 100, 30]),
+                    RoutingDomainTag::new(8),
+                ),
+                EspEncapsulationKind::UdpEncapsulated,
+                EspSpi::new(spi).unwrap(),
+            ));
+        assert!(SessionRePinPlan::new(
+            session_id(1),
+            operation_id(30),
+            same_spi_in_distinct_scopes,
+        )
+        .is_ok());
+
+        let mut duplicate_outbound_binding = valid.requests().to_vec();
+        duplicate_outbound_binding[2].outbound_sa_binding_id =
+            duplicate_outbound_binding[1].outbound_sa_binding_id;
+        assert!(
+            SessionRePinPlan::new(session_id(1), operation_id(31), duplicate_outbound_binding,)
+                .is_err()
+        );
+
         let mut different_owner = valid.requests().to_vec();
         different_owner[2].new_owner = ClusterNode::new("another-owner");
         assert!(SessionRePinPlan::new(session_id(1), operation_id(4), different_owner).is_err());
@@ -3559,20 +5448,21 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_v1_encoding_remains_byte_compatible_and_backward_decodable() {
-        // Captured from the unmodified 9be2e01 v1 encoder with this synthetic
-        // plan. Keep this immutable: generating both sides from the current
-        // wire DTO would allow an accidental migration break to self-agree.
-        const LEGACY_V1_SHA256: [u8; 32] = [
-            107, 231, 107, 94, 20, 132, 232, 3, 34, 95, 4, 165, 220, 200, 44, 214, 203, 191, 46,
-            163, 69, 103, 214, 240, 166, 210, 249, 125, 189, 145, 87, 169,
+    fn checkpoint_v3_wire_is_canonical_with_destination_scoped_fingerprints() {
+        // The first-public journal wire version remains v3. IKE transitions
+        // retain the v4 domain while ESP counter transitions carry the v5
+        // outbound-binding domain. Keep this synthetic encoding immutable so
+        // a wire DTO change cannot self-agree.
+        const V3_DESTINATION_SCOPED_SHA256: [u8; 32] = [
+            82, 135, 104, 142, 148, 122, 195, 215, 254, 196, 164, 242, 104, 44, 54, 189, 158, 71,
+            148, 83, 104, 56, 192, 36, 122, 118, 228, 237, 97, 148, 191, 106,
         ];
         let plan = plan_with(1, 1, 100, 3);
         let checkpoint =
             SessionRePinCheckpoint::from_progress(plan.clone(), Vec::new(), None).unwrap();
-        let legacy_v1 = encode_checkpoint(&checkpoint).unwrap();
-        let encoded_hash: [u8; 32] = Sha256::digest(legacy_v1.as_bytes()).into();
-        assert_eq!(encoded_hash, LEGACY_V1_SHA256);
+        let encoded_v3 = encode_checkpoint(&checkpoint).unwrap();
+        let encoded_hash: [u8; 32] = Sha256::digest(encoded_v3.as_bytes()).into();
+        assert_eq!(encoded_hash, V3_DESTINATION_SCOPED_SHA256);
 
         let key = SessionKey {
             tenant: tenant(),
@@ -3588,15 +5478,72 @@ mod tests {
             state_class: StateClass::AuthoritativeSession,
             state_type: StateType::new(SESSION_REPIN_KEY_TYPE).unwrap(),
             expires_at: None,
-            payload: legacy_v1,
+            payload: encoded_v3,
         };
         let SessionRePinJournalEntry::Active(decoded) =
             decode_journal_record(&record, &key, plan.session_id()).unwrap()
         else {
-            panic!("expected v1 checkpoint");
+            panic!("expected v3 checkpoint");
         };
         assert_eq!(decoded, checkpoint);
         assert_eq!(encode_checkpoint(&decoded).unwrap(), record.payload);
+    }
+
+    #[test]
+    fn legacy_active_v1_envelope_is_explicitly_unreadable() {
+        let plan = plan_with(1, 1, 100, 3);
+        let checkpoint =
+            SessionRePinCheckpoint::from_progress(plan.clone(), Vec::new(), None).unwrap();
+        let payload = encode_json_payload(
+            &journal_payload_format().unwrap(),
+            SessionPayloadVersion::new(1),
+            &JournalWire::from_checkpoint(&checkpoint),
+            Some(SESSION_REPIN_JOURNAL_MAX_BYTES),
+        )
+        .unwrap();
+        let key = SessionKey {
+            tenant: tenant(),
+            nf_kind: nf_kind(),
+            key_type: SessionKeyType::other(SESSION_REPIN_KEY_TYPE).unwrap(),
+            stable_id: plan.session_id().as_stable_id().clone(),
+        };
+        let record = StoredSessionRecord {
+            key: key.clone(),
+            generation: Generation::new(1),
+            owner: OwnerId::new(plan.new_owner().as_str()).unwrap(),
+            fence: opc_session_store::FenceToken::new(1),
+            state_class: StateClass::AuthoritativeSession,
+            state_type: StateType::new(SESSION_REPIN_KEY_TYPE).unwrap(),
+            expires_at: None,
+            payload,
+        };
+
+        assert!(decode_journal_record(&record, &key, plan.session_id()).is_err());
+    }
+
+    #[tokio::test]
+    async fn retirement_v2_tombstone_remains_readable() {
+        let store = SessionStore::new(FakeSessionBackend::new());
+        let journal = SessionStoreRePinJournal::new(store.clone(), tenant(), nf_kind());
+        let plan = plan_with(1, 1, 100, 3);
+        complete_journal_plan(&journal, &plan, 2).await;
+        journal
+            .retire(plan.session_id(), plan.identity())
+            .await
+            .unwrap();
+        let key = journal.key(plan.session_id()).unwrap();
+        let record = store.get(&key).await.unwrap().unwrap();
+        let envelope =
+            decode_session_payload_envelope(&record.payload, Some(SESSION_REPIN_JOURNAL_MAX_BYTES))
+                .unwrap();
+        assert_eq!(
+            envelope.version().get(),
+            SESSION_REPIN_RETIREMENT_PAYLOAD_VERSION
+        );
+        assert!(matches!(
+            decode_journal_record(&record, &key, plan.session_id()).unwrap(),
+            SessionRePinJournalEntry::Retired(_)
+        ));
     }
 
     #[test]
@@ -3643,6 +5590,183 @@ mod tests {
         );
     }
 
+    #[test]
+    fn retiring_v4_marker_wire_rejects_unknown_fields_and_nonadvancing_authority() {
+        let plan = plan_with(7, 7, 700, MIN_SESSION_REPIN_SAS);
+        let active_fence = OwnershipFence::new(10).expect("nonzero");
+        let checkpoint = SessionRePinCheckpoint::from_progress(
+            plan.clone(),
+            vec![active_fence; plan.len()],
+            None,
+        )
+        .expect("terminal checkpoint");
+        let progress =
+            SessionRePinRetirementProgress::from_terminal(checkpoint).expect("retirement progress");
+        let proof = OwnershipRetirementSupersededProof::new(
+            OwnershipRetirementRequest::from_committed(&plan.requests()[0], active_fence),
+            OwnershipFence::new(11).expect("nonzero"),
+        );
+        let progress = progress.with_superseded(&proof).expect("superseded marker");
+        let wire = RetiringWire::from_progress(&progress);
+
+        let mut unknown = serde_json::to_value(&wire).expect("serialize wire");
+        unknown["retirement_markers"][0]["contradictory_fence"] = serde_json::json!(u64::MAX);
+        assert!(serde_json::from_value::<RetiringWire>(unknown).is_err());
+
+        let mut nonadvancing = serde_json::to_value(&wire).expect("serialize wire");
+        nonadvancing["retirement_markers"][0]["authoritative_fence"] =
+            serde_json::json!(active_fence.get());
+        let decoded =
+            serde_json::from_value::<RetiringWire>(nonadvancing).expect("structurally valid wire");
+        assert!(decoded.into_progress().is_err());
+    }
+
+    #[tokio::test]
+    async fn production_retiring_v4_max_plan_roundtrips_and_rejects_tampering() {
+        let store = SessionStore::new(FakeSessionBackend::new());
+        let journal = SessionStoreRePinJournal::new(store.clone(), tenant(), nf_kind());
+        let plan = plan_with(8, 8, 800, MAX_SESSION_REPIN_SAS);
+        complete_journal_plan(&journal, &plan, 10).await;
+
+        let SessionRePinRetirementResume::InProgress(mut progress) = journal
+            .begin_steering_retirement(plan.session_id(), plan.identity())
+            .await
+            .expect("terminal checkpoint enters durable retirement")
+        else {
+            panic!("fresh terminal checkpoint cannot already be retired");
+        };
+
+        let active_fence = progress
+            .checkpoint
+            .completed_fence(0)
+            .expect("terminal plan retains the first active fence");
+        let first_grant = OwnershipRetirementGrant::new(
+            OwnershipRetirementRequest::from_committed(&plan.requests()[0], active_fence),
+            OwnershipFence::new(active_fence.get() + 1).expect("advanced fence"),
+        );
+        let pending = PendingOwnershipRetirement::for_test(
+            first_grant.clone(),
+            crate::RePinSteeringOperationPermit::unguarded(plan.requests()[0].ownership_key),
+        );
+        let (cleanup_progress, _original_cleanup_proof) = journal
+            .record_cleanup_complete(&progress, &pending)
+            .await
+            .expect("CleanupComplete marker is durable");
+        drop(pending);
+
+        let restarted = SessionStoreRePinJournal::new(store.clone(), tenant(), nf_kind());
+        let SessionRePinRetirementResume::InProgress(recovered_cleanup) = restarted
+            .begin_steering_retirement(plan.session_id(), plan.identity())
+            .await
+            .expect("restart recovers CleanupComplete")
+        else {
+            panic!("CleanupComplete must remain in non-expiring v4 progress");
+        };
+        assert_eq!(recovered_cleanup, cleanup_progress);
+        assert_eq!(
+            recovered_cleanup.grant(0).expect("grant reconstructs"),
+            first_grant
+        );
+        let reconstructed_cleanup = OwnershipCleanupCompleteProof::new(
+            recovered_cleanup.grant(0).expect("grant reconstructs"),
+        );
+        let finalized = OwnershipRetirementFinalizedProof::for_test(
+            reconstructed_cleanup,
+            crate::OwnershipRetirementFinalization::AlreadyDeleted,
+        );
+        progress = restarted
+            .record_ownership_finalized(&recovered_cleanup, &finalized)
+            .await
+            .expect("reconstructed cleanup proof finalizes after restart");
+
+        for index in 1..plan.len() {
+            let active_fence = progress
+                .checkpoint
+                .completed_fence(index)
+                .expect("terminal plan retains every active fence");
+            let proof = OwnershipRetirementSupersededProof::new(
+                OwnershipRetirementRequest::from_committed(&plan.requests()[index], active_fence),
+                OwnershipFence::new(active_fence.get() + 1).expect("advanced fence"),
+            );
+            progress = restarted
+                .record_ownership_superseded(&progress, &proof)
+                .await
+                .expect("ordered superseded marker is durable");
+        }
+        assert_eq!(
+            progress.status().ownership_finalized_count(),
+            MAX_SESSION_REPIN_SAS
+        );
+
+        let key = journal.key(plan.session_id()).expect("journal key");
+        let record = store
+            .get(&key)
+            .await
+            .expect("read succeeds")
+            .expect("Retiring record exists");
+        assert_eq!(record.expires_at, None);
+        let envelope =
+            decode_session_payload_envelope(&record.payload, Some(SESSION_REPIN_JOURNAL_MAX_BYTES))
+                .expect("v4 envelope decodes");
+        assert_eq!(
+            envelope.version().get(),
+            SESSION_REPIN_RETIRING_PAYLOAD_VERSION
+        );
+        assert!(record.payload.as_bytes().len() <= SESSION_REPIN_JOURNAL_MAX_BYTES);
+
+        let final_restart = SessionStoreRePinJournal::new(store, tenant(), nf_kind());
+        let SessionRePinRetirementResume::InProgress(recovered) = final_restart
+            .begin_steering_retirement(plan.session_id(), plan.identity())
+            .await
+            .expect("restart recovers exact v4 progress")
+        else {
+            panic!("non-expiring Retiring progress must survive restart");
+        };
+        assert_eq!(recovered, progress);
+
+        let wire: RetiringWire = decode_json_payload(
+            &record.payload,
+            &journal_payload_format().expect("static payload format"),
+            SessionPayloadVersion::new(SESSION_REPIN_RETIRING_PAYLOAD_VERSION),
+            Some(SESSION_REPIN_JOURNAL_MAX_BYTES),
+        )
+        .expect("stored v4 payload decodes");
+        let base = serde_json::to_value(wire).expect("v4 wire serializes");
+        let assert_rejected = |value: serde_json::Value| {
+            let mut tampered = record.clone();
+            tampered.payload = encode_json_payload(
+                &journal_payload_format().expect("static payload format"),
+                SessionPayloadVersion::new(SESSION_REPIN_RETIRING_PAYLOAD_VERSION),
+                &value,
+                Some(SESSION_REPIN_JOURNAL_MAX_BYTES),
+            )
+            .expect("tampered fixture remains a valid envelope");
+            assert!(decode_journal_record(&tampered, &key, plan.session_id()).is_err());
+        };
+
+        let mut unknown = base.clone();
+        unknown["unexpected_retirement_authority"] = serde_json::json!(true);
+        assert_rejected(unknown);
+
+        let mut nonadvancing = base.clone();
+        nonadvancing["retirement_markers"][0]["authoritative_fence"] = serde_json::json!(10);
+        assert_rejected(nonadvancing);
+
+        let mut impossible_finalized_count = base;
+        impossible_finalized_count["ownership_finalized_count"] =
+            serde_json::json!(MAX_SESSION_REPIN_SAS + 1);
+        assert_rejected(impossible_finalized_count);
+
+        let retired = final_restart
+            .finish_steering_retirement(&recovered)
+            .await
+            .expect("fully finalized v4 progress becomes a v2 tombstone");
+        assert_eq!(
+            retired.disposition(),
+            SessionRePinRetirementDisposition::Retired
+        );
+    }
+
     #[tokio::test]
     async fn happy_path_exposes_success_only_after_every_sa_is_durable() {
         let harness = Harness::new();
@@ -3665,87 +5789,228 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn coordinator_retirement_blocks_later_resume_without_teardown_side_effects() {
-        let harness = Harness::new();
-        let coordinator = harness.coordinator();
-        let outcome = coordinator.start(harness.plan.clone()).await.unwrap();
-        let steering_attempts = harness.steering.install_attempts();
-        let fence_operations = harness.fencer.inner.operations().len();
-        let retired = coordinator
-            .retire(harness.plan.session_id(), outcome.identity())
+    async fn safe_retirement_is_idempotent_for_concurrent_active_and_retiring_callers() {
+        let (plan, journal, authority, steering, ownership, audit) =
+            retirement_test_components().await;
+        let coordinator = retirement_test_coordinator(
+            journal.clone(),
+            authority.clone(),
+            steering.clone(),
+            ownership,
+            audit,
+        );
+        let (left, right) = tokio::join!(
+            coordinator.retire(plan.session_id(), plan.identity()),
+            coordinator.retire(plan.session_id(), plan.identity()),
+        );
+        let left = left.expect("first concurrent retirement converges");
+        let right = right.expect("second concurrent retirement converges");
+        assert_one_retired_one_already(&left, &right);
+        assert_eq!(steering.host_calls.load(Ordering::SeqCst), plan.len());
+
+        let (plan, journal, authority, steering, ownership, audit) =
+            retirement_test_components().await;
+        authority.fail_begin_on_call(1);
+        let coordinator =
+            retirement_test_coordinator(journal, authority, steering, ownership, audit);
+        assert!(coordinator
+            .retire(plan.session_id(), plan.identity())
             .await
-            .unwrap();
-        assert_eq!(
-            retired.disposition(),
-            SessionRePinRetirementDisposition::Retired
+            .is_err());
+        let (left, right) = tokio::join!(
+            coordinator.retire(plan.session_id(), plan.identity()),
+            coordinator.retire(plan.session_id(), plan.identity()),
         );
-        assert_eq!(
-            coordinator
-                .status(harness.plan.session_id(), outcome.identity())
-                .await
-                .unwrap(),
-            None
-        );
-        assert!(matches!(
-            coordinator
-                .resume(harness.plan.session_id(), outcome.identity())
-                .await,
-            Err(SessionRePinError::Journal(IpsecLbError::NotFound))
-        ));
-        assert_eq!(harness.steering.install_attempts(), steering_attempts);
-        assert_eq!(harness.fencer.inner.operations().len(), fence_operations);
+        let left = left.expect("first Retiring caller converges");
+        let right = right.expect("second Retiring caller converges");
+        assert_one_retired_one_already(&left, &right);
     }
 
     #[tokio::test]
-    async fn overlapping_terminal_resume_can_reinstall_steering_after_retirement() {
-        let harness = Harness::new();
-        let terminal = harness
-            .coordinator()
-            .start(harness.plan.clone())
+    async fn cleanup_marker_resume_needs_no_host_for_the_marked_terminal_key() {
+        let (plan, journal, authority, steering, ownership, audit) =
+            retirement_test_components().await;
+        authority.fail_finalize_on_call(plan.len());
+        let coordinator =
+            retirement_test_coordinator(journal, authority, steering.clone(), ownership, audit);
+        assert!(coordinator
+            .retire(plan.session_id(), plan.identity())
             .await
-            .unwrap();
-        let steering_attempts = harness.steering.install_attempts();
-        let blocking = BlockingJournal::new(harness.journal.clone(), 3);
-        let coordinator = SessionRePinCoordinator::new(
-            RePinCoordinator::new(
-                harness.steering.clone(),
-                harness.fencer.clone(),
-                harness.ownership.clone(),
-                harness.audit.clone(),
-            ),
-            blocking.clone(),
-        );
-        let session_id = harness.plan.session_id().clone();
-        let identity = terminal.identity();
-        let task = tokio::spawn(async move { coordinator.resume(&session_id, identity).await });
-        wait_until_entered(&blocking.entered).await;
+            .is_err());
+        let acquired_before = steering.batch_acquires.load(Ordering::SeqCst);
+        let host_before = steering.host_calls.load(Ordering::SeqCst);
+        assert_eq!(host_before, plan.len());
+        steering.fail_acquire.store(true, Ordering::SeqCst);
 
-        harness
-            .journal
-            .retire(harness.plan.session_id(), terminal.identity())
+        let outcome = coordinator
+            .retire(plan.session_id(), plan.identity())
             .await
-            .unwrap();
-        blocking.unblock();
-        assert!(task.await.unwrap().is_ok());
+            .expect("durable terminal cleanup marker finalizes without Host");
         assert_eq!(
-            harness.steering.install_attempts(),
-            steering_attempts + harness.plan.len()
+            outcome.disposition(),
+            SessionRePinRetirementDisposition::Retired
         );
         assert_eq!(
-            harness
-                .journal
-                .load(harness.plan.session_id())
-                .await
-                .unwrap(),
-            None
+            steering.batch_acquires.load(Ordering::SeqCst),
+            acquired_before
         );
+        assert_eq!(steering.host_calls.load(Ordering::SeqCst), host_before);
+    }
+
+    #[tokio::test]
+    async fn concurrent_callers_converge_from_the_same_cleanup_marker() {
+        let (plan, journal, authority, steering, ownership, audit) =
+            retirement_test_components().await;
+        authority.fail_finalize_on_call(1);
+        let coordinator =
+            retirement_test_coordinator(journal, authority, steering, ownership, audit);
+        assert!(coordinator
+            .retire(plan.session_id(), plan.identity())
+            .await
+            .is_err());
+        let (left, right) = tokio::join!(
+            coordinator.retire(plan.session_id(), plan.identity()),
+            coordinator.retire(plan.session_id(), plan.identity()),
+        );
+        let left = left.expect("first cleanup-marker caller converges");
+        let right = right.expect("second cleanup-marker caller converges");
+        assert_one_retired_one_already(&left, &right);
+    }
+
+    #[tokio::test]
+    async fn crash_before_later_key_begin_preserves_a_newer_lineage_without_host_cleanup() {
+        let (plan, journal, authority, steering, ownership, audit) =
+            retirement_test_components().await;
+        authority.fail_begin_on_call(1);
+        let coordinator = retirement_test_coordinator(
+            journal,
+            authority.clone(),
+            steering.clone(),
+            ownership,
+            audit,
+        );
+        assert!(coordinator
+            .retire(plan.session_id(), plan.identity())
+            .await
+            .is_err());
+        authority.install_successor(
+            &plan.requests()[1],
+            OwnershipFence::new(20).expect("nonzero"),
+        );
+
+        let outcome = coordinator
+            .retire(plan.session_id(), plan.identity())
+            .await
+            .expect("strictly newer lineage is durably superseded");
+        assert_eq!(
+            outcome.disposition(),
+            SessionRePinRetirementDisposition::Retired
+        );
+        assert_eq!(steering.host_calls.load(Ordering::SeqCst), 1);
         assert!(matches!(
-            harness
-                .coordinator()
-                .resume(harness.plan.session_id(), terminal.identity())
-                .await,
-            Err(SessionRePinError::Journal(IpsecLbError::NotFound))
+            lock_unpoisoned(&authority.states).get(&plan.requests()[1].ownership_key),
+            Some(RetirementAuthorityState::Active(grant)) if grant.fence.get() == 20
         ));
+    }
+
+    #[tokio::test]
+    async fn dropping_retirement_observer_never_cancels_session_host_or_marker_work() {
+        for stage in 1..=3 {
+            let (plan, journal, authority, steering, ownership, audit) =
+                retirement_test_components().await;
+            let blocking_journal = RetirementBlockingJournal::new(
+                journal,
+                if stage == 1 {
+                    1
+                } else if stage == 3 {
+                    2
+                } else {
+                    0
+                },
+            );
+            if stage == 2 {
+                steering.block_host();
+            }
+            let coordinator = retirement_test_coordinator(
+                blocking_journal.clone(),
+                authority,
+                steering.clone(),
+                ownership,
+                audit,
+            );
+            let worker = coordinator.clone();
+            let session_id = plan.session_id().clone();
+            let identity = plan.identity();
+            let observer = tokio::spawn(async move { worker.retire(&session_id, identity).await });
+            if stage == 2 {
+                wait_until_entered(&steering.host_entered).await;
+            } else {
+                wait_until_entered(&blocking_journal.entered).await;
+            }
+            observer.abort();
+            let _ = observer.await;
+            if stage == 2 {
+                steering.release_host();
+            } else {
+                blocking_journal.unblock();
+            }
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(3),
+                coordinator.retire(plan.session_id(), plan.identity()),
+            )
+            .await
+            .expect("detached retirement worker remains bounded")
+            .expect("observer retry converges");
+            assert!(matches!(
+                outcome.disposition(),
+                SessionRePinRetirementDisposition::Retired
+                    | SessionRePinRetirementDisposition::AlreadyRetired
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn retirement_batch_prevents_activation_ownership_commit_crossing_the_cut() {
+        let (plan, journal, authority, steering, ownership, audit) =
+            retirement_test_components().await;
+        let blocking_journal = RetirementBlockingJournal::new(journal, 1);
+        let retirement = retirement_test_coordinator(
+            blocking_journal.clone(),
+            authority.clone(),
+            steering.clone(),
+            ownership.clone(),
+            audit.clone(),
+        );
+        let retirement_worker = retirement.clone();
+        let session_id = plan.session_id().clone();
+        let identity = plan.identity();
+        let retirement_task =
+            tokio::spawn(async move { retirement_worker.retire(&session_id, identity).await });
+        wait_until_entered(&blocking_journal.entered).await;
+
+        let mut activation = plan.requests()[0].clone();
+        activation.previous_owner = activation.new_owner.clone();
+        activation.previous_fence = OwnershipFence::new(10).expect("nonzero");
+        activation.new_owner = ClusterNode::new("newer-owner");
+        activation.transition_id = OwnershipTransitionId::new(99_999).expect("nonzero");
+        activation.rule.owner = ShardId::new(10);
+        ownership.set_shard_owner(activation.rule.owner, activation.new_owner.clone());
+        let activation_coordinator = test_repin!(steering, authority.clone(), ownership, audit);
+        let activation_task =
+            tokio::spawn(async move { activation_coordinator.repin(activation).await });
+        tokio::task::yield_now().await;
+        assert_eq!(authority.fence_calls.load(Ordering::SeqCst), 0);
+
+        blocking_journal.unblock();
+        retirement_task
+            .await
+            .expect("retirement task joins")
+            .expect("retirement converges");
+        assert!(activation_task
+            .await
+            .expect("activation task joins")
+            .is_err());
+        assert_eq!(authority.fence_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -3788,7 +6053,7 @@ mod tests {
         let fence_operations = harness.fencer.inner.operations().len();
         let steering_attempts = harness.steering.install_attempts();
         let audit_attempts = harness.audit.record_attempts();
-        let repin = RePinCoordinator::new(
+        let repin = test_repin!(
             harness.steering.clone(),
             harness.fencer.clone(),
             harness.ownership.clone(),
@@ -4003,7 +6268,7 @@ mod tests {
         let harness = Harness::new();
         let blocking = BlockingSteering::new(harness.steering.clone());
         let coordinator = SessionRePinCoordinator::new(
-            RePinCoordinator::new(
+            test_repin!(
                 blocking.clone(),
                 harness.fencer.clone(),
                 harness.ownership.clone(),
@@ -4041,7 +6306,7 @@ mod tests {
             let harness = Harness::new();
             let blocking = BlockingJournal::new(harness.journal.clone(), stage);
             let coordinator = SessionRePinCoordinator::new(
-                RePinCoordinator::new(
+                test_repin!(
                     harness.steering.clone(),
                     harness.fencer.clone(),
                     harness.ownership.clone(),
@@ -4097,7 +6362,7 @@ mod tests {
         assert!(harness.fencer.inner.operations().is_empty());
         for request in harness.plan.requests() {
             assert_eq!(
-                harness.fencer.inner.owner(request.sa),
+                harness.fencer.inner.owner(request.ownership_key),
                 Some(request.previous_owner.clone())
             );
         }
@@ -4460,7 +6725,7 @@ mod tests {
                 let operation_count = harness.fencer.inner.operations().len();
                 let target = harness.plan.requests()[completed - 1].sa;
                 let coordinator = SessionRePinCoordinator::new(
-                    RePinCoordinator::new(
+                    test_repin!(
                         harness.steering.clone(),
                         DivergentCompletedFencer {
                             inner: harness.fencer.clone(),
@@ -4518,9 +6783,11 @@ mod tests {
                 previous_owner: request.new_owner.clone(),
                 new_owner: foreign_owner,
                 rule: foreign_rule,
+                ownership_key: request.ownership_key,
+                outbound_sa_binding_id: request.outbound_sa_binding_id,
                 resume: request.resume,
             };
-            let direct_per_sa = RePinCoordinator::new(
+            let direct_per_sa = test_repin!(
                 harness.steering.clone(),
                 harness.fencer.clone(),
                 harness.ownership.clone(),
@@ -5167,7 +7434,7 @@ mod tests {
         );
         let ports = Harness::new();
         let coordinator = SessionRePinCoordinator::new(
-            RePinCoordinator::new(ports.steering, ports.fencer, ports.ownership, ports.audit),
+            test_repin!(ports.steering, ports.fencer, ports.ownership, ports.audit),
             degraded,
         );
         assert!(matches!(
@@ -5289,7 +7556,7 @@ mod tests {
         journal.begin(&second).await.unwrap();
         let ports = Harness::new();
         let coordinator = SessionRePinCoordinator::new(
-            RePinCoordinator::new(ports.steering, ports.fencer, ports.ownership, ports.audit),
+            test_repin!(ports.steering, ports.fencer, ports.ownership, ports.audit),
             journal,
         );
 

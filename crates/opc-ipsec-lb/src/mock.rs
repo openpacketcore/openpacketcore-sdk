@@ -9,13 +9,15 @@ use crate::error::IpsecLbError;
 use crate::model::{
     ClusterNode, SaId, ShardId, SteeringProbe, SteeringRule, VipAdvertisement, VipProbe,
 };
+use crate::ownership::SessionOwnershipKey;
 use crate::ports::{
-    OwnershipFencer, OwnershipSource, RePinAuditSink, SteeringBackend, VipAdvertiser,
+    OwnershipFencer, OwnershipSource, RePinAuditSink, RePinSteeringBackend, SteeringBackend,
+    VipAdvertiser,
 };
 use crate::repin::{
-    validate_sa_identifier, OwnershipFence, OwnershipFenceGrant, OwnershipFenceRequest,
-    OwnershipRetryProof, OwnershipSnapshot, OwnershipTransitionFingerprint, OwnershipTransitionId,
-    RePinAuditEvent,
+    validate_ownership_key_matches_sa, validate_sa_identifier, OwnershipFence, OwnershipFenceGrant,
+    OwnershipFenceRequest, OwnershipRetryProof, OwnershipSnapshot, OwnershipTransitionFingerprint,
+    OwnershipTransitionId, RePinAuditEvent, RePinSteeringOperationPermit, RePinSteeringUpdate,
 };
 
 /// Recorded steering operation.
@@ -160,17 +162,8 @@ impl MockSteeringBackend {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.operations.clone()
     }
-}
 
-impl Default for MockSteeringBackend {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[async_trait]
-impl SteeringBackend for MockSteeringBackend {
-    async fn install_rule(&self, rule: SteeringRule) -> Result<(), IpsecLbError> {
+    fn install_rule_sync(&self, rule: SteeringRule) -> Result<(), IpsecLbError> {
         let mut state = self
             .state
             .lock()
@@ -203,6 +196,19 @@ impl SteeringBackend for MockSteeringBackend {
         state.operations.push(MockSteeringOperation::Install(rule));
         Ok(())
     }
+}
+
+impl Default for MockSteeringBackend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl SteeringBackend for MockSteeringBackend {
+    async fn install_rule(&self, rule: SteeringRule) -> Result<(), IpsecLbError> {
+        self.install_rule_sync(rule)
+    }
 
     async fn remove_rule(&self, rule: SteeringRule) -> Result<(), IpsecLbError> {
         let mut state = self
@@ -229,6 +235,23 @@ impl SteeringBackend for MockSteeringBackend {
         }
         state.operations.push(MockSteeringOperation::Probe);
         Ok(SteeringProbe::mock())
+    }
+}
+
+#[async_trait]
+impl RePinSteeringBackend for MockSteeringBackend {
+    async fn apply_fenced_repin(
+        &self,
+        update: RePinSteeringUpdate,
+        mut permit: RePinSteeringOperationPermit,
+    ) -> Result<RePinSteeringOperationPermit, IpsecLbError> {
+        if permit.ownership_key() != update.ownership_key() {
+            return Err(IpsecLbError::adapter_contract_violation(
+                "mock_repin_operation_permit_key_mismatch",
+            ));
+        }
+        permit.publish_with_esp_counter_guard(|| self.install_rule_sync(update.rule()))??;
+        Ok(permit)
     }
 }
 
@@ -339,6 +362,7 @@ pub struct MockOwnershipSource {
 struct MockOwnershipState {
     shard_owners: BTreeMap<ShardId, ClusterNode>,
     sa_owners: BTreeMap<SaId, OwnershipSnapshot>,
+    scoped_sa_owners: BTreeMap<SessionOwnershipKey, OwnershipSnapshot>,
 }
 
 impl MockOwnershipSource {
@@ -367,6 +391,15 @@ impl MockOwnershipSource {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.sa_owners.insert(sa, snapshot);
     }
+
+    /// Set an authoritative destination-scoped SA owner and fence snapshot.
+    pub fn set_scoped_sa_ownership(&self, key: SessionOwnershipKey, snapshot: OwnershipSnapshot) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.scoped_sa_owners.insert(key, snapshot);
+    }
 }
 
 #[async_trait]
@@ -386,6 +419,17 @@ impl OwnershipSource for MockOwnershipSource {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         Ok(state.sa_owners.get(&sa).cloned())
     }
+
+    async fn scoped_sa_ownership(
+        &self,
+        key: SessionOwnershipKey,
+    ) -> Result<Option<OwnershipSnapshot>, IpsecLbError> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Ok(state.scoped_sa_owners.get(&key).cloned())
+    }
 }
 
 /// Mock ownership fencer.
@@ -396,7 +440,7 @@ pub struct MockOwnershipFencer {
 
 #[derive(Debug)]
 struct MockOwnershipFenceState {
-    owners: BTreeMap<SaId, MockOwnershipEntry>,
+    owners: BTreeMap<SessionOwnershipKey, MockOwnershipEntry>,
     operations: Vec<OwnershipFenceRequest>,
     recovery_attempts: usize,
     retry_validation_attempts: usize,
@@ -426,26 +470,26 @@ impl MockOwnershipFencer {
         }
     }
 
-    /// Set the current owner for an SA with the initial fence token.
-    pub fn set_owner(&self, sa: SaId, owner: ClusterNode) {
+    /// Set the current owner for a destination-scoped SA with the initial fence token.
+    pub fn set_owner(&self, key: SessionOwnershipKey, owner: ClusterNode) {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state
             .owners
-            .insert(sa, (owner, OwnershipFence::new(1).unwrap(), None));
+            .insert(key, (owner, OwnershipFence::new(1).unwrap(), None));
         state.next_fence = state.next_fence.max(2);
     }
 
-    /// Return the current owner for an SA.
+    /// Return the current owner for a destination-scoped SA.
     #[must_use]
-    pub fn owner(&self, sa: SaId) -> Option<ClusterNode> {
+    pub fn owner(&self, key: SessionOwnershipKey) -> Option<ClusterNode> {
         let state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.owners.get(&sa).map(|(owner, _, _)| owner.clone())
+        state.owners.get(&key).map(|(owner, _, _)| owner.clone())
     }
 
     /// Return recorded fence operations.
@@ -501,6 +545,7 @@ impl OwnershipFencer for MockOwnershipFencer {
         request: &OwnershipFenceRequest,
     ) -> Result<Option<OwnershipFenceGrant>, IpsecLbError> {
         validate_sa_identifier(request.sa)?;
+        validate_ownership_key_matches_sa(request.sa, request.ownership_key)?;
         if request.previous_owner == request.new_owner {
             return Err(IpsecLbError::ownership_conflict(
                 "ownership recovery requires distinct owners",
@@ -515,7 +560,7 @@ impl OwnershipFencer for MockOwnershipFencer {
         if let Some(failure) = &state.failure {
             return Err(failure.clone());
         }
-        let Some((owner, fence, transition_id)) = state.owners.get(&request.sa) else {
+        let Some((owner, fence, transition_id)) = state.owners.get(&request.ownership_key) else {
             return Err(IpsecLbError::NotFound);
         };
         if owner == &request.previous_owner {
@@ -539,6 +584,7 @@ impl OwnershipFencer for MockOwnershipFencer {
         }
         Ok(Some(OwnershipFenceGrant {
             sa: request.sa,
+            ownership_key: request.ownership_key,
             transition_id: request.transition_id,
             fingerprint: request.fingerprint,
             owner: owner.clone(),
@@ -551,6 +597,7 @@ impl OwnershipFencer for MockOwnershipFencer {
         request: OwnershipFenceRequest,
     ) -> Result<OwnershipFenceGrant, IpsecLbError> {
         validate_sa_identifier(request.sa)?;
+        validate_ownership_key_matches_sa(request.sa, request.ownership_key)?;
         let mut state = self
             .state
             .lock()
@@ -559,7 +606,7 @@ impl OwnershipFencer for MockOwnershipFencer {
             return Err(failure.clone());
         }
         let Some((current_owner, current_fence, _current_transition)) =
-            state.owners.get(&request.sa)
+            state.owners.get(&request.ownership_key)
         else {
             return Err(IpsecLbError::NotFound);
         };
@@ -579,7 +626,7 @@ impl OwnershipFencer for MockOwnershipFencer {
             .checked_add(1)
             .ok_or_else(|| IpsecLbError::invalid_config("fence", "fence token exhausted"))?;
         state.owners.insert(
-            request.sa,
+            request.ownership_key,
             (
                 request.new_owner.clone(),
                 fence,
@@ -589,6 +636,7 @@ impl OwnershipFencer for MockOwnershipFencer {
         state.operations.push(request.clone());
         Ok(OwnershipFenceGrant {
             sa: request.sa,
+            ownership_key: request.ownership_key,
             transition_id: request.transition_id,
             fingerprint: request.fingerprint,
             owner: request.new_owner,
@@ -598,6 +646,7 @@ impl OwnershipFencer for MockOwnershipFencer {
 
     async fn validate_retry_proof(&self, proof: &OwnershipRetryProof) -> Result<(), IpsecLbError> {
         validate_sa_identifier(proof.sa())?;
+        validate_ownership_key_matches_sa(proof.sa(), proof.ownership_key())?;
         let mut state = self
             .state
             .lock()
@@ -606,7 +655,7 @@ impl OwnershipFencer for MockOwnershipFencer {
         if let Some(failure) = &state.failure {
             return Err(failure.clone());
         }
-        let Some((owner, fence, transition_id)) = state.owners.get(&proof.sa()) else {
+        let Some((owner, fence, transition_id)) = state.owners.get(&proof.ownership_key()) else {
             return Err(IpsecLbError::NotFound);
         };
         if owner != proof.owner()
@@ -737,6 +786,9 @@ impl RePinAuditSink for MockRePinAuditSink {
 mod tests {
     use super::*;
     use crate::model::{IpAddress, SteerKey};
+    use crate::ownership::{
+        DestinationContext, EspEncapsulationKind, EspOwnershipKey, EspSpi, RoutingDomainTag,
+    };
 
     #[tokio::test]
     async fn mock_steering_lifecycle_records_operations() {
@@ -793,11 +845,17 @@ mod tests {
     #[tokio::test]
     async fn mock_fencer_rejects_stale_owner() {
         let fencer = MockOwnershipFencer::new();
-        let sa = SaId::Esp { spi: 9 };
-        fencer.set_owner(sa, ClusterNode::new("node-a"));
+        let sa = SaId::Esp { spi: 0x0109 };
+        let ownership_key = SessionOwnershipKey::Esp(EspOwnershipKey::new(
+            DestinationContext::new(IpAddress::V4([192, 0, 2, 10]), RoutingDomainTag::new(7)),
+            EspEncapsulationKind::UdpEncapsulated,
+            EspSpi::new(0x0109).unwrap(),
+        ));
+        fencer.set_owner(ownership_key, ClusterNode::new("node-a"));
         let err = fencer
             .fence_sa_owner(OwnershipFenceRequest {
                 sa,
+                ownership_key,
                 transition_id: OwnershipTransitionId::new(1).unwrap(),
                 fingerprint: OwnershipTransitionFingerprint::from_bytes([1; 32]),
                 previous_fence: OwnershipFence::new(1).unwrap(),
@@ -807,7 +865,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, IpsecLbError::OwnershipConflict { .. }));
-        assert_eq!(fencer.owner(sa).unwrap().as_str(), "node-a");
+        assert_eq!(fencer.owner(ownership_key).unwrap().as_str(), "node-a");
     }
 
     #[tokio::test]

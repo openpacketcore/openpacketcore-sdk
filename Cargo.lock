@@ -2639,6 +2639,7 @@ dependencies = [
  "nix",
  "opc-identity",
  "opc-ipsec-lb-ebpf-common",
+ "opc-ipsec-xfrm",
  "opc-key",
  "opc-linux-gtpu-sys",
  "opc-route-steering",

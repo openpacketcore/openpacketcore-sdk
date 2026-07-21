@@ -13,20 +13,27 @@ use opc_session_store::{
     StateClass, StoreError, StoredSessionRecord,
 };
 use opc_types::{NetworkFunctionKind, TenantId};
+use sha2::{Digest, Sha256};
 
 use crate::error::IpsecLbError;
 use crate::model::{ClusterNode, SaId, ShardId};
-use crate::ports::{OwnershipFencer, OwnershipSource};
+use crate::ownership::SessionOwnershipKey;
+use crate::ports::{OwnershipFencer, OwnershipRetirementAuthority, OwnershipSource};
 use crate::repin::{
-    validate_sa_identifier, OwnershipFence, OwnershipFenceGrant, OwnershipFenceRequest,
-    OwnershipRetryProof, OwnershipSnapshot, OwnershipTransitionFingerprint, OwnershipTransitionId,
+    validate_ownership_key_matches_sa, validate_sa_identifier, OwnershipCleanupCompleteProof,
+    OwnershipFence, OwnershipFenceGrant, OwnershipFenceRequest, OwnershipRetirementAdmission,
+    OwnershipRetirementFinalization, OwnershipRetirementGrant, OwnershipRetirementRequest,
+    OwnershipRetirementSupersededProof, OwnershipRetryProof, OwnershipSnapshot,
+    OwnershipTransitionFingerprint, OwnershipTransitionId,
 };
 
 const OWNERSHIP_KEY_TYPE: &str = "ipsec-lb-ownership";
 const SHARD_KEY_PREFIX: &[u8] = b"opc-ipsec-lb/shard/";
 const IKE_SA_KEY_PREFIX: &[u8] = b"opc-ipsec-lb/sa/ike/";
 const ESP_SA_KEY_PREFIX: &[u8] = b"opc-ipsec-lb/sa/esp/";
+const SCOPED_SA_KEY_DOMAIN: &[u8] = b"opc-ipsec-lb/session-store/scoped-sa-key/v1";
 const OWNERSHIP_TRANSITION_PAYLOAD_PREFIX: &[u8] = b"opc-ipsec-lb/transition/v1:";
+const OWNERSHIP_RETIRING_PAYLOAD_PREFIX: &[u8] = b"opc-ipsec-lb/retiring/v1:";
 /// The lease only needs to cover one fenced owner-promotion CAS. A failed
 /// writer must not prevent another promotion indefinitely.
 const OWNERSHIP_FENCE_LEASE_TTL: Duration = Duration::from_secs(10);
@@ -139,6 +146,14 @@ pub trait SessionOwnershipKeyResolver: Send + Sync + fmt::Debug {
 
     /// Return the session-store key for an SA owner.
     fn sa_key(&self, sa: SaId) -> Result<SessionKey, IpsecLbError>;
+
+    /// Return the authoritative key for one destination-scoped SA identity.
+    ///
+    /// The default fails closed so an older SPI-only resolver can never be
+    /// selected accidentally for Host-XDP re-pin.
+    fn scoped_sa_key(&self, _key: &SessionOwnershipKey) -> Result<SessionKey, IpsecLbError> {
+        Err(IpsecLbError::Unsupported)
+    }
 }
 
 /// Deterministic default keyspace for IPsec LB ownership records.
@@ -196,6 +211,15 @@ impl SessionOwnershipKeyResolver for SessionOwnershipKeyspace {
         }
         self.key(stable_id)
     }
+
+    fn scoped_sa_key(&self, key: &SessionOwnershipKey) -> Result<SessionKey, IpsecLbError> {
+        let canonical = key.to_canonical_bytes();
+        let mut hasher = Sha256::new();
+        hasher.update(SCOPED_SA_KEY_DOMAIN);
+        hasher.update((canonical.len() as u16).to_be_bytes());
+        hasher.update(canonical);
+        self.key(hasher.finalize().to_vec())
+    }
 }
 
 /// Ownership source backed by `opc-session-store` record metadata.
@@ -234,7 +258,14 @@ where
         let Some(record) = self.backend.get(&key).await.map_err(map_store_error)? else {
             return Ok(None);
         };
-        validate_ownership_record(&record, &key)?;
+        if matches!(
+            validate_ownership_record(&record, &key)?,
+            OwnershipRecordState::Retiring { .. }
+        ) {
+            return Err(IpsecLbError::ownership_conflict(
+                "ownership record is retiring",
+            ));
+        }
         Ok(Some(OwnershipSnapshot::new(
             ClusterNode::new(record.owner.as_str()),
             OwnershipFence::new(record.fence.get())?,
@@ -258,6 +289,14 @@ where
 
     async fn sa_ownership(&self, sa: SaId) -> Result<Option<OwnershipSnapshot>, IpsecLbError> {
         let key = self.resolver.sa_key(sa)?;
+        self.ownership_for_key(key).await
+    }
+
+    async fn scoped_sa_ownership(
+        &self,
+        ownership_key: SessionOwnershipKey,
+    ) -> Result<Option<OwnershipSnapshot>, IpsecLbError> {
+        let key = self.resolver.scoped_sa_key(&ownership_key)?;
         self.ownership_for_key(key).await
     }
 }
@@ -330,17 +369,23 @@ where
         request: &OwnershipFenceRequest,
     ) -> Result<Option<OwnershipFenceGrant>, IpsecLbError> {
         validate_sa_identifier(request.sa)?;
+        validate_ownership_key_matches_sa(request.sa, request.ownership_key)?;
         if request.previous_owner == request.new_owner {
             return Err(IpsecLbError::ownership_conflict(
                 "ownership recovery requires distinct owners",
             ));
         }
 
-        let key = self.resolver.sa_key(request.sa)?;
+        let key = self.resolver.scoped_sa_key(&request.ownership_key)?;
         let Some(current) = self.backend.get(&key).await.map_err(map_store_error)? else {
             return Err(IpsecLbError::NotFound);
         };
         let committed_transition = validate_ownership_record(&current, &key)?;
+        if matches!(committed_transition, OwnershipRecordState::Retiring { .. }) {
+            return Err(IpsecLbError::ownership_conflict(
+                "ownership record is retiring",
+            ));
+        }
 
         if current.owner.as_str() == request.previous_owner.as_str() {
             return if current.fence.get() == request.previous_fence.get() {
@@ -356,7 +401,12 @@ where
                 "neither requested owner holds the authoritative SA record",
             ));
         }
-        if committed_transition != Some((request.transition_id, request.fingerprint)) {
+        if committed_transition
+            != (OwnershipRecordState::Active {
+                transition_id: request.transition_id,
+                fingerprint: request.fingerprint,
+            })
+        {
             return Err(IpsecLbError::ownership_conflict(
                 "current owner was committed by a different ownership transition",
             ));
@@ -364,6 +414,7 @@ where
 
         Ok(Some(OwnershipFenceGrant {
             sa: request.sa,
+            ownership_key: request.ownership_key,
             transition_id: request.transition_id,
             fingerprint: request.fingerprint,
             owner: request.new_owner.clone(),
@@ -376,16 +427,24 @@ where
         request: OwnershipFenceRequest,
     ) -> Result<OwnershipFenceGrant, IpsecLbError> {
         validate_sa_identifier(request.sa)?;
+        validate_ownership_key_matches_sa(request.sa, request.ownership_key)?;
         if request.previous_owner == request.new_owner {
             return Err(IpsecLbError::ownership_conflict(
                 "ownership promotion requires distinct owners",
             ));
         }
-        let key = self.resolver.sa_key(request.sa)?;
+        let key = self.resolver.scoped_sa_key(&request.ownership_key)?;
         let Some(current) = self.backend.get(&key).await.map_err(map_store_error)? else {
             return Err(IpsecLbError::NotFound);
         };
-        validate_ownership_record(&current, &key)?;
+        if matches!(
+            validate_ownership_record(&current, &key)?,
+            OwnershipRecordState::Retiring { .. }
+        ) {
+            return Err(IpsecLbError::ownership_conflict(
+                "ownership record is retiring",
+            ));
+        }
 
         if current.owner.as_str() != request.previous_owner.as_str() {
             return Err(IpsecLbError::ownership_conflict(
@@ -450,6 +509,7 @@ where
         };
         let grant = OwnershipFenceGrant {
             sa: request.sa,
+            ownership_key: request.ownership_key,
             transition_id: request.transition_id,
             fingerprint: request.fingerprint,
             owner: request.new_owner,
@@ -492,6 +552,402 @@ where
             )),
         }
     }
+
+    async fn begin_retirement(
+        &self,
+        request: OwnershipRetirementRequest,
+    ) -> Result<OwnershipRetirementAdmission, IpsecLbError> {
+        validate_sa_identifier(request.sa())?;
+        validate_ownership_key_matches_sa(request.sa(), request.ownership_key())?;
+        let key = self.resolver.scoped_sa_key(&request.ownership_key())?;
+        let Some(current) = self.backend.get(&key).await.map_err(map_store_error)? else {
+            return Err(IpsecLbError::NotFound);
+        };
+        let state = validate_ownership_record(&current, &key)?;
+        if let Some(grant) = exact_retirement_grant(&current, state, &request)? {
+            return Ok(OwnershipRetirementAdmission::Granted(grant));
+        }
+        let expected_active = OwnershipRecordState::Active {
+            transition_id: request.transition_id(),
+            fingerprint: request.fingerprint(),
+        };
+        if state != expected_active
+            || current.owner.as_str() != request.owner().as_str()
+            || current.fence.get() != request.active_fence().get()
+        {
+            if let Some(proof) = superseded_retirement_proof(&current, state, &request)? {
+                return Ok(OwnershipRetirementAdmission::Superseded(proof));
+            }
+            return Err(IpsecLbError::ownership_conflict(
+                "retirement does not match the exact active ownership record",
+            ));
+        }
+
+        let next_generation = current.generation.next().ok_or_else(|| {
+            IpsecLbError::invalid_config(
+                "session_store.generation",
+                "ownership record generation exhausted",
+            )
+        })?;
+        let owner = OwnerId::new(request.owner().as_str()).map_err(|_| {
+            IpsecLbError::invalid_config("session_store.owner", "ownership record owner is invalid")
+        })?;
+        let lease = acquire_lease_cleanup(
+            Arc::clone(&self.backend),
+            key.clone(),
+            owner.clone(),
+            self.lease_ttl,
+        )
+        .await?;
+        let committed_fence = lease.guard().map(LeaseGuard::fence).ok_or_else(|| {
+            IpsecLbError::invalid_config(
+                "session_store.lease",
+                "ownership lease cleanup guard is unavailable",
+            )
+        })?;
+        if committed_fence.get() <= request.active_fence().get() {
+            return Err(IpsecLbError::invalid_config(
+                "session_store.fence",
+                "ownership retirement lease fence did not advance",
+            ));
+        }
+        let retirement_fence = OwnershipFence::new(committed_fence.get())?;
+        let desired_grant = OwnershipRetirementGrant::new(request.clone(), retirement_fence);
+        let record = StoredSessionRecord {
+            key: key.clone(),
+            generation: next_generation,
+            owner,
+            fence: committed_fence,
+            state_class: StateClass::AuthoritativeSession,
+            state_type: current.state_type,
+            expires_at: None,
+            payload: encode_ownership_retiring(&request),
+        };
+        let cas_lease = lease.guard().cloned().ok_or_else(|| {
+            IpsecLbError::invalid_config(
+                "session_store.lease",
+                "ownership lease cleanup guard is unavailable",
+            )
+        })?;
+        let result = tokio::time::timeout(
+            self.lease_ttl,
+            self.backend.compare_and_set(CompareAndSet {
+                key: key.clone(),
+                lease: cas_lease,
+                expected_generation: Some(current.generation),
+                new_record: record,
+            }),
+        )
+        .await;
+        match result {
+            Ok(Ok(CompareAndSetResult::Success)) => {
+                Ok(OwnershipRetirementAdmission::Granted(desired_grant))
+            }
+            Ok(Ok(CompareAndSetResult::Conflict { .. })) => {
+                self.recover_retirement_after_write(&key, &request).await
+            }
+            Ok(Err(_)) | Err(_) => {
+                // Both outcomes may hide a committed CAS. Only exact
+                // authoritative readback may classify the permit safe to
+                // release; missing, malformed, or unavailable state is
+                // indeterminate and poisons the Host operation stripe.
+                self.recover_retirement_after_write(&key, &request).await
+            }
+        }
+    }
+
+    async fn recover_retirement_after_write(
+        &self,
+        key: &SessionKey,
+        request: &OwnershipRetirementRequest,
+    ) -> Result<OwnershipRetirementAdmission, IpsecLbError> {
+        let Some(current) = self
+            .backend
+            .get(key)
+            .await
+            .map_err(|_| IpsecLbError::OwnershipRetirementIndeterminate)?
+        else {
+            return Err(IpsecLbError::OwnershipRetirementIndeterminate);
+        };
+        let state = validate_ownership_record(&current, key)
+            .map_err(|_| IpsecLbError::OwnershipRetirementIndeterminate)?;
+        if let Some(grant) = exact_retirement_grant(&current, state, request)
+            .map_err(|_| IpsecLbError::OwnershipRetirementIndeterminate)?
+        {
+            return Ok(OwnershipRetirementAdmission::Granted(grant));
+        }
+        if let Some(proof) = superseded_retirement_proof(&current, state, request)
+            .map_err(|_| IpsecLbError::OwnershipRetirementIndeterminate)?
+        {
+            return Ok(OwnershipRetirementAdmission::Superseded(proof));
+        }
+        Err(IpsecLbError::ownership_conflict(
+            "ownership record changed during retirement",
+        ))
+    }
+
+    async fn finalize_retirement(
+        &self,
+        cleanup: &OwnershipCleanupCompleteProof,
+    ) -> Result<OwnershipRetirementFinalization, IpsecLbError> {
+        let grant = cleanup.grant();
+        let request = grant.request();
+        validate_sa_identifier(request.sa())?;
+        validate_ownership_key_matches_sa(request.sa(), request.ownership_key())?;
+        let key = self.resolver.scoped_sa_key(&request.ownership_key())?;
+        let Some(current) = self.backend.get(&key).await.map_err(map_store_error)? else {
+            return Ok(OwnershipRetirementFinalization::AlreadyDeleted);
+        };
+        match classify_retirement_finalization(&current, &key, grant)? {
+            RetirementRecordDisposition::Exact => {}
+            RetirementRecordDisposition::Superseded => {
+                return Ok(OwnershipRetirementFinalization::Superseded);
+            }
+        }
+        let owner = OwnerId::new(request.owner().as_str()).map_err(|_| {
+            IpsecLbError::invalid_config("session_store.owner", "ownership record owner is invalid")
+        })?;
+        let lease = acquire_lease_cleanup(
+            Arc::clone(&self.backend),
+            key.clone(),
+            owner,
+            self.lease_ttl,
+        )
+        .await?;
+        let Some(rechecked) = self.backend.get(&key).await.map_err(map_store_error)? else {
+            return Ok(OwnershipRetirementFinalization::AlreadyDeleted);
+        };
+        match classify_retirement_finalization(&rechecked, &key, grant)? {
+            RetirementRecordDisposition::Exact => {}
+            RetirementRecordDisposition::Superseded => {
+                return Ok(OwnershipRetirementFinalization::Superseded);
+            }
+        }
+        let guard = lease.guard().cloned().ok_or_else(|| {
+            IpsecLbError::invalid_config(
+                "session_store.lease",
+                "ownership lease cleanup guard is unavailable",
+            )
+        })?;
+        if guard.fence() <= rechecked.fence || guard.fence().get() <= grant.retirement_fence().get()
+        {
+            return Err(IpsecLbError::invalid_config(
+                "session_store.fence",
+                "ownership retirement finalization lease fence did not advance",
+            ));
+        }
+        let refreshed_generation = rechecked.generation.next().ok_or_else(|| {
+            IpsecLbError::invalid_config(
+                "session_store.generation",
+                "ownership record generation exhausted",
+            )
+        })?;
+        let refreshed = StoredSessionRecord {
+            key: key.clone(),
+            generation: refreshed_generation,
+            owner: guard.owner().clone(),
+            fence: guard.fence(),
+            state_class: StateClass::AuthoritativeSession,
+            state_type: rechecked.state_type,
+            expires_at: None,
+            payload: encode_ownership_retiring(request),
+        };
+        let refresh = tokio::time::timeout(
+            self.lease_ttl,
+            self.backend.compare_and_set(CompareAndSet {
+                key: key.clone(),
+                lease: guard.clone(),
+                expected_generation: Some(rechecked.generation),
+                new_record: refreshed.clone(),
+            }),
+        )
+        .await;
+        match refresh {
+            Ok(Ok(CompareAndSetResult::Success)) => {}
+            Ok(Ok(CompareAndSetResult::Conflict { .. })) => {
+                match self.backend.get(&key).await.map_err(map_store_error)? {
+                    None => return Ok(OwnershipRetirementFinalization::AlreadyDeleted),
+                    Some(observed) if observed == refreshed => {}
+                    Some(observed) => {
+                        return match classify_retirement_finalization(&observed, &key, grant)? {
+                            RetirementRecordDisposition::Superseded => {
+                                Ok(OwnershipRetirementFinalization::Superseded)
+                            }
+                            RetirementRecordDisposition::Exact => {
+                                Err(IpsecLbError::ownership_conflict(
+                                    "ownership retirement refresh lost its exact generation",
+                                ))
+                            }
+                        };
+                    }
+                }
+            }
+            Ok(Err(error)) => match self.backend.get(&key).await.map_err(map_store_error)? {
+                None => return Ok(OwnershipRetirementFinalization::AlreadyDeleted),
+                Some(observed) if observed == refreshed => {}
+                Some(observed) => {
+                    return match classify_retirement_finalization(&observed, &key, grant)? {
+                        RetirementRecordDisposition::Superseded => {
+                            Ok(OwnershipRetirementFinalization::Superseded)
+                        }
+                        RetirementRecordDisposition::Exact => Err(map_store_error(error)),
+                    };
+                }
+            },
+            Err(_) => match self.backend.get(&key).await.map_err(map_store_error)? {
+                None => return Ok(OwnershipRetirementFinalization::AlreadyDeleted),
+                Some(observed) if observed == refreshed => {}
+                Some(observed) => {
+                    return match classify_retirement_finalization(&observed, &key, grant)? {
+                        RetirementRecordDisposition::Superseded => {
+                            Ok(OwnershipRetirementFinalization::Superseded)
+                        }
+                        RetirementRecordDisposition::Exact => Err(IpsecLbError::io(
+                            "session_store_ownership_retirement_refresh",
+                            io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                "ownership retirement refresh acknowledgement timed out",
+                            ),
+                        )),
+                    };
+                }
+            },
+        }
+        let deletion =
+            tokio::time::timeout(self.lease_ttl, self.backend.delete_fenced(&guard)).await;
+        match deletion {
+            Ok(Ok(())) => Ok(OwnershipRetirementFinalization::Deleted),
+            Ok(Err(error)) => match self.backend.get(&key).await.map_err(map_store_error)? {
+                None => Ok(OwnershipRetirementFinalization::Deleted),
+                Some(observed) => match classify_retirement_finalization(&observed, &key, grant)? {
+                    RetirementRecordDisposition::Superseded => {
+                        Ok(OwnershipRetirementFinalization::Superseded)
+                    }
+                    RetirementRecordDisposition::Exact => Err(map_store_error(error)),
+                },
+            },
+            Err(_) => match self.backend.get(&key).await.map_err(map_store_error)? {
+                None => Ok(OwnershipRetirementFinalization::Deleted),
+                Some(observed) => match classify_retirement_finalization(&observed, &key, grant)? {
+                    RetirementRecordDisposition::Superseded => {
+                        Ok(OwnershipRetirementFinalization::Superseded)
+                    }
+                    RetirementRecordDisposition::Exact => Err(IpsecLbError::io(
+                        "session_store_ownership_retirement_delete",
+                        io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "ownership retirement delete acknowledgement timed out",
+                        ),
+                    )),
+                },
+            },
+        }
+    }
+}
+
+fn exact_retirement_grant(
+    record: &StoredSessionRecord,
+    state: OwnershipRecordState,
+    request: &OwnershipRetirementRequest,
+) -> Result<Option<OwnershipRetirementGrant>, IpsecLbError> {
+    let OwnershipRecordState::Retiring {
+        transition_id,
+        fingerprint,
+        active_fence,
+        map_owner,
+    } = state
+    else {
+        return Ok(None);
+    };
+    if record.owner.as_str() != request.owner().as_str()
+        || transition_id != request.transition_id()
+        || fingerprint != request.fingerprint()
+        || active_fence != request.active_fence()
+        || map_owner != request.map_owner()
+        || record.fence.get() <= active_fence.get()
+    {
+        return Ok(None);
+    }
+    Ok(Some(OwnershipRetirementGrant::new(
+        request.clone(),
+        OwnershipFence::new(record.fence.get())?,
+    )))
+}
+
+fn superseded_retirement_proof(
+    record: &StoredSessionRecord,
+    state: OwnershipRecordState,
+    request: &OwnershipRetirementRequest,
+) -> Result<Option<OwnershipRetirementSupersededProof>, IpsecLbError> {
+    if record.fence.get() <= request.active_fence().get() {
+        return Ok(None);
+    }
+    let different_lineage = match state {
+        OwnershipRecordState::Active {
+            transition_id,
+            fingerprint,
+        }
+        | OwnershipRecordState::Retiring {
+            transition_id,
+            fingerprint,
+            ..
+        } => transition_id != request.transition_id() || fingerprint != request.fingerprint(),
+        OwnershipRecordState::Unbound => false,
+    };
+    if !different_lineage {
+        return Ok(None);
+    }
+    Ok(Some(OwnershipRetirementSupersededProof::new(
+        request.clone(),
+        OwnershipFence::new(record.fence.get())?,
+    )))
+}
+
+enum RetirementRecordDisposition {
+    Exact,
+    Superseded,
+}
+
+fn classify_retirement_finalization(
+    record: &StoredSessionRecord,
+    key: &SessionKey,
+    grant: &OwnershipRetirementGrant,
+) -> Result<RetirementRecordDisposition, IpsecLbError> {
+    let state = validate_ownership_record(record, key)?;
+    let request = grant.request();
+    let exact_lineage = matches!(
+        state,
+        OwnershipRecordState::Retiring {
+            transition_id,
+            fingerprint,
+            active_fence,
+            map_owner,
+        } if transition_id == request.transition_id()
+            && fingerprint == request.fingerprint()
+            && active_fence == request.active_fence()
+            && map_owner == request.map_owner()
+    ) && record.owner.as_str() == request.owner().as_str();
+    if exact_lineage && record.fence.get() >= grant.retirement_fence().get() {
+        return Ok(RetirementRecordDisposition::Exact);
+    }
+    let different_lineage = match state {
+        OwnershipRecordState::Active {
+            transition_id,
+            fingerprint,
+        }
+        | OwnershipRecordState::Retiring {
+            transition_id,
+            fingerprint,
+            ..
+        } => transition_id != request.transition_id() || fingerprint != request.fingerprint(),
+        OwnershipRecordState::Unbound => false,
+    };
+    if different_lineage && record.fence.get() > grant.retirement_fence().get() {
+        return Ok(RetirementRecordDisposition::Superseded);
+    }
+    Err(IpsecLbError::ownership_conflict(
+        "cleanup proof does not match the current ownership record",
+    ))
 }
 
 #[async_trait]
@@ -516,7 +972,8 @@ where
 
     async fn validate_retry_proof(&self, proof: &OwnershipRetryProof) -> Result<(), IpsecLbError> {
         validate_sa_identifier(proof.sa())?;
-        let key = self.resolver.sa_key(proof.sa())?;
+        validate_ownership_key_matches_sa(proof.sa(), proof.ownership_key())?;
+        let key = self.resolver.scoped_sa_key(&proof.ownership_key())?;
         let Some(current) = self.backend.get(&key).await.map_err(map_store_error)? else {
             return Err(IpsecLbError::NotFound);
         };
@@ -524,7 +981,11 @@ where
 
         if current.owner.as_str() != proof.owner().as_str()
             || current.fence.get() != proof.fence().get()
-            || committed_transition != Some((proof.transition_id(), proof.fingerprint()))
+            || committed_transition
+                != (OwnershipRecordState::Active {
+                    transition_id: proof.transition_id(),
+                    fingerprint: proof.fingerprint(),
+                })
         {
             return Err(IpsecLbError::ownership_conflict(
                 "retry proof does not match the authoritative owner and fence",
@@ -534,10 +995,46 @@ where
     }
 }
 
+#[async_trait]
+impl<B, R> OwnershipRetirementAuthority for SessionStoreOwnershipFencer<B, R>
+where
+    B: SessionBackend + SessionLeaseManager + 'static,
+    R: SessionOwnershipKeyResolver,
+{
+    async fn begin_ownership_retirement(
+        &self,
+        request: OwnershipRetirementRequest,
+    ) -> Result<OwnershipRetirementAdmission, IpsecLbError> {
+        self.begin_retirement(request).await
+    }
+
+    async fn finalize_ownership_retirement(
+        &self,
+        cleanup: &OwnershipCleanupCompleteProof,
+    ) -> Result<OwnershipRetirementFinalization, IpsecLbError> {
+        self.finalize_retirement(cleanup).await
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OwnershipRecordState {
+    Unbound,
+    Active {
+        transition_id: OwnershipTransitionId,
+        fingerprint: OwnershipTransitionFingerprint,
+    },
+    Retiring {
+        transition_id: OwnershipTransitionId,
+        fingerprint: OwnershipTransitionFingerprint,
+        active_fence: OwnershipFence,
+        map_owner: ShardId,
+    },
+}
+
 fn validate_ownership_record(
     record: &StoredSessionRecord,
     expected_key: &SessionKey,
-) -> Result<Option<(OwnershipTransitionId, OwnershipTransitionFingerprint)>, IpsecLbError> {
+) -> Result<OwnershipRecordState, IpsecLbError> {
     if &record.key != expected_key {
         return Err(IpsecLbError::invalid_config(
             "session_store.key",
@@ -599,10 +1096,32 @@ fn encode_ownership_transition(
 
 fn decode_ownership_transition(
     payload: &EncryptedSessionPayload,
-) -> Result<Option<(OwnershipTransitionId, OwnershipTransitionFingerprint)>, IpsecLbError> {
+) -> Result<OwnershipRecordState, IpsecLbError> {
     let bytes = payload.as_bytes();
     if bytes.is_empty() {
-        return Ok(None);
+        return Ok(OwnershipRecordState::Unbound);
+    }
+    if let Some(raw) = bytes.strip_prefix(OWNERSHIP_RETIRING_PAYLOAD_PREFIX) {
+        let raw: [u8; 58] = raw.try_into().map_err(|_| {
+            IpsecLbError::invalid_config(
+                "session_store.payload",
+                "ownership retirement metadata length is invalid",
+            )
+        })?;
+        let mut transition = [0_u8; 16];
+        transition.copy_from_slice(&raw[..16]);
+        let mut fingerprint = [0_u8; 32];
+        fingerprint.copy_from_slice(&raw[16..48]);
+        let mut active_fence = [0_u8; 8];
+        active_fence.copy_from_slice(&raw[48..56]);
+        let mut map_owner = [0_u8; 2];
+        map_owner.copy_from_slice(&raw[56..]);
+        return Ok(OwnershipRecordState::Retiring {
+            transition_id: OwnershipTransitionId::new(u128::from_be_bytes(transition))?,
+            fingerprint: OwnershipTransitionFingerprint::from_bytes(fingerprint),
+            active_fence: OwnershipFence::new(u64::from_be_bytes(active_fence))?,
+            map_owner: ShardId::new(u16::from_be_bytes(map_owner)),
+        });
     }
     let Some(raw_id) = bytes.strip_prefix(OWNERSHIP_TRANSITION_PAYLOAD_PREFIX) else {
         return Err(IpsecLbError::invalid_config(
@@ -629,11 +1148,21 @@ fn decode_ownership_transition(
         )
     })?;
     OwnershipTransitionId::new(u128::from_be_bytes(raw_id)).map(|transition_id| {
-        Some((
+        OwnershipRecordState::Active {
             transition_id,
-            OwnershipTransitionFingerprint::from_bytes(raw_fingerprint),
-        ))
+            fingerprint: OwnershipTransitionFingerprint::from_bytes(raw_fingerprint),
+        }
     })
+}
+
+fn encode_ownership_retiring(request: &OwnershipRetirementRequest) -> EncryptedSessionPayload {
+    let mut payload = Vec::with_capacity(OWNERSHIP_RETIRING_PAYLOAD_PREFIX.len() + 58);
+    payload.extend_from_slice(OWNERSHIP_RETIRING_PAYLOAD_PREFIX);
+    payload.extend_from_slice(&request.transition_id().get().to_be_bytes());
+    payload.extend_from_slice(&request.fingerprint().as_bytes());
+    payload.extend_from_slice(&request.active_fence().get().to_be_bytes());
+    payload.extend_from_slice(&request.map_owner().get().to_be_bytes());
+    EncryptedSessionPayload::new(payload)
 }
 
 fn map_lease_error(error: LeaseError) -> IpsecLbError {
@@ -750,6 +1279,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use opc_ipsec_xfrm::OutboundSaBindingId;
     use opc_key::{KeyId, KeyPurpose, MemoryKeyProvider, Zeroizing};
     use opc_session_store::{
         BackendCapabilities, BackendInstanceIdentity, BackendPeerBinding, CompareAndSet,
@@ -761,6 +1291,14 @@ mod tests {
     use tokio::sync::{Barrier, Notify};
 
     use super::*;
+    use crate::failover::{
+        AntiReplayResume, SendIvCounterMode, SendIvForwardJump, MIN_SEND_IV_FORWARD_JUMP,
+    };
+    use crate::ownership::{
+        DestinationContext, EspEncapsulationKind, EspOwnershipKey, EspSpi,
+        EstablishedIkeOwnershipKey, IkeSpi, RoutingDomainTag,
+    };
+    use crate::repin::{RePinRequest, ResumeKeySource, SameSpiOutboundIvResume, SameSpiResume};
 
     fn keyspace() -> SessionOwnershipKeyspace {
         SessionOwnershipKeyspace::new(
@@ -788,6 +1326,219 @@ mod tests {
 
     fn fingerprint(value: u8) -> OwnershipTransitionFingerprint {
         OwnershipTransitionFingerprint::from_bytes([value; 32])
+    }
+
+    fn scoped_key(sa: SaId) -> SessionOwnershipKey {
+        scoped_key_in_context(sa, [192, 0, 2, 10], 7)
+    }
+
+    fn scoped_key_in_context(
+        sa: SaId,
+        destination_address: [u8; 4],
+        routing_domain: u64,
+    ) -> SessionOwnershipKey {
+        let destination = DestinationContext::new(
+            crate::IpAddress::V4(destination_address),
+            RoutingDomainTag::new(routing_domain),
+        );
+        match sa {
+            SaId::Esp { spi } => SessionOwnershipKey::Esp(EspOwnershipKey::new(
+                destination,
+                EspEncapsulationKind::UdpEncapsulated,
+                EspSpi::new(spi).expect("allocatable test SPI"),
+            )),
+            SaId::Ike { responder_spi } => {
+                SessionOwnershipKey::EstablishedIke(EstablishedIkeOwnershipKey::new(
+                    destination,
+                    IkeSpi::new(11).expect("nonzero initiator SPI"),
+                    IkeSpi::new(responder_spi).expect("nonzero responder SPI"),
+                ))
+            }
+        }
+    }
+
+    fn retirement_request_for_test(
+        transition: u128,
+        active_fence: u64,
+    ) -> OwnershipRetirementRequest {
+        let spi = 0x3344_5566;
+        let sa = SaId::Esp { spi };
+        let request = RePinRequest {
+            sa,
+            transition_id: transition_id(transition),
+            previous_fence: OwnershipFence::new(active_fence - 1).expect("nonzero"),
+            previous_owner: ClusterNode::new("source"),
+            new_owner: ClusterNode::new("target"),
+            rule: crate::SteeringRule {
+                shard: ShardId::new(7),
+                owner: ShardId::new(9),
+                key: crate::SteerKey::EspSpi(spi),
+            },
+            ownership_key: scoped_key(sa),
+            outbound_sa_binding_id: Some(OutboundSaBindingId::from_bytes([0x56; 32])),
+            resume: SameSpiResume {
+                previous_sa: sa,
+                resumed_sa: sa,
+                outbound_iv: SameSpiOutboundIvResume::CounterBased {
+                    checkpointed_send_iv_next: 10,
+                    restored_send_iv_next: 10 + MIN_SEND_IV_FORWARD_JUMP,
+                    forward_jump: Some(SendIvForwardJump {
+                        forward_jump: MIN_SEND_IV_FORWARD_JUMP,
+                        counter_mode: SendIvCounterMode::EspExtendedSequenceNumbers {
+                            max_peer_sequence_lag: 0,
+                        },
+                    }),
+                },
+                anti_replay: AntiReplayResume::ExactWindowRestore {
+                    checkpoint_highest_accepted: 9,
+                    restored_highest_accepted: 9,
+                },
+                key_source: ResumeKeySource::LiveMirrored,
+            },
+        };
+        OwnershipRetirementRequest::from_committed(
+            &request,
+            OwnershipFence::new(active_fence).expect("nonzero"),
+        )
+    }
+
+    fn retirement_record(
+        key: SessionKey,
+        owner: &str,
+        fence: u64,
+        payload: EncryptedSessionPayload,
+    ) -> StoredSessionRecord {
+        StoredSessionRecord {
+            key,
+            generation: Generation::new(2),
+            owner: OwnerId::new(owner).expect("valid owner"),
+            fence: FenceToken::new(fence),
+            state_class: StateClass::AuthoritativeSession,
+            state_type: StateType::from_static(OWNERSHIP_KEY_TYPE),
+            expires_at: None,
+            payload,
+        }
+    }
+
+    #[test]
+    fn retirement_supersession_requires_a_strictly_newer_distinct_lineage() {
+        let request = retirement_request_for_test(7, 10);
+        let key = keyspace()
+            .scoped_sa_key(&request.ownership_key())
+            .expect("key");
+        let same_active = retirement_record(
+            key.clone(),
+            request.owner().as_str(),
+            12,
+            encode_ownership_transition(request.transition_id(), request.fingerprint()),
+        );
+        let same_state = validate_ownership_record(&same_active, &key).expect("valid state");
+        assert!(
+            superseded_retirement_proof(&same_active, same_state, &request)
+                .expect("classification")
+                .is_none()
+        );
+
+        let unbound = retirement_record(
+            key.clone(),
+            "new-owner",
+            12,
+            EncryptedSessionPayload::new([]),
+        );
+        let unbound_state = validate_ownership_record(&unbound, &key).expect("valid state");
+        assert!(
+            superseded_retirement_proof(&unbound, unbound_state, &request)
+                .expect("classification")
+                .is_none()
+        );
+
+        let successor = retirement_request_for_test(8, 11);
+        let foreign_active = retirement_record(
+            key.clone(),
+            "new-owner",
+            12,
+            encode_ownership_transition(successor.transition_id(), successor.fingerprint()),
+        );
+        let foreign_state = validate_ownership_record(&foreign_active, &key).expect("valid state");
+        let proof = superseded_retirement_proof(&foreign_active, foreign_state, &request)
+            .expect("classification")
+            .expect("different lineage supersedes");
+        assert_eq!(proof.authoritative_fence().get(), 12);
+
+        let foreign_retiring = retirement_record(
+            key.clone(),
+            "new-owner",
+            13,
+            encode_ownership_retiring(&successor),
+        );
+        let foreign_retiring_state =
+            validate_ownership_record(&foreign_retiring, &key).expect("valid state");
+        assert!(
+            superseded_retirement_proof(&foreign_retiring, foreign_retiring_state, &request)
+                .expect("classification")
+                .is_some()
+        );
+
+        let exact_retiring = retirement_record(
+            key.clone(),
+            request.owner().as_str(),
+            11,
+            encode_ownership_retiring(&request),
+        );
+        let exact_state = validate_ownership_record(&exact_retiring, &key).expect("valid state");
+        assert!(
+            exact_retirement_grant(&exact_retiring, exact_state, &request)
+                .expect("exact classification")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn cleanup_finalization_supersedes_only_a_newer_distinct_lineage() {
+        let request = retirement_request_for_test(7, 10);
+        let grant = OwnershipRetirementGrant::new(
+            request.clone(),
+            OwnershipFence::new(11).expect("nonzero"),
+        );
+        let key = keyspace()
+            .scoped_sa_key(&request.ownership_key())
+            .expect("key");
+        let successor = retirement_request_for_test(8, 11);
+        for (payload, expected) in [
+            (
+                encode_ownership_retiring(&request),
+                Ok(RetirementRecordDisposition::Exact),
+            ),
+            (
+                encode_ownership_transition(successor.transition_id(), successor.fingerprint()),
+                Ok(RetirementRecordDisposition::Superseded),
+            ),
+            (
+                encode_ownership_retiring(&successor),
+                Ok(RetirementRecordDisposition::Superseded),
+            ),
+            (
+                encode_ownership_transition(request.transition_id(), request.fingerprint()),
+                Err(()),
+            ),
+            (EncryptedSessionPayload::new([]), Err(())),
+        ] {
+            let record = retirement_record(key.clone(), request.owner().as_str(), 12, payload);
+            let actual = classify_retirement_finalization(&record, &key, &grant).map_err(|_| ());
+            match expected {
+                Ok(expected) => assert!(matches!(
+                    (actual, expected),
+                    (
+                        Ok(RetirementRecordDisposition::Exact),
+                        RetirementRecordDisposition::Exact
+                    ) | (
+                        Ok(RetirementRecordDisposition::Superseded),
+                        RetirementRecordDisposition::Superseded
+                    )
+                )),
+                Err(()) => assert!(actual.is_err()),
+            }
+        }
     }
 
     async fn write_owner<B>(
@@ -838,11 +1589,19 @@ mod tests {
         Pending,
     }
 
+    #[derive(Debug, Clone, Copy)]
+    enum PostCasReadBehavior {
+        Delegate,
+        Missing,
+        Malformed,
+    }
+
     #[derive(Debug, Clone)]
     struct InstrumentedBackend<B> {
         inner: B,
         read_barrier: Option<Arc<Barrier>>,
         cas_behavior: CasBehavior,
+        post_cas_read: PostCasReadBehavior,
         release_fails: bool,
         release_hangs: bool,
         acquire_waits_after_apply: bool,
@@ -858,6 +1617,7 @@ mod tests {
                 inner,
                 read_barrier: Some(Arc::new(Barrier::new(2))),
                 cas_behavior: CasBehavior::Delegate,
+                post_cas_read: PostCasReadBehavior::Delegate,
                 release_fails: false,
                 release_hangs: false,
                 acquire_waits_after_apply: false,
@@ -878,6 +1638,7 @@ mod tests {
                 inner,
                 read_barrier: None,
                 cas_behavior,
+                post_cas_read: PostCasReadBehavior::Delegate,
                 release_fails: false,
                 release_hangs: false,
                 acquire_waits_after_apply: false,
@@ -893,6 +1654,7 @@ mod tests {
                 inner,
                 read_barrier: None,
                 cas_behavior: CasBehavior::Delegate,
+                post_cas_read: PostCasReadBehavior::Delegate,
                 release_fails: true,
                 release_hangs: false,
                 acquire_waits_after_apply: false,
@@ -908,6 +1670,7 @@ mod tests {
                 inner,
                 read_barrier: None,
                 cas_behavior: CasBehavior::Delegate,
+                post_cas_read: PostCasReadBehavior::Delegate,
                 release_fails: false,
                 release_hangs: true,
                 acquire_waits_after_apply: false,
@@ -923,6 +1686,7 @@ mod tests {
                 inner,
                 read_barrier: None,
                 cas_behavior: CasBehavior::Delegate,
+                post_cas_read: PostCasReadBehavior::Delegate,
                 release_fails: false,
                 release_hangs: false,
                 acquire_waits_after_apply: true,
@@ -931,6 +1695,15 @@ mod tests {
                 acquire_continue: Arc::new(Notify::new()),
                 cas_attempts: Arc::new(AtomicUsize::new(0)),
             }
+        }
+
+        fn with_ambiguous_retirement_readback(
+            inner: SessionStore<FakeSessionBackend>,
+            post_cas_read: PostCasReadBehavior,
+        ) -> Self {
+            let mut backend = Self::with_cas_behavior(inner, CasBehavior::CommitThenStoreError);
+            backend.post_cas_read = post_cas_read;
+            backend
         }
     }
 
@@ -952,9 +1725,20 @@ mod tests {
         }
 
         async fn get(&self, key: &SessionKey) -> Result<Option<StoredSessionRecord>, StoreError> {
-            let result = self.inner.get(key).await;
+            let mut result = self.inner.get(key).await;
             if let Some(barrier) = &self.read_barrier {
                 barrier.wait().await;
+            }
+            if self.cas_attempts.load(Ordering::SeqCst) > 0 {
+                match self.post_cas_read {
+                    PostCasReadBehavior::Delegate => {}
+                    PostCasReadBehavior::Missing => return Ok(None),
+                    PostCasReadBehavior::Malformed => {
+                        if let Ok(Some(record)) = &mut result {
+                            record.payload = EncryptedSessionPayload::new(b"malformed");
+                        }
+                    }
+                }
             }
             result
         }
@@ -1034,6 +1818,125 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ambiguous_retirement_missing_or_malformed_readback_is_indeterminate() {
+        for readback in [PostCasReadBehavior::Missing, PostCasReadBehavior::Malformed] {
+            let store = SessionStore::new(FakeSessionBackend::new());
+            let keyspace = keyspace();
+            let retirement = retirement_request_for_test(7, 2);
+            let key = keyspace
+                .scoped_sa_key(&retirement.ownership_key())
+                .expect("ownership key");
+            write_owner(
+                &store,
+                key.clone(),
+                "source",
+                StateClass::AuthoritativeSession,
+            )
+            .await;
+            let activation = SessionStoreOwnershipFencer::new(store.clone(), keyspace.clone());
+            let grant = activation
+                .fence_sa_owner(OwnershipFenceRequest {
+                    sa: retirement.sa(),
+                    ownership_key: retirement.ownership_key(),
+                    transition_id: retirement.transition_id(),
+                    fingerprint: retirement.fingerprint(),
+                    previous_fence: OwnershipFence::new(1).expect("nonzero"),
+                    previous_owner: ClusterNode::new("source"),
+                    new_owner: retirement.owner().clone(),
+                })
+                .await
+                .expect("activation is committed");
+            assert_eq!(grant.fence, retirement.active_fence());
+
+            let backend =
+                InstrumentedBackend::with_ambiguous_retirement_readback(store.clone(), readback);
+            let authority = SessionStoreOwnershipFencer::new(backend, keyspace);
+            assert_eq!(
+                authority
+                    .begin_ownership_retirement(retirement.clone())
+                    .await,
+                Err(IpsecLbError::OwnershipRetirementIndeterminate)
+            );
+
+            let committed = store
+                .get(&key)
+                .await
+                .expect("authoritative read succeeds")
+                .expect("committed retirement remains present");
+            assert!(matches!(
+                validate_ownership_record(&committed, &key).expect("committed record validates"),
+                OwnershipRecordState::Retiring { .. }
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn retirement_deletes_record_but_preserves_the_durable_store_fence_floor() {
+        let store = SessionStore::new(FakeSessionBackend::new());
+        let keyspace = keyspace();
+        let retirement = retirement_request_for_test(9, 2);
+        let key = keyspace
+            .scoped_sa_key(&retirement.ownership_key())
+            .expect("ownership key");
+        write_owner(
+            &store,
+            key.clone(),
+            "source",
+            StateClass::AuthoritativeSession,
+        )
+        .await;
+        let authority = SessionStoreOwnershipFencer::new(store.clone(), keyspace);
+        let activation = authority
+            .fence_sa_owner(OwnershipFenceRequest {
+                sa: retirement.sa(),
+                ownership_key: retirement.ownership_key(),
+                transition_id: retirement.transition_id(),
+                fingerprint: retirement.fingerprint(),
+                previous_fence: OwnershipFence::new(1).expect("nonzero"),
+                previous_owner: ClusterNode::new("source"),
+                new_owner: retirement.owner().clone(),
+            })
+            .await
+            .expect("activation is committed");
+        assert_eq!(activation.fence, retirement.active_fence());
+        let OwnershipRetirementAdmission::Granted(grant) = authority
+            .begin_ownership_retirement(retirement)
+            .await
+            .expect("retirement grant")
+        else {
+            panic!("exact active lineage cannot be superseded");
+        };
+        let retirement_fence = grant.retirement_fence();
+        let cleanup = OwnershipCleanupCompleteProof::new(grant);
+        assert_eq!(
+            authority
+                .finalize_ownership_retirement(&cleanup)
+                .await
+                .expect("cleanup finalizes"),
+            OwnershipRetirementFinalization::Deleted
+        );
+        assert!(store.get(&key).await.expect("read succeeds").is_none());
+
+        let next_owner = OwnerId::new("next-owner").expect("valid owner");
+        let next = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                match store
+                    .acquire(&key, next_owner.clone(), Duration::from_secs(60))
+                    .await
+                {
+                    Ok(lease) => break lease,
+                    Err(LeaseError::AlreadyHeld) => tokio::task::yield_now().await,
+                    Err(error) => panic!("unexpected lease-acquisition error: {error:?}"),
+                }
+            }
+        })
+        .await
+        .expect("detached lease release completes within its bounded timeout");
+        assert!(next.fence().get() > retirement_fence.get());
+        store.release(next).await.expect("lease releases");
+    }
+
+    #[tokio::test]
     async fn reads_sa_and_shard_owners_from_session_store_metadata() {
         let store = SessionStore::new(FakeSessionBackend::new());
         let keyspace = keyspace();
@@ -1105,11 +2008,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn same_spi_in_distinct_scopes_has_independent_records_and_fences() {
+        let store = SessionStore::new(FakeSessionBackend::new());
+        let keyspace = keyspace();
+        let sa = SaId::Esp { spi: 0x1122_3344 };
+        let first_scope = scoped_key_in_context(sa, [192, 0, 2, 10], 7);
+        let second_scope = scoped_key_in_context(sa, [198, 51, 100, 10], 8);
+        let first_store_key = keyspace.scoped_sa_key(&first_scope).unwrap();
+        let second_store_key = keyspace.scoped_sa_key(&second_scope).unwrap();
+        assert_ne!(first_store_key, second_store_key);
+        let first = write_owner(
+            &store,
+            first_store_key.clone(),
+            "worker-a",
+            StateClass::AuthoritativeSession,
+        )
+        .await;
+        let second = write_owner(
+            &store,
+            second_store_key.clone(),
+            "worker-b",
+            StateClass::AuthoritativeSession,
+        )
+        .await;
+
+        let fencer = SessionStoreOwnershipFencer::new(store.clone(), keyspace);
+        let grant = fencer
+            .fence_sa_owner(OwnershipFenceRequest {
+                sa,
+                ownership_key: first_scope,
+                transition_id: transition_id(1),
+                fingerprint: fingerprint(1),
+                previous_fence: OwnershipFence::new(first.fence.get()).unwrap(),
+                previous_owner: ClusterNode::new("worker-a"),
+                new_owner: ClusterNode::new("worker-c"),
+            })
+            .await
+            .unwrap();
+
+        let first_after = store.get(&first_store_key).await.unwrap().unwrap();
+        let second_after = store.get(&second_store_key).await.unwrap().unwrap();
+        assert_eq!(first_after.owner.as_str(), "worker-c");
+        assert_eq!(first_after.fence.get(), grant.fence.get());
+        assert!(first_after.fence > first.fence);
+        assert_eq!(second_after, second);
+    }
+
+    #[tokio::test]
+    async fn legacy_spi_only_record_cannot_authorize_a_scoped_repin() {
+        let store = SessionStore::new(FakeSessionBackend::new());
+        let keyspace = keyspace();
+        let sa = SaId::Esp { spi: 0x2233_4455 };
+        let legacy = write_owner(
+            &store,
+            keyspace.sa_key(sa).unwrap(),
+            "worker-a",
+            StateClass::AuthoritativeSession,
+        )
+        .await;
+        let ownership_key = scoped_key(sa);
+        let source = SessionStoreOwnershipSource::new(store.clone(), keyspace.clone());
+        assert_eq!(
+            source.scoped_sa_ownership(ownership_key).await.unwrap(),
+            None
+        );
+
+        let fencer = SessionStoreOwnershipFencer::new(store, keyspace);
+        assert_eq!(
+            fencer
+                .fence_sa_owner(OwnershipFenceRequest {
+                    sa,
+                    ownership_key,
+                    transition_id: transition_id(1),
+                    fingerprint: fingerprint(1),
+                    previous_fence: OwnershipFence::new(legacy.fence.get()).unwrap(),
+                    previous_owner: ClusterNode::new("worker-a"),
+                    new_owner: ClusterNode::new("worker-b"),
+                })
+                .await,
+            Err(IpsecLbError::NotFound)
+        );
+    }
+
+    #[tokio::test]
     async fn fencer_projects_the_strictly_higher_committed_store_fence() {
         let store = SessionStore::new(FakeSessionBackend::new());
         let keyspace = keyspace();
         let sa = SaId::Esp { spi: 0x1122_3344 };
-        let key = keyspace.sa_key(sa).unwrap();
+        let ownership_key = scoped_key(sa);
+        let key = keyspace.scoped_sa_key(&ownership_key).unwrap();
         let initial = write_owner(
             &store,
             key.clone(),
@@ -1122,6 +2109,7 @@ mod tests {
         let grant = fencer
             .fence_sa_owner(OwnershipFenceRequest {
                 sa,
+                ownership_key,
                 transition_id: transition_id(1),
                 fingerprint: fingerprint(1),
                 previous_fence: OwnershipFence::new(1).unwrap(),
@@ -1145,9 +2133,10 @@ mod tests {
         let store = SessionStore::new(FakeSessionBackend::new());
         let keyspace = keyspace();
         let sa = SaId::Esp { spi: 0x2233_4455 };
+        let ownership_key = scoped_key(sa);
         write_owner(
             &store,
-            keyspace.sa_key(sa).unwrap(),
+            keyspace.scoped_sa_key(&ownership_key).unwrap(),
             "worker-a",
             StateClass::AuthoritativeSession,
         )
@@ -1156,6 +2145,7 @@ mod tests {
         let grant = fencer
             .fence_sa_owner(OwnershipFenceRequest {
                 sa,
+                ownership_key,
                 transition_id: transition_id(1),
                 fingerprint: fingerprint(1),
                 previous_fence: OwnershipFence::new(1).unwrap(),
@@ -1183,6 +2173,7 @@ mod tests {
         fencer
             .fence_sa_owner(OwnershipFenceRequest {
                 sa,
+                ownership_key,
                 transition_id: transition_id(2),
                 fingerprint: fingerprint(2),
                 previous_fence: OwnershipFence::new(2).unwrap(),
@@ -1202,9 +2193,10 @@ mod tests {
         let store = SessionStore::new(FakeSessionBackend::new());
         let keyspace = keyspace();
         let sa = SaId::Esp { spi: 0x2345_6789 };
+        let ownership_key = scoped_key(sa);
         write_owner(
             &store,
-            keyspace.sa_key(sa).unwrap(),
+            keyspace.scoped_sa_key(&ownership_key).unwrap(),
             "worker-a",
             StateClass::AuthoritativeSession,
         )
@@ -1212,6 +2204,7 @@ mod tests {
         let fencer = SessionStoreOwnershipFencer::new(store.clone(), keyspace.clone());
         let request = OwnershipFenceRequest {
             sa,
+            ownership_key,
             transition_id: transition_id(1),
             fingerprint: fingerprint(1),
             previous_fence: OwnershipFence::new(1).unwrap(),
@@ -1252,6 +2245,7 @@ mod tests {
         let returned_to_a = fencer
             .fence_sa_owner(OwnershipFenceRequest {
                 sa,
+                ownership_key,
                 transition_id: transition_id(3),
                 fingerprint: fingerprint(3),
                 previous_fence: committed.fence,
@@ -1261,7 +2255,7 @@ mod tests {
             .await
             .unwrap();
         assert!(returned_to_a.fence > request.previous_fence);
-        let key = keyspace.sa_key(sa).unwrap();
+        let key = keyspace.scoped_sa_key(&ownership_key).unwrap();
         let before_stale_replay = store.get(&key).await.unwrap().unwrap();
 
         assert!(matches!(
@@ -1283,10 +2277,15 @@ mod tests {
         );
 
         for sa in [SaId::Esp { spi: 0 }, SaId::Ike { responder_spi: 0 }] {
+            let ownership_key = match sa {
+                SaId::Esp { .. } => scoped_key(SaId::Esp { spi: 0x0100 }),
+                SaId::Ike { .. } => scoped_key(SaId::Ike { responder_spi: 1 }),
+            };
             assert!(matches!(
                 fencer
                     .fence_sa_owner(OwnershipFenceRequest {
                         sa,
+                        ownership_key,
                         transition_id: transition_id(1),
                         fingerprint: fingerprint(1),
                         previous_fence: OwnershipFence::new(1).unwrap(),
@@ -1300,6 +2299,7 @@ mod tests {
 
             let proof = OwnershipRetryProof::from_grant(&OwnershipFenceGrant {
                 sa,
+                ownership_key,
                 transition_id: transition_id(1),
                 fingerprint: fingerprint(1),
                 owner: ClusterNode::new("worker-b"),
@@ -1329,7 +2329,8 @@ mod tests {
         let sa = SaId::Ike {
             responder_spi: 0x1122_3344_5566_7788,
         };
-        let key = keyspace.sa_key(sa).unwrap();
+        let ownership_key = scoped_key(sa);
+        let key = keyspace.scoped_sa_key(&ownership_key).unwrap();
         let initial = write_owner(
             &quorum,
             key.clone(),
@@ -1342,6 +2343,7 @@ mod tests {
         let grant = fencer
             .fence_sa_owner(OwnershipFenceRequest {
                 sa,
+                ownership_key,
                 transition_id: transition_id(1),
                 fingerprint: fingerprint(1),
                 previous_fence: OwnershipFence::new(1).unwrap(),
@@ -1365,11 +2367,14 @@ mod tests {
         let fencer = SessionStoreOwnershipFencer::new(store.clone(), keyspace.clone());
         let missing_sa = SaId::Ike { responder_spi: 1 };
         let stale_sa = SaId::Ike { responder_spi: 2 };
+        let missing_key = scoped_key(missing_sa);
+        let stale_key = scoped_key(stale_sa);
 
         assert_eq!(
             fencer
                 .fence_sa_owner(OwnershipFenceRequest {
                     sa: missing_sa,
+                    ownership_key: missing_key,
                     transition_id: transition_id(1),
                     fingerprint: fingerprint(1),
                     previous_fence: OwnershipFence::new(1).unwrap(),
@@ -1381,7 +2386,7 @@ mod tests {
             IpsecLbError::NotFound
         );
 
-        let key = keyspace.sa_key(stale_sa).unwrap();
+        let key = keyspace.scoped_sa_key(&stale_key).unwrap();
         let initial = write_owner(
             &store,
             key.clone(),
@@ -1393,6 +2398,7 @@ mod tests {
             fencer
                 .fence_sa_owner(OwnershipFenceRequest {
                     sa: stale_sa,
+                    ownership_key: stale_key,
                     transition_id: transition_id(1),
                     fingerprint: fingerprint(1),
                     previous_fence: OwnershipFence::new(1).unwrap(),
@@ -1409,6 +2415,7 @@ mod tests {
             fencer
                 .fence_sa_owner(OwnershipFenceRequest {
                     sa: stale_sa,
+                    ownership_key: stale_key,
                     transition_id: transition_id(1),
                     fingerprint: fingerprint(1),
                     previous_fence: OwnershipFence::new(1).unwrap(),
@@ -1430,7 +2437,8 @@ mod tests {
         let store = SessionStore::new(FakeSessionBackend::new());
         let keyspace = keyspace();
         let sa = SaId::Esp { spi: 0x5566_7788 };
-        let key = keyspace.sa_key(sa).unwrap();
+        let ownership_key = scoped_key(sa);
+        let key = keyspace.scoped_sa_key(&ownership_key).unwrap();
         let initial = write_owner(
             &store,
             key.clone(),
@@ -1448,6 +2456,7 @@ mod tests {
                 fencer
                     .fence_sa_owner(OwnershipFenceRequest {
                         sa,
+                        ownership_key,
                         transition_id: transition_id(if owner == "worker-b" { 1 } else { 2 }),
                         fingerprint: fingerprint(if owner == "worker-b" { 1 } else { 2 }),
                         previous_fence: OwnershipFence::new(1).unwrap(),
@@ -1488,7 +2497,8 @@ mod tests {
         );
         let keyspace = keyspace();
         let sa = SaId::Esp { spi: 0x6677_8899 };
-        let key = keyspace.sa_key(sa).unwrap();
+        let ownership_key = scoped_key(sa);
+        let key = keyspace.scoped_sa_key(&ownership_key).unwrap();
         let initial = write_owner(
             &quorum,
             key.clone(),
@@ -1508,6 +2518,7 @@ mod tests {
                 fencer
                     .fence_sa_owner(OwnershipFenceRequest {
                         sa,
+                        ownership_key,
                         transition_id: transition_id(if owner == "worker-b" { 1 } else { 2 }),
                         fingerprint: fingerprint(if owner == "worker-b" { 1 } else { 2 }),
                         previous_fence: OwnershipFence::new(1).unwrap(),
@@ -1546,10 +2557,11 @@ mod tests {
         for behavior in [CasBehavior::Conflict, CasBehavior::StoreConflict] {
             let store = SessionStore::new(FakeSessionBackend::new());
             let keyspace = keyspace();
-            let sa = SaId::Esp { spi: 9 };
+            let sa = SaId::Esp { spi: 0x0109 };
+            let ownership_key = scoped_key(sa);
             write_owner(
                 &store,
-                keyspace.sa_key(sa).unwrap(),
+                keyspace.scoped_sa_key(&ownership_key).unwrap(),
                 "worker-a",
                 StateClass::AuthoritativeSession,
             )
@@ -1562,6 +2574,7 @@ mod tests {
                 fencer
                     .fence_sa_owner(OwnershipFenceRequest {
                         sa,
+                        ownership_key,
                         transition_id: transition_id(1),
                         fingerprint: fingerprint(1),
                         previous_fence: OwnershipFence::new(1).unwrap(),
@@ -1581,8 +2594,9 @@ mod tests {
     async fn commit_ambiguous_store_error_is_recoverable_without_refencing() {
         let store = SessionStore::new(FakeSessionBackend::new());
         let keyspace = keyspace();
-        let sa = SaId::Esp { spi: 12 };
-        let key = keyspace.sa_key(sa).unwrap();
+        let sa = SaId::Esp { spi: 0x010c };
+        let ownership_key = scoped_key(sa);
+        let key = keyspace.scoped_sa_key(&ownership_key).unwrap();
         write_owner(
             &store,
             key.clone(),
@@ -1597,6 +2611,7 @@ mod tests {
         let fencer = SessionStoreOwnershipFencer::new(backend, keyspace);
         let request = OwnershipFenceRequest {
             sa,
+            ownership_key,
             transition_id: transition_id(1),
             fingerprint: fingerprint(1),
             previous_fence: OwnershipFence::new(1).unwrap(),
@@ -1624,8 +2639,9 @@ mod tests {
     async fn commit_then_hung_ack_is_bounded_and_recoverable_without_refencing() {
         let store = SessionStore::new(FakeSessionBackend::new());
         let keyspace = keyspace();
-        let sa = SaId::Esp { spi: 16 };
-        let key = keyspace.sa_key(sa).unwrap();
+        let sa = SaId::Esp { spi: 0x0110 };
+        let ownership_key = scoped_key(sa);
+        let key = keyspace.scoped_sa_key(&ownership_key).unwrap();
         write_owner(
             &store,
             key.clone(),
@@ -1640,6 +2656,7 @@ mod tests {
         fencer.lease_ttl = Duration::from_millis(50);
         let request = OwnershipFenceRequest {
             sa,
+            ownership_key,
             transition_id: transition_id(1),
             fingerprint: fingerprint(1),
             previous_fence: OwnershipFence::new(1).unwrap(),
@@ -1677,10 +2694,11 @@ mod tests {
     async fn cancelling_apply_then_wait_acquire_releases_the_lease() {
         let store = SessionStore::new(FakeSessionBackend::new());
         let keyspace = keyspace();
-        let sa = SaId::Esp { spi: 14 };
+        let sa = SaId::Esp { spi: 0x010e };
+        let ownership_key = scoped_key(sa);
         write_owner(
             &store,
-            keyspace.sa_key(sa).unwrap(),
+            keyspace.scoped_sa_key(&ownership_key).unwrap(),
             "worker-a",
             StateClass::AuthoritativeSession,
         )
@@ -1692,6 +2710,7 @@ mod tests {
         let fencer = SessionStoreOwnershipFencer::new(backend, keyspace.clone());
         let request = OwnershipFenceRequest {
             sa,
+            ownership_key,
             transition_id: transition_id(1),
             fingerprint: fingerprint(1),
             previous_fence: OwnershipFence::new(1).unwrap(),
@@ -1735,10 +2754,11 @@ mod tests {
     async fn cancelled_hung_acquire_task_is_bounded_by_the_lease_ttl() {
         let store = SessionStore::new(FakeSessionBackend::new());
         let keyspace = keyspace();
-        let sa = SaId::Esp { spi: 15 };
+        let sa = SaId::Esp { spi: 0x010f };
+        let ownership_key = scoped_key(sa);
         write_owner(
             &store,
-            keyspace.sa_key(sa).unwrap(),
+            keyspace.scoped_sa_key(&ownership_key).unwrap(),
             "worker-a",
             StateClass::AuthoritativeSession,
         )
@@ -1749,6 +2769,7 @@ mod tests {
         fencer.lease_ttl = Duration::from_millis(50);
         let request = OwnershipFenceRequest {
             sa,
+            ownership_key,
             transition_id: transition_id(1),
             fingerprint: fingerprint(1),
             previous_fence: OwnershipFence::new(1).unwrap(),
@@ -1803,10 +2824,11 @@ mod tests {
     async fn cancelling_a_pending_cas_releases_the_lease_for_immediate_replay() {
         let store = SessionStore::new(FakeSessionBackend::new());
         let keyspace = keyspace();
-        let sa = SaId::Esp { spi: 13 };
+        let sa = SaId::Esp { spi: 0x010d };
+        let ownership_key = scoped_key(sa);
         write_owner(
             &store,
-            keyspace.sa_key(sa).unwrap(),
+            keyspace.scoped_sa_key(&ownership_key).unwrap(),
             "worker-a",
             StateClass::AuthoritativeSession,
         )
@@ -1817,6 +2839,7 @@ mod tests {
         let fencer = SessionStoreOwnershipFencer::new(backend, keyspace.clone());
         let request = OwnershipFenceRequest {
             sa,
+            ownership_key,
             transition_id: transition_id(1),
             fingerprint: fingerprint(1),
             previous_fence: OwnershipFence::new(1).unwrap(),
@@ -1867,8 +2890,9 @@ mod tests {
     async fn committed_grant_does_not_wait_for_release_completion() {
         let store = SessionStore::new(FakeSessionBackend::new());
         let keyspace = keyspace();
-        let sa = SaId::Esp { spi: 10 };
-        let key = keyspace.sa_key(sa).unwrap();
+        let sa = SaId::Esp { spi: 0x010a };
+        let ownership_key = scoped_key(sa);
+        let key = keyspace.scoped_sa_key(&ownership_key).unwrap();
         write_owner(
             &store,
             key.clone(),
@@ -1883,6 +2907,7 @@ mod tests {
         let grant = fencer
             .fence_sa_owner(OwnershipFenceRequest {
                 sa,
+                ownership_key,
                 transition_id: transition_id(1),
                 fingerprint: fingerprint(1),
                 previous_fence: OwnershipFence::new(1).unwrap(),
@@ -1905,8 +2930,9 @@ mod tests {
     async fn hung_release_cannot_hide_an_already_committed_grant() {
         let store = SessionStore::new(FakeSessionBackend::new());
         let keyspace = keyspace();
-        let sa = SaId::Esp { spi: 11 };
-        let key = keyspace.sa_key(sa).unwrap();
+        let sa = SaId::Esp { spi: 0x010b };
+        let ownership_key = scoped_key(sa);
+        let key = keyspace.scoped_sa_key(&ownership_key).unwrap();
         write_owner(
             &store,
             key.clone(),
@@ -1922,6 +2948,7 @@ mod tests {
             Duration::from_millis(100),
             fencer.fence_sa_owner(OwnershipFenceRequest {
                 sa,
+                ownership_key,
                 transition_id: transition_id(1),
                 fingerprint: fingerprint(1),
                 previous_fence: OwnershipFence::new(1).unwrap(),
@@ -1961,12 +2988,18 @@ mod tests {
             expires_at: None,
             payload: EncryptedSessionPayload::new([]),
         };
-        assert_eq!(validate_ownership_record(&valid, &expected_key), Ok(None));
+        assert_eq!(
+            validate_ownership_record(&valid, &expected_key),
+            Ok(OwnershipRecordState::Unbound)
+        );
         let mut transitioned = valid.clone();
         transitioned.payload = encode_ownership_transition(transition_id(7), fingerprint(9));
         assert_eq!(
             validate_ownership_record(&transitioned, &expected_key),
-            Ok(Some((transition_id(7), fingerprint(9))))
+            Ok(OwnershipRecordState::Active {
+                transition_id: transition_id(7),
+                fingerprint: fingerprint(9),
+            })
         );
 
         let mut wrong_record_key = valid.clone();

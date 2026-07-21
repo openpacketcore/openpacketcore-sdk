@@ -24,6 +24,7 @@ use std::num::{NonZeroU128, NonZeroU64};
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
+use tokio::sync::oneshot;
 
 use crate::model::sa_uses_esn;
 use crate::namespace::{NamespaceActorBinding, NamespaceBoundLinuxXfrmBackend};
@@ -305,8 +306,69 @@ pub enum EspCounterProofRequirement {
     BeforeOwnershipCommit,
     /// Immediately before publishing the first successor steering entry.
     BeforeFirstPublication,
-    /// After ownership is already committed; the counter may have advanced.
+    /// After ownership is already committed; the counter may advance but must
+    /// never regress below the receipt's issuance watermark.
     CommittedRecovery,
+}
+
+/// Opaque actor-wide lease for one steering-publication attempt.
+///
+/// The namespace actor issues this only after revalidating the exact live
+/// receipt and kernel state. While the value is alive, that actor remains
+/// blocked, so no SDK mutation can invalidate the receipt between validation
+/// and publication. Dropping the value releases the actor. The actor lease has
+/// no automatic release because that could reopen the race while a detached
+/// Host mutation is still executing; the final publication cut nevertheless
+/// fails closed when the receipt's bounded freshness deadline has elapsed.
+///
+/// This lease is single-use, non-cloneable, non-serializable, and contains no
+/// key, SPI, counter, address, or namespace identifier.
+#[must_use = "dropping the publication guard releases the XFRM mutation gate"]
+pub struct EspCounterPublicationGuard {
+    release: Option<oneshot::Sender<()>>,
+    expires_at: Instant,
+}
+
+impl EspCounterPublicationGuard {
+    pub(crate) const fn new(release: oneshot::Sender<()>, expires_at: Instant) -> Self {
+        Self {
+            release: Some(release),
+            expires_at,
+        }
+    }
+
+    /// Execute the single fence-last publication cut while the actor remains
+    /// blocked, rejecting an attempt that has crossed the receipt deadline.
+    ///
+    /// The guard is consumed and remains live until `publication` returns.
+    /// Callers must perform only the final externally visible publication and
+    /// its exact readback inside this closure; preparatory staging belongs
+    /// before this boundary.
+    pub fn publish<E>(
+        self,
+        publication: impl FnOnce() -> Result<(), E>,
+    ) -> Result<Result<(), E>, EspCounterResumeError> {
+        if Instant::now() >= self.expires_at {
+            return Err(EspCounterResumeError::ProofUnavailable {
+                code: "esp_counter_publication_guard_expired",
+            });
+        }
+        Ok(publication())
+    }
+}
+
+impl Drop for EspCounterPublicationGuard {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+    }
+}
+
+impl fmt::Debug for EspCounterPublicationGuard {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("EspCounterPublicationGuard(<redacted>)")
+    }
 }
 
 /// Opaque evidence issued only by the namespace-bound Linux actor.
@@ -352,6 +414,23 @@ impl AppliedEspCounterReceipt {
         }
         self.backend
             .validate_outbound_esp_counter_receipt(self.binding, requirement)
+            .await
+    }
+
+    async fn acquire_publication_guard(
+        &self,
+        expected_target: &OutboundEspCounterTarget,
+        requirement: EspCounterProofRequirement,
+    ) -> Result<EspCounterPublicationGuard, EspCounterResumeError> {
+        if !self.target.matches(expected_target)
+            || self.binding.outbound_sa != expected_target.outbound_sa
+        {
+            return Err(EspCounterResumeError::ProofUnavailable {
+                code: "esp_counter_receipt_target_mismatch",
+            });
+        }
+        self.backend
+            .acquire_outbound_esp_counter_publication_guard(self.binding, requirement)
             .await
     }
 }
@@ -424,6 +503,30 @@ impl EspCounterResumeProofSet {
                     code: "esp_counter_receipt_absent_or_stale",
                 })?;
         receipt.validate(expected_target, requirement).await
+    }
+
+    /// Revalidate one exact receipt and hold its namespace actor across one
+    /// cancellation-safe steering-publication attempt.
+    ///
+    /// The returned guard must be moved into the component that owns the
+    /// actual publication, rather than retained only by the awaiting caller.
+    /// This ensures cancellation cannot release the XFRM mutation gate while
+    /// a detached blocking publication continues.
+    pub async fn acquire_publication_guard(
+        &self,
+        expected_target: &OutboundEspCounterTarget,
+        binding: EspCounterResumeBinding,
+        requirement: EspCounterProofRequirement,
+    ) -> Result<EspCounterPublicationGuard, EspCounterResumeError> {
+        let receipt =
+            self.receipts
+                .get(&binding)
+                .ok_or(EspCounterResumeError::ProofUnavailable {
+                    code: "esp_counter_receipt_absent_or_stale",
+                })?;
+        receipt
+            .acquire_publication_guard(expected_target, requirement)
+            .await
     }
 }
 
@@ -528,7 +631,6 @@ enum ReceiptAuthority {
 struct CounterReceiptRecord {
     binding: EspCounterResumeBinding,
     expectation: OutboundSaPolicyExpectation,
-    requested_last: u64,
     observed_last: u64,
     esn: bool,
     authority: ReceiptAuthority,
@@ -584,7 +686,6 @@ impl EspCounterReceiptRegistry {
         let record = CounterReceiptRecord {
             binding: request.binding,
             expectation,
-            requested_last: request.binding.requested_last_assigned(),
             observed_last,
             esn,
             authority: ReceiptAuthority::Applied,
@@ -640,7 +741,6 @@ impl EspCounterReceiptRegistry {
         let record = CounterReceiptRecord {
             binding: request.binding,
             expectation,
-            requested_last,
             observed_last,
             esn,
             authority: ReceiptAuthority::CommittedRecoveryOnly,
@@ -664,6 +764,21 @@ impl EspCounterReceiptRegistry {
     ) -> Result<(), EspCounterResumeError> {
         self.validate_with_clock(backend, binding, requirement, Instant::now)
             .await
+    }
+
+    pub(crate) async fn validate_for_publication(
+        &mut self,
+        backend: &LinuxXfrmBackend,
+        binding: EspCounterResumeBinding,
+        requirement: EspCounterProofRequirement,
+    ) -> Result<Instant, EspCounterResumeError> {
+        self.validate(backend, binding, requirement).await?;
+        self.records
+            .get(&binding)
+            .map(|record| record.expires_at)
+            .ok_or(EspCounterResumeError::ProofUnavailable {
+                code: "esp_counter_receipt_absent_or_stale",
+            })
     }
 
     async fn validate_with_clock<C>(
@@ -927,9 +1042,9 @@ async fn validate_receipt_readback(
                 code: "esp_counter_receipt_exact_state_changed",
             })
         }
-        EspCounterProofRequirement::CommittedRecovery if observed_last < record.requested_last => {
+        EspCounterProofRequirement::CommittedRecovery if observed_last < record.observed_last => {
             Err(EspCounterResumeError::ReadbackRejected {
-                code: "esp_counter_receipt_below_applied_floor",
+                code: "esp_counter_receipt_below_issuance_watermark",
             })
         }
         EspCounterProofRequirement::BeforeOwnershipCommit
@@ -994,11 +1109,34 @@ pub(crate) fn map_backend_error(error: XfrmError) -> EspCounterResumeError {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Condvar, Mutex};
 
     use super::*;
+
+    #[test]
+    fn expired_publication_guard_never_runs_the_publication_cut() {
+        let (release, _held) = oneshot::channel();
+        let guard = EspCounterPublicationGuard::new(
+            release,
+            Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("test instant supports one-second subtraction"),
+        );
+        let called = Cell::new(false);
+
+        let error = guard
+            .publish(|| {
+                called.set(true);
+                Ok::<(), ()>(())
+            })
+            .unwrap_err();
+
+        assert_eq!(error.code(), "esp_counter_publication_guard_expired");
+        assert!(!called.get());
+    }
     use crate::linux::{
         test_outbound_binding_readback_bodies, LinuxXfrmBackendConfig, LinuxXfrmTransport,
         SensitiveBuffer,
@@ -1303,7 +1441,6 @@ mod tests {
         let record = CounterReceiptRecord {
             binding,
             expectation,
-            requested_last: 49,
             observed_last: 49,
             esn: true,
             authority,

@@ -115,10 +115,11 @@ jobs:
       # under concurrent raw map access; graceful cross-process bpf-link
       # handoff under continuous traffic with no verdict gap; and
       # SIGKILL/restart behavior with owner flushing and persisted-fence
-      # enforcement. It also fault-cuts every v1/v4 map-unlink boundary,
-      # rejects active-map aliases without link mutation, preserves unique
-      # maximum fence evidence, and migrates a frozen v3 link/map artifact to
-      # the current v4 hash-map ABI.
+      # enforcement. It also fault-cuts the current global and
+      # destination-scoped v5 cleanup order plus legacy-v1 map-unlink
+      # boundaries, rejects active-map aliases without link mutation,
+      # preserves unique maximum fence evidence, and migrates a frozen v3
+      # link/map artifact to the current v5 destination-scoped fence ABI.
       - name: Run privileged XDP test in a fresh netns
         run: |
           set -euo pipefail
@@ -184,7 +185,7 @@ jobs:
           inventory "${rebuilt}" > rebuilt.inventory
           cat rebuilt.inventory
           diff -u committed.inventory rebuilt.inventory
-          for symbol in opc_ipsec_lb_xdp IPSEC_LB_OWNERS IPSEC_LB_CONFIG IPSEC_LB_FENCE IPSEC_LB_COUNTERS; do
+          for symbol in opc_ipsec_lb_xdp IPSEC_LB_OWNERS IPSEC_LB_CONFIG IPSEC_LB_FENCE IPSEC_LB_KEY_FENCES IPSEC_LB_COUNTERS; do
             grep -q " ${symbol}$" committed.inventory
           done
           for section in .text xdp maps .BTF .BTF.ext .relxdp .rel.BTF .rel.BTF.ext; do

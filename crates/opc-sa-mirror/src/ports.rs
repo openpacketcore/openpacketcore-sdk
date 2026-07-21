@@ -101,8 +101,10 @@ pub struct LiveMirroredTakeover {
 ///
 /// Methods are synchronous by contract: a conforming holder keeps keymat in
 /// local process memory, so yielding it performs no I/O. Yielding does not
-/// grant ownership — the caller must still win the ordinary fenced re-pin
-/// (`RePinCoordinator`), which remains the only split-brain authority.
+/// grant ownership. For ESP the caller must first install the yielded keymat,
+/// apply/read back the restored counter through `opc-ipsec-xfrm`, and supply
+/// that live receipt/target pair to the ordinary fenced `RePinCoordinator`.
+/// The coordinator remains the only split-brain authority.
 pub trait StandbyKeymatSource: Send + Sync + fmt::Debug {
     /// Remove and yield the mirrored keymat for `sa` with validated resume
     /// evidence.

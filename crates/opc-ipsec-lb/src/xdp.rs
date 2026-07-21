@@ -43,11 +43,13 @@
 //! the old or new 16-byte owner/generation value, never a mixed pair. Strict
 //! decoding separately rejects structurally invalid values.
 //!
-//! The ownership fence generation lives in its own single-entry hash map, so
-//! replacement similarly publishes an old-or-new `u64`. Attach adopts pinned
-//! maps across process restarts but flushes the owner map and rewrites the
-//! config before the program is attached; the persisted fence is honored so
-//! entries installed by a crashed owner cannot be re-armed.
+//! The legacy global fence and destination-scoped fences live in separate
+//! maps, so each replacement publishes an old-or-new `u64`. Attach adopts
+//! pinned maps across process restarts without re-arming them: global mode
+//! stages no owners, while destination-scoped mode turns every complete
+//! owner/fence pair into a stale owner-only activation witness and preserves
+//! owner-only or fence-only conflict witnesses. The config and normalized
+//! recovery state are read back before the program is attached.
 //!
 //! The per-interface directory and its `control` subdirectory are permanent
 //! lifecycle-lock identity. Operators must never remove or rename either
@@ -59,26 +61,35 @@
 //! are close-on-exec, but a raw `fork` child that neither `exec`s nor closes
 //! inherited descriptors retains the lease and is unsupported.
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::io;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use async_trait::async_trait;
 use opc_ipsec_lb_ebpf_common::{
-    XdpDatapathConfig, XdpOwnerValue, CONFIG_KEY, CONFIG_VALUE_LEN, COUNTER_ERROR, COUNTER_LOCAL,
-    COUNTER_MISS, COUNTER_NATT_KEEPALIVE, COUNTER_PASS_NON_SWU, COUNTER_REDIRECT, COUNTER_SLOTS,
-    COUNTER_STALE, COUNTER_UNCLASSIFIABLE, FENCE_KEY, MAP_CONFIG, MAP_COUNTERS, MAP_FENCE,
-    MAP_OWNERS, OWNERSHIP_KEY_MAX_ENCODED_BYTES, OWNER_KEY_LEN, OWNER_VALUE_LEN, PROG_SWU_XDP,
-    XDP_CONFIG_ABI_VERSION, XDP_MIN_KERNEL_RELEASE,
+    XdpDatapathConfig, XdpFenceMode, XdpOwnerValue, CONFIG_KEY, CONFIG_VALUE_LEN, COUNTER_ERROR,
+    COUNTER_LOCAL, COUNTER_MISS, COUNTER_NATT_KEEPALIVE, COUNTER_PASS_NON_SWU, COUNTER_REDIRECT,
+    COUNTER_SLOTS, COUNTER_STALE, COUNTER_UNCLASSIFIABLE, FENCE_KEY, MAP_CONFIG, MAP_COUNTERS,
+    MAP_FENCE, MAP_KEY_FENCES, MAP_OWNERS, OWNERSHIP_KEY_MAX_ENCODED_BYTES, OWNER_KEY_LEN,
+    OWNER_VALUE_LEN, PROG_SWU_XDP, XDP_CONFIG_ABI_VERSION, XDP_MIN_KERNEL_RELEASE,
 };
+use sha2::{Digest, Sha256};
 
 use crate::error::IpsecLbError;
 use crate::model::{ShardId, SteeringBackendKind, SteeringProbe};
 use crate::ownership::{RoutingDomainTag, SessionOwnershipKey};
+use crate::ports::{RePinSteeringBackend, RePinSteeringRetirementBackend};
+use crate::repin::{OwnershipRetirementGrant, RePinSteeringOperationPermit, RePinSteeringUpdate};
 
 /// Default bpffs directory under which per-interface map pins are created.
 pub const DEFAULT_BPFFS_PIN_ROOT: &str = "/sys/fs/bpf/opc-ipsec-lb";
+
+/// Fixed bound on process-local per-key operation serialization state.
+const REPIN_OPERATION_STRIPES: usize = 256;
 
 /// Runtime behavior for the Host-XDP steering backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -171,9 +182,10 @@ pub(crate) trait HostXdpRuntime: Send + Sync + fmt::Debug {
     /// Load the pinned maps, write the datapath config, and attach the XDP
     /// program for `interface`.
     ///
-    /// Implementations must flush the owner map when adopting pre-existing
-    /// pins and write `config` before the program is attached, so the
-    /// datapath never verdicts with a previous process's state.
+    /// Implementations must normalize every adopted owner into a non-live
+    /// state and write `config` before the program is attached. Global mode
+    /// stages no owners; destination-scoped mode may retain owner-only or
+    /// fence-only recovery witnesses, but never a live pair.
     fn attach(
         &self,
         interface: &str,
@@ -184,8 +196,9 @@ pub(crate) trait HostXdpRuntime: Send + Sync + fmt::Debug {
         lease: Box<dyn HostXdpLifecycleLock>,
     ) -> Result<(), IpsecLbError>;
 
-    /// Quiesce owner mutation, empty and verify the owner map, pin a duplicate
-    /// reference to the live link, and release the lifetime lease.
+    /// Quiesce owner mutation, make every owner record non-live and verify the
+    /// recovery witnesses, pin a duplicate reference to the live link, and
+    /// release the lifetime lease.
     fn prepare_upgrade_handoff(
         &self,
         ifindex: u32,
@@ -244,6 +257,46 @@ pub(crate) trait HostXdpRuntime: Send + Sync + fmt::Debug {
 
     /// Write the ownership fence generation.
     fn fence_write(&self, ifindex: u32, generation: u64) -> Result<(), IpsecLbError>;
+
+    /// Read one destination-scoped ownership fence generation.
+    fn key_fence_read(
+        &self,
+        ifindex: u32,
+        key: [u8; OWNER_KEY_LEN],
+    ) -> Result<Option<u64>, IpsecLbError>;
+
+    /// Publish one destination-scoped ownership fence generation.
+    fn key_fence_write(
+        &self,
+        ifindex: u32,
+        key: [u8; OWNER_KEY_LEN],
+        generation: u64,
+    ) -> Result<(), IpsecLbError>;
+
+    /// Remove one destination-scoped ownership fence; returns whether it existed.
+    ///
+    /// This is deliberately private to the runtime boundary. Public callers
+    /// cannot delete fencing evidence outside the backend's fail-closed
+    /// activation and retirement protocols.
+    fn key_fence_remove(
+        &self,
+        ifindex: u32,
+        key: [u8; OWNER_KEY_LEN],
+    ) -> Result<bool, IpsecLbError>;
+
+    /// Remove and prove absent the current v5 config entry, forcing every
+    /// packet through the datapath's fail-closed missing-config path.
+    ///
+    /// This is an emergency backend-wide cut used only when an indeterminate
+    /// dual map failure could otherwise leave an old owner/fence pair live.
+    fn quiesce_repin(&self, ifindex: u32) -> Result<(), IpsecLbError>;
+
+    /// Prove that pinned state can be admitted or migrated for keyed re-pin.
+    fn repin_pins_feasible(
+        &self,
+        pin_dir: &Path,
+        config: &[u8; CONFIG_VALUE_LEN],
+    ) -> Result<(), IpsecLbError>;
 
     /// Read the aggregated per-CPU per-verdict counters.
     fn counters_read(&self, ifindex: u32) -> Result<[u64; COUNTER_SLOTS as usize], IpsecLbError>;
@@ -325,6 +378,27 @@ pub enum HostXdpAttachMode {
     Generic,
 }
 
+/// Ownership-generation domain enforced by the Host-XDP writer.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HostXdpFenceDomain {
+    /// Legacy deployment-wide floor advanced explicitly with
+    /// [`HostXdpSteeringBackend::advance_fence`].
+    #[default]
+    Global,
+    /// Independent monotonic generations for each destination-scoped key.
+    ///
+    /// The backend holds the exclusive per-interface lifecycle lease and
+    /// resets the legacy global datapath floor to zero. Restart recovery keeps
+    /// exact owner identities but withholds their per-key fence, so every
+    /// recovered entry remains stale until the same authoritative transition
+    /// completes fence-last activation. Generation regression and ambiguous
+    /// same-generation ownership fail closed. This domain is required by
+    /// [`crate::RePinCoordinator`] because one session contains multiple
+    /// independently fenced SAs.
+    PerOwnershipKey,
+}
+
 fn mode_accepts_live(configured: HostXdpAttachMode, live: Option<HostXdpAttachMode>) -> bool {
     matches!(
         (configured, live),
@@ -344,6 +418,8 @@ pub struct HostXdpSteeringBackendConfig {
     /// Routing-domain tag mixed into every ownership key. Installed owner
     /// records must carry the same tag.
     pub routing_domain: RoutingDomainTag,
+    /// Generation domain for owner replacement.
+    pub fence_domain: HostXdpFenceDomain,
     /// Channel for remote-owned packets. The default is [`HostXdpRedirectHandoff::Disabled`];
     /// production redirect requires an explicit interface.
     pub redirect_handoff: HostXdpRedirectHandoff,
@@ -357,9 +433,25 @@ impl Default for HostXdpSteeringBackendConfig {
             bpffs_pin_root: PathBuf::from(DEFAULT_BPFFS_PIN_ROOT),
             self_shard: ShardId::new(1),
             routing_domain: RoutingDomainTag::new(0),
+            fence_domain: HostXdpFenceDomain::Global,
             redirect_handoff: HostXdpRedirectHandoff::Disabled,
             attach_mode: HostXdpAttachMode::default(),
         }
+    }
+}
+
+impl HostXdpSteeringBackendConfig {
+    /// Select destination-scoped fencing required by same-SPI re-pin.
+    ///
+    /// The default remains the legacy global floor for compatibility. A
+    /// composition root that wires [`crate::RePinCoordinator`] to Host-XDP
+    /// must opt in through this constructor and admit
+    /// [`HostXdpSteeringBackend::probe_repin`] rather than the generic
+    /// steering probe.
+    #[must_use]
+    pub fn for_destination_scoped_repin(mut self) -> Self {
+        self.fence_domain = HostXdpFenceDomain::PerOwnershipKey;
+        self
     }
 }
 
@@ -369,6 +461,7 @@ impl fmt::Debug for HostXdpSteeringBackendConfig {
             .field("bpffs_pin_root", &"<redacted>")
             .field("self_shard", &"<redacted>")
             .field("routing_domain", &"<redacted>")
+            .field("fence_domain", &self.fence_domain)
             .field("redirect_handoff", &self.redirect_handoff)
             .field("attach_mode", &self.attach_mode)
             .finish()
@@ -466,7 +559,35 @@ struct HostXdpSteeringBackendInner {
     runtime: Arc<dyn HostXdpRuntime>,
     config: HostXdpSteeringBackendConfig,
     operation_gate: Mutex<()>,
+    repin_identity: Arc<()>,
+    repin_stripes: Vec<Arc<HostXdpRePinStripe>>,
     state: Mutex<HostXdpState>,
+}
+
+struct HostXdpRePinStripe {
+    gate: Arc<tokio::sync::Mutex<()>>,
+    poisoned: AtomicBool,
+}
+
+struct HostXdpRePinPermitEvidence {
+    backend_identity: Arc<()>,
+    stripe: Arc<HostXdpRePinStripe>,
+    ownership_key: SessionOwnershipKey,
+    _guards: Arc<HostXdpRePinGuardSet>,
+    poison_if_unclassified: bool,
+    retirement_classified: bool,
+}
+
+struct HostXdpRePinGuardSet {
+    _guards: Vec<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl Drop for HostXdpRePinPermitEvidence {
+    fn drop(&mut self) {
+        if self.poison_if_unclassified && !self.retirement_classified {
+            self.stripe.poisoned.store(true, Ordering::Release);
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -559,12 +680,22 @@ impl HostXdpSteeringBackend {
         runtime: Arc<dyn HostXdpRuntime>,
         config: HostXdpSteeringBackendConfig,
     ) -> Self {
+        let repin_stripes = (0..REPIN_OPERATION_STRIPES)
+            .map(|_| {
+                Arc::new(HostXdpRePinStripe {
+                    gate: Arc::new(tokio::sync::Mutex::new(())),
+                    poisoned: AtomicBool::new(false),
+                })
+            })
+            .collect();
         Self {
             inner: Arc::new(HostXdpSteeringBackendInner {
                 interface: interface.into(),
                 runtime,
                 config,
                 operation_gate: Mutex::new(()),
+                repin_identity: Arc::new(()),
+                repin_stripes,
                 state: Mutex::new(HostXdpState::default()),
             }),
         }
@@ -599,12 +730,13 @@ impl HostXdpSteeringBackend {
     /// Prepare a terminal, fail-closed handoff to a newer SDK process.
     ///
     /// The backend stops accepting ownership mutations, drains the serialized
-    /// mutation boundary, empties and verifies the owner map so every SWu
-    /// packet takes the userspace slow path, pins a duplicate reference to the
-    /// live XDP link, and releases its per-interface lifetime lease. The old
-    /// process must keep its userspace slow path available until the new
-    /// process reports readiness. This backend cannot be resumed after a
-    /// successful call.
+    /// mutation boundary, and verifies every owner is non-live. Global mode
+    /// empties the owner map; destination-scoped mode removes matching fences
+    /// and retains owner-only recovery witnesses. It then pins a duplicate
+    /// reference to the live XDP link and releases its per-interface lifetime
+    /// lease. The old process must keep its userspace slow path available until
+    /// the new process reports readiness. This backend cannot be resumed after
+    /// a successful call.
     pub async fn prepare_upgrade_handoff(&self) -> Result<(), IpsecLbError> {
         self.run_blocking("host_xdp_prepare_upgrade_handoff", |backend| {
             backend.prepare_upgrade_handoff_sync()
@@ -617,7 +749,7 @@ impl HostXdpSteeringBackend {
     ///
     /// The handoff link, attached program, interface, and datapath identity are
     /// validated before mutation. A fresh bounded map namespace is initialized
-    /// with the non-regressing migrated fence and no owners before
+    /// with non-regressing, non-live recovery witnesses before
     /// `BPF_LINK_UPDATE`; packets therefore observe either the old verdict or a
     /// fail-closed map-miss slow-path verdict. A foreign occupied hook is never
     /// adopted.
@@ -663,7 +795,12 @@ impl HostXdpSteeringBackend {
         .await
     }
 
-    /// Remove the owner record for one ownership key.
+    /// Remove one legacy/global-fence owner record.
+    ///
+    /// Destination-scoped mode rejects this unfenced operation. Keyed owner
+    /// and fence retirement requires the authoritative durable retirement
+    /// boundary; deleting only the owner would leak fencing state and make a
+    /// partial failure impossible to recover safely.
     pub async fn remove_owner(&self, key: &SessionOwnershipKey) -> Result<(), IpsecLbError> {
         let key = *key;
         self.run_blocking("host_xdp_remove_owner", move |backend| {
@@ -688,6 +825,180 @@ impl HostXdpSteeringBackend {
         .await
     }
 
+    /// Converge one coordinator-issued fenced re-pin owner and verify exact
+    /// kernel-map readback before reporting success.
+    ///
+    /// The operation first removes and proves the keyed fence absent, then
+    /// removes the old owner, stages and reads back the new owner while fence
+    /// absence keeps the datapath stale, and finally publishes and reads back
+    /// the exact destination-scoped fence as the activation point. Every step
+    /// runs under the same serialized writer gate. Equal-generation conflicts
+    /// retain a non-live map witness so the same grant can never overwrite a
+    /// different owner. Exact retry is idempotent.
+    pub async fn apply_fenced_repin_owner(
+        &self,
+        update: RePinSteeringUpdate,
+        permit: RePinSteeringOperationPermit,
+    ) -> Result<RePinSteeringOperationPermit, IpsecLbError> {
+        self.run_blocking("host_xdp_apply_fenced_repin_owner", move |backend| {
+            backend.apply_fenced_repin_owner_sync(update, permit)
+        })
+        .await
+    }
+
+    async fn acquire_host_repin_permit(
+        &self,
+        ownership_key: SessionOwnershipKey,
+    ) -> Result<RePinSteeringOperationPermit, IpsecLbError> {
+        self.validate_repin_key(&ownership_key)?;
+        let stripe = self.repin_stripe(&ownership_key);
+        if stripe.poisoned.load(Ordering::Acquire) {
+            return Err(IpsecLbError::adapter_contract_violation(
+                "host_xdp_repin_operation_stripe_poisoned",
+            ));
+        }
+        let guard = Arc::clone(&stripe.gate).lock_owned().await;
+        if stripe.poisoned.load(Ordering::Acquire) {
+            return Err(IpsecLbError::adapter_contract_violation(
+                "host_xdp_repin_operation_stripe_poisoned",
+            ));
+        }
+        let guards = Arc::new(HostXdpRePinGuardSet {
+            _guards: vec![guard],
+        });
+        let evidence = HostXdpRePinPermitEvidence {
+            backend_identity: Arc::clone(&self.inner.repin_identity),
+            stripe,
+            ownership_key,
+            _guards: guards,
+            poison_if_unclassified: false,
+            retirement_classified: false,
+        };
+        let permit = RePinSteeringOperationPermit::guarded(ownership_key, evidence);
+        self.run_blocking("host_xdp_repin_permit_preflight", move |backend| {
+            backend.ensure_repin_ready_sync(&ownership_key)?;
+            Ok(permit)
+        })
+        .await
+    }
+
+    async fn acquire_host_repin_retirement_permits(
+        &self,
+        ownership_keys: Vec<SessionOwnershipKey>,
+    ) -> Result<Vec<RePinSteeringOperationPermit>, IpsecLbError> {
+        if ownership_keys.is_empty()
+            || ownership_keys.len() > crate::session_repin::MAX_SESSION_REPIN_SAS
+        {
+            return Err(IpsecLbError::invalid_config(
+                "session_repin.ownership_keys",
+                "retirement permit batch is empty or exceeds the session bound",
+            ));
+        }
+        let mut unique_keys = BTreeSet::new();
+        for key in &ownership_keys {
+            self.validate_repin_key(key)?;
+            if !unique_keys.insert(*key) {
+                return Err(IpsecLbError::adapter_contract_violation(
+                    "host_xdp_repin_retirement_duplicate_key",
+                ));
+            }
+        }
+        let mut stripe_indexes = ownership_keys
+            .iter()
+            .map(|key| self.repin_stripe_index(key))
+            .collect::<Vec<_>>();
+        stripe_indexes.sort_unstable();
+        stripe_indexes.dedup();
+
+        for index in &stripe_indexes {
+            if self.inner.repin_stripes[*index]
+                .poisoned
+                .load(Ordering::Acquire)
+            {
+                return Err(IpsecLbError::adapter_contract_violation(
+                    "host_xdp_repin_operation_stripe_poisoned",
+                ));
+            }
+        }
+        let mut guards = Vec::with_capacity(stripe_indexes.len());
+        for index in &stripe_indexes {
+            guards.push(
+                Arc::clone(&self.inner.repin_stripes[*index])
+                    .gate
+                    .clone()
+                    .lock_owned()
+                    .await,
+            );
+        }
+        for index in &stripe_indexes {
+            if self.inner.repin_stripes[*index]
+                .poisoned
+                .load(Ordering::Acquire)
+            {
+                return Err(IpsecLbError::adapter_contract_violation(
+                    "host_xdp_repin_operation_stripe_poisoned",
+                ));
+            }
+        }
+
+        let guards = Arc::new(HostXdpRePinGuardSet { _guards: guards });
+        let mut permits = Vec::with_capacity(ownership_keys.len());
+        for key in ownership_keys {
+            let evidence = HostXdpRePinPermitEvidence {
+                backend_identity: Arc::clone(&self.inner.repin_identity),
+                stripe: self.repin_stripe(&key),
+                ownership_key: key,
+                _guards: Arc::clone(&guards),
+                poison_if_unclassified: false,
+                retirement_classified: false,
+            };
+            permits.push(RePinSteeringOperationPermit::guarded(key, evidence));
+        }
+
+        if let Some(first) = permits.first() {
+            let key = first.ownership_key();
+            self.run_blocking("host_xdp_repin_permit_preflight", move |backend| {
+                backend.ensure_repin_ready_sync(&key)?;
+                Ok(())
+            })
+            .await?;
+        }
+        Ok(permits)
+    }
+
+    fn validate_repin_key(&self, key: &SessionOwnershipKey) -> Result<(), IpsecLbError> {
+        if key.destination().routing_domain() != self.inner.config.routing_domain {
+            return Err(IpsecLbError::invalid_config(
+                "ownership.routing_domain",
+                "ownership key routing domain does not match the backend",
+            ));
+        }
+        if self.inner.config.fence_domain != HostXdpFenceDomain::PerOwnershipKey {
+            return Err(IpsecLbError::invalid_config(
+                "fence_domain",
+                "same-SPI re-pin requires destination-scoped datapath fencing",
+            ));
+        }
+        Ok(())
+    }
+
+    fn repin_stripe(&self, key: &SessionOwnershipKey) -> Arc<HostXdpRePinStripe> {
+        Arc::clone(&self.inner.repin_stripes[self.repin_stripe_index(key)])
+    }
+
+    fn repin_stripe_index(&self, key: &SessionOwnershipKey) -> usize {
+        let digest = Sha256::digest(key.to_canonical_bytes());
+        let mut prefix = [0_u8; 8];
+        prefix.copy_from_slice(&digest[..8]);
+        (u64::from_be_bytes(prefix) % self.inner.repin_stripes.len() as u64) as usize
+    }
+
+    fn ensure_repin_ready_sync(&self, key: &SessionOwnershipKey) -> Result<(), IpsecLbError> {
+        self.validate_repin_key(key)?;
+        let _operation = self.operation_gate()?;
+        self.ensure_attached_under_gate().map(|_| ())
+    }
+
     /// Advance the ownership fence generation.
     ///
     /// Entries older than the fence are stale and handed to the slow path.
@@ -710,6 +1021,18 @@ impl HostXdpSteeringBackend {
     pub async fn probe(&self) -> Result<SteeringProbe, IpsecLbError> {
         self.run_blocking("host_xdp_probe", |backend| Ok(backend.probe_sync()))
             .await
+    }
+
+    /// Probe the exact destination-scoped re-pin composition path.
+    ///
+    /// This is stricter than [`Self::probe`]: Global fence mode, a foreign
+    /// attachment, an unavailable lifecycle lease, or pinned-state migration
+    /// that cannot preserve keyed evidence reports `mutation_ready = false`.
+    pub async fn probe_repin(&self) -> Result<SteeringProbe, IpsecLbError> {
+        self.run_blocking("host_xdp_repin_probe", |backend| {
+            Ok(backend.probe_repin_sync())
+        })
+        .await
     }
 
     async fn run_blocking<T, F>(&self, operation: &'static str, f: F) -> Result<T, IpsecLbError>
@@ -748,6 +1071,10 @@ impl HostXdpSteeringBackend {
 
     fn datapath_config(&self) -> [u8; CONFIG_VALUE_LEN] {
         XdpDatapathConfig {
+            fence_mode: match self.inner.config.fence_domain {
+                HostXdpFenceDomain::Global => XdpFenceMode::Global,
+                HostXdpFenceDomain::PerOwnershipKey => XdpFenceMode::PerOwnershipKey,
+            },
             self_shard: self.inner.config.self_shard.get(),
             routing_domain: self.inner.config.routing_domain.get(),
             handoff_ifindex: self.inner.config.redirect_handoff.ifindex(),
@@ -838,10 +1165,10 @@ impl HostXdpSteeringBackend {
         if self.inner.runtime.attached_prog_id(ifindex)?.is_some() {
             return Err(IpsecLbError::AlreadyExists);
         }
-        // The runtime flushes adopted owner pins and writes the config before
-        // attaching the program, so the datapath never verdicts with a
-        // previous process's state. The fence map is deliberately not
-        // rewritten: a persisted fence survives process restarts.
+        // The runtime normalizes adopted pins into a non-live state and writes
+        // the config before attaching the program. Global mode stages no
+        // owners; destination-scoped mode may retain stale owner-only or
+        // fence-only witnesses. Persisted authority is never silently rearmed.
         let mut state = self.state()?;
         self.inner.runtime.attach(
             &self.inner.interface,
@@ -1083,10 +1410,16 @@ impl HostXdpSteeringBackend {
                 "ownership key routing domain does not match the backend",
             ));
         }
+        if self.inner.config.fence_domain == HostXdpFenceDomain::PerOwnershipKey {
+            return Err(IpsecLbError::invalid_config(
+                "fence_domain",
+                "destination-scoped owner installation requires an authoritative re-pin permit",
+            ));
+        }
         let _operation = self.operation_gate()?;
-        // Attach first so a persisted fence is adopted before this generation
-        // is validated. The operation gate also serializes the check and map
-        // write against every fence advance.
+        // Attach first so persisted fencing evidence is adopted before this
+        // generation is validated. The operation gate also serializes the
+        // check and map writes against every fence advance.
         let ifindex = self.ensure_attached_under_gate()?;
         let current_fence = self.state()?.current_fence;
         if generation < current_fence {
@@ -1109,6 +1442,12 @@ impl HostXdpSteeringBackend {
             return Err(IpsecLbError::invalid_config(
                 "ownership.routing_domain",
                 "ownership key routing domain does not match the backend",
+            ));
+        }
+        if self.inner.config.fence_domain == HostXdpFenceDomain::PerOwnershipKey {
+            return Err(IpsecLbError::invalid_config(
+                "fence_domain",
+                "destination-scoped owner removal requires authoritative retirement",
             ));
         }
         let map_key = owner_map_key(key);
@@ -1155,11 +1494,758 @@ impl HostXdpSteeringBackend {
         Ok(Some((ShardId::new(value.owner_shard), value.generation)))
     }
 
+    fn apply_fenced_repin_owner_sync(
+        &self,
+        update: RePinSteeringUpdate,
+        permit: RePinSteeringOperationPermit,
+    ) -> Result<RePinSteeringOperationPermit, IpsecLbError> {
+        let key = update.ownership_key();
+        let generation = update.generation().get();
+        self.validate_repin_key(&key)?;
+        let (permit, counter_guard) =
+            permit.into_guarded_with_esp_counter_publication::<HostXdpRePinPermitEvidence>()?;
+        let counter_publication_required = counter_guard.is_some();
+        let expected_stripe = self.repin_stripe(&key);
+        if !Arc::ptr_eq(&permit.backend_identity, &self.inner.repin_identity)
+            || permit.ownership_key != key
+            || !Arc::ptr_eq(&permit.stripe, &expected_stripe)
+            || permit.poison_if_unclassified
+            || permit.stripe.poisoned.load(Ordering::Acquire)
+        {
+            return Err(IpsecLbError::adapter_contract_violation(
+                "host_xdp_repin_operation_permit_mismatched",
+            ));
+        }
+
+        let _operation = self.operation_gate()?;
+        let ifindex = self.ensure_attached_under_gate()?;
+        self.apply_keyed_owner_under_gate(
+            ifindex,
+            &key,
+            update.owner(),
+            generation,
+            counter_guard,
+        )?;
+        if counter_publication_required {
+            Ok(RePinSteeringOperationPermit::guarded_after_counter_publication(key, permit))
+        } else {
+            Ok(RePinSteeringOperationPermit::guarded(key, permit))
+        }
+    }
+
+    fn consume_host_repin_permit(
+        &self,
+        permit: RePinSteeringOperationPermit,
+        expected_key: &SessionOwnershipKey,
+        retirement: bool,
+    ) -> Result<HostXdpRePinPermitEvidence, IpsecLbError> {
+        if permit.ownership_key() != *expected_key {
+            return Err(IpsecLbError::adapter_contract_violation(
+                "host_xdp_repin_operation_permit_key_mismatch",
+            ));
+        }
+        let evidence = permit.into_guarded::<HostXdpRePinPermitEvidence>()?;
+        let expected_stripe = self.repin_stripe(expected_key);
+        if !Arc::ptr_eq(&evidence.backend_identity, &self.inner.repin_identity)
+            || evidence.ownership_key != *expected_key
+            || !Arc::ptr_eq(&evidence.stripe, &expected_stripe)
+            || evidence.poison_if_unclassified != retirement
+            || evidence.stripe.poisoned.load(Ordering::Acquire)
+        {
+            return Err(IpsecLbError::adapter_contract_violation(
+                "host_xdp_repin_operation_permit_mismatched",
+            ));
+        }
+        Ok(evidence)
+    }
+
+    fn retire_fenced_repin_owner_sync(
+        &self,
+        grant: OwnershipRetirementGrant,
+        permit: RePinSteeringOperationPermit,
+    ) -> Result<RePinSteeringOperationPermit, IpsecLbError> {
+        let request = grant.request();
+        let key = request.ownership_key();
+        self.validate_repin_key(&key)?;
+        crate::repin::validate_ownership_key_matches_sa(request.sa(), key)?;
+        let active_fence = request.active_fence().get();
+        let retirement_fence = grant.retirement_fence().get();
+        if retirement_fence <= active_fence {
+            return Err(IpsecLbError::adapter_contract_violation(
+                "host_xdp_retirement_fence_did_not_advance",
+            ));
+        }
+
+        let mut evidence = self.consume_host_repin_permit(permit, &key, true)?;
+        // An exact Retiring grant classifies the cancellation-ambiguous store
+        // CAS before any map mutation. From this point the durable store state
+        // rejects ordinary activation even if this blocking operation fails.
+        evidence.retirement_classified = true;
+
+        let _operation = self.operation_gate()?;
+        let ifindex = self.ensure_attached_under_gate()?;
+        let map_key = owner_map_key(&key);
+        let expected_owner = XdpOwnerValue {
+            owner_shard: request.map_owner().get(),
+            generation: active_fence,
+        }
+        .encode();
+
+        let observed_fence = self.inner.runtime.key_fence_read(ifindex, map_key);
+        let observed_owner = self.inner.runtime.owner_get(ifindex, map_key);
+        if matches!(&observed_fence, Ok(Some(fence)) if *fence > retirement_fence)
+            || matches!(&observed_owner, Ok(Some(raw)) if XdpOwnerValue::decode(raw)
+                .is_some_and(|owner| owner.generation > retirement_fence))
+        {
+            return Err(IpsecLbError::ownership_conflict(
+                "retirement cannot replace newer destination-scoped authority",
+            ));
+        }
+        let (observed_fence, observed_owner) = match (observed_fence, observed_owner) {
+            (Ok(fence), Ok(owner)) => (fence, owner),
+            (fence, owner) => {
+                let error = fence.err().or_else(|| owner.err()).unwrap_or_else(|| {
+                    IpsecLbError::adapter_contract_violation(
+                        "host_xdp_retirement_initial_read_indeterminate",
+                    )
+                });
+                return Err(self.contain_indeterminate_keyed_state(
+                    ifindex,
+                    map_key,
+                    retirement_fence,
+                    error,
+                ));
+            }
+        };
+        if let Some(value) = observed_fence {
+            if value != active_fence && value != retirement_fence {
+                return Err(self.contain_indeterminate_keyed_state(
+                    ifindex,
+                    map_key,
+                    retirement_fence,
+                    IpsecLbError::ownership_conflict(
+                        "retirement found a foreign destination-scoped fence",
+                    ),
+                ));
+            }
+        }
+        match observed_owner {
+            None => {}
+            Some(value) if value == expected_owner => {}
+            Some(_) => {
+                return Err(self.contain_indeterminate_keyed_state(
+                    ifindex,
+                    map_key,
+                    retirement_fence,
+                    IpsecLbError::ownership_conflict(
+                        "retirement found a foreign destination-scoped owner",
+                    ),
+                ));
+            }
+        }
+
+        if observed_fence.is_none() && observed_owner.is_none() {
+            return Ok(RePinSteeringOperationPermit::guarded(key, evidence));
+        }
+
+        if observed_fence != Some(retirement_fence) {
+            let publish = self
+                .inner
+                .runtime
+                .key_fence_write(ifindex, map_key, retirement_fence);
+            match self.inner.runtime.key_fence_read(ifindex, map_key) {
+                Ok(Some(value)) if value == retirement_fence => {}
+                Ok(_) => {
+                    let error = publish.err().unwrap_or_else(|| {
+                        IpsecLbError::adapter_contract_violation(
+                            "host_xdp_retirement_fence_readback_mismatch",
+                        )
+                    });
+                    return Err(self.contain_indeterminate_keyed_state(
+                        ifindex,
+                        map_key,
+                        retirement_fence,
+                        error,
+                    ));
+                }
+                Err(error) => {
+                    return Err(self.contain_indeterminate_keyed_state(
+                        ifindex,
+                        map_key,
+                        retirement_fence,
+                        error,
+                    ));
+                }
+            }
+        }
+
+        if observed_owner.is_some() {
+            let remove = self.inner.runtime.owner_remove(ifindex, map_key);
+            match self.inner.runtime.owner_get(ifindex, map_key) {
+                Ok(None) => {}
+                Ok(Some(_)) => {
+                    return Err(remove.err().unwrap_or_else(|| {
+                        IpsecLbError::adapter_contract_violation(
+                            "host_xdp_retirement_owner_readback_mismatch",
+                        )
+                    }));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        let remove_fence = self.inner.runtime.key_fence_remove(ifindex, map_key);
+        match self.inner.runtime.key_fence_read(ifindex, map_key) {
+            Ok(None) => {}
+            Ok(Some(_)) => {
+                return Err(remove_fence.err().unwrap_or_else(|| {
+                    IpsecLbError::adapter_contract_violation(
+                        "host_xdp_retirement_fence_removal_readback_mismatch",
+                    )
+                }));
+            }
+            Err(error) => return Err(error),
+        }
+
+        if self.inner.runtime.owner_get(ifindex, map_key)?.is_some()
+            || self
+                .inner
+                .runtime
+                .key_fence_read(ifindex, map_key)?
+                .is_some()
+        {
+            return Err(IpsecLbError::adapter_contract_violation(
+                "host_xdp_retirement_final_readback_mismatch",
+            ));
+        }
+        Ok(RePinSteeringOperationPermit::guarded(key, evidence))
+    }
+
+    fn apply_keyed_owner_under_gate(
+        &self,
+        ifindex: u32,
+        key: &SessionOwnershipKey,
+        owner: ShardId,
+        generation: u64,
+        counter_guard: Option<opc_ipsec_xfrm::EspCounterPublicationGuard>,
+    ) -> Result<(), IpsecLbError> {
+        let map_key = owner_map_key(key);
+        let expected = XdpOwnerValue {
+            owner_shard: owner.get(),
+            generation,
+        }
+        .encode();
+
+        let observed_fence = self.inner.runtime.key_fence_read(ifindex, map_key);
+        let observed_owner = self.inner.runtime.owner_get(ifindex, map_key);
+        if matches!(&observed_fence, Ok(Some(current)) if *current > generation)
+            || matches!(&observed_owner, Ok(Some(raw)) if XdpOwnerValue::decode(raw)
+                .is_some_and(|value| value.generation > generation))
+        {
+            // A newer complete activation or a newer owner staged before its
+            // fence-last cut belongs to another transition. An older retry
+            // must leave it untouched.
+            return Err(IpsecLbError::ownership_conflict(
+                "destination-scoped owner or fence generation cannot regress",
+            ));
+        }
+        let (observed_fence, observed_owner) = match (observed_fence, observed_owner) {
+            (Ok(fence), Ok(owner)) => (fence, owner),
+            (fence, owner) => {
+                let read_error = fence.err().or_else(|| owner.err()).unwrap_or_else(|| {
+                    IpsecLbError::adapter_contract_violation(
+                        "host_xdp_repin_initial_read_indeterminate",
+                    )
+                });
+                // Retry the paired read once. Exact desired state resolves a
+                // lost read acknowledgement, but the final ESP counter guard
+                // must still be consumed before treating it as published.
+                match (
+                    self.inner.runtime.key_fence_read(ifindex, map_key),
+                    self.inner.runtime.owner_get(ifindex, map_key),
+                ) {
+                    (Ok(Some(fence)), Ok(Some(owner)))
+                        if fence == generation && owner == expected =>
+                    {
+                        if let Some(guard) = counter_guard {
+                            guard
+                                .publish(|| Ok::<(), IpsecLbError>(()))
+                                .map_err(|error| {
+                                    IpsecLbError::applied_counter_proof_rejected(error.code())
+                                })??;
+                        }
+                        return Ok(());
+                    }
+                    (Ok(fence), Ok(owner))
+                        if fence.is_some_and(|observed| observed > generation)
+                            || owner.as_ref().is_some_and(|raw| {
+                                XdpOwnerValue::decode(raw)
+                                    .is_some_and(|owner| owner.generation > generation)
+                            }) =>
+                    {
+                        return Err(IpsecLbError::ownership_conflict(
+                            "destination-scoped authority advanced concurrently",
+                        ));
+                    }
+                    (Ok(Some(fence)), Ok(owner))
+                        if fence == generation
+                            && owner.as_ref().is_none_or(|raw| {
+                                XdpOwnerValue::decode(raw)
+                                    .is_none_or(|value| value.generation >= generation)
+                                    && *raw != expected
+                            }) =>
+                    {
+                        let equal_owner_witness = owner.as_ref().is_some_and(|raw| {
+                            *raw != expected
+                                && XdpOwnerValue::decode(raw)
+                                    .is_some_and(|value| value.generation == generation)
+                        });
+                        if equal_owner_witness {
+                            return self.quarantine_equal_generation_conflict(
+                                ifindex, map_key, generation, true, true,
+                            );
+                        }
+                        return Err(IpsecLbError::ownership_conflict(
+                            "destination-scoped generation names a different owner",
+                        ));
+                    }
+                    (Ok(fence), Ok(owner))
+                        if !matches!(
+                            (owner, fence),
+                            (Some(raw), Some(fence))
+                                if fence != 0
+                                    && XdpOwnerValue::decode(&raw)
+                                        .is_some_and(|owner| owner.generation == fence)
+                        ) =>
+                    {
+                        return Err(read_error);
+                    }
+                    (Ok(_), Ok(_)) => {
+                        return Err(self.contain_indeterminate_keyed_state(
+                            ifindex, map_key, generation, read_error,
+                        ));
+                    }
+                    (Err(_), _) | (_, Err(_)) => {
+                        return Err(self.quiesce_indeterminate_backend(ifindex));
+                    }
+                }
+            }
+        };
+
+        let equal_generation_different_owner = observed_owner
+            .as_ref()
+            .and_then(XdpOwnerValue::decode)
+            .is_some_and(|value| value.generation == generation)
+            && observed_owner != Some(expected);
+        if observed_fence == Some(0) {
+            if equal_generation_different_owner {
+                // The zero fence is invalid but non-live. Remove only that
+                // invalid value and retain the same-generation owner as the
+                // durable conflict witness; clearing both would let an exact
+                // retry publish a different owner at the same generation.
+                let remove = self.inner.runtime.key_fence_remove(ifindex, map_key);
+                return match self.inner.runtime.key_fence_read(ifindex, map_key) {
+                    Ok(None) => Err(IpsecLbError::ownership_conflict(
+                        "destination-scoped generation names a different owner",
+                    )),
+                    Ok(Some(_)) => Err(remove.err().unwrap_or_else(|| {
+                        IpsecLbError::adapter_contract_violation(
+                            "host_xdp_repin_zero_fence_removal_indeterminate",
+                        )
+                    })),
+                    Err(error) => Err(error),
+                };
+            }
+            let invalid = IpsecLbError::adapter_contract_violation("host_xdp_repin_key_fence_zero");
+            return match self.clear_keyed_state(ifindex, map_key) {
+                Ok(()) => Err(invalid),
+                Err(cleanup_error) => Err(cleanup_error),
+            };
+        }
+        if observed_fence == Some(generation) && observed_owner == Some(expected) {
+            if let Some(guard) = counter_guard {
+                guard
+                    .publish(|| Ok::<(), IpsecLbError>(()))
+                    .map_err(|error| {
+                        IpsecLbError::applied_counter_proof_rejected(error.code())
+                    })??;
+            }
+            return Ok(());
+        }
+        let same_fence_conflicting_owner = observed_fence == Some(generation)
+            && observed_owner.as_ref().is_none_or(|raw| {
+                XdpOwnerValue::decode(raw).is_none_or(|value| value.generation >= generation)
+                    && *raw != expected
+            });
+        if same_fence_conflicting_owner || equal_generation_different_owner {
+            return self.quarantine_equal_generation_conflict(
+                ifindex,
+                map_key,
+                generation,
+                observed_fence == Some(generation),
+                equal_generation_different_owner,
+            );
+        }
+
+        // Activation is deliberately fence-last:
+        // 1. delete the keyed fence and prove absence (the fail-closed cut);
+        // 2. remove the old owner and prove absence;
+        // 3. stage and read back the new owner while the datapath is stale;
+        // 4. publish and read back the exact authoritative fence.
+        if let Err(error) = self.clear_keyed_state(ifindex, map_key) {
+            return Err(self.contain_indeterminate_keyed_state(ifindex, map_key, generation, error));
+        }
+        self.insert_keyed_owner_with_readback(ifindex, map_key, expected, generation)?;
+
+        if let Some(guard) = counter_guard {
+            return match guard.publish(|| {
+                self.publish_keyed_owner_with_readback(ifindex, map_key, expected, generation)
+            }) {
+                Ok(result) => result,
+                Err(error) => {
+                    let expired = IpsecLbError::applied_counter_proof_rejected(error.code());
+                    match self.clear_keyed_state(ifindex, map_key) {
+                        Ok(()) => Err(expired),
+                        Err(cleanup_error) => Err(self.contain_indeterminate_keyed_state(
+                            ifindex,
+                            map_key,
+                            generation,
+                            cleanup_error,
+                        )),
+                    }
+                }
+            };
+        }
+
+        self.publish_keyed_owner_with_readback(ifindex, map_key, expected, generation)
+    }
+
+    /// Attempt an emergency per-key stale cut, then a backend-wide CONFIG cut
+    /// and detach. `host_xdp_repin_containment_unproven` is a fatal outcome:
+    /// readiness remains false and an operator must contain the node because
+    /// neither datapath quiescence nor detach was authoritatively proven.
+    fn contain_indeterminate_keyed_state(
+        &self,
+        ifindex: u32,
+        map_key: [u8; OWNER_KEY_LEN],
+        generation: u64,
+        original_error: IpsecLbError,
+    ) -> IpsecLbError {
+        let observed_owner = self.inner.runtime.owner_get(ifindex, map_key);
+        let observed_fence = self.inner.runtime.key_fence_read(ifindex, map_key);
+        if matches!(&observed_fence, Ok(Some(fence)) if *fence > generation)
+            || matches!(&observed_owner, Ok(Some(raw)) if XdpOwnerValue::decode(raw)
+                .is_some_and(|owner| owner.generation > generation))
+        {
+            return IpsecLbError::ownership_conflict(
+                "destination-scoped authority advanced concurrently",
+            );
+        }
+        match (&observed_owner, &observed_fence) {
+            (Ok(owner), Ok(fence))
+                if !matches!(
+                    (owner, fence),
+                    (Some(raw), Some(fence))
+                        if *fence != 0
+                            && XdpOwnerValue::decode(raw)
+                                .is_some_and(|owner| owner.generation == *fence)
+                ) =>
+            {
+                return original_error;
+            }
+            (Ok(_), Ok(_)) => {}
+            // A failed retry read leaves the current generation unknown. Never
+            // overwrite it with a possibly older emergency fence; skip
+            // directly to backend-wide quiescence and detach containment.
+            (Err(_), _) | (_, Err(_)) => return self.quiesce_indeterminate_backend(ifindex),
+        }
+
+        // A failed fence removal and failed owner removal can leave the old
+        // pair live. Publish the already committed higher generation as an
+        // emergency fail-closed cut: the old owner immediately becomes stale,
+        // and an exact retry can remove that older-owner residue normally.
+        let _write = self
+            .inner
+            .runtime
+            .key_fence_write(ifindex, map_key, generation);
+        if let (Ok(Some(observed_fence)), Ok(observed_owner)) = (
+            self.inner.runtime.key_fence_read(ifindex, map_key),
+            self.inner.runtime.owner_get(ifindex, map_key),
+        ) {
+            let owner_is_live = observed_owner.as_ref().is_some_and(|raw| {
+                XdpOwnerValue::decode(raw).is_some_and(|owner| owner.generation == observed_fence)
+            });
+            if observed_fence >= generation && !owner_is_live {
+                return original_error;
+            }
+        }
+
+        self.quiesce_indeterminate_backend(ifindex)
+    }
+
+    /// Remove CONFIG and prove absence so the live program has no
+    /// classification authority, latch the backend indeterminate, and then
+    /// best-effort detach it.
+    fn quiesce_indeterminate_backend(&self, ifindex: u32) -> IpsecLbError {
+        let config_absent = self.inner.runtime.quiesce_repin(ifindex).is_ok();
+        if let Ok(mut state) = self.state() {
+            state.attachment = HostXdpAttachmentState::Indeterminate {
+                ifindex,
+                mode: self.inner.config.attach_mode,
+            };
+        }
+        let detached =
+            match self
+                .inner
+                .runtime
+                .detach(&self.inner.interface, ifindex, &self.pin_dir())
+            {
+                Ok(()) => {
+                    if let Ok(mut state) = self.state() {
+                        state.attachment = HostXdpAttachmentState::Detached;
+                    }
+                    true
+                }
+                Err(failure) => {
+                    let detached = failure.disposition == HostXdpLinkDisposition::Detached;
+                    if let Ok(mut state) = self.state() {
+                        apply_link_disposition(
+                            &mut state,
+                            failure.disposition,
+                            ifindex,
+                            self.inner.config.attach_mode,
+                        );
+                    }
+                    detached
+                }
+            };
+        if config_absent || detached {
+            IpsecLbError::adapter_contract_violation("host_xdp_repin_backend_quarantined")
+        } else {
+            IpsecLbError::adapter_contract_violation("host_xdp_repin_containment_unproven")
+        }
+    }
+
+    fn publish_keyed_owner_with_readback(
+        &self,
+        ifindex: u32,
+        map_key: [u8; OWNER_KEY_LEN],
+        expected: [u8; OWNER_VALUE_LEN],
+        generation: u64,
+    ) -> Result<(), IpsecLbError> {
+        let fence_write = self
+            .inner
+            .runtime
+            .key_fence_write(ifindex, map_key, generation);
+        let fence_readback = self.inner.runtime.key_fence_read(ifindex, map_key);
+        let owner_readback = self.inner.runtime.owner_get(ifindex, map_key);
+        if matches!(&fence_readback, Ok(Some(observed)) if *observed == generation)
+            && matches!(&owner_readback, Ok(Some(observed)) if *observed == expected)
+        {
+            // Exact readback resolves an acknowledgement lost after apply.
+            return Ok(());
+        }
+
+        let newer_generation = match &fence_readback {
+            Ok(Some(observed)) if *observed > generation => Some(*observed),
+            Ok(_) | Err(_) => None,
+        };
+        let newer_owner_generation = match &owner_readback {
+            Ok(Some(raw)) => XdpOwnerValue::decode(raw)
+                .map(|value| value.generation)
+                .filter(|owner_generation| *owner_generation > generation),
+            Ok(None) | Err(_) => None,
+        };
+        if newer_generation.is_some() || newer_owner_generation.is_some() {
+            return Err(IpsecLbError::ownership_conflict(
+                "destination-scoped owner or fence generation advanced concurrently",
+            ));
+        }
+
+        // The fence write may already have made the staged owner live. A
+        // partial final read cannot distinguish that state from a failed
+        // write, so invalidate both maps and escalate through containment if
+        // cleanup is not authoritatively proven. Equal-generation conflict
+        // witnesses are preserved only when both reads succeeded.
+        if fence_readback.is_err() || owner_readback.is_err() {
+            let final_error = IpsecLbError::adapter_contract_violation(
+                "host_xdp_repin_activation_readback_indeterminate",
+            );
+            return match self.clear_keyed_state(ifindex, map_key) {
+                Ok(()) => Err(final_error),
+                Err(cleanup_error) => Err(self.contain_indeterminate_keyed_state(
+                    ifindex,
+                    map_key,
+                    generation,
+                    cleanup_error,
+                )),
+            };
+        }
+
+        let final_equal_fence = matches!(
+            &fence_readback,
+            Ok(Some(observed)) if *observed == generation
+        );
+        let final_equal_different_owner = matches!(&owner_readback, Ok(Some(raw)) if *raw != expected
+            && XdpOwnerValue::decode(raw).is_some_and(|value| value.generation == generation));
+        if (final_equal_fence
+            && matches!(&owner_readback, Ok(observed) if *observed != Some(expected)))
+            || final_equal_different_owner
+        {
+            return self.quarantine_equal_generation_conflict(
+                ifindex,
+                map_key,
+                generation,
+                final_equal_fence,
+                final_equal_different_owner,
+            );
+        }
+
+        let final_error = fence_write.err().unwrap_or_else(|| {
+            IpsecLbError::adapter_contract_violation(
+                "host_xdp_repin_activation_readback_indeterminate",
+            )
+        });
+        match self.clear_keyed_state(ifindex, map_key) {
+            Ok(()) => Err(final_error),
+            Err(cleanup_error) => Err(self.contain_indeterminate_keyed_state(
+                ifindex,
+                map_key,
+                generation,
+                cleanup_error,
+            )),
+        }
+    }
+
+    fn insert_keyed_owner_with_readback(
+        &self,
+        ifindex: u32,
+        map_key: [u8; OWNER_KEY_LEN],
+        expected: [u8; OWNER_VALUE_LEN],
+        generation: u64,
+    ) -> Result<(), IpsecLbError> {
+        let insert = self.inner.runtime.owner_insert(ifindex, map_key, expected);
+        match self.inner.runtime.owner_get(ifindex, map_key) {
+            Ok(Some(observed)) if observed == expected => Ok(()),
+            _ => {
+                let insert_error = insert.err().unwrap_or_else(|| {
+                    IpsecLbError::adapter_contract_violation(
+                        "host_xdp_repin_owner_readback_mismatch",
+                    )
+                });
+                match self.clear_keyed_state(ifindex, map_key) {
+                    Ok(()) => Err(insert_error),
+                    Err(cleanup_error) => Err(self.contain_indeterminate_keyed_state(
+                        ifindex,
+                        map_key,
+                        generation,
+                        cleanup_error,
+                    )),
+                }
+            }
+        }
+    }
+
+    fn remove_keyed_owner_with_readback(
+        &self,
+        ifindex: u32,
+        map_key: [u8; OWNER_KEY_LEN],
+    ) -> Result<(), IpsecLbError> {
+        let remove = self.inner.runtime.owner_remove(ifindex, map_key);
+        match self.inner.runtime.owner_get(ifindex, map_key) {
+            Ok(None) => Ok(()),
+            _ => Err(remove.err().unwrap_or_else(|| {
+                IpsecLbError::adapter_contract_violation(
+                    "host_xdp_repin_owner_invalidation_indeterminate",
+                )
+            })),
+        }
+    }
+
+    fn quarantine_equal_generation_conflict(
+        &self,
+        ifindex: u32,
+        map_key: [u8; OWNER_KEY_LEN],
+        generation: u64,
+        fence_is_witness: bool,
+        owner_is_witness: bool,
+    ) -> Result<(), IpsecLbError> {
+        let conflict = || {
+            IpsecLbError::ownership_conflict(
+                "destination-scoped generation names a different owner",
+            )
+        };
+        if owner_is_witness && fence_is_witness {
+            // Prefer fence absence as the immediate fail-closed cut while
+            // retaining the mismatching owner as a durable retry witness.
+            let _remove = self.inner.runtime.key_fence_remove(ifindex, map_key);
+            return match self.inner.runtime.key_fence_read(ifindex, map_key) {
+                Ok(None) => Err(conflict()),
+                Ok(Some(observed)) if observed == generation => {
+                    match self.remove_keyed_owner_with_readback(ifindex, map_key) {
+                        Ok(()) => Err(conflict()),
+                        Err(error) => Err(self.contain_indeterminate_keyed_state(
+                            ifindex, map_key, generation, error,
+                        )),
+                    }
+                }
+                Ok(Some(_)) => Err(conflict()),
+                Err(error) => {
+                    Err(self.contain_indeterminate_keyed_state(ifindex, map_key, generation, error))
+                }
+            };
+        }
+
+        // One stale witness is already sufficient. Leaving it in place makes
+        // every retry of this same corrupted grant conflict; only a genuinely
+        // higher authoritative generation may clear and replace it.
+        Err(conflict())
+    }
+
+    fn remove_keyed_fence_with_readback(
+        &self,
+        ifindex: u32,
+        map_key: [u8; OWNER_KEY_LEN],
+    ) -> Result<(), IpsecLbError> {
+        let remove = self.inner.runtime.key_fence_remove(ifindex, map_key);
+        match self.inner.runtime.key_fence_read(ifindex, map_key) {
+            Ok(None) => Ok(()),
+            _ => Err(remove.err().unwrap_or_else(|| {
+                IpsecLbError::adapter_contract_violation(
+                    "host_xdp_repin_key_fence_removal_indeterminate",
+                )
+            })),
+        }
+    }
+
+    fn clear_keyed_state(
+        &self,
+        ifindex: u32,
+        map_key: [u8; OWNER_KEY_LEN],
+    ) -> Result<(), IpsecLbError> {
+        let fence_result = self.remove_keyed_fence_with_readback(ifindex, map_key);
+        let owner_result = self.remove_keyed_owner_with_readback(ifindex, map_key);
+        match (fence_result, owner_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(fence_error), Ok(())) => Err(fence_error),
+            (Ok(()), Err(owner_error)) => Err(owner_error),
+            (Err(_), Err(_)) => Err(IpsecLbError::adapter_contract_violation(
+                "host_xdp_repin_quarantine_indeterminate",
+            )),
+        }
+    }
+
     fn advance_fence_sync(&self, generation: u64) -> Result<(), IpsecLbError> {
         if generation == 0 {
             return Err(IpsecLbError::invalid_config(
                 "fence.generation",
                 "fence generation must be non-zero",
+            ));
+        }
+        if self.inner.config.fence_domain == HostXdpFenceDomain::PerOwnershipKey {
+            return Err(IpsecLbError::invalid_config(
+                "fence_domain",
+                "global fence advancement is unavailable in destination-scoped mode",
             ));
         }
         let _operation = self.operation_gate()?;
@@ -1245,6 +2331,120 @@ impl HostXdpSteeringBackend {
             key_material_free: true,
             details,
         }
+    }
+
+    fn probe_repin_sync(&self) -> SteeringProbe {
+        let mut probe = self.probe_sync();
+        if !probe.mutation_ready {
+            return probe;
+        }
+        if self.inner.config.fence_domain != HostXdpFenceDomain::PerOwnershipKey {
+            probe.mutation_ready = false;
+            probe.details = Some("Host-XDP re-pin requires destination-scoped ownership fencing");
+            return probe;
+        }
+        if self
+            .inner
+            .repin_stripes
+            .iter()
+            .any(|stripe| stripe.poisoned.load(Ordering::Acquire))
+        {
+            probe.mutation_ready = false;
+            probe.details = Some("Host-XDP re-pin operation state is indeterminate");
+            return probe;
+        }
+
+        let feasible = (|| {
+            validate_interface_name(&self.inner.interface)?;
+            match self.state()?.attachment {
+                HostXdpAttachmentState::Ready { .. } => return Ok(()),
+                HostXdpAttachmentState::Detached => {}
+                HostXdpAttachmentState::AwaitingFence { .. }
+                | HostXdpAttachmentState::HandoffPrepared { .. }
+                | HostXdpAttachmentState::UpgradeCleanupPending { .. }
+                | HostXdpAttachmentState::Indeterminate { .. } => {
+                    return Err(IpsecLbError::XdpUpgradeIndeterminate);
+                }
+            }
+            let ifindex = self.inner.runtime.ifindex_by_name(&self.inner.interface)?;
+            if ifindex == 0 || self.inner.runtime.attached_prog_id(ifindex)?.is_some() {
+                return Err(IpsecLbError::XdpUpgradeRequiresDrain);
+            }
+            let _lease = self.inner.runtime.lifecycle_lock(&self.pin_dir())?;
+            let config = self.datapath_config();
+            self.inner
+                .runtime
+                .repin_pins_feasible(&self.pin_dir(), &config)?;
+            Ok(())
+        })();
+        if feasible.is_err() {
+            probe.mutation_ready = false;
+            probe.details = Some("Host-XDP re-pin lifecycle or keyed migration is unavailable");
+        } else {
+            probe.details = Some("Host-XDP destination-scoped re-pin mutation ready");
+        }
+        probe
+    }
+}
+
+#[async_trait]
+impl RePinSteeringBackend for HostXdpSteeringBackend {
+    async fn acquire_repin_permit(
+        &self,
+        ownership_key: SessionOwnershipKey,
+    ) -> Result<RePinSteeringOperationPermit, IpsecLbError> {
+        self.acquire_host_repin_permit(ownership_key).await
+    }
+
+    async fn apply_fenced_repin(
+        &self,
+        update: RePinSteeringUpdate,
+        permit: RePinSteeringOperationPermit,
+    ) -> Result<RePinSteeringOperationPermit, IpsecLbError> {
+        self.apply_fenced_repin_owner(update, permit).await
+    }
+}
+
+#[async_trait]
+impl RePinSteeringRetirementBackend for HostXdpSteeringBackend {
+    async fn acquire_repin_retirement_permits(
+        &self,
+        ownership_keys: Vec<SessionOwnershipKey>,
+    ) -> Result<Vec<RePinSteeringOperationPermit>, IpsecLbError> {
+        self.acquire_host_repin_retirement_permits(ownership_keys)
+            .await
+    }
+
+    fn arm_repin_retirement_permit(
+        &self,
+        permit: RePinSteeringOperationPermit,
+    ) -> Result<RePinSteeringOperationPermit, IpsecLbError> {
+        let key = permit.ownership_key();
+        let mut evidence = self.consume_host_repin_permit(permit, &key, false)?;
+        evidence.poison_if_unclassified = true;
+        Ok(RePinSteeringOperationPermit::guarded(key, evidence))
+    }
+
+    fn release_classified_repin_retirement_permit(
+        &self,
+        permit: RePinSteeringOperationPermit,
+    ) -> Result<(), IpsecLbError> {
+        let key = permit.ownership_key();
+        let mut evidence = self.consume_host_repin_permit(permit, &key, true)?;
+        evidence.retirement_classified = true;
+        Ok(())
+    }
+
+    async fn retire_fenced_repin(
+        &self,
+        grant: &OwnershipRetirementGrant,
+        permit: RePinSteeringOperationPermit,
+    ) -> Result<RePinSteeringOperationPermit, IpsecLbError> {
+        let grant = grant.clone();
+        self.run_blocking("host_xdp_retire_fenced_repin_owner", move |backend| {
+            backend.retire_fenced_repin_owner_sync(grant, permit)
+        })
+        .await
     }
 }
 
@@ -1451,6 +2651,43 @@ impl HostXdpRuntime for UnsupportedHostXdpRuntime {
         Err(IpsecLbError::Unsupported)
     }
 
+    fn key_fence_read(
+        &self,
+        _ifindex: u32,
+        _key: [u8; OWNER_KEY_LEN],
+    ) -> Result<Option<u64>, IpsecLbError> {
+        Err(IpsecLbError::Unsupported)
+    }
+
+    fn key_fence_write(
+        &self,
+        _ifindex: u32,
+        _key: [u8; OWNER_KEY_LEN],
+        _generation: u64,
+    ) -> Result<(), IpsecLbError> {
+        Err(IpsecLbError::Unsupported)
+    }
+
+    fn key_fence_remove(
+        &self,
+        _ifindex: u32,
+        _key: [u8; OWNER_KEY_LEN],
+    ) -> Result<bool, IpsecLbError> {
+        Err(IpsecLbError::Unsupported)
+    }
+
+    fn quiesce_repin(&self, _ifindex: u32) -> Result<(), IpsecLbError> {
+        Err(IpsecLbError::Unsupported)
+    }
+
+    fn repin_pins_feasible(
+        &self,
+        _pin_dir: &Path,
+        _config: &[u8; CONFIG_VALUE_LEN],
+    ) -> Result<(), IpsecLbError> {
+        Err(IpsecLbError::Unsupported)
+    }
+
     fn counters_read(&self, _ifindex: u32) -> Result<[u64; COUNTER_SLOTS as usize], IpsecLbError> {
         Err(IpsecLbError::Unsupported)
     }
@@ -1488,13 +2725,14 @@ mod aya_runtime {
     use opc_linux_gtpu_sys as sys;
 
     use super::{
-        mode_accepts_live, HostXdpAttachMode, HostXdpEnvironment, HostXdpLifecycleLock,
-        HostXdpLinkDisposition, HostXdpRedirectHandoff, HostXdpRuntime, HostXdpRuntimeAdoption,
-        HostXdpRuntimeFailure, CONFIG_KEY, CONFIG_VALUE_LEN, COUNTER_SLOTS, FENCE_KEY, MAP_CONFIG,
-        MAP_COUNTERS, MAP_FENCE, MAP_OWNERS, OWNER_KEY_LEN, OWNER_VALUE_LEN, PROG_SWU_XDP,
+        mode_accepts_live, owner_map_key, HostXdpAttachMode, HostXdpEnvironment,
+        HostXdpLifecycleLock, HostXdpLinkDisposition, HostXdpRedirectHandoff, HostXdpRuntime,
+        HostXdpRuntimeAdoption, HostXdpRuntimeFailure, XdpOwnerValue, CONFIG_KEY, CONFIG_VALUE_LEN,
+        COUNTER_SLOTS, FENCE_KEY, MAP_CONFIG, MAP_COUNTERS, MAP_FENCE, MAP_KEY_FENCES, MAP_OWNERS,
+        OWNERSHIP_KEY_MAX_ENCODED_BYTES, OWNER_KEY_LEN, OWNER_VALUE_LEN, PROG_SWU_XDP,
         XDP_CONFIG_ABI_VERSION,
     };
-    use crate::IpsecLbError;
+    use crate::{IpsecLbError, SessionOwnershipKey};
 
     const DATAPATH_OBJECT: &[u8] = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -1555,26 +2793,65 @@ mod aya_runtime {
         }
     }
 
+    type PinnedOwners = BTreeMap<[u8; OWNER_KEY_LEN], [u8; OWNER_VALUE_LEN]>;
+    type PinnedKeyFences = BTreeMap<[u8; OWNER_KEY_LEN], u64>;
+
     #[derive(Debug)]
     struct PinnedMapNamespace {
         slot: MapNamespaceSlot,
         version: u8,
         config: [u8; CONFIG_VALUE_LEN],
         fence_generation: u64,
+        owners: PinnedOwners,
+        key_fences: PinnedKeyFences,
         map_ids: BTreeSet<u32>,
     }
 
     #[derive(Debug)]
     struct PartialPinnedMapNamespace {
         slot: MapNamespaceSlot,
+        version: Option<u8>,
         fence_generation: u64,
+        owners: PinnedOwners,
+        owners_map_present: bool,
+        key_fences: PinnedKeyFences,
+        key_fence_map_present: bool,
+        counters_map_present: bool,
         map_ids: BTreeSet<u32>,
+    }
+
+    impl PartialPinnedMapNamespace {
+        fn is_empty_v5_cleanup_residue(&self) -> bool {
+            self.version == Some(XDP_CONFIG_ABI_VERSION)
+                && self.owners.is_empty()
+                && !self.owners_map_present
+                && self.key_fences.is_empty()
+                && !self.key_fence_map_present
+                && !self.counters_map_present
+                && self.map_ids.len() == 2
+        }
+
+        fn is_scalar_fence_only_cleanup_residue(&self) -> bool {
+            self.version.is_none()
+                && self.owners.is_empty()
+                && !self.owners_map_present
+                && self.key_fences.is_empty()
+                && !self.key_fence_map_present
+                && !self.counters_map_present
+                && self.map_ids.len() == 1
+        }
     }
 
     #[derive(Debug, Default)]
     struct PinnedNamespaceInventory {
         complete: Vec<PinnedMapNamespace>,
         partial: Vec<PartialPinnedMapNamespace>,
+    }
+
+    #[derive(Debug, Default, Clone, PartialEq, Eq)]
+    struct DestinationScopedRecoveryMaps {
+        owners: PinnedOwners,
+        key_fences: PinnedKeyFences,
     }
 
     impl PinnedNamespaceInventory {
@@ -1591,21 +2868,275 @@ mod aya_runtime {
                 .unwrap_or(0)
         }
 
-        fn fence_sources(&self) -> impl Iterator<Item = (MapNamespaceSlot, u64)> + '_ {
+        fn recovery_maps(&self) -> Result<DestinationScopedRecoveryMaps, IpsecLbError> {
+            self.recovery_maps_without(None)
+        }
+
+        fn recovery_maps_for_config(
+            &self,
+            expected_config: &[u8; CONFIG_VALUE_LEN],
+        ) -> Result<DestinationScopedRecoveryMaps, IpsecLbError> {
+            self.recovery_maps_for_config_without(expected_config, None)
+        }
+
+        fn recovery_maps_for_config_without(
+            &self,
+            expected_config: &[u8; CONFIG_VALUE_LEN],
+            omitted: Option<MapNamespaceSlot>,
+        ) -> Result<DestinationScopedRecoveryMaps, IpsecLbError> {
+            let mut recovered = match omitted {
+                Some(slot) => self.recovery_maps_without(Some(slot))?,
+                None => self.recovery_maps()?,
+            };
+            match expected_config[1] {
+                0 => {
+                    let global_floor = omitted
+                        .map_or_else(|| self.max_fence(), |slot| self.max_fence_without(slot));
+                    let owners = std::mem::take(&mut recovered.owners);
+                    for (key, raw_owner) in owners {
+                        let owner = XdpOwnerValue::decode(&raw_owner)
+                            .ok_or(IpsecLbError::XdpUpgradeIndeterminate)?;
+                        merge_recovery_fence(
+                            &mut recovered,
+                            key,
+                            owner.generation.max(global_floor),
+                        )?;
+                    }
+                    Ok(recovered)
+                }
+                1 => Ok(recovered),
+                _ => Err(IpsecLbError::XdpUpgradeIndeterminate),
+            }
+        }
+
+        fn recovery_maps_without(
+            &self,
+            omitted: Option<MapNamespaceSlot>,
+        ) -> Result<DestinationScopedRecoveryMaps, IpsecLbError> {
+            let mut recovered = DestinationScopedRecoveryMaps::default();
+            for namespace in self
+                .complete
+                .iter()
+                .filter(|namespace| Some(namespace.slot) != omitted)
+            {
+                merge_recovery_namespace(
+                    &mut recovered,
+                    Some(namespace.version),
+                    &namespace.owners,
+                    &namespace.key_fences,
+                    namespace.fence_generation,
+                )?;
+            }
+            for namespace in self
+                .partial
+                .iter()
+                .filter(|namespace| Some(namespace.slot) != omitted)
+            {
+                merge_recovery_namespace(
+                    &mut recovered,
+                    namespace.version,
+                    &namespace.owners,
+                    &namespace.key_fences,
+                    namespace.fence_generation,
+                )?;
+            }
+            Ok(recovered)
+        }
+
+        fn max_fence_without(&self, omitted: MapNamespaceSlot) -> u64 {
             self.complete
                 .iter()
-                .map(|namespace| (namespace.slot, namespace.fence_generation))
+                .filter(|namespace| namespace.slot != omitted)
+                .map(|namespace| namespace.fence_generation)
                 .chain(
                     self.partial
                         .iter()
-                        .map(|namespace| (namespace.slot, namespace.fence_generation)),
+                        .filter(|namespace| namespace.slot != omitted)
+                        .map(|namespace| namespace.fence_generation),
                 )
+                .max()
+                .unwrap_or(0)
         }
+
+        fn target_overwrite_is_redundant(
+            &self,
+            target: MapNamespaceSlot,
+            expected_config: &[u8; CONFIG_VALUE_LEN],
+        ) -> Result<bool, IpsecLbError> {
+            Ok(self.max_fence_without(target) == self.max_fence()
+                && self.recovery_maps_for_config_without(expected_config, Some(target))?
+                    == self.recovery_maps_for_config(expected_config)?)
+        }
+
+        fn has_slot(&self, slot: MapNamespaceSlot) -> bool {
+            self.complete.iter().any(|namespace| namespace.slot == slot)
+                || self.partial.iter().any(|namespace| namespace.slot == slot)
+        }
+
+        fn validate_destination_scoped_migration(
+            &self,
+            expected_config: &[u8; CONFIG_VALUE_LEN],
+        ) -> Result<(), IpsecLbError> {
+            if expected_config[1] != 1 {
+                return Ok(());
+            }
+            for namespace in &self.complete {
+                if namespace.version < 5
+                    && namespace.fence_generation != 0
+                    && namespace.owners.is_empty()
+                {
+                    return Err(IpsecLbError::XdpUpgradeRequiresDrain);
+                }
+            }
+            for namespace in &self.partial {
+                match namespace.version {
+                    Some(version)
+                        if version >= 5
+                            && !namespace.key_fence_map_present
+                            && !namespace.is_empty_v5_cleanup_residue() =>
+                    {
+                        return Err(IpsecLbError::XdpUpgradeIndeterminate);
+                    }
+                    Some(version)
+                        if version < 5
+                            && namespace.fence_generation != 0
+                            && namespace.owners.is_empty() =>
+                    {
+                        return Err(IpsecLbError::XdpUpgradeRequiresDrain);
+                    }
+                    None if namespace.is_scalar_fence_only_cleanup_residue() => {}
+                    None => {
+                        return Err(IpsecLbError::XdpUpgradeIndeterminate);
+                    }
+                    _ => {}
+                }
+            }
+            Ok(())
+        }
+    }
+
+    fn merge_recovery_namespace(
+        recovered: &mut DestinationScopedRecoveryMaps,
+        version: Option<u8>,
+        owners: &PinnedOwners,
+        key_fences: &PinnedKeyFences,
+        legacy_floor: u64,
+    ) -> Result<(), IpsecLbError> {
+        match version {
+            Some(version) if version < 5 => {
+                for (key, generation) in key_fences {
+                    merge_recovery_fence(recovered, *key, *generation)?;
+                }
+                for (key, raw_owner) in owners {
+                    let owner = XdpOwnerValue::decode(raw_owner)
+                        .ok_or(IpsecLbError::XdpUpgradeIndeterminate)?;
+                    merge_recovery_fence(recovered, *key, owner.generation.max(legacy_floor))?;
+                }
+                Ok(())
+            }
+            Some(_) => {
+                for (key, raw_owner) in owners {
+                    let owner = XdpOwnerValue::decode(raw_owner)
+                        .ok_or(IpsecLbError::XdpUpgradeIndeterminate)?;
+                    if key_fences
+                        .get(key)
+                        .is_some_and(|fence| *fence != owner.generation)
+                    {
+                        return Err(IpsecLbError::XdpUpgradeIndeterminate);
+                    }
+                    merge_recovery_owner(recovered, *key, *raw_owner)?;
+                }
+                for (key, generation) in key_fences {
+                    if !owners.contains_key(key) {
+                        merge_recovery_fence(recovered, *key, *generation)?;
+                    }
+                }
+                Ok(())
+            }
+            None if owners.is_empty() && key_fences.is_empty() => Ok(()),
+            None => Err(IpsecLbError::XdpUpgradeIndeterminate),
+        }
+    }
+
+    fn merge_recovery_owner(
+        recovered: &mut DestinationScopedRecoveryMaps,
+        key: [u8; OWNER_KEY_LEN],
+        raw_owner: [u8; OWNER_VALUE_LEN],
+    ) -> Result<(), IpsecLbError> {
+        let owner =
+            XdpOwnerValue::decode(&raw_owner).ok_or(IpsecLbError::XdpUpgradeIndeterminate)?;
+        if let Some(fence) = recovered.key_fences.get(&key).copied() {
+            if fence >= owner.generation {
+                return Ok(());
+            }
+            recovered.key_fences.remove(&key);
+        }
+        match recovered.owners.get(&key).copied() {
+            None => {
+                if recovered.owners.len() + recovered.key_fences.len() >= 65_536 {
+                    return Err(IpsecLbError::XdpUpgradeRequiresDrain);
+                }
+                recovered.owners.insert(key, raw_owner);
+            }
+            Some(existing) => {
+                let existing = XdpOwnerValue::decode(&existing)
+                    .ok_or(IpsecLbError::XdpUpgradeIndeterminate)?;
+                match existing.generation.cmp(&owner.generation) {
+                    std::cmp::Ordering::Less => {
+                        recovered.owners.insert(key, raw_owner);
+                    }
+                    std::cmp::Ordering::Equal if existing.owner_shard != owner.owner_shard => {
+                        return Err(IpsecLbError::XdpUpgradeIndeterminate);
+                    }
+                    std::cmp::Ordering::Equal | std::cmp::Ordering::Greater => {}
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn merge_recovery_fence(
+        recovered: &mut DestinationScopedRecoveryMaps,
+        key: [u8; OWNER_KEY_LEN],
+        generation: u64,
+    ) -> Result<(), IpsecLbError> {
+        if generation == 0 {
+            return Err(IpsecLbError::XdpUpgradeIndeterminate);
+        }
+        if let Some(raw_owner) = recovered.owners.get(&key).copied() {
+            let owner =
+                XdpOwnerValue::decode(&raw_owner).ok_or(IpsecLbError::XdpUpgradeIndeterminate)?;
+            if owner.generation > generation {
+                return Ok(());
+            }
+            recovered.owners.remove(&key);
+        }
+        if !recovered.key_fences.contains_key(&key)
+            && recovered.owners.len() + recovered.key_fences.len() >= 65_536
+        {
+            return Err(IpsecLbError::XdpUpgradeRequiresDrain);
+        }
+        recovered
+            .key_fences
+            .entry(key)
+            .and_modify(|current| *current = (*current).max(generation))
+            .or_insert(generation);
+        Ok(())
     }
 
     impl AyaHostXdpRuntime {
         pub(super) fn new() -> Self {
             Self::default()
+        }
+
+        pub(super) fn repin_pins_feasible(
+            interface_dir: &Path,
+            config: &[u8; CONFIG_VALUE_LEN],
+        ) -> Result<(), IpsecLbError> {
+            let inventory = Self::inspect_namespaces(interface_dir, config)?;
+            inventory.validate_destination_scoped_migration(config)?;
+            let _ = Self::staging_slot(&inventory, config)?;
+            Ok(())
         }
 
         fn load_fresh(map_pin_dir: &Path) -> Result<Ebpf, IpsecLbError> {
@@ -1681,6 +3212,16 @@ mod aya_runtime {
                 .map_err(|error| map_error("xdp_config_write", error))
         }
 
+        fn config_read_map(ebpf: &mut Ebpf) -> Result<[u8; CONFIG_VALUE_LEN], IpsecLbError> {
+            let map = ebpf
+                .map(MAP_CONFIG)
+                .ok_or_else(|| IpsecLbError::io("xdp_config_map", invalid_data("map missing")))?;
+            let hash = BpfHashMap::<_, u32, [u8; CONFIG_VALUE_LEN]>::try_from(map)
+                .map_err(|error| map_error("xdp_config_map", error))?;
+            hash.get(&CONFIG_KEY, 0)
+                .map_err(|error| map_error("xdp_config_read", error))
+        }
+
         fn fence_map(
             ebpf: &mut Ebpf,
         ) -> Result<BpfHashMap<&mut aya::maps::MapData, u32, u64>, IpsecLbError> {
@@ -1691,13 +3232,233 @@ mod aya_runtime {
                 .map_err(|error| map_error("xdp_fence_map", error))
         }
 
+        fn key_fences_map(
+            ebpf: &mut Ebpf,
+        ) -> Result<BpfHashMap<&mut aya::maps::MapData, [u8; OWNER_KEY_LEN], u64>, IpsecLbError>
+        {
+            let map = ebpf.map_mut(MAP_KEY_FENCES).ok_or_else(|| {
+                IpsecLbError::io("xdp_key_fences_map", invalid_data("map missing"))
+            })?;
+            BpfHashMap::<_, [u8; OWNER_KEY_LEN], u64>::try_from(map)
+                .map_err(|error| map_error("xdp_key_fences_map", error))
+        }
+
+        fn read_pinned_owners(
+            path: &Path,
+            expected_config: &[u8; CONFIG_VALUE_LEN],
+        ) -> Result<(PinnedOwners, u32), IpsecLbError> {
+            let (map, id) = Self::map_schema(
+                path,
+                "xdp_upgrade_owners_schema",
+                MapType::Hash,
+                OWNER_KEY_LEN as u32,
+                OWNER_VALUE_LEN as u32,
+                65_536,
+            )?;
+            let owners = BpfHashMap::<_, [u8; OWNER_KEY_LEN], [u8; OWNER_VALUE_LEN]>::try_from(
+                Map::HashMap(map),
+            )
+            .map_err(|error| map_error("xdp_upgrade_owners_open", error))?;
+            let mut values = BTreeMap::new();
+            for key in owners.keys() {
+                let key = key.map_err(|error| map_error("xdp_upgrade_owners_read", error))?;
+                Self::validate_pinned_owner_key(key, expected_config)?;
+                let raw = owners
+                    .get(&key, 0)
+                    .map_err(|error| map_error("xdp_upgrade_owners_read", error))?;
+                XdpOwnerValue::decode(&raw).ok_or(IpsecLbError::XdpUpgradeIndeterminate)?;
+                values.insert(key, raw);
+            }
+            Ok((values, id))
+        }
+
+        fn read_pinned_key_fences(
+            path: &Path,
+            expected_config: &[u8; CONFIG_VALUE_LEN],
+        ) -> Result<(BTreeMap<[u8; OWNER_KEY_LEN], u64>, u32), IpsecLbError> {
+            let (map, id) = Self::map_schema(
+                path,
+                "xdp_upgrade_key_fences_schema",
+                MapType::Hash,
+                OWNER_KEY_LEN as u32,
+                8,
+                65_536,
+            )?;
+            let fences = BpfHashMap::<_, [u8; OWNER_KEY_LEN], u64>::try_from(Map::HashMap(map))
+                .map_err(|error| map_error("xdp_upgrade_key_fences_open", error))?;
+            let mut generations = BTreeMap::new();
+            for key in fences.keys() {
+                let key = key.map_err(|error| map_error("xdp_upgrade_key_fences_read", error))?;
+                Self::validate_pinned_owner_key(key, expected_config)?;
+                let generation = fences
+                    .get(&key, 0)
+                    .map_err(|error| map_error("xdp_upgrade_key_fences_read", error))?;
+                if generation == 0 {
+                    return Err(IpsecLbError::XdpUpgradeIndeterminate);
+                }
+                generations.insert(key, generation);
+            }
+            Ok((generations, id))
+        }
+
+        fn validate_pinned_owner_key(
+            map_key: [u8; OWNER_KEY_LEN],
+            expected_config: &[u8; CONFIG_VALUE_LEN],
+        ) -> Result<(), IpsecLbError> {
+            let encoded_len = usize::from(map_key[0]);
+            if encoded_len == 0
+                || encoded_len > OWNERSHIP_KEY_MAX_ENCODED_BYTES
+                || map_key[encoded_len + 1..].iter().any(|byte| *byte != 0)
+            {
+                return Err(IpsecLbError::XdpUpgradeIndeterminate);
+            }
+            let key = SessionOwnershipKey::from_canonical_bytes(&map_key[1..=encoded_len])
+                .map_err(|_| IpsecLbError::XdpUpgradeIndeterminate)?;
+            let expected_domain = u64::from_be_bytes([
+                expected_config[4],
+                expected_config[5],
+                expected_config[6],
+                expected_config[7],
+                expected_config[8],
+                expected_config[9],
+                expected_config[10],
+                expected_config[11],
+            ]);
+            if key.destination().routing_domain().get() != expected_domain
+                || owner_map_key(&key) != map_key
+            {
+                return Err(IpsecLbError::XdpUpgradeIndeterminate);
+            }
+            Ok(())
+        }
+
+        fn write_key_fences_map(
+            ebpf: &mut Ebpf,
+            fences: &BTreeMap<[u8; OWNER_KEY_LEN], u64>,
+        ) -> Result<(), IpsecLbError> {
+            let mut map = Self::key_fences_map(ebpf)?;
+            for (key, generation) in fences {
+                if *generation == 0 {
+                    return Err(IpsecLbError::XdpUpgradeIndeterminate);
+                }
+                map.insert(*key, *generation, 0)
+                    .map_err(|error| map_error("xdp_key_fences_initialize", error))?;
+            }
+            Ok(())
+        }
+
+        fn write_owners_map(
+            ebpf: &mut Ebpf,
+            owners: &BTreeMap<[u8; OWNER_KEY_LEN], [u8; OWNER_VALUE_LEN]>,
+        ) -> Result<(), IpsecLbError> {
+            let mut map = Self::owners_map(ebpf)?;
+            for (key, raw_owner) in owners {
+                XdpOwnerValue::decode(raw_owner).ok_or(IpsecLbError::XdpUpgradeIndeterminate)?;
+                map.insert(*key, *raw_owner, 0)
+                    .map_err(|error| map_error("xdp_owners_initialize", error))?;
+            }
+            Ok(())
+        }
+
+        fn seed_live_key_fences_from_owners(
+            ebpf: &mut Ebpf,
+            legacy_floor: u64,
+            config: &[u8; CONFIG_VALUE_LEN],
+        ) -> Result<(), IpsecLbError> {
+            let owner_generations = {
+                let owners = Self::owners_map(ebpf)?;
+                let mut observed = BTreeMap::new();
+                for key in owners.keys() {
+                    let key = key.map_err(|error| map_error("xdp_handoff_owners_read", error))?;
+                    Self::validate_pinned_owner_key(key, config)?;
+                    let raw = owners
+                        .get(&key, 0)
+                        .map_err(|error| map_error("xdp_handoff_owners_read", error))?;
+                    let value =
+                        XdpOwnerValue::decode(&raw).ok_or(IpsecLbError::XdpUpgradeIndeterminate)?;
+                    observed.insert(key, value.generation.max(legacy_floor));
+                }
+                observed
+            };
+            let mut fences = Self::key_fences_map(ebpf)?;
+            for (key, generation) in owner_generations {
+                let current = match fences.get(&key, 0) {
+                    Ok(current) => current,
+                    Err(MapError::KeyNotFound) => 0,
+                    Err(error) => return Err(map_error("xdp_handoff_key_fence_read", error)),
+                };
+                if current < generation {
+                    fences
+                        .insert(key, generation, 0)
+                        .map_err(|error| map_error("xdp_handoff_key_fence_write", error))?;
+                }
+                if fences
+                    .get(&key, 0)
+                    .map_err(|error| map_error("xdp_handoff_key_fence_readback", error))?
+                    != current.max(generation)
+                {
+                    return Err(IpsecLbError::XdpUpgradeIndeterminate);
+                }
+            }
+            Ok(())
+        }
+
+        fn prepare_live_per_key_handoff(
+            ebpf: &mut Ebpf,
+            config: &[u8; CONFIG_VALUE_LEN],
+        ) -> Result<(), IpsecLbError> {
+            let owners = {
+                let owners = Self::owners_map(ebpf)?;
+                let mut observed = BTreeMap::new();
+                for key in owners.keys() {
+                    let key = key.map_err(|error| map_error("xdp_handoff_owners_read", error))?;
+                    Self::validate_pinned_owner_key(key, config)?;
+                    let raw = owners
+                        .get(&key, 0)
+                        .map_err(|error| map_error("xdp_handoff_owners_read", error))?;
+                    let value =
+                        XdpOwnerValue::decode(&raw).ok_or(IpsecLbError::XdpUpgradeIndeterminate)?;
+                    observed.insert(key, value.generation);
+                }
+                observed
+            };
+            let mut fences = Self::key_fences_map(ebpf)?;
+            for (key, owner_generation) in owners {
+                match fences.get(&key, 0) {
+                    Ok(fence_generation) if fence_generation == owner_generation => {
+                        fences
+                            .remove(&key)
+                            .map_err(|error| map_error("xdp_handoff_key_fence_remove", error))?;
+                        match fences.get(&key, 0) {
+                            Err(MapError::KeyNotFound) => {}
+                            Ok(_) => return Err(IpsecLbError::XdpUpgradeIndeterminate),
+                            Err(error) => {
+                                return Err(map_error("xdp_handoff_key_fence_readback", error));
+                            }
+                        }
+                    }
+                    Err(MapError::KeyNotFound) => {}
+                    Ok(_) => {
+                        return Err(IpsecLbError::XdpUpgradeIndeterminate);
+                    }
+                    Err(error) => return Err(map_error("xdp_handoff_key_fence_read", error)),
+                }
+            }
+            Ok(())
+        }
+
         fn unpin_namespace(map_pin_dir: &Path, remove_directory: bool) -> Result<(), IpsecLbError> {
-            // Delete fencing evidence last. V1 stores its fence inline in the
-            // config map and has no fence pin; v2-v4 store it in the fence
-            // map. This order therefore leaves a readable non-regression
-            // witness after every interrupted SDK-produced cleanup until the
-            // namespace is otherwise empty.
-            for map_name in [MAP_OWNERS, MAP_COUNTERS, MAP_CONFIG, MAP_FENCE] {
+            // Remove authority-bearing state before its schema, but retain the
+            // scalar fence as the final crash witness. Every interrupted SDK
+            // cleanup is therefore either self-describing or the narrowly
+            // recognized, exact-schema scalar-fence tail.
+            for map_name in [
+                MAP_OWNERS,
+                MAP_COUNTERS,
+                MAP_KEY_FENCES,
+                MAP_CONFIG,
+                MAP_FENCE,
+            ] {
                 match fs::remove_file(map_pin_dir.join(map_name)) {
                     Ok(()) => {}
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -1715,9 +3476,15 @@ mod aya_runtime {
         }
 
         fn namespace_has_any_pin(path: &Path) -> bool {
-            [MAP_OWNERS, MAP_CONFIG, MAP_FENCE, MAP_COUNTERS]
-                .iter()
-                .any(|name| path.join(name).exists())
+            [
+                MAP_OWNERS,
+                MAP_CONFIG,
+                MAP_FENCE,
+                MAP_KEY_FENCES,
+                MAP_COUNTERS,
+            ]
+            .iter()
+            .any(|name| path.join(name).exists())
         }
 
         fn audit_interface_directory(interface_dir: &Path) -> Result<(), IpsecLbError> {
@@ -1736,6 +3503,7 @@ mod aya_runtime {
                     MAP_CONFIG,
                     MAP_FENCE,
                     MAP_COUNTERS,
+                    MAP_KEY_FENCES,
                 ]
                 .iter()
                 .any(|allowed| name == std::ffi::OsStr::new(allowed));
@@ -1756,9 +3524,15 @@ mod aya_runtime {
                 let entry =
                     entry.map_err(|error| IpsecLbError::io("xdp_map_namespace_read", error))?;
                 let name = entry.file_name();
-                let allowed = [MAP_OWNERS, MAP_CONFIG, MAP_FENCE, MAP_COUNTERS]
-                    .iter()
-                    .any(|allowed| name == std::ffi::OsStr::new(allowed));
+                let allowed = [
+                    MAP_OWNERS,
+                    MAP_CONFIG,
+                    MAP_FENCE,
+                    MAP_KEY_FENCES,
+                    MAP_COUNTERS,
+                ]
+                .iter()
+                .any(|allowed| name == std::ffi::OsStr::new(allowed));
                 if !allowed {
                     return Err(IpsecLbError::XdpUpgradeIndeterminate);
                 }
@@ -1836,7 +3610,12 @@ mod aya_runtime {
             value: &[u8; CONFIG_VALUE_LEN],
             expected: &[u8; CONFIG_VALUE_LEN],
         ) -> bool {
-            value[1] == 0
+            let fence_mode_matches = if value[0] >= 5 {
+                value[1] == expected[1]
+            } else {
+                value[1] == 0
+            };
+            fence_mode_matches
                 && value[2..12] == expected[2..12]
                 && value[20..24] == expected[20..24]
                 && value[24..].iter().all(|byte| *byte == 0)
@@ -1893,7 +3672,7 @@ mod aya_runtime {
                 {
                     return Err(IpsecLbError::XdpUpgradeRequiresDrain);
                 }
-                let expected_type = if value[0] == XDP_CONFIG_ABI_VERSION {
+                let expected_type = if value[0] >= 4 {
                     MapType::Hash
                 } else {
                     MapType::Array
@@ -1954,6 +3733,11 @@ mod aya_runtime {
             let mut map_ids = BTreeSet::new();
             let mut config = None;
             let mut config_type = None;
+            let mut owners = BTreeMap::new();
+            let mut key_fences = BTreeMap::new();
+            let owners_map_present = path.join(MAP_OWNERS).exists();
+            let key_fence_map_present = path.join(MAP_KEY_FENCES).exists();
+            let counters_map_present = path.join(MAP_COUNTERS).exists();
             if path.join(MAP_CONFIG).exists() {
                 let (value, map_type, id) =
                     Self::partial_config_pin(&path.join(MAP_CONFIG), expected_config)?;
@@ -1962,14 +3746,15 @@ mod aya_runtime {
                 map_ids.insert(id);
             }
             if path.join(MAP_OWNERS).exists() {
-                let (_, id) = Self::map_schema(
-                    &path.join(MAP_OWNERS),
-                    "xdp_partial_owners_schema",
-                    MapType::Hash,
-                    OWNER_KEY_LEN as u32,
-                    OWNER_VALUE_LEN as u32,
-                    65_536,
-                )?;
+                let (observed, id) =
+                    Self::read_pinned_owners(&path.join(MAP_OWNERS), expected_config)?;
+                owners = observed;
+                map_ids.insert(id);
+            }
+            if path.join(MAP_KEY_FENCES).exists() {
+                let (observed, id) =
+                    Self::read_pinned_key_fences(&path.join(MAP_KEY_FENCES), expected_config)?;
+                key_fences = observed;
                 map_ids.insert(id);
             }
             if path.join(MAP_COUNTERS).exists() {
@@ -2024,7 +3809,13 @@ mod aya_runtime {
 
             Ok(PartialPinnedMapNamespace {
                 slot,
+                version: config.map(|value| value[0]),
                 fence_generation,
+                owners,
+                owners_map_present,
+                key_fences,
+                key_fence_map_present,
+                counters_map_present,
                 map_ids,
             })
         }
@@ -2054,7 +3845,7 @@ mod aya_runtime {
             {
                 return Err(IpsecLbError::XdpUpgradeRequiresDrain);
             }
-            let expected_config_type = if version == XDP_CONFIG_ABI_VERSION {
+            let expected_config_type = if version >= 4 {
                 MapType::Hash
             } else {
                 MapType::Array
@@ -2063,14 +3854,8 @@ mod aya_runtime {
                 return Err(IpsecLbError::XdpUpgradeIndeterminate);
             }
 
-            let (_, owners_id) = Self::map_schema(
-                &path.join(MAP_OWNERS),
-                "xdp_upgrade_owners_schema",
-                MapType::Hash,
-                OWNER_KEY_LEN as u32,
-                OWNER_VALUE_LEN as u32,
-                65_536,
-            )?;
+            let (owners, owners_id) =
+                Self::read_pinned_owners(&path.join(MAP_OWNERS), expected_config)?;
             let (_, counters_id) = Self::map_schema(
                 &path.join(MAP_COUNTERS),
                 "xdp_upgrade_counters_schema",
@@ -2081,6 +3866,20 @@ mod aya_runtime {
             )?;
 
             let mut map_ids = BTreeSet::from([config_id, owners_id, counters_id]);
+            let key_fences = if version >= 5 {
+                if !path.join(MAP_KEY_FENCES).is_file() {
+                    return Err(IpsecLbError::XdpUpgradeIndeterminate);
+                }
+                let (key_fences, key_fences_id) =
+                    Self::read_pinned_key_fences(&path.join(MAP_KEY_FENCES), expected_config)?;
+                map_ids.insert(key_fences_id);
+                key_fences
+            } else {
+                if path.join(MAP_KEY_FENCES).exists() {
+                    return Err(IpsecLbError::XdpUpgradeIndeterminate);
+                }
+                BTreeMap::new()
+            };
             let fence_generation = if version == 1 {
                 if path.join(MAP_FENCE).exists() {
                     return Err(IpsecLbError::XdpUpgradeIndeterminate);
@@ -2128,11 +3927,26 @@ mod aya_runtime {
                 }
             };
 
+            if version >= 5 && config[1] == 1 {
+                for (key, raw_owner) in &owners {
+                    let owner = XdpOwnerValue::decode(raw_owner)
+                        .ok_or(IpsecLbError::XdpUpgradeIndeterminate)?;
+                    if key_fences
+                        .get(key)
+                        .is_some_and(|fence| *fence != owner.generation)
+                    {
+                        return Err(IpsecLbError::XdpUpgradeIndeterminate);
+                    }
+                }
+            }
+
             Ok(Some(PinnedMapNamespace {
                 slot,
                 version,
                 config,
                 fence_generation,
+                owners,
+                key_fences,
                 map_ids,
             }))
         }
@@ -2164,17 +3978,18 @@ mod aya_runtime {
             Ok(inventory)
         }
 
-        fn staging_slot(inventory: &PinnedNamespaceInventory) -> MapNamespaceSlot {
-            let max_fence = inventory.max_fence();
-            let mut max_sources = inventory
-                .fence_sources()
-                .filter(|(_, generation)| *generation == max_fence);
-            let first = max_sources.next().map(|(slot, _)| slot);
-            let unique_max = first.filter(|_| max_sources.next().is_none());
-            match unique_max {
-                Some(MapNamespaceSlot::A) => MapNamespaceSlot::B,
-                Some(MapNamespaceSlot::B | MapNamespaceSlot::Legacy) | None => MapNamespaceSlot::A,
+        fn staging_slot(
+            inventory: &PinnedNamespaceInventory,
+            expected_config: &[u8; CONFIG_VALUE_LEN],
+        ) -> Result<MapNamespaceSlot, IpsecLbError> {
+            for candidate in [MapNamespaceSlot::A, MapNamespaceSlot::B] {
+                if !inventory.has_slot(candidate)
+                    || inventory.target_overwrite_is_redundant(candidate, expected_config)?
+                {
+                    return Ok(candidate);
+                }
             }
+            Err(IpsecLbError::XdpUpgradeIndeterminate)
         }
 
         fn persist_namespace_fence(
@@ -2217,7 +4032,7 @@ mod aya_runtime {
                         .set(FENCE_KEY, generation, 0)
                         .map_err(|error| map_error("xdp_upgrade_fence_persist", error))?;
                 }
-                3 | 4 => {
+                3..=5 => {
                     let (map, _) = Self::map_schema(
                         &path.join(MAP_FENCE),
                         "xdp_upgrade_fence_schema",
@@ -2248,6 +4063,8 @@ mod aya_runtime {
             slot: MapNamespaceSlot,
             expected_config: &[u8; CONFIG_VALUE_LEN],
             expected_fence: u64,
+            expected_owners: &PinnedOwners,
+            expected_key_fences: &PinnedKeyFences,
             program: &ProgramInfo,
         ) -> Result<(), IpsecLbError> {
             let staged = Self::inspect_namespace(interface_dir, slot, expected_config)?
@@ -2255,10 +4072,11 @@ mod aya_runtime {
             if staged.version != XDP_CONFIG_ABI_VERSION
                 || staged.config != *expected_config
                 || staged.fence_generation != expected_fence
+                || staged.owners != *expected_owners
+                || staged.key_fences != *expected_key_fences
             {
                 return Err(IpsecLbError::XdpUpgradeIndeterminate);
             }
-            Self::pinned_owners_empty(&slot.path(interface_dir))?;
             let _ = Self::active_namespace(std::slice::from_ref(&staged), program)?;
             Ok(())
         }
@@ -2355,26 +4173,6 @@ mod aya_runtime {
                 }
             }
             found.ok_or(IpsecLbError::XdpUpgradeRequiresDrain)
-        }
-
-        fn pinned_owners_empty(map_pin_dir: &Path) -> Result<(), IpsecLbError> {
-            let (map, _) = Self::map_schema(
-                &map_pin_dir.join(MAP_OWNERS),
-                "xdp_upgrade_owners_schema",
-                MapType::Hash,
-                OWNER_KEY_LEN as u32,
-                OWNER_VALUE_LEN as u32,
-                65_536,
-            )?;
-            let owners = BpfHashMap::<_, [u8; OWNER_KEY_LEN], [u8; OWNER_VALUE_LEN]>::try_from(
-                Map::HashMap(map),
-            )
-            .map_err(|error| map_error("xdp_upgrade_owners_open", error))?;
-            match owners.keys().next() {
-                None => Ok(()),
-                Some(Ok(_)) => Err(IpsecLbError::XdpUpgradeRequiresDrain),
-                Some(Err(error)) => Err(map_error("xdp_upgrade_owners_verify_empty", error)),
-            }
         }
 
         fn cleanup_namespaces_except(
@@ -2506,18 +4304,21 @@ mod aya_runtime {
             }
 
             let inventory = Self::inspect_namespaces(interface_dir, &config)?;
+            inventory.validate_destination_scoped_migration(&config)?;
             let fence_generation = inventory.max_fence();
-            let map_slot = Self::staging_slot(&inventory);
+            let recovery_maps = inventory.recovery_maps_for_config(&config)?;
+            let map_slot = Self::staging_slot(&inventory, &config)?;
             let map_pin_dir = map_slot.path(interface_dir);
             Self::unpin_namespace(&map_pin_dir, map_slot.remove_directory())?;
             let mut ebpf = Self::load_fresh(&map_pin_dir)?;
             let stage_result = (|| {
-                Self::owners_empty_map(&mut ebpf)?;
                 Self::config_write_map(&mut ebpf, config)?;
                 let mut fence = Self::fence_map(&mut ebpf)?;
                 fence
                     .insert(FENCE_KEY, fence_generation, 0)
                     .map_err(|error| map_error("xdp_fence_initialize", error))?;
+                Self::write_owners_map(&mut ebpf, &recovery_maps.owners)?;
+                Self::write_key_fences_map(&mut ebpf, &recovery_maps.key_fences)?;
                 let program = Self::xdp_program(&mut ebpf)?;
                 program
                     .load()
@@ -2539,6 +4340,8 @@ mod aya_runtime {
                 map_slot,
                 &config,
                 fence_generation,
+                &recovery_maps.owners,
+                &recovery_maps.key_fences,
                 &staged_program,
             ) {
                 drop(ebpf);
@@ -2657,8 +4460,6 @@ mod aya_runtime {
                 {
                     return Err(IpsecLbError::XdpUpgradeIndeterminate);
                 }
-                Self::owners_flush_map(&mut device.ebpf)?;
-                Self::owners_empty_map(&mut device.ebpf)?;
                 let fence_generation = {
                     let fence = Self::fence_map(&mut device.ebpf)?;
                     match fence.get(&FENCE_KEY, 0) {
@@ -2667,6 +4468,20 @@ mod aya_runtime {
                         Err(error) => return Err(map_error("xdp_fence_read", error)),
                     }
                 };
+                let config = Self::config_read_map(&mut device.ebpf)?;
+                match config[1] {
+                    0 => {
+                        Self::seed_live_key_fences_from_owners(
+                            &mut device.ebpf,
+                            fence_generation,
+                            &config,
+                        )?;
+                        Self::owners_flush_map(&mut device.ebpf)?;
+                        Self::owners_empty_map(&mut device.ebpf)?;
+                    }
+                    1 => Self::prepare_live_per_key_handoff(&mut device.ebpf, &config)?,
+                    _ => return Err(IpsecLbError::XdpUpgradeIndeterminate),
+                }
                 let handoff_path = interface_dir.join(HANDOFF_LINK);
                 if handoff_path.exists() {
                     return Err(IpsecLbError::XdpUpgradeIndeterminate);
@@ -2741,7 +4556,11 @@ mod aya_runtime {
             let old_program = sys::open_xdp_program_by_id(attached_program_id)
                 .map_err(|error| unchanged(IpsecLbError::io("xdp_upgrade_program_open", error)))?;
             let old_program_info = Self::program_info(attached_program_id).map_err(unchanged)?;
-            let inventory = Self::inspect_namespaces(interface_dir, &config).map_err(unchanged)?;
+            let mut inventory =
+                Self::inspect_namespaces(interface_dir, &config).map_err(unchanged)?;
+            inventory
+                .validate_destination_scoped_migration(&config)
+                .map_err(unchanged)?;
             let active = Self::active_namespace(&inventory.complete, &old_program_info)
                 .map_err(unchanged)?;
             if inventory
@@ -2751,28 +4570,56 @@ mod aya_runtime {
             {
                 return Err(unchanged(IpsecLbError::XdpUpgradeIndeterminate));
             }
-            Self::pinned_owners_empty(&active.slot.path(interface_dir)).map_err(unchanged)?;
             let fence_generation = inventory.max_fence();
-            if active.fence_generation < fence_generation {
-                Self::persist_namespace_fence(interface_dir, active, fence_generation, &config)
-                    .map_err(unchanged)?;
-            }
             let target_slot = match active.slot {
                 MapNamespaceSlot::A => MapNamespaceSlot::B,
                 MapNamespaceSlot::Legacy | MapNamespaceSlot::B => MapNamespaceSlot::A,
             };
+            if active.fence_generation < fence_generation {
+                Self::persist_namespace_fence(interface_dir, active, fence_generation, &config)
+                    .map_err(unchanged)?;
+                // Re-read all pins after carrying the scalar maximum into the
+                // live namespace. A disjoint scalar-only target is now
+                // redundant, but unique owner/keyed-fence evidence must still
+                // prevent target erasure.
+                inventory = Self::inspect_namespaces(interface_dir, &config).map_err(unchanged)?;
+                inventory
+                    .validate_destination_scoped_migration(&config)
+                    .map_err(unchanged)?;
+                let refreshed_active =
+                    Self::active_namespace(&inventory.complete, &old_program_info)
+                        .map_err(unchanged)?;
+                if refreshed_active.slot == target_slot
+                    || inventory
+                        .partial
+                        .iter()
+                        .any(|partial| !partial.map_ids.is_disjoint(&refreshed_active.map_ids))
+                {
+                    return Err(unchanged(IpsecLbError::XdpUpgradeIndeterminate));
+                }
+            }
+            if !inventory
+                .target_overwrite_is_redundant(target_slot, &config)
+                .map_err(unchanged)?
+            {
+                return Err(unchanged(IpsecLbError::XdpUpgradeRequiresDrain));
+            }
+            let recovery_maps = inventory
+                .recovery_maps_for_config(&config)
+                .map_err(unchanged)?;
             let target_dir = target_slot.path(interface_dir);
             Self::unpin_namespace(&target_dir, target_slot.remove_directory())
                 .map_err(unchanged)?;
             let mut new_ebpf = Self::load_fresh(&target_dir).map_err(unchanged)?;
 
             let initialize_result = (|| {
-                Self::owners_empty_map(&mut new_ebpf)?;
                 Self::config_write_map(&mut new_ebpf, config)?;
                 let mut fence = Self::fence_map(&mut new_ebpf)?;
                 fence
                     .insert(FENCE_KEY, fence_generation, 0)
                     .map_err(|error| map_error("xdp_upgrade_fence_initialize", error))?;
+                Self::write_owners_map(&mut new_ebpf, &recovery_maps.owners)?;
+                Self::write_key_fences_map(&mut new_ebpf, &recovery_maps.key_fences)?;
                 let new_program = Self::xdp_program(&mut new_ebpf)?;
                 new_program
                     .load()
@@ -2795,6 +4642,8 @@ mod aya_runtime {
                 target_slot,
                 &config,
                 fence_generation,
+                &recovery_maps.owners,
+                &recovery_maps.key_fences,
                 &staged_program,
             ) {
                 drop(new_ebpf);
@@ -3071,6 +4920,79 @@ mod aya_runtime {
                 hash.insert(FENCE_KEY, generation, 0)
                     .map_err(|error| map_error("xdp_fence_write", error))
             })
+        }
+
+        fn key_fence_read(
+            &self,
+            ifindex: u32,
+            key: [u8; OWNER_KEY_LEN],
+        ) -> Result<Option<u64>, IpsecLbError> {
+            self.with_device(ifindex, "xdp_key_fence_read", |device| {
+                let hash = Self::key_fences_map(&mut device.ebpf)?;
+                match hash.get(&key, 0) {
+                    Ok(generation) => Ok(Some(generation)),
+                    Err(MapError::KeyNotFound) => Ok(None),
+                    Err(error) => Err(map_error("xdp_key_fence_read", error)),
+                }
+            })
+        }
+
+        fn key_fence_write(
+            &self,
+            ifindex: u32,
+            key: [u8; OWNER_KEY_LEN],
+            generation: u64,
+        ) -> Result<(), IpsecLbError> {
+            self.with_device(ifindex, "xdp_key_fence_write", |device| {
+                let mut hash = Self::key_fences_map(&mut device.ebpf)?;
+                hash.insert(key, generation, 0)
+                    .map_err(|error| map_error("xdp_key_fence_write", error))
+            })
+        }
+
+        fn key_fence_remove(
+            &self,
+            ifindex: u32,
+            key: [u8; OWNER_KEY_LEN],
+        ) -> Result<bool, IpsecLbError> {
+            self.with_device(ifindex, "xdp_key_fence_remove", |device| {
+                let mut hash = Self::key_fences_map(&mut device.ebpf)?;
+                match hash.remove(&key) {
+                    Ok(()) => Ok(true),
+                    Err(MapError::KeyNotFound) => Ok(false),
+                    Err(error) => Err(map_error("xdp_key_fence_remove", error)),
+                }
+            })
+        }
+
+        fn quiesce_repin(&self, ifindex: u32) -> Result<(), IpsecLbError> {
+            self.with_device(ifindex, "xdp_repin_quiesce", |device| {
+                let map = device.ebpf.map_mut(MAP_CONFIG).ok_or_else(|| {
+                    IpsecLbError::io("xdp_config_map", invalid_data("map missing"))
+                })?;
+                let mut hash = BpfHashMap::<_, u32, [u8; CONFIG_VALUE_LEN]>::try_from(map)
+                    .map_err(|error| map_error("xdp_config_map", error))?;
+                let remove = hash
+                    .remove(&CONFIG_KEY)
+                    .map_err(|error| map_error("xdp_repin_quiesce", error));
+                match hash.get(&CONFIG_KEY, 0) {
+                    Err(MapError::KeyNotFound) => Ok(()),
+                    Ok(_) => Err(remove.err().unwrap_or_else(|| {
+                        IpsecLbError::adapter_contract_violation(
+                            "host_xdp_repin_quiesce_readback_mismatch",
+                        )
+                    })),
+                    Err(error) => Err(map_error("xdp_repin_quiesce_readback", error)),
+                }
+            })
+        }
+
+        fn repin_pins_feasible(
+            &self,
+            pin_dir: &Path,
+            config: &[u8; CONFIG_VALUE_LEN],
+        ) -> Result<(), IpsecLbError> {
+            Self::repin_pins_feasible(pin_dir, config)
         }
 
         fn counters_read(
@@ -3662,8 +5584,431 @@ mod aya_runtime {
                 version: XDP_CONFIG_ABI_VERSION,
                 config: [0; CONFIG_VALUE_LEN],
                 fence_generation: 0,
+                owners: BTreeMap::new(),
+                key_fences: BTreeMap::new(),
                 map_ids: map_ids.iter().copied().collect(),
             }
+        }
+
+        fn raw_owner(owner_shard: u16, generation: u64) -> [u8; OWNER_VALUE_LEN] {
+            XdpOwnerValue {
+                owner_shard,
+                generation,
+            }
+            .encode()
+        }
+
+        fn config(fence_mode: u8) -> [u8; CONFIG_VALUE_LEN] {
+            let mut config = [0; CONFIG_VALUE_LEN];
+            config[0] = XDP_CONFIG_ABI_VERSION;
+            config[1] = fence_mode;
+            config
+        }
+
+        fn partial_namespace(
+            version: Option<u8>,
+            owners: PinnedOwners,
+            owners_map_present: bool,
+            key_fences: PinnedKeyFences,
+            key_fence_map_present: bool,
+            counters_map_present: bool,
+            map_ids: &[u32],
+        ) -> PartialPinnedMapNamespace {
+            PartialPinnedMapNamespace {
+                slot: MapNamespaceSlot::A,
+                version,
+                fence_generation: 19,
+                owners,
+                owners_map_present,
+                key_fences,
+                key_fence_map_present,
+                counters_map_present,
+                map_ids: map_ids.iter().copied().collect(),
+            }
+        }
+
+        #[test]
+        fn v5_cleanup_prefixes_preserve_every_remaining_authority_witness() {
+            let key = [7; OWNER_KEY_LEN];
+            let destination_scoped = config(1);
+            let mut complete = namespace(MapNamespaceSlot::A, &[1, 2, 3, 4, 5]);
+            complete.fence_generation = 19;
+            complete.owners.insert(key, raw_owner(2, 17));
+            complete.key_fences.insert(key, 17);
+            let complete_inventory = PinnedNamespaceInventory {
+                complete: vec![complete],
+                partial: Vec::new(),
+            };
+            assert_eq!(
+                complete_inventory.validate_destination_scoped_migration(&destination_scoped),
+                Ok(()),
+                "complete cut 0 must remain recoverable"
+            );
+            assert_eq!(complete_inventory.max_fence(), 19);
+            let recovered = complete_inventory
+                .recovery_maps_for_config(&destination_scoped)
+                .expect("recover complete v5 namespace");
+            assert_eq!(recovered.owners.get(&key), Some(&raw_owner(2, 17)));
+            assert!(!recovered.key_fences.contains_key(&key));
+
+            let prefixes = [
+                partial_namespace(
+                    Some(XDP_CONFIG_ABI_VERSION),
+                    BTreeMap::new(),
+                    false,
+                    BTreeMap::from([(key, 17)]),
+                    true,
+                    true,
+                    &[1, 2, 3, 4],
+                ),
+                partial_namespace(
+                    Some(XDP_CONFIG_ABI_VERSION),
+                    BTreeMap::new(),
+                    false,
+                    BTreeMap::from([(key, 17)]),
+                    true,
+                    false,
+                    &[1, 2, 3],
+                ),
+                partial_namespace(
+                    Some(XDP_CONFIG_ABI_VERSION),
+                    BTreeMap::new(),
+                    false,
+                    BTreeMap::new(),
+                    false,
+                    false,
+                    &[1, 2],
+                ),
+                partial_namespace(
+                    None,
+                    BTreeMap::new(),
+                    false,
+                    BTreeMap::new(),
+                    false,
+                    false,
+                    &[1],
+                ),
+            ];
+
+            for (index, partial) in prefixes.into_iter().enumerate() {
+                let inventory = PinnedNamespaceInventory {
+                    complete: Vec::new(),
+                    partial: vec![partial],
+                };
+                assert_eq!(
+                    inventory.validate_destination_scoped_migration(&destination_scoped),
+                    Ok(()),
+                    "cleanup cut {} must remain recoverable",
+                    index + 1
+                );
+                assert_eq!(inventory.max_fence(), 19);
+                let recovered = inventory
+                    .recovery_maps_for_config(&destination_scoped)
+                    .expect("recover exact cleanup prefix");
+                if index < 2 {
+                    assert_eq!(recovered.key_fences.get(&key), Some(&17));
+                } else {
+                    assert!(recovered.key_fences.is_empty());
+                }
+                assert!(recovered.owners.is_empty());
+            }
+
+            let empty = PinnedNamespaceInventory::default();
+            assert_eq!(
+                empty.validate_destination_scoped_migration(&destination_scoped),
+                Ok(())
+            );
+        }
+
+        #[test]
+        fn v5_cleanup_residue_classifier_rejects_ambiguous_pin_mixtures() {
+            let key = [7; OWNER_KEY_LEN];
+            let destination_scoped = config(1);
+            let ambiguous = [
+                partial_namespace(
+                    Some(XDP_CONFIG_ABI_VERSION),
+                    BTreeMap::new(),
+                    true,
+                    BTreeMap::new(),
+                    false,
+                    false,
+                    &[1, 2, 3],
+                ),
+                partial_namespace(
+                    Some(XDP_CONFIG_ABI_VERSION),
+                    BTreeMap::new(),
+                    false,
+                    BTreeMap::new(),
+                    false,
+                    true,
+                    &[1, 2, 3],
+                ),
+                partial_namespace(
+                    Some(XDP_CONFIG_ABI_VERSION),
+                    BTreeMap::from([(key, raw_owner(2, 17))]),
+                    false,
+                    BTreeMap::new(),
+                    false,
+                    false,
+                    &[1, 2],
+                ),
+                partial_namespace(
+                    Some(XDP_CONFIG_ABI_VERSION),
+                    BTreeMap::new(),
+                    false,
+                    BTreeMap::from([(key, 17)]),
+                    false,
+                    false,
+                    &[1, 2],
+                ),
+                partial_namespace(
+                    Some(XDP_CONFIG_ABI_VERSION),
+                    BTreeMap::new(),
+                    false,
+                    BTreeMap::new(),
+                    false,
+                    false,
+                    &[1, 2, 3],
+                ),
+                partial_namespace(
+                    None,
+                    BTreeMap::new(),
+                    false,
+                    BTreeMap::new(),
+                    false,
+                    false,
+                    &[1, 2],
+                ),
+                partial_namespace(
+                    None,
+                    BTreeMap::new(),
+                    false,
+                    BTreeMap::new(),
+                    false,
+                    true,
+                    &[1, 2],
+                ),
+            ];
+
+            for partial in ambiguous {
+                let inventory = PinnedNamespaceInventory {
+                    complete: Vec::new(),
+                    partial: vec![partial],
+                };
+                assert_eq!(
+                    inventory.validate_destination_scoped_migration(&destination_scoped),
+                    Err(IpsecLbError::XdpUpgradeIndeterminate)
+                );
+            }
+        }
+
+        #[test]
+        fn v5_restart_preserves_owner_only_and_fence_only_witnesses() {
+            let live_key = [1; OWNER_KEY_LEN];
+            let staged_key = [2; OWNER_KEY_LEN];
+            let wrong_owner_key = [3; OWNER_KEY_LEN];
+            let fence_only_key = [4; OWNER_KEY_LEN];
+            let mut pinned = namespace(MapNamespaceSlot::A, &[1, 2, 3, 4, 5]);
+            pinned.owners.insert(live_key, raw_owner(2, 10));
+            pinned.key_fences.insert(live_key, 10);
+            pinned.owners.insert(staged_key, raw_owner(3, 11));
+            pinned.owners.insert(wrong_owner_key, raw_owner(4, 12));
+            pinned.key_fences.insert(fence_only_key, 13);
+            let inventory = PinnedNamespaceInventory {
+                complete: vec![pinned],
+                partial: Vec::new(),
+            };
+
+            let recovered = inventory.recovery_maps().expect("normalize v5 restart");
+            assert_eq!(recovered.owners.get(&live_key), Some(&raw_owner(2, 10)));
+            assert_eq!(recovered.owners.get(&staged_key), Some(&raw_owner(3, 11)));
+            assert_eq!(
+                recovered.owners.get(&wrong_owner_key),
+                Some(&raw_owner(4, 12))
+            );
+            assert!(!recovered.key_fences.contains_key(&live_key));
+            assert_eq!(recovered.key_fences.get(&fence_only_key), Some(&13));
+        }
+
+        #[test]
+        fn v5_restart_rejects_mismatched_owner_and_fence_pair() {
+            let key = [1; OWNER_KEY_LEN];
+            let mut pinned = namespace(MapNamespaceSlot::A, &[1, 2, 3, 4, 5]);
+            pinned.owners.insert(key, raw_owner(2, 10));
+            pinned.key_fences.insert(key, 11);
+            let inventory = PinnedNamespaceInventory {
+                complete: vec![pinned],
+                partial: Vec::new(),
+            };
+
+            assert_eq!(
+                inventory.recovery_maps(),
+                Err(IpsecLbError::XdpUpgradeIndeterminate)
+            );
+        }
+
+        #[test]
+        fn legacy_restart_seeds_only_a_fence_witness() {
+            let key = [1; OWNER_KEY_LEN];
+            let mut pinned = namespace(MapNamespaceSlot::Legacy, &[1, 2, 3, 4]);
+            pinned.version = 4;
+            pinned.fence_generation = 12;
+            pinned.owners.insert(key, raw_owner(2, 10));
+            let inventory = PinnedNamespaceInventory {
+                complete: vec![pinned],
+                partial: Vec::new(),
+            };
+
+            let recovered = inventory.recovery_maps().expect("normalize legacy restart");
+            assert!(recovered.owners.is_empty());
+            assert_eq!(recovered.key_fences.get(&key), Some(&12));
+        }
+
+        #[test]
+        fn partial_legacy_evidence_cannot_coexist_with_a_recovered_owner() {
+            let key = [1; OWNER_KEY_LEN];
+            for (legacy_generation, expected_owner, expected_fence) in [
+                (9, true, None),
+                (10, false, Some(10)),
+                (11, false, Some(11)),
+            ] {
+                let mut current = namespace(MapNamespaceSlot::A, &[1, 2, 3, 4, 5]);
+                current.owners.insert(key, raw_owner(2, 10));
+                let partial = PartialPinnedMapNamespace {
+                    slot: MapNamespaceSlot::B,
+                    version: Some(4),
+                    fence_generation: 0,
+                    owners: BTreeMap::from([(key, raw_owner(3, legacy_generation))]),
+                    owners_map_present: true,
+                    key_fences: BTreeMap::new(),
+                    key_fence_map_present: false,
+                    counters_map_present: false,
+                    map_ids: BTreeSet::new(),
+                };
+                let inventory = PinnedNamespaceInventory {
+                    complete: vec![current],
+                    partial: vec![partial],
+                };
+
+                let recovered = inventory.recovery_maps().expect("merge legacy witness");
+                assert_eq!(recovered.owners.contains_key(&key), expected_owner);
+                assert_eq!(recovered.key_fences.get(&key).copied(), expected_fence);
+                assert!(recovered
+                    .owners
+                    .keys()
+                    .all(|owner_key| !recovered.key_fences.contains_key(owner_key)));
+            }
+        }
+
+        #[test]
+        fn global_attach_and_adoption_never_rearm_persisted_owners() {
+            let key = [1; OWNER_KEY_LEN];
+            let mut active = namespace(MapNamespaceSlot::A, &[1, 2, 3, 4, 5]);
+            active.fence_generation = 10;
+            active.owners.insert(key, raw_owner(2, 10));
+            active.key_fences.insert(key, 10);
+            let inventory = PinnedNamespaceInventory {
+                complete: vec![active],
+                partial: Vec::new(),
+            };
+            let global_config = config(0);
+
+            let recovered = inventory
+                .recovery_maps_for_config(&global_config)
+                .expect("normalize global restart");
+            assert!(recovered.owners.is_empty());
+            assert_eq!(recovered.key_fences.get(&key), Some(&10));
+            assert_eq!(
+                AyaHostXdpRuntime::staging_slot(&inventory, &global_config),
+                Ok(MapNamespaceSlot::B)
+            );
+            assert_eq!(
+                inventory.target_overwrite_is_redundant(MapNamespaceSlot::B, &global_config),
+                Ok(true)
+            );
+        }
+
+        #[test]
+        fn scalar_only_target_becomes_redundant_after_active_fence_carry_forward() {
+            let mut active = namespace(MapNamespaceSlot::Legacy, &[1, 2, 3, 4, 5]);
+            active.fence_generation = 83;
+            let scalar_only_target = PartialPinnedMapNamespace {
+                slot: MapNamespaceSlot::A,
+                version: None,
+                fence_generation: 84,
+                owners: BTreeMap::new(),
+                owners_map_present: false,
+                key_fences: BTreeMap::new(),
+                key_fence_map_present: false,
+                counters_map_present: false,
+                map_ids: BTreeSet::from([6]),
+            };
+            let mut inventory = PinnedNamespaceInventory {
+                complete: vec![active],
+                partial: vec![scalar_only_target],
+            };
+            let global_config = config(0);
+
+            assert_eq!(
+                inventory.target_overwrite_is_redundant(MapNamespaceSlot::A, &global_config,),
+                Ok(false),
+                "the unique scalar maximum must not be erased"
+            );
+
+            let max_fence = inventory.max_fence();
+            inventory.complete[0].fence_generation = max_fence;
+            assert_eq!(
+                inventory.target_overwrite_is_redundant(MapNamespaceSlot::A, &global_config,),
+                Ok(true),
+                "a target is disposable only after the live namespace carries its maximum"
+            );
+        }
+
+        #[test]
+        fn adoption_refuses_to_unpin_unique_owner_or_fence_witness() {
+            let owner_key = [1; OWNER_KEY_LEN];
+            let fence_key = [2; OWNER_KEY_LEN];
+            let active = namespace(MapNamespaceSlot::A, &[1, 2, 3, 4, 5]);
+            let destination_scoped_config = config(1);
+
+            let mut unique_owner = namespace(MapNamespaceSlot::B, &[6, 7, 8, 9, 10]);
+            unique_owner.owners.insert(owner_key, raw_owner(2, 10));
+            let owner_inventory = PinnedNamespaceInventory {
+                complete: vec![active],
+                partial: vec![PartialPinnedMapNamespace {
+                    slot: MapNamespaceSlot::B,
+                    version: Some(unique_owner.version),
+                    fence_generation: unique_owner.fence_generation,
+                    owners: unique_owner.owners,
+                    owners_map_present: true,
+                    key_fences: unique_owner.key_fences,
+                    key_fence_map_present: true,
+                    counters_map_present: false,
+                    map_ids: unique_owner.map_ids,
+                }],
+            };
+            assert_eq!(
+                owner_inventory.target_overwrite_is_redundant(
+                    MapNamespaceSlot::B,
+                    &destination_scoped_config,
+                ),
+                Ok(false)
+            );
+
+            let active = namespace(MapNamespaceSlot::A, &[1, 2, 3, 4, 5]);
+            let mut unique_fence = namespace(MapNamespaceSlot::B, &[6, 7, 8, 9, 10]);
+            unique_fence.key_fences.insert(fence_key, 11);
+            let fence_inventory = PinnedNamespaceInventory {
+                complete: vec![active, unique_fence],
+                partial: Vec::new(),
+            };
+            assert_eq!(
+                fence_inventory.target_overwrite_is_redundant(
+                    MapNamespaceSlot::B,
+                    &destination_scoped_config,
+                ),
+                Ok(false)
+            );
         }
 
         #[test]
@@ -4054,6 +6399,8 @@ mod tests {
     use std::collections::HashMap;
     use std::num::NonZeroU32;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    #[cfg(target_os = "linux")]
+    use std::sync::MutexGuard;
 
     #[cfg(target_os = "linux")]
     use std::fs;
@@ -4063,11 +6410,32 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
+    use crate::failover::{
+        AntiReplayResume, SendIvCounterMode, SendIvForwardJump, MIN_SEND_IV_FORWARD_JUMP,
+    };
+    use crate::mock::{MockOwnershipFencer, MockOwnershipSource, MockRePinAuditSink};
     use crate::model::IpAddress;
     use crate::ownership::{
         DestinationContext, EspEncapsulationKind, EspOwnershipKey, EspSpi,
         EstablishedIkeOwnershipKey, IkeSpi,
     };
+    use crate::repin::{
+        OwnershipFence, OwnershipRetirementRequest, OwnershipTransitionId, RePinCoordinator,
+        RePinRequest, RePinRetryStage, ResumeKeySource, SameSpiOutboundIvResume, SameSpiResume,
+    };
+    use opc_ipsec_lb_ebpf_common::{decide_owner_verdict_with_keyed_fence, XdpVerdict};
+    use opc_ipsec_xfrm::OutboundSaBindingId;
+
+    #[cfg(target_os = "linux")]
+    static PROCESS_SPAWN_TEST_GUARD: Mutex<()> = Mutex::new(());
+
+    #[cfg(target_os = "linux")]
+    fn lock_process_spawn_tests() -> MutexGuard<'static, ()> {
+        match PROCESS_SPAWN_TEST_GUARD.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
 
     #[derive(Debug, Default)]
     struct TestRuntime {
@@ -4094,6 +6462,7 @@ mod tests {
         config: Option<[u8; CONFIG_VALUE_LEN]>,
         owners: HashMap<(u32, [u8; OWNER_KEY_LEN]), [u8; OWNER_VALUE_LEN]>,
         fences: HashMap<u32, u64>,
+        key_fences: HashMap<(u32, [u8; OWNER_KEY_LEN]), u64>,
         leases: HashMap<u32, Box<dyn HostXdpLifecycleLock>>,
         fence_writes: Vec<u64>,
         link_up: bool,
@@ -4105,6 +6474,24 @@ mod tests {
         adopt_error: Option<&'static str>,
         detach_error_before_drop: Option<&'static str>,
         detach_error_after_drop: Option<&'static str>,
+        owner_get_calls: usize,
+        owner_get_failures: usize,
+        owner_get_failure_on_call: Option<usize>,
+        owner_get_override_on_call: Option<(usize, Option<[u8; OWNER_VALUE_LEN]>)>,
+        owner_remove_calls: usize,
+        owner_remove_failures: usize,
+        owner_remove_failure_on_call: Option<usize>,
+        owner_insert_error_after_apply: bool,
+        key_fence_read_failures: usize,
+        key_fence_read_calls: usize,
+        key_fence_read_failure_on_call: Option<usize>,
+        key_fence_write_failures: usize,
+        key_fence_write_error_after_apply: bool,
+        key_fence_remove_failures: usize,
+        key_fence_remove_error_after_apply: bool,
+        key_fence_read_failure_after_remove: bool,
+        quiesce_failures: usize,
+        repin_pins_error: Option<&'static str>,
         counters: [u64; COUNTER_SLOTS as usize],
     }
 
@@ -4130,6 +6517,7 @@ mod tests {
                 config: None,
                 owners: HashMap::new(),
                 fences: HashMap::new(),
+                key_fences: HashMap::new(),
                 leases: HashMap::new(),
                 fence_writes: Vec::new(),
                 link_up: true,
@@ -4141,6 +6529,24 @@ mod tests {
                 adopt_error: None,
                 detach_error_before_drop: None,
                 detach_error_after_drop: None,
+                owner_get_calls: 0,
+                owner_get_failures: 0,
+                owner_get_failure_on_call: None,
+                owner_get_override_on_call: None,
+                owner_remove_calls: 0,
+                owner_remove_failures: 0,
+                owner_remove_failure_on_call: None,
+                owner_insert_error_after_apply: false,
+                key_fence_read_failures: 0,
+                key_fence_read_calls: 0,
+                key_fence_read_failure_on_call: None,
+                key_fence_write_failures: 0,
+                key_fence_write_error_after_apply: false,
+                key_fence_remove_failures: 0,
+                key_fence_remove_error_after_apply: false,
+                key_fence_read_failure_after_remove: false,
+                quiesce_failures: 0,
+                repin_pins_error: None,
                 counters: [0; COUNTER_SLOTS as usize],
             }
         }
@@ -4246,6 +6652,25 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
             let mut state = self.state();
+            if XdpDatapathConfig::decode(&config)
+                .is_some_and(|config| config.fence_mode == XdpFenceMode::PerOwnershipKey)
+            {
+                // Mirror production v5 recovery: a complete matching pair is
+                // made non-live before the program is attached, retaining the
+                // owner as an exact-retry witness while removing its fence.
+                let live_keys: Vec<_> = state
+                    .owners
+                    .iter()
+                    .filter_map(|(&(owner_ifindex, key), raw)| {
+                        let owner = XdpOwnerValue::decode(raw)?;
+                        (state.key_fences.get(&(owner_ifindex, key)) == Some(&owner.generation))
+                            .then_some((owner_ifindex, key))
+                    })
+                    .collect();
+                for key in live_keys {
+                    state.key_fences.remove(&key);
+                }
+            }
             state
                 .attached
                 .push((interface.to_owned(), ifindex, pin_dir.to_path_buf()));
@@ -4352,6 +6777,17 @@ mod tests {
                     HostXdpLinkDisposition::Detached,
                 ));
             }
+            // Successful production detach unpins the namespace maps. Model
+            // that cleanup so a proven Detached state can be probed and
+            // reattached from a clean namespace.
+            state.config = None;
+            state
+                .owners
+                .retain(|(owner_ifindex, _), _| *owner_ifindex != ifindex);
+            state
+                .key_fences
+                .retain(|(fence_ifindex, _), _| *fence_ifindex != ifindex);
+            state.fences.remove(&ifindex);
             Ok(())
         }
 
@@ -4360,7 +6796,32 @@ mod tests {
             ifindex: u32,
             key: [u8; OWNER_KEY_LEN],
         ) -> Result<Option<[u8; OWNER_VALUE_LEN]>, IpsecLbError> {
-            Ok(self.state().owners.get(&(ifindex, key)).copied())
+            let mut state = self.state();
+            state.owner_get_calls = state.owner_get_calls.saturating_add(1);
+            if state.owner_get_failure_on_call == Some(state.owner_get_calls) {
+                state.owner_get_failure_on_call = None;
+                return Err(IpsecLbError::io(
+                    "xdp_test_owner_get",
+                    io::Error::other("injected owner readback failure"),
+                ));
+            }
+            if state.owner_get_failures > 0 {
+                state.owner_get_failures -= 1;
+                return Err(IpsecLbError::io(
+                    "xdp_test_owner_get",
+                    io::Error::other("injected owner readback failure"),
+                ));
+            }
+            if state
+                .owner_get_override_on_call
+                .is_some_and(|(call, _)| call == state.owner_get_calls)
+            {
+                return Ok(state
+                    .owner_get_override_on_call
+                    .take()
+                    .and_then(|(_, value)| value));
+            }
+            Ok(state.owners.get(&(ifindex, key)).copied())
         }
 
         fn owner_insert(
@@ -4369,7 +6830,15 @@ mod tests {
             key: [u8; OWNER_KEY_LEN],
             value: [u8; OWNER_VALUE_LEN],
         ) -> Result<(), IpsecLbError> {
-            self.state().owners.insert((ifindex, key), value);
+            let mut state = self.state();
+            state.owners.insert((ifindex, key), value);
+            if state.owner_insert_error_after_apply {
+                state.owner_insert_error_after_apply = false;
+                return Err(IpsecLbError::io(
+                    "xdp_test_owner_insert",
+                    io::Error::other("injected owner insert acknowledgement failure"),
+                ));
+            }
             Ok(())
         }
 
@@ -4378,7 +6847,23 @@ mod tests {
             ifindex: u32,
             key: [u8; OWNER_KEY_LEN],
         ) -> Result<bool, IpsecLbError> {
-            Ok(self.state().owners.remove(&(ifindex, key)).is_some())
+            let mut state = self.state();
+            state.owner_remove_calls = state.owner_remove_calls.saturating_add(1);
+            if state.owner_remove_failure_on_call == Some(state.owner_remove_calls) {
+                state.owner_remove_failure_on_call = None;
+                return Err(IpsecLbError::io(
+                    "xdp_test_owner_remove",
+                    io::Error::other("injected owner rollback failure"),
+                ));
+            }
+            if state.owner_remove_failures > 0 {
+                state.owner_remove_failures -= 1;
+                return Err(IpsecLbError::io(
+                    "xdp_test_owner_remove",
+                    io::Error::other("injected owner rollback failure"),
+                ));
+            }
+            Ok(state.owners.remove(&(ifindex, key)).is_some())
         }
 
         fn fence_read(&self, ifindex: u32) -> Result<u64, IpsecLbError> {
@@ -4397,6 +6882,110 @@ mod tests {
             state.fences.insert(ifindex, generation);
             state.fence_writes.push(generation);
             Ok(())
+        }
+
+        fn key_fence_read(
+            &self,
+            ifindex: u32,
+            key: [u8; OWNER_KEY_LEN],
+        ) -> Result<Option<u64>, IpsecLbError> {
+            let mut state = self.state();
+            state.key_fence_read_calls = state.key_fence_read_calls.saturating_add(1);
+            if state.key_fence_read_failure_on_call == Some(state.key_fence_read_calls) {
+                state.key_fence_read_failure_on_call = None;
+                return Err(IpsecLbError::io(
+                    "xdp_test_key_fence_read",
+                    io::Error::other("injected keyed-fence readback failure"),
+                ));
+            }
+            if state.key_fence_read_failures > 0 {
+                state.key_fence_read_failures -= 1;
+                return Err(IpsecLbError::io(
+                    "xdp_test_key_fence_read",
+                    io::Error::other("injected keyed-fence readback failure"),
+                ));
+            }
+            Ok(state.key_fences.get(&(ifindex, key)).copied())
+        }
+
+        fn key_fence_write(
+            &self,
+            ifindex: u32,
+            key: [u8; OWNER_KEY_LEN],
+            generation: u64,
+        ) -> Result<(), IpsecLbError> {
+            let mut state = self.state();
+            if state.key_fence_write_failures > 0 {
+                state.key_fence_write_failures -= 1;
+                return Err(IpsecLbError::io(
+                    "xdp_test_key_fence_write",
+                    io::Error::other("injected keyed-fence write failure"),
+                ));
+            }
+            state.key_fences.insert((ifindex, key), generation);
+            if state.key_fence_write_error_after_apply {
+                state.key_fence_write_error_after_apply = false;
+                return Err(IpsecLbError::io(
+                    "xdp_test_key_fence_write",
+                    io::Error::other("injected keyed-fence acknowledgement failure"),
+                ));
+            }
+            Ok(())
+        }
+
+        fn key_fence_remove(
+            &self,
+            ifindex: u32,
+            key: [u8; OWNER_KEY_LEN],
+        ) -> Result<bool, IpsecLbError> {
+            let mut state = self.state();
+            if state.key_fence_remove_failures > 0 {
+                state.key_fence_remove_failures -= 1;
+                return Err(IpsecLbError::io(
+                    "xdp_test_key_fence_remove",
+                    io::Error::other("injected keyed-fence remove failure"),
+                ));
+            }
+            let removed = state.key_fences.remove(&(ifindex, key)).is_some();
+            if state.key_fence_read_failure_after_remove {
+                state.key_fence_read_failure_after_remove = false;
+                state.key_fence_read_failures = state.key_fence_read_failures.saturating_add(1);
+            }
+            if state.key_fence_remove_error_after_apply {
+                state.key_fence_remove_error_after_apply = false;
+                return Err(IpsecLbError::io(
+                    "xdp_test_key_fence_remove",
+                    io::Error::other("injected keyed-fence remove acknowledgement failure"),
+                ));
+            }
+            Ok(removed)
+        }
+
+        fn quiesce_repin(&self, _ifindex: u32) -> Result<(), IpsecLbError> {
+            let mut state = self.state();
+            if state.quiesce_failures > 0 {
+                state.quiesce_failures -= 1;
+                return Err(IpsecLbError::io(
+                    "xdp_test_repin_quiesce",
+                    io::Error::other("injected repin quiesce failure"),
+                ));
+            }
+            state.config = None;
+            Ok(())
+        }
+
+        fn repin_pins_feasible(
+            &self,
+            _pin_dir: &Path,
+            _config: &[u8; CONFIG_VALUE_LEN],
+        ) -> Result<(), IpsecLbError> {
+            match self.state().repin_pins_error {
+                Some(operation) => Err(IpsecLbError::io(
+                    operation,
+                    io::Error::other("injected keyed migration failure"),
+                )),
+                None => Ok(()),
+            }
         }
 
         fn counters_read(
@@ -4427,6 +7016,21 @@ mod tests {
         }
     }
 
+    fn repin_config() -> HostXdpSteeringBackendConfig {
+        config().for_destination_scoped_repin()
+    }
+
+    fn apply_keyed_test_update(
+        backend: &HostXdpSteeringBackend,
+        key: &SessionOwnershipKey,
+        owner: ShardId,
+        generation: u64,
+    ) -> Result<(), IpsecLbError> {
+        let _operation = backend.operation_gate()?;
+        let ifindex = backend.ensure_attached_under_gate()?;
+        backend.apply_keyed_owner_under_gate(ifindex, key, owner, generation, None)
+    }
+
     fn esp_key(spi: u32) -> SessionOwnershipKey {
         SessionOwnershipKey::Esp(EspOwnershipKey::new(
             DestinationContext::new(IpAddress::V4([203, 0, 113, 7]), RoutingDomainTag::new(7)),
@@ -4435,12 +7039,713 @@ mod tests {
         ))
     }
 
+    fn test_outbound_sa_binding_id(spi: u32) -> OutboundSaBindingId {
+        let mut bytes = [0x66; 32];
+        bytes[..4].copy_from_slice(&spi.to_be_bytes());
+        OutboundSaBindingId::from_bytes(bytes)
+    }
+
+    fn owner_value(owner_shard: u16, generation: u64) -> [u8; OWNER_VALUE_LEN] {
+        XdpOwnerValue {
+            owner_shard,
+            generation,
+        }
+        .encode()
+    }
+
+    fn coordinator_repin_request(
+        spi: u32,
+        ownership_key: SessionOwnershipKey,
+        transition_id: u128,
+    ) -> RePinRequest {
+        let sa = crate::SaId::Esp { spi };
+        RePinRequest {
+            sa,
+            transition_id: OwnershipTransitionId::new(transition_id).expect("nonzero"),
+            previous_fence: OwnershipFence::new(1).expect("nonzero"),
+            previous_owner: crate::ClusterNode::new("source"),
+            new_owner: crate::ClusterNode::new("target"),
+            rule: crate::SteeringRule {
+                shard: ShardId::new(7),
+                owner: ShardId::new(3),
+                key: crate::SteerKey::EspSpi(spi),
+            },
+            ownership_key,
+            outbound_sa_binding_id: Some(test_outbound_sa_binding_id(spi)),
+            resume: SameSpiResume {
+                previous_sa: sa,
+                resumed_sa: sa,
+                outbound_iv: SameSpiOutboundIvResume::CounterBased {
+                    checkpointed_send_iv_next: 10,
+                    restored_send_iv_next: 10 + MIN_SEND_IV_FORWARD_JUMP,
+                    forward_jump: Some(SendIvForwardJump {
+                        forward_jump: MIN_SEND_IV_FORWARD_JUMP,
+                        counter_mode: SendIvCounterMode::EspExtendedSequenceNumbers {
+                            max_peer_sequence_lag: 0,
+                        },
+                    }),
+                },
+                anti_replay: AntiReplayResume::ExactWindowRestore {
+                    checkpoint_highest_accepted: 9,
+                    restored_highest_accepted: 9,
+                },
+                key_source: ResumeKeySource::LiveMirrored,
+            },
+        }
+    }
+
+    fn deterministic_host_test_permit(
+        backend: &HostXdpSteeringBackend,
+        key: SessionOwnershipKey,
+        retirement_armed: bool,
+    ) -> RePinSteeringOperationPermit {
+        let stripe = backend.repin_stripe(&key);
+        let evidence = HostXdpRePinPermitEvidence {
+            backend_identity: Arc::clone(&backend.inner.repin_identity),
+            stripe,
+            ownership_key: key,
+            _guards: Arc::new(HostXdpRePinGuardSet {
+                _guards: Vec::new(),
+            }),
+            poison_if_unclassified: retirement_armed,
+            retirement_classified: false,
+        };
+        RePinSteeringOperationPermit::guarded(key, evidence)
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct IndeterminateRetirementAuthority;
+
+    #[async_trait]
+    impl crate::OwnershipFencer for IndeterminateRetirementAuthority {
+        async fn recover_fence_grant(
+            &self,
+            _request: &crate::OwnershipFenceRequest,
+        ) -> Result<Option<crate::OwnershipFenceGrant>, IpsecLbError> {
+            Err(IpsecLbError::Unsupported)
+        }
+
+        async fn fence_sa_owner(
+            &self,
+            _request: crate::OwnershipFenceRequest,
+        ) -> Result<crate::OwnershipFenceGrant, IpsecLbError> {
+            Err(IpsecLbError::Unsupported)
+        }
+
+        async fn validate_retry_proof(
+            &self,
+            _proof: &crate::OwnershipRetryProof,
+        ) -> Result<(), IpsecLbError> {
+            Err(IpsecLbError::Unsupported)
+        }
+    }
+
+    #[async_trait]
+    impl crate::OwnershipRetirementAuthority for IndeterminateRetirementAuthority {
+        async fn begin_ownership_retirement(
+            &self,
+            _request: OwnershipRetirementRequest,
+        ) -> Result<crate::OwnershipRetirementAdmission, IpsecLbError> {
+            Err(IpsecLbError::OwnershipRetirementIndeterminate)
+        }
+
+        async fn finalize_ownership_retirement(
+            &self,
+            _cleanup: &crate::OwnershipCleanupCompleteProof,
+        ) -> Result<crate::OwnershipRetirementFinalization, IpsecLbError> {
+            Err(IpsecLbError::Unsupported)
+        }
+    }
+
+    fn keyed_test_verdict(runtime: &TestRuntime, map_key: [u8; OWNER_KEY_LEN]) -> XdpVerdict {
+        let state = runtime.state();
+        let config = XdpDatapathConfig {
+            fence_mode: XdpFenceMode::PerOwnershipKey,
+            self_shard: 3,
+            routing_domain: 7,
+            handoff_ifindex: 42,
+        };
+        decide_owner_verdict_with_keyed_fence(
+            state.owners.get(&(7, map_key)).copied(),
+            &config,
+            u64::MAX,
+            state.key_fences.get(&(7, map_key)).copied(),
+        )
+    }
+
     fn established_key() -> SessionOwnershipKey {
         SessionOwnershipKey::EstablishedIke(EstablishedIkeOwnershipKey::new(
             DestinationContext::new(IpAddress::V4([203, 0, 113, 7]), RoutingDomainTag::new(7)),
             IkeSpi::new(0x1111).expect("nonzero"),
             IkeSpi::new(0x2222).expect("nonzero"),
         ))
+    }
+
+    fn retirement_grant(
+        spi: u32,
+        active_fence: u64,
+        retirement_fence: u64,
+    ) -> OwnershipRetirementGrant {
+        let sa = crate::SaId::Esp { spi };
+        let request = RePinRequest {
+            sa,
+            transition_id: OwnershipTransitionId::new(77).expect("nonzero"),
+            previous_fence: OwnershipFence::new(active_fence - 1).expect("nonzero"),
+            previous_owner: crate::ClusterNode::new("source"),
+            new_owner: crate::ClusterNode::new("target"),
+            rule: crate::SteeringRule {
+                shard: ShardId::new(7),
+                owner: ShardId::new(3),
+                key: crate::SteerKey::EspSpi(spi),
+            },
+            ownership_key: esp_key(spi),
+            outbound_sa_binding_id: Some(test_outbound_sa_binding_id(spi)),
+            resume: SameSpiResume {
+                previous_sa: sa,
+                resumed_sa: sa,
+                outbound_iv: SameSpiOutboundIvResume::CounterBased {
+                    checkpointed_send_iv_next: 10,
+                    restored_send_iv_next: 10 + MIN_SEND_IV_FORWARD_JUMP,
+                    forward_jump: Some(SendIvForwardJump {
+                        forward_jump: MIN_SEND_IV_FORWARD_JUMP,
+                        counter_mode: SendIvCounterMode::EspExtendedSequenceNumbers {
+                            max_peer_sequence_lag: 0,
+                        },
+                    }),
+                },
+                anti_replay: AntiReplayResume::ExactWindowRestore {
+                    checkpoint_highest_accepted: 9,
+                    restored_highest_accepted: 9,
+                },
+                key_source: ResumeKeySource::LiveMirrored,
+            },
+        };
+        OwnershipRetirementGrant::new(
+            OwnershipRetirementRequest::from_committed(
+                &request,
+                OwnershipFence::new(active_fence).expect("nonzero"),
+            ),
+            OwnershipFence::new(retirement_fence).expect("nonzero"),
+        )
+    }
+
+    async fn retire_with_fresh_permit(
+        backend: &HostXdpSteeringBackend,
+        grant: &OwnershipRetirementGrant,
+    ) -> Result<(), IpsecLbError> {
+        let mut permits = backend
+            .acquire_repin_retirement_permits(vec![grant.request().ownership_key()])
+            .await?;
+        let permit = permits.pop().ok_or_else(|| {
+            IpsecLbError::adapter_contract_violation("test_retirement_permit_missing")
+        })?;
+        let permit = backend.arm_repin_retirement_permit(permit)?;
+        let permit = backend.retire_fenced_repin(grant, permit).await?;
+        drop(permit);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retirement_batch_is_bounded_and_deduplicates_colliding_stripes() {
+        let backend = HostXdpSteeringBackend::with_runtime_and_config(
+            "swu0",
+            Arc::new(TestRuntime::default()),
+            repin_config(),
+        );
+        assert!(backend
+            .acquire_repin_retirement_permits(Vec::new())
+            .await
+            .is_err());
+        let oversized = (0..=crate::session_repin::MAX_SESSION_REPIN_SAS)
+            .map(|offset| esp_key(0x1000 + offset as u32))
+            .collect();
+        assert!(backend
+            .acquire_repin_retirement_permits(oversized)
+            .await
+            .is_err());
+
+        let first = esp_key(0x2000);
+        let first_stripe = backend.repin_stripe_index(&first);
+        let second = (0x2001..0x4000)
+            .map(esp_key)
+            .find(|key| backend.repin_stripe_index(key) == first_stripe)
+            .expect("bounded search finds a colliding stripe");
+        let permits = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            backend.acquire_repin_retirement_permits(vec![first, second]),
+        )
+        .await
+        .expect("colliding batch must not self-deadlock")
+        .expect("colliding batch is valid");
+        assert_eq!(permits.len(), 2);
+
+        let blocked_backend = backend.clone();
+        let blocked =
+            tokio::spawn(async move { blocked_backend.acquire_repin_permit(first).await });
+        tokio::task::yield_now().await;
+        assert!(!blocked.is_finished());
+        drop(permits);
+        let activation_permit = tokio::time::timeout(std::time::Duration::from_secs(2), blocked)
+            .await
+            .expect("dropping the complete shared batch releases the stripe")
+            .expect("activation task joins")
+            .expect("activation permit acquires");
+        drop(activation_permit);
+    }
+
+    #[tokio::test]
+    async fn indeterminate_retirement_poison_fails_readiness_and_same_stripe_admission() {
+        let backend = HostXdpSteeringBackend::with_runtime_and_config(
+            "swu0",
+            Arc::new(TestRuntime::default()),
+            repin_config(),
+        );
+        let key = esp_key(0x2f00);
+        let mut permits = backend
+            .acquire_repin_retirement_permits(vec![key])
+            .await
+            .expect("retirement batch acquires");
+        let permit = permits.pop().expect("one permit");
+        let armed = backend
+            .arm_repin_retirement_permit(permit)
+            .expect("permit arms");
+        drop(armed);
+
+        let probe = backend.probe_repin().await.expect("probe completes");
+        assert!(!probe.mutation_ready);
+        assert_eq!(
+            probe.details,
+            Some("Host-XDP re-pin operation state is indeterminate")
+        );
+        assert!(backend.acquire_repin_permit(key).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn indeterminate_authority_result_is_not_classified_as_safe_permit_release() {
+        let backend = HostXdpSteeringBackend::with_runtime_and_config(
+            "swu0",
+            Arc::new(TestRuntime::default()),
+            repin_config(),
+        );
+        let request = coordinator_repin_request(0x2f01, esp_key(0x2f01), 401);
+        let coordinator = RePinCoordinator::new(
+            backend.clone(),
+            IndeterminateRetirementAuthority,
+            MockOwnershipSource::default(),
+            MockRePinAuditSink::new(),
+        )
+        .with_test_applied_esp_counter_proof();
+        let mut permits = coordinator
+            .acquire_retirement_permits(std::slice::from_ref(&request))
+            .await
+            .expect("Host permit batch acquires");
+        let permit = permits.pop().expect("one Host permit");
+
+        let error = match coordinator
+            .cleanup_committed_for_retirement(
+                &request,
+                OwnershipFence::new(2).expect("nonzero"),
+                permit,
+            )
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("ambiguous authority cannot authorize Host cleanup"),
+        };
+        assert_eq!(error, IpsecLbError::OwnershipRetirementIndeterminate);
+        let probe = backend.probe_repin().await.expect("probe completes");
+        assert!(!probe.mutation_ready);
+        assert_eq!(
+            probe.details,
+            Some("Host-XDP re-pin operation state is indeterminate")
+        );
+        assert!(backend
+            .acquire_repin_permit(request.ownership_key)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn public_repin_coordinator_reaches_exact_host_key_owner_and_generation() {
+        let runtime = Arc::new(TestRuntime::default());
+        let backend = HostXdpSteeringBackend::with_runtime_and_config(
+            "swu0",
+            runtime.clone(),
+            repin_config(),
+        );
+        backend.attach().await.expect("attach");
+        let fencer = MockOwnershipFencer::new();
+        let ownership = MockOwnershipSource::default();
+        ownership.set_shard_owner(ShardId::new(3), crate::ClusterNode::new("target"));
+        let coordinator = RePinCoordinator::new(
+            backend,
+            fencer.clone(),
+            ownership,
+            MockRePinAuditSink::new(),
+        )
+        .with_test_applied_esp_counter_proof();
+
+        let spi = 0x3001;
+        let key = esp_key(spi);
+        let request = coordinator_repin_request(spi, key, 301);
+        fencer.set_owner(key, request.previous_owner.clone());
+        let outcome = coordinator
+            .repin(request)
+            .await
+            .expect("typed coordinator publishes Host owner");
+        let map_key = owner_map_key(&key);
+        {
+            let state = runtime.state();
+            assert_eq!(
+                state.owners.get(&(7, map_key)),
+                Some(&owner_value(3, outcome.fence().get()))
+            );
+            assert_eq!(
+                state.key_fences.get(&(7, map_key)),
+                Some(&outcome.fence().get())
+            );
+        }
+
+        let foreign_domain_key = SessionOwnershipKey::Esp(EspOwnershipKey::new(
+            DestinationContext::new(IpAddress::V4([203, 0, 113, 7]), RoutingDomainTag::new(8)),
+            EspEncapsulationKind::UdpEncapsulated,
+            EspSpi::new(0x3002).expect("allocatable"),
+        ));
+        assert!(coordinator
+            .repin(coordinator_repin_request(0x3002, foreign_domain_key, 302))
+            .await
+            .is_err());
+        assert!(!runtime
+            .state()
+            .owners
+            .contains_key(&(7, owner_map_key(&foreign_domain_key))));
+
+        let stale_generation_key = esp_key(0x3003);
+        let stale_map_key = owner_map_key(&stale_generation_key);
+        {
+            let mut state = runtime.state();
+            state.owners.insert((7, stale_map_key), owner_value(4, 99));
+            state.key_fences.insert((7, stale_map_key), 99);
+        }
+        fencer.set_owner(stale_generation_key, crate::ClusterNode::new("source"));
+        assert!(coordinator
+            .repin(coordinator_repin_request(0x3003, stale_generation_key, 303,))
+            .await
+            .is_err());
+        let state = runtime.state();
+        assert_eq!(
+            state.owners.get(&(7, stale_map_key)),
+            Some(&owner_value(4, 99))
+        );
+        assert_eq!(state.key_fences.get(&(7, stale_map_key)), Some(&99));
+    }
+
+    #[tokio::test]
+    async fn fresh_repin_rejects_counter_advance_at_final_guard_before_host_publication() {
+        let runtime = Arc::new(TestRuntime::default());
+        let backend = HostXdpSteeringBackend::with_runtime_and_config(
+            "swu0",
+            runtime.clone(),
+            repin_config(),
+        );
+        backend.attach().await.expect("attach");
+        let fencer = MockOwnershipFencer::new();
+        let ownership = MockOwnershipSource::default();
+        ownership.set_shard_owner(ShardId::new(3), crate::ClusterNode::new("target"));
+        let coordinator = RePinCoordinator::new(
+            backend,
+            fencer.clone(),
+            ownership,
+            MockRePinAuditSink::new(),
+        )
+        .with_test_applied_esp_counter_proof()
+        .with_test_counter_advance_before_first_publication();
+
+        let spi = 0x3010;
+        let key = esp_key(spi);
+        let request = coordinator_repin_request(spi, key, 310);
+        fencer.set_owner(key, request.previous_owner.clone());
+        let error = coordinator
+            .repin(request)
+            .await
+            .expect_err("counter advance between audit and final guard must reject");
+        let partial = error
+            .into_partial()
+            .expect("ownership committed before the final guard");
+        assert_eq!(partial.resume_at(), RePinRetryStage::SteeringInstall);
+        assert!(matches!(
+            partial.cause(),
+            IpsecLbError::AppliedCounterProofRejected {
+                code: "esp_counter_receipt_exact_state_changed"
+            }
+        ));
+        let map_key = owner_map_key(&key);
+        let state = runtime.state();
+        assert!(!state.owners.contains_key(&(7, map_key)));
+        assert!(!state.key_fences.contains_key(&(7, map_key)));
+    }
+
+    #[tokio::test]
+    async fn transient_prepublication_proof_failure_retries_the_fenced_audit_first() {
+        let runtime = Arc::new(TestRuntime::default());
+        let backend = HostXdpSteeringBackend::with_runtime_and_config(
+            "swu0",
+            runtime.clone(),
+            repin_config(),
+        );
+        backend.attach().await.expect("attach");
+        let fencer = MockOwnershipFencer::new();
+        let ownership = MockOwnershipSource::default();
+        ownership.set_shard_owner(ShardId::new(3), crate::ClusterNode::new("target"));
+        let audit = MockRePinAuditSink::new();
+        let coordinator = RePinCoordinator::new(backend, fencer.clone(), ownership, audit.clone())
+            .with_test_applied_esp_counter_proof()
+            .with_test_transient_first_publication_validation_failure();
+
+        let spi = 0x3011;
+        let key = esp_key(spi);
+        let request = coordinator_repin_request(spi, key, 311);
+        fencer.set_owner(key, request.previous_owner.clone());
+        let partial = coordinator
+            .repin(request)
+            .await
+            .expect_err("injected proof read fails after ownership commit")
+            .into_partial()
+            .expect("failure remains retryable");
+        assert_eq!(partial.resume_at(), RePinRetryStage::FencedAudit);
+        assert_eq!(
+            audit
+                .events()
+                .iter()
+                .map(|event| event.kind)
+                .collect::<Vec<_>>(),
+            vec![crate::RePinAuditEventKind::Attempt]
+        );
+
+        coordinator
+            .retry(partial)
+            .await
+            .expect("retry emits fenced audit before publication");
+        assert_eq!(
+            audit
+                .events()
+                .iter()
+                .map(|event| event.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                crate::RePinAuditEventKind::Attempt,
+                crate::RePinAuditEventKind::Fenced,
+                crate::RePinAuditEventKind::SteeringInstalled,
+            ]
+        );
+        assert_eq!(
+            keyed_test_verdict(&runtime, owner_map_key(&key)),
+            XdpVerdict::Local
+        );
+    }
+
+    #[tokio::test]
+    async fn more_than_65536_activation_retirement_cycles_return_host_maps_to_baseline() {
+        const CYCLES: u64 = 65_537;
+
+        let runtime = Arc::new(TestRuntime::default());
+        let backend = HostXdpSteeringBackend::with_runtime_and_config(
+            "swu0",
+            runtime.clone(),
+            repin_config(),
+        );
+        backend.attach().await.expect("attach");
+        let key = esp_key(0x30ff);
+        let request = coordinator_repin_request(0x30ff, key, 500);
+        let baseline = {
+            let state = runtime.state();
+            (state.owners.len(), state.key_fences.len())
+        };
+
+        for cycle in 0..CYCLES {
+            let active_generation = OwnershipFence::new(
+                cycle
+                    .checked_mul(2)
+                    .and_then(|value| value.checked_add(2))
+                    .expect("bounded generation"),
+            )
+            .expect("nonzero active generation");
+            let retirement_generation = OwnershipFence::new(
+                active_generation
+                    .get()
+                    .checked_add(1)
+                    .expect("bounded retirement generation"),
+            )
+            .expect("nonzero retirement generation");
+
+            let activation_permit = deterministic_host_test_permit(&backend, key, false);
+            let activation_permit = backend
+                .apply_fenced_repin_owner_sync(
+                    RePinSteeringUpdate::for_test(&request, active_generation),
+                    activation_permit,
+                )
+                .expect("activation reaches Host maps");
+            drop(activation_permit);
+
+            let grant = OwnershipRetirementGrant::new(
+                OwnershipRetirementRequest::from_committed(&request, active_generation),
+                retirement_generation,
+            );
+            let retirement_permit = deterministic_host_test_permit(&backend, key, true);
+            let retirement_permit = backend
+                .retire_fenced_repin_owner_sync(grant, retirement_permit)
+                .expect("retirement removes exact Host state");
+            drop(retirement_permit);
+        }
+
+        let state = runtime.state();
+        assert_eq!(state.owners.len(), baseline.0);
+        assert_eq!(state.key_fences.len(), baseline.1);
+        assert!(!state.owners.contains_key(&(7, owner_map_key(&key))));
+        assert!(!state.key_fences.contains_key(&(7, owner_map_key(&key))));
+        // Host cleanup is intentionally not the durable ABA barrier. The
+        // paired session-store finalization test proves the per-key store
+        // fence floor survives record deletion and remains authoritative.
+    }
+
+    #[tokio::test]
+    async fn keyed_retirement_converges_every_acknowledgement_cut() {
+        for cut in 0..5 {
+            let runtime = Arc::new(TestRuntime::default());
+            let backend = HostXdpSteeringBackend::with_runtime_and_config(
+                "swu0",
+                runtime.clone(),
+                repin_config(),
+            );
+            backend.attach().await.expect("attach");
+            let grant = retirement_grant(0x3000 + cut, 10, 11);
+            let map_key = owner_map_key(&grant.request().ownership_key());
+            {
+                let mut state = runtime.state();
+                state.owners.insert((7, map_key), owner_value(3, 10));
+                state.key_fences.insert((7, map_key), 10);
+                match cut {
+                    0 => state.key_fence_write_error_after_apply = true,
+                    1 => state.owner_remove_failures = 1,
+                    2 => state.key_fence_remove_failures = 1,
+                    3 => state.key_fence_remove_error_after_apply = true,
+                    4 => state.key_fence_read_failure_after_remove = true,
+                    _ => unreachable!(),
+                }
+            }
+
+            let first = retire_with_fresh_permit(&backend, &grant).await;
+            if matches!(cut, 1 | 2 | 4) {
+                assert!(first.is_err());
+                retire_with_fresh_permit(&backend, &grant)
+                    .await
+                    .expect("retry converges a partial retirement");
+            } else {
+                first.expect("exact readback resolves a lost acknowledgement");
+            }
+            let state = runtime.state();
+            assert!(!state.owners.contains_key(&(7, map_key)));
+            assert!(!state.key_fences.contains_key(&(7, map_key)));
+        }
+    }
+
+    #[tokio::test]
+    async fn keyed_retirement_newer_initial_state_has_zero_mutation() {
+        for (owner, fence) in [
+            (owner_value(4, 12), 12),
+            (owner_value(3, 10), 12),
+            (owner_value(4, 12), 10),
+        ] {
+            let runtime = Arc::new(TestRuntime::default());
+            let backend = HostXdpSteeringBackend::with_runtime_and_config(
+                "swu0",
+                runtime.clone(),
+                repin_config(),
+            );
+            backend.attach().await.expect("attach");
+            let grant = retirement_grant(0x3500, 10, 11);
+            let map_key = owner_map_key(&grant.request().ownership_key());
+            {
+                let mut state = runtime.state();
+                state.owners.insert((7, map_key), owner);
+                state.key_fences.insert((7, map_key), fence);
+            }
+            assert!(retire_with_fresh_permit(&backend, &grant).await.is_err());
+            let state = runtime.state();
+            assert_eq!(state.owners.get(&(7, map_key)), Some(&owner));
+            assert_eq!(state.key_fences.get(&(7, map_key)), Some(&fence));
+            assert_eq!(state.owner_remove_calls, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn keyed_retirement_partial_read_preserves_any_known_newer_witness() {
+        for newer_fence_is_known in [true, false] {
+            let runtime = Arc::new(TestRuntime::default());
+            let backend = HostXdpSteeringBackend::with_runtime_and_config(
+                "swu0",
+                runtime.clone(),
+                repin_config(),
+            );
+            backend.attach().await.expect("attach");
+            let grant = retirement_grant(0x3500, 10, 11);
+            let map_key = owner_map_key(&grant.request().ownership_key());
+            let owner = if newer_fence_is_known {
+                owner_value(3, 10)
+            } else {
+                owner_value(4, 12)
+            };
+            let fence = if newer_fence_is_known { 12 } else { 10 };
+            {
+                let mut state = runtime.state();
+                state.owners.insert((7, map_key), owner);
+                state.key_fences.insert((7, map_key), fence);
+                if newer_fence_is_known {
+                    state.owner_get_failures = 1;
+                } else {
+                    state.key_fence_read_failures = 1;
+                }
+            }
+
+            assert!(matches!(
+                retire_with_fresh_permit(&backend, &grant).await,
+                Err(IpsecLbError::OwnershipConflict { .. })
+            ));
+            let state = runtime.state();
+            assert_eq!(state.owners.get(&(7, map_key)), Some(&owner));
+            assert_eq!(state.key_fences.get(&(7, map_key)), Some(&fence));
+            assert_eq!(state.owner_remove_calls, 0);
+            assert!(state.live_attached);
+            assert!(state.config.is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn keyed_retirement_same_generation_foreign_live_state_is_staled() {
+        let runtime = Arc::new(TestRuntime::default());
+        let backend = HostXdpSteeringBackend::with_runtime_and_config(
+            "swu0",
+            runtime.clone(),
+            repin_config(),
+        );
+        backend.attach().await.expect("attach");
+        let grant = retirement_grant(0x3500, 10, 11);
+        let map_key = owner_map_key(&grant.request().ownership_key());
+        {
+            let mut state = runtime.state();
+            state.owners.insert((7, map_key), owner_value(4, 10));
+            state.key_fences.insert((7, map_key), 10);
+        }
+
+        assert!(retire_with_fresh_permit(&backend, &grant).await.is_err());
+        let state = runtime.state();
+        assert_eq!(state.owners.get(&(7, map_key)), Some(&owner_value(4, 10)));
+        assert_eq!(state.key_fences.get(&(7, map_key)), Some(&11));
+        drop(state);
+        assert_eq!(
+            keyed_test_verdict(&runtime, map_key),
+            XdpVerdict::SlowPathStale
+        );
     }
 
     #[tokio::test]
@@ -4646,6 +7951,747 @@ mod tests {
                 .await,
             Err(IpsecLbError::InvalidConfig { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn keyed_repin_is_exact_per_key_and_preserves_unrelated_generations() {
+        let runtime = Arc::new(TestRuntime::default());
+        let backend = HostXdpSteeringBackend::with_runtime_and_config(
+            "swu0",
+            runtime.clone(),
+            repin_config(),
+        );
+        let high = esp_key(0x0100);
+        let low = esp_key(0x0101);
+
+        apply_keyed_test_update(&backend, &high, ShardId::new(2), 100)
+            .expect("publish high generation");
+        apply_keyed_test_update(&backend, &low, ShardId::new(3), 2)
+            .expect("publish independent low generation");
+        apply_keyed_test_update(&backend, &high, ShardId::new(2), 100)
+            .expect("exact retry is idempotent");
+
+        let state = runtime.state();
+        let high_map_key = owner_map_key(&high);
+        let low_map_key = owner_map_key(&low);
+        assert_eq!(state.key_fences.get(&(7, high_map_key)), Some(&100));
+        assert_eq!(state.key_fences.get(&(7, low_map_key)), Some(&2));
+        assert_eq!(
+            state.owners.get(&(7, high_map_key)),
+            Some(
+                &XdpOwnerValue {
+                    owner_shard: 2,
+                    generation: 100,
+                }
+                .encode()
+            )
+        );
+        assert_eq!(
+            state.owners.get(&(7, low_map_key)),
+            Some(
+                &XdpOwnerValue {
+                    owner_shard: 3,
+                    generation: 2,
+                }
+                .encode()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn keyed_repin_recovers_staged_owner_but_preserves_fence_only_conflict() {
+        let runtime = Arc::new(TestRuntime::default());
+        let backend = HostXdpSteeringBackend::with_runtime_and_config(
+            "swu0",
+            runtime.clone(),
+            repin_config(),
+        );
+        backend.attach().await.expect("attach");
+        let staged_key = esp_key(0x0100);
+        let fenced_key = esp_key(0x0101);
+        let staged_map_key = owner_map_key(&staged_key);
+        let fenced_map_key = owner_map_key(&fenced_key);
+        {
+            let mut state = runtime.state();
+            state.owners.insert((7, staged_map_key), owner_value(3, 10));
+            state.key_fences.insert((7, fenced_map_key), 10);
+        }
+
+        apply_keyed_test_update(&backend, &staged_key, ShardId::new(3), 10)
+            .expect("finish fence-last activation from staged owner");
+        assert_eq!(
+            keyed_test_verdict(&runtime, staged_map_key),
+            XdpVerdict::Local
+        );
+
+        for _ in 0..2 {
+            assert!(matches!(
+                apply_keyed_test_update(&backend, &fenced_key, ShardId::new(3), 10),
+                Err(IpsecLbError::OwnershipConflict { .. })
+            ));
+        }
+        let state = runtime.state();
+        assert!(!state.owners.contains_key(&(7, fenced_map_key)));
+        assert_eq!(state.key_fences.get(&(7, fenced_map_key)), Some(&10));
+    }
+
+    #[tokio::test]
+    async fn keyed_repin_equal_generation_different_owner_fails_closed() {
+        let runtime = Arc::new(TestRuntime::default());
+        let backend = HostXdpSteeringBackend::with_runtime_and_config(
+            "swu0",
+            runtime.clone(),
+            repin_config(),
+        );
+        backend.attach().await.expect("attach");
+        let key = esp_key(0x0100);
+        let map_key = owner_map_key(&key);
+        {
+            let mut state = runtime.state();
+            state.key_fences.insert((7, map_key), 10);
+            state.owners.insert(
+                (7, map_key),
+                XdpOwnerValue {
+                    owner_shard: 2,
+                    generation: 10,
+                }
+                .encode(),
+            );
+        }
+
+        for _ in 0..2 {
+            assert!(matches!(
+                apply_keyed_test_update(&backend, &key, ShardId::new(3), 10),
+                Err(IpsecLbError::OwnershipConflict { .. })
+            ));
+        }
+        let state = runtime.state();
+        assert!(!state.key_fences.contains_key(&(7, map_key)));
+        assert_eq!(state.owners.get(&(7, map_key)), Some(&owner_value(2, 10)));
+    }
+
+    #[tokio::test]
+    async fn keyed_repin_initial_read_failures_publish_a_proven_stale_cut() {
+        for fail_fence_read in [true, false] {
+            let runtime = Arc::new(TestRuntime::default());
+            let backend = HostXdpSteeringBackend::with_runtime_and_config(
+                "swu0",
+                runtime.clone(),
+                repin_config(),
+            );
+            backend.attach().await.expect("attach");
+            let key = esp_key(0x0100);
+            let map_key = owner_map_key(&key);
+            {
+                let mut state = runtime.state();
+                state.owners.insert((7, map_key), owner_value(2, 9));
+                state.key_fences.insert((7, map_key), 9);
+                if fail_fence_read {
+                    state.key_fence_read_failures = 1;
+                } else {
+                    state.owner_get_failures = 1;
+                }
+            }
+
+            assert!(apply_keyed_test_update(&backend, &key, ShardId::new(3), 10).is_err());
+            let state = runtime.state();
+            assert_eq!(state.owners.get(&(7, map_key)), Some(&owner_value(2, 9)));
+            assert_eq!(state.key_fences.get(&(7, map_key)), Some(&10));
+            drop(state);
+            assert_eq!(
+                keyed_test_verdict(&runtime, map_key),
+                XdpVerdict::SlowPathStale
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn keyed_repin_persistent_read_failure_never_overwrites_unknown_authority() {
+        let runtime = Arc::new(TestRuntime::default());
+        let backend = HostXdpSteeringBackend::with_runtime_and_config(
+            "swu0",
+            runtime.clone(),
+            repin_config(),
+        );
+        backend.attach().await.expect("attach");
+        let key = esp_key(0x0100);
+        let map_key = owner_map_key(&key);
+        {
+            let mut state = runtime.state();
+            state.owners.insert((7, map_key), owner_value(2, 9));
+            state.key_fences.insert((7, map_key), 9);
+            state.key_fence_read_failures = 2;
+            state.detach_error_before_drop = Some("xdp_test_detach");
+        }
+
+        let error = apply_keyed_test_update(&backend, &key, ShardId::new(3), 10)
+            .expect_err("persistent read failure must quarantine the backend");
+        assert!(matches!(
+            error,
+            IpsecLbError::AdapterContractViolation {
+                code: "host_xdp_repin_backend_quarantined"
+            }
+        ));
+        {
+            let state = runtime.state();
+            assert_eq!(state.owners.get(&(7, map_key)), Some(&owner_value(2, 9)));
+            assert_eq!(state.key_fences.get(&(7, map_key)), Some(&9));
+            assert!(state.config.is_none());
+            assert!(state.live_attached);
+        }
+        assert!(matches!(
+            backend.probe_repin().await,
+            Ok(SteeringProbe {
+                mutation_ready: false,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn keyed_containment_preserves_any_known_newer_witness_on_partial_read() {
+        for newer_owner_is_known in [true, false] {
+            let runtime = Arc::new(TestRuntime::default());
+            let backend = HostXdpSteeringBackend::with_runtime_and_config(
+                "swu0",
+                runtime.clone(),
+                repin_config(),
+            );
+            backend.attach().await.expect("attach");
+            let map_key = owner_map_key(&esp_key(0x0100));
+            let owner = if newer_owner_is_known {
+                owner_value(4, 12)
+            } else {
+                owner_value(2, 9)
+            };
+            let fence = if newer_owner_is_known { 9 } else { 12 };
+            {
+                let mut state = runtime.state();
+                state.owners.insert((7, map_key), owner);
+                state.key_fences.insert((7, map_key), fence);
+                if newer_owner_is_known {
+                    state.key_fence_read_failures = 1;
+                } else {
+                    state.owner_get_failures = 1;
+                }
+            }
+
+            let error = backend.contain_indeterminate_keyed_state(
+                7,
+                map_key,
+                10,
+                IpsecLbError::adapter_contract_violation("injected_original_error"),
+            );
+            assert!(matches!(error, IpsecLbError::OwnershipConflict { .. }));
+            let state = runtime.state();
+            assert_eq!(state.owners.get(&(7, map_key)), Some(&owner));
+            assert_eq!(state.key_fences.get(&(7, map_key)), Some(&fence));
+            assert!(state.config.is_some());
+            assert!(state.live_attached);
+            assert!(state.detached.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn keyed_repin_indeterminate_reads_preserve_equal_generation_conflict_witnesses() {
+        for fail_fence_read in [true, false] {
+            let runtime = Arc::new(TestRuntime::default());
+            let backend = HostXdpSteeringBackend::with_runtime_and_config(
+                "swu0",
+                runtime.clone(),
+                repin_config(),
+            );
+            backend.attach().await.expect("attach");
+            let key = esp_key(0x0100);
+            let map_key = owner_map_key(&key);
+            {
+                let mut state = runtime.state();
+                state.owners.insert((7, map_key), owner_value(2, 10));
+                state.key_fences.insert((7, map_key), 10);
+                if fail_fence_read {
+                    state.key_fence_read_failures = 1;
+                } else {
+                    state.owner_get_failures = 1;
+                }
+            }
+
+            assert!(apply_keyed_test_update(&backend, &key, ShardId::new(3), 10).is_err());
+            for _ in 0..2 {
+                assert!(matches!(
+                    apply_keyed_test_update(&backend, &key, ShardId::new(3), 10),
+                    Err(IpsecLbError::OwnershipConflict { .. })
+                ));
+            }
+            let state = runtime.state();
+            assert!(!state.key_fences.contains_key(&(7, map_key)));
+            assert_eq!(state.owners.get(&(7, map_key)), Some(&owner_value(2, 10)));
+        }
+    }
+
+    #[tokio::test]
+    async fn keyed_repin_preserves_newer_staged_owner_without_a_matching_fence() {
+        for fence in [None, Some(9)] {
+            let runtime = Arc::new(TestRuntime::default());
+            let backend = HostXdpSteeringBackend::with_runtime_and_config(
+                "swu0",
+                runtime.clone(),
+                repin_config(),
+            );
+            backend.attach().await.expect("attach");
+            let key = esp_key(0x0100);
+            let map_key = owner_map_key(&key);
+            {
+                let mut state = runtime.state();
+                state.owners.insert((7, map_key), owner_value(4, 11));
+                if let Some(fence) = fence {
+                    state.key_fences.insert((7, map_key), fence);
+                }
+            }
+
+            assert!(matches!(
+                apply_keyed_test_update(&backend, &key, ShardId::new(3), 10),
+                Err(IpsecLbError::OwnershipConflict { .. })
+            ));
+            let state = runtime.state();
+            assert_eq!(state.owners.get(&(7, map_key)), Some(&owner_value(4, 11)));
+            assert_eq!(state.key_fences.get(&(7, map_key)).copied(), fence);
+        }
+    }
+
+    #[tokio::test]
+    async fn keyed_repin_removal_failures_leave_the_key_non_live() {
+        for fail_fence_remove in [true, false] {
+            let runtime = Arc::new(TestRuntime::default());
+            let backend = HostXdpSteeringBackend::with_runtime_and_config(
+                "swu0",
+                runtime.clone(),
+                repin_config(),
+            );
+            backend.attach().await.expect("attach");
+            let key = esp_key(0x0100);
+            let map_key = owner_map_key(&key);
+            {
+                let mut state = runtime.state();
+                state.owners.insert((7, map_key), owner_value(2, 9));
+                state.key_fences.insert((7, map_key), 9);
+                if fail_fence_remove {
+                    state.key_fence_remove_failures = 1;
+                } else {
+                    state.owner_remove_failures = 1;
+                }
+            }
+
+            assert!(apply_keyed_test_update(&backend, &key, ShardId::new(3), 10).is_err());
+            assert!(matches!(
+                keyed_test_verdict(&runtime, map_key),
+                XdpVerdict::SlowPathMiss | XdpVerdict::SlowPathStale
+            ));
+            let state = runtime.state();
+            if fail_fence_remove {
+                assert_eq!(state.key_fences.get(&(7, map_key)), Some(&9));
+                assert!(!state.owners.contains_key(&(7, map_key)));
+            } else {
+                assert!(!state.key_fences.contains_key(&(7, map_key)));
+                assert_eq!(state.owners.get(&(7, map_key)), Some(&owner_value(2, 9)));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn keyed_repin_dual_removal_failure_publishes_emergency_stale_cut() {
+        for lost_ack in [false, true] {
+            let runtime = Arc::new(TestRuntime::default());
+            let backend = HostXdpSteeringBackend::with_runtime_and_config(
+                "swu0",
+                runtime.clone(),
+                repin_config(),
+            );
+            backend.attach().await.expect("attach");
+            let key = esp_key(0x0100);
+            let map_key = owner_map_key(&key);
+            {
+                let mut state = runtime.state();
+                state.owners.insert((7, map_key), owner_value(2, 9));
+                state.key_fences.insert((7, map_key), 9);
+                state.key_fence_remove_failures = 1;
+                state.owner_remove_failures = 1;
+                state.key_fence_write_error_after_apply = lost_ack;
+            }
+
+            assert!(apply_keyed_test_update(&backend, &key, ShardId::new(3), 10).is_err());
+            assert_eq!(
+                keyed_test_verdict(&runtime, map_key),
+                XdpVerdict::SlowPathStale
+            );
+            {
+                let state = runtime.state();
+                assert_eq!(state.owners.get(&(7, map_key)), Some(&owner_value(2, 9)));
+                assert_eq!(state.key_fences.get(&(7, map_key)), Some(&10));
+                assert!(state.live_attached);
+                assert!(state.config.is_some());
+            }
+
+            apply_keyed_test_update(&backend, &key, ShardId::new(3), 10)
+                .expect("exact retry replaces the older-owner residue");
+            assert_eq!(keyed_test_verdict(&runtime, map_key), XdpVerdict::Local);
+        }
+    }
+
+    #[tokio::test]
+    async fn keyed_repin_unprovable_emergency_cut_quiesces_or_reports_fatal_state() {
+        for (quiesce_fails, detach_fails, expected_code) in [
+            (false, true, "host_xdp_repin_backend_quarantined"),
+            (true, false, "host_xdp_repin_backend_quarantined"),
+            (true, true, "host_xdp_repin_containment_unproven"),
+        ] {
+            let runtime = Arc::new(TestRuntime::default());
+            let backend = HostXdpSteeringBackend::with_runtime_and_config(
+                "swu0",
+                runtime.clone(),
+                repin_config(),
+            );
+            backend.attach().await.expect("attach");
+            let key = esp_key(0x0100);
+            let map_key = owner_map_key(&key);
+            {
+                let mut state = runtime.state();
+                state.owners.insert((7, map_key), owner_value(2, 9));
+                state.key_fences.insert((7, map_key), 9);
+                state.key_fence_remove_failures = 1;
+                state.owner_remove_failures = 1;
+                state.key_fence_write_failures = 1;
+                state.quiesce_failures = usize::from(quiesce_fails);
+                state.detach_error_before_drop = detach_fails.then_some("xdp_test_detach");
+            }
+
+            let error = apply_keyed_test_update(&backend, &key, ShardId::new(3), 10)
+                .expect_err("fault injection must fail closed");
+            assert!(matches!(
+                error,
+                IpsecLbError::AdapterContractViolation { code } if code == expected_code
+            ));
+            {
+                let state = runtime.state();
+                if !quiesce_fails {
+                    assert_eq!(state.owners.get(&(7, map_key)), Some(&owner_value(2, 9)));
+                    assert_eq!(state.key_fences.get(&(7, map_key)), Some(&9));
+                    assert!(state.config.is_none(), "CONFIG absence is the proven cut");
+                    assert!(
+                        state.live_attached,
+                        "injected detach failure preserves the link"
+                    );
+                } else if !detach_fails {
+                    assert!(!state.owners.contains_key(&(7, map_key)));
+                    assert!(!state.key_fences.contains_key(&(7, map_key)));
+                    assert!(!state.live_attached, "detach is the proven cut");
+                } else {
+                    assert_eq!(state.owners.get(&(7, map_key)), Some(&owner_value(2, 9)));
+                    assert_eq!(state.key_fences.get(&(7, map_key)), Some(&9));
+                    assert!(state.config.is_some());
+                    assert!(state.live_attached);
+                }
+            }
+            let probe = backend.probe_repin().await.expect("probe completes");
+            assert_eq!(probe.mutation_ready, quiesce_fails && !detach_fails);
+            if quiesce_fails && !detach_fails {
+                backend
+                    .attach()
+                    .await
+                    .expect("reattach after proven detach");
+                apply_keyed_test_update(&backend, &key, ShardId::new(3), 10)
+                    .expect("exact retry converges after clean reattach");
+                assert_eq!(keyed_test_verdict(&runtime, map_key), XdpVerdict::Local);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn keyed_repin_proven_detach_with_infeasible_pins_is_not_ready() {
+        let runtime = Arc::new(TestRuntime::default());
+        let backend = HostXdpSteeringBackend::with_runtime_and_config(
+            "swu0",
+            runtime.clone(),
+            repin_config(),
+        );
+        backend.attach().await.expect("attach");
+        let key = esp_key(0x0100);
+        let map_key = owner_map_key(&key);
+        {
+            let mut state = runtime.state();
+            state.owners.insert((7, map_key), owner_value(2, 9));
+            state.key_fences.insert((7, map_key), 9);
+            state.key_fence_remove_failures = 1;
+            state.owner_remove_failures = 1;
+            state.key_fence_write_failures = 1;
+            state.quiesce_failures = 1;
+            state.detach_error_after_drop = Some("xdp_test_detach_cleanup");
+        }
+
+        let error = apply_keyed_test_update(&backend, &key, ShardId::new(3), 10)
+            .expect_err("post-detach cleanup ambiguity must fail closed");
+        assert!(matches!(
+            error,
+            IpsecLbError::AdapterContractViolation {
+                code: "host_xdp_repin_backend_quarantined"
+            }
+        ));
+        runtime.state().repin_pins_error = Some("xdp_test_infeasible_residue");
+        assert!(matches!(
+            backend.probe_repin().await,
+            Ok(SteeringProbe {
+                mutation_ready: false,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn keyed_repin_equal_generation_lost_remove_ack_preserves_owner_witness() {
+        let runtime = Arc::new(TestRuntime::default());
+        let backend = HostXdpSteeringBackend::with_runtime_and_config(
+            "swu0",
+            runtime.clone(),
+            repin_config(),
+        );
+        backend.attach().await.expect("attach");
+        let key = esp_key(0x0100);
+        let map_key = owner_map_key(&key);
+        {
+            let mut state = runtime.state();
+            state.owners.insert((7, map_key), owner_value(2, 10));
+            state.key_fences.insert((7, map_key), 10);
+            state.key_fence_remove_error_after_apply = true;
+        }
+
+        for _ in 0..2 {
+            assert!(matches!(
+                apply_keyed_test_update(&backend, &key, ShardId::new(3), 10),
+                Err(IpsecLbError::OwnershipConflict { .. })
+            ));
+        }
+        let state = runtime.state();
+        assert!(!state.key_fences.contains_key(&(7, map_key)));
+        assert_eq!(state.owners.get(&(7, map_key)), Some(&owner_value(2, 10)));
+    }
+
+    #[tokio::test]
+    async fn keyed_repin_equal_generation_fence_readback_failure_preserves_owner_witness() {
+        let runtime = Arc::new(TestRuntime::default());
+        let backend = HostXdpSteeringBackend::with_runtime_and_config(
+            "swu0",
+            runtime.clone(),
+            repin_config(),
+        );
+        backend.attach().await.expect("attach");
+        let key = esp_key(0x0100);
+        let map_key = owner_map_key(&key);
+        {
+            let mut state = runtime.state();
+            state.owners.insert((7, map_key), owner_value(2, 10));
+            state.key_fences.insert((7, map_key), 10);
+            state.key_fence_read_failure_after_remove = true;
+        }
+
+        assert!(apply_keyed_test_update(&backend, &key, ShardId::new(3), 10).is_err());
+        assert!(matches!(
+            apply_keyed_test_update(&backend, &key, ShardId::new(3), 10),
+            Err(IpsecLbError::OwnershipConflict { .. })
+        ));
+        let state = runtime.state();
+        assert!(!state.key_fences.contains_key(&(7, map_key)));
+        assert_eq!(state.owners.get(&(7, map_key)), Some(&owner_value(2, 10)));
+    }
+
+    #[tokio::test]
+    async fn keyed_repin_final_owner_read_failure_never_leaves_published_pair_live() {
+        let runtime = Arc::new(TestRuntime::default());
+        let backend = HostXdpSteeringBackend::with_runtime_and_config(
+            "swu0",
+            runtime.clone(),
+            repin_config(),
+        );
+        backend.attach().await.expect("attach");
+        let key = esp_key(0x0100);
+        let map_key = owner_map_key(&key);
+        runtime.state().owner_get_failure_on_call = Some(4);
+
+        assert!(apply_keyed_test_update(&backend, &key, ShardId::new(3), 10).is_err());
+        assert_eq!(
+            keyed_test_verdict(&runtime, map_key),
+            XdpVerdict::SlowPathMiss
+        );
+        let state = runtime.state();
+        assert!(!state.owners.contains_key(&(7, map_key)));
+        assert!(!state.key_fences.contains_key(&(7, map_key)));
+    }
+
+    #[tokio::test]
+    async fn keyed_repin_final_fence_read_failure_never_leaves_equal_owner_live() {
+        for observed_owner in [None, Some(owner_value(4, 10))] {
+            let runtime = Arc::new(TestRuntime::default());
+            let backend = HostXdpSteeringBackend::with_runtime_and_config(
+                "swu0",
+                runtime.clone(),
+                repin_config(),
+            );
+            backend.attach().await.expect("attach");
+            let key = esp_key(0x0100);
+            let map_key = owner_map_key(&key);
+            {
+                let mut state = runtime.state();
+                state.key_fence_read_failure_on_call = Some(3);
+                if let Some(owner) = observed_owner {
+                    state.owner_get_override_on_call = Some((4, Some(owner)));
+                }
+            }
+
+            assert!(apply_keyed_test_update(&backend, &key, ShardId::new(3), 10).is_err());
+            assert_eq!(
+                keyed_test_verdict(&runtime, map_key),
+                XdpVerdict::SlowPathMiss
+            );
+            let state = runtime.state();
+            assert!(!state.owners.contains_key(&(7, map_key)));
+            assert!(!state.key_fences.contains_key(&(7, map_key)));
+        }
+    }
+
+    #[tokio::test]
+    async fn keyed_repin_owner_readback_mismatch_and_remove_failure_stays_stale() {
+        let runtime = Arc::new(TestRuntime::default());
+        let backend = HostXdpSteeringBackend::with_runtime_and_config(
+            "swu0",
+            runtime.clone(),
+            repin_config(),
+        );
+        backend.attach().await.expect("attach");
+        let key = esp_key(0x0100);
+        let map_key = owner_map_key(&key);
+        {
+            let mut state = runtime.state();
+            state.owner_get_override_on_call = Some((3, Some(owner_value(4, 10))));
+            state.owner_remove_failure_on_call = Some(2);
+        }
+
+        assert!(apply_keyed_test_update(&backend, &key, ShardId::new(3), 10).is_err());
+        assert_eq!(
+            keyed_test_verdict(&runtime, map_key),
+            XdpVerdict::SlowPathStale
+        );
+        let state = runtime.state();
+        assert!(!state.key_fences.contains_key(&(7, map_key)));
+        assert_eq!(state.owners.get(&(7, map_key)), Some(&owner_value(3, 10)));
+    }
+
+    #[test]
+    fn keyed_repin_crash_cuts_remain_miss_or_stale_until_fence_last() {
+        let config = XdpDatapathConfig {
+            fence_mode: XdpFenceMode::PerOwnershipKey,
+            self_shard: 3,
+            routing_domain: 7,
+            handoff_ifindex: 42,
+        };
+        let old = owner_value(2, 9);
+        let new = owner_value(3, 10);
+        for (owner, fence, expected) in [
+            (Some(old), None, XdpVerdict::SlowPathStale),
+            (None, None, XdpVerdict::SlowPathMiss),
+            (Some(new), None, XdpVerdict::SlowPathStale),
+            (Some(new), Some(10), XdpVerdict::Local),
+        ] {
+            assert_eq!(
+                decide_owner_verdict_with_keyed_fence(owner, &config, u64::MAX, fence),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn keyed_repin_accepts_exact_apply_with_lost_acknowledgements() {
+        let runtime = Arc::new(TestRuntime::default());
+        let backend = HostXdpSteeringBackend::with_runtime_and_config(
+            "swu0",
+            runtime.clone(),
+            repin_config(),
+        );
+        backend.attach().await.expect("attach");
+        let key = esp_key(0x0100);
+        {
+            let mut state = runtime.state();
+            state.key_fence_write_error_after_apply = true;
+            state.owner_insert_error_after_apply = true;
+        }
+
+        apply_keyed_test_update(&backend, &key, ShardId::new(2), 10)
+            .expect("exact readback resolves both lost acknowledgements");
+        assert_eq!(
+            backend.owner_record(&key).await.expect("owner readback"),
+            Some((ShardId::new(2), 10))
+        );
+    }
+
+    #[tokio::test]
+    async fn keyed_repin_zero_fence_is_rejected_with_no_live_owner() {
+        let runtime = Arc::new(TestRuntime::default());
+        let backend = HostXdpSteeringBackend::with_runtime_and_config(
+            "swu0",
+            runtime.clone(),
+            repin_config(),
+        );
+        backend.attach().await.expect("attach");
+        let key = esp_key(0x0100);
+        let map_key = owner_map_key(&key);
+        {
+            let mut state = runtime.state();
+            state.key_fences.insert((7, map_key), 0);
+            state.owners.insert(
+                (7, map_key),
+                XdpOwnerValue {
+                    owner_shard: 2,
+                    generation: 9,
+                }
+                .encode(),
+            );
+        }
+
+        assert!(matches!(
+            apply_keyed_test_update(&backend, &key, ShardId::new(3), 10),
+            Err(IpsecLbError::AdapterContractViolation { .. })
+        ));
+        assert!(!runtime.state().owners.contains_key(&(7, map_key)));
+    }
+
+    #[tokio::test]
+    async fn keyed_repin_zero_fence_preserves_same_generation_owner_conflict() {
+        let runtime = Arc::new(TestRuntime::default());
+        let backend = HostXdpSteeringBackend::with_runtime_and_config(
+            "swu0",
+            runtime.clone(),
+            repin_config(),
+        );
+        backend.attach().await.expect("attach");
+        let key = esp_key(0x0100);
+        let map_key = owner_map_key(&key);
+        {
+            let mut state = runtime.state();
+            state.key_fences.insert((7, map_key), 0);
+            state.owners.insert((7, map_key), owner_value(2, 10));
+        }
+
+        for _ in 0..2 {
+            assert!(matches!(
+                apply_keyed_test_update(&backend, &key, ShardId::new(3), 10),
+                Err(IpsecLbError::OwnershipConflict { .. })
+            ));
+        }
+        let state = runtime.state();
+        assert!(!state.key_fences.contains_key(&(7, map_key)));
+        assert_eq!(state.owners.get(&(7, map_key)), Some(&owner_value(2, 10)));
+        drop(state);
+        assert_eq!(
+            keyed_test_verdict(&runtime, map_key),
+            XdpVerdict::SlowPathStale
+        );
     }
 
     #[tokio::test]
@@ -5090,6 +9136,8 @@ mod tests {
         const CHILD_ROOT_ENV: &str = "OPC_XDP_LIFECYCLE_LOCK_CHILD_ROOT";
         const EXACT_TEST: &str = "xdp::tests::process_shared_lifecycle_lock_is_busy_then_retryable";
 
+        let _spawn_guard = lock_process_spawn_tests();
+
         if let Some(root) = std::env::var_os(CHILD_ROOT_ENV) {
             let root = PathBuf::from(root);
             let runtime = Arc::new(TestRuntime::with_process_shared_lifecycle(
@@ -5199,6 +9247,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn lifecycle_lease_is_not_inherited_across_exec() {
+        let _spawn_guard = lock_process_spawn_tests();
         let root =
             std::env::temp_dir().join(format!("opc-xdp-lifecycle-cloexec-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
@@ -5386,6 +9435,39 @@ mod tests {
             Some(
                 "configured redirect hand-off interface is absent, down, or conflicts with the attachment interface"
             )
+        );
+    }
+
+    #[tokio::test]
+    async fn repin_probe_requires_keyed_mode_and_runtime_specific_migration_proof() {
+        let runtime = Arc::new(TestRuntime::default());
+        let legacy =
+            HostXdpSteeringBackend::with_runtime_and_config("swu0", runtime.clone(), config());
+        let probe = legacy.probe_repin().await.expect("legacy probe");
+        assert!(!probe.mutation_ready);
+        assert_eq!(
+            probe.details,
+            Some("Host-XDP re-pin requires destination-scoped ownership fencing")
+        );
+
+        let keyed = HostXdpSteeringBackend::with_runtime_and_config(
+            "swu0",
+            runtime.clone(),
+            repin_config(),
+        );
+        let probe = keyed.probe_repin().await.expect("keyed probe");
+        assert!(probe.mutation_ready);
+        assert_eq!(
+            probe.details,
+            Some("Host-XDP destination-scoped re-pin mutation ready")
+        );
+
+        runtime.state().repin_pins_error = Some("xdp_test_repin_pins");
+        let probe = keyed.probe_repin().await.expect("failed migration probe");
+        assert!(!probe.mutation_ready);
+        assert_eq!(
+            probe.details,
+            Some("Host-XDP re-pin lifecycle or keyed migration is unavailable")
         );
     }
 

@@ -71,6 +71,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fence and requires an independently proven committed fence before resumed
   publication. Privileged namespace proof covers cross-namespace receipt
   rejection, a restored ESN counter, and the first real ESP packet (#333).
+- **Counter-authorized Host-XDP re-pin composition — `opc-ipsec-lb`,
+  `opc-ipsec-xfrm`:** durable ESP requests now retain only the exact outbound
+  SA binding identity, while live actor-derived target and receipt sets remain
+  process-local. The coordinator revalidates the counter before ownership and
+  again under a single-use actor publication guard at the Host fence-last cut;
+  cancellation, expiry, ignored backend errors, counter regression, and
+  first-publication counter advancement all fail closed. Host-XDP ABI v5 adds
+  destination-scoped keyed fences, owner-first/fence-last activation,
+  fence-first retirement, crash-safe namespace migration, and bounded
+  quarantine for indeterminate cleanup. The generic re-pin coordinator now
+  composes directly with Host-XDP without reverting to the unsafe SPI-only
+  adapter (#333, #444).
 - **Epoch-bound live session-consensus membership — `opc-session-store`,
   `opc-session-net`:** adds restart-safe, idempotent 3→5→3 topology transitions
   with exact descriptor binding, learner catch-up markers, joint-consensus

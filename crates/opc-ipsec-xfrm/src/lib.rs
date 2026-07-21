@@ -79,11 +79,11 @@ pub use composite::{
     XFRM_COMPOSITE_INSTALL_ROLLBACK_ORDER, XFRM_COMPOSITE_REKEY_ORDER, XFRM_COMPOSITE_REMOVE_ORDER,
 };
 pub use counter_resume::{
-    AppliedEspCounterReceipt, EspCounterProofRequirement, EspCounterResumeApplyRequest,
-    EspCounterResumeBinding, EspCounterResumeError, EspCounterResumeProofSet,
-    EspCounterResumeRecoveryRequest, OutboundEspCounterTarget, OutboundEspCounterTargetSet,
-    ESP_COUNTER_RECEIPT_MAX_AGE, MAX_ESP_COUNTER_PROOF_SET_SIZE, MAX_ESP_COUNTER_RECEIPTS,
-    MAX_ESP_COUNTER_TARGET_SET_SIZE,
+    AppliedEspCounterReceipt, EspCounterProofRequirement, EspCounterPublicationGuard,
+    EspCounterResumeApplyRequest, EspCounterResumeBinding, EspCounterResumeError,
+    EspCounterResumeProofSet, EspCounterResumeRecoveryRequest, OutboundEspCounterTarget,
+    OutboundEspCounterTargetSet, ESP_COUNTER_RECEIPT_MAX_AGE, MAX_ESP_COUNTER_PROOF_SET_SIZE,
+    MAX_ESP_COUNTER_RECEIPTS, MAX_ESP_COUNTER_TARGET_SET_SIZE,
 };
 pub use dscp::{
     LinuxXfrmDscpMarkingConfig, DEFAULT_XFRM_DSCP_BPFFS_PIN_ROOT, DEFAULT_XFRM_DSCP_TC_PRIORITY,
