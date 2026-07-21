@@ -54,6 +54,10 @@ const SNAPSHOT_RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 const SNAPSHOT_CATCH_UP_COMMANDS: usize = 4_300;
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 const MAX_CAPTURED_CONSENSUS_PAYLOADS: usize = 4_096;
+// Keep the bounded election qualification from competing with the deliberately
+// expensive snapshot-compaction qualification under the parallel test harness.
+static ELECTION_AND_SNAPSHOT_TEST_PERMIT: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(1);
 const ENCRYPTION_NAMESPACE: &str = "consensus-boundary-qualification";
 const PLAINTEXT_CANARY_BEFORE_ROTATION: &[u8] =
     b"opc-session-consensus-plaintext-canary-before-key-rotation";
@@ -2164,36 +2168,33 @@ async fn isolated_node_fails_closed_and_recovers_after_both_peer_paths_heal() {
 
 #[tokio::test]
 async fn observed_leader_loss_elects_a_different_higher_term_leader_and_recovers() {
+    let _timing_permit = ELECTION_AND_SNAPSHOT_TEST_PERMIT
+        .acquire()
+        .await
+        .expect("qualification semaphore remains open");
     let cluster = TestCluster::start().await;
     let (old_leader_index, old_leader_id, old_term) = cluster.observed_leader();
     cluster.isolate(old_leader_index);
     let survivors = (0..MEMBER_COUNT)
         .filter(|index| *index != old_leader_index)
         .collect::<Vec<_>>();
+    let recovery_deadline = tokio::time::Instant::now() + RECOVERY_TIMEOUT;
 
-    let (new_leader_id, new_term) = tokio::time::timeout(RECOVERY_TIMEOUT, async {
+    let (new_leader_id, new_term) = tokio::time::timeout_at(recovery_deadline, async {
         loop {
-            let reports = futures_util::future::join_all(
-                survivors
-                    .iter()
-                    .map(|index| cluster.stores[*index].probe_durable_readiness()),
-            )
-            .await;
             let statuses = survivors
                 .iter()
                 .map(|index| cluster.stores[*index].status())
                 .collect::<Vec<_>>();
-            if reports.iter().all(DurableReadinessReport::is_ready) {
-                if let Some(new_leader_id) = statuses.first().and_then(|status| status.leader_id) {
-                    let new_term = statuses.first().expect("survivor status").term;
-                    if new_leader_id != old_leader_id
-                        && new_term > old_term
-                        && statuses.iter().all(|status| {
-                            status.leader_id == Some(new_leader_id) && status.term == new_term
-                        })
-                    {
-                        break (new_leader_id, new_term);
-                    }
+            if let Some(new_leader_id) = statuses.first().and_then(|status| status.leader_id) {
+                let new_term = statuses.first().expect("survivor status").term;
+                if new_leader_id != old_leader_id
+                    && new_term > old_term
+                    && statuses.iter().all(|status| {
+                        status.leader_id == Some(new_leader_id) && status.term == new_term
+                    })
+                {
+                    break (new_leader_id, new_term);
                 }
             }
             tokio::time::sleep(POLL_INTERVAL).await;
@@ -2203,6 +2204,31 @@ async fn observed_leader_loss_elects_a_different_higher_term_leader_and_recovers
     .expect("surviving majority elects a different higher-term leader");
     assert_ne!(new_leader_id, old_leader_id);
     assert!(new_term > old_term);
+
+    tokio::time::timeout_at(recovery_deadline, async {
+        loop {
+            let reports = futures_util::future::join_all(
+                survivors
+                    .iter()
+                    .map(|index| cluster.stores[*index].probe_durable_readiness()),
+            )
+            .await;
+            if reports.iter().all(DurableReadinessReport::is_ready) {
+                let statuses = survivors
+                    .iter()
+                    .map(|index| cluster.stores[*index].status())
+                    .collect::<Vec<_>>();
+                if statuses.iter().all(|status| {
+                    status.leader_id == Some(new_leader_id) && status.term == new_term
+                }) {
+                    break;
+                }
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .expect("surviving majority reaches durable readiness after leader election");
 
     let key = session_key(b"observed-leader-loss");
     let lease = cluster.stores[survivors[0]]
@@ -2238,6 +2264,10 @@ async fn observed_leader_loss_elects_a_different_higher_term_leader_and_recovers
 
 #[tokio::test]
 async fn lagging_replica_installs_compacted_snapshot_without_losing_committed_state() {
+    let _timing_permit = ELECTION_AND_SNAPSHOT_TEST_PERMIT
+        .acquire()
+        .await
+        .expect("qualification semaphore remains open");
     let cluster = TestCluster::start().await;
     let lagging_before = cluster.stores[0]
         .probe_durable_readiness()

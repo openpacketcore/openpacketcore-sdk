@@ -10,6 +10,7 @@ use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -49,6 +50,16 @@ const FOUNDATION_RANDOM_SEED_BASE: u64 = 0x0143_0000;
 const MAX_FAILURE_STDERR_BYTES: usize = 4 * 1024;
 const MAX_FAILURE_STDERR_LINES: usize = 16;
 const FAULT_TARGET_CANDIDATES: [usize; 2] = [0, 2];
+// These tests spawn the same quorum-node binary and exercise bounded process,
+// port, and readiness behavior. Keep only those process tests from competing
+// with one another while leaving the pure schedule test parallel.
+static PROCESS_QUALIFICATION_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn acquire_process_qualification_test_lock() -> MutexGuard<'static, ()> {
+    PROCESS_QUALIFICATION_TEST_LOCK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
 
 #[derive(Debug)]
 enum HarnessError {
@@ -3183,6 +3194,7 @@ fn run_foundation(member_count: usize) -> Result<(), HarnessError> {
 
 #[test]
 fn real_three_and_five_process_openraft_sqlite_stop_restart_foundation() {
+    let _process_test_guard = acquire_process_qualification_test_lock();
     run_foundation(3).expect("three-process foundation evidence");
     run_foundation(5).expect("five-process foundation evidence");
 }
@@ -3264,6 +3276,7 @@ fn assert_process_gone(pid: u32) {
 
 #[test]
 fn occupied_initial_bind_is_a_typed_process_failure() {
+    let _process_test_guard = acquire_process_qualification_test_lock();
     let directory = tempfile::tempdir().expect("bind conflict directory");
     let reservation = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve conflict port");
     let address = reservation.local_addr().expect("reserved address");
@@ -3299,6 +3312,7 @@ fn occupied_initial_bind_is_a_typed_process_failure() {
 
 #[test]
 fn disconnected_child_reports_exit_and_cleanup_is_bounded() {
+    let _process_test_guard = acquire_process_qualification_test_lock();
     let directory = tempfile::tempdir().expect("disconnected child directory");
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_opc-session-quorum-node"));
     let (mut child, _) = ChildNode::spawn_bound(
@@ -3330,6 +3344,7 @@ fn disconnected_child_reports_exit_and_cleanup_is_bounded() {
 
 #[test]
 fn induced_no_quorum_retains_last_reason_and_reaps_every_child() {
+    let _process_test_guard = acquire_process_qualification_test_lock();
     let schedule_sha256 = format!("sha256:{}", "0".repeat(64));
     let mut fleet = Fleet::start(3, &schedule_sha256).expect("start no-quorum fleet");
     let pids = fleet
