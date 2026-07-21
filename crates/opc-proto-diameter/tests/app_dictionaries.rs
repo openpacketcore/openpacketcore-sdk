@@ -3658,6 +3658,7 @@ fn swm_answer_result_category_is_classified() {
         error_message: None,
         state_avps: vec![],
         eap_master_session_key: None,
+        extensions: Default::default(),
     };
     assert_eq!(answer.result_category(), SwmResultCategory::Success);
 }
@@ -4010,6 +4011,7 @@ fn sample_swm_request() -> SwmDiameterEapRequest {
         terminal_information: None,
         high_priority_access_info: None,
         state_avps: vec![b"opaque-state".to_vec()],
+        extensions: Default::default(),
     }
 }
 
@@ -4037,6 +4039,7 @@ fn sample_swm_answer() -> SwmDiameterEapAnswer {
         error_message: None,
         state_avps: vec![],
         eap_master_session_key: Some(vec![0xAA; 32].into()),
+        extensions: Default::default(),
     }
 }
 
@@ -5973,17 +5976,33 @@ fn swm_dea_unknown_vendor_avp_policy_matrix() {
     let encoded = encode_message(&message);
     let decoded = decode_message(&encoded);
 
-    for policy in [UnknownIePolicy::Preserve, UnknownIePolicy::Drop] {
-        let ctx = DecodeContext {
-            unknown_ie_policy: policy,
+    let preserved = apps::swm::parse_swm_diameter_eap_answer(
+        &decoded,
+        DecodeContext {
+            unknown_ie_policy: UnknownIePolicy::Preserve,
             ..DecodeContext::default()
-        };
-        let answer = apps::swm::parse_swm_diameter_eap_answer(&decoded, ctx)
-            .expect("non-mandatory unknown vendor AVP must be tolerated");
-        // The typed projection does not retain the opaque unknown AVP.
-        assert!(answer.apn_configurations.is_empty());
-        assert!(answer.service_selection.is_none());
-    }
+        },
+    )
+    .expect("Preserve retains a non-mandatory unknown vendor AVP");
+    assert_eq!(preserved.extensions.len(), 1);
+    let metadata = preserved
+        .extensions
+        .metadata()
+        .next()
+        .expect("one value-free metadata record");
+    assert_eq!(metadata.code(), AvpCode::new(9999));
+    assert_eq!(metadata.vendor_id(), Some(apps::VENDOR_ID_3GPP));
+    assert_eq!(metadata.value_len(), b"unknown".len());
+
+    let dropped = apps::swm::parse_swm_diameter_eap_answer(
+        &decoded,
+        DecodeContext {
+            unknown_ie_policy: UnknownIePolicy::Drop,
+            ..DecodeContext::default()
+        },
+    )
+    .expect("Drop tolerates a non-mandatory unknown vendor AVP");
+    assert!(dropped.extensions.is_empty());
 
     let ctx = DecodeContext {
         unknown_ie_policy: UnknownIePolicy::Reject,
