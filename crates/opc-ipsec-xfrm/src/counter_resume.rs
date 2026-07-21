@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 use sha2::{Digest, Sha256};
 
 use crate::model::sa_uses_esn;
-use crate::namespace::{NamespaceBoundLinuxXfrmBackend, NetworkNamespaceBinding};
+use crate::namespace::{NamespaceActorBinding, NamespaceBoundLinuxXfrmBackend};
 use crate::outbound_binding::OutboundSaPolicyExpectation;
 use crate::{
     InstalledOutboundSaBinding, LinuxXfrmBackend, OutboundSaBindingError, OutboundSaBindingId,
@@ -99,6 +99,56 @@ impl EspCounterResumeBinding {
 impl fmt::Debug for EspCounterResumeBinding {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("EspCounterResumeBinding(<redacted>)")
+    }
+}
+
+/// Opaque, process-local correlation for the intended live XFRM actor and
+/// outbound SA binding.
+///
+/// [`OutboundSaBindingId`] deliberately remains stable across process and
+/// network-namespace restart, so it cannot by itself distinguish two live
+/// namespaces with identical SA/policy configuration. This target is derived
+/// only from an [`InstalledOutboundSaBinding`] and binds proof validation to
+/// that exact live actor without exposing or persisting namespace identity.
+/// It is not serializable and is not evidence by itself.
+#[derive(Clone)]
+pub struct OutboundEspCounterTarget {
+    actor: NamespaceActorBinding,
+    outbound_sa: OutboundSaBindingId,
+}
+
+impl OutboundEspCounterTarget {
+    fn new(authority: &InstalledOutboundSaBinding) -> Self {
+        Self {
+            actor: authority.actor_binding(),
+            outbound_sa: authority.id(),
+        }
+    }
+
+    fn matches(&self, other: &Self) -> bool {
+        self.actor == other.actor && self.outbound_sa == other.outbound_sa
+    }
+
+    /// Return the durable, key-free SA correlation carried by this live
+    /// target. The returned ID remains correlation only, not authority.
+    #[must_use]
+    pub const fn outbound_sa_binding_id(&self) -> OutboundSaBindingId {
+        self.outbound_sa
+    }
+}
+
+impl fmt::Debug for OutboundEspCounterTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("OutboundEspCounterTarget(<redacted>)")
+    }
+}
+
+impl InstalledOutboundSaBinding {
+    /// Bind subsequent counter-proof validation to this exact live namespace
+    /// actor without changing the durable [`OutboundSaBindingId`].
+    #[must_use]
+    pub fn outbound_esp_counter_target(&self) -> OutboundEspCounterTarget {
+        OutboundEspCounterTarget::new(self)
     }
 }
 
@@ -202,21 +252,35 @@ pub enum EspCounterProofRequirement {
 #[derive(Clone)]
 pub struct AppliedEspCounterReceipt {
     binding: EspCounterResumeBinding,
+    target: OutboundEspCounterTarget,
     backend: NamespaceBoundLinuxXfrmBackend,
 }
 
 impl AppliedEspCounterReceipt {
     pub(crate) const fn new(
         binding: EspCounterResumeBinding,
+        target: OutboundEspCounterTarget,
         backend: NamespaceBoundLinuxXfrmBackend,
     ) -> Self {
-        Self { binding, backend }
+        Self {
+            binding,
+            target,
+            backend,
+        }
     }
 
     async fn validate(
         &self,
+        expected_target: &OutboundEspCounterTarget,
         requirement: EspCounterProofRequirement,
     ) -> Result<(), EspCounterResumeError> {
+        if !self.target.matches(expected_target)
+            || self.binding.outbound_sa != expected_target.outbound_sa
+        {
+            return Err(EspCounterResumeError::ProofUnavailable {
+                code: "esp_counter_receipt_target_mismatch",
+            });
+        }
         self.backend
             .validate_outbound_esp_counter_receipt(self.binding, requirement)
             .await
@@ -230,6 +294,11 @@ impl fmt::Debug for AppliedEspCounterReceipt {
 }
 
 /// Bounded collection of opaque receipts for a multi-SA re-pin plan.
+///
+/// Every validation also requires the process-local target derived from the
+/// intended live [`InstalledOutboundSaBinding`]. A receipt issued for an
+/// otherwise identical SA in another actor or network namespace is rejected
+/// before that receipt's backend is queried.
 #[derive(Clone)]
 pub struct EspCounterResumeProofSet {
     receipts: HashMap<EspCounterResumeBinding, AppliedEspCounterReceipt>,
@@ -271,9 +340,11 @@ impl EspCounterResumeProofSet {
         Self { receipts }
     }
 
-    /// Validate the exact operation receipt at a coordinator boundary.
+    /// Validate the exact operation receipt and live actor target at a
+    /// coordinator boundary.
     pub async fn validate_counter_proof(
         &self,
+        expected_target: &OutboundEspCounterTarget,
         binding: EspCounterResumeBinding,
         requirement: EspCounterProofRequirement,
     ) -> Result<(), EspCounterResumeError> {
@@ -283,7 +354,7 @@ impl EspCounterResumeProofSet {
                 .ok_or(EspCounterResumeError::ProofUnavailable {
                     code: "esp_counter_receipt_absent_or_stale",
                 })?;
-        receipt.validate(requirement).await
+        receipt.validate(expected_target, requirement).await
     }
 }
 
@@ -413,7 +484,7 @@ impl EspCounterReceiptRegistry {
     pub(crate) async fn apply(
         &mut self,
         backend: &LinuxXfrmBackend,
-        actor_namespace: NetworkNamespaceBinding,
+        actor: &NamespaceActorBinding,
         actor_request: CounterResumeActorRequest,
     ) -> Result<(), EspCounterResumeError> {
         let CounterResumeActorRequest {
@@ -427,7 +498,7 @@ impl EspCounterReceiptRegistry {
             });
         }
         let expectation = authority
-            .validated_expectation_for_actor(actor_namespace, &request.parameters, expected_id)
+            .validated_expectation_for_actor(actor, &request.parameters, expected_id)
             .map_err(map_binding_error)?;
         validate_requested_counter(&request, expectation.replay_esn())?;
 
@@ -463,7 +534,7 @@ impl EspCounterReceiptRegistry {
     pub(crate) async fn recover_committed(
         &mut self,
         backend: &LinuxXfrmBackend,
-        actor_namespace: NetworkNamespaceBinding,
+        actor: &NamespaceActorBinding,
         actor_request: CounterRecoveryActorRequest,
     ) -> Result<(), EspCounterResumeError> {
         let CounterRecoveryActorRequest {
@@ -477,7 +548,7 @@ impl EspCounterReceiptRegistry {
             });
         }
         let expectation = authority
-            .validated_expectation_for_actor(actor_namespace, &request.parameters, expected_id)
+            .validated_expectation_for_actor(actor, &request.parameters, expected_id)
             .map_err(map_binding_error)?;
         let validation_request =
             EspCounterResumeApplyRequest::new(request.binding, request.parameters.clone());

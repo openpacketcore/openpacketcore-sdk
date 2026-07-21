@@ -6,6 +6,7 @@ use std::env;
 use std::fs;
 use std::io;
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use opc_ipsec_xfrm::{
@@ -19,6 +20,7 @@ use opc_ipsec_xfrm::{
 
 const IPPROTO_ESP: u8 = 50;
 const SHARED_SPI: u32 = 0x7333_0001;
+static NEXT_NAMESPACE_SET: AtomicU64 = AtomicU64::new(1);
 
 fn command(program: &str, args: &[&str]) -> io::Result<Output> {
     Command::new(program).args(args).output()
@@ -40,11 +42,12 @@ struct TestNamespaces {
 impl TestNamespaces {
     fn provision() -> io::Result<Self> {
         let pid = std::process::id();
+        let set = NEXT_NAMESPACE_SET.fetch_add(1, Ordering::Relaxed);
         let mut namespaces = Self {
             names: Vec::with_capacity(2),
         };
         for suffix in ["a", "b"] {
-            let name = format!("opcx{pid}{suffix}");
+            let name = format!("opcx{pid}{set}{suffix}");
             let _ = command("ip", &["netns", "del", &name]);
             run("ip", &["netns", "add", &name])?;
             namespaces.names.push(name);
@@ -274,6 +277,75 @@ async fn identical_sas_remain_isolated_between_namespace_bound_actors(
 }
 
 #[tokio::test]
+#[ignore = "requires root, CAP_NET_ADMIN, Linux XFRM, iproute2, and named netns support"]
+async fn counter_receipt_from_identical_other_namespace_is_rejected(
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if env::var("OPC_XFRM_RUN_NAMESPACE_PRIVILEGED").as_deref() != Ok("1") {
+        eprintln!("skipping: set OPC_XFRM_RUN_NAMESPACE_PRIVILEGED=1 on a privileged Linux host");
+        return Ok(());
+    }
+
+    let namespaces = TestNamespaces::provision()?;
+    let (backend_a, authority_a, request_a) =
+        install_binding_in_namespace(namespaces.names[0].clone())?;
+    let (backend_b, authority_b, request_b) =
+        install_binding_in_namespace(namespaces.names[1].clone())?;
+    assert_eq!(
+        authority_a.id(),
+        authority_b.id(),
+        "durable correlation must remain stable across identical namespace state"
+    );
+
+    let target_a = authority_a.outbound_esp_counter_target();
+    let target_b = authority_b.outbound_esp_counter_target();
+    let binding = EspCounterResumeBinding::new(33, 34, authority_b.id(), 17)?;
+    let receipt = backend_b
+        .apply_and_read_back_outbound_esp_counter(
+            &authority_b,
+            authority_b.id(),
+            EspCounterResumeApplyRequest::new(binding, request_b.sa.parameters.clone()),
+        )
+        .await?;
+    let proofs = EspCounterResumeProofSet::single(receipt);
+    proofs
+        .validate_counter_proof(
+            &target_b,
+            binding,
+            EspCounterProofRequirement::BeforeOwnershipCommit,
+        )
+        .await?;
+    let error = proofs
+        .validate_counter_proof(
+            &target_a,
+            binding,
+            EspCounterProofRequirement::BeforeOwnershipCommit,
+        )
+        .await
+        .expect_err("a valid receipt from namespace B must not authorize namespace A");
+    assert_eq!(error.code(), "esp_counter_receipt_target_mismatch");
+
+    for (backend, request) in [(&backend_a, &request_a), (&backend_b, &request_b)] {
+        backend
+            .remove_policy(RemovePolicyRequest::new(
+                request.policy.parameters.selector.clone(),
+                request.policy.parameters.direction,
+            ))
+            .await?;
+        backend
+            .remove_sa(RemoveSaRequest::new(
+                request.sa.parameters.id.destination,
+                request.sa.parameters.id.protocol,
+                request.sa.parameters.id.spi,
+            ))
+            .await?;
+    }
+    drop(backend_a);
+    drop(backend_b);
+    drop(namespaces);
+    Ok(())
+}
+
+#[tokio::test]
 #[ignore = "requires root, CAP_NET_ADMIN, Linux XFRM, iproute2, ping, and named netns support"]
 async fn outbound_binding_installs_recovers_and_transforms_first_packet(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -303,6 +375,7 @@ async fn outbound_binding_installs_recovers_and_transforms_first_packet(
     assert_eq!(installed.id(), recovered.id());
 
     const RESUMED_SEND_NEXT: u64 = (1_u64 << 32) + 17;
+    let counter_target = recovered.outbound_esp_counter_target();
     let counter_binding = EspCounterResumeBinding::new(1, 1, recovered.id(), RESUMED_SEND_NEXT)?;
     let receipt = backend
         .apply_and_read_back_outbound_esp_counter(
@@ -313,6 +386,7 @@ async fn outbound_binding_installs_recovers_and_transforms_first_packet(
         .await?;
     EspCounterResumeProofSet::single(receipt)
         .validate_counter_proof(
+            &counter_target,
             counter_binding,
             EspCounterProofRequirement::BeforeFirstPublication,
         )

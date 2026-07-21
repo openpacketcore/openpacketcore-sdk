@@ -36,6 +36,46 @@ pub(crate) struct NetworkNamespaceBinding {
     inode: u64,
 }
 
+/// Process-local identity of one exact namespace actor.
+///
+/// Namespace device/inode identity alone is insufficient for receipt
+/// correlation: two independently spawned actors can legitimately target
+/// the same namespace. The private `Arc` seal makes their live authority
+/// distinct without putting process-local identity into the durable
+/// [`OutboundSaBindingId`].
+#[derive(Clone)]
+pub(crate) struct NamespaceActorBinding {
+    namespace: NetworkNamespaceBinding,
+    identity: Arc<()>,
+}
+
+impl NamespaceActorBinding {
+    pub(crate) fn new(namespace: NetworkNamespaceBinding) -> Self {
+        Self {
+            namespace,
+            identity: Arc::new(()),
+        }
+    }
+
+    pub(crate) const fn namespace(&self) -> NetworkNamespaceBinding {
+        self.namespace
+    }
+}
+
+impl PartialEq for NamespaceActorBinding {
+    fn eq(&self, other: &Self) -> bool {
+        self.namespace == other.namespace && Arc::ptr_eq(&self.identity, &other.identity)
+    }
+}
+
+impl Eq for NamespaceActorBinding {}
+
+impl fmt::Debug for NamespaceActorBinding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("NamespaceActorBinding(<redacted>)")
+    }
+}
+
 impl NetworkNamespaceBinding {
     #[cfg(target_os = "linux")]
     pub(crate) fn capture() -> Result<Self, XfrmError> {
@@ -102,7 +142,7 @@ pub struct NamespaceBoundLinuxXfrmBackend {
 
 struct NamespaceBoundLinuxXfrmBackendInner {
     sender: mpsc::Sender<NamespaceCommand>,
-    binding: NetworkNamespaceBinding,
+    actor_binding: NamespaceActorBinding,
 }
 
 impl fmt::Debug for NamespaceBoundLinuxXfrmBackend {
@@ -125,13 +165,17 @@ fn bind_with_capacity(
     capacity: usize,
 ) -> Result<NamespaceBoundLinuxXfrmBackend, XfrmError> {
     let binding = NetworkNamespaceBinding::capture()?;
+    let actor_binding = NamespaceActorBinding::new(binding);
     let backend = backend.for_namespace_actor(binding);
     let (sender, receiver) = mpsc::channel(capacity);
     let (startup_sender, startup_receiver) = std::sync::mpsc::sync_channel(1);
 
     let worker = std::thread::Builder::new()
         .name(String::from("opc-xfrm-netns"))
-        .spawn(move || run_actor(backend, binding, receiver, startup_sender))
+        .spawn({
+            let actor_binding = actor_binding.clone();
+            move || run_actor(backend, actor_binding, receiver, startup_sender)
+        })
         .map_err(|error| XfrmError::io("network_namespace_actor_spawn", error))?;
 
     let startup = startup_receiver
@@ -144,13 +188,16 @@ fn bind_with_capacity(
     startup?;
 
     Ok(NamespaceBoundLinuxXfrmBackend {
-        inner: Arc::new(NamespaceBoundLinuxXfrmBackendInner { sender, binding }),
+        inner: Arc::new(NamespaceBoundLinuxXfrmBackendInner {
+            sender,
+            actor_binding,
+        }),
     })
 }
 
 fn run_actor(
     backend: LinuxXfrmBackend,
-    binding: NetworkNamespaceBinding,
+    actor_binding: NamespaceActorBinding,
     mut receiver: mpsc::Receiver<NamespaceCommand>,
     startup: std::sync::mpsc::SyncSender<Result<(), XfrmError>>,
 ) {
@@ -174,7 +221,7 @@ fn run_actor(
     }
 
     runtime.block_on(async move {
-        let mut state = NamespaceActorState::new(binding);
+        let mut state = NamespaceActorState::new(actor_binding);
         while let Some(command) = receiver.recv().await {
             command.execute(&backend, &mut state).await;
         }
@@ -182,14 +229,14 @@ fn run_actor(
 }
 
 struct NamespaceActorState {
-    binding: NetworkNamespaceBinding,
+    actor_binding: NamespaceActorBinding,
     counter_receipts: EspCounterReceiptRegistry,
 }
 
 impl NamespaceActorState {
-    fn new(binding: NetworkNamespaceBinding) -> Self {
+    fn new(actor_binding: NamespaceActorBinding) -> Self {
         Self {
-            binding,
+            actor_binding,
             counter_receipts: EspCounterReceiptRegistry::default(),
         }
     }
@@ -218,7 +265,11 @@ impl NamespaceBoundLinuxXfrmBackend {
     /// Return the actor's captured namespace binding to crate-internal sealed
     /// authorities without exposing device or inode values publicly.
     pub(crate) fn network_namespace_binding(&self) -> NetworkNamespaceBinding {
-        self.inner.binding
+        self.inner.actor_binding.namespace()
+    }
+
+    pub(crate) fn namespace_actor_binding(&self) -> NamespaceActorBinding {
+        self.inner.actor_binding.clone()
     }
 
     async fn dispatch<T>(
@@ -289,8 +340,7 @@ impl NamespaceBoundLinuxXfrmBackend {
         request: XfrmCompositeInstallRequest,
     ) -> Result<InstalledOutboundSaBinding, OutboundSaBindingError> {
         let expectation = validate_outbound_request(&request)?;
-        let binding =
-            InstalledOutboundSaBinding::new(self.network_namespace_binding(), expectation);
+        let binding = InstalledOutboundSaBinding::new(self.namespace_actor_binding(), expectation);
         binding
             .validate_current(self, &request.sa.parameters, binding.id())
             .await?;
@@ -325,6 +375,7 @@ impl NamespaceBoundLinuxXfrmBackend {
         request: EspCounterResumeApplyRequest,
     ) -> Result<AppliedEspCounterReceipt, EspCounterResumeError> {
         let binding = request.binding();
+        let target = authority.outbound_esp_counter_target();
         let permit =
             self.inner
                 .sender
@@ -347,7 +398,7 @@ impl NamespaceBoundLinuxXfrmBackend {
             .map_err(|_| EspCounterResumeError::Backend {
                 code: "esp_counter_backend_state_indeterminate",
             })??;
-        Ok(AppliedEspCounterReceipt::new(binding, self.clone()))
+        Ok(AppliedEspCounterReceipt::new(binding, target, self.clone()))
     }
 
     pub(crate) async fn validate_outbound_esp_counter_receipt(
@@ -383,8 +434,10 @@ impl NamespaceBoundLinuxXfrmBackend {
     /// and transient-key readback and requires the observed sequence to be at
     /// or above the durable requested floor. The returned receipt is
     /// structurally capped to
-    /// [`EspCounterProofRequirement::CommittedRecovery`]; it can never
-    /// authorize a new fence or first steering publication.
+    /// [`EspCounterProofRequirement::CommittedRecovery`]. It can never
+    /// authorize a new fence. A caller may use it while resuming publication
+    /// only after independently proving the exact ownership fence was already
+    /// committed before process loss.
     pub async fn recover_committed_outbound_esp_counter(
         &self,
         authority: &InstalledOutboundSaBinding,
@@ -392,6 +445,7 @@ impl NamespaceBoundLinuxXfrmBackend {
         request: EspCounterResumeRecoveryRequest,
     ) -> Result<AppliedEspCounterReceipt, EspCounterResumeError> {
         let binding = request.binding();
+        let target = authority.outbound_esp_counter_target();
         let permit =
             self.inner
                 .sender
@@ -414,7 +468,7 @@ impl NamespaceBoundLinuxXfrmBackend {
             .map_err(|_| EspCounterResumeError::Backend {
                 code: "esp_counter_backend_unavailable",
             })??;
-        Ok(AppliedEspCounterReceipt::new(binding, self.clone()))
+        Ok(AppliedEspCounterReceipt::new(binding, target, self.clone()))
     }
 }
 
@@ -516,7 +570,7 @@ impl NamespaceCommand {
                 let _ = reply.send(
                     state
                         .counter_receipts
-                        .apply(backend, state.binding, *request)
+                        .apply(backend, &state.actor_binding, *request)
                         .await,
                 );
             }
@@ -524,7 +578,7 @@ impl NamespaceCommand {
                 let _ = reply.send(
                     state
                         .counter_receipts
-                        .recover_committed(backend, state.binding, *request)
+                        .recover_committed(backend, &state.actor_binding, *request)
                         .await,
                 );
             }
@@ -851,7 +905,7 @@ mod tests {
         request: &XfrmCompositeInstallRequest,
     ) -> InstalledOutboundSaBinding {
         InstalledOutboundSaBinding::new(
-            backend.network_namespace_binding(),
+            backend.namespace_actor_binding(),
             validate_outbound_request(request).unwrap(),
         )
     }
@@ -994,7 +1048,9 @@ mod tests {
         NamespaceBoundLinuxXfrmBackend {
             inner: Arc::new(NamespaceBoundLinuxXfrmBackendInner {
                 sender,
-                binding: NetworkNamespaceBinding::capture().unwrap(),
+                actor_binding: NamespaceActorBinding::new(
+                    NetworkNamespaceBinding::capture().unwrap(),
+                ),
             }),
         }
     }
@@ -1378,6 +1434,7 @@ mod tests {
         let authority = counter_binding(&backend, &request);
         let apply = counter_request(&authority, &request, 1, 2, 100);
         let proof_binding = apply.binding();
+        let target = authority.outbound_esp_counter_target();
 
         let receipt = backend
             .apply_and_read_back_outbound_esp_counter(&authority, authority.id(), apply.clone())
@@ -1385,6 +1442,7 @@ mod tests {
             .unwrap();
         EspCounterResumeProofSet::single(receipt)
             .validate_counter_proof(
+                &target,
                 proof_binding,
                 EspCounterProofRequirement::BeforeOwnershipCommit,
             )
@@ -1498,6 +1556,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn receipt_from_identical_second_actor_cannot_prove_the_intended_target() {
+        let request = outbound_install_request();
+        let backend_a = LinuxXfrmBackend::with_transport(BindingTransport::new([]))
+            .bind_current_network_namespace()
+            .unwrap();
+        let authority_a = counter_binding(&backend_a, &request);
+        let target_a = authority_a.outbound_esp_counter_target();
+        assert_eq!(
+            format!("{target_a:?}"),
+            "OutboundEspCounterTarget(<redacted>)"
+        );
+
+        let (policy, sa) = outbound_readback_at(&request, 49);
+        let transport_b = BindingTransport::new([
+            Ok(Some(policy.clone())),
+            Ok(Some(sa.clone())),
+            Ok(Some(policy)),
+            Ok(Some(sa)),
+        ]);
+        let capture_b = transport_b.clone();
+        let backend_b = LinuxXfrmBackend::with_transport(transport_b)
+            .bind_current_network_namespace()
+            .unwrap();
+        let authority_b = counter_binding(&backend_b, &request);
+        assert_eq!(authority_a.id(), authority_b.id());
+
+        let apply = counter_request(&authority_b, &request, 7, 8, 50);
+        let proof_binding = apply.binding();
+        let receipt_b = backend_b
+            .apply_and_read_back_outbound_esp_counter(&authority_b, authority_b.id(), apply)
+            .await
+            .unwrap();
+        let error = EspCounterResumeProofSet::single(receipt_b)
+            .validate_counter_proof(
+                &target_a,
+                proof_binding,
+                EspCounterProofRequirement::BeforeOwnershipCommit,
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code(), "esp_counter_receipt_target_mismatch");
+        assert_eq!(
+            capture_b.operations(),
+            vec![
+                "query_outbound_policy_binding",
+                "query_outbound_sa_binding",
+                "query_outbound_policy_binding",
+                "query_outbound_sa_binding",
+            ],
+            "target rejection must not validate through the receipt's foreign actor"
+        );
+    }
+
+    #[tokio::test]
     async fn committed_counter_recovery_accepts_advanced_state_but_cannot_fence() {
         let request = outbound_install_request();
         let (policy, sa) = outbound_readback_at(&request, 100);
@@ -1513,6 +1626,7 @@ mod tests {
             .bind_current_network_namespace()
             .unwrap();
         let authority = counter_binding(&backend, &request);
+        let target = authority.outbound_esp_counter_target();
         let binding = EspCounterResumeBinding::new(11, 12, authority.id(), 50).unwrap();
         let receipt = backend
             .recover_committed_outbound_esp_counter(
@@ -1524,7 +1638,11 @@ mod tests {
             .unwrap();
         let proofs = EspCounterResumeProofSet::single(receipt);
         proofs
-            .validate_counter_proof(binding, EspCounterProofRequirement::CommittedRecovery)
+            .validate_counter_proof(
+                &target,
+                binding,
+                EspCounterProofRequirement::CommittedRecovery,
+            )
             .await
             .unwrap();
         for requirement in [
@@ -1532,7 +1650,7 @@ mod tests {
             EspCounterProofRequirement::BeforeFirstPublication,
         ] {
             let error = proofs
-                .validate_counter_proof(binding, requirement)
+                .validate_counter_proof(&target, binding, requirement)
                 .await
                 .unwrap_err();
             assert_eq!(error.code(), "esp_counter_recovered_receipt_cannot_fence");
@@ -1542,7 +1660,11 @@ mod tests {
             EspCounterResumeBinding::new(11, 13, authority.id(), 50).unwrap(),
         ] {
             let error = proofs
-                .validate_counter_proof(mismatched, EspCounterProofRequirement::CommittedRecovery)
+                .validate_counter_proof(
+                    &target,
+                    mismatched,
+                    EspCounterProofRequirement::CommittedRecovery,
+                )
                 .await
                 .unwrap_err();
             assert_eq!(error.code(), "esp_counter_receipt_absent_or_stale");
@@ -1572,10 +1694,10 @@ mod tests {
 
         let current = backend.network_namespace_binding();
         let foreign = InstalledOutboundSaBinding::new(
-            NetworkNamespaceBinding {
+            NamespaceActorBinding::new(NetworkNamespaceBinding {
                 device: current.device.wrapping_add(1),
                 inode: current.inode.wrapping_add(1),
-            },
+            }),
             validate_outbound_request(&request).unwrap(),
         );
         let error = backend
@@ -1661,6 +1783,7 @@ mod tests {
             .bind_current_network_namespace()
             .unwrap();
         let authority = counter_binding(&backend, &request);
+        let target = authority.outbound_esp_counter_target();
         let apply = counter_request(&authority, &request, 1, 2, 50);
         let proof_binding = apply.binding();
         let receipt = backend
@@ -1676,6 +1799,7 @@ mod tests {
             .unwrap_err();
         let error = EspCounterResumeProofSet::single(receipt)
             .validate_counter_proof(
+                &target,
                 proof_binding,
                 EspCounterProofRequirement::BeforeFirstPublication,
             )
@@ -1953,8 +2077,12 @@ mod tests {
         assert!(!binding_debug.contains("9876543210"));
 
         let (sender, _receiver) = mpsc::channel(1);
+        let actor_binding = NamespaceActorBinding::new(binding);
         let backend = NamespaceBoundLinuxXfrmBackend {
-            inner: Arc::new(NamespaceBoundLinuxXfrmBackendInner { sender, binding }),
+            inner: Arc::new(NamespaceBoundLinuxXfrmBackendInner {
+                sender,
+                actor_binding,
+            }),
         };
         let debug = format!("{backend:?}");
         assert!(!debug.contains("1234567890"));

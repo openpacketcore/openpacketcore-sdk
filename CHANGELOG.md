@@ -64,10 +64,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   validation, advances only through `XFRM_MSG_NEWAE`, and requires exact final
   readback before issuing a bounded, redaction-safe receipt. Equal retries are
   idempotent, already-advanced state never rolls backward, and admitted work
-  survives observer cancellation. A separate read-only process-loss recovery
-  path issues committed-recovery-only evidence that cannot authorize a fresh
-  ownership fence or first publication. Privileged namespace proof covers a
-  restored ESN counter and the first real ESP packet (#333).
+  survives observer cancellation. Proof validation is bound to the exact live
+  namespace actor even when another namespace has identical durable SA state.
+  A separate read-only process-loss recovery path issues
+  committed-recovery-only evidence that cannot authorize a fresh ownership
+  fence and requires an independently proven committed fence before resumed
+  publication. Privileged namespace proof covers cross-namespace receipt
+  rejection, a restored ESN counter, and the first real ESP packet (#333).
 - **Epoch-bound live session-consensus membership — `opc-session-store`,
   `opc-session-net`:** adds restart-safe, idempotent 3→5→3 topology transitions
   with exact descriptor binding, learner catch-up markers, joint-consensus

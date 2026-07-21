@@ -177,7 +177,12 @@ Same-SPI failover must use
 The production API accepts only the live `InstalledOutboundSaBinding`, its
 exact `OutboundSaBindingId`, a durable `EspCounterResumeBinding`, and transient
 exact SA parameters. It has no caller-selectable direction and is not exposed
-through `XfrmBackend` or the mock backend.
+through `XfrmBackend` or the mock backend. The durable ID intentionally remains
+stable when identical state is recovered in another namespace. Before using a
+receipt, the coordinator must therefore derive an `OutboundEspCounterTarget`
+from its intended live binding and supply that opaque, process-local target to
+proof validation. A receipt from another actor or network namespace is rejected
+before the foreign backend is queried, even when every durable field is equal.
 
 `EspCounterResumeBinding::new` takes the **next** ESP sequence number the
 successor is allowed to emit. Linux GETSA replay state reports the last
@@ -204,9 +209,9 @@ fails.
 
 ```rust,no_run
 use opc_ipsec_xfrm::{
-    AppliedEspCounterReceipt, EspCounterResumeApplyRequest,
-    EspCounterResumeBinding, InstalledOutboundSaBinding,
-    NamespaceBoundLinuxXfrmBackend, SaParameters,
+    EspCounterProofRequirement, EspCounterResumeApplyRequest,
+    EspCounterResumeBinding, EspCounterResumeProofSet,
+    InstalledOutboundSaBinding, NamespaceBoundLinuxXfrmBackend, SaParameters,
 };
 
 async fn apply_counter(
@@ -216,18 +221,26 @@ async fn apply_counter(
     fence_generation: u64,
     requested_next: u64,
     exact_sa: SaParameters,
-) -> Result<AppliedEspCounterReceipt, opc_ipsec_xfrm::EspCounterResumeError> {
+) -> Result<(), opc_ipsec_xfrm::EspCounterResumeError> {
+    let target = authority.outbound_esp_counter_target();
     let binding = EspCounterResumeBinding::new(
         operation_id,
         fence_generation,
         authority.id(),
         requested_next,
     )?;
-    backend
+    let receipt = backend
         .apply_and_read_back_outbound_esp_counter(
             authority,
             authority.id(),
             EspCounterResumeApplyRequest::new(binding, exact_sa),
+        )
+        .await?;
+    EspCounterResumeProofSet::single(receipt)
+        .validate_counter_proof(
+            &target,
+            binding,
+            EspCounterProofRequirement::BeforeOwnershipCommit,
         )
         .await
 }
@@ -243,9 +256,11 @@ After process loss and an already-committed ownership grant,
 `recover_committed_outbound_esp_counter` performs read-only exact validation
 and accepts a live counter at or above the durable floor. Its receipt is
 structurally limited to `EspCounterProofRequirement::CommittedRecovery`; it
-cannot authorize a new ownership fence or first successor publication. This
-separation prevents an advanced live SA from being reinterpreted as fresh
-pre-publication authority.
+cannot authorize a new ownership fence. A product may use that proof while
+resuming publication only after it independently proves that the exact
+ownership fence was committed before process loss. This separation prevents an
+advanced live SA from being reinterpreted as fresh pre-commit authority while
+retaining crash recovery after fencing but before steering.
 
 ## Usage
 

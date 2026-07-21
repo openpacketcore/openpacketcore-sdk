@@ -746,7 +746,7 @@ impl XfrmInstallJournal {
             });
         }
         Ok(InstalledOutboundSaBinding::new(
-            backend.network_namespace_binding(),
+            backend.namespace_actor_binding(),
             expectation,
         ))
     }

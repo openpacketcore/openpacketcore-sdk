@@ -5,7 +5,9 @@ use std::{error::Error, fmt};
 use sha2::{Digest, Sha256};
 
 use crate::model::sa_uses_esn;
-use crate::namespace::{NamespaceBoundLinuxXfrmBackend, NetworkNamespaceBinding};
+#[cfg(test)]
+use crate::namespace::NetworkNamespaceBinding;
+use crate::namespace::{NamespaceActorBinding, NamespaceBoundLinuxXfrmBackend};
 use crate::{
     IpAddress, LifetimeConfig, PolicyParameters, SaParameters, UdpEncap, XfrmAction,
     XfrmCompositeInstallRequest, XfrmDirection, XfrmError, XfrmId, XfrmInstallCommitError,
@@ -59,19 +61,16 @@ impl fmt::Debug for OutboundSaBindingId {
 /// ```
 #[derive(Clone, PartialEq, Eq)]
 pub struct InstalledOutboundSaBinding {
-    namespace: NetworkNamespaceBinding,
+    actor: NamespaceActorBinding,
     expectation: OutboundSaPolicyExpectation,
 }
 
 impl InstalledOutboundSaBinding {
     pub(crate) const fn new(
-        namespace: NetworkNamespaceBinding,
+        actor: NamespaceActorBinding,
         expectation: OutboundSaPolicyExpectation,
     ) -> Self {
-        Self {
-            namespace,
-            expectation,
-        }
+        Self { actor, expectation }
     }
 
     /// Return the stable key-free ID that a durable re-pin request must retain
@@ -88,7 +87,7 @@ impl InstalledOutboundSaBinding {
         expected_id: OutboundSaBindingId,
     ) -> Result<OutboundSaPolicyExpectation, OutboundSaBindingError> {
         self.validated_expectation_for_actor(
-            backend.network_namespace_binding(),
+            &backend.namespace_actor_binding(),
             parameters,
             expected_id,
         )
@@ -96,13 +95,18 @@ impl InstalledOutboundSaBinding {
 
     pub(crate) fn validated_expectation_for_actor(
         &self,
-        actor_namespace: NetworkNamespaceBinding,
+        actor: &NamespaceActorBinding,
         parameters: &SaParameters,
         expected_id: OutboundSaBindingId,
     ) -> Result<OutboundSaPolicyExpectation, OutboundSaBindingError> {
-        if self.namespace != actor_namespace {
+        if self.actor.namespace() != actor.namespace() {
             return Err(OutboundSaBindingError::rejected(
                 "xfrm_outbound_sa_binding_namespace_mismatch",
+            ));
+        }
+        if self.actor != *actor {
+            return Err(OutboundSaBindingError::rejected(
+                "xfrm_outbound_sa_binding_actor_mismatch",
             ));
         }
         if self.id() != expected_id {
@@ -138,7 +142,11 @@ impl InstalledOutboundSaBinding {
 
     #[cfg(test)]
     pub(crate) const fn namespace(&self) -> NetworkNamespaceBinding {
-        self.namespace
+        self.actor.namespace()
+    }
+
+    pub(crate) fn actor_binding(&self) -> NamespaceActorBinding {
+        self.actor.clone()
     }
 }
 
@@ -813,7 +821,10 @@ mod tests {
     fn debug_and_errors_do_not_expose_hostile_identity_material() {
         let expectation = validate_outbound_request(&outbound_request()).unwrap();
         let binding = InstalledOutboundSaBinding::new(
-            NetworkNamespaceBinding::for_test(1_234_567_890, 9_876_543_210),
+            NamespaceActorBinding::new(NetworkNamespaceBinding::for_test(
+                1_234_567_890,
+                9_876_543_210,
+            )),
             expectation,
         );
         let debug = format!("{binding:?}");
