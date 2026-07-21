@@ -6,6 +6,7 @@
 //! request digest for idempotency and the status/evidence types for bounded
 //! operator-facing state.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::time::Duration;
 
@@ -14,11 +15,11 @@ use thiserror::Error;
 
 use crate::consensus::{
     SessionConsensusClusterId, SessionConsensusConfigurationEpoch, SessionConsensusConfigurationId,
-    SessionConsensusIdentity,
+    SessionConsensusIdentity, SessionConsensusNodeId,
 };
 use crate::topology::{
-    QuorumReplicaDescriptor, QuorumTopologyConfig, QuorumTopologyError, ValidatedQuorumTopology,
-    QUORUM_TOPOLOGY_MAX_MEMBERS,
+    QuorumReplicaDescriptor, QuorumTopologyConfig, QuorumTopologyError, ReplicaId,
+    ValidatedQuorumTopology, QUORUM_TOPOLOGY_MAX_MEMBERS,
 };
 
 const TRANSITION_REQUEST_DIGEST_DOMAIN: &[u8] =
@@ -290,6 +291,51 @@ impl SessionTopologyTransitionRequest {
     #[must_use]
     pub const fn desired_configuration_id(&self) -> SessionConsensusConfigurationId {
         self.desired_configuration_id
+    }
+
+    /// Exact consensus scope derived for the desired descriptor set.
+    #[must_use]
+    pub const fn desired_identity(&self) -> SessionConsensusIdentity {
+        SessionConsensusIdentity::new(
+            self.cluster_id,
+            self.desired_configuration_id,
+            self.desired_epoch,
+        )
+    }
+
+    /// Stable consensus node ID of one desired logical replica.
+    ///
+    /// The result is absent when the replica is not part of the exact desired
+    /// descriptor set. Node IDs are derived from cluster identity and logical
+    /// replica identity, so retained members keep their ID across epochs.
+    #[must_use]
+    pub fn desired_consensus_node_id(
+        &self,
+        replica_id: &ReplicaId,
+    ) -> Option<SessionConsensusNodeId> {
+        self.desired_members
+            .binary_search_by(|descriptor| descriptor.replica_id().cmp(replica_id))
+            .ok()?;
+        opc_consensus::derive_node_id(self.cluster_id, replica_id.as_str().as_bytes()).ok()
+    }
+
+    /// Exact desired voter IDs in canonical order.
+    #[must_use]
+    pub fn desired_consensus_node_ids(&self) -> BTreeSet<SessionConsensusNodeId> {
+        self.desired_members
+            .iter()
+            .filter_map(|descriptor| self.desired_consensus_node_id(descriptor.replica_id()))
+            .collect()
+    }
+
+    pub(crate) fn desired_node_bindings(&self) -> BTreeMap<SessionConsensusNodeId, [u8; 32]> {
+        self.desired_members
+            .iter()
+            .filter_map(|descriptor| {
+                self.desired_consensus_node_id(descriptor.replica_id())
+                    .map(|node_id| (node_id, descriptor.configuration_fingerprint()))
+            })
+            .collect()
     }
 
     /// Complete caller-approved operation timeout.

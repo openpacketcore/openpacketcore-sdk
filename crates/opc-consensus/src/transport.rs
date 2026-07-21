@@ -139,6 +139,17 @@ pub trait ConsensusPeer: Send + Sync + std::fmt::Debug {
     /// Canonical ordinal expected for the authenticated remote peer.
     fn node_id(&self) -> ConsensusNodeId;
 
+    /// Exact authenticated cluster/configuration/epoch scope enforced by this
+    /// peer adapter, when the adapter can prove one.
+    ///
+    /// Fixed-topology compatibility adapters may leave this absent. Dynamic
+    /// membership admission must require an exact value before a peer can be
+    /// staged under a successor configuration; a caller-supplied node ordinal
+    /// alone is not sufficient binding evidence.
+    fn scope_identity(&self) -> Option<ConsensusIdentity> {
+        None
+    }
+
     /// Send one scoped call under one complete logical deadline.
     async fn call(
         &self,

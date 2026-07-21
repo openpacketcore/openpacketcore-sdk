@@ -99,6 +99,15 @@ fn request_accepts_bounded_odd_memberships_and_canonicalizes_order() {
             SESSION_TOPOLOGY_TRANSITION_MAX_OPERATION_TIMEOUT
         );
         assert_eq!(request.desired_members().len(), count);
+        assert_eq!(request.desired_consensus_node_ids().len(), count);
+        for descriptor in request.desired_members() {
+            assert!(request
+                .desired_consensus_node_id(descriptor.replica_id())
+                .is_some());
+        }
+        assert!(request
+            .desired_consensus_node_id(&ReplicaId::new("absent").expect("absent replica ID"))
+            .is_none());
         assert!(request
             .desired_members()
             .windows(2)
