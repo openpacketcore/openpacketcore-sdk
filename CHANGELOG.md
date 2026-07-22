@@ -8,6 +8,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Breaking: correlated SWm Diameter-EAP redirect and routing —
+  `opc-proto-diameter`:** `SwmDiameterEapRequest` adds ordered redacted
+  `route_records`; existing originated literals initialize `Vec::new()`.
+  DER/DEA now validate and retain exact ordered Proxy-Info, DER alone emits
+  Route-Record, and every DEA profile forbids Route-Record. A new response
+  parser separates ordinary E-clear application answers from RFC 6733 generic
+  E-bit errors. Redirect-Host values remain sealed until authenticated
+  connection generation, both transaction identifiers, P, optional-present
+  Session-Id, and exact Proxy-Info correlation succeed. Typed redirect usage,
+  cache time, DiameterURI validation, RFC cache precedence, combined
+  count/byte bounds, opaque Failed-AVP reception, and redaction-safe
+  diagnostics fail closed. Public generic origination is limited to
+  request-bound base `DIAMETER_REDIRECT_INDICATION` (3006); all other
+  originated failures continue through the existing bound error-answer
+  builder, and parsed generic/ordinary Failed-AVP evidence cannot be rebound
+  through a typed builder (#352).
 - **Breaking: typed SWm DEA authorization timers — `opc-proto-diameter`:**
   `SwmDiameterEapAnswer` adds `session_timeout`, `authorization_lifetime`,
   `auth_grace_period`, and `re_auth_request_type`. Existing literals initialize

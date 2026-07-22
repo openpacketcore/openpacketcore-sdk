@@ -189,6 +189,7 @@ async fn epdg_sdk_protocol_xfrm_testbed_and_evidence_components_compose(
             terminal_information: None,
             high_priority_access_info: None,
             state_avps: vec![b"opaque-redacted-state".to_vec()],
+            route_records: Vec::new(),
             extensions: Default::default(),
         },
         0x1111_2222,
@@ -387,6 +388,7 @@ fn epdg_unauthenticated_emergency_identity_recovery_components_compose(
         terminal_information: None,
         high_priority_access_info: None,
         state_avps: Vec::new(),
+        route_records: Vec::new(),
         extensions: Default::default(),
     };
     let initial_owned = build_swm_diameter_eap_request(

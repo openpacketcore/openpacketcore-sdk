@@ -4015,6 +4015,7 @@ fn sample_swm_request() -> SwmDiameterEapRequest {
         terminal_information: None,
         high_priority_access_info: None,
         state_avps: vec![b"opaque-state".to_vec()],
+        route_records: Vec::new(),
         extensions: Default::default(),
     }
 }
