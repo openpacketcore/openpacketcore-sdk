@@ -232,6 +232,13 @@ These checks are mechanical message-shape validation only; AAA challenge
 selection, subscriber authorization, local emergency policy, realm routing,
 transport state, and EAP-AKA policy remain downstream product work.
 
+`SwmDiameterResult::is_diameter_authorization_rejected` classifies only the
+base RFC 6733 permanent-failure value 5003. It returns false for base value
+4001 (`DIAMETER_AUTHENTICATION_REJECTED`) and for an experimental result with
+the same numeric code. An independently constructed DEA fixture proves the
+exact M-set Result-Code AVP bytes. Selecting or constructing a response in a
+different access protocol remains outside this Diameter boundary.
+
 SWm DER and DEA each carry a role-specific sealed collection for
 command-unmodeled optional AVPs at the trailing command wildcard. Under
 `Preserve`, the typed parser retains at most 128 well-formed M-clear AVPs and

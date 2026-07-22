@@ -117,6 +117,17 @@ pub const IKEV2_NOTIFY_TEMPORARY_FAILURE: u16 = 43;
 /// @conformance boundary-only
 pub const IKEV2_NOTIFY_CHILD_SA_NOT_FOUND: u16 = 44;
 
+/// 3GPP private IKEv2 Notify error type for AUTHORIZATION_REJECTED.
+///
+/// TS 24.302 uses this value when an ePDG rejects tunnel establishment because
+/// the user is barred from non-3GPP access or the subscribed APN. The product
+/// remains responsible for choosing this outcome from trusted authorization
+/// state.
+///
+/// @spec 3GPP TS24.302 7.4.1.2, 8.1.2.2
+/// @conformance boundary-only
+pub const IKEV2_NOTIFY_AUTHORIZATION_REJECTED: u16 = 9_003;
+
 /// IKEv2 Notify Message Type for NAT_DETECTION_SOURCE_IP.
 ///
 /// @spec IETF RFC7296 2.23; IANA IKEv2 Notify Message Status Types
@@ -274,6 +285,22 @@ impl<'a> Ikev2NotifyPayload<'a> {
     /// Return true when this is a 3GPP DEVICE_IDENTITY Notify payload.
     pub const fn is_device_identity(self) -> bool {
         self.notify_message_type == IKEV2_NOTIFY_DEVICE_IDENTITY
+    }
+
+    /// Return true for a received 3GPP AUTHORIZATION_REJECTED Notify body.
+    ///
+    /// The typed form has no SPI and no notification data. RFC 7296 requires
+    /// receivers to ignore Protocol ID when SPI Size is zero, so that field is
+    /// deliberately not inspected here. Senders use
+    /// [`Ikev2NotifyPayloadBuild::authorization_rejected`](crate::Ikev2NotifyPayloadBuild::authorization_rejected)
+    /// to emit the canonical Protocol ID zero representation.
+    ///
+    /// @spec 3GPP TS24.302 8.1.2.2; IETF RFC7296 3.10
+    pub const fn is_authorization_rejected(self) -> bool {
+        self.notify_message_type == IKEV2_NOTIFY_AUTHORIZATION_REJECTED
+            && self.spi_size == 0
+            && self.spi.is_empty()
+            && self.notification_data.is_empty()
     }
 
     /// Return true when Protocol ID and SPI Size have the cookie-compatible shape.

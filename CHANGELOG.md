@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Typed SWm/IKEv2 authorization-rejection wire helpers —
+  `opc-proto-diameter`, `opc-proto-ikev2`:** the Diameter base registry now
+  names RFC 6733 `DIAMETER_AUTHORIZATION_REJECTED` as 5003, and
+  `SwmDiameterResult` classifies only that exact base result. It deliberately
+  excludes 4001 (`DIAMETER_AUTHENTICATION_REJECTED`) and same-numbered
+  experimental results. IKEv2 exposes TS 24.302 private error 9003 plus a
+  canonical Protocol-ID-zero, empty-SPI, empty-data sender constructor.
+  Receive recognition requires the empty SPI/data shape but, as RFC 7296
+  mandates when SPI Size is zero, ignores Protocol ID. Cross-protocol
+  selection, IKE_AUTH assembly, ePDG authentication, and provisioning policy
+  remain product-owned (#352).
 - **Typed request-bound SWm DEA gateway context — `opc-proto-diameter`:**
   SWm DEA now parses canonical RFC 5447 `MIP6-Agent-Info` for the chained
   S2b-S8 Serving-GW and 3GPP `Emergency-Info` for the HSS-derived emergency

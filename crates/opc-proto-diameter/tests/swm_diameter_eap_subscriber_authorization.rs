@@ -1063,8 +1063,11 @@ fn non_success_dea_can_carry_non_result_conditioned_subscriber_facts() {
         Some(VENDOR_ID_3GPP),
         &2_u32.to_be_bytes(),
     );
-    let parsed = parse(&answer_wire(5003, &[extra]))
-        .expect("standalone parser retains syntactically valid subscriber facts");
+    let parsed = parse(&answer_wire(
+        base::RESULT_CODE_DIAMETER_AUTHORIZATION_REJECTED,
+        &[extra],
+    ))
+    .expect("standalone parser retains syntactically valid subscriber facts");
     let rebuilt = swm::build_swm_diameter_eap_answer(
         &parsed,
         HOP_BY_HOP,
@@ -1081,6 +1084,36 @@ fn non_success_dea_can_carry_non_result_conditioned_subscriber_facts() {
 }
 
 #[test]
+fn authorization_rejected_helper_matches_only_base_result_code_5003() {
+    const RESULT_AVP: [u8; 12] = [
+        0x00, 0x00, 0x01, 0x0c, // Result-Code (268)
+        0x40, 0x00, 0x00, 0x0c, // M set, twelve-octet AVP
+        0x00, 0x00, 0x13, 0x8b, // DIAMETER_AUTHORIZATION_REJECTED (5003)
+    ];
+
+    assert_eq!(base::RESULT_CODE_DIAMETER_AUTHORIZATION_REJECTED, 5_003);
+    let wire = answer_wire(base::RESULT_CODE_DIAMETER_AUTHORIZATION_REJECTED, &[]);
+    assert!(wire
+        .windows(RESULT_AVP.len())
+        .any(|window| window == RESULT_AVP));
+
+    let parsed = parse(&wire).expect("synthetic authorization-rejected DEA");
+    assert!(parsed.result.is_diameter_authorization_rejected());
+    assert!(!format!("{parsed:?}").contains("aaa.synthetic.invalid"));
+
+    // RFC 6733 assigns 4001 to DIAMETER_AUTHENTICATION_REJECTED, not
+    // DIAMETER_AUTHORIZATION_REJECTED.
+    assert!(!SwmDiameterResult::Base(4_001).is_diameter_authorization_rejected());
+    assert!(!SwmDiameterResult::Base(base::RESULT_CODE_DIAMETER_SUCCESS)
+        .is_diameter_authorization_rejected());
+    assert!(!SwmDiameterResult::Experimental {
+        vendor_id: VENDOR_ID_3GPP,
+        code: base::RESULT_CODE_DIAMETER_AUTHORIZATION_REJECTED,
+    }
+    .is_diameter_authorization_rejected());
+}
+
+#[test]
 fn apn_oi_requires_correlated_non_emergency_network_mobility() {
     let apn_wire = raw_avp(
         swm::AVP_APN_OI_REPLACEMENT,
@@ -1088,7 +1121,11 @@ fn apn_oi_requires_correlated_non_emergency_network_mobility() {
         Some(VENDOR_ID_3GPP),
         APN_OI.as_bytes(),
     );
-    assert!(parse(&answer_wire(5003, &[apn_wire])).is_err());
+    assert!(parse(&answer_wire(
+        base::RESULT_CODE_DIAMETER_AUTHORIZATION_REJECTED,
+        &[apn_wire]
+    ))
+    .is_err());
 
     let authorization = SwmDeaSubscriberAuthorization::new()
         .with_apn_oi_replacement(SwmApnOiReplacement::new(APN_OI).expect("valid synthetic APN-OI"));
@@ -1107,7 +1144,7 @@ fn apn_oi_requires_correlated_non_emergency_network_mobility() {
         typed_context(UnknownIePolicy::Preserve),
     )
     .expect("ordinary DER envelope");
-    answer.result = SwmDiameterResult::Base(5003);
+    answer.result = SwmDiameterResult::Base(base::RESULT_CODE_DIAMETER_AUTHORIZATION_REJECTED);
     answer.eap_payload = None;
     assert!(
         swm::build_swm_diameter_eap_answer_for(&normal, &answer, EncodeContext::default(),)

@@ -112,6 +112,12 @@ pub const RESULT_CODE_DIAMETER_INVALID_AVP_BITS: u32 = 3009;
 pub const RESULT_CODE_DIAMETER_AVP_UNSUPPORTED: u32 = 5001;
 /// Unknown Session-Id permanent-failure result code.
 pub const RESULT_CODE_DIAMETER_UNKNOWN_SESSION_ID: u32 = 5002;
+/// Authorization rejected permanent-failure result code.
+///
+/// This is distinct from `DIAMETER_AUTHENTICATION_REJECTED` (4001).
+///
+/// @spec IETF RFC6733 7.1.5
+pub const RESULT_CODE_DIAMETER_AUTHORIZATION_REJECTED: u32 = 5003;
 /// Invalid AVP value permanent-failure result code.
 pub const RESULT_CODE_DIAMETER_INVALID_AVP_VALUE: u32 = 5004;
 /// Missing mandatory AVP permanent-failure result code.
