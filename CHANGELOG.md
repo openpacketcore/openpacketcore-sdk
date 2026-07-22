@@ -19,6 +19,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mandates when SPI Size is zero, ignores Protocol ID. Cross-protocol
   selection, IKE_AUTH assembly, ePDG authentication, and provisioning policy
   remain product-owned (#352).
+- **Request-bound SWm DRA delivery errors — `opc-proto-diameter`:** the typed
+  generic E-bit DEA surface can now originate exact RFC 6733
+  `DIAMETER_UNABLE_TO_DELIVER` (3002) and `DIAMETER_TOO_BUSY` (3004) from one
+  retained DER. A private zeroized binding prevents a cloned or mutated answer
+  from being applied to another transaction or conflicting request while the
+  existing builder preserves P, both identifiers, Session-Id, and ordered
+  Proxy-Info and clears R/T. Origin identities and routing state remain
+  redacted. Application-only DEA AVPs are rejected for these two profiles;
+  valid generic wildcard and foreign-vendor optional AVPs retain bounded RFC
+  6733 handling. Result 3004 additionally requires a DER with Destination-Host.
+  Received delivery failures require the exact DER Session-Id and become
+  actionable only after the transport atomically consumes the
+  connection-generation/Hop-by-Hop pending entry and the complete request
+  envelope correlates. Parsed generic answers remain non-reoriginatable
+  (#464).
 - **Typed request-bound SWm DEA gateway context — `opc-proto-diameter`:**
   SWm DEA now parses canonical RFC 5447 `MIP6-Agent-Info` for the chained
   S2b-S8 Serving-GW and 3GPP `Emergency-Info` for the HSS-derived emergency
