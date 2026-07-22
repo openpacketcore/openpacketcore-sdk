@@ -5,9 +5,9 @@
 
 use core::fmt;
 
-use opc_protocol::{BorrowDecode, DecodeContext, DecodeErrorCode};
+use opc_protocol::{DecodeContext, DecodeErrorCode};
 
-use crate::Message;
+use crate::{Ikev2MessageRejection, Ikev2UnknownCriticalPayloadMessage, Message};
 
 /// UDP port assigned to IKE.
 pub const IKE_UDP_PORT: u16 = 500;
@@ -30,11 +30,7 @@ pub fn classify_ike_nat_traversal_datagram(
     udp_destination_port: u16,
     datagram: &[u8],
 ) -> NatTraversalClassification<'_> {
-    classify_ike_nat_traversal_datagram_with_context(
-        udp_destination_port,
-        datagram,
-        DecodeContext::default(),
-    )
+    inspect_ike_nat_traversal_datagram(udp_destination_port, datagram).into_classification()
 }
 
 /// Classify an ingress IKE/NAT-T UDP datagram with explicit decode limits.
@@ -46,70 +42,233 @@ pub fn classify_ike_nat_traversal_datagram_with_context(
     datagram: &[u8],
     ctx: DecodeContext,
 ) -> NatTraversalClassification<'_> {
+    inspect_ike_nat_traversal_datagram_with_context(udp_destination_port, datagram, ctx)
+        .into_classification()
+}
+
+/// Classify an ingress IKE/NAT-T UDP datagram while retaining a typed
+/// unknown-critical rejection sidecar.
+///
+/// The ordinary classification remains available through
+/// [`NatTraversalInspection::classification`] and uses the existing public
+/// classification enum. Ordinary valid classifications are unchanged.
+/// Rejection precedence is intentionally hardened: malformed offender framing
+/// remains malformed, and bytes beyond the declared IKE boundary classify as
+/// trailing even when the declared message also contains an unknown critical
+/// payload.
+#[must_use]
+pub fn inspect_ike_nat_traversal_datagram(
+    udp_destination_port: u16,
+    datagram: &[u8],
+) -> NatTraversalInspection<'_> {
+    inspect_ike_nat_traversal_datagram_with_context(
+        udp_destination_port,
+        datagram,
+        DecodeContext::default(),
+    )
+}
+
+/// Classify an ingress IKE/NAT-T UDP datagram with explicit decode limits
+/// while retaining a typed unknown-critical rejection sidecar.
+#[must_use]
+pub fn inspect_ike_nat_traversal_datagram_with_context(
+    udp_destination_port: u16,
+    datagram: &[u8],
+    ctx: DecodeContext,
+) -> NatTraversalInspection<'_> {
     match udp_destination_port {
-        IKE_UDP_PORT => classify_ike_datagram(NatTraversalIkeTransport::Udp500, datagram, ctx),
-        IKE_NAT_TRAVERSAL_UDP_PORT => classify_udp_4500_datagram(datagram, ctx),
-        port => NatTraversalClassification::Rejected(NatTraversalRejection::UnsupportedPort {
-            udp_destination_port: port,
-        }),
+        IKE_UDP_PORT => inspect_ike_datagram(NatTraversalIkeTransport::Udp500, datagram, ctx),
+        IKE_NAT_TRAVERSAL_UDP_PORT => inspect_udp_4500_datagram(datagram, ctx),
+        port => NatTraversalInspection::classified(NatTraversalClassification::Rejected(
+            NatTraversalRejection::UnsupportedPort {
+                udp_destination_port: port,
+            },
+        )),
     }
 }
 
-fn classify_udp_4500_datagram(
-    datagram: &[u8],
-    ctx: DecodeContext,
-) -> NatTraversalClassification<'_> {
+fn inspect_udp_4500_datagram(datagram: &[u8], ctx: DecodeContext) -> NatTraversalInspection<'_> {
     if datagram == [NAT_TRAVERSAL_KEEPALIVE].as_slice() {
-        return NatTraversalClassification::NatKeepalive(NatTraversalKeepalive { datagram });
+        return NatTraversalInspection::classified(NatTraversalClassification::NatKeepalive(
+            NatTraversalKeepalive { datagram },
+        ));
     }
 
     if datagram.starts_with(&NON_ESP_MARKER) {
-        return classify_ike_datagram(NatTraversalIkeTransport::Udp4500NonEspMarker, datagram, ctx);
+        return inspect_ike_datagram(NatTraversalIkeTransport::Udp4500NonEspMarker, datagram, ctx);
     }
 
     if datagram.len() < ESP_HEADER_PREFIX_LEN {
-        return NatTraversalClassification::Rejected(NatTraversalRejection::RuntEspCandidate {
-            datagram,
-        });
+        return NatTraversalInspection::classified(NatTraversalClassification::Rejected(
+            NatTraversalRejection::RuntEspCandidate { datagram },
+        ));
     }
 
     let spi = u32::from_be_bytes([datagram[0], datagram[1], datagram[2], datagram[3]]);
     let sequence_number = u32::from_be_bytes([datagram[4], datagram[5], datagram[6], datagram[7]]);
-    NatTraversalClassification::EspCandidate(NatTraversalEspCandidate {
-        datagram,
-        spi,
-        sequence_number,
-    })
+    NatTraversalInspection::classified(NatTraversalClassification::EspCandidate(
+        NatTraversalEspCandidate {
+            datagram,
+            spi,
+            sequence_number,
+        },
+    ))
 }
 
-fn classify_ike_datagram(
+fn inspect_ike_datagram(
     transport: NatTraversalIkeTransport,
     datagram: &[u8],
     ctx: DecodeContext,
-) -> NatTraversalClassification<'_> {
+) -> NatTraversalInspection<'_> {
     let ike_bytes = match transport {
         NatTraversalIkeTransport::Udp500 => datagram,
         NatTraversalIkeTransport::Udp4500NonEspMarker => &datagram[NON_ESP_MARKER_LEN..],
     };
 
-    match Message::decode(ike_bytes, ctx) {
-        Ok(([], message)) => NatTraversalClassification::Ike(NatTraversalIkeMessage {
-            transport,
-            datagram,
-            ike_bytes,
-            message,
-        }),
-        Ok((_tail, message)) => {
+    match Message::decode_with_rejection(ike_bytes, ctx) {
+        Ok(([], message)) => NatTraversalInspection::classified(NatTraversalClassification::Ike(
+            NatTraversalIkeMessage {
+                transport,
+                datagram,
+                ike_bytes,
+                message,
+            },
+        )),
+        Ok((_tail, message)) => NatTraversalInspection::classified(
             NatTraversalClassification::Rejected(NatTraversalRejection::TrailingIkeBytes {
                 transport,
                 declared_len: usize::try_from(message.header.length).unwrap_or(usize::MAX),
                 actual_len: ike_bytes.len(),
-            })
+            }),
+        ),
+        Err(Ikev2MessageRejection::Malformed(error)) => NatTraversalInspection::classified(
+            NatTraversalClassification::Rejected(NatTraversalRejection::MalformedIke {
+                transport,
+                decode_code: NatTraversalIkeDecodeErrorCode::from(error.code()),
+            }),
+        ),
+        Err(Ikev2MessageRejection::UnknownCriticalPayload(rejection)) => {
+            if rejection.has_trailing_bytes() {
+                NatTraversalInspection::classified(NatTraversalClassification::Rejected(
+                    NatTraversalRejection::TrailingIkeBytes {
+                        transport,
+                        declared_len: rejection.declared_len(),
+                        actual_len: ike_bytes.len(),
+                    },
+                ))
+            } else {
+                NatTraversalInspection {
+                    classification: NatTraversalClassification::Rejected(
+                        NatTraversalRejection::MalformedIke {
+                            transport,
+                            decode_code: NatTraversalIkeDecodeErrorCode::UnknownCriticalPayload,
+                        },
+                    ),
+                    unknown_critical_payload: Some(NatTraversalUnknownCriticalPayload {
+                        transport,
+                        rejection,
+                    }),
+                }
+            }
         }
-        Err(error) => NatTraversalClassification::Rejected(NatTraversalRejection::MalformedIke {
-            transport,
-            decode_code: NatTraversalIkeDecodeErrorCode::from(error.code()),
-        }),
+    }
+}
+
+/// Source-compatible NAT traversal classification enum plus an optional typed
+/// unknown-critical rejection sidecar.
+#[derive(Clone, PartialEq, Eq)]
+pub struct NatTraversalInspection<'a> {
+    classification: NatTraversalClassification<'a>,
+    unknown_critical_payload: Option<NatTraversalUnknownCriticalPayload>,
+}
+
+impl<'a> NatTraversalInspection<'a> {
+    fn classified(classification: NatTraversalClassification<'a>) -> Self {
+        Self {
+            classification,
+            unknown_critical_payload: None,
+        }
+    }
+
+    /// Ordinary source-compatible coarse classification outcome.
+    #[must_use]
+    pub const fn classification(&self) -> &NatTraversalClassification<'a> {
+        &self.classification
+    }
+
+    /// Consume the inspection and return its ordinary classification.
+    #[must_use]
+    pub fn into_classification(self) -> NatTraversalClassification<'a> {
+        self.classification
+    }
+
+    /// Typed unknown-critical rejection, when complete framing established it.
+    #[must_use]
+    pub const fn unknown_critical_payload(&self) -> Option<NatTraversalUnknownCriticalPayload> {
+        self.unknown_critical_payload
+    }
+
+    /// Stable machine-readable classification code.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        self.classification.code()
+    }
+
+    /// Return whether the ordinary classification accepts the datagram.
+    #[must_use]
+    pub const fn is_accepted(&self) -> bool {
+        self.classification.is_accepted()
+    }
+}
+
+impl fmt::Debug for NatTraversalInspection<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NatTraversalInspection")
+            .field("classification", &self.classification)
+            .field("unknown_critical_payload", &self.unknown_critical_payload)
+            .finish()
+    }
+}
+
+/// Transport-qualified unknown-critical IKE message fact.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct NatTraversalUnknownCriticalPayload {
+    transport: NatTraversalIkeTransport,
+    rejection: Ikev2UnknownCriticalPayloadMessage,
+}
+
+impl NatTraversalUnknownCriticalPayload {
+    /// Stable machine-readable rejection code.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        self.rejection.code()
+    }
+
+    /// Transport encapsulation used by the rejected IKE message.
+    #[must_use]
+    pub const fn transport(self) -> NatTraversalIkeTransport {
+        self.transport
+    }
+
+    /// UDP destination port that selected the transport.
+    #[must_use]
+    pub const fn udp_destination_port(self) -> u16 {
+        self.transport.udp_destination_port()
+    }
+
+    /// Generic message-bound unknown-critical fact.
+    #[must_use]
+    pub const fn rejection(self) -> Ikev2UnknownCriticalPayloadMessage {
+        self.rejection
+    }
+}
+
+impl fmt::Debug for NatTraversalUnknownCriticalPayload {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NatTraversalUnknownCriticalPayload")
+            .field("transport", &self.transport)
+            .field("rejection", &self.rejection)
+            .finish()
     }
 }
 

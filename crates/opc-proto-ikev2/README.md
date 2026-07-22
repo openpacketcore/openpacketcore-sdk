@@ -28,7 +28,9 @@ control-plane stack.
 - `header` exposes `Header`, `HeaderFlags`, `decode_header`, and
   `encode_header`.
 - `payload` exposes `PayloadChain`, `RawPayload`, `RawPayloadIterator`,
-  `PayloadType`, and `validate_payload_chain`.
+  `PayloadType`, and ordinary or detailed payload-chain validation. The
+  detailed boundary retains only an unknown critical payload's exact type and
+  bounded chain offset; it never retains the payload body.
 - `validation` exposes `Ikev2ValidationProfile`, separating conformant network
   receive behavior from opt-in sender-canonical fixture validation.
 - `crypto` defines the caller-supplied `CryptoProvider` boundary and protected
@@ -100,6 +102,46 @@ control-plane stack.
   request `Debug` output is redacted.
 - `fragmentation`, `notify`, `nat_detection`, `nat_traversal`, and `exchange`
   expose RFC-specific mechanism helpers without owning product state.
+
+## Unknown critical payload rejection
+
+`Message::decode_with_rejection` and NAT-T inspection preserve the exact
+one-octet payload type required by RFC 7296 section 2.5. A generic message fact
+is not reply authority. Only an exact initial IKE_SA_INIT request can be
+converted into `Ikev2SaInitUnknownCriticalPayloadRequest`; responses, trailing
+datagrams, malformed framing, truncation, and exceeded decode bounds cannot
+produce that wrapper. Its header remains private and `build_response()` routes
+through the existing bounded Notify type 1 builder:
+
+```rust
+use opc_proto_ikev2::{
+    inspect_ike_nat_traversal_datagram, IKE_UDP_PORT,
+};
+
+# let datagram = [0u8; 0];
+let inspection = inspect_ike_nat_traversal_datagram(IKE_UDP_PORT, &datagram);
+if let Some(rejection) = inspection.unknown_critical_payload() {
+    if let Ok(request) = rejection.rejection().try_into_ike_sa_init_request() {
+        let response = request.build_response()?;
+        // Apply product-owned source admission, rate limiting, and
+        // retransmission caching before sending `response`.
+        let _ = response;
+    }
+}
+# Ok::<(), opc_proto_ikev2::Ikev2SaInitNotifyBuildError>(())
+```
+
+Authenticated code that has already opened `SK`/`SKF` uses
+`PayloadChain::validate_with_rejection` or
+`RawPayloadIterator::unknown_critical_rejection` for the same protocol fact;
+exchange correlation and protected error transmission remain caller-owned.
+The original `classify_ike_nat_traversal_datagram` API keeps its public enum
+shape and continues returning the coarse
+`MalformedIke { decode_code: UnknownCriticalPayload }` outcome for existing
+metrics and exhaustive matches on a fully framed, exact-length offender.
+Rejection precedence is deliberately corrected for mixed-invalid input:
+malformed offender framing stays malformed, and bytes beyond the declared IKE
+length win as `TrailingIkeBytes`; neither produces a typed reply sidecar.
 
 ## Process-wide cryptographic module admission
 
