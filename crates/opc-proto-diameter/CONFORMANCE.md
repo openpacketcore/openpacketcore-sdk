@@ -249,9 +249,10 @@ and cannot be injected through
 the public collection API. Endpoint rebuilds canonicalize these AVPs to the
 trailing wildcard. This is not a byte-preserving relay/proxy contract; exact
 forwarding uses the raw `Message` path.
-Typed handling for M-set routing AVPs such as `Proxy-Info` and `Route-Record`
-is outside this focused optional-extension surface; no handling claim is made
-for them here.
+M-set routing AVPs do not enter the optional-extension collections. The typed
+routing surface separately validates and retains ordered DER/DEA `Proxy-Info`,
+retains ordered DER `Route-Record`, and forbids `Route-Record` on every DEA
+profile.
 
 The finite DEA authorization-timer rows are modeled as follows. Every field
 remains absent by default, preserving prior canonical message bytes.
@@ -270,9 +271,53 @@ the bytes of existing typed answers. Deployments applying TS 29.273's strict
 initial-authorization condition should require the field at their policy
 boundary. Explicit zero means unlimited and is therefore not smaller than a
 positive `Authorization-Lifetime`. Timeout enforcement, re-authorization
-scheduling, and teardown remain product policy. Redirect handling is not
-included in this slice and remains part of the open SWm authorization-context
-work.
+scheduling, and teardown remain product policy.
+
+#### SWm Diameter-EAP generic error and routing scope
+
+Diameter-EAP responses are selected by the header E bit. E-clear messages use
+the TS 29.273 application DEA grammar and reject base 3xxx results. E-set
+messages use RFC 6733 section 7.2's generic answer grammar: optional
+`Session-Id`, mandatory `Origin-Host`, `Origin-Realm`, and base `Result-Code`,
+followed by bounded diagnostics/routing and extension AVPs. The generic grammar
+does not require SWm `Auth-Application-Id`, `Auth-Request-Type`, or EAP AVPs.
+The parser accepts valid 3xxx, 5xxx, and unrecognized fallback families and
+rejects 1xxx, 2xxx, 4xxx, and values below 1000. `Experimental-Result` can be
+present only in addition to the base result and never supplies E-bit or
+redirect semantics. Known application AVPs in the generic wildcard retain
+their typed flags/width validation; an optional `Auth-Application-Id` must
+match header application 16_777_264. Destination-Host, Destination-Realm,
+Route-Record, vendor-id zero, and unknown M-set AVPs fail closed.
+
+| Routing/error AVP or signal | Wire rule | Typed guarantee and evidence |
+|:----------------------------|:----------|:-----------------------------|
+| Header R/P/E/T | DER sets R/P and clears E. DEA clears R/T, sets P, and selects ordinary/generic grammar with E. | Raw negative fixtures cover DER E, DEA P/T, ordinary E parsing, and base 3xxx on E-clear DEA. Failover retransmission alone sets DER T while retaining End-to-End identity and allocating a replacement Hop-by-Hop identifier/connection binding. |
+| `Proxy-Info` | IETF 284, M set, repeated; grouped exact-once `Proxy-Host` and `Proxy-State` | The grouped parser requires nonempty ASCII Proxy-Host, retains opaque Proxy-State privately, applies unknown-child policy, caps children at 128, and matches full vendor-aware keys. Builders echo the exact ordered request chain after diagnostics and before generic wildcard redirect AVPs. Correlation requires byte-identical order/content. Values never appear in diagnostics. |
+| `Route-Record` | IETF 282, M set, repeated on DER; forbidden on DEA | DER retains ordered nonempty ASCII identities and emits them after Proxy-Info. No answer builder reflects them; baseline and projected DEA dictionaries mark the AVP `Forbidden`, and typed parsing rejects it independently. |
+| Base `Result-Code` 3006 plus `Redirect-Host` | Redirect-Indication requires one or more repeated IETF 292 DiameterURI values | `SwmDiameterRedirect` preserves bounded wire order without assigning target preference. Only exact base 3006 with E set creates redirect semantics; experimental numeric 3006 remains ordinary/opaque. Missing, invalid, excessive, or out-of-context targets fail. Target values remain sealed until correlation. |
+| `Redirect-Host-Usage` / `Redirect-Max-Cache-Time` | IETF 261/262, singleton | Absence and explicit `DONT_CACHE` are preserved distinctly and both produce effective no-cache. A nonzero usage requires Max-Cache-Time. RFC does not forbid Max-Cache-Time with absent/zero usage, so it is preserved but is not actionable cache policy. The typed precedence accessor follows RFC 6733's route precedence rather than numeric enum order. |
+| `Failed-AVP` | IETF 279, M set, repeated | Generic E parsing validates the outer AVP and keeps its inner representation opaque, including synthesized/malformed representations permitted by RFC 6733. The explicit MUST-presence codes 5001, 5004, 5007, 5008, 5009, 5014, and 5016 fail when absent; 3009 and 5005 retain their non-MUST compatibility. Ordinary E-clear RFC 4072 DEA retains repeated values for value-free metadata but refuses typed re-origination to prevent evidence rebinding. |
+| Retained routing/error budget | Combined Proxy-Info, Route-Record, redirect, Failed-AVP, and generic wildcard values | Checked arithmetic caps retained entries at 128 and bytes at `DecodeContext::max_message_len`. Redirect construction accounts for usage/cache AVPs before it can produce an unencodable plan. |
+
+`parse_swm_diameter_eap_response_envelope_from_connection` binds received
+responses to an authenticated, process-unique connection generation.
+`SwmDiameterEapRequestEnvelope::correlate_response` then requires matching
+connection, Hop-by-Hop and End-to-End identifiers, P, exact Proxy-Info, and a
+matching Session-Id when the generic grammar carries one. Ordinary application
+answers additionally satisfy the configured direct/routed logical-Origin
+policy and request application/authentication facts. Generic errors skip only
+logical-Origin matching because an RFC 6733 intermediary may originate them.
+Parsed Redirect-Host values are inaccessible and cannot be re-encoded before
+that complete gate succeeds.
+
+The public generic origination path is restricted to request-bound base 3006
+through `SwmDiameterEapGenericErrorAnswer::new_redirect` and
+`build_swm_diameter_eap_response_for`. Arbitrary originated errors use the
+existing `error_answer::build_diameter_error_answer` boundary, which binds
+failure evidence to the inspected request. Exact response retransmission uses
+the cached `OwnedMessage`, not a mutable parsed value. Target selection,
+connection attempts, pending-request consumption, redirect-cache keying and
+expiry, duplicate-response handling, and route policy remain consumer-owned.
 
 The typed DER surface also carries optional `RAT-Type` and
 `Service-Selection` authorization context. `RAT-Type` uses vendor 10415, code

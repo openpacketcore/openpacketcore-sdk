@@ -135,6 +135,7 @@ fn establish_session(
             terminal_information: None,
             high_priority_access_info: None,
             state_avps: Vec::new(),
+            route_records: Vec::new(),
             extensions: Default::default(),
         },
         transaction,

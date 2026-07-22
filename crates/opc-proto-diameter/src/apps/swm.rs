@@ -7,6 +7,8 @@
 //! STR when Diameter session state is maintained, and the RAR/RAA then AAR/AAA
 //! authorization-information update sequence, the non-overload DER access
 //! context (QoS capabilities, visited PLMN, AAA failover, and priority), a
+//! typed request-correlated RFC 6733 routing boundary for Proxy-Info,
+//! Route-Record, and generic E-bit redirects, a
 //! typed request-conditioned RFC 7683 baseline loss-overload offer/report,
 //! ordered RFC 8583 Diameter Load context, typed successful-session timer
 //! context, and a bounded
@@ -14,8 +16,10 @@
 //! Context-Identifier, Service-Selection, and the TS 29.273 emergency attach
 //! sequence. The top-level default pointer is accepted under the DEA
 //! extension-AVP wildcard; it is not part of the baseline SWm DEA command ABNF.
-//! This module does not implement transport state, realm routing, local
-//! emergency-access policy, duplicate-request cache lifetime, or IKEv2 policy.
+//! This module does not select redirect targets, enforce redirect cache
+//! lifetime, attempt peer connections, implement transport state or realm
+//! routing, choose local emergency-access policy, set duplicate-request cache
+//! lifetime, or implement IKEv2 policy.
 //! A live Diameter client must still
 //! consume a pending request keyed by peer connection and Hop-by-Hop Identifier
 //! before passing the parsed transaction envelopes to emergency evidence; the
@@ -67,6 +71,8 @@ pub const APPLICATION_ID: ApplicationId = ApplicationId::new(16_777_264);
 pub const COMMAND_DIAMETER_EAP: CommandCode = CommandCode::new(268);
 
 const MAX_SWM_DIAMETER_EAP_EXTENSIONS: usize = 128;
+const MAX_SWM_DIAMETER_EAP_ROUTING_AVPS: usize = 128;
+const MAX_SWM_REDIRECT_HOSTS: usize = 128;
 
 /// EAP-Payload AVP code (RFC 4072).
 pub const AVP_EAP_PAYLOAD: AvpCode = AvpCode::new(462);
@@ -127,6 +133,8 @@ pub const DIAMETER_ERROR_USER_UNKNOWN: u32 = 5001;
 const DIAMETER_MULTI_ROUND_AUTH: u32 = 1001;
 /// Width of the TS 33.402 Annex A.4 unauthenticated-emergency MSK.
 pub const UNAUTHENTICATED_EMERGENCY_MSK_LEN: usize = 32;
+/// Base result used by an RFC 6733 redirect agent.
+pub const DIAMETER_REDIRECT_INDICATION: u32 = 3006;
 /// Largest identity body that fits an RFC 3748 EAP-Response/Identity packet.
 ///
 /// The five-octet fixed packet prefix (Code, Identifier, Length, and Type) is
@@ -199,7 +207,7 @@ pub const APPLICATION: ApplicationDefinition = ApplicationDefinition::new(
     SpecRef::new("3gpp", "TS29273", "SWm Diameter application"),
 );
 
-static SWM_REQUEST_AVP_RULES: [CommandAvpRule; 25] = [
+static SWM_REQUEST_AVP_RULES: [CommandAvpRule; 32] = [
     CommandAvpRule::new(
         AvpKey::ietf(base::AVP_SESSION_ID),
         AvpCardinality::ZeroOrOne,
@@ -276,9 +284,37 @@ static SWM_REQUEST_AVP_RULES: [CommandAvpRule; 25] = [
         AvpKey::ietf(base::AVP_RESULT_CODE),
         AvpCardinality::Forbidden,
     ),
+    CommandAvpRule::new(
+        AvpKey::ietf(base::AVP_EXPERIMENTAL_RESULT),
+        AvpCardinality::Forbidden,
+    ),
+    CommandAvpRule::new(
+        AvpKey::ietf(base::AVP_REDIRECT_HOST),
+        AvpCardinality::Forbidden,
+    ),
+    CommandAvpRule::new(
+        AvpKey::ietf(base::AVP_REDIRECT_HOST_USAGE),
+        AvpCardinality::Forbidden,
+    ),
+    CommandAvpRule::new(
+        AvpKey::ietf(base::AVP_REDIRECT_MAX_CACHE_TIME),
+        AvpCardinality::Forbidden,
+    ),
+    CommandAvpRule::new(
+        AvpKey::ietf(base::AVP_FAILED_AVP),
+        AvpCardinality::Forbidden,
+    ),
+    CommandAvpRule::new(
+        AvpKey::ietf(base::AVP_PROXY_INFO),
+        AvpCardinality::ZeroOrMore,
+    ),
+    CommandAvpRule::new(
+        AvpKey::ietf(base::AVP_ROUTE_RECORD),
+        AvpCardinality::ZeroOrMore,
+    ),
 ];
 
-static SWM_ANSWER_AVP_RULES: [CommandAvpRule; 24] = [
+static SWM_ANSWER_AVP_RULES: [CommandAvpRule; 32] = [
     CommandAvpRule::new(AvpKey::ietf(AVP_STATE), AvpCardinality::ZeroOrMore),
     CommandAvpRule::new(
         AvpKey::ietf(base::AVP_RESULT_CODE),
@@ -354,9 +390,41 @@ static SWM_ANSWER_AVP_RULES: [CommandAvpRule; 24] = [
     CommandAvpRule::new(AvpKey::ietf(AVP_LOAD_TYPE), AvpCardinality::Forbidden),
     CommandAvpRule::new(AvpKey::ietf(AVP_LOAD_VALUE), AvpCardinality::Forbidden),
     CommandAvpRule::new(AvpKey::ietf(AVP_SOURCE_ID), AvpCardinality::Forbidden),
+    CommandAvpRule::new(
+        AvpKey::ietf(base::AVP_PROXY_INFO),
+        AvpCardinality::ZeroOrMore,
+    ),
+    CommandAvpRule::new(
+        AvpKey::ietf(base::AVP_DESTINATION_HOST),
+        AvpCardinality::Forbidden,
+    ),
+    CommandAvpRule::new(
+        AvpKey::ietf(base::AVP_DESTINATION_REALM),
+        AvpCardinality::Forbidden,
+    ),
+    CommandAvpRule::new(
+        AvpKey::ietf(base::AVP_ROUTE_RECORD),
+        AvpCardinality::Forbidden,
+    ),
+    CommandAvpRule::new(
+        AvpKey::ietf(base::AVP_REDIRECT_HOST),
+        AvpCardinality::ZeroOrMore,
+    ),
+    CommandAvpRule::new(
+        AvpKey::ietf(base::AVP_REDIRECT_HOST_USAGE),
+        AvpCardinality::ZeroOrOne,
+    ),
+    CommandAvpRule::new(
+        AvpKey::ietf(base::AVP_REDIRECT_MAX_CACHE_TIME),
+        AvpCardinality::ZeroOrOne,
+    ),
+    CommandAvpRule::new(
+        AvpKey::ietf(base::AVP_FAILED_AVP),
+        AvpCardinality::ZeroOrMore,
+    ),
 ];
 
-static SWM_PROJECTED_PROFILE_ANSWER_AVP_RULES: [CommandAvpRule; 24] = [
+static SWM_PROJECTED_PROFILE_ANSWER_AVP_RULES: [CommandAvpRule; 32] = [
     CommandAvpRule::new(AvpKey::ietf(AVP_STATE), AvpCardinality::ZeroOrMore),
     CommandAvpRule::new(
         AvpKey::ietf(base::AVP_RESULT_CODE),
@@ -432,6 +500,38 @@ static SWM_PROJECTED_PROFILE_ANSWER_AVP_RULES: [CommandAvpRule; 24] = [
     CommandAvpRule::new(AvpKey::ietf(AVP_LOAD_TYPE), AvpCardinality::Forbidden),
     CommandAvpRule::new(AvpKey::ietf(AVP_LOAD_VALUE), AvpCardinality::Forbidden),
     CommandAvpRule::new(AvpKey::ietf(AVP_SOURCE_ID), AvpCardinality::Forbidden),
+    CommandAvpRule::new(
+        AvpKey::ietf(base::AVP_PROXY_INFO),
+        AvpCardinality::ZeroOrMore,
+    ),
+    CommandAvpRule::new(
+        AvpKey::ietf(base::AVP_DESTINATION_HOST),
+        AvpCardinality::Forbidden,
+    ),
+    CommandAvpRule::new(
+        AvpKey::ietf(base::AVP_DESTINATION_REALM),
+        AvpCardinality::Forbidden,
+    ),
+    CommandAvpRule::new(
+        AvpKey::ietf(base::AVP_ROUTE_RECORD),
+        AvpCardinality::Forbidden,
+    ),
+    CommandAvpRule::new(
+        AvpKey::ietf(base::AVP_REDIRECT_HOST),
+        AvpCardinality::ZeroOrMore,
+    ),
+    CommandAvpRule::new(
+        AvpKey::ietf(base::AVP_REDIRECT_HOST_USAGE),
+        AvpCardinality::ZeroOrOne,
+    ),
+    CommandAvpRule::new(
+        AvpKey::ietf(base::AVP_REDIRECT_MAX_CACHE_TIME),
+        AvpCardinality::ZeroOrOne,
+    ),
+    CommandAvpRule::new(
+        AvpKey::ietf(base::AVP_FAILED_AVP),
+        AvpCardinality::ZeroOrMore,
+    ),
 ];
 
 static TERMINAL_INFORMATION_AVP_RULES: [CommandAvpRule; 2] = [
@@ -1152,6 +1252,191 @@ impl SwmDiameterResult {
     }
 }
 
+/// RFC 6733 Redirect-Host-Usage cache scope.
+///
+/// The SDK rejects unassigned values because applying an unknown cache scope
+/// would silently broaden or narrow routing policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SwmRedirectHostUsage {
+    /// Do not cache the redirect target.
+    DontCache,
+    /// Cache for this Session-Id only.
+    AllSession,
+    /// Cache for all requests in the realm.
+    AllRealm,
+    /// Cache for this realm and application.
+    RealmAndApplication,
+    /// Cache for this application.
+    AllApplication,
+    /// Cache for this Destination-Host.
+    AllHost,
+    /// Cache for this user.
+    AllUser,
+}
+
+impl SwmRedirectHostUsage {
+    /// Parse the assigned RFC 6733 value.
+    #[must_use]
+    pub const fn from_value(value: u32) -> Option<Self> {
+        match value {
+            0 => Some(Self::DontCache),
+            1 => Some(Self::AllSession),
+            2 => Some(Self::AllRealm),
+            3 => Some(Self::RealmAndApplication),
+            4 => Some(Self::AllApplication),
+            5 => Some(Self::AllHost),
+            6 => Some(Self::AllUser),
+            _ => None,
+        }
+    }
+
+    /// Return the assigned RFC 6733 value.
+    #[must_use]
+    pub const fn value(self) -> u32 {
+        match self {
+            Self::DontCache => 0,
+            Self::AllSession => 1,
+            Self::AllRealm => 2,
+            Self::RealmAndApplication => 3,
+            Self::AllApplication => 4,
+            Self::AllHost => 5,
+            Self::AllUser => 6,
+        }
+    }
+
+    /// Return whether this directive creates a cached route.
+    #[must_use]
+    pub const fn is_cacheable(self) -> bool {
+        !matches!(self, Self::DontCache)
+    }
+
+    /// Return RFC 6733 section 6.13's cache-route precedence rank.
+    ///
+    /// This order intentionally differs from the numeric wire values. A
+    /// smaller rank has higher precedence; `DONT_CACHE` creates no route.
+    #[must_use]
+    pub const fn routing_precedence_rank(self) -> Option<u8> {
+        match self {
+            Self::DontCache => None,
+            Self::AllSession => Some(1),
+            Self::AllUser => Some(2),
+            Self::RealmAndApplication => Some(3),
+            Self::AllRealm => Some(4),
+            Self::AllApplication => Some(5),
+            Self::AllHost => Some(6),
+        }
+    }
+}
+
+/// Redaction-safe validation failure for an RFC 6733 redirect plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SwmDiameterRedirectError {
+    /// Redirect-Indication omitted every Redirect-Host.
+    MissingHost,
+    /// Redirect-Host count exceeds the typed boundary.
+    TooManyHosts,
+    /// Combined redirect AVP count exceeds the shared routing boundary.
+    TooManyAvps,
+    /// A Redirect-Host is not a valid DiameterURI.
+    InvalidHost,
+    /// A cacheable usage omitted Redirect-Max-Cache-Time.
+    MissingMaxCacheTime,
+}
+
+impl SwmDiameterRedirectError {
+    /// Stable value-free diagnostic code.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MissingHost => "swm_diameter_redirect_missing_host",
+            Self::TooManyHosts => "swm_diameter_redirect_too_many_hosts",
+            Self::TooManyAvps => "swm_diameter_redirect_too_many_avps",
+            Self::InvalidHost => "swm_diameter_redirect_invalid_host",
+            Self::MissingMaxCacheTime => "swm_diameter_redirect_missing_max_cache_time",
+        }
+    }
+}
+
+impl fmt::Display for SwmDiameterRedirectError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl Error for SwmDiameterRedirectError {}
+
+/// Wire-ordered RFC 6733 redirect targets plus their exact cache directive.
+///
+/// Redirect host values are redacted in diagnostics. `usage` and
+/// `max_cache_time` preserve wire presence: an absent usage is distinct from
+/// an explicitly encoded `DONT_CACHE`, and the SDK never invents a cache
+/// lifetime. Wire order is preserved for replay and diagnostics; RFC 6733 does
+/// not define it as target preference, and target selection remains consumer
+/// policy.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SwmDiameterRedirect {
+    hosts: Vec<Redacted<String>>,
+    usage: Option<SwmRedirectHostUsage>,
+    max_cache_time: Option<u32>,
+}
+
+impl SwmDiameterRedirect {
+    /// Construct a validated redirect plan.
+    pub fn new(
+        hosts: Vec<Redacted<String>>,
+        usage: Option<SwmRedirectHostUsage>,
+        max_cache_time: Option<u32>,
+    ) -> Result<Self, SwmDiameterRedirectError> {
+        validate_redirect_values(&hosts, usage, max_cache_time)?;
+        Ok(Self {
+            hosts,
+            usage,
+            max_cache_time,
+        })
+    }
+
+    /// Borrow ordered redirect targets.
+    #[must_use]
+    pub fn hosts(&self) -> &[Redacted<String>] {
+        &self.hosts
+    }
+
+    /// Return the exact optional cache scope.
+    #[must_use]
+    pub const fn usage(&self) -> Option<SwmRedirectHostUsage> {
+        self.usage
+    }
+
+    /// Return the RFC 6733 effective cache scope.
+    ///
+    /// Absence defaults to `DONT_CACHE`, while [`Self::usage`] retains the
+    /// exact wire-presence distinction.
+    #[must_use]
+    pub const fn effective_usage(&self) -> SwmRedirectHostUsage {
+        match self.usage {
+            Some(usage) => usage,
+            None => SwmRedirectHostUsage::DontCache,
+        }
+    }
+
+    /// Return the exact optional cache lifetime in seconds.
+    #[must_use]
+    pub const fn max_cache_time(&self) -> Option<u32> {
+        self.max_cache_time
+    }
+}
+
+impl fmt::Debug for SwmDiameterRedirect {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SwmDiameterRedirect")
+            .field("host_count", &self.hosts.len())
+            .field("usage", &self.usage)
+            .field("max_cache_time_present", &self.max_cache_time.is_some())
+            .finish()
+    }
+}
+
 /// Maximum service lifetime carried by a successful SWm DEA.
 ///
 /// `Session-Timeout` is an RFC 6733 `Unsigned32` measured in seconds. A zero
@@ -1331,10 +1616,14 @@ impl SwmDiameterTransaction {
 }
 
 /// A parsed SWm DER together with its immutable Diameter transaction IDs.
-#[derive(PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SwmDiameterEapRequestEnvelope {
     transaction: SwmDiameterTransaction,
+    proxiable: bool,
+    potentially_retransmitted: bool,
+    expected_answer_peer: Option<SwmExpectedAnswerPeer>,
     request: SwmDiameterEapRequest,
+    proxy_infos: Vec<SwmAdditionalAvp>,
 }
 
 impl SwmDiameterEapRequestEnvelope {
@@ -1349,8 +1638,42 @@ impl SwmDiameterEapRequestEnvelope {
     ) -> Self {
         Self {
             transaction,
+            proxiable: true,
+            potentially_retransmitted: false,
+            expected_answer_peer: None,
             request,
+            proxy_infos: Vec::new(),
         }
+    }
+
+    /// Bind an outbound DER to its authenticated answer connection.
+    #[must_use]
+    pub fn for_outbound_on(
+        request: SwmDiameterEapRequest,
+        transaction: SwmDiameterTransaction,
+        expected_answer_peer: SwmExpectedAnswerPeer,
+    ) -> Self {
+        Self {
+            transaction,
+            proxiable: true,
+            potentially_retransmitted: false,
+            expected_answer_peer: Some(expected_answer_peer),
+            request,
+            proxy_infos: Vec::new(),
+        }
+    }
+
+    /// Attach trusted answer-peer evidence before transport dispatch.
+    #[must_use]
+    pub fn with_expected_answer_peer(mut self, peer: SwmExpectedAnswerPeer) -> Self {
+        self.expected_answer_peer = Some(peer);
+        self
+    }
+
+    /// Borrow the authenticated answer-path binding.
+    #[must_use]
+    pub const fn expected_answer_peer(&self) -> Option<&SwmExpectedAnswerPeer> {
+        self.expected_answer_peer.as_ref()
     }
 
     /// Borrow the typed DER facts.
@@ -1361,6 +1684,48 @@ impl SwmDiameterEapRequestEnvelope {
     /// Return the transaction IDs from the validated Diameter header.
     pub const fn transaction(&self) -> SwmDiameterTransaction {
         self.transaction
+    }
+
+    /// Return whether this request carries RFC 6733's T bit.
+    #[must_use]
+    pub const fn is_potentially_retransmitted(&self) -> bool {
+        self.potentially_retransmitted
+    }
+
+    /// Return the ordered private Proxy-Info count.
+    #[must_use]
+    pub fn proxy_info_count(&self) -> usize {
+        self.proxy_infos.len()
+    }
+
+    /// Mark a pending request for failover retransmission.
+    ///
+    /// The End-to-End identifier and payload stay fixed while the transport
+    /// supplies a fresh Hop-by-Hop identifier and authenticated connection.
+    pub fn mark_for_failover_retransmission(
+        &mut self,
+        replacement_hop_by_hop_identifier: u32,
+        new_peer: SwmExpectedAnswerPeer,
+    ) {
+        self.transaction = SwmDiameterTransaction::new(
+            replacement_hop_by_hop_identifier,
+            self.transaction.end_to_end_identifier(),
+        );
+        self.potentially_retransmitted = true;
+        self.expected_answer_peer = Some(new_peer);
+    }
+
+    /// Compare immutable duplicate-cache payload facts.
+    ///
+    /// Hop-by-Hop, T, and connection generation are intentionally excluded;
+    /// End-to-End, P, typed request facts, Route-Record, extensions, and exact
+    /// ordered Proxy-Info bytes are included.
+    #[must_use]
+    pub fn same_replay_payload(&self, other: &Self) -> bool {
+        self.transaction.end_to_end_identifier() == other.transaction.end_to_end_identifier()
+            && self.proxiable == other.proxiable
+            && self.request == other.request
+            && lifecycle::additional_avp_sequences_match(&self.proxy_infos, &other.proxy_infos)
     }
 
     /// Consume a DEA envelope and bind it to this request.
@@ -1378,6 +1743,22 @@ impl SwmDiameterEapRequestEnvelope {
             answer,
         })
     }
+
+    /// Correlate a response received on an authenticated Diameter connection.
+    ///
+    /// This is the only API that exposes parsed redirect targets. It checks
+    /// connection generation, both transaction identifiers, P, exact ordered
+    /// Proxy-Info, and Session-Id when the generic grammar carried it.
+    pub fn correlate_response(
+        self,
+        response: SwmDiameterEapResponseEnvelope,
+    ) -> Result<SwmCorrelatedDiameterEapResponse, SwmDiameterEapCorrelationError> {
+        ensure_correlated_response(&self, &response)?;
+        Ok(SwmCorrelatedDiameterEapResponse {
+            request: self,
+            response,
+        })
+    }
 }
 
 impl fmt::Debug for SwmDiameterEapRequestEnvelope {
@@ -1385,7 +1766,11 @@ impl fmt::Debug for SwmDiameterEapRequestEnvelope {
         formatter
             .debug_struct("SwmDiameterEapRequestEnvelope")
             .field("transaction", &self.transaction)
+            .field("proxiable", &self.proxiable)
+            .field("potentially_retransmitted", &self.potentially_retransmitted)
+            .field("expected_answer_peer", &self.expected_answer_peer)
             .field("request", &self.request)
+            .field("proxy_info_count", &self.proxy_infos.len())
             .finish()
     }
 }
@@ -1394,7 +1779,9 @@ impl fmt::Debug for SwmDiameterEapRequestEnvelope {
 #[derive(PartialEq, Eq)]
 pub struct SwmDiameterEapAnswerEnvelope {
     transaction: SwmDiameterTransaction,
+    proxiable: bool,
     answer: SwmDiameterEapAnswer,
+    proxy_infos: Vec<SwmAdditionalAvp>,
     provenance: SwmDiameterEapAnswerEnvelopeProvenance,
 }
 
@@ -1447,7 +1834,9 @@ impl SwmDiameterEapAnswerEnvelope {
     pub fn for_outbound(answer: SwmDiameterEapAnswer, transaction: SwmDiameterTransaction) -> Self {
         Self {
             transaction,
+            proxiable: true,
             answer,
+            proxy_infos: Vec::new(),
             provenance: SwmDiameterEapAnswerEnvelopeProvenance::Outbound,
         }
     }
@@ -1461,6 +1850,12 @@ impl SwmDiameterEapAnswerEnvelope {
     pub const fn transaction(&self) -> SwmDiameterTransaction {
         self.transaction
     }
+
+    /// Return the private ordered Proxy-Info count.
+    #[must_use]
+    pub fn proxy_info_count(&self) -> usize {
+        self.proxy_infos.len()
+    }
 }
 
 impl fmt::Debug for SwmDiameterEapAnswerEnvelope {
@@ -1468,7 +1863,151 @@ impl fmt::Debug for SwmDiameterEapAnswerEnvelope {
         formatter
             .debug_struct("SwmDiameterEapAnswerEnvelope")
             .field("transaction", &self.transaction)
+            .field("proxiable", &self.proxiable)
             .field("answer", &self.answer)
+            .field("proxy_info_count", &self.proxy_infos.len())
+            .finish()
+    }
+}
+
+/// A parsed Diameter-EAP response bound to its authenticated connection.
+#[derive(Clone)]
+pub struct SwmDiameterEapResponseEnvelope {
+    transaction: SwmDiameterTransaction,
+    proxiable: bool,
+    received_on: SwmDiameterConnectionToken,
+    response: SwmDiameterEapResponse,
+    proxy_infos: Vec<SwmAdditionalAvp>,
+}
+
+impl SwmDiameterEapResponseEnvelope {
+    /// Borrow the typed response without exposing uncorrelated redirect hosts.
+    #[must_use]
+    pub const fn response(&self) -> &SwmDiameterEapResponse {
+        &self.response
+    }
+
+    /// Return the Diameter transaction identifiers.
+    #[must_use]
+    pub const fn transaction(&self) -> SwmDiameterTransaction {
+        self.transaction
+    }
+
+    /// Return the authenticated connection generation.
+    #[must_use]
+    pub const fn received_on(&self) -> SwmDiameterConnectionToken {
+        self.received_on
+    }
+
+    /// Return the private ordered Proxy-Info count.
+    #[must_use]
+    pub fn proxy_info_count(&self) -> usize {
+        self.proxy_infos.len()
+    }
+}
+
+impl fmt::Debug for SwmDiameterEapResponseEnvelope {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SwmDiameterEapResponseEnvelope")
+            .field("transaction", &self.transaction)
+            .field("proxiable", &self.proxiable)
+            .field("received_on", &self.received_on)
+            .field("response", &self.response)
+            .field("proxy_info_count", &self.proxy_infos.len())
+            .finish()
+    }
+}
+
+/// Strict response-correlation failure for Diameter-EAP routing decisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SwmDiameterEapCorrelationError {
+    /// The request lacks authenticated connection evidence.
+    PeerBindingMissing,
+    /// The answer arrived on a different connection generation.
+    PeerConnectionMismatch,
+    /// Hop-by-Hop or End-to-End identifiers differ.
+    TransactionMismatch,
+    /// The answer did not preserve the P bit.
+    ProxiableMismatch,
+    /// The ordered Proxy-Info chain differs.
+    ProxyInfoMismatch,
+    /// A present Session-Id differs from the request.
+    SessionMismatch,
+    /// An ordinary answer violates its trusted logical-origin policy.
+    PeerIdentityMismatch,
+    /// Ordinary application correlation fields are inconsistent.
+    ApplicationMismatch,
+}
+
+impl SwmDiameterEapCorrelationError {
+    /// Stable value-free diagnostic code.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PeerBindingMissing => "swm_dea_peer_binding_missing",
+            Self::PeerConnectionMismatch => "swm_dea_peer_connection_mismatch",
+            Self::TransactionMismatch => "swm_dea_transaction_mismatch",
+            Self::ProxiableMismatch => "swm_dea_proxiable_mismatch",
+            Self::ProxyInfoMismatch => "swm_dea_proxy_info_mismatch",
+            Self::SessionMismatch => "swm_dea_session_mismatch",
+            Self::PeerIdentityMismatch => "swm_dea_peer_identity_mismatch",
+            Self::ApplicationMismatch => "swm_dea_application_mismatch",
+        }
+    }
+}
+
+impl fmt::Display for SwmDiameterEapCorrelationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl Error for SwmDiameterEapCorrelationError {}
+
+/// Authenticated, transaction-bound Diameter-EAP response.
+pub struct SwmCorrelatedDiameterEapResponse {
+    request: SwmDiameterEapRequestEnvelope,
+    response: SwmDiameterEapResponseEnvelope,
+}
+
+impl SwmCorrelatedDiameterEapResponse {
+    /// Borrow the correlated request.
+    #[must_use]
+    pub const fn request(&self) -> &SwmDiameterEapRequest {
+        self.request.request()
+    }
+
+    /// Borrow the correlated response.
+    #[must_use]
+    pub const fn response(&self) -> &SwmDiameterEapResponse {
+        self.response.response()
+    }
+
+    /// Borrow actionable redirect targets after all correlation checks.
+    #[must_use]
+    pub fn redirect(&self) -> Option<&SwmDiameterRedirect> {
+        match self.response.response() {
+            SwmDiameterEapResponse::GenericError(answer) => answer.redirect.as_ref(),
+            SwmDiameterEapResponse::Application(_) => None,
+        }
+    }
+
+    /// Return the correlated Diameter identifiers.
+    #[must_use]
+    pub const fn transaction(&self) -> SwmDiameterTransaction {
+        self.request.transaction()
+    }
+}
+
+impl fmt::Debug for SwmCorrelatedDiameterEapResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SwmCorrelatedDiameterEapResponse")
+            .field("transaction", &self.transaction())
+            .field("request", &self.request())
+            .field("response", &self.response())
+            .field("redirect_present", &self.redirect().is_some())
             .finish()
     }
 }
@@ -2763,6 +3302,13 @@ impl fmt::Debug for SwmDiameterEapRequestExtensions {
 /// Typed rebuilding canonicalizes retained extensions to the trailing command
 /// wildcard; use [`Message`] directly when an exact relay/proxy byte stream is
 /// required.
+///
+/// A parsed ordinary answer can retain repeated RFC 4072 `Failed-AVP` values
+/// for value-free metadata, but the typed answer builder deliberately refuses
+/// to re-originate those mandatory evidence AVPs. Cache and replay the original
+/// [`OwnedMessage`] for exact retransmission; use
+/// [`crate::error_answer::build_diameter_error_answer`] for a newly originated
+/// request-bound failure.
 #[derive(Default, Clone, PartialEq, Eq)]
 pub struct SwmDiameterEapAnswerExtensions {
     avps: Vec<SwmAdditionalAvp>,
@@ -2799,6 +3345,293 @@ impl fmt::Debug for SwmDiameterEapAnswerExtensions {
             .debug_struct("SwmDiameterEapAnswerExtensions")
             .field("avp_count", &self.avps.len())
             .finish()
+    }
+}
+
+/// RFC 6733 section 7.2 generic error answer carried by the Diameter-EAP
+/// command code.
+///
+/// This grammar deliberately omits application-only fields such as
+/// Auth-Application-Id and Auth-Request-Type. The base Result-Code is retained
+/// separately from [`SwmDiameterResult`] so an Experimental-Result with the
+/// same numeric value can never claim the E bit.
+///
+/// Parsed redirect values are deliberately sealed until strict request
+/// correlation succeeds:
+///
+/// ```compile_fail
+/// use opc_proto_diameter::apps::swm::SwmDiameterEapResponse;
+///
+/// fn expose_uncorrelated(response: &SwmDiameterEapResponse) {
+///     if let SwmDiameterEapResponse::GenericError(answer) = response {
+///         let _targets = &answer.redirect;
+///     }
+/// }
+/// ```
+#[derive(Clone)]
+pub struct SwmDiameterEapGenericErrorAnswer {
+    /// Optional Session-Id copied when it was present on the request.
+    pub session_id: Option<Redacted<String>>,
+    /// Mandatory base Result-Code used with RFC 6733's E-bit grammar.
+    ///
+    /// This includes 3xxx protocol errors and the explicit 5xxx/unrecognized
+    /// fallback permitted by RFC 6733 section 7.1.5.
+    pub result_code: u32,
+    /// Origin-Host of the server or Diameter agent producing the error.
+    pub origin_host: Redacted<String>,
+    /// Origin-Realm of the server or Diameter agent producing the error.
+    pub origin_realm: Redacted<String>,
+    /// Typed redirect context for exact `DIAMETER_REDIRECT_INDICATION`.
+    redirect: Option<SwmDiameterRedirect>,
+    /// Optional redacted Error-Message.
+    pub error_message: Option<Redacted<String>>,
+    /// Optional redacted Error-Reporting-Host.
+    pub error_reporting_host: Option<Redacted<String>>,
+    /// Optional Origin-State-Id.
+    pub origin_state_id: Option<u32>,
+    /// Optional Experimental-Result retained in addition to mandatory base
+    /// Result-Code.
+    pub experimental_result: Option<SwmDiameterResult>,
+    /// Ordered validated Failed-AVP values. Raw values remain private.
+    failed_avps: Vec<SwmAdditionalAvp>,
+    /// Ordered, sealed generic-wildcard AVPs.
+    additional_avps: Vec<SwmAdditionalAvp>,
+    provenance: SwmDiameterEapGenericErrorAnswerProvenance,
+}
+
+#[derive(Clone, Copy)]
+enum SwmDiameterEapGenericErrorAnswerProvenance {
+    Outbound,
+    Parsed,
+}
+
+impl fmt::Debug for SwmDiameterEapGenericErrorAnswer {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SwmDiameterEapGenericErrorAnswer")
+            .field("session_id", &self.session_id)
+            .field("result_code", &self.result_code)
+            .field("origin_host", &self.origin_host)
+            .field("origin_realm", &self.origin_realm)
+            .field("redirect", &self.redirect)
+            .field("error_message_present", &self.error_message.is_some())
+            .field(
+                "error_reporting_host_present",
+                &self.error_reporting_host.is_some(),
+            )
+            .field("origin_state_id_present", &self.origin_state_id.is_some())
+            .field(
+                "experimental_result_present",
+                &self.experimental_result.is_some(),
+            )
+            .field("failed_avp_count", &self.failed_avps.len())
+            .field("additional_avp_count", &self.additional_avps.len())
+            .finish()
+    }
+}
+
+impl SwmDiameterEapGenericErrorAnswer {
+    /// Construct an RFC 6733 redirect-indication answer.
+    ///
+    /// The required Session-Id is copied from the SWm DER. Other originated
+    /// generic errors must use the request-bound
+    /// [`crate::error_answer::build_diameter_error_answer`] boundary so mandatory
+    /// Failed-AVP evidence cannot be omitted. Parsed generic errors remain
+    /// receive-capable for every supported E-bit result family.
+    pub fn new_redirect(
+        session_id: impl Into<Redacted<String>>,
+        origin_host: impl Into<Redacted<String>>,
+        origin_realm: impl Into<Redacted<String>>,
+        redirect: SwmDiameterRedirect,
+    ) -> Result<Self, EncodeError> {
+        let answer = Self {
+            session_id: Some(session_id.into()),
+            result_code: DIAMETER_REDIRECT_INDICATION,
+            origin_host: origin_host.into(),
+            origin_realm: origin_realm.into(),
+            redirect: Some(redirect),
+            error_message: None,
+            error_reporting_host: None,
+            origin_state_id: None,
+            experimental_result: None,
+            failed_avps: Vec::new(),
+            additional_avps: Vec::new(),
+            provenance: SwmDiameterEapGenericErrorAnswerProvenance::Outbound,
+        };
+        answer.validate_for_encode()?;
+        Ok(answer)
+    }
+
+    /// Return whether this answer contains redirect targets.
+    ///
+    /// Target values remain sealed until a
+    /// [`SwmCorrelatedDiameterEapResponse`] is produced.
+    #[must_use]
+    pub const fn has_redirect(&self) -> bool {
+        self.redirect.is_some()
+    }
+
+    /// Return the number of validated Failed-AVP values.
+    #[must_use]
+    pub fn failed_avp_count(&self) -> usize {
+        self.failed_avps.len()
+    }
+
+    /// Return the number of sealed generic-wildcard AVPs.
+    #[must_use]
+    pub fn additional_avp_count(&self) -> usize {
+        self.additional_avps.len()
+    }
+
+    fn validate_for_encode(&self) -> Result<(), EncodeError> {
+        if matches!(
+            self.provenance,
+            SwmDiameterEapGenericErrorAnswerProvenance::Parsed
+        ) {
+            return Err(encode_structural_error(
+                "parsed generic SWm DEA cannot be re-originated",
+                "7.2",
+            ));
+        }
+        if self.result_code != DIAMETER_REDIRECT_INDICATION {
+            return Err(encode_structural_error(
+                "outbound generic SWm DEA supports only DIAMETER_REDIRECT_INDICATION",
+                "6.12",
+            ));
+        }
+        if self
+            .session_id
+            .as_ref()
+            .is_some_and(|session_id| session_id.as_ref().is_empty())
+        {
+            return Err(encode_structural_error(
+                "generic SWm DEA Session-Id must not be empty when present",
+                "7.2",
+            ));
+        }
+        if self.origin_host.as_ref().is_empty()
+            || !self.origin_host.as_ref().is_ascii()
+            || self.origin_realm.as_ref().is_empty()
+            || !self.origin_realm.as_ref().is_ascii()
+        {
+            return Err(encode_structural_error(
+                "generic SWm DEA Origin identities must be nonempty ASCII",
+                "7.2",
+            ));
+        }
+        if self
+            .error_reporting_host
+            .as_ref()
+            .is_some_and(|host| host.as_ref().is_empty() || !host.as_ref().is_ascii())
+        {
+            return Err(encode_structural_error(
+                "generic SWm DEA Error-Reporting-Host must be a nonempty ASCII DiameterIdentity",
+                "7.4",
+            ));
+        }
+        if !result_code_allows_generic_error_bit(self.result_code) {
+            return Err(encode_structural_error(
+                "generic SWm DEA Result-Code cannot use the E bit",
+                "7.1",
+            ));
+        }
+        if self.result_code == DIAMETER_REDIRECT_INDICATION {
+            let redirect = self.redirect.as_ref().ok_or_else(|| {
+                encode_structural_error(
+                    "DIAMETER_REDIRECT_INDICATION requires Redirect-Host",
+                    "6.12",
+                )
+            })?;
+            validate_redirect_values(
+                redirect.hosts(),
+                redirect.usage(),
+                redirect.max_cache_time(),
+            )
+            .map_err(|_| {
+                encode_structural_error("generic SWm DEA redirect context is invalid", "6.12")
+            })?;
+        } else if self.redirect.is_some() {
+            return Err(encode_structural_error(
+                "Redirect AVPs require DIAMETER_REDIRECT_INDICATION",
+                "6.12",
+            ));
+        }
+        match self.experimental_result {
+            Some(SwmDiameterResult::Base(_)) => {
+                return Err(encode_structural_error(
+                    "generic SWm DEA experimental result must use Experimental-Result",
+                    "7.6",
+                ));
+            }
+            Some(SwmDiameterResult::Experimental { vendor_id, .. }) if vendor_id.get() == 0 => {
+                return Err(encode_structural_error(
+                    "generic SWm DEA Experimental-Result Vendor-Id must not be zero",
+                    "7.6",
+                ));
+            }
+            None | Some(SwmDiameterResult::Experimental { .. }) => {}
+        }
+        validate_diameter_eap_routing_for_encode(
+            self.failed_avps.len(),
+            &[],
+            self.additional_avps.len(),
+            "7.2",
+        )?;
+        Ok(())
+    }
+}
+
+const fn result_code_allows_generic_error_bit(result_code: u32) -> bool {
+    result_code >= 1000 && !matches!(result_code / 1000, 1 | 2 | 4)
+}
+
+const fn result_code_requires_failed_avp(result_code: u32) -> bool {
+    matches!(
+        result_code,
+        base::RESULT_CODE_DIAMETER_AVP_UNSUPPORTED
+            | base::RESULT_CODE_DIAMETER_INVALID_AVP_VALUE
+            | base::RESULT_CODE_DIAMETER_CONTRADICTING_AVPS
+            | base::RESULT_CODE_DIAMETER_AVP_NOT_ALLOWED
+            | base::RESULT_CODE_DIAMETER_AVP_OCCURS_TOO_MANY_TIMES
+            | base::RESULT_CODE_DIAMETER_INVALID_AVP_LENGTH
+            | base::RESULT_CODE_DIAMETER_INVALID_AVP_BIT_COMBO
+    )
+}
+
+/// Typed Diameter-EAP response grammar selected by the Diameter E bit.
+#[derive(Clone)]
+pub enum SwmDiameterEapResponse {
+    /// Ordinary TS 29.273 DEA application grammar (E clear).
+    Application(Box<SwmDiameterEapAnswer>),
+    /// RFC 6733 section 7.2 generic error grammar (E set).
+    GenericError(Box<SwmDiameterEapGenericErrorAnswer>),
+}
+
+impl SwmDiameterEapResponse {
+    /// Return whether this response uses RFC 6733's generic error grammar.
+    #[must_use]
+    pub const fn uses_generic_error_grammar(&self) -> bool {
+        matches!(self, Self::GenericError(_))
+    }
+
+    fn session_id(&self) -> Option<&str> {
+        match self {
+            Self::Application(answer) => Some(answer.session_id.as_ref()),
+            Self::GenericError(answer) => answer.session_id.as_deref().map(String::as_str),
+        }
+    }
+}
+
+impl fmt::Debug for SwmDiameterEapResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Application(answer) => {
+                formatter.debug_tuple("Application").field(answer).finish()
+            }
+            Self::GenericError(answer) => {
+                formatter.debug_tuple("GenericError").field(answer).finish()
+            }
+        }
     }
 }
 
@@ -2855,6 +3688,8 @@ pub struct SwmDiameterEapRequest {
     pub high_priority_access_info: Option<SwmHighPriorityAccessInfo>,
     /// Ordered opaque State AVP values (only their count appears in diagnostics).
     pub state_avps: Vec<Vec<u8>>,
+    /// Ordered Route-Record identities (values are redacted in diagnostics).
+    pub route_records: Vec<Redacted<String>>,
     /// Parser-retained optional AVPs from the trailing DER extension wildcard.
     ///
     /// Use the empty default for locally originated requests. Nonempty values
@@ -2902,6 +3737,7 @@ impl std::fmt::Debug for SwmDiameterEapRequest {
             .field("terminal_information", &self.terminal_information)
             .field("high_priority_access_info", &self.high_priority_access_info)
             .field("state_avps", &self.state_avps.len())
+            .field("route_record_count", &self.route_records.len())
             .field("extensions", &self.extensions)
             .finish()
     }
@@ -3033,7 +3869,7 @@ impl std::fmt::Debug for SwmDiameterEapAnswer {
             )
             .field("eap_payload", &self.eap_payload)
             .field("eap_reissued_payload", &self.eap_reissued_payload)
-            .field("error_message", &self.error_message)
+            .field("error_message_present", &self.error_message.is_some())
             .field("state_avps", &self.state_avps.len())
             .field("eap_master_session_key", &self.eap_master_session_key)
             .field("extensions", &self.extensions)
@@ -3241,6 +4077,16 @@ impl SwmDiameterEapAnswer {
             return Err(encode_structural_error(
                 "SWm DEA Auth-Application-Id must be the SWm application id",
                 "DEA",
+            ));
+        }
+        if matches!(
+            self.result,
+            SwmDiameterResult::Base(code)
+                if builder_helpers::result_code_requires_error_bit(code)
+        ) {
+            return Err(encode_structural_error(
+                "base 3xxx SWm DEA requires the generic E-bit response grammar",
+                "7.2",
             ));
         }
         if !self.auth_request_type.is_authorize_authenticate() {
@@ -3456,7 +4302,7 @@ fn retain_diameter_eap_extension(
     offset: usize,
     section: &'static str,
     seen_keys: &mut HashSet<AvpKey>,
-    retained_bytes: &mut usize,
+    retention: &mut DiameterEapRetention,
     retained: &mut Vec<SwmAdditionalAvp>,
 ) -> Result<(), DecodeError> {
     builder_helpers::handle_unknown_avp(ctx, avp, offset, section)?;
@@ -3470,34 +4316,188 @@ fn retain_diameter_eap_extension(
     if ctx.unknown_ie_policy != UnknownIePolicy::Preserve {
         return Ok(());
     }
-    if retained.len() >= MAX_SWM_DIAMETER_EAP_EXTENSIONS {
-        return Err(DecodeError::new(DecodeErrorCode::IeCountExceeded, offset)
-            .with_spec_ref(SpecRef::new("3gpp", "TS29273", section)));
-    }
-    let retained_avp_bytes = avp
-        .header
-        .header_len()
-        .checked_add(avp.value.len())
-        .and_then(|len| len.checked_add(avp.padding.len()))
-        .ok_or_else(|| {
-            DecodeError::new(DecodeErrorCode::LengthOverflow, offset)
-                .with_spec_ref(SpecRef::new("ietf", "RFC6733", "4"))
-        })?;
-    let next_retained_bytes = retained_bytes
-        .checked_add(retained_avp_bytes)
-        .ok_or_else(|| {
-            DecodeError::new(DecodeErrorCode::LengthOverflow, offset)
-                .with_spec_ref(SpecRef::new("ietf", "RFC6733", "4"))
-        })?;
-    if next_retained_bytes > ctx.max_message_len {
-        return Err(
-            DecodeError::new(DecodeErrorCode::MessageLengthExceeded, offset)
-                .with_spec_ref(SpecRef::new("ietf", "RFC6733", "3")),
-        );
-    }
+    retention.account(avp, offset, section, ctx)?;
 
-    *retained_bytes = next_retained_bytes;
     retained.push(SwmAdditionalAvp::from_raw_exact(avp));
+    Ok(())
+}
+
+#[derive(Default)]
+struct DiameterEapRetention {
+    count: usize,
+    bytes: usize,
+}
+
+impl DiameterEapRetention {
+    fn account(
+        &mut self,
+        avp: &RawAvp<'_>,
+        offset: usize,
+        section: &'static str,
+        ctx: DecodeContext,
+    ) -> Result<(), DecodeError> {
+        if self.count >= MAX_SWM_DIAMETER_EAP_ROUTING_AVPS {
+            return Err(DecodeError::new(DecodeErrorCode::IeCountExceeded, offset)
+                .with_spec_ref(SpecRef::new("3gpp", "TS29273", section)));
+        }
+        let retained_avp_bytes = avp
+            .header
+            .header_len()
+            .checked_add(avp.value.len())
+            .and_then(|len| len.checked_add(avp.padding.len()))
+            .ok_or_else(|| {
+                DecodeError::new(DecodeErrorCode::LengthOverflow, offset)
+                    .with_spec_ref(SpecRef::new("ietf", "RFC6733", "4"))
+            })?;
+        let next_retained_bytes = self.bytes.checked_add(retained_avp_bytes).ok_or_else(|| {
+            DecodeError::new(DecodeErrorCode::LengthOverflow, offset)
+                .with_spec_ref(SpecRef::new("ietf", "RFC6733", "4"))
+        })?;
+        if next_retained_bytes > ctx.max_message_len {
+            return Err(
+                DecodeError::new(DecodeErrorCode::MessageLengthExceeded, offset)
+                    .with_spec_ref(SpecRef::new("ietf", "RFC6733", "3")),
+            );
+        }
+
+        self.bytes = next_retained_bytes;
+        self.count = self.count.checked_add(1).ok_or_else(|| {
+            DecodeError::new(DecodeErrorCode::LengthOverflow, offset)
+                .with_spec_ref(SpecRef::new("ietf", "RFC6733", "4"))
+        })?;
+        Ok(())
+    }
+}
+
+fn retain_diameter_eap_proxy_info(
+    avp: &RawAvp<'_>,
+    ctx: DecodeContext,
+    offset: usize,
+    value_offset: usize,
+    section: &'static str,
+    retention: &mut DiameterEapRetention,
+    proxy_infos: &mut Vec<SwmAdditionalAvp>,
+) -> Result<(), DecodeError> {
+    lifecycle::validate_proxy_info(avp, ctx, offset, value_offset)?;
+    retention.account(avp, offset, section, ctx)?;
+    proxy_infos.push(SwmAdditionalAvp::from_raw_exact(avp));
+    Ok(())
+}
+
+fn retain_diameter_eap_route_record(
+    avp: &RawAvp<'_>,
+    ctx: DecodeContext,
+    offset: usize,
+    value_offset: usize,
+    section: &'static str,
+    retention: &mut DiameterEapRetention,
+    route_records: &mut Vec<Redacted<String>>,
+) -> Result<(), DecodeError> {
+    lifecycle::validate_base_definition(avp, offset)?;
+    builder_helpers::validate_known_avp_value(
+        avp.value,
+        AvpDataType::DiameterIdentity,
+        ctx,
+        value_offset,
+        "6.7.1",
+    )?;
+    let value = builder_helpers::parse_string_value(avp.value, value_offset, "6.7.1")?;
+    if value.is_empty() {
+        return Err(decode_structural_error_at(
+            "SWm DER Route-Record must be a nonempty DiameterIdentity",
+            offset,
+            "6.7.1",
+        ));
+    }
+    retention.account(avp, offset, section, ctx)?;
+    route_records.push(Redacted::from(value));
+    Ok(())
+}
+
+fn validate_diameter_eap_request_header(message: &Message<'_>) -> Result<(), DecodeError> {
+    let flags = message.header.flags;
+    if !flags.is_proxiable() || flags.is_error() {
+        return Err(decode_structural_error_at(
+            "SWm DER must set P and clear E",
+            4,
+            "DER",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_diameter_eap_answer_header(message: &Message<'_>) -> Result<(), DecodeError> {
+    let flags = message.header.flags;
+    if !flags.is_proxiable() || flags.is_potentially_retransmitted() {
+        return Err(decode_structural_error_at(
+            "SWm DEA must set P and clear T",
+            4,
+            "DEA",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_redirect_values(
+    hosts: &[Redacted<String>],
+    usage: Option<SwmRedirectHostUsage>,
+    max_cache_time: Option<u32>,
+) -> Result<(), SwmDiameterRedirectError> {
+    if hosts.is_empty() {
+        return Err(SwmDiameterRedirectError::MissingHost);
+    }
+    if hosts.len() > MAX_SWM_REDIRECT_HOSTS {
+        return Err(SwmDiameterRedirectError::TooManyHosts);
+    }
+    let redirect_avp_count = hosts
+        .len()
+        .checked_add(usize::from(usage.is_some()))
+        .and_then(|count| count.checked_add(usize::from(max_cache_time.is_some())))
+        .ok_or(SwmDiameterRedirectError::TooManyAvps)?;
+    if redirect_avp_count > MAX_SWM_DIAMETER_EAP_ROUTING_AVPS {
+        return Err(SwmDiameterRedirectError::TooManyAvps);
+    }
+    for host in hosts {
+        builder_helpers::validate_known_avp_value(
+            host.as_ref().as_bytes(),
+            AvpDataType::DiameterUri,
+            DecodeContext::default(),
+            0,
+            "6.12",
+        )
+        .map_err(|_| SwmDiameterRedirectError::InvalidHost)?;
+    }
+    if usage.is_some_and(SwmRedirectHostUsage::is_cacheable) && max_cache_time.is_none() {
+        return Err(SwmDiameterRedirectError::MissingMaxCacheTime);
+    }
+    Ok(())
+}
+
+fn validate_diameter_eap_routing_for_encode(
+    proxy_count: usize,
+    route_records: &[Redacted<String>],
+    extension_count: usize,
+    section: &'static str,
+) -> Result<(), EncodeError> {
+    let total = proxy_count
+        .checked_add(route_records.len())
+        .and_then(|count| count.checked_add(extension_count))
+        .ok_or_else(EncodeError::length_overflow)?;
+    if total > MAX_SWM_DIAMETER_EAP_ROUTING_AVPS {
+        return Err(encode_structural_error(
+            "SWm Diameter-EAP routing and extension count exceeds its bound",
+            section,
+        ));
+    }
+    if route_records
+        .iter()
+        .any(|record| record.as_ref().is_empty() || !record.as_ref().is_ascii())
+    {
+        return Err(encode_structural_error(
+            "SWm DER Route-Record must be a nonempty ASCII DiameterIdentity",
+            "6.7.1",
+        ));
+    }
     Ok(())
 }
 
@@ -3537,7 +4537,31 @@ pub fn build_swm_diameter_eap_request(
     end_to_end_identifier: u32,
     ctx: EncodeContext,
 ) -> Result<OwnedMessage, EncodeError> {
+    build_swm_diameter_eap_request_internal(
+        request,
+        &[],
+        builder_helpers::app_request_flags(),
+        hop_by_hop_identifier,
+        end_to_end_identifier,
+        ctx,
+    )
+}
+
+fn build_swm_diameter_eap_request_internal(
+    request: &SwmDiameterEapRequest,
+    proxy_infos: &[SwmAdditionalAvp],
+    flags: crate::CommandFlags,
+    hop_by_hop_identifier: u32,
+    end_to_end_identifier: u32,
+    ctx: EncodeContext,
+) -> Result<OwnedMessage, EncodeError> {
     request.validate_for_encode()?;
+    validate_diameter_eap_routing_for_encode(
+        proxy_infos.len(),
+        &request.route_records,
+        request.extensions.len(),
+        "DER",
+    )?;
     let mut raw_avps = BytesMut::new();
     builder_helpers::append_utf8_avp(
         &mut raw_avps,
@@ -3706,6 +4730,18 @@ pub fn build_swm_diameter_eap_request(
         true,
         ctx,
     )?;
+    for proxy_info in proxy_infos {
+        proxy_info.append_to(&mut raw_avps, ctx)?;
+    }
+    for route_record in &request.route_records {
+        builder_helpers::append_utf8_avp(
+            &mut raw_avps,
+            base::AVP_ROUTE_RECORD,
+            route_record.as_ref(),
+            true,
+            ctx,
+        )?;
+    }
     append_diameter_eap_extensions(
         &mut raw_avps,
         request.extensions.retained_avps(),
@@ -3713,7 +4749,7 @@ pub fn build_swm_diameter_eap_request(
         "DER",
     )?;
     builder_helpers::build_message(
-        builder_helpers::app_request_flags(),
+        flags,
         COMMAND_DIAMETER_EAP,
         APPLICATION_ID,
         raw_avps,
@@ -3721,6 +4757,44 @@ pub fn build_swm_diameter_eap_request(
         end_to_end_identifier,
         ctx,
         "DER",
+    )
+}
+
+/// Build one retained DER envelope, including exact Proxy-Info and failover T.
+///
+/// This is the request retransmission/rebuild boundary. It requires an
+/// authenticated expected-answer binding so the resulting response can be
+/// correlated before redirect targets become actionable.
+pub fn build_swm_diameter_eap_request_envelope(
+    envelope: &SwmDiameterEapRequestEnvelope,
+    ctx: EncodeContext,
+) -> Result<OwnedMessage, EncodeError> {
+    let expected_peer = envelope.expected_answer_peer.as_ref().ok_or_else(|| {
+        encode_structural_error(
+            "outbound SWm DER requires an authenticated answer-peer binding",
+            "6.2.1",
+        )
+    })?;
+    expected_peer.validate_for_encode()?;
+    if !envelope.proxiable {
+        return Err(encode_structural_error(
+            "SWm DER must preserve the P bit",
+            "DER",
+        ));
+    }
+    let mut flags = builder_helpers::app_request_flags();
+    if envelope.potentially_retransmitted {
+        flags = crate::CommandFlags::from_bits(
+            flags.bits() | crate::CommandFlags::POTENTIALLY_RETRANSMITTED,
+        );
+    }
+    build_swm_diameter_eap_request_internal(
+        &envelope.request,
+        &envelope.proxy_infos,
+        flags,
+        envelope.transaction.hop_by_hop_identifier(),
+        envelope.transaction.end_to_end_identifier(),
+        ctx,
     )
 }
 
@@ -3767,6 +4841,18 @@ pub fn parse_swm_diameter_eap_request_with_provenance(
     message: &Message<'_>,
     ctx: DecodeContext,
 ) -> Result<SwmDiameterEapRequest, DiameterParserError> {
+    parse_swm_diameter_eap_request_parts(message, ctx).map(|parts| parts.request)
+}
+
+struct ParsedSwmDiameterEapRequestParts {
+    request: SwmDiameterEapRequest,
+    proxy_infos: Vec<SwmAdditionalAvp>,
+}
+
+fn parse_swm_diameter_eap_request_parts(
+    message: &Message<'_>,
+    ctx: DecodeContext,
+) -> Result<ParsedSwmDiameterEapRequestParts, DiameterParserError> {
     builder_helpers::ensure_app_header(
         message,
         COMMAND_DIAMETER_EAP,
@@ -3775,6 +4861,8 @@ pub fn parse_swm_diameter_eap_request_with_provenance(
         "DER",
     )
     .map_err(|error| DiameterParserError::decoded(message, error))?;
+    validate_diameter_eap_request_header(message)
+        .map_err(|error| DiameterParserError::decoded(message, error))?;
     let mut session_id = None;
     let mut auth_application_id = None;
     let mut origin_host = None;
@@ -3797,12 +4885,14 @@ pub fn parse_swm_diameter_eap_request_with_provenance(
     let mut terminal_information = None;
     let mut high_priority_access_info = None;
     let mut state_avps = Vec::new();
+    let mut route_records = Vec::new();
+    let mut proxy_infos = Vec::new();
     let mut terminal_missing_imei = None;
     let mut supported_features_missing_child = None;
     let mut qos_missing_child = None;
     let mut extensions = Vec::new();
     let mut extension_keys = HashSet::new();
-    let mut retained_extension_bytes = 0_usize;
+    let mut retention = DiameterEapRetention::default();
     let parse_result = builder_helpers::for_each_avp(
         message.raw_avps,
         ctx,
@@ -3812,6 +4902,15 @@ pub fn parse_swm_diameter_eap_request_with_provenance(
             let value_offset = builder_helpers::offset_add(offset, avp.header.header_len(), "DER")?;
             let code = avp.header.code;
             if let Some(vendor_id) = avp.header.vendor_id {
+                if vendor_id.get() == 0 {
+                    return Err(DecodeError::new(
+                        DecodeErrorCode::Structural {
+                            reason: "SWm DER Vendor-Id field must not contain zero",
+                        },
+                        offset,
+                    )
+                    .with_spec_ref(SpecRef::new("ietf", "RFC6733", "4.1.1")));
+                }
                 if code == AVP_EMERGENCY_SERVICES && vendor_id == VENDOR_ID_3GPP {
                     validate_emergency_services_flags(&avp.header, offset, "DER")?;
                     let value =
@@ -3931,7 +5030,7 @@ pub fn parse_swm_diameter_eap_request_with_provenance(
                         offset,
                         "DER",
                         &mut extension_keys,
-                        &mut retained_extension_bytes,
+                        &mut retention,
                         &mut extensions,
                     )?;
                 }
@@ -4039,6 +5138,40 @@ pub fn parse_swm_diameter_eap_request_with_provenance(
                     offset,
                     "4.1",
                 )?;
+            } else if avp.header.key() == AvpKey::ietf(base::AVP_PROXY_INFO) {
+                retain_diameter_eap_proxy_info(
+                    &avp,
+                    ctx,
+                    offset,
+                    value_offset,
+                    "DER",
+                    &mut retention,
+                    &mut proxy_infos,
+                )?;
+            } else if avp.header.key() == AvpKey::ietf(base::AVP_ROUTE_RECORD) {
+                retain_diameter_eap_route_record(
+                    &avp,
+                    ctx,
+                    offset,
+                    value_offset,
+                    "DER",
+                    &mut retention,
+                    &mut route_records,
+                )?;
+            } else if matches!(
+                avp.header.key(),
+                key if key == AvpKey::ietf(base::AVP_RESULT_CODE)
+                    || key == AvpKey::ietf(base::AVP_EXPERIMENTAL_RESULT)
+                    || key == AvpKey::ietf(base::AVP_REDIRECT_HOST)
+                    || key == AvpKey::ietf(base::AVP_REDIRECT_HOST_USAGE)
+                    || key == AvpKey::ietf(base::AVP_REDIRECT_MAX_CACHE_TIME)
+                    || key == AvpKey::ietf(base::AVP_FAILED_AVP)
+            ) {
+                return Err(decode_structural_error_at(
+                    "answer-only routing or error AVP is not valid in SWm DER grammar",
+                    offset,
+                    "7.2",
+                ));
             } else if code == AVP_STATE {
                 state_avps.push(avp.value.to_vec());
             } else {
@@ -4048,7 +5181,7 @@ pub fn parse_swm_diameter_eap_request_with_provenance(
                     offset,
                     "DER",
                     &mut extension_keys,
-                    &mut retained_extension_bytes,
+                    &mut retention,
                     &mut extensions,
                 )?;
             }
@@ -4213,11 +5346,15 @@ pub fn parse_swm_diameter_eap_request_with_provenance(
         terminal_information,
         high_priority_access_info,
         state_avps,
+        route_records,
         extensions: SwmDiameterEapRequestExtensions { avps: extensions },
     };
     validate_decoded_request(&request)
         .map_err(|error| DiameterParserError::decoded(message, error))?;
-    Ok(request)
+    Ok(ParsedSwmDiameterEapRequestParts {
+        request,
+        proxy_infos,
+    })
 }
 
 fn require_swm_request_field<T>(
@@ -4265,10 +5402,14 @@ pub fn parse_swm_diameter_eap_request_envelope_with_provenance(
     ctx: DecodeContext,
 ) -> Result<SwmDiameterEapRequestEnvelope, DiameterParserError> {
     let transaction = SwmDiameterTransaction::from_message(message);
-    let request = parse_swm_diameter_eap_request_with_provenance(message, ctx)?;
+    let parts = parse_swm_diameter_eap_request_parts(message, ctx)?;
     Ok(SwmDiameterEapRequestEnvelope {
         transaction,
-        request,
+        proxiable: message.header.flags.is_proxiable(),
+        potentially_retransmitted: message.header.flags.is_potentially_retransmitted(),
+        expected_answer_peer: None,
+        request: parts.request,
+        proxy_infos: parts.proxy_infos,
     })
 }
 
@@ -4287,6 +5428,8 @@ pub fn build_swm_diameter_eap_answer(
 ) -> Result<OwnedMessage, EncodeError> {
     build_swm_diameter_eap_answer_internal(
         answer,
+        &[],
+        true,
         hop_by_hop_identifier,
         end_to_end_identifier,
         false,
@@ -4296,12 +5439,20 @@ pub fn build_swm_diameter_eap_answer(
 
 fn build_swm_diameter_eap_answer_internal(
     answer: &SwmDiameterEapAnswer,
+    proxy_infos: &[SwmAdditionalAvp],
+    proxiable: bool,
     hop_by_hop_identifier: u32,
     end_to_end_identifier: u32,
     overload_request_conditioned: bool,
     ctx: EncodeContext,
 ) -> Result<OwnedMessage, EncodeError> {
     answer.validate_for_encode()?;
+    validate_diameter_eap_routing_for_encode(
+        proxy_infos.len(),
+        &[],
+        answer.extensions.len(),
+        "DEA",
+    )?;
     if !overload_request_conditioned
         && (answer.oc_supported_features.is_some() || answer.oc_olr.is_some())
     {
@@ -4494,11 +5645,12 @@ fn build_swm_diameter_eap_answer_internal(
             ctx,
         )?;
     }
+    for proxy_info in proxy_infos {
+        proxy_info.append_to(&mut raw_avps, ctx)?;
+    }
     append_diameter_eap_extensions(&mut raw_avps, answer.extensions.retained_avps(), ctx, "DEA")?;
     builder_helpers::build_message(
-        builder_helpers::app_answer_flags(builder_helpers::result_code_requires_error_bit(
-            answer.result.code(),
-        )),
+        crate::CommandFlags::answer(proxiable, false),
         COMMAND_DIAMETER_EAP,
         APPLICATION_ID,
         raw_avps,
@@ -4542,10 +5694,177 @@ pub fn build_swm_diameter_eap_answer_for(
     let transaction = request.transaction();
     build_swm_diameter_eap_answer_internal(
         answer,
+        &request.proxy_infos,
+        request.proxiable,
         transaction.hop_by_hop_identifier(),
         transaction.end_to_end_identifier(),
         true,
         ctx,
+    )
+}
+
+/// Build an ordinary or generic Diameter-EAP response for one exact DER.
+///
+/// The response preserves P and both identifiers, copies the exact ordered
+/// Proxy-Info chain, and never reflects request Route-Record values. Generic
+/// errors use RFC 6733 section 7.2 grammar and do not acquire application-only
+/// fields.
+pub fn build_swm_diameter_eap_response_for(
+    request: &SwmDiameterEapRequestEnvelope,
+    response: &SwmDiameterEapResponse,
+    ctx: EncodeContext,
+) -> Result<OwnedMessage, EncodeError> {
+    match response {
+        SwmDiameterEapResponse::Application(answer) => {
+            build_swm_diameter_eap_answer_for(request, answer, ctx)
+        }
+        SwmDiameterEapResponse::GenericError(answer) => {
+            build_swm_diameter_eap_generic_error_for(request, answer, ctx)
+        }
+    }
+}
+
+fn build_swm_diameter_eap_generic_error_for(
+    request: &SwmDiameterEapRequestEnvelope,
+    answer: &SwmDiameterEapGenericErrorAnswer,
+    ctx: EncodeContext,
+) -> Result<OwnedMessage, EncodeError> {
+    answer.validate_for_encode()?;
+    if answer.session_id.as_deref().map(String::as_str) != Some(request.request.session_id.as_ref())
+    {
+        return Err(encode_structural_error(
+            "request-bound generic SWm DEA must copy Session-Id",
+            "6.2",
+        ));
+    }
+    let redirect_avp_count = answer.redirect.as_ref().map_or(0, |redirect| {
+        redirect.hosts().len()
+            + usize::from(redirect.usage().is_some())
+            + usize::from(redirect.max_cache_time().is_some())
+    });
+    let retained_count = request
+        .proxy_infos
+        .len()
+        .checked_add(answer.failed_avps.len())
+        .and_then(|count| count.checked_add(answer.additional_avps.len()))
+        .and_then(|count| count.checked_add(redirect_avp_count))
+        .ok_or_else(EncodeError::length_overflow)?;
+    if retained_count > MAX_SWM_DIAMETER_EAP_ROUTING_AVPS {
+        return Err(encode_structural_error(
+            "generic SWm DEA routing and extension count exceeds its bound",
+            "7.2",
+        ));
+    }
+
+    let mut raw_avps = BytesMut::new();
+    if let Some(session_id) = answer.session_id.as_ref() {
+        builder_helpers::append_utf8_avp(
+            &mut raw_avps,
+            base::AVP_SESSION_ID,
+            session_id.as_ref(),
+            true,
+            ctx,
+        )?;
+    }
+    builder_helpers::append_utf8_avp(
+        &mut raw_avps,
+        base::AVP_ORIGIN_HOST,
+        answer.origin_host.as_ref(),
+        true,
+        ctx,
+    )?;
+    builder_helpers::append_utf8_avp(
+        &mut raw_avps,
+        base::AVP_ORIGIN_REALM,
+        answer.origin_realm.as_ref(),
+        true,
+        ctx,
+    )?;
+    builder_helpers::append_u32_avp(
+        &mut raw_avps,
+        base::AVP_RESULT_CODE,
+        answer.result_code,
+        true,
+        ctx,
+    )?;
+    if let Some(origin_state_id) = answer.origin_state_id {
+        builder_helpers::append_u32_avp(
+            &mut raw_avps,
+            base::AVP_ORIGIN_STATE_ID,
+            origin_state_id,
+            true,
+            ctx,
+        )?;
+    }
+    if let Some(error_message) = answer.error_message.as_ref() {
+        builder_helpers::append_utf8_avp(
+            &mut raw_avps,
+            base::AVP_ERROR_MESSAGE,
+            error_message.as_ref(),
+            false,
+            ctx,
+        )?;
+    }
+    if let Some(error_reporting_host) = answer.error_reporting_host.as_ref() {
+        builder_helpers::append_utf8_avp(
+            &mut raw_avps,
+            base::AVP_ERROR_REPORTING_HOST,
+            error_reporting_host.as_ref(),
+            false,
+            ctx,
+        )?;
+    }
+    for failed_avp in &answer.failed_avps {
+        failed_avp.append_to(&mut raw_avps, ctx)?;
+    }
+    if let Some(SwmDiameterResult::Experimental { vendor_id, code }) = answer.experimental_result {
+        append_experimental_result_avp(&mut raw_avps, vendor_id, code, ctx)?;
+    }
+    for proxy_info in &request.proxy_infos {
+        proxy_info.append_to(&mut raw_avps, ctx)?;
+    }
+    if let Some(redirect) = answer.redirect.as_ref() {
+        for host in redirect.hosts() {
+            builder_helpers::append_utf8_avp(
+                &mut raw_avps,
+                base::AVP_REDIRECT_HOST,
+                host.as_ref(),
+                true,
+                ctx,
+            )?;
+        }
+        if let Some(usage) = redirect.usage() {
+            builder_helpers::append_u32_avp(
+                &mut raw_avps,
+                base::AVP_REDIRECT_HOST_USAGE,
+                usage.value(),
+                true,
+                ctx,
+            )?;
+        }
+        if let Some(max_cache_time) = redirect.max_cache_time() {
+            builder_helpers::append_u32_avp(
+                &mut raw_avps,
+                base::AVP_REDIRECT_MAX_CACHE_TIME,
+                max_cache_time,
+                true,
+                ctx,
+            )?;
+        }
+    }
+    for avp in &answer.additional_avps {
+        avp.append_to(&mut raw_avps, ctx)?;
+    }
+    let transaction = request.transaction;
+    builder_helpers::build_message(
+        crate::CommandFlags::answer(request.proxiable, true),
+        COMMAND_DIAMETER_EAP,
+        APPLICATION_ID,
+        raw_avps,
+        transaction.hop_by_hop_identifier(),
+        transaction.end_to_end_identifier(),
+        ctx,
+        "7.2",
     )
 }
 
@@ -4554,6 +5873,18 @@ pub fn parse_swm_diameter_eap_answer(
     message: &Message<'_>,
     ctx: DecodeContext,
 ) -> Result<SwmDiameterEapAnswer, DecodeError> {
+    parse_swm_diameter_eap_application_answer_parts(message, ctx).map(|parts| parts.answer)
+}
+
+struct ParsedSwmDiameterEapApplicationAnswerParts {
+    answer: SwmDiameterEapAnswer,
+    proxy_infos: Vec<SwmAdditionalAvp>,
+}
+
+fn parse_swm_diameter_eap_application_answer_parts(
+    message: &Message<'_>,
+    ctx: DecodeContext,
+) -> Result<ParsedSwmDiameterEapApplicationAnswerParts, DecodeError> {
     builder_helpers::ensure_app_header(
         message,
         COMMAND_DIAMETER_EAP,
@@ -4561,6 +5892,13 @@ pub fn parse_swm_diameter_eap_answer(
         CommandKind::Answer,
         "DEA",
     )?;
+    validate_diameter_eap_answer_header(message)?;
+    if message.header.flags.is_error() {
+        return Err(decode_structural_error(
+            "SWm DEA E-bit response requires the generic response parser",
+            "7.2",
+        ));
+    }
     let mut session_id = None;
     let mut auth_application_id = None;
     let mut auth_request_type = None;
@@ -4587,9 +5925,10 @@ pub fn parse_swm_diameter_eap_answer(
     let mut error_message = None;
     let mut state_avps = Vec::new();
     let mut eap_master_session_key = None;
+    let mut proxy_infos = Vec::new();
     let mut extensions = Vec::new();
     let mut extension_keys = HashSet::new();
-    let mut retained_extension_bytes = 0_usize;
+    let mut retention = DiameterEapRetention::default();
     builder_helpers::for_each_avp(
         message.raw_avps,
         ctx,
@@ -4645,7 +5984,7 @@ pub fn parse_swm_diameter_eap_answer(
                         offset,
                         "DEA",
                         &mut extension_keys,
-                        &mut retained_extension_bytes,
+                        &mut retention,
                         &mut extensions,
                     )?;
                 }
@@ -4802,6 +6141,38 @@ pub fn parse_swm_diameter_eap_answer(
             } else if code == base::AVP_ERROR_MESSAGE {
                 let value = builder_helpers::parse_utf8_value(avp.value, value_offset, "7.3")?;
                 builder_helpers::set_once(&mut error_message, value, offset, "7.3")?;
+            } else if avp.header.key() == AvpKey::ietf(base::AVP_PROXY_INFO) {
+                retain_diameter_eap_proxy_info(
+                    &avp,
+                    ctx,
+                    offset,
+                    value_offset,
+                    "DEA",
+                    &mut retention,
+                    &mut proxy_infos,
+                )?;
+            } else if avp.header.key() == AvpKey::ietf(base::AVP_FAILED_AVP) {
+                // RFC 4072 section 3.2 permits repeated Failed-AVP values on
+                // ordinary E-clear answers. Their inner bytes can describe a
+                // malformed or synthesized AVP, so only validate the outer
+                // base identity and retain the payload opaquely.
+                lifecycle::validate_base_definition(&avp, offset)?;
+                retention.account(&avp, offset, "3.2", ctx)?;
+                extensions.push(SwmAdditionalAvp::from_raw_exact(&avp));
+            } else if matches!(
+                avp.header.key(),
+                key if key == AvpKey::ietf(base::AVP_ROUTE_RECORD)
+                    || key == AvpKey::ietf(base::AVP_DESTINATION_HOST)
+                    || key == AvpKey::ietf(base::AVP_DESTINATION_REALM)
+                    || key == AvpKey::ietf(base::AVP_REDIRECT_HOST)
+                    || key == AvpKey::ietf(base::AVP_REDIRECT_HOST_USAGE)
+                    || key == AvpKey::ietf(base::AVP_REDIRECT_MAX_CACHE_TIME)
+            ) {
+                return Err(decode_structural_error_at(
+                    "routing or generic-error AVP is not valid in ordinary SWm DEA grammar",
+                    offset,
+                    "7.2",
+                ));
             } else if code == AVP_STATE {
                 state_avps.push(avp.value.to_vec());
             } else if code == AVP_EAP_MASTER_SESSION_KEY {
@@ -4818,7 +6189,7 @@ pub fn parse_swm_diameter_eap_answer(
                     offset,
                     "DEA",
                     &mut extension_keys,
-                    &mut retained_extension_bytes,
+                    &mut retention,
                     &mut extensions,
                 )?;
             }
@@ -4855,11 +6226,12 @@ pub fn parse_swm_diameter_eap_answer(
             ));
         }
     };
-    if message.header.flags.is_error()
-        != builder_helpers::result_code_requires_error_bit(result.code())
-    {
+    if matches!(
+        result,
+        SwmDiameterResult::Base(code) if builder_helpers::result_code_requires_error_bit(code)
+    ) {
         return Err(decode_structural_error(
-            "SWm DEA E bit does not match the result-code family",
+            "base 3xxx SWm DEA requires the generic E-bit response grammar",
             "7.2",
         ));
     }
@@ -4912,7 +6284,374 @@ pub fn parse_swm_diameter_eap_answer(
         answer.oc_olr.as_ref(),
     )?;
     validate_decoded_answer(&answer)?;
-    Ok(answer)
+    Ok(ParsedSwmDiameterEapApplicationAnswerParts {
+        answer,
+        proxy_infos,
+    })
+}
+
+struct ParsedSwmDiameterEapGenericErrorParts {
+    answer: SwmDiameterEapGenericErrorAnswer,
+    proxy_infos: Vec<SwmAdditionalAvp>,
+}
+
+/// Parse either ordinary SWm DEA application grammar or RFC 6733 generic
+/// E-bit error grammar.
+///
+/// Parsed redirect hosts remain sealed in the generic value. Use
+/// [`parse_swm_diameter_eap_response_envelope_from_connection`] and correlate
+/// it with the retained DER before making a redirect decision.
+pub fn parse_swm_diameter_eap_response(
+    message: &Message<'_>,
+    ctx: DecodeContext,
+) -> Result<SwmDiameterEapResponse, DecodeError> {
+    if message.header.flags.is_error() {
+        parse_swm_diameter_eap_generic_error_parts(message, ctx)
+            .map(|parts| SwmDiameterEapResponse::GenericError(Box::new(parts.answer)))
+    } else {
+        parse_swm_diameter_eap_application_answer_parts(message, ctx)
+            .map(|parts| SwmDiameterEapResponse::Application(Box::new(parts.answer)))
+    }
+}
+
+/// Parse a Diameter-EAP response with authenticated connection evidence.
+pub fn parse_swm_diameter_eap_response_envelope_from_connection(
+    message: &Message<'_>,
+    received_on: SwmDiameterConnectionToken,
+    ctx: DecodeContext,
+) -> Result<SwmDiameterEapResponseEnvelope, DecodeError> {
+    let transaction = SwmDiameterTransaction::from_message(message);
+    let (response, proxy_infos) = if message.header.flags.is_error() {
+        let parts = parse_swm_diameter_eap_generic_error_parts(message, ctx)?;
+        (
+            SwmDiameterEapResponse::GenericError(Box::new(parts.answer)),
+            parts.proxy_infos,
+        )
+    } else {
+        let parts = parse_swm_diameter_eap_application_answer_parts(message, ctx)?;
+        (
+            SwmDiameterEapResponse::Application(Box::new(parts.answer)),
+            parts.proxy_infos,
+        )
+    };
+    Ok(SwmDiameterEapResponseEnvelope {
+        transaction,
+        proxiable: message.header.flags.is_proxiable(),
+        received_on,
+        response,
+        proxy_infos,
+    })
+}
+
+fn parse_swm_diameter_eap_generic_error_parts(
+    message: &Message<'_>,
+    ctx: DecodeContext,
+) -> Result<ParsedSwmDiameterEapGenericErrorParts, DecodeError> {
+    builder_helpers::ensure_app_header(
+        message,
+        COMMAND_DIAMETER_EAP,
+        APPLICATION_ID,
+        CommandKind::Answer,
+        "7.2",
+    )?;
+    validate_diameter_eap_answer_header(message)?;
+    if !message.header.flags.is_error() {
+        return Err(decode_structural_error(
+            "generic SWm DEA requires the E bit",
+            "7.2",
+        ));
+    }
+
+    let mut session_id = None;
+    let mut result_code = None;
+    let mut origin_host = None;
+    let mut origin_realm = None;
+    let mut redirect_hosts = Vec::new();
+    let mut redirect_usage = None;
+    let mut redirect_max_cache_time = None;
+    let mut error_message = None;
+    let mut error_reporting_host = None;
+    let mut origin_state_id = None;
+    let mut experimental_result = None;
+    let mut failed_avps = Vec::new();
+    let mut proxy_infos = Vec::new();
+    let mut additional_avps = Vec::new();
+    let mut generic_auth_application_id = None;
+    let mut retention = DiameterEapRetention::default();
+
+    builder_helpers::for_each_avp(
+        message.raw_avps,
+        ctx,
+        crate::DIAMETER_HEADER_LEN,
+        0,
+        |offset, avp| {
+            let value_offset = builder_helpers::offset_add(offset, avp.header.header_len(), "7.2")?;
+            if avp
+                .header
+                .vendor_id
+                .is_some_and(|vendor_id| vendor_id.get() == 0)
+            {
+                return Err(DecodeError::new(
+                    DecodeErrorCode::Structural {
+                        reason: "generic SWm DEA Vendor-Id field must not contain zero",
+                    },
+                    offset,
+                )
+                .with_spec_ref(SpecRef::new("ietf", "RFC6733", "4.1.1")));
+            }
+            let key = avp.header.key();
+            if key == AvpKey::ietf(base::AVP_SESSION_ID) {
+                lifecycle::validate_base_definition(&avp, offset)?;
+                let value = builder_helpers::parse_string_value(avp.value, value_offset, "8.8")?;
+                if value.is_empty() {
+                    return Err(decode_structural_error_at(
+                        "generic SWm DEA Session-Id must not be empty",
+                        offset,
+                        "8.8",
+                    ));
+                }
+                builder_helpers::set_once(&mut session_id, Redacted::from(value), offset, "8.8")?;
+            } else if key == AvpKey::ietf(base::AVP_ORIGIN_HOST) {
+                let value = parse_required_base_identity(&avp, ctx, offset, value_offset, "6.3")?;
+                builder_helpers::set_once(&mut origin_host, value, offset, "6.3")?;
+            } else if key == AvpKey::ietf(base::AVP_ORIGIN_REALM) {
+                let value = parse_required_base_identity(&avp, ctx, offset, value_offset, "6.4")?;
+                builder_helpers::set_once(&mut origin_realm, value, offset, "6.4")?;
+            } else if key == AvpKey::ietf(base::AVP_RESULT_CODE) {
+                lifecycle::validate_base_definition(&avp, offset)?;
+                let value = builder_helpers::parse_u32_value(avp.value, value_offset, "7.1")?;
+                builder_helpers::set_once(&mut result_code, value, offset, "7.1")?;
+            } else if key == AvpKey::ietf(base::AVP_ORIGIN_STATE_ID) {
+                lifecycle::validate_base_definition(&avp, offset)?;
+                let value = builder_helpers::parse_u32_value(avp.value, value_offset, "8.16")?;
+                builder_helpers::set_once(&mut origin_state_id, value, offset, "8.16")?;
+            } else if key == AvpKey::ietf(base::AVP_ERROR_MESSAGE) {
+                lifecycle::validate_base_definition(&avp, offset)?;
+                let value = builder_helpers::parse_utf8_value(avp.value, value_offset, "7.3")?;
+                builder_helpers::set_once(
+                    &mut error_message,
+                    Redacted::from(value),
+                    offset,
+                    "7.3",
+                )?;
+            } else if key == AvpKey::ietf(base::AVP_ERROR_REPORTING_HOST) {
+                let value = parse_required_base_identity(&avp, ctx, offset, value_offset, "7.4")?;
+                builder_helpers::set_once(&mut error_reporting_host, value, offset, "7.4")?;
+            } else if key == AvpKey::ietf(base::AVP_EXPERIMENTAL_RESULT) {
+                lifecycle::validate_base_definition(&avp, offset)?;
+                let value = parse_experimental_result(avp.value, ctx, value_offset, 1)?;
+                builder_helpers::set_once(&mut experimental_result, value, offset, "7.6")?;
+            } else if key == AvpKey::ietf(base::AVP_FAILED_AVP) {
+                // RFC 6733 section 7.5 permits synthesized and zero-filled
+                // offending AVP representations. Validate only the trusted
+                // outer identity/flags and retain the value opaquely.
+                lifecycle::validate_base_definition(&avp, offset)?;
+                retention.account(&avp, offset, "7.5", ctx)?;
+                failed_avps.push(SwmAdditionalAvp::from_raw_exact(&avp));
+            } else if key == AvpKey::ietf(base::AVP_REDIRECT_HOST) {
+                lifecycle::validate_base_definition(&avp, offset)?;
+                builder_helpers::validate_known_avp_value(
+                    avp.value,
+                    AvpDataType::DiameterUri,
+                    ctx,
+                    value_offset,
+                    "6.12",
+                )?;
+                if redirect_hosts.len() >= MAX_SWM_REDIRECT_HOSTS {
+                    return Err(DecodeError::new(DecodeErrorCode::IeCountExceeded, offset)
+                        .with_spec_ref(SpecRef::new("ietf", "RFC6733", "6.12")));
+                }
+                retention.account(&avp, offset, "6.12", ctx)?;
+                let value = builder_helpers::parse_string_value(avp.value, value_offset, "6.12")?;
+                redirect_hosts.push(Redacted::from(value));
+            } else if key == AvpKey::ietf(base::AVP_REDIRECT_HOST_USAGE) {
+                lifecycle::validate_base_definition(&avp, offset)?;
+                let value = builder_helpers::parse_u32_value(avp.value, value_offset, "6.13")?;
+                let usage = SwmRedirectHostUsage::from_value(value).ok_or_else(|| {
+                    DecodeError::new(
+                        DecodeErrorCode::InvalidEnumValue {
+                            field: "Redirect-Host-Usage",
+                            value: u64::from(value),
+                        },
+                        value_offset,
+                    )
+                    .with_spec_ref(SpecRef::new("ietf", "RFC6733", "6.13"))
+                })?;
+                builder_helpers::set_once(&mut redirect_usage, usage, offset, "6.13")?;
+                retention.account(&avp, offset, "6.13", ctx)?;
+            } else if key == AvpKey::ietf(base::AVP_REDIRECT_MAX_CACHE_TIME) {
+                lifecycle::validate_base_definition(&avp, offset)?;
+                let value = builder_helpers::parse_u32_value(avp.value, value_offset, "6.14")?;
+                builder_helpers::set_once(&mut redirect_max_cache_time, value, offset, "6.14")?;
+                retention.account(&avp, offset, "6.14", ctx)?;
+            } else if key == AvpKey::ietf(base::AVP_AUTH_APPLICATION_ID) {
+                lifecycle::validate_base_definition(&avp, offset)?;
+                let value = builder_helpers::parse_u32_value(avp.value, value_offset, "6.8")?;
+                if value != APPLICATION_ID.get() {
+                    return Err(decode_structural_error_at(
+                        "generic SWm DEA Auth-Application-Id must match the header application",
+                        offset,
+                        "6.8",
+                    ));
+                }
+                builder_helpers::set_once(&mut generic_auth_application_id, value, offset, "6.8")?;
+                retention.account(&avp, offset, "7.2", ctx)?;
+                additional_avps.push(SwmAdditionalAvp::from_raw_exact(&avp));
+            } else if key == AvpKey::ietf(base::AVP_PROXY_INFO) {
+                retain_diameter_eap_proxy_info(
+                    &avp,
+                    ctx,
+                    offset,
+                    value_offset,
+                    "7.2",
+                    &mut retention,
+                    &mut proxy_infos,
+                )?;
+            } else if key == AvpKey::ietf(base::AVP_ROUTE_RECORD) {
+                return Err(decode_structural_error_at(
+                    "SWm DEA must not contain Route-Record",
+                    offset,
+                    "6.7.1",
+                ));
+            } else if key == AvpKey::ietf(base::AVP_DESTINATION_HOST)
+                || key == AvpKey::ietf(base::AVP_DESTINATION_REALM)
+            {
+                return Err(decode_structural_error_at(
+                    "Diameter answers must not contain Destination-Host or Destination-Realm",
+                    offset,
+                    "6.2",
+                ));
+            } else {
+                retain_generic_error_wildcard_avp(
+                    &avp,
+                    ctx,
+                    offset,
+                    value_offset,
+                    &mut retention,
+                    &mut additional_avps,
+                )?;
+            }
+            Ok(())
+        },
+    )?;
+
+    let result_code = builder_helpers::require_field(
+        result_code,
+        "generic SWm DEA requires base Result-Code",
+        "7.2",
+    )?;
+    if !result_code_allows_generic_error_bit(result_code) {
+        return Err(decode_structural_error(
+            "generic SWm DEA E bit is invalid for this Result-Code family",
+            "7.1",
+        ));
+    }
+    if result_code_requires_failed_avp(result_code) && failed_avps.is_empty() {
+        return Err(decode_structural_error(
+            "generic SWm DEA Result-Code requires Failed-AVP evidence",
+            "7.5",
+        ));
+    }
+    let has_redirect_context =
+        !redirect_hosts.is_empty() || redirect_usage.is_some() || redirect_max_cache_time.is_some();
+    let redirect = if result_code == DIAMETER_REDIRECT_INDICATION {
+        Some(
+            SwmDiameterRedirect::new(redirect_hosts, redirect_usage, redirect_max_cache_time)
+                .map_err(|_| {
+                    decode_structural_error("generic SWm DEA redirect context is invalid", "6.12")
+                })?,
+        )
+    } else if has_redirect_context {
+        return Err(decode_structural_error(
+            "Redirect AVPs require DIAMETER_REDIRECT_INDICATION",
+            "6.12",
+        ));
+    } else {
+        None
+    };
+
+    Ok(ParsedSwmDiameterEapGenericErrorParts {
+        answer: SwmDiameterEapGenericErrorAnswer {
+            session_id,
+            result_code,
+            origin_host: builder_helpers::require_field(
+                origin_host,
+                "generic SWm DEA requires Origin-Host",
+                "7.2",
+            )?,
+            origin_realm: builder_helpers::require_field(
+                origin_realm,
+                "generic SWm DEA requires Origin-Realm",
+                "7.2",
+            )?,
+            redirect,
+            error_message,
+            error_reporting_host,
+            origin_state_id,
+            experimental_result,
+            failed_avps,
+            additional_avps,
+            provenance: SwmDiameterEapGenericErrorAnswerProvenance::Parsed,
+        },
+        proxy_infos,
+    })
+}
+
+fn parse_required_base_identity(
+    avp: &RawAvp<'_>,
+    ctx: DecodeContext,
+    offset: usize,
+    value_offset: usize,
+    section: &'static str,
+) -> Result<Redacted<String>, DecodeError> {
+    lifecycle::validate_base_definition(avp, offset)?;
+    builder_helpers::validate_known_avp_value(
+        avp.value,
+        AvpDataType::DiameterIdentity,
+        ctx,
+        value_offset,
+        section,
+    )?;
+    let value = builder_helpers::parse_string_value(avp.value, value_offset, section)?;
+    if value.is_empty() {
+        return Err(decode_structural_error_at(
+            "DiameterIdentity must not be empty",
+            offset,
+            section,
+        ));
+    }
+    Ok(Redacted::from(value))
+}
+
+fn retain_generic_error_wildcard_avp(
+    avp: &RawAvp<'_>,
+    ctx: DecodeContext,
+    offset: usize,
+    value_offset: usize,
+    retention: &mut DiameterEapRetention,
+    retained: &mut Vec<SwmAdditionalAvp>,
+) -> Result<(), DecodeError> {
+    let definition = base::dictionary()
+        .find_avp(avp.header.key())
+        .or_else(|| dictionary().find_avp(avp.header.key()));
+    if let Some(definition) = definition {
+        lifecycle::validate_flags(&avp.header, definition.flags(), offset, "7.2")?;
+        builder_helpers::validate_known_avp_value(
+            avp.value,
+            definition.data_type(),
+            ctx,
+            value_offset,
+            "7.2",
+        )?;
+    } else {
+        builder_helpers::handle_unknown_avp(ctx, avp, offset, "7.2")?;
+        if ctx.unknown_ie_policy != UnknownIePolicy::Preserve {
+            return Ok(());
+        }
+    }
+    retention.account(avp, offset, "7.2", ctx)?;
+    retained.push(SwmAdditionalAvp::from_raw_exact(avp));
+    Ok(())
 }
 
 /// Parse a SWm DEA while retaining its Diameter transaction identifiers.
@@ -4924,10 +6663,12 @@ pub fn parse_swm_diameter_eap_answer_envelope(
     ctx: DecodeContext,
 ) -> Result<SwmDiameterEapAnswerEnvelope, DecodeError> {
     let transaction = SwmDiameterTransaction::from_message(message);
-    let answer = parse_swm_diameter_eap_answer(message, ctx)?;
+    let parts = parse_swm_diameter_eap_application_answer_parts(message, ctx)?;
     Ok(SwmDiameterEapAnswerEnvelope {
         transaction,
-        answer,
+        proxiable: message.header.flags.is_proxiable(),
+        answer: parts.answer,
+        proxy_infos: parts.proxy_infos,
         provenance: SwmDiameterEapAnswerEnvelopeProvenance::Parsed,
     })
 }
@@ -5507,6 +7248,12 @@ pub(super) fn append_experimental_result_avp(
     code: u32,
     ctx: EncodeContext,
 ) -> Result<(), EncodeError> {
+    if vendor_id.get() == 0 {
+        return Err(encode_structural_error(
+            "Experimental-Result Vendor-Id must not be zero",
+            "7.6",
+        ));
+    }
     let mut value = BytesMut::new();
     builder_helpers::append_u32_avp(&mut value, base::AVP_VENDOR_ID, vendor_id.get(), true, ctx)?;
     builder_helpers::append_u32_avp(
@@ -5546,11 +7293,17 @@ pub(super) fn parse_experimental_result(
         }
         Ok(())
     })?;
+    let vendor_id =
+        vendor_id.ok_or_else(|| missing_child_error(base_offset, "missing Vendor-Id child AVP"))?;
+    if vendor_id == 0 {
+        return Err(decode_structural_error_at(
+            "Experimental-Result Vendor-Id must not be zero",
+            base_offset,
+            "7.6",
+        ));
+    }
     Ok(SwmDiameterResult::Experimental {
-        vendor_id: VendorId::new(
-            vendor_id
-                .ok_or_else(|| missing_child_error(base_offset, "missing Vendor-Id child AVP"))?,
-        ),
+        vendor_id: VendorId::new(vendor_id),
         code: code.ok_or_else(|| {
             missing_child_error(base_offset, "missing Experimental-Result-Code child AVP")
         })?,
@@ -6324,6 +8077,14 @@ fn ensure_correlated_answer(
     if request_envelope.transaction() != answer_envelope.transaction() {
         return Err(SwmEmergencyAuthorizationError::DiameterTransactionMismatch);
     }
+    if request_envelope.proxiable != answer_envelope.proxiable
+        || !lifecycle::additional_avp_sequences_match(
+            &request_envelope.proxy_infos,
+            &answer_envelope.proxy_infos,
+        )
+    {
+        return Err(SwmEmergencyAuthorizationError::AnswerRequestMismatch);
+    }
     let request = request_envelope.request();
     let answer = answer_envelope.answer();
     ensure_same_session(request, answer)?;
@@ -6348,6 +8109,64 @@ fn ensure_correlated_answer(
         SwmDiameterEapAnswerEnvelopeProvenance::Outbound => answer.validate_for_encode(),
     }
     .map_err(|_| SwmEmergencyAuthorizationError::AnswerInvalid)?;
+    Ok(())
+}
+
+fn ensure_correlated_response(
+    request_envelope: &SwmDiameterEapRequestEnvelope,
+    response_envelope: &SwmDiameterEapResponseEnvelope,
+) -> Result<(), SwmDiameterEapCorrelationError> {
+    let expected_peer = request_envelope
+        .expected_answer_peer
+        .as_ref()
+        .ok_or(SwmDiameterEapCorrelationError::PeerBindingMissing)?;
+    if expected_peer.connection() != response_envelope.received_on {
+        return Err(SwmDiameterEapCorrelationError::PeerConnectionMismatch);
+    }
+    if request_envelope.transaction != response_envelope.transaction {
+        return Err(SwmDiameterEapCorrelationError::TransactionMismatch);
+    }
+    if request_envelope.proxiable != response_envelope.proxiable {
+        return Err(SwmDiameterEapCorrelationError::ProxiableMismatch);
+    }
+    if !lifecycle::additional_avp_sequences_match(
+        &request_envelope.proxy_infos,
+        &response_envelope.proxy_infos,
+    ) {
+        return Err(SwmDiameterEapCorrelationError::ProxyInfoMismatch);
+    }
+    if response_envelope
+        .response
+        .session_id()
+        .is_some_and(|session_id| session_id != request_envelope.request.session_id.as_ref())
+    {
+        return Err(SwmDiameterEapCorrelationError::SessionMismatch);
+    }
+
+    if let SwmDiameterEapResponse::Application(answer) = &response_envelope.response {
+        if !expected_peer.matches_origin(answer.origin_host.as_ref(), answer.origin_realm.as_ref())
+        {
+            return Err(SwmDiameterEapCorrelationError::PeerIdentityMismatch);
+        }
+        let request = &request_envelope.request;
+        if request.auth_application_id != answer.auth_application_id
+            || request.auth_request_type != answer.auth_request_type
+            || !mobility_answer_matches_offer(
+                request.mip6_feature_vector,
+                answer.mip6_feature_vector,
+                answer.result.is_diameter_success(),
+            )
+            || lifecycle::validate_diameter_eap_answer_overload_control_for_request(
+                request.oc_supported_features.as_ref(),
+                answer.oc_supported_features.as_ref(),
+                answer.oc_olr.as_ref(),
+            )
+            .is_err()
+            || answer.validate_for_correlation().is_err()
+        {
+            return Err(SwmDiameterEapCorrelationError::ApplicationMismatch);
+        }
+    }
     Ok(())
 }
 

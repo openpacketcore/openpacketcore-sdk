@@ -122,8 +122,10 @@ charging decisions, watchdog policy, or a carrier-ready EPC/ePDG product claim.
   originated struct literals. Rebuilding a parsed typed endpoint message moves retained
   extensions to the trailing wildcard and canonicalizes framing, so an exact
   relay or proxy must continue forwarding the raw `Message` bytes instead.
-  Typed handling for M-set routing AVPs such as `Proxy-Info` and `Route-Record`
-  is outside these optional-extension collections.
+  M-set routing AVPs are modeled separately: DER retains ordered
+  `Proxy-Info` and `Route-Record`, while DEA retains ordered `Proxy-Info` and
+  forbids `Route-Record` reflection. Generic E-bit answers use the strict
+  response/correlation boundary described below.
   `SwmMip6FeatureVector::gtpv2_only()` emits the exact
   `0x0000400000000000` capability; despite the legacy AVP name, that bit is
   independent of bearer IP family and is not limited to IPv6. Meanwhile,
@@ -526,9 +528,88 @@ fn set_success_timers(answer: &mut SwmDiameterEapAnswer) {
 }
 ```
 
-Diagnostics expose only timer presence. Redirect result and target handling is
-not included in this slice and remains part of the broader SWm authorization
-context work.
+Diagnostics expose only timer presence.
+
+### SWm Diameter-EAP generic errors, routing, and redirect
+
+`parse_swm_diameter_eap_response` selects the response grammar from the
+Diameter E bit. E-clear responses use the ordinary TS 29.273 DEA model. E-set
+responses use RFC 6733 section 7.2's generic grammar and therefore do not
+require application-only `Auth-Application-Id`, `Auth-Request-Type`, or EAP
+AVPs. The generic parser requires base `Result-Code`, accepts the RFC-permitted
+3xxx and permanent/unrecognized fallback families, and keeps an accompanying
+`Experimental-Result` distinct. The numeric value 3006 has redirect semantics
+only when carried as the base `Result-Code` with E set.
+
+Inbound redirect targets are sealed until the answer has been correlated with
+the retained DER. A live transport supplies a process-unique
+`SwmDiameterConnectionToken`; correlation then checks that connection
+generation, both Diameter identifiers, P, the exact ordered `Proxy-Info`
+chain, and `Session-Id` when the generic answer carries it. An ordinary answer
+also checks the configured logical-Origin policy and application fields. A
+generic error may be originated by an intermediary, so it skips only that
+logical-Origin check. Never make a redirect decision from the answer-local
+parser:
+
+```rust
+use opc_proto_diameter::apps::swm::{
+    parse_swm_diameter_eap_response_envelope_from_connection,
+    SwmDiameterConnectionToken, SwmDiameterEapRequestEnvelope,
+};
+use opc_proto_diameter::Message;
+use opc_protocol::DecodeContext;
+
+fn correlate_response<'a>(
+    pending: SwmDiameterEapRequestEnvelope,
+    message: &Message<'a>,
+    connection: SwmDiameterConnectionToken,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let received = parse_swm_diameter_eap_response_envelope_from_connection(
+        message,
+        connection,
+        DecodeContext::conservative(),
+    )?;
+    let correlated = pending.correlate_response(received)?;
+    if let Some(redirect) = correlated.redirect() {
+        // Target selection, connection establishment, cache storage, and
+        // expiry are product policy. Do not log the target values.
+        let _ordered_targets = redirect.hosts();
+        let _cache_scope = redirect.effective_usage();
+        let _cache_seconds = redirect.max_cache_time();
+    }
+    Ok(())
+}
+```
+
+`SwmDiameterRedirect` validates one or more DiameterURI targets and preserves
+their wire order, but RFC 6733 does not define that order as target preference.
+An absent `Redirect-Host-Usage` and explicit `DONT_CACHE` remain distinct;
+both have an effective no-cache policy. `Redirect-Max-Cache-Time` is required
+for a nonzero/cacheable usage and is preserved, but ignored for routing-cache
+purposes, when usage is absent or `DONT_CACHE`. The type exposes the RFC cache
+route precedence separately from the numeric enumerated order.
+
+The public generic origination surface is intentionally limited to exact
+`DIAMETER_REDIRECT_INDICATION` through
+`SwmDiameterEapGenericErrorAnswer::new_redirect` and the request-bound
+`build_swm_diameter_eap_response_for`. It copies Session-Id, P, both
+identifiers, and exact Proxy-Info, clears R/T, sets E, and never reflects a DER
+Route-Record. Other originated protocol or application failures must use
+`error_answer::build_diameter_error_answer`, whose bound failure token proves
+the request and any required Failed-AVP. A parsed generic response cannot be
+re-encoded through the redirect builder; exact retransmission uses a cached
+`OwnedMessage`.
+
+Both routing roles share a 128-AVP retained count and the decode context's
+message-byte bound. Proxy-Info requires exactly one nonempty ASCII Proxy-Host
+and one opaque Proxy-State, applies the configured unknown-child policy, and
+caps grouped children at 128. DER permits ordered repeated Route-Record;
+every DEA profile forbids it. Ordinary E-clear DEA may receive repeated opaque
+Failed-AVP for value-free metadata, but the mutable typed answer cannot
+re-originate that evidence. Generic receive parsing enforces Failed-AVP for the
+RFC result codes where its presence is a MUST while retaining the inner value
+opaque, because RFC 6733 permits synthesized and malformed offending AVP
+representations.
 
 ### SWm Session-Termination
 

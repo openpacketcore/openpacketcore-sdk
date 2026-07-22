@@ -5055,11 +5055,35 @@ pub(super) fn validate_proxy_info(
     validate_base_definition(avp, offset)?;
     let mut proxy_host = None;
     let mut proxy_state = None;
+    let mut child_count = 0_usize;
     builder_helpers::for_each_avp(avp.value, ctx, value_offset, 1, |child_offset, child| {
+        if child
+            .header
+            .vendor_id
+            .is_some_and(|vendor_id| vendor_id.get() == 0)
+        {
+            return Err(DecodeError::new(
+                DecodeErrorCode::Structural {
+                    reason: "Proxy-Info child Vendor-Id field must not contain zero",
+                },
+                child_offset,
+            )
+            .with_spec_ref(SpecRef::new("ietf", "RFC6733", "4.1.1")));
+        }
+        child_count = child_count.checked_add(1).ok_or_else(|| {
+            DecodeError::new(DecodeErrorCode::LengthOverflow, child_offset)
+                .with_spec_ref(SpecRef::new("ietf", "RFC6733", "6.7.2"))
+        })?;
+        if child_count > MAX_ADDITIONAL_AVPS {
+            return Err(
+                DecodeError::new(DecodeErrorCode::IeCountExceeded, child_offset)
+                    .with_spec_ref(SpecRef::new("ietf", "RFC6733", "6.7.2")),
+            );
+        }
         let child_value_offset =
             builder_helpers::offset_add(child_offset, child.header.header_len(), "6.7.2")?;
         if child.header.key() == AvpKey::ietf(base::AVP_PROXY_HOST) {
-            let _ = parse_core_string(&child, ctx, child_offset, child_value_offset, "6.7.3")?;
+            parse_core_string(&child, ctx, child_offset, child_value_offset, "6.7.3")?;
             builder_helpers::set_once(&mut proxy_host, (), child_offset, "6.7.2")?;
         } else if child.header.key() == AvpKey::ietf(base::AVP_PROXY_STATE) {
             validate_base_definition(&child, child_offset)?;

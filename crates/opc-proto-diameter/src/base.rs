@@ -116,6 +116,8 @@ pub const RESULT_CODE_DIAMETER_UNKNOWN_SESSION_ID: u32 = 5002;
 pub const RESULT_CODE_DIAMETER_INVALID_AVP_VALUE: u32 = 5004;
 /// Missing mandatory AVP permanent-failure result code.
 pub const RESULT_CODE_DIAMETER_MISSING_AVP: u32 = 5005;
+/// Contradictory AVP set permanent-failure result code.
+pub const RESULT_CODE_DIAMETER_CONTRADICTING_AVPS: u32 = 5007;
 /// Forbidden AVP permanent-failure result code.
 pub const RESULT_CODE_DIAMETER_AVP_NOT_ALLOWED: u32 = 5008;
 /// Excess AVP occurrence permanent-failure result code.
@@ -130,6 +132,8 @@ pub const RESULT_CODE_DIAMETER_UNABLE_TO_COMPLY: u32 = 5012;
 pub const RESULT_CODE_DIAMETER_INVALID_BIT_IN_HEADER: u32 = 5013;
 /// Invalid AVP length permanent-failure result code.
 pub const RESULT_CODE_DIAMETER_INVALID_AVP_LENGTH: u32 = 5014;
+/// Invalid AVP flag-bit combination permanent-failure result code.
+pub const RESULT_CODE_DIAMETER_INVALID_AVP_BIT_COMBO: u32 = 5016;
 /// Inband-Security-Id value for no in-band security.
 pub const INBAND_SECURITY_ID_NO_INBAND_SECURITY: u32 = 0;
 /// Inband-Security-Id value for TLS.
