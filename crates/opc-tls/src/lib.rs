@@ -451,12 +451,20 @@ impl AuthenticatedClientConfig {
     /// Use the returned fixed config for TLS and call
     /// [`TlsClientHandshake::admit`] only after application negotiation.
     pub fn begin_handshake(&self) -> Result<TlsClientHandshake, TlsMaterialError> {
+        self.begin_handshake_with_provider(Arc::clone(self.config.crypto_provider()))
+    }
+
+    fn begin_handshake_with_provider(
+        &self,
+        provider: Arc<rustls::crypto::CryptoProvider>,
+    ) -> Result<TlsClientHandshake, TlsMaterialError> {
         let snapshot = self.controller.snapshot()?;
         let config = fixed_client_config(
             &snapshot,
             self.policy.clone(),
             self.compat_mode,
             self.allow_unconstrained_peer_policy,
+            provider,
         )?;
         Ok(TlsClientHandshake::new(
             Arc::new(config),
@@ -472,11 +480,48 @@ impl AuthenticatedClientConfig {
     /// immutable attempt and does not publish or retain partial state.
     pub async fn run_handshake<T, E, F, Fut>(
         &self,
+        operation: F,
+    ) -> Result<TlsHandshakeOutcome<T>, TlsHandshakeRunError<E>>
+    where
+        F: FnMut(TlsClientHandshake) -> Fut,
+        Fut: std::future::Future<Output = Result<T, E>>,
+    {
+        self.run_handshake_using(Self::begin_handshake, operation)
+            .await
+    }
+
+    /// Run TLS plus application negotiation while advertising only the
+    /// requested subset of cipher suites already supported by this config's
+    /// crypto provider. The filtered provider is installed before rustls builds
+    /// each immutable material-snapshot config, so excluded suites never cross
+    /// the handshake boundary.
+    pub async fn run_handshake_with_cipher_suites<T, E, F, Fut>(
+        &self,
+        allowed: &[rustls::CipherSuite],
+        operation: F,
+    ) -> Result<TlsHandshakeOutcome<T>, TlsHandshakeRunError<E>>
+    where
+        F: FnMut(TlsClientHandshake) -> Fut,
+        Fut: std::future::Future<Output = Result<T, E>>,
+    {
+        let provider = filtered_crypto_provider(self.config.crypto_provider(), allowed)
+            .map_err(TlsHandshakeRunError::Material)?;
+        self.run_handshake_using(
+            move |config| config.begin_handshake_with_provider(Arc::clone(&provider)),
+            operation,
+        )
+        .await
+    }
+
+    async fn run_handshake_using<T, E, F, Fut, B>(
+        &self,
+        mut begin: B,
         mut operation: F,
     ) -> Result<TlsHandshakeOutcome<T>, TlsHandshakeRunError<E>>
     where
         F: FnMut(TlsClientHandshake) -> Fut,
         Fut: std::future::Future<Output = Result<T, E>>,
+        B: FnMut(&Self) -> Result<TlsClientHandshake, TlsMaterialError>,
     {
         let _permit = self
             .controller
@@ -484,9 +529,7 @@ impl AuthenticatedClientConfig {
             .await
             .map_err(TlsHandshakeRunError::Material)?;
         for retry in 0..=MAX_TLS_HANDSHAKE_EPOCH_RETRIES {
-            let handshake = self
-                .begin_handshake()
-                .map_err(TlsHandshakeRunError::Material)?;
+            let handshake = begin(self).map_err(TlsHandshakeRunError::Material)?;
             let value = match operation(handshake.clone()).await {
                 Ok(value) => value,
                 Err(error) => match handshake.admit() {
@@ -564,12 +607,20 @@ impl AuthenticatedServerConfig {
     /// Use the returned fixed config for TLS and call
     /// [`TlsServerHandshake::admit`] only after application negotiation.
     pub fn begin_handshake(&self) -> Result<TlsServerHandshake, TlsMaterialError> {
+        self.begin_handshake_with_provider(Arc::clone(self.config.crypto_provider()))
+    }
+
+    fn begin_handshake_with_provider(
+        &self,
+        provider: Arc<rustls::crypto::CryptoProvider>,
+    ) -> Result<TlsServerHandshake, TlsMaterialError> {
         let snapshot = self.controller.snapshot()?;
         let config = fixed_server_config(
             &snapshot,
             self.policy.clone(),
             self.compat_mode,
             self.allow_unconstrained_peer_policy,
+            provider,
         )?;
         Ok(TlsServerHandshake::new(
             Arc::new(config),
@@ -581,11 +632,47 @@ impl AuthenticatedServerConfig {
     /// Run TLS plus application negotiation with bounded epoch-change retries.
     pub async fn run_handshake<T, E, F, Fut>(
         &self,
+        operation: F,
+    ) -> Result<TlsHandshakeOutcome<T>, TlsHandshakeRunError<E>>
+    where
+        F: FnMut(TlsServerHandshake) -> Fut,
+        Fut: std::future::Future<Output = Result<T, E>>,
+    {
+        self.run_handshake_using(Self::begin_handshake, operation)
+            .await
+    }
+
+    /// Server-side counterpart to
+    /// [`AuthenticatedClientConfig::run_handshake_with_cipher_suites`].
+    /// Excluded suites are removed from the provider used for rustls selection,
+    /// rather than rejected only after a completed handshake.
+    pub async fn run_handshake_with_cipher_suites<T, E, F, Fut>(
+        &self,
+        allowed: &[rustls::CipherSuite],
+        operation: F,
+    ) -> Result<TlsHandshakeOutcome<T>, TlsHandshakeRunError<E>>
+    where
+        F: FnMut(TlsServerHandshake) -> Fut,
+        Fut: std::future::Future<Output = Result<T, E>>,
+    {
+        let provider = filtered_crypto_provider(self.config.crypto_provider(), allowed)
+            .map_err(TlsHandshakeRunError::Material)?;
+        self.run_handshake_using(
+            move |config| config.begin_handshake_with_provider(Arc::clone(&provider)),
+            operation,
+        )
+        .await
+    }
+
+    async fn run_handshake_using<T, E, F, Fut, B>(
+        &self,
+        mut begin: B,
         mut operation: F,
     ) -> Result<TlsHandshakeOutcome<T>, TlsHandshakeRunError<E>>
     where
         F: FnMut(TlsServerHandshake) -> Fut,
         Fut: std::future::Future<Output = Result<T, E>>,
+        B: FnMut(&Self) -> Result<TlsServerHandshake, TlsMaterialError>,
     {
         let _permit = self
             .controller
@@ -593,9 +680,7 @@ impl AuthenticatedServerConfig {
             .await
             .map_err(TlsHandshakeRunError::Material)?;
         for retry in 0..=MAX_TLS_HANDSHAKE_EPOCH_RETRIES {
-            let handshake = self
-                .begin_handshake()
-                .map_err(TlsHandshakeRunError::Material)?;
+            let handshake = begin(self).map_err(TlsHandshakeRunError::Material)?;
             let value = match operation(handshake.clone()).await {
                 Ok(value) => value,
                 Err(error) => match handshake.admit() {
@@ -786,6 +871,7 @@ pub struct TlsConfigBuilder {
     policy: PeerPolicy,
     compat_mode: bool,
     allow_unconstrained_peer_policy: bool,
+    crypto_provider: Option<Arc<rustls::crypto::CryptoProvider>>,
 }
 
 impl TlsConfigBuilder {
@@ -797,6 +883,7 @@ impl TlsConfigBuilder {
             policy: PeerPolicy::default(),
             compat_mode: false,
             allow_unconstrained_peer_policy: false,
+            crypto_provider: None,
         }
     }
 
@@ -809,6 +896,7 @@ impl TlsConfigBuilder {
             policy: PeerPolicy::default(),
             compat_mode: false,
             allow_unconstrained_peer_policy: false,
+            crypto_provider: None,
         }
     }
 
@@ -839,6 +927,11 @@ impl TlsConfigBuilder {
         self
     }
 
+    fn with_crypto_provider(mut self, provider: Arc<rustls::crypto::CryptoProvider>) -> Self {
+        self.crypto_provider = Some(provider);
+        self
+    }
+
     pub fn build_client_config(self) -> Result<rustls::ClientConfig, rustls::Error> {
         self.validate_raw_config_material_settings()?;
         self.build_reloadable_client_config()
@@ -854,7 +947,10 @@ impl TlsConfigBuilder {
                 .ok();
         });
 
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let provider = self
+            .crypto_provider
+            .clone()
+            .unwrap_or_else(|| Arc::new(rustls::crypto::ring::default_provider()));
         let verifier = Arc::new(SpiffeServerCertVerifier {
             state_rx: self.state_rx.clone(),
             policy: self.policy.clone(),
@@ -919,7 +1015,10 @@ impl TlsConfigBuilder {
                 .ok();
         });
 
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let provider = self
+            .crypto_provider
+            .clone()
+            .unwrap_or_else(|| Arc::new(rustls::crypto::ring::default_provider()));
         let verifier = Arc::new(SpiffeClientCertVerifier {
             state_rx: self.state_rx.clone(),
             policy: self.policy.clone(),
@@ -996,16 +1095,35 @@ impl TlsConfigBuilder {
     }
 }
 
+fn filtered_crypto_provider(
+    provider: &Arc<rustls::crypto::CryptoProvider>,
+    allowed: &[rustls::CipherSuite],
+) -> Result<Arc<rustls::crypto::CryptoProvider>, TlsMaterialError> {
+    if allowed.is_empty() {
+        return Err(TlsMaterialError::Configuration);
+    }
+    let mut provider = provider.as_ref().clone();
+    provider
+        .cipher_suites
+        .retain(|suite| allowed.contains(&suite.suite()));
+    if provider.cipher_suites.is_empty() {
+        return Err(TlsMaterialError::Configuration);
+    }
+    Ok(Arc::new(provider))
+}
+
 fn fixed_client_config(
     snapshot: &material::TlsMaterialSnapshot,
     policy: PeerPolicy,
     compat_mode: bool,
     allow_unconstrained_peer_policy: bool,
+    provider: Arc<rustls::crypto::CryptoProvider>,
 ) -> Result<rustls::ClientConfig, TlsMaterialError> {
     let (_state_tx, state_rx) = watch::channel(Some(snapshot.state.as_ref().clone()));
     let mut builder = TlsConfigBuilder::new(state_rx)
         .with_policy(policy)
-        .with_compat_mode(compat_mode);
+        .with_compat_mode(compat_mode)
+        .with_crypto_provider(provider);
     if allow_unconstrained_peer_policy {
         builder = builder.allow_any_trusted_peer();
     }
@@ -1019,11 +1137,13 @@ fn fixed_server_config(
     policy: PeerPolicy,
     compat_mode: bool,
     allow_unconstrained_peer_policy: bool,
+    provider: Arc<rustls::crypto::CryptoProvider>,
 ) -> Result<rustls::ServerConfig, TlsMaterialError> {
     let (_state_tx, state_rx) = watch::channel(Some(snapshot.state.as_ref().clone()));
     let mut builder = TlsConfigBuilder::new(state_rx)
         .with_policy(policy)
-        .with_compat_mode(compat_mode);
+        .with_compat_mode(compat_mode)
+        .with_crypto_provider(provider);
     if allow_unconstrained_peer_policy {
         builder = builder.allow_any_trusted_peer();
     }
@@ -1068,6 +1188,32 @@ mod policy_tests {
     use opc_types::{SpiffeId, Timestamp};
     use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
     use std::io::Cursor;
+
+    #[test]
+    fn cipher_provider_filter_is_exact_and_fails_closed() {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let filtered = filtered_crypto_provider(
+            &provider,
+            &[rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256],
+        )
+        .expect("ring provider supports the requested TLS 1.3 suite");
+        assert_eq!(filtered.cipher_suites.len(), 1);
+        assert_eq!(
+            filtered.cipher_suites[0].suite(),
+            rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256
+        );
+        assert!(matches!(
+            filtered_crypto_provider(&provider, &[]),
+            Err(TlsMaterialError::Configuration)
+        ));
+        assert!(matches!(
+            filtered_crypto_provider(
+                &provider,
+                &[rustls::CipherSuite::TLS_RSA_WITH_AES_128_CBC_SHA]
+            ),
+            Err(TlsMaterialError::Configuration)
+        ));
+    }
 
     fn workload(td: &str, tenant: &str, nf: &str, inst: &str) -> WorkloadIdentity {
         WorkloadIdentity {

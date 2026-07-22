@@ -1,0 +1,31 @@
+[package]
+name = "opc-diameter-transport"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Mutually authenticated Diameter-over-TLS/TCP transport for OpenPacketCore"
+readme = "README.md"
+publish = false
+
+[dependencies]
+bytes = { workspace = true }
+opc-proto-diameter = { path = "../opc-proto-diameter", version = "0.2.0", features = ["peer"] }
+opc-protocol = { path = "../opc-protocol", version = "0.2.0" }
+opc-tls = { path = "../opc-tls", version = "0.2.0" }
+opc-types = { path = "../opc-types", version = "0.2.0" }
+rustls-pki-types = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "net", "rt", "sync", "time"] }
+tokio-rustls = { workspace = true }
+
+[dev-dependencies]
+opc-identity = { path = "../opc-identity", version = "0.2.0" }
+rcgen = { workspace = true }
+time = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "test-util", "time"] }
+
+[lints]
+workspace = true

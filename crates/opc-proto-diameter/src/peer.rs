@@ -155,6 +155,14 @@ pub struct PeerIdentity {
     pub origin_realm: String,
 }
 
+/// Return whether one DiameterIdentity value satisfies the SDK's shared wire
+/// contract: nonempty ASCII. This intentionally does not impose a narrower
+/// punctuation or DNS-label grammar.
+#[must_use]
+pub fn is_valid_diameter_identity(value: &str) -> bool {
+    !value.is_empty() && value.is_ascii()
+}
+
 impl PeerIdentity {
     /// Create a peer identity from Origin-Host and Origin-Realm values.
     pub fn new(origin_host: impl Into<String>, origin_realm: impl Into<String>) -> Self {
@@ -164,16 +172,25 @@ impl PeerIdentity {
         }
     }
 
+    /// Compare the RFC 6733 DiameterIdentity semantics of both the FQDN-like
+    /// Origin-Host and realm. Wire spelling remains structurally available via
+    /// the derived `Eq`/`Hash`, while authorization and peer binding must use
+    /// this ASCII case-insensitive comparison.
+    pub fn semantically_eq(&self, other: &Self) -> bool {
+        self.origin_host.eq_ignore_ascii_case(&other.origin_host)
+            && self.origin_realm.eq_ignore_ascii_case(&other.origin_realm)
+    }
+
     fn validate_for_encode(&self, section: &'static str) -> Result<(), EncodeError> {
-        if self.origin_host.is_empty() {
+        if !is_valid_diameter_identity(&self.origin_host) {
             return Err(encode_structural_error(
-                "diameter peer Origin-Host must not be empty",
+                "diameter peer Origin-Host must be nonempty ASCII",
                 section,
             ));
         }
-        if self.origin_realm.is_empty() {
+        if !is_valid_diameter_identity(&self.origin_realm) {
             return Err(encode_structural_error(
-                "diameter peer Origin-Realm must not be empty",
+                "diameter peer Origin-Realm must be nonempty ASCII",
                 section,
             ));
         }
@@ -2269,6 +2286,12 @@ impl PeerSession {
     #[must_use]
     pub const fn policy(&self) -> &PeerSessionPolicy {
         &self.policy
+    }
+
+    /// Return the exact local capabilities used by this session.
+    #[must_use]
+    pub const fn local_capabilities(&self) -> &PeerCapabilities {
+        &self.local_capabilities
     }
 
     /// Return the session transport-protection policy.
@@ -5331,10 +5354,10 @@ fn collect_procedure_avps_with_provenance(
         }
         let code = avp.header.code;
         if code == AVP_ORIGIN_HOST {
-            let value = parse_string_value(avp.value, value_offset, "6.3")?;
+            let value = parse_diameter_identity_value(avp.value, value_offset, "6.3")?;
             set_once(&mut parsed.origin_host, value, offset, section)
         } else if code == AVP_ORIGIN_REALM {
-            let value = parse_string_value(avp.value, value_offset, "6.4")?;
+            let value = parse_diameter_identity_value(avp.value, value_offset, "6.4")?;
             set_once(&mut parsed.origin_realm, value, offset, section)
         } else if code == AVP_RESULT_CODE {
             let value = parse_u32_value(avp.value, value_offset, "7.1")?;
@@ -5591,6 +5614,22 @@ fn parse_string_value(
     if parsed.is_empty() {
         return Err(decode_structural_error(
             "diameter UTF-8 or DiameterIdentity AVP must not be empty",
+            offset,
+            section,
+        ));
+    }
+    Ok(parsed)
+}
+
+fn parse_diameter_identity_value(
+    value: &[u8],
+    offset: usize,
+    section: &'static str,
+) -> Result<String, DecodeError> {
+    let parsed = parse_string_value(value, offset, section)?;
+    if !is_valid_diameter_identity(&parsed) {
+        return Err(decode_structural_error(
+            "DiameterIdentity AVP must contain nonempty ASCII",
             offset,
             section,
         ));
@@ -5953,6 +5992,17 @@ mod tests {
     use crate::{AvpFlags, AVP_HEADER_LEN};
     use bytes::Bytes;
     use opc_protocol::{DecodeErrorCode, Encode, ValidationLevel};
+
+    #[test]
+    fn peer_identity_semantics_are_ascii_case_insensitive_without_changing_structural_eq() {
+        let canonical = PeerIdentity::new("aaa.example.net", "example.net");
+        let case_variant = PeerIdentity::new("AAA.Example.NET", "EXAMPLE.Net");
+        let other_host = PeerIdentity::new("other.example.net", "example.net");
+
+        assert_ne!(canonical, case_variant);
+        assert!(canonical.semantically_eq(&case_variant));
+        assert!(!canonical.semantically_eq(&other_host));
+    }
 
     fn sample_capabilities() -> PeerCapabilities {
         let mut capabilities = PeerCapabilities::new(
