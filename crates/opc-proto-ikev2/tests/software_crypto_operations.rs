@@ -92,6 +92,33 @@ fn software_prf_matches_rfc4868_prf_one_known_answers_for_all_three_widths() {
 }
 
 #[test]
+fn software_sha1_prf_and_prf_plus_match_independent_vectors() {
+    // RFC 2202 section 3 test case 1.
+    let key = [0x0b; 20];
+    let prf = OPERATIONS
+        .prf(IkePrfAlgorithm::HmacSha1, &key, b"Hi There")
+        .expect("RFC 2202 HMAC-SHA1 computes");
+    assert_eq!(
+        prf.as_slice(),
+        decode_hex("b617318655057264e28bc0b6fb378c8ef146be00").as_slice()
+    );
+
+    // Independently reproduced RFC 7296 section 2.13 PRF+ construction.
+    let expanded = OPERATIONS
+        .prf_plus(IkePrfAlgorithm::HmacSha1, &key, b"Hi There", 60)
+        .expect("HMAC-SHA1 PRF+ computes");
+    assert_eq!(
+        expanded.as_slice(),
+        decode_hex(concat!(
+            "29e6e7119ecc3640f21fd6bd787a4a512a309f87",
+            "0712afe9b04b22bc233fa36f1766a6750ea37cb0",
+            "74047bec7a361429df72abf51101d23b75b4d2ca"
+        ))
+        .as_slice()
+    );
+}
+
+#[test]
 fn software_prf_hashes_an_oversized_key_first_per_rfc4868_prf_five() {
     let key = [0xaa; 131];
     let output = OPERATIONS
@@ -275,6 +302,29 @@ fn software_integrity_checksums_match_rfc4868_truncated_known_answers() {
             .verify_integrity_checksum(algorithm, &key, b"Hi There", expected_icv)
             .expect("matching checksum verifies");
     }
+}
+
+#[test]
+fn software_hmac_sha1_96_matches_rfc2202_and_rfc2404() {
+    let key = [0x0c; 20];
+    let expected = decode_hex("4c1a03424b55e07fe7f27be1");
+    let checksum = OPERATIONS
+        .compute_integrity_checksum(
+            IkeIntegrityAlgorithm::HmacSha1_96,
+            &key,
+            b"Test With ",
+            b"Truncation",
+        )
+        .expect("RFC 2202 truncated HMAC-SHA1 computes");
+    assert_eq!(checksum.as_slice(), expected.as_slice());
+    OPERATIONS
+        .verify_integrity_checksum(
+            IkeIntegrityAlgorithm::HmacSha1_96,
+            &key,
+            b"Test With Truncation",
+            &checksum,
+        )
+        .expect("RFC 2404 96-bit ICV verifies");
 }
 
 #[test]
@@ -629,6 +679,8 @@ fn software_aead_open_rejects_tampering_and_bad_lengths_with_stable_codes() {
 fn software_dh_round_trips_through_opaque_handles_and_matches_the_existing_path_for_all_groups() {
     support::ensure_ike_crypto();
     let cases = [
+        (IkeDhGroup::Modp768, Ikev2DhGroup::Modp768),
+        (IkeDhGroup::Modp1024, Ikev2DhGroup::Modp1024),
         (IkeDhGroup::Modp2048, Ikev2DhGroup::Modp2048),
         (IkeDhGroup::Ecp256, Ikev2DhGroup::Ecp256),
         (IkeDhGroup::Ecp384, Ikev2DhGroup::Ecp384),
@@ -666,8 +718,8 @@ fn software_dh_rejects_malformed_peer_values_and_keeps_handle_debug_redaction_sa
     let error = handle
         .agree(&short)
         .expect_err("short peer value must fail closed");
-    assert_eq!(error.code(), CryptoOperationErrorCode::InvalidPeerPublicKey);
-    assert_eq!(error.as_str(), "crypto_op_invalid_peer_public_key");
+    assert_eq!(error.code(), CryptoOperationErrorCode::InvalidInputLength);
+    assert_eq!(error.as_str(), "crypto_op_invalid_input_length");
 
     let zeros = vec![0_u8; IkeDhGroup::Ecp256.public_value_len()];
     let error = handle

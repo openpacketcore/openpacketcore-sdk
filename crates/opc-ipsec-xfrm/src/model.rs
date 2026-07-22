@@ -226,6 +226,10 @@ pub const XFRM_ENCR_NULL: &str = "ecb(cipher_null)";
 /// hand-write hyphenated forms.
 pub const XFRM_AEAD_RFC4106_GCM_AES: &str = "rfc4106(gcm(aes))";
 
+/// The exact Linux kernel XFRM name for HMAC-SHA-1 authentication; do not
+/// hand-write hyphenated forms.
+pub const XFRM_AUTH_HMAC_SHA1: &str = "hmac(sha1)";
+
 /// The exact Linux kernel XFRM name for HMAC-SHA-256 authentication; do not
 /// hand-write hyphenated forms.
 pub const XFRM_AUTH_HMAC_SHA256: &str = "hmac(sha256)";
@@ -280,6 +284,11 @@ impl AuthAlgorithm {
             name: name.into(),
             truncation_len_bits,
         }
+    }
+
+    /// Create the Linux XFRM HMAC-SHA-1 authentication algorithm.
+    pub fn hmac_sha1(truncation_len_bits: u32) -> Self {
+        Self::new(XFRM_AUTH_HMAC_SHA1, truncation_len_bits)
     }
 
     /// Create the Linux XFRM HMAC-SHA-256 authentication algorithm.
@@ -1279,12 +1288,17 @@ mod tests {
         assert_eq!(XFRM_ENCR_CBC_AES, "cbc(aes)");
         assert_eq!(XFRM_ENCR_NULL, "ecb(cipher_null)");
         assert_eq!(XFRM_AEAD_RFC4106_GCM_AES, "rfc4106(gcm(aes))");
+        assert_eq!(XFRM_AUTH_HMAC_SHA1, "hmac(sha1)");
         assert_eq!(XFRM_AUTH_HMAC_SHA256, "hmac(sha256)");
         assert_eq!(XFRM_AUTH_HMAC_SHA384, "hmac(sha384)");
         assert_eq!(XFRM_AUTH_HMAC_SHA512, "hmac(sha512)");
 
         assert_eq!(Algorithm::cbc_aes().name, XFRM_ENCR_CBC_AES);
         assert_eq!(Algorithm::null().name, XFRM_ENCR_NULL);
+        assert_eq!(
+            AuthAlgorithm::hmac_sha1(96),
+            AuthAlgorithm::new(XFRM_AUTH_HMAC_SHA1, 96)
+        );
         assert_eq!(
             AuthAlgorithm::hmac_sha256(128),
             AuthAlgorithm::new(XFRM_AUTH_HMAC_SHA256, 128)

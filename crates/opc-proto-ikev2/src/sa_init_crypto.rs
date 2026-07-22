@@ -14,7 +14,7 @@ use std::{error::Error, fmt};
 
 use crypto_bigint::{
     modular::{FixedMontyForm, FixedMontyParams},
-    Odd, Random, U2048,
+    Odd, Random, U1024, U2048, U768,
 };
 use opc_crypto_provider::{CryptoOperationErrorCode, IkeDhKeyPair};
 use p256::{
@@ -24,13 +24,14 @@ use p256::{
 };
 use p384::{ecdh::EphemeralSecret as P384EphemeralSecret, PublicKey as P384PublicKey};
 use p521::{ecdh::EphemeralSecret as P521EphemeralSecret, PublicKey as P521PublicKey};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
     crypto_module::{
         execute_dh_agree, execute_dh_generate, execute_prf, execute_prf_plus,
         Ikev2CryptoModuleError,
     },
+    hmac_sha1::hmac_sha1,
     hmac_sha2::{hmac_sha2_256, hmac_sha2_384, hmac_sha2_512},
     ike_auth::Ikev2ChildSaNegotiation,
     sa_init::{
@@ -49,12 +50,16 @@ const PROTOCOL_ID_IKE: u8 = 1;
 const ENCR_NULL: u16 = 11;
 const ENCR_AES_CBC: u16 = 12;
 const ENCR_AES_GCM_16: u16 = 20;
+const PRF_HMAC_SHA1: u16 = 2;
 const PRF_HMAC_SHA2_256: u16 = 5;
 const PRF_HMAC_SHA2_384: u16 = 6;
 const PRF_HMAC_SHA2_512: u16 = 7;
+const INTEG_HMAC_SHA1_96: u16 = 2;
 const INTEG_HMAC_SHA2_256_128: u16 = 12;
 const INTEG_HMAC_SHA2_384_192: u16 = 13;
 const INTEG_HMAC_SHA2_512_256: u16 = 14;
+const DH_MODP_768: u16 = 1;
+const DH_MODP_1024: u16 = 2;
 const DH_MODP_2048: u16 = 14;
 const DH_ECP_256: u16 = 19;
 const DH_ECP_384: u16 = 20;
@@ -69,16 +74,38 @@ const AES_256_KEY_BITS: u16 = 256;
 const AES_GCM_128_KEY_BITS: u16 = 128;
 const AES_GCM_192_KEY_BITS: u16 = 192;
 const AES_GCM_256_KEY_BITS: u16 = 256;
+const MODP_768_PUBLIC_VALUE_LEN: usize = 96;
+const MODP_1024_PUBLIC_VALUE_LEN: usize = 128;
 const MODP_2048_PUBLIC_VALUE_LEN: usize = 256;
 const ECP_256_PUBLIC_VALUE_LEN: usize = 64;
 const ECP_384_PUBLIC_VALUE_LEN: usize = 96;
 const ECP_521_PUBLIC_VALUE_LEN: usize = 132;
+const MODP_768_SHARED_SECRET_LEN: usize = 96;
+const MODP_1024_SHARED_SECRET_LEN: usize = 128;
 const MODP_2048_SHARED_SECRET_LEN: usize = 256;
 const ECP_256_SHARED_SECRET_LEN: usize = 32;
 const ECP_384_SHARED_SECRET_LEN: usize = 48;
 const ECP_521_SHARED_SECRET_LEN: usize = 66;
 const MODP_GENERATOR_TWO: u64 = 2;
 const MODP_PRIVATE_REJECTION_LIMIT: usize = 64;
+
+// RFC 2409 section 6.1, Oakley Group 1.
+const MODP_768_PRIME_HEX: &str = concat!(
+    "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1",
+    "29024E088A67CC74020BBEA63B139B22514A08798E3404DD",
+    "EF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245",
+    "E485B576625E7EC6F44C42E9A63A3620FFFFFFFFFFFFFFFF"
+);
+
+// RFC 2409 section 6.2, Oakley Group 2.
+const MODP_1024_PRIME_HEX: &str = concat!(
+    "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1",
+    "29024E088A67CC74020BBEA63B139B22514A08798E3404DD",
+    "EF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245",
+    "E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7ED",
+    "EE386BFB5A899FA5AE9F24117C4B1FE649286651ECE65381",
+    "FFFFFFFFFFFFFFFF"
+);
 
 const MODP_2048_PRIME_HEX: &str = concat!(
     "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1",
@@ -97,6 +124,16 @@ const MODP_2048_PRIME_HEX: &str = concat!(
 /// IKEv2 Diffie-Hellman groups supported by the SDK SA_INIT material helper.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Ikev2DhGroup {
+    /// 768-bit MODP group, IKEv2 Transform ID 1.
+    ///
+    /// This deprecated group is available only for caller-selected legacy
+    /// interoperability; the SDK never offers or prefers it automatically.
+    Modp768,
+    /// 1024-bit MODP group, IKEv2 Transform ID 2.
+    ///
+    /// This weak group is available only for caller-selected legacy
+    /// interoperability; the SDK never offers or prefers it automatically.
+    Modp1024,
     /// 2048-bit MODP group, IKEv2 Transform ID 14.
     Modp2048,
     /// NIST P-256 ECP group, IKEv2 Transform ID 19.
@@ -116,6 +153,8 @@ impl Ikev2DhGroup {
     /// Transform IDs.
     pub const fn from_transform_id(transform_id: u16) -> Result<Self, Ikev2SaInitCryptoError> {
         match transform_id {
+            DH_MODP_768 => Ok(Self::Modp768),
+            DH_MODP_1024 => Ok(Self::Modp1024),
             DH_MODP_2048 => Ok(Self::Modp2048),
             DH_ECP_256 => Ok(Self::Ecp256),
             DH_ECP_384 => Ok(Self::Ecp384),
@@ -127,6 +166,8 @@ impl Ikev2DhGroup {
     /// IKEv2 DH Transform ID.
     pub const fn transform_id(self) -> u16 {
         match self {
+            Self::Modp768 => DH_MODP_768,
+            Self::Modp1024 => DH_MODP_1024,
             Self::Modp2048 => DH_MODP_2048,
             Self::Ecp256 => DH_ECP_256,
             Self::Ecp384 => DH_ECP_384,
@@ -137,6 +178,8 @@ impl Ikev2DhGroup {
     /// Human-readable algorithm name safe for diagnostics.
     pub const fn name(self) -> &'static str {
         match self {
+            Self::Modp768 => "MODP-768",
+            Self::Modp1024 => "MODP-1024",
             Self::Modp2048 => "MODP-2048",
             Self::Ecp256 => "ECP-256",
             Self::Ecp384 => "ECP-384",
@@ -147,6 +190,8 @@ impl Ikev2DhGroup {
     /// Wire public value length in octets for this group.
     pub const fn public_value_len(self) -> usize {
         match self {
+            Self::Modp768 => MODP_768_PUBLIC_VALUE_LEN,
+            Self::Modp1024 => MODP_1024_PUBLIC_VALUE_LEN,
             Self::Modp2048 => MODP_2048_PUBLIC_VALUE_LEN,
             Self::Ecp256 => ECP_256_PUBLIC_VALUE_LEN,
             Self::Ecp384 => ECP_384_PUBLIC_VALUE_LEN,
@@ -160,6 +205,8 @@ impl Ikev2DhGroup {
     /// fixed-width x-coordinate representation defined for the group.
     pub const fn shared_secret_len(self) -> usize {
         match self {
+            Self::Modp768 => MODP_768_SHARED_SECRET_LEN,
+            Self::Modp1024 => MODP_1024_SHARED_SECRET_LEN,
             Self::Modp2048 => MODP_2048_SHARED_SECRET_LEN,
             Self::Ecp256 => ECP_256_SHARED_SECRET_LEN,
             Self::Ecp384 => ECP_384_SHARED_SECRET_LEN,
@@ -179,6 +226,11 @@ impl TryFrom<u16> for Ikev2DhGroup {
 /// IKEv2 PRF algorithms supported by the SDK SA_INIT material helper.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Ikev2PrfAlgorithm {
+    /// PRF_HMAC_SHA1, IKEv2 Transform ID 2.
+    ///
+    /// This algorithm is available only for an explicitly selected
+    /// compatibility profile; the SDK has no implicit proposal policy.
+    HmacSha1,
     /// PRF_HMAC_SHA2_256, IKEv2 Transform ID 5.
     HmacSha2_256,
     /// PRF_HMAC_SHA2_384, IKEv2 Transform ID 6.
@@ -196,6 +248,7 @@ impl Ikev2PrfAlgorithm {
     /// Transform IDs.
     pub const fn from_transform_id(transform_id: u16) -> Result<Self, Ikev2SaInitCryptoError> {
         match transform_id {
+            PRF_HMAC_SHA1 => Ok(Self::HmacSha1),
             PRF_HMAC_SHA2_256 => Ok(Self::HmacSha2_256),
             PRF_HMAC_SHA2_384 => Ok(Self::HmacSha2_384),
             PRF_HMAC_SHA2_512 => Ok(Self::HmacSha2_512),
@@ -206,6 +259,7 @@ impl Ikev2PrfAlgorithm {
     /// IKEv2 PRF Transform ID.
     pub const fn transform_id(self) -> u16 {
         match self {
+            Self::HmacSha1 => PRF_HMAC_SHA1,
             Self::HmacSha2_256 => PRF_HMAC_SHA2_256,
             Self::HmacSha2_384 => PRF_HMAC_SHA2_384,
             Self::HmacSha2_512 => PRF_HMAC_SHA2_512,
@@ -215,6 +269,7 @@ impl Ikev2PrfAlgorithm {
     /// PRF output length and preferred key length in octets.
     pub const fn output_len(self) -> usize {
         match self {
+            Self::HmacSha1 => 20,
             Self::HmacSha2_256 => 32,
             Self::HmacSha2_384 => 48,
             Self::HmacSha2_512 => 64,
@@ -224,6 +279,7 @@ impl Ikev2PrfAlgorithm {
     /// Human-readable algorithm name safe for diagnostics.
     pub const fn name(self) -> &'static str {
         match self {
+            Self::HmacSha1 => "HMAC-SHA1",
             Self::HmacSha2_256 => "HMAC-SHA2-256",
             Self::HmacSha2_384 => "HMAC-SHA2-384",
             Self::HmacSha2_512 => "HMAC-SHA2-512",
@@ -401,6 +457,11 @@ impl Ikev2EncryptionAlgorithm {
 /// IKEv2 integrity algorithms for encrypt-then-MAC IKE and Child SAs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Ikev2IntegrityAlgorithm {
+    /// AUTH_HMAC_SHA1_96, IKEv2 Transform ID 2.
+    ///
+    /// This algorithm is available only for an explicitly selected
+    /// compatibility profile; the SDK has no implicit proposal policy.
+    HmacSha1_96,
     /// AUTH_HMAC_SHA2_256_128, IKEv2 Transform ID 12.
     HmacSha2_256_128,
     /// AUTH_HMAC_SHA2_384_192, IKEv2 Transform ID 13.
@@ -418,6 +479,7 @@ impl Ikev2IntegrityAlgorithm {
     /// unsupported Transform IDs.
     pub const fn from_transform_id(transform_id: u16) -> Result<Self, Ikev2SaInitCryptoError> {
         match transform_id {
+            INTEG_HMAC_SHA1_96 => Ok(Self::HmacSha1_96),
             INTEG_HMAC_SHA2_256_128 => Ok(Self::HmacSha2_256_128),
             INTEG_HMAC_SHA2_384_192 => Ok(Self::HmacSha2_384_192),
             INTEG_HMAC_SHA2_512_256 => Ok(Self::HmacSha2_512_256),
@@ -428,6 +490,7 @@ impl Ikev2IntegrityAlgorithm {
     /// IKEv2 integrity Transform ID.
     pub const fn transform_id(self) -> u16 {
         match self {
+            Self::HmacSha1_96 => INTEG_HMAC_SHA1_96,
             Self::HmacSha2_256_128 => INTEG_HMAC_SHA2_256_128,
             Self::HmacSha2_384_192 => INTEG_HMAC_SHA2_384_192,
             Self::HmacSha2_512_256 => INTEG_HMAC_SHA2_512_256,
@@ -437,6 +500,7 @@ impl Ikev2IntegrityAlgorithm {
     /// Preferred integrity key length in octets.
     pub const fn key_len(self) -> usize {
         match self {
+            Self::HmacSha1_96 => 20,
             Self::HmacSha2_256_128 => 32,
             Self::HmacSha2_384_192 => 48,
             Self::HmacSha2_512_256 => 64,
@@ -446,6 +510,7 @@ impl Ikev2IntegrityAlgorithm {
     /// Truncated integrity checksum length in octets.
     pub const fn icv_len(self) -> usize {
         match self {
+            Self::HmacSha1_96 => 12,
             Self::HmacSha2_256_128 => 16,
             Self::HmacSha2_384_192 => 24,
             Self::HmacSha2_512_256 => 32,
@@ -460,6 +525,7 @@ impl Ikev2IntegrityAlgorithm {
     /// Exact Linux kernel XFRM algorithm name safe to copy into auth requests.
     pub const fn xfrm_name(self) -> &'static str {
         match self {
+            Self::HmacSha1_96 => "hmac(sha1)",
             Self::HmacSha2_256_128 => "hmac(sha256)",
             Self::HmacSha2_384_192 => "hmac(sha384)",
             Self::HmacSha2_512_256 => "hmac(sha512)",
@@ -469,6 +535,7 @@ impl Ikev2IntegrityAlgorithm {
     /// Human-readable algorithm name safe for diagnostics.
     pub const fn name(self) -> &'static str {
         match self {
+            Self::HmacSha1_96 => "HMAC-SHA1-96",
             Self::HmacSha2_256_128 => "HMAC-SHA2-256-128",
             Self::HmacSha2_384_192 => "HMAC-SHA2-384-192",
             Self::HmacSha2_512_256 => "HMAC-SHA2-512-256",
@@ -1027,8 +1094,8 @@ impl Ikev2EphemeralDhKey {
     /// Returns [`Ikev2SaInitCryptoError`] when the module admission is absent
     /// or withdrawn, the group was not preflighted, or generation fails.
     pub fn generate(group: Ikev2DhGroup) -> Result<Self, Ikev2SaInitCryptoError> {
-        let (inner, public_value) =
-            execute_dh_generate(group).map_err(|error| map_dh_module_error(group, 0, error))?;
+        let (inner, public_value) = execute_dh_generate(group)
+            .map_err(|error| map_dh_generate_module_error(group, error))?;
         Ok(Self {
             group,
             public_value,
@@ -1051,19 +1118,20 @@ impl Ikev2EphemeralDhKey {
     /// # Errors
     ///
     /// Returns [`Ikev2SaInitCryptoError`] when admission or readiness was
-    /// withdrawn after generation, the peer value is invalid, or agreement
-    /// fails.
+    /// withdrawn after generation, the peer KE is malformed, the peer public
+    /// value is invalid, or agreement fails.
     pub fn agree(
         &self,
         peer_public_value: &[u8],
     ) -> Result<Zeroizing<Vec<u8>>, Ikev2SaInitCryptoError> {
+        validate_peer_public_len(self.group, peer_public_value)?;
         execute_dh_agree(
             self.group,
             self.inner.as_ref(),
             &self.public_value,
             peer_public_value,
         )
-        .map_err(|error| map_dh_module_error(self.group, peer_public_value.len(), error))
+        .map_err(|error| map_dh_agree_module_error(self.group, peer_public_value.len(), error))
     }
 }
 
@@ -1076,20 +1144,35 @@ impl fmt::Debug for Ikev2EphemeralDhKey {
     }
 }
 
-fn map_dh_module_error(
+fn map_dh_generate_module_error(
+    group: Ikev2DhGroup,
+    error: Ikev2CryptoModuleError,
+) -> Ikev2SaInitCryptoError {
+    if error.operation_code() == Some(CryptoOperationErrorCode::KeyGenerationFailed) {
+        Ikev2SaInitCryptoError::KeyGenerationFailed { group }
+    } else {
+        Ikev2SaInitCryptoError::CryptoModuleFailure { error }
+    }
+}
+
+fn map_dh_agree_module_error(
     group: Ikev2DhGroup,
     peer_public_len: usize,
     error: Ikev2CryptoModuleError,
 ) -> Ikev2SaInitCryptoError {
     match error.operation_code() {
+        Some(CryptoOperationErrorCode::InvalidInputLength) => {
+            Ikev2SaInitCryptoError::MalformedKeyExchange {
+                group,
+                expected_len: group.public_value_len(),
+                actual_len: peer_public_len,
+            }
+        }
         Some(CryptoOperationErrorCode::InvalidPeerPublicKey) => {
             Ikev2SaInitCryptoError::InvalidPeerPublicKey {
                 group,
                 actual_len: peer_public_len,
             }
-        }
-        Some(CryptoOperationErrorCode::KeyGenerationFailed) => {
-            Ikev2SaInitCryptoError::KeyGenerationFailed { group }
         }
         Some(CryptoOperationErrorCode::KeyAgreementFailed) => {
             Ikev2SaInitCryptoError::KeyAgreementFailed { group }
@@ -1105,7 +1188,9 @@ pub(crate) struct SoftwareEphemeralDhKey {
 }
 
 enum SoftwareEphemeralDhSecret {
-    Modp2048(Zeroizing<Vec<u8>>),
+    Modp768(Zeroizing<U768>),
+    Modp1024(Zeroizing<U1024>),
+    Modp2048(Zeroizing<U2048>),
     Ecp256(P256EphemeralSecret),
     Ecp384(P384EphemeralSecret),
     Ecp521(P521EphemeralSecret),
@@ -1121,6 +1206,8 @@ impl SoftwareEphemeralDhKey {
     /// sampled in range.
     pub fn generate(group: Ikev2DhGroup) -> Result<Self, Ikev2SaInitCryptoError> {
         match group {
+            Ikev2DhGroup::Modp768 => generate_modp768_key(),
+            Ikev2DhGroup::Modp1024 => generate_modp1024_key(),
             Ikev2DhGroup::Modp2048 => generate_modp2048_key(),
             Ikev2DhGroup::Ecp256 => {
                 let secret = P256EphemeralSecret::try_generate()
@@ -1173,6 +1260,12 @@ impl SoftwareEphemeralDhKey {
     ) -> Result<Zeroizing<Vec<u8>>, Ikev2SaInitCryptoError> {
         validate_peer_public_len(self.group, peer_public_value)?;
         match &self.secret {
+            SoftwareEphemeralDhSecret::Modp768(private) => {
+                agree_modp768(private, peer_public_value)
+            }
+            SoftwareEphemeralDhSecret::Modp1024(private) => {
+                agree_modp1024(private, peer_public_value)
+            }
             SoftwareEphemeralDhSecret::Modp2048(private) => {
                 agree_modp2048(private, peer_public_value)
             }
@@ -1340,6 +1433,8 @@ pub enum Ikev2SaInitCryptoErrorCode {
     UnexpectedIntegrityTransform,
     /// Peer public value was invalid for the negotiated DH group.
     InvalidPeerPublicKey,
+    /// Key Exchange data did not have the negotiated group's fixed width.
+    MalformedKeyExchange,
     /// Ephemeral key generation failed.
     KeyGenerationFailed,
     /// Key agreement failed.
@@ -1378,6 +1473,7 @@ impl Ikev2SaInitCryptoErrorCode {
                 "ike_sa_init_crypto_unexpected_integrity_transform"
             }
             Self::InvalidPeerPublicKey => "ike_sa_init_crypto_invalid_peer_public_key",
+            Self::MalformedKeyExchange => "ike_sa_init_crypto_malformed_key_exchange",
             Self::KeyGenerationFailed => "ike_sa_init_crypto_key_generation_failed",
             Self::KeyAgreementFailed => "ike_sa_init_crypto_key_agreement_failed",
             Self::InvalidNonceLength => "ike_sa_init_crypto_invalid_nonce_length",
@@ -1429,6 +1525,15 @@ pub enum Ikev2SaInitCryptoError {
         /// Negotiated DH group.
         group: Ikev2DhGroup,
         /// Supplied peer public value length.
+        actual_len: usize,
+    },
+    /// Key Exchange data did not have the negotiated group's fixed width.
+    MalformedKeyExchange {
+        /// Negotiated DH group.
+        group: Ikev2DhGroup,
+        /// Required fixed width.
+        expected_len: usize,
+        /// Supplied public-value width.
         actual_len: usize,
     },
     /// Ephemeral key generation failed.
@@ -1495,6 +1600,7 @@ impl Ikev2SaInitCryptoError {
                 Ikev2SaInitCryptoErrorCode::UnexpectedIntegrityTransform
             }
             Self::InvalidPeerPublicKey { .. } => Ikev2SaInitCryptoErrorCode::InvalidPeerPublicKey,
+            Self::MalformedKeyExchange { .. } => Ikev2SaInitCryptoErrorCode::MalformedKeyExchange,
             Self::KeyGenerationFailed { .. } => Ikev2SaInitCryptoErrorCode::KeyGenerationFailed,
             Self::KeyAgreementFailed { .. } => Ikev2SaInitCryptoErrorCode::KeyAgreementFailed,
             Self::InvalidNonceLength { .. } => Ikev2SaInitCryptoErrorCode::InvalidNonceLength,
@@ -1554,6 +1660,15 @@ impl fmt::Display for Ikev2SaInitCryptoError {
                     group.name()
                 )
             }
+            Self::MalformedKeyExchange {
+                group,
+                expected_len,
+                actual_len,
+            } => write!(
+                f,
+                "malformed key exchange for {} (expected {expected_len} bytes, got {actual_len})",
+                group.name()
+            ),
             Self::KeyGenerationFailed { group } => {
                 write!(f, "IKEv2 {} ephemeral key generation failed", group.name())
             }
@@ -1607,6 +1722,10 @@ pub fn derive_ike_sa_init_key_material(
 ) -> Result<Ikev2SaInitKeyMaterial, Ikev2SaInitCryptoError> {
     validate_nonce("initiator", initiator_nonce)?;
     validate_nonce("responder", responder_nonce)?;
+    // The admitted DH boundary validates the negotiated group and returns a
+    // fixed-width secret. Keep this lower-level KDF boundary compatible with
+    // independently supplied RFC 7296 test material while still rejecting an
+    // absent secret.
     validate_secret_input("DH shared secret", dh_shared_secret)?;
     if let Some(ppk) = ppk {
         validate_secret_input("PPK", ppk)?;
@@ -1633,9 +1752,10 @@ pub fn derive_ike_sa_init_key_material(
 /// old IKE SA's negotiated PRF derives the new `SKEYSEED` from `SK_d (old)`,
 /// while the new IKE SA's negotiated PRF expands that `SKEYSEED` into the new
 /// seven-key stream. `new_dh_shared_secret` is mandatory for an IKE-SA rekey
-/// and must already use the selected group's fixed-width representation: 256
-/// octets for MODP-2048 or 32, 48, and 66 octets for ECP-256, ECP-384, and
-/// ECP-521 respectively. MODP leading-zero padding and the ECP fixed-width
+/// and must already use the selected group's fixed-width representation: 96,
+/// 128, or 256 octets for MODP-768, MODP-1024, or MODP-2048, or 32, 48, and 66
+/// octets for ECP-256, ECP-384, and ECP-521 respectively. MODP leading-zero
+/// padding and the ECP fixed-width
 /// x-coordinate representation must be retained.
 ///
 /// RFC 8784 PPK post-processing is not repeated during rekey. Quantum
@@ -1923,6 +2043,7 @@ pub(crate) fn software_prf(
         });
     }
     match algorithm {
+        Ikev2PrfAlgorithm::HmacSha1 => Ok(hmac_sha1(key, &[data])),
         Ikev2PrfAlgorithm::HmacSha2_256 => Ok(hmac_sha2_256(key, &[data])),
         Ikev2PrfAlgorithm::HmacSha2_384 => Ok(hmac_sha2_384(key, &[data])),
         Ikev2PrfAlgorithm::HmacSha2_512 => Ok(hmac_sha2_512(key, &[data])),
@@ -2026,76 +2147,139 @@ fn transform_build_key_length_bits(
     Ok(key_bits)
 }
 
-fn generate_modp2048_key() -> Result<SoftwareEphemeralDhKey, Ikev2SaInitCryptoError> {
-    let group = Ikev2DhGroup::Modp2048;
-    let prime = modp2048_prime();
-    let max_private = prime.wrapping_sub(&U2048::from_u64(2));
+macro_rules! define_modp_group {
+    (
+        $generate:ident,
+        $agree:ident,
+        $pow:ident,
+        $prime:ident,
+        $validate:ident,
+        $uint:ty,
+        $group:path,
+        $secret_variant:ident,
+        $prime_hex:ident
+    ) => {
+        fn $generate() -> Result<SoftwareEphemeralDhKey, Ikev2SaInitCryptoError> {
+            let group = $group;
+            let prime = $prime();
+            let min_private = <$uint>::from_u64(2);
+            let max_private = prime.wrapping_sub(&<$uint>::from_u64(2));
 
-    for _ in 0..MODP_PRIVATE_REJECTION_LIMIT {
-        let candidate = U2048::try_random()
-            .map_err(|_| Ikev2SaInitCryptoError::KeyGenerationFailed { group })?;
-        if candidate < U2048::from_u64(2) || candidate > max_private {
-            continue;
+            for _ in 0..MODP_PRIVATE_REJECTION_LIMIT {
+                let candidate = Zeroizing::new(
+                    <$uint>::try_random()
+                        .map_err(|_| Ikev2SaInitCryptoError::KeyGenerationFailed { group })?,
+                );
+                if &*candidate < &min_private || &*candidate > &max_private {
+                    continue;
+                }
+                let public = $pow(&<$uint>::from_u64(MODP_GENERATOR_TWO), &candidate)
+                    .map_err(|_| Ikev2SaInitCryptoError::KeyGenerationFailed { group })?;
+                if *public <= <$uint>::ONE {
+                    continue;
+                }
+                let public_value = public.to_be_bytes().as_ref().to_vec();
+                return Ok(SoftwareEphemeralDhKey {
+                    group,
+                    public_value,
+                    secret: SoftwareEphemeralDhSecret::$secret_variant(candidate),
+                });
+            }
+
+            Err(Ikev2SaInitCryptoError::KeyGenerationFailed { group })
         }
-        let private_bytes = Zeroizing::new(candidate.to_be_bytes().as_ref().to_vec());
-        let public_value = modp2048_pow(&U2048::from_u64(MODP_GENERATOR_TWO), &candidate)?
-            .to_be_bytes()
-            .as_ref()
-            .to_vec();
-        return Ok(SoftwareEphemeralDhKey {
-            group,
-            public_value,
-            secret: SoftwareEphemeralDhSecret::Modp2048(private_bytes),
-        });
-    }
 
-    Err(Ikev2SaInitCryptoError::KeyGenerationFailed { group })
+        fn $agree(
+            private: &$uint,
+            peer_public_value: &[u8],
+        ) -> Result<Zeroizing<Vec<u8>>, Ikev2SaInitCryptoError> {
+            let group = $group;
+            let peer = <$uint>::from_be_slice(peer_public_value);
+            $validate(&peer, peer_public_value.len())?;
+            let shared = $pow(&peer, private)?;
+            if *shared <= <$uint>::ONE {
+                return Err(Ikev2SaInitCryptoError::KeyAgreementFailed { group });
+            }
+            let mut shared_bytes = shared.to_be_bytes();
+            let output = Zeroizing::new(shared_bytes.as_slice().to_vec());
+            shared_bytes.as_mut_slice().zeroize();
+            Ok(output)
+        }
+
+        fn $pow(
+            base: &$uint,
+            exponent: &$uint,
+        ) -> Result<Zeroizing<$uint>, Ikev2SaInitCryptoError> {
+            let group = $group;
+            let odd_prime = Odd::new($prime())
+                .into_option()
+                .ok_or(Ikev2SaInitCryptoError::KeyAgreementFailed { group })?;
+            let params = FixedMontyParams::new_vartime(odd_prime);
+            let base = Zeroizing::new(FixedMontyForm::new(base, &params));
+            let powered = Zeroizing::new(base.pow(exponent));
+            Ok(Zeroizing::new(powered.retrieve()))
+        }
+
+        fn $prime() -> $uint {
+            <$uint>::from_be_hex($prime_hex)
+        }
+
+        fn $validate(peer: &$uint, actual_len: usize) -> Result<(), Ikev2SaInitCryptoError> {
+            let group = $group;
+            let prime = $prime();
+            let min_public = <$uint>::from_u64(2);
+            let max_public = prime.wrapping_sub(&<$uint>::from_u64(2));
+            if peer < &min_public || peer > &max_public {
+                return Err(Ikev2SaInitCryptoError::InvalidPeerPublicKey { group, actual_len });
+            }
+
+            Ok(())
+        }
+    };
 }
 
-fn agree_modp2048(
-    private: &[u8],
-    peer_public_value: &[u8],
-) -> Result<Zeroizing<Vec<u8>>, Ikev2SaInitCryptoError> {
-    let group = Ikev2DhGroup::Modp2048;
-    let peer = U2048::from_be_slice(peer_public_value);
-    let prime = modp2048_prime();
-    let min_public = U2048::from_u64(2);
-    let max_public = prime.wrapping_sub(&U2048::from_u64(2));
-    if peer < min_public || peer > max_public {
-        return Err(Ikev2SaInitCryptoError::InvalidPeerPublicKey {
-            group,
-            actual_len: peer_public_value.len(),
-        });
-    }
-    let private = U2048::from_be_slice(private);
-    let shared = modp2048_pow(&peer, &private)?;
-    if shared <= U2048::ONE {
-        return Err(Ikev2SaInitCryptoError::KeyAgreementFailed { group });
-    }
-    Ok(Zeroizing::new(shared.to_be_bytes().as_ref().to_vec()))
-}
-
-fn modp2048_pow(base: &U2048, exponent: &U2048) -> Result<U2048, Ikev2SaInitCryptoError> {
-    let odd_prime = Odd::new(modp2048_prime()).into_option().ok_or(
-        Ikev2SaInitCryptoError::KeyAgreementFailed {
-            group: Ikev2DhGroup::Modp2048,
-        },
-    )?;
-    let params = FixedMontyParams::new_vartime(odd_prime);
-    Ok(FixedMontyForm::new(base, &params).pow(exponent).retrieve())
-}
-
-fn modp2048_prime() -> U2048 {
-    U2048::from_be_hex(MODP_2048_PRIME_HEX)
-}
+define_modp_group!(
+    generate_modp768_key,
+    agree_modp768,
+    modp768_pow,
+    modp768_prime,
+    validate_modp768_public,
+    U768,
+    Ikev2DhGroup::Modp768,
+    Modp768,
+    MODP_768_PRIME_HEX
+);
+define_modp_group!(
+    generate_modp1024_key,
+    agree_modp1024,
+    modp1024_pow,
+    modp1024_prime,
+    validate_modp1024_public,
+    U1024,
+    Ikev2DhGroup::Modp1024,
+    Modp1024,
+    MODP_1024_PRIME_HEX
+);
+define_modp_group!(
+    generate_modp2048_key,
+    agree_modp2048,
+    modp2048_pow,
+    modp2048_prime,
+    validate_modp2048_public,
+    U2048,
+    Ikev2DhGroup::Modp2048,
+    Modp2048,
+    MODP_2048_PRIME_HEX
+);
 
 fn validate_peer_public_len(
     group: Ikev2DhGroup,
     peer_public_value: &[u8],
 ) -> Result<(), Ikev2SaInitCryptoError> {
     if peer_public_value.len() != group.public_value_len() {
-        return Err(Ikev2SaInitCryptoError::InvalidPeerPublicKey {
+        return Err(Ikev2SaInitCryptoError::MalformedKeyExchange {
             group,
+            expected_len: group.public_value_len(),
             actual_len: peer_public_value.len(),
         });
     }
@@ -2112,14 +2296,23 @@ pub(crate) fn validate_dh_public_value(
         actual_len: peer_public_value.len(),
     };
     match group {
+        Ikev2DhGroup::Modp768 => {
+            validate_modp768_public(
+                &U768::from_be_slice(peer_public_value),
+                peer_public_value.len(),
+            )?;
+        }
+        Ikev2DhGroup::Modp1024 => {
+            validate_modp1024_public(
+                &U1024::from_be_slice(peer_public_value),
+                peer_public_value.len(),
+            )?;
+        }
         Ikev2DhGroup::Modp2048 => {
-            let peer = U2048::from_be_slice(peer_public_value);
-            let prime = modp2048_prime();
-            let min_public = U2048::from_u64(2);
-            let max_public = prime.wrapping_sub(&U2048::from_u64(2));
-            if peer < min_public || peer > max_public {
-                return Err(invalid());
-            }
+            validate_modp2048_public(
+                &U2048::from_be_slice(peer_public_value),
+                peer_public_value.len(),
+            )?;
         }
         Ikev2DhGroup::Ecp256 => {
             let sec1 = sec1_uncompressed_from_ike(group, peer_public_value)?;
@@ -2350,6 +2543,14 @@ mod tests {
     #[test]
     fn transform_id_conversions_are_stable() {
         assert_eq!(
+            must_ok(Ikev2DhGroup::from_transform_id(1)),
+            Ikev2DhGroup::Modp768
+        );
+        assert_eq!(
+            must_ok(Ikev2DhGroup::from_transform_id(2)),
+            Ikev2DhGroup::Modp1024
+        );
+        assert_eq!(
             must_ok(Ikev2DhGroup::from_transform_id(14)),
             Ikev2DhGroup::Modp2048
         );
@@ -2365,6 +2566,13 @@ mod tests {
             must_ok(Ikev2DhGroup::from_transform_id(21)),
             Ikev2DhGroup::Ecp521
         );
+        assert_eq!(
+            must_ok(Ikev2PrfAlgorithm::from_transform_id(2)),
+            Ikev2PrfAlgorithm::HmacSha1
+        );
+        assert_eq!(Ikev2PrfAlgorithm::HmacSha1.transform_id(), 2);
+        assert_eq!(Ikev2PrfAlgorithm::HmacSha1.output_len(), 20);
+        assert_eq!(Ikev2PrfAlgorithm::HmacSha1.name(), "HMAC-SHA1");
         assert_eq!(
             must_ok(Ikev2PrfAlgorithm::from_transform_id(5)),
             Ikev2PrfAlgorithm::HmacSha2_256
@@ -2411,6 +2619,10 @@ mod tests {
             Ikev2EncryptionAlgorithm::AesCbc256
         );
         assert_eq!(
+            must_ok(Ikev2IntegrityAlgorithm::from_transform_id(2)),
+            Ikev2IntegrityAlgorithm::HmacSha1_96
+        );
+        assert_eq!(
             must_ok(Ikev2IntegrityAlgorithm::from_transform_id(12)),
             Ikev2IntegrityAlgorithm::HmacSha2_256_128
         );
@@ -2418,6 +2630,10 @@ mod tests {
 
     #[test]
     fn integrity_xfrm_names_use_linux_kernel_templates() {
+        assert_eq!(
+            Ikev2IntegrityAlgorithm::HmacSha1_96.xfrm_name(),
+            "hmac(sha1)"
+        );
         assert_eq!(
             Ikev2IntegrityAlgorithm::HmacSha2_256_128.xfrm_name(),
             "hmac(sha256)"
@@ -2430,6 +2646,7 @@ mod tests {
             Ikev2IntegrityAlgorithm::HmacSha2_512_256.xfrm_name(),
             "hmac(sha512)"
         );
+        assert_eq!(Ikev2IntegrityAlgorithm::HmacSha1_96.icv_len(), 12);
         assert_eq!(Ikev2IntegrityAlgorithm::HmacSha2_256_128.icv_len(), 16);
         assert_eq!(Ikev2IntegrityAlgorithm::HmacSha2_384_192.icv_len(), 24);
         assert_eq!(Ikev2IntegrityAlgorithm::HmacSha2_512_256.icv_len(), 32);
@@ -2801,6 +3018,8 @@ mod tests {
     fn dh_round_trip_succeeds_for_all_supported_groups() {
         crate::test_support::ensure_ike_crypto();
         for group in [
+            Ikev2DhGroup::Modp768,
+            Ikev2DhGroup::Modp1024,
             Ikev2DhGroup::Modp2048,
             Ikev2DhGroup::Ecp256,
             Ikev2DhGroup::Ecp384,
@@ -2821,6 +3040,8 @@ mod tests {
     #[test]
     fn malformed_peer_public_values_fail_closed() {
         for group in [
+            Ikev2DhGroup::Modp768,
+            Ikev2DhGroup::Modp1024,
             Ikev2DhGroup::Modp2048,
             Ikev2DhGroup::Ecp256,
             Ikev2DhGroup::Ecp384,
@@ -2830,7 +3051,7 @@ mod tests {
             let short = vec![0u8; group.public_value_len() - 1];
             assert_eq!(
                 must_err(key.agree(&short)).as_str(),
-                "ike_sa_init_crypto_invalid_peer_public_key"
+                "ike_sa_init_crypto_malformed_key_exchange"
             );
             let zeros = vec![0u8; group.public_value_len()];
             assert_eq!(
@@ -2838,6 +3059,141 @@ mod tests {
                 "ike_sa_init_crypto_invalid_peer_public_key"
             );
         }
+    }
+
+    #[test]
+    fn modp_groups_match_independently_reproduced_fixed_exponent_vectors() {
+        use sha2::{Digest, Sha256};
+
+        // Synthetic exponents. A/B/shared outputs were reproduced with both
+        // Python bigint and Node.js bigint implementations using the RFC 2409
+        // group 1/2 and RFC 3526 group 14 primes.
+        const X: &str = "123456789abcdef0fedcba98765432100123456789abcdef0fedcba987654321";
+        const Y: &str = "fedcba98765432100123456789abcdef112233445566778899aabbccddeeff00";
+
+        macro_rules! assert_group_vector {
+            ($uint:ty, $pow:ident, $digest:literal) => {{
+                let mut x_bytes = Zeroizing::new(vec![0_u8; <$uint>::BYTES]);
+                let mut y_bytes = Zeroizing::new(vec![0_u8; <$uint>::BYTES]);
+                let x_fixture = Zeroizing::new(hex_to_bytes(X));
+                let y_fixture = Zeroizing::new(hex_to_bytes(Y));
+                let x_offset = x_bytes.len() - x_fixture.len();
+                let y_offset = y_bytes.len() - y_fixture.len();
+                x_bytes[x_offset..].copy_from_slice(&x_fixture);
+                y_bytes[y_offset..].copy_from_slice(&y_fixture);
+                let x = Zeroizing::new(<$uint>::from_be_slice(&x_bytes));
+                let y = Zeroizing::new(<$uint>::from_be_slice(&y_bytes));
+
+                let public_x = must_ok($pow(&<$uint>::from_u64(2), &x));
+                let public_y = must_ok($pow(&<$uint>::from_u64(2), &y));
+                let shared_xy = must_ok($pow(&public_y, &x));
+                let shared_yx = must_ok($pow(&public_x, &y));
+                assert_eq!(*shared_xy, *shared_yx);
+
+                let public_x_bytes = public_x.to_be_bytes();
+                let public_y_bytes = public_y.to_be_bytes();
+                let mut shared_bytes = shared_xy.to_be_bytes();
+                assert_eq!(public_x_bytes.as_slice().len(), <$uint>::BYTES);
+                assert_eq!(public_y_bytes.as_slice().len(), <$uint>::BYTES);
+                assert_eq!(shared_bytes.as_slice().len(), <$uint>::BYTES);
+
+                let mut digest = Sha256::new();
+                digest.update(public_x_bytes.as_slice());
+                digest.update(public_y_bytes.as_slice());
+                digest.update(shared_bytes.as_slice());
+                assert_eq!(digest.finalize().as_slice(), hex_to_bytes($digest));
+                shared_bytes.as_mut_slice().zeroize();
+            }};
+        }
+
+        assert_group_vector!(
+            U768,
+            modp768_pow,
+            "26248c89e98de5692fd45cd8b17ecbaad98bf9d79eb4c4c5b60a7b23e7fd372a"
+        );
+        assert_group_vector!(
+            U1024,
+            modp1024_pow,
+            "9c29d85076813b214c8ef24817c9aca994b81b3d7e18bb8bd094da29bf89e63e"
+        );
+        assert_group_vector!(
+            U2048,
+            modp2048_pow,
+            "df148e68b72c2f6baba85a92162761d75ad2964f1c4194980ace133f54e9145b"
+        );
+    }
+
+    #[test]
+    fn modp_rfc6989_range_and_malformed_ke_checks_fail_closed() {
+        macro_rules! assert_group_boundaries {
+            ($group:expr, $uint:ty, $prime:ident) => {{
+                let group = $group;
+                let prime = $prime();
+                for accepted in [
+                    <$uint>::from_u64(2),
+                    prime.wrapping_sub(&<$uint>::from_u64(2)),
+                ] {
+                    let bytes = accepted.to_be_bytes();
+                    must_ok(validate_dh_public_value(group, bytes.as_slice()));
+                }
+                for rejected in [
+                    <$uint>::ZERO,
+                    <$uint>::ONE,
+                    prime.wrapping_sub(&<$uint>::ONE),
+                    prime,
+                    prime.wrapping_add(&<$uint>::ONE),
+                ] {
+                    let bytes = rejected.to_be_bytes();
+                    assert!(matches!(
+                        must_err(validate_dh_public_value(group, bytes.as_slice())),
+                        Ikev2SaInitCryptoError::InvalidPeerPublicKey { .. }
+                    ));
+                }
+                let short = vec![0_u8; group.public_value_len() - 1];
+                let error = must_err(validate_dh_public_value(group, &short));
+                assert_eq!(
+                    error.code(),
+                    Ikev2SaInitCryptoErrorCode::MalformedKeyExchange
+                );
+                assert_eq!(error.as_str(), "ike_sa_init_crypto_malformed_key_exchange");
+            }};
+        }
+
+        // RFC 6989 sections 2.1 and 5 assign groups 1, 2, and 14 the strict
+        // range test 1 < r < p-1. The order-q test is for groups 22-24.
+        assert_group_boundaries!(Ikev2DhGroup::Modp768, U768, modp768_prime);
+        assert_group_boundaries!(Ikev2DhGroup::Modp1024, U1024, modp1024_prime);
+        assert_group_boundaries!(Ikev2DhGroup::Modp2048, U2048, modp2048_prime);
+    }
+
+    #[test]
+    fn hmac_sha1_matches_rfc2202_test_case_one() {
+        crate::test_support::ensure_ike_crypto();
+        let actual = must_ok(prf(Ikev2PrfAlgorithm::HmacSha1, &[0x0b; 20], b"Hi There"));
+        assert_eq!(
+            actual.as_slice(),
+            hex_to_bytes("b617318655057264e28bc0b6fb378c8ef146be00").as_slice()
+        );
+    }
+
+    #[test]
+    fn hmac_sha1_prf_plus_matches_independent_rfc7296_fixture() {
+        crate::test_support::ensure_ike_crypto();
+        let actual = must_ok(prf_plus(
+            Ikev2PrfAlgorithm::HmacSha1,
+            &[0x0b; 20],
+            b"Hi There",
+            60,
+        ));
+        assert_eq!(
+            actual.as_slice(),
+            hex_to_bytes(concat!(
+                "29e6e7119ecc3640f21fd6bd787a4a512a309f87",
+                "0712afe9b04b22bc233fa36f1766a6750ea37cb0",
+                "74047bec7a361429df72abf51101d23b75b4d2ca"
+            ))
+            .as_slice()
+        );
     }
 
     #[test]
@@ -3086,6 +3442,139 @@ mod tests {
                 len: 0,
             }
         );
+    }
+
+    #[test]
+    fn sha1_modp_compatibility_suites_cover_initial_restore_rekey_and_child_pfs() {
+        crate::test_support::ensure_ike_crypto();
+        let child_profile = must_ok(Ikev2ChildSaCryptoProfile::from_transform_ids(
+            PRF_HMAC_SHA1,
+            ENCR_AES_CBC,
+            Some(AES_128_KEY_BITS),
+            Some(INTEG_HMAC_SHA1_96),
+        ));
+
+        for group in [
+            Ikev2DhGroup::Modp768,
+            Ikev2DhGroup::Modp1024,
+            Ikev2DhGroup::Modp2048,
+        ] {
+            let profile = must_ok(Ikev2SaInitCryptoProfile::from_transform_ids(
+                PRF_HMAC_SHA1,
+                group.transform_id(),
+                ENCR_AES_CBC,
+                Some(AES_128_KEY_BITS),
+                Some(INTEG_HMAC_SHA1_96),
+            ));
+            let wire_order_independent = must_ok(Ikev2SaInitCryptoProfile::from_transforms(&[
+                Ikev2SaTransform {
+                    transform_type: TRANSFORM_TYPE_DH,
+                    transform_id: group.transform_id(),
+                    attributes: Vec::new(),
+                },
+                Ikev2SaTransform {
+                    transform_type: TRANSFORM_TYPE_INTEG,
+                    transform_id: INTEG_HMAC_SHA1_96,
+                    attributes: Vec::new(),
+                },
+                Ikev2SaTransform {
+                    transform_type: TRANSFORM_TYPE_ENCR,
+                    transform_id: ENCR_AES_CBC,
+                    attributes: vec![Ikev2TransformAttribute {
+                        attribute_type: TRANSFORM_ATTRIBUTE_KEY_LENGTH,
+                        value: Ikev2TransformAttributeValue::Tv(AES_128_KEY_BITS),
+                    }],
+                },
+                Ikev2SaTransform {
+                    transform_type: TRANSFORM_TYPE_PRF,
+                    transform_id: PRF_HMAC_SHA1,
+                    attributes: Vec::new(),
+                },
+            ]));
+            assert_eq!(wire_order_independent, profile);
+            let initiator = must_ok(Ikev2EphemeralDhKey::generate(group));
+            let responder = must_ok(Ikev2EphemeralDhKey::generate(group));
+            let initiator_shared = must_ok(initiator.agree(responder.public_value()));
+            let responder_shared = must_ok(responder.agree(initiator.public_value()));
+
+            assert_eq!(initiator.public_value().len(), group.public_value_len());
+            assert_eq!(responder.public_value().len(), group.public_value_len());
+            assert_eq!(initiator_shared.len(), group.shared_secret_len());
+            assert_eq!(responder_shared.len(), group.shared_secret_len());
+            assert_eq!(initiator_shared.as_slice(), responder_shared.as_slice());
+
+            let material = must_ok(derive_ike_sa_init_key_material(
+                profile,
+                [0x10; IKE_SPI_LEN],
+                [0x20; IKE_SPI_LEN],
+                &[0x30; 32],
+                &[0x40; 32],
+                &initiator_shared,
+                None,
+            ));
+            assert_eq!(material.sk_d().len(), 20);
+            assert_eq!(material.sk_ai().len(), 20);
+            assert_eq!(material.sk_ar().len(), 20);
+            assert_eq!(material.sk_ei().len(), 16);
+            assert_eq!(material.sk_er().len(), 16);
+            assert_eq!(material.sk_pi().len(), 20);
+            assert_eq!(material.sk_pr().len(), 20);
+
+            let restored = must_ok(Ikev2SaInitKeyMaterial::from_established_keys(
+                profile,
+                false,
+                material.sk_d(),
+                material.sk_ai(),
+                material.sk_ar(),
+                material.sk_ei(),
+                material.sk_er(),
+                material.sk_pi(),
+                material.sk_pr(),
+            ));
+            assert_eq!(restored.sk_d(), material.sk_d());
+            assert_eq!(restored.sk_ai(), material.sk_ai());
+            assert_eq!(restored.sk_er(), material.sk_er());
+
+            let rekeyed = must_ok(derive_ike_sa_rekey_key_material(
+                Ikev2PrfAlgorithm::HmacSha1,
+                restored.sk_d(),
+                profile,
+                [0x50; IKE_SPI_LEN],
+                [0x60; IKE_SPI_LEN],
+                &[0x70; 32],
+                &[0x80; 32],
+                &responder_shared,
+            ));
+            assert_eq!(rekeyed.sk_d().len(), 20);
+            assert_eq!(rekeyed.sk_ai().len(), 20);
+            assert_eq!(rekeyed.sk_ei().len(), 16);
+
+            let child_from_live = must_ok(derive_child_sa_key_material(
+                child_profile,
+                material.sk_d(),
+                &[0x90; 32],
+                &[0xa0; 32],
+                Some(&initiator_shared),
+            ));
+            let child_from_restored = must_ok(derive_child_sa_key_material(
+                child_profile,
+                restored.sk_d(),
+                &[0x90; 32],
+                &[0xa0; 32],
+                Some(&responder_shared),
+            ));
+            assert_eq!(child_from_live, child_from_restored);
+            assert_eq!(
+                child_from_live.initiator_to_responder_encryption().len(),
+                16
+            );
+            assert_eq!(child_from_live.initiator_to_responder_integrity().len(), 20);
+            assert_eq!(
+                child_from_live.responder_to_initiator_encryption().len(),
+                16
+            );
+            assert_eq!(child_from_live.responder_to_initiator_integrity().len(), 20);
+        }
     }
 
     #[test]

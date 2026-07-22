@@ -48,10 +48,12 @@ control-plane stack.
   IKE/Child SA key-material derivation. IKE-SA profiles preserve the complete negotiated
   PRF, DH, encryption/key-size, and optional integrity suite; invalid AEAD plus
   integrity or CBC without integrity combinations cannot be constructed.
-  PRF-HMAC-SHA2-256/384/512 are supported for initial IKE-SA derivation,
-  IKE-SA rekey (including distinct old/new PRFs), Child-SA KEYMAT, restore, and
-  AUTH calculations. Child-SA profiles additionally support ENCR_NULL (11)
-  with a mandatory separate SHA-2 integrity transform and exactly zero
+  PRF-HMAC-SHA1 and PRF-HMAC-SHA2-256/384/512 are supported for initial IKE-SA
+  derivation, IKE-SA rekey (including distinct old/new PRFs), Child-SA KEYMAT,
+  restore, and AUTH calculations. MODP-768/MODP-1024 and HMAC-SHA1 are explicit
+  legacy-interoperability choices and are never inserted into caller policy.
+  Child-SA profiles additionally support ENCR_NULL (11) with a mandatory
+  separate supported integrity transform and exactly zero
   encryption/salt KEYMAT octets. The notify-only error builder is deliberately bounded to
   one IKE-SA-shaped `UNSUPPORTED_CRITICAL_PAYLOAD`, `NO_PROPOSAL_CHOSEN`, or
   `INVALID_KE_PAYLOAD`. Typed convenience builders write the offending payload
@@ -59,7 +61,7 @@ control-plane stack.
   big-endian octets. These failures are mutually exclusive, so the builder
   rejects a multi-Notify response rather than emitting ambiguity.
 - `protected_payload_crypto` provides caller-keyed AES-GCM-16 and
-  AES-CBC/SHA-2 encrypt-then-MAC `SK`/`SKF` open/seal helpers for
+  AES-CBC/HMAC encrypt-then-MAC `SK`/`SKF` open/seal helpers for
   already-derived SA_INIT key material. Production CBC sealing obtains a fresh
   16-octet IV from the admitted module's `ApprovedEntropy` operation; callers
   cache the complete already-sealed response for retransmission.
@@ -384,15 +386,49 @@ The executable IKE-SA matrix is:
 
 | Mechanism | Transform IDs and sizes | Key/material contract |
 | --- | --- | --- |
-| PRF | HMAC-SHA2-256 (5), HMAC-SHA2-384 (6), HMAC-SHA2-512 (7) | 32, 48, or 64 octets for each of `SK_d`, `SK_pi`, and `SK_pr` |
-| DH | MODP-2048 (14), ECP-256 (19), ECP-384 (20), ECP-521 (21) | Exact public-value lengths 256, 64, 96, and 132 octets |
+| PRF | HMAC-SHA1 (2, compatibility), HMAC-SHA2-256 (5), HMAC-SHA2-384 (6), HMAC-SHA2-512 (7) | 20, 32, 48, or 64 octets for each of `SK_d`, `SK_pi`, and `SK_pr` |
+| DH | MODP-768 (1, compatibility), MODP-1024 (2, compatibility), MODP-2048 (14), ECP-256 (19), ECP-384 (20), ECP-521 (21) | Exact public/shared widths: MODP 96/96, 128/128, 256/256; ECP public 64/96/132 and shared 32/48/66 octets |
 | AES-GCM-16 | ENCR 20 with 128, 192, or 256-bit key; no INTEG | AES key plus four-octet salt; eight-octet explicit IV and 16-octet tag on the wire |
 | AES-CBC | ENCR 12 with 128, 192, or 256-bit key | Raw 16, 24, or 32-octet `SK_e*`; fresh 16-octet IV per newly sealed message |
-| SHA-2 integrity | AUTH-HMAC-SHA2-256-128 (12), 384-192 (13), or 512-256 (14) | 32/48/64-octet `SK_a*`; 16/24/32-octet ICV |
+| Integrity | AUTH-HMAC-SHA1-96 (2, compatibility) or AUTH-HMAC-SHA2-256-128 (12), 384-192 (13), or 512-256 (14) | 20/32/48/64-octet `SK_a*`; 12/16/24/32-octet ICV |
 
-Every CBC key size may be paired with each supported SHA-2 integrity
+Every CBC key size may be paired with each supported integrity
 algorithm. `validate_executable()` is the explicit startup check, although all
 public profile constructors already enforce the same contract.
+
+### Legacy IKE interoperability profiles
+
+MODP-768, MODP-1024, PRF-HMAC-SHA1, and AUTH-HMAC-SHA1-96 exist only to
+interoperate with peers that cannot negotiate the stronger profiles above.
+RFC 8247 marks MODP group 1 as `MUST NOT`, group 2 as `SHOULD NOT`, and the
+SHA-1 PRF/integrity transforms for deprecation; RFC 9395 also deprecates group
+1. The SDK deliberately has no default proposal policy, and recognizing these
+typed algorithms does not offer or select them. A product must explicitly add
+the exact compatibility profile to its `Ikev2SaInitNegotiationPolicy`:
+
+```rust
+use opc_proto_ikev2::{
+    Ikev2DhGroup, Ikev2EncryptionAlgorithm, Ikev2IntegrityAlgorithm,
+    Ikev2PrfAlgorithm, Ikev2SaInitCryptoProfile, Ikev2SaInitNegotiationPolicy,
+    Ikev2SaInitNegotiationError,
+};
+
+fn compatibility_policy(
+) -> Result<Ikev2SaInitNegotiationPolicy, Ikev2SaInitNegotiationError> {
+    let legacy = Ikev2SaInitCryptoProfile::new_encrypt_then_mac(
+        Ikev2PrfAlgorithm::HmacSha1,
+        Ikev2DhGroup::Modp1024,
+        Ikev2EncryptionAlgorithm::AesCbc128,
+        Ikev2IntegrityAlgorithm::HmacSha1_96,
+    )
+    .map_err(Ikev2SaInitNegotiationError::UnsupportedConfiguredProfile)?;
+    Ikev2SaInitNegotiationPolicy::new(vec![legacy])
+}
+```
+
+Keep stronger profiles earlier in the caller-owned preference list. No DES,
+3DES, MD5, unauthenticated CBC, or other legacy algorithm is enabled by this
+compatibility boundary.
 
 ## Authenticated-only ESP Child SAs
 

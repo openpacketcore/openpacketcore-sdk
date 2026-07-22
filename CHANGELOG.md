@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Explicit IKEv2 legacy-interoperability suites — `opc-proto-ikev2`:**
+  executable typed support now covers MODP-768/1024 (Transform IDs 1/2),
+  PRF-HMAC-SHA1 (2), and AUTH-HMAC-SHA1-96 (2) across admitted-provider
+  preflight, DH agreement, initial/rekey/Child/restore KDFs, IKE AUTH,
+  AES-CBC `SK`/`SKF`, and Linux XFRM projection. MODP public values and shared
+  secrets retain exact modulus widths; malformed KE lengths and invalid range
+  values fail with distinct stable codes. These deprecated algorithms are
+  never offered or preferred automatically: consumers must explicitly add an
+  exact compatibility profile to their caller-owned negotiation policy. No
+  other legacy algorithm is enabled. Downstream exhaustive matches on
+  `Ikev2DhGroup`, `Ikev2PrfAlgorithm`, `Ikev2IntegrityAlgorithm`, or
+  `Ikev2SaInitCryptoError{,Code}` must handle the new variants (#476).
 - **Complete checked SWm DER authorization context — `opc-proto-diameter`:**
   `SwmDerAccessContext` and its immutable source snapshot now cover all twelve
   conditional TS 29.273 DER rows: RAT type, Service-Selection,
@@ -1230,8 +1242,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   missing/duplicate SA, Nonce, or KE fail closed with stable redaction-safe
   errors. Selection reuses the executable SA_INIT policy and exposes the chosen
   profile and initiator SPI directly to the existing rekey KDF. That KDF now
-  requires the selected group's fixed-width shared secret (DH14 256 octets;
-  DH19/20/21 32/48/66 octets) and reports a mismatch through the pre-existing
+  requires the selected group's fixed-width shared secret (DH1/2/14
+  96/128/256 octets; DH19/20/21 32/48/66 octets) and reports a mismatch through the pre-existing
   redaction-safe invalid-key-length error contract. The response builder
   requires a caller-allocated non-zero responder SPI plus exact Nr/KEr and
   emits immutable `SA, Nr, KEr` bytes.

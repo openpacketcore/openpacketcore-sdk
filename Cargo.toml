@@ -40,7 +40,7 @@ sha2 = "0.10"
 # this explicit alias on the RustCrypto digest 0.11 line with zeroization until
 # the remaining workspace crypto stack can move as one compatibility change.
 sha2-zeroize = { package = "sha2", version = "0.11", features = ["zeroize"] }
-sha1 = "0.11"
+sha1 = { version = "0.11", features = ["zeroize"] }
 rand = "0.10"
 aes = { version = "0.9.1", features = ["zeroize"] }
 aes-gcm = { version = "0.11.0", default-features = false, features = ["aes", "alloc", "zeroize"] }

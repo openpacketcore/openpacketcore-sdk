@@ -233,7 +233,8 @@ impl Error for Ikev2SaInitNegotiationError {
 ///
 /// The selected DH transform must match the request KE payload. A supported
 /// offered suite with a different KE group returns a typed mismatch suitable
-/// for an `INVALID_KE_PAYLOAD` response; an unsupported suite, including DH1,
+/// for an `INVALID_KE_PAYLOAD` response. Any suite absent from the caller's
+/// policy—including compatibility algorithms the caller did not opt into—
 /// returns [`Ikev2SaInitNegotiationError::NoAcceptableProposal`].
 ///
 /// # Errors

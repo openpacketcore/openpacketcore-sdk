@@ -605,7 +605,17 @@ fn payloads_with_transforms(
     transforms: Vec<Ikev2SaTransform<'static>>,
     ke_group: u16,
 ) -> Ikev2SaInitPayloads<'static> {
-    static KE: [u8; 256] = {
+    static KE_768: [u8; 96] = {
+        let mut value = [0_u8; 96];
+        value[95] = 2;
+        value
+    };
+    static KE_1024: [u8; 128] = {
+        let mut value = [0_u8; 128];
+        value[127] = 2;
+        value
+    };
+    static KE_2048: [u8; 256] = {
         let mut value = [0_u8; 256];
         value[255] = 2;
         value
@@ -623,7 +633,11 @@ fn payloads_with_transforms(
         },
         key_exchange: Ikev2KeyExchangePayload {
             dh_group: ke_group,
-            key_exchange_data: &KE,
+            key_exchange_data: match ke_group {
+                1 => &KE_768,
+                2 => &KE_1024,
+                _ => &KE_2048,
+            },
         },
         nonce: Ikev2NoncePayload { nonce: &NONCE },
         notifies: Vec::new(),
@@ -794,7 +808,7 @@ fn duplicate_or_contradictory_transforms_fail_closed() {
 }
 
 #[test]
-fn unsupported_dh1_is_typed_no_acceptable_proposal_and_ke_mismatch_is_distinct() {
+fn unconfigured_dh1_is_typed_no_acceptable_proposal_and_ke_mismatch_is_distinct() {
     let mut dh1 = observed_transforms();
     dh1[3].transform_id = 1;
     let no_proposal =
@@ -818,4 +832,49 @@ fn unsupported_dh1_is_typed_no_acceptable_proposal_and_ke_mismatch_is_distinct()
         }
     );
     assert!(!mismatch.is_no_acceptable_proposal());
+}
+
+#[test]
+fn sha1_modp_compatibility_suites_require_explicit_policy_entries() {
+    for group in [
+        Ikev2DhGroup::Modp768,
+        Ikev2DhGroup::Modp1024,
+        Ikev2DhGroup::Modp2048,
+    ] {
+        let transforms = vec![
+            transform(
+                TRANSFORM_TYPE_ENCR,
+                12,
+                vec![Ikev2TransformAttribute {
+                    attribute_type: 14,
+                    value: Ikev2TransformAttributeValue::Tv(128),
+                }],
+            ),
+            transform(TRANSFORM_TYPE_INTEG, 2, Vec::new()),
+            transform(TRANSFORM_TYPE_PRF, 2, Vec::new()),
+            transform(TRANSFORM_TYPE_DH, group.transform_id(), Vec::new()),
+        ];
+        let payloads = payloads_with_transforms(transforms, group.transform_id());
+
+        let not_configured = negotiate_ike_sa_init(&payloads, &observed_policy()).unwrap_err();
+        assert_eq!(
+            not_configured,
+            Ikev2SaInitNegotiationError::NoAcceptableProposal
+        );
+
+        let compatibility_profile = Ikev2SaInitCryptoProfile::from_transform_ids(
+            2,
+            group.transform_id(),
+            12,
+            Some(128),
+            Some(2),
+        )
+        .expect("explicit compatibility profile is executable");
+        let explicit_policy =
+            Ikev2SaInitNegotiationPolicy::new(vec![observed_profile(), compatibility_profile])
+                .expect("explicit compatibility policy is valid");
+        let selected = negotiate_ike_sa_init(&payloads, &explicit_policy)
+            .expect("explicitly configured compatibility suite selects");
+        assert_eq!(selected.profile(), compatibility_profile);
+    }
 }

@@ -8,12 +8,12 @@
 //! mechanism that is safe to expose as an SDK primitive today: fixed-header
 //! decode/encode, raw-preserving generic payload-chain walking for unencrypted
 //! payloads, protected-payload boundary metadata, caller-owned crypto provider
-//! traits, typed executable IKE-SA profiles, PRF-HMAC-SHA2-256/384/512, initial
-//! and rekey IKE-SA key-agreement/key-derivation material,
+//! traits, typed executable IKE-SA profiles, PRF-HMAC-SHA1/SHA2, MODP and ECP
+//! key agreement, initial and rekey IKE-SA key-derivation material,
 //! bounded receive-to-notify IKE_SA_INIT unknown-critical rejection and other
 //! notify-only IKE_SA_INIT error responses,
 //! product-neutral executable IKE_SA_INIT proposal selection, caller-keyed
-//! SA_INIT AES-GCM and AES-CBC/SHA-2 protected-payload open/seal helpers, typed
+//! SA_INIT AES-GCM and AES-CBC/HMAC protected-payload open/seal helpers, typed
 //! IKE_AUTH cleartext payload helpers, transcript-bound shared-key AUTH MIC
 //! verification, transcript-bound signature AUTH (RFC 7296 method 1 and
 //! RFC 7427 method 14) against caller-trusted keys, typed 3GPP DEVICE_IDENTITY
@@ -45,6 +45,10 @@
 //! SDK admission evidence. RFC 7296 CERTREQ authority-key hashing validates an
 //! exact DER `SubjectPublicKeyInfo` and has an explicit requirement independent
 //! of NAT-detection hashing even though both route through admitted SHA-1.
+//! MODP-768, MODP-1024, PRF-HMAC-SHA1, and AUTH-HMAC-SHA1-96 are executable
+//! interoperability mechanisms only: callers must put their exact typed suite
+//! into [`Ikev2SaInitNegotiationPolicy`]. The SDK has no default proposal list
+//! and never automatically enables or prefers these legacy transforms.
 //!
 //! @spec IETF RFC7296
 //! @req REQ-IETF-RFC7296-IKEV2-SCAFFOLD-001
@@ -58,6 +62,7 @@ pub mod device_identity;
 pub mod exchange;
 pub mod fragmentation;
 pub mod header;
+mod hmac_sha1;
 mod hmac_sha2;
 pub mod ike_auth;
 pub mod ike_auth_signature;
