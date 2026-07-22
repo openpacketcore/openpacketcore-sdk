@@ -8,7 +8,8 @@
 //! authorization-information update sequence, the non-overload DER access
 //! context (QoS capabilities, visited PLMN, AAA failover, and priority), a
 //! typed request-correlated RFC 6733 routing boundary for Proxy-Info,
-//! Route-Record, and generic E-bit redirects, a
+//! Route-Record, generic E-bit redirects, and exact request-bound DRA
+//! `DIAMETER_UNABLE_TO_DELIVER` / `DIAMETER_TOO_BUSY` responses, a
 //! typed request-conditioned RFC 7683 baseline loss-overload offer/report,
 //! ordered RFC 8583 Diameter Load context, typed successful-session timer
 //! context, request-bound canonical RFC 5447 serving/emergency gateway
@@ -21,10 +22,11 @@
 //! lifetime, attempt peer connections, implement transport state or realm
 //! routing, choose local emergency-access policy, set duplicate-request cache
 //! lifetime, or implement IKEv2 policy.
-//! A live Diameter client must still
-//! consume a pending request keyed by peer connection and Hop-by-Hop Identifier
-//! before passing the parsed transaction envelopes to emergency evidence; the
-//! codec enforces identifier equality but cannot prove transport liveness.
+//! A live Diameter client must still atomically consume a pending request keyed
+//! by peer connection and Hop-by-Hop Identifier before passing parsed response
+//! envelopes to correlation or emergency evidence; the codec enforces the
+//! remaining identifiers and request facts but cannot prove transport
+//! liveness or reject a response replay without that consumer-owned state.
 //!
 //! @spec 3GPP TS29273
 //! @spec 3GPP TS29272 7.3
@@ -41,7 +43,7 @@ use opc_protocol::{
     EncodeErrorCode, SpecRef, UnknownIePolicy,
 };
 use opc_types::{Imei, Imei15};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use std::{collections::HashSet, error::Error, fmt, net::IpAddr};
 use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, Zeroizing};
@@ -1458,6 +1460,50 @@ pub enum SwmResultCategory {
     Unknown,
 }
 
+/// Agent-generated SWm delivery failure that may be originated with RFC
+/// 6733's generic E-bit answer grammar.
+///
+/// This intentionally models only the two routing failures a DRA can produce
+/// without application processing. Other protocol failures continue through
+/// the request-bound [`crate::error_answer`] machinery so required diagnostic
+/// evidence cannot be omitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SwmDiameterEapAgentDeliveryFailure {
+    /// No eligible destination could receive the request.
+    UnableToDeliver,
+    /// The explicitly selected `Destination-Host` cannot currently serve the
+    /// request.
+    TooBusy,
+}
+
+impl SwmDiameterEapAgentDeliveryFailure {
+    /// Parse an exact RFC 6733 agent-delivery result code.
+    #[must_use]
+    pub const fn from_result_code(result_code: u32) -> Option<Self> {
+        match result_code {
+            base::RESULT_CODE_DIAMETER_UNABLE_TO_DELIVER => Some(Self::UnableToDeliver),
+            base::RESULT_CODE_DIAMETER_TOO_BUSY => Some(Self::TooBusy),
+            _ => None,
+        }
+    }
+
+    /// Return the exact RFC 6733 base `Result-Code` value.
+    #[must_use]
+    pub const fn result_code(self) -> u32 {
+        match self {
+            Self::UnableToDeliver => base::RESULT_CODE_DIAMETER_UNABLE_TO_DELIVER,
+            Self::TooBusy => base::RESULT_CODE_DIAMETER_TOO_BUSY,
+        }
+    }
+
+    const fn is_valid_for(self, request: &SwmDiameterEapRequest) -> bool {
+        match self {
+            Self::UnableToDeliver => true,
+            Self::TooBusy => request.destination_host.is_some(),
+        }
+    }
+}
+
 impl SwmResultCategory {
     /// Classify a result code by its thousand-digit family.
     pub const fn from_result_code(result_code: u32) -> Self {
@@ -2320,7 +2366,7 @@ pub enum SwmDiameterEapCorrelationError {
     ProxiableMismatch,
     /// The ordered Proxy-Info chain differs.
     ProxyInfoMismatch,
-    /// A present Session-Id differs from the request.
+    /// Session-Id correlation failed.
     SessionMismatch,
     /// An ordinary answer violates its trusted logical-origin policy.
     PeerIdentityMismatch,
@@ -2381,6 +2427,26 @@ impl SwmCorrelatedDiameterEapResponse {
         }
     }
 
+    /// Return an actionable DRA delivery failure after complete correlation.
+    ///
+    /// This accessor recognizes only exact base
+    /// `DIAMETER_UNABLE_TO_DELIVER` and `DIAMETER_TOO_BUSY`. Redirect and every
+    /// other generic 3xxx result return `None`. Reaching this method proves the
+    /// response arrived on the authenticated connection generation to which
+    /// the DER was dispatched and matched its transaction, P bit, required
+    /// Session-Id, and ordered Proxy-Info chain. The caller must still
+    /// atomically consume its transport pending entry before treating this
+    /// structurally correlated value as live.
+    #[must_use]
+    pub fn agent_delivery_failure(&self) -> Option<SwmDiameterEapAgentDeliveryFailure> {
+        match self.response.response() {
+            SwmDiameterEapResponse::GenericError(answer) => {
+                SwmDiameterEapAgentDeliveryFailure::from_result_code(answer.result_code)
+            }
+            SwmDiameterEapResponse::Application(_) => None,
+        }
+    }
+
     /// Return the correlated Diameter identifiers.
     #[must_use]
     pub const fn transaction(&self) -> SwmDiameterTransaction {
@@ -2424,6 +2490,10 @@ impl fmt::Debug for SwmCorrelatedDiameterEapResponse {
             .field("request", &self.request())
             .field("response", &self.response())
             .field("redirect_present", &self.redirect().is_some())
+            .field(
+                "agent_delivery_failure_present",
+                &self.agent_delivery_failure().is_some(),
+            )
             .finish()
     }
 }
@@ -3817,10 +3887,73 @@ pub struct SwmDiameterEapGenericErrorAnswer {
     provenance: SwmDiameterEapGenericErrorAnswerProvenance,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum SwmDiameterEapGenericErrorAnswerProvenance {
-    Outbound,
+    OutboundRedirect,
+    OutboundAgentDeliveryFailure {
+        failure: SwmDiameterEapAgentDeliveryFailure,
+        request_binding: SwmDiameterEapAgentErrorRequestBinding,
+    },
     Parsed,
+}
+
+#[derive(Clone)]
+struct SwmDiameterEapAgentErrorRequestBinding {
+    transaction: SwmDiameterTransaction,
+    proxiable: bool,
+    request_digest: Zeroizing<[u8; 32]>,
+}
+
+impl SwmDiameterEapAgentErrorRequestBinding {
+    fn for_request(request: &SwmDiameterEapRequestEnvelope) -> Result<Self, EncodeError> {
+        let mut flags = builder_helpers::app_request_flags();
+        if request.potentially_retransmitted {
+            flags = crate::CommandFlags::from_bits(
+                flags.bits() | crate::CommandFlags::POTENTIALLY_RETRANSMITTED,
+            );
+        }
+        let message = build_swm_diameter_eap_request_internal(
+            &request.request,
+            &request.proxy_infos,
+            flags,
+            request.transaction.hop_by_hop_identifier(),
+            request.transaction.end_to_end_identifier(),
+            EncodeContext {
+                max_message_len: crate::MAX_U24 as usize,
+                ..EncodeContext::default()
+            },
+        )?;
+        let mut hasher = Sha256::new();
+        hasher.update(b"opc-swm-agent-error-request-binding-v1\0");
+        hasher.update([message.header.version, message.header.flags.bits()]);
+        hasher.update(message.header.length.to_be_bytes());
+        hasher.update(message.header.command_code.get().to_be_bytes());
+        hasher.update(message.header.application_id.get().to_be_bytes());
+        hasher.update(message.header.hop_by_hop_identifier.to_be_bytes());
+        hasher.update(message.header.end_to_end_identifier.to_be_bytes());
+        hasher.update(&message.raw_avps);
+        let mut output = hasher.finalize();
+        let mut request_digest = [0_u8; 32];
+        request_digest.copy_from_slice(&output);
+        output.as_mut_slice().zeroize();
+        Ok(Self {
+            transaction: request.transaction,
+            proxiable: request.proxiable,
+            request_digest: Zeroizing::new(request_digest),
+        })
+    }
+
+    fn matches(&self, request: &SwmDiameterEapRequestEnvelope) -> Result<bool, EncodeError> {
+        if self.transaction != request.transaction || self.proxiable != request.proxiable {
+            return Ok(false);
+        }
+        let candidate = Self::for_request(request)?;
+        Ok(bool::from(
+            self.request_digest
+                .as_slice()
+                .ct_eq(candidate.request_digest.as_slice()),
+        ))
+    }
 }
 
 impl fmt::Debug for SwmDiameterEapGenericErrorAnswer {
@@ -3874,7 +4007,51 @@ impl SwmDiameterEapGenericErrorAnswer {
             experimental_result: None,
             failed_avps: Vec::new(),
             additional_avps: Vec::new(),
-            provenance: SwmDiameterEapGenericErrorAnswerProvenance::Outbound,
+            provenance: SwmDiameterEapGenericErrorAnswerProvenance::OutboundRedirect,
+        };
+        answer.validate_for_encode()?;
+        Ok(answer)
+    }
+
+    /// Construct a DRA-generated delivery failure for one exact SWm DER.
+    ///
+    /// The request binding covers the complete canonical DER, both transaction
+    /// identifiers, P/T, and ordered `Proxy-Info`. The generic response builder
+    /// checks that binding before writing response bytes and then copies the
+    /// request's Session-Id, P bit, identifiers, and proxy chain. Only
+    /// [`SwmDiameterEapAgentDeliveryFailure::UnableToDeliver`] and
+    /// [`SwmDiameterEapAgentDeliveryFailure::TooBusy`] are representable. The
+    /// latter is rejected unless the retained DER contains `Destination-Host`,
+    /// as required by RFC 6733 section 7.1.3.
+    pub fn new_agent_delivery_failure_for(
+        request: &SwmDiameterEapRequestEnvelope,
+        failure: SwmDiameterEapAgentDeliveryFailure,
+        origin_host: impl Into<Redacted<String>>,
+        origin_realm: impl Into<Redacted<String>>,
+    ) -> Result<Self, EncodeError> {
+        if !failure.is_valid_for(request.request()) {
+            return Err(encode_structural_error(
+                "DIAMETER_TOO_BUSY requires a SWm DER with Destination-Host",
+                "7.1.3",
+            ));
+        }
+        let request_binding = SwmDiameterEapAgentErrorRequestBinding::for_request(request)?;
+        let answer = Self {
+            session_id: Some(request.request.session_id.clone()),
+            result_code: failure.result_code(),
+            origin_host: origin_host.into(),
+            origin_realm: origin_realm.into(),
+            redirect: None,
+            error_message: None,
+            error_reporting_host: None,
+            origin_state_id: None,
+            experimental_result: None,
+            failed_avps: Vec::new(),
+            additional_avps: Vec::new(),
+            provenance: SwmDiameterEapGenericErrorAnswerProvenance::OutboundAgentDeliveryFailure {
+                failure,
+                request_binding,
+            },
         };
         answer.validate_for_encode()?;
         Ok(answer)
@@ -3902,20 +4079,42 @@ impl SwmDiameterEapGenericErrorAnswer {
     }
 
     fn validate_for_encode(&self) -> Result<(), EncodeError> {
-        if matches!(
-            self.provenance,
-            SwmDiameterEapGenericErrorAnswerProvenance::Parsed
-        ) {
-            return Err(encode_structural_error(
-                "parsed generic SWm DEA cannot be re-originated",
-                "7.2",
-            ));
-        }
-        if self.result_code != DIAMETER_REDIRECT_INDICATION {
-            return Err(encode_structural_error(
-                "outbound generic SWm DEA supports only DIAMETER_REDIRECT_INDICATION",
-                "6.12",
-            ));
+        match &self.provenance {
+            SwmDiameterEapGenericErrorAnswerProvenance::Parsed => {
+                return Err(encode_structural_error(
+                    "parsed generic SWm DEA cannot be re-originated",
+                    "7.2",
+                ));
+            }
+            SwmDiameterEapGenericErrorAnswerProvenance::OutboundRedirect => {
+                if self.result_code != DIAMETER_REDIRECT_INDICATION {
+                    return Err(encode_structural_error(
+                        "outbound redirect SWm DEA requires DIAMETER_REDIRECT_INDICATION",
+                        "6.12",
+                    ));
+                }
+            }
+            SwmDiameterEapGenericErrorAnswerProvenance::OutboundAgentDeliveryFailure {
+                failure,
+                ..
+            } => {
+                if self.result_code != failure.result_code() {
+                    return Err(encode_structural_error(
+                        "outbound SWm agent delivery failure Result-Code changed after binding",
+                        "7.1.3",
+                    ));
+                }
+                if self.redirect.is_some()
+                    || self.experimental_result.is_some()
+                    || !self.failed_avps.is_empty()
+                    || !self.additional_avps.is_empty()
+                {
+                    return Err(encode_structural_error(
+                        "outbound SWm agent delivery failure contains non-delivery context",
+                        "7.2",
+                    ));
+                }
+            }
         }
         if self
             .session_id
@@ -6275,6 +6474,18 @@ fn build_swm_diameter_eap_generic_error_for(
     ctx: EncodeContext,
 ) -> Result<OwnedMessage, EncodeError> {
     answer.validate_for_encode()?;
+    if let SwmDiameterEapGenericErrorAnswerProvenance::OutboundAgentDeliveryFailure {
+        request_binding,
+        ..
+    } = &answer.provenance
+    {
+        if !request_binding.matches(request)? {
+            return Err(encode_structural_error(
+                "SWm agent delivery failure does not match its bound DER envelope",
+                "7.2",
+            ));
+        }
+    }
     if answer.session_id.as_deref().map(String::as_str) != Some(request.request.session_id.as_ref())
     {
         return Err(encode_structural_error(
@@ -7216,6 +7427,16 @@ fn parse_swm_diameter_eap_generic_error_parts(
             "7.5",
         ));
     }
+    if SwmDiameterEapAgentDeliveryFailure::from_result_code(result_code).is_some()
+        && additional_avps
+            .iter()
+            .any(is_known_agent_delivery_application_avp)
+    {
+        return Err(decode_structural_error(
+            "SWm agent delivery failure must omit application-only AVPs",
+            "7.2",
+        ));
+    }
     let has_redirect_context =
         !redirect_hosts.is_empty() || redirect_usage.is_some() || redirect_max_cache_time.is_some();
     let redirect = if result_code == DIAMETER_REDIRECT_INDICATION {
@@ -7259,6 +7480,77 @@ fn parse_swm_diameter_eap_generic_error_parts(
         },
         proxy_infos,
     })
+}
+
+fn is_known_agent_delivery_application_avp(avp: &SwmAdditionalAvp) -> bool {
+    let header = avp.header();
+    match header.vendor_id {
+        None => matches!(
+            header.code,
+            base::AVP_AUTH_APPLICATION_ID
+                | base::AVP_AUTH_GRACE_PERIOD
+                | base::AVP_AUTH_SESSION_STATE
+                | base::AVP_AUTHORIZATION_LIFETIME
+                | base::AVP_CLASS
+                | base::AVP_RE_AUTH_REQUEST_TYPE
+                | base::AVP_SESSION_TIMEOUT
+                | base::AVP_USER_NAME
+                | AVP_AUTH_REQUEST_TYPE
+                | AVP_EAP_MASTER_SESSION_KEY
+                | AVP_EAP_PAYLOAD
+                | AVP_EAP_REISSUED_PAYLOAD
+                | AVP_MIP6_AGENT_INFO
+                | AVP_MIP6_FEATURE_VECTOR
+                | AVP_MIP6_HOME_LINK_PREFIX
+                | AVP_MIP_HOME_AGENT_ADDRESS
+                | AVP_MIP_HOME_AGENT_HOST
+                | AVP_MOBILE_NODE_IDENTIFIER
+                | AVP_QOS_CAPABILITY
+                | AVP_QOS_PROFILE_ID
+                | AVP_QOS_PROFILE_TEMPLATE
+                | AVP_REPLY_MESSAGE
+                | AVP_SERVICE_SELECTION
+                | AVP_STATE
+                | AVP_SUBSCRIPTION_ID
+                | AVP_SUBSCRIPTION_ID_DATA
+                | AVP_SUBSCRIPTION_ID_TYPE
+        ),
+        Some(vendor_id) if vendor_id == VENDOR_ID_3GPP => matches!(
+            header.code,
+            AVP_3GPP_CHARGING_CHARACTERISTICS
+                | AVP_AAA_FAILURE_INDICATION
+                | AVP_AAR_FLAGS
+                | AVP_ALLOCATION_RETENTION_PRIORITY
+                | AVP_AMBR
+                | AVP_APN_CONFIGURATION
+                | AVP_APN_OI_REPLACEMENT
+                | AVP_CONTEXT_IDENTIFIER
+                | AVP_CORE_NETWORK_RESTRICTIONS
+                | AVP_EMERGENCY_INFO
+                | AVP_EMERGENCY_SERVICES
+                | AVP_EPS_SUBSCRIBED_QOS_PROFILE
+                | AVP_FEATURE_LIST
+                | AVP_FEATURE_LIST_ID
+                | AVP_HIGH_PRIORITY_ACCESS_INFO
+                | AVP_IMEI
+                | AVP_MAX_REQUESTED_BANDWIDTH_DL
+                | AVP_MAX_REQUESTED_BANDWIDTH_UL
+                | AVP_MPS_PRIORITY
+                | AVP_PDN_TYPE
+                | AVP_PRE_EMPTION_CAPABILITY
+                | AVP_PRE_EMPTION_VULNERABILITY
+                | AVP_PRIORITY_LEVEL
+                | AVP_QOS_CLASS_IDENTIFIER
+                | AVP_RAT_TYPE
+                | AVP_SOFTWARE_VERSION
+                | AVP_SUPPORTED_FEATURES
+                | AVP_TERMINAL_INFORMATION
+                | AVP_UE_LOCAL_IP_ADDRESS
+                | AVP_UE_USAGE_TYPE
+                | AVP_VISITED_NETWORK_IDENTIFIER
+        ),
+        Some(_) => false,
+    }
 }
 
 fn parse_required_base_identity(
@@ -8870,6 +9162,21 @@ fn ensure_correlated_response(
         .is_some_and(|session_id| session_id != request_envelope.request.session_id.as_ref())
     {
         return Err(SwmDiameterEapCorrelationError::SessionMismatch);
+    }
+
+    if let SwmDiameterEapResponse::GenericError(answer) = &response_envelope.response {
+        if let Some(failure) =
+            SwmDiameterEapAgentDeliveryFailure::from_result_code(answer.result_code)
+        {
+            if !failure.is_valid_for(request_envelope.request()) {
+                return Err(SwmDiameterEapCorrelationError::ApplicationMismatch);
+            }
+            if answer.session_id.as_deref().map(String::as_str)
+                != Some(request_envelope.request.session_id.as_ref())
+            {
+                return Err(SwmDiameterEapCorrelationError::SessionMismatch);
+            }
+        }
     }
 
     if let SwmDiameterEapResponse::Application(answer) = &response_envelope.response {

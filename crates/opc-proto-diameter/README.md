@@ -715,7 +715,7 @@ generation, both Diameter identifiers, P, the exact ordered `Proxy-Info`
 chain, and `Session-Id` when the generic answer carries it. An ordinary answer
 also checks the configured logical-Origin policy and application fields. A
 generic error may be originated by an intermediary, so it skips only that
-logical-Origin check. Never make a redirect decision from the answer-local
+logical-Origin check. Never make a routing decision from the answer-local
 parser:
 
 ```rust
@@ -727,7 +727,7 @@ use opc_proto_diameter::Message;
 use opc_protocol::DecodeContext;
 
 fn correlate_response<'a>(
-    pending: SwmDiameterEapRequestEnvelope,
+    atomically_removed_pending: SwmDiameterEapRequestEnvelope,
     message: &Message<'a>,
     connection: SwmDiameterConnectionToken,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -736,7 +736,7 @@ fn correlate_response<'a>(
         connection,
         DecodeContext::conservative(),
     )?;
-    let correlated = pending.correlate_response(received)?;
+    let correlated = atomically_removed_pending.correlate_response(received)?;
     if let Some(redirect) = correlated.redirect() {
         // Target selection, connection establishment, cache storage, and
         // expiry are product policy. Do not log the target values.
@@ -744,9 +744,20 @@ fn correlate_response<'a>(
         let _cache_scope = redirect.effective_usage();
         let _cache_seconds = redirect.max_cache_time();
     }
+    if let Some(delivery_failure) = correlated.agent_delivery_failure() {
+        // Alternate-peer selection and retry timing remain product policy.
+        // Only exact correlated base 3002/3004 reach this branch.
+        let _ = delivery_failure;
+    }
     Ok(())
 }
 ```
+
+The transport must atomically remove that pending envelope by authenticated
+connection generation plus Hop-by-Hop Identifier before correlation. The
+remaining End-to-End and complete request-envelope checks happen afterward.
+An identical response must find no second pending entry. Cloning a codec
+envelope or repeating `correlate_response` does not prove transport liveness.
 
 `SwmDiameterRedirect` validates one or more DiameterURI targets and preserves
 their wire order, but RFC 6733 does not define that order as target preference.
@@ -756,16 +767,52 @@ for a nonzero/cacheable usage and is preserved, but ignored for routing-cache
 purposes, when usage is absent or `DONT_CACHE`. The type exposes the RFC cache
 route precedence separately from the numeric enumerated order.
 
-The public generic origination surface is intentionally limited to exact
+The public generic origination surface supports exact
 `DIAMETER_REDIRECT_INDICATION` through
-`SwmDiameterEapGenericErrorAnswer::new_redirect` and the request-bound
-`build_swm_diameter_eap_response_for`. It copies Session-Id, P, both
-identifiers, and exact Proxy-Info, clears R/T, sets E, and never reflects a DER
-Route-Record. Other originated protocol or application failures must use
+`SwmDiameterEapGenericErrorAnswer::new_redirect` and two DRA delivery failures
+through `new_agent_delivery_failure_for`: `DIAMETER_UNABLE_TO_DELIVER` and
+`DIAMETER_TOO_BUSY`. Both paths finish through the existing request-bound
+`build_swm_diameter_eap_response_for` machinery. The delivery constructor
+privately binds the complete canonical DER and cannot be transplanted to a
+different transaction, proxy chain, or conflicting request:
+
+```rust
+use opc_proto_diameter::apps::swm::{
+    build_swm_diameter_eap_response_for, SwmDiameterEapAgentDeliveryFailure,
+    SwmDiameterEapGenericErrorAnswer, SwmDiameterEapRequestEnvelope,
+    SwmDiameterEapResponse,
+};
+use opc_proto_diameter::OwnedMessage;
+use opc_protocol::{EncodeContext, EncodeError};
+
+fn unable_to_deliver(
+    request: &SwmDiameterEapRequestEnvelope,
+) -> Result<OwnedMessage, EncodeError> {
+    let answer = SwmDiameterEapGenericErrorAnswer::new_agent_delivery_failure_for(
+        request,
+        SwmDiameterEapAgentDeliveryFailure::UnableToDeliver,
+        "dra.synthetic.example",
+        "routing.synthetic.example",
+    )?;
+    build_swm_diameter_eap_response_for(
+        request,
+        &SwmDiameterEapResponse::GenericError(Box::new(answer)),
+        EncodeContext::default(),
+    )
+}
+```
+
+The 3004 variant additionally requires that the retained DER selected a
+specific server with `Destination-Host`, as required by RFC 6733 section
+7.1.3. On receive, both delivery variants require the answer to carry the
+request's exact Session-Id before they become actionable. The builder copies
+Session-Id, P, both identifiers, and exact Proxy-Info, clears R/T, sets E, and
+never reflects a DER Route-Record or adds SWm application fields. Other
+originated protocol or application failures must use
 `error_answer::build_diameter_error_answer`, whose bound failure token proves
 the request and any required Failed-AVP. A parsed generic response cannot be
-re-encoded through the redirect builder; exact retransmission uses a cached
-`OwnedMessage`.
+re-encoded through any originated generic path; exact retransmission uses a
+cached `OwnedMessage`.
 
 Both routing roles share a 128-AVP retained count and the decode context's
 message-byte bound. Proxy-Info requires exactly one nonempty ASCII Proxy-Host
