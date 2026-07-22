@@ -526,12 +526,7 @@ pub(super) fn append_authorization(
     ctx: EncodeContext,
 ) -> Result<(), EncodeError> {
     if let Some(value) = authorization.apn_oi_replacement.as_ref() {
-        builder_helpers::append_avp(
-            dst,
-            AvpHeader::vendor(AVP_APN_OI_REPLACEMENT, VENDOR_ID_3GPP, true),
-            value.as_str().as_bytes(),
-            ctx,
-        )?;
+        append_apn_oi_replacement_avp(dst, value, ctx)?;
     }
     if let Some(value) = authorization.subscription_id.as_ref() {
         let mut grouped = BytesMut::new();
@@ -552,19 +547,7 @@ pub(super) fn append_authorization(
         )?;
     }
     if let Some(value) = authorization.charging_characteristics {
-        let octets = value.octets();
-        let encoded = [
-            encode_hex_nibble(octets[0] >> 4),
-            encode_hex_nibble(octets[0] & 0x0f),
-            encode_hex_nibble(octets[1] >> 4),
-            encode_hex_nibble(octets[1] & 0x0f),
-        ];
-        builder_helpers::append_avp(
-            dst,
-            AvpHeader::vendor(AVP_3GPP_CHARGING_CHARACTERISTICS, VENDOR_ID_3GPP, false),
-            &encoded,
-            ctx,
-        )?;
+        append_charging_characteristics_avp(dst, value, ctx)?;
     }
     if let Some(value) = authorization.ue_usage_type {
         builder_helpers::append_vendor_u32_avp(
@@ -597,6 +580,39 @@ pub(super) fn append_authorization(
         )?;
     }
     Ok(())
+}
+
+pub(super) fn append_apn_oi_replacement_avp(
+    dst: &mut BytesMut,
+    value: &SwmApnOiReplacement,
+    ctx: EncodeContext,
+) -> Result<(), EncodeError> {
+    builder_helpers::append_avp(
+        dst,
+        AvpHeader::vendor(AVP_APN_OI_REPLACEMENT, VENDOR_ID_3GPP, true),
+        value.as_str().as_bytes(),
+        ctx,
+    )
+}
+
+pub(super) fn append_charging_characteristics_avp(
+    dst: &mut BytesMut,
+    value: SwmChargingCharacteristics,
+    ctx: EncodeContext,
+) -> Result<(), EncodeError> {
+    let octets = value.octets();
+    let encoded = [
+        encode_hex_nibble(octets[0] >> 4),
+        encode_hex_nibble(octets[0] & 0x0f),
+        encode_hex_nibble(octets[1] >> 4),
+        encode_hex_nibble(octets[1] & 0x0f),
+    ];
+    builder_helpers::append_avp(
+        dst,
+        AvpHeader::vendor(AVP_3GPP_CHARGING_CHARACTERISTICS, VENDOR_ID_3GPP, false),
+        &encoded,
+        ctx,
+    )
 }
 
 pub(super) fn parse_apn_oi_replacement(

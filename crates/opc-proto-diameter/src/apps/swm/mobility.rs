@@ -633,7 +633,7 @@ pub(super) fn append_gateway_context(
     Ok(())
 }
 
-fn append_mip6_agent_info_avp(
+pub(super) fn append_mip6_agent_info_avp(
     dst: &mut BytesMut,
     info: &SwmMip6AgentInfo,
     ctx: EncodeContext,

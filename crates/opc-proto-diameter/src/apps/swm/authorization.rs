@@ -19,9 +19,10 @@ use super::lifecycle::{
 use super::{
     append_apn_configuration_avp, append_experimental_result_avp, builder_helpers,
     parse_apn_configuration, parse_experimental_result, ApnConfiguration, AuthRequestType,
-    Redacted, SwmDiameterResult, SwmDiameterTransaction, SwmResultCategory, APPLICATION_ID,
-    AVP_AAR_FLAGS, AVP_AUTH_REQUEST_TYPE, AVP_DRMP, AVP_HIGH_PRIORITY_ACCESS_INFO, AVP_LOAD,
-    AVP_OC_OLR, AVP_OC_SUPPORTED_FEATURES, AVP_UE_LOCAL_IP_ADDRESS,
+    Redacted, SwmApnConfigurationView, SwmAuthorizedApnConfiguration, SwmDiameterResult,
+    SwmDiameterTransaction, SwmResultCategory, APPLICATION_ID, AVP_AAR_FLAGS,
+    AVP_AUTH_REQUEST_TYPE, AVP_DRMP, AVP_HIGH_PRIORITY_ACCESS_INFO, AVP_LOAD, AVP_OC_OLR,
+    AVP_OC_SUPPORTED_FEATURES, AVP_UE_LOCAL_IP_ADDRESS,
 };
 use crate::apps::VENDOR_ID_3GPP;
 use crate::base;
@@ -672,8 +673,27 @@ pub struct SwmAuthorizationAnswer {
     ///
     /// It may be absent only on a received RFC 6733 generic E-bit answer.
     pub user_name: Option<Redacted<String>>,
-    /// Optional APN subscription projection from the AAA.
-    pub apn_configuration: Option<ApnConfiguration>,
+    /// Optional complete, validated APN subscription projection from the AAA.
+    ///
+    /// The value retains every modeled and safely preserved APN child. The
+    /// raw legacy [`ApnConfiguration`] remains available through
+    /// [`SwmAuthorizedApnConfiguration::core`], but cannot be mutated or
+    /// detached from its sealed supplemental authorization facts. A plain
+    /// parsed answer deliberately cannot inspect the supplement:
+    ///
+    /// ```compile_fail
+    /// use opc_proto_diameter::apps::swm::SwmAuthorizationAnswer;
+    ///
+    /// fn inspect_uncorrelated(answer: &SwmAuthorizationAnswer) {
+    ///     if let Some(configuration) = answer.apn_configuration.as_ref() {
+    ///         let _ = configuration.as_view();
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// Use [`SwmCorrelatedAuthorizationExchange::apn_configuration_view`]
+    /// after connection, Origin, and request correlation.
+    pub apn_configuration: Option<SwmAuthorizedApnConfiguration>,
     /// Optional RFC 7944 routing priority.
     pub drmp: Option<SwmRoutingMessagePriority>,
     /// Ordered, validated extension AVPs.
@@ -1224,6 +1244,19 @@ impl SwmCorrelatedAuthorizationExchange {
     #[must_use]
     pub const fn answer(&self) -> &SwmAuthorizationAnswer {
         self.answer.answer()
+    }
+
+    /// Borrow the complete AAA APN authorization only after strict correlation.
+    ///
+    /// The correlated exchange proves the authenticated connection generation,
+    /// expected Origin-Host/Realm, transaction, application, session, request
+    /// type, user, proxy chain, and request-specific constraints.
+    #[must_use]
+    pub fn apn_configuration_view(&self) -> Option<SwmApnConfigurationView<'_>> {
+        self.answer()
+            .apn_configuration
+            .as_ref()
+            .map(SwmAuthorizedApnConfiguration::as_view)
     }
 
     /// Return the identifiers shared by the exchange.
@@ -1994,7 +2027,7 @@ pub fn build_swm_authorization_answer(
     )?;
     append_string(&mut avps, base::AVP_USER_NAME, user_name.as_ref(), ctx)?;
     if let Some(apn) = answer.apn_configuration.as_ref() {
-        append_apn_configuration_avp(&mut avps, apn, ctx)?;
+        append_apn_configuration_avp(&mut avps, apn.core(), Some(apn.supplement()), ctx)?;
     }
     append_additional(&mut avps, &answer.additional_avps, ctx)?;
     append_additional(&mut avps, &request.proxy_infos, ctx)?;
@@ -2958,10 +2991,20 @@ fn parse_authorization_answer_parts(
                 parse_required_string(&avp, offset, value_offset, &mut user_name)?;
             } else if key == AvpKey::vendor(super::AVP_APN_CONFIGURATION, VENDOR_ID_3GPP) {
                 validate_vendor_definition(&avp, offset)?;
-                let value = parse_apn_configuration(avp.value, ctx, value_offset, 1)?;
+                let mut retention = super::DiameterEapRetention::default();
+                let (value, supplement) =
+                    parse_apn_configuration(&avp, ctx, offset, value_offset, 1, &mut retention)?;
                 validate_authorization_apn(&value)
                     .map_err(|reason| decode_error(reason, offset, "7.2.2.1.4"))?;
-                builder_helpers::set_once(&mut apn_configuration, value, offset, "7.2.2.1.4")?;
+                let authorized = SwmAuthorizedApnConfiguration::from_parsed(value, supplement)
+                    .map_err(|_| {
+                        decode_error(
+                            "SWm AAA APN-Configuration is not safe for authorization",
+                            offset,
+                            "7.2.2.1.4",
+                        )
+                    })?;
+                builder_helpers::set_once(&mut apn_configuration, authorized, offset, "7.2.2.1.4")?;
             } else if key == AvpKey::ietf(AVP_DRMP) {
                 parse_drmp(&avp, offset, value_offset, &mut drmp)?;
             } else if key == AvpKey::ietf(base::AVP_PROXY_INFO) {
@@ -3676,7 +3719,8 @@ fn validate_authorization_answer_for_encode(
         "7.2.2.1.4",
     )?;
     if let Some(apn) = answer.apn_configuration.as_ref() {
-        validate_authorization_apn(apn).map_err(|reason| encode_error(reason, "7.2.2.1.4"))?;
+        validate_authorization_apn(apn.core())
+            .map_err(|reason| encode_error(reason, "7.2.2.1.4"))?;
     }
     validate_additional_for_encode(
         &answer.additional_avps,

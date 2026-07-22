@@ -223,6 +223,82 @@ charging decisions, watchdog policy, or a carrier-ready EPC/ePDG product claim.
   User-Name and EAP identity contract without consumer-owned wire formatting.
   The top-level `Service-Selection` remains a distinct AVP and is not treated
   as that default pointer.
+
+  Modeled per-APN wire values are split between the typed
+  `ApnConfiguration` core and a sealed supplement.
+  `SwmAuthorizedApnConfiguration` adds bounded static served-party addresses,
+  VPLMN dynamic-address permission, canonical `SwmMip6AgentInfo`,
+  visited-network and PDN-GW allocation provenance, per-APN charging/APN-OI
+  replacement, and the 5GS interworking indicator. Its supplement is bound to
+  the entire core, including APN, PDN type, QoS, and AMBR. Reordering or
+  changing any public core field therefore fails before supplemental facts can
+  be exposed or encoded. Parsed supplemental values have no answer-local or
+  transaction-only getter. `SwmCorrelatedDiameterEapResponse` exposes them only
+  after authenticated connection generation, expected Origin-Host/Realm, and
+  complete DER/DEA correlation. Its `apn_configuration_views` method preserves
+  wildcard and future-PDN wire facts; its `authorized_apn_configurations`
+  method additionally rejects both as broad policy grants.
+
+  APN network identifiers follow TS 23.003 section 9.1.1, including the
+  63-octet label-encoded limit and reserved-name restrictions. An exact `*`
+  is a typed DER default-APN request and a TS 29.272 wildcard profile parent.
+  `Specific-APN-Info` is a bounded typed grouped value containing one concrete
+  APN, one canonical MIP6 gateway identity, an optional visited network, and
+  sealed optional extensions. Repeated ordered APN/gateway pairs are retained;
+  they can satisfy exact named-request correlation but do not select a product
+  APN or gateway and never turn the wildcard parent into a broad authorization
+  grant. QCI/ARP and AMBR are typed and range checked; extended AMBR values
+  above `u32::MAX` are represented in bits per second without truncation.
+
+  Originated profiles use the request-bound mutator so conditions cannot be
+  bypassed accidentally:
+
+  ```rust
+  use std::net::{IpAddr, Ipv4Addr};
+  use opc_proto_diameter::apps::swm::{
+      ApnConfiguration, PdnType, SwmAuthorizedApnConfiguration,
+      SwmPdnGwAllocationType,
+  };
+
+  # fn install(
+  #     request: &opc_proto_diameter::apps::swm::SwmDiameterEapRequestEnvelope,
+  #     answer: &mut opc_proto_diameter::apps::swm::SwmDiameterEapAnswer,
+  #     gateway: opc_proto_diameter::apps::swm::SwmMip6AgentInfo,
+  # ) -> Result<(), opc_proto_diameter::apps::swm::SwmApnConfigurationError> {
+  let core = ApnConfiguration {
+      context_identifier: 7,
+      service_selection: "ims.synthetic.invalid".to_owned().into(),
+      pdn_type: PdnType::Ipv4,
+      eps_subscribed_qos_profile: None,
+      ambr: None,
+  };
+  let authorized = SwmAuthorizedApnConfiguration::builder(core)
+      .add_served_party_ip_address(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10)))?
+      .with_mip6_agent_info(gateway)
+      .with_pdn_gw_allocation_type(SwmPdnGwAllocationType::Static)
+      .build()?;
+  answer.set_authorized_apn_profile_for(request, Some(7), vec![authorized])?;
+  # Ok(())
+  # }
+  ```
+
+  APN profile material requires exact base `DIAMETER_SUCCESS` and is forbidden
+  for an emergency DER. Network-based-only fields require explicit AAA NBM
+  selection, or trusted local `NetworkBased` provenance when the DEA omits its
+  mobility vector. Local address assignment permits only the HA-APN core plus
+  a gateway identity for IKEv2 Home-Agent discovery. If the DEA carries an
+  explicit local/non-NBM MIP6 vector, `MIP6_INTEGRATED` must prove that
+  discovery mode. A requested APN must be
+  represented. Unknown optional APN children follow `UnknownIePolicy`, are
+  retained only in sealed parser state, and share the DEA-wide 128-entry and
+  retained-byte budgets with top-level and nested mobility extensions.
+  Foreign-vendor numeric collisions remain unknown values, repeated typed
+  `Specific-APN-Info` values remain ordered, and only the exact nine APN child
+  identities prohibited by TS 29.273 section 8.2.3.7 are rejected.
+  The request-bound 3002/3004 agent-delivery profile treats the exact 3GPP
+  identities `(554, 10415)`, `(555, 10415)`, `(848, 10415)`, `(1432, 10415)`,
+  `(1438, 10415)`, `(1472, 10415)`, and `(1706, 10415)` as application-only;
+  numeric-code and foreign-vendor collisions stay outside that set.
 - `app-gx`, `app-s6a`, `app-s6b`, and `app-swx` currently provide dictionary
   slots rather than full typed application APIs.
 
@@ -1211,8 +1287,14 @@ value are not. It does not choose cache policy or mutate authorization state.
 RAR requires `AUTHORIZE_ONLY`, exact Session-Id/User-Name, and the addressed
 Destination-Host used by the procedure. AAR/AAA require
 `Auth-Request-Type = AUTHORIZE_ONLY`. AAA preserves exactly one base or grouped
-experimental result and optionally exposes a typed APN-Configuration on exact
-base success. RAA and AAA expose the optional typed Re-Auth-Request-Type and
+experimental result and optionally exposes a complete
+`SwmAuthorizedApnConfiguration` on exact base success. Its sealed supplement
+survives parse/build instead of being discarded. A plain parsed AAA exposes
+only `.core()` wire facts; call
+`SwmCorrelatedAuthorizationExchange::apn_configuration_view` for supplemental
+fields after authenticated connection, expected-Origin, and complete AAR/AAA
+request correlation. Unsupported PDN enum values remain available only on the
+raw DEA wire model and fail before they become AAA authorization. RAA and AAA expose the optional typed Re-Auth-Request-Type and
 preserve repeated Reply-Message values in their redaction-safe extension
 collections; RAR declares Reply-Message as a singleton. A protocol-error-class
 experimental result is rejected on origination because RFC 6733's E-bit

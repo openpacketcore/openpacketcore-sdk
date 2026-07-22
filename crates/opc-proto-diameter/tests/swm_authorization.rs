@@ -203,6 +203,22 @@ fn apn_configuration() -> Vec<u8> {
     apn_configuration_with(7, b"ims")
 }
 
+fn complete_apn_configuration() -> Vec<u8> {
+    let mut address = vec![0, 1];
+    address.extend_from_slice(&Ipv4Addr::new(198, 51, 100, 10).octets());
+    let children: Vec<u8> = [
+        vendor_avp(swm::AVP_CONTEXT_IDENTIFIER, 0x40, &7_u32.to_be_bytes()),
+        vendor_avp(swm::AVP_SERVED_PARTY_IP_ADDRESS, 0x40, &address),
+        vendor_avp(swm::AVP_PDN_TYPE, 0x40, &0_u32.to_be_bytes()),
+        avp(swm::AVP_SERVICE_SELECTION, 0x40, b"ims"),
+        avp(AvpCode::new(UNKNOWN + 7), 0x00, b"private-apn-extension"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    vendor_avp(swm::AVP_APN_CONFIGURATION, 0x40, &children)
+}
+
 fn aaa_avps() -> Vec<Vec<u8>> {
     vec![
         avp(base::AVP_SESSION_ID, 0x40, SESSION.as_bytes()),
@@ -1307,6 +1323,7 @@ fn aaa_fixture_has_answer_role_and_correlates() {
             .apn_configuration
             .as_ref()
             .expect("typed APN must be present")
+            .core()
             .service_selection
             .as_ref(),
         "ims"
@@ -1318,6 +1335,50 @@ fn aaa_fixture_has_answer_role_and_correlates() {
     request
         .correlate_answer(answer)
         .expect("exact AAR/AAA must correlate");
+}
+
+#[test]
+fn aaa_complete_apn_authorization_retains_supplement_and_round_trips() {
+    let request = parsed_authorization_request(&aar_wire(0xc0));
+    let mut avps = aaa_avps();
+    avps[7] = complete_apn_configuration();
+    let wire = message(265, 0x40, HOP_AAR, END_AAR, avps);
+    let answer = parsed_authorization_answer(&decode(&wire), CONNECTION_A);
+    let authorized = answer
+        .answer()
+        .apn_configuration
+        .as_ref()
+        .expect("typed complete APN authorization");
+    assert_eq!(authorized.core().service_selection.as_ref(), "ims");
+    let raw_debug = format!("{answer:?} {authorized:?}");
+    assert!(raw_debug.contains("supplement_sealed"));
+    for supplemental_marker in [
+        "served_party_ip_address_count",
+        "mip6_agent_info_present",
+        "extension_count",
+    ] {
+        assert!(!raw_debug.contains(supplemental_marker));
+    }
+
+    let rebuilt =
+        swm::build_swm_authorization_answer(&request, answer.answer(), EncodeContext::default())
+            .expect("complete typed AAA APN must rebuild");
+    assert_eq!(encode(&rebuilt), wire);
+
+    let correlated = request
+        .correlate_answer(answer)
+        .expect("complete AAA supplement requires strict AAR/AAA correlation");
+    let view = correlated
+        .apn_configuration_view()
+        .expect("correlated complete APN authorization");
+    assert_eq!(
+        view.served_party_ip_addresses(),
+        [IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10))]
+    );
+    assert_eq!(view.extension_metadata().count(), 1);
+    let debug = format!("{correlated:?} {view:?}");
+    assert!(!debug.contains("198.51.100.10"));
+    assert!(!debug.contains("private-apn-extension"));
 }
 
 #[test]
@@ -1336,18 +1397,16 @@ fn aaa_rejects_invalid_apn_profile_on_decode_and_encode() {
         "zero Context-Identifier must fail closed on decode"
     );
 
-    let request = parsed_authorization_request(&aar_wire(0xc0));
-    let mut answer =
-        swm::parse_swm_authorization_answer(&decode(&aaa_wire()), DecodeContext::default())
-            .expect("valid AAA must parse");
-    answer
-        .apn_configuration
-        .as_mut()
-        .expect("typed APN must be present")
-        .service_selection = Redacted::from(String::new());
+    let invalid = swm::SwmAuthorizedApnConfiguration::new(swm::ApnConfiguration {
+        context_identifier: 7,
+        service_selection: Redacted::from(String::new()),
+        pdn_type: swm::PdnType::Ipv4,
+        eps_subscribed_qos_profile: None,
+        ambr: None,
+    });
     assert!(
-        swm::build_swm_authorization_answer(&request, &answer, EncodeContext::default()).is_err(),
-        "empty Service-Selection must fail closed on encode"
+        invalid.is_err(),
+        "empty Service-Selection is unconstructible"
     );
 }
 

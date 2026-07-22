@@ -612,10 +612,19 @@ Top-level `Service-Selection` is not interpreted as the subscription default.
 Context-Identifier to its exact child APN configuration.
 
 Context identifiers and APN Service-Selection values are validated at both
-encode and parse boundaries. Child identifiers must be nonzero and unique,
-child Service-Selection values must be nonempty and unique, and a present
-nonzero default identifier must resolve to a supplied configuration. APN
-profile material is accepted only when Result-Code is exactly
+encode and parse boundaries. Child identifiers must be nonzero and unique.
+Child Service-Selection values must be unique APN Network Identifiers under TS
+23.003 section 9.1.1: their label-length encoding is at most 63 octets, labels
+have the required ASCII syntax and boundaries, reserved
+`rac`/`lac`/`sgsn`/`rnc` prefixes and a terminal `gprs` label are forbidden,
+and case is insignificant. Exact `*` is accepted as a typed DER request for
+the subscription default and as a raw TS 29.272 wildcard configuration. A
+nonempty wildcard response profile requires a nonzero projected default
+identifier that resolves to a supplied configuration. `Specific-APN-Info` is
+typed as an ordered concrete APN/gateway pair and may satisfy exact named DER
+correlation. The codec does not choose among repeated pairs, and a wildcard
+parent remains ineligible as a broad policy authorization. APN profile material
+is accepted only when Result-Code is exactly
 `DIAMETER_SUCCESS` (2001), not merely another 2xxx result. A missing default
 remains `None`; an unresolved or ambiguous profile fails closed, and the
 resolver independently returns `None` for any invalid profile.
@@ -634,13 +643,71 @@ profiles is ambiguous and fails closed; typed `set_once` checks independently
 protect singleton fields. The opt-in profile remains an interoperability
 extension and is not a baseline SWm cardinality claim.
 
-The modeled APN-Configuration child subset is `Context-Identifier`,
-`Service-Selection`, `PDN-Type`, `EPS-Subscribed-QoS-Profile` (QCI +
-Allocation-Retention-Priority), and `AMBR`. The remaining APN-Configuration
-children (for example `VPLMN-Dynamic-Address-Allowed`,
-`PDN-GW-Allocation-Type`, `MIP6-Agent-Info`, and
-the nested `3GPP-Charging-Characteristics`) are deliberately not modeled yet and are
-handled by the unknown-AVP policy.
+The SWm authorization projection of the TS 29.272 V19.5.0 APN value is split
+between the typed `ApnConfiguration` wire core and a sealed ordered supplement.
+`SwmAuthorizedApnConfiguration` is the originated construction boundary. A
+supplement stores an exact snapshot of its entire core and revalidates it
+before exposure or encoding; equality is ordinary structural equality.
+Reordering cores or changing Context-Identifier, Service-Selection, PDN-Type,
+QoS, or AMBR fails closed instead of transplanting addresses or gateway facts.
+There is no answer-local or transaction-only supplemental APN getter.
+`SwmCorrelatedDiameterEapResponse::apn_configuration_views` provides
+structurally checked wire facts only after the response is bound to the expected
+authenticated connection generation and Origin-Host/Realm as well as the full
+DER/DEA transaction and application facts. Its
+`authorized_apn_configurations` method additionally rejects wildcard parents
+and unsupported PDN enum values as broad authorization grants. Both remain
+preserved and re-encodable on the raw answer core surface.
+
+The understood outer `APN-Configuration` requires V, clears P, and accepts
+either inbound M shape under TS 29.273 table 7.2.3.1/1 note 2; canonical
+encoding always sets M. Every understood nested APN, QoS, ARP, and AMBR child
+likewise ignores only a received M-bit mismatch while still enforcing exact V,
+P, type, width, and cardinality, then emits the defining canonical M value.
+
+| APN child | Typed surface and wire contract | Validation evidence |
+|---|---|---|
+| `Context-Identifier`, `Service-Selection`, `PDN-Type` | Typed core; 3GPP Context/PDN children canonically set V/M and clear P, while IETF Service-Selection clears V/P and sets M | Required singletons; identifiers are nonzero/unique; named APNs satisfy the complete TS 23.003 Network-Identifier grammar and are unique case-insensitively. Exact request wildcard selection resolves only through the default pointer. Raw wildcard profiles and unknown PDN enum values round-trip but are rejected by the authorization view. |
+| `Served-Party-IP-Address` | Ordered `IpAddr` slice; code 848/vendor 10415, Address, canonical V/M set and P clear; TS 32.299 section 7.2.187 | Zero to two values, no repeated family, IPv6 lower 64 bits zero, assignable unicast semantics, and family compatibility with PDN-Type. Truncation, third values, duplicate families, unspecified/broadcast/multicast/loopback/link-local values, and noncanonical prefixes fail. Private, CGNAT, ULA, and documentation ranges remain representable. |
+| `EPS-Subscribed-QoS-Profile`, `Allocation-Retention-Priority` | `SwmQosClassIdentifier`, `SwmPriorityLevel`, and typed pre-emption enums; all grouped/leaf values canonically set V/M and clear P | QCI admits assigned 1-9, 65-67, 69-76, 79-80, 82-85 and operator-specific 128-254 values; spare/reserved values fail. Priority is 1-15; both pre-emption fields are 0/1 with their specified absent defaults. Missing/duplicate children, wrong widths, V/P, or nested cardinality fail. |
+| `AMBR` | Exact `SwmBandwidth` UL/DL values; base codes 516/515 plus extended codes 555/554, all canonical V/M set and P clear | Values 1 through `u32::MAX` use the base AVP. Higher exactly representable multiples of 1000 use a saturated base plus extended kbps through `u32::MAX * 1000` bps. Zero, the 4,294,967,296-4,294,967,999 gap, inconsistent extended/base pairs, overflow, missing/duplicate children, and wrong flags fail. It is NBM-only. |
+| `VPLMN-Dynamic-Address-Allowed` | `SwmVplmnDynamicAddressAllowed`; code 1432/vendor 10415, Enumerated, V/M set and P clear | Width, enum, flags, vendor, and singleton violations fail. |
+| `MIP6-Agent-Info` | Reuses the canonical `SwmMip6AgentInfo` codec | Empty identity, excessive addresses, host/prefix/cardinality/depth violations, and unknown mandatory children fail. APN nested extensions consume the same DEA retention budget. |
+| `Visited-Network-Identifier`, `PDN-GW-Allocation-Type` | Reuses `SwmVisitedNetworkIdentifier` plus `SwmPdnGwAllocationType`; allocation code 1438/vendor 10415 is Enumerated with V/M set and P clear | Allocation cannot appear without a gateway. A visited identifier requires explicit Dynamic allocation; Dynamic does not require the optional identifier. |
+| `Specific-APN-Info` | `SwmSpecificApnInfo`; code 1472/vendor 10415, Grouped and repeatable only below parent `Service-Selection == "*"`; canonical outer V/M set and P clear; exactly one concrete IETF Service-Selection, exactly one canonical IETF MIP6-Agent-Info, optional singleton 3GPP Visited-Network-Identifier, then sealed optional extensions | Missing/duplicate known children, nested wildcard/invalid APN, concrete parent, wrong type/vendor/V/P/length, malformed gateway or visited network, excessive count/depth, and unknown mandatory children fail. Received M mismatches are tolerated for understood values and rebuild canonically. Repeated ordered APN/gateway pairs—including the same APN—remain distinct; product selection is outside the codec. Unknown optional children share the DEA retention budget. |
+| `3GPP-Charging-Characteristics`, `APN-OI-Replacement` | Reuses the canonical subscriber-profile `SwmChargingCharacteristics` and `SwmApnOiReplacement` values | Exact width/string grammar, flags, vendor, singleton cardinality, and NBM request conditioning are shared with the DEA subscriber authorization surface. |
+| `Interworking-5GS-Indicator` | `SwmInterworking5gsIndicator`; code 1706/vendor 10415, Enumerated, V set and M/P clear | Only values 0 and 1 are accepted; absent means not subscribed. It is NBM-only. |
+| trailing optional `AVP` | Sealed ordered extension replay with value-free metadata | `Preserve` retains optional M-clear exact bytes, `Drop` discards, `Reject` fails, and unknown mandatory children always fail. Nested APN, nested MIP6, and top-level DEA extensions share one 128-entry plus retained-byte budget. |
+
+The request-bound mutator is atomic and requires an exact DER envelope, exact
+base `DIAMETER_SUCCESS`, a non-emergency request, request/answer identity and
+mobility correlation, and inclusion of an explicitly requested APN. Explicit
+DEA PMIPv6/GTPv2 selection takes precedence. Otherwise typed local
+`NetworkBased` provenance permits the NBM field set, while
+`LocalIpAddressAssignment` restricts each APN to HA-APN plus PDN-GW identity
+for IKEv2 Home-Agent discovery. An explicit local/non-NBM DEA vector must also
+set `MIP6_INTEGRATED`; contradictory AAA evidence fails rather than falling
+back to local provenance. Product APN selection and gateway policy remain
+outside the codec.
+
+Only the nine exact TS 29.273 section 8.2.3.7 prohibited child identities are
+rejected: LIPA-Permission, Restoration-Priority,
+SIPTO-Local-Network-Permission, WLAN-Offloadability,
+Non-IP-PDN-Type-Indicator, Non-IP-Data-Delivery-Mechanism, SCEF-Realm,
+Preferred-Data-Mode, and SCEF-ID. Specific-APN-Info is a typed repeatable group
+under the conservative dictionary. SIPTO-Permission,
+PDN-Connection-Continuity, RDS-Indicator, and Ethernet-PDN-Type-Indicator are
+not hard-rejected; they follow the unknown policy until a typed SWm meaning is
+modeled. Foreign-vendor numeric collisions likewise remain ordinary unknown
+optional AVPs. Synthetic independent fixtures cover exact identities,
+canonical flags/order, byte-exact replay, shared retention exhaustion,
+semantic contradictions, and redaction-safe diagnostics.
+
+The request-bound 3002/3004 agent-delivery classifier includes the exact SWm
+application-only 3GPP identities `(554, 10415)`, `(555, 10415)`,
+`(848, 10415)`, `(1432, 10415)`, `(1438, 10415)`, `(1472, 10415)`, and
+`(1706, 10415)`. Numeric-code or foreign-vendor collisions are not members of
+that set.
 
 #### SWm Session-Termination scope
 
@@ -902,7 +969,14 @@ High-Priority-Access-Info, Authorization-Lifetime and Auth-Grace-Period hints,
 DRMP, routing, proxy, overload, and extension state.
 Ordinary AAA clears R/T, requires the correlated session/request type/user and exactly
 one base Result-Code or grouped Experimental-Result, and exposes an optional
-typed APN-Configuration only on exact base `DIAMETER_SUCCESS`. It exposes the
+complete `SwmAuthorizedApnConfiguration` only on exact base
+`DIAMETER_SUCCESS`. Parsing preserves the APN supplement rather than reducing
+it to the five-field core, and encoding restores the complete value. A plain
+parsed AAA exposes only `.core()` wire facts; addresses, gateway, charging,
+APN-OI, interworking, and sealed extension metadata become visible only through
+`SwmCorrelatedAuthorizationExchange::apn_configuration_view` after authenticated
+connection, expected-Origin, and complete AAR/AAA request correlation.
+Unsupported raw PDN enum values fail at this authorization boundary. It exposes the
 optional typed Re-Auth-Request-Type, Authorization-Lifetime,
 Auth-Grace-Period, and TS 29.273 Session-Timeout, and preserves repeated
 Reply-Message values. All timer AVPs are singleton Unsigned32 values with
