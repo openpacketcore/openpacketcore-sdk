@@ -12,6 +12,132 @@ dictionaries and typed helpers.
 It does not provide peer transport, realm routing, AAA/HSS/CDF behavior,
 charging decisions, watchdog policy, or a carrier-ready EPC/ePDG product claim.
 
+## Direct and in-band transport-protection readiness boundary
+
+`PeerProtectionRequirement` retains both the transport mechanism and the RFC
+6733 sequence. Its private fields and four typed constructors prevent an
+unprotected or sequence-less requirement. Wrap one in
+`PeerProtectionPolicy::Require(...)` when constructing `PeerSession`:
+
+- `direct_tls_tcp` and `direct_dtls_sctp` require protection before any
+  Diameter bytes;
+- `inband_tls_tcp` and `inband_dtls_sctp` permit only CER/CEA first, select wire
+  `Inband-Security-Id` 1, and then require protection before any other command.
+
+Wire value 1 advertises both TLS/TCP and DTLS/SCTP, while the typed requirement
+records the exact transport so one cannot attest the other. For the in-band
+sequence, an omitted `Inband-Security-Id` has RFC 6733's effective support set
+`{0}` and explicit disjoint sets never gain an implicit zero. For the direct
+sequence, the AVP is still parsed but is not a protection prerequisite and does
+not trigger a second handshake.
+
+The transport allocates a process-unique, monotonically increasing
+`PeerSessionGeneration` for each connection candidate and uses the
+generation-bound CER/CEA and lifecycle methods. One generation can be either a
+CER initiator or responder, never both. During simultaneous open, the transport
+elects the winning candidate and binds it as a fresh generation. Delayed
+messages or lifecycle events from a losing connection cannot create, revoke, or
+poison readiness on the winner.
+
+The direct TLS/TCP initiator flow is:
+
+```rust,ignore
+let requirement = PeerProtectionRequirement::direct_tls_tcp();
+let mut session = PeerSession::with_policy_and_protection(
+    local_capabilities,
+    session_policy,
+    PeerProtectionPolicy::Require(requirement),
+);
+session.begin_connection_generation(connection_generation)?;
+
+let pending = session.pending_protection().ok_or(AppError::TlsNotPending)?;
+// Complete TLS/TCP and mutual peer-identity verification before any Diameter.
+session.attest_mutually_authenticated_protection(
+    &pending,
+    PeerProtectionMechanism::TlsTcp,
+)?;
+// Protection evidence is now ready, but product traffic remains blocked until
+// the correlated CER/CEA succeeds.
+session.capabilities_request_sent_on(connection_generation, &cer_header)?;
+session.observe_capabilities_answer_on(connection_generation, &cea_header, &cea)?;
+
+session.admit_message(
+    connection_generation,
+    PeerMessageDirection::Outbound,
+    &application_header,
+)?;
+```
+
+The in-band initiator instead completes CER/CEA before taking the pending token:
+
+```rust,ignore
+let requirement = PeerProtectionRequirement::inband_tls_tcp();
+let mut session = PeerSession::with_policy_and_protection(
+    local_capabilities,
+    session_policy,
+    PeerProtectionPolicy::Require(requirement),
+);
+session.begin_connection_generation(connection_generation)?;
+session.capabilities_request_sent_on(connection_generation, &cer_header)?;
+session.observe_capabilities_answer_on(connection_generation, &cea_header, &cea)?;
+
+let pending = session.pending_protection().ok_or(AppError::TlsNotPending)?;
+// Complete in-band TLS/TCP and mutual peer-identity verification immediately.
+session.attest_mutually_authenticated_protection(
+    &pending,
+    PeerProtectionMechanism::TlsTcp,
+)?;
+
+session.admit_message(
+    connection_generation,
+    PeerMessageDirection::Outbound,
+    &application_header,
+)?;
+```
+
+A responder instead calls `capabilities_request_received_on` and prepares the
+one exact matching typed CEA through the session boundary:
+
+```rust,ignore
+let emission = session.prepare_capabilities_answer_on(
+    connection_generation,
+    &cea,
+    EncodeContext::default(),
+)?;
+transport.write_all(emission.as_bytes())?;
+```
+
+Preparation rejects a Result-Code that contradicts the retained CER projection.
+For in-band protection it also rejects a security advertisement that differs
+from local effective support; direct protection deliberately does not use that
+AVP as a prerequisite. Preparation canonically serializes the retained
+transaction identifiers and typed answer, then consumes that transaction before
+returning immutable bytes. A retry must replay those same retained bytes; a
+transport failure requires a new connection generation rather than rebuilding a
+different CEA. Header-only outbound CEA admission is unavailable. Only
+successful in-band preparation makes `pending_protection` available. Direct
+preparation retains the already-attested evidence and completes peer readiness.
+While any protection attempt is pending, `admit_message` rejects every Diameter
+header, including CER and CEA.
+Generation-bound watchdog and disconnect operations require the exact DWR/DWA
+or DPR/DPA header and re-evaluate command admission immediately before state
+mutation. They therefore cannot mutate a CER/CEA-only or protection-pending
+session. Reconnect, backoff, and failure events on a protected policy must also
+use their `_on(connection_generation, ...)` forms. The legacy unbound forms
+cannot mutate protected readiness. Late facts from an older generation neither
+unlock nor poison the current connection. Received CEA parsing and session
+completion require the E bit to agree exactly with the Result-Code family.
+
+The default `PeerSession::new` and `PeerSession::with_policy` constructors keep
+the existing explicit no-in-band-security behavior. Such sessions may be
+traffic-ready, but `protection_readiness().protected_ready()` is always false
+and admissions report `is_protected() == false`.
+
+This boundary does not open sockets, perform TLS/TCP or DTLS/SCTP framing,
+select a crypto provider, validate certificates, or rotate credentials. The
+caller's attestation is a typed assertion after those transport-owned checks;
+it is not itself cryptographic proof.
+
 ## API Shape
 
 - Root types include `Header`, `Message<'a>`, `OwnedMessage`, `AvpHeader`,
@@ -62,7 +188,20 @@ charging decisions, watchdog policy, or a carrier-ready EPC/ePDG product claim.
   `AvpDataType`, `AvpFlagRules`, and related metadata types.
 - The `peer` feature adds transport-neutral CER/CEA, DWR/DWA, DPR/DPA
   builders/parsers, capability negotiation helpers, result-code helpers, and
-  `PeerSession` projection state. Its trusted CER/CEA command profiles permit
+  `PeerSession` projection state. An explicit sequence-aware
+  `PeerProtectionRequirement` adds a generation-bound RFC 6733 direct or in-band
+  TLS/TCP or DTLS/SCTP readiness boundary. Direct mode admits no Diameter before
+  protection and only CER/CEA until capability success; in-band mode permits
+  exact CER/CEA before its handshake. The responder may prepare one immutable
+  canonical CEA emission, and no Diameter message is admitted while a selected
+  protection handshake is pending. Generation-bound DWR/DWA/DPR/DPA mutations include
+  exact-header command admission, and CEA E-bit/Result-Code mismatches fail
+  before consuming the retained transaction. Traffic becomes ready only after
+  the caller attests the exact selected mechanism and the required sequence
+  completes for the current connection and protection generations.
+  The default compatibility policy preserves effective no-in-band-security
+  behavior but never reports protected readiness. Its trusted CER/CEA command
+  profiles permit
   the six explicitly repeatable RFC 6733 capability AVPs, including every
   advertised Host-IP-Address for an SCTP-multihomed peer; singleton fields and
   the watchdog/disconnect profiles retain conservative duplicate rejection.

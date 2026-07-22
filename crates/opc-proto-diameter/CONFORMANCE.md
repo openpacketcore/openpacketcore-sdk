@@ -180,7 +180,7 @@ Feature-gated under the `peer` feature.
 
 | Procedure | Request | Answer | Notes |
 |:----------|:--------|:-------|:------|
-| Capabilities-Exchange | CER | CEA | Full capability AVPs, plus minimal protocol-error answer helper. |
+| Capabilities-Exchange | CER | CEA | Full capability AVPs, minimal protocol-error answer helper, and generation-bound direct or in-band TLS/TCP or DTLS/SCTP readiness/admission state. |
 | Device-Watchdog | DWR | DWA | Optional `Origin-State-Id`. |
 | Disconnect-Peer | DPR | DPA | `Disconnect-Cause` enumeration. |
 
@@ -188,6 +188,33 @@ Peer helpers include:
 - Capability intersection (`CapabilityNegotiation`) with Relay Application Id
   awareness.
 - Result-code family classification and E-bit derivation per RFC 6733 §7.2.
+- Explicit RFC 6733 direct-before-capabilities and in-band-after-capabilities
+  TLS/TCP and DTLS/SCTP requirements. Pending tokens, evidence, readiness, and
+  command admissions retain the exact sequence and transport kind. Direct mode
+  admits no Diameter before protection attestation, then admits only CER/CEA;
+  application readiness remains false until capability success. In-band mode
+  permits only CER/CEA before the handshake and requires wire
+  `Inband-Security-Id` 1. In that mode an omitted AVP has effective support
+  `{0}` and explicit disjoint sets do not receive a fallback. Direct mode still
+  parses the AVP but does not use it as a prerequisite or start a second
+  handshake.
+  Generation-bound CER/CEA correlation produces the responder's one matching
+  typed cleartext CEA as immutable, canonically serialized bytes before the
+  retained transaction is consumed. Header-only outbound CEA admission is not
+  available. One generation cannot combine initiator and responder
+  roles; simultaneous-open election remains transport-owned. Every
+  protected-policy watchdog/disconnect message mutation re-evaluates the exact
+  DWR/DWA/DPR/DPA header admission; reconnect/backoff/failure events are also
+  generation-bound. Stale, CER/CEA-only, protection-pending, and legacy-unbound
+  events cannot mutate a winner. Contradictory CEA result/security content in
+  the applicable in-band sequence, or
+  E-bit/Result-Code family, downgrade, handshake failure, disconnect, and
+  cloned state fail closed without consuming retryable capability evidence.
+  `DIAMETER_NO_COMMON_SECURITY` (5017) retains the required non-E-bit
+  permanent-error shape.
+- Compatibility no-in-band-security sessions preserve their existing traffic
+  behavior while reporting neither mutually authenticated evidence nor
+  protected readiness.
 - Optional answer diagnostics (`Error-Message`, raw `Failed-AVP` values).
 - Provenance-aware CER, DWR, and DPR request parsers; their legacy forms return
   byte-for-byte equivalent `DecodeError` values.
@@ -1435,6 +1462,10 @@ The following are outside the current crate scope:
 - Complete 3GPP Rf/SWm/Gx/S6a/S6b/SWx application coverage beyond the current
   Rf accounting and SWm Diameter-EAP, Session-Termination, Abort-Session,
   Re-Auth, and AA typed subsets.
-- Transport operations, TCP/SCTP transport, TLS/TLS-PSK handling, realm routing,
-  peer topology, watchdog thresholds, failover state machines, AAA/HSS/CDF
-  behavior, charging decisions, and deployment readiness policy.
+- Transport operations, TCP/SCTP framing/connectors, TLS handshakes and
+  certificate validation, DTLS/SCTP, credential rotation, crypto-provider
+  binding, realm routing, peer topology, watchdog thresholds, failover state
+  machines, AAA/HSS/CDF behavior, charging decisions, and deployment readiness
+  policy. The peer state machine consumes a caller assertion only after the
+  transport performs mutual authentication; it does not claim cryptographic
+  proof or a complete protected transport.

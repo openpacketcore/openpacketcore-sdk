@@ -146,6 +146,8 @@ pub const RESULT_CODE_DIAMETER_INVALID_BIT_IN_HEADER: u32 = 5013;
 pub const RESULT_CODE_DIAMETER_INVALID_AVP_LENGTH: u32 = 5014;
 /// Invalid AVP flag-bit combination permanent-failure result code.
 pub const RESULT_CODE_DIAMETER_INVALID_AVP_BIT_COMBO: u32 = 5016;
+/// No common security mechanism permanent-failure result code.
+pub const RESULT_CODE_DIAMETER_NO_COMMON_SECURITY: u32 = 5017;
 /// Inband-Security-Id value for no in-band security.
 pub const INBAND_SECURITY_ID_NO_INBAND_SECURITY: u32 = 0;
 /// Inband-Security-Id value for TLS.
