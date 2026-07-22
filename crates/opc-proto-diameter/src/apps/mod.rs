@@ -47,6 +47,8 @@ pub mod gx {
 /// 3GPP Rf accounting application dictionary.
 #[cfg(feature = "app-rf")]
 pub mod rf;
+#[cfg(any(feature = "app-rf", feature = "app-swm"))]
+mod subscription_id;
 
 /// 3GPP S6a/S6d application dictionary skeleton.
 #[cfg(feature = "app-s6a")]

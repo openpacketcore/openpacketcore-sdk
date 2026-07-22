@@ -12,7 +12,7 @@
 //! typed request-conditioned RFC 7683 baseline loss-overload offer/report,
 //! ordered RFC 8583 Diameter Load context, typed successful-session timer
 //! context, request-bound canonical RFC 5447 serving/emergency gateway
-//! context, and a bounded
+//! context, typed redaction-safe top-level DEA subscriber facts, and a bounded
 //! subscription-profile extension surface for APN-Configuration, its default
 //! Context-Identifier, Service-Selection, and the TS 29.273 emergency attach
 //! sequence. The top-level default pointer is accepted under the DEA
@@ -60,10 +60,15 @@ use crate::{
 };
 
 mod authorization;
+mod dea_authorization;
 mod lifecycle;
 mod mobility;
 
+pub use super::subscription_id::{
+    AVP_SUBSCRIPTION_ID, AVP_SUBSCRIPTION_ID_DATA, AVP_SUBSCRIPTION_ID_TYPE,
+};
 pub use authorization::*;
+pub use dea_authorization::*;
 pub use lifecycle::*;
 pub use mobility::*;
 
@@ -127,6 +132,16 @@ pub const AVP_TERMINAL_INFORMATION: AvpCode = AvpCode::new(1401);
 pub const AVP_IMEI: AvpCode = AvpCode::new(1402);
 /// Software-Version AVP code (3GPP TS 29.272 §7.3.5).
 pub const AVP_SOFTWARE_VERSION: AvpCode = AvpCode::new(1403);
+/// APN-OI-Replacement AVP code (3GPP TS 29.272 section 7.3.32).
+pub const AVP_APN_OI_REPLACEMENT: AvpCode = AvpCode::new(1427);
+/// 3GPP-Charging-Characteristics AVP code (3GPP TS 29.061 section 16.4.7).
+pub const AVP_3GPP_CHARGING_CHARACTERISTICS: AvpCode = AvpCode::new(13);
+/// UE-Usage-Type AVP code (3GPP TS 29.272 section 7.3.202).
+pub const AVP_UE_USAGE_TYPE: AvpCode = AvpCode::new(1680);
+/// Core-Network-Restrictions AVP code (3GPP TS 29.272 section 7.3.230).
+pub const AVP_CORE_NETWORK_RESTRICTIONS: AvpCode = AvpCode::new(1704);
+/// MPS-Priority AVP code (3GPP TS 29.272 section 7.3.131).
+pub const AVP_MPS_PRIORITY: AvpCode = AvpCode::new(1616);
 
 /// Emergency-Indication bit in the Emergency-Services AVP.
 pub const EMERGENCY_SERVICES_EMERGENCY_INDICATION: u32 = 1 << 0;
@@ -210,7 +225,7 @@ pub const APPLICATION: ApplicationDefinition = ApplicationDefinition::new(
     SpecRef::new("3gpp", "TS29273", "SWm Diameter application"),
 );
 
-static SWM_REQUEST_AVP_RULES: [CommandAvpRule; 32] = [
+static SWM_REQUEST_AVP_RULES: [CommandAvpRule; 38] = [
     CommandAvpRule::new(
         AvpKey::ietf(base::AVP_SESSION_ID),
         AvpCardinality::ZeroOrOne,
@@ -308,6 +323,27 @@ static SWM_REQUEST_AVP_RULES: [CommandAvpRule; 32] = [
         AvpCardinality::Forbidden,
     ),
     CommandAvpRule::new(
+        AvpKey::vendor(AVP_APN_OI_REPLACEMENT, VENDOR_ID_3GPP),
+        AvpCardinality::Forbidden,
+    ),
+    CommandAvpRule::new(AvpKey::ietf(AVP_SUBSCRIPTION_ID), AvpCardinality::Forbidden),
+    CommandAvpRule::new(
+        AvpKey::vendor(AVP_3GPP_CHARGING_CHARACTERISTICS, VENDOR_ID_3GPP),
+        AvpCardinality::Forbidden,
+    ),
+    CommandAvpRule::new(
+        AvpKey::vendor(AVP_UE_USAGE_TYPE, VENDOR_ID_3GPP),
+        AvpCardinality::Forbidden,
+    ),
+    CommandAvpRule::new(
+        AvpKey::vendor(AVP_CORE_NETWORK_RESTRICTIONS, VENDOR_ID_3GPP),
+        AvpCardinality::Forbidden,
+    ),
+    CommandAvpRule::new(
+        AvpKey::vendor(AVP_MPS_PRIORITY, VENDOR_ID_3GPP),
+        AvpCardinality::Forbidden,
+    ),
+    CommandAvpRule::new(
         AvpKey::ietf(base::AVP_PROXY_INFO),
         AvpCardinality::ZeroOrMore,
     ),
@@ -317,7 +353,7 @@ static SWM_REQUEST_AVP_RULES: [CommandAvpRule; 32] = [
     ),
 ];
 
-static SWM_ANSWER_AVP_RULES: [CommandAvpRule; 34] = [
+static SWM_ANSWER_AVP_RULES: [CommandAvpRule; 40] = [
     CommandAvpRule::new(AvpKey::ietf(AVP_STATE), AvpCardinality::ZeroOrMore),
     CommandAvpRule::new(
         AvpKey::ietf(base::AVP_RESULT_CODE),
@@ -430,9 +466,30 @@ static SWM_ANSWER_AVP_RULES: [CommandAvpRule; 34] = [
         AvpKey::ietf(base::AVP_FAILED_AVP),
         AvpCardinality::ZeroOrMore,
     ),
+    CommandAvpRule::new(
+        AvpKey::vendor(AVP_APN_OI_REPLACEMENT, VENDOR_ID_3GPP),
+        AvpCardinality::ZeroOrOne,
+    ),
+    CommandAvpRule::new(AvpKey::ietf(AVP_SUBSCRIPTION_ID), AvpCardinality::ZeroOrOne),
+    CommandAvpRule::new(
+        AvpKey::vendor(AVP_3GPP_CHARGING_CHARACTERISTICS, VENDOR_ID_3GPP),
+        AvpCardinality::ZeroOrOne,
+    ),
+    CommandAvpRule::new(
+        AvpKey::vendor(AVP_UE_USAGE_TYPE, VENDOR_ID_3GPP),
+        AvpCardinality::ZeroOrOne,
+    ),
+    CommandAvpRule::new(
+        AvpKey::vendor(AVP_CORE_NETWORK_RESTRICTIONS, VENDOR_ID_3GPP),
+        AvpCardinality::ZeroOrOne,
+    ),
+    CommandAvpRule::new(
+        AvpKey::vendor(AVP_MPS_PRIORITY, VENDOR_ID_3GPP),
+        AvpCardinality::ZeroOrOne,
+    ),
 ];
 
-static SWM_PROJECTED_PROFILE_ANSWER_AVP_RULES: [CommandAvpRule; 34] = [
+static SWM_PROJECTED_PROFILE_ANSWER_AVP_RULES: [CommandAvpRule; 40] = [
     CommandAvpRule::new(AvpKey::ietf(AVP_STATE), AvpCardinality::ZeroOrMore),
     CommandAvpRule::new(
         AvpKey::ietf(base::AVP_RESULT_CODE),
@@ -544,6 +601,27 @@ static SWM_PROJECTED_PROFILE_ANSWER_AVP_RULES: [CommandAvpRule; 34] = [
     CommandAvpRule::new(
         AvpKey::ietf(base::AVP_FAILED_AVP),
         AvpCardinality::ZeroOrMore,
+    ),
+    CommandAvpRule::new(
+        AvpKey::vendor(AVP_APN_OI_REPLACEMENT, VENDOR_ID_3GPP),
+        AvpCardinality::ZeroOrOne,
+    ),
+    CommandAvpRule::new(AvpKey::ietf(AVP_SUBSCRIPTION_ID), AvpCardinality::ZeroOrOne),
+    CommandAvpRule::new(
+        AvpKey::vendor(AVP_3GPP_CHARGING_CHARACTERISTICS, VENDOR_ID_3GPP),
+        AvpCardinality::ZeroOrOne,
+    ),
+    CommandAvpRule::new(
+        AvpKey::vendor(AVP_UE_USAGE_TYPE, VENDOR_ID_3GPP),
+        AvpCardinality::ZeroOrOne,
+    ),
+    CommandAvpRule::new(
+        AvpKey::vendor(AVP_CORE_NETWORK_RESTRICTIONS, VENDOR_ID_3GPP),
+        AvpCardinality::ZeroOrOne,
+    ),
+    CommandAvpRule::new(
+        AvpKey::vendor(AVP_MPS_PRIORITY, VENDOR_ID_3GPP),
+        AvpCardinality::ZeroOrOne,
     ),
 ];
 
@@ -566,6 +644,17 @@ static SUPPORTED_FEATURES_AVP_RULES: [CommandAvpRule; 3] = [
     ),
     CommandAvpRule::new(
         AvpKey::vendor(AVP_FEATURE_LIST, VENDOR_ID_3GPP),
+        AvpCardinality::ZeroOrOne,
+    ),
+];
+
+static SUBSCRIPTION_ID_AVP_RULES: [CommandAvpRule; 2] = [
+    CommandAvpRule::new(
+        AvpKey::ietf(AVP_SUBSCRIPTION_ID_TYPE),
+        AvpCardinality::ZeroOrOne,
+    ),
+    CommandAvpRule::new(
+        AvpKey::ietf(AVP_SUBSCRIPTION_ID_DATA),
         AvpCardinality::ZeroOrOne,
     ),
 ];
@@ -676,7 +765,7 @@ pub const COMMAND_DIAMETER_EAP_ANSWER_PROJECTED_PROFILE: CommandDefinition =
     )
     .with_avp_rules(&SWM_PROJECTED_PROFILE_ANSWER_AVP_RULES);
 
-const SWM_AVPS: [AvpDefinition; 54] = [
+const SWM_AVPS: [AvpDefinition; 62] = [
     AvpDefinition::new(
         AvpKey::ietf(AVP_EAP_PAYLOAD),
         "EAP-Payload",
@@ -759,6 +848,95 @@ const SWM_AVPS: [AvpDefinition; 54] = [
         SpecRef::new("3gpp", "TS29272", "7.3.210"),
     )
     .with_grouped_avp_rules(&EMERGENCY_INFO_AVP_RULES),
+    AvpDefinition::new(
+        AvpKey::vendor(AVP_APN_OI_REPLACEMENT, VENDOR_ID_3GPP),
+        "APN-OI-Replacement",
+        AvpDataType::Utf8String,
+        AvpFlagRules::new(
+            FlagRequirement::MustBeSet,
+            FlagRequirement::MayBeSet,
+            FlagRequirement::MustBeUnset,
+        ),
+        SpecRef::new("3gpp", "TS29272", "7.3.32"),
+    ),
+    AvpDefinition::new(
+        AvpKey::ietf(AVP_SUBSCRIPTION_ID),
+        "Subscription-Id",
+        AvpDataType::Grouped,
+        AvpFlagRules::new(
+            FlagRequirement::MustBeUnset,
+            FlagRequirement::MayBeSet,
+            FlagRequirement::MayBeSet,
+        ),
+        SpecRef::new("ietf", "RFC4006", "8.46"),
+    )
+    .with_grouped_avp_rules(&SUBSCRIPTION_ID_AVP_RULES),
+    AvpDefinition::new(
+        AvpKey::ietf(AVP_SUBSCRIPTION_ID_TYPE),
+        "Subscription-Id-Type",
+        AvpDataType::Enumerated,
+        AvpFlagRules::new(
+            FlagRequirement::MustBeUnset,
+            FlagRequirement::MustBeSet,
+            FlagRequirement::MayBeSet,
+        ),
+        SpecRef::new("ietf", "RFC4006", "8.47"),
+    ),
+    AvpDefinition::new(
+        AvpKey::ietf(AVP_SUBSCRIPTION_ID_DATA),
+        "Subscription-Id-Data",
+        AvpDataType::Utf8String,
+        AvpFlagRules::new(
+            FlagRequirement::MustBeUnset,
+            FlagRequirement::MustBeSet,
+            FlagRequirement::MayBeSet,
+        ),
+        SpecRef::new("ietf", "RFC4006", "8.48"),
+    ),
+    AvpDefinition::new(
+        AvpKey::vendor(AVP_3GPP_CHARGING_CHARACTERISTICS, VENDOR_ID_3GPP),
+        "3GPP-Charging-Characteristics",
+        AvpDataType::Utf8String,
+        AvpFlagRules::new(
+            FlagRequirement::MustBeSet,
+            FlagRequirement::MayBeSet,
+            FlagRequirement::MayBeSet,
+        ),
+        SpecRef::new("3gpp", "TS29061", "16.4.7"),
+    ),
+    AvpDefinition::new(
+        AvpKey::vendor(AVP_UE_USAGE_TYPE, VENDOR_ID_3GPP),
+        "UE-Usage-Type",
+        AvpDataType::Unsigned32,
+        AvpFlagRules::new(
+            FlagRequirement::MustBeSet,
+            FlagRequirement::MayBeSet,
+            FlagRequirement::MustBeUnset,
+        ),
+        SpecRef::new("3gpp", "TS29272", "7.3.202"),
+    ),
+    AvpDefinition::new(
+        AvpKey::vendor(AVP_CORE_NETWORK_RESTRICTIONS, VENDOR_ID_3GPP),
+        "Core-Network-Restrictions",
+        AvpDataType::Unsigned32,
+        AvpFlagRules::new(
+            FlagRequirement::MustBeSet,
+            FlagRequirement::MayBeSet,
+            FlagRequirement::MustBeUnset,
+        ),
+        SpecRef::new("3gpp", "TS29272", "7.3.230"),
+    ),
+    AvpDefinition::new(
+        AvpKey::vendor(AVP_MPS_PRIORITY, VENDOR_ID_3GPP),
+        "MPS-Priority",
+        AvpDataType::Unsigned32,
+        AvpFlagRules::new(
+            FlagRequirement::MustBeSet,
+            FlagRequirement::MayBeSet,
+            FlagRequirement::MustBeUnset,
+        ),
+        SpecRef::new("3gpp", "TS29272", "7.3.131"),
+    ),
     AvpDefinition::new(
         AvpKey::ietf(AVP_QOS_CAPABILITY),
         "QoS-Capability",
@@ -1706,6 +1884,18 @@ impl SwmDiameterTransaction {
     }
 }
 
+/// Trusted mobility mode configured locally for one SWm request boundary.
+///
+/// This is application-side provenance and has no Diameter wire
+/// representation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SwmLocallyConfiguredMobilityMode {
+    /// The ePDG uses a network-based mobility protocol selected locally.
+    NetworkBased,
+    /// The ePDG assigns the UE address locally without network-based mobility.
+    LocalIpAddressAssignment,
+}
+
 /// A parsed SWm DER together with its immutable Diameter transaction IDs.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SwmDiameterEapRequestEnvelope {
@@ -1713,6 +1903,7 @@ pub struct SwmDiameterEapRequestEnvelope {
     proxiable: bool,
     potentially_retransmitted: bool,
     expected_answer_peer: Option<SwmExpectedAnswerPeer>,
+    locally_configured_mobility_mode: Option<SwmLocallyConfiguredMobilityMode>,
     request: SwmDiameterEapRequest,
     proxy_infos: Vec<SwmAdditionalAvp>,
 }
@@ -1732,6 +1923,7 @@ impl SwmDiameterEapRequestEnvelope {
             proxiable: true,
             potentially_retransmitted: false,
             expected_answer_peer: None,
+            locally_configured_mobility_mode: None,
             request,
             proxy_infos: Vec::new(),
         }
@@ -1749,6 +1941,7 @@ impl SwmDiameterEapRequestEnvelope {
             proxiable: true,
             potentially_retransmitted: false,
             expected_answer_peer: Some(expected_answer_peer),
+            locally_configured_mobility_mode: None,
             request,
             proxy_infos: Vec::new(),
         }
@@ -1765,6 +1958,28 @@ impl SwmDiameterEapRequestEnvelope {
     #[must_use]
     pub const fn expected_answer_peer(&self) -> Option<&SwmExpectedAnswerPeer> {
         self.expected_answer_peer.as_ref()
+    }
+
+    /// Attach trusted local mobility configuration to this request boundary.
+    ///
+    /// This does not add a `MIP6-Feature-Vector` to the DER. It is consulted
+    /// only when a correlated DEA supplies no explicit mobility selection;
+    /// an explicit AAA selection always takes precedence.
+    #[must_use]
+    pub const fn with_locally_configured_mobility_mode(
+        mut self,
+        mode: SwmLocallyConfiguredMobilityMode,
+    ) -> Self {
+        self.locally_configured_mobility_mode = Some(mode);
+        self
+    }
+
+    /// Return trusted local mobility provenance, if the application attached it.
+    #[must_use]
+    pub const fn locally_configured_mobility_mode(
+        &self,
+    ) -> Option<SwmLocallyConfiguredMobilityMode> {
+        self.locally_configured_mobility_mode
     }
 
     /// Borrow the typed DER facts.
@@ -1809,12 +2024,14 @@ impl SwmDiameterEapRequestEnvelope {
     /// Compare immutable duplicate-cache payload facts.
     ///
     /// Hop-by-Hop, T, and connection generation are intentionally excluded;
-    /// End-to-End, P, typed request facts, Route-Record, extensions, and exact
-    /// ordered Proxy-Info bytes are included.
+    /// End-to-End, P, typed request facts, trusted local mobility context,
+    /// Route-Record, extensions, and exact ordered Proxy-Info bytes are
+    /// included.
     #[must_use]
     pub fn same_replay_payload(&self, other: &Self) -> bool {
         self.transaction.end_to_end_identifier() == other.transaction.end_to_end_identifier()
             && self.proxiable == other.proxiable
+            && self.locally_configured_mobility_mode == other.locally_configured_mobility_mode
             && self.request == other.request
             && lifecycle::additional_avp_sequences_match(&self.proxy_infos, &other.proxy_infos)
     }
@@ -1829,9 +2046,14 @@ impl SwmDiameterEapRequestEnvelope {
         answer: SwmDiameterEapAnswerEnvelope,
     ) -> Result<SwmCorrelatedDiameterEapExchange, SwmEmergencyAuthorizationError> {
         ensure_correlated_answer(&self, &answer)?;
+        let effective_mobility_mode = effective_mobility_mode(&self, answer.answer());
+        let mobility_mode_source =
+            effective_mobility_mode_source(&self, answer.answer(), effective_mobility_mode);
         Ok(SwmCorrelatedDiameterEapExchange {
             request: self,
             answer,
+            effective_mobility_mode,
+            mobility_mode_source,
         })
     }
 
@@ -1860,6 +2082,10 @@ impl fmt::Debug for SwmDiameterEapRequestEnvelope {
             .field("proxiable", &self.proxiable)
             .field("potentially_retransmitted", &self.potentially_retransmitted)
             .field("expected_answer_peer", &self.expected_answer_peer)
+            .field(
+                "locally_configured_mobility_mode",
+                &self.locally_configured_mobility_mode,
+            )
             .field("request", &self.request)
             .field("proxy_info_count", &self.proxy_infos.len())
             .finish()
@@ -1886,6 +2112,8 @@ enum SwmDiameterEapAnswerEnvelopeProvenance {
 pub struct SwmCorrelatedDiameterEapExchange {
     request: SwmDiameterEapRequestEnvelope,
     answer: SwmDiameterEapAnswerEnvelope,
+    effective_mobility_mode: Option<SwmLocallyConfiguredMobilityMode>,
+    mobility_mode_source: Option<SwmConditionalValueSource>,
 }
 
 impl SwmCorrelatedDiameterEapExchange {
@@ -1921,6 +2149,38 @@ impl SwmCorrelatedDiameterEapExchange {
     ) -> Result<SwmAuthorizedGateway<'_>, SwmGatewayContextError> {
         mobility::authorize_emergency_gateway(self.request(), self.answer(), authorization)
     }
+
+    /// Return the effective mobility-mode provenance for this exchange.
+    ///
+    /// An explicit DEA `MIP6-Feature-Vector` is AAA-derived and takes
+    /// precedence. Otherwise this reports trusted local configuration attached
+    /// to the request envelope, or `None` when neither source exists.
+    #[must_use]
+    pub const fn mobility_mode_source(&self) -> Option<SwmConditionalValueSource> {
+        self.mobility_mode_source
+    }
+
+    /// Return the effective mobility mode after applying AAA precedence.
+    ///
+    /// Explicit DEA network-based bits select `NetworkBased`; explicit
+    /// `ASSIGN_LOCAL_IP` selects `LocalIpAddressAssignment`; an explicit vector
+    /// containing neither selection produces `None` without falling back to
+    /// local configuration. When the DEA omits the vector, the trusted local
+    /// request-envelope mode is used.
+    #[must_use]
+    pub const fn effective_mobility_mode(&self) -> Option<SwmLocallyConfiguredMobilityMode> {
+        self.effective_mobility_mode
+    }
+
+    /// Return the raw local mobility input retained with the request.
+    ///
+    /// Inspect [`Self::answer`] for an explicit AAA `MIP6-Feature-Vector`; that
+    /// value takes precedence over this retained fallback, as indicated by
+    /// [`Self::mobility_mode_source`].
+    #[must_use]
+    pub const fn local_mobility_mode_input(&self) -> Option<SwmLocallyConfiguredMobilityMode> {
+        self.request.locally_configured_mobility_mode()
+    }
 }
 
 impl fmt::Debug for SwmCorrelatedDiameterEapExchange {
@@ -1930,6 +2190,8 @@ impl fmt::Debug for SwmCorrelatedDiameterEapExchange {
             .field("transaction", &self.transaction())
             .field("request", &self.request())
             .field("answer", &self.answer())
+            .field("effective_mobility_mode", &self.effective_mobility_mode)
+            .field("mobility_mode_source", &self.mobility_mode_source)
             .finish()
     }
 }
@@ -3899,6 +4161,16 @@ pub struct SwmDiameterEapAnswer {
     pub origin_realm: Redacted<String>,
     /// User-Name (redacted in diagnostic output).
     pub user_name: Option<Redacted<String>>,
+    /// Optional subscriber authorization facts from an ordinary DEA.
+    ///
+    /// Identity, charging, usage, restriction, and priority values remain
+    /// redacted in diagnostic output. APN-OI-Replacement is additionally
+    /// trusted only when the request-bound effective mobility mode is
+    /// network-based. An explicit DEA feature vector takes precedence; only
+    /// when it is absent may the request envelope's trusted local mobility
+    /// provenance supply that effective mode. Presence of these facts does not
+    /// itself imply successful authorization.
+    pub subscriber_authorization: SwmDeaSubscriberAuthorization,
     /// Mobility capabilities selected or authorized by the AAA server.
     pub mip6_feature_vector: Option<SwmMip6FeatureVector>,
     /// Ordered Supported-Features groups returned by the AAA server.
@@ -3975,6 +4247,7 @@ impl std::fmt::Debug for SwmDiameterEapAnswer {
             .field("origin_host", &self.origin_host)
             .field("origin_realm", &self.origin_realm)
             .field("user_name", &self.user_name)
+            .field("subscriber_authorization", &self.subscriber_authorization)
             .field(
                 "mip6_feature_vector",
                 &self.mip6_feature_vector.map(|_| "<redacted>"),
@@ -4229,6 +4502,11 @@ impl SwmDiameterEapAnswer {
                 "DEA",
             ));
         }
+        dea_authorization::validate_result_conditions(
+            &self.subscriber_authorization,
+            self.result.is_diameter_success(),
+        )
+        .map_err(|reason| encode_structural_error(reason, "7.1.2.1.2"))?;
         if matches!(
             self.result,
             SwmDiameterResult::Base(code)
@@ -5057,6 +5335,7 @@ fn parse_swm_diameter_eap_request_parts(
         |offset, avp| {
             let value_offset = builder_helpers::offset_add(offset, avp.header.header_len(), "DER")?;
             let code = avp.header.code;
+            dea_authorization::validate_top_level_identity(&avp.header, offset)?;
             if let Some(vendor_id) = avp.header.vendor_id {
                 if vendor_id.get() == 0 {
                     return Err(DecodeError::new(
@@ -5179,6 +5458,21 @@ fn parse_swm_diameter_eap_request_parts(
                         offset,
                         "5.2.3.36",
                     )?;
+                } else if vendor_id == VENDOR_ID_3GPP
+                    && matches!(
+                        code,
+                        AVP_APN_OI_REPLACEMENT
+                            | AVP_3GPP_CHARGING_CHARACTERISTICS
+                            | AVP_UE_USAGE_TYPE
+                            | AVP_CORE_NETWORK_RESTRICTIONS
+                            | AVP_MPS_PRIORITY
+                    )
+                {
+                    return Err(decode_structural_error_at(
+                        "answer-only subscriber authorization AVP appears in SWm DER",
+                        offset,
+                        "7.2.2.1.1",
+                    ));
                 } else {
                     retain_diameter_eap_extension(
                         ctx,
@@ -5223,6 +5517,12 @@ fn parse_swm_diameter_eap_request_parts(
             } else if code == base::AVP_USER_NAME {
                 let value = builder_helpers::parse_string_value(avp.value, value_offset, "8.14")?;
                 builder_helpers::set_once(&mut user_name, Redacted::from(value), offset, "8.14")?;
+            } else if code == AVP_SUBSCRIPTION_ID {
+                return Err(decode_structural_error_at(
+                    "answer-only Subscription-Id appears in SWm DER",
+                    offset,
+                    "7.2.2.1.1",
+                ));
             } else if code == AVP_SERVICE_SELECTION {
                 validate_base_mandatory_flags(&avp.header, offset, "6.2")?;
                 let value = builder_helpers::parse_string_value(avp.value, value_offset, "6.2")?;
@@ -5564,6 +5864,7 @@ pub fn parse_swm_diameter_eap_request_envelope_with_provenance(
         proxiable: message.header.flags.is_proxiable(),
         potentially_retransmitted: message.header.flags.is_potentially_retransmitted(),
         expected_answer_peer: None,
+        locally_configured_mobility_mode: None,
         request: parts.request,
         proxy_infos: parts.proxy_infos,
     })
@@ -5605,7 +5906,7 @@ fn build_swm_diameter_eap_answer_internal(
     proxiable: bool,
     hop_by_hop_identifier: u32,
     end_to_end_identifier: u32,
-    overload_request_conditioned: bool,
+    request_conditioned: bool,
     ctx: EncodeContext,
 ) -> Result<OwnedMessage, EncodeError> {
     answer.validate_for_encode()?;
@@ -5615,12 +5916,18 @@ fn build_swm_diameter_eap_answer_internal(
         answer.extensions.len(),
         "DEA",
     )?;
-    if !overload_request_conditioned
-        && (answer.oc_supported_features.is_some() || answer.oc_olr.is_some())
-    {
+    if !request_conditioned && (answer.oc_supported_features.is_some() || answer.oc_olr.is_some()) {
         return Err(encode_structural_error(
             "SWm DEA overload-control response requires a correlated DER capability offer",
             "RFC7683-5.1.2",
+        ));
+    }
+    if !request_conditioned
+        && dea_authorization::has_request_conditioned_values(&answer.subscriber_authorization)
+    {
+        return Err(encode_structural_error(
+            "SWm DEA APN-OI-Replacement requires a correlated DER",
+            "7.1.2.1.2",
         ));
     }
     let mut raw_avps = BytesMut::new();
@@ -5676,6 +5983,7 @@ fn build_swm_diameter_eap_answer_internal(
             ctx,
         )?;
     }
+    dea_authorization::append_authorization(&mut raw_avps, &answer.subscriber_authorization, ctx)?;
     if let Some(features) = answer.mip6_feature_vector {
         builder_helpers::append_u64_avp(
             &mut raw_avps,
@@ -5890,6 +6198,7 @@ fn validate_swm_diameter_eap_answer_for(
             answer.mip6_feature_vector,
             answer.result.is_diameter_success(),
         )
+        || !subscriber_authorization_matches_request(request, answer)
         || lifecycle::validate_diameter_eap_answer_overload_control_for_request(
             request_facts.oc_supported_features.as_ref(),
             answer.oc_supported_features.as_ref(),
@@ -6126,6 +6435,7 @@ fn parse_swm_diameter_eap_application_answer_parts(
     let mut origin_host = None;
     let mut origin_realm = None;
     let mut user_name = None;
+    let mut subscriber_authorization = SwmDeaSubscriberAuthorization::new();
     let mut mip6_feature_vector = None;
     let mut mip6_agent_info = None;
     let mut emergency_info = None;
@@ -6158,6 +6468,7 @@ fn parse_swm_diameter_eap_application_answer_parts(
         |offset, avp| {
             let value_offset = builder_helpers::offset_add(offset, avp.header.header_len(), "DEA")?;
             let code = avp.header.code;
+            dea_authorization::validate_top_level_identity(&avp.header, offset)?;
             // Vendor-specific AVPs are matched by (vendor-id, code); only
             // genuinely unknown ones fall through to the unknown-AVP policy.
             if let Some(vendor_id) = avp.header.vendor_id {
@@ -6180,6 +6491,55 @@ fn parse_swm_diameter_eap_application_answer_parts(
                         &mut retention,
                     )?;
                     builder_helpers::set_once(&mut emergency_info, value, offset, "7.3.210")?;
+                } else if code == AVP_APN_OI_REPLACEMENT && vendor_id == VENDOR_ID_3GPP {
+                    let value =
+                        dea_authorization::parse_apn_oi_replacement(&avp, offset, value_offset)?;
+                    builder_helpers::set_once(
+                        &mut subscriber_authorization.apn_oi_replacement,
+                        value,
+                        offset,
+                        "7.3.32",
+                    )?;
+                } else if code == AVP_3GPP_CHARGING_CHARACTERISTICS && vendor_id == VENDOR_ID_3GPP {
+                    let value = dea_authorization::parse_charging_characteristics(
+                        &avp,
+                        offset,
+                        value_offset,
+                    )?;
+                    builder_helpers::set_once(
+                        &mut subscriber_authorization.charging_characteristics,
+                        value,
+                        offset,
+                        "16.4.7",
+                    )?;
+                } else if code == AVP_UE_USAGE_TYPE && vendor_id == VENDOR_ID_3GPP {
+                    let value = dea_authorization::parse_ue_usage_type(&avp, offset, value_offset)?;
+                    builder_helpers::set_once(
+                        &mut subscriber_authorization.ue_usage_type,
+                        value,
+                        offset,
+                        "7.3.202",
+                    )?;
+                } else if code == AVP_CORE_NETWORK_RESTRICTIONS && vendor_id == VENDOR_ID_3GPP {
+                    let value = dea_authorization::parse_core_network_restrictions(
+                        &avp,
+                        offset,
+                        value_offset,
+                    )?;
+                    builder_helpers::set_once(
+                        &mut subscriber_authorization.core_network_restrictions,
+                        value,
+                        offset,
+                        "7.3.230",
+                    )?;
+                } else if code == AVP_MPS_PRIORITY && vendor_id == VENDOR_ID_3GPP {
+                    let value = dea_authorization::parse_mps_priority(&avp, offset, value_offset)?;
+                    builder_helpers::set_once(
+                        &mut subscriber_authorization.mps_priority,
+                        value,
+                        offset,
+                        "7.3.131",
+                    )?;
                 } else if matches!(
                     code,
                     AVP_MIP6_AGENT_INFO
@@ -6269,6 +6629,20 @@ fn parse_swm_diameter_eap_application_answer_parts(
             } else if code == base::AVP_USER_NAME {
                 let value = builder_helpers::parse_string_value(avp.value, value_offset, "8.14")?;
                 builder_helpers::set_once(&mut user_name, Redacted::from(value), offset, "8.14")?;
+            } else if code == AVP_SUBSCRIPTION_ID {
+                let value = dea_authorization::parse_subscription_id(
+                    &avp,
+                    ctx,
+                    offset,
+                    value_offset,
+                    &mut retention,
+                )?;
+                builder_helpers::set_once(
+                    &mut subscriber_authorization.subscription_id,
+                    value,
+                    offset,
+                    "8.46",
+                )?;
             } else if code == AVP_MIP6_FEATURE_VECTOR {
                 validate_base_m_bit_agnostic_flags(&avp.header, offset, "4.2.5")?;
                 let value = builder_helpers::parse_u64_value(avp.value, value_offset, "4.2.5")?;
@@ -6525,6 +6899,7 @@ fn parse_swm_diameter_eap_application_answer_parts(
             "DEA",
         )?,
         user_name,
+        subscriber_authorization,
         mip6_feature_vector,
         supported_features,
         oc_supported_features,
@@ -8101,6 +8476,59 @@ fn mobility_answer_matches_offer(
     }
 }
 
+fn subscriber_authorization_matches_request(
+    request: &SwmDiameterEapRequestEnvelope,
+    answer: &SwmDiameterEapAnswer,
+) -> bool {
+    let network_based_mobility_authorized = match answer.mip6_feature_vector {
+        Some(features) => features.bits() & SwmMip6FeatureVector::NETWORK_BASED_MOBILITY_BITS != 0,
+        None => matches!(
+            request.locally_configured_mobility_mode(),
+            Some(SwmLocallyConfiguredMobilityMode::NetworkBased)
+        ),
+    };
+    dea_authorization::validate_for_request(
+        &answer.subscriber_authorization,
+        answer.result.is_diameter_success(),
+        request.request().requests_emergency_services(),
+        network_based_mobility_authorized,
+    )
+    .is_ok()
+}
+
+fn effective_mobility_mode_source(
+    request: &SwmDiameterEapRequestEnvelope,
+    answer: &SwmDiameterEapAnswer,
+    effective_mode: Option<SwmLocallyConfiguredMobilityMode>,
+) -> Option<SwmConditionalValueSource> {
+    match answer.mip6_feature_vector {
+        Some(_) if effective_mode.is_some() => Some(SwmConditionalValueSource::AaaDerived),
+        Some(_) => None,
+        None if request.locally_configured_mobility_mode().is_some() => {
+            Some(SwmConditionalValueSource::LocallyConfigured)
+        }
+        None => None,
+    }
+}
+
+fn effective_mobility_mode(
+    request: &SwmDiameterEapRequestEnvelope,
+    answer: &SwmDiameterEapAnswer,
+) -> Option<SwmLocallyConfiguredMobilityMode> {
+    match answer.mip6_feature_vector {
+        Some(features)
+            if features.bits() & SwmMip6FeatureVector::NETWORK_BASED_MOBILITY_BITS != 0 =>
+        {
+            Some(SwmLocallyConfiguredMobilityMode::NetworkBased)
+        }
+        Some(features) if features.contains(SwmMip6FeatureVector::ASSIGN_LOCAL_IP) => {
+            Some(SwmLocallyConfiguredMobilityMode::LocalIpAddressAssignment)
+        }
+        Some(_) => None,
+        None => request.locally_configured_mobility_mode(),
+    }
+}
+
 fn validate_decoded_request(request: &SwmDiameterEapRequest) -> Result<(), DecodeError> {
     if request.session_id.as_ref().is_empty() {
         return Err(decode_structural_error(
@@ -8261,6 +8689,11 @@ fn validate_decoded_answer(answer: &SwmDiameterEapAnswer) -> Result<(), DecodeEr
         }
     }
     validate_apn_profile(answer).map_err(|reason| decode_structural_error(reason, "DEA"))?;
+    dea_authorization::validate_result_conditions(
+        &answer.subscriber_authorization,
+        answer.result.is_diameter_success(),
+    )
+    .map_err(|reason| decode_structural_error(reason, "7.1.2.1.2"))?;
     if !answer.auth_request_type.is_authorize_authenticate() {
         return Err(decode_structural_error(
             "SWm DEA Auth-Request-Type must be AUTHORIZE_AUTHENTICATE",
@@ -8373,6 +8806,7 @@ fn ensure_correlated_answer(
             answer.mip6_feature_vector,
             answer.result.is_diameter_success(),
         )
+        || !subscriber_authorization_matches_request(request_envelope, answer)
         || lifecycle::validate_diameter_eap_answer_overload_control_for_request(
             request.oc_supported_features.as_ref(),
             answer.oc_supported_features.as_ref(),
@@ -8434,6 +8868,7 @@ fn ensure_correlated_response(
                 answer.mip6_feature_vector,
                 answer.result.is_diameter_success(),
             )
+            || !subscriber_authorization_matches_request(request_envelope, answer)
             || lifecycle::validate_diameter_eap_answer_overload_control_for_request(
                 request.oc_supported_features.as_ref(),
                 answer.oc_supported_features.as_ref(),

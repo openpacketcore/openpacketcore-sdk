@@ -234,6 +234,7 @@ fn sample_answer() -> swm::SwmDiameterEapAnswer {
         default_context_identifier: None,
         apn_configurations: Vec::new(),
         mobile_node_identifier: None,
+        subscriber_authorization: Default::default(),
         session_timeout: None,
         authorization_lifetime: None,
         auth_grace_period: None,

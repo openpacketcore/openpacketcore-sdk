@@ -166,6 +166,7 @@ fn successful_answer() -> SwmDiameterEapAnswer {
             .expect("synthetic Origin-Realm is UTF-8")
             .into(),
         user_name: None,
+        subscriber_authorization: Default::default(),
         mip6_feature_vector: None,
         supported_features: Vec::new(),
         oc_supported_features: None,

@@ -594,7 +594,109 @@ remain prohibited. `Emergency-Info` sets vendor 10415, clears P, and accepts
 either standards-permitted M value. Unknown optional grouped children follow
 `UnknownIePolicy` and share the DEA retention count/byte budget; unknown
 mandatory children fail closed.
+### SWm DEA subscriber authorization facts
 
+`SwmDiameterEapAnswer::subscriber_authorization` groups the finite top-level
+subscriber rows from TS 29.273 V19.2: `APN-OI-Replacement`, the RFC 4006
+E.164 `Subscription-Id` form, `3GPP-Charging-Characteristics`,
+`UE-Usage-Type`, `Core-Network-Restrictions`, and `MPS-Priority`. Existing
+answer struct literals must add
+`subscriber_authorization: SwmDeaSubscriberAuthorization::default()`; an empty
+bundle emits no AVPs and preserves the prior DEA bytes.
+
+The types enforce wire syntax rather than product authorization policy.
+`SwmE164Number` accepts one through fifteen decimal digits beginning with 1
+through 9; dialling prefixes, `+`, whitespace, separators, zero-prefixed
+numbers, and all-zero dummy values are not E.164 numbers on this wire. Its
+retained allocation is redacted and zeroized on drop.
+`SwmApnOiReplacement` accepts the case-insensitive suffix
+`mncNNN.mccNNN.gprs`, with exactly three digits per PLMN label and optional
+valid DNS-style prefix labels.
+`SwmChargingCharacteristics` exposes the defining two octets while the codec
+accepts upper- or lowercase hexadecimal and emits four uppercase characters.
+Core-network and MPS bitmasks expose only assigned bits; deprecated or unknown
+received bits are discarded before canonical replay. `UE-Usage-Type` is
+bounded to the standardized/operator range 0 through 255. When MPS-Priority is
+present on SWm, `MPS-EPS-Priority` must be set; all-zero and CS- or
+messaging-only masks fail on parse and build.
+
+`APN-OI-Replacement` is the one request/result-conditioned value in this
+bundle: it requires exact base `DIAMETER_SUCCESS`, a non-emergency DER, and a
+correlated effective network-based mobility mode. A DER offer of either PMIPv6
+or GTPv2 permits the collective network-based mobility selection defined by TS
+29.273. An explicit DEA `MIP6-Feature-Vector` is AAA-derived and always takes
+precedence. When the DEA omits that vector, an application may attach trusted
+local mode provenance to the retained request envelope with
+`with_locally_configured_mobility_mode`; parsed and default envelopes invent no
+such provenance and fail closed for APN-OI. Originate APN-OI only through
+`build_swm_diameter_eap_answer_for`, which checks this boundary. After answer
+correlation, `effective_mobility_mode()` and `mobility_mode_source()` expose
+the selected mode and whether it came from AAA or local configuration. The
+other five rows are typed subscriber facts and may occur on an ordinary
+non-success DEA; their presence never turns that result into authorization
+success.
+
+```rust
+use opc_proto_diameter::apps::swm::{
+    build_swm_diameter_eap_answer_for, SwmApnOiReplacement,
+    SwmChargingCharacteristics, SwmDeaSubscriberAuthorization,
+    SwmDiameterEapAnswer, SwmDiameterEapRequestEnvelope, SwmE164Number,
+    SwmLocallyConfiguredMobilityMode, SwmSubscriptionId, SwmUeUsageType,
+};
+use opc_proto_diameter::OwnedMessage;
+use opc_protocol::EncodeContext;
+
+fn build_dea_with_subscriber_facts(
+    request: SwmDiameterEapRequestEnvelope,
+    mut answer: SwmDiameterEapAnswer,
+) -> Result<OwnedMessage, Box<dyn std::error::Error>> {
+    // This trusted site policy is retained beside the transaction. It is used
+    // only because this answer intentionally carries no explicit AAA mobility
+    // selection.
+    let request = request.with_locally_configured_mobility_mode(
+        SwmLocallyConfiguredMobilityMode::NetworkBased,
+    );
+    answer.mip6_feature_vector = None;
+    answer.subscriber_authorization = SwmDeaSubscriberAuthorization::new()
+        .with_apn_oi_replacement(SwmApnOiReplacement::new(
+            "mnc001.mcc001.gprs",
+        )?)
+        .with_subscription_id(SwmSubscriptionId::e164(SwmE164Number::new(
+            "15551234567",
+        )?))
+        .with_charging_characteristics(SwmChargingCharacteristics::from_octets([
+            0x01, 0x02,
+        ]))
+        .with_ue_usage_type(SwmUeUsageType::new(128));
+    Ok(build_swm_diameter_eap_answer_for(
+        &request,
+        &answer,
+        EncodeContext::default(),
+    )?)
+}
+```
+
+RFC 4006 permits P on the `Subscription-Id` group and its two required
+children; TS 29.061 likewise permits P on charging characteristics. Parsers
+accept those forms and builders emit canonical P-clear AVPs. Under TS 29.273's
+understood-AVP rule, APN-OI, the outer Subscription-Id group, charging
+characteristics, UE usage, core restrictions, and MPS priority accept either
+received M value. Builders still emit their exact canonical M values: set for
+APN-OI and outer Subscription-Id, clear for the other four. Subscription-Id's
+required children remain M-set on receive and encode. Optional unknown
+children follow `UnknownIePolicy`: Preserve retains them in a sealed,
+value-redacted collection for replay, Drop discards them, Reject refuses them,
+and unknown M-set children always fail. All six top-level rows remain singleton
+and are rejected on DER. The Rf and SWm dictionaries share P-permitted
+metadata, but Rf retains RFC 4006's required outer M bit. Only the SWm
+application dictionary tolerates either outer M shape. SWm required children
+remain strict, and Rf's established parser behavior is unchanged.
+
+A vendor-specific child that reuses the core Subscription-Id-Type or
+Subscription-Id-Data code is rejected even when valid IETF children are also
+present; it never enters optional-extension retention. The six top-level
+subscriber codes likewise require their exact IETF/3GPP vendor identity under
+every unknown-AVP policy, including explicit Vendor-Id zero.
 ### SWm Diameter-EAP generic errors, routing, and redirect
 
 `parse_swm_diameter_eap_response` selects the response grammar from the
