@@ -357,6 +357,69 @@ its typed parser retain RFC 4006's canonical outer M-set rule. The SWm
 application dictionary alone tolerates either received outer M shape;
 required grouped children remain strict on SWm and Rf's established child
 parser behavior is unchanged.
+The finite SWm DEA access-location rows are modeled below. TS 29.273 does not
+enumerate either row in the baseline DER command grammar, so DER has no typed
+field for them; an optional DER occurrence remains governed by the existing
+bounded trailing-extension policy.
+
+| AVP | TS 29.273 presence | Wire identity and cardinality | Typed SDK field | Positive / negative evidence |
+|:----|:-------------------|:------------------------------|:----------------|:-----------------------------|
+| `Access-Network-Info` | Optional DEA access-location context | 3GPP 10415/1526, `Grouped`, singleton, V set and P clear; understood M mismatch accepted under table 7.2.3.1/1 note 2 | `SwmDiameterEapAnswer::set_wlan_location_with_time` / `set_wlan_location_without_time`; received values through `SwmCorrelatedDiameterEapResponse::wlan_location` and `SwmAccessNetworkInfo` | Independent raw fixture and typed builder cover canonical order, exact headers, strict P rejection, parse/rebuild, explicit locator-omission evidence, redaction, duplicates, type/length, malformed grouped children, and full-key vendor-collision extension policy. |
+| `User-Location-Info-Time` | Optional last-known time conditional on WLAN location | 3GPP 10415/2812, Diameter `Time`, singleton, exactly four NTP-seconds octets; canonical V set/M clear/P clear, defining P and understood M mismatch accepted | Originated through `SwmDiameterEapAnswer::set_wlan_location_with_time`; received through `SwmCorrelatedWlanLocation::user_location_info_time` / `user_location_info_time_omission` | Independent raw and typed fixtures cover exact bytes, explicit originated omission, tolerated received omission, rejection without Access-Network-Info, duplicate/wrong-vendor/wrong-width failures, defining TS 29.212 provenance, and presence-only diagnostics. |
+
+The raw parsed-answer location API exposes only `has_wlan_location` and
+`has_wlan_location_time`; it has no SSID, BSSID, civic, operator,
+logical-access, or timestamp accessor. Typed access to a received value becomes
+available only from `SwmCorrelatedDiameterEapResponse::wlan_location` after authenticated
+connection generation, both transaction identifiers, P, ordered Proxy-Info,
+Session-Id, application fields, and the configured logical Origin have all
+matched the retained DER. Location freshness and how the location influences
+authorization remain product policy after that correlation boundary.
+
+`Access-Network-Info` requires its 1..32-octet UTF-8 SSID and at least one
+BSSID, civic access-point address, or Logical-Access-ID unless the originator
+provides typed `OmittedByOperatorPolicy` evidence. A received SSID-only value
+remains interoperable but retains `AbsentOnReceive` rather than inventing that
+policy provenance. A BSSID is exposed as six validated individual, nonzero
+octets. Common colon/dash and upper/lower input spellings decode, while encode
+uses the canonical 17-octet upper-case dash-separated representation. Lengths
+are checked before copying attacker-controlled SSID/BSSID text. The TS 29.273 civic profile requires paired
+RFC 5580 `Location-Information` and `Location-Data`: code is exactly zero,
+association indexes match, and the entity must be `AccessNetwork`. The former
+has the RFC 5580 21..251-octet payload bound. Method tokens use the IANA Method
+Tokens snapshot dated 2022-09-15 for both origination and receive; an
+unregistered later token fails closed until that snapshot is updated. The
+latter contains a bounded RFC
+4776 uppercase country code plus ordered UTF-8 civic elements. CAtype
+membership uses the IANA snapshot dated 2014-04-11, including language and
+ISO-15924 script validation. RFC 6848 CAtype 40 accepts an arbitrary bounded
+`namespace-URI SP XML-local-name SP nonempty-text` triple, including private
+and future namespaces, while rejecting malformed URIs/names/separators,
+truncation, and values beyond the one-octet bound. CAtype 29 uses the IANA
+Location Types snapshot dated 2024-07-08. One-sided,
+truncated, overlong, mismatched-index, invalid-code, invalid-method, invalid
+country, and malformed element inputs fail closed.
+
+Operator-Name admits only namespace `1` registered ASCII realm form or
+namespace `2` five/six-digit E.212 form. Logical-Access-ID remains an opaque,
+nonempty ETSI OctetString. ETSI defines no common size limit for its
+technology-independent form, so the enclosing `DecodeContext` and
+`EncodeContext` provide the allocation/message bound; a caller originating an
+RFC 3046 Circuit-ID must separately honor that format's one-octet length.
+Unknown optional group children share the answer-wide budget of at most 128
+retained entries and no more bytes than `DecodeContext::max_message_len`, and
+expose metadata only. Retained children and receive-only locator/time-omission
+provenance can be emitted only through the immutable parsed answer envelope. A
+parser-created access value remains receive-derived after every public mutator;
+copying or transplanting it into an ordinary builder fails closed, and a caller
+must construct a fresh complete originated value. Unknown mandatory children
+fail. Numeric collisions with top-level or nested location codes under another
+vendor identity are distinct unknown AVPs: optional occurrences follow
+`UnknownIePolicy` plus the shared retention budget, while M-set occurrences
+fail closed. A timestamp without WLAN
+location fails; a received location without a timestamp is tolerated and an
+originated omission requires typed evidence. Location/timestamp source,
+freshness, authorization use, and logging/export policy remain product-owned.
 
 #### SWm Diameter-EAP generic error and routing scope
 

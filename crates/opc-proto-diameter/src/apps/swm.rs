@@ -13,8 +13,9 @@
 //! typed request-conditioned RFC 7683 baseline loss-overload offer/report,
 //! ordered RFC 8583 Diameter Load context, typed successful-session timer
 //! context, request-bound canonical RFC 5447 serving/emergency gateway
-//! context, typed redaction-safe top-level DEA subscriber facts, and a bounded,
-//! request-conditioned complete SWm APN authorization
+//! context, typed redaction-safe top-level DEA subscriber facts, typed sealed
+//! SWm DEA WLAN access/civic-location context with a location-bound last-known
+//! timestamp, and a bounded, request-conditioned complete SWm APN authorization
 //! surface with sealed extension retention, its default Context-Identifier,
 //! Service-Selection, and the TS 29.273 emergency attach sequence. The
 //! top-level default pointer is accepted under the DEA
@@ -49,8 +50,7 @@ use std::{collections::HashSet, error::Error, fmt, net::IpAddr};
 use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, Zeroizing};
 
-use super::builder_helpers;
-use super::VENDOR_ID_3GPP;
+use super::{builder_helpers, VENDOR_ID_3GPP};
 use crate::avp::dictionary::Redacted;
 use crate::base;
 use crate::dictionary::{
@@ -66,6 +66,7 @@ mod apn;
 mod authorization;
 mod dea_authorization;
 mod lifecycle;
+mod location;
 mod mobility;
 
 pub use super::subscription_id::{
@@ -75,6 +76,7 @@ pub use apn::*;
 pub use authorization::*;
 pub use dea_authorization::*;
 pub use lifecycle::*;
+pub use location::*;
 pub use mobility::*;
 
 /// 3GPP SWm application identifier.
@@ -362,7 +364,7 @@ static SWM_REQUEST_AVP_RULES: [CommandAvpRule; 38] = [
     ),
 ];
 
-static SWM_ANSWER_AVP_RULES: [CommandAvpRule; 40] = [
+static SWM_ANSWER_AVP_RULES: [CommandAvpRule; 42] = [
     CommandAvpRule::new(AvpKey::ietf(AVP_STATE), AvpCardinality::ZeroOrMore),
     CommandAvpRule::new(
         AvpKey::ietf(base::AVP_RESULT_CODE),
@@ -416,6 +418,14 @@ static SWM_ANSWER_AVP_RULES: [CommandAvpRule; 40] = [
     CommandAvpRule::new(
         AvpKey::vendor(AVP_SUPPORTED_FEATURES, VENDOR_ID_3GPP),
         AvpCardinality::ZeroOrMore,
+    ),
+    CommandAvpRule::new(
+        AvpKey::vendor(AVP_ACCESS_NETWORK_INFO, VENDOR_ID_3GPP),
+        AvpCardinality::ZeroOrOne,
+    ),
+    CommandAvpRule::new(
+        AvpKey::vendor(AVP_USER_LOCATION_INFO_TIME, VENDOR_ID_3GPP),
+        AvpCardinality::ZeroOrOne,
     ),
     CommandAvpRule::new(
         AvpKey::ietf(AVP_OC_SUPPORTED_FEATURES),
@@ -498,7 +508,7 @@ static SWM_ANSWER_AVP_RULES: [CommandAvpRule; 40] = [
     ),
 ];
 
-static SWM_PROJECTED_PROFILE_ANSWER_AVP_RULES: [CommandAvpRule; 40] = [
+static SWM_PROJECTED_PROFILE_ANSWER_AVP_RULES: [CommandAvpRule; 42] = [
     CommandAvpRule::new(AvpKey::ietf(AVP_STATE), AvpCardinality::ZeroOrMore),
     CommandAvpRule::new(
         AvpKey::ietf(base::AVP_RESULT_CODE),
@@ -552,6 +562,14 @@ static SWM_PROJECTED_PROFILE_ANSWER_AVP_RULES: [CommandAvpRule; 40] = [
     CommandAvpRule::new(
         AvpKey::vendor(AVP_SUPPORTED_FEATURES, VENDOR_ID_3GPP),
         AvpCardinality::ZeroOrMore,
+    ),
+    CommandAvpRule::new(
+        AvpKey::vendor(AVP_ACCESS_NETWORK_INFO, VENDOR_ID_3GPP),
+        AvpCardinality::ZeroOrOne,
+    ),
+    CommandAvpRule::new(
+        AvpKey::vendor(AVP_USER_LOCATION_INFO_TIME, VENDOR_ID_3GPP),
+        AvpCardinality::ZeroOrOne,
     ),
     CommandAvpRule::new(
         AvpKey::ietf(AVP_OC_SUPPORTED_FEATURES),
@@ -887,7 +905,7 @@ pub const COMMAND_DIAMETER_EAP_ANSWER_PROJECTED_PROFILE: CommandDefinition =
     )
     .with_avp_rules(&SWM_PROJECTED_PROFILE_ANSWER_AVP_RULES);
 
-const SWM_AVPS: [AvpDefinition; 69] = [
+const SWM_AVPS: [AvpDefinition; 77] = [
     AvpDefinition::new(
         AvpKey::ietf(AVP_EAP_PAYLOAD),
         "EAP-Payload",
@@ -1175,6 +1193,97 @@ const SWM_AVPS: [AvpDefinition; 69] = [
             FlagRequirement::MustBeUnset,
         ),
         SpecRef::new("3gpp", "TS29273", "8.2.3.21"),
+    ),
+    AvpDefinition::new(
+        AvpKey::vendor(AVP_ACCESS_NETWORK_INFO, VENDOR_ID_3GPP),
+        "Access-Network-Info",
+        AvpDataType::Grouped,
+        // TS 29.273 requires V set and P clear, while table 7.2.3.1/1 note 2
+        // allows an understood receiver to ignore an M-bit mismatch.
+        AvpFlagRules::new(
+            FlagRequirement::MustBeSet,
+            FlagRequirement::MayBeSet,
+            FlagRequirement::MustBeUnset,
+        ),
+        SpecRef::new("3gpp", "TS29273", "5.2.3.24"),
+    )
+    .with_grouped_avp_rules(&ACCESS_NETWORK_INFO_AVP_RULES),
+    AvpDefinition::new(
+        AvpKey::vendor(AVP_SSID, VENDOR_ID_3GPP),
+        "SSID",
+        AvpDataType::Utf8String,
+        AvpFlagRules::new(
+            FlagRequirement::MustBeSet,
+            FlagRequirement::MayBeSet,
+            FlagRequirement::MustBeUnset,
+        ),
+        SpecRef::new("3gpp", "TS29273", "5.2.3.22"),
+    ),
+    AvpDefinition::new(
+        AvpKey::vendor(AVP_BSSID, VENDOR_ID_3GPP),
+        "BSSID",
+        AvpDataType::Utf8String,
+        AvpFlagRules::new(
+            FlagRequirement::MustBeSet,
+            FlagRequirement::MayBeSet,
+            FlagRequirement::MayBeSet,
+        ),
+        SpecRef::new("3gpp", "TS32299", "7.2.30A"),
+    ),
+    AvpDefinition::new(
+        AvpKey::ietf(AVP_LOCATION_INFORMATION),
+        "Location-Information",
+        AvpDataType::OctetString,
+        AvpFlagRules::new(
+            FlagRequirement::MustBeUnset,
+            FlagRequirement::MayBeSet,
+            FlagRequirement::MayBeSet,
+        ),
+        SpecRef::new("ietf", "RFC5580", "4.2"),
+    ),
+    AvpDefinition::new(
+        AvpKey::ietf(AVP_LOCATION_DATA),
+        "Location-Data",
+        AvpDataType::OctetString,
+        AvpFlagRules::new(
+            FlagRequirement::MustBeUnset,
+            FlagRequirement::MayBeSet,
+            FlagRequirement::MayBeSet,
+        ),
+        SpecRef::new("ietf", "RFC5580", "4.3"),
+    ),
+    AvpDefinition::new(
+        AvpKey::ietf(AVP_OPERATOR_NAME),
+        "Operator-Name",
+        AvpDataType::OctetString,
+        AvpFlagRules::new(
+            FlagRequirement::MustBeUnset,
+            FlagRequirement::MayBeSet,
+            FlagRequirement::MayBeSet,
+        ),
+        SpecRef::new("ietf", "RFC5580", "4.1"),
+    ),
+    AvpDefinition::new(
+        AvpKey::vendor(AVP_LOGICAL_ACCESS_ID, VENDOR_ID_ETSI),
+        "Logical-Access-ID",
+        AvpDataType::OctetString,
+        AvpFlagRules::new(
+            FlagRequirement::MustBeSet,
+            FlagRequirement::MayBeSet,
+            FlagRequirement::MayBeSet,
+        ),
+        SpecRef::new("etsi", "ES283034", "7.3.3"),
+    ),
+    AvpDefinition::new(
+        AvpKey::vendor(AVP_USER_LOCATION_INFO_TIME, VENDOR_ID_3GPP),
+        "User-Location-Info-Time",
+        AvpDataType::Time,
+        AvpFlagRules::new(
+            FlagRequirement::MustBeSet,
+            FlagRequirement::MayBeSet,
+            FlagRequirement::MayBeSet,
+        ),
+        SpecRef::new("3gpp", "TS29212", "5.3.101"),
     ),
     AvpDefinition::new(
         AvpKey::ietf(AVP_STATE),
@@ -2603,6 +2712,58 @@ pub struct SwmCorrelatedDiameterEapResponse {
     response: SwmDiameterEapResponseEnvelope,
 }
 
+/// Correlation-authorized typed view of WLAN location facts from an ordinary DEA.
+///
+/// This value can be obtained only after authenticated connection-generation,
+/// Origin, transaction, application, session, P-bit, and Proxy-Info checks have
+/// succeeded. It borrows the parsed response and cannot outlive that evidence.
+#[derive(Clone, Copy)]
+pub struct SwmCorrelatedWlanLocation<'a> {
+    access_network_info: &'a SwmAccessNetworkInfo,
+    user_location_info_time: Option<SwmUserLocationInfoTime>,
+    user_location_info_time_omission: Option<SwmUserLocationInfoTimeOmission>,
+}
+
+impl<'a> SwmCorrelatedWlanLocation<'a> {
+    /// Borrow the WLAN SSID, locator, civic, operator, and extension facts.
+    #[must_use]
+    pub const fn access_network_info(&self) -> &'a SwmAccessNetworkInfo {
+        self.access_network_info
+    }
+
+    /// Return the last-known WLAN location timestamp when the DEA supplied it.
+    #[must_use]
+    pub const fn user_location_info_time(&self) -> Option<SwmUserLocationInfoTime> {
+        self.user_location_info_time
+    }
+
+    /// Return typed evidence that the received or originated location omitted
+    /// its timestamp.
+    #[must_use]
+    pub const fn user_location_info_time_omission(
+        &self,
+    ) -> Option<SwmUserLocationInfoTimeOmission> {
+        self.user_location_info_time_omission
+    }
+}
+
+impl fmt::Debug for SwmCorrelatedWlanLocation<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SwmCorrelatedWlanLocation")
+            .field("access_network_info", &self.access_network_info)
+            .field(
+                "user_location_info_time_present",
+                &self.user_location_info_time.is_some(),
+            )
+            .field(
+                "user_location_info_time_omission_present",
+                &self.user_location_info_time_omission.is_some(),
+            )
+            .finish()
+    }
+}
+
 impl SwmCorrelatedDiameterEapResponse {
     /// Borrow the correlated request.
     #[must_use]
@@ -2614,6 +2775,30 @@ impl SwmCorrelatedDiameterEapResponse {
     #[must_use]
     pub const fn response(&self) -> &SwmDiameterEapResponse {
         self.response.response()
+    }
+
+    /// Borrow WLAN location facts after complete authenticated correlation.
+    ///
+    /// The raw parsed-answer API exposes only location presence metadata and
+    /// has no SSID, BSSID, civic, operator, logical-access, or timestamp value
+    /// accessor. Those typed accessors become available only through this
+    /// correlated view.
+    #[must_use]
+    pub fn wlan_location(&self) -> Option<SwmCorrelatedWlanLocation<'_>> {
+        let SwmDiameterEapResponse::Application(answer) = self.response() else {
+            return None;
+        };
+        answer
+            .extensions
+            .access_network_info
+            .as_ref()
+            .map(|access| SwmCorrelatedWlanLocation {
+                access_network_info: access,
+                user_location_info_time: answer.extensions.user_location_info_time,
+                user_location_info_time_omission: answer
+                    .extensions
+                    .user_location_info_time_omission,
+            })
     }
 
     /// Borrow actionable redirect targets after all correlation checks.
@@ -2689,6 +2874,7 @@ impl fmt::Debug for SwmCorrelatedDiameterEapResponse {
             .field("request", &self.request())
             .field("response", &self.response())
             .field("redirect_present", &self.redirect().is_some())
+            .field("wlan_location_present", &self.wlan_location().is_some())
             .field(
                 "agent_delivery_failure_present",
                 &self.agent_delivery_failure().is_some(),
@@ -4205,6 +4391,9 @@ pub struct SwmDiameterEapAnswerExtensions {
     avps: Vec<SwmAdditionalAvp>,
     gateway_context: SwmDeaGatewayContext,
     apn_configurations: Vec<SwmApnConfigurationSupplement>,
+    access_network_info: Option<SwmAccessNetworkInfo>,
+    user_location_info_time: Option<SwmUserLocationInfoTime>,
+    user_location_info_time_omission: Option<SwmUserLocationInfoTimeOmission>,
 }
 
 impl SwmDiameterEapAnswerExtensions {
@@ -4239,6 +4428,18 @@ impl fmt::Debug for SwmDiameterEapAnswerExtensions {
             .field("avp_count", &self.avps.len())
             .field("gateway_context", &self.gateway_context)
             .field("apn_configuration_count", &self.apn_configurations.len())
+            .field(
+                "access_network_info_present",
+                &self.access_network_info.is_some(),
+            )
+            .field(
+                "user_location_info_time_present",
+                &self.user_location_info_time.is_some(),
+            )
+            .field(
+                "user_location_info_time_omission_present",
+                &self.user_location_info_time_omission.is_some(),
+            )
             .finish()
     }
 }
@@ -4768,6 +4969,18 @@ impl std::fmt::Debug for SwmDiameterEapRequest {
 }
 
 /// A SWm Diameter-EAP-Answer (DEA).
+///
+/// Parsed WLAN location values have no raw-answer accessor. Raw answers expose
+/// location presence metadata; typed value access requires authenticated
+/// response correlation:
+///
+/// ```compile_fail
+/// use opc_proto_diameter::apps::swm::SwmDiameterEapAnswer;
+///
+/// fn bypass_correlation(answer: &SwmDiameterEapAnswer) {
+///     let _ = &answer.extensions.access_network_info;
+/// }
+/// ```
 #[derive(Clone, PartialEq, Eq)]
 pub struct SwmDiameterEapAnswer {
     /// Session-Id (redacted in diagnostic output).
@@ -5068,6 +5281,65 @@ impl SwmDiameterEapRequest {
 }
 
 impl SwmDiameterEapAnswer {
+    /// Return whether the DEA contains sealed WLAN access-location context.
+    ///
+    /// Received values remain unavailable until the response is authenticated
+    /// and correlated through [`SwmCorrelatedDiameterEapResponse::wlan_location`].
+    #[must_use]
+    pub const fn has_wlan_location(&self) -> bool {
+        self.extensions.access_network_info.is_some()
+    }
+
+    /// Return whether the sealed WLAN context includes a last-known timestamp.
+    #[must_use]
+    pub const fn has_wlan_location_time(&self) -> bool {
+        self.extensions.user_location_info_time.is_some()
+    }
+
+    /// Set an originated WLAN location with its last-known timestamp.
+    ///
+    /// Parsed receive-only values and retained nested extensions cannot be
+    /// transplanted through this boundary.
+    pub fn set_wlan_location_with_time(
+        &mut self,
+        access_network_info: SwmAccessNetworkInfo,
+        time: SwmUserLocationInfoTime,
+    ) -> Result<(), SwmLocationContextError> {
+        access_network_info.validate_for_encode(location::SwmLocationEncodePurpose::Origination)?;
+        self.extensions.access_network_info = Some(access_network_info);
+        self.extensions.user_location_info_time = Some(time);
+        self.extensions.user_location_info_time_omission = None;
+        Ok(())
+    }
+
+    /// Set an originated WLAN location whose timestamp is unavailable.
+    ///
+    /// The typed omission evidence must originate locally; receive-derived
+    /// omission provenance is rejected.
+    pub fn set_wlan_location_without_time(
+        &mut self,
+        access_network_info: SwmAccessNetworkInfo,
+        omission: SwmUserLocationInfoTimeOmission,
+    ) -> Result<(), SwmLocationContextError> {
+        access_network_info.validate_for_encode(location::SwmLocationEncodePurpose::Origination)?;
+        if omission.was_absent_on_receive() {
+            return Err(SwmLocationContextError::new(
+                SwmLocationContextErrorCode::InvalidReplayProvenance,
+            ));
+        }
+        self.extensions.access_network_info = Some(access_network_info);
+        self.extensions.user_location_info_time = None;
+        self.extensions.user_location_info_time_omission = Some(omission);
+        Ok(())
+    }
+
+    /// Remove all originated WLAN location context.
+    pub fn clear_wlan_location(&mut self) {
+        self.extensions.access_network_info = None;
+        self.extensions.user_location_info_time = None;
+        self.extensions.user_location_info_time_omission = None;
+    }
+
     /// Borrow typed serving/emergency gateway facts carried by the DEA.
     ///
     /// Parsed values are wire facts, not authorization. Received clients
@@ -5080,16 +5352,17 @@ impl SwmDiameterEapAnswer {
     }
 
     fn validate_for_encode(&self) -> Result<(), EncodeError> {
-        self.validate_with_load_purpose(true)
+        self.validate_with_load_purpose(true, location::SwmLocationEncodePurpose::Origination)
     }
 
     fn validate_for_correlation(&self) -> Result<(), EncodeError> {
-        self.validate_with_load_purpose(false)
+        self.validate_with_load_purpose(false, location::SwmLocationEncodePurpose::ParsedReplay)
     }
 
     fn validate_with_load_purpose(
         &self,
         require_complete_originated_loads: bool,
+        location_purpose: location::SwmLocationEncodePurpose,
     ) -> Result<(), EncodeError> {
         if self.session_id.as_ref().is_empty() {
             return Err(encode_structural_error(
@@ -5237,6 +5510,41 @@ impl SwmDiameterEapAnswer {
                 "originated SWm DEA Load requires Load-Type, Load-Value, and SourceID",
                 "RFC8583-6.1",
             ));
+        }
+        if let Some(access_network_info) = self.extensions.access_network_info.as_ref() {
+            access_network_info
+                .validate_for_encode(location_purpose)
+                .map_err(location::location_encode_error)?;
+        }
+        match (
+            location_purpose,
+            self.extensions.access_network_info.is_some(),
+            self.extensions.user_location_info_time.is_some(),
+            self.extensions.user_location_info_time_omission,
+        ) {
+            (_, false, false, None) | (_, true, true, None) => {}
+            (location::SwmLocationEncodePurpose::Origination, true, false, Some(omission))
+                if !omission.was_absent_on_receive() => {}
+            (location::SwmLocationEncodePurpose::ParsedReplay, true, false, Some(omission))
+                if omission.was_absent_on_receive() => {}
+            (_, false, true, _) => {
+                return Err(encode_structural_error(
+                    "SWm DEA User-Location-Info-Time requires Access-Network-Info",
+                    "7.2.2.1.2",
+                ));
+            }
+            (_, true, false, None) => {
+                return Err(encode_structural_error(
+                    "originated SWm DEA location without time requires omission evidence",
+                    "7.2.2.1.2",
+                ));
+            }
+            _ => {
+                return Err(encode_structural_error(
+                    "SWm DEA location-time omission evidence is internally inconsistent",
+                    "7.2.2.1.2",
+                ));
+            }
         }
         validate_dea_timers(self).map_err(|reason| encode_structural_error(reason, "7.2.2.1.2"))?;
         if self.result_category() == SwmResultCategory::Success && !self.carries_eap_material() {
@@ -6522,9 +6830,51 @@ pub fn build_swm_diameter_eap_answer(
         true,
         hop_by_hop_identifier,
         end_to_end_identifier,
-        false,
+        SwmDiameterEapAnswerBuildMode {
+            request_conditioned: false,
+            location_purpose: location::SwmLocationEncodePurpose::Origination,
+        },
         ctx,
     )
+}
+
+/// Canonically rebuild one immutable parsed SWm DEA envelope.
+///
+/// This is the only encoding boundary that accepts receive-only location
+/// provenance such as an SSID-only `Access-Network-Info` or a received
+/// location without `User-Location-Info-Time`. The sealed envelope prevents
+/// those exceptions from being copied into or mutating a newly originated
+/// answer. Known AVP flags are emitted canonically, while retained optional
+/// extensions and the exact Diameter transaction and Proxy-Info chain are
+/// preserved.
+pub fn build_swm_diameter_eap_answer_envelope(
+    envelope: &SwmDiameterEapAnswerEnvelope,
+    ctx: EncodeContext,
+) -> Result<OwnedMessage, EncodeError> {
+    if envelope.provenance != SwmDiameterEapAnswerEnvelopeProvenance::Parsed {
+        return Err(encode_structural_error(
+            "SWm DEA replay requires an immutable parsed answer envelope",
+            "DEA",
+        ));
+    }
+    build_swm_diameter_eap_answer_internal(
+        &envelope.answer,
+        &envelope.proxy_infos,
+        envelope.proxiable,
+        envelope.transaction.hop_by_hop_identifier(),
+        envelope.transaction.end_to_end_identifier(),
+        SwmDiameterEapAnswerBuildMode {
+            request_conditioned: true,
+            location_purpose: location::SwmLocationEncodePurpose::ParsedReplay,
+        },
+        ctx,
+    )
+}
+
+#[derive(Clone, Copy)]
+struct SwmDiameterEapAnswerBuildMode {
+    request_conditioned: bool,
+    location_purpose: location::SwmLocationEncodePurpose,
 }
 
 fn build_swm_diameter_eap_answer_internal(
@@ -6533,23 +6883,39 @@ fn build_swm_diameter_eap_answer_internal(
     proxiable: bool,
     hop_by_hop_identifier: u32,
     end_to_end_identifier: u32,
-    request_conditioned: bool,
+    mode: SwmDiameterEapAnswerBuildMode,
     ctx: EncodeContext,
 ) -> Result<OwnedMessage, EncodeError> {
-    answer.validate_for_encode()?;
+    answer.validate_with_load_purpose(
+        mode.location_purpose == location::SwmLocationEncodePurpose::Origination,
+        mode.location_purpose,
+    )?;
+    let retained_extension_count = answer
+        .extensions
+        .len()
+        .checked_add(
+            answer
+                .extensions
+                .access_network_info
+                .as_ref()
+                .map_or(0, |access| access.extensions().len()),
+        )
+        .ok_or_else(EncodeError::length_overflow)?;
     validate_diameter_eap_routing_for_encode(
         proxy_infos.len(),
         &[],
-        answer.extensions.len(),
+        retained_extension_count,
         "DEA",
     )?;
-    if !request_conditioned && (answer.oc_supported_features.is_some() || answer.oc_olr.is_some()) {
+    if !mode.request_conditioned
+        && (answer.oc_supported_features.is_some() || answer.oc_olr.is_some())
+    {
         return Err(encode_structural_error(
             "SWm DEA overload-control response requires a correlated DER capability offer",
             "RFC7683-5.1.2",
         ));
     }
-    if !request_conditioned
+    if !mode.request_conditioned
         && dea_authorization::has_request_conditioned_values(&answer.subscriber_authorization)
     {
         return Err(encode_structural_error(
@@ -6636,6 +7002,17 @@ fn build_swm_diameter_eap_answer_internal(
     }
     for load in &answer.load_reports {
         lifecycle::append_load(&mut raw_avps, load, ctx)?;
+    }
+    if let Some(access_network_info) = answer.extensions.access_network_info.as_ref() {
+        location::append_access_network_info_avp(
+            &mut raw_avps,
+            access_network_info,
+            mode.location_purpose,
+            ctx,
+        )?;
+    }
+    if let Some(user_location_info_time) = answer.extensions.user_location_info_time {
+        location::append_user_location_info_time_avp(&mut raw_avps, user_location_info_time, ctx)?;
     }
     if let Some(default_context_identifier) = answer.default_context_identifier {
         builder_helpers::append_vendor_u32_avp(
@@ -6855,7 +7232,10 @@ fn build_swm_diameter_eap_answer_for_validated(
         request.proxiable,
         transaction.hop_by_hop_identifier(),
         transaction.end_to_end_identifier(),
-        true,
+        SwmDiameterEapAnswerBuildMode {
+            request_conditioned: true,
+            location_purpose: location::SwmLocationEncodePurpose::Origination,
+        },
         ctx,
     )
 }
@@ -7084,6 +7464,8 @@ fn parse_swm_diameter_eap_application_answer_parts(
     let mut oc_supported_features = None;
     let mut oc_olr = None;
     let mut load_reports = Vec::new();
+    let mut access_network_info = None;
+    let mut user_location_info_time = None;
     let mut service_selection = None;
     let mut default_context_identifier = None;
     let mut apn_configurations = Vec::new();
@@ -7231,6 +7613,25 @@ fn parse_swm_diameter_eap_application_answer_parts(
                         1,
                         offset,
                     )?);
+                } else if code == AVP_ACCESS_NETWORK_INFO && vendor_id == VENDOR_ID_3GPP {
+                    let value = location::parse_access_network_info(
+                        &avp,
+                        ctx,
+                        offset,
+                        value_offset,
+                        1,
+                        &mut retention,
+                    )?;
+                    builder_helpers::set_once(&mut access_network_info, value, offset, "5.2.3.24")?;
+                } else if code == AVP_USER_LOCATION_INFO_TIME && vendor_id == VENDOR_ID_3GPP {
+                    let value =
+                        location::parse_user_location_info_time(&avp, offset, value_offset)?;
+                    builder_helpers::set_once(
+                        &mut user_location_info_time,
+                        value,
+                        offset,
+                        "5.3.101",
+                    )?;
                 } else {
                     retain_diameter_eap_extension(
                         ctx,
@@ -7521,6 +7922,12 @@ fn parse_swm_diameter_eap_application_answer_parts(
             "7.2",
         ));
     }
+    let user_location_info_time_omission =
+        if access_network_info.is_some() && user_location_info_time.is_none() {
+            Some(SwmUserLocationInfoTimeOmission::received_without_timestamp())
+        } else {
+            None
+        };
     let answer = SwmDiameterEapAnswer {
         session_id: builder_helpers::require_field(
             session_id,
@@ -7571,6 +7978,9 @@ fn parse_swm_diameter_eap_application_answer_parts(
                 emergency_info,
             },
             apn_configurations: apn_configuration_supplements,
+            access_network_info,
+            user_location_info_time,
+            user_location_info_time_omission,
         },
     };
     lifecycle::validate_diameter_eap_answer_overload_control(
@@ -9492,6 +9902,31 @@ fn validate_decoded_answer(answer: &SwmDiameterEapAnswer) -> Result<(), DecodeEr
     }
     validate_answer_supported_features(&answer.supported_features)
         .map_err(|reason| decode_structural_error(reason, "6.3.29"))?;
+    if let Some(access_network_info) = answer.extensions.access_network_info.as_ref() {
+        access_network_info
+            .validate_received()
+            .map_err(|error| location::location_decode_error(error, crate::DIAMETER_HEADER_LEN))?;
+    }
+    match (
+        answer.extensions.access_network_info.is_some(),
+        answer.extensions.user_location_info_time.is_some(),
+        answer.extensions.user_location_info_time_omission,
+    ) {
+        (false, false, None) | (true, true, None) => {}
+        (true, false, Some(omission)) if omission.was_absent_on_receive() => {}
+        (false, true, _) => {
+            return Err(decode_structural_error(
+                "SWm DEA User-Location-Info-Time requires Access-Network-Info",
+                "7.2.2.1.2",
+            ));
+        }
+        _ => {
+            return Err(decode_structural_error(
+                "decoded SWm DEA location-time provenance is inconsistent",
+                "7.2.2.1.2",
+            ));
+        }
+    }
     validate_dea_timers(answer).map_err(|reason| decode_structural_error(reason, "7.2.2.1.2"))?;
     if answer.result_category() == SwmResultCategory::Success && !answer.carries_eap_material() {
         return Err(decode_structural_error(

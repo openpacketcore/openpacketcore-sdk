@@ -126,6 +126,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   application dictionary alone tolerates either received outer M shape. The
   typed Rf parser still requires outer M set, required SWm child M rules stay
   strict, and originated bytes remain canonical (#352).
+- **Typed SWm DEA WLAN access-location context — `opc-proto-diameter`:**
+  `SwmDiameterEapAnswer` stores location in a private sealed extension and adds
+  `set_wlan_location_with_time`, `set_wlan_location_without_time`, and
+  `clear_wlan_location` for explicit origination. Raw parsed answers have no
+  location-value accessor; typed received values become available through
+  `SwmCorrelatedDiameterEapResponse::wlan_location` after authenticated peer,
+  transaction, proxy, session, application, and Origin correlation. Existing
+  answer literals and bytes remain compatible. The typed grouped model covers
+  SSID, canonical BSSID, paired RFC 5580/4776 civic location,
+  Realm/E212 Operator-Name, opaque ETSI Logical-Access-ID, and sealed bounded
+  unknown children. `SwmAccessNetworkInfo::try_new` now requires a locator or
+  typed `OmittedByOperatorPolicy` evidence; received SSID-only values retain a
+  distinct absence provenance. BSSID input accepts common case and separator
+  spellings but validates an individual, nonzero address and emits canonical
+  upper-case dash form. Civic entity, current IANA CAtype/value formats, and
+  location-method registrations are enforced on both origination and receive;
+  unregistered future method tokens fail closed until the registry snapshot is
+  updated.
+  User-Location-Info-Time now requires Access-Network-Info, while a location
+  without time remains receive-compatible and requires explicit omission
+  evidence when originated. Receive-only absence provenance and retained raw
+  children can be emitted only by the immutable parsed-envelope replay
+  boundary; copying, transplanting, or applying any public mutator to a parsed
+  value cannot promote it into originated state. Exact
+  vendor/flags/cardinality/length validation, pre-allocation bounds,
+  receive-side known M-bit tolerance, strict Access-Network-Info/SSID P-bit
+  rejection, full vendor-aware unknown-code collision handling, specification
+  provenance, and value-free diagnostics have positive and malformed fixtures.
+  RFC 6848 CAtype 40 accepts bounded structural URI, XML local-name, and text
+  triples without a closed namespace whitelist (#352).
 - **Breaking: correlated SWm Diameter-EAP redirect and routing —
   `opc-proto-diameter`:** `SwmDiameterEapRequest` adds ordered redacted
   `route_records`; existing originated literals initialize `Vec::new()`.
