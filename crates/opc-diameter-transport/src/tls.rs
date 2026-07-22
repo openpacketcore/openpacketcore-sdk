@@ -35,7 +35,7 @@ use crate::DiameterFrameLimits;
 
 static NEXT_SESSION_GENERATION: AtomicU64 = AtomicU64::new(1);
 
-trait DiameterIo: AsyncRead + AsyncWrite + Unpin + Send {}
+pub(crate) trait DiameterIo: AsyncRead + AsyncWrite + Unpin + Send {}
 
 impl<T> DiameterIo for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 
@@ -706,9 +706,10 @@ impl fmt::Debug for DiameterTlsAcceptor {
 
 /// An admitted mutually authenticated TLS/TCP stream bound to one peer session.
 ///
-/// This slice intentionally exposes sequential `&mut self` send and receive
-/// operations. It does not yet provide the owned split or actor required for a
-/// normal concurrent Diameter receive/watchdog loop.
+/// Capability setup and narrow integrations may use the sequential `&mut self`
+/// operations. Long-lived users consume a negotiated connection with
+/// [`DiameterTlsConnection::into_peer_runtime`], which privately owns the split
+/// without exposing raw I/O or mutable peer-session state.
 pub struct DiameterTlsConnection {
     io: Box<dyn DiameterIo>,
     shutdown: Arc<std::net::TcpStream>,
@@ -1164,6 +1165,36 @@ impl DiameterTlsConnection {
         }
         Ok((message, operation))
     }
+
+    pub(crate) fn into_runtime_parts(self) -> DiameterTlsRuntimeParts {
+        let Self {
+            io,
+            shutdown,
+            session,
+            generation,
+            evidence,
+            expected_peer,
+            frame_limits,
+            material_status,
+            hard_deadline,
+            retired,
+            _retirement_task,
+            closed: _,
+        } = self;
+        DiameterTlsRuntimeParts {
+            io,
+            shutdown,
+            session,
+            generation,
+            evidence,
+            expected_peer,
+            frame_limits,
+            material_status,
+            hard_deadline,
+            retired,
+            retirement_task: _retirement_task,
+        }
+    }
 }
 
 impl fmt::Debug for DiameterTlsConnection {
@@ -1263,9 +1294,23 @@ fn poison_connection(
     shutdown.shutdown(Shutdown::Both)
 }
 
-struct RetirementTask {
+pub(crate) struct RetirementTask {
     task: tokio::task::JoinHandle<()>,
     shutdown: Arc<std::net::TcpStream>,
+}
+
+pub(crate) struct DiameterTlsRuntimeParts {
+    pub(crate) io: Box<dyn DiameterIo>,
+    pub(crate) shutdown: Arc<std::net::TcpStream>,
+    pub(crate) session: PeerSession,
+    pub(crate) generation: PeerSessionGeneration,
+    pub(crate) evidence: DiameterTlsEvidence,
+    pub(crate) expected_peer: ExpectedPeerIdentity,
+    pub(crate) frame_limits: DiameterFrameLimits,
+    pub(crate) material_status: TlsMaterialStatusReceiver,
+    pub(crate) hard_deadline: Instant,
+    pub(crate) retired: Arc<AtomicBool>,
+    pub(crate) retirement_task: RetirementTask,
 }
 
 impl Drop for RetirementTask {
@@ -1614,7 +1659,7 @@ fn material_status_matches(epoch: TlsMaterialEpoch, status: opc_tls::TlsMaterial
     }
 }
 
-fn retirement_required(
+pub(crate) fn retirement_required(
     material_status: &TlsMaterialStatusReceiver,
     admitted_epoch: TlsMaterialEpoch,
     hard_deadline: Instant,

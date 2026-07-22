@@ -5,22 +5,33 @@
 //! SPIFFE identity has matched, coherent credential material has been admitted,
 //! and the exact `opc-proto-diameter` peer-protection attempt has been attested.
 //! Direct-mode connector/acceptor methods own their respective canonical
-//! CER/CEA roles; generic sequential send/receive methods admit only
-//! post-negotiation application messages. The connection exposes owned
-//! retirement-aware readiness projections, but it does not yet expose a
-//! concurrent read/write split, watchdog/disconnect facade, or actor for a
-//! full-duplex Diameter runtime.
+//! CER/CEA roles. A negotiated connection can then be consumed into a bounded
+//! full-duplex peer runtime that owns watchdog and disconnect procedures while
+//! delivering only admitted application messages.
 
 #![forbid(unsafe_code)]
 
 mod frame;
 mod inband;
+mod runtime;
 mod tls;
+
+mod election;
+
+pub use election::{
+    elect_simultaneous_open, DiameterElectionError, DiameterElectionInput, DiameterElectionOutcome,
+};
 
 pub use frame::{DiameterFrameLimits, DiameterFrameLimitsError};
 pub use inband::{
     DiameterInbandTlsInitiator, DiameterInbandTlsInitiatorAwaitingAnswer,
     DiameterInbandTlsResponder, DiameterInbandTlsResponderCerReceived,
+};
+pub use runtime::{
+    DiameterApplicationMessage, DiameterApplicationReceiver, DiameterPeerActivity,
+    DiameterPeerHandle, DiameterPeerRuntime, DiameterPeerRuntimeConfig,
+    DiameterPeerRuntimeConfigError, DiameterPeerRuntimeError, DiameterWatchdogTwinit,
+    DiameterWatchdogTwinitError,
 };
 pub use tls::{
     DiameterCapabilitiesExchangeAnswer, DiameterCapabilitiesExchangeOutcome,

@@ -1136,6 +1136,8 @@ impl PeerProtectionReadiness {
     }
 
     /// Return whether non-CER/CEA traffic is permitted by protection state.
+    /// An outstanding watchdog probe retains permission; a degraded session
+    /// does not.
     #[must_use]
     pub const fn traffic_permitted(self) -> bool {
         self.traffic_permitted
@@ -1750,7 +1752,8 @@ pub struct PeerSessionReadiness {
     pub draining: bool,
     /// Whether reconnect work is required or delayed by backoff.
     pub reconnecting: bool,
-    /// Whether the peer is ready for product traffic.
+    /// Whether the peer is ready for product traffic. This remains true while
+    /// a watchdog answer is pending and becomes false when the peer degrades.
     pub traffic_ready: bool,
     /// Stable blockers in evaluation order.
     pub blockers: Vec<PeerSessionBlocker>,
@@ -1964,6 +1967,12 @@ pub enum PeerSessionBoundError {
         /// Stable lifecycle operation name.
         operation: &'static str,
     },
+    /// The answer does not match the exact retained request transaction, or
+    /// no request transaction is outstanding for the operation.
+    TransactionMismatch {
+        /// Stable lifecycle operation name.
+        operation: &'static str,
+    },
 }
 
 impl PeerSessionBoundError {
@@ -1975,6 +1984,7 @@ impl PeerSessionBoundError {
             Self::InvalidTransition { .. } => "diameter_peer_lifecycle_invalid_transition",
             Self::CommandNotAdmitted { .. } => "diameter_peer_lifecycle_command_not_admitted",
             Self::InvalidPeerHeader { .. } => "diameter_peer_lifecycle_invalid_header",
+            Self::TransactionMismatch { .. } => "diameter_peer_lifecycle_transaction_mismatch",
         }
     }
 
@@ -2004,6 +2014,9 @@ impl fmt::Display for PeerSessionBoundError {
                 reason.as_str()
             ),
             Self::InvalidPeerHeader { operation } => {
+                write!(f, "{}: operation {operation}", self.as_str())
+            }
+            Self::TransactionMismatch { operation } => {
                 write!(f, "{}: operation {operation}", self.as_str())
             }
         }
@@ -2041,12 +2054,12 @@ enum PeerCapabilityRole {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct PeerCapabilityTransaction {
+struct PeerTransaction {
     hop_by_hop_identifier: u32,
     end_to_end_identifier: u32,
 }
 
-impl PeerCapabilityTransaction {
+impl PeerTransaction {
     fn from_header(header: &Header) -> Self {
         Self {
             hop_by_hop_identifier: header.hop_by_hop_identifier,
@@ -2071,8 +2084,11 @@ pub struct PeerSession {
     next_protection_generation: u64,
     protection: PeerProtectionLifecycle,
     capabilities_request_outstanding: bool,
-    outbound_capability_transaction: Option<PeerCapabilityTransaction>,
-    inbound_capability_transaction: Option<PeerCapabilityTransaction>,
+    outbound_capability_transaction: Option<PeerTransaction>,
+    inbound_capability_transaction: Option<PeerTransaction>,
+    outbound_watchdog_transaction: Option<PeerTransaction>,
+    outbound_disconnect_transaction: Option<PeerTransaction>,
+    inbound_disconnect_transaction: Option<PeerTransaction>,
     capability_role: Option<PeerCapabilityRole>,
     selected_protection: Option<PeerProtectionMechanism>,
     capability_evidence_generation_bound: bool,
@@ -2136,6 +2152,21 @@ impl Clone for PeerSession {
                 None
             } else {
                 self.inbound_capability_transaction
+            },
+            outbound_watchdog_transaction: if protection_was_authoritative {
+                None
+            } else {
+                self.outbound_watchdog_transaction
+            },
+            outbound_disconnect_transaction: if protection_was_authoritative {
+                None
+            } else {
+                self.outbound_disconnect_transaction
+            },
+            inbound_disconnect_transaction: if protection_was_authoritative {
+                None
+            } else {
+                self.inbound_disconnect_transaction
             },
             capability_role: if protection_was_authoritative {
                 None
@@ -2252,6 +2283,9 @@ impl PeerSession {
             capabilities_request_outstanding: false,
             outbound_capability_transaction: None,
             inbound_capability_transaction: None,
+            outbound_watchdog_transaction: None,
+            outbound_disconnect_transaction: None,
+            inbound_disconnect_transaction: None,
             capability_role: None,
             selected_protection: None,
             capability_evidence_generation_bound: false,
@@ -2329,6 +2363,9 @@ impl PeerSession {
         self.capabilities_request_outstanding = false;
         self.outbound_capability_transaction = None;
         self.inbound_capability_transaction = None;
+        self.outbound_watchdog_transaction = None;
+        self.outbound_disconnect_transaction = None;
+        self.inbound_disconnect_transaction = None;
         self.capability_role = None;
         self.selected_protection = None;
         self.capability_evidence_generation_bound = false;
@@ -2395,7 +2432,10 @@ impl PeerSession {
                 session_generation: self.session_generation,
                 protection_generation: None,
                 protected_ready: false,
-                traffic_permitted: true,
+                traffic_permitted: matches!(
+                    self.state,
+                    PeerSessionState::Negotiated | PeerSessionState::WatchdogProbing
+                ),
                 failure: None,
             },
             PeerProtectionLifecycle::Pending {
@@ -2421,9 +2461,7 @@ impl PeerSession {
                 traffic_permitted: evidence.is_mutually_authenticated()
                     && matches!(
                         self.state,
-                        PeerSessionState::Negotiated
-                            | PeerSessionState::WatchdogProbing
-                            | PeerSessionState::Degraded
+                        PeerSessionState::Negotiated | PeerSessionState::WatchdogProbing
                     ),
                 failure: None,
             },
@@ -2564,6 +2602,10 @@ impl PeerSession {
     /// handshake is pending.
     /// Explicitly unprotected negotiation preserves existing traffic behavior
     /// but produces admission with `protected == false`.
+    /// In accordance with RFC 3539, an outstanding watchdog probe does not by
+    /// itself block application traffic. A missed or rejected watchdog that
+    /// moves the session to `Degraded` does block application traffic while
+    /// retaining watchdog and disconnect admission for failover handling.
     ///
     /// # Errors
     ///
@@ -2600,7 +2642,10 @@ impl PeerSession {
             PeerCommandClass::CapabilitiesExchange => {
                 self.capabilities_header_is_admissible(direction, header)
             }
-            PeerCommandClass::Application => self.state == PeerSessionState::Negotiated,
+            PeerCommandClass::Application => matches!(
+                self.state,
+                PeerSessionState::Negotiated | PeerSessionState::WatchdogProbing
+            ),
             PeerCommandClass::DeviceWatchdog => matches!(
                 self.state,
                 PeerSessionState::Negotiated
@@ -2730,7 +2775,7 @@ impl PeerSession {
         if self.capability_role == Some(PeerCapabilityRole::Responder) {
             return Err(PeerCapabilityBoundaryError::ConflictingTransaction);
         }
-        let transaction = PeerCapabilityTransaction::from_header(header);
+        let transaction = PeerTransaction::from_header(header);
         match self.outbound_capability_transaction {
             Some(current) if current != transaction => {
                 return Err(PeerCapabilityBoundaryError::ConflictingTransaction);
@@ -2817,7 +2862,7 @@ impl PeerSession {
         if self.capability_role == Some(PeerCapabilityRole::Initiator) {
             return Err(PeerCapabilityBoundaryError::ConflictingTransaction);
         }
-        let transaction = PeerCapabilityTransaction::from_header(header);
+        let transaction = PeerTransaction::from_header(header);
         match self.inbound_capability_transaction {
             Some(current) if current != transaction => {
                 return Err(PeerCapabilityBoundaryError::ConflictingTransaction);
@@ -3063,8 +3108,17 @@ impl PeerSession {
             CommandKind::Request,
             "watchdog_request_sent",
         )?;
-        self.watchdog_request_sent_inner()
-            .map_err(PeerSessionBoundError::from_session)
+        if self.outbound_watchdog_transaction.is_some() {
+            return Err(PeerSessionBoundError::TransactionMismatch {
+                operation: "watchdog_request_sent",
+            });
+        }
+        let transaction = PeerTransaction::from_header(header);
+        let transition = self
+            .watchdog_request_sent_inner()
+            .map_err(PeerSessionBoundError::from_session)?;
+        self.outbound_watchdog_transaction = Some(transaction);
+        Ok(transition)
     }
 
     fn watchdog_request_sent_inner(&mut self) -> Result<PeerSessionTransition, PeerSessionError> {
@@ -3193,8 +3247,19 @@ impl PeerSession {
             CommandKind::Answer,
             "observe_watchdog_answer",
         )?;
-        self.observe_watchdog_answer_inner(answer)
-            .map_err(PeerSessionBoundError::from_session)
+        if !self
+            .outbound_watchdog_transaction
+            .is_some_and(|transaction| transaction.matches(header))
+        {
+            return Err(PeerSessionBoundError::TransactionMismatch {
+                operation: "observe_watchdog_answer",
+            });
+        }
+        let transition = self
+            .observe_watchdog_answer_inner(answer)
+            .map_err(PeerSessionBoundError::from_session)?;
+        self.outbound_watchdog_transaction = None;
+        Ok(transition)
     }
 
     fn observe_watchdog_answer_inner(
@@ -3220,6 +3285,7 @@ impl PeerSession {
         }
         let alive = blockers.is_empty();
         self.missed_watchdogs = if alive { 0 } else { self.missed_watchdogs };
+        self.outbound_watchdog_transaction = None;
         self.state = if alive {
             PeerSessionState::Negotiated
         } else {
@@ -3271,8 +3337,106 @@ impl PeerSession {
         generation: PeerSessionGeneration,
     ) -> Result<PeerSessionTransition, PeerSessionBoundError> {
         self.validate_lifecycle_generation(generation)?;
-        self.watchdog_missed_inner()
-            .map_err(PeerSessionBoundError::from_session)
+        if self.outbound_watchdog_transaction.is_none() {
+            return Err(PeerSessionBoundError::TransactionMismatch {
+                operation: "watchdog_missed",
+            });
+        }
+        let transition = self
+            .watchdog_missed_inner()
+            .map_err(PeerSessionBoundError::from_session)?;
+        self.outbound_watchdog_transaction = None;
+        Ok(transition)
+    }
+
+    /// Enter the RFC 3539 `SUSPECT` grace interval for an exact outstanding
+    /// watchdog without discarding its DWA correlation authority.
+    ///
+    /// This transition is intended for a transport runtime that owns the
+    /// second watchdog interval and closes the connection if that interval
+    /// also expires. It does not retransmit DWR.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PeerSessionBoundError`] for stale generation evidence, no
+    /// outstanding watchdog, or an invalid lifecycle state.
+    pub fn watchdog_suspect_on(
+        &mut self,
+        generation: PeerSessionGeneration,
+    ) -> Result<PeerSessionTransition, PeerSessionBoundError> {
+        self.validate_lifecycle_generation(generation)?;
+        if self.outbound_watchdog_transaction.is_none() {
+            return Err(PeerSessionBoundError::TransactionMismatch {
+                operation: "watchdog_suspect",
+            });
+        }
+        if self.state != PeerSessionState::WatchdogProbing {
+            return Err(PeerSessionBoundError::from_session(
+                PeerSessionError::InvalidTransition {
+                    operation: "watchdog_suspect",
+                    state: self.state,
+                },
+            ));
+        }
+        let previous = self.state;
+        self.missed_watchdogs = self.missed_watchdogs.saturating_add(1);
+        self.state = PeerSessionState::Degraded;
+        self.last_blockers = vec![PeerSessionBlocker::WatchdogMissed];
+        self.last_watchdog_projection = Some(PeerSessionWatchdogProjection {
+            result_code: None,
+            origin_state_id: None,
+            diagnostics_present: false,
+            missed_watchdogs: self.missed_watchdogs,
+            alive: false,
+            blockers: self.last_blockers.clone(),
+        });
+        Ok(self.transition(PeerSessionEvent::WatchdogMissed, previous))
+    }
+
+    /// Record RFC 3539 peer activity while an exact DWA remains pending.
+    ///
+    /// Any structurally valid Diameter message resets the transport-owned
+    /// watchdog timer. Activity observed during `SUSPECT` returns the session
+    /// to traffic-ready watchdog probing but deliberately retains the exact
+    /// DWR transaction until its DWA arrives.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PeerSessionBoundError`] for stale generation evidence, no
+    /// outstanding watchdog, or an invalid lifecycle state.
+    pub fn watchdog_peer_activity_on(
+        &mut self,
+        generation: PeerSessionGeneration,
+    ) -> Result<(), PeerSessionBoundError> {
+        self.validate_lifecycle_generation(generation)?;
+        if self.outbound_watchdog_transaction.is_none() {
+            return Err(PeerSessionBoundError::TransactionMismatch {
+                operation: "watchdog_peer_activity",
+            });
+        }
+        if !matches!(
+            self.state,
+            PeerSessionState::WatchdogProbing | PeerSessionState::Degraded
+        ) {
+            return Err(PeerSessionBoundError::from_session(
+                PeerSessionError::InvalidTransition {
+                    operation: "watchdog_peer_activity",
+                    state: self.state,
+                },
+            ));
+        }
+        self.state = PeerSessionState::WatchdogProbing;
+        self.missed_watchdogs = 0;
+        self.last_blockers = vec![PeerSessionBlocker::WatchdogAnswerPending];
+        self.last_watchdog_projection = Some(PeerSessionWatchdogProjection {
+            result_code: None,
+            origin_state_id: None,
+            diagnostics_present: false,
+            missed_watchdogs: 0,
+            alive: true,
+            blockers: self.last_blockers.clone(),
+        });
+        Ok(())
     }
 
     fn watchdog_missed_inner(&mut self) -> Result<PeerSessionTransition, PeerSessionError> {
@@ -3289,6 +3453,7 @@ impl PeerSession {
         }
         let previous = self.state;
         self.missed_watchdogs = self.missed_watchdogs.saturating_add(1);
+        self.outbound_watchdog_transaction = None;
         let threshold = self.policy.watchdog_miss_threshold.max(1);
         let threshold_exceeded = self.missed_watchdogs >= threshold;
         let blocker = if threshold_exceeded {
@@ -3345,7 +3510,15 @@ impl PeerSession {
             CommandKind::Request,
             "disconnect_request_sent",
         )?;
-        Ok(self.disconnect_request_sent_inner(cause))
+        if self.outbound_disconnect_transaction.is_some() {
+            return Err(PeerSessionBoundError::TransactionMismatch {
+                operation: "disconnect_request_sent",
+            });
+        }
+        let transaction = PeerTransaction::from_header(header);
+        let transition = self.disconnect_request_sent_inner(cause);
+        self.outbound_disconnect_transaction = Some(transaction);
+        Ok(transition)
     }
 
     fn disconnect_request_sent_inner(&mut self, _cause: DisconnectCause) -> PeerSessionTransition {
@@ -3361,6 +3534,7 @@ impl PeerSession {
             return self.transition(PeerSessionEvent::Failure, previous);
         }
         self.disconnect_requests_sent = self.disconnect_requests_sent.saturating_add(1);
+        self.outbound_watchdog_transaction = None;
         self.revoke_protection(PeerProtectionFailure::SessionFailed);
         self.state = PeerSessionState::Disconnecting;
         self.last_blockers = vec![PeerSessionBlocker::DisconnectInProgress];
@@ -3406,7 +3580,15 @@ impl PeerSession {
             CommandKind::Request,
             "observe_disconnect_request",
         )?;
-        Ok(self.observe_disconnect_request_inner(request))
+        if self.inbound_disconnect_transaction.is_some() {
+            return Err(PeerSessionBoundError::TransactionMismatch {
+                operation: "observe_disconnect_request",
+            });
+        }
+        let transaction = PeerTransaction::from_header(header);
+        let transition = self.observe_disconnect_request_inner(request);
+        self.inbound_disconnect_transaction = Some(transaction);
+        Ok(transition)
     }
 
     fn observe_disconnect_request_inner(
@@ -3425,6 +3607,7 @@ impl PeerSession {
             return self.transition(PeerSessionEvent::Failure, previous);
         }
         self.disconnect_requests_received = self.disconnect_requests_received.saturating_add(1);
+        self.outbound_watchdog_transaction = None;
         self.revoke_protection(PeerProtectionFailure::SessionFailed);
         self.state = PeerSessionState::Draining;
         self.last_blockers = vec![
@@ -3473,7 +3656,17 @@ impl PeerSession {
             CommandKind::Answer,
             "disconnect_answer_sent",
         )?;
-        Ok(self.disconnect_answer_sent_inner(answer))
+        if !self
+            .inbound_disconnect_transaction
+            .is_some_and(|transaction| transaction.matches(header))
+        {
+            return Err(PeerSessionBoundError::TransactionMismatch {
+                operation: "disconnect_answer_sent",
+            });
+        }
+        let transition = self.disconnect_answer_sent_inner(answer);
+        self.inbound_disconnect_transaction = None;
+        Ok(transition)
     }
 
     fn disconnect_answer_sent_inner(
@@ -3528,7 +3721,17 @@ impl PeerSession {
             CommandKind::Answer,
             "observe_disconnect_answer",
         )?;
-        Ok(self.observe_disconnect_answer_inner(answer))
+        if !self
+            .outbound_disconnect_transaction
+            .is_some_and(|transaction| transaction.matches(header))
+        {
+            return Err(PeerSessionBoundError::TransactionMismatch {
+                operation: "observe_disconnect_answer",
+            });
+        }
+        let transition = self.observe_disconnect_answer_inner(answer);
+        self.outbound_disconnect_transaction = None;
+        Ok(transition)
     }
 
     fn observe_disconnect_answer_inner(
@@ -3577,6 +3780,7 @@ impl PeerSession {
     fn schedule_reconnect_inner(&mut self) -> PeerSessionTransition {
         let previous = self.state;
         self.reconnects_scheduled = self.reconnects_scheduled.saturating_add(1);
+        self.clear_pending_lifecycle_transactions();
         self.revoke_protection(PeerProtectionFailure::SessionFailed);
         self.state = PeerSessionState::Reconnecting;
         self.last_blockers.clear();
@@ -3609,6 +3813,7 @@ impl PeerSession {
     fn enter_backoff_inner(&mut self) -> PeerSessionTransition {
         let previous = self.state;
         self.backoffs_entered = self.backoffs_entered.saturating_add(1);
+        self.clear_pending_lifecycle_transactions();
         self.revoke_protection(PeerProtectionFailure::SessionFailed);
         self.state = PeerSessionState::Backoff;
         self.last_blockers = vec![PeerSessionBlocker::ReconnectBackoff];
@@ -3641,6 +3846,7 @@ impl PeerSession {
     fn backoff_elapsed_inner(&mut self) -> PeerSessionTransition {
         let previous = self.state;
         self.reconnects_scheduled = self.reconnects_scheduled.saturating_add(1);
+        self.clear_pending_lifecycle_transactions();
         self.revoke_protection(PeerProtectionFailure::SessionFailed);
         self.state = PeerSessionState::Reconnecting;
         self.last_blockers.clear();
@@ -3673,6 +3879,7 @@ impl PeerSession {
 
     fn fail_inner(&mut self, blocker: PeerSessionBlocker) -> PeerSessionTransition {
         let previous = self.state;
+        self.clear_pending_lifecycle_transactions();
         self.revoke_protection(PeerProtectionFailure::SessionFailed);
         self.state = PeerSessionState::Failed;
         self.last_blockers = vec![blocker];
@@ -3697,8 +3904,10 @@ impl PeerSession {
                 self.state,
                 PeerSessionState::Reconnecting | PeerSessionState::Backoff
             ),
-            traffic_ready: self.state == PeerSessionState::Negotiated
-                && self.protection_readiness().traffic_permitted,
+            traffic_ready: matches!(
+                self.state,
+                PeerSessionState::Negotiated | PeerSessionState::WatchdogProbing
+            ) && self.protection_readiness().traffic_permitted,
             blockers,
         }
     }
@@ -4236,6 +4445,7 @@ impl PeerSession {
         self.capabilities_request_outstanding = false;
         self.outbound_capability_transaction = None;
         self.inbound_capability_transaction = None;
+        self.clear_pending_lifecycle_transactions();
         self.capability_role = None;
         self.state = PeerSessionState::Failed;
         self.last_blockers = vec![PeerSessionBlocker::SessionFailed];
@@ -4253,6 +4463,12 @@ impl PeerSession {
         self.outbound_capability_transaction = None;
         self.inbound_capability_transaction = None;
         self.capability_role = None;
+    }
+
+    fn clear_pending_lifecycle_transactions(&mut self) {
+        self.outbound_watchdog_transaction = None;
+        self.outbound_disconnect_transaction = None;
+        self.inbound_disconnect_transaction = None;
     }
 
     fn protection_transition(
@@ -4275,6 +4491,7 @@ impl PeerSession {
             blockers.push(PeerSessionBlocker::DisconnectResultNotSuccess);
         }
         let acknowledged = blockers.is_empty();
+        self.clear_pending_lifecycle_transactions();
         self.revoke_protection(PeerProtectionFailure::SessionFailed);
         self.state = if acknowledged {
             PeerSessionState::Reconnecting
@@ -4378,7 +4595,9 @@ pub fn cea_result_code(local: &PeerCapabilities, remote: &PeerCapabilities) -> u
 /// particular, a Capabilities-Exchange-Answer with
 /// `DIAMETER_NO_COMMON_APPLICATION` (5010) will not have the E bit set by this
 /// helper, because 5010 is not a protocol error even though the capability
-/// exchange failed.
+/// exchange failed. A permanent-failure (5xxx) answer may still deliberately
+/// select RFC 6733's generic E-bit grammar; typed peer-answer builders choose
+/// the ordinary command grammar for that class.
 pub const fn result_code_requires_error_bit(result_code: u32) -> bool {
     result_code >= 3000 && result_code < 4000
 }
@@ -4392,10 +4611,28 @@ fn ensure_result_code_error_bit(
         Ok(())
     } else {
         Err(decode_structural_error(
-            "diameter CEA error flag does not match Result-Code family",
+            "diameter answer error flag does not match Result-Code family",
             4,
             section,
         ))
+    }
+}
+
+fn ensure_lifecycle_answer_result_code_error_bit(
+    header: &Header,
+    result_code: u32,
+    section: &'static str,
+) -> Result<(), DecodeError> {
+    // RFC 6733 section 7.1.5 permits permanent failures in either the
+    // command's ordinary answer grammar or the generic E-bit fallback
+    // grammar. DWA and DPA share the required Result-Code/Origin identity
+    // fields with that fallback grammar, so the typed boundary can safely
+    // retain either representation. Every other result family keeps the
+    // section 7.2 requirement enforced by the common helper.
+    if (5000..6000).contains(&result_code) {
+        Ok(())
+    } else {
+        ensure_result_code_error_bit(header, result_code, section)
     }
 }
 
@@ -4672,6 +4909,7 @@ pub fn parse_device_watchdog_answer(
         "diameter DWA requires Result-Code",
         section,
     )?;
+    ensure_lifecycle_answer_result_code_error_bit(&message.header, result_code, section)?;
     Ok(DeviceWatchdogAnswer {
         result_code,
         identity: avps.identity(section)?,
@@ -4792,6 +5030,7 @@ pub fn parse_disconnect_peer_answer(
         "diameter DPA requires Result-Code",
         section,
     )?;
+    ensure_lifecycle_answer_result_code_error_bit(&message.header, result_code, section)?;
     Ok(DisconnectPeerAnswer {
         result_code,
         identity: avps.identity(section)?,
@@ -5988,6 +6227,7 @@ mod tests {
     use crate::base::{
         INBAND_SECURITY_ID_NO_INBAND_SECURITY, RESULT_CODE_DIAMETER_COMMAND_UNSUPPORTED,
         RESULT_CODE_DIAMETER_NO_COMMON_APPLICATION, RESULT_CODE_DIAMETER_SUCCESS,
+        RESULT_CODE_DIAMETER_UNABLE_TO_COMPLY,
     };
     use crate::{AvpFlags, AVP_HEADER_LEN};
     use bytes::Bytes;
@@ -6751,6 +6991,55 @@ mod tests {
     }
 
     #[test]
+    fn pending_lifecycle_transactions_clear_on_generation_failure_and_terminal_paths() {
+        let header = Header::new(
+            peer_request_flags(PeerProcedure::DeviceWatchdog),
+            COMMAND_DEVICE_WATCHDOG,
+            APPLICATION_ID_COMMON_MESSAGES,
+            0x1020_3040,
+            0x5060_7080,
+        );
+        let transaction = PeerTransaction::from_header(&header);
+        let mut session = PeerSession::new(sample_capabilities());
+        session.outbound_watchdog_transaction = Some(transaction);
+        session.outbound_disconnect_transaction = Some(transaction);
+        session.inbound_disconnect_transaction = Some(transaction);
+
+        if let Err(error) =
+            session.begin_connection_generation(PeerSessionGeneration::new(NonZeroU64::MIN))
+        {
+            panic!("connection generation failed: {error}");
+        }
+        assert!(session.outbound_watchdog_transaction.is_none());
+        assert!(session.outbound_disconnect_transaction.is_none());
+        assert!(session.inbound_disconnect_transaction.is_none());
+
+        session.outbound_watchdog_transaction = Some(transaction);
+        session.outbound_disconnect_transaction = Some(transaction);
+        session.inbound_disconnect_transaction = Some(transaction);
+        let _transition = session.fail_inner(PeerSessionBlocker::SessionFailed);
+        assert!(session.outbound_watchdog_transaction.is_none());
+        assert!(session.outbound_disconnect_transaction.is_none());
+        assert!(session.inbound_disconnect_transaction.is_none());
+
+        session.outbound_watchdog_transaction = Some(transaction);
+        session.outbound_disconnect_transaction = Some(transaction);
+        session.inbound_disconnect_transaction = Some(transaction);
+        session.apply_disconnect_answer(
+            &DisconnectPeerAnswer {
+                result_code: RESULT_CODE_DIAMETER_SUCCESS,
+                identity: PeerIdentity::new("aaa-peer.example.net", "example.net"),
+                origin_state_id: None,
+                diagnostics: AnswerDiagnostics::default(),
+            },
+            false,
+        );
+        assert!(session.outbound_watchdog_transaction.is_none());
+        assert!(session.outbound_disconnect_transaction.is_none());
+        assert!(session.inbound_disconnect_transaction.is_none());
+    }
+
+    #[test]
     fn common_application_ids_are_computed_across_advertisement_forms() {
         let application_id = ApplicationId::new(16_777_272);
         let mut local = sample_capabilities();
@@ -6976,6 +7265,164 @@ mod tests {
             Ok(parsed) => assert_eq!(parsed, dpa_answer),
             Err(error) => panic!("DPA parse failed: {error}"),
         }
+    }
+
+    #[test]
+    fn watchdog_and_disconnect_answers_enforce_result_code_error_bit_consistency() {
+        let identity = PeerIdentity::new("aaa2.example.net", "example.net");
+        let successful_watchdog = DeviceWatchdogAnswer {
+            result_code: RESULT_CODE_DIAMETER_SUCCESS,
+            identity: identity.clone(),
+            origin_state_id: None,
+            diagnostics: AnswerDiagnostics::default(),
+        };
+        let built = match build_device_watchdog_answer(
+            &successful_watchdog,
+            0x10,
+            0x20,
+            EncodeContext::default(),
+        ) {
+            Ok(message) => message,
+            Err(error) => panic!("DWA build failed: {error}"),
+        };
+        let mut encoded = BytesMut::from(encode_owned(&built));
+        encoded[4] |= CommandFlags::ERROR;
+        let message = decode_message(&encoded);
+        assert!(matches!(
+            parse_device_watchdog_answer(&message, DecodeContext::default()),
+            Err(error) if matches!(error.code(), DecodeErrorCode::Structural { .. })
+        ));
+
+        let protocol_error_watchdog = DeviceWatchdogAnswer {
+            result_code: RESULT_CODE_DIAMETER_COMMAND_UNSUPPORTED,
+            identity: identity.clone(),
+            origin_state_id: None,
+            diagnostics: AnswerDiagnostics::default(),
+        };
+        let built = match build_device_watchdog_answer(
+            &protocol_error_watchdog,
+            0x30,
+            0x40,
+            EncodeContext::default(),
+        ) {
+            Ok(message) => message,
+            Err(error) => panic!("DWA build failed: {error}"),
+        };
+        let mut encoded = BytesMut::from(encode_owned(&built));
+        encoded[4] &= !CommandFlags::ERROR;
+        let message = decode_message(&encoded);
+        assert!(matches!(
+            parse_device_watchdog_answer(&message, DecodeContext::default()),
+            Err(error) if matches!(error.code(), DecodeErrorCode::Structural { .. })
+        ));
+
+        let successful_disconnect = DisconnectPeerAnswer {
+            result_code: RESULT_CODE_DIAMETER_SUCCESS,
+            identity: identity.clone(),
+            origin_state_id: None,
+            diagnostics: AnswerDiagnostics::default(),
+        };
+        let built = match build_disconnect_peer_answer(
+            &successful_disconnect,
+            0x50,
+            0x60,
+            EncodeContext::default(),
+        ) {
+            Ok(message) => message,
+            Err(error) => panic!("DPA build failed: {error}"),
+        };
+        let mut encoded = BytesMut::from(encode_owned(&built));
+        encoded[4] |= CommandFlags::ERROR;
+        let message = decode_message(&encoded);
+        assert!(matches!(
+            parse_disconnect_peer_answer(&message, DecodeContext::default()),
+            Err(error) if matches!(error.code(), DecodeErrorCode::Structural { .. })
+        ));
+
+        let protocol_error_disconnect = DisconnectPeerAnswer {
+            result_code: RESULT_CODE_DIAMETER_COMMAND_UNSUPPORTED,
+            identity,
+            origin_state_id: None,
+            diagnostics: AnswerDiagnostics::default(),
+        };
+        let built = match build_disconnect_peer_answer(
+            &protocol_error_disconnect,
+            0x70,
+            0x80,
+            EncodeContext::default(),
+        ) {
+            Ok(message) => message,
+            Err(error) => panic!("DPA build failed: {error}"),
+        };
+        let mut encoded = BytesMut::from(encode_owned(&built));
+        encoded[4] &= !CommandFlags::ERROR;
+        let message = decode_message(&encoded);
+        assert!(matches!(
+            parse_disconnect_peer_answer(&message, DecodeContext::default()),
+            Err(error) if matches!(error.code(), DecodeErrorCode::Structural { .. })
+        ));
+    }
+
+    #[test]
+    fn watchdog_permanent_failure_accepts_command_and_error_bit_grammars() {
+        let answer = DeviceWatchdogAnswer {
+            result_code: RESULT_CODE_DIAMETER_UNABLE_TO_COMPLY,
+            identity: PeerIdentity::new("aaa2.example.net", "example.net"),
+            origin_state_id: Some(25),
+            diagnostics: AnswerDiagnostics::default(),
+        };
+        let built =
+            match build_device_watchdog_answer(&answer, 0x90, 0xa0, EncodeContext::default()) {
+                Ok(message) => message,
+                Err(error) => panic!("5xxx DWA build failed: {error}"),
+            };
+        assert!(!built.header.flags.is_error());
+
+        let command_wire = encode_owned(&built);
+        let command_message = decode_message(&command_wire);
+        assert_eq!(
+            parse_device_watchdog_answer(&command_message, DecodeContext::default()),
+            Ok(answer.clone())
+        );
+
+        let mut generic_wire = BytesMut::from(command_wire);
+        generic_wire[4] |= CommandFlags::ERROR;
+        let generic_message = decode_message(&generic_wire);
+        assert_eq!(
+            parse_device_watchdog_answer(&generic_message, DecodeContext::default()),
+            Ok(answer)
+        );
+    }
+
+    #[test]
+    fn disconnect_permanent_failure_accepts_command_and_error_bit_grammars() {
+        let answer = DisconnectPeerAnswer {
+            result_code: RESULT_CODE_DIAMETER_UNABLE_TO_COMPLY,
+            identity: PeerIdentity::new("aaa2.example.net", "example.net"),
+            origin_state_id: Some(26),
+            diagnostics: AnswerDiagnostics::default(),
+        };
+        let built =
+            match build_disconnect_peer_answer(&answer, 0xb0, 0xc0, EncodeContext::default()) {
+                Ok(message) => message,
+                Err(error) => panic!("5xxx DPA build failed: {error}"),
+            };
+        assert!(!built.header.flags.is_error());
+
+        let command_wire = encode_owned(&built);
+        let command_message = decode_message(&command_wire);
+        assert_eq!(
+            parse_disconnect_peer_answer(&command_message, DecodeContext::default()),
+            Ok(answer.clone())
+        );
+
+        let mut generic_wire = BytesMut::from(command_wire);
+        generic_wire[4] |= CommandFlags::ERROR;
+        let generic_message = decode_message(&generic_wire);
+        assert_eq!(
+            parse_disconnect_peer_answer(&generic_message, DecodeContext::default()),
+            Ok(answer)
+        );
     }
 
     #[test]
@@ -7672,7 +8119,7 @@ mod tests {
             Err(error) if matches!(
                 error.code(),
                 DecodeErrorCode::Structural {
-                    reason: "diameter CEA error flag does not match Result-Code family"
+                    reason: "diameter answer error flag does not match Result-Code family"
                 }
             )
         ));
@@ -7712,7 +8159,7 @@ mod tests {
             Err(error) if matches!(
                 error.code(),
                 DecodeErrorCode::Structural {
-                    reason: "diameter CEA error flag does not match Result-Code family"
+                    reason: "diameter answer error flag does not match Result-Code family"
                 }
             )
         ));

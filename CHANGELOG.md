@@ -44,12 +44,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   immediate update race and revoking the exact generation before release.
   Ordinary healthy handle drop synchronously full-closes TCP even without
   retirement-task scheduling. Unchecked borrowed or mutable `PeerSession`
-  access is not exposed.
-  This slice exposes a sequential connection handle and does not yet provide a
-  concurrent read/write split or actor for a normal full-duplex
-  Diameter/watchdog loop. It also does not implement simultaneous-open winner
-  election, realm routing, listener/reconnect policy, DTLS/SCTP, or SCTP PPID
-  47, and makes no complete RFC 6733 or product-readiness claim (#348).
+  access is not exposed. A successfully negotiated connection can be consumed
+  into a full-duplex owner with persistent reader/writer tasks and distinct
+  bounded caller, priority-control, and inbound-application queues. It
+  handles identity-bound DWR/DWA and DPR/DPA, correlates both identifiers,
+  emits request-bound typed errors for safely classifiable malformed peer
+  requests, discards answers with an unknown Hop-by-Hop identifier, and keeps
+  application traffic available while a watchdog is pending. Runtime-owned
+  RFC 3539 timing recalculates jitter on every reset, enters `SUSPECT` after the
+  first unanswered interval without retransmitting DWR, and closes after the
+  second. A locally initiated DPR can supersede a pending DWR without allowing
+  the watchdog to block graceful shutdown. Inbound DPR returns success only after the consumer explicitly
+  proves its application transactions quiescent. Queue sizes, frame-completion
+  and maximum-write bounds, local Origin-State-Id, and base `Twinit` are typed;
+  identifier allocation, initial watchdog scheduling, and reconnect policy
+  remain caller-owned. A
+  transport-neutral RFC 6733 simultaneous-open helper returns the converged
+  local survivor and fails closed on indistinguishable Origin-Host values.
+  Realm routing, listener/reconnect orchestration, DTLS/SCTP, and SCTP PPID 47
+  remain outside this slice, which makes no complete RFC 6733 or
+  product-readiness claim (#348).
 - **Explicit IKEv2 legacy-interoperability suites — `opc-proto-ikev2`:**
   executable typed support now covers MODP-768/1024 (Transform IDs 1/2),
   PRF-HMAC-SHA1 (2), and AUTH-HMAC-SHA1-96 (2) across admitted-provider
@@ -135,7 +149,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   CER/CEA afterwards; it does not treat `Inband-Security-Id` as a prerequisite
   or unlock application traffic before capability success. A
   generation cannot combine initiator and responder roles, so simultaneous-open
-  election remains transport-owned. An in-band protection-handshake phase
+  election remains transport-owned. Exact DWR and DPR transactions retain both
+  Diameter identifiers; unknown or duplicate DWA/DPA cannot mutate the
+  session, an exact Hop-by-Hop answer with a conflicting End-to-End identifier
+  fails closed, and Result-Code/E-bit contradictions fail typed parsing. DWA
+  and DPA accept both RFC-valid permanent-error grammars while retaining strict
+  protocol/transient error-bit rules.
+  Application traffic remains admitted while a watchdog response is pending,
+  while degraded state remains failover-only. An in-band protection-handshake phase
   admits no Diameter messages. Only an exact current-generation caller
   assertion of the selected mutually authenticated TLS/TCP or DTLS/SCTP
   mechanism unlocks

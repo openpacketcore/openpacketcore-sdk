@@ -132,42 +132,58 @@ fn app_request() -> Header {
 }
 
 fn watchdog_request() -> Header {
+    watchdog_request_with_ids(0x300, 0x400)
+}
+
+fn watchdog_request_with_ids(hop: u32, end: u32) -> Header {
     Header::new(
         peer_request_flags(PeerProcedure::DeviceWatchdog),
         PeerProcedure::DeviceWatchdog.command_code(),
         APPLICATION_ID_COMMON_MESSAGES,
-        0x300,
-        0x400,
+        hop,
+        end,
     )
 }
 
 fn watchdog_answer_header() -> Header {
+    watchdog_answer_header_with_ids(0x300, 0x400)
+}
+
+fn watchdog_answer_header_with_ids(hop: u32, end: u32) -> Header {
     Header::new(
         peer_answer_flags(PeerProcedure::DeviceWatchdog, false),
         PeerProcedure::DeviceWatchdog.command_code(),
         APPLICATION_ID_COMMON_MESSAGES,
-        0x300,
-        0x400,
+        hop,
+        end,
     )
 }
 
 fn disconnect_request() -> Header {
+    disconnect_request_with_ids(0x500, 0x600)
+}
+
+fn disconnect_request_with_ids(hop: u32, end: u32) -> Header {
     Header::new(
         peer_request_flags(PeerProcedure::DisconnectPeer),
         PeerProcedure::DisconnectPeer.command_code(),
         APPLICATION_ID_COMMON_MESSAGES,
-        0x500,
-        0x600,
+        hop,
+        end,
     )
 }
 
 fn disconnect_answer_header() -> Header {
+    disconnect_answer_header_with_ids(0x500, 0x600)
+}
+
+fn disconnect_answer_header_with_ids(hop: u32, end: u32) -> Header {
     Header::new(
         peer_answer_flags(PeerProcedure::DisconnectPeer, false),
         PeerProcedure::DisconnectPeer.command_code(),
         APPLICATION_ID_COMMON_MESSAGES,
-        0x500,
-        0x600,
+        hop,
+        end,
     )
 }
 
@@ -321,6 +337,261 @@ fn initiator_tls_blocks_all_diameter_until_exact_attestation() {
     assert_eq!(admission.direction(), PeerMessageDirection::Inbound);
     assert!(admission.is_protected());
     assert_eq!(admission.mechanism(), Some(PeerProtectionMechanism::TlsTcp));
+}
+
+#[test]
+fn watchdog_probe_retains_application_readiness_and_requires_exact_answer_ids() {
+    let connection = generation(50);
+    let stale_connection = generation(49);
+    let mut session = protected_session(connection);
+    let request_header = watchdog_request_with_ids(0x301, 0x401);
+
+    let transition = match session.watchdog_request_sent_on(connection, &request_header) {
+        Ok(transition) => transition,
+        Err(error) => panic!("watchdog request boundary failed: {error}"),
+    };
+    assert_eq!(transition.state, PeerSessionState::WatchdogProbing);
+    assert!(transition.readiness.probing);
+    assert!(transition.readiness.traffic_ready);
+    assert!(session.protection_readiness().traffic_permitted());
+    for direction in [
+        PeerMessageDirection::Inbound,
+        PeerMessageDirection::Outbound,
+    ] {
+        if let Err(error) = session.admit_message(connection, direction, &app_request()) {
+            panic!("application traffic was blocked during watchdog probe: {error}");
+        }
+    }
+
+    let probing_snapshot = session.snapshot();
+    assert_eq!(
+        session.observe_watchdog_answer_on(
+            stale_connection,
+            &watchdog_answer_header_with_ids(0x301, 0x401),
+            &watchdog_answer(),
+        ),
+        Err(PeerSessionBoundError::StaleGeneration)
+    );
+    for mismatched_header in [
+        watchdog_answer_header_with_ids(0x302, 0x401),
+        watchdog_answer_header_with_ids(0x301, 0x402),
+    ] {
+        assert_eq!(
+            session.observe_watchdog_answer_on(connection, &mismatched_header, &watchdog_answer(),),
+            Err(PeerSessionBoundError::TransactionMismatch {
+                operation: "observe_watchdog_answer",
+            })
+        );
+        assert_eq!(session.snapshot(), probing_snapshot);
+    }
+
+    let answer_header = watchdog_answer_header_with_ids(0x301, 0x401);
+    let transition =
+        match session.observe_watchdog_answer_on(connection, &answer_header, &watchdog_answer()) {
+            Ok(transition) => transition,
+            Err(error) => panic!("exact watchdog answer was rejected: {error}"),
+        };
+    assert_eq!(transition.state, PeerSessionState::Negotiated);
+    assert!(transition.readiness.traffic_ready);
+    assert_eq!(
+        session.observe_watchdog_answer_on(connection, &answer_header, &watchdog_answer()),
+        Err(PeerSessionBoundError::TransactionMismatch {
+            operation: "observe_watchdog_answer",
+        })
+    );
+
+    let next_request = watchdog_request_with_ids(0x303, 0x403);
+    if let Err(error) = session.watchdog_request_sent_on(connection, &next_request) {
+        panic!("next watchdog transaction failed: {error}");
+    }
+    let transition = match session.watchdog_missed_on(connection) {
+        Ok(transition) => transition,
+        Err(error) => panic!("watchdog miss boundary failed: {error}"),
+    };
+    assert_eq!(transition.state, PeerSessionState::Degraded);
+    assert!(!transition.readiness.traffic_ready);
+    assert!(!session.protection_readiness().traffic_permitted());
+    assert_eq!(
+        session.admit_message(connection, PeerMessageDirection::Inbound, &app_request(),),
+        Err(PeerCommandAdmissionError::SessionNotReady {
+            command: PeerCommandClass::Application,
+            state: PeerSessionState::Degraded,
+        })
+    );
+    assert_eq!(
+        session.watchdog_missed_on(connection),
+        Err(PeerSessionBoundError::TransactionMismatch {
+            operation: "watchdog_missed",
+        })
+    );
+}
+
+#[test]
+fn watchdog_suspect_retains_exact_dwa_and_peer_activity_resets_grace() {
+    let connection = generation(52);
+    let mut session = protected_session(connection);
+    let request = watchdog_request_with_ids(0x321, 0x421);
+    session
+        .watchdog_request_sent_on(connection, &request)
+        .unwrap_or_else(|error| panic!("watchdog request failed: {error}"));
+
+    let suspect = session
+        .watchdog_suspect_on(connection)
+        .unwrap_or_else(|error| panic!("suspect transition failed: {error}"));
+    assert_eq!(suspect.state, PeerSessionState::Degraded);
+    assert!(!suspect.readiness.traffic_ready);
+    assert_eq!(session.snapshot().missed_watchdogs, 1);
+    assert_eq!(
+        session.admit_message(connection, PeerMessageDirection::Inbound, &app_request()),
+        Err(PeerCommandAdmissionError::SessionNotReady {
+            command: PeerCommandClass::Application,
+            state: PeerSessionState::Degraded,
+        })
+    );
+
+    session
+        .watchdog_peer_activity_on(connection)
+        .unwrap_or_else(|error| panic!("peer activity reset failed: {error}"));
+    assert_eq!(session.state(), PeerSessionState::WatchdogProbing);
+    assert!(session.snapshot().readiness.traffic_ready);
+    assert_eq!(session.snapshot().missed_watchdogs, 0);
+    assert_eq!(
+        session.observe_watchdog_answer_on(
+            connection,
+            &watchdog_answer_header_with_ids(0x321, 0x422),
+            &watchdog_answer(),
+        ),
+        Err(PeerSessionBoundError::TransactionMismatch {
+            operation: "observe_watchdog_answer",
+        })
+    );
+
+    let exact = session
+        .observe_watchdog_answer_on(
+            connection,
+            &watchdog_answer_header_with_ids(0x321, 0x421),
+            &watchdog_answer(),
+        )
+        .unwrap_or_else(|error| panic!("late exact DWA failed: {error}"));
+    assert_eq!(exact.state, PeerSessionState::Negotiated);
+    assert!(exact.readiness.traffic_ready);
+}
+
+#[test]
+fn stray_watchdog_answers_fail_closed_without_mutating_peer_state() {
+    let connection = generation(51);
+    let mut session = protected_session(connection);
+    let snapshot = session.snapshot();
+
+    assert_eq!(
+        session.observe_watchdog_answer_on(
+            connection,
+            &watchdog_answer_header_with_ids(0x311, 0x411),
+            &watchdog_answer(),
+        ),
+        Err(PeerSessionBoundError::TransactionMismatch {
+            operation: "observe_watchdog_answer",
+        })
+    );
+    assert_eq!(session.snapshot(), snapshot);
+    assert_eq!(
+        PeerSessionBoundError::TransactionMismatch {
+            operation: "observe_watchdog_answer",
+        }
+        .as_str(),
+        "diameter_peer_lifecycle_transaction_mismatch"
+    );
+}
+
+#[test]
+fn disconnect_answers_require_both_ids_for_local_and_peer_initiated_transactions() {
+    let local_connection = generation(52);
+    let mut local_session = protected_session(local_connection);
+    let local_request_header = disconnect_request_with_ids(0x501, 0x601);
+    if let Err(error) = local_session.disconnect_request_sent_on(
+        local_connection,
+        &local_request_header,
+        DisconnectCause::Busy,
+    ) {
+        panic!("local DPR boundary failed: {error}");
+    }
+    let disconnecting_snapshot = local_session.snapshot();
+    for mismatched_header in [
+        disconnect_answer_header_with_ids(0x502, 0x601),
+        disconnect_answer_header_with_ids(0x501, 0x602),
+    ] {
+        assert_eq!(
+            local_session.observe_disconnect_answer_on(
+                local_connection,
+                &mismatched_header,
+                &disconnect_peer_answer(),
+            ),
+            Err(PeerSessionBoundError::TransactionMismatch {
+                operation: "observe_disconnect_answer",
+            })
+        );
+        assert_eq!(local_session.snapshot(), disconnecting_snapshot);
+    }
+    let local_answer_header = disconnect_answer_header_with_ids(0x501, 0x601);
+    if let Err(error) = local_session.observe_disconnect_answer_on(
+        local_connection,
+        &local_answer_header,
+        &disconnect_peer_answer(),
+    ) {
+        panic!("exact local DPA boundary failed: {error}");
+    }
+    assert_eq!(local_session.state(), PeerSessionState::Reconnecting);
+    assert!(local_session
+        .observe_disconnect_answer_on(
+            local_connection,
+            &local_answer_header,
+            &disconnect_peer_answer(),
+        )
+        .is_err());
+
+    let peer_connection = generation(53);
+    let mut peer_session = protected_session(peer_connection);
+    let peer_request_header = disconnect_request_with_ids(0x511, 0x611);
+    if let Err(error) = peer_session.observe_disconnect_request_on(
+        peer_connection,
+        &peer_request_header,
+        &disconnect_peer_request(),
+    ) {
+        panic!("peer DPR boundary failed: {error}");
+    }
+    let draining_snapshot = peer_session.snapshot();
+    for mismatched_header in [
+        disconnect_answer_header_with_ids(0x512, 0x611),
+        disconnect_answer_header_with_ids(0x511, 0x612),
+    ] {
+        assert_eq!(
+            peer_session.disconnect_answer_sent_on(
+                peer_connection,
+                &mismatched_header,
+                &disconnect_peer_answer(),
+            ),
+            Err(PeerSessionBoundError::TransactionMismatch {
+                operation: "disconnect_answer_sent",
+            })
+        );
+        assert_eq!(peer_session.snapshot(), draining_snapshot);
+    }
+    let peer_answer_header = disconnect_answer_header_with_ids(0x511, 0x611);
+    if let Err(error) = peer_session.disconnect_answer_sent_on(
+        peer_connection,
+        &peer_answer_header,
+        &disconnect_peer_answer(),
+    ) {
+        panic!("exact peer DPA boundary failed: {error}");
+    }
+    assert_eq!(peer_session.state(), PeerSessionState::Reconnecting);
+    assert!(peer_session
+        .disconnect_answer_sent_on(
+            peer_connection,
+            &peer_answer_header,
+            &disconnect_peer_answer(),
+        )
+        .is_err());
 }
 
 #[test]
