@@ -34,11 +34,12 @@ not trigger a second handshake.
 The transport allocates a process-unique, monotonically increasing
 `PeerSessionGeneration` for each connection candidate and uses the
 generation-bound CER/CEA and lifecycle methods. One generation can be either a
-CER initiator or responder, never both. A future product transport must elect
-the winning candidate during simultaneous open and bind it as a fresh
-generation; this slice does not perform that election. Generation binding
-ensures delayed messages or lifecycle events from a losing connection cannot
-create, revoke, or poison readiness on the winner.
+CER initiator or responder, never both. The sibling `opc-diameter-transport`
+crate exposes the RFC 6733 simultaneous-open winner-election decision; the
+consumer applies that decision while orchestrating candidates, retains the
+winner's exact generation, and closes the loser. Generation binding ensures
+delayed messages or lifecycle events from a losing connection cannot create,
+revoke, or poison readiness on the winner.
 
 `PeerIdentity::semantically_eq` centralizes RFC DiameterIdentity comparison for
 Origin-Host/Origin-Realm authorization and peer binding. It is ASCII case-
@@ -145,9 +146,9 @@ This boundary does not open sockets, perform TLS/TCP or DTLS/SCTP framing,
 select a crypto provider, validate certificates, or rotate credentials. The
 caller's attestation is a typed assertion after those transport-owned checks;
 it is not itself cryptographic proof. The sibling `opc-diameter-transport`
-crate implements the scoped TLS/TCP adapter; this codec crate remains
-transport-neutral, and neither crate currently implements DTLS/SCTP or
-simultaneous-open winner election.
+crate implements the scoped TLS/TCP adapter and exposes the transport-neutral
+simultaneous-open winner-election decision; this codec crate remains
+transport-neutral, and neither crate currently implements DTLS/SCTP.
 
 ## API Shape
 
