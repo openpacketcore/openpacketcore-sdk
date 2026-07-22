@@ -488,6 +488,48 @@ known M mismatch under TS 29.273 table 7.2.3.1/2 note 2. Use
 duplicate rejection is enabled so only declared repeated Load AVPs bypass the
 blanket duplicate pre-scan.
 
+### SWm DEA authorization timers
+
+`SwmDiameterEapAnswer::session_timeout` is an optional
+`SwmSessionTimeout`. `None` means the AAA server supplied no timeout, while
+`Some(SwmSessionTimeout::unlimited())` preserves an explicit RFC 6733 zero
+value. TS 29.273 conditions this field on successful authentication and
+authorization, so the codec permits it only with exact base
+`DIAMETER_SUCCESS` (2001), not another 2xxx or an experimental result. The SDK
+reports the value but does not schedule re-authentication or session teardown.
+
+The base Diameter grammar permits omission, and existing SWm peers and public
+typed literals predate this field. The parser and builder therefore preserve
+an absent value and its prior bytes. A deployment applying the stricter TS
+29.273 initial-authorization condition should require it at the product policy
+boundary.
+
+`authorization_lifetime`, `auth_grace_period`, and
+`re_auth_request_type` expose the related RFC 6733 answer context. Positive
+`Authorization-Lifetime` requires a typed `SwmReAuthRequestType`. When both
+timers are finite and nonzero, `Session-Timeout` cannot be smaller than
+`Authorization-Lifetime`; explicit timeout zero is unlimited. No relationship
+is invented for `Auth-Grace-Period`. TS 29.273 requires SWm to omit
+`Auth-Session-State`, so the parser rejects it even if its M bit is clear and
+the configured unknown-AVP policy would otherwise drop it.
+
+```rust
+use opc_proto_diameter::apps::swm::{
+    SwmDiameterEapAnswer, SwmReAuthRequestType, SwmSessionTimeout,
+};
+
+fn set_success_timers(answer: &mut SwmDiameterEapAnswer) {
+    answer.session_timeout = Some(SwmSessionTimeout::from_seconds(3_600));
+    answer.authorization_lifetime = Some(3_000);
+    answer.auth_grace_period = Some(60);
+    answer.re_auth_request_type = Some(SwmReAuthRequestType::AuthorizeOnly);
+}
+```
+
+Diagnostics expose only timer presence. Redirect result and target handling is
+not included in this slice and remains part of the broader SWm authorization
+context work.
+
 ### SWm Session-Termination
 
 An ePDG creates an outbound STR by binding typed facts to identifiers allocated
