@@ -697,6 +697,7 @@ fn swm_der_remaining_access_context_round_trips_with_canonical_wire() {
         high_priority_access_info: SwmConditionalValue::UeProvided(
             SwmHighPriorityAccessInfo::configured(),
         ),
+        ..SwmDerAccessContext::default()
     };
     assert_eq!(
         context.qos_capability.source(),
@@ -2720,6 +2721,45 @@ fn swm_der_rat_type_preserves_unknown_values() {
     )
     .expect("future RAT-Type values remain forward compatible");
     assert_eq!(parsed.rat_type, Some(SwmRatType::Other(42)));
+    let rebuilt =
+        apps::swm::build_swm_diameter_eap_request(&parsed, 1, 2, EncodeContext::default())
+            .expect("a genuinely unknown RAT-Type remains originatable");
+    let reparsed = apps::swm::parse_swm_diameter_eap_request(
+        &decode_message(&encode_message(&rebuilt)),
+        DecodeContext::conservative(),
+    )
+    .expect("a genuinely unknown RAT-Type remains stable");
+    assert_eq!(reparsed.rat_type, Some(SwmRatType::Other(42)));
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_der_rat_type_aliases_parse_canonically_and_cannot_be_originated() {
+    for (wire_value, canonical) in [(0_u32, SwmRatType::Wlan), (1, SwmRatType::Virtual)] {
+        let rat_type = encode_raw_vendor_avp(
+            apps::swm::AVP_RAT_TYPE,
+            apps::VENDOR_ID_3GPP,
+            true,
+            &wire_value.to_be_bytes(),
+        );
+        let raw = build_raw_swm_der_with_extras(
+            Some(apps::swm::APPLICATION_ID.get()),
+            3,
+            &[0x02, 0x17, 0x00, 0x04],
+            &[rat_type],
+        );
+        let parsed = apps::swm::parse_swm_diameter_eap_request(
+            &decode_message(&encode_message(&raw)),
+            DecodeContext::conservative(),
+        )
+        .expect("assigned RAT-Type values parse through their canonical variants");
+        assert_eq!(parsed.rat_type, Some(canonical));
+
+        let mut request = sample_swm_request();
+        request.rat_type = Some(SwmRatType::Other(wire_value));
+        apps::swm::build_swm_diameter_eap_request(&request, 1, 2, EncodeContext::default())
+            .expect_err("typed aliases of assigned RAT-Type values must not originate");
+    }
 }
 
 #[test]

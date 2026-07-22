@@ -19,16 +19,20 @@ use opc_ipsec_xfrm::{
 };
 use opc_proto_diameter::apps::swm::{
     build_eap_response_identity, build_swm_diameter_eap_answer_for, build_swm_diameter_eap_request,
-    derive_unauthenticated_emergency_msk, emergency_nai, parse_swm_diameter_eap_answer_envelope,
-    parse_swm_diameter_eap_request, parse_swm_diameter_eap_request_envelope,
+    build_swm_diameter_eap_request_with_access_context, derive_unauthenticated_emergency_msk,
+    emergency_nai, parse_swm_diameter_eap_answer_envelope, parse_swm_diameter_eap_request,
+    parse_swm_diameter_eap_request_envelope,
     parse_swm_diameter_eap_response_envelope_from_connection, AuthRequestType,
-    SwmChargingCharacteristics, SwmCoreNetworkRestrictions, SwmDeaSubscriberAuthorization,
+    SwmChargingCharacteristics, SwmConditionalValue, SwmConditionalValueSource,
+    SwmCoreNetworkRestrictions, SwmDeaSubscriberAuthorization, SwmDerAccessContext,
     SwmDiameterConnectionToken, SwmDiameterEapAnswer, SwmDiameterEapRequest, SwmDiameterResult,
     SwmE164Number, SwmEmergencyAuthorizationEvidence, SwmEmergencyAuthorizationPath,
-    SwmEmergencyServices, SwmExpectedAnswerPeer, SwmMpsPriority, SwmMultiRoundTimeout,
-    SwmPgwTraceEvents, SwmPgwTraceInterfaces, SwmSubscriptionId, SwmTerminalInformation,
-    SwmTraceData, SwmTraceDepth, SwmTraceInfo, SwmTraceReference, SwmTraceReportingConsumerUri,
-    SwmUeUsageType, APPLICATION_ID as SWM_APPLICATION_ID, COMMAND_DIAMETER_EAP,
+    SwmEmergencyServices, SwmExpectedAnswerPeer, SwmHighPriorityAccessInfo, SwmMip6FeatureVector,
+    SwmMpsPriority, SwmMultiRoundTimeout, SwmOcSupportedFeatures, SwmPgwTraceEvents,
+    SwmPgwTraceInterfaces, SwmQosCapability, SwmQosProfileTemplate, SwmRatType,
+    SwmRequestedSupportedFeatures, SwmSubscriptionId, SwmTerminalInformation, SwmTraceData,
+    SwmTraceDepth, SwmTraceInfo, SwmTraceReference, SwmTraceReportingConsumerUri, SwmUeUsageType,
+    SwmVisitedNetworkIdentifier, APPLICATION_ID as SWM_APPLICATION_ID, COMMAND_DIAMETER_EAP,
 };
 use opc_proto_diameter::Message as DiameterMessage;
 use opc_proto_gtpv2c::{
@@ -175,7 +179,7 @@ async fn epdg_sdk_protocol_xfrm_testbed_and_evidence_components_compose(
     assert_eq!(pgw.active_sessions, 1);
 
     let mut diameter = DiameterPeerSimulator::new("aaa-swm");
-    let der = build_swm_diameter_eap_request(
+    let checked_der = build_swm_diameter_eap_request_with_access_context(
         &SwmDiameterEapRequest {
             session_id: "sess;swm;redacted".into(),
             auth_application_id: SWM_APPLICATION_ID.get(),
@@ -202,10 +206,53 @@ async fn epdg_sdk_protocol_xfrm_testbed_and_evidence_components_compose(
             route_records: Vec::new(),
             extensions: Default::default(),
         },
+        SwmDerAccessContext {
+            rat_type: SwmConditionalValue::UeProvided(SwmRatType::Wlan),
+            service_selection: SwmConditionalValue::UeProvided("ims.synthetic.invalid".into()),
+            mip6_feature_vector: SwmConditionalValue::LocallyConfigured(
+                SwmMip6FeatureVector::gtpv2_only(),
+            ),
+            qos_capability: SwmConditionalValue::LocallyConfigured(SwmQosCapability::new(vec![
+                SwmQosProfileTemplate::ietf_diameter(),
+            ])?),
+            visited_network_identifier: SwmConditionalValue::LocallyConfigured(
+                SwmVisitedNetworkIdentifier::new("001", "01")?,
+            ),
+            supported_features: SwmConditionalValue::LocallyConfigured(vec![
+                SwmRequestedSupportedFeatures::swm_discovery(),
+            ]),
+            ue_local_ip_address: SwmConditionalValue::UeProvided(IpAddr::V4(Ipv4Addr::new(
+                192, 0, 2, 47,
+            ))),
+            oc_supported_features: SwmConditionalValue::LocallyConfigured(
+                SwmOcSupportedFeatures::loss(),
+            ),
+            terminal_information: SwmConditionalValue::UeProvided(SwmTerminalInformation {
+                imei: Imei::new("490154203237518")?,
+                software_version: Some("01".into()),
+            }),
+            high_priority_access_info: SwmConditionalValue::UeProvided(
+                SwmHighPriorityAccessInfo::configured(),
+            ),
+            ..SwmDerAccessContext::default()
+        },
         0x1111_2222,
         0x3333_4444,
         EncodeContext::default(),
     )?;
+    assert_eq!(
+        checked_der.source_snapshot().rat_type(),
+        Some(SwmConditionalValueSource::UeProvided)
+    );
+    assert_eq!(
+        checked_der.source_snapshot().mip6_feature_vector(),
+        Some(SwmConditionalValueSource::LocallyConfigured)
+    );
+    assert_eq!(
+        checked_der.source_snapshot().terminal_information(),
+        Some(SwmConditionalValueSource::UeProvided)
+    );
+    let der = checked_der.message();
     let der_message = DiameterMessage {
         header: der.header.clone(),
         raw_avps: &der.raw_avps,

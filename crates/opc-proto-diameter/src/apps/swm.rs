@@ -1888,6 +1888,9 @@ pub enum SwmRatType {
     /// Unknown access represented by the TS 29.273 `VIRTUAL` value.
     Virtual,
     /// Unknown or subsequently assigned value.
+    ///
+    /// Values zero and one alias [`Self::Wlan`] and [`Self::Virtual`]
+    /// respectively. They are noncanonical and rejected by outbound builders.
     Other(u32),
 }
 
@@ -1908,6 +1911,10 @@ impl SwmRatType {
             1 => Self::Virtual,
             other => Self::Other(other),
         }
+    }
+
+    const fn is_canonical(self) -> bool {
+        !matches!(self, Self::Other(0 | 1))
     }
 }
 
@@ -3690,12 +3697,28 @@ impl<T> fmt::Debug for SwmConditionalValue<T> {
 /// Field identifying a redaction-safe DER access-context validation failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SwmDerAccessContextField {
+    /// RAT-Type.
+    RatType,
+    /// Service-Selection.
+    ServiceSelection,
+    /// MIP6-Feature-Vector.
+    Mip6FeatureVector,
     /// QoS-Capability.
     QosCapability,
     /// Visited-Network-Identifier.
     VisitedNetworkIdentifier,
     /// AAA-Failure-Indication.
     AaaFailureIndication,
+    /// Supported-Features.
+    SupportedFeatures,
+    /// UE-Local-IP-Address.
+    UeLocalIpAddress,
+    /// OC-Supported-Features.
+    OcSupportedFeatures,
+    /// Terminal-Information.
+    TerminalInformation,
+    /// Emergency-Services.
+    EmergencyServices,
     /// High-Priority-Access-Info.
     HighPriorityAccessInfo,
 }
@@ -3713,8 +3736,14 @@ pub enum SwmDerAccessContextErrorCode {
     EmptyQosCapability,
     /// QoS-Capability exceeds the defensive profile-template bound.
     TooManyQosProfiles,
+    /// A present Supported-Features collection contains no group.
+    EmptySupportedFeatures,
     /// A presence-significant indication is present without its defined bit.
     InactiveIndication,
+    /// Two individually valid conditional values cannot appear together.
+    ContradictoryValues,
+    /// A typed enum value aliases another canonical variant.
+    NonCanonicalValue,
 }
 
 /// Redaction-safe DER access-context construction failure.
@@ -3950,13 +3979,39 @@ impl fmt::Debug for SwmQosCapability {
 /// by [`build_swm_diameter_eap_request_with_access_context`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SwmDerAccessContextSourceSnapshot {
+    rat_type: Option<SwmConditionalValueSource>,
+    service_selection: Option<SwmConditionalValueSource>,
+    mip6_feature_vector: Option<SwmConditionalValueSource>,
     qos_capability: Option<SwmConditionalValueSource>,
     visited_network_identifier: Option<SwmConditionalValueSource>,
     aaa_failure_indication: Option<SwmConditionalValueSource>,
+    supported_features: Option<SwmConditionalValueSource>,
+    ue_local_ip_address: Option<SwmConditionalValueSource>,
+    oc_supported_features: Option<SwmConditionalValueSource>,
+    terminal_information: Option<SwmConditionalValueSource>,
+    emergency_services: Option<SwmConditionalValueSource>,
     high_priority_access_info: Option<SwmConditionalValueSource>,
 }
 
 impl SwmDerAccessContextSourceSnapshot {
+    /// Return the RAT-Type source, or `None` when absent.
+    #[must_use]
+    pub const fn rat_type(self) -> Option<SwmConditionalValueSource> {
+        self.rat_type
+    }
+
+    /// Return the Service-Selection source, or `None` when absent.
+    #[must_use]
+    pub const fn service_selection(self) -> Option<SwmConditionalValueSource> {
+        self.service_selection
+    }
+
+    /// Return the MIP6-Feature-Vector source, or `None` when absent.
+    #[must_use]
+    pub const fn mip6_feature_vector(self) -> Option<SwmConditionalValueSource> {
+        self.mip6_feature_vector
+    }
+
     /// Return the QoS-Capability source, or `None` when absent.
     #[must_use]
     pub const fn qos_capability(self) -> Option<SwmConditionalValueSource> {
@@ -3975,6 +4030,36 @@ impl SwmDerAccessContextSourceSnapshot {
         self.aaa_failure_indication
     }
 
+    /// Return the Supported-Features source, or `None` when absent.
+    #[must_use]
+    pub const fn supported_features(self) -> Option<SwmConditionalValueSource> {
+        self.supported_features
+    }
+
+    /// Return the UE-Local-IP-Address source, or `None` when absent.
+    #[must_use]
+    pub const fn ue_local_ip_address(self) -> Option<SwmConditionalValueSource> {
+        self.ue_local_ip_address
+    }
+
+    /// Return the OC-Supported-Features source, or `None` when absent.
+    #[must_use]
+    pub const fn oc_supported_features(self) -> Option<SwmConditionalValueSource> {
+        self.oc_supported_features
+    }
+
+    /// Return the Terminal-Information source, or `None` when absent.
+    #[must_use]
+    pub const fn terminal_information(self) -> Option<SwmConditionalValueSource> {
+        self.terminal_information
+    }
+
+    /// Return the Emergency-Services source, or `None` when absent.
+    #[must_use]
+    pub const fn emergency_services(self) -> Option<SwmConditionalValueSource> {
+        self.emergency_services
+    }
+
     /// Return the High-Priority-Access-Info source, or `None` when absent.
     #[must_use]
     pub const fn high_priority_access_info(self) -> Option<SwmConditionalValueSource> {
@@ -3984,19 +4069,37 @@ impl SwmDerAccessContextSourceSnapshot {
 
 /// Product-neutral application-side inputs for conditional DER access AVPs.
 ///
-/// The checked outbound builder accepts locally configured QoS and PLMN
-/// context, AAA-derived server-failure state, and UE-provided priority state.
-/// It rejects every other source before encoding. The request's public wire
-/// fields remain directly accessible for parser replay and API compatibility;
-/// direct assignment is source-agnostic and produces no source snapshot.
+/// The checked outbound builder covers every conditional authorization-context
+/// row in TS 29.273 table 7.1.2.1.1/1. It distinguishes local capability and
+/// configuration, authenticated AAA transport state, and values supplied by or
+/// observed at the UE-facing access boundary. It rejects every prohibited
+/// source before encoding. The request's public wire fields remain directly
+/// accessible for parser replay and API compatibility; direct assignment is
+/// source-agnostic and produces no source snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SwmDerAccessContext {
+    /// UE-facing access type, or locally configured `VIRTUAL` fallback.
+    pub rat_type: SwmConditionalValue<SwmRatType>,
+    /// UE-requested APN for a non-emergency session.
+    pub service_selection: SwmConditionalValue<Redacted<String>>,
+    /// Locally configured mobility capabilities.
+    pub mip6_feature_vector: SwmConditionalValue<SwmMip6FeatureVector>,
     /// Locally configured QoS profile capabilities.
     pub qos_capability: SwmConditionalValue<SwmQosCapability>,
     /// Locally configured visited PLMN identity; absent for home access.
     pub visited_network_identifier: SwmConditionalValue<SwmVisitedNetworkIdentifier>,
     /// AAA-derived evidence that the previously assigned server is unavailable.
     pub aaa_failure_indication: SwmConditionalValue<SwmAaaFailureIndication>,
+    /// Locally configured ordered feature declarations for this Diameter session.
+    pub supported_features: SwmConditionalValue<Vec<SwmRequestedSupportedFeatures>>,
+    /// UE source address observed at the protected access boundary.
+    pub ue_local_ip_address: SwmConditionalValue<IpAddr>,
+    /// Locally configured RFC 7683 overload-control capability.
+    pub oc_supported_features: SwmConditionalValue<SwmOcSupportedFeatures>,
+    /// UE-provided equipment identity, when available.
+    pub terminal_information: SwmConditionalValue<SwmTerminalInformation>,
+    /// UE-provided emergency-session indication.
+    pub emergency_services: SwmConditionalValue<SwmEmergencyServices>,
     /// UE-provided access-priority indication admitted by local policy.
     pub high_priority_access_info: SwmConditionalValue<SwmHighPriorityAccessInfo>,
 }
@@ -4008,6 +4111,18 @@ impl SwmDerAccessContext {
     ) -> Result<SwmDerAccessContextSourceSnapshot, SwmDerAccessContextError> {
         for (present, field) in [
             (
+                request.rat_type.is_some(),
+                SwmDerAccessContextField::RatType,
+            ),
+            (
+                request.service_selection.is_some(),
+                SwmDerAccessContextField::ServiceSelection,
+            ),
+            (
+                request.mip6_feature_vector.is_some(),
+                SwmDerAccessContextField::Mip6FeatureVector,
+            ),
+            (
                 request.qos_capability.is_some(),
                 SwmDerAccessContextField::QosCapability,
             ),
@@ -4018,6 +4133,26 @@ impl SwmDerAccessContext {
             (
                 request.aaa_failure_indication.is_some(),
                 SwmDerAccessContextField::AaaFailureIndication,
+            ),
+            (
+                !request.supported_features.is_empty(),
+                SwmDerAccessContextField::SupportedFeatures,
+            ),
+            (
+                request.ue_local_ip_address.is_some(),
+                SwmDerAccessContextField::UeLocalIpAddress,
+            ),
+            (
+                request.oc_supported_features.is_some(),
+                SwmDerAccessContextField::OcSupportedFeatures,
+            ),
+            (
+                request.terminal_information.is_some(),
+                SwmDerAccessContextField::TerminalInformation,
+            ),
+            (
+                request.emergency_services.is_some(),
+                SwmDerAccessContextField::EmergencyServices,
             ),
             (
                 request.high_priority_access_info.is_some(),
@@ -4033,11 +4168,30 @@ impl SwmDerAccessContext {
         }
 
         let source_snapshot = SwmDerAccessContextSourceSnapshot {
+            rat_type: self.rat_type.source(),
+            service_selection: self.service_selection.source(),
+            mip6_feature_vector: self.mip6_feature_vector.source(),
             qos_capability: self.qos_capability.source(),
             visited_network_identifier: self.visited_network_identifier.source(),
             aaa_failure_indication: self.aaa_failure_indication.source(),
+            supported_features: self.supported_features.source(),
+            ue_local_ip_address: self.ue_local_ip_address.source(),
+            oc_supported_features: self.oc_supported_features.source(),
+            terminal_information: self.terminal_information.source(),
+            emergency_services: self.emergency_services.source(),
             high_priority_access_info: self.high_priority_access_info.source(),
         };
+        let rat_type = rat_type_from_allowed_source(self.rat_type)?;
+        let service_selection = value_from_expected_source(
+            self.service_selection,
+            SwmConditionalValueSource::UeProvided,
+            SwmDerAccessContextField::ServiceSelection,
+        )?;
+        let mip6_feature_vector = value_from_expected_source(
+            self.mip6_feature_vector,
+            SwmConditionalValueSource::LocallyConfigured,
+            SwmDerAccessContextField::Mip6FeatureVector,
+        )?;
         let qos_capability = value_from_expected_source(
             self.qos_capability,
             SwmConditionalValueSource::LocallyConfigured,
@@ -4056,6 +4210,43 @@ impl SwmDerAccessContext {
             SwmConditionalValueSource::AaaDerived,
             SwmDerAccessContextField::AaaFailureIndication,
         )?;
+        let supported_features = value_from_expected_source(
+            self.supported_features,
+            SwmConditionalValueSource::LocallyConfigured,
+            SwmDerAccessContextField::SupportedFeatures,
+        )?;
+        if supported_features.as_ref().is_some_and(Vec::is_empty) {
+            return Err(SwmDerAccessContextError::new(
+                SwmDerAccessContextErrorCode::EmptySupportedFeatures,
+                SwmDerAccessContextField::SupportedFeatures,
+            ));
+        }
+        let ue_local_ip_address = value_from_expected_source(
+            self.ue_local_ip_address,
+            SwmConditionalValueSource::UeProvided,
+            SwmDerAccessContextField::UeLocalIpAddress,
+        )?;
+        let oc_supported_features = value_from_expected_source(
+            self.oc_supported_features,
+            SwmConditionalValueSource::LocallyConfigured,
+            SwmDerAccessContextField::OcSupportedFeatures,
+        )?;
+        let terminal_information = value_from_expected_source(
+            self.terminal_information,
+            SwmConditionalValueSource::UeProvided,
+            SwmDerAccessContextField::TerminalInformation,
+        )?;
+        let emergency_services = value_from_expected_source(
+            self.emergency_services,
+            SwmConditionalValueSource::UeProvided,
+            SwmDerAccessContextField::EmergencyServices,
+        )?;
+        if emergency_services.is_some_and(|services| !services.is_emergency_indicated()) {
+            return Err(SwmDerAccessContextError::new(
+                SwmDerAccessContextErrorCode::InactiveIndication,
+                SwmDerAccessContextField::EmergencyServices,
+            ));
+        }
         let high_priority_access_info = value_from_expected_source(
             self.high_priority_access_info,
             SwmConditionalValueSource::UeProvided,
@@ -4067,10 +4258,24 @@ impl SwmDerAccessContext {
                 SwmDerAccessContextField::HighPriorityAccessInfo,
             ));
         }
+        if service_selection.is_some() && emergency_services.is_some() {
+            return Err(SwmDerAccessContextError::new(
+                SwmDerAccessContextErrorCode::ContradictoryValues,
+                SwmDerAccessContextField::ServiceSelection,
+            ));
+        }
 
+        request.rat_type = rat_type;
+        request.service_selection = service_selection;
+        request.mip6_feature_vector = mip6_feature_vector;
         request.qos_capability = qos_capability;
         request.visited_network_identifier = visited_network_identifier;
         request.aaa_failure_indication = aaa_failure_indication;
+        request.supported_features = supported_features.unwrap_or_default();
+        request.ue_local_ip_address = ue_local_ip_address;
+        request.oc_supported_features = oc_supported_features;
+        request.terminal_information = terminal_information;
+        request.emergency_services = emergency_services;
         request.high_priority_access_info = high_priority_access_info;
         Ok(source_snapshot)
     }
@@ -4210,6 +4415,30 @@ fn value_from_expected_source<T>(
         | SwmConditionalValue::AaaDerived(_) => Err(SwmDerAccessContextError::new(
             SwmDerAccessContextErrorCode::InvalidProvenance,
             field,
+        )),
+    }
+}
+
+fn rat_type_from_allowed_source(
+    value: SwmConditionalValue<SwmRatType>,
+) -> Result<Option<SwmRatType>, SwmDerAccessContextError> {
+    match value {
+        SwmConditionalValue::Absent => Ok(None),
+        SwmConditionalValue::LocallyConfigured(SwmRatType::Other(0 | 1))
+        | SwmConditionalValue::UeProvided(SwmRatType::Other(0 | 1))
+        | SwmConditionalValue::AaaDerived(SwmRatType::Other(0 | 1)) => {
+            Err(SwmDerAccessContextError::new(
+                SwmDerAccessContextErrorCode::NonCanonicalValue,
+                SwmDerAccessContextField::RatType,
+            ))
+        }
+        SwmConditionalValue::UeProvided(value @ (SwmRatType::Wlan | SwmRatType::Other(_)))
+        | SwmConditionalValue::LocallyConfigured(value @ SwmRatType::Virtual) => Ok(Some(value)),
+        SwmConditionalValue::LocallyConfigured(_)
+        | SwmConditionalValue::UeProvided(_)
+        | SwmConditionalValue::AaaDerived(_) => Err(SwmDerAccessContextError::new(
+            SwmDerAccessContextErrorCode::InvalidProvenance,
+            SwmDerAccessContextField::RatType,
         )),
     }
 }
@@ -5450,6 +5679,15 @@ impl SwmDiameterEapRequest {
                 ));
             }
         }
+        if self
+            .rat_type
+            .is_some_and(|rat_type| !rat_type.is_canonical())
+        {
+            return Err(encode_structural_error(
+                "SWm DER RAT-Type must use its canonical typed variant",
+                "7.1.2.1.1",
+            ));
+        }
         if let Some(service_selection) = self.service_selection.as_ref() {
             if !valid_service_selection(service_selection.as_ref()) {
                 return Err(encode_structural_error(
@@ -5507,7 +5745,10 @@ impl SwmDiameterEapRequest {
                     }
                     SwmDerAccessContextErrorCode::PrepopulatedField
                     | SwmDerAccessContextErrorCode::InvalidProvenance
-                    | SwmDerAccessContextErrorCode::InvalidVisitedNetworkIdentifier => {
+                    | SwmDerAccessContextErrorCode::InvalidVisitedNetworkIdentifier
+                    | SwmDerAccessContextErrorCode::EmptySupportedFeatures
+                    | SwmDerAccessContextErrorCode::ContradictoryValues
+                    | SwmDerAccessContextErrorCode::NonCanonicalValue => {
                         "SWm DER QoS-Capability is invalid"
                     }
                 };
@@ -6489,7 +6730,8 @@ pub fn build_swm_diameter_eap_request_envelope(
 
 /// Validate conditional access-context sources and build one outbound DER.
 ///
-/// The four raw context fields on `request` must initially be absent. This
+/// All twelve conditional authorization-context fields on `request` must
+/// initially be absent. This
 /// prevents checked context from being silently combined with independently
 /// populated wire fields. Validation and application happen on a clone, so a
 /// failure never modifies the caller's request.
@@ -9164,9 +9406,10 @@ fn parse_qos_capability(
             SwmDerAccessContextErrorCode::InactiveIndication => "QoS-Capability is invalid",
             SwmDerAccessContextErrorCode::PrepopulatedField
             | SwmDerAccessContextErrorCode::InvalidProvenance
-            | SwmDerAccessContextErrorCode::InvalidVisitedNetworkIdentifier => {
-                "QoS-Capability is invalid"
-            }
+            | SwmDerAccessContextErrorCode::InvalidVisitedNetworkIdentifier
+            | SwmDerAccessContextErrorCode::EmptySupportedFeatures
+            | SwmDerAccessContextErrorCode::ContradictoryValues
+            | SwmDerAccessContextErrorCode::NonCanonicalValue => "QoS-Capability is invalid",
         };
         QosCapabilityParseError::Decode(
             DecodeError::new(DecodeErrorCode::Structural { reason }, base_offset)
@@ -10126,6 +10369,15 @@ fn validate_decoded_request(request: &SwmDiameterEapRequest) -> Result<(), Decod
             ));
         }
     }
+    if request
+        .rat_type
+        .is_some_and(|rat_type| !rat_type.is_canonical())
+    {
+        return Err(decode_structural_error(
+            "SWm DER RAT-Type must use its canonical typed variant",
+            "7.1.2.1.1",
+        ));
+    }
     if let Some(service_selection) = request.service_selection.as_ref() {
         if !valid_service_selection(service_selection.as_ref()) {
             return Err(decode_structural_error(
@@ -10177,7 +10429,10 @@ fn validate_decoded_request(request: &SwmDiameterEapRequest) -> Result<(), Decod
                 }
                 SwmDerAccessContextErrorCode::PrepopulatedField
                 | SwmDerAccessContextErrorCode::InvalidProvenance
-                | SwmDerAccessContextErrorCode::InvalidVisitedNetworkIdentifier => {
+                | SwmDerAccessContextErrorCode::InvalidVisitedNetworkIdentifier
+                | SwmDerAccessContextErrorCode::EmptySupportedFeatures
+                | SwmDerAccessContextErrorCode::ContradictoryValues
+                | SwmDerAccessContextErrorCode::NonCanonicalValue => {
                     "SWm DER QoS-Capability is invalid"
                 }
             };
