@@ -156,6 +156,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provenance, and value-free diagnostics have positive and malformed fixtures.
   RFC 6848 CAtype 40 accepts bounded structural URI, XML local-name, and text
   triples without a closed namespace whitelist (#352).
+- **Breaking: typed RFC 4072 SWm EAP-round timeout —
+  `opc-proto-diameter`:** `SwmDiameterEapAnswer` adds optional
+  `multi_round_timeout`; existing struct literals initialize it with `None`,
+  preserving prior bytes. `SwmMultiRoundTimeout` retains the complete
+  `Unsigned32` domain for base/IETF `Multi-Round-Time-Out` AVP 272. DER forbids
+  the exact IETF key; DEA dictionaries and the typed codec enforce singleton,
+  width, vendor, and M/V/P rules while foreign-vendor collisions remain under
+  `UnknownIePolicy`. Only
+  `SwmCorrelatedDiameterEapResponse::current_eap_request_timeout` makes the
+  value actionable, after authenticated request correlation and only for exact
+  base `DIAMETER_MULTI_ROUND_AUTH` with an actual `EAP-Payload` Request. The
+  SDK does not choose timer policy or schedule runtime work (#467).
 - **Breaking: correlated SWm Diameter-EAP redirect and routing —
   `opc-proto-diameter`:** `SwmDiameterEapRequest` adds ordered redacted
   `route_records`; existing originated literals initialize `Vec::new()`.

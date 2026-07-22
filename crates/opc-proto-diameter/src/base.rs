@@ -57,6 +57,8 @@ pub const AVP_FIRMWARE_REVISION: AvpCode = AvpCode::new(267);
 pub const AVP_RESULT_CODE: AvpCode = AvpCode::new(268);
 /// Product-Name AVP code.
 pub const AVP_PRODUCT_NAME: AvpCode = AvpCode::new(269);
+/// Multi-Round-Time-Out AVP code.
+pub const AVP_MULTI_ROUND_TIME_OUT: AvpCode = AvpCode::new(272);
 /// Disconnect-Cause AVP code.
 pub const AVP_DISCONNECT_CAUSE: AvpCode = AvpCode::new(273);
 /// Auth-Grace-Period AVP code.
@@ -257,7 +259,7 @@ const BASE_COMMANDS: [CommandDefinition; 6] = [
     ),
 ];
 
-const BASE_AVPS: [AvpDefinition; 37] = [
+const BASE_AVPS: [AvpDefinition; 38] = [
     AvpDefinition::new(
         AvpKey::ietf(AVP_USER_NAME),
         "User-Name",
@@ -377,6 +379,13 @@ const BASE_AVPS: [AvpDefinition; 37] = [
         AvpDataType::Utf8String,
         AvpFlagRules::base_must_not_set_m(),
         SpecRef::new("ietf", "RFC6733", "5.3.7"),
+    ),
+    AvpDefinition::new(
+        AvpKey::ietf(AVP_MULTI_ROUND_TIME_OUT),
+        "Multi-Round-Time-Out",
+        AvpDataType::Unsigned32,
+        AvpFlagRules::base_mandatory(),
+        SpecRef::new("ietf", "RFC6733", "8.19"),
     ),
     AvpDefinition::new(
         AvpKey::ietf(AVP_DISCONNECT_CAUSE),
@@ -666,6 +675,7 @@ mod tests {
             (AVP_SESSION_TIMEOUT, "Session-Timeout", "8.13"),
             (AVP_AUTH_GRACE_PERIOD, "Auth-Grace-Period", "8.10"),
             (AVP_AUTHORIZATION_LIFETIME, "Authorization-Lifetime", "8.9"),
+            (AVP_MULTI_ROUND_TIME_OUT, "Multi-Round-Time-Out", "8.19"),
         ] {
             let definition = dictionary()
                 .find_avp(AvpKey::ietf(code))

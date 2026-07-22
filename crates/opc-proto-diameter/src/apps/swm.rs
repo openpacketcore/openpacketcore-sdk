@@ -236,7 +236,7 @@ pub const APPLICATION: ApplicationDefinition = ApplicationDefinition::new(
     SpecRef::new("3gpp", "TS29273", "SWm Diameter application"),
 );
 
-static SWM_REQUEST_AVP_RULES: [CommandAvpRule; 38] = [
+static SWM_REQUEST_AVP_RULES: [CommandAvpRule; 39] = [
     CommandAvpRule::new(
         AvpKey::ietf(base::AVP_SESSION_ID),
         AvpCardinality::ZeroOrOne,
@@ -334,6 +334,10 @@ static SWM_REQUEST_AVP_RULES: [CommandAvpRule; 38] = [
         AvpCardinality::Forbidden,
     ),
     CommandAvpRule::new(
+        AvpKey::ietf(base::AVP_MULTI_ROUND_TIME_OUT),
+        AvpCardinality::Forbidden,
+    ),
+    CommandAvpRule::new(
         AvpKey::vendor(AVP_APN_OI_REPLACEMENT, VENDOR_ID_3GPP),
         AvpCardinality::Forbidden,
     ),
@@ -364,7 +368,7 @@ static SWM_REQUEST_AVP_RULES: [CommandAvpRule; 38] = [
     ),
 ];
 
-static SWM_ANSWER_AVP_RULES: [CommandAvpRule; 42] = [
+static SWM_ANSWER_AVP_RULES: [CommandAvpRule; 43] = [
     CommandAvpRule::new(AvpKey::ietf(AVP_STATE), AvpCardinality::ZeroOrMore),
     CommandAvpRule::new(
         AvpKey::ietf(base::AVP_RESULT_CODE),
@@ -397,6 +401,10 @@ static SWM_ANSWER_AVP_RULES: [CommandAvpRule; 42] = [
     ),
     CommandAvpRule::new(
         AvpKey::ietf(base::AVP_SESSION_TIMEOUT),
+        AvpCardinality::ZeroOrOne,
+    ),
+    CommandAvpRule::new(
+        AvpKey::ietf(base::AVP_MULTI_ROUND_TIME_OUT),
         AvpCardinality::ZeroOrOne,
     ),
     CommandAvpRule::new(
@@ -508,7 +516,7 @@ static SWM_ANSWER_AVP_RULES: [CommandAvpRule; 42] = [
     ),
 ];
 
-static SWM_PROJECTED_PROFILE_ANSWER_AVP_RULES: [CommandAvpRule; 42] = [
+static SWM_PROJECTED_PROFILE_ANSWER_AVP_RULES: [CommandAvpRule; 43] = [
     CommandAvpRule::new(AvpKey::ietf(AVP_STATE), AvpCardinality::ZeroOrMore),
     CommandAvpRule::new(
         AvpKey::ietf(base::AVP_RESULT_CODE),
@@ -541,6 +549,10 @@ static SWM_PROJECTED_PROFILE_ANSWER_AVP_RULES: [CommandAvpRule; 42] = [
     ),
     CommandAvpRule::new(
         AvpKey::ietf(base::AVP_SESSION_TIMEOUT),
+        AvpCardinality::ZeroOrOne,
+    ),
+    CommandAvpRule::new(
+        AvpKey::ietf(base::AVP_MULTI_ROUND_TIME_OUT),
         AvpCardinality::ZeroOrOne,
     ),
     CommandAvpRule::new(
@@ -2110,6 +2122,44 @@ impl fmt::Debug for SwmSessionTimeout {
     }
 }
 
+/// Maximum response time for one EAP Request in a multi-round SWm exchange.
+///
+/// `Multi-Round-Time-Out` is an RFC 6733 `Unsigned32` measured in seconds.
+/// Every value in the wire domain, including zero, is preserved exactly;
+/// absence is represented by the surrounding [`Option`]. This type does not
+/// impose a local cap, choose a default, start a clock, or extend the value to
+/// any later EAP Request.
+///
+/// Use [`SwmCorrelatedDiameterEapResponse::current_eap_request_timeout`] before
+/// treating a received value as actionable. The raw field remains available
+/// so grammar-valid answers retain exact wire provenance even when their
+/// result or EAP packet does not make the timer applicable.
+///
+/// @spec IETF RFC6733 8.19
+/// @spec IETF RFC4072 2.5, 3.2, 5
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SwmMultiRoundTimeout(u32);
+
+impl SwmMultiRoundTimeout {
+    /// Construct a timeout from its exact `Unsigned32` wire value in seconds.
+    #[must_use]
+    pub const fn from_seconds(seconds: u32) -> Self {
+        Self(seconds)
+    }
+
+    /// Return the exact wire value in seconds.
+    #[must_use]
+    pub const fn seconds(self) -> u32 {
+        self.0
+    }
+}
+
+impl fmt::Debug for SwmMultiRoundTimeout {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SwmMultiRoundTimeout(<redacted>)")
+    }
+}
+
 /// Typed Emergency-Services bitmask for a SWm DER.
 ///
 /// TS 29.273 defines this AVP as an `Unsigned32`, not a grouped AVP. Only bit
@@ -2801,6 +2851,37 @@ impl SwmCorrelatedDiameterEapResponse {
             })
     }
 
+    /// Return the timeout that applies to the current `EAP-Payload` Request.
+    ///
+    /// A value is actionable only after complete authenticated response
+    /// correlation and only for an ordinary DEA carrying exact base
+    /// `DIAMETER_MULTI_ROUND_AUTH` plus one structurally valid EAP Request in
+    /// `EAP-Payload`. An EAP Request carried only in `EAP-Reissued-Payload`, a
+    /// same-numbered `Experimental-Result`, a final EAP Success or Failure, a
+    /// malformed packet, or any other result returns `None`. The raw typed DEA
+    /// field remains available to preserve grammar-valid wire facts.
+    ///
+    /// The returned value applies to this EAP Request alone. Clock selection,
+    /// local bounds/defaults, timer scheduling, retransmission, cancellation,
+    /// persistence, and attach teardown remain product policy.
+    ///
+    /// @spec IETF RFC6733 8.19
+    /// @spec IETF RFC4072 2.5
+    #[must_use]
+    pub fn current_eap_request_timeout(&self) -> Option<SwmMultiRoundTimeout> {
+        let SwmDiameterEapResponse::Application(answer) = self.response() else {
+            return None;
+        };
+        if answer.authorization_outcome() != SwmAuthorizationOutcome::EapInProgress {
+            return None;
+        }
+        let payload = answer.eap_payload.as_ref()?.as_ref();
+        if classify_outer_eap_packet(payload) != Some(OuterEapPacketCode::Request) {
+            return None;
+        }
+        answer.multi_round_timeout
+    }
+
     /// Borrow actionable redirect targets after all correlation checks.
     #[must_use]
     pub fn redirect(&self) -> Option<&SwmDiameterRedirect> {
@@ -2875,6 +2956,10 @@ impl fmt::Debug for SwmCorrelatedDiameterEapResponse {
             .field("response", &self.response())
             .field("redirect_present", &self.redirect().is_some())
             .field("wlan_location_present", &self.wlan_location().is_some())
+            .field(
+                "current_eap_request_timeout_present",
+                &self.current_eap_request_timeout().is_some(),
+            )
             .field(
                 "agent_delivery_failure_present",
                 &self.agent_delivery_failure().is_some(),
@@ -5051,6 +5136,14 @@ pub struct SwmDiameterEapAnswer {
     /// field. An explicit `SwmSessionTimeout::unlimited()` preserves the RFC
     /// 6733 zero value.
     pub session_timeout: Option<SwmSessionTimeout>,
+    /// Optional maximum response time for the current multi-round EAP Request.
+    ///
+    /// Every `Unsigned32` value is retained exactly, including zero. This raw
+    /// grammar fact does not imply that the timer is applicable; received
+    /// clients must use
+    /// [`SwmCorrelatedDiameterEapResponse::current_eap_request_timeout`] for
+    /// the request-correlated, exact-result classification.
+    pub multi_round_timeout: Option<SwmMultiRoundTimeout>,
     /// Optional RFC 6733 authorization lifetime, in seconds.
     ///
     /// A positive value requires [`SwmReAuthRequestType`]. Diagnostics expose
@@ -5109,6 +5202,10 @@ impl std::fmt::Debug for SwmDiameterEapAnswer {
             .field(
                 "session_timeout",
                 &self.session_timeout.map(|_| "<redacted>"),
+            )
+            .field(
+                "multi_round_timeout_present",
+                &self.multi_round_timeout.is_some(),
             )
             .field(
                 "authorization_lifetime_present",
@@ -6514,6 +6611,14 @@ fn parse_swm_diameter_eap_request_parts(
                     offset,
                 )
                 .with_spec_ref(SpecRef::new("3gpp", "TS29273", "7.2.2.1.1")));
+            } else if code == base::AVP_MULTI_ROUND_TIME_OUT {
+                return Err(DecodeError::new(
+                    DecodeErrorCode::Structural {
+                        reason: "Multi-Round-Time-Out is forbidden in Diameter-EAP-Request",
+                    },
+                    offset,
+                )
+                .with_spec_ref(SpecRef::new("ietf", "RFC4072", "5")));
             } else if code == AVP_AUTH_REQUEST_TYPE {
                 let value = builder_helpers::parse_u32_value(avp.value, value_offset, "8.7")?;
                 builder_helpers::set_once(
@@ -7055,6 +7160,15 @@ fn build_swm_diameter_eap_answer_internal(
             ctx,
         )?;
     }
+    if let Some(multi_round_timeout) = answer.multi_round_timeout {
+        builder_helpers::append_u32_avp(
+            &mut raw_avps,
+            base::AVP_MULTI_ROUND_TIME_OUT,
+            multi_round_timeout.seconds(),
+            true,
+            ctx,
+        )?;
+    }
     if let Some(re_auth_request_type) = answer.re_auth_request_type {
         builder_helpers::append_u32_avp(
             &mut raw_avps,
@@ -7472,6 +7586,7 @@ fn parse_swm_diameter_eap_application_answer_parts(
     let mut apn_configuration_supplements = Vec::new();
     let mut mobile_node_identifier = None;
     let mut session_timeout = None;
+    let mut multi_round_timeout = None;
     let mut authorization_lifetime = None;
     let mut auth_grace_period = None;
     let mut re_auth_request_type = None;
@@ -7783,6 +7898,15 @@ fn parse_swm_diameter_eap_application_answer_parts(
                     offset,
                     "8.13",
                 )?;
+            } else if code == base::AVP_MULTI_ROUND_TIME_OUT {
+                validate_base_mandatory_flags(&avp.header, offset, "8.19")?;
+                let value = builder_helpers::parse_u32_value(avp.value, value_offset, "8.19")?;
+                builder_helpers::set_once(
+                    &mut multi_round_timeout,
+                    SwmMultiRoundTimeout::from_seconds(value),
+                    offset,
+                    "8.19",
+                )?;
             } else if code == base::AVP_AUTHORIZATION_LIFETIME {
                 validate_base_mandatory_flags(&avp.header, offset, "8.9")?;
                 let value = builder_helpers::parse_u32_value(avp.value, value_offset, "8.9")?;
@@ -7963,6 +8087,7 @@ fn parse_swm_diameter_eap_application_answer_parts(
         apn_configurations,
         mobile_node_identifier,
         session_timeout,
+        multi_round_timeout,
         authorization_lifetime,
         auth_grace_period,
         re_auth_request_type,
@@ -8323,6 +8448,7 @@ fn is_known_agent_delivery_application_avp(avp: &SwmAdditionalAvp) -> bool {
                 | base::AVP_CLASS
                 | base::AVP_RE_AUTH_REQUEST_TYPE
                 | base::AVP_SESSION_TIMEOUT
+                | base::AVP_MULTI_ROUND_TIME_OUT
                 | base::AVP_USER_NAME
                 | AVP_AUTH_REQUEST_TYPE
                 | AVP_EAP_MASTER_SESSION_KEY

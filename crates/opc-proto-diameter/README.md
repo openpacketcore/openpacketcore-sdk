@@ -671,6 +671,39 @@ fn set_success_timers(answer: &mut SwmDiameterEapAnswer) {
 
 Diagnostics expose only timer presence.
 
+`Multi-Round-Time-Out` is an independent RFC 4072 per-challenge timer, not a
+session or authorization lifetime. `SwmDiameterEapAnswer::multi_round_timeout`
+retains its exact `Unsigned32` wire value as `SwmMultiRoundTimeout`, including
+zero, without manufacturing a default or applying a deployment cap. The raw
+field remains representable on every grammar-valid DEA so exact wire
+provenance is not discarded.
+
+A client must not act on that raw field directly. After the request has been
+bound to an authenticated Diameter connection and the response has passed
+transaction, P-bit, Proxy-Info, Session-Id, application, and Origin
+correlation, use this exact integration call:
+
+```rust
+use opc_proto_diameter::apps::swm::{
+    SwmCorrelatedDiameterEapResponse, SwmMultiRoundTimeout,
+};
+
+fn current_round_timeout(
+    response: &SwmCorrelatedDiameterEapResponse,
+) -> Option<SwmMultiRoundTimeout> {
+    response.current_eap_request_timeout()
+}
+```
+
+The accessor returns a value only for exact base
+`DIAMETER_MULTI_ROUND_AUTH` (1001) with one structurally valid EAP Request in
+`EAP-Payload`. A same-numbered `Experimental-Result`, EAP Success/Failure,
+malformed packet, unrelated result, or Request carried only in
+`EAP-Reissued-Payload` is non-actionable. RFC 4072 scopes the value to that EAP
+Request alone. The product owns clock selection, local min/max/default policy,
+timer arm/re-arm/cancel behavior, retransmission, attach teardown,
+persistence, and operational evidence.
+
 ### SWm DEA serving and emergency gateway context
 
 `SwmDiameterEapAnswer::gateway_context()` exposes parsed RFC 5447

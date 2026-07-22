@@ -198,6 +198,7 @@ fn establish_session(
         apn_configurations: Vec::new(),
         mobile_node_identifier: None,
         session_timeout: None,
+        multi_round_timeout: None,
         authorization_lifetime: None,
         auth_grace_period: None,
         re_auth_request_type: None,

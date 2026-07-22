@@ -266,6 +266,7 @@ remains absent by default, preserving prior canonical message bytes.
 
 | AVP | TS 29.273 presence | Wire identity and cardinality | Typed SDK field | Positive / negative evidence |
 |:----|:-------------------|:------------------------------|:----------------|:-----------------------------|
+| `Multi-Round-Time-Out` | RFC 4072 DEA 0-1 and DER 0; SHOULD accompany base `DIAMETER_MULTI_ROUND_AUTH` | IETF 272, `Unsigned32`, V/P clear and M set, singleton | raw `SwmDiameterEapAnswer::multi_round_timeout` / `SwmMultiRoundTimeout`; actionable `SwmCorrelatedDiameterEapResponse::current_eap_request_timeout` | Independent `.example` wire fixture proves exact network-order bytes. Absent, zero, one, and `u32::MAX` round trip; consecutive answers retain independent values. Duplicate, wrong width/flags/vendor, and exact-IETF DER placement fail. Foreign-vendor collisions follow `UnknownIePolicy` and cannot shadow the IETF field. The actionable accessor additionally requires authenticated request correlation, exact base 1001, and an actual `EAP-Payload` Request; experimental 1001, terminal/malformed packets, unrelated results, and reissued-only Requests return `None`. Diagnostics expose presence only. |
 | `Session-Timeout` | Conditional on successful authentication and authorization | IETF 27, `Unsigned32`, V/P clear and M set, singleton | `SwmDiameterEapAnswer::session_timeout` / `SwmSessionTimeout` | Absent, zero/unlimited, nonzero, and `u32::MAX` round trip. Invalid IETF flags/width, duplicates, and every result other than exact base `DIAMETER_SUCCESS` fail. A nonzero-vendor code collision is a distinct unknown AVP governed by `UnknownIePolicy`; M-set unknown AVPs still fail. Diagnostics omit the value. |
 | `Authorization-Lifetime` | Optional authorization lifetime | IETF 291, `Unsigned32`, V/P clear and M set, singleton | `SwmDiameterEapAnswer::authorization_lifetime` | Zero and positive values round trip. A positive value without `Re-Auth-Request-Type`, duplicates, invalid IETF flags/width, and a finite value larger than finite `Session-Timeout` fail. Nonzero-vendor code collisions follow the unknown-AVP policy. |
 | `Auth-Grace-Period` | Optional | IETF 276, `Unsigned32`, V/P clear and M set, singleton | `SwmDiameterEapAnswer::auth_grace_period` | Zero and `u32::MAX` round trip independently. No relationship to another timer is invented. Invalid IETF flags/width and duplicates fail; nonzero-vendor code collisions follow the unknown-AVP policy. |
@@ -279,6 +280,13 @@ initial-authorization condition should require the field at their policy
 boundary. Explicit zero means unlimited and is therefore not smaller than a
 positive `Authorization-Lifetime`. Timeout enforcement, re-authorization
 scheduling, and teardown remain product policy.
+
+`Multi-Round-Time-Out` is not part of those cross-field lifetime constraints.
+RFC 4072 scopes it to the EAP Request carried by the same DEA. The SDK retains
+the grammar-valid raw fact without starting a clock; only the fully correlated
+response accessor classifies it as applicable. Local caps/defaults, timer
+scheduling and cancellation, retransmission, persistence, and attach teardown
+remain product-owned.
 
 The finite DEA serving/emergency gateway rows are modeled through one shared
 canonical RFC 5447 codec. Parsed values are inspectable wire facts only;
