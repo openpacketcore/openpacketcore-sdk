@@ -379,6 +379,7 @@ full-key foreign-vendor collisions, and unknown optional AVPs keep the bounded
 section 7.2 wildcard behavior. Result 3004 becomes actionable only when the
 correlated DER selected a specific server with Destination-Host, as required
 by RFC 6733 section 7.1.3. Both results require the DER's exact Session-Id
+and the authenticated Diameter agent's exact Origin-Host/Origin-Realm pair
 before they become actionable.
 
 | Routing/error AVP or signal | Wire rule | Typed guarantee and evidence |
@@ -387,7 +388,7 @@ before they become actionable.
 | `Proxy-Info` | IETF 284, M set, repeated; grouped exact-once `Proxy-Host` and `Proxy-State` | The grouped parser requires nonempty ASCII Proxy-Host, retains opaque Proxy-State privately, applies unknown-child policy, caps children at 128, and matches full vendor-aware keys. Builders echo the exact ordered request chain after diagnostics and before generic wildcard redirect AVPs. Correlation requires byte-identical order/content. Values never appear in diagnostics. |
 | `Route-Record` | IETF 282, M set, repeated on DER; forbidden on DEA | DER retains ordered nonempty ASCII identities and emits them after Proxy-Info. No answer builder reflects them; baseline and projected DEA dictionaries mark the AVP `Forbidden`, and typed parsing rejects it independently. |
 | Base `Result-Code` 3006 plus `Redirect-Host` | Redirect-Indication requires one or more repeated IETF 292 DiameterURI values | `SwmDiameterRedirect` preserves bounded wire order without assigning target preference. Only exact base 3006 with E set creates redirect semantics; experimental numeric 3006 remains ordinary/opaque. Missing, invalid, excessive, or out-of-context targets fail. Target values remain sealed until correlation. |
-| Base `Result-Code` 3002 / 3004 | `DIAMETER_UNABLE_TO_DELIVER` / `DIAMETER_TOO_BUSY`, E set; R/T clear; request P and identifiers preserved | `SwmDiameterEapAgentDeliveryFailure` admits only these exact values. `new_agent_delivery_failure_for` records a private zeroized binding over the complete canonical request envelope before the shared generic builder copies Session-Id and ordered Proxy-Info. Mutation, transplant to a conflicting request, application-only AVPs, redirect/experimental context, and parsed-answer re-origination fail closed. Result 3004 additionally requires request Destination-Host. Received failures require the exact request Session-Id and become typed only after the transport atomically removes the pending connection-generation/Hop-by-Hop entry and the SDK validates End-to-End plus the complete request correlation. Independent literal exact-wire fixtures cover both values. |
+| Base `Result-Code` 3002 / 3004 | `DIAMETER_UNABLE_TO_DELIVER` / `DIAMETER_TOO_BUSY`, E set; R/T clear; request P and identifiers preserved | `SwmDiameterEapAgentDeliveryFailure` admits only these exact values. `new_agent_delivery_failure_for` records a private zeroized binding over the complete canonical request envelope before the shared generic builder copies Session-Id and ordered Proxy-Info. Mutation, transplant to a conflicting request, application-only AVPs, redirect/experimental context, and parsed-answer re-origination fail closed. Result 3004 additionally requires request Destination-Host. Received failures require the exact request Session-Id and a separate exact, ASCII-case-insensitive authenticated-agent Origin pair; missing and mismatched authority have stable value-free errors. They become typed only after the transport atomically removes the pending connection-generation/Hop-by-Hop entry and the SDK validates End-to-End plus the complete request correlation. Independent literal exact-wire fixtures cover both values. |
 | `Redirect-Host-Usage` / `Redirect-Max-Cache-Time` | IETF 261/262, singleton | Absence and explicit `DONT_CACHE` are preserved distinctly and both produce effective no-cache. A nonzero usage requires Max-Cache-Time. RFC does not forbid Max-Cache-Time with absent/zero usage, so it is preserved but is not actionable cache policy. The typed precedence accessor follows RFC 6733's route precedence rather than numeric enum order. |
 | `Failed-AVP` | IETF 279, M set, repeated | Generic E parsing validates the outer AVP and keeps its inner representation opaque, including synthesized/malformed representations permitted by RFC 6733. The explicit MUST-presence codes 5001, 5004, 5007, 5008, 5009, 5014, and 5016 fail when absent; 3009 and 5005 retain their non-MUST compatibility. Ordinary E-clear RFC 4072 DEA retains repeated values for value-free metadata but refuses typed re-origination to prevent evidence rebinding. |
 | Retained routing/error budget | Combined Proxy-Info, Route-Record, redirect, Failed-AVP, and generic wildcard values | Checked arithmetic caps retained entries at 128 and bytes at `DecodeContext::max_message_len`. Redirect construction accounts for usage/cache AVPs before it can produce an unencodable plan. |
@@ -400,9 +401,14 @@ matching Session-Id when the generic grammar carries one. Ordinary application
 answers additionally satisfy the configured direct/routed logical-Origin
 policy and request application/authentication facts. Generic errors skip only
 terminal logical-Origin matching because an RFC 6733 intermediary may originate
-them. Exact 3002/3004 additionally require Session-Id presence and exact match.
-Parsed Redirect-Host values are inaccessible and cannot be re-encoded before
-that complete gate succeeds.
+them. Exact 3002/3004 additionally require Session-Id presence and exact match,
+plus an exact ASCII-case-insensitive Origin-Host/Origin-Realm match against the
+authenticated dialed agent. `SwmExpectedAnswerPeer::routed_via` carries that
+agent pair independently of terminal AAA authority; plain `routed` carries no
+agent authority and fails closed. A direct binding derives agent authority from
+the exact negotiated peer identity. Destination values never supply either
+authority. Parsed Redirect-Host values are inaccessible and cannot be
+re-encoded before that complete gate succeeds.
 
 The public generic origination path is restricted to request-bound base 3006
 through `SwmDiameterEapGenericErrorAnswer::new_redirect` and exact base

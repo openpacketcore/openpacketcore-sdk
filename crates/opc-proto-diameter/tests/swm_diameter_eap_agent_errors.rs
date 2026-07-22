@@ -197,8 +197,36 @@ fn bound_request(
     eap_payload: &[u8],
     proxies: &[Vec<u8>],
 ) -> SwmDiameterEapRequestEnvelope {
-    parsed_request(hop_by_hop, eap_payload, proxies)
-        .with_expected_answer_peer(SwmExpectedAnswerPeer::routed(connection))
+    parsed_request(hop_by_hop, eap_payload, proxies).with_expected_answer_peer(
+        SwmExpectedAnswerPeer::routed_via(
+            connection,
+            "dra.synthetic.example",
+            "routing.synthetic.example",
+        ),
+    )
+}
+
+fn agent_error_avps_from_origin(
+    result_code: u32,
+    session_id: Option<&[u8]>,
+    origin_host: &[u8],
+    origin_realm: &[u8],
+    proxies: &[Vec<u8>],
+    extras: &[Vec<u8>],
+) -> Vec<Vec<u8>> {
+    let mut avps = Vec::new();
+    if let Some(session_id) = session_id {
+        avps.push(mandatory_avp(base::AVP_SESSION_ID, session_id));
+    }
+    avps.push(mandatory_avp(base::AVP_ORIGIN_HOST, origin_host));
+    avps.push(mandatory_avp(base::AVP_ORIGIN_REALM, origin_realm));
+    avps.push(mandatory_avp(
+        base::AVP_RESULT_CODE,
+        &result_code.to_be_bytes(),
+    ));
+    avps.extend_from_slice(proxies);
+    avps.extend_from_slice(extras);
+    avps
 }
 
 fn agent_error_avps(
@@ -207,19 +235,14 @@ fn agent_error_avps(
     proxies: &[Vec<u8>],
     extras: &[Vec<u8>],
 ) -> Vec<Vec<u8>> {
-    let mut avps = Vec::new();
-    if let Some(session_id) = session_id {
-        avps.push(mandatory_avp(base::AVP_SESSION_ID, session_id));
-    }
-    avps.push(mandatory_avp(base::AVP_ORIGIN_HOST, DRA_HOST));
-    avps.push(mandatory_avp(base::AVP_ORIGIN_REALM, DRA_REALM));
-    avps.push(mandatory_avp(
-        base::AVP_RESULT_CODE,
-        &result_code.to_be_bytes(),
-    ));
-    avps.extend_from_slice(proxies);
-    avps.extend_from_slice(extras);
-    avps
+    agent_error_avps_from_origin(
+        result_code,
+        session_id,
+        DRA_HOST,
+        DRA_REALM,
+        proxies,
+        extras,
+    )
 }
 
 fn agent_error_wire(
@@ -234,6 +257,27 @@ fn agent_error_wire(
         hop_by_hop,
         END_TO_END,
         &agent_error_avps(result_code, session_id, proxies, extras),
+    )
+}
+
+fn agent_error_wire_from_origin(
+    result_code: u32,
+    hop_by_hop: u32,
+    origin_host: &[u8],
+    origin_realm: &[u8],
+) -> Vec<u8> {
+    message_wire(
+        CommandFlags::answer(true, true),
+        hop_by_hop,
+        END_TO_END,
+        &agent_error_avps_from_origin(
+            result_code,
+            Some(SESSION_ID),
+            origin_host,
+            origin_realm,
+            &[],
+            &[],
+        ),
     )
 }
 
@@ -619,7 +663,11 @@ fn correlated_failure_is_connection_generation_and_request_bound() {
     let mut failed_over = request.clone();
     failed_over.mark_for_failover_retransmission(
         HOP_BY_HOP ^ 0x0100_0000,
-        SwmExpectedAnswerPeer::routed(CONNECTION_TWO),
+        SwmExpectedAnswerPeer::routed_via(
+            CONNECTION_TWO,
+            "dra.synthetic.example",
+            "routing.synthetic.example",
+        ),
     );
     let stale_on_old_generation = swm::parse_swm_diameter_eap_response_envelope_from_connection(
         &decode(&wire),
@@ -658,6 +706,131 @@ fn correlated_failure_is_connection_generation_and_request_bound() {
         .correlate_response(other_result)
         .expect("other generic result still correlates structurally");
     assert_eq!(other_correlated.agent_delivery_failure(), None);
+}
+
+#[test]
+fn correlated_failure_requires_exact_authenticated_agent_authority() {
+    let request_payload = &[0x02, 0x2a, 0x00, 0x08, 0x32, 0x44, 0x55, 0x66];
+    let valid_wire = agent_error_wire(
+        base::RESULT_CODE_DIAMETER_UNABLE_TO_DELIVER,
+        HOP_BY_HOP,
+        Some(SESSION_ID),
+        &[],
+        &[],
+    );
+    let parsed_response = |wire: &[u8]| {
+        swm::parse_swm_diameter_eap_response_envelope_from_connection(
+            &decode(wire),
+            CONNECTION_ONE,
+            typed_context(UnknownIePolicy::Preserve),
+        )
+        .expect("synthetic authenticated-agent response")
+    };
+
+    let no_authority = parsed_request(HOP_BY_HOP, request_payload, &[])
+        .with_expected_answer_peer(SwmExpectedAnswerPeer::routed(CONNECTION_ONE));
+    assert_eq!(
+        no_authority
+            .correlate_response(parsed_response(&valid_wire))
+            .expect_err("a routed connection alone cannot authorize an agent error"),
+        SwmDiameterEapCorrelationError::AgentAuthorityMissing,
+    );
+
+    for (origin_host, origin_realm) in [
+        (b"other-dra.synthetic.example".as_slice(), DRA_REALM),
+        (DRA_HOST, b"other-routing.synthetic.example".as_slice()),
+    ] {
+        let wrong_origin_wire = agent_error_wire_from_origin(
+            base::RESULT_CODE_DIAMETER_UNABLE_TO_DELIVER,
+            HOP_BY_HOP,
+            origin_host,
+            origin_realm,
+        );
+        assert_eq!(
+            bound_request(CONNECTION_ONE, HOP_BY_HOP, request_payload, &[])
+                .correlate_response(parsed_response(&wrong_origin_wire))
+                .expect_err("the authenticated agent Origin pair is exact"),
+            SwmDiameterEapCorrelationError::AgentIdentityMismatch,
+        );
+    }
+
+    let case_insensitive = parsed_request(HOP_BY_HOP, request_payload, &[])
+        .with_expected_answer_peer(SwmExpectedAnswerPeer::routed_via(
+            CONNECTION_ONE,
+            "DRA.SYNTHETIC.EXAMPLE",
+            "ROUTING.SYNTHETIC.EXAMPLE",
+        ));
+    assert_eq!(
+        case_insensitive
+            .correlate_response(parsed_response(&valid_wire))
+            .expect("Diameter identities compare ASCII case-insensitively")
+            .agent_delivery_failure(),
+        Some(SwmDiameterEapAgentDeliveryFailure::UnableToDeliver),
+    );
+
+    let direct = parsed_request(HOP_BY_HOP, request_payload, &[]).with_expected_answer_peer(
+        SwmExpectedAnswerPeer::direct(
+            CONNECTION_ONE,
+            "DRA.SYNTHETIC.EXAMPLE",
+            "ROUTING.SYNTHETIC.EXAMPLE",
+        ),
+    );
+    assert_eq!(
+        direct
+            .correlate_response(parsed_response(&valid_wire))
+            .expect("a direct peer derives agent authority from its exact identity")
+            .agent_delivery_failure(),
+        Some(SwmDiameterEapAgentDeliveryFailure::UnableToDeliver),
+    );
+
+    let direct_with_conflicting_override = parsed_request(HOP_BY_HOP, request_payload, &[])
+        .with_expected_answer_peer(
+            SwmExpectedAnswerPeer::direct(
+                CONNECTION_ONE,
+                "dra.synthetic.example",
+                "routing.synthetic.example",
+            )
+            .with_authenticated_agent_origin(
+                "other-dra.synthetic.example",
+                "other-routing.synthetic.example",
+            ),
+        );
+    assert_eq!(
+        direct_with_conflicting_override
+            .clone()
+            .correlate_response(parsed_response(&valid_wire))
+            .expect("a routed-agent override cannot replace direct peer authority")
+            .agent_delivery_failure(),
+        Some(SwmDiameterEapAgentDeliveryFailure::UnableToDeliver),
+    );
+    let conflicting_origin_wire = agent_error_wire_from_origin(
+        base::RESULT_CODE_DIAMETER_UNABLE_TO_DELIVER,
+        HOP_BY_HOP,
+        b"other-dra.synthetic.example",
+        b"other-routing.synthetic.example",
+    );
+    assert_eq!(
+        direct_with_conflicting_override
+            .correlate_response(parsed_response(&conflicting_origin_wire))
+            .expect_err("a direct peer's negotiated identity is immutable authority"),
+        SwmDiameterEapCorrelationError::AgentIdentityMismatch,
+    );
+
+    let separate_terminal_authority = parsed_request(HOP_BY_HOP, request_payload, &[])
+        .with_expected_answer_peer(
+            SwmExpectedAnswerPeer::routed_in_realm(
+                CONNECTION_ONE,
+                "terminal-aaa.synthetic.example",
+            )
+            .with_authenticated_agent_origin("dra.synthetic.example", "routing.synthetic.example"),
+        );
+    assert_eq!(
+        separate_terminal_authority
+            .correlate_response(parsed_response(&valid_wire))
+            .expect("terminal AAA and authenticated DRA authority remain independent")
+            .agent_delivery_failure(),
+        Some(SwmDiameterEapAgentDeliveryFailure::UnableToDeliver),
+    );
 }
 
 #[test]
@@ -742,7 +915,11 @@ fn failover_retransmission_t_is_bound_but_the_agent_answer_clears_t() {
     let replacement_hop = HOP_BY_HOP ^ 0x0200_0000;
     request.mark_for_failover_retransmission(
         replacement_hop,
-        SwmExpectedAnswerPeer::routed(CONNECTION_TWO),
+        SwmExpectedAnswerPeer::routed_via(
+            CONNECTION_TWO,
+            "dra.synthetic.example",
+            "routing.synthetic.example",
+        ),
     );
     assert!(request.is_potentially_retransmitted());
 
@@ -780,7 +957,11 @@ fn raw_3004_without_destination_host_is_receive_capable_but_not_actionable() {
         &[0x02, 0x25, 0x00, 0x08, 0x32, 0x10, 0x20, 0x30],
         &[],
     )
-    .with_expected_answer_peer(SwmExpectedAnswerPeer::routed(CONNECTION_ONE));
+    .with_expected_answer_peer(SwmExpectedAnswerPeer::routed_via(
+        CONNECTION_ONE,
+        "dra.synthetic.example",
+        "routing.synthetic.example",
+    ));
     let wire = agent_error_wire(
         base::RESULT_CODE_DIAMETER_TOO_BUSY,
         HOP_BY_HOP,

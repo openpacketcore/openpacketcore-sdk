@@ -77,8 +77,10 @@ charging decisions, watchdog policy, or a carrier-ready EPC/ePDG product claim.
   require an authenticated connection-generation token and may apply an
   explicit direct-host, routed-realm, or connection-only routed Origin policy;
   RFC 6733 generic E-bit answers, including the permitted permanent-failure
-  fallback, may omit Session-Id and skip logical-Origin policy, but still
-  require the exact connection, transaction, P, and Proxy-Info chain. The
+  fallback, may omit Session-Id and skip terminal logical-Origin policy, but
+  still require the exact connection, transaction, P, and Proxy-Info chain.
+  Exact 3002/3004 DRA delivery failures additionally require Session-Id and a
+  separately bound authenticated-agent Origin pair. The
   initial outbound STR, ASR, RAR, or AAR clears T, and each envelope exposes a
   one-way
   `mark_for_failover_retransmission` transition for queued, unacknowledged
@@ -713,10 +715,11 @@ the retained DER. A live transport supplies a process-unique
 `SwmDiameterConnectionToken`; correlation then checks that connection
 generation, both Diameter identifiers, P, the exact ordered `Proxy-Info`
 chain, and `Session-Id` when the generic answer carries it. An ordinary answer
-also checks the configured logical-Origin policy and application fields. A
-generic error may be originated by an intermediary, so it skips only that
-logical-Origin check. Never make a routing decision from the answer-local
-parser:
+also checks the configured terminal logical-Origin policy and application
+fields. A generic error may be originated by an intermediary, so it skips that
+terminal policy. Exact 3002/3004 delivery failures instead require the DER's
+Session-Id and the authenticated agent's exact Origin pair. Never make a
+routing decision from the answer-local parser:
 
 ```rust
 use opc_proto_diameter::apps::swm::{
@@ -758,6 +761,18 @@ connection generation plus Hop-by-Hop Identifier before correlation. The
 remaining End-to-End and complete request-envelope checks happen afterward.
 An identical response must find no second pending entry. Cloning a codec
 envelope or repeating `correlate_response` does not prove transport liveness.
+
+For a DRA connection, bind the request with
+`SwmExpectedAnswerPeer::routed_via(connection, agent_host, agent_realm)` using
+the identity negotiated for that authenticated connection. Plain `routed()`
+does not carry agent authority and therefore cannot authorize a 3002/3004
+response. The agent pair is separate from both the DER request-routing realm
+and the terminal AAA Origin policy; `with_authenticated_agent_origin` can add
+it to a `routed_in_realm` terminal policy without conflating them. A direct AAA
+binding derives both authorities from its exact peer identity, and a chained
+agent-origin setting cannot override that negotiated authority. Host and realm
+comparison is exact and ASCII case-insensitive, and neither identity is
+included in diagnostics.
 
 `SwmDiameterRedirect` validates one or more DiameterURI targets and preserves
 their wire order, but RFC 6733 does not define that order as target preference.
@@ -805,9 +820,10 @@ fn unable_to_deliver(
 The 3004 variant additionally requires that the retained DER selected a
 specific server with `Destination-Host`, as required by RFC 6733 section
 7.1.3. On receive, both delivery variants require the answer to carry the
-request's exact Session-Id before they become actionable. The builder copies
-Session-Id, P, both identifiers, and exact Proxy-Info, clears R/T, sets E, and
-never reflects a DER Route-Record or adds SWm application fields. Other
+request's exact Session-Id and match the separately bound authenticated-agent
+Origin pair before they become actionable. The builder copies Session-Id, P,
+both identifiers, and exact Proxy-Info, clears R/T, sets E, and never reflects
+a DER Route-Record or adds SWm application fields. Other
 originated protocol or application failures must use
 `error_answer::build_diameter_error_answer`, whose bound failure token proves
 the request and any required Failed-AVP. A parsed generic response cannot be

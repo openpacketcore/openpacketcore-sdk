@@ -1072,6 +1072,12 @@ enum SwmAnswerOriginPolicy {
     Realm(Redacted<String>),
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct SwmAuthenticatedAgentOrigin {
+    origin_host: Redacted<String>,
+    origin_realm: Redacted<String>,
+}
+
 /// Expected peer and optional logical origin for request-bound answers.
 ///
 /// Every mode binds an answer to the same authenticated connection generation
@@ -1081,13 +1087,15 @@ enum SwmAnswerOriginPolicy {
 /// logical-origin constraints when trusted routing state can prove them.
 /// Destination AVPs are never treated as proof of the final Origin.
 ///
-/// Generic RFC 6733 E-bit errors skip only the logical-origin policy because
-/// an intermediary can originate them; connection binding and every other
-/// correlation check remain mandatory.
+/// Generic RFC 6733 E-bit errors skip the final-server logical-origin policy
+/// because an intermediary can originate them. Exact 3002/3004 DRA delivery
+/// failures instead require a separately bound authenticated agent Origin pair;
+/// connection binding and every other correlation check remain mandatory.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SwmExpectedAnswerPeer {
     connection: SwmDiameterConnectionToken,
     origin_policy: SwmAnswerOriginPolicy,
+    authenticated_agent_origin: Option<SwmAuthenticatedAgentOrigin>,
 }
 
 impl SwmExpectedAnswerPeer {
@@ -1097,7 +1105,23 @@ impl SwmExpectedAnswerPeer {
         Self {
             connection,
             origin_policy: SwmAnswerOriginPolicy::Any,
+            authenticated_agent_origin: None,
         }
+    }
+
+    /// Bind a routed request to an authenticated Diameter agent.
+    ///
+    /// The agent Origin pair is distinct from both the DER Destination and the
+    /// terminal AAA Origin. DiameterIdentity comparison is ASCII
+    /// case-insensitive.
+    #[must_use]
+    pub fn routed_via(
+        connection: SwmDiameterConnectionToken,
+        agent_origin_host: impl Into<Redacted<String>>,
+        agent_origin_realm: impl Into<Redacted<String>>,
+    ) -> Self {
+        Self::routed(connection)
+            .with_authenticated_agent_origin(agent_origin_host, agent_origin_realm)
     }
 
     /// Bind a direct request to one final Origin-Host and Origin-Realm.
@@ -1109,12 +1133,18 @@ impl SwmExpectedAnswerPeer {
         origin_host: impl Into<Redacted<String>>,
         origin_realm: impl Into<Redacted<String>>,
     ) -> Self {
+        let origin_host = origin_host.into();
+        let origin_realm = origin_realm.into();
         Self {
             connection,
             origin_policy: SwmAnswerOriginPolicy::Exact {
-                origin_host: origin_host.into(),
-                origin_realm: origin_realm.into(),
+                origin_host: origin_host.clone(),
+                origin_realm: origin_realm.clone(),
             },
+            authenticated_agent_origin: Some(SwmAuthenticatedAgentOrigin {
+                origin_host,
+                origin_realm,
+            }),
         }
     }
 
@@ -1129,7 +1159,29 @@ impl SwmExpectedAnswerPeer {
         Self {
             connection,
             origin_policy: SwmAnswerOriginPolicy::Realm(origin_realm.into()),
+            authenticated_agent_origin: None,
         }
+    }
+
+    /// Bind the exact authenticated agent Origin pair for generic 3002/3004.
+    ///
+    /// This does not alter the independent terminal-answer Origin policy. A
+    /// direct binding derives agent authority from its negotiated exact peer
+    /// identity, so this method cannot override that authority.
+    #[must_use]
+    pub fn with_authenticated_agent_origin(
+        mut self,
+        origin_host: impl Into<Redacted<String>>,
+        origin_realm: impl Into<Redacted<String>>,
+    ) -> Self {
+        if matches!(&self.origin_policy, SwmAnswerOriginPolicy::Exact { .. }) {
+            return self;
+        }
+        self.authenticated_agent_origin = Some(SwmAuthenticatedAgentOrigin {
+            origin_host: origin_host.into(),
+            origin_realm: origin_realm.into(),
+        });
+        self
     }
 
     /// Return the opaque connection generation used for transport dispatch.
@@ -1152,6 +1204,23 @@ impl SwmExpectedAnswerPeer {
                 expected_realm.as_ref().eq_ignore_ascii_case(origin_realm)
             }
         }
+    }
+
+    pub(super) fn matches_authenticated_agent_origin(
+        &self,
+        origin_host: &str,
+        origin_realm: &str,
+    ) -> Option<bool> {
+        self.authenticated_agent_origin.as_ref().map(|expected| {
+            expected
+                .origin_host
+                .as_ref()
+                .eq_ignore_ascii_case(origin_host)
+                && expected
+                    .origin_realm
+                    .as_ref()
+                    .eq_ignore_ascii_case(origin_realm)
+        })
     }
 
     pub(super) fn validate_for_encode(&self) -> Result<(), EncodeError> {
@@ -1177,7 +1246,20 @@ impl SwmExpectedAnswerPeer {
                 "expected SWm answer Origin-Realm must be a nonempty ASCII DiameterIdentity",
                 "6.4",
             ),
+        }?;
+        if let Some(agent_origin) = &self.authenticated_agent_origin {
+            validate_identity_for_encode(
+                agent_origin.origin_host.as_ref(),
+                "authenticated Diameter agent Origin-Host must be a nonempty ASCII DiameterIdentity",
+                "6.3",
+            )?;
+            validate_identity_for_encode(
+                agent_origin.origin_realm.as_ref(),
+                "authenticated Diameter agent Origin-Realm must be a nonempty ASCII DiameterIdentity",
+                "6.4",
+            )?;
         }
+        Ok(())
     }
 }
 
@@ -1198,6 +1280,10 @@ impl fmt::Debug for SwmExpectedAnswerPeer {
                 .field("origin_policy", &"routed_in_realm")
                 .field("origin_realm", origin_realm),
         };
+        debug.field(
+            "authenticated_agent_origin",
+            &self.authenticated_agent_origin.as_ref().map(|_| "exact"),
+        );
         debug.finish()
     }
 }
