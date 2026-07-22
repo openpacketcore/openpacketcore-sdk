@@ -33,6 +33,41 @@ boundary for the experimental Diameter codec and peer state machine.
 - A connection retains typed TLS version, cipher, credential epoch, peer
   identity, protection-sequence, and generation evidence. It exposes no raw
   stream escape that can bypass `PeerSession` command admission.
+- After successful CER/CEA, `DiameterTlsConnection::into_peer_runtime` consumes
+  the sequential handle into one full-duplex owner. Independent persistent
+  reader and writer tasks never cancel an in-progress frame merely to service
+  the opposite direction. Separate bounded caller, priority-control, and
+  inbound-application queues plus a configured maximum frame-write duration
+  bound how long application load can delay DWA/DPA handling. Queue exhaustion
+  on a peer-controlled lane fails closed. Once a first frame octet arrives, a
+  separate completion timeout prevents slow partial frames from occupying a
+  connection until credential expiry.
+- The runtime automatically parses, identity-checks, admits, and answers DWR
+  and DPR. Safely classifiable malformed requests receive request-bound typed
+  RFC error answers before the connection closes. Caller-originated probes and
+  disconnects retain both Diameter identifiers and accept only the exact
+  correlated DWA/DPA. Answers with an unknown Hop-by-Hop identifier, including
+  stale duplicates, are discarded as RFC 6733 requires. An answer reusing the
+  exact Hop-by-Hop identifier with a different End-to-End identifier, a
+  wrong-identity exact answer, and invalid control grammar fail closed.
+- Application traffic remains admissible while an exact watchdog response is
+  pending, as RFC 3539 permits. The caller supplies a validated base `Twinit`
+  and schedules the initial attempt from the exposed inbound-activity clock
+  using `DiameterWatchdogTwinit::sample_effective_interval`; the runtime
+  applies fresh jitter on every reset. The first unanswered
+  interval enters `SUSPECT` without retransmitting DWR, any received Diameter
+  message resets Tw, and a second unanswered interval closes the connection.
+  A locally initiated graceful disconnect supersedes an outstanding watchdog
+  only after its DPR is flushed; the displaced watchdog completes with a typed
+  non-terminal result while the exact DPR/DPA transaction owns shutdown.
+  Inbound DPR is acknowledged with success only after the consumer explicitly
+  declares its application transaction ledger quiescent; admitted application
+  traffic clears that declaration. Cancelling an already-enqueued public
+  operation synchronously shuts down the socket rather than leaving the caller
+  uncertain whether a partial frame or side effect occurred.
+- `elect_simultaneous_open` provides the transport-neutral RFC 6733 section
+  5.6.4 Origin-Host comparison and a typed local survivor decision. Equal or
+  case-only-equal identities fail closed instead of selecting divergent peers.
 - Credential-source loss, an admitted epoch replacement, certificate-chain
   expiry, or the configured maximum authentication age retires an idle socket.
   A rejected candidate that retains the same usable epoch does not retire it.
@@ -48,33 +83,32 @@ boundary for the experimental Diameter codec and peer state machine.
   `TlsHandshake`; `ProtocolRejected` remains the defensive classification for
   a completed negotiation whose version or ALPN evidence violates policy.
 
-All parser, TLS, identity, deadline, and write failures are represented by a
+All parser, TLS, identity, and started frame-I/O failures are represented by a
 closed redaction-safe error set and terminally full-close the affected
-connection. Cancelling a frame operation after it starts also synchronously
-revokes the exact peer generation and full-closes TCP, so a retained handle
-cannot resume a partially read or written frame.
+connection. Validation, deadline, and backpressure rejections that the enqueue
+or writer path proves occurred before starting leave it active. An unproven
+caller timeout after submission is terminal, as is cancelling a submitted
+frame operation: both synchronously revoke the exact peer generation and
+full-close TCP, so a retained handle cannot resume a partially read or written
+frame.
 Application policy and Diameter application state machines remain outside this
 crate.
 
 ## Explicit limits
 
-This crate currently implements TLS/TCP only. It does not implement DTLS/SCTP,
-does not emit SCTP PPID 47, and does not claim simultaneous-open winner
-election. Each candidate receives a monotonic `PeerSessionGeneration`, but the
-consumer still owns winner election, listener/reconnect policy, backoff, realm
-routing, and peer topology.
+This crate currently implements TLS/TCP only. It does not implement DTLS/SCTP
+and does not emit SCTP PPID 47. Each candidate receives a monotonic
+`PeerSessionGeneration`, and the SDK exposes the simultaneous-open decision,
+but the consumer still owns candidate orchestration, listener/reconnect policy,
+backoff, realm routing, peer topology, base `Twinit` selection, initial watchdog
+scheduling, identifier allocation, and all application state machines.
 
-`DiameterTlsConnection` is a sequential connection handle in this slice:
-`send_message` and `receive_message` both require exclusive mutable access. It
-exposes only owned redaction-safe session snapshots/readiness after retirement
-reconciliation, not a borrowed mutable `PeerSession`. These generic methods
-are application-message-only after typed capability negotiation; connection-
-owned watchdog/disconnect lifecycle methods are not yet present. The handle
-does not yet provide an owned read/write split or actor, and an external mutex
-must not be held across a blocked receive to emulate one. Consequently this is
-not yet the normal long-lived full-duplex Diameter/watchdog runtime. The crate
-is experimental and is not a complete RFC 6733 transport or deployment-
-readiness profile.
+The original sequential `DiameterTlsConnection` methods remain available for
+capability setup and narrow integrations. Long-lived use should consume a
+negotiated connection into the bounded runtime instead of wrapping that handle
+in an external mutex. The crate remains experimental and does not make a
+complete RFC 6733 deployment-readiness claim until the real RFC 6083
+DTLS/SCTP/PPID-47 transport is implemented and qualified.
 
 ## Verification
 

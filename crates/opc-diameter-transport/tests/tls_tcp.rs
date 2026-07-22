@@ -1,25 +1,32 @@
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use opc_identity::{build_identity_state, IdentityState, TrustBundle, TrustBundleSet, TrustDomain};
 use opc_proto_diameter::base::{
-    APPLICATION_ID_COMMON_MESSAGES, INBAND_SECURITY_ID_TLS,
+    APPLICATION_ID_COMMON_MESSAGES, AVP_DISCONNECT_CAUSE, AVP_ORIGIN_HOST, AVP_ORIGIN_REALM,
+    INBAND_SECURITY_ID_TLS, RESULT_CODE_DIAMETER_AVP_UNSUPPORTED, RESULT_CODE_DIAMETER_MISSING_AVP,
     RESULT_CODE_DIAMETER_NO_COMMON_APPLICATION, RESULT_CODE_DIAMETER_NO_COMMON_SECURITY,
-    RESULT_CODE_DIAMETER_SUCCESS, RESULT_CODE_DIAMETER_UNABLE_TO_DELIVER,
+    RESULT_CODE_DIAMETER_SUCCESS, RESULT_CODE_DIAMETER_UNABLE_TO_COMPLY,
+    RESULT_CODE_DIAMETER_UNABLE_TO_DELIVER,
 };
 use opc_proto_diameter::peer::{
     build_capabilities_exchange_answer, build_capabilities_exchange_error_answer,
-    build_capabilities_exchange_request, peer_answer_flags, peer_request_flags, AnswerDiagnostics,
-    CapabilitiesExchangeAnswer, CapabilitiesExchangeErrorAnswer, HostIpAddress, PeerCapabilities,
-    PeerIdentity, PeerProcedure, PeerProtectionPolicy, PeerProtectionRequirement,
-    PeerProtectionSequence, PeerSession, PeerSessionPolicy,
+    build_capabilities_exchange_request, build_device_watchdog_answer,
+    build_device_watchdog_request, build_disconnect_peer_answer, build_disconnect_peer_request,
+    parse_device_watchdog_answer, parse_disconnect_peer_answer, peer_answer_flags,
+    peer_request_flags, AnswerDiagnostics, CapabilitiesExchangeAnswer,
+    CapabilitiesExchangeErrorAnswer, DeviceWatchdogAnswer, DeviceWatchdogRequest,
+    DisconnectPeerAnswer, DisconnectPeerRequest, HostIpAddress, PeerCapabilities, PeerIdentity,
+    PeerProcedure, PeerProtectionPolicy, PeerProtectionRequirement, PeerProtectionSequence,
+    PeerSession, PeerSessionPolicy,
 };
 use opc_proto_diameter::{
-    ApplicationId, CommandCode, CommandFlags, Header, OwnedMessage, VendorId, DIAMETER_HEADER_LEN,
-    MAX_U24,
+    ApplicationId, CommandCode, CommandFlags, Header, Message, OwnedMessage, VendorId,
+    DIAMETER_HEADER_LEN, MAX_U24,
 };
-use opc_protocol::{Encode, EncodeContext};
+use opc_protocol::{DecodeContext, Encode, EncodeContext, OwnedDecode};
 use opc_tls::{
     AuthenticatedClientConfig, AuthenticatedServerConfig, TlsConfigBuilder,
     TlsMaterialAvailability, TlsMaterialReloadReason,
@@ -34,8 +41,10 @@ use tokio::time::Instant;
 
 use opc_diameter_transport::{
     DiameterCapabilitiesExchangeAnswer, DiameterCapabilitiesExchangeOutcome,
-    DiameterConnectionRole, DiameterTlsAcceptor, DiameterTlsCipher, DiameterTlsConnector,
-    DiameterTlsPolicy, ExpectedPeerIdentity, ExpectedPeerIdentityError,
+    DiameterConnectionRole, DiameterPeerRuntimeConfig, DiameterPeerRuntimeConfigError,
+    DiameterPeerRuntimeError, DiameterTlsAcceptor, DiameterTlsCipher, DiameterTlsConnection,
+    DiameterTlsConnector, DiameterTlsPolicy, DiameterWatchdogTwinit, DiameterWatchdogTwinitError,
+    ExpectedPeerIdentity, ExpectedPeerIdentityError,
 };
 
 const CLIENT_ID: &str =
@@ -290,6 +299,72 @@ where
         .await
         .expect("read Diameter body");
     header
+}
+
+async fn read_diameter_frame<R>(reader: &mut R) -> OwnedMessage
+where
+    R: AsyncRead + Unpin,
+{
+    let mut header = [0_u8; DIAMETER_HEADER_LEN];
+    reader
+        .read_exact(&mut header)
+        .await
+        .expect("read Diameter header");
+    let declared_length =
+        (usize::from(header[1]) << 16) | (usize::from(header[2]) << 8) | usize::from(header[3]);
+    assert!(declared_length >= DIAMETER_HEADER_LEN);
+    let mut wire = BytesMut::with_capacity(declared_length);
+    wire.extend_from_slice(&header);
+    wire.resize(declared_length, 0);
+    reader
+        .read_exact(&mut wire[DIAMETER_HEADER_LEN..])
+        .await
+        .expect("read Diameter body");
+    OwnedMessage::decode_owned(wire.freeze(), DecodeContext::default())
+        .expect("decode complete Diameter frame")
+}
+
+fn ietf_avp(code: u32, mandatory: bool, value: &[u8]) -> Bytes {
+    let declared_length = 8_usize
+        .checked_add(value.len())
+        .expect("small synthetic AVP length");
+    let padded_length = declared_length
+        .checked_add(3)
+        .expect("small synthetic AVP padding")
+        & !3;
+    let mut wire = BytesMut::with_capacity(padded_length);
+    wire.extend_from_slice(&code.to_be_bytes());
+    wire.extend_from_slice(&[
+        if mandatory { 0x40 } else { 0 },
+        ((declared_length >> 16) & 0xff) as u8,
+        ((declared_length >> 8) & 0xff) as u8,
+        (declared_length & 0xff) as u8,
+    ]);
+    wire.extend_from_slice(value);
+    wire.resize(padded_length, 0);
+    wire.freeze()
+}
+
+fn peer_request_with_avps(
+    procedure: PeerProcedure,
+    hop_by_hop_identifier: u32,
+    end_to_end_identifier: u32,
+    avps: &[Bytes],
+) -> OwnedMessage {
+    let mut raw_avps = BytesMut::new();
+    for avp in avps {
+        raw_avps.extend_from_slice(avp);
+    }
+    OwnedMessage {
+        header: Header::new(
+            peer_request_flags(procedure),
+            procedure.command_code(),
+            APPLICATION_ID_COMMON_MESSAGES,
+            hop_by_hop_identifier,
+            end_to_end_identifier,
+        ),
+        raw_avps: raw_avps.freeze(),
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -2775,5 +2850,1825 @@ async fn assert_direct_acceptor_rejects_raw_client_certificate(
     assert_eq!(
         error,
         opc_diameter_transport::DiameterTlsError::Authentication
+    );
+}
+
+fn runtime_config(origin_state_id: u32) -> DiameterPeerRuntimeConfig {
+    let capacity = NonZeroUsize::new(8).expect("nonzero test capacity");
+    DiameterPeerRuntimeConfig::new(capacity, capacity, capacity, Some(origin_state_id))
+        .expect("valid runtime queue bounds")
+}
+
+#[test]
+fn peer_runtime_config_rejects_queue_and_frame_timeout_bounds() {
+    let one = NonZeroUsize::new(1).expect("nonzero test capacity");
+    let too_large = NonZeroUsize::new(tokio::sync::Semaphore::MAX_PERMITS + 1)
+        .expect("Tokio's maximum leaves room for an invalid capacity");
+
+    assert_eq!(
+        DiameterPeerRuntimeConfig::new(too_large, one, one, None),
+        Err(DiameterPeerRuntimeConfigError::CommandQueueTooLarge)
+    );
+    assert_eq!(
+        DiameterPeerRuntimeConfig::new(one, too_large, one, None),
+        Err(DiameterPeerRuntimeConfigError::ControlQueueTooLarge)
+    );
+    assert_eq!(
+        DiameterPeerRuntimeConfig::new(one, one, too_large, None),
+        Err(DiameterPeerRuntimeConfigError::ApplicationQueueTooLarge)
+    );
+
+    let config = DiameterPeerRuntimeConfig::new(one, one, one, None)
+        .expect("unit queue capacities are valid");
+    assert_eq!(
+        config.with_frame_io_timeouts(Duration::ZERO, Duration::from_secs(1)),
+        Err(DiameterPeerRuntimeConfigError::FrameCompletionTimeoutZero)
+    );
+    assert_eq!(
+        config.with_frame_io_timeouts(Duration::from_secs(1), Duration::ZERO),
+        Err(DiameterPeerRuntimeConfigError::FrameWriteTimeoutZero)
+    );
+    assert_eq!(
+        config.with_frame_io_timeouts(Duration::MAX, Duration::from_secs(1)),
+        Err(DiameterPeerRuntimeConfigError::FrameCompletionTimeoutTooLarge)
+    );
+    assert_eq!(
+        config.with_frame_io_timeouts(Duration::from_secs(1), Duration::MAX),
+        Err(DiameterPeerRuntimeConfigError::FrameWriteTimeoutTooLarge)
+    );
+}
+
+#[test]
+fn watchdog_twinit_enforces_the_rfc_3539_minimum_and_clock_bound() {
+    assert_eq!(
+        DiameterWatchdogTwinit::new(DiameterWatchdogTwinit::MINIMUM - Duration::from_nanos(1)),
+        Err(DiameterWatchdogTwinitError::BelowMinimum)
+    );
+    assert_eq!(
+        DiameterWatchdogTwinit::new(DiameterWatchdogTwinit::MINIMUM)
+            .expect("the RFC minimum is valid")
+            .get(),
+        DiameterWatchdogTwinit::MINIMUM
+    );
+    assert_eq!(
+        DiameterWatchdogTwinit::new(Duration::MAX),
+        Err(DiameterWatchdogTwinitError::TooLarge)
+    );
+}
+
+async fn negotiated_direct_connections() -> (
+    TestTlsMaterial,
+    DiameterTlsConnection,
+    DiameterTlsConnection,
+) {
+    let material = tls_material();
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind runtime listener");
+    let address = listener.local_addr().expect("runtime listener address");
+    let policy = DiameterTlsPolicy::default();
+    let acceptor = DiameterTlsAcceptor::new(material.server.clone(), expected(CLIENT_ID), policy);
+    let connector = DiameterTlsConnector::new(material.client.clone(), expected(SERVER_ID), policy);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let server = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.expect("accept runtime TCP");
+        acceptor
+            .accept_direct(tcp, direct_session("server.example.test"), deadline)
+            .await
+            .expect("accept runtime TLS")
+    });
+    let mut client = connector
+        .connect_direct(
+            address,
+            server_name(),
+            direct_session("client.example.test"),
+            deadline,
+        )
+        .await
+        .expect("connect runtime TLS");
+    let mut server = server.await.expect("join runtime acceptor");
+    let (sent, received) = tokio::join!(
+        client.send_capabilities_request(0x1100, 0x2200, deadline),
+        server.receive_capabilities_request(deadline),
+    );
+    sent.expect("send runtime CER");
+    received.expect("receive runtime CER");
+    let answer = CapabilitiesExchangeAnswer {
+        result_code: RESULT_CODE_DIAMETER_SUCCESS,
+        capabilities: capabilities("server.example.test", false),
+        diagnostics: AnswerDiagnostics::default(),
+    };
+    let (emitted, observed) = tokio::join!(
+        server.send_capabilities_answer(&answer, deadline),
+        client.receive_capabilities_answer(deadline),
+    );
+    assert!(emitted.expect("send runtime CEA").is_negotiated());
+    assert!(observed.expect("receive runtime CEA").1.is_negotiated());
+    (material, client, server)
+}
+
+async fn negotiated_client_with_raw_server() -> (
+    TestTlsMaterial,
+    DiameterTlsConnection,
+    tokio_rustls::server::TlsStream<TcpStream>,
+) {
+    let material = tls_material();
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind raw runtime listener");
+    let address = listener.local_addr().expect("raw runtime listener address");
+    let server_config = material.server.clone();
+    let connector = DiameterTlsConnector::new(
+        material.client.clone(),
+        expected(SERVER_ID),
+        DiameterTlsPolicy::default(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let server = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.expect("accept raw runtime TCP");
+        let handshake = server_config
+            .begin_handshake()
+            .expect("freeze raw server material");
+        let mut tls = tokio_rustls::TlsAcceptor::from(handshake.rustls_config())
+            .accept(tcp)
+            .await
+            .expect("accept raw mutual TLS");
+        let header = read_diameter_frame_header(&mut tls).await;
+        let answer = build_capabilities_exchange_answer(
+            &CapabilitiesExchangeAnswer {
+                result_code: RESULT_CODE_DIAMETER_SUCCESS,
+                capabilities: capabilities("server.example.test", false),
+                diagnostics: AnswerDiagnostics::default(),
+            },
+            u32::from_be_bytes(header[12..16].try_into().expect("CER hop-by-hop")),
+            u32::from_be_bytes(header[16..20].try_into().expect("CER end-to-end")),
+            EncodeContext::default(),
+        )
+        .expect("build raw peer CEA");
+        tls.write_all(&encode_message(&answer))
+            .await
+            .expect("write raw peer CEA");
+        tls.flush().await.expect("flush raw peer CEA");
+        tls
+    });
+    let mut client = connector
+        .connect_direct(
+            address,
+            server_name(),
+            direct_session("client.example.test"),
+            deadline,
+        )
+        .await
+        .expect("connect raw runtime TLS");
+    client
+        .send_capabilities_request(0x1110, 0x2220, deadline)
+        .await
+        .expect("send raw runtime CER");
+    let (_, outcome) = client
+        .receive_capabilities_answer(deadline)
+        .await
+        .expect("receive raw runtime CEA");
+    assert!(outcome.is_negotiated());
+    let tls = server.await.expect("join raw runtime negotiation");
+    (material, client, tls)
+}
+
+#[tokio::test]
+async fn peer_runtime_construction_requires_an_entered_tokio_runtime() {
+    let (_material, client, _server) = negotiated_direct_connections().await;
+    let error = std::thread::spawn(move || {
+        client
+            .into_peer_runtime(runtime_config(10))
+            .expect_err("runtime construction outside Tokio must fail closed")
+    })
+    .join()
+    .expect("join non-Tokio runtime-construction thread");
+
+    assert_eq!(error, DiameterPeerRuntimeError::RuntimeUnavailable);
+}
+
+#[test]
+fn dropping_owner_tokio_runtime_closes_detached_parts_without_hanging() {
+    let (_material_sources, client_handle, mut client_incoming, _server_handle, _server_incoming) =
+        std::thread::spawn(|| {
+            let owner = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("build owner Tokio runtime");
+            let detached = owner.block_on(async {
+                let (material, client, server) = negotiated_direct_connections().await;
+                let material_sources = (
+                    material._client_source.clone(),
+                    material._server_source.clone(),
+                );
+                let client = client
+                    .into_peer_runtime(runtime_config(10))
+                    .expect("start client runtime on owner");
+                let server = server
+                    .into_peer_runtime(runtime_config(20))
+                    .expect("start server runtime on owner");
+                let (client_handle, client_incoming) = client.into_parts();
+                let (server_handle, server_incoming) = server.into_parts();
+                (
+                    material_sources,
+                    client_handle,
+                    client_incoming,
+                    server_handle,
+                    server_incoming,
+                )
+            });
+            drop(owner);
+            detached
+        })
+        .join()
+        .expect("join owner Tokio runtime thread");
+
+    let observer = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build observer Tokio runtime");
+    observer.block_on(async {
+        let readiness_error =
+            tokio::time::timeout(Duration::from_secs(1), client_handle.readiness())
+                .await
+                .expect("readiness must finish after owner runtime drop")
+                .expect_err("readiness must fail after owner runtime drop");
+        assert!(matches!(
+            readiness_error,
+            DiameterPeerRuntimeError::Closed
+                | DiameterPeerRuntimeError::Transport(_)
+                | DiameterPeerRuntimeError::PeerDisconnected { .. }
+        ));
+
+        let send_error = tokio::time::timeout(
+            Duration::from_secs(1),
+            client_handle.send_application(
+                application_request(),
+                Instant::now() + Duration::from_secs(1),
+            ),
+        )
+        .await
+        .expect("send must finish after owner runtime drop")
+        .expect_err("send must fail after owner runtime drop");
+        assert_eq!(send_error, readiness_error);
+
+        let receive_error = tokio::time::timeout(Duration::from_secs(1), client_incoming.receive())
+            .await
+            .expect("receive must finish after owner runtime drop")
+            .expect_err("receive must fail after owner runtime drop");
+        assert_eq!(receive_error, readiness_error);
+    });
+}
+
+#[tokio::test]
+async fn credential_retirement_remains_authoritative_after_runtime_conversion() {
+    let (material, client, server) = negotiated_direct_connections().await;
+    let client = client
+        .into_peer_runtime(runtime_config(10))
+        .expect("start client runtime");
+    let server = server
+        .into_peer_runtime(runtime_config(20))
+        .expect("start server runtime");
+    let (client_handle, _client_incoming) = client.into_parts();
+    let (_server_handle, mut server_incoming) = server.into_parts();
+
+    material._client_source.send_replace(None);
+    let client_error = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            match client_handle.readiness().await {
+                Ok(_) => tokio::task::yield_now().await,
+                Err(error) => break error,
+            }
+        }
+    })
+    .await
+    .expect("runtime must observe credential retirement");
+    assert_eq!(
+        client_error,
+        DiameterPeerRuntimeError::Transport(opc_diameter_transport::DiameterTlsError::Retired)
+    );
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(1), server_incoming.receive())
+            .await
+            .expect("retirement must close the peer runtime")
+            .expect_err("retirement must not release an application message"),
+        DiameterPeerRuntimeError::Transport(_)
+            | DiameterPeerRuntimeError::Closed
+            | DiameterPeerRuntimeError::PeerDisconnected { .. }
+    ));
+}
+
+#[tokio::test]
+async fn peer_runtime_times_out_a_partial_frame_after_its_first_octet() {
+    let (_material, client, mut raw_server) = negotiated_client_with_raw_server().await;
+    let capacity = NonZeroUsize::new(8).expect("nonzero test capacity");
+    let config = DiameterPeerRuntimeConfig::new(capacity, capacity, capacity, Some(10))
+        .expect("valid runtime queue bounds")
+        .with_frame_io_timeouts(Duration::from_millis(25), Duration::from_secs(1))
+        .expect("valid bounded frame timeouts");
+    let client = client
+        .into_peer_runtime(config)
+        .expect("start client runtime");
+    let (_client_handle, mut client_incoming) = client.into_parts();
+
+    raw_server
+        .write_all(&[opc_proto_diameter::DIAMETER_VERSION])
+        .await
+        .expect("write first Diameter frame octet");
+    raw_server
+        .flush()
+        .await
+        .expect("flush first Diameter frame octet");
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), client_incoming.receive())
+            .await
+            .expect("partial-frame timeout must be bounded")
+            .expect_err("partial frame must terminate the runtime"),
+        DiameterPeerRuntimeError::Transport(
+            opc_diameter_transport::DiameterTlsError::DeadlineExceeded
+        )
+    );
+}
+
+#[tokio::test]
+async fn peer_runtime_carries_application_traffic_in_both_directions_concurrently() {
+    let (_material, client, server) = negotiated_direct_connections().await;
+    let client = client
+        .into_peer_runtime(runtime_config(10))
+        .expect("start client runtime");
+    let server = server
+        .into_peer_runtime(runtime_config(20))
+        .expect("start server runtime");
+    let (client_handle, mut client_incoming) = client.into_parts();
+    let (server_handle, mut server_incoming) = server.into_parts();
+    let request = application_request();
+    let answer = OwnedMessage {
+        header: Header::new(
+            CommandFlags::answer(false, false),
+            CommandCode::new(268),
+            APP_ID,
+            0x300,
+            0x400,
+        ),
+        raw_avps: Bytes::new(),
+    };
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let (sent_request, received_request, sent_answer, received_answer) = tokio::join!(
+        client_handle.send_application(request.clone(), deadline),
+        server_incoming.receive(),
+        server_handle.send_application(answer.clone(), deadline),
+        client_incoming.receive(),
+    );
+
+    assert!(sent_request.expect("send request").is_protected());
+    assert_eq!(
+        received_request.expect("receive request").into_message(),
+        request
+    );
+    assert!(sent_answer.expect("send answer").is_protected());
+    assert_eq!(
+        received_answer.expect("receive answer").into_message(),
+        answer
+    );
+}
+
+#[tokio::test]
+async fn peer_runtime_rejects_oversize_local_application_without_closing() {
+    let (_material, client, server) = negotiated_direct_connections().await;
+    let client = client
+        .into_peer_runtime(runtime_config(10))
+        .expect("start client runtime");
+    let server = server
+        .into_peer_runtime(runtime_config(20))
+        .expect("start server runtime");
+    let (client_handle, _client_incoming) = client.into_parts();
+    let (_server_handle, mut server_incoming) = server.into_parts();
+
+    let limits = opc_diameter_transport::DiameterFrameLimits::default();
+    let oversized = OwnedMessage {
+        header: Header::new(
+            CommandFlags::request(true),
+            CommandCode::new(268),
+            APP_ID,
+            0x5100,
+            0x6100,
+        ),
+        raw_avps: Bytes::from(vec![
+            0_u8;
+            limits.max_message_len() + 1 - DIAMETER_HEADER_LEN
+        ]),
+    };
+    assert_eq!(
+        client_handle
+            .send_application(oversized, Instant::now() + Duration::from_secs(1))
+            .await
+            .expect_err("oversize local frame must fail before transport output"),
+        DiameterPeerRuntimeError::Transport(opc_diameter_transport::DiameterTlsError::InvalidFrame)
+    );
+
+    let valid = application_request();
+    let (sent, received) = tokio::join!(
+        client_handle.send_application(valid.clone(), Instant::now() + Duration::from_secs(3),),
+        server_incoming.receive(),
+    );
+    assert!(sent
+        .expect("runtime remains usable after local prevalidation failure")
+        .is_protected());
+    assert_eq!(
+        received
+            .expect("peer receives the next valid application frame")
+            .into_message(),
+        valid
+    );
+}
+
+#[tokio::test]
+async fn peer_runtime_rejects_a_watchdog_probe_before_the_peer_is_idle() {
+    let (_material, client, server) = negotiated_direct_connections().await;
+    let client = client
+        .into_peer_runtime(runtime_config(10))
+        .expect("start client runtime");
+    let server = server
+        .into_peer_runtime(runtime_config(20))
+        .expect("start server runtime");
+    let (client_handle, _client_incoming) = client.into_parts();
+    let (_server_handle, _server_incoming) = server.into_parts();
+
+    let error = client_handle
+        .probe_watchdog(
+            0x3100,
+            0x4100,
+            DiameterWatchdogTwinit::new(Duration::from_secs(6)).expect("valid Twinit"),
+            Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .expect_err("fresh peer activity must postpone DWR emission");
+
+    assert_eq!(error, DiameterPeerRuntimeError::WatchdogNotDue);
+}
+
+#[tokio::test]
+async fn peer_runtime_watchdog_jitter_stays_within_the_rfc_3539_range() {
+    let (_material, client, mut raw_server) = negotiated_client_with_raw_server().await;
+    let client = client
+        .into_peer_runtime(runtime_config(10))
+        .expect("start client runtime");
+    let (client_handle, _client_incoming) = client.into_parts();
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(4)).await;
+
+    let started = Instant::now();
+    let probe = tokio::spawn(async move {
+        client_handle
+            .probe_watchdog(
+                0x3200,
+                0x4200,
+                DiameterWatchdogTwinit::new(Duration::from_secs(6)).expect("valid Twinit"),
+                Instant::now() + Duration::from_secs(30),
+            )
+            .await
+    });
+    let header = read_diameter_frame_header(&mut raw_server).await;
+    assert_eq!(
+        u32::from_be_bytes([0, header[5], header[6], header[7]]),
+        PeerProcedure::DeviceWatchdog.command_code().get()
+    );
+
+    assert_eq!(
+        probe.await.expect("join unanswered watchdog probe"),
+        Err(DiameterPeerRuntimeError::WatchdogSuspect)
+    );
+    let elapsed = Instant::now().saturating_duration_since(started);
+    assert!(elapsed >= Duration::from_secs(4), "elapsed={elapsed:?}");
+    assert!(
+        elapsed <= Duration::from_millis(8_010),
+        "elapsed={elapsed:?}"
+    );
+}
+
+#[tokio::test]
+async fn peer_runtime_accepts_an_exact_late_dwa_after_entering_suspect() {
+    let (_material, client, mut raw_server) = negotiated_client_with_raw_server().await;
+    let client = client
+        .into_peer_runtime(runtime_config(10))
+        .expect("start client runtime");
+    let (client_handle, mut client_incoming) = client.into_parts();
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(4)).await;
+
+    let observed_handle = client_handle.clone();
+    let probe = tokio::spawn(async move {
+        client_handle
+            .probe_watchdog(
+                0x3250,
+                0x4250,
+                DiameterWatchdogTwinit::new(Duration::from_secs(6)).expect("valid Twinit"),
+                Instant::now() + Duration::from_secs(30),
+            )
+            .await
+    });
+    let request_header = read_diameter_frame_header(&mut raw_server).await;
+    let hop_by_hop = u32::from_be_bytes(request_header[12..16].try_into().expect("DWR hop-by-hop"));
+    let end_to_end = u32::from_be_bytes(request_header[16..20].try_into().expect("DWR end-to-end"));
+    assert_eq!(
+        probe.await.expect("join unanswered watchdog probe"),
+        Err(DiameterPeerRuntimeError::WatchdogSuspect)
+    );
+    assert!(
+        !observed_handle
+            .readiness()
+            .await
+            .expect("suspect runtime remains observable")
+            .traffic_ready,
+        "suspect peer must stop application admission"
+    );
+
+    let inbound_before_reset = observed_handle
+        .activity()
+        .await
+        .expect("activity before watchdog reset")
+        .last_inbound();
+    tokio::time::advance(Duration::from_millis(1)).await;
+    let unrelated_application = application_request();
+    raw_server
+        .write_all(&encode_message(&unrelated_application))
+        .await
+        .expect("write unrelated application during watchdog grace");
+    raw_server
+        .flush()
+        .await
+        .expect("flush unrelated application during watchdog grace");
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), client_incoming.receive())
+            .await
+            .expect("unrelated application delivery must precede the reset interval")
+            .expect("unrelated application remains admitted")
+            .into_message(),
+        unrelated_application
+    );
+    let activity_after_reset = observed_handle
+        .activity()
+        .await
+        .expect("activity after watchdog reset");
+    assert!(activity_after_reset.last_inbound() > inbound_before_reset);
+    let pending = observed_handle
+        .peer_session_snapshot()
+        .await
+        .expect("snapshot after unrelated peer activity");
+    assert_eq!(pending.watchdog_requests_sent, 1);
+    assert_eq!(pending.watchdog_answers_observed, 0);
+    assert!(pending.readiness.probing);
+    assert!(pending.readiness.traffic_ready);
+
+    let answer = build_device_watchdog_answer(
+        &DeviceWatchdogAnswer {
+            result_code: RESULT_CODE_DIAMETER_SUCCESS,
+            identity: PeerIdentity::new("server.example.test", "example.test"),
+            origin_state_id: Some(20),
+            diagnostics: AnswerDiagnostics::default(),
+        },
+        hop_by_hop,
+        end_to_end,
+        EncodeContext::default(),
+    )
+    .expect("build exact late DWA");
+    raw_server
+        .write_all(&encode_message(&answer))
+        .await
+        .expect("write exact late DWA");
+    raw_server.flush().await.expect("flush exact late DWA");
+
+    let completed = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let snapshot = observed_handle
+                .peer_session_snapshot()
+                .await
+                .expect("late DWA must retain the runtime");
+            if snapshot.watchdog_answers_observed == 1 {
+                break snapshot;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("late exact DWA must recover before the second interval");
+    assert_eq!(completed.watchdog_requests_sent, 1);
+    assert_eq!(completed.watchdog_answers_observed, 1);
+    assert!(completed.readiness.negotiated);
+}
+
+#[tokio::test]
+async fn peer_runtime_closes_after_a_second_watchdog_interval_without_retransmitting() {
+    let (_material, client, mut raw_server) = negotiated_client_with_raw_server().await;
+    let client = client
+        .into_peer_runtime(runtime_config(10))
+        .expect("start client runtime");
+    let (client_handle, mut client_incoming) = client.into_parts();
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(4)).await;
+
+    let _retained_handle = client_handle.clone();
+    let probe = tokio::spawn(async move {
+        client_handle
+            .probe_watchdog(
+                0x3260,
+                0x4260,
+                DiameterWatchdogTwinit::new(Duration::from_secs(6)).expect("valid Twinit"),
+                Instant::now() + Duration::from_secs(30),
+            )
+            .await
+    });
+    let _request_header = read_diameter_frame_header(&mut raw_server).await;
+    assert_eq!(
+        probe.await.expect("join unanswered watchdog probe"),
+        Err(DiameterPeerRuntimeError::WatchdogSuspect)
+    );
+
+    let second_interval_started = Instant::now();
+    let mut unexpected_wire = [0_u8; 1];
+    let (terminal, raw_read) = tokio::join!(
+        client_incoming.receive(),
+        raw_server.read(&mut unexpected_wire),
+    );
+    assert_eq!(
+        terminal.expect_err("the second unanswered interval must be terminal"),
+        DiameterPeerRuntimeError::DeadlineExceeded
+    );
+    assert!(
+        !matches!(raw_read, Ok(count) if count > 0),
+        "the runtime must not retransmit DWR during the grace interval"
+    );
+    let elapsed = Instant::now().saturating_duration_since(second_interval_started);
+    assert!(elapsed >= Duration::from_secs(4), "elapsed={elapsed:?}");
+    assert!(
+        elapsed <= Duration::from_millis(8_010),
+        "elapsed={elapsed:?}"
+    );
+}
+
+#[tokio::test]
+async fn peer_runtime_discards_unknown_watchdog_answers_then_rejects_wrong_end_to_end() {
+    let (_material, client, mut raw_server) = negotiated_client_with_raw_server().await;
+    let client = client
+        .into_peer_runtime(runtime_config(10))
+        .expect("start client runtime");
+    let (client_handle, _client_incoming) = client.into_parts();
+    tokio::time::sleep(Duration::from_secs(4)).await;
+
+    let observed_handle = client_handle.clone();
+    let probe = tokio::spawn(async move {
+        client_handle
+            .probe_watchdog(
+                0x3300,
+                0x4300,
+                DiameterWatchdogTwinit::new(Duration::from_secs(6)).expect("valid Twinit"),
+                Instant::now() + Duration::from_secs(30),
+            )
+            .await
+    });
+    let request_header = read_diameter_frame_header(&mut raw_server).await;
+    let hop_by_hop = u32::from_be_bytes(request_header[12..16].try_into().expect("DWR hop-by-hop"));
+    let end_to_end = u32::from_be_bytes(request_header[16..20].try_into().expect("DWR end-to-end"));
+    let answer = DeviceWatchdogAnswer {
+        result_code: RESULT_CODE_DIAMETER_SUCCESS,
+        identity: PeerIdentity::new("server.example.test", "example.test"),
+        origin_state_id: Some(20),
+        diagnostics: AnswerDiagnostics::default(),
+    };
+    let unknown = build_device_watchdog_answer(
+        &answer,
+        hop_by_hop.wrapping_add(1),
+        end_to_end,
+        EncodeContext::default(),
+    )
+    .expect("build unknown DWA");
+    for _ in 0..2 {
+        raw_server
+            .write_all(&encode_message(&unknown))
+            .await
+            .expect("write unknown DWA");
+        raw_server.flush().await.expect("flush unknown DWA");
+    }
+    let wrong_end_to_end = build_device_watchdog_answer(
+        &answer,
+        hop_by_hop,
+        end_to_end.wrapping_add(1),
+        EncodeContext::default(),
+    )
+    .expect("build wrong-end-to-end DWA");
+    raw_server
+        .write_all(&encode_message(&wrong_end_to_end))
+        .await
+        .expect("write wrong-end-to-end DWA");
+    raw_server
+        .flush()
+        .await
+        .expect("flush wrong-end-to-end DWA");
+
+    assert_eq!(
+        probe.await.expect("join mismatched watchdog probe"),
+        Err(DiameterPeerRuntimeError::TransactionMismatch)
+    );
+    assert_eq!(
+        observed_handle
+            .readiness()
+            .await
+            .expect_err("wrong end-to-end identifier is terminal"),
+        DiameterPeerRuntimeError::TransactionMismatch
+    );
+}
+
+#[tokio::test]
+async fn correlated_watchdog_answer_with_mtls_mismatched_identity_is_terminal() {
+    let (_material, client, mut raw_server) = negotiated_client_with_raw_server().await;
+    let client = client
+        .into_peer_runtime(runtime_config(10))
+        .expect("start client runtime");
+    let (client_handle, mut client_incoming) = client.into_parts();
+    tokio::time::sleep(Duration::from_secs(4)).await;
+
+    let _retained_handle = client_handle.clone();
+    let probe = tokio::spawn(async move {
+        client_handle
+            .probe_watchdog(
+                0x3340,
+                0x4340,
+                DiameterWatchdogTwinit::new(Duration::from_secs(6)).expect("valid Twinit"),
+                Instant::now() + Duration::from_secs(3),
+            )
+            .await
+    });
+    let request_header = read_diameter_frame_header(&mut raw_server).await;
+    let hop_by_hop = u32::from_be_bytes(request_header[12..16].try_into().expect("DWR hop-by-hop"));
+    let end_to_end = u32::from_be_bytes(request_header[16..20].try_into().expect("DWR end-to-end"));
+    let mismatched = build_device_watchdog_answer(
+        &DeviceWatchdogAnswer {
+            result_code: RESULT_CODE_DIAMETER_SUCCESS,
+            identity: PeerIdentity::new("other.example.test", "other.test"),
+            origin_state_id: None,
+            diagnostics: AnswerDiagnostics::default(),
+        },
+        hop_by_hop,
+        end_to_end,
+        EncodeContext::default(),
+    )
+    .expect("build identity-mismatched DWA");
+    raw_server
+        .write_all(&encode_message(&mismatched))
+        .await
+        .expect("write identity-mismatched DWA");
+    raw_server
+        .flush()
+        .await
+        .expect("flush identity-mismatched DWA");
+
+    assert_eq!(
+        probe.await.expect("join identity-mismatched watchdog"),
+        Err(DiameterPeerRuntimeError::PeerIdentityMismatch)
+    );
+    assert_eq!(
+        client_incoming
+            .receive()
+            .await
+            .expect_err("identity mismatch must deliver no application message"),
+        DiameterPeerRuntimeError::PeerIdentityMismatch
+    );
+}
+
+#[tokio::test]
+async fn local_disconnect_supersedes_an_unanswered_watchdog_after_dpr_emission() {
+    let (_material, client, mut raw_server) = negotiated_client_with_raw_server().await;
+    let client = client
+        .into_peer_runtime(runtime_config(10))
+        .expect("start client runtime");
+    let (client_handle, _client_incoming) = client.into_parts();
+    tokio::time::sleep(Duration::from_secs(4)).await;
+
+    let disconnect_handle = client_handle.clone();
+    let watchdog = tokio::spawn(async move {
+        client_handle
+            .probe_watchdog(
+                0x3350,
+                0x4350,
+                DiameterWatchdogTwinit::new(Duration::from_secs(6)).expect("valid Twinit"),
+                Instant::now() + Duration::from_secs(30),
+            )
+            .await
+    });
+    let watchdog_header = read_diameter_frame_header(&mut raw_server).await;
+    assert_eq!(
+        u32::from_be_bytes([
+            0,
+            watchdog_header[5],
+            watchdog_header[6],
+            watchdog_header[7],
+        ]),
+        PeerProcedure::DeviceWatchdog.command_code().get()
+    );
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if disconnect_handle
+                .activity()
+                .await
+                .expect("runtime activity after DWR")
+                .sequence()
+                > 0
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("runtime must commit DWR emission before disconnect");
+
+    let mut disconnect = tokio::spawn(async move {
+        disconnect_handle
+            .disconnect(
+                opc_proto_diameter::peer::DisconnectCause::Rebooting,
+                0x5550,
+                0x6650,
+                Instant::now() + Duration::from_secs(30),
+            )
+            .await
+    });
+    tokio::task::yield_now().await;
+    let disconnect_header = tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::select! {
+            result = &mut disconnect => {
+                panic!("disconnect completed before DPR emission: {result:?}")
+            }
+            header = read_diameter_frame_header(&mut raw_server) => header,
+        }
+    })
+    .await
+    .expect("local disconnect must emit DPR while DWA is pending");
+    assert_eq!(
+        u32::from_be_bytes([
+            0,
+            disconnect_header[5],
+            disconnect_header[6],
+            disconnect_header[7],
+        ]),
+        PeerProcedure::DisconnectPeer.command_code().get()
+    );
+    assert_eq!(
+        watchdog.await.expect("join superseded watchdog"),
+        Err(DiameterPeerRuntimeError::WatchdogSupersededByDisconnect)
+    );
+
+    let hop_by_hop = u32::from_be_bytes(
+        disconnect_header[12..16]
+            .try_into()
+            .expect("DPR hop-by-hop"),
+    );
+    let end_to_end = u32::from_be_bytes(
+        disconnect_header[16..20]
+            .try_into()
+            .expect("DPR end-to-end"),
+    );
+    let answer = build_disconnect_peer_answer(
+        &DisconnectPeerAnswer {
+            result_code: RESULT_CODE_DIAMETER_SUCCESS,
+            identity: PeerIdentity::new("server.example.test", "example.test"),
+            origin_state_id: Some(20),
+            diagnostics: AnswerDiagnostics::default(),
+        },
+        hop_by_hop,
+        end_to_end,
+        EncodeContext::default(),
+    )
+    .expect("build exact DPA");
+    raw_server
+        .write_all(&encode_message(&answer))
+        .await
+        .expect("write exact DPA");
+    raw_server.flush().await.expect("flush exact DPA");
+
+    assert_eq!(
+        disconnect
+            .await
+            .expect("join disconnect that superseded watchdog")
+            .expect("exact DPA completes disconnect")
+            .result_code,
+        RESULT_CODE_DIAMETER_SUCCESS
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn local_disconnect_returns_exact_dpa_after_terminal_is_observable() {
+    let (_material, client, mut raw_server) = negotiated_client_with_raw_server().await;
+    let client = client
+        .into_peer_runtime(runtime_config(10))
+        .expect("start client runtime");
+    let (client_handle, _client_incoming) = client.into_parts();
+    let observed_handle = client_handle.clone();
+    let (polling, mut polling_rx) = watch::channel(true);
+    let (paused, paused_rx) = oneshot::channel();
+    let disconnect = tokio::spawn(async move {
+        let operation = client_handle.disconnect(
+            opc_proto_diameter::peer::DisconnectCause::Rebooting,
+            0x5560,
+            0x6660,
+            Instant::now() + Duration::from_secs(3),
+        );
+        tokio::pin!(operation);
+        let mut paused = Some(paused);
+        loop {
+            let enabled = *polling_rx.borrow_and_update();
+            if !enabled {
+                if let Some(paused) = paused.take() {
+                    let _ = paused.send(());
+                }
+                polling_rx
+                    .changed()
+                    .await
+                    .expect("test polling gate remains open");
+                continue;
+            }
+            tokio::select! {
+                biased;
+                changed = polling_rx.changed() => {
+                    changed.expect("test polling gate remains open");
+                }
+                result = &mut operation => break result,
+            }
+        }
+    });
+
+    let request_header = read_diameter_frame_header(&mut raw_server).await;
+    assert_eq!(
+        u32::from_be_bytes([0, request_header[5], request_header[6], request_header[7],]),
+        PeerProcedure::DisconnectPeer.command_code().get()
+    );
+    let hop_by_hop = u32::from_be_bytes(request_header[12..16].try_into().expect("DPR hop-by-hop"));
+    let end_to_end = u32::from_be_bytes(request_header[16..20].try_into().expect("DPR end-to-end"));
+
+    polling.send_replace(false);
+    paused_rx
+        .await
+        .expect("disconnect completion polling is paused after DPR emission");
+    let expected_answer = DisconnectPeerAnswer {
+        result_code: RESULT_CODE_DIAMETER_SUCCESS,
+        identity: PeerIdentity::new("server.example.test", "example.test"),
+        origin_state_id: Some(20),
+        diagnostics: AnswerDiagnostics::default(),
+    };
+    let answer = build_disconnect_peer_answer(
+        &expected_answer,
+        hop_by_hop,
+        end_to_end,
+        EncodeContext::default(),
+    )
+    .expect("build exact DPA");
+    raw_server
+        .write_all(&encode_message(&answer))
+        .await
+        .expect("write exact DPA");
+    raw_server.flush().await.expect("flush exact DPA");
+
+    let terminal = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            match observed_handle.readiness().await {
+                Ok(_) => tokio::task::yield_now().await,
+                Err(error) => break error,
+            }
+        }
+    })
+    .await
+    .expect("exact DPA must make local disconnect terminal observable");
+    assert_eq!(
+        terminal,
+        DiameterPeerRuntimeError::PeerDisconnected { peer_cause: None }
+    );
+
+    polling.send_replace(true);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), disconnect)
+            .await
+            .expect("disconnect completion must remain bounded")
+            .expect("join local disconnect")
+            .expect("exact DPA wins over the subsequently observed terminal state"),
+        expected_answer
+    );
+}
+
+#[tokio::test]
+async fn peer_runtime_owns_exact_watchdog_request_answer_transaction() {
+    let (_material, client, server) = negotiated_direct_connections().await;
+    let client = client
+        .into_peer_runtime(runtime_config(10))
+        .expect("start client runtime");
+    let server = server
+        .into_peer_runtime(runtime_config(20))
+        .expect("start server runtime");
+    let (client_handle, _client_incoming) = client.into_parts();
+    let (server_handle, _server_incoming) = server.into_parts();
+
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let answer = client_handle
+        .probe_watchdog(
+            0x3300,
+            0x4400,
+            DiameterWatchdogTwinit::new(Duration::from_secs(6)).expect("valid Twinit"),
+            Instant::now() + Duration::from_secs(3),
+        )
+        .await
+        .expect("correlated DWA");
+    assert_eq!(answer.result_code, RESULT_CODE_DIAMETER_SUCCESS);
+    assert_eq!(answer.origin_state_id, Some(20));
+    assert!(answer
+        .identity
+        .semantically_eq(&PeerIdentity::new("server.example.test", "example.test")));
+    assert_eq!(
+        client_handle
+            .peer_session_snapshot()
+            .await
+            .expect("client snapshot")
+            .watchdog_answers_observed,
+        1
+    );
+    assert_eq!(
+        server_handle
+            .peer_session_snapshot()
+            .await
+            .expect("server snapshot")
+            .watchdog_requests_received,
+        1
+    );
+}
+
+#[tokio::test]
+async fn malformed_peer_requests_receive_exact_bound_error_answers_before_close() {
+    const UNKNOWN_MANDATORY_AVP: u32 = 65_000;
+    struct Case {
+        name: &'static str,
+        procedure: PeerProcedure,
+        avps: Vec<Bytes>,
+        result_code: u32,
+        failed_avp_code: u32,
+        exact_failed_avp: Option<Bytes>,
+    }
+
+    let origin_host = ietf_avp(AVP_ORIGIN_HOST.get(), true, b"server.example.test");
+    let origin_realm = ietf_avp(AVP_ORIGIN_REALM.get(), true, b"example.test");
+    let disconnect_cause = ietf_avp(AVP_DISCONNECT_CAUSE.get(), true, &0_u32.to_be_bytes());
+    let unsupported = ietf_avp(UNKNOWN_MANDATORY_AVP, true, &[0xde, 0xad, 0xbe, 0xef]);
+    let cases = vec![
+        Case {
+            name: "DWR missing Origin-Host",
+            procedure: PeerProcedure::DeviceWatchdog,
+            avps: vec![origin_realm.clone()],
+            result_code: RESULT_CODE_DIAMETER_MISSING_AVP,
+            failed_avp_code: AVP_ORIGIN_HOST.get(),
+            exact_failed_avp: None,
+        },
+        Case {
+            name: "DWR missing Origin-Realm",
+            procedure: PeerProcedure::DeviceWatchdog,
+            avps: vec![origin_host.clone()],
+            result_code: RESULT_CODE_DIAMETER_MISSING_AVP,
+            failed_avp_code: AVP_ORIGIN_REALM.get(),
+            exact_failed_avp: None,
+        },
+        Case {
+            name: "DPR missing Origin-Host",
+            procedure: PeerProcedure::DisconnectPeer,
+            avps: vec![origin_realm.clone(), disconnect_cause.clone()],
+            result_code: RESULT_CODE_DIAMETER_MISSING_AVP,
+            failed_avp_code: AVP_ORIGIN_HOST.get(),
+            exact_failed_avp: None,
+        },
+        Case {
+            name: "DPR missing Origin-Realm",
+            procedure: PeerProcedure::DisconnectPeer,
+            avps: vec![origin_host.clone(), disconnect_cause.clone()],
+            result_code: RESULT_CODE_DIAMETER_MISSING_AVP,
+            failed_avp_code: AVP_ORIGIN_REALM.get(),
+            exact_failed_avp: None,
+        },
+        Case {
+            name: "DPR missing Disconnect-Cause",
+            procedure: PeerProcedure::DisconnectPeer,
+            avps: vec![origin_host.clone(), origin_realm.clone()],
+            result_code: RESULT_CODE_DIAMETER_MISSING_AVP,
+            failed_avp_code: AVP_DISCONNECT_CAUSE.get(),
+            exact_failed_avp: None,
+        },
+        Case {
+            name: "DWR unsupported mandatory AVP",
+            procedure: PeerProcedure::DeviceWatchdog,
+            avps: vec![origin_host, origin_realm, unsupported.clone()],
+            result_code: RESULT_CODE_DIAMETER_AVP_UNSUPPORTED,
+            failed_avp_code: UNKNOWN_MANDATORY_AVP,
+            exact_failed_avp: Some(unsupported),
+        },
+    ];
+
+    for (index, case) in cases.into_iter().enumerate() {
+        let (_material, client, mut raw_server) = negotiated_client_with_raw_server().await;
+        let client = client
+            .into_peer_runtime(runtime_config(10))
+            .expect("start client runtime");
+        let (_client_handle, mut client_incoming) = client.into_parts();
+        let hop_by_hop = 0x7000_u32 + u32::try_from(index).expect("small case index");
+        let end_to_end = 0x8000_u32 + u32::try_from(index).expect("small case index");
+        let request = peer_request_with_avps(case.procedure, hop_by_hop, end_to_end, &case.avps);
+        raw_server
+            .write_all(&encode_message(&request))
+            .await
+            .expect("write malformed peer request");
+        raw_server
+            .flush()
+            .await
+            .expect("flush malformed peer request");
+        let response =
+            tokio::time::timeout(Duration::from_secs(2), read_diameter_frame(&mut raw_server))
+                .await
+                .unwrap_or_else(|_| panic!("{} did not receive an answer", case.name));
+
+        assert_eq!(
+            response.header.command_code, request.header.command_code,
+            "{}",
+            case.name
+        );
+        assert_eq!(
+            response.header.application_id, request.header.application_id,
+            "{}",
+            case.name
+        );
+        assert_eq!(
+            response.header.flags.is_proxiable(),
+            request.header.flags.is_proxiable(),
+            "{}",
+            case.name
+        );
+        assert!(!response.header.flags.is_request(), "{}", case.name);
+        assert!(response.header.flags.is_error(), "{}", case.name);
+        assert_eq!(
+            response.header.hop_by_hop_identifier, hop_by_hop,
+            "{}",
+            case.name
+        );
+        assert_eq!(
+            response.header.end_to_end_identifier, end_to_end,
+            "{}",
+            case.name
+        );
+
+        let borrowed = Message {
+            header: response.header.clone(),
+            raw_avps: &response.raw_avps,
+            tail: &[],
+        };
+        let (result_code, diagnostics) = match case.procedure {
+            PeerProcedure::DeviceWatchdog => {
+                let answer = parse_device_watchdog_answer(&borrowed, DecodeContext::default())
+                    .unwrap_or_else(|error| panic!("{} DWA parse failed: {error}", case.name));
+                (answer.result_code, answer.diagnostics)
+            }
+            PeerProcedure::DisconnectPeer => {
+                let answer = parse_disconnect_peer_answer(&borrowed, DecodeContext::default())
+                    .unwrap_or_else(|error| panic!("{} DPA parse failed: {error}", case.name));
+                (answer.result_code, answer.diagnostics)
+            }
+            PeerProcedure::CapabilitiesExchange => {
+                panic!("capability exchange is outside this malformed runtime test")
+            }
+        };
+        assert_eq!(result_code, case.result_code, "{}", case.name);
+        assert_eq!(diagnostics.failed_avps.len(), 1, "{}", case.name);
+        let failed_avp = &diagnostics.failed_avps[0];
+        assert!(failed_avp.len() >= 8, "{}", case.name);
+        assert_eq!(
+            u32::from_be_bytes(failed_avp[..4].try_into().expect("Failed-AVP code")),
+            case.failed_avp_code,
+            "{}",
+            case.name
+        );
+        if let Some(expected) = case.exact_failed_avp {
+            assert_eq!(failed_avp, &expected, "{}", case.name);
+        }
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), client_incoming.receive())
+                .await
+                .unwrap_or_else(|_| panic!("{} runtime did not terminate", case.name))
+                .expect_err("malformed request must close after its answer"),
+            DiameterPeerRuntimeError::InvalidControlMessage,
+            "{}",
+            case.name
+        );
+    }
+}
+
+#[tokio::test]
+async fn inbound_peer_requests_with_mtls_mismatched_identity_are_terminal() {
+    for (index, procedure) in [PeerProcedure::DeviceWatchdog, PeerProcedure::DisconnectPeer]
+        .into_iter()
+        .enumerate()
+    {
+        let (_material, client, mut raw_server) = negotiated_client_with_raw_server().await;
+        let client = client
+            .into_peer_runtime(runtime_config(10))
+            .expect("start client runtime");
+        let (_client_handle, mut client_incoming) = client.into_parts();
+        let identity = PeerIdentity::new("other.example.test", "other.test");
+        let identifier = u32::try_from(index).expect("small request index");
+        let request = match procedure {
+            PeerProcedure::DeviceWatchdog => build_device_watchdog_request(
+                &DeviceWatchdogRequest {
+                    identity,
+                    origin_state_id: None,
+                },
+                0x7100 + identifier,
+                0x8100 + identifier,
+                EncodeContext::default(),
+            )
+            .expect("build identity-mismatched DWR"),
+            PeerProcedure::DisconnectPeer => build_disconnect_peer_request(
+                &DisconnectPeerRequest {
+                    identity,
+                    disconnect_cause: opc_proto_diameter::peer::DisconnectCause::Rebooting,
+                    origin_state_id: None,
+                },
+                0x7100 + identifier,
+                0x8100 + identifier,
+                EncodeContext::default(),
+            )
+            .expect("build identity-mismatched DPR"),
+            PeerProcedure::CapabilitiesExchange => {
+                panic!("capability exchange is outside the runtime identity table")
+            }
+        };
+        raw_server
+            .write_all(&encode_message(&request))
+            .await
+            .expect("write identity-mismatched peer request");
+        raw_server
+            .flush()
+            .await
+            .expect("flush identity-mismatched peer request");
+
+        assert_eq!(
+            client_incoming
+                .receive()
+                .await
+                .expect_err("identity mismatch must deliver no application message"),
+            DiameterPeerRuntimeError::PeerIdentityMismatch,
+            "procedure={procedure:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn peer_runtime_completes_disconnect_then_reports_terminal_state() {
+    let (_material, client, server) = negotiated_direct_connections().await;
+    let client = client
+        .into_peer_runtime(runtime_config(10))
+        .expect("start client runtime");
+    let server = server
+        .into_peer_runtime(runtime_config(20))
+        .expect("start server runtime");
+    let (client_handle, _client_incoming) = client.into_parts();
+    let (server_handle, mut server_incoming) = server.into_parts();
+    server_handle
+        .set_application_quiesced_for_disconnect(true)
+        .await
+        .expect("declare server application drain");
+
+    let (answer, server_terminal) = tokio::join!(
+        client_handle.disconnect(
+            opc_proto_diameter::peer::DisconnectCause::Rebooting,
+            0x5500,
+            0x6600,
+            Instant::now() + Duration::from_secs(3),
+        ),
+        server_incoming.receive(),
+    );
+    let answer = answer.expect("correlated DPA is returned before closure");
+    assert_eq!(answer.result_code, RESULT_CODE_DIAMETER_SUCCESS);
+    assert_eq!(answer.origin_state_id, Some(20));
+    assert_eq!(
+        server_terminal.expect_err("peer DPR closes receive half"),
+        DiameterPeerRuntimeError::PeerDisconnected {
+            peer_cause: Some(opc_proto_diameter::peer::DisconnectCause::Rebooting),
+        }
+    );
+}
+
+#[tokio::test]
+async fn peer_runtime_rejects_disconnect_until_application_traffic_is_quiesced() {
+    let (_material, client, server) = negotiated_direct_connections().await;
+    let client = client
+        .into_peer_runtime(runtime_config(10))
+        .expect("start client runtime");
+    let server = server
+        .into_peer_runtime(runtime_config(20))
+        .expect("start server runtime");
+    let (client_handle, _client_incoming) = client.into_parts();
+    let (_server_handle, mut server_incoming) = server.into_parts();
+
+    let (answer, terminal) = tokio::join!(
+        client_handle.disconnect(
+            opc_proto_diameter::peer::DisconnectCause::Rebooting,
+            0x5510,
+            0x6610,
+            Instant::now() + Duration::from_secs(3),
+        ),
+        server_incoming.receive(),
+    );
+    assert_eq!(
+        answer
+            .expect("a non-quiesced peer still returns a correlated DPA")
+            .result_code,
+        RESULT_CODE_DIAMETER_UNABLE_TO_COMPLY
+    );
+    assert_eq!(
+        terminal.expect_err("peer DPR closes the receive half after DPA"),
+        DiameterPeerRuntimeError::PeerDisconnected {
+            peer_cause: Some(opc_proto_diameter::peer::DisconnectCause::Rebooting),
+        }
+    );
+}
+
+#[tokio::test]
+async fn peer_runtime_discards_unknown_disconnect_answers_then_rejects_wrong_end_to_end() {
+    let (_material, client, mut raw_server) = negotiated_client_with_raw_server().await;
+    let client = client
+        .into_peer_runtime(runtime_config(10))
+        .expect("start client runtime");
+    let (client_handle, _client_incoming) = client.into_parts();
+    let observed_handle = client_handle.clone();
+    let disconnect = tokio::spawn(async move {
+        client_handle
+            .disconnect(
+                opc_proto_diameter::peer::DisconnectCause::Rebooting,
+                0x5530,
+                0x6630,
+                Instant::now() + Duration::from_secs(3),
+            )
+            .await
+    });
+    let request_header = read_diameter_frame_header(&mut raw_server).await;
+    let hop_by_hop = u32::from_be_bytes(request_header[12..16].try_into().expect("DPR hop-by-hop"));
+    let end_to_end = u32::from_be_bytes(request_header[16..20].try_into().expect("DPR end-to-end"));
+    let answer = DisconnectPeerAnswer {
+        result_code: RESULT_CODE_DIAMETER_SUCCESS,
+        identity: PeerIdentity::new("server.example.test", "example.test"),
+        origin_state_id: Some(20),
+        diagnostics: AnswerDiagnostics::default(),
+    };
+    let unknown = build_disconnect_peer_answer(
+        &answer,
+        hop_by_hop.wrapping_add(1),
+        end_to_end,
+        EncodeContext::default(),
+    )
+    .expect("build unknown DPA");
+    for _ in 0..2 {
+        raw_server
+            .write_all(&encode_message(&unknown))
+            .await
+            .expect("write unknown DPA");
+        raw_server.flush().await.expect("flush unknown DPA");
+    }
+    let wrong_end_to_end = build_disconnect_peer_answer(
+        &answer,
+        hop_by_hop,
+        end_to_end.wrapping_add(1),
+        EncodeContext::default(),
+    )
+    .expect("build wrong-end-to-end DPA");
+    raw_server
+        .write_all(&encode_message(&wrong_end_to_end))
+        .await
+        .expect("write wrong-end-to-end DPA");
+    raw_server
+        .flush()
+        .await
+        .expect("flush wrong-end-to-end DPA");
+
+    assert_eq!(
+        disconnect.await.expect("join mismatched disconnect"),
+        Err(DiameterPeerRuntimeError::TransactionMismatch)
+    );
+    assert_eq!(
+        observed_handle
+            .readiness()
+            .await
+            .expect_err("wrong end-to-end identifier is terminal"),
+        DiameterPeerRuntimeError::TransactionMismatch
+    );
+}
+
+#[tokio::test]
+async fn correlated_disconnect_answer_with_mtls_mismatched_identity_is_terminal() {
+    let (_material, client, mut raw_server) = negotiated_client_with_raw_server().await;
+    let client = client
+        .into_peer_runtime(runtime_config(10))
+        .expect("start client runtime");
+    let (client_handle, mut client_incoming) = client.into_parts();
+    let _retained_handle = client_handle.clone();
+    let disconnect = tokio::spawn(async move {
+        client_handle
+            .disconnect(
+                opc_proto_diameter::peer::DisconnectCause::Rebooting,
+                0x5540,
+                0x6640,
+                Instant::now() + Duration::from_secs(3),
+            )
+            .await
+    });
+    let request_header = read_diameter_frame_header(&mut raw_server).await;
+    let hop_by_hop = u32::from_be_bytes(request_header[12..16].try_into().expect("DPR hop-by-hop"));
+    let end_to_end = u32::from_be_bytes(request_header[16..20].try_into().expect("DPR end-to-end"));
+    let mismatched = build_disconnect_peer_answer(
+        &DisconnectPeerAnswer {
+            result_code: RESULT_CODE_DIAMETER_SUCCESS,
+            identity: PeerIdentity::new("other.example.test", "other.test"),
+            origin_state_id: None,
+            diagnostics: AnswerDiagnostics::default(),
+        },
+        hop_by_hop,
+        end_to_end,
+        EncodeContext::default(),
+    )
+    .expect("build identity-mismatched DPA");
+    raw_server
+        .write_all(&encode_message(&mismatched))
+        .await
+        .expect("write identity-mismatched DPA");
+    raw_server
+        .flush()
+        .await
+        .expect("flush identity-mismatched DPA");
+
+    assert_eq!(
+        disconnect
+            .await
+            .expect("join identity-mismatched disconnect"),
+        Err(DiameterPeerRuntimeError::PeerIdentityMismatch)
+    );
+    assert_eq!(
+        client_incoming
+            .receive()
+            .await
+            .expect_err("identity mismatch must deliver no application message"),
+        DiameterPeerRuntimeError::PeerIdentityMismatch
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn authoritative_close_wins_over_a_late_exact_disconnect_answer() {
+    let (_material, client, mut raw_server) = negotiated_client_with_raw_server().await;
+    let client = client
+        .into_peer_runtime(runtime_config(10))
+        .expect("start client runtime");
+    let (client_handle, mut client_incoming) = client.into_parts();
+    let closing_handle = client_handle.clone();
+    let disconnect = tokio::spawn(async move {
+        client_handle
+            .disconnect(
+                opc_proto_diameter::peer::DisconnectCause::Rebooting,
+                0x5590,
+                0x6690,
+                Instant::now() + Duration::from_secs(3),
+            )
+            .await
+    });
+    let request_header = read_diameter_frame_header(&mut raw_server).await;
+    let hop_by_hop = u32::from_be_bytes(request_header[12..16].try_into().expect("DPR hop-by-hop"));
+    let end_to_end = u32::from_be_bytes(request_header[16..20].try_into().expect("DPR end-to-end"));
+    let answer = build_disconnect_peer_answer(
+        &DisconnectPeerAnswer {
+            result_code: RESULT_CODE_DIAMETER_SUCCESS,
+            identity: PeerIdentity::new("server.example.test", "example.test"),
+            origin_state_id: Some(20),
+            diagnostics: AnswerDiagnostics::default(),
+        },
+        hop_by_hop,
+        end_to_end,
+        EncodeContext::default(),
+    )
+    .expect("build exact late DPA");
+    let answer_wire = encode_message(&answer);
+
+    let ((), late_write) = tokio::join!(
+        biased;
+        closing_handle.close(),
+        async {
+            raw_server.write_all(&answer_wire).await?;
+            raw_server.flush().await
+        },
+    );
+    drop(late_write);
+    assert_eq!(
+        disconnect.await.expect("join closed local disconnect"),
+        Err(DiameterPeerRuntimeError::Closed)
+    );
+    assert_eq!(
+        client_incoming
+            .receive()
+            .await
+            .expect_err("authoritative close must remain the public winner"),
+        DiameterPeerRuntimeError::Closed
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn authoritative_close_wins_over_a_late_peer_disconnect_cause() {
+    let (_material, client, mut raw_server) = negotiated_client_with_raw_server().await;
+    let client = client
+        .into_peer_runtime(runtime_config(10))
+        .expect("start client runtime");
+    let (client_handle, mut client_incoming) = client.into_parts();
+    let request = build_disconnect_peer_request(
+        &DisconnectPeerRequest {
+            identity: PeerIdentity::new("server.example.test", "example.test"),
+            disconnect_cause: opc_proto_diameter::peer::DisconnectCause::Busy,
+            origin_state_id: Some(20),
+        },
+        0x55a0,
+        0x66a0,
+        EncodeContext::default(),
+    )
+    .expect("build valid late peer DPR");
+    let request_wire = encode_message(&request);
+
+    let ((), late_write) = tokio::join!(
+        biased;
+        client_handle.close(),
+        async {
+            raw_server.write_all(&request_wire).await?;
+            raw_server.flush().await
+        },
+    );
+    drop(late_write);
+    assert_eq!(
+        client_incoming
+            .receive()
+            .await
+            .expect_err("late peer DPR must not replace the authoritative close"),
+        DiameterPeerRuntimeError::Closed
+    );
+}
+
+#[tokio::test]
+async fn admitted_application_traffic_clears_disconnect_quiescence() {
+    let (_material, client, server) = negotiated_direct_connections().await;
+    let client = client
+        .into_peer_runtime(runtime_config(10))
+        .expect("start client runtime");
+    let server = server
+        .into_peer_runtime(runtime_config(20))
+        .expect("start server runtime");
+    let (client_handle, _client_incoming) = client.into_parts();
+    let (server_handle, mut server_incoming) = server.into_parts();
+    server_handle
+        .set_application_quiesced_for_disconnect(true)
+        .await
+        .expect("declare server application drain");
+
+    let application = application_request();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let (sent, received) = tokio::join!(
+        client_handle.send_application(application.clone(), deadline),
+        server_incoming.receive(),
+    );
+    sent.expect("send admitted application request");
+    assert_eq!(
+        received
+            .expect("receive admitted application request")
+            .into_message(),
+        application
+    );
+
+    let (answer, terminal) = tokio::join!(
+        client_handle.disconnect(
+            opc_proto_diameter::peer::DisconnectCause::Rebooting,
+            0x5520,
+            0x6620,
+            Instant::now() + Duration::from_secs(3),
+        ),
+        server_incoming.receive(),
+    );
+    assert_eq!(
+        answer
+            .expect("post-traffic disconnect returns a correlated DPA")
+            .result_code,
+        RESULT_CODE_DIAMETER_UNABLE_TO_COMPLY
+    );
+    assert_eq!(
+        terminal.expect_err("peer DPR closes the receive half after DPA"),
+        DiameterPeerRuntimeError::PeerDisconnected {
+            peer_cause: Some(opc_proto_diameter::peer::DisconnectCause::Rebooting),
+        }
+    );
+}
+
+#[tokio::test]
+async fn dropping_application_receiver_terminally_closes_runtime() {
+    let (_material, client, server) = negotiated_direct_connections().await;
+    let client = client
+        .into_peer_runtime(runtime_config(10))
+        .expect("start client runtime");
+    let server = server
+        .into_peer_runtime(runtime_config(20))
+        .expect("start server runtime");
+    let (_client_handle, mut client_incoming) = client.into_parts();
+    let (_server_handle, server_incoming) = server.into_parts();
+
+    drop(server_incoming);
+    let error = tokio::time::timeout(Duration::from_secs(1), client_incoming.receive())
+        .await
+        .expect("peer observes receiver-drop closure")
+        .expect_err("receiver drop must not leave a live peer");
+    assert!(matches!(
+        error,
+        DiameterPeerRuntimeError::Transport(_)
+            | DiameterPeerRuntimeError::Closed
+            | DiameterPeerRuntimeError::PeerDisconnected { .. }
+    ));
+}
+
+#[tokio::test]
+async fn dropping_all_command_handles_terminally_closes_runtime() {
+    let (_material, client, server) = negotiated_direct_connections().await;
+    let client = client
+        .into_peer_runtime(runtime_config(10))
+        .expect("start client runtime");
+    let server = server
+        .into_peer_runtime(runtime_config(20))
+        .expect("start server runtime");
+    let (_client_handle, mut client_incoming) = client.into_parts();
+    let (server_handle, _server_incoming) = server.into_parts();
+
+    drop(server_handle);
+    let error = tokio::time::timeout(Duration::from_secs(1), client_incoming.receive())
+        .await
+        .expect("peer observes last-handle closure")
+        .expect_err("dropping every command handle must not leave a read-only peer alive");
+    assert!(matches!(
+        error,
+        DiameterPeerRuntimeError::Transport(_)
+            | DiameterPeerRuntimeError::Closed
+            | DiameterPeerRuntimeError::PeerDisconnected { .. }
+    ));
+}
+
+#[tokio::test]
+async fn cancelling_enqueued_operation_terminally_closes_runtime() {
+    let (_material, client, _server) = negotiated_direct_connections().await;
+    let client = client
+        .into_peer_runtime(runtime_config(10))
+        .expect("start client runtime");
+    let (client_handle, mut client_incoming) = client.into_parts();
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let operation = tokio::spawn(async move {
+        client_handle
+            .probe_watchdog(
+                0x7700,
+                0x8800,
+                DiameterWatchdogTwinit::new(Duration::from_secs(6)).expect("valid Twinit"),
+                Instant::now() + Duration::from_secs(3),
+            )
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    operation.abort();
+    let _ = operation.await;
+
+    let error = tokio::time::timeout(Duration::from_secs(1), client_incoming.receive())
+        .await
+        .expect("cancelled operation closes runtime")
+        .expect_err("cancelled enqueued operation must be terminal");
+    assert!(matches!(
+        error,
+        DiameterPeerRuntimeError::Transport(_) | DiameterPeerRuntimeError::Closed
+    ));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn abort_and_await_closes_retained_handle_synchronously() {
+    let (_material, client, mut raw_server) = negotiated_client_with_raw_server().await;
+    let client = client
+        .into_peer_runtime(runtime_config(10))
+        .expect("start client runtime");
+    let (client_handle, _client_incoming) = client.into_parts();
+    let retained_handle = client_handle.clone();
+    tokio::time::sleep(Duration::from_secs(4)).await;
+
+    let operation = tokio::spawn(async move {
+        client_handle
+            .probe_watchdog(
+                0x7710,
+                0x8810,
+                DiameterWatchdogTwinit::new(Duration::from_secs(6)).expect("valid Twinit"),
+                Instant::now() + Duration::from_secs(3),
+            )
+            .await
+    });
+    let request_header = read_diameter_frame_header(&mut raw_server).await;
+    assert_eq!(
+        u32::from_be_bytes([0, request_header[5], request_header[6], request_header[7],]),
+        PeerProcedure::DeviceWatchdog.command_code().get()
+    );
+
+    operation.abort();
+    assert!(operation
+        .await
+        .expect_err("aborted watchdog task must be cancelled")
+        .is_cancelled());
+    assert_eq!(
+        retained_handle
+            .readiness()
+            .await
+            .expect_err("abort+await must synchronously close retained readiness"),
+        DiameterPeerRuntimeError::Closed
+    );
+    assert_eq!(
+        retained_handle
+            .peer_session_snapshot()
+            .await
+            .expect_err("abort+await must synchronously close retained snapshots"),
+        DiameterPeerRuntimeError::Closed
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn abort_and_await_does_not_release_an_already_buffered_application() {
+    let (_material, client, mut raw_server) = negotiated_client_with_raw_server().await;
+    let client = client
+        .into_peer_runtime(runtime_config(10))
+        .expect("start client runtime");
+    let (client_handle, mut client_incoming) = client.into_parts();
+    let retained_handle = client_handle.clone();
+
+    let application = application_request();
+    let watchdog = build_device_watchdog_request(
+        &DeviceWatchdogRequest {
+            identity: PeerIdentity::new("server.example.test", "example.test"),
+            origin_state_id: Some(20),
+        },
+        0x7720,
+        0x8820,
+        EncodeContext::default(),
+    )
+    .expect("build ordering-barrier DWR");
+    raw_server
+        .write_all(&encode_message(&application))
+        .await
+        .expect("write application frame to be buffered");
+    raw_server
+        .write_all(&encode_message(&watchdog))
+        .await
+        .expect("write ordering-barrier DWR");
+    raw_server
+        .flush()
+        .await
+        .expect("flush buffered application and DWR");
+    let answer_header = read_diameter_frame_header(&mut raw_server).await;
+    assert_eq!(
+        u32::from_be_bytes([0, answer_header[5], answer_header[6], answer_header[7],]),
+        PeerProcedure::DeviceWatchdog.command_code().get(),
+        "receiving DWA proves the preceding application was processed"
+    );
+
+    let operation = tokio::spawn(async move {
+        client_handle
+            .disconnect(
+                opc_proto_diameter::peer::DisconnectCause::Rebooting,
+                0x7730,
+                0x8830,
+                Instant::now() + Duration::from_secs(3),
+            )
+            .await
+    });
+    let request_header = read_diameter_frame_header(&mut raw_server).await;
+    assert_eq!(
+        u32::from_be_bytes([0, request_header[5], request_header[6], request_header[7],]),
+        PeerProcedure::DisconnectPeer.command_code().get()
+    );
+
+    operation.abort();
+    assert!(operation
+        .await
+        .expect_err("aborted disconnect task must be cancelled")
+        .is_cancelled());
+    assert_eq!(
+        retained_handle
+            .readiness()
+            .await
+            .expect_err("abort+await must synchronously close the retained handle"),
+        DiameterPeerRuntimeError::Closed
+    );
+    assert_eq!(
+        client_incoming
+            .receive()
+            .await
+            .expect_err("buffered application must not cross the cancellation boundary"),
+        DiameterPeerRuntimeError::Closed
     );
 }

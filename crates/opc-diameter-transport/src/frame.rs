@@ -1,4 +1,3 @@
-#[cfg(test)]
 use bytes::Bytes;
 use bytes::BytesMut;
 use opc_proto_diameter::{Header, OwnedMessage, DIAMETER_HEADER_LEN, MAX_U24};
@@ -97,6 +96,48 @@ where
         .map_err(|_| DiameterTlsError::DeadlineExceeded)?
         .map_err(|_| DiameterTlsError::Transport)?;
 
+    read_frame_body(reader, header_wire, limits, deadline).await
+}
+
+/// Read one runtime frame without treating an entirely idle connection as a
+/// partial frame. Once the first header octet arrives, the rest of the frame
+/// must complete within `completion_timeout` and before `hard_deadline`.
+pub(crate) async fn read_runtime_frame<R>(
+    reader: &mut R,
+    limits: DiameterFrameLimits,
+    completion_timeout: std::time::Duration,
+    hard_deadline: Instant,
+) -> Result<OwnedMessage, DiameterTlsError>
+where
+    R: AsyncRead + Unpin + ?Sized,
+{
+    let mut header_wire = [0_u8; DIAMETER_HEADER_LEN];
+    tokio::time::timeout_at(hard_deadline, reader.read_exact(&mut header_wire[..1]))
+        .await
+        .map_err(|_| DiameterTlsError::DeadlineExceeded)?
+        .map_err(|_| DiameterTlsError::Transport)?;
+    let completion_deadline = Instant::now()
+        .checked_add(completion_timeout)
+        .map_or(hard_deadline, |deadline| deadline.min(hard_deadline));
+    tokio::time::timeout_at(
+        completion_deadline,
+        reader.read_exact(&mut header_wire[1..]),
+    )
+    .await
+    .map_err(|_| DiameterTlsError::DeadlineExceeded)?
+    .map_err(|_| DiameterTlsError::Transport)?;
+    read_frame_body(reader, header_wire, limits, completion_deadline).await
+}
+
+async fn read_frame_body<R>(
+    reader: &mut R,
+    header_wire: [u8; DIAMETER_HEADER_LEN],
+    limits: DiameterFrameLimits,
+    deadline: Instant,
+) -> Result<OwnedMessage, DiameterTlsError>
+where
+    R: AsyncRead + Unpin + ?Sized,
+{
     // Reject reserved fixed-header bits before trusting the declared length or
     // allocating/awaiting the body. The final opaque message decode below
     // deliberately remains HeaderOnly; typed command parsers own AVP grammar.
@@ -159,6 +200,12 @@ where
     if usize::try_from(header.length).ok() != Some(wire.len()) {
         return Err(DiameterTlsError::InvalidFrame);
     }
+    // Tokio's timeout future polls its inner future first. Reject an already
+    // expired absolute deadline before constructing that future so a
+    // synchronously ready stream cannot emit bytes after expiry.
+    if Instant::now() >= deadline {
+        return Err(DiameterTlsError::DeadlineExceeded);
+    }
     tokio::time::timeout_at(deadline, async {
         writer.write_all(wire).await?;
         writer.flush().await
@@ -176,7 +223,6 @@ pub(crate) fn borrowed(message: &OwnedMessage) -> opc_proto_diameter::Message<'_
     }
 }
 
-#[cfg(test)]
 pub(crate) fn encoded_bytes(
     message: &OwnedMessage,
     limits: DiameterFrameLimits,
@@ -293,6 +339,32 @@ mod tests {
         assert_eq!(error, DiameterTlsError::Transport);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn runtime_partial_frame_must_complete_before_its_bounded_deadline() {
+        let (mut writer, mut reader) = tokio::io::duplex(128);
+        writer
+            .write_all(&[1])
+            .await
+            .expect("write the first Diameter header octet");
+
+        let read = tokio::spawn(async move {
+            read_runtime_frame(
+                &mut reader,
+                DiameterFrameLimits::default(),
+                Duration::from_secs(5),
+                Instant::now() + Duration::from_secs(60),
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+
+        assert_eq!(
+            read.await.expect("join bounded partial-frame read"),
+            Err(DiameterTlsError::DeadlineExceeded)
+        );
+    }
+
     #[tokio::test]
     async fn opaque_framing_preserves_repeatable_avps_for_typed_parsers() {
         let duplicate_avps = [
@@ -328,6 +400,26 @@ mod tests {
         .await
         .expect_err("invalid frame must fail");
         assert_eq!(error, DiameterTlsError::InvalidFrame);
+        drop(writer);
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output).await.expect("drain output");
+        assert!(output.is_empty());
+    }
+
+    #[tokio::test]
+    async fn raw_write_rejects_an_expired_deadline_without_output() {
+        let message = message_with_payload(&[]);
+        let wire = encoded_bytes(&message, DiameterFrameLimits::default()).expect("encode");
+        let (mut writer, mut reader) = tokio::io::duplex(128);
+        let error = write_wire_frame(
+            &mut writer,
+            &wire,
+            DiameterFrameLimits::default(),
+            Instant::now(),
+        )
+        .await
+        .expect_err("expired write must fail before polling the stream");
+        assert_eq!(error, DiameterTlsError::DeadlineExceeded);
         drop(writer);
         let mut output = Vec::new();
         reader.read_to_end(&mut output).await.expect("drain output");

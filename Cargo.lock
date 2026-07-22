@@ -2526,6 +2526,7 @@ dependencies = [
  "opc-protocol",
  "opc-tls",
  "opc-types",
+ "rand 0.10.2",
  "rcgen",
  "rustls-pki-types",
  "thiserror 2.0.18",
