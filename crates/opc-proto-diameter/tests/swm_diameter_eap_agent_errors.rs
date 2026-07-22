@@ -6,7 +6,7 @@ use bytes::BytesMut;
 use opc_proto_diameter::apps::swm::{
     self, SwmDiameterEapAgentDeliveryFailure, SwmDiameterEapCorrelationError,
     SwmDiameterEapGenericErrorAnswer, SwmDiameterEapRequestEnvelope, SwmDiameterEapResponse,
-    SwmDiameterResult, SwmDiameterTransaction, SwmExpectedAnswerPeer,
+    SwmDiameterResult, SwmExpectedAnswerPeer,
 };
 use opc_proto_diameter::apps::VENDOR_ID_3GPP;
 use opc_proto_diameter::dictionary::AvpKey;
@@ -926,25 +926,13 @@ fn diagnostics_redact_origin_session_proxy_and_connection_values() {
 }
 
 #[test]
-fn public_result_mapping_is_exact() {
+fn originated_result_codes_are_exact() {
     assert_eq!(
-        SwmDiameterEapAgentDeliveryFailure::from_result_code(
-            base::RESULT_CODE_DIAMETER_UNABLE_TO_DELIVER,
-        ),
-        Some(SwmDiameterEapAgentDeliveryFailure::UnableToDeliver),
+        SwmDiameterEapAgentDeliveryFailure::UnableToDeliver.result_code(),
+        base::RESULT_CODE_DIAMETER_UNABLE_TO_DELIVER,
     );
     assert_eq!(
-        SwmDiameterEapAgentDeliveryFailure::from_result_code(base::RESULT_CODE_DIAMETER_TOO_BUSY,),
-        Some(SwmDiameterEapAgentDeliveryFailure::TooBusy),
-    );
-    for unsupported in [3001, 3003, 3005, swm::DIAMETER_REDIRECT_INDICATION, 5005] {
-        assert_eq!(
-            SwmDiameterEapAgentDeliveryFailure::from_result_code(unsupported),
-            None,
-        );
-    }
-    assert_eq!(
-        SwmDiameterTransaction::new(HOP_BY_HOP, END_TO_END).hop_by_hop_identifier(),
-        HOP_BY_HOP,
+        SwmDiameterEapAgentDeliveryFailure::TooBusy.result_code(),
+        base::RESULT_CODE_DIAMETER_TOO_BUSY,
     );
 }

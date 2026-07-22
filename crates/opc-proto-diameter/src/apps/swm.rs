@@ -1477,9 +1477,7 @@ pub enum SwmDiameterEapAgentDeliveryFailure {
 }
 
 impl SwmDiameterEapAgentDeliveryFailure {
-    /// Parse an exact RFC 6733 agent-delivery result code.
-    #[must_use]
-    pub const fn from_result_code(result_code: u32) -> Option<Self> {
+    const fn from_result_code(result_code: u32) -> Option<Self> {
         match result_code {
             base::RESULT_CODE_DIAMETER_UNABLE_TO_DELIVER => Some(Self::UnableToDeliver),
             base::RESULT_CODE_DIAMETER_TOO_BUSY => Some(Self::TooBusy),
