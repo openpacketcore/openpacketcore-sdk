@@ -429,6 +429,56 @@ location fails; a received location without a timestamp is tolerated and an
 originated omission requires typed evidence. Location/timestamp source,
 freshness, authorization use, and logging/export policy remain product-owned.
 
+#### SWm DEA subscriber/equipment trace context
+
+The finite SWm trace surface implements TS 29.273 V19.2 sections 7.2.2.1.2 and
+8.2.3.13/14 using the TS 29.272 V19.5 grouped definitions and the current
+Release-18 TS 32.422 bitmaps. `Trace-Info` is forbidden on DER and optional
+singleton on both baseline and projected-profile command-268 DEA. It carries
+exactly one `Trace-Data` activation. Direct `Trace-Reference` deactivation is
+rejected in this boundary because TS 29.273 assigns that form to the separate
+command-265 Authorization Answer.
+
+| AVP | Presence and wire identity | Typed SDK surface | Positive / negative evidence |
+|:----|:---------------------------|:------------------|:-----------------------------|
+| `Trace-Info` | 3GPP 10415/1505, `Grouped`, V set/M/P clear; DEA 0-1, DER forbidden | `SwmDiameterEapAnswer::set_trace_info` / `clear_trace_info`; raw received presence through `has_trace_info`; correlated typed data through `SwmCorrelatedDiameterEapResponse::trace_info` and `SwmTraceInfo::data` | A synthetic activation fixture built from test-local literal trace AVP codes proves the command-specific shape and parsed-envelope replay; a separate assertion checks the production registry constants. Duplicate, wrong vendor/flags, empty, direct deactivation, misnested and DER occurrences fail. |
+| `Trace-Data` | 3GPP 10415/1458, `Grouped`, V/M set and P clear; activation singleton | `SwmTraceData` | Typed construction and test-local literal-code synthetic fixtures cover canonical child order, all mandatory children, optional fields and bounded nested extensions. Missing/duplicate required children, known-child foreign-vendor collisions and wrong nesting fail. |
+| `Trace-Reference` | 3GPP 10415/1459, `OctetString`, V/M set and P clear; exactly six octets containing TS 24.008 PLMN plus Trace ID | `SwmTraceReference` | The nested activation form round trips. A direct command-268 child, wrong width, invalid PLMN nibbles, flags/vendor and duplicates fail; diagnostics redact the value. |
+| `Trace-Depth` | 3GPP 10415/1462, `Enumerated`, V/M set and P clear; activation singleton | all six assigned `SwmTraceDepth` variants | Values 0..=5 parse and encode; unknown values and wrong width/flags/vendor fail. |
+| `Trace-NE-Type-List` | 3GPP 10415/1463, `OctetString`, V/M set and P clear; optional singleton; Release-18 three-octet PDN-GW selection is exactly `00 01 00` | `SwmTraceData::with_explicit_pdn_gateway_target` / `has_explicit_pdn_gateway_target` | Omission means PDN-GW activation; omission and the exact explicit bitmap round trip, while wrong length or any other NE bit fails. |
+| `Trace-Interface-List` | 3GPP 10415/1464, `OctetString`, V/M set and P clear; optional singleton; Release-18 width 23 octets, PGW octet 11 uses S2a/S2b/S2c/S5/S6b/Gx/S8b/SGi masks `01/02/04/08/10/20/40/80` | `SwmPgwTraceInterfaces` | Omission requests all listed PGW interfaces. Zero and each exact individual bit-to-accessor/encoder mapping are covered. Wrong width or any non-PGW octet fails. |
+| `Trace-Event-List` | 3GPP 10415/1465, `OctetString`, V/M set and P clear; required singleton; TS 32.422 V18.5 §5.1 overview spans 17 octets and assigns PGW to the high nibble of shared PGW/SGW octet 9, using creation/termination/bearer masks `10/20/40` | `SwmPgwTraceEvents` | Zero, every individual event and combined `70` are covered. Wrong width, reserved/SGW bits in octet 9, or any other octet fails. |
+| `Trace-Collection-Entity` | 3GPP 10415/1452, Diameter `Address`, V/M set and P clear; required singleton | `SwmTraceData::collection_entity` | Independent IPv4 and IPv6 fixtures cover exact family/width; malformed family/length/flags/vendor and duplicates fail. Diagnostics redact the address. |
+| `Trace-Reporting-Consumer-Uri` | 3GPP 10415/1727, `DiameterURI`, V set/M/P clear; optional singleton. TS 29.272 delegates this value to TS 32.422/32.158 HTTP(S) Trace Reporting MnS syntax rather than RFC 6733 `aaa`/`aaas` routing URI syntax. | `SwmTraceReportingConsumerUri` / `SwmTraceData::with_reporting_consumer_uri` | Accepted/rejected literal fixtures cover case-insensitive schemes, DNS/IPv4/bracketed IPv6 authorities, usable ports, optional roots, required three-segment suffix shape, percent escapes, dot/empty segments, userinfo, query/fragment, ASCII and the documented 2048-octet SDK bound. Diagnostics redact the URI. |
+
+The M values in the table are canonical encoding values. Per TS 29.273 table
+7.2.3.1/1 note 2 and table 7.2.3.1/2 note 2, the decoder ignores an M-bit
+mismatch on every understood trace AVP, while continuing to enforce V, P,
+vendor identity, type, length and cardinality. Raw tests toggle M on
+`Trace-Info`, `Trace-Data`, and every known child and prove canonical re-encode.
+
+Unknown well-formed M-clear children at both grouped levels follow
+`UnknownIePolicy`: `Preserve` retains them in received order within the shared
+128-entry and `max_message_len` budget, `Drop` discards them, and `Reject`
+fails. Unknown M-set children always fail. Group depth and direct child counts
+honor `DecodeContext`; retained values expose count metadata only.
+
+Raw parsed answers intentionally expose trace presence only. Typed trace data
+is exposed after authenticated connection generation, both transaction
+identifiers, P, ordered Proxy-Info, Session-Id, application fields and expected
+Origin all match the retained DER. Receive-derived references, endpoints and
+activation data keep sealed provenance through clone, so a direct clone cannot
+be re-originated or transplanted; immutable parsed-envelope replay emits a
+canonical reconstruction. Parser-retained unknown optional AVPs keep their
+exact bytes and relative order in the trailing extension position. A caller can
+deliberately reconstruct fresh values through the validated public constructors,
+which is an explicit downstream policy action.
+The command table conditions `Trace-Info` on subscriber/equipment trace having
+been activated in the HSS; the SDK does not infer product authorization from
+its presence or replace the separately modeled Diameter result. Whether to
+accept, authorize, execute, persist or stop a trace, endpoint trust/TLS, DNS,
+reporting transport, retention and audit remain downstream product policy.
+
 #### SWm Diameter-EAP generic error and routing scope
 
 Diameter-EAP responses are selected by the header E bit. E-clear messages use

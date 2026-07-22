@@ -1,4 +1,9 @@
-use std::{error::Error, num::NonZeroU64, sync::OnceLock};
+use std::{
+    error::Error,
+    net::{IpAddr, Ipv4Addr},
+    num::NonZeroU64,
+    sync::OnceLock,
+};
 
 use opc_crypto_provider::ProviderPolicy;
 use opc_evidence::{
@@ -21,8 +26,9 @@ use opc_proto_diameter::apps::swm::{
     SwmDiameterConnectionToken, SwmDiameterEapAnswer, SwmDiameterEapRequest, SwmDiameterResult,
     SwmE164Number, SwmEmergencyAuthorizationEvidence, SwmEmergencyAuthorizationPath,
     SwmEmergencyServices, SwmExpectedAnswerPeer, SwmMpsPriority, SwmMultiRoundTimeout,
-    SwmSubscriptionId, SwmTerminalInformation, SwmUeUsageType,
-    APPLICATION_ID as SWM_APPLICATION_ID, COMMAND_DIAMETER_EAP,
+    SwmPgwTraceEvents, SwmPgwTraceInterfaces, SwmSubscriptionId, SwmTerminalInformation,
+    SwmTraceData, SwmTraceDepth, SwmTraceInfo, SwmTraceReference, SwmTraceReportingConsumerUri,
+    SwmUeUsageType, APPLICATION_ID as SWM_APPLICATION_ID, COMMAND_DIAMETER_EAP,
 };
 use opc_proto_diameter::Message as DiameterMessage;
 use opc_proto_gtpv2c::{
@@ -721,6 +727,123 @@ fn epdg_swm_multi_round_timeout_uses_the_authenticated_current_request_boundary(
             .map(SwmMultiRoundTimeout::seconds),
         Some(12),
     );
+
+    Ok(())
+}
+
+#[test]
+fn epdg_swm_trace_context_uses_the_authenticated_response_boundary() -> Result<(), Box<dyn Error>> {
+    let request = SwmDiameterEapRequest {
+        session_id: "epdg-a.example;trace;1".into(),
+        auth_application_id: SWM_APPLICATION_ID.get(),
+        origin_host: "epdg-a.example".into(),
+        origin_realm: "visited.example".into(),
+        destination_realm: "home.example".into(),
+        destination_host: Some("aaa-a.example".into()),
+        user_name: None,
+        rat_type: None,
+        service_selection: None,
+        mip6_feature_vector: None,
+        qos_capability: None,
+        visited_network_identifier: None,
+        aaa_failure_indication: None,
+        supported_features: Vec::new(),
+        ue_local_ip_address: None,
+        oc_supported_features: None,
+        auth_request_type: AuthRequestType::AuthorizeAuthenticate,
+        eap_payload: vec![2, 0x2b, 0, 5, 1].into(),
+        emergency_services: None,
+        terminal_information: None,
+        high_priority_access_info: None,
+        state_avps: Vec::new(),
+        route_records: Vec::new(),
+        extensions: Default::default(),
+    };
+    let request_owned = build_swm_diameter_eap_request(
+        &request,
+        0x1000_002b,
+        0x2000_002b,
+        EncodeContext::default(),
+    )?;
+    let request_message = DiameterMessage {
+        header: request_owned.header.clone(),
+        raw_avps: &request_owned.raw_avps,
+        tail: &[],
+    };
+    let connection = SwmDiameterConnectionToken::new(NonZeroU64::MIN);
+    let request_envelope =
+        parse_swm_diameter_eap_request_envelope(&request_message, DecodeContext::conservative())?
+            .with_expected_answer_peer(SwmExpectedAnswerPeer::direct(
+                connection,
+                "aaa-a.example",
+                "home.example",
+            ));
+
+    let trace_data = SwmTraceData::new(
+        SwmTraceReference::new([0x21, 0xf3, 0x54, 0, 0, 1])?,
+        SwmTraceDepth::Medium,
+        SwmPgwTraceEvents::new(true, true, true),
+        IpAddr::V4(Ipv4Addr::new(192, 0, 2, 44)),
+    )?
+    .with_explicit_pdn_gateway_target()
+    .with_interfaces(SwmPgwTraceInterfaces::new(
+        false, true, false, false, false, false, true, false,
+    ))
+    .with_reporting_consumer_uri(SwmTraceReportingConsumerUri::new(
+        "https://collector.example/TraceReportingMnS/v1800/traceRecords",
+    )?)?;
+    let mut answer = SwmDiameterEapAnswer {
+        session_id: request.session_id.clone(),
+        auth_application_id: SWM_APPLICATION_ID.get(),
+        auth_request_type: AuthRequestType::AuthorizeAuthenticate,
+        result: SwmDiameterResult::Base(2_001),
+        origin_host: "aaa-a.example".into(),
+        origin_realm: "home.example".into(),
+        user_name: None,
+        subscriber_authorization: Default::default(),
+        mip6_feature_vector: None,
+        supported_features: Vec::new(),
+        oc_supported_features: None,
+        oc_olr: None,
+        load_reports: Vec::new(),
+        service_selection: None,
+        default_context_identifier: None,
+        apn_configurations: Vec::new(),
+        mobile_node_identifier: None,
+        session_timeout: None,
+        multi_round_timeout: None,
+        authorization_lifetime: None,
+        auth_grace_period: None,
+        re_auth_request_type: None,
+        eap_payload: Some(vec![3, 0x2b, 0, 4].into()),
+        eap_reissued_payload: None,
+        error_message: None,
+        state_avps: Vec::new(),
+        eap_master_session_key: None,
+        extensions: Default::default(),
+    };
+    answer.set_trace_info(SwmTraceInfo::activation(trace_data)?)?;
+    let answer_owned =
+        build_swm_diameter_eap_answer_for(&request_envelope, &answer, EncodeContext::default())?;
+    let answer_message = DiameterMessage {
+        header: answer_owned.header.clone(),
+        raw_avps: &answer_owned.raw_avps,
+        tail: &[],
+    };
+    let response = parse_swm_diameter_eap_response_envelope_from_connection(
+        &answer_message,
+        connection,
+        DecodeContext::conservative(),
+    )?;
+    let correlated = request_envelope.correlate_response(response)?;
+    let trace_data = correlated
+        .trace_info()
+        .ok_or("trace context is absent")?
+        .data();
+    assert!(trace_data.events().traces_bearer_lifecycle());
+    assert!(trace_data
+        .interfaces()
+        .is_some_and(SwmPgwTraceInterfaces::includes_s2b));
 
     Ok(())
 }

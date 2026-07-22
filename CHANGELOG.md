@@ -23,6 +23,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Diagnostic surfaces expose no packet bytes or IKE SPIs. Sending, source
   admission, rate limiting, protected-message handling, and retransmission
   caching remain product-owned (#470).
+- **Typed, correlation-gated SWm DEA trace context — `opc-proto-diameter`:**
+  command-268 `Trace-Info` now has a strict activation model for the TS 29.273
+  PDN-GW profile. Direct `Trace-Reference` deactivation remains outside this
+  Diameter-EAP Answer boundary because it belongs to command-265 Authorization
+  Answer. The model covers validated trace references and depth, the current
+  Release-18 17-octet event and 23-octet interface bitmaps (including S8b),
+  optional explicit PDN-GW targeting, IPv4/IPv6 collection entities, and a
+  bounded strict TS 32.158 HTTP(S) reporting-consumer URI profile. DER role,
+  V/P flags, vendor identity, widths, cardinality, nesting,
+  unknown mandatory children and shared retention budgets fail closed. Raw
+  understood-AVP M-bit mismatches are accepted as TS 29.273 requires and
+  canonicalized on re-encode.
+  Raw answers expose presence only; received data requires authenticated
+  request/response correlation and retains sealed provenance that prevents
+  direct clone-based transplantation or re-origination. Callers may explicitly
+  reconstruct a fresh validated value when their own policy authorizes it, and
+  parsed-envelope replay stays available for canonical endpoint rebuilding.
+  All trace identity, address,
+  endpoint and bitmap material remains redacted. Trace authorization,
+  reporting transport, endpoint trust/TLS, persistence and lifecycle remain
+  product-owned (#352).
 - **Typed SWm/IKEv2 authorization-rejection wire helpers —
   `opc-proto-diameter`, `opc-proto-ikev2`:** the Diameter base registry now
   names RFC 6733 `DIAMETER_AUTHORIZATION_REJECTED` as 5003, and

@@ -131,6 +131,35 @@ charging decisions, watchdog policy, or a carrier-ready EPC/ePDG product claim.
   public mutator; ordinary construction and transplantation fail closed, and a
   caller adapting facts must construct a fresh complete value with
   `SwmAccessNetworkInfo::try_new`.
+  DEA also supports the finite TS 29.273 command-268 `Trace-Info` activation
+  profile for a PDN-GW. Direct `Trace-Reference` deactivation is rejected here
+  because it belongs to the separate command-265 Authorization Answer. The
+  typed model covers the six-octet trace reference,
+  all six trace-depth values, the Release-18 17-octet PGW event bitmap,
+  optional 23-octet PGW interface bitmap (including S8b), optional explicit
+  PDN-GW NE bitmap, IPv4/IPv6 collection entity, and optional TS 32.158
+  reporting-consumer URI. Zero event/interface selections are valid. The URI
+  validator accepts case-insensitive HTTP(S), DNS/IPv4/bracketed-IPv6
+  authorities, optional usable ports and optional root path segments; it
+  requires MnS name/version plus a resource segment and rejects userinfo,
+  queries, fragments, empty/dot segments, legacy numeric IPv4 aliases,
+  encoded delimiters/control/traversal ambiguity, malformed escapes,
+  non-ASCII input, and values over the SDK's 2048-octet resource bound. This is syntax
+  validation only: endpoint authorization, DNS, TLS, reachability, trace
+  policy, and collection lifecycle remain product-owned.
+  Known received trace AVPs ignore an M-bit mismatch as required by
+  TS 29.273 tables 7.2.3.1/1 and 7.2.3.1/2, note 2; encoding always emits the
+  canonical M bit while V, P, vendor identity, shape and cardinality remain strict.
+  Raw answers expose only `has_trace_info`; correlated typed data is available
+  only through `SwmCorrelatedDiameterEapResponse::trace_info` after
+  authenticated connection generation and complete request/answer
+  correlation. Receive-derived trace references, endpoints and directives
+  retain sealed provenance across clones and direct clones cannot be
+  transplanted into a newly originated answer. A caller may explicitly
+  reconstruct fresh validated values when its own policy authorizes a new
+  trace. Immutable parsed-envelope replay remains available for canonical
+  endpoint rebuilding. Trace references, collection addresses,
+  reporting endpoints and bitmap values are redacted from diagnostics.
   DER and DEA also expose distinct, sealed parser-populated `extensions`
   collections for the trailing command wildcard. `UnknownIePolicy::Preserve`
   retains at most 128 command-unmodeled optional M-clear AVPs in received
@@ -255,6 +284,44 @@ charging decisions, watchdog policy, or a carrier-ready EPC/ePDG product claim.
       Ok(())
   }
   ```
+
+  A trusted AAA originator can attach a fresh trace directive without raw AVP
+  construction:
+
+  ```rust
+  use std::net::{IpAddr, Ipv4Addr};
+  use opc_proto_diameter::apps::swm::{
+      SwmDiameterEapAnswer, SwmPgwTraceEvents, SwmPgwTraceInterfaces,
+      SwmTraceData, SwmTraceDepth, SwmTraceInfo, SwmTraceReference,
+      SwmTraceReportingConsumerUri,
+  };
+
+  fn add_trace(answer: &mut SwmDiameterEapAnswer) -> Result<(), Box<dyn std::error::Error>> {
+      let reference = SwmTraceReference::new([0x21, 0xf3, 0x54, 0, 0, 1])?;
+      let endpoint = SwmTraceReportingConsumerUri::new(
+          "https://collector.example/TraceReportingMnS/v1800/traceRecords",
+      )?;
+      let data = SwmTraceData::new(
+          reference,
+          SwmTraceDepth::Medium,
+          SwmPgwTraceEvents::new(true, true, true),
+          IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
+      )?
+      .with_explicit_pdn_gateway_target()
+      .with_interfaces(SwmPgwTraceInterfaces::new(
+          false, true, false, false, false, false, true, false,
+      ))
+      .with_reporting_consumer_uri(endpoint)?;
+      answer.set_trace_info(SwmTraceInfo::activation(data)?)?;
+      Ok(())
+  }
+  ```
+
+  On receive, first bind the parsed response to its authenticated connection
+  and retained DER with `correlate_response`; only then inspect
+  `correlated_response.trace_info().map(SwmTraceInfo::data)`. Presence reports
+  typed protocol data, not authorization to execute a trace; keep result and
+  trace policy decisions downstream.
 
   Civic location uses `SwmCivicLocationInformation` and
   `SwmCivicLocationData`; `with_civic_location` requires both values and their
