@@ -530,6 +530,71 @@ fn set_success_timers(answer: &mut SwmDiameterEapAnswer) {
 
 Diagnostics expose only timer presence.
 
+### SWm DEA serving and emergency gateway context
+
+`SwmDiameterEapAnswer::gateway_context()` exposes parsed RFC 5447
+`MIP6-Agent-Info` and 3GPP `Emergency-Info` as redaction-safe typed wire facts.
+The shared `SwmMip6AgentInfo` model retains up to two home-agent addresses in
+wire order, an optional `Destination-Realm`/`Destination-Host` indirection,
+an optional 17-octet IPv6 home-link prefix, and bounded optional extension
+children. Address presence has RFC selection precedence over host identity,
+but the host is not discarded. Public `Debug` output reports only counts and
+presence.
+
+Top-level `MIP6-Agent-Info` identifies the Serving-GW only for chained S2b-S8.
+Nested `Emergency-Info` identifies the dynamically allocated emergency PDN-GW
+only for the authenticated, non-roaming, HSS-derived condition and an emergency
+DER. Both require exact base `DIAMETER_SUCCESS`. The request-bound construction
+API names these conditions instead of accepting raw provenance booleans:
+
+```rust
+use opc_proto_diameter::apps::swm::{
+    build_swm_diameter_eap_answer_for_with_gateway_context,
+    SwmDiameterEapAnswer, SwmDiameterEapRequestEnvelope, SwmMip6AgentInfo,
+    SwmRequestBoundDeaGatewayContext,
+};
+use opc_protocol::EncodeContext;
+
+fn build_chained_answer(
+    request: &SwmDiameterEapRequestEnvelope,
+    answer: &SwmDiameterEapAnswer,
+    serving_gateway: SwmMip6AgentInfo,
+) -> Result<opc_proto_diameter::OwnedMessage, opc_protocol::EncodeError> {
+    let context = SwmRequestBoundDeaGatewayContext::chained_s2b_s8(
+        request,
+        serving_gateway,
+    );
+    build_swm_diameter_eap_answer_for_with_gateway_context(
+        request,
+        answer,
+        &context,
+        EncodeContext::default(),
+    )
+}
+```
+
+Parsed identities are intentionally not authorization evidence. On a live
+client connection, parse with
+`parse_swm_diameter_eap_response_envelope_from_connection`, correlate through
+`SwmDiameterEapRequestEnvelope::correlate_response`, and only then call
+`authorize_chained_s2b_s8_gateway` or
+`authorize_authenticated_non_roaming_emergency_gateway` with the corresponding
+caller-assertion token on the resulting `SwmCorrelatedDiameterEapResponse`.
+That path checks the authenticated connection generation as well as exact
+message/result/request correlation. The consumer remains responsible for
+establishing the routing, authentication, roaming, and HSS-provenance
+assertions. The answer-envelope correlation API remains available to a trusted
+server-side/originated boundary, but it is not a substitute for transport peer
+authentication on received network traffic.
+
+Canonical builders set M on every `MIP6-Agent-Info`. TS 29.272/29.273 require
+receivers that understand this reused AVP to ignore an M-bit mismatch, so both
+M values are accepted at DEA top level and inside `Emergency-Info`; V and P
+remain prohibited. `Emergency-Info` sets vendor 10415, clears P, and accepts
+either standards-permitted M value. Unknown optional grouped children follow
+`UnknownIePolicy` and share the DEA retention count/byte budget; unknown
+mandatory children fail closed.
+
 ### SWm Diameter-EAP generic errors, routing, and redirect
 
 `parse_swm_diameter_eap_response` selects the response grammar from the

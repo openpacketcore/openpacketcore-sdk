@@ -273,6 +273,33 @@ boundary. Explicit zero means unlimited and is therefore not smaller than a
 positive `Authorization-Lifetime`. Timeout enforcement, re-authorization
 scheduling, and teardown remain product policy.
 
+The finite DEA serving/emergency gateway rows are modeled through one shared
+canonical RFC 5447 codec. Parsed values are inspectable wire facts only;
+acting on them from received network traffic requires authenticated connection
+generation plus exact transaction/application/session/proxy correlation and a
+named caller assertion at the trusted product boundary. The authenticated
+`SwmCorrelatedDiameterEapResponse` is the production client path.
+
+| AVP | TS/IETF presence | Wire identity and cardinality | Typed SDK surface | Positive / negative evidence |
+|:----|:-----------------|:------------------------------|:------------------|:-----------------------------|
+| Top-level `MIP6-Agent-Info` | DEA Serving-GW only for chained S2b-S8 and exact `DIAMETER_SUCCESS` | IETF 486, Grouped, singleton in SWm DEA; V/P clear; canonical emission uses the defining M setting, while TS 29.273's SWm re-use table 7.2.3.1/2 note 2 makes an understood inbound M mismatch non-fatal | `SwmDeaGatewayContext::chained_s2b_s8_serving_gateway` / `SwmMip6AgentInfo` | Independent M-set/M-clear fixtures parse. Request-bound construction emits M set. Wrong vendor/P, duplicate outer AVPs, empty identity, non-success results, and unbound re-origination fail. |
+| `MIP-Home-Agent-Address` | At least one address or host is required | IETF 334, Address, zero to two in one Agent-Info, V/P clear and M set | ordered `SwmMip6AgentInfo::home_agent_addresses` | IPv4/IPv6 and two same-family addresses preserve wire order. A third address, wrong family/length/flags/vendor, and truncation fail. Addresses take selection precedence without discarding the host. |
+| `MIP-Home-Agent-Host` | Optional identity indirection | IETF 348, Grouped singleton; exactly one nonempty ASCII IETF `Destination-Realm` and one `Destination-Host`; V/P clear and M set | `SwmMipHomeAgentHost` | Host-only and address-plus-host fixtures parse; missing/empty/duplicate children, duplicate host groups, wrong flags/vendor, and unknown mandatory children fail. Diagnostics never reveal either identity. |
+| `MIP6-Home-Link-Prefix` | Optional | IETF 125, OctetString singleton, exactly one prefix-length octet plus 16 IPv6 octets; V/P clear and M set | `SwmMip6HomeLinkPrefix` | Prefixes 0 through 128 with zero trailing bits are representable. Wrong width, length above 128, nonzero host bits, duplicates, and wrong flags/vendor fail. Diagnostics redact the prefix. |
+| `Emergency-Info` | DEA emergency PDN-GW only for an emergency DER, authenticated non-roaming user, HSS provenance, and exact `DIAMETER_SUCCESS` | 3GPP 1687/vendor 10415, Grouped singleton; V set/P clear/M may; exactly one usable nested `MIP6-Agent-Info` is required by the defining prose | `SwmDeaGatewayContext::emergency_info` / `SwmEmergencyInfo` | Both outer M values and nested Agent-Info M-set/M-clear fixtures parse; canonical emission uses outer M clear and nested M set. Missing/duplicate nested identity, wrong vendor/P, non-emergency construction, result mismatch, and request-binding mismatch fail. |
+
+Every grouped level caps direct children at 128. Preserved unknown optional
+children share the existing DEA-wide `DiameterEapRetention` 128-entry and
+`DecodeContext::max_message_len` byte budgets, including mixed top-level and
+nested input; unknown mandatory children always fail. Exact address, host,
+prefix, extension, and emergency values are absent from errors and diagnostics.
+For received client traffic, `SwmCorrelatedDiameterEapResponse` adds the
+authenticated connection-generation check. The trusted server-side/originated
+`SwmCorrelatedDiameterEapExchange` helper assumes its caller already owns that
+transport boundary.
+The SDK does not infer chained routing, roaming status, authentication, HSS
+provenance, or gateway selection policy.
+
 #### SWm Diameter-EAP generic error and routing scope
 
 Diameter-EAP responses are selected by the header E bit. E-clear messages use
