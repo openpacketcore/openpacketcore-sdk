@@ -29,11 +29,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   redacted. Application-only DEA AVPs are rejected for these two profiles;
   valid generic wildcard and foreign-vendor optional AVPs retain bounded RFC
   6733 handling. Result 3004 additionally requires a DER with Destination-Host.
-  Received delivery failures require the exact DER Session-Id and become
-  actionable only after the transport atomically consumes the
+  Received delivery failures require the exact DER Session-Id and a separately
+  configured, ASCII-case-insensitive match to the authenticated dialed-DRA
+  Origin pair; plain routed bindings carry no such authority and fail closed.
+  They become actionable only after the transport atomically consumes the
   connection-generation/Hop-by-Hop pending entry and the complete request
   envelope correlates. Parsed generic answers remain non-reoriginatable
-  (#464).
+  (#464). Downstream exhaustive matches on `SwmDiameterEapCorrelationError`
+  must add arms for `AgentAuthorityMissing` and `AgentIdentityMismatch`.
 - **Typed request-bound SWm DEA gateway context — `opc-proto-diameter`:**
   SWm DEA now parses canonical RFC 5447 `MIP6-Agent-Info` for the chained
   S2b-S8 Serving-GW and 3GPP `Emergency-Info` for the HSS-derived emergency

@@ -2122,7 +2122,11 @@ impl SwmDiameterEapRequestEnvelope {
     ///
     /// This is the only API that exposes parsed redirect targets. It checks
     /// connection generation, both transaction identifiers, P, exact ordered
-    /// Proxy-Info, and Session-Id when the generic grammar carried it.
+    /// Proxy-Info, and Session-Id when the generic grammar carried it. Exact
+    /// 3002/3004 delivery failures require Session-Id plus the separately
+    /// configured authenticated-agent Origin pair. The transport must
+    /// atomically consume the matching pending entry before calling this
+    /// codec-level correlation step.
     pub fn correlate_response(
         self,
         response: SwmDiameterEapResponseEnvelope,
@@ -2366,6 +2370,10 @@ pub enum SwmDiameterEapCorrelationError {
     ProxyInfoMismatch,
     /// Session-Id correlation failed.
     SessionMismatch,
+    /// A 3002/3004 answer has no authenticated agent Origin authority.
+    AgentAuthorityMissing,
+    /// A 3002/3004 answer does not match the authenticated agent Origin.
+    AgentIdentityMismatch,
     /// An ordinary answer violates its trusted logical-origin policy.
     PeerIdentityMismatch,
     /// Ordinary application correlation fields are inconsistent.
@@ -2383,6 +2391,8 @@ impl SwmDiameterEapCorrelationError {
             Self::ProxiableMismatch => "swm_dea_proxiable_mismatch",
             Self::ProxyInfoMismatch => "swm_dea_proxy_info_mismatch",
             Self::SessionMismatch => "swm_dea_session_mismatch",
+            Self::AgentAuthorityMissing => "swm_dea_agent_authority_missing",
+            Self::AgentIdentityMismatch => "swm_dea_agent_identity_mismatch",
             Self::PeerIdentityMismatch => "swm_dea_peer_identity_mismatch",
             Self::ApplicationMismatch => "swm_dea_application_mismatch",
         }
@@ -2432,9 +2442,10 @@ impl SwmCorrelatedDiameterEapResponse {
     /// other generic 3xxx result return `None`. Reaching this method proves the
     /// response arrived on the authenticated connection generation to which
     /// the DER was dispatched and matched its transaction, P bit, required
-    /// Session-Id, and ordered Proxy-Info chain. The caller must still
-    /// atomically consume its transport pending entry before treating this
-    /// structurally correlated value as live.
+    /// Session-Id, ordered Proxy-Info chain, and separately configured exact
+    /// authenticated-agent Origin pair. The transport must atomically consume
+    /// its pending entry before correlation; a codec envelope alone cannot
+    /// prove liveness or make a duplicate actionable.
     #[must_use]
     pub fn agent_delivery_failure(&self) -> Option<SwmDiameterEapAgentDeliveryFailure> {
         match self.response.response() {
@@ -9173,6 +9184,14 @@ fn ensure_correlated_response(
                 != Some(request_envelope.request.session_id.as_ref())
             {
                 return Err(SwmDiameterEapCorrelationError::SessionMismatch);
+            }
+            match expected_peer.matches_authenticated_agent_origin(
+                answer.origin_host.as_ref(),
+                answer.origin_realm.as_ref(),
+            ) {
+                None => return Err(SwmDiameterEapCorrelationError::AgentAuthorityMissing),
+                Some(false) => return Err(SwmDiameterEapCorrelationError::AgentIdentityMismatch),
+                Some(true) => {}
             }
         }
     }
