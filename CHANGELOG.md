@@ -8,6 +8,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Bounded Diameter TLS/TCP transport — `opc-diameter-transport`:** adds an
+  experimental transport crate for direct TLS-before-Diameter and same-stream
+  in-band CER/CEA-then-TLS sequencing. Exact bounded framing avoids read-ahead,
+  strictly rejects reserved command bits before body allocation, and leaves
+  repeatable AVPs to strict typed CER/CEA parsing. Every operation uses an
+  absolute deadline, and the connection admits commands only through the exact
+  `PeerSessionGeneration`. Direct connection-owned role methods build the
+  connector's canonical CER, strictly commit its correlated full or minimal
+  protocol-error CEA, and prepare the acceptor's sole canonical CEA. Explicit
+  non-success outcomes are delivered before both sides fail closed; generic
+  send/receive is application-message-only and cannot bypass CER/CEA or expose
+  a half-functional watchdog/disconnect path. TLS 1.3 mutual authentication
+  requires the exact configured certificate SPIFFE ID and an ASCII-case-
+  insensitive semantic match for the parsed CER/CEA `Origin-Host`/
+  `Origin-Realm`; configured, originated, and received peer DiameterIdentity
+  values share a nonempty-ASCII contract. Client `ServerName` is routing/SNI
+  input rather than authorization evidence; SPIFFE identity remains the
+  authority and a DNS SAN is not required. Malformed capability messages remain distinct
+  from a successfully parsed identity mismatch. Typed evidence retains the
+  negotiated version/cipher, admitted credential epoch, peer identity, and
+  protection sequence without exposing them through error or debug text.
+  Cipher policy filters the rustls provider before handshake advertisement and
+  defensively checks negotiated evidence; TLS-1.2-only offers now fail during
+  the handshake rather than reaching post-negotiation protocol rejection.
+  Resumption, early data, tickets,
+  half-RTT data, and HTTP ALPN defaults are disabled. Frame-operation
+  cancellation, I/O, authentication, and framing failures synchronously revoke
+  the exact generation and full-close TCP. Admitted trust/material replacement,
+  source loss, local or peer certificate expiry,
+  and a bounded maximum connection age retire even idle sockets, while a
+  rejected candidate retaining the same usable epoch preserves the connection.
+  Admission, I/O, and owned redaction-safe readiness/snapshot accessors also
+  reconcile authoritative material and age synchronously, closing the
+  immediate update race and revoking the exact generation before release.
+  Ordinary healthy handle drop synchronously full-closes TCP even without
+  retirement-task scheduling. Unchecked borrowed or mutable `PeerSession`
+  access is not exposed.
+  This slice exposes a sequential connection handle and does not yet provide a
+  concurrent read/write split or actor for a normal full-duplex
+  Diameter/watchdog loop. It also does not implement simultaneous-open winner
+  election, realm routing, listener/reconnect policy, DTLS/SCTP, or SCTP PPID
+  47, and makes no complete RFC 6733 or product-readiness claim (#348).
 - **Explicit IKEv2 legacy-interoperability suites — `opc-proto-ikev2`:**
   executable typed support now covers MODP-768/1024 (Transform IDs 1/2),
   PRF-HMAC-SHA1 (2), and AUTH-HMAC-SHA1-96 (2) across admitted-provider

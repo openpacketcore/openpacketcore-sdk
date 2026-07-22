@@ -322,6 +322,7 @@ pub struct TlsMaterialController {
 ///
 /// The receiver exposes only the redaction-safe status. Source identity,
 /// certificate and key material never cross this boundary.
+#[derive(Clone)]
 pub struct TlsMaterialStatusReceiver {
     controller: TlsMaterialController,
     source_rx: MaterialSourceReceiver,

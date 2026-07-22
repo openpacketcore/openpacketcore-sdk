@@ -2517,6 +2517,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "opc-diameter-transport"
+version = "0.2.0"
+dependencies = [
+ "bytes",
+ "opc-identity",
+ "opc-proto-diameter",
+ "opc-protocol",
+ "opc-tls",
+ "opc-types",
+ "rcgen",
+ "rustls-pki-types",
+ "thiserror 2.0.18",
+ "time",
+ "tokio",
+ "tokio-rustls",
+]
+
+[[package]]
 name = "opc-evidence"
 version = "0.2.0"
 dependencies = [

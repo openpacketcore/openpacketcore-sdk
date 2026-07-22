@@ -216,6 +216,10 @@ Peer helpers include:
   behavior while reporting neither mutually authenticated evidence nor
   protected readiness.
 - Optional answer diagnostics (`Error-Message`, raw `Failed-AVP` values).
+- Base peer `Origin-Host` and `Origin-Realm` use the shared nonempty-ASCII
+  DiameterIdentity contract on both typed encode and parse. Authorization and
+  generation binding compare these values ASCII case-insensitively without
+  imposing a narrower punctuation or DNS-label grammar.
 - Provenance-aware CER, DWR, and DPR request parsers; their legacy forms return
   byte-for-byte equivalent `DecodeError` values.
 - Unknown AVP handling in typed peer/application parsers: mandatory unknown
@@ -1468,4 +1472,7 @@ The following are outside the current crate scope:
   machines, AAA/HSS/CDF behavior, charging decisions, and deployment readiness
   policy. The peer state machine consumes a caller assertion only after the
   transport performs mutual authentication; it does not claim cryptographic
-  proof or a complete protected transport.
+  proof or a complete protected transport. The sibling
+  `opc-diameter-transport` crate supplies a bounded TLS/TCP adapter; it does not
+  change this codec crate's scope and does not claim DTLS/SCTP or
+  simultaneous-open winner election.
