@@ -15,8 +15,10 @@
 //! context, request-bound canonical RFC 5447 serving/emergency gateway
 //! context, typed redaction-safe top-level DEA subscriber facts, typed sealed
 //! SWm DEA WLAN access/civic-location context with a location-bound last-known
-//! timestamp, and a bounded, request-conditioned complete SWm APN authorization
-//! surface with sealed extension retention, its default Context-Identifier,
+//! timestamp, typed correlation-gated SWm subscriber/equipment trace
+//! activation for the Release-18 PDN-GW profile, and a
+//! bounded, request-conditioned complete SWm APN authorization surface with
+//! sealed extension retention, its default Context-Identifier,
 //! Service-Selection, and the TS 29.273 emergency attach sequence. The
 //! top-level default pointer is accepted under the DEA
 //! extension-AVP wildcard; it is not part of the baseline SWm DEA command ABNF.
@@ -32,6 +34,8 @@
 //!
 //! @spec 3GPP TS29273
 //! @spec 3GPP TS29272 7.3
+//! @spec 3GPP TS32422 5
+//! @spec 3GPP TS32158 4.4.3
 //! @spec IETF RFC4072
 //! @spec IETF RFC5778
 //! @spec IETF RFC7683
@@ -68,6 +72,7 @@ mod dea_authorization;
 mod lifecycle;
 mod location;
 mod mobility;
+mod trace;
 
 pub use super::subscription_id::{
     AVP_SUBSCRIPTION_ID, AVP_SUBSCRIPTION_ID_DATA, AVP_SUBSCRIPTION_ID_TYPE,
@@ -78,6 +83,7 @@ pub use dea_authorization::*;
 pub use lifecycle::*;
 pub use location::*;
 pub use mobility::*;
+pub use trace::*;
 
 /// 3GPP SWm application identifier.
 pub const APPLICATION_ID: ApplicationId = ApplicationId::new(16_777_264);
@@ -236,7 +242,7 @@ pub const APPLICATION: ApplicationDefinition = ApplicationDefinition::new(
     SpecRef::new("3gpp", "TS29273", "SWm Diameter application"),
 );
 
-static SWM_REQUEST_AVP_RULES: [CommandAvpRule; 39] = [
+static SWM_REQUEST_AVP_RULES: [CommandAvpRule; 40] = [
     CommandAvpRule::new(
         AvpKey::ietf(base::AVP_SESSION_ID),
         AvpCardinality::ZeroOrOne,
@@ -359,6 +365,10 @@ static SWM_REQUEST_AVP_RULES: [CommandAvpRule; 39] = [
         AvpCardinality::Forbidden,
     ),
     CommandAvpRule::new(
+        AvpKey::vendor(AVP_TRACE_INFO, VENDOR_ID_3GPP),
+        AvpCardinality::Forbidden,
+    ),
+    CommandAvpRule::new(
         AvpKey::ietf(base::AVP_PROXY_INFO),
         AvpCardinality::ZeroOrMore,
     ),
@@ -368,7 +378,7 @@ static SWM_REQUEST_AVP_RULES: [CommandAvpRule; 39] = [
     ),
 ];
 
-static SWM_ANSWER_AVP_RULES: [CommandAvpRule; 43] = [
+static SWM_ANSWER_AVP_RULES: [CommandAvpRule; 44] = [
     CommandAvpRule::new(AvpKey::ietf(AVP_STATE), AvpCardinality::ZeroOrMore),
     CommandAvpRule::new(
         AvpKey::ietf(base::AVP_RESULT_CODE),
@@ -514,9 +524,13 @@ static SWM_ANSWER_AVP_RULES: [CommandAvpRule; 43] = [
         AvpKey::vendor(AVP_MPS_PRIORITY, VENDOR_ID_3GPP),
         AvpCardinality::ZeroOrOne,
     ),
+    CommandAvpRule::new(
+        AvpKey::vendor(AVP_TRACE_INFO, VENDOR_ID_3GPP),
+        AvpCardinality::ZeroOrOne,
+    ),
 ];
 
-static SWM_PROJECTED_PROFILE_ANSWER_AVP_RULES: [CommandAvpRule; 43] = [
+static SWM_PROJECTED_PROFILE_ANSWER_AVP_RULES: [CommandAvpRule; 44] = [
     CommandAvpRule::new(AvpKey::ietf(AVP_STATE), AvpCardinality::ZeroOrMore),
     CommandAvpRule::new(
         AvpKey::ietf(base::AVP_RESULT_CODE),
@@ -660,6 +674,10 @@ static SWM_PROJECTED_PROFILE_ANSWER_AVP_RULES: [CommandAvpRule; 43] = [
     ),
     CommandAvpRule::new(
         AvpKey::vendor(AVP_MPS_PRIORITY, VENDOR_ID_3GPP),
+        AvpCardinality::ZeroOrOne,
+    ),
+    CommandAvpRule::new(
+        AvpKey::vendor(AVP_TRACE_INFO, VENDOR_ID_3GPP),
         AvpCardinality::ZeroOrOne,
     ),
 ];
@@ -879,6 +897,44 @@ static EMERGENCY_INFO_AVP_RULES: [CommandAvpRule; 1] = [CommandAvpRule::new(
     AvpCardinality::ZeroOrOne,
 )];
 
+static TRACE_INFO_AVP_RULES: [CommandAvpRule; 1] = [CommandAvpRule::new(
+    AvpKey::vendor(AVP_TRACE_DATA, VENDOR_ID_3GPP),
+    // The dictionary cardinality model records singleton/repeatability. The
+    // command-specific parser below separately enforces mandatory presence.
+    AvpCardinality::ZeroOrOne,
+)];
+
+static TRACE_DATA_AVP_RULES: [CommandAvpRule; 7] = [
+    CommandAvpRule::new(
+        AvpKey::vendor(AVP_TRACE_REFERENCE, VENDOR_ID_3GPP),
+        AvpCardinality::ZeroOrOne,
+    ),
+    CommandAvpRule::new(
+        AvpKey::vendor(AVP_TRACE_DEPTH, VENDOR_ID_3GPP),
+        AvpCardinality::ZeroOrOne,
+    ),
+    CommandAvpRule::new(
+        AvpKey::vendor(AVP_TRACE_NE_TYPE_LIST, VENDOR_ID_3GPP),
+        AvpCardinality::ZeroOrOne,
+    ),
+    CommandAvpRule::new(
+        AvpKey::vendor(AVP_TRACE_INTERFACE_LIST, VENDOR_ID_3GPP),
+        AvpCardinality::ZeroOrOne,
+    ),
+    CommandAvpRule::new(
+        AvpKey::vendor(AVP_TRACE_EVENT_LIST, VENDOR_ID_3GPP),
+        AvpCardinality::ZeroOrOne,
+    ),
+    CommandAvpRule::new(
+        AvpKey::vendor(AVP_TRACE_COLLECTION_ENTITY, VENDOR_ID_3GPP),
+        AvpCardinality::ZeroOrOne,
+    ),
+    CommandAvpRule::new(
+        AvpKey::vendor(AVP_TRACE_REPORTING_CONSUMER_URI, VENDOR_ID_3GPP),
+        AvpCardinality::ZeroOrOne,
+    ),
+];
+
 /// SWm Diameter-EAP-Request command definition.
 pub const COMMAND_DIAMETER_EAP_REQUEST: CommandDefinition = CommandDefinition::new(
     COMMAND_DIAMETER_EAP,
@@ -917,7 +973,7 @@ pub const COMMAND_DIAMETER_EAP_ANSWER_PROJECTED_PROFILE: CommandDefinition =
     )
     .with_avp_rules(&SWM_PROJECTED_PROFILE_ANSWER_AVP_RULES);
 
-const SWM_AVPS: [AvpDefinition; 77] = [
+const SWM_AVPS: [AvpDefinition; 86] = [
     AvpDefinition::new(
         AvpKey::ietf(AVP_EAP_PAYLOAD),
         "EAP-Payload",
@@ -1000,6 +1056,107 @@ const SWM_AVPS: [AvpDefinition; 77] = [
         SpecRef::new("3gpp", "TS29272", "7.3.210"),
     )
     .with_grouped_avp_rules(&EMERGENCY_INFO_AVP_RULES),
+    AvpDefinition::new(
+        AvpKey::vendor(AVP_TRACE_INFO, VENDOR_ID_3GPP),
+        "Trace-Info",
+        AvpDataType::Grouped,
+        AvpFlagRules::new(
+            FlagRequirement::MustBeSet,
+            FlagRequirement::MustBeUnset,
+            FlagRequirement::MustBeUnset,
+        ),
+        SpecRef::new("3gpp", "TS29273", "8.2.3.13"),
+    )
+    .with_grouped_avp_rules(&TRACE_INFO_AVP_RULES),
+    AvpDefinition::new(
+        AvpKey::vendor(AVP_TRACE_DATA, VENDOR_ID_3GPP),
+        "Trace-Data",
+        AvpDataType::Grouped,
+        AvpFlagRules::new(
+            FlagRequirement::MustBeSet,
+            FlagRequirement::MustBeSet,
+            FlagRequirement::MustBeUnset,
+        ),
+        SpecRef::new("3gpp", "TS29272", "7.3.63"),
+    )
+    .with_grouped_avp_rules(&TRACE_DATA_AVP_RULES),
+    AvpDefinition::new(
+        AvpKey::vendor(AVP_TRACE_REFERENCE, VENDOR_ID_3GPP),
+        "Trace-Reference",
+        AvpDataType::OctetString,
+        AvpFlagRules::new(
+            FlagRequirement::MustBeSet,
+            FlagRequirement::MustBeSet,
+            FlagRequirement::MustBeUnset,
+        ),
+        SpecRef::new("3gpp", "TS29272", "7.3.64"),
+    ),
+    AvpDefinition::new(
+        AvpKey::vendor(AVP_TRACE_DEPTH, VENDOR_ID_3GPP),
+        "Trace-Depth",
+        AvpDataType::Enumerated,
+        AvpFlagRules::new(
+            FlagRequirement::MustBeSet,
+            FlagRequirement::MustBeSet,
+            FlagRequirement::MustBeUnset,
+        ),
+        SpecRef::new("3gpp", "TS29272", "7.3.67"),
+    ),
+    AvpDefinition::new(
+        AvpKey::vendor(AVP_TRACE_NE_TYPE_LIST, VENDOR_ID_3GPP),
+        "Trace-NE-Type-List",
+        AvpDataType::OctetString,
+        AvpFlagRules::new(
+            FlagRequirement::MustBeSet,
+            FlagRequirement::MustBeSet,
+            FlagRequirement::MustBeUnset,
+        ),
+        SpecRef::new("3gpp", "TS29272", "7.3.68"),
+    ),
+    AvpDefinition::new(
+        AvpKey::vendor(AVP_TRACE_INTERFACE_LIST, VENDOR_ID_3GPP),
+        "Trace-Interface-List",
+        AvpDataType::OctetString,
+        AvpFlagRules::new(
+            FlagRequirement::MustBeSet,
+            FlagRequirement::MustBeSet,
+            FlagRequirement::MustBeUnset,
+        ),
+        SpecRef::new("3gpp", "TS29272", "7.3.69"),
+    ),
+    AvpDefinition::new(
+        AvpKey::vendor(AVP_TRACE_EVENT_LIST, VENDOR_ID_3GPP),
+        "Trace-Event-List",
+        AvpDataType::OctetString,
+        AvpFlagRules::new(
+            FlagRequirement::MustBeSet,
+            FlagRequirement::MustBeSet,
+            FlagRequirement::MustBeUnset,
+        ),
+        SpecRef::new("3gpp", "TS29272", "7.3.70"),
+    ),
+    AvpDefinition::new(
+        AvpKey::vendor(AVP_TRACE_COLLECTION_ENTITY, VENDOR_ID_3GPP),
+        "Trace-Collection-Entity",
+        AvpDataType::Address,
+        AvpFlagRules::new(
+            FlagRequirement::MustBeSet,
+            FlagRequirement::MustBeSet,
+            FlagRequirement::MustBeUnset,
+        ),
+        SpecRef::new("3gpp", "TS29272", "7.3.98"),
+    ),
+    AvpDefinition::new(
+        AvpKey::vendor(AVP_TRACE_REPORTING_CONSUMER_URI, VENDOR_ID_3GPP),
+        "Trace-Reporting-Consumer-Uri",
+        AvpDataType::DiameterUri,
+        AvpFlagRules::new(
+            FlagRequirement::MustBeSet,
+            FlagRequirement::MustBeUnset,
+            FlagRequirement::MustBeUnset,
+        ),
+        SpecRef::new("3gpp", "TS29272", "7.3.252"),
+    ),
     AvpDefinition::new(
         AvpKey::vendor(AVP_APN_OI_REPLACEMENT, VENDOR_ID_3GPP),
         "APN-OI-Replacement",
@@ -2851,6 +3008,25 @@ impl SwmCorrelatedDiameterEapResponse {
             })
     }
 
+    /// Borrow correlated typed command-268 trace activation data.
+    ///
+    /// This value is available only after authenticated connection-generation,
+    /// exact Origin, transaction, application, session, P-bit, and Proxy-Info
+    /// correlation. The raw DEA surface exposes presence only. This accessor
+    /// does not authorize executing the trace: result handling, endpoint trust,
+    /// and trace policy remain product-owned. Cloning this receive-derived
+    /// value does not make that clone valid for a new origination; canonical
+    /// replay remains available only through the parsed envelope. A caller may
+    /// explicitly reconstruct fresh values through validated public
+    /// constructors when its own policy authorizes a new trace.
+    #[must_use]
+    pub fn trace_info(&self) -> Option<&SwmTraceInfo> {
+        let SwmDiameterEapResponse::Application(answer) = self.response() else {
+            return None;
+        };
+        answer.extensions.trace_info.as_ref()
+    }
+
     /// Return the timeout that applies to the current `EAP-Payload` Request.
     ///
     /// A value is actionable only after complete authenticated response
@@ -2956,6 +3132,7 @@ impl fmt::Debug for SwmCorrelatedDiameterEapResponse {
             .field("response", &self.response())
             .field("redirect_present", &self.redirect().is_some())
             .field("wlan_location_present", &self.wlan_location().is_some())
+            .field("trace_info_present", &self.trace_info().is_some())
             .field(
                 "current_eap_request_timeout_present",
                 &self.current_eap_request_timeout().is_some(),
@@ -4479,6 +4656,7 @@ pub struct SwmDiameterEapAnswerExtensions {
     access_network_info: Option<SwmAccessNetworkInfo>,
     user_location_info_time: Option<SwmUserLocationInfoTime>,
     user_location_info_time_omission: Option<SwmUserLocationInfoTimeOmission>,
+    trace_info: Option<SwmTraceInfo>,
 }
 
 impl SwmDiameterEapAnswerExtensions {
@@ -4525,6 +4703,7 @@ impl fmt::Debug for SwmDiameterEapAnswerExtensions {
                 "user_location_info_time_omission_present",
                 &self.user_location_info_time_omission.is_some(),
             )
+            .field("trace_info_present", &self.trace_info.is_some())
             .finish()
     }
 }
@@ -5393,6 +5572,31 @@ impl SwmDiameterEapAnswer {
         self.extensions.user_location_info_time.is_some()
     }
 
+    /// Return whether the DEA contains sealed subscriber/equipment trace data.
+    ///
+    /// Received values remain unavailable until the response is authenticated
+    /// and correlated through [`SwmCorrelatedDiameterEapResponse::trace_info`].
+    #[must_use]
+    pub const fn has_trace_info(&self) -> bool {
+        self.extensions.trace_info.is_some()
+    }
+
+    /// Attach one locally originated command-268 trace activation.
+    ///
+    /// A trace value produced by the parser remains receive-derived after
+    /// cloning and is rejected here. Replay a received answer only through
+    /// [`build_swm_diameter_eap_answer_envelope`].
+    pub fn set_trace_info(&mut self, trace_info: SwmTraceInfo) -> Result<(), SwmTraceValueError> {
+        trace_info.validate_for_encode(trace::SwmTraceEncodePurpose::Origination)?;
+        self.extensions.trace_info = Some(trace_info);
+        Ok(())
+    }
+
+    /// Remove an originated trace directive.
+    pub fn clear_trace_info(&mut self) {
+        self.extensions.trace_info = None;
+    }
+
     /// Set an originated WLAN location with its last-known timestamp.
     ///
     /// Parsed receive-only values and retained nested extensions cannot be
@@ -5449,17 +5653,26 @@ impl SwmDiameterEapAnswer {
     }
 
     fn validate_for_encode(&self) -> Result<(), EncodeError> {
-        self.validate_with_load_purpose(true, location::SwmLocationEncodePurpose::Origination)
+        self.validate_with_load_purpose(
+            true,
+            location::SwmLocationEncodePurpose::Origination,
+            trace::SwmTraceEncodePurpose::Origination,
+        )
     }
 
     fn validate_for_correlation(&self) -> Result<(), EncodeError> {
-        self.validate_with_load_purpose(false, location::SwmLocationEncodePurpose::ParsedReplay)
+        self.validate_with_load_purpose(
+            false,
+            location::SwmLocationEncodePurpose::ParsedReplay,
+            trace::SwmTraceEncodePurpose::ParsedReplay,
+        )
     }
 
     fn validate_with_load_purpose(
         &self,
         require_complete_originated_loads: bool,
         location_purpose: location::SwmLocationEncodePurpose,
+        trace_purpose: trace::SwmTraceEncodePurpose,
     ) -> Result<(), EncodeError> {
         if self.session_id.as_ref().is_empty() {
             return Err(encode_structural_error(
@@ -5612,6 +5825,11 @@ impl SwmDiameterEapAnswer {
             access_network_info
                 .validate_for_encode(location_purpose)
                 .map_err(location::location_encode_error)?;
+        }
+        if let Some(trace_info) = self.extensions.trace_info.as_ref() {
+            trace_info
+                .validate_for_encode(trace_purpose)
+                .map_err(trace::trace_encode_error)?;
         }
         match (
             location_purpose,
@@ -6510,6 +6728,12 @@ fn parse_swm_diameter_eap_request_parts(
                         offset,
                         "7.2.2.1.1",
                     ));
+                } else if trace::is_trace_avp_code(code) {
+                    return Err(decode_structural_error_at(
+                        "answer-only trace AVP is not valid in SWm DER grammar",
+                        offset,
+                        "7.2.2.1.1",
+                    ));
                 } else {
                     retain_diameter_eap_extension(
                         ctx,
@@ -6670,6 +6894,12 @@ fn parse_swm_diameter_eap_request_parts(
                 ));
             } else if code == AVP_STATE {
                 state_avps.push(avp.value.to_vec());
+            } else if trace::is_trace_avp_code(code) {
+                return Err(decode_structural_error_at(
+                    "trace AVP uses the wrong vendor identity in SWm DER",
+                    offset,
+                    "7.2.2.1.1",
+                ));
             } else {
                 retain_diameter_eap_extension(
                     ctx,
@@ -6938,6 +7168,7 @@ pub fn build_swm_diameter_eap_answer(
         SwmDiameterEapAnswerBuildMode {
             request_conditioned: false,
             location_purpose: location::SwmLocationEncodePurpose::Origination,
+            trace_purpose: trace::SwmTraceEncodePurpose::Origination,
         },
         ctx,
     )
@@ -6971,6 +7202,7 @@ pub fn build_swm_diameter_eap_answer_envelope(
         SwmDiameterEapAnswerBuildMode {
             request_conditioned: true,
             location_purpose: location::SwmLocationEncodePurpose::ParsedReplay,
+            trace_purpose: trace::SwmTraceEncodePurpose::ParsedReplay,
         },
         ctx,
     )
@@ -6980,6 +7212,7 @@ pub fn build_swm_diameter_eap_answer_envelope(
 struct SwmDiameterEapAnswerBuildMode {
     request_conditioned: bool,
     location_purpose: location::SwmLocationEncodePurpose,
+    trace_purpose: trace::SwmTraceEncodePurpose,
 }
 
 fn build_swm_diameter_eap_answer_internal(
@@ -6994,6 +7227,7 @@ fn build_swm_diameter_eap_answer_internal(
     answer.validate_with_load_purpose(
         mode.location_purpose == location::SwmLocationEncodePurpose::Origination,
         mode.location_purpose,
+        mode.trace_purpose,
     )?;
     let retained_extension_count = answer
         .extensions
@@ -7005,6 +7239,17 @@ fn build_swm_diameter_eap_answer_internal(
                 .as_ref()
                 .map_or(0, |access| access.extensions().len()),
         )
+        .and_then(|count| {
+            answer
+                .extensions
+                .trace_info
+                .as_ref()
+                .map_or(Some(count), |trace_info| {
+                    trace_info
+                        .retained_avp_count()
+                        .and_then(|trace_count| count.checked_add(trace_count))
+                })
+        })
         .ok_or_else(EncodeError::length_overflow)?;
     validate_diameter_eap_routing_for_encode(
         proxy_infos.len(),
@@ -7118,6 +7363,9 @@ fn build_swm_diameter_eap_answer_internal(
     }
     if let Some(user_location_info_time) = answer.extensions.user_location_info_time {
         location::append_user_location_info_time_avp(&mut raw_avps, user_location_info_time, ctx)?;
+    }
+    if let Some(trace_info) = answer.extensions.trace_info.as_ref() {
+        trace::append_trace_info(&mut raw_avps, trace_info, mode.trace_purpose, ctx)?;
     }
     if let Some(default_context_identifier) = answer.default_context_identifier {
         builder_helpers::append_vendor_u32_avp(
@@ -7349,6 +7597,7 @@ fn build_swm_diameter_eap_answer_for_validated(
         SwmDiameterEapAnswerBuildMode {
             request_conditioned: true,
             location_purpose: location::SwmLocationEncodePurpose::Origination,
+            trace_purpose: trace::SwmTraceEncodePurpose::Origination,
         },
         ctx,
     )
@@ -7585,6 +7834,7 @@ fn parse_swm_diameter_eap_application_answer_parts(
     let mut apn_configurations = Vec::new();
     let mut apn_configuration_supplements = Vec::new();
     let mut mobile_node_identifier = None;
+    let mut trace_info = None;
     let mut session_timeout = None;
     let mut multi_round_timeout = None;
     let mut authorization_lifetime = None;
@@ -7747,6 +7997,16 @@ fn parse_swm_diameter_eap_application_answer_parts(
                         offset,
                         "5.3.101",
                     )?;
+                } else if code == AVP_TRACE_INFO && vendor_id == VENDOR_ID_3GPP {
+                    let value =
+                        trace::parse_trace_info(&avp, ctx, offset, value_offset, &mut retention)?;
+                    builder_helpers::set_once(&mut trace_info, value, offset, "8.2.3.13")?;
+                } else if trace::is_trace_avp_code(code) {
+                    return Err(decode_structural_error_at(
+                        "SWm DEA trace AVP uses the wrong vendor identity or nesting",
+                        offset,
+                        "8.2.3.13",
+                    ));
                 } else {
                     retain_diameter_eap_extension(
                         ctx,
@@ -7993,6 +8253,12 @@ fn parse_swm_diameter_eap_application_answer_parts(
                     offset,
                     "4.3",
                 )?;
+            } else if trace::is_trace_avp_code(code) {
+                return Err(decode_structural_error_at(
+                    "SWm DEA trace AVP uses the wrong vendor identity or nesting",
+                    offset,
+                    "8.2.3.13",
+                ));
             } else {
                 retain_diameter_eap_extension(
                     ctx,
@@ -8106,6 +8372,7 @@ fn parse_swm_diameter_eap_application_answer_parts(
             access_network_info,
             user_location_info_time,
             user_location_info_time_omission,
+            trace_info,
         },
     };
     lifecycle::validate_diameter_eap_answer_overload_control(
@@ -8506,6 +8773,15 @@ fn is_known_agent_delivery_application_avp(avp: &SwmAdditionalAvp) -> bool {
                 | AVP_SPECIFIC_APN_INFO
                 | AVP_SUPPORTED_FEATURES
                 | AVP_TERMINAL_INFORMATION
+                | AVP_TRACE_COLLECTION_ENTITY
+                | AVP_TRACE_DATA
+                | AVP_TRACE_DEPTH
+                | AVP_TRACE_EVENT_LIST
+                | AVP_TRACE_INFO
+                | AVP_TRACE_INTERFACE_LIST
+                | AVP_TRACE_NE_TYPE_LIST
+                | AVP_TRACE_REFERENCE
+                | AVP_TRACE_REPORTING_CONSUMER_URI
                 | AVP_UE_LOCAL_IP_ADDRESS
                 | AVP_UE_USAGE_TYPE
                 | AVP_VISITED_NETWORK_IDENTIFIER
