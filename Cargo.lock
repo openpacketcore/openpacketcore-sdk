@@ -3007,6 +3007,7 @@ dependencies = [
  "quickcheck",
  "sha2 0.10.9",
  "subtle",
+ "url",
  "zeroize",
 ]
 

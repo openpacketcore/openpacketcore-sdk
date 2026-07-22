@@ -110,7 +110,27 @@ charging decisions, watchdog policy, or a carrier-ready EPC/ePDG product claim.
   RFC 5777 `QoS-Capability`, `Visited-Network-Identifier`,
   `AAA-Failure-Indication`, reused `High-Priority-Access-Info`, and the RFC
   7683 baseline overload offer. DEA exposes the correlated loss-algorithm
-  selection/report and ordered RFC 8583 Load reports.
+  selection/report, ordered RFC 8583 Load reports, and typed
+  `Access-Network-Info` plus `User-Location-Info-Time`. The location group
+  validates its required SSID, individual/nonzero BSSID, paired RFC 5580 civic
+  Location-Information/Location-Data, Realm/E212 Operator-Name, and opaque
+  ETSI Logical-Access-ID without exposing values through diagnostics. Unknown
+  optional children use a sealed, bounded parser-retention collection. Raw
+  parsed answers have no location-value accessor and expose only location/time
+  presence through their location API; typed values are available through
+  `SwmCorrelatedDiameterEapResponse::wlan_location` after authenticated
+  connection and complete request/response correlation. These
+  fields are DEA-only in the baseline SWm command grammar. Access-Network-Info
+  and SSID require P clear; the table-note exception applies only to understood
+  M-bit mismatches. A timestamp requires location; a
+  location may omit its timestamp only with typed omission provenance. Locally
+  originated access information similarly requires a locator or explicit
+  `OmittedByOperatorPolicy` evidence. Receive-only omission provenance and
+  retained children can be replayed only through the immutable parsed-envelope
+  builder. A parser-created access value remains receive-derived through every
+  public mutator; ordinary construction and transplantation fail closed, and a
+  caller adapting facts must construct a fresh complete value with
+  `SwmAccessNetworkInfo::try_new`.
   DER and DEA also expose distinct, sealed parser-populated `extensions`
   collections for the trailing command wildcard. `UnknownIePolicy::Preserve`
   retains at most 128 command-unmodeled optional M-clear AVPs in received
@@ -206,6 +226,49 @@ charging decisions, watchdog policy, or a carrier-ready EPC/ePDG product claim.
   Preserve these fields when replacing the EAP payload and `State` values for
   a subsequent round; parsing and rebuilding a typed request retains the exact
   vector value.
+  A DEA originator can attach WLAN access context without a raw AVP boundary:
+
+  ```rust
+  use opc_proto_diameter::apps::swm::{
+      SwmAccessNetworkInfo, SwmAccessNetworkLocatorEvidence,
+      SwmAccessNetworkOperatorName,
+      SwmBasicServiceSetIdentifier, SwmDiameterEapAnswer,
+      SwmUserLocationInfoTime, SwmWlanSsid,
+  };
+
+  fn add_location(answer: &mut SwmDiameterEapAnswer) -> Result<(), Box<dyn std::error::Error>> {
+      let bssid = SwmBasicServiceSetIdentifier::try_from_octets([
+          0x02, 0, 0, 0, 0, 1,
+      ])?;
+      let access = SwmAccessNetworkInfo::try_new(
+          SwmWlanSsid::try_new("example-wlan")?,
+          SwmAccessNetworkLocatorEvidence::Bssid(bssid),
+      )?
+      .with_operator_name(SwmAccessNetworkOperatorName::try_realm(
+          "example.invalid",
+      )?);
+      // Set this only when an independently sourced last-known time exists.
+      answer.set_wlan_location_with_time(
+          access,
+          SwmUserLocationInfoTime::from_ntp_seconds(0x0102_0304),
+      )?;
+      Ok(())
+  }
+  ```
+
+  Civic location uses `SwmCivicLocationInformation` and
+  `SwmCivicLocationData`; `with_civic_location` requires both values and their
+  RFC 5580 association indexes to match and requires the `AccessNetwork`
+  entity. Location methods use the IANA Method Tokens registry snapshot dated
+  2022-09-15 for both origination and receive. Unregistered later tokens fail
+  closed until the snapshot is updated.
+  Civic CAtype membership follows the IANA snapshot dated 2014-04-11. RFC 4776
+  script values are validated, while RFC 6848 CAtype 40 accepts any bounded
+  structural `namespace-URI SP XML-local-name SP nonempty-text` extension and
+  preserves private/future namespaces. CAtype 29 uses the Location Types
+  registry snapshot dated 2024-07-08. Numeric location-code collisions under a
+  different vendor identity remain unknown AVPs and follow the configured
+  preserve/drop/reject policy.
   `Redirect-Host-Usage` and `Redirect-Max-Cache-Time` remain singleton, and an
   undeclared wildcard extension never gains repeatability implicitly. Missing
   required STR and ASR fields retain sealed 5005 provenance for the generic RFC

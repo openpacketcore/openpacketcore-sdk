@@ -32,6 +32,7 @@ opc-protocol = { path = "../opc-protocol", version = "0.2.0" }
 opc-types = { path = "../opc-types", version = "0.2.0" }
 sha2 = { workspace = true }
 subtle = { workspace = true }
+url = "2.5"
 zeroize = { workspace = true }
 
 [dev-dependencies]
