@@ -50,6 +50,11 @@ path = "tests/testbed_bridge.rs"
 required-features = ["peer"]
 
 [[test]]
+name = "peer_protection"
+path = "tests/peer_protection.rs"
+required-features = ["peer"]
+
+[[test]]
 name = "error_answers"
 path = "tests/error_answers.rs"
 required-features = ["app-swm", "peer"]

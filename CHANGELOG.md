@@ -67,6 +67,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   endpoint and bitmap material remains redacted. Trace authorization,
   reporting transport, endpoint trust/TLS, persistence and lifecycle remain
   product-owned (#352).
+- **Generation-bound Diameter transport sequencing — `opc-proto-diameter`:**
+  `PeerSession` now accepts a typed TLS/TCP or DTLS/SCTP protection requirement
+  with an explicit direct-before-capabilities or in-band-after-capabilities
+  sequence. Pending tokens, evidence, readiness, and command admissions retain
+  that sequence. The
+  CER/CEA path is bound to a transport-owned, redacted, monotonically advancing
+  connection generation. Responder CEA preparation is one-shot and transaction-
+  correlated, returning only immutable canonical bytes after validating the
+  typed Result-Code/security advertisement; header-only CEA send admission is
+  unavailable and CEA E-bit/Result-Code mismatches fail before consuming the
+  transaction. Direct protection admits no Diameter before attestation and only
+  CER/CEA afterwards; it does not treat `Inband-Security-Id` as a prerequisite
+  or unlock application traffic before capability success. A
+  generation cannot combine initiator and responder roles, so simultaneous-open
+  election remains transport-owned. An in-band protection-handshake phase
+  admits no Diameter messages. Only an exact current-generation caller
+  assertion of the selected mutually authenticated TLS/TCP or DTLS/SCTP
+  mechanism unlocks
+  application/watchdog traffic. Stale success/failure facts cannot unlock or
+  poison a reconnect; every protected-policy lifecycle event is exact-generation
+  bound, and DWR/DWA/DPR/DPA methods re-evaluate exact-header admission before
+  mutation; current-generation mechanism mismatch, contradictory CEA content,
+  and downgrade fail closed; and disconnect/failure/Clone revoke authority.
+  In the in-band sequence, omitted `Inband-Security-Id` has RFC 6733's effective
+  `{0}` support, without
+  treating an explicit disjoint intersection as implicit zero. The existing
+  no-in-band-security constructors retain traffic behavior while never reporting
+  protected readiness. This slice adds readiness/admission only; it does not
+  implement TCP/TLS or DTLS/SCTP transport, certificate validation, rotation,
+  or crypto-provider binding (#348).
 - **Typed SWm/IKEv2 authorization-rejection wire helpers —
   `opc-proto-diameter`, `opc-proto-ikev2`:** the Diameter base registry now
   names RFC 6733 `DIAMETER_AUTHORIZATION_REJECTED` as 5003, and

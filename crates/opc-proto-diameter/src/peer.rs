@@ -11,11 +11,13 @@
 
 use std::fmt;
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::num::NonZeroU64;
 use std::str;
+use std::sync::Arc;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use opc_protocol::{
-    BorrowDecode, DecodeContext, DecodeError, DecodeErrorCode, EncodeContext, EncodeError,
+    BorrowDecode, DecodeContext, DecodeError, DecodeErrorCode, Encode, EncodeContext, EncodeError,
     EncodeErrorCode, SpecRef, UnknownIePolicy,
 };
 
@@ -26,7 +28,9 @@ use crate::base::{
     AVP_ORIGIN_REALM, AVP_ORIGIN_STATE_ID, AVP_PRODUCT_NAME, AVP_RESULT_CODE,
     AVP_SUPPORTED_VENDOR_ID, AVP_VENDOR_ID, AVP_VENDOR_SPECIFIC_APPLICATION_ID,
     COMMAND_CAPABILITIES_EXCHANGE, COMMAND_DEVICE_WATCHDOG, COMMAND_DISCONNECT_PEER,
-    RESULT_CODE_DIAMETER_NO_COMMON_APPLICATION, RESULT_CODE_DIAMETER_SUCCESS,
+    INBAND_SECURITY_ID_NO_INBAND_SECURITY, INBAND_SECURITY_ID_TLS,
+    RESULT_CODE_DIAMETER_NO_COMMON_APPLICATION, RESULT_CODE_DIAMETER_NO_COMMON_SECURITY,
+    RESULT_CODE_DIAMETER_SUCCESS,
 };
 use crate::dictionary::{CommandKind, Dictionary, DictionarySet};
 use crate::parser_error::{
@@ -110,6 +114,18 @@ pub const fn procedure_for_command(command_code: CommandCode) -> Option<PeerProc
 pub fn classify_header(header: &Header) -> Option<(PeerProcedure, CommandKind)> {
     procedure_for_command(header.command_code)
         .map(|procedure| (procedure, header.flags.command_kind()))
+}
+
+fn is_capabilities_header(header: &Header, kind: CommandKind) -> bool {
+    is_peer_procedure_header(header, PeerProcedure::CapabilitiesExchange, kind)
+}
+
+fn is_peer_procedure_header(header: &Header, procedure: PeerProcedure, kind: CommandKind) -> bool {
+    header.command_code == procedure.command_code()
+        && header.application_id == APPLICATION_ID_COMMON_MESSAGES
+        && header.flags.command_kind() == kind
+        && !header.flags.is_proxiable()
+        && (kind == CommandKind::Answer || !header.flags.is_error())
 }
 
 /// Build command flags for a peer request.
@@ -605,6 +621,930 @@ impl PeerSessionPolicy {
     }
 }
 
+/// Transport-protection mechanism required for a Diameter connection.
+///
+/// RFC 6733 `Inband-Security-Id` value 1 advertises support for both TLS/TCP
+/// and DTLS/SCTP. The selected transport kind is therefore retained
+/// separately from the wire capability value. `Unprotected` records the
+/// explicit no-in-band-security result and never represents a protected
+/// transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum PeerProtectionMechanism {
+    /// No in-band protection was negotiated.
+    Unprotected,
+    /// TLS/TCP, established either directly or after in-band negotiation.
+    TlsTcp,
+    /// DTLS/SCTP, established either directly or after in-band negotiation.
+    DtlsSctp,
+}
+
+impl PeerProtectionMechanism {
+    /// Return the corresponding RFC 6733 `Inband-Security-Id` value when this
+    /// mechanism is negotiated in band.
+    #[must_use]
+    pub const fn inband_security_id(self) -> u32 {
+        match self {
+            Self::Unprotected => INBAND_SECURITY_ID_NO_INBAND_SECURITY,
+            Self::TlsTcp | Self::DtlsSctp => INBAND_SECURITY_ID_TLS,
+        }
+    }
+
+    /// Return whether this mechanism represents mutually authenticated
+    /// transport protection after successful caller attestation.
+    #[must_use]
+    pub const fn is_protected(self) -> bool {
+        matches!(self, Self::TlsTcp | Self::DtlsSctp)
+    }
+
+    /// Stable machine name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unprotected => "unprotected",
+            Self::TlsTcp => "tls_tcp",
+            Self::DtlsSctp => "dtls_sctp",
+        }
+    }
+}
+
+/// RFC 6733 sequencing for mutually authenticated transport protection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum PeerProtectionSequence {
+    /// Complete protection before sending or accepting any Diameter message.
+    DirectBeforeCapabilities,
+    /// Negotiate protection in CER/CEA, then complete it before application
+    /// traffic.
+    InbandAfterCapabilities,
+}
+
+impl PeerProtectionSequence {
+    /// Stable machine name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DirectBeforeCapabilities => "direct_before_capabilities",
+            Self::InbandAfterCapabilities => "inband_after_capabilities",
+        }
+    }
+}
+
+/// Valid protected-transport requirement for one Diameter peer.
+///
+/// Private fields prevent constructing an unprotected or sequence-less
+/// requirement. Callers select one of the four typed constructors and can then
+/// inspect the retained mechanism and RFC 6733 sequence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PeerProtectionRequirement {
+    mechanism: PeerProtectionMechanism,
+    sequence: PeerProtectionSequence,
+}
+
+impl PeerProtectionRequirement {
+    /// Require mutually authenticated TLS/TCP before CER/CEA.
+    #[must_use]
+    pub const fn direct_tls_tcp() -> Self {
+        Self {
+            mechanism: PeerProtectionMechanism::TlsTcp,
+            sequence: PeerProtectionSequence::DirectBeforeCapabilities,
+        }
+    }
+
+    /// Require CER/CEA-negotiated, mutually authenticated TLS/TCP.
+    #[must_use]
+    pub const fn inband_tls_tcp() -> Self {
+        Self {
+            mechanism: PeerProtectionMechanism::TlsTcp,
+            sequence: PeerProtectionSequence::InbandAfterCapabilities,
+        }
+    }
+
+    /// Require mutually authenticated DTLS/SCTP before CER/CEA.
+    #[must_use]
+    pub const fn direct_dtls_sctp() -> Self {
+        Self {
+            mechanism: PeerProtectionMechanism::DtlsSctp,
+            sequence: PeerProtectionSequence::DirectBeforeCapabilities,
+        }
+    }
+
+    /// Require CER/CEA-negotiated, mutually authenticated DTLS/SCTP.
+    #[must_use]
+    pub const fn inband_dtls_sctp() -> Self {
+        Self {
+            mechanism: PeerProtectionMechanism::DtlsSctp,
+            sequence: PeerProtectionSequence::InbandAfterCapabilities,
+        }
+    }
+
+    /// Return the required protected transport mechanism.
+    #[must_use]
+    pub const fn mechanism(self) -> PeerProtectionMechanism {
+        self.mechanism
+    }
+
+    /// Return when protection must complete relative to CER/CEA.
+    #[must_use]
+    pub const fn sequence(self) -> PeerProtectionSequence {
+        self.sequence
+    }
+}
+
+/// Product-neutral protection mode applied to the peer lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum PeerProtectionPolicy {
+    /// Preserve the existing explicit no-in-band-security behavior. This mode
+    /// never reports protected readiness and does not accept a TLS-only
+    /// capability result.
+    CompatibilityUnprotected,
+    /// Require the typed mechanism and RFC 6733 protection sequence.
+    Require(PeerProtectionRequirement),
+}
+
+impl PeerProtectionPolicy {
+    /// Stable machine name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CompatibilityUnprotected => "compatibility_unprotected",
+            Self::Require(requirement) => match (requirement.mechanism(), requirement.sequence()) {
+                (
+                    PeerProtectionMechanism::TlsTcp,
+                    PeerProtectionSequence::DirectBeforeCapabilities,
+                ) => "require_direct_tls_tcp",
+                (
+                    PeerProtectionMechanism::TlsTcp,
+                    PeerProtectionSequence::InbandAfterCapabilities,
+                ) => "require_inband_tls_tcp",
+                (
+                    PeerProtectionMechanism::DtlsSctp,
+                    PeerProtectionSequence::DirectBeforeCapabilities,
+                ) => "require_direct_dtls_sctp",
+                (
+                    PeerProtectionMechanism::DtlsSctp,
+                    PeerProtectionSequence::InbandAfterCapabilities,
+                ) => "require_inband_dtls_sctp",
+                (PeerProtectionMechanism::Unprotected, _) => "invalid_protection_requirement",
+            },
+        }
+    }
+
+    const fn requires_generation_binding(self) -> bool {
+        matches!(self, Self::Require(_))
+    }
+
+    /// Return the typed protected-transport requirement, if protection is
+    /// required.
+    #[must_use]
+    pub const fn requirement(self) -> Option<PeerProtectionRequirement> {
+        match self {
+            Self::CompatibilityUnprotected => None,
+            Self::Require(requirement) => Some(requirement),
+        }
+    }
+}
+
+/// Opaque generation of one logical Diameter transport connection.
+///
+/// The transport allocates a process-unique, monotonically increasing nonzero
+/// value for every connection candidate, including both sides of a
+/// simultaneous-open race. The value is redacted from diagnostics so it cannot
+/// become a high-cardinality label.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PeerSessionGeneration(NonZeroU64);
+
+impl PeerSessionGeneration {
+    /// Wrap one transport-owned, process-unique connection generation.
+    #[must_use]
+    pub const fn new(value: NonZeroU64) -> Self {
+        Self(value)
+    }
+}
+
+impl fmt::Debug for PeerSessionGeneration {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PeerSessionGeneration(<redacted>)")
+    }
+}
+
+/// Opaque generation of one protection establishment attempt.
+///
+/// Values are scoped to a [`PeerSessionGeneration`] and are not credentials or
+/// transport keying material.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PeerProtectionGeneration(NonZeroU64);
+
+impl fmt::Debug for PeerProtectionGeneration {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PeerProtectionGeneration(<redacted>)")
+    }
+}
+
+/// Error returned when capability evidence is presented on the wrong logical
+/// Diameter connection generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum PeerSessionBindingError {
+    /// The binding belongs to an earlier connection generation.
+    StaleGeneration,
+    /// A new connection generation did not advance monotonically.
+    GenerationNotAdvanced,
+}
+
+impl PeerSessionBindingError {
+    /// Stable machine-readable error code.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::StaleGeneration => "diameter_peer_binding_stale_generation",
+            Self::GenerationNotAdvanced => "diameter_peer_binding_generation_not_advanced",
+        }
+    }
+}
+
+impl fmt::Display for PeerSessionBindingError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::error::Error for PeerSessionBindingError {}
+
+/// Opaque, request-like fact authorizing completion of the current protection
+/// attempt.
+///
+/// The token is bound to one logical [`PeerSession`] instance, its current
+/// connection generation, the current protection generation, and the selected
+/// mechanism. A token retained across reconnect or a replacement negotiation
+/// cannot complete the new attempt.
+#[derive(Clone)]
+pub struct PeerProtectionPending {
+    authority: Arc<PeerSessionAuthority>,
+    session_generation: PeerSessionGeneration,
+    protection_generation: PeerProtectionGeneration,
+    mechanism: PeerProtectionMechanism,
+    sequence: PeerProtectionSequence,
+}
+
+impl PartialEq for PeerProtectionPending {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.authority, &other.authority)
+            && self.session_generation == other.session_generation
+            && self.protection_generation == other.protection_generation
+            && self.mechanism == other.mechanism
+            && self.sequence == other.sequence
+    }
+}
+
+impl Eq for PeerProtectionPending {}
+
+impl PeerProtectionPending {
+    /// Return the logical connection generation bound to this attempt.
+    #[must_use]
+    pub const fn session_generation(&self) -> PeerSessionGeneration {
+        self.session_generation
+    }
+
+    /// Return the protection-attempt generation.
+    #[must_use]
+    pub const fn protection_generation(&self) -> PeerProtectionGeneration {
+        self.protection_generation
+    }
+
+    /// Return the negotiated protection mechanism.
+    #[must_use]
+    pub const fn mechanism(&self) -> PeerProtectionMechanism {
+        self.mechanism
+    }
+
+    /// Return the RFC 6733 sequencing bound to this attempt.
+    #[must_use]
+    pub const fn sequence(&self) -> PeerProtectionSequence {
+        self.sequence
+    }
+}
+
+impl fmt::Debug for PeerProtectionPending {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PeerProtectionPending")
+            .field("session_generation", &self.session_generation)
+            .field("protection_generation", &self.protection_generation)
+            .field("mechanism", &self.mechanism)
+            .field("sequence", &self.sequence)
+            .finish()
+    }
+}
+
+/// Redaction-safe evidence that the caller attested mutually authenticated
+/// protection for an exact pending attempt.
+///
+/// This is state-machine evidence, not a certificate, channel binding, or
+/// cryptographic proof. The transport implementation remains responsible for
+/// verifying the TLS peer before invoking the attestation method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PeerProtectionEvidence {
+    session_generation: PeerSessionGeneration,
+    protection_generation: PeerProtectionGeneration,
+    mechanism: PeerProtectionMechanism,
+    sequence: PeerProtectionSequence,
+}
+
+impl PeerProtectionEvidence {
+    /// Return the logical connection generation covered by the evidence.
+    #[must_use]
+    pub const fn session_generation(self) -> PeerSessionGeneration {
+        self.session_generation
+    }
+
+    /// Return the protection-attempt generation covered by the evidence.
+    #[must_use]
+    pub const fn protection_generation(self) -> PeerProtectionGeneration {
+        self.protection_generation
+    }
+
+    /// Return the attested protection mechanism.
+    #[must_use]
+    pub const fn mechanism(self) -> PeerProtectionMechanism {
+        self.mechanism
+    }
+
+    /// Return the RFC 6733 sequence used to establish this protection.
+    #[must_use]
+    pub const fn sequence(self) -> PeerProtectionSequence {
+        self.sequence
+    }
+
+    /// Return whether this evidence represents mutually authenticated
+    /// protected readiness.
+    #[must_use]
+    pub const fn is_mutually_authenticated(self) -> bool {
+        self.mechanism.is_protected()
+    }
+}
+
+/// Typed reason that a negotiated protection attempt failed closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum PeerProtectionFailure {
+    /// The transport handshake failed or was interrupted.
+    HandshakeFailed,
+    /// The transport peer did not pass mutual identity authentication.
+    PeerAuthenticationFailed,
+    /// A capability update attempted to replace required protection with an
+    /// unprotected or contradictory mechanism.
+    DowngradeRejected,
+    /// Protection policy selected a mechanism this boundary cannot attest.
+    UnsupportedMechanism,
+    /// Protected-session evidence arrived through a legacy,
+    /// generation-unbound control method.
+    UnboundCapabilityEvidence,
+    /// A hostile command was presented before protection became ready.
+    CommandBeforeProtection,
+    /// A bounded generation counter was exhausted.
+    GenerationExhausted,
+    /// The surrounding peer session failed for another reason.
+    SessionFailed,
+}
+
+impl PeerProtectionFailure {
+    /// Stable machine-readable failure code.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::HandshakeFailed => "diameter_peer_protection_handshake_failed",
+            Self::PeerAuthenticationFailed => "diameter_peer_protection_peer_authentication_failed",
+            Self::DowngradeRejected => "diameter_peer_protection_downgrade_rejected",
+            Self::UnsupportedMechanism => "diameter_peer_protection_mechanism_unsupported",
+            Self::UnboundCapabilityEvidence => {
+                "diameter_peer_protection_capability_evidence_unbound"
+            }
+            Self::CommandBeforeProtection => "diameter_peer_command_before_protection_ready",
+            Self::GenerationExhausted => "diameter_peer_protection_generation_exhausted",
+            Self::SessionFailed => "diameter_peer_protection_session_failed",
+        }
+    }
+}
+
+/// Typed protection lifecycle projected by [`PeerSession`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum PeerProtectionState {
+    /// Capability negotiation has not selected an in-band protection result.
+    NotNegotiated,
+    /// No in-band protection was selected; application traffic may follow the
+    /// existing explicit-unprotected behavior but protected readiness is false.
+    Unprotected,
+    /// A direct or in-band protected mechanism is awaiting caller attestation.
+    Pending,
+    /// The current protection generation was attested as mutually authenticated.
+    Protected,
+    /// Protection failed closed.
+    Failed,
+}
+
+impl PeerProtectionState {
+    /// Stable machine name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotNegotiated => "not_negotiated",
+            Self::Unprotected => "unprotected",
+            Self::Pending => "pending",
+            Self::Protected => "protected",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// Redaction-safe protection readiness for a Diameter peer session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PeerProtectionReadiness {
+    /// Current protection lifecycle state.
+    state: PeerProtectionState,
+    /// Negotiated mechanism, when one was selected.
+    mechanism: Option<PeerProtectionMechanism>,
+    /// RFC 6733 protection sequence, when protection is required.
+    sequence: Option<PeerProtectionSequence>,
+    /// Current logical connection generation.
+    session_generation: Option<PeerSessionGeneration>,
+    /// Current protection-attempt generation, when one exists.
+    protection_generation: Option<PeerProtectionGeneration>,
+    /// Whether mutually authenticated protected transport is ready.
+    protected_ready: bool,
+    /// Whether both the protection sequence and capability exchange permit
+    /// non-CER/CEA traffic. Direct attestation alone leaves this false until
+    /// CER/CEA succeeds.
+    traffic_permitted: bool,
+    /// Stable failure reason, when protection failed closed.
+    failure: Option<PeerProtectionFailure>,
+}
+
+impl PeerProtectionReadiness {
+    /// Return the current protection lifecycle state.
+    #[must_use]
+    pub const fn state(self) -> PeerProtectionState {
+        self.state
+    }
+
+    /// Return the negotiated mechanism, when present.
+    #[must_use]
+    pub const fn mechanism(self) -> Option<PeerProtectionMechanism> {
+        self.mechanism
+    }
+
+    /// Return the required RFC 6733 protection sequence, when present.
+    #[must_use]
+    pub const fn sequence(self) -> Option<PeerProtectionSequence> {
+        self.sequence
+    }
+
+    /// Return the current redacted connection generation.
+    #[must_use]
+    pub const fn session_generation(self) -> Option<PeerSessionGeneration> {
+        self.session_generation
+    }
+
+    /// Return the current redacted protection-attempt generation.
+    #[must_use]
+    pub const fn protection_generation(self) -> Option<PeerProtectionGeneration> {
+        self.protection_generation
+    }
+
+    /// Return whether mutually authenticated SDK transport protection is ready.
+    #[must_use]
+    pub const fn protected_ready(self) -> bool {
+        self.protected_ready
+    }
+
+    /// Return whether non-CER/CEA traffic is permitted by protection state.
+    #[must_use]
+    pub const fn traffic_permitted(self) -> bool {
+        self.traffic_permitted
+    }
+
+    /// Return the stable failure reason, when protection failed closed.
+    #[must_use]
+    pub const fn failure(self) -> Option<PeerProtectionFailure> {
+        self.failure
+    }
+}
+
+/// Protection transition emitted after an explicit caller completion or
+/// failure attestation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum PeerProtectionEvent {
+    /// Mutually authenticated TLS completion was accepted.
+    Established,
+    /// A current protection attempt failed closed.
+    Failed,
+}
+
+impl PeerProtectionEvent {
+    /// Stable machine name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Established => "established",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// One protection-specific transition and its resulting session readiness.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerProtectionTransition {
+    /// Event that caused the transition.
+    event: PeerProtectionEvent,
+    /// Protection state before the transition.
+    previous_state: PeerProtectionState,
+    /// Protection state after the transition.
+    state: PeerProtectionState,
+    /// Protection readiness after the transition.
+    protection: PeerProtectionReadiness,
+    /// Generic peer readiness after the transition.
+    session: PeerSessionReadiness,
+}
+
+impl PeerProtectionTransition {
+    /// Return the protection event.
+    #[must_use]
+    pub const fn event(&self) -> PeerProtectionEvent {
+        self.event
+    }
+
+    /// Return the protection state before the event.
+    #[must_use]
+    pub const fn previous_state(&self) -> PeerProtectionState {
+        self.previous_state
+    }
+
+    /// Return the protection state after the event.
+    #[must_use]
+    pub const fn state(&self) -> PeerProtectionState {
+        self.state
+    }
+
+    /// Return protection readiness after the event.
+    #[must_use]
+    pub const fn protection(&self) -> PeerProtectionReadiness {
+        self.protection
+    }
+
+    /// Return generic peer readiness after the event.
+    #[must_use]
+    pub const fn session(&self) -> &PeerSessionReadiness {
+        &self.session
+    }
+}
+
+/// Protection-attempt completion error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum PeerProtectionError {
+    /// The token belongs to an earlier connection generation.
+    StaleSessionGeneration,
+    /// The token belongs to an earlier protection attempt.
+    StaleProtectionGeneration,
+    /// No protection completion is pending.
+    NotPending {
+        /// Current protection state.
+        state: PeerProtectionState,
+    },
+    /// The attested mechanism does not match the negotiated mechanism.
+    MechanismMismatch {
+        /// Negotiated mechanism.
+        expected: PeerProtectionMechanism,
+        /// Mechanism claimed by the caller.
+        actual: PeerProtectionMechanism,
+    },
+}
+
+impl PeerProtectionError {
+    /// Stable machine-readable error code.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::StaleSessionGeneration => "diameter_peer_protection_stale_session_generation",
+            Self::StaleProtectionGeneration => {
+                "diameter_peer_protection_stale_protection_generation"
+            }
+            Self::NotPending { .. } => "diameter_peer_protection_not_pending",
+            Self::MechanismMismatch { .. } => "diameter_peer_protection_mechanism_mismatch",
+        }
+    }
+}
+
+impl fmt::Display for PeerProtectionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::StaleSessionGeneration | Self::StaleProtectionGeneration => {
+                f.write_str(self.as_str())
+            }
+            Self::NotPending { state } => {
+                write!(f, "{}: state {}", self.as_str(), state.as_str())
+            }
+            Self::MechanismMismatch { expected, actual } => write!(
+                f,
+                "{}: expected {}, actual {}",
+                self.as_str(),
+                expected.as_str(),
+                actual.as_str()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PeerProtectionError {}
+
+/// Diameter message direction evaluated at the peer-session boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum PeerMessageDirection {
+    /// Message arrived from the peer.
+    Inbound,
+    /// Message will be sent to the peer.
+    Outbound,
+}
+
+impl PeerMessageDirection {
+    /// Stable machine name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Inbound => "inbound",
+            Self::Outbound => "outbound",
+        }
+    }
+}
+
+/// Error returned by generation-bound CER/CEA handling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum PeerCapabilityBoundaryError {
+    /// The supplied connection generation is stale.
+    StaleGeneration,
+    /// The Diameter header is not the required CER or CEA role.
+    InvalidCapabilitiesHeader,
+    /// The message does not correlate to the retained capability transaction.
+    TransactionMismatch,
+    /// A conflicting transaction or the opposite CER role already occupies
+    /// this connection generation.
+    ConflictingTransaction,
+    /// The committed CEA result does not match the retained CER projection.
+    AnswerOutcomeMismatch,
+    /// The committed CEA security advertisement does not match local support
+    /// or the selected transport mechanism.
+    AnswerSecurityMismatch,
+    /// The CEA error flag does not match its Result-Code family.
+    AnswerErrorBitMismatch,
+    /// The current session state does not accept another capability exchange.
+    InvalidSessionState,
+}
+
+impl PeerCapabilityBoundaryError {
+    /// Stable machine-readable error code.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::StaleGeneration => "diameter_peer_capability_stale_generation",
+            Self::InvalidCapabilitiesHeader => "diameter_peer_capability_invalid_header",
+            Self::TransactionMismatch => "diameter_peer_capability_transaction_mismatch",
+            Self::ConflictingTransaction => "diameter_peer_capability_transaction_conflict",
+            Self::AnswerOutcomeMismatch => "diameter_peer_capability_answer_outcome_mismatch",
+            Self::AnswerSecurityMismatch => "diameter_peer_capability_answer_security_mismatch",
+            Self::AnswerErrorBitMismatch => "diameter_peer_capability_answer_error_bit_mismatch",
+            Self::InvalidSessionState => "diameter_peer_capability_invalid_session_state",
+        }
+    }
+}
+
+impl fmt::Display for PeerCapabilityBoundaryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::error::Error for PeerCapabilityBoundaryError {}
+
+/// Error returned while preparing the exact responder CEA bytes for emission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PeerCapabilityAnswerPreparationError {
+    /// Capability state, transaction, result, or security validation failed.
+    Boundary(PeerCapabilityBoundaryError),
+    /// Canonical typed CEA construction or serialization failed.
+    Encode(EncodeError),
+}
+
+impl PeerCapabilityAnswerPreparationError {
+    /// Stable machine-readable error code.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Boundary(error) => error.as_str(),
+            Self::Encode(_) => "diameter_peer_capability_answer_encode_failed",
+        }
+    }
+}
+
+impl fmt::Display for PeerCapabilityAnswerPreparationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Boundary(error) => error.fmt(f),
+            Self::Encode(_) => f.write_str(self.as_str()),
+        }
+    }
+}
+
+impl std::error::Error for PeerCapabilityAnswerPreparationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Boundary(error) => Some(error),
+            Self::Encode(error) => Some(error),
+        }
+    }
+}
+
+impl From<PeerCapabilityBoundaryError> for PeerCapabilityAnswerPreparationError {
+    fn from(error: PeerCapabilityBoundaryError) -> Self {
+        Self::Boundary(error)
+    }
+}
+
+impl From<EncodeError> for PeerCapabilityAnswerPreparationError {
+    fn from(error: EncodeError) -> Self {
+        Self::Encode(error)
+    }
+}
+
+/// Coarse command class evaluated by the additive peer admission boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum PeerCommandClass {
+    /// CER or CEA.
+    CapabilitiesExchange,
+    /// DWR or DWA.
+    DeviceWatchdog,
+    /// DPR or DPA.
+    DisconnectPeer,
+    /// Any non-base application command.
+    Application,
+}
+
+impl PeerCommandClass {
+    /// Classify a decoded Diameter header without relying on caller-supplied
+    /// command labels.
+    #[must_use]
+    pub fn from_header(header: &Header) -> Self {
+        match procedure_for_command(header.command_code) {
+            Some(PeerProcedure::CapabilitiesExchange) => Self::CapabilitiesExchange,
+            Some(PeerProcedure::DeviceWatchdog) => Self::DeviceWatchdog,
+            Some(PeerProcedure::DisconnectPeer) => Self::DisconnectPeer,
+            None => Self::Application,
+        }
+    }
+
+    /// Stable machine name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CapabilitiesExchange => "capabilities_exchange",
+            Self::DeviceWatchdog => "device_watchdog",
+            Self::DisconnectPeer => "disconnect_peer",
+            Self::Application => "application",
+        }
+    }
+}
+
+/// Redaction-safe successful command admission evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PeerCommandAdmission {
+    /// Admitted command class.
+    command: PeerCommandClass,
+    /// Admitted message direction.
+    direction: PeerMessageDirection,
+    /// Logical connection generation that was admitted.
+    session_generation: Option<PeerSessionGeneration>,
+    /// Active protection mechanism, if policy selected one.
+    mechanism: Option<PeerProtectionMechanism>,
+    /// RFC 6733 protection sequence backing the admission, when required.
+    sequence: Option<PeerProtectionSequence>,
+    /// Protection generation covering this admission, when attested.
+    protection_generation: Option<PeerProtectionGeneration>,
+    /// Whether admission is backed by mutually authenticated protection.
+    protected: bool,
+}
+
+impl PeerCommandAdmission {
+    /// Return the admitted command class.
+    #[must_use]
+    pub const fn command(self) -> PeerCommandClass {
+        self.command
+    }
+
+    /// Return the admitted message direction.
+    #[must_use]
+    pub const fn direction(self) -> PeerMessageDirection {
+        self.direction
+    }
+
+    /// Return the exact redacted connection generation.
+    #[must_use]
+    pub const fn session_generation(self) -> Option<PeerSessionGeneration> {
+        self.session_generation
+    }
+
+    /// Return the negotiated mechanism.
+    #[must_use]
+    pub const fn mechanism(self) -> Option<PeerProtectionMechanism> {
+        self.mechanism
+    }
+
+    /// Return the RFC 6733 protection sequence backing this admission.
+    #[must_use]
+    pub const fn sequence(self) -> Option<PeerProtectionSequence> {
+        self.sequence
+    }
+
+    /// Return the attested protection generation, when protected.
+    #[must_use]
+    pub const fn protection_generation(self) -> Option<PeerProtectionGeneration> {
+        self.protection_generation
+    }
+
+    /// Return whether mutually authenticated SDK transport protection backs
+    /// this admission.
+    #[must_use]
+    pub const fn is_protected(self) -> bool {
+        self.protected
+    }
+}
+
+/// Error returned when a command class is not admissible in the current peer
+/// or protection state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum PeerCommandAdmissionError {
+    /// The supplied connection generation is stale or unbound.
+    StaleGeneration,
+    /// Protection has not completed or has failed closed.
+    ProtectionNotReady {
+        /// Rejected command class.
+        command: PeerCommandClass,
+        /// Current protection state.
+        protection_state: PeerProtectionState,
+    },
+    /// The generic peer session is not ready for this command class.
+    SessionNotReady {
+        /// Rejected command class.
+        command: PeerCommandClass,
+        /// Current peer state.
+        state: PeerSessionState,
+    },
+}
+
+impl PeerCommandAdmissionError {
+    /// Stable machine-readable error code.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::StaleGeneration => "diameter_peer_command_stale_generation",
+            Self::ProtectionNotReady { .. } => "diameter_peer_command_protection_not_ready",
+            Self::SessionNotReady { .. } => "diameter_peer_command_session_not_ready",
+        }
+    }
+}
+
+impl fmt::Display for PeerCommandAdmissionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::StaleGeneration => f.write_str(self.as_str()),
+            Self::ProtectionNotReady {
+                command,
+                protection_state,
+            } => write!(
+                f,
+                "{}: command {}, protection state {}",
+                self.as_str(),
+                command.as_str(),
+                protection_state.as_str()
+            ),
+            Self::SessionNotReady { command, state } => write!(
+                f,
+                "{}: command {}, session state {}",
+                self.as_str(),
+                command.as_str(),
+                state.as_str()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PeerCommandAdmissionError {}
+
 /// Transport-neutral Diameter peer session state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PeerSessionState {
@@ -799,6 +1739,50 @@ pub struct PeerSessionReadiness {
     pub blockers: Vec<PeerSessionBlocker>,
 }
 
+/// Exact canonical responder CEA bytes admitted and consumed by a peer session.
+///
+/// Construction is available only through
+/// [`PeerSession::prepare_capabilities_answer_on`]. The session consumes the
+/// retained inbound CER transaction before returning this value, so a second
+/// CEA cannot be prepared for the same request. The wire bytes are immutable and
+/// are the only responder CEA representation admitted by the protected-session
+/// boundary.
+#[derive(PartialEq, Eq)]
+pub struct PeerCapabilitiesAnswerEmission {
+    wire: Bytes,
+    readiness: PeerSessionReadiness,
+}
+
+impl fmt::Debug for PeerCapabilitiesAnswerEmission {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PeerCapabilitiesAnswerEmission")
+            .field("wire", &"<redacted>")
+            .field("wire_len", &self.wire.len())
+            .field("readiness", &self.readiness)
+            .finish()
+    }
+}
+
+impl PeerCapabilitiesAnswerEmission {
+    /// Return the exact immutable CEA bytes to emit on the bound connection.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.wire
+    }
+
+    /// Consume the emission facade and return its exact immutable CEA bytes.
+    #[must_use]
+    pub fn into_bytes(self) -> Bytes {
+        self.wire
+    }
+
+    /// Return readiness after the CEA transaction was consumed.
+    #[must_use]
+    pub const fn readiness(&self) -> &PeerSessionReadiness {
+        &self.readiness
+    }
+}
+
 /// Projection of a CEA or received CER into generic session readiness.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerSessionCapabilityProjection {
@@ -810,7 +1794,8 @@ pub struct PeerSessionCapabilityProjection {
     pub relay_application_common: bool,
     /// Whether configured accepted application policy passed.
     pub accepted_application_common: bool,
-    /// Whether configured accepted in-band security policy passed.
+    /// Whether configured in-band security policy passed, or whether that
+    /// field is not applicable because direct protection already completed.
     pub accepted_inband_security_common: bool,
     /// Whether diagnostic AVPs were present in the CEA.
     pub diagnostics_present: bool,
@@ -936,12 +1921,144 @@ impl fmt::Display for PeerSessionError {
 
 impl std::error::Error for PeerSessionError {}
 
+/// Error returned by an exact-generation peer lifecycle operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PeerSessionBoundError {
+    /// The event belongs to a stale or unbound transport generation.
+    StaleGeneration,
+    /// The current peer state does not accept the requested operation.
+    InvalidTransition {
+        /// Stable operation name.
+        operation: &'static str,
+        /// Current peer state.
+        state: PeerSessionState,
+    },
+    /// The exact command header was not admissible in the current peer state.
+    CommandNotAdmitted {
+        /// Stable lifecycle operation name.
+        operation: &'static str,
+        /// Typed command-admission rejection.
+        reason: PeerCommandAdmissionError,
+    },
+    /// The supplied header does not match the lifecycle operation's Diameter
+    /// procedure and request/answer role.
+    InvalidPeerHeader {
+        /// Stable lifecycle operation name.
+        operation: &'static str,
+    },
+}
+
+impl PeerSessionBoundError {
+    /// Stable machine-readable error code.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::StaleGeneration => "diameter_peer_lifecycle_stale_generation",
+            Self::InvalidTransition { .. } => "diameter_peer_lifecycle_invalid_transition",
+            Self::CommandNotAdmitted { .. } => "diameter_peer_lifecycle_command_not_admitted",
+            Self::InvalidPeerHeader { .. } => "diameter_peer_lifecycle_invalid_header",
+        }
+    }
+
+    fn from_session(error: PeerSessionError) -> Self {
+        match error {
+            PeerSessionError::InvalidTransition { operation, state } => {
+                Self::InvalidTransition { operation, state }
+            }
+        }
+    }
+}
+
+impl fmt::Display for PeerSessionBoundError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::StaleGeneration => f.write_str(self.as_str()),
+            Self::InvalidTransition { operation, state } => write!(
+                f,
+                "{}: operation {operation}, state {}",
+                self.as_str(),
+                state.as_str()
+            ),
+            Self::CommandNotAdmitted { operation, reason } => write!(
+                f,
+                "{}: operation {operation}, reason {}",
+                self.as_str(),
+                reason.as_str()
+            ),
+            Self::InvalidPeerHeader { operation } => {
+                write!(f, "{}: operation {operation}", self.as_str())
+            }
+        }
+    }
+}
+
+impl std::error::Error for PeerSessionBoundError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeerProtectionLifecycle {
+    NotNegotiated,
+    Unprotected,
+    Pending {
+        generation: PeerProtectionGeneration,
+        requirement: PeerProtectionRequirement,
+    },
+    Protected {
+        evidence: PeerProtectionEvidence,
+    },
+    Failed {
+        mechanism: Option<PeerProtectionMechanism>,
+        sequence: Option<PeerProtectionSequence>,
+        generation: Option<PeerProtectionGeneration>,
+        failure: PeerProtectionFailure,
+    },
+}
+
+#[derive(Debug)]
+struct PeerSessionAuthority;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeerCapabilityRole {
+    Initiator,
+    Responder,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct PeerCapabilityTransaction {
+    hop_by_hop_identifier: u32,
+    end_to_end_identifier: u32,
+}
+
+impl PeerCapabilityTransaction {
+    fn from_header(header: &Header) -> Self {
+        Self {
+            hop_by_hop_identifier: header.hop_by_hop_identifier,
+            end_to_end_identifier: header.end_to_end_identifier,
+        }
+    }
+
+    fn matches(self, header: &Header) -> bool {
+        self.hop_by_hop_identifier == header.hop_by_hop_identifier
+            && self.end_to_end_identifier == header.end_to_end_identifier
+    }
+}
+
 /// Transport-neutral Diameter peer session state machine.
-#[derive(Clone)]
 pub struct PeerSession {
+    authority: Arc<PeerSessionAuthority>,
     local_capabilities: PeerCapabilities,
     policy: PeerSessionPolicy,
+    protection_policy: PeerProtectionPolicy,
     state: PeerSessionState,
+    session_generation: Option<PeerSessionGeneration>,
+    next_protection_generation: u64,
+    protection: PeerProtectionLifecycle,
+    capabilities_request_outstanding: bool,
+    outbound_capability_transaction: Option<PeerCapabilityTransaction>,
+    inbound_capability_transaction: Option<PeerCapabilityTransaction>,
+    capability_role: Option<PeerCapabilityRole>,
+    selected_protection: Option<PeerProtectionMechanism>,
+    capability_evidence_generation_bound: bool,
     remote_capabilities: Option<PeerCapabilities>,
     last_capability_projection: Option<PeerSessionCapabilityProjection>,
     last_watchdog_projection: Option<PeerSessionWatchdogProjection>,
@@ -962,11 +2079,95 @@ pub struct PeerSession {
     backoffs_entered: usize,
 }
 
+impl Clone for PeerSession {
+    fn clone(&self) -> Self {
+        let protection_was_authoritative = self.protection_policy.requires_generation_binding()
+            && self.session_generation.is_some();
+        Self {
+            authority: Arc::new(PeerSessionAuthority),
+            local_capabilities: self.local_capabilities.clone(),
+            policy: self.policy.clone(),
+            protection_policy: self.protection_policy,
+            state: if protection_was_authoritative {
+                PeerSessionState::Failed
+            } else {
+                self.state
+            },
+            session_generation: self.session_generation,
+            next_protection_generation: self.next_protection_generation,
+            protection: if protection_was_authoritative {
+                PeerProtectionLifecycle::Failed {
+                    mechanism: self.protection_readiness().mechanism,
+                    sequence: self.protection_readiness().sequence,
+                    generation: self.protection_readiness().protection_generation,
+                    failure: PeerProtectionFailure::SessionFailed,
+                }
+            } else {
+                self.protection
+            },
+            capabilities_request_outstanding: if protection_was_authoritative {
+                false
+            } else {
+                self.capabilities_request_outstanding
+            },
+            outbound_capability_transaction: if protection_was_authoritative {
+                None
+            } else {
+                self.outbound_capability_transaction
+            },
+            inbound_capability_transaction: if protection_was_authoritative {
+                None
+            } else {
+                self.inbound_capability_transaction
+            },
+            capability_role: if protection_was_authoritative {
+                None
+            } else {
+                self.capability_role
+            },
+            selected_protection: if protection_was_authoritative {
+                None
+            } else {
+                self.selected_protection
+            },
+            capability_evidence_generation_bound: if protection_was_authoritative {
+                false
+            } else {
+                self.capability_evidence_generation_bound
+            },
+            remote_capabilities: self.remote_capabilities.clone(),
+            last_capability_projection: self.last_capability_projection.clone(),
+            last_watchdog_projection: self.last_watchdog_projection.clone(),
+            last_disconnect_projection: self.last_disconnect_projection.clone(),
+            last_blockers: if protection_was_authoritative {
+                vec![PeerSessionBlocker::SessionFailed]
+            } else {
+                self.last_blockers.clone()
+            },
+            capabilities_requests_sent: self.capabilities_requests_sent,
+            capabilities_requests_received: self.capabilities_requests_received,
+            capabilities_answers_observed: self.capabilities_answers_observed,
+            capabilities_protocol_errors_observed: self.capabilities_protocol_errors_observed,
+            watchdog_requests_sent: self.watchdog_requests_sent,
+            watchdog_requests_received: self.watchdog_requests_received,
+            watchdog_answers_observed: self.watchdog_answers_observed,
+            missed_watchdogs: self.missed_watchdogs,
+            disconnect_requests_sent: self.disconnect_requests_sent,
+            disconnect_requests_received: self.disconnect_requests_received,
+            disconnect_answers_observed: self.disconnect_answers_observed,
+            reconnects_scheduled: self.reconnects_scheduled,
+            backoffs_entered: self.backoffs_entered,
+        }
+    }
+}
+
 impl fmt::Debug for PeerSession {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PeerSession")
             .field("state", &self.state)
+            .field("protection", &self.protection_readiness())
             .field("policy", &self.policy)
+            .field("protection_policy", &self.protection_policy)
             .field(
                 "has_remote_capabilities",
                 &self.remote_capabilities.is_some(),
@@ -1007,10 +2208,36 @@ impl PeerSession {
     /// Create a session with an explicit readiness policy.
     #[must_use]
     pub fn with_policy(local_capabilities: PeerCapabilities, policy: PeerSessionPolicy) -> Self {
-        Self {
+        Self::with_policy_and_protection(
             local_capabilities,
             policy,
+            PeerProtectionPolicy::CompatibilityUnprotected,
+        )
+    }
+
+    /// Create a session with explicit capability and transport-protection
+    /// policy.
+    #[must_use]
+    pub fn with_policy_and_protection(
+        local_capabilities: PeerCapabilities,
+        policy: PeerSessionPolicy,
+        protection_policy: PeerProtectionPolicy,
+    ) -> Self {
+        Self {
+            authority: Arc::new(PeerSessionAuthority),
+            local_capabilities,
+            policy,
+            protection_policy,
             state: PeerSessionState::Idle,
+            session_generation: None,
+            next_protection_generation: 0,
+            protection: PeerProtectionLifecycle::NotNegotiated,
+            capabilities_request_outstanding: false,
+            outbound_capability_transaction: None,
+            inbound_capability_transaction: None,
+            capability_role: None,
+            selected_protection: None,
+            capability_evidence_generation_bound: false,
             remote_capabilities: None,
             last_capability_projection: None,
             last_watchdog_projection: None,
@@ -1044,6 +2271,59 @@ impl PeerSession {
         &self.policy
     }
 
+    /// Return the session transport-protection policy.
+    #[must_use]
+    pub const fn protection_policy(&self) -> PeerProtectionPolicy {
+        self.protection_policy
+    }
+
+    /// Bind this state machine to a new exact transport connection generation.
+    ///
+    /// The generation must be process-unique and monotonically greater than
+    /// the preceding generation supplied to this session. Binding a new
+    /// generation revokes all pending or established protection evidence
+    /// before any readiness is reported. A direct requirement creates its
+    /// pending protection token at this boundary; an in-band requirement waits
+    /// for the correlated CER/CEA.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PeerSessionBindingError::GenerationNotAdvanced`] when a
+    /// generation is reused or moves backwards.
+    pub fn begin_connection_generation(
+        &mut self,
+        generation: PeerSessionGeneration,
+    ) -> Result<(), PeerSessionBindingError> {
+        if self
+            .session_generation
+            .is_some_and(|current| generation.0 <= current.0)
+        {
+            return Err(PeerSessionBindingError::GenerationNotAdvanced);
+        }
+        self.session_generation = Some(generation);
+        self.next_protection_generation = 0;
+        self.protection = PeerProtectionLifecycle::NotNegotiated;
+        self.capabilities_request_outstanding = false;
+        self.outbound_capability_transaction = None;
+        self.inbound_capability_transaction = None;
+        self.capability_role = None;
+        self.selected_protection = None;
+        self.capability_evidence_generation_bound = false;
+        self.state = PeerSessionState::Idle;
+        self.remote_capabilities = None;
+        self.last_capability_projection = None;
+        self.last_watchdog_projection = None;
+        self.last_disconnect_projection = None;
+        self.last_blockers.clear();
+        self.missed_watchdogs = 0;
+        if let Some(requirement) = self.protection_policy.requirement() {
+            if requirement.sequence() == PeerProtectionSequence::DirectBeforeCapabilities {
+                self.start_pending_protection(requirement);
+            }
+        }
+        Ok(())
+    }
+
     /// Return the last capability projection, if one exists.
     #[must_use]
     pub const fn last_capability_projection(&self) -> Option<&PeerSessionCapabilityProjection> {
@@ -1060,6 +2340,276 @@ impl PeerSession {
     #[must_use]
     pub const fn last_disconnect_projection(&self) -> Option<&PeerSessionDisconnectProjection> {
         self.last_disconnect_projection.as_ref()
+    }
+
+    /// Return the current typed protection readiness.
+    ///
+    /// `protected_ready` becomes true only after this session accepts an exact
+    /// current-generation attestation for the required mutually authenticated
+    /// TLS/TCP or DTLS/SCTP mechanism. `traffic_permitted` additionally requires
+    /// successful CER/CEA. Explicit no-in-band-security negotiation keeps
+    /// `protected_ready` false.
+    #[must_use]
+    pub const fn protection_readiness(&self) -> PeerProtectionReadiness {
+        match self.protection {
+            PeerProtectionLifecycle::NotNegotiated => PeerProtectionReadiness {
+                state: PeerProtectionState::NotNegotiated,
+                mechanism: None,
+                sequence: match self.protection_policy.requirement() {
+                    Some(requirement) => Some(requirement.sequence()),
+                    None => None,
+                },
+                session_generation: self.session_generation,
+                protection_generation: None,
+                protected_ready: false,
+                traffic_permitted: false,
+                failure: None,
+            },
+            PeerProtectionLifecycle::Unprotected => PeerProtectionReadiness {
+                state: PeerProtectionState::Unprotected,
+                mechanism: Some(PeerProtectionMechanism::Unprotected),
+                sequence: None,
+                session_generation: self.session_generation,
+                protection_generation: None,
+                protected_ready: false,
+                traffic_permitted: true,
+                failure: None,
+            },
+            PeerProtectionLifecycle::Pending {
+                generation,
+                requirement,
+            } => PeerProtectionReadiness {
+                state: PeerProtectionState::Pending,
+                mechanism: Some(requirement.mechanism()),
+                sequence: Some(requirement.sequence()),
+                session_generation: self.session_generation,
+                protection_generation: Some(generation),
+                protected_ready: false,
+                traffic_permitted: false,
+                failure: None,
+            },
+            PeerProtectionLifecycle::Protected { evidence } => PeerProtectionReadiness {
+                state: PeerProtectionState::Protected,
+                mechanism: Some(evidence.mechanism()),
+                sequence: Some(evidence.sequence()),
+                session_generation: self.session_generation,
+                protection_generation: Some(evidence.protection_generation()),
+                protected_ready: evidence.is_mutually_authenticated(),
+                traffic_permitted: evidence.is_mutually_authenticated()
+                    && matches!(
+                        self.state,
+                        PeerSessionState::Negotiated
+                            | PeerSessionState::WatchdogProbing
+                            | PeerSessionState::Degraded
+                    ),
+                failure: None,
+            },
+            PeerProtectionLifecycle::Failed {
+                mechanism,
+                sequence,
+                generation,
+                failure,
+            } => PeerProtectionReadiness {
+                state: PeerProtectionState::Failed,
+                mechanism,
+                sequence,
+                session_generation: self.session_generation,
+                protection_generation: generation,
+                protected_ready: false,
+                traffic_permitted: false,
+                failure: Some(failure),
+            },
+        }
+    }
+
+    /// Return the opaque token for the current direct or in-band protection
+    /// establishment attempt.
+    #[must_use]
+    pub fn pending_protection(&self) -> Option<PeerProtectionPending> {
+        match (self.protection, self.session_generation) {
+            (
+                PeerProtectionLifecycle::Pending {
+                    generation,
+                    requirement,
+                },
+                Some(session_generation),
+            ) => Some(PeerProtectionPending {
+                authority: Arc::clone(&self.authority),
+                session_generation,
+                protection_generation: generation,
+                mechanism: requirement.mechanism(),
+                sequence: requirement.sequence(),
+            }),
+            (
+                PeerProtectionLifecycle::NotNegotiated
+                | PeerProtectionLifecycle::Unprotected
+                | PeerProtectionLifecycle::Protected { .. }
+                | PeerProtectionLifecycle::Failed { .. },
+                _,
+            ) => None,
+            (PeerProtectionLifecycle::Pending { .. }, None) => None,
+        }
+    }
+
+    /// Return accepted protection evidence for the current session generation.
+    #[must_use]
+    pub const fn protection_evidence(&self) -> Option<PeerProtectionEvidence> {
+        match self.protection {
+            PeerProtectionLifecycle::Protected { evidence } => Some(evidence),
+            PeerProtectionLifecycle::NotNegotiated
+            | PeerProtectionLifecycle::Unprotected
+            | PeerProtectionLifecycle::Pending { .. }
+            | PeerProtectionLifecycle::Failed { .. } => None,
+        }
+    }
+
+    /// Attest that the exact current protection attempt completed with the
+    /// selected mutually authenticated transport mechanism.
+    ///
+    /// The caller must invoke this only after its TLS/TCP or DTLS/SCTP
+    /// implementation has completed the handshake and verified both local and
+    /// remote identities. This state-machine boundary does not perform transport
+    /// protection or certificate validation itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PeerProtectionError`] for a stale, non-pending, or wrong-
+    /// mechanism token. Stale errors do not mutate current readiness. A
+    /// current-attempt mechanism mismatch fails the session closed.
+    pub fn attest_mutually_authenticated_protection(
+        &mut self,
+        pending: &PeerProtectionPending,
+        mechanism: PeerProtectionMechanism,
+    ) -> Result<PeerProtectionTransition, PeerProtectionError> {
+        let (session_generation, generation) =
+            self.validate_pending_protection(pending, mechanism)?;
+        let previous_state = self.protection_readiness().state;
+        let evidence = PeerProtectionEvidence {
+            session_generation,
+            protection_generation: generation,
+            mechanism,
+            sequence: pending.sequence(),
+        };
+        self.protection = PeerProtectionLifecycle::Protected { evidence };
+        if self.capability_exchange_complete() {
+            self.state = PeerSessionState::Negotiated;
+            self.last_blockers.clear();
+        } else {
+            self.state = match pending.sequence() {
+                PeerProtectionSequence::DirectBeforeCapabilities => PeerSessionState::Idle,
+                PeerProtectionSequence::InbandAfterCapabilities => {
+                    PeerSessionState::CapabilitiesPending
+                }
+            };
+            self.last_blockers = vec![PeerSessionBlocker::CapabilitiesExchangePending];
+        }
+        Ok(self.protection_transition(PeerProtectionEvent::Established, previous_state))
+    }
+
+    /// Fail the exact current protection attempt with a stable, redaction-safe
+    /// reason.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PeerProtectionError`] when the supplied token is stale or no
+    /// longer pending. A rejected stale failure cannot poison the current
+    /// session generation.
+    pub fn fail_pending_protection(
+        &mut self,
+        pending: &PeerProtectionPending,
+        failure: PeerProtectionFailure,
+    ) -> Result<PeerProtectionTransition, PeerProtectionError> {
+        let mechanism = pending.mechanism();
+        let (_session_generation, generation) =
+            self.validate_pending_protection(pending, mechanism)?;
+        let previous_state = self.protection_readiness().state;
+        self.fail_protection_lifecycle(
+            Some(mechanism),
+            Some(pending.sequence()),
+            Some(generation),
+            failure,
+        );
+        Ok(self.protection_transition(PeerProtectionEvent::Failed, previous_state))
+    }
+
+    /// Evaluate whether a decoded Diameter header may cross the current peer
+    /// and protection boundary on an exact connection generation.
+    ///
+    /// Direct protection admits no Diameter bytes until attestation, then admits
+    /// only CER/CEA until capability success. In-band protection admits only the
+    /// correlated CER/CEA first, then no Diameter message while the selected
+    /// handshake is pending.
+    /// Explicitly unprotected negotiation preserves existing traffic behavior
+    /// but produces admission with `protected == false`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PeerCommandAdmissionError`] when protection or generic peer
+    /// state does not admit the command.
+    pub fn admit_message(
+        &self,
+        generation: PeerSessionGeneration,
+        direction: PeerMessageDirection,
+        header: &Header,
+    ) -> Result<PeerCommandAdmission, PeerCommandAdmissionError> {
+        if self.session_generation != Some(generation) {
+            return Err(PeerCommandAdmissionError::StaleGeneration);
+        }
+        let command = PeerCommandClass::from_header(header);
+        let protection = self.protection_readiness();
+        let terminal_disconnect_answer = command == PeerCommandClass::DisconnectPeer
+            && header.flags.command_kind() == CommandKind::Answer
+            && match direction {
+                PeerMessageDirection::Inbound => self.state == PeerSessionState::Disconnecting,
+                PeerMessageDirection::Outbound => self.state == PeerSessionState::Draining,
+            };
+        if !terminal_disconnect_answer
+            && (protection.state == PeerProtectionState::Pending
+                || protection.state == PeerProtectionState::Failed)
+        {
+            return Err(PeerCommandAdmissionError::ProtectionNotReady {
+                command,
+                protection_state: protection.state,
+            });
+        }
+
+        let session_ready = match command {
+            PeerCommandClass::CapabilitiesExchange => {
+                self.capabilities_header_is_admissible(direction, header)
+            }
+            PeerCommandClass::Application => self.state == PeerSessionState::Negotiated,
+            PeerCommandClass::DeviceWatchdog => matches!(
+                self.state,
+                PeerSessionState::Negotiated
+                    | PeerSessionState::WatchdogProbing
+                    | PeerSessionState::Degraded
+            ),
+            PeerCommandClass::DisconnectPeer => match header.flags.command_kind() {
+                CommandKind::Request => matches!(
+                    self.state,
+                    PeerSessionState::Negotiated
+                        | PeerSessionState::WatchdogProbing
+                        | PeerSessionState::Degraded
+                ),
+                CommandKind::Answer => terminal_disconnect_answer,
+            },
+        };
+        if !session_ready {
+            return Err(PeerCommandAdmissionError::SessionNotReady {
+                command,
+                state: self.state,
+            });
+        }
+
+        Ok(PeerCommandAdmission {
+            command,
+            direction,
+            session_generation: self.session_generation,
+            mechanism: protection.mechanism,
+            sequence: protection.sequence,
+            protection_generation: protection.protection_generation,
+            protected: protection.protected_ready,
+        })
     }
 
     /// Project a CEA without mutating session state.
@@ -1089,7 +2639,13 @@ impl PeerSession {
         if !self.policy.accepted_application_ids.is_empty() {
             blockers.push(PeerSessionBlocker::AcceptedApplicationMissing);
         }
-        if !self.policy.accepted_inband_security_ids.is_empty() {
+        let direct_protection = self
+            .protection_policy
+            .requirement()
+            .is_some_and(|requirement| {
+                requirement.sequence() == PeerProtectionSequence::DirectBeforeCapabilities
+            });
+        if !direct_protection && !self.policy.accepted_inband_security_ids.is_empty() {
             blockers.push(PeerSessionBlocker::AcceptedInbandSecurityMissing);
         }
         PeerSessionCapabilityProjection {
@@ -1097,7 +2653,7 @@ impl PeerSession {
             has_common_application: false,
             relay_application_common: false,
             accepted_application_common: false,
-            accepted_inband_security_common: false,
+            accepted_inband_security_common: direct_protection,
             diagnostics_present: !answer.diagnostics.is_empty(),
             accepted: false,
             blockers,
@@ -1107,14 +2663,80 @@ impl PeerSession {
     /// Mark a CER as sent.
     #[must_use]
     pub fn capabilities_request_sent(&mut self) -> PeerSessionTransition {
+        if let Some(requirement) = self.protection_policy.requirement() {
+            let previous = self.state;
+            self.fail_protection_lifecycle(
+                Some(requirement.mechanism()),
+                Some(requirement.sequence()),
+                self.protection_readiness().protection_generation,
+                PeerProtectionFailure::UnboundCapabilityEvidence,
+            );
+            return self.transition(PeerSessionEvent::Failure, previous);
+        }
+        self.capabilities_request_sent_inner()
+    }
+
+    /// Mark an exact-generation CER as sent on the protected-session path.
+    ///
+    /// Retransmission with the same Diameter identifiers is accepted. A
+    /// different outstanding CER on the same generation fails without
+    /// replacing the retained transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PeerCapabilityBoundaryError`] for a stale generation,
+    /// non-CER header, or conflicting outstanding transaction.
+    pub fn capabilities_request_sent_on(
+        &mut self,
+        generation: PeerSessionGeneration,
+        header: &Header,
+    ) -> Result<PeerSessionTransition, PeerCapabilityBoundaryError> {
+        self.validate_capability_generation(generation)?;
+        if !self.capability_phase_is_available() {
+            return Err(PeerCapabilityBoundaryError::InvalidSessionState);
+        }
+        if !matches!(
+            self.state,
+            PeerSessionState::Idle | PeerSessionState::CapabilitiesPending
+        ) {
+            return Err(PeerCapabilityBoundaryError::InvalidSessionState);
+        }
+        if !is_capabilities_header(header, CommandKind::Request) {
+            return Err(PeerCapabilityBoundaryError::InvalidCapabilitiesHeader);
+        }
+        if self.capability_role == Some(PeerCapabilityRole::Responder) {
+            return Err(PeerCapabilityBoundaryError::ConflictingTransaction);
+        }
+        let transaction = PeerCapabilityTransaction::from_header(header);
+        match self.outbound_capability_transaction {
+            Some(current) if current != transaction => {
+                return Err(PeerCapabilityBoundaryError::ConflictingTransaction);
+            }
+            Some(_) => {}
+            None => {
+                self.capability_role = Some(PeerCapabilityRole::Initiator);
+                self.outbound_capability_transaction = Some(transaction);
+            }
+        }
+        Ok(self.capabilities_request_sent_inner())
+    }
+
+    fn capabilities_request_sent_inner(&mut self) -> PeerSessionTransition {
         let previous = self.state;
         self.capabilities_requests_sent = self.capabilities_requests_sent.saturating_add(1);
+        self.capabilities_request_outstanding = true;
         self.state = PeerSessionState::CapabilitiesPending;
-        self.remote_capabilities = None;
-        self.last_capability_projection = None;
+        if self.inbound_capability_transaction.is_none() {
+            self.remote_capabilities = None;
+            self.last_capability_projection = None;
+            self.selected_protection = None;
+            if !self.direct_protection_is_attested() {
+                self.protection = PeerProtectionLifecycle::NotNegotiated;
+            }
+        }
         self.last_watchdog_projection = None;
         self.last_disconnect_projection = None;
-        self.last_blockers.clear();
+        self.last_blockers = vec![PeerSessionBlocker::CapabilitiesExchangePending];
         self.missed_watchdogs = 0;
         self.transition(PeerSessionEvent::CapabilitiesRequestSent, previous)
     }
@@ -1125,14 +2747,133 @@ impl PeerSession {
         &mut self,
         remote: PeerCapabilities,
     ) -> PeerSessionTransition {
+        if let Some(requirement) = self.protection_policy.requirement() {
+            let previous = self.state;
+            self.fail_protection_lifecycle(
+                Some(requirement.mechanism()),
+                Some(requirement.sequence()),
+                self.protection_readiness().protection_generation,
+                PeerProtectionFailure::UnboundCapabilityEvidence,
+            );
+            return self.transition(PeerSessionEvent::Failure, previous);
+        }
+        self.capabilities_request_received_inner(remote, false)
+    }
+
+    /// Observe an exact-generation decoded CER on the protected-session path.
+    ///
+    /// The matching CEA must subsequently be committed with
+    /// [`PeerSession::prepare_capabilities_answer_on`]. That commit creates an
+    /// in-band protection attempt or, for already-attested direct protection,
+    /// completes capability readiness. An initiator CER on this same generation
+    /// is rejected; simultaneous-open election is owned by the transport facade.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PeerCapabilityBoundaryError`] for a stale generation,
+    /// non-CER header, or conflicting inbound transaction.
+    pub fn capabilities_request_received_on(
+        &mut self,
+        generation: PeerSessionGeneration,
+        header: &Header,
+        remote: PeerCapabilities,
+    ) -> Result<PeerSessionTransition, PeerCapabilityBoundaryError> {
+        self.validate_capability_generation(generation)?;
+        if !self.capability_phase_is_available() {
+            return Err(PeerCapabilityBoundaryError::InvalidSessionState);
+        }
+        if !matches!(
+            self.state,
+            PeerSessionState::Idle | PeerSessionState::CapabilitiesPending
+        ) {
+            return Err(PeerCapabilityBoundaryError::InvalidSessionState);
+        }
+        if !is_capabilities_header(header, CommandKind::Request) {
+            return Err(PeerCapabilityBoundaryError::InvalidCapabilitiesHeader);
+        }
+        if self.capability_role == Some(PeerCapabilityRole::Initiator) {
+            return Err(PeerCapabilityBoundaryError::ConflictingTransaction);
+        }
+        let transaction = PeerCapabilityTransaction::from_header(header);
+        match self.inbound_capability_transaction {
+            Some(current) if current != transaction => {
+                return Err(PeerCapabilityBoundaryError::ConflictingTransaction);
+            }
+            Some(_) => {}
+            None => {
+                self.capability_role = Some(PeerCapabilityRole::Responder);
+                self.inbound_capability_transaction = Some(transaction);
+            }
+        }
+        Ok(self.capabilities_request_received_inner(remote, true))
+    }
+
+    fn capabilities_request_received_inner(
+        &mut self,
+        remote: PeerCapabilities,
+        generation_bound: bool,
+    ) -> PeerSessionTransition {
         let previous = self.state;
         self.capabilities_requests_received = self.capabilities_requests_received.saturating_add(1);
         let negotiated = negotiate_capabilities(&self.local_capabilities, &remote);
-        let result_code = negotiated.cea_result_code();
+        let mut result_code = negotiated.cea_result_code();
+        if result_code == RESULT_CODE_DIAMETER_SUCCESS
+            && !self.protection_security_is_common(&negotiated)
+        {
+            result_code = RESULT_CODE_DIAMETER_NO_COMMON_SECURITY;
+        }
         let projection = self.project_capabilities(result_code, &remote, false);
-        self.remote_capabilities = Some(remote);
-        self.apply_capability_projection(projection);
+        self.remote_capabilities = Some(remote.clone());
+        self.apply_capability_projection(projection, &remote, generation_bound);
         self.transition(PeerSessionEvent::CapabilitiesRequestReceived, previous)
+    }
+
+    /// Prepare and consume the exact matching CEA for a generation-bound CER.
+    ///
+    /// This is the sole responder-side emission boundary. It validates the
+    /// typed Result-Code and, for in-band protection, security advertisement;
+    /// canonically builds and serializes the CEA with the retained request
+    /// identifiers; and consumes the inbound transaction before returning
+    /// immutable bytes. Direct protection parses but does not negotiate
+    /// `Inband-Security-Id`. Callers emit
+    /// only [`PeerCapabilitiesAnswerEmission::as_bytes`]; header-only outbound
+    /// CEA admission is deliberately unavailable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PeerCapabilityAnswerPreparationError`] for a stale generation,
+    /// missing transaction, contradictory typed answer content, or canonical
+    /// construction/serialization failure. A failed preparation does not consume
+    /// the request, while a successful preparation is one-shot.
+    pub fn prepare_capabilities_answer_on(
+        &mut self,
+        generation: PeerSessionGeneration,
+        answer: &CapabilitiesExchangeAnswer,
+        ctx: EncodeContext,
+    ) -> Result<PeerCapabilitiesAnswerEmission, PeerCapabilityAnswerPreparationError> {
+        self.validate_capability_generation(generation)?;
+        let Some(transaction) = self.inbound_capability_transaction else {
+            return Err(PeerCapabilityBoundaryError::TransactionMismatch.into());
+        };
+        self.validate_capabilities_answer_commit(answer)?;
+        let message = build_capabilities_exchange_answer(
+            answer,
+            transaction.hop_by_hop_identifier,
+            transaction.end_to_end_identifier,
+            ctx,
+        )?;
+        self.validate_capabilities_answer_error_bit(&message.header, answer.result_code)?;
+        let mut wire = BytesMut::new();
+        message.encode(&mut wire, ctx)?;
+
+        self.inbound_capability_transaction = None;
+        if self.state != PeerSessionState::Failed {
+            self.finish_capability_phase();
+        }
+        Ok(PeerCapabilitiesAnswerEmission {
+            wire: wire.freeze(),
+            readiness: self.readiness(),
+        })
     }
 
     /// Observe a decoded CEA from the peer.
@@ -1141,12 +2882,60 @@ impl PeerSession {
         &mut self,
         answer: &CapabilitiesExchangeAnswer,
     ) -> PeerSessionTransition {
+        if let Some(requirement) = self.protection_policy.requirement() {
+            let previous = self.state;
+            self.fail_protection_lifecycle(
+                Some(requirement.mechanism()),
+                Some(requirement.sequence()),
+                self.protection_readiness().protection_generation,
+                PeerProtectionFailure::UnboundCapabilityEvidence,
+            );
+            return self.transition(PeerSessionEvent::Failure, previous);
+        }
+        self.observe_capabilities_answer_inner(answer, false)
+    }
+
+    /// Observe an exact-generation decoded CEA on the protected-session path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PeerCapabilityBoundaryError`] for a stale generation,
+    /// non-CEA header, or transaction mismatch.
+    pub fn observe_capabilities_answer_on(
+        &mut self,
+        generation: PeerSessionGeneration,
+        header: &Header,
+        answer: &CapabilitiesExchangeAnswer,
+    ) -> Result<PeerSessionTransition, PeerCapabilityBoundaryError> {
+        self.validate_capability_generation(generation)?;
+        if !is_capabilities_header(header, CommandKind::Answer) {
+            return Err(PeerCapabilityBoundaryError::InvalidCapabilitiesHeader);
+        }
+        let Some(transaction) = self.outbound_capability_transaction else {
+            return Err(PeerCapabilityBoundaryError::TransactionMismatch);
+        };
+        if !transaction.matches(header) {
+            return Err(PeerCapabilityBoundaryError::TransactionMismatch);
+        }
+        self.validate_capabilities_answer_error_bit(header, answer.result_code)?;
+        self.outbound_capability_transaction = None;
+        self.capabilities_request_outstanding = false;
+        Ok(self.observe_capabilities_answer_inner(answer, true))
+    }
+
+    fn observe_capabilities_answer_inner(
+        &mut self,
+        answer: &CapabilitiesExchangeAnswer,
+        generation_bound: bool,
+    ) -> PeerSessionTransition {
         let previous = self.state;
         self.capabilities_answers_observed = self.capabilities_answers_observed.saturating_add(1);
+        self.capabilities_request_outstanding = false;
         self.remote_capabilities = Some(answer.capabilities.clone());
         let projection = self.project_capabilities_answer(answer);
-        let accepted = projection.accepted;
-        self.apply_capability_projection(projection);
+        let capability_accepted = projection.accepted;
+        self.apply_capability_projection(projection, &answer.capabilities, generation_bound);
+        let accepted = capability_accepted && self.state != PeerSessionState::Failed;
         self.transition(
             if accepted {
                 PeerSessionEvent::CapabilitiesAnswerAccepted
@@ -1163,11 +2952,56 @@ impl PeerSession {
         &mut self,
         answer: &CapabilitiesExchangeErrorAnswer,
     ) -> PeerSessionTransition {
+        if let Some(requirement) = self.protection_policy.requirement() {
+            let previous = self.state;
+            self.fail_protection_lifecycle(
+                Some(requirement.mechanism()),
+                Some(requirement.sequence()),
+                self.protection_readiness().protection_generation,
+                PeerProtectionFailure::UnboundCapabilityEvidence,
+            );
+            return self.transition(PeerSessionEvent::Failure, previous);
+        }
+        self.observe_capabilities_protocol_error_answer_inner(answer)
+    }
+
+    /// Observe an exact-generation protocol-error CEA.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PeerCapabilityBoundaryError`] for a stale generation,
+    /// non-CEA header, or transaction mismatch.
+    pub fn observe_capabilities_protocol_error_answer_on(
+        &mut self,
+        generation: PeerSessionGeneration,
+        header: &Header,
+        answer: &CapabilitiesExchangeErrorAnswer,
+    ) -> Result<PeerSessionTransition, PeerCapabilityBoundaryError> {
+        self.validate_capability_generation(generation)?;
+        if !is_capabilities_header(header, CommandKind::Answer) {
+            return Err(PeerCapabilityBoundaryError::InvalidCapabilitiesHeader);
+        }
+        let Some(transaction) = self.outbound_capability_transaction else {
+            return Err(PeerCapabilityBoundaryError::TransactionMismatch);
+        };
+        if !transaction.matches(header) {
+            return Err(PeerCapabilityBoundaryError::TransactionMismatch);
+        }
+        self.validate_capabilities_answer_error_bit(header, answer.result_code)?;
+        self.outbound_capability_transaction = None;
+        self.capabilities_request_outstanding = false;
+        Ok(self.observe_capabilities_protocol_error_answer_inner(answer))
+    }
+
+    fn observe_capabilities_protocol_error_answer_inner(
+        &mut self,
+        answer: &CapabilitiesExchangeErrorAnswer,
+    ) -> PeerSessionTransition {
         let previous = self.state;
         self.capabilities_protocol_errors_observed =
             self.capabilities_protocol_errors_observed.saturating_add(1);
         let projection = self.project_capabilities_protocol_error_answer(answer);
-        self.apply_capability_projection(projection);
+        self.apply_rejected_capability_projection(projection);
         self.transition(PeerSessionEvent::CapabilitiesProtocolError, previous)
     }
 
@@ -1178,6 +3012,39 @@ impl PeerSession {
     /// Returns [`PeerSessionError`] when capability negotiation has not
     /// completed or the session is draining, reconnecting, or failed.
     pub fn watchdog_request_sent(&mut self) -> Result<PeerSessionTransition, PeerSessionError> {
+        if self.protection_policy.requires_generation_binding() {
+            return Err(PeerSessionError::InvalidTransition {
+                operation: "watchdog_request_sent_unbound",
+                state: self.state,
+            });
+        }
+        self.watchdog_request_sent_inner()
+    }
+
+    /// Mark a DWR as sent on the exact current transport generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PeerSessionBoundError`] for stale connection evidence or an
+    /// invalid peer-state transition.
+    pub fn watchdog_request_sent_on(
+        &mut self,
+        generation: PeerSessionGeneration,
+        header: &Header,
+    ) -> Result<PeerSessionTransition, PeerSessionBoundError> {
+        self.validate_lifecycle_message(
+            generation,
+            PeerMessageDirection::Outbound,
+            header,
+            PeerProcedure::DeviceWatchdog,
+            CommandKind::Request,
+            "watchdog_request_sent",
+        )?;
+        self.watchdog_request_sent_inner()
+            .map_err(PeerSessionBoundError::from_session)
+    }
+
+    fn watchdog_request_sent_inner(&mut self) -> Result<PeerSessionTransition, PeerSessionError> {
         if !matches!(
             self.state,
             PeerSessionState::Negotiated | PeerSessionState::Degraded
@@ -1208,7 +3075,50 @@ impl PeerSession {
         &mut self,
         request: &DeviceWatchdogRequest,
     ) -> PeerSessionTransition {
+        if self.protection_policy.requires_generation_binding() {
+            return self.transition(PeerSessionEvent::Failure, self.state);
+        }
+        self.observe_watchdog_request_inner(request)
+    }
+
+    /// Observe a decoded DWR on the exact current transport generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PeerSessionBoundError::StaleGeneration`] without mutation
+    /// when the request belongs to an earlier transport.
+    pub fn observe_watchdog_request_on(
+        &mut self,
+        generation: PeerSessionGeneration,
+        header: &Header,
+        request: &DeviceWatchdogRequest,
+    ) -> Result<PeerSessionTransition, PeerSessionBoundError> {
+        self.validate_lifecycle_message(
+            generation,
+            PeerMessageDirection::Inbound,
+            header,
+            PeerProcedure::DeviceWatchdog,
+            CommandKind::Request,
+            "observe_watchdog_request",
+        )?;
+        Ok(self.observe_watchdog_request_inner(request))
+    }
+
+    fn observe_watchdog_request_inner(
+        &mut self,
+        request: &DeviceWatchdogRequest,
+    ) -> PeerSessionTransition {
         let previous = self.state;
+        if matches!(self.protection, PeerProtectionLifecycle::Pending { .. }) {
+            let readiness = self.protection_readiness();
+            self.fail_protection_lifecycle(
+                readiness.mechanism,
+                readiness.sequence,
+                readiness.protection_generation,
+                PeerProtectionFailure::CommandBeforeProtection,
+            );
+            return self.transition(PeerSessionEvent::Failure, previous);
+        }
         self.watchdog_requests_received = self.watchdog_requests_received.saturating_add(1);
         self.last_watchdog_projection = Some(PeerSessionWatchdogProjection {
             result_code: None,
@@ -1228,6 +3138,43 @@ impl PeerSession {
     /// Returns [`PeerSessionError`] when no negotiated session or outstanding
     /// watchdog probe exists.
     pub fn observe_watchdog_answer(
+        &mut self,
+        answer: &DeviceWatchdogAnswer,
+    ) -> Result<PeerSessionTransition, PeerSessionError> {
+        if self.protection_policy.requires_generation_binding() {
+            return Err(PeerSessionError::InvalidTransition {
+                operation: "observe_watchdog_answer_unbound",
+                state: self.state,
+            });
+        }
+        self.observe_watchdog_answer_inner(answer)
+    }
+
+    /// Observe a decoded DWA on the exact current transport generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PeerSessionBoundError`] for stale connection evidence or an
+    /// invalid peer-state transition.
+    pub fn observe_watchdog_answer_on(
+        &mut self,
+        generation: PeerSessionGeneration,
+        header: &Header,
+        answer: &DeviceWatchdogAnswer,
+    ) -> Result<PeerSessionTransition, PeerSessionBoundError> {
+        self.validate_lifecycle_message(
+            generation,
+            PeerMessageDirection::Inbound,
+            header,
+            PeerProcedure::DeviceWatchdog,
+            CommandKind::Answer,
+            "observe_watchdog_answer",
+        )?;
+        self.observe_watchdog_answer_inner(answer)
+            .map_err(PeerSessionBoundError::from_session)
+    }
+
+    fn observe_watchdog_answer_inner(
         &mut self,
         answer: &DeviceWatchdogAnswer,
     ) -> Result<PeerSessionTransition, PeerSessionError> {
@@ -1281,6 +3228,31 @@ impl PeerSession {
     /// Returns [`PeerSessionError`] when no negotiated session or outstanding
     /// watchdog probe exists.
     pub fn watchdog_missed(&mut self) -> Result<PeerSessionTransition, PeerSessionError> {
+        if self.protection_policy.requires_generation_binding() {
+            return Err(PeerSessionError::InvalidTransition {
+                operation: "watchdog_missed_unbound",
+                state: self.state,
+            });
+        }
+        self.watchdog_missed_inner()
+    }
+
+    /// Record a missed watchdog on the exact current transport generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PeerSessionBoundError`] for stale connection evidence or an
+    /// invalid peer-state transition.
+    pub fn watchdog_missed_on(
+        &mut self,
+        generation: PeerSessionGeneration,
+    ) -> Result<PeerSessionTransition, PeerSessionBoundError> {
+        self.validate_lifecycle_generation(generation)?;
+        self.watchdog_missed_inner()
+            .map_err(PeerSessionBoundError::from_session)
+    }
+
+    fn watchdog_missed_inner(&mut self) -> Result<PeerSessionTransition, PeerSessionError> {
         if !matches!(
             self.state,
             PeerSessionState::WatchdogProbing
@@ -1315,14 +3287,58 @@ impl PeerSession {
             alive: false,
             blockers: self.last_blockers.clone(),
         });
+        if threshold_exceeded {
+            self.revoke_protection(PeerProtectionFailure::SessionFailed);
+        }
         Ok(self.transition(PeerSessionEvent::WatchdogMissed, previous))
     }
 
     /// Mark a local DPR as sent.
     #[must_use]
-    pub fn disconnect_request_sent(&mut self, _cause: DisconnectCause) -> PeerSessionTransition {
+    pub fn disconnect_request_sent(&mut self, cause: DisconnectCause) -> PeerSessionTransition {
+        if self.protection_policy.requires_generation_binding() {
+            return self.transition(PeerSessionEvent::Failure, self.state);
+        }
+        self.disconnect_request_sent_inner(cause)
+    }
+
+    /// Mark a local DPR as sent on the exact current transport generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PeerSessionBoundError::StaleGeneration`] without mutation
+    /// when the request belongs to an earlier transport.
+    pub fn disconnect_request_sent_on(
+        &mut self,
+        generation: PeerSessionGeneration,
+        header: &Header,
+        cause: DisconnectCause,
+    ) -> Result<PeerSessionTransition, PeerSessionBoundError> {
+        self.validate_lifecycle_message(
+            generation,
+            PeerMessageDirection::Outbound,
+            header,
+            PeerProcedure::DisconnectPeer,
+            CommandKind::Request,
+            "disconnect_request_sent",
+        )?;
+        Ok(self.disconnect_request_sent_inner(cause))
+    }
+
+    fn disconnect_request_sent_inner(&mut self, _cause: DisconnectCause) -> PeerSessionTransition {
         let previous = self.state;
+        if matches!(self.protection, PeerProtectionLifecycle::Pending { .. }) {
+            let readiness = self.protection_readiness();
+            self.fail_protection_lifecycle(
+                readiness.mechanism,
+                readiness.sequence,
+                readiness.protection_generation,
+                PeerProtectionFailure::CommandBeforeProtection,
+            );
+            return self.transition(PeerSessionEvent::Failure, previous);
+        }
         self.disconnect_requests_sent = self.disconnect_requests_sent.saturating_add(1);
+        self.revoke_protection(PeerProtectionFailure::SessionFailed);
         self.state = PeerSessionState::Disconnecting;
         self.last_blockers = vec![PeerSessionBlocker::DisconnectInProgress];
         self.last_disconnect_projection = Some(PeerSessionDisconnectProjection {
@@ -1339,10 +3355,54 @@ impl PeerSession {
     #[must_use]
     pub fn observe_disconnect_request(
         &mut self,
+        request: &DisconnectPeerRequest,
+    ) -> PeerSessionTransition {
+        if self.protection_policy.requires_generation_binding() {
+            return self.transition(PeerSessionEvent::Failure, self.state);
+        }
+        self.observe_disconnect_request_inner(request)
+    }
+
+    /// Observe a decoded DPR on the exact current transport generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PeerSessionBoundError::StaleGeneration`] without mutation
+    /// when the request belongs to an earlier transport.
+    pub fn observe_disconnect_request_on(
+        &mut self,
+        generation: PeerSessionGeneration,
+        header: &Header,
+        request: &DisconnectPeerRequest,
+    ) -> Result<PeerSessionTransition, PeerSessionBoundError> {
+        self.validate_lifecycle_message(
+            generation,
+            PeerMessageDirection::Inbound,
+            header,
+            PeerProcedure::DisconnectPeer,
+            CommandKind::Request,
+            "observe_disconnect_request",
+        )?;
+        Ok(self.observe_disconnect_request_inner(request))
+    }
+
+    fn observe_disconnect_request_inner(
+        &mut self,
         _request: &DisconnectPeerRequest,
     ) -> PeerSessionTransition {
         let previous = self.state;
+        if matches!(self.protection, PeerProtectionLifecycle::Pending { .. }) {
+            let readiness = self.protection_readiness();
+            self.fail_protection_lifecycle(
+                readiness.mechanism,
+                readiness.sequence,
+                readiness.protection_generation,
+                PeerProtectionFailure::CommandBeforeProtection,
+            );
+            return self.transition(PeerSessionEvent::Failure, previous);
+        }
         self.disconnect_requests_received = self.disconnect_requests_received.saturating_add(1);
+        self.revoke_protection(PeerProtectionFailure::SessionFailed);
         self.state = PeerSessionState::Draining;
         self.last_blockers = vec![
             PeerSessionBlocker::PeerRequestedDisconnect,
@@ -1364,7 +3424,50 @@ impl PeerSession {
         &mut self,
         answer: &DisconnectPeerAnswer,
     ) -> PeerSessionTransition {
+        if self.protection_policy.requires_generation_binding() {
+            return self.transition(PeerSessionEvent::Failure, self.state);
+        }
+        self.disconnect_answer_sent_inner(answer)
+    }
+
+    /// Mark a local DPA as sent on the exact current transport generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PeerSessionBoundError::StaleGeneration`] without mutation
+    /// when the answer belongs to an earlier transport.
+    pub fn disconnect_answer_sent_on(
+        &mut self,
+        generation: PeerSessionGeneration,
+        header: &Header,
+        answer: &DisconnectPeerAnswer,
+    ) -> Result<PeerSessionTransition, PeerSessionBoundError> {
+        self.validate_lifecycle_message(
+            generation,
+            PeerMessageDirection::Outbound,
+            header,
+            PeerProcedure::DisconnectPeer,
+            CommandKind::Answer,
+            "disconnect_answer_sent",
+        )?;
+        Ok(self.disconnect_answer_sent_inner(answer))
+    }
+
+    fn disconnect_answer_sent_inner(
+        &mut self,
+        answer: &DisconnectPeerAnswer,
+    ) -> PeerSessionTransition {
         let previous = self.state;
+        if matches!(self.protection, PeerProtectionLifecycle::Pending { .. }) {
+            let readiness = self.protection_readiness();
+            self.fail_protection_lifecycle(
+                readiness.mechanism,
+                readiness.sequence,
+                readiness.protection_generation,
+                PeerProtectionFailure::CommandBeforeProtection,
+            );
+            return self.transition(PeerSessionEvent::Failure, previous);
+        }
         self.disconnect_answers_observed = self.disconnect_answers_observed.saturating_add(1);
         self.apply_disconnect_answer(answer, true);
         self.transition(PeerSessionEvent::DisconnectAnswerSent, previous)
@@ -1376,7 +3479,50 @@ impl PeerSession {
         &mut self,
         answer: &DisconnectPeerAnswer,
     ) -> PeerSessionTransition {
+        if self.protection_policy.requires_generation_binding() {
+            return self.transition(PeerSessionEvent::Failure, self.state);
+        }
+        self.observe_disconnect_answer_inner(answer)
+    }
+
+    /// Observe a decoded DPA on the exact current transport generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PeerSessionBoundError::StaleGeneration`] without mutation
+    /// when the answer belongs to an earlier transport.
+    pub fn observe_disconnect_answer_on(
+        &mut self,
+        generation: PeerSessionGeneration,
+        header: &Header,
+        answer: &DisconnectPeerAnswer,
+    ) -> Result<PeerSessionTransition, PeerSessionBoundError> {
+        self.validate_lifecycle_message(
+            generation,
+            PeerMessageDirection::Inbound,
+            header,
+            PeerProcedure::DisconnectPeer,
+            CommandKind::Answer,
+            "observe_disconnect_answer",
+        )?;
+        Ok(self.observe_disconnect_answer_inner(answer))
+    }
+
+    fn observe_disconnect_answer_inner(
+        &mut self,
+        answer: &DisconnectPeerAnswer,
+    ) -> PeerSessionTransition {
         let previous = self.state;
+        if matches!(self.protection, PeerProtectionLifecycle::Pending { .. }) {
+            let readiness = self.protection_readiness();
+            self.fail_protection_lifecycle(
+                readiness.mechanism,
+                readiness.sequence,
+                readiness.protection_generation,
+                PeerProtectionFailure::CommandBeforeProtection,
+            );
+            return self.transition(PeerSessionEvent::Failure, previous);
+        }
         self.disconnect_answers_observed = self.disconnect_answers_observed.saturating_add(1);
         self.apply_disconnect_answer(answer, false);
         self.transition(PeerSessionEvent::DisconnectAnswerReceived, previous)
@@ -1385,8 +3531,30 @@ impl PeerSession {
     /// Move to reconnecting state.
     #[must_use]
     pub fn schedule_reconnect(&mut self) -> PeerSessionTransition {
+        if self.protection_policy.requires_generation_binding() {
+            return self.transition(PeerSessionEvent::Failure, self.state);
+        }
+        self.schedule_reconnect_inner()
+    }
+
+    /// Move the exact current transport generation to reconnecting state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PeerSessionBoundError::StaleGeneration`] without mutation
+    /// for an event from an earlier transport.
+    pub fn schedule_reconnect_on(
+        &mut self,
+        generation: PeerSessionGeneration,
+    ) -> Result<PeerSessionTransition, PeerSessionBoundError> {
+        self.validate_lifecycle_generation(generation)?;
+        Ok(self.schedule_reconnect_inner())
+    }
+
+    fn schedule_reconnect_inner(&mut self) -> PeerSessionTransition {
         let previous = self.state;
         self.reconnects_scheduled = self.reconnects_scheduled.saturating_add(1);
+        self.revoke_protection(PeerProtectionFailure::SessionFailed);
         self.state = PeerSessionState::Reconnecting;
         self.last_blockers.clear();
         self.transition(PeerSessionEvent::ReconnectScheduled, previous)
@@ -1395,8 +3563,30 @@ impl PeerSession {
     /// Move to reconnect backoff state.
     #[must_use]
     pub fn enter_backoff(&mut self) -> PeerSessionTransition {
+        if self.protection_policy.requires_generation_binding() {
+            return self.transition(PeerSessionEvent::Failure, self.state);
+        }
+        self.enter_backoff_inner()
+    }
+
+    /// Move the exact current transport generation into reconnect backoff.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PeerSessionBoundError::StaleGeneration`] without mutation
+    /// for an event from an earlier transport.
+    pub fn enter_backoff_on(
+        &mut self,
+        generation: PeerSessionGeneration,
+    ) -> Result<PeerSessionTransition, PeerSessionBoundError> {
+        self.validate_lifecycle_generation(generation)?;
+        Ok(self.enter_backoff_inner())
+    }
+
+    fn enter_backoff_inner(&mut self) -> PeerSessionTransition {
         let previous = self.state;
         self.backoffs_entered = self.backoffs_entered.saturating_add(1);
+        self.revoke_protection(PeerProtectionFailure::SessionFailed);
         self.state = PeerSessionState::Backoff;
         self.last_blockers = vec![PeerSessionBlocker::ReconnectBackoff];
         self.transition(PeerSessionEvent::BackoffEntered, previous)
@@ -1405,8 +3595,30 @@ impl PeerSession {
     /// Mark reconnect backoff elapsed.
     #[must_use]
     pub fn backoff_elapsed(&mut self) -> PeerSessionTransition {
+        if self.protection_policy.requires_generation_binding() {
+            return self.transition(PeerSessionEvent::Failure, self.state);
+        }
+        self.backoff_elapsed_inner()
+    }
+
+    /// Mark reconnect backoff elapsed for the exact current generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PeerSessionBoundError::StaleGeneration`] without mutation
+    /// for an event from an earlier transport.
+    pub fn backoff_elapsed_on(
+        &mut self,
+        generation: PeerSessionGeneration,
+    ) -> Result<PeerSessionTransition, PeerSessionBoundError> {
+        self.validate_lifecycle_generation(generation)?;
+        Ok(self.backoff_elapsed_inner())
+    }
+
+    fn backoff_elapsed_inner(&mut self) -> PeerSessionTransition {
         let previous = self.state;
         self.reconnects_scheduled = self.reconnects_scheduled.saturating_add(1);
+        self.revoke_protection(PeerProtectionFailure::SessionFailed);
         self.state = PeerSessionState::Reconnecting;
         self.last_blockers.clear();
         self.transition(PeerSessionEvent::BackoffElapsed, previous)
@@ -1415,7 +3627,30 @@ impl PeerSession {
     /// Fail the session closed with a stable blocker.
     #[must_use]
     pub fn fail(&mut self, blocker: PeerSessionBlocker) -> PeerSessionTransition {
+        if self.protection_policy.requires_generation_binding() {
+            return self.transition(PeerSessionEvent::Failure, self.state);
+        }
+        self.fail_inner(blocker)
+    }
+
+    /// Fail the exact current transport generation closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PeerSessionBoundError::StaleGeneration`] without mutation
+    /// for an event from an earlier transport.
+    pub fn fail_on(
+        &mut self,
+        generation: PeerSessionGeneration,
+        blocker: PeerSessionBlocker,
+    ) -> Result<PeerSessionTransition, PeerSessionBoundError> {
+        self.validate_lifecycle_generation(generation)?;
+        Ok(self.fail_inner(blocker))
+    }
+
+    fn fail_inner(&mut self, blocker: PeerSessionBlocker) -> PeerSessionTransition {
         let previous = self.state;
+        self.revoke_protection(PeerProtectionFailure::SessionFailed);
         self.state = PeerSessionState::Failed;
         self.last_blockers = vec![blocker];
         self.transition(PeerSessionEvent::Failure, previous)
@@ -1439,7 +3674,8 @@ impl PeerSession {
                 self.state,
                 PeerSessionState::Reconnecting | PeerSessionState::Backoff
             ),
-            traffic_ready: self.state == PeerSessionState::Negotiated,
+            traffic_ready: self.state == PeerSessionState::Negotiated
+                && self.protection_readiness().traffic_permitted,
             blockers,
         }
     }
@@ -1482,12 +3718,33 @@ impl PeerSession {
                 .accepted_application_ids
                 .iter()
                 .any(|application_id| negotiated.application_ids.contains(application_id));
-        let accepted_inband_security_common = self.policy.accepted_inband_security_ids.is_empty()
-            || self
-                .policy
-                .accepted_inband_security_ids
-                .iter()
-                .any(|security_id| negotiated.inband_security_ids.contains(security_id));
+        let accepted_inband_security_common = match self.protection_policy {
+            PeerProtectionPolicy::CompatibilityUnprotected => {
+                let no_inband_common = negotiated
+                    .inband_security_ids
+                    .contains(&INBAND_SECURITY_ID_NO_INBAND_SECURITY);
+                let selector_accepts_no_inband =
+                    self.policy.accepted_inband_security_ids.is_empty()
+                        || self
+                            .policy
+                            .accepted_inband_security_ids
+                            .contains(&INBAND_SECURITY_ID_NO_INBAND_SECURITY);
+                no_inband_common && selector_accepts_no_inband
+            }
+            PeerProtectionPolicy::Require(requirement) => match requirement.sequence() {
+                PeerProtectionSequence::DirectBeforeCapabilities => true,
+                PeerProtectionSequence::InbandAfterCapabilities => {
+                    negotiated
+                        .inband_security_ids
+                        .contains(&INBAND_SECURITY_ID_TLS)
+                        && (self.policy.accepted_inband_security_ids.is_empty()
+                            || self
+                                .policy
+                                .accepted_inband_security_ids
+                                .contains(&INBAND_SECURITY_ID_TLS))
+                }
+            },
+        };
         let mut blockers = Vec::new();
         if result_code != RESULT_CODE_DIAMETER_SUCCESS {
             blockers.push(PeerSessionBlocker::CapabilitiesResultNotSuccess);
@@ -1513,17 +3770,480 @@ impl PeerSession {
         }
     }
 
-    fn apply_capability_projection(&mut self, projection: PeerSessionCapabilityProjection) {
+    fn protection_security_is_common(&self, negotiated: &CapabilityNegotiation) -> bool {
+        match self.protection_policy {
+            PeerProtectionPolicy::CompatibilityUnprotected => negotiated
+                .inband_security_ids
+                .contains(&INBAND_SECURITY_ID_NO_INBAND_SECURITY),
+            PeerProtectionPolicy::Require(requirement) => match requirement.sequence() {
+                PeerProtectionSequence::DirectBeforeCapabilities => true,
+                PeerProtectionSequence::InbandAfterCapabilities => negotiated
+                    .inband_security_ids
+                    .contains(&INBAND_SECURITY_ID_TLS),
+            },
+        }
+    }
+
+    fn apply_capability_projection(
+        &mut self,
+        projection: PeerSessionCapabilityProjection,
+        remote: &PeerCapabilities,
+        generation_bound: bool,
+    ) {
+        self.missed_watchdogs = 0;
+        self.last_watchdog_projection = None;
+        self.last_disconnect_projection = None;
+        let mechanism = self.selected_protection_for(remote);
+        if self
+            .selected_protection
+            .is_some_and(|selected| selected != mechanism)
+        {
+            self.last_capability_projection = Some(projection);
+            self.fail_protection_lifecycle(
+                Some(mechanism),
+                self.protection_policy
+                    .requirement()
+                    .map(|requirement| requirement.sequence()),
+                self.protection_readiness().protection_generation,
+                PeerProtectionFailure::DowngradeRejected,
+            );
+            return;
+        }
+        if !projection.accepted {
+            self.apply_rejected_capability_projection(projection);
+            return;
+        }
+
+        if mechanism.is_protected() && !generation_bound {
+            self.last_capability_projection = Some(projection);
+            self.fail_protection_lifecycle(
+                Some(mechanism),
+                self.protection_policy
+                    .requirement()
+                    .map(|requirement| requirement.sequence()),
+                None,
+                PeerProtectionFailure::UnboundCapabilityEvidence,
+            );
+            return;
+        }
+        self.selected_protection = Some(mechanism);
+        self.capability_evidence_generation_bound |= generation_bound;
+        self.last_capability_projection = Some(projection);
+        self.finish_capability_phase();
+    }
+
+    fn apply_rejected_capability_projection(
+        &mut self,
+        projection: PeerSessionCapabilityProjection,
+    ) {
         self.missed_watchdogs = 0;
         self.last_watchdog_projection = None;
         self.last_disconnect_projection = None;
         self.last_blockers = projection.blockers.clone();
-        self.state = if projection.accepted {
-            PeerSessionState::Negotiated
-        } else {
-            PeerSessionState::Failed
+        self.state = PeerSessionState::Failed;
+        self.protection = PeerProtectionLifecycle::Failed {
+            mechanism: self.selected_protection,
+            sequence: self
+                .protection_policy
+                .requirement()
+                .map(|requirement| requirement.sequence()),
+            generation: self.protection_readiness().protection_generation,
+            failure: PeerProtectionFailure::SessionFailed,
         };
         self.last_capability_projection = Some(projection);
+    }
+
+    fn selected_protection_for(&self, remote: &PeerCapabilities) -> PeerProtectionMechanism {
+        let negotiated = negotiate_capabilities(&self.local_capabilities, remote);
+        match self.protection_policy {
+            PeerProtectionPolicy::CompatibilityUnprotected => PeerProtectionMechanism::Unprotected,
+            PeerProtectionPolicy::Require(requirement) => match requirement.sequence() {
+                PeerProtectionSequence::DirectBeforeCapabilities => requirement.mechanism(),
+                PeerProtectionSequence::InbandAfterCapabilities => {
+                    if negotiated
+                        .inband_security_ids
+                        .contains(&INBAND_SECURITY_ID_TLS)
+                    {
+                        requirement.mechanism()
+                    } else {
+                        PeerProtectionMechanism::Unprotected
+                    }
+                }
+            },
+        }
+    }
+
+    fn finish_capability_phase(&mut self) {
+        if self.capabilities_request_outstanding
+            || self.outbound_capability_transaction.is_some()
+            || self.inbound_capability_transaction.is_some()
+        {
+            self.state = PeerSessionState::CapabilitiesPending;
+            self.last_blockers = vec![PeerSessionBlocker::CapabilitiesExchangePending];
+            return;
+        }
+
+        match (self.protection_policy, self.selected_protection) {
+            (
+                PeerProtectionPolicy::CompatibilityUnprotected,
+                Some(PeerProtectionMechanism::Unprotected),
+            ) => {
+                self.protection = PeerProtectionLifecycle::Unprotected;
+                self.state = PeerSessionState::Negotiated;
+                self.last_blockers.clear();
+            }
+            (PeerProtectionPolicy::Require(requirement), Some(mechanism))
+                if mechanism == requirement.mechanism()
+                    && self.capability_evidence_generation_bound
+                    && self.session_generation.is_some() =>
+            {
+                match requirement.sequence() {
+                    PeerProtectionSequence::DirectBeforeCapabilities => {
+                        if self.direct_protection_is_attested() {
+                            self.state = PeerSessionState::Negotiated;
+                            self.last_blockers.clear();
+                        } else {
+                            self.fail_protection_lifecycle(
+                                Some(requirement.mechanism()),
+                                Some(requirement.sequence()),
+                                self.protection_readiness().protection_generation,
+                                PeerProtectionFailure::UnboundCapabilityEvidence,
+                            );
+                        }
+                    }
+                    PeerProtectionSequence::InbandAfterCapabilities => {
+                        self.start_pending_protection(requirement);
+                    }
+                }
+            }
+            (PeerProtectionPolicy::Require(requirement), Some(mechanism))
+                if mechanism != requirement.mechanism() =>
+            {
+                self.fail_protection_lifecycle(
+                    Some(requirement.mechanism()),
+                    Some(requirement.sequence()),
+                    self.protection_readiness().protection_generation,
+                    PeerProtectionFailure::DowngradeRejected,
+                );
+            }
+            (PeerProtectionPolicy::Require(requirement), Some(_)) => {
+                self.fail_protection_lifecycle(
+                    Some(requirement.mechanism()),
+                    Some(requirement.sequence()),
+                    self.protection_readiness().protection_generation,
+                    PeerProtectionFailure::UnboundCapabilityEvidence,
+                );
+            }
+            (_, None) | (PeerProtectionPolicy::CompatibilityUnprotected, Some(_)) => {
+                self.state = PeerSessionState::CapabilitiesPending;
+                self.last_blockers = vec![PeerSessionBlocker::CapabilitiesExchangePending];
+            }
+        }
+    }
+
+    fn start_pending_protection(&mut self, requirement: PeerProtectionRequirement) {
+        if matches!(self.protection, PeerProtectionLifecycle::Pending { .. }) {
+            self.state = match requirement.sequence() {
+                PeerProtectionSequence::DirectBeforeCapabilities => PeerSessionState::Idle,
+                PeerProtectionSequence::InbandAfterCapabilities => {
+                    PeerSessionState::CapabilitiesPending
+                }
+            };
+            self.last_blockers = vec![PeerSessionBlocker::CapabilitiesExchangePending];
+            return;
+        }
+        let Some(next) = self.next_protection_generation.checked_add(1) else {
+            self.fail_protection_lifecycle(
+                Some(requirement.mechanism()),
+                Some(requirement.sequence()),
+                None,
+                PeerProtectionFailure::GenerationExhausted,
+            );
+            return;
+        };
+        let Some(nonzero) = NonZeroU64::new(next) else {
+            self.fail_protection_lifecycle(
+                Some(requirement.mechanism()),
+                Some(requirement.sequence()),
+                None,
+                PeerProtectionFailure::GenerationExhausted,
+            );
+            return;
+        };
+        let generation = PeerProtectionGeneration(nonzero);
+        self.next_protection_generation = next;
+        self.protection = PeerProtectionLifecycle::Pending {
+            generation,
+            requirement,
+        };
+        self.state = match requirement.sequence() {
+            PeerProtectionSequence::DirectBeforeCapabilities => PeerSessionState::Idle,
+            PeerProtectionSequence::InbandAfterCapabilities => {
+                PeerSessionState::CapabilitiesPending
+            }
+        };
+        self.last_blockers = vec![PeerSessionBlocker::CapabilitiesExchangePending];
+    }
+
+    fn validate_pending_protection(
+        &mut self,
+        pending: &PeerProtectionPending,
+        mechanism: PeerProtectionMechanism,
+    ) -> Result<(PeerSessionGeneration, PeerProtectionGeneration), PeerProtectionError> {
+        if !Arc::ptr_eq(&pending.authority, &self.authority) {
+            return Err(PeerProtectionError::StaleSessionGeneration);
+        }
+        let Some(session_generation) = self.session_generation else {
+            return Err(PeerProtectionError::StaleSessionGeneration);
+        };
+        if pending.session_generation != session_generation {
+            return Err(PeerProtectionError::StaleSessionGeneration);
+        }
+        let PeerProtectionLifecycle::Pending {
+            generation,
+            requirement,
+        } = self.protection
+        else {
+            return Err(PeerProtectionError::NotPending {
+                state: self.protection_readiness().state,
+            });
+        };
+        if pending.protection_generation != generation || pending.sequence != requirement.sequence()
+        {
+            return Err(PeerProtectionError::StaleProtectionGeneration);
+        }
+        let expected = requirement.mechanism();
+        if pending.mechanism != expected || mechanism != expected {
+            self.fail_protection_lifecycle(
+                Some(expected),
+                Some(requirement.sequence()),
+                Some(generation),
+                PeerProtectionFailure::DowngradeRejected,
+            );
+            return Err(PeerProtectionError::MechanismMismatch {
+                expected,
+                actual: mechanism,
+            });
+        }
+        Ok((session_generation, generation))
+    }
+
+    fn direct_protection_is_attested(&self) -> bool {
+        let Some(requirement) = self.protection_policy.requirement() else {
+            return false;
+        };
+        if requirement.sequence() != PeerProtectionSequence::DirectBeforeCapabilities {
+            return false;
+        }
+        matches!(
+            (self.protection, self.session_generation),
+            (PeerProtectionLifecycle::Protected { evidence }, Some(session_generation))
+                if evidence.session_generation() == session_generation
+                    && evidence.mechanism() == requirement.mechanism()
+                    && evidence.sequence() == requirement.sequence()
+        )
+    }
+
+    fn capability_phase_is_available(&self) -> bool {
+        match self.protection_policy.requirement() {
+            None => matches!(self.protection, PeerProtectionLifecycle::NotNegotiated),
+            Some(requirement)
+                if requirement.sequence() == PeerProtectionSequence::InbandAfterCapabilities =>
+            {
+                matches!(self.protection, PeerProtectionLifecycle::NotNegotiated)
+            }
+            Some(_) => self.direct_protection_is_attested(),
+        }
+    }
+
+    fn capability_exchange_complete(&self) -> bool {
+        self.last_capability_projection
+            .as_ref()
+            .is_some_and(|projection| projection.accepted)
+            && self.selected_protection.is_some()
+            && !self.capabilities_request_outstanding
+            && self.outbound_capability_transaction.is_none()
+            && self.inbound_capability_transaction.is_none()
+    }
+
+    fn validate_capability_generation(
+        &self,
+        generation: PeerSessionGeneration,
+    ) -> Result<(), PeerCapabilityBoundaryError> {
+        if self.session_generation == Some(generation) {
+            Ok(())
+        } else {
+            Err(PeerCapabilityBoundaryError::StaleGeneration)
+        }
+    }
+
+    fn validate_lifecycle_generation(
+        &self,
+        generation: PeerSessionGeneration,
+    ) -> Result<(), PeerSessionBoundError> {
+        if self.session_generation == Some(generation) {
+            Ok(())
+        } else {
+            Err(PeerSessionBoundError::StaleGeneration)
+        }
+    }
+
+    fn validate_lifecycle_message(
+        &self,
+        generation: PeerSessionGeneration,
+        direction: PeerMessageDirection,
+        header: &Header,
+        procedure: PeerProcedure,
+        kind: CommandKind,
+        operation: &'static str,
+    ) -> Result<(), PeerSessionBoundError> {
+        self.validate_lifecycle_generation(generation)?;
+        if !is_peer_procedure_header(header, procedure, kind) {
+            return Err(PeerSessionBoundError::InvalidPeerHeader { operation });
+        }
+        self.admit_message(generation, direction, header)
+            .map(|_admission| ())
+            .map_err(|reason| PeerSessionBoundError::CommandNotAdmitted { operation, reason })
+    }
+
+    fn validate_capabilities_answer_commit(
+        &self,
+        answer: &CapabilitiesExchangeAnswer,
+    ) -> Result<(), PeerCapabilityBoundaryError> {
+        let Some(projection) = self.last_capability_projection.as_ref() else {
+            return Err(PeerCapabilityBoundaryError::InvalidSessionState);
+        };
+        if answer.result_code != projection.result_code {
+            return Err(PeerCapabilityBoundaryError::AnswerOutcomeMismatch);
+        }
+        let direct_protection = self
+            .protection_policy
+            .requirement()
+            .is_some_and(|requirement| {
+                requirement.sequence() == PeerProtectionSequence::DirectBeforeCapabilities
+            });
+        if !direct_protection
+            && !same_effective_inband_security_support(
+                &answer.capabilities.inband_security_ids,
+                &self.local_capabilities.inband_security_ids,
+            )
+        {
+            return Err(PeerCapabilityBoundaryError::AnswerSecurityMismatch);
+        }
+        if projection.accepted && !direct_protection {
+            let Some(mechanism) = self.selected_protection else {
+                return Err(PeerCapabilityBoundaryError::InvalidSessionState);
+            };
+            if !effective_inband_security_ids(&answer.capabilities.inband_security_ids)
+                .contains(&mechanism.inband_security_id())
+            {
+                return Err(PeerCapabilityBoundaryError::AnswerSecurityMismatch);
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_capabilities_answer_error_bit(
+        &self,
+        header: &Header,
+        result_code: u32,
+    ) -> Result<(), PeerCapabilityBoundaryError> {
+        if header.flags.is_error() != result_code_requires_error_bit(result_code) {
+            Err(PeerCapabilityBoundaryError::AnswerErrorBitMismatch)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn capabilities_header_is_admissible(
+        &self,
+        direction: PeerMessageDirection,
+        header: &Header,
+    ) -> bool {
+        if !self.capability_phase_is_available()
+            || !matches!(
+                self.state,
+                PeerSessionState::Idle | PeerSessionState::CapabilitiesPending
+            )
+        {
+            return false;
+        }
+        match (direction, header.flags.command_kind()) {
+            (PeerMessageDirection::Inbound, CommandKind::Request) => {
+                is_capabilities_header(header, CommandKind::Request)
+                    && self
+                        .capability_role
+                        .is_none_or(|role| role == PeerCapabilityRole::Responder)
+                    && self
+                        .inbound_capability_transaction
+                        .is_none_or(|transaction| transaction.matches(header))
+            }
+            (PeerMessageDirection::Outbound, CommandKind::Request) => {
+                is_capabilities_header(header, CommandKind::Request)
+                    && self
+                        .capability_role
+                        .is_none_or(|role| role == PeerCapabilityRole::Initiator)
+                    && self
+                        .outbound_capability_transaction
+                        .is_none_or(|transaction| transaction.matches(header))
+            }
+            (PeerMessageDirection::Inbound, CommandKind::Answer) => {
+                is_capabilities_header(header, CommandKind::Answer)
+                    && self
+                        .outbound_capability_transaction
+                        .is_some_and(|transaction| transaction.matches(header))
+            }
+            (PeerMessageDirection::Outbound, CommandKind::Answer) => false,
+        }
+    }
+
+    fn fail_protection_lifecycle(
+        &mut self,
+        mechanism: Option<PeerProtectionMechanism>,
+        sequence: Option<PeerProtectionSequence>,
+        generation: Option<PeerProtectionGeneration>,
+        failure: PeerProtectionFailure,
+    ) {
+        self.protection = PeerProtectionLifecycle::Failed {
+            mechanism,
+            sequence,
+            generation,
+            failure,
+        };
+        self.capabilities_request_outstanding = false;
+        self.outbound_capability_transaction = None;
+        self.inbound_capability_transaction = None;
+        self.capability_role = None;
+        self.state = PeerSessionState::Failed;
+        self.last_blockers = vec![PeerSessionBlocker::SessionFailed];
+    }
+
+    fn revoke_protection(&mut self, failure: PeerProtectionFailure) {
+        let readiness = self.protection_readiness();
+        self.protection = PeerProtectionLifecycle::Failed {
+            mechanism: readiness.mechanism,
+            sequence: readiness.sequence,
+            generation: readiness.protection_generation,
+            failure,
+        };
+        self.capabilities_request_outstanding = false;
+        self.outbound_capability_transaction = None;
+        self.inbound_capability_transaction = None;
+        self.capability_role = None;
+    }
+
+    fn protection_transition(
+        &self,
+        event: PeerProtectionEvent,
+        previous_state: PeerProtectionState,
+    ) -> PeerProtectionTransition {
+        PeerProtectionTransition {
+            event,
+            previous_state,
+            state: self.protection_readiness().state,
+            protection: self.protection_readiness(),
+            session: self.readiness(),
+        }
     }
 
     fn apply_disconnect_answer(&mut self, answer: &DisconnectPeerAnswer, peer_requested: bool) {
@@ -1532,6 +4252,7 @@ impl PeerSession {
             blockers.push(PeerSessionBlocker::DisconnectResultNotSuccess);
         }
         let acknowledged = blockers.is_empty();
+        self.revoke_protection(PeerProtectionFailure::SessionFailed);
         self.state = if acknowledged {
             PeerSessionState::Reconnecting
         } else {
@@ -1590,6 +4311,8 @@ pub fn negotiate_capabilities(
 ) -> CapabilityNegotiation {
     let local_application_ids = advertised_non_relay_application_ids(local);
     let remote_application_ids = advertised_non_relay_application_ids(remote);
+    let local_inband_security_ids = effective_inband_security_ids(&local.inband_security_ids);
+    let remote_inband_security_ids = effective_inband_security_ids(&remote.inband_security_ids);
     CapabilityNegotiation {
         application_ids: common_copy(&local_application_ids, &remote_application_ids),
         relay_application: advertises_relay_application(local)
@@ -1610,7 +4333,7 @@ pub fn negotiate_capabilities(
             &local.vendor_specific_applications,
             &remote.vendor_specific_applications,
         ),
-        inband_security_ids: common_copy(&local.inband_security_ids, &remote.inband_security_ids),
+        inband_security_ids: common_copy(local_inband_security_ids, remote_inband_security_ids),
     }
 }
 
@@ -1635,6 +4358,22 @@ pub fn cea_result_code(local: &PeerCapabilities, remote: &PeerCapabilities) -> u
 /// exchange failed.
 pub const fn result_code_requires_error_bit(result_code: u32) -> bool {
     result_code >= 3000 && result_code < 4000
+}
+
+fn ensure_result_code_error_bit(
+    header: &Header,
+    result_code: u32,
+    section: &'static str,
+) -> Result<(), DecodeError> {
+    if header.flags.is_error() == result_code_requires_error_bit(result_code) {
+        Ok(())
+    } else {
+        Err(decode_structural_error(
+            "diameter CEA error flag does not match Result-Code family",
+            4,
+            section,
+        ))
+    }
 }
 
 /// Build a Capabilities-Exchange-Request message.
@@ -1737,6 +4476,7 @@ pub fn parse_capabilities_exchange_answer(
         "diameter CEA requires Result-Code",
         section,
     )?;
+    ensure_result_code_error_bit(&message.header, result_code, section)?;
     let diagnostics = avps.diagnostics();
     Ok(CapabilitiesExchangeAnswer {
         result_code,
@@ -1792,19 +4532,13 @@ pub fn parse_capabilities_exchange_error_answer(
         PeerProcedure::CapabilitiesExchange,
         CommandKind::Answer,
     )?;
-    if !message.header.flags.is_error() {
-        return Err(decode_structural_error(
-            "diameter CEA error answer requires the error flag",
-            4,
-            "7.2",
-        ));
-    }
     let avps = collect_procedure_avps(message.raw_avps, ctx, section)?;
     let result_code = require_field(
         avps.result_code.clone(),
         "diameter CEA error answer requires Result-Code",
         section,
     )?;
+    ensure_result_code_error_bit(&message.header, result_code, "7.2")?;
     if !result_code_requires_error_bit(result_code) {
         return Err(decode_structural_error(
             "diameter CEA error answer Result-Code must be a protocol-error value",
@@ -3085,6 +5819,22 @@ fn common_copy<T: Copy + Eq>(local: &[T], remote: &[T]) -> Vec<T> {
     common
 }
 
+const DEFAULT_INBAND_SECURITY_IDS: [u32; 1] = [INBAND_SECURITY_ID_NO_INBAND_SECURITY];
+
+fn effective_inband_security_ids(security_ids: &[u32]) -> &[u32] {
+    if security_ids.is_empty() {
+        &DEFAULT_INBAND_SECURITY_IDS
+    } else {
+        security_ids
+    }
+}
+
+fn same_effective_inband_security_support(left: &[u32], right: &[u32]) -> bool {
+    let left = effective_inband_security_ids(left);
+    let right = effective_inband_security_ids(right);
+    left.iter().all(|value| right.contains(value)) && right.iter().all(|value| left.contains(value))
+}
+
 fn advertised_non_relay_application_ids(capabilities: &PeerCapabilities) -> Vec<ApplicationId> {
     let mut application_ids = Vec::new();
     for application_id in &capabilities.auth_application_ids {
@@ -3767,7 +6517,7 @@ mod tests {
         remote.auth_application_ids.clear();
         remote.acct_application_ids.clear();
         remote.vendor_specific_applications.clear();
-        remote.inband_security_ids.clear();
+        remote.inband_security_ids = vec![INBAND_SECURITY_ID_TLS];
         let policy = PeerSessionPolicy::default()
             .without_relay_application()
             .accept_application(ApplicationId::new(16_777_251))
@@ -4872,7 +7622,7 @@ mod tests {
             Err(error) if matches!(
                 error.code(),
                 DecodeErrorCode::Structural {
-                    reason: "diameter CEA error answer requires the error flag"
+                    reason: "diameter CEA error flag does not match Result-Code family"
                 }
             )
         ));
@@ -4912,7 +7662,7 @@ mod tests {
             Err(error) if matches!(
                 error.code(),
                 DecodeErrorCode::Structural {
-                    reason: "diameter CEA error answer Result-Code must be a protocol-error value"
+                    reason: "diameter CEA error flag does not match Result-Code family"
                 }
             )
         ));

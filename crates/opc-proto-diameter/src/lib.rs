@@ -10,6 +10,21 @@
 //! initial 3GPP application work. It deliberately does **not** implement product
 //! policy such as realm routing, AAA/HSS behavior, charging decisions, watchdog
 //! thresholds, or peer transport operations.
+//! With the `peer` feature, [`peer::PeerSession`] also provides an explicit,
+//! generation-bound RFC 6733 direct or in-band TLS/TCP and DTLS/SCTP readiness
+//! and header-admission boundary. A typed requirement retains both mechanism and
+//! sequence. Direct protection admits no Diameter before exact-generation
+//! attestation and still withholds application readiness until CER/CEA succeeds.
+//! In-band protection permits one correlated CER/CEA, then blocks every Diameter
+//! message until the selected mechanism is attested. Each transport candidate
+//! has exactly one CER role; simultaneous-open election remains transport-owned.
+//! The boundary produces a responder's exact matching, typed CEA once as
+//! immutable canonical bytes. Generation-bound lifecycle mutations re-evaluate
+//! exact-header command admission, and a CEA E-bit must match its Result-Code
+//! family before capability evidence is consumed. This is state-machine evidence
+//! only: protected framing,
+//! certificate validation, credential rotation, and crypto-provider selection
+//! remain transport-owned.
 //! `error_answer` adds the bounded RFC 6733 request envelope and negative-
 //! answer boundary without exposing sensitive AVP contents or retaining an
 //! unbounded request suffix.
