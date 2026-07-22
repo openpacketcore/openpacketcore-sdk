@@ -3355,7 +3355,7 @@ async fn peer_runtime_accepts_an_exact_late_dwa_after_entering_suspect() {
         .expect("start client runtime");
     let (client_handle, mut client_incoming) = client.into_parts();
     tokio::time::pause();
-    tokio::time::advance(Duration::from_secs(4)).await;
+    tokio::time::advance(Duration::from_secs(28)).await;
 
     let observed_handle = client_handle.clone();
     let probe = tokio::spawn(async move {
@@ -3363,8 +3363,8 @@ async fn peer_runtime_accepts_an_exact_late_dwa_after_entering_suspect() {
             .probe_watchdog(
                 0x3250,
                 0x4250,
-                DiameterWatchdogTwinit::new(Duration::from_secs(6)).expect("valid Twinit"),
-                Instant::now() + Duration::from_secs(30),
+                DiameterWatchdogTwinit::new(Duration::from_secs(30)).expect("valid Twinit"),
+                Instant::now() + Duration::from_secs(90),
             )
             .await
     });
@@ -3390,6 +3390,11 @@ async fn peer_runtime_accepts_an_exact_late_dwa_after_entering_suspect() {
         .expect("activity before watchdog reset")
         .last_inbound();
     tokio::time::advance(Duration::from_millis(1)).await;
+    // Once the virtual clock has driven the peer into SUSPECT, return to the
+    // real clock before waiting on socket I/O. A paused Tokio clock may
+    // auto-advance the timeout before the runtime's reader task is polled,
+    // making this transport test scheduler-dependent under workspace load.
+    tokio::time::resume();
     let unrelated_application = application_request();
     raw_server
         .write_all(&encode_message(&unrelated_application))
@@ -3400,7 +3405,7 @@ async fn peer_runtime_accepts_an_exact_late_dwa_after_entering_suspect() {
         .await
         .expect("flush unrelated application during watchdog grace");
     assert_eq!(
-        tokio::time::timeout(Duration::from_secs(1), client_incoming.receive())
+        tokio::time::timeout(Duration::from_secs(5), client_incoming.receive())
             .await
             .expect("unrelated application delivery must precede the reset interval")
             .expect("unrelated application remains admitted")
@@ -3439,7 +3444,7 @@ async fn peer_runtime_accepts_an_exact_late_dwa_after_entering_suspect() {
         .expect("write exact late DWA");
     raw_server.flush().await.expect("flush exact late DWA");
 
-    let completed = tokio::time::timeout(Duration::from_secs(1), async {
+    let completed = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let snapshot = observed_handle
                 .peer_session_snapshot()
