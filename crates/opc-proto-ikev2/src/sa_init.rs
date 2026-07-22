@@ -10,13 +10,13 @@ use opc_protocol::{DecodeContext, DecodeError};
 
 use crate::{
     header::{Header, HeaderFlags, EXCHANGE_TYPE_IKE_SA_INIT},
-    message::{Message, OwnedMessage},
+    message::{Ikev2UnknownCriticalPayloadMessage, Message, OwnedMessage},
     notify::{
         Ikev2NotifyPayload, Ikev2NotifyPayloadError, IKEV2_NOTIFY_AUTHORIZATION_REJECTED,
         IKEV2_NOTIFY_INVALID_KE_PAYLOAD, IKEV2_NOTIFY_NO_PROPOSAL_CHOSEN,
         IKEV2_NOTIFY_PROTOCOL_ID_NONE, IKEV2_NOTIFY_UNSUPPORTED_CRITICAL_PAYLOAD,
     },
-    payload::{PayloadType, RawPayload, GENERIC_PAYLOAD_HEADER_LEN},
+    payload::{Ikev2UnknownCriticalPayload, PayloadType, RawPayload, GENERIC_PAYLOAD_HEADER_LEN},
     validation::Ikev2ValidationProfile,
     HEADER_LEN,
 };
@@ -1098,6 +1098,137 @@ impl fmt::Display for Ikev2SaInitNotifyBuildError {
 }
 
 impl Error for Ikev2SaInitNotifyBuildError {}
+
+/// Error while converting an unknown-critical message fact into reply
+/// authority for an initial IKE_SA_INIT request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ikev2SaInitUnknownCriticalPayloadRequestError {
+    /// The fixed header was not a valid initial request.
+    InvalidRequest(Ikev2SaInitNotifyBuildError),
+    /// Bytes followed the IKE message boundary declared by the request.
+    TrailingBytes,
+}
+
+impl Ikev2SaInitUnknownCriticalPayloadRequestError {
+    /// Stable machine-readable error code.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::InvalidRequest(error) => error.as_str(),
+            Self::TrailingBytes => "ike_sa_init_unknown_critical_request_trailing_bytes",
+        }
+    }
+}
+
+impl fmt::Display for Ikev2SaInitUnknownCriticalPayloadRequestError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.code())
+    }
+}
+
+impl Error for Ikev2SaInitUnknownCriticalPayloadRequestError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::InvalidRequest(error) => Some(error),
+            Self::TrailingBytes => None,
+        }
+    }
+}
+
+/// Reply-authorized IKE_SA_INIT request carrying one unknown critical payload.
+///
+/// This value can be constructed only from a fully framed unknown-critical
+/// message fact whose fixed header passes the same request-shape validator as
+/// the existing unauthenticated error response builder. It retains no packet
+/// body and its `Debug` output omits both IKE SPIs.
+///
+/// Returning this value does not transmit a packet. Source admission, response
+/// rate limiting, retransmission caching, and anti-amplification policy remain
+/// product-owned.
+///
+/// @spec IETF RFC7296 2.5, 2.21.1, 3.10.1
+/// @req REQ-IETF-RFC7296-SA-INIT-UNKNOWN-CRITICAL-REQUEST-001
+/// @conformance boundary-only
+#[derive(Clone, PartialEq, Eq)]
+pub struct Ikev2SaInitUnknownCriticalPayloadRequest {
+    request_header: Header,
+    rejection: Ikev2UnknownCriticalPayload,
+}
+
+impl Ikev2SaInitUnknownCriticalPayloadRequest {
+    /// Stable machine-readable rejection code.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        self.rejection.code()
+    }
+
+    /// Exact one-octet unsupported payload type required in Notify data.
+    #[must_use]
+    pub const fn offending_payload_type(&self) -> u8 {
+        self.rejection.payload_type()
+    }
+
+    /// Bounded byte offset from the start of the request payload region.
+    #[must_use]
+    pub const fn payload_offset(&self) -> usize {
+        self.rejection.payload_offset()
+    }
+
+    /// Build the canonical Notify type 1 IKE_SA_INIT response.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Ikev2SaInitNotifyBuildError`] if a wire length overflows. The
+    /// request shape was already validated when this value was constructed and
+    /// is checked again by the existing response builder.
+    pub fn build_response(&self) -> Result<OwnedMessage, Ikev2SaInitNotifyBuildError> {
+        build_ike_sa_init_unsupported_critical_payload_response(
+            &self.request_header,
+            self.offending_payload_type(),
+        )
+    }
+}
+
+impl fmt::Debug for Ikev2SaInitUnknownCriticalPayloadRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Ikev2SaInitUnknownCriticalPayloadRequest")
+            .field("code", &self.code())
+            .field("rejection", &self.rejection)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Ikev2UnknownCriticalPayloadMessage {
+    /// Validate this protocol fact as a reply-safe initial IKE_SA_INIT request.
+    ///
+    /// The validation reuses the exact predicate applied by the existing
+    /// unauthenticated Notify response builder. In particular, a received
+    /// response can never produce the reply-authority wrapper.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Ikev2SaInitUnknownCriticalPayloadRequestError`] when the
+    /// retained header is not an initial request with the Initiator flag, a
+    /// non-zero initiator SPI, zero responder SPI, and Message ID zero, or when
+    /// bytes followed the declared message boundary.
+    pub fn try_into_ike_sa_init_request(
+        self,
+    ) -> Result<
+        Ikev2SaInitUnknownCriticalPayloadRequest,
+        Ikev2SaInitUnknownCriticalPayloadRequestError,
+    > {
+        let request_header = self.request_header();
+        validate_notify_response_request_header(&request_header)
+            .map_err(Ikev2SaInitUnknownCriticalPayloadRequestError::InvalidRequest)?;
+        if self.has_trailing_bytes() {
+            return Err(Ikev2SaInitUnknownCriticalPayloadRequestError::TrailingBytes);
+        }
+        Ok(Ikev2SaInitUnknownCriticalPayloadRequest {
+            request_header,
+            rejection: self.rejection(),
+        })
+    }
+}
 
 /// Build an IKE_SA_INIT response containing SA, KE, Nonce, and optional Notify
 /// payloads with canonical generic-payload chaining.

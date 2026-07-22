@@ -10,7 +10,8 @@
 //! payloads, protected-payload boundary metadata, caller-owned crypto provider
 //! traits, typed executable IKE-SA profiles, PRF-HMAC-SHA2-256/384/512, initial
 //! and rekey IKE-SA key-agreement/key-derivation material,
-//! bounded notify-only IKE_SA_INIT error responses,
+//! bounded receive-to-notify IKE_SA_INIT unknown-critical rejection and other
+//! notify-only IKE_SA_INIT error responses,
 //! product-neutral executable IKE_SA_INIT proposal selection, caller-keyed
 //! SA_INIT AES-GCM and AES-CBC/SHA-2 protected-payload open/seal helpers, typed
 //! IKE_AUTH cleartext payload helpers, transcript-bound shared-key AUTH MIC
@@ -198,7 +199,9 @@ pub use ike_sa_rekey::{
     Ikev2IkeSaRekeyResponseError, Ikev2IkeSaRekeyResponsePayloads, Ikev2IkeSaRekeySentRequest,
     IKEV2_REKEY_IKE_SPI_LEN,
 };
-pub use message::{Message, OwnedMessage};
+pub use message::{
+    Ikev2MessageRejection, Ikev2UnknownCriticalPayloadMessage, Message, OwnedMessage,
+};
 pub use nat_detection::{
     evaluate_ikev2_nat_detection, ikev2_nat_detection_hash, Ikev2NatDetectionEndpointStatus,
     Ikev2NatDetectionEvaluation, Ikev2NatDetectionObservedEndpoint, Ikev2NatDetectionOutcome,
@@ -206,8 +209,10 @@ pub use nat_detection::{
 };
 pub use nat_traversal::{
     classify_ike_nat_traversal_datagram, classify_ike_nat_traversal_datagram_with_context,
+    inspect_ike_nat_traversal_datagram, inspect_ike_nat_traversal_datagram_with_context,
     NatTraversalClassification, NatTraversalEspCandidate, NatTraversalIkeDecodeErrorCode,
-    NatTraversalIkeMessage, NatTraversalIkeTransport, NatTraversalKeepalive, NatTraversalRejection,
+    NatTraversalIkeMessage, NatTraversalIkeTransport, NatTraversalInspection,
+    NatTraversalKeepalive, NatTraversalRejection, NatTraversalUnknownCriticalPayload,
     IKE_NAT_TRAVERSAL_UDP_PORT, IKE_UDP_PORT, NAT_TRAVERSAL_KEEPALIVE,
 };
 pub use notify::{
@@ -226,8 +231,10 @@ pub use notify::{
     IKEV2_NOTIFY_TS_UNACCEPTABLE, IKEV2_NOTIFY_UNSUPPORTED_CRITICAL_PAYLOAD,
 };
 pub use payload::{
-    validate_payload_chain, validate_payload_chain_with_profile, PayloadChain, PayloadType,
-    RawPayload, RawPayloadIterator, GENERIC_PAYLOAD_HEADER_LEN,
+    validate_payload_chain, validate_payload_chain_with_profile,
+    validate_payload_chain_with_rejection, validate_payload_chain_with_rejection_and_profile,
+    Ikev2PayloadChainRejection, Ikev2UnknownCriticalPayload, PayloadChain, PayloadType, RawPayload,
+    RawPayloadIterator, GENERIC_PAYLOAD_HEADER_LEN,
 };
 pub use pcscf_restoration::{
     build_ikev2_pcscf_restoration_request, decode_ikev2_pcscf_restoration_response,
@@ -257,10 +264,12 @@ pub use sa_init::{
     Ikev2KeyExchangePayloadError, Ikev2NoncePayload, Ikev2NoncePayloadBuild,
     Ikev2NoncePayloadError, Ikev2NotifyPayloadBuild, Ikev2SaInitBuildError,
     Ikev2SaInitNotifyBuildError, Ikev2SaInitPayloadError, Ikev2SaInitPayloads,
-    Ikev2SaInitResponsePayloads, Ikev2SaPayload, Ikev2SaPayloadBuild, Ikev2SaPayloadError,
-    Ikev2SaProposal, Ikev2SaProposalBuild, Ikev2SaTransform, Ikev2SaTransformBuild,
-    Ikev2TransformAttribute, Ikev2TransformAttributeBuild, Ikev2TransformAttributeBuildValue,
-    Ikev2TransformAttributeValue, Ikev2VendorIdPayload, Ikev2VendorIdPayloadError,
+    Ikev2SaInitResponsePayloads, Ikev2SaInitUnknownCriticalPayloadRequest,
+    Ikev2SaInitUnknownCriticalPayloadRequestError, Ikev2SaPayload, Ikev2SaPayloadBuild,
+    Ikev2SaPayloadError, Ikev2SaProposal, Ikev2SaProposalBuild, Ikev2SaTransform,
+    Ikev2SaTransformBuild, Ikev2TransformAttribute, Ikev2TransformAttributeBuild,
+    Ikev2TransformAttributeBuildValue, Ikev2TransformAttributeValue, Ikev2VendorIdPayload,
+    Ikev2VendorIdPayloadError,
 };
 pub use sa_init_crypto::{
     derive_child_sa_key_material, derive_ike_sa_init_key_material,

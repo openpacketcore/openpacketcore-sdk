@@ -3,6 +3,8 @@
 //! @spec IETF RFC7296 3.1, 3.2
 //! @req REQ-IETF-RFC7296-MESSAGE-001
 
+use core::fmt;
+
 use bytes::{BufMut, Bytes, BytesMut};
 use opc_protocol::{
     BorrowDecode, DecodeContext, DecodeError, DecodeErrorCode, DecodeResult, Encode, EncodeContext,
@@ -11,12 +13,186 @@ use opc_protocol::{
 
 use crate::{
     header::{decode_header_with_profile, encode_header, Header, HEADER_LEN},
-    payload::{validate_payload_chain_with_profile, PayloadChain, PayloadType, RawPayloadIterator},
+    payload::{
+        validate_payload_chain_with_rejection_and_profile, Ikev2PayloadChainRejection,
+        Ikev2UnknownCriticalPayload, PayloadChain, PayloadType, RawPayloadIterator,
+    },
     validation::Ikev2ValidationProfile,
 };
 
 fn spec_ref() -> SpecRef {
     SpecRef::new("ietf", "RFC7296", "3.1")
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct RejectedMessageHeader {
+    initiator_spi: u64,
+    responder_spi: u64,
+    next_payload: u8,
+    major_version: u8,
+    minor_version: u8,
+    exchange_type: u8,
+    flags: crate::HeaderFlags,
+    message_id: u32,
+    length: u32,
+}
+
+impl RejectedMessageHeader {
+    fn from_header(header: &Header) -> Self {
+        Self {
+            initiator_spi: header.initiator_spi,
+            responder_spi: header.responder_spi,
+            next_payload: header.next_payload,
+            major_version: header.major_version,
+            minor_version: header.minor_version,
+            exchange_type: header.exchange_type,
+            flags: header.flags,
+            message_id: header.message_id,
+            length: header.length,
+        }
+    }
+
+    pub(crate) fn to_header(self) -> Header {
+        Header {
+            initiator_spi: self.initiator_spi,
+            responder_spi: self.responder_spi,
+            next_payload: self.next_payload,
+            major_version: self.major_version,
+            minor_version: self.minor_version,
+            exchange_type: self.exchange_type,
+            flags: self.flags,
+            message_id: self.message_id,
+            length: self.length,
+        }
+    }
+}
+
+/// Unknown-critical rejection attached to one structurally valid IKEv2
+/// message header.
+///
+/// This type is a protocol fact, not authority to transmit a response. Its
+/// retained header projection is private and its `Debug` output omits both
+/// SPIs and all packet bytes. An IKE_SA_INIT response can be authorized only
+/// by converting this fact through the request-shape boundary in [`crate::sa_init`].
+///
+/// @spec IETF RFC7296 2.5, 3.1, 3.2
+/// @req REQ-IETF-RFC7296-MESSAGE-UNKNOWN-CRITICAL-001
+/// @conformance boundary-only
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Ikev2UnknownCriticalPayloadMessage {
+    header: RejectedMessageHeader,
+    rejection: Ikev2UnknownCriticalPayload,
+    has_trailing_bytes: bool,
+}
+
+impl Ikev2UnknownCriticalPayloadMessage {
+    /// Stable machine-readable rejection code.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        self.rejection.code()
+    }
+
+    /// Exact typed unsupported-payload fact.
+    #[must_use]
+    pub const fn rejection(self) -> Ikev2UnknownCriticalPayload {
+        self.rejection
+    }
+
+    /// Return whether the received IKE header was a request.
+    ///
+    /// This is informational only. It does not validate the exchange-specific
+    /// request shape and does not grant reply authority.
+    #[must_use]
+    pub const fn is_request(self) -> bool {
+        !self.header.flags.response()
+    }
+
+    pub(crate) const fn has_trailing_bytes(self) -> bool {
+        self.has_trailing_bytes
+    }
+
+    pub(crate) const fn declared_len(self) -> usize {
+        self.header.length as usize
+    }
+
+    pub(crate) fn request_header(self) -> Header {
+        self.header.to_header()
+    }
+}
+
+impl fmt::Debug for Ikev2UnknownCriticalPayloadMessage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Ikev2UnknownCriticalPayloadMessage")
+            .field("code", &self.code())
+            .field("rejection", &self.rejection)
+            .field("is_request", &self.is_request())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Detailed IKEv2 message decode rejection.
+///
+/// Existing [`Message::decode_with_profile`] and [`BorrowDecode`] APIs retain
+/// their source-compatible [`DecodeError`] surface. This additive boundary
+/// preserves the exact unsupported payload type only when its complete generic
+/// framing was validated; malformed offender framing remains malformed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Ikev2MessageRejection {
+    /// The fixed header or payload chain was malformed or exceeded limits.
+    Malformed(DecodeError),
+    /// A fully framed unknown payload set the Critical bit.
+    UnknownCriticalPayload(Ikev2UnknownCriticalPayloadMessage),
+}
+
+impl Ikev2MessageRejection {
+    /// Stable machine-readable rejection code.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::Malformed(_) => "ike_message_malformed",
+            Self::UnknownCriticalPayload(rejection) => rejection.code(),
+        }
+    }
+
+    /// Return the typed unknown-critical message fact when present.
+    #[must_use]
+    pub const fn unknown_critical_payload(&self) -> Option<Ikev2UnknownCriticalPayloadMessage> {
+        match self {
+            Self::Malformed(_) => None,
+            Self::UnknownCriticalPayload(rejection) => Some(*rejection),
+        }
+    }
+
+    pub(crate) fn into_decode_error(self) -> DecodeError {
+        match self {
+            Self::Malformed(error) => error,
+            Self::UnknownCriticalPayload(rejection) => rejection.rejection.decode_error(),
+        }
+    }
+}
+
+impl fmt::Display for Ikev2MessageRejection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Malformed(error) => write!(f, "{}: {error}", self.code()),
+            Self::UnknownCriticalPayload(rejection) => write!(
+                f,
+                "{}: type {} at payload offset {}",
+                rejection.code(),
+                rejection.rejection().payload_type(),
+                rejection.rejection().payload_offset()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for Ikev2MessageRejection {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Malformed(error) => Some(error),
+            Self::UnknownCriticalPayload(_) => None,
+        }
+    }
 }
 
 /// Borrowed IKEv2 message shell.
@@ -71,34 +247,82 @@ impl<'a> Message<'a> {
         ctx: DecodeContext,
         profile: Ikev2ValidationProfile,
     ) -> DecodeResult<'a, Self> {
+        Self::decode_with_profile_and_rejection(input, ctx, profile)
+            .map_err(Ikev2MessageRejection::into_decode_error)
+    }
+
+    /// Decode a borrowed IKEv2 message while preserving a typed
+    /// unknown-critical rejection fact.
+    ///
+    /// Malformed lengths, truncation, payload-count bounds, and every failure
+    /// before a complete offending payload is established remain ordinary
+    /// non-reply-capable [`Ikev2MessageRejection::Malformed`] outcomes.
+    pub fn decode_with_rejection(
+        input: &'a [u8],
+        ctx: DecodeContext,
+    ) -> Result<(&'a [u8], Self), Ikev2MessageRejection> {
+        Self::decode_with_profile_and_rejection(input, ctx, Ikev2ValidationProfile::NetworkReceive)
+    }
+
+    /// Decode a borrowed IKEv2 message with an explicit validation profile
+    /// while preserving a typed unknown-critical rejection fact.
+    pub fn decode_with_profile_and_rejection(
+        input: &'a [u8],
+        ctx: DecodeContext,
+        profile: Ikev2ValidationProfile,
+    ) -> Result<(&'a [u8], Self), Ikev2MessageRejection> {
         let spec = spec_ref();
-        let (_, header) = decode_header_with_profile(input, ctx, profile)?;
+        let (_, header) = decode_header_with_profile(input, ctx, profile)
+            .map_err(Ikev2MessageRejection::Malformed)?;
         let msg_end = usize::try_from(header.length).map_err(|_| {
-            DecodeError::new(DecodeErrorCode::LengthOverflow, 24).with_spec_ref(spec.clone())
+            Ikev2MessageRejection::Malformed(
+                DecodeError::new(DecodeErrorCode::LengthOverflow, 24).with_spec_ref(spec.clone()),
+            )
         })?;
         if msg_end > ctx.max_message_len {
-            return Err(
-                DecodeError::new(DecodeErrorCode::MessageLengthExceeded, 24).with_spec_ref(spec)
-            );
+            return Err(Ikev2MessageRejection::Malformed(
+                DecodeError::new(DecodeErrorCode::MessageLengthExceeded, 24).with_spec_ref(spec),
+            ));
         }
         if msg_end < HEADER_LEN {
-            return Err(DecodeError::new(
-                DecodeErrorCode::InvalidLength {
-                    reason: "IKEv2 length shorter than fixed header",
-                },
-                24,
-            )
-            .with_spec_ref(spec));
+            return Err(Ikev2MessageRejection::Malformed(
+                DecodeError::new(
+                    DecodeErrorCode::InvalidLength {
+                        reason: "IKEv2 length shorter than fixed header",
+                    },
+                    24,
+                )
+                .with_spec_ref(spec),
+            ));
         }
         if input.len() < msg_end {
-            return Err(
-                DecodeError::new(DecodeErrorCode::Truncated, input.len()).with_spec_ref(spec)
-            );
+            return Err(Ikev2MessageRejection::Malformed(
+                DecodeError::new(DecodeErrorCode::Truncated, input.len()).with_spec_ref(spec),
+            ));
         }
 
         let payload_region = &input[HEADER_LEN..msg_end];
         let first_payload = PayloadType::from_u8(header.next_payload);
-        validate_payload_chain_with_profile(first_payload, payload_region, ctx, profile)?;
+        match validate_payload_chain_with_rejection_and_profile(
+            first_payload,
+            payload_region,
+            ctx,
+            profile,
+        ) {
+            Ok(()) => {}
+            Err(Ikev2PayloadChainRejection::Malformed(error)) => {
+                return Err(Ikev2MessageRejection::Malformed(error));
+            }
+            Err(Ikev2PayloadChainRejection::UnknownCriticalPayload(rejection)) => {
+                return Err(Ikev2MessageRejection::UnknownCriticalPayload(
+                    Ikev2UnknownCriticalPayloadMessage {
+                        header: RejectedMessageHeader::from_header(&header),
+                        rejection,
+                        has_trailing_bytes: input.len() != msg_end,
+                    },
+                ));
+            }
+        }
         let tail = &input[msg_end..];
 
         Ok((

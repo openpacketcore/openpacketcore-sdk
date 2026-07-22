@@ -3,12 +3,131 @@
 //! @spec IETF RFC7296 3.2
 //! @req REQ-IETF-RFC7296-3.2-001
 
+use core::fmt;
+
 use opc_protocol::{DecodeContext, DecodeError, DecodeErrorCode, SpecRef};
 
 use crate::{crypto::ProtectedPayloadKind, validation::Ikev2ValidationProfile};
 
 /// IKEv2 generic payload header length in octets.
 pub const GENERIC_PAYLOAD_HEADER_LEN: usize = 4;
+
+/// Typed rejection fact for an unrecognized IKEv2 payload whose Critical bit
+/// is set.
+///
+/// The offset is measured from the start of the payload-chain region, not from
+/// the fixed IKE header. Construction is internal to the bounded generic
+/// payload parser and occurs only after the offending payload's complete
+/// generic framing and declared length have been validated. The payload body
+/// is neither retained nor exposed.
+///
+/// @spec IETF RFC7296 2.5, 3.2
+/// @req REQ-IETF-RFC7296-3.2-UNKNOWN-CRITICAL-001
+/// @conformance boundary-only
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Ikev2UnknownCriticalPayload {
+    payload_type: u8,
+    payload_offset: usize,
+}
+
+impl Ikev2UnknownCriticalPayload {
+    /// Stable machine-readable rejection code.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        "ike_unknown_critical_payload"
+    }
+
+    /// Exact one-octet unsupported payload type required by RFC 7296.
+    #[must_use]
+    pub const fn payload_type(self) -> u8 {
+        self.payload_type
+    }
+
+    /// Bounded byte offset from the start of the payload-chain region.
+    #[must_use]
+    pub const fn payload_offset(self) -> usize {
+        self.payload_offset
+    }
+
+    pub(crate) fn decode_error(self) -> DecodeError {
+        DecodeError::new(DecodeErrorCode::UnknownCriticalIe, self.payload_offset)
+            .with_spec_ref(spec_ref())
+    }
+}
+
+impl fmt::Debug for Ikev2UnknownCriticalPayload {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Ikev2UnknownCriticalPayload")
+            .field("code", &self.code())
+            .field("payload_type", &self.payload_type)
+            .field("payload_offset", &self.payload_offset)
+            .finish()
+    }
+}
+
+/// Detailed generic payload-chain validation failure.
+///
+/// Existing decode APIs continue to return [`DecodeError`]. This additive
+/// boundary is for protocol handlers that must retain the exact RFC 7296
+/// unsupported-payload type without reparsing packet bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Ikev2PayloadChainRejection {
+    /// A fully framed unknown payload set the Critical bit.
+    UnknownCriticalPayload(Ikev2UnknownCriticalPayload),
+    /// Any other malformed or bounded-decode failure.
+    Malformed(DecodeError),
+}
+
+impl Ikev2PayloadChainRejection {
+    /// Stable machine-readable rejection code.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::UnknownCriticalPayload(rejection) => rejection.code(),
+            Self::Malformed(_) => "ike_payload_chain_malformed",
+        }
+    }
+
+    /// Return the unknown-critical fact when this rejection has one.
+    #[must_use]
+    pub const fn unknown_critical_payload(&self) -> Option<Ikev2UnknownCriticalPayload> {
+        match self {
+            Self::UnknownCriticalPayload(rejection) => Some(*rejection),
+            Self::Malformed(_) => None,
+        }
+    }
+
+    pub(crate) fn into_decode_error(self) -> DecodeError {
+        match self {
+            Self::UnknownCriticalPayload(rejection) => rejection.decode_error(),
+            Self::Malformed(error) => error,
+        }
+    }
+}
+
+impl fmt::Display for Ikev2PayloadChainRejection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownCriticalPayload(rejection) => write!(
+                f,
+                "{}: type {} at payload offset {}",
+                rejection.code(),
+                rejection.payload_type(),
+                rejection.payload_offset()
+            ),
+            Self::Malformed(error) => write!(f, "{}: {error}", self.code()),
+        }
+    }
+}
+
+impl std::error::Error for Ikev2PayloadChainRejection {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Malformed(error) => Some(error),
+            Self::UnknownCriticalPayload(_) => None,
+        }
+    }
+}
 
 fn spec_ref() -> SpecRef {
     SpecRef::new("ietf", "RFC7296", "3.2")
@@ -245,6 +364,15 @@ impl<'a> PayloadChain<'a> {
         validate_payload_chain(self.first_payload, self.bytes, ctx)
     }
 
+    /// Validate the payload chain while retaining a typed unknown-critical
+    /// rejection fact.
+    pub fn validate_with_rejection(
+        &self,
+        ctx: DecodeContext,
+    ) -> Result<(), Ikev2PayloadChainRejection> {
+        validate_payload_chain_with_rejection(self.first_payload, self.bytes, ctx)
+    }
+
     /// Validate the payload chain with an explicit IKEv2 validation profile.
     pub fn validate_with_profile(
         &self,
@@ -252,6 +380,21 @@ impl<'a> PayloadChain<'a> {
         profile: Ikev2ValidationProfile,
     ) -> Result<(), DecodeError> {
         validate_payload_chain_with_profile(self.first_payload, self.bytes, ctx, profile)
+    }
+
+    /// Validate the payload chain with an explicit IKEv2 validation profile
+    /// while retaining a typed unknown-critical rejection fact.
+    pub fn validate_with_profile_and_rejection(
+        &self,
+        ctx: DecodeContext,
+        profile: Ikev2ValidationProfile,
+    ) -> Result<(), Ikev2PayloadChainRejection> {
+        validate_payload_chain_with_rejection_and_profile(
+            self.first_payload,
+            self.bytes,
+            ctx,
+            profile,
+        )
     }
 }
 
@@ -265,8 +408,10 @@ pub struct RawPayloadIterator<'a> {
     remaining: &'a [u8],
     ctx: DecodeContext,
     profile: Ikev2ValidationProfile,
+    input_len: usize,
     offset: usize,
     seen: usize,
+    unknown_critical_rejection: Option<Ikev2UnknownCriticalPayload>,
 }
 
 impl<'a> RawPayloadIterator<'a> {
@@ -292,9 +437,21 @@ impl<'a> RawPayloadIterator<'a> {
             remaining: bytes,
             ctx,
             profile,
+            input_len: bytes.len(),
             offset: 0,
             seen: 0,
+            unknown_critical_rejection: None,
         }
+    }
+
+    /// Return the typed rejection fact after iteration encounters a fully
+    /// framed unknown critical payload.
+    ///
+    /// All other decode failures, including truncation, invalid declared
+    /// lengths, and payload-count bounds, return `None`.
+    #[must_use]
+    pub const fn unknown_critical_rejection(&self) -> Option<Ikev2UnknownCriticalPayload> {
+        self.unknown_critical_rejection
     }
 
     fn fail(&mut self, code: DecodeErrorCode, offset: usize, spec: SpecRef) -> DecodeError {
@@ -309,6 +466,13 @@ impl<'a> Iterator for RawPayloadIterator<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let spec = spec_ref();
+        if !self.current_payload.is_no_next() && self.input_len > self.ctx.max_message_len {
+            return Some(Err(self.fail(
+                DecodeErrorCode::MessageLengthExceeded,
+                0,
+                spec,
+            )));
+        }
         if self.current_payload.is_no_next() {
             if self.remaining.is_empty() {
                 return None;
@@ -370,15 +534,6 @@ impl<'a> Iterator for RawPayloadIterator<'a> {
             )));
         }
 
-        if matches!(payload_type, PayloadType::Unknown(_)) && critical {
-            let offset = self.offset;
-            return Some(Err(self.fail(
-                DecodeErrorCode::UnknownCriticalIe,
-                offset,
-                spec,
-            )));
-        }
-
         if payload_len < GENERIC_PAYLOAD_HEADER_LEN {
             let offset = self.offset + 2;
             return Some(Err(self.fail(
@@ -392,6 +547,21 @@ impl<'a> Iterator for RawPayloadIterator<'a> {
         if payload_len > self.remaining.len() {
             let offset = self.offset + self.remaining.len();
             return Some(Err(self.fail(DecodeErrorCode::Truncated, offset, spec)));
+        }
+
+        if let PayloadType::Unknown(payload_type) = payload_type {
+            if critical {
+                let rejection = Ikev2UnknownCriticalPayload {
+                    payload_type,
+                    payload_offset: self.offset,
+                };
+                self.unknown_critical_rejection = Some(rejection);
+                return Some(Err(self.fail(
+                    DecodeErrorCode::UnknownCriticalIe,
+                    self.offset,
+                    spec,
+                )));
+            }
         }
 
         let body = &self.remaining[GENERIC_PAYLOAD_HEADER_LEN..payload_len];
@@ -445,6 +615,29 @@ pub fn validate_payload_chain(
     )
 }
 
+/// Validate an IKEv2 generic payload chain while retaining a typed
+/// unknown-critical rejection fact.
+///
+/// Unlike ordinary [`validate_payload_chain`], this boundary distinguishes a
+/// fully framed unsupported critical payload from all malformed and bounded
+/// decode failures. It never retains payload bytes.
+///
+/// @spec IETF RFC7296 2.5, 3.2
+/// @req REQ-IETF-RFC7296-3.2-VALIDATE-REJECTION-001
+/// @conformance boundary-only
+pub fn validate_payload_chain_with_rejection(
+    first_payload: PayloadType,
+    bytes: &[u8],
+    ctx: DecodeContext,
+) -> Result<(), Ikev2PayloadChainRejection> {
+    validate_payload_chain_with_rejection_and_profile(
+        first_payload,
+        bytes,
+        ctx,
+        Ikev2ValidationProfile::NetworkReceive,
+    )
+}
+
 /// Validate an IKEv2 generic payload chain with an explicit profile.
 ///
 /// Network receive validation ignores the generic-header reserved bits as RFC
@@ -461,22 +654,47 @@ pub fn validate_payload_chain_with_profile(
     ctx: DecodeContext,
     profile: Ikev2ValidationProfile,
 ) -> Result<(), DecodeError> {
+    validate_payload_chain_with_rejection_and_profile(first_payload, bytes, ctx, profile)
+        .map_err(Ikev2PayloadChainRejection::into_decode_error)
+}
+
+/// Validate an IKEv2 generic payload chain with an explicit validation
+/// profile while retaining a typed unknown-critical rejection fact.
+///
+/// @spec IETF RFC7296 2.5, 3.2
+/// @req REQ-IETF-RFC7296-3.2-VALIDATE-REJECTION-002
+/// @conformance boundary-only
+pub fn validate_payload_chain_with_rejection_and_profile(
+    first_payload: PayloadType,
+    bytes: &[u8],
+    ctx: DecodeContext,
+    profile: Ikev2ValidationProfile,
+) -> Result<(), Ikev2PayloadChainRejection> {
     if first_payload.is_no_next() && bytes.is_empty() {
         return Ok(());
     }
     if first_payload.is_no_next() && !bytes.is_empty() {
-        return Err(DecodeError::new(
-            DecodeErrorCode::Structural {
-                reason: "payload bytes present with No Next Payload in IKE header",
-            },
-            0,
-        )
-        .with_spec_ref(spec_ref()));
+        return Err(Ikev2PayloadChainRejection::Malformed(
+            DecodeError::new(
+                DecodeErrorCode::Structural {
+                    reason: "payload bytes present with No Next Payload in IKE header",
+                },
+                0,
+            )
+            .with_spec_ref(spec_ref()),
+        ));
     }
 
     let mut iterator = RawPayloadIterator::new_with_profile(first_payload, bytes, ctx, profile);
-    for item in &mut iterator {
-        let _payload = item?;
+    while let Some(item) = iterator.next() {
+        if let Err(error) = item {
+            return match iterator.unknown_critical_rejection() {
+                Some(rejection) => Err(Ikev2PayloadChainRejection::UnknownCriticalPayload(
+                    rejection,
+                )),
+                None => Err(Ikev2PayloadChainRejection::Malformed(error)),
+            };
+        }
     }
     Ok(())
 }

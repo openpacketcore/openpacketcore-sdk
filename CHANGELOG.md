@@ -8,6 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Request-bound IKEv2 unknown-critical rejection — `opc-proto-ikev2`:**
+  generic payload walking and message/NAT-T decode now retain the exact
+  one-octet type plus bounded payload-chain offset for a fully framed unknown
+  Critical payload. An additive NAT inspection sidecar covers UDP/500 and
+  UDP/4500 without changing the existing coarse classification enum shape.
+  Rejection precedence is hardened for mixed-invalid input: malformed offender
+  framing remains malformed and trailing bytes win over the declared message's
+  unknown-critical fact. Only an exact, no-tail initial IKE_SA_INIT request can
+  produce the private-header reply wrapper that composes with the existing
+  canonical Notify type 1 builder. Responses, invalid or truncated framing,
+  trailing datagrams, and count/length bounds remain non-reply-capable;
+  unknown noncritical and understood Critical payload behavior is unchanged.
+  Diagnostic surfaces expose no packet bytes or IKE SPIs. Sending, source
+  admission, rate limiting, protected-message handling, and retransmission
+  caching remain product-owned (#470).
 - **Typed SWm/IKEv2 authorization-rejection wire helpers —
   `opc-proto-diameter`, `opc-proto-ikev2`:** the Diameter base registry now
   names RFC 6733 `DIAMETER_AUTHORIZATION_REJECTED` as 5003, and
