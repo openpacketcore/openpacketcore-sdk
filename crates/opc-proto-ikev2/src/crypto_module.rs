@@ -66,6 +66,7 @@ impl Ikev2CryptoRequirements {
     pub fn all_software_supported() -> Self {
         let mut requirements = Self::new();
         for prf in [
+            Ikev2PrfAlgorithm::HmacSha1,
             Ikev2PrfAlgorithm::HmacSha2_256,
             Ikev2PrfAlgorithm::HmacSha2_384,
             Ikev2PrfAlgorithm::HmacSha2_512,
@@ -73,6 +74,7 @@ impl Ikev2CryptoRequirements {
             requirements.add_prf(prf);
         }
         for integrity in [
+            Ikev2IntegrityAlgorithm::HmacSha1_96,
             Ikev2IntegrityAlgorithm::HmacSha2_256_128,
             Ikev2IntegrityAlgorithm::HmacSha2_384_192,
             Ikev2IntegrityAlgorithm::HmacSha2_512_256,
@@ -90,6 +92,8 @@ impl Ikev2CryptoRequirements {
             requirements.add_encryption(encryption);
         }
         for group in [
+            Ikev2DhGroup::Modp768,
+            Ikev2DhGroup::Modp1024,
             Ikev2DhGroup::Modp2048,
             Ikev2DhGroup::Ecp256,
             Ikev2DhGroup::Ecp384,
@@ -883,8 +887,14 @@ pub(crate) fn execute_dh_agree(
 ) -> Result<Zeroizing<Vec<u8>>, Ikev2CryptoModuleError> {
     let (_selected, mapped) = select_dh(group)?;
     validate_dh_handle(mapped, keypair, expected_public_value)?;
-    validate_dh_public_value(group, peer_public_value).map_err(|_| {
-        Ikev2CryptoModuleError::from_operation_code(CryptoOperationErrorCode::InvalidPeerPublicKey)
+    validate_dh_public_value(group, peer_public_value).map_err(|error| {
+        let code = match error {
+            Ikev2SaInitCryptoError::MalformedKeyExchange { .. } => {
+                CryptoOperationErrorCode::InvalidInputLength
+            }
+            _ => CryptoOperationErrorCode::InvalidPeerPublicKey,
+        };
+        Ikev2CryptoModuleError::from_operation_code(code)
     })?;
     let shared_secret = keypair
         .agree(peer_public_value)
@@ -1083,6 +1093,7 @@ enum MappedEncryption {
 
 const fn map_prf(algorithm: Ikev2PrfAlgorithm) -> IkePrfAlgorithm {
     match algorithm {
+        Ikev2PrfAlgorithm::HmacSha1 => IkePrfAlgorithm::HmacSha1,
         Ikev2PrfAlgorithm::HmacSha2_256 => IkePrfAlgorithm::HmacSha2_256,
         Ikev2PrfAlgorithm::HmacSha2_384 => IkePrfAlgorithm::HmacSha2_384,
         Ikev2PrfAlgorithm::HmacSha2_512 => IkePrfAlgorithm::HmacSha2_512,
@@ -1091,6 +1102,7 @@ const fn map_prf(algorithm: Ikev2PrfAlgorithm) -> IkePrfAlgorithm {
 
 const fn map_integrity(algorithm: Ikev2IntegrityAlgorithm) -> IkeIntegrityAlgorithm {
     match algorithm {
+        Ikev2IntegrityAlgorithm::HmacSha1_96 => IkeIntegrityAlgorithm::HmacSha1_96,
         Ikev2IntegrityAlgorithm::HmacSha2_256_128 => IkeIntegrityAlgorithm::HmacSha2_256_128,
         Ikev2IntegrityAlgorithm::HmacSha2_384_192 => IkeIntegrityAlgorithm::HmacSha2_384_192,
         Ikev2IntegrityAlgorithm::HmacSha2_512_256 => IkeIntegrityAlgorithm::HmacSha2_512_256,
@@ -1123,6 +1135,8 @@ const fn map_encryption(algorithm: Ikev2EncryptionAlgorithm) -> Option<MappedEnc
 
 const fn map_dh_group(group: Ikev2DhGroup) -> IkeDhGroup {
     match group {
+        Ikev2DhGroup::Modp768 => IkeDhGroup::Modp768,
+        Ikev2DhGroup::Modp1024 => IkeDhGroup::Modp1024,
         Ikev2DhGroup::Modp2048 => IkeDhGroup::Modp2048,
         Ikev2DhGroup::Ecp256 => IkeDhGroup::Ecp256,
         Ikev2DhGroup::Ecp384 => IkeDhGroup::Ecp384,

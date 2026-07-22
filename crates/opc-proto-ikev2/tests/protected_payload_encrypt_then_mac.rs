@@ -244,13 +244,14 @@ fn cbc_sha512_opens_and_seals_independent_complete_message_vector() {
 }
 
 #[test]
-fn every_declared_cbc_key_size_and_sha2_integrity_roundtrips_both_directions() {
+fn every_declared_cbc_key_size_and_integrity_roundtrips_both_directions() {
     let encryptions = [
         Ikev2EncryptionAlgorithm::AesCbc128,
         Ikev2EncryptionAlgorithm::AesCbc192,
         Ikev2EncryptionAlgorithm::AesCbc256,
     ];
     let integrities = [
+        Ikev2IntegrityAlgorithm::HmacSha1_96,
         Ikev2IntegrityAlgorithm::HmacSha2_256_128,
         Ikev2IntegrityAlgorithm::HmacSha2_384_192,
         Ikev2IntegrityAlgorithm::HmacSha2_512_256,
@@ -293,6 +294,52 @@ fn every_declared_cbc_key_size_and_sha2_integrity_roundtrips_both_directions() {
             }
         }
     }
+}
+
+#[test]
+fn cbc_hmac_sha1_96_rejects_authenticated_message_tampering() {
+    let profile = Ikev2SaInitCryptoProfile::new_encrypt_then_mac(
+        Ikev2PrfAlgorithm::HmacSha1,
+        Ikev2DhGroup::Modp1024,
+        Ikev2EncryptionAlgorithm::AesCbc256,
+        Ikev2IntegrityAlgorithm::HmacSha1_96,
+    )
+    .expect("explicit compatibility profile is executable");
+    let material = established_material(profile);
+    let body_len =
+        ikev2_aes_cbc_protected_body_len(profile, INNER_PAYLOAD.len()).expect("CBC body length");
+    let prefix = protected_prefix(
+        ProtectedPayloadKind::Encrypted,
+        Ikev2ProtectedPayloadDirection::InitiatorToResponder,
+        body_len,
+        None,
+        0x5348_4131,
+    );
+    let body = seal_ikev2_sa_init_aes_cbc_protected_payload_with_iv_for_test_vector(
+        profile,
+        &material,
+        Ikev2ProtectedPayloadDirection::InitiatorToResponder,
+        ProtectedPayloadSealContext {
+            kind: ProtectedPayloadKind::Encrypted,
+            message_prefix: &prefix,
+        },
+        &INNER_PAYLOAD,
+        CBC_IV,
+    )
+    .expect("CBC/HMAC-SHA1-96 seals");
+    let mut encoded = message(&prefix, &body);
+    *encoded.last_mut().expect("synthetic ICV exists") ^= 1;
+    let error = open(
+        &encoded,
+        profile,
+        &material,
+        Ikev2ProtectedPayloadDirection::InitiatorToResponder,
+    )
+    .expect_err("tampered HMAC-SHA1-96 ICV must fail");
+    assert_eq!(
+        provider_error(&error),
+        &Ikev2ProtectedPayloadCryptoError::AuthenticationFailed
+    );
 }
 
 #[test]

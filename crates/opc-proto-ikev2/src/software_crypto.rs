@@ -3,7 +3,7 @@
 //!
 //! [`Ikev2SoftwareCryptoOperations`] delegates every operation to the
 //! algorithm code that already backs this crate's IKEv2 helpers — the same
-//! HMAC-SHA2 composition, AES-GCM/AES-CBC primitives, DH/ECDH agreement, and
+//! HMAC-SHA1/SHA2 composition, AES-GCM/AES-CBC primitives, DH/ECDH agreement, and
 //! RSA/ECDSA signature calls — so its outputs are byte-identical to the
 //! existing code paths. The public IKEv2 crypto paths execute through the
 //! process-wide admitted module; this software implementation is one explicit
@@ -363,7 +363,16 @@ fn software_self_test(operations: &Ikev2SoftwareCryptoOperations) -> SelfTestOut
                     0x50, 0xc2, 0x6c, 0x9c, 0xd0, 0xd8, 0x9d,
                 ]
         });
-    let prf_ok = operations
+    let sha1_prf_ok = operations
+        .prf(IkePrfAlgorithm::HmacSha1, &[0x0b; 20], b"Hi There")
+        .is_ok_and(|output| {
+            output.as_slice()
+                == [
+                    0xb6, 0x17, 0x31, 0x86, 0x55, 0x05, 0x72, 0x64, 0xe2, 0x8b, 0xc0, 0xb6, 0xfb,
+                    0x37, 0x8c, 0x8e, 0xf1, 0x46, 0xbe, 0x00,
+                ]
+        });
+    let sha2_prf_ok = operations
         .prf(IkePrfAlgorithm::HmacSha2_256, &[0x0b; 20], b"Hi There")
         .is_ok_and(|output| {
             output.as_slice()
@@ -373,8 +382,9 @@ fn software_self_test(operations: &Ikev2SoftwareCryptoOperations) -> SelfTestOut
                     0x37, 0x6c, 0x2e, 0x32, 0xcf, 0xf7,
                 ]
         });
+    let prf_ok = sha1_prf_ok && sha2_prf_ok;
     let integrity_key = [0x0b; 32];
-    let integrity_ok = operations
+    let sha2_integrity_ok = operations
         .compute_integrity_checksum(
             IkeIntegrityAlgorithm::HmacSha2_256_128,
             &integrity_key,
@@ -391,6 +401,29 @@ fn software_self_test(operations: &Ikev2SoftwareCryptoOperations) -> SelfTestOut
                 )
                 .is_ok()
         });
+    let sha1_integrity_key = [0x0c; 20];
+    let sha1_integrity_ok = operations
+        .compute_integrity_checksum(
+            IkeIntegrityAlgorithm::HmacSha1_96,
+            &sha1_integrity_key,
+            b"Test With ",
+            b"Truncation",
+        )
+        .is_ok_and(|checksum| {
+            checksum.as_slice()
+                == [
+                    0x4c, 0x1a, 0x03, 0x42, 0x4b, 0x55, 0xe0, 0x7f, 0xe7, 0xf2, 0x7b, 0xe1,
+                ]
+                && operations
+                    .verify_integrity_checksum(
+                        IkeIntegrityAlgorithm::HmacSha1_96,
+                        &sha1_integrity_key,
+                        b"Test With Truncation",
+                        &checksum,
+                    )
+                    .is_ok()
+        });
+    let integrity_ok = sha1_integrity_ok && sha2_integrity_ok;
     let aead_key = [0x11; 16];
     let aead_salt = [0x22; 4];
     let aead_iv = [0x33; 8];
@@ -554,6 +587,7 @@ fn map_prf_algorithm(
     algorithm: IkePrfAlgorithm,
 ) -> Result<Ikev2PrfAlgorithm, CryptoOperationError> {
     match algorithm {
+        IkePrfAlgorithm::HmacSha1 => Ok(Ikev2PrfAlgorithm::HmacSha1),
         IkePrfAlgorithm::HmacSha2_256 => Ok(Ikev2PrfAlgorithm::HmacSha2_256),
         IkePrfAlgorithm::HmacSha2_384 => Ok(Ikev2PrfAlgorithm::HmacSha2_384),
         IkePrfAlgorithm::HmacSha2_512 => Ok(Ikev2PrfAlgorithm::HmacSha2_512),
@@ -565,6 +599,7 @@ fn map_integrity_algorithm(
     algorithm: IkeIntegrityAlgorithm,
 ) -> Result<Ikev2IntegrityAlgorithm, CryptoOperationError> {
     match algorithm {
+        IkeIntegrityAlgorithm::HmacSha1_96 => Ok(Ikev2IntegrityAlgorithm::HmacSha1_96),
         IkeIntegrityAlgorithm::HmacSha2_256_128 => Ok(Ikev2IntegrityAlgorithm::HmacSha2_256_128),
         IkeIntegrityAlgorithm::HmacSha2_384_192 => Ok(Ikev2IntegrityAlgorithm::HmacSha2_384_192),
         IkeIntegrityAlgorithm::HmacSha2_512_256 => Ok(Ikev2IntegrityAlgorithm::HmacSha2_512_256),
@@ -596,6 +631,8 @@ fn map_cbc_algorithm(
 
 fn map_dh_group(group: IkeDhGroup) -> Result<Ikev2DhGroup, CryptoOperationError> {
     match group {
+        IkeDhGroup::Modp768 => Ok(Ikev2DhGroup::Modp768),
+        IkeDhGroup::Modp1024 => Ok(Ikev2DhGroup::Modp1024),
         IkeDhGroup::Modp2048 => Ok(Ikev2DhGroup::Modp2048),
         IkeDhGroup::Ecp256 => Ok(Ikev2DhGroup::Ecp256),
         IkeDhGroup::Ecp384 => Ok(Ikev2DhGroup::Ecp384),
@@ -614,6 +651,9 @@ fn map_sa_init_error(error: Ikev2SaInitCryptoError) -> CryptoOperationError {
         }
         Ikev2SaInitCryptoError::InvalidPeerPublicKey { .. } => {
             CryptoOperationErrorCode::InvalidPeerPublicKey
+        }
+        Ikev2SaInitCryptoError::MalformedKeyExchange { .. } => {
+            CryptoOperationErrorCode::InvalidInputLength
         }
         Ikev2SaInitCryptoError::KeyGenerationFailed { .. } => {
             CryptoOperationErrorCode::KeyGenerationFailed
@@ -683,7 +723,8 @@ impl IkePrfOperations for Ikev2SoftwareCryptoOperations {
     fn supports_prf(&self, algorithm: IkePrfAlgorithm) -> bool {
         matches!(
             algorithm,
-            IkePrfAlgorithm::HmacSha2_256
+            IkePrfAlgorithm::HmacSha1
+                | IkePrfAlgorithm::HmacSha2_256
                 | IkePrfAlgorithm::HmacSha2_384
                 | IkePrfAlgorithm::HmacSha2_512
         )
@@ -715,7 +756,8 @@ impl IkeIntegrityOperations for Ikev2SoftwareCryptoOperations {
     fn supports_integrity(&self, algorithm: IkeIntegrityAlgorithm) -> bool {
         matches!(
             algorithm,
-            IkeIntegrityAlgorithm::HmacSha2_256_128
+            IkeIntegrityAlgorithm::HmacSha1_96
+                | IkeIntegrityAlgorithm::HmacSha2_256_128
                 | IkeIntegrityAlgorithm::HmacSha2_384_192
                 | IkeIntegrityAlgorithm::HmacSha2_512_256
         )
@@ -857,7 +899,12 @@ impl IkeDiffieHellmanOperations for Ikev2SoftwareCryptoOperations {
     fn supports_dh_group(&self, group: IkeDhGroup) -> bool {
         matches!(
             group,
-            IkeDhGroup::Modp2048 | IkeDhGroup::Ecp256 | IkeDhGroup::Ecp384 | IkeDhGroup::Ecp521
+            IkeDhGroup::Modp768
+                | IkeDhGroup::Modp1024
+                | IkeDhGroup::Modp2048
+                | IkeDhGroup::Ecp256
+                | IkeDhGroup::Ecp384
+                | IkeDhGroup::Ecp521
         )
     }
 

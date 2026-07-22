@@ -29,6 +29,7 @@ use crate::{
         Ikev2CryptoModuleError,
     },
     fragmentation::IKEV2_ENCRYPTED_FRAGMENT_FIXED_BODY_LEN,
+    hmac_sha1::hmac_sha1,
     hmac_sha2::{hmac_sha2_256, hmac_sha2_384, hmac_sha2_512},
     payload::GENERIC_PAYLOAD_HEADER_LEN,
     sa_init_crypto::{
@@ -573,7 +574,7 @@ impl CryptoProvider for Ikev2SaInitProtectedPayloadProvider<'_> {
 /// Authenticate and decrypt one IKEv2 `SK` or `SKF` payload body with SA_INIT keys.
 ///
 /// The helper supports RFC 5282 `ENCR_AES_GCM_16` and RFC 7296 AES-CBC with a
-/// typed SHA-2 integrity transform. It uses `SK_ei`/`SK_ai` for
+/// typed integrity transform. It uses `SK_ei`/`SK_ai` for
 /// [`Ikev2ProtectedPayloadDirection::InitiatorToResponder`] and
 /// `SK_er`/`SK_ar` for
 /// [`Ikev2ProtectedPayloadDirection::ResponderToInitiator`].
@@ -1611,6 +1612,7 @@ pub(crate) fn software_compute_integrity_checksum(
 ) -> Result<Zeroizing<Vec<u8>>, Ikev2ProtectedPayloadCryptoError> {
     validate_key_len("SK_a", integrity.key_len(), integrity_key.len())?;
     let mut checksum = match integrity {
+        Ikev2IntegrityAlgorithm::HmacSha1_96 => hmac_sha1(integrity_key, &[first, second]),
         Ikev2IntegrityAlgorithm::HmacSha2_256_128 => hmac_sha2_256(integrity_key, &[first, second]),
         Ikev2IntegrityAlgorithm::HmacSha2_384_192 => hmac_sha2_384(integrity_key, &[first, second]),
         Ikev2IntegrityAlgorithm::HmacSha2_512_256 => hmac_sha2_512(integrity_key, &[first, second]),
@@ -1645,6 +1647,7 @@ pub(crate) fn software_verify_integrity_checksum(
         return Err(Ikev2ProtectedPayloadCryptoError::AuthenticationFailed);
     }
     let expected = match integrity {
+        Ikev2IntegrityAlgorithm::HmacSha1_96 => hmac_sha1(integrity_key, &[authenticated_message]),
         Ikev2IntegrityAlgorithm::HmacSha2_256_128 => {
             hmac_sha2_256(integrity_key, &[authenticated_message])
         }

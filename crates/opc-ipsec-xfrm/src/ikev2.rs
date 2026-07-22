@@ -273,7 +273,7 @@ impl Error for Ikev2ChildSaXfrmError {}
 ///
 /// AES-GCM profiles map to [`Ikev2ChildSaXfrmKeys::aead`] with Linux
 /// [`crate::XFRM_AEAD_RFC4106_GCM_AES`] and a 128-bit ICV. AES-CBC profiles with supported
-/// HMAC-SHA2 integrity map to separate crypt/auth slots. ENCR_NULL profiles map
+/// supported HMAC integrity map to separate crypt/auth slots. ENCR_NULL profiles map
 /// to the auth slot plus Linux's canonical zero-key
 /// [`crate::XFRM_ENCR_NULL`] crypt slot. The IKEv2 KEYMAT remains
 /// authenticated-only: no cipher key or salt bytes are fabricated.
@@ -544,6 +544,7 @@ fn child_sa_xfrm_keys_from_direction(
 
 fn auth_algorithm_from_ikev2_integrity(integrity: Ikev2IntegrityAlgorithm) -> AuthAlgorithm {
     match integrity {
+        Ikev2IntegrityAlgorithm::HmacSha1_96 => AuthAlgorithm::hmac_sha1(integrity.icv_len_bits()),
         Ikev2IntegrityAlgorithm::HmacSha2_256_128 => {
             AuthAlgorithm::hmac_sha256(integrity.icv_len_bits())
         }
@@ -746,7 +747,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        XFRM_AEAD_RFC4106_GCM_AES, XFRM_AUTH_HMAC_SHA256, XFRM_ENCR_CBC_AES, XFRM_ENCR_NULL,
+        XFRM_AEAD_RFC4106_GCM_AES, XFRM_AUTH_HMAC_SHA1, XFRM_AUTH_HMAC_SHA256, XFRM_ENCR_CBC_AES,
+        XFRM_ENCR_NULL,
     };
     use opc_crypto_provider::ProviderPolicy;
     use opc_proto_ikev2::{
@@ -1391,6 +1393,44 @@ mod tests {
             outbound_crypt.1.as_bytes(),
             hex_to_bytes("8c2afd17eeff3e2a77f1c49d07cb5a9456546102f02fe52ee641dd4e3bc207ce")
         );
+    }
+
+    #[test]
+    fn derives_sha1_compatibility_child_sa_into_exact_xfrm_metadata() {
+        ensure_ike_crypto();
+        let profile = Ikev2ChildSaCryptoProfile::new_encrypt_then_mac(
+            Ikev2PrfAlgorithm::HmacSha1,
+            Ikev2EncryptionAlgorithm::AesCbc128,
+            Ikev2IntegrityAlgorithm::HmacSha1_96,
+        );
+        let keys = match derive_child_sa_xfrm_keys(
+            profile,
+            &[0x0f; 20],
+            &[0xa1; 16],
+            &[0xb2; 16],
+            Some(&[0xc3; 96]),
+        ) {
+            Ok(keys) => keys,
+            Err(error) => panic!("SHA1 compatibility Child SA derivation failed: {error:?}"),
+        };
+
+        for direction in [&keys.inbound, &keys.outbound] {
+            assert!(direction.aead.is_none());
+            let crypt = match &direction.crypt {
+                Some(crypt) => crypt,
+                None => panic!("SHA1 compatibility direction omitted AES-CBC keys"),
+            };
+            assert_eq!(crypt.0.name, XFRM_ENCR_CBC_AES);
+            assert_eq!(crypt.1.len(), 16);
+
+            let auth = match &direction.auth {
+                Some(auth) => auth,
+                None => panic!("SHA1 compatibility direction omitted authentication keys"),
+            };
+            assert_eq!(auth.0.name, XFRM_AUTH_HMAC_SHA1);
+            assert_eq!(auth.0.truncation_len_bits, 96);
+            assert_eq!(auth.1.len(), 20);
+        }
     }
 
     #[test]

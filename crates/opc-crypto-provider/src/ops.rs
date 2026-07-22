@@ -193,6 +193,8 @@ impl fmt::Display for IkeHashAlgorithm {
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IkePrfAlgorithm {
+    /// PRF_HMAC_SHA1, exposed for explicitly configured legacy interoperability.
+    HmacSha1,
     /// PRF_HMAC_SHA2_256.
     HmacSha2_256,
     /// PRF_HMAC_SHA2_384.
@@ -205,6 +207,7 @@ impl IkePrfAlgorithm {
     /// Stable machine-readable algorithm code.
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::HmacSha1 => "prf_hmac_sha1",
             Self::HmacSha2_256 => "prf_hmac_sha2_256",
             Self::HmacSha2_384 => "prf_hmac_sha2_384",
             Self::HmacSha2_512 => "prf_hmac_sha2_512",
@@ -215,6 +218,7 @@ impl IkePrfAlgorithm {
     #[must_use]
     pub const fn output_len(self) -> usize {
         match self {
+            Self::HmacSha1 => 20,
             Self::HmacSha2_256 => 32,
             Self::HmacSha2_384 => 48,
             Self::HmacSha2_512 => 64,
@@ -232,6 +236,8 @@ impl fmt::Display for IkePrfAlgorithm {
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IkeIntegrityAlgorithm {
+    /// AUTH_HMAC_SHA1_96, exposed for explicitly configured legacy interoperability.
+    HmacSha1_96,
     /// AUTH_HMAC_SHA2_256_128.
     HmacSha2_256_128,
     /// AUTH_HMAC_SHA2_384_192.
@@ -244,6 +250,7 @@ impl IkeIntegrityAlgorithm {
     /// Stable machine-readable algorithm code.
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::HmacSha1_96 => "auth_hmac_sha1_96",
             Self::HmacSha2_256_128 => "auth_hmac_sha2_256_128",
             Self::HmacSha2_384_192 => "auth_hmac_sha2_384_192",
             Self::HmacSha2_512_256 => "auth_hmac_sha2_512_256",
@@ -254,6 +261,7 @@ impl IkeIntegrityAlgorithm {
     #[must_use]
     pub const fn key_len(self) -> usize {
         match self {
+            Self::HmacSha1_96 => 20,
             Self::HmacSha2_256_128 => 32,
             Self::HmacSha2_384_192 => 48,
             Self::HmacSha2_512_256 => 64,
@@ -264,6 +272,7 @@ impl IkeIntegrityAlgorithm {
     #[must_use]
     pub const fn icv_len(self) -> usize {
         match self {
+            Self::HmacSha1_96 => 12,
             Self::HmacSha2_256_128 => 16,
             Self::HmacSha2_384_192 => 24,
             Self::HmacSha2_512_256 => 32,
@@ -384,6 +393,10 @@ impl fmt::Display for IkeCbcAlgorithm {
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IkeDhGroup {
+    /// 768-bit MODP group (Transform ID 1), exposed only for explicit legacy compatibility.
+    Modp768,
+    /// 1024-bit MODP group (Transform ID 2), exposed only for explicit legacy compatibility.
+    Modp1024,
     /// 2048-bit MODP group (Transform ID 14).
     Modp2048,
     /// NIST P-256 ECP group (Transform ID 19).
@@ -398,6 +411,8 @@ impl IkeDhGroup {
     /// Stable machine-readable group code.
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Modp768 => "modp_768",
+            Self::Modp1024 => "modp_1024",
             Self::Modp2048 => "modp_2048",
             Self::Ecp256 => "ecp_256",
             Self::Ecp384 => "ecp_384",
@@ -409,6 +424,8 @@ impl IkeDhGroup {
     #[must_use]
     pub const fn public_value_len(self) -> usize {
         match self {
+            Self::Modp768 => 96,
+            Self::Modp1024 => 128,
             Self::Modp2048 => 256,
             Self::Ecp256 => 64,
             Self::Ecp384 => 96,
@@ -420,6 +437,8 @@ impl IkeDhGroup {
     #[must_use]
     pub const fn shared_secret_len(self) -> usize {
         match self {
+            Self::Modp768 => 96,
+            Self::Modp1024 => 128,
             Self::Modp2048 => 256,
             Self::Ecp256 => 32,
             Self::Ecp384 => 48,
@@ -469,8 +488,7 @@ impl fmt::Display for IkeSignatureAlgorithm {
 
 /// IKEv2 PRF operations ([`crate::CryptoCapability::IkePrf`]).
 ///
-/// RFC 7296 section 2.13 `prf` and `prf+` over the negotiated HMAC-SHA2
-/// family.
+/// RFC 7296 section 2.13 `prf` and `prf+` over the negotiated HMAC family.
 pub trait IkePrfOperations: Send + Sync {
     /// Whether this module can execute `algorithm`.
     fn supports_prf(&self, algorithm: IkePrfAlgorithm) -> bool;
@@ -1001,13 +1019,19 @@ mod tests {
     fn algorithm_identifiers_have_stable_codes_and_consistent_lengths() {
         assert_eq!(IkeHashAlgorithm::Sha1.as_str(), "sha1");
         assert_eq!(IkeHashAlgorithm::Sha1.output_len(), 20);
+        assert_eq!(IkePrfAlgorithm::HmacSha1.as_str(), "prf_hmac_sha1");
         assert_eq!(IkePrfAlgorithm::HmacSha2_256.as_str(), "prf_hmac_sha2_256");
         assert_eq!(IkePrfAlgorithm::HmacSha2_384.as_str(), "prf_hmac_sha2_384");
         assert_eq!(IkePrfAlgorithm::HmacSha2_512.as_str(), "prf_hmac_sha2_512");
+        assert_eq!(IkePrfAlgorithm::HmacSha1.output_len(), 20);
         assert_eq!(IkePrfAlgorithm::HmacSha2_256.output_len(), 32);
         assert_eq!(IkePrfAlgorithm::HmacSha2_384.output_len(), 48);
         assert_eq!(IkePrfAlgorithm::HmacSha2_512.output_len(), 64);
 
+        assert_eq!(
+            IkeIntegrityAlgorithm::HmacSha1_96.as_str(),
+            "auth_hmac_sha1_96"
+        );
         assert_eq!(
             IkeIntegrityAlgorithm::HmacSha2_256_128.as_str(),
             "auth_hmac_sha2_256_128"
@@ -1021,6 +1045,7 @@ mod tests {
             "auth_hmac_sha2_512_256"
         );
         for (algorithm, key_len, icv_len) in [
+            (IkeIntegrityAlgorithm::HmacSha1_96, 20, 12),
             (IkeIntegrityAlgorithm::HmacSha2_256_128, 32, 16),
             (IkeIntegrityAlgorithm::HmacSha2_384_192, 48, 24),
             (IkeIntegrityAlgorithm::HmacSha2_512_256, 64, 32),
@@ -1053,6 +1078,8 @@ mod tests {
         }
 
         for (group, code, public_len, secret_len) in [
+            (IkeDhGroup::Modp768, "modp_768", 96, 96),
+            (IkeDhGroup::Modp1024, "modp_1024", 128, 128),
             (IkeDhGroup::Modp2048, "modp_2048", 256, 256),
             (IkeDhGroup::Ecp256, "ecp_256", 64, 32),
             (IkeDhGroup::Ecp384, "ecp_384", 96, 48),

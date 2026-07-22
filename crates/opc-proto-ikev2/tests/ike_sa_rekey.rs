@@ -325,6 +325,8 @@ fn rekey_kdf_requires_each_group_fixed_width_shared_secret() {
     support::ensure_ike_crypto();
     let nonce = [0x11; 16];
     for (group, expected_len) in [
+        (Ikev2DhGroup::Modp768, 96),
+        (Ikev2DhGroup::Modp1024, 128),
         (Ikev2DhGroup::Modp2048, 256),
         (Ikev2DhGroup::Ecp256, 32),
         (Ikev2DhGroup::Ecp384, 48),

@@ -13,13 +13,13 @@ use opc_proto_ikev2::{
     Ikev2CreateChildSaRekeyRequestBuild, Ikev2CreateChildSaRekeyResponseBuild, Ikev2DeletePayload,
     Ikev2DhGroup, Ikev2EncryptionAlgorithm, Ikev2IdentificationPayloadBuild,
     Ikev2IkeAuthBuildError, Ikev2IkeAuthPayloadBuild, Ikev2IkeAuthPayloadError, Ikev2IkeAuthPeer,
-    Ikev2IkeAuthSignedOctets, Ikev2IkeAuthVerificationError, Ikev2KeyExchangePayloadBuild,
-    Ikev2NoncePayloadBuild, Ikev2PrfAlgorithm, Ikev2SaInitCryptoProfile, Ikev2SaInitKeyMaterial,
-    Ikev2SaPayload, Ikev2SaPayloadBuild, Ikev2SaProposal, Ikev2SaProposalBuild,
-    Ikev2SaTransformBuild, Ikev2TrafficSelectorBuild, Ikev2TrafficSelectorPayloadBuild,
-    PayloadChain, PayloadType, IKEV2_AUTH_METHOD_SHARED_KEY_MIC, IKEV2_IPSEC_SPI_SIZE,
-    IKEV2_NOTIFY_REKEY_SA, IKEV2_SECURITY_PROTOCOL_ID_ESP, IKEV2_SECURITY_PROTOCOL_ID_IKE,
-    IKEV2_TS_IPV4_ADDR_RANGE, IKEV2_TS_IPV6_ADDR_RANGE,
+    Ikev2IkeAuthSignedOctets, Ikev2IkeAuthVerificationError, Ikev2IntegrityAlgorithm,
+    Ikev2KeyExchangePayloadBuild, Ikev2NoncePayloadBuild, Ikev2PrfAlgorithm,
+    Ikev2SaInitCryptoProfile, Ikev2SaInitKeyMaterial, Ikev2SaPayload, Ikev2SaPayloadBuild,
+    Ikev2SaProposal, Ikev2SaProposalBuild, Ikev2SaTransformBuild, Ikev2TrafficSelectorBuild,
+    Ikev2TrafficSelectorPayloadBuild, PayloadChain, PayloadType, IKEV2_AUTH_METHOD_SHARED_KEY_MIC,
+    IKEV2_IPSEC_SPI_SIZE, IKEV2_NOTIFY_REKEY_SA, IKEV2_SECURITY_PROTOCOL_ID_ESP,
+    IKEV2_SECURITY_PROTOCOL_ID_IKE, IKEV2_TS_IPV4_ADDR_RANGE, IKEV2_TS_IPV6_ADDR_RANGE,
 };
 
 mod support;
@@ -127,6 +127,13 @@ fn key_material() -> Ikev2SaInitKeyMaterial {
 fn shared_key_auth_payload_length_helper_matches_builder() {
     for profile in [
         profile(),
+        Ikev2SaInitCryptoProfile::new_encrypt_then_mac(
+            Ikev2PrfAlgorithm::HmacSha1,
+            Ikev2DhGroup::Modp768,
+            Ikev2EncryptionAlgorithm::AesCbc128,
+            Ikev2IntegrityAlgorithm::HmacSha1_96,
+        )
+        .expect("valid explicit SHA1 compatibility profile"),
         Ikev2SaInitCryptoProfile::new_aead(
             Ikev2PrfAlgorithm::HmacSha2_384,
             Ikev2DhGroup::Ecp384,
@@ -381,6 +388,68 @@ fn computes_and_verifies_shared_key_auth_mic_without_leaking_inputs() {
     assert!(!rendered.contains("private-user@example.net"));
     assert!(!rendered.contains("153"));
     assert!(!rendered.contains("first-ike-sa-init-request-wire-bytes"));
+}
+
+#[test]
+fn sha1_compatibility_profile_computes_and_verifies_ike_auth_mic() {
+    support::ensure_ike_crypto();
+    let profile = Ikev2SaInitCryptoProfile::new_encrypt_then_mac(
+        Ikev2PrfAlgorithm::HmacSha1,
+        Ikev2DhGroup::Modp768,
+        Ikev2EncryptionAlgorithm::AesCbc128,
+        Ikev2IntegrityAlgorithm::HmacSha1_96,
+    )
+    .expect("explicit SHA1 compatibility profile is executable");
+    let material = derive_ike_sa_init_key_material(
+        profile,
+        [0x11; 8],
+        [0x22; 8],
+        &[0x33; 32],
+        &[0x44; 32],
+        &[0x55; 96],
+        None,
+    )
+    .expect("SHA1 compatibility key material derives");
+    let signed = Ikev2IkeAuthSignedOctets {
+        peer: Ikev2IkeAuthPeer::Initiator,
+        ike_sa_init_message: b"synthetic-sha1-compatibility-transcript",
+        peer_nonce: &[0x66; 32],
+        identity_payload_body: &[2, 0, 0, 0, b'i', b'd'],
+    };
+    let auth_keying_material = [0x77; 64];
+    let mic = compute_ike_auth_shared_key_mic(profile, &material, signed, &auth_keying_material)
+        .expect("SHA1 compatibility AUTH MIC computes");
+    assert_eq!(mic.len(), 20);
+
+    let authentication = opc_proto_ikev2::Ikev2AuthenticationPayload {
+        auth_method: IKEV2_AUTH_METHOD_SHARED_KEY_MIC,
+        auth_data: &mic,
+    };
+    verify_ike_auth_shared_key_mic(
+        profile,
+        &material,
+        signed,
+        &auth_keying_material,
+        &authentication,
+    )
+    .expect("SHA1 compatibility AUTH MIC verifies");
+
+    let mut corrupted = mic;
+    corrupted[0] ^= 0x80;
+    let corrupted_authentication = opc_proto_ikev2::Ikev2AuthenticationPayload {
+        auth_method: IKEV2_AUTH_METHOD_SHARED_KEY_MIC,
+        auth_data: &corrupted,
+    };
+    assert_eq!(
+        verify_ike_auth_shared_key_mic(
+            profile,
+            &material,
+            signed,
+            &auth_keying_material,
+            &corrupted_authentication,
+        ),
+        Err(Ikev2IkeAuthVerificationError::AuthenticationFailed)
+    );
 }
 
 #[test]
