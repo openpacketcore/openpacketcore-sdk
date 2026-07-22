@@ -236,6 +236,7 @@ fn sample_answer() -> swm::SwmDiameterEapAnswer {
         mobile_node_identifier: None,
         subscriber_authorization: Default::default(),
         session_timeout: None,
+        multi_round_timeout: None,
         authorization_lifetime: None,
         auth_grace_period: None,
         re_auth_request_type: None,

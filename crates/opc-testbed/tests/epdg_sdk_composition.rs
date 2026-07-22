@@ -1,4 +1,4 @@
-use std::{error::Error, sync::OnceLock};
+use std::{error::Error, num::NonZeroU64, sync::OnceLock};
 
 use opc_crypto_provider::ProviderPolicy;
 use opc_evidence::{
@@ -15,11 +15,13 @@ use opc_ipsec_xfrm::{
 use opc_proto_diameter::apps::swm::{
     build_eap_response_identity, build_swm_diameter_eap_answer_for, build_swm_diameter_eap_request,
     derive_unauthenticated_emergency_msk, emergency_nai, parse_swm_diameter_eap_answer_envelope,
-    parse_swm_diameter_eap_request, parse_swm_diameter_eap_request_envelope, AuthRequestType,
+    parse_swm_diameter_eap_request, parse_swm_diameter_eap_request_envelope,
+    parse_swm_diameter_eap_response_envelope_from_connection, AuthRequestType,
     SwmChargingCharacteristics, SwmCoreNetworkRestrictions, SwmDeaSubscriberAuthorization,
-    SwmDiameterEapAnswer, SwmDiameterEapRequest, SwmDiameterResult, SwmE164Number,
-    SwmEmergencyAuthorizationEvidence, SwmEmergencyAuthorizationPath, SwmEmergencyServices,
-    SwmMpsPriority, SwmSubscriptionId, SwmTerminalInformation, SwmUeUsageType,
+    SwmDiameterConnectionToken, SwmDiameterEapAnswer, SwmDiameterEapRequest, SwmDiameterResult,
+    SwmE164Number, SwmEmergencyAuthorizationEvidence, SwmEmergencyAuthorizationPath,
+    SwmEmergencyServices, SwmExpectedAnswerPeer, SwmMpsPriority, SwmMultiRoundTimeout,
+    SwmSubscriptionId, SwmTerminalInformation, SwmUeUsageType,
     APPLICATION_ID as SWM_APPLICATION_ID, COMMAND_DIAMETER_EAP,
 };
 use opc_proto_diameter::Message as DiameterMessage;
@@ -430,6 +432,7 @@ fn epdg_unauthenticated_emergency_identity_recovery_components_compose(
         apn_configurations: Vec::new(),
         mobile_node_identifier: None,
         session_timeout: None,
+        multi_round_timeout: None,
         authorization_lifetime: None,
         auth_grace_period: None,
         re_auth_request_type: None,
@@ -517,6 +520,7 @@ fn epdg_unauthenticated_emergency_identity_recovery_components_compose(
         apn_configurations: Vec::new(),
         mobile_node_identifier: Some(emergency_nai(&imei).into()),
         session_timeout: None,
+        multi_round_timeout: None,
         authorization_lifetime: None,
         auth_grace_period: None,
         re_auth_request_type: None,
@@ -615,6 +619,108 @@ fn epdg_unauthenticated_emergency_identity_recovery_components_compose(
         auth_data,
     })?;
     assert_eq!(auth_body[0], IKEV2_AUTH_METHOD_SHARED_KEY_MIC);
+
+    Ok(())
+}
+
+#[test]
+fn epdg_swm_multi_round_timeout_uses_the_authenticated_current_request_boundary(
+) -> Result<(), Box<dyn Error>> {
+    let request = SwmDiameterEapRequest {
+        session_id: "epdg-a.example;multi-round;1".into(),
+        auth_application_id: SWM_APPLICATION_ID.get(),
+        origin_host: "epdg-a.example".into(),
+        origin_realm: "visited.example".into(),
+        destination_realm: "home.example".into(),
+        destination_host: Some("aaa-a.example".into()),
+        user_name: None,
+        rat_type: None,
+        service_selection: None,
+        mip6_feature_vector: None,
+        qos_capability: None,
+        visited_network_identifier: None,
+        aaa_failure_indication: None,
+        supported_features: Vec::new(),
+        ue_local_ip_address: None,
+        oc_supported_features: None,
+        auth_request_type: AuthRequestType::AuthorizeAuthenticate,
+        eap_payload: vec![2, 0x2a, 0, 5, 1].into(),
+        emergency_services: None,
+        terminal_information: None,
+        high_priority_access_info: None,
+        state_avps: Vec::new(),
+        route_records: Vec::new(),
+        extensions: Default::default(),
+    };
+    let request_owned = build_swm_diameter_eap_request(
+        &request,
+        0x1000_002a,
+        0x2000_002a,
+        EncodeContext::default(),
+    )?;
+    let request_message = DiameterMessage {
+        header: request_owned.header.clone(),
+        raw_avps: &request_owned.raw_avps,
+        tail: &[],
+    };
+    let connection = SwmDiameterConnectionToken::new(NonZeroU64::MIN);
+    let request_envelope =
+        parse_swm_diameter_eap_request_envelope(&request_message, DecodeContext::conservative())?
+            .with_expected_answer_peer(SwmExpectedAnswerPeer::direct(
+                connection,
+                "aaa-a.example",
+                "home.example",
+            ));
+
+    let answer = SwmDiameterEapAnswer {
+        session_id: request.session_id.clone(),
+        auth_application_id: SWM_APPLICATION_ID.get(),
+        auth_request_type: AuthRequestType::AuthorizeAuthenticate,
+        result: SwmDiameterResult::Base(1_001),
+        origin_host: "aaa-a.example".into(),
+        origin_realm: "home.example".into(),
+        user_name: None,
+        subscriber_authorization: Default::default(),
+        mip6_feature_vector: None,
+        supported_features: Vec::new(),
+        oc_supported_features: None,
+        oc_olr: None,
+        load_reports: Vec::new(),
+        service_selection: None,
+        default_context_identifier: None,
+        apn_configurations: Vec::new(),
+        mobile_node_identifier: None,
+        session_timeout: None,
+        multi_round_timeout: Some(SwmMultiRoundTimeout::from_seconds(12)),
+        authorization_lifetime: None,
+        auth_grace_period: None,
+        re_auth_request_type: None,
+        eap_payload: Some(vec![1, 0x2a, 0, 5, 1].into()),
+        eap_reissued_payload: None,
+        error_message: None,
+        state_avps: Vec::new(),
+        eap_master_session_key: None,
+        extensions: Default::default(),
+    };
+    let answer_owned =
+        build_swm_diameter_eap_answer_for(&request_envelope, &answer, EncodeContext::default())?;
+    let answer_message = DiameterMessage {
+        header: answer_owned.header.clone(),
+        raw_avps: &answer_owned.raw_avps,
+        tail: &[],
+    };
+    let response = parse_swm_diameter_eap_response_envelope_from_connection(
+        &answer_message,
+        connection,
+        DecodeContext::conservative(),
+    )?;
+    let correlated = request_envelope.correlate_response(response)?;
+    assert_eq!(
+        correlated
+            .current_eap_request_timeout()
+            .map(SwmMultiRoundTimeout::seconds),
+        Some(12),
+    );
 
     Ok(())
 }
