@@ -1209,6 +1209,14 @@ recovered exact 15-digit IMEI in `Terminal-Information`. The recovery branch
 accepts only the TS 23.003 IMSI emergency NAI forms for AKA/AKA-prime and an
 exact EAP-Response/Identity whose bytes equal User-Name.
 
+For an ordinary base result, use
+`SwmDiameterResult::is_diameter_authorization_rejected()` to identify exact
+RFC 6733 `DIAMETER_AUTHORIZATION_REJECTED` (5003). The helper deliberately
+returns false for base value 4001 (`DIAMETER_AUTHENTICATION_REJECTED`) and for
+an `Experimental-Result` that happens to reuse numeric value 5003. Choosing an
+IKEv2 or other access-protocol response from that wire fact remains product
+policy; this crate does not translate between protocols.
+
 Emergency DER builders should use `emergency_nai(&imei)` for the direct IMEI
 path and pass the exact resulting bytes to `build_eap_response_identity`;
 recovery DER builders use the same EAP helper with their canonical IMSI

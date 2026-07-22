@@ -73,6 +73,15 @@ control-plane stack.
   responses using the redaction-safe exact-15-digit `Imei15` and `Imeisv`
   types. TBCD decoding preserves the received fifteenth IMEI digit (including
   a spare zero or non-Luhn digit) and enforces the terminal filler nibble.
+- `notify` exposes the TS 24.302 private error value
+  `IKEV2_NOTIFY_AUTHORIZATION_REJECTED` (9003). Construct its canonical
+  Protocol-ID-zero, empty-SPI, empty-data body with
+  `Ikev2NotifyPayloadBuild::authorization_rejected()`, encode it through
+  `build_ike_auth_notify_payload`, and recognize its empty-SPI/empty-data
+  receive shape with `Ikev2NotifyPayload::is_authorization_rejected()`.
+  Consistent with RFC 7296 section 3.10, receive recognition ignores Protocol
+  ID when SPI Size is zero. Choosing this outcome from Diameter or local
+  authorization state remains product-owned.
 - `dedicated_bearer` implements the TS 24.302 multiple-bearer Notify values and
   strict opened-payload views/builders for dedicated-bearer `CREATE_CHILD_SA`
   and `INFORMATIONAL` modification/deletion exchanges. TFT values use the
@@ -820,6 +829,12 @@ DEVICE_IDENTITY carries equipment identity only; it does not define or weaken
 IKE authentication. Emergency procedures continue to use the ordinary RFC 7296
 method-2 shared-key AUTH helper with caller-supplied, procedure-derived keying
 material. The product layer owns exchange correlation and authorization policy.
+
+The AUTHORIZATION_REJECTED helper only builds the TS 24.302 Notify body. A
+product that selects it must still follow TS 24.302 section 7.4.1.2, including
+providing the UE the information needed to authenticate the ePDG. The SDK does
+not infer that selection from a Diameter result and does not implement captive
+portal or provisioning policy.
 
 See [CONFORMANCE.md](CONFORMANCE.md) for the exact evidence boundary and
 explicit non-goals.

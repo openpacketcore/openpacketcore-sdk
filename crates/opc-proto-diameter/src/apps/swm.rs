@@ -1509,6 +1509,23 @@ impl SwmDiameterResult {
         matches!(self, Self::Base(base::RESULT_CODE_DIAMETER_SUCCESS))
     }
 
+    /// Return whether this is exact base `DIAMETER_AUTHORIZATION_REJECTED`.
+    ///
+    /// RFC 6733 assigns authorization rejection value 5003. Value 4001 is
+    /// `DIAMETER_AUTHENTICATION_REJECTED` and intentionally returns false.
+    ///
+    /// This method classifies one received SWm result. Selecting a downstream
+    /// access-protocol response remains product policy.
+    ///
+    /// @spec IETF RFC6733 7.1.5; 3GPP TS29.273 7.1.2.1.2
+    #[must_use]
+    pub const fn is_diameter_authorization_rejected(self) -> bool {
+        matches!(
+            self,
+            Self::Base(base::RESULT_CODE_DIAMETER_AUTHORIZATION_REJECTED)
+        )
+    }
+
     /// Return whether this is the 3GPP emergency identity-recovery response.
     pub const fn requests_emergency_identity_recovery(self) -> bool {
         matches!(
