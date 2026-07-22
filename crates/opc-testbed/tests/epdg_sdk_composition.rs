@@ -16,9 +16,11 @@ use opc_proto_diameter::apps::swm::{
     build_eap_response_identity, build_swm_diameter_eap_answer_for, build_swm_diameter_eap_request,
     derive_unauthenticated_emergency_msk, emergency_nai, parse_swm_diameter_eap_answer_envelope,
     parse_swm_diameter_eap_request, parse_swm_diameter_eap_request_envelope, AuthRequestType,
-    SwmDiameterEapAnswer, SwmDiameterEapRequest, SwmDiameterResult,
+    SwmChargingCharacteristics, SwmCoreNetworkRestrictions, SwmDeaSubscriberAuthorization,
+    SwmDiameterEapAnswer, SwmDiameterEapRequest, SwmDiameterResult, SwmE164Number,
     SwmEmergencyAuthorizationEvidence, SwmEmergencyAuthorizationPath, SwmEmergencyServices,
-    SwmTerminalInformation, APPLICATION_ID as SWM_APPLICATION_ID, COMMAND_DIAMETER_EAP,
+    SwmMpsPriority, SwmSubscriptionId, SwmTerminalInformation, SwmUeUsageType,
+    APPLICATION_ID as SWM_APPLICATION_ID, COMMAND_DIAMETER_EAP,
 };
 use opc_proto_diameter::Message as DiameterMessage;
 use opc_proto_gtpv2c::{
@@ -417,6 +419,7 @@ fn epdg_unauthenticated_emergency_identity_recovery_components_compose(
         origin_host: "aaa.redacted.example".into(),
         origin_realm: "home.redacted.example".into(),
         user_name: None,
+        subscriber_authorization: Default::default(),
         mip6_feature_vector: None,
         supported_features: Vec::new(),
         oc_supported_features: None,
@@ -498,6 +501,12 @@ fn epdg_unauthenticated_emergency_identity_recovery_components_compose(
         origin_host: "aaa.redacted.example".into(),
         origin_realm: "home.redacted.example".into(),
         user_name: None,
+        subscriber_authorization: SwmDeaSubscriberAuthorization::new()
+            .with_subscription_id(SwmSubscriptionId::e164(SwmE164Number::new("15550100001")?))
+            .with_charging_characteristics(SwmChargingCharacteristics::from_octets([0x08, 0x00]))
+            .with_ue_usage_type(SwmUeUsageType::new(7))
+            .with_core_network_restrictions(SwmCoreNetworkRestrictions::five_gc_not_allowed())
+            .with_mps_priority(SwmMpsPriority::none().with_eps_priority(true)),
         mip6_feature_vector: None,
         supported_features: Vec::new(),
         oc_supported_features: None,
@@ -530,6 +539,35 @@ fn epdg_unauthenticated_emergency_identity_recovery_components_compose(
     };
     let final_answer_envelope =
         parse_swm_diameter_eap_answer_envelope(&final_message, DecodeContext::conservative())?;
+    let subscriber = &final_answer_envelope.answer().subscriber_authorization;
+    assert_eq!(
+        subscriber
+            .subscription_id()
+            .map(|value| value.value().as_str()),
+        Some("15550100001")
+    );
+    assert_eq!(
+        subscriber
+            .charging_characteristics()
+            .map(|value| value.octets()),
+        Some([0x08, 0x00])
+    );
+    assert_eq!(
+        subscriber.ue_usage_type().map(|value| value.value()),
+        Some(7)
+    );
+    assert_eq!(
+        subscriber
+            .core_network_restrictions()
+            .map(SwmCoreNetworkRestrictions::disallows_five_gc),
+        Some(true)
+    );
+    assert_eq!(
+        subscriber
+            .mps_priority()
+            .map(SwmMpsPriority::has_eps_priority),
+        Some(true)
+    );
     let initial_exchange = initial_request_envelope.correlate_answer(identity_answer_envelope)?;
     let retry_exchange = retry_request_envelope.correlate_answer(final_answer_envelope)?;
 

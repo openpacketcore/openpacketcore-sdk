@@ -23,6 +23,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mismatch at both DEA top level and inside `Emergency-Info`, while V/P,
   cardinality, length, vendor, and prefix-host-bit violations fail closed
   (#352).
+- **Breaking: typed SWm DEA subscriber authorization facts —
+  `opc-proto-diameter`:** `SwmDiameterEapAnswer` adds the non-exhaustive
+  `subscriber_authorization` bundle. Existing struct literals must add
+  `subscriber_authorization: Default::default()`; the empty bundle preserves
+  prior wire bytes. Typed, redaction-safe models now cover
+  APN-OI-Replacement, E.164/MSISDN Subscription-Id, charging characteristics,
+  UE usage, core-network restrictions, and MPS priority. Codec validation pins
+  vendor-aware identity, width, singleton/grouped cardinality, assigned bit
+  ranges, sealed optional child preservation, and canonical replay. Receivers
+  tolerate the TS 29.273 understood-AVP M-bit mismatch on the six affected
+  outer values while required Subscription-Id children remain strict.
+  APN-OI alone requires exact success, non-emergency access, its exact
+  `[prefix.]mncNNN.mccNNN.gprs` syntax, and correlated network-based mobility
+  provenance. `SwmDiameterEapRequestEnvelope` can now retain explicit trusted
+  local mobility mode when a DEA omits its mobility vector; an explicit AAA
+  vector takes precedence. Correlated exchanges expose the effective typed
+  mode and `SwmConditionalValueSource`. The other subscriber facts do not
+  imply success. Retained E.164/MSISDN storage uses the crate's redacted,
+  zeroize-on-drop `Sensitive<String>` owner. Numeric core-code collisions with
+  the wrong vendor identity fail closed at both the top level and inside
+  Subscription-Id, independent of unknown-AVP policy. A present MPS-Priority
+  must set `MPS-EPS-Priority`.
+  The shared RFC 4006 Subscription-Id codec preserves the established Rf API,
+  bytes, missing-child diagnostics, and historical Rf child parsing behavior.
+  Rf dictionary metadata now correctly marks P as permitted on the group and
+  both children, and retains RFC 4006's required outer M bit. The SWm
+  application dictionary alone tolerates either received outer M shape. The
+  typed Rf parser still requires outer M set, required SWm child M rules stay
+  strict, and originated bytes remain canonical (#352).
 - **Breaking: correlated SWm Diameter-EAP redirect and routing —
   `opc-proto-diameter`:** `SwmDiameterEapRequest` adds ordered redacted
   `route_records`; existing originated literals initialize `Vec::new()`.

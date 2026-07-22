@@ -18,12 +18,17 @@ use opc_protocol::{
 };
 
 use super::builder_helpers;
+use super::subscription_id::{append_subscription_id_avp, parse_subscription_id};
+pub use super::subscription_id::{
+    SubscriptionId, SubscriptionIdType, AVP_SUBSCRIPTION_ID, AVP_SUBSCRIPTION_ID_DATA,
+    AVP_SUBSCRIPTION_ID_TYPE,
+};
 use super::VENDOR_ID_3GPP;
 use crate::avp::dictionary::Redacted;
 use crate::base;
 use crate::dictionary::{
     ApplicationDefinition, AvpDataType, AvpDefinition, AvpFlagRules, AvpKey, CommandDefinition,
-    CommandKind, Dictionary,
+    CommandKind, Dictionary, FlagRequirement,
 };
 use crate::{ApplicationId, AvpCode, AvpHeader, CommandCode, Message, OwnedMessage};
 
@@ -39,12 +44,6 @@ pub const AVP_ACCOUNTING_RECORD_TYPE: AvpCode = AvpCode::new(480);
 pub const AVP_ACCOUNTING_RECORD_NUMBER: AvpCode = AvpCode::new(485);
 /// Event-Timestamp AVP code (RFC 6733 §5.3.2).
 pub const AVP_EVENT_TIMESTAMP: AvpCode = AvpCode::new(55);
-/// Subscription-Id grouped AVP code (RFC 4006 §8.46).
-pub const AVP_SUBSCRIPTION_ID: AvpCode = AvpCode::new(443);
-/// Subscription-Id-Data AVP code (RFC 4006 §8.47).
-pub const AVP_SUBSCRIPTION_ID_DATA: AvpCode = AvpCode::new(444);
-/// Subscription-Id-Type AVP code (RFC 4006 §8.48).
-pub const AVP_SUBSCRIPTION_ID_TYPE: AvpCode = AvpCode::new(450);
 /// Multiple-Services-Credit-Control grouped AVP code (RFC 4006 §8.16).
 pub const AVP_MULTIPLE_SERVICES_CREDIT_CONTROL: AvpCode = AvpCode::new(456);
 /// Used-Service-Unit grouped AVP code (RFC 4006 §8.19).
@@ -136,21 +135,33 @@ const RF_AVPS: [AvpDefinition; 20] = [
         AvpKey::ietf(AVP_SUBSCRIPTION_ID),
         "Subscription-Id",
         AvpDataType::Grouped,
-        AvpFlagRules::base_mandatory(),
+        AvpFlagRules::new(
+            FlagRequirement::MustBeUnset,
+            FlagRequirement::MustBeSet,
+            FlagRequirement::MayBeSet,
+        ),
         SpecRef::new("ietf", "RFC4006", "8.46"),
     ),
     AvpDefinition::new(
         AvpKey::ietf(AVP_SUBSCRIPTION_ID_TYPE),
         "Subscription-Id-Type",
         AvpDataType::Enumerated,
-        AvpFlagRules::base_mandatory(),
+        AvpFlagRules::new(
+            FlagRequirement::MustBeUnset,
+            FlagRequirement::MustBeSet,
+            FlagRequirement::MayBeSet,
+        ),
         SpecRef::new("ietf", "RFC4006", "8.47"),
     ),
     AvpDefinition::new(
         AvpKey::ietf(AVP_SUBSCRIPTION_ID_DATA),
         "Subscription-Id-Data",
         AvpDataType::Utf8String,
-        AvpFlagRules::base_mandatory(),
+        AvpFlagRules::new(
+            FlagRequirement::MustBeUnset,
+            FlagRequirement::MustBeSet,
+            FlagRequirement::MayBeSet,
+        ),
         SpecRef::new("ietf", "RFC4006", "8.48"),
     ),
     AvpDefinition::new(
@@ -296,58 +307,6 @@ impl AccountingRecordType {
             other => Self::Other(other),
         }
     }
-}
-
-/// Subscription-Id-Type values from RFC 4006 §8.47.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum SubscriptionIdType {
-    /// End User E.164.
-    EndUserE164,
-    /// End User IMSI.
-    EndUserImsi,
-    /// End User SIP URI.
-    EndUserSipUri,
-    /// End User NAI.
-    EndUserNai,
-    /// End User Private.
-    EndUserPrivate,
-    /// Unknown or application-specific value.
-    Other(u32),
-}
-
-impl SubscriptionIdType {
-    /// Return the wire value for this subscription-id type.
-    pub const fn value(self) -> u32 {
-        match self {
-            Self::EndUserE164 => 0,
-            Self::EndUserImsi => 1,
-            Self::EndUserSipUri => 2,
-            Self::EndUserNai => 3,
-            Self::EndUserPrivate => 4,
-            Self::Other(v) => v,
-        }
-    }
-
-    /// Parse a subscription-id type from its wire value.
-    pub const fn from_value(value: u32) -> Self {
-        match value {
-            0 => Self::EndUserE164,
-            1 => Self::EndUserImsi,
-            2 => Self::EndUserSipUri,
-            3 => Self::EndUserNai,
-            4 => Self::EndUserPrivate,
-            other => Self::Other(other),
-        }
-    }
-}
-
-/// A single subscription identifier carried inside a Subscription-Id grouped AVP.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SubscriptionId {
-    /// Type of subscription identifier.
-    pub subscription_id_type: SubscriptionIdType,
-    /// Subscription identifier value (redacted in diagnostic output).
-    pub subscription_id_data: Redacted<String>,
 }
 
 /// Used-Service-Unit grouped AVP (RFC 4006 §8.19).
@@ -729,6 +688,7 @@ pub fn parse_rf_accounting_request(
                 let value = builder_helpers::parse_string_value(avp.value, value_offset, "8.6")?;
                 builder_helpers::set_once(&mut service_context_id, value, offset, "8.6")?;
             } else if code == AVP_SUBSCRIPTION_ID {
+                validate_subscription_id_outer_flags(&avp.header, offset)?;
                 subscription_ids.push(parse_subscription_id(avp.value, ctx, value_offset, 1)?);
             } else if code == AVP_MULTIPLE_SERVICES_CREDIT_CONTROL {
                 multiple_services_credit_controls.push(parse_multiple_services_credit_control(
@@ -799,6 +759,22 @@ pub fn parse_rf_accounting_request(
         multiple_services_credit_controls,
         ps_information,
     })
+}
+
+fn validate_subscription_id_outer_flags(
+    header: &AvpHeader,
+    offset: usize,
+) -> Result<(), DecodeError> {
+    if header.vendor_id.is_some() || !header.flags.is_mandatory() {
+        return Err(DecodeError::new(
+            DecodeErrorCode::Structural {
+                reason: "Rf Subscription-Id must clear V and set M",
+            },
+            offset.saturating_add(4),
+        )
+        .with_spec_ref(SpecRef::new("ietf", "RFC4006", "8.46")));
+    }
+    Ok(())
 }
 
 /// Build a raw Rf Accounting-Answer message.
@@ -1006,74 +982,6 @@ pub fn parse_rf_accounting_answer(
         acct_application_id,
         origin_state_id,
         event_timestamp,
-    })
-}
-
-fn append_subscription_id_avp(
-    dst: &mut BytesMut,
-    subscription_id: &SubscriptionId,
-    ctx: EncodeContext,
-) -> Result<(), EncodeError> {
-    let mut value = BytesMut::new();
-    builder_helpers::append_u32_avp(
-        &mut value,
-        AVP_SUBSCRIPTION_ID_TYPE,
-        subscription_id.subscription_id_type.value(),
-        true,
-        ctx,
-    )?;
-    builder_helpers::append_utf8_avp(
-        &mut value,
-        AVP_SUBSCRIPTION_ID_DATA,
-        subscription_id.subscription_id_data.as_ref(),
-        true,
-        ctx,
-    )?;
-    builder_helpers::append_avp(dst, AvpHeader::ietf(AVP_SUBSCRIPTION_ID, true), &value, ctx)
-}
-
-fn parse_subscription_id(
-    value: &[u8],
-    ctx: DecodeContext,
-    base_offset: usize,
-    depth: usize,
-) -> Result<SubscriptionId, DecodeError> {
-    let mut subscription_id_type = None;
-    let mut subscription_id_data = None;
-    builder_helpers::for_each_avp(value, ctx, base_offset, depth, |offset, avp| {
-        let value_offset = builder_helpers::offset_add(offset, avp.header.header_len(), "8.46")?;
-        let code = avp.header.code;
-        if avp.header.vendor_id.is_some() {
-            return builder_helpers::handle_unknown_avp(ctx, &avp, offset, "8.46");
-        }
-        if code == AVP_SUBSCRIPTION_ID_TYPE {
-            let value = builder_helpers::parse_u32_value(avp.value, value_offset, "8.47")?;
-            builder_helpers::set_once(
-                &mut subscription_id_type,
-                SubscriptionIdType::from_value(value),
-                offset,
-                "8.46",
-            )?;
-        } else if code == AVP_SUBSCRIPTION_ID_DATA {
-            let value = builder_helpers::parse_string_value(avp.value, value_offset, "8.48")?;
-            builder_helpers::set_once(
-                &mut subscription_id_data,
-                Redacted::from(value),
-                offset,
-                "8.46",
-            )?;
-        } else {
-            builder_helpers::handle_unknown_avp(ctx, &avp, offset, "8.46")?;
-        }
-        Ok(())
-    })?;
-    Ok(SubscriptionId {
-        subscription_id_type: subscription_id_type.ok_or_else(|| {
-            missing_child_error(base_offset, "missing Subscription-Id-Type child AVP")
-        })?,
-        subscription_id_data: subscription_id_data.ok_or_else(|| {
-            missing_child_error(base_offset, "missing Subscription-Id-Data child AVP")
-        })?,
     })
 }
 
@@ -1342,11 +1250,6 @@ fn parse_ps_information(
         sgsn_address,
         ggsn_address,
     })
-}
-
-fn missing_child_error(base_offset: usize, reason: &'static str) -> DecodeError {
-    DecodeError::new(DecodeErrorCode::Structural { reason }, base_offset)
-        .with_spec_ref(SpecRef::new("ietf", "RFC6733", "grouped"))
 }
 
 fn encode_structural_error(reason: &'static str) -> EncodeError {

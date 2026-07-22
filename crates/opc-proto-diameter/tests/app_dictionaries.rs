@@ -275,6 +275,80 @@ fn app_dictionaries_layer_includes_rf_and_swm() {
     let set = apps::APP_DICTIONARIES;
     assert!(set.find_application(apps::rf::APPLICATION_ID).is_some());
     assert!(set.find_application(apps::swm::APPLICATION_ID).is_some());
+
+    // Rf is intentionally registered before SWm. Both application definitions
+    // permit P, while Rf retains RFC 4006's required outer M bit and SWm keeps
+    // its understood-M-mismatch tolerance local.
+    for code in [
+        apps::swm::AVP_SUBSCRIPTION_ID,
+        apps::swm::AVP_SUBSCRIPTION_ID_TYPE,
+        apps::swm::AVP_SUBSCRIPTION_ID_DATA,
+    ] {
+        assert_eq!(
+            set.find_avp(AvpKey::ietf(code))
+                .expect("shared Subscription-Id definition")
+                .flags()
+                .protected(),
+            FlagRequirement::MayBeSet
+        );
+    }
+    assert_eq!(
+        set.find_avp(AvpKey::ietf(apps::swm::AVP_SUBSCRIPTION_ID))
+            .expect("shared Subscription-Id definition")
+            .flags()
+            .mandatory(),
+        FlagRequirement::MustBeSet
+    );
+    assert_eq!(
+        apps::swm::dictionary()
+            .find_avp(AvpKey::ietf(apps::swm::AVP_SUBSCRIPTION_ID))
+            .expect("SWm Subscription-Id definition")
+            .flags()
+            .mandatory(),
+        FlagRequirement::MayBeSet
+    );
+    for child in [
+        apps::swm::AVP_SUBSCRIPTION_ID_TYPE,
+        apps::swm::AVP_SUBSCRIPTION_ID_DATA,
+    ] {
+        assert_eq!(
+            set.find_avp(AvpKey::ietf(child))
+                .expect("shared Subscription-Id child definition")
+                .flags()
+                .mandatory(),
+            FlagRequirement::MustBeSet
+        );
+    }
+
+    let protected_child_flags = AvpFlags::new(false, true, true);
+    let mut grouped = BytesMut::new();
+    grouped.extend_from_slice(&encode_raw_avp_with_header(
+        AvpHeader::ietf(apps::swm::AVP_SUBSCRIPTION_ID_TYPE, true)
+            .with_flags(protected_child_flags),
+        &0_u32.to_be_bytes(),
+    ));
+    grouped.extend_from_slice(&encode_raw_avp_with_header(
+        AvpHeader::ietf(apps::swm::AVP_SUBSCRIPTION_ID_DATA, true)
+            .with_flags(protected_child_flags),
+        b"15550100001",
+    ));
+    for outer_mandatory in [false, true] {
+        let subscription = encode_raw_avp_with_header(
+            AvpHeader::ietf(apps::swm::AVP_SUBSCRIPTION_ID, outer_mandatory)
+                .with_flags(AvpFlags::new(false, outer_mandatory, true)),
+            &grouped,
+        );
+        let owned = build_raw_swm_dea_with_extras(&[subscription]);
+        let encoded = encode_message(&owned);
+        let message = decode_message(&encoded);
+        assert!(message
+            .validate_command_avps_with_dictionary(DecodeContext::conservative(), set)
+            .is_ok());
+        assert!(
+            apps::swm::parse_swm_diameter_eap_answer(&message, DecodeContext::conservative(),)
+                .is_ok()
+        );
+    }
 }
 
 #[test]
@@ -352,6 +426,41 @@ fn rf_dictionary_validation_recognizes_grouped_avps() {
             DictionarySet::new(&[apps::rf::dictionary()]),
         )
         .is_ok());
+    for code in [
+        apps::rf::AVP_SUBSCRIPTION_ID,
+        apps::rf::AVP_SUBSCRIPTION_ID_TYPE,
+        apps::rf::AVP_SUBSCRIPTION_ID_DATA,
+    ] {
+        assert_eq!(
+            apps::rf::dictionary()
+                .find_avp(AvpKey::ietf(code))
+                .expect("RFC 4006 Subscription-Id definition")
+                .flags()
+                .protected(),
+            FlagRequirement::MayBeSet
+        );
+    }
+    assert_eq!(
+        apps::rf::dictionary()
+            .find_avp(AvpKey::ietf(apps::rf::AVP_SUBSCRIPTION_ID))
+            .expect("RFC 4006 Subscription-Id definition")
+            .flags()
+            .mandatory(),
+        FlagRequirement::MustBeSet
+    );
+    for child in [
+        apps::rf::AVP_SUBSCRIPTION_ID_TYPE,
+        apps::rf::AVP_SUBSCRIPTION_ID_DATA,
+    ] {
+        assert_eq!(
+            apps::rf::dictionary()
+                .find_avp(AvpKey::ietf(child))
+                .expect("RFC 4006 Subscription-Id child definition")
+                .flags()
+                .mandatory(),
+            FlagRequirement::MustBeSet
+        );
+    }
 }
 
 #[test]
@@ -1658,7 +1767,7 @@ fn swm_mip6_feature_vector_rejects_malformed_and_uncorrelated_values() {
 
 #[test]
 #[cfg(feature = "app-swm")]
-fn swm_mip6_authorization_is_exact_success_and_request_conditioned() {
+fn swm_mip6_authorization_is_collective_success_and_request_conditioned() {
     let mut offered_request = sample_swm_request();
     offered_request.mip6_feature_vector = Some(SwmMip6FeatureVector::gtpv2_only());
 
@@ -1672,6 +1781,20 @@ fn swm_mip6_authorization_is_exact_success_and_request_conditioned() {
     success_with_vector.mip6_feature_vector = Some(SwmMip6FeatureVector::gtpv2_only());
     correlate_exchange(&offered_request, &success_with_vector, 1, 2)
         .expect("exact success returns authorization for an offered vector");
+
+    let mut pmip_only_request = sample_swm_request();
+    pmip_only_request.mip6_feature_vector = Some(SwmMip6FeatureVector::from_bits_retain(
+        SwmMip6FeatureVector::PMIP6_SUPPORTED,
+    ));
+    correlate_exchange(&pmip_only_request, &success_with_vector, 1, 2)
+        .expect("a PMIPv6 DER offer permits the collective GTPv2 NBM selection");
+
+    let mut pmip_only_answer = sample_swm_answer();
+    pmip_only_answer.mip6_feature_vector = Some(SwmMip6FeatureVector::from_bits_retain(
+        SwmMip6FeatureVector::PMIP6_SUPPORTED,
+    ));
+    correlate_exchange(&offered_request, &pmip_only_answer, 1, 2)
+        .expect("a GTPv2 DER offer permits the collective PMIPv6 NBM selection");
 
     let mut unoffered_request = sample_swm_request();
     unoffered_request.mip6_feature_vector = None;
@@ -3644,6 +3767,7 @@ fn swm_answer_result_category_is_classified() {
         origin_host: "aaa.home.example".into(),
         origin_realm: "home.example".into(),
         user_name: None,
+        subscriber_authorization: Default::default(),
         mip6_feature_vector: None,
         supported_features: vec![],
         oc_supported_features: None,
@@ -4030,6 +4154,7 @@ fn sample_swm_answer() -> SwmDiameterEapAnswer {
         origin_host: "aaa.home.example".into(),
         origin_realm: "home.example".into(),
         user_name: None,
+        subscriber_authorization: Default::default(),
         mip6_feature_vector: None,
         supported_features: vec![],
         oc_supported_features: None,
@@ -4731,6 +4856,134 @@ fn rf_grouped_subscription_id_rejects_duplicate_child() {
     let encoded = encode_message(&message);
     let decoded = decode_message(&encoded);
     assert!(apps::rf::parse_rf_accounting_request(&decoded, DecodeContext::default()).is_err());
+}
+
+#[test]
+#[cfg(feature = "app-rf")]
+fn rf_grouped_subscription_id_preserves_established_child_flag_tolerance() {
+    let mut sub_value = BytesMut::new();
+    sub_value.extend_from_slice(&encode_raw_avp_with_header(
+        AvpHeader::ietf(apps::rf::AVP_SUBSCRIPTION_ID_TYPE, false)
+            .with_flags(AvpFlags::new(false, false, true)),
+        &1_u32.to_be_bytes(),
+    ));
+    sub_value.extend_from_slice(&encode_raw_avp_with_header(
+        AvpHeader::ietf(apps::rf::AVP_SUBSCRIPTION_ID_DATA, false),
+        b"001010123456789",
+    ));
+    let extras = [encode_raw_avp(
+        apps::rf::AVP_SUBSCRIPTION_ID,
+        true,
+        &sub_value,
+    )];
+    let message = build_raw_rf_acr(Some(apps::rf::APPLICATION_ID.get()), &extras);
+    let encoded = encode_message(&message);
+    let decoded = decode_message(&encoded);
+
+    let parsed = apps::rf::parse_rf_accounting_request(&decoded, DecodeContext::default())
+        .expect("Rf child flag tolerance is an established parser behavior");
+    assert_eq!(parsed.subscription_ids.len(), 1);
+    assert_eq!(
+        parsed.subscription_ids[0].subscription_id_type,
+        apps::rf::SubscriptionIdType::EndUserImsi
+    );
+}
+
+#[test]
+#[cfg(feature = "app-rf")]
+fn rf_grouped_subscription_id_preserves_optional_vendor_child_tolerance() {
+    for vendor_child in [
+        encode_raw_vendor_avp(
+            apps::rf::AVP_SUBSCRIPTION_ID_TYPE,
+            VendorId::new(42_424),
+            false,
+            &0_u32.to_be_bytes(),
+        ),
+        encode_raw_vendor_avp(
+            apps::rf::AVP_SUBSCRIPTION_ID_TYPE,
+            VendorId::new(0),
+            false,
+            &0_u32.to_be_bytes(),
+        ),
+        encode_raw_vendor_avp(AvpCode::new(998_001), VendorId::new(0), false, b"optional"),
+    ] {
+        let mut sub_value = BytesMut::new();
+        sub_value.extend_from_slice(&encode_raw_avp(
+            apps::rf::AVP_SUBSCRIPTION_ID_TYPE,
+            true,
+            &1_u32.to_be_bytes(),
+        ));
+        sub_value.extend_from_slice(&encode_raw_avp(
+            apps::rf::AVP_SUBSCRIPTION_ID_DATA,
+            true,
+            b"001010123456789",
+        ));
+        sub_value.extend_from_slice(&vendor_child);
+        let extras = [encode_raw_avp(
+            apps::rf::AVP_SUBSCRIPTION_ID,
+            true,
+            &sub_value,
+        )];
+        let message = build_raw_rf_acr(Some(apps::rf::APPLICATION_ID.get()), &extras);
+        let encoded = encode_message(&message);
+        let decoded = decode_message(&encoded);
+        for unknown_ie_policy in [UnknownIePolicy::Preserve, UnknownIePolicy::Drop] {
+            let parsed = apps::rf::parse_rf_accounting_request(
+                &decoded,
+                DecodeContext {
+                    unknown_ie_policy,
+                    ..DecodeContext::default()
+                },
+            )
+            .expect("Rf preserves its established optional vendor-child tolerance");
+            assert_eq!(parsed.subscription_ids.len(), 1);
+        }
+    }
+}
+
+#[test]
+#[cfg(feature = "app-rf")]
+fn rf_grouped_subscription_id_rejects_noncanonical_outer_flags() {
+    let mut sub_value = BytesMut::new();
+    sub_value.extend_from_slice(&encode_raw_avp(
+        apps::rf::AVP_SUBSCRIPTION_ID_TYPE,
+        true,
+        &1_u32.to_be_bytes(),
+    ));
+    sub_value.extend_from_slice(&encode_raw_avp(
+        apps::rf::AVP_SUBSCRIPTION_ID_DATA,
+        true,
+        b"001010123456789",
+    ));
+    let outer = encode_raw_avp(apps::rf::AVP_SUBSCRIPTION_ID, false, &sub_value);
+    let message = build_raw_rf_acr(Some(apps::rf::APPLICATION_ID.get()), &[outer]);
+    let encoded = encode_message(&message);
+    let decoded = decode_message(&encoded);
+    assert!(apps::rf::parse_rf_accounting_request(&decoded, DecodeContext::default()).is_err());
+}
+
+#[test]
+#[cfg(feature = "app-rf")]
+fn rf_grouped_subscription_id_tolerates_optional_foreign_vendor_outer_code() {
+    for vendor_id in [VendorId::new(42_424), VendorId::new(0)] {
+        let outer =
+            encode_raw_vendor_avp(apps::rf::AVP_SUBSCRIPTION_ID, vendor_id, false, b"optional");
+        let message = build_raw_rf_acr(Some(apps::rf::APPLICATION_ID.get()), &[outer]);
+        let encoded = encode_message(&message);
+        let decoded = decode_message(&encoded);
+
+        for unknown_ie_policy in [UnknownIePolicy::Preserve, UnknownIePolicy::Drop] {
+            let parsed = apps::rf::parse_rf_accounting_request(
+                &decoded,
+                DecodeContext {
+                    unknown_ie_policy,
+                    ..DecodeContext::default()
+                },
+            )
+            .expect("optional foreign-vendor code collisions remain unknown Rf AVPs");
+            assert!(parsed.subscription_ids.is_empty());
+        }
+    }
 }
 
 #[test]

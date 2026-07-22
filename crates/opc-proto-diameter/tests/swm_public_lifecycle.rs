@@ -187,6 +187,7 @@ fn establish_session(
         origin_host: Redacted::from(AAA_HOST.to_owned()),
         origin_realm: Redacted::from(AAA_REALM.to_owned()),
         user_name: inbound.request().user_name.clone(),
+        subscriber_authorization: Default::default(),
         mip6_feature_vector: None,
         supported_features: Vec::new(),
         oc_supported_features: None,

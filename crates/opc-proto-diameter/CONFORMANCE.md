@@ -300,6 +300,57 @@ transport boundary.
 The SDK does not infer chained routing, roaming status, authentication, HSS
 provenance, or gateway selection policy.
 
+#### SWm DEA subscriber authorization facts
+
+The following finite rows implement TS 29.273 V19.2 section 7.2.2.1.2 using
+the defining TS 29.272 V19.5, TS 29.061 V19.1, and RFC 4006 wire contracts.
+Every field is absent by default and is held in the non-exhaustive
+`SwmDeaSubscriberAuthorization` bundle. Presence is a typed fact, not an
+authorization-success signal.
+
+| AVP | TS 29.273 presence/condition | Wire identity, flags, and typed field | Positive / negative evidence |
+|:----|:-----------------------------|:--------------------------------------|:-----------------------------|
+| `APN-OI-Replacement` | Conditional on exact `DIAMETER_SUCCESS`, non-emergency access, and proven network-based mobility | 3GPP 10415/1427, UTF8String, canonical V/M set and P clear, singleton; understood outer M mismatch accepted; `SwmApnOiReplacement` | Checked construction and raw parse require case-insensitive `[prefix.]mncNNN.mccNNN.gprs`, with exactly three PLMN digits. Empty/overlong/malformed suffixes, P/vendor, duplicate occurrence, direct-builder use, emergency/result/local-assignment/absent-provenance, and explicit AAA override cases are covered. |
+| `Subscription-Id` (MSISDN) | Conditional only on the MSISDN being available | IETF 443 Grouped, canonical V clear/M set/P permitted, singleton; understood outer M mismatch accepted. Required IETF 450 `END_USER_E164` and 444 UTF8String children remain V clear/M set/P permitted; `SwmSubscriptionId` / `SwmE164Number` | One-to-fifteen decimal digits beginning 1..9 round trip in redacted zeroize-on-drop storage. Wrong type, zero prefix/dummy, `+`/separator syntax, overlength, missing/duplicate child, strict child flags, unknown M-set child, and duplicate outer group fail. Optional unknown children are bounded and sealed under Preserve, discarded under Drop, and replayed after the canonical required children. |
+| `3GPP-Charging-Characteristics` | Optional subscriber charging fact | 3GPP 10415/13, UTF8String, canonical V set/M clear/P permitted, singleton; understood outer M mismatch accepted; `SwmChargingCharacteristics` | Exactly four upper/lowercase hexadecimal characters decode to two octets; builders emit uppercase and P clear. Non-hex, wrong length/vendor, and duplicates fail. Diagnostics do not expose the value. |
+| `UE-Usage-Type` | Conditional on subscription information being available | 3GPP 10415/1680, Unsigned32, V set/P clear and understood M mismatch accepted, singleton; `SwmUeUsageType` | Values 0..=255 round trip; 256, wrong width/vendor/P, and duplicates fail. Builders emit M clear and diagnostics hide the classification. |
+| `Core-Network-Restrictions` | Conditional on subscription information being available | 3GPP 10415/1704, Unsigned32, V set/P clear and understood M mismatch accepted, singleton; `SwmCoreNetworkRestrictions` | Assigned bit 1 is retained. Deprecated bit 0 and unassigned bits are discarded; builders emit the canonical assigned mask with M clear. Width/vendor/P/cardinality negatives fail. |
+| `MPS-Priority` | Conditional on an HSS MPS subscription; `MPS-EPS-Priority` must be set | 3GPP 10415/1616, Unsigned32, canonical V set/M/P clear, singleton; understood outer M mismatch accepted; `SwmMpsPriority` | Assigned CS, EPS, and messaging bits round trip; unknown bits are discarded. All-zero, CS-only, messaging-only, P, wrong width/vendor, and duplicates fail on parse and build. |
+
+The typed parser rejects a foreign or absent vendor identity reusing any of the
+six top-level subscriber codes under every unknown-AVP policy, including
+Vendor-Id zero. A vendor-specific child reusing core code 450 or 444 inside
+Subscription-Id fails before optional-extension retention even when the valid
+IETF child is also present. Genuinely unrelated optional extensions retain the
+established policy behavior. The command dictionary marks all six rows
+forbidden on DER and singleton on both baseline and projected-profile DEA.
+Independent raw fixtures assert exact code/vendor,
+width, flags, canonical bytes, result/request conditions, redaction, grouped
+extension retention, both understood outer M shapes, and absent-byte
+compatibility. Product code still owns MSISDN availability, charging and MPS
+policy, restriction enforcement, trusted local mobility configuration, and the
+final authorization decision.
+
+The request envelope can retain one explicit
+`SwmLocallyConfiguredMobilityMode` without changing DER bytes. Parsed and
+default envelopes carry no local provenance, fail closed for APN-OI, preserve
+the attached mode across failover retransmission, and include it in replay
+payload equality. A DEA vector takes precedence: any PMIPv6/GTPv2 bit maps to
+effective `NetworkBased`, `ASSIGN_LOCAL_IP` maps to
+`LocalIpAddressAssignment`, and a vector with neither selection maps to no
+effective mode without falling back. Only an absent DEA vector permits the
+retained local mode. `SwmCorrelatedDiameterEapExchange` exposes both
+`effective_mobility_mode()` and `mobility_mode_source()`. Network-based offers
+and selections retain TS 29.273's collective PMIPv6/GTPv2 semantics rather
+than requiring the same protocol bit on both sides.
+
+The shared Rf and SWm RFC 4006 definitions both mark P as permitted on the
+`Subscription-Id` group and its required children. Rf dictionary metadata and
+its typed parser retain RFC 4006's canonical outer M-set rule. The SWm
+application dictionary alone tolerates either received outer M shape;
+required grouped children remain strict on SWm and Rf's established child
+parser behavior is unchanged.
+
 #### SWm Diameter-EAP generic error and routing scope
 
 Diameter-EAP responses are selected by the header E bit. E-clear messages use
@@ -560,7 +611,7 @@ The modeled APN-Configuration child subset is `Context-Identifier`,
 Allocation-Retention-Priority), and `AMBR`. The remaining APN-Configuration
 children (for example `VPLMN-Dynamic-Address-Allowed`,
 `PDN-GW-Allocation-Type`, `MIP6-Agent-Info`, and
-`3GPP-Charging-Characteristics`) are deliberately not modeled yet and are
+the nested `3GPP-Charging-Characteristics`) are deliberately not modeled yet and are
 handled by the unknown-AVP policy.
 
 #### SWm Session-Termination scope
