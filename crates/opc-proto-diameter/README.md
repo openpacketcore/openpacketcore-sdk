@@ -186,8 +186,9 @@ charging decisions, watchdog policy, or a carrier-ready EPC/ePDG product claim.
   collective PMIP6/GTPv2 selection, and rejects unoffered non-NBM bits.
   The codec does not own a multi-round EAP procedure state machine: a consumer
   must carry the same access context into each continuation DER. For an attach
-  where all four conditional access-context facts have independently been
-  established, a GTPv2-only deployment can build the request without raw AVPs:
+  where the applicable conditional access-context facts have independently
+  been established, a GTPv2-only deployment can build the request without raw
+  AVPs or source-agnostic field assignment:
 
   ```rust
   use std::net::IpAddr;
@@ -196,24 +197,24 @@ charging decisions, watchdog policy, or a carrier-ready EPC/ePDG product claim.
       SwmAaaFailureIndication, SwmConditionalValue, SwmDerAccessContext,
       SwmBuiltDerAccessContextRequest, SwmDiameterEapRequest,
       SwmHighPriorityAccessInfo, SwmMip6FeatureVector, SwmQosCapability,
-      SwmQosProfileTemplate, SwmRequestedSupportedFeatures,
+      SwmQosProfileTemplate, SwmRatType, SwmRequestedSupportedFeatures,
       SwmVisitedNetworkIdentifier,
   };
   use opc_proto_diameter::VendorId;
   use opc_protocol::EncodeContext;
 
   fn build_access_context(
-      request: &mut SwmDiameterEapRequest,
+      request: &SwmDiameterEapRequest,
       ue_ip: IpAddr,
       hop_by_hop_identifier: u32,
       end_to_end_identifier: u32,
   ) -> Result<SwmBuiltDerAccessContextRequest, Box<dyn std::error::Error>> {
-      request.mip6_feature_vector = Some(SwmMip6FeatureVector::gtpv2_only());
-      request.supported_features =
-          vec![SwmRequestedSupportedFeatures::swm_discovery()];
-      request.ue_local_ip_address = Some(ue_ip);
-
       let access_context = SwmDerAccessContext {
+          rat_type: SwmConditionalValue::UeProvided(SwmRatType::Wlan),
+          service_selection: SwmConditionalValue::UeProvided("ims".into()),
+          mip6_feature_vector: SwmConditionalValue::LocallyConfigured(
+              SwmMip6FeatureVector::gtpv2_only(),
+          ),
           qos_capability: SwmConditionalValue::LocallyConfigured(
               SwmQosCapability::new(vec![
                   SwmQosProfileTemplate::new(VendorId::new(0), 0),
@@ -225,9 +226,14 @@ charging decisions, watchdog policy, or a carrier-ready EPC/ePDG product claim.
           aaa_failure_indication: SwmConditionalValue::AaaDerived(
               SwmAaaFailureIndication::previously_assigned_server_unavailable(),
           ),
+          supported_features: SwmConditionalValue::LocallyConfigured(vec![
+              SwmRequestedSupportedFeatures::swm_discovery(),
+          ]),
+          ue_local_ip_address: SwmConditionalValue::UeProvided(ue_ip),
           high_priority_access_info: SwmConditionalValue::UeProvided(
               SwmHighPriorityAccessInfo::configured(),
           ),
+          ..SwmDerAccessContext::default()
       };
       Ok(build_swm_diameter_eap_request_with_access_context(
           request,
@@ -239,12 +245,20 @@ charging decisions, watchdog policy, or a carrier-ready EPC/ePDG product claim.
   }
   ```
 
-  Use `SwmConditionalValue::Absent` for each condition that does not apply;
-  in particular, omit the visited-network identifier at home and omit the AAA
-  failure indication during an ordinary server selection. Provenance is a
-  local construction fact and is intentionally not inferred by the wire
-  parser. The checked builder owns the typed request, encoded message, and an
-  informational source snapshot in one immutable wrapper while it is retained.
+  The checked boundary covers all twelve conditional DER authorization-context
+  fields: RAT type, service selection, MIP6 feature vector, QoS capability,
+  visited-network identifier, AAA-failure indication, Supported-Features,
+  UE-local address, OC-Supported-Features, terminal information, emergency
+  services, and high-priority access. Use `SwmConditionalValue::Absent` for
+  each condition that does not apply; in particular, omit the visited-network
+  identifier at home, omit the AAA failure indication during an ordinary
+  server selection, and never combine Service-Selection with the emergency
+  indication. `SwmRatType::Other(0|1)` is noncanonical and rejected; use the
+  named WLAN/VIRTUAL variants so their distinct source requirements remain
+  enforceable. Provenance is a local construction fact and is intentionally not
+  inferred by the wire parser. The checked builder owns the typed request,
+  encoded message, and an informational source snapshot in one immutable
+  wrapper while it is retained.
   Consuming `into_parts` ends that coupling. The ordinary typed
   wire builder remains available for parser replay but cannot attest source.
   Debug output exposes only source/presence/count metadata. Builders

@@ -8,6 +8,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Complete checked SWm DER authorization context — `opc-proto-diameter`:**
+  `SwmDerAccessContext` and its immutable source snapshot now cover all twelve
+  conditional TS 29.273 DER rows: RAT type, Service-Selection,
+  MIP6-Feature-Vector, QoS-Capability, Visited-Network-Identifier,
+  AAA-Failure-Indication, Supported-Features, UE-Local-IP-Address,
+  OC-Supported-Features, Terminal-Information, Emergency-Services, and
+  High-Priority-Access-Info. The checked builder rejects every disallowed
+  local/UE/AAA source, every prepopulated raw context field, an explicitly
+  empty feature collection, inactive presence-significant indications, and a
+  normal APN combined with emergency access before encoding; failure remains
+  atomic and redaction-safe. WLAN/future observed RAT values and the locally
+  configured VIRTUAL fallback retain distinct allowed provenance.
+  Noncanonical `SwmRatType::Other(0|1)` aliases are rejected by both the
+  ordinary wire builder and checked boundary so they cannot bypass that source
+  distinction. All-absent construction remains byte-identical to the ordinary
+  builder. Existing
+  `SwmDerAccessContext` struct literals must add the new fields or use
+  `..SwmDerAccessContext::default()`; exhaustive matches on
+  `SwmDerAccessContextField` and `SwmDerAccessContextErrorCode` must handle the
+  new variants. The conformance ledger now maps every finite DER and DEA
+  authorization-context row to its typed boundary and independent positive and
+  negative evidence. Presence conditions and every downstream authorization
+  decision remain product-owned (#352).
 - **Request-bound IKEv2 unknown-critical rejection — `opc-proto-ikev2`:**
   generic payload walking and message/NAT-T decode now retain the exact
   one-octet type plus bounded payload-chain offset for a fully framed unknown

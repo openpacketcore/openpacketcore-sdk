@@ -611,31 +611,89 @@ RFC 8583 Load is supported independently. Overload state storage, timer
 application, traffic abatement, transport authentication, and routing policy
 remain consumer responsibilities.
 
-The remaining non-overload DER access-context slice is mapped below. Canonical
+The finite DER authorization-context closure is mapped below. Canonical
 builders use the TS 29.273 V19.2.0 flags; receivers enforce V/P and apply table
-7.2.3.1/1 note 2 by ignoring an understood outer M-bit mismatch.
+7.2.3.1/1 note 2 by ignoring an understood outer M-bit mismatch. The cited
+test modules contain independent raw-wire positive/negative fixtures; the
+checked source and prepopulation matrix is additionally exhaustive in
+`swm_diameter_eap_der_provenance.rs`.
 
 | AVP | TS 29.273 presence | Wire identity and cardinality | Typed SDK field | Positive / negative evidence |
 |:----|:-------------------|:------------------------------|:----------------|:-----------------------------|
-| `QoS-Capability` | Optional capability announcement | IETF 578, Grouped, M set, V/P clear, singleton; contains one or more ordered RFC 5777 `QoS-Profile-Template` 574 groups | `SwmQosCapability` / `SwmQosProfileTemplate` | Multiple profiles and repeated complete identities round trip; empty groups, missing/duplicate required children, wrong widths/flags, excessive counts, and unknown mandatory children fail |
-| `Visited-Network-Identifier` | Conditional: present when the ePDG is outside the UE home network | 3GPP 10415/600, OctetString, V+M set, P clear, singleton | `SwmVisitedNetworkIdentifier` | Two-digit MNC canonicalization and roaming fixture; malformed PLMN domains, vendor, flags, and duplicates fail |
-| `AAA-Failure-Indication` | Optional: only after a previously assigned AAA server is determined unavailable | 3GPP 10415/1518, Unsigned32, V set, M/P clear, singleton | `SwmAaaFailureIndication` | Defined bit zero round trips; a present zero mask and malformed width fail; reserved received bits are discarded and never re-originated as required by §8.2.3.21 |
-| `High-Priority-Access-Info` | Conditional: UE access-priority indication admitted by operator policy | 3GPP 10415/1542, Unsigned32, V set, M/P clear, singleton | reused `SwmHighPriorityAccessInfo` | Configured bit round trips; a present zero mask, malformed width, and invalid provenance fail; reserved received bits are discarded |
+| `RAT-Type` | Conditional on known access; `VIRTUAL` is the specified fallback | 3GPP 10415/1032, Enumerated, canonical V/M set and P clear, singleton | `SwmDiameterEapRequest::rat_type` / `SwmRatType` | `app_dictionaries.rs` and the provenance fixture: WLAN, VIRTUAL, and retained future values pass; width/vendor/flags, duplicate, every invalid source/value pairing, and noncanonical `Other(0|1)` aliases fail |
+| `Service-Selection` | Conditional on a UE-requested APN; forbidden for emergency DER | IETF 493, UTF8String, canonical M set and V/P clear, singleton | `SwmDiameterEapRequest::service_selection` | `app_dictionaries.rs` and the provenance fixture: a synthetic APN passes; empty/malformed APN, vendor/flags, duplicate, non-UE source, and emergency coexistence fail |
+| `MIP6-Feature-Vector` | Optional locally offered mobility capability | IETF 124, Unsigned64, canonical M set and V/P clear, singleton | `SwmDiameterEapRequest::mip6_feature_vector` / `SwmMip6FeatureVector` | `app_dictionaries.rs`: exact GTPv2 bit and stable multi-round replay pass; wrong width/flags/vendor, duplicate, answer-only request bit, and non-local source fail |
+| `QoS-Capability` | Optional capability announcement | IETF 578, Grouped, M set, V/P clear, singleton; contains one or more ordered RFC 5777 `QoS-Profile-Template` 574 groups | `SwmQosCapability` / `SwmQosProfileTemplate` | `app_dictionaries.rs`: multiple profiles and repeated complete identities pass; empty groups, missing/duplicate required children, wrong widths/flags, excessive counts, and unknown mandatory children fail |
+| `Visited-Network-Identifier` | Conditional: present when the ePDG is outside the UE home network | 3GPP 10415/600, OctetString, V/M set and P clear, singleton | `SwmVisitedNetworkIdentifier` | `app_dictionaries.rs`: two-digit MNC canonicalization and roaming pass; malformed PLMN domains, vendor/flags, duplicate, and non-local source fail |
+| `AAA-Failure-Indication` | Optional: only after a previously assigned AAA server is determined unavailable | 3GPP 10415/1518, Unsigned32, V set and M/P clear, singleton | `SwmAaaFailureIndication` | `app_dictionaries.rs`: defined bit zero passes; zero-valued presence, malformed width, vendor/flags, duplicate, and non-AAA source fail; reserved received bits canonicalize away |
+| `Supported-Features` | Optional ordered feature negotiation | 3GPP 10415/628, Grouped, repeated; V set/P clear, request M explicit; exact required 266/629/630 children | `SwmDiameterEapRequest::supported_features` / `SwmRequestedSupportedFeatures` | `app_dictionaries.rs`: discovery/required M policy, ordered distinct identities, and optional-child retention pass; empty checked collection, duplicate identity/children, wrong vendor/flags/width, and unknown mandatory children fail |
+| `UE-Local-IP-Address` | Optional observed protected-access source address | 3GPP 10415/2805, Address, canonical V set and M/P clear, singleton | `SwmDiameterEapRequest::ue_local_ip_address` | `app_dictionaries.rs` plus the provenance fixture: independent IPv4/IPv6 values pass; wrong family/length/vendor/flags, duplicate, and non-UE source fail |
+| `OC-Supported-Features` | Optional reacting-node capability | IETF 621, Grouped, singleton, V/P clear and request M explicit | `SwmDiameterEapRequest::oc_supported_features` / `SwmOcSupportedFeatures` | `swm_diameter_eap_overload.rs`: implicit/explicit loss and both outer M shapes pass; zero/missing-loss, duplicate, vendor/V/P, malformed child, extension re-origination, and non-local source fail |
+| `Terminal-Information` | Conditional when UE equipment identity is available | 3GPP 10415/1401, Grouped, canonical V/M set and P clear, singleton; mandatory IMEI child | `SwmDiameterEapRequest::terminal_information` / `SwmTerminalInformation` | `app_dictionaries.rs` plus the provenance fixture: IMEI and optional software version pass with redacted diagnostics; missing/duplicate IMEI, malformed identity/version, flags/vendor, prepopulation, and non-UE source fail |
+| `Emergency-Services` | Conditional on an emergency PDN request | 3GPP 10415/1538, Unsigned32, canonical V set and M/P clear, singleton | `SwmDiameterEapRequest::emergency_services` / `SwmEmergencyServices` | `app_dictionaries.rs` plus the provenance fixture: defined bit zero passes; zero-valued presence, wrong width/flags/vendor, duplicate, non-UE source, and coexistence with Service-Selection fail |
+| `High-Priority-Access-Info` | Conditional: UE access-priority indication admitted by operator policy | 3GPP 10415/1542, Unsigned32, V set and M/P clear, singleton | reused `SwmHighPriorityAccessInfo` | `app_dictionaries.rs`: configured bit passes; zero-valued presence, malformed width, vendor/flags, duplicate, and non-UE source fail; reserved received bits canonicalize away |
 
 `SwmDerAccessContext` is an application-side checked-construction input, not
 wire metadata. `SwmConditionalValue` distinguishes absent, locally configured,
 UE-provided, and AAA-derived values without logging values. The checked
-outbound builder accepts locally configured QoS/visited-PLMN data, an
-AAA-transport-derived server failure, and UE-provided high-priority access.
-Every other source and every prepopulated raw context field fails before
-encoding. It returns a wrapper that creates the typed request, encoded message,
-and an informational source snapshot together and exposes them immutably while
-the wrapper is retained. `into_parts` explicitly consumes that coupling; the
-snapshot then describes only the returned request/message at construction time.
+outbound builder covers all twelve rows. WLAN/future RAT values,
+Service-Selection, UE-local address, Terminal-Information,
+Emergency-Services, and high-priority access require UE-facing provenance;
+the VIRTUAL RAT fallback, mobility/feature/QoS/visited-network/overload
+capabilities require local provenance; AAA-Failure-Indication requires
+authenticated AAA-state provenance. The ordinary and checked builders reject
+`SwmRatType::Other(0|1)` because those values alias the canonical WLAN/VIRTUAL
+variants and would otherwise erase their distinct source contract. Every other
+source, a present empty Supported-Features collection, an inactive
+presence-significant indication, Service-Selection combined with
+Emergency-Services, and every prepopulated raw context field fail before
+encoding. It returns a wrapper that creates the
+typed request, encoded message, and an informational source snapshot together
+and exposes them immutably while the wrapper is retained. `into_parts`
+explicitly consumes that coupling; the snapshot then describes only the
+returned request/message at construction time.
 The ordinary builder remains a source-agnostic wire-validation and parser-replay
 boundary. Diameter does not encode provenance, so decode never guesses it.
 Product code still decides whether roaming, QoS announcement, server failover,
 and operator priority-admission conditions apply.
+
+#### Finite DEA authorization-context closure index
+
+This index closes the finite TS 29.273 section 7.2.2.1.2 checklist in one
+place. Detailed nested grammars and conditions remain in the dedicated tables
+above and below; this table records the top-level closure, canonical send
+shape, public typed boundary, and independent positive/negative fixture module.
+
+| AVP | TS 29.273 presence | Wire identity and cardinality | Typed SDK field | Positive / negative evidence |
+|:----|:-------------------|:------------------------------|:----------------|:-----------------------------|
+| `APN-OI-Replacement` | Conditional on successful non-emergency network-based authorization | 3GPP 10415/1427, UTF8String, canonical V/M set and P clear, singleton | `SwmDeaSubscriberAuthorization::apn_oi_replacement` | `swm_diameter_eap_subscriber_authorization.rs`: valid PLMN suffix and request-bound mobility provenance pass; syntax/length, vendor/flags, duplicate, result/emergency/mobility contradictions fail |
+| `APN-Configuration` and remaining children | Conditional authorized subscription profile | 3GPP 10415/1430, Grouped, canonical V/M set and P clear; baseline 0-1, ordered repetition only in the explicit projected profile | `SwmDiameterEapAnswer::apn_configurations`, `SwmAuthorizedApnConfiguration`, correlated authorization views | `swm_diameter_eap_apn_completion.rs`: complete core/supplement and Specific-APN-Info pass; missing/duplicate/misnested children, vendor/flags/type/length, prohibited SWm children, retention limits, mutation/transplant, and mobility/address contradictions fail |
+| `MIP6-Feature-Vector` | Conditional successful mobility selection | IETF 124, Unsigned64, canonical M set and V/P clear, singleton | `SwmDiameterEapAnswer::mip6_feature_vector` / correlated effective mobility | `app_dictionaries.rs`: offered PMIPv6/GTPv2 collective selection passes; unsolicited/non-success, local-address plus NBM contradiction, wrong width/flags/vendor, and duplicate fail |
+| `Mobile-Node-Identifier` | Conditional permanent identity | IETF 506, UTF8String, canonical M set and V/P clear, singleton | `SwmDiameterEapAnswer::mobile_node_identifier` | `app_dictionaries.rs`: synthetic UTF-8 identity round trip passes; malformed UTF-8, flags/vendor, duplicate, and request/correlated-identity mismatch fail with redacted diagnostics |
+| `Trace-Info` | Conditional subscriber/equipment trace activation | 3GPP 10415/1505, Grouped, canonical V set and M/P clear, singleton | `SwmDiameterEapAnswer::set_trace_info`; received data only through `SwmCorrelatedDiameterEapResponse::trace_info` | `swm_diameter_eap_trace.rs`: complete activation and authenticated correlation pass; missing/duplicate/misnested children, bitmap/URI/address bounds, vendor/flags, direct deactivation, replay/transplant, and DER placement fail |
+| `Subscription-Id` (MSISDN) | Conditional when MSISDN is available | IETF 443, Grouped, canonical M set and V clear, P permitted, singleton | `SwmDeaSubscriberAuthorization::subscription_id` / `SwmSubscriptionId` | `swm_diameter_eap_subscriber_authorization.rs`: E.164 and bounded optional children pass; wrong type/digits, missing/duplicate children, vendor/flags, unknown mandatory child, and duplicate outer group fail |
+| `Session-Timeout` | Conditional on successful authentication and authorization | IETF 27, Unsigned32, canonical M set and V/P clear, singleton | `SwmDiameterEapAnswer::session_timeout` / `SwmSessionTimeout` | `swm_diameter_eap_timers.rs`: absent, unlimited zero, finite, and maximum pass; non-success, width/vendor/flags, duplicate, and inconsistent lifetime fail |
+| `MIP6-Agent-Info` | Conditional Serving-GW identity for chained S2b-S8 | IETF 486, Grouped, canonical M set and V/P clear, singleton | `SwmDeaGatewayContext::chained_s2b_s8_serving_gateway` / `SwmMip6AgentInfo` | `swm_diameter_eap_mobility.rs`: address/host/prefix forms and authenticated correlation pass; empty/excessive/malformed children, vendor/flags, duplicate, non-success, replay and request mismatch fail |
+| `3GPP-Charging-Characteristics` | Optional subscriber charging fact | 3GPP 10415/13, UTF8String, canonical V set/M clear/P clear; received P permitted, singleton | `SwmDeaSubscriberAuthorization::charging_characteristics` / `SwmChargingCharacteristics` | `swm_diameter_eap_subscriber_authorization.rs`: exact four-hex-digit form passes; syntax/length, vendor/flags, and duplicate fail without exposing the value |
+| ordered `Redirect-Host` | Conditional generic E-bit redirect result | IETF 292, DiameterURI, canonical M set and V/P clear, ordered repeated | `SwmDiameterEapGenericErrorAnswer::new_redirect`; actionable only after response correlation | `swm_diameter_eap_routing.rs`: ordered targets and cache directives pass; ordinary DEA placement, absent target, malformed/excessive URI, flags/vendor, uncorrelated access, mutation, and replay fail |
+| `Supported-Features` | Optional ordered feature negotiation result | 3GPP 10415/628, Grouped, repeated, V set and M/P clear; exact required 266/629/630 children | `SwmDiameterEapAnswer::supported_features` / `SwmSupportedFeatureList` | `app_dictionaries.rs`: ordered distinct lists and bounded optional children pass; duplicate identities/children, vendor/flags/width, unsupported selection, and unknown mandatory children fail |
+| `OC-Supported-Features` | Conditional on the DER offer | IETF 621, Grouped, canonical M/V/P clear, singleton | `SwmDiameterEapAnswer::oc_supported_features` / `SwmOcSupportedFeatures` | `swm_diameter_eap_overload.rs`: absent/implicit/explicit loss pass; unsolicited/unoffered selection, zero/missing-loss, duplicate, flags/vendor, and malformed child fail |
+| `OC-OLR` | Optional overload report | IETF 623, Grouped, canonical M/V/P clear, singleton | `SwmDiameterEapAnswer::oc_olr` / `SwmOcOlr` | `swm_diameter_eap_overload.rs`: host/realm loss reports pass; missing support/reduction/required children, invalid values/type/width/flags, duplicate, and unknown mandatory child fail |
+| `Load` | Optional load report | IETF 650, Grouped, canonical M/V/P clear, ordered repeated and bounded | `SwmDiameterEapAnswer::load_reports` / `SwmLoad` | `swm_diameter_eap_overload.rs`: host/peer reports preserve order; excessive count, invalid type/value/source, duplicate child, flags/vendor, and unknown mandatory child fail |
+| `Access-Network-Info` | Optional WLAN access-location context | 3GPP 10415/1526, Grouped, canonical V set and M/P clear, singleton | originated setters; received value only through `SwmCorrelatedDiameterEapResponse::wlan_location` | `swm_diameter_eap_location.rs`: SSID plus BSSID/civic/logical forms and authenticated correlation pass; malformed/truncated/excessive children, vendor/flags, duplicate, raw-answer access, replay and transplant fail |
+| `User-Location-Info-Time` | Optional time conditional on access-network information | 3GPP 10415/2812, Time, canonical V set and M/P clear, singleton | correlated WLAN location time/omission accessors | `swm_diameter_eap_location.rs`: exact four-octet value and explicit omission pass; occurrence without location, width/vendor/flags, duplicate, raw access, and correlation mismatch fail |
+| `UE-Usage-Type` | Conditional when subscription information is available | 3GPP 10415/1680, Unsigned32, canonical V set and M/P clear, singleton | `SwmDeaSubscriberAuthorization::ue_usage_type` / `SwmUeUsageType` | `swm_diameter_eap_subscriber_authorization.rs`: assigned bounded values pass; out-of-range, width/vendor/flags, duplicate, and DER placement fail |
+| `Emergency-Info` | Conditional emergency PDN-GW identity | 3GPP 10415/1687, Grouped, canonical V set and M/P clear, singleton | `SwmDeaGatewayContext::emergency_info` / `SwmEmergencyInfo` | `swm_diameter_eap_mobility.rs`: nested gateway identity plus exact emergency/request correlation pass; missing/duplicate nested identity, vendor/flags, non-emergency/non-success/roaming, replay and mismatch fail |
+| `Core-Network-Restrictions` | Conditional when subscription information is available | 3GPP 10415/1704, Unsigned32, canonical V set and M/P clear, singleton | `SwmDeaSubscriberAuthorization::core_network_restrictions` / `SwmCoreNetworkRestrictions` | `swm_diameter_eap_subscriber_authorization.rs`: assigned bit passes and reserved bits canonicalize away; width/vendor/flags, duplicate, and DER placement fail |
+| `MPS-Priority` | Conditional on HSS MPS subscription with EPS priority | 3GPP 10415/1616, Unsigned32, canonical V set and M/P clear, singleton | `SwmDeaSubscriberAuthorization::mps_priority` / `SwmMpsPriority` | `swm_diameter_eap_subscriber_authorization.rs`: valid EPS-bearing masks pass; zero/CS-only/messaging-only, width/vendor/flags, duplicate, and DER placement fail |
+
+The opt-in top-level `default_context_identifier` remains only the documented
+TS 29.272 profile projection and is not counted as a baseline SWm DEA closure
+row. Every received authorization, mobility, redirect, location, trace, or
+supplemental APN fact that can drive behavior remains gated by its documented
+request and authenticated-connection correlation boundary. Target selection,
+subscriber policy, timer enforcement, tracing, charging, and location use stay
+product-owned.
 
 RFC 5777 grouped values are bounded. Required `Vendor-Id` and
 `QoS-Profile-Id` children are exact singleton Unsigned32 values with strict
