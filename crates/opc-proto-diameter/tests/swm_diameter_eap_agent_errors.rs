@@ -517,6 +517,48 @@ fn agent_delivery_profile_rejects_application_avps_but_retains_bounded_unknowns(
             Some(VENDOR_ID_3GPP),
             b"apn.synthetic.example",
         ),
+        raw_avp(
+            swm::AVP_EXTENDED_MAX_REQUESTED_BANDWIDTH_DL,
+            AvpFlags::VENDOR | AvpFlags::MANDATORY,
+            Some(VENDOR_ID_3GPP),
+            &1_u32.to_be_bytes(),
+        ),
+        raw_avp(
+            swm::AVP_EXTENDED_MAX_REQUESTED_BANDWIDTH_UL,
+            AvpFlags::VENDOR | AvpFlags::MANDATORY,
+            Some(VENDOR_ID_3GPP),
+            &1_u32.to_be_bytes(),
+        ),
+        raw_avp(
+            swm::AVP_SERVED_PARTY_IP_ADDRESS,
+            AvpFlags::VENDOR | AvpFlags::MANDATORY,
+            Some(VENDOR_ID_3GPP),
+            &[0, 1, 192, 0, 2, 10],
+        ),
+        raw_avp(
+            swm::AVP_VPLMN_DYNAMIC_ADDRESS_ALLOWED,
+            AvpFlags::VENDOR | AvpFlags::MANDATORY,
+            Some(VENDOR_ID_3GPP),
+            &1_u32.to_be_bytes(),
+        ),
+        raw_avp(
+            swm::AVP_PDN_GW_ALLOCATION_TYPE,
+            AvpFlags::VENDOR | AvpFlags::MANDATORY,
+            Some(VENDOR_ID_3GPP),
+            &0_u32.to_be_bytes(),
+        ),
+        raw_avp(
+            swm::AVP_SPECIFIC_APN_INFO,
+            AvpFlags::VENDOR | AvpFlags::MANDATORY,
+            Some(VENDOR_ID_3GPP),
+            &[],
+        ),
+        raw_avp(
+            swm::AVP_INTERWORKING_5GS_INDICATOR,
+            AvpFlags::VENDOR,
+            Some(VENDOR_ID_3GPP),
+            &0_u32.to_be_bytes(),
+        ),
     ];
     for application_avp in application_avps {
         let wire = agent_error_wire(
@@ -574,6 +616,39 @@ fn agent_delivery_profile_rejects_application_avps_but_retains_bounded_unknowns(
         panic!("E-bit response must use generic grammar");
     };
     assert_eq!(answer.additional_avp_count(), 1);
+
+    for code in [
+        swm::AVP_EXTENDED_MAX_REQUESTED_BANDWIDTH_DL,
+        swm::AVP_EXTENDED_MAX_REQUESTED_BANDWIDTH_UL,
+        swm::AVP_SERVED_PARTY_IP_ADDRESS,
+        swm::AVP_VPLMN_DYNAMIC_ADDRESS_ALLOWED,
+        swm::AVP_PDN_GW_ALLOCATION_TYPE,
+        swm::AVP_SPECIFIC_APN_INFO,
+        swm::AVP_INTERWORKING_5GS_INDICATOR,
+    ] {
+        let foreign_collision = raw_avp(
+            code,
+            AvpFlags::VENDOR,
+            Some(VendorId::new(42_424)),
+            b"foreign-vendor-opaque",
+        );
+        let wire = agent_error_wire(
+            base::RESULT_CODE_DIAMETER_UNABLE_TO_DELIVER,
+            HOP_BY_HOP,
+            Some(SESSION_ID),
+            &[],
+            &[foreign_collision],
+        );
+        let parsed = swm::parse_swm_diameter_eap_response(
+            &decode(&wire),
+            typed_context(UnknownIePolicy::Preserve),
+        )
+        .expect("new APN identities require exact vendor matching");
+        let SwmDiameterEapResponse::GenericError(answer) = parsed else {
+            panic!("E-bit response must use generic grammar");
+        };
+        assert_eq!(answer.additional_avp_count(), 1);
+    }
 
     let unknown_optional = raw_avp(AvpCode::new(900_464), 0, None, b"opaque-extension");
     let wire = agent_error_wire(

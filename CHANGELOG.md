@@ -37,6 +37,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   envelope correlates. Parsed generic answers remain non-reoriginatable
   (#464). Downstream exhaustive matches on `SwmDiameterEapCorrelationError`
   must add arms for `AgentAuthorityMissing` and `AgentIdentityMismatch`.
+- **Breaking: request-bound SWm DEA APN authorization completion —
+  `opc-proto-diameter`:** the `ApnConfiguration` wire core now uses validated
+  QCI, ARP, and exact-width `SwmBandwidth` values; literals that construct
+  those nested values must migrate from anonymous integers. Base and extended
+  AMBR cover the full TS 29.272 representable range, including values above
+  `u32::MAX`, while zero, the unrepresentable gap, inconsistent saturation,
+  reserved QCI values, and invalid ARP values fail closed. A sealed supplement
+  exposes bounded static IPv4/IPv6 values, VPLMN dynamic-address permission,
+  MIP6 gateway identity, visited-network and gateway-allocation provenance,
+  APN-level charging/APN-OI replacement, and the 5GS interworking indicator.
+  It is bound to the entire immutable core, not only Context-Identifier, so
+  mutation or reordering cannot transplant authorization facts. Raw DEA cores
+  remain wire facts; policy consumes them only through a correlated exchange.
+  Unknown PDN enum values round-trip on the raw surface but cannot produce an
+  authorized view.
+
+  APN network identifiers now implement TS 23.003 section 9.1.1 label syntax,
+  63-octet encoded bound, reserved-prefix and terminal-`gprs` restrictions.
+  Exact `*` is modeled as the DER default-APN request and as a valid
+  TS 29.272 wildcard profile. `Specific-APN-Info` is now a bounded typed grouped
+  value with exact required Service-Selection/MIP6-Agent-Info, optional
+  Visited-Network-Identifier, ordered repetition, and shared sealed-extension
+  retention. A named request may correlate to an exact nested APN without the
+  codec selecting a gateway; the wildcard parent still cannot become a broad
+  authorization grant. Understood APN and nested QoS/AMBR children accept
+  either received M-bit shape and re-encode their defining canonical flags.
+  Foreign-vendor numeric collisions follow `UnknownIePolicy`. The request-bound
+  3002/3004 agent-delivery classifier rejects every newly modeled exact 3GPP
+  application identity while retaining foreign-vendor collision behavior. Only the
+  nine TS 29.273 section 8.2.3.7 APN children that are prohibited on SWm are
+  rejected by exact identity. The atomic request-bound mutator still requires
+  exact base success, rejects emergency requests, enforces requested-APN and
+  mobility correlation, and shares one bounded retention budget with nested
+  gateway/top-level extensions. Parsed supplemental APN facts are no longer
+  exposed from the answer or transaction-only exchange; they require the strict
+  authenticated-connection and expected-Origin response correlation boundary.
+
+  `SwmAuthorizationAnswer::apn_configuration` now carries a complete
+  `SwmAuthorizedApnConfiguration`, preserving its supplement through AAA
+  parse/build; callers that previously accessed an `ApnConfiguration`
+  directly must use `.core()`. Parsed supplemental AAA facts are sealed until
+  `SwmCorrelatedAuthorizationExchange::apn_configuration_view` proves the
+  authenticated connection, expected Origin, and complete AAR/AAA request
+  correlation. Extension equality is ordinary lawful value equality.
+  Served-Party-IP-Address is referenced to TS 32.299 section 7.2.187 (#352).
 - **Typed request-bound SWm DEA gateway context — `opc-proto-diameter`:**
   SWm DEA now parses canonical RFC 5447 `MIP6-Agent-Info` for the chained
   S2b-S8 Serving-GW and 3GPP `Emergency-Info` for the HSS-derived emergency
