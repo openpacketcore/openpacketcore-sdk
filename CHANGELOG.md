@@ -8,6 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Typed request-bound SWm DEA gateway context — `opc-proto-diameter`:**
+  SWm DEA now parses canonical RFC 5447 `MIP6-Agent-Info` for the chained
+  S2b-S8 Serving-GW and 3GPP `Emergency-Info` for the HSS-derived emergency
+  PDN-GW. One shared typed codec preserves up to two home-agent addresses in
+  wire order, optional host indirection and home-link prefix, and bounded
+  unknown children without exposing values through diagnostics. Originated
+  context requires an exact retained DER, exact base `DIAMETER_SUCCESS`, and a
+  named caller assertion for the applicable routing or authenticated
+  non-roaming emergency condition. Consumers can distinguish parsed wire facts
+  from the result of full DER/DEA correlation plus an explicit caller
+  authorization call. Builders
+  emit canonical M-set `MIP6-Agent-Info`; receivers accept its understood M-bit
+  mismatch at both DEA top level and inside `Emergency-Info`, while V/P,
+  cardinality, length, vendor, and prefix-host-bit violations fail closed
+  (#352).
 - **Breaking: correlated SWm Diameter-EAP redirect and routing —
   `opc-proto-diameter`:** `SwmDiameterEapRequest` adds ordered redacted
   `route_records`; existing originated literals initialize `Vec::new()`.

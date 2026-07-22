@@ -11,6 +11,7 @@
 //! Route-Record, and generic E-bit redirects, a
 //! typed request-conditioned RFC 7683 baseline loss-overload offer/report,
 //! ordered RFC 8583 Diameter Load context, typed successful-session timer
+//! context, request-bound canonical RFC 5447 serving/emergency gateway
 //! context, and a bounded
 //! subscription-profile extension surface for APN-Configuration, its default
 //! Context-Identifier, Service-Selection, and the TS 29.273 emergency attach
@@ -60,9 +61,11 @@ use crate::{
 
 mod authorization;
 mod lifecycle;
+mod mobility;
 
 pub use authorization::*;
 pub use lifecycle::*;
+pub use mobility::*;
 
 /// 3GPP SWm application identifier.
 pub const APPLICATION_ID: ApplicationId = ApplicationId::new(16_777_264);
@@ -314,7 +317,7 @@ static SWM_REQUEST_AVP_RULES: [CommandAvpRule; 32] = [
     ),
 ];
 
-static SWM_ANSWER_AVP_RULES: [CommandAvpRule; 32] = [
+static SWM_ANSWER_AVP_RULES: [CommandAvpRule; 34] = [
     CommandAvpRule::new(AvpKey::ietf(AVP_STATE), AvpCardinality::ZeroOrMore),
     CommandAvpRule::new(
         AvpKey::ietf(base::AVP_RESULT_CODE),
@@ -338,6 +341,11 @@ static SWM_ANSWER_AVP_RULES: [CommandAvpRule; 32] = [
     ),
     CommandAvpRule::new(
         AvpKey::ietf(AVP_MIP6_FEATURE_VECTOR),
+        AvpCardinality::ZeroOrOne,
+    ),
+    CommandAvpRule::new(AvpKey::ietf(AVP_MIP6_AGENT_INFO), AvpCardinality::ZeroOrOne),
+    CommandAvpRule::new(
+        AvpKey::vendor(AVP_EMERGENCY_INFO, VENDOR_ID_3GPP),
         AvpCardinality::ZeroOrOne,
     ),
     CommandAvpRule::new(
@@ -424,7 +432,7 @@ static SWM_ANSWER_AVP_RULES: [CommandAvpRule; 32] = [
     ),
 ];
 
-static SWM_PROJECTED_PROFILE_ANSWER_AVP_RULES: [CommandAvpRule; 32] = [
+static SWM_PROJECTED_PROFILE_ANSWER_AVP_RULES: [CommandAvpRule; 34] = [
     CommandAvpRule::new(AvpKey::ietf(AVP_STATE), AvpCardinality::ZeroOrMore),
     CommandAvpRule::new(
         AvpKey::ietf(base::AVP_RESULT_CODE),
@@ -448,6 +456,11 @@ static SWM_PROJECTED_PROFILE_ANSWER_AVP_RULES: [CommandAvpRule; 32] = [
     ),
     CommandAvpRule::new(
         AvpKey::ietf(AVP_MIP6_FEATURE_VECTOR),
+        AvpCardinality::ZeroOrOne,
+    ),
+    CommandAvpRule::new(AvpKey::ietf(AVP_MIP6_AGENT_INFO), AvpCardinality::ZeroOrOne),
+    CommandAvpRule::new(
+        AvpKey::vendor(AVP_EMERGENCY_INFO, VENDOR_ID_3GPP),
         AvpCardinality::ZeroOrOne,
     ),
     CommandAvpRule::new(
@@ -594,6 +607,37 @@ static LOAD_AVP_RULES: [CommandAvpRule; 3] = [
     CommandAvpRule::new(AvpKey::ietf(AVP_SOURCE_ID), AvpCardinality::ZeroOrOne),
 ];
 
+static MIP6_AGENT_INFO_AVP_RULES: [CommandAvpRule; 3] = [
+    CommandAvpRule::new(
+        AvpKey::ietf(AVP_MIP_HOME_AGENT_ADDRESS),
+        AvpCardinality::ZeroOrMore,
+    ),
+    CommandAvpRule::new(
+        AvpKey::ietf(AVP_MIP_HOME_AGENT_HOST),
+        AvpCardinality::ZeroOrOne,
+    ),
+    CommandAvpRule::new(
+        AvpKey::ietf(AVP_MIP6_HOME_LINK_PREFIX),
+        AvpCardinality::ZeroOrOne,
+    ),
+];
+
+static MIP_HOME_AGENT_HOST_AVP_RULES: [CommandAvpRule; 2] = [
+    CommandAvpRule::new(
+        AvpKey::ietf(base::AVP_DESTINATION_REALM),
+        AvpCardinality::ZeroOrOne,
+    ),
+    CommandAvpRule::new(
+        AvpKey::ietf(base::AVP_DESTINATION_HOST),
+        AvpCardinality::ZeroOrOne,
+    ),
+];
+
+static EMERGENCY_INFO_AVP_RULES: [CommandAvpRule; 1] = [CommandAvpRule::new(
+    AvpKey::ietf(AVP_MIP6_AGENT_INFO),
+    AvpCardinality::ZeroOrOne,
+)];
+
 /// SWm Diameter-EAP-Request command definition.
 pub const COMMAND_DIAMETER_EAP_REQUEST: CommandDefinition = CommandDefinition::new(
     COMMAND_DIAMETER_EAP,
@@ -632,7 +676,7 @@ pub const COMMAND_DIAMETER_EAP_ANSWER_PROJECTED_PROFILE: CommandDefinition =
     )
     .with_avp_rules(&SWM_PROJECTED_PROFILE_ANSWER_AVP_RULES);
 
-const SWM_AVPS: [AvpDefinition; 49] = [
+const SWM_AVPS: [AvpDefinition; 54] = [
     AvpDefinition::new(
         AvpKey::ietf(AVP_EAP_PAYLOAD),
         "EAP-Payload",
@@ -668,6 +712,53 @@ const SWM_AVPS: [AvpDefinition; 49] = [
         AvpFlagRules::base_optional(),
         SpecRef::new("ietf", "RFC5447", "4.2.5"),
     ),
+    AvpDefinition::new(
+        AvpKey::ietf(AVP_MIP6_AGENT_INFO),
+        "MIP6-Agent-Info",
+        AvpDataType::Grouped,
+        // Canonical SWm emission follows the defining M setting. TS 29.273's
+        // SWm re-use table 7.2.3.1/2 and note 2 require receivers that
+        // understand the AVP to ignore an M mismatch.
+        // TS 29.272 reuses the understood AVP without a contrary nested flag
+        // rule, so the same receive behavior applies inside Emergency-Info.
+        AvpFlagRules::base_optional(),
+        SpecRef::new("ietf", "RFC5447", "4.2.1"),
+    )
+    .with_grouped_avp_rules(&MIP6_AGENT_INFO_AVP_RULES),
+    AvpDefinition::new(
+        AvpKey::ietf(AVP_MIP_HOME_AGENT_ADDRESS),
+        "MIP-Home-Agent-Address",
+        AvpDataType::Address,
+        AvpFlagRules::base_mandatory(),
+        SpecRef::new("ietf", "RFC5447", "4.2.2"),
+    ),
+    AvpDefinition::new(
+        AvpKey::ietf(AVP_MIP_HOME_AGENT_HOST),
+        "MIP-Home-Agent-Host",
+        AvpDataType::Grouped,
+        AvpFlagRules::base_mandatory(),
+        SpecRef::new("ietf", "RFC4004", "7.11"),
+    )
+    .with_grouped_avp_rules(&MIP_HOME_AGENT_HOST_AVP_RULES),
+    AvpDefinition::new(
+        AvpKey::ietf(AVP_MIP6_HOME_LINK_PREFIX),
+        "MIP6-Home-Link-Prefix",
+        AvpDataType::OctetString,
+        AvpFlagRules::base_mandatory(),
+        SpecRef::new("ietf", "RFC5447", "4.2.4"),
+    ),
+    AvpDefinition::new(
+        AvpKey::vendor(AVP_EMERGENCY_INFO, VENDOR_ID_3GPP),
+        "Emergency-Info",
+        AvpDataType::Grouped,
+        AvpFlagRules::new(
+            FlagRequirement::MustBeSet,
+            FlagRequirement::MayBeSet,
+            FlagRequirement::MustBeUnset,
+        ),
+        SpecRef::new("3gpp", "TS29272", "7.3.210"),
+    )
+    .with_grouped_avp_rules(&EMERGENCY_INFO_AVP_RULES),
     AvpDefinition::new(
         AvpKey::ietf(AVP_QOS_CAPABILITY),
         "QoS-Capability",
@@ -1812,6 +1903,24 @@ impl SwmCorrelatedDiameterEapExchange {
     pub const fn transaction(&self) -> SwmDiameterTransaction {
         self.request.transaction()
     }
+
+    /// Authorize the optional top-level Serving-GW identity after exact DER/DEA
+    /// correlation and a caller assertion that this is a chained S2b-S8 flow.
+    pub fn authorize_chained_s2b_s8_gateway(
+        &self,
+        authorization: SwmChainedS2bS8Authorization,
+    ) -> Result<Option<SwmAuthorizedGateway<'_>>, SwmGatewayContextError> {
+        mobility::authorize_chained_gateway(self.answer(), authorization)
+    }
+
+    /// Authorize the emergency PDN-GW after exact DER/DEA correlation and a
+    /// caller assertion of authenticated non-roaming HSS provenance.
+    pub fn authorize_authenticated_non_roaming_emergency_gateway(
+        &self,
+        authorization: SwmAuthenticatedNonRoamingEmergencyAuthorization,
+    ) -> Result<SwmAuthorizedGateway<'_>, SwmGatewayContextError> {
+        mobility::authorize_emergency_gateway(self.request(), self.answer(), authorization)
+    }
 }
 
 impl fmt::Debug for SwmCorrelatedDiameterEapExchange {
@@ -1997,6 +2106,34 @@ impl SwmCorrelatedDiameterEapResponse {
     #[must_use]
     pub const fn transaction(&self) -> SwmDiameterTransaction {
         self.request.transaction()
+    }
+
+    /// Authorize the optional top-level Serving-GW identity after authenticated
+    /// connection and exact application-response correlation.
+    pub fn authorize_chained_s2b_s8_gateway(
+        &self,
+        authorization: SwmChainedS2bS8Authorization,
+    ) -> Result<Option<SwmAuthorizedGateway<'_>>, SwmGatewayContextError> {
+        match self.response() {
+            SwmDiameterEapResponse::Application(answer) => {
+                mobility::authorize_chained_gateway(answer, authorization)
+            }
+            SwmDiameterEapResponse::GenericError(_) => Err(mobility::gateway_context_unavailable()),
+        }
+    }
+
+    /// Authorize the emergency PDN-GW after authenticated connection and exact
+    /// application-response correlation.
+    pub fn authorize_authenticated_non_roaming_emergency_gateway(
+        &self,
+        authorization: SwmAuthenticatedNonRoamingEmergencyAuthorization,
+    ) -> Result<SwmAuthorizedGateway<'_>, SwmGatewayContextError> {
+        match self.response() {
+            SwmDiameterEapResponse::Application(answer) => {
+                mobility::authorize_emergency_gateway(self.request(), answer, authorization)
+            }
+            SwmDiameterEapResponse::GenericError(_) => Err(mobility::gateway_context_unavailable()),
+        }
     }
 }
 
@@ -3312,6 +3449,7 @@ impl fmt::Debug for SwmDiameterEapRequestExtensions {
 #[derive(Default, Clone, PartialEq, Eq)]
 pub struct SwmDiameterEapAnswerExtensions {
     avps: Vec<SwmAdditionalAvp>,
+    gateway_context: SwmDeaGatewayContext,
 }
 
 impl SwmDiameterEapAnswerExtensions {
@@ -3344,6 +3482,7 @@ impl fmt::Debug for SwmDiameterEapAnswerExtensions {
         formatter
             .debug_struct("SwmDiameterEapAnswerExtensions")
             .field("avp_count", &self.avps.len())
+            .field("gateway_context", &self.gateway_context)
             .finish()
     }
 }
@@ -4026,6 +4165,17 @@ impl SwmDiameterEapRequest {
 }
 
 impl SwmDiameterEapAnswer {
+    /// Borrow typed serving/emergency gateway facts carried by the DEA.
+    ///
+    /// Parsed values are wire facts, not authorization. Received clients
+    /// should use the authenticated [`SwmCorrelatedDiameterEapResponse`]
+    /// authorization helpers. A trusted originated/server boundary can use
+    /// [`SwmCorrelatedDiameterEapExchange`].
+    #[must_use]
+    pub const fn gateway_context(&self) -> &SwmDeaGatewayContext {
+        &self.extensions.gateway_context
+    }
+
     fn validate_for_encode(&self) -> Result<(), EncodeError> {
         self.validate_with_load_purpose(true)
     }
@@ -4132,6 +4282,12 @@ impl SwmDiameterEapAnswer {
         if !self.result.is_diameter_success() && self.mip6_feature_vector.is_some() {
             return Err(encode_structural_error(
                 "non-success SWm DEA must not carry MIP6-Feature-Vector",
+                "7.1.2.1.2",
+            ));
+        }
+        if !self.result.is_diameter_success() && !self.gateway_context().is_empty() {
+            return Err(encode_structural_error(
+                "non-success SWm DEA must not carry serving or emergency gateway context",
                 "7.1.2.1.2",
             ));
         }
@@ -5426,6 +5582,12 @@ pub fn build_swm_diameter_eap_answer(
     end_to_end_identifier: u32,
     ctx: EncodeContext,
 ) -> Result<OwnedMessage, EncodeError> {
+    if !answer.gateway_context().is_empty() {
+        return Err(encode_structural_error(
+            "SWm DEA gateway context requires the request-bound answer builder",
+            "7.1.2.1.2",
+        ));
+    }
     build_swm_diameter_eap_answer_internal(
         answer,
         &[],
@@ -5523,6 +5685,7 @@ fn build_swm_diameter_eap_answer_internal(
             ctx,
         )?;
     }
+    mobility::append_gateway_context(&mut raw_avps, answer.gateway_context(), ctx)?;
     for supported_features in &answer.supported_features {
         append_supported_features_avp(&mut raw_avps, supported_features, false, ctx)?;
     }
@@ -5670,6 +5833,54 @@ pub fn build_swm_diameter_eap_answer_for(
     answer: &SwmDiameterEapAnswer,
     ctx: EncodeContext,
 ) -> Result<OwnedMessage, EncodeError> {
+    if !answer.gateway_context().is_empty() {
+        return Err(encode_structural_error(
+            "SWm DEA gateway context requires explicit request-bound provenance",
+            "7.1.2.1.2",
+        ));
+    }
+    validate_swm_diameter_eap_answer_for(request, answer)?;
+    build_swm_diameter_eap_answer_for_validated(request, answer, ctx)
+}
+
+/// Build a SWm DEA with standards-conditioned serving/emergency gateway
+/// context bound to one exact retained DER.
+///
+/// The typed context constructor records whether the caller is asserting a
+/// chained S2b-S8 serving gateway or HSS-derived authenticated non-roaming
+/// emergency gateway. This builder verifies the exact DER binding and exact
+/// base `DIAMETER_SUCCESS` before emitting either AVP.
+pub fn build_swm_diameter_eap_answer_for_with_gateway_context(
+    request: &SwmDiameterEapRequestEnvelope,
+    answer: &SwmDiameterEapAnswer,
+    gateway_context: &SwmRequestBoundDeaGatewayContext,
+    ctx: EncodeContext,
+) -> Result<OwnedMessage, EncodeError> {
+    if !answer.gateway_context().is_empty() && answer.gateway_context() != gateway_context.context()
+    {
+        return Err(encode_structural_error(
+            "SWm DEA parsed and request-bound gateway contexts differ",
+            "7.1.2.1.2",
+        ));
+    }
+    gateway_context
+        .validate_for(request, answer.result)
+        .map_err(|_| {
+            encode_structural_error(
+                "SWm DEA request-bound gateway context is invalid",
+                "7.1.2.1.2",
+            )
+        })?;
+    validate_swm_diameter_eap_answer_for(request, answer)?;
+    let mut answer = answer.clone();
+    answer.extensions.gateway_context = gateway_context.context().clone();
+    build_swm_diameter_eap_answer_for_validated(request, &answer, ctx)
+}
+
+fn validate_swm_diameter_eap_answer_for(
+    request: &SwmDiameterEapRequestEnvelope,
+    answer: &SwmDiameterEapAnswer,
+) -> Result<(), EncodeError> {
     let request_facts = request.request();
     if request_facts.session_id.as_ref() != answer.session_id.as_ref()
         || request_facts.auth_application_id != answer.auth_application_id
@@ -5691,6 +5902,14 @@ pub fn build_swm_diameter_eap_answer_for(
             "DEA",
         ));
     }
+    Ok(())
+}
+
+fn build_swm_diameter_eap_answer_for_validated(
+    request: &SwmDiameterEapRequestEnvelope,
+    answer: &SwmDiameterEapAnswer,
+    ctx: EncodeContext,
+) -> Result<OwnedMessage, EncodeError> {
     let transaction = request.transaction();
     build_swm_diameter_eap_answer_internal(
         answer,
@@ -5908,6 +6127,8 @@ fn parse_swm_diameter_eap_application_answer_parts(
     let mut origin_realm = None;
     let mut user_name = None;
     let mut mip6_feature_vector = None;
+    let mut mip6_agent_info = None;
+    let mut emergency_info = None;
     let mut supported_features = Vec::new();
     let mut oc_supported_features = None;
     let mut oc_olr = None;
@@ -5949,7 +6170,30 @@ fn parse_swm_diameter_eap_application_answer_parts(
                     )
                     .with_spec_ref(SpecRef::new("ietf", "RFC6733", "4.1.1")));
                 }
-                if code == AVP_CONTEXT_IDENTIFIER && vendor_id == VENDOR_ID_3GPP {
+                if code == AVP_EMERGENCY_INFO && vendor_id == VENDOR_ID_3GPP {
+                    let value = mobility::parse_emergency_info(
+                        &avp,
+                        ctx,
+                        offset,
+                        value_offset,
+                        1,
+                        &mut retention,
+                    )?;
+                    builder_helpers::set_once(&mut emergency_info, value, offset, "7.3.210")?;
+                } else if matches!(
+                    code,
+                    AVP_MIP6_AGENT_INFO
+                        | AVP_MIP_HOME_AGENT_ADDRESS
+                        | AVP_MIP_HOME_AGENT_HOST
+                        | AVP_MIP6_HOME_LINK_PREFIX
+                ) || code == AVP_EMERGENCY_INFO
+                {
+                    return Err(decode_structural_error_at(
+                        "SWm DEA mobility AVP uses the wrong vendor identity",
+                        offset,
+                        "7.1.2.1.2",
+                    ));
+                } else if code == AVP_CONTEXT_IDENTIFIER && vendor_id == VENDOR_ID_3GPP {
                     let value =
                         builder_helpers::parse_u32_value(avp.value, value_offset, "7.3.27")?;
                     builder_helpers::set_once(
@@ -6034,6 +6278,28 @@ fn parse_swm_diameter_eap_application_answer_parts(
                     offset,
                     "4.2.5",
                 )?;
+            } else if code == AVP_MIP6_AGENT_INFO {
+                let value = mobility::parse_mip6_agent_info(
+                    &avp,
+                    ctx,
+                    offset,
+                    value_offset,
+                    1,
+                    &mut retention,
+                )?;
+                builder_helpers::set_once(&mut mip6_agent_info, value, offset, "4.2.1")?;
+            } else if matches!(
+                code,
+                AVP_MIP_HOME_AGENT_ADDRESS
+                    | AVP_MIP_HOME_AGENT_HOST
+                    | AVP_MIP6_HOME_LINK_PREFIX
+                    | AVP_EMERGENCY_INFO
+            ) {
+                return Err(decode_structural_error_at(
+                    "grouped mobility child or vendor AVP appears at DEA top level",
+                    offset,
+                    "7.1.2.1.2",
+                ));
             } else if code == AVP_OC_SUPPORTED_FEATURES {
                 let value = lifecycle::parse_diameter_eap_answer_oc_supported_features(
                     &avp,
@@ -6277,7 +6543,13 @@ fn parse_swm_diameter_eap_application_answer_parts(
         error_message,
         state_avps,
         eap_master_session_key,
-        extensions: SwmDiameterEapAnswerExtensions { avps: extensions },
+        extensions: SwmDiameterEapAnswerExtensions {
+            avps: extensions,
+            gateway_context: SwmDeaGatewayContext {
+                chained_s2b_s8_serving_gateway: mip6_agent_info,
+                emergency_info,
+            },
+        },
     };
     lifecycle::validate_diameter_eap_answer_overload_control(
         answer.oc_supported_features.as_ref(),
@@ -8032,6 +8304,12 @@ fn validate_decoded_answer(answer: &SwmDiameterEapAnswer) -> Result<(), DecodeEr
     if !answer.result.is_diameter_success() && answer.mip6_feature_vector.is_some() {
         return Err(decode_structural_error(
             "non-success SWm DEA must not carry MIP6-Feature-Vector",
+            "7.1.2.1.2",
+        ));
+    }
+    if !answer.result.is_diameter_success() && !answer.gateway_context().is_empty() {
+        return Err(decode_structural_error(
+            "non-success SWm DEA must not carry serving or emergency gateway context",
             "7.1.2.1.2",
         ));
     }
