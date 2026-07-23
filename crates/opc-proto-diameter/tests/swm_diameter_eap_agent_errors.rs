@@ -1056,7 +1056,7 @@ fn raw_3004_without_destination_host_is_receive_capable_but_not_actionable() {
         request
             .correlate_response(response)
             .expect_err("nonconforming 3004 cannot become actionable"),
-        SwmDiameterEapCorrelationError::ApplicationMismatch,
+        SwmDiameterEapCorrelationError::AgentApplicationBindingInvalid,
     );
 }
 

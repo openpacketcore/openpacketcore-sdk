@@ -1120,10 +1120,17 @@ the retained DER. A live transport supplies a process-unique
 generation, both Diameter identifiers, P, the exact ordered `Proxy-Info`
 chain, and `Session-Id` when the generic answer carries it. An ordinary answer
 also checks the configured terminal logical-Origin policy and application
-fields. A generic error may be originated by an intermediary, so it skips that
-terminal policy. Exact 3002/3004 delivery failures instead require the DER's
-Session-Id and the authenticated agent's exact Origin pair. Never make a
-routing decision from the answer-local parser:
+fields. Application failures are typed as separate, value-free
+`SwmDiameterEapCorrelationError` outcomes for Auth-Application-Id,
+Auth-Request-Type, missing or incompatible mobility authorization, subscriber
+authorization, overload control, APN authorization, and final answer
+validation. This lets a caller retain fail-closed behavior without parsing
+diagnostic text or reproducing private correlation logic. A generic error may
+be originated by an intermediary, so it skips that terminal policy. Exact
+3002/3004 delivery failures instead require the DER's Session-Id and the
+authenticated agent's exact Origin pair. An invalid delivery-agent
+result/request combination has its own typed outcome. Never make a routing
+decision from the answer-local parser:
 
 ```rust
 use opc_proto_diameter::apps::swm::{
