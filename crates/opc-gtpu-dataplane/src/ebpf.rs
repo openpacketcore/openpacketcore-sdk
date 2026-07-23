@@ -617,7 +617,8 @@ pub(crate) trait EbpfGtpuRuntime: Send + Sync + fmt::Debug {
 
     /// Prove the exact grouped schema, config, held pins, live hooks, program
     /// references, and namespace lease for this attachment. Implementations
-    /// perform two identical inventories bracketing hook/config inspection.
+    /// repeat exact named-map identity around schema/config/live-hook
+    /// inspection.
     fn grouped_datapath_usable(
         &self,
         ifindex: u32,

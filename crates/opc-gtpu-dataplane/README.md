@@ -264,8 +264,10 @@ peer contract. Missing state is never interpreted as `Any`.
 install. The eBPF adapter derives the rest of the public
 `GtpuDownlinkEndpoint` from the request's peer, the managed device's concrete
 local address, and the attachment ifindex. The semantic API accepts canonical
-IPv4 or IPv6 endpoint pairs so adapters can share one contract; the current tc
-object remains IPv4-only and rejects IPv6 before publishing any state.
+IPv4 or IPv6 endpoint pairs so adapters can share one contract. The legacy
+single-context eBPF API remains IPv4-only. The grouped-session API and current
+tc object support independent inner and outer IPv4/IPv6 families, including
+cross-family transport and simultaneous IPv4v6 entries.
 
 After the complete outer IPv4/UDP/GTP-U envelope has passed its existing
 structural and checksum checks, the tc ingress program selects exactly one
@@ -495,11 +497,14 @@ boundary for exact policy values.
 
 `CreateGtpDeviceRequest::uplink_mtu_policy` carries an explicit, device-level
 `GtpuUplinkMtuPolicy`: the effective S2b-U link MTU (bounded so the fixed
-36-byte encapsulation plus the RFC 791 minimum 68-byte inner packet always
-fits) and the outer-fragmentation choice. `inner_mtu()` is the headroom
-accounting: effective link MTU minus the encapsulation overhead. `None`
-requests no change: a fresh device gets the legacy total-length-only
-behavior and a device with a persisted policy keeps it.
+36-byte IPv4/UDP/GTP-U encapsulation plus the RFC 791 minimum 68-byte inner
+packet always fits) and the outer-fragmentation choice. The legacy
+`inner_mtu()` accessor is the IPv4 headroom calculation. The grouped tc path
+selects the overhead from the authoritative outer family: 36 bytes for outer
+IPv4 and 56 bytes for outer IPv6, and rejects a packet when the corresponding
+total exceeds the effective link MTU. `None` requests no change: a fresh
+device gets the legacy total-length-only behavior and a device with a
+persisted policy keeps it.
 
 `decide_uplink_encap` in `opc-gtpu-ebpf-common` is the shared typed decision
 used by host callers and, through `apply_uplink_mtu_policy`, by the tc uplink
@@ -544,17 +549,27 @@ routing layer.
 
 ### Downlink outer-fragment handling
 
-`GtpuProbe::downlink_outer_fragment_handling` states each backend's contract
-explicitly; there is no implicit behavior. The eBPF backend is
-*handoff-capable* (`KernelReassemblyHandoff`): the tc ingress program passes
-outer IPv4 fragments to the kernel stack unchanged, the kernel reassembles
-under its bounded `net.ipv4.ipfrag_*` accounting (reported from the live
-sysctls, absent when unreadable — never fabricated defaults), and exactly
-one complete UDP/2152 datagram is delivered to a socket bound on the
-concrete local S2b-U address. The contract is complete only while the
-operator runs an SDK consumer on that socket: without one, the kernel
-answers each fragment set with ICMP port unreachable toward the PGW and the
-packet is lost.
+`GtpuProbe::downlink_outer_fragment_handling` states each backend's outer-IPv4
+contract explicitly; there is no implicit behavior. A legacy v5 eBPF
+attachment is *handoff-capable* (`KernelReassemblyHandoff`): the tc ingress
+program passes outer IPv4 fragments to the kernel stack unchanged, the kernel
+reassembles under its bounded `net.ipv4.ipfrag_*` accounting (reported from
+the live sysctls, absent when unreadable — never fabricated defaults), and
+exactly one complete UDP/2152 datagram is delivered to a socket bound on the
+concrete local S2b-U address. The contract is complete only while the operator
+runs an SDK consumer on that socket: without one, the kernel answers each
+fragment set with ICMP port unreachable toward the PGW and the packet is lost.
+
+Grouped fragmentation is reported separately per attachment through
+`GtpuIpFamilyCapabilities::downlink_outer_ipv4_fragment_handling` and
+`downlink_outer_ipv6_fragment_handling`; both are currently `Unsupported`.
+Although grouped outer-IPv4 fragments reach the kernel, the existing consumer
+authorizes only the legacy v5 graph and cannot safely deliver a grouped TEID.
+The bounded IPv6 extension walker accepts an atomic Fragment header, but
+packets requiring IPv6 reassembly likewise pass to the host without a matching
+grouped consumer authority. Complete fragmented grouped GTP-U therefore
+requires a separately qualified consumer and cannot be inferred from
+unfragmented `outer_ipv4` or `outer_ipv6` support.
 
 The Linux `gtp` backend reports this contract as `Unsupported`: discovering
 the generic-netlink family proves that the driver is present, but does not
@@ -1002,27 +1017,29 @@ retained only for the exact automatic empty-graph migration proof described
 above, and the frozen v2 object is retained only for the explicit drained
 teardown identity proof. Neither legacy object runs as the current datapath.
 
-### Grouped dual-stack contract foundation
+### Grouped dual-stack eBPF contract
 
-The public grouped-session API is an additive contract foundation. Existing
-`GtpuProbe` fields and legacy v5 map-key bytes are unchanged, and the current
-Linux and eBPF backends do not yet claim this capability. Implementations opt
-in through the async, fallible `gtpu_ip_family_capabilities` query. It accepts
-a `GtpuSessionAttachmentSelector` containing the stable device identity, exact
-live name/ifindex, and endpoint set, so evidence is never reported globally for
-a backend that manages several attachments. The inherited per-attachment
-result is Missing/Unsupported until a backend independently qualifies the
-complete graph. In particular, ordinary Linux generic-netlink GTP cannot
-report atomic grouped reconciliation because its per-context commands have no
-external activation gate.
+The public grouped-session API is additive. Existing `GtpuProbe` fields and
+legacy v5 map-key bytes are unchanged. The current eBPF backend opts in only
+after the live attachment proves its exact schema, configuration, named map
+identities, tc programs, and held namespace lease. The async, fallible
+`gtpu_ip_family_capabilities` query accepts a
+`GtpuSessionAttachmentSelector` containing the stable device identity, exact
+live name/ifindex, and endpoint set, so evidence is never reported globally
+for a backend that manages several attachments. Missing, mismatched, or
+changing attachment evidence withdraws the capability. Ordinary Linux
+generic-netlink GTP remains `Unsupported` for atomic grouped reconciliation
+because its per-context commands have no external activation gate.
 
 `CreateGtpDeviceEndpointSetRequest` binds a cryptographically stable device
 identity to an exact local set containing at most one IPv4 and one IPv6
 endpoint. That identity selects the pin namespace independently of a mutable
 ifindex. Every reconcile, readback, and adoption must revalidate both the live
-interface identity and exact endpoint membership. Hook repair or adoption
-requires two identical complete graph inventories bracketing the operation;
-partial, foreign, or changing evidence fails closed.
+interface identity and exact endpoint membership. Capability evidence repeats
+the exact named-map identity around schema, configuration, and live-hook
+inspection. Create and adoption preflight the exact pin namespace and both tc
+slots before publication. Partial, foreign, or changing identity evidence
+fails closed.
 
 A `GtpuSessionGroup` has a caller-owned cryptographically unique ID and one or
 two canonical inner-family entries. Inner IPv4 is a `/32`; an IPv6 PAA is
@@ -1056,6 +1073,8 @@ provenance. `Fresh` attests through the caller's durable registry that an
 introduced selector has never been published in the pin namespace. Reuse
 carries the complete exact retired source group plus an attestation that
 traffic was drained or an RCU grace period completed after exact removal.
+One retired proof must cover every selector introduced relative to the active
+base generation; combining selectors from several retired groups fails closed.
 Direct transfer from a live source group remains forbidden, and cross-device
 or same-group reuse evidence is rejected before mutation.
 
@@ -1085,10 +1104,12 @@ offload support.
   ePDG uplink datapath.
 - The eBPF backend requires bpffs, kernel BTF, tc/eBPF privileges
   (`CAP_NET_ADMIN` and `CAP_BPF` or `CAP_SYS_ADMIN`), and enough MTU headroom
-  for 36 bytes of outer IPv4/UDP/GTP-U headers. The current object also uses
-  the bounded `bpf_loop` helper (available in mainline Linux 5.17 and newer)
-  to checksum the complete declared UDP range without verifier unrolling; the
-  repository's documented production node profile remains Linux 6.8 or newer.
+  for 36 bytes of outer IPv4/UDP/GTP-U headers or 56 bytes of outer
+  IPv6/UDP/GTP-U headers. The current object also uses the bounded `bpf_loop`
+  helper (available in mainline Linux 5.17 and newer) to checksum the complete
+  declared UDP range and walk IPv6 extension headers without verifier
+  unrolling; the repository's documented production node profile remains
+  Linux 6.8 or newer.
   CI loads both committed classifiers on exact Linux 6.8.0-134 as a verifier
   compatibility gate in addition to running the full privileged datapath suite.
 - The ignored privileged eBPF proof additionally requires the `gtp` and
@@ -1102,8 +1123,10 @@ offload support.
 
 ## Roadmap
 
-- Expand eBPF datapath support beyond IPv4 only when the map schema and tests
-  cover it.
+- Qualify a bounded grouped outer-IPv4/IPv6 fragment-reassembly consumer before
+  advertising either independent per-family capability.
+- Qualify additional checksum/GSO offload states before broadening the
+  `MaterializedOnly` outer-IPv6 contract.
 - Keep privileged integration tests as the source of truth for Linux kernel and
   tc behavior.
 - Add product-level route/XFRM/namespace orchestration in consumer crates rather

@@ -213,9 +213,10 @@ pub trait GtpuDataplaneBackend: Send + Sync + std::fmt::Debug {
     /// one exact attachment.
     ///
     /// The default is explicitly Missing/Unsupported. A backend may report
-    /// Available only after two identical full-graph inventories bracket hook
-    /// repair/adoption and prove exact schema/map/program identities, canonical
-    /// endpoint configuration, and exclusive lease ownership. Ordinary
+    /// Available only after exact named-map identity is repeated around schema,
+    /// configuration, and live-hook inspection, with canonical endpoint
+    /// configuration and exclusive lease ownership proven. Create and adoption
+    /// separately preflight the pin namespace and both tc slots. Ordinary
     /// `probe()` must not mutate live state to manufacture this evidence.
     ///
     /// This query is async and attachment-scoped because qualification may

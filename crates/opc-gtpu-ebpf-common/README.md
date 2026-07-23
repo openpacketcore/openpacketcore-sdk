@@ -21,7 +21,9 @@ GTP-U encapsulation/classification helpers.
   ingress/source-port counter cardinality; map names and indexes are shared by
   userspace and the tc object.
 - `build_uplink_encap` builds the exact 36-byte outer IPv4/UDP/GTPv1-U header
-  sequence for uplink encapsulation.
+  sequence for legacy uplink encapsulation. The grouped ABI also defines the
+  56-byte outer-IPv6 overhead and family-neutral session entry used by the tc
+  program's mandatory IPv6 UDP-checksum path.
 - `classify_gtpu` classifies a mandatory GTP-U header as `NotGtpV1`,
   `NotGpdu`, or `Gpdu { teid, length, has_opt, has_ext }`.
 - `ipv4_header_checksum` computes an option-free IPv4 header checksum.
@@ -92,10 +94,15 @@ assert_eq!(encap.len(), GTPU_ENCAP_LEN);
 - `#![no_std]`, `#![forbid(unsafe_code)]`, and dependency-free.
 - Contains no map access, loader code, tc hooks, kernel syscalls, or product
   policy.
-- The grouped-session constants are an additive ABI foundation. They do not
-  change legacy key bytes or claim that a loader or tc program currently
-  publishes the new maps. The independent `GTPU_SCHEMA6` marker prevents a v5
-  graph from being mistaken for this schema.
+- The grouped-session ABI is used by the current loader and tc programs without
+  changing legacy key bytes. The independent `GTPU_SCHEMA6` marker prevents a
+  v5 graph from being mistaken for the grouped schema. Each attachment owns
+  exact configuration, authority, transaction-journal, uplink-index, and
+  downlink-index maps; tc retains one selected index and validates it against
+  the matching whole-value authority before that packet is authorized.
+- Authority, transaction, and selector maps each have 65,536 entries. A
+  dual-stack group consumes two entries in each selector index, so an
+  all-dual-stack attachment has a 32,768-group selector budget.
 - Group authority is designed for whole-value `BPF_MAP_UPDATE_ELEM` replacement
   in an ordinary non-per-CPU HASH map. A tc consumer retains an index value,
   performs one authority lookup, validates generation and slot, and does not
