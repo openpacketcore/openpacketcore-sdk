@@ -2284,6 +2284,7 @@ impl EbpfGtpuDataplaneBackend {
                 local_endpoint_sets: unavailable,
                 ipv6_udp_checksum: unavailable,
                 uplink_checksum_offload: GtpuUplinkChecksumOffloadContract::Unsupported,
+                downlink_outer_ipv4_fragment_handling: GtpuDownlinkFragmentContract::Unsupported,
                 downlink_outer_ipv6_fragment_handling: GtpuDownlinkFragmentContract::Unsupported,
             });
         }
@@ -2319,6 +2320,11 @@ impl EbpfGtpuDataplaneBackend {
             } else {
                 GtpuUplinkChecksumOffloadContract::Unsupported
             },
+            // The existing userspace reassembly consumer authorizes only the
+            // frozen single-context IPv4 graph. Grouped maps deliberately
+            // contain no legacy PDR/commit authority, so a reassembled
+            // grouped TEID cannot safely re-enter that consumer.
+            downlink_outer_ipv4_fragment_handling: GtpuDownlinkFragmentContract::Unsupported,
             downlink_outer_ipv6_fragment_handling: GtpuDownlinkFragmentContract::Unsupported,
         })
     }
@@ -4338,7 +4344,7 @@ impl EbpfGtpuDataplaneBackend {
         let env = self.inner.runtime.probe_environment();
         let (
             has_attached_device,
-            has_ipv4_downlink_attachment,
+            has_legacy_ipv4_downlink_attachment,
             dscp_datapath_usable,
             source_port_datapath_usable,
             bearer_mark_datapath_usable,
@@ -4349,12 +4355,7 @@ impl EbpfGtpuDataplaneBackend {
             .map(|devices| {
                 (
                     !devices.is_empty(),
-                    devices.values().any(|device| {
-                        device.local_ip.is_some()
-                            || device
-                                .grouped
-                                .is_some_and(|grouped| grouped.local_endpoints.ipv4().is_some())
-                    }),
+                    devices.values().any(|device| device.local_ip.is_some()),
                     !devices.is_empty()
                         && devices
                             .keys()
@@ -4498,7 +4499,7 @@ impl EbpfGtpuDataplaneBackend {
             // consumer can receive them on a concrete S2b-U address. Outer
             // IPv6 fragment handling is reported separately and remains
             // unsupported.
-            downlink_outer_fragment_handling: if has_ipv4_downlink_attachment
+            downlink_outer_fragment_handling: if has_legacy_ipv4_downlink_attachment
                 && endpoint_binding_datapath_usable
             {
                 GtpuDownlinkFragmentContract::KernelReassemblyHandoff {
@@ -17954,6 +17955,10 @@ mod tests {
             GtpuUplinkChecksumOffloadContract::MaterializedOnly
         );
         assert_eq!(
+            capabilities.downlink_outer_ipv4_fragment_handling,
+            GtpuDownlinkFragmentContract::Unsupported
+        );
+        assert_eq!(
             capabilities.downlink_outer_ipv6_fragment_handling,
             GtpuDownlinkFragmentContract::Unsupported
         );
@@ -18088,17 +18093,21 @@ mod tests {
         assert_eq!(capabilities.outer_ipv4, GtpuCapability::Available);
         assert_eq!(capabilities.outer_ipv6, GtpuCapability::Available);
         assert_eq!(
+            capabilities.downlink_outer_ipv4_fragment_handling,
+            GtpuDownlinkFragmentContract::Unsupported
+        );
+        assert_eq!(
             capabilities.downlink_outer_ipv6_fragment_handling,
             GtpuDownlinkFragmentContract::Unsupported
         );
-        assert!(matches!(
+        assert_eq!(
             backend
                 .probe()
                 .await
                 .unwrap()
                 .downlink_outer_fragment_handling,
-            GtpuDownlinkFragmentContract::KernelReassemblyHandoff { .. }
-        ));
+            GtpuDownlinkFragmentContract::Unsupported
+        );
         let base = grouped_group(
             12,
             device_id,
@@ -19245,6 +19254,10 @@ mod tests {
         assert_eq!(
             capabilities.uplink_checksum_offload,
             GtpuUplinkChecksumOffloadContract::Unsupported
+        );
+        assert_eq!(
+            capabilities.downlink_outer_ipv4_fragment_handling,
+            GtpuDownlinkFragmentContract::Unsupported
         );
         assert_eq!(
             capabilities.downlink_outer_ipv6_fragment_handling,
@@ -22836,6 +22849,10 @@ mod tests {
         assert!(probe.btf_present);
         assert!(probe.mutation_ready);
         assert_eq!(probe.egress_dscp_marking, GtpuCapability::Available);
+        assert!(matches!(
+            probe.downlink_outer_fragment_handling,
+            GtpuDownlinkFragmentContract::KernelReassemblyHandoff { .. }
+        ));
         assert!(!probe.gtp_module_present);
 
         for missing in ["bpffs", "btf", "net_admin", "bpf"] {

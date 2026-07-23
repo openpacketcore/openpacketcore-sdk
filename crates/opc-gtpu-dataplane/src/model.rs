@@ -2055,6 +2055,14 @@ pub struct GtpuIpFamilyCapabilities {
     pub ipv6_udp_checksum: GtpuCapability,
     /// Exact offload/materialization invariant used for uplink checksums.
     pub uplink_checksum_offload: GtpuUplinkChecksumOffloadContract,
+    /// Demonstrated fragmented outer IPv4 downlink contract for this exact
+    /// grouped attachment.
+    ///
+    /// This is intentionally separate from the legacy backend-global
+    /// [`GtpuProbe::downlink_outer_fragment_handling`] field. A grouped
+    /// attachment must not inherit the legacy IPv4 reassembly-consumer claim:
+    /// that consumer authorizes only the frozen single-context map graph.
+    pub downlink_outer_ipv4_fragment_handling: GtpuDownlinkFragmentContract,
     /// Demonstrated fragmented outer IPv6 downlink contract.
     ///
     /// This is independent of [`Self::outer_ipv6`]: a backend may support
@@ -2077,6 +2085,7 @@ impl GtpuIpFamilyCapabilities {
             local_endpoint_sets: GtpuCapability::Missing,
             ipv6_udp_checksum: GtpuCapability::Missing,
             uplink_checksum_offload: GtpuUplinkChecksumOffloadContract::Unsupported,
+            downlink_outer_ipv4_fragment_handling: GtpuDownlinkFragmentContract::Unsupported,
             downlink_outer_ipv6_fragment_handling: GtpuDownlinkFragmentContract::Unsupported,
         }
     }
@@ -2722,6 +2731,10 @@ mod tests {
         assert_eq!(
             capabilities.uplink_checksum_offload,
             GtpuUplinkChecksumOffloadContract::Unsupported
+        );
+        assert_eq!(
+            capabilities.downlink_outer_ipv4_fragment_handling,
+            GtpuDownlinkFragmentContract::Unsupported
         );
         assert_eq!(
             capabilities.downlink_outer_ipv6_fragment_handling,
