@@ -13,6 +13,8 @@ const SCTP_NOTIFICATION_TYPE_BASE: u16 = 1 << 15;
 pub const SCTP_ASSOC_CHANGE_NOTIFICATION: u16 = SCTP_NOTIFICATION_TYPE_BASE + 1;
 pub const SCTP_PEER_ADDR_CHANGE_NOTIFICATION: u16 = SCTP_NOTIFICATION_TYPE_BASE + 2;
 pub const SCTP_SHUTDOWN_EVENT_NOTIFICATION: u16 = SCTP_NOTIFICATION_TYPE_BASE + 5;
+pub const SCTP_AUTHENTICATION_EVENT_NOTIFICATION: u16 = SCTP_NOTIFICATION_TYPE_BASE + 8;
+pub const SCTP_SENDER_DRY_EVENT_NOTIFICATION: u16 = SCTP_NOTIFICATION_TYPE_BASE + 9;
 
 fn unsupported() -> io::Error {
     io::Error::new(
@@ -105,6 +107,56 @@ pub fn set_recv_rcvinfo(_fd: BorrowedFd<'_>, _enabled: bool) -> io::Result<()> {
 }
 
 pub fn set_events(_fd: BorrowedFd<'_>, _events: EventSubscriptions) -> io::Result<()> {
+    Err(unsupported())
+}
+
+pub fn require_authenticated_chunk(_fd: BorrowedFd<'_>, _chunk_type: u8) -> io::Result<()> {
+    Err(unsupported())
+}
+
+pub fn set_authentication_enabled(_fd: BorrowedFd<'_>, _enabled: bool) -> io::Result<()> {
+    Err(unsupported())
+}
+
+pub fn peer_authentication_supported(_fd: BorrowedFd<'_>, _assoc_id: i32) -> io::Result<bool> {
+    Err(unsupported())
+}
+
+pub fn peer_authenticated_chunks(_fd: BorrowedFd<'_>, _assoc_id: i32) -> io::Result<Vec<u8>> {
+    Err(unsupported())
+}
+
+pub fn set_event(
+    _fd: BorrowedFd<'_>,
+    _assoc_id: i32,
+    _event_type: u16,
+    _enabled: bool,
+) -> io::Result<()> {
+    Err(unsupported())
+}
+
+pub fn install_auth_key(
+    _fd: BorrowedFd<'_>,
+    _assoc_id: i32,
+    _key_id: u16,
+    _key: &[u8],
+) -> io::Result<()> {
+    Err(unsupported())
+}
+
+pub fn set_active_auth_key(_fd: BorrowedFd<'_>, _assoc_id: i32, _key_id: u16) -> io::Result<()> {
+    Err(unsupported())
+}
+
+pub fn deactivate_auth_key(_fd: BorrowedFd<'_>, _assoc_id: i32, _key_id: u16) -> io::Result<()> {
+    Err(unsupported())
+}
+
+pub fn delete_auth_key(_fd: BorrowedFd<'_>, _assoc_id: i32, _key_id: u16) -> io::Result<()> {
+    Err(unsupported())
+}
+
+pub fn shutdown_both(_fd: BorrowedFd<'_>) -> io::Result<()> {
     Err(unsupported())
 }
 

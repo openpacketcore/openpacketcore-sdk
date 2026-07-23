@@ -19,9 +19,12 @@ other protocol codecs.
   `peer_primary_address`, `listen`, `accept`, `socket_error`, `set_initmsg`,
   `set_rto_parameters`, `set_peer_address_parameters`,
   `set_primary_peer_address`, `set_nodelay`, `set_recv_rcvinfo`, `set_events`,
-  `send_msg`, and `recv_msg`.
+  association-scoped SCTP-AUTH configuration/key lifecycle, dynamic
+  `set_event`, `shutdown_both`, `send_msg`, and `recv_msg`.
 - Constants: `SCTP_UNORDERED_FLAG`, `SCTP_NOTIFICATION_FLAG`,
-  `SCTP_ASSOC_CHANGE_NOTIFICATION`, and `SCTP_SHUTDOWN_EVENT_NOTIFICATION`.
+  `SCTP_ASSOC_CHANGE_NOTIFICATION`, `SCTP_SHUTDOWN_EVENT_NOTIFICATION`,
+  `SCTP_AUTHENTICATION_EVENT_NOTIFICATION`, and
+  `SCTP_SENDER_DRY_EVENT_NOTIFICATION`.
 
 ## Usage
 
@@ -52,6 +55,12 @@ let fd = open_socket(AddressFamily::Ipv4, SocketStyle::OneToOne)?;
   exact Linux packed/aligned UAPI layouts. Unit tests assert every field offset,
   total size, alignment, option-update encoding, wildcard behavior, and
   redaction-safe peer-parameter `Debug` output.
+- SCTP-AUTH support is enabled before chunk requirements are configured and
+  before an association forms. Key-option scratch buffers are zeroized, key
+  identifiers retain their association scope, and callers can observe exact
+  AUTH and sender-dry notifications through the safe crate. These primitives
+  do not implement DTLS, establish an application identity, or assign Diameter
+  PPID 47.
 
 ## Roadmap
 
@@ -65,4 +74,5 @@ let fd = open_socket(AddressFamily::Ipv4, SocketStyle::OneToOne)?;
 cargo test -p opc-libsctp-sys
 cargo test -p opc-libsctp-sys linux::tests::loopback_bindx_connectx_reports_all_addresses -- --ignored --exact
 cargo test -p opc-libsctp-sys linux::tests::loopback_path_tuning_and_primary_selection -- --ignored --exact
+cargo test -p opc-libsctp-sys linux::tests::loopback_authentication_configuration_and_key_switch -- --ignored --exact
 ```

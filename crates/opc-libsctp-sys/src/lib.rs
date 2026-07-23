@@ -33,6 +33,13 @@ pub type AssocId = i32;
 /// causing an unbounded allocation at the socket boundary.
 pub const MAX_SCTP_ADDRESSES: usize = 64;
 
+/// Maximum shared-secret bytes accepted by Linux's `sctp_authkey` UAPI.
+///
+/// The wire-independent UAPI length field is a `u16`. Keeping the same bound
+/// at this boundary prevents truncation when building the variable-length
+/// socket option.
+pub const MAX_SCTP_AUTH_KEY_BYTES: usize = u16::MAX as usize;
+
 /// IP address family used when opening an SCTP socket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AddressFamily {
@@ -345,6 +352,83 @@ pub fn set_events(fd: BorrowedFd<'_>, events: EventSubscriptions) -> io::Result<
     platform::set_events(fd, events)
 }
 
+/// Require a chunk type to be received only when SCTP-AUTH authenticated.
+///
+/// Linux applies this option to future associations on the socket. It must be
+/// configured before connecting or accepting the association it is intended
+/// to protect.
+pub fn require_authenticated_chunk(fd: BorrowedFd<'_>, chunk_type: u8) -> io::Result<()> {
+    platform::require_authenticated_chunk(fd, chunk_type)
+}
+
+/// Enable or disable SCTP-AUTH support before association establishment.
+pub fn set_authentication_enabled(fd: BorrowedFd<'_>, enabled: bool) -> io::Result<()> {
+    platform::set_authentication_enabled(fd, enabled)
+}
+
+/// Return whether the established peer negotiated SCTP-AUTH support.
+pub fn peer_authentication_supported(fd: BorrowedFd<'_>, assoc_id: AssocId) -> io::Result<bool> {
+    platform::peer_authentication_supported(fd, assoc_id)
+}
+
+/// Return the chunk types that the established peer requires authenticated.
+///
+/// SCTP chunk types are one octet, so the result is intrinsically bounded to
+/// at most 256 distinct values. A malformed kernel response is rejected.
+pub fn peer_authenticated_chunks(fd: BorrowedFd<'_>, assoc_id: AssocId) -> io::Result<Vec<u8>> {
+    platform::peer_authenticated_chunks(fd, assoc_id)
+}
+
+/// Enable or disable one notification for a specific association.
+///
+/// The association identifier is ignored for one-to-one sockets.
+pub fn set_event(
+    fd: BorrowedFd<'_>,
+    assoc_id: AssocId,
+    event_type: u16,
+    enabled: bool,
+) -> io::Result<()> {
+    platform::set_event(fd, assoc_id, event_type, enabled)
+}
+
+/// Install an association-scoped SCTP-AUTH shared key.
+///
+/// The temporary variable-length UAPI option buffer is zeroized before it is
+/// released. The caller remains responsible for its own input buffer.
+pub fn install_auth_key(
+    fd: BorrowedFd<'_>,
+    assoc_id: AssocId,
+    key_id: u16,
+    key: &[u8],
+) -> io::Result<()> {
+    platform::install_auth_key(fd, assoc_id, key_id, key)
+}
+
+/// Select the SCTP-AUTH key used for subsequently submitted messages.
+pub fn set_active_auth_key(fd: BorrowedFd<'_>, assoc_id: AssocId, key_id: u16) -> io::Result<()> {
+    platform::set_active_auth_key(fd, assoc_id, key_id)
+}
+
+/// Stop using an inactive SCTP-AUTH key for outgoing messages.
+///
+/// Linux rejects attempts to deactivate the currently active key.
+pub fn deactivate_auth_key(fd: BorrowedFd<'_>, assoc_id: AssocId, key_id: u16) -> io::Result<()> {
+    platform::deactivate_auth_key(fd, assoc_id, key_id)
+}
+
+/// Delete a deactivated, no-longer-used SCTP-AUTH key from the kernel.
+pub fn delete_auth_key(fd: BorrowedFd<'_>, assoc_id: AssocId, key_id: u16) -> io::Result<()> {
+    platform::delete_auth_key(fd, assoc_id, key_id)
+}
+
+/// Terminate both directions of a one-to-one SCTP socket.
+///
+/// This is used to make cancellation and indeterminate security-transition
+/// failures terminal rather than leaving a live association behind.
+pub fn shutdown_both(fd: BorrowedFd<'_>) -> io::Result<()> {
+    platform::shutdown_both(fd)
+}
+
 /// Send one SCTP message with stream/PPID metadata.
 pub fn send_msg(fd: BorrowedFd<'_>, payload: &[u8], info: SendInfo) -> io::Result<usize> {
     platform::send_msg(fd, payload, info)
@@ -370,6 +454,13 @@ pub const SCTP_PEER_ADDR_CHANGE_NOTIFICATION: u16 = platform::SCTP_PEER_ADDR_CHA
 /// SCTP shutdown notification type.
 pub const SCTP_SHUTDOWN_EVENT_NOTIFICATION: u16 = platform::SCTP_SHUTDOWN_EVENT_NOTIFICATION;
 
+/// SCTP authentication notification type.
+pub const SCTP_AUTHENTICATION_EVENT_NOTIFICATION: u16 =
+    platform::SCTP_AUTHENTICATION_EVENT_NOTIFICATION;
+
+/// SCTP sender-dry notification type.
+pub const SCTP_SENDER_DRY_EVENT_NOTIFICATION: u16 = platform::SCTP_SENDER_DRY_EVENT_NOTIFICATION;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -392,6 +483,8 @@ mod tests {
         assert_eq!(SCTP_ASSOC_CHANGE_NOTIFICATION, 0x8001);
         assert_eq!(SCTP_PEER_ADDR_CHANGE_NOTIFICATION, 0x8002);
         assert_eq!(SCTP_SHUTDOWN_EVENT_NOTIFICATION, 0x8005);
+        assert_eq!(SCTP_AUTHENTICATION_EVENT_NOTIFICATION, 0x8008);
+        assert_eq!(SCTP_SENDER_DRY_EVENT_NOTIFICATION, 0x8009);
     }
 
     #[test]

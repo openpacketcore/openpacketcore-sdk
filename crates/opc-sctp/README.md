@@ -22,9 +22,14 @@ Diameter transports are outside the current crate boundary.
   that can emit it safely.
 - Config: `SctpEndpointConfig`, `SctpConnectConfig`, `SctpMode`, `InitConfig`,
   `RtoConfig`, `HeartbeatConfig`, `DeliveryOrder`, `SctpCapabilities`, and
-  `MAX_STATIC_MULTIHOMING_ADDRESSES`.
+  `SctpAuthenticationConfig`, `MAX_STATIC_MULTIHOMING_ADDRESSES`, and
+  `MAX_SCTP_AUTH_KEY_BYTES`.
 - Messaging: `OutboundMessage`, `InboundMessage`, `SctpEvent`,
-  `SctpPeerAddrState`, `SctpEndpoint`, and `SctpAssociation`.
+  `SctpPeerAddrState`, `SctpAuthenticationIndication`, `SctpEndpoint`,
+  `SctpAssociation`, and its exclusive send/receive halves.
+- SCTP-AUTH lifecycle: `SctpAuthKeyId`, zeroizing `SctpAuthKey`, typed AUTH
+  events, active-key selection, confirmed old-key retirement, and bounded
+  `SctpSenderDrainOutcome` waits.
 - Observability: `SctpHealth`, `SctpPathHealth`, `SctpPathStatus`,
   `SctpMetrics`, and `SctpMetricsSnapshot`.
 - Diameter helpers: `DiameterSctpPeer`, `DiameterSctpAssociation`,
@@ -168,6 +173,67 @@ be reordered by concurrent callers. All raw `SCTP_RTOINFO`,
 `SCTP_PEER_ADDR_PARAMS`, and `SCTP_PRIMARY_ADDR` layouts remain confined to
 `opc-libsctp-sys`.
 
+### SCTP-AUTH key rotation and bounded sender drain
+
+Linux SCTP-AUTH can be required explicitly on one-to-one associations. The
+authenticated constructors enable kernel AUTH support and require DATA
+authentication before connect/listen, then reject a peer that did not
+negotiate AUTH. FORWARD-TSN authentication is an explicit addition for a
+caller using partial reliability. Ordinary `bind` and `connect` remain
+unchanged and do not enable these requirements.
+
+An RFC 6083 exporter result is admitted only through the exact-width helper:
+
+```rust,no_run
+use opc_sctp::{SctpAssociation, SctpAuthKey, SctpAuthKeyId, SctpError};
+
+async fn install_exported_key(
+    association: &SctpAssociation,
+    key_id: u16,
+    exporter: Vec<u8>,
+) -> Result<(), SctpError> {
+    let key_id = SctpAuthKeyId::new(key_id).ok_or(SctpError::InvalidConfig {
+        field: "key_id",
+        reason: "must be nonzero",
+    })?;
+    association
+        .install_auth_key(SctpAuthKey::for_rfc6083(key_id, exporter)?)
+        .await?;
+    association.activate_auth_key(key_id).await
+}
+```
+
+The SDK consumes and zeroizes key material after installation, rejects an
+identifier already present in the association ledger, and wraps RFC 6083 key
+identifiers from 65535 to 1 without allowing callers to install or activate
+identifier 0. After the first switch, `retire_initial_auth_key` provides the
+narrow drain/deactivate/FREE/delete path required to remove SCTP-AUTH's
+protocol-defined empty key 0. Rotation policy, exporter derivation, peer
+confirmation, and collision-free identifier choice remain caller-owned.
+`retire_auth_key` accepts only an inactive installed nonzero key,
+serializes against new sends, establishes sender-dry, deactivates the key,
+waits for the matching kernel `SCTP_AUTH_FREE_KEY` notification, and only then
+deletes it. Its one timeout bounds writer admission, drain, and retirement
+confirmation. The receive side must be continuously polled to deliver that
+evidence. Timeout or cancellation after drain begins, AUTH loss, or an
+indeterminate transition makes the association terminal; a confirmed
+deactivated key whose final delete failed can be retried explicitly.
+
+`SctpAssociation::into_split` provides a single mutable send/control owner and
+a single mutable receive owner. While the receive half drains notifications,
+the send half can hold its exclusive writer gate and call
+`wait_for_sender_dry_or_shutdown(timeout)`. Sender-dry is armed only for that
+bounded operation on an authenticated association, so a notification from
+before a later send cannot satisfy the wait. The proof remains valid only until
+that sole writer sends again. Timeout or cancellation, including while waiting
+for writer admission, physically shuts down the socket rather than returning a
+reusable association.
+
+This API is a prerequisite for RFC 6083 DTLS/SCTP shutdown and key changes; it
+is not DTLS. It does not derive exporter keys, validate certificates or peer
+identity, carry DTLS records, emit PPID 47, or satisfy protected-Diameter
+readiness by itself.
+
 ### Legacy Diameter PPID 0 interoperability
 
 Strict inbound PPID validation and RFC PPID 46 outbound framing are the
@@ -265,6 +331,10 @@ this crate.
 - Linux SCTP sockets are supported; non-Linux hosts fail closed with
   unsupported-platform errors.
 - One-to-one and one-to-many modes are represented.
+- SCTP-AUTH configuration and rotation are intentionally limited to one-to-one
+  associations. `capabilities()` reports only build/API availability; the
+  authenticated constructor still verifies host support and the established
+  peer before returning an association.
 - Static multihoming binds every configured local address and connects with the
   complete remote address set on Linux. Address sets are bounded and must use
   one family and port; exactly one address preserves the original syscall path.
@@ -291,6 +361,11 @@ this crate.
   `SCTP_SN_TYPE_BASE` values. Peer-address-change decoding supports IPv4 and
   IPv6 `sockaddr_storage` layouts, rejects truncated or unknown-family events,
   and retains unknown future state values as typed `Unknown` transitions.
+- `SctpEvent` now has typed `SenderDry` and `Authentication` variants, and
+  `SctpError` has typed drain/AUTH failures. Downstream exhaustive matches must
+  add arms for those variants. The low-level `EventSubscriptions::default()`
+  remains source/behavior compatible; authenticated safe associations override
+  sender-dry subscription so it can be armed only around a bounded operation.
 - Per-path health is bounded to `MAX_STATIC_MULTIHOMING_ADDRESSES` and advances
   only while the consumer receives association messages or notifications.
 - Custom RTO and heartbeat configs use exact asserted Linux UAPI layouts and
@@ -316,4 +391,5 @@ cargo test -p opc-libsctp-sys linux::tests::loopback_path_tuning_and_primary_sel
 cargo test -p opc-sctp tests::loopback_static_multihoming_binds_and_connects_full_sets -- --ignored --exact
 cargo test -p opc-sctp tests::loopback_diameter_recv_surfaces_transport_notification -- --ignored --exact
 cargo test -p opc-sctp tests::static_multihoming_survives_primary_path_drop -- --ignored --exact
+cargo test -p opc-sctp tests::loopback_authenticated_association_switches_keys_and_drains -- --ignored --exact
 ```
