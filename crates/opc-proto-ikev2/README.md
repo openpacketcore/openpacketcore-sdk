@@ -99,6 +99,15 @@ control-plane stack.
   `Ikev2NotifyPayloadBuild::eap_only_authentication()`. Whether the negotiated
   EAP method is mutually authenticating, key-generating, and resistant to
   dictionary attacks remains product-owned policy.
+- For TS 24.302 P-CSCF restoration capability, `notify` exposes private status
+  type `IKEV2_NOTIFY_P_CSCF_RESELECTION_SUPPORT` (41304) and the strict
+  `decode_ikev2_pcscf_reselection_support_notify` classifier. It accepts only
+  Protocol ID zero, SPI Size zero, empty SPI, and empty notification data;
+  malformed matching values return stable payload-free errors while unrelated
+  Notify values remain distinguishable. Build the canonical four-octet body
+  with `Ikev2NotifyPayloadBuild::p_cscf_reselection_support()`. Deciding
+  whether to relay this authenticated UE capability into PCO or APCO remains
+  product-owned policy.
 - `dedicated_bearer` implements the TS 24.302 multiple-bearer Notify values and
   strict opened-payload views/builders for dedicated-bearer `CREATE_CHILD_SA`
   and `INFORMATIONAL` modification/deletion exchanges. TFT values use the

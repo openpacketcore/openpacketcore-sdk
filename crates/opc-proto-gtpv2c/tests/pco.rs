@@ -1,7 +1,8 @@
 use bytes::BytesMut;
 use opc_proto_gtpv2c::{
-    decode_typed_ie_sequence, encode_typed_ie_sequence, PcoAddressConfiguration, PcoDecodeError,
-    PcoRequest, ProtocolConfigurationOptions, TypedIe, TypedIeValue, PCO_MAX_CONTAINERS,
+    decode_typed_ie_sequence, encode_typed_ie_sequence, AdditionalProtocolConfigurationOptions,
+    PcoAddressConfiguration, PcoDecodeError, PcoRequest, ProtocolConfigurationOptions, TypedIe,
+    TypedIeValue, PCO_CONTAINER_P_CSCF_RESELECTION_SUPPORT, PCO_MAX_CONTAINERS,
 };
 use opc_protocol::{DecodeContext, EncodeContext};
 
@@ -14,11 +15,56 @@ fn request_encoder_emits_zero_length_address_containers_in_registry_order() {
         dns_server_ipv6: true,
         p_cscf_ipv4: true,
         dns_server_ipv4: true,
+        p_cscf_reselection_support: false,
     }
     .encode_request_contents();
     assert_eq!(
         encoded,
         vec![0x80, 0x00, 0x01, 0x00, 0x00, 0x03, 0x00, 0x00, 0x0c, 0x00, 0x00, 0x0d, 0x00,]
+    );
+}
+
+#[test]
+fn pcscf_reselection_support_is_an_independent_empty_request_container() {
+    assert_eq!(PCO_CONTAINER_P_CSCF_RESELECTION_SUPPORT, 0x0012);
+
+    let support_only = PcoRequest {
+        p_cscf_reselection_support: true,
+        ..PcoRequest::none()
+    };
+    assert!(support_only.is_requested());
+    assert_eq!(
+        support_only.encode_request_contents(),
+        vec![0x80, 0x00, 0x12, 0x00]
+    );
+
+    let addresses_only = PcoRequest {
+        p_cscf_ipv6: true,
+        p_cscf_ipv4: true,
+        ..PcoRequest::none()
+    };
+    assert_eq!(
+        addresses_only.encode_request_contents(),
+        vec![0x80, 0x00, 0x01, 0x00, 0x00, 0x0c, 0x00]
+    );
+}
+
+#[test]
+fn reselection_support_orders_after_all_legacy_address_requests() {
+    let encoded = PcoRequest {
+        p_cscf_ipv6: true,
+        dns_server_ipv6: true,
+        p_cscf_ipv4: true,
+        dns_server_ipv4: true,
+        p_cscf_reselection_support: true,
+    }
+    .encode_request_contents();
+    assert_eq!(
+        encoded,
+        vec![
+            0x80, 0x00, 0x01, 0x00, 0x00, 0x03, 0x00, 0x00, 0x0c, 0x00, 0x00, 0x0d, 0x00, 0x00,
+            0x12, 0x00,
+        ]
     );
 }
 
@@ -115,24 +161,41 @@ fn pco_request_round_trips_through_opaque_gtpv2c_ie_transport() {
         dns_server_ipv6: false,
         p_cscf_ipv4: true,
         dns_server_ipv4: true,
+        p_cscf_reselection_support: true,
     }
     .encode_request_contents();
     let pco = ProtocolConfigurationOptions {
         value: value.clone(),
     };
-    let ies = [TypedIe {
-        instance: 0,
-        value: TypedIeValue::ProtocolConfigurationOptions(pco.clone()),
-    }];
+    let apco = AdditionalProtocolConfigurationOptions {
+        value: value.clone(),
+    };
+    let ies = [
+        TypedIe {
+            instance: 0,
+            value: TypedIeValue::ProtocolConfigurationOptions(pco.clone()),
+        },
+        TypedIe {
+            instance: 0,
+            value: TypedIeValue::AdditionalProtocolConfigurationOptions(apco.clone()),
+        },
+    ];
     let mut wire = BytesMut::new();
     encode_typed_ie_sequence(&ies, &mut wire, EncodeContext::default()).expect("encode PCO IE");
     let decoded =
         decode_typed_ie_sequence(&wire, DecodeContext::default(), 0).expect("decode PCO IE");
 
-    assert_eq!(decoded.len(), 1);
+    assert_eq!(decoded.len(), 2);
     assert_eq!(
         decoded[0].value,
         TypedIeValue::ProtocolConfigurationOptions(pco)
     );
-    assert_eq!(value, vec![0x80, 0x00, 0x0c, 0x00, 0x00, 0x0d, 0x00]);
+    assert_eq!(
+        decoded[1].value,
+        TypedIeValue::AdditionalProtocolConfigurationOptions(apco)
+    );
+    assert_eq!(
+        value,
+        vec![0x80, 0x00, 0x0c, 0x00, 0x00, 0x0d, 0x00, 0x00, 0x12, 0x00]
+    );
 }

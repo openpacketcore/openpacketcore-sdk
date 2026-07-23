@@ -182,6 +182,15 @@ pub const IKEV2_NOTIFY_EAP_ONLY_AUTHENTICATION: u16 = 16_417;
 /// @conformance boundary-only
 pub const IKEV2_NOTIFY_DEVICE_IDENTITY: u16 = 41_101;
 
+/// IKEv2 Notify Message Type for 3GPP P_CSCF_RESELECTION_SUPPORT.
+///
+/// A UE includes this status Notify in an IKE_AUTH request to indicate support
+/// for the P-CSCF restoration extension over untrusted WLAN.
+///
+/// @spec 3GPP TS24.302 7.2.1, 7.4.1.1, 8.1.2.3, 8.2.9.4
+/// @conformance boundary-only
+pub const IKEV2_NOTIFY_P_CSCF_RESELECTION_SUPPORT: u16 = 41_304;
+
 /// Protocol ID used by IKE-level notifications with no protocol-specific SPI.
 pub const IKEV2_NOTIFY_PROTOCOL_ID_NONE: u8 = 0;
 
@@ -420,6 +429,100 @@ pub const fn decode_ikev2_eap_only_authentication_notify(
         return Err(Ikev2EapOnlyAuthenticationNotifyError::NotificationDataNonempty);
     }
     Ok(Some(Ikev2EapOnlyAuthentication { _private: () }))
+}
+
+/// Validated 3GPP P_CSCF_RESELECTION_SUPPORT signal.
+///
+/// Values can only be obtained by validating a decoded Notify with
+/// [`decode_ikev2_pcscf_reselection_support_notify`].
+///
+/// @spec 3GPP TS24.302 8.2.9.4
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Ikev2PcscfReselectionSupport {
+    _private: (),
+}
+
+impl fmt::Debug for Ikev2PcscfReselectionSupport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Ikev2PcscfReselectionSupport")
+    }
+}
+
+/// Structural failure for a type-41304 P_CSCF_RESELECTION_SUPPORT Notify.
+///
+/// Validation reports the first invalid field in TS 24.302 wire order:
+/// Protocol ID, SPI Size, SPI bytes, then notification data. Variants contain
+/// no packet bytes, endpoint addresses, or subscriber identity.
+///
+/// @spec 3GPP TS24.302 8.2.9.4
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ikev2PcscfReselectionSupportNotifyError {
+    /// Protocol ID was not zero.
+    ProtocolIdNonzero,
+    /// The declared SPI Size was not zero.
+    SpiSizeNonzero,
+    /// SPI bytes were present despite a zero SPI Size.
+    SpiNonempty,
+    /// Notification data was present.
+    NotificationDataNonempty,
+}
+
+impl Ikev2PcscfReselectionSupportNotifyError {
+    /// Stable machine-readable error code.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ProtocolIdNonzero => "ike_pcscf_reselection_support_protocol_id_nonzero",
+            Self::SpiSizeNonzero => "ike_pcscf_reselection_support_spi_size_nonzero",
+            Self::SpiNonempty => "ike_pcscf_reselection_support_spi_nonempty",
+            Self::NotificationDataNonempty => {
+                "ike_pcscf_reselection_support_notification_data_nonempty"
+            }
+        }
+    }
+}
+
+impl fmt::Display for Ikev2PcscfReselectionSupportNotifyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Error for Ikev2PcscfReselectionSupportNotifyError {}
+
+/// Decode one 3GPP P_CSCF_RESELECTION_SUPPORT Notify occurrence.
+///
+/// An unrelated Notify returns `Ok(None)`. A canonical type-41304 Notify
+/// returns `Ok(Some(_))`. A type-41304 Notify with any non-canonical structural
+/// field returns a typed error while the original lossless
+/// [`Ikev2NotifyPayload`] remains owned by the caller.
+///
+/// # Errors
+///
+/// Returns [`Ikev2PcscfReselectionSupportNotifyError`] when a type-41304
+/// Notify has nonzero Protocol ID or SPI Size, nonempty SPI bytes, or nonempty
+/// notification data.
+///
+/// @spec 3GPP TS24.302 8.2.9.4
+pub const fn decode_ikev2_pcscf_reselection_support_notify(
+    notify: Ikev2NotifyPayload<'_>,
+) -> Result<Option<Ikev2PcscfReselectionSupport>, Ikev2PcscfReselectionSupportNotifyError> {
+    if notify.notify_message_type != IKEV2_NOTIFY_P_CSCF_RESELECTION_SUPPORT {
+        return Ok(None);
+    }
+    if notify.protocol_id != IKEV2_NOTIFY_PROTOCOL_ID_NONE {
+        return Err(Ikev2PcscfReselectionSupportNotifyError::ProtocolIdNonzero);
+    }
+    if notify.spi_size != 0 {
+        return Err(Ikev2PcscfReselectionSupportNotifyError::SpiSizeNonzero);
+    }
+    if !notify.spi.is_empty() {
+        return Err(Ikev2PcscfReselectionSupportNotifyError::SpiNonempty);
+    }
+    if !notify.notification_data.is_empty() {
+        return Err(Ikev2PcscfReselectionSupportNotifyError::NotificationDataNonempty);
+    }
+    Ok(Some(Ikev2PcscfReselectionSupport { _private: () }))
 }
 
 impl fmt::Debug for Ikev2NotifyPayload<'_> {
