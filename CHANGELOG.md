@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Typed EAP-AKA/AKA-prime packet projection — `opc-proto-eap`,
+  `opc-proto-ikev2`, `opc-proto-diameter`:** adds one strict,
+  allocation-bounded RFC 4187/RFC 9048 parser shared by IKEv2 EAP and SWm
+  Diameter-EAP payloads. It validates complete framing, subtype
+  direction/cardinality, KDF negotiation, Notification phase semantics, and
+  unknown-attribute behavior while exposing only redaction-safe structural
+  evidence. Cryptographic verification, key derivation, and EAP session state
+  remain product-owned (#509).
 - **Admitted declared-sealed key custody — `opc-key`:** adds a process-wide,
   immutable `KeyCustodyModule` slot that binds `CryptoModule` evidence and
   `RemoteSealProvider` operations to one exact object. Installation requires

@@ -335,6 +335,12 @@ transport-neutral, and neither crate currently implements DTLS/SCTP.
   `(10415, 1)` with value zero and request M clear. Correlation requires exact
   `DIAMETER_SUCCESS` before a DEA can authorize mobility, accepts the TS
   collective PMIP6/GTPv2 selection, and rejects unoffered non-NBM bits.
+  EAP-Payload and EAP-Reissued-Payload expose explicit `project_*_aka`
+  accessors backed by the canonical `opc-proto-eap` parser. DER, raw DEA, and
+  authenticated transaction-correlated DEA surfaces return the same bounded,
+  redaction-safe EAP-AKA/AKA-prime structural evidence. Generic EAP remains
+  opaque unless callers opt in, and Diameter correlation does not substitute
+  for AKA cryptographic verification.
   The codec does not own a multi-round EAP procedure state machine: a consumer
   must carry the same access context into each continuation DER. For an attach
   where the applicable conditional access-context facts have independently

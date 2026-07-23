@@ -253,6 +253,14 @@ AVPs, data types, flag rules) is present; typed builders/parsers are limited to
 | `app-s6b` | 3GPP S6b (id 16_777_272) | — | dictionary only |
 | `app-swx` | 3GPP SWx (id 16_777_265) | — | dictionary only |
 
+SWm DER/DEA EAP payload accessors explicitly delegate Type 23/50 projection to
+`opc-proto-eap`. Raw answer access proves structure only; the
+`SwmCorrelatedDiameterEapResponse` methods additionally require the existing
+authenticated Diameter peer/transaction correlation. Neither surface verifies
+AKA method cryptography or derives EAP keys. The compiler-external
+`opc-testbed/tests/eap_aka_transport_projection.rs` test proves identical
+projection and error behavior across SWm and IKEv2.
+
 The SWm typed helpers validate the ePDG-required Diameter-EAP subset at both
 encode and parse boundaries: `Auth-Request-Type` must be
 `AUTHORIZE_AUTHENTICATE`, DER `EAP-Payload` must be present and nonempty,

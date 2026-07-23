@@ -29,6 +29,7 @@ jobs:
           - opc-proto-pfcp
           - opc-proto-nas
           - opc-proto-ngap
+          - opc-proto-eap
           - opc-proto-tft
           - opc-proto-gtpv2c
           - opc-proto-ikev2
@@ -78,6 +79,7 @@ jobs:
           - opc-proto-pfcp
           - opc-proto-nas
           - opc-proto-ngap
+          - opc-proto-eap
           - opc-proto-tft
           - opc-proto-gtpv2c
           - opc-proto-ikev2

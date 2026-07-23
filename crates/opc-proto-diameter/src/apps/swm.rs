@@ -3015,6 +3015,39 @@ impl SwmCorrelatedDiameterEapResponse {
         self.response.response()
     }
 
+    /// Project a correlated ordinary DEA's EAP-Payload as EAP-AKA/AKA-prime.
+    ///
+    /// `Ok(None)` means the response uses generic-error grammar or has no
+    /// EAP-Payload. `Err(_)` retains a strict, redaction-safe structural
+    /// failure. Correlation authenticates the Diameter source and transaction;
+    /// it does not verify AKA method cryptography.
+    #[must_use = "projection failures and present EAP evidence must be handled"]
+    pub fn project_eap_payload_aka(
+        &self,
+    ) -> Result<Option<opc_proto_eap::EapAkaPacket<'_>>, opc_proto_eap::EapAkaError> {
+        match self.response() {
+            SwmDiameterEapResponse::Application(answer) => answer.project_eap_payload_aka(),
+            SwmDiameterEapResponse::GenericError(_) => Ok(None),
+        }
+    }
+
+    /// Project a correlated ordinary DEA's EAP-Reissued-Payload as
+    /// EAP-AKA/AKA-prime.
+    ///
+    /// `Ok(None)` means the response uses generic-error grammar or has no
+    /// reissued payload. The returned evidence is structural only.
+    #[must_use = "projection failures and present EAP evidence must be handled"]
+    pub fn project_eap_reissued_payload_aka(
+        &self,
+    ) -> Result<Option<opc_proto_eap::EapAkaPacket<'_>>, opc_proto_eap::EapAkaError> {
+        match self.response() {
+            SwmDiameterEapResponse::Application(answer) => {
+                answer.project_eap_reissued_payload_aka()
+            }
+            SwmDiameterEapResponse::GenericError(_) => Ok(None),
+        }
+    }
+
     /// Borrow WLAN location facts after complete authenticated correlation.
     ///
     /// The raw parsed-answer API exposes only location presence metadata and
@@ -5662,6 +5695,16 @@ impl std::fmt::Debug for SwmDiameterEapAnswer {
 }
 
 impl SwmDiameterEapRequest {
+    /// Project the DER EAP-Payload as strict EAP-AKA/AKA-prime evidence.
+    ///
+    /// This opt-in operation leaves generic Diameter-EAP handling unchanged.
+    /// It exposes no raw AKA attributes and performs no method cryptography.
+    pub fn project_eap_aka(
+        &self,
+    ) -> Result<opc_proto_eap::EapAkaPacket<'_>, opc_proto_eap::EapAkaError> {
+        opc_proto_eap::EapAkaPacket::parse(self.eap_payload.as_ref().as_slice())
+    }
+
     fn validate_for_encode(&self) -> Result<(), EncodeError> {
         if self.session_id.as_ref().is_empty() {
             return Err(encode_structural_error(
@@ -5822,6 +5865,36 @@ impl SwmDiameterEapRequest {
 }
 
 impl SwmDiameterEapAnswer {
+    /// Project EAP-Payload as strict EAP-AKA/AKA-prime evidence when present.
+    ///
+    /// This raw answer surface proves packet structure only. Use
+    /// [`SwmCorrelatedDiameterEapResponse::project_eap_payload_aka`] when
+    /// Diameter peer and transaction authority are required.
+    #[must_use = "projection failures and present EAP evidence must be handled"]
+    pub fn project_eap_payload_aka(
+        &self,
+    ) -> Result<Option<opc_proto_eap::EapAkaPacket<'_>>, opc_proto_eap::EapAkaError> {
+        self.eap_payload
+            .as_ref()
+            .map(|payload| opc_proto_eap::EapAkaPacket::parse(payload.as_ref().as_slice()))
+            .transpose()
+    }
+
+    /// Project EAP-Reissued-Payload as strict EAP-AKA/AKA-prime evidence.
+    ///
+    /// This raw answer surface proves packet structure only. Use
+    /// [`SwmCorrelatedDiameterEapResponse::project_eap_reissued_payload_aka`]
+    /// when Diameter peer and transaction authority are required.
+    #[must_use = "projection failures and present EAP evidence must be handled"]
+    pub fn project_eap_reissued_payload_aka(
+        &self,
+    ) -> Result<Option<opc_proto_eap::EapAkaPacket<'_>>, opc_proto_eap::EapAkaError> {
+        self.eap_reissued_payload
+            .as_ref()
+            .map(|payload| opc_proto_eap::EapAkaPacket::parse(payload.as_ref().as_slice()))
+            .transpose()
+    }
+
     /// Return whether the DEA contains sealed WLAN access-location context.
     ///
     /// Received values remain unavailable until the response is authenticated

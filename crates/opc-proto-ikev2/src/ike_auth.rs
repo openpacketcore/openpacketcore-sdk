@@ -361,6 +361,19 @@ impl<'a> Ikev2EapPayload<'a> {
         }
         Ok(Self { packet: body })
     }
+
+    /// Project this complete EAP payload as strict EAP-AKA/AKA-prime evidence.
+    ///
+    /// This opt-in parser does not affect generic EAP handling: Identity,
+    /// Success, Failure, and other method packets remain valid IKEv2 EAP
+    /// payloads but return a typed [`opc_proto_eap::EapAkaError`] here. The
+    /// projection exposes no raw AKA attributes and performs no cryptographic
+    /// verification.
+    pub fn project_aka(
+        &self,
+    ) -> Result<opc_proto_eap::EapAkaPacket<'a>, opc_proto_eap::EapAkaError> {
+        opc_proto_eap::EapAkaPacket::parse(self.packet)
+    }
 }
 
 impl fmt::Debug for Ikev2EapPayload<'_> {
