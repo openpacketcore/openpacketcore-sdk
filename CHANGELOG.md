@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Pre-admission IKEv2 signing-key inspection — `opc-proto-ikev2`:** adds a
+  bounded, exact-DER, non-signing configuration helper for ECDSA P-256 and
+  P-384 PKCS#8. It returns the exact typed signature-generation requirement
+  plus deterministic canonical public SPKI identity and can require an exact
+  match with a bounded DER leaf certificate. Stable redaction-safe failures
+  cover empty, oversized, trailing, malformed, unsupported, and mismatched
+  input. The RustCrypto secret-key object and separately owned public-point
+  derivation scalar are explicitly zeroized. The result has no key
+  handle/signing authority and does not invoke the installed module; actual key
+  loading and signing remain module-only (#413).
 - **RFC 7427 local AUTH self-verification — `opc-proto-ikev2`:** the local
   signing authority can now mint a sealed, non-copyable, one-operation
   pre-transmit verification authorization bound to the exact successful

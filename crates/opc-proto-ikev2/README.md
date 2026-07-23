@@ -42,6 +42,15 @@ control-plane stack.
 - `certreq` validates one bounded, exact DER X.509 `SubjectPublicKeyInfo` and
   computes its RFC 7296 section 3.7 Certification Authority identifier through
   the admitted IKE hash operation. The result has redaction-safe `Debug`.
+- `pre_admission` performs one deliberately narrow configuration operation
+  before the process module is installed: bounded, exact-DER inspection of
+  unencrypted ECDSA P-256/P-384 PKCS#8. It returns the exact typed
+  signature-generation requirement and deterministic public SPKI identity,
+  and can require an exact match with a bounded DER leaf certificate. It
+  retains no private-key handle and cannot sign. Its RustCrypto secret-key
+  object and separate public-point derivation scalar are explicitly zeroized;
+  certificate trust and every actual key load/sign operation remain
+  caller/module-owned.
 - `sa_init`, `sa_init_crypto`, and `sa_init_negotiation` provide typed
   SA/KE/Nonce/Notify helpers, SA_INIT response builders, product-neutral
   responder proposal selection, Diffie-Hellman group/profile types, and
@@ -357,6 +366,35 @@ deliberately separate. Default builds can verify RSA peer AUTH but reject RSA
 private-key signing unless the `rsa-signing` feature is compiled. The bundled
 `Ikev2SoftwareCryptoModule` is an explicit RustCrypto-backed choice and reports
 `ValidationState::NotValidated`; selecting it makes no certification claim.
+
+When the configured private key determines the startup requirement, inspect it
+before the one-shot module installation and require its exact public identity
+to match the product-validated leaf certificate:
+
+```rust
+use opc_proto_ikev2::{
+    inspect_ikev2_signature_key_pkcs8_der, Ikev2CryptoRequirements,
+    Ikev2PreAdmissionInspectionError,
+};
+
+fn add_configured_signing_requirement(
+    pkcs8_der: &[u8],
+    validated_leaf_certificate_der: &[u8],
+    requirements: &mut Ikev2CryptoRequirements,
+) -> Result<(), Ikev2PreAdmissionInspectionError> {
+    let inspection = inspect_ikev2_signature_key_pkcs8_der(pkcs8_der)?;
+    inspection.require_leaf_certificate_spki_match(validated_leaf_certificate_der)?;
+    inspection.requirement().apply_to(requirements);
+    Ok(())
+}
+```
+
+This helper accepts neither PEM nor encrypted PKCS#8, performs no certificate
+chain/validity/name/key-usage checks, and is never a fallback for IKE traffic.
+Its RustCrypto secret-key object and explicitly owned public-point derivation
+scalar are zeroized independently; the result retains public metadata only.
+After admission, load the configured PKCS#8 and sign only through the installed
+module-backed `Ikev2SignatureAuthKey` path.
 
 `require_nat_detection` and `require_certreq_authority_hash` are also
 deliberately separate. Both require `IkeHash` and SHA-1, but a configuration
