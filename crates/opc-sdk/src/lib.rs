@@ -175,9 +175,12 @@ pub mod prelude {
 
     #[cfg(feature = "key")]
     pub use opc_key::{
-        AeadAlgorithm, ConfigAad, CryptoOperationError, EncryptedPayload, EnvelopeAad,
-        EnvelopeMetadata, KeyError, KeyHandle, KeyId, KeyProvider, KeyPurpose, KmsKeyProvider,
-        MemoryKeyProvider, SessionAad, ShadowSecurityAad,
+        admitted_key_custody, install_key_custody_module, key_custody_required_capabilities,
+        AdmittedKeyCustody, AeadAlgorithm, CapabilityReport, ConfigAad, CryptoCapability,
+        CryptoOperationError, EncryptedPayload, EnvelopeAad, EnvelopeMetadata,
+        KeyCustodyInstallError, KeyCustodyModule, KeyCustodyOperationError, KeyError, KeyHandle,
+        KeyId, KeyProvider, KeyPurpose, KmsKeyProvider, MemoryKeyProvider, ProviderPolicy,
+        RemoteSealProvider, SessionAad, ShadowSecurityAad, MAX_KEY_CUSTODY_BOUND_AAD_BYTES,
     };
 
     #[cfg(feature = "session")]

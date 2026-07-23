@@ -11,7 +11,7 @@ readme = "README.md"
 documentation = "https://docs.rs/opc-crypto-provider"
 keywords = ["5g", "cnf", "cryptography", "telecom", "packet-core"]
 categories = ["cryptography", "network-programming"]
-publish = false
+publish = true
 
 [features]
 testkit = []
@@ -22,9 +22,12 @@ serde = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
-opc-crypto-provider = { path = ".", version = "0.2.0", features = ["testkit"] }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[[test]]
+name = "fail_closed"
+required-features = ["testkit"]
 
 [lints]
 workspace = true

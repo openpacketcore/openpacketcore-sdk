@@ -78,6 +78,12 @@ fn sdk_prelude_exposes_security_entry_points() {
 
     let _crypto_envelope: Option<CryptoEnvelopeV1> = None;
     let _crypto_error = CryptoError::InvalidEnvelope;
+    let custody_requirements = key_custody_required_capabilities();
+    assert!(custody_requirements.contains(CryptoCapability::SealedKeyStorage));
+    assert_eq!(MAX_KEY_CUSTODY_BOUND_AAD_BYTES, 64 * 1024);
+    let _admitted_custody: Option<AdmittedKeyCustody> = None;
+    let _custody_install_error: Option<KeyCustodyInstallError> = None;
+    let _direct_remote_provider: Option<&dyn RemoteSealProvider> = None;
     let _kms_provider_size = std::mem::size_of::<KmsKeyProvider>();
     let _memory_provider_size = std::mem::size_of::<MemoryKeyProvider>();
     let _tls_builder_size = std::mem::size_of::<TlsConfigBuilder>();
