@@ -923,6 +923,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `opc-key` custody remain later #334 slices.
 
 ### Fixed
+- **Heap-aware NETCONF notification queue budgets — `opc-config-model` /
+  `opc-config-bus` / `opc-netconf-server`:** config-change subscriptions now
+  charge both retained snapshots, every heap-backed delta, and changed-path
+  capacity in the existing bounded subscriber queue before enqueue.
+  `DisconnectOnLag` rejects a single oversized, unsizeable, or
+  arithmetic-overflowing event without disturbing already queued order;
+  byte pressure follows all existing lag policies and releases charges on
+  dequeue, replacement, and receiver drop. The limit is a conservative
+  accounting bound that double-counts shared allocations and excludes
+  allocator metadata, `Arc` control blocks, and queue spare capacity.
+  `OpcConfig` gains source-compatible default-`None` snapshot/delta sizing
+  hooks; notification-enabled implementations must implement both or their
+  byte-budgeted stream disconnects fail-closed with a stable value-free reason.
+  Count-only subscribers remain unchanged (#496).
 - **Linux 6.8 GTP-U eBPF verifier compatibility — `opc-gtpu-dataplane`:**
   reduces the bounded checksum callback frame so the complete downlink call
   chain remains below Linux 6.8's cumulative 512-byte BPF stack limit without

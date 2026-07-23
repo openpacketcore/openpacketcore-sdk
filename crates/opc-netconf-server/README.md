@@ -135,6 +135,23 @@ Implemented scope:
   them.
 - TLS and SSH listener entry points with authenticated principal mapping.
 
+NETCONF config-change subscriptions use `DisconnectOnLag` with both the
+existing event-count cap and `MgmtLimits::max_subscriber_queue_bytes`. The byte
+limit is the config bus's conservative accounting bound: it includes both
+heap-backed snapshots, deltas, and changed-path storage without cloning values,
+but excludes allocator metadata, `Arc` control blocks, and queue spare
+capacity. Shared allocations are deliberately charged in full per event. An
+event larger than the whole budget disconnects before enqueue; already queued
+events retain their original order and remain drainable.
+
+Migration: the additive `OpcConfig` retained-size hooks default to `None`, so
+existing implementations remain source-compatible. A notification-enabled
+implementation must now implement both snapshot and delta hooks. Otherwise its
+byte-budgeted NETCONF subscriber disconnects predictably on the first
+unsizeable config-change event with the value-free
+`retained-size-unavailable` reason. The server never falls back to shallow
+`size_of` accounting.
+
 Limitations:
 
 - No generic XML projection engine; generated or CNF-specific bindings must

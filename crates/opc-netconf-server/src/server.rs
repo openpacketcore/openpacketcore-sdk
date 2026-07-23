@@ -98,7 +98,7 @@ const NETCONF_CREATE_SUBSCRIPTION_PATH: &str = "/ncn:create-subscription";
 const NETCONF_NOTIFICATION_STREAM: &str = "NETCONF";
 const NETCONF_NOTIFICATION_NS: &str = "urn:ietf:params:xml:ns:netconf:notification:1.0";
 const NETCONF_CONFIG_CHANGE_NS: &str = "urn:ietf:params:xml:ns:yang:ietf-netconf-notifications";
-const MIN_NOTIFICATION_EVENT_BYTES_ESTIMATE: usize = 4096;
+const MIN_NOTIFICATION_COUNT_SLOT_BYTES: usize = 4096;
 const MAX_NOTIFICATION_EVENT_CAPACITY: usize = 4096;
 const DEFAULT_CONFIRMED_COMMIT_TIMEOUT_SECS: u32 = 600;
 
@@ -1503,9 +1503,10 @@ where
             ));
         }
 
-        let receiver = self.binding.config_bus().subscribe(
+        let receiver = self.binding.config_bus().subscribe_with_byte_budget(
             SubscriberLagPolicy::DisconnectOnLag,
             notification_capacity::<C>(limits),
+            limits.max_subscriber_queue_bytes,
         );
         record_rpc_success(metric_operation, context.started.elapsed());
         RpcSessionHandlingResult::with_action(
@@ -5895,15 +5896,17 @@ fn schema_node_paths(paths: &[&'static str]) -> Vec<SchemaNodePath> {
         .collect::<Vec<_>>()
 }
 
-fn notification_event_bytes_estimate<C: OpcConfig>() -> usize {
+// Secondary count-cap sizing only. The enforced retained-byte charge is
+// computed from each concrete ConfigEvent by opc-config-bus before enqueue.
+fn notification_count_slot_bytes<C: OpcConfig>() -> usize {
     std::mem::size_of::<ConfigEvent<C>>()
         .saturating_add(std::mem::size_of::<C>().saturating_mul(2))
         .saturating_add(std::mem::size_of::<C::Delta>())
-        .max(MIN_NOTIFICATION_EVENT_BYTES_ESTIMATE)
+        .max(MIN_NOTIFICATION_COUNT_SLOT_BYTES)
 }
 
 fn notification_capacity<C: OpcConfig>(limits: &MgmtLimits) -> usize {
-    (limits.max_subscriber_queue_bytes / notification_event_bytes_estimate::<C>())
+    (limits.max_subscriber_queue_bytes / notification_count_slot_bytes::<C>())
         .clamp(1, MAX_NOTIFICATION_EVENT_CAPACITY)
 }
 
@@ -6120,6 +6123,18 @@ mod tests {
             Ok(paths)
         }
 
+        fn subscriber_snapshot_retained_size_bytes(&self) -> Option<usize> {
+            Some(
+                std::mem::size_of::<Self>()
+                    .saturating_add(self.hostname.capacity())
+                    .saturating_add(self.secret.capacity()),
+            )
+        }
+
+        fn subscriber_delta_retained_size_bytes(_delta: &Self::Delta) -> Option<usize> {
+            Some(std::mem::size_of::<Self::Delta>())
+        }
+
         fn apply_delta(&mut self, _delta: Self::Delta) -> Result<(), ConfigError> {
             Ok(())
         }
@@ -6158,6 +6173,14 @@ mod tests {
             _deltas: &[Self::Delta],
         ) -> Result<Vec<YangPath>, ConfigError> {
             Ok(Vec::new())
+        }
+
+        fn subscriber_snapshot_retained_size_bytes(&self) -> Option<usize> {
+            Some(std::mem::size_of::<Self>())
+        }
+
+        fn subscriber_delta_retained_size_bytes(_delta: &Self::Delta) -> Option<usize> {
+            Some(std::mem::size_of::<Self::Delta>())
         }
 
         fn apply_delta(&mut self, _delta: Self::Delta) -> Result<(), ConfigError> {
@@ -7712,13 +7735,13 @@ mod tests {
     }
 
     #[test]
-    fn notification_capacity_uses_config_specific_event_estimate() {
+    fn notification_count_capacity_preserves_inline_secondary_limit() {
         let limits = MgmtLimits {
             max_subscriber_queue_bytes: 64 * 1024,
             ..MgmtLimits::default()
         };
 
-        let estimate = notification_event_bytes_estimate::<LargeNotificationConfig>();
+        let estimate = notification_count_slot_bytes::<LargeNotificationConfig>();
         let capacity = notification_capacity::<LargeNotificationConfig>(&limits);
 
         assert!(estimate > 4096);
@@ -9049,6 +9072,39 @@ mod tests {
 
         let (server, _bus, _audit) = server_fixture_with_notifications().await;
         assert!(server.server_hello(None).contains(NOTIFICATION_1_0));
+    }
+
+    #[tokio::test]
+    async fn notification_subscription_installs_retained_byte_budget() {
+        let (server, _bus, _audit) = server_fixture_with_notifications().await;
+        let registry = SessionRegistry::new();
+        let _registration = registry.register(1).expect("register session");
+        let limits = MgmtLimits {
+            max_subscriber_queue_bytes: 32 * 1024,
+            ..MgmtLimits::default()
+        };
+
+        let result = server
+            .handle_rpc_for_session_with_action_async(
+                RequestId::new(),
+                &principal(),
+                &create_subscription_rpc("700"),
+                &limits,
+                1,
+                &registry,
+                0,
+            )
+            .await;
+        let Some(RpcSessionAction::StartNetconfNotifications(receiver)) = result.action else {
+            panic!("expected notification receiver");
+        };
+
+        assert_eq!(
+            receiver.retained_byte_budget(),
+            Some(limits.max_subscriber_queue_bytes)
+        );
+        assert_eq!(receiver.retained_bytes(), 0);
+        assert!(!receiver.is_closed());
     }
 
     #[tokio::test]

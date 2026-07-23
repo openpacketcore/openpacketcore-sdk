@@ -562,8 +562,8 @@ pub struct ConfigChange<C: OpcConfig> {
     pub version: ConfigVersion,
     pub previous: std::sync::Arc<C>,
     pub current: std::sync::Arc<C>,
-    pub deltas: Vec<C::Delta>,
-    pub changed_paths: Vec<YangPath>,
+    pub deltas: std::sync::Arc<[C::Delta]>,
+    pub changed_paths: std::sync::Arc<[YangPath]>,
 }
 ```
 
@@ -574,6 +574,22 @@ cannot block publication of future commits. Each subscriber must choose one of:
 - `drop_newest`
 - `disconnect_on_lag`
 - `force_resync`
+
+Byte-budgeted channels MUST charge an event before accepting it. The
+conservative charge includes both retained snapshots, all deltas, and changed
+paths. Config-model estimates include inline values and owned heap capacities
+in bytes (for example `Vec<T>::capacity() * size_of::<T>()`, using checked or
+saturating arithmetic) without cloning or serializing values. An unavailable
+estimate, arithmetic overflow, or a single event larger than the full budget
+engages the subscriber's lag policy; it MUST NOT fall back to shallow
+`size_of` accounting. `disconnect_on_lag` preserves the order of events
+already accepted and rejects the overflowing event before retention.
+
+The byte limit is a conservative accounting bound rather than a strict
+allocator-resident-memory bound. Shared allocations are charged in full for
+each event occurrence. Allocator metadata, reference-count control blocks, and
+queue spare capacity are excluded and MUST be documented by management
+protocol adapters.
 
 Critical NF subsystems that cannot tolerate missed notifications MUST expose a
 resync method and compare local applied version against `ConfigBus::version()`.
