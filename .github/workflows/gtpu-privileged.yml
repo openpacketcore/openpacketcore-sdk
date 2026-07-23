@@ -91,6 +91,10 @@ jobs:
       # exact attached-program/pinned-map identity and per-CPU counter sums,
       # byte-compatible unmarked traffic, drained legacy schema adoption and
       # populated endpoint-unbound fail-closed migration,
+      # grouped dual-stack lifecycle across every inner/outer family pairing,
+      # mandatory outer-IPv6 UDP checksum validation, exact IPv4/IPv6 PMTU and
+      # fragment handling, generation-safe replacement, restart adoption, and
+      # both-family removal,
       # unknown-mark/TEID drops, echo passthrough, restore/adoption, and
       # ownership-safe teardown (no opc_gtpu filters or pins left behind;
       # already-visible foreign filters are preserved).

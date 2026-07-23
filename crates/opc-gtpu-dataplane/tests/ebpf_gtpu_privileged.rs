@@ -46,7 +46,7 @@ use std::cell::RefCell;
 use std::env;
 use std::fs;
 use std::io::{self, IoSliceMut, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
@@ -63,37 +63,44 @@ use aya::{Ebpf, EbpfLoader};
 use nix::libc;
 use nix::{setsockopt_impl, sockopt_impl};
 use opc_gtpu_dataplane::{
-    reassembly_commit_authorizes_graph, CreateGtpDeviceRequest, CurrentEbpfGraphRecoveryOutcome,
-    CurrentEbpfGraphRecoveryRefusal, CurrentEbpfGraphRecoveryRequest, CurrentEbpfGraphWriterProof,
-    DrainedV2TeardownOutcome, DrainedV2TeardownRefusal, DrainedV2TeardownRequest, DscpCodepoint,
-    EbpfGtpuDataplaneBackend, EbpfGtpuDataplaneBackendConfig, GtpBearerMark, GtpDevice,
-    GtpPdpContext, GtpVersion, GtpuCapability, GtpuDataplaneBackend, GtpuError,
-    GtpuOuterFragmentPolicy, GtpuReassemblyConsumer, GtpuReassemblyDrop,
+    reassembly_commit_authorizes_graph, CreateGtpDeviceEndpointSetRequest, CreateGtpDeviceRequest,
+    CurrentEbpfGraphRecoveryOutcome, CurrentEbpfGraphRecoveryRefusal,
+    CurrentEbpfGraphRecoveryRequest, CurrentEbpfGraphWriterProof, DrainedV2TeardownOutcome,
+    DrainedV2TeardownRefusal, DrainedV2TeardownRequest, DscpCodepoint, EbpfGtpuDataplaneBackend,
+    EbpfGtpuDataplaneBackendConfig, GtpBearerMark, GtpDevice, GtpPdpContext, GtpVersion,
+    GtpuCapability, GtpuDataplaneBackend, GtpuDownlinkFragmentContract, GtpuError,
+    GtpuLocalEndpointSet, GtpuOuterFragmentPolicy, GtpuReassemblyConsumer, GtpuReassemblyDrop,
     GtpuReassemblyGraphIdentity, GtpuReassemblyOutcome, GtpuReassemblyPdr, GtpuReassemblySelector,
-    GtpuReassemblySocket, GtpuSourcePortPolicy, GtpuUplinkMtuPolicy, GtpuUplinkSourcePortPolicy,
-    GtpuV2DrainProof, PdpContextIndeterminateReason, PdpContextInstallOutcome,
-    PdpContextLocalTeidSelector, PdpContextReadback, PdpContextRemovalOutcome, PdpContextSelector,
-    PdpContextSelectorOccupancy, PdpContextUplinkSelector, RemovePdpContextRequest, Teid,
+    GtpuReassemblySocket, GtpuSessionAttachmentSelector, GtpuSessionDeviceId, GtpuSessionEntry,
+    GtpuSessionGroup, GtpuSessionGroupId, GtpuSessionGroupReadback,
+    GtpuSessionGroupReconcileOutcome, GtpuSessionGroupReconcileRequest,
+    GtpuSessionGroupRemovalOutcome, GtpuSessionGroupSelector, GtpuSessionSelectorProvenance,
+    GtpuSourcePortPolicy, GtpuUplinkChecksumOffloadContract, GtpuUplinkMtuPolicy,
+    GtpuUplinkSourcePortPolicy, GtpuV2DrainProof, PdpContextIndeterminateReason,
+    PdpContextInstallOutcome, PdpContextLocalTeidSelector, PdpContextReadback,
+    PdpContextRemovalOutcome, PdpContextSelector, PdpContextSelectorOccupancy,
+    PdpContextUplinkSelector, RemovePdpContextRequest, Teid,
 };
 use opc_gtpu_ebpf_common::{
-    internet_checksum, ipv4_header_checksum, udp_ipv4_checksum, DownlinkEndpointBinding,
-    DownlinkPdr, GtpuEndpointAddress, MarkedBearerOwner, MarkedBearerOwnerPhase, MarkedDownlinkPdr,
-    PdpContextCommit, UplinkFar, UplinkFarKey, COUNTER_DL_BINDING_FAMILY_MISMATCH,
-    COUNTER_DL_BINDING_INGRESS_MISMATCH, COUNTER_DL_BINDING_INVALID,
-    COUNTER_DL_BINDING_LOCAL_MISMATCH, COUNTER_DL_BINDING_PEER_MISMATCH,
-    COUNTER_DL_BINDING_SOURCE_PORT_MISMATCH, COUNTER_DL_DECAP, COUNTER_DL_DST_MISMATCH,
-    COUNTER_DL_MALFORMED, COUNTER_DL_UNKNOWN_TEID, COUNTER_UL_ENCAP, COUNTER_UL_FAR_MISS,
-    COUNTER_UL_MTU_REJECT, COUNTER_UL_PMTU_CORRUPT, DOWNLINK_ENDPOINT_BINDING_VALUE_LEN,
-    DOWNLINK_PDR_VALUE_LEN, ETH_HDR_LEN, GTPU_MANDATORY_HDR_LEN, IPV4_MIN_HDR_LEN, MAP_CONFIG,
-    MAP_COUNTERS, MAP_DOWNLINK_BINDING_COUNTERS, MAP_DOWNLINK_ENDPOINT_BINDING,
-    MAP_DOWNLINK_MARK_PDR, MAP_DOWNLINK_PDR, MAP_MARKED_BEARER_OWNER, MAP_UPLINK_DSCP,
-    MAP_UPLINK_FAR, MAP_UPLINK_MARK_DSCP, MAP_UPLINK_MARK_FAR, MAP_UPLINK_MARK_SOURCE_PORT,
-    MAP_UPLINK_PMTU, MAP_UPLINK_PMTU_COUNTERS, MAP_UPLINK_SOURCE_PORT,
-    MARKED_BEARER_OWNER_VALUE_LEN, MARKED_DOWNLINK_PDR_VALUE_LEN, PROG_DOWNLINK, PROG_UPLINK,
-    UDP_HDR_LEN, UPLINK_BEARER_SCHEMA_MARKER_VALUE, UPLINK_DSCP_SCHEMA_MARKER_KEY,
-    UPLINK_DSCP_SCHEMA_MARKER_VALUE, UPLINK_DSCP_VALUE_LEN, UPLINK_FAR_VALUE_LEN,
-    UPLINK_MARK_KEY_LEN, UPLINK_PMTU_SCHEMA_MARKER_VALUE, UPLINK_PMTU_VALUE_LEN,
-    UPLINK_SOURCE_PORT_VALUE_LEN,
+    internet_checksum, ipv4_header_checksum, udp_ipv4_checksum, udp_ipv6_checksum,
+    udp_ipv6_checksum_is_valid, DownlinkEndpointBinding, DownlinkPdr, GtpuEndpointAddress,
+    MarkedBearerOwner, MarkedBearerOwnerPhase, MarkedDownlinkPdr, PdpContextCommit, UplinkFar,
+    UplinkFarKey, COUNTER_DL_BINDING_FAMILY_MISMATCH, COUNTER_DL_BINDING_INGRESS_MISMATCH,
+    COUNTER_DL_BINDING_INVALID, COUNTER_DL_BINDING_LOCAL_MISMATCH,
+    COUNTER_DL_BINDING_PEER_MISMATCH, COUNTER_DL_BINDING_SOURCE_PORT_MISMATCH, COUNTER_DL_DECAP,
+    COUNTER_DL_DST_MISMATCH, COUNTER_DL_MALFORMED, COUNTER_DL_UNKNOWN_TEID, COUNTER_UL_ENCAP,
+    COUNTER_UL_FAR_MISS, COUNTER_UL_MTU_REJECT, COUNTER_UL_PMTU_CORRUPT,
+    DOWNLINK_ENDPOINT_BINDING_VALUE_LEN, DOWNLINK_PDR_VALUE_LEN, ETH_HDR_LEN,
+    GTPU_MANDATORY_HDR_LEN, IPV4_MIN_HDR_LEN, MAP_CONFIG, MAP_CONFIG_IPV6, MAP_COUNTERS,
+    MAP_DOWNLINK_BINDING_COUNTERS, MAP_DOWNLINK_ENDPOINT_BINDING, MAP_DOWNLINK_MARK_PDR,
+    MAP_DOWNLINK_PDR, MAP_MARKED_BEARER_OWNER, MAP_SESSION_DOWNLINK_INDEX, MAP_SESSION_GROUPS,
+    MAP_SESSION_UPLINK_INDEX, MAP_UPLINK_DSCP, MAP_UPLINK_FAR, MAP_UPLINK_MARK_DSCP,
+    MAP_UPLINK_MARK_FAR, MAP_UPLINK_MARK_SOURCE_PORT, MAP_UPLINK_PMTU, MAP_UPLINK_PMTU_COUNTERS,
+    MAP_UPLINK_SOURCE_PORT, MARKED_BEARER_OWNER_VALUE_LEN, MARKED_DOWNLINK_PDR_VALUE_LEN,
+    PROG_DOWNLINK, PROG_UPLINK, UDP_HDR_LEN, UPLINK_BEARER_SCHEMA_MARKER_VALUE,
+    UPLINK_DSCP_SCHEMA_MARKER_KEY, UPLINK_DSCP_SCHEMA_MARKER_VALUE, UPLINK_DSCP_VALUE_LEN,
+    UPLINK_FAR_VALUE_LEN, UPLINK_MARK_KEY_LEN, UPLINK_PMTU_SCHEMA_MARKER_VALUE,
+    UPLINK_PMTU_VALUE_LEN, UPLINK_SOURCE_PORT_VALUE_LEN,
 };
 use opc_ipsec_xfrm::{
     Algorithm, AuthAlgorithm, InstallPolicyRequest, InstallSaRequest, IpAddress, KeyMaterial,
@@ -114,11 +121,16 @@ const EPDG_S2BU_IP: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 1);
 const EPDG_S2BU_ALT_IP: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 2);
 const PGW_IP: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 10);
 const PGW_ALT_IP: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 11);
+const EPDG_S2BU_IPV6: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 2, 0, 0, 0, 0, 1);
+const PGW_IPV6: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 2, 0, 0, 0, 0, 0x10);
+const PGW_ALT_IPV6: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 2, 0, 0, 0, 0, 0x11);
 const EPDG_SWU_IP: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 1);
 const UE_SWU_IP: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 2);
 const AUTH_GTP_IP: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 10);
 const UE_PAA: Ipv4Addr = Ipv4Addr::new(10, 45, 0, 2);
+const UE_PAA_IPV6: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0x45, 0, 0, 0, 0, 2);
 const REMOTE_HOST: Ipv4Addr = Ipv4Addr::new(8, 8, 8, 8);
+const REMOTE_HOST_IPV6: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0xffff, 0, 0, 0, 0, 8);
 const LOCAL_TEID: u32 = 0x1000_0001;
 const PEER_TEID: u32 = 0x2000_0001;
 const MARK_A: u32 = 0x0001_0001;
@@ -129,6 +141,14 @@ const LOCAL_TEID_A: u32 = 0x1000_0002;
 const LOCAL_TEID_B: u32 = 0x1000_0003;
 const PEER_TEID_A: u32 = 0x2000_0002;
 const PEER_TEID_B: u32 = 0x2000_0003;
+const GROUP_LOCAL_TEID_V4_INITIAL: u32 = 0x6100_0001;
+const GROUP_PEER_TEID_V4_INITIAL: u32 = 0x6200_0001;
+const GROUP_LOCAL_TEID_V6_INITIAL: u32 = 0x6100_0002;
+const GROUP_PEER_TEID_V6_INITIAL: u32 = 0x6200_0002;
+const GROUP_LOCAL_TEID_V4_CROSSED: u32 = 0x7100_0001;
+const GROUP_PEER_TEID_V4_CROSSED: u32 = 0x7200_0001;
+const GROUP_LOCAL_TEID_V6_CROSSED: u32 = 0x7100_0002;
+const GROUP_PEER_TEID_V6_CROSSED: u32 = 0x7200_0002;
 const INBOUND_SPI_DEFAULT: u32 = 0x3000_0000;
 const INBOUND_SPI_A: u32 = 0x3000_0001;
 const OUTBOUND_SPI_DEFAULT: u32 = 0x4000_0001;
@@ -212,6 +232,23 @@ fn tc_filters(direction: &str) -> String {
         .expect("run tc filter show");
     assert!(output.status.success(), "tc filter show {direction} failed");
     String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+fn ipv6_host_discard_total() -> u64 {
+    fs::read_to_string("/proc/net/snmp6")
+        .expect("read IPv6 host counters")
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let name = fields.next()?;
+            let value = fields.next()?.parse::<u64>().ok()?;
+            matches!(
+                name,
+                "Ip6InHdrErrors" | "Ip6InDiscards" | "Ip6InUnknownProtos"
+            )
+            .then_some(value)
+        })
+        .fold(0_u64, u64::saturating_add)
 }
 
 fn command_stdout(program: &str, args: &[&str]) -> String {
@@ -445,10 +482,36 @@ impl TestNet {
 
         run("ip", &["addr", "add", "192.0.2.1/24", "dev", "s2bu"]);
         run("ip", &["addr", "add", "192.0.2.2/32", "dev", "s2bu"]);
+        run(
+            "ip",
+            &[
+                "-6",
+                "addr",
+                "add",
+                "2001:db8:2::1/64",
+                "dev",
+                "s2bu",
+                "nodad",
+            ],
+        );
         run("ip", &["link", "set", "s2bu", "up"]);
+        run("ethtool", &["-K", "s2bu", "tx", "off"]);
         run("ip", &["addr", "add", "10.45.0.1/24", "dev", "ue0"]);
         run("ip", &["addr", "add", "198.18.0.1/24", "dev", "ue0"]);
+        run(
+            "ip",
+            &[
+                "-6",
+                "addr",
+                "add",
+                "2001:db8:45::1/64",
+                "dev",
+                "ue0",
+                "nodad",
+            ],
+        );
         run("ip", &["link", "set", "ue0", "up"]);
+        run("ethtool", &["-K", "ue0", "tx", "off"]);
         run("tc", &["qdisc", "add", "dev", "ue0", "clsact"]);
         for (priority, source_port, mark) in [
             (10_u16, 5001_u16, MARK_A),
@@ -484,6 +547,17 @@ impl TestNet {
             );
         }
         run("ip", &["route", "add", "8.8.8.8/32", "via", "192.0.2.10"]);
+        run(
+            "ip",
+            &[
+                "-6",
+                "route",
+                "add",
+                "2001:db8:ffff::8/128",
+                "via",
+                "2001:db8:2::10",
+            ],
+        );
 
         run(
             "ip",
@@ -497,6 +571,20 @@ impl TestNet {
                 "s2bup",
             ],
         );
+        run(
+            "ip",
+            &[
+                "-n",
+                &pgw_ns,
+                "-6",
+                "addr",
+                "add",
+                "2001:db8:2::10/64",
+                "dev",
+                "s2bup",
+                "nodad",
+            ],
+        );
         run("ip", &["-n", &pgw_ns, "link", "set", "s2bup", "up"]);
         run(
             "ip",
@@ -508,6 +596,20 @@ impl TestNet {
                 "192.0.2.11/32",
                 "dev",
                 "s2bup",
+            ],
+        );
+        run(
+            "ip",
+            &[
+                "-n",
+                &pgw_ns,
+                "-6",
+                "addr",
+                "add",
+                "2001:db8:2::11/128",
+                "dev",
+                "s2bup",
+                "nodad",
             ],
         );
         // A veth peer can otherwise present locally generated UDP at tc
@@ -525,6 +627,20 @@ impl TestNet {
             "ip",
             &["-n", &pgw_ns, "addr", "add", "8.8.8.8/32", "dev", "lo"],
         );
+        run(
+            "ip",
+            &[
+                "-n",
+                &pgw_ns,
+                "-6",
+                "addr",
+                "add",
+                "2001:db8:ffff::8/128",
+                "dev",
+                "lo",
+                "nodad",
+            ],
+        );
 
         run(
             "ip",
@@ -534,14 +650,46 @@ impl TestNet {
             "ip",
             &["-n", &ue_ns, "addr", "add", "198.18.0.2/24", "dev", "ue1"],
         );
+        run(
+            "ip",
+            &[
+                "-n",
+                &ue_ns,
+                "-6",
+                "addr",
+                "add",
+                "2001:db8:45::2/64",
+                "dev",
+                "ue1",
+                "nodad",
+            ],
+        );
         run("ip", &["-n", &ue_ns, "link", "set", "ue1", "up"]);
+        run(
+            "ip",
+            &["netns", "exec", &ue_ns, "ethtool", "-K", "ue1", "tx", "off"],
+        );
         run("ip", &["-n", &ue_ns, "link", "set", "lo", "up"]);
         run(
             "ip",
             &["-n", &ue_ns, "route", "add", "default", "via", "10.45.0.1"],
         );
+        run(
+            "ip",
+            &[
+                "-n",
+                &ue_ns,
+                "-6",
+                "route",
+                "add",
+                "default",
+                "via",
+                "2001:db8:45::1",
+            ],
+        );
 
         fs::write("/proc/sys/net/ipv4/ip_forward", "1").expect("enable forwarding");
+        fs::write("/proc/sys/net/ipv6/conf/all/forwarding", "1").expect("enable IPv6 forwarding");
         for interface in ["all", "default", "s2bu", "ue0"] {
             let path = format!("/proc/sys/net/ipv4/conf/{interface}/rp_filter");
             fs::write(&path, "0").expect("relax rp_filter");
@@ -696,6 +844,114 @@ fn session_context(link_ifindex: u32) -> GtpPdpContext {
         egress_dscp: None,
         uplink_source_port_policy: GtpuUplinkSourcePortPolicy::LegacyServicePort,
     }
+}
+
+fn grouped_device_id() -> GtpuSessionDeviceId {
+    GtpuSessionDeviceId::new([0x34; 16]).expect("nonzero grouped device ID")
+}
+
+fn grouped_group_id() -> GtpuSessionGroupId {
+    GtpuSessionGroupId::new([0x44; 16]).expect("nonzero grouped session ID")
+}
+
+fn grouped_endpoints() -> GtpuLocalEndpointSet {
+    GtpuLocalEndpointSet::new(IpAddr::V4(EPDG_S2BU_IP), Some(IpAddr::V6(EPDG_S2BU_IPV6)))
+        .expect("canonical dual-stack endpoint authority")
+}
+
+fn grouped_device_request(policy: GtpuUplinkMtuPolicy) -> CreateGtpDeviceEndpointSetRequest {
+    let mut request = CreateGtpDeviceRequest::new("s2bu");
+    request.uplink_mtu_policy = Some(policy);
+    CreateGtpDeviceEndpointSetRequest::new(request, grouped_device_id(), grouped_endpoints())
+        .expect("canonical grouped device request")
+}
+
+fn grouped_entry(
+    link_ifindex: u32,
+    inner: IpAddr,
+    local_outer: IpAddr,
+    peer_outer: IpAddr,
+    local_teid: u32,
+    peer_teid: u32,
+) -> GtpuSessionEntry {
+    GtpuSessionEntry::new(
+        GtpPdpContext {
+            local_teid: Teid::new(local_teid).expect("nonzero grouped local TEID"),
+            peer_teid: Teid::new(peer_teid).expect("nonzero grouped peer TEID"),
+            ms_address: inner,
+            peer_address: peer_outer,
+            link_ifindex,
+            downlink_source_port_policy: GtpuSourcePortPolicy::Exact(GTPU_PORT),
+            gtp_version: GtpVersion::V1,
+            bearer_mark: None,
+            egress_dscp: None,
+            uplink_source_port_policy: GtpuUplinkSourcePortPolicy::LegacyServicePort,
+        },
+        local_outer,
+    )
+    .expect("canonical grouped entry")
+}
+
+fn initial_grouped_session(link_ifindex: u32) -> GtpuSessionGroup {
+    GtpuSessionGroup::new(
+        grouped_group_id(),
+        grouped_device_id(),
+        vec![
+            grouped_entry(
+                link_ifindex,
+                IpAddr::V4(UE_PAA),
+                IpAddr::V4(EPDG_S2BU_IP),
+                IpAddr::V4(PGW_IP),
+                GROUP_LOCAL_TEID_V4_INITIAL,
+                GROUP_PEER_TEID_V4_INITIAL,
+            ),
+            grouped_entry(
+                link_ifindex,
+                IpAddr::V6(UE_PAA_IPV6),
+                IpAddr::V6(EPDG_S2BU_IPV6),
+                IpAddr::V6(PGW_IPV6),
+                GROUP_LOCAL_TEID_V6_INITIAL,
+                GROUP_PEER_TEID_V6_INITIAL,
+            ),
+        ],
+    )
+    .expect("canonical initial dual-stack group")
+}
+
+fn crossed_grouped_session(link_ifindex: u32) -> GtpuSessionGroup {
+    GtpuSessionGroup::new(
+        grouped_group_id(),
+        grouped_device_id(),
+        vec![
+            grouped_entry(
+                link_ifindex,
+                IpAddr::V4(UE_PAA),
+                IpAddr::V6(EPDG_S2BU_IPV6),
+                IpAddr::V6(PGW_ALT_IPV6),
+                GROUP_LOCAL_TEID_V4_CROSSED,
+                GROUP_PEER_TEID_V4_CROSSED,
+            ),
+            grouped_entry(
+                link_ifindex,
+                IpAddr::V6(UE_PAA_IPV6),
+                IpAddr::V4(EPDG_S2BU_IP),
+                IpAddr::V4(PGW_ALT_IP),
+                GROUP_LOCAL_TEID_V6_CROSSED,
+                GROUP_PEER_TEID_V6_CROSSED,
+            ),
+        ],
+    )
+    .expect("canonical crossed dual-stack group")
+}
+
+fn fresh_grouped_reconcile(group: GtpuSessionGroup) -> GtpuSessionGroupReconcileRequest {
+    GtpuSessionGroupReconcileRequest::new(group, GtpuSessionSelectorProvenance::Fresh)
+        .expect("fresh grouped selector provenance")
+}
+
+fn grouped_attachment(device: &GtpDevice) -> GtpuSessionAttachmentSelector {
+    GtpuSessionAttachmentSelector::new(grouped_device_id(), device.clone(), grouped_endpoints())
+        .expect("exact grouped attachment selector")
 }
 
 fn marked_session_context(link_ifindex: u32) -> GtpPdpContext {
@@ -1006,6 +1262,150 @@ fn capture_nat_t_esp_spi(capture: &OwnedFd) -> u32 {
     }
 }
 
+fn capture_grouped_outer_ipv6(
+    capture: &OwnedFd,
+    expected_source: Ipv6Addr,
+    expected_destination: Ipv6Addr,
+    expected_teid: u32,
+    expected_inner: &[u8],
+) {
+    use nix::sys::socket::{recv, MsgFlags};
+
+    let expected_gpdu = build_gpdu(expected_teid, None, expected_inner);
+    let mut frame = vec![0_u8; 65_536];
+    loop {
+        let length = recv(capture.as_raw_fd(), &mut frame, MsgFlags::empty())
+            .expect("receive grouped outer IPv6 frame before timeout");
+        if length < ETH_HDR_LEN + 40 + UDP_HDR_LEN + GTPU_MANDATORY_HDR_LEN
+            || frame[12..14] != 0x86dd_u16.to_be_bytes()
+        {
+            continue;
+        }
+        let ip = ETH_HDR_LEN;
+        if frame[ip] >> 4 != 6
+            || frame[ip + 6] != IPPROTO_UDP
+            || frame[ip + 8..ip + 24] != expected_source.octets()
+            || frame[ip + 24..ip + 40] != expected_destination.octets()
+        {
+            continue;
+        }
+        let payload_length = usize::from(u16::from_be_bytes([frame[ip + 4], frame[ip + 5]]));
+        let ip_end = ip + 40 + payload_length;
+        if ip_end > length {
+            continue;
+        }
+        let udp = ip + 40;
+        let udp_length = usize::from(u16::from_be_bytes([frame[udp + 4], frame[udp + 5]]));
+        if frame[udp..udp + 2] != GTPU_PORT.to_be_bytes()
+            || frame[udp + 2..udp + 4] != GTPU_PORT.to_be_bytes()
+            || udp + udp_length != ip_end
+            || frame[udp + UDP_HDR_LEN..ip_end] != expected_gpdu
+        {
+            continue;
+        }
+        let checksum = u16::from_be_bytes([frame[udp + 6], frame[udp + 7]]);
+        assert_ne!(checksum, 0, "outer IPv6 UDP checksum is mandatory");
+        let mut checksum_input = frame[udp..ip_end].to_vec();
+        checksum_input[6..8].fill(0);
+        let expected_checksum = udp_ipv6_checksum(
+            expected_source.octets(),
+            expected_destination.octets(),
+            &checksum_input,
+        )
+        .expect("captured bounded IPv6 UDP datagram");
+        assert_eq!(
+            checksum, expected_checksum,
+            "captured outer IPv6 UDP checksum must equal independent recomputation"
+        );
+        assert!(
+            udp_ipv6_checksum_is_valid(
+                expected_source.octets(),
+                expected_destination.octets(),
+                &frame[udp..ip_end],
+            ),
+            "captured outer IPv6 UDP checksum must independently validate"
+        );
+        return;
+    }
+}
+
+fn capture_inner_udp_packet(
+    capture: &OwnedFd,
+    source: IpAddr,
+    destination: IpAddr,
+    source_port: u16,
+    destination_port: u16,
+    expected_payload: &[u8],
+) -> Vec<u8> {
+    use nix::sys::socket::{recv, MsgFlags};
+
+    let mut frame = vec![0_u8; 65_536];
+    loop {
+        let length = recv(capture.as_raw_fd(), &mut frame, MsgFlags::empty())
+            .expect("receive inner packet before timeout");
+        if length < ETH_HDR_LEN + IPV4_MIN_HDR_LEN + UDP_HDR_LEN {
+            continue;
+        }
+        let ip = ETH_HDR_LEN;
+        let (ip_end, udp) = match (source, destination) {
+            (IpAddr::V4(source), IpAddr::V4(destination))
+                if frame[12..14] == 0x0800_u16.to_be_bytes()
+                    && frame[ip] >> 4 == 4
+                    && frame[ip + 12..ip + 16] == source.octets()
+                    && frame[ip + 16..ip + 20] == destination.octets() =>
+            {
+                let ihl = usize::from(frame[ip] & 0x0f) * 4;
+                let total = usize::from(u16::from_be_bytes([frame[ip + 2], frame[ip + 3]]));
+                (ip + total, ip + ihl)
+            }
+            (IpAddr::V6(source), IpAddr::V6(destination))
+                if frame[12..14] == 0x86dd_u16.to_be_bytes()
+                    && frame[ip] >> 4 == 6
+                    && frame[ip + 6] == IPPROTO_UDP
+                    && frame[ip + 8..ip + 24] == source.octets()
+                    && frame[ip + 24..ip + 40] == destination.octets() =>
+            {
+                let payload = usize::from(u16::from_be_bytes([frame[ip + 4], frame[ip + 5]]));
+                (ip + 40 + payload, ip + 40)
+            }
+            _ => continue,
+        };
+        if ip_end > length
+            || udp + UDP_HDR_LEN > ip_end
+            || frame[udp..udp + 2] != source_port.to_be_bytes()
+            || frame[udp + 2..udp + 4] != destination_port.to_be_bytes()
+            || &frame[udp + UDP_HDR_LEN..ip_end] != expected_payload
+        {
+            continue;
+        }
+        let mut packet = frame[ip..ip_end].to_vec();
+        match packet[0] >> 4 {
+            4 => {
+                assert!(packet[8] > 0, "captured IPv4 packet has usable TTL");
+                packet[8] -= 1;
+                let header_len = usize::from(packet[0] & 0x0f) * 4;
+                packet[10..12].fill(0);
+                let checksum = internet_checksum(&packet[..header_len]);
+                packet[10..12].copy_from_slice(&checksum.to_be_bytes());
+            }
+            6 => {
+                assert!(packet[7] > 0, "captured IPv6 packet has usable hop limit");
+                packet[7] -= 1;
+            }
+            _ => unreachable!("capture filter accepts only IPv4 or IPv6"),
+        }
+        return packet;
+    }
+}
+
+fn assert_exact_gpdu(payload: &[u8], expected_teid: u32, expected_inner: &[u8]) {
+    assert_eq!(
+        payload,
+        build_gpdu(expected_teid, None, expected_inner),
+        "received G-PDU must preserve the selected TEID and exact inner packet"
+    );
+}
+
 /// Build an inner IPv4/UDP packet as it would leave the PGW toward the UE.
 fn build_inner_udp(
     src: Ipv4Addr,
@@ -1030,6 +1430,45 @@ fn build_inner_udp(
     packet[22..24].copy_from_slice(&dport.to_be_bytes());
     packet[24..26].copy_from_slice(&(udp_len as u16).to_be_bytes());
     packet[28..].copy_from_slice(payload);
+    packet
+}
+
+/// Build an inner IPv6/UDP packet with the mandatory UDP checksum
+/// independently materialized before it reaches the datapath.
+fn build_inner_udp_v6(
+    src: Ipv6Addr,
+    dst: Ipv6Addr,
+    sport: u16,
+    dport: u16,
+    payload: &[u8],
+) -> Vec<u8> {
+    let udp_len = UDP_HDR_LEN + payload.len();
+    let mut packet = vec![0_u8; 40 + udp_len];
+    packet[0] = 0x60;
+    packet[4..6].copy_from_slice(
+        &u16::try_from(udp_len)
+            .expect("bounded synthetic inner IPv6 payload")
+            .to_be_bytes(),
+    );
+    packet[6] = IPPROTO_UDP;
+    packet[7] = 64;
+    packet[8..24].copy_from_slice(&src.octets());
+    packet[24..40].copy_from_slice(&dst.octets());
+    packet[40..42].copy_from_slice(&sport.to_be_bytes());
+    packet[42..44].copy_from_slice(&dport.to_be_bytes());
+    packet[44..46].copy_from_slice(
+        &u16::try_from(udp_len)
+            .expect("bounded synthetic inner UDP length")
+            .to_be_bytes(),
+    );
+    packet[48..].copy_from_slice(payload);
+    let checksum = udp_ipv6_checksum(src.octets(), dst.octets(), &packet[40..])
+        .expect("bounded synthetic inner IPv6 UDP checksum");
+    packet[46..48].copy_from_slice(&checksum.to_be_bytes());
+    assert!(
+        udp_ipv6_checksum_is_valid(src.octets(), dst.octets(), &packet[40..]),
+        "synthetic inner IPv6 UDP checksum must validate independently"
+    );
     packet
 }
 
@@ -1468,6 +1907,53 @@ if sender.sendto(packet, (destination, 0)) != len(packet):
     );
 }
 
+/// Send one fully materialized IPv6 packet through the UE namespace. The
+/// explicit header and UDP checksum make this the positive path for the
+/// backend's `MaterializedOnly` outer-IPv6 checksum capability.
+fn send_raw_ipv6_packet(namespace: &str, packet: &[u8]) {
+    const PYTHON_SENDER: &str = r#"
+import socket
+import sys
+
+packet = sys.stdin.buffer.read()
+destination = socket.inet_ntop(socket.AF_INET6, packet[24:40])
+sender = socket.socket(socket.AF_INET6, socket.SOCK_RAW, socket.IPPROTO_RAW)
+# Linux UAPI IPV6_HDRINCL; Python does not expose this constant on every
+# distribution even though the kernel option is stable.
+sender.setsockopt(socket.IPPROTO_IPV6, 36, 1)
+if sender.sendto(packet, (destination, 0, 0, 0)) != len(packet):
+    raise SystemExit(1)
+"#;
+
+    let mut child = Command::new("ip")
+        .args(["netns", "exec", namespace, "python3", "-c", PYTHON_SENDER])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn materialized raw IPv6 sender");
+    child
+        .stdin
+        .take()
+        .expect("materialized raw IPv6 sender stdin")
+        .write_all(packet)
+        .expect("write synthetic IPv6 packet to materialized sender");
+    assert!(
+        child
+            .wait()
+            .expect("wait for materialized raw IPv6 sender")
+            .success(),
+        "materialized raw IPv6 sender failed"
+    );
+}
+
+fn forwarded_ipv6_packet(mut packet: Vec<u8>) -> Vec<u8> {
+    assert_eq!(packet[0] >> 4, 6);
+    assert!(packet[7] > 0, "synthetic IPv6 packet has usable hop limit");
+    packet[7] -= 1;
+    packet
+}
+
 fn build_outer_gtpu_frame(
     destination_mac: [u8; 6],
     source_mac: [u8; 6],
@@ -1522,6 +2008,155 @@ fn build_outer_gtpu_frame(
         frame[udp + 6..udp + 8].copy_from_slice(&udp_checksum.to_be_bytes());
     }
     frame
+}
+
+#[derive(Clone, Copy)]
+enum OuterIpv6Extension {
+    None,
+    AtomicFragment { identification: u32 },
+    DiscardRequiredDestinationOption,
+}
+
+fn outer_ipv6_extension(extension: OuterIpv6Extension) -> (u8, Vec<u8>) {
+    match extension {
+        OuterIpv6Extension::None => (IPPROTO_UDP, Vec::new()),
+        OuterIpv6Extension::AtomicFragment { identification } => {
+            let mut header = vec![0_u8; 8];
+            header[0] = IPPROTO_UDP;
+            header[4..8].copy_from_slice(&identification.to_be_bytes());
+            (44, header)
+        }
+        OuterIpv6Extension::DiscardRequiredDestinationOption => {
+            // Action bits 01 require an IPv6 node to discard this unknown
+            // option. It is intentionally outside the SDK's bounded GTP-U
+            // parser, which must return host-pass without moving SDK counters.
+            (60, vec![IPPROTO_UDP, 0, 0x40, 0, 1, 2, 0, 0])
+        }
+    }
+}
+
+fn build_outer_ipv6_gtpu_frame(
+    destination_mac: [u8; 6],
+    source_mac: [u8; 6],
+    source: Ipv6Addr,
+    destination: Ipv6Addr,
+    gtpu: &[u8],
+    extension: OuterIpv6Extension,
+) -> Vec<u8> {
+    let (next_header, extension) = outer_ipv6_extension(extension);
+    let udp_len = UDP_HDR_LEN + gtpu.len();
+    let payload_len = extension.len() + udp_len;
+    let ip_end = ETH_HDR_LEN + 40 + payload_len;
+    let mut frame = vec![0_u8; ip_end];
+    frame[..6].copy_from_slice(&destination_mac);
+    frame[6..12].copy_from_slice(&source_mac);
+    frame[12..14].copy_from_slice(&0x86dd_u16.to_be_bytes());
+
+    let ip = ETH_HDR_LEN;
+    frame[ip] = 0x60;
+    frame[ip + 4..ip + 6].copy_from_slice(
+        &u16::try_from(payload_len)
+            .expect("bounded synthetic outer IPv6 payload")
+            .to_be_bytes(),
+    );
+    frame[ip + 6] = next_header;
+    frame[ip + 7] = 64;
+    frame[ip + 8..ip + 24].copy_from_slice(&source.octets());
+    frame[ip + 24..ip + 40].copy_from_slice(&destination.octets());
+    frame[ip + 40..ip + 40 + extension.len()].copy_from_slice(&extension);
+
+    let udp = ip + 40 + extension.len();
+    frame[udp..udp + 2].copy_from_slice(&GTPU_PORT.to_be_bytes());
+    frame[udp + 2..udp + 4].copy_from_slice(&GTPU_PORT.to_be_bytes());
+    frame[udp + 4..udp + 6].copy_from_slice(
+        &u16::try_from(udp_len)
+            .expect("bounded synthetic outer IPv6 UDP length")
+            .to_be_bytes(),
+    );
+    frame[udp + UDP_HDR_LEN..ip_end].copy_from_slice(gtpu);
+    let checksum = udp_ipv6_checksum(source.octets(), destination.octets(), &frame[udp..ip_end])
+        .expect("bounded synthetic outer IPv6 UDP checksum");
+    frame[udp + 6..udp + 8].copy_from_slice(&checksum.to_be_bytes());
+    assert_ne!(checksum, 0, "outer IPv6 UDP checksum is mandatory");
+    assert!(
+        udp_ipv6_checksum_is_valid(source.octets(), destination.octets(), &frame[udp..ip_end],),
+        "synthetic outer IPv6 UDP checksum must validate independently"
+    );
+    frame
+}
+
+fn build_outer_ipv6_fragment_pair(
+    complete: &[u8],
+    first_fragmentable_len: usize,
+    identification: u32,
+) -> (Vec<u8>, Vec<u8>) {
+    let ip = ETH_HDR_LEN;
+    assert!(complete.len() >= ip + 40 + UDP_HDR_LEN);
+    assert_eq!(complete[12..14], 0x86dd_u16.to_be_bytes());
+    assert_eq!(complete[ip + 6], IPPROTO_UDP);
+    assert!(first_fragmentable_len > 0 && first_fragmentable_len.is_multiple_of(8));
+    let complete_payload_len =
+        usize::from(u16::from_be_bytes([complete[ip + 4], complete[ip + 5]]));
+    let fragmentable = &complete[ip + 40..ip + 40 + complete_payload_len];
+    assert!(first_fragmentable_len < fragmentable.len());
+
+    let build = |offset: usize, more: bool, payload: &[u8]| {
+        let mut frame = vec![0_u8; ETH_HDR_LEN + 40 + 8 + payload.len()];
+        frame[..ETH_HDR_LEN].copy_from_slice(&complete[..ETH_HDR_LEN]);
+        frame[ip..ip + 40].copy_from_slice(&complete[ip..ip + 40]);
+        frame[ip + 4..ip + 6].copy_from_slice(
+            &u16::try_from(8 + payload.len())
+                .expect("bounded synthetic IPv6 fragment payload")
+                .to_be_bytes(),
+        );
+        frame[ip + 6] = 44;
+        let fragment = ip + 40;
+        frame[fragment] = IPPROTO_UDP;
+        let offset_units = u16::try_from(offset / 8).expect("bounded fragment offset");
+        let offset_and_flags = (offset_units << 3) | u16::from(more);
+        frame[fragment + 2..fragment + 4].copy_from_slice(&offset_and_flags.to_be_bytes());
+        frame[fragment + 4..fragment + 8].copy_from_slice(&identification.to_be_bytes());
+        frame[fragment + 8..].copy_from_slice(payload);
+        frame
+    };
+
+    (
+        build(0, true, &fragmentable[..first_fragmentable_len]),
+        build(
+            first_fragmentable_len,
+            false,
+            &fragmentable[first_fragmentable_len..],
+        ),
+    )
+}
+
+fn outer_ipv6_udp_offset(frame: &[u8]) -> Option<usize> {
+    if frame.len() < ETH_HDR_LEN + 40 || frame[12..14] != 0x86dd_u16.to_be_bytes() {
+        return None;
+    }
+    let mut next_header = frame[ETH_HDR_LEN + 6];
+    let mut cursor = ETH_HDR_LEN + 40;
+    for _ in 0..4 {
+        match next_header {
+            IPPROTO_UDP => return Some(cursor),
+            44 => {
+                next_header = *frame.get(cursor)?;
+                cursor = cursor.checked_add(8)?;
+            }
+            0 | 43 | 60 => {
+                next_header = *frame.get(cursor)?;
+                let length = usize::from(*frame.get(cursor + 1)?)
+                    .checked_add(1)?
+                    .checked_mul(8)?;
+                cursor = cursor.checked_add(length)?;
+            }
+            _ => return None,
+        }
+        if cursor > frame.len() {
+            return None;
+        }
+    }
+    None
 }
 
 fn outer_udp_offset(frame: &[u8]) -> usize {
@@ -1596,6 +2231,39 @@ fn receive_raw_downlink(socket: &UdpSocket, expected: &[u8]) {
         .expect("validated raw GTP-U frame must decapsulate");
     assert_eq!(&buffer[..length], expected);
     assert_eq!(source, SocketAddr::from((REMOTE_HOST, 53)));
+}
+
+fn receive_grouped_downlink(
+    socket: &UdpSocket,
+    expected_source: SocketAddr,
+    expected_payload: &[u8],
+) {
+    let mut buffer = [0_u8; 2048];
+    socket
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set grouped downlink receive timeout");
+    let (length, source) = socket
+        .recv_from(&mut buffer)
+        .expect("authorized grouped G-PDU must decapsulate");
+    assert_eq!(source, expected_source);
+    assert_eq!(&buffer[..length], expected_payload);
+}
+
+fn receive_grouped_uplink(
+    socket: &UdpSocket,
+    expected_source: SocketAddr,
+    expected_teid: u32,
+    expected_inner: &[u8],
+) {
+    let mut buffer = vec![0_u8; 65_536];
+    socket
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set grouped uplink receive timeout");
+    let (length, source) = socket.recv_from(&mut buffer).unwrap_or_else(|error| {
+        panic!("authorized grouped uplink TEID {expected_teid:#010x} must encapsulate: {error}")
+    });
+    assert_eq!(source, expected_source);
+    assert_exact_gpdu(&buffer[..length], expected_teid, expected_inner);
 }
 
 async fn exercise_outer_envelope_validation(
@@ -2933,6 +3601,9 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
                 MAP_MARKED_BEARER_OWNER,
                 MAP_COUNTERS,
                 MAP_CONFIG,
+                MAP_SESSION_GROUPS,
+                MAP_SESSION_UPLINK_INDEX,
+                MAP_CONFIG_IPV6,
             ],
         ),
         "the live uplink program must reference the exact pinned maps read by diagnostics",
@@ -2954,6 +3625,9 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
                 MAP_DOWNLINK_BINDING_COUNTERS,
                 MAP_MARKED_BEARER_OWNER,
                 MAP_COUNTERS,
+                MAP_SESSION_GROUPS,
+                MAP_SESSION_DOWNLINK_INDEX,
+                MAP_CONFIG_IPV6,
             ],
         ),
         "the live downlink program must reference the exact pinned maps read by diagnostics",
@@ -4999,6 +5673,722 @@ async fn ebpf_gtpu_downlink_outer_fragments_reenter_sdk_consumer_exactly_once(
         "exactly the three valid sets decapsulated, once each"
     );
     assert_eq!(counters.malformed, 0);
+
+    drop(net);
+    Ok(())
+}
+
+#[tokio::test]
+// The serial guard is deliberately held for the entire test body; see
+// PRIVILEGED_TEST_LOCK.
+#[allow(clippy::await_holding_lock)]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn ebpf_gtpu_grouped_dual_stack_live_contract() -> Result<(), Box<dyn std::error::Error>> {
+    if env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref() != Ok("1") {
+        eprintln!("skipping: set OPC_GTPU_RUN_PRIVILEGED=1 inside a fresh privileged netns");
+        return Ok(());
+    }
+
+    let _serial = PRIVILEGED_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let net = TestNet::provision();
+    let config = EbpfGtpuDataplaneBackendConfig {
+        bpffs_pin_root: net.pin_root.clone(),
+        ..EbpfGtpuDataplaneBackendConfig::default()
+    };
+    let policy = GtpuUplinkMtuPolicy::new(1500, GtpuOuterFragmentPolicy::SignalPacketTooBig)
+        .expect("canonical dual-stack PMTU policy");
+    let backend = EbpfGtpuDataplaneBackend::with_config(config.clone());
+    let device = backend
+        .create_device_with_endpoints(grouped_device_request(policy))
+        .await?;
+    let capabilities = backend
+        .gtpu_ip_family_capabilities(grouped_attachment(&device))
+        .await?;
+    assert_eq!(capabilities.inner_ipv4, GtpuCapability::Available);
+    assert_eq!(capabilities.inner_ipv6, GtpuCapability::Available);
+    assert_eq!(capabilities.outer_ipv4, GtpuCapability::Available);
+    assert_eq!(capabilities.outer_ipv6, GtpuCapability::Available);
+    assert_eq!(
+        capabilities.grouped_atomic_reconciliation,
+        GtpuCapability::Available
+    );
+    assert_eq!(capabilities.local_endpoint_sets, GtpuCapability::Available);
+    assert_eq!(capabilities.ipv6_udp_checksum, GtpuCapability::Available);
+    assert_eq!(
+        capabilities.uplink_checksum_offload,
+        GtpuUplinkChecksumOffloadContract::MaterializedOnly
+    );
+    assert_eq!(
+        capabilities.downlink_outer_ipv4_fragment_handling,
+        GtpuDownlinkFragmentContract::Unsupported
+    );
+    assert_eq!(
+        capabilities.downlink_outer_ipv6_fragment_handling,
+        GtpuDownlinkFragmentContract::Unsupported
+    );
+
+    let initial = initial_grouped_session(device.ifindex);
+    assert_eq!(
+        backend
+            .reconcile_pdp_context_group(fresh_grouped_reconcile(initial.clone()))
+            .await?,
+        GtpuSessionGroupReconcileOutcome::Activated
+    );
+    assert_eq!(
+        backend
+            .read_pdp_context_group(GtpuSessionGroupSelector::new(
+                grouped_group_id(),
+                grouped_device_id(),
+            ))
+            .await?,
+        GtpuSessionGroupReadback::Active(initial.clone())
+    );
+
+    // Resolve outer neighbours before opening capture sockets so every
+    // subsequent single send is an exact one-packet counter assertion.
+    run("ping", &["-c", "1", "-W", "1", "192.0.2.10"]);
+    run("ping", &["-6", "-c", "1", "-W", "1", "2001:db8:2::10"]);
+
+    let pgw_v4 = in_netns(&net.pgw_ns, || {
+        UdpSocket::bind((PGW_IP, GTPU_PORT)).expect("bind initial PGW IPv4 GTP-U socket")
+    });
+    let pgw_v6 = in_netns(&net.pgw_ns, || {
+        UdpSocket::bind((PGW_IPV6, GTPU_PORT)).expect("bind initial PGW IPv6 GTP-U socket")
+    });
+    let ue_v4 = in_netns(&net.ue_ns, || {
+        UdpSocket::bind((UE_PAA, 5600)).expect("bind grouped UE IPv4 socket")
+    });
+    let ue_v6 = in_netns(&net.ue_ns, || {
+        UdpSocket::bind((UE_PAA_IPV6, 5601)).expect("bind grouped UE IPv6 socket")
+    });
+    let ue_capture = packet_capture_socket(&net.ue_ns);
+    let pgw_capture = packet_capture_socket(&net.pgw_ns);
+
+    // Initial group: both inner and outer families are live simultaneously.
+    let v4_uplink_payload = b"grouped-v4-inner-v4-outer";
+    ue_v4.send_to(v4_uplink_payload, (REMOTE_HOST, 53))?;
+    let v4_uplink_inner = capture_inner_udp_packet(
+        &ue_capture,
+        IpAddr::V4(UE_PAA),
+        IpAddr::V4(REMOTE_HOST),
+        5600,
+        53,
+        v4_uplink_payload,
+    );
+    receive_grouped_uplink(
+        &pgw_v4,
+        SocketAddr::from((EPDG_S2BU_IP, GTPU_PORT)),
+        GROUP_PEER_TEID_V4_INITIAL,
+        &v4_uplink_inner,
+    );
+
+    let v6_uplink_payload = b"grouped-v6-inner-v6-outer";
+    let v6_uplink_before = backend.datapath_snapshot(&device).await?;
+    let v6_uplink_sent =
+        build_inner_udp_v6(UE_PAA_IPV6, REMOTE_HOST_IPV6, 5601, 53, v6_uplink_payload);
+    send_raw_ipv6_packet(&net.ue_ns, &v6_uplink_sent);
+    let v6_uplink_inner = forwarded_ipv6_packet(v6_uplink_sent);
+    std::thread::sleep(Duration::from_millis(50));
+    let v6_uplink_after = backend.datapath_snapshot(&device).await?;
+    assert_eq!(
+        v6_uplink_after.counters.uplink_encapsulated,
+        v6_uplink_before.counters.uplink_encapsulated + 1,
+        "outer-IPv6 uplink must reach successful encapsulation: before={v6_uplink_before:?} after={v6_uplink_after:?}"
+    );
+    capture_grouped_outer_ipv6(
+        &pgw_capture,
+        EPDG_S2BU_IPV6,
+        PGW_IPV6,
+        GROUP_PEER_TEID_V6_INITIAL,
+        &v6_uplink_inner,
+    );
+    receive_grouped_uplink(
+        &pgw_v6,
+        SocketAddr::from((EPDG_S2BU_IPV6, GTPU_PORT)),
+        GROUP_PEER_TEID_V6_INITIAL,
+        &v6_uplink_inner,
+    );
+
+    let destination_mac = main_link_address("s2bu");
+    let source_mac = net.pgw_link_address("s2bup");
+
+    let v4_downlink_payload = b"grouped-downlink-v4";
+    let v4_downlink_inner = build_inner_udp(REMOTE_HOST, UE_PAA, 53, 5600, v4_downlink_payload);
+    let v4_downlink = build_outer_gtpu_frame(
+        destination_mac,
+        source_mac,
+        &[],
+        &build_gpdu(GROUP_LOCAL_TEID_V4_INITIAL, None, &v4_downlink_inner),
+        true,
+        0,
+    );
+    send_raw_gtpu_frame(
+        &net.pgw_ns,
+        "s2bup",
+        &v4_downlink,
+        RawChecksumMetadata::Unverified,
+    );
+    receive_grouped_downlink(
+        &ue_v4,
+        SocketAddr::from((REMOTE_HOST, 53)),
+        v4_downlink_payload,
+    );
+
+    let v6_downlink_payload = b"grouped-downlink-v6";
+    let v6_downlink_inner =
+        build_inner_udp_v6(REMOTE_HOST_IPV6, UE_PAA_IPV6, 53, 5601, v6_downlink_payload);
+    let v6_gpdu = build_gpdu(GROUP_LOCAL_TEID_V6_INITIAL, None, &v6_downlink_inner);
+    let v6_downlink = build_outer_ipv6_gtpu_frame(
+        destination_mac,
+        source_mac,
+        PGW_IPV6,
+        EPDG_S2BU_IPV6,
+        &v6_gpdu,
+        OuterIpv6Extension::None,
+    );
+    send_raw_gtpu_frame(
+        &net.pgw_ns,
+        "s2bup",
+        &v6_downlink,
+        RawChecksumMetadata::Unverified,
+    );
+    receive_grouped_downlink(
+        &ue_v6,
+        SocketAddr::from((REMOTE_HOST_IPV6, 53)),
+        v6_downlink_payload,
+    );
+
+    // An atomic IPv6 Fragment header is safe to parse without reassembly and
+    // must decapsulate through the same exact grouped selector.
+    let atomic_payload = b"grouped-atomic-fragment";
+    let atomic_inner = build_inner_udp_v6(REMOTE_HOST_IPV6, UE_PAA_IPV6, 53, 5601, atomic_payload);
+    let atomic = build_outer_ipv6_gtpu_frame(
+        destination_mac,
+        source_mac,
+        PGW_IPV6,
+        EPDG_S2BU_IPV6,
+        &build_gpdu(GROUP_LOCAL_TEID_V6_INITIAL, None, &atomic_inner),
+        OuterIpv6Extension::AtomicFragment {
+            identification: 0x3440_0001,
+        },
+    );
+    send_raw_gtpu_frame(
+        &net.pgw_ns,
+        "s2bup",
+        &atomic,
+        RawChecksumMetadata::Unverified,
+    );
+    receive_grouped_downlink(
+        &ue_v6,
+        SocketAddr::from((REMOTE_HOST_IPV6, 53)),
+        atomic_payload,
+    );
+
+    // A zero or corrupt mandatory outer IPv6 UDP checksum is a counted
+    // malformed drop before selector authorization.
+    let malformed_before = backend.datapath_snapshot(&device).await?;
+    let mut zero_checksum = v6_downlink.clone();
+    let zero_udp = outer_ipv6_udp_offset(&zero_checksum).expect("outer IPv6 UDP offset");
+    zero_checksum[zero_udp + 6..zero_udp + 8].fill(0);
+    send_raw_gtpu_frame(
+        &net.pgw_ns,
+        "s2bup",
+        &zero_checksum,
+        RawChecksumMetadata::Unverified,
+    );
+    expect_no_datagram(&ue_v6);
+
+    let mut corrupt_checksum = v6_downlink.clone();
+    let corrupt_udp = outer_ipv6_udp_offset(&corrupt_checksum).expect("outer IPv6 UDP offset");
+    corrupt_checksum[corrupt_udp + 6] ^= 0x80;
+    send_raw_gtpu_frame(
+        &net.pgw_ns,
+        "s2bup",
+        &corrupt_checksum,
+        RawChecksumMetadata::Unverified,
+    );
+    expect_no_datagram(&ue_v6);
+    let malformed_after = backend.datapath_snapshot(&device).await?;
+    assert_eq!(
+        malformed_after.counters.downlink_malformed,
+        malformed_before.counters.downlink_malformed + 2
+    );
+    assert_eq!(
+        malformed_after.counters.downlink_decapsulated,
+        malformed_before.counters.downlink_decapsulated
+    );
+
+    // A valid non-atomic fragment pair is passed to the host: Linux
+    // reassembles it and delivers the exact UDP/GTP payload to a local
+    // consumer. A discard-required option reaches the host IPv6 parser and
+    // moves a host discard counter. Neither path moves any SDK counter.
+    let host_pass_before = backend.datapath_snapshot(&device).await?;
+    let host_consumer =
+        UdpSocket::bind((EPDG_S2BU_IPV6, GTPU_PORT)).expect("bind host IPv6 GTP-U consumer");
+    host_consumer
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set host IPv6 GTP-U timeout");
+    let (non_atomic_first, non_atomic_second) =
+        build_outer_ipv6_fragment_pair(&v6_downlink, 48, 0x3440_0002);
+    send_raw_gtpu_frame(
+        &net.pgw_ns,
+        "s2bup",
+        &non_atomic_first,
+        RawChecksumMetadata::Unverified,
+    );
+    send_raw_gtpu_frame(
+        &net.pgw_ns,
+        "s2bup",
+        &non_atomic_second,
+        RawChecksumMetadata::Unverified,
+    );
+    let mut reassembled = vec![0_u8; 65_536];
+    let (reassembled_len, reassembled_source) = host_consumer
+        .recv_from(&mut reassembled)
+        .expect("host must receive reassembled outer IPv6 UDP/GTP");
+    assert_eq!(reassembled_source, SocketAddr::from((PGW_IPV6, GTPU_PORT)));
+    assert_eq!(&reassembled[..reassembled_len], v6_gpdu);
+
+    let host_discards_before = ipv6_host_discard_total();
+    let discard_option = build_outer_ipv6_gtpu_frame(
+        destination_mac,
+        source_mac,
+        PGW_IPV6,
+        EPDG_S2BU_IPV6,
+        &v6_gpdu,
+        OuterIpv6Extension::DiscardRequiredDestinationOption,
+    );
+    send_raw_gtpu_frame(
+        &net.pgw_ns,
+        "s2bup",
+        &discard_option,
+        RawChecksumMetadata::Unverified,
+    );
+    let discard_deadline = Instant::now() + Duration::from_secs(1);
+    while ipv6_host_discard_total() == host_discards_before && Instant::now() < discard_deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        ipv6_host_discard_total() > host_discards_before,
+        "discard-required option must reach the host IPv6 parser"
+    );
+    let host_pass_after = backend.datapath_snapshot(&device).await?;
+    assert_eq!(host_pass_after.counters, host_pass_before.counters);
+    expect_no_datagram(&ue_v6);
+
+    // Exact and one-byte-over PMTU boundaries use the selected outer family:
+    // 1500-36 for outer IPv4 and 1500-56 for outer IPv6.
+    let pmtu_before = backend.datapath_snapshot(&device).await?;
+    let exact_v4_payload = vec![b'4'; 1436];
+    ue_v4.send_to(&exact_v4_payload, (REMOTE_HOST, 53))?;
+    let exact_v4_inner = capture_inner_udp_packet(
+        &ue_capture,
+        IpAddr::V4(UE_PAA),
+        IpAddr::V4(REMOTE_HOST),
+        5600,
+        53,
+        &exact_v4_payload,
+    );
+    assert_eq!(exact_v4_inner.len(), 1500 - 36);
+    receive_grouped_uplink(
+        &pgw_v4,
+        SocketAddr::from((EPDG_S2BU_IP, GTPU_PORT)),
+        GROUP_PEER_TEID_V4_INITIAL,
+        &exact_v4_inner,
+    );
+
+    let exact_v6_payload = vec![b'6'; 1396];
+    let exact_v6_sent =
+        build_inner_udp_v6(UE_PAA_IPV6, REMOTE_HOST_IPV6, 5601, 53, &exact_v6_payload);
+    send_raw_ipv6_packet(&net.ue_ns, &exact_v6_sent);
+    let exact_v6_inner = forwarded_ipv6_packet(exact_v6_sent);
+    assert_eq!(exact_v6_inner.len(), 1500 - 56);
+    receive_grouped_uplink(
+        &pgw_v6,
+        SocketAddr::from((EPDG_S2BU_IPV6, GTPU_PORT)),
+        GROUP_PEER_TEID_V6_INITIAL,
+        &exact_v6_inner,
+    );
+    capture_grouped_outer_ipv6(
+        &pgw_capture,
+        EPDG_S2BU_IPV6,
+        PGW_IPV6,
+        GROUP_PEER_TEID_V6_INITIAL,
+        &exact_v6_inner,
+    );
+    let exact_after = backend.datapath_snapshot(&device).await?;
+    assert_eq!(
+        exact_after.counters.uplink_mtu_rejected,
+        pmtu_before.counters.uplink_mtu_rejected
+    );
+    assert_eq!(
+        exact_after.counters.uplink_encapsulated,
+        pmtu_before.counters.uplink_encapsulated + 2
+    );
+
+    let over_v4_payload = vec![b'x'; 1437];
+    ue_v4.send_to(&over_v4_payload, (REMOTE_HOST, 53))?;
+    expect_no_datagram(&pgw_v4);
+    let over_v6_payload = vec![b'y'; 1397];
+    let over_v6_sent =
+        build_inner_udp_v6(UE_PAA_IPV6, REMOTE_HOST_IPV6, 5601, 53, &over_v6_payload);
+    send_raw_ipv6_packet(&net.ue_ns, &over_v6_sent);
+    expect_no_datagram(&pgw_v6);
+    let over_after = backend.datapath_snapshot(&device).await?;
+    assert_eq!(
+        over_after.counters.uplink_mtu_rejected,
+        exact_after.counters.uplink_mtu_rejected + 2
+    );
+    assert_eq!(
+        over_after.counters.uplink_encapsulated,
+        exact_after.counters.uplink_encapsulated
+    );
+
+    // One atomic N -> N+1 reconciliation crosses both outer families, rotates
+    // both TEIDs, and relocates both peers while preserving one logical group.
+    let crossed = crossed_grouped_session(device.ifindex);
+    assert_eq!(
+        backend
+            .reconcile_pdp_context_group(fresh_grouped_reconcile(crossed.clone()))
+            .await?,
+        GtpuSessionGroupReconcileOutcome::Activated
+    );
+    assert_eq!(
+        backend
+            .read_pdp_context_group(GtpuSessionGroupSelector::new(
+                grouped_group_id(),
+                grouped_device_id(),
+            ))
+            .await?,
+        GtpuSessionGroupReadback::Active(crossed.clone())
+    );
+    run("ping", &["-c", "1", "-W", "1", "192.0.2.11"]);
+    run("ping", &["-6", "-c", "1", "-W", "1", "2001:db8:2::11"]);
+    let pgw_alt_v4 = in_netns(&net.pgw_ns, || {
+        UdpSocket::bind((PGW_ALT_IP, GTPU_PORT)).expect("bind relocated PGW IPv4 GTP-U socket")
+    });
+    let pgw_alt_v6 = in_netns(&net.pgw_ns, || {
+        UdpSocket::bind((PGW_ALT_IPV6, GTPU_PORT)).expect("bind relocated PGW IPv6 GTP-U socket")
+    });
+
+    let crossed_v4_payload = b"grouped-v4-inner-v6-outer";
+    ue_v4.send_to(crossed_v4_payload, (REMOTE_HOST, 53))?;
+    let crossed_v4_inner = capture_inner_udp_packet(
+        &ue_capture,
+        IpAddr::V4(UE_PAA),
+        IpAddr::V4(REMOTE_HOST),
+        5600,
+        53,
+        crossed_v4_payload,
+    );
+    receive_grouped_uplink(
+        &pgw_alt_v6,
+        SocketAddr::from((EPDG_S2BU_IPV6, GTPU_PORT)),
+        GROUP_PEER_TEID_V4_CROSSED,
+        &crossed_v4_inner,
+    );
+    capture_grouped_outer_ipv6(
+        &pgw_capture,
+        EPDG_S2BU_IPV6,
+        PGW_ALT_IPV6,
+        GROUP_PEER_TEID_V4_CROSSED,
+        &crossed_v4_inner,
+    );
+
+    let crossed_v6_payload = b"grouped-v6-inner-v4-outer";
+    let crossed_v6_sent =
+        build_inner_udp_v6(UE_PAA_IPV6, REMOTE_HOST_IPV6, 5601, 53, crossed_v6_payload);
+    send_raw_ipv6_packet(&net.ue_ns, &crossed_v6_sent);
+    let crossed_v6_inner = forwarded_ipv6_packet(crossed_v6_sent);
+    receive_grouped_uplink(
+        &pgw_alt_v4,
+        SocketAddr::from((EPDG_S2BU_IP, GTPU_PORT)),
+        GROUP_PEER_TEID_V6_CROSSED,
+        &crossed_v6_inner,
+    );
+
+    let crossed_v4_down_payload = b"crossed-downlink-v4";
+    let crossed_v4_down_inner =
+        build_inner_udp(REMOTE_HOST, UE_PAA, 53, 5600, crossed_v4_down_payload);
+    let old_v4 = build_outer_gtpu_frame(
+        destination_mac,
+        source_mac,
+        &[],
+        &build_gpdu(GROUP_LOCAL_TEID_V4_INITIAL, None, &crossed_v4_down_inner),
+        true,
+        0,
+    );
+    send_raw_gtpu_frame(
+        &net.pgw_ns,
+        "s2bup",
+        &old_v4,
+        RawChecksumMetadata::Unverified,
+    );
+    expect_no_datagram(&ue_v4);
+    let old_v4_on_new_peer = build_outer_ipv6_gtpu_frame(
+        destination_mac,
+        source_mac,
+        PGW_ALT_IPV6,
+        EPDG_S2BU_IPV6,
+        &build_gpdu(GROUP_LOCAL_TEID_V4_INITIAL, None, &crossed_v4_down_inner),
+        OuterIpv6Extension::None,
+    );
+    send_raw_gtpu_frame(
+        &net.pgw_ns,
+        "s2bup",
+        &old_v4_on_new_peer,
+        RawChecksumMetadata::Unverified,
+    );
+    expect_no_datagram(&ue_v4);
+    let new_v4_on_old_peer = build_outer_gtpu_frame(
+        destination_mac,
+        source_mac,
+        &[],
+        &build_gpdu(GROUP_LOCAL_TEID_V4_CROSSED, None, &crossed_v4_down_inner),
+        true,
+        0,
+    );
+    send_raw_gtpu_frame(
+        &net.pgw_ns,
+        "s2bup",
+        &new_v4_on_old_peer,
+        RawChecksumMetadata::Unverified,
+    );
+    expect_no_datagram(&ue_v4);
+    let new_v4 = build_outer_ipv6_gtpu_frame(
+        destination_mac,
+        source_mac,
+        PGW_ALT_IPV6,
+        EPDG_S2BU_IPV6,
+        &build_gpdu(GROUP_LOCAL_TEID_V4_CROSSED, None, &crossed_v4_down_inner),
+        OuterIpv6Extension::None,
+    );
+    send_raw_gtpu_frame(
+        &net.pgw_ns,
+        "s2bup",
+        &new_v4,
+        RawChecksumMetadata::Unverified,
+    );
+    receive_grouped_downlink(
+        &ue_v4,
+        SocketAddr::from((REMOTE_HOST, 53)),
+        crossed_v4_down_payload,
+    );
+
+    let crossed_v6_down_payload = b"crossed-downlink-v6";
+    let crossed_v6_down_inner = build_inner_udp_v6(
+        REMOTE_HOST_IPV6,
+        UE_PAA_IPV6,
+        53,
+        5601,
+        crossed_v6_down_payload,
+    );
+    let old_v6 = build_outer_ipv6_gtpu_frame(
+        destination_mac,
+        source_mac,
+        PGW_IPV6,
+        EPDG_S2BU_IPV6,
+        &build_gpdu(GROUP_LOCAL_TEID_V6_INITIAL, None, &crossed_v6_down_inner),
+        OuterIpv6Extension::None,
+    );
+    send_raw_gtpu_frame(
+        &net.pgw_ns,
+        "s2bup",
+        &old_v6,
+        RawChecksumMetadata::Unverified,
+    );
+    expect_no_datagram(&ue_v6);
+    let new_v6_on_old_peer = build_outer_ipv6_gtpu_frame(
+        destination_mac,
+        source_mac,
+        PGW_IPV6,
+        EPDG_S2BU_IPV6,
+        &build_gpdu(GROUP_LOCAL_TEID_V6_CROSSED, None, &crossed_v6_down_inner),
+        OuterIpv6Extension::None,
+    );
+    send_raw_gtpu_frame(
+        &net.pgw_ns,
+        "s2bup",
+        &new_v6_on_old_peer,
+        RawChecksumMetadata::Unverified,
+    );
+    expect_no_datagram(&ue_v6);
+    let mut old_v6_on_new_peer = build_outer_gtpu_frame(
+        destination_mac,
+        source_mac,
+        &[],
+        &build_gpdu(GROUP_LOCAL_TEID_V6_INITIAL, None, &crossed_v6_down_inner),
+        true,
+        0,
+    );
+    let outer_ip = ETH_HDR_LEN;
+    old_v6_on_new_peer[outer_ip + 12..outer_ip + 16].copy_from_slice(&PGW_ALT_IP.octets());
+    refresh_outer_ipv4_checksum(&mut old_v6_on_new_peer);
+    refresh_outer_udp_checksum(&mut old_v6_on_new_peer);
+    send_raw_gtpu_frame(
+        &net.pgw_ns,
+        "s2bup",
+        &old_v6_on_new_peer,
+        RawChecksumMetadata::Unverified,
+    );
+    expect_no_datagram(&ue_v6);
+    let mut new_v6 = build_outer_gtpu_frame(
+        destination_mac,
+        source_mac,
+        &[],
+        &build_gpdu(GROUP_LOCAL_TEID_V6_CROSSED, None, &crossed_v6_down_inner),
+        true,
+        0,
+    );
+    new_v6[outer_ip + 12..outer_ip + 16].copy_from_slice(&PGW_ALT_IP.octets());
+    refresh_outer_ipv4_checksum(&mut new_v6);
+    refresh_outer_udp_checksum(&mut new_v6);
+    send_raw_gtpu_frame(
+        &net.pgw_ns,
+        "s2bup",
+        &new_v6,
+        RawChecksumMetadata::Unverified,
+    );
+    receive_grouped_downlink(
+        &ue_v6,
+        SocketAddr::from((REMOTE_HOST_IPV6, 53)),
+        crossed_v6_down_payload,
+    );
+
+    // Drop all process-local loader state, then adopt the exact retained
+    // grouped attachment through the public stable-ID/endpoint-set create
+    // boundary. Readback, capabilities, and live traffic must survive without
+    // raw-map intervention.
+    drop(backend);
+    let adopted_backend = EbpfGtpuDataplaneBackend::with_config(config);
+    let adopted = adopted_backend
+        .create_device_with_endpoints(grouped_device_request(policy))
+        .await?;
+    assert_eq!(adopted, device);
+    assert_eq!(
+        adopted_backend
+            .read_pdp_context_group(GtpuSessionGroupSelector::new(
+                grouped_group_id(),
+                grouped_device_id(),
+            ))
+            .await?,
+        GtpuSessionGroupReadback::Active(crossed.clone())
+    );
+    let adopted_capabilities = adopted_backend
+        .gtpu_ip_family_capabilities(grouped_attachment(&adopted))
+        .await?;
+    assert_eq!(
+        adopted_capabilities, capabilities,
+        "restart adoption must preserve the complete attachment-scoped capability report"
+    );
+    assert_eq!(
+        adopted_capabilities.grouped_atomic_reconciliation,
+        GtpuCapability::Available
+    );
+    assert_eq!(
+        adopted_capabilities.local_endpoint_sets,
+        GtpuCapability::Available
+    );
+    assert_eq!(
+        adopted_capabilities.ipv6_udp_checksum,
+        GtpuCapability::Available
+    );
+    assert_eq!(
+        adopted_capabilities.uplink_checksum_offload,
+        GtpuUplinkChecksumOffloadContract::MaterializedOnly
+    );
+    assert_eq!(
+        adopted_capabilities.downlink_outer_ipv4_fragment_handling,
+        GtpuDownlinkFragmentContract::Unsupported
+    );
+    assert_eq!(
+        adopted_capabilities.downlink_outer_ipv6_fragment_handling,
+        GtpuDownlinkFragmentContract::Unsupported
+    );
+    let adopted_payload = b"grouped-adopted-live";
+    ue_v4.send_to(adopted_payload, (REMOTE_HOST, 53))?;
+    let adopted_inner = capture_inner_udp_packet(
+        &ue_capture,
+        IpAddr::V4(UE_PAA),
+        IpAddr::V4(REMOTE_HOST),
+        5600,
+        53,
+        adopted_payload,
+    );
+    receive_grouped_uplink(
+        &pgw_alt_v6,
+        SocketAddr::from((EPDG_S2BU_IPV6, GTPU_PORT)),
+        GROUP_PEER_TEID_V4_CROSSED,
+        &adopted_inner,
+    );
+    let adopted_v6_payload = b"grouped-adopted-v6-live";
+    let adopted_v6_sent =
+        build_inner_udp_v6(UE_PAA_IPV6, REMOTE_HOST_IPV6, 5601, 53, adopted_v6_payload);
+    send_raw_ipv6_packet(&net.ue_ns, &adopted_v6_sent);
+    let adopted_v6_inner = forwarded_ipv6_packet(adopted_v6_sent);
+    receive_grouped_uplink(
+        &pgw_alt_v4,
+        SocketAddr::from((EPDG_S2BU_IP, GTPU_PORT)),
+        GROUP_PEER_TEID_V6_CROSSED,
+        &adopted_v6_inner,
+    );
+    capture_grouped_outer_ipv6(
+        &pgw_capture,
+        EPDG_S2BU_IPV6,
+        PGW_ALT_IPV6,
+        GROUP_PEER_TEID_V4_CROSSED,
+        &adopted_inner,
+    );
+
+    assert_eq!(
+        adopted_backend
+            .remove_pdp_context_group_exact(crossed.clone())
+            .await?,
+        GtpuSessionGroupRemovalOutcome::Removed
+    );
+    assert_eq!(
+        adopted_backend
+            .read_pdp_context_group(GtpuSessionGroupSelector::new(
+                grouped_group_id(),
+                grouped_device_id(),
+            ))
+            .await?,
+        GtpuSessionGroupReadback::Absent
+    );
+    assert_eq!(
+        adopted_backend
+            .remove_pdp_context_group_exact(crossed)
+            .await?,
+        GtpuSessionGroupRemovalOutcome::AlreadyAbsent
+    );
+
+    ue_v4.send_to(b"grouped-removed-uplink", (REMOTE_HOST, 53))?;
+    expect_no_datagram(&pgw_alt_v6);
+    let removed_v6 = build_inner_udp_v6(
+        UE_PAA_IPV6,
+        REMOTE_HOST_IPV6,
+        5601,
+        53,
+        b"grouped-removed-v6-uplink",
+    );
+    send_raw_ipv6_packet(&net.ue_ns, &removed_v6);
+    expect_no_datagram(&pgw_alt_v4);
+    send_raw_gtpu_frame(
+        &net.pgw_ns,
+        "s2bup",
+        &new_v4,
+        RawChecksumMetadata::Unverified,
+    );
+    expect_no_datagram(&ue_v4);
+    send_raw_gtpu_frame(
+        &net.pgw_ns,
+        "s2bup",
+        &new_v6,
+        RawChecksumMetadata::Unverified,
+    );
+    expect_no_datagram(&ue_v6);
 
     drop(net);
     Ok(())
