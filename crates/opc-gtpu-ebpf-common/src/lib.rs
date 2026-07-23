@@ -3,9 +3,9 @@
 //! This crate is the single source of truth for the byte layouts exchanged
 //! between the `opc-gtpu-dataplane` eBPF backend (userspace loader) and the
 //! `opc-gtpu-dataplane-ebpf` tc programs: BPF map key/value encodings and the
-//! exact GTP-U/UDP/IPv4 encapsulation bytes stamped on uplink packets. It is
-//! `no_std`, dependency-free, and fully deterministic so the wire format is
-//! unit-testable in ordinary CI without a kernel.
+//! exact GTP-U/UDP/IPv4-or-IPv6 encapsulation bytes stamped on uplink packets.
+//! It is `no_std`, dependency-free, and fully deterministic so the wire format
+//! is unit-testable in ordinary CI without a kernel.
 //!
 //! All multi-byte fields are big-endian (network byte order) unless noted.
 

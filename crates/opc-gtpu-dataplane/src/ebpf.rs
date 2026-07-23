@@ -7,11 +7,13 @@
 //! backend instead drives a pair of tc `clsact` eBPF programs on the PGW-facing
 //! (S2b-U) interface:
 //!
-//! - **egress** (`opc_gtpu_uplink`): looks up the uplink FAR by the inner IPv4
-//!   source and prepends `[outer IPv4][UDP][GTPv1-U]` toward the PGW peer.
-//! - **ingress** (`opc_gtpu_downlink`): matches GTPv1-U G-PDUs on UDP/2152,
-//!   looks up the downlink PDR by TEID, strips the outer headers, and lets the
-//!   inner packet continue up the stack (through XFRM policy toward the UE).
+//! - **egress** (`opc_gtpu_uplink`): looks up either the legacy IPv4 FAR or a
+//!   family-tagged grouped FAR and prepends IPv4 or IPv6 UDP/GTPv1-U headers
+//!   toward the exact PGW peer.
+//! - **ingress** (`opc_gtpu_downlink`): matches IPv4 or IPv6 GTPv1-U G-PDUs on
+//!   UDP/2152, authorizes the exact grouped generation/PDR by TEID, strips the
+//!   outer headers, and lets the inner IPv4 or IPv6 packet continue up the
+//!   stack (through XFRM policy toward the UE).
 //!
 //! `create_device` does **not** create a netdevice: it attaches the programs
 //! to the existing interface named in the request and pins the session maps
@@ -20,8 +22,11 @@
 //! PDP-context installs/removals are pure BPF map upserts/deletes and are
 //! idempotent.
 //!
-//! Only IPv4 is supported for the outer transport and the UE PAA; IPv6
-//! requests are rejected as invalid configuration.
+//! The legacy single-context API remains IPv4-only. The additive grouped API
+//! supports independent inner and outer IPv4/IPv6 families, including both
+//! inner families active in one logical group. Callers must inspect the exact
+//! attachment's typed family capabilities; outer-IPv6 uplink encapsulation is
+//! deliberately advertised only for fully materialized, non-GSO packets.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
