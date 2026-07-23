@@ -29,8 +29,26 @@ const SCTP_AUTH_SUPPORTED: libc::c_int = 129;
 const SCTP_GETADDRS_HEADER_BYTES: usize = mem::size_of::<i32>() + mem::size_of::<u32>();
 const SCTP_AUTH_CHUNKS_HEADER_BYTES: usize = mem::size_of::<i32>() + mem::size_of::<u32>();
 const MAX_SCTP_CHUNK_TYPES: usize = 256;
+// Deliberately roomy stack storage for both receive-info control messages.
+// The runtime `CMSG_SPACE` check below remains authoritative on every Linux
+// ABI instead of relying on this slot count as an unchecked layout claim.
+const RECV_CONTROL_CMSG_SLOTS: usize = 16;
 const SPP_HB_ENABLE: u32 = 1;
 const SPP_HB_TIME_IS_ZERO: u32 = 1 << 7;
+
+type RecvControlStorage = [mem::MaybeUninit<libc::cmsghdr>; RECV_CONTROL_CMSG_SLOTS];
+
+fn required_recv_control_len() -> io::Result<usize> {
+    let modern_payload_len = mem::size_of::<libc::sctp_rcvinfo>() as libc::c_uint;
+    // SAFETY: The arguments are fixed Linux UAPI payload sizes.
+    let modern = unsafe { libc::CMSG_SPACE(modern_payload_len) } as usize;
+    let legacy_payload_len = mem::size_of::<libc::sctp_sndrcvinfo>() as libc::c_uint;
+    // SAFETY: As above, the argument is a fixed Linux UAPI payload size.
+    let legacy = unsafe { libc::CMSG_SPACE(legacy_payload_len) } as usize;
+    modern
+        .checked_add(legacy)
+        .ok_or_else(|| io::Error::other("SCTP receive ancillary storage length overflowed"))
+}
 
 pub const SCTP_UNORDERED_FLAG: u16 = libc::SCTP_UNORDERED as u16;
 pub const SCTP_NOTIFICATION_FLAG: i32 = libc::SCTP_NOTIFICATION;
@@ -666,24 +684,23 @@ pub fn recv_msg(fd: BorrowedFd<'_>, buffer: &mut [u8]) -> io::Result<Received> {
         iov_base: buffer.as_mut_ptr().cast::<libc::c_void>(),
         iov_len: buffer.len(),
     };
-    let control_len = {
-        // SAFETY: The arguments are the sizes of the control-message payload
-        // types and the returned buffer size is used only for ancillary data
-        // allocation. Space for both the modern `sctp_rcvinfo` and the legacy
-        // `sctp_sndrcvinfo` keeps `recvmsg` from setting MSG_CTRUNC when a
-        // kernel or subscription delivers more than one receive-info cmsg.
-        unsafe {
-            libc::CMSG_SPACE(mem::size_of::<libc::sctp_rcvinfo>() as libc::c_uint)
-                + libc::CMSG_SPACE(mem::size_of::<libc::sctp_sndrcvinfo>() as libc::c_uint)
-        }
-    };
-    let mut control = vec![0_u8; control_len as usize];
+    // Space for both modern and legacy receive-info messages prevents an
+    // avoidable MSG_CTRUNC when a kernel/subscription delivers both.
+    let required_control_len = required_recv_control_len()?;
+    let mut control: RecvControlStorage =
+        [const { mem::MaybeUninit::<libc::cmsghdr>::uninit() }; RECV_CONTROL_CMSG_SLOTS];
+    let control_capacity = mem::size_of_val(&control);
+    if required_control_len > control_capacity {
+        return Err(io::Error::other(
+            "SCTP receive ancillary storage is too small",
+        ));
+    }
     // SAFETY: Zeroed `msghdr` is initialized below before `recvmsg`.
     let mut header: libc::msghdr = unsafe { mem::zeroed() };
     header.msg_iov = &mut iov;
     header.msg_iovlen = 1;
     header.msg_control = control.as_mut_ptr().cast::<libc::c_void>();
-    header.msg_controllen = control.len();
+    header.msg_controllen = required_control_len;
 
     // SAFETY: `header` references valid payload/control buffers for `recvmsg`;
     // `fd` is borrowed and live.
@@ -1314,6 +1331,17 @@ mod tests {
         );
         assert_eq!(offset_of!(PackedSctpPeerAddressParameters, dscp), 154);
         assert_eq!(offset_of!(PackedSctpPeerAddressParameters, padding), 155);
+    }
+
+    #[test]
+    fn recv_control_storage_is_aligned_and_holds_both_cmsgs() {
+        let mut storage: RecvControlStorage =
+            [const { mem::MaybeUninit::<libc::cmsghdr>::uninit() }; RECV_CONTROL_CMSG_SLOTS];
+        let required = required_recv_control_len().expect("fixed CMSG lengths fit");
+        let address = storage.as_mut_ptr() as usize;
+
+        assert_eq!(address % align_of::<libc::cmsghdr>(), 0);
+        assert!(required <= size_of::<RecvControlStorage>());
     }
 
     #[test]

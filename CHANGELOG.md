@@ -20,6 +20,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   method, hash, key-material, signature, and credential substitution fails
   closed with redaction-safe diagnostics. Existing remote-peer verification
   remains directionally separate and rejects local signed octets (#500).
+- **Bounded reusable SCTP receive scratch — `opc-sctp` /
+  `opc-libsctp-sys`:** each socket now allocates one 64 KiB payload scratch
+  region instead of allocating and zero-filling one for every receive chunk.
+  Its async ownership gate serializes one-to-many endpoint receivers while the
+  association gate continues to cover receive/event/path ordering. Returned
+  payloads own only the received prefix; an RAII guard zeroizes the exact
+  kernel-reported prefix after successful receives, while syscall errors
+  conservatively clear the entire offered slice because no reliable byte count
+  is available. Partial accumulators are cleared on cancellation. The Linux
+  syscall boundary now uses runtime-validated, `cmsghdr`-aligned fixed stack
+  storage for both modern and legacy receive-info control messages instead of
+  a per-chunk heap vector (#492).
 - **BREAKING — RFC 7427 signature-hash authority — `opc-proto-ikev2`:**
   adds bounded typed `SIGNATURE_HASH_ALGORITHMS` (16431) encode/decode,
   preserves both ordered extensible offers, and computes separate directional

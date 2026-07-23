@@ -59,6 +59,29 @@ async fn send_ngap(remote: std::net::SocketAddr, payload: Bytes) -> Result<(), S
 }
 ```
 
+### Receive scratch ownership
+
+Each Linux SCTP socket allocates one bounded 64 KiB payload scratch region and
+reuses it for every receive chunk. The socket's async scratch gate serializes
+concurrent one-to-many endpoint receivers; one-to-one associations retain their
+outer gate so receive, notification, and peer-path updates remain in kernel
+order. Split association ownership continues to have one mutable receive half.
+
+The returned `Bytes` owns exactly the received payload prefix and never borrows
+the socket scratch. After a successful receive, the SDK zeroizes exactly the
+kernel-reported scratch prefix before the next chunk or return, so small
+successful messages do not incur a full 64 KiB clear. If the receive syscall
+fails, there is no reliable byte count; the SDK conservatively zeroizes the
+entire offered scratch slice (up to 64 KiB) before returning the error. Partial
+accumulated records are also cleared if an error or cancellation drops them.
+The scratch allocation is released and fully cleared when the socket is
+dropped.
+
+Receive futures remain non-cancellation-safe after consuming the first chunk of
+a multi-chunk SCTP record: canceling at that point can leave the kernel's
+remaining partial delivery for the next caller. This ordering contract is
+unchanged by scratch reuse.
+
 ### Multihoming path events and health
 
 `SctpAssociation::recv` returns notifications in wire order through

@@ -435,6 +435,9 @@ pub fn send_msg(fd: BorrowedFd<'_>, payload: &[u8], info: SendInfo) -> io::Resul
 }
 
 /// Receive one SCTP message and its metadata.
+///
+/// On Linux the fixed receive-info ancillary storage is properly aligned and
+/// stack-bound; this function does not allocate a control buffer per call.
 pub fn recv_msg(fd: BorrowedFd<'_>, buffer: &mut [u8]) -> io::Result<Received> {
     platform::recv_msg(fd, buffer)
 }
