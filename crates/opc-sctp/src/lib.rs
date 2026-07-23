@@ -10,31 +10,45 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(target_os = "linux")]
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io;
 use std::net::SocketAddr;
 #[cfg(any(target_os = "linux", test))]
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
+use std::num::NonZeroU16;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 #[cfg(any(target_os = "linux", test))]
 use std::sync::{Mutex, RwLock};
+use std::time::Duration;
 
 use bytes::Bytes;
 #[cfg(target_os = "linux")]
 use bytes::BytesMut;
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsFd, OwnedFd};
 #[cfg(target_os = "linux")]
 use tokio::io::unix::AsyncFd;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 const SCTP_RECV_CHUNK_BYTES: usize = 64 * 1024;
 
 #[cfg(any(target_os = "linux", test))]
 const SCTP_PEER_ADDR_CHANGE_BYTES: usize = 148;
+
+#[cfg(any(target_os = "linux", test))]
+const SCTP_SENDER_DRY_EVENT_BYTES: usize = 12;
+
+#[cfg(any(target_os = "linux", test))]
+const SCTP_AUTHENTICATION_EVENT_BYTES: usize = 20;
+
+#[cfg(any(target_os = "linux", test))]
+const MIN_SCTP_NOTIFICATION_RECV_BYTES: usize = SCTP_PEER_ADDR_CHANGE_BYTES;
 
 /// Maximum number of addresses accepted in one static SCTP multihoming set.
 pub const MAX_STATIC_MULTIHOMING_ADDRESSES: usize = opc_libsctp_sys::MAX_SCTP_ADDRESSES;
@@ -49,6 +63,14 @@ pub const DIAMETER_SCTP_PPID: PayloadProtocolIdentifier = PayloadProtocolIdentif
 
 /// Default SCTP stream used by the Diameter SCTP helper.
 pub const DIAMETER_DEFAULT_STREAM_ID: u16 = 0;
+
+/// Maximum SCTP-AUTH shared-secret bytes accepted by the kernel UAPI.
+pub const MAX_SCTP_AUTH_KEY_BYTES: usize = opc_libsctp_sys::MAX_SCTP_AUTH_KEY_BYTES;
+
+#[cfg(any(target_os = "linux", test))]
+const SCTP_DATA_CHUNK_TYPE: u8 = 0;
+#[cfg(any(target_os = "linux", test))]
+const SCTP_FORWARD_TSN_CHUNK_TYPE: u8 = 192;
 
 /// Host-order SCTP payload protocol identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -98,6 +120,207 @@ pub enum DeliveryOrder {
     Ordered,
     /// Unordered delivery.
     Unordered,
+}
+
+/// Pre-association SCTP-AUTH chunk requirements.
+///
+/// This configuration requires DATA chunks to be authenticated. Optionally it
+/// can also require FORWARD-TSN for a caller that uses partial reliability.
+/// Configuring these kernel checks does not establish DTLS, authenticate an
+/// application peer, or make an ordinary SCTP association protected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SctpAuthenticationConfig {
+    authenticate_forward_tsn: bool,
+}
+
+impl SctpAuthenticationConfig {
+    /// Require SCTP DATA chunks to carry valid SCTP-AUTH authentication.
+    #[must_use]
+    pub const fn data() -> Self {
+        Self {
+            authenticate_forward_tsn: false,
+        }
+    }
+
+    /// Also require FORWARD-TSN authentication for partial-reliability use.
+    #[must_use]
+    pub const fn with_forward_tsn(mut self) -> Self {
+        self.authenticate_forward_tsn = true;
+        self
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    fn chunk_types(self) -> impl Iterator<Item = u8> {
+        [
+            Some(SCTP_DATA_CHUNK_TYPE),
+            self.authenticate_forward_tsn
+                .then_some(SCTP_FORWARD_TSN_CHUNK_TYPE),
+        ]
+        .into_iter()
+        .flatten()
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn validate_peer_authenticated_chunks(
+    authentication: SctpAuthenticationConfig,
+    peer_chunks: &[u8],
+) -> Result<(), SctpError> {
+    for chunk_type in authentication.chunk_types() {
+        if !peer_chunks.contains(&chunk_type) {
+            return Err(SctpError::PeerAuthenticationChunkUnavailable { chunk_type });
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn sctp_recv_chunk_capacity(remaining_payload_bytes: usize) -> usize {
+    remaining_payload_bytes.clamp(MIN_SCTP_NOTIFICATION_RECV_BYTES, SCTP_RECV_CHUNK_BYTES)
+}
+
+/// Nonzero SCTP-AUTH shared-key identifier.
+///
+/// Identifier zero is the protocol's initial null key and is deliberately not
+/// accepted for installation or activation; a dedicated retirement method can
+/// remove that initial key after the first switch. RFC 6083 rolls 65535 over
+/// to identifier 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SctpAuthKeyId(NonZeroU16);
+
+impl SctpAuthKeyId {
+    /// Create a nonzero key identifier.
+    #[must_use]
+    pub const fn new(value: u16) -> Option<Self> {
+        match NonZeroU16::new(value) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
+    }
+
+    /// Return the numeric key identifier.
+    #[must_use]
+    pub const fn get(self) -> u16 {
+        self.0.get()
+    }
+
+    /// Return the next RFC 6083 rotation identifier, wrapping 65535 to 1.
+    #[must_use]
+    pub const fn next_rfc6083(self) -> Self {
+        let next = if self.get() == u16::MAX {
+            1
+        } else {
+            self.get() + 1
+        };
+        match NonZeroU16::new(next) {
+            Some(next) => Self(next),
+            None => self,
+        }
+    }
+}
+
+/// Owned SCTP-AUTH shared key consumed by an installation operation.
+///
+/// Key material is zeroized when the value is dropped, including validation
+/// and kernel-error paths. `Debug` never exposes the material.
+pub struct SctpAuthKey {
+    key_id: SctpAuthKeyId,
+    material: Zeroizing<Vec<u8>>,
+}
+
+impl SctpAuthKey {
+    /// Validate and own shared-key material for one nonzero identifier.
+    pub fn new(key_id: SctpAuthKeyId, material: Vec<u8>) -> Result<Self, SctpError> {
+        let material = Zeroizing::new(material);
+        if material.is_empty() {
+            return Err(SctpError::InvalidConfig {
+                field: "auth_key.material",
+                reason: "must not be empty",
+            });
+        }
+        if material.len() > MAX_SCTP_AUTH_KEY_BYTES {
+            return Err(SctpError::InvalidConfig {
+                field: "auth_key.material",
+                reason: "exceeds the SCTP-AUTH UAPI length limit",
+            });
+        }
+        Ok(Self { key_id, material })
+    }
+
+    /// Own a 64-byte RFC 6083 exporter secret for SCTP-AUTH rotation.
+    pub fn for_rfc6083(key_id: SctpAuthKeyId, material: Vec<u8>) -> Result<Self, SctpError> {
+        if material.len() != 64 {
+            let _material = Zeroizing::new(material);
+            return Err(SctpError::InvalidConfig {
+                field: "auth_key.material",
+                reason: "RFC 6083 exporter material must be exactly 64 bytes",
+            });
+        }
+        Self::new(key_id, material)
+    }
+
+    /// Return the key identifier without exposing key material.
+    #[must_use]
+    pub const fn key_id(&self) -> SctpAuthKeyId {
+        self.key_id
+    }
+
+    /// Return the key length without exposing key material.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.material.len()
+    }
+
+    /// Return whether this key contains no material.
+    ///
+    /// Valid constructed keys are never empty; this accessor supports generic
+    /// secret-container handling without exposing bytes.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.material.is_empty()
+    }
+}
+
+impl fmt::Debug for SctpAuthKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SctpAuthKey")
+            .field("key_id", &self.key_id)
+            .field("material", &"<redacted>")
+            .field("material_bytes", &self.material.len())
+            .finish()
+    }
+}
+
+/// Terminal evidence returned by a bounded sender-drain wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SctpSenderDrainOutcome {
+    /// All submitted SCTP user data has been acknowledged and cannot be revoked.
+    SenderDry,
+}
+
+/// SCTP-AUTH key event reported by the kernel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SctpAuthenticationIndication {
+    /// The peer first used a new active key.
+    NewKey,
+    /// The implementation no longer uses the indicated key.
+    FreeKey,
+    /// The peer did not negotiate SCTP-AUTH support.
+    NoAuthentication,
+    /// Kernel indication not known by this SDK version.
+    Unknown(u32),
+}
+
+impl SctpAuthenticationIndication {
+    #[cfg(any(target_os = "linux", test))]
+    const fn from_kernel(value: u32) -> Self {
+        match value {
+            0 => Self::NewKey,
+            1 => Self::FreeKey,
+            2 => Self::NoAuthentication,
+            other => Self::Unknown(other),
+        }
+    }
 }
 
 /// INIT parameters.
@@ -1133,6 +1356,22 @@ pub enum SctpEvent {
         /// Association identifier.
         assoc_id: i32,
     },
+    /// The SCTP stack has no user data left to send or retransmit.
+    SenderDry {
+        /// Association identifier.
+        assoc_id: i32,
+    },
+    /// SCTP-AUTH key lifecycle or capability event.
+    Authentication {
+        /// Key identifier affected by the event.
+        key_id: u16,
+        /// Alternate key identifier reported by Linux.
+        alternate_key_id: u16,
+        /// Typed authentication indication.
+        indication: SctpAuthenticationIndication,
+        /// Association identifier.
+        assoc_id: i32,
+    },
     /// Notification type not decoded by this crate yet.
     Unknown {
         /// Kernel SCTP notification type.
@@ -1171,6 +1410,22 @@ impl fmt::Debug for SctpEvent {
                 .finish(),
             Self::Shutdown { assoc_id } => f
                 .debug_struct("Shutdown")
+                .field("assoc_id", assoc_id)
+                .finish(),
+            Self::SenderDry { assoc_id } => f
+                .debug_struct("SenderDry")
+                .field("assoc_id", assoc_id)
+                .finish(),
+            Self::Authentication {
+                key_id,
+                alternate_key_id,
+                indication,
+                assoc_id,
+            } => f
+                .debug_struct("Authentication")
+                .field("key_id", key_id)
+                .field("alternate_key_id", alternate_key_id)
+                .field("indication", indication)
                 .field("assoc_id", assoc_id)
                 .finish(),
             Self::Unknown { notification_type } => f
@@ -1383,6 +1638,27 @@ pub enum SctpError {
         /// Configured receive cap.
         max_message_bytes: usize,
     },
+    /// The bounded sender-drain wait expired without dry or shutdown evidence.
+    #[error("SCTP sender-drain deadline expired")]
+    SenderDrainTimeout,
+    /// The peer began SCTP shutdown while a sender drain was in progress.
+    #[error("SCTP peer shutdown interrupted sender drain")]
+    PeerShutdownDuringDrain,
+    /// The peer did not negotiate required SCTP-AUTH support.
+    #[error("SCTP peer does not support required authentication")]
+    PeerAuthenticationUnavailable,
+    /// The peer did not require authentication for a configured chunk type.
+    #[error("SCTP peer did not require authentication for chunk type {chunk_type}")]
+    PeerAuthenticationChunkUnavailable {
+        /// Required SCTP chunk type absent from the peer's AUTH parameter.
+        chunk_type: u8,
+    },
+    /// The bounded wait for kernel confirmation that an old key is free expired.
+    #[error("SCTP-AUTH key-retirement deadline expired")]
+    AuthKeyRetirementTimeout,
+    /// Authentication lifecycle evidence overflowed its bounded internal queue.
+    #[error("SCTP-AUTH lifecycle event queue overflowed")]
+    AuthEventQueueOverflow,
 }
 
 /// SCTP metric snapshot.
@@ -1727,6 +2003,164 @@ fn record_path_event_serialized<CurrentPrimary>(
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug)]
+struct SctpSenderDrainTracker {
+    state: tokio::sync::watch::Sender<SctpSenderDrainState>,
+}
+
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SctpSenderDrainState {
+    Idle,
+    Waiting,
+    SenderDry,
+    PeerShutdown,
+    Closed,
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl Default for SctpSenderDrainTracker {
+    fn default() -> Self {
+        let (state, _receiver) = tokio::sync::watch::channel(SctpSenderDrainState::Idle);
+        Self { state }
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl SctpSenderDrainTracker {
+    fn prepare_wait(
+        &self,
+    ) -> Result<tokio::sync::watch::Receiver<SctpSenderDrainState>, SctpError> {
+        let mut terminal = None;
+        self.state.send_if_modified(|state| match state {
+            SctpSenderDrainState::PeerShutdown => {
+                terminal = Some(SctpError::PeerShutdownDuringDrain);
+                false
+            }
+            SctpSenderDrainState::Closed => {
+                terminal = Some(SctpError::Closed);
+                false
+            }
+            SctpSenderDrainState::Idle
+            | SctpSenderDrainState::Waiting
+            | SctpSenderDrainState::SenderDry => {
+                *state = SctpSenderDrainState::Waiting;
+                true
+            }
+        });
+        match terminal {
+            Some(error) => Err(error),
+            None => Ok(self.state.subscribe()),
+        }
+    }
+
+    fn record_event(&self, event: SctpEvent) {
+        match event {
+            SctpEvent::SenderDry { .. } => {
+                self.state.send_if_modified(|state| {
+                    if *state == SctpSenderDrainState::Waiting {
+                        *state = SctpSenderDrainState::SenderDry;
+                        true
+                    } else {
+                        false
+                    }
+                });
+            }
+            SctpEvent::Shutdown { .. } => {
+                self.state.send_replace(SctpSenderDrainState::PeerShutdown);
+            }
+            SctpEvent::AssociationChange { .. }
+            | SctpEvent::PeerAddrChange { .. }
+            | SctpEvent::Authentication { .. }
+            | SctpEvent::Unknown { .. } => {}
+        }
+    }
+
+    fn mark_closed(&self) {
+        self.state.send_if_modified(|state| {
+            if *state == SctpSenderDrainState::PeerShutdown {
+                false
+            } else {
+                *state = SctpSenderDrainState::Closed;
+                true
+            }
+        });
+    }
+
+    fn reset_idle(&self) {
+        self.state.send_if_modified(|state| {
+            if matches!(
+                state,
+                SctpSenderDrainState::Waiting | SctpSenderDrainState::SenderDry
+            ) {
+                *state = SctpSenderDrainState::Idle;
+                true
+            } else {
+                false
+            }
+        });
+    }
+
+    #[cfg(test)]
+    async fn wait_for_dry_or_shutdown(
+        state: tokio::sync::watch::Receiver<SctpSenderDrainState>,
+        timeout: Duration,
+    ) -> Result<SctpSenderDrainOutcome, SctpError> {
+        let deadline = checked_operation_deadline(timeout, "sender_drain_timeout")?;
+        Self::wait_for_dry_or_shutdown_until(state, deadline).await
+    }
+
+    async fn wait_for_dry_or_shutdown_until(
+        mut state: tokio::sync::watch::Receiver<SctpSenderDrainState>,
+        deadline: tokio::time::Instant,
+    ) -> Result<SctpSenderDrainOutcome, SctpError> {
+        loop {
+            match *state.borrow_and_update() {
+                SctpSenderDrainState::SenderDry => return Ok(SctpSenderDrainOutcome::SenderDry),
+                SctpSenderDrainState::PeerShutdown => {
+                    return Err(SctpError::PeerShutdownDuringDrain)
+                }
+                SctpSenderDrainState::Closed => return Err(SctpError::Closed),
+                SctpSenderDrainState::Idle | SctpSenderDrainState::Waiting => {}
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(SctpError::SenderDrainTimeout);
+            }
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(deadline) => {
+                    return Err(SctpError::SenderDrainTimeout);
+                }
+                changed = state.changed() => {
+                    if changed.is_err() {
+                        return Err(SctpError::Closed);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn checked_operation_deadline(
+    timeout: Duration,
+    field: &'static str,
+) -> Result<tokio::time::Instant, SctpError> {
+    if timeout.is_zero() {
+        return Err(SctpError::InvalidConfig {
+            field,
+            reason: "must be greater than zero",
+        });
+    }
+    tokio::time::Instant::now()
+        .checked_add(timeout)
+        .ok_or(SctpError::InvalidConfig {
+            field,
+            reason: "deadline is outside the runtime clock range",
+        })
+}
+
 /// Capabilities available from this build of the SCTP transport.
 ///
 /// A Linux kernel or container policy can still reject multihoming for a
@@ -1739,6 +2173,20 @@ pub struct SctpCapabilities {
     pub platform_supported: bool,
     /// This build exposes bounded static bindx/connectx support.
     pub static_multihoming: bool,
+}
+
+impl SctpCapabilities {
+    /// Return whether this build exposes Linux SCTP-AUTH controls.
+    #[must_use]
+    pub const fn authentication_api(self) -> bool {
+        cfg!(target_os = "linux")
+    }
+
+    /// Return whether this build exposes typed bounded sender-drain controls.
+    #[must_use]
+    pub const fn sender_dry_api(self) -> bool {
+        cfg!(target_os = "linux")
+    }
 }
 
 /// Return SCTP capabilities for the current build target.
@@ -1759,19 +2207,60 @@ pub struct SctpEndpoint {
 /// Connected one-to-one SCTP association.
 #[derive(Debug)]
 pub struct SctpAssociation {
-    imp: platform::Association,
+    imp: Arc<platform::Association>,
+}
+
+/// Exclusive sending and SCTP-AUTH control half of a split association.
+///
+/// This type is intentionally not `Clone`: a protected transport engine can
+/// give one task authority over message ordering and key transitions while a
+/// receive task continuously drains notifications.
+#[derive(Debug)]
+pub struct SctpAssociationSendHalf {
+    imp: Arc<platform::Association>,
+}
+
+/// Exclusive receive half of a split association.
+///
+/// Polling this half drives sender-dry and peer-shutdown evidence observed by
+/// [`SctpAssociationSendHalf::wait_for_sender_dry_or_shutdown`].
+#[derive(Debug)]
+pub struct SctpAssociationReceiveHalf {
+    imp: Arc<platform::Association>,
 }
 
 impl SctpEndpoint {
     /// Bind an SCTP endpoint.
     pub fn bind(config: SctpEndpointConfig) -> Result<Self, SctpError> {
         config.validate()?;
-        platform::bind_endpoint(config).map(|imp| Self { imp })
+        platform::bind_endpoint(config, None).map(|imp| Self { imp })
+    }
+
+    /// Bind an endpoint that requires SCTP-AUTH on selected chunk types.
+    ///
+    /// The requirement is installed before listen and therefore applies to
+    /// future accepted associations. This configures SCTP authentication only;
+    /// it does not establish DTLS or authenticate an application identity.
+    pub fn bind_with_authentication(
+        config: SctpEndpointConfig,
+        authentication: SctpAuthenticationConfig,
+    ) -> Result<Self, SctpError> {
+        config.validate()?;
+        if config.mode != SctpMode::OneToOne {
+            return Err(SctpError::InvalidConfig {
+                field: "mode",
+                reason: "SCTP-AUTH key rotation requires one-to-one associations",
+            });
+        }
+        platform::bind_endpoint(config, Some(authentication)).map(|imp| Self { imp })
     }
 
     /// Accept a one-to-one SCTP association.
     pub async fn accept(&self) -> Result<SctpAssociation, SctpError> {
-        self.imp.accept().await.map(|imp| SctpAssociation { imp })
+        self.imp
+            .accept()
+            .await
+            .map(|imp| SctpAssociation { imp: Arc::new(imp) })
     }
 
     /// Send one message on a one-to-many endpoint.
@@ -1804,9 +2293,25 @@ impl SctpAssociation {
     /// Connect one SCTP association.
     pub async fn connect(config: SctpConnectConfig) -> Result<Self, SctpError> {
         config.validate()?;
-        platform::connect_association(config)
+        platform::connect_association(config, None)
             .await
-            .map(|imp| Self { imp })
+            .map(|imp| Self { imp: Arc::new(imp) })
+    }
+
+    /// Connect an association that requires SCTP-AUTH on selected chunks.
+    ///
+    /// The requirement is installed before association setup. The initial
+    /// SCTP-AUTH key remains identifier 0's null key; callers install and
+    /// activate exported key material only at their protocol-defined epoch.
+    /// This method does not run or attest DTLS.
+    pub async fn connect_with_authentication(
+        config: SctpConnectConfig,
+        authentication: SctpAuthenticationConfig,
+    ) -> Result<Self, SctpError> {
+        config.validate()?;
+        platform::connect_association(config, Some(authentication))
+            .await
+            .map(|imp| Self { imp: Arc::new(imp) })
     }
 
     /// Send one message.
@@ -1824,6 +2329,90 @@ impl SctpAssociation {
     /// after it starts consuming a multi-chunk SCTP record.
     pub async fn recv(&self) -> Result<InboundMessage, SctpError> {
         self.imp.recv().await
+    }
+
+    /// Consume this association into exclusive full-duplex ownership halves.
+    ///
+    /// The receive half must be polled while the send half waits for sender-dry
+    /// evidence because SCTP notifications share the ordinary receive queue.
+    #[must_use]
+    pub fn into_split(self) -> (SctpAssociationSendHalf, SctpAssociationReceiveHalf) {
+        let receive = Arc::clone(&self.imp);
+        (
+            SctpAssociationSendHalf { imp: self.imp },
+            SctpAssociationReceiveHalf { imp: receive },
+        )
+    }
+
+    /// Install one association-scoped SCTP-AUTH key.
+    ///
+    /// `key` is consumed and zeroized after the kernel call on both success and
+    /// failure. Installation does not make the key active.
+    pub async fn install_auth_key(&self, key: SctpAuthKey) -> Result<(), SctpError> {
+        self.imp.install_auth_key(key).await
+    }
+
+    /// Select an installed SCTP-AUTH key for subsequently submitted messages.
+    pub async fn activate_auth_key(&self, key_id: SctpAuthKeyId) -> Result<(), SctpError> {
+        self.imp.activate_auth_key(key_id).await
+    }
+
+    /// Deactivate and then delete an old SCTP-AUTH key.
+    ///
+    /// The caller must first satisfy its protocol's peer-confirmation rule.
+    /// This method serializes against sends, proves sender-dry, deactivates the
+    /// inactive key, waits for its matching `SCTP_AUTH_FREE_KEY`, and only then
+    /// deletes it. The receive side must continuously drain notifications.
+    /// `timeout` bounds lock acquisition, drain, and kernel confirmation as one
+    /// operation. If deletion fails after confirmed deactivation, retry with
+    /// [`Self::delete_deactivated_auth_key`].
+    pub async fn retire_auth_key(
+        &self,
+        key_id: SctpAuthKeyId,
+        timeout: Duration,
+    ) -> Result<(), SctpError> {
+        self.imp.retire_auth_key(key_id, timeout).await
+    }
+
+    /// Drain and retire SCTP-AUTH's initial empty key after the first switch.
+    ///
+    /// Key identifier 0 cannot be installed or activated through the ordinary
+    /// key APIs. This narrow operation exists so an RFC 6083 consumer can
+    /// remove the protocol-defined initial null key after activating key 1.
+    pub async fn retire_initial_auth_key(&self, timeout: Duration) -> Result<(), SctpError> {
+        self.imp.retire_initial_auth_key(timeout).await
+    }
+
+    /// Retry deletion of a key already successfully deactivated.
+    pub async fn delete_deactivated_auth_key(
+        &self,
+        key_id: SctpAuthKeyId,
+    ) -> Result<(), SctpError> {
+        self.imp.delete_deactivated_auth_key(key_id).await
+    }
+
+    /// Retry deletion of the confirmed-deactivated initial empty key.
+    pub async fn delete_deactivated_initial_auth_key(&self) -> Result<(), SctpError> {
+        self.imp.delete_deactivated_initial_auth_key().await
+    }
+
+    /// Wait up to `timeout` for sender-dry or peer-shutdown evidence.
+    ///
+    /// This operation is available only on an association created with an
+    /// authentication config, where sender-dry was not permanently subscribed.
+    /// A receive operation on this association (or its split receive half)
+    /// must continuously drain notifications. Every successful nonempty send
+    /// invalidates older sender-dry evidence before this method can succeed.
+    /// The returned proof describes that instant and is invalidated by a later
+    /// send. Consumers that must sequence a protocol transition immediately
+    /// after the proof should use the mutable split send half as their sole
+    /// writer. Timeout or cancellation, including while waiting for writer
+    /// admission, makes the association terminal.
+    pub async fn wait_for_sender_dry_or_shutdown(
+        &self,
+        timeout: Duration,
+    ) -> Result<SctpSenderDrainOutcome, SctpError> {
+        self.imp.wait_for_sender_dry_or_shutdown(timeout).await
     }
 
     /// Return association health.
@@ -1876,6 +2465,88 @@ impl SctpAssociation {
     /// Return the peer addresses active on this association.
     pub fn peer_addresses(&self) -> Result<Vec<SocketAddr>, SctpError> {
         self.imp.peer_addresses()
+    }
+}
+
+impl SctpAssociationSendHalf {
+    /// Send one message.
+    pub async fn send(&mut self, message: OutboundMessage) -> Result<usize, SctpError> {
+        self.imp.send(message).await
+    }
+
+    /// Install one association-scoped SCTP-AUTH key and consume its material.
+    pub async fn install_auth_key(&mut self, key: SctpAuthKey) -> Result<(), SctpError> {
+        self.imp.install_auth_key(key).await
+    }
+
+    /// Select an installed SCTP-AUTH key for subsequent sends.
+    pub async fn activate_auth_key(&mut self, key_id: SctpAuthKeyId) -> Result<(), SctpError> {
+        self.imp.activate_auth_key(key_id).await
+    }
+
+    /// Drain sends, then deactivate and delete an old SCTP-AUTH key.
+    ///
+    /// The paired receive half must continuously drain notifications. The
+    /// timeout bounds the complete serialized drain and retirement operation.
+    pub async fn retire_auth_key(
+        &mut self,
+        key_id: SctpAuthKeyId,
+        timeout: Duration,
+    ) -> Result<(), SctpError> {
+        self.imp.retire_auth_key(key_id, timeout).await
+    }
+
+    /// Drain and retire SCTP-AUTH's initial empty key after the first switch.
+    pub async fn retire_initial_auth_key(&mut self, timeout: Duration) -> Result<(), SctpError> {
+        self.imp.retire_initial_auth_key(timeout).await
+    }
+
+    /// Retry deletion of a key that is already deactivated.
+    pub async fn delete_deactivated_auth_key(
+        &mut self,
+        key_id: SctpAuthKeyId,
+    ) -> Result<(), SctpError> {
+        self.imp.delete_deactivated_auth_key(key_id).await
+    }
+
+    /// Retry deletion of the confirmed-deactivated initial empty key.
+    pub async fn delete_deactivated_initial_auth_key(&mut self) -> Result<(), SctpError> {
+        self.imp.delete_deactivated_initial_auth_key().await
+    }
+
+    /// Wait up to `timeout` for sender-dry or peer-shutdown evidence.
+    ///
+    /// The paired receive half must be actively draining SCTP notifications.
+    /// The proof remains valid only until this sole mutable writer next sends.
+    /// Timeout or cancellation makes the association terminal.
+    pub async fn wait_for_sender_dry_or_shutdown(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<SctpSenderDrainOutcome, SctpError> {
+        self.imp.wait_for_sender_dry_or_shutdown(timeout).await
+    }
+
+    /// Return association health.
+    pub fn health(&self) -> SctpHealth {
+        self.imp.health()
+    }
+}
+
+impl SctpAssociationReceiveHalf {
+    /// Receive one message or notification and update association evidence.
+    pub async fn recv(&mut self) -> Result<InboundMessage, SctpError> {
+        self.imp.recv().await
+    }
+
+    /// Return association health.
+    pub fn health(&self) -> SctpHealth {
+        self.imp.health()
+    }
+
+    /// Return bounded peer-path health for this association.
+    #[must_use]
+    pub fn peer_path_health(&self) -> Vec<SctpPathHealth> {
+        self.imp.peer_path_health()
     }
 }
 
@@ -2102,6 +2773,18 @@ fn parse_sctp_event(payload: &[u8]) -> Option<SctpEvent> {
     {
         return None;
     }
+    if notification_type == opc_libsctp_sys::SCTP_SENDER_DRY_EVENT_NOTIFICATION
+        && (declared_len != SCTP_SENDER_DRY_EVENT_BYTES
+            || available_len != SCTP_SENDER_DRY_EVENT_BYTES)
+    {
+        return None;
+    }
+    if notification_type == opc_libsctp_sys::SCTP_AUTHENTICATION_EVENT_NOTIFICATION
+        && (declared_len != SCTP_AUTHENTICATION_EVENT_BYTES
+            || available_len != SCTP_AUTHENTICATION_EVENT_BYTES)
+    {
+        return None;
+    }
     let payload = &payload[..declared_len];
 
     match notification_type {
@@ -2121,6 +2804,17 @@ fn parse_sctp_event(payload: &[u8]) -> Option<SctpEvent> {
         opc_libsctp_sys::SCTP_SHUTDOWN_EVENT_NOTIFICATION => Some(SctpEvent::Shutdown {
             assoc_id: read_i32_ne(payload, 8)?,
         }),
+        opc_libsctp_sys::SCTP_SENDER_DRY_EVENT_NOTIFICATION => Some(SctpEvent::SenderDry {
+            assoc_id: read_i32_ne(payload, 8)?,
+        }),
+        opc_libsctp_sys::SCTP_AUTHENTICATION_EVENT_NOTIFICATION => {
+            Some(SctpEvent::Authentication {
+                key_id: read_u16_ne(payload, 8)?,
+                alternate_key_id: read_u16_ne(payload, 10)?,
+                indication: SctpAuthenticationIndication::from_kernel(read_u32_ne(payload, 12)?),
+                assoc_id: read_i32_ne(payload, 16)?,
+            })
+        }
         other => Some(SctpEvent::Unknown {
             notification_type: other,
         }),
@@ -2227,6 +2921,32 @@ fn path_control_io_err(
 }
 
 #[cfg(target_os = "linux")]
+fn auth_io_err(operation: &'static str, source: io::Error) -> SctpError {
+    if opc_libsctp_sys::is_sctp_capability_unavailable(&source)
+        || source.kind() == io::ErrorKind::PermissionDenied
+    {
+        SctpError::CapabilityUnavailable {
+            capability: "sctp_authentication",
+            source,
+        }
+    } else {
+        io_err(operation, source)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn sender_dry_io_err(operation: &'static str, source: io::Error) -> SctpError {
+    if opc_libsctp_sys::is_sctp_capability_unavailable(&source) {
+        SctpError::CapabilityUnavailable {
+            capability: "sender_dry_notifications",
+            source,
+        }
+    } else {
+        io_err(operation, source)
+    }
+}
+
+#[cfg(target_os = "linux")]
 mod platform {
     use super::*;
 
@@ -2234,6 +2954,7 @@ mod platform {
     pub struct Endpoint {
         socket: Arc<SctpSocket>,
         mode: SctpMode,
+        authentication: Option<SctpAuthenticationConfig>,
     }
 
     #[derive(Debug)]
@@ -2243,6 +2964,11 @@ mod platform {
         peer_paths: SctpPathTracker,
         recv_gate: tokio::sync::Mutex<()>,
         path_control_gate: Mutex<()>,
+        writer_control_gate: tokio::sync::Mutex<()>,
+        sender_drain: SctpSenderDrainTracker,
+        auth_keys: Mutex<BTreeMap<u16, AuthKeyLifecycle>>,
+        auth_events: tokio::sync::broadcast::Sender<AuthLifecycleSignal>,
+        authentication: Option<SctpAuthenticationConfig>,
     }
 
     #[derive(Debug)]
@@ -2253,7 +2979,35 @@ mod platform {
         closed: AtomicBool,
     }
 
-    pub fn bind_endpoint(config: SctpEndpointConfig) -> Result<Endpoint, SctpError> {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum AuthKeyLifecycle {
+        Inactive,
+        Active,
+        DeactivationPending,
+        Deactivated,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum AuthLifecycleSignal {
+        FreeKey(u16),
+        NoAuthentication,
+        Closed,
+    }
+
+    fn auth_key_ledger(
+        authentication: Option<SctpAuthenticationConfig>,
+    ) -> Mutex<BTreeMap<u16, AuthKeyLifecycle>> {
+        let mut keys = BTreeMap::new();
+        if authentication.is_some() {
+            keys.insert(0, AuthKeyLifecycle::Active);
+        }
+        Mutex::new(keys)
+    }
+
+    pub fn bind_endpoint(
+        config: SctpEndpointConfig,
+        authentication: Option<SctpAuthenticationConfig>,
+    ) -> Result<Endpoint, SctpError> {
         let local = config.local_addrs[0];
         let fd = opc_libsctp_sys::open_socket(sys_family(&local), sys_style(config.mode))
             .map_err(|source| io_err("socket", source))?;
@@ -2263,6 +3017,7 @@ mod platform {
             config.nodelay,
             config.rto,
             config.heartbeat,
+            authentication,
         )?;
         if config.local_addrs.len() == 1 {
             opc_libsctp_sys::bind(fd.as_fd(), &local).map_err(|source| io_err("bind", source))?;
@@ -2280,10 +3035,14 @@ mod platform {
                 closed: AtomicBool::new(false),
             }),
             mode: config.mode,
+            authentication,
         })
     }
 
-    pub async fn connect_association(config: SctpConnectConfig) -> Result<Association, SctpError> {
+    pub async fn connect_association(
+        config: SctpConnectConfig,
+        authentication: Option<SctpAuthenticationConfig>,
+    ) -> Result<Association, SctpError> {
         let remote = config.remote_addrs[0];
         let peer_paths = SctpPathTracker::new(&config.remote_addrs);
         let fd = opc_libsctp_sys::open_socket(sys_family(&remote), sys_style(SctpMode::OneToOne))
@@ -2294,6 +3053,7 @@ mod platform {
             config.nodelay,
             config.rto,
             config.heartbeat,
+            authentication,
         )?;
         if config.local_addrs.len() == 1 {
             opc_libsctp_sys::bind(fd.as_fd(), &config.local_addrs[0])
@@ -2319,16 +3079,25 @@ mod platform {
         if status == opc_libsctp_sys::ConnectStatus::InProgress {
             wait_connected(&socket).await?;
         }
+        if let Some(authentication) = authentication {
+            require_peer_authentication(socket.fd.get_ref().as_fd(), authentication)?;
+        }
         if let Ok(primary_peer) = opc_libsctp_sys::peer_primary_address(socket.fd.get_ref().as_fd())
         {
             peer_paths.initialize_primary_reachable(primary_peer);
         }
+        let (auth_events, _auth_events_receiver) = tokio::sync::broadcast::channel(16);
         Ok(Association {
             socket,
             mode: SctpMode::OneToOne,
             peer_paths,
             recv_gate: tokio::sync::Mutex::new(()),
             path_control_gate: Mutex::new(()),
+            writer_control_gate: tokio::sync::Mutex::new(()),
+            sender_drain: SctpSenderDrainTracker::default(),
+            auth_keys: auth_key_ledger(authentication),
+            auth_events,
+            authentication,
         })
     }
 
@@ -2349,6 +3118,9 @@ mod platform {
                     .map_err(|source| io_err("accept_ready", source))?;
                 match guard.try_io(|inner| opc_libsctp_sys::accept(inner.get_ref().as_fd())) {
                     Ok(Ok((fd, peer))) => {
+                        if let Some(authentication) = self.authentication {
+                            require_peer_authentication(fd.as_fd(), authentication)?;
+                        }
                         let mut peer_addrs = match opc_libsctp_sys::peer_addresses(fd.as_fd(), 0) {
                             Ok(peer_addrs) if !peer_addrs.is_empty() => peer_addrs,
                             Ok(_) | Err(_) => vec![peer],
@@ -2367,6 +3139,8 @@ mod platform {
                         let async_fd =
                             AsyncFd::new(fd).map_err(|source| io_err("async_fd", source))?;
                         self.socket.metrics.record_accept();
+                        let (auth_events, _auth_events_receiver) =
+                            tokio::sync::broadcast::channel(16);
                         return Ok(Association {
                             socket: Arc::new(SctpSocket {
                                 fd: async_fd,
@@ -2378,6 +3152,11 @@ mod platform {
                             peer_paths,
                             recv_gate: tokio::sync::Mutex::new(()),
                             path_control_gate: Mutex::new(()),
+                            writer_control_gate: tokio::sync::Mutex::new(()),
+                            sender_drain: SctpSenderDrainTracker::default(),
+                            auth_keys: auth_key_ledger(self.authentication),
+                            auth_events,
+                            authentication: self.authentication,
                         });
                     }
                     Ok(Err(source)) if source.kind() == io::ErrorKind::Interrupted => continue,
@@ -2431,13 +3210,33 @@ mod platform {
 
     impl Association {
         pub async fn send(&self, message: OutboundMessage) -> Result<usize, SctpError> {
-            self.socket.send(message).await
+            let _writer_guard = self.writer_control_gate.lock().await;
+            if !self.socket.is_open() {
+                return Err(SctpError::Closed);
+            }
+            let result = self.socket.send(message).await;
+            if result.is_err() {
+                self.terminal_close();
+            }
+            result
         }
 
         pub async fn recv(&self) -> Result<InboundMessage, SctpError> {
             let _recv_guard = self.recv_gate.lock().await;
-            let message = self.socket.recv().await?;
+            self.ensure_open()?;
+            let message = match self.socket.recv().await {
+                Ok(message) => message,
+                Err(error) => {
+                    self.terminal_close();
+                    return Err(error);
+                }
+            };
             if let Some(event) = message.event {
+                self.sender_drain.record_event(event);
+                self.record_auth_event(event);
+                if matches!(event, SctpEvent::Shutdown { .. }) {
+                    self.terminal_close();
+                }
                 record_path_event_serialized(
                     &self.path_control_gate,
                     &self.peer_paths,
@@ -2446,6 +3245,337 @@ mod platform {
                 );
             }
             Ok(message)
+        }
+
+        pub async fn install_auth_key(&self, key: SctpAuthKey) -> Result<(), SctpError> {
+            let _writer_guard = self.writer_control_gate.lock().await;
+            self.ensure_open()?;
+            self.ensure_authentication_configured()?;
+            let mut keys = self.lock_auth_keys();
+            if keys.contains_key(&key.key_id.get()) {
+                return Err(SctpError::InvalidConfig {
+                    field: "auth_key.key_id",
+                    reason: "key identifier is already installed",
+                });
+            }
+            opc_libsctp_sys::install_auth_key(
+                self.socket.fd.get_ref().as_fd(),
+                0,
+                key.key_id.get(),
+                &key.material,
+            )
+            .map_err(|source| auth_io_err("install_auth_key", source))?;
+            keys.insert(key.key_id.get(), AuthKeyLifecycle::Inactive);
+            Ok(())
+        }
+
+        pub async fn activate_auth_key(&self, key_id: SctpAuthKeyId) -> Result<(), SctpError> {
+            let _writer_guard = self.writer_control_gate.lock().await;
+            self.ensure_open()?;
+            self.ensure_authentication_configured()?;
+            let mut keys = self.lock_auth_keys();
+            match keys.get(&key_id.get()) {
+                Some(AuthKeyLifecycle::Inactive | AuthKeyLifecycle::Active) => {}
+                Some(AuthKeyLifecycle::DeactivationPending | AuthKeyLifecycle::Deactivated) => {
+                    return Err(SctpError::InvalidConfig {
+                        field: "auth_key.key_id",
+                        reason: "key is being retired",
+                    })
+                }
+                None => {
+                    return Err(SctpError::InvalidConfig {
+                        field: "auth_key.key_id",
+                        reason: "key identifier is not installed",
+                    })
+                }
+            }
+            opc_libsctp_sys::set_active_auth_key(self.socket.fd.get_ref().as_fd(), 0, key_id.get())
+                .map_err(|source| auth_io_err("activate_auth_key", source))?;
+            for lifecycle in keys.values_mut() {
+                if *lifecycle == AuthKeyLifecycle::Active {
+                    *lifecycle = AuthKeyLifecycle::Inactive;
+                }
+            }
+            keys.insert(key_id.get(), AuthKeyLifecycle::Active);
+            Ok(())
+        }
+
+        pub async fn retire_auth_key(
+            &self,
+            key_id: SctpAuthKeyId,
+            timeout: Duration,
+        ) -> Result<(), SctpError> {
+            self.retire_auth_key_number(key_id.get(), timeout).await
+        }
+
+        pub async fn retire_initial_auth_key(&self, timeout: Duration) -> Result<(), SctpError> {
+            self.retire_auth_key_number(0, timeout).await
+        }
+
+        async fn retire_auth_key_number(
+            &self,
+            key_id: u16,
+            timeout: Duration,
+        ) -> Result<(), SctpError> {
+            let deadline = checked_operation_deadline(timeout, "auth_key_retirement_timeout")?;
+            let _writer_guard = tokio::time::timeout_at(deadline, self.writer_control_gate.lock())
+                .await
+                .map_err(|_| SctpError::AuthKeyRetirementTimeout)?;
+            self.ensure_open()?;
+            self.ensure_authentication_configured()?;
+            {
+                let keys = self.lock_auth_keys();
+                match keys.get(&key_id) {
+                    Some(AuthKeyLifecycle::Inactive) => {}
+                    Some(AuthKeyLifecycle::Active) => {
+                        return Err(SctpError::InvalidConfig {
+                            field: "auth_key.key_id",
+                            reason: "active key cannot be retired",
+                        })
+                    }
+                    Some(AuthKeyLifecycle::DeactivationPending) => {
+                        return Err(SctpError::InvalidConfig {
+                            field: "auth_key.key_id",
+                            reason: "key retirement is already pending",
+                        })
+                    }
+                    Some(AuthKeyLifecycle::Deactivated) => {
+                        return Err(SctpError::InvalidConfig {
+                            field: "auth_key.key_id",
+                            reason: "key is already deactivated",
+                        })
+                    }
+                    None => {
+                        return Err(SctpError::InvalidConfig {
+                            field: "auth_key.key_id",
+                            reason: "key identifier is not installed",
+                        })
+                    }
+                }
+            }
+
+            // Linux does not emit a later FREE_KEY notification when an
+            // outstanding packet finally releases a key that was deactivated
+            // while still referenced. With the writer gate held, first prove
+            // all submitted data is dry; only then can deactivation produce
+            // unambiguous synchronous retirement evidence.
+            self.wait_for_sender_dry_locked(deadline)
+                .await
+                .map_err(|error| match error {
+                    SctpError::SenderDrainTimeout => SctpError::AuthKeyRetirementTimeout,
+                    other => other,
+                })?;
+            if tokio::time::Instant::now() >= deadline {
+                return Err(SctpError::AuthKeyRetirementTimeout);
+            }
+
+            let mut auth_events = self.auth_events.subscribe();
+            {
+                let mut keys = self.lock_auth_keys();
+                keys.insert(key_id, AuthKeyLifecycle::DeactivationPending);
+                if let Err(source) = opc_libsctp_sys::deactivate_auth_key(
+                    self.socket.fd.get_ref().as_fd(),
+                    0,
+                    key_id,
+                ) {
+                    drop(keys);
+                    self.terminal_close();
+                    return Err(auth_io_err("deactivate_auth_key", source));
+                }
+            }
+            let mut retirement = AuthRetirementGuard {
+                association: self,
+                pending: true,
+            };
+            self.wait_for_auth_key_free_until(key_id, deadline, &mut auth_events)
+                .await?;
+            retirement.pending = false;
+            opc_libsctp_sys::delete_auth_key(self.socket.fd.get_ref().as_fd(), 0, key_id)
+                .map_err(|source| auth_io_err("delete_auth_key", source))?;
+            self.lock_auth_keys().remove(&key_id);
+            Ok(())
+        }
+
+        pub async fn delete_deactivated_auth_key(
+            &self,
+            key_id: SctpAuthKeyId,
+        ) -> Result<(), SctpError> {
+            self.delete_deactivated_auth_key_number(key_id.get()).await
+        }
+
+        pub async fn delete_deactivated_initial_auth_key(&self) -> Result<(), SctpError> {
+            self.delete_deactivated_auth_key_number(0).await
+        }
+
+        async fn delete_deactivated_auth_key_number(&self, key_id: u16) -> Result<(), SctpError> {
+            let _writer_guard = self.writer_control_gate.lock().await;
+            self.ensure_open()?;
+            self.ensure_authentication_configured()?;
+            let mut keys = self.lock_auth_keys();
+            if keys.get(&key_id) != Some(&AuthKeyLifecycle::Deactivated) {
+                return Err(SctpError::InvalidConfig {
+                    field: "auth_key.key_id",
+                    reason: "key is not confirmed deactivated",
+                });
+            }
+            opc_libsctp_sys::delete_auth_key(self.socket.fd.get_ref().as_fd(), 0, key_id)
+                .map_err(|source| auth_io_err("delete_auth_key", source))?;
+            keys.remove(&key_id);
+            Ok(())
+        }
+
+        pub async fn wait_for_sender_dry_or_shutdown(
+            &self,
+            timeout: Duration,
+        ) -> Result<SctpSenderDrainOutcome, SctpError> {
+            let deadline = checked_operation_deadline(timeout, "sender_drain_timeout")?;
+            self.ensure_open()?;
+            self.ensure_authentication_configured()?;
+            let mut operation = TerminalOperationGuard {
+                association: self,
+                pending: true,
+            };
+            let _writer_guard = tokio::time::timeout_at(deadline, self.writer_control_gate.lock())
+                .await
+                .map_err(|_| SctpError::SenderDrainTimeout)?;
+            self.ensure_open()?;
+            let result = self.wait_for_sender_dry_locked(deadline).await;
+            if result.is_ok() {
+                operation.pending = false;
+            }
+            result
+        }
+
+        async fn wait_for_sender_dry_locked(
+            &self,
+            deadline: tokio::time::Instant,
+        ) -> Result<SctpSenderDrainOutcome, SctpError> {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(SctpError::SenderDrainTimeout);
+            }
+            let receiver = self.sender_drain.prepare_wait()?;
+            // Arm the guard before the syscall. Linux can install the event
+            // subscription and then fail while allocating the immediate dry
+            // notification, so every reported error is an indeterminate state
+            // that must disable best-effort and physically close on drop.
+            let mut subscription = SenderDrySubscription {
+                association: self,
+                armed: true,
+            };
+            opc_libsctp_sys::set_event(
+                self.socket.fd.get_ref().as_fd(),
+                0,
+                opc_libsctp_sys::SCTP_SENDER_DRY_EVENT_NOTIFICATION,
+                true,
+            )
+            .map_err(|source| sender_dry_io_err("enable_sender_dry_event", source))?;
+            let result =
+                SctpSenderDrainTracker::wait_for_dry_or_shutdown_until(receiver, deadline).await;
+            match result {
+                Ok(outcome) => {
+                    subscription.disarm()?;
+                    Ok(outcome)
+                }
+                Err(SctpError::PeerShutdownDuringDrain) => {
+                    subscription.disarm()?;
+                    self.terminal_close();
+                    Err(SctpError::PeerShutdownDuringDrain)
+                }
+                Err(error) => Err(error),
+            }
+        }
+
+        fn ensure_open(&self) -> Result<(), SctpError> {
+            if self.socket.is_open() {
+                Ok(())
+            } else {
+                Err(SctpError::Closed)
+            }
+        }
+
+        fn ensure_authentication_configured(&self) -> Result<(), SctpError> {
+            if self.authentication.is_some() {
+                Ok(())
+            } else {
+                Err(SctpError::UnsupportedFeature {
+                    feature: "association_authentication_not_configured",
+                })
+            }
+        }
+
+        fn terminal_close(&self) {
+            let _ = opc_libsctp_sys::shutdown_both(self.socket.fd.get_ref().as_fd());
+            self.socket.mark_closed();
+            self.sender_drain.mark_closed();
+            let _ = self.auth_events.send(AuthLifecycleSignal::Closed);
+        }
+
+        fn record_auth_event(&self, event: SctpEvent) {
+            let SctpEvent::Authentication {
+                key_id, indication, ..
+            } = event
+            else {
+                return;
+            };
+            match indication {
+                SctpAuthenticationIndication::FreeKey => {
+                    let mut keys = self.lock_auth_keys();
+                    if keys.get(&key_id) == Some(&AuthKeyLifecycle::DeactivationPending) {
+                        keys.insert(key_id, AuthKeyLifecycle::Deactivated);
+                    }
+                    drop(keys);
+                    let _ = self.auth_events.send(AuthLifecycleSignal::FreeKey(key_id));
+                }
+                SctpAuthenticationIndication::NoAuthentication => {
+                    let _ = self.auth_events.send(AuthLifecycleSignal::NoAuthentication);
+                    self.terminal_close();
+                }
+                SctpAuthenticationIndication::NewKey | SctpAuthenticationIndication::Unknown(_) => {
+                }
+            }
+        }
+
+        fn lock_auth_keys(&self) -> std::sync::MutexGuard<'_, BTreeMap<u16, AuthKeyLifecycle>> {
+            match self.auth_keys.lock() {
+                Ok(keys) => keys,
+                Err(poisoned) => poisoned.into_inner(),
+            }
+        }
+
+        async fn wait_for_auth_key_free_until(
+            &self,
+            key_id: u16,
+            deadline: tokio::time::Instant,
+            events: &mut tokio::sync::broadcast::Receiver<AuthLifecycleSignal>,
+        ) -> Result<(), SctpError> {
+            loop {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(SctpError::AuthKeyRetirementTimeout);
+                }
+                tokio::select! {
+                    biased;
+                    _ = tokio::time::sleep_until(deadline) => {
+                        return Err(SctpError::AuthKeyRetirementTimeout);
+                    }
+                    event = events.recv() => {
+                        match event {
+                            Ok(AuthLifecycleSignal::FreeKey(free_key_id))
+                                if free_key_id == key_id => return Ok(()),
+                            Ok(AuthLifecycleSignal::FreeKey(_)) => {}
+                            Ok(AuthLifecycleSignal::NoAuthentication) => {
+                                return Err(SctpError::PeerAuthenticationUnavailable)
+                            }
+                            Ok(AuthLifecycleSignal::Closed) => return Err(SctpError::Closed),
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                                return Err(SctpError::AuthEventQueueOverflow)
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                return Err(SctpError::Closed)
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         pub fn health(&self) -> SctpHealth {
@@ -2501,6 +3631,67 @@ mod platform {
         }
     }
 
+    struct SenderDrySubscription<'a> {
+        association: &'a Association,
+        armed: bool,
+    }
+
+    impl SenderDrySubscription<'_> {
+        fn disarm(&mut self) -> Result<(), SctpError> {
+            opc_libsctp_sys::set_event(
+                self.association.socket.fd.get_ref().as_fd(),
+                0,
+                opc_libsctp_sys::SCTP_SENDER_DRY_EVENT_NOTIFICATION,
+                false,
+            )
+            .map_err(|source| sender_dry_io_err("disable_sender_dry_event", source))?;
+            self.association.sender_drain.reset_idle();
+            self.armed = false;
+            Ok(())
+        }
+    }
+
+    impl Drop for SenderDrySubscription<'_> {
+        fn drop(&mut self) {
+            if !self.armed {
+                return;
+            }
+            let _ = opc_libsctp_sys::set_event(
+                self.association.socket.fd.get_ref().as_fd(),
+                0,
+                opc_libsctp_sys::SCTP_SENDER_DRY_EVENT_NOTIFICATION,
+                false,
+            );
+            self.association.terminal_close();
+        }
+    }
+
+    struct AuthRetirementGuard<'a> {
+        association: &'a Association,
+        pending: bool,
+    }
+
+    impl Drop for AuthRetirementGuard<'_> {
+        fn drop(&mut self) {
+            if self.pending {
+                self.association.terminal_close();
+            }
+        }
+    }
+
+    struct TerminalOperationGuard<'a> {
+        association: &'a Association,
+        pending: bool,
+    }
+
+    impl Drop for TerminalOperationGuard<'_> {
+        fn drop(&mut self) {
+            if self.pending {
+                self.association.terminal_close();
+            }
+        }
+    }
+
     impl SctpSocket {
         async fn send(&self, message: OutboundMessage) -> Result<usize, SctpError> {
             let info = sys_send_info(&message);
@@ -2551,7 +3742,11 @@ mod platform {
                         max_message_bytes: self.max_message_bytes,
                     });
                 }
-                let chunk_len = remaining.min(SCTP_RECV_CHUNK_BYTES);
+                // Notifications share the receive queue with DATA but are not
+                // governed by the caller's payload cap. Always provide enough
+                // room for every fixed notification decoded by this crate,
+                // then enforce `remaining` independently for DATA below.
+                let chunk_len = sctp_recv_chunk_capacity(remaining);
                 let mut buffer = BytesMut::zeroed(chunk_len);
                 let received = self.recv_chunk(&mut buffer).await?;
                 if received.bytes == 0 && !received.flags.notification {
@@ -2572,6 +3767,14 @@ mod platform {
                         "sctp notification received"
                     );
                     return Ok(message);
+                }
+
+                if received.bytes > remaining {
+                    self.mark_closed();
+                    self.metrics.record_io_error();
+                    return Err(SctpError::MessageTooLarge {
+                        max_message_bytes: self.max_message_bytes,
+                    });
                 }
 
                 let first = first_received.get_or_insert(received);
@@ -2646,15 +3849,32 @@ mod platform {
         nodelay: bool,
         rto: RtoConfig,
         heartbeat: HeartbeatConfig,
+        authentication: Option<SctpAuthenticationConfig>,
     ) -> Result<(), SctpError> {
+        if let Some(authentication) = authentication {
+            opc_libsctp_sys::set_authentication_enabled(fd, true)
+                .map_err(|source| auth_io_err("enable_authentication", source))?;
+            for chunk_type in authentication.chunk_types() {
+                opc_libsctp_sys::require_authenticated_chunk(fd, chunk_type)
+                    .map_err(|source| auth_io_err("require_authenticated_chunk", source))?;
+            }
+        }
         opc_libsctp_sys::set_initmsg(fd, sys_init(init))
             .map_err(|source| io_err("set_initmsg", source))?;
         opc_libsctp_sys::set_nodelay(fd, nodelay)
             .map_err(|source| io_err("set_nodelay", source))?;
         opc_libsctp_sys::set_recv_rcvinfo(fd, true)
             .map_err(|source| io_err("set_recv_rcvinfo", source))?;
-        opc_libsctp_sys::set_events(fd, opc_libsctp_sys::EventSubscriptions::default())
-            .map_err(|source| io_err("set_events", source))?;
+        let events = opc_libsctp_sys::EventSubscriptions {
+            authentication: authentication.is_some(),
+            // Existing ordinary associations retain their historical event
+            // subscription. Authenticated associations arm sender-dry only
+            // around an exclusive bounded operation so queued stale evidence
+            // cannot authorize a key transition.
+            sender_dry: authentication.is_none(),
+            ..opc_libsctp_sys::EventSubscriptions::default()
+        };
+        opc_libsctp_sys::set_events(fd, events).map_err(|source| io_err("set_events", source))?;
         if rto != RtoConfig::default() {
             opc_libsctp_sys::set_rto_parameters(
                 fd,
@@ -2684,6 +3904,20 @@ mod platform {
             })?;
         }
         Ok(())
+    }
+
+    fn require_peer_authentication(
+        fd: std::os::fd::BorrowedFd<'_>,
+        authentication: SctpAuthenticationConfig,
+    ) -> Result<(), SctpError> {
+        match opc_libsctp_sys::peer_authentication_supported(fd, 0) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(SctpError::PeerAuthenticationUnavailable),
+            Err(source) => Err(auth_io_err("peer_authentication_supported", source)),
+        }?;
+        let peer_chunks = opc_libsctp_sys::peer_authenticated_chunks(fd, 0)
+            .map_err(|source| auth_io_err("peer_authenticated_chunks", source))?;
+        validate_peer_authenticated_chunks(authentication, &peer_chunks)
     }
 
     async fn wait_connected(socket: &SctpSocket) -> Result<(), SctpError> {
@@ -2722,11 +3956,17 @@ mod platform {
     #[derive(Debug)]
     pub struct Association;
 
-    pub fn bind_endpoint(_config: SctpEndpointConfig) -> Result<Endpoint, SctpError> {
+    pub fn bind_endpoint(
+        _config: SctpEndpointConfig,
+        _authentication: Option<SctpAuthenticationConfig>,
+    ) -> Result<Endpoint, SctpError> {
         Err(SctpError::UnsupportedPlatform)
     }
 
-    pub async fn connect_association(_config: SctpConnectConfig) -> Result<Association, SctpError> {
+    pub async fn connect_association(
+        _config: SctpConnectConfig,
+        _authentication: Option<SctpAuthenticationConfig>,
+    ) -> Result<Association, SctpError> {
         Err(SctpError::UnsupportedPlatform)
     }
 
@@ -2774,6 +4014,51 @@ mod platform {
 
         pub async fn recv(&self) -> Result<InboundMessage, SctpError> {
             let _ = self;
+            Err(SctpError::UnsupportedPlatform)
+        }
+
+        pub async fn install_auth_key(&self, key: SctpAuthKey) -> Result<(), SctpError> {
+            let _ = (self, key);
+            Err(SctpError::UnsupportedPlatform)
+        }
+
+        pub async fn activate_auth_key(&self, key_id: SctpAuthKeyId) -> Result<(), SctpError> {
+            let _ = (self, key_id);
+            Err(SctpError::UnsupportedPlatform)
+        }
+
+        pub async fn retire_auth_key(
+            &self,
+            key_id: SctpAuthKeyId,
+            timeout: Duration,
+        ) -> Result<(), SctpError> {
+            let _ = (self, key_id, timeout);
+            Err(SctpError::UnsupportedPlatform)
+        }
+
+        pub async fn retire_initial_auth_key(&self, timeout: Duration) -> Result<(), SctpError> {
+            let _ = (self, timeout);
+            Err(SctpError::UnsupportedPlatform)
+        }
+
+        pub async fn delete_deactivated_auth_key(
+            &self,
+            key_id: SctpAuthKeyId,
+        ) -> Result<(), SctpError> {
+            let _ = (self, key_id);
+            Err(SctpError::UnsupportedPlatform)
+        }
+
+        pub async fn delete_deactivated_initial_auth_key(&self) -> Result<(), SctpError> {
+            let _ = self;
+            Err(SctpError::UnsupportedPlatform)
+        }
+
+        pub async fn wait_for_sender_dry_or_shutdown(
+            &self,
+            timeout: Duration,
+        ) -> Result<SctpSenderDrainOutcome, SctpError> {
+            let _ = (self, timeout);
             Err(SctpError::UnsupportedPlatform)
         }
 
@@ -2884,6 +4169,145 @@ mod tests {
         push_i32_ne(&mut payload, error);
         push_i32_ne(&mut payload, assoc_id);
         payload
+    }
+
+    fn sender_dry_notification(assoc_id: i32) -> Vec<u8> {
+        let mut payload = Vec::with_capacity(SCTP_SENDER_DRY_EVENT_BYTES);
+        push_u16_ne(
+            &mut payload,
+            opc_libsctp_sys::SCTP_SENDER_DRY_EVENT_NOTIFICATION,
+        );
+        push_u16_ne(&mut payload, 0);
+        push_u32_ne(&mut payload, SCTP_SENDER_DRY_EVENT_BYTES as u32);
+        push_i32_ne(&mut payload, assoc_id);
+        payload
+    }
+
+    fn authentication_notification(
+        key_id: u16,
+        alternate_key_id: u16,
+        indication: u32,
+        assoc_id: i32,
+    ) -> Vec<u8> {
+        let mut payload = Vec::with_capacity(SCTP_AUTHENTICATION_EVENT_BYTES);
+        push_u16_ne(
+            &mut payload,
+            opc_libsctp_sys::SCTP_AUTHENTICATION_EVENT_NOTIFICATION,
+        );
+        push_u16_ne(&mut payload, 0);
+        push_u32_ne(&mut payload, SCTP_AUTHENTICATION_EVENT_BYTES as u32);
+        push_u16_ne(&mut payload, key_id);
+        push_u16_ne(&mut payload, alternate_key_id);
+        push_u32_ne(&mut payload, indication);
+        push_i32_ne(&mut payload, assoc_id);
+        payload
+    }
+
+    #[test]
+    fn authentication_config_requires_data_and_optionally_forward_tsn() {
+        assert_eq!(
+            SctpAuthenticationConfig::default()
+                .chunk_types()
+                .collect::<Vec<_>>(),
+            vec![SCTP_DATA_CHUNK_TYPE]
+        );
+        assert_eq!(
+            SctpAuthenticationConfig::data()
+                .with_forward_tsn()
+                .chunk_types()
+                .collect::<Vec<_>>(),
+            vec![SCTP_DATA_CHUNK_TYPE, SCTP_FORWARD_TSN_CHUNK_TYPE]
+        );
+    }
+
+    #[test]
+    fn peer_authentication_must_cover_every_configured_chunk() {
+        assert!(validate_peer_authenticated_chunks(
+            SctpAuthenticationConfig::data(),
+            &[SCTP_DATA_CHUNK_TYPE]
+        )
+        .is_ok());
+        assert!(matches!(
+            validate_peer_authenticated_chunks(SctpAuthenticationConfig::data(), &[]),
+            Err(SctpError::PeerAuthenticationChunkUnavailable {
+                chunk_type: SCTP_DATA_CHUNK_TYPE
+            })
+        ));
+        assert!(matches!(
+            validate_peer_authenticated_chunks(
+                SctpAuthenticationConfig::data().with_forward_tsn(),
+                &[SCTP_DATA_CHUNK_TYPE]
+            ),
+            Err(SctpError::PeerAuthenticationChunkUnavailable {
+                chunk_type: SCTP_FORWARD_TSN_CHUNK_TYPE
+            })
+        ));
+        assert!(validate_peer_authenticated_chunks(
+            SctpAuthenticationConfig::data().with_forward_tsn(),
+            &[SCTP_FORWARD_TSN_CHUNK_TYPE, SCTP_DATA_CHUNK_TYPE]
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn notification_receive_capacity_is_independent_of_payload_cap() {
+        assert_eq!(
+            sctp_recv_chunk_capacity(1),
+            MIN_SCTP_NOTIFICATION_RECV_BYTES
+        );
+        assert_eq!(
+            sctp_recv_chunk_capacity(SCTP_RECV_CHUNK_BYTES * 2),
+            SCTP_RECV_CHUNK_BYTES
+        );
+    }
+
+    #[test]
+    fn auth_key_ids_follow_rfc_6083_rotation_without_zero() {
+        assert_eq!(SctpAuthKeyId::new(0), None);
+        assert_eq!(SctpAuthKeyId::new(1).unwrap().next_rfc6083().get(), 2);
+        assert_eq!(
+            SctpAuthKeyId::new(u16::MAX).unwrap().next_rfc6083().get(),
+            1
+        );
+    }
+
+    #[test]
+    fn auth_keys_validate_rfc_6083_width_and_redact_material() {
+        let key_id = SctpAuthKeyId::new(7).unwrap();
+        let marker = b"sctp-auth-sensitive-marker";
+        let mut material = vec![0_u8; 64];
+        material[..marker.len()].copy_from_slice(marker);
+        let key = SctpAuthKey::for_rfc6083(key_id, material).unwrap();
+
+        assert_eq!(key.key_id(), key_id);
+        assert_eq!(key.len(), 64);
+        assert!(!key.is_empty());
+        let debug = format!("{key:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(debug.contains("material_bytes"));
+        assert!(!debug.contains("sctp-auth-sensitive-marker"));
+
+        assert!(matches!(
+            SctpAuthKey::for_rfc6083(key_id, vec![0_u8; 63]),
+            Err(SctpError::InvalidConfig {
+                field: "auth_key.material",
+                ..
+            })
+        ));
+        assert!(matches!(
+            SctpAuthKey::new(key_id, Vec::new()),
+            Err(SctpError::InvalidConfig {
+                field: "auth_key.material",
+                ..
+            })
+        ));
+        assert!(matches!(
+            SctpAuthKey::new(key_id, vec![0_u8; MAX_SCTP_AUTH_KEY_BYTES + 1]),
+            Err(SctpError::InvalidConfig {
+                field: "auth_key.material",
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -3010,6 +4434,118 @@ mod tests {
             parse_sctp_event(&payload),
             Some(SctpEvent::Shutdown { assoc_id: 9 })
         );
+    }
+
+    #[test]
+    fn parses_exact_sender_dry_notification_and_rejects_bad_lengths() {
+        assert_eq!(opc_libsctp_sys::SCTP_SENDER_DRY_EVENT_NOTIFICATION, 0x8009);
+        let payload = sender_dry_notification(11);
+        assert_eq!(
+            parse_sctp_event(&payload),
+            Some(SctpEvent::SenderDry { assoc_id: 11 })
+        );
+
+        assert_eq!(parse_sctp_event(&payload[..payload.len() - 1]), None);
+        let mut trailing = payload.clone();
+        trailing.push(0);
+        assert_eq!(parse_sctp_event(&trailing), None);
+        let mut false_declared_length = payload;
+        false_declared_length[4..8].copy_from_slice(&8_u32.to_ne_bytes());
+        assert_eq!(parse_sctp_event(&false_declared_length), None);
+    }
+
+    #[test]
+    fn parses_typed_authentication_notifications_and_rejects_bad_lengths() {
+        assert_eq!(
+            opc_libsctp_sys::SCTP_AUTHENTICATION_EVENT_NOTIFICATION,
+            0x8008
+        );
+        for (raw, expected) in [
+            (0, SctpAuthenticationIndication::NewKey),
+            (1, SctpAuthenticationIndication::FreeKey),
+            (2, SctpAuthenticationIndication::NoAuthentication),
+            (77, SctpAuthenticationIndication::Unknown(77)),
+        ] {
+            let payload = authentication_notification(9, 8, raw, 17);
+            assert_eq!(
+                parse_sctp_event(&payload),
+                Some(SctpEvent::Authentication {
+                    key_id: 9,
+                    alternate_key_id: 8,
+                    indication: expected,
+                    assoc_id: 17,
+                })
+            );
+        }
+
+        let payload = authentication_notification(9, 8, 1, 17);
+        assert_eq!(parse_sctp_event(&payload[..payload.len() - 1]), None);
+        let mut trailing = payload.clone();
+        trailing.push(0);
+        assert_eq!(parse_sctp_event(&trailing), None);
+        let mut false_declared_length = payload;
+        false_declared_length[4..8].copy_from_slice(&16_u32.to_ne_bytes());
+        assert_eq!(parse_sctp_event(&false_declared_length), None);
+    }
+
+    #[tokio::test]
+    async fn sender_drain_tracker_ignores_stale_dry_and_accepts_current_evidence() {
+        let tracker = SctpSenderDrainTracker::default();
+        tracker.record_event(SctpEvent::SenderDry { assoc_id: 3 });
+        let stale_wait = tracker.prepare_wait().unwrap();
+        assert!(matches!(
+            SctpSenderDrainTracker::wait_for_dry_or_shutdown(stale_wait, Duration::from_millis(1))
+                .await,
+            Err(SctpError::SenderDrainTimeout)
+        ));
+
+        tracker.reset_idle();
+        let current_wait = tracker.prepare_wait().unwrap();
+        tracker.record_event(SctpEvent::SenderDry { assoc_id: 3 });
+        assert_eq!(
+            SctpSenderDrainTracker::wait_for_dry_or_shutdown(current_wait, Duration::from_secs(1))
+                .await
+                .unwrap(),
+            SctpSenderDrainOutcome::SenderDry
+        );
+    }
+
+    #[tokio::test]
+    async fn sender_drain_tracker_reports_peer_shutdown_and_closed_states() {
+        let tracker = SctpSenderDrainTracker::default();
+        let shutdown_wait = tracker.prepare_wait().unwrap();
+        tracker.record_event(SctpEvent::Shutdown { assoc_id: 5 });
+        assert!(matches!(
+            SctpSenderDrainTracker::wait_for_dry_or_shutdown(shutdown_wait, Duration::from_secs(1))
+                .await,
+            Err(SctpError::PeerShutdownDuringDrain)
+        ));
+        assert!(matches!(
+            tracker.prepare_wait(),
+            Err(SctpError::PeerShutdownDuringDrain)
+        ));
+        tracker.mark_closed();
+        assert!(matches!(
+            tracker.prepare_wait(),
+            Err(SctpError::PeerShutdownDuringDrain)
+        ));
+
+        let tracker = SctpSenderDrainTracker::default();
+        tracker.mark_closed();
+        assert!(matches!(tracker.prepare_wait(), Err(SctpError::Closed)));
+    }
+
+    #[tokio::test]
+    async fn sender_drain_tracker_rejects_zero_timeout() {
+        let tracker = SctpSenderDrainTracker::default();
+        let receiver = tracker.prepare_wait().unwrap();
+        assert!(matches!(
+            SctpSenderDrainTracker::wait_for_dry_or_shutdown(receiver, Duration::ZERO).await,
+            Err(SctpError::InvalidConfig {
+                field: "sender_drain_timeout",
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -3977,6 +5513,17 @@ mod tests {
         let capabilities = capabilities();
         assert_eq!(capabilities.platform_supported, cfg!(target_os = "linux"));
         assert_eq!(capabilities.static_multihoming, cfg!(target_os = "linux"));
+        assert_eq!(capabilities.authentication_api(), cfg!(target_os = "linux"));
+        assert_eq!(capabilities.sender_dry_api(), cfg!(target_os = "linux"));
+    }
+
+    #[test]
+    fn authenticated_endpoint_rejects_one_to_many_before_socket_setup() {
+        let config = SctpEndpointConfig::one_to_many("127.0.0.1:0".parse().unwrap());
+        assert!(matches!(
+            SctpEndpoint::bind_with_authentication(config, SctpAuthenticationConfig::data()),
+            Err(SctpError::InvalidConfig { field: "mode", .. })
+        ));
     }
 
     #[test]
@@ -4366,6 +5913,107 @@ mod tests {
                 Err(error) => panic!("unexpected receive error: {error}"),
             }
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires Linux kernel SCTP-AUTH and sender-dry support"]
+    async fn loopback_authenticated_association_switches_keys_and_drains() {
+        let authentication = SctpAuthenticationConfig::data();
+        let mut server_config = SctpEndpointConfig::one_to_one("127.0.0.1:0".parse().unwrap());
+        // Lifecycle notifications must remain intact even when the caller's
+        // DATA cap is smaller than every typed notification.
+        server_config.max_message_bytes = 1;
+        let server = SctpEndpoint::bind_with_authentication(server_config, authentication).unwrap();
+        let server_addr = server.local_addresses().unwrap()[0];
+        let mut client_config = SctpConnectConfig::new(server_addr);
+        client_config.max_message_bytes = 1;
+        let client = tokio::time::timeout(
+            Duration::from_secs(5),
+            SctpAssociation::connect_with_authentication(client_config, authentication),
+        )
+        .await
+        .expect("authenticated SCTP connect timed out")
+        .unwrap();
+        let accepted = tokio::time::timeout(Duration::from_secs(5), server.accept())
+            .await
+            .expect("authenticated SCTP accept timed out")
+            .unwrap();
+
+        let first_key_id = SctpAuthKeyId::new(1).unwrap();
+        client
+            .install_auth_key(SctpAuthKey::for_rfc6083(first_key_id, vec![0x11; 64]).unwrap())
+            .await
+            .unwrap();
+        accepted
+            .install_auth_key(SctpAuthKey::for_rfc6083(first_key_id, vec![0x11; 64]).unwrap())
+            .await
+            .unwrap();
+        client.activate_auth_key(first_key_id).await.unwrap();
+        accepted.activate_auth_key(first_key_id).await.unwrap();
+
+        client
+            .send(OutboundMessage::ordered(
+                Bytes::from_static(b"x"),
+                0,
+                DIAMETER_SCTP_PPID,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(recv_data(&accepted).await.payload, Bytes::from_static(b"x"));
+
+        let (mut client_send, mut client_receive) = client.into_split();
+        let (mut server_send, mut server_receive) = accepted.into_split();
+        let client_pump = tokio::spawn(async move { while client_receive.recv().await.is_ok() {} });
+        let server_pump = tokio::spawn(async move { while server_receive.recv().await.is_ok() {} });
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::try_join!(
+                client_send.retire_initial_auth_key(Duration::from_secs(4)),
+                server_send.retire_initial_auth_key(Duration::from_secs(4))
+            )
+        })
+        .await
+        .expect("initial SCTP-AUTH key retirement timed out")
+        .unwrap();
+
+        let second_key_id = first_key_id.next_rfc6083();
+        client_send
+            .install_auth_key(SctpAuthKey::for_rfc6083(second_key_id, vec![0x22; 64]).unwrap())
+            .await
+            .unwrap();
+        server_send
+            .install_auth_key(SctpAuthKey::for_rfc6083(second_key_id, vec![0x22; 64]).unwrap())
+            .await
+            .unwrap();
+        client_send.activate_auth_key(second_key_id).await.unwrap();
+        server_send.activate_auth_key(second_key_id).await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::try_join!(
+                client_send.retire_auth_key(first_key_id, Duration::from_secs(4)),
+                server_send.retire_auth_key(first_key_id, Duration::from_secs(4))
+            )
+        })
+        .await
+        .expect("SCTP-AUTH retirement timed out")
+        .unwrap();
+        let (client_dry, server_dry) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::try_join!(
+                client_send.wait_for_sender_dry_or_shutdown(Duration::from_secs(4)),
+                server_send.wait_for_sender_dry_or_shutdown(Duration::from_secs(4))
+            )
+        })
+        .await
+        .expect("sender-dry evidence timed out")
+        .unwrap();
+        assert_eq!(client_dry, SctpSenderDrainOutcome::SenderDry);
+        assert_eq!(server_dry, SctpSenderDrainOutcome::SenderDry);
+
+        drop(client_send);
+        drop(server_send);
+        client_pump.abort();
+        server_pump.abort();
     }
 
     #[cfg(target_os = "linux")]

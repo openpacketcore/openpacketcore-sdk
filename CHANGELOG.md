@@ -8,6 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **BREAKING — SCTP-AUTH rotation and sender-drain foundation — `opc-sctp` /
+  `opc-libsctp-sys`:** adds exact Linux SCTP-AUTH UAPI bindings, pre-association
+  DATA/FORWARD-TSN requirements, established-peer capability verification,
+  zeroizing association-key installation, active-key switching, and
+  sender-dry/deactivate/`SCTP_AUTH_FREE_KEY`/delete retirement ordering. A bounded
+  association ledger rejects silent key-ID replacement; nonzero RFC 6083 IDs
+  wrap from 65535 to 1, while the RFC-specific constructor requires exactly 64
+  exporter bytes. A narrow initial-key retirement operation removes the
+  protocol-defined empty key 0 after the first active-key switch. Exclusive
+  mutable send/receive ownership and dynamically armed
+  sender-dry waits serialize shutdown against sends. Timeout, cancellation,
+  peer shutdown, AUTH loss, or indeterminate security transitions physically
+  terminate the association. Ordinary send and PPID selection stay unchanged,
+  and the low-level default event subscription is preserved. Downstream
+  exhaustive matches on `SctpEvent` and `SctpError` must handle the new typed
+  AUTH/drain variants. This is lower-layer plumbing only: it does not implement DTLS,
+  derive exporter material, validate peer identity, emit PPID 47, or claim
+  protected Diameter readiness (#348).
 - **Bounded Diameter TLS/TCP transport — `opc-diameter-transport`:** adds an
   experimental transport crate for direct TLS-before-Diameter and same-stream
   in-band CER/CEA-then-TLS sequencing. Exact bounded framing avoids read-ahead,

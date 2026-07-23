@@ -4,6 +4,8 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::ptr;
 
+use zeroize::Zeroizing;
+
 use crate::{
     AddressFamily, ConnectStatus, EventSubscriptions, InitMsg, PeerAddressParameters, Received,
     RecvFlags, RecvInfo, RtoParameters, SendInfo, SocketStyle, MAX_SCTP_ADDRESSES,
@@ -16,7 +18,17 @@ const SCTP_SOCKOPT_CONNECTX_OLD: libc::c_int = 107;
 const SCTP_GET_PEER_ADDRS: libc::c_int = 108;
 const SCTP_GET_LOCAL_ADDRS: libc::c_int = 109;
 const SCTP_SOCKOPT_CONNECTX: libc::c_int = 110;
+const SCTP_AUTH_CHUNK: libc::c_int = 21;
+const SCTP_AUTH_KEY: libc::c_int = 23;
+const SCTP_AUTH_ACTIVE_KEY: libc::c_int = 24;
+const SCTP_AUTH_DELETE_KEY: libc::c_int = 25;
+const SCTP_PEER_AUTH_CHUNKS: libc::c_int = 26;
+const SCTP_AUTH_DEACTIVATE_KEY: libc::c_int = 35;
+const SCTP_EVENT: libc::c_int = 127;
+const SCTP_AUTH_SUPPORTED: libc::c_int = 129;
 const SCTP_GETADDRS_HEADER_BYTES: usize = mem::size_of::<i32>() + mem::size_of::<u32>();
+const SCTP_AUTH_CHUNKS_HEADER_BYTES: usize = mem::size_of::<i32>() + mem::size_of::<u32>();
+const MAX_SCTP_CHUNK_TYPES: usize = 256;
 const SPP_HB_ENABLE: u32 = 1;
 const SPP_HB_TIME_IS_ZERO: u32 = 1 << 7;
 
@@ -26,6 +38,46 @@ const SCTP_NOTIFICATION_TYPE_BASE: u16 = 1 << 15;
 pub const SCTP_ASSOC_CHANGE_NOTIFICATION: u16 = SCTP_NOTIFICATION_TYPE_BASE + 1;
 pub const SCTP_PEER_ADDR_CHANGE_NOTIFICATION: u16 = SCTP_NOTIFICATION_TYPE_BASE + 2;
 pub const SCTP_SHUTDOWN_EVENT_NOTIFICATION: u16 = SCTP_NOTIFICATION_TYPE_BASE + 5;
+pub const SCTP_AUTHENTICATION_EVENT_NOTIFICATION: u16 = SCTP_NOTIFICATION_TYPE_BASE + 8;
+pub const SCTP_SENDER_DRY_EVENT_NOTIFICATION: u16 = SCTP_NOTIFICATION_TYPE_BASE + 9;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct SctpAuthChunk {
+    chunk_type: u8,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SctpAuthKeyHeader {
+    assoc_id: i32,
+    key_id: u16,
+    key_len: u16,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct SctpAuthKeyId {
+    assoc_id: i32,
+    key_id: u16,
+    padding: [u8; 2],
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct SctpAssocValue {
+    assoc_id: i32,
+    value: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct SctpEvent {
+    assoc_id: i32,
+    event_type: u16,
+    enabled: u8,
+    padding: u8,
+}
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
@@ -387,6 +439,173 @@ pub fn set_events(fd: BorrowedFd<'_>, events: EventSubscriptions) -> io::Result<
     set_sockopt(fd, libc::IPPROTO_SCTP, libc::SCTP_EVENTS, &raw)
 }
 
+pub fn require_authenticated_chunk(fd: BorrowedFd<'_>, chunk_type: u8) -> io::Result<()> {
+    set_sockopt(
+        fd,
+        libc::IPPROTO_SCTP,
+        SCTP_AUTH_CHUNK,
+        &SctpAuthChunk { chunk_type },
+    )
+}
+
+pub fn set_authentication_enabled(fd: BorrowedFd<'_>, enabled: bool) -> io::Result<()> {
+    set_sockopt(
+        fd,
+        libc::IPPROTO_SCTP,
+        SCTP_AUTH_SUPPORTED,
+        &SctpAssocValue {
+            assoc_id: 0,
+            value: u32::from(enabled),
+        },
+    )
+}
+
+pub fn peer_authentication_supported(fd: BorrowedFd<'_>, assoc_id: i32) -> io::Result<bool> {
+    let mut value = SctpAssocValue { assoc_id, value: 0 };
+    get_sockopt(fd, libc::IPPROTO_SCTP, SCTP_AUTH_SUPPORTED, &mut value)?;
+    Ok(value.value != 0)
+}
+
+pub fn peer_authenticated_chunks(fd: BorrowedFd<'_>, assoc_id: i32) -> io::Result<Vec<u8>> {
+    let mut option = vec![0_u8; SCTP_AUTH_CHUNKS_HEADER_BYTES + MAX_SCTP_CHUNK_TYPES];
+    option[0..4].copy_from_slice(&assoc_id.to_ne_bytes());
+    let actual_len = raw_getsockopt(fd, SCTP_PEER_AUTH_CHUNKS, &mut option)?;
+    decode_peer_authenticated_chunks(&option, actual_len)
+}
+
+fn decode_peer_authenticated_chunks(option: &[u8], actual_len: usize) -> io::Result<Vec<u8>> {
+    if actual_len > option.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "SCTP peer authentication response exceeded the supplied buffer",
+        ));
+    }
+    if actual_len < SCTP_AUTH_CHUNKS_HEADER_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "truncated SCTP peer authentication chunk response",
+        ));
+    }
+    let chunk_count = u32::from_ne_bytes(
+        option[4..8]
+            .try_into()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid SCTP chunk count"))?,
+    );
+    let chunk_count = usize::try_from(chunk_count)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid SCTP chunk count"))?;
+    if chunk_count > MAX_SCTP_CHUNK_TYPES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "SCTP peer authentication chunk count exceeds protocol bounds",
+        ));
+    }
+    let expected_len = SCTP_AUTH_CHUNKS_HEADER_BYTES
+        .checked_add(chunk_count)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "SCTP chunk size overflow"))?;
+    if actual_len != expected_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unexpected SCTP peer authentication chunk response length",
+        ));
+    }
+    Ok(option[SCTP_AUTH_CHUNKS_HEADER_BYTES..expected_len].to_vec())
+}
+
+pub fn set_event(
+    fd: BorrowedFd<'_>,
+    assoc_id: i32,
+    event_type: u16,
+    enabled: bool,
+) -> io::Result<()> {
+    set_sockopt(
+        fd,
+        libc::IPPROTO_SCTP,
+        SCTP_EVENT,
+        &SctpEvent {
+            assoc_id,
+            event_type,
+            enabled: enabled as u8,
+            padding: 0,
+        },
+    )
+}
+
+pub fn install_auth_key(
+    fd: BorrowedFd<'_>,
+    assoc_id: i32,
+    key_id: u16,
+    key: &[u8],
+) -> io::Result<()> {
+    let option = auth_key_option(assoc_id, key_id, key)?;
+    raw_setsockopt(fd, SCTP_AUTH_KEY, &option).map(|_| ())
+}
+
+pub fn set_active_auth_key(fd: BorrowedFd<'_>, assoc_id: i32, key_id: u16) -> io::Result<()> {
+    set_sockopt(
+        fd,
+        libc::IPPROTO_SCTP,
+        SCTP_AUTH_ACTIVE_KEY,
+        &raw_auth_key_id(assoc_id, key_id),
+    )
+}
+
+pub fn deactivate_auth_key(fd: BorrowedFd<'_>, assoc_id: i32, key_id: u16) -> io::Result<()> {
+    set_sockopt(
+        fd,
+        libc::IPPROTO_SCTP,
+        SCTP_AUTH_DEACTIVATE_KEY,
+        &raw_auth_key_id(assoc_id, key_id),
+    )
+}
+
+pub fn delete_auth_key(fd: BorrowedFd<'_>, assoc_id: i32, key_id: u16) -> io::Result<()> {
+    set_sockopt(
+        fd,
+        libc::IPPROTO_SCTP,
+        SCTP_AUTH_DELETE_KEY,
+        &raw_auth_key_id(assoc_id, key_id),
+    )
+}
+
+pub fn shutdown_both(fd: BorrowedFd<'_>) -> io::Result<()> {
+    // SAFETY: `shutdown` observes the borrowed live descriptor only. `SHUT_RDWR`
+    // makes both directions terminal and wakes blocked socket operations.
+    cvt(unsafe { libc::shutdown(fd.as_raw_fd(), libc::SHUT_RDWR) })
+}
+
+fn auth_key_option(assoc_id: i32, key_id: u16, key: &[u8]) -> io::Result<Zeroizing<Vec<u8>>> {
+    let key_len = u16::try_from(key.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "SCTP-AUTH shared key exceeds the UAPI length limit",
+        )
+    })?;
+    let header = SctpAuthKeyHeader {
+        assoc_id,
+        key_id,
+        key_len,
+    };
+    let total_len = mem::size_of::<SctpAuthKeyHeader>()
+        .checked_add(key.len())
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "SCTP-AUTH key size overflow")
+        })?;
+    let mut option = Zeroizing::new(vec![0_u8; total_len]);
+    option[0..4].copy_from_slice(&header.assoc_id.to_ne_bytes());
+    option[4..6].copy_from_slice(&header.key_id.to_ne_bytes());
+    option[6..8].copy_from_slice(&header.key_len.to_ne_bytes());
+    option[mem::size_of::<SctpAuthKeyHeader>()..].copy_from_slice(key);
+    Ok(option)
+}
+
+const fn raw_auth_key_id(assoc_id: i32, key_id: u16) -> SctpAuthKeyId {
+    SctpAuthKeyId {
+        assoc_id,
+        key_id,
+        padding: [0; 2],
+    }
+}
+
 pub fn send_msg(fd: BorrowedFd<'_>, payload: &[u8], info: SendInfo) -> io::Result<usize> {
     let mut iov = libc::iovec {
         iov_base: payload.as_ptr().cast::<libc::c_void>().cast_mut(),
@@ -534,6 +753,70 @@ fn set_sockopt<T>(
             mem::size_of::<T>() as libc::socklen_t,
         )
     })
+}
+
+fn get_sockopt<T>(
+    fd: BorrowedFd<'_>,
+    level: libc::c_int,
+    name: libc::c_int,
+    value: &mut T,
+) -> io::Result<()> {
+    let expected_len = mem::size_of::<T>();
+    let mut value_len = libc::socklen_t::try_from(expected_len).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "SCTP socket option is too large",
+        )
+    })?;
+    // SAFETY: `value` points to a fully initialized writable option payload of
+    // `value_len` bytes and remains live for the call; `fd` is borrowed.
+    cvt(unsafe {
+        libc::getsockopt(
+            fd.as_raw_fd(),
+            level,
+            name,
+            (value as *mut T).cast::<libc::c_void>(),
+            &mut value_len,
+        )
+    })?;
+    let actual_len = usize::try_from(value_len)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid SCTP option length"))?;
+    if actual_len != expected_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unexpected SCTP option length",
+        ));
+    }
+    Ok(())
+}
+
+fn raw_getsockopt(fd: BorrowedFd<'_>, name: libc::c_int, value: &mut [u8]) -> io::Result<usize> {
+    let mut value_len = libc::socklen_t::try_from(value.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "SCTP socket option is too large",
+        )
+    })?;
+    // SAFETY: `value` is a live writable byte slice of `value_len` bytes for
+    // the duration of the call and `fd` remains borrowed.
+    cvt(unsafe {
+        libc::getsockopt(
+            fd.as_raw_fd(),
+            libc::IPPROTO_SCTP,
+            name,
+            value.as_mut_ptr().cast::<libc::c_void>(),
+            &mut value_len,
+        )
+    })?;
+    let actual_len = usize::try_from(value_len)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid SCTP option length"))?;
+    if actual_len > value.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "SCTP socket option exceeded the supplied buffer",
+        ));
+    }
+    Ok(actual_len)
 }
 
 fn raw_setsockopt(fd: BorrowedFd<'_>, name: libc::c_int, value: &[u8]) -> io::Result<libc::c_int> {
@@ -968,6 +1251,29 @@ mod tests {
         assert_eq!(size_of::<libc::sctp_rcvinfo>(), 28);
         assert_eq!(size_of::<SctpEventSubscribe>(), 10);
         assert_eq!(align_of::<SctpEventSubscribe>(), 1);
+        assert_eq!(size_of::<SctpAuthChunk>(), 1);
+        assert_eq!(align_of::<SctpAuthChunk>(), 1);
+        assert_eq!(offset_of!(SctpAuthChunk, chunk_type), 0);
+        assert_eq!(size_of::<SctpAuthKeyHeader>(), 8);
+        assert_eq!(align_of::<SctpAuthKeyHeader>(), 4);
+        assert_eq!(offset_of!(SctpAuthKeyHeader, assoc_id), 0);
+        assert_eq!(offset_of!(SctpAuthKeyHeader, key_id), 4);
+        assert_eq!(offset_of!(SctpAuthKeyHeader, key_len), 6);
+        assert_eq!(size_of::<SctpAuthKeyId>(), 8);
+        assert_eq!(align_of::<SctpAuthKeyId>(), 4);
+        assert_eq!(offset_of!(SctpAuthKeyId, assoc_id), 0);
+        assert_eq!(offset_of!(SctpAuthKeyId, key_id), 4);
+        assert_eq!(offset_of!(SctpAuthKeyId, padding), 6);
+        assert_eq!(size_of::<SctpAssocValue>(), 8);
+        assert_eq!(align_of::<SctpAssocValue>(), 4);
+        assert_eq!(offset_of!(SctpAssocValue, assoc_id), 0);
+        assert_eq!(offset_of!(SctpAssocValue, value), 4);
+        assert_eq!(size_of::<SctpEvent>(), 8);
+        assert_eq!(align_of::<SctpEvent>(), 4);
+        assert_eq!(offset_of!(SctpEvent, assoc_id), 0);
+        assert_eq!(offset_of!(SctpEvent, event_type), 4);
+        assert_eq!(offset_of!(SctpEvent, enabled), 6);
+        assert_eq!(offset_of!(SctpEvent, padding), 7);
         assert_eq!(size_of::<SctpRtoInfo>(), 16);
         assert_eq!(align_of::<SctpRtoInfo>(), 4);
         assert_eq!(offset_of!(SctpRtoInfo, assoc_id), 0);
@@ -1008,6 +1314,75 @@ mod tests {
         );
         assert_eq!(offset_of!(PackedSctpPeerAddressParameters, dscp), 154);
         assert_eq!(offset_of!(PackedSctpPeerAddressParameters, padding), 155);
+    }
+
+    #[test]
+    fn auth_options_match_linux_uapi_and_bound_secret_material() {
+        assert_eq!(SCTP_AUTH_CHUNK, 21);
+        assert_eq!(SCTP_AUTH_KEY, 23);
+        assert_eq!(SCTP_AUTH_ACTIVE_KEY, 24);
+        assert_eq!(SCTP_AUTH_DELETE_KEY, 25);
+        assert_eq!(SCTP_PEER_AUTH_CHUNKS, 26);
+        assert_eq!(SCTP_AUTH_DEACTIVATE_KEY, 35);
+        assert_eq!(SCTP_EVENT, 127);
+        assert_eq!(SCTP_AUTH_SUPPORTED, 129);
+
+        let secret = [0xA5_u8; 64];
+        let option = auth_key_option(0x0102_0304, 9, &secret).unwrap();
+        assert_eq!(option.len(), 72);
+        assert_eq!(&option[0..4], &0x0102_0304_i32.to_ne_bytes());
+        assert_eq!(&option[4..6], &9_u16.to_ne_bytes());
+        assert_eq!(&option[6..8], &64_u16.to_ne_bytes());
+        assert_eq!(&option[8..], &secret);
+
+        let key_id = raw_auth_key_id(0x0102_0304, 9);
+        assert_eq!(key_id.assoc_id, 0x0102_0304);
+        assert_eq!(key_id.key_id, 9);
+        assert_eq!(key_id.padding, [0; 2]);
+
+        let oversized = vec![0_u8; crate::MAX_SCTP_AUTH_KEY_BYTES + 1];
+        let error = auth_key_option(0, 1, &oversized).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn peer_authentication_chunks_are_exactly_bounded() {
+        let mut option = vec![0_u8; SCTP_AUTH_CHUNKS_HEADER_BYTES + 2];
+        option[0..4].copy_from_slice(&7_i32.to_ne_bytes());
+        option[4..8].copy_from_slice(&2_u32.to_ne_bytes());
+        option[8..10].copy_from_slice(&[0, 192]);
+        assert_eq!(
+            decode_peer_authenticated_chunks(&option, option.len()).unwrap(),
+            vec![0, 192]
+        );
+
+        assert_eq!(
+            decode_peer_authenticated_chunks(&option, 7)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            decode_peer_authenticated_chunks(&option, 9)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            decode_peer_authenticated_chunks(&option, option.len() + 1)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let mut excessive = vec![0_u8; SCTP_AUTH_CHUNKS_HEADER_BYTES];
+        excessive[4..8].copy_from_slice(&257_u32.to_ne_bytes());
+        assert_eq!(
+            decode_peer_authenticated_chunks(&excessive, excessive.len())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 
     #[test]
@@ -1215,6 +1590,76 @@ mod tests {
             classify_connect_result(-1, Some(io::Error::from_raw_os_error(libc::ECONNREFUSED)))
                 .unwrap_err();
         assert_eq!(refused.raw_os_error(), Some(libc::ECONNREFUSED));
+    }
+
+    #[test]
+    #[ignore = "requires Linux kernel SCTP-AUTH support"]
+    fn loopback_authentication_configuration_and_key_switch() {
+        let events = EventSubscriptions {
+            authentication: true,
+            ..EventSubscriptions::default()
+        };
+
+        let listener = open_socket(AddressFamily::Ipv4, SocketStyle::OneToOne).unwrap();
+        set_authentication_enabled(listener.as_fd(), true).unwrap();
+        require_authenticated_chunk(listener.as_fd(), 0).unwrap();
+        set_initmsg(listener.as_fd(), TEST_INIT).unwrap();
+        set_recv_rcvinfo(listener.as_fd(), true).unwrap();
+        set_events(listener.as_fd(), events).unwrap();
+        bind(listener.as_fd(), &"127.0.0.1:0".parse().unwrap()).unwrap();
+        listen(listener.as_fd(), 8).unwrap();
+        let server_addr = local_addr(listener.as_fd());
+
+        let client = open_socket(AddressFamily::Ipv4, SocketStyle::OneToOne).unwrap();
+        set_authentication_enabled(client.as_fd(), true).unwrap();
+        require_authenticated_chunk(client.as_fd(), 0).unwrap();
+        set_initmsg(client.as_fd(), TEST_INIT).unwrap();
+        set_recv_rcvinfo(client.as_fd(), true).unwrap();
+        set_events(client.as_fd(), events).unwrap();
+        if connect(client.as_fd(), &server_addr).unwrap() == ConnectStatus::InProgress {
+            wait_fd(client.as_fd(), libc::POLLOUT);
+            assert!(socket_error(client.as_fd()).unwrap().is_none());
+        }
+
+        wait_fd(listener.as_fd(), libc::POLLIN);
+        let (accepted, _peer) = accept(listener.as_fd()).unwrap();
+        assert!(peer_authentication_supported(client.as_fd(), 0).unwrap());
+        assert!(peer_authentication_supported(accepted.as_fd(), 0).unwrap());
+        assert!(peer_authenticated_chunks(client.as_fd(), 0)
+            .unwrap()
+            .contains(&0));
+        assert!(peer_authenticated_chunks(accepted.as_fd(), 0)
+            .unwrap()
+            .contains(&0));
+
+        let key = [0x5A_u8; 64];
+        install_auth_key(client.as_fd(), 0, 1, &key).unwrap();
+        install_auth_key(accepted.as_fd(), 0, 1, &key).unwrap();
+        set_active_auth_key(client.as_fd(), 0, 1).unwrap();
+        set_active_auth_key(accepted.as_fd(), 0, 1).unwrap();
+
+        let payload = b"authenticated-sctp-data";
+        assert_eq!(
+            send_msg(
+                client.as_fd(),
+                payload,
+                SendInfo {
+                    stream_id: 0,
+                    flags: 0,
+                    ppid_network_order: 46_u32.to_be(),
+                    context: 0,
+                    assoc_id: 0,
+                },
+            )
+            .unwrap(),
+            payload.len()
+        );
+        let mut buffer = [0_u8; 256];
+        let received = recv_data_message(accepted.as_fd(), &mut buffer);
+        assert_eq!(&buffer[..received.bytes], payload);
+
+        set_event(client.as_fd(), 0, SCTP_SENDER_DRY_EVENT_NOTIFICATION, true).unwrap();
+        set_event(client.as_fd(), 0, SCTP_SENDER_DRY_EVENT_NOTIFICATION, false).unwrap();
     }
 
     #[test]
