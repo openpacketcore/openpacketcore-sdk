@@ -19,7 +19,8 @@
 //! verification, transcript-bound signature AUTH (RFC 7296 method 1 and
 //! RFC 7427 method 14) against caller-trusted keys, bounded typed RFC 7427
 //! signature-hash offer negotiation and transcript-bound directional
-//! method-14 authorities, typed 3GPP DEVICE_IDENTITY,
+//! method-14 authorities including sealed local pre-transmit AUTH
+//! self-verification, typed 3GPP DEVICE_IDENTITY,
 //! P_CSCF_RESELECTION_SUPPORT, and AUTHORIZATION_REJECTED notifications,
 //! product-neutral Child SA
 //! negotiation intent including authenticated-only ESP ENCR_NULL profiles and
@@ -194,11 +195,11 @@ pub use ike_auth::{
     IKEV2_TS_IPV6_ADDR_RANGE,
 };
 pub use ike_auth_signature::{
-    compute_ike_auth_signature, verify_ike_auth_signature, Ikev2SignatureAuthKey,
-    Ikev2SignatureAuthMethod, Ikev2SignatureKeyError, Ikev2SignaturePublicKey,
-    IKEV2_AUTH_METHOD_DIGITAL_SIGNATURE, IKEV2_AUTH_METHOD_RSA_DIGITAL_SIGNATURE,
-    RFC7427_ALGORITHM_IDENTIFIER_ECDSA_SHA2_256, RFC7427_ALGORITHM_IDENTIFIER_ECDSA_SHA2_384,
-    RFC7427_ALGORITHM_IDENTIFIER_RSA_SHA2_256,
+    compute_ike_auth_signature, verify_ike_auth_signature, verify_local_ike_auth_signature,
+    Ikev2LocalAuthSelfVerificationAuthorization, Ikev2SignatureAuthKey, Ikev2SignatureAuthMethod,
+    Ikev2SignatureKeyError, Ikev2SignaturePublicKey, IKEV2_AUTH_METHOD_DIGITAL_SIGNATURE,
+    IKEV2_AUTH_METHOD_RSA_DIGITAL_SIGNATURE, RFC7427_ALGORITHM_IDENTIFIER_ECDSA_SHA2_256,
+    RFC7427_ALGORITHM_IDENTIFIER_ECDSA_SHA2_384, RFC7427_ALGORITHM_IDENTIFIER_RSA_SHA2_256,
 };
 pub use ike_sa_rekey::{
     build_ike_sa_rekey_request, build_ike_sa_rekey_response, decode_ike_sa_rekey_request,

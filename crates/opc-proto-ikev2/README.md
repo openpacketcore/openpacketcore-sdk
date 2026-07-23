@@ -159,8 +159,9 @@ local peer to sign with SHA2-384; no common bidirectional hash is required.
 use opc_protocol::DecodeContext;
 use opc_proto_ikev2::{
     compute_ike_auth_signature, negotiate_ikev2_signature_hash_algorithms,
-    Ikev2SignatureHashAlgorithm, Ikev2SignatureHashLocalOffer,
-    Ikev2SignatureHashLocalRole,
+    verify_local_ike_auth_signature, Ikev2AuthenticationPayload,
+    Ikev2SignatureHashAlgorithm, Ikev2SignatureHashLocalOffer, Ikev2SignatureHashLocalRole,
+    IKEV2_AUTH_METHOD_DIGITAL_SIGNATURE,
 };
 
 # fn example(
@@ -168,6 +169,7 @@ use opc_proto_ikev2::{
 #     material: &opc_proto_ikev2::Ikev2SaInitKeyMaterial,
 #     signed_octets: opc_proto_ikev2::Ikev2IkeAuthSignedOctets<'_>,
 #     key: &opc_proto_ikev2::Ikev2SignatureAuthKey,
+#     local_public_credential: &opc_proto_ikev2::Ikev2SignaturePublicKey,
 #     request_bytes: &[u8],
 #     response_bytes: &[u8],
 # ) -> Result<(), Box<dyn std::error::Error>> {
@@ -189,6 +191,15 @@ let authorities = negotiate_ikev2_signature_hash_algorithms(
 let signing_authorization = authorities
     .signing()
     .for_exchange(request_bytes, response_bytes)?;
+let self_verification_authorization = authorities
+    .signing()
+    .authorize_local_auth_self_verification(
+        request_bytes,
+        response_bytes,
+        signed_octets,
+        Ikev2SignatureHashAlgorithm::Sha2_256,
+        local_public_credential,
+    )?;
 let auth_data = compute_ike_auth_signature(
     profile,
     material,
@@ -196,7 +207,16 @@ let auth_data = compute_ike_auth_signature(
     key,
     Some(signing_authorization),
 )?;
-# let _ = auth_data;
+verify_local_ike_auth_signature(
+    profile,
+    material,
+    &Ikev2AuthenticationPayload {
+        auth_method: IKEV2_AUTH_METHOD_DIGITAL_SIGNATURE,
+        auth_data: &auth_data,
+    },
+    self_verification_authorization,
+)?;
+// Only transmit the AUTH payload after self-verification succeeds.
 # Ok(())
 # }
 ```
@@ -213,6 +233,17 @@ wrong-direction use are typed errors. The product must retain the authority,
 exact messages, and key material together as one IKE-SA state: the SDK cannot
 infer whether separately supplied key material belongs to a different
 application session whose signer-side message happens to be byte-identical.
+
+Local pre-transmit verification deliberately does not invert the IKE role or
+reuse the peer verification authority. Instead,
+`authorize_local_auth_self_verification` captures the local signed-octet
+inputs, selected hash, and caller-selected public credential inside a separate
+sealed authorization. `verify_local_ike_auth_signature` consumes that value,
+accepts method 14 only, and verifies the generated wire AUTH against the same
+admitted crypto-module boundary. Transcript, role, message direction, Nonce,
+identity, method, hash, key material, signature, or credential substitution
+fails closed. Existing peer-verification integration remains unchanged.
+
 RFC 7296 method 1 is unchanged semantically and passes `None`. This boundary
 does not choose certificate identity, certificate trust, signature-key type,
 or product hash/key preference.

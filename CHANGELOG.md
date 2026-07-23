@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **RFC 7427 local AUTH self-verification — `opc-proto-ikev2`:** the local
+  signing authority can now mint a sealed, non-copyable, one-operation
+  pre-transmit verification authorization bound to the exact successful
+  negotiation, local IKE role, retained request/response, opposite-message
+  Nonce, identity body, selected hash, and caller-selected public credential.
+  `verify_local_ike_auth_signature` consumes that authorization and accepts
+  method 14 only, using the same admitted verification operation as peer AUTH
+  without role inversion. ECDSA P-256/SHA-256, P-384/SHA-384, and
+  feature-gated RSA are covered; every transcript, direction, Nonce, identity,
+  method, hash, key-material, signature, and credential substitution fails
+  closed with redaction-safe diagnostics. Existing remote-peer verification
+  remains directionally separate and rejects local signed octets (#500).
 - **BREAKING — RFC 7427 signature-hash authority — `opc-proto-ikev2`:**
   adds bounded typed `SIGNATURE_HASH_ALGORITHMS` (16431) encode/decode,
   preserves both ordered extensible offers, and computes separate directional

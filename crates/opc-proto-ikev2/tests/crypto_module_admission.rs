@@ -26,18 +26,18 @@ use opc_proto_ikev2::{
     ikev2_aes_gcm_protected_body_len, ikev2_certreq_authority_key_hash, ikev2_nat_detection_hash,
     install_ikev2_crypto_module, negotiate_ikev2_signature_hash_algorithms,
     seal_ikev2_sa_init_aes_cbc_protected_payload, seal_ikev2_sa_init_protected_payload,
-    verify_ike_auth_signature, Header, HeaderFlags, Ikev2AuthenticationPayload,
-    Ikev2CertReqSubjectPublicKeyInfo, Ikev2CertReqSubjectPublicKeyInfoError,
-    Ikev2CryptoModuleErrorCode, Ikev2CryptoModuleInstallError, Ikev2CryptoRequirements,
-    Ikev2DhGroup, Ikev2EncryptionAlgorithm, Ikev2EphemeralDhKey, Ikev2IkeAuthPeer,
-    Ikev2IkeAuthSignedOctets, Ikev2IkeAuthVerificationError, Ikev2IntegrityAlgorithm,
-    Ikev2PrfAlgorithm, Ikev2ProtectedPayloadCryptoError, Ikev2ProtectedPayloadDirection,
-    Ikev2SaInitCryptoError, Ikev2SaInitCryptoProfile, Ikev2SignatureAuthKey,
-    Ikev2SignatureHashAlgorithm, Ikev2SignatureHashLocalRole, Ikev2SignatureHashSigningAuthority,
-    Ikev2SignatureHashVerificationAuthority, Ikev2SignaturePublicKey, Ikev2SoftwareCryptoModule,
-    Ikev2SoftwareCryptoOperations, PayloadType, ProtectedPayloadContext, ProtectedPayloadKind,
-    ProtectedPayloadSealContext, IKEV2_AUTH_METHOD_DIGITAL_SIGNATURE,
-    IKEV2_CERTREQ_SUBJECT_PUBLIC_KEY_INFO_MAX_LEN,
+    verify_ike_auth_signature, verify_local_ike_auth_signature, Header, HeaderFlags,
+    Ikev2AuthenticationPayload, Ikev2CertReqSubjectPublicKeyInfo,
+    Ikev2CertReqSubjectPublicKeyInfoError, Ikev2CryptoModuleErrorCode,
+    Ikev2CryptoModuleInstallError, Ikev2CryptoRequirements, Ikev2DhGroup, Ikev2EncryptionAlgorithm,
+    Ikev2EphemeralDhKey, Ikev2IkeAuthPeer, Ikev2IkeAuthSignedOctets, Ikev2IkeAuthVerificationError,
+    Ikev2IntegrityAlgorithm, Ikev2PrfAlgorithm, Ikev2ProtectedPayloadCryptoError,
+    Ikev2ProtectedPayloadDirection, Ikev2SaInitCryptoError, Ikev2SaInitCryptoProfile,
+    Ikev2SignatureAuthKey, Ikev2SignatureHashAlgorithm, Ikev2SignatureHashLocalRole,
+    Ikev2SignatureHashSigningAuthority, Ikev2SignatureHashVerificationAuthority,
+    Ikev2SignaturePublicKey, Ikev2SoftwareCryptoModule, Ikev2SoftwareCryptoOperations, PayloadType,
+    ProtectedPayloadContext, ProtectedPayloadKind, ProtectedPayloadSealContext,
+    IKEV2_AUTH_METHOD_DIGITAL_SIGNATURE, IKEV2_CERTREQ_SUBJECT_PUBLIC_KEY_INFO_MAX_LEN,
 };
 use opc_protocol::DecodeContext;
 use zeroize::Zeroizing;
@@ -1107,6 +1107,70 @@ fn one_admitted_module_handles_every_operation_and_withdrawal_never_falls_back()
         module.counts.snapshot(),
         before_nonce_mismatch,
         "nonce mismatch must fail before PRF, signing, or verification dispatch"
+    );
+
+    let local_authorization = signing_authority
+        .authorize_local_auth_self_verification(
+            &sa_init_request,
+            &sa_init_response,
+            signed_octets,
+            Ikev2SignatureHashAlgorithm::Sha2_256,
+            &public,
+        )
+        .expect("exact local self-verification authorization");
+    verify_local_ike_auth_signature(
+        profile,
+        &material,
+        &Ikev2AuthenticationPayload {
+            auth_method: IKEV2_AUTH_METHOD_DIGITAL_SIGNATURE,
+            auth_data: &auth_data,
+        },
+        local_authorization,
+    )
+    .expect("local self-verification routed");
+
+    let before_local_rejections = module.counts.snapshot();
+    let wrong_local_nonce = Ikev2IkeAuthSignedOctets {
+        peer_nonce: support::TEST_RESPONDER_NONCE,
+        ..signed_octets
+    };
+    assert_eq!(
+        signing_authority
+            .authorize_local_auth_self_verification(
+                &sa_init_request,
+                &sa_init_response,
+                wrong_local_nonce,
+                Ikev2SignatureHashAlgorithm::Sha2_256,
+                &public,
+            )
+            .expect_err("wrong local nonce must fail before authorization"),
+        Ikev2IkeAuthVerificationError::SignatureHashAuthorityExchangeMismatch
+    );
+    let method_substitution_authorization = signing_authority
+        .authorize_local_auth_self_verification(
+            &sa_init_request,
+            &sa_init_response,
+            signed_octets,
+            Ikev2SignatureHashAlgorithm::Sha2_256,
+            &public,
+        )
+        .expect("exact local self-verification authorization");
+    assert_eq!(
+        verify_local_ike_auth_signature(
+            profile,
+            &material,
+            &Ikev2AuthenticationPayload {
+                auth_method: 1,
+                auth_data: &auth_data,
+            },
+            method_substitution_authorization,
+        ),
+        Err(Ikev2IkeAuthVerificationError::UnsupportedAuthenticationMethod { method: 1 })
+    );
+    assert_eq!(
+        module.counts.snapshot(),
+        before_local_rejections,
+        "local authority and method rejection must precede PRF or signature dispatch"
     );
 
     let unadmitted_profile = Ikev2SaInitCryptoProfile::new_encrypt_then_mac(
