@@ -75,7 +75,9 @@ use opc_gtpu_ebpf_common::{
     UPLINK_SOURCE_PORT_VALUE_LEN,
 };
 #[cfg(test)]
-use opc_gtpu_ebpf_common::{classify_ipv6_extension_step, Ipv6ExtensionStep};
+use opc_gtpu_ebpf_common::{
+    classify_ipv6_extension_step, internet_checksum, udp_ipv6_checksum, Ipv6ExtensionStep,
+};
 
 /// Uplink FAR: UE PAA (IPv4, network order) -> encap state.
 #[map]
@@ -1736,6 +1738,59 @@ fn malformed_downlink() -> i32 {
 // UDP datagram into thousands of helper invocations.
 const CHECKSUM_CHUNK_LEN: usize = 128;
 
+#[derive(Clone, Copy)]
+struct ChecksumRemainderPlan {
+    chunk_64: bool,
+    chunk_32: bool,
+    chunk_16: bool,
+    chunk_8: bool,
+    chunk_4: bool,
+    suffix_len: usize,
+}
+
+/// Decompose every sub-128-byte tail into complete helper reads plus at most
+/// one zero-padded one-to-three-byte suffix.
+///
+/// Keeping this plan explicit prevents a larger residual tail from being
+/// mistaken for a suffix after the fixed helper calls have advanced `cursor`.
+#[inline(always)]
+const fn checksum_remainder_plan(mut length: usize) -> Option<ChecksumRemainderPlan> {
+    if length >= CHECKSUM_CHUNK_LEN {
+        return None;
+    }
+    let chunk_64 = length >= 64;
+    if chunk_64 {
+        length -= 64;
+    }
+    let chunk_32 = length >= 32;
+    if chunk_32 {
+        length -= 32;
+    }
+    let chunk_16 = length >= 16;
+    if chunk_16 {
+        length -= 16;
+    }
+    let chunk_8 = length >= 8;
+    if chunk_8 {
+        length -= 8;
+    }
+    let chunk_4 = length >= 4;
+    if chunk_4 {
+        length -= 4;
+    }
+    if length > 3 {
+        return None;
+    }
+    Some(ChecksumRemainderPlan {
+        chunk_64,
+        chunk_32,
+        chunk_16,
+        chunk_8,
+        chunk_4,
+        suffix_len: length,
+    })
+}
+
 #[repr(C)]
 struct ChecksumLoopContext {
     skb: *mut __sk_buff,
@@ -1885,25 +1940,25 @@ fn checksum_skb_region(
     }
     seed = loop_context.seed;
     let mut cursor = usize::try_from(loop_context.offset).map_err(|_| ())?;
-    let mut remaining = length % CHECKSUM_CHUNK_LEN;
+    let plan = checksum_remainder_plan(length % CHECKSUM_CHUNK_LEN).ok_or(())?;
 
-    if remaining >= 32 {
+    if plan.chunk_64 {
+        (cursor, seed) = checksum_packet_chunk::<64>(ctx, cursor, seed)?;
+    }
+    if plan.chunk_32 {
         (cursor, seed) = checksum_packet_chunk::<32>(ctx, cursor, seed)?;
-        remaining -= 32;
     }
-    if remaining >= 16 {
+    if plan.chunk_16 {
         (cursor, seed) = checksum_packet_chunk::<16>(ctx, cursor, seed)?;
-        remaining -= 16;
     }
-    if remaining >= 8 {
+    if plan.chunk_8 {
         (cursor, seed) = checksum_packet_chunk::<8>(ctx, cursor, seed)?;
-        remaining -= 8;
     }
-    if remaining >= 4 {
+    if plan.chunk_4 {
         (cursor, seed) = checksum_packet_chunk::<4>(ctx, cursor, seed)?;
-        remaining -= 4;
     }
 
+    let remaining = plan.suffix_len;
     if remaining != 0 {
         let mut suffix = [0_u8; 4];
         suffix[0] = ctx.load(cursor).map_err(|_| ())?;
@@ -2520,6 +2575,65 @@ mod tests {
         // without an additional big-endian conversion.
         let helper_sum = 0xac68;
         assert_eq!(finalized_internet_checksum_bytes(helper_sum), [0x97, 0x53]);
+    }
+
+    #[test]
+    fn checksum_remainder_plan_covers_every_byte_exactly() {
+        for length in 0..CHECKSUM_CHUNK_LEN {
+            let plan = checksum_remainder_plan(length).expect("bounded checksum remainder");
+            let covered = usize::from(plan.chunk_64) * 64
+                + usize::from(plan.chunk_32) * 32
+                + usize::from(plan.chunk_16) * 16
+                + usize::from(plan.chunk_8) * 8
+                + usize::from(plan.chunk_4) * 4
+                + plan.suffix_len;
+            assert_eq!(covered, length);
+            assert!(plan.suffix_len <= 3);
+        }
+        assert!(checksum_remainder_plan(CHECKSUM_CHUNK_LEN).is_none());
+    }
+
+    #[test]
+    fn live_ipv6_gtpu_checksum_vector_covers_the_complete_73_byte_inner_packet() {
+        let source = [
+            0x20, 0x01, 0x0d, 0xb8, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x01,
+        ];
+        let destination = [
+            0x20, 0x01, 0x0d, 0xb8, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x10,
+        ];
+        let udp = [
+            0x08, 0x68, 0x08, 0x68, 0x00, 0x59, 0x00, 0x00, 0x30, 0xff, 0x00, 0x49, 0x62, 0x00,
+            0x00, 0x02, 0x60, 0x00, 0x00, 0x00, 0x00, 0x21, 0x11, 0x3f, 0x20, 0x01, 0x0d, 0xb8,
+            0x00, 0x45, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x20, 0x01,
+            0x0d, 0xb8, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08,
+            0x15, 0xe1, 0x00, 0x35, 0x00, 0x21, 0xb1, 0x5b, 0x67, 0x72, 0x6f, 0x75, 0x70, 0x65,
+            0x64, 0x2d, 0x76, 0x36, 0x2d, 0x69, 0x6e, 0x6e, 0x65, 0x72, 0x2d, 0x76, 0x36, 0x2d,
+            0x6f, 0x75, 0x74, 0x65, 0x72,
+        ];
+
+        assert_eq!(udp.len(), 16 + 73);
+        assert_eq!(udp_ipv6_checksum(source, destination, &udp), Some(0x8e6c));
+
+        let mut pseudo_header = [0_u8; 40];
+        pseudo_header[..16].copy_from_slice(&source);
+        pseudo_header[16..32].copy_from_slice(&destination);
+        pseudo_header[32..36].copy_from_slice(&(udp.len() as u32).to_be_bytes());
+        pseudo_header[39] = IPV6_NH_UDP;
+        let mut prior_bug_input = pseudo_header.to_vec();
+        prior_bug_input.extend_from_slice(&udp[..16]);
+        prior_bug_input.extend_from_slice(&udp[16..16 + 63]);
+        assert_eq!(
+            internet_checksum(&prior_bug_input),
+            0x485d,
+            "the prior 32+16+8+4+3 plan omitted the final ten bytes"
+        );
+
+        let plan = checksum_remainder_plan(73).expect("73-byte live inner packet");
+        assert!(plan.chunk_64);
+        assert!(plan.chunk_8);
+        assert_eq!(plan.suffix_len, 1);
     }
 
     #[test]
