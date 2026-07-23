@@ -33,6 +33,12 @@ control-plane stack.
   zero TWAN spare flags. PAA has explicit dynamic IPv4/IPv6/IPv4v6,
   AAA-provided static IPv4/IPv6/IPv4v6, Non-IP, and Ethernet constructors;
   encode validates that the selected family matches its address fields.
+- `decode_typed_ie_sequence` applies `DecodeContext::unknown_ie_policy` at
+  every top-level and Bearer Context scope. `Drop` omits unsupported IEs from
+  the typed view, `Preserve` retains byte-exact `TypedIeValue::Raw` entries,
+  and `Reject` fails with `UnknownCriticalIe`. `TypedIe::decode_from_raw`
+  necessarily returns one value, so callers needing omission use the sequence
+  API.
 - `Message<'a>` and `OwnedMessage` provide the raw borrowed/owned message
   shells and implement the shared `opc-protocol` codec traits.
 - `inspect_gtpv2c_request` and `Gtpv2cErrorResponsePlanner` form a separate
@@ -239,9 +245,10 @@ limits, UDP source selection, session lookup, and logging policy.
 message grammar keyed by procedure, direction, and exact enclosing Bearer
 Context instance before decoding its value. The grammar applies explicit S2b
 applicability where the profile assigns an exact endpoint role. It discards
-unexpected known keys, preserves genuinely unknown optional keys, retains the
-first non-repeatable type/instance key in each exact scope, ignores later
-occurrences, and truncates declared lists at their procedure-table bounds.
+unexpected known keys, applies `UnknownIePolicy` to genuinely unknown optional
+keys, retains the first non-repeatable type/instance key in each exact scope,
+ignores later occurrences, and truncates declared lists at their
+procedure-table bounds.
 Typed procedure projections enforce required presence, F-TEID interface/value
 semantics, conditional S2b endpoint/context relationships, and correlation.
 Length, mandatory-field, and semantic validation
@@ -263,9 +270,10 @@ IP, and the UICC-less emergency identity requires that local IP. Delete Session
 uses UE Local IP/UDP instance 0, UE TCP Port instance 1, WLAN Location and
 Timestamp instance 1, and optional Diameter/IKEv2 RAN/NAS Cause instance 0;
 it has no ePDG-IP instance-3 role. Procedure-aware receive discards wrong known
-instances and retains genuinely unknown optionals. Canonical sender
+instances and applies the selected unknown-IE policy to genuinely unknown
+optionals. Canonical sender
 `additional_ies` apply that same per-procedure type/instance grammar, while
-still preserving genuinely unknown and private extensions.
+still allowing explicitly supplied unknown and private extensions.
 
 The runnable [`dedicated_bearer` example](examples/dedicated_bearer.rs) shows
 the GTP transaction boundary for receiving a triggered request, projecting its

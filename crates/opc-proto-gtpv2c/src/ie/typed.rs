@@ -3532,7 +3532,10 @@ pub struct TypedIe<'a> {
 }
 
 impl<'a> TypedIe<'a> {
-    /// Decode a sequence of GTPv2-C IEs into typed values with raw fallback.
+    /// Decode a sequence of GTPv2-C IEs under the context's unknown-IE policy.
+    ///
+    /// Unknown IEs are omitted, retained as [`TypedIeValue::Raw`], or rejected
+    /// according to [`DecodeContext::unknown_ie_policy`].
     pub fn decode_sequence(input: &'a [u8], ctx: DecodeContext) -> Result<Vec<Self>, DecodeError> {
         decode_typed_ie_sequence(input, ctx, 0)
     }
@@ -3542,6 +3545,12 @@ impl<'a> TypedIe<'a> {
     /// `base_offset` is the absolute byte position of the start of the raw IE
     /// header within the containing input. It is used so that value-level decode
     /// errors report offsets relative to the message rather than to the IE value.
+    ///
+    /// This single-result conversion cannot represent deliberate omission.
+    /// Consequently, an unsupported IE is returned as [`TypedIeValue::Raw`]
+    /// under both [`UnknownIePolicy::Drop`] and [`UnknownIePolicy::Preserve`].
+    /// Use [`Self::decode_sequence`] or [`decode_typed_ie_sequence`] when the
+    /// complete three-way policy must be enforced.
     pub fn decode_from_raw(
         raw: RawIe<'a>,
         ctx: DecodeContext,
@@ -3890,7 +3899,15 @@ pub fn encode_typed_ie_sequence(
     Ok(())
 }
 
-/// Decode a sequence of GTPv2-C IEs into typed values with raw fallback.
+/// Decode a sequence of GTPv2-C IEs under the selected unknown-IE policy.
+///
+/// [`UnknownIePolicy::Drop`] omits unsupported IEs from the returned typed
+/// view, [`UnknownIePolicy::Preserve`] retains them as
+/// [`TypedIeValue::Raw`], and [`UnknownIePolicy::Reject`] returns
+/// [`DecodeErrorCode::UnknownCriticalIe`]. The policy is applied recursively
+/// to grouped [`BearerContext`] members. This changes only the interpreted
+/// typed sequence; callers that retain the enclosing raw message bytes can
+/// still perform a separate raw-preserving re-encode.
 ///
 /// @spec 3GPP TS29274 R18 8.2
 /// @req REQ-3GPP-TS29274-R18-S2B-IE-004
@@ -4019,6 +4036,15 @@ fn decode_typed_ie_sequence_at<'a>(
                 }) {
                     continue;
                 }
+                // Drop before duplicate handling. A deliberately ignored
+                // unsupported key cannot make an otherwise acceptable
+                // sequence fail `DuplicateIePolicy::Reject`, and it must not
+                // influence First/Last ordering for the retained typed view.
+                if matches!(ctx.unknown_ie_policy, UnknownIePolicy::Drop)
+                    && !is_supported_typed_ie(raw.ie_type)
+                {
+                    continue;
+                }
                 let key = (raw.ie_type, raw.instance);
                 let first_offset = seen.iter().find_map(|(seen_key, first_offset)| {
                     (*seen_key == key).then_some(*first_offset)
@@ -4099,6 +4125,41 @@ fn decode_typed_ie_sequence_at<'a>(
         }
     }
     Ok(ies)
+}
+
+const fn is_supported_typed_ie(ie_type: u8) -> bool {
+    matches!(
+        ie_type,
+        IE_TYPE_IMSI
+            | IE_TYPE_CAUSE
+            | IE_TYPE_RECOVERY
+            | IE_TYPE_APN
+            | IE_TYPE_AMBR
+            | IE_TYPE_EBI
+            | IE_TYPE_IP_ADDRESS
+            | IE_TYPE_MEI
+            | IE_TYPE_MSISDN
+            | IE_TYPE_INDICATION
+            | IE_TYPE_PCO
+            | IE_TYPE_PAA
+            | IE_TYPE_BEARER_QOS
+            | IE_TYPE_RAT_TYPE
+            | IE_TYPE_SERVING_NETWORK
+            | IE_TYPE_BEARER_TFT
+            | IE_TYPE_F_TEID
+            | IE_TYPE_BEARER_CONTEXT
+            | IE_TYPE_CHARGING_ID
+            | IE_TYPE_CHARGING_CHARACTERISTICS
+            | IE_TYPE_TRACE_INFORMATION
+            | IE_TYPE_PDN_TYPE
+            | IE_TYPE_PORT_NUMBER
+            | IE_TYPE_APN_RESTRICTION
+            | IE_TYPE_SELECTION_MODE
+            | IE_TYPE_APCO
+            | IE_TYPE_TWAN_IDENTIFIER
+            | IE_TYPE_RAN_NAS_CAUSE
+            | IE_TYPE_TWAN_IDENTIFIER_TIMESTAMP
+    )
 }
 
 fn apply_duplicate_policy<'a>(

@@ -4,6 +4,10 @@
 
 //! PFCP protocol codec (TS 29.244) for OpenPacketCore.
 //!
+//! [`ie::decode_typed_ie_sequence`] is the unknown-IE policy boundary for
+//! top-level and grouped typed views. The raw [`InformationElement`] message
+//! layer remains independently byte-preserving.
+//!
 //! @spec 3GPP TS29244 R18
 //! @req REQ-3GPP-TS29244-R18-001
 //! @conformance v0 — see CONFORMANCE.md
