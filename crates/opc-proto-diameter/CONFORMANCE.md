@@ -551,14 +551,20 @@ responses to an authenticated, process-unique connection generation.
 connection, Hop-by-Hop and End-to-End identifiers, P, exact Proxy-Info, and a
 matching Session-Id when the generic grammar carries one. Ordinary application
 answers additionally satisfy the configured direct/routed logical-Origin
-policy and request application/authentication facts. Generic errors skip only
-terminal logical-Origin matching because an RFC 6733 intermediary may originate
-them. Exact 3002/3004 additionally require Session-Id presence and exact match,
-plus an exact ASCII-case-insensitive Origin-Host/Origin-Realm match against the
-authenticated dialed agent. `SwmExpectedAnswerPeer::routed_via` carries that
-agent pair independently of terminal AAA authority; plain `routed` carries no
-agent authority and fails closed. A direct binding derives agent authority from
-the exact negotiated peer identity. Destination values never supply either
+policy and request application/authentication facts. Every formerly combined
+application predicate has a stable value-free correlation outcome:
+Auth-Application-Id, Auth-Request-Type, successful-answer mobility omission,
+contradictory or unauthorized mobility content, subscriber authorization,
+overload control, APN authorization, and final answer validation. Generic
+errors skip only terminal logical-Origin matching because an RFC 6733
+intermediary may originate them. Exact 3002/3004 additionally require
+Session-Id presence and exact match, plus an exact ASCII-case-insensitive
+Origin-Host/Origin-Realm match against the authenticated dialed agent; an
+invalid result/request application binding is reported separately from those
+agent-authority gates. `SwmExpectedAnswerPeer::routed_via` carries that agent
+pair independently of terminal AAA authority; plain `routed` carries no agent
+authority and fails closed. A direct binding derives agent authority from the
+exact negotiated peer identity. Destination values never supply either
 authority. Parsed Redirect-Host values are inaccessible and cannot be
 re-encoded before that complete gate succeeds.
 

@@ -2889,8 +2889,24 @@ pub enum SwmDiameterEapCorrelationError {
     AgentIdentityMismatch,
     /// An ordinary answer violates its trusted logical-origin policy.
     PeerIdentityMismatch,
-    /// Ordinary application correlation fields are inconsistent.
-    ApplicationMismatch,
+    /// The answer's Auth-Application-Id differs from the request.
+    AuthApplicationIdMismatch,
+    /// The answer's Auth-Request-Type differs from the request.
+    AuthRequestTypeMismatch,
+    /// A successful answer omitted mobility features required by the offer.
+    MobilityFeatureMissing,
+    /// The answer's mobility features contradict or exceed the request offer.
+    MobilityFeatureMismatch,
+    /// Subscriber authorization facts contradict the retained request context.
+    SubscriberAuthorizationMismatch,
+    /// Answer overload-control facts contradict the retained request offer.
+    OverloadControlMismatch,
+    /// Answer APN authorization facts contradict the retained request context.
+    ApnAuthorizationMismatch,
+    /// The correlated answer failed its final structural validation.
+    AnswerValidationFailure,
+    /// A delivery-agent result is invalid for the retained request shape.
+    AgentApplicationBindingInvalid,
 }
 
 impl SwmDiameterEapCorrelationError {
@@ -2907,7 +2923,15 @@ impl SwmDiameterEapCorrelationError {
             Self::AgentAuthorityMissing => "swm_dea_agent_authority_missing",
             Self::AgentIdentityMismatch => "swm_dea_agent_identity_mismatch",
             Self::PeerIdentityMismatch => "swm_dea_peer_identity_mismatch",
-            Self::ApplicationMismatch => "swm_dea_application_mismatch",
+            Self::AuthApplicationIdMismatch => "swm_dea_auth_application_id_mismatch",
+            Self::AuthRequestTypeMismatch => "swm_dea_auth_request_type_mismatch",
+            Self::MobilityFeatureMissing => "swm_dea_mobility_feature_missing",
+            Self::MobilityFeatureMismatch => "swm_dea_mobility_feature_mismatch",
+            Self::SubscriberAuthorizationMismatch => "swm_dea_subscriber_authorization_mismatch",
+            Self::OverloadControlMismatch => "swm_dea_overload_control_mismatch",
+            Self::ApnAuthorizationMismatch => "swm_dea_apn_authorization_mismatch",
+            Self::AnswerValidationFailure => "swm_dea_answer_validation_failure",
+            Self::AgentApplicationBindingInvalid => "swm_dea_agent_application_binding_invalid",
         }
     }
 }
@@ -10697,7 +10721,7 @@ fn ensure_correlated_response(
             SwmDiameterEapAgentDeliveryFailure::from_result_code(answer.result_code)
         {
             if !failure.is_valid_for(request_envelope.request()) {
-                return Err(SwmDiameterEapCorrelationError::ApplicationMismatch);
+                return Err(SwmDiameterEapCorrelationError::AgentApplicationBindingInvalid);
             }
             if answer.session_id.as_deref().map(String::as_str)
                 != Some(request_envelope.request.session_id.as_ref())
@@ -10721,25 +10745,49 @@ fn ensure_correlated_response(
             return Err(SwmDiameterEapCorrelationError::PeerIdentityMismatch);
         }
         let request = &request_envelope.request;
-        if request.auth_application_id != answer.auth_application_id
-            || request.auth_request_type != answer.auth_request_type
-            || !mobility_answer_matches_offer(
-                request.mip6_feature_vector,
-                answer.mip6_feature_vector,
-                answer.result.is_diameter_success(),
-            )
-            || !subscriber_authorization_matches_request(request_envelope, answer)
-            || lifecycle::validate_diameter_eap_answer_overload_control_for_request(
-                request.oc_supported_features.as_ref(),
-                answer.oc_supported_features.as_ref(),
-                answer.oc_olr.as_ref(),
-            )
-            .is_err()
-            || apn::validate_for_request(request_envelope, answer).is_err()
-            || answer.validate_for_correlation().is_err()
-        {
-            return Err(SwmDiameterEapCorrelationError::ApplicationMismatch);
+        if request.auth_application_id != answer.auth_application_id {
+            return Err(SwmDiameterEapCorrelationError::AuthApplicationIdMismatch);
         }
+        if request.auth_request_type != answer.auth_request_type {
+            return Err(SwmDiameterEapCorrelationError::AuthRequestTypeMismatch);
+        }
+        ensure_correlated_mobility_features(
+            request.mip6_feature_vector,
+            answer.mip6_feature_vector,
+            answer.result.is_diameter_success(),
+        )?;
+        if !subscriber_authorization_matches_request(request_envelope, answer) {
+            return Err(SwmDiameterEapCorrelationError::SubscriberAuthorizationMismatch);
+        }
+        if lifecycle::validate_diameter_eap_answer_overload_control_for_request(
+            request.oc_supported_features.as_ref(),
+            answer.oc_supported_features.as_ref(),
+            answer.oc_olr.as_ref(),
+        )
+        .is_err()
+        {
+            return Err(SwmDiameterEapCorrelationError::OverloadControlMismatch);
+        }
+        if apn::validate_for_request(request_envelope, answer).is_err() {
+            return Err(SwmDiameterEapCorrelationError::ApnAuthorizationMismatch);
+        }
+        if answer.validate_for_correlation().is_err() {
+            return Err(SwmDiameterEapCorrelationError::AnswerValidationFailure);
+        }
+    }
+    Ok(())
+}
+
+fn ensure_correlated_mobility_features(
+    offered: Option<SwmMip6FeatureVector>,
+    authorized: Option<SwmMip6FeatureVector>,
+    exact_success: bool,
+) -> Result<(), SwmDiameterEapCorrelationError> {
+    if exact_success && offered.is_some() && authorized.is_none() {
+        return Err(SwmDiameterEapCorrelationError::MobilityFeatureMissing);
+    }
+    if !mobility_answer_matches_offer(offered, authorized, exact_success) {
+        return Err(SwmDiameterEapCorrelationError::MobilityFeatureMismatch);
     }
     Ok(())
 }
@@ -11023,4 +11071,329 @@ fn decode_structural_error_at(
 ) -> DecodeError {
     DecodeError::new(DecodeErrorCode::Structural { reason }, offset)
         .with_spec_ref(SpecRef::new("3gpp", "TS29273", section))
+}
+
+#[cfg(test)]
+mod diameter_eap_correlation_tests {
+    use std::num::NonZeroU64;
+
+    use super::*;
+
+    const CONNECTION: SwmDiameterConnectionToken = SwmDiameterConnectionToken::new(NonZeroU64::MIN);
+    const TRANSACTION: SwmDiameterTransaction =
+        SwmDiameterTransaction::new(0x1020_3040, 0x5060_7080);
+
+    fn request_facts() -> SwmDiameterEapRequest {
+        SwmDiameterEapRequest {
+            session_id: "session;synthetic;correlation".to_owned().into(),
+            auth_application_id: APPLICATION_ID.get(),
+            origin_host: "epdg.synthetic.example".to_owned().into(),
+            origin_realm: "visited.synthetic.example".to_owned().into(),
+            destination_realm: "home.synthetic.example".to_owned().into(),
+            destination_host: Some("aaa.synthetic.example".to_owned().into()),
+            user_name: Some("subscriber@synthetic.invalid".to_owned().into()),
+            rat_type: None,
+            service_selection: None,
+            mip6_feature_vector: None,
+            qos_capability: None,
+            visited_network_identifier: None,
+            aaa_failure_indication: None,
+            supported_features: Vec::new(),
+            ue_local_ip_address: None,
+            oc_supported_features: None,
+            auth_request_type: AuthRequestType::AuthorizeAuthenticate,
+            eap_payload: vec![2, 0x35, 0, 5, 1].into(),
+            emergency_services: None,
+            terminal_information: None,
+            high_priority_access_info: None,
+            state_avps: Vec::new(),
+            route_records: Vec::new(),
+            extensions: Default::default(),
+        }
+    }
+
+    fn bound_request() -> SwmDiameterEapRequestEnvelope {
+        SwmDiameterEapRequestEnvelope::for_outbound_on(
+            request_facts(),
+            TRANSACTION,
+            SwmExpectedAnswerPeer::direct(
+                CONNECTION,
+                "aaa.synthetic.example",
+                "home.synthetic.example",
+            ),
+        )
+    }
+
+    fn answer_facts() -> SwmDiameterEapAnswer {
+        SwmDiameterEapAnswer {
+            session_id: "session;synthetic;correlation".to_owned().into(),
+            auth_application_id: APPLICATION_ID.get(),
+            auth_request_type: AuthRequestType::AuthorizeAuthenticate,
+            result: SwmDiameterResult::Base(base::RESULT_CODE_DIAMETER_SUCCESS),
+            origin_host: "aaa.synthetic.example".to_owned().into(),
+            origin_realm: "home.synthetic.example".to_owned().into(),
+            user_name: None,
+            subscriber_authorization: Default::default(),
+            mip6_feature_vector: None,
+            supported_features: Vec::new(),
+            oc_supported_features: None,
+            oc_olr: None,
+            load_reports: Vec::new(),
+            service_selection: None,
+            default_context_identifier: None,
+            apn_configurations: Vec::new(),
+            mobile_node_identifier: None,
+            session_timeout: None,
+            multi_round_timeout: None,
+            authorization_lifetime: None,
+            auth_grace_period: None,
+            re_auth_request_type: None,
+            eap_payload: Some(vec![3, 0x35, 0, 4].into()),
+            eap_reissued_payload: None,
+            error_message: None,
+            state_avps: Vec::new(),
+            eap_master_session_key: None,
+            extensions: Default::default(),
+        }
+    }
+
+    fn application_response(answer: SwmDiameterEapAnswer) -> SwmDiameterEapResponseEnvelope {
+        SwmDiameterEapResponseEnvelope {
+            transaction: TRANSACTION,
+            proxiable: true,
+            received_on: CONNECTION,
+            response: SwmDiameterEapResponse::Application(Box::new(answer)),
+            proxy_infos: Vec::new(),
+        }
+    }
+
+    fn correlate_application(
+        request: SwmDiameterEapRequestEnvelope,
+        answer: SwmDiameterEapAnswer,
+    ) -> Result<SwmCorrelatedDiameterEapResponse, SwmDiameterEapCorrelationError> {
+        request.correlate_response(application_response(answer))
+    }
+
+    fn assert_correlation_error(
+        result: Result<SwmCorrelatedDiameterEapResponse, SwmDiameterEapCorrelationError>,
+        expected: SwmDiameterEapCorrelationError,
+    ) {
+        assert_eq!(result.err(), Some(expected));
+    }
+
+    #[test]
+    fn exact_application_correlation_remains_accepted() {
+        assert!(correlate_application(bound_request(), answer_facts()).is_ok());
+    }
+
+    #[test]
+    fn application_id_mismatch_has_typed_outcome() {
+        let mut request = bound_request();
+        request.request.auth_application_id = APPLICATION_ID.get() + 1;
+        assert_correlation_error(
+            correlate_application(request, answer_facts()),
+            SwmDiameterEapCorrelationError::AuthApplicationIdMismatch,
+        );
+    }
+
+    #[test]
+    fn auth_request_type_mismatch_has_typed_outcome() {
+        let mut request = bound_request();
+        request.request.auth_request_type = AuthRequestType::AuthorizeOnly;
+        assert_correlation_error(
+            correlate_application(request, answer_facts()),
+            SwmDiameterEapCorrelationError::AuthRequestTypeMismatch,
+        );
+    }
+
+    #[test]
+    fn successful_answer_missing_offered_mobility_has_typed_outcome() {
+        let mut request = bound_request();
+        request.request.mip6_feature_vector = Some(SwmMip6FeatureVector::gtpv2_only());
+        assert_correlation_error(
+            correlate_application(request, answer_facts()),
+            SwmDiameterEapCorrelationError::MobilityFeatureMissing,
+        );
+    }
+
+    #[test]
+    fn unauthorized_and_contradictory_mobility_have_typed_outcome() {
+        let mut unauthorized = answer_facts();
+        unauthorized.mip6_feature_vector = Some(SwmMip6FeatureVector::gtpv2_only());
+        assert_correlation_error(
+            correlate_application(bound_request(), unauthorized),
+            SwmDiameterEapCorrelationError::MobilityFeatureMismatch,
+        );
+
+        let mut request = bound_request();
+        request.request.mip6_feature_vector = Some(SwmMip6FeatureVector::gtpv2_only());
+        let mut contradictory = answer_facts();
+        contradictory.mip6_feature_vector = Some(SwmMip6FeatureVector::from_bits_retain(
+            SwmMip6FeatureVector::GTPV2_SUPPORTED | SwmMip6FeatureVector::ASSIGN_LOCAL_IP,
+        ));
+        assert_correlation_error(
+            correlate_application(request, contradictory),
+            SwmDiameterEapCorrelationError::MobilityFeatureMismatch,
+        );
+    }
+
+    #[test]
+    fn subscriber_authorization_mismatch_has_typed_outcome() {
+        let mut answer = answer_facts();
+        let apn_oi_replacement = match SwmApnOiReplacement::new("mnc001.mcc001.gprs") {
+            Ok(value) => value,
+            Err(error) => panic!("synthetic APN-OI-Replacement failed: {error}"),
+        };
+        answer.subscriber_authorization =
+            SwmDeaSubscriberAuthorization::new().with_apn_oi_replacement(apn_oi_replacement);
+        assert_correlation_error(
+            correlate_application(bound_request(), answer),
+            SwmDiameterEapCorrelationError::SubscriberAuthorizationMismatch,
+        );
+    }
+
+    #[test]
+    fn overload_control_mismatch_has_typed_outcome() {
+        let mut answer = answer_facts();
+        answer.oc_supported_features = Some(SwmOcSupportedFeatures::loss());
+        assert_correlation_error(
+            correlate_application(bound_request(), answer),
+            SwmDiameterEapCorrelationError::OverloadControlMismatch,
+        );
+    }
+
+    #[test]
+    fn apn_authorization_mismatch_has_typed_outcome() {
+        let mut request = bound_request();
+        request.request.service_selection = Some("ims.synthetic.example".to_owned().into());
+        request.request.mip6_feature_vector = Some(SwmMip6FeatureVector::gtpv2_only());
+
+        let mut answer = answer_facts();
+        answer.mip6_feature_vector = Some(SwmMip6FeatureVector::gtpv2_only());
+        answer.default_context_identifier = Some(7);
+        answer.apn_configurations.push(ApnConfiguration {
+            context_identifier: 7,
+            service_selection: "other.synthetic.example".to_owned().into(),
+            pdn_type: PdnType::Ipv4,
+            eps_subscribed_qos_profile: None,
+            ambr: None,
+        });
+        assert_correlation_error(
+            correlate_application(request, answer),
+            SwmDiameterEapCorrelationError::ApnAuthorizationMismatch,
+        );
+    }
+
+    #[test]
+    fn final_answer_validation_failure_has_typed_outcome() {
+        let mut answer = answer_facts();
+        answer.state_avps.push(Vec::new());
+        assert_correlation_error(
+            correlate_application(bound_request(), answer),
+            SwmDiameterEapCorrelationError::AnswerValidationFailure,
+        );
+    }
+
+    #[test]
+    fn invalid_delivery_agent_application_binding_has_typed_outcome() {
+        let mut request = bound_request();
+        request.request.destination_host = None;
+        let response = SwmDiameterEapResponseEnvelope {
+            transaction: TRANSACTION,
+            proxiable: true,
+            received_on: CONNECTION,
+            response: SwmDiameterEapResponse::GenericError(Box::new(
+                SwmDiameterEapGenericErrorAnswer {
+                    session_id: Some("session;synthetic;correlation".to_owned().into()),
+                    result_code: base::RESULT_CODE_DIAMETER_TOO_BUSY,
+                    origin_host: "aaa.synthetic.example".to_owned().into(),
+                    origin_realm: "home.synthetic.example".to_owned().into(),
+                    redirect: None,
+                    error_message: None,
+                    error_reporting_host: None,
+                    origin_state_id: None,
+                    experimental_result: None,
+                    failed_avps: Vec::new(),
+                    additional_avps: Vec::new(),
+                    provenance: SwmDiameterEapGenericErrorAnswerProvenance::Parsed,
+                },
+            )),
+            proxy_infos: Vec::new(),
+        };
+        assert_correlation_error(
+            request.correlate_response(response),
+            SwmDiameterEapCorrelationError::AgentApplicationBindingInvalid,
+        );
+    }
+
+    #[test]
+    fn valid_multi_round_answer_remains_protocol_progress() {
+        let request = bound_request();
+        assert!(!request.is_potentially_retransmitted());
+        let mut answer = answer_facts();
+        answer.result = SwmDiameterResult::Base(DIAMETER_MULTI_ROUND_AUTH);
+        answer.eap_payload = Some(vec![1, 0x35, 0, 5, 1].into());
+
+        let correlated = match correlate_application(request, answer) {
+            Ok(correlated) => correlated,
+            Err(error) => panic!("valid RFC 4072 multi-round response failed: {error}"),
+        };
+        let SwmDiameterEapResponse::Application(answer) = correlated.response() else {
+            panic!("ordinary multi-round answer keeps application grammar");
+        };
+        assert_eq!(
+            answer.authorization_outcome(),
+            SwmAuthorizationOutcome::EapInProgress,
+        );
+    }
+
+    #[test]
+    fn typed_application_outcomes_are_stable_and_value_free() {
+        let cases = [
+            (
+                SwmDiameterEapCorrelationError::AuthApplicationIdMismatch,
+                "swm_dea_auth_application_id_mismatch",
+            ),
+            (
+                SwmDiameterEapCorrelationError::AuthRequestTypeMismatch,
+                "swm_dea_auth_request_type_mismatch",
+            ),
+            (
+                SwmDiameterEapCorrelationError::MobilityFeatureMissing,
+                "swm_dea_mobility_feature_missing",
+            ),
+            (
+                SwmDiameterEapCorrelationError::MobilityFeatureMismatch,
+                "swm_dea_mobility_feature_mismatch",
+            ),
+            (
+                SwmDiameterEapCorrelationError::SubscriberAuthorizationMismatch,
+                "swm_dea_subscriber_authorization_mismatch",
+            ),
+            (
+                SwmDiameterEapCorrelationError::OverloadControlMismatch,
+                "swm_dea_overload_control_mismatch",
+            ),
+            (
+                SwmDiameterEapCorrelationError::ApnAuthorizationMismatch,
+                "swm_dea_apn_authorization_mismatch",
+            ),
+            (
+                SwmDiameterEapCorrelationError::AnswerValidationFailure,
+                "swm_dea_answer_validation_failure",
+            ),
+            (
+                SwmDiameterEapCorrelationError::AgentApplicationBindingInvalid,
+                "swm_dea_agent_application_binding_invalid",
+            ),
+        ];
+        for (error, code) in cases {
+            assert_eq!(error.as_str(), code);
+            assert_eq!(error.to_string(), code);
+            let debug = format!("{error:?}");
+            assert!(!debug.contains("subscriber@synthetic.invalid"));
+            assert!(!debug.contains("aaa.synthetic.example"));
+            assert!(!debug.contains("session;synthetic;correlation"));
+        }
+    }
 }

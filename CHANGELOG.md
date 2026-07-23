@@ -18,6 +18,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   derivation scalar are explicitly zeroized. The result has no key
   handle/signing authority and does not invoke the installed module; actual key
   loading and signing remain module-only (#413).
+- **BREAKING — typed SWm DEA application-correlation failures —
+  `opc-proto-diameter`:** `SwmDiameterEapCorrelationError::ApplicationMismatch`
+  is replaced by value-free outcomes for Auth-Application-Id,
+  Auth-Request-Type, missing versus contradictory mobility authorization,
+  subscriber authorization, overload control, APN authorization, final answer
+  validation, and invalid delivery-agent application binding. Each outcome has
+  a stable redaction-safe code while every existing authenticated connection,
+  transaction, P-bit, Proxy-Info, Session-Id, Origin-authority, and application
+  gate remains fail closed. Downstream exhaustive matches must handle the nine
+  new variants; valid RFC 4072 multi-round EAP remains correlated progress
+  (#505).
 - **RFC 7427 local AUTH self-verification — `opc-proto-ikev2`:** the local
   signing authority can now mint a sealed, non-copyable, one-operation
   pre-transmit verification authorization bound to the exact successful
