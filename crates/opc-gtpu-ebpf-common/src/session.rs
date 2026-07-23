@@ -824,12 +824,27 @@ fn wire_address_is_canonical(family: u8, value: &[u8]) -> bool {
     }
 }
 
+fn wire_paa_is_canonical(family: u8, value: &[u8]) -> bool {
+    if value.len() != 16 {
+        return false;
+    }
+    match GtpuSessionIpFamily::from_wire(family) {
+        Some(GtpuSessionIpFamily::Ipv4) => {
+            value[..4].iter().any(|byte| *byte != 0) && value[4..].iter().all(|byte| *byte == 0)
+        }
+        Some(GtpuSessionIpFamily::Ipv6) => {
+            value[..8].iter().any(|byte| *byte != 0) && value[8..].iter().all(|byte| *byte == 0)
+        }
+        None => false,
+    }
+}
+
 fn entry_wire_is_canonical(value: &[u8], expected_family: GtpuSessionIpFamily) -> bool {
     if value.len() != GTPU_SESSION_ENTRY_LEN
         || value[0] != ENTRY_FORMAT_VERSION
         || value[1] != expected_family as u8
         || value[3] != 0
-        || !wire_address_is_canonical(value[1], &value[4..20])
+        || !wire_paa_is_canonical(value[1], &value[4..20])
         || !wire_address_is_canonical(value[2], &value[20..36])
         || !wire_address_is_canonical(value[2], &value[36..52])
         || value[52..56].iter().all(|byte| *byte == 0)
@@ -861,6 +876,151 @@ fn entry_wire_is_canonical(value: &[u8], expected_family: GtpuSessionIpFamily) -
     };
     downlink_policy_is_canonical
         && GtpuUplinkSourcePortPolicy::from_map_value([value[70], value[71]]).is_some()
+}
+
+/// Zero-copy, verifier-friendly view of one canonical grouped-session entry.
+///
+/// The view borrows the selected 80-byte slot directly from the atomic group
+/// authority. It never materializes the entry on the BPF stack. Construction
+/// is restricted to [`select_gtpu_session_entry_wire`], which validates the
+/// complete authority, retained selector, device configuration, generation,
+/// and selected slot before returning the view.
+#[derive(Clone, Copy)]
+pub struct GtpuSessionEntryWireView<'a> {
+    wire: &'a [u8; GTPU_SESSION_ENTRY_LEN],
+}
+
+impl core::fmt::Debug for GtpuSessionEntryWireView<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("GtpuSessionEntryWireView")
+            .field("inner_family", &self.inner_family())
+            .field("outer_family", &self.outer_family())
+            .field("routing_identity", &"<redacted>")
+            .finish()
+    }
+}
+
+impl<'a> GtpuSessionEntryWireView<'a> {
+    /// Return the already-validated fixed-width entry bytes.
+    #[must_use]
+    pub const fn as_wire(self) -> &'a [u8; GTPU_SESSION_ENTRY_LEN] {
+        self.wire
+    }
+
+    /// Inner address family selected by this authority slot.
+    #[must_use]
+    pub fn inner_family(self) -> GtpuSessionIpFamily {
+        match self.wire[1] {
+            4 => GtpuSessionIpFamily::Ipv4,
+            _ => GtpuSessionIpFamily::Ipv6,
+        }
+    }
+
+    /// Outer transport family selected by this entry.
+    #[must_use]
+    pub fn outer_family(self) -> GtpuSessionIpFamily {
+        match self.wire[2] {
+            4 => GtpuSessionIpFamily::Ipv4,
+            _ => GtpuSessionIpFamily::Ipv6,
+        }
+    }
+
+    /// Peer outer address in the canonical sixteen-byte wire slot.
+    #[must_use]
+    pub fn peer_outer_wire(self) -> [u8; 16] {
+        copy_16(self.wire, 20).unwrap_or([0; 16])
+    }
+
+    /// Local outer address in the canonical sixteen-byte wire slot.
+    #[must_use]
+    pub fn local_outer_wire(self) -> [u8; 16] {
+        copy_16(self.wire, 36).unwrap_or([0; 16])
+    }
+
+    /// Incoming/local TEID in network order.
+    #[must_use]
+    pub fn local_teid(self) -> [u8; 4] {
+        copy_4(self.wire, 52).unwrap_or([0; 4])
+    }
+
+    /// Outgoing/peer TEID in network order.
+    #[must_use]
+    pub fn peer_teid(self) -> [u8; 4] {
+        copy_4(self.wire, 56).unwrap_or([0; 4])
+    }
+
+    /// Complete packet mark in network order.
+    #[must_use]
+    pub fn bearer_mark(self) -> [u8; 4] {
+        copy_4(self.wire, 60).unwrap_or([0; 4])
+    }
+
+    /// Optional fixed outer DSCP.
+    #[must_use]
+    pub const fn egress_dscp(self) -> Option<u8> {
+        if self.wire[64] == 0xff {
+            None
+        } else {
+            Some(self.wire[64])
+        }
+    }
+
+    /// Canonical uplink UDP source port.
+    #[must_use]
+    pub const fn uplink_source_port(self) -> u16 {
+        u16::from_be_bytes([self.wire[70], self.wire[71]])
+    }
+
+    /// Require an exact canonical grouped uplink selector.
+    #[must_use]
+    pub fn authorizes_uplink_key(self, key: &[u8; GTPU_SESSION_UPLINK_KEY_LEN]) -> bool {
+        key[0] == self.wire[1]
+            && key[1..4].iter().all(|byte| *byte == 0)
+            && key[4..20] == self.wire[4..20]
+            && key[20..24] == self.wire[60..64]
+    }
+
+    /// Require an exact canonical grouped downlink selector.
+    #[must_use]
+    pub fn authorizes_downlink_key(self, key: &[u8; GTPU_SESSION_DOWNLINK_KEY_LEN]) -> bool {
+        key[0] == self.wire[2]
+            && key[1] == self.wire[1]
+            && key[2] == 0
+            && key[3] == 0
+            && key[4..8] == self.wire[52..56]
+    }
+
+    /// Require exact packet endpoints, source-port policy, and inner PAA.
+    ///
+    /// IPv4 packet addresses occupy the first four bytes with a zero tail.
+    /// IPv6 inner PAAs authorize their canonical `/64` prefix.
+    #[must_use]
+    pub fn authorizes_downlink_packet(
+        self,
+        peer_outer: &[u8; 16],
+        local_outer: &[u8; 16],
+        source_port: u16,
+        inner_destination: &[u8; 16],
+    ) -> bool {
+        if peer_outer[..] != self.wire[20..36]
+            || local_outer[..] != self.wire[36..52]
+            || !match self.wire[1] {
+                4 => inner_destination[..] == self.wire[4..20],
+                6 => inner_destination[..8] == self.wire[4..12],
+                _ => false,
+            }
+        {
+            return false;
+        }
+        let first = u16::from_be_bytes([self.wire[66], self.wire[67]]);
+        let last = u16::from_be_bytes([self.wire[68], self.wire[69]]);
+        match self.wire[65] {
+            0 => true,
+            1 => source_port == first,
+            2 => source_port >= first && source_port <= last,
+            _ => false,
+        }
+    }
 }
 
 /// Canonical grouped uplink lookup key `(inner family, PAA, complete mark)`.
@@ -1765,6 +1925,177 @@ impl GtpuSessionTransactionRecord {
     }
 }
 
+fn retained_reference_slot_for_generation(
+    reference: &[u8; GTPU_SESSION_GROUP_REF_LEN],
+    generation: u64,
+) -> Option<u8> {
+    if reference[..16].iter().all(|byte| *byte == 0)
+        || reference[25..32].iter().any(|byte| *byte != 0)
+        || reference[41..48].iter().any(|byte| *byte != 0)
+    {
+        return None;
+    }
+    let base_generation = u64::from_be_bytes([
+        reference[16],
+        reference[17],
+        reference[18],
+        reference[19],
+        reference[20],
+        reference[21],
+        reference[22],
+        reference[23],
+    ]);
+    let desired_generation = u64::from_be_bytes([
+        reference[32],
+        reference[33],
+        reference[34],
+        reference[35],
+        reference[36],
+        reference[37],
+        reference[38],
+        reference[39],
+    ]);
+    let base_slot = reference[24];
+    let desired_slot = reference[40];
+    let base_present = base_generation != 0;
+    let desired_present = desired_generation != 0;
+    if !base_present && base_slot != 0
+        || !desired_present && desired_slot != 0
+        || base_present && base_slot > GTPU_SESSION_IPV6_SLOT
+        || desired_present && desired_slot > GTPU_SESSION_IPV6_SLOT
+        || !base_present && !desired_present
+        || base_present
+            && desired_present
+            && (base_generation.checked_add(1) != Some(desired_generation)
+                || base_slot != desired_slot)
+    {
+        return None;
+    }
+    if base_generation == generation {
+        Some(base_slot)
+    } else if desired_generation == generation {
+        Some(desired_slot)
+    } else {
+        None
+    }
+}
+
+fn device_config_wire_is_canonical(
+    config: &[u8; GTPU_SESSION_CONFIG_VALUE_LEN],
+    observed_ifindex: u32,
+) -> bool {
+    let family_mask = config[1];
+    let ingress_ifindex = u32::from_be_bytes([config[4], config[5], config[6], config[7]]);
+    if config[0] != CONFIG_FORMAT_VERSION
+        || !matches!(family_mask, 1..=3)
+        || config[2] != 0
+        || config[3] != 0
+        || config[8..24].iter().all(|byte| *byte == 0)
+        || config[56..].iter().any(|byte| *byte != 0)
+        || ingress_ifindex == 0
+        || ingress_ifindex != observed_ifindex
+    {
+        return false;
+    }
+    let ipv4_is_canonical = if family_mask & 1 != 0 {
+        config[24..28].iter().any(|byte| *byte != 0) && config[28..40].iter().all(|byte| *byte == 0)
+    } else {
+        config[24..40].iter().all(|byte| *byte == 0)
+    };
+    let ipv6_is_canonical = if family_mask & 2 != 0 {
+        config[40..56].iter().any(|byte| *byte != 0)
+    } else {
+        config[40..56].iter().all(|byte| *byte == 0)
+    };
+    ipv4_is_canonical && ipv6_is_canonical
+}
+
+fn config_authorizes_entry_local(
+    config: &[u8; GTPU_SESSION_CONFIG_VALUE_LEN],
+    entry: &[u8; GTPU_SESSION_ENTRY_LEN],
+) -> bool {
+    match entry[2] {
+        4 => config[1] & 1 != 0 && config[24..28] == entry[36..40],
+        6 => config[1] & 2 != 0 && config[40..56] == entry[36..52],
+        _ => false,
+    }
+}
+
+/// Select one canonical grouped-session slot without copying it.
+///
+/// This is the BPF packet-path counterpart to the typed
+/// [`gtpu_session_group_authorizes_uplink`] and
+/// [`gtpu_session_group_authorizes_downlink`] helpers. The retained index is
+/// validated before the authority, the authority is examined exactly once,
+/// and only an Active generation whose device, group, slot, and local endpoint
+/// match the canonical configuration is returned.
+///
+/// The five scalar/reference inputs and pointer-sized return are deliberate:
+/// they stay within the BPF-to-BPF calling convention and avoid an 80-byte
+/// structure return on the verifier stack. Packet selector and endpoint checks
+/// remain explicit methods on the returned [`GtpuSessionEntryWireView`].
+#[must_use]
+pub fn select_gtpu_session_entry_wire<'a>(
+    authority: &'a [u8; GTPU_SESSION_GROUP_VALUE_LEN],
+    retained_reference: &[u8; GTPU_SESSION_GROUP_REF_LEN],
+    config: &[u8; GTPU_SESSION_CONFIG_VALUE_LEN],
+    observed_ifindex: u32,
+    expected_slot: u8,
+) -> Option<GtpuSessionEntryWireView<'a>> {
+    let family_mask = authority[2];
+    let generation = u64::from_be_bytes([
+        authority[4],
+        authority[5],
+        authority[6],
+        authority[7],
+        authority[8],
+        authority[9],
+        authority[10],
+        authority[11],
+    ]);
+    if expected_slot > GTPU_SESSION_IPV6_SLOT
+        || authority[0] != GROUP_FORMAT_VERSION
+        || authority[1] != GtpuSessionGroupPhase::Active as u8
+        || !matches!(family_mask, 1..=3)
+        || authority[3] != 0
+        || generation == 0
+        || authority[12..16].iter().any(|byte| *byte != 0)
+        || authority[16..32] != config[8..24]
+        || authority[32..48] != retained_reference[..16]
+        || !device_config_wire_is_canonical(config, observed_ifindex)
+        || retained_reference_slot_for_generation(retained_reference, generation)
+            != Some(expected_slot)
+    {
+        return None;
+    }
+    for (slot, family, mask) in [
+        (0_usize, GtpuSessionIpFamily::Ipv4, 1_u8),
+        (1, GtpuSessionIpFamily::Ipv6, 2),
+    ] {
+        let start = GROUP_HEADER_LEN + slot * GTPU_SESSION_ENTRY_LEN;
+        let end = start + GTPU_SESSION_ENTRY_LEN;
+        let encoded = authority.get(start..end)?;
+        if family_mask & mask != 0 {
+            if !entry_wire_is_canonical(encoded, family) {
+                return None;
+            }
+        } else if encoded.iter().any(|byte| *byte != 0) {
+            return None;
+        }
+    }
+    let mask = 1_u8.checked_shl(u32::from(expected_slot))?;
+    if family_mask & mask == 0 {
+        return None;
+    }
+    let start = GROUP_HEADER_LEN + usize::from(expected_slot) * GTPU_SESSION_ENTRY_LEN;
+    let end = start + GTPU_SESSION_ENTRY_LEN;
+    let entry: &[u8; GTPU_SESSION_ENTRY_LEN] = authority.get(start..end)?.try_into().ok()?;
+    if !config_authorizes_entry_local(config, entry) {
+        return None;
+    }
+    Some(GtpuSessionEntryWireView { wire: entry })
+}
+
 /// Select one exact uplink action from an already-retained index and authority.
 ///
 /// Required tc order is: decode/retain the index value first, extract
@@ -1951,6 +2282,115 @@ mod tests {
     fn candidate(generation: u64, entry: GtpuSessionEntry) -> GtpuSessionIndexCandidate {
         GtpuSessionIndexCandidate::new(self::generation(generation), entry.inner_family().slot())
             .unwrap()
+    }
+
+    fn typed_uplink_authorizes_wire_inputs(
+        authority: &[u8; GTPU_SESSION_GROUP_VALUE_LEN],
+        reference: &[u8; GTPU_SESSION_GROUP_REF_LEN],
+        config: &[u8; GTPU_SESSION_CONFIG_VALUE_LEN],
+        entry: GtpuSessionEntry,
+    ) -> bool {
+        let Some(reference) = GtpuSessionGroupRef::decode(reference) else {
+            return false;
+        };
+        let Some(config) = GtpuSessionDeviceConfig::decode(config) else {
+            return false;
+        };
+        gtpu_session_group_authorizes_uplink(
+            authority,
+            reference,
+            GtpuSessionUplinkKey::from_entry(entry),
+            config,
+            42,
+        )
+        .is_some()
+    }
+
+    fn wire_view_authorizes_uplink_inputs(
+        authority: &[u8; GTPU_SESSION_GROUP_VALUE_LEN],
+        reference: &[u8; GTPU_SESSION_GROUP_REF_LEN],
+        config: &[u8; GTPU_SESSION_CONFIG_VALUE_LEN],
+        entry: GtpuSessionEntry,
+    ) -> bool {
+        let key = GtpuSessionUplinkKey::from_entry(entry).encode();
+        select_gtpu_session_entry_wire(
+            authority,
+            reference,
+            config,
+            42,
+            entry.inner_family().slot(),
+        )
+        .is_some_and(|view| view.authorizes_uplink_key(&key))
+    }
+
+    fn typed_downlink_authorizes_wire_inputs(
+        authority: &[u8; GTPU_SESSION_GROUP_VALUE_LEN],
+        reference: &[u8; GTPU_SESSION_GROUP_REF_LEN],
+        config: &[u8; GTPU_SESSION_CONFIG_VALUE_LEN],
+        entry: GtpuSessionEntry,
+    ) -> bool {
+        let Some(reference) = GtpuSessionGroupRef::decode(reference) else {
+            return false;
+        };
+        let Some(config) = GtpuSessionDeviceConfig::decode(config) else {
+            return false;
+        };
+        gtpu_session_group_authorizes_downlink(
+            authority,
+            reference,
+            GtpuSessionDownlinkKey::from_entry(entry),
+            config,
+            42,
+            entry.peer_outer_address(),
+            entry.local_outer_address(),
+            21_152,
+            inner_packet(entry, 7),
+        )
+        .is_some()
+    }
+
+    fn wire_view_authorizes_downlink_inputs(
+        authority: &[u8; GTPU_SESSION_GROUP_VALUE_LEN],
+        reference: &[u8; GTPU_SESSION_GROUP_REF_LEN],
+        config: &[u8; GTPU_SESSION_CONFIG_VALUE_LEN],
+        entry: GtpuSessionEntry,
+    ) -> bool {
+        let key = GtpuSessionDownlinkKey::from_entry(entry).encode();
+        let peer_outer = address_bytes(entry.peer_outer_address());
+        let local_outer = address_bytes(entry.local_outer_address());
+        let inner_destination = address_bytes(inner_packet(entry, 7));
+        select_gtpu_session_entry_wire(
+            authority,
+            reference,
+            config,
+            42,
+            entry.inner_family().slot(),
+        )
+        .is_some_and(|view| {
+            view.authorizes_downlink_key(&key)
+                && view.authorizes_downlink_packet(
+                    &peer_outer,
+                    &local_outer,
+                    21_152,
+                    &inner_destination,
+                )
+        })
+    }
+
+    fn assert_wire_view_typed_parity(
+        authority: &[u8; GTPU_SESSION_GROUP_VALUE_LEN],
+        reference: &[u8; GTPU_SESSION_GROUP_REF_LEN],
+        config: &[u8; GTPU_SESSION_CONFIG_VALUE_LEN],
+        entry: GtpuSessionEntry,
+    ) {
+        assert_eq!(
+            wire_view_authorizes_uplink_inputs(authority, reference, config, entry),
+            typed_uplink_authorizes_wire_inputs(authority, reference, config, entry),
+        );
+        assert_eq!(
+            wire_view_authorizes_downlink_inputs(authority, reference, config, entry),
+            typed_downlink_authorizes_wire_inputs(authority, reference, config, entry),
+        );
     }
 
     #[test]
@@ -2254,6 +2694,211 @@ mod tests {
             ipv4.local_outer_address(),
             21_152,
             inner_packet(ipv6, 2),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn zero_copy_wire_view_matches_typed_authorizers_for_both_families() {
+        let entries = [v4_entry(), v6_entry()];
+        let authority = active(9, Some(entries[0]), Some(entries[1])).encode();
+        let config = device_config();
+        let config_wire = config.encode();
+        for entry in entries {
+            let reference = GtpuSessionGroupRef::single(group_id(), candidate(9, entry));
+            let reference_wire = reference.encode();
+            let view = select_gtpu_session_entry_wire(
+                &authority,
+                &reference_wire,
+                &config_wire,
+                42,
+                entry.inner_family().slot(),
+            )
+            .unwrap();
+
+            let uplink_key = GtpuSessionUplinkKey::from_entry(entry);
+            let uplink_key_wire = uplink_key.encode();
+            assert_eq!(
+                view.authorizes_uplink_key(&uplink_key_wire),
+                gtpu_session_group_authorizes_uplink(
+                    &authority,
+                    reference,
+                    uplink_key,
+                    config,
+                    42,
+                )
+                .is_some()
+            );
+
+            let downlink_key = GtpuSessionDownlinkKey::from_entry(entry);
+            let downlink_key_wire = downlink_key.encode();
+            let peer_outer = address_bytes(entry.peer_outer_address());
+            let local_outer = address_bytes(entry.local_outer_address());
+            let inner_destination = address_bytes(inner_packet(entry, 7));
+            let source_port = 21_152;
+            assert_eq!(
+                view.authorizes_downlink_key(&downlink_key_wire)
+                    && view.authorizes_downlink_packet(
+                        &peer_outer,
+                        &local_outer,
+                        source_port,
+                        &inner_destination,
+                    ),
+                gtpu_session_group_authorizes_downlink(
+                    &authority,
+                    reference,
+                    downlink_key,
+                    config,
+                    42,
+                    entry.peer_outer_address(),
+                    entry.local_outer_address(),
+                    source_port,
+                    inner_packet(entry, 7),
+                )
+                .is_some()
+            );
+            assert_eq!(view.inner_family(), entry.inner_family());
+            assert_eq!(view.outer_family(), entry.outer_family());
+            assert_eq!(view.peer_outer_wire(), peer_outer);
+            assert_eq!(view.local_outer_wire(), local_outer);
+            assert_eq!(view.local_teid(), entry.local_teid());
+            assert_eq!(view.peer_teid(), entry.peer_teid());
+            assert_eq!(view.bearer_mark(), entry.bearer_mark());
+            assert_eq!(view.egress_dscp(), entry.egress_dscp());
+            assert_eq!(
+                view.uplink_source_port(),
+                entry.uplink_source_port_policy().effective_source_port()
+            );
+        }
+    }
+
+    #[test]
+    fn zero_copy_wire_view_rejects_representative_malformed_inputs() {
+        let entry = v4_entry();
+        let authority = active(3, Some(entry), None).encode();
+        let reference = GtpuSessionGroupRef::single(group_id(), candidate(3, entry)).encode();
+        let config = device_config().encode();
+
+        let mut malformed_authority = authority;
+        malformed_authority[GROUP_HEADER_LEN + 72] = 1;
+        assert!(GtpuSessionGroupRecord::decode(&malformed_authority).is_none());
+        assert!(select_gtpu_session_entry_wire(
+            &malformed_authority,
+            &reference,
+            &config,
+            42,
+            GTPU_SESSION_IPV4_SLOT,
+        )
+        .is_none());
+
+        let mut malformed_reference = reference;
+        malformed_reference[25] = 1;
+        assert!(GtpuSessionGroupRef::decode(&malformed_reference).is_none());
+        assert!(select_gtpu_session_entry_wire(
+            &authority,
+            &malformed_reference,
+            &config,
+            42,
+            GTPU_SESSION_IPV4_SLOT,
+        )
+        .is_none());
+
+        let mut malformed_config = config;
+        malformed_config[56] = 1;
+        assert!(GtpuSessionDeviceConfig::decode(&malformed_config).is_none());
+        assert!(select_gtpu_session_entry_wire(
+            &authority,
+            &reference,
+            &malformed_config,
+            42,
+            GTPU_SESSION_IPV4_SLOT,
+        )
+        .is_none());
+
+        assert!(select_gtpu_session_entry_wire(
+            &authority,
+            &reference,
+            &config,
+            43,
+            GTPU_SESSION_IPV4_SLOT,
+        )
+        .is_none());
+        assert!(select_gtpu_session_entry_wire(
+            &authority,
+            &reference,
+            &config,
+            42,
+            GTPU_SESSION_IPV6_SLOT,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn zero_copy_wire_view_matches_typed_authorizers_for_all_single_byte_mutations() {
+        let entries = [v4_entry(), v6_entry()];
+        let authority = active(9, Some(entries[0]), Some(entries[1])).encode();
+        let config = device_config().encode();
+        for entry in entries {
+            let reference = GtpuSessionGroupRef::single(group_id(), candidate(9, entry)).encode();
+            assert_wire_view_typed_parity(&authority, &reference, &config, entry);
+
+            let mut mutated_authority = authority;
+            for offset in 0..mutated_authority.len() {
+                let original = mutated_authority[offset];
+                for replacement in u8::MIN..=u8::MAX {
+                    if replacement == original {
+                        continue;
+                    }
+                    mutated_authority[offset] = replacement;
+                    assert_wire_view_typed_parity(&mutated_authority, &reference, &config, entry);
+                }
+                mutated_authority[offset] = original;
+            }
+
+            let mut mutated_reference = reference;
+            for offset in 0..mutated_reference.len() {
+                let original = mutated_reference[offset];
+                for replacement in u8::MIN..=u8::MAX {
+                    if replacement == original {
+                        continue;
+                    }
+                    mutated_reference[offset] = replacement;
+                    assert_wire_view_typed_parity(&authority, &mutated_reference, &config, entry);
+                }
+                mutated_reference[offset] = original;
+            }
+
+            let mut mutated_config = config;
+            for offset in 0..mutated_config.len() {
+                let original = mutated_config[offset];
+                for replacement in u8::MIN..=u8::MAX {
+                    if replacement == original {
+                        continue;
+                    }
+                    mutated_config[offset] = replacement;
+                    assert_wire_view_typed_parity(&authority, &reference, &mutated_config, entry);
+                }
+                mutated_config[offset] = original;
+            }
+        }
+    }
+
+    #[test]
+    fn zero_copy_wire_view_rejects_noncanonical_ipv6_paa_lower_half() {
+        let ipv6 = v6_entry();
+        let mut authority = active(4, None, Some(ipv6)).encode();
+        let ipv6_entry = GROUP_HEADER_LEN + GTPU_SESSION_ENTRY_LEN;
+        authority[ipv6_entry + 12] = 1;
+        let reference = GtpuSessionGroupRef::single(group_id(), candidate(4, ipv6)).encode();
+        let config = device_config().encode();
+
+        assert!(GtpuSessionGroupRecord::decode(&authority).is_none());
+        assert!(select_gtpu_session_entry_wire(
+            &authority,
+            &reference,
+            &config,
+            42,
+            GTPU_SESSION_IPV6_SLOT,
         )
         .is_none());
     }

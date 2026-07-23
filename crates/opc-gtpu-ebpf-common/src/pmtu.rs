@@ -1,23 +1,28 @@
 //! Typed uplink PMTU/fragmentation decision and the downlink outer-fragment
 //! contract.
 //!
-//! The uplink half turns the fixed [`GTPU_ENCAP_LEN`]-byte encapsulation into
-//! a typed action: emit within the effective link MTU, require a host-side
-//! outer-fragmentation action without emitting, or fail closed with typed ICMP
-//! Packet-Too-Big guidance. It is pure `no_std` logic
-//! shared between host-side callers and the tc uplink program so both enforce
-//! the identical decision table.
+//! The uplink half accounts for either the fixed
+//! [`GTPU_IPV4_ENCAP_LEN`](crate::GTPU_IPV4_ENCAP_LEN)-byte or
+//! [`GTPU_IPV6_ENCAP_LEN`](crate::GTPU_IPV6_ENCAP_LEN)-byte encapsulation and
+//! turns it into a typed action: emit within the effective link MTU, require a
+//! host-side outer-fragmentation action without emitting, or fail closed with
+//! typed ICMP Packet-Too-Big guidance. It is pure `no_std` logic shared
+//! between host-side callers and the tc uplink program so both enforce the
+//! identical family-aware decision table.
 //!
-//! The downlink half states the backend-neutral outer-fragment contract: the
-//! tc datapath hands outer fragments to the kernel stack unchanged and the
-//! SDK's post-reassembly consumer feeds the reassembled GTP-U datagram back
-//! into the SDK PDR/binding/decapsulation path. Reassembly resources stay in
-//! the kernel's bounded `ipfrag` accounting; the SDK never holds an unbounded
-//! userspace fragment cache.
+//! The downlink half states the legacy outer-IPv4 fragment contract: the tc
+//! datapath hands fragments to the kernel stack unchanged and the SDK's
+//! post-reassembly consumer feeds the reassembled GTP-U datagram back into the
+//! legacy PDR/binding/decapsulation path. Grouped sessions have no equivalent
+//! reassembly consumer, so non-atomic outer IPv4 and IPv6 fragments are an
+//! independently unsupported capability. An atomic IPv6 Fragment header is a
+//! complete packet and does not invoke reassembly. Legacy reassembly resources
+//! stay in the kernel's bounded `ipfrag` accounting; the SDK never holds an
+//! unbounded userspace fragment cache.
 
 use crate::{
-    build_uplink_encap_with_dscp_and_source_port, ipv4_header_checksum, GTPU_ENCAP_LEN,
-    IPV4_MIN_HDR_LEN,
+    build_uplink_encap_with_dscp_and_source_port, ipv4_header_checksum, GtpuSessionIpFamily,
+    GTPU_ENCAP_LEN, GTPU_IPV4_ENCAP_LEN, GTPU_IPV6_ENCAP_LEN, IPV4_MIN_HDR_LEN,
 };
 
 /// Byte length of the single-slot uplink MTU policy map value.
@@ -29,14 +34,33 @@ use crate::{
 pub const UPLINK_PMTU_VALUE_LEN: usize = 4;
 
 /// Policy flag: an over-MTU encapsulation requires an explicit host-side outer
-/// IPv4 fragmentation action (see
+/// fragmentation action for the selected outer family (see
 /// [`GtpuOuterFragmentPolicy::RequireOuterFragmentation`]).
 pub const UPLINK_PMTU_FLAG_OUTER_FRAGMENT_REQUIRED: u8 = 1;
 
-/// Minimum acceptable effective link MTU: the fixed encapsulation plus the
-/// IPv4 minimum MTU of 68 (RFC 791 section 3.1), so at least one
-/// minimum-size inner packet always fits.
+/// Minimum acceptable effective link MTU for the preserved outer-IPv4 map
+/// contract: 36 bytes of encapsulation plus the IPv4 minimum MTU of 68
+/// (RFC 791 section 3.1).
+///
+/// At this lowest accepted value an outer-IPv6 session has an inner MTU of 48
+/// bytes. Family-aware callers must use
+/// [`GtpuUplinkMtuPolicy::inner_mtu_for_outer`] or [`decide_uplink_pmtu`]
+/// rather than treating this legacy constructor bound as a family-independent
+/// minimum.
 pub const MIN_UPLINK_LINK_MTU: u16 = GTPU_ENCAP_LEN as u16 + 68;
+
+/// Fixed outer IP/UDP/GTP-U encapsulation overhead for one outer family.
+///
+/// This is 36 bytes for outer IPv4 and 56 bytes for outer IPv6. The result is
+/// suitable for both link-MTU admission and inner-facing Packet-Too-Big
+/// guidance.
+#[must_use]
+pub const fn encap_overhead(outer_family: GtpuSessionIpFamily) -> u16 {
+    match outer_family {
+        GtpuSessionIpFamily::Ipv4 => GTPU_IPV4_ENCAP_LEN as u16,
+        GtpuSessionIpFamily::Ipv6 => GTPU_IPV6_ENCAP_LEN as u16,
+    }
+}
 
 /// Explicit uplink outer-fragmentation policy for one S2b-U link.
 ///
@@ -55,15 +79,17 @@ pub enum GtpuOuterFragmentPolicy {
     /// generation helper).
     #[default]
     SignalPacketTooBig,
-    /// Require the caller to fragment an over-MTU outer IPv4 packet before it
-    /// is emitted. [`decide_uplink_encap`] returns a typed
-    /// [`UplinkEncapOutcome::RequiresOuterFragmentation`] action containing the
-    /// unfragmented encapsulation header and bounded excess; it never describes
-    /// the oversized packet as emitted.
+    /// Require the caller to fragment an over-MTU outer packet before it is
+    /// emitted. [`decide_uplink_pmtu`] returns a pure selected-family action
+    /// with bounded excess; it does not build an IPv6 Fragment header or claim
+    /// emission. The legacy [`decide_uplink_encap`] API returns a concrete
+    /// unfragmented outer-IPv4 header in
+    /// [`UplinkEncapOutcome::RequiresOuterFragmentation`].
     ///
-    /// The tc eBPF backend rejects this policy during configuration because
-    /// `bpf_redirect_neigh` bypasses the kernel's `ip_fragment` path. A host
-    /// backend may accept it only when it executes the required fragmentation.
+    /// The tc eBPF backend rejects this policy for both outer families during
+    /// configuration because `bpf_redirect_neigh` bypasses the required host
+    /// fragmentation path. A host backend may accept it only when it executes
+    /// the required family-specific action.
     RequireOuterFragmentation,
 }
 
@@ -82,8 +108,9 @@ impl core::fmt::Debug for GtpuOuterFragmentPolicy {
 /// The effective link MTU is an input to this type (chosen by the operator or
 /// read from the egress interface); choosing it is deliberately out of scope
 /// for the dataplane. Construction bounds it to
-/// [`MIN_UPLINK_LINK_MTU`]..=`u16::MAX` so the encapsulated minimum inner
-/// packet always fits and the IPv4 total-length field cannot overflow.
+/// [`MIN_UPLINK_LINK_MTU`]..=`u16::MAX`, preserving the existing map encoding
+/// and outer-IPv4 minimum-packet guarantee. Outer-IPv6 headroom is 20 bytes
+/// smaller and is exposed explicitly by [`Self::inner_mtu_for_outer`].
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct GtpuUplinkMtuPolicy {
     effective_link_mtu: u16,
@@ -101,8 +128,10 @@ impl core::fmt::Debug for GtpuUplinkMtuPolicy {
 
 impl GtpuUplinkMtuPolicy {
     /// Construct one canonical policy. A link MTU below
-    /// [`MIN_UPLINK_LINK_MTU`] cannot carry even the smallest inner packet
-    /// and fails closed with `None`.
+    /// [`MIN_UPLINK_LINK_MTU`] cannot satisfy the preserved outer-IPv4
+    /// minimum-packet guarantee and fails closed with `None`. This constructor
+    /// and the four-byte map representation remain wire-compatible; use
+    /// [`Self::inner_mtu_for_outer`] for an outer-IPv6 session.
     #[must_use]
     pub const fn new(
         effective_link_mtu: u16,
@@ -131,11 +160,22 @@ impl GtpuUplinkMtuPolicy {
     }
 
     /// Maximum inner packet length that encapsulates within the effective
-    /// link MTU: the headroom accounting for the fixed [`GTPU_ENCAP_LEN`]
-    /// overhead.
+    /// link MTU using the legacy outer-IPv4
+    /// [`GTPU_ENCAP_LEN`]-byte overhead.
+    ///
+    /// Use [`Self::inner_mtu_for_outer`] for a family-aware grouped session.
     #[must_use]
     pub const fn inner_mtu(self) -> u16 {
-        self.effective_link_mtu - GTPU_ENCAP_LEN as u16
+        self.inner_mtu_for_outer(GtpuSessionIpFamily::Ipv4)
+    }
+
+    /// Maximum inner packet length for one selected outer IP family.
+    ///
+    /// Outer IPv4 accounts for 36 bytes and outer IPv6 accounts for 56 bytes.
+    /// Construction guarantees the subtraction is defined for both families.
+    #[must_use]
+    pub const fn inner_mtu_for_outer(self, outer_family: GtpuSessionIpFamily) -> u16 {
+        self.effective_link_mtu - encap_overhead(outer_family)
     }
 
     /// Encode into the fixed single-slot map value.
@@ -215,9 +255,10 @@ pub const ICMPV6_TYPE_PACKET_TOO_BIG: u8 = 2;
 /// when uplink encapsulation is rejected for size.
 ///
 /// The advertised MTU is always the inner-facing MTU (effective link MTU
-/// minus the fixed encapsulation overhead), so the inner source learns the
-/// largest inner packet the tunnel can carry. Values carry only bounded
-/// lengths and protocol constants; no address or session state is retained.
+/// minus the selected outer family's encapsulation overhead), so the inner
+/// source learns the largest inner packet the tunnel can carry. Values carry
+/// only bounded lengths and protocol constants; no address or session state
+/// is retained.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GtpuPmtuSignal {
     /// ICMPv4 Destination Unreachable / fragmentation-needed (type
@@ -234,6 +275,73 @@ pub enum GtpuPmtuSignal {
         /// Inner-facing MTU advertised to the inner source.
         inner_mtu: u16,
     },
+}
+
+/// Family-aware PMTU decision independent of any concrete encapsulation
+/// buffer.
+///
+/// This is the common policy boundary for typed host guidance and the tc
+/// grouped-session path. It contains lengths and protocol constants only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UplinkPmtuDecision {
+    /// The complete encapsulated packet fits the effective link MTU.
+    Emit {
+        /// Remaining link-MTU headroom after family-specific encapsulation.
+        headroom: u16,
+    },
+    /// The packet does not fit and a host-side outer fragmenter must act
+    /// before transmission. This pure decision does not build fragment bytes.
+    RequiresOuterFragmentation {
+        /// Bytes by which the encapsulated packet exceeds the effective MTU.
+        excess: u16,
+    },
+    /// Fail-closed rejection with exact inner-facing Packet-Too-Big guidance.
+    RejectTooBig {
+        /// ICMP guidance toward the inner source.
+        signal: GtpuPmtuSignal,
+        /// Family-specific encapsulation overhead accounted against the MTU.
+        encap_overhead: u16,
+        /// Complete attempted outer packet length.
+        attempted_total: u32,
+    },
+}
+
+/// Decide one family-aware uplink PMTU action without building packet bytes.
+///
+/// `outer_family` selects the exact 36-byte IPv4 or 56-byte IPv6
+/// encapsulation overhead. `inner_protocol` selects the ICMP protocol used for
+/// rejection guidance and must match the actual inner packet family.
+#[must_use]
+pub const fn decide_uplink_pmtu(
+    policy: GtpuUplinkMtuPolicy,
+    outer_family: GtpuSessionIpFamily,
+    inner_len: u16,
+    inner_protocol: GtpuPmtuProtocol,
+) -> UplinkPmtuDecision {
+    let overhead = encap_overhead(outer_family);
+    let attempted_total = inner_len as u32 + overhead as u32;
+    let link_mtu = policy.effective_link_mtu as u32;
+    if attempted_total <= link_mtu {
+        UplinkPmtuDecision::Emit {
+            headroom: (link_mtu - attempted_total) as u16,
+        }
+    } else {
+        match policy.fragmentation {
+            GtpuOuterFragmentPolicy::RequireOuterFragmentation => {
+                UplinkPmtuDecision::RequiresOuterFragmentation {
+                    excess: (attempted_total - link_mtu) as u16,
+                }
+            }
+            GtpuOuterFragmentPolicy::SignalPacketTooBig => UplinkPmtuDecision::RejectTooBig {
+                signal: GtpuPmtuSignal::new(
+                    inner_protocol,
+                    policy.inner_mtu_for_outer(outer_family),
+                ),
+                encap_overhead: overhead,
+                attempted_total,
+            },
+        }
+    }
 }
 
 impl GtpuPmtuSignal {
@@ -383,33 +491,33 @@ pub fn decide_uplink_encap(
 ) -> Option<UplinkEncapOutcome> {
     let mut encap =
         build_uplink_encap_with_dscp_and_source_port(far, inner_len, dscp, source_port)?;
-    let outer_total = u32::from(inner_len) + GTPU_ENCAP_LEN as u32;
-    let link_mtu = u32::from(mtu_policy.effective_link_mtu);
-    if outer_total <= link_mtu {
-        if matches!(
-            mtu_policy.fragmentation,
-            GtpuOuterFragmentPolicy::SignalPacketTooBig
-        ) {
-            stamp_ipv4_dont_fragment(&mut encap);
-        }
-        Some(UplinkEncapOutcome::Emit {
-            encap,
-            headroom: (link_mtu - outer_total) as u16,
-        })
-    } else {
-        match mtu_policy.fragmentation {
-            GtpuOuterFragmentPolicy::RequireOuterFragmentation => {
-                Some(UplinkEncapOutcome::RequiresOuterFragmentation {
-                    encap,
-                    excess: (outer_total - link_mtu) as u16,
-                })
+    match decide_uplink_pmtu(
+        mtu_policy,
+        GtpuSessionIpFamily::Ipv4,
+        inner_len,
+        inner_family,
+    ) {
+        UplinkPmtuDecision::Emit { headroom } => {
+            if matches!(
+                mtu_policy.fragmentation,
+                GtpuOuterFragmentPolicy::SignalPacketTooBig
+            ) {
+                stamp_ipv4_dont_fragment(&mut encap);
             }
-            GtpuOuterFragmentPolicy::SignalPacketTooBig => Some(UplinkEncapOutcome::RejectTooBig {
-                signal: GtpuPmtuSignal::new(inner_family, mtu_policy.inner_mtu()),
-                encap_overhead: GTPU_ENCAP_LEN as u16,
-                attempted_total: outer_total,
-            }),
+            Some(UplinkEncapOutcome::Emit { encap, headroom })
         }
+        UplinkPmtuDecision::RequiresOuterFragmentation { excess } => {
+            Some(UplinkEncapOutcome::RequiresOuterFragmentation { encap, excess })
+        }
+        UplinkPmtuDecision::RejectTooBig {
+            signal,
+            encap_overhead,
+            attempted_total,
+        } => Some(UplinkEncapOutcome::RejectTooBig {
+            signal,
+            encap_overhead,
+            attempted_total,
+        }),
     }
 }
 
@@ -456,6 +564,75 @@ mod tests {
             GtpuOuterFragmentPolicy::RequireOuterFragmentation,
         )
         .is_some());
+    }
+
+    #[test]
+    fn family_aware_overhead_and_inner_mtu_are_exact() {
+        let policy = strict_policy(1500);
+        assert_eq!(encap_overhead(GtpuSessionIpFamily::Ipv4), 36);
+        assert_eq!(encap_overhead(GtpuSessionIpFamily::Ipv6), 56);
+        assert_eq!(policy.inner_mtu(), 1464);
+        assert_eq!(policy.inner_mtu_for_outer(GtpuSessionIpFamily::Ipv4), 1464);
+        assert_eq!(policy.inner_mtu_for_outer(GtpuSessionIpFamily::Ipv6), 1444);
+
+        let minimum = strict_policy(MIN_UPLINK_LINK_MTU);
+        assert_eq!(minimum.inner_mtu_for_outer(GtpuSessionIpFamily::Ipv4), 68);
+        assert_eq!(minimum.inner_mtu_for_outer(GtpuSessionIpFamily::Ipv6), 48);
+    }
+
+    #[test]
+    fn family_aware_pmtu_accepts_exact_boundary_and_rejects_one_over() {
+        let policy = strict_policy(1500);
+        for (outer_family, exact_inner, overhead) in [
+            (GtpuSessionIpFamily::Ipv4, 1464, 36),
+            (GtpuSessionIpFamily::Ipv6, 1444, 56),
+        ] {
+            for protocol in [GtpuPmtuProtocol::Icmpv4, GtpuPmtuProtocol::Icmpv6] {
+                assert_eq!(
+                    decide_uplink_pmtu(policy, outer_family, exact_inner, protocol),
+                    UplinkPmtuDecision::Emit { headroom: 0 }
+                );
+                assert_eq!(
+                    decide_uplink_pmtu(policy, outer_family, exact_inner + 1, protocol),
+                    UplinkPmtuDecision::RejectTooBig {
+                        signal: GtpuPmtuSignal::new(protocol, exact_inner),
+                        encap_overhead: overhead,
+                        attempted_total: 1501,
+                    }
+                );
+            }
+        }
+
+        let fragment =
+            GtpuUplinkMtuPolicy::new(1500, GtpuOuterFragmentPolicy::RequireOuterFragmentation)
+                .unwrap();
+        assert_eq!(
+            decide_uplink_pmtu(
+                fragment,
+                GtpuSessionIpFamily::Ipv6,
+                1445,
+                GtpuPmtuProtocol::Icmpv6,
+            ),
+            UplinkPmtuDecision::RequiresOuterFragmentation { excess: 1 }
+        );
+    }
+
+    #[test]
+    fn family_aware_pmtu_keeps_attempted_total_in_u32() {
+        let policy = strict_policy(u16::MAX);
+        assert_eq!(
+            decide_uplink_pmtu(
+                policy,
+                GtpuSessionIpFamily::Ipv6,
+                u16::MAX,
+                GtpuPmtuProtocol::Icmpv6,
+            ),
+            UplinkPmtuDecision::RejectTooBig {
+                signal: GtpuPmtuSignal::Icmpv6PacketTooBig { inner_mtu: 65_479 },
+                encap_overhead: 56,
+                attempted_total: 65_591,
+            }
+        );
     }
 
     #[test]

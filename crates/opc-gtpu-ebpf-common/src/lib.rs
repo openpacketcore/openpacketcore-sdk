@@ -34,22 +34,24 @@ pub use fragment::{
     LINUX_DEFAULT_REASSEMBLY_BOUNDS, MAX_REASSEMBLED_GTPU_LEN,
 };
 pub use pmtu::{
-    apply_uplink_mtu_policy, decide_uplink_encap, stamp_ipv4_dont_fragment,
-    GtpuOuterFragmentPolicy, GtpuPmtuProtocol, GtpuPmtuSignal, GtpuUplinkMtuPolicy,
-    UplinkEncapOutcome, UplinkMtuMapState, ICMPV4_CODE_FRAGMENTATION_NEEDED_DF_SET,
-    ICMPV4_TYPE_DESTINATION_UNREACHABLE, ICMPV6_TYPE_PACKET_TOO_BIG, MIN_UPLINK_LINK_MTU,
-    UPLINK_PMTU_FLAG_OUTER_FRAGMENT_REQUIRED, UPLINK_PMTU_VALUE_LEN,
+    apply_uplink_mtu_policy, decide_uplink_encap, decide_uplink_pmtu, encap_overhead,
+    stamp_ipv4_dont_fragment, GtpuOuterFragmentPolicy, GtpuPmtuProtocol, GtpuPmtuSignal,
+    GtpuUplinkMtuPolicy, UplinkEncapOutcome, UplinkMtuMapState, UplinkPmtuDecision,
+    ICMPV4_CODE_FRAGMENTATION_NEEDED_DF_SET, ICMPV4_TYPE_DESTINATION_UNREACHABLE,
+    ICMPV6_TYPE_PACKET_TOO_BIG, MIN_UPLINK_LINK_MTU, UPLINK_PMTU_FLAG_OUTER_FRAGMENT_REQUIRED,
+    UPLINK_PMTU_VALUE_LEN,
 };
 pub use session::{
     gtpu_session_group_authorizes_downlink, gtpu_session_group_authorizes_uplink,
-    GtpuSessionAuthorityHeader, GtpuSessionDeviceConfig, GtpuSessionDeviceId,
-    GtpuSessionDownlinkKey, GtpuSessionEntry, GtpuSessionGeneration, GtpuSessionGroupId,
-    GtpuSessionGroupPhase, GtpuSessionGroupRecord, GtpuSessionGroupRef, GtpuSessionIndexCandidate,
-    GtpuSessionIpFamily, GtpuSessionPaa, GtpuSessionTransactionId, GtpuSessionTransactionPhase,
-    GtpuSessionTransactionRecord, GtpuSessionUplinkKey, GTPU_SESSION_CONFIG_VALUE_LEN,
-    GTPU_SESSION_DOWNLINK_KEY_LEN, GTPU_SESSION_ENTRY_LEN, GTPU_SESSION_GROUP_ID_LEN,
-    GTPU_SESSION_GROUP_REF_LEN, GTPU_SESSION_GROUP_VALUE_LEN, GTPU_SESSION_IPV4_SLOT,
-    GTPU_SESSION_IPV6_SLOT, GTPU_SESSION_TRANSACTION_VALUE_LEN, GTPU_SESSION_UPLINK_KEY_LEN,
+    select_gtpu_session_entry_wire, GtpuSessionAuthorityHeader, GtpuSessionDeviceConfig,
+    GtpuSessionDeviceId, GtpuSessionDownlinkKey, GtpuSessionEntry, GtpuSessionEntryWireView,
+    GtpuSessionGeneration, GtpuSessionGroupId, GtpuSessionGroupPhase, GtpuSessionGroupRecord,
+    GtpuSessionGroupRef, GtpuSessionIndexCandidate, GtpuSessionIpFamily, GtpuSessionPaa,
+    GtpuSessionTransactionId, GtpuSessionTransactionPhase, GtpuSessionTransactionRecord,
+    GtpuSessionUplinkKey, GTPU_SESSION_CONFIG_VALUE_LEN, GTPU_SESSION_DOWNLINK_KEY_LEN,
+    GTPU_SESSION_ENTRY_LEN, GTPU_SESSION_GROUP_ID_LEN, GTPU_SESSION_GROUP_REF_LEN,
+    GTPU_SESSION_GROUP_VALUE_LEN, GTPU_SESSION_IPV4_SLOT, GTPU_SESSION_IPV6_SLOT,
+    GTPU_SESSION_TRANSACTION_VALUE_LEN, GTPU_SESSION_UPLINK_KEY_LEN,
 };
 
 /// GTP-U UDP port (TS 29.281 §4.4.2).
