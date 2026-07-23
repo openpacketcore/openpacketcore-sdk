@@ -39,6 +39,9 @@ route steering, XFRM policy, deployment defaults, or traffic-readiness policy.
   `CurrentEbpfGraphWriterProof`, `CurrentEbpfGraphDrainProof`,
   `CurrentEbpfGraphRecoveryOutcome`, `CurrentEbpfGraphRecoveryRefusal`, and
   `CurrentEbpfGraphRecoveryProgress`,
+  `GtpuLocalEndpointSet`, `GtpuSessionAttachmentSelector`,
+  `GtpuSessionGroup`, `GtpuSessionGroupReconcileRequest`,
+  `GtpuSessionSelectorProvenance`, and `GtpuSessionSelectorReuseProof`,
   `EbpfGtpuDatapathSnapshot`, `EbpfGtpuDatapathCounters`, `DscpCodepoint`,
   `GtpRole`, `GtpVersion`, `GtpAddressFamily`, and `GTPU_PORT`.
 - `GtpuError` is intentionally redaction-safe; TEIDs and addresses are not
@@ -998,6 +1001,75 @@ object is embedded from
 retained only for the exact automatic empty-graph migration proof described
 above, and the frozen v2 object is retained only for the explicit drained
 teardown identity proof. Neither legacy object runs as the current datapath.
+
+### Grouped dual-stack contract foundation
+
+The public grouped-session API is an additive contract foundation. Existing
+`GtpuProbe` fields and legacy v5 map-key bytes are unchanged, and the current
+Linux and eBPF backends do not yet claim this capability. Implementations opt
+in through the async, fallible `gtpu_ip_family_capabilities` query. It accepts
+a `GtpuSessionAttachmentSelector` containing the stable device identity, exact
+live name/ifindex, and endpoint set, so evidence is never reported globally for
+a backend that manages several attachments. The inherited per-attachment
+result is Missing/Unsupported until a backend independently qualifies the
+complete graph. In particular, ordinary Linux generic-netlink GTP cannot
+report atomic grouped reconciliation because its per-context commands have no
+external activation gate.
+
+`CreateGtpDeviceEndpointSetRequest` binds a cryptographically stable device
+identity to an exact local set containing at most one IPv4 and one IPv6
+endpoint. That identity selects the pin namespace independently of a mutable
+ifindex. Every reconcile, readback, and adoption must revalidate both the live
+interface identity and exact endpoint membership. Hook repair or adoption
+requires two identical complete graph inventories bracketing the operation;
+partial, foreign, or changing evidence fails closed.
+
+A `GtpuSessionGroup` has a caller-owned cryptographically unique ID and one or
+two canonical inner-family entries. Inner IPv4 is a `/32`; an IPv6 PAA is
+projected explicitly to the TS 29.274 `/64` forwarding identity. The owned
+public context is normalized to that address, so equality and restart readback
+never depend on an interface identifier omitted by the ABI. Outer peer and
+local addresses remain exact `/32` or `/128` endpoints and may use a family
+independent of the inner slot. Removed group IDs are permanently retired by
+the caller for that stable pin namespace lifetime; the dataplane does not
+accumulate permanent tombstones.
+
+The separate family-tagged schema uses one ordinary non-per-CPU HASH authority
+value updated only by whole-element replacement. Fresh creation publishes a
+fenced Pending generation 1, stages exact `NOEXIST` indexes, then commits
+Active. Update leaves Active generation N authoritative while it stages
+dual-candidate N/N+1 selector values, replaces the authority once with Active
+N+1, verifies it, and removes exact N candidates. Removal writes Removing
+first, deletes exact owned indexes, and deletes authority last. The journal
+stores byte-exact base and desired graphs only while an operation is in flight;
+missing or mismatched recovery evidence never authorizes guessed cleanup.
+
+A tc consumer retains the decoded index value first, extracts the group ID,
+performs one authority lookup, validates the selected generation and slot, and
+never re-reads the index. An old RCU holder may finish with its retained values.
+Consequently, `GtpuSessionGroupReconcileRequest` requires explicit selector
+provenance. `Fresh` attests through the caller's durable registry that an
+introduced selector has never been published in the pin namespace. Reuse
+carries the complete exact retired source group plus an attestation that
+traffic was drained or an RCU grace period completed after exact removal.
+Direct transfer from a live source group remains forbidden, and cross-device
+or same-group reuse evidence is rejected before mutation.
+
+The shared IPv6 envelope contract keeps a dual-purpose tc hook transparent to
+unrelated IPv6 traffic: non-GTP-U traffic, packets requiring reassembly, and
+unsupported AH/ESP processing pass to the host stack. Once UDP/2152 is proven,
+malformed IPv6/UDP/GTP-U boundaries or an invalid mandatory IPv6 UDP checksum
+become reject candidates before session lookup.
+
+Uplink outer-IPv6 checksum support has one explicit qualification contract:
+`MaterializedOnly`. Before `bpf_skb_adjust_room`, tc rejects non-zero
+`gso_size`, then performs a reversible non-pseudo
+`bpf_l4_csum_replace` probe on a safe even 16-bit word. The first update must
+change the word and the reverse update must restore and reload the exact
+snapshot; any error drops. Because Linux leaves the target unchanged for
+`CHECKSUM_PARTIAL`, only fully materialized, non-GSO bytes proceed to software
+IPv6 UDP checksum generation. This contract does not claim GSO or checksum
+offload support.
 
 ## Status And Limits
 
