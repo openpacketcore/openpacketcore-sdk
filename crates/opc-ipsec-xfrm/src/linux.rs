@@ -10,16 +10,16 @@ use std::time::Duration;
 use async_trait::async_trait;
 use opc_ipsec_xfrm_ebpf_common::{MarkProfile, IPPROTO_ESP};
 use opc_linux_xfrm_sys::{
-    align_to_netlink, open_netlink_socket, receive_message, send_message, LINUX_EINVAL,
-    LINUX_ENOPROTOOPT, NLMSG_DONE, NLMSG_ERROR, NLM_F_ACK, NLM_F_CREATE, NLM_F_EXCL, NLM_F_REPLACE,
-    NLM_F_REQUEST, XFRMA_ALG_AEAD, XFRMA_ALG_AUTH, XFRMA_ALG_AUTH_TRUNC, XFRMA_ALG_CRYPT,
-    XFRMA_ENCAP, XFRMA_IF_ID, XFRMA_LASTUSED, XFRMA_MARK, XFRMA_PAD, XFRMA_POLICY_TYPE,
-    XFRMA_REPLAY_ESN_VAL, XFRMA_REPLAY_VAL, XFRMA_SA_DIR, XFRMA_SET_MARK, XFRMA_SET_MARK_MASK,
-    XFRMA_TMPL, XFRM_AE_RVAL, XFRM_MSG_ALLOCSPI, XFRM_MSG_DELPOLICY, XFRM_MSG_DELSA,
-    XFRM_MSG_GETPOLICY, XFRM_MSG_GETSA, XFRM_MSG_MIGRATE_STATE, XFRM_MSG_NEWAE, XFRM_MSG_NEWPOLICY,
-    XFRM_MSG_NEWSA, XFRM_MSG_UPDPOLICY, XFRM_MSG_UPDSA, XFRM_POLICY_ALLOW, XFRM_POLICY_BLOCK,
-    XFRM_POLICY_FWD, XFRM_POLICY_IN, XFRM_POLICY_OUT, XFRM_POLICY_TYPE_MAIN, XFRM_SA_DIR_OUT,
-    XFRM_STATE_ESN,
+    align_to_netlink, open_netlink_socket, receive_message_outcome, send_message,
+    ReceiveMessageOutcome, LINUX_EINVAL, LINUX_ENOPROTOOPT, NLMSG_DONE, NLMSG_ERROR, NLM_F_ACK,
+    NLM_F_CREATE, NLM_F_EXCL, NLM_F_REPLACE, NLM_F_REQUEST, XFRMA_ALG_AEAD, XFRMA_ALG_AUTH,
+    XFRMA_ALG_AUTH_TRUNC, XFRMA_ALG_CRYPT, XFRMA_ENCAP, XFRMA_IF_ID, XFRMA_LASTUSED, XFRMA_MARK,
+    XFRMA_PAD, XFRMA_POLICY_TYPE, XFRMA_REPLAY_ESN_VAL, XFRMA_REPLAY_VAL, XFRMA_SA_DIR,
+    XFRMA_SET_MARK, XFRMA_SET_MARK_MASK, XFRMA_TMPL, XFRM_AE_RVAL, XFRM_MSG_ALLOCSPI,
+    XFRM_MSG_DELPOLICY, XFRM_MSG_DELSA, XFRM_MSG_GETPOLICY, XFRM_MSG_GETSA, XFRM_MSG_MIGRATE_STATE,
+    XFRM_MSG_NEWAE, XFRM_MSG_NEWPOLICY, XFRM_MSG_NEWSA, XFRM_MSG_UPDPOLICY, XFRM_MSG_UPDSA,
+    XFRM_POLICY_ALLOW, XFRM_POLICY_BLOCK, XFRM_POLICY_FWD, XFRM_POLICY_IN, XFRM_POLICY_OUT,
+    XFRM_POLICY_TYPE_MAIN, XFRM_SA_DIR_OUT, XFRM_STATE_ESN,
 };
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
@@ -82,12 +82,29 @@ const XFRM_KEY_READBACK_REDACTED: &str = "xfrm_key_readback_redacted";
 
 pub(crate) type SensitiveBuffer = Zeroizing<Vec<u8>>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NetlinkOperationClass {
+    Mutation,
+    ReadOnly,
+}
+
+fn netlink_operation_class(message_type: u16) -> NetlinkOperationClass {
+    match message_type {
+        XFRM_MSG_GETSA | XFRM_MSG_GETPOLICY => NetlinkOperationClass::ReadOnly,
+        _ => NetlinkOperationClass::Mutation,
+    }
+}
+
 /// Runtime behavior for the safe Linux XFRM backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LinuxXfrmBackendConfig {
     /// Number of nonblocking receive attempts before returning a timeout.
     pub receive_attempts: u16,
-    /// Netlink receive buffer size in bytes.
+    /// Hard netlink receive bound in bytes.
+    ///
+    /// A consumed response above this bound makes a mutation
+    /// [`XfrmError::StateIndeterminate`] and makes a read
+    /// [`XfrmError::ResponseTooLarge`].
     pub receive_buffer_len: usize,
     /// Delay between nonblocking receive attempts.
     pub retry_delay: Duration,
@@ -379,9 +396,13 @@ impl LinuxXfrmBackend {
         self.ensure_namespace_binding()?;
         let sequence = self.next_sequence();
         let request = encode_netlink_message(message_type, flags, sequence, &body)?;
-        self.inner
-            .transport
-            .transact(operation, &request, sequence, self.inner.config)
+        self.inner.transport.transact(
+            operation,
+            netlink_operation_class(message_type),
+            &request,
+            sequence,
+            self.inner.config,
+        )
     }
 
     async fn transact_blocking(
@@ -1005,6 +1026,7 @@ pub(crate) trait LinuxXfrmTransport: Send + Sync + fmt::Debug {
     fn transact(
         &self,
         operation: &'static str,
+        operation_class: NetlinkOperationClass,
         request: &[u8],
         expected_sequence: u32,
         config: LinuxXfrmBackendConfig,
@@ -1020,6 +1042,7 @@ impl LinuxXfrmTransport for NetlinkXfrmTransport {
     fn transact(
         &self,
         operation: &'static str,
+        operation_class: NetlinkOperationClass,
         request: &[u8],
         expected_sequence: u32,
         config: LinuxXfrmBackendConfig,
@@ -1034,24 +1057,13 @@ impl LinuxXfrmTransport for NetlinkXfrmTransport {
             ));
         }
 
-        let mut buffer = Zeroizing::new(vec![0_u8; config.receive_buffer_len]);
-        for _ in 0..config.receive_attempts {
-            match receive_message(&socket, &mut buffer) {
-                Ok(0) => {}
-                Ok(len) => return parse_netlink_response(&buffer[..len], expected_sequence),
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                    ) => {}
-                Err(error) => return Err(XfrmError::io("netlink_receive", error)),
-            }
-            if !config.retry_delay.is_zero() {
-                std::thread::sleep(config.retry_delay);
-            }
-        }
-
-        Err(XfrmError::StateIndeterminate { operation })
+        receive_netlink_response(
+            operation,
+            operation_class,
+            expected_sequence,
+            config,
+            |buffer| receive_message_outcome(&socket, buffer),
+        )
     }
 
     fn probe(&self, _config: LinuxXfrmBackendConfig) -> XfrmProbe {
@@ -1109,6 +1121,63 @@ impl LinuxXfrmTransport for NetlinkXfrmTransport {
             },
         }
     }
+}
+
+fn receive_netlink_response(
+    operation: &'static str,
+    operation_class: NetlinkOperationClass,
+    expected_sequence: u32,
+    config: LinuxXfrmBackendConfig,
+    mut receive: impl FnMut(&mut [u8]) -> io::Result<ReceiveMessageOutcome>,
+) -> Result<Option<SensitiveBuffer>, XfrmError> {
+    let mut buffer = Zeroizing::new(vec![0_u8; config.receive_buffer_len]);
+    for _ in 0..config.receive_attempts {
+        match receive(&mut buffer) {
+            Ok(ReceiveMessageOutcome::Complete { bytes_received: 0 }) => {}
+            Ok(ReceiveMessageOutcome::Complete { bytes_received }) => {
+                let response = buffer.get(..bytes_received).ok_or_else(|| {
+                    XfrmError::io(
+                        "netlink_receive",
+                        invalid_data("receive length exceeded bounded buffer"),
+                    )
+                })?;
+                return parse_netlink_response(response, expected_sequence);
+            }
+            Ok(ReceiveMessageOutcome::ConsumedOversize {
+                buffer_bytes,
+                datagram_bytes,
+            }) => {
+                return Err(match operation_class {
+                    NetlinkOperationClass::Mutation => XfrmError::StateIndeterminate { operation },
+                    NetlinkOperationClass::ReadOnly => XfrmError::ResponseTooLarge {
+                        operation,
+                        buffer_bytes,
+                        datagram_bytes,
+                    },
+                });
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) => {}
+            Err(error) => return Err(XfrmError::io("netlink_receive", error)),
+            Ok(_) => {
+                return Err(match operation_class {
+                    NetlinkOperationClass::Mutation => XfrmError::StateIndeterminate { operation },
+                    NetlinkOperationClass::ReadOnly => XfrmError::io(
+                        "netlink_receive",
+                        invalid_data("unsupported receive outcome"),
+                    ),
+                });
+            }
+        }
+        if !config.retry_delay.is_zero() {
+            std::thread::sleep(config.retry_delay);
+        }
+    }
+
+    Err(XfrmError::StateIndeterminate { operation })
 }
 
 fn process_has_cap_net_admin() -> Option<bool> {
@@ -1281,9 +1350,31 @@ fn encode_sa_info_inner(
     allow_zero_spi: bool,
     dscp_profile: Option<MarkProfile>,
 ) -> Result<SensitiveBuffer, XfrmError> {
+    encode_sa_info_inner_observed(parameters, allow_zero_spi, dscp_profile, |_, _, _| {})
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SaEncodingAllocationStage {
+    BeforeSensitiveAttributes,
+    Complete,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SaEncodingPlan {
+    encoded_len: usize,
+    output_mark: Option<XfrmMark>,
+}
+
+fn encode_sa_info_inner_observed(
+    parameters: &SaParameters,
+    allow_zero_spi: bool,
+    dscp_profile: Option<MarkProfile>,
+    mut observe_allocation: impl FnMut(SaEncodingAllocationStage, *const u8, usize),
+) -> Result<SensitiveBuffer, XfrmError> {
     validate_sa_parameters(parameters, allow_zero_spi)?;
+    let plan = sa_encoding_plan(parameters, dscp_profile)?;
     let family = address_family(parameters.id.destination);
-    let mut out = sensitive_buffer_with_capacity(XFRM_USER_SA_INFO_LEN + 256);
+    let mut out = sensitive_buffer_with_capacity(plan.encoded_len);
     encode_selector(&mut out, &parameters.selector)?;
     encode_xfrm_id(
         &mut out,
@@ -1320,6 +1411,11 @@ fn encode_sa_info_inner(
     push_u8(&mut out, flags);
     out.resize(XFRM_USER_SA_INFO_LEN, 0);
 
+    observe_allocation(
+        SaEncodingAllocationStage::BeforeSensitiveAttributes,
+        out.as_ptr(),
+        out.capacity(),
+    );
     if let Some((auth, key)) = &parameters.auth {
         append_attr(
             &mut out,
@@ -1346,7 +1442,7 @@ fn encode_sa_info_inner(
     }
     append_replay_state_attr(&mut out, parameters)?;
     append_common_attrs(&mut out, parameters.mark, parameters.if_id)?;
-    if let Some(output_mark) = compose_output_mark(parameters, dscp_profile)? {
+    if let Some(output_mark) = plan.output_mark {
         append_attr(&mut out, XFRMA_SET_MARK, &output_mark.value.to_ne_bytes())?;
         append_attr(
             &mut out,
@@ -1354,7 +1450,124 @@ fn encode_sa_info_inner(
             &output_mark.mask.to_ne_bytes(),
         )?;
     }
+    if out.len() != plan.encoded_len {
+        return Err(XfrmError::io(
+            "sa_encode",
+            invalid_data("encoded SA length differed from checked plan"),
+        ));
+    }
+    observe_allocation(
+        SaEncodingAllocationStage::Complete,
+        out.as_ptr(),
+        out.capacity(),
+    );
     Ok(out)
+}
+
+fn sa_encoding_plan(
+    parameters: &SaParameters,
+    dscp_profile: Option<MarkProfile>,
+) -> Result<SaEncodingPlan, XfrmError> {
+    let output_mark = compose_output_mark(parameters, dscp_profile)?;
+    let mut encoded_len = XFRM_USER_SA_INFO_LEN;
+
+    if let Some((auth, key)) = &parameters.auth {
+        let _ = encode_algorithm_name(&auth.name)?;
+        validate_key_material(key.as_bytes())?;
+        if auth.truncation_len_bits == 0 {
+            return Err(XfrmError::invalid_config(
+                "auth.truncation_len_bits",
+                "truncation length must be nonzero",
+            ));
+        }
+        checked_add_sa_attr(
+            &mut encoded_len,
+            checked_algorithm_payload_len(XFRM_ALGO_AUTH_HEADER_LEN, key.len())?,
+        )?;
+    }
+    if let Some((algorithm, key)) = &parameters.crypt {
+        let _ = encode_algorithm_name(&algorithm.name)?;
+        validate_encryption_key_material(&algorithm.name, key.as_bytes())?;
+        checked_add_sa_attr(
+            &mut encoded_len,
+            checked_algorithm_payload_len(XFRM_ALGO_HEADER_LEN, key.len())?,
+        )?;
+    }
+    if let Some((aead, key)) = &parameters.aead {
+        let _ = encode_algorithm_name(&aead.name)?;
+        validate_key_material(key.as_bytes())?;
+        if aead.icv_len_bits == 0 {
+            return Err(XfrmError::invalid_config(
+                "aead.icv_len_bits",
+                "icv length must be nonzero",
+            ));
+        }
+        checked_add_sa_attr(
+            &mut encoded_len,
+            checked_algorithm_payload_len(XFRM_ALGO_AEAD_HEADER_LEN, key.len())?,
+        )?;
+    }
+    if parameters.encap.is_some() {
+        checked_add_sa_attr(&mut encoded_len, XFRM_ENCAP_TEMPLATE_LEN)?;
+    }
+    if let Some(replay_payload_len) = replay_state_payload_len(parameters)? {
+        checked_add_sa_attr(&mut encoded_len, replay_payload_len)?;
+    }
+    if parameters.mark.is_some() {
+        checked_add_sa_attr(&mut encoded_len, XFRM_MARK_LEN)?;
+    }
+    if parameters.if_id.is_some() {
+        checked_add_sa_attr(&mut encoded_len, size_of::<u32>())?;
+    }
+    if output_mark.is_some() {
+        checked_add_sa_attr(&mut encoded_len, size_of::<u32>())?;
+        checked_add_sa_attr(&mut encoded_len, size_of::<u32>())?;
+    }
+
+    Ok(SaEncodingPlan {
+        encoded_len,
+        output_mark,
+    })
+}
+
+fn checked_algorithm_payload_len(header_len: usize, key_len: usize) -> Result<usize, XfrmError> {
+    header_len
+        .checked_add(key_len)
+        .ok_or_else(|| XfrmError::invalid_config("netlink.attr", "attribute length overflow"))
+}
+
+fn replay_state_payload_len(parameters: &SaParameters) -> Result<Option<usize>, XfrmError> {
+    let (esn, bitmap_words) = match parameters.replay_state.as_ref() {
+        Some(replay_state) => (replay_state.esn, replay_state.bitmap.len()),
+        None if parameters.replay_window > 32 => {
+            (true, parameters.replay_window.div_ceil(32).max(1) as usize)
+        }
+        None => return Ok(None),
+    };
+    if !esn {
+        return Ok(Some(XFRM_REPLAY_STATE_LEN));
+    }
+    let bitmap_len = bitmap_words.checked_mul(size_of::<u32>()).ok_or_else(|| {
+        XfrmError::invalid_config("replay_state.bitmap", "bitmap length overflow")
+    })?;
+    XFRM_REPLAY_STATE_ESN_BASE_LEN
+        .checked_add(bitmap_len)
+        .map(Some)
+        .ok_or_else(|| XfrmError::invalid_config("replay_state.bitmap", "bitmap length overflow"))
+}
+
+fn checked_add_sa_attr(encoded_len: &mut usize, payload_len: usize) -> Result<(), XfrmError> {
+    let length = ROUTE_ATTRIBUTE_HEADER_LEN
+        .checked_add(payload_len)
+        .ok_or_else(|| XfrmError::invalid_config("netlink.attr", "attribute length overflow"))?;
+    let _ = u16::try_from(length)
+        .map_err(|_| XfrmError::invalid_config("netlink.attr", "attribute length overflow"))?;
+    let aligned = align_to_netlink(length)
+        .ok_or_else(|| XfrmError::invalid_config("netlink.attr", "attribute length overflow"))?;
+    *encoded_len = encoded_len
+        .checked_add(aligned)
+        .ok_or_else(|| XfrmError::invalid_config("netlink.length", "message length overflow"))?;
+    Ok(())
 }
 
 fn compose_output_mark(
@@ -1848,8 +2061,15 @@ fn encode_replay_state_esn(replay_state: &SaReplayState) -> Result<SensitiveBuff
     let bitmap_words = u32::try_from(replay_state.bitmap.len()).map_err(|_| {
         XfrmError::invalid_config("replay_state.bitmap", "bitmap word count overflow")
     })?;
+    let bitmap_len = replay_state
+        .bitmap
+        .len()
+        .checked_mul(size_of::<u32>())
+        .ok_or_else(|| {
+            XfrmError::invalid_config("replay_state.bitmap", "bitmap length overflow")
+        })?;
     let capacity = XFRM_REPLAY_STATE_ESN_BASE_LEN
-        .checked_add(replay_state.bitmap.len().saturating_mul(4))
+        .checked_add(bitmap_len)
         .ok_or_else(|| {
             XfrmError::invalid_config("replay_state.bitmap", "bitmap length overflow")
         })?;
@@ -3720,6 +3940,7 @@ mod tests {
         fn transact(
             &self,
             _operation: &'static str,
+            _operation_class: NetlinkOperationClass,
             request: &[u8],
             _expected_sequence: u32,
             _config: LinuxXfrmBackendConfig,
@@ -3777,6 +3998,7 @@ mod tests {
         fn transact(
             &self,
             _operation: &'static str,
+            _operation_class: NetlinkOperationClass,
             request: &[u8],
             _expected_sequence: u32,
             _config: LinuxXfrmBackendConfig,
@@ -3887,6 +4109,7 @@ mod tests {
         fn transact(
             &self,
             _operation: &'static str,
+            _operation_class: NetlinkOperationClass,
             _request: &[u8],
             _expected_sequence: u32,
             _config: LinuxXfrmBackendConfig,
@@ -4110,6 +4333,198 @@ mod tests {
     fn assert_sensitive_buffer(_buffer: &SensitiveBuffer) {}
 
     fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+
+    #[test]
+    fn consumed_oversize_mutation_is_indeterminate_without_second_receive() {
+        let config = LinuxXfrmBackendConfig {
+            receive_attempts: 8,
+            receive_buffer_len: 8,
+            retry_delay: Duration::ZERO,
+        };
+        let mut receive_calls = 0;
+
+        let error = receive_netlink_response(
+            "install_sa",
+            NetlinkOperationClass::Mutation,
+            7,
+            config,
+            |buffer| {
+                receive_calls += 1;
+                Ok(ReceiveMessageOutcome::ConsumedOversize {
+                    buffer_bytes: buffer.len(),
+                    datagram_bytes: 64,
+                })
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            XfrmError::StateIndeterminate {
+                operation: "install_sa"
+            }
+        ));
+        assert_eq!(receive_calls, 1);
+    }
+
+    #[test]
+    fn consumed_oversize_read_preserves_bounded_size_evidence() {
+        let config = LinuxXfrmBackendConfig {
+            receive_attempts: 8,
+            receive_buffer_len: 16,
+            retry_delay: Duration::ZERO,
+        };
+        let mut receive_calls = 0;
+
+        let error = receive_netlink_response(
+            "query_sa",
+            NetlinkOperationClass::ReadOnly,
+            9,
+            config,
+            |buffer| {
+                receive_calls += 1;
+                Ok(ReceiveMessageOutcome::ConsumedOversize {
+                    buffer_bytes: buffer.len(),
+                    datagram_bytes: 128,
+                })
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            XfrmError::ResponseTooLarge {
+                operation: "query_sa",
+                buffer_bytes: 16,
+                datagram_bytes: 128,
+            }
+        ));
+        assert_eq!(receive_calls, 1);
+    }
+
+    #[test]
+    fn operation_classification_keeps_reads_distinct_from_mutations() {
+        assert_eq!(
+            netlink_operation_class(XFRM_MSG_GETSA),
+            NetlinkOperationClass::ReadOnly
+        );
+        assert_eq!(
+            netlink_operation_class(XFRM_MSG_GETPOLICY),
+            NetlinkOperationClass::ReadOnly
+        );
+        for message_type in [
+            XFRM_MSG_ALLOCSPI,
+            XFRM_MSG_NEWSA,
+            XFRM_MSG_UPDSA,
+            XFRM_MSG_DELSA,
+            XFRM_MSG_NEWPOLICY,
+            XFRM_MSG_UPDPOLICY,
+            XFRM_MSG_DELPOLICY,
+            XFRM_MSG_NEWAE,
+            XFRM_MSG_MIGRATE_STATE,
+        ] {
+            assert_eq!(
+                netlink_operation_class(message_type),
+                NetlinkOperationClass::Mutation
+            );
+        }
+    }
+
+    #[test]
+    fn cbc_hmac_natt_sa_destination_does_not_reallocate_after_key_copy() {
+        let mut parameters = sa_parameters();
+        parameters.auth = Some((
+            AuthAlgorithm::hmac_sha512(256),
+            KeyMaterial::new(vec![0xab; 64]),
+        ));
+        parameters.crypt = Some((Algorithm::cbc_aes(), KeyMaterial::new(vec![0xcd; 32])));
+        parameters.encap = Some(UdpEncap::esp_in_udp(4500, 4500));
+        let mut allocations = Vec::new();
+
+        let body =
+            encode_sa_info_inner_observed(&parameters, false, None, |stage, pointer, capacity| {
+                allocations.push((stage, pointer, capacity))
+            })
+            .unwrap();
+
+        assert_eq!(body.len(), 496);
+        assert_eq!(allocations.len(), 2);
+        assert_eq!(
+            allocations[0].0,
+            SaEncodingAllocationStage::BeforeSensitiveAttributes
+        );
+        assert_eq!(allocations[1].0, SaEncodingAllocationStage::Complete);
+        assert_eq!(allocations[0].1, allocations[1].1);
+        assert_eq!(allocations[0].2, allocations[1].2);
+        assert!(allocations[0].2 >= body.len());
+        assert_sensitive_buffer(&body);
+    }
+
+    #[test]
+    fn aead_largest_replay_shape_and_marks_do_not_reallocate_after_key_copy() {
+        const MAX_ESN_BITMAP_WORDS_PER_ATTR: u32 = 16_376;
+
+        let mut parameters = sa_parameters();
+        parameters.auth = None;
+        parameters.crypt = None;
+        parameters.aead = Some((
+            AeadAlgorithm::rfc4106_gcm_aes(128),
+            KeyMaterial::new(vec![0xef; 36]),
+        ));
+        parameters.replay_window = MAX_ESN_BITMAP_WORDS_PER_ATTR * 32;
+        parameters.mark = Some(XfrmMark {
+            value: 0x1234_0000,
+            mask: 0xffff_0000,
+        });
+        parameters.if_id = Some(7);
+        parameters.output_mark = Some(XfrmMark {
+            value: 0x0000_1200,
+            mask: 0x0000_ff00,
+        });
+        let mut allocations = Vec::new();
+
+        let body =
+            encode_sa_info_inner_observed(&parameters, false, None, |stage, pointer, capacity| {
+                allocations.push((stage, pointer, capacity))
+            })
+            .unwrap();
+
+        assert_eq!(allocations.len(), 2);
+        assert_eq!(allocations[0].1, allocations[1].1);
+        assert_eq!(allocations[0].2, allocations[1].2);
+        assert!(allocations[0].2 >= body.len());
+        assert!(route_attr_payload(&body, XFRMA_ALG_AEAD).is_some());
+        assert_eq!(
+            route_attr_payload(&body, XFRMA_REPLAY_ESN_VAL)
+                .unwrap()
+                .len(),
+            XFRM_REPLAY_STATE_ESN_BASE_LEN
+                + MAX_ESN_BITMAP_WORDS_PER_ATTR as usize * size_of::<u32>()
+        );
+        assert!(route_attr_payload(&body, XFRMA_MARK).is_some());
+        assert!(route_attr_payload(&body, XFRMA_IF_ID).is_some());
+        assert!(route_attr_payload(&body, XFRMA_SET_MARK).is_some());
+        assert!(route_attr_payload(&body, XFRMA_SET_MARK_MASK).is_some());
+        assert_sensitive_buffer(&body);
+    }
+
+    #[test]
+    fn sa_plan_rejects_replay_attribute_overflow_before_allocating_bitmap() {
+        const FIRST_OVERSIZED_ESN_BITMAP_WORDS: u32 = 16_377;
+
+        let mut parameters = sa_parameters();
+        parameters.replay_window = FIRST_OVERSIZED_ESN_BITMAP_WORDS * 32;
+
+        let error = encode_sa_info(&parameters).unwrap_err();
+
+        assert!(matches!(
+            error,
+            XfrmError::InvalidConfig {
+                field: "netlink.attr",
+                reason: "attribute length overflow",
+            }
+        ));
+    }
 
     #[test]
     fn relocate_sa_codec_matches_upstream_uapi_layout() {

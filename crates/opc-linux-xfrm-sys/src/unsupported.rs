@@ -1,6 +1,8 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::ReceiveMessageOutcome;
+
 #[derive(Debug)]
 pub struct NetlinkSocket {
     _private: (),
@@ -32,7 +34,10 @@ pub fn send_message(_socket: &NetlinkSocket, _payload: &[u8]) -> io::Result<usiz
     Err(unsupported())
 }
 
-pub fn receive_message(_socket: &NetlinkSocket, _buffer: &mut [u8]) -> io::Result<usize> {
+pub fn receive_message_outcome(
+    _socket: &NetlinkSocket,
+    _buffer: &mut [u8],
+) -> io::Result<ReceiveMessageOutcome> {
     Err(unsupported())
 }
 
