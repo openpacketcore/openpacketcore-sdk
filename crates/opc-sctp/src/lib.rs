@@ -7,6 +7,12 @@
 //! an association is protected. Deployments must provide and attest a separate
 //! protection mechanism such as IPsec, or use a real protected Diameter
 //! transport outside this crate.
+//!
+//! Each Linux socket reuses one bounded 64 KiB receive scratch allocation.
+//! One-to-many callers share its async ownership gate; one-to-one associations
+//! retain their wider receive/event ordering gate. Returned payloads own only
+//! the received prefix, and that prefix is zeroized in the reusable scratch
+//! before the receive operation completes.
 
 #![forbid(unsafe_code)]
 
@@ -28,6 +34,8 @@ use bytes::Bytes;
 #[cfg(target_os = "linux")]
 use bytes::BytesMut;
 use thiserror::Error;
+#[cfg(target_os = "linux")]
+use zeroize::Zeroize;
 use zeroize::Zeroizing;
 
 #[cfg(target_os = "linux")]
@@ -177,6 +185,291 @@ fn validate_peer_authenticated_chunks(
 #[cfg(any(target_os = "linux", test))]
 fn sctp_recv_chunk_capacity(remaining_payload_bytes: usize) -> usize {
     remaining_payload_bytes.clamp(MIN_SCTP_NOTIFICATION_RECV_BYTES, SCTP_RECV_CHUNK_BYTES)
+}
+
+#[cfg(target_os = "linux")]
+struct ReceiveScratch {
+    buffer: BytesMut,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+std::thread_local! {
+    static RECEIVE_SCRATCH_ALLOCATIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(target_os = "linux")]
+struct ReceivedScratchPrefix<'a> {
+    bytes: &'a mut [u8],
+}
+
+#[cfg(target_os = "linux")]
+impl ReceivedScratchPrefix<'_> {
+    fn as_slice(&self) -> &[u8] {
+        self.bytes
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ReceivedScratchPrefix<'_> {
+    fn drop(&mut self) {
+        self.bytes.zeroize();
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl ReceiveScratch {
+    fn new() -> Self {
+        #[cfg(test)]
+        RECEIVE_SCRATCH_ALLOCATIONS.with(|allocations| {
+            allocations.set(allocations.get().saturating_add(1));
+        });
+        Self {
+            buffer: BytesMut::zeroed(SCTP_RECV_CHUNK_BYTES),
+        }
+    }
+
+    fn chunk_mut(&mut self, len: usize) -> Option<&mut [u8]> {
+        self.buffer.get_mut(..len)
+    }
+
+    fn written_prefix(
+        &mut self,
+        received_len: usize,
+        offered_len: usize,
+    ) -> Option<ReceivedScratchPrefix<'_>> {
+        let safe_written_len = received_len.min(offered_len).min(self.buffer.len());
+        if safe_written_len != received_len {
+            self.buffer[..safe_written_len].zeroize();
+            return None;
+        }
+        Some(ReceivedScratchPrefix {
+            bytes: &mut self.buffer[..safe_written_len],
+        })
+    }
+
+    #[cfg(test)]
+    fn allocation_address(&self) -> usize {
+        self.buffer.as_ptr() as usize
+    }
+
+    #[cfg(test)]
+    fn allocation_count_for_current_test_thread() -> usize {
+        RECEIVE_SCRATCH_ALLOCATIONS.with(std::cell::Cell::get)
+    }
+
+    #[cfg(test)]
+    fn is_zeroed(&self) -> bool {
+        self.buffer.iter().all(|byte| *byte == 0)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl fmt::Debug for ReceiveScratch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ReceiveScratch").finish_non_exhaustive()
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ReceiveScratch {
+    fn drop(&mut self) {
+        self.buffer.as_mut().zeroize();
+    }
+}
+
+#[cfg(target_os = "linux")]
+trait ReceiveChunkSource: Sync {
+    fn recv_chunk<'a>(
+        &'a self,
+        buffer: &'a mut [u8],
+    ) -> impl std::future::Future<Output = Result<opc_libsctp_sys::Received, ReceiveFailure>> + Send + 'a;
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct ReceiveFailure {
+    error: SctpError,
+    close_socket: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl ReceiveFailure {
+    fn preserve_socket(error: SctpError) -> Self {
+        Self {
+            error,
+            close_socket: false,
+        }
+    }
+
+    fn close_socket(error: SctpError) -> Self {
+        Self {
+            error,
+            close_socket: true,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct ReceiveOwner {
+    scratch: tokio::sync::Mutex<ReceiveScratch>,
+}
+
+#[cfg(target_os = "linux")]
+impl ReceiveOwner {
+    fn new() -> Self {
+        Self {
+            scratch: tokio::sync::Mutex::new(ReceiveScratch::new()),
+        }
+    }
+
+    async fn recv<S>(
+        &self,
+        source: &S,
+        max_message_bytes: usize,
+    ) -> Result<InboundMessage, ReceiveFailure>
+    where
+        S: ReceiveChunkSource,
+    {
+        // Holding this gate across the complete record serializes concurrent
+        // one-to-many endpoint receivers. Associations retain a wider outer
+        // gate for receive, event, and path-state ordering.
+        let mut scratch = self.scratch.lock().await;
+        let mut accumulator = ReceiveAccumulator::new(max_message_bytes);
+        loop {
+            let remaining = accumulator.remaining_payload_bytes().ok_or_else(|| {
+                ReceiveFailure::close_socket(SctpError::MessageTooLarge { max_message_bytes })
+            })?;
+            // Notifications share the receive queue with DATA but are not
+            // governed by the caller's payload cap. Always provide enough
+            // room for every fixed notification decoded by this crate, then
+            // enforce `remaining` independently for DATA below.
+            let chunk_len = sctp_recv_chunk_capacity(remaining);
+            let buffer = scratch
+                .chunk_mut(chunk_len)
+                .ok_or_else(|| ReceiveFailure::close_socket(invalid_receive_scratch_error()))?;
+            let received = match source.recv_chunk(buffer).await {
+                Ok(received) => received,
+                Err(error) => {
+                    // A failed syscall has no reliable returned byte count.
+                    buffer.zeroize();
+                    return Err(error);
+                }
+            };
+            let received_prefix = scratch
+                .written_prefix(received.bytes, chunk_len)
+                .ok_or_else(|| ReceiveFailure::close_socket(invalid_receive_scratch_error()))?;
+            let assembled = accumulator.push(received, received_prefix.as_slice());
+            drop(received_prefix);
+            if let Some(message) = assembled.map_err(ReceiveFailure::close_socket)? {
+                return Ok(message);
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl fmt::Debug for ReceiveOwner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ReceiveOwner").finish_non_exhaustive()
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn invalid_receive_scratch_error() -> SctpError {
+    io_err(
+        "recv_scratch",
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "kernel receive length exceeded bounded scratch storage",
+        ),
+    )
+}
+
+#[cfg(target_os = "linux")]
+struct ReceiveAccumulator {
+    max_message_bytes: usize,
+    payload: BytesMut,
+    first_received: Option<opc_libsctp_sys::Received>,
+    payload_truncated: bool,
+    control_truncated: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl ReceiveAccumulator {
+    fn new(max_message_bytes: usize) -> Self {
+        Self {
+            max_message_bytes,
+            payload: BytesMut::new(),
+            first_received: None,
+            payload_truncated: false,
+            control_truncated: false,
+        }
+    }
+
+    fn remaining_payload_bytes(&self) -> Option<usize> {
+        self.max_message_bytes
+            .checked_sub(self.payload.len())
+            .filter(|remaining| *remaining > 0)
+    }
+
+    fn push(
+        &mut self,
+        received: opc_libsctp_sys::Received,
+        received_prefix: &[u8],
+    ) -> Result<Option<InboundMessage>, SctpError> {
+        if received_prefix.len() != received.bytes {
+            return Err(io_err(
+                "recv_scratch",
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "kernel receive length exceeded bounded scratch storage",
+                ),
+            ));
+        }
+        if received.bytes == 0 && !received.flags.notification {
+            return Err(SctpError::Closed);
+        }
+        if received.flags.notification {
+            let mut notification = BytesMut::with_capacity(received.bytes);
+            notification.extend_from_slice(received_prefix);
+            return Ok(Some(map_recv(received, notification)));
+        }
+
+        let remaining = self.max_message_bytes.saturating_sub(self.payload.len());
+        if received.bytes > remaining {
+            return Err(SctpError::MessageTooLarge {
+                max_message_bytes: self.max_message_bytes,
+            });
+        }
+
+        let first = self.first_received.get_or_insert(received);
+        self.payload_truncated |= received.flags.payload_truncated;
+        self.control_truncated |= received.flags.control_truncated;
+        self.payload.extend_from_slice(received_prefix);
+
+        if received.flags.end_of_record {
+            let mut complete = *first;
+            complete.bytes = self.payload.len();
+            complete.flags.end_of_record = true;
+            complete.flags.payload_truncated = self.payload_truncated;
+            complete.flags.control_truncated = self.control_truncated;
+            return Ok(Some(map_recv(complete, std::mem::take(&mut self.payload))));
+        }
+        if self.payload.len() >= self.max_message_bytes {
+            return Err(SctpError::MessageTooLarge {
+                max_message_bytes: self.max_message_bytes,
+            });
+        }
+        Ok(None)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ReceiveAccumulator {
+    fn drop(&mut self) {
+        self.payload.as_mut().zeroize();
+    }
 }
 
 /// Nonzero SCTP-AUTH shared-key identifier.
@@ -2269,6 +2562,12 @@ impl SctpEndpoint {
     }
 
     /// Receive one message on a one-to-many endpoint.
+    ///
+    /// Concurrent active calls share one socket-owned receive gate and are
+    /// serialized in kernel receive order. Returned payloads own exactly the
+    /// received bytes; the reusable scratch prefix is cleared before this
+    /// method returns. A receive future is not cancellation-safe after it
+    /// starts consuming a multi-chunk SCTP record.
     pub async fn recv(&self) -> Result<InboundMessage, SctpError> {
         self.imp.recv().await
     }
@@ -2325,8 +2624,9 @@ impl SctpAssociation {
     /// kernel receive order before this returns. A made-primary event is
     /// reconciled best-effort with the kernel's current primary; if that
     /// health-only query fails, the event is returned while the last known
-    /// designation is preserved. A receive future is not cancellation-safe
-    /// after it starts consuming a multi-chunk SCTP record.
+    /// designation is preserved. Returned payloads own exactly the received
+    /// bytes and do not borrow the socket scratch. A receive future is not
+    /// cancellation-safe after it starts consuming a multi-chunk SCTP record.
     pub async fn recv(&self) -> Result<InboundMessage, SctpError> {
         self.imp.recv().await
     }
@@ -2975,6 +3275,7 @@ mod platform {
     struct SctpSocket {
         fd: AsyncFd<OwnedFd>,
         max_message_bytes: usize,
+        recv_owner: ReceiveOwner,
         metrics: SctpMetrics,
         closed: AtomicBool,
     }
@@ -3031,6 +3332,7 @@ mod platform {
             socket: Arc::new(SctpSocket {
                 fd: async_fd,
                 max_message_bytes: config.max_message_bytes,
+                recv_owner: ReceiveOwner::new(),
                 metrics: SctpMetrics::default(),
                 closed: AtomicBool::new(false),
             }),
@@ -3073,6 +3375,7 @@ mod platform {
         let socket = Arc::new(SctpSocket {
             fd: async_fd,
             max_message_bytes: config.max_message_bytes,
+            recv_owner: ReceiveOwner::new(),
             metrics: SctpMetrics::default(),
             closed: AtomicBool::new(false),
         });
@@ -3145,6 +3448,7 @@ mod platform {
                             socket: Arc::new(SctpSocket {
                                 fd: async_fd,
                                 max_message_bytes: self.socket.max_message_bytes,
+                                recv_owner: ReceiveOwner::new(),
                                 metrics: self.socket.metrics.clone(),
                                 closed: AtomicBool::new(false),
                             }),
@@ -3729,109 +4033,35 @@ mod platform {
         }
 
         async fn recv(&self) -> Result<InboundMessage, SctpError> {
-            let mut payload = BytesMut::new();
-            let mut first_received = None;
-            let mut payload_truncated = false;
-            let mut control_truncated = false;
-            loop {
-                let remaining = self.max_message_bytes.saturating_sub(payload.len());
-                if remaining == 0 {
-                    self.mark_closed();
-                    self.metrics.record_io_error();
-                    return Err(SctpError::MessageTooLarge {
-                        max_message_bytes: self.max_message_bytes,
-                    });
-                }
-                // Notifications share the receive queue with DATA but are not
-                // governed by the caller's payload cap. Always provide enough
-                // room for every fixed notification decoded by this crate,
-                // then enforce `remaining` independently for DATA below.
-                let chunk_len = sctp_recv_chunk_capacity(remaining);
-                let mut buffer = BytesMut::zeroed(chunk_len);
-                let received = self.recv_chunk(&mut buffer).await?;
-                if received.bytes == 0 && !received.flags.notification {
-                    self.mark_closed();
-                    self.metrics.record_io_error();
-                    return Err(SctpError::Closed);
-                }
-                buffer.truncate(received.bytes);
-
-                if received.flags.notification {
-                    self.metrics.record_rx(received.bytes);
-                    let message = map_recv(received, buffer);
-                    tracing::trace!(
-                        bytes = message.payload.len(),
-                        stream_id = message.stream_id,
-                        ppid = %message.ppid,
-                        notification = message.notification,
-                        "sctp notification received"
-                    );
-                    return Ok(message);
-                }
-
-                if received.bytes > remaining {
-                    self.mark_closed();
-                    self.metrics.record_io_error();
-                    return Err(SctpError::MessageTooLarge {
-                        max_message_bytes: self.max_message_bytes,
-                    });
-                }
-
-                let first = first_received.get_or_insert(received);
-                payload_truncated |= received.flags.payload_truncated;
-                control_truncated |= received.flags.control_truncated;
-                payload.extend_from_slice(&buffer);
-
-                if received.flags.end_of_record {
-                    let mut complete = *first;
-                    complete.bytes = payload.len();
-                    complete.flags.end_of_record = true;
-                    complete.flags.payload_truncated = payload_truncated;
-                    complete.flags.control_truncated = control_truncated;
-                    self.metrics.record_rx(payload.len());
-                    let message = map_recv(complete, payload);
-                    tracing::trace!(
-                        bytes = message.payload.len(),
-                        stream_id = message.stream_id,
-                        ppid = %message.ppid,
-                        notification = message.notification,
-                        "sctp message received"
-                    );
-                    return Ok(message);
-                }
-                if payload.len() >= self.max_message_bytes {
-                    self.mark_closed();
-                    self.metrics.record_io_error();
-                    return Err(SctpError::MessageTooLarge {
-                        max_message_bytes: self.max_message_bytes,
-                    });
-                }
-            }
-        }
-
-        async fn recv_chunk(
-            &self,
-            buffer: &mut BytesMut,
-        ) -> Result<opc_libsctp_sys::Received, SctpError> {
-            loop {
-                let mut guard = self
-                    .fd
-                    .readable()
-                    .await
-                    .map_err(|source| io_err("recv_ready", source))?;
-                match guard
-                    .try_io(|inner| opc_libsctp_sys::recv_msg(inner.get_ref().as_fd(), buffer))
-                {
-                    Ok(Ok(received)) => return Ok(received),
-                    Ok(Err(source)) if source.kind() == io::ErrorKind::Interrupted => continue,
-                    Ok(Err(source)) => {
+            let message = match self.recv_owner.recv(self, self.max_message_bytes).await {
+                Ok(message) => message,
+                Err(failure) => {
+                    if failure.close_socket {
                         self.mark_closed();
                         self.metrics.record_io_error();
-                        return Err(io_err("recv", source));
                     }
-                    Err(_would_block) => continue,
+                    return Err(failure.error);
                 }
+            };
+            self.metrics.record_rx(message.payload.len());
+            if message.notification {
+                tracing::trace!(
+                    bytes = message.payload.len(),
+                    stream_id = message.stream_id,
+                    ppid = %message.ppid,
+                    notification = message.notification,
+                    "sctp notification received"
+                );
+            } else {
+                tracing::trace!(
+                    bytes = message.payload.len(),
+                    stream_id = message.stream_id,
+                    ppid = %message.ppid,
+                    notification = message.notification,
+                    "sctp message received"
+                );
             }
+            Ok(message)
         }
 
         fn is_open(&self) -> bool {
@@ -3840,6 +4070,37 @@ mod platform {
 
         fn mark_closed(&self) {
             self.closed.store(true, Ordering::Relaxed);
+        }
+    }
+
+    impl ReceiveChunkSource for SctpSocket {
+        #[allow(
+            clippy::manual_async_fn,
+            reason = "the private source contract must preserve a Send receive future"
+        )]
+        fn recv_chunk<'a>(
+            &'a self,
+            buffer: &'a mut [u8],
+        ) -> impl std::future::Future<Output = Result<opc_libsctp_sys::Received, ReceiveFailure>>
+               + Send
+               + 'a {
+            async move {
+                loop {
+                    let mut guard = self.fd.readable().await.map_err(|source| {
+                        ReceiveFailure::preserve_socket(io_err("recv_ready", source))
+                    })?;
+                    match guard
+                        .try_io(|inner| opc_libsctp_sys::recv_msg(inner.get_ref().as_fd(), buffer))
+                    {
+                        Ok(Ok(received)) => return Ok(received),
+                        Ok(Err(source)) if source.kind() == io::ErrorKind::Interrupted => continue,
+                        Ok(Err(source)) => {
+                            return Err(ReceiveFailure::close_socket(io_err("recv", source)));
+                        }
+                        Err(_would_block) => continue,
+                    }
+                }
+            }
         }
     }
 
@@ -4183,6 +4444,90 @@ mod tests {
         payload
     }
 
+    #[cfg(target_os = "linux")]
+    fn synthetic_received(
+        bytes: usize,
+        stream_id: u16,
+        ppid: PayloadProtocolIdentifier,
+        assoc_id: i32,
+        flags: opc_libsctp_sys::RecvFlags,
+    ) -> opc_libsctp_sys::Received {
+        opc_libsctp_sys::Received {
+            bytes,
+            info: (!flags.notification).then_some(opc_libsctp_sys::RecvInfo {
+                stream_id,
+                ssn: 0,
+                flags: 0,
+                ppid_network_order: ppid.to_network_order(),
+                tsn: 0,
+                cumulative_tsn: 0,
+                context: 0,
+                assoc_id,
+            }),
+            flags,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn synthetic_recv_flags(
+        notification: bool,
+        end_of_record: bool,
+        payload_truncated: bool,
+        control_truncated: bool,
+    ) -> opc_libsctp_sys::RecvFlags {
+        opc_libsctp_sys::RecvFlags {
+            notification,
+            end_of_record,
+            payload_truncated,
+            control_truncated,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    struct RepeatingSmallReceiveSource {
+        marker: std::sync::atomic::AtomicU8,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl RepeatingSmallReceiveSource {
+        fn new() -> Self {
+            Self {
+                marker: std::sync::atomic::AtomicU8::new(0),
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl ReceiveChunkSource for RepeatingSmallReceiveSource {
+        #[allow(
+            clippy::manual_async_fn,
+            reason = "the private source contract must preserve a Send receive future"
+        )]
+        fn recv_chunk<'a>(
+            &'a self,
+            buffer: &'a mut [u8],
+        ) -> impl std::future::Future<Output = Result<opc_libsctp_sys::Received, ReceiveFailure>>
+               + Send
+               + 'a {
+            async move {
+                let payload = buffer.get_mut(..37).ok_or_else(|| {
+                    ReceiveFailure::close_socket(io_err(
+                        "synthetic_recv",
+                        io::Error::new(io::ErrorKind::InvalidData, "synthetic receive buffer"),
+                    ))
+                })?;
+                payload.fill(self.marker.fetch_add(1, Ordering::Relaxed));
+                Ok(synthetic_received(
+                    payload.len(),
+                    1,
+                    DIAMETER_SCTP_PPID,
+                    1,
+                    synthetic_recv_flags(false, true, false, false),
+                ))
+            }
+        }
+    }
+
     fn authentication_notification(
         key_id: u16,
         alternate_key_id: u16,
@@ -4259,6 +4604,365 @@ mod tests {
             sctp_recv_chunk_capacity(SCTP_RECV_CHUNK_BYTES * 2),
             SCTP_RECV_CHUNK_BYTES
         );
+    }
+
+    #[test]
+    fn public_receive_futures_remain_send() {
+        fn assert_send<T: Send>(_: T) {}
+        fn endpoint(endpoint: &SctpEndpoint) {
+            assert_send(endpoint.recv());
+        }
+        fn association(association: &SctpAssociation) {
+            assert_send(association.recv());
+        }
+        fn receive_half(receive_half: &mut SctpAssociationReceiveHalf) {
+            assert_send(receive_half.recv());
+        }
+
+        let _ = endpoint as fn(&SctpEndpoint);
+        let _ = association as fn(&SctpAssociation);
+        let _ = receive_half as fn(&mut SctpAssociationReceiveHalf);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn receive_scratch_reuses_one_allocation_and_zeroizes_long_then_short() {
+        let allocations_before = ReceiveScratch::allocation_count_for_current_test_thread();
+        let mut scratch = ReceiveScratch::new();
+        let expected_allocations = allocations_before.saturating_add(1);
+        assert_eq!(
+            ReceiveScratch::allocation_count_for_current_test_thread(),
+            expected_allocations
+        );
+        let allocation = scratch.allocation_address();
+        let long = vec![0xA5; 32 * 1024];
+        scratch
+            .chunk_mut(long.len())
+            .expect("long chunk fits")
+            .copy_from_slice(&long);
+        let mut long_accumulator = ReceiveAccumulator::new(long.len());
+        let long_prefix = scratch
+            .written_prefix(long.len(), long.len())
+            .expect("kernel length fits");
+        let long_message = long_accumulator
+            .push(
+                synthetic_received(
+                    long.len(),
+                    7,
+                    DIAMETER_SCTP_PPID,
+                    11,
+                    synthetic_recv_flags(false, true, false, false),
+                ),
+                long_prefix.as_slice(),
+            )
+            .expect("long chunk assembles")
+            .expect("long message completes");
+        drop(long_prefix);
+
+        assert_eq!(long_message.payload.as_ref(), long.as_slice());
+        assert_eq!(scratch.allocation_address(), allocation);
+        assert!(scratch.is_zeroed());
+
+        let short = [0x11, 0x22, 0x33];
+        scratch
+            .chunk_mut(short.len())
+            .expect("short chunk fits")
+            .copy_from_slice(&short);
+        let mut short_accumulator = ReceiveAccumulator::new(short.len());
+        let short_prefix = scratch
+            .written_prefix(short.len(), short.len())
+            .expect("kernel length fits");
+        let short_message = short_accumulator
+            .push(
+                synthetic_received(
+                    short.len(),
+                    8,
+                    NGAP_PPID,
+                    12,
+                    synthetic_recv_flags(false, true, false, false),
+                ),
+                short_prefix.as_slice(),
+            )
+            .expect("short chunk assembles")
+            .expect("short message completes");
+        drop(short_prefix);
+
+        assert_eq!(short_message.payload.as_ref(), short.as_slice());
+        assert_eq!(long_message.payload.as_ref(), long.as_slice());
+        assert_eq!(scratch.allocation_address(), allocation);
+        assert!(scratch.is_zeroed());
+        let debug = format!("{scratch:?}");
+        assert_eq!(debug, "ReceiveScratch { .. }");
+        assert!(!debug.contains("65536"));
+        assert!(!debug.contains("165"));
+        assert_eq!(scratch.allocation_address(), allocation);
+        assert_eq!(
+            ReceiveScratch::allocation_count_for_current_test_thread(),
+            expected_allocations
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn production_receive_path_reuses_socket_scratch_for_steady_state_messages() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("current-thread runtime");
+        let allocations_before = ReceiveScratch::allocation_count_for_current_test_thread();
+        let owner = ReceiveOwner::new();
+        let expected_scratch_allocations = allocations_before.saturating_add(1);
+        assert_eq!(
+            ReceiveScratch::allocation_count_for_current_test_thread(),
+            expected_scratch_allocations
+        );
+        let source = RepeatingSmallReceiveSource::new();
+
+        // Warm the current-thread runtime and the exact production record
+        // assembly path before measuring its steady state.
+        let warmup = runtime
+            .block_on(owner.recv(&source, SCTP_RECV_CHUNK_BYTES))
+            .expect("warmup receive");
+        assert_eq!(warmup.payload.len(), 37);
+        drop(warmup);
+
+        let allocations = allocation_counter::measure(|| {
+            runtime.block_on(async {
+                for _ in 0..64 {
+                    let message = owner
+                        .recv(&source, SCTP_RECV_CHUNK_BYTES)
+                        .await
+                        .expect("steady-state receive");
+                    assert_eq!(message.payload.len(), 37);
+                    assert!(message
+                        .payload
+                        .iter()
+                        .all(|byte| *byte == message.payload[0]));
+                }
+            });
+        });
+
+        // The returned 37-byte owned payloads allocate by design. The entire
+        // measured path must nevertheless allocate less than one receive
+        // scratch region; this deterministically fails if a fresh 64 KiB
+        // temporary is added to the production loop.
+        assert!(
+            allocations.bytes_total < SCTP_RECV_CHUNK_BYTES as u64,
+            "steady-state receive allocated {} bytes",
+            allocations.bytes_total
+        );
+        assert_eq!(
+            ReceiveScratch::allocation_count_for_current_test_thread(),
+            expected_scratch_allocations
+        );
+        let scratch = runtime.block_on(owner.scratch.lock());
+        assert!(scratch.is_zeroed());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reusable_scratch_preserves_notification_data_interleave_and_small_cap() {
+        let mut scratch = ReceiveScratch::new();
+        let notification = sender_dry_notification(29);
+        scratch
+            .chunk_mut(notification.len())
+            .expect("notification fits")
+            .copy_from_slice(&notification);
+        let mut notification_accumulator = ReceiveAccumulator::new(1);
+        let notification_prefix = scratch
+            .written_prefix(notification.len(), notification.len())
+            .expect("notification length fits");
+        let notification_message = notification_accumulator
+            .push(
+                synthetic_received(
+                    notification.len(),
+                    0,
+                    PayloadProtocolIdentifier::new(0),
+                    0,
+                    synthetic_recv_flags(true, true, false, false),
+                ),
+                notification_prefix.as_slice(),
+            )
+            .expect("notification assembles above data cap")
+            .expect("notification completes");
+        drop(notification_prefix);
+
+        assert!(notification_message.notification);
+        assert!(matches!(
+            notification_message.event,
+            Some(SctpEvent::SenderDry { assoc_id: 29 })
+        ));
+        assert!(scratch.is_zeroed());
+
+        scratch
+            .chunk_mut(1)
+            .expect("data byte fits")
+            .copy_from_slice(b"x");
+        let mut data_accumulator = ReceiveAccumulator::new(1);
+        let data_prefix = scratch.written_prefix(1, 1).expect("data length fits");
+        let data_message = data_accumulator
+            .push(
+                synthetic_received(
+                    1,
+                    4,
+                    DIAMETER_SCTP_PPID,
+                    29,
+                    synthetic_recv_flags(false, true, false, false),
+                ),
+                data_prefix.as_slice(),
+            )
+            .expect("data assembles")
+            .expect("data completes");
+        drop(data_prefix);
+
+        assert_eq!(data_message.payload, Bytes::from_static(b"x"));
+        assert_eq!(data_message.stream_id, 4);
+        assert_eq!(data_message.ppid, DIAMETER_SCTP_PPID);
+        assert_eq!(data_message.assoc_id, 29);
+        assert!(scratch.is_zeroed());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reusable_scratch_reassembles_multichunk_and_zeroizes_cap_failures() {
+        let mut scratch = ReceiveScratch::new();
+        let first_len = SCTP_RECV_CHUNK_BYTES;
+        scratch
+            .chunk_mut(first_len)
+            .expect("first chunk fits")
+            .fill(0x41);
+        let mut accumulator = ReceiveAccumulator::new(first_len + 17);
+        let first_prefix = scratch
+            .written_prefix(first_len, first_len)
+            .expect("first length fits");
+        assert!(accumulator
+            .push(
+                synthetic_received(
+                    first_len,
+                    3,
+                    DIAMETER_SCTP_PPID,
+                    41,
+                    synthetic_recv_flags(false, false, true, false),
+                ),
+                first_prefix.as_slice(),
+            )
+            .expect("first chunk assembles")
+            .is_none());
+        drop(first_prefix);
+        assert!(scratch.is_zeroed());
+
+        let second = [0x42; 17];
+        scratch
+            .chunk_mut(second.len())
+            .expect("second chunk fits")
+            .copy_from_slice(&second);
+        let second_prefix = scratch
+            .written_prefix(second.len(), second.len())
+            .expect("second length fits");
+        let message = accumulator
+            .push(
+                synthetic_received(
+                    second.len(),
+                    9,
+                    NGAP_PPID,
+                    99,
+                    synthetic_recv_flags(false, true, false, true),
+                ),
+                second_prefix.as_slice(),
+            )
+            .expect("second chunk assembles")
+            .expect("record completes");
+        drop(second_prefix);
+
+        assert_eq!(message.payload.len(), first_len + second.len());
+        assert!(message.payload[..first_len]
+            .iter()
+            .all(|byte| *byte == 0x41));
+        assert_eq!(&message.payload[first_len..], second.as_slice());
+        assert_eq!(message.stream_id, 3);
+        assert_eq!(message.ppid, DIAMETER_SCTP_PPID);
+        assert_eq!(message.assoc_id, 41);
+        assert!(message.truncated);
+        assert!(message.control_truncated);
+        assert!(scratch.is_zeroed());
+
+        scratch
+            .chunk_mut(5)
+            .expect("oversize chunk fits scratch")
+            .fill(0xCC);
+        let mut capped = ReceiveAccumulator::new(4);
+        let oversize_prefix = scratch
+            .written_prefix(5, 5)
+            .expect("kernel length fits scratch");
+        let error = capped
+            .push(
+                synthetic_received(
+                    5,
+                    1,
+                    DIAMETER_SCTP_PPID,
+                    1,
+                    synthetic_recv_flags(false, true, false, false),
+                ),
+                oversize_prefix.as_slice(),
+            )
+            .expect_err("payload exceeds configured cap");
+        drop(oversize_prefix);
+        assert!(matches!(
+            error,
+            SctpError::MessageTooLarge {
+                max_message_bytes: 4
+            }
+        ));
+        assert!(scratch.is_zeroed());
+
+        scratch
+            .chunk_mut(4)
+            .expect("offered chunk fits scratch")
+            .fill(0xDD);
+        assert!(scratch.written_prefix(5, 4).is_none());
+        assert!(scratch.is_zeroed());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn receive_scratch_gate_serializes_concurrent_split_style_owners() {
+        let gate = Arc::new(tokio::sync::Mutex::new(ReceiveScratch::new()));
+        let (first_acquired_tx, first_acquired_rx) = tokio::sync::oneshot::channel();
+        let (release_first_tx, release_first_rx) = tokio::sync::oneshot::channel();
+        let first_gate = Arc::clone(&gate);
+        let first = tokio::spawn(async move {
+            let scratch = first_gate.lock().await;
+            first_acquired_tx
+                .send(scratch.allocation_address())
+                .expect("first acquisition observed");
+            let _ = release_first_rx.await;
+            drop(scratch);
+        });
+        let first_address = first_acquired_rx.await.expect("first owner acquired gate");
+
+        let (second_started_tx, second_started_rx) = tokio::sync::oneshot::channel();
+        let (second_acquired_tx, mut second_acquired_rx) = tokio::sync::oneshot::channel();
+        let second_gate = Arc::clone(&gate);
+        let second = tokio::spawn(async move {
+            second_started_tx.send(()).expect("second owner started");
+            let scratch = second_gate.lock().await;
+            second_acquired_tx
+                .send(scratch.allocation_address())
+                .expect("second acquisition observed");
+        });
+        second_started_rx.await.expect("second owner reached gate");
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            second_acquired_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+
+        release_first_tx.send(()).expect("release first owner");
+        let second_address = second_acquired_rx
+            .await
+            .expect("second owner acquired after release");
+        first.await.expect("first owner completed");
+        second.await.expect("second owner completed");
+        assert_eq!(first_address, second_address);
     }
 
     #[test]
@@ -5676,6 +6380,16 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    async fn recv_endpoint_data(endpoint: &SctpEndpoint) -> InboundMessage {
+        loop {
+            let message = endpoint.recv().await.unwrap();
+            if !message.notification {
+                return message;
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     struct SctpPathDrop {
         delete_rules: Vec<Vec<String>>,
     }
@@ -5874,6 +6588,66 @@ mod tests {
         assert_eq!(received[1].stream_id, 2);
         assert!(received.iter().all(|message| {
             !message.truncated && !message.control_truncated && message.ppid == DIAMETER_SCTP_PPID
+        }));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires Linux kernel SCTP support"]
+    async fn concurrent_one_to_many_endpoint_receives_preserve_multi_chunk_messages() {
+        let server = Arc::new(
+            SctpEndpoint::bind(SctpEndpointConfig::one_to_many(
+                "127.0.0.1:0".parse().unwrap(),
+            ))
+            .unwrap(),
+        );
+        let server_addr = server.local_addresses().unwrap()[0];
+        let client = SctpAssociation::connect(SctpConnectConfig::new(server_addr))
+            .await
+            .unwrap();
+        let first_payload = Bytes::from(vec![0x31_u8; 100_000]);
+        let second_payload = Bytes::from(vec![0x42_u8; 100_000]);
+
+        client
+            .send(OutboundMessage::ordered(
+                first_payload.clone(),
+                1,
+                DIAMETER_SCTP_PPID,
+            ))
+            .await
+            .unwrap();
+        client
+            .send(OutboundMessage::ordered(
+                second_payload.clone(),
+                2,
+                DIAMETER_SCTP_PPID,
+            ))
+            .await
+            .unwrap();
+
+        let first_server = Arc::clone(&server);
+        let second_server = Arc::clone(&server);
+        let (first_received, second_received) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), async move {
+                tokio::join!(
+                    recv_endpoint_data(&first_server),
+                    recv_endpoint_data(&second_server)
+                )
+            })
+            .await
+            .expect("concurrent one-to-many receive timed out");
+
+        let mut received = [first_received, second_received];
+        received.sort_by_key(|message| message.payload.first().copied());
+        assert_eq!(received[0].payload, first_payload);
+        assert_eq!(received[0].stream_id, 1);
+        assert_eq!(received[1].payload, second_payload);
+        assert_eq!(received[1].stream_id, 2);
+        assert!(received.iter().all(|message| {
+            !message.truncated
+                && !message.control_truncated
+                && message.ppid == DIAMETER_SCTP_PPID
+                && message.assoc_id != 0
         }));
     }
 
