@@ -4,10 +4,11 @@ use opc_proto_ikev2::{
     Ikev2DhGroup, Ikev2EncryptionAlgorithm, Ikev2IdentificationPayloadBuild, Ikev2IkeAuthPeer,
     Ikev2IkeAuthSignedOctets, Ikev2IkeAuthVerificationError, Ikev2PrfAlgorithm,
     Ikev2SaInitCryptoProfile, Ikev2SaInitKeyMaterial, Ikev2SignatureAuthKey,
-    Ikev2SignatureAuthMethod, Ikev2SignatureKeyError, Ikev2SignaturePublicKey,
-    IKEV2_AUTH_METHOD_DIGITAL_SIGNATURE, IKEV2_AUTH_METHOD_RSA_DIGITAL_SIGNATURE,
-    IKEV2_AUTH_METHOD_SHARED_KEY_MIC, RFC7427_ALGORITHM_IDENTIFIER_ECDSA_SHA2_256,
-    RFC7427_ALGORITHM_IDENTIFIER_ECDSA_SHA2_384, RFC7427_ALGORITHM_IDENTIFIER_RSA_SHA2_256,
+    Ikev2SignatureAuthMethod, Ikev2SignatureHashAlgorithm, Ikev2SignatureKeyError,
+    Ikev2SignaturePublicKey, IKEV2_AUTH_METHOD_DIGITAL_SIGNATURE,
+    IKEV2_AUTH_METHOD_RSA_DIGITAL_SIGNATURE, IKEV2_AUTH_METHOD_SHARED_KEY_MIC,
+    RFC7427_ALGORITHM_IDENTIFIER_ECDSA_SHA2_256, RFC7427_ALGORITHM_IDENTIFIER_ECDSA_SHA2_384,
+    RFC7427_ALGORITHM_IDENTIFIER_RSA_SHA2_256,
 };
 
 mod support;
@@ -77,12 +78,20 @@ fn auth_payload(auth_method: u8, auth_data: &[u8]) -> Ikev2AuthenticationPayload
 #[test]
 fn ecdsa_p256_method_14_signature_round_trips() {
     let identity = identity_payload_body();
-    let octets = signed_octets(SA_INIT_RESPONSE, PEER_NONCE, &identity);
+    let authority =
+        support::responder_signature_hash_context(Ikev2SignatureHashAlgorithm::Sha2_256);
+    let octets = signed_octets(&authority.sa_init_response, PEER_NONCE, &identity);
     let key = Ikev2SignatureAuthKey::ecdsa_p256_pkcs8_der(P256_PKCS8_DER).expect("P-256 key");
     assert_eq!(key.method().as_u8(), IKEV2_AUTH_METHOD_DIGITAL_SIGNATURE);
 
-    let auth_data =
-        compute_ike_auth_signature(profile(), &key_material(), octets, &key).expect("sign");
+    let auth_data = compute_ike_auth_signature(
+        profile(),
+        &key_material(),
+        octets,
+        &key,
+        Some(authority.signing_authorization()),
+    )
+    .expect("sign");
     assert_eq!(
         usize::from(auth_data[0]),
         RFC7427_ALGORITHM_IDENTIFIER_ECDSA_SHA2_256.len()
@@ -102,6 +111,7 @@ fn ecdsa_p256_method_14_signature_round_trips() {
             octets,
             &public,
             &auth_payload(IKEV2_AUTH_METHOD_DIGITAL_SIGNATURE, &auth_data),
+            Some(authority.verification_authorization()),
         )
         .expect("method 14 ECDSA P-256 verifies");
     }
@@ -110,11 +120,19 @@ fn ecdsa_p256_method_14_signature_round_trips() {
 #[test]
 fn ecdsa_p384_method_14_signature_round_trips() {
     let identity = identity_payload_body();
-    let octets = signed_octets(SA_INIT_RESPONSE, PEER_NONCE, &identity);
+    let authority =
+        support::responder_signature_hash_context(Ikev2SignatureHashAlgorithm::Sha2_384);
+    let octets = signed_octets(&authority.sa_init_response, PEER_NONCE, &identity);
     let key = Ikev2SignatureAuthKey::ecdsa_p384_pkcs8_der(P384_PKCS8_DER).expect("P-384 key");
 
-    let auth_data =
-        compute_ike_auth_signature(profile(), &key_material(), octets, &key).expect("sign");
+    let auth_data = compute_ike_auth_signature(
+        profile(),
+        &key_material(),
+        octets,
+        &key,
+        Some(authority.signing_authorization()),
+    )
+    .expect("sign");
     assert_eq!(
         &auth_data[1..1 + RFC7427_ALGORITHM_IDENTIFIER_ECDSA_SHA2_384.len()],
         RFC7427_ALGORITHM_IDENTIFIER_ECDSA_SHA2_384
@@ -127,6 +145,7 @@ fn ecdsa_p384_method_14_signature_round_trips() {
         octets,
         &public,
         &auth_payload(IKEV2_AUTH_METHOD_DIGITAL_SIGNATURE, &auth_data),
+        Some(authority.verification_authorization()),
     )
     .expect("method 14 ECDSA P-384 verifies");
 }
@@ -134,13 +153,21 @@ fn ecdsa_p384_method_14_signature_round_trips() {
 #[test]
 fn tampered_transcript_fails_verification() {
     let identity = identity_payload_body();
-    let octets = signed_octets(SA_INIT_RESPONSE, PEER_NONCE, &identity);
+    let authority =
+        support::responder_signature_hash_context(Ikev2SignatureHashAlgorithm::Sha2_256);
+    let octets = signed_octets(&authority.sa_init_response, PEER_NONCE, &identity);
     let key = Ikev2SignatureAuthKey::ecdsa_p256_pkcs8_der(P256_PKCS8_DER).expect("P-256 key");
-    let auth_data =
-        compute_ike_auth_signature(profile(), &key_material(), octets, &key).expect("sign");
+    let auth_data = compute_ike_auth_signature(
+        profile(),
+        &key_material(),
+        octets,
+        &key,
+        Some(authority.signing_authorization()),
+    )
+    .expect("sign");
 
     let tampered_nonce = [0x67; 32];
-    let tampered = signed_octets(SA_INIT_RESPONSE, &tampered_nonce, &identity);
+    let tampered = signed_octets(&authority.sa_init_response, &tampered_nonce, &identity);
     let public = Ikev2SignaturePublicKey::from_spki_der(P256_SPKI_DER).expect("P-256 SPKI");
     assert_eq!(
         verify_ike_auth_signature(
@@ -149,6 +176,7 @@ fn tampered_transcript_fails_verification() {
             tampered,
             &public,
             &auth_payload(IKEV2_AUTH_METHOD_DIGITAL_SIGNATURE, &auth_data),
+            Some(authority.verification_authorization()),
         ),
         Err(Ikev2IkeAuthVerificationError::SignatureVerificationFailed)
     );
@@ -157,10 +185,18 @@ fn tampered_transcript_fails_verification() {
 #[test]
 fn wrong_key_type_fails_closed() {
     let identity = identity_payload_body();
-    let octets = signed_octets(SA_INIT_RESPONSE, PEER_NONCE, &identity);
+    let authority =
+        support::responder_signature_hash_context(Ikev2SignatureHashAlgorithm::Sha2_256);
+    let octets = signed_octets(&authority.sa_init_response, PEER_NONCE, &identity);
     let key = Ikev2SignatureAuthKey::ecdsa_p256_pkcs8_der(P256_PKCS8_DER).expect("P-256 key");
-    let auth_data =
-        compute_ike_auth_signature(profile(), &key_material(), octets, &key).expect("sign");
+    let auth_data = compute_ike_auth_signature(
+        profile(),
+        &key_material(),
+        octets,
+        &key,
+        Some(authority.signing_authorization()),
+    )
+    .expect("sign");
 
     // ECDSA-signed AUTH data presented against an RSA trust anchor.
     let rsa_public = Ikev2SignaturePublicKey::from_spki_der(RSA_SPKI_DER).expect("RSA SPKI");
@@ -171,6 +207,7 @@ fn wrong_key_type_fails_closed() {
             octets,
             &rsa_public,
             &auth_payload(IKEV2_AUTH_METHOD_DIGITAL_SIGNATURE, &auth_data),
+            Some(authority.verification_authorization()),
         ),
         Err(Ikev2IkeAuthVerificationError::SignatureKeyMismatch)
     );
@@ -187,6 +224,7 @@ fn wrong_key_type_fails_closed() {
             octets,
             &ec_public,
             &auth_payload(IKEV2_AUTH_METHOD_DIGITAL_SIGNATURE, &corrupted),
+            Some(authority.verification_authorization()),
         ),
         Err(Ikev2IkeAuthVerificationError::SignatureVerificationFailed)
     );
@@ -195,7 +233,9 @@ fn wrong_key_type_fails_closed() {
 #[test]
 fn malformed_rfc7427_framing_fails_closed() {
     let identity = identity_payload_body();
-    let octets = signed_octets(SA_INIT_RESPONSE, PEER_NONCE, &identity);
+    let authority =
+        support::responder_signature_hash_context(Ikev2SignatureHashAlgorithm::Sha2_256);
+    let octets = signed_octets(&authority.sa_init_response, PEER_NONCE, &identity);
     let public = Ikev2SignaturePublicKey::from_spki_der(RSA_SPKI_DER).expect("RSA SPKI");
 
     // Length byte runs past the AUTH data.
@@ -207,6 +247,7 @@ fn malformed_rfc7427_framing_fails_closed() {
             octets,
             &public,
             &auth_payload(IKEV2_AUTH_METHOD_DIGITAL_SIGNATURE, &bad_length),
+            Some(authority.verification_authorization()),
         ),
         Err(Ikev2IkeAuthVerificationError::SignatureEncodingInvalid)
     );
@@ -224,6 +265,7 @@ fn malformed_rfc7427_framing_fails_closed() {
             octets,
             &public,
             &auth_payload(IKEV2_AUTH_METHOD_DIGITAL_SIGNATURE, &no_signature),
+            Some(authority.verification_authorization()),
         ),
         Err(Ikev2IkeAuthVerificationError::SignatureEncodingInvalid)
     );
@@ -242,6 +284,7 @@ fn malformed_rfc7427_framing_fails_closed() {
             octets,
             &public,
             &auth_payload(IKEV2_AUTH_METHOD_DIGITAL_SIGNATURE, &unknown),
+            Some(authority.verification_authorization()),
         ),
         Err(Ikev2IkeAuthVerificationError::SignatureAlgorithmUnsupported)
     );
@@ -261,6 +304,7 @@ fn non_signature_auth_methods_are_rejected() {
                 octets,
                 &public,
                 &auth_payload(method, &[0u8; 32]),
+                None,
             ),
             Err(Ikev2IkeAuthVerificationError::UnsupportedAuthenticationMethod { method })
         );
@@ -270,7 +314,9 @@ fn non_signature_auth_methods_are_rejected() {
 #[test]
 fn method_1_payload_with_ec_key_fails_closed() {
     let identity = identity_payload_body();
-    let octets = signed_octets(SA_INIT_RESPONSE, PEER_NONCE, &identity);
+    let authority =
+        support::responder_signature_hash_context(Ikev2SignatureHashAlgorithm::Sha2_256);
+    let octets = signed_octets(&authority.sa_init_response, PEER_NONCE, &identity);
     let key = Ikev2SignatureAuthKey::ecdsa_p256_pkcs8_der(P256_PKCS8_DER).expect("P-256 key");
     // EC constructors pin the method to Digital Signature (14).
     assert_eq!(key.method(), Ikev2SignatureAuthMethod::DigitalSignature);
@@ -278,8 +324,14 @@ fn method_1_payload_with_ec_key_fails_closed() {
     // A method-1 payload can only be verified against an RSA key; an ECDSA
     // trust anchor fails closed.
     let public = Ikev2SignaturePublicKey::from_spki_der(P256_SPKI_DER).expect("P-256 SPKI");
-    let auth_data =
-        compute_ike_auth_signature(profile(), &key_material(), octets, &key).expect("sign");
+    let auth_data = compute_ike_auth_signature(
+        profile(),
+        &key_material(),
+        octets,
+        &key,
+        Some(authority.signing_authorization()),
+    )
+    .expect("sign");
     assert_eq!(
         verify_ike_auth_signature(
             profile(),
@@ -287,6 +339,7 @@ fn method_1_payload_with_ec_key_fails_closed() {
             octets,
             &public,
             &auth_payload(IKEV2_AUTH_METHOD_RSA_DIGITAL_SIGNATURE, &auth_data),
+            None,
         ),
         Err(Ikev2IkeAuthVerificationError::SignatureKeyMismatch)
     );
@@ -424,8 +477,8 @@ mod rsa_signing {
             IKEV2_AUTH_METHOD_RSA_DIGITAL_SIGNATURE
         );
 
-        let auth_data =
-            compute_ike_auth_signature(profile(), &key_material(), octets, &key).expect("sign");
+        let auth_data = compute_ike_auth_signature(profile(), &key_material(), octets, &key, None)
+            .expect("sign");
         assert_eq!(auth_data.len(), 256);
 
         let auth_body = build_ike_auth_authentication_payload(&Ikev2AuthenticationPayloadBuild {
@@ -442,6 +495,7 @@ mod rsa_signing {
             octets,
             &public,
             &auth_payload(IKEV2_AUTH_METHOD_RSA_DIGITAL_SIGNATURE, &auth_data),
+            None,
         )
         .expect("method 1 verifies");
     }
@@ -449,15 +503,23 @@ mod rsa_signing {
     #[test]
     fn rsa_method_14_signature_round_trips_with_certificate_key() {
         let identity = identity_payload_body();
-        let octets = signed_octets(SA_INIT_RESPONSE, PEER_NONCE, &identity);
+        let authority =
+            support::responder_signature_hash_context(Ikev2SignatureHashAlgorithm::Sha2_256);
+        let octets = signed_octets(&authority.sa_init_response, PEER_NONCE, &identity);
         let key = Ikev2SignatureAuthKey::rsa_pkcs8_der(
             Ikev2SignatureAuthMethod::DigitalSignature,
             RSA_PKCS8_DER,
         )
         .expect("RSA key");
 
-        let auth_data =
-            compute_ike_auth_signature(profile(), &key_material(), octets, &key).expect("sign");
+        let auth_data = compute_ike_auth_signature(
+            profile(),
+            &key_material(),
+            octets,
+            &key,
+            Some(authority.signing_authorization()),
+        )
+        .expect("sign");
 
         // RFC 7427 framing: length octet, AlgorithmIdentifier DER, raw signature.
         assert_eq!(
@@ -481,6 +543,7 @@ mod rsa_signing {
             octets,
             &public,
             &auth_payload(IKEV2_AUTH_METHOD_DIGITAL_SIGNATURE, &auth_data),
+            Some(authority.verification_authorization()),
         )
         .expect("method 14 RSA verifies");
     }

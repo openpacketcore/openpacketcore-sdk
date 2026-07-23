@@ -46,6 +46,10 @@ use crate::{
         Ikev2AuthenticationPayload, Ikev2IkeAuthSignedOctets, Ikev2IkeAuthVerificationError,
     },
     sa_init_crypto::{Ikev2SaInitCryptoProfile, Ikev2SaInitKeyMaterial},
+    signature_hash::{
+        Ikev2SignatureHashAlgorithm, Ikev2SignatureHashAuthorityError,
+        Ikev2SignatureHashSigningAuthorization, Ikev2SignatureHashVerificationAuthorization,
+    },
 };
 
 /// IKEv2 AUTH Method 1, RSA Digital Signature (RSASSA-PKCS1-v1_5).
@@ -338,30 +342,41 @@ impl fmt::Debug for Ikev2SignaturePublicKey {
 ///
 /// Feed the result into `build_ike_auth_authentication_payload` with
 /// `key.method().as_u8()` as the AUTH method.
+/// RFC 7427 method 14 requires a one-operation
+/// `signature_hash_authorization` bound to both peers' exact `IKE_SA_INIT`
+/// messages; method 1 ignores this argument.
 ///
 /// # Errors
 ///
 /// Returns [`Ikev2IkeAuthVerificationError`] when the transcript inputs are
 /// structurally invalid, the method/key combination is not allowed (method 1
-/// requires an RSA key), or the signing backend fails.
+/// requires an RSA key), RFC 7427 authority is absent or mismatched, or the
+/// signing backend fails.
 pub fn compute_ike_auth_signature(
     profile: Ikev2SaInitCryptoProfile,
     key_material: &Ikev2SaInitKeyMaterial,
     signed_octets: Ikev2IkeAuthSignedOctets<'_>,
     key: &Ikev2SignatureAuthKey,
+    signature_hash_authorization: Option<Ikev2SignatureHashSigningAuthorization<'_>>,
 ) -> Result<Vec<u8>, Ikev2IkeAuthVerificationError> {
     validate_signed_octets(signed_octets)?;
-    let signed = build_signed_octets(profile.prf(), key_material, signed_octets)?;
-    let signature = execute_signing_key(key.algorithm, key.signing_key.as_ref(), &signed)
-        .map_err(map_signature_module_error)?;
 
     #[cfg(feature = "rsa-signing")]
     if key.method == Ikev2SignatureAuthMethod::RsaDigitalSignature {
         if key.algorithm != IkeSignatureAlgorithm::RsaPkcs1V15Sha2_256 {
             return Err(Ikev2IkeAuthVerificationError::SignatureKeyMismatch);
         }
+        let signed = build_signed_octets(profile.prf(), key_material, signed_octets)?;
+        let signature = execute_signing_key(key.algorithm, key.signing_key.as_ref(), &signed)
+            .map_err(map_signature_module_error)?;
         return Ok(signature);
     }
+
+    let signature_hash = signature_hash_for_algorithm(key.algorithm)?;
+    require_signing_hash_authority(signature_hash_authorization, signature_hash, signed_octets)?;
+    let signed = build_signed_octets(profile.prf(), key_material, signed_octets)?;
+    let signature = execute_signing_key(key.algorithm, key.signing_key.as_ref(), &signed)
+        .map_err(map_signature_module_error)?;
 
     let algorithm_identifier: &[u8] = match key.algorithm {
         IkeSignatureAlgorithm::RsaPkcs1V15Sha2_256 => &RFC7427_ALGORITHM_IDENTIFIER_RSA_SHA2_256,
@@ -387,28 +402,33 @@ pub fn compute_ike_auth_signature(
 /// AUTH method other than 1 or 14 (including the shared-key method 2, which
 /// [`crate::verify_ike_auth_shared_key_mic`] owns) fails with
 /// `UnsupportedAuthenticationMethod`.
+/// RFC 7427 method 14 additionally requires direction-specific
+/// `signature_hash_authorization` bound to both exact SA_INIT messages; method
+/// 1 ignores that argument.
 ///
 /// # Errors
 ///
 /// Returns [`Ikev2IkeAuthVerificationError`] when the transcript inputs are
 /// structurally invalid, the AUTH data framing is malformed, the algorithm or
 /// method is unsupported, the key type does not match the signature algorithm,
-/// or the signature does not verify.
+/// RFC 7427 authority is absent or mismatched, or the signature does not
+/// verify.
 pub fn verify_ike_auth_signature(
     profile: Ikev2SaInitCryptoProfile,
     key_material: &Ikev2SaInitKeyMaterial,
     signed_octets: Ikev2IkeAuthSignedOctets<'_>,
     public_key: &Ikev2SignaturePublicKey,
     authentication: &Ikev2AuthenticationPayload<'_>,
+    signature_hash_authorization: Option<Ikev2SignatureHashVerificationAuthorization<'_>>,
 ) -> Result<(), Ikev2IkeAuthVerificationError> {
     validate_signed_octets(signed_octets)?;
-    let signed = build_signed_octets(profile.prf(), key_material, signed_octets)?;
 
-    let (algorithm, signature) = match authentication.auth_method {
+    let (algorithm, signature, signature_hash) = match authentication.auth_method {
         IKEV2_AUTH_METHOD_RSA_DIGITAL_SIGNATURE => match public_key {
             Ikev2SignaturePublicKey::Rsa(_) => (
                 IkeSignatureAlgorithm::RsaPkcs1V15Sha2_256,
                 authentication.auth_data,
+                None,
             ),
             _ => return Err(Ikev2IkeAuthVerificationError::SignatureKeyMismatch),
         },
@@ -420,28 +440,36 @@ pub fn verify_ike_auth_signature(
             }
             if algorithm_identifier == RFC7427_ALGORITHM_IDENTIFIER_RSA_SHA2_256 {
                 match public_key {
-                    Ikev2SignaturePublicKey::Rsa(_) => {
-                        (IkeSignatureAlgorithm::RsaPkcs1V15Sha2_256, signature)
-                    }
+                    Ikev2SignaturePublicKey::Rsa(_) => (
+                        IkeSignatureAlgorithm::RsaPkcs1V15Sha2_256,
+                        signature,
+                        Some(Ikev2SignatureHashAlgorithm::Sha2_256),
+                    ),
                     _ => return Err(Ikev2IkeAuthVerificationError::SignatureKeyMismatch),
                 }
             } else if algorithm_identifier == RFC7427_ALGORITHM_IDENTIFIER_ECDSA_SHA2_256 {
                 match public_key {
-                    Ikev2SignaturePublicKey::EcdsaP256(_) => {
-                        (IkeSignatureAlgorithm::EcdsaP256Sha2_256, signature)
-                    }
-                    Ikev2SignaturePublicKey::EcdsaP384(_) => {
-                        (IkeSignatureAlgorithm::EcdsaP384Sha2_256, signature)
-                    }
+                    Ikev2SignaturePublicKey::EcdsaP256(_) => (
+                        IkeSignatureAlgorithm::EcdsaP256Sha2_256,
+                        signature,
+                        Some(Ikev2SignatureHashAlgorithm::Sha2_256),
+                    ),
+                    Ikev2SignaturePublicKey::EcdsaP384(_) => (
+                        IkeSignatureAlgorithm::EcdsaP384Sha2_256,
+                        signature,
+                        Some(Ikev2SignatureHashAlgorithm::Sha2_256),
+                    ),
                     Ikev2SignaturePublicKey::Rsa(_) => {
                         return Err(Ikev2IkeAuthVerificationError::SignatureKeyMismatch);
                     }
                 }
             } else if algorithm_identifier == RFC7427_ALGORITHM_IDENTIFIER_ECDSA_SHA2_384 {
                 match public_key {
-                    Ikev2SignaturePublicKey::EcdsaP384(_) => {
-                        (IkeSignatureAlgorithm::EcdsaP384Sha2_384, signature)
-                    }
+                    Ikev2SignaturePublicKey::EcdsaP384(_) => (
+                        IkeSignatureAlgorithm::EcdsaP384Sha2_384,
+                        signature,
+                        Some(Ikev2SignatureHashAlgorithm::Sha2_384),
+                    ),
                     _ => return Err(Ikev2IkeAuthVerificationError::SignatureKeyMismatch),
                 }
             } else {
@@ -452,11 +480,68 @@ pub fn verify_ike_auth_signature(
             return Err(Ikev2IkeAuthVerificationError::UnsupportedAuthenticationMethod { method });
         }
     };
+    if let Some(signature_hash) = signature_hash {
+        require_verification_hash_authority(
+            signature_hash_authorization,
+            signature_hash,
+            signed_octets,
+        )?;
+    }
+    let signed = build_signed_octets(profile.prf(), key_material, signed_octets)?;
     let public_key_spki = encode_public_key_spki(public_key)?;
     with_signature_verification_operation(algorithm, |module| {
         module.verify_signature(algorithm, &public_key_spki, &signed, signature)
     })
     .map_err(map_signature_module_error)
+}
+
+fn signature_hash_for_algorithm(
+    algorithm: IkeSignatureAlgorithm,
+) -> Result<Ikev2SignatureHashAlgorithm, Ikev2IkeAuthVerificationError> {
+    match algorithm {
+        IkeSignatureAlgorithm::RsaPkcs1V15Sha2_256
+        | IkeSignatureAlgorithm::EcdsaP256Sha2_256
+        | IkeSignatureAlgorithm::EcdsaP384Sha2_256 => Ok(Ikev2SignatureHashAlgorithm::Sha2_256),
+        IkeSignatureAlgorithm::EcdsaP384Sha2_384 => Ok(Ikev2SignatureHashAlgorithm::Sha2_384),
+        _ => Err(Ikev2IkeAuthVerificationError::SignatureAlgorithmUnsupported),
+    }
+}
+
+fn require_signing_hash_authority(
+    authorization: Option<Ikev2SignatureHashSigningAuthorization<'_>>,
+    required: Ikev2SignatureHashAlgorithm,
+    signed_octets: Ikev2IkeAuthSignedOctets<'_>,
+) -> Result<(), Ikev2IkeAuthVerificationError> {
+    let authorization =
+        authorization.ok_or(Ikev2IkeAuthVerificationError::SignatureHashAuthorityMissing)?;
+    authorization
+        .validate(required, signed_octets)
+        .map_err(map_signature_hash_authority_error)
+}
+
+fn require_verification_hash_authority(
+    authorization: Option<Ikev2SignatureHashVerificationAuthorization<'_>>,
+    required: Ikev2SignatureHashAlgorithm,
+    signed_octets: Ikev2IkeAuthSignedOctets<'_>,
+) -> Result<(), Ikev2IkeAuthVerificationError> {
+    let authorization =
+        authorization.ok_or(Ikev2IkeAuthVerificationError::SignatureHashAuthorityMissing)?;
+    authorization
+        .validate(required, signed_octets)
+        .map_err(map_signature_hash_authority_error)
+}
+
+const fn map_signature_hash_authority_error(
+    error: Ikev2SignatureHashAuthorityError,
+) -> Ikev2IkeAuthVerificationError {
+    match error {
+        Ikev2SignatureHashAuthorityError::AlgorithmNotAuthorized => {
+            Ikev2IkeAuthVerificationError::SignatureHashNotAuthorized
+        }
+        Ikev2SignatureHashAuthorityError::ExchangeMismatch => {
+            Ikev2IkeAuthVerificationError::SignatureHashAuthorityExchangeMismatch
+        }
+    }
 }
 
 fn encode_public_key_spki(

@@ -96,6 +96,7 @@ fn default_build_admits_rsa_verification_but_rejects_private_rsa_signing() {
             auth_method: IKEV2_AUTH_METHOD_RSA_DIGITAL_SIGNATURE,
             auth_data: &signature,
         },
+        None,
     )
     .expect("admitted RSA public-key verification succeeds");
 }

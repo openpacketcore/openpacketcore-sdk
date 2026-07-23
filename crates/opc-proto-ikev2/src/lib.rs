@@ -17,7 +17,9 @@
 //! IKE_AUTH cleartext payload helpers including fail-closed RFC 5998
 //! EAP_ONLY_AUTHENTICATION Notify validation, transcript-bound shared-key AUTH MIC
 //! verification, transcript-bound signature AUTH (RFC 7296 method 1 and
-//! RFC 7427 method 14) against caller-trusted keys, typed 3GPP DEVICE_IDENTITY,
+//! RFC 7427 method 14) against caller-trusted keys, bounded typed RFC 7427
+//! signature-hash offer negotiation and transcript-bound directional
+//! method-14 authorities, typed 3GPP DEVICE_IDENTITY,
 //! P_CSCF_RESELECTION_SUPPORT, and AUTHORIZATION_REJECTED notifications,
 //! product-neutral Child SA
 //! negotiation intent including authenticated-only ESP ENCR_NULL profiles and
@@ -79,6 +81,7 @@ pub mod protected_payload_crypto;
 pub mod sa_init;
 pub mod sa_init_crypto;
 pub mod sa_init_negotiation;
+pub mod signature_hash;
 pub mod software_crypto;
 #[cfg(any(test, feature = "testkit"))]
 pub mod testkit;
@@ -239,8 +242,9 @@ pub use notify::{
     IKEV2_NOTIFY_NAT_DETECTION_DESTINATION_IP, IKEV2_NOTIFY_NAT_DETECTION_SOURCE_IP,
     IKEV2_NOTIFY_NO_ADDITIONAL_SAS, IKEV2_NOTIFY_NO_PROPOSAL_CHOSEN, IKEV2_NOTIFY_PROTOCOL_ID_NONE,
     IKEV2_NOTIFY_P_CSCF_RESELECTION_SUPPORT, IKEV2_NOTIFY_REKEY_SA,
-    IKEV2_NOTIFY_SINGLE_PAIR_REQUIRED, IKEV2_NOTIFY_TEMPORARY_FAILURE,
-    IKEV2_NOTIFY_TS_UNACCEPTABLE, IKEV2_NOTIFY_UNSUPPORTED_CRITICAL_PAYLOAD,
+    IKEV2_NOTIFY_SIGNATURE_HASH_ALGORITHMS, IKEV2_NOTIFY_SINGLE_PAIR_REQUIRED,
+    IKEV2_NOTIFY_TEMPORARY_FAILURE, IKEV2_NOTIFY_TS_UNACCEPTABLE,
+    IKEV2_NOTIFY_UNSUPPORTED_CRITICAL_PAYLOAD,
 };
 pub use payload::{
     validate_payload_chain, validate_payload_chain_with_profile,
@@ -293,6 +297,15 @@ pub use sa_init_crypto::{
 pub use sa_init_negotiation::{
     negotiate_ike_sa_init, Ikev2SaInitNegotiation, Ikev2SaInitNegotiationError,
     Ikev2SaInitNegotiationPolicy,
+};
+pub use signature_hash::{
+    decode_ikev2_signature_hash_algorithms_notify, negotiate_ikev2_signature_hash_algorithms,
+    Ikev2SignatureHashAlgorithm, Ikev2SignatureHashAuthorities, Ikev2SignatureHashBindingError,
+    Ikev2SignatureHashLocalOffer, Ikev2SignatureHashLocalRole, Ikev2SignatureHashNegotiation,
+    Ikev2SignatureHashNegotiationError, Ikev2SignatureHashPeerOffer,
+    Ikev2SignatureHashSigningAuthority, Ikev2SignatureHashSigningAuthorization,
+    Ikev2SignatureHashVerificationAuthority, Ikev2SignatureHashVerificationAuthorization,
+    IKEV2_SIGNATURE_HASH_ALGORITHMS_MAX_COUNT,
 };
 pub use software_crypto::{
     install_ikev2_software_crypto_module, Ikev2SoftwareCryptoModule, Ikev2SoftwareCryptoOperations,

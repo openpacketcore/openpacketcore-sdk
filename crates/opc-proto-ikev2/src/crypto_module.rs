@@ -932,6 +932,22 @@ pub(crate) fn with_signature_generation_operation<T>(
     operation(selected.module()).map_err(|error| Ikev2CryptoModuleError::operation(&error))
 }
 
+pub(crate) fn signature_verification_algorithm_admitted(
+    algorithm: IkeSignatureAlgorithm,
+) -> Result<bool, Ikev2CryptoModuleError> {
+    let selected = select_module(CryptoCapability::IkeSignature)?;
+    Ok(selected.signature_verification_admitted(algorithm)
+        && selected.module().supports_signature_verification(algorithm))
+}
+
+pub(crate) fn signature_generation_algorithm_admitted(
+    algorithm: IkeSignatureAlgorithm,
+) -> Result<bool, Ikev2CryptoModuleError> {
+    let selected = select_module(CryptoCapability::IkeSignature)?;
+    Ok(selected.signature_generation_admitted(algorithm)
+        && selected.module().supports_signature_generation(algorithm))
+}
+
 pub(crate) fn execute_signing_key(
     algorithm: IkeSignatureAlgorithm,
     key: &dyn IkeSigningKey,

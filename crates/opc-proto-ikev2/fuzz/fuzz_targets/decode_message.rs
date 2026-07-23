@@ -2,7 +2,10 @@
 
 use bytes::Bytes;
 use libfuzzer_sys::fuzz_target;
-use opc_proto_ikev2::{Message, OwnedMessage, PayloadChain, PayloadType};
+use opc_proto_ikev2::{
+    decode_ikev2_signature_hash_algorithms_notify, Ikev2NotifyPayload, Message, OwnedMessage,
+    PayloadChain, PayloadType,
+};
 use opc_protocol::{BorrowDecode, DecodeContext, OwnedDecode};
 
 fuzz_target!(|data: &[u8]| {
@@ -12,5 +15,8 @@ fuzz_target!(|data: &[u8]| {
         if item.is_err() {
             break;
         }
+    }
+    if let Ok(notify) = Ikev2NotifyPayload::decode_body(data) {
+        let _ = decode_ikev2_signature_hash_algorithms_notify(notify);
     }
 });

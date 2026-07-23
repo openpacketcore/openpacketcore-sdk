@@ -24,20 +24,25 @@ use opc_proto_ikev2::{
     compute_ike_auth_signature, decrypt_ikev2_sa_init_protected_payload,
     derive_ike_sa_init_key_material, ikev2_aes_cbc_protected_body_len,
     ikev2_aes_gcm_protected_body_len, ikev2_certreq_authority_key_hash, ikev2_nat_detection_hash,
-    install_ikev2_crypto_module, seal_ikev2_sa_init_aes_cbc_protected_payload,
-    seal_ikev2_sa_init_protected_payload, verify_ike_auth_signature, Header, HeaderFlags,
-    Ikev2AuthenticationPayload, Ikev2CertReqSubjectPublicKeyInfo,
-    Ikev2CertReqSubjectPublicKeyInfoError, Ikev2CryptoModuleErrorCode,
-    Ikev2CryptoModuleInstallError, Ikev2CryptoRequirements, Ikev2DhGroup, Ikev2EncryptionAlgorithm,
-    Ikev2EphemeralDhKey, Ikev2IkeAuthPeer, Ikev2IkeAuthSignedOctets, Ikev2IkeAuthVerificationError,
-    Ikev2IntegrityAlgorithm, Ikev2PrfAlgorithm, Ikev2ProtectedPayloadCryptoError,
-    Ikev2ProtectedPayloadDirection, Ikev2SaInitCryptoError, Ikev2SaInitCryptoProfile,
-    Ikev2SignatureAuthKey, Ikev2SignaturePublicKey, Ikev2SoftwareCryptoModule,
+    install_ikev2_crypto_module, negotiate_ikev2_signature_hash_algorithms,
+    seal_ikev2_sa_init_aes_cbc_protected_payload, seal_ikev2_sa_init_protected_payload,
+    verify_ike_auth_signature, Header, HeaderFlags, Ikev2AuthenticationPayload,
+    Ikev2CertReqSubjectPublicKeyInfo, Ikev2CertReqSubjectPublicKeyInfoError,
+    Ikev2CryptoModuleErrorCode, Ikev2CryptoModuleInstallError, Ikev2CryptoRequirements,
+    Ikev2DhGroup, Ikev2EncryptionAlgorithm, Ikev2EphemeralDhKey, Ikev2IkeAuthPeer,
+    Ikev2IkeAuthSignedOctets, Ikev2IkeAuthVerificationError, Ikev2IntegrityAlgorithm,
+    Ikev2PrfAlgorithm, Ikev2ProtectedPayloadCryptoError, Ikev2ProtectedPayloadDirection,
+    Ikev2SaInitCryptoError, Ikev2SaInitCryptoProfile, Ikev2SignatureAuthKey,
+    Ikev2SignatureHashAlgorithm, Ikev2SignatureHashLocalRole, Ikev2SignatureHashSigningAuthority,
+    Ikev2SignatureHashVerificationAuthority, Ikev2SignaturePublicKey, Ikev2SoftwareCryptoModule,
     Ikev2SoftwareCryptoOperations, PayloadType, ProtectedPayloadContext, ProtectedPayloadKind,
     ProtectedPayloadSealContext, IKEV2_AUTH_METHOD_DIGITAL_SIGNATURE,
     IKEV2_CERTREQ_SUBJECT_PUBLIC_KEY_INFO_MAX_LEN,
 };
+use opc_protocol::DecodeContext;
 use zeroize::Zeroizing;
+
+mod support;
 
 const P256_PKCS8_DER: &[u8] = include_bytes!("data/p256_pkcs8.der");
 const P256_SPKI_DER: &[u8] = include_bytes!("data/p256_spki.der");
@@ -52,6 +57,35 @@ const HOSTILE_PROVIDER_DIAGNOSTIC: &str = "hostile-provider-diagnostic-marker";
 const HOSTILE_PROVIDER_OUTPUT: &[u8] = b"hostile-provider-output-marker";
 #[cfg(feature = "rsa-signing")]
 const RSA2048_PKCS8_DER: &[u8] = include_bytes!("data/rsa2048_pkcs8.der");
+
+fn signature_hash_authorities() -> (
+    Vec<u8>,
+    Vec<u8>,
+    Ikev2SignatureHashSigningAuthority,
+    Ikev2SignatureHashVerificationAuthority,
+) {
+    let hashes = [Ikev2SignatureHashAlgorithm::Sha2_256];
+    let (request, response) = support::signature_hash_exchange(Some(&hashes), Some(&hashes));
+    let responder = negotiate_ikev2_signature_hash_algorithms(
+        Ikev2SignatureHashLocalRole::Responder,
+        &request,
+        &response,
+        DecodeContext::default(),
+    )
+    .expect("responder test signature-hash negotiation")
+    .into_authorities()
+    .into_parts();
+    let initiator = negotiate_ikev2_signature_hash_algorithms(
+        Ikev2SignatureHashLocalRole::Initiator,
+        &request,
+        &response,
+        DecodeContext::default(),
+    )
+    .expect("initiator test signature-hash negotiation")
+    .into_authorities()
+    .into_parts();
+    (request, response, responder.0, initiator.1)
+}
 
 fn spki_with_extra_outer_element() -> Vec<u8> {
     let mut der = P256_SPKI_DER.to_vec();
@@ -993,14 +1027,26 @@ fn one_admitted_module_handles_every_operation_and_withdrawal_never_falls_back()
     let key = Ikev2SignatureAuthKey::ecdsa_p256_pkcs8_der(P256_PKCS8_DER)
         .expect("signing key loaded through module");
     let identity = [0x44; 8];
+    let (sa_init_request, sa_init_response, signing_authority, verification_authority) =
+        signature_hash_authorities();
     let signed_octets = Ikev2IkeAuthSignedOctets {
         peer: Ikev2IkeAuthPeer::Responder,
-        ike_sa_init_message: &[0x55; 32],
+        ike_sa_init_message: &sa_init_response,
         peer_nonce: &[0x66; 32],
         identity_payload_body: &identity,
     };
-    let auth_data = compute_ike_auth_signature(profile, &material, signed_octets, &key)
-        .expect("signing routed");
+    let auth_data = compute_ike_auth_signature(
+        profile,
+        &material,
+        signed_octets,
+        &key,
+        Some(
+            signing_authority
+                .for_exchange(&sa_init_request, &sa_init_response)
+                .expect("signing authority matches test exchange"),
+        ),
+    )
+    .expect("signing routed");
     let public =
         Ikev2SignaturePublicKey::from_spki_der(P256_SPKI_DER).expect("synthetic verification key");
     verify_ike_auth_signature(
@@ -1012,6 +1058,11 @@ fn one_admitted_module_handles_every_operation_and_withdrawal_never_falls_back()
             auth_method: IKEV2_AUTH_METHOD_DIGITAL_SIGNATURE,
             auth_data: &auth_data,
         },
+        Some(
+            verification_authority
+                .for_exchange(&sa_init_request, &sa_init_response)
+                .expect("verification authority matches test exchange"),
+        ),
     )
     .expect("verification routed");
 
@@ -1307,8 +1358,18 @@ fn one_admitted_module_handles_every_operation_and_withdrawal_never_falls_back()
 
     let sign_count = module.counts.signature_sign.load(Ordering::SeqCst);
     module.set_malformed_output(MalformedOutput::SigningAlgorithm);
-    let error = compute_ike_auth_signature(profile, &material, signed_octets, &key)
-        .expect_err("signing-handle algorithm drift must fail before signing");
+    let error = compute_ike_auth_signature(
+        profile,
+        &material,
+        signed_octets,
+        &key,
+        Some(
+            signing_authority
+                .for_exchange(&sa_init_request, &sa_init_response)
+                .expect("signing authority matches test exchange"),
+        ),
+    )
+    .expect_err("signing-handle algorithm drift must fail before signing");
     assert!(matches!(
         error,
         Ikev2IkeAuthVerificationError::CryptoModuleFailure { error }
@@ -1335,8 +1396,18 @@ fn one_admitted_module_handles_every_operation_and_withdrawal_never_falls_back()
         ),
     ] {
         module.set_malformed_output(malformed_output);
-        let error =
-            compute_ike_auth_signature(profile, &material, signed_octets, &key).expect_err(failure);
+        let error = compute_ike_auth_signature(
+            profile,
+            &material,
+            signed_octets,
+            &key,
+            Some(
+                signing_authority
+                    .for_exchange(&sa_init_request, &sa_init_response)
+                    .expect("signing authority matches test exchange"),
+            ),
+        )
+        .expect_err(failure);
         assert!(matches!(
             error,
             Ikev2IkeAuthVerificationError::CryptoModuleFailure { error }
@@ -1353,7 +1424,7 @@ fn one_admitted_module_handles_every_operation_and_withdrawal_never_falls_back()
         )
         .expect("RSA signing key loads through the admitted module");
         module.set_malformed_output(MalformedOutput::SigningRsaWrongWidth);
-        let error = compute_ike_auth_signature(profile, &material, signed_octets, &rsa_key)
+        let error = compute_ike_auth_signature(profile, &material, signed_octets, &rsa_key, None)
             .expect_err("wrong-width successful RSA signature must fail closed");
         assert!(matches!(
             error,
@@ -1412,8 +1483,18 @@ fn one_admitted_module_handles_every_operation_and_withdrawal_never_falls_back()
 
     let sign_count = module.counts.signature_sign.load(Ordering::SeqCst);
     module.withdraw_signature_after_next_prf();
-    let error = compute_ike_auth_signature(profile, &material, signed_octets, &key)
-        .expect_err("signature withdrawal between transcript PRF and handle use must fail");
+    let error = compute_ike_auth_signature(
+        profile,
+        &material,
+        signed_octets,
+        &key,
+        Some(
+            signing_authority
+                .for_exchange(&sa_init_request, &sa_init_response)
+                .expect("signing authority matches test exchange"),
+        ),
+    )
+    .expect_err("signature withdrawal between transcript PRF and handle use must fail");
     assert!(matches!(
         error,
         Ikev2IkeAuthVerificationError::CryptoModuleFailure { error }

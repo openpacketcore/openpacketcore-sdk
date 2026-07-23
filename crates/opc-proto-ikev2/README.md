@@ -67,7 +67,11 @@ control-plane stack.
   cache the complete already-sealed response for retransmission.
 - `ike_auth` and `ike_auth_signature` provide cleartext IKE_AUTH payload
   helpers, shared-key AUTH MIC helpers, signature AUTH helpers, and Child SA
-  selector/proposal helpers. For RFC 5998, call
+  selector/proposal helpers. RFC 7427 method 14 signing and verification
+  require distinct signing and verification authorities. They can only be
+  minted after the exact correlated SA_INIT request/response bytes prove both
+  `SIGNATURE_HASH_ALGORITHMS` offers and current crypto-module admission.
+  For RFC 5998, call
   `Ikev2IkeAuthCleartextPayloads::eap_only_authentication()`: absence is
   `Ok(None)`, exactly one canonical Protocol-ID-zero/empty-SPI/empty-data
   Notify is `Ok(Some(_))`, and malformed or duplicate type-16417 occurrences
@@ -126,6 +130,88 @@ control-plane stack.
   request `Debug` output is redacted.
 - `fragmentation`, `notify`, `nat_detection`, `nat_traversal`, and `exchange`
   expose RFC-specific mechanism helpers without owning product state.
+
+## RFC 7427 signature-hash negotiation
+
+`Ikev2SignatureHashLocalOffer` encodes a canonical type-16431 Notify and
+preflights every advertised hash against the installed process crypto module's
+admitted verification algorithms. The receive boundary preserves every
+standardized, unassigned, and private-use identifier in wire order. It accepts
+at most 64 identifiers and rejects reserved zero, empty or odd-length data,
+duplicate identifiers or Notify occurrences, a nonzero Protocol ID, or a
+nonempty SPI shape.
+
+Negotiation consumes both complete SA_INIT messages, checks their request and
+response shape, SPI/message correlation, required payloads, and absence of
+trailing bytes, then recovers both offers from those exact transcripts. It
+computes two independent sets:
+
+- hashes offered by the peer that the admitted local signing path can use;
+- hashes sent locally that the admitted local verification path can accept.
+
+RFC 7427 explicitly permits those sets to differ. A local SHA2-256 offer and a
+peer SHA2-384 offer therefore authorizes the peer to sign with SHA2-256 and the
+local peer to sign with SHA2-384; no common bidirectional hash is required.
+
+```rust
+use opc_protocol::DecodeContext;
+use opc_proto_ikev2::{
+    compute_ike_auth_signature, negotiate_ikev2_signature_hash_algorithms,
+    Ikev2SignatureHashAlgorithm, Ikev2SignatureHashLocalOffer,
+    Ikev2SignatureHashLocalRole,
+};
+
+# fn example(
+#     profile: opc_proto_ikev2::Ikev2SaInitCryptoProfile,
+#     material: &opc_proto_ikev2::Ikev2SaInitKeyMaterial,
+#     signed_octets: opc_proto_ikev2::Ikev2IkeAuthSignedOctets<'_>,
+#     key: &opc_proto_ikev2::Ikev2SignatureAuthKey,
+#     request_bytes: &[u8],
+#     response_bytes: &[u8],
+# ) -> Result<(), Box<dyn std::error::Error>> {
+let local_offer = Ikev2SignatureHashLocalOffer::new(&[
+    Ikev2SignatureHashAlgorithm::Sha2_384,
+    Ikev2SignatureHashAlgorithm::Sha2_256,
+])?;
+let outbound_notify = local_offer.to_notify_payload();
+// Encode `outbound_notify` in this peer's IKE_SA_INIT.
+let _ = outbound_notify;
+
+let authorities = negotiate_ikev2_signature_hash_algorithms(
+    Ikev2SignatureHashLocalRole::Responder,
+    request_bytes,
+    response_bytes,
+    DecodeContext::default(),
+)?
+.into_authorities();
+let signing_authorization = authorities
+    .signing()
+    .for_exchange(request_bytes, response_bytes)?;
+let auth_data = compute_ike_auth_signature(
+    profile,
+    material,
+    signed_octets,
+    key,
+    Some(signing_authorization),
+)?;
+# let _ = auth_data;
+# Ok(())
+# }
+```
+
+For verification, bind `authorities.verification()` with the same
+`for_exchange(request_bytes, response_bytes)` call and pass the resulting
+one-operation authorization to `verify_ike_auth_signature`. Each non-copyable
+authorization checks the method-14 AlgorithmIdentifier hash, both exact
+request/response messages, and the expected signer role before transcript PRF
+or signature execution. Peer/local omission, a presented stale exchange, and
+wrong-direction use are typed errors. The product must retain the authority,
+exact messages, and key material together as one IKE-SA state: the SDK cannot
+infer whether separately supplied key material belongs to a different
+application session whose signer-side message happens to be byte-identical.
+RFC 7296 method 1 is unchanged semantically and passes `None`. This boundary
+does not choose certificate identity, certificate trust, signature-key type,
+or product hash/key preference.
 
 ## Unknown critical payload rejection
 
