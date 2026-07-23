@@ -5,7 +5,7 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 
-use crate::NETLINK_XFRM;
+use crate::{ReceiveMessageOutcome, NETLINK_XFRM};
 
 const BPF_FS_MAGIC: libc::c_long = 0xcafe_4a11;
 const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
@@ -195,9 +195,12 @@ pub fn send_message(socket: &NetlinkSocket, payload: &[u8]) -> io::Result<usize>
     }
 }
 
-pub fn receive_message(socket: &NetlinkSocket, buffer: &mut [u8]) -> io::Result<usize> {
+pub fn receive_message_outcome(
+    socket: &NetlinkSocket,
+    buffer: &mut [u8],
+) -> io::Result<ReceiveMessageOutcome> {
     if buffer.is_empty() {
-        return Ok(0);
+        return Ok(ReceiveMessageOutcome::Complete { bytes_received: 0 });
     }
     // SAFETY: `buffer` is a valid writable byte slice for its length and the
     // socket fd is live. `recv` writes at most `buffer.len()` bytes.
@@ -214,27 +217,25 @@ pub fn receive_message(socket: &NetlinkSocket, buffer: &mut [u8]) -> io::Result<
     if rc < 0 {
         Err(io::Error::last_os_error())
     } else {
-        classify_recv(rc as usize, buffer.len())
+        Ok(classify_recv(rc as usize, buffer.len()))
     }
 }
 
 /// Classify a successful `recv` return value against the caller buffer.
 ///
-/// Returns the number of bytes available in the buffer when the datagram fits
-/// (or exactly fits). Returns [`io::ErrorKind::InvalidData`] when the kernel
-/// reported a real datagram length larger than the buffer, which can only
-/// happen when `recv` was called with `MSG_TRUNC`.
-fn classify_recv(received_len: usize, buf_len: usize) -> io::Result<usize> {
+/// Returns a complete byte count when the datagram fits (or exactly fits).
+/// Preserves a consumed-oversize result when the kernel reports a real
+/// datagram length larger than the buffer.
+fn classify_recv(received_len: usize, buf_len: usize) -> ReceiveMessageOutcome {
     if received_len > buf_len {
-        Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "netlink XFRM datagram truncated: buffer is {} bytes but datagram is {} bytes",
-                buf_len, received_len
-            ),
-        ))
+        ReceiveMessageOutcome::ConsumedOversize {
+            buffer_bytes: buf_len,
+            datagram_bytes: received_len,
+        }
     } else {
-        Ok(received_len)
+        ReceiveMessageOutcome::Complete {
+            bytes_received: received_len,
+        }
     }
 }
 
@@ -287,21 +288,24 @@ mod tests {
         let cases: &[(usize, usize, usize)] = &[(0, 1, 0), (5, 10, 5), (10, 10, 10)];
         for &(received, buf_len, expected) in cases {
             assert_eq!(
-                classify_recv(received, buf_len).unwrap(),
-                expected,
+                classify_recv(received, buf_len),
+                ReceiveMessageOutcome::Complete {
+                    bytes_received: expected
+                },
                 "received={received}, buf_len={buf_len}"
             );
         }
     }
 
     #[test]
-    fn classify_recv_rejects_truncated_datagram() {
-        let err = classify_recv(11, 10).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-        let msg = err.to_string();
-        assert!(msg.contains("truncated"), "{msg}");
-        assert!(msg.contains("buffer is 10 bytes"), "{msg}");
-        assert!(msg.contains("datagram is 11 bytes"), "{msg}");
+    fn classify_recv_preserves_consumed_oversize_evidence() {
+        assert_eq!(
+            classify_recv(11, 10),
+            ReceiveMessageOutcome::ConsumedOversize {
+                buffer_bytes: 10,
+                datagram_bytes: 11,
+            }
+        );
     }
 
     /// Build a connected pair of `AF_UNIX` `SOCK_DGRAM` sockets.
@@ -320,7 +324,7 @@ mod tests {
         let rc = unsafe {
             libc::socketpair(
                 libc::AF_UNIX,
-                libc::SOCK_DGRAM | libc::SOCK_CLOEXEC,
+                libc::SOCK_DGRAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
                 0,
                 fds.as_mut_ptr(),
             )
@@ -393,9 +397,14 @@ mod tests {
         let sock = skip_if_sandbox_denies!(datagram_socket_with(payload));
 
         let mut buf = [0_u8; 32];
-        let n = receive_message(&sock, &mut buf).unwrap();
-        assert_eq!(n, payload.len());
-        assert_eq!(&buf[..n], payload);
+        let outcome = receive_message_outcome(&sock, &mut buf).unwrap();
+        assert_eq!(
+            outcome,
+            ReceiveMessageOutcome::Complete {
+                bytes_received: payload.len()
+            }
+        );
+        assert_eq!(&buf[..payload.len()], payload);
     }
 
     #[test]
@@ -405,20 +414,48 @@ mod tests {
         let sock = skip_if_sandbox_denies!(datagram_socket_with(payload));
 
         let mut buf = [0_u8; 8];
-        let n = receive_message(&sock, &mut buf).unwrap();
-        assert_eq!(n, payload.len());
+        let outcome = receive_message_outcome(&sock, &mut buf).unwrap();
+        assert_eq!(
+            outcome,
+            ReceiveMessageOutcome::Complete {
+                bytes_received: payload.len()
+            }
+        );
         assert_eq!(&buf, payload);
     }
 
     #[test]
-    fn receive_message_rejects_truncated_datagram() {
+    fn receive_message_reports_and_consumes_oversized_datagram() {
         let payload = b"0123456789abcdef";
         assert_eq!(payload.len(), 16);
         let sock = skip_if_sandbox_denies!(datagram_socket_with(payload));
 
         let mut buf = [0_u8; 8];
-        let err = receive_message(&sock, &mut buf).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-        assert!(err.to_string().contains("truncated"), "{err}");
+        let outcome = receive_message_outcome(&sock, &mut buf).unwrap();
+        assert_eq!(
+            outcome,
+            ReceiveMessageOutcome::ConsumedOversize {
+                buffer_bytes: buf.len(),
+                datagram_bytes: payload.len(),
+            }
+        );
+        assert_eq!(&buf, &payload[..buf.len()]);
+
+        let error = receive_message_outcome(&sock, &mut buf).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn legacy_receive_api_maps_consumed_oversize_to_invalid_data() {
+        let payload = b"0123456789abcdef";
+        let inner = skip_if_sandbox_denies!(datagram_socket_with(payload));
+        let socket = crate::NetlinkSocket { inner };
+
+        let mut buf = [0_u8; 8];
+        let error = crate::receive_message(&socket, &mut buf).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("buffer is 8 bytes"));
+        assert!(error.to_string().contains("datagram is 16 bytes"));
     }
 }

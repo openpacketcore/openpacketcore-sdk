@@ -34,6 +34,12 @@
 //! are indistinguishable, so both fail closed before fresh mint or recovery
 //! with `xfrm_outbound_sa_binding_key_readback_unavailable`; algorithm shape is
 //! never accepted as a substitute for exact key proof.
+//! Before Linux SA encoding copies any key byte, the backend validates every
+//! variable attribute and computes the complete checked UAPI body length. The
+//! algorithm temporaries, fixed-capacity SA body, and complete netlink request
+//! are zeroizing buffers, so no secret-bearing destination allocation grows
+//! during encoding. This guarantee covers the transient userspace UAPI copy;
+//! kernel key custody remains platform-owned.
 //!
 //! Same-SPI successor activation uses
 //! [`NamespaceBoundLinuxXfrmBackend::apply_and_read_back_outbound_esp_counter`].

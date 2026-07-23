@@ -613,6 +613,16 @@ excludes the old key material needed for rollback.
 - Safe Rust only (`#![forbid(unsafe_code)]`).
 - `KeyMaterial` zeroizes on drop, redacts debug/display, and compares bytes
   with constant-time equality.
+- Linux SA encoding validates and computes the complete UAPI body size before
+  copying authentication, encryption, or AEAD keys. Algorithm temporaries, the
+  fixed-capacity SA body, and the complete netlink request are zeroizing
+  buffers; the destination allocation cannot grow after its first key copy.
+  This covers the transient userspace UAPI copy only—kernel key custody remains
+  platform-owned.
+- The configured netlink receive size is a hard bound. A consumed oversized
+  reply after a mutation returns `StateIndeterminate` with the original
+  operation; an oversized read returns typed `ResponseTooLarge`. Neither path
+  retries the already-consumed datagram.
 - Linux mutation requires kernel XFRM support and effective `CAP_NET_ADMIN`.
 - Exact SA relocation additionally requires the upstream
   `XFRM_MSG_MIGRATE_STATE` UAPI and product-owned authenticated endpoint and

@@ -70,6 +70,45 @@ pub fn send_message(socket: &NetlinkSocket, payload: &[u8]) -> io::Result<usize>
     platform::send_message(&socket.inner, payload)
 }
 
+/// Result of consuming one netlink datagram into a caller-owned bounded buffer.
+///
+/// The oversized case is a successful socket receive with incomplete payload
+/// delivery, not an ordinary I/O failure. Linux has already consumed that
+/// datagram, so callers must not issue a second receive in an attempt to
+/// recover it.
+///
+/// A zero-length buffer retains the legacy no-op behavior: it returns
+/// [`Self::Complete`] with zero bytes and does not touch the socket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ReceiveMessageOutcome {
+    /// The complete datagram is present in the caller's buffer.
+    Complete {
+        /// Number of initialized bytes in the caller's buffer.
+        bytes_received: usize,
+    },
+    /// The datagram exceeded the caller's hard buffer bound and was consumed.
+    ConsumedOversize {
+        /// Configured caller buffer size.
+        buffer_bytes: usize,
+        /// Full datagram size reported by Linux through `MSG_TRUNC`.
+        datagram_bytes: usize,
+    },
+}
+
+/// Receive and classify one raw netlink XFRM datagram from the kernel.
+///
+/// This is the lossless ownership API for bounded reads. An
+/// [`ReceiveMessageOutcome::ConsumedOversize`] value preserves both sizes and
+/// proves that the datagram was consumed. The caller must classify any
+/// already-sent mutation as indeterminate and must not retry the receive.
+pub fn receive_message_outcome(
+    socket: &NetlinkSocket,
+    buffer: &mut [u8],
+) -> io::Result<ReceiveMessageOutcome> {
+    platform::receive_message_outcome(&socket.inner, buffer)
+}
+
 /// Receive one raw netlink XFRM message buffer from the kernel.
 ///
 /// # Datagram sizing
@@ -83,9 +122,22 @@ pub fn send_message(socket: &NetlinkSocket, payload: &[u8]) -> io::Result<usize>
 ///
 /// A truncation error is terminal for that datagram: `MSG_TRUNC` still consumes
 /// the message. Callers should size buffers to the largest expected XFRM
-/// response and treat truncation as an indeterminate operation result.
+/// response and treat truncation as an indeterminate operation result. New
+/// callers that need to retain typed truncation evidence should use
+/// [`receive_message_outcome`].
 pub fn receive_message(socket: &NetlinkSocket, buffer: &mut [u8]) -> io::Result<usize> {
-    platform::receive_message(&socket.inner, buffer)
+    match receive_message_outcome(socket, buffer)? {
+        ReceiveMessageOutcome::Complete { bytes_received } => Ok(bytes_received),
+        ReceiveMessageOutcome::ConsumedOversize {
+            buffer_bytes,
+            datagram_bytes,
+        } => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "netlink XFRM datagram truncated: buffer is {buffer_bytes} bytes but datagram is {datagram_bytes} bytes"
+            ),
+        )),
+    }
 }
 
 /// Open or create a directory strictly beneath `/sys/fs/bpf`.

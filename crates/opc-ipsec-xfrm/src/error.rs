@@ -57,6 +57,22 @@ pub enum XfrmError {
         /// Stable operation label.
         operation: &'static str,
     },
+    /// A bounded read response exceeded the configured receive buffer.
+    ///
+    /// The response datagram was consumed. Unlike [`Self::StateIndeterminate`],
+    /// this variant is emitted only for non-mutating operations and does not
+    /// imply that kernel state may have changed.
+    #[error(
+        "XFRM {operation} response exceeded the bounded receive buffer ({datagram_bytes} > {buffer_bytes} bytes)"
+    )]
+    ResponseTooLarge {
+        /// Stable read operation label.
+        operation: &'static str,
+        /// Configured receive-buffer bound.
+        buffer_bytes: usize,
+        /// Full datagram size reported by Linux.
+        datagram_bytes: usize,
+    },
     /// Query-proven state did not match the caller's current-state snapshot.
     #[error("XFRM {operation} current state does not match the request")]
     StateMismatch {
@@ -180,6 +196,21 @@ mod tests {
             err.to_string(),
             "XFRM install_sa final state is indeterminate"
         );
+    }
+
+    #[test]
+    fn response_too_large_display_contains_only_stable_sizes_and_operation() {
+        let err = XfrmError::ResponseTooLarge {
+            operation: "query_sa",
+            buffer_bytes: 8_192,
+            datagram_bytes: 12_288,
+        };
+
+        assert_eq!(
+            err.to_string(),
+            "XFRM query_sa response exceeded the bounded receive buffer (12288 > 8192 bytes)"
+        );
+        assert_eq!(err.raw_os_error(), None);
     }
 
     #[test]

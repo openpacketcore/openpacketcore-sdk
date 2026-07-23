@@ -1099,6 +1099,7 @@ pub(crate) fn map_backend_error(error: XfrmError) -> EspCounterResumeError {
         XfrmError::InvalidConfig { .. } => "esp_counter_backend_invalid_config",
         XfrmError::Io { .. } => "esp_counter_backend_io",
         XfrmError::StateIndeterminate { .. } => "esp_counter_backend_state_indeterminate",
+        XfrmError::ResponseTooLarge { .. } => "esp_counter_backend_response_too_large",
         XfrmError::StateMismatch { .. } => "esp_counter_backend_state_mismatch",
         XfrmError::NotFound => "esp_counter_backend_sa_not_found",
         XfrmError::AlreadyExists => "esp_counter_backend_sa_already_exists",
@@ -1185,6 +1186,7 @@ mod tests {
         fn transact(
             &self,
             _operation: &'static str,
+            _operation_class: crate::linux::NetlinkOperationClass,
             _request: &[u8],
             _expected_sequence: u32,
             _config: LinuxXfrmBackendConfig,

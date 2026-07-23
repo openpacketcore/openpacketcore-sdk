@@ -858,6 +858,7 @@ mod tests {
         fn transact(
             &self,
             operation: &'static str,
+            _operation_class: crate::linux::NetlinkOperationClass,
             _request: &[u8],
             _expected_sequence: u32,
             _config: LinuxXfrmBackendConfig,
@@ -1180,6 +1181,7 @@ mod tests {
         fn transact(
             &self,
             _operation: &'static str,
+            _operation_class: crate::linux::NetlinkOperationClass,
             _request: &[u8],
             _expected_sequence: u32,
             _config: LinuxXfrmBackendConfig,
@@ -1249,6 +1251,7 @@ mod tests {
         fn transact(
             &self,
             _operation: &'static str,
+            _operation_class: crate::linux::NetlinkOperationClass,
             _request: &[u8],
             _expected_sequence: u32,
             _config: LinuxXfrmBackendConfig,
@@ -1382,6 +1385,7 @@ mod tests {
         fn transact(
             &self,
             operation: &'static str,
+            _operation_class: crate::linux::NetlinkOperationClass,
             _request: &[u8],
             _expected_sequence: u32,
             _config: LinuxXfrmBackendConfig,
@@ -1436,6 +1440,7 @@ mod tests {
         fn transact(
             &self,
             operation: &'static str,
+            _operation_class: crate::linux::NetlinkOperationClass,
             _request: &[u8],
             _expected_sequence: u32,
             _config: LinuxXfrmBackendConfig,
@@ -2342,6 +2347,7 @@ mod tests {
         fn transact(
             &self,
             _operation: &'static str,
+            _operation_class: crate::linux::NetlinkOperationClass,
             _request: &[u8],
             _expected_sequence: u32,
             _config: LinuxXfrmBackendConfig,
