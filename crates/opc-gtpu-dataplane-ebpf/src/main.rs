@@ -69,9 +69,9 @@ use opc_gtpu_ebpf_common::{
     GTPU_SESSION_SCHEMA_MARKER_LEN, GTPU_SESSION_TRANSACTION_VALUE_LEN,
     GTPU_SESSION_UPLINK_KEY_LEN, GTPU_UDP_PORT, IPV6_HDR_LEN, IPV6_MAX_EXT_HEADERS,
     IPV6_MAX_OPTIONS_PER_HEADER, IPV6_NH_DESTINATION_OPTIONS, IPV6_NH_FRAGMENT, IPV6_NH_HOP_BY_HOP,
-    IPV6_NH_ROUTING, IPV6_NH_UDP, MARKED_BEARER_OWNER_VALUE_LEN, MARKED_DOWNLINK_PDR_VALUE_LEN,
-    UPLINK_DSCP_SCHEMA_MARKER_KEY, UPLINK_DSCP_VALUE_LEN, UPLINK_FAR_VALUE_LEN,
-    UPLINK_MARK_KEY_LEN, UPLINK_PMTU_COUNTER_SLOTS, UPLINK_PMTU_VALUE_LEN,
+    IPV6_NH_NONE, IPV6_NH_ROUTING, IPV6_NH_UDP, MARKED_BEARER_OWNER_VALUE_LEN,
+    MARKED_DOWNLINK_PDR_VALUE_LEN, UPLINK_DSCP_SCHEMA_MARKER_KEY, UPLINK_DSCP_VALUE_LEN,
+    UPLINK_FAR_VALUE_LEN, UPLINK_MARK_KEY_LEN, UPLINK_PMTU_COUNTER_SLOTS, UPLINK_PMTU_VALUE_LEN,
     UPLINK_SOURCE_PORT_VALUE_LEN,
 };
 #[cfg(test)]
@@ -224,13 +224,29 @@ const fn ipv4_inner_length_is_exact(version_ihl: u8, total_len: u16, available: 
 }
 
 #[inline(always)]
-const fn ipv6_inner_length_is_exact(version: u8, payload_len: u16, available: usize) -> bool {
-    version >> 4 == 6
-        && payload_len != 0
-        && match IPV6_HDR_LEN.checked_add(payload_len as usize) {
-            Some(total) => total == available,
-            None => false,
-        }
+const fn ipv6_inner_total_length(
+    version: u8,
+    payload_len: u16,
+    next_header: u8,
+    available: usize,
+) -> Option<usize> {
+    if version >> 4 != 6 || (payload_len == 0 && next_header != IPV6_NH_NONE) {
+        return None;
+    }
+    match IPV6_HDR_LEN.checked_add(payload_len as usize) {
+        Some(total) if total == available => Some(total),
+        Some(_) | None => None,
+    }
+}
+
+#[inline(always)]
+const fn ipv6_inner_length_is_exact(
+    version: u8,
+    payload_len: u16,
+    next_header: u8,
+    available: usize,
+) -> bool {
+    ipv6_inner_total_length(version, payload_len, next_header, available).is_some()
 }
 
 #[inline(always)]
@@ -491,10 +507,8 @@ fn grouped_inner_length(ctx: &TcContext, family: GtpuSessionIpFamily) -> Option<
         GtpuSessionIpFamily::Ipv6 => {
             let version = ctx.load::<u8>(ETH_HDR_LEN).ok()?;
             let payload_len = u16::from_be(ctx.load::<u16>(ETH_HDR_LEN + 4).ok()?);
-            if !ipv6_inner_length_is_exact(version, payload_len, available) {
-                return None;
-            }
-            let total_len = IPV6_HDR_LEN.checked_add(usize::from(payload_len))?;
+            let next_header = ctx.load::<u8>(ETH_HDR_LEN + 6).ok()?;
+            let total_len = ipv6_inner_total_length(version, payload_len, next_header, available)?;
             u16::try_from(total_len).ok()
         }
     }
@@ -806,7 +820,10 @@ fn grouped_inner_payload_is_exact(
             let Ok(payload_len) = ctx.load::<u16>(payload_offset + 4) else {
                 return false;
             };
-            ipv6_inner_length_is_exact(version, u16::from_be(payload_len), available)
+            let Ok(next_header) = ctx.load::<u8>(payload_offset + 6) else {
+                return false;
+            };
+            ipv6_inner_length_is_exact(version, u16::from_be(payload_len), next_header, available)
         }
     }
 }
@@ -2531,11 +2548,41 @@ mod tests {
     }
 
     #[test]
-    fn grouped_ipv6_inner_length_rejects_jumbograms_and_trailing_bytes() {
-        assert!(ipv6_inner_length_is_exact(0x60, 8, IPV6_HDR_LEN + 8));
-        assert!(!ipv6_inner_length_is_exact(0x40, 8, IPV6_HDR_LEN + 8));
-        assert!(!ipv6_inner_length_is_exact(0x60, 0, IPV6_HDR_LEN));
-        assert!(!ipv6_inner_length_is_exact(0x60, 8, IPV6_HDR_LEN + 9));
+    fn grouped_ipv6_uplink_length_accepts_an_empty_no_next_header_packet() {
+        assert_eq!(
+            ipv6_inner_total_length(0x60, 0, IPV6_NH_NONE, IPV6_HDR_LEN),
+            Some(IPV6_HDR_LEN)
+        );
+        assert_eq!(
+            ipv6_inner_total_length(0x60, 8, IPV6_NH_UDP, IPV6_HDR_LEN + 8),
+            Some(IPV6_HDR_LEN + 8)
+        );
+    }
+
+    #[test]
+    fn grouped_ipv6_downlink_length_accepts_an_empty_no_next_header_packet() {
+        assert!(ipv6_inner_length_is_exact(
+            0x60,
+            0,
+            IPV6_NH_NONE,
+            IPV6_HDR_LEN
+        ));
+        assert!(ipv6_inner_length_is_exact(
+            0x60,
+            8,
+            IPV6_NH_UDP,
+            IPV6_HDR_LEN + 8
+        ));
+    }
+
+    #[test]
+    fn grouped_ipv6_inner_length_rejects_jumbograms_truncation_and_trailing_bytes() {
+        assert!(ipv6_inner_total_length(0x40, 8, IPV6_NH_UDP, IPV6_HDR_LEN + 8).is_none());
+        assert!(ipv6_inner_total_length(0x60, 0, IPV6_NH_HOP_BY_HOP, IPV6_HDR_LEN + 8).is_none());
+        assert!(ipv6_inner_total_length(0x60, 0, IPV6_NH_NONE, IPV6_HDR_LEN + 1).is_none());
+        assert!(ipv6_inner_total_length(0x60, 0, IPV6_NH_UDP, IPV6_HDR_LEN).is_none());
+        assert!(ipv6_inner_total_length(0x60, 8, IPV6_NH_UDP, IPV6_HDR_LEN + 7).is_none());
+        assert!(ipv6_inner_total_length(0x60, 8, IPV6_NH_UDP, IPV6_HDR_LEN + 9).is_none());
     }
 
     #[test]
