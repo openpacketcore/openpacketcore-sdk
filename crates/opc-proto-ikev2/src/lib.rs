@@ -50,6 +50,12 @@
 //! SDK admission evidence. RFC 7296 CERTREQ authority-key hashing validates an
 //! exact DER `SubjectPublicKeyInfo` and has an explicit requirement independent
 //! of NAT-detection hashing even though both route through admitted SHA-1.
+//! [`inspect_ikev2_signature_key_pkcs8_der`] is the narrow configuration-time
+//! exception to module installation: it performs bounded, exact-DER,
+//! non-signing inspection to derive a typed signature-generation requirement
+//! and canonical public SPKI identity before the one-shot admission decision.
+//! It returns no private-key handle or signing authority, and actual key
+//! loading/signing remains module-only.
 //! MODP-768, MODP-1024, PRF-HMAC-SHA1, and AUTH-HMAC-SHA1-96 are executable
 //! interoperability mechanisms only: callers must put their exact typed suite
 //! into [`Ikev2SaInitNegotiationPolicy`]. The SDK has no default proposal list
@@ -78,6 +84,7 @@ pub mod nat_traversal;
 pub mod notify;
 pub mod payload;
 pub mod pcscf_restoration;
+pub mod pre_admission;
 pub mod protected_payload_crypto;
 pub mod sa_init;
 pub mod sa_init_crypto;
@@ -259,6 +266,12 @@ pub use pcscf_restoration::{
     validate_ikev2_pcscf_restoration_response_correlation, Ikev2PcscfRestorationAddress,
     Ikev2PcscfRestorationAddressFamilies, Ikev2PcscfRestorationError, Ikev2PcscfRestorationRequest,
     Ikev2PcscfRestorationResponse, IKEV2_PCSCF_RESTORATION_MAX_ADDRESSES,
+};
+pub use pre_admission::{
+    inspect_ikev2_signature_key_pkcs8_der, Ikev2PreAdmissionInspectionError,
+    Ikev2SignatureGenerationRequirement, Ikev2SignatureKeyInspection,
+    Ikev2SignaturePublicKeyIdentity, IKEV2_PRE_ADMISSION_LEAF_CERTIFICATE_DER_MAX_LEN,
+    IKEV2_PRE_ADMISSION_PKCS8_DER_MAX_LEN,
 };
 pub use protected_payload_crypto::{
     decrypt_ikev2_sa_init_protected_payload, ikev2_aes_cbc_padding_len,
