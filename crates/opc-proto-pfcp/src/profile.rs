@@ -9,10 +9,10 @@
 
 use std::collections::{HashMap, HashSet};
 
-use opc_protocol::{DecodeContext, DecodeError, EncodeError};
+use opc_protocol::{DecodeContext, DecodeError, DecodeErrorCode, EncodeError, SpecRef};
 use thiserror::Error;
 
-use crate::ie::TypedIe;
+use crate::ie::{decode_typed_ie_sequence, TypedIe};
 use crate::{Header, InformationElement, MessageType};
 
 /// Validation result for PFCP Production Profile v1.
@@ -199,22 +199,26 @@ fn decode_typed_ies(
     ies: &[InformationElement],
     ctx: DecodeContext,
 ) -> ProfileResult<Vec<TypedIe>> {
-    ies.iter()
-        .map(|ie| decode_typed_ie(scope, ie, ctx))
-        .collect::<ProfileResult<Vec<_>>>()
-}
+    if ies.len() > ctx.max_ies {
+        return Err(ProfileValidationError::TypedDecode {
+            scope,
+            source: DecodeError::new(DecodeErrorCode::IeCountExceeded, 0)
+                .with_spec_ref(SpecRef::new("3gpp", "TS29244", "8.1.1")),
+        });
+    }
 
-fn decode_typed_ie(
-    scope: &'static str,
-    ie: &InformationElement,
-    ctx: DecodeContext,
-) -> ProfileResult<TypedIe> {
-    let mut encoded = bytes::BytesMut::with_capacity(ie.wire_len());
-    ie.encode(&mut encoded)
-        .map_err(|_| ProfileValidationError::RawEncode { scope })?;
-    let (_, typed) = TypedIe::decode(&encoded, ctx, 0)
-        .map_err(|source| ProfileValidationError::TypedDecode { scope, source })?;
-    Ok(typed)
+    let mut typed_ies = Vec::new();
+    for ie in ies {
+        // Do not preallocate from a manually constructed raw IE. `encode`
+        // validates the u16 wire-length bound before its first buffer write.
+        let mut encoded = bytes::BytesMut::new();
+        ie.encode(&mut encoded)
+            .map_err(|_| ProfileValidationError::RawEncode { scope })?;
+        let mut decoded = decode_typed_ie_sequence(&encoded, ctx, 0)
+            .map_err(|source| ProfileValidationError::TypedDecode { scope, source })?;
+        typed_ies.append(&mut decoded);
+    }
+    Ok(typed_ies)
 }
 
 fn validate_seid_presence(header: &Header) -> ProfileResult<()> {

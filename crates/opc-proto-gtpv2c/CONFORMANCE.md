@@ -110,8 +110,11 @@ The profile owns the typed IE families required by the S2b messages above:
   Their Debug surfaces redact addresses, ports, SSIDs, operator/location
   contents, relay identities, Circuit-ID, and timestamp values.
 - Response and policy containers: Cause, Indication, PCO, APCO.
-- Unknown, private, and unsupported future IEs remain raw-preserved and are not
-  interpreted as product policy.
+- Unknown, private, and unsupported future IEs follow the caller's
+  `UnknownIePolicy` at every typed sequence scope: `Drop` omits them from the
+  interpreted view, `Preserve` retains byte-exact `TypedIeValue::Raw`, and
+  `Reject` returns `UnknownCriticalIe`. They are never interpreted as product
+  policy.
 
 ### Required semantic validation
 
@@ -225,8 +228,8 @@ failures and must cover at least these rules:
 - ProcedureAware receive classifies every crate-known typed/control IE key
   against one message grammar keyed by procedure, direction, and exact
   enclosing Bearer Context instance before decoding its value. Unexpected
-  known type/instance combinations are discarded under clause 7.7.9, while
-  genuinely unknown optional keys remain raw-preserved. The grammar applies
+  known type/instance combinations are discarded under clause 7.7.9.
+  Genuinely unknown optional keys then follow `UnknownIePolicy`. The grammar applies
   explicit S2b applicability where the profile assigns an exact endpoint role;
   the same entry defines clause 7.7.10 cardinality, including instance-1
   Bearer Context lists and bounded PGW load/overload lists. Typed projections
@@ -243,6 +246,10 @@ failures and must cover at least these rules:
 
 - The raw `Message` and `OwnedMessage` layers remain byte-preserving for
   unknown and vendor-specific IEs.
+- Unknown-IE filtering applies only to the interpreted typed view. A
+  raw-preserving encode from retained `raw_ies` reproduces the original
+  unknown IEs, while canonical typed-view encode emits only retained entries;
+  callers must not treat raw forwarding as a sanitized re-encode.
 - Typed builders added for this profile must not construct messages missing
   mandatory profile-owned IEs.
 - Procedure-aware validation APIs and projection/error codes must remain
@@ -250,9 +257,10 @@ failures and must cover at least these rules:
 - Product code must continue to enforce APN/DNN policy, bearer policy, roaming
   policy, charging policy, persistence, and transport behavior outside this
   crate.
-- Unknown well-formed top-level and nested optional IEs are preserved in order
-  through the typed dedicated-bearer projections/builders. Unknown duplicate
-  IE keys obey the caller's `DuplicateIePolicy` for Structural/Strict decode
+- Under `UnknownIePolicy::Preserve`, well-formed top-level and nested optional
+  IEs are preserved in order through typed dedicated-bearer
+  projections/builders. Preserved unknown duplicate IE keys obey the caller's
+  `DuplicateIePolicy` for Structural/Strict decode
   and the first-wins receiver rule for ProcedureAware S2b decode. Standardized Bearer
   Context and dedicated-EBI lists are cardinality-aware, as are request-only
   Load Control Information instance 1 (up to ten), Overload Control
@@ -359,8 +367,9 @@ coverage.
      message encoding retains accepted extension octets and spare bits.
    - Top-level and grouped typed IE sequences enforce
      `DecodeContext::duplicate_ie_policy` by IE type and instance.
-   - Unsupported/private/future IEs outside the typed subset remain available as
-     `TypedIeValue::Raw` and re-encode byte-exact.
+   - Unsupported/private/future IEs outside the typed subset are omitted,
+     retained as byte-exact `TypedIeValue::Raw`, or rejected at top-level and
+     grouped sequence boundaries according to `UnknownIePolicy`.
 
 4. **S2b message views**
    - `S2bMessage` decodes Echo Request/Response, Create Session
@@ -491,9 +500,9 @@ bytes while emitting the selected typed Message Priority. Canonical encoding
 recomputes the Length field, emits version 2 with the typed MP flag/priority and
 header and IE spare bits zeroed, encodes TBCD/APN/PLMN/PAA/F-TEID/Bearer QoS
 fields in canonical form, emits typed charging, trace, endpoint, location, and
-Diameter/IKEv2 release values at their procedure-owned instances, preserves
-opaque PCO/APCO/Indication bytes, and still carries unsupported IEs through the
-raw fallback.
+Diameter/IKEv2 release values at their procedure-owned instances, and
+preserves opaque PCO/APCO/Indication bytes. It carries unsupported IEs through
+the raw fallback only when the typed decode policy retained them.
 Use the raw `Message` layer or `EncodeContext { raw_preserving: true, .. }` on a
 freshly decoded S2b view for byte-exact forwarding.
 

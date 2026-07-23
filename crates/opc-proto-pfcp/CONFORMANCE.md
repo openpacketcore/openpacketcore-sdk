@@ -128,9 +128,11 @@ profile failures and must cover at least these rules:
 - Type/Length framing for standard IEs (type < 32768).
 - Vendor-specific IEs (type ≥ 32768): the Length field includes the
   2-octet Enterprise ID per §8.1.1; lengths < 2 are rejected.
-- Unknown IEs preserved byte-exact for re-encode (raw-preserving
-  round-trip), verified by byte-identity tests and a quickcheck property
-  over arbitrary IE types and values.
+- Unknown IEs are always preserved byte-exact in the raw
+  `InformationElement` layer. The typed sequence boundary applies
+  `UnknownIePolicy`: `Drop` omits them, `Preserve` retains `TypedIe::Raw` in
+  wire order, and `Reject` returns `UnknownCriticalIe`, recursively through
+  grouped IEs.
 - Truncated TLV rejection (header and value).
 - Overflow length rejection.
 
@@ -199,7 +201,9 @@ encode round-trip is therefore byte-exact for spec-canonical messages —
 which is what every fixture in the test suite asserts — but not for
 messages carrying non-zero spare bits or future extension octets. Use the
 raw `InformationElement` layer when byte-exact forwarding of arbitrary
-peer traffic is required.
+peer traffic is required. Filtering a typed view with `Drop` does not mutate
+the raw IEs retained by an enclosing message and is therefore not a sanitized
+raw-preserving re-encode.
 
 ### 5. Typed Grouped IEs (§7.5.2)
 Grouped IEs decode their members recursively as `TypedIe`, enforcing

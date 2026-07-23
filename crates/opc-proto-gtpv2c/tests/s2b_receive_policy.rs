@@ -12,7 +12,7 @@ use opc_proto_gtpv2c::{
 };
 use opc_protocol::{
     BorrowDecode, DecodeContext, DecodeErrorCode, DuplicateIePolicy, Encode, EncodeContext,
-    ValidationLevel,
+    UnknownIePolicy, ValidationLevel,
 };
 
 const ECHO_REQUEST_FIXTURE: &[u8] = include_bytes!("fixtures/spec/echo_request_recovery.bin");
@@ -591,7 +591,7 @@ fn assigned_nested_create_session_response_charging_id_is_preserved() {
 }
 
 #[test]
-fn grouped_scope_discards_known_unexpected_type_and_preserves_unknown_optional_ie() {
+fn grouped_scope_applies_unknown_policy_after_known_ie_disposition() {
     let (_, decoded) = S2bMessage::decode(CREATE_BEARER_REQUEST_FIXTURE, structural_context())
         .expect("fixture decodes structurally");
     let view = decoded.as_view().expect("typed Create Bearer view");
@@ -641,6 +641,27 @@ fn grouped_scope_discards_known_unexpected_type_and_preserves_unknown_optional_i
         .members
         .iter()
         .any(|ie| ie.ie_type() == 244 && ie.instance == 6));
+
+    let drop_context = DecodeContext {
+        unknown_ie_policy: UnknownIePolicy::Drop,
+        ..procedure_context()
+    };
+    let (_, decoded) = S2bMessage::decode(&bytes, drop_context)
+        .expect("grouped unknown IE must be omitted under Drop");
+    let context = decoded
+        .as_view()
+        .expect("typed view")
+        .ies
+        .iter()
+        .find_map(|ie| match &ie.value {
+            TypedIeValue::BearerContext(context) => Some(context),
+            _ => None,
+        })
+        .expect("bearer context");
+    assert!(!context
+        .members
+        .iter()
+        .any(|ie| matches!(ie.ie_type(), IE_TYPE_RECOVERY | 244)));
 }
 
 fn assert_instance_one_discards_malformed_member(
@@ -836,6 +857,46 @@ fn response_pgw_change_info_is_singleton_and_keeps_first_grouped_value() {
             .expect("singleton duplicate evidence");
         assert_eq!(evidence.duplicate_count(), 2);
     }
+}
+
+#[test]
+fn procedure_aware_view_drops_unknown_ies_only_from_the_typed_projection() {
+    let unknown = raw_ie(0xfa, 7, &[0xa5, 0x5a]);
+    let bytes = append_raw_ies(ECHO_REQUEST_FIXTURE, &unknown);
+    let ctx = DecodeContext {
+        unknown_ie_policy: UnknownIePolicy::Drop,
+        ..procedure_context()
+    };
+
+    let (_, decoded) =
+        S2bMessage::decode(&bytes, ctx).expect("procedure-aware Drop must decode the message");
+    let view = decoded.as_view().expect("typed Echo view");
+    assert_eq!(view.ies.len(), 1);
+    assert_eq!(view.ies[0].ie_type(), IE_TYPE_RECOVERY);
+
+    let mut canonical = BytesMut::new();
+    decoded
+        .encode(&mut canonical, EncodeContext::default())
+        .expect("canonical typed-view encode succeeds");
+    assert_ne!(canonical.as_ref(), bytes);
+    let (_, canonical_message) =
+        Message::decode(&canonical, structural_context()).expect("canonical message decodes");
+    assert_eq!(
+        canonical_message.raw_ies,
+        &raw_ie(IE_TYPE_RECOVERY, 0, &[0x2a])
+    );
+
+    let mut raw_preserving = BytesMut::new();
+    decoded
+        .encode(
+            &mut raw_preserving,
+            EncodeContext {
+                raw_preserving: true,
+                ..EncodeContext::default()
+            },
+        )
+        .expect("raw-preserving encode succeeds");
+    assert_eq!(raw_preserving.as_ref(), bytes);
 }
 
 #[test]

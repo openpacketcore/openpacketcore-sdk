@@ -13,7 +13,9 @@
 //! rejection Causes, and bearer correlation required by TS 29.274. They can be
 //! paired with the bounded [`Gtpv2cTriggeredTransactions`] registry for
 //! generation-bound at-most-once application dispatch and exact committed
-//! response replay. Unsupported IEs remain raw-preserved.
+//! response replay. Typed IE sequences omit, raw-preserve, or reject
+//! unsupported IEs according to [`opc_protocol::UnknownIePolicy`]; the
+//! enclosing raw message remains available for byte-exact forwarding.
 //! S2b Create Session Requests carry the requested family only in
 //! [`PdnAddressAllocation`]; explicit dynamic/static constructors prevent a
 //! top-level PDN Type IE or family/address-shape mismatch from being emitted.

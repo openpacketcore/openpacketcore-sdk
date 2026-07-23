@@ -19,8 +19,11 @@ control-plane behavior.
   priority, and length fields.
 - `InformationElement` is the raw TLV layer. Unknown and vendor-specific IEs
   are preserved byte-exactly here.
-- `ie::TypedIe` decodes known session-management IEs and falls back to
-  `TypedIe::Raw` for unsupported IEs.
+- `ie::decode_typed_ie_sequence` enforces the selected unknown-IE policy at
+  top level and recursively inside grouped IEs: `Drop` omits unsupported
+  entries, `Preserve` retains `TypedIe::Raw`, and `Reject` fails closed.
+  `ie::TypedIe::decode` is the explicit single-IE compatibility boundary:
+  because it must return one value, `Drop` behaves as `Preserve` there.
 - `ie` re-exports grouped and simple typed IEs including `CreatePdr`, `Pdi`,
   `CreateFar`, `CreateQer`, `CreateUrr`, `UsageReport`, `Cause`, `NodeId`,
   `FSeid`, `FTeid`, `PdrId`, `FarId`, `QerId`, `UrrId`, `ApplyAction`,
@@ -64,7 +67,9 @@ attestation. Graduation remains blocked on encoder capacity and header/length
 invariants, declared-PDU limit scoping, and independent N4 fixture/peer
 evidence. The raw layer is the byte-exact forwarding surface. The typed layer
 may canonicalize spare bits and discard future extension octets it does not
-model, so use raw IEs for arbitrary peer-traffic forwarding.
+model, so use raw IEs for arbitrary peer-traffic forwarding. A typed-view
+`Drop` is not a sanitized rewrite of an enclosing raw message: forwarding the
+retained raw `Message` still forwards its original unknown IEs.
 
 See [CONFORMANCE.md](CONFORMANCE.md) for the exact IE families, procedures,
 semantic rules, fuzzing, and remaining codec boundary.

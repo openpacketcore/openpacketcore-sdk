@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Unknown-IE policy enforcement — `opc-proto-gtpv2c` /
+  `opc-proto-pfcp`:** typed top-level and grouped IE sequence decoders now
+  implement distinct `Drop`, `Preserve`, and `Reject` outcomes. Raw message
+  forwarding remains byte-exact and separate from a filtered typed-view
+  re-encode; PFCP exposes the policy-enforcing sequence API explicitly (#494).
 - **Production dual-stack GTP-U eBPF sessions — `opc-gtpu-dataplane` /
   `opc-gtpu-ebpf-common` / `opc-gtpu-dataplane-ebpf`:** adds an
   attachment-scoped grouped-session ABI and loader with stable device

@@ -3,8 +3,10 @@
 //! Typed PFCP Information Elements (TS 29.244 §8.2).
 //!
 //! This module builds on the raw TLV layer ([`InformationElement`]) to provide
-//! structured decode/encode for the session-management IE set. Unknown and
-//! vendor-specific IEs retain byte-exact raw preservation.
+//! structured decode/encode for the session-management IE set. The public
+//! sequence decoder applies [`UnknownIePolicy`] consistently at top level and
+//! inside grouped IEs; the raw [`InformationElement`] layer remains the
+//! byte-exact forwarding boundary.
 //!
 //! @spec 3GPP TS29244 R18 8.2
 //! @req REQ-3GPP-TS29244-R18-8.2-001
@@ -155,6 +157,14 @@ impl TypedIe {
     /// decoder when the type code is known.
     ///
     /// `depth` tracks grouped-IE nesting; `ctx.max_depth` is enforced.
+    ///
+    /// # Unknown-IE policy
+    ///
+    /// A single-result API cannot represent a deliberately omitted IE, so
+    /// [`UnknownIePolicy::Drop`] and [`UnknownIePolicy::Preserve`] both return
+    /// [`TypedIe::Raw`] for an unsupported type here. Use
+    /// [`decode_typed_ie_sequence`] to enforce all three policy outcomes,
+    /// including omission under `Drop`.
     ///
     /// @spec 3GPP TS29244 R18 8.1.1, 8.2
     /// @req REQ-3GPP-TS29244-R18-8.2-003
@@ -708,6 +718,63 @@ impl TypedIe {
             Self::Raw(raw) => raw.ie_type,
         }
     }
+}
+
+/// Decode a complete PFCP IE sequence under the context's unknown-IE policy.
+///
+/// This is the policy-enforcing boundary for both top-level typed views and
+/// grouped IE members:
+///
+/// - [`UnknownIePolicy::Drop`] omits unsupported IEs;
+/// - [`UnknownIePolicy::Preserve`] retains each unsupported IE as
+///   [`TypedIe::Raw`] in wire order;
+/// - [`UnknownIePolicy::Reject`] returns
+///   [`DecodeErrorCode::UnknownCriticalIe`].
+///
+/// Every well-formed input IE counts toward [`DecodeContext::max_ies`],
+/// including an IE subsequently omitted by `Drop`. This prevents a stream of
+/// unknown IEs from bypassing the allocation/work bound. Dropping changes only
+/// this interpreted typed view; it does not mutate raw [`InformationElement`]
+/// values retained by an enclosing [`crate::Message`].
+///
+/// # Errors
+///
+/// Returns a structured, value-free [`DecodeError`] for malformed input,
+/// exceeded depth/IE limits, rejected unknown IEs, or invalid known IE values.
+///
+/// @spec 3GPP TS29244 R18 8.1.1, 8.2
+/// @req REQ-3GPP-TS29244-R18-8.2-005
+pub fn decode_typed_ie_sequence(
+    input: &[u8],
+    ctx: DecodeContext,
+    depth: usize,
+) -> Result<Vec<TypedIe>, DecodeError> {
+    let spec_ref = SpecRef::new("3gpp", "TS29244", "8.1.1");
+    if depth > ctx.max_depth {
+        return Err(DecodeError::new(DecodeErrorCode::DepthExceeded, 0).with_spec_ref(spec_ref));
+    }
+
+    let mut ies = Vec::new();
+    let mut offset = 0usize;
+    let mut ie_count = 0usize;
+
+    while offset < input.len() {
+        ie_count = ie_count.saturating_add(1);
+        if ie_count > ctx.max_ies {
+            return Err(
+                DecodeError::new(DecodeErrorCode::IeCountExceeded, offset).with_spec_ref(spec_ref)
+            );
+        }
+
+        let (remaining, ie) = TypedIe::decode(&input[offset..], ctx, depth)?;
+        offset = input.len().saturating_sub(remaining.len());
+        if matches!(ctx.unknown_ie_policy, UnknownIePolicy::Drop) && matches!(ie, TypedIe::Raw(_)) {
+            continue;
+        }
+        ies.push(ie);
+    }
+
+    Ok(ies)
 }
 
 /// Decode a grouped IE: its value is a sequence of TLV IEs.
