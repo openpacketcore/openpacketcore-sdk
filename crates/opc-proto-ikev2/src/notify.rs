@@ -277,9 +277,26 @@ impl<'a> Ikev2NotifyPayload<'a> {
         self.notify_message_type == IKEV2_NOTIFY_COOKIE2
     }
 
-    /// Return true when this is an EAP_ONLY_AUTHENTICATION Notify payload.
+    /// Return true when this is a canonical EAP_ONLY_AUTHENTICATION Notify.
+    ///
+    /// RFC 5998 requires Protocol ID zero, SPI Size zero, no SPI, and no
+    /// notification data. This helper validates that complete shape rather
+    /// than recognizing Notify Message Type 16417 alone.
+    ///
+    /// This compatibility predicate loses the distinction between an
+    /// unrelated Notify and a malformed type-16417 Notify. Use
+    /// [`decode_ikev2_eap_only_authentication_notify`] for new code.
+    ///
+    /// @spec IETF RFC5998 3
+    #[deprecated(
+        note = "use decode_ikev2_eap_only_authentication_notify for typed shape validation"
+    )]
     pub const fn is_eap_only_authentication(self) -> bool {
         self.notify_message_type == IKEV2_NOTIFY_EAP_ONLY_AUTHENTICATION
+            && self.protocol_id == IKEV2_NOTIFY_PROTOCOL_ID_NONE
+            && self.spi_size == 0
+            && self.spi.is_empty()
+            && self.notification_data.is_empty()
     }
 
     /// Return true when this is a 3GPP DEVICE_IDENTITY Notify payload.
@@ -307,6 +324,102 @@ impl<'a> Ikev2NotifyPayload<'a> {
     pub const fn has_empty_protocol_spi(self) -> bool {
         self.protocol_id == IKEV2_NOTIFY_PROTOCOL_ID_NONE && self.spi_size == 0
     }
+}
+
+/// Validated RFC 5998 EAP_ONLY_AUTHENTICATION signal.
+///
+/// Values can only be obtained by validating a decoded Notify with
+/// [`decode_ikev2_eap_only_authentication_notify`] or an opened IKE_AUTH
+/// payload set with
+/// [`Ikev2IkeAuthCleartextPayloads::eap_only_authentication`](crate::Ikev2IkeAuthCleartextPayloads::eap_only_authentication).
+///
+/// @spec IETF RFC5998 3
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Ikev2EapOnlyAuthentication {
+    _private: (),
+}
+
+impl fmt::Debug for Ikev2EapOnlyAuthentication {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Ikev2EapOnlyAuthentication")
+    }
+}
+
+/// Structural failure for a type-16417 EAP_ONLY_AUTHENTICATION Notify.
+///
+/// Validation reports the first invalid field in RFC 5998 wire order:
+/// Protocol ID, SPI Size, SPI bytes, then notification data. Variants contain
+/// no packet bytes or peer identifiers.
+///
+/// @spec IETF RFC5998 3
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ikev2EapOnlyAuthenticationNotifyError {
+    /// Protocol ID was not zero.
+    ProtocolIdNonzero,
+    /// The declared SPI Size was not zero.
+    SpiSizeNonzero,
+    /// SPI bytes were present despite a zero SPI Size.
+    SpiNonempty,
+    /// Notification data was present.
+    NotificationDataNonempty,
+}
+
+impl Ikev2EapOnlyAuthenticationNotifyError {
+    /// Stable machine-readable error code.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ProtocolIdNonzero => "ike_eap_only_authentication_protocol_id_nonzero",
+            Self::SpiSizeNonzero => "ike_eap_only_authentication_spi_size_nonzero",
+            Self::SpiNonempty => "ike_eap_only_authentication_spi_nonempty",
+            Self::NotificationDataNonempty => {
+                "ike_eap_only_authentication_notification_data_nonempty"
+            }
+        }
+    }
+}
+
+impl fmt::Display for Ikev2EapOnlyAuthenticationNotifyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Error for Ikev2EapOnlyAuthenticationNotifyError {}
+
+/// Decode one RFC 5998 EAP_ONLY_AUTHENTICATION Notify occurrence.
+///
+/// An unrelated Notify returns `Ok(None)`. A canonical type-16417 Notify
+/// returns `Ok(Some(_))`. A type-16417 Notify with any non-canonical structural
+/// field returns a typed error while the original lossless
+/// [`Ikev2NotifyPayload`] remains owned by the caller.
+///
+/// # Errors
+///
+/// Returns [`Ikev2EapOnlyAuthenticationNotifyError`] when a type-16417 Notify
+/// has nonzero Protocol ID or SPI Size, nonempty SPI bytes, or nonempty
+/// notification data.
+///
+/// @spec IETF RFC5998 3
+pub const fn decode_ikev2_eap_only_authentication_notify(
+    notify: Ikev2NotifyPayload<'_>,
+) -> Result<Option<Ikev2EapOnlyAuthentication>, Ikev2EapOnlyAuthenticationNotifyError> {
+    if notify.notify_message_type != IKEV2_NOTIFY_EAP_ONLY_AUTHENTICATION {
+        return Ok(None);
+    }
+    if notify.protocol_id != IKEV2_NOTIFY_PROTOCOL_ID_NONE {
+        return Err(Ikev2EapOnlyAuthenticationNotifyError::ProtocolIdNonzero);
+    }
+    if notify.spi_size != 0 {
+        return Err(Ikev2EapOnlyAuthenticationNotifyError::SpiSizeNonzero);
+    }
+    if !notify.spi.is_empty() {
+        return Err(Ikev2EapOnlyAuthenticationNotifyError::SpiNonempty);
+    }
+    if !notify.notification_data.is_empty() {
+        return Err(Ikev2EapOnlyAuthenticationNotifyError::NotificationDataNonempty);
+    }
+    Ok(Some(Ikev2EapOnlyAuthentication { _private: () }))
 }
 
 impl fmt::Debug for Ikev2NotifyPayload<'_> {

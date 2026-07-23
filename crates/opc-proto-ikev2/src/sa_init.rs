@@ -13,8 +13,9 @@ use crate::{
     message::{Ikev2UnknownCriticalPayloadMessage, Message, OwnedMessage},
     notify::{
         Ikev2NotifyPayload, Ikev2NotifyPayloadError, IKEV2_NOTIFY_AUTHORIZATION_REJECTED,
-        IKEV2_NOTIFY_INVALID_KE_PAYLOAD, IKEV2_NOTIFY_NO_PROPOSAL_CHOSEN,
-        IKEV2_NOTIFY_PROTOCOL_ID_NONE, IKEV2_NOTIFY_UNSUPPORTED_CRITICAL_PAYLOAD,
+        IKEV2_NOTIFY_EAP_ONLY_AUTHENTICATION, IKEV2_NOTIFY_INVALID_KE_PAYLOAD,
+        IKEV2_NOTIFY_NO_PROPOSAL_CHOSEN, IKEV2_NOTIFY_PROTOCOL_ID_NONE,
+        IKEV2_NOTIFY_UNSUPPORTED_CRITICAL_PAYLOAD,
     },
     payload::{Ikev2UnknownCriticalPayload, PayloadType, RawPayload, GENERIC_PAYLOAD_HEADER_LEN},
     validation::Ikev2ValidationProfile,
@@ -903,6 +904,27 @@ pub struct Ikev2NotifyPayloadBuild {
 }
 
 impl Ikev2NotifyPayloadBuild {
+    /// Construct the canonical RFC 5998 EAP_ONLY_AUTHENTICATION Notify value.
+    ///
+    /// The returned value uses Notify Message Type 16417, Protocol ID zero,
+    /// an empty SPI, and empty notification data. Pass it to
+    /// [`crate::build_ike_auth_notify_payload`] to encode the four-octet
+    /// Notify body.
+    ///
+    /// Whether to offer or accept EAP-only authentication remains
+    /// product-owned policy.
+    ///
+    /// @spec IETF RFC5998 3
+    #[must_use]
+    pub fn eap_only_authentication() -> Self {
+        Self {
+            protocol_id: IKEV2_NOTIFY_PROTOCOL_ID_NONE,
+            spi: Vec::new(),
+            notify_message_type: IKEV2_NOTIFY_EAP_ONLY_AUTHENTICATION,
+            notification_data: Vec::new(),
+        }
+    }
+
     /// Construct the canonical 3GPP AUTHORIZATION_REJECTED Notify body value.
     ///
     /// The returned value uses Notify Message Type 9003, Protocol ID zero,

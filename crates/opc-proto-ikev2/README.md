@@ -67,7 +67,13 @@ control-plane stack.
   cache the complete already-sealed response for retransmission.
 - `ike_auth` and `ike_auth_signature` provide cleartext IKE_AUTH payload
   helpers, shared-key AUTH MIC helpers, signature AUTH helpers, and Child SA
-  selector/proposal helpers.
+  selector/proposal helpers. For RFC 5998, call
+  `Ikev2IkeAuthCleartextPayloads::eap_only_authentication()`: absence is
+  `Ok(None)`, exactly one canonical Protocol-ID-zero/empty-SPI/empty-data
+  Notify is `Ok(Some(_))`, and malformed or duplicate type-16417 occurrences
+  are typed errors. Duplicate diagnostics retain only canonical/malformed
+  counts and the first structural reason; the lossless raw Notify views remain
+  available separately in `notifies`.
 - `ike_sa_rekey` strictly decodes authenticated/opened `SA, Ni, KEi`
   `CREATE_CHILD_SA` requests, selects an existing executable IKE-SA profile,
   and builds an immutable exact `SA, Nr, KEr` response chain. It rejects
@@ -86,6 +92,13 @@ control-plane stack.
   Consistent with RFC 7296 section 3.10, receive recognition ignores Protocol
   ID when SPI Size is zero. Choosing this outcome from Diameter or local
   authorization state remains product-owned.
+- `notify` also exposes
+  `decode_ikev2_eap_only_authentication_notify` for classifying one RFC 5998
+  Notify without collapsing malformed type-16417 values into absence. Build
+  the canonical sender value with
+  `Ikev2NotifyPayloadBuild::eap_only_authentication()`. Whether the negotiated
+  EAP method is mutually authenticating, key-generating, and resistant to
+  dictionary attacks remains product-owned policy.
 - `dedicated_bearer` implements the TS 24.302 multiple-bearer Notify values and
   strict opened-payload views/builders for dedicated-bearer `CREATE_CHILD_SA`
   and `INFORMATIONAL` modification/deletion exchanges. TFT values use the
