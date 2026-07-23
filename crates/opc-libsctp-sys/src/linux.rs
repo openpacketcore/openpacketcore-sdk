@@ -39,13 +39,12 @@ const SPP_HB_TIME_IS_ZERO: u32 = 1 << 7;
 type RecvControlStorage = [mem::MaybeUninit<libc::cmsghdr>; RECV_CONTROL_CMSG_SLOTS];
 
 fn required_recv_control_len() -> io::Result<usize> {
+    let modern_payload_len = mem::size_of::<libc::sctp_rcvinfo>() as libc::c_uint;
     // SAFETY: The arguments are fixed Linux UAPI payload sizes.
-    let modern =
-        unsafe { libc::CMSG_SPACE(mem::size_of::<libc::sctp_rcvinfo>() as libc::c_uint) } as usize;
+    let modern = unsafe { libc::CMSG_SPACE(modern_payload_len) } as usize;
+    let legacy_payload_len = mem::size_of::<libc::sctp_sndrcvinfo>() as libc::c_uint;
     // SAFETY: As above, the argument is a fixed Linux UAPI payload size.
-    let legacy =
-        unsafe { libc::CMSG_SPACE(mem::size_of::<libc::sctp_sndrcvinfo>() as libc::c_uint) }
-            as usize;
+    let legacy = unsafe { libc::CMSG_SPACE(legacy_payload_len) } as usize;
     modern
         .checked_add(legacy)
         .ok_or_else(|| io::Error::other("SCTP receive ancillary storage length overflowed"))
