@@ -1229,7 +1229,10 @@ pub enum GtpuSessionSelectorReuseEvidence {
 /// This value carries the complete old semantic graph so a backend can compare
 /// only overlapping selectors and reject invented or cross-device evidence.
 /// It does not authorize direct transfer from a still-live source authority:
-/// exact source removal must already be proven.
+/// exact source removal must already be proven. The one retired graph must
+/// cover every selector newly introduced by the desired reconciliation.
+/// Combining selectors from multiple retired groups is deliberately
+/// fail-closed by the current single-proof API.
 #[derive(Clone, PartialEq, Eq)]
 pub struct GtpuSessionSelectorReuseProof {
     retired_group: GtpuSessionGroup,
@@ -1290,6 +1293,9 @@ pub enum GtpuSessionSelectorProvenance {
     /// namespace.
     Fresh,
     /// Reuse after exact removal and explicit drain/grace evidence.
+    ///
+    /// The proof's one retired graph must cover every desired selector not
+    /// retained from the active base generation.
     Reused(GtpuSessionSelectorReuseProof),
 }
 
@@ -2049,6 +2055,12 @@ pub struct GtpuIpFamilyCapabilities {
     pub ipv6_udp_checksum: GtpuCapability,
     /// Exact offload/materialization invariant used for uplink checksums.
     pub uplink_checksum_offload: GtpuUplinkChecksumOffloadContract,
+    /// Demonstrated fragmented outer IPv6 downlink contract.
+    ///
+    /// This is independent of [`Self::outer_ipv6`]: a backend may support
+    /// complete, unfragmented IPv6 GTP-U transport while lacking an IPv6
+    /// reassembly consumer and must then report `Unsupported`.
+    pub downlink_outer_ipv6_fragment_handling: GtpuDownlinkFragmentContract,
 }
 
 impl GtpuIpFamilyCapabilities {
@@ -2065,6 +2077,7 @@ impl GtpuIpFamilyCapabilities {
             local_endpoint_sets: GtpuCapability::Missing,
             ipv6_udp_checksum: GtpuCapability::Missing,
             uplink_checksum_offload: GtpuUplinkChecksumOffloadContract::Unsupported,
+            downlink_outer_ipv6_fragment_handling: GtpuDownlinkFragmentContract::Unsupported,
         }
     }
 }
@@ -2110,8 +2123,8 @@ pub struct GtpuProbe {
     /// `RequireOuterFragmentation` policy is rejected because tc redirect
     /// cannot execute the required fragmentation.
     pub uplink_pmtu_enforcement: GtpuCapability,
-    /// The backend's demonstrated contract for fragmented outer downlink
-    /// packets: a bounded kernel-reassembly handoff whose reassembled
+    /// The backend's demonstrated contract for fragmented outer IPv4
+    /// downlink packets: a bounded kernel-reassembly handoff whose reassembled
     /// datagrams re-enter the SDK GTP-U consumer exactly once, or an
     /// explicit unsupported statement. The handoff contract is
     /// handoff-capable only: it is complete only while the operator runs an
@@ -2709,6 +2722,10 @@ mod tests {
         assert_eq!(
             capabilities.uplink_checksum_offload,
             GtpuUplinkChecksumOffloadContract::Unsupported
+        );
+        assert_eq!(
+            capabilities.downlink_outer_ipv6_fragment_handling,
+            GtpuDownlinkFragmentContract::Unsupported
         );
     }
 }
