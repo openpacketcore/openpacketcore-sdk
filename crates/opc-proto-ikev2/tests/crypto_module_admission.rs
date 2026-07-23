@@ -1066,6 +1066,49 @@ fn one_admitted_module_handles_every_operation_and_withdrawal_never_falls_back()
     )
     .expect("verification routed");
 
+    let before_nonce_mismatch = module.counts.snapshot();
+    let opposite_direction_nonce = Ikev2IkeAuthSignedOctets {
+        peer_nonce: support::TEST_RESPONDER_NONCE,
+        ..signed_octets
+    };
+    assert_eq!(
+        compute_ike_auth_signature(
+            profile,
+            &material,
+            opposite_direction_nonce,
+            &key,
+            Some(
+                signing_authority
+                    .for_exchange(&sa_init_request, &sa_init_response)
+                    .expect("signing authority matches test exchange"),
+            ),
+        ),
+        Err(Ikev2IkeAuthVerificationError::SignatureHashAuthorityExchangeMismatch)
+    );
+    assert_eq!(
+        verify_ike_auth_signature(
+            profile,
+            &material,
+            opposite_direction_nonce,
+            &public,
+            &Ikev2AuthenticationPayload {
+                auth_method: IKEV2_AUTH_METHOD_DIGITAL_SIGNATURE,
+                auth_data: &auth_data,
+            },
+            Some(
+                verification_authority
+                    .for_exchange(&sa_init_request, &sa_init_response)
+                    .expect("verification authority matches test exchange"),
+            ),
+        ),
+        Err(Ikev2IkeAuthVerificationError::SignatureHashAuthorityExchangeMismatch)
+    );
+    assert_eq!(
+        module.counts.snapshot(),
+        before_nonce_mismatch,
+        "nonce mismatch must fail before PRF, signing, or verification dispatch"
+    );
+
     let unadmitted_profile = Ikev2SaInitCryptoProfile::new_encrypt_then_mac(
         Ikev2PrfAlgorithm::HmacSha2_512,
         Ikev2DhGroup::Ecp256,

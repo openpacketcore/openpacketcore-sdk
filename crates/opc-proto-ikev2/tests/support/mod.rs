@@ -26,6 +26,8 @@ pub(crate) fn ensure_ike_crypto() {
 
 const TEST_INITIATOR_SPI: u64 = 0x0102_0304_0506_0708;
 const TEST_RESPONDER_SPI: u64 = 0x1112_1314_1516_1718;
+pub(crate) const TEST_INITIATOR_NONCE: &[u8] = &[0x66; 32];
+pub(crate) const TEST_RESPONDER_NONCE: &[u8] = &[0x77; 32];
 const PAYLOAD_SECURITY_ASSOCIATION: u8 = 33;
 const PAYLOAD_KEY_EXCHANGE: u8 = 34;
 const PAYLOAD_NONCE: u8 = 40;
@@ -137,7 +139,11 @@ fn build_sa_init_message(request: bool, offer: Option<&[Ikev2SignatureHashAlgori
     ];
     let mut ke_body = vec![0, 19, 0, 0];
     ke_body.extend_from_slice(&[0x55; 32]);
-    let nonce_body = [0x66; 32];
+    let nonce_body = if request {
+        TEST_INITIATOR_NONCE
+    } else {
+        TEST_RESPONDER_NONCE
+    };
 
     let mut raw_payloads = Vec::new();
     append_payload(&mut raw_payloads, PAYLOAD_KEY_EXCHANGE, &sa_body);
@@ -145,7 +151,7 @@ fn build_sa_init_message(request: bool, offer: Option<&[Ikev2SignatureHashAlgori
     append_payload(
         &mut raw_payloads,
         if offer.is_some() { PAYLOAD_NOTIFY } else { 0 },
-        &nonce_body,
+        nonce_body,
     );
     if let Some(algorithms) = offer {
         let mut notify_body = vec![0, 0, 0x40, 0x2f];

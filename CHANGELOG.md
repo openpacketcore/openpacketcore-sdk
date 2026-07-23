@@ -16,17 +16,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   works when the two directions have no hash in common. Negotiation decodes
   the exact correlated request/response messages and mints distinct,
   non-copyable signing and verification authorities bound to both exact
-  SA_INIT messages and the AUTH peer role. Local offers are preflighted against
-  the installed module's admitted verification algorithms. Empty, malformed,
-  oversized, duplicate, unsupported-only, omitted, uncorrelated, trailing,
-  and stale-exchange states fail with stable payload-free errors.
+  SA_INIT messages, their validated Nonce payloads, and the AUTH peer role.
+  Local offers are preflighted against the installed module's admitted
+  verification algorithms. Empty, malformed, oversized, duplicate,
+  unsupported-only, omitted, uncorrelated, trailing, stale-exchange, and
+  mismatched peer-nonce states fail with stable payload-free errors.
   `compute_ike_auth_signature` and `verify_ike_auth_signature` now take their
   respective optional one-operation authorization type: method 14 requires
   callers to bind both exact SA_INIT messages and validates the framed
-  signature hash plus exchange binding before cryptographic execution; legacy
-  method 1 passes `None`. Products retain each authority, exact exchange, and
-  key material as one IKE-SA state; independently supplied key material has no
-  inferable application-session identity (#495).
+  signature hash, exchange binding, and direction-correct opposite-message
+  nonce before cryptographic execution; legacy method 1 passes `None`.
+  Products retain each authority, exact exchange, and key material as one
+  IKE-SA state; independently supplied key material has no inferable
+  application-session identity (#495).
   Downstream exhaustive matches on `Ikev2IkeAuthVerificationError` must add
   arms for `SignatureHashAuthorityMissing` and
   `SignatureHashNotAuthorized`, and

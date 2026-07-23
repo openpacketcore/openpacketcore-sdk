@@ -344,7 +344,8 @@ impl fmt::Debug for Ikev2SignaturePublicKey {
 /// `key.method().as_u8()` as the AUTH method.
 /// RFC 7427 method 14 requires a one-operation
 /// `signature_hash_authorization` bound to both peers' exact `IKE_SA_INIT`
-/// messages; method 1 ignores this argument.
+/// messages and the opposite message's validated Nonce payload; method 1
+/// ignores this argument.
 ///
 /// # Errors
 ///
@@ -403,8 +404,8 @@ pub fn compute_ike_auth_signature(
 /// [`crate::verify_ike_auth_shared_key_mic`] owns) fails with
 /// `UnsupportedAuthenticationMethod`.
 /// RFC 7427 method 14 additionally requires direction-specific
-/// `signature_hash_authorization` bound to both exact SA_INIT messages; method
-/// 1 ignores that argument.
+/// `signature_hash_authorization` bound to both exact SA_INIT messages and the
+/// opposite message's validated Nonce payload; method 1 ignores that argument.
 ///
 /// # Errors
 ///

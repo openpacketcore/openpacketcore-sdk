@@ -75,10 +75,23 @@ fn signed_octets<'a>(
     sa_init_message: &'a [u8],
     identity: &'a [u8],
 ) -> Ikev2IkeAuthSignedOctets<'a> {
+    let peer_nonce = match peer {
+        Ikev2IkeAuthPeer::Initiator => support::TEST_RESPONDER_NONCE,
+        Ikev2IkeAuthPeer::Responder => support::TEST_INITIATOR_NONCE,
+    };
+    signed_octets_with_nonce(peer, sa_init_message, peer_nonce, identity)
+}
+
+fn signed_octets_with_nonce<'a>(
+    peer: Ikev2IkeAuthPeer,
+    sa_init_message: &'a [u8],
+    peer_nonce: &'a [u8],
+    identity: &'a [u8],
+) -> Ikev2IkeAuthSignedOctets<'a> {
     Ikev2IkeAuthSignedOctets {
         peer,
         ike_sa_init_message: sa_init_message,
-        peer_nonce: &[0x77; 32],
+        peer_nonce,
         identity_payload_body: identity,
     }
 }
@@ -526,6 +539,218 @@ fn authority_is_bound_to_exact_exchange_and_peer_before_crypto() {
         ),
         Err(Ikev2IkeAuthVerificationError::SignatureHashAuthorityExchangeMismatch)
     );
+}
+
+#[test]
+fn responder_method14_authority_binds_exact_initiator_nonce() {
+    support::ensure_ike_crypto();
+    let hashes = [Ikev2SignatureHashAlgorithm::Sha2_256];
+    let (request, response) = support::signature_hash_exchange(Some(&hashes), Some(&hashes));
+    let responder = negotiate_ikev2_signature_hash_algorithms(
+        Ikev2SignatureHashLocalRole::Responder,
+        &request,
+        &response,
+        DecodeContext::default(),
+    )
+    .expect("responder negotiation")
+    .into_authorities();
+    let initiator = negotiate_ikev2_signature_hash_algorithms(
+        Ikev2SignatureHashLocalRole::Initiator,
+        &request,
+        &response,
+        DecodeContext::default(),
+    )
+    .expect("initiator negotiation")
+    .into_authorities();
+    let identity = identity_payload_body();
+    let material = key_material();
+    let key = Ikev2SignatureAuthKey::ecdsa_p256_pkcs8_der(P256_PKCS8_DER).expect("P-256 key");
+    let public = Ikev2SignaturePublicKey::from_spki_der(P256_SPKI_DER).expect("P-256 public key");
+    let exact = signed_octets(Ikev2IkeAuthPeer::Responder, &response, &identity);
+
+    let auth_data = compute_ike_auth_signature(
+        profile(),
+        &material,
+        exact,
+        &key,
+        Some(
+            responder
+                .signing()
+                .for_exchange(&request, &response)
+                .expect("responder signing exchange"),
+        ),
+    )
+    .expect("exact initiator nonce signs");
+    let authentication = Ikev2AuthenticationPayload {
+        auth_method: IKEV2_AUTH_METHOD_DIGITAL_SIGNATURE,
+        auth_data: &auth_data,
+    };
+    verify_ike_auth_signature(
+        profile(),
+        &material,
+        exact,
+        &public,
+        &authentication,
+        Some(
+            initiator
+                .verification()
+                .for_exchange(&request, &response)
+                .expect("initiator verification exchange"),
+        ),
+    )
+    .expect("exact initiator nonce verifies");
+
+    let stale_nonce = [0x55; 32];
+    let arbitrary_nonce = [0x99; 32];
+    for invalid_nonce in [
+        stale_nonce.as_slice(),
+        arbitrary_nonce.as_slice(),
+        support::TEST_RESPONDER_NONCE,
+    ] {
+        let invalid = signed_octets_with_nonce(
+            Ikev2IkeAuthPeer::Responder,
+            &response,
+            invalid_nonce,
+            &identity,
+        );
+        assert_eq!(
+            compute_ike_auth_signature(
+                profile(),
+                &material,
+                invalid,
+                &key,
+                Some(
+                    responder
+                        .signing()
+                        .for_exchange(&request, &response)
+                        .expect("responder signing exchange"),
+                ),
+            ),
+            Err(Ikev2IkeAuthVerificationError::SignatureHashAuthorityExchangeMismatch)
+        );
+        assert_eq!(
+            verify_ike_auth_signature(
+                profile(),
+                &material,
+                invalid,
+                &public,
+                &authentication,
+                Some(
+                    initiator
+                        .verification()
+                        .for_exchange(&request, &response)
+                        .expect("initiator verification exchange"),
+                ),
+            ),
+            Err(Ikev2IkeAuthVerificationError::SignatureHashAuthorityExchangeMismatch)
+        );
+    }
+}
+
+#[test]
+fn initiator_method14_authority_binds_exact_responder_nonce() {
+    support::ensure_ike_crypto();
+    let hashes = [Ikev2SignatureHashAlgorithm::Sha2_256];
+    let (request, response) = support::signature_hash_exchange(Some(&hashes), Some(&hashes));
+    let initiator = negotiate_ikev2_signature_hash_algorithms(
+        Ikev2SignatureHashLocalRole::Initiator,
+        &request,
+        &response,
+        DecodeContext::default(),
+    )
+    .expect("initiator negotiation")
+    .into_authorities();
+    let responder = negotiate_ikev2_signature_hash_algorithms(
+        Ikev2SignatureHashLocalRole::Responder,
+        &request,
+        &response,
+        DecodeContext::default(),
+    )
+    .expect("responder negotiation")
+    .into_authorities();
+    let identity = identity_payload_body();
+    let material = key_material();
+    let key = Ikev2SignatureAuthKey::ecdsa_p256_pkcs8_der(P256_PKCS8_DER).expect("P-256 key");
+    let public = Ikev2SignaturePublicKey::from_spki_der(P256_SPKI_DER).expect("P-256 public key");
+    let exact = signed_octets(Ikev2IkeAuthPeer::Initiator, &request, &identity);
+
+    let auth_data = compute_ike_auth_signature(
+        profile(),
+        &material,
+        exact,
+        &key,
+        Some(
+            initiator
+                .signing()
+                .for_exchange(&request, &response)
+                .expect("initiator signing exchange"),
+        ),
+    )
+    .expect("exact responder nonce signs");
+    let authentication = Ikev2AuthenticationPayload {
+        auth_method: IKEV2_AUTH_METHOD_DIGITAL_SIGNATURE,
+        auth_data: &auth_data,
+    };
+    verify_ike_auth_signature(
+        profile(),
+        &material,
+        exact,
+        &public,
+        &authentication,
+        Some(
+            responder
+                .verification()
+                .for_exchange(&request, &response)
+                .expect("responder verification exchange"),
+        ),
+    )
+    .expect("exact responder nonce verifies");
+
+    let stale_nonce = [0x55; 32];
+    let arbitrary_nonce = [0x99; 32];
+    for invalid_nonce in [
+        stale_nonce.as_slice(),
+        arbitrary_nonce.as_slice(),
+        support::TEST_INITIATOR_NONCE,
+    ] {
+        let invalid = signed_octets_with_nonce(
+            Ikev2IkeAuthPeer::Initiator,
+            &request,
+            invalid_nonce,
+            &identity,
+        );
+        assert_eq!(
+            compute_ike_auth_signature(
+                profile(),
+                &material,
+                invalid,
+                &key,
+                Some(
+                    initiator
+                        .signing()
+                        .for_exchange(&request, &response)
+                        .expect("initiator signing exchange"),
+                ),
+            ),
+            Err(Ikev2IkeAuthVerificationError::SignatureHashAuthorityExchangeMismatch)
+        );
+        assert_eq!(
+            verify_ike_auth_signature(
+                profile(),
+                &material,
+                invalid,
+                &public,
+                &authentication,
+                Some(
+                    responder
+                        .verification()
+                        .for_exchange(&request, &response)
+                        .expect("responder verification exchange"),
+                ),
+            ),
+            Err(Ikev2IkeAuthVerificationError::SignatureHashAuthorityExchangeMismatch)
+        );
+    }
 }
 
 #[test]

@@ -70,7 +70,8 @@ control-plane stack.
   selector/proposal helpers. RFC 7427 method 14 signing and verification
   require distinct signing and verification authorities. They can only be
   minted after the exact correlated SA_INIT request/response bytes prove both
-  `SIGNATURE_HASH_ALGORITHMS` offers and current crypto-module admission.
+  `SIGNATURE_HASH_ALGORITHMS` offers, both validated Nonce payloads, and current
+  crypto-module admission.
   For RFC 5998, call
   `Ikev2IkeAuthCleartextPayloads::eap_only_authentication()`: absence is
   `Ok(None)`, exactly one canonical Protocol-ID-zero/empty-SPI/empty-data
@@ -142,9 +143,10 @@ duplicate identifiers or Notify occurrences, a nonzero Protocol ID, or a
 nonempty SPI shape.
 
 Negotiation consumes both complete SA_INIT messages, checks their request and
-response shape, SPI/message correlation, required payloads, and absence of
-trailing bytes, then recovers both offers from those exact transcripts. It
-computes two independent sets:
+response shape, SPI/message correlation, required payloads (including exactly
+one valid Nonce in each message), and absence of trailing bytes, then retains
+both exact nonce values and recovers both offers from those exact transcripts.
+It computes two independent sets:
 
 - hashes offered by the peer that the admitted local signing path can use;
 - hashes sent locally that the admitted local verification path can accept.
@@ -203,8 +205,10 @@ For verification, bind `authorities.verification()` with the same
 `for_exchange(request_bytes, response_bytes)` call and pass the resulting
 one-operation authorization to `verify_ike_auth_signature`. Each non-copyable
 authorization checks the method-14 AlgorithmIdentifier hash, both exact
-request/response messages, and the expected signer role before transcript PRF
-or signature execution. Peer/local omission, a presented stale exchange, and
+request/response messages, the expected signer role, and the direction-correct
+opposite-message nonce (`Nr` for initiator AUTH, `Ni` for responder AUTH)
+before transcript PRF or signature execution. Peer/local omission, a presented
+stale exchange or nonce, opposite-direction nonce substitution, and
 wrong-direction use are typed errors. The product must retain the authority,
 exact messages, and key material together as one IKE-SA state: the SDK cannot
 infer whether separately supplied key material belongs to a different

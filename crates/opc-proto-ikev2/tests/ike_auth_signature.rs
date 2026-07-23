@@ -151,7 +151,7 @@ fn ecdsa_p384_method_14_signature_round_trips() {
 }
 
 #[test]
-fn tampered_transcript_fails_verification() {
+fn tampered_peer_nonce_is_rejected_by_exchange_authority() {
     let identity = identity_payload_body();
     let authority =
         support::responder_signature_hash_context(Ikev2SignatureHashAlgorithm::Sha2_256);
@@ -178,7 +178,7 @@ fn tampered_transcript_fails_verification() {
             &auth_payload(IKEV2_AUTH_METHOD_DIGITAL_SIGNATURE, &auth_data),
             Some(authority.verification_authorization()),
         ),
-        Err(Ikev2IkeAuthVerificationError::SignatureVerificationFailed)
+        Err(Ikev2IkeAuthVerificationError::SignatureHashAuthorityExchangeMismatch)
     );
 }
 

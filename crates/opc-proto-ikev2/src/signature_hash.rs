@@ -3,9 +3,9 @@
 //! The `SIGNATURE_HASH_ALGORITHMS` Notify is exchanged in `IKE_SA_INIT`.
 //! This module preserves each peer's ordered offer, bounds untrusted input,
 //! and produces distinct signing and verification authorities bound to the
-//! exact request/response transcript. RFC 7427 does not require both
-//! directions to use the same hash: each signer chooses from the offer sent by
-//! the other peer.
+//! exact request/response transcript and its validated Nonce payloads. RFC
+//! 7427 does not require both directions to use the same hash: each signer
+//! chooses from the offer sent by the other peer.
 //!
 //! @spec IETF RFC7427 3, 4
 //! @req REQ-IETF-RFC7427-SIGNATURE-HASH-001
@@ -384,8 +384,9 @@ impl fmt::Debug for Ikev2SignatureHashAuthorities {
 
 /// Authority for method-14 signatures produced by the local peer.
 ///
-/// It is bound to both exact `IKE_SA_INIT` messages and the expected AUTH peer
-/// role. It cannot be copied or constructed outside this module.
+/// It is bound to both exact `IKE_SA_INIT` messages, their validated Nonce
+/// payloads, and the expected AUTH peer role. It cannot be copied or
+/// constructed outside this module.
 pub struct Ikev2SignatureHashSigningAuthority {
     algorithms: Vec<Ikev2SignatureHashAlgorithm>,
     binding: TranscriptBinding,
@@ -405,6 +406,8 @@ impl Ikev2SignatureHashSigningAuthority {
     /// both exact messages for every operation. This prevents an authority
     /// from a different exchange from being used when the caller presents the
     /// current pair but only the signer-side message happens to be identical.
+    /// The signing operation also proves that its `peer_nonce` is the Nonce
+    /// retained from the opposite bound SA_INIT message.
     /// The caller remains responsible for retaining the resulting authority,
     /// SA_INIT messages, and key material as one IKE-SA state; byte slices
     /// cannot prove that separately supplied key material came from the same
@@ -447,8 +450,9 @@ impl fmt::Debug for Ikev2SignatureHashSigningAuthority {
 
 /// Authority for method-14 signatures received from the remote peer.
 ///
-/// It is bound to both exact `IKE_SA_INIT` messages and the expected AUTH peer
-/// role. It cannot be copied or constructed outside this module.
+/// It is bound to both exact `IKE_SA_INIT` messages, their validated Nonce
+/// payloads, and the expected AUTH peer role. It cannot be copied or
+/// constructed outside this module.
 pub struct Ikev2SignatureHashVerificationAuthority {
     algorithms: Vec<Ikev2SignatureHashAlgorithm>,
     binding: TranscriptBinding,
@@ -473,6 +477,8 @@ impl Ikev2SignatureHashVerificationAuthority {
     ///
     /// Returns [`Ikev2SignatureHashBindingError::ExchangeMismatch`] unless
     /// both messages exactly match the exchange that minted this authority.
+    /// The verification operation also proves that its `peer_nonce` is the
+    /// Nonce retained from the opposite bound SA_INIT message.
     pub fn for_exchange<'a>(
         &'a self,
         request: &'a [u8],
@@ -597,6 +603,8 @@ impl TranscriptBinding {
 struct ExchangeBinding {
     request: Vec<u8>,
     response: Vec<u8>,
+    request_nonce: Vec<u8>,
+    response_nonce: Vec<u8>,
 }
 
 /// Failure to bind a directional authority to an exact SA_INIT exchange.
@@ -671,7 +679,7 @@ pub fn negotiate_ikev2_signature_hash_algorithms(
         }
     };
     let request_offer = extract_offer(&request_payloads.notifies, request_missing)?;
-    let response_notifies = decode_response_notifies(&response, ctx)?;
+    let response_payloads = decode_response_payloads(&response, ctx)?;
     let response_missing = match local_role {
         Ikev2SignatureHashLocalRole::Initiator => {
             Ikev2SignatureHashNegotiationError::PeerOfferMissing
@@ -680,7 +688,7 @@ pub fn negotiate_ikev2_signature_hash_algorithms(
             Ikev2SignatureHashNegotiationError::LocalOfferMissing
         }
     };
-    let response_offer = extract_offer(&response_notifies, response_missing)?;
+    let response_offer = extract_offer(&response_payloads.notifies, response_missing)?;
 
     let (local_offer, peer_offer, local_peer, peer_peer) = match local_role {
         Ikev2SignatureHashLocalRole::Initiator => (
@@ -717,6 +725,8 @@ pub fn negotiate_ikev2_signature_hash_algorithms(
     let exchange = Arc::new(ExchangeBinding {
         request: request_bytes.to_vec(),
         response: response_bytes.to_vec(),
+        request_nonce: request_payloads.nonce.nonce.to_vec(),
+        response_nonce: response_payloads.nonce.nonce.to_vec(),
     });
     Ok(Ikev2SignatureHashNegotiation {
         local_offer,
@@ -842,13 +852,18 @@ fn validate_exchange_headers(
     Ok(())
 }
 
-fn decode_response_notifies<'a>(
+struct ResponsePayloads<'a> {
+    nonce: Ikev2NoncePayload<'a>,
+    notifies: Vec<Ikev2NotifyPayload<'a>>,
+}
+
+fn decode_response_payloads<'a>(
     response: &Message<'a>,
     ctx: DecodeContext,
-) -> Result<Vec<Ikev2NotifyPayload<'a>>, Ikev2SignatureHashNegotiationError> {
+) -> Result<ResponsePayloads<'a>, Ikev2SignatureHashNegotiationError> {
     let mut security_association = false;
     let mut key_exchange = false;
-    let mut nonce = false;
+    let mut nonce = None;
     let mut notifies = Vec::new();
 
     for raw in response.payloads_with_context(ctx) {
@@ -867,10 +882,13 @@ fn decode_response_notifies<'a>(
                 key_exchange = true;
             }
             PayloadType::Nonce => {
-                if nonce || Ikev2NoncePayload::decode(raw).is_err() {
+                if nonce.is_some() {
                     return Err(Ikev2SignatureHashNegotiationError::InvalidResponseMessage);
                 }
-                nonce = true;
+                nonce = Some(
+                    Ikev2NoncePayload::decode(raw)
+                        .map_err(|_| Ikev2SignatureHashNegotiationError::InvalidResponseMessage)?,
+                );
             }
             PayloadType::Notify => {
                 notifies.push(
@@ -882,10 +900,13 @@ fn decode_response_notifies<'a>(
         }
     }
 
-    if !security_association || !key_exchange || !nonce {
+    if !security_association || !key_exchange {
         return Err(Ikev2SignatureHashNegotiationError::InvalidResponseMessage);
     }
-    Ok(notifies)
+    Ok(ResponsePayloads {
+        nonce: nonce.ok_or(Ikev2SignatureHashNegotiationError::InvalidResponseMessage)?,
+        notifies,
+    })
 }
 
 fn extract_offer(
@@ -913,12 +934,19 @@ fn validate_authority(
     if !algorithms.contains(&required) {
         return Err(Ikev2SignatureHashAuthorityError::AlgorithmNotAuthorized);
     }
-    let expected_message = match binding.expected_peer {
-        Ikev2IkeAuthPeer::Initiator => binding.exchange.request.as_slice(),
-        Ikev2IkeAuthPeer::Responder => binding.exchange.response.as_slice(),
+    let (expected_message, expected_peer_nonce) = match binding.expected_peer {
+        Ikev2IkeAuthPeer::Initiator => (
+            binding.exchange.request.as_slice(),
+            binding.exchange.response_nonce.as_slice(),
+        ),
+        Ikev2IkeAuthPeer::Responder => (
+            binding.exchange.response.as_slice(),
+            binding.exchange.request_nonce.as_slice(),
+        ),
     };
     if signed_octets.peer != binding.expected_peer
         || signed_octets.ike_sa_init_message != expected_message
+        || signed_octets.peer_nonce != expected_peer_nonce
     {
         return Err(Ikev2SignatureHashAuthorityError::ExchangeMismatch);
     }
