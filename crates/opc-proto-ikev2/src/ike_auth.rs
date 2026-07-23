@@ -16,7 +16,11 @@ use zeroize::Zeroizing;
 
 use crate::{
     crypto_module::{execute_prf, Ikev2CryptoModuleError},
-    notify::{Ikev2NotifyPayload, Ikev2NotifyPayloadError, IKEV2_NOTIFY_REKEY_SA},
+    notify::{
+        decode_ikev2_eap_only_authentication_notify, Ikev2EapOnlyAuthentication,
+        Ikev2EapOnlyAuthenticationNotifyError, Ikev2NotifyPayload, Ikev2NotifyPayloadError,
+        IKEV2_NOTIFY_REKEY_SA,
+    },
     payload::{PayloadChain, PayloadType, RawPayload, GENERIC_PAYLOAD_HEADER_LEN},
     sa_init::{
         encode_ke_payload_build, encode_nonce_payload_build, encode_notify_payload_build,
@@ -748,14 +752,121 @@ impl fmt::Debug for Ikev2IkeAuthCleartextPayloads<'_> {
     }
 }
 
+/// Fail-closed RFC 5998 EAP_ONLY_AUTHENTICATION aggregate error.
+///
+/// Variants retain only structural occurrence counts and a typed malformed
+/// reason. No raw SPI, notification data, packet bytes, or peer identity is
+/// retained or rendered.
+///
+/// @spec IETF RFC5998 3
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ikev2EapOnlyAuthenticationError {
+    /// Exactly one type-16417 Notify was present and malformed.
+    Malformed {
+        /// First invalid field in RFC 5998 wire order.
+        reason: Ikev2EapOnlyAuthenticationNotifyError,
+    },
+    /// Two or more type-16417 Notify payloads were present.
+    Duplicate {
+        /// Total type-16417 occurrence count.
+        occurrences: usize,
+        /// Canonical type-16417 occurrence count.
+        valid_occurrences: usize,
+        /// Malformed type-16417 occurrence count.
+        malformed_occurrences: usize,
+        /// First malformed reason in wire order, if any occurrence was malformed.
+        first_malformed_reason: Option<Ikev2EapOnlyAuthenticationNotifyError>,
+    },
+}
+
+impl Ikev2EapOnlyAuthenticationError {
+    /// Stable machine-readable error code.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Malformed { reason } => reason.as_str(),
+            Self::Duplicate { .. } => "ike_auth_eap_only_authentication_duplicate",
+        }
+    }
+}
+
+impl fmt::Display for Ikev2EapOnlyAuthenticationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Error for Ikev2EapOnlyAuthenticationError {}
+
 impl Ikev2IkeAuthCleartextPayloads<'_> {
-    /// Return true when the peer sent an RFC 5998 EAP_ONLY_AUTHENTICATION
-    /// status notify, signalling it accepts EAP-only mutual authentication and
-    /// the responder may omit CERT payloads and signature AUTH.
+    /// Return the validated RFC 5998 EAP_ONLY_AUTHENTICATION request.
+    ///
+    /// Absence returns `Ok(None)` and exactly one canonical type-16417 Notify
+    /// returns `Ok(Some(_))`. Exactly one malformed occurrence and every
+    /// duplicate combination fail closed. Duplicate classification is
+    /// independent of wire order and retains canonical/malformed counts plus
+    /// the first malformed structural reason. The original lossless Notify
+    /// views remain in [`Self::notifies`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Ikev2EapOnlyAuthenticationError`] for one malformed
+    /// type-16417 Notify or two or more type-16417 occurrences.
+    ///
+    /// @spec IETF RFC5998 3
+    pub fn eap_only_authentication(
+        &self,
+    ) -> Result<Option<Ikev2EapOnlyAuthentication>, Ikev2EapOnlyAuthenticationError> {
+        let mut valid_occurrences = 0_usize;
+        let mut malformed_occurrences = 0_usize;
+        let mut first_result = None;
+        let mut first_malformed_reason = None;
+
+        for notify in &self.notifies {
+            match decode_ikev2_eap_only_authentication_notify(*notify) {
+                Ok(None) => {}
+                Ok(Some(marker)) => {
+                    valid_occurrences = valid_occurrences.saturating_add(1);
+                    if first_result.is_none() {
+                        first_result = Some(Ok(marker));
+                    }
+                }
+                Err(reason) => {
+                    malformed_occurrences = malformed_occurrences.saturating_add(1);
+                    if first_malformed_reason.is_none() {
+                        first_malformed_reason = Some(reason);
+                    }
+                    if first_result.is_none() {
+                        first_result = Some(Err(reason));
+                    }
+                }
+            }
+        }
+
+        let occurrences = valid_occurrences.saturating_add(malformed_occurrences);
+        match (occurrences, first_result) {
+            (0, _) => Ok(None),
+            (1, Some(Ok(marker))) => Ok(Some(marker)),
+            (1, Some(Err(reason))) => Err(Ikev2EapOnlyAuthenticationError::Malformed { reason }),
+            _ => Err(Ikev2EapOnlyAuthenticationError::Duplicate {
+                occurrences,
+                valid_occurrences,
+                malformed_occurrences,
+                first_malformed_reason,
+            }),
+        }
+    }
+
+    /// Return true only when the peer sent exactly one canonical RFC 5998
+    /// EAP_ONLY_AUTHENTICATION status Notify.
+    ///
+    /// This compatibility helper fails closed for malformed, duplicate, and
+    /// mixed occurrences. Prefer [`Self::eap_only_authentication`] when
+    /// diagnostics must distinguish absence and structural errors.
+    #[must_use]
+    #[deprecated(note = "use eap_only_authentication for typed fail-closed validation")]
     pub fn eap_only_authentication_requested(&self) -> bool {
-        self.notifies
-            .iter()
-            .any(|notify| notify.is_eap_only_authentication())
+        matches!(self.eap_only_authentication(), Ok(Some(_)))
     }
 }
 

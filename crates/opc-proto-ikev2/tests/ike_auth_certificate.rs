@@ -4,8 +4,7 @@ use opc_proto_ikev2::{
     decode_ike_auth_cleartext_payloads, Ikev2CertificatePayload, Ikev2CertificatePayloadBuild,
     Ikev2CertificateRequestPayload, Ikev2CertificateRequestPayloadBuild, Ikev2IkeAuthBuildError,
     Ikev2IkeAuthPayloadBuild, Ikev2IkeAuthPayloadError, Ikev2NotifyPayloadBuild, PayloadType,
-    IKEV2_CERT_ENCODING_X509_SIGNATURE, IKEV2_NOTIFY_EAP_ONLY_AUTHENTICATION,
-    IKEV2_NOTIFY_PROTOCOL_ID_NONE,
+    IKEV2_CERT_ENCODING_X509_SIGNATURE, IKEV2_NOTIFY_PROTOCOL_ID_NONE,
 };
 
 const RSA_CERT_DER: &[u8] = include_bytes!("data/rsa2048_cert.der");
@@ -125,13 +124,8 @@ fn certificate_debug_reports_lengths_only() {
 
 #[test]
 fn eap_only_authentication_notify_round_trips() {
-    let body = build_ike_auth_notify_payload(&Ikev2NotifyPayloadBuild {
-        protocol_id: IKEV2_NOTIFY_PROTOCOL_ID_NONE,
-        spi: Vec::new(),
-        notify_message_type: IKEV2_NOTIFY_EAP_ONLY_AUTHENTICATION,
-        notification_data: Vec::new(),
-    })
-    .expect("EAP_ONLY notify build");
+    let body = build_ike_auth_notify_payload(&Ikev2NotifyPayloadBuild::eap_only_authentication())
+        .expect("EAP_ONLY notify build");
     let (first, bytes) = build_ike_auth_cleartext_payload_chain(&[Ikev2IkeAuthPayloadBuild {
         payload_type: PayloadType::Notify,
         body,
@@ -140,12 +134,14 @@ fn eap_only_authentication_notify_round_trips() {
 
     let decoded = decode_ike_auth_cleartext_payloads(first, &bytes).expect("EAP_ONLY decode");
     assert_eq!(decoded.notifies.len(), 1);
-    assert!(decoded.notifies[0].is_eap_only_authentication());
-    assert!(decoded.eap_only_authentication_requested());
+    assert!(decoded
+        .eap_only_authentication()
+        .expect("canonical EAP_ONLY")
+        .is_some());
 }
 
 #[test]
-fn absent_eap_only_authentication_notify_reads_false() {
+fn absent_eap_only_authentication_notify_remains_distinct() {
     let body = build_ike_auth_notify_payload(&Ikev2NotifyPayloadBuild {
         protocol_id: IKEV2_NOTIFY_PROTOCOL_ID_NONE,
         spi: Vec::new(),
@@ -160,5 +156,5 @@ fn absent_eap_only_authentication_notify_reads_false() {
     .expect("notify chain");
 
     let decoded = decode_ike_auth_cleartext_payloads(first, &bytes).expect("notify decode");
-    assert!(!decoded.eap_only_authentication_requested());
+    assert_eq!(decoded.eap_only_authentication(), Ok(None));
 }

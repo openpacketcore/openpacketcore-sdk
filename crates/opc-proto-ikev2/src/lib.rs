@@ -14,7 +14,8 @@
 //! notify-only IKE_SA_INIT error responses,
 //! product-neutral executable IKE_SA_INIT proposal selection, caller-keyed
 //! SA_INIT AES-GCM and AES-CBC/HMAC protected-payload open/seal helpers, typed
-//! IKE_AUTH cleartext payload helpers, transcript-bound shared-key AUTH MIC
+//! IKE_AUTH cleartext payload helpers including fail-closed RFC 5998
+//! EAP_ONLY_AUTHENTICATION Notify validation, transcript-bound shared-key AUTH MIC
 //! verification, transcript-bound signature AUTH (RFC 7296 method 1 and
 //! RFC 7427 method 14) against caller-trusted keys, typed 3GPP DEVICE_IDENTITY
 //! and AUTHORIZATION_REJECTED notifications, product-neutral Child SA
@@ -177,15 +178,16 @@ pub use ike_auth::{
     Ikev2ConfigurationAttribute, Ikev2ConfigurationAttributeBuild, Ikev2ConfigurationPayload,
     Ikev2ConfigurationPayloadBuild, Ikev2CreateChildSaRekeyRequestBuild,
     Ikev2CreateChildSaRekeyRequestPayloads, Ikev2CreateChildSaRekeyResponseBuild,
-    Ikev2CreateChildSaRekeyResponsePayloads, Ikev2DeletePayload, Ikev2EapPayload,
-    Ikev2IdentificationPayload, Ikev2IdentificationPayloadBuild, Ikev2IkeAuthBuildError,
-    Ikev2IkeAuthCleartextPayloads, Ikev2IkeAuthPayloadBuild, Ikev2IkeAuthPayloadError,
-    Ikev2IkeAuthPeer, Ikev2IkeAuthSignedOctets, Ikev2IkeAuthVerificationError,
-    Ikev2TrafficSelector, Ikev2TrafficSelectorBuild, Ikev2TrafficSelectorPayload,
-    Ikev2TrafficSelectorPayloadBuild, IKEV2_AUTH_METHOD_SHARED_KEY_MIC,
-    IKEV2_CERT_ENCODING_X509_SIGNATURE, IKEV2_IKE_SA_DELETE_SPI_SIZE, IKEV2_IPSEC_SPI_SIZE,
-    IKEV2_SECURITY_PROTOCOL_ID_AH, IKEV2_SECURITY_PROTOCOL_ID_ESP, IKEV2_SECURITY_PROTOCOL_ID_IKE,
-    IKEV2_TS_IPV4_ADDR_RANGE, IKEV2_TS_IPV6_ADDR_RANGE,
+    Ikev2CreateChildSaRekeyResponsePayloads, Ikev2DeletePayload, Ikev2EapOnlyAuthenticationError,
+    Ikev2EapPayload, Ikev2IdentificationPayload, Ikev2IdentificationPayloadBuild,
+    Ikev2IkeAuthBuildError, Ikev2IkeAuthCleartextPayloads, Ikev2IkeAuthPayloadBuild,
+    Ikev2IkeAuthPayloadError, Ikev2IkeAuthPeer, Ikev2IkeAuthSignedOctets,
+    Ikev2IkeAuthVerificationError, Ikev2TrafficSelector, Ikev2TrafficSelectorBuild,
+    Ikev2TrafficSelectorPayload, Ikev2TrafficSelectorPayloadBuild,
+    IKEV2_AUTH_METHOD_SHARED_KEY_MIC, IKEV2_CERT_ENCODING_X509_SIGNATURE,
+    IKEV2_IKE_SA_DELETE_SPI_SIZE, IKEV2_IPSEC_SPI_SIZE, IKEV2_SECURITY_PROTOCOL_ID_AH,
+    IKEV2_SECURITY_PROTOCOL_ID_ESP, IKEV2_SECURITY_PROTOCOL_ID_IKE, IKEV2_TS_IPV4_ADDR_RANGE,
+    IKEV2_TS_IPV6_ADDR_RANGE,
 };
 pub use ike_auth_signature::{
     compute_ike_auth_signature, verify_ike_auth_signature, Ikev2SignatureAuthKey,
@@ -221,11 +223,13 @@ pub use nat_traversal::{
     IKE_NAT_TRAVERSAL_UDP_PORT, IKE_UDP_PORT, NAT_TRAVERSAL_KEEPALIVE,
 };
 pub use notify::{
-    build_ike_sa_init_cookie_response, extract_ike_sa_init_cookie_notify, Ikev2CookieNotify,
-    Ikev2CookieNotifyBuildError, Ikev2CookieNotifyExtractError, Ikev2NotifyPayload,
-    Ikev2NotifyPayloadError, IKEV2_NOTIFY_AUTHENTICATION_FAILED,
-    IKEV2_NOTIFY_AUTHORIZATION_REJECTED, IKEV2_NOTIFY_CHILD_SA_NOT_FOUND, IKEV2_NOTIFY_COOKIE,
-    IKEV2_NOTIFY_COOKIE2, IKEV2_NOTIFY_DEVICE_IDENTITY, IKEV2_NOTIFY_EAP_ONLY_AUTHENTICATION,
+    build_ike_sa_init_cookie_response, decode_ikev2_eap_only_authentication_notify,
+    extract_ike_sa_init_cookie_notify, Ikev2CookieNotify, Ikev2CookieNotifyBuildError,
+    Ikev2CookieNotifyExtractError, Ikev2EapOnlyAuthentication,
+    Ikev2EapOnlyAuthenticationNotifyError, Ikev2NotifyPayload, Ikev2NotifyPayloadError,
+    IKEV2_NOTIFY_AUTHENTICATION_FAILED, IKEV2_NOTIFY_AUTHORIZATION_REJECTED,
+    IKEV2_NOTIFY_CHILD_SA_NOT_FOUND, IKEV2_NOTIFY_COOKIE, IKEV2_NOTIFY_COOKIE2,
+    IKEV2_NOTIFY_DEVICE_IDENTITY, IKEV2_NOTIFY_EAP_ONLY_AUTHENTICATION,
     IKEV2_NOTIFY_FAILED_CP_REQUIRED, IKEV2_NOTIFY_INTERNAL_ADDRESS_FAILURE,
     IKEV2_NOTIFY_INVALID_IKE_SPI, IKEV2_NOTIFY_INVALID_KE_PAYLOAD,
     IKEV2_NOTIFY_INVALID_MAJOR_VERSION, IKEV2_NOTIFY_INVALID_MESSAGE_ID,
