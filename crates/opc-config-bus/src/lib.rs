@@ -45,10 +45,10 @@ pub use datastore::{
     CommittedRevisionSource, EncryptingManagedDatastore, InMemoryManagedDatastore,
     ManagedDatastore, MockManagedDatastore,
 };
-pub use subscribers::{ConfigReceiver, SubscriberLagPolicy};
+pub use subscribers::{ConfigReceiver, SubscriberDisconnectReason, SubscriberLagPolicy};
 pub use types::{
     AtomicConfigSnapshot, AuthorityMode, CommitWrite, CommitWriteReceipt, ConfigChange,
-    ConfigEvent, ConfigSnapshot, ConfirmedCommitResolution, DriftState, PublishedSnapshot,
-    SealedConfig, StoreError, StoreErrorCode, StoredConfig, StoredRequestFingerprint,
-    StoredRequestMode,
+    ConfigEvent, ConfigEventRetainedSizeError, ConfigSnapshot, ConfirmedCommitResolution,
+    DriftState, PublishedSnapshot, SealedConfig, StoreError, StoreErrorCode, StoredConfig,
+    StoredRequestFingerprint, StoredRequestMode,
 };

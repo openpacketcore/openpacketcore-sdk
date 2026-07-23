@@ -59,6 +59,33 @@ The port does not create another election, membership, or replication
 authority. `opc-config-bus-consensus` adapts the existing
 `ConsensusConfigStore` Openraft result to this port.
 
+## Subscriber Retained-Byte Budgets
+
+`ConfigBus::subscribe` remains the source- and behavior-compatible count-only
+API. `ConfigBus::subscribe_with_byte_budget` adds a conservative byte bound to
+the same per-subscriber queue and lag policies. Before enqueue, the bus charges
+the event's inline representation, both config snapshots, every delta, and
+changed-path inline/string capacities. It uses `OpcConfig`'s retained-size
+hooks without cloning or serializing config values. Checked arithmetic,
+unavailable estimates, and a single event larger than the entire budget are
+overflow conditions; no shallow fallback is used.
+
+`DropOldest` evicts as many old events as necessary before accepting an event
+that can fit, `DropNewest` rejects the incoming event, `DisconnectOnLag`
+preserves the already queued delivery order and closes before retaining the
+incoming event, and `ForceResync` clears the backlog and charges its replacement
+marker. If even that marker cannot fit, the subscriber closes. Dequeue and
+receiver drop release each queued charge exactly once. The value-free
+`SubscriberDisconnectReason` distinguishes count, byte, unavailable-size, and
+arithmetic-overflow failures.
+
+The configured value is a conservative accounting bound, not a strict
+allocator-resident-memory bound. Shared snapshot allocations are intentionally
+charged in full for every queued event, including an adjacent event's shared
+current/previous snapshot. Allocator metadata, `Arc` reference-count control
+blocks, the queue object's own fields, and `VecDeque` spare capacity are
+excluded.
+
 `EncryptingManagedDatastore` returns a `CommitWriteReceipt` containing the
 exact digest persisted with each new encrypted record. That SHA-256 value
 covers the complete plaintext envelope bytes: the format marker plus the

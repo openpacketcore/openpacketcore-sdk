@@ -830,6 +830,25 @@ impl<C: OpcConfig> Clone for ConfigChange<C> {
     }
 }
 
+/// Why a config event could not receive a conservative retained-size charge.
+///
+/// Variants deliberately carry no config values, paths, transaction
+/// identifiers, or subscriber identities, so they are safe to use in
+/// diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[non_exhaustive]
+pub enum ConfigEventRetainedSizeError {
+    /// The config type did not provide snapshot retained-size accounting.
+    #[error("config snapshot retained size is unavailable")]
+    SnapshotSizeUnavailable,
+    /// The config type did not provide retained-size accounting for a delta.
+    #[error("config delta retained size is unavailable")]
+    DeltaSizeUnavailable,
+    /// The sum of the event's retained components exceeded `usize`.
+    #[error("config event retained size overflowed")]
+    ArithmeticOverflow,
+}
+
 /// Subscriber notifications emitted by the config bus.
 #[derive(Clone)]
 pub enum ConfigEvent<C: OpcConfig> {
@@ -852,6 +871,53 @@ impl<C: OpcConfig> ConfigEvent<C> {
             Self::Change(change) => change.version,
             Self::ResyncRequired { latest_version } => *latest_version,
         }
+    }
+
+    /// Computes the conservative byte charge for retaining this event in a
+    /// subscriber queue without cloning or serializing its values.
+    ///
+    /// A change charges the event's inline representation, both snapshot
+    /// estimates supplied by [`OpcConfig`], every delta estimate, and each
+    /// changed path's inline value and string capacity. Shared allocations are
+    /// deliberately charged once per event occurrence. Allocator metadata,
+    /// reference-count control blocks, and queue spare capacity are excluded.
+    pub fn retained_size_bytes(&self) -> Result<usize, ConfigEventRetainedSizeError> {
+        let Self::Change(change) = self else {
+            return Ok(std::mem::size_of::<Self>());
+        };
+
+        let previous = change
+            .previous
+            .subscriber_snapshot_retained_size_bytes()
+            .ok_or(ConfigEventRetainedSizeError::SnapshotSizeUnavailable)?
+            .max(std::mem::size_of::<C>());
+        let current = change
+            .current
+            .subscriber_snapshot_retained_size_bytes()
+            .ok_or(ConfigEventRetainedSizeError::SnapshotSizeUnavailable)?
+            .max(std::mem::size_of::<C>());
+
+        let mut retained = std::mem::size_of::<Self>()
+            .checked_add(previous)
+            .and_then(|bytes| bytes.checked_add(current))
+            .ok_or(ConfigEventRetainedSizeError::ArithmeticOverflow)?;
+
+        for delta in change.deltas.iter() {
+            let delta = C::subscriber_delta_retained_size_bytes(delta)
+                .ok_or(ConfigEventRetainedSizeError::DeltaSizeUnavailable)?
+                .max(std::mem::size_of::<C::Delta>());
+            retained = retained
+                .checked_add(delta)
+                .ok_or(ConfigEventRetainedSizeError::ArithmeticOverflow)?;
+        }
+
+        for path in change.changed_paths.iter() {
+            retained = retained
+                .checked_add(path.retained_size_bytes())
+                .ok_or(ConfigEventRetainedSizeError::ArithmeticOverflow)?;
+        }
+
+        Ok(retained)
     }
 }
 

@@ -35,7 +35,21 @@ use opc_config_model::{CommitRequest, OpcConfig, RequestSource};
 `OpcConfig` implementors provide schema identity, syntax and semantic
 validation, diff/changed-path reporting, and candidate application. Optional
 `admission_payload_size_bytes` support lets the config bus reject oversized
-requests before expensive work.
+requests before expensive work. The optional
+`subscriber_snapshot_retained_size_bytes` and
+`subscriber_delta_retained_size_bytes` hooks provide conservative,
+allocation-free accounting for byte-budgeted subscriber queues. Each `Some`
+estimate includes the value's inline size and every owned heap allocation's
+capacity in bytes; for example, `Vec<T>` charges
+`capacity * size_of::<T>()` with checked or saturating arithmetic, plus nested
+allocations owned by initialized elements. Shared allocations are charged in
+full. Allocator metadata and reference-count control blocks are excluded.
+
+The retained-size hooks default to `None` for source compatibility. This does
+not mean zero bytes: a byte-budgeted subscriber treats an unavailable estimate
+as overflow and applies its lag policy. Existing `OpcConfig` implementations
+used with NETCONF notifications must implement both hooks before upgrading.
+Count-only `ConfigBus::subscribe` consumers are unchanged.
 
 ## Relationships
 

@@ -94,8 +94,13 @@ pub struct MgmtLimits {
     /// Maximum number of namespace declarations permitted on a single XML
     /// element.
     pub max_xml_namespace_decls: usize,
-    /// Maximum total bytes buffered for a single subscriber/notification queue
-    /// before the lag policy (drop/disconnect/resync) engages.
+    /// Maximum conservative retained-byte charge for a single
+    /// subscriber/notification queue before its lag policy
+    /// (drop/disconnect/resync) engages.
+    ///
+    /// Protocol implementations document the charged values and fixed
+    /// allocator/container overhead they exclude; this is not necessarily a
+    /// strict allocator-resident-memory measurement.
     pub max_subscriber_queue_bytes: usize,
     /// Maximum number of concurrent subscriptions a single session/connection
     /// may hold.

@@ -333,6 +333,15 @@ impl YangPath {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Returns the bytes retained by this path's value and owned string
+    /// allocation, excluding allocator metadata.
+    ///
+    /// Capacity rather than length is charged so a cleared or shortened path
+    /// cannot hide allocation retained by a queued change event.
+    pub fn retained_size_bytes(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(self.0.capacity())
+    }
 }
 
 impl fmt::Display for YangPath {
@@ -649,6 +658,35 @@ pub trait OpcConfig: Clone + Send + Sync + 'static {
     fn admission_payload_size_bytes(&self) -> Result<Option<usize>, ConfigError> {
         Ok(None)
     }
+    /// Returns a conservative byte charge for retaining this snapshot in a
+    /// subscriber queue.
+    ///
+    /// `Some` must include `size_of::<Self>()` plus the capacities **in bytes**
+    /// of every directly or indirectly owned heap allocation that this value
+    /// keeps alive. For example, a `Vec<T>` charges
+    /// `capacity * size_of::<T>()` with checked or saturating arithmetic, plus
+    /// heap allocations owned by its initialized elements. Shared allocations
+    /// are charged in full each time they appear; allocator metadata and
+    /// reference-count control blocks are excluded. Implementations must not
+    /// clone or serialize the config merely to measure it. The default `None`
+    /// preserves source compatibility and makes byte-budgeted subscribers
+    /// fail closed instead of using a shallow estimate.
+    fn subscriber_snapshot_retained_size_bytes(&self) -> Option<usize> {
+        None
+    }
+    /// Returns a conservative byte charge for retaining one structured delta
+    /// in a subscriber queue.
+    ///
+    /// `Some` follows the same contract as
+    /// [`Self::subscriber_snapshot_retained_size_bytes`]: it includes
+    /// `size_of::<Self::Delta>()` and all owned heap allocation capacities,
+    /// charges shared allocations in full, excludes allocator metadata and
+    /// reference-count control blocks, and performs no cloning or
+    /// serialization. The default `None` makes byte-budgeted subscribers fail
+    /// closed.
+    fn subscriber_delta_retained_size_bytes(_delta: &Self::Delta) -> Option<usize> {
+        None
+    }
     fn apply_delta(&mut self, delta: Self::Delta) -> Result<(), ConfigError>;
     fn validate_syntax(&self) -> Result<(), ValidationError>;
     fn validate_semantics(&self, ctx: &ValidationContext<Self>) -> Result<(), ValidationError>;
@@ -671,6 +709,12 @@ impl OpcConfig for () {
         _deltas: &[Self::Delta],
     ) -> Result<Vec<YangPath>, ConfigError> {
         Ok(vec![])
+    }
+    fn subscriber_snapshot_retained_size_bytes(&self) -> Option<usize> {
+        Some(std::mem::size_of::<Self>())
+    }
+    fn subscriber_delta_retained_size_bytes(_delta: &Self::Delta) -> Option<usize> {
+        Some(std::mem::size_of::<Self::Delta>())
     }
     fn apply_delta(&mut self, _delta: Self::Delta) -> Result<(), ConfigError> {
         Ok(())

@@ -357,11 +357,49 @@ impl<C: OpcConfig> ConfigBus<C> {
     /// to `lag_policy` — and never delays publication or other subscribers.
     /// Dropping the returned receiver unregisters the subscription.
     pub fn subscribe(&self, lag_policy: SubscriberLagPolicy, capacity: usize) -> ConfigReceiver<C> {
-        let subscriber = Arc::new(SubscriberState::new(lag_policy, capacity.max(1)));
-        self.subscribers
-            .lock()
-            .expect("subscriber list mutex poisoned")
-            .push(Arc::clone(&subscriber));
+        self.subscribe_inner(lag_policy, capacity, None)
+    }
+
+    /// Registers a change subscriber bounded by both event count and a
+    /// conservative retained-byte budget.
+    ///
+    /// Event charges come from [`ConfigEvent::retained_size_bytes`]. An
+    /// unavailable or overflowing config-provided estimate is treated as
+    /// overflow rather than falling back to shallow `size_of` accounting.
+    /// The lag policy is applied before the incoming event is accepted. A
+    /// zero byte budget therefore rejects every change event; callers that
+    /// expose a management limit should validate it as nonzero first.
+    ///
+    /// Existing [`Self::subscribe`] remains count-only for source and
+    /// behavioral compatibility.
+    pub fn subscribe_with_byte_budget(
+        &self,
+        lag_policy: SubscriberLagPolicy,
+        capacity: usize,
+        retained_byte_budget: usize,
+    ) -> ConfigReceiver<C> {
+        self.subscribe_inner(lag_policy, capacity, Some(retained_byte_budget))
+    }
+
+    fn subscribe_inner(
+        &self,
+        lag_policy: SubscriberLagPolicy,
+        capacity: usize,
+        retained_byte_budget: Option<usize>,
+    ) -> ConfigReceiver<C> {
+        let subscriber = Arc::new(SubscriberState::new(
+            lag_policy,
+            capacity.max(1),
+            retained_byte_budget,
+        ));
+        let mut subscribers = match self.subscribers.lock() {
+            Ok(subscribers) => subscribers,
+            Err(poisoned) => {
+                tracing::error!("recovering poisoned config subscriber-list state");
+                poisoned.into_inner()
+            }
+        };
+        subscribers.push(Arc::clone(&subscriber));
         ConfigReceiver { inner: subscriber }
     }
 
@@ -1472,8 +1510,17 @@ fn fanout<C: OpcConfig>(
         guard.clone()
     };
 
+    let event = ConfigEvent::Change(change);
+    let retained_size = if snapshot
+        .iter()
+        .any(|subscriber| subscriber.retained_byte_budget.is_some())
+    {
+        event.retained_size_bytes()
+    } else {
+        Ok(0)
+    };
     for subscriber in snapshot {
-        subscriber.enqueue(ConfigEvent::Change(change.clone()));
+        subscriber.enqueue_with_retained_size(event.clone(), retained_size);
     }
 }
 
@@ -1530,7 +1577,13 @@ async fn await_worker_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{fmt, sync::MutexGuard};
+    use std::{
+        fmt,
+        sync::{
+            atomic::{AtomicUsize, Ordering as AtomicOrdering},
+            MutexGuard,
+        },
+    };
     use tracing::{
         field::{Field, Visit},
         span::{Attributes, Id, Record},
@@ -1550,6 +1603,61 @@ mod tests {
 
     struct CaptureSubscriber {
         events: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[derive(Clone)]
+    struct CountingSizeConfig {
+        snapshot_calls: Arc<AtomicUsize>,
+    }
+
+    #[derive(Debug)]
+    struct CountingSizeDelta {
+        delta_calls: Arc<AtomicUsize>,
+    }
+
+    impl OpcConfig for CountingSizeConfig {
+        type Delta = CountingSizeDelta;
+
+        fn schema_digest(&self) -> opc_types::SchemaDigest {
+            opc_types::SchemaDigest::from_bytes([9; 32])
+        }
+
+        fn diff(&self, _previous: &Self) -> Result<Vec<Self::Delta>, ConfigError> {
+            Ok(Vec::new())
+        }
+
+        fn changed_paths(
+            &self,
+            _previous: &Self,
+            _deltas: &[Self::Delta],
+        ) -> Result<Vec<YangPath>, ConfigError> {
+            Ok(Vec::new())
+        }
+
+        fn subscriber_snapshot_retained_size_bytes(&self) -> Option<usize> {
+            self.snapshot_calls.fetch_add(1, AtomicOrdering::AcqRel);
+            Some(std::mem::size_of::<Self>())
+        }
+
+        fn subscriber_delta_retained_size_bytes(delta: &Self::Delta) -> Option<usize> {
+            delta.delta_calls.fetch_add(1, AtomicOrdering::AcqRel);
+            Some(std::mem::size_of::<Self::Delta>())
+        }
+
+        fn apply_delta(&mut self, _delta: Self::Delta) -> Result<(), ConfigError> {
+            Ok(())
+        }
+
+        fn validate_syntax(&self) -> Result<(), ValidationError> {
+            Ok(())
+        }
+
+        fn validate_semantics(
+            &self,
+            _ctx: &ValidationContext<Self>,
+        ) -> Result<(), ValidationError> {
+            Ok(())
+        }
     }
 
     impl CaptureSubscriber {
@@ -1621,6 +1729,57 @@ mod tests {
         assert!(!rendered.contains(secret));
         assert!(rendered.contains("<redacted>"));
         assert!(rendered.contains("internal"));
+    }
+
+    #[test]
+    fn fanout_sizes_one_event_once_for_multiple_byte_budgeted_subscribers() {
+        let snapshot_calls = Arc::new(AtomicUsize::new(0));
+        let delta_calls = Arc::new(AtomicUsize::new(0));
+        let change = ConfigChange {
+            tx_id: TxId::new(),
+            version: ConfigVersion::new(1),
+            previous: Arc::new(CountingSizeConfig {
+                snapshot_calls: Arc::clone(&snapshot_calls),
+            }),
+            current: Arc::new(CountingSizeConfig {
+                snapshot_calls: Arc::clone(&snapshot_calls),
+            }),
+            deltas: Arc::from([CountingSizeDelta {
+                delta_calls: Arc::clone(&delta_calls),
+            }]),
+            changed_paths: Arc::from([]),
+        };
+        let first = Arc::new(SubscriberState::new(
+            SubscriberLagPolicy::DisconnectOnLag,
+            4,
+            Some(usize::MAX),
+        ));
+        let second = Arc::new(SubscriberState::new(
+            SubscriberLagPolicy::DropNewest,
+            4,
+            Some(usize::MAX),
+        ));
+        let count_only = Arc::new(SubscriberState::new(
+            SubscriberLagPolicy::DropOldest,
+            4,
+            None,
+        ));
+        let subscribers = Arc::new(Mutex::new(vec![
+            Arc::clone(&first),
+            Arc::clone(&second),
+            Arc::clone(&count_only),
+        ]));
+
+        fanout(&subscribers, change);
+
+        assert_eq!(snapshot_calls.load(AtomicOrdering::Acquire), 2);
+        assert_eq!(delta_calls.load(AtomicOrdering::Acquire), 1);
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert_eq!(count_only.len(), 1);
+        assert!(first.retained_bytes() > 0);
+        assert_eq!(first.retained_bytes(), second.retained_bytes());
+        assert_eq!(count_only.retained_bytes(), 0);
     }
 
     #[tokio::test]
