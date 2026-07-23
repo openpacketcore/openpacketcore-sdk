@@ -21,7 +21,7 @@ app-gx = ["base"]
 app-rf = ["base"]
 app-s6a = ["base"]
 app-s6b = ["base"]
-app-swm = ["base"]
+app-swm = ["base", "dep:opc-proto-eap"]
 app-swx = ["base"]
 all-apps = ["app-gx", "app-rf", "app-s6a", "app-s6b", "app-swm", "app-swx"]
 
@@ -29,6 +29,7 @@ all-apps = ["app-gx", "app-rf", "app-s6a", "app-s6b", "app-swm", "app-swx"]
 bytes = { workspace = true }
 hmac = { workspace = true }
 opc-protocol = { path = "../opc-protocol", version = "0.2.0" }
+opc-proto-eap = { path = "../opc-proto-eap", version = "0.2.0", optional = true }
 opc-types = { path = "../opc-types", version = "0.2.0" }
 sha2 = { workspace = true }
 subtle = { workspace = true }

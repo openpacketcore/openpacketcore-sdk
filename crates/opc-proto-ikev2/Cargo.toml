@@ -30,6 +30,7 @@ bytes = { workspace = true }
 cbc = { workspace = true }
 crypto-bigint = { version = "0.7.5", features = ["getrandom", "zeroize"] }
 opc-crypto-provider = { path = "../opc-crypto-provider", version = "0.2.0" }
+opc-proto-eap = { path = "../opc-proto-eap", version = "0.2.0" }
 opc-protocol = { path = "../opc-protocol", version = "0.2.0" }
 opc-proto-tft = { path = "../opc-proto-tft", version = "0.2.0" }
 opc-types = { path = "../opc-types", version = "0.2.0" }

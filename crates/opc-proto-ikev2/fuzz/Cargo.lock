@@ -730,6 +730,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "opc-proto-eap"
+version = "0.2.0"
+dependencies = [
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "opc-proto-ikev2"
 version = "0.2.0"
 dependencies = [
@@ -740,6 +747,7 @@ dependencies = [
  "cbc",
  "crypto-bigint",
  "opc-crypto-provider",
+ "opc-proto-eap",
  "opc-proto-tft",
  "opc-protocol",
  "opc-types",

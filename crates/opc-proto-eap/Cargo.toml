@@ -1,0 +1,20 @@
+[package]
+name = "opc-proto-eap"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Typed, redaction-safe EAP-AKA and EAP-AKA-prime packet projection"
+readme = "README.md"
+documentation = "https://docs.rs/opc-proto-eap"
+keywords = ["eap", "aka", "3gpp", "telecom", "codec"]
+categories = ["network-programming", "encoding"]
+publish = false # experimental projection: not published until graduation
+
+[dependencies]
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

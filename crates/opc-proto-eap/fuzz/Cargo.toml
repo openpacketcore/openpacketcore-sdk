@@ -1,0 +1,19 @@
+[package]
+name = "opc-proto-eap-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+opc-proto-eap = { path = ".." }
+
+[workspace]
+
+[[bin]]
+name = "project_packet"
+path = "fuzz_targets/project_packet.rs"
+test = false

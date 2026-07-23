@@ -29,7 +29,8 @@
 //! opened-payload helpers for 3GPP TS 24.302 dedicated-bearer establishment,
 //! modification, deletion, and typed P-CSCF restoration `INFORMATIONAL`
 //! configuration exchange. It does not implement an IKE SA state machine,
-//! EAP-AKA, retransmission policy, cookie policy, Child SA installation, XFRM
+//! EAP-AKA cryptography/session state, retransmission policy, cookie policy,
+//! Child SA installation, XFRM
 //! programming, or any product-specific 3GPP ePDG policy.
 //!
 //! Network decoders follow RFC 7296 receiver rules through

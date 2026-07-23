@@ -17,10 +17,10 @@ provides a typed TS 24.302 P-CSCF restoration `INFORMATIONAL` boundary for
 forwarding a bounded valued IPv4/IPv6 address list and accepting only the
 required empty per-family `CFG_REPLY` echoes.
 
-It does not implement an IKE SA state machine, EAP-AKA, retransmission policy,
-cookie policy, Child SA lifecycle, XFRM/IPsec programming, bearer admission or
-allocation policy, carrier acceptance evidence, or a production ePDG
-control-plane stack.
+It does not implement an IKE SA state machine, EAP-AKA cryptography or session
+state, retransmission policy, cookie policy, Child SA lifecycle, XFRM/IPsec
+programming, bearer admission or allocation policy, carrier acceptance
+evidence, or a production ePDG control-plane stack.
 
 ## API Shape
 
@@ -31,6 +31,9 @@ control-plane stack.
   `PayloadType`, and ordinary or detailed payload-chain validation. The
   detailed boundary retains only an unknown critical payload's exact type and
   bounded chain offset; it never retains the payload body.
+- `Ikev2EapPayload::project_aka` explicitly opts a complete EAP payload into
+  the canonical `opc-proto-eap` Type 23/50 parser. It returns only bounded,
+  redaction-safe structural evidence. Generic EAP packets remain opaque.
 - `validation` exposes `Ikev2ValidationProfile`, separating conformant network
   receive behavior from opt-in sender-canonical fixture validation.
 - `crypto` defines the caller-supplied `CryptoProvider` boundary and protected
@@ -1103,9 +1106,9 @@ explicit non-goals.
 - Add independent-peer fixtures before claiming interoperability.
 - Continue adding typed cleartext payload bodies with octet-level fixture
   evidence.
-- Keep SA state machines, retransmission queues, cookie policy, EAP-AKA, SPI
-  allocation, Child SA installation, and ePDG product decisions outside this
-  crate.
+- Keep SA state machines, retransmission queues, cookie policy, EAP-AKA
+  cryptography/session state, SPI allocation, Child SA installation, and ePDG
+  product decisions outside this crate.
 
 ## Verification
 
