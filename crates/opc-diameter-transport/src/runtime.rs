@@ -1,7 +1,6 @@
 //! Bounded full-duplex runtime for an admitted Diameter peer connection.
 
 use std::fmt;
-use std::net::Shutdown;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -26,11 +25,13 @@ use opc_proto_diameter::peer::{
 };
 use opc_proto_diameter::OwnedMessage;
 use opc_protocol::{DecodeContext, ValidationLevel};
-use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot, watch, Mutex};
 use tokio::time::Instant;
 
-use crate::frame::{borrowed, encoded_bytes, read_runtime_frame, write_wire_frame};
+use crate::frame::{borrowed, decode_wire_frame, encoded_bytes, validate_wire_frame};
+use crate::frame_transport::{
+    ProtectedFrameReceiver, ProtectedFrameSender, ProtectedFrameTransportClose,
+};
 use crate::tls::{retirement_required, DiameterTlsRuntimeParts};
 use crate::{DiameterFrameLimits, DiameterTlsConnection, DiameterTlsError, DiameterTlsEvidence};
 
@@ -421,7 +422,7 @@ pub struct DiameterApplicationReceiver {
     pending: Option<DiameterApplicationMessage>,
     terminal: watch::Receiver<Option<DiameterPeerRuntimeError>>,
     core: Arc<RuntimeCore>,
-    shutdown: Arc<std::net::TcpStream>,
+    transport_close: Arc<dyn ProtectedFrameTransportClose>,
     closing: Arc<RuntimeClosing>,
 }
 
@@ -474,7 +475,7 @@ impl Drop for DiameterApplicationReceiver {
     fn drop(&mut self) {
         // A runtime without its sole application consumer cannot safely
         // discard a future admitted message while continuing watchdog traffic.
-        mark_closing(&self.closing, &self.shutdown);
+        mark_closing(&self.closing, &self.transport_close);
     }
 }
 
@@ -665,7 +666,7 @@ impl DiameterPeerHandle {
         write_deadline: Instant,
     ) -> Result<DeviceWatchdogAnswer, DiameterPeerRuntimeError> {
         let mut guard = SubmittedOperationGuard::new(
-            Arc::clone(&self.core.shutdown),
+            Arc::clone(&self.core.transport_close),
             Arc::clone(&self.core.closing),
         );
         let mut terminal = self.core.terminal.subscribe();
@@ -737,7 +738,7 @@ async fn await_submitted_result<T>(
     deadline: Instant,
 ) -> Result<T, DiameterPeerRuntimeError> {
     let mut guard =
-        SubmittedOperationGuard::new(Arc::clone(&core.shutdown), Arc::clone(&core.closing));
+        SubmittedOperationGuard::new(Arc::clone(&core.transport_close), Arc::clone(&core.closing));
     let mut terminal = core.terminal.subscribe();
     let outcome = tokio::select! {
         biased;
@@ -1048,7 +1049,7 @@ struct RuntimeState {
 struct RuntimeCore {
     state: Mutex<RuntimeState>,
     terminal: watch::Sender<Option<DiameterPeerRuntimeError>>,
-    shutdown: Arc<std::net::TcpStream>,
+    transport_close: Arc<dyn ProtectedFrameTransportClose>,
     closing: Arc<RuntimeClosing>,
     generation: PeerSessionGeneration,
     expected_peer: opc_proto_diameter::peer::PeerIdentity,
@@ -1190,13 +1191,13 @@ impl RuntimeCore {
         }
         let watchdog = state.pending_watchdog.take();
         let disconnect = state.pending_disconnect.take();
-        // Full-close the socket before publishing terminal state or completing
-        // a public operation. This ordering makes the observable terminal
-        // boundary synchronous rather than a promise that a supervisor will
-        // close it later.
-        let _ = self.shutdown.shutdown(Shutdown::Both);
+        // Full-close the transport before publishing terminal state or
+        // completing a public operation. This ordering makes the observable
+        // terminal boundary synchronous rather than a promise that a
+        // supervisor will close it later.
+        self.transport_close.close();
         state.terminal = Some(error);
-        // Complete every live operation after the socket and state are
+        // Complete every live operation after the transport and state are
         // terminal but before watch/closing wakeups. On a multi-thread
         // executor this prevents a later terminal notification from preempting
         // the operation result committed by this winner.
@@ -1284,17 +1285,17 @@ fn take_incarnation(next: &mut u64) -> Result<u64, DiameterPeerRuntimeError> {
 }
 
 struct RuntimeHandleLifetime {
-    shutdown: Arc<std::net::TcpStream>,
+    transport_close: Arc<dyn ProtectedFrameTransportClose>,
     closing: Arc<RuntimeClosing>,
 }
 
 struct RuntimeSupervisorLifetime {
-    shutdown: Arc<std::net::TcpStream>,
+    transport_close: Arc<dyn ProtectedFrameTransportClose>,
     closing: Arc<RuntimeClosing>,
 }
 
 struct SubmittedOperationGuard {
-    shutdown: Arc<std::net::TcpStream>,
+    transport_close: Arc<dyn ProtectedFrameTransportClose>,
     closing: Arc<RuntimeClosing>,
     armed: bool,
 }
@@ -1328,9 +1329,12 @@ impl RuntimeClosing {
 }
 
 impl SubmittedOperationGuard {
-    fn new(shutdown: Arc<std::net::TcpStream>, closing: Arc<RuntimeClosing>) -> Self {
+    fn new(
+        transport_close: Arc<dyn ProtectedFrameTransportClose>,
+        closing: Arc<RuntimeClosing>,
+    ) -> Self {
         Self {
-            shutdown,
+            transport_close,
             closing,
             armed: true,
         }
@@ -1344,14 +1348,14 @@ impl SubmittedOperationGuard {
 impl Drop for SubmittedOperationGuard {
     fn drop(&mut self) {
         if self.armed {
-            mark_closing(&self.closing, &self.shutdown);
+            mark_closing(&self.closing, &self.transport_close);
         }
     }
 }
 
 impl Drop for RuntimeHandleLifetime {
     fn drop(&mut self) {
-        mark_closing(&self.closing, &self.shutdown);
+        mark_closing(&self.closing, &self.transport_close);
     }
 }
 
@@ -1360,13 +1364,13 @@ impl Drop for RuntimeSupervisorLifetime {
         // A dropped Tokio runtime aborts the reader, writer, and supervisor
         // together. Publish a synchronous closure marker from the supervisor
         // future's owned guard even when that future is never polled again.
-        mark_closing(&self.closing, &self.shutdown);
+        mark_closing(&self.closing, &self.transport_close);
     }
 }
 
-fn mark_closing(closing: &RuntimeClosing, shutdown: &std::net::TcpStream) {
+fn mark_closing(closing: &RuntimeClosing, transport_close: &Arc<dyn ProtectedFrameTransportClose>) {
     closing.mark();
-    let _ = shutdown.shutdown(Shutdown::Both);
+    transport_close.close();
 }
 
 fn start_runtime(
@@ -1375,8 +1379,7 @@ fn start_runtime(
     runtime: &tokio::runtime::Handle,
 ) -> Result<DiameterPeerRuntime, DiameterPeerRuntimeError> {
     let DiameterTlsRuntimeParts {
-        io,
-        shutdown,
+        frame_transport,
         session,
         generation,
         evidence,
@@ -1387,6 +1390,7 @@ fn start_runtime(
         retired,
         retirement_task,
     } = parts;
+    let (frame_receiver, frame_sender, transport_close) = frame_transport.into_parts();
     let admitted_epoch = evidence.material_epoch();
     let (terminal_tx, terminal_rx) = watch::channel(None);
     let closing = Arc::new(RuntimeClosing::new());
@@ -1407,7 +1411,7 @@ fn start_runtime(
             application_quiesced: false,
         }),
         terminal: terminal_tx,
-        shutdown: Arc::clone(&shutdown),
+        transport_close: Arc::clone(&transport_close),
         closing: Arc::clone(&closing),
         generation,
         expected_peer: expected_peer.diameter_identity().clone(),
@@ -1423,12 +1427,10 @@ fn start_runtime(
     let (commands_tx, commands_rx) = mpsc::channel(config.command_queue_capacity.get());
     let (control_tx, control_rx) = mpsc::channel(config.control_queue_capacity.get());
     let (applications_tx, applications_rx) = mpsc::channel(config.application_queue_capacity.get());
-    let (reader, writer) = tokio::io::split(io);
-
     let reader_core = Arc::clone(&core);
     let mut reader_task = runtime.spawn(async move {
         let outcome = reader_loop(
-            reader,
+            frame_receiver,
             Arc::clone(&reader_core),
             control_tx,
             applications_tx,
@@ -1438,12 +1440,18 @@ fn start_runtime(
     });
     let writer_core = Arc::clone(&core);
     let mut writer_task = runtime.spawn(async move {
-        let outcome = writer_loop(writer, Arc::clone(&writer_core), commands_rx, control_rx).await;
+        let outcome = writer_loop(
+            frame_sender,
+            Arc::clone(&writer_core),
+            commands_rx,
+            control_rx,
+        )
+        .await;
         finish_runtime_task(&writer_core, outcome).await
     });
     let supervisor_core = Arc::clone(&core);
     let supervisor_lifetime = RuntimeSupervisorLifetime {
-        shutdown: Arc::clone(&shutdown),
+        transport_close: Arc::clone(&transport_close),
         closing: Arc::clone(&closing),
     };
     runtime.spawn(async move {
@@ -1480,7 +1488,7 @@ fn start_runtime(
     });
 
     let handle_lifetime = Arc::new(RuntimeHandleLifetime {
-        shutdown: Arc::clone(&shutdown),
+        transport_close: Arc::clone(&transport_close),
         closing: Arc::clone(&closing),
     });
     Ok(DiameterPeerRuntime {
@@ -1495,7 +1503,7 @@ fn start_runtime(
             pending: None,
             terminal: terminal_rx,
             core: Arc::clone(&core),
-            shutdown,
+            transport_close,
             closing,
         },
     })
@@ -1515,25 +1523,30 @@ async fn finish_runtime_task(
     Err(winner)
 }
 
-async fn reader_loop<R>(
-    mut reader: R,
+async fn reader_loop(
+    mut receiver: Box<dyn ProtectedFrameReceiver>,
     core: Arc<RuntimeCore>,
     control: mpsc::Sender<ControlCommand>,
     applications: mpsc::Sender<DiameterApplicationMessage>,
-) -> Result<(), DiameterPeerRuntimeError>
-where
-    R: AsyncRead + Unpin,
-{
+) -> Result<(), DiameterPeerRuntimeError> {
     loop {
         core.ensure_active().await?;
-        let message = read_runtime_frame(
-            &mut reader,
-            core.frame_limits,
-            core.frame_completion_timeout,
+        if Instant::now() >= core.hard_deadline {
+            return Err(core.classify_transport(DiameterTlsError::DeadlineExceeded));
+        }
+        let wire = tokio::time::timeout_at(
             core.hard_deadline,
+            receiver.receive_frame(
+                core.frame_limits,
+                core.frame_completion_timeout,
+                core.hard_deadline,
+            ),
         )
         .await
+        .map_err(|_| core.classify_transport(DiameterTlsError::DeadlineExceeded))?
         .map_err(|error| core.classify_transport(error))?;
+        let message = decode_wire_frame(wire, core.frame_limits)
+            .map_err(|error| core.classify_transport(error))?;
         // RFC 3539 resets Tw for every structurally valid received Diameter
         // message, including transport-owned commands consumed below.
         core.observe_inbound_activity().await?;
@@ -1909,11 +1922,11 @@ async fn handle_disconnect_answer(
         };
         let intended = DiameterPeerRuntimeError::PeerDisconnected { peer_cause: None };
         // Linearize successful local disconnect completion while holding the
-        // same state lock used by every competing terminator. TCP is closed
-        // before success becomes public; the exact result becomes ready before
-        // terminal/closing watches wake, so the caller cannot observe a false
-        // disconnect failure after receiving a valid correlated DPA.
-        let _ = core.shutdown.shutdown(Shutdown::Both);
+        // same state lock used by every competing terminator. The transport is
+        // closed before success becomes public; the exact result becomes ready
+        // before terminal/closing watches wake, so the caller cannot observe a
+        // false disconnect failure after receiving a valid correlated DPA.
+        core.transport_close.close();
         state.terminal = Some(intended);
         if let Some(result) = pending.superseded_watchdog.take() {
             let _ = result.send(Err(
@@ -1927,15 +1940,12 @@ async fn handle_disconnect_answer(
     Ok(true)
 }
 
-async fn writer_loop<W>(
-    mut writer: W,
+async fn writer_loop(
+    mut sender: Box<dyn ProtectedFrameSender>,
     core: Arc<RuntimeCore>,
     mut commands: mpsc::Receiver<WriterCommand>,
     mut control: mpsc::Receiver<ControlCommand>,
-) -> Result<(), DiameterPeerRuntimeError>
-where
-    W: AsyncWrite + Unpin,
-{
+) -> Result<(), DiameterPeerRuntimeError> {
     let mut terminal = core.terminal.subscribe();
     loop {
         core.ensure_active().await?;
@@ -1955,26 +1965,23 @@ where
                     // that cause instead of racing it with a generic Closed.
                     return wait_for_terminal(&core, &mut terminal).await;
                 };
-                write_control(&mut writer, &core, command).await?;
+                write_control(&mut *sender, &core, command).await?;
             }
             command = commands.recv() => {
                 let Some(command) = command else {
                     return Err(DiameterPeerRuntimeError::Closed);
                 };
-                write_command(&mut writer, &core, command).await?;
+                write_command(&mut *sender, &core, command).await?;
             }
         }
     }
 }
 
-async fn write_control<W>(
-    writer: &mut W,
+async fn write_control(
+    sender: &mut dyn ProtectedFrameSender,
     core: &Arc<RuntimeCore>,
     command: ControlCommand,
-) -> Result<(), DiameterPeerRuntimeError>
-where
-    W: AsyncWrite + Unpin,
-{
+) -> Result<(), DiameterPeerRuntimeError> {
     match command {
         ControlCommand::Watchdog {
             message,
@@ -1984,7 +1991,7 @@ where
             if !authority.authorizes(core.generation, &message) {
                 return Err(DiameterPeerRuntimeError::CommandNotAdmitted);
             }
-            write_runtime_frame(writer, core, &message, deadline)
+            write_runtime_frame(sender, core, &message, deadline)
                 .await
                 .map(drop)
         }
@@ -1992,7 +1999,7 @@ where
             message,
             deadline,
             completion,
-        } => match write_runtime_frame(writer, core, &message, deadline).await {
+        } => match write_runtime_frame(sender, core, &message, deadline).await {
             Ok(mut state) => {
                 let terminal = DiameterPeerRuntimeError::InvalidControlMessage;
                 let _ = core.terminate_locked_with(&mut state, terminal, true, || {
@@ -2028,7 +2035,7 @@ where
                     .disconnect_answer_sent_on(core.generation, &message.header, &answer)
                     .map_err(|_| DiameterPeerRuntimeError::CommandNotAdmitted)?;
             }
-            match write_runtime_frame(writer, core, &message, deadline).await {
+            match write_runtime_frame(sender, core, &message, deadline).await {
                 Ok(mut state) => {
                     let terminal = DiameterPeerRuntimeError::PeerDisconnected {
                         peer_cause: Some(peer_cause),
@@ -2058,14 +2065,11 @@ where
     }
 }
 
-async fn write_command<W>(
-    writer: &mut W,
+async fn write_command(
+    sender: &mut dyn ProtectedFrameSender,
     core: &Arc<RuntimeCore>,
     command: WriterCommand,
-) -> Result<(), DiameterPeerRuntimeError>
-where
-    W: AsyncWrite + Unpin,
-{
+) -> Result<(), DiameterPeerRuntimeError> {
     match command {
         WriterCommand::Application {
             message,
@@ -2106,7 +2110,7 @@ where
                 state.application_quiesced = false;
                 (admission, wire)
             };
-            match write_runtime_wire_frame(writer, core, &wire, deadline).await {
+            match write_runtime_wire_frame(sender, core, &wire, deadline).await {
                 Ok(state) => {
                     // Commit success under the first post-flush state guard.
                     // A deadline queued behind this guard must observe the
@@ -2189,7 +2193,7 @@ where
                 (message, incarnation, timer)
             };
             let (message, incarnation, mut timer) = prepared;
-            let mut state = write_runtime_frame(writer, core, &message, write_deadline).await?;
+            let mut state = write_runtime_frame(sender, core, &message, write_deadline).await?;
             let deadline = jittered_watchdog_deadline(Instant::now(), twinit, core.hard_deadline);
             let should_start = if let Some(pending) = state
                 .pending_watchdog
@@ -2273,7 +2277,7 @@ where
                 (message, incarnation)
             };
             let (message, incarnation) = message;
-            let mut state = write_runtime_frame(writer, core, &message, deadline).await?;
+            let mut state = write_runtime_frame(sender, core, &message, deadline).await?;
             let superseded = state
                 .pending_disconnect
                 .as_mut()
@@ -2294,15 +2298,12 @@ where
     }
 }
 
-async fn write_runtime_frame<'a, W>(
-    writer: &mut W,
+async fn write_runtime_frame<'a>(
+    sender: &mut dyn ProtectedFrameSender,
     core: &'a RuntimeCore,
     message: &OwnedMessage,
     deadline: Instant,
-) -> Result<tokio::sync::MutexGuard<'a, RuntimeState>, DiameterPeerRuntimeError>
-where
-    W: AsyncWrite + Unpin,
-{
+) -> Result<tokio::sync::MutexGuard<'a, RuntimeState>, DiameterPeerRuntimeError> {
     let state = core.active_state().await?;
     let wire = match encoded_bytes(message, core.frame_limits) {
         Ok(wire) => wire,
@@ -2314,18 +2315,15 @@ where
         }
     };
     drop(state);
-    write_runtime_wire_frame(writer, core, &wire, deadline).await
+    write_runtime_wire_frame(sender, core, &wire, deadline).await
 }
 
-async fn write_runtime_wire_frame<'a, W>(
-    writer: &mut W,
+async fn write_runtime_wire_frame<'a>(
+    sender: &mut dyn ProtectedFrameSender,
     core: &'a RuntimeCore,
     wire: &[u8],
     deadline: Instant,
-) -> Result<tokio::sync::MutexGuard<'a, RuntimeState>, DiameterPeerRuntimeError>
-where
-    W: AsyncWrite + Unpin,
-{
+) -> Result<tokio::sync::MutexGuard<'a, RuntimeState>, DiameterPeerRuntimeError> {
     drop(core.active_state().await?);
     let deadline = deadline.min(bounded_operation_deadline(
         Instant::now(),
@@ -2336,7 +2334,20 @@ where
         let contender = core.classify_write_deadline();
         return Err(core.terminate(contender, true).await);
     }
-    if let Err(error) = write_wire_frame(writer, wire, core.frame_limits, deadline).await {
+    if let Err(error) = validate_wire_frame(wire, core.frame_limits) {
+        let contender = core.classify_transport(error);
+        return Err(core.terminate(contender, true).await);
+    }
+    let emission = tokio::time::timeout_at(
+        deadline,
+        sender.send_frame(wire, core.frame_limits, deadline),
+    )
+    .await;
+    let emission = match emission {
+        Ok(emission) => emission,
+        Err(_) => Err(DiameterTlsError::DeadlineExceeded),
+    };
+    if let Err(error) = emission {
         let contender = match error {
             DiameterTlsError::DeadlineExceeded => core.classify_write_deadline(),
             other => core.classify_transport(other),
@@ -2532,119 +2543,144 @@ fn ensure_expected_identity(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+    use std::sync::atomic::AtomicUsize;
 
-    struct BrokenPipeAfterRelease {
+    use crate::frame_transport::{FrameTransportFuture, ProtectedFrameTransportParts};
+    use opc_protocol::OwnedDecode;
+
+    struct UncertainFrameSender {
         first_poll: Option<oneshot::Sender<()>>,
         failure_poll: Option<oneshot::Sender<()>>,
         released: Arc<AtomicBool>,
-        waiter: Arc<std::sync::Mutex<Option<std::task::Waker>>>,
+        release: Arc<tokio::sync::Notify>,
     }
 
-    struct BrokenPipeRelease {
+    struct UncertainFrameRelease {
         released: Arc<AtomicBool>,
-        waiter: Arc<std::sync::Mutex<Option<std::task::Waker>>>,
+        release: Arc<tokio::sync::Notify>,
     }
 
-    struct NeverReadyWriter;
+    struct NeverReadyFrameSender;
 
-    impl BrokenPipeAfterRelease {
+    struct CapturingFrameSender {
+        frames: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    }
+
+    struct ScriptedFrameReceiver {
+        frames: VecDeque<Result<bytes::Bytes, DiameterTlsError>>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[derive(Default)]
+    struct TestTransportClose {
+        closed: AtomicBool,
+        calls: AtomicUsize,
+    }
+
+    impl ProtectedFrameTransportClose for TestTransportClose {
+        fn close(&self) {
+            if !self.closed.swap(true, Ordering::AcqRel) {
+                self.calls.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+    }
+
+    impl UncertainFrameSender {
         fn new() -> (
             Self,
-            BrokenPipeRelease,
+            UncertainFrameRelease,
             oneshot::Receiver<()>,
             oneshot::Receiver<()>,
         ) {
             let (first_poll, first_polled) = oneshot::channel();
             let (failure_poll, failure_polled) = oneshot::channel();
             let released = Arc::new(AtomicBool::new(false));
-            let waiter = Arc::new(std::sync::Mutex::new(None));
+            let release = Arc::new(tokio::sync::Notify::new());
             (
                 Self {
                     first_poll: Some(first_poll),
                     failure_poll: Some(failure_poll),
                     released: Arc::clone(&released),
-                    waiter: Arc::clone(&waiter),
+                    release: Arc::clone(&release),
                 },
-                BrokenPipeRelease { released, waiter },
+                UncertainFrameRelease { released, release },
                 first_polled,
                 failure_polled,
             )
         }
     }
 
-    impl BrokenPipeRelease {
+    impl UncertainFrameRelease {
         fn release(&self) {
             self.released.store(true, Ordering::Release);
-            let waiter = self
-                .waiter
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take();
-            if let Some(waiter) = waiter {
-                waiter.wake();
-            }
+            self.release.notify_waiters();
         }
     }
 
-    impl AsyncWrite for BrokenPipeAfterRelease {
-        fn poll_write(
-            mut self: std::pin::Pin<&mut Self>,
-            context: &mut std::task::Context<'_>,
-            _buffer: &[u8],
-        ) -> std::task::Poll<std::io::Result<usize>> {
-            if !self.released.load(Ordering::Acquire) {
+    impl ProtectedFrameSender for UncertainFrameSender {
+        fn send_frame<'a>(
+            &'a mut self,
+            _wire: &'a [u8],
+            _limits: DiameterFrameLimits,
+            _deadline: Instant,
+        ) -> FrameTransportFuture<'a, ()> {
+            Box::pin(async move {
                 if let Some(first_poll) = self.first_poll.take() {
                     let _ = first_poll.send(());
                 }
-                *self
-                    .waiter
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                    Some(context.waker().clone());
-                return std::task::Poll::Pending;
-            }
-            if let Some(failure_poll) = self.failure_poll.take() {
-                let _ = failure_poll.send(());
-            }
-            std::task::Poll::Ready(Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)))
-        }
-
-        fn poll_flush(
-            self: std::pin::Pin<&mut Self>,
-            _context: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<std::io::Result<()>> {
-            std::task::Poll::Ready(Ok(()))
-        }
-
-        fn poll_shutdown(
-            self: std::pin::Pin<&mut Self>,
-            _context: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<std::io::Result<()>> {
-            std::task::Poll::Ready(Ok(()))
+                let released = self.release.notified();
+                if !self.released.load(Ordering::Acquire) {
+                    released.await;
+                }
+                if let Some(failure_poll) = self.failure_poll.take() {
+                    let _ = failure_poll.send(());
+                }
+                Err(DiameterTlsError::Transport)
+            })
         }
     }
 
-    impl AsyncWrite for NeverReadyWriter {
-        fn poll_write(
-            self: std::pin::Pin<&mut Self>,
-            _context: &mut std::task::Context<'_>,
-            _buffer: &[u8],
-        ) -> std::task::Poll<std::io::Result<usize>> {
-            std::task::Poll::Pending
+    impl ProtectedFrameSender for NeverReadyFrameSender {
+        fn send_frame<'a>(
+            &'a mut self,
+            _wire: &'a [u8],
+            _limits: DiameterFrameLimits,
+            _deadline: Instant,
+        ) -> FrameTransportFuture<'a, ()> {
+            Box::pin(std::future::pending())
         }
+    }
 
-        fn poll_flush(
-            self: std::pin::Pin<&mut Self>,
-            _context: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<std::io::Result<()>> {
-            std::task::Poll::Ready(Ok(()))
+    impl ProtectedFrameSender for CapturingFrameSender {
+        fn send_frame<'a>(
+            &'a mut self,
+            wire: &'a [u8],
+            _limits: DiameterFrameLimits,
+            _deadline: Instant,
+        ) -> FrameTransportFuture<'a, ()> {
+            let mut frames = self
+                .frames
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            frames.push(wire.to_vec());
+            Box::pin(std::future::ready(Ok(())))
         }
+    }
 
-        fn poll_shutdown(
-            self: std::pin::Pin<&mut Self>,
-            _context: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<std::io::Result<()>> {
-            std::task::Poll::Ready(Ok(()))
+    impl ProtectedFrameReceiver for ScriptedFrameReceiver {
+        fn receive_frame(
+            &mut self,
+            _limits: DiameterFrameLimits,
+            _completion_timeout: Duration,
+            _hard_deadline: Instant,
+        ) -> FrameTransportFuture<'_, bytes::Bytes> {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            let result = self
+                .frames
+                .pop_front()
+                .unwrap_or(Err(DiameterTlsError::Transport));
+            Box::pin(std::future::ready(result))
         }
     }
 
@@ -2685,22 +2721,10 @@ mod tests {
         .expect("build valid test identity state")
     }
 
-    fn test_tcp_pair() -> (std::net::TcpStream, std::net::TcpStream) {
-        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-            .expect("bind test TCP listener");
-        let address = listener.local_addr().expect("read test listener address");
-        let connector = std::thread::spawn(move || {
-            std::net::TcpStream::connect(address).expect("connect test TCP")
-        });
-        let (accepted, _) = listener.accept().expect("accept test TCP");
-        let connected = connector.join().expect("join test TCP connector");
-        (accepted, connected)
-    }
-
     fn test_runtime_core() -> (
         Arc<RuntimeCore>,
         watch::Sender<Option<opc_identity::IdentityState>>,
-        std::net::TcpStream,
+        Arc<TestTransportClose>,
     ) {
         test_runtime_core_with_hard_deadline(Instant::now() + Duration::from_secs(60))
     }
@@ -2710,7 +2734,7 @@ mod tests {
     ) -> (
         Arc<RuntimeCore>,
         watch::Sender<Option<opc_identity::IdentityState>>,
-        std::net::TcpStream,
+        Arc<TestTransportClose>,
     ) {
         let (material_source, material_rx) = watch::channel(Some(test_identity_state()));
         let material_controller = opc_tls::TlsMaterialController::new(material_rx);
@@ -2762,7 +2786,9 @@ mod tests {
             },
         );
 
-        let (shutdown, connected_peer) = test_tcp_pair();
+        let transport_close = Arc::new(TestTransportClose::default());
+        let runtime_transport_close: Arc<dyn ProtectedFrameTransportClose> =
+            transport_close.clone();
         let (terminal, _) = watch::channel(None);
         let started_at = Instant::now();
         let core = Arc::new(RuntimeCore {
@@ -2781,7 +2807,7 @@ mod tests {
                 application_quiesced: false,
             }),
             terminal,
-            shutdown: Arc::new(shutdown),
+            transport_close: runtime_transport_close,
             closing: Arc::new(RuntimeClosing::new()),
             generation,
             expected_peer,
@@ -2794,7 +2820,7 @@ mod tests {
             frame_completion_timeout: Duration::from_secs(5),
             max_frame_write_duration: Duration::from_secs(5),
         });
-        (core, material_source, connected_peer)
+        (core, material_source, transport_close)
     }
 
     fn test_capacity() -> NonZeroUsize {
@@ -2959,9 +2985,223 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_failure_returns_the_authoritative_terminal_winner() {
-        let (core, _material_source, _connected_peer) = test_runtime_core();
-        let (mut writer, release, first_polled, failure_polled) = BrokenPipeAfterRelease::new();
+    async fn abstract_frame_transport_preserves_complete_message_boundaries() {
+        let first = OwnedMessage {
+            header: opc_proto_diameter::Header::new(
+                opc_proto_diameter::CommandFlags::request(true),
+                opc_proto_diameter::CommandCode::new(268),
+                opc_proto_diameter::ApplicationId::new(1),
+                11,
+                13,
+            ),
+            raw_avps: bytes::Bytes::new(),
+        };
+        let second = OwnedMessage {
+            header: opc_proto_diameter::Header::new(
+                opc_proto_diameter::CommandFlags::answer(false, false),
+                opc_proto_diameter::CommandCode::new(268),
+                opc_proto_diameter::ApplicationId::new(1),
+                17,
+                19,
+            ),
+            raw_avps: bytes::Bytes::new(),
+        };
+        let receive_calls = Arc::new(AtomicUsize::new(0));
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let close = Arc::new(TestTransportClose::default());
+        let runtime_close: Arc<dyn ProtectedFrameTransportClose> = close.clone();
+        let limits = DiameterFrameLimits::default();
+        let first_wire = encoded_bytes(&first, limits).expect("encode first fake frame");
+        let second_wire = encoded_bytes(&second, limits).expect("encode second fake frame");
+        let parts = ProtectedFrameTransportParts::new(
+            Box::new(ScriptedFrameReceiver {
+                frames: VecDeque::from([
+                    Ok(bytes::Bytes::copy_from_slice(&first_wire)),
+                    Ok(bytes::Bytes::copy_from_slice(&second_wire)),
+                ]),
+                calls: Arc::clone(&receive_calls),
+            }),
+            Box::new(CapturingFrameSender {
+                frames: Arc::clone(&captured),
+            }),
+            runtime_close,
+        );
+        let (mut receiver, mut sender, transport_close) = parts.into_parts();
+        let hard_deadline = Instant::now() + Duration::from_secs(1);
+
+        assert_eq!(
+            receiver
+                .receive_frame(limits, Duration::from_secs(1), hard_deadline)
+                .await,
+            Ok(bytes::Bytes::copy_from_slice(&first_wire))
+        );
+        assert_eq!(
+            receiver
+                .receive_frame(limits, Duration::from_secs(1), hard_deadline)
+                .await,
+            Ok(bytes::Bytes::copy_from_slice(&second_wire))
+        );
+        sender
+            .send_frame(&first_wire, limits, hard_deadline)
+            .await
+            .expect("send first fake frame");
+        sender
+            .send_frame(&second_wire, limits, hard_deadline)
+            .await
+            .expect("send second fake frame");
+
+        assert_eq!(receive_calls.load(Ordering::Acquire), 2);
+        let frames = captured
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(frames.len(), 2);
+        assert_eq!(
+            OwnedMessage::decode_owned(
+                bytes::Bytes::from(frames[0].clone()),
+                limits.decode_context()
+            )
+            .expect("decode first captured frame"),
+            first
+        );
+        assert_eq!(
+            OwnedMessage::decode_owned(
+                bytes::Bytes::from(frames[1].clone()),
+                limits.decode_context()
+            )
+            .expect("decode second captured frame"),
+            second
+        );
+        drop(frames);
+        transport_close.close();
+        assert!(close.closed.load(Ordering::Acquire));
+        assert_eq!(close.calls.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn runtime_preserves_fake_frame_boundaries_and_rejects_invalid_wire() {
+        let (core, _material_source, _transport_close) = test_runtime_core();
+        let limits = core.frame_limits;
+        let first = OwnedMessage {
+            header: opc_proto_diameter::Header::new(
+                opc_proto_diameter::CommandFlags::request(true),
+                opc_proto_diameter::CommandCode::new(268),
+                opc_proto_diameter::ApplicationId::new(1),
+                23,
+                29,
+            ),
+            raw_avps: bytes::Bytes::new(),
+        };
+        let second = OwnedMessage {
+            header: opc_proto_diameter::Header::new(
+                opc_proto_diameter::CommandFlags::answer(false, false),
+                opc_proto_diameter::CommandCode::new(268),
+                opc_proto_diameter::ApplicationId::new(1),
+                31,
+                37,
+            ),
+            raw_avps: bytes::Bytes::new(),
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let valid_trailing_wire =
+            encoded_bytes(&first, limits).expect("encode trailing runtime frame");
+        let mut trailing_wire = bytes::BytesMut::from(valid_trailing_wire.as_ref());
+        trailing_wire.extend_from_slice(&[0]);
+        let receiver = ScriptedFrameReceiver {
+            frames: VecDeque::from([
+                Ok(bytes::Bytes::copy_from_slice(
+                    &encoded_bytes(&first, limits).expect("encode first runtime frame"),
+                )),
+                Ok(bytes::Bytes::copy_from_slice(
+                    &encoded_bytes(&second, limits).expect("encode second runtime frame"),
+                )),
+                Ok(trailing_wire.freeze()),
+            ]),
+            calls: Arc::clone(&calls),
+        };
+        let (control, _control_receiver) = mpsc::channel(1);
+        let (applications, mut application_receiver) = mpsc::channel(2);
+
+        assert_eq!(
+            reader_loop(Box::new(receiver), core, control, applications).await,
+            Err(DiameterPeerRuntimeError::Transport(
+                DiameterTlsError::InvalidFrame
+            ))
+        );
+        assert_eq!(calls.load(Ordering::Acquire), 3);
+        assert_eq!(
+            application_receiver
+                .recv()
+                .await
+                .expect("receive first bounded application frame")
+                .into_message(),
+            first
+        );
+        assert_eq!(
+            application_receiver
+                .recv()
+                .await
+                .expect("receive second bounded application frame")
+                .into_message(),
+            second
+        );
+        assert!(application_receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn runtime_rejects_invalid_outbound_wire_before_transport_poll() {
+        let (core, _material_source, transport_close) = test_runtime_core();
+        let message = OwnedMessage {
+            header: opc_proto_diameter::Header::new(
+                opc_proto_diameter::CommandFlags::request(true),
+                opc_proto_diameter::CommandCode::new(268),
+                opc_proto_diameter::ApplicationId::new(1),
+                41,
+                43,
+            ),
+            raw_avps: bytes::Bytes::new(),
+        };
+        let mut invalid_wire =
+            encoded_bytes(&message, core.frame_limits).expect("encode invalid outbound fixture");
+        invalid_wire = {
+            let mut bytes = bytes::BytesMut::from(invalid_wire.as_ref());
+            bytes.extend_from_slice(&[0]);
+            bytes.freeze()
+        };
+        let frames = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut sender = CapturingFrameSender {
+            frames: Arc::clone(&frames),
+        };
+
+        let error = match write_runtime_wire_frame(
+            &mut sender,
+            &core,
+            &invalid_wire,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        {
+            Ok(_) => panic!("invalid outbound frame must fail before transport emission"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error,
+            DiameterPeerRuntimeError::Transport(DiameterTlsError::InvalidFrame)
+        );
+        assert!(
+            frames
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "invalid outbound wire must not reach the transport"
+        );
+        assert!(transport_close.closed.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn uncertain_frame_send_returns_terminal_winner_and_closes_transport() {
+        let (core, _material_source, transport_close) = test_runtime_core();
+        let (mut sender, release, first_polled, failure_polled) = UncertainFrameSender::new();
         let message = OwnedMessage {
             header: opc_proto_diameter::Header::new(
                 opc_proto_diameter::CommandFlags::request(true),
@@ -2975,7 +3215,7 @@ mod tests {
         let write_core = Arc::clone(&core);
         let write_task = tokio::spawn(async move {
             write_runtime_frame(
-                &mut writer,
+                &mut sender,
                 &write_core,
                 &message,
                 Instant::now() + Duration::from_secs(30),
@@ -3018,12 +3258,13 @@ mod tests {
             core.terminal_error(),
             DiameterPeerRuntimeError::ProtocolViolation
         );
+        assert!(transport_close.closed.load(Ordering::Acquire));
     }
 
     #[tokio::test(start_paused = true)]
-    async fn hard_deadline_write_timeout_is_classified_as_retirement() {
+    async fn frame_send_hard_deadline_retires_and_closes_transport() {
         let hard_deadline = Instant::now() + Duration::from_secs(1);
-        let (core, _material_source, _connected_peer) =
+        let (core, _material_source, transport_close) =
             test_runtime_core_with_hard_deadline(hard_deadline);
         let message = OwnedMessage {
             header: opc_proto_diameter::Header::new(
@@ -3036,9 +3277,9 @@ mod tests {
             raw_avps: bytes::Bytes::new(),
         };
         let wire = encoded_bytes(&message, core.frame_limits).expect("encode test frame");
-        let mut writer = NeverReadyWriter;
+        let mut sender = NeverReadyFrameSender;
         let mut write = Box::pin(write_runtime_wire_frame(
-            &mut writer,
+            &mut sender,
             &core,
             &wire,
             hard_deadline + Duration::from_secs(30),
@@ -3063,6 +3304,7 @@ mod tests {
             core.terminal_error(),
             DiameterPeerRuntimeError::Transport(DiameterTlsError::Retired),
         );
+        assert!(transport_close.closed.load(Ordering::Acquire));
     }
 
     #[tokio::test]
@@ -3085,7 +3327,7 @@ mod tests {
         );
 
         let intended = DiameterPeerRuntimeError::PeerDisconnected { peer_cause: None };
-        let _ = core.shutdown.shutdown(Shutdown::Both);
+        core.transport_close.close();
         let mut state = state;
         state.terminal = Some(intended);
         let _ = result_tx.send(Ok(7_u8));
@@ -3318,9 +3560,12 @@ mod tests {
                 );
             }
 
-            let (mut writer, mut reader) = tokio::io::duplex(4096);
+            let frames = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let mut sender = CapturingFrameSender {
+                frames: Arc::clone(&frames),
+            };
             write_control(
-                &mut writer,
+                &mut sender,
                 &core,
                 ControlCommand::Watchdog {
                     message: answer,
@@ -3330,14 +3575,16 @@ mod tests {
             )
             .await
             .expect("accepted DWR retains authority across disconnect transition");
-            let emitted = read_runtime_frame(
-                &mut reader,
-                core.frame_limits,
-                Duration::from_secs(1),
-                Instant::now() + Duration::from_secs(1),
+            let wire = frames
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pop()
+                .expect("capture retained-authority DWA");
+            let emitted = OwnedMessage::decode_owned(
+                bytes::Bytes::from(wire),
+                core.frame_limits.decode_context(),
             )
-            .await
-            .expect("read retained-authority DWA");
+            .expect("decode retained-authority DWA");
             assert!(authority.authorizes(core.generation, &emitted));
         }
     }
@@ -3379,7 +3626,7 @@ mod tests {
             pending: None,
             terminal: core.terminal.subscribe(),
             core: Arc::clone(&core),
-            shutdown: Arc::clone(&core.shutdown),
+            transport_close: Arc::clone(&core.transport_close),
             closing: Arc::clone(&core.closing),
         };
 

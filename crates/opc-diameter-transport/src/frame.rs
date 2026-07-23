@@ -96,18 +96,36 @@ where
         .map_err(|_| DiameterTlsError::DeadlineExceeded)?
         .map_err(|_| DiameterTlsError::Transport)?;
 
-    read_frame_body(reader, header_wire, limits, deadline).await
+    let wire = read_frame_body_wire(reader, header_wire, limits, deadline).await?;
+    decode_wire_frame(wire, limits)
 }
 
 /// Read one runtime frame without treating an entirely idle connection as a
 /// partial frame. Once the first header octet arrives, the rest of the frame
 /// must complete within `completion_timeout` and before `hard_deadline`.
+#[cfg(test)]
 pub(crate) async fn read_runtime_frame<R>(
     reader: &mut R,
     limits: DiameterFrameLimits,
     completion_timeout: std::time::Duration,
     hard_deadline: Instant,
 ) -> Result<OwnedMessage, DiameterTlsError>
+where
+    R: AsyncRead + Unpin + ?Sized,
+{
+    let wire = read_runtime_wire_frame(reader, limits, completion_timeout, hard_deadline).await?;
+    decode_wire_frame(wire, limits)
+}
+
+/// Read exactly one bounded Diameter wire frame from a protected byte stream.
+/// The returned bytes preserve the complete transport message boundary; the
+/// common runtime decoder remains authoritative for the typed message.
+pub(crate) async fn read_runtime_wire_frame<R>(
+    reader: &mut R,
+    limits: DiameterFrameLimits,
+    completion_timeout: std::time::Duration,
+    hard_deadline: Instant,
+) -> Result<Bytes, DiameterTlsError>
 where
     R: AsyncRead + Unpin + ?Sized,
 {
@@ -126,15 +144,15 @@ where
     .await
     .map_err(|_| DiameterTlsError::DeadlineExceeded)?
     .map_err(|_| DiameterTlsError::Transport)?;
-    read_frame_body(reader, header_wire, limits, completion_deadline).await
+    read_frame_body_wire(reader, header_wire, limits, completion_deadline).await
 }
 
-async fn read_frame_body<R>(
+async fn read_frame_body_wire<R>(
     reader: &mut R,
     header_wire: [u8; DIAMETER_HEADER_LEN],
     limits: DiameterFrameLimits,
     deadline: Instant,
-) -> Result<OwnedMessage, DiameterTlsError>
+) -> Result<Bytes, DiameterTlsError>
 where
     R: AsyncRead + Unpin + ?Sized,
 {
@@ -156,8 +174,34 @@ where
     .map_err(|_| DiameterTlsError::DeadlineExceeded)?
     .map_err(|_| DiameterTlsError::Transport)?;
 
-    OwnedMessage::decode_owned(wire.freeze(), limits.decode_context())
+    Ok(wire.freeze())
+}
+
+pub(crate) fn decode_wire_frame(
+    wire: Bytes,
+    limits: DiameterFrameLimits,
+) -> Result<OwnedMessage, DiameterTlsError> {
+    validate_wire_frame(&wire, limits)?;
+    OwnedMessage::decode_owned(wire, limits.decode_context())
         .map_err(|_| DiameterTlsError::InvalidFrame)
+}
+
+pub(crate) fn validate_wire_frame(
+    wire: &[u8],
+    limits: DiameterFrameLimits,
+) -> Result<(), DiameterTlsError> {
+    if wire.len() < DIAMETER_HEADER_LEN || wire.len() > limits.max_message_len() {
+        return Err(DiameterTlsError::InvalidFrame);
+    }
+    let (_, header) = Header::decode(
+        &wire[..DIAMETER_HEADER_LEN],
+        limits.strict_header_decode_context(),
+    )
+    .map_err(|_| DiameterTlsError::InvalidFrame)?;
+    if usize::try_from(header.length).ok() != Some(wire.len()) {
+        return Err(DiameterTlsError::InvalidFrame);
+    }
+    Ok(())
 }
 
 pub(crate) async fn write_frame<W>(
@@ -189,17 +233,7 @@ pub(crate) async fn write_wire_frame<W>(
 where
     W: AsyncWrite + Unpin + ?Sized,
 {
-    if wire.len() < DIAMETER_HEADER_LEN || wire.len() > limits.max_message_len() {
-        return Err(DiameterTlsError::InvalidFrame);
-    }
-    let (_, header) = Header::decode(
-        &wire[..DIAMETER_HEADER_LEN],
-        limits.strict_header_decode_context(),
-    )
-    .map_err(|_| DiameterTlsError::InvalidFrame)?;
-    if usize::try_from(header.length).ok() != Some(wire.len()) {
-        return Err(DiameterTlsError::InvalidFrame);
-    }
+    validate_wire_frame(wire, limits)?;
     // Tokio's timeout future polls its inner future first. Reject an already
     // expired absolute deadline before constructing that future so a
     // synchronously ready stream cannot emit bytes after expiry.

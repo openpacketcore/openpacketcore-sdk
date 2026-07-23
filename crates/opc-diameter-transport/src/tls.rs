@@ -31,6 +31,7 @@ use tokio::time::Instant;
 use tokio_rustls::rustls::{self, CipherSuite, ProtocolVersion};
 
 use crate::frame::{borrowed, read_frame, write_frame};
+use crate::frame_transport::{ProtectedFrameTransportClose, ProtectedFrameTransportParts};
 use crate::DiameterFrameLimits;
 
 static NEXT_SESSION_GENERATION: AtomicU64 = AtomicU64::new(1);
@@ -1181,9 +1182,9 @@ impl DiameterTlsConnection {
             _retirement_task,
             closed: _,
         } = self;
+        let transport_close: Arc<dyn ProtectedFrameTransportClose> = shutdown.clone();
         DiameterTlsRuntimeParts {
-            io,
-            shutdown,
+            frame_transport: ProtectedFrameTransportParts::from_stream(io, transport_close),
             session,
             generation,
             evidence,
@@ -1300,8 +1301,7 @@ pub(crate) struct RetirementTask {
 }
 
 pub(crate) struct DiameterTlsRuntimeParts {
-    pub(crate) io: Box<dyn DiameterIo>,
-    pub(crate) shutdown: Arc<std::net::TcpStream>,
+    pub(crate) frame_transport: ProtectedFrameTransportParts,
     pub(crate) session: PeerSession,
     pub(crate) generation: PeerSessionGeneration,
     pub(crate) evidence: DiameterTlsEvidence,

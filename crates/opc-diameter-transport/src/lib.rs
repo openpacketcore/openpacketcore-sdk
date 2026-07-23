@@ -12,6 +12,7 @@
 #![forbid(unsafe_code)]
 
 mod frame;
+mod frame_transport;
 mod inband;
 mod runtime;
 mod tls;
