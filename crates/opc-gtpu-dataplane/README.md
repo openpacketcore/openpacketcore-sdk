@@ -1043,6 +1043,10 @@ N+1, verifies it, and removes exact N candidates. Removal writes Removing
 first, deletes exact owned indexes, and deletes authority last. The journal
 stores byte-exact base and desired graphs only while an operation is in flight;
 missing or mismatched recovery evidence never authorizes guessed cleanup.
+The authority map, transaction journal, and each selector index are sized for
+65,536 entries per attachment. Each dual-stack group consumes two entries in
+the uplink index and two in the downlink index, so the selector budget limits
+an all-dual-stack attachment to 32,768 groups rather than 65,536.
 
 A tc consumer retains the decoded index value first, extracts the group ID,
 performs one authority lookup, validates the selected generation and slot, and
