@@ -647,11 +647,13 @@ deployment qualification.
 `opc-gtpu-dataplane` now binds every eBPF downlink PDR to a canonical outer
 peer/local pair, address family, exact ingress attachment, and explicit bounded
 UDP source-port policy. The shared no-std schema covers IPv4/IPv6 semantics and
-fixed redaction-safe encodings; the current tc adapter is explicitly IPv4-only.
-Ingress retains its full prior envelope and checksum validation, then requires
-the binding before inspecting or delivering the inner packet. Missing,
-non-canonical, wrong-family, wrong-peer, wrong-local, wrong-interface, and
-wrong-port state fails closed through six fixed aggregate reason counters.
+fixed redaction-safe encodings. The frozen legacy single-context graph remains
+IPv4-only; the additive current grouped tc path supports independently selected
+inner and outer IPv4/IPv6 families, including simultaneous inner IPv4 and IPv6
+entries. Ingress retains its full envelope and checksum validation, then
+requires the binding before inspecting or delivering the inner packet.
+Missing, non-canonical, wrong-family, wrong-peer, wrong-local, wrong-interface,
+and wrong-port state fails closed through six fixed aggregate reason counters.
 
 The host reconciler includes endpoint identity in fresh publication, exact
 default and marked peer relocation, rollback, marked owner phases, removal,
@@ -690,7 +692,7 @@ both namespaces.
 
 The implementation requires an explicit previous-writer-stopped attestation.
 Populated forwarding state additionally requires a separate sessions-and-
-traffic-drained attestation. Before proof publication it validates the exact 15
+traffic-drained attestation. Before proof publication it validates the exact 21
 current map names, ABIs, schema marker, configuration, PMTU state, and IDs,
 loads and identifies both committed current classifier artifacts against those
 maps, drops those temporary programs, then completely enumerates loaded BPF

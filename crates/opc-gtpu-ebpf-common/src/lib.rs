@@ -3,9 +3,9 @@
 //! This crate is the single source of truth for the byte layouts exchanged
 //! between the `opc-gtpu-dataplane` eBPF backend (userspace loader) and the
 //! `opc-gtpu-dataplane-ebpf` tc programs: BPF map key/value encodings and the
-//! exact GTP-U/UDP/IPv4 encapsulation bytes stamped on uplink packets. It is
-//! `no_std`, dependency-free, and fully deterministic so the wire format is
-//! unit-testable in ordinary CI without a kernel.
+//! exact GTP-U/UDP/IPv4-or-IPv6 encapsulation bytes stamped on uplink packets.
+//! It is `no_std`, dependency-free, and fully deterministic so the wire format
+//! is unit-testable in ordinary CI without a kernel.
 //!
 //! All multi-byte fields are big-endian (network byte order) unless noted.
 
@@ -16,22 +16,42 @@
 mod envelope;
 mod fragment;
 mod pmtu;
+mod session;
 
 pub use envelope::{
-    classify_udp_checksum, internet_checksum, internet_checksum_sum_is_valid, udp_ipv4_checksum,
-    udp_ipv4_checksum_is_valid, GtpuEnvelopeBounds, GtpuEnvelopeError, Ipv4EnvelopeBounds,
-    UdpChecksumDisposition, UdpChecksumEvidence, UdpEnvelopeBounds, IPV4_MAX_HDR_LEN,
+    classify_ipv6_extension_step, classify_ipv6_gtpu_ingress, classify_udp_checksum,
+    internet_checksum, internet_checksum_sum_is_valid, udp_ipv4_checksum,
+    udp_ipv4_checksum_is_valid, udp_ipv6_checksum, udp_ipv6_checksum_is_valid,
+    udp_ipv6_checksum_segments, validate_ipv6_options_header, validate_ipv6_routing_header,
+    GtpuEnvelopeBounds, GtpuEnvelopeError, Ipv4EnvelopeBounds, Ipv6ExtensionError,
+    Ipv6ExtensionStep, Ipv6GtpuIngress, Ipv6UdpEnvelopeBounds, UdpChecksumDisposition,
+    UdpChecksumEvidence, UdpEnvelopeBounds, IPV4_MAX_HDR_LEN, IPV6_MAX_EXT_HEADERS,
+    IPV6_MAX_OPTIONS_PER_HEADER, IPV6_NH_AUTHENTICATION, IPV6_NH_DESTINATION_OPTIONS, IPV6_NH_ESP,
+    IPV6_NH_FRAGMENT, IPV6_NH_HOP_BY_HOP, IPV6_NH_NONE, IPV6_NH_ROUTING, IPV6_NH_UDP,
 };
 pub use fragment::{
     parse_gtpu_tpdu, GtpuDownlinkFragmentContract, GtpuReassemblyBounds, GtpuTpdu, GtpuTpduError,
     LINUX_DEFAULT_REASSEMBLY_BOUNDS, MAX_REASSEMBLED_GTPU_LEN,
 };
 pub use pmtu::{
-    apply_uplink_mtu_policy, decide_uplink_encap, stamp_ipv4_dont_fragment,
-    GtpuOuterFragmentPolicy, GtpuPmtuProtocol, GtpuPmtuSignal, GtpuUplinkMtuPolicy,
-    UplinkEncapOutcome, UplinkMtuMapState, ICMPV4_CODE_FRAGMENTATION_NEEDED_DF_SET,
-    ICMPV4_TYPE_DESTINATION_UNREACHABLE, ICMPV6_TYPE_PACKET_TOO_BIG, MIN_UPLINK_LINK_MTU,
-    UPLINK_PMTU_FLAG_OUTER_FRAGMENT_REQUIRED, UPLINK_PMTU_VALUE_LEN,
+    apply_uplink_mtu_policy, decide_uplink_encap, decide_uplink_pmtu, encap_overhead,
+    stamp_ipv4_dont_fragment, GtpuOuterFragmentPolicy, GtpuPmtuProtocol, GtpuPmtuSignal,
+    GtpuUplinkMtuPolicy, UplinkEncapOutcome, UplinkMtuMapState, UplinkPmtuDecision,
+    ICMPV4_CODE_FRAGMENTATION_NEEDED_DF_SET, ICMPV4_TYPE_DESTINATION_UNREACHABLE,
+    ICMPV6_TYPE_PACKET_TOO_BIG, MIN_UPLINK_LINK_MTU, UPLINK_PMTU_FLAG_OUTER_FRAGMENT_REQUIRED,
+    UPLINK_PMTU_VALUE_LEN,
+};
+pub use session::{
+    gtpu_session_group_authorizes_downlink, gtpu_session_group_authorizes_uplink,
+    select_gtpu_session_entry_wire, GtpuSessionAuthorityHeader, GtpuSessionDeviceConfig,
+    GtpuSessionDeviceId, GtpuSessionDownlinkKey, GtpuSessionEntry, GtpuSessionEntryWireView,
+    GtpuSessionGeneration, GtpuSessionGroupId, GtpuSessionGroupPhase, GtpuSessionGroupRecord,
+    GtpuSessionGroupRef, GtpuSessionIndexCandidate, GtpuSessionIpFamily, GtpuSessionPaa,
+    GtpuSessionTransactionId, GtpuSessionTransactionPhase, GtpuSessionTransactionRecord,
+    GtpuSessionUplinkKey, GTPU_SESSION_CONFIG_VALUE_LEN, GTPU_SESSION_DOWNLINK_KEY_LEN,
+    GTPU_SESSION_ENTRY_LEN, GTPU_SESSION_GROUP_ID_LEN, GTPU_SESSION_GROUP_REF_LEN,
+    GTPU_SESSION_GROUP_VALUE_LEN, GTPU_SESSION_IPV4_SLOT, GTPU_SESSION_IPV6_SLOT,
+    GTPU_SESSION_TRANSACTION_VALUE_LEN, GTPU_SESSION_UPLINK_KEY_LEN,
 };
 
 /// GTP-U UDP port (TS 29.281 §4.4.2).
@@ -41,8 +61,12 @@ pub const GTPU_UDP_PORT: u16 = 2152;
 pub const ETH_HDR_LEN: usize = 14;
 /// EtherType for IPv4.
 pub const ETH_P_IPV4: u16 = 0x0800;
+/// EtherType for IPv6.
+pub const ETH_P_IPV6: u16 = 0x86dd;
 /// Minimum (option-free) IPv4 header length.
 pub const IPV4_MIN_HDR_LEN: usize = 20;
+/// Fixed IPv6 base-header length.
+pub const IPV6_HDR_LEN: usize = 40;
 /// UDP header length.
 pub const UDP_HDR_LEN: usize = 8;
 /// Mandatory GTPv1-U header length (flags, type, length, TEID).
@@ -52,6 +76,12 @@ pub const GTPU_MANDATORY_HDR_LEN: usize = 8;
 pub const GTPU_OPT_LEN: usize = 4;
 /// Total uplink encapsulation prepended per packet: outer IPv4 + UDP + GTP-U.
 pub const GTPU_ENCAP_LEN: usize = IPV4_MIN_HDR_LEN + UDP_HDR_LEN + GTPU_MANDATORY_HDR_LEN;
+/// Explicit IPv4 alias for the legacy encapsulation size.
+pub const GTPU_IPV4_ENCAP_LEN: usize = GTPU_ENCAP_LEN;
+/// Total uplink encapsulation prepended for an outer IPv6/UDP/GTP-U packet.
+pub const GTPU_IPV6_ENCAP_LEN: usize = IPV6_HDR_LEN + UDP_HDR_LEN + GTPU_MANDATORY_HDR_LEN;
+/// Largest supported fixed outer encapsulation.
+pub const GTPU_MAX_ENCAP_LEN: usize = GTPU_IPV6_ENCAP_LEN;
 
 /// GTPv1-U flags octet sent on uplink: version=1, PT=1, E=S=PN=0.
 pub const GTPU_FLAGS_V1_GPDU: u8 = 0x30;
@@ -205,6 +235,17 @@ pub const UPLINK_SOURCE_PORT_SCHEMA_MARKER_VALUE: [u8; UPLINK_FAR_VALUE_LEN] = *
 /// MTU map pin is missing.
 pub const UPLINK_PMTU_SCHEMA_MARKER_VALUE: [u8; UPLINK_FAR_VALUE_LEN] = *b"OPC-PMTU-v5\0";
 
+/// Byte width of the independent family-tagged grouped-session schema marker.
+pub const GTPU_SESSION_SCHEMA_MARKER_LEN: usize = 16;
+/// Marker for the additive family-tagged grouped-session ABI.
+///
+/// This marker lives in the new schema map and never occupies or reinterprets
+/// a legacy four-byte IPv4 selector.
+pub const GTPU_SESSION_SCHEMA_MARKER_VALUE: [u8; GTPU_SESSION_SCHEMA_MARKER_LEN] =
+    *b"OPC-GROUP-IP-v6\0";
+/// Single-slot key for [`MAP_CONFIG_IPV6`].
+pub const GTPU_SESSION_CONFIG_KEY: u32 = 0;
+
 /// BPF map name: uplink FAR, keyed by UE PAA (IPv4, network order).
 pub const MAP_UPLINK_FAR: &str = "GTPU_UPLINK_FAR";
 /// BPF map name: marked uplink FAR, keyed by `(UE PAA, packet mark)`.
@@ -238,6 +279,22 @@ pub const MAP_COUNTERS: &str = "GTPU_COUNTERS";
 pub const MAP_DOWNLINK_BINDING_COUNTERS: &str = "GTPU_DL_DROP";
 /// BPF map name: single-slot device configuration (local S2b-U IPv4).
 pub const MAP_CONFIG: &str = "GTPU_CONFIG";
+/// BPF map name: family-tagged grouped-session authority.
+///
+/// This map must be a normal, non-per-CPU `BPF_MAP_TYPE_HASH`. Activation and
+/// fencing are whole-value `BPF_MAP_UPDATE_ELEM` replacements; array,
+/// per-CPU, and in-place mutation cannot implement the snapshot contract.
+pub const MAP_SESSION_GROUPS: &str = "GTPU_SESSIONS";
+/// BPF map name: family-tagged grouped uplink selector index.
+pub const MAP_SESSION_UPLINK_INDEX: &str = "GTPU_UL_INDEX";
+/// BPF map name: family-tagged grouped downlink selector index.
+pub const MAP_SESSION_DOWNLINK_INDEX: &str = "GTPU_DL_INDEX";
+/// BPF map name: durable userspace-only grouped-session transaction journal.
+pub const MAP_SESSION_TRANSACTIONS: &str = "GTPU_SESS_TXN";
+/// BPF map name: managed IPv6 local-endpoint/device configuration.
+pub const MAP_CONFIG_IPV6: &str = "GTPU_CONFIG6";
+/// BPF map name: independent grouped-session schema marker.
+pub const MAP_SESSION_SCHEMA: &str = "GTPU_SCHEMA6";
 
 /// tc program name handling uplink (subscriber → PGW) encapsulation.
 pub const PROG_UPLINK: &str = "opc_gtpu_uplink";
@@ -401,9 +458,11 @@ impl UplinkFarKey {
 
 /// Product-neutral IP address used by a GTP-U outer-endpoint binding.
 ///
-/// The semantic model supports both address families even though the current
-/// tc datapath executes only IPv4 GTP-U. Address bytes are always network
-/// ordered and are redacted from `Debug` output.
+/// The semantic model supports both address families. The legacy v5 tc schema
+/// remains IPv4-only; the additive grouped v6 schema uses this type but does
+/// not claim production availability until its separately reported
+/// qualification contract is proven. Address bytes are network ordered and
+/// redacted from `Debug` output.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum GtpuEndpointAddress {
     /// IPv4 endpoint address.
@@ -2222,6 +2281,12 @@ mod tests {
             MAP_UPLINK_MARK_SOURCE_PORT,
             MAP_UPLINK_PMTU,
             MAP_UPLINK_PMTU_COUNTERS,
+            MAP_SESSION_GROUPS,
+            MAP_SESSION_UPLINK_INDEX,
+            MAP_SESSION_DOWNLINK_INDEX,
+            MAP_SESSION_TRANSACTIONS,
+            MAP_CONFIG_IPV6,
+            MAP_SESSION_SCHEMA,
         ];
         for name in new_names {
             assert!(name.len() <= BPF_OBJ_NAME_VISIBLE_LEN);
@@ -2242,6 +2307,12 @@ mod tests {
             MAP_MARKED_BEARER_OWNER,
             MAP_COUNTERS,
             MAP_CONFIG,
+            MAP_SESSION_GROUPS,
+            MAP_SESSION_UPLINK_INDEX,
+            MAP_SESSION_DOWNLINK_INDEX,
+            MAP_SESSION_TRANSACTIONS,
+            MAP_CONFIG_IPV6,
+            MAP_SESSION_SCHEMA,
         ];
         for (index, name) in all_names.iter().enumerate() {
             let name = &name.as_bytes()[..name.len().min(BPF_OBJ_NAME_VISIBLE_LEN)];

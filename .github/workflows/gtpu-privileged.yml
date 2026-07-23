@@ -91,6 +91,10 @@ jobs:
       # exact attached-program/pinned-map identity and per-CPU counter sums,
       # byte-compatible unmarked traffic, drained legacy schema adoption and
       # populated endpoint-unbound fail-closed migration,
+      # grouped dual-stack lifecycle across every inner/outer family pairing,
+      # mandatory outer-IPv6 UDP checksum validation, exact IPv4/IPv6 PMTU and
+      # fragment handling, generation-safe replacement, restart adoption, and
+      # both-family removal,
       # unknown-mark/TEID drops, echo passthrough, restore/adoption, and
       # ownership-safe teardown (no opc_gtpu filters or pins left behind;
       # already-visible foreign filters are preserved).
@@ -346,35 +350,14 @@ jobs:
           inventory() {
             # Private verifier-bounded subprograms retain local linkage. Rust
             # therefore gives them v0-mangled symbols whose crate-disambiguator
-            # prefixes can differ across source roots. Keep checking that each
-            # subprogram exists while normalizing only that non-ABI prefix.
+            # prefixes can differ across source roots. Normalize only that
+            # non-ABI prefix while preserving the complete module/function
+            # suffix, then require every packet-path helper explicitly below.
             readelf -sW "$1" | awk '
               $4 == "FUNC" || $4 == "OBJECT" {
                 name = $8
-                if (name ~ /^_RNvC[^_]+_17opc_gtpu_datapath19checksum_loop_chunk$/) {
-                  name = "checksum_loop_chunk"
-                }
-                if (name ~ /^_RNvC[^_]+_17opc_gtpu_datapath28authorize_and_decap_downlink$/) {
-                  name = "authorize_and_decap_downlink"
-                }
-                if (name ~ /^_RNvC[^_]+_17opc_gtpu_datapath14parse_downlink$/) {
-                  name = "parse_downlink"
-                }
-                if (name ~ /^_RNvC[^_]+_20opc_gtpu_ebpf_common24pdp_commit_wire_is_valid$/) {
-                  name = "pdp_commit_wire_is_valid"
-                }
-                if (name ~ /^_RNvC[^_]+_20opc_gtpu_ebpf_common32pdp_commit_wire_authorizes_graph$/) {
-                  name = "pdp_commit_wire_authorizes_graph"
-                }
-                if (name ~ /^_RNvC[^_]+_20opc_gtpu_ebpf_common35marked_owner_wire_authorizes_uplink$/) {
-                  name = "marked_owner_wire_authorizes_uplink"
-                }
-                if (name ~ /^_RNvC[^_]+_20opc_gtpu_ebpf_common35pdp_commit_wire_authorizes_downlink$/) {
-                  name = "pdp_commit_wire_authorizes_downlink"
-                }
-                if (name ~ /^_RNvC[^_]+_20opc_gtpu_ebpf_common37marked_owner_wire_authorizes_downlink$/) {
-                  name = "marked_owner_wire_authorizes_downlink"
-                }
+                gsub(/C[^_]+_17opc_gtpu_datapath/, "C<crate>_17opc_gtpu_datapath", name)
+                gsub(/C[^_]+_20opc_gtpu_ebpf_common/, "C<crate>_20opc_gtpu_ebpf_common", name)
                 print $4, name
               }
             ' | sort
@@ -383,8 +366,23 @@ jobs:
           inventory "${rebuilt}" > rebuilt.inventory
           cat rebuilt.inventory
           diff -u committed.inventory rebuilt.inventory
-          for symbol in opc_gtpu_uplink opc_gtpu_downlink checksum_loop_chunk authorize_and_decap_downlink parse_downlink pdp_commit_wire_is_valid pdp_commit_wire_authorizes_graph marked_owner_wire_authorizes_uplink pdp_commit_wire_authorizes_downlink marked_owner_wire_authorizes_downlink GTPU_UPLINK_FAR GTPU_ULM_FAR GTPU_UPLINK_DSCP GTPU_ULM_DSCP GTPU_UL_SPORT GTPU_ULM_SPORT GTPU_PMTU_CFG GTPU_PMTU_DROP GTPU_DOWNLINK_PDR GTPU_DLM_PDR GTPU_DL_BIND GTPU_DL_DROP GTPU_M_OWNER GTPU_COUNTERS GTPU_CONFIG; do
-            grep -q " ${symbol}$" committed.inventory
+          for symbol in opc_gtpu_uplink opc_gtpu_downlink \
+            checksum_loop_chunk parse_downlink authorize_and_decap_legacy_downlink \
+            handle_downlink_ipv6 parse_downlink_ipv6 ipv6_udp_offset \
+            software_ipv6_udp_checksum_is_valid walk_ipv6_extension_step \
+            grouped_uplink_authority grouped_downlink_authority decap_grouped_downlink \
+            encapsulate_grouped_ipv4 encapsulate_grouped_ipv6 \
+            checksum_bytes_are_materialized select_gtpu_session_entry_wire \
+            wire_address_is_canonical apply_uplink_mtu_policy \
+            pdp_commit_wire_is_valid pdp_commit_wire_authorizes_graph \
+            marked_owner_wire_authorizes_uplink pdp_commit_wire_authorizes_downlink \
+            marked_owner_wire_authorizes_downlink \
+            GTPU_UPLINK_FAR GTPU_ULM_FAR GTPU_UPLINK_DSCP GTPU_ULM_DSCP \
+            GTPU_UL_SPORT GTPU_ULM_SPORT GTPU_PMTU_CFG GTPU_PMTU_DROP \
+            GTPU_DOWNLINK_PDR GTPU_DLM_PDR GTPU_DL_BIND GTPU_DL_DROP \
+            GTPU_M_OWNER GTPU_COUNTERS GTPU_CONFIG GTPU_SESSIONS \
+            GTPU_UL_INDEX GTPU_DL_INDEX GTPU_SESS_TXN GTPU_SCHEMA6 GTPU_CONFIG6; do
+            grep -Eq "( |[[:digit:]])${symbol}$" committed.inventory
           done
 
           functional_section_names() {

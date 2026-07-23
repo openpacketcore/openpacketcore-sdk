@@ -12,41 +12,39 @@ CO-RE object, and is intentionally excluded from the SDK workspace.
 
 The crate exposes tc entry points, not a Rust library API:
 
-- `opc_gtpu_uplink`: tc egress program. Mark zero looks up the default FAR by
-  inner UE IPv4 source address. A non-zero complete packet mark selects an
-  additive FAR by `(UE address, mark)` and must match an `Active` owner-journal
-  entry before the program prepends `[outer IPv4][UDP][GTPv1-U]`, consumes the
-  mark, and redirects toward the peer. The UDP destination port is always
-  2152. The additive `GTPU_UL_SPORT`/`GTPU_ULM_SPORT` map value is a complete
-  PDP-context commit record, including the explicit source port. The program
-  accepts only an `Active` record whose FAR and DSCP match the selected live
-  entries exactly; an absent, transitional, malformed, or mixed record drops
-  fail closed. When the single-slot `GTPU_PMTU_CFG` policy map carries a
-  configured effective link MTU, the program applies the shared
-  `apply_uplink_mtu_policy` decision to every encapsulation: over-MTU packets
-  drop fail closed into the `GTPU_PMTU_DROP` per-CPU counter (slot 0). The
-  host-only `RequireOuterFragmentation` policy is not executable because
-  `bpf_redirect_neigh` bypasses the kernel's `ip_fragment`; SDK configuration
-  rejects it, and an out-of-band map writer makes every packet drop into the
-  corrupt-policy canary (slot 1). The program never emits an oversized packet,
-  an inner packet unencapsulated, or ICMP itself. The strict policy stamps DF
-  and refreshes the outer checksum on emitted fitting packets; an all-zero
-  slot is the explicit unset legacy behavior and corrupt policy bytes drop
-  fail closed.
+- `opc_gtpu_uplink`: tc egress program. It resolves an IPv4 `/32` or canonical
+  IPv6 `/64` UE source plus the complete packet mark through the grouped
+  uplink index, retains that index value, and performs exactly one
+  generation/slot-authority lookup. The selected entry may use an independent
+  outer IPv4 or IPv6 endpoint family. It then prepends the corresponding
+  `[outer IP][UDP][GTPv1-U]` header, consumes a nonzero mark, and redirects
+  toward the peer. A present but malformed, transitional, stale, or
+  mismatched grouped reference drops fail closed; only a true grouped-index
+  miss may use the frozen v5 IPv4 maps. Outer IPv6 requires fully materialized,
+  non-GSO bytes, gets a mandatory software-generated UDP checksum, and accounts
+  56 bytes against the effective link MTU; outer IPv4 accounts 36 bytes and
+  retains the strict DF behavior. The UDP destination port is always 2152.
+  The host-only `RequireOuterFragmentation` policy remains non-executable
+  because `bpf_redirect_neigh` bypasses the kernel fragmentation path.
 - `opc_gtpu_downlink`: tc ingress program. It matches UDP/2152 GTPv1-U G-PDUs,
-  proves the existing outer envelope/checksum boundary, selects exactly one
-  downlink PDR by TEID, and then requires a canonical `GTPU_DL_BIND` value that
-  matches outer peer, local destination, IPv4 family, current tc attachment,
-  and explicit UDP source-port policy. Before decapsulation, both default and
-  marked paths require an `Active` commit record matching the complete selected
-  FAR, DSCP, local TEID, endpoint binding, and source-port policy; marked PDRs
-  additionally require the compatible owner journal. Only then does it validate
-  the inner destination, strip outer headers, write zero for a default bearer
-  or the exact dedicated mark, and continue to XFRM policy selection through
-  the stack. Outer IPv4 fragments are passed to the kernel stack unchanged;
-  the kernel reassembles under bounded `ipfrag` accounting and the SDK's
-  userspace `GtpuReassemblyConsumer` re-applies this same PDR/binding/decap
-  path to the reassembled datagram exactly once.
+  proves the complete outer IPv4 or IPv6 envelope and checksum boundary,
+  derives the independent inner family, and resolves `(outer family, inner
+  family, local TEID)` through the retained grouped index and one authority
+  lookup. Only an exact `Active` generation/slot, attachment configuration,
+  outer peer/local endpoint, UDP source-port policy, and inner destination may
+  decapsulate. The program strips the proven outer envelope, writes the
+  dedicated-bearer mark (or zero), and continues through the ePDG's XFRM
+  output policy. A true grouped-index miss alone may enter the legacy IPv4
+  PDR/commit path. Legacy outer-IPv4 fragments retain the bounded
+  kernel-reassembly handoff. Grouped outer-IPv4 and outer-IPv6 packets
+  requiring reassembly pass to the host, but the backend reports both
+  per-family grouped fragment capabilities as unsupported because the current
+  consumer cannot authorize the grouped graph. A bounded IPv6 extension walk
+  accepts canonical Hop-by-Hop, Destination Options,
+  Routing-with-zero-Segments-Left, and atomic Fragment headers. AH, ESP, active
+  routing, discard-required options, non-atomic fragments, or chains outside
+  the bounded contract are left to the host before any grouped session is
+  authorized. IPv6 UDP checksums are mandatory.
 
 Map names, counter indexes, program names, and byte layouts are imported from
 `opc-gtpu-ebpf-common`. `GTPU_DL_DROP` is a fixed six-slot per-CPU counter map
@@ -65,16 +63,22 @@ Its values are aggregate and contain no rejected endpoint or session fields.
 
 - Unpublished standalone crate (`publish = false`) with its own `Cargo.lock`.
 - Build profile uses `panic = "abort"` and optimized BPF codegen.
-- The datapath is currently IPv4 GTP-U only.
-- Missing, corrupt, transitional, or mismatched commit records and endpoint
-  bindings fail closed before inner packet delivery. The userspace schema
-  exposes IPv4/IPv6 semantics, but this object deliberately rejects a stored
-  IPv6 binding as a family mismatch.
-- The downlink envelope path uses a 192-byte bounded checksum callback. The
-  endpoint/owner authorization and decapsulation phase is a separate BPF
-  subprogram so the verified call chains remain below Linux's 512-byte stack
-  limit, including Linux 6.8, without weakening either boundary or reducing
-  checksum coverage.
+- The grouped datapath supports all four independent outer/inner IPv4/IPv6
+  combinations and simultaneous IPv4v6 session groups. The frozen v5 maps
+  remain an IPv4-only compatibility fallback and are never consulted after a
+  grouped selector has been observed.
+- Missing, corrupt, transitional, or mismatched grouped authority, index,
+  attachment configuration, legacy commit record, or endpoint binding fails
+  closed before inner packet delivery.
+- IPv6 extension and checksum processing use bounded `bpf_loop` callbacks.
+  The committed classifiers are verifier-loaded on exact Linux 6.8 in CI so
+  their complete call chains remain below that kernel's cumulative 512-byte
+  BPF stack limit without reducing checksum coverage.
+- Outer IPv6 is `MaterializedOnly`: GSO and pending
+  `CHECKSUM_PARTIAL` state are rejected before encapsulation. Outer IPv6
+  fragment reassembly is not claimed; only atomic Fragment headers are handled
+  by the fast path. Grouped outer-IPv4 fragment reassembly is also unsupported;
+  the qualified IPv4 reassembly consumer remains specific to the legacy maps.
 - The S2b-U boundary owns the complete 32-bit packet mark; masked sharing is
   unsupported. The userspace crate remains safe Rust. Aya exposes a safe mark
   setter but no getter, so the verifier-bound program uses one isolated,

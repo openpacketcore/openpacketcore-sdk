@@ -18,6 +18,7 @@ opc-linux-gtpu-sys = { path = "../opc-linux-gtpu-sys", version = "0.2.0" }
 opc-gtpu-ebpf-common = { path = "../opc-gtpu-ebpf-common", version = "0.2.0" }
 opc-types = { path = "../opc-types", version = "0.2.0" }
 async-trait = { workspace = true }
+rand = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt", "time"] }
 

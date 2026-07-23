@@ -7,11 +7,13 @@
 //! backend instead drives a pair of tc `clsact` eBPF programs on the PGW-facing
 //! (S2b-U) interface:
 //!
-//! - **egress** (`opc_gtpu_uplink`): looks up the uplink FAR by the inner IPv4
-//!   source and prepends `[outer IPv4][UDP][GTPv1-U]` toward the PGW peer.
-//! - **ingress** (`opc_gtpu_downlink`): matches GTPv1-U G-PDUs on UDP/2152,
-//!   looks up the downlink PDR by TEID, strips the outer headers, and lets the
-//!   inner packet continue up the stack (through XFRM policy toward the UE).
+//! - **egress** (`opc_gtpu_uplink`): looks up either the legacy IPv4 FAR or a
+//!   family-tagged grouped FAR and prepends IPv4 or IPv6 UDP/GTPv1-U headers
+//!   toward the exact PGW peer.
+//! - **ingress** (`opc_gtpu_downlink`): matches IPv4 or IPv6 GTPv1-U G-PDUs on
+//!   UDP/2152, authorizes the exact grouped generation/PDR by TEID, strips the
+//!   outer headers, and lets the inner IPv4 or IPv6 packet continue up the
+//!   stack (through XFRM policy toward the UE).
 //!
 //! `create_device` does **not** create a netdevice: it attaches the programs
 //! to the existing interface named in the request and pins the session maps
@@ -20,36 +22,51 @@
 //! PDP-context installs/removals are pure BPF map upserts/deletes and are
 //! idempotent.
 //!
-//! Only IPv4 is supported for the outer transport and the UE PAA; IPv6
-//! requests are rejected as invalid configuration.
+//! The legacy single-context API remains IPv4-only. The additive grouped API
+//! supports independent inner and outer IPv4/IPv6 families, including both
+//! inner families active in one logical group. Callers must inspect the exact
+//! attachment's typed family capabilities; outer-IPv6 uplink encapsulation is
+//! deliberately advertised only for fully materialized, non-GSO packets.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use opc_gtpu_ebpf_common::{
     DownlinkEndpointBinding, DownlinkPdr, GtpuEndpointAddress, GtpuOuterFragmentPolicy,
+    GtpuSessionDeviceConfig, GtpuSessionDownlinkKey, GtpuSessionEntry as EbpfSessionEntry,
+    GtpuSessionGeneration, GtpuSessionGroupPhase, GtpuSessionGroupRecord, GtpuSessionGroupRef,
+    GtpuSessionIndexCandidate, GtpuSessionIpFamily, GtpuSessionTransactionId,
+    GtpuSessionTransactionPhase, GtpuSessionTransactionRecord, GtpuSessionUplinkKey,
     GtpuUplinkMtuPolicy, MarkedBearerOwner, MarkedBearerOwnerPhase, MarkedDownlinkPdr,
     PdpContextCommit, UplinkFar, UplinkFarKey, UplinkMtuMapState,
-    DOWNLINK_ENDPOINT_BINDING_VALUE_LEN, DOWNLINK_PDR_VALUE_LEN, MARKED_BEARER_OWNER_VALUE_LEN,
-    MARKED_DOWNLINK_PDR_VALUE_LEN, UPLINK_DSCP_VALUE_LEN, UPLINK_FAR_VALUE_LEN,
-    UPLINK_MARK_KEY_LEN, UPLINK_PMTU_VALUE_LEN, UPLINK_SOURCE_PORT_VALUE_LEN,
+    DOWNLINK_ENDPOINT_BINDING_VALUE_LEN, DOWNLINK_PDR_VALUE_LEN, GTPU_SESSION_CONFIG_VALUE_LEN,
+    GTPU_SESSION_DOWNLINK_KEY_LEN, GTPU_SESSION_GROUP_ID_LEN, GTPU_SESSION_GROUP_REF_LEN,
+    GTPU_SESSION_GROUP_VALUE_LEN, GTPU_SESSION_TRANSACTION_VALUE_LEN, GTPU_SESSION_UPLINK_KEY_LEN,
+    MARKED_BEARER_OWNER_VALUE_LEN, MARKED_DOWNLINK_PDR_VALUE_LEN, UPLINK_DSCP_VALUE_LEN,
+    UPLINK_FAR_VALUE_LEN, UPLINK_MARK_KEY_LEN, UPLINK_PMTU_VALUE_LEN, UPLINK_SOURCE_PORT_VALUE_LEN,
 };
 
 use crate::backend::error_proves_no_requested_mutation;
 use crate::model::{classify_dual_selector_state, DualSelectorState};
 use crate::{
-    CreateGtpDeviceRequest, CurrentEbpfGraphRecoveryOutcome, CurrentEbpfGraphRecoveryRequest,
-    DrainedV2TeardownOutcome, DrainedV2TeardownRefusal, DrainedV2TeardownRequest, GtpAddressFamily,
-    GtpBearerMark, GtpDevice, GtpPdpContext, GtpVersion, GtpuBackendKind, GtpuCapability,
-    GtpuDataplaneBackend, GtpuDownlinkEndpoint, GtpuDownlinkFragmentContract, GtpuError, GtpuProbe,
-    PdpContextIndeterminateReason, PdpContextInstallOutcome, PdpContextLocalTeidSelector,
-    PdpContextReadback, PdpContextReconciliationCapabilities, PdpContextRemovalOutcome,
-    PdpContextSelector, PdpContextUplinkSelector, RemovePdpContextRequest, Teid,
+    CreateGtpDeviceEndpointSetRequest, CreateGtpDeviceRequest, CurrentEbpfGraphRecoveryOutcome,
+    CurrentEbpfGraphRecoveryRequest, DrainedV2TeardownOutcome, DrainedV2TeardownRefusal,
+    DrainedV2TeardownRequest, GtpAddressFamily, GtpBearerMark, GtpDevice, GtpPdpContext,
+    GtpVersion, GtpuBackendKind, GtpuCapability, GtpuDataplaneBackend, GtpuDownlinkEndpoint,
+    GtpuDownlinkFragmentContract, GtpuError, GtpuIpFamilyCapabilities, GtpuLocalEndpointSet,
+    GtpuProbe, GtpuSessionAttachmentSelector, GtpuSessionDeviceId, GtpuSessionEntry,
+    GtpuSessionGroup, GtpuSessionGroupConflict, GtpuSessionGroupIndeterminateReason,
+    GtpuSessionGroupReadback, GtpuSessionGroupReconcileOutcome, GtpuSessionGroupReconcileRequest,
+    GtpuSessionGroupRemovalOutcome, GtpuSessionGroupSelector, GtpuSessionSelectorProvenance,
+    GtpuUplinkChecksumOffloadContract, PdpContextIndeterminateReason, PdpContextInstallOutcome,
+    PdpContextLocalTeidSelector, PdpContextReadback, PdpContextReconciliationCapabilities,
+    PdpContextRemovalOutcome, PdpContextSelector, PdpContextUplinkSelector,
+    RemovePdpContextRequest, Teid,
 };
 
 /// Default bpffs directory under which per-interface map pins are created.
@@ -190,6 +207,36 @@ pub(crate) enum CurrentRecoveryManagedState {
     Indeterminate,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EbpfMapUpdateMode {
+    /// Insert only when the key is absent.
+    NoExist,
+    /// Replace only when the key already exists.
+    Exist,
+}
+
+#[derive(Clone, PartialEq, Eq, Default)]
+pub(crate) struct EbpfSessionIndexInventory {
+    uplink: Vec<(
+        [u8; GTPU_SESSION_UPLINK_KEY_LEN],
+        [u8; GTPU_SESSION_GROUP_REF_LEN],
+    )>,
+    downlink: Vec<(
+        [u8; GTPU_SESSION_DOWNLINK_KEY_LEN],
+        [u8; GTPU_SESSION_GROUP_REF_LEN],
+    )>,
+}
+
+impl fmt::Debug for EbpfSessionIndexInventory {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EbpfSessionIndexInventory")
+            .field("uplink_count", &self.uplink.len())
+            .field("downlink_count", &self.downlink.len())
+            .finish()
+    }
+}
+
 /// Narrow synchronous port to the kernel eBPF machinery.
 ///
 /// The production implementation loads the committed CO-RE object with `aya`,
@@ -209,6 +256,17 @@ pub(crate) trait EbpfGtpuRuntime: Send + Sync + fmt::Debug {
         pin_dir: &Path,
         tc_priority: u16,
         local_ip: [u8; 4],
+    ) -> Result<EbpfAttachmentDisposition, GtpuError>;
+
+    /// Create or adopt the independent grouped-session schema and bind its
+    /// exact stable device/endpoint authority to `ifindex`.
+    fn attach_grouped(
+        &self,
+        interface: &str,
+        ifindex: u32,
+        pin_dir: &Path,
+        tc_priority: u16,
+        config: [u8; GTPU_SESSION_CONFIG_VALUE_LEN],
     ) -> Result<EbpfAttachmentDisposition, GtpuError>;
 
     /// Adopt a previously provisioned interface: reuse the pinned maps,
@@ -464,6 +522,114 @@ pub(crate) trait EbpfGtpuRuntime: Send + Sync + fmt::Debug {
         local_teid: [u8; 4],
     ) -> Result<bool, GtpuError>;
 
+    /// Generate a fresh nonzero transaction token from the system CSPRNG.
+    fn next_session_transaction_id(&self) -> Result<GtpuSessionTransactionId, GtpuError>;
+
+    /// Read one grouped authority value.
+    fn session_group_get(
+        &self,
+        ifindex: u32,
+        key: [u8; GTPU_SESSION_GROUP_ID_LEN],
+    ) -> Result<Option<[u8; GTPU_SESSION_GROUP_VALUE_LEN]>, GtpuError>;
+    /// Insert or replace one complete grouped authority value.
+    fn session_group_put(
+        &self,
+        ifindex: u32,
+        key: [u8; GTPU_SESSION_GROUP_ID_LEN],
+        value: [u8; GTPU_SESSION_GROUP_VALUE_LEN],
+        mode: EbpfMapUpdateMode,
+    ) -> Result<(), GtpuError>;
+    /// Remove one grouped authority value.
+    fn session_group_remove(
+        &self,
+        ifindex: u32,
+        key: [u8; GTPU_SESSION_GROUP_ID_LEN],
+    ) -> Result<bool, GtpuError>;
+
+    /// Read one family-tagged uplink selector reference.
+    fn session_uplink_get(
+        &self,
+        ifindex: u32,
+        key: [u8; GTPU_SESSION_UPLINK_KEY_LEN],
+    ) -> Result<Option<[u8; GTPU_SESSION_GROUP_REF_LEN]>, GtpuError>;
+    /// Insert or replace one family-tagged uplink selector reference.
+    fn session_uplink_put(
+        &self,
+        ifindex: u32,
+        key: [u8; GTPU_SESSION_UPLINK_KEY_LEN],
+        value: [u8; GTPU_SESSION_GROUP_REF_LEN],
+        mode: EbpfMapUpdateMode,
+    ) -> Result<(), GtpuError>;
+    /// Remove one family-tagged uplink selector reference.
+    fn session_uplink_remove(
+        &self,
+        ifindex: u32,
+        key: [u8; GTPU_SESSION_UPLINK_KEY_LEN],
+    ) -> Result<bool, GtpuError>;
+
+    /// Read one family-tagged downlink selector reference.
+    fn session_downlink_get(
+        &self,
+        ifindex: u32,
+        key: [u8; GTPU_SESSION_DOWNLINK_KEY_LEN],
+    ) -> Result<Option<[u8; GTPU_SESSION_GROUP_REF_LEN]>, GtpuError>;
+    /// Insert or replace one family-tagged downlink selector reference.
+    fn session_downlink_put(
+        &self,
+        ifindex: u32,
+        key: [u8; GTPU_SESSION_DOWNLINK_KEY_LEN],
+        value: [u8; GTPU_SESSION_GROUP_REF_LEN],
+        mode: EbpfMapUpdateMode,
+    ) -> Result<(), GtpuError>;
+    /// Remove one family-tagged downlink selector reference.
+    fn session_downlink_remove(
+        &self,
+        ifindex: u32,
+        key: [u8; GTPU_SESSION_DOWNLINK_KEY_LEN],
+    ) -> Result<bool, GtpuError>;
+
+    /// Read one bounded in-flight grouped transaction journal.
+    fn session_transaction_get(
+        &self,
+        ifindex: u32,
+        key: [u8; GTPU_SESSION_GROUP_ID_LEN],
+    ) -> Result<Option<[u8; GTPU_SESSION_TRANSACTION_VALUE_LEN]>, GtpuError>;
+    /// Insert or replace one complete transaction journal.
+    fn session_transaction_put(
+        &self,
+        ifindex: u32,
+        key: [u8; GTPU_SESSION_GROUP_ID_LEN],
+        value: [u8; GTPU_SESSION_TRANSACTION_VALUE_LEN],
+        mode: EbpfMapUpdateMode,
+    ) -> Result<(), GtpuError>;
+    /// Remove one completed transaction journal.
+    fn session_transaction_remove(
+        &self,
+        ifindex: u32,
+        key: [u8; GTPU_SESSION_GROUP_ID_LEN],
+    ) -> Result<bool, GtpuError>;
+
+    /// Enumerate every selector value whose duplicated group ID names `key`.
+    ///
+    /// The result includes malformed values when their first sixteen bytes
+    /// match, allowing userspace to fail closed rather than overlooking a
+    /// corrupt owned component.
+    fn session_index_inventory(
+        &self,
+        ifindex: u32,
+        key: [u8; GTPU_SESSION_GROUP_ID_LEN],
+    ) -> Result<EbpfSessionIndexInventory, GtpuError>;
+
+    /// Prove the exact grouped schema, config, held pins, live hooks, program
+    /// references, and namespace lease for this attachment. Implementations
+    /// repeat exact named-map identity around schema/config/live-hook
+    /// inspection.
+    fn grouped_datapath_usable(
+        &self,
+        ifindex: u32,
+        expected_config: [u8; GTPU_SESSION_CONFIG_VALUE_LEN],
+    ) -> bool;
+
     /// Read counters only after proving the live hooks and exact named pins.
     fn datapath_snapshot(&self, ifindex: u32) -> Result<EbpfGtpuDatapathSnapshot, GtpuError>;
 
@@ -520,10 +686,327 @@ pub(crate) trait EbpfGtpuRuntime: Send + Sync + fmt::Debug {
     fn pdp_cleanup_datapath_usable(&self, ifindex: u32) -> bool;
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct ManagedDevice {
     name: String,
-    local_ip: Ipv4Addr,
+    /// Legacy v5 IPv4 authority. Grouped attachments deliberately leave this
+    /// absent even when their endpoint set contains IPv4, so no grouped graph
+    /// can fall through the legacy single-address reconciliation path.
+    local_ip: Option<Ipv4Addr>,
+    grouped: Option<ManagedGroupedDevice>,
+}
+
+impl fmt::Debug for ManagedDevice {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ManagedDevice")
+            .field("interface_identity", &"<redacted>")
+            .field("legacy_ipv4", &self.local_ip.is_some())
+            .field("grouped", &self.grouped)
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ManagedGroupedDevice {
+    device_id: GtpuSessionDeviceId,
+    local_endpoints: GtpuLocalEndpointSet,
+}
+
+impl fmt::Debug for ManagedGroupedDevice {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ManagedGroupedDevice")
+            .field("device_id", &"<redacted>")
+            .field("ipv4_endpoint", &self.local_endpoints.ipv4().is_some())
+            .field("ipv6_endpoint", &self.local_endpoints.ipv6().is_some())
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct GroupedAttachmentContext {
+    device: GtpDevice,
+    grouped: ManagedGroupedDevice,
+    config: [u8; GTPU_SESSION_CONFIG_VALUE_LEN],
+}
+
+impl fmt::Debug for GroupedAttachmentContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GroupedAttachmentContext")
+            .field("device", &"<redacted-interface-identity>")
+            .field("grouped", &self.grouped)
+            .field("config", &"<redacted>")
+            .finish()
+    }
+}
+
+fn endpoint_address(address: IpAddr) -> GtpuEndpointAddress {
+    match address {
+        IpAddr::V4(address) => GtpuEndpointAddress::Ipv4(address.octets()),
+        IpAddr::V6(address) => GtpuEndpointAddress::Ipv6(address.octets()),
+    }
+}
+
+fn ip_address(address: GtpuEndpointAddress) -> IpAddr {
+    match address {
+        GtpuEndpointAddress::Ipv4(address) => IpAddr::V4(Ipv4Addr::from(address)),
+        GtpuEndpointAddress::Ipv6(address) => IpAddr::V6(Ipv6Addr::from(address)),
+    }
+}
+
+fn grouped_device_config(
+    device_id: GtpuSessionDeviceId,
+    ifindex: u32,
+    endpoints: GtpuLocalEndpointSet,
+) -> Option<GtpuSessionDeviceConfig> {
+    GtpuSessionDeviceConfig::new(
+        device_id,
+        ifindex,
+        endpoints.ipv4().map(|address| address.octets()),
+        endpoints.ipv6().map(|address| address.octets()),
+    )
+}
+
+fn grouped_entry_to_ebpf(entry: &GtpuSessionEntry) -> Option<EbpfSessionEntry> {
+    let context = entry.context();
+    validate_gtp_version(context.gtp_version).ok()?;
+    EbpfSessionEntry::new(
+        entry.inner_paa(),
+        endpoint_address(context.peer_address),
+        endpoint_address(entry.local_outer_address()),
+        context.local_teid.get().to_be_bytes(),
+        context.peer_teid.get().to_be_bytes(),
+        context
+            .bearer_mark
+            .map_or([0; 4], |mark| mark.get().to_be_bytes()),
+        context.egress_dscp.map(crate::DscpCodepoint::get),
+        context.downlink_source_port_policy,
+        context.uplink_source_port_policy,
+    )
+}
+
+fn grouped_record_from_model(
+    group: &GtpuSessionGroup,
+    generation: GtpuSessionGeneration,
+) -> Option<GtpuSessionGroupRecord> {
+    let mut ipv4 = None;
+    let mut ipv6 = None;
+    for entry in group.entries() {
+        let entry = grouped_entry_to_ebpf(entry)?;
+        match entry.inner_family() {
+            GtpuSessionIpFamily::Ipv4 if ipv4.replace(entry).is_none() => {}
+            GtpuSessionIpFamily::Ipv6 if ipv6.replace(entry).is_none() => {}
+            GtpuSessionIpFamily::Ipv4 | GtpuSessionIpFamily::Ipv6 => return None,
+        }
+    }
+    GtpuSessionGroupRecord::active(group.id(), group.device_id(), generation, ipv4, ipv6)
+}
+
+fn grouped_model_from_record(
+    record: GtpuSessionGroupRecord,
+    device: &GtpDevice,
+) -> Option<GtpuSessionGroup> {
+    if record.phase() != GtpuSessionGroupPhase::Active {
+        return None;
+    }
+    let mut entries = Vec::with_capacity(2);
+    for family in [GtpuSessionIpFamily::Ipv4, GtpuSessionIpFamily::Ipv6] {
+        let Some(entry) = record.entry(family) else {
+            continue;
+        };
+        let mark = u32::from_be_bytes(entry.bearer_mark());
+        let context = GtpPdpContext {
+            local_teid: Teid::new(u32::from_be_bytes(entry.local_teid()))?,
+            peer_teid: Teid::new(u32::from_be_bytes(entry.peer_teid()))?,
+            ms_address: ip_address(entry.inner_paa().canonical_address()),
+            peer_address: ip_address(entry.peer_outer_address()),
+            link_ifindex: device.ifindex,
+            downlink_source_port_policy: entry.downlink_source_port_policy(),
+            gtp_version: GtpVersion::V1,
+            bearer_mark: if mark == 0 {
+                None
+            } else {
+                Some(GtpBearerMark::new(mark)?)
+            },
+            uplink_source_port_policy: entry.uplink_source_port_policy(),
+            egress_dscp: entry
+                .egress_dscp()
+                .map(crate::DscpCodepoint::new)
+                .transpose()
+                .ok()?,
+        };
+        entries.push(GtpuSessionEntry::new(context, ip_address(entry.local_outer_address())).ok()?);
+    }
+    GtpuSessionGroup::new(record.group_id(), record.device_id(), entries).ok()
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum GroupedIndexKey {
+    Uplink([u8; GTPU_SESSION_UPLINK_KEY_LEN]),
+    Downlink([u8; GTPU_SESSION_DOWNLINK_KEY_LEN]),
+}
+
+impl fmt::Debug for GroupedIndexKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Uplink(encoded) => {
+                let family =
+                    GtpuSessionUplinkKey::decode(encoded).map(GtpuSessionUplinkKey::family);
+                formatter
+                    .debug_struct("GroupedUplinkIndexKey")
+                    .field("family", &family)
+                    .field("routing_identity", &"<redacted>")
+                    .finish()
+            }
+            Self::Downlink(encoded) => {
+                let decoded = GtpuSessionDownlinkKey::decode(encoded);
+                formatter
+                    .debug_struct("GroupedDownlinkIndexKey")
+                    .field(
+                        "outer_family",
+                        &decoded.map(GtpuSessionDownlinkKey::outer_family),
+                    )
+                    .field(
+                        "inner_family",
+                        &decoded.map(GtpuSessionDownlinkKey::inner_family),
+                    )
+                    .field("local_teid", &"<redacted>")
+                    .finish()
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct GroupedIndexElement {
+    key: GroupedIndexKey,
+    value: [u8; GTPU_SESSION_GROUP_REF_LEN],
+}
+
+impl fmt::Debug for GroupedIndexElement {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GroupedIndexElement")
+            .field("key", &self.key)
+            .field("group_reference", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct GroupedObservation {
+    authority: Option<[u8; GTPU_SESSION_GROUP_VALUE_LEN]>,
+    transaction: Option<[u8; GTPU_SESSION_TRANSACTION_VALUE_LEN]>,
+    indexes: Vec<GroupedIndexElement>,
+}
+
+impl fmt::Debug for GroupedObservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GroupedObservation")
+            .field("authority_present", &self.authority.is_some())
+            .field("transaction_present", &self.transaction.is_some())
+            .field("index_count", &self.indexes.len())
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GroupedStageRefusal {
+    Conflict(GtpuSessionGroupConflict),
+    Indeterminate(GtpuSessionGroupIndeterminateReason),
+}
+
+fn grouped_record_candidates(
+    record: GtpuSessionGroupRecord,
+) -> Option<BTreeMap<GroupedIndexKey, GtpuSessionIndexCandidate>> {
+    let mut candidates = BTreeMap::new();
+    for family in [GtpuSessionIpFamily::Ipv4, GtpuSessionIpFamily::Ipv6] {
+        let Some(entry) = record.entry(family) else {
+            continue;
+        };
+        let candidate = GtpuSessionIndexCandidate::new(record.generation(), family.slot())?;
+        for key in [
+            GroupedIndexKey::Uplink(GtpuSessionUplinkKey::from_entry(entry).encode()),
+            GroupedIndexKey::Downlink(GtpuSessionDownlinkKey::from_entry(entry).encode()),
+        ] {
+            if candidates.insert(key, candidate).is_some() {
+                return None;
+            }
+        }
+    }
+    Some(candidates)
+}
+
+fn grouped_active_indexes(record: GtpuSessionGroupRecord) -> Option<Vec<GroupedIndexElement>> {
+    let mut indexes = grouped_record_candidates(record)?
+        .into_iter()
+        .map(|(key, candidate)| GroupedIndexElement {
+            key,
+            value: GtpuSessionGroupRef::single(record.group_id(), candidate).encode(),
+        })
+        .collect::<Vec<_>>();
+    indexes.sort_unstable();
+    Some(indexes)
+}
+
+fn grouped_staged_indexes(
+    base: Option<GtpuSessionGroupRecord>,
+    desired: GtpuSessionGroupRecord,
+) -> Option<Vec<GroupedIndexElement>> {
+    let base_candidates = match base {
+        Some(base) => Some(grouped_record_candidates(base)?),
+        None => None,
+    };
+    let desired_candidates = grouped_record_candidates(desired)?;
+    let mut keys = BTreeMap::new();
+    if let Some(base) = &base_candidates {
+        for (key, candidate) in base {
+            keys.insert(*key, (Some(*candidate), None));
+        }
+    }
+    for (key, candidate) in desired_candidates {
+        keys.entry(key)
+            .and_modify(|(_, next)| *next = Some(candidate))
+            .or_insert((None, Some(candidate)));
+    }
+    keys.into_iter()
+        .map(|(key, (base, desired_candidate))| {
+            Some(GroupedIndexElement {
+                key,
+                value: GtpuSessionGroupRef::new(desired.group_id(), base, desired_candidate)?
+                    .encode(),
+            })
+        })
+        .collect()
+}
+
+fn grouped_inventory_elements(
+    mut inventory: EbpfSessionIndexInventory,
+) -> Vec<GroupedIndexElement> {
+    let mut indexes = Vec::with_capacity(inventory.uplink.len() + inventory.downlink.len());
+    indexes.extend(
+        inventory
+            .uplink
+            .drain(..)
+            .map(|(key, value)| GroupedIndexElement {
+                key: GroupedIndexKey::Uplink(key),
+                value,
+            }),
+    );
+    indexes.extend(
+        inventory
+            .downlink
+            .drain(..)
+            .map(|(key, value)| GroupedIndexElement {
+                key: GroupedIndexKey::Downlink(key),
+                value,
+            }),
+    );
+    indexes.sort_unstable();
+    indexes
 }
 
 #[derive(Clone, Copy)]
@@ -702,6 +1185,17 @@ impl EbpfGtpuDataplaneBackend {
         self.inner.config.bpffs_pin_root.join(interface)
     }
 
+    fn grouped_pin_dir(&self, device_id: GtpuSessionDeviceId) -> PathBuf {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut namespace = String::with_capacity(3 + GTPU_SESSION_GROUP_ID_LEN * 2);
+        namespace.push_str("v6-");
+        for byte in device_id.to_bytes() {
+            namespace.push(char::from(HEX[usize::from(byte >> 4)]));
+            namespace.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+        self.inner.config.bpffs_pin_root.join(namespace)
+    }
+
     fn devices(&self) -> Result<std::sync::MutexGuard<'_, HashMap<u32, ManagedDevice>>, GtpuError> {
         self.inner
             .devices
@@ -714,6 +1208,1131 @@ impl EbpfGtpuDataplaneBackend {
             .operation_lock
             .lock()
             .map_err(|_| GtpuError::io("ebpf_reconciliation", poisoned_lock()))
+    }
+
+    fn grouped_attachment_context(
+        &self,
+        device_id: GtpuSessionDeviceId,
+    ) -> Result<GroupedAttachmentContext, GtpuSessionGroupIndeterminateReason> {
+        let (device, grouped) = {
+            let devices = self
+                .devices()
+                .map_err(|_| GtpuSessionGroupIndeterminateReason::AuthorityUnavailable)?;
+            devices
+                .iter()
+                .find_map(|(ifindex, managed)| {
+                    managed
+                        .grouped
+                        .filter(|grouped| grouped.device_id == device_id)
+                        .map(|grouped| {
+                            (
+                                GtpDevice {
+                                    name: managed.name.clone(),
+                                    ifindex: *ifindex,
+                                },
+                                grouped,
+                            )
+                        })
+                })
+                .ok_or(GtpuSessionGroupIndeterminateReason::AttachmentIdentityMismatch)?
+        };
+        let config =
+            grouped_device_config(grouped.device_id, device.ifindex, grouped.local_endpoints)
+                .ok_or(GtpuSessionGroupIndeterminateReason::EndpointAuthorityMismatch)?
+                .encode();
+        let context = GroupedAttachmentContext {
+            device,
+            grouped,
+            config,
+        };
+        self.ensure_grouped_attachment(&context)?;
+        Ok(context)
+    }
+
+    fn ensure_grouped_attachment(
+        &self,
+        context: &GroupedAttachmentContext,
+    ) -> Result<(), GtpuSessionGroupIndeterminateReason> {
+        let process_binding_is_exact = self.devices().is_ok_and(|devices| {
+            devices.get(&context.device.ifindex).is_some_and(|managed| {
+                managed.name == context.device.name
+                    && managed.local_ip.is_none()
+                    && managed.grouped == Some(context.grouped)
+            }) && devices
+                .values()
+                .filter(|managed| {
+                    managed
+                        .grouped
+                        .is_some_and(|grouped| grouped.device_id == context.grouped.device_id)
+                })
+                .count()
+                == 1
+        });
+        if !process_binding_is_exact {
+            return Err(GtpuSessionGroupIndeterminateReason::AttachmentIdentityMismatch);
+        }
+        if !matches!(
+            self.inner.runtime.ifindex_by_name(&context.device.name),
+            Ok(ifindex) if ifindex == context.device.ifindex
+        ) {
+            return Err(GtpuSessionGroupIndeterminateReason::AttachmentIdentityMismatch);
+        }
+        if !self
+            .inner
+            .runtime
+            .grouped_datapath_usable(context.device.ifindex, context.config)
+        {
+            return Err(GtpuSessionGroupIndeterminateReason::AuthorityUnavailable);
+        }
+        Ok(())
+    }
+
+    fn validate_grouped_model_attachment(
+        &self,
+        group: &GtpuSessionGroup,
+        context: &GroupedAttachmentContext,
+    ) -> Result<(), GtpuSessionGroupIndeterminateReason> {
+        group
+            .validate_attachment(
+                context.grouped.device_id,
+                &context.device,
+                context.grouped.local_endpoints,
+            )
+            .map_err(|error| match error {
+                crate::GtpuSessionModelError::DeviceIdentityMismatch
+                | crate::GtpuSessionModelError::AttachmentMismatch => {
+                    GtpuSessionGroupIndeterminateReason::AttachmentIdentityMismatch
+                }
+                crate::GtpuSessionModelError::LocalEndpointNotManaged => {
+                    GtpuSessionGroupIndeterminateReason::EndpointAuthorityMismatch
+                }
+                _ => GtpuSessionGroupIndeterminateReason::IncompleteState,
+            })
+    }
+
+    fn grouped_observation(
+        &self,
+        ifindex: u32,
+        group_id: opc_gtpu_ebpf_common::GtpuSessionGroupId,
+    ) -> Result<GroupedObservation, GtpuError> {
+        let key = group_id.to_bytes();
+        Ok(GroupedObservation {
+            authority: self.inner.runtime.session_group_get(ifindex, key)?,
+            transaction: self.inner.runtime.session_transaction_get(ifindex, key)?,
+            indexes: grouped_inventory_elements(
+                self.inner.runtime.session_index_inventory(ifindex, key)?,
+            ),
+        })
+    }
+
+    fn stable_grouped_observation(
+        &self,
+        context: &GroupedAttachmentContext,
+        group_id: opc_gtpu_ebpf_common::GtpuSessionGroupId,
+    ) -> Result<Option<GroupedObservation>, GtpuSessionGroupIndeterminateReason> {
+        self.ensure_grouped_attachment(context)?;
+        let first = self
+            .grouped_observation(context.device.ifindex, group_id)
+            .map_err(|_| GtpuSessionGroupIndeterminateReason::IncompleteState)?;
+        let second = self
+            .grouped_observation(context.device.ifindex, group_id)
+            .map_err(|_| GtpuSessionGroupIndeterminateReason::IncompleteState)?;
+        self.ensure_grouped_attachment(context)?;
+        Ok((first == second).then_some(first))
+    }
+
+    fn classify_grouped_readback(
+        &self,
+        selector: GtpuSessionGroupSelector,
+        context: &GroupedAttachmentContext,
+        observation: GroupedObservation,
+    ) -> GtpuSessionGroupReadback {
+        if observation.authority.is_none()
+            && observation.transaction.is_none()
+            && observation.indexes.is_empty()
+        {
+            return GtpuSessionGroupReadback::Absent;
+        }
+        if observation.transaction.is_some() {
+            return GtpuSessionGroupReadback::Indeterminate(
+                GtpuSessionGroupIndeterminateReason::IncompleteState,
+            );
+        }
+        let Some(encoded) = observation.authority else {
+            return GtpuSessionGroupReadback::Indeterminate(
+                GtpuSessionGroupIndeterminateReason::IncompleteState,
+            );
+        };
+        let Some(record) = GtpuSessionGroupRecord::decode(&encoded) else {
+            return GtpuSessionGroupReadback::Indeterminate(
+                GtpuSessionGroupIndeterminateReason::IncompleteState,
+            );
+        };
+        if record.group_id() != selector.id() || record.device_id() != selector.device_id() {
+            return GtpuSessionGroupReadback::Indeterminate(
+                GtpuSessionGroupIndeterminateReason::AttachmentIdentityMismatch,
+            );
+        }
+        if record.phase() != GtpuSessionGroupPhase::Active
+            || grouped_active_indexes(record).as_ref() != Some(&observation.indexes)
+        {
+            return GtpuSessionGroupReadback::Indeterminate(
+                GtpuSessionGroupIndeterminateReason::IncompleteState,
+            );
+        }
+        let Some(group) = grouped_model_from_record(record, &context.device) else {
+            return GtpuSessionGroupReadback::Indeterminate(
+                GtpuSessionGroupIndeterminateReason::IncompleteState,
+            );
+        };
+        match self.validate_grouped_model_attachment(&group, context) {
+            Ok(()) => GtpuSessionGroupReadback::Active(group),
+            Err(reason) => GtpuSessionGroupReadback::Indeterminate(reason),
+        }
+    }
+
+    fn read_pdp_context_group_sync(
+        &self,
+        selector: GtpuSessionGroupSelector,
+    ) -> Result<GtpuSessionGroupReadback, GtpuError> {
+        let _operation = self.operation_guard()?;
+        let context = match self.grouped_attachment_context(selector.device_id()) {
+            Ok(context) => context,
+            Err(reason) => return Ok(GtpuSessionGroupReadback::Indeterminate(reason)),
+        };
+        match self.stable_grouped_observation(&context, selector.id()) {
+            Ok(Some(observation)) => {
+                Ok(self.classify_grouped_readback(selector, &context, observation))
+            }
+            Ok(None) => Ok(GtpuSessionGroupReadback::Indeterminate(
+                GtpuSessionGroupIndeterminateReason::StateChanged,
+            )),
+            Err(reason) => Ok(GtpuSessionGroupReadback::Indeterminate(reason)),
+        }
+    }
+
+    fn grouped_index_get(
+        &self,
+        ifindex: u32,
+        key: GroupedIndexKey,
+    ) -> Result<Option<[u8; GTPU_SESSION_GROUP_REF_LEN]>, GtpuError> {
+        match key {
+            GroupedIndexKey::Uplink(key) => self.inner.runtime.session_uplink_get(ifindex, key),
+            GroupedIndexKey::Downlink(key) => self.inner.runtime.session_downlink_get(ifindex, key),
+        }
+    }
+
+    fn grouped_index_put(
+        &self,
+        ifindex: u32,
+        element: GroupedIndexElement,
+        mode: EbpfMapUpdateMode,
+    ) -> Result<(), GtpuError> {
+        match element.key {
+            GroupedIndexKey::Uplink(key) => {
+                self.inner
+                    .runtime
+                    .session_uplink_put(ifindex, key, element.value, mode)
+            }
+            GroupedIndexKey::Downlink(key) => {
+                self.inner
+                    .runtime
+                    .session_downlink_put(ifindex, key, element.value, mode)
+            }
+        }
+    }
+
+    fn grouped_index_remove(&self, ifindex: u32, key: GroupedIndexKey) -> Result<bool, GtpuError> {
+        match key {
+            GroupedIndexKey::Uplink(key) => self.inner.runtime.session_uplink_remove(ifindex, key),
+            GroupedIndexKey::Downlink(key) => {
+                self.inner.runtime.session_downlink_remove(ifindex, key)
+            }
+        }
+    }
+
+    fn put_grouped_journal_exact(
+        &self,
+        context: &GroupedAttachmentContext,
+        journal: GtpuSessionTransactionRecord,
+        mode: EbpfMapUpdateMode,
+    ) -> Result<(), GtpuSessionGroupIndeterminateReason> {
+        self.ensure_grouped_attachment(context)?;
+        let key = journal.group_id().to_bytes();
+        let expected = journal.encode();
+        let current = self
+            .inner
+            .runtime
+            .session_transaction_get(context.device.ifindex, key)
+            .map_err(|_| GtpuSessionGroupIndeterminateReason::MutationUnconfirmed)?;
+        if current == Some(expected) {
+            return Ok(());
+        }
+        if current.is_some() {
+            return Err(GtpuSessionGroupIndeterminateReason::JournalMismatch);
+        }
+        let _ =
+            self.inner
+                .runtime
+                .session_transaction_put(context.device.ifindex, key, expected, mode);
+        self.ensure_grouped_attachment(context)?;
+        match self
+            .inner
+            .runtime
+            .session_transaction_get(context.device.ifindex, key)
+        {
+            Ok(Some(observed)) if observed == expected => Ok(()),
+            Ok(Some(_)) => Err(GtpuSessionGroupIndeterminateReason::JournalMismatch),
+            Ok(None) | Err(_) => Err(GtpuSessionGroupIndeterminateReason::MutationUnconfirmed),
+        }
+    }
+
+    fn replace_grouped_journal_exact(
+        &self,
+        context: &GroupedAttachmentContext,
+        prior: GtpuSessionTransactionRecord,
+        next: GtpuSessionTransactionRecord,
+    ) -> Result<(), GtpuSessionGroupIndeterminateReason> {
+        self.ensure_grouped_attachment(context)?;
+        let key = prior.group_id().to_bytes();
+        let prior = prior.encode();
+        let next = next.encode();
+        match self
+            .inner
+            .runtime
+            .session_transaction_get(context.device.ifindex, key)
+        {
+            Ok(Some(current)) if current == next => return Ok(()),
+            Ok(Some(current)) if current == prior => {}
+            Ok(_) => return Err(GtpuSessionGroupIndeterminateReason::JournalMismatch),
+            Err(_) => return Err(GtpuSessionGroupIndeterminateReason::MutationUnconfirmed),
+        }
+        let _ = self.inner.runtime.session_transaction_put(
+            context.device.ifindex,
+            key,
+            next,
+            EbpfMapUpdateMode::Exist,
+        );
+        self.ensure_grouped_attachment(context)?;
+        match self
+            .inner
+            .runtime
+            .session_transaction_get(context.device.ifindex, key)
+        {
+            Ok(Some(current)) if current == next => Ok(()),
+            Ok(Some(_)) => Err(GtpuSessionGroupIndeterminateReason::JournalMismatch),
+            Ok(None) | Err(_) => Err(GtpuSessionGroupIndeterminateReason::MutationUnconfirmed),
+        }
+    }
+
+    fn put_grouped_authority_exact(
+        &self,
+        context: &GroupedAttachmentContext,
+        expected_prior: Option<GtpuSessionGroupRecord>,
+        desired: GtpuSessionGroupRecord,
+    ) -> Result<(), GtpuSessionGroupIndeterminateReason> {
+        self.ensure_grouped_attachment(context)?;
+        let key = desired.group_id().to_bytes();
+        let desired_bytes = desired.encode();
+        let current = self
+            .inner
+            .runtime
+            .session_group_get(context.device.ifindex, key)
+            .map_err(|_| GtpuSessionGroupIndeterminateReason::MutationUnconfirmed)?;
+        if current == Some(desired_bytes) {
+            return Ok(());
+        }
+        if current != expected_prior.map(GtpuSessionGroupRecord::encode) {
+            return Err(GtpuSessionGroupIndeterminateReason::JournalMismatch);
+        }
+        let mode = if expected_prior.is_some() {
+            EbpfMapUpdateMode::Exist
+        } else {
+            EbpfMapUpdateMode::NoExist
+        };
+        let _ =
+            self.inner
+                .runtime
+                .session_group_put(context.device.ifindex, key, desired_bytes, mode);
+        self.ensure_grouped_attachment(context)?;
+        match self
+            .inner
+            .runtime
+            .session_group_get(context.device.ifindex, key)
+        {
+            Ok(Some(current)) if current == desired_bytes => Ok(()),
+            Ok(Some(_)) => Err(GtpuSessionGroupIndeterminateReason::JournalMismatch),
+            Ok(None) | Err(_) => Err(GtpuSessionGroupIndeterminateReason::MutationUnconfirmed),
+        }
+    }
+
+    fn put_grouped_index_exact(
+        &self,
+        context: &GroupedAttachmentContext,
+        expected_prior: Option<[u8; GTPU_SESSION_GROUP_REF_LEN]>,
+        desired: GroupedIndexElement,
+    ) -> Result<(), GtpuSessionGroupIndeterminateReason> {
+        self.ensure_grouped_attachment(context)?;
+        let current = self
+            .grouped_index_get(context.device.ifindex, desired.key)
+            .map_err(|_| GtpuSessionGroupIndeterminateReason::MutationUnconfirmed)?;
+        if current == Some(desired.value) {
+            return Ok(());
+        }
+        if current != expected_prior {
+            return Err(GtpuSessionGroupIndeterminateReason::JournalMismatch);
+        }
+        let mode = if expected_prior.is_some() {
+            EbpfMapUpdateMode::Exist
+        } else {
+            EbpfMapUpdateMode::NoExist
+        };
+        let _ = self.grouped_index_put(context.device.ifindex, desired, mode);
+        self.ensure_grouped_attachment(context)?;
+        match self.grouped_index_get(context.device.ifindex, desired.key) {
+            Ok(Some(current)) if current == desired.value => Ok(()),
+            Ok(Some(_)) => Err(GtpuSessionGroupIndeterminateReason::JournalMismatch),
+            Ok(None) | Err(_) => Err(GtpuSessionGroupIndeterminateReason::MutationUnconfirmed),
+        }
+    }
+
+    fn remove_grouped_index_exact(
+        &self,
+        context: &GroupedAttachmentContext,
+        expected: GroupedIndexElement,
+    ) -> Result<(), GtpuSessionGroupIndeterminateReason> {
+        self.ensure_grouped_attachment(context)?;
+        match self.grouped_index_get(context.device.ifindex, expected.key) {
+            Ok(None) => return Ok(()),
+            Ok(Some(current)) if current == expected.value => {}
+            Ok(Some(_)) => return Err(GtpuSessionGroupIndeterminateReason::JournalMismatch),
+            Err(_) => return Err(GtpuSessionGroupIndeterminateReason::MutationUnconfirmed),
+        }
+        let _ = self.grouped_index_remove(context.device.ifindex, expected.key);
+        self.ensure_grouped_attachment(context)?;
+        match self.grouped_index_get(context.device.ifindex, expected.key) {
+            Ok(None) => Ok(()),
+            Ok(Some(current)) if current == expected.value => {
+                Err(GtpuSessionGroupIndeterminateReason::MutationUnconfirmed)
+            }
+            Ok(Some(_)) => Err(GtpuSessionGroupIndeterminateReason::JournalMismatch),
+            Err(_) => Err(GtpuSessionGroupIndeterminateReason::MutationUnconfirmed),
+        }
+    }
+
+    fn remove_grouped_authority_exact(
+        &self,
+        context: &GroupedAttachmentContext,
+        expected: GtpuSessionGroupRecord,
+    ) -> Result<(), GtpuSessionGroupIndeterminateReason> {
+        self.ensure_grouped_attachment(context)?;
+        let key = expected.group_id().to_bytes();
+        let expected = expected.encode();
+        match self
+            .inner
+            .runtime
+            .session_group_get(context.device.ifindex, key)
+        {
+            Ok(None) => return Ok(()),
+            Ok(Some(current)) if current == expected => {}
+            Ok(Some(_)) => return Err(GtpuSessionGroupIndeterminateReason::JournalMismatch),
+            Err(_) => return Err(GtpuSessionGroupIndeterminateReason::MutationUnconfirmed),
+        }
+        let _ = self
+            .inner
+            .runtime
+            .session_group_remove(context.device.ifindex, key);
+        self.ensure_grouped_attachment(context)?;
+        match self
+            .inner
+            .runtime
+            .session_group_get(context.device.ifindex, key)
+        {
+            Ok(None) => Ok(()),
+            Ok(Some(current)) if current == expected => {
+                Err(GtpuSessionGroupIndeterminateReason::MutationUnconfirmed)
+            }
+            Ok(Some(_)) => Err(GtpuSessionGroupIndeterminateReason::JournalMismatch),
+            Err(_) => Err(GtpuSessionGroupIndeterminateReason::MutationUnconfirmed),
+        }
+    }
+
+    fn remove_grouped_journal_exact(
+        &self,
+        context: &GroupedAttachmentContext,
+        expected: GtpuSessionTransactionRecord,
+    ) -> Result<(), GtpuSessionGroupIndeterminateReason> {
+        self.ensure_grouped_attachment(context)?;
+        let key = expected.group_id().to_bytes();
+        let expected = expected.encode();
+        match self
+            .inner
+            .runtime
+            .session_transaction_get(context.device.ifindex, key)
+        {
+            Ok(None) => return Ok(()),
+            Ok(Some(current)) if current == expected => {}
+            Ok(Some(_)) => return Err(GtpuSessionGroupIndeterminateReason::JournalMismatch),
+            Err(_) => return Err(GtpuSessionGroupIndeterminateReason::MutationUnconfirmed),
+        }
+        let _ = self
+            .inner
+            .runtime
+            .session_transaction_remove(context.device.ifindex, key);
+        self.ensure_grouped_attachment(context)?;
+        match self
+            .inner
+            .runtime
+            .session_transaction_get(context.device.ifindex, key)
+        {
+            Ok(None) => Ok(()),
+            Ok(Some(current)) if current == expected => {
+                Err(GtpuSessionGroupIndeterminateReason::MutationUnconfirmed)
+            }
+            Ok(Some(_)) => Err(GtpuSessionGroupIndeterminateReason::JournalMismatch),
+            Err(_) => Err(GtpuSessionGroupIndeterminateReason::MutationUnconfirmed),
+        }
+    }
+
+    fn execute_grouped_install_journal(
+        &self,
+        context: &GroupedAttachmentContext,
+        mut journal: GtpuSessionTransactionRecord,
+    ) -> Result<(), GtpuSessionGroupIndeterminateReason> {
+        let desired = journal
+            .desired()
+            .ok_or(GtpuSessionGroupIndeterminateReason::JournalMismatch)?;
+        let base = journal.base();
+        let staged = grouped_staged_indexes(base, desired)
+            .ok_or(GtpuSessionGroupIndeterminateReason::JournalMismatch)?;
+        let base_indexes = match base {
+            Some(base) => grouped_active_indexes(base)
+                .ok_or(GtpuSessionGroupIndeterminateReason::JournalMismatch)?,
+            None => Vec::new(),
+        }
+        .into_iter()
+        .map(|element| (element.key, element.value))
+        .collect::<BTreeMap<_, _>>();
+        let desired_indexes = grouped_active_indexes(desired)
+            .ok_or(GtpuSessionGroupIndeterminateReason::JournalMismatch)?;
+
+        if journal.phase() == GtpuSessionTransactionPhase::Prepared {
+            if base.is_none() {
+                let pending = journal
+                    .fence_authority()
+                    .ok_or(GtpuSessionGroupIndeterminateReason::JournalMismatch)?;
+                self.put_grouped_authority_exact(context, None, pending)?;
+            }
+            for element in &staged {
+                self.put_grouped_index_exact(
+                    context,
+                    base_indexes.get(&element.key).copied(),
+                    *element,
+                )?;
+            }
+            let next = journal
+                .advance()
+                .ok_or(GtpuSessionGroupIndeterminateReason::JournalMismatch)?;
+            self.replace_grouped_journal_exact(context, journal, next)?;
+            journal = next;
+        }
+
+        if journal.phase() == GtpuSessionTransactionPhase::IndexesStaged {
+            let prior = match base {
+                Some(base) => base,
+                None => GtpuSessionTransactionRecord::prepare(
+                    journal.group_id(),
+                    journal.transaction_id(),
+                    None,
+                    Some(desired),
+                )
+                .and_then(GtpuSessionTransactionRecord::fence_authority)
+                .ok_or(GtpuSessionGroupIndeterminateReason::JournalMismatch)?,
+            };
+            self.put_grouped_authority_exact(context, Some(prior), desired)?;
+            let next = journal
+                .advance()
+                .ok_or(GtpuSessionGroupIndeterminateReason::JournalMismatch)?;
+            self.replace_grouped_journal_exact(context, journal, next)?;
+            journal = next;
+        }
+
+        if journal.phase() != GtpuSessionTransactionPhase::AuthorityCommitted {
+            return Err(GtpuSessionGroupIndeterminateReason::JournalMismatch);
+        }
+        let staged_by_key = staged
+            .iter()
+            .map(|element| (element.key, element.value))
+            .collect::<BTreeMap<_, _>>();
+        let desired_by_key = desired_indexes
+            .iter()
+            .map(|element| (element.key, element.value))
+            .collect::<BTreeMap<_, _>>();
+        for element in &desired_indexes {
+            self.put_grouped_index_exact(
+                context,
+                staged_by_key.get(&element.key).copied(),
+                *element,
+            )?;
+        }
+        for element in staged {
+            if !desired_by_key.contains_key(&element.key) {
+                self.remove_grouped_index_exact(context, element)?;
+            }
+        }
+        let observation = self
+            .grouped_observation(context.device.ifindex, journal.group_id())
+            .map_err(|_| GtpuSessionGroupIndeterminateReason::MutationUnconfirmed)?;
+        if observation.authority != Some(desired.encode())
+            || observation.transaction != Some(journal.encode())
+            || observation.indexes != desired_indexes
+        {
+            return Err(GtpuSessionGroupIndeterminateReason::MutationUnconfirmed);
+        }
+        self.remove_grouped_journal_exact(context, journal)?;
+        let final_observation = self
+            .stable_grouped_observation(context, journal.group_id())?
+            .ok_or(GtpuSessionGroupIndeterminateReason::StateChanged)?;
+        if final_observation.authority == Some(desired.encode())
+            && final_observation.transaction.is_none()
+            && final_observation.indexes == desired_indexes
+        {
+            Ok(())
+        } else {
+            Err(GtpuSessionGroupIndeterminateReason::MutationUnconfirmed)
+        }
+    }
+
+    fn execute_grouped_removal_journal(
+        &self,
+        context: &GroupedAttachmentContext,
+        mut journal: GtpuSessionTransactionRecord,
+    ) -> Result<(), GtpuSessionGroupIndeterminateReason> {
+        let base = journal
+            .base()
+            .ok_or(GtpuSessionGroupIndeterminateReason::JournalMismatch)?;
+        if journal.desired().is_some() {
+            return Err(GtpuSessionGroupIndeterminateReason::JournalMismatch);
+        }
+        let prepared = GtpuSessionTransactionRecord::prepare(
+            journal.group_id(),
+            journal.transaction_id(),
+            Some(base),
+            None,
+        )
+        .ok_or(GtpuSessionGroupIndeterminateReason::JournalMismatch)?;
+        let removing = prepared
+            .fence_authority()
+            .ok_or(GtpuSessionGroupIndeterminateReason::JournalMismatch)?;
+        if journal.phase() == GtpuSessionTransactionPhase::Prepared {
+            self.put_grouped_authority_exact(context, Some(base), removing)?;
+            let next = journal
+                .advance()
+                .ok_or(GtpuSessionGroupIndeterminateReason::JournalMismatch)?;
+            self.replace_grouped_journal_exact(context, journal, next)?;
+            journal = next;
+        }
+        if journal.phase() != GtpuSessionTransactionPhase::AuthorityCommitted {
+            return Err(GtpuSessionGroupIndeterminateReason::JournalMismatch);
+        }
+        for element in grouped_active_indexes(base)
+            .ok_or(GtpuSessionGroupIndeterminateReason::JournalMismatch)?
+        {
+            self.remove_grouped_index_exact(context, element)?;
+        }
+        self.remove_grouped_authority_exact(context, removing)?;
+        let observation = self
+            .grouped_observation(context.device.ifindex, journal.group_id())
+            .map_err(|_| GtpuSessionGroupIndeterminateReason::MutationUnconfirmed)?;
+        if observation.authority.is_some()
+            || observation.transaction != Some(journal.encode())
+            || !observation.indexes.is_empty()
+        {
+            return Err(GtpuSessionGroupIndeterminateReason::MutationUnconfirmed);
+        }
+        self.remove_grouped_journal_exact(context, journal)?;
+        let final_observation = self
+            .stable_grouped_observation(context, journal.group_id())?
+            .ok_or(GtpuSessionGroupIndeterminateReason::StateChanged)?;
+        if final_observation.authority.is_none()
+            && final_observation.transaction.is_none()
+            && final_observation.indexes.is_empty()
+        {
+            Ok(())
+        } else {
+            Err(GtpuSessionGroupIndeterminateReason::MutationUnconfirmed)
+        }
+    }
+
+    fn preflight_grouped_index_stage(
+        &self,
+        context: &GroupedAttachmentContext,
+        base: Option<GtpuSessionGroupRecord>,
+        desired: GtpuSessionGroupRecord,
+    ) -> Result<(), GroupedStageRefusal> {
+        self.ensure_grouped_attachment(context)
+            .map_err(GroupedStageRefusal::Indeterminate)?;
+        let base_indexes = match base {
+            Some(base) => {
+                grouped_active_indexes(base).ok_or(GroupedStageRefusal::Indeterminate(
+                    GtpuSessionGroupIndeterminateReason::IncompleteState,
+                ))?
+            }
+            None => Vec::new(),
+        }
+        .into_iter()
+        .map(|element| (element.key, element.value))
+        .collect::<BTreeMap<_, _>>();
+        let staged =
+            grouped_staged_indexes(base, desired).ok_or(GroupedStageRefusal::Indeterminate(
+                GtpuSessionGroupIndeterminateReason::IncompleteState,
+            ))?;
+        for element in staged {
+            let current = self
+                .grouped_index_get(context.device.ifindex, element.key)
+                .map_err(|_| {
+                    GroupedStageRefusal::Indeterminate(
+                        GtpuSessionGroupIndeterminateReason::AuthorityUnavailable,
+                    )
+                })?;
+            let expected = base_indexes.get(&element.key).copied();
+            if current == expected {
+                continue;
+            }
+            let Some(current) = current else {
+                return Err(GroupedStageRefusal::Indeterminate(
+                    GtpuSessionGroupIndeterminateReason::IncompleteState,
+                ));
+            };
+            match GtpuSessionGroupRef::decode(&current) {
+                Some(reference) if reference.group_id() != desired.group_id() => {
+                    return Err(GroupedStageRefusal::Conflict(
+                        GtpuSessionGroupConflict::SelectorOwnedByAnotherGroup,
+                    ));
+                }
+                Some(_) | None => {
+                    return Err(GroupedStageRefusal::Indeterminate(
+                        GtpuSessionGroupIndeterminateReason::IncompleteState,
+                    ));
+                }
+            }
+        }
+        self.ensure_grouped_attachment(context)
+            .map_err(GroupedStageRefusal::Indeterminate)
+    }
+
+    fn validate_grouped_selector_provenance(
+        &self,
+        context: &GroupedAttachmentContext,
+        desired: &GtpuSessionGroup,
+        base: Option<GtpuSessionGroupRecord>,
+        provenance: &GtpuSessionSelectorProvenance,
+    ) -> Result<(), GtpuSessionGroupIndeterminateReason> {
+        let GtpuSessionSelectorProvenance::Reused(proof) = provenance else {
+            return Ok(());
+        };
+        let retired = proof.retired_group();
+        self.validate_grouped_model_attachment(retired, context)?;
+        let desired_record = grouped_record_from_model(desired, GtpuSessionGeneration::INITIAL)
+            .ok_or(GtpuSessionGroupIndeterminateReason::IncompleteState)?;
+        let retired_record = grouped_record_from_model(retired, GtpuSessionGeneration::INITIAL)
+            .ok_or(GtpuSessionGroupIndeterminateReason::GraceUnproven)?;
+        let desired_keys = grouped_record_candidates(desired_record)
+            .ok_or(GtpuSessionGroupIndeterminateReason::IncompleteState)?;
+        let retired_keys = grouped_record_candidates(retired_record)
+            .ok_or(GtpuSessionGroupIndeterminateReason::GraceUnproven)?;
+        let base_keys = match base {
+            Some(base) => grouped_record_candidates(base)
+                .ok_or(GtpuSessionGroupIndeterminateReason::IncompleteState)?,
+            None => BTreeMap::new(),
+        };
+        let introduced_keys = desired_keys
+            .keys()
+            .filter(|key| !base_keys.contains_key(key))
+            .copied()
+            .collect::<Vec<_>>();
+        if introduced_keys.is_empty()
+            || !introduced_keys
+                .iter()
+                .all(|key| retired_keys.contains_key(key))
+        {
+            return Err(GtpuSessionGroupIndeterminateReason::GraceUnproven);
+        }
+        let retired_observation = self
+            .stable_grouped_observation(context, retired.id())?
+            .ok_or(GtpuSessionGroupIndeterminateReason::StateChanged)?;
+        if retired_observation.authority.is_none()
+            && retired_observation.transaction.is_none()
+            && retired_observation.indexes.is_empty()
+        {
+            Ok(())
+        } else {
+            Err(GtpuSessionGroupIndeterminateReason::GraceUnproven)
+        }
+    }
+
+    fn reconcile_pdp_context_group_sync(
+        &self,
+        request: GtpuSessionGroupReconcileRequest,
+    ) -> Result<GtpuSessionGroupReconcileOutcome, GtpuError> {
+        let _operation = self.operation_guard()?;
+        let (desired, provenance) = request.into_parts();
+        let context = match self.grouped_attachment_context(desired.device_id()) {
+            Ok(context) => context,
+            Err(reason) => return Ok(GtpuSessionGroupReconcileOutcome::Indeterminate(reason)),
+        };
+        if let Err(reason) = self.validate_grouped_model_attachment(&desired, &context) {
+            return Ok(GtpuSessionGroupReconcileOutcome::Indeterminate(reason));
+        }
+        let observation = match self.stable_grouped_observation(&context, desired.id()) {
+            Ok(Some(observation)) => observation,
+            Ok(None) => {
+                return Ok(GtpuSessionGroupReconcileOutcome::Indeterminate(
+                    GtpuSessionGroupIndeterminateReason::StateChanged,
+                ));
+            }
+            Err(reason) => return Ok(GtpuSessionGroupReconcileOutcome::Indeterminate(reason)),
+        };
+
+        if let Some(encoded_journal) = observation.transaction {
+            let Some(journal) = GtpuSessionTransactionRecord::decode(&encoded_journal) else {
+                return Ok(GtpuSessionGroupReconcileOutcome::Indeterminate(
+                    GtpuSessionGroupIndeterminateReason::JournalMismatch,
+                ));
+            };
+            if journal.group_id() != desired.id()
+                || journal
+                    .base()
+                    .is_some_and(|base| base.device_id() != desired.device_id())
+                || journal
+                    .desired()
+                    .is_some_and(|next| next.device_id() != desired.device_id())
+            {
+                return Ok(GtpuSessionGroupReconcileOutcome::Indeterminate(
+                    GtpuSessionGroupIndeterminateReason::JournalMismatch,
+                ));
+            }
+            if journal.desired().is_none() {
+                return match self.execute_grouped_removal_journal(&context, journal) {
+                    Ok(()) => Err(GtpuError::RetryRequired {
+                        operation: "ebpf_grouped_reconcile_after_removal",
+                    }),
+                    Err(reason) => Ok(GtpuSessionGroupReconcileOutcome::Indeterminate(reason)),
+                };
+            }
+            let expected_desired = grouped_record_from_model(&desired, journal.target_generation());
+            if journal.desired() != expected_desired {
+                return Ok(GtpuSessionGroupReconcileOutcome::Indeterminate(
+                    GtpuSessionGroupIndeterminateReason::JournalMismatch,
+                ));
+            }
+            return match self.execute_grouped_install_journal(&context, journal) {
+                Ok(()) => Ok(GtpuSessionGroupReconcileOutcome::Activated),
+                Err(reason) => Ok(GtpuSessionGroupReconcileOutcome::Indeterminate(reason)),
+            };
+        }
+
+        let base = match observation.authority {
+            None if observation.indexes.is_empty() => None,
+            None => {
+                return Ok(GtpuSessionGroupReconcileOutcome::Indeterminate(
+                    GtpuSessionGroupIndeterminateReason::IncompleteState,
+                ));
+            }
+            Some(encoded) => {
+                let Some(record) = GtpuSessionGroupRecord::decode(&encoded) else {
+                    return Ok(GtpuSessionGroupReconcileOutcome::Indeterminate(
+                        GtpuSessionGroupIndeterminateReason::IncompleteState,
+                    ));
+                };
+                if record.group_id() != desired.id() {
+                    return Ok(GtpuSessionGroupReconcileOutcome::Indeterminate(
+                        GtpuSessionGroupIndeterminateReason::IncompleteState,
+                    ));
+                }
+                if record.device_id() != desired.device_id() {
+                    return Ok(GtpuSessionGroupReconcileOutcome::Conflict(
+                        GtpuSessionGroupConflict::DeviceAlias,
+                    ));
+                }
+                if record.phase() != GtpuSessionGroupPhase::Active
+                    || grouped_active_indexes(record).as_ref() != Some(&observation.indexes)
+                {
+                    return Ok(GtpuSessionGroupReconcileOutcome::Indeterminate(
+                        GtpuSessionGroupIndeterminateReason::JournalMismatch,
+                    ));
+                }
+                let Some(active) = grouped_model_from_record(record, &context.device) else {
+                    return Ok(GtpuSessionGroupReconcileOutcome::Indeterminate(
+                        GtpuSessionGroupIndeterminateReason::IncompleteState,
+                    ));
+                };
+                if let Err(reason) = self.validate_grouped_model_attachment(&active, &context) {
+                    return Ok(GtpuSessionGroupReconcileOutcome::Indeterminate(reason));
+                }
+                if active == desired {
+                    return Ok(GtpuSessionGroupReconcileOutcome::ExactAlreadyActive);
+                }
+                Some(record)
+            }
+        };
+        if let Err(reason) =
+            self.validate_grouped_selector_provenance(&context, &desired, base, &provenance)
+        {
+            return Ok(GtpuSessionGroupReconcileOutcome::Indeterminate(reason));
+        }
+        let generation = match base {
+            Some(base) => match base.generation().checked_next() {
+                Some(generation) => generation,
+                None => {
+                    return Ok(GtpuSessionGroupReconcileOutcome::Indeterminate(
+                        GtpuSessionGroupIndeterminateReason::GenerationExhausted,
+                    ));
+                }
+            },
+            None => GtpuSessionGeneration::INITIAL,
+        };
+        let Some(desired_record) = grouped_record_from_model(&desired, generation) else {
+            return Ok(GtpuSessionGroupReconcileOutcome::Indeterminate(
+                GtpuSessionGroupIndeterminateReason::IncompleteState,
+            ));
+        };
+        match self.preflight_grouped_index_stage(&context, base, desired_record) {
+            Ok(()) => {}
+            Err(GroupedStageRefusal::Conflict(conflict)) => {
+                return Ok(GtpuSessionGroupReconcileOutcome::Conflict(conflict));
+            }
+            Err(GroupedStageRefusal::Indeterminate(reason)) => {
+                return Ok(GtpuSessionGroupReconcileOutcome::Indeterminate(reason));
+            }
+        }
+        let transaction_id = match self.inner.runtime.next_session_transaction_id() {
+            Ok(transaction_id) => transaction_id,
+            Err(_) => {
+                return Ok(GtpuSessionGroupReconcileOutcome::Indeterminate(
+                    GtpuSessionGroupIndeterminateReason::MutationUnconfirmed,
+                ));
+            }
+        };
+        let Some(journal) = GtpuSessionTransactionRecord::prepare(
+            desired.id(),
+            transaction_id,
+            base,
+            Some(desired_record),
+        ) else {
+            return Ok(GtpuSessionGroupReconcileOutcome::Indeterminate(
+                GtpuSessionGroupIndeterminateReason::GenerationExhausted,
+            ));
+        };
+        if let Err(reason) =
+            self.put_grouped_journal_exact(&context, journal, EbpfMapUpdateMode::NoExist)
+        {
+            return Ok(GtpuSessionGroupReconcileOutcome::Indeterminate(reason));
+        }
+        match self.execute_grouped_install_journal(&context, journal) {
+            Ok(()) => Ok(GtpuSessionGroupReconcileOutcome::Activated),
+            Err(reason) => Ok(GtpuSessionGroupReconcileOutcome::Indeterminate(reason)),
+        }
+    }
+
+    fn remove_pdp_context_group_exact_sync(
+        &self,
+        expected: GtpuSessionGroup,
+    ) -> Result<GtpuSessionGroupRemovalOutcome, GtpuError> {
+        let _operation = self.operation_guard()?;
+        let context = match self.grouped_attachment_context(expected.device_id()) {
+            Ok(context) => context,
+            Err(reason) => return Ok(GtpuSessionGroupRemovalOutcome::Indeterminate(reason)),
+        };
+        if let Err(reason) = self.validate_grouped_model_attachment(&expected, &context) {
+            return Ok(GtpuSessionGroupRemovalOutcome::Indeterminate(reason));
+        }
+        let observation = match self.stable_grouped_observation(&context, expected.id()) {
+            Ok(Some(observation)) => observation,
+            Ok(None) => {
+                return Ok(GtpuSessionGroupRemovalOutcome::Indeterminate(
+                    GtpuSessionGroupIndeterminateReason::StateChanged,
+                ));
+            }
+            Err(reason) => return Ok(GtpuSessionGroupRemovalOutcome::Indeterminate(reason)),
+        };
+        if let Some(encoded_journal) = observation.transaction {
+            let Some(journal) = GtpuSessionTransactionRecord::decode(&encoded_journal) else {
+                return Ok(GtpuSessionGroupRemovalOutcome::Indeterminate(
+                    GtpuSessionGroupIndeterminateReason::JournalMismatch,
+                ));
+            };
+            if journal.group_id() != expected.id()
+                || journal
+                    .base()
+                    .is_some_and(|base| base.device_id() != expected.device_id())
+                || journal
+                    .desired()
+                    .is_some_and(|desired| desired.device_id() != expected.device_id())
+            {
+                return Ok(GtpuSessionGroupRemovalOutcome::Indeterminate(
+                    GtpuSessionGroupIndeterminateReason::JournalMismatch,
+                ));
+            }
+            if let Some(desired) = journal.desired() {
+                let desired_model = grouped_model_from_record(desired, &context.device);
+                if desired_model.as_ref() != Some(&expected) {
+                    return Ok(GtpuSessionGroupRemovalOutcome::Conflict(
+                        GtpuSessionGroupConflict::GroupMismatch,
+                    ));
+                }
+                return match self.execute_grouped_install_journal(&context, journal) {
+                    Ok(()) => Err(GtpuError::RetryRequired {
+                        operation: "ebpf_grouped_removal_after_install",
+                    }),
+                    Err(reason) => Ok(GtpuSessionGroupRemovalOutcome::Indeterminate(reason)),
+                };
+            }
+            let base_model = journal
+                .base()
+                .and_then(|base| grouped_model_from_record(base, &context.device));
+            if base_model.as_ref() != Some(&expected) {
+                return Ok(GtpuSessionGroupRemovalOutcome::Conflict(
+                    GtpuSessionGroupConflict::GroupMismatch,
+                ));
+            }
+            return match self.execute_grouped_removal_journal(&context, journal) {
+                Ok(()) => Ok(GtpuSessionGroupRemovalOutcome::Removed),
+                Err(reason) => Ok(GtpuSessionGroupRemovalOutcome::Indeterminate(reason)),
+            };
+        }
+        let Some(encoded_authority) = observation.authority else {
+            return if observation.indexes.is_empty() {
+                Ok(GtpuSessionGroupRemovalOutcome::AlreadyAbsent)
+            } else {
+                Ok(GtpuSessionGroupRemovalOutcome::Indeterminate(
+                    GtpuSessionGroupIndeterminateReason::IncompleteState,
+                ))
+            };
+        };
+        let Some(base) = GtpuSessionGroupRecord::decode(&encoded_authority) else {
+            return Ok(GtpuSessionGroupRemovalOutcome::Indeterminate(
+                GtpuSessionGroupIndeterminateReason::IncompleteState,
+            ));
+        };
+        if base.group_id() != expected.id() {
+            return Ok(GtpuSessionGroupRemovalOutcome::Indeterminate(
+                GtpuSessionGroupIndeterminateReason::IncompleteState,
+            ));
+        }
+        if base.device_id() != expected.device_id() {
+            return Ok(GtpuSessionGroupRemovalOutcome::Conflict(
+                GtpuSessionGroupConflict::DeviceAlias,
+            ));
+        }
+        if base.phase() != GtpuSessionGroupPhase::Active
+            || grouped_active_indexes(base).as_ref() != Some(&observation.indexes)
+        {
+            return Ok(GtpuSessionGroupRemovalOutcome::Indeterminate(
+                GtpuSessionGroupIndeterminateReason::IncompleteState,
+            ));
+        }
+        let active = grouped_model_from_record(base, &context.device);
+        if active.as_ref() != Some(&expected) {
+            return Ok(GtpuSessionGroupRemovalOutcome::Conflict(
+                GtpuSessionGroupConflict::GroupMismatch,
+            ));
+        }
+        let transaction_id = match self.inner.runtime.next_session_transaction_id() {
+            Ok(transaction_id) => transaction_id,
+            Err(_) => {
+                return Ok(GtpuSessionGroupRemovalOutcome::Indeterminate(
+                    GtpuSessionGroupIndeterminateReason::MutationUnconfirmed,
+                ));
+            }
+        };
+        let Some(journal) =
+            GtpuSessionTransactionRecord::prepare(expected.id(), transaction_id, Some(base), None)
+        else {
+            return Ok(GtpuSessionGroupRemovalOutcome::Indeterminate(
+                GtpuSessionGroupIndeterminateReason::GenerationExhausted,
+            ));
+        };
+        if let Err(reason) =
+            self.put_grouped_journal_exact(&context, journal, EbpfMapUpdateMode::NoExist)
+        {
+            return Ok(GtpuSessionGroupRemovalOutcome::Indeterminate(reason));
+        }
+        match self.execute_grouped_removal_journal(&context, journal) {
+            Ok(()) => Ok(GtpuSessionGroupRemovalOutcome::Removed),
+            Err(reason) => Ok(GtpuSessionGroupRemovalOutcome::Indeterminate(reason)),
+        }
+    }
+
+    fn gtpu_ip_family_capabilities_sync(
+        &self,
+        attachment: GtpuSessionAttachmentSelector,
+    ) -> Result<GtpuIpFamilyCapabilities, GtpuError> {
+        let _operation = self.operation_guard()?;
+        let environment = self.inner.runtime.probe_environment();
+        let unavailable = if !environment.platform_supported
+            || !environment.bpffs_present
+            || !environment.btf_present
+        {
+            GtpuCapability::Missing
+        } else if !environment.net_admin_capable || !environment.bpf_capable {
+            GtpuCapability::PermissionDenied
+        } else {
+            GtpuCapability::Unknown
+        };
+        if unavailable != GtpuCapability::Unknown {
+            return Ok(GtpuIpFamilyCapabilities {
+                inner_ipv4: unavailable,
+                inner_ipv6: unavailable,
+                outer_ipv4: unavailable,
+                outer_ipv6: unavailable,
+                grouped_atomic_reconciliation: unavailable,
+                local_endpoint_sets: unavailable,
+                ipv6_udp_checksum: unavailable,
+                uplink_checksum_offload: GtpuUplinkChecksumOffloadContract::Unsupported,
+                downlink_outer_ipv4_fragment_handling: GtpuDownlinkFragmentContract::Unsupported,
+                downlink_outer_ipv6_fragment_handling: GtpuDownlinkFragmentContract::Unsupported,
+            });
+        }
+        let Ok(context) = self.grouped_attachment_context(attachment.device_id()) else {
+            return Ok(GtpuIpFamilyCapabilities::unsupported());
+        };
+        if context.device != *attachment.device()
+            || context.grouped.local_endpoints != attachment.local_endpoints()
+            || self.ensure_grouped_attachment(&context).is_err()
+        {
+            return Ok(GtpuIpFamilyCapabilities::unsupported());
+        }
+        let outer_ipv4 = if context.grouped.local_endpoints.ipv4().is_some() {
+            GtpuCapability::Available
+        } else {
+            GtpuCapability::Missing
+        };
+        let outer_ipv6 = if context.grouped.local_endpoints.ipv6().is_some() {
+            GtpuCapability::Available
+        } else {
+            GtpuCapability::Missing
+        };
+        Ok(GtpuIpFamilyCapabilities {
+            inner_ipv4: GtpuCapability::Available,
+            inner_ipv6: GtpuCapability::Available,
+            outer_ipv4,
+            outer_ipv6,
+            grouped_atomic_reconciliation: GtpuCapability::Available,
+            local_endpoint_sets: GtpuCapability::Available,
+            ipv6_udp_checksum: outer_ipv6,
+            uplink_checksum_offload: if outer_ipv6 == GtpuCapability::Available {
+                GtpuUplinkChecksumOffloadContract::MaterializedOnly
+            } else {
+                GtpuUplinkChecksumOffloadContract::Unsupported
+            },
+            // The existing userspace reassembly consumer authorizes only the
+            // frozen single-context IPv4 graph. Grouped maps deliberately
+            // contain no legacy PDR/commit authority, so a reassembled
+            // grouped TEID cannot safely re-enter that consumer.
+            downlink_outer_ipv4_fragment_handling: GtpuDownlinkFragmentContract::Unsupported,
+            downlink_outer_ipv6_fragment_handling: GtpuDownlinkFragmentContract::Unsupported,
+        })
     }
 
     fn rollback_default_selector(
@@ -1212,7 +2831,97 @@ impl EbpfGtpuDataplaneBackend {
             ifindex,
             ManagedDevice {
                 name: request.name.clone(),
-                local_ip,
+                local_ip: Some(local_ip),
+                grouped: None,
+            },
+        );
+        Ok(GtpDevice {
+            name: request.name,
+            ifindex,
+        })
+    }
+
+    fn create_device_with_endpoints_sync(
+        &self,
+        request: CreateGtpDeviceEndpointSetRequest,
+    ) -> Result<GtpDevice, GtpuError> {
+        let _operation = self.operation_guard()?;
+        let (request, device_id, local_endpoints) = request.into_parts();
+        validate_interface_name(&request.name)?;
+        require_ebpf_executable_pmtu_policy(request.uplink_mtu_policy)?;
+        if !request.bind_address.is_unspecified() {
+            return Err(GtpuError::invalid_config(
+                "device.bind_address",
+                "explicit endpoint-set authority requires an unspecified legacy bind address",
+            ));
+        }
+        let ifindex = self.inner.runtime.ifindex_by_name(&request.name)?;
+        let config =
+            grouped_device_config(device_id, ifindex, local_endpoints).ok_or_else(|| {
+                GtpuError::invalid_config(
+                    "device.local_endpoints",
+                    "grouped endpoint authority must contain one or two canonical addresses",
+                )
+            })?;
+        let pin_dir = self.grouped_pin_dir(device_id);
+
+        // Keep the process-local binding guard held across durable attach
+        // publication. A stable device ID may bind exactly one live ifindex
+        // and a mutable ifindex may belong to exactly one managed namespace.
+        let mut devices = self.devices()?;
+        if devices.contains_key(&ifindex)
+            || devices.values().any(|managed| {
+                managed
+                    .grouped
+                    .is_some_and(|grouped| grouped.device_id == device_id)
+                    || managed.name == request.name
+            })
+        {
+            return Err(GtpuError::AlreadyExists);
+        }
+        let attachment = self.inner.runtime.attach_grouped(
+            &request.name,
+            ifindex,
+            &pin_dir,
+            self.inner.config.tc_priority,
+            config.encode(),
+        )?;
+        if let Some(policy) = request.uplink_mtu_policy {
+            if self
+                .inner
+                .runtime
+                .pmtu_policy_write(ifindex, policy.map_value())
+                .is_err()
+            {
+                if attachment == EbpfAttachmentDisposition::Retained {
+                    return Err(GtpuError::StateIndeterminate {
+                        operation: "ebpf_grouped_device_policy_update",
+                    });
+                }
+                return match self.inner.runtime.detach(
+                    &request.name,
+                    ifindex,
+                    &pin_dir,
+                    self.inner.config.tc_priority,
+                ) {
+                    Ok(()) => Err(GtpuError::StateIndeterminate {
+                        operation: "ebpf_grouped_device_policy_update",
+                    }),
+                    Err(_) => Err(GtpuError::StateIndeterminate {
+                        operation: "ebpf_grouped_device_create",
+                    }),
+                };
+            }
+        }
+        devices.insert(
+            ifindex,
+            ManagedDevice {
+                name: request.name.clone(),
+                local_ip: None,
+                grouped: Some(ManagedGroupedDevice {
+                    device_id,
+                    local_endpoints,
+                }),
             },
         );
         Ok(GtpDevice {
@@ -1242,7 +2951,8 @@ impl EbpfGtpuDataplaneBackend {
             ifindex,
             ManagedDevice {
                 name: name.clone(),
-                local_ip: Ipv4Addr::from(local_ip),
+                local_ip: Some(Ipv4Addr::from(local_ip)),
+                grouped: None,
             },
         );
         Ok(GtpDevice { name, ifindex })
@@ -1258,10 +2968,17 @@ impl EbpfGtpuDataplaneBackend {
         if !is_managed {
             return Err(GtpuError::NotFound);
         }
+        let pin_dir = devices
+            .get(&device.ifindex)
+            .and_then(|managed| managed.grouped)
+            .map_or_else(
+                || self.pin_dir(&device.name),
+                |grouped| self.grouped_pin_dir(grouped.device_id),
+            );
         self.inner.runtime.detach(
             &device.name,
             device.ifindex,
-            &self.pin_dir(&device.name),
+            &pin_dir,
             self.inner.config.tc_priority,
         )?;
         devices.remove(&device.ifindex);
@@ -1450,8 +3167,11 @@ impl EbpfGtpuDataplaneBackend {
         let local_ip = self
             .devices()?
             .get(&context.link_ifindex)
-            .map(|device| device.local_ip)
-            .ok_or(GtpuError::NotFound)?;
+            .ok_or(GtpuError::NotFound)?
+            .local_ip
+            .ok_or(GtpuError::UnsupportedFeature {
+                feature: "legacy_ipv4_pdp_on_grouped_attachment",
+            })?;
         if ms_address == local_ip {
             return Err(GtpuError::invalid_config(
                 "pdp.ms_address",
@@ -1476,8 +3196,11 @@ impl EbpfGtpuDataplaneBackend {
     fn managed_local_ip_locked(&self, ifindex: u32) -> Result<Ipv4Addr, GtpuError> {
         self.devices()?
             .get(&ifindex)
-            .map(|device| device.local_ip)
-            .ok_or(GtpuError::NotFound)
+            .ok_or(GtpuError::NotFound)?
+            .local_ip
+            .ok_or(GtpuError::UnsupportedFeature {
+                feature: "legacy_ipv4_pdp_on_grouped_attachment",
+            })
     }
 
     fn read_default_context_locked(
@@ -1820,6 +3543,15 @@ impl EbpfGtpuDataplaneBackend {
             PdpContextSelector::LocalTeid(selector) => selector.link_ifindex(),
             PdpContextSelector::Uplink(selector) => selector.link_ifindex(),
         };
+        {
+            let devices = self.devices()?;
+            let device = devices.get(&ifindex).ok_or(GtpuError::NotFound)?;
+            if device.local_ip.is_none() {
+                return Err(GtpuError::UnsupportedFeature {
+                    feature: "legacy_ipv4_pdp_on_grouped_attachment",
+                });
+            }
+        }
         if !self.inner.runtime.pdp_readback_datapath_usable(ifindex) {
             return Err(GtpuError::StateIndeterminate {
                 operation: "ebpf_pdp_context_readback",
@@ -2085,7 +3817,9 @@ impl EbpfGtpuDataplaneBackend {
             let device = devices
                 .get(&request.link_ifindex)
                 .ok_or(GtpuError::NotFound)?;
-            device.local_ip
+            device.local_ip.ok_or(GtpuError::UnsupportedFeature {
+                feature: "legacy_ipv4_pdp_on_grouped_attachment",
+            })?
         };
         if ms_address == local_ip {
             return Err(GtpuError::invalid_config(
@@ -2520,8 +4254,16 @@ impl EbpfGtpuDataplaneBackend {
 
     fn remove_pdp_context_locked(&self, request: RemovePdpContextRequest) -> Result<(), GtpuError> {
         validate_gtp_version(request.gtp_version)?;
-        if !self.devices()?.contains_key(&request.link_ifindex) {
-            return Err(GtpuError::NotFound);
+        {
+            let devices = self.devices()?;
+            let device = devices
+                .get(&request.link_ifindex)
+                .ok_or(GtpuError::NotFound)?;
+            if device.local_ip.is_none() {
+                return Err(GtpuError::UnsupportedFeature {
+                    feature: "legacy_ipv4_pdp_on_grouped_attachment",
+                });
+            }
         }
         if !self
             .inner
@@ -2608,6 +4350,7 @@ impl EbpfGtpuDataplaneBackend {
         let env = self.inner.runtime.probe_environment();
         let (
             has_attached_device,
+            has_legacy_ipv4_downlink_attachment,
             dscp_datapath_usable,
             source_port_datapath_usable,
             bearer_mark_datapath_usable,
@@ -2618,6 +4361,7 @@ impl EbpfGtpuDataplaneBackend {
             .map(|devices| {
                 (
                     !devices.is_empty(),
+                    devices.values().any(|device| device.local_ip.is_some()),
                     !devices.is_empty()
                         && devices
                             .keys()
@@ -2642,7 +4386,7 @@ impl EbpfGtpuDataplaneBackend {
                             .all(|ifindex| self.inner.runtime.pmtu_datapath_usable(*ifindex)),
                 )
             })
-            .unwrap_or((false, false, false, false, false, false));
+            .unwrap_or((false, false, false, false, false, false, false));
         let mutation_ready = env.platform_supported
             && env.bpffs_present
             && env.btf_present
@@ -2755,12 +4499,15 @@ impl EbpfGtpuDataplaneBackend {
                 // A managed device lost or cannot access its required maps.
                 GtpuCapability::Missing
             },
-            // The tc downlink program is handoff-capable: it passes outer
-            // fragments to the kernel stack unchanged. The contract is
-            // complete only while the operator runs the SDK
-            // GtpuReassemblyConsumer on the concrete S2b-U address; bounds
-            // come from the live sysctls and are absent when unreadable.
-            downlink_outer_fragment_handling: if endpoint_binding_datapath_usable {
+            // This legacy probe field is exclusively the outer IPv4
+            // contract. The tc downlink program passes IPv4 fragments to the
+            // kernel stack unchanged, and the IPv4-only SDK reassembly
+            // consumer can receive them on a concrete S2b-U address. Outer
+            // IPv6 fragment handling is reported separately and remains
+            // unsupported.
+            downlink_outer_fragment_handling: if has_legacy_ipv4_downlink_attachment
+                && endpoint_binding_datapath_usable
+            {
                 GtpuDownlinkFragmentContract::KernelReassemblyHandoff {
                     bounds: crate::reassembly::linux_reassembly_bounds(),
                 }
@@ -2777,6 +4524,16 @@ impl GtpuDataplaneBackend for EbpfGtpuDataplaneBackend {
     async fn create_device(&self, request: CreateGtpDeviceRequest) -> Result<GtpDevice, GtpuError> {
         self.run_blocking("ebpf_create_device", move |backend| {
             backend.create_device_sync(request)
+        })
+        .await
+    }
+
+    async fn create_device_with_endpoints(
+        &self,
+        request: CreateGtpDeviceEndpointSetRequest,
+    ) -> Result<GtpDevice, GtpuError> {
+        self.run_blocking("ebpf_create_grouped_device", move |backend| {
+            backend.create_device_with_endpoints_sync(request)
         })
         .await
     }
@@ -2861,6 +4618,36 @@ impl GtpuDataplaneBackend for EbpfGtpuDataplaneBackend {
         .await
     }
 
+    async fn read_pdp_context_group(
+        &self,
+        selector: GtpuSessionGroupSelector,
+    ) -> Result<GtpuSessionGroupReadback, GtpuError> {
+        self.run_blocking("ebpf_grouped_readback", move |backend| {
+            backend.read_pdp_context_group_sync(selector)
+        })
+        .await
+    }
+
+    async fn reconcile_pdp_context_group(
+        &self,
+        request: GtpuSessionGroupReconcileRequest,
+    ) -> Result<GtpuSessionGroupReconcileOutcome, GtpuError> {
+        self.run_blocking("ebpf_grouped_reconcile", move |backend| {
+            backend.reconcile_pdp_context_group_sync(request)
+        })
+        .await
+    }
+
+    async fn remove_pdp_context_group_exact(
+        &self,
+        expected: GtpuSessionGroup,
+    ) -> Result<GtpuSessionGroupRemovalOutcome, GtpuError> {
+        self.run_blocking("ebpf_grouped_remove", move |backend| {
+            backend.remove_pdp_context_group_exact_sync(expected)
+        })
+        .await
+    }
+
     fn pdp_context_reconciliation_capabilities(&self) -> PdpContextReconciliationCapabilities {
         let environment = self.inner.runtime.probe_environment();
         let capability = if !environment.platform_supported
@@ -2885,6 +4672,16 @@ impl GtpuDataplaneBackend for EbpfGtpuDataplaneBackend {
             classified_install: capability,
             exact_removal: capability,
         }
+    }
+
+    async fn gtpu_ip_family_capabilities(
+        &self,
+        attachment: GtpuSessionAttachmentSelector,
+    ) -> Result<GtpuIpFamilyCapabilities, GtpuError> {
+        self.run_blocking("ebpf_grouped_capabilities", move |backend| {
+            backend.gtpu_ip_family_capabilities_sync(attachment)
+        })
+        .await
     }
 
     async fn probe(&self) -> Result<GtpuProbe, GtpuError> {
@@ -2966,6 +4763,7 @@ mod aya_runtime {
     //! tc clsact filters, and performs pinned BPF map operations.
 
     use std::collections::{HashMap, HashSet};
+    use std::fmt;
     use std::fs::{self, File};
     use std::io;
     use std::mem::ManuallyDrop;
@@ -2991,25 +4789,32 @@ mod aya_runtime {
     use aya_obj::maps::PinningType;
     use aya_obj::{Features as AyaObjectFeatures, Object as AyaObject};
     use opc_linux_gtpu_sys as sys;
+    use rand::{rngs::SysRng, TryRng};
     use sha1::{Digest as Sha1Digest, Sha1};
     use sha2::{Digest as Sha2Digest, Sha256};
 
     use opc_gtpu_ebpf_common::{
-        default_bearer_graph_is_valid, DownlinkEndpointBinding, DownlinkPdr, GtpuUplinkMtuPolicy,
-        GtpuUplinkSourcePortPolicy, MarkedBearerOwner, MarkedBearerOwnerPhase, MarkedDownlinkPdr,
-        PdpContextCommit, UplinkFar, UplinkFarKey, UplinkMtuMapState,
+        default_bearer_graph_is_valid, DownlinkEndpointBinding, DownlinkPdr,
+        GtpuSessionDeviceConfig, GtpuSessionIpFamily, GtpuSessionTransactionId,
+        GtpuUplinkMtuPolicy, GtpuUplinkSourcePortPolicy, MarkedBearerOwner, MarkedBearerOwnerPhase,
+        MarkedDownlinkPdr, PdpContextCommit, UplinkFar, UplinkFarKey, UplinkMtuMapState,
         COUNTER_DL_BINDING_FAMILY_MISMATCH, COUNTER_DL_BINDING_INGRESS_MISMATCH,
         COUNTER_DL_BINDING_INVALID, COUNTER_DL_BINDING_LOCAL_MISMATCH,
         COUNTER_DL_BINDING_PEER_MISMATCH, COUNTER_DL_BINDING_SOURCE_PORT_MISMATCH,
         COUNTER_DL_DECAP, COUNTER_DL_DST_MISMATCH, COUNTER_DL_MALFORMED, COUNTER_DL_UNKNOWN_TEID,
         COUNTER_SLOTS, COUNTER_UL_ENCAP, COUNTER_UL_FAR_MISS, COUNTER_UL_MTU_REJECT,
         COUNTER_UL_PMTU_CORRUPT, DOWNLINK_BINDING_COUNTER_SLOTS,
-        DOWNLINK_ENDPOINT_BINDING_VALUE_LEN, DOWNLINK_PDR_VALUE_LEN, MAP_CONFIG, MAP_COUNTERS,
+        DOWNLINK_ENDPOINT_BINDING_VALUE_LEN, DOWNLINK_PDR_VALUE_LEN, GTPU_SESSION_CONFIG_KEY,
+        GTPU_SESSION_CONFIG_VALUE_LEN, GTPU_SESSION_DOWNLINK_KEY_LEN, GTPU_SESSION_GROUP_ID_LEN,
+        GTPU_SESSION_GROUP_REF_LEN, GTPU_SESSION_GROUP_VALUE_LEN, GTPU_SESSION_SCHEMA_MARKER_LEN,
+        GTPU_SESSION_SCHEMA_MARKER_VALUE, GTPU_SESSION_TRANSACTION_VALUE_LEN,
+        GTPU_SESSION_UPLINK_KEY_LEN, MAP_CONFIG, MAP_CONFIG_IPV6, MAP_COUNTERS,
         MAP_DOWNLINK_BINDING_COUNTERS, MAP_DOWNLINK_ENDPOINT_BINDING, MAP_DOWNLINK_MARK_PDR,
-        MAP_DOWNLINK_PDR, MAP_MARKED_BEARER_OWNER, MAP_UPLINK_DSCP, MAP_UPLINK_FAR,
-        MAP_UPLINK_MARK_DSCP, MAP_UPLINK_MARK_FAR, MAP_UPLINK_MARK_SOURCE_PORT, MAP_UPLINK_PMTU,
-        MAP_UPLINK_PMTU_COUNTERS, MAP_UPLINK_SOURCE_PORT, MARKED_BEARER_OWNER_VALUE_LEN,
-        MARKED_DOWNLINK_PDR_VALUE_LEN, PROG_DOWNLINK, PROG_UPLINK,
+        MAP_DOWNLINK_PDR, MAP_MARKED_BEARER_OWNER, MAP_SESSION_DOWNLINK_INDEX, MAP_SESSION_GROUPS,
+        MAP_SESSION_SCHEMA, MAP_SESSION_TRANSACTIONS, MAP_SESSION_UPLINK_INDEX, MAP_UPLINK_DSCP,
+        MAP_UPLINK_FAR, MAP_UPLINK_MARK_DSCP, MAP_UPLINK_MARK_FAR, MAP_UPLINK_MARK_SOURCE_PORT,
+        MAP_UPLINK_PMTU, MAP_UPLINK_PMTU_COUNTERS, MAP_UPLINK_SOURCE_PORT,
+        MARKED_BEARER_OWNER_VALUE_LEN, MARKED_DOWNLINK_PDR_VALUE_LEN, PROG_DOWNLINK, PROG_UPLINK,
         UPLINK_BEARER_SCHEMA_MARKER_VALUE, UPLINK_DSCP_SCHEMA_MARKER_KEY,
         UPLINK_DSCP_SCHEMA_MARKER_VALUE, UPLINK_DSCP_VALUE_LEN,
         UPLINK_ENDPOINT_SCHEMA_MARKER_VALUE, UPLINK_FAR_VALUE_LEN, UPLINK_MARK_KEY_LEN,
@@ -3020,6 +4825,7 @@ mod aya_runtime {
     use super::{
         ebpf_pmtu_map_state_is_executable, CurrentRecoveryManagedState, EbpfAttachmentDisposition,
         EbpfEnvironment, EbpfGtpuDatapathCounters, EbpfGtpuDatapathSnapshot, EbpfGtpuRuntime,
+        EbpfMapUpdateMode, EbpfSessionIndexInventory,
     };
     use crate::{
         CurrentEbpfGraphRecoveryOutcome, CurrentEbpfGraphRecoveryProgress,
@@ -3184,7 +4990,7 @@ mod aya_runtime {
         },
     ];
 
-    const CURRENT_MAP_NAMES: [&str; 15] = [
+    const CURRENT_MAP_NAMES: [&str; 21] = [
         MAP_UPLINK_FAR,
         MAP_UPLINK_MARK_FAR,
         MAP_UPLINK_DSCP,
@@ -3200,6 +5006,12 @@ mod aya_runtime {
         MAP_COUNTERS,
         MAP_DOWNLINK_BINDING_COUNTERS,
         MAP_CONFIG,
+        MAP_SESSION_GROUPS,
+        MAP_SESSION_UPLINK_INDEX,
+        MAP_SESSION_DOWNLINK_INDEX,
+        MAP_SESSION_TRANSACTIONS,
+        MAP_CONFIG_IPV6,
+        MAP_SESSION_SCHEMA,
     ];
 
     #[derive(Clone, Copy)]
@@ -3317,10 +5129,58 @@ mod aya_runtime {
             value_size: 4,
             max_entries: 1,
         },
+        CurrentMapSpec {
+            name: MAP_SESSION_GROUPS,
+            map_type: bpf_map_type::BPF_MAP_TYPE_HASH as u32,
+            key_size: GTPU_SESSION_GROUP_ID_LEN as u32,
+            value_size: GTPU_SESSION_GROUP_VALUE_LEN as u32,
+            max_entries: 65_536,
+        },
+        CurrentMapSpec {
+            name: MAP_SESSION_UPLINK_INDEX,
+            map_type: bpf_map_type::BPF_MAP_TYPE_HASH as u32,
+            key_size: GTPU_SESSION_UPLINK_KEY_LEN as u32,
+            value_size: GTPU_SESSION_GROUP_REF_LEN as u32,
+            max_entries: 65_536,
+        },
+        CurrentMapSpec {
+            name: MAP_SESSION_DOWNLINK_INDEX,
+            map_type: bpf_map_type::BPF_MAP_TYPE_HASH as u32,
+            key_size: GTPU_SESSION_DOWNLINK_KEY_LEN as u32,
+            value_size: GTPU_SESSION_GROUP_REF_LEN as u32,
+            max_entries: 65_536,
+        },
+        CurrentMapSpec {
+            name: MAP_SESSION_TRANSACTIONS,
+            map_type: bpf_map_type::BPF_MAP_TYPE_HASH as u32,
+            key_size: GTPU_SESSION_GROUP_ID_LEN as u32,
+            value_size: GTPU_SESSION_TRANSACTION_VALUE_LEN as u32,
+            max_entries: 65_536,
+        },
+        CurrentMapSpec {
+            name: MAP_CONFIG_IPV6,
+            map_type: bpf_map_type::BPF_MAP_TYPE_ARRAY as u32,
+            key_size: 4,
+            value_size: GTPU_SESSION_CONFIG_VALUE_LEN as u32,
+            max_entries: 1,
+        },
+        CurrentMapSpec {
+            name: MAP_SESSION_SCHEMA,
+            map_type: bpf_map_type::BPF_MAP_TYPE_ARRAY as u32,
+            key_size: 4,
+            value_size: GTPU_SESSION_SCHEMA_MARKER_LEN as u32,
+            max_entries: 1,
+        },
     ];
 
-    const CURRENT_RECOVERY_PROOF_LEN: usize = 136;
+    const CURRENT_RECOVERY_PROOF_LEN: usize = 160;
     const CURRENT_RECOVERY_MAGIC: [u8; 8] = *b"OPCCURR1";
+    const CURRENT_RECOVERY_MAP_IDS_OFFSET: usize = 48;
+    const CURRENT_RECOVERY_PROOF_MAP_ID_OFFSET: usize =
+        CURRENT_RECOVERY_MAP_IDS_OFFSET + CURRENT_MAP_NAMES.len() * 4;
+    const CURRENT_RECOVERY_GRAPH_DEVICE_OFFSET: usize = CURRENT_RECOVERY_PROOF_MAP_ID_OFFSET + 4;
+    const CURRENT_RECOVERY_GRAPH_INODE_OFFSET: usize = CURRENT_RECOVERY_GRAPH_DEVICE_OFFSET + 8;
+    const CURRENT_RECOVERY_CHECKSUM_OFFSET: usize = CURRENT_RECOVERY_GRAPH_INODE_OFFSET + 8;
 
     const TC_HANDLE: TcHandle = TcHandle::new(0, 1);
     const RECONCILER_CONTROL_DIRECTORY: &str = "GTPU_RECONCILER_LOCKS";
@@ -3420,6 +5280,12 @@ mod aya_runtime {
         counters: u32,
         downlink_binding_counters: u32,
         config: u32,
+        session_groups: u32,
+        session_uplink_index: u32,
+        session_downlink_index: u32,
+        session_transactions: u32,
+        config_ipv6: u32,
+        session_schema: u32,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3660,14 +5526,18 @@ mod aya_runtime {
             encoded[9] = u8::from(self.allow_populated);
             encoded[16..48].copy_from_slice(&self.namespace_hash);
             for (index, map_id) in self.map_ids.into_iter().enumerate() {
-                let offset = 48 + index * 4;
+                let offset = CURRENT_RECOVERY_MAP_IDS_OFFSET + index * 4;
                 encoded[offset..offset + 4].copy_from_slice(&map_id.to_ne_bytes());
             }
-            encoded[108..112].copy_from_slice(&self.proof_map_id.to_ne_bytes());
-            encoded[112..120].copy_from_slice(&self.graph_device.to_ne_bytes());
-            encoded[120..128].copy_from_slice(&self.graph_inode.to_ne_bytes());
-            let checksum = teardown_record_checksum(&encoded[..128]);
-            encoded[128..136].copy_from_slice(&checksum.to_ne_bytes());
+            let proof = CURRENT_RECOVERY_PROOF_MAP_ID_OFFSET;
+            encoded[proof..proof + 4].copy_from_slice(&self.proof_map_id.to_ne_bytes());
+            let device = CURRENT_RECOVERY_GRAPH_DEVICE_OFFSET;
+            encoded[device..device + 8].copy_from_slice(&self.graph_device.to_ne_bytes());
+            let inode = CURRENT_RECOVERY_GRAPH_INODE_OFFSET;
+            encoded[inode..inode + 8].copy_from_slice(&self.graph_inode.to_ne_bytes());
+            let checksum = teardown_record_checksum(&encoded[..CURRENT_RECOVERY_CHECKSUM_OFFSET]);
+            encoded[CURRENT_RECOVERY_CHECKSUM_OFFSET..CURRENT_RECOVERY_PROOF_LEN]
+                .copy_from_slice(&checksum.to_ne_bytes());
             encoded
         }
 
@@ -3682,8 +5552,11 @@ mod aya_runtime {
                 || encoded[8] != 1
                 || encoded[9] > 1
                 || encoded[10..16] != [0; 6]
-                || u64::from_ne_bytes(encoded[128..136].try_into().ok()?)
-                    != teardown_record_checksum(&encoded[..128])
+                || u64::from_ne_bytes(
+                    encoded[CURRENT_RECOVERY_CHECKSUM_OFFSET..CURRENT_RECOVERY_PROOF_LEN]
+                        .try_into()
+                        .ok()?,
+                ) != teardown_record_checksum(&encoded[..CURRENT_RECOVERY_CHECKSUM_OFFSET])
             {
                 return None;
             }
@@ -3691,15 +5564,25 @@ mod aya_runtime {
             namespace_hash.copy_from_slice(&encoded[16..48]);
             let mut map_ids = [0_u32; CURRENT_MAP_NAMES.len()];
             for (index, map_id) in map_ids.iter_mut().enumerate() {
-                *map_id = read_u32(48 + index * 4)?;
+                *map_id = read_u32(CURRENT_RECOVERY_MAP_IDS_OFFSET + index * 4)?;
             }
             let record = Self {
                 namespace_hash,
                 allow_populated: encoded[9] == 1,
                 map_ids,
-                graph_device: u64::from_ne_bytes(encoded[112..120].try_into().ok()?),
-                graph_inode: u64::from_ne_bytes(encoded[120..128].try_into().ok()?),
-                proof_map_id: read_u32(108)?,
+                graph_device: u64::from_ne_bytes(
+                    encoded[CURRENT_RECOVERY_GRAPH_DEVICE_OFFSET
+                        ..CURRENT_RECOVERY_GRAPH_DEVICE_OFFSET + 8]
+                        .try_into()
+                        .ok()?,
+                ),
+                graph_inode: u64::from_ne_bytes(
+                    encoded[CURRENT_RECOVERY_GRAPH_INODE_OFFSET
+                        ..CURRENT_RECOVERY_GRAPH_INODE_OFFSET + 8]
+                        .try_into()
+                        .ok()?,
+                ),
+                proof_map_id: read_u32(CURRENT_RECOVERY_PROOF_MAP_ID_OFFSET)?,
             };
             (record.namespace_hash != [0; 32]
                 && record.proof_map_id != 0
@@ -3954,6 +5837,56 @@ mod aya_runtime {
         PmtuV5,
     }
 
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum GroupedSchemaState {
+        /// No pin graph existed before this provisioning attempt.
+        Fresh,
+        /// The additive maps exist, but the independent schema commit has not
+        /// completed. `config` records a crash after config publication and
+        /// before marker publication; `None` is the pristine all-zero state.
+        Initializing {
+            config: Option<GtpuSessionDeviceConfig>,
+        },
+        /// The exact independent marker and canonical config were committed.
+        Retained { config: GtpuSessionDeviceConfig },
+    }
+
+    impl fmt::Debug for GroupedSchemaState {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Fresh => formatter.write_str("GroupedSchemaState::Fresh"),
+                Self::Initializing { config } => formatter
+                    .debug_struct("GroupedSchemaState::Initializing")
+                    .field("config_present", &config.is_some())
+                    .field(
+                        "ipv4_endpoint",
+                        &config.is_some_and(|config| {
+                            config.local_endpoint(GtpuSessionIpFamily::Ipv4).is_some()
+                        }),
+                    )
+                    .field(
+                        "ipv6_endpoint",
+                        &config.is_some_and(|config| {
+                            config.local_endpoint(GtpuSessionIpFamily::Ipv6).is_some()
+                        }),
+                    )
+                    .finish(),
+                Self::Retained { config } => formatter
+                    .debug_struct("GroupedSchemaState::Retained")
+                    .field("config_present", &true)
+                    .field(
+                        "ipv4_endpoint",
+                        &config.local_endpoint(GtpuSessionIpFamily::Ipv4).is_some(),
+                    )
+                    .field(
+                        "ipv6_endpoint",
+                        &config.local_endpoint(GtpuSessionIpFamily::Ipv6).is_some(),
+                    )
+                    .finish(),
+            }
+        }
+    }
+
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum PinCleanupHookProof {
         /// No attach operation was reached; require both slots to be empty.
@@ -4115,6 +6048,12 @@ mod aya_runtime {
                 MAP_COUNTERS,
                 MAP_DOWNLINK_BINDING_COUNTERS,
                 MAP_CONFIG,
+                MAP_SESSION_GROUPS,
+                MAP_SESSION_UPLINK_INDEX,
+                MAP_SESSION_DOWNLINK_INDEX,
+                MAP_SESSION_TRANSACTIONS,
+                MAP_CONFIG_IPV6,
+                MAP_SESSION_SCHEMA,
             ] {
                 match fs::remove_file(pin_dir.join(map_name)) {
                     Ok(()) => {}
@@ -4391,7 +6330,7 @@ mod aya_runtime {
         fn current_graph_forwarding_populated(
             pin_dir: &Path,
         ) -> Result<bool, CurrentIdentityError> {
-            let mut populated = false;
+            let mut legacy_populated = false;
             let far = BpfHashMap::<MapData, [u8; 4], [u8; UPLINK_FAR_VALUE_LEN]>::try_from(
                 Self::current_map(pin_dir, MAP_UPLINK_FAR)?,
             )
@@ -4405,7 +6344,7 @@ mod aya_runtime {
                     }
                     marker_seen = true;
                 } else {
-                    populated = true;
+                    legacy_populated = true;
                 }
             }
             if !marker_seen {
@@ -4425,7 +6364,7 @@ mod aya_runtime {
                         .map_err(|_| CurrentIdentityError::Indeterminate)?
                         .is_some()
                     {
-                        populated = true;
+                        legacy_populated = true;
                     }
                 }};
             }
@@ -4474,6 +6413,7 @@ mod aya_runtime {
                 .get(&0, 0)
                 .map_err(|_| CurrentIdentityError::Indeterminate)?
                 == [0; 4]
+                && legacy_populated
             {
                 return Err(CurrentIdentityError::Mismatch);
             }
@@ -4488,7 +6428,67 @@ mod aya_runtime {
             if !ebpf_pmtu_map_state_is_executable(GtpuUplinkMtuPolicy::decode_map_value(&pmtu)) {
                 return Err(CurrentIdentityError::Mismatch);
             }
-            Ok(populated)
+
+            let mut grouped_populated = false;
+            macro_rules! observe_grouped_hash {
+                ($name:expr, $key:ty, $value:ty) => {{
+                    let map = BpfHashMap::<MapData, $key, $value>::try_from(Self::current_map(
+                        pin_dir, $name,
+                    )?)
+                    .map_err(|_| CurrentIdentityError::Mismatch)?;
+                    if map
+                        .iter()
+                        .next()
+                        .transpose()
+                        .map_err(|_| CurrentIdentityError::Indeterminate)?
+                        .is_some()
+                    {
+                        grouped_populated = true;
+                    }
+                }};
+            }
+            observe_grouped_hash!(
+                MAP_SESSION_GROUPS,
+                [u8; GTPU_SESSION_GROUP_ID_LEN],
+                [u8; GTPU_SESSION_GROUP_VALUE_LEN]
+            );
+            observe_grouped_hash!(
+                MAP_SESSION_UPLINK_INDEX,
+                [u8; GTPU_SESSION_UPLINK_KEY_LEN],
+                [u8; GTPU_SESSION_GROUP_REF_LEN]
+            );
+            observe_grouped_hash!(
+                MAP_SESSION_DOWNLINK_INDEX,
+                [u8; GTPU_SESSION_DOWNLINK_KEY_LEN],
+                [u8; GTPU_SESSION_GROUP_REF_LEN]
+            );
+            observe_grouped_hash!(
+                MAP_SESSION_TRANSACTIONS,
+                [u8; GTPU_SESSION_GROUP_ID_LEN],
+                [u8; GTPU_SESSION_TRANSACTION_VALUE_LEN]
+            );
+
+            let config_ipv6 = Array::<MapData, [u8; GTPU_SESSION_CONFIG_VALUE_LEN]>::try_from(
+                Self::current_map(pin_dir, MAP_CONFIG_IPV6)?,
+            )
+            .map_err(|_| CurrentIdentityError::Mismatch)?
+            .get(&GTPU_SESSION_CONFIG_KEY, 0)
+            .map_err(|_| CurrentIdentityError::Indeterminate)?;
+            let schema = Array::<MapData, [u8; GTPU_SESSION_SCHEMA_MARKER_LEN]>::try_from(
+                Self::current_map(pin_dir, MAP_SESSION_SCHEMA)?,
+            )
+            .map_err(|_| CurrentIdentityError::Mismatch)?
+            .get(&GTPU_SESSION_CONFIG_KEY, 0)
+            .map_err(|_| CurrentIdentityError::Indeterminate)?;
+            let grouped_uninitialized = config_ipv6 == [0; GTPU_SESSION_CONFIG_VALUE_LEN]
+                && schema == [0; GTPU_SESSION_SCHEMA_MARKER_LEN];
+            let grouped_initialized = schema == GTPU_SESSION_SCHEMA_MARKER_VALUE
+                && GtpuSessionDeviceConfig::decode(&config_ipv6)
+                    .is_some_and(|decoded| decoded.encode() == config_ipv6);
+            if !grouped_initialized && (grouped_populated || !grouped_uninitialized) {
+                return Err(CurrentIdentityError::Mismatch);
+            }
+            Ok(legacy_populated || grouped_populated)
         }
 
         fn legacy_v2_recorded_pin_count(
@@ -4656,6 +6656,12 @@ mod aya_runtime {
                     MAP_COUNTERS,
                     MAP_DOWNLINK_BINDING_COUNTERS,
                     MAP_CONFIG,
+                    MAP_SESSION_GROUPS,
+                    MAP_SESSION_UPLINK_INDEX,
+                    MAP_SESSION_DOWNLINK_INDEX,
+                    MAP_SESSION_TRANSACTIONS,
+                    MAP_CONFIG_IPV6,
+                    MAP_SESSION_SCHEMA,
                 ] {
                     if pin_dir
                         .join(other_pin)
@@ -4793,6 +6799,296 @@ mod aya_runtime {
                 ));
             }
             Ok(state)
+        }
+
+        /// Inspect the independent grouped-session marker before Aya can
+        /// create a missing pinned-by-name map. The all-zero array slots are
+        /// an explicit uncommitted state, never an alias for legacy v5.
+        fn grouped_schema_preflight(
+            pin_dir: &Path,
+            bearer_state: BearerSchemaState,
+        ) -> Result<GroupedSchemaState, GtpuError> {
+            if bearer_state == BearerSchemaState::Fresh {
+                return Ok(GroupedSchemaState::Fresh);
+            }
+
+            let grouped_pins = [
+                MAP_SESSION_GROUPS,
+                MAP_SESSION_UPLINK_INDEX,
+                MAP_SESSION_DOWNLINK_INDEX,
+                MAP_SESSION_TRANSACTIONS,
+                MAP_CONFIG_IPV6,
+                MAP_SESSION_SCHEMA,
+            ];
+            let present = grouped_pins
+                .iter()
+                .map(|name| {
+                    pin_dir
+                        .join(name)
+                        .try_exists()
+                        .map_err(|error| GtpuError::io("ebpf_grouped_schema", error))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if present.iter().all(|present| !present) {
+                return Ok(GroupedSchemaState::Initializing { config: None });
+            }
+            if present.iter().any(|present| !present) {
+                return Err(GtpuError::io(
+                    "ebpf_grouped_schema",
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "adopted grouped GTP-U map pin is missing",
+                    ),
+                ));
+            }
+
+            let schema = Array::<MapData, [u8; GTPU_SESSION_SCHEMA_MARKER_LEN]>::try_from(
+                Self::current_map(pin_dir, MAP_SESSION_SCHEMA)
+                    .map_err(|_| state_indeterminate("ebpf_grouped_schema"))?,
+            )
+            .map_err(|error| map_error("ebpf_grouped_schema", error))?
+            .get(&GTPU_SESSION_CONFIG_KEY, 0)
+            .map_err(|error| map_error("ebpf_grouped_schema", error))?;
+            let config = Array::<MapData, [u8; GTPU_SESSION_CONFIG_VALUE_LEN]>::try_from(
+                Self::current_map(pin_dir, MAP_CONFIG_IPV6)
+                    .map_err(|_| state_indeterminate("ebpf_grouped_schema"))?,
+            )
+            .map_err(|error| map_error("ebpf_grouped_schema", error))?
+            .get(&GTPU_SESSION_CONFIG_KEY, 0)
+            .map_err(|error| map_error("ebpf_grouped_schema", error))?;
+            let decoded = GtpuSessionDeviceConfig::decode(&config)
+                .filter(|decoded| decoded.encode() == config);
+
+            if schema == GTPU_SESSION_SCHEMA_MARKER_VALUE {
+                return decoded
+                    .map(|config| GroupedSchemaState::Retained { config })
+                    .ok_or_else(|| state_indeterminate("ebpf_grouped_config"));
+            }
+            if schema != [0; GTPU_SESSION_SCHEMA_MARKER_LEN] {
+                return Err(state_indeterminate("ebpf_grouped_schema"));
+            }
+            if config != [0; GTPU_SESSION_CONFIG_VALUE_LEN] && decoded.is_none() {
+                return Err(state_indeterminate("ebpf_grouped_config"));
+            }
+
+            macro_rules! require_empty {
+                ($name:expr, $key:ty, $value:ty) => {{
+                    let map = BpfHashMap::<MapData, $key, $value>::try_from(
+                        Self::current_map(pin_dir, $name)
+                            .map_err(|_| state_indeterminate("ebpf_grouped_schema"))?,
+                    )
+                    .map_err(|error| map_error("ebpf_grouped_schema", error))?;
+                    if map
+                        .iter()
+                        .next()
+                        .transpose()
+                        .map_err(|error| map_error("ebpf_grouped_schema", error))?
+                        .is_some()
+                    {
+                        return Err(state_indeterminate("ebpf_grouped_schema"));
+                    }
+                }};
+            }
+            require_empty!(
+                MAP_SESSION_GROUPS,
+                [u8; GTPU_SESSION_GROUP_ID_LEN],
+                [u8; GTPU_SESSION_GROUP_VALUE_LEN]
+            );
+            require_empty!(
+                MAP_SESSION_UPLINK_INDEX,
+                [u8; GTPU_SESSION_UPLINK_KEY_LEN],
+                [u8; GTPU_SESSION_GROUP_REF_LEN]
+            );
+            require_empty!(
+                MAP_SESSION_DOWNLINK_INDEX,
+                [u8; GTPU_SESSION_DOWNLINK_KEY_LEN],
+                [u8; GTPU_SESSION_GROUP_REF_LEN]
+            );
+            require_empty!(
+                MAP_SESSION_TRANSACTIONS,
+                [u8; GTPU_SESSION_GROUP_ID_LEN],
+                [u8; GTPU_SESSION_TRANSACTION_VALUE_LEN]
+            );
+            Ok(GroupedSchemaState::Initializing { config: decoded })
+        }
+
+        fn grouped_config_same_namespace(
+            current: GtpuSessionDeviceConfig,
+            desired: GtpuSessionDeviceConfig,
+        ) -> bool {
+            current.device_id() == desired.device_id()
+                && current.local_endpoint(GtpuSessionIpFamily::Ipv4)
+                    == desired.local_endpoint(GtpuSessionIpFamily::Ipv4)
+                && current.local_endpoint(GtpuSessionIpFamily::Ipv6)
+                    == desired.local_endpoint(GtpuSessionIpFamily::Ipv6)
+        }
+
+        fn grouped_config_read(
+            ebpf: &Ebpf,
+        ) -> Result<[u8; GTPU_SESSION_CONFIG_VALUE_LEN], GtpuError> {
+            let map = ebpf
+                .map(MAP_CONFIG_IPV6)
+                .ok_or_else(|| GtpuError::io("ebpf_grouped_config", invalid_data("map missing")))?;
+            let array = Array::<_, [u8; GTPU_SESSION_CONFIG_VALUE_LEN]>::try_from(map)
+                .map_err(|error| map_error("ebpf_grouped_config", error))?;
+            array
+                .get(&GTPU_SESSION_CONFIG_KEY, 0)
+                .map_err(|error| map_error("ebpf_grouped_config", error))
+        }
+
+        fn grouped_config_write_verified(
+            ebpf: &mut Ebpf,
+            value: [u8; GTPU_SESSION_CONFIG_VALUE_LEN],
+        ) -> Result<(), GtpuError> {
+            let write = {
+                let map = ebpf.map_mut(MAP_CONFIG_IPV6).ok_or_else(|| {
+                    GtpuError::io("ebpf_grouped_config", invalid_data("map missing"))
+                })?;
+                let mut array = Array::<_, [u8; GTPU_SESSION_CONFIG_VALUE_LEN]>::try_from(map)
+                    .map_err(|error| map_error("ebpf_grouped_config", error))?;
+                array.set(GTPU_SESSION_CONFIG_KEY, value, 0)
+            };
+            if matches!(Self::grouped_config_read(ebpf), Ok(observed) if observed == value) {
+                return Ok(());
+            }
+            let _ = write;
+            Err(state_indeterminate("ebpf_grouped_config_write"))
+        }
+
+        fn grouped_schema_read(
+            ebpf: &Ebpf,
+        ) -> Result<[u8; GTPU_SESSION_SCHEMA_MARKER_LEN], GtpuError> {
+            let map = ebpf
+                .map(MAP_SESSION_SCHEMA)
+                .ok_or_else(|| GtpuError::io("ebpf_grouped_schema", invalid_data("map missing")))?;
+            let array = Array::<_, [u8; GTPU_SESSION_SCHEMA_MARKER_LEN]>::try_from(map)
+                .map_err(|error| map_error("ebpf_grouped_schema", error))?;
+            array
+                .get(&GTPU_SESSION_CONFIG_KEY, 0)
+                .map_err(|error| map_error("ebpf_grouped_schema", error))
+        }
+
+        fn grouped_schema_write_verified(ebpf: &mut Ebpf) -> Result<(), GtpuError> {
+            let write = {
+                let map = ebpf.map_mut(MAP_SESSION_SCHEMA).ok_or_else(|| {
+                    GtpuError::io("ebpf_grouped_schema", invalid_data("map missing"))
+                })?;
+                let mut array = Array::<_, [u8; GTPU_SESSION_SCHEMA_MARKER_LEN]>::try_from(map)
+                    .map_err(|error| map_error("ebpf_grouped_schema", error))?;
+                array.set(GTPU_SESSION_CONFIG_KEY, GTPU_SESSION_SCHEMA_MARKER_VALUE, 0)
+            };
+            if matches!(
+                Self::grouped_schema_read(ebpf),
+                Ok(observed) if observed == GTPU_SESSION_SCHEMA_MARKER_VALUE
+            ) {
+                return Ok(());
+            }
+            let _ = write;
+            Err(state_indeterminate("ebpf_grouped_schema_write"))
+        }
+
+        /// Grouped attachment never adopts legacy IPv4 authority. Every
+        /// legacy forwarding map must be empty, the legacy config slot must
+        /// remain all-zero, and only the recognized userspace schema marker
+        /// may occupy the FAR map.
+        fn require_empty_legacy_authority(
+            ebpf: &Ebpf,
+            bearer_state: BearerSchemaState,
+        ) -> Result<(), GtpuError> {
+            let missing =
+                || GtpuError::io("ebpf_grouped_legacy_graph", invalid_data("map missing"));
+            let far = BpfHashMap::<_, [u8; 4], [u8; UPLINK_FAR_VALUE_LEN]>::try_from(
+                ebpf.map(MAP_UPLINK_FAR).ok_or_else(missing)?,
+            )
+            .map_err(|error| map_error("ebpf_grouped_legacy_graph", error))?;
+            let expected_marker = match bearer_state {
+                BearerSchemaState::Fresh => None,
+                BearerSchemaState::LegacyV0 => None,
+                BearerSchemaState::V1Uncommitted => None,
+                BearerSchemaState::DscpV1 => Some(UPLINK_DSCP_SCHEMA_MARKER_VALUE),
+                BearerSchemaState::BearerV2 => Some(UPLINK_BEARER_SCHEMA_MARKER_VALUE),
+                BearerSchemaState::EndpointV3 => Some(UPLINK_ENDPOINT_SCHEMA_MARKER_VALUE),
+                BearerSchemaState::SourcePortV4 => Some(UPLINK_SOURCE_PORT_SCHEMA_MARKER_VALUE),
+                BearerSchemaState::PmtuV5 => Some(UPLINK_PMTU_SCHEMA_MARKER_VALUE),
+            };
+            let mut marker_seen = false;
+            for entry in far.iter() {
+                let (key, value) =
+                    entry.map_err(|error| map_error("ebpf_grouped_legacy_graph", error))?;
+                if key != UPLINK_DSCP_SCHEMA_MARKER_KEY
+                    || marker_seen
+                    || expected_marker != Some(value)
+                {
+                    return Err(GtpuError::AlreadyExists);
+                }
+                marker_seen = true;
+            }
+            if marker_seen != expected_marker.is_some() {
+                return Err(state_indeterminate("ebpf_grouped_legacy_graph"));
+            }
+
+            macro_rules! require_empty {
+                ($name:expr, $key:ty, $value:ty) => {{
+                    let map = BpfHashMap::<_, $key, $value>::try_from(
+                        ebpf.map($name).ok_or_else(missing)?,
+                    )
+                    .map_err(|error| map_error("ebpf_grouped_legacy_graph", error))?;
+                    if map
+                        .iter()
+                        .next()
+                        .transpose()
+                        .map_err(|error| map_error("ebpf_grouped_legacy_graph", error))?
+                        .is_some()
+                    {
+                        return Err(GtpuError::AlreadyExists);
+                    }
+                }};
+            }
+            require_empty!(
+                MAP_UPLINK_MARK_FAR,
+                [u8; UPLINK_MARK_KEY_LEN],
+                [u8; UPLINK_FAR_VALUE_LEN]
+            );
+            require_empty!(MAP_UPLINK_DSCP, [u8; 4], [u8; UPLINK_DSCP_VALUE_LEN]);
+            require_empty!(
+                MAP_UPLINK_MARK_DSCP,
+                [u8; UPLINK_MARK_KEY_LEN],
+                [u8; UPLINK_DSCP_VALUE_LEN]
+            );
+            require_empty!(
+                MAP_UPLINK_SOURCE_PORT,
+                [u8; 4],
+                [u8; UPLINK_SOURCE_PORT_VALUE_LEN]
+            );
+            require_empty!(
+                MAP_UPLINK_MARK_SOURCE_PORT,
+                [u8; UPLINK_MARK_KEY_LEN],
+                [u8; UPLINK_SOURCE_PORT_VALUE_LEN]
+            );
+            require_empty!(MAP_DOWNLINK_PDR, [u8; 4], [u8; DOWNLINK_PDR_VALUE_LEN]);
+            require_empty!(
+                MAP_DOWNLINK_MARK_PDR,
+                [u8; 4],
+                [u8; MARKED_DOWNLINK_PDR_VALUE_LEN]
+            );
+            require_empty!(
+                MAP_DOWNLINK_ENDPOINT_BINDING,
+                [u8; 4],
+                [u8; DOWNLINK_ENDPOINT_BINDING_VALUE_LEN]
+            );
+            require_empty!(
+                MAP_MARKED_BEARER_OWNER,
+                [u8; UPLINK_MARK_KEY_LEN],
+                [u8; MARKED_BEARER_OWNER_VALUE_LEN]
+            );
+            let config = Array::<_, [u8; 4]>::try_from(ebpf.map(MAP_CONFIG).ok_or_else(missing)?)
+                .map_err(|error| map_error("ebpf_grouped_legacy_graph", error))?
+                .get(&0, 0)
+                .map_err(|error| map_error("ebpf_grouped_legacy_graph", error))?;
+            if config != [0; 4] {
+                return Err(GtpuError::AlreadyExists);
+            }
+            Ok(())
         }
 
         fn write_bearer_schema_marker(ebpf: &mut Ebpf) -> Result<(), GtpuError> {
@@ -5653,6 +7949,9 @@ mod aya_runtime {
                         MAP_MARKED_BEARER_OWNER,
                         MAP_COUNTERS,
                         MAP_CONFIG,
+                        MAP_SESSION_GROUPS,
+                        MAP_SESSION_UPLINK_INDEX,
+                        MAP_CONFIG_IPV6,
                     ],
                 )?,
                 downlink: Self::program_identity(
@@ -5672,6 +7971,9 @@ mod aya_runtime {
                         MAP_MARKED_BEARER_OWNER,
                         MAP_COUNTERS,
                         MAP_DOWNLINK_BINDING_COUNTERS,
+                        MAP_SESSION_GROUPS,
+                        MAP_SESSION_DOWNLINK_INDEX,
+                        MAP_CONFIG_IPV6,
                     ],
                 )?,
                 pins: Self::pinned_map_identity(pin_dir)?,
@@ -6576,6 +8878,12 @@ mod aya_runtime {
                 counters: id(MAP_COUNTERS)?,
                 downlink_binding_counters: id(MAP_DOWNLINK_BINDING_COUNTERS)?,
                 config: id(MAP_CONFIG)?,
+                session_groups: id(MAP_SESSION_GROUPS)?,
+                session_uplink_index: id(MAP_SESSION_UPLINK_INDEX)?,
+                session_downlink_index: id(MAP_SESSION_DOWNLINK_INDEX)?,
+                session_transactions: id(MAP_SESSION_TRANSACTIONS)?,
+                config_ipv6: id(MAP_CONFIG_IPV6)?,
+                session_schema: id(MAP_SESSION_SCHEMA)?,
             })
         }
 
@@ -6596,6 +8904,12 @@ mod aya_runtime {
                 identity.counters,
                 identity.downlink_binding_counters,
                 identity.config,
+                identity.session_groups,
+                identity.session_uplink_index,
+                identity.session_downlink_index,
+                identity.session_transactions,
+                identity.config_ipv6,
+                identity.session_schema,
             ]
         }
 
@@ -6678,6 +8992,45 @@ mod aya_runtime {
             .map_err(|error| map_error("ebpf_map_identity", error))?;
             let config = Array::<_, [u8; 4]>::try_from(ebpf.map(MAP_CONFIG).ok_or_else(missing)?)
                 .map_err(|error| map_error("ebpf_map_identity", error))?;
+            let session_groups = BpfHashMap::<
+                _,
+                [u8; GTPU_SESSION_GROUP_ID_LEN],
+                [u8; GTPU_SESSION_GROUP_VALUE_LEN],
+            >::try_from(
+                ebpf.map(MAP_SESSION_GROUPS).ok_or_else(missing)?
+            )
+            .map_err(|error| map_error("ebpf_map_identity", error))?;
+            let session_uplink_index = BpfHashMap::<
+                _,
+                [u8; GTPU_SESSION_UPLINK_KEY_LEN],
+                [u8; GTPU_SESSION_GROUP_REF_LEN],
+            >::try_from(
+                ebpf.map(MAP_SESSION_UPLINK_INDEX).ok_or_else(missing)?
+            )
+            .map_err(|error| map_error("ebpf_map_identity", error))?;
+            let session_downlink_index = BpfHashMap::<
+                _,
+                [u8; GTPU_SESSION_DOWNLINK_KEY_LEN],
+                [u8; GTPU_SESSION_GROUP_REF_LEN],
+            >::try_from(
+                ebpf.map(MAP_SESSION_DOWNLINK_INDEX).ok_or_else(missing)?,
+            )
+            .map_err(|error| map_error("ebpf_map_identity", error))?;
+            let session_transactions =
+                BpfHashMap::<
+                    _,
+                    [u8; GTPU_SESSION_GROUP_ID_LEN],
+                    [u8; GTPU_SESSION_TRANSACTION_VALUE_LEN],
+                >::try_from(ebpf.map(MAP_SESSION_TRANSACTIONS).ok_or_else(missing)?)
+                .map_err(|error| map_error("ebpf_map_identity", error))?;
+            let config_ipv6 = Array::<_, [u8; GTPU_SESSION_CONFIG_VALUE_LEN]>::try_from(
+                ebpf.map(MAP_CONFIG_IPV6).ok_or_else(missing)?,
+            )
+            .map_err(|error| map_error("ebpf_map_identity", error))?;
+            let session_schema = Array::<_, [u8; GTPU_SESSION_SCHEMA_MARKER_LEN]>::try_from(
+                ebpf.map(MAP_SESSION_SCHEMA).ok_or_else(missing)?,
+            )
+            .map_err(|error| map_error("ebpf_map_identity", error))?;
             Ok(PinnedMapIdentity {
                 uplink_far: info_id(uplink_far.map())?,
                 uplink_mark_far: info_id(uplink_mark_far.map())?,
@@ -6694,6 +9047,12 @@ mod aya_runtime {
                 counters: info_id(counters.map())?,
                 downlink_binding_counters: info_id(downlink_binding_counters.map())?,
                 config: info_id(config.map())?,
+                session_groups: info_id(session_groups.map())?,
+                session_uplink_index: info_id(session_uplink_index.map())?,
+                session_downlink_index: info_id(session_downlink_index.map())?,
+                session_transactions: info_id(session_transactions.map())?,
+                config_ipv6: info_id(config_ipv6.map())?,
+                session_schema: info_id(session_schema.map())?,
             })
         }
 
@@ -7969,6 +10328,220 @@ mod aya_runtime {
                     ebpf,
                     marked_owner_by_teid: indexes.marked_owner_by_teid,
                     default_teid_by_ue: indexes.default_teid_by_ue,
+                    links: attached.links,
+                    pin_dir: canonical_pin_dir,
+                    tc_priority,
+                    datapath_identity: attached.identity,
+                    _reconciler_ownership: reconciler_ownership,
+                },
+            );
+            Ok(if pins_preexisted {
+                EbpfAttachmentDisposition::Retained
+            } else {
+                EbpfAttachmentDisposition::Fresh
+            })
+        }
+
+        fn attach_grouped(
+            &self,
+            interface: &str,
+            ifindex: u32,
+            pin_dir: &Path,
+            tc_priority: u16,
+            config: [u8; GTPU_SESSION_CONFIG_VALUE_LEN],
+        ) -> Result<EbpfAttachmentDisposition, GtpuError> {
+            let desired = GtpuSessionDeviceConfig::decode(&config)
+                .filter(|decoded| decoded.encode() == config)
+                .filter(|decoded| decoded.ingress_ifindex() == ifindex)
+                .ok_or_else(|| {
+                    GtpuError::invalid_config(
+                        "device.local_endpoints",
+                        "non-canonical grouped attachment authority",
+                    )
+                })?;
+            Self::validate_replacement_identity(interface, ifindex).map_err(
+                |error| match error {
+                    ReplacementHookObservationError::IdentityChanged => GtpuError::NotFound,
+                    ReplacementHookObservationError::Indeterminate => {
+                        state_indeterminate("ebpf_grouped_interface_identity")
+                    }
+                },
+            )?;
+
+            let reconciler_ownership = Self::acquire_reconciler_ownership(pin_dir)?;
+            Self::ensure_no_current_recovery_proof(&reconciler_ownership)?;
+            let pins_preexisted = reconciler_ownership.canonical_pin_dir.is_dir();
+            let canonical_pin_dir =
+                Self::canonical_pin_dir(&reconciler_ownership.canonical_pin_dir)?;
+            if canonical_pin_dir != reconciler_ownership.canonical_pin_dir {
+                return Err(state_indeterminate("ebpf_pin_dir_identity"));
+            }
+            let bearer_state = Self::bearer_schema_preflight(&canonical_pin_dir)?;
+            let grouped_state = Self::grouped_schema_preflight(&canonical_pin_dir, bearer_state)?;
+            let mut ebpf = match self.load_pinned(&canonical_pin_dir) {
+                Ok(ebpf) => ebpf,
+                Err(error) if pins_preexisted => return Err(error),
+                Err(error) => {
+                    return match Self::cleanup_pin_set_if_detached(
+                        &canonical_pin_dir,
+                        None,
+                        ifindex,
+                        tc_priority,
+                        PinCleanupHookProof::RequireEmptySlots,
+                    ) {
+                        Ok(()) => Err(error),
+                        Err(cleanup_error) => Err(cleanup_error),
+                    };
+                }
+            };
+            let expected_pins = Self::held_map_identity(&ebpf)
+                .map_err(|_| state_indeterminate("ebpf_map_identity"))?;
+            let named_pins = Self::pinned_map_identity(&canonical_pin_dir)
+                .map_err(|_| state_indeterminate("ebpf_map_identity"))?;
+            if named_pins != expected_pins {
+                return Err(state_indeterminate("ebpf_map_identity"));
+            }
+
+            let provisioned = (|| {
+                Self::require_empty_legacy_authority(&ebpf, bearer_state)?;
+                self.require_canonical_pmtu_slot(&ebpf)?;
+
+                let recorded = match grouped_state {
+                    GroupedSchemaState::Fresh
+                    | GroupedSchemaState::Initializing { config: None } => None,
+                    GroupedSchemaState::Initializing {
+                        config: Some(config),
+                    }
+                    | GroupedSchemaState::Retained { config } => Some(config),
+                };
+                let observed = Self::grouped_config_read(&ebpf)?;
+                if observed
+                    != recorded.map_or([0; GTPU_SESSION_CONFIG_VALUE_LEN], |config| config.encode())
+                {
+                    return Err(state_indeterminate("ebpf_grouped_config"));
+                }
+
+                match recorded {
+                    None => Self::grouped_config_write_verified(&mut ebpf, config)?,
+                    Some(current) if current == desired => {}
+                    Some(current)
+                        if Self::grouped_config_same_namespace(current, desired)
+                            && current.ingress_ifindex() != desired.ingress_ifindex() =>
+                    {
+                        let ids = Self::pinned_map_ids(&expected_pins);
+                        if Self::current_program_references(&ids, None)?
+                            != CurrentProgramReference::Absent
+                        {
+                            return Err(GtpuError::AlreadyExists);
+                        }
+                        Self::validate_replacement_identity(interface, ifindex)
+                            .map_err(|_| state_indeterminate("ebpf_grouped_interface_identity"))?;
+                        Self::grouped_config_write_verified(&mut ebpf, config)?;
+                    }
+                    Some(_) => return Err(GtpuError::AlreadyExists),
+                }
+                if Self::grouped_config_read(&ebpf)? != config {
+                    return Err(state_indeterminate("ebpf_grouped_config"));
+                }
+
+                match grouped_state {
+                    GroupedSchemaState::Retained { .. } => {
+                        if Self::grouped_schema_read(&ebpf)? != GTPU_SESSION_SCHEMA_MARKER_VALUE {
+                            return Err(state_indeterminate("ebpf_grouped_schema"));
+                        }
+                    }
+                    GroupedSchemaState::Fresh | GroupedSchemaState::Initializing { .. } => {
+                        if Self::grouped_schema_read(&ebpf)? != [0; GTPU_SESSION_SCHEMA_MARKER_LEN]
+                        {
+                            return Err(state_indeterminate("ebpf_grouped_schema"));
+                        }
+                        Self::grouped_schema_write_verified(&mut ebpf)?;
+                    }
+                }
+
+                Self::validate_replacement_identity(interface, ifindex)
+                    .map_err(|_| state_indeterminate("ebpf_grouped_interface_identity"))?;
+                let attached = self.attach_programs(
+                    &mut ebpf,
+                    interface,
+                    ifindex,
+                    &canonical_pin_dir,
+                    tc_priority,
+                    bearer_state,
+                )?;
+                if bearer_state != BearerSchemaState::PmtuV5 {
+                    if let Err(error) = Self::write_bearer_schema_marker(&mut ebpf) {
+                        if attached.replaced_existing {
+                            return Err(state_indeterminate("ebpf_schema_marker_commit"));
+                        }
+                        let rollback = detach_datapath_if_current(
+                            attached.links,
+                            &attached.identity,
+                            ifindex,
+                            tc_priority,
+                        );
+                        return Err(error_after_rollback(
+                            error,
+                            rollback,
+                            false,
+                            "ebpf_tc_attach_rollback",
+                        ));
+                    }
+                }
+                Ok(attached)
+            })();
+            let attached = match provisioned {
+                Ok(attached) => attached,
+                Err(error) => {
+                    let error = Self::finish_fresh_attach_failure(
+                        &canonical_pin_dir,
+                        &expected_pins,
+                        pins_preexisted,
+                        ifindex,
+                        tc_priority,
+                        error,
+                    );
+                    drop(ebpf);
+                    return Err(error);
+                }
+            };
+
+            let mut devices = match self.devices.lock() {
+                Ok(devices) => devices,
+                Err(_) => {
+                    if attached.replaced_existing {
+                        return Err(state_indeterminate("ebpf_grouped_device_commit"));
+                    }
+                    let rollback = detach_datapath_if_current(
+                        attached.links,
+                        &attached.identity,
+                        ifindex,
+                        tc_priority,
+                    );
+                    let error = error_after_rollback(
+                        GtpuError::io("ebpf_grouped_attach", super::poisoned_lock()),
+                        rollback,
+                        false,
+                        "ebpf_tc_attach_rollback",
+                    );
+                    let error = Self::finish_fresh_attach_failure(
+                        &canonical_pin_dir,
+                        &expected_pins,
+                        pins_preexisted,
+                        ifindex,
+                        tc_priority,
+                        error,
+                    );
+                    drop(ebpf);
+                    return Err(error);
+                }
+            };
+            devices.insert(
+                ifindex,
+                LoadedDevice {
+                    ebpf,
+                    marked_owner_by_teid: HashMap::new(),
+                    default_teid_by_ue: HashMap::new(),
                     links: attached.links,
                     pin_dir: canonical_pin_dir,
                     tc_priority,
@@ -9806,6 +12379,410 @@ mod aya_runtime {
             )
         }
 
+        fn next_session_transaction_id(&self) -> Result<GtpuSessionTransactionId, GtpuError> {
+            let mut rng = SysRng;
+            for _ in 0..4 {
+                let mut value = [0_u8; GTPU_SESSION_GROUP_ID_LEN];
+                rng.try_fill_bytes(&mut value).map_err(|_| {
+                    GtpuError::io(
+                        "ebpf_grouped_transaction_entropy",
+                        io::Error::other("system random source unavailable"),
+                    )
+                })?;
+                if let Some(token) = GtpuSessionTransactionId::new(value) {
+                    return Ok(token);
+                }
+            }
+            Err(state_indeterminate("ebpf_grouped_transaction_entropy"))
+        }
+
+        fn session_group_get(
+            &self,
+            ifindex: u32,
+            key: [u8; GTPU_SESSION_GROUP_ID_LEN],
+        ) -> Result<Option<[u8; GTPU_SESSION_GROUP_VALUE_LEN]>, GtpuError> {
+            self.with_device(ifindex, "ebpf_session_group_get", |device| {
+                let map = device.ebpf.map(MAP_SESSION_GROUPS).ok_or_else(|| {
+                    GtpuError::io("ebpf_session_group_map", invalid_data("map missing"))
+                })?;
+                let hash = BpfHashMap::<
+                    _,
+                    [u8; GTPU_SESSION_GROUP_ID_LEN],
+                    [u8; GTPU_SESSION_GROUP_VALUE_LEN],
+                >::try_from(map)
+                .map_err(|error| map_error("ebpf_session_group_map", error))?;
+                match hash.get(&key, 0) {
+                    Ok(value) => Ok(Some(value)),
+                    Err(MapError::KeyNotFound) => Ok(None),
+                    Err(error) => Err(map_error("ebpf_session_group_get", error)),
+                }
+            })
+        }
+
+        fn session_group_put(
+            &self,
+            ifindex: u32,
+            key: [u8; GTPU_SESSION_GROUP_ID_LEN],
+            value: [u8; GTPU_SESSION_GROUP_VALUE_LEN],
+            mode: EbpfMapUpdateMode,
+        ) -> Result<(), GtpuError> {
+            self.with_device(ifindex, "ebpf_session_group_put", |device| {
+                let map = device.ebpf.map_mut(MAP_SESSION_GROUPS).ok_or_else(|| {
+                    GtpuError::io("ebpf_session_group_map", invalid_data("map missing"))
+                })?;
+                let mut hash = BpfHashMap::<
+                    _,
+                    [u8; GTPU_SESSION_GROUP_ID_LEN],
+                    [u8; GTPU_SESSION_GROUP_VALUE_LEN],
+                >::try_from(map)
+                .map_err(|error| map_error("ebpf_session_group_map", error))?;
+                let flags = match mode {
+                    EbpfMapUpdateMode::NoExist => 1,
+                    EbpfMapUpdateMode::Exist => 2,
+                };
+                hash.insert(key, value, flags)
+                    .map_err(|error| map_error("ebpf_session_group_put", error))
+            })
+        }
+
+        fn session_group_remove(
+            &self,
+            ifindex: u32,
+            key: [u8; GTPU_SESSION_GROUP_ID_LEN],
+        ) -> Result<bool, GtpuError> {
+            self.with_device(ifindex, "ebpf_session_group_remove", |device| {
+                let map = device.ebpf.map_mut(MAP_SESSION_GROUPS).ok_or_else(|| {
+                    GtpuError::io("ebpf_session_group_map", invalid_data("map missing"))
+                })?;
+                let mut hash = BpfHashMap::<
+                    _,
+                    [u8; GTPU_SESSION_GROUP_ID_LEN],
+                    [u8; GTPU_SESSION_GROUP_VALUE_LEN],
+                >::try_from(map)
+                .map_err(|error| map_error("ebpf_session_group_map", error))?;
+                map_delete_result("ebpf_session_group_remove", hash.remove(&key))
+            })
+        }
+
+        fn session_uplink_get(
+            &self,
+            ifindex: u32,
+            key: [u8; GTPU_SESSION_UPLINK_KEY_LEN],
+        ) -> Result<Option<[u8; GTPU_SESSION_GROUP_REF_LEN]>, GtpuError> {
+            self.with_device(ifindex, "ebpf_session_uplink_get", |device| {
+                let map = device.ebpf.map(MAP_SESSION_UPLINK_INDEX).ok_or_else(|| {
+                    GtpuError::io("ebpf_session_uplink_map", invalid_data("map missing"))
+                })?;
+                let hash = BpfHashMap::<
+                    _,
+                    [u8; GTPU_SESSION_UPLINK_KEY_LEN],
+                    [u8; GTPU_SESSION_GROUP_REF_LEN],
+                >::try_from(map)
+                .map_err(|error| map_error("ebpf_session_uplink_map", error))?;
+                match hash.get(&key, 0) {
+                    Ok(value) => Ok(Some(value)),
+                    Err(MapError::KeyNotFound) => Ok(None),
+                    Err(error) => Err(map_error("ebpf_session_uplink_get", error)),
+                }
+            })
+        }
+
+        fn session_uplink_put(
+            &self,
+            ifindex: u32,
+            key: [u8; GTPU_SESSION_UPLINK_KEY_LEN],
+            value: [u8; GTPU_SESSION_GROUP_REF_LEN],
+            mode: EbpfMapUpdateMode,
+        ) -> Result<(), GtpuError> {
+            self.with_device(ifindex, "ebpf_session_uplink_put", |device| {
+                let map = device
+                    .ebpf
+                    .map_mut(MAP_SESSION_UPLINK_INDEX)
+                    .ok_or_else(|| {
+                        GtpuError::io("ebpf_session_uplink_map", invalid_data("map missing"))
+                    })?;
+                let mut hash = BpfHashMap::<
+                    _,
+                    [u8; GTPU_SESSION_UPLINK_KEY_LEN],
+                    [u8; GTPU_SESSION_GROUP_REF_LEN],
+                >::try_from(map)
+                .map_err(|error| map_error("ebpf_session_uplink_map", error))?;
+                let flags = match mode {
+                    EbpfMapUpdateMode::NoExist => 1,
+                    EbpfMapUpdateMode::Exist => 2,
+                };
+                hash.insert(key, value, flags)
+                    .map_err(|error| map_error("ebpf_session_uplink_put", error))
+            })
+        }
+
+        fn session_uplink_remove(
+            &self,
+            ifindex: u32,
+            key: [u8; GTPU_SESSION_UPLINK_KEY_LEN],
+        ) -> Result<bool, GtpuError> {
+            self.with_device(ifindex, "ebpf_session_uplink_remove", |device| {
+                let map = device
+                    .ebpf
+                    .map_mut(MAP_SESSION_UPLINK_INDEX)
+                    .ok_or_else(|| {
+                        GtpuError::io("ebpf_session_uplink_map", invalid_data("map missing"))
+                    })?;
+                let mut hash = BpfHashMap::<
+                    _,
+                    [u8; GTPU_SESSION_UPLINK_KEY_LEN],
+                    [u8; GTPU_SESSION_GROUP_REF_LEN],
+                >::try_from(map)
+                .map_err(|error| map_error("ebpf_session_uplink_map", error))?;
+                map_delete_result("ebpf_session_uplink_remove", hash.remove(&key))
+            })
+        }
+
+        fn session_downlink_get(
+            &self,
+            ifindex: u32,
+            key: [u8; GTPU_SESSION_DOWNLINK_KEY_LEN],
+        ) -> Result<Option<[u8; GTPU_SESSION_GROUP_REF_LEN]>, GtpuError> {
+            self.with_device(ifindex, "ebpf_session_downlink_get", |device| {
+                let map = device.ebpf.map(MAP_SESSION_DOWNLINK_INDEX).ok_or_else(|| {
+                    GtpuError::io("ebpf_session_downlink_map", invalid_data("map missing"))
+                })?;
+                let hash = BpfHashMap::<
+                    _,
+                    [u8; GTPU_SESSION_DOWNLINK_KEY_LEN],
+                    [u8; GTPU_SESSION_GROUP_REF_LEN],
+                >::try_from(map)
+                .map_err(|error| map_error("ebpf_session_downlink_map", error))?;
+                match hash.get(&key, 0) {
+                    Ok(value) => Ok(Some(value)),
+                    Err(MapError::KeyNotFound) => Ok(None),
+                    Err(error) => Err(map_error("ebpf_session_downlink_get", error)),
+                }
+            })
+        }
+
+        fn session_downlink_put(
+            &self,
+            ifindex: u32,
+            key: [u8; GTPU_SESSION_DOWNLINK_KEY_LEN],
+            value: [u8; GTPU_SESSION_GROUP_REF_LEN],
+            mode: EbpfMapUpdateMode,
+        ) -> Result<(), GtpuError> {
+            self.with_device(ifindex, "ebpf_session_downlink_put", |device| {
+                let map = device
+                    .ebpf
+                    .map_mut(MAP_SESSION_DOWNLINK_INDEX)
+                    .ok_or_else(|| {
+                        GtpuError::io("ebpf_session_downlink_map", invalid_data("map missing"))
+                    })?;
+                let mut hash = BpfHashMap::<
+                    _,
+                    [u8; GTPU_SESSION_DOWNLINK_KEY_LEN],
+                    [u8; GTPU_SESSION_GROUP_REF_LEN],
+                >::try_from(map)
+                .map_err(|error| map_error("ebpf_session_downlink_map", error))?;
+                let flags = match mode {
+                    EbpfMapUpdateMode::NoExist => 1,
+                    EbpfMapUpdateMode::Exist => 2,
+                };
+                hash.insert(key, value, flags)
+                    .map_err(|error| map_error("ebpf_session_downlink_put", error))
+            })
+        }
+
+        fn session_downlink_remove(
+            &self,
+            ifindex: u32,
+            key: [u8; GTPU_SESSION_DOWNLINK_KEY_LEN],
+        ) -> Result<bool, GtpuError> {
+            self.with_device(ifindex, "ebpf_session_downlink_remove", |device| {
+                let map = device
+                    .ebpf
+                    .map_mut(MAP_SESSION_DOWNLINK_INDEX)
+                    .ok_or_else(|| {
+                        GtpuError::io("ebpf_session_downlink_map", invalid_data("map missing"))
+                    })?;
+                let mut hash = BpfHashMap::<
+                    _,
+                    [u8; GTPU_SESSION_DOWNLINK_KEY_LEN],
+                    [u8; GTPU_SESSION_GROUP_REF_LEN],
+                >::try_from(map)
+                .map_err(|error| map_error("ebpf_session_downlink_map", error))?;
+                map_delete_result("ebpf_session_downlink_remove", hash.remove(&key))
+            })
+        }
+
+        fn session_transaction_get(
+            &self,
+            ifindex: u32,
+            key: [u8; GTPU_SESSION_GROUP_ID_LEN],
+        ) -> Result<Option<[u8; GTPU_SESSION_TRANSACTION_VALUE_LEN]>, GtpuError> {
+            self.with_device(ifindex, "ebpf_session_transaction_get", |device| {
+                let map = device.ebpf.map(MAP_SESSION_TRANSACTIONS).ok_or_else(|| {
+                    GtpuError::io("ebpf_session_transaction_map", invalid_data("map missing"))
+                })?;
+                let hash = BpfHashMap::<
+                    _,
+                    [u8; GTPU_SESSION_GROUP_ID_LEN],
+                    [u8; GTPU_SESSION_TRANSACTION_VALUE_LEN],
+                >::try_from(map)
+                .map_err(|error| map_error("ebpf_session_transaction_map", error))?;
+                match hash.get(&key, 0) {
+                    Ok(value) => Ok(Some(value)),
+                    Err(MapError::KeyNotFound) => Ok(None),
+                    Err(error) => Err(map_error("ebpf_session_transaction_get", error)),
+                }
+            })
+        }
+
+        fn session_transaction_put(
+            &self,
+            ifindex: u32,
+            key: [u8; GTPU_SESSION_GROUP_ID_LEN],
+            value: [u8; GTPU_SESSION_TRANSACTION_VALUE_LEN],
+            mode: EbpfMapUpdateMode,
+        ) -> Result<(), GtpuError> {
+            self.with_device(ifindex, "ebpf_session_transaction_put", |device| {
+                let map = device
+                    .ebpf
+                    .map_mut(MAP_SESSION_TRANSACTIONS)
+                    .ok_or_else(|| {
+                        GtpuError::io("ebpf_session_transaction_map", invalid_data("map missing"))
+                    })?;
+                let mut hash = BpfHashMap::<
+                    _,
+                    [u8; GTPU_SESSION_GROUP_ID_LEN],
+                    [u8; GTPU_SESSION_TRANSACTION_VALUE_LEN],
+                >::try_from(map)
+                .map_err(|error| map_error("ebpf_session_transaction_map", error))?;
+                let flags = match mode {
+                    EbpfMapUpdateMode::NoExist => 1,
+                    EbpfMapUpdateMode::Exist => 2,
+                };
+                hash.insert(key, value, flags)
+                    .map_err(|error| map_error("ebpf_session_transaction_put", error))
+            })
+        }
+
+        fn session_transaction_remove(
+            &self,
+            ifindex: u32,
+            key: [u8; GTPU_SESSION_GROUP_ID_LEN],
+        ) -> Result<bool, GtpuError> {
+            self.with_device(ifindex, "ebpf_session_transaction_remove", |device| {
+                let map = device
+                    .ebpf
+                    .map_mut(MAP_SESSION_TRANSACTIONS)
+                    .ok_or_else(|| {
+                        GtpuError::io("ebpf_session_transaction_map", invalid_data("map missing"))
+                    })?;
+                let mut hash = BpfHashMap::<
+                    _,
+                    [u8; GTPU_SESSION_GROUP_ID_LEN],
+                    [u8; GTPU_SESSION_TRANSACTION_VALUE_LEN],
+                >::try_from(map)
+                .map_err(|error| map_error("ebpf_session_transaction_map", error))?;
+                map_delete_result("ebpf_session_transaction_remove", hash.remove(&key))
+            })
+        }
+
+        fn session_index_inventory(
+            &self,
+            ifindex: u32,
+            group_id: [u8; GTPU_SESSION_GROUP_ID_LEN],
+        ) -> Result<EbpfSessionIndexInventory, GtpuError> {
+            self.with_device(ifindex, "ebpf_session_index_inventory", |device| {
+                let uplink = BpfHashMap::<
+                    _,
+                    [u8; GTPU_SESSION_UPLINK_KEY_LEN],
+                    [u8; GTPU_SESSION_GROUP_REF_LEN],
+                >::try_from(
+                    device.ebpf.map(MAP_SESSION_UPLINK_INDEX).ok_or_else(|| {
+                        GtpuError::io("ebpf_session_uplink_map", invalid_data("map missing"))
+                    })?,
+                )
+                .map_err(|error| map_error("ebpf_session_uplink_map", error))?;
+                let downlink = BpfHashMap::<
+                    _,
+                    [u8; GTPU_SESSION_DOWNLINK_KEY_LEN],
+                    [u8; GTPU_SESSION_GROUP_REF_LEN],
+                >::try_from(
+                    device.ebpf.map(MAP_SESSION_DOWNLINK_INDEX).ok_or_else(|| {
+                        GtpuError::io("ebpf_session_downlink_map", invalid_data("map missing"))
+                    })?,
+                )
+                .map_err(|error| map_error("ebpf_session_downlink_map", error))?;
+                let mut inventory = EbpfSessionIndexInventory::default();
+                for entry in uplink.iter() {
+                    let (key, value) =
+                        entry.map_err(|error| map_error("ebpf_session_index_inventory", error))?;
+                    if value[..GTPU_SESSION_GROUP_ID_LEN] == group_id {
+                        inventory.uplink.push((key, value));
+                    }
+                }
+                for entry in downlink.iter() {
+                    let (key, value) =
+                        entry.map_err(|error| map_error("ebpf_session_index_inventory", error))?;
+                    if value[..GTPU_SESSION_GROUP_ID_LEN] == group_id {
+                        inventory.downlink.push((key, value));
+                    }
+                }
+                inventory.uplink.sort_unstable();
+                inventory.downlink.sort_unstable();
+                Ok(inventory)
+            })
+        }
+
+        fn grouped_datapath_usable(
+            &self,
+            ifindex: u32,
+            expected_config: [u8; GTPU_SESSION_CONFIG_VALUE_LEN],
+        ) -> bool {
+            let Some(expected) = GtpuSessionDeviceConfig::decode(&expected_config)
+                .filter(|config| config.encode() == expected_config)
+                .filter(|config| config.ingress_ifindex() == ifindex)
+            else {
+                return false;
+            };
+            let Ok(devices) = self.devices.lock() else {
+                return false;
+            };
+            let Some(device) = devices.get(&ifindex) else {
+                return false;
+            };
+            let Ok(first) = Self::datapath_identity(&device.ebpf, &device.pin_dir) else {
+                return false;
+            };
+            if first != device.datapath_identity {
+                return false;
+            }
+            let hooks_are_exact = matches!(
+                slot_owner(ifindex, TcAttachType::Egress, device.tc_priority),
+                Ok(Some(owner))
+                    if owner.name == PROG_UPLINK
+                        && owner.program_id == Some(first.uplink.program_id)
+            ) && matches!(
+                slot_owner(ifindex, TcAttachType::Ingress, device.tc_priority),
+                Ok(Some(owner))
+                    if owner.name == PROG_DOWNLINK
+                        && owner.program_id == Some(first.downlink.program_id)
+            );
+            let config_is_exact = matches!(
+                Self::grouped_config_read(&device.ebpf),
+                Ok(observed)
+                    if observed == expected_config
+                        && GtpuSessionDeviceConfig::decode(&observed) == Some(expected)
+            );
+            let schema_is_exact = matches!(
+                Self::grouped_schema_read(&device.ebpf),
+                Ok(observed) if observed == GTPU_SESSION_SCHEMA_MARKER_VALUE
+            );
+            let Ok(second) = Self::datapath_identity(&device.ebpf, &device.pin_dir) else {
+                return false;
+            };
+            first == second && hooks_are_exact && config_is_exact && schema_is_exact
+        }
+
         fn datapath_snapshot(&self, ifindex: u32) -> Result<EbpfGtpuDatapathSnapshot, GtpuError> {
             let devices = self
                 .devices
@@ -10151,6 +13128,33 @@ mod aya_runtime {
             let rendered = format!("{error:?} {error}");
             assert!(!rendered.contains(canary));
             assert!(!rendered.contains("subscriber-material"));
+        }
+
+        #[test]
+        fn grouped_schema_debug_redacts_config_identity_and_endpoints() {
+            let config = GtpuSessionDeviceConfig::new(
+                opc_gtpu_ebpf_common::GtpuSessionDeviceId::new([0x5A; GTPU_SESSION_GROUP_ID_LEN])
+                    .unwrap(),
+                31_337,
+                Some([161, 178, 195, 212]),
+                Some([
+                    0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6, 0x17, 0x28, 0x39, 0x4a, 0x5b, 0x6c, 0x7d,
+                    0x8e, 0x9f, 0xa0,
+                ]),
+            )
+            .unwrap();
+            let rendered = format!(
+                "{:?} {:?}",
+                GroupedSchemaState::Initializing {
+                    config: Some(config)
+                },
+                GroupedSchemaState::Retained { config }
+            );
+            assert!(rendered.contains("ipv4_endpoint: true"));
+            assert!(rendered.contains("ipv6_endpoint: true"));
+            for secret in ["31337", "161, 178, 195, 212", "90, 90, 90, 90", "a1b2"] {
+                assert!(!rendered.contains(secret), "leaked sentinel {secret}");
+            }
         }
 
         #[test]
@@ -10736,6 +13740,12 @@ mod aya_runtime {
                 counters: 9,
                 downlink_binding_counters: 10,
                 config: 11,
+                session_groups: 16,
+                session_uplink_index: 17,
+                session_downlink_index: 18,
+                session_transactions: 19,
+                config_ipv6: 20,
+                session_schema: 21,
             };
             let swapped = PinnedMapIdentity {
                 uplink_far: expected.uplink_dscp,
@@ -11249,6 +14259,7 @@ mod aya_runtime {
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, HashSet, VecDeque};
+    use std::hash::Hash;
     use std::net::Ipv6Addr;
     use std::sync::{Barrier, Mutex};
 
@@ -11257,7 +14268,7 @@ mod tests {
     use crate::model::{GtpBearerMark, Teid};
     use crate::{
         CurrentEbpfGraphRecoveryProgress, CurrentEbpfGraphRecoveryRefusal,
-        DrainedV2TeardownProgress, GtpAddressFamily,
+        DrainedV2TeardownProgress, GtpAddressFamily, GtpuSessionSelectorReuseProof,
     };
 
     use super::*;
@@ -11265,20 +14276,45 @@ mod tests {
     const S2BU_IFINDEX: u32 = 7;
     const REPLACEMENT_IFINDEX: u32 = 19;
     const LEGACY_V2_PIN_COUNT: usize = 9;
-    const CURRENT_PIN_COUNT: usize = 15;
+    const CURRENT_PIN_COUNT: usize = 21;
 
-    #[derive(Debug)]
     struct FakeRuntime {
         ifindexes: HashMap<String, u32>,
         state: Mutex<FakeState>,
         environment: EbpfEnvironment,
     }
 
-    #[derive(Debug, Default)]
+    impl fmt::Debug for FakeRuntime {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter
+                .debug_struct("FakeRuntime")
+                .field("interface_count", &self.ifindexes.len())
+                .field("environment", &self.environment)
+                .finish_non_exhaustive()
+        }
+    }
+
+    #[derive(Default)]
     struct FakeState {
         attached: HashMap<u32, FakeAttachment>,
         // Simulates pinned state that survives detach-free process restarts.
         pinned_config: HashMap<PathBuf, [u8; 4]>,
+        pinned_grouped_config: HashMap<PathBuf, [u8; GTPU_SESSION_CONFIG_VALUE_LEN]>,
+        grouped_schema_ready: HashSet<PathBuf>,
+        grouped_map_ready: HashSet<u32>,
+        session_groups:
+            HashMap<(u32, [u8; GTPU_SESSION_GROUP_ID_LEN]), [u8; GTPU_SESSION_GROUP_VALUE_LEN]>,
+        session_uplink_index:
+            HashMap<(u32, [u8; GTPU_SESSION_UPLINK_KEY_LEN]), [u8; GTPU_SESSION_GROUP_REF_LEN]>,
+        session_downlink_index:
+            HashMap<(u32, [u8; GTPU_SESSION_DOWNLINK_KEY_LEN]), [u8; GTPU_SESSION_GROUP_REF_LEN]>,
+        session_transactions: HashMap<
+            (u32, [u8; GTPU_SESSION_GROUP_ID_LEN]),
+            [u8; GTPU_SESSION_TRANSACTION_VALUE_LEN],
+        >,
+        transaction_counter: u128,
+        session_group_get_overrides: VecDeque<Option<[u8; GTPU_SESSION_GROUP_VALUE_LEN]>>,
+        competing_transaction_on_noexist: Option<[u8; GTPU_SESSION_TRANSACTION_VALUE_LEN]>,
         far: HashMap<(u32, [u8; 4]), [u8; UPLINK_FAR_VALUE_LEN]>,
         marked_far: HashMap<(u32, [u8; UPLINK_MARK_KEY_LEN]), [u8; UPLINK_FAR_VALUE_LEN]>,
         dscp: HashMap<(u32, [u8; 4]), [u8; UPLINK_DSCP_VALUE_LEN]>,
@@ -11307,6 +14343,8 @@ mod tests {
         downlink_binding_counters_map_ready: HashSet<u32>,
         uplink_filter_ready: HashSet<u32>,
         downlink_filter_ready: HashSet<u32>,
+        uplink_filter_pin_dir: HashMap<u32, PathBuf>,
+        downlink_filter_pin_dir: HashMap<u32, PathBuf>,
         uplink_filter_foreign: HashSet<u32>,
         downlink_filter_foreign: HashSet<u32>,
         legacy_v2_extra_hooks: HashSet<(u32, FakeLegacyV2Hook, FakeLegacyV2Program)>,
@@ -11325,6 +14363,7 @@ mod tests {
         empty_pin_dirs: HashSet<PathBuf>,
         operations: Vec<&'static str>,
         failures: VecDeque<&'static str>,
+        failures_after: VecDeque<&'static str>,
         crashes_after: VecDeque<&'static str>,
     }
 
@@ -11392,6 +14431,64 @@ mod tests {
         tc_priority: u16,
     }
 
+    #[derive(Clone, PartialEq, Eq)]
+    struct FakeGroupedPublicationSnapshot {
+        attached: HashMap<u32, FakeAttachment>,
+        pinned_grouped_config: HashMap<PathBuf, [u8; GTPU_SESSION_CONFIG_VALUE_LEN]>,
+        grouped_schema_ready: HashSet<PathBuf>,
+        grouped_map_ready: HashSet<u32>,
+        uplink_filter_pin_dir: HashMap<u32, PathBuf>,
+        downlink_filter_pin_dir: HashMap<u32, PathBuf>,
+        session_groups:
+            HashMap<(u32, [u8; GTPU_SESSION_GROUP_ID_LEN]), [u8; GTPU_SESSION_GROUP_VALUE_LEN]>,
+        session_uplink_index:
+            HashMap<(u32, [u8; GTPU_SESSION_UPLINK_KEY_LEN]), [u8; GTPU_SESSION_GROUP_REF_LEN]>,
+        session_downlink_index:
+            HashMap<(u32, [u8; GTPU_SESSION_DOWNLINK_KEY_LEN]), [u8; GTPU_SESSION_GROUP_REF_LEN]>,
+        session_transactions: HashMap<
+            (u32, [u8; GTPU_SESSION_GROUP_ID_LEN]),
+            [u8; GTPU_SESSION_TRANSACTION_VALUE_LEN],
+        >,
+        pmtu_policy: HashMap<u32, [u8; UPLINK_PMTU_VALUE_LEN]>,
+        schema: HashMap<PathBuf, FakeSchema>,
+    }
+
+    impl FakeGroupedPublicationSnapshot {
+        fn capture(state: &FakeState) -> Self {
+            Self {
+                attached: state.attached.clone(),
+                pinned_grouped_config: state.pinned_grouped_config.clone(),
+                grouped_schema_ready: state.grouped_schema_ready.clone(),
+                grouped_map_ready: state.grouped_map_ready.clone(),
+                uplink_filter_pin_dir: state.uplink_filter_pin_dir.clone(),
+                downlink_filter_pin_dir: state.downlink_filter_pin_dir.clone(),
+                session_groups: state.session_groups.clone(),
+                session_uplink_index: state.session_uplink_index.clone(),
+                session_downlink_index: state.session_downlink_index.clone(),
+                session_transactions: state.session_transactions.clone(),
+                pmtu_policy: state.pmtu_policy.clone(),
+                schema: state.schema.clone(),
+            }
+        }
+    }
+
+    fn fake_grouped_put<K: Copy + Eq + Hash, V>(
+        map: &mut HashMap<(u32, K), V>,
+        ifindex: u32,
+        key: K,
+        value: V,
+        mode: EbpfMapUpdateMode,
+    ) -> Result<(), GtpuError> {
+        let occupied = map.contains_key(&(ifindex, key));
+        match (mode, occupied) {
+            (EbpfMapUpdateMode::NoExist, true) => return Err(GtpuError::AlreadyExists),
+            (EbpfMapUpdateMode::Exist, false) => return Err(GtpuError::NotFound),
+            _ => {}
+        }
+        map.insert((ifindex, key), value);
+        Ok(())
+    }
+
     impl FakeRuntime {
         fn new() -> Self {
             Self {
@@ -11431,6 +14528,10 @@ mod tests {
             self.state().crashes_after.extend(operations);
         }
 
+        fn fail_after_in_order(&self, operations: impl IntoIterator<Item = &'static str>) {
+            self.state().failures_after.extend(operations);
+        }
+
         fn fail_if_requested(
             state: &mut FakeState,
             operation: &'static str,
@@ -11450,6 +14551,20 @@ mod tests {
                 state.crashes_after.pop_front();
                 panic!("injected deterministic crash after {operation}");
             }
+        }
+
+        fn fail_after_if_requested(
+            state: &mut FakeState,
+            operation: &'static str,
+        ) -> Result<(), GtpuError> {
+            if state.failures_after.front().copied() == Some(operation) {
+                state.failures_after.pop_front();
+                return Err(GtpuError::io(
+                    operation,
+                    io::Error::other("injected fake runtime acknowledgement failure"),
+                ));
+            }
+            Ok(())
         }
 
         fn current_proof_disappeared(
@@ -11581,6 +14696,133 @@ mod tests {
                     }
                 }
             }
+        }
+
+        fn validate_grouped_attach_preflight(
+            state: &FakeState,
+            pin_dir: &Path,
+            requested_ifindex: u32,
+            recorded: Option<GtpuSessionDeviceConfig>,
+        ) -> Result<(), GtpuError> {
+            let authority_ifindex =
+                recorded.map_or(requested_ifindex, GtpuSessionDeviceConfig::ingress_ifindex);
+            if state.pin_identity_invalid.contains(&authority_ifindex) {
+                return Err(GtpuError::StateIndeterminate {
+                    operation: "ebpf_map_identity",
+                });
+            }
+            for (ready, owner) in [
+                (
+                    state.uplink_filter_ready.contains(&requested_ifindex),
+                    state.uplink_filter_pin_dir.get(&requested_ifindex),
+                ),
+                (
+                    state.downlink_filter_ready.contains(&requested_ifindex),
+                    state.downlink_filter_pin_dir.get(&requested_ifindex),
+                ),
+            ] {
+                if ready {
+                    match owner {
+                        Some(owner) if owner == pin_dir => {}
+                        Some(_) => return Err(GtpuError::AlreadyExists),
+                        None => {
+                            return Err(GtpuError::StateIndeterminate {
+                                operation: "ebpf_grouped_hook_identity",
+                            });
+                        }
+                    }
+                }
+            }
+            if state.uplink_filter_foreign.contains(&requested_ifindex)
+                || state.downlink_filter_foreign.contains(&requested_ifindex)
+            {
+                return Err(GtpuError::AlreadyExists);
+            }
+            if state
+                .pmtu_policy
+                .get(&authority_ifindex)
+                .is_some_and(|value| {
+                    !ebpf_pmtu_map_state_is_executable(GtpuUplinkMtuPolicy::decode_map_value(value))
+                })
+            {
+                return Err(GtpuError::StateIndeterminate {
+                    operation: "ebpf_pmtu_policy_adopt",
+                });
+            }
+
+            let legacy_far_populated = state.far.keys().any(|(ifindex, key)| {
+                *ifindex == authority_ifindex
+                    && *key != opc_gtpu_ebpf_common::UPLINK_DSCP_SCHEMA_MARKER_KEY
+            });
+            let legacy_hash_populated = state
+                .marked_far
+                .keys()
+                .any(|(ifindex, _)| *ifindex == authority_ifindex)
+                || state
+                    .dscp
+                    .keys()
+                    .any(|(ifindex, _)| *ifindex == authority_ifindex)
+                || state
+                    .marked_dscp
+                    .keys()
+                    .any(|(ifindex, _)| *ifindex == authority_ifindex)
+                || state
+                    .sport
+                    .keys()
+                    .any(|(ifindex, _)| *ifindex == authority_ifindex)
+                || state
+                    .marked_sport
+                    .keys()
+                    .any(|(ifindex, _)| *ifindex == authority_ifindex)
+                || state
+                    .pdr
+                    .keys()
+                    .any(|(ifindex, _)| *ifindex == authority_ifindex)
+                || state
+                    .marked_pdr
+                    .keys()
+                    .any(|(ifindex, _)| *ifindex == authority_ifindex)
+                || state
+                    .downlink_binding
+                    .keys()
+                    .any(|(ifindex, _)| *ifindex == authority_ifindex)
+                || state
+                    .marked_owner
+                    .keys()
+                    .any(|(ifindex, _)| *ifindex == authority_ifindex);
+            if legacy_far_populated || legacy_hash_populated {
+                return Err(GtpuError::AlreadyExists);
+            }
+
+            let grouped_populated = state
+                .session_groups
+                .keys()
+                .any(|(ifindex, _)| *ifindex == authority_ifindex)
+                || state
+                    .session_uplink_index
+                    .keys()
+                    .any(|(ifindex, _)| *ifindex == authority_ifindex)
+                || state
+                    .session_downlink_index
+                    .keys()
+                    .any(|(ifindex, _)| *ifindex == authority_ifindex)
+                || state
+                    .session_transactions
+                    .keys()
+                    .any(|(ifindex, _)| *ifindex == authority_ifindex);
+            let schema_committed = state.grouped_schema_ready.contains(pin_dir);
+            let grouped_maps_present = state.grouped_map_ready.contains(&authority_ifindex);
+            if (recorded.is_some() || schema_committed) && !grouped_maps_present {
+                return Err(GtpuError::StateIndeterminate {
+                    operation: "ebpf_grouped_schema",
+                });
+            }
+            if !schema_committed && grouped_populated {
+                return Err(GtpuError::StateIndeterminate {
+                    operation: "ebpf_grouped_schema",
+                });
+            }
+            Ok(())
         }
 
         fn rebuild_owner_index(
@@ -12205,6 +15447,12 @@ mod tests {
             state.pmtu_counters_map_ready.insert(ifindex);
             state.uplink_filter_ready.insert(ifindex);
             state.downlink_filter_ready.insert(ifindex);
+            state
+                .uplink_filter_pin_dir
+                .insert(ifindex, pin_dir.to_path_buf());
+            state
+                .downlink_filter_pin_dir
+                .insert(ifindex, pin_dir.to_path_buf());
             // The additive MTU policy slot persists across restarts; only a
             // fresh provisioning initializes the explicit unset state.
             state
@@ -12214,6 +15462,207 @@ mod tests {
             state
                 .schema
                 .insert(pin_dir.to_path_buf(), FakeSchema::PmtuV5);
+            Ok(disposition)
+        }
+
+        fn attach_grouped(
+            &self,
+            interface: &str,
+            ifindex: u32,
+            pin_dir: &Path,
+            tc_priority: u16,
+            config: [u8; GTPU_SESSION_CONFIG_VALUE_LEN],
+        ) -> Result<EbpfAttachmentDisposition, GtpuError> {
+            let desired = GtpuSessionDeviceConfig::decode(&config)
+                .filter(|decoded| decoded.encode() == config)
+                .filter(|decoded| decoded.ingress_ifindex() == ifindex)
+                .ok_or_else(|| {
+                    GtpuError::invalid_config(
+                        "device.local_endpoints",
+                        "non-canonical grouped attachment authority",
+                    )
+                })?;
+            let mut state = self.state();
+            state.operations.push("attach_grouped");
+            if state.attached.contains_key(&ifindex)
+                || state
+                    .attached
+                    .values()
+                    .any(|attachment| attachment.pin_dir == pin_dir)
+            {
+                return Err(GtpuError::AlreadyExists);
+            }
+            if state.pinned_config.contains_key(pin_dir) {
+                return Err(GtpuError::AlreadyExists);
+            }
+            let disposition = if state.pinned_grouped_config.contains_key(pin_dir)
+                || state.grouped_schema_ready.contains(pin_dir)
+                || state.schema.contains_key(pin_dir)
+            {
+                EbpfAttachmentDisposition::Retained
+            } else {
+                EbpfAttachmentDisposition::Fresh
+            };
+            let recorded = state
+                .pinned_grouped_config
+                .get(pin_dir)
+                .copied()
+                .map(|encoded| {
+                    GtpuSessionDeviceConfig::decode(&encoded)
+                        .filter(|decoded| decoded.encode() == encoded)
+                        .ok_or(GtpuError::StateIndeterminate {
+                            operation: "ebpf_grouped_config",
+                        })
+                })
+                .transpose()?;
+            Self::validate_schema(
+                &state,
+                pin_dir,
+                recorded.map_or(ifindex, GtpuSessionDeviceConfig::ingress_ifindex),
+            )?;
+            if state.grouped_schema_ready.contains(pin_dir) && recorded.is_none() {
+                return Err(GtpuError::StateIndeterminate {
+                    operation: "ebpf_grouped_schema",
+                });
+            }
+            Self::validate_grouped_attach_preflight(&state, pin_dir, ifindex, recorded)?;
+            if let Some(current) = recorded {
+                let same_namespace = current.device_id() == desired.device_id()
+                    && current.local_endpoint(GtpuSessionIpFamily::Ipv4)
+                        == desired.local_endpoint(GtpuSessionIpFamily::Ipv4)
+                    && current.local_endpoint(GtpuSessionIpFamily::Ipv6)
+                        == desired.local_endpoint(GtpuSessionIpFamily::Ipv6);
+                if !same_namespace {
+                    return Err(GtpuError::AlreadyExists);
+                }
+                let old_ifindex = current.ingress_ifindex();
+                if old_ifindex != ifindex {
+                    if state.uplink_filter_ready.contains(&old_ifindex)
+                        || state.downlink_filter_ready.contains(&old_ifindex)
+                        || state.uplink_filter_foreign.contains(&old_ifindex)
+                        || state.downlink_filter_foreign.contains(&old_ifindex)
+                    {
+                        return Err(GtpuError::AlreadyExists);
+                    }
+                    let groups = state
+                        .session_groups
+                        .iter()
+                        .filter_map(|((index, key), value)| {
+                            (*index == old_ifindex).then_some((*key, *value))
+                        })
+                        .collect::<Vec<_>>();
+                    let uplink = state
+                        .session_uplink_index
+                        .iter()
+                        .filter_map(|((index, key), value)| {
+                            (*index == old_ifindex).then_some((*key, *value))
+                        })
+                        .collect::<Vec<_>>();
+                    let downlink = state
+                        .session_downlink_index
+                        .iter()
+                        .filter_map(|((index, key), value)| {
+                            (*index == old_ifindex).then_some((*key, *value))
+                        })
+                        .collect::<Vec<_>>();
+                    let transactions = state
+                        .session_transactions
+                        .iter()
+                        .filter_map(|((index, key), value)| {
+                            (*index == old_ifindex).then_some((*key, *value))
+                        })
+                        .collect::<Vec<_>>();
+                    state
+                        .session_groups
+                        .retain(|(index, _), _| *index != old_ifindex);
+                    state
+                        .session_uplink_index
+                        .retain(|(index, _), _| *index != old_ifindex);
+                    state
+                        .session_downlink_index
+                        .retain(|(index, _), _| *index != old_ifindex);
+                    state
+                        .session_transactions
+                        .retain(|(index, _), _| *index != old_ifindex);
+                    state.session_groups.extend(
+                        groups
+                            .into_iter()
+                            .map(|(key, value)| ((ifindex, key), value)),
+                    );
+                    state.session_uplink_index.extend(
+                        uplink
+                            .into_iter()
+                            .map(|(key, value)| ((ifindex, key), value)),
+                    );
+                    state.session_downlink_index.extend(
+                        downlink
+                            .into_iter()
+                            .map(|(key, value)| ((ifindex, key), value)),
+                    );
+                    state.session_transactions.extend(
+                        transactions
+                            .into_iter()
+                            .map(|(key, value)| ((ifindex, key), value)),
+                    );
+                    state.grouped_map_ready.remove(&old_ifindex);
+                    state.uplink_filter_pin_dir.remove(&old_ifindex);
+                    state.downlink_filter_pin_dir.remove(&old_ifindex);
+                }
+            }
+
+            state.dscp_map_ready.insert(ifindex);
+            state.marked_far_map_ready.insert(ifindex);
+            state.marked_dscp_map_ready.insert(ifindex);
+            state.sport_map_ready.insert(ifindex);
+            state.marked_sport_map_ready.insert(ifindex);
+            state.marked_pdr_map_ready.insert(ifindex);
+            state.marked_owner_map_ready.insert(ifindex);
+            state.downlink_binding_map_ready.insert(ifindex);
+            state.downlink_binding_counters_map_ready.insert(ifindex);
+            state.pmtu_map_ready.insert(ifindex);
+            state.pmtu_counters_map_ready.insert(ifindex);
+            state.grouped_map_ready.insert(ifindex);
+            state
+                .pmtu_policy
+                .entry(ifindex)
+                .or_insert([0; UPLINK_PMTU_VALUE_LEN]);
+            state
+                .schema
+                .insert(pin_dir.to_path_buf(), FakeSchema::PmtuV5);
+
+            if recorded != Some(desired) {
+                Self::fail_if_requested(&mut state, "grouped_config_write")?;
+                state
+                    .pinned_grouped_config
+                    .insert(pin_dir.to_path_buf(), config);
+                Self::fail_after_if_requested(&mut state, "grouped_config_write")?;
+                Self::crash_if_requested(&mut state, "grouped_config_write");
+            }
+            if !state.grouped_schema_ready.contains(pin_dir) {
+                Self::fail_if_requested(&mut state, "grouped_schema_write")?;
+                state.grouped_schema_ready.insert(pin_dir.to_path_buf());
+                Self::fail_after_if_requested(&mut state, "grouped_schema_write")?;
+                Self::crash_if_requested(&mut state, "grouped_schema_write");
+            }
+            Self::fail_if_requested(&mut state, "grouped_attach_hooks")?;
+            state.uplink_filter_ready.insert(ifindex);
+            state.downlink_filter_ready.insert(ifindex);
+            state
+                .uplink_filter_pin_dir
+                .insert(ifindex, pin_dir.to_path_buf());
+            state
+                .downlink_filter_pin_dir
+                .insert(ifindex, pin_dir.to_path_buf());
+            Self::fail_after_if_requested(&mut state, "grouped_attach_hooks")?;
+            Self::crash_if_requested(&mut state, "grouped_attach_hooks");
+            state.attached.insert(
+                ifindex,
+                FakeAttachment {
+                    interface: interface.to_string(),
+                    pin_dir: pin_dir.to_path_buf(),
+                    tc_priority,
+                },
+            );
             Ok(disposition)
         }
 
@@ -12277,6 +15726,12 @@ mod tests {
             state.pmtu_counters_map_ready.insert(ifindex);
             state.uplink_filter_ready.insert(ifindex);
             state.downlink_filter_ready.insert(ifindex);
+            state
+                .uplink_filter_pin_dir
+                .insert(ifindex, pin_dir.to_path_buf());
+            state
+                .downlink_filter_pin_dir
+                .insert(ifindex, pin_dir.to_path_buf());
             state
                 .pmtu_policy
                 .entry(ifindex)
@@ -12510,6 +15965,8 @@ mod tests {
             state.pmtu_counters_map_ready.remove(&ifindex);
             state.uplink_filter_ready.remove(&ifindex);
             state.downlink_filter_ready.remove(&ifindex);
+            state.uplink_filter_pin_dir.remove(&ifindex);
+            state.downlink_filter_pin_dir.remove(&ifindex);
             state.uplink_filter_foreign.remove(&ifindex);
             state.downlink_filter_foreign.remove(&ifindex);
             state
@@ -12519,6 +15976,9 @@ mod tests {
             state.v2_schema_identity_invalid.remove(&ifindex);
             state.schema.remove(pin_dir);
             state.pinned_config.remove(pin_dir);
+            state.pinned_grouped_config.remove(pin_dir);
+            state.grouped_schema_ready.remove(pin_dir);
+            state.grouped_map_ready.remove(&ifindex);
             state.empty_pin_dirs.remove(pin_dir);
             state.far.retain(|(index, _), _| *index != ifindex);
             state.marked_far.retain(|(index, _), _| *index != ifindex);
@@ -12538,6 +15998,18 @@ mod tests {
                 .retain(|(index, _), _| *index != ifindex);
             state
                 .default_teid_by_ue
+                .retain(|(index, _), _| *index != ifindex);
+            state
+                .session_groups
+                .retain(|(index, _), _| *index != ifindex);
+            state
+                .session_uplink_index
+                .retain(|(index, _), _| *index != ifindex);
+            state
+                .session_downlink_index
+                .retain(|(index, _), _| *index != ifindex);
+            state
+                .session_transactions
                 .retain(|(index, _), _| *index != ifindex);
             Ok(())
         }
@@ -12697,6 +16169,7 @@ mod tests {
                     ));
                 }
                 state.uplink_filter_ready.remove(&ifindex);
+                state.uplink_filter_pin_dir.remove(&ifindex);
             }
             if state.downlink_filter_ready.contains(&ifindex) {
                 if Self::fail_if_requested(&mut state, "v2_detach_downlink").is_err() {
@@ -12705,6 +16178,7 @@ mod tests {
                     ));
                 }
                 state.downlink_filter_ready.remove(&ifindex);
+                state.downlink_filter_pin_dir.remove(&ifindex);
             }
 
             loop {
@@ -13509,6 +16983,339 @@ mod tests {
             }
         }
 
+        fn next_session_transaction_id(&self) -> Result<GtpuSessionTransactionId, GtpuError> {
+            let mut state = self.state();
+            Self::fail_if_requested(&mut state, "session_transaction_entropy")?;
+            state.transaction_counter = state.transaction_counter.wrapping_add(1);
+            if state.transaction_counter == 0 {
+                state.transaction_counter = 1;
+            }
+            GtpuSessionTransactionId::new(state.transaction_counter.to_be_bytes()).ok_or(
+                GtpuError::StateIndeterminate {
+                    operation: "ebpf_grouped_transaction_entropy",
+                },
+            )
+        }
+
+        fn session_group_get(
+            &self,
+            ifindex: u32,
+            key: [u8; GTPU_SESSION_GROUP_ID_LEN],
+        ) -> Result<Option<[u8; GTPU_SESSION_GROUP_VALUE_LEN]>, GtpuError> {
+            let mut state = self.state();
+            Self::fail_if_requested(&mut state, "session_group_get")?;
+            if !state.grouped_map_ready.contains(&ifindex) {
+                return Err(GtpuError::NotFound);
+            }
+            if let Some(value) = state.session_group_get_overrides.pop_front() {
+                return Ok(value);
+            }
+            Ok(state.session_groups.get(&(ifindex, key)).copied())
+        }
+
+        fn session_group_put(
+            &self,
+            ifindex: u32,
+            key: [u8; GTPU_SESSION_GROUP_ID_LEN],
+            value: [u8; GTPU_SESSION_GROUP_VALUE_LEN],
+            mode: EbpfMapUpdateMode,
+        ) -> Result<(), GtpuError> {
+            let mut state = self.state();
+            let phase_operation = GtpuSessionGroupRecord::decode(&value)
+                .map(|record| match record.phase() {
+                    GtpuSessionGroupPhase::Pending => "session_group_put_pending",
+                    GtpuSessionGroupPhase::Active => "session_group_put_active",
+                    GtpuSessionGroupPhase::Removing => "session_group_put_removing",
+                })
+                .unwrap_or("session_group_put_malformed");
+            state.operations.push(phase_operation);
+            state.operations.push("session_group_put");
+            Self::fail_if_requested(&mut state, phase_operation)?;
+            Self::fail_if_requested(&mut state, "session_group_put")?;
+            if !state.grouped_map_ready.contains(&ifindex) {
+                return Err(GtpuError::NotFound);
+            }
+            fake_grouped_put(&mut state.session_groups, ifindex, key, value, mode)?;
+            Self::fail_after_if_requested(&mut state, phase_operation)?;
+            Self::fail_after_if_requested(&mut state, "session_group_put")?;
+            Self::crash_if_requested(&mut state, phase_operation);
+            Self::crash_if_requested(&mut state, "session_group_put");
+            Ok(())
+        }
+
+        fn session_group_remove(
+            &self,
+            ifindex: u32,
+            key: [u8; GTPU_SESSION_GROUP_ID_LEN],
+        ) -> Result<bool, GtpuError> {
+            let mut state = self.state();
+            state.operations.push("session_group_remove");
+            Self::fail_if_requested(&mut state, "session_group_remove")?;
+            if !state.grouped_map_ready.contains(&ifindex) {
+                return Err(GtpuError::NotFound);
+            }
+            let removed = state.session_groups.remove(&(ifindex, key)).is_some();
+            Self::fail_after_if_requested(&mut state, "session_group_remove")?;
+            Self::crash_if_requested(&mut state, "session_group_remove");
+            Ok(removed)
+        }
+
+        fn session_uplink_get(
+            &self,
+            ifindex: u32,
+            key: [u8; GTPU_SESSION_UPLINK_KEY_LEN],
+        ) -> Result<Option<[u8; GTPU_SESSION_GROUP_REF_LEN]>, GtpuError> {
+            let mut state = self.state();
+            Self::fail_if_requested(&mut state, "session_uplink_get")?;
+            if !state.grouped_map_ready.contains(&ifindex) {
+                return Err(GtpuError::NotFound);
+            }
+            Ok(state.session_uplink_index.get(&(ifindex, key)).copied())
+        }
+
+        fn session_uplink_put(
+            &self,
+            ifindex: u32,
+            key: [u8; GTPU_SESSION_UPLINK_KEY_LEN],
+            value: [u8; GTPU_SESSION_GROUP_REF_LEN],
+            mode: EbpfMapUpdateMode,
+        ) -> Result<(), GtpuError> {
+            let mut state = self.state();
+            let phase_operation = GtpuSessionGroupRef::decode(&value)
+                .map(|reference| {
+                    if reference.desired().is_some() {
+                        "session_uplink_put_staged"
+                    } else {
+                        "session_uplink_put_active"
+                    }
+                })
+                .unwrap_or("session_uplink_put_malformed");
+            state.operations.push(phase_operation);
+            state.operations.push("session_uplink_put");
+            Self::fail_if_requested(&mut state, phase_operation)?;
+            Self::fail_if_requested(&mut state, "session_uplink_put")?;
+            if !state.grouped_map_ready.contains(&ifindex) {
+                return Err(GtpuError::NotFound);
+            }
+            fake_grouped_put(&mut state.session_uplink_index, ifindex, key, value, mode)?;
+            Self::fail_after_if_requested(&mut state, phase_operation)?;
+            Self::fail_after_if_requested(&mut state, "session_uplink_put")?;
+            Self::crash_if_requested(&mut state, phase_operation);
+            Self::crash_if_requested(&mut state, "session_uplink_put");
+            Ok(())
+        }
+
+        fn session_uplink_remove(
+            &self,
+            ifindex: u32,
+            key: [u8; GTPU_SESSION_UPLINK_KEY_LEN],
+        ) -> Result<bool, GtpuError> {
+            let mut state = self.state();
+            state.operations.push("session_uplink_remove");
+            Self::fail_if_requested(&mut state, "session_uplink_remove")?;
+            if !state.grouped_map_ready.contains(&ifindex) {
+                return Err(GtpuError::NotFound);
+            }
+            let removed = state.session_uplink_index.remove(&(ifindex, key)).is_some();
+            Self::fail_after_if_requested(&mut state, "session_uplink_remove")?;
+            Self::crash_if_requested(&mut state, "session_uplink_remove");
+            Ok(removed)
+        }
+
+        fn session_downlink_get(
+            &self,
+            ifindex: u32,
+            key: [u8; GTPU_SESSION_DOWNLINK_KEY_LEN],
+        ) -> Result<Option<[u8; GTPU_SESSION_GROUP_REF_LEN]>, GtpuError> {
+            let mut state = self.state();
+            Self::fail_if_requested(&mut state, "session_downlink_get")?;
+            if !state.grouped_map_ready.contains(&ifindex) {
+                return Err(GtpuError::NotFound);
+            }
+            Ok(state.session_downlink_index.get(&(ifindex, key)).copied())
+        }
+
+        fn session_downlink_put(
+            &self,
+            ifindex: u32,
+            key: [u8; GTPU_SESSION_DOWNLINK_KEY_LEN],
+            value: [u8; GTPU_SESSION_GROUP_REF_LEN],
+            mode: EbpfMapUpdateMode,
+        ) -> Result<(), GtpuError> {
+            let mut state = self.state();
+            let phase_operation = GtpuSessionGroupRef::decode(&value)
+                .map(|reference| {
+                    if reference.desired().is_some() {
+                        "session_downlink_put_staged"
+                    } else {
+                        "session_downlink_put_active"
+                    }
+                })
+                .unwrap_or("session_downlink_put_malformed");
+            state.operations.push(phase_operation);
+            state.operations.push("session_downlink_put");
+            Self::fail_if_requested(&mut state, phase_operation)?;
+            Self::fail_if_requested(&mut state, "session_downlink_put")?;
+            if !state.grouped_map_ready.contains(&ifindex) {
+                return Err(GtpuError::NotFound);
+            }
+            fake_grouped_put(&mut state.session_downlink_index, ifindex, key, value, mode)?;
+            Self::fail_after_if_requested(&mut state, phase_operation)?;
+            Self::fail_after_if_requested(&mut state, "session_downlink_put")?;
+            Self::crash_if_requested(&mut state, phase_operation);
+            Self::crash_if_requested(&mut state, "session_downlink_put");
+            Ok(())
+        }
+
+        fn session_downlink_remove(
+            &self,
+            ifindex: u32,
+            key: [u8; GTPU_SESSION_DOWNLINK_KEY_LEN],
+        ) -> Result<bool, GtpuError> {
+            let mut state = self.state();
+            state.operations.push("session_downlink_remove");
+            Self::fail_if_requested(&mut state, "session_downlink_remove")?;
+            if !state.grouped_map_ready.contains(&ifindex) {
+                return Err(GtpuError::NotFound);
+            }
+            let removed = state
+                .session_downlink_index
+                .remove(&(ifindex, key))
+                .is_some();
+            Self::fail_after_if_requested(&mut state, "session_downlink_remove")?;
+            Self::crash_if_requested(&mut state, "session_downlink_remove");
+            Ok(removed)
+        }
+
+        fn session_transaction_get(
+            &self,
+            ifindex: u32,
+            key: [u8; GTPU_SESSION_GROUP_ID_LEN],
+        ) -> Result<Option<[u8; GTPU_SESSION_TRANSACTION_VALUE_LEN]>, GtpuError> {
+            let mut state = self.state();
+            Self::fail_if_requested(&mut state, "session_transaction_get")?;
+            if !state.grouped_map_ready.contains(&ifindex) {
+                return Err(GtpuError::NotFound);
+            }
+            Ok(state.session_transactions.get(&(ifindex, key)).copied())
+        }
+
+        fn session_transaction_put(
+            &self,
+            ifindex: u32,
+            key: [u8; GTPU_SESSION_GROUP_ID_LEN],
+            value: [u8; GTPU_SESSION_TRANSACTION_VALUE_LEN],
+            mode: EbpfMapUpdateMode,
+        ) -> Result<(), GtpuError> {
+            let mut state = self.state();
+            let phase_operation = GtpuSessionTransactionRecord::decode(&value)
+                .map(|journal| match journal.phase() {
+                    GtpuSessionTransactionPhase::Prepared => "session_transaction_put_prepared",
+                    GtpuSessionTransactionPhase::IndexesStaged => {
+                        "session_transaction_put_indexes_staged"
+                    }
+                    GtpuSessionTransactionPhase::AuthorityCommitted => {
+                        "session_transaction_put_authority_committed"
+                    }
+                })
+                .unwrap_or("session_transaction_put_malformed");
+            state.operations.push(phase_operation);
+            state.operations.push("session_transaction_put");
+            Self::fail_if_requested(&mut state, phase_operation)?;
+            Self::fail_if_requested(&mut state, "session_transaction_put")?;
+            if !state.grouped_map_ready.contains(&ifindex) {
+                return Err(GtpuError::NotFound);
+            }
+            if mode == EbpfMapUpdateMode::NoExist {
+                if let Some(competing) = state.competing_transaction_on_noexist.take() {
+                    state.session_transactions.insert((ifindex, key), competing);
+                }
+            }
+            fake_grouped_put(&mut state.session_transactions, ifindex, key, value, mode)?;
+            Self::fail_after_if_requested(&mut state, phase_operation)?;
+            Self::fail_after_if_requested(&mut state, "session_transaction_put")?;
+            Self::crash_if_requested(&mut state, phase_operation);
+            Self::crash_if_requested(&mut state, "session_transaction_put");
+            Ok(())
+        }
+
+        fn session_transaction_remove(
+            &self,
+            ifindex: u32,
+            key: [u8; GTPU_SESSION_GROUP_ID_LEN],
+        ) -> Result<bool, GtpuError> {
+            let mut state = self.state();
+            state.operations.push("session_transaction_remove");
+            Self::fail_if_requested(&mut state, "session_transaction_remove")?;
+            if !state.grouped_map_ready.contains(&ifindex) {
+                return Err(GtpuError::NotFound);
+            }
+            let removed = state.session_transactions.remove(&(ifindex, key)).is_some();
+            Self::fail_after_if_requested(&mut state, "session_transaction_remove")?;
+            Self::crash_if_requested(&mut state, "session_transaction_remove");
+            Ok(removed)
+        }
+
+        fn session_index_inventory(
+            &self,
+            ifindex: u32,
+            group_id: [u8; GTPU_SESSION_GROUP_ID_LEN],
+        ) -> Result<EbpfSessionIndexInventory, GtpuError> {
+            let mut state = self.state();
+            Self::fail_if_requested(&mut state, "session_index_inventory")?;
+            if !state.grouped_map_ready.contains(&ifindex) {
+                return Err(GtpuError::NotFound);
+            }
+            let mut inventory = EbpfSessionIndexInventory {
+                uplink: state
+                    .session_uplink_index
+                    .iter()
+                    .filter_map(|((index, key), value)| {
+                        (*index == ifindex && value[..GTPU_SESSION_GROUP_ID_LEN] == group_id)
+                            .then_some((*key, *value))
+                    })
+                    .collect(),
+                downlink: state
+                    .session_downlink_index
+                    .iter()
+                    .filter_map(|((index, key), value)| {
+                        (*index == ifindex && value[..GTPU_SESSION_GROUP_ID_LEN] == group_id)
+                            .then_some((*key, *value))
+                    })
+                    .collect(),
+            };
+            inventory.uplink.sort_unstable();
+            inventory.downlink.sort_unstable();
+            Ok(inventory)
+        }
+
+        fn grouped_datapath_usable(
+            &self,
+            ifindex: u32,
+            expected_config: [u8; GTPU_SESSION_CONFIG_VALUE_LEN],
+        ) -> bool {
+            let Some(expected) = GtpuSessionDeviceConfig::decode(&expected_config)
+                .filter(|config| config.encode() == expected_config)
+                .filter(|config| config.ingress_ifindex() == ifindex)
+            else {
+                return false;
+            };
+            let state = self.state();
+            let Some(attachment) = state.attached.get(&ifindex) else {
+                return false;
+            };
+            state.pinned_grouped_config.get(&attachment.pin_dir) == Some(&expected.encode())
+                && state.grouped_schema_ready.contains(&attachment.pin_dir)
+                && state.grouped_map_ready.contains(&ifindex)
+                && state.uplink_filter_ready.contains(&ifindex)
+                && state.downlink_filter_ready.contains(&ifindex)
+                && state.uplink_filter_pin_dir.get(&ifindex) == Some(&attachment.pin_dir)
+                && state.downlink_filter_pin_dir.get(&ifindex) == Some(&attachment.pin_dir)
+                && !state.pin_identity_invalid.contains(&ifindex)
+                && !state.uplink_filter_foreign.contains(&ifindex)
+                && !state.downlink_filter_foreign.contains(&ifindex)
+        }
+
         fn datapath_snapshot(&self, ifindex: u32) -> Result<EbpfGtpuDatapathSnapshot, GtpuError> {
             let mut state = self.state();
             let exact = state.attached.contains_key(&ifindex)
@@ -13753,6 +17560,1816 @@ mod tests {
         (backend, runtime)
     }
 
+    fn grouped_device_id(value: u8) -> GtpuSessionDeviceId {
+        GtpuSessionDeviceId::new([value; GTPU_SESSION_GROUP_ID_LEN]).unwrap()
+    }
+
+    fn grouped_group_id(value: u8) -> opc_gtpu_ebpf_common::GtpuSessionGroupId {
+        opc_gtpu_ebpf_common::GtpuSessionGroupId::new([value; GTPU_SESSION_GROUP_ID_LEN]).unwrap()
+    }
+
+    fn ipv6_local() -> Ipv6Addr {
+        "2001:db8:10::1".parse().unwrap()
+    }
+
+    fn ipv6_peer() -> Ipv6Addr {
+        "2001:db8:20::1".parse().unwrap()
+    }
+
+    fn ipv6_inner() -> Ipv6Addr {
+        "2001:db8:100:1::1234".parse().unwrap()
+    }
+
+    fn grouped_device_request(
+        name: &str,
+        device_id: GtpuSessionDeviceId,
+        endpoints: GtpuLocalEndpointSet,
+    ) -> CreateGtpDeviceEndpointSetRequest {
+        CreateGtpDeviceEndpointSetRequest::new(
+            CreateGtpDeviceRequest::new(name),
+            device_id,
+            endpoints,
+        )
+        .unwrap()
+    }
+
+    fn grouped_v6_entry(local_teid: u32, peer_teid: u32, peer: Ipv6Addr) -> GtpuSessionEntry {
+        GtpuSessionEntry::new(
+            GtpPdpContext {
+                local_teid: teid(local_teid),
+                peer_teid: teid(peer_teid),
+                ms_address: IpAddr::V6(ipv6_inner()),
+                peer_address: IpAddr::V6(peer),
+                link_ifindex: S2BU_IFINDEX,
+                downlink_source_port_policy: crate::GtpuSourcePortPolicy::Any,
+                gtp_version: GtpVersion::V1,
+                bearer_mark: None,
+                egress_dscp: Some(crate::DscpCodepoint::new(18).unwrap()),
+                uplink_source_port_policy: crate::GtpuUplinkSourcePortPolicy::LegacyServicePort,
+            },
+            IpAddr::V6(ipv6_local()),
+        )
+        .unwrap()
+    }
+
+    fn grouped_v4_entry(local_teid: u32, peer_teid: u32) -> GtpuSessionEntry {
+        GtpuSessionEntry::new(
+            GtpPdpContext {
+                local_teid: teid(local_teid),
+                peer_teid: teid(peer_teid),
+                ms_address: IpAddr::V4(Ipv4Addr::new(10, 45, 0, 2)),
+                peer_address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
+                link_ifindex: S2BU_IFINDEX,
+                downlink_source_port_policy: crate::GtpuSourcePortPolicy::Any,
+                gtp_version: GtpVersion::V1,
+                bearer_mark: None,
+                egress_dscp: None,
+                uplink_source_port_policy: crate::GtpuUplinkSourcePortPolicy::LegacyServicePort,
+            },
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+        )
+        .unwrap()
+    }
+
+    fn grouped_entry_for_addresses(
+        inner: IpAddr,
+        peer_outer: IpAddr,
+        local_outer: IpAddr,
+        local_teid: u32,
+        peer_teid: u32,
+        bearer_mark: Option<u32>,
+    ) -> GtpuSessionEntry {
+        GtpuSessionEntry::new(
+            GtpPdpContext {
+                local_teid: teid(local_teid),
+                peer_teid: teid(peer_teid),
+                ms_address: inner,
+                peer_address: peer_outer,
+                link_ifindex: S2BU_IFINDEX,
+                downlink_source_port_policy: crate::GtpuSourcePortPolicy::Any,
+                gtp_version: GtpVersion::V1,
+                bearer_mark: bearer_mark.and_then(GtpBearerMark::new),
+                egress_dscp: None,
+                uplink_source_port_policy: crate::GtpuUplinkSourcePortPolicy::LegacyServicePort,
+            },
+            local_outer,
+        )
+        .unwrap()
+    }
+
+    fn grouped_group(
+        id: u8,
+        device_id: GtpuSessionDeviceId,
+        entries: Vec<GtpuSessionEntry>,
+    ) -> GtpuSessionGroup {
+        GtpuSessionGroup::new(grouped_group_id(id), device_id, entries).unwrap()
+    }
+
+    fn fresh_group_request(group: GtpuSessionGroup) -> GtpuSessionGroupReconcileRequest {
+        GtpuSessionGroupReconcileRequest::new(group, GtpuSessionSelectorProvenance::Fresh).unwrap()
+    }
+
+    fn grouped_rekey_pair(
+        device_id: GtpuSessionDeviceId,
+        group_id: u8,
+    ) -> (GtpuSessionGroup, GtpuSessionGroup) {
+        let base = grouped_group(
+            group_id,
+            device_id,
+            vec![grouped_entry_for_addresses(
+                IpAddr::V6("2001:db8:100:1::1234".parse().unwrap()),
+                IpAddr::V6("2001:db8:20::1".parse().unwrap()),
+                IpAddr::V6(ipv6_local()),
+                0x1100_0001,
+                0x2100_0001,
+                Some(0x41),
+            )],
+        );
+        let desired = grouped_group(
+            group_id,
+            device_id,
+            vec![grouped_entry_for_addresses(
+                IpAddr::V6("2001:db8:100:2::5678".parse().unwrap()),
+                IpAddr::V6("2001:db8:30::2".parse().unwrap()),
+                IpAddr::V6(ipv6_local()),
+                0x1200_0002,
+                0x2200_0002,
+                Some(0x42),
+            )],
+        );
+        (base, desired)
+    }
+
+    async fn attach_grouped_fake(
+        runtime: Arc<FakeRuntime>,
+        device_id: GtpuSessionDeviceId,
+        endpoints: GtpuLocalEndpointSet,
+    ) -> EbpfGtpuDataplaneBackend {
+        let backend = EbpfGtpuDataplaneBackend::with_runtime(runtime);
+        backend
+            .create_device_with_endpoints(grouped_device_request("s2bu", device_id, endpoints))
+            .await
+            .unwrap();
+        backend
+    }
+
+    async fn restart_grouped_fake(
+        runtime: Arc<FakeRuntime>,
+        device_id: GtpuSessionDeviceId,
+        endpoints: GtpuLocalEndpointSet,
+    ) -> EbpfGtpuDataplaneBackend {
+        runtime.state().attached.remove(&S2BU_IFINDEX);
+        attach_grouped_fake(runtime, device_id, endpoints).await
+    }
+
+    fn assert_fake_packet_authority_is_single_generation(
+        state: &FakeState,
+        ifindex: u32,
+        group_id: opc_gtpu_ebpf_common::GtpuSessionGroupId,
+        config: GtpuSessionDeviceConfig,
+    ) {
+        let Some(authority_bytes) = state.session_groups.get(&(ifindex, group_id.to_bytes()))
+        else {
+            return;
+        };
+        let authority = GtpuSessionGroupRecord::decode(authority_bytes).unwrap();
+        for ((index, key_bytes), value) in &state.session_uplink_index {
+            if *index != ifindex {
+                continue;
+            }
+            let Some(reference) = GtpuSessionGroupRef::decode(value) else {
+                continue;
+            };
+            if reference.group_id() != group_id {
+                continue;
+            }
+            let key = GtpuSessionUplinkKey::decode(key_bytes).unwrap();
+            if let Some(selected) = opc_gtpu_ebpf_common::gtpu_session_group_authorizes_uplink(
+                authority_bytes,
+                reference,
+                key,
+                config,
+                ifindex,
+            ) {
+                assert_eq!(authority.phase(), GtpuSessionGroupPhase::Active);
+                assert_eq!(authority.entry(key.family()), Some(selected));
+            }
+        }
+        for ((index, key_bytes), value) in &state.session_downlink_index {
+            if *index != ifindex {
+                continue;
+            }
+            let Some(reference) = GtpuSessionGroupRef::decode(value) else {
+                continue;
+            };
+            if reference.group_id() != group_id {
+                continue;
+            }
+            let key = GtpuSessionDownlinkKey::decode(key_bytes).unwrap();
+            let selected_family = key.inner_family();
+            let selected = authority.entry(selected_family);
+            let authorized = selected.and_then(|entry| {
+                opc_gtpu_ebpf_common::gtpu_session_group_authorizes_downlink(
+                    authority_bytes,
+                    reference,
+                    key,
+                    config,
+                    ifindex,
+                    entry.peer_outer_address(),
+                    entry.local_outer_address(),
+                    crate::GTPU_PORT,
+                    entry.inner_paa().canonical_address(),
+                )
+            });
+            if let Some(selected) = authorized {
+                assert_eq!(authority.phase(), GtpuSessionGroupPhase::Active);
+                assert_eq!(authority.entry(selected_family), Some(selected));
+            }
+        }
+        if authority.phase() != GtpuSessionGroupPhase::Active {
+            return;
+        }
+        for family in [GtpuSessionIpFamily::Ipv4, GtpuSessionIpFamily::Ipv6] {
+            let Some(entry) = authority.entry(family) else {
+                continue;
+            };
+            let uplink_key = GtpuSessionUplinkKey::from_entry(entry);
+            let uplink_ref = GtpuSessionGroupRef::decode(
+                state
+                    .session_uplink_index
+                    .get(&(ifindex, uplink_key.encode()))
+                    .expect("active authority must retain its exact uplink selector"),
+            )
+            .unwrap();
+            assert_eq!(
+                opc_gtpu_ebpf_common::gtpu_session_group_authorizes_uplink(
+                    authority_bytes,
+                    uplink_ref,
+                    uplink_key,
+                    config,
+                    ifindex,
+                ),
+                Some(entry)
+            );
+
+            let downlink_key = GtpuSessionDownlinkKey::from_entry(entry);
+            let downlink_ref = GtpuSessionGroupRef::decode(
+                state
+                    .session_downlink_index
+                    .get(&(ifindex, downlink_key.encode()))
+                    .expect("active authority must retain its exact downlink selector"),
+            )
+            .unwrap();
+            assert_eq!(
+                opc_gtpu_ebpf_common::gtpu_session_group_authorizes_downlink(
+                    authority_bytes,
+                    downlink_ref,
+                    downlink_key,
+                    config,
+                    ifindex,
+                    entry.peer_outer_address(),
+                    entry.local_outer_address(),
+                    crate::GTPU_PORT,
+                    entry.inner_paa().canonical_address(),
+                ),
+                Some(entry)
+            );
+        }
+    }
+
+    #[test]
+    fn grouped_loader_debug_surfaces_redact_raw_map_identity() {
+        let device_id = grouped_device_id(0x5A);
+        let local_outer: Ipv6Addr = "a1b2:c3d4:e5f6:1728:394a:5b6c:7d8e:9fa0".parse().unwrap();
+        let peer_outer: Ipv6Addr = "b1c2:d3e4:f506:2738:495a:6b7c:8d9e:afb0".parse().unwrap();
+        let inner: Ipv6Addr = "c1d2:e3f4:1506:3748:596a:7b8c:9dae:bfc0".parse().unwrap();
+        let endpoints = GtpuLocalEndpointSet::new(IpAddr::V6(local_outer), None).unwrap();
+        let grouped = ManagedGroupedDevice {
+            device_id,
+            local_endpoints: endpoints,
+        };
+        let context = GroupedAttachmentContext {
+            device: GtpDevice {
+                name: "sentinel-sensitive-interface".to_string(),
+                ifindex: 31_337,
+            },
+            grouped,
+            config: grouped_device_config(device_id, 31_337, endpoints)
+                .unwrap()
+                .encode(),
+        };
+        let managed = ManagedDevice {
+            name: "sentinel-sensitive-interface".to_string(),
+            local_ip: None,
+            grouped: Some(grouped),
+        };
+        let group = grouped_group(
+            0x5B,
+            device_id,
+            vec![grouped_entry_for_addresses(
+                IpAddr::V6(inner),
+                IpAddr::V6(peer_outer),
+                IpAddr::V6(local_outer),
+                0xDEAD_BEEF,
+                0xBADC_0FFE,
+                Some(0xCAFE_BABE),
+            )],
+        );
+        let record = grouped_record_from_model(&group, GtpuSessionGeneration::INITIAL).unwrap();
+        let indexes = grouped_active_indexes(record).unwrap();
+        let mut inventory = EbpfSessionIndexInventory::default();
+        for element in &indexes {
+            match element.key {
+                GroupedIndexKey::Uplink(key) => {
+                    inventory.uplink.push((key, element.value));
+                }
+                GroupedIndexKey::Downlink(key) => {
+                    inventory.downlink.push((key, element.value));
+                }
+            }
+        }
+        let transaction = GtpuSessionTransactionRecord::prepare(
+            group.id(),
+            GtpuSessionTransactionId::new([0xA5; 16]).unwrap(),
+            None,
+            Some(record),
+        )
+        .unwrap();
+        let observation = GroupedObservation {
+            authority: Some(record.encode()),
+            transaction: Some(transaction.encode()),
+            indexes: indexes.clone(),
+        };
+        let debug = format!(
+            "{managed:?} {grouped:?} {context:?} {inventory:?} {indexes:?} {observation:?}"
+        );
+        for secret in [
+            "sentinel-sensitive-interface",
+            "31337",
+            "a1b2:c3d4",
+            "161, 178, 195, 212",
+            "222, 173, 190, 239",
+            "202, 254, 186, 190",
+            "90, 90, 90, 90",
+            "165, 165, 165, 165",
+        ] {
+            assert!(!debug.contains(secret), "leaked sentinel {secret}");
+        }
+    }
+
+    #[tokio::test]
+    async fn grouped_ipv6_only_attachment_reconciles_reads_and_removes_exactly() {
+        let (backend, runtime) = backend_with_fake();
+        let device_id = grouped_device_id(1);
+        let endpoints = GtpuLocalEndpointSet::new(IpAddr::V6(ipv6_local()), None).unwrap();
+        let device = backend
+            .create_device_with_endpoints(grouped_device_request("s2bu", device_id, endpoints))
+            .await
+            .unwrap();
+        assert_eq!(device.ifindex, S2BU_IFINDEX);
+
+        let pin_dir = backend.grouped_pin_dir(device_id);
+        let expected_config = grouped_device_config(device_id, S2BU_IFINDEX, endpoints)
+            .unwrap()
+            .encode();
+        {
+            let state = runtime.state();
+            assert_eq!(
+                state.pinned_grouped_config.get(&pin_dir),
+                Some(&expected_config)
+            );
+            assert!(!state.pinned_config.contains_key(&pin_dir));
+            assert!(state.grouped_schema_ready.contains(&pin_dir));
+        }
+
+        let capabilities = backend
+            .gtpu_ip_family_capabilities(
+                GtpuSessionAttachmentSelector::new(device_id, device.clone(), endpoints).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(capabilities.inner_ipv4, GtpuCapability::Available);
+        assert_eq!(capabilities.inner_ipv6, GtpuCapability::Available);
+        assert_eq!(capabilities.outer_ipv4, GtpuCapability::Missing);
+        assert_eq!(capabilities.outer_ipv6, GtpuCapability::Available);
+        assert_eq!(
+            capabilities.grouped_atomic_reconciliation,
+            GtpuCapability::Available
+        );
+        assert_eq!(
+            capabilities.uplink_checksum_offload,
+            GtpuUplinkChecksumOffloadContract::MaterializedOnly
+        );
+        assert_eq!(
+            capabilities.downlink_outer_ipv4_fragment_handling,
+            GtpuDownlinkFragmentContract::Unsupported
+        );
+        assert_eq!(
+            capabilities.downlink_outer_ipv6_fragment_handling,
+            GtpuDownlinkFragmentContract::Unsupported
+        );
+        assert_eq!(
+            backend
+                .probe()
+                .await
+                .unwrap()
+                .downlink_outer_fragment_handling,
+            GtpuDownlinkFragmentContract::Unsupported
+        );
+
+        let legacy_error = backend.install_pdp_context(context()).await.unwrap_err();
+        assert!(matches!(
+            legacy_error,
+            GtpuError::UnsupportedFeature {
+                feature: "legacy_ipv4_pdp_on_grouped_attachment"
+            }
+        ));
+
+        let group = grouped_group(
+            11,
+            device_id,
+            vec![grouped_v6_entry(0x1000_0011, 0x2000_0011, ipv6_peer())],
+        );
+        assert_eq!(
+            backend
+                .reconcile_pdp_context_group(fresh_group_request(group.clone()))
+                .await
+                .unwrap(),
+            GtpuSessionGroupReconcileOutcome::Activated
+        );
+        assert_eq!(
+            backend
+                .reconcile_pdp_context_group(fresh_group_request(group.clone()))
+                .await
+                .unwrap(),
+            GtpuSessionGroupReconcileOutcome::ExactAlreadyActive
+        );
+        assert_eq!(
+            backend
+                .read_pdp_context_group(GtpuSessionGroupSelector::new(group.id(), device_id,))
+                .await
+                .unwrap(),
+            GtpuSessionGroupReadback::Active(group.clone())
+        );
+        let grouped_before_legacy_remove = {
+            let state = runtime.state();
+            (
+                state.session_groups.clone(),
+                state.session_uplink_index.clone(),
+                state.session_downlink_index.clone(),
+                state.session_transactions.clone(),
+            )
+        };
+        let legacy_remove_error = backend
+            .remove_pdp_context(RemovePdpContextRequest::from_context(
+                group.entries()[0].context(),
+            ))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            legacy_remove_error,
+            GtpuError::UnsupportedFeature {
+                feature: "legacy_ipv4_pdp_on_grouped_attachment"
+            }
+        ));
+        let grouped_after_legacy_remove = {
+            let state = runtime.state();
+            (
+                state.session_groups.clone(),
+                state.session_uplink_index.clone(),
+                state.session_downlink_index.clone(),
+                state.session_transactions.clone(),
+            )
+        };
+        assert_eq!(grouped_after_legacy_remove, grouped_before_legacy_remove);
+        assert_eq!(
+            backend
+                .read_pdp_context_group(GtpuSessionGroupSelector::new(group.id(), device_id,))
+                .await
+                .unwrap(),
+            GtpuSessionGroupReadback::Active(group.clone())
+        );
+        assert_eq!(
+            backend
+                .remove_pdp_context_group_exact(group.clone())
+                .await
+                .unwrap(),
+            GtpuSessionGroupRemovalOutcome::Removed
+        );
+        assert_eq!(
+            backend
+                .read_pdp_context_group(GtpuSessionGroupSelector::new(group.id(), device_id,))
+                .await
+                .unwrap(),
+            GtpuSessionGroupReadback::Absent
+        );
+        assert_eq!(
+            backend.remove_pdp_context_group_exact(group).await.unwrap(),
+            GtpuSessionGroupRemovalOutcome::AlreadyAbsent
+        );
+    }
+
+    #[tokio::test]
+    async fn grouped_dual_stack_update_stages_and_normalizes_both_family_indexes() {
+        let (backend, runtime) = backend_with_fake();
+        let device_id = grouped_device_id(2);
+        let endpoints = GtpuLocalEndpointSet::new(
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+            Some(IpAddr::V6(ipv6_local())),
+        )
+        .unwrap();
+        backend
+            .create_device_with_endpoints(grouped_device_request("s2bu", device_id, endpoints))
+            .await
+            .unwrap();
+        let capabilities = backend
+            .gtpu_ip_family_capabilities(
+                GtpuSessionAttachmentSelector::new(
+                    device_id,
+                    GtpDevice {
+                        name: "s2bu".to_string(),
+                        ifindex: S2BU_IFINDEX,
+                    },
+                    endpoints,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(capabilities.outer_ipv4, GtpuCapability::Available);
+        assert_eq!(capabilities.outer_ipv6, GtpuCapability::Available);
+        assert_eq!(
+            capabilities.downlink_outer_ipv4_fragment_handling,
+            GtpuDownlinkFragmentContract::Unsupported
+        );
+        assert_eq!(
+            capabilities.downlink_outer_ipv6_fragment_handling,
+            GtpuDownlinkFragmentContract::Unsupported
+        );
+        assert_eq!(
+            backend
+                .probe()
+                .await
+                .unwrap()
+                .downlink_outer_fragment_handling,
+            GtpuDownlinkFragmentContract::Unsupported
+        );
+        let base = grouped_group(
+            12,
+            device_id,
+            vec![
+                grouped_v4_entry(0x1000_0012, 0x2000_0012),
+                grouped_v6_entry(0x1000_0013, 0x2000_0013, ipv6_peer()),
+            ],
+        );
+        assert_eq!(
+            backend
+                .reconcile_pdp_context_group(fresh_group_request(base.clone()))
+                .await
+                .unwrap(),
+            GtpuSessionGroupReconcileOutcome::Activated
+        );
+        let grouped_before_legacy_read = {
+            let state = runtime.state();
+            (
+                state.session_groups.clone(),
+                state.session_uplink_index.clone(),
+                state.session_downlink_index.clone(),
+                state.session_transactions.clone(),
+            )
+        };
+        let legacy_read_error = backend
+            .read_pdp_context(PdpContextSelector::LocalTeid(
+                PdpContextLocalTeidSelector::from_context(base.entries()[0].context()).unwrap(),
+            ))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            legacy_read_error,
+            GtpuError::UnsupportedFeature {
+                feature: "legacy_ipv4_pdp_on_grouped_attachment"
+            }
+        ));
+        let grouped_after_legacy_read = {
+            let state = runtime.state();
+            (
+                state.session_groups.clone(),
+                state.session_uplink_index.clone(),
+                state.session_downlink_index.clone(),
+                state.session_transactions.clone(),
+            )
+        };
+        assert_eq!(grouped_after_legacy_read, grouped_before_legacy_read);
+        assert_eq!(
+            backend
+                .read_pdp_context_group(GtpuSessionGroupSelector::new(base.id(), device_id,))
+                .await
+                .unwrap(),
+            GtpuSessionGroupReadback::Active(base.clone())
+        );
+
+        let desired = grouped_group(
+            12,
+            device_id,
+            vec![
+                grouped_v4_entry(0x1000_0012, 0x3000_0012),
+                grouped_v6_entry(0x1000_0013, 0x3000_0013, "2001:db8:20::2".parse().unwrap()),
+            ],
+        );
+        runtime.state().operations.clear();
+        assert_eq!(
+            backend
+                .reconcile_pdp_context_group(fresh_group_request(desired.clone()))
+                .await
+                .unwrap(),
+            GtpuSessionGroupReconcileOutcome::Activated
+        );
+        {
+            let state = runtime.state();
+            let authority = GtpuSessionGroupRecord::decode(
+                state
+                    .session_groups
+                    .get(&(S2BU_IFINDEX, desired.id().to_bytes()))
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(authority.generation().get(), 2);
+            assert_eq!(authority.phase(), GtpuSessionGroupPhase::Active);
+            assert_eq!(
+                state
+                    .session_uplink_index
+                    .iter()
+                    .filter(|((ifindex, _), _)| *ifindex == S2BU_IFINDEX)
+                    .count(),
+                2
+            );
+            assert_eq!(
+                state
+                    .session_downlink_index
+                    .iter()
+                    .filter(|((ifindex, _), _)| *ifindex == S2BU_IFINDEX)
+                    .count(),
+                2
+            );
+            for value in
+                state
+                    .session_uplink_index
+                    .iter()
+                    .filter_map(|((ifindex, _), value)| (*ifindex == S2BU_IFINDEX).then_some(value))
+                    .chain(state.session_downlink_index.iter().filter_map(
+                        |((ifindex, _), value)| (*ifindex == S2BU_IFINDEX).then_some(value),
+                    ))
+            {
+                let reference = GtpuSessionGroupRef::decode(value).unwrap();
+                assert_eq!(reference.group_id(), desired.id());
+                assert_eq!(reference.base().unwrap().generation().get(), 2);
+                assert!(reference.desired().is_none());
+            }
+            assert!(!state
+                .session_transactions
+                .contains_key(&(S2BU_IFINDEX, desired.id().to_bytes())));
+            assert!(
+                state
+                    .operations
+                    .iter()
+                    .filter(|operation| **operation == "session_uplink_put")
+                    .count()
+                    >= 4
+            );
+            assert!(
+                state
+                    .operations
+                    .iter()
+                    .filter(|operation| **operation == "session_downlink_put")
+                    .count()
+                    >= 4
+            );
+        }
+        assert_eq!(
+            backend
+                .read_pdp_context_group(GtpuSessionGroupSelector::new(desired.id(), device_id,))
+                .await
+                .unwrap(),
+            GtpuSessionGroupReadback::Active(desired)
+        );
+    }
+
+    #[tokio::test]
+    async fn grouped_crossed_inner_outer_families_activate_simultaneously() {
+        let (backend, _runtime) = backend_with_fake();
+        let device_id = grouped_device_id(6);
+        let local_v4 = Ipv4Addr::new(192, 0, 2, 1);
+        let endpoints =
+            GtpuLocalEndpointSet::new(IpAddr::V4(local_v4), Some(IpAddr::V6(ipv6_local())))
+                .unwrap();
+        backend
+            .create_device_with_endpoints(grouped_device_request("s2bu", device_id, endpoints))
+            .await
+            .unwrap();
+        let crossed = grouped_group(
+            16,
+            device_id,
+            vec![
+                grouped_entry_for_addresses(
+                    IpAddr::V6(ipv6_inner()),
+                    IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
+                    IpAddr::V4(local_v4),
+                    0x1000_0016,
+                    0x2000_0016,
+                    None,
+                ),
+                grouped_entry_for_addresses(
+                    IpAddr::V4(Ipv4Addr::new(10, 45, 0, 2)),
+                    IpAddr::V6(ipv6_peer()),
+                    IpAddr::V6(ipv6_local()),
+                    0x1000_0017,
+                    0x2000_0017,
+                    Some(0x77),
+                ),
+            ],
+        );
+        assert_eq!(
+            backend
+                .reconcile_pdp_context_group(fresh_group_request(crossed.clone()))
+                .await
+                .unwrap(),
+            GtpuSessionGroupReconcileOutcome::Activated
+        );
+        assert_eq!(
+            backend
+                .read_pdp_context_group(GtpuSessionGroupSelector::new(crossed.id(), device_id,))
+                .await
+                .unwrap(),
+            GtpuSessionGroupReadback::Active(crossed)
+        );
+    }
+
+    #[tokio::test]
+    async fn grouped_retained_adoption_is_exact_and_rebind_requires_no_program_reference() {
+        let runtime = Arc::new(FakeRuntime::new());
+        let first = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
+        let device_id = grouped_device_id(3);
+        let endpoints = GtpuLocalEndpointSet::new(IpAddr::V6(ipv6_local()), None).unwrap();
+        first
+            .create_device_with_endpoints(grouped_device_request("s2bu", device_id, endpoints))
+            .await
+            .unwrap();
+        let pin_dir = first.grouped_pin_dir(device_id);
+        {
+            let mut state = runtime.state();
+            state.attached.remove(&S2BU_IFINDEX);
+        }
+
+        let adopted = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
+        assert!(adopted
+            .create_device_with_endpoints(grouped_device_request("s2bu", device_id, endpoints,))
+            .await
+            .is_ok());
+        assert_eq!(
+            runtime.state().pinned_grouped_config[&pin_dir],
+            grouped_device_config(device_id, S2BU_IFINDEX, endpoints)
+                .unwrap()
+                .encode()
+        );
+
+        {
+            let mut state = runtime.state();
+            state.attached.remove(&S2BU_IFINDEX);
+        }
+        let mismatched =
+            GtpuLocalEndpointSet::new(IpAddr::V6("2001:db8:10::99".parse().unwrap()), None)
+                .unwrap();
+        let retry = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
+        assert!(matches!(
+            retry
+                .create_device_with_endpoints(
+                    grouped_device_request("s2bu", device_id, mismatched,)
+                )
+                .await,
+            Err(GtpuError::AlreadyExists)
+        ));
+
+        let rebind = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
+        assert!(matches!(
+            rebind
+                .create_device_with_endpoints(grouped_device_request(
+                    "s2bu-new", device_id, endpoints,
+                ))
+                .await,
+            Err(GtpuError::AlreadyExists)
+        ));
+        {
+            let mut state = runtime.state();
+            state.uplink_filter_ready.remove(&S2BU_IFINDEX);
+            state.downlink_filter_ready.remove(&S2BU_IFINDEX);
+        }
+        assert!(rebind
+            .create_device_with_endpoints(grouped_device_request("s2bu-new", device_id, endpoints,))
+            .await
+            .is_ok());
+        let rebound =
+            GtpuSessionDeviceConfig::decode(&runtime.state().pinned_grouped_config[&pin_dir])
+                .unwrap();
+        assert_eq!(rebound.ingress_ifindex(), REPLACEMENT_IFINDEX);
+    }
+
+    #[tokio::test]
+    async fn grouped_attach_rejects_legacy_or_uncommitted_authority_without_publication() {
+        let device_id = grouped_device_id(16);
+        let endpoints = GtpuLocalEndpointSet::new(IpAddr::V6(ipv6_local()), None).unwrap();
+
+        let legacy_runtime = Arc::new(FakeRuntime::new());
+        let legacy_backend = EbpfGtpuDataplaneBackend::with_runtime(legacy_runtime.clone());
+        legacy_runtime
+            .state()
+            .far
+            .insert((S2BU_IFINDEX, [10, 45, 0, 2]), [0xA5; UPLINK_FAR_VALUE_LEN]);
+        let before = FakeGroupedPublicationSnapshot::capture(&legacy_runtime.state());
+        assert!(matches!(
+            legacy_backend
+                .create_device_with_endpoints(grouped_device_request("s2bu", device_id, endpoints,))
+                .await,
+            Err(GtpuError::AlreadyExists)
+        ));
+        let after = FakeGroupedPublicationSnapshot::capture(&legacy_runtime.state());
+        assert!(after == before);
+
+        let grouped_runtime = Arc::new(FakeRuntime::new());
+        let grouped_backend = EbpfGtpuDataplaneBackend::with_runtime(grouped_runtime.clone());
+        let pin_dir = grouped_backend.grouped_pin_dir(device_id);
+        let group_id = grouped_group_id(32);
+        {
+            let mut state = grouped_runtime.state();
+            state.pinned_grouped_config.insert(
+                pin_dir.clone(),
+                grouped_device_config(device_id, S2BU_IFINDEX, endpoints)
+                    .unwrap()
+                    .encode(),
+            );
+            state.grouped_map_ready.insert(S2BU_IFINDEX);
+            state.session_groups.insert(
+                (S2BU_IFINDEX, group_id.to_bytes()),
+                [0x5A; GTPU_SESSION_GROUP_VALUE_LEN],
+            );
+        }
+        let before = FakeGroupedPublicationSnapshot::capture(&grouped_runtime.state());
+        assert!(matches!(
+            grouped_backend
+                .create_device_with_endpoints(grouped_device_request("s2bu", device_id, endpoints,))
+                .await,
+            Err(GtpuError::StateIndeterminate {
+                operation: "ebpf_grouped_schema"
+            })
+        ));
+        let after = FakeGroupedPublicationSnapshot::capture(&grouped_runtime.state());
+        assert!(after == before);
+        assert!(!grouped_runtime
+            .state()
+            .grouped_schema_ready
+            .contains(&pin_dir));
+    }
+
+    #[tokio::test]
+    async fn grouped_attach_rejects_corrupt_retained_identity_without_repair() {
+        for case in [
+            "corrupt-pmtu",
+            "pin-identity",
+            "foreign-hook",
+            "missing-grouped-map",
+        ] {
+            let runtime = Arc::new(FakeRuntime::new());
+            let device_id = grouped_device_id(17);
+            let endpoints = GtpuLocalEndpointSet::new(IpAddr::V6(ipv6_local()), None).unwrap();
+            let first = attach_grouped_fake(runtime.clone(), device_id, endpoints).await;
+            let pin_dir = first.grouped_pin_dir(device_id);
+            {
+                let mut state = runtime.state();
+                state.attached.remove(&S2BU_IFINDEX);
+                match case {
+                    "corrupt-pmtu" => {
+                        state
+                            .pmtu_policy
+                            .insert(S2BU_IFINDEX, [0xFF; UPLINK_PMTU_VALUE_LEN]);
+                    }
+                    "pin-identity" => {
+                        state.pin_identity_invalid.insert(S2BU_IFINDEX);
+                    }
+                    "foreign-hook" => {
+                        state.uplink_filter_foreign.insert(S2BU_IFINDEX);
+                    }
+                    "missing-grouped-map" => {
+                        state.grouped_map_ready.remove(&S2BU_IFINDEX);
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            let before = FakeGroupedPublicationSnapshot::capture(&runtime.state());
+            let restarted = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
+            assert!(
+                restarted
+                    .create_device_with_endpoints(grouped_device_request(
+                        "s2bu", device_id, endpoints,
+                    ))
+                    .await
+                    .is_err(),
+                "{case}"
+            );
+            let after = FakeGroupedPublicationSnapshot::capture(&runtime.state());
+            assert!(after == before, "{case}");
+            assert_eq!(
+                runtime.state().pinned_grouped_config.get(&pin_dir),
+                before.pinned_grouped_config.get(&pin_dir),
+                "{case}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn grouped_attach_rejects_live_hooks_bound_to_another_pin_namespace() {
+        let runtime = Arc::new(FakeRuntime::new());
+        let old_device_id = grouped_device_id(18);
+        let new_device_id = grouped_device_id(19);
+        let endpoints = GtpuLocalEndpointSet::new(IpAddr::V6(ipv6_local()), None).unwrap();
+        let first = attach_grouped_fake(runtime.clone(), old_device_id, endpoints).await;
+        let old_pin_dir = first.grouped_pin_dir(old_device_id);
+        let new_pin_dir = first.grouped_pin_dir(new_device_id);
+        assert!(old_pin_dir != new_pin_dir);
+        {
+            let mut state = runtime.state();
+            state.attached.remove(&S2BU_IFINDEX);
+            assert_eq!(
+                state.uplink_filter_pin_dir.get(&S2BU_IFINDEX),
+                Some(&old_pin_dir)
+            );
+            assert_eq!(
+                state.downlink_filter_pin_dir.get(&S2BU_IFINDEX),
+                Some(&old_pin_dir)
+            );
+        }
+
+        let before = FakeGroupedPublicationSnapshot::capture(&runtime.state());
+        let restarted = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
+        assert!(matches!(
+            restarted
+                .create_device_with_endpoints(grouped_device_request(
+                    "s2bu",
+                    new_device_id,
+                    endpoints,
+                ))
+                .await,
+            Err(GtpuError::AlreadyExists)
+        ));
+        let after = FakeGroupedPublicationSnapshot::capture(&runtime.state());
+        assert!(after == before);
+        assert!(!runtime
+            .state()
+            .pinned_grouped_config
+            .contains_key(&new_pin_dir));
+    }
+
+    #[tokio::test]
+    async fn grouped_install_recovers_every_durable_phase_after_process_crash() {
+        for crash_operation in [
+            "session_transaction_put_prepared",
+            "session_group_put_pending",
+            "session_uplink_put_staged",
+            "session_downlink_put_staged",
+            "session_transaction_put_indexes_staged",
+            "session_group_put_active",
+            "session_transaction_put_authority_committed",
+            "session_uplink_put_active",
+            "session_downlink_put_active",
+            "session_transaction_remove",
+        ] {
+            let runtime = Arc::new(FakeRuntime::new());
+            let device_id = grouped_device_id(4);
+            let endpoints = GtpuLocalEndpointSet::new(IpAddr::V6(ipv6_local()), None).unwrap();
+            let backend = attach_grouped_fake(runtime.clone(), device_id, endpoints).await;
+            let group = grouped_group(
+                14,
+                device_id,
+                vec![grouped_v6_entry(0x1000_0014, 0x2000_0014, ipv6_peer())],
+            );
+            runtime.crash_after_in_order([crash_operation]);
+            assert!(
+                backend
+                    .reconcile_pdp_context_group(fresh_group_request(group.clone()))
+                    .await
+                    .is_err(),
+                "crash point {crash_operation}"
+            );
+
+            let restarted = restart_grouped_fake(runtime.clone(), device_id, endpoints).await;
+            assert!(
+                matches!(
+                    restarted
+                        .reconcile_pdp_context_group(fresh_group_request(group.clone()))
+                        .await
+                        .unwrap(),
+                    GtpuSessionGroupReconcileOutcome::Activated
+                        | GtpuSessionGroupReconcileOutcome::ExactAlreadyActive
+                ),
+                "restart point {crash_operation}"
+            );
+            assert_eq!(
+                restarted
+                    .read_pdp_context_group(GtpuSessionGroupSelector::new(group.id(), device_id,))
+                    .await
+                    .unwrap(),
+                GtpuSessionGroupReadback::Active(group.clone()),
+                "final readback point {crash_operation}"
+            );
+            let state = runtime.state();
+            assert!(!state
+                .session_transactions
+                .contains_key(&(S2BU_IFINDEX, group.id().to_bytes())));
+        }
+    }
+
+    #[tokio::test]
+    async fn grouped_install_reconciles_ack_loss_by_exact_readback() {
+        for failed_ack in [
+            "session_transaction_put_prepared",
+            "session_group_put_pending",
+            "session_uplink_put_staged",
+            "session_downlink_put_staged",
+            "session_transaction_put_indexes_staged",
+            "session_group_put_active",
+            "session_transaction_put_authority_committed",
+            "session_uplink_put_active",
+            "session_downlink_put_active",
+            "session_transaction_remove",
+        ] {
+            let runtime = Arc::new(FakeRuntime::new());
+            let device_id = grouped_device_id(5);
+            let endpoints = GtpuLocalEndpointSet::new(IpAddr::V6(ipv6_local()), None).unwrap();
+            let backend = attach_grouped_fake(runtime.clone(), device_id, endpoints).await;
+            let group = grouped_group(
+                15,
+                device_id,
+                vec![grouped_v6_entry(0x1000_0015, 0x2000_0015, ipv6_peer())],
+            );
+            runtime.fail_after_in_order([failed_ack]);
+            assert_eq!(
+                backend
+                    .reconcile_pdp_context_group(fresh_group_request(group.clone()))
+                    .await
+                    .unwrap(),
+                GtpuSessionGroupReconcileOutcome::Activated,
+                "ACK point {failed_ack}"
+            );
+            assert_eq!(
+                backend
+                    .read_pdp_context_group(GtpuSessionGroupSelector::new(group.id(), device_id,))
+                    .await
+                    .unwrap(),
+                GtpuSessionGroupReadback::Active(group),
+                "ACK readback point {failed_ack}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn grouped_update_recovers_every_n_to_n_plus_one_cut_without_mixed_authority() {
+        for crash_operation in [
+            "session_transaction_put_prepared",
+            "session_uplink_put_staged",
+            "session_downlink_put_staged",
+            "session_transaction_put_indexes_staged",
+            "session_group_put_active",
+            "session_transaction_put_authority_committed",
+            "session_uplink_put_active",
+            "session_downlink_put_active",
+            "session_uplink_remove",
+            "session_downlink_remove",
+            "session_transaction_remove",
+        ] {
+            let runtime = Arc::new(FakeRuntime::new());
+            let device_id = grouped_device_id(7);
+            let endpoints = GtpuLocalEndpointSet::new(IpAddr::V6(ipv6_local()), None).unwrap();
+            let backend = attach_grouped_fake(runtime.clone(), device_id, endpoints).await;
+            let (base, desired) = grouped_rekey_pair(device_id, 17);
+            assert_eq!(
+                backend
+                    .reconcile_pdp_context_group(fresh_group_request(base))
+                    .await
+                    .unwrap(),
+                GtpuSessionGroupReconcileOutcome::Activated
+            );
+
+            runtime.crash_after_in_order([crash_operation]);
+            assert!(
+                backend
+                    .reconcile_pdp_context_group(fresh_group_request(desired.clone()))
+                    .await
+                    .is_err(),
+                "crash point {crash_operation}"
+            );
+            {
+                let state = runtime.state();
+                assert_fake_packet_authority_is_single_generation(
+                    &state,
+                    S2BU_IFINDEX,
+                    desired.id(),
+                    grouped_device_config(device_id, S2BU_IFINDEX, endpoints).unwrap(),
+                );
+            }
+
+            let restarted = restart_grouped_fake(runtime.clone(), device_id, endpoints).await;
+            assert!(
+                matches!(
+                    restarted
+                        .reconcile_pdp_context_group(fresh_group_request(desired.clone()))
+                        .await
+                        .unwrap(),
+                    GtpuSessionGroupReconcileOutcome::Activated
+                        | GtpuSessionGroupReconcileOutcome::ExactAlreadyActive
+                ),
+                "restart point {crash_operation}"
+            );
+            assert_eq!(
+                restarted
+                    .read_pdp_context_group(GtpuSessionGroupSelector::new(desired.id(), device_id,))
+                    .await
+                    .unwrap(),
+                GtpuSessionGroupReadback::Active(desired.clone()),
+                "final readback point {crash_operation}"
+            );
+            let state = runtime.state();
+            assert_fake_packet_authority_is_single_generation(
+                &state,
+                S2BU_IFINDEX,
+                desired.id(),
+                grouped_device_config(device_id, S2BU_IFINDEX, endpoints).unwrap(),
+            );
+            assert!(!state
+                .session_transactions
+                .contains_key(&(S2BU_IFINDEX, desired.id().to_bytes())));
+        }
+    }
+
+    #[tokio::test]
+    async fn grouped_update_reconciles_every_ack_loss_by_exact_readback() {
+        for failed_ack in [
+            "session_transaction_put_prepared",
+            "session_uplink_put_staged",
+            "session_downlink_put_staged",
+            "session_transaction_put_indexes_staged",
+            "session_group_put_active",
+            "session_transaction_put_authority_committed",
+            "session_uplink_put_active",
+            "session_downlink_put_active",
+            "session_uplink_remove",
+            "session_downlink_remove",
+            "session_transaction_remove",
+        ] {
+            let runtime = Arc::new(FakeRuntime::new());
+            let device_id = grouped_device_id(8);
+            let endpoints = GtpuLocalEndpointSet::new(IpAddr::V6(ipv6_local()), None).unwrap();
+            let backend = attach_grouped_fake(runtime.clone(), device_id, endpoints).await;
+            let (base, desired) = grouped_rekey_pair(device_id, 18);
+            assert_eq!(
+                backend
+                    .reconcile_pdp_context_group(fresh_group_request(base))
+                    .await
+                    .unwrap(),
+                GtpuSessionGroupReconcileOutcome::Activated
+            );
+
+            runtime.fail_after_in_order([failed_ack]);
+            assert_eq!(
+                backend
+                    .reconcile_pdp_context_group(fresh_group_request(desired.clone()))
+                    .await
+                    .unwrap(),
+                GtpuSessionGroupReconcileOutcome::Activated,
+                "ACK point {failed_ack}"
+            );
+            assert_eq!(
+                backend
+                    .read_pdp_context_group(GtpuSessionGroupSelector::new(desired.id(), device_id,))
+                    .await
+                    .unwrap(),
+                GtpuSessionGroupReadback::Active(desired.clone()),
+                "ACK readback point {failed_ack}"
+            );
+            assert_fake_packet_authority_is_single_generation(
+                &runtime.state(),
+                S2BU_IFINDEX,
+                desired.id(),
+                grouped_device_config(device_id, S2BU_IFINDEX, endpoints).unwrap(),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn grouped_removal_recovers_every_durable_cut_and_fails_closed() {
+        for crash_operation in [
+            "session_transaction_put_prepared",
+            "session_group_put_removing",
+            "session_transaction_put_authority_committed",
+            "session_uplink_remove",
+            "session_downlink_remove",
+            "session_group_remove",
+            "session_transaction_remove",
+        ] {
+            let runtime = Arc::new(FakeRuntime::new());
+            let device_id = grouped_device_id(9);
+            let endpoints = GtpuLocalEndpointSet::new(IpAddr::V6(ipv6_local()), None).unwrap();
+            let backend = attach_grouped_fake(runtime.clone(), device_id, endpoints).await;
+            let (active, _) = grouped_rekey_pair(device_id, 19);
+            assert_eq!(
+                backend
+                    .reconcile_pdp_context_group(fresh_group_request(active.clone()))
+                    .await
+                    .unwrap(),
+                GtpuSessionGroupReconcileOutcome::Activated
+            );
+
+            runtime.crash_after_in_order([crash_operation]);
+            assert!(
+                backend
+                    .remove_pdp_context_group_exact(active.clone())
+                    .await
+                    .is_err(),
+                "crash point {crash_operation}"
+            );
+            assert_fake_packet_authority_is_single_generation(
+                &runtime.state(),
+                S2BU_IFINDEX,
+                active.id(),
+                grouped_device_config(device_id, S2BU_IFINDEX, endpoints).unwrap(),
+            );
+
+            let restarted = restart_grouped_fake(runtime.clone(), device_id, endpoints).await;
+            assert!(
+                matches!(
+                    restarted
+                        .remove_pdp_context_group_exact(active.clone())
+                        .await
+                        .unwrap(),
+                    GtpuSessionGroupRemovalOutcome::Removed
+                        | GtpuSessionGroupRemovalOutcome::AlreadyAbsent
+                ),
+                "restart point {crash_operation}"
+            );
+            assert_eq!(
+                restarted
+                    .read_pdp_context_group(GtpuSessionGroupSelector::new(active.id(), device_id,))
+                    .await
+                    .unwrap(),
+                GtpuSessionGroupReadback::Absent,
+                "final readback point {crash_operation}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn grouped_removal_reconciles_every_ack_loss_by_exact_readback() {
+        for failed_ack in [
+            "session_transaction_put_prepared",
+            "session_group_put_removing",
+            "session_transaction_put_authority_committed",
+            "session_uplink_remove",
+            "session_downlink_remove",
+            "session_group_remove",
+            "session_transaction_remove",
+        ] {
+            let runtime = Arc::new(FakeRuntime::new());
+            let device_id = grouped_device_id(10);
+            let endpoints = GtpuLocalEndpointSet::new(IpAddr::V6(ipv6_local()), None).unwrap();
+            let backend = attach_grouped_fake(runtime.clone(), device_id, endpoints).await;
+            let (active, _) = grouped_rekey_pair(device_id, 20);
+            assert_eq!(
+                backend
+                    .reconcile_pdp_context_group(fresh_group_request(active.clone()))
+                    .await
+                    .unwrap(),
+                GtpuSessionGroupReconcileOutcome::Activated
+            );
+
+            runtime.fail_after_in_order([failed_ack]);
+            assert_eq!(
+                backend
+                    .remove_pdp_context_group_exact(active.clone())
+                    .await
+                    .unwrap(),
+                GtpuSessionGroupRemovalOutcome::Removed,
+                "ACK point {failed_ack}"
+            );
+            assert_eq!(
+                backend
+                    .read_pdp_context_group(GtpuSessionGroupSelector::new(active.id(), device_id,))
+                    .await
+                    .unwrap(),
+                GtpuSessionGroupReadback::Absent,
+                "ACK readback point {failed_ack}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn grouped_selector_collision_requires_exact_retirement_and_reuse_proof() {
+        let runtime = Arc::new(FakeRuntime::new());
+        let device_id = grouped_device_id(11);
+        let endpoints = GtpuLocalEndpointSet::new(
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+            Some(IpAddr::V6(ipv6_local())),
+        )
+        .unwrap();
+        let backend = attach_grouped_fake(runtime, device_id, endpoints).await;
+        let source = grouped_group(
+            21,
+            device_id,
+            vec![
+                grouped_v4_entry(0x1300_0001, 0x2300_0001),
+                grouped_v6_entry(0x1300_0002, 0x2300_0002, ipv6_peer()),
+            ],
+        );
+        let replacement = grouped_group(22, device_id, source.entries().to_vec());
+        assert_eq!(
+            backend
+                .reconcile_pdp_context_group(fresh_group_request(source.clone()))
+                .await
+                .unwrap(),
+            GtpuSessionGroupReconcileOutcome::Activated
+        );
+
+        let live_reuse = GtpuSessionGroupReconcileRequest::new(
+            replacement.clone(),
+            GtpuSessionSelectorProvenance::Reused(
+                GtpuSessionSelectorReuseProof::after_traffic_drain(source.clone()),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            backend
+                .reconcile_pdp_context_group(live_reuse)
+                .await
+                .unwrap(),
+            GtpuSessionGroupReconcileOutcome::Indeterminate(
+                GtpuSessionGroupIndeterminateReason::GraceUnproven
+            )
+        );
+        assert_eq!(
+            backend
+                .reconcile_pdp_context_group(fresh_group_request(replacement.clone()))
+                .await
+                .unwrap(),
+            GtpuSessionGroupReconcileOutcome::Conflict(
+                GtpuSessionGroupConflict::SelectorOwnedByAnotherGroup
+            )
+        );
+
+        assert_eq!(
+            backend
+                .remove_pdp_context_group_exact(source.clone())
+                .await
+                .unwrap(),
+            GtpuSessionGroupRemovalOutcome::Removed
+        );
+        let unrelated = grouped_group(
+            23,
+            device_id,
+            vec![grouped_entry_for_addresses(
+                IpAddr::V6("2001:db8:100:99::1".parse().unwrap()),
+                IpAddr::V6("2001:db8:40::1".parse().unwrap()),
+                IpAddr::V6(ipv6_local()),
+                0x1300_0099,
+                0x2300_0099,
+                None,
+            )],
+        );
+        assert_eq!(
+            backend
+                .reconcile_pdp_context_group(
+                    GtpuSessionGroupReconcileRequest::new(
+                        unrelated,
+                        GtpuSessionSelectorProvenance::Reused(
+                            GtpuSessionSelectorReuseProof::after_rcu_grace_period(source.clone(),),
+                        ),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap(),
+            GtpuSessionGroupReconcileOutcome::Indeterminate(
+                GtpuSessionGroupIndeterminateReason::GraceUnproven
+            )
+        );
+
+        assert_eq!(
+            backend
+                .reconcile_pdp_context_group(
+                    GtpuSessionGroupReconcileRequest::new(
+                        replacement.clone(),
+                        GtpuSessionSelectorProvenance::Reused(
+                            GtpuSessionSelectorReuseProof::after_rcu_grace_period(source,),
+                        ),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap(),
+            GtpuSessionGroupReconcileOutcome::Activated
+        );
+        assert_eq!(
+            backend
+                .read_pdp_context_group(GtpuSessionGroupSelector::new(replacement.id(), device_id,))
+                .await
+                .unwrap(),
+            GtpuSessionGroupReadback::Active(replacement)
+        );
+    }
+
+    #[tokio::test]
+    async fn grouped_reuse_proof_cannot_launder_an_unproved_retired_selector() {
+        let runtime = Arc::new(FakeRuntime::new());
+        let device_id = grouped_device_id(15);
+        let endpoints = GtpuLocalEndpointSet::new(
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+            Some(IpAddr::V6(ipv6_local())),
+        )
+        .unwrap();
+        let backend = attach_grouped_fake(runtime.clone(), device_id, endpoints).await;
+        let source_a = grouped_group(
+            29,
+            device_id,
+            vec![grouped_v4_entry(0x1800_0001, 0x2800_0001)],
+        );
+        let source_b = grouped_group(
+            30,
+            device_id,
+            vec![grouped_v6_entry(0x1800_0002, 0x2800_0002, ipv6_peer())],
+        );
+        for source in [&source_a, &source_b] {
+            assert_eq!(
+                backend
+                    .reconcile_pdp_context_group(fresh_group_request(source.clone()))
+                    .await
+                    .unwrap(),
+                GtpuSessionGroupReconcileOutcome::Activated
+            );
+            assert_eq!(
+                backend
+                    .remove_pdp_context_group_exact(source.clone())
+                    .await
+                    .unwrap(),
+                GtpuSessionGroupRemovalOutcome::Removed
+            );
+        }
+
+        let desired = grouped_group(
+            31,
+            device_id,
+            vec![source_a.entries()[0].clone(), source_b.entries()[0].clone()],
+        );
+        let before = {
+            let state = runtime.state();
+            (
+                state.session_groups.clone(),
+                state.session_uplink_index.clone(),
+                state.session_downlink_index.clone(),
+                state.session_transactions.clone(),
+            )
+        };
+        let proof_for_a_only = GtpuSessionGroupReconcileRequest::new(
+            desired.clone(),
+            GtpuSessionSelectorProvenance::Reused(
+                GtpuSessionSelectorReuseProof::after_traffic_drain(source_a),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            backend
+                .reconcile_pdp_context_group(proof_for_a_only)
+                .await
+                .unwrap(),
+            GtpuSessionGroupReconcileOutcome::Indeterminate(
+                GtpuSessionGroupIndeterminateReason::GraceUnproven
+            )
+        );
+        let after = {
+            let state = runtime.state();
+            (
+                state.session_groups.clone(),
+                state.session_uplink_index.clone(),
+                state.session_downlink_index.clone(),
+                state.session_transactions.clone(),
+            )
+        };
+        assert_eq!(after, before);
+        assert_eq!(
+            backend
+                .read_pdp_context_group(GtpuSessionGroupSelector::new(desired.id(), device_id,))
+                .await
+                .unwrap(),
+            GtpuSessionGroupReadback::Absent
+        );
+    }
+
+    #[tokio::test]
+    async fn grouped_readback_rejects_corruption_and_semantic_aba() {
+        let runtime = Arc::new(FakeRuntime::new());
+        let device_id = grouped_device_id(12);
+        let endpoints = GtpuLocalEndpointSet::new(IpAddr::V6(ipv6_local()), None).unwrap();
+        let backend = attach_grouped_fake(runtime.clone(), device_id, endpoints).await;
+        let group = grouped_group(
+            24,
+            device_id,
+            vec![grouped_v6_entry(0x1400_0001, 0x2400_0001, ipv6_peer())],
+        );
+        assert_eq!(
+            backend
+                .reconcile_pdp_context_group(fresh_group_request(group.clone()))
+                .await
+                .unwrap(),
+            GtpuSessionGroupReconcileOutcome::Activated
+        );
+        let selector = GtpuSessionGroupSelector::new(group.id(), device_id);
+        let (authority, uplink, downlink) = {
+            let state = runtime.state();
+            (
+                state.session_groups[&(S2BU_IFINDEX, group.id().to_bytes())],
+                state
+                    .session_uplink_index
+                    .iter()
+                    .find(|((ifindex, _), _)| *ifindex == S2BU_IFINDEX)
+                    .map(|(key, value)| (*key, *value))
+                    .unwrap(),
+                state
+                    .session_downlink_index
+                    .iter()
+                    .find(|((ifindex, _), _)| *ifindex == S2BU_IFINDEX)
+                    .map(|(key, value)| (*key, *value))
+                    .unwrap(),
+            )
+        };
+
+        runtime.state().session_groups.insert(
+            (S2BU_IFINDEX, group.id().to_bytes()),
+            [0; GTPU_SESSION_GROUP_VALUE_LEN],
+        );
+        assert_eq!(
+            backend.read_pdp_context_group(selector).await.unwrap(),
+            GtpuSessionGroupReadback::Indeterminate(
+                GtpuSessionGroupIndeterminateReason::IncompleteState
+            )
+        );
+        runtime
+            .state()
+            .session_groups
+            .insert((S2BU_IFINDEX, group.id().to_bytes()), authority);
+
+        runtime.state().session_uplink_index.remove(&uplink.0);
+        assert_eq!(
+            backend.read_pdp_context_group(selector).await.unwrap(),
+            GtpuSessionGroupReadback::Indeterminate(
+                GtpuSessionGroupIndeterminateReason::IncompleteState
+            )
+        );
+        runtime
+            .state()
+            .session_uplink_index
+            .insert(uplink.0, uplink.1);
+
+        let mut malformed_key = uplink.0 .1;
+        malformed_key[1] = 1;
+        let mut malformed_ref = [0_u8; GTPU_SESSION_GROUP_REF_LEN];
+        malformed_ref[..GTPU_SESSION_GROUP_ID_LEN].copy_from_slice(&group.id().to_bytes());
+        runtime
+            .state()
+            .session_uplink_index
+            .insert((S2BU_IFINDEX, malformed_key), malformed_ref);
+        assert_eq!(
+            backend.read_pdp_context_group(selector).await.unwrap(),
+            GtpuSessionGroupReadback::Indeterminate(
+                GtpuSessionGroupIndeterminateReason::IncompleteState
+            )
+        );
+        runtime
+            .state()
+            .session_uplink_index
+            .remove(&(S2BU_IFINDEX, malformed_key));
+
+        runtime.state().session_transactions.insert(
+            (S2BU_IFINDEX, group.id().to_bytes()),
+            [0; GTPU_SESSION_TRANSACTION_VALUE_LEN],
+        );
+        assert_eq!(
+            backend
+                .reconcile_pdp_context_group(fresh_group_request(group.clone()))
+                .await
+                .unwrap(),
+            GtpuSessionGroupReconcileOutcome::Indeterminate(
+                GtpuSessionGroupIndeterminateReason::JournalMismatch
+            )
+        );
+        runtime
+            .state()
+            .session_transactions
+            .remove(&(S2BU_IFINDEX, group.id().to_bytes()));
+
+        let base = GtpuSessionGroupRecord::decode(&authority).expect("valid authority");
+        let semantic_aba =
+            grouped_record_from_model(&group, base.generation().checked_next().unwrap())
+                .unwrap()
+                .encode();
+        runtime
+            .state()
+            .session_group_get_overrides
+            .extend([Some(authority), Some(semantic_aba)]);
+        assert_eq!(
+            backend.read_pdp_context_group(selector).await.unwrap(),
+            GtpuSessionGroupReadback::Indeterminate(
+                GtpuSessionGroupIndeterminateReason::StateChanged
+            )
+        );
+        assert_eq!(
+            runtime.state().session_downlink_index[&downlink.0],
+            downlink.1
+        );
+    }
+
+    #[tokio::test]
+    async fn grouped_attachment_loss_fails_closed_and_withdraws_capabilities() {
+        let runtime = Arc::new(FakeRuntime::new());
+        let device_id = grouped_device_id(13);
+        let endpoints = GtpuLocalEndpointSet::new(
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+            Some(IpAddr::V6(ipv6_local())),
+        )
+        .unwrap();
+        let backend = attach_grouped_fake(runtime.clone(), device_id, endpoints).await;
+        let group = grouped_group(
+            25,
+            device_id,
+            vec![grouped_v6_entry(0x1500_0001, 0x2500_0001, ipv6_peer())],
+        );
+        assert_eq!(
+            backend
+                .reconcile_pdp_context_group(fresh_group_request(group.clone()))
+                .await
+                .unwrap(),
+            GtpuSessionGroupReconcileOutcome::Activated
+        );
+        let attachment = GtpuSessionAttachmentSelector::new(
+            device_id,
+            GtpDevice {
+                name: "s2bu".to_string(),
+                ifindex: S2BU_IFINDEX,
+            },
+            endpoints,
+        )
+        .unwrap();
+
+        runtime
+            .state()
+            .grouped_schema_ready
+            .remove(&backend.grouped_pin_dir(device_id));
+        assert_eq!(
+            backend
+                .read_pdp_context_group(GtpuSessionGroupSelector::new(group.id(), device_id,))
+                .await
+                .unwrap(),
+            GtpuSessionGroupReadback::Indeterminate(
+                GtpuSessionGroupIndeterminateReason::AuthorityUnavailable
+            )
+        );
+        assert_eq!(
+            backend
+                .reconcile_pdp_context_group(fresh_group_request(group))
+                .await
+                .unwrap(),
+            GtpuSessionGroupReconcileOutcome::Indeterminate(
+                GtpuSessionGroupIndeterminateReason::AuthorityUnavailable
+            )
+        );
+        let capabilities = backend
+            .gtpu_ip_family_capabilities(attachment)
+            .await
+            .unwrap();
+        assert_eq!(capabilities.inner_ipv4, GtpuCapability::Missing);
+        assert_eq!(capabilities.inner_ipv6, GtpuCapability::Missing);
+        assert_eq!(capabilities.outer_ipv4, GtpuCapability::Missing);
+        assert_eq!(capabilities.outer_ipv6, GtpuCapability::Missing);
+        assert_eq!(
+            capabilities.grouped_atomic_reconciliation,
+            GtpuCapability::Missing
+        );
+        assert_eq!(
+            capabilities.uplink_checksum_offload,
+            GtpuUplinkChecksumOffloadContract::Unsupported
+        );
+        assert_eq!(
+            capabilities.downlink_outer_ipv4_fragment_handling,
+            GtpuDownlinkFragmentContract::Unsupported
+        );
+        assert_eq!(
+            capabilities.downlink_outer_ipv6_fragment_handling,
+            GtpuDownlinkFragmentContract::Unsupported
+        );
+    }
+
+    #[tokio::test]
+    async fn grouped_transaction_collision_entropy_failure_and_generation_exhaustion_fail_closed() {
+        let device_id = grouped_device_id(14);
+        let endpoints = GtpuLocalEndpointSet::new(IpAddr::V6(ipv6_local()), None).unwrap();
+
+        let collision_runtime = Arc::new(FakeRuntime::new());
+        let collision_backend =
+            attach_grouped_fake(collision_runtime.clone(), device_id, endpoints).await;
+        let collision_group = grouped_group(
+            26,
+            device_id,
+            vec![grouped_v6_entry(0x1600_0001, 0x2600_0001, ipv6_peer())],
+        );
+        let collision_record =
+            grouped_record_from_model(&collision_group, GtpuSessionGeneration::INITIAL).unwrap();
+        let competing = GtpuSessionTransactionRecord::prepare(
+            collision_group.id(),
+            GtpuSessionTransactionId::new([0xCC; 16]).unwrap(),
+            None,
+            Some(collision_record),
+        )
+        .unwrap();
+        collision_runtime.state().competing_transaction_on_noexist = Some(competing.encode());
+        assert_eq!(
+            collision_backend
+                .reconcile_pdp_context_group(fresh_group_request(collision_group.clone()))
+                .await
+                .unwrap(),
+            GtpuSessionGroupReconcileOutcome::Indeterminate(
+                GtpuSessionGroupIndeterminateReason::JournalMismatch
+            )
+        );
+        assert_eq!(
+            collision_runtime.state().session_transactions
+                [&(S2BU_IFINDEX, collision_group.id().to_bytes())],
+            competing.encode()
+        );
+
+        let entropy_runtime = Arc::new(FakeRuntime::new());
+        let entropy_backend =
+            attach_grouped_fake(entropy_runtime.clone(), device_id, endpoints).await;
+        let entropy_group = grouped_group(
+            27,
+            device_id,
+            vec![grouped_v6_entry(0x1700_0001, 0x2700_0001, ipv6_peer())],
+        );
+        entropy_runtime.fail_in_order(["session_transaction_entropy"]);
+        assert_eq!(
+            entropy_backend
+                .reconcile_pdp_context_group(fresh_group_request(entropy_group))
+                .await
+                .unwrap(),
+            GtpuSessionGroupReconcileOutcome::Indeterminate(
+                GtpuSessionGroupIndeterminateReason::MutationUnconfirmed
+            )
+        );
+
+        let exhausted_runtime = Arc::new(FakeRuntime::new());
+        let exhausted_backend =
+            attach_grouped_fake(exhausted_runtime.clone(), device_id, endpoints).await;
+        let (base, desired) = grouped_rekey_pair(device_id, 28);
+        let exhausted =
+            grouped_record_from_model(&base, GtpuSessionGeneration::new(u64::MAX).unwrap())
+                .unwrap();
+        {
+            let mut state = exhausted_runtime.state();
+            state
+                .session_groups
+                .insert((S2BU_IFINDEX, base.id().to_bytes()), exhausted.encode());
+            for element in grouped_active_indexes(exhausted).unwrap() {
+                match element.key {
+                    GroupedIndexKey::Uplink(key) => {
+                        state
+                            .session_uplink_index
+                            .insert((S2BU_IFINDEX, key), element.value);
+                    }
+                    GroupedIndexKey::Downlink(key) => {
+                        state
+                            .session_downlink_index
+                            .insert((S2BU_IFINDEX, key), element.value);
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            exhausted_backend
+                .reconcile_pdp_context_group(fresh_group_request(desired))
+                .await
+                .unwrap(),
+            GtpuSessionGroupReconcileOutcome::Indeterminate(
+                GtpuSessionGroupIndeterminateReason::GenerationExhausted
+            )
+        );
+        assert!(!exhausted_runtime
+            .state()
+            .session_transactions
+            .contains_key(&(S2BU_IFINDEX, base.id().to_bytes())));
+    }
+
     fn seed_drained_v2(runtime: &FakeRuntime) -> PathBuf {
         let pin_dir = PathBuf::from(DEFAULT_BPFFS_PIN_ROOT).join("s2bu");
         let mut state = runtime.state();
@@ -13965,7 +19582,8 @@ mod tests {
             REPLACEMENT_IFINDEX,
             ManagedDevice {
                 name: "s2bu-new".to_string(),
-                local_ip: Ipv4Addr::new(192, 0, 2, 99),
+                local_ip: Some(Ipv4Addr::new(192, 0, 2, 99)),
+                grouped: None,
             },
         );
 
@@ -17237,6 +22855,10 @@ mod tests {
         assert!(probe.btf_present);
         assert!(probe.mutation_ready);
         assert_eq!(probe.egress_dscp_marking, GtpuCapability::Available);
+        assert!(matches!(
+            probe.downlink_outer_fragment_handling,
+            GtpuDownlinkFragmentContract::KernelReassemblyHandoff { .. }
+        ));
         assert!(!probe.gtp_module_present);
 
         for missing in ["bpffs", "btf", "net_admin", "bpf"] {

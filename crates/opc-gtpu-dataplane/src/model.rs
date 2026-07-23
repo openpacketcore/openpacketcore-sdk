@@ -1,12 +1,14 @@
 //! Safe model types for Linux GTP-U dataplane backend operations.
 
 use std::fmt;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::num::NonZeroU32;
 
+use opc_gtpu_ebpf_common::GtpuEndpointAddress;
 pub use opc_gtpu_ebpf_common::{
     GtpuDownlinkFragmentContract, GtpuOuterFragmentPolicy, GtpuReassemblyBounds,
-    GtpuSourcePortPolicy, GtpuSourcePortRange, GtpuUplinkMtuPolicy, GtpuUplinkSourcePortPolicy,
+    GtpuSessionDeviceId, GtpuSessionGroupId, GtpuSessionPaa, GtpuSourcePortPolicy,
+    GtpuSourcePortRange, GtpuUplinkMtuPolicy, GtpuUplinkSourcePortPolicy,
 };
 use opc_types::DscpCodepoint;
 
@@ -529,6 +531,284 @@ impl fmt::Debug for CreateGtpDeviceRequest {
     }
 }
 
+/// Redaction-safe reason a grouped-session model value is invalid.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GtpuSessionModelError {
+    /// A local endpoint or PDP address is unspecified.
+    UnspecifiedAddress,
+    /// Both endpoint-set addresses use the same family.
+    DuplicateEndpointFamily,
+    /// The legacy single bind address conflicts with the explicit endpoint set.
+    ConflictingLegacyBindAddress,
+    /// Local and peer outer addresses use different families.
+    OuterFamilyMismatch,
+    /// A local outer endpoint aliases the inner PAA identity.
+    InnerOuterAlias,
+    /// A PDP context lacks a usable link or canonical PAA.
+    InvalidContext,
+    /// A group has no family entries.
+    EmptyGroup,
+    /// A group has more than one entry per supported inner family.
+    TooManyEntries,
+    /// Two entries project the same inner family.
+    DuplicateInnerFamily,
+    /// Entries refer to different GTP links.
+    MixedLinks,
+    /// Entries use different GTP versions.
+    MixedVersions,
+    /// A group and managed attachment carry different stable device IDs.
+    DeviceIdentityMismatch,
+    /// The live interface does not match every entry's exact attachment.
+    AttachmentMismatch,
+    /// An entry's local outer address is not in the managed endpoint set.
+    LocalEndpointNotManaged,
+    /// Selector-reuse evidence names the wrong device, group, or graph.
+    ReuseProofMismatch,
+}
+
+impl fmt::Display for GtpuSessionModelError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::UnspecifiedAddress => "grouped GTP-U address is unspecified",
+            Self::DuplicateEndpointFamily => "grouped GTP-U endpoint family is duplicated",
+            Self::ConflictingLegacyBindAddress => {
+                "legacy GTP-U bind address conflicts with explicit endpoint set"
+            }
+            Self::OuterFamilyMismatch => "grouped GTP-U outer address families differ",
+            Self::InnerOuterAlias => "grouped GTP-U inner and local outer identities alias",
+            Self::InvalidContext => "grouped GTP-U PDP context is invalid",
+            Self::EmptyGroup => "grouped GTP-U session has no entries",
+            Self::TooManyEntries => "grouped GTP-U session has too many entries",
+            Self::DuplicateInnerFamily => "grouped GTP-U inner family is duplicated",
+            Self::MixedLinks => "grouped GTP-U entries use different links",
+            Self::MixedVersions => "grouped GTP-U entries use different versions",
+            Self::DeviceIdentityMismatch => "grouped GTP-U device identity differs",
+            Self::AttachmentMismatch => "grouped GTP-U attachment differs",
+            Self::LocalEndpointNotManaged => "grouped GTP-U local endpoint is not managed",
+            Self::ReuseProofMismatch => "grouped GTP-U selector reuse proof differs",
+        })
+    }
+}
+
+impl std::error::Error for GtpuSessionModelError {}
+
+/// One or two exact local outer addresses managed as a single attachment.
+///
+/// The set is family-canonical and contains at most one IPv4 and one IPv6
+/// address. It is attachment authority, not a wildcard: every grouped
+/// reconcile, readback, and adoption must revalidate entry membership against
+/// the currently proven set.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GtpuLocalEndpointSet {
+    ipv4: Option<Ipv4Addr>,
+    ipv6: Option<Ipv6Addr>,
+}
+
+impl GtpuLocalEndpointSet {
+    /// Construct an exact one- or two-family endpoint set.
+    ///
+    /// # Errors
+    ///
+    /// Unspecified addresses and a duplicate family are rejected.
+    pub fn new(primary: IpAddr, secondary: Option<IpAddr>) -> Result<Self, GtpuSessionModelError> {
+        if primary.is_unspecified() || secondary.is_some_and(|address| address.is_unspecified()) {
+            return Err(GtpuSessionModelError::UnspecifiedAddress);
+        }
+        let mut endpoints = Self {
+            ipv4: None,
+            ipv6: None,
+        };
+        for address in [Some(primary), secondary].into_iter().flatten() {
+            match address {
+                IpAddr::V4(address) if endpoints.ipv4.replace(address).is_some() => {
+                    return Err(GtpuSessionModelError::DuplicateEndpointFamily);
+                }
+                IpAddr::V6(address) if endpoints.ipv6.replace(address).is_some() => {
+                    return Err(GtpuSessionModelError::DuplicateEndpointFamily);
+                }
+                IpAddr::V4(_) | IpAddr::V6(_) => {}
+            }
+        }
+        Ok(endpoints)
+    }
+
+    /// Return the exact IPv4 endpoint, if managed.
+    #[must_use]
+    pub const fn ipv4(self) -> Option<Ipv4Addr> {
+        self.ipv4
+    }
+
+    /// Return the exact IPv6 endpoint, if managed.
+    #[must_use]
+    pub const fn ipv6(self) -> Option<Ipv6Addr> {
+        self.ipv6
+    }
+
+    /// Return whether the exact address belongs to the set.
+    #[must_use]
+    pub const fn contains(self, address: IpAddr) -> bool {
+        match address {
+            IpAddr::V4(address) => match self.ipv4 {
+                Some(expected) => expected.to_bits() == address.to_bits(),
+                None => false,
+            },
+            IpAddr::V6(address) => match self.ipv6 {
+                Some(expected) => expected.to_bits() == address.to_bits(),
+                None => false,
+            },
+        }
+    }
+}
+
+impl fmt::Debug for GtpuLocalEndpointSet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GtpuLocalEndpointSet")
+            .field("ipv4", &self.ipv4.map(|_| "<redacted>"))
+            .field("ipv6", &self.ipv6.map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+/// Additive device request with exact dual-family endpoint authority.
+///
+/// `device_id` identifies the stable pin namespace and is deliberately
+/// independent of the mutable Linux ifindex. A replacement interface must be
+/// proven and rebound independently before this identity authorizes it.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct CreateGtpDeviceEndpointSetRequest {
+    device: CreateGtpDeviceRequest,
+    device_id: GtpuSessionDeviceId,
+    local_endpoints: GtpuLocalEndpointSet,
+}
+
+impl CreateGtpDeviceEndpointSetRequest {
+    /// Wrap a legacy-compatible device request with explicit endpoint
+    /// authority.
+    ///
+    /// The legacy `bind_address` must remain unspecified. A concrete value
+    /// would create two competing local-address authorities and is rejected.
+    pub fn new(
+        device: CreateGtpDeviceRequest,
+        device_id: GtpuSessionDeviceId,
+        local_endpoints: GtpuLocalEndpointSet,
+    ) -> Result<Self, GtpuSessionModelError> {
+        if !device.bind_address.is_unspecified() {
+            return Err(GtpuSessionModelError::ConflictingLegacyBindAddress);
+        }
+        Ok(Self {
+            device,
+            device_id,
+            local_endpoints,
+        })
+    }
+
+    /// Underlying device policy/name request.
+    #[must_use]
+    pub const fn device(&self) -> &CreateGtpDeviceRequest {
+        &self.device
+    }
+
+    /// Stable managed device/pin-namespace identity.
+    #[must_use]
+    pub const fn device_id(&self) -> GtpuSessionDeviceId {
+        self.device_id
+    }
+
+    /// Exact managed local endpoints.
+    #[must_use]
+    pub const fn local_endpoints(&self) -> GtpuLocalEndpointSet {
+        self.local_endpoints
+    }
+
+    /// Consume the request without discarding stable attachment authority.
+    #[must_use]
+    pub fn into_parts(
+        self,
+    ) -> (
+        CreateGtpDeviceRequest,
+        GtpuSessionDeviceId,
+        GtpuLocalEndpointSet,
+    ) {
+        (self.device, self.device_id, self.local_endpoints)
+    }
+}
+
+impl fmt::Debug for CreateGtpDeviceEndpointSetRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CreateGtpDeviceEndpointSetRequest")
+            .field("device", &self.device)
+            .field("device_id", &self.device_id)
+            .field("local_endpoints", &self.local_endpoints)
+            .finish()
+    }
+}
+
+/// Exact point-in-time attachment selected for grouped capability inspection.
+///
+/// The stable device ID selects one managed pin namespace while `device`
+/// identifies the currently expected name/ifindex binding and
+/// `local_endpoints` supplies the exact endpoint authority that must be
+/// observed. A successful capability query is scoped to this complete value;
+/// it is never a backend-global assertion.
+#[derive(Clone, PartialEq, Eq)]
+pub struct GtpuSessionAttachmentSelector {
+    device_id: GtpuSessionDeviceId,
+    device: GtpDevice,
+    local_endpoints: GtpuLocalEndpointSet,
+}
+
+impl GtpuSessionAttachmentSelector {
+    /// Construct an exact stable-identity/live-attachment selector.
+    ///
+    /// # Errors
+    ///
+    /// An empty interface name or ifindex zero cannot identify a live
+    /// attachment and is rejected.
+    pub fn new(
+        device_id: GtpuSessionDeviceId,
+        device: GtpDevice,
+        local_endpoints: GtpuLocalEndpointSet,
+    ) -> Result<Self, GtpuSessionModelError> {
+        if device.name.is_empty() || device.ifindex == 0 {
+            return Err(GtpuSessionModelError::AttachmentMismatch);
+        }
+        Ok(Self {
+            device_id,
+            device,
+            local_endpoints,
+        })
+    }
+
+    /// Stable managed device/pin-namespace identity.
+    #[must_use]
+    pub const fn device_id(&self) -> GtpuSessionDeviceId {
+        self.device_id
+    }
+
+    /// Exact expected live interface identity.
+    #[must_use]
+    pub const fn device(&self) -> &GtpDevice {
+        &self.device
+    }
+
+    /// Exact currently managed local endpoints.
+    #[must_use]
+    pub const fn local_endpoints(&self) -> GtpuLocalEndpointSet {
+        self.local_endpoints
+    }
+}
+
+impl fmt::Debug for GtpuSessionAttachmentSelector {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GtpuSessionAttachmentSelector")
+            .field("device_id", &self.device_id)
+            .field("device", &"<redacted-interface-identity>")
+            .field("local_endpoints", &self.local_endpoints)
+            .finish()
+    }
+}
+
 /// Exact backend-neutral identity of one authorized downlink GTP-U endpoint.
 ///
 /// The current eBPF adapter constructs this value from the PDP peer address,
@@ -676,6 +956,492 @@ impl fmt::Debug for GtpPdpContext {
             .field("uplink_source_port_policy", &"<redacted>")
             .finish()
     }
+}
+
+fn endpoint_address(address: IpAddr) -> GtpuEndpointAddress {
+    match address {
+        IpAddr::V4(address) => GtpuEndpointAddress::Ipv4(address.octets()),
+        IpAddr::V6(address) => GtpuEndpointAddress::Ipv6(address.octets()),
+    }
+}
+
+/// One canonical inner-family entry in a grouped session.
+///
+/// Construction projects `context.ms_address` to the canonical IPv4 `/32` or
+/// TS 29.274 IPv6 `/64` forwarding address. The owned context therefore never
+/// retains an IPv6 interface identifier that the fixed ABI cannot persist or
+/// reconstruct. Outer addresses remain exact `/32` or `/128`.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct GtpuSessionEntry {
+    context: GtpPdpContext,
+    inner_paa: GtpuSessionPaa,
+    local_outer_address: IpAddr,
+}
+
+impl GtpuSessionEntry {
+    /// Construct one group entry with an exact local outer address.
+    ///
+    /// # Errors
+    ///
+    /// Unspecified addresses, ifindex zero, an unusable PAA prefix, and mixed
+    /// local/peer outer families fail closed.
+    pub fn new(
+        mut context: GtpPdpContext,
+        local_outer_address: IpAddr,
+    ) -> Result<Self, GtpuSessionModelError> {
+        if context.ms_address.is_unspecified()
+            || context.peer_address.is_unspecified()
+            || local_outer_address.is_unspecified()
+            || context.link_ifindex == 0
+        {
+            return Err(GtpuSessionModelError::InvalidContext);
+        }
+        if GtpAddressFamily::from_ip(context.peer_address)
+            != GtpAddressFamily::from_ip(local_outer_address)
+        {
+            return Err(GtpuSessionModelError::OuterFamilyMismatch);
+        }
+        let inner_paa = GtpuSessionPaa::from_full_paa(endpoint_address(context.ms_address))
+            .ok_or(GtpuSessionModelError::InvalidContext)?;
+        if inner_paa.contains(endpoint_address(local_outer_address)) {
+            return Err(GtpuSessionModelError::InnerOuterAlias);
+        }
+        context.ms_address = match inner_paa.canonical_address() {
+            GtpuEndpointAddress::Ipv4(address) => IpAddr::V4(Ipv4Addr::from(address)),
+            GtpuEndpointAddress::Ipv6(address) => IpAddr::V6(Ipv6Addr::from(address)),
+        };
+        Ok(Self {
+            context,
+            inner_paa,
+            local_outer_address,
+        })
+    }
+
+    /// Complete existing PDP-context policy.
+    #[must_use]
+    pub const fn context(&self) -> &GtpPdpContext {
+        &self.context
+    }
+
+    /// Canonical IPv4 `/32` or IPv6 `/64` forwarding identity.
+    #[must_use]
+    pub const fn inner_paa(&self) -> GtpuSessionPaa {
+        self.inner_paa
+    }
+
+    /// Exact managed local outer source/destination address.
+    #[must_use]
+    pub const fn local_outer_address(&self) -> IpAddr {
+        self.local_outer_address
+    }
+
+    /// Inner family slot.
+    #[must_use]
+    pub const fn inner_family(&self) -> GtpAddressFamily {
+        GtpAddressFamily::from_ip(self.context.ms_address)
+    }
+
+    /// Outer transport family.
+    #[must_use]
+    pub const fn outer_family(&self) -> GtpAddressFamily {
+        GtpAddressFamily::from_ip(self.context.peer_address)
+    }
+}
+
+impl fmt::Debug for GtpuSessionEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GtpuSessionEntry")
+            .field("inner_family", &self.inner_family())
+            .field("outer_family", &self.outer_family())
+            .field("attachment_and_routing_identity", &"<redacted>")
+            .finish()
+    }
+}
+
+/// One caller-identified logical session containing one or both inner families.
+///
+/// Entry order is canonicalized to IPv4 then IPv6. Each entry may use an
+/// independent outer family. The same outer-family/local-TEID pair may serve
+/// both slots in this one group because downlink authorization first parses
+/// and exact-checks the inner family and PAA; it may not alias another group.
+#[derive(Clone, PartialEq, Eq)]
+pub struct GtpuSessionGroup {
+    id: GtpuSessionGroupId,
+    device_id: GtpuSessionDeviceId,
+    entries: Vec<GtpuSessionEntry>,
+}
+
+impl GtpuSessionGroup {
+    /// Construct a one- or two-family group.
+    ///
+    /// Group IDs are caller-owned cryptographically unique values and must be
+    /// permanently retired after removal for the stable pin-namespace
+    /// lifetime. They must not be derived from subscriber/TEID selectors.
+    pub fn new(
+        id: GtpuSessionGroupId,
+        device_id: GtpuSessionDeviceId,
+        mut entries: Vec<GtpuSessionEntry>,
+    ) -> Result<Self, GtpuSessionModelError> {
+        if entries.is_empty() {
+            return Err(GtpuSessionModelError::EmptyGroup);
+        }
+        if entries.len() > 2 {
+            return Err(GtpuSessionModelError::TooManyEntries);
+        }
+        entries.sort_by_key(|entry| match entry.inner_family() {
+            GtpAddressFamily::Ipv4 => 0_u8,
+            GtpAddressFamily::Ipv6 => 1,
+        });
+        if entries.len() == 2 && entries[0].inner_family() == entries[1].inner_family() {
+            return Err(GtpuSessionModelError::DuplicateInnerFamily);
+        }
+        let link_ifindex = entries[0].context.link_ifindex;
+        if entries
+            .iter()
+            .any(|entry| entry.context.link_ifindex != link_ifindex)
+        {
+            return Err(GtpuSessionModelError::MixedLinks);
+        }
+        let version = entries[0].context.gtp_version;
+        if entries
+            .iter()
+            .any(|entry| entry.context.gtp_version != version)
+        {
+            return Err(GtpuSessionModelError::MixedVersions);
+        }
+        Ok(Self {
+            id,
+            device_id,
+            entries,
+        })
+    }
+
+    /// Stable caller-owned group identity.
+    #[must_use]
+    pub const fn id(&self) -> GtpuSessionGroupId {
+        self.id
+    }
+
+    /// Stable managed device/pin-namespace identity.
+    #[must_use]
+    pub const fn device_id(&self) -> GtpuSessionDeviceId {
+        self.device_id
+    }
+
+    /// Canonically ordered family entries.
+    #[must_use]
+    pub fn entries(&self) -> &[GtpuSessionEntry] {
+        &self.entries
+    }
+
+    /// Revalidate this graph against exact live attachment authority.
+    ///
+    /// Backends call this on every reconcile, readback, and adoption; success
+    /// during construction is never cached as durable proof.
+    pub fn validate_attachment(
+        &self,
+        expected_device_id: GtpuSessionDeviceId,
+        device: &GtpDevice,
+        local_endpoints: GtpuLocalEndpointSet,
+    ) -> Result<(), GtpuSessionModelError> {
+        if self.device_id != expected_device_id {
+            return Err(GtpuSessionModelError::DeviceIdentityMismatch);
+        }
+        if device.ifindex == 0
+            || self
+                .entries
+                .iter()
+                .any(|entry| entry.context.link_ifindex != device.ifindex)
+        {
+            return Err(GtpuSessionModelError::AttachmentMismatch);
+        }
+        if self
+            .entries
+            .iter()
+            .any(|entry| !local_endpoints.contains(entry.local_outer_address))
+        {
+            return Err(GtpuSessionModelError::LocalEndpointNotManaged);
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for GtpuSessionGroup {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GtpuSessionGroup")
+            .field("id", &self.id)
+            .field("device_id", &self.device_id)
+            .field("entries", &self.entries)
+            .finish()
+    }
+}
+
+/// Exact typed selector for grouped-session readback.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GtpuSessionGroupSelector {
+    id: GtpuSessionGroupId,
+    device_id: GtpuSessionDeviceId,
+}
+
+impl GtpuSessionGroupSelector {
+    /// Construct a selector that cannot silently cross a managed device.
+    #[must_use]
+    pub const fn new(id: GtpuSessionGroupId, device_id: GtpuSessionDeviceId) -> Self {
+        Self { id, device_id }
+    }
+
+    /// Group identity.
+    #[must_use]
+    pub const fn id(self) -> GtpuSessionGroupId {
+        self.id
+    }
+
+    /// Expected managed device identity.
+    #[must_use]
+    pub const fn device_id(self) -> GtpuSessionDeviceId {
+        self.device_id
+    }
+}
+
+impl fmt::Debug for GtpuSessionGroupSelector {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GtpuSessionGroupSelector")
+            .field("id", &self.id)
+            .field("device_id", &self.device_id)
+            .finish()
+    }
+}
+
+/// Caller evidence that makes one retired selector graph safe to reuse.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GtpuSessionSelectorReuseEvidence {
+    /// Every source of packets that could retain the retired index values was
+    /// stopped and completely drained before reuse.
+    TrafficDrained,
+    /// A complete RCU grace period was observed after exact source-group
+    /// removal.
+    RcuGracePeriodElapsed,
+}
+
+/// Explicit attestation for selector/TEID reuse from one exact retired group.
+///
+/// This value carries the complete old semantic graph so a backend can compare
+/// only overlapping selectors and reject invented or cross-device evidence.
+/// It does not authorize direct transfer from a still-live source authority:
+/// exact source removal must already be proven. The one retired graph must
+/// cover every selector newly introduced by the desired reconciliation.
+/// Combining selectors from multiple retired groups is deliberately
+/// fail-closed by the current single-proof API.
+#[derive(Clone, PartialEq, Eq)]
+pub struct GtpuSessionSelectorReuseProof {
+    retired_group: GtpuSessionGroup,
+    evidence: GtpuSessionSelectorReuseEvidence,
+}
+
+impl GtpuSessionSelectorReuseProof {
+    /// Attest that traffic for the exact retired group was fully drained.
+    #[must_use]
+    pub const fn after_traffic_drain(retired_group: GtpuSessionGroup) -> Self {
+        Self {
+            retired_group,
+            evidence: GtpuSessionSelectorReuseEvidence::TrafficDrained,
+        }
+    }
+
+    /// Attest that an RCU grace period completed after exact group removal.
+    #[must_use]
+    pub const fn after_rcu_grace_period(retired_group: GtpuSessionGroup) -> Self {
+        Self {
+            retired_group,
+            evidence: GtpuSessionSelectorReuseEvidence::RcuGracePeriodElapsed,
+        }
+    }
+
+    /// Exact graph whose selectors have been retired.
+    #[must_use]
+    pub const fn retired_group(&self) -> &GtpuSessionGroup {
+        &self.retired_group
+    }
+
+    /// Kind of external completion evidence supplied by the caller.
+    #[must_use]
+    pub const fn evidence(&self) -> GtpuSessionSelectorReuseEvidence {
+        self.evidence
+    }
+}
+
+impl fmt::Debug for GtpuSessionSelectorReuseProof {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GtpuSessionSelectorReuseProof")
+            .field(
+                "retired_group",
+                &GtpuSessionGroupSelector::new(self.retired_group.id, self.retired_group.device_id),
+            )
+            .field("semantic_graph", &"<redacted>")
+            .field("evidence", &self.evidence)
+            .finish()
+    }
+}
+
+/// Provenance of selectors newly introduced by one reconciliation.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GtpuSessionSelectorProvenance {
+    /// The caller's durable registry proves every selector not already owned
+    /// by this same active group has never been published in the stable pin
+    /// namespace.
+    Fresh,
+    /// Reuse after exact removal and explicit drain/grace evidence.
+    ///
+    /// The proof's one retired graph must cover every desired selector not
+    /// retained from the active base generation.
+    Reused(GtpuSessionSelectorReuseProof),
+}
+
+/// Complete request for grouped-session convergence.
+///
+/// Selector provenance is mandatory because the bounded dataplane journal
+/// does not retain permanent selector tombstones. A backend rejects reused or
+/// historically indeterminate selectors as
+/// [`GtpuSessionGroupIndeterminateReason::GraceUnproven`] unless the request
+/// carries exact source-bound completion evidence.
+#[derive(Clone, PartialEq, Eq)]
+pub struct GtpuSessionGroupReconcileRequest {
+    desired: GtpuSessionGroup,
+    selector_provenance: GtpuSessionSelectorProvenance,
+}
+
+impl GtpuSessionGroupReconcileRequest {
+    /// Construct a request with an explicit selector-history claim.
+    ///
+    /// # Errors
+    ///
+    /// Reuse proof for the same group or another device is rejected before a
+    /// backend can inspect or mutate dataplane state.
+    pub fn new(
+        desired: GtpuSessionGroup,
+        selector_provenance: GtpuSessionSelectorProvenance,
+    ) -> Result<Self, GtpuSessionModelError> {
+        if let GtpuSessionSelectorProvenance::Reused(proof) = &selector_provenance {
+            if proof.retired_group.device_id != desired.device_id
+                || proof.retired_group.id == desired.id
+            {
+                return Err(GtpuSessionModelError::ReuseProofMismatch);
+            }
+        }
+        Ok(Self {
+            desired,
+            selector_provenance,
+        })
+    }
+
+    /// Desired canonical semantic graph.
+    #[must_use]
+    pub const fn desired(&self) -> &GtpuSessionGroup {
+        &self.desired
+    }
+
+    /// Explicit freshness or reuse evidence for introduced selectors.
+    #[must_use]
+    pub const fn selector_provenance(&self) -> &GtpuSessionSelectorProvenance {
+        &self.selector_provenance
+    }
+
+    /// Consume the request without discarding mandatory selector provenance.
+    #[must_use]
+    pub fn into_parts(self) -> (GtpuSessionGroup, GtpuSessionSelectorProvenance) {
+        (self.desired, self.selector_provenance)
+    }
+}
+
+impl fmt::Debug for GtpuSessionGroupReconcileRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GtpuSessionGroupReconcileRequest")
+            .field(
+                "desired",
+                &GtpuSessionGroupSelector::new(self.desired.id, self.desired.device_id),
+            )
+            .field("semantic_graph", &"<redacted>")
+            .field("selector_provenance", &self.selector_provenance)
+            .finish()
+    }
+}
+
+/// Stable reason grouped reconciliation could not prove a final state.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GtpuSessionGroupIndeterminateReason {
+    /// A map/index/journal graph is partial, malformed, or transitional.
+    IncompleteState,
+    /// State changed during the bounded observation window.
+    StateChanged,
+    /// Exact map, program, hook, lease, or pin authority was not proven.
+    AuthorityUnavailable,
+    /// Mutation final state could not be confirmed after possible ACK loss.
+    MutationUnconfirmed,
+    /// The durable base/desired journal does not exactly match live state.
+    JournalMismatch,
+    /// Local endpoint-set membership could not be proven.
+    EndpointAuthorityMismatch,
+    /// Stable pin identity and live replacement attachment were not both proven.
+    AttachmentIdentityMismatch,
+    /// The monotonic generation has no successor.
+    GenerationExhausted,
+    /// Selector/TEID reuse lacks a required RCU grace or traffic-drain proof.
+    GraceUnproven,
+}
+
+/// Redaction-safe grouped-session conflict classification.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GtpuSessionGroupConflict {
+    /// The group ID is already bound to another managed device.
+    DeviceAlias,
+    /// The group ID identifies a different valid semantic graph.
+    GroupMismatch,
+    /// A desired selector belongs to another group; cross-group transfer is forbidden.
+    SelectorOwnedByAnotherGroup,
+}
+
+/// Strict grouped-session readback.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GtpuSessionGroupReadback {
+    /// No authority or selector component remains for this never-used ID.
+    Absent,
+    /// One exact Active authority and complete index graph was proven.
+    Active(GtpuSessionGroup),
+    /// Exact completeness/equality could not be proven.
+    Indeterminate(GtpuSessionGroupIndeterminateReason),
+}
+
+/// Classified result of grouped-session convergence.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GtpuSessionGroupReconcileOutcome {
+    /// The desired complete graph became the one Active generation.
+    Activated,
+    /// Exact Active state was already present; this is the only idempotent retry.
+    ExactAlreadyActive,
+    /// Valid state conflicts and was left untouched.
+    Conflict(GtpuSessionGroupConflict),
+    /// Final state or exact authority could not be proven.
+    Indeterminate(GtpuSessionGroupIndeterminateReason),
+}
+
+/// Classified result of exact grouped-session removal.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GtpuSessionGroupRemovalOutcome {
+    /// The exact graph was fenced, selectors removed, and authority deleted last.
+    Removed,
+    /// No component existed for an ID proven never to have been reused.
+    AlreadyAbsent,
+    /// Valid state differs from the exact expected graph and was untouched.
+    Conflict(GtpuSessionGroupConflict),
+    /// Exact ownership or final cleanup could not be proven.
+    Indeterminate(GtpuSessionGroupIndeterminateReason),
 }
 
 /// Uplink selector identity for one PDP context.
@@ -1241,6 +2007,90 @@ pub enum GtpuCapability {
     PermissionDenied,
 }
 
+/// Uplink checksum/offload contract for software outer IPv6 UDP checksums.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum GtpuUplinkChecksumOffloadContract {
+    /// The runtime has not independently qualified checksum handling.
+    #[default]
+    Unknown,
+    /// Only fully materialized, non-GSO inner packets are admitted.
+    ///
+    /// Before room adjustment, tc rejects `gso_size != 0`. It then performs a
+    /// reversible non-pseudo `bpf_l4_csum_replace` probe on one safe even
+    /// 16-bit word: the first update must visibly change the word, the reverse
+    /// update must restore the exact snapshot, and every helper/reload failure
+    /// drops. Linux leaves the target unchanged for `CHECKSUM_PARTIAL`, so that
+    /// state is rejected without parsing an inner transport header. Only after
+    /// this proof may software compute outer IPv6 UDP checksum over materialized
+    /// bytes. This contract does not claim GSO or checksum-offload support.
+    MaterializedOnly,
+    /// This backend cannot execute a correct outer IPv6 UDP checksum contract.
+    Unsupported,
+}
+
+/// Additive address-family and atomic-group capability report.
+///
+/// This report is separate from [`GtpuProbe`] so existing public probe literals
+/// remain source compatible. `grouped_atomic_reconciliation` is Available only
+/// after exact v6 schema/map IDs and normal HASH map types, exact program hooks,
+/// canonical endpoint configuration, and the exclusive namespace lease have
+/// all been proven. Ordinary Linux generic-netlink GTP remains Missing: its
+/// multi-command updates have no external atomic activation gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GtpuIpFamilyCapabilities {
+    /// Grouped inner IPv4 `/32` forwarding.
+    pub inner_ipv4: GtpuCapability,
+    /// Grouped inner IPv6 TS 29.274 `/64` forwarding.
+    pub inner_ipv6: GtpuCapability,
+    /// Exact outer IPv4 GTP-U transport.
+    pub outer_ipv4: GtpuCapability,
+    /// Exact outer IPv6 GTP-U transport.
+    pub outer_ipv6: GtpuCapability,
+    /// One-generation activation for one- or two-family session groups.
+    pub grouped_atomic_reconciliation: GtpuCapability,
+    /// Managed one- or two-family local endpoint sets.
+    pub local_endpoint_sets: GtpuCapability,
+    /// Mandatory outer IPv6 UDP checksum generation/verification.
+    pub ipv6_udp_checksum: GtpuCapability,
+    /// Exact offload/materialization invariant used for uplink checksums.
+    pub uplink_checksum_offload: GtpuUplinkChecksumOffloadContract,
+    /// Demonstrated fragmented outer IPv4 downlink contract for this exact
+    /// grouped attachment.
+    ///
+    /// This is intentionally separate from the legacy backend-global
+    /// [`GtpuProbe::downlink_outer_fragment_handling`] field. A grouped
+    /// attachment must not inherit the legacy IPv4 reassembly-consumer claim:
+    /// that consumer authorizes only the frozen single-context map graph.
+    pub downlink_outer_ipv4_fragment_handling: GtpuDownlinkFragmentContract,
+    /// Demonstrated fragmented outer IPv6 downlink contract.
+    ///
+    /// This is independent of [`Self::outer_ipv6`]: a backend may support
+    /// complete, unfragmented IPv6 GTP-U transport while lacking an IPv6
+    /// reassembly consumer and must then report `Unsupported`.
+    pub downlink_outer_ipv6_fragment_handling: GtpuDownlinkFragmentContract,
+}
+
+impl GtpuIpFamilyCapabilities {
+    /// Explicit unsupported defaults for backends that have not implemented
+    /// and independently qualified the additive grouped contract.
+    #[must_use]
+    pub const fn unsupported() -> Self {
+        Self {
+            inner_ipv4: GtpuCapability::Missing,
+            inner_ipv6: GtpuCapability::Missing,
+            outer_ipv4: GtpuCapability::Missing,
+            outer_ipv6: GtpuCapability::Missing,
+            grouped_atomic_reconciliation: GtpuCapability::Missing,
+            local_endpoint_sets: GtpuCapability::Missing,
+            ipv6_udp_checksum: GtpuCapability::Missing,
+            uplink_checksum_offload: GtpuUplinkChecksumOffloadContract::Unsupported,
+            downlink_outer_ipv4_fragment_handling: GtpuDownlinkFragmentContract::Unsupported,
+            downlink_outer_ipv6_fragment_handling: GtpuDownlinkFragmentContract::Unsupported,
+        }
+    }
+}
+
 /// Capability and health probe for a GTP-U backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct GtpuProbe {
@@ -1282,8 +2132,8 @@ pub struct GtpuProbe {
     /// `RequireOuterFragmentation` policy is rejected because tc redirect
     /// cannot execute the required fragmentation.
     pub uplink_pmtu_enforcement: GtpuCapability,
-    /// The backend's demonstrated contract for fragmented outer downlink
-    /// packets: a bounded kernel-reassembly handoff whose reassembled
+    /// The backend's demonstrated contract for fragmented outer IPv4
+    /// downlink packets: a bounded kernel-reassembly handoff whose reassembled
     /// datagrams re-enter the SDK GTP-U consumer exactly once, or an
     /// explicit unsupported statement. The handoff contract is
     /// handoff-capable only: it is complete only while the operator runs an
@@ -1631,5 +2481,264 @@ mod tests {
         assert!(!debug.contains("tenant-sensitive-pin"));
         assert!(!debug.contains("tenant-sensitive-interface"));
         assert!(!debug.contains("41"));
+    }
+
+    #[test]
+    fn grouped_endpoint_set_is_exact_canonical_and_redacted() {
+        let ipv4 = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        let ipv6 = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 2, 0, 0, 0, 0, 1));
+        let endpoints = GtpuLocalEndpointSet::new(ipv6, Some(ipv4)).unwrap();
+        assert!(endpoints.contains(ipv4));
+        assert!(endpoints.contains(ipv6));
+        assert!(!endpoints.contains(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2))));
+        assert_eq!(
+            GtpuLocalEndpointSet::new(ipv4, Some(IpAddr::V4(Ipv4Addr::LOCALHOST))),
+            Err(GtpuSessionModelError::DuplicateEndpointFamily)
+        );
+        assert_eq!(
+            GtpuLocalEndpointSet::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), None),
+            Err(GtpuSessionModelError::UnspecifiedAddress)
+        );
+
+        let device_id = GtpuSessionDeviceId::new([2; 16]).unwrap();
+        let request = CreateGtpDeviceEndpointSetRequest::new(
+            CreateGtpDeviceRequest::new("gtp0"),
+            device_id,
+            endpoints,
+        )
+        .unwrap();
+        assert_eq!(request.device_id(), device_id);
+        assert_eq!(request.local_endpoints(), endpoints);
+        let (round_trip_device, round_trip_device_id, round_trip_endpoints) =
+            request.clone().into_parts();
+        assert_eq!(&round_trip_device, request.device());
+        assert_eq!(round_trip_device_id, device_id);
+        assert_eq!(round_trip_endpoints, endpoints);
+        let mut conflicting = CreateGtpDeviceRequest::new("gtp0");
+        conflicting.bind_address = ipv4;
+        assert_eq!(
+            CreateGtpDeviceEndpointSetRequest::new(conflicting, device_id, endpoints),
+            Err(GtpuSessionModelError::ConflictingLegacyBindAddress)
+        );
+        let attachment = GtpuSessionAttachmentSelector::new(
+            device_id,
+            GtpDevice {
+                name: "tenant-sensitive-interface".to_string(),
+                ifindex: 41,
+            },
+            endpoints,
+        )
+        .unwrap();
+        assert_eq!(attachment.device_id(), device_id);
+        assert_eq!(attachment.device().ifindex, 41);
+        assert_eq!(attachment.local_endpoints(), endpoints);
+        assert_eq!(
+            GtpuSessionAttachmentSelector::new(
+                device_id,
+                GtpDevice {
+                    name: "gtp0".to_string(),
+                    ifindex: 0,
+                },
+                endpoints,
+            ),
+            Err(GtpuSessionModelError::AttachmentMismatch)
+        );
+        let debug = format!(
+            "{request:?} {endpoints:?} {attachment:?} \
+             {round_trip_device:?} {round_trip_device_id:?} {round_trip_endpoints:?}"
+        );
+        for secret in [
+            "192.0.2.1",
+            "2001:db8",
+            "[2, 2",
+            "tenant-sensitive-interface",
+            "41",
+        ] {
+            assert!(!debug.contains(secret));
+        }
+    }
+
+    #[test]
+    fn grouped_session_normalizes_ipv6_paa_and_revalidates_attachment() {
+        let ipv4_local = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        let ipv6_local = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 2, 0, 0, 0, 0, 1));
+        let ipv4_entry = GtpuSessionEntry::new(reconciliation_context(), ipv4_local).unwrap();
+        let mut ipv6_context = reconciliation_context();
+        ipv6_context.local_teid = Teid::new(0x1234_5679).unwrap();
+        ipv6_context.peer_teid = Teid::new(0x8765_4322).unwrap();
+        ipv6_context.ms_address = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 1, 0, 0, 0, 0, 0xbeef));
+        ipv6_context.peer_address = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 3, 0, 0, 0, 0, 10));
+        let mut same_prefix_context = ipv6_context.clone();
+        same_prefix_context.ms_address = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 1, 0, 0, 0, 0, 7));
+        let ipv6_entry = GtpuSessionEntry::new(ipv6_context, ipv6_local).unwrap();
+        let same_prefix_entry = GtpuSessionEntry::new(same_prefix_context, ipv6_local).unwrap();
+        assert_eq!(
+            ipv6_entry.context().ms_address,
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 1, 0, 0, 0, 0, 0))
+        );
+        assert_eq!(
+            ipv6_entry, same_prefix_entry,
+            "equality must contain only state reconstructible from the /64 ABI"
+        );
+        assert!(ipv6_entry.inner_paa().contains(GtpuEndpointAddress::Ipv6(
+            Ipv6Addr::new(0x2001, 0xdb8, 1, 0, 0, 0, 0, 7).octets()
+        )));
+        assert!(!ipv6_entry.inner_paa().contains(GtpuEndpointAddress::Ipv6(
+            Ipv6Addr::new(0x2001, 0xdb8, 1, 1, 0, 0, 0, 7).octets()
+        )));
+
+        let group_id = GtpuSessionGroupId::new([1; 16]).unwrap();
+        let device_id = GtpuSessionDeviceId::new([2; 16]).unwrap();
+        let group = GtpuSessionGroup::new(
+            group_id,
+            device_id,
+            vec![ipv6_entry.clone(), ipv4_entry.clone()],
+        )
+        .unwrap();
+        assert_eq!(group.entries()[0].inner_family(), GtpAddressFamily::Ipv4);
+        assert_eq!(group.entries()[1].inner_family(), GtpAddressFamily::Ipv6);
+        assert_eq!(
+            GtpuSessionGroup::new(
+                group_id,
+                device_id,
+                vec![ipv4_entry.clone(), ipv4_entry.clone()]
+            ),
+            Err(GtpuSessionModelError::DuplicateInnerFamily)
+        );
+
+        let device = GtpDevice {
+            name: "gtp0".to_string(),
+            ifindex: 7,
+        };
+        let endpoints = GtpuLocalEndpointSet::new(ipv4_local, Some(ipv6_local)).unwrap();
+        assert_eq!(
+            group.validate_attachment(device_id, &device, endpoints),
+            Ok(())
+        );
+        assert_eq!(
+            group.validate_attachment(
+                GtpuSessionDeviceId::new([3; 16]).unwrap(),
+                &device,
+                endpoints
+            ),
+            Err(GtpuSessionModelError::DeviceIdentityMismatch)
+        );
+        let wrong_endpoints =
+            GtpuLocalEndpointSet::new(ipv4_local, Some(IpAddr::V6(Ipv6Addr::LOCALHOST))).unwrap();
+        assert_eq!(
+            group.validate_attachment(device_id, &device, wrong_endpoints),
+            Err(GtpuSessionModelError::LocalEndpointNotManaged)
+        );
+        let replacement = GtpDevice {
+            name: "gtp0".to_string(),
+            ifindex: 8,
+        };
+        assert_eq!(
+            group.validate_attachment(device_id, &replacement, endpoints),
+            Err(GtpuSessionModelError::AttachmentMismatch)
+        );
+
+        let debug = format!("{group:?}");
+        for secret in ["10.23.0.2", "2001:db8", "12345678", "[1, 1", "[2, 2"] {
+            assert!(!debug.contains(secret));
+        }
+
+        let desired = GtpuSessionGroup::new(
+            GtpuSessionGroupId::new([3; 16]).unwrap(),
+            device_id,
+            group.entries().to_vec(),
+        )
+        .unwrap();
+        let reuse_proof = GtpuSessionSelectorReuseProof::after_rcu_grace_period(group.clone());
+        let reconcile = GtpuSessionGroupReconcileRequest::new(
+            desired.clone(),
+            GtpuSessionSelectorProvenance::Reused(reuse_proof),
+        )
+        .unwrap();
+        assert_eq!(reconcile.desired(), &desired);
+        assert!(matches!(
+            reconcile.selector_provenance(),
+            GtpuSessionSelectorProvenance::Reused(proof)
+                if proof.retired_group() == &group
+                    && proof.evidence()
+                        == GtpuSessionSelectorReuseEvidence::RcuGracePeriodElapsed
+        ));
+        let (round_trip_desired, round_trip_provenance) = reconcile.clone().into_parts();
+        assert_eq!(round_trip_desired, desired);
+        assert_eq!(
+            round_trip_provenance,
+            reconcile.selector_provenance().clone()
+        );
+        let parts_debug = format!("{round_trip_desired:?} {round_trip_provenance:?}");
+        for secret in ["10.23.0.2", "2001:db8", "gtp0", "ifindex", "[1, 1"] {
+            assert!(!parts_debug.contains(secret));
+        }
+        let same_group_proof = GtpuSessionSelectorReuseProof::after_traffic_drain(desired.clone());
+        assert_eq!(
+            GtpuSessionGroupReconcileRequest::new(
+                desired.clone(),
+                GtpuSessionSelectorProvenance::Reused(same_group_proof),
+            ),
+            Err(GtpuSessionModelError::ReuseProofMismatch)
+        );
+        let other_device_source = GtpuSessionGroup::new(
+            GtpuSessionGroupId::new([4; 16]).unwrap(),
+            GtpuSessionDeviceId::new([9; 16]).unwrap(),
+            group.entries().to_vec(),
+        )
+        .unwrap();
+        assert_eq!(
+            GtpuSessionGroupReconcileRequest::new(
+                desired,
+                GtpuSessionSelectorProvenance::Reused(
+                    GtpuSessionSelectorReuseProof::after_traffic_drain(other_device_source,),
+                ),
+            ),
+            Err(GtpuSessionModelError::ReuseProofMismatch)
+        );
+        let debug = format!("{reconcile:?}");
+        for secret in ["10.23.0.2", "2001:db8", "gtp0", "ifindex", "[1, 1"] {
+            assert!(!debug.contains(secret));
+        }
+    }
+
+    #[test]
+    fn grouped_entry_rejects_outer_mismatch_and_inner_outer_alias() {
+        let mut mismatch = reconciliation_context();
+        mismatch.peer_address = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 3, 0, 0, 0, 0, 10));
+        assert_eq!(
+            GtpuSessionEntry::new(mismatch, IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))),
+            Err(GtpuSessionModelError::OuterFamilyMismatch)
+        );
+
+        let mut alias = reconciliation_context();
+        alias.peer_address = IpAddr::V4(Ipv4Addr::new(10, 23, 0, 3));
+        assert_eq!(
+            GtpuSessionEntry::new(alias, IpAddr::V4(Ipv4Addr::new(10, 23, 0, 2))),
+            Err(GtpuSessionModelError::InnerOuterAlias)
+        );
+    }
+
+    #[test]
+    fn unqualified_grouped_capabilities_are_explicitly_unsupported() {
+        let capabilities = GtpuIpFamilyCapabilities::unsupported();
+        assert_eq!(
+            capabilities.grouped_atomic_reconciliation,
+            GtpuCapability::Missing
+        );
+        assert_eq!(capabilities.inner_ipv6, GtpuCapability::Missing);
+        assert_eq!(capabilities.outer_ipv6, GtpuCapability::Missing);
+        assert_eq!(
+            capabilities.uplink_checksum_offload,
+            GtpuUplinkChecksumOffloadContract::Unsupported
+        );
+        assert_eq!(
+            capabilities.downlink_outer_ipv4_fragment_handling,
+            GtpuDownlinkFragmentContract::Unsupported
+        );
+        assert_eq!(
+            capabilities.downlink_outer_ipv6_fragment_handling,
+            GtpuDownlinkFragmentContract::Unsupported
+        );
     }
 }

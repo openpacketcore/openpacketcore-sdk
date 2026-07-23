@@ -8,6 +8,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Production dual-stack GTP-U eBPF sessions — `opc-gtpu-dataplane` /
+  `opc-gtpu-ebpf-common` / `opc-gtpu-dataplane-ebpf`:** adds an
+  attachment-scoped grouped-session ABI and loader with stable device
+  identities, exact IPv4/IPv6 endpoint sets, independent inner/outer address
+  families, simultaneous IPv4v6 entries, generation-fenced selector indexes,
+  and a durable in-flight journal for exact create/update/remove recovery.
+  The tc classifiers retain one selector snapshot and validate one whole-value
+  authority generation before forwarding, while a true index miss alone may
+  use the frozen IPv4 v5 maps. Uplink supports IPv4 or IPv6 encapsulation with
+  family-aware 36/56-byte MTU accounting; IPv6 requires fully materialized
+  non-GSO bytes and a mandatory software UDP checksum. Downlink validates
+  crossed-family packets and a bounded RFC 8200 extension-header contract,
+  including atomic fragments. The frozen v5 IPv4 path retains its qualified
+  kernel reassembly handoff, but grouped outer-IPv4 and outer-IPv6 fragment
+  handling are reported independently as unsupported because the current
+  consumer cannot authorize grouped state. Per-attachment capability evidence
+  requires exact live schema/config/map/program/lease identity. Selector reuse
+  requires one exactly removed source plus drain-or-RCU-grace proof covering
+  every introduced selector, map capacity is documented, and all diagnostics
+  remain value-redacted. The generic Linux `gtp` backend does not claim atomic
+  grouped parity (#344).
 - **BREAKING — Typed P-CSCF reselection-capability relay — `opc-proto-ikev2` /
   `opc-proto-gtpv2c`:** adds strict build/decode support for the TS 24.302
   `P_CSCF_RESELECTION_SUPPORT` Notify (41304) and explicit encoding of the
