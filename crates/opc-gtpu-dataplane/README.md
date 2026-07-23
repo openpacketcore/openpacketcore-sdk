@@ -701,7 +701,7 @@ removed, the eBPF backend:
 - acquires a nonblocking exclusive `flock` on a permanent control-directory
   inode keyed only by the validated pin namespace below the canonical shared
   bpffs root;
-- validates the canonical graph directory and the exact current 15-map names,
+- validates the canonical graph directory and the exact current 21-map names,
   ABIs, schema markers, configuration, PMTU state, and kernel map IDs;
 - loads the committed current classifier artifacts against those exact maps
   only after the read-only inventory succeeds, derives their exact program
@@ -764,7 +764,7 @@ loop {
 ```
 
 The first authorized mutation publishes a checksummed proof map bound to the
-namespace hash, canonical graph device/inode, all 15 exact map IDs, populated
+namespace hash, canonical graph device/inode, all 21 exact map IDs, populated
 state authorization, and the proof map's own kernel ID. Normal create/adopt
 fences on that reserved proof. Every surviving map and the proof remain open by
 FD during cleanup. An ordinary unlink or final directory-removal failure

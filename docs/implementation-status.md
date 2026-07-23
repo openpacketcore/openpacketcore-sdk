@@ -692,7 +692,7 @@ both namespaces.
 
 The implementation requires an explicit previous-writer-stopped attestation.
 Populated forwarding state additionally requires a separate sessions-and-
-traffic-drained attestation. Before proof publication it validates the exact 15
+traffic-drained attestation. Before proof publication it validates the exact 21
 current map names, ABIs, schema marker, configuration, PMTU state, and IDs,
 loads and identifies both committed current classifier artifacts against those
 maps, drops those temporary programs, then completely enumerates loaded BPF
