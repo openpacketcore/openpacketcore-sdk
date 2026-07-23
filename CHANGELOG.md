@@ -33,6 +33,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   arms for `SignatureHashAuthorityMissing` and
   `SignatureHashNotAuthorized`, and
   `SignatureHashAuthorityExchangeMismatch`.
+- **Procedure-aware NGAP protocol-IE policy — `opc-proto-ngap`:** every
+  currently typed Release-18 procedure/outcome now applies its known IE,
+  expected-criticality, and cardinality metadata to `DecodeContext`
+  unknown/duplicate policies. Typed container counts are bounded from the
+  aligned-PER prefix before materialization. `Drop`, `First`, and `Last`
+  filter only the typed view; raw-preserving encode intentionally retains the
+  immutable received PDU (#493).
 - **Unknown-IE policy enforcement — `opc-proto-gtpv2c` /
   `opc-proto-pfcp`:** typed top-level and grouped IE sequence decoders now
   implement distinct `Drop`, `Preserve`, and `Reject` outcomes. Raw message

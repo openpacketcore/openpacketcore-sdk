@@ -9,12 +9,14 @@ surface built on `rasn`. The current scope is the v1 subset documented in
 `CONFORMANCE.md`.
 
 It is not a full NGAP implementation and does not provide SCTP transport, AMF
-or gNB procedure state, NAS handling, or semantic validation of NGAP IE values.
+or gNB procedure state, NAS handling, or semantic validation of NGAP IE
+contents. The typed boundary does validate top-level identifiers, criticality,
+cardinality, and configured decode policies.
 
 ## API Shape
 
-- `Pdu` stores the decoded PDU kind plus the raw bytes needed for byte-exact
-  re-encode.
+- `Pdu` stores the policy-filtered decoded PDU kind plus the immutable raw bytes
+  needed for byte-exact re-encode.
 - `PduKind` distinguishes initiating, successful, and unsuccessful NGAP-PDU
   wrappers and exposes procedure code and criticality.
 - `Message` is the supported typed message-body subset with `Unknown(Bytes)`
@@ -24,6 +26,45 @@ or gNB procedure state, NAS handling, or semantic validation of NGAP IE values.
 - `decode` and `Pdu::decode` parse one APER PDU. `Pdu::decode_owned` rejects
   trailing bytes after a complete PDU.
 - `encode` and the `Encode` implementation support raw-preserving output only.
+
+## Typed IE policy boundary
+
+Each currently typed procedure/outcome has Release-18 metadata for its known
+top-level protocol-IE identifiers, required wire criticality, and
+singleton/repeatable cardinality. Before `rasn` materializes a typed
+`ProtocolIE-Container`, the decoder reads its exact aligned-PER 16-bit count,
+applies `DecodeContext::max_ies`, and rejects a count that cannot fit in the
+available message bytes.
+
+The remaining `DecodeContext` policies apply as follows:
+
+- `UnknownIePolicy::Preserve` retains an unknown entry and its opaque raw value
+  in the typed generated container.
+- `UnknownIePolicy::Drop` removes unknown entries from the typed container.
+- `UnknownIePolicy::Reject` rejects every unknown entry. A `reject`-criticality
+  entry uses the stable `UnknownCriticalIe` code; `ignore` and `notify` use a
+  value-free structural error.
+- Strict and procedure-aware validation always reject an unknown
+  `reject`-criticality IE, including when the selected unknown policy is
+  `Preserve` or `Drop`. Structural validation leaves that choice to the
+  unknown-IE policy.
+- `DuplicateIePolicy::{First,Last,Reject}` acts on singleton identifiers.
+  Repeatable identifiers retain every occurrence. All top-level IEs in the
+  current typed subset are singleton; list-valued IEs carry repetition inside
+  their value.
+- Known identifiers must carry their TS 38.413 criticality. A mismatch fails
+  with a stable, value-free structural error.
+
+Filtering changes only the typed view. `Pdu::raw` is never rewritten, and the
+only supported encoder is raw-preserving. Consequently, encoding a PDU decoded
+with `Drop`, `First`, or `Last` emits the original wire entries, not a
+sanitized reconstruction. A consumer that needs a sanitized canonical message
+must wait for or provide a canonical typed encoder; it must not treat
+raw-preserving encode as typed-view serialization.
+
+`Debug` for `Pdu`, `PduKind`, and `Message` reports only outcome/procedure
+metadata, lengths, variant names, and IE counts. It never renders raw PDU
+bytes, opaque IE values, or embedded NAS payloads.
 
 ## Usage
 

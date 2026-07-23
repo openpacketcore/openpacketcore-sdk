@@ -32,6 +32,38 @@ on an initiating message, NGSetupResponse on a successful outcome, and
 NGSetupFailure on an unsuccessful outcome. The same outcome-aware rule is
 applied to the first-CNF N2 subset above.
 
+## Protocol-IE policy and cardinality
+
+The wrapper carries procedure/outcome-specific metadata transcribed from the
+pinned TS 38.413 Release-18 ASN.1 object sets for every typed row above:
+recognized top-level IE identifiers, expected criticality, and
+singleton/repeatable cardinality.
+
+- Known identifiers are accepted only with their specified criticality.
+- `UnknownIePolicy::Preserve` retains the generated entry and opaque open-type
+  value; `Drop` removes it from the typed container; and `Reject` returns a
+  stable value-free decode error.
+- An unknown IE carrying `criticality=reject` returns
+  `DecodeErrorCode::UnknownCriticalIe` under `Reject`, `Strict`, or
+  `ProcedureAware`. Structural validation with `Preserve` or `Drop` remains the
+  explicit compatibility path for such an entry.
+- `DuplicateIePolicy::First` and `Last` select deterministically in original
+  wire order, while `Reject` returns `DecodeErrorCode::DuplicateIe`.
+  Repeatable metadata exempts legal repetition. The current typed Release-18
+  top-level object sets contain only singleton identifiers; list-valued IEs
+  encode their repetition inside one IE value.
+- Presence and conditional-presence rules, and semantic validation inside each
+  opaque IE value, remain outside this framing subset.
+
+These policies filter the typed generated container, not the preserved wire
+image. `Pdu::raw` remains the immutable received bytes. Raw-preserving encode
+therefore reproduces unknown or duplicate entries removed by `Drop`, `First`,
+or `Last`; it is not a sanitized typed-view encoder.
+
+Public `Debug` output for the wrapper and message enums is redacted to
+procedure/outcome metadata, lengths, variant names, and IE counts. It does not
+render `Pdu::raw`, opaque IE values, or NAS payload bytes.
+
 ## Encoding mode
 
 - **Raw-preserving**: byte-exact `decode → encode` is proven for every
@@ -57,8 +89,11 @@ applied to the first-CNF N2 subset above.
 
 ## Robustness & Fuzzing
 
-The decode path carries no `unsafe`, uses checked length arithmetic, and never
-preallocates from a wire-declared length. Three layers guard it:
+The decode path carries no `unsafe` and uses checked length arithmetic. For
+typed procedures it parses the exact aligned-PER container prefix before
+`rasn`: the fixed-width 16-bit `ProtocolIE-Container` count must satisfy
+`DecodeContext::max_ies` and the minimum physical bytes required by that many
+entries before `SequenceOf` materialization. Three additional layers guard it:
 
 - **Per-PR regression guard** — `tests/corpus_replay.rs` replays every committed
   corpus entry, byte-truncations of each, and hostile constant inputs through
@@ -76,4 +111,5 @@ preallocates from a wire-declared length. Three layers guard it:
 - Typed decode of procedures outside the first-CNF N2 subset above; preserved
   raw as `Message::Unknown`.
 - UPER encoding.
-- Semantic validation of IE values beyond structural decode.
+- Semantic validation of IE contents or mandatory/conditional presence beyond
+  the top-level identifier, criticality, and cardinality contract above.

@@ -12,9 +12,20 @@
 //! `rasn` 0.28 that prevents canonical typed encoding from meeting ADR 0015
 //! byte-exact requirements.
 //!
+//! For every typed procedure/outcome, decoding applies the caller's
+//! [`DecodeContext`] to the inner `ProtocolIE-Container`: the element count is
+//! bounded before `rasn` materializes it, known IE identifiers and criticality
+//! are checked against the pinned Release-18 object set, and unknown/duplicate
+//! entries follow the selected policies. `Drop`, `First`, and `Last` affect the
+//! typed message view only. [`Pdu::raw`] remains the immutable received PDU, so
+//! raw-preserving [`encode`] deliberately reproduces entries filtered from the
+//! typed view.
+//!
 //! @spec 3GPP TS38413 R18
 //! @req REQ-3GPP-TS38413-R18-001
 //! @conformance v1-subset — see CONFORMANCE.md
+
+use std::fmt;
 
 use bytes::{Bytes, BytesMut};
 use opc_protocol::{
@@ -23,6 +34,7 @@ use opc_protocol::{
 };
 
 mod generated;
+mod policy;
 
 pub use generated::ngap_common_data_types::{Criticality, ProcedureCode};
 
@@ -42,8 +54,12 @@ pub mod messages {
     };
 }
 
-/// A decoded NGAP PDU with raw-preserving re-encode support.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A decoded NGAP PDU with a policy-filtered typed view and raw re-encode.
+///
+/// [`Self::raw`] always contains the immutable received PDU. When decoding with
+/// [`UnknownIePolicy::Drop`] or a duplicate policy that selects one occurrence,
+/// the typed [`Self::kind`] may omit entries that remain present in `raw`.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Pdu {
     /// Original PDU bytes, preserved for byte-exact re-emission.
     pub raw: Bytes,
@@ -52,7 +68,7 @@ pub struct Pdu {
 }
 
 /// NGAP PDU outcome kind and decoded message body.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum PduKind {
     /// Initiating message.
     Initiating {
@@ -89,7 +105,7 @@ pub enum PduKind {
 /// structural typed-dispatch coverage only. Unsupported procedure/outcome
 /// combinations are surfaced as [`Message::Unknown`] with body bytes preserved
 /// raw.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Message {
     /// NG Setup Request (initiating message, procedure code 21).
     NgSetupRequest(messages::NGSetupRequest),
@@ -127,6 +143,107 @@ pub enum Message {
     Unknown(Bytes),
 }
 
+impl fmt::Debug for Pdu {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Pdu")
+            .field("raw_len", &self.raw.len())
+            .field("kind", &self.kind)
+            .finish()
+    }
+}
+
+impl fmt::Debug for PduKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Initiating {
+                procedure_code,
+                criticality,
+                message,
+            } => formatter
+                .debug_struct("Initiating")
+                .field("procedure_code", procedure_code)
+                .field("criticality", criticality)
+                .field("message", message)
+                .finish(),
+            Self::Successful {
+                procedure_code,
+                criticality,
+                message,
+            } => formatter
+                .debug_struct("Successful")
+                .field("procedure_code", procedure_code)
+                .field("criticality", criticality)
+                .field("message", message)
+                .finish(),
+            Self::Unsuccessful {
+                procedure_code,
+                criticality,
+                message,
+            } => formatter
+                .debug_struct("Unsuccessful")
+                .field("procedure_code", procedure_code)
+                .field("criticality", criticality)
+                .field("message", message)
+                .finish(),
+        }
+    }
+}
+
+impl fmt::Debug for Message {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        macro_rules! typed {
+            ($name:literal, $message:expr) => {
+                formatter
+                    .debug_struct($name)
+                    .field("ie_count", &$message.protocol_ies.0.len())
+                    .finish()
+            };
+        }
+
+        match self {
+            Self::NgSetupRequest(message) => typed!("NgSetupRequest", message),
+            Self::NgSetupResponse(message) => typed!("NgSetupResponse", message),
+            Self::NgSetupFailure(message) => typed!("NgSetupFailure", message),
+            Self::InitialUeMessage(message) => typed!("InitialUeMessage", message),
+            Self::DownlinkNasTransport(message) => typed!("DownlinkNasTransport", message),
+            Self::UplinkNasTransport(message) => typed!("UplinkNasTransport", message),
+            Self::InitialContextSetupRequest(message) => {
+                typed!("InitialContextSetupRequest", message)
+            }
+            Self::InitialContextSetupResponse(message) => {
+                typed!("InitialContextSetupResponse", message)
+            }
+            Self::InitialContextSetupFailure(message) => {
+                typed!("InitialContextSetupFailure", message)
+            }
+            Self::PduSessionResourceSetupRequest(message) => {
+                typed!("PduSessionResourceSetupRequest", message)
+            }
+            Self::PduSessionResourceSetupResponse(message) => {
+                typed!("PduSessionResourceSetupResponse", message)
+            }
+            Self::PduSessionResourceReleaseCommand(message) => {
+                typed!("PduSessionResourceReleaseCommand", message)
+            }
+            Self::PduSessionResourceReleaseResponse(message) => {
+                typed!("PduSessionResourceReleaseResponse", message)
+            }
+            Self::UeContextReleaseCommand(message) => {
+                typed!("UeContextReleaseCommand", message)
+            }
+            Self::UeContextReleaseComplete(message) => {
+                typed!("UeContextReleaseComplete", message)
+            }
+            Self::Paging(message) => typed!("Paging", message),
+            Self::Unknown(body) => formatter
+                .debug_struct("Unknown")
+                .field("body_len", &body.len())
+                .finish(),
+        }
+    }
+}
+
 const PROCEDURE_CODE_NG_SETUP: u8 = 21;
 const PROCEDURE_CODE_INITIAL_UE: u8 = 15;
 const PROCEDURE_CODE_DOWNLINK_NAS_TRANSPORT: u8 = 4;
@@ -154,6 +271,12 @@ fn enforce_depth(required: usize, ctx: DecodeContext) -> Result<(), DecodeError>
 }
 
 /// Decode an NGAP PDU from a byte slice.
+///
+/// Typed procedure bodies enforce the configured unknown-IE, duplicate-IE,
+/// depth, message-length, and pre-materialization IE-count policies. Known
+/// protocol IEs must carry the criticality assigned by TS 38.413. Unknown IEs
+/// with `reject` criticality fail in strict/procedure-aware contexts even when
+/// the unknown-IE policy would otherwise preserve or drop them.
 ///
 /// @spec 3GPP TS38413 R18 9.1
 /// @req REQ-3GPP-TS38413-R18-9.1-001
@@ -252,106 +375,139 @@ fn decode_message(
     }
 
     macro_rules! decode_as {
-        ($ty:ty, $variant:ident, $reason:literal) => {{
+        ($ty:ty, $variant:ident, $reason:literal, $profile:expr, $id_of:expr) => {{
             enforce_depth(NGAP_TYPED_MESSAGE_DEPTH, ctx)?;
-            let msg: $ty = rasn::aper::decode(value).map_err(|_| {
+            let declared_count = policy::preflight_ie_count(value, ctx, $reason)?;
+            let mut msg: $ty = rasn::aper::decode(value).map_err(|_| {
                 DecodeError::new(DecodeErrorCode::Structural { reason: $reason }, 0)
             })?;
-            enforce_ie_count(msg.protocol_ies.0.len(), ctx)?;
+            policy::apply_ie_policy(
+                &mut msg.protocol_ies.0,
+                declared_count,
+                $profile,
+                ctx,
+                $id_of,
+                |ie| ie.criticality as u8,
+            )?;
             Ok(Message::$variant(msg))
         }};
     }
 
     match (outcome, procedure_code) {
-        (Outcome::Initiating, PROCEDURE_CODE_NG_SETUP) => {
-            decode_as!(messages::NGSetupRequest, NgSetupRequest, "ngsetup request")
-        }
-        (Outcome::Successful, PROCEDURE_CODE_NG_SETUP) => {
-            decode_as!(
-                messages::NGSetupResponse,
-                NgSetupResponse,
-                "ngsetup response"
-            )
-        }
-        (Outcome::Unsuccessful, PROCEDURE_CODE_NG_SETUP) => {
-            decode_as!(messages::NGSetupFailure, NgSetupFailure, "ngsetup failure")
-        }
+        (Outcome::Initiating, PROCEDURE_CODE_NG_SETUP) => decode_as!(
+            messages::NGSetupRequest,
+            NgSetupRequest,
+            "ngsetup request",
+            policy::NG_SETUP_REQUEST,
+            |ie| ie.id
+        ),
+        (Outcome::Successful, PROCEDURE_CODE_NG_SETUP) => decode_as!(
+            messages::NGSetupResponse,
+            NgSetupResponse,
+            "ngsetup response",
+            policy::NG_SETUP_RESPONSE,
+            |ie| ie.id
+        ),
+        (Outcome::Unsuccessful, PROCEDURE_CODE_NG_SETUP) => decode_as!(
+            messages::NGSetupFailure,
+            NgSetupFailure,
+            "ngsetup failure",
+            policy::NG_SETUP_FAILURE,
+            |ie| ie.id
+        ),
         (Outcome::Initiating, PROCEDURE_CODE_INITIAL_UE) => decode_as!(
             messages::InitialUEMessage,
             InitialUeMessage,
-            "initial ue message"
+            "initial ue message",
+            policy::INITIAL_UE_MESSAGE,
+            |ie| ie.id
         ),
         (Outcome::Initiating, PROCEDURE_CODE_DOWNLINK_NAS_TRANSPORT) => decode_as!(
             messages::DownlinkNASTransport,
             DownlinkNasTransport,
-            "downlink nas transport"
+            "downlink nas transport",
+            policy::DOWNLINK_NAS_TRANSPORT,
+            |ie| ie.id
         ),
         (Outcome::Initiating, PROCEDURE_CODE_UPLINK_NAS_TRANSPORT) => decode_as!(
             messages::UplinkNASTransport,
             UplinkNasTransport,
-            "uplink nas transport"
+            "uplink nas transport",
+            policy::UPLINK_NAS_TRANSPORT,
+            |ie| ie.id.0
         ),
         (Outcome::Initiating, PROCEDURE_CODE_INITIAL_CONTEXT_SETUP) => decode_as!(
             messages::InitialContextSetupRequest,
             InitialContextSetupRequest,
-            "initial context setup request"
+            "initial context setup request",
+            policy::INITIAL_CONTEXT_SETUP_REQUEST,
+            |ie| ie.id
         ),
         (Outcome::Successful, PROCEDURE_CODE_INITIAL_CONTEXT_SETUP) => decode_as!(
             messages::InitialContextSetupResponse,
             InitialContextSetupResponse,
-            "initial context setup response"
+            "initial context setup response",
+            policy::INITIAL_CONTEXT_SETUP_RESPONSE,
+            |ie| ie.id
         ),
         (Outcome::Unsuccessful, PROCEDURE_CODE_INITIAL_CONTEXT_SETUP) => decode_as!(
             messages::InitialContextSetupFailure,
             InitialContextSetupFailure,
-            "initial context setup failure"
+            "initial context setup failure",
+            policy::INITIAL_CONTEXT_SETUP_FAILURE,
+            |ie| ie.id
         ),
         (Outcome::Initiating, PROCEDURE_CODE_PDU_SESSION_RESOURCE_SETUP) => decode_as!(
             messages::PDUSessionResourceSetupRequest,
             PduSessionResourceSetupRequest,
-            "pdu session resource setup request"
+            "pdu session resource setup request",
+            policy::PDU_SESSION_RESOURCE_SETUP_REQUEST,
+            |ie| ie.id
         ),
         (Outcome::Successful, PROCEDURE_CODE_PDU_SESSION_RESOURCE_SETUP) => decode_as!(
             messages::PDUSessionResourceSetupResponse,
             PduSessionResourceSetupResponse,
-            "pdu session resource setup response"
+            "pdu session resource setup response",
+            policy::PDU_SESSION_RESOURCE_SETUP_RESPONSE,
+            |ie| ie.id
         ),
         (Outcome::Initiating, PROCEDURE_CODE_PDU_SESSION_RESOURCE_RELEASE) => decode_as!(
             messages::PDUSessionResourceReleaseCommand,
             PduSessionResourceReleaseCommand,
-            "pdu session resource release command"
+            "pdu session resource release command",
+            policy::PDU_SESSION_RESOURCE_RELEASE_COMMAND,
+            |ie| ie.id
         ),
         (Outcome::Successful, PROCEDURE_CODE_PDU_SESSION_RESOURCE_RELEASE) => decode_as!(
             messages::PDUSessionResourceReleaseResponse,
             PduSessionResourceReleaseResponse,
-            "pdu session resource release response"
+            "pdu session resource release response",
+            policy::PDU_SESSION_RESOURCE_RELEASE_RESPONSE,
+            |ie| ie.id
         ),
         (Outcome::Initiating, PROCEDURE_CODE_UE_CONTEXT_RELEASE) => decode_as!(
             messages::UEContextReleaseCommand,
             UeContextReleaseCommand,
-            "ue context release command"
+            "ue context release command",
+            policy::UE_CONTEXT_RELEASE_COMMAND,
+            |ie| ie.id.0
         ),
         (Outcome::Successful, PROCEDURE_CODE_UE_CONTEXT_RELEASE) => decode_as!(
             messages::UEContextReleaseComplete,
             UeContextReleaseComplete,
-            "ue context release complete"
+            "ue context release complete",
+            policy::UE_CONTEXT_RELEASE_COMPLETE,
+            |ie| ie.id.0
         ),
         (Outcome::Initiating, PROCEDURE_CODE_PAGING) => {
-            decode_as!(messages::Paging, Paging, "paging")
+            decode_as!(messages::Paging, Paging, "paging", policy::PAGING, |ie| ie
+                .id)
         }
         _ if reject_unknown_message(ctx) => Err(unknown_message_error(criticality)),
         _ => {
             enforce_depth(NGAP_UNKNOWN_MESSAGE_DEPTH, ctx)?;
             Ok(Message::Unknown(Bytes::copy_from_slice(value)))
         }
-    }
-}
-
-fn enforce_ie_count(count: usize, ctx: DecodeContext) -> Result<(), DecodeError> {
-    if count > ctx.max_ies {
-        Err(DecodeError::new(DecodeErrorCode::IeCountExceeded, 0))
-    } else {
-        Ok(())
     }
 }
 
@@ -449,6 +605,7 @@ impl Encode for Pdu {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+    use opc_protocol::DuplicateIePolicy;
 
     /// Known-good NGSetupRequest APER PDU captured from an independent
     /// `asn1c`-based implementation (libngap). The outer NGAP-PDU wrapper is
@@ -505,6 +662,57 @@ mod tests {
             0x00,
             0x00,
         ]
+    }
+
+    fn typed_ie_pdu(
+        outcome: FixtureOutcome,
+        procedure_code: u8,
+        outer_criticality: Criticality,
+        entries: &[(u16, Criticality, &[u8])],
+    ) -> Vec<u8> {
+        let mut body = vec![
+            0,
+            u8::try_from(entries.len() >> 8).unwrap(),
+            u8::try_from(entries.len() & 0xff).unwrap(),
+        ];
+        for (id, criticality, value) in entries {
+            assert!(value.len() < 128, "test helper uses short open types");
+            body.extend_from_slice(&id.to_be_bytes());
+            body.push(match criticality {
+                Criticality::reject => 0,
+                Criticality::ignore => 0x40,
+                Criticality::notify => 0x80,
+            });
+            body.push(u8::try_from(value.len()).unwrap());
+            body.extend_from_slice(value);
+        }
+        assert!(body.len() < 128, "test helper uses a short outer open type");
+
+        let outer_criticality = match outer_criticality {
+            Criticality::reject => 0,
+            Criticality::ignore => 0x40,
+            Criticality::notify => 0x80,
+        };
+        let mut pdu = vec![
+            outcome.choice_octet(),
+            procedure_code,
+            outer_criticality,
+            u8::try_from(body.len()).unwrap(),
+        ];
+        pdu.extend_from_slice(&body);
+        pdu
+    }
+
+    fn ngsetup_request_ies(
+        pdu: &Pdu,
+    ) -> &[generated::ngap_pdu_contents::AnonymousNGSetupRequestProtocolIEs] {
+        match &pdu.kind {
+            PduKind::Initiating {
+                message: Message::NgSetupRequest(request),
+                ..
+            } => &request.protocol_ies.0,
+            other => panic!("expected NGSetupRequest, got {other:?}"),
+        }
     }
 
     fn raw_preserving_context() -> EncodeContext {
@@ -665,6 +873,398 @@ mod tests {
         };
         let err = decode(&bytes, ctx).unwrap_err();
         assert_eq!(err.code(), &DecodeErrorCode::IeCountExceeded);
+    }
+
+    #[test]
+    fn typed_ie_count_is_bounded_before_structural_materialization() {
+        // The container declares two entries but contains neither entry. If
+        // structural decoding ran first this would be a generic malformed-body
+        // error. The tighter context observes the count before `rasn` can
+        // reserve the declared SequenceOf.
+        let bytes = vec![
+            FixtureOutcome::Initiating.choice_octet(),
+            PROCEDURE_CODE_NG_SETUP,
+            0x40,
+            0x03,
+            0x00,
+            0x00,
+            0x02,
+        ];
+        let err = decode(
+            &bytes,
+            DecodeContext {
+                max_ies: 1,
+                ..DecodeContext::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), &DecodeErrorCode::IeCountExceeded);
+
+        let err = decode(
+            &bytes,
+            DecodeContext {
+                max_ies: 2,
+                ..DecodeContext::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err.code(),
+            DecodeErrorCode::Structural { reason } if *reason == "ngsetup request"
+        ));
+    }
+
+    #[test]
+    fn typed_ie_count_accepts_below_and_exact_limits_and_rejects_over_limit() {
+        let entries = [
+            (65_000, Criticality::ignore, &[0x11][..]),
+            (65_001, Criticality::notify, &[0x22][..]),
+        ];
+        let bytes = typed_ie_pdu(
+            FixtureOutcome::Initiating,
+            PROCEDURE_CODE_NG_SETUP,
+            Criticality::ignore,
+            &entries,
+        );
+
+        for max_ies in [2, 3] {
+            let pdu = decode(
+                &bytes,
+                DecodeContext {
+                    max_ies,
+                    ..DecodeContext::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(ngsetup_request_ies(&pdu).len(), 2);
+        }
+
+        let err = decode(
+            &bytes,
+            DecodeContext {
+                max_ies: 1,
+                ..DecodeContext::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), &DecodeErrorCode::IeCountExceeded);
+    }
+
+    #[test]
+    fn unknown_ie_policy_is_honored_for_all_ngap_criticalities() {
+        for criticality in [
+            Criticality::reject,
+            Criticality::ignore,
+            Criticality::notify,
+        ] {
+            let bytes = typed_ie_pdu(
+                FixtureOutcome::Initiating,
+                PROCEDURE_CODE_NG_SETUP,
+                Criticality::ignore,
+                &[(65_000, criticality, &[0xa5])],
+            );
+
+            let preserved = decode(
+                &bytes,
+                DecodeContext {
+                    unknown_ie_policy: UnknownIePolicy::Preserve,
+                    validation_level: ValidationLevel::Structural,
+                    ..DecodeContext::default()
+                },
+            )
+            .unwrap();
+            let entries = ngsetup_request_ies(&preserved);
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].id, 65_000);
+            assert_eq!(entries[0].value.as_bytes(), &[0xa5]);
+
+            let dropped = decode(
+                &bytes,
+                DecodeContext {
+                    unknown_ie_policy: UnknownIePolicy::Drop,
+                    validation_level: ValidationLevel::Structural,
+                    ..DecodeContext::default()
+                },
+            )
+            .unwrap();
+            assert!(ngsetup_request_ies(&dropped).is_empty());
+
+            let err = decode(
+                &bytes,
+                DecodeContext {
+                    unknown_ie_policy: UnknownIePolicy::Reject,
+                    validation_level: ValidationLevel::Structural,
+                    ..DecodeContext::default()
+                },
+            )
+            .unwrap_err();
+            if criticality == Criticality::reject {
+                assert_eq!(err.code(), &DecodeErrorCode::UnknownCriticalIe);
+            } else {
+                assert!(matches!(
+                    err.code(),
+                    DecodeErrorCode::Structural { reason }
+                        if *reason == "unknown ngap protocol ie"
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn strict_context_rejects_unknown_reject_ie_even_when_policy_preserves_or_drops() {
+        let bytes = typed_ie_pdu(
+            FixtureOutcome::Initiating,
+            PROCEDURE_CODE_NG_SETUP,
+            Criticality::ignore,
+            &[(65_000, Criticality::reject, &[0x01])],
+        );
+
+        for validation_level in [ValidationLevel::Strict, ValidationLevel::ProcedureAware] {
+            for unknown_ie_policy in [UnknownIePolicy::Preserve, UnknownIePolicy::Drop] {
+                let err = decode(
+                    &bytes,
+                    DecodeContext {
+                        validation_level,
+                        unknown_ie_policy,
+                        ..DecodeContext::default()
+                    },
+                )
+                .unwrap_err();
+                assert_eq!(err.code(), &DecodeErrorCode::UnknownCriticalIe);
+            }
+        }
+    }
+
+    #[test]
+    fn known_ie_criticality_mismatch_fails_value_free() {
+        let bytes = typed_ie_pdu(
+            FixtureOutcome::Initiating,
+            PROCEDURE_CODE_NG_SETUP,
+            Criticality::ignore,
+            &[(27, Criticality::ignore, &[0x01])],
+        );
+        let err = decode(&bytes, DecodeContext::default()).unwrap_err();
+        assert!(matches!(
+            err.code(),
+            DecodeErrorCode::Structural { reason }
+                if *reason == "ngap protocol ie criticality mismatch"
+        ));
+        assert!(!err.to_string().contains("01"));
+    }
+
+    #[test]
+    fn duplicate_singleton_policy_is_deterministic() {
+        let bytes = typed_ie_pdu(
+            FixtureOutcome::Initiating,
+            PROCEDURE_CODE_NG_SETUP,
+            Criticality::ignore,
+            &[
+                (27, Criticality::reject, &[0x11]),
+                (27, Criticality::reject, &[0x22]),
+            ],
+        );
+
+        let err = decode(
+            &bytes,
+            DecodeContext {
+                duplicate_ie_policy: DuplicateIePolicy::Reject,
+                ..DecodeContext::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), &DecodeErrorCode::DuplicateIe);
+
+        for (policy, expected) in [
+            (DuplicateIePolicy::First, &[0x11][..]),
+            (DuplicateIePolicy::Last, &[0x22][..]),
+        ] {
+            let pdu = decode(
+                &bytes,
+                DecodeContext {
+                    duplicate_ie_policy: policy,
+                    ..DecodeContext::default()
+                },
+            )
+            .unwrap();
+            let entries = ngsetup_request_ies(&pdu);
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].value.as_bytes(), expected);
+
+            // Duplicate filtering is a typed-view decision. Raw-preserving
+            // encoding deliberately re-emits the original two-entry PDU.
+            assert_eq!(encode(&pdu, raw_preserving_context()).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn drop_filters_the_typed_view_but_raw_encode_remains_byte_exact() {
+        let bytes = typed_ie_pdu(
+            FixtureOutcome::Initiating,
+            PROCEDURE_CODE_NG_SETUP,
+            Criticality::ignore,
+            &[
+                (27, Criticality::reject, &[0x11]),
+                (65_000, Criticality::ignore, &[0xde, 0xad]),
+            ],
+        );
+        let pdu = decode(
+            &bytes,
+            DecodeContext {
+                unknown_ie_policy: UnknownIePolicy::Drop,
+                ..DecodeContext::default()
+            },
+        )
+        .unwrap();
+        let entries = ngsetup_request_ies(&pdu);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, 27);
+        assert_eq!(encode(&pdu, raw_preserving_context()).unwrap(), bytes);
+    }
+
+    #[test]
+    fn public_debug_omits_raw_and_ie_values() {
+        let bytes = typed_ie_pdu(
+            FixtureOutcome::Initiating,
+            PROCEDURE_CODE_NG_SETUP,
+            Criticality::ignore,
+            &[(65_000, Criticality::ignore, b"private-marker")],
+        );
+        let pdu = decode(&bytes, DecodeContext::default()).unwrap();
+        let rendered_pdu = format!("{pdu:?}");
+        let rendered_kind = format!("{:?}", pdu.kind);
+        assert!(rendered_pdu.contains("raw_len"));
+        assert!(rendered_kind.contains("ie_count"));
+        assert!(!rendered_pdu.contains("private-marker"));
+        assert!(!rendered_kind.contains("private-marker"));
+    }
+
+    #[test]
+    fn every_typed_procedure_uses_its_ie_profile() {
+        let cases = [
+            (
+                FixtureOutcome::Initiating,
+                PROCEDURE_CODE_NG_SETUP,
+                Criticality::ignore,
+                27,
+                Criticality::reject,
+            ),
+            (
+                FixtureOutcome::Successful,
+                PROCEDURE_CODE_NG_SETUP,
+                Criticality::reject,
+                1,
+                Criticality::reject,
+            ),
+            (
+                FixtureOutcome::Unsuccessful,
+                PROCEDURE_CODE_NG_SETUP,
+                Criticality::reject,
+                15,
+                Criticality::ignore,
+            ),
+            (
+                FixtureOutcome::Initiating,
+                PROCEDURE_CODE_INITIAL_UE,
+                Criticality::ignore,
+                85,
+                Criticality::reject,
+            ),
+            (
+                FixtureOutcome::Initiating,
+                PROCEDURE_CODE_DOWNLINK_NAS_TRANSPORT,
+                Criticality::ignore,
+                10,
+                Criticality::reject,
+            ),
+            (
+                FixtureOutcome::Initiating,
+                PROCEDURE_CODE_UPLINK_NAS_TRANSPORT,
+                Criticality::ignore,
+                10,
+                Criticality::reject,
+            ),
+            (
+                FixtureOutcome::Initiating,
+                PROCEDURE_CODE_INITIAL_CONTEXT_SETUP,
+                Criticality::reject,
+                10,
+                Criticality::reject,
+            ),
+            (
+                FixtureOutcome::Successful,
+                PROCEDURE_CODE_INITIAL_CONTEXT_SETUP,
+                Criticality::reject,
+                10,
+                Criticality::ignore,
+            ),
+            (
+                FixtureOutcome::Unsuccessful,
+                PROCEDURE_CODE_INITIAL_CONTEXT_SETUP,
+                Criticality::reject,
+                10,
+                Criticality::ignore,
+            ),
+            (
+                FixtureOutcome::Initiating,
+                PROCEDURE_CODE_PDU_SESSION_RESOURCE_SETUP,
+                Criticality::reject,
+                10,
+                Criticality::reject,
+            ),
+            (
+                FixtureOutcome::Successful,
+                PROCEDURE_CODE_PDU_SESSION_RESOURCE_SETUP,
+                Criticality::reject,
+                10,
+                Criticality::ignore,
+            ),
+            (
+                FixtureOutcome::Initiating,
+                PROCEDURE_CODE_PDU_SESSION_RESOURCE_RELEASE,
+                Criticality::reject,
+                10,
+                Criticality::reject,
+            ),
+            (
+                FixtureOutcome::Successful,
+                PROCEDURE_CODE_PDU_SESSION_RESOURCE_RELEASE,
+                Criticality::reject,
+                10,
+                Criticality::ignore,
+            ),
+            (
+                FixtureOutcome::Initiating,
+                PROCEDURE_CODE_UE_CONTEXT_RELEASE,
+                Criticality::reject,
+                114,
+                Criticality::reject,
+            ),
+            (
+                FixtureOutcome::Successful,
+                PROCEDURE_CODE_UE_CONTEXT_RELEASE,
+                Criticality::reject,
+                10,
+                Criticality::ignore,
+            ),
+            (
+                FixtureOutcome::Initiating,
+                PROCEDURE_CODE_PAGING,
+                Criticality::ignore,
+                115,
+                Criticality::ignore,
+            ),
+        ];
+
+        for (outcome, procedure_code, outer_criticality, id, ie_criticality) in cases {
+            let bytes = typed_ie_pdu(
+                outcome,
+                procedure_code,
+                outer_criticality,
+                &[(id, ie_criticality, &[0])],
+            );
+            let pdu = decode(&bytes, DecodeContext::default()).unwrap();
+            assert_eq!(encode(&pdu, raw_preserving_context()).unwrap(), bytes);
+        }
     }
 
     #[test]
