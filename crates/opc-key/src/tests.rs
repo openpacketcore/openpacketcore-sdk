@@ -179,7 +179,9 @@ fn encrypt_and_decrypt_bound_payload_round_trip() {
 }
 
 #[tokio::test]
-async fn memory_remote_seal_provider_round_trips_and_binds_aad() {
+async fn direct_memory_remote_seal_provider_remains_compatible_and_unadmitted() {
+    // This type implements only `RemoteSealProvider`: direct calls remain the
+    // ordinary compatibility path and carry no custody admission handle.
     let provider = MemoryRemoteSealProvider::new(
         KeyId::new("session-active-2026-01").expect("key id"),
         KeyPurpose::Session,

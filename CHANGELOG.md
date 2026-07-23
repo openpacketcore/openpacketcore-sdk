@@ -8,6 +8,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Admitted declared-sealed key custody — `opc-key`:** adds a process-wide,
+  immutable `KeyCustodyModule` slot that binds `CryptoModule` evidence and
+  `RemoteSealProvider` operations to one exact object. Installation requires
+  the module to declare, self-test, and service explicit `sealed_key_storage`
+  and `zeroization` policy grants, returns and retains the exact bounded
+  admission report, and exposes the non-forgeable `AdmittedKeyCustody` adapter
+  only after success. The SDK does not independently certify the provider
+  declarations. Every operation rechecks the complete frozen grant against
+  live identity, validation declaration, advertisement, and readiness before
+  dispatch; self-test evidence remains an admission-time snapshot. Successful
+  provider AAD is capped at 64 KiB before parsing and must be canonical and
+  exactly bound to caller context. Stable fieldless errors preserve only
+  `NotFound`/`Unavailable` provider classifications. Existing local/direct
+  providers and durable/KMS formats are unchanged and remain explicitly
+  unadmitted compatibility paths. Cargo publication eligibility is also
+  enabled for `opc-crypto-provider` solely so published `opc-key` has a valid
+  registry dependency closure. This release mechanic neither asserts product
+  maturity nor independently certifies provider declarations, and it does not
+  enable the repository's currently disabled automated crates.io publishing
+  path (#334).
 - **Pre-admission IKEv2 signing-key inspection — `opc-proto-ikev2`:** adds a
   bounded, exact-DER, non-signing configuration helper for ECDSA P-256 and
   P-384 PKCS#8. It returns the exact typed signature-generation requirement

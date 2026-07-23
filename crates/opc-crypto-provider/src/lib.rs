@@ -34,8 +34,9 @@
 //!   [`ProviderPolicy::admit`], and there is no fallback path.
 //! - [`CryptoModule`] is the evidence trait: identity, capabilities, self-test,
 //!   and readiness. [`IkeCryptoModule`] composes it with the complete IKEv2
-//!   operation surface so admission and execution use one exact object. TLS
-//!   and `opc-key` custody bindings remain later work.
+//!   operation surface so admission and execution use one exact object.
+//!   `opc-key` defines its downstream composite evidence/remote-seal binding;
+//!   TLS binding remains later work.
 //! - The [`ops`] module defines the synchronous, object-safe IKE
 //!   **operation traits** ([`IkeHashOperations`], [`IkeEntropyOperations`],
 //!   [`IkePrfOperations`], [`IkeIntegrityOperations`],

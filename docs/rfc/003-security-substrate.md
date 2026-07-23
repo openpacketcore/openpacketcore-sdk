@@ -487,6 +487,37 @@ pub trait RemoteSealProvider: Send + Sync {
 If raw bytes are materialized, they MUST be zeroized after use where the crypto
 backend permits.
 
+Deployments that require sealing through a provider that declares
+non-exportable custody can install one process-level `KeyCustodyModule`. The
+composite object MUST supply both `CryptoModule` evidence and
+`RemoteSealProvider` operations; evidence from one object MUST NOT authorize
+operations on another. Admission requires the module to declare, self-test, and
+service the explicit `sealed_key_storage` and `zeroization` capabilities and
+returns a bounded `CapabilityReport`. The SDK does not independently certify
+those declarations. The process slot is immutable after success, and the
+opaque `AdmittedKeyCustody` adapter has no public constructor or fallback.
+
+The recorded self-test outcome is admission-time evidence; seal and unseal do
+not rerun an asynchronous power-on self-test. Before every operation, the SDK
+synchronously verifies that the module identity and validation declaration
+still match admission and that the complete frozen grant remains both
+advertised and serviceable. A module whose subsequent self-test or health state
+becomes invalid MUST withdraw the affected readiness capability. Provider
+`NotFound` and `Unavailable` classifications retain their public meaning;
+other provider context is collapsed to a fieldless redaction-safe error.
+
+Successful provider-returned bound AAD MUST be rejected before parsing when it
+exceeds 64 KiB. Within that bound it MUST decode as the exact canonical SDK AAD
+shape and reserialize byte-for-byte from the caller's `EnvelopeAad` plus the
+returned `KeyId`. Oversized, malformed, non-canonical, or context-mismatched
+provider output fails closed.
+
+The existing `KeyProvider`, `KeyHandle`, and direct `RemoteSealProvider`
+interfaces remain available for ordinary non-validated compatibility. Those
+values cannot construct `AdmittedKeyCustody` and MUST NOT inherit or advertise
+its admission evidence merely because another process component installed a
+module.
+
 For remote sealing, `key_id` MUST come from a canonical, validated envelope.
 It selects the exact historical remote key and MUST NOT be replaced by the
 provider's current active key. `KmsRemoteSealProvider` snapshots one coherent

@@ -13,8 +13,9 @@ use crate::selftest::{ModuleReadiness, SelfTestError, SelfTestOutcome};
 /// This trait is deliberately evidence-only: it exposes no key handles and no
 /// algorithm operations. [`IkeCryptoModule`] composes this evidence surface
 /// with the IKEv2 operation traits so one exact object can be admitted and
-/// execute IKEv2 operations. TLS and `opc-key` custody bindings remain outside
-/// this slice; nothing in this crate itself performs cryptography.
+/// execute IKEv2 operations. `opc-key` defines its own downstream composite
+/// evidence/remote-seal binding; TLS binding remains outside this crate.
+/// Nothing in this crate itself performs cryptography.
 ///
 /// The name avoids `CryptoProvider`, which already means the IKEv2
 /// protected-payload opener in `opc-proto-ikev2`; consumers of both traits

@@ -112,6 +112,7 @@ The SDK is organized into a clean multi-crate Rust workspace and a Go reference 
 | Crate | Purpose | Reference |
 | :--- | :--- | :--- |
 | [`opc-identity`](crates/opc-identity/) | SPIFFE Workload Identity and SVID reload support. | [RFC 003](docs/rfc/003-security-substrate.md) |
+| [`opc-crypto-provider`](crates/opc-crypto-provider/) | Provider-neutral cryptographic capability evidence, self-test/readiness, policy admission, and operation traits; module declarations are not SDK certification. | [RFC 003](docs/rfc/003-security-substrate.md) |
 | [`opc-key`](crates/opc-key/) | Key-provider traits, in-memory adapters, and tenant-bound AEAD payload helpers. | [RFC 003](docs/rfc/003-security-substrate.md) |
 | [`opc-crypto`](crates/opc-crypto/) | AEAD envelope encoding, decoding, and provider-driven encryption. | [RFC 003](docs/rfc/003-security-substrate.md) |
 | [`opc-tls`](crates/opc-tls/) | Reloadable SPIFFE-aware mTLS client and server support. | [RFC 003](docs/rfc/003-security-substrate.md) |

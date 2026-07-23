@@ -134,9 +134,8 @@ are Cargo-publishable; packages with `publish = false` are held.
 required version keys, but it does not require every manifest to declare an
 explicit boolean.
 
-At this revision, the workspace contains 32 Cargo-publishable packages and 46
-held packages. The authoritative current publication list is generated rather
-than duplicated here:
+The authoritative current publication list is generated rather than duplicated
+here:
 
 ```bash
 python3 scripts/publish-order.py --names

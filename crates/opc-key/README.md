@@ -6,8 +6,9 @@ Tenant- and purpose-scoped key abstractions for OpenPacketCore.
 
 `opc-key` defines the key provider boundary used by encryption, persistence,
 session, and Vault/KMS adapters. It keeps key material behind `KeyHandle`,
-models authenticated-data domains, and exposes both in-memory and remote KMS
-providers.
+models authenticated-data domains, exposes both in-memory and remote KMS
+providers, and offers an opt-in admitted boundary for sealing through a
+provider that declares non-exportable custody.
 
 ## API Shape
 
@@ -21,6 +22,14 @@ providers.
 - `RemoteSealProvider` delegates encryption to KMS/HKMS and receives the
   validated envelope key ID on unseal so historical reads never substitute the
   current active key.
+- `KeyCustodyModule` composes `CryptoModule` evidence and
+  `RemoteSealProvider` operations on one exact object.
+- `install_key_custody_module` admits that object once per process and returns
+  the exact bounded `CapabilityReport` used at admission.
+- `AdmittedKeyCustody` is a non-forgeable `RemoteSealProvider` adapter obtained
+  only after installation. Every operation rechecks the frozen complete grant
+  against live module identity, validation declaration, advertisement, and
+  readiness before dispatch, with no implicit fallback.
 - `RemoteSealMaterialController` atomically publishes an active remote key and
   an opaque, constant-space process-local epoch. An in-flight seal keeps the
   snapshot it began with. Cloned controllers share state only within one
@@ -65,10 +74,49 @@ async fn example() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 }
 ```
 
+### Admitted non-exportable custody
+
+Install the selected composite module during the runtime `SecurityInit` phase,
+then obtain the opaque adapter for persistence/session composition:
+
+```rust,no_run
+use std::sync::Arc;
+
+use opc_key::{
+    admitted_key_custody, install_key_custody_module, AdmittedKeyCustody, CapabilityReport,
+    CryptoCapability, KeyCustodyModule, ProviderPolicy,
+};
+
+async fn admit_custody(
+    module: Arc<dyn KeyCustodyModule>,
+) -> Result<(CapabilityReport, AdmittedKeyCustody), Box<dyn std::error::Error + Send + Sync>> {
+    let policy = ProviderPolicy::new()
+        .require(CryptoCapability::SealedKeyStorage)
+        .require(CryptoCapability::Zeroization);
+    let report = install_key_custody_module(module, policy).await?;
+    let custody = admitted_key_custody()?;
+    Ok((report, custody))
+}
+```
+
+The report contains module-declared evidence; the SDK does not independently
+certify the provider's non-exportability or validation claims. Its self-test
+result is admission-time evidence. Seal/unseal does not rerun an asynchronous
+power-on self-test. A module whose later health or self-test state becomes
+invalid must withdraw the affected capabilities from its live readiness; the
+next operation then fails before provider dispatch.
+
+Successful provider-returned bound AAD is limited to 64 KiB before parsing,
+must decode in the canonical SDK representation, and must exactly reserialize
+from the caller's AAD plus the returned key ID. Oversized, malformed,
+non-canonical, or context-mismatched output fails with a fieldless stable code.
+
 ## Relationships
 
 - `opc-crypto` consumes `KeyProvider` and `KeyHandle` to build encoded
   envelopes.
+- `opc-crypto-provider` supplies the bounded evidence, module identity,
+  capability, and policy-admission types used by admitted custody.
 - `opc-key-vault` implements the provider boundary for HashiCorp Vault Transit.
 - `opc-persist` and `opc-session-store` use key purposes and AAD builders to
   bind stored ciphertext to tenant, version, namespace, and generation data.
@@ -80,6 +128,15 @@ async fn example() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
   custody.
 - `KmsKeyProvider` redacts errors and requires TLS for TCP endpoints. Unix
   sockets are accepted for local KMS deployments.
+- Existing `KeyProvider`, `KeyHandle`, `KmsRemoteSealProvider`,
+  `MemoryRemoteSealProvider`, and custom `RemoteSealProvider` implementations
+  remain source- and wire-compatible. They are explicitly unadmitted unless
+  the consumer composes the same object as a `KeyCustodyModule`; direct values
+  cannot construct or impersonate `AdmittedKeyCustody`.
+- An admitted provider must explicitly satisfy both `sealed_key_storage` and
+  `zeroization`. Provider `NotFound` and `Unavailable` outcomes keep their
+  existing public meaning; all other provider context is collapsed to a
+  redaction-safe fieldless operation code.
 - Rotation keeps historical keys addressable by key ID.
 - `KmsRemoteSealProvider` keeps no local historical-key or authorization cache.
   Every unseal calls KMS/HKMS with the exact validated envelope key ID. KMS/HKMS

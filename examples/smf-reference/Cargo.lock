@@ -1352,6 +1352,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "opc-crypto-provider"
+version = "0.2.0"
+dependencies = [
+ "async-trait",
+ "serde",
+ "zeroize",
+]
+
+[[package]]
 name = "opc-data-governance"
 version = "0.2.0"
 dependencies = [
@@ -1384,6 +1393,7 @@ dependencies = [
  "aes-gcm-siv",
  "async-trait",
  "hkdf",
+ "opc-crypto-provider",
  "opc-identity",
  "opc-tls",
  "opc-types",

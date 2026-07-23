@@ -2494,7 +2494,6 @@ name = "opc-crypto-provider"
 version = "0.2.0"
 dependencies = [
  "async-trait",
- "opc-crypto-provider",
  "serde",
  "serde_json",
  "tokio",
@@ -2726,6 +2725,7 @@ dependencies = [
  "aes-gcm-siv",
  "async-trait",
  "hkdf 0.12.4",
+ "opc-crypto-provider",
  "opc-identity",
  "opc-tls",
  "opc-types",
