@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **BREAKING — Typed P-CSCF reselection-capability relay — `opc-proto-ikev2` /
+  `opc-proto-gtpv2c`:** adds strict build/decode support for the TS 24.302
+  `P_CSCF_RESELECTION_SUPPORT` Notify (41304) and explicit encoding of the
+  independent empty TS 24.008 PCO/APCO request container `0x0012`.
+  `PcoRequest` exhaustive struct literals must initialize
+  `p_cscf_reselection_support` or use `..PcoRequest::none()` (#487).
 - **BREAKING — SCTP-AUTH rotation and sender-drain foundation — `opc-sctp` /
   `opc-libsctp-sys`:** adds exact Linux SCTP-AUTH UAPI bindings, pre-association
   DATA/FORWARD-TSN requirements, established-peer capability verification,

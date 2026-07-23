@@ -90,6 +90,10 @@ control-plane stack.
 - `PcoRequest` and `PcoAddressConfiguration` provide a bounded TS 24.008 inner
   codec for IPv4/IPv6 DNS and P-CSCF containers while the outer PCO/APCO IE
   transport remains opaque and byte-preserving.
+  `PcoRequest::p_cscf_reselection_support` independently emits the exact empty
+  request container `0x0012`; neither P-CSCF address-family flag implies the
+  capability. Selected containers are encoded once in ascending identifier
+  order, and `PcoRequest::none()` remains byte-empty.
 - Public profile constructors build profile-valid owned messages:
   `s2b_echo_request`, `s2b_echo_response`,
   `s2b_create_session_request`,

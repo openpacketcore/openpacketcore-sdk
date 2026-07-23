@@ -17,8 +17,9 @@
 //! IKE_AUTH cleartext payload helpers including fail-closed RFC 5998
 //! EAP_ONLY_AUTHENTICATION Notify validation, transcript-bound shared-key AUTH MIC
 //! verification, transcript-bound signature AUTH (RFC 7296 method 1 and
-//! RFC 7427 method 14) against caller-trusted keys, typed 3GPP DEVICE_IDENTITY
-//! and AUTHORIZATION_REJECTED notifications, product-neutral Child SA
+//! RFC 7427 method 14) against caller-trusted keys, typed 3GPP DEVICE_IDENTITY,
+//! P_CSCF_RESELECTION_SUPPORT, and AUTHORIZATION_REJECTED notifications,
+//! product-neutral Child SA
 //! negotiation intent including authenticated-only ESP ENCR_NULL profiles and
 //! KEYMAT, strict responder and
 //! initiator boundaries for opened IKE-SA rekey `CREATE_CHILD_SA` exchanges, and strict
@@ -224,9 +225,10 @@ pub use nat_traversal::{
 };
 pub use notify::{
     build_ike_sa_init_cookie_response, decode_ikev2_eap_only_authentication_notify,
-    extract_ike_sa_init_cookie_notify, Ikev2CookieNotify, Ikev2CookieNotifyBuildError,
-    Ikev2CookieNotifyExtractError, Ikev2EapOnlyAuthentication,
-    Ikev2EapOnlyAuthenticationNotifyError, Ikev2NotifyPayload, Ikev2NotifyPayloadError,
+    decode_ikev2_pcscf_reselection_support_notify, extract_ike_sa_init_cookie_notify,
+    Ikev2CookieNotify, Ikev2CookieNotifyBuildError, Ikev2CookieNotifyExtractError,
+    Ikev2EapOnlyAuthentication, Ikev2EapOnlyAuthenticationNotifyError, Ikev2NotifyPayload,
+    Ikev2NotifyPayloadError, Ikev2PcscfReselectionSupport, Ikev2PcscfReselectionSupportNotifyError,
     IKEV2_NOTIFY_AUTHENTICATION_FAILED, IKEV2_NOTIFY_AUTHORIZATION_REJECTED,
     IKEV2_NOTIFY_CHILD_SA_NOT_FOUND, IKEV2_NOTIFY_COOKIE, IKEV2_NOTIFY_COOKIE2,
     IKEV2_NOTIFY_DEVICE_IDENTITY, IKEV2_NOTIFY_EAP_ONLY_AUTHENTICATION,
@@ -236,7 +238,8 @@ pub use notify::{
     IKEV2_NOTIFY_INVALID_SELECTORS, IKEV2_NOTIFY_INVALID_SPI, IKEV2_NOTIFY_INVALID_SYNTAX,
     IKEV2_NOTIFY_NAT_DETECTION_DESTINATION_IP, IKEV2_NOTIFY_NAT_DETECTION_SOURCE_IP,
     IKEV2_NOTIFY_NO_ADDITIONAL_SAS, IKEV2_NOTIFY_NO_PROPOSAL_CHOSEN, IKEV2_NOTIFY_PROTOCOL_ID_NONE,
-    IKEV2_NOTIFY_REKEY_SA, IKEV2_NOTIFY_SINGLE_PAIR_REQUIRED, IKEV2_NOTIFY_TEMPORARY_FAILURE,
+    IKEV2_NOTIFY_P_CSCF_RESELECTION_SUPPORT, IKEV2_NOTIFY_REKEY_SA,
+    IKEV2_NOTIFY_SINGLE_PAIR_REQUIRED, IKEV2_NOTIFY_TEMPORARY_FAILURE,
     IKEV2_NOTIFY_TS_UNACCEPTABLE, IKEV2_NOTIFY_UNSUPPORTED_CRITICAL_PAYLOAD,
 };
 pub use payload::{

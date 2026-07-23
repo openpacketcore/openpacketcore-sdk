@@ -25,6 +25,13 @@ pub const PCO_CONTAINER_P_CSCF_IPV4: u16 = 0x000c;
 /// DNS Server IPv4 Address container identifier.
 pub const PCO_CONTAINER_DNS_SERVER_IPV4: u16 = 0x000d;
 
+/// P-CSCF reselection-support request container identifier.
+///
+/// In the MS-to-network direction this container has zero-length contents and
+/// independently indicates support for P-CSCF reselection. It is not implied
+/// by either P-CSCF address-family request.
+pub const PCO_CONTAINER_P_CSCF_RESELECTION_SUPPORT: u16 = 0x0012;
+
 /// Maximum number of length-delimited containers decoded from one PCO value.
 ///
 /// This bounds parser work and address-vector growth independently of the
@@ -33,7 +40,7 @@ pub const PCO_MAX_CONTAINERS: usize = 64;
 
 const PCO_CONTAINER_HEADER_LEN: usize = 3;
 
-/// Address parameters requested in an MS-to-network PCO.
+/// Parameters requested in an MS-to-network PCO or APCO.
 ///
 /// Every selected parameter is encoded as a zero-length container. An empty
 /// request encodes to an empty vector so a caller can omit the outer PCO IE.
@@ -47,10 +54,15 @@ pub struct PcoRequest {
     pub p_cscf_ipv4: bool,
     /// Request DNS Server IPv4 addresses.
     pub dns_server_ipv4: bool,
+    /// Indicate support for P-CSCF reselection.
+    ///
+    /// This emits the independent empty container `0x0012`; the P-CSCF IPv4
+    /// and IPv6 address request flags never imply it.
+    pub p_cscf_reselection_support: bool,
 }
 
 impl PcoRequest {
-    /// Construct a request with no selected address parameters.
+    /// Construct a request with no selected parameters.
     #[must_use]
     pub const fn none() -> Self {
         Self {
@@ -58,13 +70,18 @@ impl PcoRequest {
             dns_server_ipv6: false,
             p_cscf_ipv4: false,
             dns_server_ipv4: false,
+            p_cscf_reselection_support: false,
         }
     }
 
-    /// Return whether at least one address parameter is requested.
+    /// Return whether at least one parameter is requested.
     #[must_use]
     pub const fn is_requested(self) -> bool {
-        self.p_cscf_ipv6 || self.dns_server_ipv6 || self.p_cscf_ipv4 || self.dns_server_ipv4
+        self.p_cscf_ipv6
+            || self.dns_server_ipv6
+            || self.p_cscf_ipv4
+            || self.dns_server_ipv4
+            || self.p_cscf_reselection_support
     }
 
     /// Encode MS-to-network PCO contents in ascending container-ID order.
@@ -83,6 +100,7 @@ impl PcoRequest {
             self.dns_server_ipv6,
             self.p_cscf_ipv4,
             self.dns_server_ipv4,
+            self.p_cscf_reselection_support,
         ]
         .into_iter()
         .filter(|requested| *requested)
@@ -101,6 +119,9 @@ impl PcoRequest {
         }
         if self.dns_server_ipv4 {
             encode_empty_request_container(&mut encoded, PCO_CONTAINER_DNS_SERVER_IPV4);
+        }
+        if self.p_cscf_reselection_support {
+            encode_empty_request_container(&mut encoded, PCO_CONTAINER_P_CSCF_RESELECTION_SUPPORT);
         }
         encoded
     }

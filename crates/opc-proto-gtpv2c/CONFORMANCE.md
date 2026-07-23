@@ -317,7 +317,12 @@ coverage.
    - The optional TS 24.008 PCO inner codec bounds parsing to 64 containers,
      projects repeated IPv4/IPv6 DNS and P-CSCF addresses in wire order, and
      safely skips well-formed unknown containers without changing opaque IE
-     round trips.
+     round trips. Its MS-to-network request model emits the independent
+     zero-length P-CSCF reselection-support container `0x0012` exactly once
+     when selected, after lower numeric container identifiers. P-CSCF address
+     requests do not imply reselection support; empty and legacy combinations
+     retain their prior bytes. The same inner value can be carried unchanged
+     by PCO or APCO.
    - Bearer QoS decodes the fixed 22-octet shape into a typed
      Allocation/Retention Priority, QCI, and 40-bit integer-kbit/s maximum and
      guaranteed bit-rate fields. ARP priority level and spare bits are checked.
