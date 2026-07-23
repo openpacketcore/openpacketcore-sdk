@@ -15,8 +15,8 @@ use opc_proto_ikev2::{
     Ikev2EphemeralDhKey, Ikev2IdentificationPayloadBuild, Ikev2IkeAuthPeer,
     Ikev2IkeAuthSignedOctets, Ikev2IntegrityAlgorithm, Ikev2PrfAlgorithm,
     Ikev2ProtectedPayloadDirection, Ikev2SaInitCryptoProfile, Ikev2SaInitKeyMaterial,
-    Ikev2SignatureAuthKey, Ikev2SoftwareCryptoOperations, ProtectedPayloadKind,
-    ProtectedPayloadSealContext, IKEV2_AUTH_METHOD_DIGITAL_SIGNATURE,
+    Ikev2SignatureAuthKey, Ikev2SignatureHashAlgorithm, Ikev2SoftwareCryptoOperations,
+    ProtectedPayloadKind, ProtectedPayloadSealContext, IKEV2_AUTH_METHOD_DIGITAL_SIGNATURE,
     RFC7427_ALGORITHM_IDENTIFIER_ECDSA_SHA2_256, RFC7427_ALGORITHM_IDENTIFIER_ECDSA_SHA2_384,
 };
 
@@ -771,13 +771,17 @@ fn identity_payload_body() -> Vec<u8> {
 /// Reconstruct the RFC 7296 responder signed octets
 /// (`RealMessage2 | NonceIData | MACedIDForR`) through the trait PRF, which
 /// also cross-checks the PRF against the IKE_AUTH transcript path.
-fn responder_signed_octets(material: &Ikev2SaInitKeyMaterial, identity: &[u8]) -> Vec<u8> {
+fn responder_signed_octets(
+    material: &Ikev2SaInitKeyMaterial,
+    sa_init_response: &[u8],
+    identity: &[u8],
+) -> Vec<u8> {
     let macked_id = OPERATIONS
         .prf(IkePrfAlgorithm::HmacSha2_256, material.sk_pr(), identity)
         .expect("MACedIDForR computes");
     let mut signed =
-        Vec::with_capacity(SA_INIT_RESPONSE.len() + PEER_NONCE.len() + macked_id.len());
-    signed.extend_from_slice(SA_INIT_RESPONSE);
+        Vec::with_capacity(sa_init_response.len() + PEER_NONCE.len() + macked_id.len());
+    signed.extend_from_slice(sa_init_response);
     signed.extend_from_slice(PEER_NONCE);
     signed.extend_from_slice(&macked_id);
     signed
@@ -787,14 +791,6 @@ fn responder_signed_octets(material: &Ikev2SaInitKeyMaterial, identity: &[u8]) -
 fn software_ecdsa_signatures_are_byte_identical_to_the_existing_ike_auth_signature_path() {
     let identity = identity_payload_body();
     let material = signature_key_material();
-    let octets = Ikev2IkeAuthSignedOctets {
-        peer: Ikev2IkeAuthPeer::Responder,
-        ike_sa_init_message: SA_INIT_RESPONSE,
-        peer_nonce: PEER_NONCE,
-        identity_payload_body: &identity,
-    };
-    let signed = responder_signed_octets(&material, &identity);
-
     struct EcdsaParityCase {
         algorithm: IkeSignatureAlgorithm,
         pkcs8_der: &'static [u8],
@@ -829,9 +825,26 @@ fn software_ecdsa_signatures_are_byte_identical_to_the_existing_ike_auth_signatu
             }
             _ => Ikev2SignatureAuthKey::ecdsa_p384_pkcs8_der(pkcs8_der).expect("P-384 key"),
         };
-        let auth_data =
-            compute_ike_auth_signature(signature_profile(), &material, octets, &existing_key)
-                .expect("existing signature path signs");
+        let hash = match algorithm {
+            IkeSignatureAlgorithm::EcdsaP256Sha2_256 => Ikev2SignatureHashAlgorithm::Sha2_256,
+            _ => Ikev2SignatureHashAlgorithm::Sha2_384,
+        };
+        let authority = support::responder_signature_hash_context(hash);
+        let octets = Ikev2IkeAuthSignedOctets {
+            peer: Ikev2IkeAuthPeer::Responder,
+            ike_sa_init_message: &authority.sa_init_response,
+            peer_nonce: PEER_NONCE,
+            identity_payload_body: &identity,
+        };
+        let signed = responder_signed_octets(&material, &authority.sa_init_response, &identity);
+        let auth_data = compute_ike_auth_signature(
+            signature_profile(),
+            &material,
+            octets,
+            &existing_key,
+            Some(authority.signing_authorization()),
+        )
+        .expect("existing signature path signs");
         assert_eq!(usize::from(auth_data[0]), algorithm_identifier.len());
         let existing_signature = &auth_data[1 + algorithm_identifier.len()..];
 
@@ -865,6 +878,7 @@ fn software_ecdsa_signatures_are_byte_identical_to_the_existing_ike_auth_signatu
                 auth_method: IKEV2_AUTH_METHOD_DIGITAL_SIGNATURE,
                 auth_data: &framed,
             },
+            Some(authority.verification_authorization()),
         )
         .expect("existing verifier accepts the software signature");
     }
@@ -874,7 +888,7 @@ fn software_ecdsa_signatures_are_byte_identical_to_the_existing_ike_auth_signatu
 fn software_signature_verification_fails_closed_with_stable_codes() {
     let material = signature_key_material();
     let identity = identity_payload_body();
-    let signed = responder_signed_octets(&material, &identity);
+    let signed = responder_signed_octets(&material, SA_INIT_RESPONSE, &identity);
     let signing_key = OPERATIONS
         .load_signing_key(IkeSignatureAlgorithm::EcdsaP256Sha2_256, P256_PKCS8_DER)
         .expect("software signing key loads");
@@ -976,11 +990,11 @@ mod rsa_signing {
         )
         .expect("RSA key");
         let auth_data =
-            compute_ike_auth_signature(signature_profile(), &material, octets, &existing_key)
+            compute_ike_auth_signature(signature_profile(), &material, octets, &existing_key, None)
                 .expect("existing RSA path signs");
         assert_eq!(auth_data.len(), 256);
 
-        let signed = responder_signed_octets(&material, &identity);
+        let signed = responder_signed_octets(&material, SA_INIT_RESPONSE, &identity);
         let signing_key = OPERATIONS
             .load_signing_key(IkeSignatureAlgorithm::RsaPkcs1V15Sha2_256, RSA_PKCS8_DER)
             .expect("software RSA key loads");

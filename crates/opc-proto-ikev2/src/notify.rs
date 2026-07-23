@@ -176,6 +176,15 @@ pub const IKEV2_NOTIFY_COOKIE2: u16 = 16_401;
 /// @conformance boundary-only
 pub const IKEV2_NOTIFY_EAP_ONLY_AUTHENTICATION: u16 = 16_417;
 
+/// IKEv2 Notify Message Type for SIGNATURE_HASH_ALGORITHMS.
+///
+/// The Notify appears in `IKE_SA_INIT` and carries an ordered, unpadded list
+/// of 16-bit IANA IKEv2 hash algorithm identifiers.
+///
+/// @spec IETF RFC7427 4
+/// @conformance boundary-only
+pub const IKEV2_NOTIFY_SIGNATURE_HASH_ALGORITHMS: u16 = 16_431;
+
 /// IKEv2 Notify Message Type for 3GPP DEVICE_IDENTITY.
 ///
 /// @spec 3GPP TS24.302 8.2.9.2

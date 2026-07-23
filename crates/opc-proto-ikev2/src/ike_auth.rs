@@ -2573,6 +2573,12 @@ pub enum Ikev2IkeAuthVerificationError {
     SignatureEncodingInvalid,
     /// Signature AlgorithmIdentifier is not supported by this verifier.
     SignatureAlgorithmUnsupported,
+    /// RFC 7427 method 14 was attempted without negotiated hash authority.
+    SignatureHashAuthorityMissing,
+    /// The signature hash did not match the direction-specific authority.
+    SignatureHashNotAuthorized,
+    /// The signature-hash authority belonged to another SA_INIT transcript or peer direction.
+    SignatureHashAuthorityExchangeMismatch,
     /// Supplied key type does not match the AUTH method or signature algorithm.
     SignatureKeyMismatch,
     /// Producing the signature failed inside the signing backend.
@@ -2608,6 +2614,13 @@ impl Ikev2IkeAuthVerificationError {
             Self::SignatureEncodingInvalid => "ike_auth_verify_signature_encoding_invalid",
             Self::SignatureAlgorithmUnsupported => {
                 "ike_auth_verify_signature_algorithm_unsupported"
+            }
+            Self::SignatureHashAuthorityMissing => {
+                "ike_auth_verify_signature_hash_authority_missing"
+            }
+            Self::SignatureHashNotAuthorized => "ike_auth_verify_signature_hash_not_authorized",
+            Self::SignatureHashAuthorityExchangeMismatch => {
+                "ike_auth_verify_signature_hash_authority_exchange_mismatch"
             }
             Self::SignatureKeyMismatch => "ike_auth_verify_signature_key_mismatch",
             Self::SignatureComputationFailed => "ike_auth_verify_signature_computation_failed",
