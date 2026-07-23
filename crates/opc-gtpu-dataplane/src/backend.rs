@@ -24,12 +24,16 @@ pub trait GtpuDataplaneBackend: Send + Sync + std::fmt::Debug {
     /// Create a Linux `gtp` netdevice.
     async fn create_device(&self, request: CreateGtpDeviceRequest) -> Result<GtpDevice, GtpuError>;
 
-    /// Create/attach a device with exact one- or two-family endpoint authority.
+    /// Create or adopt a device with exact one- or two-family endpoint authority.
     ///
     /// This additive boundary never falls back to
     /// [`CreateGtpDeviceRequest::bind_address`]. Implementations persist the
     /// stable device ID independently of ifindex and must prove any
     /// replacement interface and existing pin namespace before rebinding.
+    /// After restart, a grouped-session consumer adopts retained state by
+    /// calling this method again with the exact stable device ID and endpoint
+    /// set; the name-only [`Self::resolve_device`] boundary is not a substitute
+    /// for that identity proof.
     async fn create_device_with_endpoints(
         &self,
         _request: CreateGtpDeviceEndpointSetRequest,
@@ -39,7 +43,7 @@ pub trait GtpuDataplaneBackend: Send + Sync + std::fmt::Debug {
         })
     }
 
-    /// Resolve an existing Linux `gtp` netdevice by interface name.
+    /// Resolve an existing legacy Linux `gtp` or single-context eBPF device by name.
     async fn resolve_device(&self, name: &str) -> Result<GtpDevice, GtpuError>;
 
     /// Remove a Linux `gtp` netdevice.
