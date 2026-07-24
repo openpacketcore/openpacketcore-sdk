@@ -704,9 +704,12 @@ matching Session-Id when the generic grammar carries one. Ordinary application
 answers additionally satisfy the configured direct/routed logical-Origin
 policy and request application/authentication facts. Every formerly combined
 application predicate has a stable value-free correlation outcome:
-Auth-Application-Id, Auth-Request-Type, successful-answer mobility omission,
-contradictory or unauthorized mobility content, subscriber authorization,
-overload control, APN authorization, and final answer validation. Generic
+Auth-Application-Id, Auth-Request-Type, contradictory or unauthorized
+mobility content, subscriber authorization, overload control, APN
+authorization, and final answer validation. The historical successful-answer
+mobility-omission outcome is retained as a stable code but no longer
+produced: RFC 5447 does not require a DEA to echo the offered vector, so
+omission correlates and defers to the trusted local mobility mode. Generic
 errors skip only terminal logical-Origin matching because an RFC 6733
 intermediary may originate them. Exact 3002/3004 additionally require
 Session-Id presence and exact match, plus an exact ASCII-case-insensitive
@@ -751,7 +754,11 @@ The exact Release 19 mobility bits are named, including GTPv2
 `0x0000400000000000`. A DER cannot originate the answer-only
 `ASSIGN_LOCAL_IP` selection. A DEA cannot combine that selection with
 PMIP6/GTPv2. Request-bound correlation permits mobility authorization only on
-exact base `DIAMETER_SUCCESS`: success requires presence to match the request,
+exact base `DIAMETER_SUCCESS`: a success answer may omit the vector — RFC
+5447 defines no echo requirement, and the TS 29.273 DEA row is category O,
+whose absence per TS 29.228 clause 6 shall not cause an application error,
+so omission signals no AAA-derived selection and leaves the trusted local
+mode effective — but cannot return an unsolicited vector,
 non-success forbids the vector, non-NBM bits must be a subset of the offer,
 and an offer containing either PMIP6 or GTPv2 authorizes the TS-defined
 collective NBM response containing either or both bits.
@@ -856,7 +863,7 @@ shape, public typed boundary, and independent positive/negative fixture module.
 |:----|:-------------------|:------------------------------|:----------------|:-----------------------------|
 | `APN-OI-Replacement` | Conditional on successful non-emergency network-based authorization | 3GPP 10415/1427, UTF8String, canonical V/M set and P clear, singleton | `SwmDeaSubscriberAuthorization::apn_oi_replacement` | `swm_diameter_eap_subscriber_authorization.rs`: valid PLMN suffix and request-bound mobility provenance pass; syntax/length, vendor/flags, duplicate, result/emergency/mobility contradictions fail |
 | `APN-Configuration` and remaining children | Conditional authorized subscription profile | 3GPP 10415/1430, Grouped, canonical V/M set and P clear; baseline 0-1, ordered repetition only in the explicit projected profile | `SwmDiameterEapAnswer::apn_configurations`, `SwmAuthorizedApnConfiguration`, correlated authorization views | `swm_diameter_eap_apn_completion.rs`: complete core/supplement and Specific-APN-Info pass; missing/duplicate/misnested children, vendor/flags/type/length, prohibited SWm children, retention limits, mutation/transplant, and mobility/address contradictions fail |
-| `MIP6-Feature-Vector` | Conditional successful mobility selection | IETF 124, Unsigned64, canonical M set and V/P clear, singleton | `SwmDiameterEapAnswer::mip6_feature_vector` / correlated effective mobility | `app_dictionaries.rs`: offered PMIPv6/GTPv2 collective selection passes; unsolicited/non-success, local-address plus NBM contradiction, wrong width/flags/vendor, and duplicate fail |
+| `MIP6-Feature-Vector` | Conditional successful mobility selection | IETF 124, Unsigned64, canonical M set and V/P clear, singleton | `SwmDiameterEapAnswer::mip6_feature_vector` / correlated effective mobility | `app_dictionaries.rs`: offered PMIPv6/GTPv2 collective selection and RFC 5447 success-with-omitted-vector local fallback pass; unsolicited/non-success, local-address plus NBM contradiction, wrong width/flags/vendor, and duplicate fail |
 | `Mobile-Node-Identifier` | Conditional permanent identity | IETF 506, UTF8String, canonical M set and V/P clear, singleton | `SwmDiameterEapAnswer::mobile_node_identifier` | `app_dictionaries.rs`: synthetic UTF-8 identity round trip passes; malformed UTF-8, flags/vendor, duplicate, and request/correlated-identity mismatch fail with redacted diagnostics |
 | `Trace-Info` | Conditional subscriber/equipment trace activation | 3GPP 10415/1505, Grouped, canonical V set and M/P clear, singleton | `SwmDiameterEapAnswer::set_trace_info`; received data only through `SwmCorrelatedDiameterEapResponse::trace_info` | `swm_diameter_eap_trace.rs`: complete activation and authenticated correlation pass; missing/duplicate/misnested children, bitmap/URI/address bounds, vendor/flags, direct deactivation, replay/transplant, and DER placement fail |
 | `Subscription-Id` (MSISDN) | Conditional when MSISDN is available | IETF 443, Grouped, canonical M set and V clear, P permitted, singleton | `SwmDeaSubscriberAuthorization::subscription_id` / `SwmSubscriptionId` | `swm_diameter_eap_subscriber_authorization.rs`: E.164 and bounded optional children pass; wrong type/digits, missing/duplicate children, vendor/flags, unknown mandatory child, and duplicate outer group fail |

@@ -1775,10 +1775,8 @@ fn swm_mip6_authorization_is_collective_success_and_request_conditioned() {
     offered_request.mip6_feature_vector = Some(SwmMip6FeatureVector::gtpv2_only());
 
     let success_without_vector = sample_swm_answer();
-    assert!(matches!(
-        correlate_exchange(&offered_request, &success_without_vector, 1, 2),
-        Err(SwmEmergencyAuthorizationError::AnswerRequestMismatch)
-    ));
+    correlate_exchange(&offered_request, &success_without_vector, 1, 2)
+        .expect("RFC 5447 permits an exact-success DEA to omit the offered vector");
 
     let mut success_with_vector = sample_swm_answer();
     success_with_vector.mip6_feature_vector = Some(SwmMip6FeatureVector::gtpv2_only());

@@ -905,11 +905,14 @@ impl SwmDiameterEapAnswer {
     /// The operation requires exact base success, rejects emergency DERs,
     /// verifies request/answer identity and mobility selection, and ensures an
     /// explicitly requested APN is represented. Network-based-only fields are
-    /// rejected unless the DEA selected GTPv2 or PMIPv6. A non-network-based
-    /// profile must carry a canonical gateway identity for every APN, and an
-    /// explicit DEA feature vector must select integrated HA discovery. This
-    /// compatibility helper retains the answer's current default pointer; use
-    /// [`Self::set_authorized_apn_profile_for`] to replace both atomically.
+    /// rejected unless the effective mobility mode is network-based — an
+    /// explicit DEA GTPv2/PMIPv6 selection, or trusted local network-based
+    /// provenance on the request envelope when the DEA omits the vector. A
+    /// non-network-based profile must carry a canonical gateway identity for
+    /// every APN, and an explicit DEA feature vector must select integrated HA
+    /// discovery. This compatibility helper retains the answer's current
+    /// default pointer; use [`Self::set_authorized_apn_profile_for`] to
+    /// replace both atomically.
     pub fn set_authorized_apn_configurations_for(
         &mut self,
         request: &SwmDiameterEapRequestEnvelope,

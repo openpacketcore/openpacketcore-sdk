@@ -889,7 +889,7 @@ fn checked_mutator_rejects_request_result_mobility_and_correlation_contradiction
             .set_authorized_apn_configurations_for(&normal, vec![complete()])
             .expect_err("network fields require selected NBM")
             .code(),
-        swm::SwmApnConfigurationErrorCode::RequestMismatch
+        swm::SwmApnConfigurationErrorCode::MobilityModeMismatch
     );
 
     let wrong = swm::SwmAuthorizedApnConfiguration::new(sample_core(

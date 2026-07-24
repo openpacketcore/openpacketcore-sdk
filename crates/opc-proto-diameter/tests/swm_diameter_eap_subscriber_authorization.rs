@@ -1321,6 +1321,47 @@ fn local_mobility_provenance_is_explicit_replay_safe_and_aaa_precedent() {
         .mip6_feature_vector
         .is_some_and(|value| value.contains(SwmMip6FeatureVector::PMIP6_SUPPORTED)));
 
+    let omitted_exchange = offered
+        .clone()
+        .correlate_answer(SwmDiameterEapAnswerEnvelope::for_outbound(
+            successful_answer(authorization.clone()),
+            offered.transaction(),
+        ))
+        .expect("an offered vector correlates when the exact-success DEA omits it");
+    assert_eq!(
+        omitted_exchange.mobility_mode_source(),
+        Some(SwmConditionalValueSource::LocallyConfigured)
+    );
+    assert_eq!(
+        omitted_exchange.effective_mobility_mode(),
+        Some(SwmLocallyConfiguredMobilityMode::NetworkBased)
+    );
+    assert_eq!(omitted_exchange.answer().mip6_feature_vector, None);
+
+    let offered_plain = swm::parse_swm_diameter_eap_request_envelope(
+        &decode(&offered_wire),
+        typed_context(UnknownIePolicy::Preserve),
+    )
+    .expect("NBM DER envelope");
+    assert!(swm::build_swm_diameter_eap_answer_for(
+        &offered_plain,
+        &successful_answer(SwmDeaSubscriberAuthorization::new()),
+        EncodeContext::default(),
+    )
+    .is_ok());
+    assert!(swm::build_swm_diameter_eap_answer_for(
+        &offered_plain,
+        &successful_answer(authorization.clone()),
+        EncodeContext::default(),
+    )
+    .is_err());
+    assert!(swm::build_swm_diameter_eap_answer_for(
+        &offered,
+        &successful_answer(authorization.clone()),
+        EncodeContext::default(),
+    )
+    .is_ok());
+
     let mut local_assignment = successful_answer(SwmDeaSubscriberAuthorization::new());
     local_assignment.mip6_feature_vector = Some(SwmMip6FeatureVector::from_bits_retain(
         SwmMip6FeatureVector::ASSIGN_LOCAL_IP,

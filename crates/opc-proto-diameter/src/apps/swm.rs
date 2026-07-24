@@ -2993,6 +2993,10 @@ pub enum SwmDiameterEapCorrelationError {
     /// The answer's Auth-Request-Type differs from the request.
     AuthRequestTypeMismatch,
     /// A successful answer omitted mobility features required by the offer.
+    ///
+    /// No longer produced: RFC 5447 does not require a DEA to echo the
+    /// offered vector, so omission correlates with the trusted local
+    /// mobility mode. Retained for stable diagnostic-code compatibility.
     MobilityFeatureMissing,
     /// The answer's mobility features contradict or exceed the request offer.
     MobilityFeatureMismatch,
@@ -10659,8 +10663,11 @@ fn mobility_answer_matches_offer(
         return authorized.is_none();
     }
     match (offered, authorized) {
-        (None, None) => true,
-        (Some(_), None) => false,
+        // RFC 5447 section 4.2.5 does not require an answer to echo the
+        // offered vector, and 3GPP TS 29.273 models it as optional in the
+        // DEA: an omitted vector signals no AAA-derived mobility selection,
+        // leaving the trusted locally configured mode effective.
+        (_, None) => true,
         (None, Some(_)) => false,
         (Some(offered), Some(authorized)) => {
             let offered_nbm = offered.bits() & SwmMip6FeatureVector::NETWORK_BASED_MOBILITY_BITS;
@@ -11129,11 +11136,13 @@ fn ensure_correlated_response(
         if request.auth_request_type != answer.auth_request_type {
             return Err(SwmDiameterEapCorrelationError::AuthRequestTypeMismatch);
         }
-        ensure_correlated_mobility_features(
+        if !mobility_answer_matches_offer(
             request.mip6_feature_vector,
             answer.mip6_feature_vector,
             answer.result.is_diameter_success(),
-        )?;
+        ) {
+            return Err(SwmDiameterEapCorrelationError::MobilityFeatureMismatch);
+        }
         if !subscriber_authorization_matches_request(request_envelope, answer) {
             return Err(SwmDiameterEapCorrelationError::SubscriberAuthorizationMismatch);
         }
@@ -11152,20 +11161,6 @@ fn ensure_correlated_response(
         if answer.validate_for_correlation().is_err() {
             return Err(SwmDiameterEapCorrelationError::AnswerValidationFailure);
         }
-    }
-    Ok(())
-}
-
-fn ensure_correlated_mobility_features(
-    offered: Option<SwmMip6FeatureVector>,
-    authorized: Option<SwmMip6FeatureVector>,
-    exact_success: bool,
-) -> Result<(), SwmDiameterEapCorrelationError> {
-    if exact_success && offered.is_some() && authorized.is_none() {
-        return Err(SwmDiameterEapCorrelationError::MobilityFeatureMissing);
-    }
-    if !mobility_answer_matches_offer(offered, authorized, exact_success) {
-        return Err(SwmDiameterEapCorrelationError::MobilityFeatureMismatch);
     }
     Ok(())
 }
@@ -11585,12 +11580,23 @@ mod diameter_eap_correlation_tests {
     }
 
     #[test]
-    fn successful_answer_missing_offered_mobility_has_typed_outcome() {
+    fn successful_answer_may_omit_offered_mobility_vector() {
         let mut request = bound_request();
         request.request.mip6_feature_vector = Some(SwmMip6FeatureVector::gtpv2_only());
+        assert!(correlate_application(request, answer_facts()).is_ok());
+    }
+
+    #[test]
+    fn non_success_answer_with_mobility_vector_has_typed_outcome() {
+        let mut request = bound_request();
+        request.request.mip6_feature_vector = Some(SwmMip6FeatureVector::gtpv2_only());
+        let mut answer = answer_facts();
+        answer.result = SwmDiameterResult::Base(DIAMETER_MULTI_ROUND_AUTH);
+        answer.eap_payload = Some(vec![1, 0x35, 0, 5, 1].into());
+        answer.mip6_feature_vector = Some(SwmMip6FeatureVector::gtpv2_only());
         assert_correlation_error(
-            correlate_application(request, answer_facts()),
-            SwmDiameterEapCorrelationError::MobilityFeatureMissing,
+            correlate_application(request, answer),
+            SwmDiameterEapCorrelationError::MobilityFeatureMismatch,
         );
     }
 
@@ -11625,7 +11631,14 @@ mod diameter_eap_correlation_tests {
         answer.subscriber_authorization =
             SwmDeaSubscriberAuthorization::new().with_apn_oi_replacement(apn_oi_replacement);
         assert_correlation_error(
-            correlate_application(bound_request(), answer),
+            correlate_application(bound_request(), answer.clone()),
+            SwmDiameterEapCorrelationError::SubscriberAuthorizationMismatch,
+        );
+
+        let mut offered = bound_request();
+        offered.request.mip6_feature_vector = Some(SwmMip6FeatureVector::gtpv2_only());
+        assert_correlation_error(
+            correlate_application(offered, answer),
             SwmDiameterEapCorrelationError::SubscriberAuthorizationMismatch,
         );
     }

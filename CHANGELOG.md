@@ -51,6 +51,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Hop-by-Hop and setting T (#394).
 
 ### Changed
+- **SWm DEA mobility-vector omission — `opc-proto-diameter`:** exact-success
+  Diameter-EAP correlation no longer rejects an answer that omits
+  `MIP6-Feature-Vector` after the DER offered it. RFC 5447 defines no echo
+  requirement and 3GPP TS 29.273 models the DEA vector as category O, whose
+  absence per TS 29.228 clause 6 shall not cause an application error, so
+  omission now signals that no AAA-derived mobility selection was made and
+  the trusted locally configured mobility mode retained by the request
+  envelope stays effective with `LocallyConfigured` provenance (TS 29.273
+  preconfigured-information fallback). The request-conditioned outbound DEA
+  builder shares the same predicate, so a success answer may likewise be
+  built without the vector. APN mutation against an offered DER whose answer
+  omits the vector without any mobility provenance now reports the precise
+  `MobilityModeMismatch` instead of `RequestMismatch`. Unsolicited,
+  out-of-offer, contradictory, structurally invalid, and non-success answer
+  vectors still fail with the existing stable codes;
+  `MobilityFeatureMissing` is retained for diagnostic-code stability but is
+  no longer produced (#523).
 - **SWm authorization-session state projection — `opc-proto-diameter`:**
   ordinary correlated DEA responses now expose bounded, opaque RFC 6733
   `Class` replacement state plus Session-Binding and
