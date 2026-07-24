@@ -28,7 +28,7 @@ tracing = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 thiserror = { workspace = true }
 url = "2.5"
-base64 = "0.22"
+base64 = "0.23"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
