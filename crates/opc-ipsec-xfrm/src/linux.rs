@@ -14,12 +14,12 @@ use opc_linux_xfrm_sys::{
     ReceiveMessageOutcome, LINUX_EINVAL, LINUX_ENOPROTOOPT, NLMSG_DONE, NLMSG_ERROR, NLM_F_ACK,
     NLM_F_CREATE, NLM_F_EXCL, NLM_F_REPLACE, NLM_F_REQUEST, XFRMA_ALG_AEAD, XFRMA_ALG_AUTH,
     XFRMA_ALG_AUTH_TRUNC, XFRMA_ALG_CRYPT, XFRMA_ENCAP, XFRMA_IF_ID, XFRMA_LASTUSED, XFRMA_MARK,
-    XFRMA_PAD, XFRMA_POLICY_TYPE, XFRMA_REPLAY_ESN_VAL, XFRMA_REPLAY_VAL, XFRMA_SA_DIR,
-    XFRMA_SET_MARK, XFRMA_SET_MARK_MASK, XFRMA_TMPL, XFRM_AE_RVAL, XFRM_MSG_ALLOCSPI,
+    XFRMA_OFFLOAD_DEV, XFRMA_PAD, XFRMA_POLICY_TYPE, XFRMA_REPLAY_ESN_VAL, XFRMA_REPLAY_VAL,
+    XFRMA_SA_DIR, XFRMA_SET_MARK, XFRMA_SET_MARK_MASK, XFRMA_TMPL, XFRM_AE_RVAL, XFRM_MSG_ALLOCSPI,
     XFRM_MSG_DELPOLICY, XFRM_MSG_DELSA, XFRM_MSG_GETPOLICY, XFRM_MSG_GETSA, XFRM_MSG_MIGRATE_STATE,
     XFRM_MSG_NEWAE, XFRM_MSG_NEWPOLICY, XFRM_MSG_NEWSA, XFRM_MSG_UPDPOLICY, XFRM_MSG_UPDSA,
     XFRM_POLICY_ALLOW, XFRM_POLICY_BLOCK, XFRM_POLICY_FWD, XFRM_POLICY_IN, XFRM_POLICY_OUT,
-    XFRM_POLICY_TYPE_MAIN, XFRM_SA_DIR_OUT, XFRM_STATE_ESN,
+    XFRM_POLICY_TYPE_MAIN, XFRM_SA_DIR_IN, XFRM_SA_DIR_OUT, XFRM_STATE_ESN,
 };
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
@@ -29,6 +29,7 @@ use crate::model::{
     sa_uses_esn, validate_relocate_sa_request, validate_sa_output_mark, validate_sa_query,
 };
 use crate::namespace::{self, NamespaceBoundLinuxXfrmBackend, NetworkNamespaceBinding};
+use crate::observation::{EspPeerObservationKey, EspPeerObservationRegistration};
 use crate::outbound_binding::{
     expected_policy, expected_sa, readback_mismatch, OutboundSaCryptoExpectation,
     OutboundSaPolicyExpectation,
@@ -496,6 +497,31 @@ impl LinuxXfrmBackend {
             .await?
             .ok_or_else(|| XfrmError::io(operation, invalid_data("missing getsa response")))?;
         parse_sa_relocation_snapshot(&response)
+    }
+
+    pub(crate) async fn query_esp_peer_observation_registration(
+        &self,
+        requested: EspPeerObservationKey,
+    ) -> Result<EspPeerObservationRegistration, XfrmError> {
+        const OPERATION: &str = "query_esp_peer_observation_registration";
+
+        if !matches!(requested.direction, XfrmDirection::In) {
+            return Err(XfrmError::invalid_config(
+                "esp_peer_observation.direction",
+                "only inbound SAs produce decap observations",
+            ));
+        }
+        let body = encode_sa_id(
+            requested.id.destination,
+            requested.id.protocol,
+            requested.id.spi,
+            requested.mark,
+        )?;
+        let response = self
+            .transact_blocking(OPERATION, XFRM_MSG_GETSA, NLM_F_REQUEST | NLM_F_ACK, body)
+            .await?
+            .ok_or_else(|| XfrmError::io(OPERATION, invalid_data("missing getsa response")))?;
+        parse_esp_peer_observation_registration(&response, requested)
     }
 
     async fn query_policy_for_outbound_binding(
@@ -2212,6 +2238,227 @@ fn parse_sa_relocation_snapshot(payload: &[u8]) -> Result<SaRelocationSnapshot, 
         output_mark: state.output_mark,
     };
     Ok(SaRelocationSnapshot { state, identity })
+}
+
+fn parse_esp_peer_observation_registration(
+    payload: &[u8],
+    requested: EspPeerObservationKey,
+) -> Result<EspPeerObservationRegistration, XfrmError> {
+    const OPERATION: &str = "query_esp_peer_observation_registration";
+
+    validate_allowed_route_attributes(
+        payload,
+        XFRM_USER_SA_INFO_LEN,
+        &[
+            XFRMA_ALG_AUTH,
+            XFRMA_ALG_AUTH_TRUNC,
+            XFRMA_ALG_CRYPT,
+            XFRMA_ENCAP,
+            XFRMA_REPLAY_VAL,
+            XFRMA_LASTUSED,
+            XFRMA_ALG_AEAD,
+            XFRMA_MARK,
+            XFRMA_REPLAY_ESN_VAL,
+            XFRMA_PAD,
+            XFRMA_OFFLOAD_DEV,
+            XFRMA_SET_MARK,
+            XFRMA_SET_MARK_MASK,
+            XFRMA_IF_ID,
+            XFRMA_SA_DIR,
+        ],
+        OPERATION,
+    )?;
+    if unique_route_attribute(payload, XFRM_USER_SA_INFO_LEN, XFRMA_OFFLOAD_DEV, OPERATION)?
+        .is_some()
+    {
+        return Err(XfrmError::UnsupportedFeature {
+            feature: "esp_peer_observation_xfrm_offload",
+        });
+    }
+
+    let snapshot = parse_sa_relocation_snapshot(payload)?;
+    if snapshot.state.id != requested.id {
+        return Err(XfrmError::StateMismatch {
+            operation: OPERATION,
+        });
+    }
+    if snapshot.identity.if_id != requested.if_id
+        || !observation_mark_selects(requested.mark, snapshot.identity.mark)
+    {
+        return Err(XfrmError::StateMismatch {
+            operation: OPERATION,
+        });
+    }
+    if snapshot.identity.mark.is_some_and(|mark| mark.mask == 0)
+        || snapshot.identity.if_id == Some(0)
+    {
+        return Err(XfrmError::io(
+            OPERATION,
+            invalid_data("noncanonical SA identity"),
+        ));
+    }
+
+    if let Some(direction) =
+        unique_route_attribute(payload, XFRM_USER_SA_INFO_LEN, XFRMA_SA_DIR, OPERATION)?
+    {
+        if direction != [XFRM_SA_DIR_IN] {
+            return Err(XfrmError::StateMismatch {
+                operation: OPERATION,
+            });
+        }
+    }
+    validate_esp_peer_observation_replay(payload)?;
+    if snapshot.state.source_address.is_unspecified()
+        || snapshot.state.id.destination.is_unspecified()
+        || family_of_ip(snapshot.state.source_address)
+            != family_of_ip(snapshot.state.id.destination)
+    {
+        return Err(XfrmError::io(
+            OPERATION,
+            invalid_data("invalid SA outer address"),
+        ));
+    }
+
+    let encap = snapshot
+        .identity
+        .encap
+        .ok_or(XfrmError::UnsupportedFeature {
+            feature: "esp_peer_observation_requires_esp_in_udp",
+        })?;
+    encap
+        .validate_esp_in_udp()
+        .map_err(|_| XfrmError::UnsupportedFeature {
+            feature: "esp_peer_observation_requires_esp_in_udp",
+        })?;
+    validate_esp_peer_observation_crypto(payload)?;
+
+    Ok(EspPeerObservationRegistration {
+        key: EspPeerObservationKey {
+            id: snapshot.state.id,
+            mark: snapshot.identity.mark,
+            if_id: snapshot.identity.if_id,
+            direction: XfrmDirection::In,
+        },
+        current_outer_source: snapshot.state.source_address,
+        current_outer_source_port: encap.source_port,
+        integrity_protected: true,
+    })
+}
+
+fn observation_mark_selects(requested: Option<XfrmMark>, observed: Option<XfrmMark>) -> bool {
+    match (requested, observed) {
+        (None, None) => true,
+        (Some(requested), Some(observed)) => {
+            requested.mask == observed.mask
+                && requested.value & observed.mask == observed.value & observed.mask
+        }
+        _ => false,
+    }
+}
+
+fn validate_esp_peer_observation_crypto(payload: &[u8]) -> Result<(), XfrmError> {
+    const OPERATION: &str = "query_esp_peer_observation_registration";
+
+    let legacy_auth =
+        unique_route_attribute(payload, XFRM_USER_SA_INFO_LEN, XFRMA_ALG_AUTH, OPERATION)?
+            .map(|attribute| parse_observed_sa_algorithm(attribute, XFRM_ALGO_HEADER_LEN))
+            .transpose()?;
+    let auth = unique_route_attribute(
+        payload,
+        XFRM_USER_SA_INFO_LEN,
+        XFRMA_ALG_AUTH_TRUNC,
+        OPERATION,
+    )?
+    .map(parse_observed_sa_auth)
+    .transpose()?;
+    let crypt = unique_route_attribute(payload, XFRM_USER_SA_INFO_LEN, XFRMA_ALG_CRYPT, OPERATION)?
+        .map(|attribute| parse_observed_sa_algorithm(attribute, XFRM_ALGO_HEADER_LEN))
+        .transpose()?;
+    let aead = unique_route_attribute(payload, XFRM_USER_SA_INFO_LEN, XFRMA_ALG_AEAD, OPERATION)?
+        .map(parse_observed_sa_aead)
+        .transpose()?;
+
+    if let Some(aead) = aead {
+        if legacy_auth.is_some() || auth.is_some() || crypt.is_some() {
+            return Err(XfrmError::io(
+                OPERATION,
+                invalid_data("contradictory SA algorithm attributes"),
+            ));
+        }
+        if aead.icv_len_bits == 0 || aead.algorithm.key.is_empty() || aead.algorithm.name.is_empty()
+        {
+            return Err(XfrmError::UnsupportedFeature {
+                feature: "esp_peer_observation_unauthenticated_sa",
+            });
+        }
+        return Ok(());
+    }
+
+    let auth = auth.ok_or(XfrmError::UnsupportedFeature {
+        feature: "esp_peer_observation_unauthenticated_sa",
+    })?;
+    if crypt.is_none()
+        || auth.truncation_len_bits == 0
+        || auth.algorithm.key.is_empty()
+        || auth.algorithm.name.is_empty()
+        || auth.algorithm.name == "digest_null"
+    {
+        return Err(XfrmError::UnsupportedFeature {
+            feature: "esp_peer_observation_unauthenticated_sa",
+        });
+    }
+    if let Some(legacy_auth) = legacy_auth {
+        let redundant_key_matches = bool::from(legacy_auth.key.ct_eq(auth.algorithm.key));
+        if legacy_auth.name != auth.algorithm.name || !redundant_key_matches {
+            return Err(XfrmError::io(
+                OPERATION,
+                invalid_data("contradictory SA authentication attributes"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_esp_peer_observation_replay(payload: &[u8]) -> Result<(), XfrmError> {
+    const OPERATION: &str = "query_esp_peer_observation_registration";
+
+    let legacy =
+        unique_route_attribute(payload, XFRM_USER_SA_INFO_LEN, XFRMA_REPLAY_VAL, OPERATION)?;
+    let extended = unique_route_attribute(
+        payload,
+        XFRM_USER_SA_INFO_LEN,
+        XFRMA_REPLAY_ESN_VAL,
+        OPERATION,
+    )?;
+    if legacy.is_some() && extended.is_some() {
+        return Err(XfrmError::io(
+            OPERATION,
+            invalid_data("contradictory SA replay attributes"),
+        ));
+    }
+
+    let fixed_window = u32::from(read_u8(payload, 215)?);
+    let esn_flag = read_u8(payload, 216)? & XFRM_STATE_ESN != 0;
+    let enabled = if let Some(extended) = extended {
+        decode_replay_state_esn(extended)?.replay_window > 0
+    } else if let Some(legacy) = legacy {
+        !esn_flag && decode_replay_state_legacy(legacy, fixed_window)?.replay_window > 0
+    } else {
+        !esn_flag && fixed_window > 0
+    };
+    if !enabled {
+        return Err(XfrmError::UnsupportedFeature {
+            feature: "esp_peer_observation_replay_disabled",
+        });
+    }
+    Ok(())
+}
+
+const fn family_of_ip(address: IpAddress) -> u8 {
+    match address {
+        IpAddress::Ipv4(_) => 4,
+        IpAddress::Ipv6(_) => 6,
+    }
 }
 
 fn parse_outbound_sa_binding_snapshot(
@@ -4257,6 +4504,15 @@ mod tests {
         test_outbound_binding_readback_bodies(&request).unwrap().1
     }
 
+    fn observation_key(parameters: &SaParameters) -> EspPeerObservationKey {
+        EspPeerObservationKey {
+            id: parameters.id,
+            mark: parameters.mark,
+            if_id: parameters.if_id,
+            direction: XfrmDirection::In,
+        }
+    }
+
     fn dscp_config() -> LinuxXfrmDscpMarkingConfig {
         let mut config = LinuxXfrmDscpMarkingConfig::new([String::from("eth0")], 25).unwrap();
         config.bpffs_pin_root = "/sys/fs/bpf/opc-ipsec-xfrm-dscp-test".into();
@@ -4617,6 +4873,121 @@ mod tests {
         assert_eq!(snapshot.identity.if_id, parameters.if_id);
         assert_eq!(snapshot.identity.output_mark, parameters.output_mark);
         assert_eq!(snapshot.identity.id, parameters.id);
+    }
+
+    #[test]
+    fn esp_peer_observation_registration_is_derived_from_exact_getsa() {
+        let parameters = relocation_parameters();
+        let body = encode_sa_info(&parameters).unwrap();
+        let registration =
+            parse_esp_peer_observation_registration(&body, observation_key(&parameters)).unwrap();
+
+        assert_eq!(registration.key.id, parameters.id);
+        assert_eq!(registration.key.mark, parameters.mark);
+        assert_eq!(registration.key.if_id, parameters.if_id);
+        assert_eq!(registration.key.direction, XfrmDirection::In);
+        assert_eq!(registration.current_outer_source, parameters.source_address);
+        assert_eq!(
+            registration.current_outer_source_port,
+            parameters.encap.unwrap().source_port
+        );
+        assert!(registration.integrity_protected);
+    }
+
+    #[test]
+    fn esp_peer_observation_registration_uses_raw_kernel_mark() {
+        let parameters = relocation_parameters();
+        let body = encode_sa_info(&parameters).unwrap();
+        let mut requested = observation_key(&parameters);
+        requested.mark = Some(XfrmMark {
+            value: 0xaabb_1234,
+            mask: 0xffff_0000,
+        });
+
+        let registration = parse_esp_peer_observation_registration(&body, requested).unwrap();
+        assert_eq!(registration.key.mark, parameters.mark);
+
+        requested.mark = Some(XfrmMark {
+            value: 0xbbbb_1234,
+            mask: 0xffff_0000,
+        });
+        assert!(matches!(
+            parse_esp_peer_observation_registration(&body, requested),
+            Err(XfrmError::StateMismatch {
+                operation: "query_esp_peer_observation_registration"
+            })
+        ));
+    }
+
+    #[test]
+    fn esp_peer_observation_registration_rejects_unsafe_sa_shapes() {
+        let parameters = relocation_parameters();
+        let requested = observation_key(&parameters);
+        let clean = encode_sa_info(&parameters).unwrap();
+
+        let mut offloaded = clean.clone();
+        append_attr(&mut offloaded, XFRMA_OFFLOAD_DEV, &[0; 8]).unwrap();
+        assert!(matches!(
+            parse_esp_peer_observation_registration(&offloaded, requested),
+            Err(XfrmError::UnsupportedFeature {
+                feature: "esp_peer_observation_xfrm_offload"
+            })
+        ));
+
+        let mut outbound = clean.clone();
+        append_attr(&mut outbound, XFRMA_SA_DIR, &[XFRM_SA_DIR_OUT]).unwrap();
+        assert!(parse_esp_peer_observation_registration(&outbound, requested).is_err());
+
+        let mut noncanonical_unspecified_direction = clean.clone();
+        append_attr(&mut noncanonical_unspecified_direction, XFRMA_SA_DIR, &[0]).unwrap();
+        assert!(parse_esp_peer_observation_registration(
+            &noncanonical_unspecified_direction,
+            requested,
+        )
+        .is_err());
+
+        let mut replay_disabled = clean.clone();
+        replay_disabled[215] = 0;
+        assert!(matches!(
+            parse_esp_peer_observation_registration(&replay_disabled, requested),
+            Err(XfrmError::UnsupportedFeature {
+                feature: "esp_peer_observation_replay_disabled"
+            })
+        ));
+
+        let mut crypt_only = clean;
+        remove_route_attr(&mut crypt_only, XFRM_USER_SA_INFO_LEN, XFRMA_ALG_AUTH_TRUNC);
+        assert!(matches!(
+            parse_esp_peer_observation_registration(&crypt_only, requested),
+            Err(XfrmError::UnsupportedFeature {
+                feature: "esp_peer_observation_unauthenticated_sa"
+            })
+        ));
+
+        let mut esn_parameters = parameters;
+        esn_parameters.replay_window = 64;
+        let mut replay_state = SaReplayState::fresh(64);
+        replay_state.esn = true;
+        esn_parameters.replay_state = Some(replay_state);
+        let mut zero_active_esn_window = encode_sa_info(&esn_parameters).unwrap();
+        // A nonzero legacy byte must not mask the selected ESN/BMP window.
+        zero_active_esn_window[215] = 32;
+        let replay = route_attr_payload_offset_from(
+            &zero_active_esn_window,
+            XFRM_USER_SA_INFO_LEN,
+            XFRMA_REPLAY_ESN_VAL,
+        )
+        .unwrap();
+        zero_active_esn_window[replay + 20..replay + 24].fill(0);
+        assert!(matches!(
+            parse_esp_peer_observation_registration(
+                &zero_active_esn_window,
+                observation_key(&esn_parameters),
+            ),
+            Err(XfrmError::UnsupportedFeature {
+                feature: "esp_peer_observation_replay_disabled"
+            })
+        ));
     }
 
     #[test]

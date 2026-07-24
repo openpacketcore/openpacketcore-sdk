@@ -262,6 +262,8 @@ pub const XFRMA_MARK: u16 = 21;
 pub const XFRMA_REPLAY_ESN_VAL: u16 = 23;
 /// Empty netlink alignment attribute.
 pub const XFRMA_PAD: u16 = 27;
+/// XFRM hardware or packet-offload device attribute.
+pub const XFRMA_OFFLOAD_DEV: u16 = 28;
 /// XFRM post-transform output skb-mark value attribute.
 pub const XFRMA_SET_MARK: u16 = 29;
 /// XFRM post-transform output skb-mark mask attribute.
@@ -273,6 +275,8 @@ pub const XFRMA_SA_DIR: u16 = 34;
 
 /// Main Security Policy Database policy type.
 pub const XFRM_POLICY_TYPE_MAIN: u8 = 0;
+/// Inbound Security Association direction.
+pub const XFRM_SA_DIR_IN: u8 = 1;
 /// Outbound Security Association direction.
 pub const XFRM_SA_DIR_OUT: u8 = 2;
 
@@ -733,12 +737,14 @@ mod tests {
         assert_eq!(XFRMA_MARK, 21);
         assert_eq!(XFRMA_REPLAY_ESN_VAL, 23);
         assert_eq!(XFRMA_PAD, 27);
+        assert_eq!(XFRMA_OFFLOAD_DEV, 28);
         assert_eq!(XFRMA_IF_ID, 31);
         assert_eq!(XFRMA_SA_DIR, 34);
         assert_eq!(XFRMA_SET_MARK, 29);
         assert_eq!(XFRMA_SET_MARK_MASK, 30);
         assert_eq!(XFRM_STATE_ESN, 0x80);
         assert_eq!(XFRM_POLICY_TYPE_MAIN, 0);
+        assert_eq!(XFRM_SA_DIR_IN, 1);
         assert_eq!(XFRM_SA_DIR_OUT, 2);
         assert_eq!(XFRM_MIGRATE_STATE_CLEAR_OFFLOAD, 1);
         assert_eq!(XFRM_MIGRATE_STATE_UPDATE_H2H_SEL, 2);

@@ -7,6 +7,13 @@ use std::time::Instant;
 use async_trait::async_trait;
 use tokio::sync::{mpsc, oneshot};
 
+#[cfg(target_os = "linux")]
+use crate::observation::linux::LinuxEspPeerObservationKernelSource;
+#[cfg(target_os = "linux")]
+use crate::observation::{
+    EspPeerObservationKey, EspPeerObservationRegistration, LinuxEspPeerObservationConfig,
+    LinuxEspPeerObservationMonitor,
+};
 use crate::{
     counter_resume::{
         map_backend_error, CounterRecoveryActorRequest, CounterResumeActorRequest,
@@ -273,6 +280,41 @@ impl NamespaceBoundLinuxXfrmBackend {
         self.inner.actor_binding.clone()
     }
 
+    /// Load and attach the production CO-RE ESP peer observation source in
+    /// this backend's pinned network namespace.
+    ///
+    /// The host must expose kernel BTF and permit loading and attaching every
+    /// required tracing program. Construction fails closed if any program,
+    /// map, namespace-cookie binding, verifier check, or link attachment is
+    /// unavailable; it never returns a partially admitted monitor.
+    #[cfg(target_os = "linux")]
+    pub async fn create_esp_peer_observation_monitor(
+        &self,
+        config: LinuxEspPeerObservationConfig,
+    ) -> Result<LinuxEspPeerObservationMonitor, XfrmError> {
+        let source = self
+            .dispatch(LostReply::ReadOnly, |reply| {
+                NamespaceCommand::CreateEspPeerObservationSource(config, reply)
+            })
+            .await?;
+        Ok(LinuxEspPeerObservationMonitor::from_kernel_source(
+            self.clone(),
+            config,
+            source,
+        ))
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) async fn query_esp_peer_observation_registration(
+        &self,
+        key: EspPeerObservationKey,
+    ) -> Result<EspPeerObservationRegistration, XfrmError> {
+        self.dispatch(LostReply::ReadOnly, |reply| {
+            NamespaceCommand::QueryEspPeerObservationRegistration(key, reply)
+        })
+        .await
+    }
+
     async fn dispatch<T>(
         &self,
         lost_reply: LostReply,
@@ -516,6 +558,16 @@ enum NamespaceCommand {
         QuerySaRequest,
         oneshot::Sender<Result<SaRelocationIdentity, XfrmError>>,
     ),
+    #[cfg(target_os = "linux")]
+    QueryEspPeerObservationRegistration(
+        EspPeerObservationKey,
+        oneshot::Sender<Result<EspPeerObservationRegistration, XfrmError>>,
+    ),
+    #[cfg(target_os = "linux")]
+    CreateEspPeerObservationSource(
+        LinuxEspPeerObservationConfig,
+        oneshot::Sender<Result<LinuxEspPeerObservationKernelSource, XfrmError>>,
+    ),
     RekeySa(RekeySaRequest, oneshot::Sender<Result<(), XfrmError>>),
     RelocateSa(RelocateSaRequest, oneshot::Sender<Result<(), XfrmError>>),
     RemoveSa(RemoveSaRequest, oneshot::Sender<Result<(), XfrmError>>),
@@ -570,6 +622,14 @@ impl NamespaceCommand {
             }
             Self::QuerySaRelocationIdentity(request, reply) => {
                 let _ = reply.send(backend.query_sa_relocation_identity(request).await);
+            }
+            #[cfg(target_os = "linux")]
+            Self::QueryEspPeerObservationRegistration(key, reply) => {
+                let _ = reply.send(backend.query_esp_peer_observation_registration(key).await);
+            }
+            #[cfg(target_os = "linux")]
+            Self::CreateEspPeerObservationSource(config, reply) => {
+                let _ = reply.send(LinuxEspPeerObservationKernelSource::load(config));
             }
             Self::RekeySa(request, reply) => {
                 state.invalidate_counter_receipts();
@@ -676,6 +736,14 @@ impl NamespaceCommand {
                 let _ = reply.send(Err(error));
             }
             Self::QuerySaRelocationIdentity(_, reply) => {
+                let _ = reply.send(Err(error));
+            }
+            #[cfg(target_os = "linux")]
+            Self::QueryEspPeerObservationRegistration(_, reply) => {
+                let _ = reply.send(Err(error));
+            }
+            #[cfg(target_os = "linux")]
+            Self::CreateEspPeerObservationSource(_, reply) => {
                 let _ = reply.send(Err(error));
             }
             Self::ValidateOutboundBinding(_, reply) => {

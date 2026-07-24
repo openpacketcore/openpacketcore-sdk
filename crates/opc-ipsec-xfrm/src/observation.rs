@@ -1,28 +1,25 @@
 //! Authenticated ESP peer outer-source observations for NAT rebinding.
 //!
-//! An [`EspPeerObservationBoundary`] turns kernel-attributed ESP decap events
-//! into bounded, typed observations: an established inbound ESP-in-UDP SA that
-//! starts arriving from a new outer source produces exactly one
-//! [`EspPeerObservation`] retaining only the minimum routing facts needed for
-//! policy (address family, ingress interface identity, encapsulation source
-//! address and port, a monotonic per-SA generation, and an explicit loss
+//! A [`LinuxEspPeerObservationMonitor`] turns kernel-attributed ESP decap
+//! events into bounded, typed observations: an established inbound ESP-in-UDP
+//! SA that starts arriving from a new outer source produces one
+//! [`EspPeerObservation`] retaining only the routing facts needed for policy
+//! (address family, kernel ingress-interface identity, encapsulation source
+//! address and port, a monotonic per-SA generation, and explicit loss
 //! status). This is the observation authority a product needs before an
-//! RFC 7296 section 2.23 recovery procedure can update the path; it is
+//! RFC 7296 section 2.23 recovery procedure can update the path. It is
 //! deliberately distinct from applying a caller-supplied relocation
-//! ([`crate::RelocateSaRequest`]). The boundary never applies a relocation and
-//! never infers one from packet sources: it only reports.
+//! ([`crate::RelocateSaRequest`]): the monitor reports; product policy decides
+//! whether to relocate.
 //!
 //! # Trust anchor
 //!
-//! "Authenticated" here means the Linux kernel ESP decap path verified the
-//! packet integrity (ICV or AEAD) **and** the packet won the final anti-replay
-//! advance on the exact SA the event names. Only an
-//! [`EspPeerObservationSource`] whose events carry
-//! [`EspPeerEventProvenance::PostFinalReplayAccepted`] may feed this boundary;
-//! anything weaker (raw sockets, tc/XDP ingress copies, or the stock
-//! `XFRM_MSG_MAPPING` notification) is rejected and must never be adapted
-//! upward, because none of those can exclude unauthenticated or replay-losing
-//! traffic:
+//! "Authenticated" means the Linux ESP input path verified ICV/AEAD and
+//! `xfrm_replay_recheck` returned success for the exact SA. The CO-RE source
+//! observes that final decision while the SA lock remains held immediately
+//! before Linux advances replay state, so a concurrent duplicate cannot also
+//! win. Raw sockets, tc/XDP ingress copies, and stock `XFRM_MSG_MAPPING` must
+//! not be adapted into this authority:
 //!
 //! - Stock `XFRM_MSG_MAPPING` is emitted from the ESP input completion path
 //!   after ICV verification but *before* the final replay recheck in
@@ -34,17 +31,25 @@
 //!   signal, and it carries no ESP sequence, ingress ifindex, XFRM `if_id`,
 //!   or lookup mark.
 //!
-//! For that reason this crate ships the boundary, the provenance contract, and
-//! a scripted replay source (feature `testkit`), but no stock-kernel event
-//! source: no stock Linux UAPI today satisfies the contract (post-final-replay
-//! emission with exact SA mark/`if_id`/direction, ingress ifindex, outer
-//! source/port, ESP sequence including ESN high bits, and a queryable
-//! loss/generation cursor). A platform event that does satisfy it (for
-//! example a qualified kernel or eBPF packet-path mechanism observing the
-//! post-recheck accept path) implements [`EspPeerObservationSource`] without
-//! boundary changes. Shipping that conformant platform source remains open
-//! follow-up work; this module is the partial landing of the observation
-//! authority.
+//! The production Linux source loads a committed CO-RE object inside the
+//! namespace-bound XFRM actor. It owns all required tracing-link file
+//! descriptors, binds source scope to `SO_NETNS_COOKIE`, keys maps by the
+//! exact raw GETSA identity, and admits only integrity/AEAD-protected,
+//! replay-enabled, non-offloaded inbound ESP-in-UDP SAs. Legacy states whose
+//! kernel direction is unspecified (`0`) are treated as inbound only at the
+//! input/replay hook; explicit outbound states are refused. Insert, delete,
+//! update, offload, counter exhaustion, link loss, malformed packet shape,
+//! and map-authority loss terminate the source fail-closed.
+//!
+//! Registration is staged: publish lifecycle state and an unarmed
+//! registration, perform a second exact GETSA, verify the kernel lifecycle
+//! generation, then arm. Teardown unpublishes first, waits for admitted hooks
+//! to quiesce, reconciles the exact `cursor - dropped` record count, and
+//! removes state deterministically. An authenticated post-relocation refresh
+//! uses the same quiescent protocol, adopts only the expected lifecycle-change
+//! reason, clears kernel and userspace dedup state together, and repeats the
+//! unarmed/double-GETSA proof. Cancellation leaves teardown or refresh
+//! resumable while the SA remains unpublished.
 //!
 //! # Acceptance rules
 //!
@@ -54,19 +59,17 @@
 //! mismatches, malformed or interface-scope-less events, insufficient
 //! provenance (unauthenticated or pre-final-replay), stale cursors (replay or
 //! reorder), events for torn-down SAs, and events that would overflow a slot
-//! that still holds an undrained observation (explicit, fail-closed). Memory
-//! is bounded: one outstanding observation and at most two retained addresses
-//! (current baseline and last reported) per SA, and a capacity-bounded
-//! registry; teardown drains and removes all observation state for the SA.
+//! that still holds an undrained observation (explicit, fail-closed). Draining
+//! an overflowed slot does not reopen it: only a successful authenticated
+//! refresh or teardown can recover, because the kernel may already suppress
+//! the overflowed tuple. Memory, map capacity, ring capacity, and work per
+//! poll are bounded; teardown drains and removes all state for the SA.
 //!
 //! # Source and lifecycle caveats
 //!
 //! - Cursors and generations are scoped to one registration lifecycle:
 //!   registration starts a fresh lifecycle, and teardown is the epoch
 //!   boundary. Consumers must not correlate generations across lifecycles.
-//! - A source restart that resets its cursors wedges every slot into
-//!   [`EspPeerObservationRejection::StaleCursor`]; the recovery is teardown
-//!   and re-registration of the affected SAs.
 //! - The boundary burns its accepted cursor for every event that passes
 //!   attribution and staleness checks, including candidates later rejected by
 //!   the fail-closed overflow rule. Source implementors must not retry a
@@ -77,11 +80,14 @@
 //!   the ingress ifindex as an informational routing fact, not a change
 //!   trigger.
 //! - After a normal drain the drained source stays the last-reported marker,
-//!   so further events from that source are `NoChange` until
-//!   [`EspPeerObservationBoundary::update_current_source`] rebases. There is
-//!   deliberately no forget API: rebaseline is the only way to clear dedup
-//!   state. The trade-off is that a peer flapping back to an already
-//!   reported (but never rebased) source is not re-reported.
+//!   so further events from it are `NoChange` until the monitor completes an
+//!   authenticated refresh. There is no public forget or caller-supplied
+//!   baseline API.
+//! - Each poll validates every tracked lifecycle both before and after record
+//!   ingestion. The successful return is its authority linearization point.
+//!   A later product-owned XFRM mutation is a new event; consumers must
+//!   serialize those writers with poll/drain/relocation decisions rather than
+//!   treating an earlier observation as perpetual SA authority.
 //!
 //! # Redaction
 //!
@@ -93,7 +99,7 @@
 //! fields for policy decisions; they are simply never formatted.
 
 use std::collections::HashMap;
-#[cfg(any(test, feature = "testkit"))]
+#[cfg(test)]
 use std::collections::VecDeque;
 use std::fmt;
 use std::num::NonZeroU64;
@@ -101,6 +107,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::XfrmError;
 use crate::model::{IpAddress, XfrmDirection, XfrmId, XfrmMark};
+
+#[cfg(target_os = "linux")]
+pub(crate) mod linux;
+#[cfg(target_os = "linux")]
+pub use linux::{
+    LinuxEspPeerObservationConfig, LinuxEspPeerObservationHandle, LinuxEspPeerObservationMonitor,
+};
 
 /// Default maximum number of SAs tracked by one observation boundary.
 ///
@@ -116,34 +129,31 @@ pub const DEFAULT_ESP_PEER_OBSERVATION_CAPACITY: usize = 1024;
 /// exposing any filesystem or namespace identity. Events minted under a
 /// different scope are rejected, so observations cannot be cross-combined
 /// across namespaces or sources.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct EspPeerObservationScope(NonZeroU64);
 
 impl EspPeerObservationScope {
-    /// Mint a fresh process-unique scope.
+    /// Mint a fresh process-unique scope for a crate-owned source factory.
     ///
-    /// Uniqueness holds for 2^64-1 mints per process; a counter wrap is
-    /// unreachable in practice and is clamped rather than allowed to panic
-    /// or fabricate a zero scope.
-    #[must_use]
-    pub fn new() -> Self {
+    /// The constructor is deliberately not public: callers cannot mint a
+    /// source identity and use it to forge trusted events. Exhaustion fails
+    /// closed instead of wrapping to an already-issued scope.
+    fn try_new() -> Result<Self, XfrmError> {
         static NEXT: AtomicU64 = AtomicU64::new(1);
-        let raw = NEXT.fetch_add(1, Ordering::Relaxed).max(1);
-        // The clamp above guarantees a nonzero value.
-        Self(NonZeroU64::new(raw).expect("scope counter clamped nonzero"))
+        let raw = NEXT
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                value.checked_add(1)
+            })
+            .map_err(|_| XfrmError::Unavailable)?;
+        NonZeroU64::new(raw).map(Self).ok_or(XfrmError::Unavailable)
     }
 
-    /// Return the raw process-local scope number. This is correlation-only
-    /// metadata and is never authority.
-    #[must_use]
-    pub const fn get(self) -> u64 {
-        self.0.get()
-    }
-}
-
-impl Default for EspPeerObservationScope {
-    fn default() -> Self {
-        Self::new()
+    #[cfg(test)]
+    fn new() -> Self {
+        match Self::try_new() {
+            Ok(scope) => scope,
+            Err(error) => panic!("test scope allocation failed: {error}"),
+        }
     }
 }
 
@@ -155,20 +165,36 @@ impl fmt::Debug for EspPeerObservationScope {
     }
 }
 
+/// Opaque registration-lifecycle epoch.
+///
+/// A fresh epoch is assigned on every successful registration, including
+/// re-registration of the same SA key. It prevents queued pre-teardown events
+/// from entering a later lifecycle whose cursor and generation restarted.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct EspPeerObservationEpoch(NonZeroU64);
+
+impl fmt::Debug for EspPeerObservationEpoch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EspPeerObservationEpoch")
+            .field("id", &"<opaque>")
+            .finish()
+    }
+}
+
 /// Provenance grade of a raw ESP peer event.
 ///
-/// The derived ordering is significant and is used directly by the boundary:
-/// any grade below [`Self::PostFinalReplayAccepted`] is rejected. See the
-/// module-level trust-anchor documentation for why weaker grades exist.
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum EspPeerEventProvenance {
+/// This type is private so downstream callers cannot assert the trusted grade.
+/// A crate-owned source must construct every event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum EspPeerEventProvenance {
     /// An unauthenticated packet-path signal (raw socket, tc/XDP ingress copy,
     /// or any pre-decryption observation). Never acceptable.
+    #[cfg(test)]
     UnauthenticatedPacketPath,
     /// Kernel ESP decap verified integrity, but the packet may still lose the
     /// final anti-replay recheck (the stock `XFRM_MSG_MAPPING` grade). Never
     /// acceptable: replayed traffic could produce an observation.
+    #[cfg(test)]
     PostIntegrityPreFinalReplay,
     /// Kernel ESP decap verified integrity and the packet won the final
     /// anti-replay advance on the exact SA named by the event.
@@ -241,20 +267,19 @@ pub enum EspPeerAddressFamily {
 
 /// Registration of one inbound integrity-protected SA with the boundary.
 ///
-/// The `current_outer_source` pair is the baseline the caller proved when the
-/// SA was established (or last rebased via
-/// [`EspPeerObservationBoundary::update_current_source`]); authenticated
-/// traffic from that source produces no observation. The registration is
-/// refused for crypt-only SAs: post-decrypt delivery on an SA without
-/// integrity is not authentication and cannot anchor an observation.
+/// The `current_outer_source` pair is the exact GETSA-proven baseline from SA
+/// establishment or the monitor's last authenticated refresh. Authenticated
+/// traffic from that source produces no observation. Registration is refused
+/// for crypt-only SAs: post-decrypt delivery on an SA without integrity is not
+/// authentication and cannot anchor an observation.
 ///
 /// Identity fields must be in canonical kernel form: the SA destination must
 /// be specified (an unspecified destination can never attribute a decap
 /// event and would be a dead slot consuming registry capacity), a configured
 /// mark must have a nonzero mask (mask 0 is equivalent to no mark), and a
 /// configured `if_id` must be nonzero (0 is equivalent to unbound). The
-/// boundary rejects the zero-forms instead of normalizing them so a caller
-/// cannot accidentally register a broader identity than the kernel SA has.
+/// boundary rejects the zero-forms instead of normalizing them so its identity
+/// can never become broader than the kernel SA.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct EspPeerObservationRegistration {
     /// Exact SA identity and direction, in canonical kernel form.
@@ -263,7 +288,10 @@ pub struct EspPeerObservationRegistration {
     pub current_outer_source: IpAddress,
     /// Current authenticated encapsulation source port (host byte order).
     pub current_outer_source_port: u16,
-    /// Caller assertion that the SA is integrity- or AEAD-protected.
+    /// Exact GETSA admission proved that the SA is integrity- or AEAD-protected.
+    ///
+    /// Production callers cannot construct this registration directly; the
+    /// namespace-bound Linux coordinator derives it from kernel readback.
     pub integrity_protected: bool,
 }
 
@@ -288,19 +316,21 @@ impl fmt::Debug for EspPeerObservationRegistration {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct EspPeerObservationEvent {
     /// Scope the event was observed in; must match the boundary scope.
-    pub scope: EspPeerObservationScope,
+    scope: EspPeerObservationScope,
+    /// Exact registration lifecycle the source observed.
+    epoch: EspPeerObservationEpoch,
     /// Exact SA identity and direction the kernel attributed the packet to.
-    pub key: EspPeerObservationKey,
+    key: EspPeerObservationKey,
     /// Trust-anchor grade of the event.
-    pub provenance: EspPeerEventProvenance,
+    provenance: EspPeerEventProvenance,
     /// Observed encapsulation source address.
-    pub outer_source: IpAddress,
+    outer_source: IpAddress,
     /// Observed encapsulation source port (host byte order).
-    pub outer_source_port: u16,
-    /// Physical ingress interface index, when the source captured one. The
-    /// interface scope cannot be dropped: both `None` and `Some(0)` are
+    outer_source_port: u16,
+    /// Kernel `skb_iif` ingress-interface index, when the source captured one.
+    /// The interface scope cannot be dropped: both `None` and `Some(0)` are
     /// rejected, because 0 is not a valid Linux interface index.
-    pub ingress_ifindex: Option<u32>,
+    ingress_ifindex: Option<u32>,
     /// Source-monotonic per-SA event cursor used for staleness rejection.
     ///
     /// The boundary burns its accepted cursor for every event that passes
@@ -310,10 +340,10 @@ pub struct EspPeerObservationEvent {
     /// lifecycle; a source restart that resets cursors wedges the slot into
     /// [`EspPeerObservationRejection::StaleCursor`], and recovery is teardown
     /// plus re-registration.
-    pub cursor: u64,
+    cursor: u64,
     /// Producer-side events the source knows were lost since the previous
     /// event for this SA. Zero asserts no known loss.
-    pub dropped_since_previous: u64,
+    dropped_since_previous: u64,
 }
 
 impl fmt::Debug for EspPeerObservationEvent {
@@ -383,6 +413,15 @@ impl EspPeerObservationLoss {
             overflowed => overflowed,
         }
     }
+
+    /// Combine source-attributed loss without erasing an overflow fact.
+    const fn with_source_attributed(self) -> Self {
+        match self {
+            Self::None => Self::SourceAttributed,
+            Self::OverflowClosed => Self::SourceAttributedOverflowClosed,
+            attributed => attributed,
+        }
+    }
 }
 
 /// One bounded, typed observation of an authenticated new outer source.
@@ -400,6 +439,8 @@ impl EspPeerObservationLoss {
 pub struct EspPeerObservation {
     /// Exact SA identity and direction this observation belongs to.
     pub key: EspPeerObservationKey,
+    /// Opaque lifecycle epoch assigned when this SA registration began.
+    pub epoch: EspPeerObservationEpoch,
     /// Address family of the observed outer source.
     pub address_family: EspPeerAddressFamily,
     /// Physical ingress interface index the packet arrived on.
@@ -452,24 +493,35 @@ impl fmt::Display for EspPeerObservation {
 /// its own generation tracking deterministically. The final generation is
 /// scoped to the terminated registration lifecycle: it correlates with the
 /// generations of observations drained during that lifecycle only, and a
-/// later re-registration starts a fresh lifecycle at generation 1.
+/// later re-registration starts a fresh lifecycle at generation 1. Any known
+/// loss not already carried by the drained observation remains explicit in
+/// [`Self::residual_loss`].
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct EspPeerObservationTeardown {
     /// Exact SA identity and direction that was terminated.
     pub key: EspPeerObservationKey,
+    /// Opaque epoch of the terminated registration lifecycle.
+    pub epoch: EspPeerObservationEpoch,
     /// Final per-SA observation generation of the terminated registration
     /// lifecycle.
     pub final_generation: u64,
     /// The drained pending observation, when one was still outstanding.
     pub drained: Option<EspPeerObservation>,
+    /// Known lifecycle loss not already carried by [`Self::drained`].
+    ///
+    /// This preserves producer loss reported after the pending observation
+    /// was queued, and loss reported without any later changed-source event.
+    pub residual_loss: EspPeerObservationLoss,
 }
 
 impl fmt::Debug for EspPeerObservationTeardown {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("EspPeerObservationTeardown")
             .field("key", &self.key)
+            .field("epoch", &self.epoch)
             .field("final_generation", &self.final_generation)
             .field("drained", &self.drained.is_some())
+            .field("residual_loss", &self.residual_loss)
             .finish()
     }
 }
@@ -493,6 +545,9 @@ pub enum EspPeerObservationRejection {
     /// The event scope does not match the boundary scope; observations from
     /// different namespaces or sources cannot be cross-combined.
     ScopeMismatch,
+    /// The event belongs to an earlier or otherwise different registration
+    /// lifecycle for the same SA key.
+    LifecycleMismatch,
     /// No SA is registered for the event's exact identity, including
     /// post-teardown arrivals (teardown removes all state).
     UnknownSa,
@@ -516,26 +571,31 @@ pub enum EspPeerObservationRejection {
     StaleCursor,
     /// The SA slot still holds an undrained observation and is closed
     /// fail-closed; drain it before further candidates can be accepted. The
-    /// rejected event's cursor is still burned (see
-    /// [`EspPeerObservationEvent::cursor`]).
+    /// rejected event's cursor is still consumed and must not be retried.
     SlotOverflowClosed,
+    /// The per-lifecycle observation generation could no longer increase.
+    /// The slot is closed fail-closed instead of repeating or wrapping a
+    /// generation.
+    GenerationOverflowClosed,
 }
 
 /// Number of [`EspPeerObservationRejection`] labels used for tally indexing.
-const REJECTION_LABEL_COUNT: usize = 10;
+const REJECTION_LABEL_COUNT: usize = 12;
 
 const fn rejection_index(label: EspPeerObservationRejection) -> usize {
     match label {
         EspPeerObservationRejection::BoundaryClosed => 0,
         EspPeerObservationRejection::ScopeMismatch => 1,
-        EspPeerObservationRejection::UnknownSa => 2,
-        EspPeerObservationRejection::WrongDirection => 3,
-        EspPeerObservationRejection::FamilyMismatch => 4,
-        EspPeerObservationRejection::MalformedSource => 5,
-        EspPeerObservationRejection::MissingIngressScope => 6,
-        EspPeerObservationRejection::InsufficientProvenance => 7,
-        EspPeerObservationRejection::StaleCursor => 8,
-        EspPeerObservationRejection::SlotOverflowClosed => 9,
+        EspPeerObservationRejection::LifecycleMismatch => 2,
+        EspPeerObservationRejection::UnknownSa => 3,
+        EspPeerObservationRejection::WrongDirection => 4,
+        EspPeerObservationRejection::FamilyMismatch => 5,
+        EspPeerObservationRejection::MalformedSource => 6,
+        EspPeerObservationRejection::MissingIngressScope => 7,
+        EspPeerObservationRejection::InsufficientProvenance => 8,
+        EspPeerObservationRejection::StaleCursor => 9,
+        EspPeerObservationRejection::SlotOverflowClosed => 10,
+        EspPeerObservationRejection::GenerationOverflowClosed => 11,
     }
 }
 
@@ -546,6 +606,7 @@ impl EspPeerObservationRejection {
         match self {
             Self::BoundaryClosed => "boundary_closed",
             Self::ScopeMismatch => "scope_mismatch",
+            Self::LifecycleMismatch => "lifecycle_mismatch",
             Self::UnknownSa => "unknown_sa",
             Self::WrongDirection => "wrong_direction",
             Self::FamilyMismatch => "family_mismatch",
@@ -554,6 +615,7 @@ impl EspPeerObservationRejection {
             Self::InsufficientProvenance => "insufficient_provenance",
             Self::StaleCursor => "stale_cursor",
             Self::SlotOverflowClosed => "slot_overflow_closed",
+            Self::GenerationOverflowClosed => "generation_overflow_closed",
         }
     }
 }
@@ -578,13 +640,12 @@ pub enum EspPeerIngestOutcome {
     Rejected(EspPeerObservationRejection),
 }
 
-/// Aggregate result of draining an [`EspPeerObservationSource`].
+/// Aggregate result of one bounded production-source poll.
 ///
 /// Counts only: no per-event values are retained. Rejections are tallied per
 /// label so a silent stream of one rejection kind (for example
 /// [`EspPeerObservationRejection::InsufficientProvenance`]) is visible to
-/// consumers that do not loop [`EspPeerObservationBoundary::ingest_event`]
-/// themselves.
+/// consumers without exposing provenance-bearing source records.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct EspPeerIngestTally {
     /// Total events consumed from the source.
@@ -595,6 +656,15 @@ pub struct EspPeerIngestTally {
     pub no_change: usize,
     /// Events rejected under any label.
     pub rejected: usize,
+    /// Standalone source-loss records consumed.
+    pub source_loss_records: usize,
+    /// Terminal source state observed while draining, if any.
+    ///
+    /// Successful production-monitor polls always report `None`: a terminal
+    /// source makes the monitor fail closed with an error and discard queued
+    /// observations. This field remains available to internal source
+    /// aggregation and deterministic boundary tests.
+    pub source_terminal: Option<EspPeerObservationSourceTerminal>,
     rejections_by_label: [usize; REJECTION_LABEL_COUNT],
 }
 
@@ -616,6 +686,74 @@ impl EspPeerIngestTally {
             }
         }
     }
+
+    fn record_source_rejection(&mut self, label: EspPeerObservationRejection) {
+        self.rejected += 1;
+        self.rejections_by_label[rejection_index(label)] += 1;
+    }
+}
+
+/// Redaction-safe terminal state of an observation source.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EspPeerObservationSourceTerminal {
+    /// The producer closed normally and will emit no further records.
+    Closed,
+    /// The producer failed to read its authenticated kernel channel.
+    IoFailure,
+    /// The producer observed a malformed or unauthenticated record.
+    ProtocolFailure,
+    /// The producer lost its kernel/program authority or lifecycle binding.
+    AuthorityLost,
+}
+
+impl EspPeerObservationSourceTerminal {
+    /// Stable value-free label suitable for metrics and logs.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Closed => "closed",
+            Self::IoFailure => "io_failure",
+            Self::ProtocolFailure => "protocol_failure",
+            Self::AuthorityLost => "authority_lost",
+        }
+    }
+}
+
+impl fmt::Display for EspPeerObservationSourceTerminal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+/// Source-attributed loss independent of a later packet event.
+///
+/// Fields are private because only a crate-owned, admitted source may bind
+/// loss to an exact scope, SA, and registration epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EspPeerObservationSourceLoss {
+    scope: EspPeerObservationScope,
+    epoch: EspPeerObservationEpoch,
+    key: EspPeerObservationKey,
+    dropped: NonZeroU64,
+}
+
+/// One pull result from a crate-owned observation source.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EspPeerObservationSourceRecord {
+    /// One authenticated, post-final-replay event.
+    Event(EspPeerObservationEvent),
+    /// Producer-side loss not dependent on a subsequent event.
+    Loss(EspPeerObservationSourceLoss),
+    /// No record is currently available; the source remains usable.
+    Idle,
+    /// The source is terminal and will emit no further trustworthy records.
+    Terminal(EspPeerObservationSourceTerminal),
+}
+
+mod source_sealed {
+    pub trait Sealed {}
 }
 
 /// A source of kernel-attributed ESP decap events.
@@ -627,62 +765,76 @@ impl EspPeerIngestTally {
 /// transport's sender verified, so local spoofed notifications are excluded);
 /// attributed by the kernel to the exact SA identity (destination, SPI,
 /// protocol, family, lookup mark, and XFRM `if_id`) and direction; emitted
-/// after integrity verification *and* the final anti-replay advance for that
-/// SA (`PostFinalReplayAccepted`); captured with the physical ingress
-/// interface index and outer encapsulation source address/port; and sequenced
-/// by a monotonic per-SA cursor with explicit producer-side loss accounting.
+/// after integrity verification and at the successful final anti-replay
+/// decision for that SA (`PostFinalReplayAccepted`); captured with the kernel
+/// `skb_iif` ingress-interface index and outer encapsulation source
+/// address/port; and sequenced by a monotonic per-SA cursor with explicit
+/// producer-side loss accounting.
 /// Sources must never yield events for crypt-only SAs, and must not retry a
 /// rejected cursor value (the boundary burns accepted cursors even for
 /// overflow-rejected candidates). See the module-level trust-anchor
 /// documentation for why stock `XFRM_MSG_MAPPING` does not meet this
 /// contract.
-pub trait EspPeerObservationSource {
-    /// Pull the next available event, or `None` when no event is pending.
-    fn next_event(&mut self) -> Option<EspPeerObservationEvent>;
+pub trait EspPeerObservationSource: source_sealed::Sealed {
+    /// Pull the next source record.
+    ///
+    /// [`EspPeerObservationSourceRecord::Idle`] is temporary. A terminal
+    /// record is explicit and permanently closes the paired boundary.
+    fn next_record(&mut self) -> EspPeerObservationSourceRecord;
 }
 
-/// Scripted in-memory [`EspPeerObservationSource`] for tests and fixtures.
+/// Scripted in-memory [`EspPeerObservationSource`] for this crate's tests.
 ///
-/// Available only with the `testkit` cargo feature (and in this crate's own
-/// unit tests): it replays caller-supplied (captured or synthetic) events
-/// verbatim and performs no provenance judgment of its own, so it can mint
-/// [`EspPeerEventProvenance::PostFinalReplayAccepted`] events without any
-/// kernel verification. It must never be used in production paths.
-#[cfg(any(test, feature = "testkit"))]
-#[derive(Debug, Default)]
-pub struct ScriptedEspPeerObservationSource {
-    events: VecDeque<EspPeerObservationEvent>,
+/// This is deliberately unavailable from feature-enabled library builds:
+/// Cargo features are additive and therefore cannot form a production trust
+/// boundary for provenance-bearing observations.
+#[cfg(test)]
+#[derive(Debug)]
+struct ScriptedEspPeerObservationSource {
+    records: VecDeque<EspPeerObservationSourceRecord>,
 }
 
-#[cfg(any(test, feature = "testkit"))]
+#[cfg(test)]
 impl ScriptedEspPeerObservationSource {
-    /// Create an empty scripted source.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    fn new() -> Self {
+        Self {
+            records: VecDeque::new(),
+        }
     }
 
-    /// Queue an event for replay.
-    pub fn push(&mut self, event: EspPeerObservationEvent) {
-        self.events.push_back(event);
+    /// Queue one scripted authenticated event.
+    fn push(&mut self, event: EspPeerObservationEvent) {
+        self.records
+            .push_back(EspPeerObservationSourceRecord::Event(event));
     }
 
-    /// Number of queued events not yet consumed.
+    /// Queue a source record, including explicit loss or termination.
+    fn push_record(&mut self, record: EspPeerObservationSourceRecord) {
+        self.records.push_back(record);
+    }
+
+    /// Number of queued records not yet consumed.
     #[must_use]
-    pub fn pending_len(&self) -> usize {
-        self.events.len()
+    fn pending_len(&self) -> usize {
+        self.records.len()
     }
 }
 
-#[cfg(any(test, feature = "testkit"))]
+#[cfg(test)]
+impl source_sealed::Sealed for ScriptedEspPeerObservationSource {}
+
+#[cfg(test)]
 impl EspPeerObservationSource for ScriptedEspPeerObservationSource {
-    fn next_event(&mut self) -> Option<EspPeerObservationEvent> {
-        self.events.pop_front()
+    fn next_record(&mut self) -> EspPeerObservationSourceRecord {
+        self.records
+            .pop_front()
+            .unwrap_or(EspPeerObservationSourceRecord::Idle)
     }
 }
 
 /// Per-SA bounded observation slot.
 struct ObservationSlot {
+    epoch: EspPeerObservationEpoch,
     current_source: (IpAddress, u16),
     last_reported: Option<(IpAddress, u16)>,
     last_cursor: Option<u64>,
@@ -695,8 +847,9 @@ struct ObservationSlot {
 }
 
 impl ObservationSlot {
-    fn new(current_source: (IpAddress, u16)) -> Self {
+    fn new(epoch: EspPeerObservationEpoch, current_source: (IpAddress, u16)) -> Self {
         Self {
+            epoch,
             current_source,
             last_reported: None,
             last_cursor: None,
@@ -711,6 +864,7 @@ impl ObservationSlot {
 impl fmt::Debug for ObservationSlot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ObservationSlot")
+            .field("epoch", &self.epoch)
             .field("generation", &self.generation)
             .field("last_cursor", &self.last_cursor)
             .field("source_loss", &self.source_loss)
@@ -729,6 +883,7 @@ impl fmt::Debug for ObservationSlot {
 #[derive(Debug)]
 pub struct EspPeerObservationBoundary {
     scope: EspPeerObservationScope,
+    next_epoch: u64,
     capacity: usize,
     slots: HashMap<EspPeerObservationKey, ObservationSlot>,
     closed: bool,
@@ -736,30 +891,30 @@ pub struct EspPeerObservationBoundary {
 
 impl EspPeerObservationBoundary {
     /// Create a boundary with the default registry capacity.
-    #[must_use]
-    pub fn new(scope: EspPeerObservationScope) -> Self {
+    #[cfg(test)]
+    fn new(scope: EspPeerObservationScope) -> Self {
         Self::with_capacity(scope, DEFAULT_ESP_PEER_OBSERVATION_CAPACITY)
     }
 
     /// Create a boundary with an explicit registry capacity.
-    #[must_use]
-    pub fn with_capacity(scope: EspPeerObservationScope, capacity: usize) -> Self {
+    fn with_capacity(scope: EspPeerObservationScope, capacity: usize) -> Self {
         Self {
             scope,
+            next_epoch: 1,
             capacity,
             slots: HashMap::new(),
             closed: false,
         }
     }
 
-    /// The scope this boundary is pinned to.
-    #[must_use]
-    pub const fn scope(&self) -> EspPeerObservationScope {
+    #[cfg(test)]
+    const fn scope(&self) -> EspPeerObservationScope {
         self.scope
     }
 
     /// Number of SAs currently tracked.
     #[must_use]
+    #[cfg(test)]
     pub fn tracked_len(&self) -> usize {
         self.slots.len()
     }
@@ -779,7 +934,7 @@ impl EspPeerObservationBoundary {
     pub fn register_sa(
         &mut self,
         registration: EspPeerObservationRegistration,
-    ) -> Result<(), XfrmError> {
+    ) -> Result<EspPeerObservationEpoch, XfrmError> {
         if self.closed {
             return Err(XfrmError::Unavailable);
         }
@@ -848,39 +1003,45 @@ impl EspPeerObservationBoundary {
                 "observation registry capacity reached",
             ));
         }
+        let epoch_raw = self.next_epoch;
+        self.next_epoch = self
+            .next_epoch
+            .checked_add(1)
+            .ok_or(XfrmError::Unavailable)?;
+        let epoch = NonZeroU64::new(epoch_raw)
+            .map(EspPeerObservationEpoch)
+            .ok_or(XfrmError::Unavailable)?;
         self.slots.insert(
             registration.key,
-            ObservationSlot::new((
-                registration.current_outer_source,
-                registration.current_outer_source_port,
-            )),
+            ObservationSlot::new(
+                epoch,
+                (
+                    registration.current_outer_source,
+                    registration.current_outer_source_port,
+                ),
+            ),
         );
-        Ok(())
+        Ok(epoch)
     }
 
-    /// Rebase the authenticated current outer source after the consumer
-    /// applied its own authenticated path update (for example an RFC 7296
-    /// section 2.23 recovery followed by [`crate::RelocateSaRequest`]).
+    /// Rebase the authenticated current outer source after the coordinator
+    /// proved the post-relocation kernel state with exact GETSA.
     ///
-    /// The last-reported marker is cleared so traffic from the previous
-    /// source is once again observation-worthy; any pending observation is
-    /// left for the consumer to drain.
+    /// With no pending observation, the last-reported marker is cleared so
+    /// traffic from the previous source becomes observation-worthy again. A
+    /// retained pending source remains marked as already reported until it is
+    /// drained, preventing that same source from manufacturing an overflow
+    /// during refresh. If the slot overflowed before refresh, that loss fact is
+    /// first folded into the pending observation so refresh cannot erase it.
     ///
     /// # Misuse hazard
     ///
-    /// This method is a rebaseline oracle: rebasing to an unverified source
-    /// permanently suppresses observations for that source (its traffic
-    /// becomes the accepted baseline) until the next rebase or teardown, and
-    /// the change is irreversible without teardown. Call it only after your
-    /// own authenticated path update completed, normally with the source
-    /// tuple from a drained [`EspPeerObservation`]. An evidence-bound rebase
-    /// restricted to drained-observation sources was considered and rejected:
-    /// a product's authenticated IKE path update can legitimately rebase to
-    /// a source the boundary never observed (for example controlled mobility
-    /// signalling), which hard-binding would break. As with
-    /// [`crate::RelocateSaRequest`], the caller remains the authority for the
-    /// new tuple.
-    pub fn update_current_source(
+    /// This method is intentionally reachable only inside the crate: it is a
+    /// rebaseline oracle, so exposing a caller-supplied tuple would let a
+    /// consumer suppress future observations for an unverified source. The
+    /// production monitor invokes it only inside its quiescent,
+    /// double-GETSA-validated refresh transaction.
+    pub(crate) fn update_current_source(
         &mut self,
         key: &EspPeerObservationKey,
         new_source: IpAddress,
@@ -899,8 +1060,15 @@ impl EspPeerObservationBoundary {
             ));
         }
         let slot = self.slots.get_mut(key).ok_or(XfrmError::NotFound)?;
+        if let (Some(observation), true) = (&mut slot.pending, slot.overflow_closed) {
+            observation.loss = observation.loss.with_overflow();
+        }
         slot.current_source = (new_source, new_source_port);
-        slot.last_reported = None;
+        slot.last_reported = slot
+            .pending
+            .as_ref()
+            .map(|pending| (pending.outer_source, pending.outer_source_port));
+        slot.overflow_closed = false;
         Ok(())
     }
 
@@ -912,7 +1080,7 @@ impl EspPeerObservationBoundary {
     /// ingress scope, provenance, staleness, then the slot rules. See
     /// [`EspPeerObservationEvent::cursor`] for the cursor-burn semantics that
     /// apply once an event passes attribution and staleness.
-    pub fn ingest_event(&mut self, event: EspPeerObservationEvent) -> EspPeerIngestOutcome {
+    pub(crate) fn ingest_event(&mut self, event: EspPeerObservationEvent) -> EspPeerIngestOutcome {
         if self.closed {
             return EspPeerIngestOutcome::Rejected(EspPeerObservationRejection::BoundaryClosed);
         }
@@ -929,6 +1097,9 @@ impl EspPeerObservationBoundary {
             }
             return EspPeerIngestOutcome::Rejected(EspPeerObservationRejection::UnknownSa);
         };
+        if event.epoch != slot.epoch {
+            return EspPeerIngestOutcome::Rejected(EspPeerObservationRejection::LifecycleMismatch);
+        }
         if family_of(event.outer_source) != event.key.address_family() {
             return EspPeerIngestOutcome::Rejected(EspPeerObservationRejection::FamilyMismatch);
         }
@@ -940,7 +1111,10 @@ impl EspPeerObservationBoundary {
                 EspPeerObservationRejection::MissingIngressScope,
             );
         };
-        if event.provenance < EspPeerEventProvenance::PostFinalReplayAccepted {
+        if !matches!(
+            event.provenance,
+            EspPeerEventProvenance::PostFinalReplayAccepted
+        ) {
             return EspPeerIngestOutcome::Rejected(
                 EspPeerObservationRejection::InsufficientProvenance,
             );
@@ -950,7 +1124,7 @@ impl EspPeerObservationBoundary {
         }
         slot.last_cursor = Some(event.cursor);
         if event.dropped_since_previous > 0 {
-            slot.source_loss = true;
+            note_source_loss(slot);
         }
         let source = (event.outer_source, event.outer_source_port);
         if source == slot.current_source || slot.last_reported == Some(source) {
@@ -962,10 +1136,13 @@ impl EspPeerObservationBoundary {
             slot.overflow_closed = true;
             return EspPeerIngestOutcome::Rejected(EspPeerObservationRejection::SlotOverflowClosed);
         }
-        // Saturates instead of wrapping: 2^64 observations on one SA is
-        // unreachable, and a repeated maximum generation is safer than a
-        // wrap panicking or restarting the lifecycle's monotonicity.
-        slot.generation = slot.generation.saturating_add(1);
+        let Some(next_generation) = slot.generation.checked_add(1) else {
+            slot.overflow_closed = true;
+            return EspPeerIngestOutcome::Rejected(
+                EspPeerObservationRejection::GenerationOverflowClosed,
+            );
+        };
+        slot.generation = next_generation;
         let loss = if slot.source_loss {
             EspPeerObservationLoss::SourceAttributed
         } else {
@@ -976,6 +1153,7 @@ impl EspPeerObservationBoundary {
         slot.source_loss = false;
         let observation = EspPeerObservation {
             key: event.key,
+            epoch: event.epoch,
             address_family: event.key.address_family(),
             ingress_ifindex,
             outer_source: event.outer_source,
@@ -998,21 +1176,78 @@ impl EspPeerObservationBoundary {
         &mut self,
         source: &mut S,
     ) -> EspPeerIngestTally {
+        self.ingest_up_to(source, usize::MAX)
+    }
+
+    /// Drain at most `max_records` source records.
+    ///
+    /// Production sources use this bounded form so a continuously replenished
+    /// kernel queue cannot monopolize an executor thread. `Idle` and
+    /// `Terminal` do not consume the budget.
+    fn ingest_up_to<S: EspPeerObservationSource + ?Sized>(
+        &mut self,
+        source: &mut S,
+        max_records: usize,
+    ) -> EspPeerIngestTally {
         let mut tally = EspPeerIngestTally::default();
-        while let Some(event) = source.next_event() {
-            tally.record(self.ingest_event(event));
+        for _ in 0..max_records {
+            match source.next_record() {
+                EspPeerObservationSourceRecord::Event(event) => {
+                    tally.record(self.ingest_event(event));
+                }
+                EspPeerObservationSourceRecord::Loss(loss) => {
+                    tally.source_loss_records += 1;
+                    if let Some(rejection) = self.ingest_source_loss(loss) {
+                        tally.record_source_rejection(rejection);
+                    }
+                }
+                EspPeerObservationSourceRecord::Idle => break,
+                EspPeerObservationSourceRecord::Terminal(terminal) => {
+                    self.closed = true;
+                    tally.source_terminal = Some(terminal);
+                    break;
+                }
+            }
         }
         tally
     }
 
+    /// Attribute a standalone producer-loss record to its exact live slot.
+    ///
+    /// Returns a rejection label when the record is stale, foreign, or no
+    /// longer attributable. A valid record updates a pending observation
+    /// immediately, so the fact cannot disappear if no later packet arrives.
+    fn ingest_source_loss(
+        &mut self,
+        loss: EspPeerObservationSourceLoss,
+    ) -> Option<EspPeerObservationRejection> {
+        if self.closed {
+            return Some(EspPeerObservationRejection::BoundaryClosed);
+        }
+        if loss.scope != self.scope {
+            return Some(EspPeerObservationRejection::ScopeMismatch);
+        }
+        let Some(slot) = self.slots.get_mut(&loss.key) else {
+            return Some(EspPeerObservationRejection::UnknownSa);
+        };
+        if loss.epoch != slot.epoch {
+            return Some(EspPeerObservationRejection::LifecycleMismatch);
+        }
+        let _dropped = loss.dropped;
+        note_source_loss(slot);
+        None
+    }
+
     /// Take the pending observation for an SA, if one is outstanding.
     ///
-    /// Draining clears the slot: if it was overflow-closed, the returned
-    /// observation's loss status gains the
-    /// [`EspPeerObservationLoss::OverflowClosed`] fact (compositionally, see
-    /// [`EspPeerObservationLoss`]) and the last-reported marker is cleared so
-    /// the next distinct source produces a fresh observation (explicit
-    /// recovery after suspected loss).
+    /// If the slot was overflow-closed, the returned observation's loss
+    /// status gains the [`EspPeerObservationLoss::OverflowClosed`] fact
+    /// (compositionally, see [`EspPeerObservationLoss`]), but draining alone
+    /// does not reopen the slot. The producer may already have suppressed the
+    /// overflowed tuple, so pretending a later packet can always recover
+    /// would lose an authenticated path change silently. Only an
+    /// authenticated [`Self::update_current_source`] rebase or teardown
+    /// reopens/removes the slot.
     ///
     /// After a normal drain the drained source stays the last-reported
     /// marker: further events from that same source are `NoChange` until
@@ -1024,8 +1259,6 @@ impl EspPeerObservationBoundary {
         let mut observation = slot.pending.take()?;
         if slot.overflow_closed {
             observation.loss = observation.loss.with_overflow();
-            slot.overflow_closed = false;
-            slot.last_reported = None;
         }
         Some(observation)
     }
@@ -1055,13 +1288,22 @@ impl EspPeerObservationBoundary {
     ) -> Result<EspPeerObservationTeardown, XfrmError> {
         let mut slot = self.slots.remove(key).ok_or(XfrmError::NotFound)?;
         let mut drained = slot.pending.take();
+        let mut residual_loss = if slot.source_loss {
+            EspPeerObservationLoss::SourceAttributed
+        } else {
+            EspPeerObservationLoss::None
+        };
         if let (Some(observation), true) = (&mut drained, slot.overflow_closed) {
             observation.loss = observation.loss.with_overflow();
+        } else if slot.overflow_closed {
+            residual_loss = residual_loss.with_overflow();
         }
         Ok(EspPeerObservationTeardown {
             key: *key,
+            epoch: slot.epoch,
             final_generation: slot.generation,
             drained,
+            residual_loss,
         })
     }
 
@@ -1079,6 +1321,14 @@ impl EspPeerObservationBoundary {
         }
         self.closed = true;
         out
+    }
+}
+
+fn note_source_loss(slot: &mut ObservationSlot) {
+    if let Some(observation) = &mut slot.pending {
+        observation.loss = observation.loss.with_source_attributed();
+    } else {
+        slot.source_loss = true;
     }
 }
 
@@ -1135,6 +1385,7 @@ mod tests {
     const CURRENT_PORT: u16 = 4500;
     const NEW_PORT: u16 = 32768;
     const IFINDEX: u32 = 42;
+    const FIRST_EPOCH: EspPeerObservationEpoch = EspPeerObservationEpoch(NonZeroU64::MIN);
 
     fn key() -> EspPeerObservationKey {
         EspPeerObservationKey {
@@ -1166,6 +1417,7 @@ mod tests {
     ) -> EspPeerObservationEvent {
         EspPeerObservationEvent {
             scope,
+            epoch: FIRST_EPOCH,
             key: key(),
             provenance: EspPeerEventProvenance::PostFinalReplayAccepted,
             outer_source: source,
@@ -1310,6 +1562,7 @@ mod tests {
         );
         let record = boundary.teardown(&key()).expect("registered");
         assert_eq!(record.key, key());
+        assert_eq!(record.epoch, FIRST_EPOCH);
         assert_eq!(record.final_generation, 1);
         let drained = record.drained.expect("pending observation drained");
         assert_eq!(drained.outer_source, NEW_SOURCE);
@@ -1323,10 +1576,18 @@ mod tests {
             matches!(boundary.teardown(&key()), Err(XfrmError::NotFound)),
             "teardown is exact and terminal"
         );
-        // Re-registration starts a fresh lifecycle with a fresh generation.
-        boundary.register_sa(registration()).unwrap();
+        // Re-registration starts a fresh lifecycle with a fresh epoch and
+        // generation. A queued event from the terminated epoch cannot enter.
+        let new_epoch = boundary.register_sa(registration()).unwrap();
+        assert_ne!(new_epoch, FIRST_EPOCH);
         assert_eq!(
             boundary.ingest_event(event(scope, NEW_SOURCE, NEW_PORT, 3)),
+            EspPeerIngestOutcome::Rejected(EspPeerObservationRejection::LifecycleMismatch)
+        );
+        let mut current_epoch_event = event(scope, NEW_SOURCE, NEW_PORT, 3);
+        current_epoch_event.epoch = new_epoch;
+        assert_eq!(
+            boundary.ingest_event(current_epoch_event),
             EspPeerIngestOutcome::ObservationQueued
         );
         assert_eq!(boundary.drain(&key()).unwrap().generation, 1);
@@ -1345,7 +1606,8 @@ mod tests {
             boundary.ingest_event(event(scope, THIRD_SOURCE, NEW_PORT, 2)),
             EspPeerIngestOutcome::Rejected(EspPeerObservationRejection::SlotOverflowClosed)
         );
-        // Fail-closed: subsequent distinct sources are rejected until drain.
+        // Fail-closed: subsequent distinct sources are rejected until an
+        // authenticated rebase or teardown.
         assert_eq!(
             boundary.ingest_event(event(scope, THIRD_SOURCE, NEW_PORT, 3)),
             EspPeerIngestOutcome::Rejected(EspPeerObservationRejection::SlotOverflowClosed)
@@ -1363,14 +1625,64 @@ mod tests {
         );
         assert!(observation.loss.overflow_closed());
         assert!(!observation.loss.source_attributed());
-        // After drain the slot recovers: the next distinct source queues fresh.
+        // Drain alone cannot recover because a kernel producer may already
+        // suppress the overflowed tuple.
         assert_eq!(
             boundary.ingest_event(event(scope, THIRD_SOURCE, NEW_PORT, 4)),
+            EspPeerIngestOutcome::Rejected(EspPeerObservationRejection::SlotOverflowClosed)
+        );
+        boundary
+            .update_current_source(&key(), NEW_SOURCE, NEW_PORT)
+            .unwrap();
+        assert_eq!(
+            boundary.ingest_event(event(scope, THIRD_SOURCE, NEW_PORT, 5)),
             EspPeerIngestOutcome::ObservationQueued
         );
         let recovered = boundary.drain(&key()).unwrap();
         assert_eq!(recovered.outer_source, THIRD_SOURCE);
         assert_eq!(recovered.generation, 2, "generation stays monotonic");
+    }
+
+    #[test]
+    fn authenticated_refresh_preserves_pending_overflow_and_source_loss() {
+        let (scope, mut boundary) = boundary();
+        let mut lossy_current = event(scope, CURRENT, CURRENT_PORT, 1);
+        lossy_current.dropped_since_previous = 1;
+        assert_eq!(
+            boundary.ingest_event(lossy_current),
+            EspPeerIngestOutcome::NoChange
+        );
+        assert_eq!(
+            boundary.ingest_event(event(scope, NEW_SOURCE, NEW_PORT, 2)),
+            EspPeerIngestOutcome::ObservationQueued
+        );
+        assert_eq!(
+            boundary.ingest_event(event(scope, THIRD_SOURCE, NEW_PORT, 3)),
+            EspPeerIngestOutcome::Rejected(EspPeerObservationRejection::SlotOverflowClosed)
+        );
+
+        // A separately authenticated relocation may finish before the
+        // consumer drains the already-pending observation. Rebaseline must
+        // not erase either explicit loss fact.
+        boundary
+            .update_current_source(&key(), NEW_SOURCE, NEW_PORT)
+            .unwrap();
+        assert_eq!(
+            boundary.ingest_event(event(scope, NEW_SOURCE, NEW_PORT, 4)),
+            EspPeerIngestOutcome::NoChange,
+            "the retained pending source is not a distinct overflow"
+        );
+        assert_eq!(
+            boundary.ingest_event(event(scope, THIRD_SOURCE, NEW_PORT, 5)),
+            EspPeerIngestOutcome::Rejected(EspPeerObservationRejection::SlotOverflowClosed),
+            "a genuinely distinct post-refresh source still closes the slot"
+        );
+        let pending = boundary.drain(&key()).unwrap();
+        assert_eq!(pending.outer_source, NEW_SOURCE);
+        assert_eq!(
+            pending.loss,
+            EspPeerObservationLoss::SourceAttributedOverflowClosed
+        );
     }
 
     #[test]
@@ -1393,6 +1705,13 @@ mod tests {
         );
         assert_eq!(
             boundary.ingest_event(event(scope, THIRD_SOURCE, NEW_PORT, 3)),
+            EspPeerIngestOutcome::Rejected(EspPeerObservationRejection::SlotOverflowClosed)
+        );
+        boundary
+            .update_current_source(&key(), NEW_SOURCE, NEW_PORT)
+            .unwrap();
+        assert_eq!(
+            boundary.ingest_event(event(scope, THIRD_SOURCE, NEW_PORT, 4)),
             EspPeerIngestOutcome::ObservationQueued
         );
     }
@@ -1668,16 +1987,152 @@ mod tests {
     }
 
     #[test]
+    fn bounded_source_ingest_yields_with_records_still_queued() {
+        let (scope, mut boundary) = boundary();
+        let mut source = ScriptedEspPeerObservationSource::new();
+        source.push(event(scope, CURRENT, CURRENT_PORT, 1));
+        source.push(event(scope, NEW_SOURCE, NEW_PORT, 2));
+        source.push(event(scope, THIRD_SOURCE, NEW_PORT, 3));
+
+        let first = boundary.ingest_up_to(&mut source, 2);
+        assert_eq!(first.events, 2);
+        assert_eq!(source.pending_len(), 1);
+
+        let second = boundary.ingest_up_to(&mut source, 2);
+        assert_eq!(second.events, 1);
+        assert_eq!(source.pending_len(), 0);
+    }
+
+    #[test]
+    fn standalone_source_loss_updates_pending_without_a_later_event() {
+        let (scope, mut boundary) = boundary();
+        assert_eq!(
+            boundary.ingest_event(event(scope, NEW_SOURCE, NEW_PORT, 1)),
+            EspPeerIngestOutcome::ObservationQueued
+        );
+
+        let mut source = ScriptedEspPeerObservationSource::new();
+        source.push_record(EspPeerObservationSourceRecord::Loss(
+            EspPeerObservationSourceLoss {
+                scope,
+                epoch: FIRST_EPOCH,
+                key: key(),
+                dropped: NonZeroU64::MIN,
+            },
+        ));
+        source.push_record(EspPeerObservationSourceRecord::Terminal(
+            EspPeerObservationSourceTerminal::Closed,
+        ));
+
+        let tally = boundary.ingest_available(&mut source);
+        assert_eq!(tally.events, 0);
+        assert_eq!(tally.source_loss_records, 1);
+        assert_eq!(
+            tally.source_terminal,
+            Some(EspPeerObservationSourceTerminal::Closed)
+        );
+        assert_eq!(tally.rejected, 0);
+
+        let observation = boundary.drain(&key()).expect("pending observation");
+        assert!(
+            observation.loss.source_attributed(),
+            "loss is retained even though no later event exists"
+        );
+        assert!(
+            matches!(
+                boundary.register_sa(registration()),
+                Err(XfrmError::Unavailable)
+            ),
+            "source termination closes admission fail-closed"
+        );
+    }
+
+    #[test]
+    fn standalone_source_loss_survives_teardown_without_an_observation() {
+        let (scope, mut boundary) = boundary();
+        let mut source = ScriptedEspPeerObservationSource::new();
+        source.push_record(EspPeerObservationSourceRecord::Loss(
+            EspPeerObservationSourceLoss {
+                scope,
+                epoch: FIRST_EPOCH,
+                key: key(),
+                dropped: NonZeroU64::MIN,
+            },
+        ));
+
+        let tally = boundary.ingest_available(&mut source);
+        assert_eq!(tally.source_loss_records, 1);
+        assert_eq!(tally.rejected, 0);
+
+        let teardown = boundary.teardown(&key()).expect("registered");
+        assert_eq!(teardown.drained, None);
+        assert_eq!(
+            teardown.residual_loss,
+            EspPeerObservationLoss::SourceAttributed,
+            "known producer loss must not disappear at lifecycle termination"
+        );
+    }
+
+    #[test]
+    fn generation_exhaustion_closes_instead_of_repeating() {
+        let (scope, mut boundary) = boundary();
+        boundary
+            .slots
+            .get_mut(&key())
+            .expect("registered")
+            .generation = u64::MAX;
+
+        assert_eq!(
+            boundary.ingest_event(event(scope, NEW_SOURCE, NEW_PORT, 1)),
+            EspPeerIngestOutcome::Rejected(EspPeerObservationRejection::GenerationOverflowClosed)
+        );
+
+        let teardown = boundary.teardown(&key()).expect("registered");
+        assert_eq!(teardown.final_generation, u64::MAX);
+        assert_eq!(teardown.drained, None);
+        assert_eq!(
+            teardown.residual_loss,
+            EspPeerObservationLoss::OverflowClosed
+        );
+    }
+
+    #[test]
+    fn standalone_loss_from_a_previous_epoch_is_rejected() {
+        let (scope, mut boundary) = boundary();
+        let record = boundary.teardown(&key()).expect("registered");
+        let current_epoch = boundary.register_sa(registration()).expect("re-register");
+        assert_ne!(current_epoch, record.epoch);
+
+        let mut source = ScriptedEspPeerObservationSource::new();
+        source.push_record(EspPeerObservationSourceRecord::Loss(
+            EspPeerObservationSourceLoss {
+                scope,
+                epoch: record.epoch,
+                key: key(),
+                dropped: NonZeroU64::MIN,
+            },
+        ));
+        let tally = boundary.ingest_available(&mut source);
+        assert_eq!(tally.source_loss_records, 1);
+        assert_eq!(tally.rejected, 1);
+        assert_eq!(
+            tally.rejections(EspPeerObservationRejection::LifecycleMismatch),
+            1
+        );
+    }
+
+    #[test]
     fn drain_all_and_close_are_deterministically_ordered() {
         let scope = EspPeerObservationScope::new();
         let mut boundary = EspPeerObservationBoundary::new(scope);
         let mut high_spi = registration();
         high_spi.key.id.spi = 0x0abc_9999;
         boundary.register_sa(registration()).unwrap();
-        boundary.register_sa(high_spi).unwrap();
+        let high_epoch = boundary.register_sa(high_spi).unwrap();
 
         let mut high_event = event(scope, NEW_SOURCE, NEW_PORT, 1);
         high_event.key.id.spi = 0x0abc_9999;
+        high_event.epoch = high_epoch;
         assert_eq!(
             boundary.ingest_event(high_event),
             EspPeerIngestOutcome::ObservationQueued
