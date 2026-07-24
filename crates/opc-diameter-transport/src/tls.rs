@@ -32,6 +32,7 @@ use tokio_rustls::rustls::{self, CipherSuite, ProtocolVersion};
 
 use crate::frame::{borrowed, read_frame, write_frame};
 use crate::frame_transport::{ProtectedFrameTransportClose, ProtectedFrameTransportParts};
+use crate::runtime::DiameterProtectedRuntimeParts;
 use crate::DiameterFrameLimits;
 
 static NEXT_SESSION_GENERATION: AtomicU64 = AtomicU64::new(1);
@@ -199,6 +200,14 @@ pub enum DiameterTlsPolicyError {
     /// The connection-age bound must be finite, nonzero, and representable.
     #[error("Diameter TLS maximum connection age is invalid")]
     InvalidConnectionAge,
+    /// A DTLS/SCTP frame limit exceeds the RFC 6083 path-MTU-derived
+    /// single-record plaintext budget (see `MAX_DTLS_SCTP_MESSAGE_BYTES`).
+    #[error("Diameter DTLS/SCTP frame limit exceeds the single-record budget")]
+    FrameLimitExceedsDtlsRecordBudget,
+    /// RFC 6083's SCTP-AUTH key transition cannot be applied to the TLS 1.3
+    /// exporter schedule without the unstandardized bis profile.
+    #[error("Diameter DTLS 1.3 over SCTP is not an admitted RFC 6083 profile")]
+    Dtls13OverSctpUnavailable,
 }
 
 /// Certificate and Diameter protocol identity expected on one connection.
@@ -333,9 +342,14 @@ impl fmt::Debug for DiameterTlsEvidence {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum DiameterTlsError {
-    /// The peer session is not configured for the requested TLS/TCP sequence.
+    /// The peer session is not configured for the requested protection
+    /// mechanism and sequence.
     #[error("Diameter peer protection policy does not match the transport sequence")]
     ProtectionPolicyMismatch,
+    /// The requested kernel SCTP receive queue is below the RFC 6083 flight
+    /// minimum or exceeds the transport-owned finite bound.
+    #[error("Diameter SCTP receive queue capacity is invalid")]
+    SctpReceiveQueueCapacityInvalid,
     /// The process-wide connection generation counter was exhausted.
     #[error("Diameter connection generation is exhausted")]
     GenerationExhausted,
@@ -345,33 +359,37 @@ pub enum DiameterTlsError {
     /// The caller's absolute operation deadline elapsed.
     #[error("Diameter transport deadline exceeded")]
     DeadlineExceeded,
-    /// TCP or stream I/O failed.
+    /// The underlying TCP, SCTP, or protected-record I/O failed.
     #[error("Diameter transport I/O failed")]
     Transport,
-    /// TLS negotiation failed without an authenticated channel.
-    #[error("Diameter TLS handshake failed")]
+    /// An authenticated peer completed the DTLS close-notify exchange.
+    #[error("Diameter peer closed the protected transport")]
+    PeerClosed,
+    /// TLS or DTLS negotiation failed without an authenticated channel.
+    #[error("Diameter protected transport handshake failed")]
     TlsHandshake,
     /// Certificate or mutual-authentication verification failed.
-    #[error("Diameter TLS peer authentication failed")]
+    #[error("Diameter protected peer authentication failed")]
     Authentication,
     /// The authenticated certificate or semantic Diameter identity did not
     /// match policy.
-    #[error("Diameter TLS peer identity did not match")]
+    #[error("Diameter protected peer identity did not match")]
     PeerIdentityMismatch,
-    /// Negotiation selected a protocol version outside policy.
-    #[error("Diameter TLS protocol downgrade rejected")]
+    /// Negotiation selected a TLS or DTLS version outside policy.
+    #[error("Diameter protected transport protocol downgrade rejected")]
     ProtocolRejected,
-    /// Negotiation selected a cipher suite outside policy.
-    #[error("Diameter TLS cipher rejected")]
+    /// Negotiation selected a TLS or DTLS cipher suite outside policy.
+    #[error("Diameter protected transport cipher rejected")]
     CipherRejected,
-    /// Coherent TLS material was unavailable or changed during admission.
-    #[error("Diameter TLS material was not admitted")]
+    /// Coherent certificate/trust material was unavailable or changed during
+    /// admission.
+    #[error("Diameter protected transport material was not admitted")]
     MaterialNotAdmitted,
     /// The Diameter frame was malformed or exceeded configured limits.
     #[error("invalid Diameter stream frame")]
     InvalidFrame,
     /// CER/CEA was malformed, contradictory, rejected, or did not negotiate
-    /// the required in-band TLS/TCP mechanism.
+    /// the required in-band TLS/TCP or DTLS/SCTP mechanism.
     #[error("Diameter capabilities exchange failed")]
     CapabilitiesExchangeFailed,
     /// The exact peer session did not admit this command on this generation.
@@ -381,8 +399,12 @@ pub enum DiameterTlsError {
     /// on the opposite endpoint role.
     #[error("Diameter capability operation does not match the connection role")]
     ConnectionRoleMismatch,
+    /// A cleartext or foreign-PPID SCTP user message reached an association
+    /// that admits only protected DTLS records.
+    #[error("Diameter transport received cleartext input")]
+    CleartextInput,
     /// The admitted credential epoch was superseded or became unavailable.
-    #[error("Diameter TLS connection retired")]
+    #[error("Diameter protected transport connection retired")]
     Retired,
 }
 
@@ -1167,7 +1189,7 @@ impl DiameterTlsConnection {
         Ok((message, operation))
     }
 
-    pub(crate) fn into_runtime_parts(self) -> DiameterTlsRuntimeParts {
+    pub(crate) fn into_runtime_parts(self) -> DiameterProtectedRuntimeParts<DiameterTlsEvidence> {
         let Self {
             io,
             shutdown,
@@ -1183,17 +1205,18 @@ impl DiameterTlsConnection {
             closed: _,
         } = self;
         let transport_close: Arc<dyn ProtectedFrameTransportClose> = shutdown.clone();
-        DiameterTlsRuntimeParts {
+        DiameterProtectedRuntimeParts {
             frame_transport: ProtectedFrameTransportParts::from_stream(io, transport_close),
             session,
             generation,
+            admitted_epoch: evidence.material_epoch(),
             evidence,
             expected_peer,
             frame_limits,
             material_status,
             hard_deadline,
             retired,
-            retirement_task: _retirement_task,
+            transport_guard: Box::new(_retirement_task),
         }
     }
 }
@@ -1298,19 +1321,6 @@ fn poison_connection(
 pub(crate) struct RetirementTask {
     task: tokio::task::JoinHandle<()>,
     shutdown: Arc<std::net::TcpStream>,
-}
-
-pub(crate) struct DiameterTlsRuntimeParts {
-    pub(crate) frame_transport: ProtectedFrameTransportParts,
-    pub(crate) session: PeerSession,
-    pub(crate) generation: PeerSessionGeneration,
-    pub(crate) evidence: DiameterTlsEvidence,
-    pub(crate) expected_peer: ExpectedPeerIdentity,
-    pub(crate) frame_limits: DiameterFrameLimits,
-    pub(crate) material_status: TlsMaterialStatusReceiver,
-    pub(crate) hard_deadline: Instant,
-    pub(crate) retired: Arc<AtomicBool>,
-    pub(crate) retirement_task: RetirementTask,
 }
 
 impl Drop for RetirementTask {

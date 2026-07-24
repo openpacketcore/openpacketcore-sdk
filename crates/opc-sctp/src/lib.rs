@@ -2522,6 +2522,28 @@ pub struct SctpAssociationReceiveHalf {
     imp: Arc<platform::Association>,
 }
 
+/// Synchronous terminal-close authority for one SCTP association.
+///
+/// Clones carry no send or receive authority. `abort` is idempotent and is
+/// intended for cancellation guards and protocol fail-closed paths.
+#[derive(Clone)]
+pub struct SctpAssociationAbortHandle {
+    imp: Arc<platform::Association>,
+}
+
+impl SctpAssociationAbortHandle {
+    /// Abort both directions of the association immediately.
+    pub fn abort(&self) {
+        self.imp.abort();
+    }
+}
+
+impl fmt::Debug for SctpAssociationAbortHandle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SctpAssociationAbortHandle([redacted])")
+    }
+}
+
 impl SctpEndpoint {
     /// Bind an SCTP endpoint.
     pub fn bind(config: SctpEndpointConfig) -> Result<Self, SctpError> {
@@ -2642,6 +2664,40 @@ impl SctpAssociation {
             SctpAssociationSendHalf { imp: self.imp },
             SctpAssociationReceiveHalf { imp: receive },
         )
+    }
+
+    /// Return terminal-close authority without granting I/O access.
+    pub fn abort_handle(&self) -> SctpAssociationAbortHandle {
+        SctpAssociationAbortHandle {
+            imp: Arc::clone(&self.imp),
+        }
+    }
+
+    /// Return whether this association was created with mandatory
+    /// authenticated DATA chunks.
+    #[must_use]
+    pub fn authenticates_data_chunks(&self) -> bool {
+        self.imp.authenticates_data_chunks()
+    }
+
+    /// Maximum reassembled user-message bytes accepted by this association.
+    #[must_use]
+    pub fn max_message_bytes(&self) -> usize {
+        self.imp.max_message_bytes()
+    }
+
+    /// Return whether this association is still at RFC 6083's initial
+    /// SCTP-AUTH boundary.
+    ///
+    /// A true result proves that authenticated DATA was configured, the
+    /// association remains open, no user DATA has been sent or received
+    /// through this handle, and key identifier 0 is the only installed and
+    /// active key. A DTLS-over-SCTP adapter should check this immediately
+    /// before consuming the association so an earlier caller cannot silently
+    /// bypass the exporter-driven key transition.
+    #[must_use]
+    pub fn is_pristine_rfc6083_auth_state(&self) -> bool {
+        self.imp.is_pristine_rfc6083_auth_state()
     }
 
     /// Install one association-scoped SCTP-AUTH key.
@@ -2769,6 +2825,14 @@ impl SctpAssociation {
 }
 
 impl SctpAssociationSendHalf {
+    /// Return terminal-close authority without granting additional send
+    /// access.
+    pub fn abort_handle(&self) -> SctpAssociationAbortHandle {
+        SctpAssociationAbortHandle {
+            imp: Arc::clone(&self.imp),
+        }
+    }
+
     /// Send one message.
     pub async fn send(&mut self, message: OutboundMessage) -> Result<usize, SctpError> {
         self.imp.send(message).await
@@ -3269,6 +3333,7 @@ mod platform {
         auth_keys: Mutex<BTreeMap<u16, AuthKeyLifecycle>>,
         auth_events: tokio::sync::broadcast::Sender<AuthLifecycleSignal>,
         authentication: Option<SctpAuthenticationConfig>,
+        user_data_observed: AtomicBool,
     }
 
     #[derive(Debug)]
@@ -3401,6 +3466,7 @@ mod platform {
             auth_keys: auth_key_ledger(authentication),
             auth_events,
             authentication,
+            user_data_observed: AtomicBool::new(false),
         })
     }
 
@@ -3461,6 +3527,7 @@ mod platform {
                             auth_keys: auth_key_ledger(self.authentication),
                             auth_events,
                             authentication: self.authentication,
+                            user_data_observed: AtomicBool::new(false),
                         });
                     }
                     Ok(Err(source)) if source.kind() == io::ErrorKind::Interrupted => continue,
@@ -3513,12 +3580,38 @@ mod platform {
     }
 
     impl Association {
+        pub fn abort(&self) {
+            self.terminal_close();
+        }
+
+        pub fn authenticates_data_chunks(&self) -> bool {
+            self.authentication.is_some()
+        }
+
+        pub fn max_message_bytes(&self) -> usize {
+            self.socket.max_message_bytes
+        }
+
+        pub fn is_pristine_rfc6083_auth_state(&self) -> bool {
+            if self.authentication.is_none()
+                || !self.socket.is_open()
+                || self.user_data_observed.load(Ordering::Acquire)
+            {
+                return false;
+            }
+            let keys = self.lock_auth_keys();
+            keys.len() == 1 && keys.get(&0) == Some(&AuthKeyLifecycle::Active)
+        }
+
         pub async fn send(&self, message: OutboundMessage) -> Result<usize, SctpError> {
             let _writer_guard = self.writer_control_gate.lock().await;
             if !self.socket.is_open() {
                 return Err(SctpError::Closed);
             }
             let result = self.socket.send(message).await;
+            if result.as_ref().is_ok_and(|bytes| *bytes > 0) {
+                self.user_data_observed.store(true, Ordering::Release);
+            }
             if result.is_err() {
                 self.terminal_close();
             }
@@ -3535,6 +3628,9 @@ mod platform {
                     return Err(error);
                 }
             };
+            if !message.notification {
+                self.user_data_observed.store(true, Ordering::Release);
+            }
             if let Some(event) = message.event {
                 self.sender_drain.record_event(event);
                 self.record_auth_event(event);
@@ -4268,6 +4364,25 @@ mod platform {
     }
 
     impl Association {
+        pub fn abort(&self) {
+            let _ = self;
+        }
+
+        pub fn authenticates_data_chunks(&self) -> bool {
+            let _ = self;
+            false
+        }
+
+        pub fn max_message_bytes(&self) -> usize {
+            let _ = self;
+            0
+        }
+
+        pub fn is_pristine_rfc6083_auth_state(&self) -> bool {
+            let _ = self;
+            false
+        }
+
         pub async fn send(&self, message: OutboundMessage) -> Result<usize, SctpError> {
             let _ = (self, message);
             Err(SctpError::UnsupportedPlatform)
@@ -6713,16 +6828,20 @@ mod tests {
             .await
             .expect("authenticated SCTP accept timed out")
             .unwrap();
+        assert!(client.is_pristine_rfc6083_auth_state());
+        assert!(accepted.is_pristine_rfc6083_auth_state());
 
         let first_key_id = SctpAuthKeyId::new(1).unwrap();
         client
             .install_auth_key(SctpAuthKey::for_rfc6083(first_key_id, vec![0x11; 64]).unwrap())
             .await
             .unwrap();
+        assert!(!client.is_pristine_rfc6083_auth_state());
         accepted
             .install_auth_key(SctpAuthKey::for_rfc6083(first_key_id, vec![0x11; 64]).unwrap())
             .await
             .unwrap();
+        assert!(!accepted.is_pristine_rfc6083_auth_state());
         client.activate_auth_key(first_key_id).await.unwrap();
         accepted.activate_auth_key(first_key_id).await.unwrap();
 

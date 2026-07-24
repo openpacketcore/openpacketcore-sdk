@@ -205,11 +205,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   terminate the association. Ordinary send and PPID selection stay unchanged,
   and the low-level default event subscription is preserved. Downstream
   exhaustive matches on `SctpEvent` and `SctpError` must handle the new typed
-  AUTH/drain variants. This is lower-layer plumbing only: it does not implement DTLS,
-  derive exporter material, validate peer identity, emit PPID 47, or claim
-  protected Diameter readiness (#348).
+  AUTH/drain variants. These lower-layer primitives do not claim protected
+  Diameter readiness by themselves; the `opc-diameter-transport` boundary
+  below consumes them and binds the resulting evidence to one peer generation
+  (#348).
+- **Mutually authenticated Diameter DTLS/SCTP transport —
+  `opc-diameter-transport`:** completes the RFC 6733 direct and in-band
+  protection sequences over the RFC 6083 DTLS-1.2-only profile. Consuming
+  typestates allow either no Diameter before DTLS or exactly one canonical
+  cleartext CER/CEA before same-association upgrade; no application command is
+  admitted before mutual authentication. Every DTLS record is one ordered
+  stream-0 PPID-47 SCTP message, with a 16,347-byte cross-suite plaintext
+  bound. A bounded real-kernel adapter requires authenticated DATA chunks,
+  continuously drains SCTP notifications, derives the exact 64-byte RFC 5705
+  `EXPORTER_DTLS_OVER_SCTP` value, and orders inactive key install,
+  sender-dry, ChangeCipherSpec, key activation, Finished, peer confirmation,
+  and old-key retirement. The raw record/prelude seam is crate-private behind
+  an opaque consuming transport capability, and the adapter requires a
+  32-to-4,096-message receive queue so valid fragmented certificate flights
+  cannot overflow an admitted configuration. Full bounded certificate chains
+  are verified in leaf-to-root order against trust-domain-scoped anchors and
+  exact SPIFFE identity. Evidence reports the negotiated DTLS version and
+  cipher, coherent material epoch, full-chain expiry, and exact Diameter
+  protection generation; the connection supports the same bounded full-duplex
+  runtime as TLS/TCP.
+  Timeouts, cancellation, downgrade, malformed metadata, queue exhaustion,
+  credential replacement, or close-order ambiguity fail the whole association
+  closed. The audited `dimpl` 0.7.2 fork is an exact vendored path dependency
+  with recorded provenance, pure-Rust production features, independent
+  provider/exporter known-answer tests, restored upstream tests, and dedicated
+  CI source gates. Explicit unprotected mode remains unprotected and requires
+  product-owned external IPsec attestation (#348).
 - **Bounded Diameter TLS/TCP transport — `opc-diameter-transport`:** adds an
-  experimental transport crate for direct TLS-before-Diameter and same-stream
+  transport crate for direct TLS-before-Diameter and same-stream
   in-band CER/CEA-then-TLS sequencing. Exact bounded framing avoids read-ahead,
   strictly rejects reserved command bits before body allocation, and leaves
   repeatable AVPs to strict typed CER/CEA parsing. Every operation uses an
@@ -261,9 +289,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   remain caller-owned. A
   transport-neutral RFC 6733 simultaneous-open helper returns the converged
   local survivor and fails closed on indistinguishable Origin-Host values.
-  Realm routing, listener/reconnect orchestration, DTLS/SCTP, and SCTP PPID 47
-  remain outside this slice, which makes no complete RFC 6733 or
-  product-readiness claim (#348).
+  Realm routing and listener/reconnect orchestration remain outside this
+  TLS/TCP slice. The RFC 6083 DTLS/SCTP and PPID-47 boundary is described in
+  the separate completed entry above (#348).
 - **Explicit IKEv2 legacy-interoperability suites — `opc-proto-ikev2`:**
   executable typed support now covers MODP-768/1024 (Transform IDs 1/2),
   PRF-HMAC-SHA1 (2), and AUTH-HMAC-SHA1-96 (2) across admitted-provider

@@ -2,7 +2,8 @@
 
 ## Status
 
-Accepted (amended 2026-06-12: crypto-provider scope and JWT backend, point 9)
+Accepted (amended 2026-06-12: crypto-provider scope and JWT backend, point 9;
+amended 2026-07-24: DTLS provider admission, point 9)
 
 ## Date
 
@@ -75,6 +76,27 @@ implicit policy does not survive contact with routine maintenance:
    once the `rsa` crate ships a constant-time release (its in-progress
    `crypto-bigint` migration), dropping the `aws-lc-sys`/`cmake` build step
    and fully satisfying the pure-Rust ideal.
+
+   A third provider family is admitted for DTLS: the audited workspace-vendored
+   `dimpl` 0.7.2 fork with its pure-Rust `rust-crypto` feature (RustCrypto
+   AEAD/ECDSA/ECDH crates) implements the RFC 6083 DTLS/SCTP record layer for
+   `opc-diameter-transport`. The existing stack cannot serve: rustls has no
+   DTLS support, and FFI/OpenSSL-class bindings are barred by point 8. The
+   production dependency is an exact, non-publishable path binding with
+   `default-features = false` and `features = ["rust-crypto"]`; its
+   `aws-lc-rs`/`rcgen` defaults and the `rsa` crate therefore stay out of the
+   production graph. Downstream feature unification is not presented as a
+   selectable deployment-provider contract. The fork's complete upstream test
+   tree and both built-in provider configurations remain CI qualification
+   inputs, and `vendor/dimpl/UPSTREAM.md` records the exact crates.io checksum,
+   upstream Git revision, local patch inventory, and mandatory source gates.
+   Peer-certificate PKI validation for DTLS is performed with the same
+   rustls-webpki verification family as the TLS side, not by the engine.
+   DTLS construction is not currently routed through
+   `opc-crypto-provider`; the transport binds the fork's audited RustCrypto
+   provider explicitly instead of consulting the fork's process-global
+   default-provider slot, and its fallible constructor runs that provider's
+   known-answer validation before it can accept traffic.
 
 ## Consequences
 

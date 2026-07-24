@@ -1549,6 +1549,7 @@ dependencies = [
  "tokio-rustls",
  "tracing",
  "x509-parser",
+ "zeroize",
 ]
 
 [[package]]

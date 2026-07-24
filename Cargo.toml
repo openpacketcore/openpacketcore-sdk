@@ -10,6 +10,9 @@ exclude = [
     "crates/opc-gtpu-dataplane-ebpf",
     "crates/opc-ipsec-lb-ebpf",
     "crates/opc-ipsec-xfrm-ebpf",
+    # The audited DTLS fork retains its upstream standalone workspace so its
+    # own test suite and lockfile remain independently reproducible.
+    "vendor/dimpl",
 ]
 resolver = "2"
 
@@ -55,6 +58,7 @@ rsa = { version = "0.9", default-features = false, features = ["std", "sha2"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 rustls-pki-types = { version = "1.8", features = ["std"] }
+rustls-webpki = { version = "0.103", default-features = false, features = ["alloc", "ring"] }
 x509-parser = { version = "0.16" }
 rcgen = { version = "0.14" }
 nix = { version = "0.31.3", default-features = false }

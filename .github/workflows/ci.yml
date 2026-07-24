@@ -19,7 +19,14 @@ jobs:
   rust:
     name: Rust workspace
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
+    # Debug symbols dominate the hosted runner's disk budget for this large
+    # all-target workspace. CI validates behavior and diagnostics without
+    # retaining symbol tables; release-profile artifacts are unaffected.
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -29,8 +36,12 @@ jobs:
         with:
           components: clippy,rustfmt
 
-      - name: Cache Rust build output
+      - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
+        with:
+          # Do not restore the former debuginfo-heavy target cache into the
+          # bounded hosted runner. Registry and Git dependency caches remain.
+          cache-targets: false
 
       - name: Check formatting
         run: cargo fmt --all --check
@@ -62,11 +73,22 @@ jobs:
       - name: Run clippy
         run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
+      - name: Reclaim lint build artifacts
+        # Test binaries are linked in a separate profile. Keeping the complete
+        # all-target Clippy graph beside them can exhaust hosted-runner disk.
+        run: cargo clean
+
       - name: Run tests
         run: cargo test --locked --workspace --exclude opc-persist --all-features --quiet -- --test-threads=4
 
+      - name: Reclaim workspace test artifacts
+        run: cargo clean
+
       - name: Run GTP-U unsupported-platform cfg tests
         run: RUSTFLAGS="--cfg opc_linux_gtpu_sys_force_unsupported" cargo test --locked -p opc-linux-gtpu-sys -p opc-gtpu-dataplane --no-default-features --quiet
+
+      - name: Reclaim alternate-cfg test artifacts
+        run: cargo clean
 
       # The opc-persist e2e suites drive real consensus subprocess clusters
       # (3-4 nodes plus TCP proxies per test). Running several clusters
@@ -74,6 +96,63 @@ jobs:
       # port-block allocator, so these suites run single-threaded in CI.
       - name: Run consensus e2e tests (serial)
         run: cargo test --locked -p opc-persist --all-features --quiet -- --test-threads=1
+
+  vendored-dtls:
+    name: Audited vendored DTLS
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/vendored-dtls
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+
+      - name: Cache Rust build output
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: opc-vendored-dtls
+
+      - name: Check external consumer resolution
+        run: python3 scripts/check-vendored-dimpl.py
+
+      - name: Check audited DTLS fork formatting
+        run: cargo fmt --manifest-path vendor/dimpl/Cargo.toml --all --check
+
+      - name: Lint every all-feature DTLS target
+        run: cargo clippy --manifest-path vendor/dimpl/Cargo.toml --all-features --all-targets -- -D warnings
+
+      - name: Lint every RustCrypto-only DTLS target
+        run: cargo clippy --manifest-path vendor/dimpl/Cargo.toml --no-default-features --features rust-crypto --all-targets -- -D warnings
+
+      - name: Deny production panic paths with all features
+        run: cargo clippy --manifest-path vendor/dimpl/Cargo.toml --all-features --lib -- -D warnings -D clippy::unwrap_used -D clippy::expect_used -D clippy::panic
+
+      - name: Deny production panic paths with RustCrypto
+        run: cargo clippy --manifest-path vendor/dimpl/Cargo.toml --no-default-features --features rust-crypto --lib -- -D warnings -D clippy::unwrap_used -D clippy::expect_used -D clippy::panic
+
+      - name: Test every all-feature DTLS target
+        run: cargo test --manifest-path vendor/dimpl/Cargo.toml --all-features --all-targets
+
+      - name: Test all-feature DTLS documentation
+        run: cargo test --manifest-path vendor/dimpl/Cargo.toml --all-features --doc
+
+      - name: Test every RustCrypto-only DTLS target
+        run: cargo test --manifest-path vendor/dimpl/Cargo.toml --no-default-features --features rust-crypto --all-targets
+
+      - name: Test RustCrypto-only DTLS documentation
+        run: cargo test --manifest-path vendor/dimpl/Cargo.toml --no-default-features --features rust-crypto --doc
+
+      - name: Enforce vendored RFC 6083 source invariants
+        run: |
+          ! rg -n '\b(unreachable!|unimplemented!|todo!)' vendor/dimpl/src
+          ! rg -n 'Rfc6083|rfc6083' vendor/dimpl/src/dtls13
+          ! rg -n 'impl Default for Config|Config::default\(\)' \
+            vendor/dimpl/src vendor/dimpl/tests vendor/dimpl/README.md
 
   session-net-i686:
     name: opc-session-net i686

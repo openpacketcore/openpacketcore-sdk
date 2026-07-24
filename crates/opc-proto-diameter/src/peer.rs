@@ -772,9 +772,11 @@ impl PeerProtectionRequirement {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum PeerProtectionPolicy {
-    /// Preserve the existing explicit no-in-band-security behavior. This mode
-    /// never reports protected readiness and does not accept a TLS-only
-    /// capability result.
+    /// Explicitly use no SDK-protected Diameter transport. This mode never
+    /// reports protected readiness and does not accept a TLS-only capability
+    /// result. A product may select it only after separately configuring and
+    /// attesting an external IPsec boundary; this SDK neither performs nor
+    /// infers that attestation.
     CompatibilityUnprotected,
     /// Require the typed mechanism and RFC 6733 protection sequence.
     Require(PeerProtectionRequirement),
