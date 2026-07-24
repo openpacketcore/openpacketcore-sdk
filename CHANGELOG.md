@@ -8,6 +8,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Independent leaf-rotation and rejected-reload evidence — `opc-session-net`:**
+  extends the seamless credential-rotation qualification for #158 with
+  deterministic in-process mTLS cases. Continuous get/CAS/lease/batch requests
+  and a gap-checked watch stream now survive rotating the client leaf and the
+  server leaf independently under one unchanged issuer, with bounded
+  request/watch-lane recycling; after each one-sided rotation, fresh handshake
+  probes through the DNS routing alias prove identity enforcement stays live —
+  a wrong-identity dial fails closed while the exact canonical-SPIFFE identity
+  still authenticates. A separate
+  case publishes identity-mismatched, empty, and over-limit reloads to each
+  side under the same traffic and proves last-known-good retention with closed,
+  redaction-safe status reasons, per-variant dial stability, and a later
+  coherent reload still rotating. These two replication-surface cases run on
+  the quarantined `legacy-session-net-compat` feature that CI exercises via
+  all-features runs. On the always-on consensus transport, a server-only
+  material epoch retires the listener's accepted lanes and replaces both
+  cached lanes exactly once; a call assigned to a stale lane fails once with
+  the typed no-replay outcome before its retried replacement renegotiates a
+  fresh session with the current contract profile, with session resumption
+  disabled by construction (#158).
 - **Initiator Child-SA rekey response boundary — `opc-proto-ikev2`:**
   composes the existing request-build representation into a retained,
   once-only RFC 7296 response boundary. It correlates the exact old IKE SPI

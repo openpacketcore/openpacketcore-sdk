@@ -1016,7 +1016,19 @@ endpoint, SPIFFE ID, certificate, key, transaction, or payload text.
   routing aliases, certificate/claim/scope mismatches, downgrade and malformed
   Hello, local and peer leaf-expiry retirement, overlapping trust rotation,
   old-trust rejection, fresh nonce/profile/ALPN checks on
-  replacements, relabeling, and replayed challenge responses over mTLS.
+  replacements, relabeling, and replayed challenge responses over mTLS. It also
+  rotates the client leaf and the server leaf independently under one unchanged
+  issuer while continuous get/CAS/lease/batch requests and a watch stream stay
+  active, proving gap-free watch continuity, bounded request/watch-lane
+  recycling, and — after each one-sided rotation — live identity enforcement
+  through the routing alias via fresh handshake probes: a wrong-identity dial
+  still fails closed while the exact identity still authenticates. (These
+  replication-surface rotation cases run on the quarantined
+  `legacy-session-net-compat` feature; CI exercises them via `--all-features`.)
+  Its rejected-reload case publishes identity-mismatched, empty, and
+  over-limit material to each side under the same traffic and proves
+  last-known-good retention with closed, redaction-safe status reasons, no
+  connection drain, and a later coherent reload still rotating.
 - `opc-tls/tests/material_epochs.rs` proves effective configured/presented-chain
   expiry across a real mutual-TLS handshake, and `src/lifecycle.rs` unit tests
   prove the corresponding local/peer retirement deadlines and fixed metric
@@ -1027,7 +1039,10 @@ endpoint, SPIFFE ID, certificate, key, transaction, or payload text.
   explicit generation or material epoch, finite cached-connection retirement,
   renewed SVID handshakes, wrong rotated identities, rejection of legacy
   backend authority, the 1,500 ms contained cold cap, and every 2/5/10-second
-  family. It forms a real three-node `ConsensusConfigStore` over the existing
+  family. A server-only material epoch retires the listener's accepted lanes
+  and replaces both cached lanes exactly once; a call assigned to a stale lane
+  fails once with the typed no-replay outcome before its retried replacement
+  completes the full negotiation. It forms a real three-node `ConsensusConfigStore` over the existing
   mTLS peer/server, restarts a follower listener, injects a persistent 500 ms
   cold delay, and proves same-leader, same-term
   catch-up/readiness/linearizable read within 10 seconds without a preflight.

@@ -2473,6 +2473,138 @@ async fn consensus_reauthentication_and_material_epochs_replace_both_cached_lane
 }
 
 #[tokio::test]
+async fn consensus_server_only_material_rotation_replaces_both_cached_lanes() {
+    let pki = TestPki::new();
+    let manifest = manifest("consensus-server-only-rotation", 8, 1);
+    let handler = Arc::new(CountingEchoHandler::default());
+    let (server_tx, server_rx) =
+        tokio::sync::watch::channel(Some(pki.identity_state(SERVER_REPLICA)));
+    let server_config = TlsConfigBuilder::new(server_rx)
+        .allow_any_trusted_peer()
+        .build_authenticated_server_config()
+        .expect("rotating consensus server config");
+    let binding = manifest
+        .bind_local(replica_id(SERVER_REPLICA))
+        .expect("server binding");
+    // Zero rotation jitter keeps the server-side material-epoch retirement
+    // immediate; stable-jitter spreading is covered separately with paused
+    // time.
+    let immediate_rotation = ConnectionLifecyclePolicy::try_new(
+        Duration::from_secs(60),
+        Duration::from_secs(2),
+        Duration::from_millis(1),
+        Duration::from_millis(20),
+        Duration::ZERO,
+    )
+    .expect("immediate rotation lifecycle");
+    let (handle, addr) =
+        SessionConsensusServer::new(handler.clone(), server_config.clone(), binding)
+            .with_connection_lifecycle(immediate_rotation)
+            .listen("127.0.0.1:0".parse().expect("listen address"))
+            .await
+            .expect("server-only rotation listener");
+    let resolutions = Arc::new(AtomicUsize::new(0));
+    let counted_resolver: RemoteAddrResolver = {
+        let resolutions = Arc::clone(&resolutions);
+        Arc::new(move || {
+            resolutions.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move { Ok(addr) })
+        })
+    };
+    let peer = RemoteSessionConsensusPeer::new_with_resolver(
+        manifest
+            .bind_local(replica_id(1))
+            .expect("client binding")
+            .bind_remote(replica_id(SERVER_REPLICA))
+            .expect("server binding"),
+        counted_resolver,
+        pki.client_config(1),
+        Some(Duration::from_secs(2)),
+    )
+    .with_connection_lifecycle(immediate_rotation);
+
+    assert_consensus_call_pair(&peer, &manifest, b"initial-primary", b"initial-overflow").await;
+    assert_eq!(resolutions.load(Ordering::SeqCst), 2);
+
+    // Rotate only the listener's leaf/key. The client material never advances,
+    // so both lane replacements must come from the server retiring its
+    // accepted connections. A call assigned to a stale lane must surface
+    // exactly one typed no-replay outcome per lane; the transport never
+    // replays it implicitly, and the retried call repeats the complete
+    // mutual-TLS and contract-profile negotiation.
+    let previous_epoch = server_config.material_status().epoch();
+    server_tx.send_replace(Some(pki.identity_state(SERVER_REPLICA)));
+    wait_for_material_epoch_change(|| server_config.material_status(), previous_epoch).await;
+
+    let mut stale_errors = Vec::new();
+    let mut drain_successes = 0_usize;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let first = peer.call(request_for_family(
+                &manifest,
+                1,
+                SessionConsensusRpcFamily::AppendEntries,
+                b"drain-primary".to_vec(),
+            ));
+            let second = peer.call(request_for_family(
+                &manifest,
+                1,
+                SessionConsensusRpcFamily::AppendEntries,
+                b"drain-overflow".to_vec(),
+            ));
+            let (first, second) = tokio::join!(first, second);
+            for outcome in [&first, &second] {
+                match outcome {
+                    Ok(_) => drain_successes += 1,
+                    Err(error) => stale_errors.push(*error),
+                }
+            }
+            if resolutions.load(Ordering::SeqCst) >= 4 && first.is_ok() && second.is_ok() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("server-only rotation must replace both cached lanes within the operation bound");
+    assert_eq!(
+        stale_errors.as_slice(),
+        [
+            SessionConsensusPeerError::Unavailable,
+            SessionConsensusPeerError::Unavailable
+        ],
+        "each stale lane must surface exactly one typed no-replay outcome"
+    );
+    assert_eq!(
+        handler.calls.load(Ordering::SeqCst),
+        2 + drain_successes,
+        "every successful drain call must reach the handler exactly once and every failed call zero times"
+    );
+
+    assert_consensus_call_pair(&peer, &manifest, b"rotated-primary", b"rotated-overflow").await;
+    assert_eq!(
+        resolutions.load(Ordering::SeqCst),
+        4,
+        "one server-only material epoch change must replace both established lanes exactly once"
+    );
+    assert_eq!(
+        handler.calls.load(Ordering::SeqCst),
+        2 + drain_successes + 2
+    );
+
+    // No further lane replacement may trail the settle.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_consensus_call_pair(&peer, &manifest, b"settled-primary", b"settled-overflow").await;
+    assert_eq!(resolutions.load(Ordering::SeqCst), 4);
+    assert_eq!(
+        handler.calls.load(Ordering::SeqCst),
+        2 + drain_successes + 4
+    );
+
+    handle.abort_and_wait().await;
+}
+
+#[tokio::test]
 async fn both_consensus_lanes_rotate_across_real_mtls_trust_cutover() {
     let manifest = manifest("consensus-two-lane-trust-cutover", 8, 1);
     let old_root = RotationRoot::new("two-lane old");
