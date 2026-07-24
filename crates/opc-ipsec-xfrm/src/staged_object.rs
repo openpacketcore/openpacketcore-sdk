@@ -1084,7 +1084,7 @@ mod tests {
     use crate::{
         AllocateSpiRequest, IpAddress, PolicyParameters, QuerySaRequest, RekeyPolicyRequest,
         RekeySaRequest, SaParameters, SaState, SpiAllocation, XfrmAction, XfrmDirection, XfrmId,
-        XfrmMode, XfrmProbe, XfrmSelector, XfrmTemplate,
+        XfrmMark, XfrmMode, XfrmProbe, XfrmSelector, XfrmTemplate,
     };
 
     #[derive(Debug, Default)]
@@ -2875,5 +2875,166 @@ mod tests {
             assert!(!surface.contains("171"), "key leak: {surface}");
             assert!(!surface.contains("0xab"), "key leak: {surface}");
         }
+    }
+
+    #[tokio::test]
+    async fn sa_removal_identity_preserves_the_lookup_mark() {
+        let mark = XfrmMark {
+            value: 0x42,
+            mask: 0xffff_ffff,
+        };
+        let mut request = sa_install_request();
+        if let XfrmObjectInstallRequest::Sa(request) = &mut request {
+            request.parameters.mark = Some(mark);
+        }
+        let expected = RemoveSaRequest {
+            mark: Some(mark),
+            ..expected_remove_sa()
+        };
+        let backend = Arc::new(GatedBackend::new());
+        let staged = XfrmStagedObjectInstall::new(request);
+        let journal = staged.journal();
+        staged.run(backend.clone()).await.expect("install applies");
+
+        let plan = journal.recovery_plan();
+        assert_eq!(
+            plan.candidate(),
+            Some(&XfrmObjectRemovalRequest::Sa(expected))
+        );
+        journal
+            .recover(
+                backend.clone(),
+                classify(&plan, XfrmResidueClassification::Owned),
+            )
+            .await
+            .expect("owned classification removes the exact marked SA");
+        assert_eq!(backend.removed_sa_requests(), vec![expected]);
+    }
+
+    #[tokio::test]
+    async fn policy_removal_identity_preserves_the_lookup_mark() {
+        let mark = XfrmMark {
+            value: 0x77,
+            mask: 0xffff_ffff,
+        };
+        let mut request = policy_install_request();
+        if let XfrmObjectInstallRequest::Policy(request) = &mut request {
+            request.parameters.mark = Some(mark);
+        }
+        let expected = RemovePolicyRequest {
+            mark: Some(mark),
+            ..expected_remove_policy()
+        };
+        let backend = Arc::new(GatedBackend::new());
+        let staged = XfrmStagedObjectInstall::new(request);
+        let journal = staged.journal();
+        staged.run(backend.clone()).await.expect("install applies");
+
+        let plan = journal.recovery_plan();
+        assert_eq!(
+            plan.candidate(),
+            Some(&XfrmObjectRemovalRequest::Policy(expected.clone()))
+        );
+        journal
+            .recover(
+                backend.clone(),
+                classify(&plan, XfrmResidueClassification::Owned),
+            )
+            .await
+            .expect("owned classification removes the exact marked policy");
+        assert_eq!(backend.removed_policy_requests(), vec![expected]);
+    }
+
+    /// Poll a future to completion without any Tokio runtime context.
+    ///
+    /// Only safe for futures that can never return `Poll::Pending` outside a
+    /// runtime, such as the staged `run`/`recover` futures whose first
+    /// statement is the runtime-presence check.
+    fn block_on_without_runtime<F: Future>(future: F) -> F::Output {
+        use std::task::{Context, Poll, Waker};
+
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+        let mut future = std::pin::pin!(future);
+        loop {
+            match future.as_mut().poll(&mut context) {
+                Poll::Ready(output) => return output,
+                Poll::Pending => std::thread::park(),
+            }
+        }
+    }
+
+    #[test]
+    fn run_and_recover_outside_a_runtime_are_typed_and_do_not_poison_the_journal() {
+        let backend = Arc::new(GatedBackend::new());
+        let staged = XfrmStagedObjectInstall::new(sa_install_request());
+        let journal = staged.journal();
+
+        let error = block_on_without_runtime(staged.run(backend.clone()))
+            .expect_err("run outside a runtime is typed");
+        assert!(matches!(
+            error,
+            XfrmStagedObjectInstallRunError::RuntimeUnavailable
+        ));
+        assert_eq!(journal.ownership(), XfrmObjectInstallOwnership::NotStarted);
+        assert!(journal.recovery_plan().is_empty());
+        assert!(backend.operations().is_empty());
+
+        let error = block_on_without_runtime(
+            journal.recover(backend.clone(), journal.recovery_plan().classification()),
+        )
+        .expect_err("recover outside a runtime is typed");
+        assert!(matches!(
+            error,
+            XfrmObjectInstallRecoveryError::RuntimeUnavailable
+        ));
+        assert_eq!(journal.ownership(), XfrmObjectInstallOwnership::NotStarted);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime builds");
+        runtime.block_on(async {
+            journal
+                .recover(backend.clone(), journal.recovery_plan().classification())
+                .await
+                .expect("unpoisoned journal recovers inside a runtime");
+        });
+        assert_eq!(journal.ownership(), XfrmObjectInstallOwnership::Recovered);
+
+        // A journal with live residue is likewise unpoisoned by a
+        // runtime-free recovery attempt.
+        let staged = XfrmStagedObjectInstall::new(policy_install_request());
+        let journal = staged.journal();
+        runtime.block_on(async {
+            staged.run(backend.clone()).await.expect("install applies");
+        });
+        assert_eq!(journal.ownership(), XfrmObjectInstallOwnership::Acquired);
+        let plan = journal.recovery_plan();
+        let error = block_on_without_runtime(journal.recover(
+            backend.clone(),
+            classify(&plan, XfrmResidueClassification::Owned),
+        ))
+        .expect_err("recover outside a runtime is typed");
+        assert!(matches!(
+            error,
+            XfrmObjectInstallRecoveryError::RuntimeUnavailable
+        ));
+        assert_eq!(journal.ownership(), XfrmObjectInstallOwnership::Acquired);
+        assert_eq!(journal.recovery_plan(), plan);
+        runtime.block_on(async {
+            journal
+                .recover(
+                    backend.clone(),
+                    classify(&plan, XfrmResidueClassification::Owned),
+                )
+                .await
+                .expect("unpoisoned journal recovers inside a runtime");
+        });
+        assert_eq!(journal.ownership(), XfrmObjectInstallOwnership::Recovered);
+        assert_eq!(
+            backend.removed_policy_requests(),
+            vec![expected_remove_policy()]
+        );
     }
 }
