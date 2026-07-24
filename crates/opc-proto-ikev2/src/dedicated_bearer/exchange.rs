@@ -12,8 +12,9 @@ use crate::{
     header::{Header, EXCHANGE_TYPE_CREATE_CHILD_SA, EXCHANGE_TYPE_INFORMATIONAL},
     ike_auth::{
         Ikev2CreateChildSaRekeyResponseBuild, Ikev2DeletePayload, Ikev2IkeAuthBuildError,
-        Ikev2IkeAuthPayloadBuild, Ikev2IkeAuthPayloadError, Ikev2TrafficSelectorPayload,
-        Ikev2TrafficSelectorPayloadBuild, IKEV2_IPSEC_SPI_SIZE, IKEV2_SECURITY_PROTOCOL_ID_ESP,
+        Ikev2IkeAuthPayloadBuild, Ikev2IkeAuthPayloadError, Ikev2TrafficSelector,
+        Ikev2TrafficSelectorPayload, Ikev2TrafficSelectorPayloadBuild, IKEV2_IPSEC_SPI_SIZE,
+        IKEV2_SECURITY_PROTOCOL_ID_ESP, IKEV2_TS_IPV4_ADDR_RANGE, IKEV2_TS_IPV6_ADDR_RANGE,
     },
     notify::{Ikev2NotifyPayload, Ikev2NotifyPayloadError, IKEV2_NOTIFY_REKEY_SA},
     payload::{PayloadChain, PayloadType, RawPayload},
@@ -42,6 +43,7 @@ const IKEV2_TRANSFORM_TYPE_ESN: u8 = 5;
 const IKEV2_TRANSFORM_ID_NONE: u16 = 0;
 const IKEV2_TRANSFORM_ID_ESN: u16 = 1;
 const IKEV2_TRANSFORM_ATTRIBUTE_KEY_LENGTH: u16 = 14;
+const IKEV2_TRAFFIC_SELECTOR_MAX_COUNT: usize = u8::MAX as usize;
 
 /// Stable payload role used in missing/duplicate diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -889,7 +891,7 @@ fn preserve_notify<'a>(
     }
 }
 
-fn validate_sa_build(
+pub(crate) fn validate_sa_build(
     sa: &Ikev2SaPayloadBuild,
     response: bool,
 ) -> Result<(), Ikev2DedicatedBearerExchangeError> {
@@ -919,7 +921,7 @@ fn validate_sa_build(
     Ok(())
 }
 
-fn validate_sa_view(
+pub(crate) fn validate_sa_view(
     sa: &Ikev2SaPayload<'_>,
     response: bool,
 ) -> Result<(), Ikev2DedicatedBearerExchangeError> {
@@ -974,6 +976,13 @@ impl EspTransformShape {
             return Err(
                 Ikev2DedicatedBearerExchangeError::MissingMandatoryEspTransform {
                     transform_type: IKEV2_TRANSFORM_TYPE_ENCR,
+                },
+            );
+        }
+        if self.esn == 0 {
+            return Err(
+                Ikev2DedicatedBearerExchangeError::MissingMandatoryEspTransform {
+                    transform_type: IKEV2_TRANSFORM_TYPE_ESN,
                 },
             );
         }
@@ -2177,18 +2186,15 @@ pub fn validate_ikev2_dedicated_bearer_create_child_sa_response_correlation(
         .iter()
         .find(|transform| transform.transform_type == IKEV2_TRANSFORM_TYPE_DH)
         .map(|transform| transform.transform_id);
-    match selected_dh_group {
-        None | Some(IKEV2_TRANSFORM_ID_NONE) if key_exchange.is_none() => {}
-        Some(group)
-            if request
-                .key_exchange
-                .as_ref()
-                .is_some_and(|request_ke| request_ke.dh_group == group)
-                && key_exchange
-                    .as_ref()
-                    .is_some_and(|response_ke| response_ke.dh_group == group) => {}
-        _ => return Err(Ikev2DedicatedBearerExchangeError::ResponseKeyExchangeMismatch),
-    }
+    validate_selected_key_exchange(
+        request
+            .key_exchange
+            .as_ref()
+            .map(|request_ke| request_ke.dh_group),
+        key_exchange.as_ref(),
+        selected_dh_group,
+    )
+    .map_err(|_| Ikev2DedicatedBearerExchangeError::ResponseKeyExchangeMismatch)?;
     if !traffic_selector_payload_is_narrowed(
         &request.traffic_selectors_initiator,
         traffic_selectors_initiator,
@@ -2201,7 +2207,7 @@ pub fn validate_ikev2_dedicated_bearer_create_child_sa_response_correlation(
     Ok(())
 }
 
-fn validate_selected_proposal(
+pub(crate) fn validate_selected_proposal(
     offered: &Ikev2SaProposal<'_>,
     selected: &Ikev2SaProposal<'_>,
 ) -> Result<(), Ikev2DedicatedBearerExchangeError> {
@@ -2225,13 +2231,34 @@ fn validate_selected_proposal(
         IKEV2_TRANSFORM_TYPE_DH,
         IKEV2_TRANSFORM_ID_NONE,
     )?;
-    validate_optional_selected_transform(
-        offered,
-        selected,
-        IKEV2_TRANSFORM_TYPE_ESN,
-        IKEV2_TRANSFORM_ID_NONE,
-    )?;
+    validate_required_selected_transform(offered, selected, IKEV2_TRANSFORM_TYPE_ESN)?;
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Ikev2SelectedKeyExchangeError {
+    Unexpected,
+    Required,
+    GroupMismatch,
+}
+
+pub(crate) fn validate_selected_key_exchange(
+    request_group: Option<u16>,
+    response: Option<&Ikev2KeyExchangePayload<'_>>,
+    selected_group: Option<u16>,
+) -> Result<(), Ikev2SelectedKeyExchangeError> {
+    let selected_group = selected_group.filter(|group| *group != IKEV2_TRANSFORM_ID_NONE);
+    match (selected_group, response) {
+        (None, None) => Ok(()),
+        (None, Some(_)) => Err(Ikev2SelectedKeyExchangeError::Unexpected),
+        (Some(_), None) => Err(Ikev2SelectedKeyExchangeError::Required),
+        (Some(group), Some(response))
+            if request_group == Some(group) && response.dh_group == group =>
+        {
+            Ok(())
+        }
+        (Some(_), Some(_)) => Err(Ikev2SelectedKeyExchangeError::GroupMismatch),
+    }
 }
 
 fn validate_optional_selected_transform(
@@ -2267,6 +2294,29 @@ fn validate_optional_selected_transform(
         Ok(())
     } else if selected_for_type.is_none() {
         Err(Ikev2DedicatedBearerExchangeError::ResponseTransformTypeOmitted { transform_type })
+    } else {
+        Err(Ikev2DedicatedBearerExchangeError::ResponseTransformNotOffered)
+    }
+}
+
+fn validate_required_selected_transform(
+    offered: &Ikev2SaProposal<'_>,
+    selected: &Ikev2SaProposal<'_>,
+    transform_type: u8,
+) -> Result<(), Ikev2DedicatedBearerExchangeError> {
+    let selected_for_type = selected
+        .transforms
+        .iter()
+        .find(|transform| transform.transform_type == transform_type)
+        .ok_or(
+            Ikev2DedicatedBearerExchangeError::ResponseTransformTypeOmitted { transform_type },
+        )?;
+    if offered
+        .transforms
+        .iter()
+        .any(|candidate| transforms_are_equivalent(candidate, selected_for_type))
+    {
+        Ok(())
     } else {
         Err(Ikev2DedicatedBearerExchangeError::ResponseTransformNotOffered)
     }
@@ -2347,21 +2397,245 @@ fn validate_informational_header_correlation(
     Ok(())
 }
 
-fn traffic_selector_payload_is_narrowed(
+pub(crate) fn traffic_selector_payload_is_narrowed(
     requested: &Ikev2TrafficSelectorPayload<'_>,
     selected: &Ikev2TrafficSelectorPayload<'_>,
 ) -> bool {
-    selected.selectors.iter().all(|selected| {
-        requested.selectors.iter().any(|requested| {
-            selected.ts_type == requested.ts_type
-                && (requested.ip_protocol_id == 0
-                    || selected.ip_protocol_id == requested.ip_protocol_id)
-                && selected.start_port >= requested.start_port
-                && selected.end_port <= requested.end_port
-                && selected.start_address >= requested.start_address
-                && selected.end_address <= requested.end_address
-        })
+    if requested.selectors.len() > IKEV2_TRAFFIC_SELECTOR_MAX_COUNT
+        || selected.selectors.len() > IKEV2_TRAFFIC_SELECTOR_MAX_COUNT
+        || requested
+            .selectors
+            .iter()
+            .chain(&selected.selectors)
+            .any(|selector| !traffic_selector_is_well_formed(selector))
+    {
+        return false;
+    }
+    selected
+        .selectors
+        .iter()
+        .all(|selected| traffic_selector_is_covered(&requested.selectors, selected))
+}
+
+#[derive(Clone, Copy)]
+enum TrafficSelectorPortSet {
+    /// Inclusive ordinary numeric port interval.
+    Range { start: u16, end: u16 },
+    /// RFC 7296 ANY ports, which also includes the OPAQUE sentinel.
+    Any,
+    /// RFC 7296 OPAQUE ports, distinct from every ordinary numeric interval.
+    Opaque,
+}
+
+impl TrafficSelectorPortSet {
+    fn from_selector(selector: &Ikev2TrafficSelector<'_>) -> Option<Self> {
+        match (selector.start_port, selector.end_port) {
+            (0, u16::MAX) => Some(Self::Any),
+            (u16::MAX, 0) if selector.ip_protocol_id != 0 => Some(Self::Opaque),
+            (start, end) if start <= end && selector.ip_protocol_id != 0 => {
+                Some(Self::Range { start, end })
+            }
+            _ => None,
+        }
+    }
+
+    const fn numeric_bounds(self) -> Option<(u16, u16)> {
+        match self {
+            Self::Range { start, end } => Some((start, end)),
+            Self::Any => Some((0, u16::MAX)),
+            Self::Opaque => None,
+        }
+    }
+
+    const fn includes_opaque(self) -> bool {
+        matches!(self, Self::Any | Self::Opaque)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TrafficSelectorCoverageBox {
+    address_start: u128,
+    address_end: u128,
+    ports: TrafficSelectorPortSet,
+}
+
+fn traffic_selector_is_covered(
+    requested: &[Ikev2TrafficSelector<'_>],
+    selected: &Ikev2TrafficSelector<'_>,
+) -> bool {
+    // Each selected rectangle is checked against the requested union. Address
+    // starts and inclusive-end successors partition the target into slabs
+    // where the active cover set is constant. Within each slab, one ordered
+    // interval pass proves exact numeric-port coverage; OPAQUE is checked as a
+    // distinct point. This avoids a protocol × address × port cell expansion.
+    let Some((selected_address_start, selected_address_end)) =
+        traffic_selector_address_bounds(selected)
+    else {
+        return false;
+    };
+    let Some(selected_ports) = TrafficSelectorPortSet::from_selector(selected) else {
+        return false;
+    };
+    let selected_numeric_ports = selected_ports.numeric_bounds();
+    let selected_includes_opaque = selected_ports.includes_opaque();
+
+    let mut numeric_covers = Vec::with_capacity(requested.len());
+    let mut opaque_covers = Vec::with_capacity(requested.len());
+    let mut address_checkpoints =
+        Vec::with_capacity(requested.len().saturating_mul(2).saturating_add(1));
+    address_checkpoints.push(selected_address_start);
+
+    for candidate in requested {
+        if candidate.ts_type != selected.ts_type
+            || !traffic_selector_protocol_can_cover(
+                candidate.ip_protocol_id,
+                selected.ip_protocol_id,
+            )
+        {
+            continue;
+        }
+        let Some((candidate_address_start, candidate_address_end)) =
+            traffic_selector_address_bounds(candidate)
+        else {
+            return false;
+        };
+        if candidate_address_end < selected_address_start
+            || candidate_address_start > selected_address_end
+        {
+            continue;
+        }
+        let Some(candidate_ports) = TrafficSelectorPortSet::from_selector(candidate) else {
+            return false;
+        };
+
+        let numeric_relevant =
+            selected_numeric_ports.is_some_and(|(selected_start, selected_end)| {
+                candidate_ports
+                    .numeric_bounds()
+                    .is_some_and(|(candidate_start, candidate_end)| {
+                        candidate_end >= selected_start && candidate_start <= selected_end
+                    })
+            });
+        let opaque_relevant = selected_includes_opaque && candidate_ports.includes_opaque();
+        if !numeric_relevant && !opaque_relevant {
+            continue;
+        }
+
+        let cover = TrafficSelectorCoverageBox {
+            address_start: candidate_address_start,
+            address_end: candidate_address_end,
+            ports: candidate_ports,
+        };
+        if numeric_relevant {
+            numeric_covers.push(cover);
+        }
+        if opaque_relevant {
+            opaque_covers.push(cover);
+        }
+
+        let clipped_start = candidate_address_start.max(selected_address_start);
+        address_checkpoints.push(clipped_start);
+        let clipped_end = candidate_address_end.min(selected_address_end);
+        if clipped_end < selected_address_end {
+            address_checkpoints.push(clipped_end + 1);
+        }
+    }
+
+    if selected_numeric_ports.is_some() && numeric_covers.is_empty() {
+        return false;
+    }
+    if selected_includes_opaque && opaque_covers.is_empty() {
+        return false;
+    }
+
+    numeric_covers.sort_unstable_by_key(|cover| {
+        cover
+            .ports
+            .numeric_bounds()
+            .map_or((u16::MAX, u16::MAX), |(start, end)| (start, end))
+    });
+    address_checkpoints.sort_unstable();
+    address_checkpoints.dedup();
+
+    address_checkpoints.into_iter().all(|address| {
+        selected_numeric_ports
+            .is_none_or(|ports| numeric_port_range_is_covered(&numeric_covers, address, ports))
+            && (!selected_includes_opaque
+                || opaque_covers
+                    .iter()
+                    .any(|cover| cover.address_start <= address && address <= cover.address_end))
     })
+}
+
+fn traffic_selector_is_well_formed(selector: &Ikev2TrafficSelector<'_>) -> bool {
+    traffic_selector_address_bounds(selector).is_some()
+        && TrafficSelectorPortSet::from_selector(selector).is_some()
+}
+
+const fn traffic_selector_protocol_can_cover(
+    requested_protocol: u8,
+    selected_protocol: u8,
+) -> bool {
+    if selected_protocol == 0 {
+        requested_protocol == 0
+    } else {
+        requested_protocol == 0 || requested_protocol == selected_protocol
+    }
+}
+
+fn traffic_selector_address_bounds(selector: &Ikev2TrafficSelector<'_>) -> Option<(u128, u128)> {
+    let expected_address_len = match selector.ts_type {
+        IKEV2_TS_IPV4_ADDR_RANGE => 4,
+        IKEV2_TS_IPV6_ADDR_RANGE => 16,
+        _ => return None,
+    };
+    if selector.start_address.len() != expected_address_len
+        || selector.end_address.len() != expected_address_len
+    {
+        return None;
+    }
+    let start = traffic_selector_address_value(selector.start_address)?;
+    let end = traffic_selector_address_value(selector.end_address)?;
+    (start <= end).then_some((start, end))
+}
+
+fn traffic_selector_address_value(address: &[u8]) -> Option<u128> {
+    match address {
+        [a, b, c, d] => Some(u128::from(u32::from_be_bytes([*a, *b, *c, *d]))),
+        bytes => Some(u128::from_be_bytes(<[u8; 16]>::try_from(bytes).ok()?)),
+    }
+}
+
+fn numeric_port_range_is_covered(
+    covers: &[TrafficSelectorCoverageBox],
+    address: u128,
+    selected_ports: (u16, u16),
+) -> bool {
+    let (selected_start, selected_end) = selected_ports;
+    let mut next_port = u32::from(selected_start);
+    let selected_end = u32::from(selected_end);
+
+    for cover in covers {
+        if address < cover.address_start || address > cover.address_end {
+            continue;
+        }
+        let Some((cover_start, cover_end)) = cover.ports.numeric_bounds() else {
+            continue;
+        };
+        let cover_start = u32::from(cover_start);
+        let cover_end = u32::from(cover_end);
+        if cover_end < next_port {
+            continue;
+        }
+        if cover_start > next_port {
+            return false;
+        }
+        if cover_end >= selected_end {
+            return true;
+        }
+        next_port = cover_end + 1;
+    }
+    false
 }
 
 #[derive(Default)]
@@ -2585,4 +2859,249 @@ fn validate_modification_shape(
         return Err(Ikev2DedicatedBearerExchangeError::ModificationHasNoUpdates);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod traffic_selector_coverage_tests {
+    use super::*;
+
+    fn selector(
+        ts_type: u8,
+        protocol: u8,
+        start_port: u16,
+        end_port: u16,
+        start_address: &'static [u8],
+        end_address: &'static [u8],
+    ) -> Ikev2TrafficSelector<'static> {
+        Ikev2TrafficSelector {
+            ts_type,
+            ip_protocol_id: protocol,
+            start_port,
+            end_port,
+            start_address,
+            end_address,
+        }
+    }
+
+    fn payload(
+        selectors: Vec<Ikev2TrafficSelector<'static>>,
+    ) -> Ikev2TrafficSelectorPayload<'static> {
+        Ikev2TrafficSelectorPayload { selectors }
+    }
+
+    fn ipv4(
+        protocol: u8,
+        start_port: u16,
+        end_port: u16,
+        start: u8,
+        end: u8,
+    ) -> Ikev2TrafficSelector<'static> {
+        const ADDRESSES: [[u8; 4]; 21] = [
+            [192, 0, 2, 0],
+            [192, 0, 2, 1],
+            [192, 0, 2, 2],
+            [192, 0, 2, 3],
+            [192, 0, 2, 4],
+            [192, 0, 2, 5],
+            [192, 0, 2, 6],
+            [192, 0, 2, 7],
+            [192, 0, 2, 8],
+            [192, 0, 2, 9],
+            [192, 0, 2, 10],
+            [192, 0, 2, 11],
+            [192, 0, 2, 12],
+            [192, 0, 2, 13],
+            [192, 0, 2, 14],
+            [192, 0, 2, 15],
+            [192, 0, 2, 16],
+            [192, 0, 2, 17],
+            [192, 0, 2, 18],
+            [192, 0, 2, 19],
+            [192, 0, 2, 20],
+        ];
+        selector(
+            IKEV2_TS_IPV4_ADDR_RANGE,
+            protocol,
+            start_port,
+            end_port,
+            &ADDRESSES[usize::from(start)],
+            &ADDRESSES[usize::from(end)],
+        )
+    }
+
+    #[test]
+    fn split_and_overlapping_ipv4_rectangles_cover_exact_unions() {
+        let selected = payload(vec![ipv4(6, 1_000, 2_000, 10, 20)]);
+
+        let split_addresses = payload(vec![
+            ipv4(6, 1_000, 2_000, 10, 15),
+            ipv4(6, 1_000, 2_000, 16, 20),
+        ]);
+        assert!(traffic_selector_payload_is_narrowed(
+            &split_addresses,
+            &selected
+        ));
+
+        let split_ports = payload(vec![
+            ipv4(6, 1_000, 1_499, 10, 20),
+            ipv4(6, 1_500, 2_000, 10, 20),
+        ]);
+        assert!(traffic_selector_payload_is_narrowed(
+            &split_ports,
+            &selected
+        ));
+
+        let overlapping = payload(vec![
+            ipv4(6, 1_000, 1_600, 10, 20),
+            ipv4(6, 1_500, 2_000, 10, 20),
+        ]);
+        assert!(traffic_selector_payload_is_narrowed(
+            &overlapping,
+            &selected
+        ));
+    }
+
+    #[test]
+    fn coverage_rejects_address_port_and_cross_product_gaps() {
+        let selected = payload(vec![ipv4(6, 1_000, 2_000, 10, 20)]);
+
+        let address_gap = payload(vec![
+            ipv4(6, 1_000, 2_000, 10, 14),
+            ipv4(6, 1_000, 2_000, 16, 20),
+        ]);
+        assert!(!traffic_selector_payload_is_narrowed(
+            &address_gap,
+            &selected
+        ));
+
+        let port_gap = payload(vec![
+            ipv4(6, 1_000, 1_499, 10, 20),
+            ipv4(6, 1_501, 2_000, 10, 20),
+        ]);
+        assert!(!traffic_selector_payload_is_narrowed(&port_gap, &selected));
+
+        let checkerboard = payload(vec![
+            ipv4(6, 1_000, 1_500, 10, 15),
+            ipv4(6, 1_501, 2_000, 16, 20),
+        ]);
+        assert!(!traffic_selector_payload_is_narrowed(
+            &checkerboard,
+            &selected
+        ));
+    }
+
+    #[test]
+    fn protocol_wildcard_and_concrete_coverage_do_not_invent_protocols() {
+        let selected_concrete = payload(vec![ipv4(17, 4_500, 4_500, 10, 20)]);
+        let requested_wildcard = payload(vec![ipv4(0, 0, u16::MAX, 10, 20)]);
+        assert!(traffic_selector_payload_is_narrowed(
+            &requested_wildcard,
+            &selected_concrete
+        ));
+
+        let selected_wildcard = payload(vec![ipv4(0, 0, u16::MAX, 10, 20)]);
+        let requested_concrete = payload(vec![ipv4(17, 0, u16::MAX, 10, 20)]);
+        assert!(!traffic_selector_payload_is_narrowed(
+            &requested_concrete,
+            &selected_wildcard
+        ));
+
+        let split_wildcard = payload(vec![
+            ipv4(0, 0, u16::MAX, 10, 15),
+            ipv4(0, 0, u16::MAX, 16, 20),
+        ]);
+        assert!(traffic_selector_payload_is_narrowed(
+            &split_wildcard,
+            &selected_wildcard
+        ));
+
+        let wrong_concrete = payload(vec![ipv4(6, 0, u16::MAX, 10, 20)]);
+        assert!(!traffic_selector_payload_is_narrowed(
+            &wrong_concrete,
+            &selected_concrete
+        ));
+    }
+
+    #[test]
+    fn adjacent_ipv6_ranges_cover_but_one_address_gap_does_not() {
+        const V6_10: [u8; 16] = [
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10,
+        ];
+        const V6_15: [u8; 16] = [
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x15,
+        ];
+        const V6_16: [u8; 16] = [
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x16,
+        ];
+        const V6_17: [u8; 16] = [
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x17,
+        ];
+        const V6_20: [u8; 16] = [
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x20,
+        ];
+        let selected = payload(vec![selector(
+            IKEV2_TS_IPV6_ADDR_RANGE,
+            6,
+            443,
+            443,
+            &V6_10,
+            &V6_20,
+        )]);
+        let adjacent = payload(vec![
+            selector(IKEV2_TS_IPV6_ADDR_RANGE, 6, 443, 443, &V6_10, &V6_15),
+            selector(IKEV2_TS_IPV6_ADDR_RANGE, 6, 443, 443, &V6_16, &V6_20),
+        ]);
+        assert!(traffic_selector_payload_is_narrowed(&adjacent, &selected));
+
+        let gap = payload(vec![
+            selector(IKEV2_TS_IPV6_ADDR_RANGE, 6, 443, 443, &V6_10, &V6_15),
+            selector(IKEV2_TS_IPV6_ADDR_RANGE, 6, 443, 443, &V6_17, &V6_20),
+        ]);
+        assert!(!traffic_selector_payload_is_narrowed(&gap, &selected));
+    }
+
+    #[test]
+    fn any_and_opaque_port_sets_remain_semantically_distinct() {
+        let selected_opaque = payload(vec![ipv4(6, u16::MAX, 0, 10, 20)]);
+        let requested_any = payload(vec![ipv4(6, 0, u16::MAX, 10, 20)]);
+        assert!(traffic_selector_payload_is_narrowed(
+            &requested_any,
+            &selected_opaque
+        ));
+
+        let requested_opaque = payload(vec![ipv4(6, u16::MAX, 0, 10, 20)]);
+        let selected_range = payload(vec![ipv4(6, 80, 80, 10, 20)]);
+        assert!(!traffic_selector_payload_is_narrowed(
+            &requested_opaque,
+            &selected_range
+        ));
+        assert!(!traffic_selector_payload_is_narrowed(
+            &requested_opaque,
+            &requested_any
+        ));
+        assert!(traffic_selector_payload_is_narrowed(
+            &requested_opaque,
+            &selected_opaque
+        ));
+
+        let numeric_full_without_opaque = payload(vec![
+            ipv4(6, 0, 32_767, 10, 20),
+            ipv4(6, 32_768, u16::MAX, 10, 20),
+        ]);
+        assert!(!traffic_selector_payload_is_narrowed(
+            &numeric_full_without_opaque,
+            &requested_any
+        ));
+    }
+
+    #[test]
+    fn forged_selector_count_above_wire_limit_fails_closed() {
+        let selected = payload(vec![ipv4(6, 80, 80, 10, 20)]);
+        let requested = payload(
+            std::iter::repeat_with(|| ipv4(6, 80, 80, 10, 20))
+                .take(IKEV2_TRAFFIC_SELECTOR_MAX_COUNT + 1)
+                .collect(),
+        );
+        assert!(!traffic_selector_payload_is_narrowed(&requested, &selected));
+    }
 }

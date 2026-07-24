@@ -8,6 +8,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Initiator Child-SA rekey response boundary — `opc-proto-ikev2`:**
+  composes the existing request-build representation into a retained,
+  once-only RFC 7296 response boundary. It correlates the exact old IKE SPI
+  pair, Message ID, response direction, `CREATE_CHILD_SA` exchange, exact
+  `REKEY_SA` identity, and caller-supplied current Child-SA selector floor;
+  parses order-independent `SA, Nr, [KEr], TSi, TSr`; validates one executable
+  ESP selection with an explicit SN/ESN transform, optional PFS, the RFC
+  PRF-specific Ni/Nr floor, and `current selectors ⊆ response selectors ⊆
+  request offer` using exact bounded union coverage across protocol, port, and
+  IPv4/IPv6 address boxes. Traffic Selector decoding/building now requires
+  protocol-zero selectors to use canonical ANY ports and preserves the
+  distinct RFC OPAQUE sentinel without treating it as a reversed numeric
+  range. The boundary retains Ni and returns Nr, both selected directional SPIs,
+  ESN/PFS state, optional KEr, and accepted selectors. Known response errors
+  are context- and shape-checked, `CHILD_SA_NOT_FOUND` is SPI-correlated,
+  unknown error-range Notifies remain typed terminal failures with redacted
+  bounded evidence, and unknown non-critical/status extensions obey mandatory
+  ignore semantics under every caller policy. Malformed, uncorrelated,
+  partial-success, or replayed terminal responses fail with redaction-safe
+  stable diagnostics. Retransmission, collision policy, key/SPI allocation,
+  installation, and old-SA retirement remain product-owned (#520).
 - **Origin-scoped Diameter End-to-End Identifier authority —
   `opc-proto-diameter`:** adds a bounded concurrency-safe RFC 6733 allocator
   with an injectable fallible wall/monotonic clock, exact four-minute

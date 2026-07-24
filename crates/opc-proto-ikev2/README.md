@@ -794,6 +794,97 @@ and nonce material, allocating collision-resistant SPIs, sealing and caching
 the complete `SK` response, handling simultaneous rekeys, installing the new
 SA, and deleting the old SA.
 
+## Child-SA rekey initiator response boundary
+
+`Ikev2ChildSaRekeyResponseBoundary` completes the initiator side of an RFC 7296
+Child-SA rekey without introducing another request representation. Construct
+it from the exact established-IKE-SA request header, the existing
+`Ikev2CreateChildSaRekeyRequestBuild`, the exact current Child-SA TSi/TSr
+floor, and the established IKE SA's PRF before sending the request. The
+current floor is separate because a rekey request may offer a superset, while
+RFC 7296 section 2.9.2 forbids the replacement SA from becoming narrower than
+the SA it replaces. Retain that boundary with the outstanding transaction,
+then pass it the authenticated and opened response:
+
+```rust
+# fn example(
+#     request_header: opc_proto_ikev2::Header,
+#     request: opc_proto_ikev2::Ikev2CreateChildSaRekeyRequestBuild,
+#     current_traffic_selectors:
+#         opc_proto_ikev2::Ikev2ChildSaRekeyCurrentTrafficSelectors,
+#     response_header: opc_proto_ikev2::Header,
+#     response_first_payload: opc_proto_ikev2::PayloadType,
+#     opened_response: &[u8],
+# ) -> Result<(), opc_proto_ikev2::Ikev2ChildSaRekeyResponseError> {
+use opc_proto_ikev2::{
+    Ikev2ChildSaRekeyResponseBoundary, Ikev2PrfAlgorithm,
+};
+
+let mut pending = Ikev2ChildSaRekeyResponseBoundary::new(
+    &request_header,
+    request,
+    current_traffic_selectors,
+    Ikev2PrfAlgorithm::HmacSha2_256,
+)?;
+let initiator_nonce = pending.initiator_nonce();
+# let _ = initiator_nonce;
+
+let accepted = pending.commit_response(
+    &response_header,
+    response_first_payload,
+    opened_response,
+)?;
+let replacement_initiator_spi = accepted.replacement_initiator_spi();
+let replacement_responder_spi = accepted.replacement_responder_spi();
+let profile = accepted.profile();
+# let _ = (
+#     replacement_initiator_spi,
+#     replacement_responder_spi,
+#     profile,
+# );
+# Ok(())
+# }
+```
+
+The response header must retain the exact old IKE SPI pair and Message ID, use
+`CREATE_CHILD_SA`, carry the response flag and opposite original-initiator
+flag, and name an outer `SK` or `SKF` payload. For `SKF`, the product first
+authenticates, opens, and reassembles the fragments, then supplies the first
+reassembled inner payload type. The opened chain is order-independent but must
+contain exactly `SA, Nr, [KEr], TSi, TSr`. The selected ESP proposal must be
+executable and drawn from the exact offer. `DH=NONE` may be represented by
+omission where RFC 7296 permits it, but ESP always requires one explicit
+SN/ESN transform (ID 0 means no extended sequence numbers). PFS requires the
+offered KE group and a valid group public value. Ni and Nr must each be at
+least half the established PRF's preferred key length, and both returned
+selector sets must cover the current Child SA while remaining within the
+request offer. Selector containment compares the exact union of complete
+protocol × port × IPv4/IPv6-address boxes, so adjacent or overlapping entries
+may collectively cover a selector while address/port checkerboard gaps never
+invent coverage. Protocol zero uses only canonical ANY ports (`0..65535`).
+RFC 7296 OPAQUE ports (`65535..0`) remain a distinct non-zero-protocol value:
+ANY covers OPAQUE, while OPAQUE does not cover ordinary numeric ports.
+
+A valid response error Notify is returned as
+`Ikev2ChildSaRekeyResponseError::PeerErrorNotify` and, like success, commits
+the boundary terminally. Known errors are validated for this exact exchange;
+`CHILD_SA_NOT_FOUND` must identify the exact ESP SPI from the retained
+`REKEY_SA`, and `INVALID_KE_PAYLOAD` retains its suggested group. An
+unrecognized error-range type still terminally fails the request as RFC 7296
+requires, while preserving bounded raw SPI/data behind redaction-safe
+diagnostics. Unknown non-critical payloads and unrecognized status Notifies
+are ignored under all policies; `Preserve` and normalized `Reject` retain them
+for successful-response inspection, while `Drop` discards them. Such
+extensions and Vendor IDs do not turn a valid error response into partial
+success. A second response cannot commit. Malformed, uncorrelated, or mixed
+error/success input does not commit, so the product can continue applying its
+own retransmission deadline. The SDK returns the responder nonce, both
+selected inbound SPIs, executable Child-SA profile, ESN selection, optional
+KEr, and accepted selectors; the boundary retains the initiator nonce for
+KEYMAT. Request retransmission and exact-wire caching, simultaneous-rekey
+policy, SPI/DH/nonce allocation, KEYMAT invocation, kernel installation, and
+old-SA retirement remain product-owned.
+
 ## Protected IKE_AUTH integration
 
 For AES-CBC, use `ikev2_aes_cbc_protected_body_len` or
