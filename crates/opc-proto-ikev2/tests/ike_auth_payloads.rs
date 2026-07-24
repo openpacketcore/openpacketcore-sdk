@@ -75,6 +75,7 @@ fn ts_payload() -> Ikev2TrafficSelectorPayloadBuild {
 
 fn ts_payload_body(
     ts_type: u8,
+    ip_protocol_id: u8,
     start_port: u16,
     end_port: u16,
     start_address: &[u8],
@@ -82,7 +83,7 @@ fn ts_payload_body(
 ) -> Vec<u8> {
     let selector_len = 8 + start_address.len() + end_address.len();
     let selector_len = u16::try_from(selector_len).expect("traffic selector length fits u16");
-    let mut body = vec![1, 0, 0, 0, ts_type, 0];
+    let mut body = vec![1, 0, 0, 0, ts_type, ip_protocol_id];
     body.extend_from_slice(&selector_len.to_be_bytes());
     body.extend_from_slice(&start_port.to_be_bytes());
     body.extend_from_slice(&end_port.to_be_bytes());
@@ -965,12 +966,13 @@ fn rejects_malformed_traffic_selectors_and_invalid_builders() {
     );
 
     assert_eq!(
-        decode_ts_error(ts_payload_body(42, 0, 1, &[10, 0, 0, 1], &[10, 0, 0, 2])),
+        decode_ts_error(ts_payload_body(42, 6, 0, 1, &[10, 0, 0, 1], &[10, 0, 0, 2],)),
         Ikev2IkeAuthPayloadError::TrafficSelectorTypeUnsupported
     );
     assert_eq!(
         decode_ts_error(ts_payload_body(
             IKEV2_TS_IPV6_ADDR_RANGE,
+            6,
             0,
             1,
             &[10, 0, 0, 1],
@@ -981,6 +983,7 @@ fn rejects_malformed_traffic_selectors_and_invalid_builders() {
     assert_eq!(
         decode_ts_error(ts_payload_body(
             IKEV2_TS_IPV4_ADDR_RANGE,
+            6,
             2,
             1,
             &[10, 0, 0, 1],
@@ -991,6 +994,7 @@ fn rejects_malformed_traffic_selectors_and_invalid_builders() {
     assert_eq!(
         decode_ts_error(ts_payload_body(
             IKEV2_TS_IPV4_ADDR_RANGE,
+            6,
             0,
             1,
             &[10, 0, 0, 2],
@@ -1056,7 +1060,7 @@ fn rejects_malformed_traffic_selectors_and_invalid_builders() {
                 ts_type: IKEV2_TS_IPV4_ADDR_RANGE,
                 ip_protocol_id: 0,
                 start_port: 0,
-                end_port: 1,
+                end_port: u16::MAX,
                 start_address: vec![10, 0, 0, 2],
                 end_address: vec![10, 0, 0, 1],
             }],
@@ -1066,4 +1070,100 @@ fn rejects_malformed_traffic_selectors_and_invalid_builders() {
         reversed_addresses,
         Ikev2IkeAuthBuildError::TrafficSelectorAddressRangeInvalid
     );
+}
+
+#[test]
+fn traffic_selector_wildcard_and_opaque_port_semantics_are_canonical() {
+    let start_address = [192, 0, 2, 10];
+    let end_address = [192, 0, 2, 20];
+    let wildcard_narrow =
+        build_ike_auth_traffic_selector_payload(&Ikev2TrafficSelectorPayloadBuild {
+            selectors: vec![Ikev2TrafficSelectorBuild {
+                ts_type: IKEV2_TS_IPV4_ADDR_RANGE,
+                ip_protocol_id: 0,
+                start_port: 4_500,
+                end_port: 4_500,
+                start_address: start_address.to_vec(),
+                end_address: end_address.to_vec(),
+            }],
+        })
+        .expect_err("protocol zero requires the canonical ANY port range");
+    assert_eq!(
+        wildcard_narrow,
+        Ikev2IkeAuthBuildError::TrafficSelectorPortRangeInvalid
+    );
+    assert_eq!(
+        decode_ts_error(ts_payload_body(
+            IKEV2_TS_IPV4_ADDR_RANGE,
+            0,
+            4_500,
+            4_500,
+            &start_address,
+            &end_address,
+        )),
+        Ikev2IkeAuthPayloadError::TrafficSelectorPortRangeInvalid
+    );
+
+    let protocol_zero_opaque =
+        build_ike_auth_traffic_selector_payload(&Ikev2TrafficSelectorPayloadBuild {
+            selectors: vec![Ikev2TrafficSelectorBuild {
+                ts_type: IKEV2_TS_IPV4_ADDR_RANGE,
+                ip_protocol_id: 0,
+                start_port: u16::MAX,
+                end_port: 0,
+                start_address: start_address.to_vec(),
+                end_address: end_address.to_vec(),
+            }],
+        })
+        .expect_err("OPAQUE is not the canonical protocol-zero ANY representation");
+    assert_eq!(
+        protocol_zero_opaque,
+        Ikev2IkeAuthBuildError::TrafficSelectorPortRangeInvalid
+    );
+    assert_eq!(
+        decode_ts_error(ts_payload_body(
+            IKEV2_TS_IPV4_ADDR_RANGE,
+            0,
+            u16::MAX,
+            0,
+            &start_address,
+            &end_address,
+        )),
+        Ikev2IkeAuthPayloadError::TrafficSelectorPortRangeInvalid
+    );
+
+    let opaque = Ikev2TrafficSelectorPayloadBuild {
+        selectors: vec![Ikev2TrafficSelectorBuild {
+            ts_type: IKEV2_TS_IPV4_ADDR_RANGE,
+            ip_protocol_id: 6,
+            start_port: u16::MAX,
+            end_port: 0,
+            start_address: start_address.to_vec(),
+            end_address: end_address.to_vec(),
+        }],
+    };
+    let opaque_body =
+        build_ike_auth_traffic_selector_payload(&opaque).expect("RFC OPAQUE selector builds");
+    assert_eq!(
+        opaque_body,
+        ts_payload_body(
+            IKEV2_TS_IPV4_ADDR_RANGE,
+            6,
+            u16::MAX,
+            0,
+            &start_address,
+            &end_address,
+        )
+    );
+    let (first, bytes) = build_ike_auth_cleartext_payload_chain(&[Ikev2IkeAuthPayloadBuild {
+        payload_type: PayloadType::TrafficSelectorInitiator,
+        body: opaque_body,
+    }])
+    .expect("OPAQUE TS chain");
+    let decoded =
+        decode_ike_auth_cleartext_payloads(first, &bytes).expect("RFC OPAQUE selector decodes");
+    let decoded = &decoded.traffic_selectors_initiator[0].selectors[0];
+    assert_eq!(decoded.ip_protocol_id, 6);
+    assert_eq!(decoded.start_port, u16::MAX);
+    assert_eq!(decoded.end_port, 0);
 }

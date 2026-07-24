@@ -24,11 +24,12 @@
 //! P_CSCF_RESELECTION_SUPPORT, and AUTHORIZATION_REJECTED notifications,
 //! product-neutral Child SA
 //! negotiation intent including authenticated-only ESP ENCR_NULL profiles and
-//! KEYMAT, strict responder and
-//! initiator boundaries for opened IKE-SA rekey `CREATE_CHILD_SA` exchanges, and strict
-//! opened-payload helpers for 3GPP TS 24.302 dedicated-bearer establishment,
-//! modification, deletion, and typed P-CSCF restoration `INFORMATIONAL`
-//! configuration exchange. It does not implement an IKE SA state machine,
+//! KEYMAT, strict responder and initiator boundaries for opened IKE-SA rekey
+//! `CREATE_CHILD_SA` exchanges, a once-only initiator boundary for opened
+//! Child-SA rekey responses, and strict opened-payload helpers for 3GPP TS
+//! 24.302 dedicated-bearer establishment, modification, deletion, and typed
+//! P-CSCF restoration `INFORMATIONAL` configuration exchange. It does not
+//! implement an IKE SA state machine,
 //! EAP-AKA cryptography/session state, retransmission policy, cookie policy,
 //! Child SA installation, XFRM
 //! programming, or any product-specific 3GPP ePDG policy.
@@ -67,6 +68,7 @@
 //! @conformance experimental-mechanism boundary — see CONFORMANCE.md
 
 pub mod certreq;
+pub mod child_sa_rekey;
 pub mod crypto;
 pub mod crypto_module;
 pub mod dedicated_bearer;
@@ -100,6 +102,12 @@ pub use certreq::{
     ikev2_certreq_authority_key_hash, Ikev2CertReqAuthorityHash, Ikev2CertReqSubjectPublicKeyInfo,
     Ikev2CertReqSubjectPublicKeyInfoError, IKEV2_CERTREQ_AUTHORITY_HASH_LEN,
     IKEV2_CERTREQ_SUBJECT_PUBLIC_KEY_INFO_MAX_LEN,
+};
+pub use child_sa_rekey::{
+    Ikev2ChildSaRekeyCurrentTrafficSelectors, Ikev2ChildSaRekeyPeerError,
+    Ikev2ChildSaRekeyPeerErrorInvalidReason, Ikev2ChildSaRekeyPeerErrorKind,
+    Ikev2ChildSaRekeyResponse, Ikev2ChildSaRekeyResponseBoundary, Ikev2ChildSaRekeyResponseError,
+    Ikev2ChildSaRekeyResponsePayloadRole,
 };
 pub use crypto::{
     open_protected_payloads, CryptoProvider, OpenedProtectedPayload, ProtectedPayloadContext,

@@ -572,7 +572,7 @@ impl<'a> Ikev2TrafficSelectorPayload<'a> {
             }
             let start_port = u16::from_be_bytes([remaining[4], remaining[5]]);
             let end_port = u16::from_be_bytes([remaining[6], remaining[7]]);
-            if start_port > end_port {
+            if !traffic_selector_ports_are_valid(remaining[1], start_port, end_port) {
                 return Err(Ikev2IkeAuthPayloadError::TrafficSelectorPortRangeInvalid);
             }
             let start_address =
@@ -616,8 +616,14 @@ pub struct Ikev2TrafficSelector<'a> {
     /// IP protocol ID, or zero for any.
     pub ip_protocol_id: u8,
     /// Inclusive start port.
+    ///
+    /// Protocol zero requires `0`; the RFC 7296 OPAQUE sentinel for a
+    /// non-zero protocol uses start `65535` and end `0`.
     pub start_port: u16,
     /// Inclusive end port.
+    ///
+    /// Protocol zero requires `65535`; the RFC 7296 OPAQUE sentinel for a
+    /// non-zero protocol uses start `65535` and end `0`.
     pub end_port: u16,
     /// Start address bytes, 4 bytes for IPv4 or 16 bytes for IPv6.
     pub start_address: &'a [u8],
@@ -1102,8 +1108,14 @@ pub struct Ikev2TrafficSelectorBuild {
     /// IP protocol ID, or zero for any.
     pub ip_protocol_id: u8,
     /// Inclusive start port.
+    ///
+    /// Protocol zero requires `0`; the RFC 7296 OPAQUE sentinel for a
+    /// non-zero protocol uses start `65535` and end `0`.
     pub start_port: u16,
     /// Inclusive end port.
+    ///
+    /// Protocol zero requires `65535`; the RFC 7296 OPAQUE sentinel for a
+    /// non-zero protocol uses start `65535` and end `0`.
     pub end_port: u16,
     /// Start address bytes, 4 bytes for IPv4 or 16 bytes for IPv6.
     pub start_address: Vec<u8>,
@@ -1555,7 +1567,11 @@ pub fn build_ike_auth_traffic_selector_payload(
         {
             return Err(Ikev2IkeAuthBuildError::TrafficSelectorAddressLengthInvalid);
         }
-        if selector.start_port > selector.end_port {
+        if !traffic_selector_ports_are_valid(
+            selector.ip_protocol_id,
+            selector.start_port,
+            selector.end_port,
+        ) {
             return Err(Ikev2IkeAuthBuildError::TrafficSelectorPortRangeInvalid);
         }
         if selector.start_address > selector.end_address {
@@ -2191,6 +2207,18 @@ const fn expected_ts_address_len(ts_type: u8) -> Option<usize> {
         IKEV2_TS_IPV4_ADDR_RANGE => Some(TS_IPV4_ADDR_LEN),
         IKEV2_TS_IPV6_ADDR_RANGE => Some(TS_IPV6_ADDR_LEN),
         _ => None,
+    }
+}
+
+const fn traffic_selector_ports_are_valid(
+    ip_protocol_id: u8,
+    start_port: u16,
+    end_port: u16,
+) -> bool {
+    if ip_protocol_id == 0 {
+        start_port == 0 && end_port == u16::MAX
+    } else {
+        start_port <= end_port || (start_port == u16::MAX && end_port == 0)
     }
 }
 

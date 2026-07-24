@@ -241,6 +241,7 @@ fn sa(spi: [u8; 4]) -> Ikev2SaPayloadBuild {
 }
 
 fn ts(
+    protocol: u8,
     start: [u8; 4],
     end: [u8; 4],
     start_port: u16,
@@ -249,7 +250,7 @@ fn ts(
     Ikev2TrafficSelectorPayloadBuild {
         selectors: vec![Ikev2TrafficSelectorBuild {
             ts_type: IKEV2_TS_IPV4_ADDR_RANGE,
-            ip_protocol_id: 0,
+            ip_protocol_id: protocol,
             start_port,
             end_port,
             start_address: start.to_vec(),
@@ -259,11 +260,11 @@ fn ts(
 }
 
 fn broad_ts() -> Ikev2TrafficSelectorPayloadBuild {
-    ts([0, 0, 0, 0], [255, 255, 255, 255], 0, u16::MAX)
+    ts(0, [0, 0, 0, 0], [255, 255, 255, 255], 0, u16::MAX)
 }
 
 fn narrow_ts() -> Ikev2TrafficSelectorPayloadBuild {
-    ts([10, 0, 0, 1], [10, 0, 0, 10], 4_500, 4_500)
+    ts(17, [10, 0, 0, 1], [10, 0, 0, 10], 4_500, 4_500)
 }
 
 fn create_request_build() -> Ikev2DedicatedBearerCreateChildSaRequestBuild {
@@ -857,7 +858,7 @@ fn new_child_sa_with_pfs_build_decode_and_response_correlation_succeed() {
 }
 
 #[test]
-fn esp_proposals_require_encryption_and_allow_esn_omission() {
+fn esp_proposals_require_encryption_and_explicit_esn() {
     let mut missing_encryption = create_request_build();
     missing_encryption.security_association.proposals[0]
         .transforms
@@ -886,14 +887,32 @@ fn esp_proposals_require_encryption_and_allow_esn_omission() {
     missing_esn.security_association.proposals[0]
         .transforms
         .retain(|transform| transform.transform_type != TRANSFORM_TYPE_ESN);
-    let wire = must_ok(build_ikev2_dedicated_bearer_create_child_sa_response(
-        &missing_esn,
+    let missing_esn_error = Ikev2DedicatedBearerExchangeError::MissingMandatoryEspTransform {
+        transform_type: TRANSFORM_TYPE_ESN,
+    };
+    assert_eq!(
+        build_ikev2_dedicated_bearer_create_child_sa_response(&missing_esn),
+        Err(missing_esn_error.clone())
+    );
+    let raw = must_ok(build_create_child_sa_rekey_response_payloads(
+        &Ikev2CreateChildSaRekeyResponseBuild {
+            security_association: missing_esn.security_association,
+            nonce: missing_esn.nonce,
+            key_exchange: missing_esn.key_exchange,
+            traffic_selectors_initiator: missing_esn.traffic_selectors_initiator,
+            traffic_selectors_responder: missing_esn.traffic_selectors_responder,
+        },
     ));
-    must_ok(decode_ikev2_dedicated_bearer_create_child_sa_response(
-        &response_header(EXCHANGE_TYPE_CREATE_CHILD_SA, 10),
-        wire.first_payload(),
-        wire.bytes(),
-    ));
+    let (first_payload, bytes) =
+        must_ok(build_ike_auth_cleartext_payload_chain(&raw.into_payloads()));
+    assert_eq!(
+        decode_ikev2_dedicated_bearer_create_child_sa_response(
+            &response_header(EXCHANGE_TYPE_CREATE_CHILD_SA, 10),
+            first_payload,
+            &bytes,
+        ),
+        Err(missing_esn_error)
+    );
 }
 
 #[test]
@@ -950,7 +969,7 @@ fn non_aead_esp_requires_and_correlates_integrity() {
 }
 
 #[test]
-fn esp_request_alternatives_and_esn_omission_correlate() {
+fn esp_request_alternatives_require_explicit_esn_selection() {
     let mut request_build = create_request_build();
     request_build.security_association.proposals[0]
         .transforms
@@ -974,9 +993,19 @@ fn esp_request_alternatives_and_esn_omission_correlate() {
 
     let mut response_build = create_response_build();
     response_build.security_association.proposals[0].transforms[0] = encryption_transform(20, 128);
-    response_build.security_association.proposals[0]
+    let mut omitted_esn = response_build.clone();
+    omitted_esn.security_association.proposals[0]
         .transforms
         .retain(|transform| transform.transform_type != TRANSFORM_TYPE_ESN);
+    assert_eq!(
+        build_ikev2_dedicated_bearer_create_child_sa_response(&omitted_esn),
+        Err(
+            Ikev2DedicatedBearerExchangeError::MissingMandatoryEspTransform {
+                transform_type: TRANSFORM_TYPE_ESN,
+            }
+        )
+    );
+
     let response_wire = must_ok(build_ikev2_dedicated_bearer_create_child_sa_response(
         &response_build,
     ));
@@ -1330,7 +1359,7 @@ fn response_correlation_rejects_expanded_selectors_and_wrong_message_id() {
     ));
 
     let mut expanded = create_response_build();
-    expanded.traffic_selectors_initiator = ts([0, 0, 0, 0], [255, 255, 255, 255], 0, u16::MAX);
+    expanded.traffic_selectors_initiator = ts(0, [0, 0, 0, 0], [255, 255, 255, 255], 0, u16::MAX);
     let response_wire = must_ok(build_ikev2_dedicated_bearer_create_child_sa_response(
         &expanded,
     ));
@@ -1774,7 +1803,7 @@ fn specification_authored_opened_payload_fixtures_are_byte_exact() {
     // 7.4.6.3 and 8.2.9.10-8.2.9.12. The first octet is the SK Next Payload;
     // the remaining octets are the already-authenticated cleartext chain.
     const CREATE_REQUEST: &str = "21280000240000002001030402010203040300000c01000014800e010000000008050000002c00002411111111111111111111111111111111111111111111111111111111111111112d00001801000000070000100000ffff00000000ffffffff2900001801000000070000100000ffff00000000ffffffff290000160000a41e0d01fefefefefafafafaf6f6f6f6290000130000a41f0a07000b000c07000b000b000000120000a4210921330a053011501194";
-    const CREATE_RESPONSE: &str = "21280000240000002001030402050607080300000c01000014800e010000000008050000002c00002422222222222222222222222222222222222222222222222222222222222222222d0000180100000007000010119411940a0000010a00000a000000180100000007000010119411940a0000010a00000a";
+    const CREATE_RESPONSE: &str = "21280000240000002001030402050607080300000c01000014800e010000000008050000002c00002422222222222222222222222222222222222222222222222222222222222222222d0000180100000007110010119411940a0000010a00000a000000180100000007110010119411940a0000010a00000a";
     const CREATE_ERROR: &str = "290000000800002035";
     const MODIFICATION: &str =
         "292900000c0304a424102030402900000e0000a41e050180804040000000100000a4210781330a03501388";

@@ -1843,8 +1843,8 @@ pub fn derive_child_sa_key_material(
     new_dh_shared_secret: Option<&[u8]>,
 ) -> Result<Ikev2ChildSaKeyMaterial, Ikev2SaInitCryptoError> {
     validate_exact_key_len("SK_d", sk_d, profile.prf.output_len())?;
-    validate_nonce("initiator", initiator_nonce)?;
-    validate_nonce("responder", responder_nonce)?;
+    validate_nonce_for_prf("initiator", initiator_nonce, profile.prf)?;
+    validate_nonce_for_prf("responder", responder_nonce, profile.prf)?;
     if let Some(secret) = new_dh_shared_secret {
         validate_secret_input("new DH shared secret", secret)?;
     }
@@ -1977,6 +1977,21 @@ fn take_key_stream(
 
 fn validate_nonce(role: &'static str, nonce: &[u8]) -> Result<(), Ikev2SaInitCryptoError> {
     if !(IKEV2_NONCE_MIN_LEN..=IKEV2_NONCE_MAX_LEN).contains(&nonce.len()) {
+        return Err(Ikev2SaInitCryptoError::InvalidNonceLength {
+            role,
+            len: nonce.len(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_nonce_for_prf(
+    role: &'static str,
+    nonce: &[u8],
+    prf: Ikev2PrfAlgorithm,
+) -> Result<(), Ikev2SaInitCryptoError> {
+    validate_nonce(role, nonce)?;
+    if nonce.len() < prf.output_len().div_ceil(2) {
         return Err(Ikev2SaInitCryptoError::InvalidNonceLength {
             role,
             len: nonce.len(),
@@ -4060,6 +4075,33 @@ mod tests {
                 &[0x0f; 32],
                 &[0xa1; 15],
                 &[0xb2; 16],
+                None,
+            ))
+            .as_str(),
+            "ike_sa_init_crypto_invalid_nonce_length"
+        );
+
+        let sha512_profile = Ikev2ChildSaCryptoProfile::new_aead(
+            Ikev2PrfAlgorithm::HmacSha2_512,
+            Ikev2EncryptionAlgorithm::AesGcm16_128,
+        );
+        assert_eq!(
+            must_err(derive_child_sa_key_material(
+                sha512_profile,
+                &[0x0f; 64],
+                &[0xa1; 31],
+                &[0xb2; 32],
+                None,
+            ))
+            .as_str(),
+            "ike_sa_init_crypto_invalid_nonce_length"
+        );
+        assert_eq!(
+            must_err(derive_child_sa_key_material(
+                sha512_profile,
+                &[0x0f; 64],
+                &[0xa1; 32],
+                &[0xb2; 31],
                 None,
             ))
             .as_str(),

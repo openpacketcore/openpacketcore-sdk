@@ -26,6 +26,11 @@ use crate::{
 mod exchange;
 mod qos;
 
+pub(crate) use exchange::{
+    traffic_selector_payload_is_narrowed, validate_sa_build, validate_sa_view,
+    validate_selected_key_exchange, validate_selected_proposal, Ikev2SelectedKeyExchangeError,
+};
+
 pub use exchange::{
     build_ikev2_dedicated_bearer_create_child_sa_error_response,
     build_ikev2_dedicated_bearer_create_child_sa_request,
