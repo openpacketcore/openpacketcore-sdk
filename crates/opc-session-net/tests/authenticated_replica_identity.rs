@@ -1681,6 +1681,8 @@ struct IndependentRotationSetup {
     client_config: AuthenticatedClientConfig,
     server_config: AuthenticatedServerConfig,
     resolve_calls: Arc<AtomicUsize>,
+    manifest: Arc<SessionReplicationManifest>,
+    addr: SocketAddr,
 }
 
 async fn start_independent_rotation(cluster: &str, generation: &str) -> IndependentRotationSetup {
@@ -1744,6 +1746,8 @@ async fn start_independent_rotation(cluster: &str, generation: &str) -> Independ
         client_config,
         server_config,
         resolve_calls,
+        manifest,
+        addr,
     }
 }
 
@@ -1800,12 +1804,36 @@ async fn assert_resolver_calls_stable(calls: &AtomicUsize, expected: usize) {
     );
 }
 
-fn assert_membership_binding(backend: &RemoteSessionBackend) {
-    let binding = backend
-        .peer_binding()
-        .expect("authenticated peer binding across the routing alias");
-    assert_eq!(binding.local_replica_id(), &replica_id(1));
-    assert_eq!(binding.remote_replica_id(), &replica_id(SERVER_REPLICA));
+// Handshake-derived membership evidence across the DNS routing alias: a
+// fresh probe that demands a different replica identity over the same trust
+// and address must fail closed, while a fresh exact-identity dial still
+// authenticates and renegotiates against the rotated material. Each probe
+// resolves through its own resolver so the exact lane-recycle accounting of
+// the traffic backend stays untouched.
+async fn assert_identity_enforcement_live(setup: &IndependentRotationSetup) {
+    let wrong_identity = remote(
+        &setup.manifest,
+        1,
+        3,
+        setup.addr,
+        setup.client_config.clone(),
+    );
+    assert_eq!(
+        wrong_identity.probe_replication_head().await,
+        Err(ReplicaReadinessFailure::Authentication),
+        "a wrong-identity probe must keep failing closed after rotation"
+    );
+    let exact_identity = remote(
+        &setup.manifest,
+        1,
+        SERVER_REPLICA,
+        setup.addr,
+        setup.client_config.clone(),
+    );
+    assert!(
+        exact_identity.probe_replication_head().await.is_ok(),
+        "the exact identity must authenticate through the routing alias after rotation"
+    );
 }
 
 async fn wait_for_material_rejection(
@@ -1871,10 +1899,10 @@ async fn independent_client_and_server_leaf_rotation_preserves_active_requests_a
     traffic.assert_progress().await;
     wait_for_resolver_calls(&setup.resolve_calls, 4).await;
     assert_resolver_calls_stable(&setup.resolve_calls, 4).await;
-    // Membership proofs survive the client-side rotation across the DNS
-    // routing alias: the dialed address is loopback while the manifest
-    // endpoint stays the canonical replica hostname.
-    assert_membership_binding(&setup.backend);
+    // Identity enforcement stays live through the client-side rotation: the
+    // dialed address is loopback while the manifest endpoint stays the
+    // canonical replica hostname, and only the exact identity authenticates.
+    assert_identity_enforcement_live(&setup).await;
 
     // Rotate only the server leaf/key. The client material never advances, so
     // the server-side retirement must prove no-dispatch to in-flight callers
@@ -1894,7 +1922,7 @@ async fn independent_client_and_server_leaf_rotation_preserves_active_requests_a
     traffic.assert_progress().await;
     wait_for_resolver_calls_within(&setup.resolve_calls, 6, ROTATION_CLEANUP_DEADLINE).await;
     assert_resolver_calls_stable(&setup.resolve_calls, 6).await;
-    assert_membership_binding(&setup.backend);
+    assert_identity_enforcement_live(&setup).await;
 
     traffic.finish().await;
     setup.handle.abort_and_wait().await;
@@ -1973,6 +2001,8 @@ async fn rejected_reloads_retain_last_good_material_and_never_interrupt_traffic(
         )
         .await,
     );
+    traffic.assert_progress().await;
+    assert_resolver_calls_stable(&setup.resolve_calls, 2).await;
     setup.server_tx.send_replace(None);
     assert_status_redaction_safe(
         wait_for_material_rejection(
@@ -1982,6 +2012,8 @@ async fn rejected_reloads_retain_last_good_material_and_never_interrupt_traffic(
         )
         .await,
     );
+    traffic.assert_progress().await;
+    assert_resolver_calls_stable(&setup.resolve_calls, 2).await;
     setup
         .server_tx
         .send_replace(Some(oversized_bundle_identity_state(

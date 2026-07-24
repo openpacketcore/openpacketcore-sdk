@@ -1020,8 +1020,12 @@ endpoint, SPIFFE ID, certificate, key, transaction, or payload text.
   rotates the client leaf and the server leaf independently under one unchanged
   issuer while continuous get/CAS/lease/batch requests and a watch stream stay
   active, proving gap-free watch continuity, bounded request/watch-lane
-  recycling, and intact manifest membership proofs after each one-sided
-  rotation. Its rejected-reload case publishes identity-mismatched, empty, and
+  recycling, and — after each one-sided rotation — live identity enforcement
+  through the routing alias via fresh handshake probes: a wrong-identity dial
+  still fails closed while the exact identity still authenticates. (These
+  replication-surface rotation cases run on the quarantined
+  `legacy-session-net-compat` feature; CI exercises them via `--all-features`.)
+  Its rejected-reload case publishes identity-mismatched, empty, and
   over-limit material to each side under the same traffic and proves
   last-known-good retention with closed, redaction-safe status reasons, no
   connection drain, and a later coherent reload still rotating.
