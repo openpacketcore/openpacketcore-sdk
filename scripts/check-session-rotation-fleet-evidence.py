@@ -50,6 +50,8 @@ EXPECTED_LIFECYCLE = {
 EXPECTED_TIMING_PROFILE = {
     "cold_connect_timeout_millis": 1500,
     "heartbeat_millis": 2000,
+    "vote_timeout_millis": 5000,
+    "election_timeout_min_millis": 5000,
     "election_timeout_max_millis": 8000,
     "operation_timeout_millis": 10000,
 }
@@ -69,7 +71,7 @@ PHASE_KINDS = ("fault", "rotation", "traffic", "recovery", "bounds")
 FD_ALLOWANCE_MAX = 8
 # Per-transition handshake-rate allowance: lane replacements, directed
 # probes, and any late retirement redial attributable to an earlier
-# transition (plan section 6; measured campaigns total at most 10).
+# transition (plan section 6).
 RESOLVER_DELTA_ALLOWANCE_MAX = 16
 # Per-directed-path campaign replacement allowance: two cached lanes plus
 # one bounded retry per endpoint rotation of the path's two members, over
@@ -296,7 +298,9 @@ def validate(document, now_epoch):
         reject("plan digest does not match the recorded phase plan")
 
     previous_generation = None
+    previous_completed = None
     traffic_phases = 0
+    fault_phases = 0
     for index, phase in enumerate(phases):
         check_exact_keys(
             phase,
@@ -316,21 +320,29 @@ def validate(document, now_epoch):
         kind = phase["kind"]
         if kind not in PHASE_KINDS:
             reject(f"phase {index} kind is not a closed enumeration value")
+        if kind == "fault":
+            fault_phases += 1
         member = phase["member"]
         if member is not None:
             check_bool_free_int(member, f"phase {index} member", 0, members - 1)
         generation = check_bool_free_int(
             phase["canary_generation"], f"phase {index} canary_generation", 1
         )
-        check_bool_free_int(
+        fresh = check_bool_free_int(
             phase["fresh_handshake_paths"],
             f"phase {index} fresh_handshake_paths",
             0,
             members * (members - 1),
         )
+        if kind in ("rotation", "recovery") and member is not None and fresh < 1:
+            reject(
+                f"phase {index} ({kind}) touches a member but proves no fresh handshake"
+            )
         ready = phase["ready_members"]
         if not isinstance(ready, list):
             reject(f"phase {index} ready_members is not an array")
+        if not ready:
+            reject(f"phase {index} ready_members is empty")
         if len(set(ready)) != len(ready):
             reject(f"phase {index} ready_members has duplicates")
         for voter in ready:
@@ -345,8 +357,13 @@ def validate(document, now_epoch):
         )
         if completed < started or completed > finished:
             reject(f"phase {index} completed outside the campaign window")
+        if previous_completed is not None and completed < previous_completed:
+            reject(f"phase {index} completed before an earlier phase")
+        previous_completed = completed
 
         if previous_generation is None:
+            if kind != "traffic":
+                reject("the first phase is not the acknowledged traffic seed")
             if generation != 1:
                 reject("the first phase does not seed the canary at generation 1")
         elif kind == "traffic":
@@ -409,9 +426,13 @@ def validate(document, now_epoch):
         reject("a lane redialed after the campaign settled")
     if bounds["authentication_failure_outcomes"] != 0:
         reject("the campaign recorded an authentication failure outcome")
-    check_bool_free_int(
+    retentions = check_bool_free_int(
         bounds["rejected_reload_retentions"], "bounds.rejected_reload_retentions"
     )
+    # A rejected reload retains both the client and the server material (two
+    # retentions per rejection fault phase); other fault kinds retain none.
+    if retentions > 2 * fault_phases:
+        reject("rejected reload retentions exceed twice the fault phase count")
 
     if document["outcome"] != "pass":
         reject("outcome is not pass; only passing campaigns produce valid evidence")

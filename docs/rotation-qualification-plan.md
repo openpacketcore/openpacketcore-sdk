@@ -168,6 +168,17 @@ any count bound is exceeded, or the checker rejects the document.
 Phase-kind SLOs enforced by the checker: `fault` ≤ 10 s, `rotation` ≤ 26 s,
 `traffic` ≤ (members + 1) × 10 s, `recovery` ≤ 37 s, `bounds` ≤ 10 s.
 
+**Resolver accounting scope.** The transition and per-path handshake
+allowances cover rotation-driven dials only. Retry traffic on fenced paths
+to an isolated member is the reconnect-gate-paced heartbeat/election stream:
+it scales with the fault window, not with rotations (measured ≈ 30 dials/s
+on the leader-to-isolated path — 75–81 dials across the ≈ 2.5 s partition
+window — and zero in-window dials from the isolated member's own outbound
+paths), it is paced by the section-2 per-directed-peer reconnect cooldown,
+and it is excluded from the rotation handshake accounting by design. The
+reconnect-backoff bound itself is that lifecycle cooldown, exercised under
+repeated rotations by the bounds campaign.
+
 ## 7. Evidence format and provenance
 
 Each campaign emits one `opc.session-net.rotation-fault-evidence.v1` JSON
@@ -186,7 +197,12 @@ The document records:
   enforces the section-6 SLOs and the exact canary accounting: the first
   phase seeds generation 1, every `traffic` phase advances it by exactly
   one, and no other phase may change it — no acknowledged committed write
-  is lost, rolled back, or double-counted.
+  is lost, rolled back, or double-counted. On `rotation` and `recovery`
+  phases, `ready_members` lists members proven ready by a fresh durable
+  readiness probe inside that phase; on `fault` phases it lists the
+  currently reachable set — a fault phase mutates no readiness state, and
+  the reachable members' availability is proven by the adjacent
+  quorum-traffic phases.
 - **Bounds**: FD growth vs allowance (nullable on non-Linux), maximum
   per-transition resolver deltas vs allowance, maximum per-path campaign
   resolver total vs the per-endpoint-rotation replacement allowance, final
@@ -228,7 +244,7 @@ re-validate deterministically.
 | Watches gap-free/duplicate-free; every old-epoch connection drains by the hard deadline | `independent_client_and_server_leaf_rotation_preserves_active_requests_and_watch`; `consensus_server_only_material_rotation_replaces_both_cached_lanes`; drain-window lifecycle assertions; testkit drain discipline |
 | Old-anchor connections cannot be established after removal; no connection survives either peer leaf expiry | Removed-root rejection probes in the merged rotation tests and in the restart campaign; `real_mtls_local_and_peer_leaf_expiry_force_exact_reauthentication`; paused-time lifecycle retirement tests |
 | Rollback procedures executable and tested before and after old-anchor removal | The 13-phase merged rotation tests exercise both rollback paths; runbook section 7.4 procedures |
-| Resource, task, file-descriptor, handshake-rate, and reconnect-backoff bounds under repeated rotations | `three_member_fleet_repeated_rotation_stays_within_handshake_and_descriptor_bounds` (FD ≤ 8, per-transition resolver deltas ≤ 16, per-path campaign totals ≤ 18, final settle quiet window = 0, zero authentication failures); testkit traffic/resource campaign (manual long-running gate) |
+| Resource, task, file-descriptor, handshake-rate, and reconnect-backoff bounds under repeated rotations | `three_member_fleet_repeated_rotation_stays_within_handshake_and_descriptor_bounds` (FD ≤ 8, per-transition resolver deltas ≤ 16, per-path campaign totals ≤ 18, final settle quiet window = 0, zero authentication failures); async-task bounds are structural — every fleet runs in its own Tokio runtime and each server task is abort-and-awaited at campaign teardown, so a leaked task fails the campaign; explicit task-count telemetry remains a section-10 gate; testkit traffic/resource campaign (manual long-running gate) |
 | Metrics/alerts expose only approved fixed labels and distinguish reload rejection, expiry, trust failure, drain overrun, reconnect failure, and durable quorum loss | Runbook section 7.1 contract; testkit observability campaigns; in-process typed distinctions asserted per campaign (section 5) |
 | Evidence records exact artifact digests, configuration, seeds, timestamps, and independent checker provenance | Section 7 of this plan; the checker contract test; testkit digest-bound evidence; signing remains an operator step |
 
@@ -244,7 +260,14 @@ python3 scripts/check-session-rotation-fleet-evidence.py \
 The fault-matrix campaigns are deterministic in structure and must pass 10
 consecutive runs in CI before a change claiming them lands. The fleet
 campaigns serialize on a binary-local guard so concurrent fleet runtimes
-cannot starve election timers on small runners.
+cannot starve election timers on small runners. The guard is binary-local:
+CI runs `cargo test --workspace --test-threads=4`, which executes test
+binaries sequentially and parallelizes only within one binary, so no
+cross-binary fleet concurrency arises in the current harness. Should the
+harness ever execute test binaries concurrently, the campaigns stay safe:
+every fleet binds ephemeral loopback ports and its own temporary
+directories, and the only process-global state (the evidence-archive
+environment variable) is read and written solely under the guard.
 
 ## 10. Remaining gates (not discharged by this plan's in-process campaigns)
 
@@ -258,5 +281,6 @@ the runbook's explicit non-claims:
 - Signed release bundle over the deployed evidence (operator signing step).
 - Live alert fire-and-clear against a running monitoring stack.
 - Remote-HKMS rotation qualification.
-- Platform sizing and soak evidence, real network/storage fault injection,
-  the crash-point matrix, and version-migration/rollback campaigns.
+- Platform sizing and soak evidence (including explicit async-task-count
+  telemetry), real network/storage fault injection, the crash-point matrix,
+  and version-migration/rollback campaigns.

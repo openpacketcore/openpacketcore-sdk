@@ -57,9 +57,10 @@ use opc_session_store::{
     EncryptingSessionBackend, Generation, LeaseGuard, OwnerId, QuorumReplicaDescriptor,
     QuorumTopologyConfig, ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain, ReplicaId,
     ReplicaTlsIdentity, SessionBackend, SessionConsensusPeer, SessionConsensusPeerError,
-    SessionConsensusRpcFamily, SessionConsensusWireRequest, SessionConsensusWireResponse,
-    SessionKey, SessionKeyType, SessionLeaseManager, SqliteSessionBackend, StateClass, StateType,
-    StoredSessionRecord, SystemClock, ValidatedQuorumTopology,
+    SessionConsensusRpcFamily, SessionConsensusRpcHandler, SessionConsensusWireRequest,
+    SessionConsensusWireResponse, SessionKey, SessionKeyType, SessionLeaseManager,
+    SqliteSessionBackend, StateClass, StateType, StoredSessionRecord, SystemClock,
+    ValidatedQuorumTopology,
 };
 use opc_tls::{
     AuthenticatedClientConfig, AuthenticatedServerConfig, TlsConfigBuilder,
@@ -329,6 +330,18 @@ fn direct_resolver(addr: SocketAddr) -> RemoteAddrResolver {
     Arc::new(move || Box::pin(async move { Ok(addr) }))
 }
 
+/// A direct resolver that counts its invocations, so a single-attempt probe
+/// can prove it made exactly one connection attempt.
+fn counted_direct_resolver(addr: SocketAddr, resolutions: Arc<AtomicUsize>) -> RemoteAddrResolver {
+    Arc::new(move || {
+        let resolutions = Arc::clone(&resolutions);
+        Box::pin(async move {
+            resolutions.fetch_add(1, Ordering::SeqCst);
+            Ok(addr)
+        })
+    })
+}
+
 fn fleet_lifecycle() -> ConnectionLifecyclePolicy {
     ConnectionLifecyclePolicy::try_new(
         Duration::from_secs(60),
@@ -375,6 +388,23 @@ impl TransportStats {
             .map(|(_, count)| *count)
             .sum()
     }
+}
+
+/// Count both authentication-failure outcome classes across every directed
+/// path. Local transport failures are recorded as "family:authentication";
+/// wire responses carrying the remote rejection are
+/// "family:remote_authentication". The two suffixes are disjoint —
+/// ":authentication" never matches ":remote_authentication" — so the sum
+/// counts every outcome exactly once.
+fn authentication_failure_outcomes(
+    transport_stats: &BTreeMap<(usize, usize), Arc<TransportStats>>,
+) -> usize {
+    transport_stats
+        .values()
+        .map(|stats| {
+            stats.total_matching(":authentication") + stats.total_matching(":remote_authentication")
+        })
+        .sum()
 }
 
 #[derive(Debug, Clone)]
@@ -432,6 +462,30 @@ impl SessionConsensusPeer for InstrumentedConsensusPeer {
         let result = self.inner.call_with_timeout(request, timeout).await;
         self.record_result(family, &result);
         result
+    }
+}
+
+/// Counts qualification-only empty Vote probes that reach the
+/// post-authentication consensus handler, so a removed-anchor probe can prove
+/// it was rejected before application admission (mirrors the merged rotation
+/// campaign's dispatch accounting in consensus_transport.rs).
+#[derive(Debug)]
+struct ProbeDispatchCountingHandler {
+    inner: Arc<dyn SessionConsensusRpcHandler>,
+    empty_vote_dispatches: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl SessionConsensusRpcHandler for ProbeDispatchCountingHandler {
+    async fn handle(
+        &self,
+        authenticated_sender: opc_session_store::SessionConsensusNodeId,
+        request: SessionConsensusWireRequest,
+    ) -> SessionConsensusWireResponse {
+        if request.family == SessionConsensusRpcFamily::Vote && request.payload.is_empty() {
+            self.empty_vote_dispatches.fetch_add(1, Ordering::SeqCst);
+        }
+        self.inner.handle(authenticated_sender, request).await
     }
 }
 
@@ -730,6 +784,8 @@ impl CampaignEvidence {
                 "timing_profile": {
                     "cold_connect_timeout_millis": DURABLE_CONSENSUS_TIMING_PROFILE.cold_connect_timeout_millis,
                     "heartbeat_millis": DURABLE_CONSENSUS_TIMING_PROFILE.append_entries_timeout_millis,
+                    "vote_timeout_millis": DURABLE_CONSENSUS_TIMING_PROFILE.vote_timeout_millis,
+                    "election_timeout_min_millis": DURABLE_CONSENSUS_TIMING_PROFILE.election_timeout_min_millis,
                     "election_timeout_max_millis": DURABLE_CONSENSUS_TIMING_PROFILE.election_timeout_max_millis,
                     "operation_timeout_millis": DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout_millis,
                 },
@@ -830,6 +886,7 @@ struct FaultFleet {
     transport_stats: BTreeMap<(usize, usize), Arc<TransportStats>>,
     probes: BTreeMap<(usize, usize), Arc<InstrumentedConsensusPeer>>,
     servers: Vec<Option<SessionConsensusServerHandle>>,
+    probe_dispatches: Vec<Arc<AtomicUsize>>,
     provider: Arc<MemoryKeyProvider>,
     canary: Option<RotationCanary>,
     down: BTreeSet<usize>,
@@ -942,12 +999,17 @@ impl FaultFleet {
         }
 
         let mut servers = Vec::with_capacity(member_count);
+        let mut probe_dispatches = Vec::with_capacity(member_count);
         for (index, replica) in replicas.iter().copied().enumerate() {
             let binding = manifest
                 .bind_local(replica_id(replica))
                 .expect("fault-matrix server binding");
+            let empty_vote_dispatches = Arc::new(AtomicUsize::new(0));
             let (server, address) = SessionConsensusServer::new(
-                stores[index].rpc_handler(),
+                Arc::new(ProbeDispatchCountingHandler {
+                    inner: stores[index].rpc_handler(),
+                    empty_vote_dispatches: Arc::clone(&empty_vote_dispatches),
+                }),
                 materials[index].server.clone(),
                 binding,
             )
@@ -960,6 +1022,7 @@ impl FaultFleet {
                 .write()
                 .expect("fault-matrix address lock") = Some(address);
             servers.push(Some(server));
+            probe_dispatches.push(empty_vote_dispatches);
         }
 
         let provider = Arc::new(MemoryKeyProvider::new());
@@ -983,6 +1046,7 @@ impl FaultFleet {
             transport_stats,
             probes,
             servers,
+            probe_dispatches,
             provider,
             canary: None,
             down: BTreeSet::new(),
@@ -1106,7 +1170,11 @@ impl FaultFleet {
     /// Fresh bidirectional mTLS handshake proof on one directed path: the
     /// qualification-only empty Vote is idempotent and may retry availability
     /// failures until the operation deadline, but it must complete on a
-    /// connection resolved after the probe began.
+    /// connection resolved after the probe began. The counter correlation
+    /// proves a fresh handshake on the path after the probe began; a
+    /// concurrent raft redial could in principle satisfy the counter while
+    /// the probe reuses that lane, but either way the post-rotation lane on
+    /// the path is newly handshaken.
     async fn probe_path(&self, source: usize, target: usize) {
         let peer = self.probes.get(&(source, target)).expect("probe path");
         let resolutions = self
@@ -1342,8 +1410,15 @@ impl FaultFleet {
     /// accounting: the per-path campaign totals (bounded by
     /// PATH_TOTAL_ALLOWANCE per path) and the maximum single-transition
     /// handshake cost (bounded by TRANSITION_RESOLVER_ALLOWANCE). Paths to an
-    /// isolated member are fault-retry traffic bounded by the
-    /// per-directed-peer reconnect gate and stay outside this accounting.
+    /// isolated member are fault-retry traffic and stay outside this
+    /// accounting by design: their stream is the reconnect-gate-paced
+    /// heartbeat/election retry, measured at roughly thirty dials per second
+    /// on the leader-to-isolated path (75-81 dials across the ~2.5 s
+    /// partition window, zero in-window dials from the isolated member's own
+    /// outbound paths), so it scales with the fault window, not with
+    /// rotations. The reconnect-backoff bound proper is the lifecycle
+    /// per-directed-peer cooldown (plan section 2) and is exercised under
+    /// repeated rotations by the bounds campaign.
     fn account_transition(&mut self, before: &BTreeMap<(usize, usize), usize>) {
         let deltas = self.resolver_deltas(before);
         let mut transition_total = 0_usize;
@@ -1507,7 +1582,11 @@ impl FaultFleet {
 
     /// A one-shot client still presenting a chain under the removed old root
     /// must be rejected before application admission by a member whose trust
-    /// is now new-only.
+    /// is now new-only. The proof matches the merged rotation campaign's
+    /// strictness: exactly one connection attempt, a typed Authentication (or,
+    /// on stacks that surface a mid-handshake alert as an abrupt close,
+    /// Timeout) outcome, and — the load-bearing assertion — zero dispatches
+    /// of the probe into the post-authentication consensus handler.
     async fn assert_old_chain_rejected(
         &self,
         source: u16,
@@ -1522,17 +1601,19 @@ impl FaultFleet {
             .allow_any_trusted_peer()
             .build_authenticated_client_config()
             .expect("old-chain probe client");
+        let resolutions = Arc::new(AtomicUsize::new(0));
         let peer = RemoteSessionConsensusPeer::new_with_resolver(
             self.manifest
                 .bind_local(replica_id(source))
                 .expect("old-chain probe source binding")
                 .bind_remote(replica_id(self.replicas[target]))
                 .expect("old-chain probe target binding"),
-            direct_resolver(address),
+            counted_direct_resolver(address, Arc::clone(&resolutions)),
             client,
             Some(DURABLE_CONSENSUS_TIMING_PROFILE.cold_connect_timeout()),
         )
         .with_connection_lifecycle(single_attempt_probe_lifecycle());
+        let dispatches_before = self.probe_dispatches[target].load(Ordering::SeqCst);
         let outcome = peer.call(vote_probe(&self.manifest, source)).await;
         assert!(
             matches!(
@@ -1543,6 +1624,16 @@ impl FaultFleet {
                 )
             ),
             "new-only member trust must reject the removed old issuer: target={target}, outcome={outcome:?}"
+        );
+        assert_eq!(
+            resolutions.load(Ordering::SeqCst),
+            1,
+            "the removed-anchor probe must make exactly one connection attempt"
+        );
+        assert_eq!(
+            self.probe_dispatches[target].load(Ordering::SeqCst),
+            dispatches_before,
+            "an old-anchor client must not reach the post-authentication consensus handler"
         );
     }
 
@@ -1597,7 +1688,10 @@ impl FaultFleet {
             .bind_local(replica_id(self.replicas[member]))
             .expect("healed member binding");
         let (server, address) = SessionConsensusServer::new(
-            self.stores[member].rpc_handler(),
+            Arc::new(ProbeDispatchCountingHandler {
+                inner: self.stores[member].rpc_handler(),
+                empty_vote_dispatches: Arc::clone(&self.probe_dispatches[member]),
+            }),
             self.materials[member].server.clone(),
             binding,
         )
@@ -1660,12 +1754,18 @@ impl FaultFleet {
     }
 
     fn authentication_failures(&self) -> usize {
-        // "family:authentication" and "family:remote_authentication" both end
-        // with ":authentication"; one suffix pass counts each exactly once.
-        self.transport_stats
-            .values()
-            .map(|stats| stats.total_matching(":authentication"))
-            .sum()
+        authentication_failure_outcomes(&self.transport_stats)
+    }
+
+    /// Every campaign must measure — never default — its authentication
+    /// failure outcomes: the archived evidence asserts a measured invariant.
+    fn record_measured_authentication_failures(&mut self) {
+        let failures = self.authentication_failures();
+        assert_eq!(
+            failures, 0,
+            "the campaign must not record any authentication failure outcome"
+        );
+        self.evidence.authentication_failure_outcomes = failures;
     }
 
     async fn finish(self) {
@@ -1730,6 +1830,7 @@ async fn three_member_partition_recovery_case() {
     fleet.settle_no_churn("bounds-final-settle").await;
 
     fleet.evidence.fd_growth = None;
+    fleet.record_measured_authentication_failures();
     fleet.evidence.record_trust_anchors(&[&old_root]);
     fleet.evidence.emit_and_check();
     fleet.finish().await;
@@ -1832,6 +1933,7 @@ async fn five_member_failure_budget_case() {
     fleet.settle_no_churn("bounds-final-settle").await;
 
     fleet.evidence.fd_growth = None;
+    fleet.record_measured_authentication_failures();
     fleet.evidence.record_trust_anchors(&[&old_root]);
     fleet.evidence.emit_and_check();
     fleet.finish().await;
@@ -1908,8 +2010,9 @@ async fn three_member_repeated_rotation_bounds_case() {
 
     // Per-path campaign totals: each directed path is retired once per
     // rotation of each of its two endpoints (two cached lanes each), so
-    // three cycles bound it to exactly twelve replacements; fewer than six
-    // means some rotation never forced a fresh handshake on it.
+    // three cycles stay within the eighteen-replacement path allowance
+    // (measured 9-13); fewer than six means some rotation never forced a
+    // fresh handshake on it.
     for ((source, target), total) in &fleet.path_totals {
         assert!(
             (6..=PATH_TOTAL_ALLOWANCE).contains(total),
@@ -1934,13 +2037,8 @@ async fn three_member_repeated_rotation_bounds_case() {
             "repeated rotation descriptor growth {growth} exceeds allowance {FD_GROWTH_ALLOWANCE}"
         );
     }
-    let authentication_failures = fleet.authentication_failures();
-    assert_eq!(
-        authentication_failures, 0,
-        "repeated graceful rotations must not record authentication failures"
-    );
     fleet.evidence.fd_growth = fd_growth;
-    fleet.evidence.authentication_failure_outcomes = authentication_failures;
+    fleet.record_measured_authentication_failures();
     let generation = fleet.canary.as_ref().expect("seeded canary").generation;
     fleet.evidence.record(
         PhaseObservation {
@@ -2078,6 +2176,7 @@ async fn three_member_restart_mid_rotation_case() {
     fleet.settle_no_churn("bounds-final-settle").await;
 
     fleet.evidence.fd_growth = None;
+    fleet.record_measured_authentication_failures();
     fleet.evidence.record_trust_anchors(&[&old_root, &new_root]);
     fleet.evidence.emit_and_check();
     fleet.finish().await;
@@ -2086,6 +2185,87 @@ async fn three_member_restart_mid_rotation_case() {
 #[test]
 fn three_member_fleet_member_restarts_mid_rotation_and_rejoins_under_overlap_trust() {
     run_fleet_test(8, three_member_restart_mid_rotation_case());
+}
+
+/// The authentication-failure accounting must count both disjoint outcome
+/// classes exactly once: "family:authentication" (local transport failure)
+/// and "family:remote_authentication" (wire response carrying the remote
+/// rejection), with every other outcome ignored.
+#[test]
+fn authentication_failure_accounting_counts_both_classes_exactly_once() {
+    let mut transport_stats = BTreeMap::new();
+    let first = Arc::new(TransportStats::default());
+    for (outcome, count) in [
+        ("vote:remote_authentication", 3_usize),
+        ("append_entries:remote_authentication", 1),
+        ("vote:ok", 7),
+    ] {
+        for _ in 0..count {
+            first.record(outcome.to_string());
+        }
+    }
+    transport_stats.insert((0_usize, 1_usize), first);
+    let second = Arc::new(TransportStats::default());
+    for (outcome, count) in [
+        ("vote:authentication", 2_usize),
+        ("append_entries:remote_timeout", 4),
+    ] {
+        for _ in 0..count {
+            second.record(outcome.to_string());
+        }
+    }
+    transport_stats.insert((1_usize, 0_usize), second);
+    assert_eq!(authentication_failure_outcomes(&transport_stats), 6);
+}
+
+/// The archived evidence copy is the operator-facing artifact mirrored from
+/// the durable publication step, so its owner-only permission is part of the
+/// qualification contract.
+#[test]
+fn archived_evidence_copy_is_owner_only_on_unix() {
+    // Serializes against the fleet campaigns: OPC_ROTATION_EVIDENCE_DIR is
+    // process-global and only guard-holding tests read it at emit time.
+    let _fleet_test_guard = FLEET_TEST_GUARD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let archive = tempfile::tempdir().expect("evidence archive directory");
+    std::env::set_var("OPC_ROTATION_EVIDENCE_DIR", archive.path());
+    let mut evidence =
+        CampaignEvidence::new("checker-fixture", "mtls-fault-matrix-3".to_string(), 3);
+    let now = utc_epoch_seconds();
+    let phase = |name: &str, generation: u64| PhaseRecord {
+        name: name.to_string(),
+        kind: "traffic",
+        member: None,
+        canary_generation: generation,
+        fresh_handshake_paths: 0,
+        ready_members: vec![0, 1, 2],
+        duration: Duration::from_millis(10),
+        completed_epoch_seconds: now,
+    };
+    evidence.phases.push(phase("seed-canary", 1));
+    evidence.phases.push(phase("traffic-after-seed", 2));
+    evidence.evidence_bounds_for_fixture();
+    evidence.emit_and_check();
+    std::env::remove_var("OPC_ROTATION_EVIDENCE_DIR");
+    let archived = archive.path().join("checker-fixture-evidence.json");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(&archived)
+            .expect("archived evidence exists")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "archived evidence must be owner-only: mode={mode:o}"
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        assert!(archived.exists(), "archived evidence exists");
+    }
 }
 
 /// The independent checker is part of the qualification contract: a valid
@@ -2190,6 +2370,64 @@ fn rotation_fault_evidence_checker_binds_digests_bounds_and_provenance() {
     });
     must_reject("allowance-above-max.json", &|doc| {
         doc["bounds"]["resolver_delta_allowance"] = serde_json::json!(17);
+    });
+    // Semantic rules on phase content: recompute the plan digest after
+    // mutation so the rejection must come from the rule under test, not from
+    // the digest binding.
+    let replan = |doc: &serde_json::Value| {
+        let mut plan = format!(
+            "{}|{}|",
+            doc["campaign_id"].as_str().expect("campaign id"),
+            doc["topology"]["members"]
+        );
+        for (index, phase) in doc["phases"]
+            .as_array()
+            .expect("phases array")
+            .iter()
+            .enumerate()
+        {
+            if index > 0 {
+                plan.push(',');
+            }
+            let member = if phase["member"].is_null() {
+                "-".to_string()
+            } else {
+                phase["member"].to_string()
+            };
+            plan.push_str(&format!(
+                "{}:{}:{member}",
+                phase["name"].as_str().expect("phase name"),
+                phase["kind"].as_str().expect("phase kind")
+            ));
+        }
+        sha256_hex(plan.as_bytes())
+    };
+    let must_reject_replan = |name: &str, mutate: &dyn Fn(&mut serde_json::Value)| {
+        let mut tampered = document.clone();
+        mutate(&mut tampered);
+        tampered["plan_sha256"] = serde_json::json!(replan(&tampered));
+        let path = write_json_document(directory.path(), name, &tampered);
+        assert!(
+            run_checker(&path, now).is_err(),
+            "checker unexpectedly accepted tampered evidence: {name}"
+        );
+    };
+    must_reject_replan("first-phase-not-traffic.json", &|doc| {
+        doc["phases"][0]["kind"] = serde_json::json!("fault");
+    });
+    must_reject_replan("rotation-without-fresh-handshake.json", &|doc| {
+        doc["phases"][2]["member"] = serde_json::json!(0);
+    });
+    must_reject("empty-ready-members.json", &|doc| {
+        doc["phases"][0]["ready_members"] = serde_json::json!([]);
+    });
+    must_reject("disordered-completion.json", &|doc| {
+        doc["started_epoch_seconds"] = serde_json::json!(now - 10);
+        doc["phases"][0]["completed_epoch_seconds"] = serde_json::json!(now - 2);
+        doc["phases"][1]["completed_epoch_seconds"] = serde_json::json!(now - 3);
+    });
+    must_reject("retentions-over-fault-count.json", &|doc| {
+        doc["bounds"]["rejected_reload_retentions"] = serde_json::json!(3);
     });
     must_reject("outcome.json", &|doc| {
         doc["outcome"] = serde_json::json!("fail");
