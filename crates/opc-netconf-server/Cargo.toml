@@ -34,7 +34,7 @@ opc-runtime = { path = "../opc-runtime", version = "0.2.0" }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 quick-xml = { version = "0.41", default-features = false }
 rand = { workspace = true, optional = true }
-russh = { version = "0.61.2", default-features = false, features = ["ring"] }
+russh = { version = "0.62.4", default-features = false, features = ["ring"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
