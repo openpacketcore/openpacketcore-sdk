@@ -77,6 +77,7 @@ pub mod model;
 mod namespace;
 mod outbound_binding;
 pub mod staged;
+pub mod staged_object;
 pub mod unsupported;
 
 pub use backend::XfrmBackend;
@@ -129,6 +130,12 @@ pub use staged::{
     XfrmInstallOwnership, XfrmInstallRecoveryClassification, XfrmInstallRecoveryError,
     XfrmInstallRecoveryPlan, XfrmResidueClassification, XfrmStagedInstall,
     XfrmStagedInstallRunError,
+};
+pub use staged_object::{
+    XfrmObjectInstallCommitError, XfrmObjectInstallJournal, XfrmObjectInstallOwnership,
+    XfrmObjectInstallRecoveryClassification, XfrmObjectInstallRecoveryError,
+    XfrmObjectInstallRecoveryPlan, XfrmObjectInstallRequest, XfrmObjectRemovalRequest,
+    XfrmStagedObjectInstall, XfrmStagedObjectInstallRunError,
 };
 pub use unsupported::UnsupportedXfrmBackend;
 
