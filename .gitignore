@@ -76,3 +76,7 @@ book/
 .brehon/
 .agents/mcp_config.json
 .antigravitycli
+
+# Python bytecode from the CI helper scripts.
+__pycache__/
+*.pyc

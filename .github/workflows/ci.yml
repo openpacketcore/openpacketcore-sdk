@@ -81,7 +81,9 @@ jobs:
           "$(go env GOPATH)/bin/actionlint" .github/workflows/*.yml
 
       # Proves the test plan still partitions every integration-test target
-      # exactly once before any shard spends a runner on it.
+      # exactly once. The shards do not wait on this job -- they run the same
+      # check themselves in their precheck step -- so this is the readable
+      # place to see a plan failure, not the thing that gates them.
       - name: Verify test shard plan
         run: python3 ci/test-shards.py verify
 
@@ -141,11 +143,14 @@ jobs:
       # and would archive an empty target directory.
       # Per-shard keys: the legs build different target sets, so one shared
       # key would make all six race to save the same multi-gigabyte archive
-      # while giving each a worse hit rate than its own.
+      # while giving each a worse hit rate than its own. Only main saves:
+      # six archives per pull request would churn the repository's shared
+      # 10 GB cache quota and evict the entries the shards restore from.
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: opc-rust-tests-${{ matrix.shard }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # Every shard issues the identical package selection and differs only
       # in cargo target filters, so feature unification -- and therefore the
