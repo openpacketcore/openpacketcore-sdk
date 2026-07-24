@@ -56,8 +56,8 @@ closes the queue and lets the detached actor drain without blocking `Drop`.
   `InstallPolicyRequest`, `QuerySaRequest`, `SaState`, `SaReplayState`,
   `SaRelocationSelector`, `SaRelocationIdentity`, `SaRelocationEncap`,
   `SaRelocationDirection`, `RelocateSaRequest`,
-  `XfrmRequestId`, `UdpEncap`, `XfrmMark`, `DscpCodepoint`, `LifetimeConfig`,
-  and `XfrmProbe`.
+  `XfrmRequestId`, `UdpEncap`, `UdpEncapError`, `XfrmMark`, `DscpCodepoint`,
+  `LifetimeConfig`, and `XfrmProbe`.
 - Algorithm/key exports include `Algorithm`, `AuthAlgorithm`, `AeadAlgorithm`,
   `KeyMaterial`, and Linux XFRM algorithm-name constants.
 - Composite helpers include `install_sa_policy_with_rollback`,
@@ -97,6 +97,9 @@ closes the queue and lets the detached actor drain without blocking `Drop`.
   SA carry the same nonzero request ID.
 - With feature `ikev2`, the crate also exports Child SA KEYMAT and negotiation
   mappers from `opc-proto-ikev2` into explicit XFRM install requests.
+  `Ikev2ChildSaXfrmOptions` can carry one shared request ID and exact
+  directional initial NAT-T templates without changing the established public
+  request struct.
 
 ## Opaque outbound-SA binding
 
@@ -331,6 +334,48 @@ installs bidirectional authenticated-only tunnel SAs through the SDK, captures
 a real ESP packet, and proves both valid delivery and integrity-failure
 rejection of a tampered packet. It contains synthetic documentation-address
 and private-address fixtures only; keys are test-only and never logged.
+
+## Initial IKEv2 Child SA NAT-T mapping
+
+The established `Ikev2ChildSaXfrmRequest` shape and
+`build_xfrm_requests_from_ikev2_child_sa` remain the source-compatible
+native-ESP boundary. To map an already validated NAT-T decision, use the one
+general options entry point:
+
+```rust,no_run
+use std::error::Error;
+
+use opc_ipsec_xfrm::{
+    build_xfrm_requests_from_ikev2_child_sa_with_options, Ikev2ChildSaXfrmOptions,
+    Ikev2ChildSaXfrmRequest, Ikev2ChildSaXfrmRequests, UdpEncap,
+};
+
+fn map_natt_child_sa(
+    request: &Ikev2ChildSaXfrmRequest,
+) -> Result<Ikev2ChildSaXfrmRequests, Box<dyn Error>> {
+    let options = Ikev2ChildSaXfrmOptions::new().with_udp_encapsulation(
+        // Peer-to-local: translated peer source port to local NAT-T port.
+        UdpEncap::esp_in_udp(62_000, 4500),
+        // Local-to-peer: local NAT-T port to translated peer destination.
+        UdpEncap::esp_in_udp(4500, 62_000),
+    )?;
+    Ok(build_xfrm_requests_from_ikev2_child_sa_with_options(
+        request, options,
+    )?)
+}
+```
+
+The options constructor rejects every type other than RFC 3948 ESP-in-UDP and
+rejects zero ports with stable, value-free errors. The mapper carries each
+validated template unchanged into its matching `SaParameters::encap`; it never
+reverses ports. Default options keep both directions at `None` and preserve the
+original native-ESP mapping exactly.
+
+NAT detection, deciding whether encapsulation is required, and selecting
+original or translated directional ports remain product-owned. This initial
+mapping does not observe post-establishment rebinding or relocate an installed
+SA; use the separately fenced relocation boundary only after authenticated
+control-plane authorization and exact state reconciliation.
 
 ## Exact SA relocation
 
@@ -634,7 +679,8 @@ excludes the old key material needed for rollback.
   output mark, but never key material.
 - The `ikev2` feature maps validated Child SA intent to XFRM requests; it does
   not run IKE, allocate SPIs, enable ENCR_NULL in an allowlist, or choose
-  product policy.
+  product policy. Caller-owned NAT detection and port selection may be passed
+  as validated directional initial ESP-in-UDP options.
 - The IKEv2 mapper keeps SPI-pinned policies as its compatibility default and
   also supports a shared non-zero request ID with wildcard policy-template SPI
   for simultaneous old/new Child-SA rekey overlap.
