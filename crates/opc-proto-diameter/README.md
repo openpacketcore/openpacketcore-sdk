@@ -195,6 +195,34 @@ crate implements the scoped TLS/TCP adapter and exposes the transport-neutral
 simultaneous-open winner-election decision; this codec crate remains
 transport-neutral, and neither crate currently implements DTLS/SCTP.
 
+## Loss-safe pending-request failover transactions
+
+`transaction::PendingRequestTable` (feature `base`) is the reusable
+pending-request primitive for RFC 6733 §5.1/§5.5.4 origin-node failover. A
+consumer tracks a canonical request on a registered connection; the table
+allocates a connection-unique Hop-by-Hop identifier for the first attempt with
+T clear, preserves the immutable End-to-End/Origin-Host identity, and
+correlates answers across every retained attempt. On transport failure the
+caller fails over to an alternate connection: the new attempt carries the
+byte-identical canonical request, T=1, and a Hop-by-Hop identifier unique on
+that connection. Write dispositions distinguish failure before write,
+uncertain/partial write, successful write followed by transport loss, fixed
+`Destination-Host` with no valid alternate (a typed inability-to-deliver; the
+destination is never silently dropped or rewritten), retry exhaustion, and
+indeterminate completion. Exactly one terminal completion is delivered per
+live transaction; late, duplicated, reordered, or simultaneous answers update
+only bounded evidence. The synchronous API makes completion delivery atomic
+with the terminal transition, so cancellation cannot re-arm a transaction.
+
+`snapshot()` produces a versioned, explicitly sensitive byte form of pending
+records for encrypted storage (no plaintext backend is provided, and the value
+is held in zeroizing memory with a redacted `Debug`). Restored records
+retransmit with T=1 and keep a stable completion token and generation, so a
+consumer can make restored delivery idempotent with a durable
+compare-and-set claim; without one, restored delivery is at-least-once.
+Attempt limits beyond the evidence bounds, deadlines, peer selection, and
+alternate routability remain caller policy.
+
 ## API Shape
 
 - Root types include `Header`, `Message<'a>`, `OwnedMessage`, `AvpHeader`,
@@ -243,6 +271,11 @@ transport-neutral, and neither crate currently implements DTLS/SCTP.
 - `dictionary` exposes `Dictionary`, `DictionarySet`, `ApplicationDefinition`,
   `CommandDefinition`, `CommandAvpRule`, `AvpCardinality`, `AvpDefinition`,
   `AvpDataType`, `AvpFlagRules`, and related metadata types.
+- `transaction` exposes `PendingRequestTable`, the read-only
+  `DiameterRequestTransaction` view, `DiameterConnectionToken`,
+  `CompletionToken`/`CompletionTokenValue`, typed attempt/completion evidence,
+  the `PendingRequestClock` injection point with a `MonotonicClock` production
+  implementation, and the versioned sensitive `PendingTableSnapshot`.
 - The `peer` feature adds transport-neutral CER/CEA, DWR/DWA, DPR/DPA
   builders/parsers, capability negotiation helpers, result-code helpers, and
   `PeerSession` projection state. An explicit sequence-aware
@@ -801,7 +834,7 @@ function signatures and their `DecodeError` values remain source-compatible.
 
 | Feature | Default | Scope |
 | --- | --- | --- |
-| `base` | yes | RFC 6733 common application and raw base metadata. |
+| `base` | yes | RFC 6733 common application, raw base metadata, and loss-safe pending-request failover transactions. |
 | `peer` | no | CER/CEA, DWR/DWA, DPR/DPA helpers and peer-session projections. |
 | `app-rf` | no | Rf accounting dictionary plus typed ACR/ACA helpers. |
 | `app-swm` | no | SWm dictionary plus typed DER/DEA, STR/STA, ASR/ASA, RAR/RAA, and AAR/AAA helpers. |

@@ -291,6 +291,51 @@ known base AVPs, and raw decode retains blanket duplicate rejection. That raw
 rejection is not sufficient provenance for a 5009 answer: error mapping emits
 5009 only when the selected command profile explicitly declares `ZeroOrOne`.
 
+#### Pending-request failover transactions (RFC 6733 §5.1, §5.5.4, §3)
+
+Available under the `base` feature as `transaction::PendingRequestTable`.
+
+- The table owns RFC 6733 wire correctness for origin-node request failover.
+  The first attempt uses a Hop-by-Hop identifier allocated strictly
+  monotonically from a caller-seeded per-connection partition with the T bit
+  clear; allocation failure is typed (`HopByHopSpaceExhausted`). Every
+  failover or restored retransmission preserves the canonical request AVP
+  bytes byte-for-byte, keeps the exact original End-to-End identifier and
+  Origin-Host, sets T=1, and draws a fresh Hop-by-Hop identifier unique on
+  the selected connection. All attempt identifiers are retained so a late
+  answer from either path is still recognized.
+- Tracked requests are validated: R bit set, E bit clear, reserved flag bits
+  clear, bounded AVP region, exactly one non-empty Origin-Host, and no second
+  pending transaction with the same End-to-End identifier.
+- Write dispositions distinguish failure before write, uncertain or partial
+  write, and successful write followed by transport loss. Fixed
+  `Destination-Host` requests require an explicit caller routability
+  assertion for failover; otherwise the transaction ends with the typed
+  `FixedDestinationNoAlternate` inability-to-deliver outcome and the
+  destination is never silently dropped or rewritten. Retry exhaustion and
+  indeterminate completion are likewise typed terminal outcomes.
+- Answers are correlated by (connection, Hop-by-Hop), then validated against
+  the request's End-to-End identifier, command code, application, and answer
+  direction. Exactly one terminal completion is delivered while a live
+  transaction exists; late, duplicated, reordered, or simultaneous answers
+  update only bounded per-record evidence. The API is synchronous, so a
+  dropped caller-side future cannot split the terminal transition from the
+  delivery or re-arm the transaction.
+- `snapshot` emits a versioned, explicitly sensitive byte form of pending
+  records only (completed records are live-only). The snapshot is held in
+  zeroizing memory with a redacted `Debug`; it contains canonical request
+  bytes and must be stored only in encrypted, integrity-protected storage. No
+  plaintext persistence backend is provided. Restore re-validates every
+  record (malformed, truncated, trailing-garbage, unsupported-version,
+  bound-violating, and tampered inputs are rejected with typed errors),
+  preserves the stable completion token and generation across repeated
+  restores, and retransmits still-pending records with T=1. Restored delivery
+  is documented as at-least-once unless the consumer durably claims delivery
+  with a compare-and-set on the completion token and generation.
+- Attempt limits beyond the evidence bound, deadlines, peer selection, and
+  alternate routability remain caller policy. Deterministic injected clocks
+  drive attempt timing evidence in tests.
+
 ### 6. Application dictionaries
 
 Feature-gated per application. Dictionary metadata (applications, commands,
@@ -1569,11 +1614,18 @@ The following are outside the current crate scope:
   Re-Auth, and AA typed subsets.
 - Transport operations, TCP/SCTP framing/connectors, TLS handshakes and
   certificate validation, DTLS/SCTP, credential rotation, crypto-provider
-  binding, realm routing, peer topology, watchdog thresholds, failover state
-  machines, AAA/HSS/CDF behavior, charging decisions, and deployment readiness
+  binding, realm routing, peer topology, watchdog thresholds, AAA/HSS/CDF
+  behavior, charging decisions, and deployment readiness
   policy. The peer state machine consumes a caller assertion only after the
   transport performs mutual authentication; it does not claim cryptographic
   proof or a complete protected transport. The sibling
   `opc-diameter-transport` crate supplies a bounded TLS/TCP adapter and a
   transport-neutral simultaneous-open winner-election helper; it does not
   change this codec crate's scope and does not claim DTLS/SCTP.
+- Failover *policy*: peer discovery, alternate-peer selection and routability,
+  failback, attempt limits beyond the table's evidence bounds, deadlines, and
+  deciding whether a request's application semantics permit failover. The
+  reusable pending-request failover transaction mechanism (wire correctness,
+  cross-connection correlation, live at-most-once completion, and the
+  versioned sensitive snapshot form) is in scope; see section 5. Unencrypted
+  persistence backends and consumer-side idempotency remain out of scope.
