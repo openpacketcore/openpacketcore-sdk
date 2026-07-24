@@ -72,7 +72,9 @@
 //! the final anti-replay advance. Stock Linux `XFRM_MSG_MAPPING` does not meet
 //! that contract (it fires post-ICV but pre-final-replay and has no loss
 //! signal), so this crate ships the boundary, the provenance contract, and a
-//! scripted source, but no stock-kernel event source. Observations retain
+//! scripted replay source (feature `testkit`), but no stock-kernel event
+//! source; landing a conformant platform source remains open follow-up work.
+//! Observations retain
 //! only minimum routing facts, are bounded per SA with explicit fail-closed
 //! overflow, terminate exactly at teardown, and are value-free in diagnostics.
 
@@ -136,12 +138,14 @@ pub use model::{
     XFRM_AUTH_HMAC_SHA512, XFRM_ENCR_CBC_AES, XFRM_ENCR_NULL,
 };
 pub use namespace::{NamespaceBoundLinuxXfrmBackend, LINUX_XFRM_NAMESPACE_ACTOR_CAPACITY};
+#[cfg(feature = "testkit")]
+pub use observation::ScriptedEspPeerObservationSource;
 pub use observation::{
-    EspPeerAddressFamily, EspPeerEventProvenance, EspPeerIngestOutcome, EspPeerObservation,
-    EspPeerObservationBoundary, EspPeerObservationEvent, EspPeerObservationKey,
+    EspPeerAddressFamily, EspPeerEventProvenance, EspPeerIngestOutcome, EspPeerIngestTally,
+    EspPeerObservation, EspPeerObservationBoundary, EspPeerObservationEvent, EspPeerObservationKey,
     EspPeerObservationLoss, EspPeerObservationRegistration, EspPeerObservationRejection,
     EspPeerObservationScope, EspPeerObservationSource, EspPeerObservationTeardown,
-    ScriptedEspPeerObservationSource, DEFAULT_ESP_PEER_OBSERVATION_CAPACITY,
+    DEFAULT_ESP_PEER_OBSERVATION_CAPACITY,
 };
 pub use opc_types::DscpCodepoint;
 pub use outbound_binding::{

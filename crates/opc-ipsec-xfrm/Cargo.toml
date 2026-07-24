@@ -16,6 +16,9 @@ publish = false
 [features]
 default = []
 ikev2 = ["dep:opc-proto-ikev2"]
+# Test support: replay-oriented observation sources that can mint events
+# without kernel verification. Never enable in production builds.
+testkit = []
 
 [dependencies]
 opc-linux-xfrm-sys = { path = "../opc-linux-xfrm-sys", version = "0.2.0" }

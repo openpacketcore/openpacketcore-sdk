@@ -538,7 +538,11 @@ lose replay), its `GFP_ATOMIC` producer loss is invisible to receivers, and it
 carries no ingress ifindex, ESP sequence, lookup mark, or XFRM `if_id`. The
 crate therefore ships the boundary, the provenance contract
 (`EspPeerObservationSource`), and `ScriptedEspPeerObservationSource` for
-replay of captured or synthetic events, but no stock-kernel event source.
+replay of captured or synthetic events (gated behind the `testkit` cargo
+feature so production builds cannot mint unverified events), but no
+stock-kernel event source. This is a partial landing of the observation
+authority: shipping a conformant platform event source remains tracked
+follow-up work.
 Registration is refused for crypt-only SAs: post-decrypt delivery without
 integrity is not authentication.
 
