@@ -223,8 +223,12 @@ compare-and-set claim; without one, restored delivery is at-least-once.
 Connection lifetimes are released with `retire_connection` once no retained
 record references them; a token that restored records still reference cannot
 be re-registered, which keeps Hop-by-Hop allocation unique across restores.
-Attempt limits beyond the evidence bounds, deadlines, peer selection, and
-alternate routability remain caller policy.
+End-to-End identifiers come from the origin-scoped `end_to_end` identifier
+authority — one affine identity per logical request, retained across
+failover; the table preserves the identifier immutably and rejects duplicate
+pending identifiers as a defense-in-depth check. Attempt limits beyond the
+evidence bounds, deadlines, peer selection, and alternate routability remain
+caller policy.
 
 ## API Shape
 

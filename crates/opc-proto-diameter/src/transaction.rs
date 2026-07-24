@@ -29,6 +29,16 @@
 //!   compare-and-set on the completion token and generation); see
 //!   [`PendingRequestTable::restore`].
 //!
+//! End-to-End identifiers are allocated outside this module, normally by the
+//! origin-scoped [`crate::end_to_end::DiameterEndToEndIdentifierAuthority`]:
+//! the consumer allocates exactly one affine identity per logical request and
+//! retains it across every retry and failover attempt. This table is that
+//! retention point — it never allocates or rewrites the identifier, only
+//! preserves it immutably. Its duplicate-End-to-End rejection at track time
+//! is a defense-in-depth invariant over its own pending set, catching
+//! consumers that bypass the authority; it is not a substitute for the
+//! authority's origin-scoped, time-fenced allocation.
+//!
 //! Attempt limits, deadlines, peer selection, and whether an alternate is
 //! routable remain caller policy. Peer discovery, realm routing, load
 //! balancing, watchdog timing, unencrypted persistence, consumer-side
@@ -751,6 +761,9 @@ pub enum TrackError {
     /// The completion token value is already tracked or retained.
     DuplicateCompletionToken,
     /// Another pending transaction already uses this End-to-End identifier.
+    /// This is a defense-in-depth invariant over the table's pending set;
+    /// End-to-End allocation itself belongs to the origin-scoped
+    /// [`crate::end_to_end::DiameterEndToEndIdentifierAuthority`].
     DuplicateEndToEnd,
     /// The connection token is not registered.
     UnknownConnection,
@@ -1360,7 +1373,11 @@ impl PendingRequestTable {
     ///
     /// The request must be a Diameter request carrying exactly one non-empty
     /// Origin-Host and a clear T bit; its AVP bytes become the immutable
-    /// canonical form every attempt reuses. A T-set request is a
+    /// canonical form every attempt reuses. Allocate the End-to-End
+    /// identifier from the origin-scoped
+    /// [`crate::end_to_end::DiameterEndToEndIdentifierAuthority`] (one
+    /// affine identity per logical request, retained across failover); this
+    /// table preserves it and never allocates one. A T-set request is a
     /// retransmission by definition and is rejected with
     /// [`TrackError::AlreadyRetransmitted`] rather than silently dropping
     /// RFC 6733 §3's duplicate-detection signal — recover it through

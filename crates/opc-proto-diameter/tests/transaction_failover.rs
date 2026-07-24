@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::num::{NonZeroU128, NonZeroU64};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -17,6 +18,11 @@ use bytes::BytesMut;
 use opc_proto_diameter::apps::swm::{
     self, AuthRequestType, SwmDiameterEapAnswer, SwmDiameterEapRequest,
     SwmDiameterEapRequestEnvelope, SwmDiameterResult, SwmDiameterTransaction,
+};
+use opc_proto_diameter::end_to_end::{
+    DiameterEndToEndIdentifierAuthority, DiameterEndToEndIdentifierAuthorityAttestation,
+    DiameterEndToEndIdentifierClock, DiameterEndToEndIdentifierClockError,
+    DiameterEndToEndIdentifierConfig, DiameterEndToEndIdentifierTime,
 };
 use opc_proto_diameter::transaction::{
     AlternateRoutability, AnswerDisposition, AnswerRejectionReason, AttemptFailure, CompletionKind,
@@ -1459,4 +1465,114 @@ fn restored_records_rearm_before_sending() {
         .expect("wire");
     assert!(wire.header.flags.is_potentially_retransmitted());
     assert_eq!(wire.header.end_to_end_identifier, 0xE2E0_0022);
+}
+
+/// Deterministic wall/monotonic clock for the E2E identifier authority.
+#[derive(Debug)]
+struct AuthorityClock {
+    unix_seconds: AtomicU64,
+    monotonic_seconds: AtomicU64,
+}
+
+impl AuthorityClock {
+    fn new(unix_seconds: u64) -> Self {
+        Self {
+            unix_seconds: AtomicU64::new(unix_seconds),
+            monotonic_seconds: AtomicU64::new(0),
+        }
+    }
+
+    fn enter_next_second(&self) {
+        self.unix_seconds.fetch_add(1, Ordering::SeqCst);
+        self.monotonic_seconds.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+impl DiameterEndToEndIdentifierClock for AuthorityClock {
+    fn now(&self) -> Result<DiameterEndToEndIdentifierTime, DiameterEndToEndIdentifierClockError> {
+        Ok(DiameterEndToEndIdentifierTime::new(
+            self.unix_seconds.load(Ordering::SeqCst),
+            Duration::from_secs(self.monotonic_seconds.load(Ordering::SeqCst)),
+        ))
+    }
+}
+
+#[test]
+fn authority_allocated_identity_survives_failover() {
+    // Composition contract: the origin-scoped authority allocates exactly one
+    // affine End-to-End identity per logical request; the table is the
+    // retention point that preserves it across failover and never allocates.
+    let clock = Arc::new(AuthorityClock::new(1_800_000_010));
+    let authority = DiameterEndToEndIdentifierAuthority::with_clock(
+        DiameterEndToEndIdentifierConfig::default(),
+        clock.clone(),
+        DiameterEndToEndIdentifierAuthorityAttestation::attest_single_origin_owner_with_faithful_clocks(EPDG_HOST)
+            .expect("attestation"),
+    )
+    .expect("authority");
+    // The restart fence quarantines allocation until the wall clock enters
+    // the next second after authority construction.
+    clock.enter_next_second();
+    let end_to_end = authority
+        .allocate()
+        .expect("allocate")
+        .into_u32_for_origin_host(EPDG_HOST)
+        .expect("origin match");
+
+    let mut harness = harness();
+    harness.with_connections();
+    let tracked = harness
+        .table
+        .track(build_der(end_to_end, false), CONNECTION_A, token(40))
+        .expect("track");
+    assert_eq!(
+        harness
+            .table
+            .fail_connection_attempts(CONNECTION_A, AttemptFailure::TransportLostAfterWrite),
+        1
+    );
+    let attempt = harness
+        .table
+        .failover(
+            tracked.value(),
+            CONNECTION_B,
+            AlternateRoutability::RealmRouted,
+        )
+        .expect("failover");
+    let wire = harness
+        .table
+        .attempt_wire_message(tracked.value())
+        .expect("wire");
+    assert!(wire.header.flags.is_potentially_retransmitted());
+    assert_eq!(wire.header.end_to_end_identifier, end_to_end);
+    let disposition = harness.table.correlate_answer(
+        CONNECTION_B,
+        build_dea(attempt.hop_by_hop_identifier(), end_to_end, 2001),
+    );
+    match disposition {
+        AnswerDisposition::Completed(completion) => {
+            assert_eq!(completion.kind(), CompletionKind::Answered);
+            assert_eq!(completion.token().generation(), 1);
+        }
+        other => panic!("expected completion, got {other:?}"),
+    }
+
+    // The authority never reissues the retained identifier to a second
+    // request, and the table accepts the distinct allocation.
+    let second = authority
+        .allocate()
+        .expect("allocate")
+        .into_u32_for_origin_host(EPDG_HOST)
+        .expect("origin match");
+    assert_ne!(second, end_to_end);
+    harness
+        .table
+        .track(build_der(second, false), CONNECTION_A, token(41))
+        .expect("distinct allocation tracks");
+
+    // An identity allocated for one Origin-Host cannot be consumed under
+    // another; the table never performs this check because it never sees the
+    // scope fingerprint — allocation remains the authority's boundary.
+    let foreign = authority.allocate().expect("allocate");
+    assert!(foreign.into_u32_for_origin_host(AAA_HOST).is_err());
 }

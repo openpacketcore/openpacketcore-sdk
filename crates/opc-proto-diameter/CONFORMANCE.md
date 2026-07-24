@@ -350,7 +350,12 @@ Available under the `base` feature as `transaction::PendingRequestTable`.
   with a compare-and-set on the completion token and generation.
 - Attempt limits beyond the evidence bound, deadlines, peer selection, and
   alternate routability remain caller policy. Deterministic injected clocks
-  drive attempt timing evidence in tests.
+  drive attempt timing evidence in tests. End-to-End allocation belongs to
+  the origin-scoped `end_to_end` authority: the consumer allocates one affine
+  identity per logical request and retains it across failover, which is
+  exactly the immutable preservation this table provides; the table's
+  duplicate-End-to-End rejection is a defense-in-depth invariant over its own
+  pending set, not an allocation authority.
 
 ### 6. Application dictionaries
 
