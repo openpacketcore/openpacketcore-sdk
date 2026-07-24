@@ -96,6 +96,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Hop-by-Hop and setting T (#394).
 
 ### Changed
+- **SWm omitted-DEA mobility fallback derives from the DER's offer —
+  `opc-proto-diameter`:** when an exact-success DEA omits
+  `MIP6-Feature-Vector` and no locally configured mobility mode was attached
+  to the request envelope, the effective mode now derives from the retained
+  DER's own offered vector through the new
+  `SwmMip6FeatureVector::mobility_mode()` classification (network-based
+  members map to `NetworkBased`; a non-mode offer such as `MIP6_INTEGRATED`
+  alone derives nothing). The offer is the preconfigured projection that
+  TS 29.273 permits to select the IP mobility mode when the answer omits the
+  vector, so a conformant success answer carrying `APN-Configuration` or
+  APN-OI-Replacement no longer requires the consumer to re-declare intent
+  the request already encodes. An explicit AAA vector and an explicitly
+  attached local mode keep precedence, in that order; both local fallbacks
+  report `LocallyConfigured` provenance; an explicit AAA non-mode vector
+  still blocks every local fallback; an offer carrying an answer-only
+  selection (possible only through the unchecked envelope constructors)
+  derives nothing; and a DER that offered nothing keeps today's fail-closed
+  behavior. Consumers that relied on rejecting vector-less answers for an
+  offered DER can detect the derived case after correlation via
+  `answer().mip6_feature_vector.is_none()` together with
+  `local_mobility_mode_input().is_none()` (#537).
 - **SWm DEA mobility-vector omission — `opc-proto-diameter`:** exact-success
   Diameter-EAP correlation no longer rejects an answer that omits
   `MIP6-Feature-Vector` after the DER offered it. RFC 5447 defines no echo
