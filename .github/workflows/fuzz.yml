@@ -3,6 +3,7 @@ name: Fuzz
 on:
   pull_request:
     paths:
+      - ".github/workflows/fuzz.yml"
       - "crates/opc-proto-*/**"
       - "crates/opc-protocol/**"
   schedule:
@@ -15,6 +16,9 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  # The 2026-07-24 nightly ICEs while compiling Tokio with cargo-fuzz's
+  # sanitizer/codegen flags. Advance this pin only after the full matrix passes.
+  FUZZ_RUST_TOOLCHAIN: nightly-2026-07-23
 
 jobs:
   fuzz:
@@ -40,21 +44,23 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Install nightly Rust toolchain
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: ${{ env.FUZZ_RUST_TOOLCHAIN }}
 
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
 
       - name: List fuzz targets
         working-directory: crates/${{ matrix.crate }}
-        run: cargo +nightly fuzz list
+        run: cargo "+${FUZZ_RUST_TOOLCHAIN}" fuzz list
 
       - name: Run fuzz targets (600s each)
         working-directory: crates/${{ matrix.crate }}
         run: |
-          for target in $(cargo +nightly fuzz list); do
+          for target in $(cargo "+${FUZZ_RUST_TOOLCHAIN}" fuzz list); do
             echo "=== Fuzzing $target ==="
-            cargo +nightly fuzz run "$target" -- -max_total_time=600
+            cargo "+${FUZZ_RUST_TOOLCHAIN}" fuzz run "$target" -- -max_total_time=600
           done
 
       - name: Upload fuzz artifacts on failure
@@ -90,21 +96,23 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Install nightly Rust toolchain
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: ${{ env.FUZZ_RUST_TOOLCHAIN }}
 
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
 
       - name: List fuzz targets
         working-directory: crates/${{ matrix.crate }}
-        run: cargo +nightly fuzz list
+        run: cargo "+${FUZZ_RUST_TOOLCHAIN}" fuzz list
 
       - name: Run fuzz targets (60s each)
         working-directory: crates/${{ matrix.crate }}
         run: |
-          for target in $(cargo +nightly fuzz list); do
+          for target in $(cargo "+${FUZZ_RUST_TOOLCHAIN}" fuzz list); do
             echo "=== Fuzzing $target ==="
-            cargo +nightly fuzz run "$target" -- -max_total_time=60
+            cargo "+${FUZZ_RUST_TOOLCHAIN}" fuzz run "$target" -- -max_total_time=60
           done
 
       - name: Upload fuzz artifacts on failure
