@@ -236,15 +236,23 @@ jobs:
       # A skipped or cancelled lane fails here too: only an all-success run
       # may report success.
       - name: Require every Rust lane to succeed
+        # Passed through the environment rather than interpolated into the
+        # script, so lane names can never be treated as shell.
+        env:
+          LANE_RESULTS: ${{ toJSON(needs) }}
         run: |
-          results='${{ join(needs.*.result, " ") }}'
-          echo "lane results: ${results}"
-          for result in ${results}; do
-            if [ "${result}" != "success" ]; then
-              echo "::error::a Rust lane reported '${result}'"
-              exit 1
-            fi
-          done
+          python3 - <<'PY'
+          import json, os, sys
+
+          lanes = json.loads(os.environ["LANE_RESULTS"])
+          for name, lane in sorted(lanes.items()):
+              print(f"{name}: {lane['result']}")
+          failed = sorted(n for n, l in lanes.items() if l["result"] != "success")
+          if failed:
+              print(f"::error::Rust lanes did not succeed: {', '.join(failed)}")
+              sys.exit(1)
+          print(f"all {len(lanes)} Rust lanes succeeded")
+          PY
 
   vendored-dtls:
     name: Audited vendored DTLS
