@@ -205,7 +205,12 @@ T clear, preserves the immutable End-to-End/Origin-Host identity, and
 correlates answers across every retained attempt. On transport failure the
 caller fails over to an alternate connection: the new attempt carries the
 byte-identical canonical request, T=1, and a Hop-by-Hop identifier unique on
-that connection. Write dispositions distinguish failure before write,
+that connection. Every new attempt starts `Prepared` and is not sendable until
+a snapshot containing it and its exact `(epoch, revision)` checkpoint are
+durably committed. `confirm_snapshot_committed` then returns the proof consumed
+by `take_attempt_dispatch`; that operation can take the attempt only once.
+The caller must report the resulting full-write or failure evidence before
+choosing another attempt. Write dispositions distinguish failure before write,
 uncertain/partial write, successful write followed by transport loss, fixed
 `Destination-Host` with no valid alternate (a typed inability-to-deliver; the
 destination is never silently dropped or rewritten), retry exhaustion, and
@@ -216,13 +221,27 @@ with the terminal transition, so cancellation cannot re-arm a transaction.
 
 `snapshot()` produces a versioned, explicitly sensitive byte form of pending
 records for encrypted storage (no plaintext backend is provided, and the value
-is held in zeroizing memory with a redacted `Debug`). Restored records
-retransmit with T=1 and keep a stable completion token and generation, so a
-consumer can make restored delivery idempotent with a durable
-compare-and-set claim; without one, restored delivery is at-least-once.
-Connection lifetimes are released with `retire_connection` once no retained
-record references them; a token that restored records still reference cannot
-be re-registered, which keeps Hop-by-Hop allocation unique across restores.
+is held in zeroizing memory with a redacted `Debug`). Restore requires the
+exact separately protected committed `(epoch, revision)`: older rollback and
+newer uncommitted candidates both fail closed. Restored records retransmit with
+T=1 and retain a stable completion token.
+
+For terminal delivery, persist a `CompletionDeliveryRecord` atomically with
+the replayable application outcome. Exact-byte compare-and-set moves
+`Ready -> Claimed`; after the side effect is durable it moves
+`Claimed -> Acknowledged`. Recover an unfinished claim by fencing the prior
+worker and reclaiming it—`Claimed` is never evidence that the effect ran.
+Before any restored request is re-armed, reconcile the durable record:
+`Ready` or `Claimed` suppresses the matching network request, while
+`Acknowledged` removes it. The table refuses to advance to a pending-only
+snapshot while any terminal delivery is unacknowledged. Exactly-once effects
+still require an atomic side-effect-plus-ack store or an idempotent effect keyed
+by `CompletionDeliveryKey`; otherwise restored delivery is at-least-once.
+
+Connection lifetimes must first be closed and are released with
+`retire_connection` only once no retained record references them; a token that
+restored records still reference cannot be re-registered, which keeps
+Hop-by-Hop allocation unique across restores.
 End-to-End identifiers come from the origin-scoped `end_to_end` identifier
 authority — one affine identity per logical request, retained across
 failover; the table preserves the identifier immutably and rejects duplicate

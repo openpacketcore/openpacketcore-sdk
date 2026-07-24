@@ -95,7 +95,7 @@ fn dispatch(table: &mut PendingRequestTable, token: CompletionTokenValue) -> Own
     let committed = commit_next(table);
     table
         .take_attempt_dispatch(token, committed)
-        .map(|dispatch| dispatch.into_message())
+        .map(|dispatch| dispatch.into_parts().1)
         .expect("attempt must dispatch once")
 }
 
@@ -337,12 +337,17 @@ fn loss_after_complete_write_failover_alternate_succeeds() {
         .table
         .track(build_der(0xE2E0_0002, false), CONNECTION_A, token(2))
         .expect("track");
+    let _initial_wire = dispatch(&mut harness.table, tracked.value());
     let attempt = harness
         .table
         .transaction(tracked.value())
         .expect("view")
         .attempts()[0]
         .attempt_id();
+    harness
+        .table
+        .record_attempt_write_success(tracked.value(), attempt)
+        .expect("record complete write");
     // The complete request was written, then the association dropped before
     // the answer arrived: the peer may have applied it.
     harness
@@ -361,6 +366,7 @@ fn loss_after_complete_write_failover_alternate_succeeds() {
             AlternateRoutability::RealmRouted,
         )
         .expect("failover");
+    let _alternate_wire = dispatch(&mut harness.table, tracked.value());
     let dispositions = vec![
         harness
             .table
@@ -385,6 +391,7 @@ fn partial_unknown_write_records_uncertain_disposition() {
         .table
         .track(build_der(0xE2E0_0003, false), CONNECTION_A, token(3))
         .expect("track");
+    let _initial_wire = dispatch(&mut harness.table, tracked.value());
     let attempt = harness
         .table
         .transaction(tracked.value())
@@ -406,6 +413,7 @@ fn partial_unknown_write_records_uncertain_disposition() {
             AlternateRoutability::RealmRouted,
         )
         .expect("failover");
+    let _alternate_wire = dispatch(&mut harness.table, tracked.value());
     let disposition = harness
         .table
         .correlate_answer(CONNECTION_B, build_dea(HBH_B, 0xE2E0_0003, 2001));
@@ -510,6 +518,7 @@ fn alternate_failure_then_second_alternate_succeeds() {
         .table
         .track(build_der(0xE2E0_0005, false), CONNECTION_A, token(5))
         .expect("track");
+    let _initial_wire = dispatch(&mut harness.table, tracked.value());
     assert_eq!(
         harness
             .table
@@ -524,6 +533,7 @@ fn alternate_failure_then_second_alternate_succeeds() {
             AlternateRoutability::RealmRouted,
         )
         .expect("failover B");
+    let _first_alternate_wire = dispatch(&mut harness.table, tracked.value());
     assert_eq!(
         harness
             .table
@@ -538,6 +548,7 @@ fn alternate_failure_then_second_alternate_succeeds() {
             AlternateRoutability::RealmRouted,
         )
         .expect("failover C");
+    let _second_alternate_wire = dispatch(&mut harness.table, tracked.value());
     let disposition = harness
         .table
         .correlate_answer(CONNECTION_C, build_dea(HBH_C, 0xE2E0_0005, 2001));
@@ -559,6 +570,7 @@ fn retry_exhaustion_produces_typed_completion() {
         .table
         .track(build_der(0xE2E0_0006, false), CONNECTION_A, token(6))
         .expect("track");
+    let _initial_wire = dispatch(&mut harness.table, tracked.value());
     harness
         .table
         .failover(
@@ -567,6 +579,7 @@ fn retry_exhaustion_produces_typed_completion() {
             AlternateRoutability::RealmRouted,
         )
         .expect("failover B");
+    let _alternate_wire = dispatch(&mut harness.table, tracked.value());
     let error = match harness.table.failover(
         tracked.value(),
         CONNECTION_C,
@@ -605,6 +618,7 @@ fn late_original_answer_after_alternate_completion_is_evidence_only() {
         .table
         .track(build_der(0xE2E0_0007, false), CONNECTION_A, token(7))
         .expect("track");
+    let _initial_wire = dispatch(&mut harness.table, tracked.value());
     assert_eq!(
         harness
             .table
@@ -619,6 +633,7 @@ fn late_original_answer_after_alternate_completion_is_evidence_only() {
             AlternateRoutability::RealmRouted,
         )
         .expect("failover");
+    let _alternate_wire = dispatch(&mut harness.table, tracked.value());
     let mut callback_count = 0usize;
     if matches!(
         harness
@@ -650,6 +665,7 @@ fn late_alternate_answer_after_original_completion_is_evidence_only() {
         .table
         .track(build_der(0xE2E0_0008, false), CONNECTION_A, token(8))
         .expect("track");
+    let _initial_wire = dispatch(&mut harness.table, tracked.value());
     // Fail over while the original attempt is still in flight; the original
     // answer wins the race.
     harness
@@ -660,6 +676,7 @@ fn late_alternate_answer_after_original_completion_is_evidence_only() {
             AlternateRoutability::RealmRouted,
         )
         .expect("failover");
+    let _alternate_wire = dispatch(&mut harness.table, tracked.value());
     let dispositions = vec![
         harness
             .table
@@ -683,6 +700,7 @@ fn duplicated_and_simultaneous_answers_complete_at_most_once() {
         .table
         .track(build_der(0xE2E0_0009, false), CONNECTION_A, token(9))
         .expect("track");
+    let _initial_wire = dispatch(&mut harness.table, tracked.value());
     assert_eq!(
         harness
             .table
@@ -697,6 +715,7 @@ fn duplicated_and_simultaneous_answers_complete_at_most_once() {
             AlternateRoutability::RealmRouted,
         )
         .expect("failover");
+    let _alternate_wire = dispatch(&mut harness.table, tracked.value());
     // "Simultaneous" answers on both connections are serialized by the
     // synchronous API; duplicates on the same connection are the same shape.
     let dispositions = vec![
@@ -726,6 +745,7 @@ fn reordered_answers_complete_on_the_first_validated_answer() {
         .table
         .track(build_der(0xE2E0_000A, false), CONNECTION_A, token(10))
         .expect("track");
+    let _initial_wire = dispatch(&mut harness.table, tracked.value());
     harness
         .table
         .failover(
@@ -734,6 +754,7 @@ fn reordered_answers_complete_on_the_first_validated_answer() {
             AlternateRoutability::RealmRouted,
         )
         .expect("failover");
+    let _alternate_wire = dispatch(&mut harness.table, tracked.value());
     // The alternate answer is observed first; the original arriving later is
     // reordered evidence only.
     let dispositions = vec![
@@ -756,6 +777,7 @@ fn mismatched_answers_are_rejected_without_completing() {
         .table
         .track(build_der(0xE2E0_000B, false), CONNECTION_A, token(11))
         .expect("track");
+    let _initial_wire = dispatch(&mut harness.table, tracked.value());
     harness
         .table
         .failover(
@@ -764,6 +786,7 @@ fn mismatched_answers_are_rejected_without_completing() {
             AlternateRoutability::RealmRouted,
         )
         .expect("failover");
+    let _alternate_wire = dispatch(&mut harness.table, tracked.value());
     // Wrong End-to-End: matches the attempt but cannot be its answer.
     let wrong_e2e = harness
         .table
@@ -937,8 +960,9 @@ fn restored_delivery_is_at_least_once_and_durable_claim_dedups() {
         .table
         .track(build_der(0xE2E0_000E, false), CONNECTION_A, token(14))
         .expect("track");
+    let _initial_wire = dispatch(&mut harness.table, tracked.value());
     // The consumer durably snapshots before the answer arrives.
-    let snapshot = snapshot_at(&mut harness.table, 1);
+    let snapshot = snapshot_at(&mut harness.table, 2);
 
     // Live path: the answer completes the transaction once.
     let first = harness
@@ -969,6 +993,7 @@ fn restored_delivery_is_at_least_once_and_durable_claim_dedups() {
             AlternateRoutability::RealmRouted,
         )
         .expect("restored retransmission");
+    let _restored_wire = dispatch(&mut restored, tracked.value());
     // The server answers the retransmission (E2E duplicate detection returns
     // the cached answer); the completion is delivered a second time.
     let second = restored.correlate_answer(CONNECTION_C, build_dea(HBH_C, 0xE2E0_000E, 2001));
@@ -1021,6 +1046,10 @@ fn restored_delivery_is_at_least_once_and_durable_claim_dedups() {
         .reclaim(claim_c)
         .expect("second reclaim");
     durable_record = reclaimed_again.encode().as_bytes().to_vec();
+    assert_eq!(
+        CompletionDeliveryRecord::decode(&durable_record),
+        Ok(reclaimed_again)
+    );
     effect_attempts += 1;
     if !applied_keys.contains(&reclaimed_again.key()) {
         applied_keys.push(reclaimed_again.key());
@@ -1137,6 +1166,10 @@ fn fixed_destination_without_alternate_is_typed_undeliverable() {
             UndeliverableReason::FixedDestinationNoAlternate,
         )
         .expect("finish");
+    harness
+        .table
+        .acknowledge_completion_delivery(acknowledged_delivery(&completion))
+        .expect("acknowledge undeliverable completion");
     match completion {
         TransactionCompletion::Undeliverable {
             reason,
@@ -1181,6 +1214,7 @@ fn no_alternate_routable_is_typed_undeliverable() {
         .table
         .track(build_der(0xE2E0_0012, false), CONNECTION_A, token(18))
         .expect("track");
+    let _initial_wire = dispatch(&mut harness.table, tracked.value());
     assert_eq!(
         harness
             .table
@@ -1202,12 +1236,17 @@ fn no_alternate_routable_is_typed_undeliverable() {
         .finish_undeliverable(tracked.value(), UndeliverableReason::NoAlternateRoutable)
         .expect("finish");
     assert_eq!(completion.kind(), CompletionKind::Undeliverable);
+    harness
+        .table
+        .acknowledge_completion_delivery(acknowledged_delivery(&completion))
+        .expect("acknowledge undeliverable completion");
     // An indeterminate outcome is likewise typed when the write disposition
     // cannot be proven and the caller stops trying.
     let second = harness
         .table
         .track(build_der(0xE2E0_0013, false), CONNECTION_A, token(19))
         .expect("track");
+    let _second_wire = dispatch(&mut harness.table, second.value());
     assert_eq!(
         harness
             .table
@@ -1248,6 +1287,8 @@ fn bounded_tables_and_completion_retention() {
             .err(),
         Some(TrackError::TableFull)
     );
+    let _first_wire = dispatch(&mut harness.table, first.value());
+    let _second_wire = dispatch(&mut harness.table, second.value());
     // Complete and durably acknowledge both. Unacknowledged work is never
     // evicted; once acknowledged, the ordinary late-answer retention bound
     // evicts the oldest completion.
@@ -1300,6 +1341,7 @@ fn deterministic_clocks_drive_attempt_evidence() {
         .table
         .track(build_der(0xE2E0_0018, false), CONNECTION_A, token(24))
         .expect("track");
+    let _initial_wire = dispatch(&mut harness.table, tracked.value());
     harness.clock.advance(Duration::from_millis(40));
     harness
         .table
@@ -1309,6 +1351,7 @@ fn deterministic_clocks_drive_attempt_evidence() {
             AlternateRoutability::RealmRouted,
         )
         .expect("failover");
+    let _alternate_wire = dispatch(&mut harness.table, tracked.value());
     harness.clock.advance(Duration::from_millis(5));
     harness
         .table
@@ -1332,6 +1375,7 @@ fn dropping_a_completion_never_re_arms_the_transaction() {
         .table
         .track(build_der(0xE2E0_0017, false), CONNECTION_A, token(23))
         .expect("track");
+    let _wire = dispatch(&mut harness.table, tracked.value());
     // The completion is delivered and immediately dropped by the caller:
     // cancellation cannot split the terminal transition from the delivery.
     drop(
@@ -1474,6 +1518,7 @@ fn connection_lifetimes_recycle_without_exhausting_the_table() {
                 AlternateRoutability::RealmRouted,
             )
             .expect("failover");
+        let _alternate_wire = dispatch(&mut harness.table, tracked.value());
         let completion = match harness.table.correlate_answer(
             alternate,
             build_dea(1, 0xE3E0_0000 + cycle as u32 * 2, 2001),

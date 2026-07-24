@@ -315,7 +315,9 @@ Available under the `base` feature as `transaction::PendingRequestTable`.
   a recycled connection identity can never allocate a duplicate Hop-by-Hop
   identifier on one connection. Closed lifetimes are released by
   `retire_connection` only after the last referencing record is retired or
-  evicted, so late-answer correlation evidence is never orphaned. Restored
+  evicted; attempting to retire an open lifetime fails typed, so its
+  Hop-by-Hop cursor cannot be reset while that transport can still carry
+  traffic. Late-answer correlation evidence is therefore never orphaned. Restored
   in-flight attempts belong to dead lifetimes: their pre-crash T-clear wire
   bytes are never re-served, and records must be re-armed through `failover`
   (which sets T=1) before sending.
@@ -326,6 +328,15 @@ Available under the `base` feature as `transaction::PendingRequestTable`.
   `FixedDestinationNoAlternate` inability-to-deliver outcome and the
   destination is never silently dropped or rewritten. Retry exhaustion and
   indeterminate completion are likewise typed terminal outcomes.
+- Every attempt starts `Prepared`. Before it can leave the table, the consumer
+  must commit a snapshot containing that attempt and attest the exact
+  `(epoch, revision)` through `confirm_snapshot_committed`.
+  `take_attempt_dispatch` consumes that proof and transitions the attempt to
+  `InFlight` exactly once; stale proofs, unsnapshotted attempts, restored dead
+  attempts, closed connections, and a second take all fail typed. The caller
+  then records either full-write success (`WrittenAwaitingAnswer`) or a typed
+  write failure. This persist-before-dispatch ordering applies to the initial
+  attempt and every failover attempt.
 - Answers are correlated by (connection, Hop-by-Hop), then validated against
   the request's End-to-End identifier, command code, application, and answer
   direction. Exactly one terminal completion is delivered while a live
@@ -343,11 +354,24 @@ Available under the `base` feature as `transaction::PendingRequestTable`.
   (duplicate tokens or attempt identities, generation/flag/disposition
   contradictions, AVP re-validation failures) are rejected with typed
   errors. Snapshot integrity and confidentiality beyond these structural
-  checks are delegated to the consumer's encrypted storage. Restore
-  preserves the stable completion token and generation across repeated
-  restores, and retransmits still-pending records with T=1. Restored delivery
-  is documented as at-least-once unless the consumer durably claims delivery
-  with a compare-and-set on the completion token and generation.
+  checks are delegated to the consumer's encrypted storage. The caller must
+  retain the exact committed checkpoint in separately rollback-resistant
+  metadata. Restore rejects both an older snapshot (`Stale`) and a newer
+  candidate whose checkpoint was never committed (`Uncommitted`), preserves
+  the stable completion token across repeated restores, and retransmits
+  still-pending records with T=1.
+- A terminal outcome is paired with a fixed-width
+  `CompletionDeliveryRecord` and caller-retained replayable intent. Durable
+  exact-byte compare-and-set transitions `Ready -> Claimed -> Acknowledged`;
+  crash recovery fences and reclaims unfinished `Claimed` work rather than
+  treating the claim as a completed effect. Before network re-arm, reconciling
+  `Ready` or `Claimed` suppresses the matching restored request, and
+  reconciling `Acknowledged` removes it. A pending-only snapshot is refused
+  while any completion remains unacknowledged, so snapshot advancement cannot
+  discard the sole replay source. Exactly-once effects require either one
+  atomic side-effect-plus-ack transaction or an idempotent sink keyed by
+  `CompletionDeliveryKey`; without that external guarantee, restored delivery
+  remains at-least-once.
 - Attempt limits beyond the evidence bound, deadlines, peer selection, and
   alternate routability remain caller policy. Deterministic injected clocks
   drive attempt timing evidence in tests. End-to-End allocation belongs to

@@ -1003,22 +1003,10 @@ impl AttemptDispatch {
         self.attempt
     }
 
-    /// Borrow the complete wire message for transport encoding.
-    #[must_use]
-    pub const fn message(&self) -> &OwnedMessage {
-        &self.message
-    }
-
     /// Consume the receipt and return its attempt identity and wire message.
     #[must_use]
     pub fn into_parts(self) -> (AttemptId, OwnedMessage) {
         (self.attempt, self.message)
-    }
-
-    /// Consume the receipt and return the complete wire message.
-    #[must_use]
-    pub fn into_message(self) -> OwnedMessage {
-        self.message
     }
 }
 
@@ -1637,6 +1625,10 @@ pub enum ConnectionTableError {
     DuplicateConnection,
     /// The connection token is not registered.
     UnknownConnection,
+    /// The connection is still open. Close the exact transport lifetime
+    /// before retiring its token so the Hop-by-Hop allocation cursor cannot
+    /// be reset while that transport can still carry traffic.
+    ConnectionStillOpen,
     /// The connection cannot be retired: at least one pending or retained
     /// transaction still holds an attempt on this token. Attempt identities
     /// must stay registered for late-answer evidence; completed records age
@@ -1653,6 +1645,7 @@ impl ConnectionTableError {
             Self::TableFull => "diameter_pending_connection_table_full",
             Self::DuplicateConnection => "diameter_pending_connection_duplicate",
             Self::UnknownConnection => "diameter_pending_connection_unknown",
+            Self::ConnectionStillOpen => "diameter_pending_connection_still_open",
             Self::ConnectionInUse => "diameter_pending_connection_in_use",
         }
     }
@@ -2339,6 +2332,9 @@ impl PendingRequestTable {
             .connections
             .get(&token.get())
             .ok_or(ConnectionTableError::UnknownConnection)?;
+        if entry.open {
+            return Err(ConnectionTableError::ConnectionStillOpen);
+        }
         if entry.live_attempts > 0 {
             return Err(ConnectionTableError::ConnectionInUse);
         }
@@ -2600,7 +2596,7 @@ impl PendingRequestTable {
     /// lifetimes: they are never served here, even when still marked in
     /// flight. Re-arm the record with [`Self::failover`] first — the
     /// re-armed attempt carries T=1 as RFC 6733 §5.5.4 requires — otherwise
-    /// this returns [`TransactionAccessError::NoLiveAttempt`]. Use
+    /// this returns [`TransactionAccessError::NoLiveAttempt`].
     pub fn take_attempt_dispatch(
         &mut self,
         token: CompletionTokenValue,
@@ -2744,15 +2740,15 @@ impl PendingRequestTable {
         let mut marked = 0usize;
         for record in self.records.values_mut() {
             for attempt in &mut record.attempts {
-                let compatible = match (attempt.disposition, failure) {
-                    (AttemptDisposition::InFlight, _) => true,
-                    (AttemptDisposition::Prepared, AttemptFailure::BeforeWrite) => true,
-                    (
-                        AttemptDisposition::WrittenAwaitingAnswer,
-                        AttemptFailure::TransportLostAfterWrite,
-                    ) => true,
-                    _ => false,
-                };
+                let compatible = matches!(
+                    (attempt.disposition, failure),
+                    (AttemptDisposition::InFlight, _)
+                        | (AttemptDisposition::Prepared, AttemptFailure::BeforeWrite)
+                        | (
+                            AttemptDisposition::WrittenAwaitingAnswer,
+                            AttemptFailure::TransportLostAfterWrite
+                        )
+                );
                 if attempt.connection == connection && compatible {
                     if failure == AttemptFailure::TransportLostAfterWrite
                         && attempt.written_at.is_none()
@@ -3724,7 +3720,10 @@ fn inspect_answer(
 }
 
 fn origin_host_matches(raw_avps: &[u8], candidate: &str) -> bool {
-    let ctx = DecodeContext::conservative();
+    let ctx = DecodeContext {
+        duplicate_ie_policy: opc_protocol::DuplicateIePolicy::First,
+        ..DecodeContext::conservative()
+    };
     let message = Message {
         header: Header::new(
             CommandFlags::request(true),
@@ -3869,7 +3868,11 @@ mod tests {
     const USER_NAME: &str = "subscriber-private@example.invalid";
     const DESTINATION_HOST: &str = "aaa.private.example";
     const EAP_MARKER: [u8; 4] = [0xE4, 0xA9, 0x00, 0x11];
-    const SNAPSHOT_EPOCH: PendingSnapshotEpoch = PendingSnapshotEpoch::new(NonZeroU128::MIN);
+    const SNAPSHOT_EPOCH: PendingSnapshotEpoch =
+        match NonZeroU128::new(0xA11C_E5E5_D00D_CAFE_0123_4567_89AB_CDEF) {
+            Some(value) => PendingSnapshotEpoch::new(value),
+            None => PendingSnapshotEpoch::new(NonZeroU128::MIN),
+        };
 
     fn token(value: u128) -> CompletionTokenValue {
         match NonZeroU128::new(value) {
@@ -3917,7 +3920,7 @@ mod tests {
         let committed = commit_next(table);
         table
             .take_attempt_dispatch(token, committed)
-            .map(AttemptDispatch::into_message)
+            .map(|dispatch| dispatch.into_parts().1)
             .unwrap_or_else(|error| panic!("dispatch: {error}"))
     }
 
@@ -4064,6 +4067,29 @@ mod tests {
         );
         let encoded = encode(&first_wire);
         assert_eq!(encoded.len(), first_wire.header.length as usize);
+    }
+
+    #[test]
+    fn origin_host_oracle_ignores_unrelated_repeatable_avps() {
+        let mut table = table(PendingRequestTableConfig::default());
+        table
+            .add_connection(CONNECTION_A, 100)
+            .unwrap_or_else(|error| panic!("connection registration: {error}"));
+        let mut request = canonical_request(None);
+        let mut avps = Vec::new();
+        avps.extend(wire_avp(282, b"relay-a.example"));
+        avps.extend(wire_avp(282, b"relay-b.example"));
+        avps.extend_from_slice(&request.raw_avps);
+        request.raw_avps = Bytes::from(avps);
+        request.header.length = (DIAMETER_HEADER_LEN + request.raw_avps.len()) as u32;
+        let tracked = table
+            .track(request, CONNECTION_A, token(1))
+            .unwrap_or_else(|error| panic!("track: {error}"));
+        let view = table
+            .transaction(tracked.value())
+            .unwrap_or_else(|| panic!("transaction view"));
+        assert!(view.has_origin_host(ORIGIN_HOST));
+        assert!(!view.has_origin_host("other.example"));
     }
 
     #[test]
@@ -4251,13 +4277,7 @@ mod tests {
                 token(2),
             )
             .unwrap_or_else(|e| panic!("{e}"));
-        table
-            .failover(
-                first.value(),
-                CONNECTION_B,
-                AlternateRoutability::RealmRouted,
-            )
-            .unwrap_or_else(|e| panic!("{e}"));
+        let _initial_wire = dispatch(&mut table, first.value());
         let first_attempt_id = {
             let view = table
                 .transaction(first.value())
@@ -4265,14 +4285,24 @@ mod tests {
             view.attempts()[0].attempt_id()
         };
         table
+            .record_attempt_write_success(first.value(), first_attempt_id)
+            .unwrap_or_else(|e| panic!("{e}"));
+        table
             .record_attempt_failure(
                 first.value(),
                 first_attempt_id,
                 AttemptFailure::TransportLostAfterWrite,
             )
             .unwrap_or_else(|e| panic!("{e}"));
+        table
+            .failover(
+                first.value(),
+                CONNECTION_B,
+                AlternateRoutability::RealmRouted,
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
 
-        let snapshot = snapshot_at(&mut table, 1);
+        let snapshot = snapshot_at(&mut table, 2);
         let restored = restore_snapshot(&snapshot, PendingRequestTableConfig::default());
         assert_eq!(restored.pending_count(), 2);
         let view = restored
@@ -4604,6 +4634,7 @@ mod tests {
         let tracked = table
             .track(canonical_request(None), CONNECTION_A, token(1))
             .unwrap_or_else(|e| panic!("{e}"));
+        let _first_wire = dispatch(&mut table, tracked.value());
         table
             .failover(
                 tracked.value(),
@@ -4611,6 +4642,7 @@ mod tests {
                 AlternateRoutability::RealmRouted,
             )
             .unwrap_or_else(|e| panic!("{e}"));
+        let _second_wire = dispatch(&mut table, tracked.value());
         assert_eq!(
             table.fail_connection_attempts(CONNECTION_A, AttemptFailure::UncertainWrite),
             1
@@ -4711,9 +4743,14 @@ mod tests {
         table
             .add_connection(CONNECTION_A, 100)
             .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            err_of(table.retire_connection(CONNECTION_A)),
+            ConnectionTableError::ConnectionStillOpen
+        );
         let tracked = table
             .track(canonical_request(None), CONNECTION_A, token(1))
             .unwrap_or_else(|e| panic!("{e}"));
+        let wire = dispatch(&mut table, tracked.value());
         table
             .close_connection(CONNECTION_A)
             .unwrap_or_else(|e| panic!("{e}"));
@@ -4724,7 +4761,6 @@ mod tests {
         );
         // Completion alone does not release it: the retained completed record
         // still provides late-answer evidence.
-        let wire = dispatch(&mut table, tracked.value());
         let completion = match table.correlate_answer(
             CONNECTION_A,
             answer_message(wire.header.hop_by_hop_identifier, E2E),
@@ -4861,8 +4897,7 @@ mod tests {
         let historical = restored
             .transaction(tracked.value())
             .unwrap_or_else(|| panic!("view"))
-            .attempts()[0]
-            ;
+            .attempts()[0];
         assert_eq!(historical.attempt_id().connection(), CONNECTION_A);
         assert!(!historical.is_retransmission());
         assert_eq!(historical.snapshotted_at(), Some(checkpoint(1).revision()));
@@ -4940,6 +4975,7 @@ mod tests {
         let tracked = pending_table
             .track(canonical_request(None), CONNECTION_A, token(1))
             .unwrap_or_else(|error| panic!("track: {error}"));
+        let _wire = dispatch(&mut pending_table, tracked.value());
 
         let mut wrong_p = answer_message(100, E2E);
         wrong_p.header.flags = CommandFlags::answer(false, false);
@@ -5130,7 +5166,8 @@ mod tests {
         assert!(restored
             .take_attempt_dispatch(tracked.value(), committed)
             .unwrap_or_else(|error| panic!("rearmed wire: {error}"))
-            .message()
+            .into_parts()
+            .1
             .header
             .flags
             .is_potentially_retransmitted());
@@ -5281,7 +5318,11 @@ mod tests {
             .add_connection(CONNECTION_A, 100)
             .unwrap_or_else(|error| panic!("connection: {error}"));
         let tracked = table
-            .track(canonical_request(None), CONNECTION_A, token(1))
+            .track(
+                canonical_request(None),
+                CONNECTION_A,
+                token(0xC011_EC71_0DEC_ADED_F00D_CAFE_1234_5678),
+            )
             .unwrap_or_else(|error| panic!("track: {error}"));
         let completion = table
             .finish_exhausted(tracked.value())

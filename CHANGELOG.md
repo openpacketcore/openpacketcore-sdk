@@ -695,11 +695,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Destination-Host` with no valid alternate, retry exhaustion, and
   indeterminate completion. A versioned, explicitly sensitive snapshot/restore
   form (zeroizing in memory, redacted diagnostics, no plaintext backend)
-  retransmits pending records with T=1, rejects stale or malformed input, and
-  preserves a stable completion token and generation so consumers can add a
-  durable compare-and-set claim/ack; restored delivery is documented
-  at-least-once otherwise. Attempt limits, deadlines, peer selection, and
-  alternate routability remain caller policy (#349).
+  uses exact rollback-fenced `(epoch, revision)` checkpoints, requires
+  persist-before-dispatch for every single-take attempt, retransmits restored
+  pending records with T=1, and rejects stale, uncommitted, or malformed input.
+  A fixed-width `Ready`/`Claimed`/`Acknowledged` delivery record reconciles
+  replayable outcomes before network re-arm and blocks pending-only snapshot
+  advancement until acknowledgement. Exactly-once effects still require an
+  atomic or idempotent caller-owned sink; restored delivery is at-least-once
+  otherwise. Attempt limits, deadlines, peer selection, and alternate
+  routability remain caller policy (#349).
 - **Sealed monotonic outbound ESP counter authority — `opc-ipsec-xfrm`:** a
   namespace-bound Linux actor now binds one durable operation/fence to an
   opaque exact OUT policy plus SA, performs transient constant-time key
