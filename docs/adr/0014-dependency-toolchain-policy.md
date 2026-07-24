@@ -2,7 +2,8 @@
 
 ## Status
 
-Accepted (amended 2026-06-12: crypto-provider scope and JWT backend, point 9)
+Accepted (amended 2026-06-12: crypto-provider scope and JWT backend, point 9;
+amended 2026-07-24: DTLS provider admission, point 9)
 
 ## Date
 
@@ -75,6 +76,20 @@ implicit policy does not survive contact with routine maintenance:
    once the `rsa` crate ships a constant-time release (its in-progress
    `crypto-bigint` migration), dropping the `aws-lc-sys`/`cmake` build step
    and fully satisfying the pure-Rust ideal.
+
+   A third provider family is admitted for DTLS: `dimpl` with its pure-Rust
+   `rust-crypto` feature (RustCrypto AEAD/ECDSA/ECDH crates) implements the
+   RFC 6083 DTLS/SCTP record layer for `opc-diameter-transport`. The existing
+   stack cannot serve: rustls has no DTLS support, and FFI/OpenSSL-class
+   bindings are barred by point 8. `dimpl` is built with
+   `default-features = false`, so its default `aws-lc-rs`/`rcgen` features
+   and the `rsa` crate stay out of the tree — RUSTSEC-2023-0071 is not
+   introduced. `dimpl`'s `aws-lc-rs` provider feature remains selectable for
+   deployments that prefer it. Peer-certificate PKI validation for DTLS is
+   performed with the same rustls-webpki verification family as the TLS
+   side, not by the engine. Admission of a single workspace TLS/DTLS
+   provider authority remains follow-up work: `opc-crypto-provider`
+   admission today covers IKEv2/`opc-key` only.
 
 ## Consequences
 

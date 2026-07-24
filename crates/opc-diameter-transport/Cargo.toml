@@ -6,24 +6,29 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "Mutually authenticated Diameter-over-TLS/TCP transport for OpenPacketCore"
+description = "Mutually authenticated Diameter-over-TLS/TCP and DTLS/SCTP transports for OpenPacketCore"
 readme = "README.md"
 publish = false
 
 [dependencies]
 bytes = { workspace = true }
+dimpl = { workspace = true }
+opc-identity = { path = "../opc-identity", version = "0.2.0" }
 opc-proto-diameter = { path = "../opc-proto-diameter", version = "0.2.0", features = ["peer"] }
 opc-protocol = { path = "../opc-protocol", version = "0.2.0" }
 opc-tls = { path = "../opc-tls", version = "0.2.0" }
 opc-types = { path = "../opc-types", version = "0.2.0" }
 rand = { workspace = true }
 rustls-pki-types = { workspace = true }
+rustls-webpki = { workspace = true }
 thiserror = { workspace = true }
+time = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 tokio-rustls = { workspace = true }
+x509-parser = { workspace = true }
+zeroize = { workspace = true }
 
 [dev-dependencies]
-opc-identity = { path = "../opc-identity", version = "0.2.0" }
 rcgen = { workspace = true }
 time = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "test-util", "time"] }
