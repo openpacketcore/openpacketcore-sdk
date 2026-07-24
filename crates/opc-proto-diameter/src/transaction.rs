@@ -74,12 +74,19 @@ use zeroize::Zeroizing;
 use crate::base;
 use crate::{
     ApplicationId, CommandCode, CommandFlags, Header, Message, OwnedMessage, DIAMETER_HEADER_LEN,
-    MAX_U24,
+    DIAMETER_VERSION, MAX_U24,
 };
 
 const SNAPSHOT_MAGIC: u32 = 0x4450_5453; // "DPTS"
-const SNAPSHOT_VERSION: u16 = 1;
+const SNAPSHOT_VERSION: u16 = 2;
+const COMPLETION_DELIVERY_MAGIC: u32 = 0x4450_444c; // "DPDL"
+const COMPLETION_DELIVERY_VERSION: u16 = 1;
+const COMPLETION_DELIVERY_ENCODED_LEN: usize = 72;
 const MAX_SERIALIZED_COUNT: usize = u16::MAX as usize;
+const SNAPSHOT_HEADER_LEN: usize = 4 + 2 + 16 + 8 + 2;
+const SNAPSHOT_RECORD_FIXED_LEN: usize = 16 + 8 + 4 + 4 + 4 + 1 + 2 + 4;
+const SNAPSHOT_ATTEMPT_LEN: usize = 8 + 4 + 1 + 8 + 8 + 8;
+const MAX_SNAPSHOT_BYTES: usize = 1 << 30;
 const MICROS_SENTINEL_NONE: u64 = u64::MAX;
 
 /// Opaque identity of one transport connection lifetime.
@@ -113,9 +120,11 @@ impl fmt::Debug for DiameterConnectionToken {
 
 /// Caller-supplied durable identity of one pending transaction.
 ///
-/// The value must be unique across every transaction the consumer may track
-/// or restore into one table. It is redacted from diagnostics; use
-/// [`Self::get`] when storing it durably.
+/// The value must never be reused within one [`PendingSnapshotEpoch`] while
+/// any snapshot, completion-delivery record, replayable intent, or
+/// acknowledgement tombstone from that epoch may still exist. This stronger
+/// epoch-wide rule prevents retire/restart ABA during durable reconciliation.
+/// It is redacted from diagnostics; use [`Self::get`] when storing it durably.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct CompletionTokenValue(NonZeroU128);
 
@@ -176,6 +185,629 @@ impl fmt::Debug for CompletionToken {
             .finish()
     }
 }
+
+/// Caller-owned identity of one durable pending-table snapshot lineage.
+///
+/// Allocate one nonzero value for the lifetime of a logical table and retain
+/// it in rollback-resistant durable metadata. A restored snapshot from a
+/// different lineage is rejected before any record is installed. The value
+/// is redacted from diagnostics.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct PendingSnapshotEpoch(NonZeroU128);
+
+impl PendingSnapshotEpoch {
+    /// Wrap one caller-allocated nonzero snapshot-lineage identity.
+    #[must_use]
+    pub const fn new(value: NonZeroU128) -> Self {
+        Self(value)
+    }
+
+    /// Return the raw identity for durable storage.
+    #[must_use]
+    pub const fn get(self) -> u128 {
+        self.0.get()
+    }
+}
+
+impl fmt::Debug for PendingSnapshotEpoch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PendingSnapshotEpoch(<redacted>)")
+    }
+}
+
+/// Monotonic revision within one [`PendingSnapshotEpoch`].
+///
+/// Revisions are caller allocated and must strictly increase for every
+/// snapshot emitted by one live or restored table. Persist the highest
+/// committed revision outside the snapshot bytes in rollback-resistant
+/// metadata; pass that exact committed head back to
+/// [`PendingRequestTable::restore`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct PendingSnapshotRevision(NonZeroU64);
+
+impl PendingSnapshotRevision {
+    /// Wrap one nonzero monotonic snapshot revision.
+    #[must_use]
+    pub const fn new(value: NonZeroU64) -> Self {
+        Self(value)
+    }
+
+    /// Return the raw revision for durable storage.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+/// Durable identity and rollback fence of one pending-table snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PendingSnapshotCheckpoint {
+    epoch: PendingSnapshotEpoch,
+    revision: PendingSnapshotRevision,
+}
+
+impl PendingSnapshotCheckpoint {
+    /// Construct a checkpoint from its caller-owned lineage and revision.
+    #[must_use]
+    pub const fn new(epoch: PendingSnapshotEpoch, revision: PendingSnapshotRevision) -> Self {
+        Self { epoch, revision }
+    }
+
+    /// Return the snapshot lineage.
+    #[must_use]
+    pub const fn epoch(self) -> PendingSnapshotEpoch {
+        self.epoch
+    }
+
+    /// Return the monotonic revision within the lineage.
+    #[must_use]
+    pub const fn revision(self) -> PendingSnapshotRevision {
+        self.revision
+    }
+}
+
+/// Table-issued proof that the caller attested one emitted snapshot as the
+/// rollback-resistant committed head.
+///
+/// Obtain this only through [`PendingRequestTable::confirm_snapshot_committed`]
+/// after the snapshot bytes are fully written and synced and the protected
+/// head has been advanced with exact compare-and-swap. The type has no public
+/// constructor so ordinary send code cannot accidentally bypass the
+/// persist-before-dispatch boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CommittedPendingSnapshot {
+    checkpoint: PendingSnapshotCheckpoint,
+}
+
+impl CommittedPendingSnapshot {
+    /// Return the exact committed checkpoint represented by this proof.
+    #[must_use]
+    pub const fn checkpoint(self) -> PendingSnapshotCheckpoint {
+        self.checkpoint
+    }
+}
+
+/// Caller-owned identity of one completion-delivery claim.
+///
+/// Generate a fresh nonzero value for every claim or recovery claim. The
+/// value is redacted from diagnostics and is used only to fence stale workers
+/// in a caller-provided durable compare-and-swap store.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CompletionClaimValue(NonZeroU128);
+
+impl CompletionClaimValue {
+    /// Wrap one caller-allocated nonzero claim identity.
+    #[must_use]
+    pub const fn new(value: NonZeroU128) -> Self {
+        Self(value)
+    }
+
+    /// Return the raw identity for durable storage.
+    #[must_use]
+    pub const fn get(self) -> u128 {
+        self.0.get()
+    }
+}
+
+impl fmt::Debug for CompletionClaimValue {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CompletionClaimValue(<redacted>)")
+    }
+}
+
+/// Durable namespace and terminal identity of one completion delivery.
+///
+/// The epoch prevents completion-token reuse in another table lineage from
+/// colliding with an older durable acknowledgement.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CompletionDeliveryKey {
+    epoch: PendingSnapshotEpoch,
+    completion: CompletionToken,
+}
+
+impl CompletionDeliveryKey {
+    /// Return the snapshot lineage that namespaces the completion.
+    #[must_use]
+    pub const fn epoch(self) -> PendingSnapshotEpoch {
+        self.epoch
+    }
+
+    /// Return the stable terminal completion identity.
+    #[must_use]
+    pub const fn completion(self) -> CompletionToken {
+        self.completion
+    }
+}
+
+impl fmt::Debug for CompletionDeliveryKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CompletionDeliveryKey")
+            .field("epoch", &self.epoch)
+            .field("completion", &self.completion)
+            .finish()
+    }
+}
+
+/// Fencing proof returned when a completion-delivery claim is acquired.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CompletionDeliveryClaim {
+    key: CompletionDeliveryKey,
+    generation: NonZeroU64,
+    value: CompletionClaimValue,
+}
+
+impl CompletionDeliveryClaim {
+    /// Return the durable delivery key protected by this claim.
+    #[must_use]
+    pub const fn key(self) -> CompletionDeliveryKey {
+        self.key
+    }
+
+    /// Return the strictly increasing claim generation.
+    #[must_use]
+    pub const fn generation(self) -> NonZeroU64 {
+        self.generation
+    }
+
+    /// Return the caller-owned claim operation identity.
+    #[must_use]
+    pub const fn value(self) -> CompletionClaimValue {
+        self.value
+    }
+}
+
+impl fmt::Debug for CompletionDeliveryClaim {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CompletionDeliveryClaim")
+            .field("key", &self.key)
+            .field("generation", &self.generation)
+            .field("value", &self.value)
+            .finish()
+    }
+}
+
+/// Durable state of one terminal-completion delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CompletionDeliveryState {
+    /// No worker currently owns delivery.
+    Ready,
+    /// A worker owns delivery but has not durably acknowledged the side effect.
+    Claimed,
+    /// The application side effect and acknowledgement are durably committed.
+    Acknowledged,
+}
+
+/// Compare-and-swap value for crash-safe terminal-completion delivery.
+///
+/// Persist this record together with an encrypted replayable completion
+/// outcome/effect intent in a durable store keyed by
+/// [`CompletionDeliveryKey`]. Apply every transition with compare-and-swap
+/// from the exact old encoded value to the returned new value. A persisted
+/// [`CompletionDeliveryState::Claimed`] state is unfinished work, not proof
+/// that the side effect ran: after proving or fencing the old worker dead,
+/// recover it with [`Self::reclaim`] and retry. The effect sink must honor the
+/// monotonically increasing claim generation when stale workers can still
+/// execute.
+///
+/// Acknowledge only after the side effect is durable. To close the unavoidable
+/// crash-after-effect / before-ack duplicate window, either commit the side
+/// effect and acknowledgement in one durable transaction or make the side
+/// effect idempotent using [`CompletionDeliveryKey`]. Until acknowledgement,
+/// keep the last committed pending snapshot authoritative; only afterward
+/// publish a newer checkpoint that omits the request.
+///
+/// This record contains no answer bytes or subscriber data. It models the
+/// external durable protocol; it is not itself a persistence backend.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CompletionDeliveryRecord {
+    key: CompletionDeliveryKey,
+    claim_generation: u64,
+    claim: Option<CompletionClaimValue>,
+    acknowledged: bool,
+}
+
+impl CompletionDeliveryRecord {
+    /// Fixed encoded length of one version-1 delivery record.
+    pub const ENCODED_LEN: usize = COMPLETION_DELIVERY_ENCODED_LEN;
+
+    /// Create the initial ready record for a terminal completion in `epoch`.
+    pub fn new(
+        epoch: PendingSnapshotEpoch,
+        completion: CompletionToken,
+    ) -> Result<Self, CompletionDeliveryError> {
+        if completion.generation() != 1 {
+            return Err(CompletionDeliveryError::CompletionNotTerminal);
+        }
+        Ok(Self {
+            key: CompletionDeliveryKey { epoch, completion },
+            claim_generation: 0,
+            claim: None,
+            acknowledged: false,
+        })
+    }
+
+    /// Return the durable epoch-namespaced delivery key.
+    #[must_use]
+    pub const fn key(self) -> CompletionDeliveryKey {
+        self.key
+    }
+
+    /// Return the highest claim generation allocated by this record.
+    #[must_use]
+    pub const fn claim_generation(self) -> u64 {
+        self.claim_generation
+    }
+
+    /// Return the current durable delivery state.
+    #[must_use]
+    pub const fn state(self) -> CompletionDeliveryState {
+        if self.acknowledged {
+            CompletionDeliveryState::Acknowledged
+        } else if self.claim.is_some() {
+            CompletionDeliveryState::Claimed
+        } else {
+            CompletionDeliveryState::Ready
+        }
+    }
+
+    /// Acquire a ready record with a fresh caller-owned claim identity.
+    ///
+    /// Persist the returned record with compare-and-swap before applying any
+    /// side effect. A concurrent claimant that loses the compare-and-swap must
+    /// discard its claim and reload the durable record.
+    pub fn claim(
+        self,
+        value: CompletionClaimValue,
+    ) -> Result<(Self, CompletionDeliveryClaim), CompletionDeliveryError> {
+        match self.state() {
+            CompletionDeliveryState::Ready => {
+                let generation = self.next_claim_generation()?;
+                let claim = CompletionDeliveryClaim {
+                    key: self.key,
+                    generation,
+                    value,
+                };
+                Ok((
+                    Self {
+                        key: self.key,
+                        claim_generation: generation.get(),
+                        claim: Some(value),
+                        acknowledged: false,
+                    },
+                    claim,
+                ))
+            }
+            CompletionDeliveryState::Claimed => Err(CompletionDeliveryError::AlreadyClaimed),
+            CompletionDeliveryState::Acknowledged => {
+                Err(CompletionDeliveryError::AlreadyAcknowledged)
+            }
+        }
+    }
+
+    /// Replace a persisted unfinished claim after its previous worker is
+    /// fenced.
+    ///
+    /// Caller policy decides when takeover is safe. Persist the returned state
+    /// with compare-and-swap from this exact record before retrying the side
+    /// effect; an acknowledgement from the stale claim will then fail closed.
+    pub fn reclaim(
+        self,
+        value: CompletionClaimValue,
+    ) -> Result<(Self, CompletionDeliveryClaim), CompletionDeliveryError> {
+        match self.state() {
+            CompletionDeliveryState::Claimed => {
+                if self.claim == Some(value) {
+                    return Err(CompletionDeliveryError::DuplicateClaim);
+                }
+                let generation = self.next_claim_generation()?;
+                let claim = CompletionDeliveryClaim {
+                    key: self.key,
+                    generation,
+                    value,
+                };
+                Ok((
+                    Self {
+                        key: self.key,
+                        claim_generation: generation.get(),
+                        claim: Some(value),
+                        acknowledged: false,
+                    },
+                    claim,
+                ))
+            }
+            CompletionDeliveryState::Ready => Err(CompletionDeliveryError::NotClaimed),
+            CompletionDeliveryState::Acknowledged => {
+                Err(CompletionDeliveryError::AlreadyAcknowledged)
+            }
+        }
+    }
+
+    /// Return an unfinished claim to the ready state after proving no side
+    /// effect was committed.
+    pub fn release(self, claim: CompletionDeliveryClaim) -> Result<Self, CompletionDeliveryError> {
+        self.verify_claim(claim)?;
+        Ok(Self {
+            key: self.key,
+            claim_generation: self.claim_generation,
+            claim: None,
+            acknowledged: false,
+        })
+    }
+
+    /// Mark delivery acknowledged after the side effect is durable.
+    ///
+    /// Persist this transition with compare-and-swap. If the side effect
+    /// cannot share the transaction, it must be idempotent by completion
+    /// token so a crash before this acknowledgement remains safely retryable.
+    pub fn acknowledge(
+        self,
+        claim: CompletionDeliveryClaim,
+    ) -> Result<Self, CompletionDeliveryError> {
+        self.verify_claim(claim)?;
+        Ok(Self {
+            key: self.key,
+            claim_generation: self.claim_generation,
+            claim: None,
+            acknowledged: true,
+        })
+    }
+
+    /// Encode this record into its strict, fixed-width version-1 form.
+    ///
+    /// The bytes contain only redacted identifiers and state, not the
+    /// replayable completion outcome. Persist that outcome atomically beside
+    /// this record.
+    #[must_use]
+    pub fn encode(self) -> CompletionDeliveryBytes {
+        let mut encoded = [0_u8; COMPLETION_DELIVERY_ENCODED_LEN];
+        encoded[0..4].copy_from_slice(&COMPLETION_DELIVERY_MAGIC.to_be_bytes());
+        encoded[4..6].copy_from_slice(&COMPLETION_DELIVERY_VERSION.to_be_bytes());
+        encoded[6] = match self.state() {
+            CompletionDeliveryState::Ready => 0,
+            CompletionDeliveryState::Claimed => 1,
+            CompletionDeliveryState::Acknowledged => 2,
+        };
+        encoded[7] = 0;
+        encoded[8..24].copy_from_slice(&self.key.epoch.get().to_be_bytes());
+        encoded[24..40].copy_from_slice(&self.key.completion.value().get().to_be_bytes());
+        encoded[40..48].copy_from_slice(&self.key.completion.generation().to_be_bytes());
+        encoded[48..56].copy_from_slice(&self.claim_generation.to_be_bytes());
+        if let Some(claim) = self.claim {
+            encoded[56..72].copy_from_slice(&claim.get().to_be_bytes());
+        }
+        CompletionDeliveryBytes { encoded }
+    }
+
+    /// Decode one exact version-1 record, rejecting truncation, trailing
+    /// bytes, unsupported versions, and impossible state combinations.
+    pub fn decode(bytes: &[u8]) -> Result<Self, CompletionDeliveryError> {
+        if bytes.len() != COMPLETION_DELIVERY_ENCODED_LEN {
+            return Err(CompletionDeliveryError::MalformedRecord);
+        }
+        let magic = u32::from_be_bytes(
+            bytes[0..4]
+                .try_into()
+                .map_err(|_| CompletionDeliveryError::MalformedRecord)?,
+        );
+        if magic != COMPLETION_DELIVERY_MAGIC {
+            return Err(CompletionDeliveryError::MalformedRecord);
+        }
+        let version = u16::from_be_bytes(
+            bytes[4..6]
+                .try_into()
+                .map_err(|_| CompletionDeliveryError::MalformedRecord)?,
+        );
+        if version != COMPLETION_DELIVERY_VERSION {
+            return Err(CompletionDeliveryError::UnsupportedVersion);
+        }
+        if bytes[7] != 0 {
+            return Err(CompletionDeliveryError::InvalidState);
+        }
+        let epoch_bits = u128::from_be_bytes(
+            bytes[8..24]
+                .try_into()
+                .map_err(|_| CompletionDeliveryError::MalformedRecord)?,
+        );
+        let token_bits = u128::from_be_bytes(
+            bytes[24..40]
+                .try_into()
+                .map_err(|_| CompletionDeliveryError::MalformedRecord)?,
+        );
+        let completion_generation = u64::from_be_bytes(
+            bytes[40..48]
+                .try_into()
+                .map_err(|_| CompletionDeliveryError::MalformedRecord)?,
+        );
+        let claim_generation = u64::from_be_bytes(
+            bytes[48..56]
+                .try_into()
+                .map_err(|_| CompletionDeliveryError::MalformedRecord)?,
+        );
+        let claim_bits = u128::from_be_bytes(
+            bytes[56..72]
+                .try_into()
+                .map_err(|_| CompletionDeliveryError::MalformedRecord)?,
+        );
+        let epoch = PendingSnapshotEpoch::new(
+            NonZeroU128::new(epoch_bits).ok_or(CompletionDeliveryError::InvalidState)?,
+        );
+        let token_value = CompletionTokenValue::new(
+            NonZeroU128::new(token_bits).ok_or(CompletionDeliveryError::InvalidState)?,
+        );
+        if completion_generation != 1 {
+            return Err(CompletionDeliveryError::InvalidState);
+        }
+        let completion = CompletionToken {
+            value: token_value,
+            generation: completion_generation,
+        };
+        let (claim, acknowledged) = match bytes[6] {
+            0 if claim_bits == 0 => (None, false),
+            1 if claim_generation > 0 => (
+                Some(CompletionClaimValue::new(
+                    NonZeroU128::new(claim_bits).ok_or(CompletionDeliveryError::InvalidState)?,
+                )),
+                false,
+            ),
+            2 if claim_generation > 0 && claim_bits == 0 => (None, true),
+            _ => return Err(CompletionDeliveryError::InvalidState),
+        };
+        Ok(Self {
+            key: CompletionDeliveryKey { epoch, completion },
+            claim_generation,
+            claim,
+            acknowledged,
+        })
+    }
+
+    fn verify_claim(self, claim: CompletionDeliveryClaim) -> Result<(), CompletionDeliveryError> {
+        match self.state() {
+            CompletionDeliveryState::Ready => Err(CompletionDeliveryError::NotClaimed),
+            CompletionDeliveryState::Acknowledged => {
+                Err(CompletionDeliveryError::AlreadyAcknowledged)
+            }
+            CompletionDeliveryState::Claimed
+                if claim.key != self.key
+                    || claim.generation.get() != self.claim_generation
+                    || self.claim != Some(claim.value) =>
+            {
+                Err(CompletionDeliveryError::StaleClaim)
+            }
+            CompletionDeliveryState::Claimed => Ok(()),
+        }
+    }
+
+    fn next_claim_generation(self) -> Result<NonZeroU64, CompletionDeliveryError> {
+        let next = self
+            .claim_generation
+            .checked_add(1)
+            .and_then(NonZeroU64::new)
+            .ok_or(CompletionDeliveryError::ClaimGenerationExhausted)?;
+        Ok(next)
+    }
+}
+
+impl fmt::Debug for CompletionDeliveryRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CompletionDeliveryRecord")
+            .field("key", &self.key)
+            .field("state", &self.state())
+            .field("claim_generation", &self.claim_generation)
+            .field("claim", &self.claim.map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+/// Fixed-width encoded durable completion-delivery record.
+pub struct CompletionDeliveryBytes {
+    encoded: [u8; COMPLETION_DELIVERY_ENCODED_LEN],
+}
+
+impl CompletionDeliveryBytes {
+    /// Borrow the exact versioned bytes for durable compare-and-swap storage.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8] {
+        &self.encoded
+    }
+}
+
+impl fmt::Debug for CompletionDeliveryBytes {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CompletionDeliveryBytes")
+            .field("version", &COMPLETION_DELIVERY_VERSION)
+            .field("len", &self.encoded.len())
+            .field("bytes", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Stable, redaction-safe completion-delivery transition failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionDeliveryError {
+    /// A pending token (`generation == 0`) cannot be delivered.
+    CompletionNotTerminal,
+    /// The record already has an unfinished claim.
+    AlreadyClaimed,
+    /// Recovery attempted to reuse the current claim identity.
+    DuplicateClaim,
+    /// The record has no claim to release or acknowledge.
+    NotClaimed,
+    /// The supplied claim belongs to an older owner or another completion.
+    StaleClaim,
+    /// Delivery was already durably acknowledged.
+    AlreadyAcknowledged,
+    /// The monotonic claim generation reached `u64::MAX`.
+    ClaimGenerationExhausted,
+    /// The encoded record is truncated, has trailing bytes, or has bad magic.
+    MalformedRecord,
+    /// The encoded record version is unsupported.
+    UnsupportedVersion,
+    /// The encoded record contains an impossible state combination.
+    InvalidState,
+    /// Reconciliation requires an acknowledged record.
+    NotAcknowledged,
+    /// The delivery record belongs to another snapshot epoch.
+    EpochMismatch,
+    /// The table retains no transaction for this completion.
+    UnknownCompletion,
+    /// The retained transaction has not reached terminal completion.
+    CompletionStillPending,
+}
+
+impl CompletionDeliveryError {
+    /// Stable machine-readable error code.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CompletionNotTerminal => "diameter_completion_not_terminal",
+            Self::AlreadyClaimed => "diameter_completion_already_claimed",
+            Self::DuplicateClaim => "diameter_completion_duplicate_claim",
+            Self::NotClaimed => "diameter_completion_not_claimed",
+            Self::StaleClaim => "diameter_completion_stale_claim",
+            Self::AlreadyAcknowledged => "diameter_completion_already_acknowledged",
+            Self::ClaimGenerationExhausted => "diameter_completion_claim_generation_exhausted",
+            Self::MalformedRecord => "diameter_completion_record_malformed",
+            Self::UnsupportedVersion => "diameter_completion_record_unsupported_version",
+            Self::InvalidState => "diameter_completion_record_invalid_state",
+            Self::NotAcknowledged => "diameter_completion_not_acknowledged",
+            Self::EpochMismatch => "diameter_completion_epoch_mismatch",
+            Self::UnknownCompletion => "diameter_completion_unknown",
+            Self::CompletionStillPending => "diameter_completion_still_pending",
+        }
+    }
+}
+
+impl fmt::Display for CompletionDeliveryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl std::error::Error for CompletionDeliveryError {}
 
 /// Injectable monotonic clock for attempt timing evidence.
 ///
@@ -243,6 +875,8 @@ pub struct PendingRequestTableConfig {
     pub max_connections: usize,
     /// Maximum canonical request size accepted by [`PendingRequestTable::track`].
     pub max_message_len: usize,
+    /// Maximum aggregate encoded pending-table snapshot size.
+    pub max_snapshot_bytes: usize,
 }
 
 impl Default for PendingRequestTableConfig {
@@ -253,6 +887,7 @@ impl Default for PendingRequestTableConfig {
             max_attempts_per_transaction: 8,
             max_connections: 64,
             max_message_len: 8192,
+            max_snapshot_bytes: 8 * 1024 * 1024,
         }
     }
 }
@@ -280,6 +915,11 @@ impl PendingRequestTableConfig {
         if self.max_message_len < DIAMETER_HEADER_LEN || self.max_message_len > MAX_U24 as usize {
             return Err(PendingRequestConfigError::MessageBoundOutOfRange);
         }
+        if self.max_snapshot_bytes < SNAPSHOT_HEADER_LEN
+            || self.max_snapshot_bytes > MAX_SNAPSHOT_BYTES
+        {
+            return Err(PendingRequestConfigError::SnapshotBoundOutOfRange);
+        }
         Ok(())
     }
 }
@@ -297,6 +937,9 @@ pub enum PendingRequestConfigError {
     ConnectionBoundOutOfRange,
     /// The message bound cannot hold a Diameter header or exceeds 24-bit length.
     MessageBoundOutOfRange,
+    /// The aggregate snapshot bound is too small for its header or exceeds the
+    /// SDK hard cap.
+    SnapshotBoundOutOfRange,
 }
 
 impl PendingRequestConfigError {
@@ -309,6 +952,7 @@ impl PendingRequestConfigError {
             Self::AttemptBoundOutOfRange => "diameter_pending_config_attempt_bound",
             Self::ConnectionBoundOutOfRange => "diameter_pending_config_connection_bound",
             Self::MessageBoundOutOfRange => "diameter_pending_config_message_bound",
+            Self::SnapshotBoundOutOfRange => "diameter_pending_config_snapshot_bound",
         }
     }
 }
@@ -342,11 +986,64 @@ impl AttemptId {
     }
 }
 
-/// Terminal write/answer disposition of one attempt.
+/// Single-use, connection-bound wire dispatch for one prepared attempt.
+///
+/// This value is returned only after the table consumes a prepared attempt
+/// behind a committed-snapshot fence. Its `Debug` representation redacts the
+/// complete Diameter message.
+pub struct AttemptDispatch {
+    attempt: AttemptId,
+    message: OwnedMessage,
+}
+
+impl AttemptDispatch {
+    /// Return the exact attempt identity, including its connection lifetime.
+    #[must_use]
+    pub const fn attempt(&self) -> AttemptId {
+        self.attempt
+    }
+
+    /// Borrow the complete wire message for transport encoding.
+    #[must_use]
+    pub const fn message(&self) -> &OwnedMessage {
+        &self.message
+    }
+
+    /// Consume the receipt and return its attempt identity and wire message.
+    #[must_use]
+    pub fn into_parts(self) -> (AttemptId, OwnedMessage) {
+        (self.attempt, self.message)
+    }
+
+    /// Consume the receipt and return the complete wire message.
+    #[must_use]
+    pub fn into_message(self) -> OwnedMessage {
+        self.message
+    }
+}
+
+impl fmt::Debug for AttemptDispatch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AttemptDispatch")
+            .field("attempt", &self.attempt)
+            .field("message", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Write/answer disposition of one attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AttemptDisposition {
-    /// The attempt is awaiting its write outcome or answer.
+    /// The attempt exists but has not been dispatched. It becomes sendable
+    /// only after a snapshot containing it is committed.
+    Prepared,
+    /// The single-use dispatch was taken and the write outcome is not yet
+    /// known.
     InFlight,
+    /// The complete request was written successfully and the attempt is
+    /// awaiting an answer.
+    WrittenAwaitingAnswer,
     /// The transport proved the request was never written.
     FailedBeforeWrite,
     /// The write outcome is unknown or partial; the peer may have received it.
@@ -363,7 +1060,9 @@ impl AttemptDisposition {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Prepared => "prepared",
             Self::InFlight => "in_flight",
+            Self::WrittenAwaitingAnswer => "written_awaiting_answer",
             Self::FailedBeforeWrite => "failed_before_write",
             Self::FailedUncertainWrite => "failed_uncertain_write",
             Self::TransportLostAfterWrite => "transport_lost_after_write",
@@ -371,10 +1070,14 @@ impl AttemptDisposition {
         }
     }
 
-    /// Return whether this attempt can still produce an answer.
+    /// Return whether this attempt is still awaiting its full-write outcome.
     #[must_use]
     pub const fn is_in_flight(self) -> bool {
         matches!(self, Self::InFlight)
+    }
+
+    const fn can_receive_answer(self) -> bool {
+        !matches!(self, Self::Prepared | Self::FailedBeforeWrite)
     }
 }
 
@@ -420,7 +1123,9 @@ pub struct AttemptEvidence {
     retransmission: bool,
     disposition: AttemptDisposition,
     started_at: Duration,
+    written_at: Option<Duration>,
     ended_at: Option<Duration>,
+    snapshotted_at: Option<PendingSnapshotRevision>,
 }
 
 impl AttemptEvidence {
@@ -470,10 +1175,28 @@ impl AttemptEvidence {
         self.started_at
     }
 
+    /// Return when the transport reported a complete successful write.
+    ///
+    /// An answer itself proves the complete request left the origin, so this
+    /// is also populated when an answer wins a race with the write callback.
+    #[must_use]
+    pub const fn written_at(&self) -> Option<Duration> {
+        self.written_at
+    }
+
     /// Return the table-clock timestamp when this attempt terminated.
     #[must_use]
     pub const fn ended_at(&self) -> Option<Duration> {
         self.ended_at
+    }
+
+    /// Return the first emitted snapshot revision that contains this attempt.
+    ///
+    /// Emission alone is not durability. The attempt becomes dispatchable only
+    /// when a current [`CommittedPendingSnapshot`] covers this revision.
+    #[must_use]
+    pub const fn snapshotted_at(&self) -> Option<PendingSnapshotRevision> {
+        self.snapshotted_at
     }
 }
 
@@ -487,7 +1210,9 @@ impl fmt::Debug for AttemptEvidence {
             .field("retransmission", &self.retransmission)
             .field("disposition", &self.disposition)
             .field("started_at", &self.started_at)
+            .field("written_at", &self.written_at)
             .field("ended_at", &self.ended_at)
+            .field("snapshotted_at", &self.snapshotted_at)
             .finish()
     }
 }
@@ -701,10 +1426,25 @@ pub struct UnmatchedAnswerEvidence {
 pub enum AnswerRejectionReason {
     /// The message carries the request (R) bit and is not an answer.
     NotAnAnswer,
+    /// The answer does not use Diameter version 1.
+    UnsupportedVersion,
+    /// The declared length does not exactly match the owned AVP region or
+    /// exceeds the configured message bound.
+    InvalidLength,
+    /// Reserved command bits are set or the answer illegally carries T=1.
+    InvalidFlags,
+    /// Another fixed-header field is structurally invalid.
+    MalformedHeader,
+    /// RFC 6733 §6.2 requires the answer P bit to equal the request P bit.
+    ProxiableMismatch,
+    /// The answer AVP framing is malformed.
+    MalformedAvps,
     /// The answer's End-to-End identifier differs from the request's.
     EndToEndMismatch,
     /// The answer's command code or application differs from the request's.
     CommandMismatch,
+    /// The correlated attempt was proven not to have written any request.
+    AttemptNotAnswerEligible,
 }
 
 impl AnswerRejectionReason {
@@ -713,8 +1453,15 @@ impl AnswerRejectionReason {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::NotAnAnswer => "not_an_answer",
+            Self::UnsupportedVersion => "unsupported_version",
+            Self::InvalidLength => "invalid_length",
+            Self::InvalidFlags => "invalid_flags",
+            Self::MalformedHeader => "malformed_header",
+            Self::ProxiableMismatch => "proxiable_mismatch",
+            Self::MalformedAvps => "malformed_avps",
             Self::EndToEndMismatch => "end_to_end_mismatch",
             Self::CommandMismatch => "command_mismatch",
+            Self::AttemptNotAnswerEligible => "attempt_not_answer_eligible",
         }
     }
 }
@@ -781,6 +1528,8 @@ pub enum TrackError {
     /// The request header or AVP region is malformed, or the message exceeds
     /// the configured size bound.
     MalformedRequest,
+    /// The request does not use Diameter version 1.
+    UnsupportedVersion,
     /// The request already carries the T (potentially retransmitted) bit.
     /// [`PendingRequestTable::track`] starts a new transaction; a T-set
     /// request is by definition a retransmission and must be recovered
@@ -805,6 +1554,7 @@ impl TrackError {
             Self::AttemptIdentifierConflict => "diameter_pending_track_attempt_conflict",
             Self::NotARequest => "diameter_pending_track_not_a_request",
             Self::MalformedRequest => "diameter_pending_track_malformed_request",
+            Self::UnsupportedVersion => "diameter_pending_track_unsupported_version",
             Self::AlreadyRetransmitted => "diameter_pending_track_already_retransmitted",
             Self::OriginHostInvalid => "diameter_pending_track_origin_host_invalid",
         }
@@ -927,10 +1677,21 @@ pub enum TransactionAccessError {
     UnknownAttempt,
     /// The attempt already terminated and cannot change disposition.
     AttemptNotInFlight,
+    /// The requested write-state transition contradicts already recorded
+    /// evidence.
+    InvalidAttemptTransition,
     /// The transaction has no in-flight attempt to produce wire bytes for.
     /// Restored attempts recovered by a snapshot never count as live; re-arm
     /// the record with [`PendingRequestTable::failover`] first.
     NoLiveAttempt,
+    /// The supplied committed-snapshot proof is not the table's current
+    /// committed head.
+    SnapshotProofMismatch,
+    /// The prepared attempt was not included in the supplied committed
+    /// snapshot, so dispatch could be lost or repeated across a crash.
+    AttemptNotDurablySnapshotted,
+    /// The attempt's connection lifetime is absent or already closed.
+    ConnectionNotOpen,
 }
 
 impl TransactionAccessError {
@@ -942,7 +1703,13 @@ impl TransactionAccessError {
             Self::NotPending => "diameter_pending_access_not_pending",
             Self::UnknownAttempt => "diameter_pending_access_unknown_attempt",
             Self::AttemptNotInFlight => "diameter_pending_access_attempt_not_in_flight",
+            Self::InvalidAttemptTransition => "diameter_pending_access_invalid_attempt_transition",
             Self::NoLiveAttempt => "diameter_pending_access_no_live_attempt",
+            Self::SnapshotProofMismatch => "diameter_pending_access_snapshot_proof_mismatch",
+            Self::AttemptNotDurablySnapshotted => {
+                "diameter_pending_access_attempt_not_durably_snapshotted"
+            }
+            Self::ConnectionNotOpen => "diameter_pending_access_connection_not_open",
         }
     }
 }
@@ -954,6 +1721,81 @@ impl fmt::Display for TransactionAccessError {
 }
 
 impl std::error::Error for TransactionAccessError {}
+
+/// Stable, redaction-safe failure to create a rollback-fenced snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotCreateError {
+    /// A live or restored table is already bound to another snapshot lineage.
+    EpochMismatch,
+    /// The supplied revision does not strictly advance the table high-water.
+    RevisionNotAdvanced,
+    /// The encoded snapshot would exceed the configured aggregate bound.
+    SizeLimitExceeded,
+    /// The bounded scratch allocation could not be reserved.
+    AllocationFailed,
+    /// A terminal completion has not been durably acknowledged, so publishing
+    /// a pending-only snapshot would lose its replay source.
+    UnacknowledgedCompletion,
+    /// A previously emitted snapshot has not been confirmed or explicitly
+    /// abandoned, so another candidate cannot be emitted safely.
+    UncommittedSnapshotOutstanding,
+}
+
+impl SnapshotCreateError {
+    /// Stable machine-readable error code.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::EpochMismatch => "diameter_pending_snapshot_epoch_mismatch",
+            Self::RevisionNotAdvanced => "diameter_pending_snapshot_revision_not_advanced",
+            Self::SizeLimitExceeded => "diameter_pending_snapshot_size_limit",
+            Self::AllocationFailed => "diameter_pending_snapshot_allocation_failed",
+            Self::UnacknowledgedCompletion => "diameter_pending_snapshot_unacknowledged_completion",
+            Self::UncommittedSnapshotOutstanding => {
+                "diameter_pending_snapshot_uncommitted_outstanding"
+            }
+        }
+    }
+}
+
+impl fmt::Display for SnapshotCreateError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl std::error::Error for SnapshotCreateError {}
+
+/// Stable, redaction-safe failure to attest an emitted snapshot as committed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotCommitError {
+    /// No snapshot has been emitted by this table.
+    NoEmittedSnapshot,
+    /// The supplied checkpoint is not the table's latest emitted snapshot.
+    CheckpointMismatch,
+    /// The supplied checkpoint would move the committed head backward.
+    CommittedHeadRegression,
+}
+
+impl SnapshotCommitError {
+    /// Stable machine-readable error code.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NoEmittedSnapshot => "diameter_pending_snapshot_no_emitted_snapshot",
+            Self::CheckpointMismatch => "diameter_pending_snapshot_commit_checkpoint_mismatch",
+            Self::CommittedHeadRegression => "diameter_pending_snapshot_commit_regression",
+        }
+    }
+}
+
+impl fmt::Display for SnapshotCommitError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl std::error::Error for SnapshotCommitError {}
 
 /// Stable, redaction-safe snapshot restore failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -967,6 +1809,12 @@ pub enum SnapshotRestoreError {
     LimitExceeded,
     /// A record fails request validation or internal consistency checks.
     InvalidRecord,
+    /// The encoded snapshot belongs to another caller-owned lineage.
+    EpochMismatch,
+    /// The encoded revision is older than the caller's durable high-water.
+    Stale,
+    /// The encoded revision is newer than the caller's committed checkpoint.
+    Uncommitted,
 }
 
 impl SnapshotRestoreError {
@@ -978,6 +1826,9 @@ impl SnapshotRestoreError {
             Self::UnsupportedVersion => "diameter_pending_snapshot_unsupported_version",
             Self::LimitExceeded => "diameter_pending_snapshot_limit_exceeded",
             Self::InvalidRecord => "diameter_pending_snapshot_invalid_record",
+            Self::EpochMismatch => "diameter_pending_snapshot_epoch_mismatch",
+            Self::Stale => "diameter_pending_snapshot_stale",
+            Self::Uncommitted => "diameter_pending_snapshot_uncommitted",
         }
     }
 }
@@ -1001,12 +1852,19 @@ impl std::error::Error for SnapshotRestoreError {}
 /// Snapshots capture *pending* records only. Completed records are live-only
 /// late-answer evidence and are never serialized.
 pub struct PendingTableSnapshot {
+    checkpoint: PendingSnapshotCheckpoint,
     encoded: Zeroizing<Vec<u8>>,
 }
 
 impl PendingTableSnapshot {
     /// The snapshot format version emitted by this build.
     pub const VERSION: u16 = SNAPSHOT_VERSION;
+
+    /// Return the lineage and monotonic revision encoded in this snapshot.
+    #[must_use]
+    pub const fn checkpoint(&self) -> PendingSnapshotCheckpoint {
+        self.checkpoint
+    }
 
     /// Borrow the encoded snapshot bytes for encrypted storage.
     #[must_use]
@@ -1032,6 +1890,7 @@ impl fmt::Debug for PendingTableSnapshot {
         formatter
             .debug_struct("PendingTableSnapshot")
             .field("version", &Self::VERSION)
+            .field("checkpoint", &self.checkpoint)
             .field("len", &self.encoded.len())
             .field("bytes", &"<redacted>")
             .finish()
@@ -1067,6 +1926,7 @@ struct TransactionRecord {
     /// post-restore re-arm.
     restored_baseline: usize,
     state: RecordState,
+    completion_delivery_acknowledged: bool,
     late_answer_count: u32,
     rejected_answer_count: u32,
 }
@@ -1235,15 +2095,21 @@ type AttemptKey = (u64, u32);
 pub struct PendingRequestTable {
     config: PendingRequestTableConfig,
     clock: Arc<dyn PendingRequestClock>,
+    snapshot_epoch: PendingSnapshotEpoch,
     records: HashMap<CompletionTokenValue, TransactionRecord>,
+    suppressed_deliveries: HashMap<CompletionTokenValue, CompletionToken>,
     attempt_index: HashMap<AttemptKey, CompletionTokenValue>,
     pending_end_to_end: HashMap<u32, CompletionTokenValue>,
     connections: HashMap<u64, ConnectionEntry>,
     pending_count: usize,
+    unacknowledged_completion_count: usize,
     completed_count: usize,
     completion_sequence: u64,
     evicted_completions: u64,
     unmatched_answers: u64,
+    snapshot_checkpoint: Option<PendingSnapshotCheckpoint>,
+    uncommitted_snapshot_checkpoint: Option<PendingSnapshotCheckpoint>,
+    committed_snapshot_checkpoint: Option<PendingSnapshotCheckpoint>,
 }
 
 impl fmt::Debug for PendingRequestTable {
@@ -1251,11 +2117,29 @@ impl fmt::Debug for PendingRequestTable {
         formatter
             .debug_struct("PendingRequestTable")
             .field("config", &self.config)
+            .field("snapshot_epoch", &self.snapshot_epoch)
             .field("pending_count", &self.pending_count)
+            .field(
+                "unacknowledged_completion_count",
+                &self.unacknowledged_completion_count,
+            )
+            .field(
+                "suppressed_delivery_count",
+                &self.suppressed_deliveries.len(),
+            )
             .field("retained_completed_count", &self.completed_count)
             .field("connection_count", &self.connections.len())
             .field("evicted_completions", &self.evicted_completions)
             .field("unmatched_answers", &self.unmatched_answers)
+            .field("snapshot_checkpoint", &self.snapshot_checkpoint)
+            .field(
+                "uncommitted_snapshot_checkpoint",
+                &self.uncommitted_snapshot_checkpoint,
+            )
+            .field(
+                "committed_snapshot_checkpoint",
+                &self.committed_snapshot_checkpoint,
+            )
             .finish()
     }
 }
@@ -1265,21 +2149,103 @@ impl PendingRequestTable {
     pub fn new(
         config: PendingRequestTableConfig,
         clock: Arc<dyn PendingRequestClock>,
+        snapshot_epoch: PendingSnapshotEpoch,
     ) -> Result<Self, PendingRequestConfigError> {
         config.validate()?;
         Ok(Self {
             config,
             clock,
+            snapshot_epoch,
             records: HashMap::new(),
+            suppressed_deliveries: HashMap::new(),
             attempt_index: HashMap::new(),
             pending_end_to_end: HashMap::new(),
             connections: HashMap::new(),
             pending_count: 0,
+            unacknowledged_completion_count: 0,
             completed_count: 0,
             completion_sequence: 0,
             evicted_completions: 0,
             unmatched_answers: 0,
+            snapshot_checkpoint: None,
+            uncommitted_snapshot_checkpoint: None,
+            committed_snapshot_checkpoint: None,
         })
+    }
+
+    /// Return the durable lineage that namespaces snapshots and completion
+    /// delivery keys for this table.
+    #[must_use]
+    pub const fn snapshot_epoch(&self) -> PendingSnapshotEpoch {
+        self.snapshot_epoch
+    }
+
+    /// Return the latest snapshot emitted by this table, whether or not the
+    /// caller has committed it externally.
+    #[must_use]
+    pub const fn latest_emitted_snapshot(&self) -> Option<PendingSnapshotCheckpoint> {
+        self.snapshot_checkpoint
+    }
+
+    /// Return a proof for the current caller-attested committed head.
+    #[must_use]
+    pub const fn committed_snapshot(&self) -> Option<CommittedPendingSnapshot> {
+        match self.committed_snapshot_checkpoint {
+            Some(checkpoint) => Some(CommittedPendingSnapshot { checkpoint }),
+            None => None,
+        }
+    }
+
+    /// Attest that the latest emitted snapshot is now the exact durable head.
+    ///
+    /// Call this only after writing and syncing the snapshot bytes, then
+    /// advancing rollback-resistant head metadata with exact compare-and-swap.
+    /// The returned unforgeable proof gates the single-use attempt dispatch.
+    /// This method does no I/O and cannot verify a false caller attestation.
+    pub fn confirm_snapshot_committed(
+        &mut self,
+        checkpoint: PendingSnapshotCheckpoint,
+    ) -> Result<CommittedPendingSnapshot, SnapshotCommitError> {
+        if self.committed_snapshot_checkpoint == Some(checkpoint)
+            && self.uncommitted_snapshot_checkpoint.is_none()
+        {
+            return Ok(CommittedPendingSnapshot { checkpoint });
+        }
+        let emitted = self
+            .uncommitted_snapshot_checkpoint
+            .ok_or(SnapshotCommitError::NoEmittedSnapshot)?;
+        if emitted != checkpoint {
+            return Err(SnapshotCommitError::CheckpointMismatch);
+        }
+        if self.committed_snapshot_checkpoint.is_some_and(|committed| {
+            committed.epoch != checkpoint.epoch || committed.revision > checkpoint.revision
+        }) {
+            return Err(SnapshotCommitError::CommittedHeadRegression);
+        }
+        self.committed_snapshot_checkpoint = Some(checkpoint);
+        self.uncommitted_snapshot_checkpoint = None;
+        Ok(CommittedPendingSnapshot { checkpoint })
+    }
+
+    /// Abandon an emitted candidate whose bytes/head were not committed.
+    ///
+    /// Use this only after proving the protected durable head did not advance
+    /// to `checkpoint`. The emitted revision remains consumed, so the next
+    /// snapshot must use a strictly greater revision. This method exists to
+    /// recover from storage or compare-and-swap failure without allowing two
+    /// outstanding candidates.
+    pub fn abandon_uncommitted_snapshot(
+        &mut self,
+        checkpoint: PendingSnapshotCheckpoint,
+    ) -> Result<(), SnapshotCommitError> {
+        let emitted = self
+            .uncommitted_snapshot_checkpoint
+            .ok_or(SnapshotCommitError::NoEmittedSnapshot)?;
+        if emitted != checkpoint {
+            return Err(SnapshotCommitError::CheckpointMismatch);
+        }
+        self.uncommitted_snapshot_checkpoint = None;
+        Ok(())
     }
 
     /// Register one connection lifetime with its caller-seeded Hop-by-Hop
@@ -1343,6 +2309,17 @@ impl PendingRequestTable {
             .get_mut(&token.get())
             .ok_or(ConnectionTableError::UnknownConnection)?;
         entry.open = false;
+        let now = self.clock.now();
+        for record in self.records.values_mut() {
+            for attempt in &mut record.attempts {
+                if attempt.connection == token
+                    && attempt.disposition == AttemptDisposition::Prepared
+                {
+                    attempt.disposition = AttemptDisposition::FailedBeforeWrite;
+                    attempt.ended_at = Some(now);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1391,10 +2368,16 @@ impl PendingRequestTable {
         connection: DiameterConnectionToken,
         token_value: CompletionTokenValue,
     ) -> Result<CompletionToken, TrackError> {
-        if self.records.contains_key(&token_value) {
+        if self.records.contains_key(&token_value)
+            || self.suppressed_deliveries.contains_key(&token_value)
+        {
             return Err(TrackError::DuplicateCompletionToken);
         }
-        if self.pending_count >= self.config.max_pending_transactions {
+        if self
+            .pending_count
+            .saturating_add(self.unacknowledged_completion_count)
+            >= self.config.max_pending_transactions
+        {
             return Err(TrackError::TableFull);
         }
         let facts = inspect_request(&request, self.decode_context())?;
@@ -1417,9 +2400,11 @@ impl PendingRequestTable {
             connection,
             hop_by_hop_identifier,
             retransmission: false,
-            disposition: AttemptDisposition::InFlight,
+            disposition: AttemptDisposition::Prepared,
             started_at: now,
+            written_at: None,
             ended_at: None,
+            snapshotted_at: None,
         };
         let record = TransactionRecord {
             token_value,
@@ -1433,6 +2418,7 @@ impl PendingRequestTable {
             attempts: vec![attempt],
             restored_baseline: 0,
             state: RecordState::Pending,
+            completion_delivery_acknowledged: false,
             late_answer_count: 0,
             rejected_answer_count: 0,
         };
@@ -1462,62 +2448,246 @@ impl PendingRequestTable {
             .map(|record| DiameterRequestTransaction { record })
     }
 
-    /// Return the exact wire message for the transaction's latest in-flight
-    /// attempt.
+    /// Reconcile a durable completion-delivery record before network re-arm.
+    ///
+    /// Call this immediately after [`Self::restore`] for every atomically
+    /// loaded delivery record and replayable intent. A Ready or Claimed record
+    /// proves an application outcome already exists, so the matching pending
+    /// network request is suppressed and snapshot advancement stays blocked
+    /// until an Acknowledged record arrives. Acknowledged removes the matching
+    /// pending, retained, or suppressed record outright.
+    ///
+    /// This precedence prevents recovery from concurrently replaying an
+    /// application outcome and retransmitting the request that produced it.
+    /// Claimed remains unfinished work: fence the old worker, reclaim, replay
+    /// the durable intent, and acknowledge according to the delivery-record
+    /// contract.
+    pub fn reconcile_completion_delivery(
+        &mut self,
+        durable: CompletionDeliveryRecord,
+    ) -> Result<bool, CompletionDeliveryError> {
+        if durable.key().epoch() != self.snapshot_epoch {
+            return Err(CompletionDeliveryError::EpochMismatch);
+        }
+        let completion = durable.key().completion();
+        let token = completion.value();
+
+        if durable.state() == CompletionDeliveryState::Acknowledged {
+            let suppressed = match self.suppressed_deliveries.get(&token) {
+                Some(retained) if *retained == completion => {
+                    self.suppressed_deliveries.remove(&token);
+                    self.unacknowledged_completion_count =
+                        self.unacknowledged_completion_count.saturating_sub(1);
+                    true
+                }
+                Some(_) => return Err(CompletionDeliveryError::UnknownCompletion),
+                None => false,
+            };
+            let retained = self.records.contains_key(&token);
+            if retained {
+                self.remove_record(token);
+            }
+            return Ok(suppressed || retained);
+        }
+
+        if let Some(retained) = self.suppressed_deliveries.get(&token) {
+            if *retained != completion {
+                return Err(CompletionDeliveryError::UnknownCompletion);
+            }
+            return Ok(true);
+        }
+
+        let Some(record) = self.records.get(&token) else {
+            return Ok(false);
+        };
+        if !record.state.is_pending() {
+            if record.completion_token() != completion {
+                return Err(CompletionDeliveryError::UnknownCompletion);
+            }
+            return Ok(true);
+        }
+
+        self.remove_record(token);
+        self.suppressed_deliveries.insert(token, completion);
+        self.unacknowledged_completion_count =
+            self.unacknowledged_completion_count.saturating_add(1);
+        Ok(true)
+    }
+
+    /// Reconcile a durably acknowledged completion against a restored table.
+    ///
+    /// Call this immediately after [`Self::restore`] and before re-arming any
+    /// request. It removes the matching pending or retained record without
+    /// emitting a completion, so an older still-authoritative pending snapshot
+    /// cannot reapply an effect that was atomically acknowledged before the
+    /// crash. The record must decode as acknowledged and belong to this
+    /// table's snapshot epoch. Returns whether a matching transaction existed.
+    pub fn reconcile_acknowledged(
+        &mut self,
+        acknowledged: CompletionDeliveryRecord,
+    ) -> Result<bool, CompletionDeliveryError> {
+        if acknowledged.state() != CompletionDeliveryState::Acknowledged {
+            return Err(CompletionDeliveryError::NotAcknowledged);
+        }
+        self.reconcile_completion_delivery(acknowledged)
+    }
+
+    /// Record that a retained live completion and its replayable application
+    /// intent were durably acknowledged.
+    ///
+    /// The supplied record must be in the acknowledged state and belong to
+    /// this table's epoch. Until every completion is acknowledged,
+    /// [`Self::snapshot`] fails closed so a newer pending-only checkpoint
+    /// cannot discard the sole replay source.
+    pub fn acknowledge_completion_delivery(
+        &mut self,
+        acknowledged: CompletionDeliveryRecord,
+    ) -> Result<(), CompletionDeliveryError> {
+        if acknowledged.state() != CompletionDeliveryState::Acknowledged {
+            return Err(CompletionDeliveryError::NotAcknowledged);
+        }
+        if acknowledged.key().epoch() != self.snapshot_epoch {
+            return Err(CompletionDeliveryError::EpochMismatch);
+        }
+        let completion = acknowledged.key().completion();
+        if let Some(suppressed) = self.suppressed_deliveries.get(&completion.value()) {
+            if *suppressed != completion {
+                return Err(CompletionDeliveryError::UnknownCompletion);
+            }
+            self.suppressed_deliveries.remove(&completion.value());
+            self.unacknowledged_completion_count =
+                self.unacknowledged_completion_count.saturating_sub(1);
+            return Ok(());
+        }
+        let record = self
+            .records
+            .get_mut(&completion.value())
+            .ok_or(CompletionDeliveryError::UnknownCompletion)?;
+        if record.state.is_pending() {
+            return Err(CompletionDeliveryError::CompletionStillPending);
+        }
+        if record.completion_token() != completion {
+            return Err(CompletionDeliveryError::UnknownCompletion);
+        }
+        if !record.completion_delivery_acknowledged {
+            record.completion_delivery_acknowledged = true;
+            self.unacknowledged_completion_count =
+                self.unacknowledged_completion_count.saturating_sub(1);
+            self.enforce_completion_retention();
+        }
+        Ok(())
+    }
+
+    /// Take the exact wire message for the latest prepared attempt once.
     ///
     /// The returned message reuses the canonical AVP bytes unchanged and only
     /// rewrites the header: the attempt's Hop-by-Hop identifier, the T bit for
     /// failover attempts, and the recomputed length. The caller writes these
     /// bytes to the attempt's connection and reports the outcome through
-    /// [`Self::record_attempt_failure`].
+    /// [`Self::record_attempt_write_success`] or
+    /// [`Self::record_attempt_failure`]. Taking the message atomically changes
+    /// the attempt from [`AttemptDisposition::Prepared`] to
+    /// [`AttemptDisposition::InFlight`], so the live-send API cannot return
+    /// the same T-clear or retransmission attempt twice.
+    ///
+    /// `committed` must be the table's current proof returned by
+    /// [`Self::confirm_snapshot_committed`], and that committed snapshot must
+    /// contain the attempt. This persist-before-dispatch fence ensures a crash
+    /// can recover every attempt that may have reached a peer and prevents
+    /// restore/send loops from bypassing the configured attempt bound.
     ///
     /// Attempts recovered by [`Self::restore`] are evidence of dead connection
     /// lifetimes: they are never served here, even when still marked in
     /// flight. Re-arm the record with [`Self::failover`] first — the
     /// re-armed attempt carries T=1 as RFC 6733 §5.5.4 requires — otherwise
     /// this returns [`TransactionAccessError::NoLiveAttempt`]. Use
-    /// [`Self::wire_message_for_attempt`] to inspect historical bytes.
-    pub fn attempt_wire_message(
-        &self,
+    pub fn take_attempt_dispatch(
+        &mut self,
         token: CompletionTokenValue,
-    ) -> Result<OwnedMessage, TransactionAccessError> {
+        committed: CommittedPendingSnapshot,
+    ) -> Result<AttemptDispatch, TransactionAccessError> {
+        if self.committed_snapshot_checkpoint != Some(committed.checkpoint) {
+            return Err(TransactionAccessError::SnapshotProofMismatch);
+        }
+        let (attempt_index, attempt, message) = {
+            let record = self
+                .records
+                .get(&token)
+                .ok_or(TransactionAccessError::UnknownTransaction)?;
+            if !record.state.is_pending() {
+                return Err(TransactionAccessError::NotPending);
+            }
+            let attempt_index = record
+                .attempts
+                .iter()
+                .rposition(|attempt| {
+                    attempt.disposition == AttemptDisposition::Prepared
+                        && attempt.attempt_index >= record.restored_baseline
+                })
+                .ok_or(TransactionAccessError::NoLiveAttempt)?;
+            let attempt = record.attempts[attempt_index];
+            (attempt_index, attempt, record.wire_message(&attempt))
+        };
+        if attempt
+            .snapshotted_at
+            .is_none_or(|revision| revision > committed.checkpoint.revision)
+        {
+            return Err(TransactionAccessError::AttemptNotDurablySnapshotted);
+        }
+        let connection_open = self
+            .connections
+            .get(&attempt.connection.get())
+            .is_some_and(|connection| connection.open);
+        if !connection_open {
+            if let Some(record) = self.records.get_mut(&token) {
+                let slot = &mut record.attempts[attempt_index];
+                slot.disposition = AttemptDisposition::FailedBeforeWrite;
+                slot.ended_at = Some(self.clock.now());
+            }
+            return Err(TransactionAccessError::ConnectionNotOpen);
+        }
         let record = self
             .records
-            .get(&token)
+            .get_mut(&token)
             .ok_or(TransactionAccessError::UnknownTransaction)?;
-        let attempt = record
-            .attempts
-            .iter()
-            .rev()
-            .find(|attempt| {
-                attempt.disposition.is_in_flight()
-                    && attempt.attempt_index >= record.restored_baseline
-            })
-            .ok_or(TransactionAccessError::NoLiveAttempt)?;
-        Ok(record.wire_message(attempt))
+        record.attempts[attempt_index].disposition = AttemptDisposition::InFlight;
+        Ok(AttemptDispatch {
+            attempt: attempt.attempt_id(),
+            message,
+        })
     }
 
-    /// Return the exact wire message for one recorded attempt, whether or not
-    /// it is still in flight.
+    /// Record that one attempt was written completely and is awaiting an
+    /// answer.
     ///
-    /// This reproduces the bytes of any attempt retained in the bounded
-    /// history — for audit, for evidence after completion, or to prove the
-    /// canonical request was never rewritten across failover.
-    pub fn wire_message_for_attempt(
-        &self,
+    /// This transition is distinct from [`AttemptDisposition::InFlight`],
+    /// which means the write outcome is not yet known. It is retained in
+    /// snapshot evidence so recovery can distinguish a queued/partial write
+    /// from a request known to have reached the transport.
+    pub fn record_attempt_write_success(
+        &mut self,
         token: CompletionTokenValue,
         attempt: AttemptId,
-    ) -> Result<OwnedMessage, TransactionAccessError> {
+    ) -> Result<AttemptEvidence, TransactionAccessError> {
         let record = self
             .records
-            .get(&token)
+            .get_mut(&token)
             .ok_or(TransactionAccessError::UnknownTransaction)?;
-        let attempt = record
+        if !record.state.is_pending() {
+            return Err(TransactionAccessError::NotPending);
+        }
+        let slot = record
             .attempts
-            .iter()
+            .iter_mut()
             .find(|slot| slot.attempt_id() == attempt)
             .ok_or(TransactionAccessError::UnknownAttempt)?;
-        Ok(record.wire_message(attempt))
+        if slot.disposition != AttemptDisposition::InFlight {
+            return Err(TransactionAccessError::InvalidAttemptTransition);
+        }
+        let now = self.clock.now();
+        slot.disposition = AttemptDisposition::WrittenAwaitingAnswer;
+        slot.written_at = Some(now);
+        Ok(*slot)
     }
 
     /// Record the transport-reported failure classification of one attempt.
@@ -1539,11 +2709,24 @@ impl PendingRequestTable {
             .iter_mut()
             .find(|slot| slot.attempt_id() == attempt)
             .ok_or(TransactionAccessError::UnknownAttempt)?;
-        if !slot.disposition.is_in_flight() {
-            return Err(TransactionAccessError::AttemptNotInFlight);
+        match (slot.disposition, failure) {
+            (AttemptDisposition::InFlight, _) => {}
+            (AttemptDisposition::Prepared, AttemptFailure::BeforeWrite) => {}
+            (
+                AttemptDisposition::WrittenAwaitingAnswer,
+                AttemptFailure::TransportLostAfterWrite,
+            ) => {}
+            (AttemptDisposition::WrittenAwaitingAnswer, _) => {
+                return Err(TransactionAccessError::InvalidAttemptTransition);
+            }
+            _ => return Err(TransactionAccessError::AttemptNotInFlight),
+        }
+        let now = self.clock.now();
+        if failure == AttemptFailure::TransportLostAfterWrite && slot.written_at.is_none() {
+            slot.written_at = Some(now);
         }
         slot.disposition = failure.disposition();
-        slot.ended_at = Some(self.clock.now());
+        slot.ended_at = Some(now);
         Ok(*slot)
     }
 
@@ -1561,7 +2744,21 @@ impl PendingRequestTable {
         let mut marked = 0usize;
         for record in self.records.values_mut() {
             for attempt in &mut record.attempts {
-                if attempt.connection == connection && attempt.disposition.is_in_flight() {
+                let compatible = match (attempt.disposition, failure) {
+                    (AttemptDisposition::InFlight, _) => true,
+                    (AttemptDisposition::Prepared, AttemptFailure::BeforeWrite) => true,
+                    (
+                        AttemptDisposition::WrittenAwaitingAnswer,
+                        AttemptFailure::TransportLostAfterWrite,
+                    ) => true,
+                    _ => false,
+                };
+                if attempt.connection == connection && compatible {
+                    if failure == AttemptFailure::TransportLostAfterWrite
+                        && attempt.written_at.is_none()
+                    {
+                        attempt.written_at = Some(now);
+                    }
                     attempt.disposition = failure.disposition();
                     attempt.ended_at = Some(now);
                     marked += 1;
@@ -1618,9 +2815,11 @@ impl PendingRequestTable {
             connection,
             hop_by_hop_identifier,
             retransmission: true,
-            disposition: AttemptDisposition::InFlight,
+            disposition: AttemptDisposition::Prepared,
             started_at: now,
+            written_at: None,
             ended_at: None,
+            snapshotted_at: None,
         };
         let record = self
             .records
@@ -1661,6 +2860,7 @@ impl PendingRequestTable {
             hop_by_hop_identifier: answer.header.hop_by_hop_identifier,
         };
         let now = self.clock.now();
+        let decode_context = self.decode_context();
         let record = match self.records.get_mut(&token) {
             Some(record) => record,
             None => {
@@ -1671,17 +2871,22 @@ impl PendingRequestTable {
                 });
             }
         };
-        let rejection = if answer.header.flags.is_request() {
-            Some(AnswerRejectionReason::NotAnAnswer)
-        } else if answer.header.end_to_end_identifier != record.end_to_end_identifier {
-            Some(AnswerRejectionReason::EndToEndMismatch)
-        } else if answer.header.command_code != record.command_code
-            || answer.header.application_id != record.application_id
-        {
-            Some(AnswerRejectionReason::CommandMismatch)
-        } else {
-            None
+        let attempt_disposition = record
+            .attempts
+            .iter()
+            .find(|slot| slot.attempt_id() == attempt_id)
+            .map(|slot| slot.disposition);
+        let Some(attempt_disposition) = attempt_disposition else {
+            self.unmatched_answers = self.unmatched_answers.saturating_add(1);
+            return AnswerDisposition::Unmatched(UnmatchedAnswerEvidence {
+                connection,
+                hop_by_hop_identifier: attempt_id.hop_by_hop_identifier,
+            });
         };
+        let rejection = inspect_answer(&answer, record, decode_context).or_else(|| {
+            (!attempt_disposition.can_receive_answer())
+                .then_some(AnswerRejectionReason::AttemptNotAnswerEligible)
+        });
         if let Some(reason) = rejection {
             record.rejected_answer_count = record.rejected_answer_count.saturating_add(1);
             return AnswerDisposition::Rejected(AnswerRejection {
@@ -1703,6 +2908,9 @@ impl PendingRequestTable {
                         hop_by_hop_identifier: attempt_id.hop_by_hop_identifier,
                     });
                 };
+                if slot.written_at.is_none() {
+                    slot.written_at = Some(now);
+                }
                 slot.disposition = AttemptDisposition::Answered;
                 slot.ended_at = Some(now);
                 let attempt = *slot;
@@ -1776,13 +2984,16 @@ impl PendingRequestTable {
 
     /// Drop one completed transaction and its attempt correlation evidence.
     ///
-    /// Pending transactions cannot be retired; finish them first. Returns
-    /// whether a completed record was removed.
+    /// Pending and durably unacknowledged completions cannot be retired.
+    /// Acknowledgement metadata and replayable intent remain caller-owned and
+    /// must not be garbage-collected until a newer exact committed snapshot
+    /// excludes the request. Returns whether an acknowledged completed record
+    /// was removed.
     pub fn retire(&mut self, token: CompletionTokenValue) -> bool {
         let Some(record) = self.records.get(&token) else {
             return false;
         };
-        if record.state.is_pending() {
+        if record.state.is_pending() || !record.completion_delivery_acknowledged {
             return false;
         }
         self.remove_record(token);
@@ -1793,6 +3004,13 @@ impl PendingRequestTable {
     #[must_use]
     pub const fn pending_count(&self) -> usize {
         self.pending_count
+    }
+
+    /// Return the number of terminal completions whose replayable intent has
+    /// not yet been durably acknowledged.
+    #[must_use]
+    pub const fn unacknowledged_completion_count(&self) -> usize {
+        self.unacknowledged_completion_count
     }
 
     /// Return the number of completed transactions retained for late-answer
@@ -1821,24 +3039,70 @@ impl PendingRequestTable {
         self.unmatched_answers
     }
 
-    /// Encode every pending transaction into the versioned, explicitly
+    /// Encode every pending transaction into a rollback-fenced, explicitly
     /// sensitive snapshot form.
     ///
     /// The snapshot contains canonical request bytes and must be stored only
     /// in encrypted, integrity-protected storage. Completed records are
-    /// live-only and never serialized. Records are encoded in completion-token
-    /// order so identical table states produce identical bytes.
-    #[must_use]
-    pub fn snapshot(&self) -> PendingTableSnapshot {
+    /// live-only and never serialized. `checkpoint` must use the existing
+    /// lineage, if any, and strictly advance its revision. Persist the encoded
+    /// bytes and checkpoint together, then advance a separately protected
+    /// durable high-water to this revision. The high-water is required at
+    /// restore time; encryption and integrity alone cannot detect rollback.
+    /// Records are encoded in completion-token order so identical table states
+    /// at one checkpoint produce identical bytes.
+    pub fn snapshot(
+        &mut self,
+        checkpoint: PendingSnapshotCheckpoint,
+    ) -> Result<PendingTableSnapshot, SnapshotCreateError> {
+        if self.uncommitted_snapshot_checkpoint.is_some() {
+            return Err(SnapshotCreateError::UncommittedSnapshotOutstanding);
+        }
+        if checkpoint.epoch != self.snapshot_epoch {
+            return Err(SnapshotCreateError::EpochMismatch);
+        }
+        if let Some(previous) = self.snapshot_checkpoint {
+            if previous.epoch != checkpoint.epoch {
+                return Err(SnapshotCreateError::EpochMismatch);
+            }
+            if checkpoint.revision <= previous.revision {
+                return Err(SnapshotCreateError::RevisionNotAdvanced);
+            }
+        }
+        if self.unacknowledged_completion_count > 0 {
+            return Err(SnapshotCreateError::UnacknowledgedCompletion);
+        }
         let mut pending: Vec<&TransactionRecord> = self
             .records
             .values()
             .filter(|record| record.state.is_pending())
             .collect();
         pending.sort_by_key(|record| record.token_value);
-        let mut encoded = Vec::new();
+        let encoded_len = pending
+            .iter()
+            .try_fold(SNAPSHOT_HEADER_LEN, |total, record| {
+                let attempts_len = record
+                    .attempts
+                    .len()
+                    .checked_mul(SNAPSHOT_ATTEMPT_LEN)
+                    .ok_or(SnapshotCreateError::SizeLimitExceeded)?;
+                total
+                    .checked_add(SNAPSHOT_RECORD_FIXED_LEN)
+                    .and_then(|value| value.checked_add(attempts_len))
+                    .and_then(|value| value.checked_add(record.raw_avps.len()))
+                    .ok_or(SnapshotCreateError::SizeLimitExceeded)
+            })?;
+        if encoded_len > self.config.max_snapshot_bytes {
+            return Err(SnapshotCreateError::SizeLimitExceeded);
+        }
+        let mut encoded = Zeroizing::new(Vec::new());
+        encoded
+            .try_reserve_exact(encoded_len)
+            .map_err(|_| SnapshotCreateError::AllocationFailed)?;
         encoded.extend_from_slice(&SNAPSHOT_MAGIC.to_be_bytes());
         encoded.extend_from_slice(&SNAPSHOT_VERSION.to_be_bytes());
+        encoded.extend_from_slice(&checkpoint.epoch.get().to_be_bytes());
+        encoded.extend_from_slice(&checkpoint.revision.get().to_be_bytes());
         push_count(&mut encoded, pending.len());
         for record in pending {
             encoded.extend_from_slice(&record.token_value.get().to_be_bytes());
@@ -1860,6 +3124,14 @@ impl PendingRequestTable {
                 encoded.extend_from_slice(&attempt.hop_by_hop_identifier.to_be_bytes());
                 encoded.push(attempt.disposition.as_snapshot_code());
                 encoded.extend_from_slice(&micros_of(attempt.started_at).to_be_bytes());
+                match attempt.written_at {
+                    Some(written) => {
+                        encoded.extend_from_slice(&micros_of(written).to_be_bytes());
+                    }
+                    None => {
+                        encoded.extend_from_slice(&MICROS_SENTINEL_NONE.to_be_bytes());
+                    }
+                }
                 match attempt.ended_at {
                     Some(ended) => {
                         encoded.extend_from_slice(&micros_of(ended).to_be_bytes());
@@ -1872,50 +3144,76 @@ impl PendingRequestTable {
             encoded.extend_from_slice(&(record.raw_avps.len() as u32).to_be_bytes());
             encoded.extend_from_slice(&record.raw_avps);
         }
-        PendingTableSnapshot {
-            encoded: Zeroizing::new(encoded),
+        for record in self
+            .records
+            .values_mut()
+            .filter(|record| record.state.is_pending())
+        {
+            for attempt in &mut record.attempts {
+                if attempt.snapshotted_at.is_none() {
+                    attempt.snapshotted_at = Some(checkpoint.revision);
+                }
+            }
         }
+        self.snapshot_checkpoint = Some(checkpoint);
+        self.uncommitted_snapshot_checkpoint = Some(checkpoint);
+        Ok(PendingTableSnapshot {
+            checkpoint,
+            encoded,
+        })
     }
 
     /// Restore a table from snapshot bytes previously written to durable
     /// (encrypted) storage.
     ///
-    /// Malformed, truncated, or trailing-garbage input, unsupported versions,
-    /// bound violations, and records that fail request validation are
-    /// rejected with typed errors; nothing is partially restored. Restored
-    /// records are pending with their full attempt history retained; re-arm
-    /// each one with [`Self::failover`] onto a fresh connection, which
+    /// `expected_checkpoint` is the caller's rollback-resistant committed
+    /// head. A snapshot from another lineage, an older rollback, or a newer
+    /// orphan that was written without committing the head is rejected with a
+    /// typed error before any record is installed.
+    /// Malformed, truncated, trailing-garbage, unsupported-version,
+    /// bound-violating, and internally inconsistent records are likewise
+    /// rejected atomically. Restored records retain full attempt evidence;
+    /// re-arm each one with [`Self::failover`] onto a fresh connection, which
     /// retransmits with T=1 while preserving the End-to-End identifier and
-    /// canonical request. Restored connection identities are historical
-    /// evidence; register fresh connections before retransmitting.
+    /// canonical request.
     ///
     /// Delivery of a restored completion is **at-least-once**: the consumer
-    /// may already have applied the completion before the crash. To make
-    /// restored delivery idempotent, durably claim each completion with a
-    /// compare-and-set on its stable [`CompletionToken`] value and generation
-    /// before applying side effects, and skip deliveries whose token was
-    /// already claimed. Both value and generation are preserved verbatim
-    /// across repeated restores.
+    /// may already have applied it before a crash. Use
+    /// [`CompletionDeliveryRecord`] in a durable compare-and-swap store:
+    /// claim before application, acknowledge only after the side effect is
+    /// durable, and recover (rather than skip) an unfinished claim. Exactly
+    /// once requires either atomic side-effect-plus-ack commit or an
+    /// idempotent side effect keyed by [`CompletionToken`].
     pub fn restore(
         bytes: &[u8],
+        expected_checkpoint: PendingSnapshotCheckpoint,
         config: PendingRequestTableConfig,
         clock: Arc<dyn PendingRequestClock>,
     ) -> Result<Self, SnapshotRestoreError> {
         config
             .validate()
             .map_err(|_| SnapshotRestoreError::LimitExceeded)?;
+        if bytes.len() > config.max_snapshot_bytes {
+            return Err(SnapshotRestoreError::LimitExceeded);
+        }
         let mut table = Self {
             config,
             clock,
+            snapshot_epoch: expected_checkpoint.epoch,
             records: HashMap::new(),
+            suppressed_deliveries: HashMap::new(),
             attempt_index: HashMap::new(),
             pending_end_to_end: HashMap::new(),
             connections: HashMap::new(),
             pending_count: 0,
+            unacknowledged_completion_count: 0,
             completed_count: 0,
             completion_sequence: 0,
             evicted_completions: 0,
             unmatched_answers: 0,
+            snapshot_checkpoint: None,
+            uncommitted_snapshot_checkpoint: None,
+            committed_snapshot_checkpoint: None,
         };
         let mut cursor = SnapshotCursor::new(bytes);
         if cursor.u32()? != SNAPSHOT_MAGIC {
@@ -1924,6 +3222,24 @@ impl PendingRequestTable {
         if cursor.u16()? != SNAPSHOT_VERSION {
             return Err(SnapshotRestoreError::UnsupportedVersion);
         }
+        let epoch = PendingSnapshotEpoch::new(
+            NonZeroU128::new(cursor.u128()?).ok_or(SnapshotRestoreError::InvalidRecord)?,
+        );
+        if epoch != expected_checkpoint.epoch {
+            return Err(SnapshotRestoreError::EpochMismatch);
+        }
+        let revision = PendingSnapshotRevision::new(
+            NonZeroU64::new(cursor.u64()?).ok_or(SnapshotRestoreError::InvalidRecord)?,
+        );
+        if revision < expected_checkpoint.revision {
+            return Err(SnapshotRestoreError::Stale);
+        }
+        if revision > expected_checkpoint.revision {
+            return Err(SnapshotRestoreError::Uncommitted);
+        }
+        let checkpoint = PendingSnapshotCheckpoint { epoch, revision };
+        table.snapshot_checkpoint = Some(checkpoint);
+        table.committed_snapshot_checkpoint = Some(checkpoint);
         let record_count = cursor.count()?;
         if record_count > config.max_pending_transactions {
             return Err(SnapshotRestoreError::LimitExceeded);
@@ -1991,18 +3307,34 @@ impl PendingRequestTable {
             record.state = RecordState::Completed { kind, sequence };
         }
         self.pending_count = self.pending_count.saturating_sub(1);
+        self.unacknowledged_completion_count =
+            self.unacknowledged_completion_count.saturating_add(1);
         self.completed_count = self.completed_count.saturating_add(1);
         if let Some(record) = self.records.get(&token) {
             self.pending_end_to_end
                 .remove(&record.end_to_end_identifier);
         }
-        while self.completed_count > self.config.max_retained_completions {
+        self.enforce_completion_retention();
+    }
+
+    fn enforce_completion_retention(&mut self) {
+        let live_unacknowledged = self
+            .unacknowledged_completion_count
+            .saturating_sub(self.suppressed_deliveries.len());
+        while self.completed_count.saturating_sub(live_unacknowledged)
+            > self.config.max_retained_completions
+        {
             let Some(oldest) = self
                 .records
                 .iter()
                 .filter_map(|(value, record)| match record.state {
-                    RecordState::Completed { sequence, .. } => Some((*value, sequence)),
+                    RecordState::Completed { sequence, .. }
+                        if record.completion_delivery_acknowledged =>
+                    {
+                        Some((*value, sequence))
+                    }
                     RecordState::Pending => None,
+                    RecordState::Completed { .. } => None,
                 })
                 .min_by_key(|(_, sequence)| *sequence)
                 .map(|(value, _)| value)
@@ -2028,6 +3360,10 @@ impl PendingRequestTable {
             if record.state.is_pending() {
                 self.pending_count = self.pending_count.saturating_sub(1);
             } else {
+                if !record.completion_delivery_acknowledged {
+                    self.unacknowledged_completion_count =
+                        self.unacknowledged_completion_count.saturating_sub(1);
+                }
                 self.completed_count = self.completed_count.saturating_sub(1);
             }
         }
@@ -2076,13 +3412,41 @@ impl PendingRequestTable {
                 return Err(SnapshotRestoreError::InvalidRecord);
             }
             let started_at = Duration::from_micros(cursor.u64()?);
+            let written_bits = cursor.u64()?;
+            let written_at = if written_bits == MICROS_SENTINEL_NONE {
+                None
+            } else {
+                Some(Duration::from_micros(written_bits))
+            };
             let ended_bits = cursor.u64()?;
             let ended_at = if ended_bits == MICROS_SENTINEL_NONE {
                 None
             } else {
                 Some(Duration::from_micros(ended_bits))
             };
-            if ended_at.is_none() != disposition.is_in_flight() {
+            let open = matches!(
+                disposition,
+                AttemptDisposition::Prepared
+                    | AttemptDisposition::InFlight
+                    | AttemptDisposition::WrittenAwaitingAnswer
+            );
+            if ended_at.is_none() != open
+                || (matches!(
+                    disposition,
+                    AttemptDisposition::WrittenAwaitingAnswer
+                        | AttemptDisposition::TransportLostAfterWrite
+                ) && written_at.is_none())
+                || (matches!(
+                    disposition,
+                    AttemptDisposition::Prepared
+                        | AttemptDisposition::InFlight
+                        | AttemptDisposition::FailedBeforeWrite
+                        | AttemptDisposition::FailedUncertainWrite
+                ) && written_at.is_some())
+                || written_at.is_some_and(|written| written < started_at)
+                || ended_at.is_some_and(|ended| ended < started_at)
+                || matches!((written_at, ended_at), (Some(written), Some(ended)) if ended < written)
+            {
                 return Err(SnapshotRestoreError::InvalidRecord);
             }
             attempts.push(AttemptEvidence {
@@ -2092,7 +3456,13 @@ impl PendingRequestTable {
                 retransmission: attempt_index > 0,
                 disposition,
                 started_at,
+                written_at,
                 ended_at,
+                snapshotted_at: Some(
+                    self.snapshot_checkpoint
+                        .ok_or(SnapshotRestoreError::InvalidRecord)?
+                        .revision,
+                ),
             });
         }
         let request_len = cursor.u32()? as usize;
@@ -2100,6 +3470,10 @@ impl PendingRequestTable {
             return Err(SnapshotRestoreError::LimitExceeded);
         }
         let raw_avps = Bytes::copy_from_slice(cursor.take(request_len)?);
+        let message_len = DIAMETER_HEADER_LEN
+            .checked_add(raw_avps.len())
+            .and_then(|length| u32::try_from(length).ok())
+            .ok_or(SnapshotRestoreError::InvalidRecord)?;
         let request = OwnedMessage {
             header: Header::new(
                 CommandFlags::request(proxiable),
@@ -2107,7 +3481,8 @@ impl PendingRequestTable {
                 application_id,
                 0,
                 end_to_end_identifier,
-            ),
+            )
+            .with_length(message_len),
             raw_avps,
         };
         let facts = inspect_request(&request, self.decode_context())
@@ -2133,6 +3508,7 @@ impl PendingRequestTable {
             attempts,
             restored_baseline,
             state: RecordState::Pending,
+            completion_delivery_acknowledged: false,
             late_answer_count: 0,
             rejected_answer_count: 0,
         })
@@ -2192,21 +3568,25 @@ impl From<HopByHopAllocateError> for FailoverError {
 impl AttemptDisposition {
     fn as_snapshot_code(self) -> u8 {
         match self {
-            Self::InFlight => 0,
-            Self::FailedBeforeWrite => 1,
-            Self::FailedUncertainWrite => 2,
-            Self::TransportLostAfterWrite => 3,
-            Self::Answered => 4,
+            Self::Prepared => 0,
+            Self::InFlight => 1,
+            Self::WrittenAwaitingAnswer => 2,
+            Self::FailedBeforeWrite => 3,
+            Self::FailedUncertainWrite => 4,
+            Self::TransportLostAfterWrite => 5,
+            Self::Answered => 6,
         }
     }
 
     fn from_snapshot_code(code: u8) -> Result<Self, SnapshotRestoreError> {
         match code {
-            0 => Ok(Self::InFlight),
-            1 => Ok(Self::FailedBeforeWrite),
-            2 => Ok(Self::FailedUncertainWrite),
-            3 => Ok(Self::TransportLostAfterWrite),
-            4 => Ok(Self::Answered),
+            0 => Ok(Self::Prepared),
+            1 => Ok(Self::InFlight),
+            2 => Ok(Self::WrittenAwaitingAnswer),
+            3 => Ok(Self::FailedBeforeWrite),
+            4 => Ok(Self::FailedUncertainWrite),
+            5 => Ok(Self::TransportLostAfterWrite),
+            6 => Ok(Self::Answered),
             _ => Err(SnapshotRestoreError::InvalidRecord),
         }
     }
@@ -2222,6 +3602,9 @@ struct RequestFacts {
 
 fn inspect_request(request: &OwnedMessage, ctx: DecodeContext) -> Result<RequestFacts, TrackError> {
     let header = &request.header;
+    if header.version != DIAMETER_VERSION {
+        return Err(TrackError::UnsupportedVersion);
+    }
     if !header.flags.is_request() {
         return Err(TrackError::NotARequest);
     }
@@ -2237,6 +3620,15 @@ fn inspect_request(request: &OwnedMessage, ctx: DecodeContext) -> Result<Request
         // drop RFC 6733 §3's duplicate-detection signal; recover such
         // requests through snapshot/restore, which re-arms them with T=1.
         return Err(TrackError::AlreadyRetransmitted);
+    }
+    let expected_len = DIAMETER_HEADER_LEN
+        .checked_add(request.raw_avps.len())
+        .ok_or(TrackError::MalformedRequest)?;
+    if expected_len > ctx.max_message_len
+        || expected_len > MAX_U24 as usize
+        || header.length as usize != expected_len
+    {
+        return Err(TrackError::MalformedRequest);
     }
     // Duplicate occurrences are classified per-AVP below so an Origin-Host
     // duplication is reported as the identity violation it is, not as a
@@ -2269,9 +3661,6 @@ fn inspect_request(request: &OwnedMessage, ctx: DecodeContext) -> Result<Request
     if origin_host_count != 1 || !origin_host_nonempty {
         return Err(TrackError::OriginHostInvalid);
     }
-    if DIAMETER_HEADER_LEN + request.raw_avps.len() > ctx.max_message_len {
-        return Err(TrackError::MalformedRequest);
-    }
     Ok(RequestFacts {
         command_code: header.command_code,
         application_id: header.application_id,
@@ -2279,6 +3668,59 @@ fn inspect_request(request: &OwnedMessage, ctx: DecodeContext) -> Result<Request
         end_to_end_identifier: header.end_to_end_identifier,
         fixed_destination,
     })
+}
+
+fn inspect_answer(
+    answer: &OwnedMessage,
+    record: &TransactionRecord,
+    ctx: DecodeContext,
+) -> Option<AnswerRejectionReason> {
+    let header = &answer.header;
+    if header.flags.is_request() {
+        return Some(AnswerRejectionReason::NotAnAnswer);
+    }
+    if header.version != DIAMETER_VERSION {
+        return Some(AnswerRejectionReason::UnsupportedVersion);
+    }
+    let expected_len = match DIAMETER_HEADER_LEN.checked_add(answer.raw_avps.len()) {
+        Some(length) => length,
+        None => return Some(AnswerRejectionReason::InvalidLength),
+    };
+    if expected_len > ctx.max_message_len
+        || expected_len > MAX_U24 as usize
+        || header.length as usize != expected_len
+    {
+        return Some(AnswerRejectionReason::InvalidLength);
+    }
+    if header.flags.is_potentially_retransmitted() || header.flags.reserved_bits() != 0 {
+        return Some(AnswerRejectionReason::InvalidFlags);
+    }
+    if !header.command_code.fits_wire() {
+        return Some(AnswerRejectionReason::MalformedHeader);
+    }
+    if header.flags.is_proxiable() != record.proxiable {
+        return Some(AnswerRejectionReason::ProxiableMismatch);
+    }
+    let framing_ctx = DecodeContext {
+        duplicate_ie_policy: opc_protocol::DuplicateIePolicy::First,
+        ..ctx
+    };
+    let borrowed = Message {
+        header: header.clone(),
+        raw_avps: &answer.raw_avps,
+        tail: &[],
+    };
+    if borrowed.validate_avps(framing_ctx).is_err() {
+        return Some(AnswerRejectionReason::MalformedAvps);
+    }
+    if header.end_to_end_identifier != record.end_to_end_identifier {
+        return Some(AnswerRejectionReason::EndToEndMismatch);
+    }
+    if header.command_code != record.command_code || header.application_id != record.application_id
+    {
+        return Some(AnswerRejectionReason::CommandMismatch);
+    }
+    None
 }
 
 fn origin_host_matches(raw_avps: &[u8], candidate: &str) -> bool {
@@ -2427,6 +3869,7 @@ mod tests {
     const USER_NAME: &str = "subscriber-private@example.invalid";
     const DESTINATION_HOST: &str = "aaa.private.example";
     const EAP_MARKER: [u8; 4] = [0xE4, 0xA9, 0x00, 0x11];
+    const SNAPSHOT_EPOCH: PendingSnapshotEpoch = PendingSnapshotEpoch::new(NonZeroU128::MIN);
 
     fn token(value: u128) -> CompletionTokenValue {
         match NonZeroU128::new(value) {
@@ -2436,10 +3879,73 @@ mod tests {
     }
 
     fn table(config: PendingRequestTableConfig) -> PendingRequestTable {
-        match PendingRequestTable::new(config, Arc::new(ManualClock::default())) {
+        match PendingRequestTable::new(config, Arc::new(ManualClock::default()), SNAPSHOT_EPOCH) {
             Ok(table) => table,
             Err(error) => panic!("default config must be valid: {error}"),
         }
+    }
+
+    fn checkpoint(revision: u64) -> PendingSnapshotCheckpoint {
+        let revision = match NonZeroU64::new(revision) {
+            Some(value) => PendingSnapshotRevision::new(value),
+            None => panic!("snapshot revision must be nonzero"),
+        };
+        PendingSnapshotCheckpoint::new(SNAPSHOT_EPOCH, revision)
+    }
+
+    fn snapshot_at(table: &mut PendingRequestTable, revision: u64) -> PendingTableSnapshot {
+        let snapshot = table
+            .snapshot(checkpoint(revision))
+            .unwrap_or_else(|error| panic!("snapshot: {error}"));
+        table
+            .confirm_snapshot_committed(snapshot.checkpoint())
+            .unwrap_or_else(|error| panic!("commit snapshot: {error}"));
+        snapshot
+    }
+
+    fn commit_next(table: &mut PendingRequestTable) -> CommittedPendingSnapshot {
+        let revision = table
+            .latest_emitted_snapshot()
+            .map_or(1, |checkpoint| checkpoint.revision().get() + 1);
+        let snapshot = snapshot_at(table, revision);
+        table
+            .committed_snapshot()
+            .unwrap_or_else(|| panic!("snapshot {:?} must be committed", snapshot.checkpoint()))
+    }
+
+    fn dispatch(table: &mut PendingRequestTable, token: CompletionTokenValue) -> OwnedMessage {
+        let committed = commit_next(table);
+        table
+            .take_attempt_dispatch(token, committed)
+            .map(AttemptDispatch::into_message)
+            .unwrap_or_else(|error| panic!("dispatch: {error}"))
+    }
+
+    fn restore_snapshot(
+        snapshot: &PendingTableSnapshot,
+        config: PendingRequestTableConfig,
+    ) -> PendingRequestTable {
+        PendingRequestTable::restore(
+            snapshot.as_bytes(),
+            snapshot.checkpoint(),
+            config,
+            Arc::new(ManualClock::default()),
+        )
+        .unwrap_or_else(|error| panic!("restore: {error}"))
+    }
+
+    fn acknowledged_delivery(completion: &TransactionCompletion) -> CompletionDeliveryRecord {
+        let ready = CompletionDeliveryRecord::new(SNAPSHOT_EPOCH, completion.token())
+            .unwrap_or_else(|error| panic!("delivery record: {error}"));
+        let claim_value = CompletionClaimValue::new(
+            NonZeroU128::new(0xCA11).unwrap_or_else(|| panic!("claim value")),
+        );
+        let (claimed, claim) = ready
+            .claim(claim_value)
+            .unwrap_or_else(|error| panic!("claim: {error}"));
+        claimed
+            .acknowledge(claim)
+            .unwrap_or_else(|error| panic!("acknowledge: {error}"))
     }
 
     fn wire_avp(code: u32, value: &[u8]) -> Vec<u8> {
@@ -2470,6 +3976,7 @@ mod tests {
         }
         avps.extend(wire_avp(1, USER_NAME.as_bytes()));
         avps.extend(wire_avp(462, &EAP_MARKER));
+        let length = (DIAMETER_HEADER_LEN + avps.len()) as u32;
         OwnedMessage {
             header: Header::new(
                 CommandFlags::request(true),
@@ -2477,7 +3984,8 @@ mod tests {
                 APPLICATION,
                 0,
                 end_to_end,
-            ),
+            )
+            .with_length(length),
             raw_avps: Bytes::copy_from_slice(&avps),
         }
     }
@@ -2488,6 +3996,7 @@ mod tests {
         avps.extend(wire_avp(264, DESTINATION_HOST.as_bytes()));
         avps.extend(wire_avp(296, b"home.private.example"));
         avps.extend(wire_avp(268, &2001_u32.to_be_bytes()));
+        let length = (DIAMETER_HEADER_LEN + avps.len()) as u32;
         OwnedMessage {
             header: Header::new(
                 CommandFlags::answer(true, false),
@@ -2495,7 +4004,8 @@ mod tests {
                 APPLICATION,
                 hop_by_hop,
                 end_to_end,
-            ),
+            )
+            .with_length(length),
             raw_avps: Bytes::copy_from_slice(&avps),
         }
     }
@@ -2515,6 +4025,13 @@ mod tests {
         }
     }
 
+    fn rejection_reason(disposition: AnswerDisposition) -> AnswerRejectionReason {
+        match disposition {
+            AnswerDisposition::Rejected(rejection) => rejection.reason,
+            other => panic!("expected rejected answer, got {other:?}"),
+        }
+    }
+
     #[test]
     fn first_attempt_is_canonical_and_connection_unique() {
         let mut table = table(PendingRequestTableConfig::default());
@@ -2530,12 +4047,8 @@ mod tests {
         assert_eq!(first.generation(), 0);
         assert_eq!(second.generation(), 0);
 
-        let first_wire = table
-            .attempt_wire_message(first.value())
-            .unwrap_or_else(|error| panic!("wire message: {error}"));
-        let second_wire = table
-            .attempt_wire_message(second.value())
-            .unwrap_or_else(|error| panic!("wire message: {error}"));
+        let first_wire = dispatch(&mut table, first.value());
+        let second_wire = dispatch(&mut table, second.value());
         assert_eq!(first_wire.header.hop_by_hop_identifier, 100);
         assert_eq!(second_wire.header.hop_by_hop_identifier, 101);
         assert!(!first_wire.header.flags.is_potentially_retransmitted());
@@ -2569,9 +4082,7 @@ mod tests {
                 token(7),
             )
             .unwrap_or_else(|e| panic!("{e}"));
-        let initial = table
-            .attempt_wire_message(tracked.value())
-            .unwrap_or_else(|e| panic!("{e}"));
+        let initial = dispatch(&mut table, tracked.value());
         let attempt = table
             .failover(
                 tracked.value(),
@@ -2582,9 +4093,7 @@ mod tests {
         assert!(attempt.is_retransmission());
         assert_eq!(attempt.hop_by_hop_identifier(), 900);
         assert_eq!(attempt.attempt_index(), 1);
-        let alternate_wire = table
-            .attempt_wire_message(tracked.value())
-            .unwrap_or_else(|e| panic!("{e}"));
+        let alternate_wire = dispatch(&mut table, tracked.value());
         assert!(alternate_wire.header.flags.is_potentially_retransmitted());
         assert_eq!(
             alternate_wire.header.end_to_end_identifier,
@@ -2663,6 +4172,7 @@ mod tests {
         );
         let mut missing_origin = canonical_request(None);
         missing_origin.raw_avps = Bytes::copy_from_slice(&wire_avp(263, b"session"));
+        missing_origin.header.length = (DIAMETER_HEADER_LEN + missing_origin.raw_avps.len()) as u32;
         assert_eq!(
             err_of(table.track(missing_origin, CONNECTION_A, token(2))),
             TrackError::OriginHostInvalid
@@ -2671,7 +4181,8 @@ mod tests {
         duplicate_origin.extend(wire_avp(264, b"a.example"));
         duplicate_origin.extend(wire_avp(264, b"b.example"));
         let duplicate = OwnedMessage {
-            header: Header::new(CommandFlags::request(true), COMMAND, APPLICATION, 0, 9),
+            header: Header::new(CommandFlags::request(true), COMMAND, APPLICATION, 0, 9)
+                .with_length((DIAMETER_HEADER_LEN + duplicate_origin.len()) as u32),
             raw_avps: Bytes::copy_from_slice(&duplicate_origin),
         };
         assert_eq!(
@@ -2761,13 +4272,8 @@ mod tests {
             )
             .unwrap_or_else(|e| panic!("{e}"));
 
-        let snapshot = table.snapshot();
-        let restored = PendingRequestTable::restore(
-            snapshot.as_bytes(),
-            PendingRequestTableConfig::default(),
-            Arc::new(ManualClock::default()),
-        )
-        .unwrap_or_else(|e| panic!("restore: {e}"));
+        let snapshot = snapshot_at(&mut table, 1);
+        let restored = restore_snapshot(&snapshot, PendingRequestTableConfig::default());
         assert_eq!(restored.pending_count(), 2);
         let view = restored
             .transaction(first.value())
@@ -2801,9 +4307,7 @@ mod tests {
             .unwrap_or_else(|e| panic!("{e}"));
         assert!(attempt.is_retransmission());
         assert_eq!(attempt.hop_by_hop_identifier(), 5000);
-        let wire = restored
-            .attempt_wire_message(first.value())
-            .unwrap_or_else(|e| panic!("{e}"));
+        let wire = dispatch(&mut restored, first.value());
         assert!(wire.header.flags.is_potentially_retransmitted());
         assert_eq!(wire.header.end_to_end_identifier, 0x0BAD_CAFE);
         assert_eq!(wire.raw_avps, canonical_request(None).raw_avps);
@@ -2818,21 +4322,20 @@ mod tests {
         let tracked = table
             .track(canonical_request(None), CONNECTION_A, token(1))
             .unwrap_or_else(|e| panic!("{e}"));
-        let wire = table
-            .attempt_wire_message(tracked.value())
-            .unwrap_or_else(|e| panic!("{e}"));
-        let disposition = table.correlate_answer(
+        let wire = dispatch(&mut table, tracked.value());
+        let completion = match table.correlate_answer(
             CONNECTION_A,
             answer_message(wire.header.hop_by_hop_identifier, 0x0BAD_CAFE),
-        );
-        assert!(matches!(disposition, AnswerDisposition::Completed(_)));
-        let snapshot = table.snapshot();
-        let restored = PendingRequestTable::restore(
-            snapshot.as_bytes(),
-            PendingRequestTableConfig::default(),
-            Arc::new(ManualClock::default()),
-        )
-        .unwrap_or_else(|e| panic!("{e}"));
+        ) {
+            AnswerDisposition::Completed(completion) => completion,
+            other => panic!("expected completion, got {other:?}"),
+        };
+        let acknowledged = acknowledged_delivery(&completion);
+        table
+            .acknowledge_completion_delivery(acknowledged)
+            .unwrap_or_else(|error| panic!("acknowledge delivery: {error}"));
+        let snapshot = snapshot_at(&mut table, 2);
+        let restored = restore_snapshot(&snapshot, PendingRequestTableConfig::default());
         assert_eq!(restored.pending_count(), 0);
     }
 
@@ -2845,7 +4348,7 @@ mod tests {
         table
             .track(canonical_request(None), CONNECTION_A, token(1))
             .unwrap_or_else(|e| panic!("{e}"));
-        let snapshot = table.snapshot();
+        let snapshot = snapshot_at(&mut table, 1);
         let bytes = snapshot.as_bytes().to_vec();
 
         let mut bad_magic = bytes.clone();
@@ -2853,6 +4356,7 @@ mod tests {
         assert!(matches!(
             PendingRequestTable::restore(
                 &bad_magic,
+                checkpoint(1),
                 PendingRequestTableConfig::default(),
                 Arc::new(ManualClock::default())
             ),
@@ -2865,6 +4369,7 @@ mod tests {
         assert!(matches!(
             PendingRequestTable::restore(
                 &stale,
+                checkpoint(1),
                 PendingRequestTableConfig::default(),
                 Arc::new(ManualClock::default())
             ),
@@ -2875,6 +4380,7 @@ mod tests {
             assert!(matches!(
                 PendingRequestTable::restore(
                     &bytes[..cut],
+                    checkpoint(1),
                     PendingRequestTableConfig::default(),
                     Arc::new(ManualClock::default())
                 ),
@@ -2889,6 +4395,7 @@ mod tests {
         assert!(matches!(
             PendingRequestTable::restore(
                 &trailing,
+                checkpoint(1),
                 PendingRequestTableConfig::default(),
                 Arc::new(ManualClock::default())
             ),
@@ -2897,12 +4404,13 @@ mod tests {
 
         // A zero completion token value is invalid.
         let mut zero_token = bytes.clone();
-        for byte in &mut zero_token[8..24] {
+        for byte in &mut zero_token[32..48] {
             *byte = 0;
         }
         assert!(matches!(
             PendingRequestTable::restore(
                 &zero_token,
+                checkpoint(1),
                 PendingRequestTableConfig::default(),
                 Arc::new(ManualClock::default())
             ),
@@ -2911,13 +4419,15 @@ mod tests {
 
         // A pending record must not contain an answered attempt.
         let mut answered = bytes.clone();
-        // Layout: magic(4) version(2) count(2) token(16) generation(8) e2e(4)
+        // Layout: magic(4) version(2) epoch(16) revision(8) count(2),
+        // token(16), generation(8), e2e(4),
         // command(4) app(4) flags(1) attempts(2) conn(8) hbh(4) disposition(1)
-        let disposition_offset = 8 + 16 + 8 + 4 + 4 + 4 + 1 + 2 + 8 + 4;
-        answered[disposition_offset] = 4;
+        let disposition_offset = 32 + 16 + 8 + 4 + 4 + 4 + 1 + 2 + 8 + 4;
+        answered[disposition_offset] = 5;
         assert!(matches!(
             PendingRequestTable::restore(
                 &answered,
+                checkpoint(1),
                 PendingRequestTableConfig::default(),
                 Arc::new(ManualClock::default())
             ),
@@ -2932,6 +4442,7 @@ mod tests {
         assert!(matches!(
             PendingRequestTable::restore(
                 snapshot.as_bytes(),
+                snapshot.checkpoint(),
                 tight,
                 Arc::new(ManualClock::default())
             ),
@@ -2948,21 +4459,12 @@ mod tests {
         let tracked = table
             .track(canonical_request(None), CONNECTION_A, token(42))
             .unwrap_or_else(|e| panic!("{e}"));
-        let first_snapshot = table.snapshot();
-        let first_restore = PendingRequestTable::restore(
-            first_snapshot.as_bytes(),
-            PendingRequestTableConfig::default(),
-            Arc::new(ManualClock::default()),
-        )
-        .unwrap_or_else(|e| panic!("{e}"));
-        let second_snapshot = first_restore.snapshot();
-        assert_eq!(first_snapshot.as_bytes(), second_snapshot.as_bytes());
-        let second_restore = PendingRequestTable::restore(
-            second_snapshot.as_bytes(),
-            PendingRequestTableConfig::default(),
-            Arc::new(ManualClock::default()),
-        )
-        .unwrap_or_else(|e| panic!("{e}"));
+        let first_snapshot = snapshot_at(&mut table, 1);
+        let mut first_restore =
+            restore_snapshot(&first_snapshot, PendingRequestTableConfig::default());
+        let second_snapshot = snapshot_at(&mut first_restore, 2);
+        let second_restore =
+            restore_snapshot(&second_snapshot, PendingRequestTableConfig::default());
         let view = second_restore
             .transaction(tracked.value())
             .unwrap_or_else(|| panic!("view"));
@@ -2983,10 +4485,8 @@ mod tests {
                 token(1),
             )
             .unwrap_or_else(|e| panic!("{e}"));
-        let wire = table
-            .attempt_wire_message(tracked.value())
-            .unwrap_or_else(|e| panic!("{e}"));
-        let snapshot = table.snapshot();
+        let wire = dispatch(&mut table, tracked.value());
+        let snapshot = snapshot_at(&mut table, 2);
         let completion = match table.correlate_answer(
             CONNECTION_A,
             answer_message(wire.header.hop_by_hop_identifier, E2E),
@@ -3057,8 +4557,17 @@ mod tests {
                 max_message_len: DIAMETER_HEADER_LEN - 1,
                 ..PendingRequestTableConfig::default()
             },
+            PendingRequestTableConfig {
+                max_snapshot_bytes: SNAPSHOT_HEADER_LEN - 1,
+                ..PendingRequestTableConfig::default()
+            },
         ] {
-            assert!(PendingRequestTable::new(config, Arc::new(ManualClock::default())).is_err());
+            assert!(PendingRequestTable::new(
+                config,
+                Arc::new(ManualClock::default()),
+                SNAPSHOT_EPOCH
+            )
+            .is_err());
         }
     }
 
@@ -3072,9 +4581,13 @@ mod tests {
             .track(canonical_request(None), CONNECTION_A, token(1))
             .unwrap_or_else(|e| panic!("{e}"));
         assert!(!table.retire(tracked.value()));
-        table
+        let completion = table
             .finish_exhausted(tracked.value())
             .unwrap_or_else(|e| panic!("{e}"));
+        let acknowledged = acknowledged_delivery(&completion);
+        table
+            .acknowledge_completion_delivery(acknowledged)
+            .unwrap_or_else(|error| panic!("acknowledge: {error}"));
         assert!(table.retire(tracked.value()));
         assert!(table.transaction(tracked.value()).is_none());
     }
@@ -3133,11 +4646,14 @@ mod tests {
     #[test]
     fn deterministic_clock_drives_attempt_evidence() {
         let clock = Arc::new(ManualClock::default());
-        let mut table =
-            match PendingRequestTable::new(PendingRequestTableConfig::default(), clock.clone()) {
-                Ok(table) => table,
-                Err(error) => panic!("{error}"),
-            };
+        let mut table = match PendingRequestTable::new(
+            PendingRequestTableConfig::default(),
+            clock.clone(),
+            SNAPSHOT_EPOCH,
+        ) {
+            Ok(table) => table,
+            Err(error) => panic!("{error}"),
+        };
         table
             .add_connection(CONNECTION_A, 100)
             .unwrap_or_else(|e| panic!("{e}"));
@@ -3208,19 +4724,22 @@ mod tests {
         );
         // Completion alone does not release it: the retained completed record
         // still provides late-answer evidence.
-        let wire = table
-            .attempt_wire_message(tracked.value())
-            .unwrap_or_else(|e| panic!("{e}"));
-        let disposition = table.correlate_answer(
+        let wire = dispatch(&mut table, tracked.value());
+        let completion = match table.correlate_answer(
             CONNECTION_A,
             answer_message(wire.header.hop_by_hop_identifier, E2E),
-        );
-        assert!(matches!(disposition, AnswerDisposition::Completed(_)));
+        ) {
+            AnswerDisposition::Completed(completion) => completion,
+            other => panic!("expected completion, got {other:?}"),
+        };
         assert_eq!(
             err_of(table.retire_connection(CONNECTION_A)),
             ConnectionTableError::ConnectionInUse
         );
         // Once the record is retired, the token becomes removable.
+        table
+            .acknowledge_completion_delivery(acknowledged_delivery(&completion))
+            .unwrap_or_else(|error| panic!("acknowledge: {error}"));
         assert!(table.retire(tracked.value()));
         table
             .retire_connection(CONNECTION_A)
@@ -3267,13 +4786,8 @@ mod tests {
                 AlternateRoutability::RealmRouted,
             )
             .unwrap_or_else(|e| panic!("{e}"));
-        let snapshot = table.snapshot();
-        let mut restored = PendingRequestTable::restore(
-            snapshot.as_bytes(),
-            PendingRequestTableConfig::default(),
-            Arc::new(ManualClock::default()),
-        )
-        .unwrap_or_else(|e| panic!("{e}"));
+        let snapshot = snapshot_at(&mut table, 1);
+        let mut restored = restore_snapshot(&snapshot, PendingRequestTableConfig::default());
         // Both historical lifetimes are rejected: re-registering either could
         // allocate a duplicate Hop-by-Hop identifier on one connection.
         assert_eq!(
@@ -3289,9 +4803,12 @@ mod tests {
         restored
             .add_connection(conn(3), 5000)
             .unwrap_or_else(|e| panic!("{e}"));
-        restored
+        let completion = restored
             .finish_indeterminate(tracked.value(), IndeterminateReason::CallerWithdrawn)
             .unwrap_or_else(|e| panic!("{e}"));
+        restored
+            .acknowledge_completion_delivery(acknowledged_delivery(&completion))
+            .unwrap_or_else(|error| panic!("acknowledge: {error}"));
         assert!(restored.retire(tracked.value()));
         restored
             .add_connection(CONNECTION_A, 100)
@@ -3328,29 +4845,27 @@ mod tests {
         let tracked = table
             .track(canonical_request(None), CONNECTION_A, token(1))
             .unwrap_or_else(|e| panic!("{e}"));
-        let snapshot = table.snapshot();
-        let mut restored = PendingRequestTable::restore(
-            snapshot.as_bytes(),
-            PendingRequestTableConfig::default(),
-            Arc::new(ManualClock::default()),
-        )
-        .unwrap_or_else(|e| panic!("{e}"));
+        let snapshot = snapshot_at(&mut table, 1);
+        let mut restored = restore_snapshot(&snapshot, PendingRequestTableConfig::default());
         // The restored attempt is still marked in flight, but its connection
         // lifetime is dead: its pre-crash T-clear bytes are never re-served.
+        let committed = restored
+            .committed_snapshot()
+            .unwrap_or_else(|| panic!("restored committed proof"));
         assert_eq!(
-            err_of(restored.attempt_wire_message(tracked.value())),
+            err_of(restored.take_attempt_dispatch(tracked.value(), committed)),
             TransactionAccessError::NoLiveAttempt
         );
-        // Historical bytes remain inspectable for audit.
+        // Historical state remains inspectable without exposing a second
+        // sendable OwnedMessage.
         let historical = restored
             .transaction(tracked.value())
             .unwrap_or_else(|| panic!("view"))
             .attempts()[0]
-            .attempt_id();
-        let evidence = restored
-            .wire_message_for_attempt(tracked.value(), historical)
-            .unwrap_or_else(|e| panic!("{e}"));
-        assert!(!evidence.header.flags.is_potentially_retransmitted());
+            ;
+        assert_eq!(historical.attempt_id().connection(), CONNECTION_A);
+        assert!(!historical.is_retransmission());
+        assert_eq!(historical.snapshotted_at(), Some(checkpoint(1).revision()));
         // Re-arming through failover produces the sendable T=1 form.
         restored
             .add_connection(conn(3), 5000)
@@ -3358,11 +4873,572 @@ mod tests {
         restored
             .failover(tracked.value(), conn(3), AlternateRoutability::RealmRouted)
             .unwrap_or_else(|e| panic!("{e}"));
-        let rearmed = restored
-            .attempt_wire_message(tracked.value())
-            .unwrap_or_else(|e| panic!("{e}"));
+        let rearmed = dispatch(&mut restored, tracked.value());
         assert!(rearmed.header.flags.is_potentially_retransmitted());
         assert_eq!(rearmed.header.end_to_end_identifier, E2E);
+    }
+
+    #[test]
+    fn terminal_state_never_exposes_a_sendable_attempt() {
+        let mut table = table(PendingRequestTableConfig::default());
+        table
+            .add_connection(CONNECTION_A, 100)
+            .unwrap_or_else(|error| panic!("connection A: {error}"));
+        table
+            .add_connection(CONNECTION_B, 900)
+            .unwrap_or_else(|error| panic!("connection B: {error}"));
+        let tracked = table
+            .track(canonical_request(None), CONNECTION_A, token(1))
+            .unwrap_or_else(|error| panic!("track: {error}"));
+        let _initial_wire = dispatch(&mut table, tracked.value());
+        let parallel = table
+            .failover(
+                tracked.value(),
+                CONNECTION_B,
+                AlternateRoutability::RealmRouted,
+            )
+            .unwrap_or_else(|error| panic!("parallel attempt: {error}"));
+
+        let completion = table.correlate_answer(CONNECTION_A, answer_message(100, E2E));
+        assert!(matches!(completion, AnswerDisposition::Completed(_)));
+
+        let committed = table
+            .committed_snapshot()
+            .unwrap_or_else(|| panic!("committed proof"));
+        assert_eq!(
+            err_of(table.take_attempt_dispatch(tracked.value(), committed)),
+            TransactionAccessError::NotPending
+        );
+        assert_eq!(
+            err_of(table.failover(
+                tracked.value(),
+                CONNECTION_B,
+                AlternateRoutability::RealmRouted
+            )),
+            FailoverError::NotPending
+        );
+        assert_eq!(
+            err_of(table.record_attempt_write_success(tracked.value(), parallel.attempt_id())),
+            TransactionAccessError::NotPending
+        );
+        assert_eq!(
+            table
+                .transaction(tracked.value())
+                .unwrap_or_else(|| panic!("terminal view"))
+                .attempts()[1]
+                .attempt_id(),
+            parallel.attempt_id()
+        );
+    }
+
+    #[test]
+    fn answer_admission_validates_the_complete_header_and_avp_region() {
+        let mut pending_table = table(PendingRequestTableConfig::default());
+        pending_table
+            .add_connection(CONNECTION_A, 100)
+            .unwrap_or_else(|error| panic!("connection: {error}"));
+        let tracked = pending_table
+            .track(canonical_request(None), CONNECTION_A, token(1))
+            .unwrap_or_else(|error| panic!("track: {error}"));
+
+        let mut wrong_p = answer_message(100, E2E);
+        wrong_p.header.flags = CommandFlags::answer(false, false);
+        assert_eq!(
+            rejection_reason(pending_table.correlate_answer(CONNECTION_A, wrong_p)),
+            AnswerRejectionReason::ProxiableMismatch
+        );
+
+        let mut t_set = answer_message(100, E2E);
+        t_set.header.flags = CommandFlags::from_bits(
+            t_set.header.flags.bits() | CommandFlags::POTENTIALLY_RETRANSMITTED,
+        );
+        assert_eq!(
+            rejection_reason(pending_table.correlate_answer(CONNECTION_A, t_set)),
+            AnswerRejectionReason::InvalidFlags
+        );
+
+        let mut reserved = answer_message(100, E2E);
+        reserved.header.flags = CommandFlags::from_bits(reserved.header.flags.bits() | 0x01);
+        assert_eq!(
+            rejection_reason(pending_table.correlate_answer(CONNECTION_A, reserved)),
+            AnswerRejectionReason::InvalidFlags
+        );
+
+        let mut wrong_version = answer_message(100, E2E);
+        wrong_version.header.version = DIAMETER_VERSION + 1;
+        assert_eq!(
+            rejection_reason(pending_table.correlate_answer(CONNECTION_A, wrong_version)),
+            AnswerRejectionReason::UnsupportedVersion
+        );
+
+        let mut bad_length = answer_message(100, E2E);
+        bad_length.header.length = bad_length.header.length.saturating_sub(1);
+        assert_eq!(
+            rejection_reason(pending_table.correlate_answer(CONNECTION_A, bad_length)),
+            AnswerRejectionReason::InvalidLength
+        );
+
+        let mut bad_command = answer_message(100, E2E);
+        bad_command.header.command_code = CommandCode::new(MAX_U24 + 1);
+        assert_eq!(
+            rejection_reason(pending_table.correlate_answer(CONNECTION_A, bad_command)),
+            AnswerRejectionReason::MalformedHeader
+        );
+
+        let mut malformed_avp = answer_message(100, E2E);
+        malformed_avp.raw_avps = Bytes::copy_from_slice(&[0, 0, 0, 1, 0x40, 0, 0, 7]);
+        malformed_avp.header.length = (DIAMETER_HEADER_LEN + malformed_avp.raw_avps.len()) as u32;
+        assert_eq!(
+            rejection_reason(pending_table.correlate_answer(CONNECTION_A, malformed_avp)),
+            AnswerRejectionReason::MalformedAvps
+        );
+
+        assert_eq!(
+            pending_table
+                .transaction(tracked.value())
+                .unwrap_or_else(|| panic!("pending view"))
+                .rejected_answer_count(),
+            7
+        );
+        assert!(matches!(
+            pending_table.correlate_answer(CONNECTION_A, answer_message(100, E2E)),
+            AnswerDisposition::Completed(_)
+        ));
+
+        let mut second = table(PendingRequestTableConfig::default());
+        second
+            .add_connection(CONNECTION_A, 100)
+            .unwrap_or_else(|error| panic!("connection: {error}"));
+        let tracked = second
+            .track(canonical_request(None), CONNECTION_A, token(2))
+            .unwrap_or_else(|error| panic!("track: {error}"));
+        let attempt = second
+            .transaction(tracked.value())
+            .unwrap_or_else(|| panic!("view"))
+            .attempts()[0]
+            .attempt_id();
+        second
+            .record_attempt_failure(tracked.value(), attempt, AttemptFailure::BeforeWrite)
+            .unwrap_or_else(|error| panic!("failure: {error}"));
+        assert_eq!(
+            rejection_reason(second.correlate_answer(CONNECTION_A, answer_message(100, E2E))),
+            AnswerRejectionReason::AttemptNotAnswerEligible
+        );
+        assert_eq!(second.pending_count(), 1);
+    }
+
+    #[test]
+    fn tracking_rejects_non_v1_requests_before_allocating_an_attempt() {
+        let mut pending_table = table(PendingRequestTableConfig::default());
+        pending_table
+            .add_connection(CONNECTION_A, 100)
+            .unwrap_or_else(|error| panic!("connection: {error}"));
+        let mut request = canonical_request(None);
+        request.header.version = DIAMETER_VERSION + 1;
+        assert_eq!(
+            err_of(pending_table.track(request, CONNECTION_A, token(1))),
+            TrackError::UnsupportedVersion
+        );
+        assert_eq!(pending_table.pending_count(), 0);
+        // Rejection did not consume the token, End-to-End identity, or first
+        // Hop-by-Hop allocation.
+        let tracked = pending_table
+            .track(canonical_request(None), CONNECTION_A, token(1))
+            .unwrap_or_else(|error| panic!("ordinary request: {error}"));
+        let wire = dispatch(&mut pending_table, tracked.value());
+        assert_eq!(wire.header.hop_by_hop_identifier, 100);
+    }
+
+    #[test]
+    fn successful_full_write_is_distinct_and_survives_restore() {
+        let clock = Arc::new(ManualClock::default());
+        let mut table = PendingRequestTable::new(
+            PendingRequestTableConfig::default(),
+            clock.clone(),
+            SNAPSHOT_EPOCH,
+        )
+        .unwrap_or_else(|error| panic!("table: {error}"));
+        table
+            .add_connection(CONNECTION_A, 100)
+            .unwrap_or_else(|error| panic!("connection: {error}"));
+        let tracked = table
+            .track(canonical_request(None), CONNECTION_A, token(1))
+            .unwrap_or_else(|error| panic!("track: {error}"));
+        let attempt = table
+            .transaction(tracked.value())
+            .unwrap_or_else(|| panic!("view"))
+            .attempts()[0]
+            .attempt_id();
+        let _wire = dispatch(&mut table, tracked.value());
+        clock.advance(Duration::from_millis(7));
+        let written = table
+            .record_attempt_write_success(tracked.value(), attempt)
+            .unwrap_or_else(|error| panic!("write success: {error}"));
+        assert_eq!(
+            written.disposition(),
+            AttemptDisposition::WrittenAwaitingAnswer
+        );
+        assert_eq!(written.written_at(), Some(Duration::from_millis(7)));
+        let committed = table
+            .committed_snapshot()
+            .unwrap_or_else(|| panic!("committed proof"));
+        assert_eq!(
+            err_of(table.take_attempt_dispatch(tracked.value(), committed)),
+            TransactionAccessError::NoLiveAttempt
+        );
+        assert_eq!(
+            err_of(table.record_attempt_failure(
+                tracked.value(),
+                attempt,
+                AttemptFailure::BeforeWrite
+            )),
+            TransactionAccessError::InvalidAttemptTransition
+        );
+
+        let snapshot = snapshot_at(&mut table, 2);
+        let mut restored = restore_snapshot(&snapshot, PendingRequestTableConfig::default());
+        let restored_attempt = restored
+            .transaction(tracked.value())
+            .unwrap_or_else(|| panic!("restored view"))
+            .attempts()[0];
+        assert_eq!(
+            restored_attempt.disposition(),
+            AttemptDisposition::WrittenAwaitingAnswer
+        );
+        assert_eq!(
+            restored_attempt.written_at(),
+            Some(Duration::from_millis(7))
+        );
+        let committed = restored
+            .committed_snapshot()
+            .unwrap_or_else(|| panic!("restored committed proof"));
+        assert_eq!(
+            err_of(restored.take_attempt_dispatch(tracked.value(), committed)),
+            TransactionAccessError::NoLiveAttempt
+        );
+        restored
+            .add_connection(CONNECTION_B, 900)
+            .unwrap_or_else(|error| panic!("alternate: {error}"));
+        restored
+            .failover(
+                tracked.value(),
+                CONNECTION_B,
+                AlternateRoutability::RealmRouted,
+            )
+            .unwrap_or_else(|error| panic!("rearm: {error}"));
+        let committed = commit_next(&mut restored);
+        assert!(restored
+            .take_attempt_dispatch(tracked.value(), committed)
+            .unwrap_or_else(|error| panic!("rearmed wire: {error}"))
+            .message()
+            .header
+            .flags
+            .is_potentially_retransmitted());
+
+        let lost = table
+            .record_attempt_failure(
+                tracked.value(),
+                attempt,
+                AttemptFailure::TransportLostAfterWrite,
+            )
+            .unwrap_or_else(|error| panic!("transport loss: {error}"));
+        assert_eq!(
+            lost.disposition(),
+            AttemptDisposition::TransportLostAfterWrite
+        );
+        assert_eq!(lost.written_at(), Some(Duration::from_millis(7)));
+    }
+
+    #[test]
+    fn snapshot_checkpoint_is_exact_monotonic_and_size_bounded() {
+        let mut pending_table = table(PendingRequestTableConfig::default());
+        pending_table
+            .add_connection(CONNECTION_A, 100)
+            .unwrap_or_else(|error| panic!("connection A: {error}"));
+        pending_table
+            .add_connection(CONNECTION_B, 900)
+            .unwrap_or_else(|error| panic!("connection B: {error}"));
+        let tracked = pending_table
+            .track(canonical_request(None), CONNECTION_A, token(1))
+            .unwrap_or_else(|error| panic!("track: {error}"));
+        let first = snapshot_at(&mut pending_table, 1);
+        pending_table
+            .failover(
+                tracked.value(),
+                CONNECTION_B,
+                AlternateRoutability::RealmRouted,
+            )
+            .unwrap_or_else(|error| panic!("failover: {error}"));
+        let second = snapshot_at(&mut pending_table, 2);
+
+        assert_eq!(
+            PendingRequestTable::restore(
+                first.as_bytes(),
+                checkpoint(2),
+                PendingRequestTableConfig::default(),
+                Arc::new(ManualClock::default())
+            )
+            .err(),
+            Some(SnapshotRestoreError::Stale)
+        );
+        assert_eq!(
+            PendingRequestTable::restore(
+                second.as_bytes(),
+                checkpoint(1),
+                PendingRequestTableConfig::default(),
+                Arc::new(ManualClock::default())
+            )
+            .err(),
+            Some(SnapshotRestoreError::Uncommitted)
+        );
+        assert!(PendingRequestTable::restore(
+            second.as_bytes(),
+            checkpoint(2),
+            PendingRequestTableConfig::default(),
+            Arc::new(ManualClock::default())
+        )
+        .is_ok());
+        let other_epoch =
+            PendingSnapshotEpoch::new(NonZeroU128::new(2).unwrap_or_else(|| panic!("other epoch")));
+        assert_eq!(
+            PendingRequestTable::restore(
+                second.as_bytes(),
+                PendingSnapshotCheckpoint::new(other_epoch, checkpoint(2).revision()),
+                PendingRequestTableConfig::default(),
+                Arc::new(ManualClock::default())
+            )
+            .err(),
+            Some(SnapshotRestoreError::EpochMismatch)
+        );
+
+        assert_eq!(
+            pending_table.snapshot(checkpoint(2)).err(),
+            Some(SnapshotCreateError::RevisionNotAdvanced)
+        );
+        assert_eq!(
+            pending_table.snapshot(checkpoint(1)).err(),
+            Some(SnapshotCreateError::RevisionNotAdvanced)
+        );
+        assert!(pending_table.snapshot(checkpoint(3)).is_ok());
+
+        let mut legacy = first.as_bytes().to_vec();
+        legacy[4..6].copy_from_slice(&1_u16.to_be_bytes());
+        assert_eq!(
+            PendingRequestTable::restore(
+                &legacy,
+                checkpoint(1),
+                PendingRequestTableConfig::default(),
+                Arc::new(ManualClock::default())
+            )
+            .err(),
+            Some(SnapshotRestoreError::UnsupportedVersion)
+        );
+
+        let exact_config = PendingRequestTableConfig {
+            max_snapshot_bytes: first.len(),
+            ..PendingRequestTableConfig::default()
+        };
+        let mut exact = table(exact_config);
+        exact
+            .add_connection(CONNECTION_A, 100)
+            .unwrap_or_else(|error| panic!("exact connection: {error}"));
+        exact
+            .track(canonical_request(None), CONNECTION_A, token(1))
+            .unwrap_or_else(|error| panic!("exact track: {error}"));
+        assert_eq!(snapshot_at(&mut exact, 1).len(), first.len());
+
+        let tight_config = PendingRequestTableConfig {
+            max_snapshot_bytes: first.len() - 1,
+            ..PendingRequestTableConfig::default()
+        };
+        let mut tight = table(tight_config);
+        tight
+            .add_connection(CONNECTION_A, 100)
+            .unwrap_or_else(|error| panic!("tight connection: {error}"));
+        tight
+            .track(canonical_request(None), CONNECTION_A, token(1))
+            .unwrap_or_else(|error| panic!("tight track: {error}"));
+        assert_eq!(
+            tight.snapshot(checkpoint(1)).err(),
+            Some(SnapshotCreateError::SizeLimitExceeded)
+        );
+        assert_eq!(
+            PendingRequestTable::restore(
+                first.as_bytes(),
+                checkpoint(1),
+                tight_config,
+                Arc::new(ManualClock::default())
+            )
+            .err(),
+            Some(SnapshotRestoreError::LimitExceeded)
+        );
+    }
+
+    #[test]
+    fn completion_delivery_record_fences_claims_and_has_a_strict_codec() {
+        let mut table = table(PendingRequestTableConfig::default());
+        table
+            .add_connection(CONNECTION_A, 100)
+            .unwrap_or_else(|error| panic!("connection: {error}"));
+        let tracked = table
+            .track(canonical_request(None), CONNECTION_A, token(1))
+            .unwrap_or_else(|error| panic!("track: {error}"));
+        let completion = table
+            .finish_exhausted(tracked.value())
+            .unwrap_or_else(|error| panic!("finish: {error}"));
+        let ready = CompletionDeliveryRecord::new(SNAPSHOT_EPOCH, completion.token())
+            .unwrap_or_else(|error| panic!("ready: {error}"));
+        assert_eq!(ready.state(), CompletionDeliveryState::Ready);
+        assert_eq!(
+            CompletionDeliveryRecord::decode(ready.encode().as_bytes()),
+            Ok(ready)
+        );
+        assert_eq!(
+            ready.encode().as_bytes().len(),
+            CompletionDeliveryRecord::ENCODED_LEN
+        );
+
+        let epoch_two = PendingSnapshotEpoch::new(
+            NonZeroU128::new(2).unwrap_or_else(|| panic!("second epoch")),
+        );
+        let other_epoch = CompletionDeliveryRecord::new(epoch_two, completion.token())
+            .unwrap_or_else(|error| panic!("other epoch: {error}"));
+        assert_ne!(ready.key(), other_epoch.key());
+
+        let claim_a =
+            CompletionClaimValue::new(NonZeroU128::new(0xA).unwrap_or_else(|| panic!("claim A")));
+        let claim_b =
+            CompletionClaimValue::new(NonZeroU128::new(0xB).unwrap_or_else(|| panic!("claim B")));
+        let (claimed_a, proof_a) = ready
+            .claim(claim_a)
+            .unwrap_or_else(|error| panic!("claim A: {error}"));
+        let (claimed_b, _) = ready
+            .claim(claim_b)
+            .unwrap_or_else(|error| panic!("claim B: {error}"));
+        // Two contenders may compute candidates, but exact-byte CAS admits
+        // only the one whose expected Ready bytes still match.
+        let expected = ready.encode().as_bytes().to_vec();
+        let mut durable = expected.clone();
+        if durable == expected {
+            durable = claimed_a.encode().as_bytes().to_vec();
+        }
+        assert_ne!(durable, expected);
+        assert_ne!(durable, claimed_b.encode().as_bytes());
+
+        let recovered = CompletionDeliveryRecord::decode(&durable)
+            .unwrap_or_else(|error| panic!("decode claimed: {error}"));
+        let (reclaimed, proof_b) = recovered
+            .reclaim(claim_b)
+            .unwrap_or_else(|error| panic!("reclaim: {error}"));
+        assert_eq!(proof_b.generation().get(), 2);
+        assert_eq!(
+            reclaimed.acknowledge(proof_a).err(),
+            Some(CompletionDeliveryError::StaleClaim)
+        );
+        let released = reclaimed
+            .release(proof_b)
+            .unwrap_or_else(|error| panic!("release: {error}"));
+        let (claimed_again, proof_again) = released
+            .claim(claim_a)
+            .unwrap_or_else(|error| panic!("claim after release: {error}"));
+        assert_eq!(proof_again.generation().get(), 3);
+        let acknowledged = claimed_again
+            .acknowledge(proof_again)
+            .unwrap_or_else(|error| panic!("acknowledge: {error}"));
+        assert_eq!(
+            CompletionDeliveryRecord::decode(acknowledged.encode().as_bytes()),
+            Ok(acknowledged)
+        );
+
+        let mut malformed = ready.encode().as_bytes().to_vec();
+        assert_eq!(
+            CompletionDeliveryRecord::decode(&malformed[..malformed.len() - 1]),
+            Err(CompletionDeliveryError::MalformedRecord)
+        );
+        malformed.push(0);
+        assert_eq!(
+            CompletionDeliveryRecord::decode(&malformed),
+            Err(CompletionDeliveryError::MalformedRecord)
+        );
+        let mut unsupported = ready.encode().as_bytes().to_vec();
+        unsupported[4..6].copy_from_slice(&2_u16.to_be_bytes());
+        assert_eq!(
+            CompletionDeliveryRecord::decode(&unsupported),
+            Err(CompletionDeliveryError::UnsupportedVersion)
+        );
+        let mut impossible = ready.encode().as_bytes().to_vec();
+        impossible[6] = 1;
+        assert_eq!(
+            CompletionDeliveryRecord::decode(&impossible),
+            Err(CompletionDeliveryError::InvalidState)
+        );
+        let mut exhausted = ready.encode().as_bytes().to_vec();
+        exhausted[48..56].copy_from_slice(&u64::MAX.to_be_bytes());
+        let exhausted = CompletionDeliveryRecord::decode(&exhausted)
+            .unwrap_or_else(|error| panic!("max generation record: {error}"));
+        assert_eq!(
+            exhausted.claim(claim_a).err(),
+            Some(CompletionDeliveryError::ClaimGenerationExhausted)
+        );
+
+        let debug = format!("{ready:?} {:?}", ready.encode());
+        assert!(!debug.contains(&SNAPSHOT_EPOCH.get().to_string()));
+        assert!(!debug.contains(&completion.token().value().get().to_string()));
+    }
+
+    #[test]
+    fn acknowledged_delivery_gates_snapshot_and_reconciles_the_old_head() {
+        let mut table = table(PendingRequestTableConfig::default());
+        table
+            .add_connection(CONNECTION_A, 100)
+            .unwrap_or_else(|error| panic!("connection: {error}"));
+        let tracked = table
+            .track(canonical_request(None), CONNECTION_A, token(1))
+            .unwrap_or_else(|error| panic!("track: {error}"));
+        let old_head = snapshot_at(&mut table, 1);
+        let completion = table
+            .finish_exhausted(tracked.value())
+            .unwrap_or_else(|error| panic!("finish: {error}"));
+        assert_eq!(table.unacknowledged_completion_count(), 1);
+        assert_eq!(
+            table.snapshot(checkpoint(2)).err(),
+            Some(SnapshotCreateError::UnacknowledgedCompletion)
+        );
+        assert!(!table.retire(tracked.value()));
+
+        let ready = CompletionDeliveryRecord::new(SNAPSHOT_EPOCH, completion.token())
+            .unwrap_or_else(|error| panic!("ready: {error}"));
+        assert_eq!(
+            table.acknowledge_completion_delivery(ready).err(),
+            Some(CompletionDeliveryError::NotAcknowledged)
+        );
+        let acknowledged = acknowledged_delivery(&completion);
+        table
+            .acknowledge_completion_delivery(acknowledged)
+            .unwrap_or_else(|error| panic!("table acknowledgement: {error}"));
+        assert_eq!(table.unacknowledged_completion_count(), 0);
+        let new_head = snapshot_at(&mut table, 2);
+
+        // Crash after the side effect plus Ack became durable but before the
+        // pending-only head advanced: restore the still-authoritative old head
+        // and reconcile Ack before any retransmission.
+        let mut recovered = restore_snapshot(&old_head, PendingRequestTableConfig::default());
+        assert_eq!(recovered.reconcile_acknowledged(acknowledged), Ok(true));
+        assert_eq!(recovered.pending_count(), 0);
+        assert!(recovered.transaction(tracked.value()).is_none());
+        let recovered_head = snapshot_at(&mut recovered, 2);
+        assert_eq!(recovered_head.as_bytes(), new_head.as_bytes());
+        assert_eq!(
+            PendingRequestTable::restore(
+                old_head.as_bytes(),
+                checkpoint(2),
+                PendingRequestTableConfig::default(),
+                Arc::new(ManualClock::default())
+            )
+            .err(),
+            Some(SnapshotRestoreError::Stale)
+        );
+        assert!(table.retire(tracked.value()));
     }
 
     /// Encode one snapshot record in the versioned on-disk form.
@@ -3385,8 +5461,18 @@ mod tests {
         for (connection, hop_by_hop, disposition, started, ended) in attempts {
             out.extend_from_slice(&connection.to_be_bytes());
             out.extend_from_slice(&hop_by_hop.to_be_bytes());
-            out.push(*disposition);
+            let disposition = match disposition {
+                0 => 0,
+                1 => 2,
+                2 => 3,
+                3 => 4,
+                4 => 5,
+                other => *other,
+            };
+            out.push(disposition);
             out.extend_from_slice(&started.to_be_bytes());
+            let written = if disposition == 4 { *started } else { u64::MAX };
+            out.extend_from_slice(&written.to_be_bytes());
             out.extend_from_slice(&ended.to_be_bytes());
         }
         out.extend_from_slice(&(raw_avps.len() as u32).to_be_bytes());
@@ -3397,7 +5483,9 @@ mod tests {
     fn snapshot_bytes(records: &[Vec<u8>]) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&0x4450_5453_u32.to_be_bytes());
-        out.extend_from_slice(&1_u16.to_be_bytes());
+        out.extend_from_slice(&SNAPSHOT_VERSION.to_be_bytes());
+        out.extend_from_slice(&SNAPSHOT_EPOCH.get().to_be_bytes());
+        out.extend_from_slice(&1_u64.to_be_bytes());
         out.extend_from_slice(&(records.len() as u16).to_be_bytes());
         for record in records {
             out.extend_from_slice(record);
@@ -3410,7 +5498,12 @@ mod tests {
     }
 
     fn restore_error(bytes: &[u8], config: PendingRequestTableConfig) -> SnapshotRestoreError {
-        match PendingRequestTable::restore(bytes, config, Arc::new(ManualClock::default())) {
+        match PendingRequestTable::restore(
+            bytes,
+            checkpoint(1),
+            config,
+            Arc::new(ManualClock::default()),
+        ) {
             Ok(_) => panic!("tampered snapshot must be rejected"),
             Err(error) => error,
         }
@@ -3428,8 +5521,13 @@ mod tests {
             &[(1, 100, 0, 0, NONE)],
             &minimal_avps(),
         )]);
-        PendingRequestTable::restore(&baseline, config, Arc::new(ManualClock::default()))
-            .unwrap_or_else(|e| panic!("baseline must restore: {e}"));
+        PendingRequestTable::restore(
+            &baseline,
+            checkpoint(1),
+            config,
+            Arc::new(ManualClock::default()),
+        )
+        .unwrap_or_else(|e| panic!("baseline must restore: {e}"));
 
         // A nonzero completion generation is impossible for a pending record.
         let bad_generation = snapshot_bytes(&[snapshot_record(

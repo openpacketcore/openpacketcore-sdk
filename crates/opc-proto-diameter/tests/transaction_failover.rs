@@ -8,7 +8,6 @@
 
 #![cfg(feature = "app-swm")]
 
-use std::collections::HashMap;
 use std::num::{NonZeroU128, NonZeroU64};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -25,11 +24,13 @@ use opc_proto_diameter::end_to_end::{
     DiameterEndToEndIdentifierConfig, DiameterEndToEndIdentifierTime,
 };
 use opc_proto_diameter::transaction::{
-    AlternateRoutability, AnswerDisposition, AnswerRejectionReason, AttemptFailure, CompletionKind,
-    CompletionTokenValue, ConnectionTableError, DiameterConnectionToken, FailoverError,
-    IndeterminateReason, PendingRequestClock, PendingRequestTable, PendingRequestTableConfig,
-    SnapshotRestoreError, TrackError, TransactionAccessError, TransactionCompletion,
-    UndeliverableReason,
+    AlternateRoutability, AnswerDisposition, AnswerRejectionReason, AttemptFailure,
+    CommittedPendingSnapshot, CompletionClaimValue, CompletionDeliveryError,
+    CompletionDeliveryRecord, CompletionKind, CompletionTokenValue, ConnectionTableError,
+    DiameterConnectionToken, FailoverError, IndeterminateReason, PendingRequestClock,
+    PendingRequestTable, PendingRequestTableConfig, PendingSnapshotCheckpoint,
+    PendingSnapshotEpoch, PendingSnapshotRevision, PendingTableSnapshot, SnapshotRestoreError,
+    TrackError, TransactionAccessError, TransactionCompletion, UndeliverableReason,
 };
 use opc_proto_diameter::{CommandFlags, Message, OwnedMessage};
 use opc_protocol::{BorrowDecode, DecodeContext, Encode, EncodeContext};
@@ -49,6 +50,7 @@ const AAA_HOST: &str = "aaa.private.invalid";
 const AAA_REALM: &str = "home.private.invalid";
 const EAP_RESPONSE: [u8; 5] = [0x02, 0x35, 0x00, 0x05, 0x01];
 const EAP_REQUEST: [u8; 5] = [0x01, 0x36, 0x00, 0x05, 0x01];
+const SNAPSHOT_EPOCH: PendingSnapshotEpoch = PendingSnapshotEpoch::new(NonZeroU128::MIN);
 
 const fn conn(value: u64) -> DiameterConnectionToken {
     match NonZeroU64::new(value) {
@@ -62,6 +64,60 @@ fn token(value: u128) -> CompletionTokenValue {
         Some(value) => CompletionTokenValue::new(value),
         None => panic!("completion token must be nonzero"),
     }
+}
+
+fn checkpoint(revision: u64) -> PendingSnapshotCheckpoint {
+    PendingSnapshotCheckpoint::new(
+        SNAPSHOT_EPOCH,
+        PendingSnapshotRevision::new(NonZeroU64::new(revision).expect("nonzero revision")),
+    )
+}
+
+fn snapshot_at(table: &mut PendingRequestTable, revision: u64) -> PendingTableSnapshot {
+    let snapshot = table
+        .snapshot(checkpoint(revision))
+        .expect("snapshot must encode");
+    table
+        .confirm_snapshot_committed(snapshot.checkpoint())
+        .expect("snapshot must be committed");
+    snapshot
+}
+
+fn commit_next(table: &mut PendingRequestTable) -> CommittedPendingSnapshot {
+    let revision = table
+        .latest_emitted_snapshot()
+        .map_or(1, |checkpoint| checkpoint.revision().get() + 1);
+    let _snapshot = snapshot_at(table, revision);
+    table.committed_snapshot().expect("committed proof")
+}
+
+fn dispatch(table: &mut PendingRequestTable, token: CompletionTokenValue) -> OwnedMessage {
+    let committed = commit_next(table);
+    table
+        .take_attempt_dispatch(token, committed)
+        .map(|dispatch| dispatch.into_message())
+        .expect("attempt must dispatch once")
+}
+
+fn restore_snapshot(snapshot: &PendingTableSnapshot) -> PendingRequestTable {
+    PendingRequestTable::restore(
+        snapshot.as_bytes(),
+        snapshot.checkpoint(),
+        PendingRequestTableConfig::default(),
+        Arc::new(ManualClock::default()),
+    )
+    .expect("snapshot must restore")
+}
+
+fn acknowledged_delivery(completion: &TransactionCompletion) -> CompletionDeliveryRecord {
+    let ready = CompletionDeliveryRecord::new(SNAPSHOT_EPOCH, completion.token())
+        .expect("terminal completion creates delivery record");
+    let claim_value =
+        CompletionClaimValue::new(NonZeroU128::new(0xCA11).expect("nonzero claim value"));
+    let (claimed, claim) = ready.claim(claim_value).expect("ready record is claimable");
+    claimed
+        .acknowledge(claim)
+        .expect("current claim is acknowledgeable")
 }
 
 #[derive(Debug, Default)]
@@ -91,7 +147,8 @@ fn harness() -> Harness {
 
 fn harness_with(config: PendingRequestTableConfig) -> Harness {
     let clock = Arc::new(ManualClock::default());
-    let table = PendingRequestTable::new(config, clock.clone()).expect("valid config");
+    let table =
+        PendingRequestTable::new(config, clock.clone(), SNAPSHOT_EPOCH).expect("valid config");
     Harness { table, clock }
 }
 
@@ -226,10 +283,7 @@ fn loss_before_write_failover_alternate_succeeds() {
         .table
         .track(build_der(0xE2E0_0001, false), CONNECTION_A, token(1))
         .expect("track");
-    let first_wire = harness
-        .table
-        .attempt_wire_message(tracked.value())
-        .expect("wire");
+    let first_wire = dispatch(&mut harness.table, tracked.value());
     assert_eq!(first_wire.header.hop_by_hop_identifier, HBH_A);
     assert!(!first_wire.header.flags.is_potentially_retransmitted());
 
@@ -256,10 +310,7 @@ fn loss_before_write_failover_alternate_succeeds() {
         .expect("failover");
     assert!(alternate.is_retransmission());
     assert_eq!(alternate.hop_by_hop_identifier(), HBH_B);
-    let alternate_wire = harness
-        .table
-        .attempt_wire_message(tracked.value())
-        .expect("wire");
+    let alternate_wire = dispatch(&mut harness.table, tracked.value());
     assert!(alternate_wire.header.flags.is_potentially_retransmitted());
     assert_eq!(
         alternate_wire.header.end_to_end_identifier,
@@ -377,10 +428,7 @@ fn every_alternate_attempt_preserves_wire_identity() {
         .table
         .track(canonical.clone(), CONNECTION_A, token(4))
         .expect("track");
-    let original_wire = harness
-        .table
-        .attempt_wire_message(tracked.value())
-        .expect("wire");
+    let original_wire = dispatch(&mut harness.table, tracked.value());
     let first_attempt = harness
         .table
         .transaction(tracked.value())
@@ -399,6 +447,7 @@ fn every_alternate_attempt_preserves_wire_identity() {
             AlternateRoutability::RealmRouted,
         )
         .expect("failover B");
+    let _second_wire = dispatch(&mut harness.table, tracked.value());
     let second_attempt = harness
         .table
         .transaction(tracked.value())
@@ -421,10 +470,7 @@ fn every_alternate_attempt_preserves_wire_identity() {
             AlternateRoutability::RealmRouted,
         )
         .expect("failover C");
-    let third_wire = harness
-        .table
-        .attempt_wire_message(tracked.value())
-        .expect("wire");
+    let third_wire = dispatch(&mut harness.table, tracked.value());
 
     // Every alternate attempt: T=1, exact original End-to-End and Origin-Host,
     // Hop-by-Hop unique on its own connection, semantic AVPs byte-identical.
@@ -757,10 +803,7 @@ fn swm_eap_multi_round_stays_sticky_across_failover() {
         .table
         .track(canonical.clone(), CONNECTION_A, token(12))
         .expect("track");
-    let original_wire = harness
-        .table
-        .attempt_wire_message(tracked.value())
-        .expect("wire");
+    let original_wire = dispatch(&mut harness.table, tracked.value());
     assert_eq!(
         harness
             .table
@@ -775,10 +818,7 @@ fn swm_eap_multi_round_stays_sticky_across_failover() {
             AlternateRoutability::RealmRouted,
         )
         .expect("failover");
-    let alternate_wire = harness
-        .table
-        .attempt_wire_message(tracked.value())
-        .expect("wire");
+    let alternate_wire = dispatch(&mut harness.table, tracked.value());
     // Failover never manufactures an EAP packet or a new application request:
     // the alternate carries the byte-identical canonical request including
     // the original EAP-Response payload.
@@ -863,20 +903,11 @@ fn snapshot_restore_retransmits_pending_with_t_and_stable_identity() {
         .table
         .track(build_der(0xE2E0_000D, false), CONNECTION_A, token(13))
         .expect("track");
-    let original_wire = harness
-        .table
-        .attempt_wire_message(tracked.value())
-        .expect("wire");
-    let snapshot = harness.table.snapshot();
+    let original_wire = dispatch(&mut harness.table, tracked.value());
+    let snapshot = snapshot_at(&mut harness.table, 2);
 
     // Simulate crash + restart: a fresh table restores the pending record.
-    let clock = Arc::new(ManualClock::default());
-    let mut restored = PendingRequestTable::restore(
-        snapshot.as_bytes(),
-        PendingRequestTableConfig::default(),
-        clock,
-    )
-    .expect("restore");
+    let mut restored = restore_snapshot(&snapshot);
     restored
         .add_connection(CONNECTION_C, HBH_C)
         .expect("connection C");
@@ -889,9 +920,7 @@ fn snapshot_restore_retransmits_pending_with_t_and_stable_identity() {
         .expect("restored retransmission");
     assert!(attempt.is_retransmission());
     assert_eq!(attempt.hop_by_hop_identifier(), HBH_C);
-    let wire = restored
-        .attempt_wire_message(tracked.value())
-        .expect("wire");
+    let wire = dispatch(&mut restored, tracked.value());
     assert!(wire.header.flags.is_potentially_retransmitted());
     assert_eq!(wire.header.end_to_end_identifier, 0xE2E0_000D);
     assert_eq!(wire.raw_avps, original_wire.raw_avps);
@@ -909,7 +938,7 @@ fn restored_delivery_is_at_least_once_and_durable_claim_dedups() {
         .track(build_der(0xE2E0_000E, false), CONNECTION_A, token(14))
         .expect("track");
     // The consumer durably snapshots before the answer arrives.
-    let snapshot = harness.table.snapshot();
+    let snapshot = snapshot_at(&mut harness.table, 1);
 
     // Live path: the answer completes the transaction once.
     let first = harness
@@ -919,16 +948,17 @@ fn restored_delivery_is_at_least_once_and_durable_claim_dedups() {
         AnswerDisposition::Completed(completion) => completion,
         other => panic!("expected completion, got {other:?}"),
     };
+    let ready = CompletionDeliveryRecord::new(SNAPSHOT_EPOCH, first_completion.token())
+        .expect("terminal completion delivery record");
+    // Persist the fixed-width record atomically with a redaction-safe,
+    // replayable application intent. In production the intent includes the
+    // encrypted outcome needed to resume the exact downstream operation.
+    let durable_intent = b"advance-one-eap-round".to_vec();
+    let mut durable_record = ready.encode().as_bytes().to_vec();
 
-    // Crash after the consumer claimed but did not durably acknowledge the
-    // delivery; the pending snapshot is restored and retransmitted.
-    let clock = Arc::new(ManualClock::default());
-    let mut restored = PendingRequestTable::restore(
-        snapshot.as_bytes(),
-        PendingRequestTableConfig::default(),
-        clock,
-    )
-    .expect("restore");
+    // Crash before the outcome is acknowledged: the still-authoritative old
+    // pending snapshot may deliver the same terminal identity again.
+    let mut restored = restore_snapshot(&snapshot);
     restored
         .add_connection(CONNECTION_C, HBH_C)
         .expect("connection C");
@@ -950,20 +980,71 @@ fn restored_delivery_is_at_least_once_and_durable_claim_dedups() {
     assert_eq!(first_completion.token(), second_completion.token());
     assert_eq!(first_completion.token().generation(), 1);
 
-    // Without a durable protocol the consumer would apply both. With a
-    // compare-and-set claim on (token, generation), exactly one applies.
-    let mut durable_claims: HashMap<(u128, u64), bool> = HashMap::new();
-    let mut applied = 0usize;
-    for completion in [first_completion, second_completion] {
-        let key = (
-            completion.token().value().get(),
-            completion.token().generation(),
-        );
-        if durable_claims.insert(key, true).is_none() {
-            applied += 1;
-        }
+    // Both deliveries race from the same durable Ready bytes. Only one exact
+    // compare-and-swap can win.
+    let claim_a = CompletionClaimValue::new(NonZeroU128::new(0xA).expect("nonzero claim A"));
+    let claim_b = CompletionClaimValue::new(NonZeroU128::new(0xB).expect("nonzero claim B"));
+    let observed_ready =
+        CompletionDeliveryRecord::decode(&durable_record).expect("decode Ready after crash");
+    let (candidate_a, proof_a) = observed_ready.claim(claim_a).expect("claim A");
+    let (candidate_b, _) = observed_ready.claim(claim_b).expect("claim B candidate");
+    let expected_ready = durable_record.clone();
+    if durable_record == expected_ready {
+        durable_record = candidate_a.encode().as_bytes().to_vec();
     }
-    assert_eq!(applied, 1);
+    assert_ne!(durable_record, candidate_b.encode().as_bytes());
+
+    // Crash while Claimed is explicitly unfinished. A new owner fences the
+    // old claim with a higher generation and resumes the persisted intent.
+    assert_eq!(durable_intent, b"advance-one-eap-round");
+    let recovered_claim =
+        CompletionDeliveryRecord::decode(&durable_record).expect("decode Claimed after crash");
+    let (reclaimed, proof_b) = recovered_claim.reclaim(claim_b).expect("reclaim");
+    durable_record = reclaimed.encode().as_bytes().to_vec();
+    assert_eq!(
+        reclaimed.acknowledge(proof_a).err(),
+        Some(CompletionDeliveryError::StaleClaim)
+    );
+
+    // Apply to an idempotent sink keyed by the epoch-namespaced completion
+    // identity. Then crash after effect but before Ack.
+    let mut effect_attempts = 1usize;
+    let mut applied_keys = vec![reclaimed.key()];
+    let after_effect_before_ack = durable_record.clone();
+
+    // Recovery must retry Claimed rather than skip it. The sink sees a second
+    // attempt but suppresses the duplicate effect by the durable key.
+    let recovered_after_effect = CompletionDeliveryRecord::decode(&after_effect_before_ack)
+        .expect("decode post-effect Claimed");
+    let claim_c = CompletionClaimValue::new(NonZeroU128::new(0xC).expect("nonzero claim C"));
+    let (reclaimed_again, proof_c) = recovered_after_effect
+        .reclaim(claim_c)
+        .expect("second reclaim");
+    durable_record = reclaimed_again.encode().as_bytes().to_vec();
+    effect_attempts += 1;
+    if !applied_keys.contains(&reclaimed_again.key()) {
+        applied_keys.push(reclaimed_again.key());
+    }
+    let acknowledged = reclaimed_again
+        .acknowledge(proof_c)
+        .expect("acknowledge current claim");
+    durable_record = acknowledged.encode().as_bytes().to_vec();
+    assert_eq!(effect_attempts, 2);
+    assert_eq!(applied_keys.len(), 1);
+    assert_eq!(
+        CompletionDeliveryRecord::decode(&durable_record),
+        Ok(acknowledged)
+    );
+    assert_eq!(proof_b.generation().get(), 2);
+
+    // If the process again restores the old pending head, the durable Ack is
+    // reconciled before re-arm, so no network request or side effect repeats.
+    let mut recovered_table = restore_snapshot(&snapshot);
+    assert_eq!(
+        recovered_table.reconcile_acknowledged(acknowledged),
+        Ok(true)
+    );
+    assert_eq!(recovered_table.pending_count(), 0);
 }
 
 #[test]
@@ -974,7 +1055,7 @@ fn restore_rejects_stale_and_malformed_snapshots() {
         .table
         .track(build_der(0xE2E0_000F, false), CONNECTION_A, token(15))
         .expect("track");
-    let snapshot = harness.table.snapshot();
+    let snapshot = snapshot_at(&mut harness.table, 1);
     let bytes = snapshot.as_bytes().to_vec();
 
     let mut stale = bytes.clone();
@@ -982,6 +1063,7 @@ fn restore_rejects_stale_and_malformed_snapshots() {
     assert_eq!(
         PendingRequestTable::restore(
             &stale,
+            checkpoint(1),
             PendingRequestTableConfig::default(),
             Arc::new(ManualClock::default())
         )
@@ -991,6 +1073,7 @@ fn restore_rejects_stale_and_malformed_snapshots() {
     let truncated = &bytes[..bytes.len() - 3];
     assert!(PendingRequestTable::restore(
         truncated,
+        checkpoint(1),
         PendingRequestTableConfig::default(),
         Arc::new(ManualClock::default())
     )
@@ -1000,6 +1083,7 @@ fn restore_rejects_stale_and_malformed_snapshots() {
     assert_eq!(
         PendingRequestTable::restore(
             &garbage,
+            checkpoint(1),
             PendingRequestTableConfig::default(),
             Arc::new(ManualClock::default())
         )
@@ -1023,6 +1107,7 @@ fn fixed_destination_without_alternate_is_typed_undeliverable() {
         .table
         .track(build_der(0xE2E0_0010, true), CONNECTION_A, token(16))
         .expect("track");
+    let wire = dispatch(&mut harness.table, tracked.value());
     assert_eq!(
         harness
             .table
@@ -1039,18 +1124,8 @@ fn fixed_destination_without_alternate_is_typed_undeliverable() {
         Err(error) => error,
     };
     assert_eq!(error, FailoverError::FixedDestinationRequiresAssertion);
-    // The destination is never silently dropped or rewritten — even after the
-    // only attempt failed, its exact recorded bytes retain Destination-Host.
-    let first_attempt = harness
-        .table
-        .transaction(tracked.value())
-        .expect("view")
-        .attempts()[0]
-        .attempt_id();
-    let wire = harness
-        .table
-        .wire_message_for_attempt(tracked.value(), first_attempt)
-        .expect("wire");
+    // The destination is never silently dropped or rewritten: the consumed
+    // dispatch retained Destination-Host byte-for-byte.
     assert!(wire
         .raw_avps
         .windows(AAA_HOST.len())
@@ -1087,10 +1162,7 @@ fn fixed_destination_without_alternate_is_typed_undeliverable() {
             AlternateRoutability::DestinationAsserted,
         )
         .expect("asserted alternate");
-    let wire = harness
-        .table
-        .attempt_wire_message(second.value())
-        .expect("wire");
+    let wire = dispatch(&mut harness.table, second.value());
     assert!(wire.header.flags.is_potentially_retransmitted());
     assert!(wire
         .raw_avps
@@ -1176,13 +1248,31 @@ fn bounded_tables_and_completion_retention() {
             .err(),
         Some(TrackError::TableFull)
     );
-    // Complete both; the retention bound evicts the oldest completion.
+    // Complete and durably acknowledge both. Unacknowledged work is never
+    // evicted; once acknowledged, the ordinary late-answer retention bound
+    // evicts the oldest completion.
+    let first_completion = match harness
+        .table
+        .correlate_answer(CONNECTION_A, build_dea(HBH_A, 0xE2E0_0014, 2001))
+    {
+        AnswerDisposition::Completed(completion) => completion,
+        other => panic!("expected first completion, got {other:?}"),
+    };
     harness
         .table
-        .correlate_answer(CONNECTION_A, build_dea(HBH_A, 0xE2E0_0014, 2001));
+        .acknowledge_completion_delivery(acknowledged_delivery(&first_completion))
+        .expect("acknowledge first completion");
+    let second_completion = match harness
+        .table
+        .correlate_answer(CONNECTION_A, build_dea(HBH_A + 1, 0xE2E0_0015, 2001))
+    {
+        AnswerDisposition::Completed(completion) => completion,
+        other => panic!("expected second completion, got {other:?}"),
+    };
     harness
         .table
-        .correlate_answer(CONNECTION_A, build_dea(HBH_A + 1, 0xE2E0_0015, 2001));
+        .acknowledge_completion_delivery(acknowledged_delivery(&second_completion))
+        .expect("acknowledge second completion");
     assert_eq!(harness.table.retained_completed_count(), 1);
     assert_eq!(harness.table.evicted_completion_count(), 1);
     // The evicted transaction no longer recognizes its attempts.
@@ -1304,13 +1394,8 @@ fn restore_rejects_recycled_connection_tokens() {
             AlternateRoutability::RealmRouted,
         )
         .expect("failover");
-    let snapshot = harness.table.snapshot();
-    let mut restored = PendingRequestTable::restore(
-        snapshot.as_bytes(),
-        PendingRequestTableConfig::default(),
-        Arc::new(ManualClock::default()),
-    )
-    .expect("restore");
+    let snapshot = snapshot_at(&mut harness.table, 1);
+    let mut restored = restore_snapshot(&snapshot);
     for recycled in [CONNECTION_A, CONNECTION_B] {
         assert_eq!(
             restored.add_connection(recycled, 0).err(),
@@ -1329,13 +1414,18 @@ fn restore_rejects_recycled_connection_tokens() {
         )
         .expect("re-arm");
     assert!(attempt.is_retransmission());
-    let wire = restored
-        .attempt_wire_message(tracked.value())
-        .expect("wire");
+    let wire = dispatch(&mut restored, tracked.value());
     assert!(wire.header.flags.is_potentially_retransmitted());
     // After the record completes and is retired, the historical tokens become
     // registerable again.
-    restored.correlate_answer(CONNECTION_C, build_dea(HBH_C, 0xE2E0_0020, 2001));
+    let completion =
+        match restored.correlate_answer(CONNECTION_C, build_dea(HBH_C, 0xE2E0_0020, 2001)) {
+            AnswerDisposition::Completed(completion) => completion,
+            other => panic!("expected completion, got {other:?}"),
+        };
+    restored
+        .acknowledge_completion_delivery(acknowledged_delivery(&completion))
+        .expect("acknowledge completion");
     assert!(restored.retire(tracked.value()));
     restored
         .add_connection(CONNECTION_A, HBH_A)
@@ -1384,10 +1474,17 @@ fn connection_lifetimes_recycle_without_exhausting_the_table() {
                 AlternateRoutability::RealmRouted,
             )
             .expect("failover");
-        harness.table.correlate_answer(
+        let completion = match harness.table.correlate_answer(
             alternate,
             build_dea(1, 0xE3E0_0000 + cycle as u32 * 2, 2001),
-        );
+        ) {
+            AnswerDisposition::Completed(completion) => completion,
+            other => panic!("expected completion, got {other:?}"),
+        };
+        harness
+            .table
+            .acknowledge_completion_delivery(acknowledged_delivery(&completion))
+            .expect("acknowledge completion");
         assert!(harness.table.retire(tracked.value()));
         harness.table.close_connection(alternate).expect("close");
         harness
@@ -1424,7 +1521,7 @@ fn track_rejects_already_retransmitted_requests() {
         .table
         .track(build_der(0xE2E0_0021, false), CONNECTION_A, token(31))
         .expect("track");
-    let wire = harness.table.attempt_wire_message(token(31)).expect("wire");
+    let wire = dispatch(&mut harness.table, token(31));
     assert!(!wire.header.flags.is_potentially_retransmitted());
 }
 
@@ -1436,18 +1533,16 @@ fn restored_records_rearm_before_sending() {
         .table
         .track(build_der(0xE2E0_0022, false), CONNECTION_A, token(32))
         .expect("track");
-    let snapshot = harness.table.snapshot();
-    let mut restored = PendingRequestTable::restore(
-        snapshot.as_bytes(),
-        PendingRequestTableConfig::default(),
-        Arc::new(ManualClock::default()),
-    )
-    .expect("restore");
+    let snapshot = snapshot_at(&mut harness.table, 1);
+    let mut restored = restore_snapshot(&snapshot);
     // The restored in-flight attempt belongs to a dead connection lifetime;
     // serving its pre-crash T-clear bytes would violate the RFC 6733 §5.5.4
     // boot rule, so the table refuses until the record is re-armed.
+    let committed = restored.committed_snapshot().expect("committed proof");
     assert_eq!(
-        restored.attempt_wire_message(tracked.value()).err(),
+        restored
+            .take_attempt_dispatch(tracked.value(), committed)
+            .err(),
         Some(TransactionAccessError::NoLiveAttempt)
     );
     restored
@@ -1460,9 +1555,7 @@ fn restored_records_rearm_before_sending() {
             AlternateRoutability::RealmRouted,
         )
         .expect("re-arm");
-    let wire = restored
-        .attempt_wire_message(tracked.value())
-        .expect("wire");
+    let wire = dispatch(&mut restored, tracked.value());
     assert!(wire.header.flags.is_potentially_retransmitted());
     assert_eq!(wire.header.end_to_end_identifier, 0xE2E0_0022);
 }
@@ -1525,6 +1618,7 @@ fn authority_allocated_identity_survives_failover() {
         .table
         .track(build_der(end_to_end, false), CONNECTION_A, token(40))
         .expect("track");
+    let _initial_wire = dispatch(&mut harness.table, tracked.value());
     assert_eq!(
         harness
             .table
@@ -1539,10 +1633,7 @@ fn authority_allocated_identity_survives_failover() {
             AlternateRoutability::RealmRouted,
         )
         .expect("failover");
-    let wire = harness
-        .table
-        .attempt_wire_message(tracked.value())
-        .expect("wire");
+    let wire = dispatch(&mut harness.table, tracked.value());
     assert!(wire.header.flags.is_potentially_retransmitted());
     assert_eq!(wire.header.end_to_end_identifier, end_to_end);
     let disposition = harness.table.correlate_answer(
