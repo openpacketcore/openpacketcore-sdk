@@ -142,6 +142,52 @@ pub struct UdpEncap {
     pub destination_port: u16,
 }
 
+/// Validation failure for an ESP-in-UDP encapsulation template.
+///
+/// Variants intentionally carry no received type or port values, keeping
+/// `Debug` and `Display` suitable for redaction-safe diagnostics.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum UdpEncapError {
+    /// The encapsulation type is not the supported RFC 3948 ESP-in-UDP type.
+    UnsupportedType,
+    /// At least one UDP port is zero.
+    ZeroPort,
+}
+
+impl UdpEncapError {
+    /// Return a stable machine-readable error code.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::UnsupportedType => "xfrm_udp_encap_unsupported_type",
+            Self::ZeroPort => "xfrm_udp_encap_zero_port",
+        }
+    }
+
+    pub(crate) fn into_xfrm_error(
+        self,
+        type_field: &'static str,
+        port_field: &'static str,
+    ) -> XfrmError {
+        match self {
+            Self::UnsupportedType => {
+                XfrmError::invalid_config(type_field, "encapsulation must be ESP-in-UDP")
+            }
+            Self::ZeroPort => {
+                XfrmError::invalid_config(port_field, "UDP encapsulation ports must be nonzero")
+            }
+        }
+    }
+}
+
+impl fmt::Display for UdpEncapError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::error::Error for UdpEncapError {}
+
 impl UdpEncap {
     /// Build an RFC 3948 ESP-in-UDP encapsulation template.
     pub const fn esp_in_udp(source_port: u16, destination_port: u16) -> Self {
@@ -150,6 +196,26 @@ impl UdpEncap {
             source_port,
             destination_port,
         }
+    }
+
+    /// Validate this template against the SDK's RFC 3948 NAT-T contract.
+    ///
+    /// The supported type is [`UDP_ENCAP_ESPINUDP`], and both ports must be
+    /// non-zero. NAT detection and translated-port selection remain
+    /// caller-owned.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable, value-free [`UdpEncapError`] when the type is
+    /// unsupported or either port is zero.
+    pub const fn validate_esp_in_udp(self) -> Result<(), UdpEncapError> {
+        if self.encap_type != UDP_ENCAP_ESPINUDP {
+            return Err(UdpEncapError::UnsupportedType);
+        }
+        if self.source_port == 0 || self.destination_port == 0 {
+            return Err(UdpEncapError::ZeroPort);
+        }
+        Ok(())
     }
 }
 
@@ -1067,19 +1133,9 @@ fn validate_relocation_address_pair(
 }
 
 fn validate_relocation_encap(encap: UdpEncap, field: &'static str) -> Result<(), XfrmError> {
-    if encap.encap_type != UDP_ENCAP_ESPINUDP {
-        return Err(XfrmError::invalid_config(
-            field,
-            "encapsulation must be ESP-in-UDP",
-        ));
-    }
-    if encap.source_port == 0 || encap.destination_port == 0 {
-        return Err(XfrmError::invalid_config(
-            field,
-            "UDP encapsulation ports must be nonzero",
-        ));
-    }
-    Ok(())
+    encap
+        .validate_esp_in_udp()
+        .map_err(|error| error.into_xfrm_error(field, field))
 }
 
 /// Request to rekey (update) an existing Security Association.
@@ -1315,6 +1371,32 @@ mod tests {
             AeadAlgorithm::rfc4106_gcm_aes(128),
             AeadAlgorithm::new(XFRM_AEAD_RFC4106_GCM_AES, 128)
         );
+    }
+
+    #[test]
+    fn udp_encapsulation_validation_is_typed_and_value_free() {
+        assert_eq!(
+            UdpEncap::esp_in_udp(4500, 62_000).validate_esp_in_udp(),
+            Ok(())
+        );
+
+        let unsupported = UdpEncap {
+            encap_type: 47,
+            source_port: 4500,
+            destination_port: 4500,
+        }
+        .validate_esp_in_udp()
+        .expect_err("unsupported encapsulation type must fail");
+        assert_eq!(unsupported, UdpEncapError::UnsupportedType);
+        assert_eq!(unsupported.to_string(), "xfrm_udp_encap_unsupported_type");
+        assert!(!format!("{unsupported:?}").contains("47"));
+
+        let zero_port = UdpEncap::esp_in_udp(0, 4500)
+            .validate_esp_in_udp()
+            .expect_err("zero UDP port must fail");
+        assert_eq!(zero_port, UdpEncapError::ZeroPort);
+        assert_eq!(zero_port.to_string(), "xfrm_udp_encap_zero_port");
+        assert!(!format!("{zero_port:?}").contains("4500"));
     }
 
     #[test]

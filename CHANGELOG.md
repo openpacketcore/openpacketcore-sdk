@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Directional initial IKEv2 Child-SA NAT-T mapping — `opc-ipsec-xfrm`:**
+  adds source-compatible build options that validate exact inbound and
+  outbound RFC 3948 ESP-in-UDP templates before projecting them into XFRM SA
+  requests. Existing request literals and native-ESP/request-ID builders are
+  unchanged wrappers. A shared value-free validation contract now rejects
+  unsupported encapsulation types and zero ports consistently for initial
+  IKEv2 mapping and SA relocation, while the generic Linux backend retains its
+  wider kernel encapsulation-type contract. NAT detection, translated port
+  selection, and post-establishment rebinding remain caller-owned (#511).
 - **Typed EAP-AKA/AKA-prime packet projection — `opc-proto-eap`,
   `opc-proto-ikev2`, `opc-proto-diameter`:** adds one strict,
   allocation-bounded RFC 4187/RFC 9048 parser shared by IKEv2 EAP and SWm

@@ -4,7 +4,10 @@
 //! a deterministic mock backend for tests, an unsupported-platform backend, and
 //! redaction-safe error types. SA parameters can carry an independent Linux
 //! lookup mark and a masked post-transform output mark; the latter is applied
-//! to inbound/decrypt SAs as well as outbound SAs. An exact single-SA
+//! to inbound/decrypt SAs as well as outbound SAs. With the `ikev2` feature,
+//! `Ikev2ChildSaXfrmOptions` carries caller-validated directional initial
+//! ESP-in-UDP templates through the typed Child-SA mapper; NAT detection and
+//! translated-port selection remain caller-owned. An exact single-SA
 //! relocation primitive uses the current-upstream Linux
 //! `XFRM_MSG_MIGRATE_STATE` UAPI after validating a query-proven current-state
 //! snapshot. It relocates SA state only: callers own authenticated endpoint
@@ -97,11 +100,11 @@ pub use dscp::{
 pub use error::XfrmError;
 #[cfg(feature = "ikev2")]
 pub use ikev2::{
-    build_xfrm_requests_from_ikev2_child_sa,
+    build_xfrm_requests_from_ikev2_child_sa, build_xfrm_requests_from_ikev2_child_sa_with_options,
     build_xfrm_requests_from_ikev2_child_sa_with_request_id, derive_child_sa_xfrm_keys,
     Ikev2ChildSaDirectionalXfrmKeys, Ikev2ChildSaKeyMaterialError, Ikev2ChildSaXfrmError,
-    Ikev2ChildSaXfrmKeys, Ikev2ChildSaXfrmRequest, Ikev2ChildSaXfrmRequests,
-    IKEV2_SECURITY_PROTOCOL_ID_ESP, IPPROTO_ESP,
+    Ikev2ChildSaXfrmKeys, Ikev2ChildSaXfrmOptions, Ikev2ChildSaXfrmOptionsError,
+    Ikev2ChildSaXfrmRequest, Ikev2ChildSaXfrmRequests, IKEV2_SECURITY_PROTOCOL_ID_ESP, IPPROTO_ESP,
 };
 pub use linux::{LinuxXfrmBackend, LinuxXfrmBackendConfig};
 pub use mock::{MockOperation, MockSaRelocation, MockXfrmBackend};
@@ -111,8 +114,8 @@ pub use model::{
     QuerySaRequest, RekeyPolicyRequest, RekeySaRequest, RelocateSaRequest, RemovePolicyRequest,
     RemoveSaRequest, SaParameters, SaRelocationDirection, SaRelocationEncap, SaRelocationIdentity,
     SaRelocationSelector, SaReplayState, SaState, SaStatistics, SpiAllocation, UdpEncap,
-    XfrmAction, XfrmBackendKind, XfrmCapability, XfrmDirection, XfrmId, XfrmMark, XfrmMode,
-    XfrmProbe, XfrmRequestId, XfrmSelector, XfrmTemplate, UDP_ENCAP_ESPINUDP,
+    UdpEncapError, XfrmAction, XfrmBackendKind, XfrmCapability, XfrmDirection, XfrmId, XfrmMark,
+    XfrmMode, XfrmProbe, XfrmRequestId, XfrmSelector, XfrmTemplate, UDP_ENCAP_ESPINUDP,
     XFRM_AEAD_RFC4106_GCM_AES, XFRM_AUTH_HMAC_SHA1, XFRM_AUTH_HMAC_SHA256, XFRM_AUTH_HMAC_SHA384,
     XFRM_AUTH_HMAC_SHA512, XFRM_ENCR_CBC_AES, XFRM_ENCR_NULL,
 };

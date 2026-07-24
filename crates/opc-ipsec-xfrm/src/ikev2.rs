@@ -17,9 +17,9 @@ use opc_proto_ikev2::{
 
 use crate::{
     AeadAlgorithm, Algorithm, AuthAlgorithm, InstallPolicyRequest, InstallSaRequest, IpAddress,
-    KeyMaterial, LifetimeConfig, PolicyParameters, SaParameters, XfrmAction,
-    XfrmCompositeInstallRequest, XfrmDirection, XfrmId, XfrmMode, XfrmRequestId, XfrmSelector,
-    XfrmTemplate,
+    KeyMaterial, LifetimeConfig, PolicyParameters, SaParameters, UdpEncap, UdpEncapError,
+    XfrmAction, XfrmCompositeInstallRequest, XfrmDirection, XfrmId, XfrmMode, XfrmRequestId,
+    XfrmSelector, XfrmTemplate,
 };
 
 /// IKEv2 Security Protocol ID for ESP proposals.
@@ -91,6 +91,130 @@ pub struct Ikev2ChildSaXfrmRequest {
     pub replay_window: u8,
     /// Policy priority to apply to both policies.
     pub policy_priority: u32,
+}
+
+/// Optional controls for one IKEv2 Child-SA-to-XFRM mapping.
+///
+/// The default preserves the original native-ESP, SPI-pinned policy behavior.
+/// Use [`Self::with_udp_encapsulation`] only after caller-owned NAT detection
+/// and translated-port selection have produced exact directional templates.
+/// The SDK validates and projects those templates but does not infer them from
+/// IKE traffic.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Ikev2ChildSaXfrmOptions {
+    request_id: Option<XfrmRequestId>,
+    inbound_udp_encap: Option<UdpEncap>,
+    outbound_udp_encap: Option<UdpEncap>,
+}
+
+/// Validation failure while constructing Child-SA-to-XFRM build options.
+///
+/// The error contains only typed direction and reason values, never configured
+/// port numbers or other request data.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ikev2ChildSaXfrmOptionsError {
+    /// A directional ESP-in-UDP template is unsupported or malformed.
+    UdpEncapInvalid {
+        /// Direction whose template failed validation.
+        direction: XfrmDirection,
+        /// Stable, value-free validation reason.
+        reason: UdpEncapError,
+    },
+}
+
+impl Ikev2ChildSaXfrmOptionsError {
+    /// Return a stable machine-readable error code.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::UdpEncapInvalid {
+                reason: UdpEncapError::UnsupportedType,
+                ..
+            } => "ikev2_child_sa_xfrm_udp_encap_unsupported_type",
+            Self::UdpEncapInvalid {
+                reason: UdpEncapError::ZeroPort,
+                ..
+            } => "ikev2_child_sa_xfrm_udp_encap_zero_port",
+        }
+    }
+}
+
+impl fmt::Display for Ikev2ChildSaXfrmOptionsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Error for Ikev2ChildSaXfrmOptionsError {}
+
+impl Ikev2ChildSaXfrmOptions {
+    /// Create native-ESP options with SPI-pinned policy templates.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            request_id: None,
+            inbound_udp_encap: None,
+            outbound_udp_encap: None,
+        }
+    }
+
+    /// Use one non-zero request ID for both SAs and wildcard policy templates.
+    #[must_use]
+    pub const fn with_request_id(mut self, request_id: XfrmRequestId) -> Self {
+        self.request_id = Some(request_id);
+        self
+    }
+
+    /// Set exact inbound and outbound UDP encapsulation templates.
+    ///
+    /// `inbound` describes peer-to-local ESP-in-UDP packets and `outbound`
+    /// describes local-to-peer packets. Both directions are configured
+    /// together so an initial Child SA cannot accidentally mix NAT-T with
+    /// native ESP. The mapper does not reverse or otherwise infer port values.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable, value-free [`Ikev2ChildSaXfrmOptionsError`] when
+    /// either template has an unsupported encapsulation type or zero port.
+    pub fn with_udp_encapsulation(
+        mut self,
+        inbound: UdpEncap,
+        outbound: UdpEncap,
+    ) -> Result<Self, Ikev2ChildSaXfrmOptionsError> {
+        validate_udp_encapsulation(XfrmDirection::In, inbound)?;
+        validate_udp_encapsulation(XfrmDirection::Out, outbound)?;
+        self.inbound_udp_encap = Some(inbound);
+        self.outbound_udp_encap = Some(outbound);
+        Ok(self)
+    }
+
+    /// Return the shared request ID, when configured.
+    #[must_use]
+    pub const fn request_id(self) -> Option<XfrmRequestId> {
+        self.request_id
+    }
+
+    /// Return the exact inbound UDP encapsulation template, when configured.
+    #[must_use]
+    pub const fn inbound_udp_encapsulation(self) -> Option<UdpEncap> {
+        self.inbound_udp_encap
+    }
+
+    /// Return the exact outbound UDP encapsulation template, when configured.
+    #[must_use]
+    pub const fn outbound_udp_encapsulation(self) -> Option<UdpEncap> {
+        self.outbound_udp_encap
+    }
+}
+
+fn validate_udp_encapsulation(
+    direction: XfrmDirection,
+    encap: UdpEncap,
+) -> Result<(), Ikev2ChildSaXfrmOptionsError> {
+    encap
+        .validate_esp_in_udp()
+        .map_err(|reason| Ikev2ChildSaXfrmOptionsError::UdpEncapInvalid { direction, reason })
 }
 
 /// XFRM install requests produced for a bidirectional Child SA.
@@ -327,7 +451,7 @@ pub fn derive_child_sa_xfrm_keys(
 pub fn build_xfrm_requests_from_ikev2_child_sa(
     request: &Ikev2ChildSaXfrmRequest,
 ) -> Result<Ikev2ChildSaXfrmRequests, Ikev2ChildSaXfrmError> {
-    build_xfrm_requests_from_ikev2_child_sa_inner(request, None)
+    build_xfrm_requests_from_ikev2_child_sa_with_options(request, Ikev2ChildSaXfrmOptions::new())
 }
 
 /// Build Child-SA installs whose policies match a shared XFRM request ID.
@@ -346,12 +470,49 @@ pub fn build_xfrm_requests_from_ikev2_child_sa_with_request_id(
     request: &Ikev2ChildSaXfrmRequest,
     request_id: XfrmRequestId,
 ) -> Result<Ikev2ChildSaXfrmRequests, Ikev2ChildSaXfrmError> {
-    build_xfrm_requests_from_ikev2_child_sa_inner(request, Some(request_id))
+    build_xfrm_requests_from_ikev2_child_sa_with_options(
+        request,
+        Ikev2ChildSaXfrmOptions::new().with_request_id(request_id),
+    )
 }
 
-fn build_xfrm_requests_from_ikev2_child_sa_inner(
+/// Build Child-SA installs with typed request-ID and directional NAT-T options.
+///
+/// The two encapsulation templates are projected directly into the respective
+/// inbound and outbound [`SaParameters::encap`] fields. The mapper validates
+/// RFC 3948 ESP-in-UDP type and non-zero ports before returning any requests,
+/// but NAT detection and translated-port selection remain caller-owned. With
+/// [`Ikev2ChildSaXfrmOptions::default`], this is request-for-request equivalent to
+/// [`build_xfrm_requests_from_ikev2_child_sa`].
+///
+/// ```
+/// # use std::error::Error;
+/// # use opc_ipsec_xfrm::{
+/// #     build_xfrm_requests_from_ikev2_child_sa_with_options,
+/// #     Ikev2ChildSaXfrmOptions, Ikev2ChildSaXfrmRequest,
+/// #     Ikev2ChildSaXfrmRequests, UdpEncap,
+/// # };
+/// # fn map_natt(
+/// #     request: &Ikev2ChildSaXfrmRequest,
+/// # ) -> Result<Ikev2ChildSaXfrmRequests, Box<dyn Error>> {
+/// let options = Ikev2ChildSaXfrmOptions::new().with_udp_encapsulation(
+///     UdpEncap::esp_in_udp(62_000, 4500),
+///     UdpEncap::esp_in_udp(4500, 62_000),
+/// )?;
+/// let requests =
+///     build_xfrm_requests_from_ikev2_child_sa_with_options(request, options)?;
+/// # Ok(requests)
+/// # }
+/// ```
+///
+/// # Errors
+///
+/// Returns [`Ikev2ChildSaXfrmError`] under the same validation rules as
+/// [`build_xfrm_requests_from_ikev2_child_sa`]. Encapsulation is validated
+/// during construction by [`Ikev2ChildSaXfrmOptions::with_udp_encapsulation`].
+pub fn build_xfrm_requests_from_ikev2_child_sa_with_options(
     request: &Ikev2ChildSaXfrmRequest,
-    request_id: Option<XfrmRequestId>,
+    options: Ikev2ChildSaXfrmOptions,
 ) -> Result<Ikev2ChildSaXfrmRequests, Ikev2ChildSaXfrmError> {
     validate_request(request)?;
 
@@ -406,6 +567,7 @@ fn build_xfrm_requests_from_ikev2_child_sa_inner(
         spi: initiator_spi,
         protocol: IPPROTO_ESP,
     };
+    let request_id = options.request_id();
 
     let inbound_sa = InstallSaRequest {
         parameters: SaParameters {
@@ -420,7 +582,7 @@ fn build_xfrm_requests_from_ikev2_child_sa_inner(
             lifetime: request.lifetime,
             replay_window: u32::from(request.replay_window),
             replay_state: None,
-            encap: None,
+            encap: options.inbound_udp_encapsulation(),
             mark: None,
             output_mark: None,
             if_id: None,
@@ -440,7 +602,7 @@ fn build_xfrm_requests_from_ikev2_child_sa_inner(
             lifetime: request.lifetime,
             replay_window: u32::from(request.replay_window),
             replay_state: None,
-            encap: None,
+            encap: options.outbound_udp_encapsulation(),
             mark: None,
             output_mark: None,
             if_id: None,
@@ -866,7 +1028,17 @@ mod tests {
 
     #[test]
     fn builds_bidirectional_sa_and_policy_requests() {
-        let built = build_xfrm_requests_from_ikev2_child_sa(&request()).expect("request builds");
+        let input = request();
+        let built = build_xfrm_requests_from_ikev2_child_sa(&input).expect("request builds");
+        let via_options = build_xfrm_requests_from_ikev2_child_sa_with_options(
+            &input,
+            Ikev2ChildSaXfrmOptions::default(),
+        )
+        .expect("default options build");
+
+        assert_eq!(built, via_options);
+        assert_eq!(built.inbound_sa.parameters.encap, None);
+        assert_eq!(built.outbound_sa.parameters.encap, None);
 
         assert_eq!(
             built.inbound_sa.parameters.id.destination,
@@ -925,6 +1097,95 @@ mod tests {
     }
 
     #[test]
+    fn symmetric_udp_encapsulation_maps_to_both_sa_directions() {
+        let encap = UdpEncap::esp_in_udp(4500, 4500);
+        let options = Ikev2ChildSaXfrmOptions::new()
+            .with_udp_encapsulation(encap, encap)
+            .expect("valid symmetric NAT-T options");
+
+        let built = build_xfrm_requests_from_ikev2_child_sa_with_options(&request(), options)
+            .expect("symmetric NAT-T request builds");
+
+        assert_eq!(built.inbound_sa.parameters.encap, Some(encap));
+        assert_eq!(built.outbound_sa.parameters.encap, Some(encap));
+    }
+
+    #[test]
+    fn directional_udp_encapsulation_preserves_exact_ports_and_other_mapping() {
+        let input = request();
+        let request_id = XfrmRequestId::new(7_002).expect("nonzero request ID");
+        let inbound = UdpEncap::esp_in_udp(62_000, 4500);
+        let outbound = UdpEncap::esp_in_udp(4500, 62_000);
+        let request_id_only = build_xfrm_requests_from_ikev2_child_sa_with_options(
+            &input,
+            Ikev2ChildSaXfrmOptions::new().with_request_id(request_id),
+        )
+        .expect("request-ID-only request builds");
+        let options = Ikev2ChildSaXfrmOptions::new()
+            .with_request_id(request_id)
+            .with_udp_encapsulation(inbound, outbound)
+            .expect("valid directional NAT-T options");
+
+        let mut built = build_xfrm_requests_from_ikev2_child_sa_with_options(&input, options)
+            .expect("directional NAT-T request builds");
+
+        assert_eq!(built.inbound_sa.parameters.encap, Some(inbound));
+        assert_eq!(built.outbound_sa.parameters.encap, Some(outbound));
+        assert_eq!(built.inbound_sa.parameters.request_id, Some(request_id));
+        assert_eq!(built.outbound_sa.parameters.request_id, Some(request_id));
+        assert_eq!(
+            built.inbound_policy.parameters.templates[0].request_id,
+            Some(request_id)
+        );
+        assert_eq!(
+            built.outbound_policy.parameters.templates[0].request_id,
+            Some(request_id)
+        );
+
+        built.inbound_sa.parameters.encap = None;
+        built.outbound_sa.parameters.encap = None;
+        assert_eq!(built, request_id_only);
+    }
+
+    #[test]
+    fn udp_encapsulation_options_reject_invalid_values_with_safe_stable_errors() {
+        let unsupported = UdpEncap {
+            encap_type: 47,
+            source_port: 4500,
+            destination_port: 4500,
+        };
+        let error = Ikev2ChildSaXfrmOptions::new()
+            .with_udp_encapsulation(unsupported, UdpEncap::esp_in_udp(4500, 4500))
+            .expect_err("unsupported inbound encapsulation must fail");
+        assert_eq!(
+            error,
+            Ikev2ChildSaXfrmOptionsError::UdpEncapInvalid {
+                direction: XfrmDirection::In,
+                reason: UdpEncapError::UnsupportedType,
+            }
+        );
+        assert_eq!(
+            error.as_str(),
+            "ikev2_child_sa_xfrm_udp_encap_unsupported_type"
+        );
+        assert!(!format!("{error:?}").contains("47"));
+
+        let zero_port = UdpEncap::esp_in_udp(4500, 0);
+        let error = Ikev2ChildSaXfrmOptions::new()
+            .with_udp_encapsulation(UdpEncap::esp_in_udp(4500, 4500), zero_port)
+            .expect_err("zero outbound port must fail");
+        assert_eq!(
+            error,
+            Ikev2ChildSaXfrmOptionsError::UdpEncapInvalid {
+                direction: XfrmDirection::Out,
+                reason: UdpEncapError::ZeroPort,
+            }
+        );
+        assert_eq!(error.to_string(), "ikev2_child_sa_xfrm_udp_encap_zero_port");
+        assert!(!format!("{error:?}").contains("4500"));
+    }
+
+    #[test]
     fn shared_request_id_builds_one_unpinned_policy_contract_for_rekey_overlap() {
         assert!(XfrmRequestId::new(0).is_none());
         let request_id = XfrmRequestId::new(7_001).expect("nonzero request ID");
@@ -937,7 +1198,13 @@ mod tests {
             .expect("old Child SA");
         let new = build_xfrm_requests_from_ikev2_child_sa_with_request_id(&new_request, request_id)
             .expect("replacement Child SA");
+        let via_options = build_xfrm_requests_from_ikev2_child_sa_with_options(
+            &old_request,
+            Ikev2ChildSaXfrmOptions::new().with_request_id(request_id),
+        )
+        .expect("request-ID options build");
 
+        assert_eq!(old, via_options);
         assert_ne!(old.inbound_sa.parameters.id, new.inbound_sa.parameters.id);
         assert_ne!(old.outbound_sa.parameters.id, new.outbound_sa.parameters.id);
         assert_eq!(old.inbound_sa.parameters.request_id, Some(request_id));
