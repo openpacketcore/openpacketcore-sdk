@@ -778,6 +778,12 @@ impl CampaignEvidence {
             std::fs::create_dir_all(&archive).expect("create evidence archive directory");
             let target = archive.join(format!("{}-evidence.json", self.campaign_id));
             std::fs::copy(&path, &target).expect("archive evidence document");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600))
+                    .expect("restrict archived evidence permissions");
+            }
         }
     }
 }
@@ -1654,12 +1660,11 @@ impl FaultFleet {
     }
 
     fn authentication_failures(&self) -> usize {
+        // "family:authentication" and "family:remote_authentication" both end
+        // with ":authentication"; one suffix pass counts each exactly once.
         self.transport_stats
             .values()
-            .map(|stats| {
-                stats.total_matching(":authentication")
-                    + stats.total_matching(":remote_authentication")
-            })
+            .map(|stats| stats.total_matching(":authentication"))
             .sum()
     }
 
@@ -2182,6 +2187,9 @@ fn rotation_fault_evidence_checker_binds_digests_bounds_and_provenance() {
     });
     must_reject("resolver-overrun.json", &|doc| {
         doc["bounds"]["max_transition_resolver_deltas"] = serde_json::json!(17);
+    });
+    must_reject("allowance-above-max.json", &|doc| {
+        doc["bounds"]["resolver_delta_allowance"] = serde_json::json!(17);
     });
     must_reject("outcome.json", &|doc| {
         doc["outcome"] = serde_json::json!("fail");

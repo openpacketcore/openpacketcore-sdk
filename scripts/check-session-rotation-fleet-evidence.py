@@ -67,7 +67,10 @@ BOUNDS_SLO_MILLIS = 10_000
 PHASE_KINDS = ("fault", "rotation", "traffic", "recovery", "bounds")
 
 FD_ALLOWANCE_MAX = 8
-RESOLVER_DELTA_ALLOWANCE_MAX = 32
+# Per-transition handshake-rate allowance: lane replacements, directed
+# probes, and any late retirement redial attributable to an earlier
+# transition (plan section 6; measured campaigns total at most 10).
+RESOLVER_DELTA_ALLOWANCE_MAX = 16
 # Per-directed-path campaign replacement allowance: two cached lanes plus
 # one bounded retry per endpoint rotation of the path's two members, over
 # three rotation cycles per member (3 x 2 x 3 = 18; measured campaigns total
