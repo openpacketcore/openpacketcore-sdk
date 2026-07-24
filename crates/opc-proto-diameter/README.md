@@ -220,6 +220,9 @@ is held in zeroizing memory with a redacted `Debug`). Restored records
 retransmit with T=1 and keep a stable completion token and generation, so a
 consumer can make restored delivery idempotent with a durable
 compare-and-set claim; without one, restored delivery is at-least-once.
+Connection lifetimes are released with `retire_connection` once no retained
+record references them; a token that restored records still reference cannot
+be re-registered, which keeps Hop-by-Hop allocation unique across restores.
 Attempt limits beyond the evidence bounds, deadlines, peer selection, and
 alternate routability remain caller policy.
 

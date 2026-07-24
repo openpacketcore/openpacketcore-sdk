@@ -305,8 +305,20 @@ Available under the `base` feature as `transaction::PendingRequestTable`.
   the selected connection. All attempt identifiers are retained so a late
   answer from either path is still recognized.
 - Tracked requests are validated: R bit set, E bit clear, reserved flag bits
-  clear, bounded AVP region, exactly one non-empty Origin-Host, and no second
+  clear, T bit clear (a T-set request is a retransmission and is rejected
+  rather than silently losing RFC 6733 §3's duplicate-detection signal),
+  bounded AVP region, exactly one non-empty Origin-Host, and no second
   pending transaction with the same End-to-End identifier.
+- Connection lifetimes are registered with a caller-seeded Hop-by-Hop
+  partition. A token that still appears in any retained transaction's
+  attempt history — including restored records — cannot be re-registered, so
+  a recycled connection identity can never allocate a duplicate Hop-by-Hop
+  identifier on one connection. Closed lifetimes are released by
+  `retire_connection` only after the last referencing record is retired or
+  evicted, so late-answer correlation evidence is never orphaned. Restored
+  in-flight attempts belong to dead lifetimes: their pre-crash T-clear wire
+  bytes are never re-served, and records must be re-armed through `failover`
+  (which sets T=1) before sending.
 - Write dispositions distinguish failure before write, uncertain or partial
   write, and successful write followed by transport loss. Fixed
   `Destination-Host` requests require an explicit caller routability
@@ -326,8 +338,12 @@ Available under the `base` feature as `transaction::PendingRequestTable`.
   zeroizing memory with a redacted `Debug`; it contains canonical request
   bytes and must be stored only in encrypted, integrity-protected storage. No
   plaintext persistence backend is provided. Restore re-validates every
-  record (malformed, truncated, trailing-garbage, unsupported-version,
-  bound-violating, and tampered inputs are rejected with typed errors),
+  record: structurally malformed, truncated, trailing-garbage,
+  unsupported-version, bound-violating, and internally inconsistent inputs
+  (duplicate tokens or attempt identities, generation/flag/disposition
+  contradictions, AVP re-validation failures) are rejected with typed
+  errors. Snapshot integrity and confidentiality beyond these structural
+  checks are delegated to the consumer's encrypted storage. Restore
   preserves the stable completion token and generation across repeated
   restores, and retransmits still-pending records with T=1. Restored delivery
   is documented as at-least-once unless the consumer durably claims delivery

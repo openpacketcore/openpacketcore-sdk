@@ -20,11 +20,12 @@ use opc_proto_diameter::apps::swm::{
 };
 use opc_proto_diameter::transaction::{
     AlternateRoutability, AnswerDisposition, AnswerRejectionReason, AttemptFailure, CompletionKind,
-    CompletionTokenValue, DiameterConnectionToken, FailoverError, IndeterminateReason,
-    PendingRequestClock, PendingRequestTable, PendingRequestTableConfig, SnapshotRestoreError,
-    TrackError, TransactionAccessError, TransactionCompletion, UndeliverableReason,
+    CompletionTokenValue, ConnectionTableError, DiameterConnectionToken, FailoverError,
+    IndeterminateReason, PendingRequestClock, PendingRequestTable, PendingRequestTableConfig,
+    SnapshotRestoreError, TrackError, TransactionAccessError, TransactionCompletion,
+    UndeliverableReason,
 };
-use opc_proto_diameter::{Message, OwnedMessage};
+use opc_proto_diameter::{CommandFlags, Message, OwnedMessage};
 use opc_protocol::{BorrowDecode, DecodeContext, Encode, EncodeContext};
 
 const CONNECTION_A: DiameterConnectionToken = conn(1);
@@ -1275,4 +1276,187 @@ fn dropping_a_completion_never_re_arms_the_transaction() {
     let view = harness.table.transaction(tracked.value()).expect("view");
     assert_eq!(view.completion_token().value(), tracked.value());
     assert_eq!(view.completion_token().generation(), 1);
+}
+
+#[test]
+fn restore_rejects_recycled_connection_tokens() {
+    // The reviewers' probe: track on A, fail over to B, snapshot, restore,
+    // then re-register a recycled token with an overlapping Hop-by-Hop seed.
+    // Before the fix this silently allocated a duplicate Hop-by-Hop on one
+    // connection; it must now fail typed.
+    let mut harness = harness();
+    harness.with_connections();
+    let tracked = harness
+        .table
+        .track(build_der(0xE2E0_0020, false), CONNECTION_A, token(30))
+        .expect("track");
+    harness
+        .table
+        .failover(
+            tracked.value(),
+            CONNECTION_B,
+            AlternateRoutability::RealmRouted,
+        )
+        .expect("failover");
+    let snapshot = harness.table.snapshot();
+    let mut restored = PendingRequestTable::restore(
+        snapshot.as_bytes(),
+        PendingRequestTableConfig::default(),
+        Arc::new(ManualClock::default()),
+    )
+    .expect("restore");
+    for recycled in [CONNECTION_A, CONNECTION_B] {
+        assert_eq!(
+            restored.add_connection(recycled, 0).err(),
+            Some(ConnectionTableError::DuplicateConnection)
+        );
+    }
+    // A fresh lifetime works and the restored record retransmits with T=1.
+    restored
+        .add_connection(CONNECTION_C, HBH_C)
+        .expect("fresh connection");
+    let attempt = restored
+        .failover(
+            tracked.value(),
+            CONNECTION_C,
+            AlternateRoutability::RealmRouted,
+        )
+        .expect("re-arm");
+    assert!(attempt.is_retransmission());
+    let wire = restored
+        .attempt_wire_message(tracked.value())
+        .expect("wire");
+    assert!(wire.header.flags.is_potentially_retransmitted());
+    // After the record completes and is retired, the historical tokens become
+    // registerable again.
+    restored.correlate_answer(CONNECTION_C, build_dea(HBH_C, 0xE2E0_0020, 2001));
+    assert!(restored.retire(tracked.value()));
+    restored
+        .add_connection(CONNECTION_A, HBH_A)
+        .expect("token reusable once unreferenced");
+}
+
+#[test]
+fn connection_lifetimes_recycle_without_exhausting_the_table() {
+    let config = PendingRequestTableConfig {
+        max_connections: 2,
+        ..PendingRequestTableConfig::default()
+    };
+    let mut harness = harness_with(config);
+    // Sixty-four full lifetimes — registration, traffic, loss, cleanup — fit
+    // in two slots because retired connections release theirs.
+    for cycle in 0..64_u64 {
+        let primary = conn(100 + cycle * 2);
+        let alternate = conn(101 + cycle * 2);
+        harness
+            .table
+            .add_connection(primary, 1)
+            .expect("add primary");
+        harness
+            .table
+            .add_connection(alternate, 1)
+            .expect("add alternate");
+        let tracked = harness
+            .table
+            .track(
+                build_der(0xE3E0_0000 + cycle as u32 * 2, false),
+                primary,
+                token(1000 + cycle as u128 * 2),
+            )
+            .expect("track");
+        harness.table.close_connection(primary).expect("close");
+        // The pending record still references the closed lifetime.
+        assert_eq!(
+            harness.table.retire_connection(primary).err(),
+            Some(ConnectionTableError::ConnectionInUse)
+        );
+        harness
+            .table
+            .failover(
+                tracked.value(),
+                alternate,
+                AlternateRoutability::RealmRouted,
+            )
+            .expect("failover");
+        harness.table.correlate_answer(
+            alternate,
+            build_dea(1, 0xE3E0_0000 + cycle as u32 * 2, 2001),
+        );
+        assert!(harness.table.retire(tracked.value()));
+        harness.table.close_connection(alternate).expect("close");
+        harness
+            .table
+            .retire_connection(primary)
+            .expect("retire primary");
+        harness
+            .table
+            .retire_connection(alternate)
+            .expect("retire alternate");
+        assert_eq!(harness.table.connection_count(), 0);
+    }
+    assert_eq!(harness.table.retained_completed_count(), 0);
+}
+
+#[test]
+fn track_rejects_already_retransmitted_requests() {
+    let mut harness = harness();
+    harness.with_connections();
+    let mut retransmitted = build_der(0xE2E0_0021, false);
+    retransmitted.header.flags = CommandFlags::from_bits(
+        retransmitted.header.flags.bits() | CommandFlags::POTENTIALLY_RETRANSMITTED,
+    );
+    assert_eq!(
+        harness
+            .table
+            .track(retransmitted, CONNECTION_A, token(31))
+            .err(),
+        Some(TrackError::AlreadyRetransmitted)
+    );
+    // An ordinary request with the same identifiers tracks cleanly; the
+    // rejected attempt had no side effects.
+    harness
+        .table
+        .track(build_der(0xE2E0_0021, false), CONNECTION_A, token(31))
+        .expect("track");
+    let wire = harness.table.attempt_wire_message(token(31)).expect("wire");
+    assert!(!wire.header.flags.is_potentially_retransmitted());
+}
+
+#[test]
+fn restored_records_rearm_before_sending() {
+    let mut harness = harness();
+    harness.with_connections();
+    let tracked = harness
+        .table
+        .track(build_der(0xE2E0_0022, false), CONNECTION_A, token(32))
+        .expect("track");
+    let snapshot = harness.table.snapshot();
+    let mut restored = PendingRequestTable::restore(
+        snapshot.as_bytes(),
+        PendingRequestTableConfig::default(),
+        Arc::new(ManualClock::default()),
+    )
+    .expect("restore");
+    // The restored in-flight attempt belongs to a dead connection lifetime;
+    // serving its pre-crash T-clear bytes would violate the RFC 6733 §5.5.4
+    // boot rule, so the table refuses until the record is re-armed.
+    assert_eq!(
+        restored.attempt_wire_message(tracked.value()).err(),
+        Some(TransactionAccessError::NoLiveAttempt)
+    );
+    restored
+        .add_connection(CONNECTION_C, HBH_C)
+        .expect("fresh connection");
+    restored
+        .failover(
+            tracked.value(),
+            CONNECTION_C,
+            AlternateRoutability::RealmRouted,
+        )
+        .expect("re-arm");
+    let wire = restored
+        .attempt_wire_message(tracked.value())
+        .expect("wire");
+    assert!(wire.header.flags.is_potentially_retransmitted());
+    assert_eq!(wire.header.end_to_end_identifier, 0xE2E0_0022);
 }

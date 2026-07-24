@@ -37,6 +37,9 @@
 //! terminal state transition and the completion hand-off are one atomic
 //! `&mut self` call, so dropping a caller-side future can never split the
 //! transition from the delivery or re-arm a completed transaction.
+//! Dropping the table itself discards every in-flight transaction without
+//! notification; consumers that must survive teardown persist
+//! [`PendingRequestTable::snapshot`] first.
 //!
 //! No `Debug`, error, or evidence representation exposes EAP payloads,
 //! User-Name, Session-Id, realm or destination identities, or raw request
@@ -208,7 +211,9 @@ impl PendingRequestClock for MonotonicClock {
 ///
 /// Every table is bounded: pending records, retained completed records,
 /// attempts per transaction, registered connections, and the accepted
-/// canonical request size are all capped here.
+/// canonical request size are all capped here. Every count bound is capped at
+/// 65,535 so an oversized legal configuration cannot turn table scans or
+/// eviction into a CPU-amplification knob.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PendingRequestTableConfig {
     /// Maximum simultaneously pending transactions. Also the snapshot record
@@ -221,7 +226,10 @@ pub struct PendingRequestTableConfig {
     /// recorded for one transaction. This bound survives crash recovery, so a
     /// restore-and-retransmit loop cannot grow attempts without limit.
     pub max_attempts_per_transaction: usize,
-    /// Maximum simultaneously registered connection lifetimes.
+    /// Maximum simultaneously registered connection lifetimes. Closed
+    /// lifetimes keep their slot until [`PendingRequestTable::retire_connection`]
+    /// releases them, and release is refused while any retained record still
+    /// holds an attempt on the token.
     pub max_connections: usize,
     /// Maximum canonical request size accepted by [`PendingRequestTable::track`].
     pub max_message_len: usize,
@@ -246,7 +254,9 @@ impl PendingRequestTableConfig {
         {
             return Err(PendingRequestConfigError::PendingBoundOutOfRange);
         }
-        if self.max_retained_completions == 0 {
+        if self.max_retained_completions == 0
+            || self.max_retained_completions > MAX_SERIALIZED_COUNT
+        {
             return Err(PendingRequestConfigError::CompletionBoundOutOfRange);
         }
         if self.max_attempts_per_transaction == 0
@@ -254,7 +264,7 @@ impl PendingRequestTableConfig {
         {
             return Err(PendingRequestConfigError::AttemptBoundOutOfRange);
         }
-        if self.max_connections == 0 {
+        if self.max_connections == 0 || self.max_connections > MAX_SERIALIZED_COUNT {
             return Err(PendingRequestConfigError::ConnectionBoundOutOfRange);
         }
         if self.max_message_len < DIAMETER_HEADER_LEN || self.max_message_len > MAX_U24 as usize {
@@ -269,11 +279,11 @@ impl PendingRequestTableConfig {
 pub enum PendingRequestConfigError {
     /// The pending-transaction bound is zero or exceeds the serialized bound.
     PendingBoundOutOfRange,
-    /// The retained-completion bound is zero.
+    /// The retained-completion bound is zero or exceeds the count bound.
     CompletionBoundOutOfRange,
     /// The per-transaction attempt bound is zero or exceeds the serialized bound.
     AttemptBoundOutOfRange,
-    /// The connection bound is zero.
+    /// The connection bound is zero or exceeds the count bound.
     ConnectionBoundOutOfRange,
     /// The message bound cannot hold a Diameter header or exceeds 24-bit length.
     MessageBoundOutOfRange,
@@ -725,8 +735,11 @@ pub enum AnswerDisposition {
     LateAnswer(LateAnswerEvidence),
     /// The answer matches no retained attempt on any connection.
     Unmatched(UnmatchedAnswerEvidence),
-    /// The answer matched a live attempt but failed validation. The attempt
-    /// remains in flight; bounded evidence only.
+    /// The answer matched a retained attempt's identity but failed
+    /// validation. Validation runs before the completion-state check, so this
+    /// variant is also returned for invalid messages that arrive after the
+    /// transaction completed; it never changes completion state and a pending
+    /// transaction's attempt remains in flight. Bounded evidence only.
     Rejected(AnswerRejection),
 }
 
@@ -745,11 +758,22 @@ pub enum TrackError {
     ConnectionClosed,
     /// The connection's Hop-by-Hop allocation space is exhausted.
     HopByHopSpaceExhausted,
+    /// The allocated (connection, Hop-by-Hop) attempt identity is already
+    /// retained. This cannot occur through the public API while connections
+    /// honor their allocated partition; it fails closed instead of silently
+    /// overwriting correlation evidence.
+    AttemptIdentifierConflict,
     /// The message is not a Diameter request (R bit clear).
     NotARequest,
     /// The request header or AVP region is malformed, or the message exceeds
     /// the configured size bound.
     MalformedRequest,
+    /// The request already carries the T (potentially retransmitted) bit.
+    /// [`PendingRequestTable::track`] starts a new transaction; a T-set
+    /// request is by definition a retransmission and must be recovered
+    /// through [`PendingRequestTable::restore`], which re-arms it with T=1,
+    /// instead of silently dropping RFC 6733 §3's duplicate-detection signal.
+    AlreadyRetransmitted,
     /// The request lacks exactly one non-empty Origin-Host AVP.
     OriginHostInvalid,
 }
@@ -765,8 +789,10 @@ impl TrackError {
             Self::UnknownConnection => "diameter_pending_track_unknown_connection",
             Self::ConnectionClosed => "diameter_pending_track_connection_closed",
             Self::HopByHopSpaceExhausted => "diameter_pending_track_hop_by_hop_exhausted",
+            Self::AttemptIdentifierConflict => "diameter_pending_track_attempt_conflict",
             Self::NotARequest => "diameter_pending_track_not_a_request",
             Self::MalformedRequest => "diameter_pending_track_malformed_request",
+            Self::AlreadyRetransmitted => "diameter_pending_track_already_retransmitted",
             Self::OriginHostInvalid => "diameter_pending_track_origin_host_invalid",
         }
     }
@@ -801,6 +827,11 @@ pub enum FailoverError {
     /// alternate can reach it ([`AlternateRoutability::DestinationAsserted`])
     /// or finish the transaction as undeliverable.
     FixedDestinationRequiresAssertion,
+    /// The allocated (connection, Hop-by-Hop) attempt identity is already
+    /// retained. This cannot occur through the public API while connections
+    /// honor their allocated partition; it fails closed instead of silently
+    /// overwriting correlation evidence.
+    AttemptIdentifierConflict,
 }
 
 impl FailoverError {
@@ -817,6 +848,7 @@ impl FailoverError {
             Self::FixedDestinationRequiresAssertion => {
                 "diameter_pending_failover_fixed_destination_requires_assertion"
             }
+            Self::AttemptIdentifierConflict => "diameter_pending_failover_attempt_conflict",
         }
     }
 }
@@ -834,11 +866,20 @@ impl std::error::Error for FailoverError {}
 pub enum ConnectionTableError {
     /// The connection bound is reached.
     TableFull,
-    /// The connection token is already registered. Connection tokens must be
-    /// unique per transport lifetime; allocate a fresh token after reconnect.
+    /// The connection token is already registered, or still appears in a
+    /// retained transaction's attempt history. Connection tokens must be
+    /// unique per transport lifetime: reusing a token that restored records
+    /// still reference could allocate a duplicate Hop-by-Hop identifier on
+    /// one connection, breaking RFC 6733 §3 correlation.
     DuplicateConnection,
     /// The connection token is not registered.
     UnknownConnection,
+    /// The connection cannot be retired: at least one pending or retained
+    /// transaction still holds an attempt on this token. Attempt identities
+    /// must stay registered for late-answer evidence; completed records age
+    /// out through the retention bound, after which the token becomes
+    /// removable.
+    ConnectionInUse,
 }
 
 impl ConnectionTableError {
@@ -849,6 +890,7 @@ impl ConnectionTableError {
             Self::TableFull => "diameter_pending_connection_table_full",
             Self::DuplicateConnection => "diameter_pending_connection_duplicate",
             Self::UnknownConnection => "diameter_pending_connection_unknown",
+            Self::ConnectionInUse => "diameter_pending_connection_in_use",
         }
     }
 }
@@ -873,6 +915,8 @@ pub enum TransactionAccessError {
     /// The attempt already terminated and cannot change disposition.
     AttemptNotInFlight,
     /// The transaction has no in-flight attempt to produce wire bytes for.
+    /// Restored attempts recovered by a snapshot never count as live; re-arm
+    /// the record with [`PendingRequestTable::failover`] first.
     NoLiveAttempt,
 }
 
@@ -1003,6 +1047,12 @@ struct TransactionRecord {
     fixed_destination: bool,
     raw_avps: Bytes,
     attempts: Vec<AttemptEvidence>,
+    /// Number of leading attempts recovered by a snapshot restore. Those
+    /// attempts belong to dead connection lifetimes: they remain correlation
+    /// and audit evidence, but their pre-crash wire bytes are never served
+    /// for sending again. The first attempt at or after this index is a
+    /// post-restore re-arm.
+    restored_baseline: usize,
     state: RecordState,
     late_answer_count: u32,
     rejected_answer_count: u32,
@@ -1144,6 +1194,10 @@ struct ConnectionEntry {
     next_hop_by_hop: u32,
     exhausted: bool,
     open: bool,
+    /// Number of attempts in retained records (pending or completed) that
+    /// reference this connection. Guards `retire_connection` so attempt
+    /// identities stay correlated for late-answer evidence.
+    live_attempts: usize,
 }
 
 type AttemptKey = (u64, u32);
@@ -1172,6 +1226,8 @@ pub struct PendingRequestTable {
     attempt_index: HashMap<AttemptKey, CompletionTokenValue>,
     pending_end_to_end: HashMap<u32, CompletionTokenValue>,
     connections: HashMap<u64, ConnectionEntry>,
+    pending_count: usize,
+    completed_count: usize,
     completion_sequence: u64,
     evicted_completions: u64,
     unmatched_answers: u64,
@@ -1182,8 +1238,8 @@ impl fmt::Debug for PendingRequestTable {
         formatter
             .debug_struct("PendingRequestTable")
             .field("config", &self.config)
-            .field("pending_count", &self.pending_count())
-            .field("retained_completed_count", &self.retained_completed_count())
+            .field("pending_count", &self.pending_count)
+            .field("retained_completed_count", &self.completed_count)
             .field("connection_count", &self.connections.len())
             .field("evicted_completions", &self.evicted_completions)
             .field("unmatched_answers", &self.unmatched_answers)
@@ -1205,6 +1261,8 @@ impl PendingRequestTable {
             attempt_index: HashMap::new(),
             pending_end_to_end: HashMap::new(),
             connections: HashMap::new(),
+            pending_count: 0,
+            completed_count: 0,
             completion_sequence: 0,
             evicted_completions: 0,
             unmatched_answers: 0,
@@ -1219,6 +1277,14 @@ impl PendingRequestTable {
     /// partition reserved for pending-request traffic. Within that partition
     /// the table allocates strictly increasing identifiers, which proves
     /// uniqueness on the connection for every attempt it emits.
+    ///
+    /// A token that still appears in any retained transaction's attempt
+    /// history — including records recovered by [`Self::restore`] — is
+    /// rejected as [`ConnectionTableError::DuplicateConnection`]: reusing it
+    /// could allocate a Hop-by-Hop identifier already outstanding on a
+    /// previous lifetime of the "same" connection and silently break
+    /// correlation. Such tokens become reusable only after every referencing
+    /// record has been retired or evicted.
     pub fn add_connection(
         &mut self,
         token: DiameterConnectionToken,
@@ -1230,12 +1296,21 @@ impl PendingRequestTable {
         if self.connections.len() >= self.config.max_connections {
             return Err(ConnectionTableError::TableFull);
         }
+        let referenced = self
+            .records
+            .values()
+            .flat_map(|record| record.attempts.iter())
+            .any(|attempt| attempt.connection == token);
+        if referenced {
+            return Err(ConnectionTableError::DuplicateConnection);
+        }
         self.connections.insert(
             token.get(),
             ConnectionEntry {
                 next_hop_by_hop: first_hop_by_hop,
                 exhausted: false,
                 open: true,
+                live_attempts: 0,
             },
         );
         Ok(())
@@ -1244,7 +1319,8 @@ impl PendingRequestTable {
     /// Mark a connection lifetime closed. New attempts on it are rejected;
     /// in-flight attempts keep their evidence until the caller classifies
     /// them with [`Self::record_attempt_failure`] or
-    /// [`Self::fail_connection_attempts`].
+    /// [`Self::fail_connection_attempts`]. A closed lifetime keeps its slot
+    /// until [`Self::retire_connection`] releases it.
     pub fn close_connection(
         &mut self,
         token: DiameterConnectionToken,
@@ -1257,13 +1333,41 @@ impl PendingRequestTable {
         Ok(())
     }
 
+    /// Release one closed connection lifetime, freeing its registration slot.
+    ///
+    /// Removal is refused with [`ConnectionTableError::ConnectionInUse`]
+    /// while any pending or retained transaction still holds an attempt on
+    /// this token: those attempt identities must stay registered so late
+    /// answers still correlate to bounded evidence. Completed records age out
+    /// through the retention bound (or [`Self::retire`]), so a token becomes
+    /// naturally removable once its last referencing record is gone.
+    pub fn retire_connection(
+        &mut self,
+        token: DiameterConnectionToken,
+    ) -> Result<(), ConnectionTableError> {
+        let entry = self
+            .connections
+            .get(&token.get())
+            .ok_or(ConnectionTableError::UnknownConnection)?;
+        if entry.live_attempts > 0 {
+            return Err(ConnectionTableError::ConnectionInUse);
+        }
+        self.connections.remove(&token.get());
+        Ok(())
+    }
+
     /// Track a canonical request on a registered connection.
     ///
     /// The request must be a Diameter request carrying exactly one non-empty
-    /// Origin-Host; its AVP bytes become the immutable canonical form every
-    /// attempt reuses. The first attempt is created immediately with T clear
-    /// and a connection-unique Hop-by-Hop identifier. The caller-supplied
-    /// token value becomes the durable identity of the transaction.
+    /// Origin-Host and a clear T bit; its AVP bytes become the immutable
+    /// canonical form every attempt reuses. A T-set request is a
+    /// retransmission by definition and is rejected with
+    /// [`TrackError::AlreadyRetransmitted`] rather than silently dropping
+    /// RFC 6733 §3's duplicate-detection signal — recover it through
+    /// [`Self::restore`] instead. The first attempt is created immediately
+    /// with T clear and a connection-unique Hop-by-Hop identifier. The
+    /// caller-supplied token value becomes the durable identity of the
+    /// transaction.
     pub fn track(
         &mut self,
         request: OwnedMessage,
@@ -1273,7 +1377,7 @@ impl PendingRequestTable {
         if self.records.contains_key(&token_value) {
             return Err(TrackError::DuplicateCompletionToken);
         }
-        if self.pending_count() >= self.config.max_pending_transactions {
+        if self.pending_count >= self.config.max_pending_transactions {
             return Err(TrackError::TableFull);
         }
         let facts = inspect_request(&request, self.decode_context())?;
@@ -1284,6 +1388,12 @@ impl PendingRequestTable {
             return Err(TrackError::DuplicateEndToEnd);
         }
         let hop_by_hop_identifier = self.allocate_hop_by_hop(connection)?;
+        if self
+            .attempt_index
+            .contains_key(&(connection.get(), hop_by_hop_identifier))
+        {
+            return Err(TrackError::AttemptIdentifierConflict);
+        }
         let now = self.clock.now();
         let attempt = AttemptEvidence {
             attempt_index: 0,
@@ -1304,6 +1414,7 @@ impl PendingRequestTable {
             fixed_destination: facts.fixed_destination,
             raw_avps: request.raw_avps,
             attempts: vec![attempt],
+            restored_baseline: 0,
             state: RecordState::Pending,
             late_answer_count: 0,
             rejected_answer_count: 0,
@@ -1312,7 +1423,11 @@ impl PendingRequestTable {
             .insert((connection.get(), hop_by_hop_identifier), token_value);
         self.pending_end_to_end
             .insert(facts.end_to_end_identifier, token_value);
+        if let Some(entry) = self.connections.get_mut(&connection.get()) {
+            entry.live_attempts += 1;
+        }
         self.records.insert(token_value, record);
+        self.pending_count += 1;
         Ok(CompletionToken {
             value: token_value,
             generation: 0,
@@ -1338,6 +1453,13 @@ impl PendingRequestTable {
     /// failover attempts, and the recomputed length. The caller writes these
     /// bytes to the attempt's connection and reports the outcome through
     /// [`Self::record_attempt_failure`].
+    ///
+    /// Attempts recovered by [`Self::restore`] are evidence of dead connection
+    /// lifetimes: they are never served here, even when still marked in
+    /// flight. Re-arm the record with [`Self::failover`] first — the
+    /// re-armed attempt carries T=1 as RFC 6733 §5.5.4 requires — otherwise
+    /// this returns [`TransactionAccessError::NoLiveAttempt`]. Use
+    /// [`Self::wire_message_for_attempt`] to inspect historical bytes.
     pub fn attempt_wire_message(
         &self,
         token: CompletionTokenValue,
@@ -1350,7 +1472,10 @@ impl PendingRequestTable {
             .attempts
             .iter()
             .rev()
-            .find(|attempt| attempt.disposition.is_in_flight())
+            .find(|attempt| {
+                attempt.disposition.is_in_flight()
+                    && attempt.attempt_index >= record.restored_baseline
+            })
             .ok_or(TransactionAccessError::NoLiveAttempt)?;
         Ok(record.wire_message(attempt))
     }
@@ -1464,6 +1589,12 @@ impl PendingRequestTable {
             return Err(FailoverError::FixedDestinationRequiresAssertion);
         }
         let hop_by_hop_identifier = self.allocate_hop_by_hop(connection)?;
+        if self
+            .attempt_index
+            .contains_key(&(connection.get(), hop_by_hop_identifier))
+        {
+            return Err(FailoverError::AttemptIdentifierConflict);
+        }
         let now = self.clock.now();
         let attempt = AttemptEvidence {
             attempt_index,
@@ -1481,6 +1612,9 @@ impl PendingRequestTable {
         record.attempts.push(attempt);
         self.attempt_index
             .insert((connection.get(), hop_by_hop_identifier), token);
+        if let Some(entry) = self.connections.get_mut(&connection.get()) {
+            entry.live_attempts += 1;
+        }
         Ok(attempt)
     }
 
@@ -1640,21 +1774,15 @@ impl PendingRequestTable {
 
     /// Return the number of pending transactions.
     #[must_use]
-    pub fn pending_count(&self) -> usize {
-        self.records
-            .values()
-            .filter(|record| record.state.is_pending())
-            .count()
+    pub const fn pending_count(&self) -> usize {
+        self.pending_count
     }
 
     /// Return the number of completed transactions retained for late-answer
     /// evidence.
     #[must_use]
-    pub fn retained_completed_count(&self) -> usize {
-        self.records
-            .values()
-            .filter(|record| !record.state.is_pending())
-            .count()
+    pub const fn retained_completed_count(&self) -> usize {
+        self.completed_count
     }
 
     /// Return the number of registered connection lifetimes.
@@ -1766,6 +1894,8 @@ impl PendingRequestTable {
             attempt_index: HashMap::new(),
             pending_end_to_end: HashMap::new(),
             connections: HashMap::new(),
+            pending_count: 0,
+            completed_count: 0,
             completion_sequence: 0,
             evicted_completions: 0,
             unmatched_answers: 0,
@@ -1784,6 +1914,7 @@ impl PendingRequestTable {
         for _ in 0..record_count {
             let record = table.restore_record(&mut cursor)?;
             table.index_restored_record(record)?;
+            table.pending_count += 1;
         }
         if !cursor.is_exhausted() {
             return Err(SnapshotRestoreError::Malformed);
@@ -1842,11 +1973,13 @@ impl PendingRequestTable {
         if let Some(record) = self.records.get_mut(&token) {
             record.state = RecordState::Completed { kind, sequence };
         }
+        self.pending_count = self.pending_count.saturating_sub(1);
+        self.completed_count = self.completed_count.saturating_add(1);
         if let Some(record) = self.records.get(&token) {
             self.pending_end_to_end
                 .remove(&record.end_to_end_identifier);
         }
-        while self.retained_completed_count() > self.config.max_retained_completions {
+        while self.completed_count > self.config.max_retained_completions {
             let Some(oldest) = self
                 .records
                 .iter()
@@ -1869,9 +2002,17 @@ impl PendingRequestTable {
             for attempt in &record.attempts {
                 self.attempt_index
                     .remove(&(attempt.connection.get(), attempt.hop_by_hop_identifier));
+                if let Some(entry) = self.connections.get_mut(&attempt.connection.get()) {
+                    entry.live_attempts = entry.live_attempts.saturating_sub(1);
+                }
             }
             self.pending_end_to_end
                 .remove(&record.end_to_end_identifier);
+            if record.state.is_pending() {
+                self.pending_count = self.pending_count.saturating_sub(1);
+            } else {
+                self.completed_count = self.completed_count.saturating_sub(1);
+            }
         }
     }
 
@@ -1900,7 +2041,10 @@ impl PendingRequestTable {
         let fixed_destination = flags & 0x01 != 0;
         let proxiable = flags & 0x02 != 0;
         let attempt_count = cursor.count()?;
-        if attempt_count == 0 || attempt_count > self.config.max_attempts_per_transaction {
+        if attempt_count == 0 {
+            return Err(SnapshotRestoreError::InvalidRecord);
+        }
+        if attempt_count > self.config.max_attempts_per_transaction {
             return Err(SnapshotRestoreError::LimitExceeded);
         }
         let mut attempts = Vec::with_capacity(attempt_count);
@@ -1959,6 +2103,7 @@ impl PendingRequestTable {
         {
             return Err(SnapshotRestoreError::InvalidRecord);
         }
+        let restored_baseline = attempts.len();
         Ok(TransactionRecord {
             token_value,
             generation,
@@ -1969,6 +2114,7 @@ impl PendingRequestTable {
             fixed_destination,
             raw_avps: request.raw_avps,
             attempts,
+            restored_baseline,
             state: RecordState::Pending,
             late_answer_count: 0,
             rejected_answer_count: 0,
@@ -2067,6 +2213,13 @@ fn inspect_request(request: &OwnedMessage, ctx: DecodeContext) -> Result<Request
         || !header.command_code.fits_wire()
     {
         return Err(TrackError::MalformedRequest);
+    }
+    if header.flags.is_potentially_retransmitted() {
+        // A T-set request is a retransmission by definition. Tracking it as a
+        // new transaction and emitting attempt 0 with T clear would silently
+        // drop RFC 6733 §3's duplicate-detection signal; recover such
+        // requests through snapshot/restore, which re-arms them with T=1.
+        return Err(TrackError::AlreadyRetransmitted);
     }
     // Duplicate occurrences are classified per-AVP below so an Origin-Host
     // duplication is reported as the identity violation it is, not as a
@@ -3006,5 +3159,447 @@ mod tests {
             )
             .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(evidence.ended_at(), Some(Duration::from_millis(35)));
+    }
+
+    fn conn(value: u64) -> DiameterConnectionToken {
+        match NonZeroU64::new(value) {
+            Some(value) => DiameterConnectionToken::new(value),
+            None => panic!("connection token must be nonzero"),
+        }
+    }
+
+    #[test]
+    fn connection_retirement_frees_slots_and_refuses_while_referenced() {
+        let config = PendingRequestTableConfig {
+            max_connections: 1,
+            ..PendingRequestTableConfig::default()
+        };
+        let mut table = table(config);
+        table
+            .add_connection(CONNECTION_A, 100)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let tracked = table
+            .track(canonical_request(None), CONNECTION_A, token(1))
+            .unwrap_or_else(|e| panic!("{e}"));
+        table
+            .close_connection(CONNECTION_A)
+            .unwrap_or_else(|e| panic!("{e}"));
+        // The pending record still references the lifetime.
+        assert_eq!(
+            err_of(table.retire_connection(CONNECTION_A)),
+            ConnectionTableError::ConnectionInUse
+        );
+        // Completion alone does not release it: the retained completed record
+        // still provides late-answer evidence.
+        let wire = table
+            .attempt_wire_message(tracked.value())
+            .unwrap_or_else(|e| panic!("{e}"));
+        let disposition = table.correlate_answer(
+            CONNECTION_A,
+            answer_message(wire.header.hop_by_hop_identifier, E2E),
+        );
+        assert!(matches!(disposition, AnswerDisposition::Completed(_)));
+        assert_eq!(
+            err_of(table.retire_connection(CONNECTION_A)),
+            ConnectionTableError::ConnectionInUse
+        );
+        // Once the record is retired, the token becomes removable.
+        assert!(table.retire(tracked.value()));
+        table
+            .retire_connection(CONNECTION_A)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(table.connection_count(), 0);
+
+        // 64 connect/close/retire cycles with one slot never brick the table.
+        for cycle in 0..64_u64 {
+            let lifetime = conn(cycle + 10);
+            table
+                .add_connection(lifetime, 1)
+                .unwrap_or_else(|e| panic!("{e}"));
+            table
+                .close_connection(lifetime)
+                .unwrap_or_else(|e| panic!("{e}"));
+            table
+                .retire_connection(lifetime)
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        assert_eq!(table.connection_count(), 0);
+        // Retiring an unknown lifetime is a typed error, not a panic.
+        assert_eq!(
+            err_of(table.retire_connection(conn(9_999))),
+            ConnectionTableError::UnknownConnection
+        );
+    }
+
+    #[test]
+    fn add_connection_rejects_tokens_referenced_by_restored_history() {
+        let mut table = table(PendingRequestTableConfig::default());
+        table
+            .add_connection(CONNECTION_A, 100)
+            .unwrap_or_else(|e| panic!("{e}"));
+        table
+            .add_connection(CONNECTION_B, 900)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let tracked = table
+            .track(canonical_request(None), CONNECTION_A, token(1))
+            .unwrap_or_else(|e| panic!("{e}"));
+        table
+            .failover(
+                tracked.value(),
+                CONNECTION_B,
+                AlternateRoutability::RealmRouted,
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+        let snapshot = table.snapshot();
+        let mut restored = PendingRequestTable::restore(
+            snapshot.as_bytes(),
+            PendingRequestTableConfig::default(),
+            Arc::new(ManualClock::default()),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        // Both historical lifetimes are rejected: re-registering either could
+        // allocate a duplicate Hop-by-Hop identifier on one connection.
+        assert_eq!(
+            err_of(restored.add_connection(CONNECTION_A, 100)),
+            ConnectionTableError::DuplicateConnection
+        );
+        assert_eq!(
+            err_of(restored.add_connection(CONNECTION_B, 900)),
+            ConnectionTableError::DuplicateConnection
+        );
+        // A genuinely fresh lifetime registers fine, and once the referencing
+        // record is gone the historical tokens become reusable.
+        restored
+            .add_connection(conn(3), 5000)
+            .unwrap_or_else(|e| panic!("{e}"));
+        restored
+            .finish_indeterminate(tracked.value(), IndeterminateReason::CallerWithdrawn)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(restored.retire(tracked.value()));
+        restored
+            .add_connection(CONNECTION_A, 100)
+            .unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    #[test]
+    fn track_rejects_retransmitted_requests() {
+        let mut table = table(PendingRequestTableConfig::default());
+        table
+            .add_connection(CONNECTION_A, 100)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let mut retransmitted = canonical_request(None);
+        retransmitted.header.flags = CommandFlags::from_bits(
+            CommandFlags::request(true).bits() | CommandFlags::POTENTIALLY_RETRANSMITTED,
+        );
+        assert_eq!(
+            err_of(table.track(retransmitted, CONNECTION_A, token(1))),
+            TrackError::AlreadyRetransmitted
+        );
+        // The rejection is fail-closed without side effects: the same token
+        // and End-to-End remain usable for an ordinary request.
+        table
+            .track(canonical_request(None), CONNECTION_A, token(1))
+            .unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    #[test]
+    fn restored_in_flight_attempts_require_rearm_before_sending() {
+        let mut table = table(PendingRequestTableConfig::default());
+        table
+            .add_connection(CONNECTION_A, 100)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let tracked = table
+            .track(canonical_request(None), CONNECTION_A, token(1))
+            .unwrap_or_else(|e| panic!("{e}"));
+        let snapshot = table.snapshot();
+        let mut restored = PendingRequestTable::restore(
+            snapshot.as_bytes(),
+            PendingRequestTableConfig::default(),
+            Arc::new(ManualClock::default()),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        // The restored attempt is still marked in flight, but its connection
+        // lifetime is dead: its pre-crash T-clear bytes are never re-served.
+        assert_eq!(
+            err_of(restored.attempt_wire_message(tracked.value())),
+            TransactionAccessError::NoLiveAttempt
+        );
+        // Historical bytes remain inspectable for audit.
+        let historical = restored
+            .transaction(tracked.value())
+            .unwrap_or_else(|| panic!("view"))
+            .attempts()[0]
+            .attempt_id();
+        let evidence = restored
+            .wire_message_for_attempt(tracked.value(), historical)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(!evidence.header.flags.is_potentially_retransmitted());
+        // Re-arming through failover produces the sendable T=1 form.
+        restored
+            .add_connection(conn(3), 5000)
+            .unwrap_or_else(|e| panic!("{e}"));
+        restored
+            .failover(tracked.value(), conn(3), AlternateRoutability::RealmRouted)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let rearmed = restored
+            .attempt_wire_message(tracked.value())
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(rearmed.header.flags.is_potentially_retransmitted());
+        assert_eq!(rearmed.header.end_to_end_identifier, E2E);
+    }
+
+    /// Encode one snapshot record in the versioned on-disk form.
+    fn snapshot_record(
+        token_value: u128,
+        generation: u64,
+        end_to_end: u32,
+        flags: u8,
+        attempts: &[(u64, u32, u8, u64, u64)],
+        raw_avps: &[u8],
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&token_value.to_be_bytes());
+        out.extend_from_slice(&generation.to_be_bytes());
+        out.extend_from_slice(&end_to_end.to_be_bytes());
+        out.extend_from_slice(&302_u32.to_be_bytes());
+        out.extend_from_slice(&100_u32.to_be_bytes());
+        out.push(flags);
+        out.extend_from_slice(&(attempts.len() as u16).to_be_bytes());
+        for (connection, hop_by_hop, disposition, started, ended) in attempts {
+            out.extend_from_slice(&connection.to_be_bytes());
+            out.extend_from_slice(&hop_by_hop.to_be_bytes());
+            out.push(*disposition);
+            out.extend_from_slice(&started.to_be_bytes());
+            out.extend_from_slice(&ended.to_be_bytes());
+        }
+        out.extend_from_slice(&(raw_avps.len() as u32).to_be_bytes());
+        out.extend_from_slice(raw_avps);
+        out
+    }
+
+    fn snapshot_bytes(records: &[Vec<u8>]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&0x4450_5453_u32.to_be_bytes());
+        out.extend_from_slice(&1_u16.to_be_bytes());
+        out.extend_from_slice(&(records.len() as u16).to_be_bytes());
+        for record in records {
+            out.extend_from_slice(record);
+        }
+        out
+    }
+
+    fn minimal_avps() -> Vec<u8> {
+        wire_avp(264, b"host.example")
+    }
+
+    fn restore_error(bytes: &[u8], config: PendingRequestTableConfig) -> SnapshotRestoreError {
+        match PendingRequestTable::restore(bytes, config, Arc::new(ManualClock::default())) {
+            Ok(_) => panic!("tampered snapshot must be rejected"),
+            Err(error) => error,
+        }
+    }
+
+    #[test]
+    fn restore_tamper_matrix_is_rejected() {
+        const NONE: u64 = u64::MAX;
+        let config = PendingRequestTableConfig::default();
+        let baseline = snapshot_bytes(&[snapshot_record(
+            1,
+            0,
+            E2E,
+            0x02,
+            &[(1, 100, 0, 0, NONE)],
+            &minimal_avps(),
+        )]);
+        PendingRequestTable::restore(&baseline, config, Arc::new(ManualClock::default()))
+            .unwrap_or_else(|e| panic!("baseline must restore: {e}"));
+
+        // A nonzero completion generation is impossible for a pending record.
+        let bad_generation = snapshot_bytes(&[snapshot_record(
+            1,
+            1,
+            E2E,
+            0x02,
+            &[(1, 100, 0, 0, NONE)],
+            &minimal_avps(),
+        )]);
+        assert_eq!(
+            restore_error(&bad_generation, config),
+            SnapshotRestoreError::InvalidRecord
+        );
+
+        // A fixed-destination flag with no Destination-Host AVP is a lie.
+        let flag_lie = snapshot_bytes(&[snapshot_record(
+            1,
+            0,
+            E2E,
+            0x03,
+            &[(1, 100, 0, 0, NONE)],
+            &minimal_avps(),
+        )]);
+        assert_eq!(
+            restore_error(&flag_lie, config),
+            SnapshotRestoreError::InvalidRecord
+        );
+
+        // Reserved flag bits are rejected.
+        let bad_flags = snapshot_bytes(&[snapshot_record(
+            1,
+            0,
+            E2E,
+            0x10,
+            &[(1, 100, 0, 0, NONE)],
+            &minimal_avps(),
+        )]);
+        assert_eq!(
+            restore_error(&bad_flags, config),
+            SnapshotRestoreError::InvalidRecord
+        );
+
+        // Duplicate completion tokens across records.
+        let duplicate_tokens = snapshot_bytes(&[
+            snapshot_record(1, 0, E2E, 0x02, &[(1, 100, 0, 0, NONE)], &minimal_avps()),
+            snapshot_record(
+                1,
+                0,
+                E2E + 1,
+                0x02,
+                &[(1, 101, 0, 0, NONE)],
+                &minimal_avps(),
+            ),
+        ]);
+        assert_eq!(
+            restore_error(&duplicate_tokens, config),
+            SnapshotRestoreError::InvalidRecord
+        );
+
+        // Duplicate End-to-End identifiers across records.
+        let duplicate_e2e = snapshot_bytes(&[
+            snapshot_record(1, 0, E2E, 0x02, &[(1, 100, 0, 0, NONE)], &minimal_avps()),
+            snapshot_record(2, 0, E2E, 0x02, &[(1, 101, 0, 0, NONE)], &minimal_avps()),
+        ]);
+        assert_eq!(
+            restore_error(&duplicate_e2e, config),
+            SnapshotRestoreError::InvalidRecord
+        );
+
+        // Duplicate attempt identities within one record.
+        let duplicate_attempt_within = snapshot_bytes(&[snapshot_record(
+            1,
+            0,
+            E2E,
+            0x02,
+            &[(1, 100, 1, 0, 5), (1, 100, 0, 6, NONE)],
+            &minimal_avps(),
+        )]);
+        assert_eq!(
+            restore_error(&duplicate_attempt_within, config),
+            SnapshotRestoreError::InvalidRecord
+        );
+
+        // Duplicate attempt identities across records.
+        let duplicate_attempt_across = snapshot_bytes(&[
+            snapshot_record(1, 0, E2E, 0x02, &[(1, 100, 0, 0, NONE)], &minimal_avps()),
+            snapshot_record(
+                2,
+                0,
+                E2E + 1,
+                0x02,
+                &[(1, 100, 0, 0, NONE)],
+                &minimal_avps(),
+            ),
+        ]);
+        assert_eq!(
+            restore_error(&duplicate_attempt_across, config),
+            SnapshotRestoreError::InvalidRecord
+        );
+
+        // An in-flight attempt must not carry an end timestamp.
+        let in_flight_ended = snapshot_bytes(&[snapshot_record(
+            1,
+            0,
+            E2E,
+            0x02,
+            &[(1, 100, 0, 0, 7)],
+            &minimal_avps(),
+        )]);
+        assert_eq!(
+            restore_error(&in_flight_ended, config),
+            SnapshotRestoreError::InvalidRecord
+        );
+
+        // A terminated attempt must carry an end timestamp.
+        let failed_open = snapshot_bytes(&[snapshot_record(
+            1,
+            0,
+            E2E,
+            0x02,
+            &[(1, 100, 1, 0, NONE)],
+            &minimal_avps(),
+        )]);
+        assert_eq!(
+            restore_error(&failed_open, config),
+            SnapshotRestoreError::InvalidRecord
+        );
+
+        // A pending record must hold at least one attempt.
+        let no_attempts = snapshot_bytes(&[snapshot_record(1, 0, E2E, 0x02, &[], &minimal_avps())]);
+        assert_eq!(
+            restore_error(&no_attempts, config),
+            SnapshotRestoreError::InvalidRecord
+        );
+
+        // A pending record must not contain an answered attempt.
+        let answered = snapshot_bytes(&[snapshot_record(
+            1,
+            0,
+            E2E,
+            0x02,
+            &[(1, 100, 4, 0, 5)],
+            &minimal_avps(),
+        )]);
+        assert_eq!(
+            restore_error(&answered, config),
+            SnapshotRestoreError::InvalidRecord
+        );
+
+        // Attempt history exceeding the restored table's per-record bound.
+        let two_attempts = snapshot_bytes(&[snapshot_record(
+            1,
+            0,
+            E2E,
+            0x02,
+            &[(1, 100, 1, 0, 5), (2, 900, 0, 6, NONE)],
+            &minimal_avps(),
+        )]);
+        let tight_attempts = PendingRequestTableConfig {
+            max_attempts_per_transaction: 1,
+            ..PendingRequestTableConfig::default()
+        };
+        assert_eq!(
+            restore_error(&two_attempts, tight_attempts),
+            SnapshotRestoreError::LimitExceeded
+        );
+
+        // Record count exceeding the restored table's pending bound.
+        let two_records = snapshot_bytes(&[
+            snapshot_record(1, 0, E2E, 0x02, &[(1, 100, 0, 0, NONE)], &minimal_avps()),
+            snapshot_record(
+                2,
+                0,
+                E2E + 1,
+                0x02,
+                &[(1, 101, 0, 0, NONE)],
+                &minimal_avps(),
+            ),
+        ]);
+        let tight_pending = PendingRequestTableConfig {
+            max_pending_transactions: 1,
+            ..PendingRequestTableConfig::default()
+        };
+        assert_eq!(
+            restore_error(&two_records, tight_pending),
+            SnapshotRestoreError::LimitExceeded
+        );
     }
 }
