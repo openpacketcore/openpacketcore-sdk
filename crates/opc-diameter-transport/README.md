@@ -12,19 +12,25 @@ state machine.
   exchange and then immediately upgrades that same unbuffered TCP stream.
 - Direct DTLS/SCTP completes a mutually authenticated DTLS 1.3 (optionally
   1.2-compatible) handshake over the `SctpMessageIo` message seam before any
-  Diameter byte is read or written. DTLS records travel per RFC 6083 as
-  unordered SCTP user messages on stream 0 with PPID 47, and PPID 47 is
+  Diameter byte is read or written. Exactly one DTLS record travels per SCTP
+  user message, ordered on stream 0 with PPID 47 (RFC 6083 sections 4.1 and
+  4.4; PPID 47 itself is registered by RFC 6733 section 11.5), and PPID 47 is
   emitted only through this attested association: the send side of the seam
   accepts only complete DTLS records. Any cleartext or foreign-PPID user
   message fails the association closed before, during, or after the
   handshake. The engine is the Sans-IO `dimpl` crate (pure-Rust `rust-crypto`
   provider; ECDHE-ECDSA AEAD suites only, no RSA/DHE/renegotiation). The
   peer's leaf certificate is validated by this crate, not the engine:
-  trust-anchor chain and validity window via rustls-webpki, plus an exact
-  configured SPIFFE identity match. The in-band CER/CEA-before-DTLS sequence
-  over SCTP and the RFC 6083 SCTP-AUTH exporter key switch are not claimed
-  (the engine exposes only the DTLS-SRTP export); the kernel-SCTP adapter for
-  the seam is follow-up work in `opc-sctp`.
+  trust-anchor chain scoped to the peer's SPIFFE trust domain plus validity
+  window via rustls-webpki, plus an exact configured SPIFFE identity match.
+  The in-band CER/CEA-before-DTLS sequence over SCTP and the RFC 6083
+  section 4.8 SCTP-AUTH exporter key switch are not claimed (the engine
+  exposes only the DTLS-SRTP export); the kernel-SCTP adapter for the seam
+  is follow-up work in `opc-sctp`.
+- Diameter frames over DTLS are bounded to the single-record plaintext
+  budget: `DtlsSctpPolicy` rejects frame limits above
+  `MAX_DTLS_SCTP_MESSAGE_BYTES` (2^14) at construction because the engine
+  does not fragment application data across records.
 - The authenticated certificate SPIFFE ID must exactly match the configured
   peer. `ExpectedPeerIdentity::new` rejects empty or non-ASCII `Origin-Host`
   and `Origin-Realm` configuration. Typed CER/CEA parsing and construction use
@@ -121,10 +127,18 @@ allocation, and all application state machines.
 The DTLS/SCTP association currently integrates the sequential connection
 methods (capability exchange and admitted application messages) but not yet
 the bounded full-duplex peer runtime, the kernel-SCTP seam adapter, the RFC
-6083 SCTP-AUTH exporter key switch, or the in-band CER/CEA-before-DTLS
-sequence over SCTP. Exact negotiated-cipher evidence for DTLS is limited by
-the engine's public API; the configured cipher allow-list bounds what can be
-negotiated and the negotiated DTLS version is reported exactly.
+6083 section 4.8 SCTP-AUTH exporter key switch, or the in-band
+CER/CEA-before-DTLS sequence over SCTP. RFC 6083 section 4.5 (SCTP DATA
+chunks authenticated per RFC 4895) is a separate unmet association-level
+requirement owned by the future `opc-sctp` integration. Peer leaf
+certificates only: the engine presents a single certificate and path
+validation is called with an empty intermediate list, so peers chaining
+through intermediate CAs fail closed. Exact negotiated-cipher evidence for
+DTLS is limited by the engine's public API; the configured cipher allow-list
+bounds what can be negotiated and the negotiated DTLS version is reported
+exactly. Local private-key custody is engine-forced into a plain `Vec<u8>`
+inside `dimpl`; the intermediate copy is zeroized and zeroizing custody is
+tracked as follow-up.
 
 The original sequential `DiameterTlsConnection` methods remain available for
 capability setup and narrow integrations. Long-lived use should consume a

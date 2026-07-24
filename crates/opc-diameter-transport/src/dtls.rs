@@ -4,32 +4,53 @@
 //! for SCTP: a mutually authenticated DTLS session is established before any
 //! Diameter byte is carried, and only then may CER/CEA and admitted
 //! application commands cross the association. DTLS records are transported
-//! per RFC 6083 as unordered SCTP user messages on stream 0 with PPID
-//! [`DIAMETER_DTLS_SCTP_PPID`] (47). PPID 47 is emitted only through an
-//! actual, attested DTLS/SCTP association; this module never upgrades a
-//! cleartext or PPID-only association into a protection claim.
+//! as ordered SCTP user messages on stream 0 with PPID
+//! [`DIAMETER_DTLS_SCTP_PPID`] (47, registered by RFC 6733 section 11.5 for
+//! "Diameter in a DTLS/SCTP DATA chunk"; RFC 6083 section 4.3 deliberately
+//! registers no DTLS-specific PPID of its own). Exactly one DTLS record is
+//! carried per SCTP user message as RFC 6083 section 4.1 requires, and all
+//! records use ordered stream-0 delivery per section 4.4 (Handshake, CCS,
+//! and Alert records MUST; ApplicationData MAY, and this transport sends it
+//! the same way because the engine's non-disableable replay window makes
+//! unordered delivery lossy). PPID 47 is emitted only through an actual,
+//! attested DTLS/SCTP association; this module never upgrades a cleartext or
+//! PPID-only association into a protection claim.
 //!
 //! The DTLS engine is `dimpl` (Sans-IO, DTLS 1.2/1.3, ECDHE-ECDSA AEAD suites
 //! only, no RSA/DHE/renegotiation) with its pure-Rust `rust-crypto` provider,
 //! chosen so the workspace does not gain a second native crypto build. Peer
 //! certificates are not PKI-validated by the engine; this module validates the
-//! peer leaf certificate itself (trust-anchor chain, validity window, exact
-//! configured SPIFFE identity) with the same rustls-webpki verification used
-//! by the TLS/TCP side, and it closes the association without processing any
-//! application command when validation fails.
+//! peer leaf certificate itself (trust-anchor chain scoped to the peer's
+//! SPIFFE trust domain, validity window, exact configured SPIFFE identity)
+//! with the same rustls-webpki verification family used by the TLS/TCP side,
+//! and it closes the association without processing any application command
+//! when validation fails.
+//!
+//! Key custody note: the engine's `DtlsCertificate` owns the local private
+//! key as a plain, cloneable `Vec<u8>`. Handing the coherent `opc-identity`
+//! key to the engine is unavoidable today; the intermediate copy made here
+//! is zeroized, and zeroizing engine-side custody is tracked as follow-up
+//! (see the admitted-key-custody direction in #508).
 //!
 //! Documented boundaries of this slice:
 //!
 //! - The message seam [`SctpMessageIo`] is transport-agnostic. This crate ships
 //!   the deterministic in-memory adapter; binding the seam to the kernel SCTP
 //!   associations in `opc-sctp` is follow-up work.
-//! - RFC 6083 section 4.5 rotates the SCTP-AUTH shared key from the DTLS
-//!   exporter (RFC 5705, label `EXPORTER_DTLS_OVER_SCTP`). `dimpl` exposes
-//!   only the DTLS-SRTP export, so this slice cannot derive that secret; the
-//!   SCTP-AUTH key switch prepared in `opc-sctp` remains unclaimed rather than
-//!   being fed substitute material.
+//! - RFC 6083 section 4.8 derives a 64-byte SCTP-AUTH shared secret from the
+//!   DTLS exporter (RFC 5705, label `EXPORTER_DTLS_OVER_SCTP`, no context) on
+//!   every handshake. `dimpl` exposes only the DTLS-SRTP export, so this
+//!   slice cannot derive that secret; the SCTP-AUTH key switch prepared in
+//!   `opc-sctp` remains unclaimed rather than being fed substitute material.
+//! - RFC 6083 section 4.5 additionally requires SCTP DATA chunks to be sent
+//!   authenticated per RFC 4895. That kernel SCTP-AUTH configuration is a
+//!   separate, also unmet, association-level requirement owned by the
+//!   `opc-sctp` integration, not by this record layer.
 //! - The in-band CER/CEA-before-DTLS sequence of RFC 6733 section 13.1 over
 //!   SCTP is not claimed here; the direct sequence is.
+//! - Peer leaf certificates only: the engine presents a single certificate
+//!   and this module passes an empty intermediate list to the path builder,
+//!   so peers that must chain through intermediate CAs fail closed.
 //! - Exact negotiated-cipher evidence is limited by the engine's public API
 //!   (it reports the negotiated protocol version only). The configured cipher
 //!   allow-list is still enforced at engine configuration; evidence reports
@@ -42,7 +63,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
-use opc_identity::IdentityState;
+use opc_identity::{IdentityState, TrustBundleSet, TrustDomain};
 use opc_proto_diameter::peer::{
     build_capabilities_exchange_request, parse_capabilities_exchange_answer,
     parse_capabilities_exchange_error_answer, parse_capabilities_exchange_request,
@@ -62,6 +83,7 @@ use rustls_pki_types::CertificateDer;
 use tokio::sync::{mpsc, watch, Notify};
 use tokio::time::Instant;
 use x509_parser::prelude::{FromDer, X509Certificate};
+use zeroize::Zeroizing;
 
 use crate::frame::{borrowed, decode_wire_frame, encoded_bytes, validate_wire_frame};
 use crate::frame_transport::FrameTransportFuture;
@@ -72,14 +94,20 @@ use crate::{
     ExpectedPeerIdentity,
 };
 
-/// RFC 6083 payload protocol identifier for DTLS over SCTP.
+/// PPID for "Diameter in a DTLS/SCTP DATA chunk" (RFC 6733 section 11.5).
 pub const DIAMETER_DTLS_SCTP_PPID: u32 = 47;
 
-/// SCTP stream carrying every record of one DTLS connection (RFC 6083
-/// section 5 fixes all records of one connection to a single stream).
+/// SCTP stream carrying every record of one DTLS connection. RFC 6083
+/// section 4.4 requires ordered stream-0 delivery for Handshake, CCS, and
+/// Alert records; this transport uses ordered stream-0 delivery for
+/// ApplicationData too.
 pub const DIAMETER_DTLS_SCTP_STREAM: u16 = 0;
 
 const ENGINE_POLL_BUFFER: usize = 16 * 1024;
+
+/// Classic DTLS record header length (content type, version, epoch, sequence
+/// number, length) used to split engine datagrams into single records.
+const DTLS_RECORD_HEADER_BYTES: usize = 13;
 
 /// One received SCTP user message surfaced through the message seam.
 #[derive(Clone, PartialEq, Eq)]
@@ -127,13 +155,16 @@ pub trait SctpTransportClose: Send + Sync {
 /// Message-oriented SCTP seam between the DTLS association and a transport.
 ///
 /// The send side deliberately accepts only complete DTLS records: the
-/// implementation emits them as unordered SCTP user messages on stream 0 with
-/// PPID 47. This keeps "PPID 47 only through an actual DTLS/SCTP association"
-/// a structural property rather than a caller discipline. The receive side
-/// surfaces every user message with its PPID so the association can fail
-/// closed on any cleartext input.
+/// implementation emits each record as its own ordered SCTP user message on
+/// stream 0 with PPID 47 (RFC 6083 sections 4.1 and 4.4). This keeps
+/// "PPID 47 only through an actual DTLS/SCTP association" and the
+/// one-record-per-message rule structural properties rather than caller
+/// discipline. Delivery must be ordered: the DTLS replay window discards
+/// reordered records, and Handshake/CCS/Alert records are only valid on
+/// ordered stream-0 delivery. The receive side surfaces every user message
+/// with its PPID so the association can fail closed on any cleartext input.
 pub trait SctpMessageIo: Send {
-    /// Emit one complete DTLS record as an unordered PPID-47 stream-0 message.
+    /// Emit one complete DTLS record as one ordered PPID-47 stream-0 message.
     fn send_dtls_record<'a>(&'a mut self, record: &'a [u8]) -> FrameTransportFuture<'a, ()>;
 
     /// Receive the next SCTP user message, or `None` once the transport is
@@ -153,6 +184,10 @@ pub struct SctpWireRecord {
     pub ppid: u32,
     /// Emitted payload length in bytes.
     pub payload_bytes: usize,
+    /// The first bytes of the emission, enough to parse either DTLS record
+    /// header format via [`parse_dtls_record_bounds`]; `None` for cleartext
+    /// or truncated payloads so wire assertions can reject them.
+    pub record_header: Option<[u8; DTLS_RECORD_HEADER_BYTES]>,
 }
 
 /// Shared, bounded wire log for one in-memory link.
@@ -229,22 +264,73 @@ impl InMemorySctpEndpoint {
         self.emit(SctpUserMessage::new(payload, ppid)).await
     }
 
-    async fn emit(&mut self, message: SctpUserMessage) -> Result<(), DiameterTlsError> {
-        if self.shared.closed.load(Ordering::Acquire) {
-            return Err(DiameterTlsError::Transport);
+    /// Clone a retained raw-injection handle. Tests use it to place
+    /// cleartext or foreign-PPID messages mid-session after this endpoint
+    /// has been consumed by an association.
+    pub fn injector(&self) -> InMemorySctpInjector {
+        InMemorySctpInjector {
+            tx: self.tx.clone(),
+            a_side: self.a_side,
+            shared: Arc::clone(&self.shared),
         }
-        if let Ok(mut log) = self.shared.log.lock() {
-            log.push(SctpWireRecord {
-                a_to_b: self.a_side,
-                ppid: message.ppid(),
-                payload_bytes: message.payload().len(),
-            });
-        }
-        self.tx
-            .send(message)
-            .await
-            .map_err(|_| DiameterTlsError::Transport)
     }
+
+    async fn emit(&mut self, message: SctpUserMessage) -> Result<(), DiameterTlsError> {
+        emit_logged(&self.tx, &self.shared, self.a_side, message).await
+    }
+}
+
+/// Retained raw-injection handle for one in-memory endpoint; see
+/// [`InMemorySctpEndpoint::injector`].
+pub struct InMemorySctpInjector {
+    tx: mpsc::Sender<SctpUserMessage>,
+    a_side: bool,
+    shared: Arc<InMemoryShared>,
+}
+
+impl InMemorySctpInjector {
+    /// Emit one raw user message with an arbitrary PPID towards the peer.
+    pub async fn send_raw_message(
+        &self,
+        ppid: u32,
+        payload: Bytes,
+    ) -> Result<(), DiameterTlsError> {
+        emit_logged(
+            &self.tx,
+            &self.shared,
+            self.a_side,
+            SctpUserMessage::new(payload, ppid),
+        )
+        .await
+    }
+}
+
+async fn emit_logged(
+    tx: &mpsc::Sender<SctpUserMessage>,
+    shared: &InMemoryShared,
+    a_side: bool,
+    message: SctpUserMessage,
+) -> Result<(), DiameterTlsError> {
+    if shared.closed.load(Ordering::Acquire) {
+        return Err(DiameterTlsError::Transport);
+    }
+    if let Ok(mut log) = shared.log.lock() {
+        log.push(SctpWireRecord {
+            a_to_b: a_side,
+            ppid: message.ppid(),
+            payload_bytes: message.payload().len(),
+            record_header: (message.ppid() == DIAMETER_DTLS_SCTP_PPID
+                && message.payload().len() >= DTLS_RECORD_HEADER_BYTES)
+                .then(|| {
+                    let mut header = [0_u8; DTLS_RECORD_HEADER_BYTES];
+                    header.copy_from_slice(&message.payload()[..DTLS_RECORD_HEADER_BYTES]);
+                    header
+                }),
+        });
+    }
+    tx.send(message)
+        .await
+        .map_err(|_| DiameterTlsError::Transport)
 }
 
 impl SctpMessageIo for InMemorySctpEndpoint {
@@ -379,6 +465,18 @@ impl DtlsSctpCipher {
     }
 }
 
+/// Maximum Diameter message wire length the DTLS/SCTP path may carry.
+///
+/// Each Diameter message is carried as the plaintext of exactly one DTLS
+/// record (RFC 6083 section 4.1 admits exactly one record per SCTP user
+/// message). RFC 9147 and RFC 6347 bound one record's plaintext to 2^14
+/// bytes; with AEAD and header overhead the ciphertext then stays within the
+/// 2^14 + 2048 record bound and the 2^14 + 2048 + 13 SCTP user-message budget
+/// of RFC 6083. The engine does not fragment application data across
+/// records, so a larger configured frame limit must be rejected at policy
+/// construction rather than letting the u16 record length wrap.
+pub const MAX_DTLS_SCTP_MESSAGE_BYTES: usize = 16_384;
+
 /// Typed DTLS/SCTP protocol, cipher, frame, and age policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DtlsSctpPolicy {
@@ -390,14 +488,18 @@ pub struct DtlsSctpPolicy {
 
 impl DtlsSctpPolicy {
     /// DTLS 1.3-only policy with all supported AEAD suites. DTLS 1.2
-    /// compatibility is deliberately not admitted by default.
-    pub const fn dtls13(frame_limits: DiameterFrameLimits) -> Self {
-        Self {
+    /// compatibility is deliberately not admitted by default. The frame
+    /// limit must not exceed [`MAX_DTLS_SCTP_MESSAGE_BYTES`].
+    pub fn dtls13(frame_limits: DiameterFrameLimits) -> Result<Self, DiameterTlsPolicyError> {
+        if frame_limits.max_message_len() > MAX_DTLS_SCTP_MESSAGE_BYTES {
+            return Err(DiameterTlsPolicyError::FrameLimitExceedsDtlsRecordBudget);
+        }
+        Ok(Self {
             allow_dtls12: false,
             allowed_ciphers: [true; 3],
             frame_limits,
             maximum_connection_age: Duration::from_secs(60 * 60),
-        }
+        })
     }
 
     /// Additionally admit DTLS 1.2 with ECDHE-ECDSA AEAD suites for
@@ -482,7 +584,14 @@ impl DtlsSctpPolicy {
 
 impl Default for DtlsSctpPolicy {
     fn default() -> Self {
-        Self::dtls13(DiameterFrameLimits::default())
+        let limits = DiameterFrameLimits::new(MAX_DTLS_SCTP_MESSAGE_BYTES)
+            .unwrap_or_else(|_| DiameterFrameLimits::default());
+        Self::dtls13(limits).unwrap_or_else(|_| Self {
+            allow_dtls12: false,
+            allowed_ciphers: [true; 3],
+            frame_limits: limits,
+            maximum_connection_age: Duration::from_secs(60 * 60),
+        })
     }
 }
 
@@ -560,7 +669,7 @@ impl fmt::Debug for DiameterDtlsSctpEvidence {
 /// Coherent local credential snapshot admitted for one handshake.
 struct AdmittedMaterial {
     certificate: dimpl::DtlsCertificate,
-    trust_anchors: Vec<CertificateDer<'static>>,
+    trust_bundles: TrustBundleSet,
     epoch: TlsMaterialEpoch,
     local_expires_at: Timestamp,
 }
@@ -574,6 +683,19 @@ fn admit_material(
     if state.is_expired() {
         return Err(DiameterTlsError::MaterialNotAdmitted);
     }
+    let leaf = state
+        .svid
+        .cert_chain
+        .first()
+        .ok_or(DiameterTlsError::MaterialNotAdmitted)?;
+    // `SvidDocument::expires_at` tracks not_after only; a not-yet-valid local
+    // certificate must not be admitted either (the peer-side check alone
+    // would leave the asymmetry).
+    let (not_before, not_after) = local_leaf_validity_window(leaf.as_ref())?;
+    let now = Timestamp::now_utc();
+    if now < not_before || now >= not_after {
+        return Err(DiameterTlsError::MaterialNotAdmitted);
+    }
     let status_value = status.status();
     if !matches!(
         status_value.availability(),
@@ -581,27 +703,37 @@ fn admit_material(
     ) {
         return Err(DiameterTlsError::MaterialNotAdmitted);
     }
-    let leaf = state
-        .svid
-        .cert_chain
-        .first()
-        .ok_or(DiameterTlsError::MaterialNotAdmitted)?;
+    // dimpl's `DtlsCertificate` owns plain `Vec<u8>` key material with no
+    // zeroization and a `Clone` derive; that custody loss is engine-forced.
+    // The intermediate copy here is zeroized so this crate does not add a
+    // second long-lived plaintext copy (see also the module docs and the
+    // admitted-key-custody direction in #508).
+    let private_key = Zeroizing::new(state.svid.private_key.secret_der().to_vec());
     let certificate = dimpl::DtlsCertificate {
         certificate: leaf.as_ref().to_vec(),
-        private_key: state.svid.private_key.secret_der().to_vec(),
+        private_key: private_key.to_vec(),
     };
-    let trust_anchors = state
-        .trust_bundles
-        .bundles
-        .values()
-        .flat_map(|bundle| bundle.certificates.iter().cloned())
-        .collect();
     Ok(AdmittedMaterial {
         certificate,
-        trust_anchors,
+        trust_bundles: state.trust_bundles,
         epoch: status_value.epoch(),
         local_expires_at: state.svid.expires_at,
     })
+}
+
+fn local_leaf_validity_window(der: &[u8]) -> Result<(Timestamp, Timestamp), DiameterTlsError> {
+    let (_, certificate) =
+        X509Certificate::from_der(der).map_err(|_| DiameterTlsError::MaterialNotAdmitted)?;
+    let to_timestamp = |asn1: x509_parser::time::ASN1Time| {
+        time::OffsetDateTime::from_unix_timestamp(asn1.timestamp())
+            .map(Timestamp::from_offset_datetime)
+            .map_err(|_| DiameterTlsError::MaterialNotAdmitted)
+    };
+    let validity = certificate.validity();
+    Ok((
+        to_timestamp(validity.not_before)?,
+        to_timestamp(validity.not_after)?,
+    ))
 }
 
 /// Peer certificate usage verified against the leaf.
@@ -613,7 +745,7 @@ enum PeerUsage {
 
 struct HandshakeValidation {
     expected_peer: ExpectedPeerIdentity,
-    trust_anchors: Vec<CertificateDer<'static>>,
+    trust_bundles: TrustBundleSet,
     usage: PeerUsage,
     allow_dtls12: bool,
 }
@@ -645,17 +777,27 @@ fn validate_peer_certificate(
     if peer_spiffe != *validation.expected_peer.spiffe_id() {
         return Err(DiameterTlsError::PeerIdentityMismatch);
     }
-    let cert_der = CertificateDer::from(der.to_vec());
-    let end_entity =
-        webpki::EndEntityCert::try_from(&cert_der).map_err(|_| DiameterTlsError::Authentication)?;
-    let anchors: Vec<_> = validation
-        .trust_anchors
+    // Anchors are scoped to the peer leaf's SPIFFE trust domain, mirroring
+    // the TLS/TCP verifier in opc-tls: a certificate chaining to an anchor
+    // that is trusted for a *different* domain must fail closed even when
+    // that anchor is present in the local trust store.
+    let trust_domain = TrustDomain::new(peer_spiffe.trust_domain())
+        .map_err(|_| DiameterTlsError::Authentication)?;
+    let bundle = validation
+        .trust_bundles
+        .get(&trust_domain)
+        .ok_or(DiameterTlsError::Authentication)?;
+    let anchors: Vec<_> = bundle
+        .certificates
         .iter()
         .filter_map(|anchor| webpki::anchor_from_trusted_cert(anchor).ok())
         .collect();
     if anchors.is_empty() {
         return Err(DiameterTlsError::MaterialNotAdmitted);
     }
+    let cert_der = CertificateDer::from(der.to_vec());
+    let end_entity =
+        webpki::EndEntityCert::try_from(&cert_der).map_err(|_| DiameterTlsError::Authentication)?;
     let since_epoch = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|_| DiameterTlsError::Authentication)?;
@@ -663,6 +805,9 @@ fn validate_peer_certificate(
         PeerUsage::Server => webpki::KeyUsage::server_auth(),
         PeerUsage::Client => webpki::KeyUsage::client_auth(),
     };
+    // Leaf-only path building: the engine presents a single peer
+    // certificate and no intermediates are carried, so peers that must
+    // chain through an intermediate CA fail closed here.
     end_entity
         .verify_for_usage(
             SIGNATURE_ALGORITHMS,
@@ -719,13 +864,105 @@ fn poll_engine(
     }
 }
 
+/// Parsed framing of one DTLS record on the wire, covering both the classic
+/// 13-byte header (epoch-0 plaintext and all DTLS 1.2 records) and the
+/// RFC 9147 unified ciphertext header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DtlsRecordBounds {
+    /// Record header length in bytes.
+    pub header_bytes: usize,
+    /// Total record length (header plus fragment) in bytes.
+    pub record_bytes: usize,
+    /// Plaintext content type for classic headers; ciphertext records carry
+    /// the real content type inside the protected tail, so it is `None`.
+    pub content_type: Option<u8>,
+    /// Classic-header epoch, or the two low epoch bits of a unified header.
+    pub epoch: u16,
+    /// Whether this record used the RFC 9147 unified header.
+    pub unified: bool,
+}
+
+/// Parse the framing of the first record in `frame`.
+///
+/// Returns `None` for truncated or unsupported shapes. Unified headers with
+/// a connection ID are rejected: the engine never negotiates connection IDs
+/// and the CID length is otherwise unknowable from the wire alone.
+pub fn parse_dtls_record_bounds(frame: &[u8]) -> Option<DtlsRecordBounds> {
+    let first = *frame.first()?;
+    if first & 0b1110_0000 == 0b0010_0000 {
+        // RFC 9147 unified header: C(0x10) S(0x08) L(0x04) epoch(0x03).
+        if first & 0b0001_0000 != 0 {
+            return None;
+        }
+        let sequence_bytes = if first & 0b0000_1000 != 0 { 2 } else { 1 };
+        let has_length = first & 0b0000_0100 != 0;
+        let header_bytes = 1 + sequence_bytes + if has_length { 2 } else { 0 };
+        if frame.len() < header_bytes {
+            return None;
+        }
+        let record_bytes = if has_length {
+            let declared = usize::from(u16::from_be_bytes([
+                frame[1 + sequence_bytes],
+                frame[2 + sequence_bytes],
+            ]));
+            header_bytes.checked_add(declared)?
+        } else {
+            // No explicit length: the record fills the remainder of the
+            // datagram, which is the whole user message here.
+            frame.len()
+        };
+        Some(DtlsRecordBounds {
+            header_bytes,
+            record_bytes,
+            content_type: None,
+            epoch: u16::from(first & 0b0000_0011),
+            unified: true,
+        })
+    } else {
+        if frame.len() < DTLS_RECORD_HEADER_BYTES {
+            return None;
+        }
+        let declared = usize::from(u16::from_be_bytes([frame[11], frame[12]]));
+        let record_bytes = DTLS_RECORD_HEADER_BYTES.checked_add(declared)?;
+        Some(DtlsRecordBounds {
+            header_bytes: DTLS_RECORD_HEADER_BYTES,
+            record_bytes,
+            content_type: Some(first),
+            epoch: u16::from_be_bytes([frame[3], frame[4]]),
+            unified: false,
+        })
+    }
+}
+
+/// Split one engine datagram into the individual DTLS records it carries.
+///
+/// RFC 6083 section 4.1 requires exactly one DTLS record per SCTP user
+/// message, while the engine may coalesce several records into one datagram.
+/// The record framing is parsed defensively; a malformed boundary fails the
+/// association closed.
+fn split_dtls_records(datagram: &[u8]) -> Result<Vec<&[u8]>, DiameterTlsError> {
+    let mut records = Vec::new();
+    let mut remaining = datagram;
+    while !remaining.is_empty() {
+        let bounds = parse_dtls_record_bounds(remaining).ok_or(DiameterTlsError::Transport)?;
+        if bounds.record_bytes == 0 || bounds.record_bytes > remaining.len() {
+            return Err(DiameterTlsError::Transport);
+        }
+        records.push(&remaining[..bounds.record_bytes]);
+        remaining = &remaining[bounds.record_bytes..];
+    }
+    Ok(records)
+}
+
 async fn flush_outbound(
     io: &mut Box<dyn SctpMessageIo>,
     state: &mut PumpState,
 ) -> Result<(), DiameterTlsError> {
-    let records: Vec<Bytes> = state.outbound.drain(..).collect();
-    for record in records {
-        io.send_dtls_record(&record).await?;
+    let datagrams: Vec<Bytes> = state.outbound.drain(..).collect();
+    for datagram in datagrams {
+        for record in split_dtls_records(&datagram)? {
+            io.send_dtls_record(record).await?;
+        }
     }
     Ok(())
 }
@@ -1021,11 +1258,11 @@ impl DiameterDtlsSctpConnector {
                 return Err(error);
             }
         };
-        let mut engine = self.new_engine(material_certificate(&material)?);
+        let mut engine = self.new_engine(material_certificate(&material)?)?;
         engine.set_active(true);
         let validation = HandshakeValidation {
             expected_peer: self.expected_peer.clone(),
-            trust_anchors: material_trust_anchors(&material),
+            trust_bundles: material.trust_bundles.clone(),
             usage: PeerUsage::Server,
             allow_dtls12: self.policy.allow_dtls12,
         };
@@ -1058,7 +1295,10 @@ impl DiameterDtlsSctpConnector {
 }
 
 impl DiameterDtlsSctpConnector {
-    fn new_engine(&self, certificate: dimpl::DtlsCertificate) -> dimpl::Dtls {
+    fn new_engine(
+        &self,
+        certificate: dimpl::DtlsCertificate,
+    ) -> Result<dimpl::Dtls, DiameterTlsError> {
         new_policy_engine(&self.policy, certificate)
     }
 }
@@ -1121,10 +1361,10 @@ impl DiameterDtlsSctpAcceptor {
                 return Err(error);
             }
         };
-        let mut engine = self.new_engine(material_certificate(&material)?);
+        let mut engine = self.new_engine(material_certificate(&material)?)?;
         let validation = HandshakeValidation {
             expected_peer: self.expected_peer.clone(),
-            trust_anchors: material_trust_anchors(&material),
+            trust_bundles: material.trust_bundles.clone(),
             usage: PeerUsage::Client,
             allow_dtls12: self.policy.allow_dtls12,
         };
@@ -1157,7 +1397,10 @@ impl DiameterDtlsSctpAcceptor {
 }
 
 impl DiameterDtlsSctpAcceptor {
-    fn new_engine(&self, certificate: dimpl::DtlsCertificate) -> dimpl::Dtls {
+    fn new_engine(
+        &self,
+        certificate: dimpl::DtlsCertificate,
+    ) -> Result<dimpl::Dtls, DiameterTlsError> {
         new_policy_engine(&self.policy, certificate)
     }
 }
@@ -1175,16 +1418,16 @@ impl fmt::Debug for DiameterDtlsSctpAcceptor {
 /// Construct the engine for the policy version floor. A DTLS 1.3-only policy
 /// must not auto-sense down to DTLS 1.2; only the explicit compatibility
 /// policy uses the version-sensing constructor.
-fn new_policy_engine(policy: &DtlsSctpPolicy, certificate: dimpl::DtlsCertificate) -> dimpl::Dtls {
-    let config = match policy.engine_config() {
-        Ok(config) => config,
-        Err(_) => unreachable!("policy engine config is validated by the caller"),
-    };
-    if policy.allow_dtls12 {
+fn new_policy_engine(
+    policy: &DtlsSctpPolicy,
+    certificate: dimpl::DtlsCertificate,
+) -> Result<dimpl::Dtls, DiameterTlsError> {
+    let config = policy.engine_config()?;
+    Ok(if policy.allow_dtls12 {
         dimpl::Dtls::new_auto(config, certificate, std::time::Instant::now())
     } else {
         dimpl::Dtls::new_13(config, certificate, std::time::Instant::now())
-    }
+    })
 }
 
 fn material_certificate(
@@ -1194,10 +1437,6 @@ fn material_certificate(
         certificate: material.certificate.certificate.clone(),
         private_key: material.certificate.private_key.clone(),
     })
-}
-
-fn material_trust_anchors(material: &AdmittedMaterial) -> Vec<CertificateDer<'static>> {
-    material.trust_anchors.clone()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1918,6 +2157,7 @@ mod tests {
                 a_to_b: true,
                 ppid: DIAMETER_DTLS_SCTP_PPID,
                 payload_bytes: 10,
+                record_header: None,
             }]
         );
         a.close_handle().close();

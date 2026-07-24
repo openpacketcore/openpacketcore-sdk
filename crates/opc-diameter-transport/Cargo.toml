@@ -26,6 +26,7 @@ time = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 tokio-rustls = { workspace = true }
 x509-parser = { workspace = true }
+zeroize = { workspace = true }
 
 [dev-dependencies]
 rcgen = { workspace = true }

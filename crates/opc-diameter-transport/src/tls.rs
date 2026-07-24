@@ -199,6 +199,10 @@ pub enum DiameterTlsPolicyError {
     /// The connection-age bound must be finite, nonzero, and representable.
     #[error("Diameter TLS maximum connection age is invalid")]
     InvalidConnectionAge,
+    /// A DTLS/SCTP frame limit exceeds the single-record 2^14 plaintext
+    /// budget (see `MAX_DTLS_SCTP_MESSAGE_BYTES`).
+    #[error("Diameter DTLS/SCTP frame limit exceeds the single-record budget")]
+    FrameLimitExceedsDtlsRecordBudget,
 }
 
 /// Certificate and Diameter protocol identity expected on one connection.
