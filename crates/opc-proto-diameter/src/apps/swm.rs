@@ -2637,7 +2637,10 @@ impl SwmDiameterEapRequestEnvelope {
     ///
     /// This does not add a `MIP6-Feature-Vector` to the DER. It is consulted
     /// only when a correlated DEA supplies no explicit mobility selection;
-    /// an explicit AAA selection always takes precedence.
+    /// an explicit AAA selection always takes precedence. Without an attached
+    /// mode, correlation falls back to the classification of the DER's own
+    /// offered vector ([`SwmMip6FeatureVector::mobility_mode`]); attaching a
+    /// mode overrides that derivation.
     #[must_use]
     pub const fn with_locally_configured_mobility_mode(
         mut self,
@@ -2721,7 +2724,7 @@ impl SwmDiameterEapRequestEnvelope {
         ensure_correlated_answer(&self, &answer)?;
         let effective_mobility_mode = effective_mobility_mode(&self, answer.answer());
         let mobility_mode_source =
-            effective_mobility_mode_source(&self, answer.answer(), effective_mobility_mode);
+            effective_mobility_mode_source(answer.answer(), effective_mobility_mode);
         Ok(SwmCorrelatedDiameterEapExchange {
             request: self,
             answer,
@@ -2830,8 +2833,11 @@ impl SwmCorrelatedDiameterEapExchange {
     /// Return the effective mobility-mode provenance for this exchange.
     ///
     /// An explicit DEA `MIP6-Feature-Vector` is AAA-derived and takes
-    /// precedence. Otherwise this reports trusted local configuration attached
-    /// to the request envelope, or `None` when neither source exists.
+    /// precedence. Otherwise this reports `LocallyConfigured` when a local
+    /// fallback resolves a mode — the attached request-envelope mode, else
+    /// the classification of the DER's own offered vector — and `None` when
+    /// none resolves. [`Self::local_mobility_mode_input`] distinguishes the
+    /// attached mode from the offer-derived one.
     #[must_use]
     pub const fn mobility_mode_source(&self) -> Option<SwmConditionalValueSource> {
         self.mobility_mode_source
@@ -2842,8 +2848,9 @@ impl SwmCorrelatedDiameterEapExchange {
     /// Explicit DEA network-based bits select `NetworkBased`; explicit
     /// `ASSIGN_LOCAL_IP` selects `LocalIpAddressAssignment`; an explicit vector
     /// containing neither selection produces `None` without falling back to
-    /// local configuration. When the DEA omits the vector, the trusted local
-    /// request-envelope mode is used.
+    /// local configuration. When the DEA omits the vector, the attached local
+    /// request-envelope mode is used, else the mode classified from the DER's
+    /// own offered vector via [`SwmMip6FeatureVector::mobility_mode`].
     #[must_use]
     pub const fn effective_mobility_mode(&self) -> Option<SwmLocallyConfiguredMobilityMode> {
         self.effective_mobility_mode
@@ -3688,6 +3695,27 @@ impl SwmMip6FeatureVector {
         self.0 & bits == bits
     }
 
+    /// Classify this vector's IP mobility-mode selection.
+    ///
+    /// Any network-based-mobility member (PMIPv6 or GTPv2) maps to
+    /// [`SwmLocallyConfiguredMobilityMode::NetworkBased`], an
+    /// `ASSIGN_LOCAL_IP` selection maps to
+    /// [`SwmLocallyConfiguredMobilityMode::LocalIpAddressAssignment`], and a
+    /// vector carrying neither (for example `MIP6_INTEGRATED` alone) selects
+    /// no mode. Correlation applies exactly this classification to an
+    /// explicit DEA vector and, when both the DEA vector and an attached
+    /// local mode are absent, to the DER's own offered vector.
+    #[must_use]
+    pub const fn mobility_mode(self) -> Option<SwmLocallyConfiguredMobilityMode> {
+        if self.0 & Self::NETWORK_BASED_MOBILITY_BITS != 0 {
+            Some(SwmLocallyConfiguredMobilityMode::NetworkBased)
+        } else if self.contains(Self::ASSIGN_LOCAL_IP) {
+            Some(SwmLocallyConfiguredMobilityMode::LocalIpAddressAssignment)
+        } else {
+            None
+        }
+    }
+
     const fn valid_request(self) -> bool {
         self.0 & Self::ANSWER_ONLY_BITS == 0
     }
@@ -3838,7 +3866,12 @@ impl fmt::Debug for SwmRequestedSupportedFeatures {
 ///
 /// This provenance is application-side metadata. Diameter does not encode it,
 /// so the parser deliberately does not invent or reconstruct it from wire
-/// bytes.
+/// bytes. Correlation may still derive a `LocallyConfigured` mobility mode
+/// from the retained request's own offered vector when the DEA omits its
+/// vector and no mode was attached; on a parsed request envelope that offer
+/// originated on the wire, and
+/// [`SwmCorrelatedDiameterEapExchange::local_mobility_mode_input`]
+/// distinguishes that derivation from an explicitly attached mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SwmConditionalValueSource {
     /// Derived from trusted local configuration or local node capabilities.
@@ -5712,8 +5745,9 @@ pub struct SwmDiameterEapAnswer {
     /// trusted only when the request-bound effective mobility mode is
     /// network-based. An explicit DEA feature vector takes precedence; only
     /// when it is absent may the request envelope's trusted local mobility
-    /// provenance supply that effective mode. Presence of these facts does not
-    /// itself imply successful authorization.
+    /// provenance — an attached mode, else the DER's own offered vector —
+    /// supply that effective mode. Presence of these facts does not itself
+    /// imply successful authorization.
     pub subscriber_authorization: SwmDeaSubscriberAuthorization,
     /// Mobility capabilities selected or authorized by the AAA server.
     pub mip6_feature_vector: Option<SwmMip6FeatureVector>,
@@ -10688,13 +10722,10 @@ fn subscriber_authorization_matches_request(
     request: &SwmDiameterEapRequestEnvelope,
     answer: &SwmDiameterEapAnswer,
 ) -> bool {
-    let network_based_mobility_authorized = match answer.mip6_feature_vector {
-        Some(features) => features.bits() & SwmMip6FeatureVector::NETWORK_BASED_MOBILITY_BITS != 0,
-        None => matches!(
-            request.locally_configured_mobility_mode(),
-            Some(SwmLocallyConfiguredMobilityMode::NetworkBased)
-        ),
-    };
+    let network_based_mobility_authorized = matches!(
+        effective_mobility_mode(request, answer),
+        Some(SwmLocallyConfiguredMobilityMode::NetworkBased)
+    );
     dea_authorization::validate_for_request(
         &answer.subscriber_authorization,
         answer.result.is_diameter_success(),
@@ -10705,16 +10736,15 @@ fn subscriber_authorization_matches_request(
 }
 
 fn effective_mobility_mode_source(
-    request: &SwmDiameterEapRequestEnvelope,
     answer: &SwmDiameterEapAnswer,
     effective_mode: Option<SwmLocallyConfiguredMobilityMode>,
 ) -> Option<SwmConditionalValueSource> {
     match answer.mip6_feature_vector {
         Some(_) if effective_mode.is_some() => Some(SwmConditionalValueSource::AaaDerived),
         Some(_) => None,
-        None if request.locally_configured_mobility_mode().is_some() => {
-            Some(SwmConditionalValueSource::LocallyConfigured)
-        }
+        // Attached and offer-derived fallbacks are both projections of
+        // trusted local configuration, so they share one provenance label.
+        None if effective_mode.is_some() => Some(SwmConditionalValueSource::LocallyConfigured),
         None => None,
     }
 }
@@ -10724,17 +10754,30 @@ fn effective_mobility_mode(
     answer: &SwmDiameterEapAnswer,
 ) -> Option<SwmLocallyConfiguredMobilityMode> {
     match answer.mip6_feature_vector {
-        Some(features)
-            if features.bits() & SwmMip6FeatureVector::NETWORK_BASED_MOBILITY_BITS != 0 =>
-        {
-            Some(SwmLocallyConfiguredMobilityMode::NetworkBased)
-        }
-        Some(features) if features.contains(SwmMip6FeatureVector::ASSIGN_LOCAL_IP) => {
-            Some(SwmLocallyConfiguredMobilityMode::LocalIpAddressAssignment)
-        }
-        Some(_) => None,
-        None => request.locally_configured_mobility_mode(),
+        // An explicit AAA vector always decides, including deciding "no
+        // mode": it must not fall through to either local fallback.
+        Some(features) => features.mobility_mode(),
+        None => request
+            .locally_configured_mobility_mode()
+            .or_else(|| derived_offer_mobility_mode(request)),
     }
+}
+
+// TS 29.273 permits preconfigured information to select the IP mobility mode
+// when the DEA omits the vector. The DER's offered vector is that
+// preconfigured projection, so it backstops a consumer that never attached
+// an explicit local mode; a DER that offered nothing stays fail-closed. The
+// unchecked envelope constructors never validate their facts, so an offer
+// carrying an answer-only selection derives nothing rather than minting
+// provenance from a vector no DER could legally carry.
+fn derived_offer_mobility_mode(
+    request: &SwmDiameterEapRequestEnvelope,
+) -> Option<SwmLocallyConfiguredMobilityMode> {
+    request
+        .request()
+        .mip6_feature_vector
+        .filter(|features| features.valid_request())
+        .and_then(SwmMip6FeatureVector::mobility_mode)
 }
 
 fn validate_decoded_request(request: &SwmDiameterEapRequest) -> Result<(), DecodeError> {
@@ -11637,9 +11680,9 @@ mod diameter_eap_correlation_tests {
 
         let mut offered = bound_request();
         offered.request.mip6_feature_vector = Some(SwmMip6FeatureVector::gtpv2_only());
-        assert_correlation_error(
-            correlate_application(offered, answer),
-            SwmDiameterEapCorrelationError::SubscriberAuthorizationMismatch,
+        assert!(
+            correlate_application(offered, answer).is_ok(),
+            "an offered network-based vector supplies the mobility provenance"
         );
     }
 
@@ -11672,6 +11715,123 @@ mod diameter_eap_correlation_tests {
         assert_correlation_error(
             correlate_application(request, answer),
             SwmDiameterEapCorrelationError::ApnAuthorizationMismatch,
+        );
+    }
+
+    fn authorized_apn_answer() -> SwmDiameterEapAnswer {
+        let mut answer = answer_facts();
+        answer.default_context_identifier = Some(7);
+        answer.apn_configurations.push(ApnConfiguration {
+            context_identifier: 7,
+            service_selection: "ims.synthetic.example".to_owned().into(),
+            pdn_type: PdnType::Ipv4,
+            eps_subscribed_qos_profile: None,
+            ambr: None,
+        });
+        answer
+    }
+
+    #[test]
+    fn omitted_vector_apn_configuration_correlates_via_offered_vector() {
+        let mut request = bound_request();
+        request.request.mip6_feature_vector = Some(SwmMip6FeatureVector::gtpv2_only());
+        request.request.service_selection = Some("ims.synthetic.example".to_owned().into());
+        assert!(
+            correlate_application(request, authorized_apn_answer()).is_ok(),
+            "the DER's offered network-based vector supplies the APN provenance"
+        );
+    }
+
+    #[test]
+    fn omitted_vector_apn_configuration_fails_without_any_provenance() {
+        let mut request = bound_request();
+        request.request.service_selection = Some("ims.synthetic.example".to_owned().into());
+        assert_correlation_error(
+            correlate_application(request, authorized_apn_answer()),
+            SwmDiameterEapCorrelationError::ApnAuthorizationMismatch,
+        );
+    }
+
+    #[test]
+    fn non_mode_offer_supplies_no_derived_provenance() {
+        let mut request = bound_request();
+        request.request.mip6_feature_vector = Some(SwmMip6FeatureVector::from_bits_retain(
+            SwmMip6FeatureVector::MIP6_INTEGRATED,
+        ));
+        request.request.service_selection = Some("ims.synthetic.example".to_owned().into());
+        assert_correlation_error(
+            correlate_application(request, authorized_apn_answer()),
+            SwmDiameterEapCorrelationError::ApnAuthorizationMismatch,
+        );
+    }
+
+    #[test]
+    fn mobility_mode_classification_is_stable() {
+        assert_eq!(
+            SwmMip6FeatureVector::gtpv2_only().mobility_mode(),
+            Some(SwmLocallyConfiguredMobilityMode::NetworkBased)
+        );
+        assert_eq!(
+            SwmMip6FeatureVector::from_bits_retain(SwmMip6FeatureVector::PMIP6_SUPPORTED)
+                .mobility_mode(),
+            Some(SwmLocallyConfiguredMobilityMode::NetworkBased)
+        );
+        assert_eq!(
+            SwmMip6FeatureVector::from_bits_retain(SwmMip6FeatureVector::ASSIGN_LOCAL_IP)
+                .mobility_mode(),
+            Some(SwmLocallyConfiguredMobilityMode::LocalIpAddressAssignment)
+        );
+        assert_eq!(
+            SwmMip6FeatureVector::from_bits_retain(SwmMip6FeatureVector::MIP6_INTEGRATED)
+                .mobility_mode(),
+            None
+        );
+        assert_eq!(
+            SwmMip6FeatureVector::from_bits_retain(
+                SwmMip6FeatureVector::GTPV2_SUPPORTED | SwmMip6FeatureVector::MIP6_INTEGRATED
+            )
+            .mobility_mode(),
+            Some(SwmLocallyConfiguredMobilityMode::NetworkBased)
+        );
+        assert_eq!(
+            SwmMip6FeatureVector::from_bits_retain(0).mobility_mode(),
+            None
+        );
+    }
+
+    #[test]
+    fn non_mode_answer_vector_blocks_derived_fallback() {
+        let mut request = bound_request();
+        request.request.mip6_feature_vector = Some(SwmMip6FeatureVector::from_bits_retain(
+            SwmMip6FeatureVector::GTPV2_SUPPORTED | SwmMip6FeatureVector::MIP6_INTEGRATED,
+        ));
+        request.request.service_selection = Some("ims.synthetic.example".to_owned().into());
+        let mut answer = authorized_apn_answer();
+        answer.mip6_feature_vector = Some(SwmMip6FeatureVector::from_bits_retain(
+            SwmMip6FeatureVector::MIP6_INTEGRATED,
+        ));
+        assert_correlation_error(
+            correlate_application(request, answer),
+            SwmDiameterEapCorrelationError::ApnAuthorizationMismatch,
+        );
+    }
+
+    #[test]
+    fn invalid_unchecked_offer_derives_no_provenance() {
+        let mut request = bound_request();
+        request.request.mip6_feature_vector = Some(SwmMip6FeatureVector::from_bits_retain(
+            SwmMip6FeatureVector::ASSIGN_LOCAL_IP,
+        ));
+        let mut answer = answer_facts();
+        let apn_oi_replacement = match SwmApnOiReplacement::new("mnc001.mcc001.gprs") {
+            Ok(value) => value,
+            Err(error) => panic!("synthetic APN-OI-Replacement failed: {error}"),
+        };
+        answer.subscriber_authorization =
+            SwmDeaSubscriberAuthorization::new().with_apn_oi_replacement(apn_oi_replacement);
+        assert_correlation_error(
+            correlate_application(request, answer),
+            SwmDiameterEapCorrelationError::SubscriberAuthorizationMismatch,
         );
     }
 

@@ -530,14 +530,23 @@ final authorization decision.
 
 The request envelope can retain one explicit
 `SwmLocallyConfiguredMobilityMode` without changing DER bytes. Parsed and
-default envelopes carry no local provenance, fail closed for APN-OI, preserve
-the attached mode across failover retransmission, and include it in replay
-payload equality. A DEA vector takes precedence: any PMIPv6/GTPv2 bit maps to
-effective `NetworkBased`, `ASSIGN_LOCAL_IP` maps to
-`LocalIpAddressAssignment`, and a vector with neither selection maps to no
-effective mode without falling back. Only an absent DEA vector permits the
-retained local mode. `SwmCorrelatedDiameterEapExchange` exposes both
-`effective_mobility_mode()` and `mobility_mode_source()`. Network-based offers
+default envelopes carry no attached provenance, preserve an attached mode
+across failover retransmission, and include it in replay payload equality. A
+DEA vector takes precedence: any PMIPv6/GTPv2 bit maps to effective
+`NetworkBased`, `ASSIGN_LOCAL_IP` maps to `LocalIpAddressAssignment`, and a
+vector with neither selection maps to no effective mode without falling
+back. Only an absent DEA vector permits the local fallback, which resolves
+in order: the attached mode, else the classification of the DER's own
+offered vector (`SwmMip6FeatureVector::mobility_mode()` — the offer is the
+preconfigured projection TS 29.273 lets select the mode when the answer
+omits the vector). A mixed offer that combines network-based members with
+non-mode capabilities such as `MIP6_INTEGRATED` derives `NetworkBased`,
+mirroring the specification's collective and/or wording; attaching a mode
+overrides that resolution. An offer carrying an answer-only selection
+derives nothing. A DER that offered nothing and attached nothing still
+fails closed for APN-OI and APN provisioning. `SwmCorrelatedDiameterEapExchange`
+exposes both `effective_mobility_mode()` and `mobility_mode_source()`; both
+local fallbacks report `LocallyConfigured` provenance. Network-based offers
 and selections retain TS 29.273's collective PMIPv6/GTPv2 semantics rather
 than requiring the same protocol bit on both sides.
 

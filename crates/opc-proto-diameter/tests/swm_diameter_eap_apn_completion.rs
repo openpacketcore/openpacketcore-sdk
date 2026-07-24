@@ -882,15 +882,24 @@ fn checked_mutator_rejects_request_result_mobility_and_correlation_contradiction
         swm::SwmApnConfigurationErrorCode::ResultNotExactSuccess
     );
 
+    let mut offerless_facts = sample_request(false);
+    offerless_facts.mip6_feature_vector = None;
+    let offerless = swm::SwmDiameterEapRequestEnvelope::for_outbound(offerless_facts, transaction);
     let mut answer = sample_answer();
     answer.mip6_feature_vector = None;
     assert_eq!(
         answer
-            .set_authorized_apn_configurations_for(&normal, vec![complete()])
-            .expect_err("network fields require selected NBM")
+            .set_authorized_apn_configurations_for(&offerless, vec![complete()])
+            .expect_err("network fields require mobility provenance")
             .code(),
         swm::SwmApnConfigurationErrorCode::MobilityModeMismatch
     );
+    assert!(answer.apn_configurations.is_empty(), "mutation is atomic");
+    // The retained DER offered a network-based vector, so an omitted answer
+    // vector no longer needs a separately attached local mode.
+    answer
+        .set_authorized_apn_configurations_for(&normal, vec![complete()])
+        .expect("the DER's offered vector supplies the NBM provenance");
 
     let wrong = swm::SwmAuthorizedApnConfiguration::new(sample_core(
         swm::PdnType::Ipv4,

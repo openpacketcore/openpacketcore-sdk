@@ -1349,18 +1349,57 @@ fn local_mobility_provenance_is_explicit_replay_safe_and_aaa_precedent() {
         EncodeContext::default(),
     )
     .is_ok());
+    // The offered network-based vector supplies the APN-OI provenance even
+    // without an attached local mode; the offer-less envelope keeps failing
+    // closed above.
     assert!(swm::build_swm_diameter_eap_answer_for(
         &offered_plain,
         &successful_answer(authorization.clone()),
         EncodeContext::default(),
     )
-    .is_err());
+    .is_ok());
     assert!(swm::build_swm_diameter_eap_answer_for(
         &offered,
         &successful_answer(authorization.clone()),
         EncodeContext::default(),
     )
     .is_ok());
+
+    let derived_exchange = offered_plain
+        .clone()
+        .correlate_answer(SwmDiameterEapAnswerEnvelope::for_outbound(
+            successful_answer(authorization.clone()),
+            offered_plain.transaction(),
+        ))
+        .expect("the offered vector alone supplies mobility provenance");
+    assert_eq!(
+        derived_exchange.mobility_mode_source(),
+        Some(SwmConditionalValueSource::LocallyConfigured)
+    );
+    assert_eq!(
+        derived_exchange.effective_mobility_mode(),
+        Some(SwmLocallyConfiguredMobilityMode::NetworkBased)
+    );
+    assert_eq!(derived_exchange.local_mobility_mode_input(), None);
+
+    let attached_precedence = offered_plain
+        .clone()
+        .with_locally_configured_mobility_mode(
+            SwmLocallyConfiguredMobilityMode::LocalIpAddressAssignment,
+        )
+        .correlate_answer(SwmDiameterEapAnswerEnvelope::for_outbound(
+            successful_answer(SwmDeaSubscriberAuthorization::new()),
+            offered_plain.transaction(),
+        ))
+        .expect("an attached local mode takes precedence over the offer");
+    assert_eq!(
+        attached_precedence.effective_mobility_mode(),
+        Some(SwmLocallyConfiguredMobilityMode::LocalIpAddressAssignment)
+    );
+    assert_eq!(
+        attached_precedence.mobility_mode_source(),
+        Some(SwmConditionalValueSource::LocallyConfigured)
+    );
 
     let mut local_assignment = successful_answer(SwmDeaSubscriberAuthorization::new());
     local_assignment.mip6_feature_vector = Some(SwmMip6FeatureVector::from_bits_retain(
