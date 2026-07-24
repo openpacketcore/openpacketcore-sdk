@@ -27,6 +27,59 @@ This document defines the conformance status of the `opc-proto-diameter` crate.
   identifier parsing and preservation.
 - `Message::tail` returns unconsumed bytes after the header-declared boundary.
 
+#### Origin-scoped End-to-End Identifier authority
+
+`DiameterEndToEndIdentifierAuthority` implements an originating endpoint's RFC
+6733 section 3 local-uniqueness mechanism. It derives the high 12 bits from the
+low 12 bits of the observed UNIX second and collision-scans a deterministic
+20-bit sequence; no randomness contributes. All clones serialize through one
+origin-local state, retain an exact 240-second monotonic recent-use fence, and
+admit 65,536 concurrent/recent identifiers by default with a configurable hard
+bound of 2^20. Work and storage remain bounded.
+
+Every coherent clock observation advances the wall and monotonic rollback
+high-water before restart, capacity, or candidate checks. A failed allocation
+therefore cannot hide a later rollback, while its cursor and recent-use fence
+remain unchanged. Clock unavailability, either rollback, restart quarantine,
+capacity exhaustion, invalid/mismatched Origin-Host, and synchronized-state
+failure are typed value-free errors. Public errors are non-exhaustive for
+forward-compatible matching.
+
+Construction consumes an affine caller attestation asserting that the previous
+owner is gone before one live shared authority takes ownership of an
+Origin-Host. Returned whole `unix_seconds` observations are globally
+nondecreasing across process incarnations and, for any two real instants less
+than 240 seconds apart, differ by at most 4095. It also asserts that the
+monotonic expiry clock cannot advance by 240 seconds before at least 240 real
+seconds have elapsed; lag is conservative and permitted. The factory validates
+the shared nonempty-ASCII DiameterIdentity contract plus an authority-specific
+1024-byte resource bound and retains only its case-insensitive,
+domain-separated SHA-256 scope fingerprint. Each authority quarantines
+allocation until wall seconds exceed its construction second. This is a
+process-local RFC time-derived restart technique. If its restart-time
+assumptions cannot be trusted, the deployment needs durable non-reuse
+state/range reservation or an independently trusted full 240-second startup
+quarantine. A shared Origin-Host separately requires an external singleton
+lease/fence or distinct Origin-Host values. The SDK authority implements none
+of those durable or distributed mechanisms.
+
+Allocation returns an affine `DiameterEndToEndRequestIdentity` that is neither
+`Clone`, `Copy`, nor `Hash`; omitting `Hash` prevents a caller-controlled
+hasher from observing the hidden identifier or scope fingerprint. Checked
+`for_originating_request` constructors on the five SWm DER/STR/ASR/RAR/AAR
+envelopes read and case-insensitively match the typed request Origin-Host before
+yielding the raw identifier; retained request envelopes then preserve it across
+ordinary retries and failover. The generic identity consumer accepts a
+caller-supplied Origin-Host for non-SWm applications. Existing raw
+transaction/envelope constructors are explicitly unchecked compatibility
+paths. Authority, attestation, identity, transaction, time, and error
+diagnostics disclose neither scope fingerprints nor identifier values. Public
+composition evidence uses one ePDG authority for DER/STR/AAR and one AAA
+authority for ASR/RAR, proves uniqueness only within each Origin-Host, and
+rejects an ePDG identity at a typed AAA-origin constructor. Hop-by-Hop
+allocation, peer selection, request bytes, retry timers, and application policy
+remain downstream.
+
 ### 2. Generic AVP TLV Layer (RFC 6733 §4)
 
 - Non-vendor AVP header (8 octets) and vendor-specific AVP header
@@ -1002,7 +1055,8 @@ same-Hop T-set duplicate build byte-identical committed success and
 unknown-session STA responses. A failover duplicate using a newly allocated
 Hop-by-Hop Identifier produces the same flags and AVPs with only the permitted
 hop-local identifier difference. The consumer still owns duplicate lookup,
-identifier allocation, committed-response caching, and replay lifetime.
+Hop-by-Hop allocation, committed-response caching, and replay lifetime;
+originating End-to-End values can be consumed from the shared authority.
 RFC 7683 capability correlation permits an answer to omit
 OC-Supported-Features after the request offered it, representing a selected
 server that is not a reporting node. A returned selection must have been
@@ -1136,8 +1190,9 @@ For the same typed ASA, T-clear and same-Hop T-set duplicates rebuild
 byte-identical answer bytes. A failover duplicate with a newly allocated
 Hop-by-Hop Identifier has the same flags, End-to-End Identifier, and AVPs with
 only the permitted hop-local identifier difference. The consumer still owns
-duplicate detection, identifier allocation, a bounded cache and its lifetime,
-exactly-once teardown, and replay of the exact committed encoded bytes.
+duplicate detection, Hop-by-Hop allocation, a bounded cache and its lifetime,
+exactly-once teardown, and replay of the exact committed encoded bytes;
+originating End-to-End values can be consumed from the shared authority.
 
 At the ePDG, after the request-bound ASA has been successfully built and its
 bytes committed, `SwmAbortSessionRequestEnvelope::post_abort_session_termination`

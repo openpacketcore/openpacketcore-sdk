@@ -29,6 +29,7 @@ use crate::base;
 use crate::dictionary::{
     AvpCardinality, AvpDefinition, AvpKey, CommandAvpRule, CommandDefinition, CommandKind,
 };
+use crate::end_to_end::{DiameterEndToEndIdentifierError, DiameterEndToEndRequestIdentity};
 use crate::parser_error::DiameterParserError;
 use crate::{AvpCode, AvpHeader, CommandCode, Message, OwnedMessage, RawAvp, DIAMETER_HEADER_LEN};
 
@@ -769,7 +770,10 @@ pub struct SwmReAuthRequestEnvelope {
 }
 
 impl SwmReAuthRequestEnvelope {
-    /// Bind outbound RAR facts to their Diameter identifiers.
+    /// Bind outbound RAR facts to caller-supplied raw identifiers.
+    ///
+    /// This is an unchecked compatibility path. New originators should use
+    /// [`Self::for_originating_request`].
     #[must_use]
     pub fn for_outbound(
         request: SwmReAuthRequest,
@@ -784,6 +788,34 @@ impl SwmReAuthRequestEnvelope {
             request,
             proxy_infos: Vec::new(),
         }
+    }
+
+    /// Bind a new RAR's affine identity to its typed Origin-Host.
+    ///
+    /// This checked originating boundary reads `request.origin_host` itself,
+    /// consumes `identity`, and installs the authenticated expected-answer
+    /// connection in the same retained envelope.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed, value-free error when the request Origin-Host is
+    /// invalid or does not match the authority that allocated `identity`.
+    pub fn for_originating_request(
+        request: SwmReAuthRequest,
+        hop_by_hop_identifier: u32,
+        identity: DiameterEndToEndRequestIdentity,
+        expected_answer_peer: SwmExpectedAnswerPeer,
+    ) -> Result<Self, DiameterEndToEndIdentifierError> {
+        let transaction = SwmDiameterTransaction::from_end_to_end_identity(
+            hop_by_hop_identifier,
+            request.origin_host.as_str(),
+            identity,
+        )?;
+        Ok(Self::for_outbound(
+            request,
+            transaction,
+            expected_answer_peer,
+        ))
     }
 
     /// Replace trusted expected-answer evidence for this retained request.
@@ -1025,7 +1057,10 @@ pub struct SwmAuthorizationRequestEnvelope {
 }
 
 impl SwmAuthorizationRequestEnvelope {
-    /// Bind outbound AAR facts to their Diameter identifiers.
+    /// Bind outbound AAR facts to caller-supplied raw identifiers.
+    ///
+    /// This is an unchecked compatibility path. New originators should use
+    /// [`Self::for_originating_request`].
     #[must_use]
     pub fn for_outbound(
         request: SwmAuthorizationRequest,
@@ -1040,6 +1075,34 @@ impl SwmAuthorizationRequestEnvelope {
             request,
             proxy_infos: Vec::new(),
         }
+    }
+
+    /// Bind a new AAR's affine identity to its typed Origin-Host.
+    ///
+    /// This checked originating boundary reads `request.origin_host` itself,
+    /// consumes `identity`, and installs the authenticated expected-answer
+    /// connection in the same retained envelope.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed, value-free error when the request Origin-Host is
+    /// invalid or does not match the authority that allocated `identity`.
+    pub fn for_originating_request(
+        request: SwmAuthorizationRequest,
+        hop_by_hop_identifier: u32,
+        identity: DiameterEndToEndRequestIdentity,
+        expected_answer_peer: SwmExpectedAnswerPeer,
+    ) -> Result<Self, DiameterEndToEndIdentifierError> {
+        let transaction = SwmDiameterTransaction::from_end_to_end_identity(
+            hop_by_hop_identifier,
+            request.origin_host.as_str(),
+            identity,
+        )?;
+        Ok(Self::for_outbound(
+            request,
+            transaction,
+            expected_answer_peer,
+        ))
     }
 
     /// Replace trusted expected-answer evidence for this retained request.

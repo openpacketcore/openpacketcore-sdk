@@ -80,5 +80,10 @@ name = "swm_diameter_eap_overload"
 path = "tests/swm_diameter_eap_overload.rs"
 required-features = ["app-swm"]
 
+[[test]]
+name = "end_to_end_identifier_authority"
+path = "tests/end_to_end_identifier_authority.rs"
+required-features = ["app-swm"]
+
 [lints]
 workspace = true

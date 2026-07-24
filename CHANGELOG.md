@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Origin-scoped Diameter End-to-End Identifier authority —
+  `opc-proto-diameter`:** adds a bounded concurrency-safe RFC 6733 allocator
+  with an injectable fallible wall/monotonic clock, exact four-minute
+  recent-use fence, 65,536-entry default bound, deterministic collision
+  scanning, typed redaction-safe failures, and affine retry identity. Every
+  valid clock observation advances rollback high-water even if allocation
+  later fails without changing the cursor or recent fence. Construction
+  consumes an affine caller attestation bound to a validated, redacted
+  Origin-Host scope. It asserts that the prior owner is gone and returned whole
+  `unix_seconds` observations are globally nondecreasing across incarnations,
+  differing by at most 4095 for any real instants less than four minutes apart.
+  The monotonic expiry clock must not advance four minutes before four real
+  minutes elapse, though conservative lag is permitted. Untrusted restart time
+  requires durable non-reuse state/range reservation or an independently
+  trusted full four-minute startup quarantine; shared Origin-Host ownership
+  separately requires an external singleton fence. Affine identities can be
+  consumed only by an origin-matched request. Checked SWm DER/STR/AAR and
+  ASR/RAR envelope constructors read their typed request's Origin-Host
+  directly; retained DER failover preserves End-to-End while changing
+  Hop-by-Hop and setting T (#394).
+
 ### Changed
 - **Directional initial IKEv2 Child-SA NAT-T mapping — `opc-ipsec-xfrm`:**
   adds source-compatible build options that validate exact inbound and
