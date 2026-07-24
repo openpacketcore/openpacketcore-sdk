@@ -3231,7 +3231,14 @@ checks.
 #163 provides the in-process bounded-retirement and request/watch continuity
 mechanism. The single-host multi-process campaigns now cover trust
 overlap/removal plus the exact synthetic fault/expiry recovery slice described
-above. #164/#143 still gate production claims on deployed trust/root cutover,
+above. The in-process quorum-fleet fault-matrix campaigns (a follower
+partition and a member restart overlapping live rotation phases, one
+unavailable member plus typed malformed-reload rejections inside the failure
+budget, and repeated-rotation descriptor/handshake-rate bounds) are fixed by
+[the rotation qualification plan](rotation-qualification-plan.md), which also
+maps every #164 acceptance bullet to its evidence and records the per-phase
+SLOs, the deterministic evidence schema, and the independent checker.
+#164/#143 still gate production claims on deployed trust/root cutover,
 real network/storage partition, broader restart/fault behavior beyond the one
 bounded same-disk active-mutator scenario, deployed mixed
 traffic/watch/restore under those
