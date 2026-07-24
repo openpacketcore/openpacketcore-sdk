@@ -1,7 +1,8 @@
 # opc-diameter-transport
 
-`opc-diameter-transport` provides the mutually authenticated TLS/TCP transport
-boundary for the experimental Diameter codec and peer state machine.
+`opc-diameter-transport` provides the mutually authenticated TLS/TCP and
+DTLS/SCTP transport boundary for the experimental Diameter codec and peer
+state machine.
 
 ## Implemented boundary
 
@@ -9,6 +10,21 @@ boundary for the experimental Diameter codec and peer state machine.
   byte is read or written.
 - In-band TLS/TCP uses consuming typestates to permit one canonical CER/CEA
   exchange and then immediately upgrades that same unbuffered TCP stream.
+- Direct DTLS/SCTP completes a mutually authenticated DTLS 1.3 (optionally
+  1.2-compatible) handshake over the `SctpMessageIo` message seam before any
+  Diameter byte is read or written. DTLS records travel per RFC 6083 as
+  unordered SCTP user messages on stream 0 with PPID 47, and PPID 47 is
+  emitted only through this attested association: the send side of the seam
+  accepts only complete DTLS records. Any cleartext or foreign-PPID user
+  message fails the association closed before, during, or after the
+  handshake. The engine is the Sans-IO `dimpl` crate (pure-Rust `rust-crypto`
+  provider; ECDHE-ECDSA AEAD suites only, no RSA/DHE/renegotiation). The
+  peer's leaf certificate is validated by this crate, not the engine:
+  trust-anchor chain and validity window via rustls-webpki, plus an exact
+  configured SPIFFE identity match. The in-band CER/CEA-before-DTLS sequence
+  over SCTP and the RFC 6083 SCTP-AUTH exporter key switch are not claimed
+  (the engine exposes only the DTLS-SRTP export); the kernel-SCTP adapter for
+  the seam is follow-up work in `opc-sctp`.
 - The authenticated certificate SPIFFE ID must exactly match the configured
   peer. `ExpectedPeerIdentity::new` rejects empty or non-ASCII `Origin-Host`
   and `Origin-Realm` configuration. Typed CER/CEA parsing and construction use
@@ -96,19 +112,26 @@ crate.
 
 ## Explicit limits
 
-This crate currently implements TLS/TCP only. It does not implement DTLS/SCTP
-and does not emit SCTP PPID 47. Each candidate receives a monotonic
-`PeerSessionGeneration`, and the SDK exposes the simultaneous-open decision,
-but the consumer still owns candidate orchestration, listener/reconnect policy,
-backoff, realm routing, peer topology, base `Twinit` selection, initial watchdog
-scheduling, identifier allocation, and all application state machines.
+Each candidate receives a monotonic `PeerSessionGeneration`, and the SDK
+exposes the simultaneous-open decision, but the consumer still owns candidate
+orchestration, listener/reconnect policy, backoff, realm routing, peer
+topology, base `Twinit` selection, initial watchdog scheduling, identifier
+allocation, and all application state machines.
+
+The DTLS/SCTP association currently integrates the sequential connection
+methods (capability exchange and admitted application messages) but not yet
+the bounded full-duplex peer runtime, the kernel-SCTP seam adapter, the RFC
+6083 SCTP-AUTH exporter key switch, or the in-band CER/CEA-before-DTLS
+sequence over SCTP. Exact negotiated-cipher evidence for DTLS is limited by
+the engine's public API; the configured cipher allow-list bounds what can be
+negotiated and the negotiated DTLS version is reported exactly.
 
 The original sequential `DiameterTlsConnection` methods remain available for
 capability setup and narrow integrations. Long-lived use should consume a
 negotiated connection into the bounded runtime instead of wrapping that handle
 in an external mutex. The crate remains experimental and does not make a
-complete RFC 6733 deployment-readiness claim until the real RFC 6083
-DTLS/SCTP/PPID-47 transport is implemented and qualified.
+complete RFC 6733 deployment-readiness claim until the remaining DTLS/SCTP
+boundaries above are implemented and qualified.
 
 ## Verification
 

@@ -381,6 +381,10 @@ pub enum DiameterTlsError {
     /// on the opposite endpoint role.
     #[error("Diameter capability operation does not match the connection role")]
     ConnectionRoleMismatch,
+    /// A cleartext or foreign-PPID SCTP user message reached an association
+    /// that admits only protected DTLS records.
+    #[error("Diameter transport received cleartext input")]
+    CleartextInput,
     /// The admitted credential epoch was superseded or became unavailable.
     #[error("Diameter TLS connection retired")]
     Retired,
