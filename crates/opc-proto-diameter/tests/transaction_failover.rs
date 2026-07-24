@@ -24,13 +24,14 @@ use opc_proto_diameter::end_to_end::{
     DiameterEndToEndIdentifierConfig, DiameterEndToEndIdentifierTime,
 };
 use opc_proto_diameter::transaction::{
-    AlternateRoutability, AnswerDisposition, AnswerRejectionReason, AttemptFailure,
-    CommittedPendingSnapshot, CompletionClaimValue, CompletionDeliveryError,
+    AlternateRoutability, AnswerDisposition, AnswerRejectionReason, AttemptDisposition,
+    AttemptFailure, CommittedPendingSnapshot, CompletionClaimValue, CompletionDeliveryError,
     CompletionDeliveryRecord, CompletionKind, CompletionTokenValue, ConnectionTableError,
     DiameterConnectionToken, FailoverError, IndeterminateReason, PendingRequestClock,
     PendingRequestTable, PendingRequestTableConfig, PendingSnapshotCheckpoint,
-    PendingSnapshotEpoch, PendingSnapshotRevision, PendingTableSnapshot, SnapshotRestoreError,
-    TrackError, TransactionAccessError, TransactionCompletion, UndeliverableReason,
+    PendingSnapshotEpoch, PendingSnapshotRevision, PendingTableSnapshot, SnapshotCommitError,
+    SnapshotCreateError, SnapshotRestoreError, TrackError, TransactionAccessError,
+    TransactionCompletion, UndeliverableReason,
 };
 use opc_proto_diameter::{CommandFlags, Message, OwnedMessage};
 use opc_protocol::{BorrowDecode, DecodeContext, Encode, EncodeContext};
@@ -972,16 +973,10 @@ fn restored_delivery_is_at_least_once_and_durable_claim_dedups() {
         AnswerDisposition::Completed(completion) => completion,
         other => panic!("expected completion, got {other:?}"),
     };
-    let ready = CompletionDeliveryRecord::new(SNAPSHOT_EPOCH, first_completion.token())
-        .expect("terminal completion delivery record");
-    // Persist the fixed-width record atomically with a redaction-safe,
-    // replayable application intent. In production the intent includes the
-    // encrypted outcome needed to resume the exact downstream operation.
-    let durable_intent = b"advance-one-eap-round".to_vec();
-    let mut durable_record = ready.encode().as_bytes().to_vec();
 
-    // Crash before the outcome is acknowledged: the still-authoritative old
-    // pending snapshot may deliver the same terminal identity again.
+    // Crash before any completion-delivery record or replayable intent becomes
+    // durable: the still-authoritative old pending snapshot may deliver the
+    // same terminal identity again.
     let mut restored = restore_snapshot(&snapshot);
     restored
         .add_connection(CONNECTION_C, HBH_C)
@@ -1004,6 +999,14 @@ fn restored_delivery_is_at_least_once_and_durable_claim_dedups() {
     // At-least-once: both deliveries carry the same stable identity.
     assert_eq!(first_completion.token(), second_completion.token());
     assert_eq!(first_completion.token().generation(), 1);
+
+    // Persist the fixed-width record atomically with a redaction-safe,
+    // replayable application intent. In production the intent includes the
+    // encrypted outcome needed to resume the exact downstream operation.
+    let ready = CompletionDeliveryRecord::new(SNAPSHOT_EPOCH, second_completion.token())
+        .expect("terminal completion delivery record");
+    let durable_intent = b"advance-one-eap-round".to_vec();
+    let mut durable_record = ready.encode().as_bytes().to_vec();
 
     // Both deliveries race from the same durable Ready bytes. Only one exact
     // compare-and-swap can win.
@@ -1074,6 +1077,173 @@ fn restored_delivery_is_at_least_once_and_durable_claim_dedups() {
         Ok(true)
     );
     assert_eq!(recovered_table.pending_count(), 0);
+}
+
+#[test]
+fn durable_ready_and_claimed_records_suppress_restored_network_rearm() {
+    let mut harness = harness();
+    harness.with_connections();
+    let tracked = harness
+        .table
+        .track(build_der(0xE2E0_0023, false), CONNECTION_A, token(33))
+        .expect("track");
+    let _initial_wire = dispatch(&mut harness.table, tracked.value());
+    let old_pending_head = snapshot_at(&mut harness.table, 2);
+    let completion = match harness
+        .table
+        .correlate_answer(CONNECTION_A, build_dea(HBH_A, 0xE2E0_0023, 2001))
+    {
+        AnswerDisposition::Completed(completion) => completion,
+        other => panic!("expected completion, got {other:?}"),
+    };
+    let ready = CompletionDeliveryRecord::new(SNAPSHOT_EPOCH, completion.token())
+        .expect("terminal completion delivery record");
+    let claim_value =
+        CompletionClaimValue::new(NonZeroU128::new(0xD).expect("nonzero claim value"));
+    let (claimed, proof) = ready.claim(claim_value).expect("claim ready delivery");
+    let acknowledged = claimed
+        .acknowledge(proof)
+        .expect("acknowledge current claim");
+
+    for durable in [ready, claimed] {
+        let mut recovered = restore_snapshot(&old_pending_head);
+        recovered
+            .add_connection(CONNECTION_C, HBH_C)
+            .expect("fresh connection");
+
+        assert_eq!(recovered.reconcile_completion_delivery(durable), Ok(true));
+        assert_eq!(recovered.pending_count(), 0);
+        assert_eq!(recovered.unacknowledged_completion_count(), 1);
+        assert_eq!(
+            recovered
+                .failover(
+                    tracked.value(),
+                    CONNECTION_C,
+                    AlternateRoutability::RealmRouted,
+                )
+                .err(),
+            Some(FailoverError::UnknownTransaction)
+        );
+        assert_eq!(
+            recovered.snapshot(checkpoint(3)).err(),
+            Some(SnapshotCreateError::UnacknowledgedCompletion)
+        );
+
+        assert_eq!(
+            recovered.reconcile_completion_delivery(acknowledged),
+            Ok(true)
+        );
+        assert_eq!(recovered.unacknowledged_completion_count(), 0);
+        assert!(recovered.snapshot(checkpoint(3)).is_ok());
+    }
+}
+
+#[test]
+fn persist_before_dispatch_fences_snapshot_and_connection_lifecycle() {
+    let mut harness = harness();
+    harness.with_connections();
+
+    let empty_head = harness
+        .table
+        .snapshot(checkpoint(1))
+        .expect("empty snapshot candidate");
+    let committed_empty = harness
+        .table
+        .confirm_snapshot_committed(empty_head.checkpoint())
+        .expect("commit empty snapshot");
+    let tracked = harness
+        .table
+        .track(build_der(0xE2E0_0024, false), CONNECTION_A, token(34))
+        .expect("track after committed head");
+
+    assert_eq!(
+        harness
+            .table
+            .take_attempt_dispatch(tracked.value(), committed_empty)
+            .err(),
+        Some(TransactionAccessError::AttemptNotDurablySnapshotted)
+    );
+
+    let candidate_two = harness
+        .table
+        .snapshot(checkpoint(2))
+        .expect("emit second snapshot");
+    assert_eq!(
+        harness.table.snapshot(checkpoint(3)).err(),
+        Some(SnapshotCreateError::UncommittedSnapshotOutstanding)
+    );
+    assert_eq!(
+        harness
+            .table
+            .confirm_snapshot_committed(checkpoint(3))
+            .err(),
+        Some(SnapshotCommitError::CheckpointMismatch)
+    );
+    assert_eq!(
+        harness
+            .table
+            .take_attempt_dispatch(tracked.value(), committed_empty)
+            .err(),
+        Some(TransactionAccessError::AttemptNotDurablySnapshotted)
+    );
+    harness
+        .table
+        .abandon_uncommitted_snapshot(candidate_two.checkpoint())
+        .expect("abandon exact uncommitted candidate");
+
+    let candidate_three = harness
+        .table
+        .snapshot(checkpoint(3))
+        .expect("emit replacement snapshot");
+    let committed_three = harness
+        .table
+        .confirm_snapshot_committed(candidate_three.checkpoint())
+        .expect("commit replacement snapshot");
+    assert_eq!(
+        harness
+            .table
+            .take_attempt_dispatch(tracked.value(), committed_empty)
+            .err(),
+        Some(TransactionAccessError::SnapshotProofMismatch)
+    );
+    let dispatch = harness
+        .table
+        .take_attempt_dispatch(tracked.value(), committed_three)
+        .expect("committed attempt dispatches once");
+    assert_eq!(dispatch.attempt().connection(), CONNECTION_A);
+    assert_eq!(
+        harness
+            .table
+            .take_attempt_dispatch(tracked.value(), committed_three)
+            .err(),
+        Some(TransactionAccessError::NoLiveAttempt)
+    );
+
+    let closed = harness
+        .table
+        .track(build_der(0xE2E0_0025, false), CONNECTION_B, token(35))
+        .expect("track on second connection");
+    let committed_four = commit_next(&mut harness.table);
+    harness
+        .table
+        .close_connection(CONNECTION_B)
+        .expect("close before dispatch");
+    assert_eq!(
+        harness
+            .table
+            .take_attempt_dispatch(closed.value(), committed_four)
+            .err(),
+        Some(TransactionAccessError::NoLiveAttempt)
+    );
+    let closed_evidence = harness
+        .table
+        .transaction(closed.value())
+        .expect("closed transaction evidence")
+        .attempts()[0];
+    assert_eq!(
+        closed_evidence.disposition(),
+        AttemptDisposition::FailedBeforeWrite
+    );
 }
 
 #[test]

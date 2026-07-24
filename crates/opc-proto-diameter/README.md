@@ -209,15 +209,16 @@ that connection. Every new attempt starts `Prepared` and is not sendable until
 a snapshot containing it and its exact `(epoch, revision)` checkpoint are
 durably committed. `confirm_snapshot_committed` then returns the proof consumed
 by `take_attempt_dispatch`; that operation can take the attempt only once.
-The caller must report the resulting full-write or failure evidence before
-choosing another attempt. Write dispositions distinguish failure before write,
-uncertain/partial write, successful write followed by transport loss, fixed
-`Destination-Host` with no valid alternate (a typed inability-to-deliver; the
-destination is never silently dropped or rewritten), retry exhaustion, and
-indeterminate completion. Exactly one terminal completion is delivered per
-live transaction; late, duplicated, reordered, or simultaneous answers update
-only bounded evidence. The synchronous API makes completion delivery atomic
-with the terminal transition, so cancellation cannot re-arm a transaction.
+The caller reports each write outcome when it becomes known; parallel attempts
+remain legal and are caller policy. Write dispositions distinguish failure
+before write, uncertain/partial write, successful write followed by transport
+loss, fixed `Destination-Host` with no valid alternate (a typed
+inability-to-deliver; the destination is never silently dropped or rewritten),
+retry exhaustion, and indeterminate completion. Exactly one terminal completion
+is delivered per live transaction; late, duplicated, reordered, or simultaneous
+answers update only bounded evidence. The synchronous API makes completion
+delivery atomic with the terminal transition, so cancellation cannot re-arm a
+transaction.
 
 `snapshot()` produces a versioned, explicitly sensitive byte form of pending
 records for encrypted storage (no plaintext backend is provided, and the value

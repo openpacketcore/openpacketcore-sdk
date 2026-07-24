@@ -5187,6 +5187,40 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_guard_fails_closed_if_a_committed_connection_is_not_open() {
+        let mut table = table(PendingRequestTableConfig::default());
+        table
+            .add_connection(CONNECTION_A, 100)
+            .unwrap_or_else(|error| panic!("connection: {error}"));
+        let tracked = table
+            .track(canonical_request(None), CONNECTION_A, token(1))
+            .unwrap_or_else(|error| panic!("track: {error}"));
+        let committed = commit_next(&mut table);
+
+        // Exercise the final defensive guard independently of
+        // `close_connection`, which proactively classifies every Prepared
+        // attempt as FailedBeforeWrite.
+        table
+            .connections
+            .get_mut(&CONNECTION_A.get())
+            .unwrap_or_else(|| panic!("registered connection"))
+            .open = false;
+        assert_eq!(
+            err_of(table.take_attempt_dispatch(tracked.value(), committed)),
+            TransactionAccessError::ConnectionNotOpen
+        );
+        let evidence = table
+            .transaction(tracked.value())
+            .unwrap_or_else(|| panic!("transaction evidence"))
+            .attempts()[0];
+        assert_eq!(
+            evidence.disposition(),
+            AttemptDisposition::FailedBeforeWrite
+        );
+        assert_eq!(evidence.ended_at(), Some(Duration::ZERO));
+    }
+
+    #[test]
     fn snapshot_checkpoint_is_exact_monotonic_and_size_bounded() {
         let mut pending_table = table(PendingRequestTableConfig::default());
         pending_table
@@ -5488,7 +5522,7 @@ mod tests {
         generation: u64,
         end_to_end: u32,
         flags: u8,
-        attempts: &[(u64, u32, u8, u64, u64)],
+        attempts: &[(u64, u32, u8, u64, u64, u64)],
         raw_avps: &[u8],
     ) -> Vec<u8> {
         let mut out = Vec::new();
@@ -5499,20 +5533,11 @@ mod tests {
         out.extend_from_slice(&100_u32.to_be_bytes());
         out.push(flags);
         out.extend_from_slice(&(attempts.len() as u16).to_be_bytes());
-        for (connection, hop_by_hop, disposition, started, ended) in attempts {
+        for (connection, hop_by_hop, disposition, started, written, ended) in attempts {
             out.extend_from_slice(&connection.to_be_bytes());
             out.extend_from_slice(&hop_by_hop.to_be_bytes());
-            let disposition = match disposition {
-                0 => 0,
-                1 => 2,
-                2 => 3,
-                3 => 4,
-                4 => 5,
-                other => *other,
-            };
-            out.push(disposition);
+            out.push(*disposition);
             out.extend_from_slice(&started.to_be_bytes());
-            let written = if disposition == 4 { *started } else { u64::MAX };
             out.extend_from_slice(&written.to_be_bytes());
             out.extend_from_slice(&ended.to_be_bytes());
         }
@@ -5559,7 +5584,7 @@ mod tests {
             0,
             E2E,
             0x02,
-            &[(1, 100, 0, 0, NONE)],
+            &[(1, 100, 0, 0, NONE, NONE)],
             &minimal_avps(),
         )]);
         PendingRequestTable::restore(
@@ -5570,13 +5595,89 @@ mod tests {
         )
         .unwrap_or_else(|e| panic!("baseline must restore: {e}"));
 
+        // Every nonterminal disposition is independently valid only with its
+        // exact written/end timestamp shape.
+        let valid_dispositions = snapshot_bytes(&[snapshot_record(
+            1,
+            0,
+            E2E,
+            0x02,
+            &[
+                (1, 100, 0, 0, NONE, NONE),
+                (2, 101, 1, 1, NONE, NONE),
+                (3, 102, 2, 2, 3, NONE),
+                (4, 103, 3, 4, NONE, 5),
+                (5, 104, 4, 6, NONE, 7),
+                (6, 105, 5, 8, 9, 10),
+            ],
+            &minimal_avps(),
+        )]);
+        PendingRequestTable::restore(
+            &valid_dispositions,
+            checkpoint(1),
+            config,
+            Arc::new(ManualClock::default()),
+        )
+        .unwrap_or_else(|e| panic!("valid disposition shapes must restore: {e}"));
+
+        let invalid_evidence = [
+            ("prepared with written timestamp", (1, 100, 0, 0, 1, NONE)),
+            ("prepared with end timestamp", (1, 100, 0, 0, NONE, 1)),
+            ("in-flight with written timestamp", (1, 100, 1, 0, 1, NONE)),
+            ("in-flight with end timestamp", (1, 100, 1, 0, NONE, 1)),
+            (
+                "written-awaiting without written timestamp",
+                (1, 100, 2, 0, NONE, NONE),
+            ),
+            ("written-awaiting with end timestamp", (1, 100, 2, 0, 1, 2)),
+            (
+                "failed-before-write with written timestamp",
+                (1, 100, 3, 0, 1, 2),
+            ),
+            (
+                "failed-before-write without end timestamp",
+                (1, 100, 3, 0, NONE, NONE),
+            ),
+            (
+                "failed-uncertain with written timestamp",
+                (1, 100, 4, 0, 1, 2),
+            ),
+            (
+                "failed-uncertain without end timestamp",
+                (1, 100, 4, 0, NONE, NONE),
+            ),
+            (
+                "transport-lost without written timestamp",
+                (1, 100, 5, 0, NONE, 2),
+            ),
+            (
+                "transport-lost without end timestamp",
+                (1, 100, 5, 0, 1, NONE),
+            ),
+        ];
+        for (case, attempt) in invalid_evidence {
+            let bytes = snapshot_bytes(&[snapshot_record(
+                1,
+                0,
+                E2E,
+                0x02,
+                &[attempt],
+                &minimal_avps(),
+            )]);
+            assert_eq!(
+                restore_error(&bytes, config),
+                SnapshotRestoreError::InvalidRecord,
+                "{case}"
+            );
+        }
+
         // A nonzero completion generation is impossible for a pending record.
         let bad_generation = snapshot_bytes(&[snapshot_record(
             1,
             1,
             E2E,
             0x02,
-            &[(1, 100, 0, 0, NONE)],
+            &[(1, 100, 0, 0, NONE, NONE)],
             &minimal_avps(),
         )]);
         assert_eq!(
@@ -5590,7 +5691,7 @@ mod tests {
             0,
             E2E,
             0x03,
-            &[(1, 100, 0, 0, NONE)],
+            &[(1, 100, 0, 0, NONE, NONE)],
             &minimal_avps(),
         )]);
         assert_eq!(
@@ -5604,7 +5705,7 @@ mod tests {
             0,
             E2E,
             0x10,
-            &[(1, 100, 0, 0, NONE)],
+            &[(1, 100, 0, 0, NONE, NONE)],
             &minimal_avps(),
         )]);
         assert_eq!(
@@ -5614,13 +5715,20 @@ mod tests {
 
         // Duplicate completion tokens across records.
         let duplicate_tokens = snapshot_bytes(&[
-            snapshot_record(1, 0, E2E, 0x02, &[(1, 100, 0, 0, NONE)], &minimal_avps()),
+            snapshot_record(
+                1,
+                0,
+                E2E,
+                0x02,
+                &[(1, 100, 0, 0, NONE, NONE)],
+                &minimal_avps(),
+            ),
             snapshot_record(
                 1,
                 0,
                 E2E + 1,
                 0x02,
-                &[(1, 101, 0, 0, NONE)],
+                &[(1, 101, 0, 0, NONE, NONE)],
                 &minimal_avps(),
             ),
         ]);
@@ -5631,8 +5739,22 @@ mod tests {
 
         // Duplicate End-to-End identifiers across records.
         let duplicate_e2e = snapshot_bytes(&[
-            snapshot_record(1, 0, E2E, 0x02, &[(1, 100, 0, 0, NONE)], &minimal_avps()),
-            snapshot_record(2, 0, E2E, 0x02, &[(1, 101, 0, 0, NONE)], &minimal_avps()),
+            snapshot_record(
+                1,
+                0,
+                E2E,
+                0x02,
+                &[(1, 100, 0, 0, NONE, NONE)],
+                &minimal_avps(),
+            ),
+            snapshot_record(
+                2,
+                0,
+                E2E,
+                0x02,
+                &[(1, 101, 0, 0, NONE, NONE)],
+                &minimal_avps(),
+            ),
         ]);
         assert_eq!(
             restore_error(&duplicate_e2e, config),
@@ -5645,7 +5767,7 @@ mod tests {
             0,
             E2E,
             0x02,
-            &[(1, 100, 1, 0, 5), (1, 100, 0, 6, NONE)],
+            &[(1, 100, 0, 0, NONE, NONE), (1, 100, 0, 6, NONE, NONE)],
             &minimal_avps(),
         )]);
         assert_eq!(
@@ -5655,46 +5777,25 @@ mod tests {
 
         // Duplicate attempt identities across records.
         let duplicate_attempt_across = snapshot_bytes(&[
-            snapshot_record(1, 0, E2E, 0x02, &[(1, 100, 0, 0, NONE)], &minimal_avps()),
+            snapshot_record(
+                1,
+                0,
+                E2E,
+                0x02,
+                &[(1, 100, 0, 0, NONE, NONE)],
+                &minimal_avps(),
+            ),
             snapshot_record(
                 2,
                 0,
                 E2E + 1,
                 0x02,
-                &[(1, 100, 0, 0, NONE)],
+                &[(1, 100, 0, 0, NONE, NONE)],
                 &minimal_avps(),
             ),
         ]);
         assert_eq!(
             restore_error(&duplicate_attempt_across, config),
-            SnapshotRestoreError::InvalidRecord
-        );
-
-        // An in-flight attempt must not carry an end timestamp.
-        let in_flight_ended = snapshot_bytes(&[snapshot_record(
-            1,
-            0,
-            E2E,
-            0x02,
-            &[(1, 100, 0, 0, 7)],
-            &minimal_avps(),
-        )]);
-        assert_eq!(
-            restore_error(&in_flight_ended, config),
-            SnapshotRestoreError::InvalidRecord
-        );
-
-        // A terminated attempt must carry an end timestamp.
-        let failed_open = snapshot_bytes(&[snapshot_record(
-            1,
-            0,
-            E2E,
-            0x02,
-            &[(1, 100, 1, 0, NONE)],
-            &minimal_avps(),
-        )]);
-        assert_eq!(
-            restore_error(&failed_open, config),
             SnapshotRestoreError::InvalidRecord
         );
 
@@ -5711,7 +5812,7 @@ mod tests {
             0,
             E2E,
             0x02,
-            &[(1, 100, 4, 0, 5)],
+            &[(1, 100, 6, 0, 0, 5)],
             &minimal_avps(),
         )]);
         assert_eq!(
@@ -5725,7 +5826,7 @@ mod tests {
             0,
             E2E,
             0x02,
-            &[(1, 100, 1, 0, 5), (2, 900, 0, 6, NONE)],
+            &[(1, 100, 3, 0, NONE, 5), (2, 900, 0, 6, NONE, NONE)],
             &minimal_avps(),
         )]);
         let tight_attempts = PendingRequestTableConfig {
@@ -5739,13 +5840,20 @@ mod tests {
 
         // Record count exceeding the restored table's pending bound.
         let two_records = snapshot_bytes(&[
-            snapshot_record(1, 0, E2E, 0x02, &[(1, 100, 0, 0, NONE)], &minimal_avps()),
+            snapshot_record(
+                1,
+                0,
+                E2E,
+                0x02,
+                &[(1, 100, 0, 0, NONE, NONE)],
+                &minimal_avps(),
+            ),
             snapshot_record(
                 2,
                 0,
                 E2E + 1,
                 0x02,
-                &[(1, 101, 0, 0, NONE)],
+                &[(1, 101, 0, 0, NONE, NONE)],
                 &minimal_avps(),
             ),
         ]);
