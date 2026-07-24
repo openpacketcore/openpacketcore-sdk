@@ -38,21 +38,26 @@ ROOT = Path(__file__).resolve().parent.parent
 PLAN_PATH = ROOT / "ci" / "test-shards.json"
 
 # Identical in every shard: this is what pins feature unification.
-SELECTION = [
-    "cargo",
-    "test",
+PACKAGES = [
     "--locked",
     "--workspace",
     "--exclude",
     "opc-persist",
     "--all-features",
-    "--quiet",
 ]
+SELECTION = ["cargo", "test", *PACKAGES, "--quiet"]
+# The unfiltered `cargo test` also compiled every example, in ordinary build
+# mode, purely as a compile check. `cargo test --examples` is NOT the same
+# thing: an explicit target filter switches examples to CompileMode::Test, so
+# they build with cfg(test) on and run as test binaries. `cargo build` keeps
+# the original semantics.
+EXAMPLES = ["cargo", "build", *PACKAGES, "--quiet", "--examples"]
 HARNESS = ["--test-threads=4"]
 
 # A partition that collapses to a handful of targets would still be "total and
-# disjoint" if metadata were misread, so hold a floor on the real inventory.
-MIN_INTEGRATION_TARGETS = 200
+# disjoint" if metadata were misread, so hold a floor on the real inventory
+# (249 today).
+MIN_INTEGRATION_TARGETS = 240
 
 
 def load_plan() -> dict:
@@ -78,7 +83,10 @@ def integration_targets() -> list[str]:
         if package["name"] == "opc-persist":
             continue
         for target in package["targets"]:
-            if "test" in target["kind"]:
+            # `test = false` keeps a target compiling but excluded from
+            # `cargo test`; naming it with --test would force it to run, so
+            # honour the manifest exactly as the unfiltered run did.
+            if "test" in target["kind"] and target.get("test", True):
                 names.add(target["name"])
     if len(names) < MIN_INTEGRATION_TARGETS:
         sys.exit(
@@ -128,18 +136,18 @@ def commands(plan: dict, shard: str, targets: list[str]) -> list[list[str]]:
     named = [name for group in heavy["shards"] for name in group]
 
     if shard == "misc":
-        # Unit tests, binary tests, doctests, plus every test in the heavy
-        # target that is not claimed by a heavy-N shard. The --skip list is
-        # what makes the heavy target's partition total: a test added to that
-        # file lands here without anyone updating this plan.
-        # --examples keeps the compile check the unfiltered `cargo test` did:
-        # it built every example even though none is a test.
+        # Unit tests, binary tests, the example compile check, doctests, plus
+        # every test in the heavy target that is not claimed by a heavy-N
+        # shard. --exact makes the skips exact-match: libtest skips by
+        # substring by default, which would also swallow a future test whose
+        # name merely starts with a fleet test's name.
         skips = [arg for name in named for arg in ("--skip", name)]
         return [
-            SELECTION + ["--lib", "--bins", "--examples", "--", *HARNESS],
+            SELECTION + ["--lib", "--bins", "--", *HARNESS],
+            list(EXAMPLES),
             SELECTION + ["--doc", "--", *HARNESS],
             SELECTION
-            + ["--test", heavy["target"], "--", *HARNESS, *skips],
+            + ["--test", heavy["target"], "--", *HARNESS, "--exact", *skips],
         ]
 
     if shard.startswith("heavy-"):
@@ -151,6 +159,7 @@ def commands(plan: dict, shard: str, targets: list[str]) -> list[list[str]]:
             + ["--test", heavy["target"], "--", *HARNESS, "--exact", *group]
         ]
 
+
     buckets = assign(plan, targets)
     if shard not in buckets:
         sys.exit(f"unknown shard id: {shard}")
@@ -160,29 +169,80 @@ def commands(plan: dict, shard: str, targets: list[str]) -> list[list[str]]:
     return [SELECTION + selected + ["--", *HARNESS]]
 
 
-def verify_workflow_matrix(plan: dict) -> None:
-    """Fail if the workflow's shard matrix drifted from this plan.
+WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 
-    Without this, adding a shard here and forgetting the matrix (or the
-    reverse) silently stops running a slice of the suite.
+
+def verify_workflow(plan: dict) -> None:
+    """Fail if ci.yml drifted from this plan.
+
+    Two ways to silently stop testing something: change the plan without the
+    matrix (a slice of the suite stops running), or add a Rust lane without
+    adding it to the aggregator's `needs` (the lane can fail while the single
+    "Rust workspace" check stays green).
     """
-    workflow = ROOT / ".github" / "workflows" / "ci.yml"
-    match = re.search(r"^\s*shard:\s*\[([^\]]*)\]", workflow.read_text(), re.M)
+    text = WORKFLOW.read_text()
+
+    body = text.split("\n  rust-tests:", 1)
+    if len(body) != 2:
+        sys.exit(f"no `rust-tests` job found in {WORKFLOW}")
+    match = re.search(r"^\s*shard:\s*\[([^\]]*)\]", body[1], re.M)
     if not match:
-        sys.exit(f"no `shard: [...]` matrix found in {workflow}")
+        sys.exit(f"no `shard: [...]` matrix in the rust-tests job of {WORKFLOW}")
     declared = [item.strip() for item in match.group(1).split(",") if item.strip()]
     expected = shard_ids(plan)
     if declared != expected:
         sys.exit(
-            f"{workflow.name} runs shards {declared} but the plan defines "
+            f"{WORKFLOW.name} runs shards {declared} but the plan defines "
             f"{expected}"
         )
-    print(f"workflow matrix ok: {len(expected)} shards")
+
+    lanes = set(re.findall(r"^  (rust-[a-z0-9-]+):$", text, re.M))
+    aggregator = text.split("\n  rust:\n", 1)
+    if len(aggregator) != 2:
+        sys.exit(f"no `rust` aggregator job found in {WORKFLOW}")
+    needed = set(re.findall(r"^      - (rust-[a-z0-9-]+)$", aggregator[1], re.M))
+    unguarded = lanes - needed
+    if unguarded:
+        sys.exit(
+            f"Rust lanes missing from the aggregator's needs: "
+            f"{sorted(unguarded)}. They could fail while 'Rust workspace' "
+            f"stays green."
+        )
+    print(
+        f"workflow ok: {len(expected)} shards, {len(lanes)} lanes all guarded "
+        f"by the aggregator"
+    )
+
+
+def verify_commands(plan: dict, targets: list[str]) -> None:
+    """Fail if a shard would run less than its definition promises.
+
+    The partition check proves which *targets* belong to which shard; this
+    proves the shard actually issues the invocations that cover them, so
+    dropping (say) the doctest command cannot pass unnoticed.
+    """
+    misc = [" ".join(command) for command in commands(plan, "misc", targets)]
+    required = {
+        "unit tests": " --lib --bins ",
+        "example compile check": "cargo build ",
+        "doctests": " --doc ",
+        "heavy remainder": f" --test {plan['heavy']['target']} ",
+    }
+    for label, fragment in required.items():
+        if not any(fragment in f"{command} " for command in misc):
+            sys.exit(f"the misc shard no longer runs {label}")
+    for index, group in enumerate(plan["heavy"]["shards"]):
+        if not group:
+            # `--exact` with no names disables filtering, so an empty group
+            # would silently re-run the entire heavy target.
+            sys.exit(f"heavy-{index} names no tests; remove the group instead")
+    print(f"shard commands ok: misc issues {len(misc)} invocations")
 
 
 def verify(plan: dict, targets: list[str]) -> None:
     """Prove every target runs exactly once across the shard set."""
-    verify_workflow_matrix(plan)
+    verify_workflow(plan)
+    verify_commands(plan, targets)
     buckets = assign(plan, targets)
     heavy = plan["heavy"]["target"]
 
@@ -238,6 +298,32 @@ def list_heavy_tests(plan: dict, extra: list[str]) -> set[str]:
     }
 
 
+def precheck(plan: dict, shard: str) -> None:
+    """Fail a heavy shard whose named tests no longer resolve.
+
+    libtest exits 0 when a filter matches nothing, so a renamed test would
+    otherwise turn a heavy shard into a green no-op. Coverage would survive
+    (``misc`` stops skipping the old name and runs the test, and verify-heavy
+    fails), but the lane would burn a runner proving nothing, and a reviewer
+    reading a green matrix would have no signal. Resolve the names first.
+    """
+    # Every shard re-checks the plan itself: rust-tests legs start alongside
+    # rust-gates rather than after it, so without this a broken plan would
+    # burn six runners before the gates job reported it.
+    verify(plan, integration_targets())
+    if not shard.startswith("heavy-"):
+        return
+    group = plan["heavy"]["shards"][int(shard.split("-", 1)[1])]
+    selected = list_heavy_tests(plan, ["--exact", *group])
+    if selected != set(group):
+        missing = sorted(set(group) - selected)
+        sys.exit(
+            f"{shard} names tests that no longer exist: {missing}. They were "
+            f"renamed or removed; update ci/test-shards.json."
+        )
+    print(f"{shard} precheck ok: {len(group)} tests resolve")
+
+
 def verify_heavy(plan: dict) -> None:
     """Prove the heavy target's own tests partition exactly.
 
@@ -246,7 +332,9 @@ def verify_heavy(plan: dict) -> None:
     """
     groups = plan["heavy"]["shards"]
     named = [name for group in groups for name in group]
-    skips = [arg for name in named for arg in ("--skip", name)]
+    # Mirrors the real misc invocation exactly, --exact included: verifying a
+    # different filter than the one that runs would prove nothing.
+    skips = ["--exact"] + [arg for name in named for arg in ("--skip", name)]
 
     everything = list_heavy_tests(plan, [])
     remainder = list_heavy_tests(plan, skips)
@@ -282,6 +370,8 @@ def main() -> None:
     plan_cmd.add_argument("--shard", required=True)
     sub.add_parser("verify")
     sub.add_parser("verify-heavy")
+    precheck_cmd = sub.add_parser("precheck")
+    precheck_cmd.add_argument("--shard", required=True)
     args = parser.parse_args()
 
     plan = load_plan()
@@ -292,6 +382,10 @@ def main() -> None:
 
     if args.command == "verify-heavy":
         verify_heavy(plan)
+        return
+
+    if args.command == "precheck":
+        precheck(plan, args.shard)
         return
 
     targets = integration_targets()

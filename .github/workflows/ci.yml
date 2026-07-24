@@ -10,6 +10,14 @@ on:
 permissions:
   contents: read
 
+# This workflow now requests ~22 concurrent jobs per run. Without a
+# concurrency group a superseded push keeps its whole fleet running and the
+# replacement run queues behind it, which costs far more wall clock than the
+# sharding saves. Runs on main are never cancelled.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 env:
   CARGO_TERM_COLOR: always
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
@@ -61,6 +69,16 @@ jobs:
 
       - name: Run opc-proto-diameter corpus generator self-test
         run: python3 crates/opc-proto-diameter/fuzz/generate_corpus.py self-test
+
+      # A workflow expression error makes GitHub reject the whole file and
+      # produce a run with no jobs at all, which reads as "nothing to see"
+      # rather than as a failure. Lint the workflows so that fails a check.
+      - name: Lint workflow files
+        env:
+          ACTIONLINT_VERSION: v1.7.12
+        run: |
+          go install "github.com/rhysd/actionlint/cmd/actionlint@${ACTIONLINT_VERSION}"
+          "$(go env GOPATH)/bin/actionlint" .github/workflows/*.yml
 
       # Proves the test plan still partitions every integration-test target
       # exactly once before any shard spends a runner on it.
@@ -121,29 +139,42 @@ jobs:
       # steps. Debug symbols remain off via CARGO_PROFILE_*_DEBUG above; do
       # not add a `cargo clean` here, since rust-cache saves in a post-step
       # and would archive an empty target directory.
+      # Per-shard keys: the legs build different target sets, so one shared
+      # key would make all six race to save the same multi-gigabyte archive
+      # while giving each a worse hit rate than its own.
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: opc-rust-tests
+          shared-key: opc-rust-tests-${{ matrix.shard }}
 
       # Every shard issues the identical package selection and differs only
       # in cargo target filters, so feature unification -- and therefore the
       # compiled configuration of every dependency -- matches the former
       # single-job run exactly.
+      # Resolves this shard's named tests before running anything: libtest
+      # exits 0 when a filter matches nothing, so a rename would otherwise
+      # leave a heavy shard green having run nothing.
+      - name: Precheck shard selection
+        run: python3 ci/test-shards.py precheck --shard '${{ matrix.shard }}'
+
       - name: Run test shard
         run: |
           set -euo pipefail
           python3 ci/test-shards.py plan --shard '${{ matrix.shard }}' > shard-commands.txt
           test -s shard-commands.txt
-          while IFS= read -r command; do
+          # The command list is read on fd 3, and each command gets its own
+          # stdin from /dev/null. Reading the list on stdin instead would let
+          # any test that spawns a child with inherited stdin drain the
+          # remaining lines, silently skipping the rest of the shard.
+          while IFS= read -r command <&3; do
             echo "::group::${command}"
-            if ! eval "${command}"; then
+            if ! eval "${command}" < /dev/null; then
               echo "::endgroup::"
               echo "::error::shard '${{ matrix.shard }}' failed: ${command}"
               exit 1
             fi
             echo "::endgroup::"
-          done < shard-commands.txt
+          done 3< shard-commands.txt
 
       # Cheap: the binary is already built on this shard.
       - name: Verify heavy-target test partition
