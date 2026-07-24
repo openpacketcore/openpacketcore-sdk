@@ -76,12 +76,19 @@ jobs:
       - name: Lint workflow files
         env:
           ACTIONLINT_VERSION: v1.7.12
+          PYFLAKES_VERSION: 3.4.0
         run: |
           set -euo pipefail
           go install "github.com/rhysd/actionlint/cmd/actionlint@${ACTIONLINT_VERSION}"
-          # actionlint silently drops its shellcheck and pyflakes rules when
-          # those tools are missing, which would leave this step passing while
-          # checking far less than it appears to. Fail instead.
+          # actionlint lints embedded shell with shellcheck and embedded
+          # python with pyflakes, but only if it can execute them. The runner
+          # image ships shellcheck and not pyflakes, so supply pyflakes in a
+          # venv rather than let the rule quietly switch itself off.
+          python3 -m venv /tmp/actionlint-venv
+          /tmp/actionlint-venv/bin/pip install --quiet "pyflakes==${PYFLAKES_VERSION}"
+          export PATH="/tmp/actionlint-venv/bin:${PATH}"
+          # A missing tool is reported only in verbose output, so a run that
+          # checks far less than it appears to still exits 0. Fail instead.
           "$(go env GOPATH)/bin/actionlint" -verbose .github/workflows/*.yml \
             2> >(tee actionlint.err >&2)
           if grep -q 'was disabled' actionlint.err; then
