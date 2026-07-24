@@ -85,6 +85,20 @@ closes the queue and lets the detached actor drain without blocking `Drop`.
   readback alone cannot distinguish an identical foreign replacement. Both
   supervised APIs require a live Tokio runtime and otherwise return a typed,
   redaction-safe runtime error.
+- `XfrmStagedObjectInstall` is the single-object counterpart of
+  `XfrmStagedInstall` for exact SA-only and policy-only installs: an SA that
+  intentionally reuses an existing shared policy, or an additional policy
+  direction for one SA. Its typed `XfrmObjectInstallRequest` supervises one
+  operation without inventing a dummy companion mutation, under the same
+  rules as the composite boundary: affine one-run execution, an owned Tokio
+  worker after first poll, a caller-cloned `XfrmObjectInstallJournal`, an
+  explicit `Acquired`/`Indeterminate`/`SupervisionLost` ownership state, and
+  generation-bound classified recovery of the single exact
+  `XfrmObjectRemovalRequest` candidate. An observed `AlreadyExists`
+  rejection authorizes no removal of the pre-existing object; an unobserved
+  result requires explicit `Owned`/`Absent`/`Foreign` classification under
+  caller-held writer exclusion before any removal, and worker loss
+  permanently disables in-process commit and recovery.
 - `InstalledOutboundSaBinding` is an opaque, unforgeable direction authority
   for one exact ESP SA and its sole outbound allow-policy. The only fresh mint
   is `XfrmStagedInstall::run_and_commit_outbound_sa_policy`, after both kernel
