@@ -57,6 +57,10 @@ pub const AVP_FIRMWARE_REVISION: AvpCode = AvpCode::new(267);
 pub const AVP_RESULT_CODE: AvpCode = AvpCode::new(268);
 /// Product-Name AVP code.
 pub const AVP_PRODUCT_NAME: AvpCode = AvpCode::new(269);
+/// Session-Binding AVP code.
+pub const AVP_SESSION_BINDING: AvpCode = AvpCode::new(270);
+/// Session-Server-Failover AVP code.
+pub const AVP_SESSION_SERVER_FAILOVER: AvpCode = AvpCode::new(271);
 /// Multi-Round-Time-Out AVP code.
 pub const AVP_MULTI_ROUND_TIME_OUT: AvpCode = AvpCode::new(272);
 /// Disconnect-Cause AVP code.
@@ -261,7 +265,7 @@ const BASE_COMMANDS: [CommandDefinition; 6] = [
     ),
 ];
 
-const BASE_AVPS: [AvpDefinition; 38] = [
+const BASE_AVPS: [AvpDefinition; 40] = [
     AvpDefinition::new(
         AvpKey::ietf(AVP_USER_NAME),
         "User-Name",
@@ -381,6 +385,20 @@ const BASE_AVPS: [AvpDefinition; 38] = [
         AvpDataType::Utf8String,
         AvpFlagRules::base_must_not_set_m(),
         SpecRef::new("ietf", "RFC6733", "5.3.7"),
+    ),
+    AvpDefinition::new(
+        AvpKey::ietf(AVP_SESSION_BINDING),
+        "Session-Binding",
+        AvpDataType::Unsigned32,
+        AvpFlagRules::base_mandatory(),
+        SpecRef::new("ietf", "RFC6733", "8.17"),
+    ),
+    AvpDefinition::new(
+        AvpKey::ietf(AVP_SESSION_SERVER_FAILOVER),
+        "Session-Server-Failover",
+        AvpDataType::Enumerated,
+        AvpFlagRules::base_mandatory(),
+        SpecRef::new("ietf", "RFC6733", "8.18"),
     ),
     AvpDefinition::new(
         AvpKey::ietf(AVP_MULTI_ROUND_TIME_OUT),
@@ -645,6 +663,32 @@ mod tests {
         assert_eq!(definition.name(), "Class");
         assert_eq!(definition.data_type(), AvpDataType::OctetString);
         assert_eq!(definition.flags(), AvpFlagRules::base_mandatory());
+    }
+
+    #[test]
+    fn base_dictionary_contains_authorization_session_routing_definitions() {
+        for (code, name, data_type, section) in [
+            (
+                AVP_SESSION_BINDING,
+                "Session-Binding",
+                AvpDataType::Unsigned32,
+                "8.17",
+            ),
+            (
+                AVP_SESSION_SERVER_FAILOVER,
+                "Session-Server-Failover",
+                AvpDataType::Enumerated,
+                "8.18",
+            ),
+        ] {
+            let definition = dictionary()
+                .find_avp(AvpKey::ietf(code))
+                .unwrap_or_else(|| panic!("{name} missing from base dictionary"));
+            assert_eq!(definition.name(), name);
+            assert_eq!(definition.data_type(), data_type);
+            assert_eq!(definition.flags(), AvpFlagRules::base_mandatory());
+            assert_eq!(definition.spec_ref().section(), section);
+        }
     }
 
     #[test]

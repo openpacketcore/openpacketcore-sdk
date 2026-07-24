@@ -73,6 +73,7 @@ mod dea_authorization;
 mod lifecycle;
 mod location;
 mod mobility;
+mod session_state;
 mod trace;
 
 pub use super::subscription_id::{
@@ -84,6 +85,7 @@ pub use dea_authorization::*;
 pub use lifecycle::*;
 pub use location::*;
 pub use mobility::*;
+pub use session_state::*;
 pub use trace::*;
 
 /// 3GPP SWm application identifier.
@@ -243,7 +245,7 @@ pub const APPLICATION: ApplicationDefinition = ApplicationDefinition::new(
     SpecRef::new("3gpp", "TS29273", "SWm Diameter application"),
 );
 
-static SWM_REQUEST_AVP_RULES: [CommandAvpRule; 40] = [
+static SWM_REQUEST_AVP_RULES: [CommandAvpRule; 43] = [
     CommandAvpRule::new(
         AvpKey::ietf(base::AVP_SESSION_ID),
         AvpCardinality::ZeroOrOne,
@@ -369,6 +371,15 @@ static SWM_REQUEST_AVP_RULES: [CommandAvpRule; 40] = [
         AvpKey::vendor(AVP_TRACE_INFO, VENDOR_ID_3GPP),
         AvpCardinality::Forbidden,
     ),
+    CommandAvpRule::new(AvpKey::ietf(base::AVP_CLASS), AvpCardinality::Forbidden),
+    CommandAvpRule::new(
+        AvpKey::ietf(base::AVP_SESSION_BINDING),
+        AvpCardinality::Forbidden,
+    ),
+    CommandAvpRule::new(
+        AvpKey::ietf(base::AVP_SESSION_SERVER_FAILOVER),
+        AvpCardinality::Forbidden,
+    ),
     CommandAvpRule::new(
         AvpKey::ietf(base::AVP_PROXY_INFO),
         AvpCardinality::ZeroOrMore,
@@ -379,7 +390,7 @@ static SWM_REQUEST_AVP_RULES: [CommandAvpRule; 40] = [
     ),
 ];
 
-static SWM_ANSWER_AVP_RULES: [CommandAvpRule; 44] = [
+static SWM_ANSWER_AVP_RULES: [CommandAvpRule; 47] = [
     CommandAvpRule::new(AvpKey::ietf(AVP_STATE), AvpCardinality::ZeroOrMore),
     CommandAvpRule::new(
         AvpKey::ietf(base::AVP_RESULT_CODE),
@@ -529,9 +540,18 @@ static SWM_ANSWER_AVP_RULES: [CommandAvpRule; 44] = [
         AvpKey::vendor(AVP_TRACE_INFO, VENDOR_ID_3GPP),
         AvpCardinality::ZeroOrOne,
     ),
+    CommandAvpRule::new(AvpKey::ietf(base::AVP_CLASS), AvpCardinality::ZeroOrMore),
+    CommandAvpRule::new(
+        AvpKey::ietf(base::AVP_SESSION_BINDING),
+        AvpCardinality::ZeroOrOne,
+    ),
+    CommandAvpRule::new(
+        AvpKey::ietf(base::AVP_SESSION_SERVER_FAILOVER),
+        AvpCardinality::ZeroOrOne,
+    ),
 ];
 
-static SWM_PROJECTED_PROFILE_ANSWER_AVP_RULES: [CommandAvpRule; 44] = [
+static SWM_PROJECTED_PROFILE_ANSWER_AVP_RULES: [CommandAvpRule; 47] = [
     CommandAvpRule::new(AvpKey::ietf(AVP_STATE), AvpCardinality::ZeroOrMore),
     CommandAvpRule::new(
         AvpKey::ietf(base::AVP_RESULT_CODE),
@@ -679,6 +699,15 @@ static SWM_PROJECTED_PROFILE_ANSWER_AVP_RULES: [CommandAvpRule; 44] = [
     ),
     CommandAvpRule::new(
         AvpKey::vendor(AVP_TRACE_INFO, VENDOR_ID_3GPP),
+        AvpCardinality::ZeroOrOne,
+    ),
+    CommandAvpRule::new(AvpKey::ietf(base::AVP_CLASS), AvpCardinality::ZeroOrMore),
+    CommandAvpRule::new(
+        AvpKey::ietf(base::AVP_SESSION_BINDING),
+        AvpCardinality::ZeroOrOne,
+    ),
+    CommandAvpRule::new(
+        AvpKey::ietf(base::AVP_SESSION_SERVER_FAILOVER),
         AvpCardinality::ZeroOrOne,
     ),
 ];
@@ -3085,6 +3114,40 @@ impl SwmCorrelatedDiameterEapResponse {
         self.response.response()
     }
 
+    /// Return the explicit Class-state update from a correlated ordinary DEA.
+    ///
+    /// An ordinary answer with one or more Class occurrences returns
+    /// [`SwmClassAvpUpdate::Replace`], preserving order, headers, zero-length
+    /// values, and opaque bytes. An ordinary answer without Class, or a generic
+    /// error answer, returns [`SwmClassAvpUpdate::Unchanged`] and therefore
+    /// cannot accidentally erase consumer-owned session state.
+    #[must_use]
+    pub fn class_avp_update(&self) -> SwmClassAvpUpdate {
+        match self.response() {
+            SwmDiameterEapResponse::Application(answer) => {
+                SwmClassAvpUpdate::from_class_avps(&answer.extensions.class_avps)
+            }
+            SwmDiameterEapResponse::GenericError(_) => SwmClassAvpUpdate::Unchanged,
+        }
+    }
+
+    /// Retain final-server authorization-session routing from an ordinary DEA.
+    ///
+    /// This projection is unavailable on the uncorrelated answer surface. Its
+    /// Origin identity is the final authorizing server carried in the DEA,
+    /// never the authenticated transport/DRA identity. Absence of
+    /// Session-Binding means Destination-Host is required; absence of
+    /// Session-Server-Failover means `REFUSE_SERVICE`.
+    #[must_use]
+    pub fn authorization_session_routing(&self) -> Option<SwmAuthorizationSessionRouting> {
+        match self.response() {
+            SwmDiameterEapResponse::Application(answer) => Some(
+                SwmAuthorizationSessionRouting::from_correlated_answer(answer),
+            ),
+            SwmDiameterEapResponse::GenericError(_) => None,
+        }
+    }
+
     /// Project a correlated ordinary DEA's EAP-Payload as EAP-AKA/AKA-prime.
     ///
     /// `Ok(None)` means the response uses generic-error grammar or has no
@@ -3267,6 +3330,18 @@ impl fmt::Debug for SwmCorrelatedDiameterEapResponse {
             .field("redirect_present", &self.redirect().is_some())
             .field("wlan_location_present", &self.wlan_location().is_some())
             .field("trace_info_present", &self.trace_info().is_some())
+            .field(
+                "class_avp_update_present",
+                &matches!(
+                    self.response(),
+                    SwmDiameterEapResponse::Application(answer)
+                        if !answer.extensions.class_avps.is_empty()
+                ),
+            )
+            .field(
+                "authorization_session_routing_present",
+                &matches!(self.response(), SwmDiameterEapResponse::Application(_)),
+            )
             .field(
                 "current_eap_request_timeout_present",
                 &self.current_eap_request_timeout().is_some(),
@@ -5007,6 +5082,9 @@ impl fmt::Debug for SwmDiameterEapRequestExtensions {
 #[derive(Default, Clone, PartialEq, Eq)]
 pub struct SwmDiameterEapAnswerExtensions {
     avps: Vec<SwmAdditionalAvp>,
+    class_avps: SwmClassAvps,
+    session_binding: Option<SwmSessionBinding>,
+    session_server_failover: Option<SwmSessionServerFailover>,
     gateway_context: SwmDeaGatewayContext,
     apn_configurations: Vec<SwmApnConfigurationSupplement>,
     access_network_info: Option<SwmAccessNetworkInfo>,
@@ -5045,6 +5123,12 @@ impl fmt::Debug for SwmDiameterEapAnswerExtensions {
         formatter
             .debug_struct("SwmDiameterEapAnswerExtensions")
             .field("avp_count", &self.avps.len())
+            .field("class_avp_count", &self.class_avps.len())
+            .field("session_binding_present", &self.session_binding.is_some())
+            .field(
+                "session_server_failover_present",
+                &self.session_server_failover.is_some(),
+            )
             .field("gateway_context", &self.gateway_context)
             .field("apn_configuration_count", &self.apn_configurations.len())
             .field(
@@ -5935,6 +6019,90 @@ impl SwmDiameterEapRequest {
 }
 
 impl SwmDiameterEapAnswer {
+    /// Return the number of retained opaque Class AVPs.
+    ///
+    /// Raw values remain sealed. Use
+    /// [`SwmCorrelatedDiameterEapResponse::class_avp_update`] for an actionable
+    /// state-transfer value after authenticated response correlation.
+    #[must_use]
+    pub fn class_avp_count(&self) -> usize {
+        self.extensions.class_avps.len()
+    }
+
+    /// Return aggregate retained Class value bytes without exposing contents.
+    #[must_use]
+    pub const fn class_avp_value_bytes(&self) -> usize {
+        self.extensions.class_avps.aggregate_value_bytes()
+    }
+
+    /// Set an originated ordered, bounded Class collection.
+    pub fn set_class_avps(&mut self, class_avps: SwmClassAvps) {
+        self.extensions.class_avps = class_avps;
+    }
+
+    /// Remove every originated Class AVP.
+    pub fn clear_class_avps(&mut self) {
+        self.extensions.class_avps = SwmClassAvps::default();
+    }
+
+    /// Return whether an explicit Session-Binding was parsed or configured.
+    ///
+    /// Actionable routing semantics are intentionally available only through
+    /// [`SwmCorrelatedDiameterEapResponse::authorization_session_routing`].
+    #[must_use]
+    pub const fn has_session_binding(&self) -> bool {
+        self.extensions.session_binding.is_some()
+    }
+
+    /// Return whether an explicit Session-Server-Failover was parsed or
+    /// configured.
+    #[must_use]
+    pub const fn has_session_server_failover(&self) -> bool {
+        self.extensions.session_server_failover.is_some()
+    }
+
+    /// Set an originated Session-Binding directive.
+    ///
+    /// The answer is unchanged when the directive would contradict an
+    /// existing Session-Server-Failover value under RFC 6733 section 8.18.
+    pub fn set_session_binding(
+        &mut self,
+        session_binding: SwmSessionBinding,
+    ) -> Result<(), SwmSessionStateError> {
+        session_state::validate_session_routing_directives(
+            Some(session_binding),
+            self.extensions.session_server_failover,
+        )?;
+        self.extensions.session_binding = Some(session_binding);
+        Ok(())
+    }
+
+    /// Remove the explicit Session-Binding directive.
+    pub fn clear_session_binding(&mut self) {
+        self.extensions.session_binding = None;
+    }
+
+    /// Set an originated Session-Server-Failover directive.
+    ///
+    /// The answer is unchanged when the directive would contradict an
+    /// existing Session-Binding value under RFC 6733 section 8.18.
+    pub fn set_session_server_failover(
+        &mut self,
+        session_server_failover: SwmSessionServerFailover,
+    ) -> Result<(), SwmSessionStateError> {
+        session_state::validate_session_routing_directives(
+            self.extensions.session_binding,
+            Some(session_server_failover),
+        )?;
+        self.extensions.session_server_failover = Some(session_server_failover);
+        Ok(())
+    }
+
+    /// Remove the explicit Session-Server-Failover directive.
+    pub fn clear_session_server_failover(&mut self) {
+        self.extensions.session_server_failover = None;
+    }
+
     /// Project EAP-Payload as strict EAP-AKA/AKA-prime evidence when present.
     ///
     /// This raw answer surface proves packet structure only. Use
@@ -6100,6 +6268,16 @@ impl SwmDiameterEapAnswer {
                 "DEA",
             ));
         }
+        session_state::validate_session_routing_directives(
+            self.extensions.session_binding,
+            self.extensions.session_server_failover,
+        )
+        .map_err(|_| {
+            encode_structural_error(
+                "SWm DEA Session-Server-Failover contradicts Session-Binding",
+                "8.18",
+            )
+        })?;
         if let Some(user_name) = self.user_name.as_ref() {
             if user_name.as_ref().is_empty() {
                 return Err(encode_structural_error(
@@ -7726,6 +7904,25 @@ fn build_swm_diameter_eap_answer_internal(
         true,
         ctx,
     )?;
+    answer.extensions.class_avps.append_to(&mut raw_avps, ctx)?;
+    if let Some(session_binding) = answer.extensions.session_binding {
+        builder_helpers::append_u32_avp(
+            &mut raw_avps,
+            base::AVP_SESSION_BINDING,
+            session_binding.wire_bits(),
+            true,
+            ctx,
+        )?;
+    }
+    if let Some(session_server_failover) = answer.extensions.session_server_failover {
+        builder_helpers::append_u32_avp(
+            &mut raw_avps,
+            base::AVP_SESSION_SERVER_FAILOVER,
+            session_server_failover.wire_value(),
+            true,
+            ctx,
+        )?;
+    }
     if let Some(user_name) = answer.user_name.as_ref() {
         builder_helpers::append_utf8_avp(
             &mut raw_avps,
@@ -8228,6 +8425,9 @@ fn parse_swm_diameter_eap_application_answer_parts(
     let mut origin_host = None;
     let mut origin_realm = None;
     let mut user_name = None;
+    let mut class_avps = SwmClassAvps::default();
+    let mut session_binding = None;
+    let mut session_server_failover = None;
     let mut subscriber_authorization = SwmDeaSubscriberAuthorization::new();
     let mut mip6_feature_vector = None;
     let mut mip6_agent_info = None;
@@ -8279,7 +8479,18 @@ fn parse_swm_diameter_eap_application_answer_parts(
                     )
                     .with_spec_ref(SpecRef::new("ietf", "RFC6733", "4.1.1")));
                 }
-                if code == AVP_EMERGENCY_INFO && vendor_id == VENDOR_ID_3GPP {
+                if let Some(section) = match code {
+                    base::AVP_CLASS => Some("8.20"),
+                    base::AVP_SESSION_BINDING => Some("8.17"),
+                    base::AVP_SESSION_SERVER_FAILOVER => Some("8.18"),
+                    _ => None,
+                } {
+                    return Err(decode_structural_error_at(
+                        "SWm DEA authorization-session AVP must use the IETF base identity",
+                        offset,
+                        section,
+                    ));
+                } else if code == AVP_EMERGENCY_INFO && vendor_id == VENDOR_ID_3GPP {
                     let value = mobility::parse_emergency_info(
                         &avp,
                         ctx,
@@ -8464,6 +8675,25 @@ fn parse_swm_diameter_eap_application_answer_parts(
             } else if code == base::AVP_USER_NAME {
                 let value = builder_helpers::parse_string_value(avp.value, value_offset, "8.14")?;
                 builder_helpers::set_once(&mut user_name, Redacted::from(value), offset, "8.14")?;
+            } else if code == base::AVP_CLASS {
+                class_avps.push_received(&avp, offset)?;
+            } else if code == base::AVP_SESSION_BINDING {
+                let value = session_state::parse_session_binding(&avp, offset, value_offset)?;
+                builder_helpers::set_once(&mut session_binding, value, offset, "8.17")?;
+                session_state::validate_session_routing_directives_for_decode(
+                    session_binding,
+                    session_server_failover,
+                    offset,
+                )?;
+            } else if code == base::AVP_SESSION_SERVER_FAILOVER {
+                let value =
+                    session_state::parse_session_server_failover(&avp, offset, value_offset)?;
+                builder_helpers::set_once(&mut session_server_failover, value, offset, "8.18")?;
+                session_state::validate_session_routing_directives_for_decode(
+                    session_binding,
+                    session_server_failover,
+                    offset,
+                )?;
             } else if code == AVP_SUBSCRIPTION_ID {
                 let value = dea_authorization::parse_subscription_id(
                     &avp,
@@ -8773,6 +9003,9 @@ fn parse_swm_diameter_eap_application_answer_parts(
         eap_master_session_key,
         extensions: SwmDiameterEapAnswerExtensions {
             avps: extensions,
+            class_avps,
+            session_binding,
+            session_server_failover,
             gateway_context: SwmDeaGatewayContext {
                 chained_s2b_s8_serving_gateway: mip6_agent_info,
                 emergency_info,
@@ -9123,6 +9356,8 @@ fn is_known_agent_delivery_application_avp(avp: &SwmAdditionalAvp) -> bool {
                 | base::AVP_AUTHORIZATION_LIFETIME
                 | base::AVP_CLASS
                 | base::AVP_RE_AUTH_REQUEST_TYPE
+                | base::AVP_SESSION_BINDING
+                | base::AVP_SESSION_SERVER_FAILOVER
                 | base::AVP_SESSION_TIMEOUT
                 | base::AVP_MULTI_ROUND_TIME_OUT
                 | base::AVP_USER_NAME

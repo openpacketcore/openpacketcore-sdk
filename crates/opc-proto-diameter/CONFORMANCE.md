@@ -986,6 +986,38 @@ application-only 3GPP identities `(554, 10415)`, `(555, 10415)`,
 `(1706, 10415)`. Numeric-code or foreign-vendor collisions are not members of
 that set.
 
+#### SWm authorization-session state
+
+Ordinary SWm DEA application answers recognize the following RFC 6733 base
+authorization-session AVPs. The baseline and projected-profile DEA command
+dictionaries use the same occurrence rules; DER and generic delivery-error
+actions remain unchanged.
+
+| AVP | Wire contract | Typed projection and action boundary | Evidence |
+|:----|:--------------|:-------------------------------------|:---------|
+| `Class` | IETF 25, OctetString, V/P clear, M set, repeated; empty values valid | `SwmClassAvps` retains canonical headers, exact value bytes, and wire order behind a redacted opaque API. The independent typed limit is 128 occurrences and 4096 aggregate value octets. `SwmClassAvpUpdate::{Unchanged, Replace}` preserves the RFC 6733 §8.20 distinction between absence and replacement. Clone/move helpers replace Class values in typed RAR/STR additional AVPs without downstream raw reconstruction. | Independent zero/one/multiple/zero-length DEA fixtures; exact STR transfer; count/aggregate/header/vendor/flag/length failures; redaction; correlated RAA/AAA replacement and absent-update tests. |
+| `Session-Binding` | IETF 270, Unsigned32, V/P clear, M set, singleton; unknown bits retained | `SwmSessionBinding` projects the defined RE_AUTH, STR, and ACCOUNTING bits as required/prohibited Destination-Host facts. Absence applies the RFC default with all three requirements clear/required. Raw DEA exposes presence only; actionable values require `SwmCorrelatedDiameterEapResponse::authorization_session_routing`. | STR-bit set/clear, unknown-bit, duplicate, width, flags, vendor, and RFC §8.18 cross-field fixtures. |
+| `Session-Server-Failover` | IETF 271, Enumerated width, V/P clear, M set, singleton | All four RFC 6733 §8.18 values are typed. Unassigned values fail closed with bounded, value-free decode diagnostics and cannot enter typed routing state. Absence is effective `REFUSE_SERVICE`; only TRY_AGAIN and TRY_AGAIN_ALLOW_SERVICE permit preparing a hostless STR retry. The AVP is rejected when all three defined Session-Binding bits are set. | Absent/all-four-assigned/unassigned-boundary fixtures, singleton/type/header failures, contradictory decode/setter failures, non-DEA parse/build rejection, and delivery-action tests. |
+
+The correlated routing value owns the ordinary DEA's final Origin-Host and
+Origin-Realm plus its exact Session-Id. Applying it to another session fails
+before mutation. Applying it to the matching STR replaces Destination-Realm
+with the final authorizing realm and either uses the final authorizing host or
+omits Destination-Host according to the STR bit. A request dispatched through
+a DRA therefore never substitutes the authenticated transport-agent identity
+for the final server identity. Host, realm, session, raw Class values, and raw
+routing values are absent from `Debug`, `Display`, and errors.
+
+RFC 6733 §8.18 permits Session-Server-Failover only when Session-Binding is
+absent or at least one defined binding bit is zero. Decode, public originated
+setters, and encode/correlation validation reject the contradictory
+all-three-defined-bits-set pair; unknown extra binding bits are retained and
+do not change that defined-bit test. Both directives are explicitly forbidden
+in every non-DEA SWm command role. Unassigned failover values and any action
+not explicitly granted fail closed. Active-session association, persistence,
+service decisions, retry attempt counting/deadlines, route selection, and
+transport pending-request ownership remain downstream responsibilities.
+
 #### SWm Session-Termination scope
 
 The typed TS 29.273 V19.2.0 STR/STA slice covers command 275 under application

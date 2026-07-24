@@ -441,7 +441,7 @@ const MAX_ROUTE_RECORDS: usize = 128;
 const MAX_ADDITIONAL_AVPS: usize = 128;
 const MAX_PROXY_INFOS: usize = 128;
 
-static ABORT_SESSION_REQUEST_AVP_RULES: [CommandAvpRule; 27] = [
+static ABORT_SESSION_REQUEST_AVP_RULES: [CommandAvpRule; 29] = [
     CommandAvpRule::new(
         AvpKey::ietf(base::AVP_SESSION_ID),
         AvpCardinality::ZeroOrOne,
@@ -469,6 +469,14 @@ static ABORT_SESSION_REQUEST_AVP_RULES: [CommandAvpRule; 27] = [
     ),
     CommandAvpRule::new(AvpKey::ietf(base::AVP_USER_NAME), AvpCardinality::ZeroOrOne),
     CommandAvpRule::new(AvpKey::ietf(base::AVP_CLASS), AvpCardinality::ZeroOrMore),
+    CommandAvpRule::new(
+        AvpKey::ietf(base::AVP_SESSION_BINDING),
+        AvpCardinality::Forbidden,
+    ),
+    CommandAvpRule::new(
+        AvpKey::ietf(base::AVP_SESSION_SERVER_FAILOVER),
+        AvpCardinality::Forbidden,
+    ),
     CommandAvpRule::new(AvpKey::ietf(super::AVP_STATE), AvpCardinality::ZeroOrOne),
     CommandAvpRule::new(
         AvpKey::ietf(super::AVP_REPLY_MESSAGE),
@@ -534,7 +542,7 @@ static ABORT_SESSION_REQUEST_AVP_RULES: [CommandAvpRule; 27] = [
     ),
 ];
 
-static ABORT_SESSION_ANSWER_AVP_RULES: [CommandAvpRule; 25] = [
+static ABORT_SESSION_ANSWER_AVP_RULES: [CommandAvpRule; 27] = [
     CommandAvpRule::new(
         AvpKey::ietf(base::AVP_SESSION_ID),
         AvpCardinality::ZeroOrOne,
@@ -553,6 +561,14 @@ static ABORT_SESSION_ANSWER_AVP_RULES: [CommandAvpRule; 25] = [
         AvpCardinality::ZeroOrOne,
     ),
     CommandAvpRule::new(AvpKey::ietf(base::AVP_USER_NAME), AvpCardinality::ZeroOrOne),
+    CommandAvpRule::new(
+        AvpKey::ietf(base::AVP_SESSION_BINDING),
+        AvpCardinality::Forbidden,
+    ),
+    CommandAvpRule::new(
+        AvpKey::ietf(base::AVP_SESSION_SERVER_FAILOVER),
+        AvpCardinality::Forbidden,
+    ),
     CommandAvpRule::new(AvpKey::ietf(super::AVP_STATE), AvpCardinality::ZeroOrOne),
     CommandAvpRule::new(
         AvpKey::ietf(base::AVP_ORIGIN_STATE_ID),
@@ -622,7 +638,7 @@ static ABORT_SESSION_ANSWER_AVP_RULES: [CommandAvpRule; 25] = [
     ),
 ];
 
-static SESSION_TERMINATION_REQUEST_AVP_RULES: [CommandAvpRule; 17] = [
+static SESSION_TERMINATION_REQUEST_AVP_RULES: [CommandAvpRule; 19] = [
     CommandAvpRule::new(
         AvpKey::ietf(base::AVP_SESSION_ID),
         AvpCardinality::ZeroOrOne,
@@ -653,6 +669,14 @@ static SESSION_TERMINATION_REQUEST_AVP_RULES: [CommandAvpRule; 17] = [
     ),
     CommandAvpRule::new(AvpKey::ietf(base::AVP_USER_NAME), AvpCardinality::ZeroOrOne),
     CommandAvpRule::new(AvpKey::ietf(base::AVP_CLASS), AvpCardinality::ZeroOrMore),
+    CommandAvpRule::new(
+        AvpKey::ietf(base::AVP_SESSION_BINDING),
+        AvpCardinality::Forbidden,
+    ),
+    CommandAvpRule::new(
+        AvpKey::ietf(base::AVP_SESSION_SERVER_FAILOVER),
+        AvpCardinality::Forbidden,
+    ),
     CommandAvpRule::new(AvpKey::ietf(AVP_DRMP), AvpCardinality::ZeroOrOne),
     CommandAvpRule::new(
         AvpKey::ietf(AVP_OC_SUPPORTED_FEATURES),
@@ -678,7 +702,7 @@ static SESSION_TERMINATION_REQUEST_AVP_RULES: [CommandAvpRule; 17] = [
     CommandAvpRule::new(AvpKey::ietf(AVP_LOAD), AvpCardinality::Forbidden),
 ];
 
-static SESSION_TERMINATION_ANSWER_AVP_RULES: [CommandAvpRule; 16] = [
+static SESSION_TERMINATION_ANSWER_AVP_RULES: [CommandAvpRule; 18] = [
     CommandAvpRule::new(
         AvpKey::ietf(base::AVP_SESSION_ID),
         AvpCardinality::ZeroOrOne,
@@ -696,6 +720,14 @@ static SESSION_TERMINATION_ANSWER_AVP_RULES: [CommandAvpRule; 16] = [
         AvpCardinality::ZeroOrOne,
     ),
     CommandAvpRule::new(AvpKey::ietf(base::AVP_CLASS), AvpCardinality::ZeroOrMore),
+    CommandAvpRule::new(
+        AvpKey::ietf(base::AVP_SESSION_BINDING),
+        AvpCardinality::Forbidden,
+    ),
+    CommandAvpRule::new(
+        AvpKey::ietf(base::AVP_SESSION_SERVER_FAILOVER),
+        AvpCardinality::Forbidden,
+    ),
     CommandAvpRule::new(AvpKey::ietf(AVP_DRMP), AvpCardinality::ZeroOrOne),
     CommandAvpRule::new(
         AvpKey::ietf(AVP_OC_SUPPORTED_FEATURES),
