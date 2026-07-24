@@ -1664,9 +1664,10 @@ The following are outside the current crate scope:
   policy. The peer state machine consumes a caller assertion only after the
   transport performs mutual authentication; it does not claim cryptographic
   proof or a complete protected transport. The sibling
-  `opc-diameter-transport` crate supplies a bounded TLS/TCP adapter and a
-  transport-neutral simultaneous-open winner-election helper; it does not
-  change this codec crate's scope and does not claim DTLS/SCTP.
+  `opc-diameter-transport` crate supplies bounded mutually authenticated
+  TLS/TCP and RFC 6083 DTLS/SCTP adapters, direct and in-band sequencing, and
+  a transport-neutral simultaneous-open winner-election helper. That
+  implementation does not change this codec crate's transport-neutral scope.
 - Failover *policy*: peer discovery, alternate-peer selection and routability,
   failback, attempt limits beyond the table's evidence bounds, deadlines, and
   deciding whether a request's application semantics permit failover. The

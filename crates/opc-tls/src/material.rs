@@ -3,7 +3,7 @@
 use opc_identity::projected_svid::ProjectedSvidControllerPublication;
 use opc_identity::{
     build_identity_state, IdentityReloadError, IdentityState, ProjectedSvidControllerClaimError,
-    ProjectedSvidSource,
+    ProjectedSvidSource, TrustBundleSet,
 };
 use opc_redaction::metrics::{
     SecurityMetricsAcceptance, SecurityMetricsController, SecurityMetricsPublication,
@@ -17,6 +17,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::runtime::Handle;
 use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
+use zeroize::Zeroizing;
 
 /// Maximum certificate count accepted in one local SVID chain.
 pub const MAX_TLS_MATERIAL_CHAIN_CERTIFICATES: usize = 16;
@@ -485,6 +486,31 @@ impl TlsMaterialController {
         }
     }
 
+    /// Freeze one coherent material snapshot for a non-rustls TLS or DTLS
+    /// provider.
+    ///
+    /// This asynchronous call acquires the same controller-owned
+    /// [`MAX_TLS_CONCURRENT_HANDSHAKES`] budget as rustls handshakes. The
+    /// returned non-cloneable value retains that permit, the controller, and
+    /// the exact accepted epoch until it is admitted or dropped. Cancelling a
+    /// waiter or dropping the value releases the permit; protocol adapters
+    /// remain responsible for applying their operation deadline to the wait.
+    /// Call [`TlsExternalHandshakeMaterial::admit`] only after the external
+    /// provider has completed its handshake. A source update rejected by this
+    /// controller is never exposed here: the retained last-known-good snapshot
+    /// remains authoritative.
+    pub async fn begin_external_handshake(
+        &self,
+    ) -> Result<TlsExternalHandshakeMaterial, TlsMaterialError> {
+        let permit = self.acquire_handshake().await?;
+        let snapshot = self.snapshot()?;
+        Ok(TlsExternalHandshakeMaterial {
+            controller: self.clone(),
+            snapshot,
+            _permit: permit,
+        })
+    }
+
     fn material_source_receiver(&self) -> MaterialSourceReceiver {
         lock_unpoisoned(&self.inner.source_rx).clone()
     }
@@ -731,6 +757,76 @@ impl TlsMaterialController {
             self.inner.metrics.as_ref(),
             TlsMaterialReloadReason::SourceClosed,
         );
+    }
+}
+
+/// Immutable coherent material for one non-rustls TLS or DTLS handshake.
+///
+/// This boundary exists for protocol engines that cannot consume a rustls
+/// configuration. It preserves the same snapshot/admit epoch contract as
+/// [`TlsClientHandshake`] and [`TlsServerHandshake`]. It is deliberately
+/// non-cloneable and retains one controller handshake permit until
+/// [`admit`](Self::admit) consumes it or it is dropped. Private-key bytes are
+/// available only as a zeroizing copy and are never included in `Debug`.
+pub struct TlsExternalHandshakeMaterial {
+    controller: TlsMaterialController,
+    snapshot: TlsMaterialSnapshot,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl TlsExternalHandshakeMaterial {
+    /// Material epoch fixed before this handshake began.
+    pub fn epoch(&self) -> TlsMaterialEpoch {
+        self.snapshot.epoch()
+    }
+
+    /// Local leaf expiry fixed before this handshake began.
+    pub fn leaf_expires_at(&self) -> Timestamp {
+        self.snapshot.leaf_expires_at()
+    }
+
+    /// Earliest expiry across the fixed local certificate chain.
+    pub fn certificate_chain_expires_at(&self) -> Timestamp {
+        self.snapshot.certificate_chain_expires_at()
+    }
+
+    /// Borrow the validated local certificate chain.
+    pub fn certificate_chain(&self) -> &[CertificateDer<'static>] {
+        &self.snapshot.state.svid.cert_chain
+    }
+
+    /// Borrow the validated trust bundles paired with this exact snapshot.
+    pub fn trust_bundles(&self) -> &TrustBundleSet {
+        &self.snapshot.state.trust_bundles
+    }
+
+    /// Copy the validated private-key DER for an external provider.
+    ///
+    /// The returned allocation is zeroized on every path unless the caller
+    /// deliberately moves its inner `Vec` into a provider that assumes
+    /// custody. Callers must not log, persist, or retain another copy.
+    pub fn private_key_der_copy(&self) -> Zeroizing<Vec<u8>> {
+        Zeroizing::new(self.snapshot.state.svid.private_key.secret_der().to_vec())
+    }
+
+    /// Verify this snapshot is still the controller's authoritative epoch
+    /// after the external handshake completed.
+    pub fn admit(self) -> Result<TlsAdmittedConnection, TlsMaterialError> {
+        self.controller.admit(&self.snapshot)
+    }
+}
+
+impl fmt::Debug for TlsExternalHandshakeMaterial {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TlsExternalHandshakeMaterial")
+            .field("epoch", &self.snapshot.epoch)
+            .field("leaf_expires_at", &self.snapshot.leaf_expires_at)
+            .field(
+                "certificate_chain_expires_at",
+                &self.snapshot.certificate_chain_expires_at,
+            )
+            .finish_non_exhaustive()
     }
 }
 

@@ -31,9 +31,31 @@ use tokio::time::Instant;
 use crate::frame::{borrowed, decode_wire_frame, encoded_bytes, validate_wire_frame};
 use crate::frame_transport::{
     ProtectedFrameReceiver, ProtectedFrameSender, ProtectedFrameTransportClose,
+    ProtectedFrameTransportParts,
 };
-use crate::tls::{retirement_required, DiameterTlsRuntimeParts};
-use crate::{DiameterFrameLimits, DiameterTlsConnection, DiameterTlsError, DiameterTlsEvidence};
+use crate::tls::retirement_required;
+use crate::{
+    DiameterDtlsSctpConnection, DiameterDtlsSctpEvidence, DiameterFrameLimits,
+    DiameterTlsConnection, DiameterTlsError, DiameterTlsEvidence, ExpectedPeerIdentity,
+};
+
+pub(crate) trait ProtectedRuntimeGuard: Send {}
+
+impl<T> ProtectedRuntimeGuard for T where T: Send {}
+
+pub(crate) struct DiameterProtectedRuntimeParts<E> {
+    pub(crate) frame_transport: ProtectedFrameTransportParts,
+    pub(crate) session: PeerSession,
+    pub(crate) generation: PeerSessionGeneration,
+    pub(crate) evidence: E,
+    pub(crate) admitted_epoch: opc_tls::TlsMaterialEpoch,
+    pub(crate) expected_peer: ExpectedPeerIdentity,
+    pub(crate) frame_limits: DiameterFrameLimits,
+    pub(crate) material_status: opc_tls::TlsMaterialStatusReceiver,
+    pub(crate) hard_deadline: Instant,
+    pub(crate) retired: Arc<AtomicBool>,
+    pub(crate) transport_guard: Box<dyn ProtectedRuntimeGuard>,
+}
 
 /// Explicit bounded queues used by a full-duplex Diameter peer runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -434,10 +456,27 @@ impl DiameterApplicationReceiver {
     ) -> Result<DiameterApplicationMessage, DiameterPeerRuntimeError> {
         let mut closing = self.closing.subscribe();
         loop {
-            drop(self.core.active_state().await?);
-            if let Some(message) = self.pending.take() {
-                return Ok(message);
+            if self.pending.is_some() {
+                match self.core.active_state().await {
+                    Ok(state) => drop(state),
+                    Err(error) if terminal_allows_buffered_delivery(error) => {}
+                    Err(error) => return Err(error),
+                }
+                return self.pending.take().ok_or(DiameterPeerRuntimeError::Closed);
             }
+            match self.receiver.try_recv() {
+                Ok(message) => {
+                    // Retain the dequeued message across the active-state
+                    // reconciliation so cancellation never discards it.
+                    self.pending = Some(message);
+                    continue;
+                }
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    return wait_for_terminal(&self.core, &mut self.terminal).await;
+                }
+                Err(mpsc::error::TryRecvError::Empty) => {}
+            }
+            drop(self.core.active_state().await?);
             tokio::select! {
                 biased;
                 changed = self.terminal.changed() => {
@@ -465,6 +504,13 @@ impl DiameterApplicationReceiver {
     }
 }
 
+fn terminal_allows_buffered_delivery(error: DiameterPeerRuntimeError) -> bool {
+    matches!(
+        error,
+        DiameterPeerRuntimeError::Transport(DiameterTlsError::PeerClosed)
+    )
+}
+
 impl fmt::Debug for DiameterApplicationReceiver {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("DiameterApplicationReceiver(..)")
@@ -481,14 +527,17 @@ impl Drop for DiameterApplicationReceiver {
 
 /// Cloneable command and observability handle for one peer runtime.
 #[derive(Clone)]
-pub struct DiameterPeerHandle {
+pub struct DiameterPeerHandle<E = DiameterTlsEvidence> {
     commands: mpsc::Sender<WriterCommand>,
     core: Arc<RuntimeCore>,
-    evidence: DiameterTlsEvidence,
+    evidence: E,
     _lifetime: Arc<RuntimeHandleLifetime>,
 }
 
-impl DiameterPeerHandle {
+impl<E> DiameterPeerHandle<E>
+where
+    E: Clone,
+{
     /// Emit one admitted application message before the absolute deadline.
     pub async fn send_application(
         &self,
@@ -574,8 +623,9 @@ impl DiameterPeerHandle {
         self.await_submitted(result_rx, deadline).await
     }
 
-    /// Return the exact authenticated TLS evidence retained by this runtime.
-    pub const fn evidence(&self) -> &DiameterTlsEvidence {
+    /// Return the exact authenticated transport evidence retained by this
+    /// runtime.
+    pub const fn evidence(&self) -> &E {
         &self.evidence
     }
 
@@ -881,7 +931,10 @@ fn prefer_committed_result<T>(
     result.try_recv().unwrap_or(terminal)
 }
 
-impl fmt::Debug for DiameterPeerHandle {
+impl<E> fmt::Debug for DiameterPeerHandle<E>
+where
+    E: fmt::Debug,
+{
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("DiameterPeerHandle")
@@ -892,24 +945,30 @@ impl fmt::Debug for DiameterPeerHandle {
 }
 
 /// Owned full-duplex runtime before splitting command and receive halves.
-pub struct DiameterPeerRuntime {
-    handle: DiameterPeerHandle,
+pub struct DiameterPeerRuntime<E = DiameterTlsEvidence> {
+    handle: DiameterPeerHandle<E>,
     receiver: DiameterApplicationReceiver,
 }
 
-impl DiameterPeerRuntime {
+impl<E> DiameterPeerRuntime<E>
+where
+    E: Clone,
+{
     /// Clone a command handle while retaining the exclusive receive half.
-    pub fn handle(&self) -> DiameterPeerHandle {
+    pub fn handle(&self) -> DiameterPeerHandle<E> {
         self.handle.clone()
     }
 
     /// Split the runtime into a cloneable command handle and exclusive receiver.
-    pub fn into_parts(self) -> (DiameterPeerHandle, DiameterApplicationReceiver) {
+    pub fn into_parts(self) -> (DiameterPeerHandle<E>, DiameterApplicationReceiver) {
         (self.handle, self.receiver)
     }
 }
 
-impl fmt::Debug for DiameterPeerRuntime {
+impl<E> fmt::Debug for DiameterPeerRuntime<E>
+where
+    E: fmt::Debug,
+{
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("DiameterPeerRuntime")
@@ -931,6 +990,23 @@ impl DiameterTlsConnection {
             return Err(DiameterPeerRuntimeError::NotNegotiated);
         }
         start_runtime(self.into_runtime_parts(), config, &runtime)
+    }
+}
+
+impl DiameterDtlsSctpConnection {
+    /// Consume a negotiated DTLS/SCTP association into the same bounded,
+    /// full-duplex Diameter peer runtime used by TLS/TCP.
+    pub fn into_peer_runtime(
+        mut self,
+        config: DiameterPeerRuntimeConfig,
+    ) -> Result<DiameterPeerRuntime<DiameterDtlsSctpEvidence>, DiameterPeerRuntimeError> {
+        let runtime = tokio::runtime::Handle::try_current()
+            .map_err(|_| DiameterPeerRuntimeError::RuntimeUnavailable)?;
+        if !self.readiness()?.traffic_ready {
+            return Err(DiameterPeerRuntimeError::NotNegotiated);
+        }
+        let parts = self.into_runtime_parts(&runtime, config.application_queue_capacity().get())?;
+        start_runtime(parts, config, &runtime)
     }
 }
 
@@ -1373,25 +1449,28 @@ fn mark_closing(closing: &RuntimeClosing, transport_close: &Arc<dyn ProtectedFra
     transport_close.close();
 }
 
-fn start_runtime(
-    parts: DiameterTlsRuntimeParts,
+fn start_runtime<E>(
+    parts: DiameterProtectedRuntimeParts<E>,
     config: DiameterPeerRuntimeConfig,
     runtime: &tokio::runtime::Handle,
-) -> Result<DiameterPeerRuntime, DiameterPeerRuntimeError> {
-    let DiameterTlsRuntimeParts {
+) -> Result<DiameterPeerRuntime<E>, DiameterPeerRuntimeError>
+where
+    E: Clone + Send + 'static,
+{
+    let DiameterProtectedRuntimeParts {
         frame_transport,
         session,
         generation,
         evidence,
+        admitted_epoch,
         expected_peer,
         frame_limits,
         material_status,
         hard_deadline,
         retired,
-        retirement_task,
+        transport_guard,
     } = parts;
     let (frame_receiver, frame_sender, transport_close) = frame_transport.into_parts();
-    let admitted_epoch = evidence.material_epoch();
     let (terminal_tx, terminal_rx) = watch::channel(None);
     let closing = Arc::new(RuntimeClosing::new());
     let started_at = Instant::now();
@@ -1456,7 +1535,7 @@ fn start_runtime(
     };
     runtime.spawn(async move {
         let _supervisor_lifetime = supervisor_lifetime;
-        let _retirement_task = retirement_task;
+        let _transport_guard = transport_guard;
         let (error, reader_finished) = tokio::select! {
             outcome = &mut reader_task => (
                 outcome.unwrap_or(Err(DiameterPeerRuntimeError::Transport(

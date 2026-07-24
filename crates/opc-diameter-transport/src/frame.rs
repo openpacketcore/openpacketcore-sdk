@@ -16,6 +16,11 @@ pub struct DiameterFrameLimits {
 }
 
 impl DiameterFrameLimits {
+    /// Statically validated RFC 6083 Diameter plaintext budget.
+    pub(crate) const RFC6083: Self = Self {
+        max_message_len: 16_347,
+    };
+
     /// Create a frame limit accepted by both the 20-byte Diameter header and
     /// its unsigned 24-bit message-length field.
     pub const fn new(max_message_len: usize) -> Result<Self, DiameterFrameLimitsError> {
@@ -59,6 +64,10 @@ impl DiameterFrameLimits {
         }
     }
 }
+
+const _: [(); 1] = [(); (DiameterFrameLimits::RFC6083.max_message_len >= DIAMETER_HEADER_LEN
+    && DiameterFrameLimits::RFC6083.max_message_len <= MAX_U24 as usize)
+    as usize];
 
 impl Default for DiameterFrameLimits {
     fn default() -> Self {

@@ -60,6 +60,12 @@ and instance metadata.
   server wrappers share that exact authority. `begin_handshake()` freezes one
   leaf/key/chain/trust snapshot; its config must be used for the complete TLS
   exchange, and `admit()` must run only after application negotiation.
+- `TlsMaterialController::begin_external_handshake()` provides the equivalent
+  snapshot/admit contract for a non-rustls TLS or DTLS engine. It waits for the
+  same 128-operation controller budget and returns a non-cloneable value that
+  retains its permit until admission or drop. Cancellation releases a waiting
+  or held permit; each protocol adapter applies its own absolute deadline to
+  the wait and zeroizes any private-key copy it transfers.
 - `run_handshake()` enforces 128 concurrent operations and retries at most two
   epoch changes after the initial attempt. Its successful
   `TlsAdmittedConnection` records the exact epoch, local leaf expiry, and the

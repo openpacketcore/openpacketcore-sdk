@@ -472,6 +472,101 @@ async fn controller_pins_identity_retains_invalid_candidates_and_versions_rollba
     );
 }
 
+#[tokio::test]
+async fn external_handshake_material_uses_one_retained_last_good_snapshot() {
+    let ca = test_ca("external provider CA");
+    let material_a = material(CLIENT_ID, &ca, None);
+    let material_b = material(CLIENT_ID, &ca, None);
+    let expected_leaf = material_a.leaf_der.clone();
+    let expected_key = material_a.state.svid.private_key.secret_der().to_vec();
+    let (source_tx, source_rx) = watch::channel(Some(material_a.state.clone()));
+    let controller = TlsMaterialController::new(source_rx);
+
+    let initial = controller
+        .begin_external_handshake()
+        .await
+        .expect("initial external snapshot");
+    assert_eq!(initial.epoch().get(), 1);
+    assert_eq!(initial.certificate_chain()[0].as_ref(), expected_leaf);
+    assert_eq!(&*initial.private_key_der_copy(), &expected_key);
+
+    let mut mismatched = material_b.state;
+    mismatched.svid.private_key = material_a.state.svid.private_key.clone_key();
+    source_tx
+        .send(Some(mismatched))
+        .expect("publish mismatched key candidate");
+
+    let retained = controller
+        .begin_external_handshake()
+        .await
+        .expect("retained external snapshot");
+    assert_eq!(retained.epoch(), initial.epoch());
+    assert_eq!(retained.certificate_chain()[0].as_ref(), expected_leaf);
+    assert_eq!(&*retained.private_key_der_copy(), &expected_key);
+    assert_eq!(
+        controller.status().availability(),
+        TlsMaterialAvailability::RetainingLastGood
+    );
+    assert_eq!(
+        controller.status().reason(),
+        Some(TlsMaterialReloadReason::PrivateKeyMismatch)
+    );
+    assert_eq!(initial.admit().expect("initial admission").epoch().get(), 1);
+    assert_eq!(
+        retained.admit().expect("retained admission").epoch().get(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn external_handshake_material_is_bounded_and_cancellation_releases_waiters() {
+    let ca = test_ca("external provider concurrency CA");
+    let state = material(CLIENT_ID, &ca, None).state;
+    let (_source_tx, source_rx) = watch::channel(Some(state));
+    let controller = TlsMaterialController::new(source_rx);
+    let mut active = Vec::with_capacity(MAX_TLS_CONCURRENT_HANDSHAKES);
+    for _ in 0..MAX_TLS_CONCURRENT_HANDSHAKES {
+        active.push(
+            controller
+                .begin_external_handshake()
+                .await
+                .expect("acquire bounded external handshake"),
+        );
+    }
+
+    let waiting_controller = controller.clone();
+    let waiting = tokio::spawn(async move { waiting_controller.begin_external_handshake().await });
+    tokio::task::yield_now().await;
+    assert!(
+        !waiting.is_finished(),
+        "the configured handshake bound must apply to external providers"
+    );
+    waiting.abort();
+    let _ = waiting.await;
+
+    drop(active.pop());
+    let admitted = tokio::time::timeout(
+        Duration::from_secs(1),
+        controller.begin_external_handshake(),
+    )
+    .await
+    .expect("cancelled waiter must not retain a permit")
+    .expect("acquire permit released by material drop");
+    admitted
+        .admit()
+        .expect("admission consumes and releases its permit");
+    drop(active);
+
+    let final_material = tokio::time::timeout(
+        Duration::from_secs(1),
+        controller.begin_external_handshake(),
+    )
+    .await
+    .expect("all permits must be available after drops")
+    .expect("acquire external material after release");
+    drop(final_material);
+}
+
 #[test]
 fn controller_rejects_oversized_candidates_and_retains_last_good() {
     let ca = test_ca("bounded CA");

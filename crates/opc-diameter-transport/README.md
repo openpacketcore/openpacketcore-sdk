@@ -1,7 +1,7 @@
 # opc-diameter-transport
 
-`opc-diameter-transport` provides the mutually authenticated TLS/TCP transport
-boundary for the experimental Diameter codec and peer state machine.
+`opc-diameter-transport` provides the mutually authenticated TLS/TCP and
+DTLS/SCTP transport boundary for the Diameter codec and peer state machine.
 
 ## Implemented boundary
 
@@ -9,6 +9,48 @@ boundary for the experimental Diameter codec and peer state machine.
   byte is read or written.
 - In-band TLS/TCP uses consuming typestates to permit one canonical CER/CEA
   exchange and then immediately upgrades that same unbuffered TCP stream.
+- Direct DTLS/SCTP completes mutually authenticated DTLS 1.2 before any
+  Diameter byte. The in-band typestates permit exactly one canonical
+  cleartext CER/CEA, seal that prelude, and complete DTLS on the same SCTP
+  association before application traffic. Exactly one DTLS record travels
+  per ordered stream-0 SCTP user message with PPID 47 (RFC 6083 sections 4.1
+  and 4.4; PPID 47 is registered by RFC 6733 section 11.5). Any cleartext or
+  foreign-PPID input after the prelude fails closed.
+- The DTLS engine is the audited workspace-vendored `dimpl` fork, compiled
+  only with its pure-Rust `rust-crypto` provider. The transport selects that
+  provider explicitly, so a process-global `dimpl` default installed by
+  unrelated code cannot replace its crypto authority. Its RFC 6083 profile
+  is DTLS-1.2-only, disables datagram replay filtering and flight
+  retransmission in favor of reliable ordered SCTP, and admits the typed
+  ECDHE-ECDSA AES-GCM and ChaCha20-Poly1305 suites reported in connection
+  evidence.
+- Complete peer certificate chains are bounded, checked for leaf-to-root
+  order, validated with rustls-webpki against trust anchors scoped to the
+  expected SPIFFE trust domain, and required to contain the exact configured
+  SPIFFE identity. The acceptor requires a non-empty client certificate, and
+  the connector requires proof that the server sent `CertificateRequest` and
+  authenticated its local certificate; a one-way-authenticated handshake
+  cannot publish mutual-authentication evidence. Evidence expiry is the
+  earliest expiry across each full local and peer chain. Invalid material
+  updates retain the last known-good epoch; valid replacement retires old
+  associations.
+- `KernelSctpMessageIo` binds the record seam to an `opc-sctp` one-to-one
+  association configured to authenticate DATA chunks. It converts into an
+  opaque `DiameterDtlsSctpTransport`; the record and cleartext-prelude methods
+  are not caller-accessible, so PPID 47 emission and the one-CER/one-CEA fence
+  remain owned by the authenticated boundary. Its independently draining
+  receive task has a bounded queue of at least 32 complete messages, matching
+  the audited engine flight bound; loss or overflow is terminal. Each
+  handshake derives the exact 64-byte RFC 5705
+  `EXPORTER_DTLS_OVER_SCTP` value (no context), installs the next SCTP-AUTH
+  key, waits for sender-dry, activates it before the protected Finished
+  boundary, and retires the protocol-defined initial empty key only after
+  peer confirmation. The empty initial key is a transition baseline, not
+  peer-derived cryptographic authentication.
+- Diameter frames over DTLS are bounded to the single-record plaintext
+  budget: `DtlsSctpPolicy` rejects frame limits above
+  `MAX_DTLS_SCTP_MESSAGE_BYTES` (16,347 bytes) at construction because the
+  engine does not fragment application data across records.
 - The authenticated certificate SPIFFE ID must exactly match the configured
   peer. `ExpectedPeerIdentity::new` rejects empty or non-ASCII `Origin-Host`
   and `Origin-Realm` configuration. Typed CER/CEA parsing and construction use
@@ -33,8 +75,9 @@ boundary for the experimental Diameter codec and peer state machine.
 - A connection retains typed TLS version, cipher, credential epoch, peer
   identity, protection-sequence, and generation evidence. It exposes no raw
   stream escape that can bypass `PeerSession` command admission.
-- After successful CER/CEA, `DiameterTlsConnection::into_peer_runtime` consumes
-  the sequential handle into one full-duplex owner. Independent persistent
+- After successful CER/CEA, both `DiameterTlsConnection` and
+  `DiameterDtlsSctpConnection` can be consumed into one full-duplex peer
+  runtime. Independent persistent
   reader and writer tasks never cancel an in-progress frame merely to service
   the opposite direction. Separate bounded caller, priority-control, and
   inbound-application queues plus a configured maximum frame-write duration
@@ -74,7 +117,7 @@ boundary for the experimental Diameter codec and peer state machine.
   Every admission, I/O, and owned readiness/snapshot accessor synchronously
   reconciles the authoritative material status and hard deadline, so an
   immediate ready operation cannot race the background watcher. Dropping a
-  healthy connection also issues synchronous full TCP shutdown.
+  healthy connection also synchronously closes its TCP or SCTP transport.
 - TLS resumption, tickets, early data, half-RTT data, and HTTP ALPN defaults are
   disabled for this Diameter boundary. Diameter has no negotiated ALPN here.
 - Cipher allowlists filter the rustls provider before handshake advertisement;
@@ -89,26 +132,51 @@ connection. Validation, deadline, and backpressure rejections that the enqueue
 or writer path proves occurred before starting leave it active. An unproven
 caller timeout after submission is terminal, as is cancelling a submitted
 frame operation: both synchronously revoke the exact peer generation and
-full-close TCP, so a retained handle cannot resume a partially read or written
-frame.
+full-close the underlying transport, so a retained handle cannot resume a
+partially read or written frame.
 Application policy and Diameter application state machines remain outside this
 crate.
 
 ## Explicit limits
 
-This crate currently implements TLS/TCP only. It does not implement DTLS/SCTP
-and does not emit SCTP PPID 47. Each candidate receives a monotonic
-`PeerSessionGeneration`, and the SDK exposes the simultaneous-open decision,
-but the consumer still owns candidate orchestration, listener/reconnect policy,
-backoff, realm routing, peer topology, base `Twinit` selection, initial watchdog
-scheduling, identifier allocation, and all application state machines.
+Each candidate receives a monotonic `PeerSessionGeneration`, and the SDK
+exposes the simultaneous-open decision, but the consumer still owns candidate
+orchestration, listener/reconnect policy, backoff, realm routing, peer
+topology, base `Twinit` selection, initial watchdog scheduling, identifier
+allocation, and all application state machines.
 
-The original sequential `DiameterTlsConnection` methods remain available for
-capability setup and narrow integrations. Long-lived use should consume a
-negotiated connection into the bounded runtime instead of wrapping that handle
-in an external mutex. The crate remains experimental and does not make a
-complete RFC 6733 deployment-readiness claim until the real RFC 6083
-DTLS/SCTP/PPID-47 transport is implemented and qualified.
+The SDK does not configure or attest an external IPsec deployment. A consumer
+may select `CompatibilityUnprotected` only after applying its own separate
+IPsec policy and evidence; the SDK still reports that association as
+unprotected and it never satisfies protected-transport readiness.
+
+The RFC 6083 profile deliberately rejects DTLS 1.3. RFC 6083's key transition
+is defined around the DTLS 1.2 Finished boundary; this SDK does not substitute
+the expired DTLS-over-SCTP-bis draft's different directional-key contract.
+Local software credentials are imported into the DTLS provider as DER. Every
+adapter and vendored-engine DER custody buffer is zeroized on drop, but
+selecting an HSM/non-exportable signing provider remains outside this transport
+API.
+
+The kernel adapter requires a one-to-one association created with
+`SctpAuthenticationConfig::data()` and a receive budget of at least
+`MAX_DTLS_SCTP_RECORD_BYTES`. Its receive queue capacity must be between
+`MIN_DTLS_SCTP_RECEIVE_QUEUE_MESSAGES` (32) and
+`MAX_DTLS_SCTP_RECEIVE_QUEUE_MESSAGES` (4,096), inclusive. It rejects a
+non-pristine SCTP-AUTH state instead of trying to adopt an association whose
+key history it cannot prove. The live kernel loopback qualification test is
+opt-in because it requires host kernel SCTP, SCTP-AUTH, and sender-dry
+support; deterministic adapter and protocol tests run on every supported
+build host.
+
+The original sequential connection methods remain available for capability
+setup and narrow integrations. Long-lived use should consume a negotiated
+TLS/TCP or DTLS/SCTP connection into the bounded runtime instead of wrapping
+that handle in an external mutex. The SDK owns transport framing,
+cryptographic sequencing, exact peer authentication, readiness evidence,
+bounded full-duplex I/O, and fail-closed retirement. Products still own peer
+topology, listener/reconnect policy, external IPsec attestation, and Diameter
+application state.
 
 ## Verification
 
@@ -116,4 +184,5 @@ DTLS/SCTP/PPID-47 transport is implemented and qualified.
 cargo test -p opc-diameter-transport
 cargo clippy -p opc-diameter-transport --all-targets --all-features -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc -p opc-diameter-transport --no-deps --all-features
+python3 scripts/check-vendored-dimpl.py
 ```

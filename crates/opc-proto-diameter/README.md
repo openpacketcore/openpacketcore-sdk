@@ -191,9 +191,10 @@ This boundary does not open sockets, perform TLS/TCP or DTLS/SCTP framing,
 select a crypto provider, validate certificates, or rotate credentials. The
 caller's attestation is a typed assertion after those transport-owned checks;
 it is not itself cryptographic proof. The sibling `opc-diameter-transport`
-crate implements the scoped TLS/TCP adapter and exposes the transport-neutral
-simultaneous-open winner-election decision; this codec crate remains
-transport-neutral, and neither crate currently implements DTLS/SCTP.
+crate implements mutually authenticated TLS/TCP and RFC 6083 DTLS/SCTP
+connectors, acceptors, direct and in-band sequencing, rotation, and the bounded
+full-duplex runtime. It also exposes the transport-neutral simultaneous-open
+winner-election decision. This codec crate remains transport-neutral.
 
 ## Loss-safe pending-request failover transactions
 
