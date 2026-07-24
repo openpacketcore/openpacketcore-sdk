@@ -440,7 +440,10 @@ caller policy.
   `SwmRequestedSupportedFeatures::swm_discovery()` emits SWm list identity
   `(10415, 1)` with value zero and request M clear. Correlation requires exact
   `DIAMETER_SUCCESS` before a DEA can authorize mobility, accepts the TS
-  collective PMIP6/GTPv2 selection, and rejects unoffered non-NBM bits.
+  collective PMIP6/GTPv2 selection, and rejects unoffered non-NBM bits. A
+  success DEA may omit the offered vector — RFC 5447 never requires the
+  answer to echo the offer — in which case no AAA-derived selection is
+  recorded and the trusted locally configured mobility mode stays effective.
   EAP-Payload and EAP-Reissued-Payload expose explicit `project_*_aka`
   accessors backed by the canonical `opc-proto-eap` parser. DER, raw DEA, and
   authenticated transaction-correlated DEA surfaces return the same bounded,
