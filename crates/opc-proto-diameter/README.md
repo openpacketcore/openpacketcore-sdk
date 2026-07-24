@@ -1303,6 +1303,71 @@ RFC result codes where its presence is a MUST while retaining the inner value
 opaque, because RFC 6733 permits synthesized and malformed offending AVP
 representations.
 
+### SWm authorization-session state
+
+An ordinary DEA can carry opaque RFC 6733 `Class` state plus
+`Session-Binding` and `Session-Server-Failover`. The raw answer surface exposes
+only presence and bounded metadata. Actionable state is available after the
+response has been authenticated and correlated to its exact DER:
+
+```rust
+use opc_proto_diameter::apps::swm::{
+    SwmAuthorizationSessionRouting, SwmClassAvps,
+    SwmCorrelatedDiameterEapResponse, SwmSessionStateError,
+    SwmSessionTerminationRequest,
+};
+
+fn retain_authorization_state(
+    response: &SwmCorrelatedDiameterEapResponse,
+    classes: &mut Option<SwmClassAvps>,
+) -> Option<SwmAuthorizationSessionRouting> {
+    response.class_avp_update().apply_to(classes);
+    response.authorization_session_routing()
+}
+
+fn prepare_str(
+    routing: &SwmAuthorizationSessionRouting,
+    classes: Option<&SwmClassAvps>,
+    request: &mut SwmSessionTerminationRequest,
+) -> Result<(), SwmSessionStateError> {
+    routing.apply_to_session_termination_request(request)?;
+    if let Some(classes) = classes {
+        classes.clone_into_session_termination_request(request)?;
+    }
+    Ok(())
+}
+```
+
+`SwmClassAvpUpdate::Unchanged` represents an answer with no Class occurrence;
+it never erases prior consumer-owned state. One or more occurrences produce
+`Replace`, including an occurrence with an empty value. Correlated RAA and AAA
+exchanges expose the same explicit replacement operation for later
+authorization updates. `SwmClassAvps` caps one session at 128 occurrences and
+4096 aggregate value octets, preserves order and canonical headers, and
+supports clone or move replacement into typed RAR and STR requests without
+exposing opaque values through diagnostics.
+
+The routing projection owns the correlated DEA's final Origin-Host and
+Origin-Realm, not a DRA or transport peer identity. An absent Session-Binding
+requires STR `Destination-Host`; the STR bit can instead prohibit it. An
+absent Session-Server-Failover is effective `REFUSE_SERVICE`.
+`remove_destination_host_after_session_termination_delivery_failure` succeeds
+only for `TRY_AGAIN` and `TRY_AGAIN_ALLOW_SERVICE`; it rejects
+`REFUSE_SERVICE`, `ALLOW_SERVICE`, absence, and session mismatch without
+mutating the request. Session-Server-Failover is a mandatory-bit Enumerated
+AVP: all four values assigned by RFC 6733 section 8.18 are typed, while an
+unassigned value fails closed during decode and cannot enter retained routing
+state. Peer selection, retry attempt state and deadlines, active-session
+storage, and teardown remain consumer-owned.
+
+RFC 6733 section 8.18 permits Session-Server-Failover only when
+Session-Binding is absent or at least one of its three defined bits is zero.
+Decode, originated setters, and encode/correlation checks reject the
+contradictory all-three-bits-set pair atomically. Unknown extra binding bits
+remain retained and do not alter that defined-bit check. Both directives are
+DEA-only in the SWm command dictionary and are rejected on DER, RAR/RAA,
+AAR/AAA, ASR/ASA, and STR/STA.
+
 ### SWm Session-Termination
 
 An ePDG creates an outbound STR by consuming one affine End-to-End identity

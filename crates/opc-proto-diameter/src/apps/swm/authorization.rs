@@ -43,7 +43,7 @@ const MAX_PROXY_INFOS: usize = 128;
 const MAX_ADDITIONAL_AVPS: usize = 128;
 const RESULT_CODE_REDIRECT_INDICATION: u32 = 3006;
 
-static RE_AUTH_REQUEST_AVP_RULES: [CommandAvpRule; 31] = [
+static RE_AUTH_REQUEST_AVP_RULES: [CommandAvpRule; 33] = [
     singleton(base::AVP_SESSION_ID),
     singleton(base::AVP_ORIGIN_HOST),
     singleton(base::AVP_ORIGIN_REALM),
@@ -58,6 +58,8 @@ static RE_AUTH_REQUEST_AVP_RULES: [CommandAvpRule; 31] = [
     singleton(super::AVP_STATE),
     singleton(super::AVP_REPLY_MESSAGE),
     repeatable(base::AVP_CLASS),
+    forbidden(base::AVP_SESSION_BINDING),
+    forbidden(base::AVP_SESSION_SERVER_FAILOVER),
     repeatable(base::AVP_PROXY_INFO),
     repeatable(base::AVP_ROUTE_RECORD),
     forbidden(base::AVP_RESULT_CODE),
@@ -77,7 +79,7 @@ static RE_AUTH_REQUEST_AVP_RULES: [CommandAvpRule; 31] = [
     forbidden(AVP_LOAD),
 ];
 
-static RE_AUTH_ANSWER_AVP_RULES: [CommandAvpRule; 30] = [
+static RE_AUTH_ANSWER_AVP_RULES: [CommandAvpRule; 32] = [
     singleton(base::AVP_SESSION_ID),
     singleton(base::AVP_RESULT_CODE),
     singleton(base::AVP_ORIGIN_HOST),
@@ -97,6 +99,8 @@ static RE_AUTH_ANSWER_AVP_RULES: [CommandAvpRule; 30] = [
     repeatable(AVP_LOAD),
     repeatable(base::AVP_FAILED_AVP),
     repeatable(base::AVP_CLASS),
+    forbidden(base::AVP_SESSION_BINDING),
+    forbidden(base::AVP_SESSION_SERVER_FAILOVER),
     repeatable(base::AVP_PROXY_INFO),
     forbidden(base::AVP_DESTINATION_REALM),
     forbidden(base::AVP_DESTINATION_HOST),
@@ -110,7 +114,7 @@ static RE_AUTH_ANSWER_AVP_RULES: [CommandAvpRule; 30] = [
     forbidden(base::AVP_TERMINATION_CAUSE),
 ];
 
-static AA_REQUEST_AVP_RULES: [CommandAvpRule; 35] = [
+static AA_REQUEST_AVP_RULES: [CommandAvpRule; 37] = [
     singleton(base::AVP_SESSION_ID),
     singleton(base::AVP_AUTH_APPLICATION_ID),
     singleton(base::AVP_ORIGIN_HOST),
@@ -136,6 +140,8 @@ static AA_REQUEST_AVP_RULES: [CommandAvpRule; 35] = [
         AvpCardinality::ZeroOrOne,
     ),
     forbidden(base::AVP_CLASS),
+    forbidden(base::AVP_SESSION_BINDING),
+    forbidden(base::AVP_SESSION_SERVER_FAILOVER),
     repeatable(base::AVP_PROXY_INFO),
     repeatable(base::AVP_ROUTE_RECORD),
     forbidden(base::AVP_RESULT_CODE),
@@ -160,7 +166,7 @@ static AA_REQUEST_AVP_RULES: [CommandAvpRule; 35] = [
     ),
 ];
 
-static AA_ANSWER_AVP_RULES: [CommandAvpRule; 36] = [
+static AA_ANSWER_AVP_RULES: [CommandAvpRule; 38] = [
     singleton(base::AVP_SESSION_ID),
     singleton(base::AVP_AUTH_APPLICATION_ID),
     singleton(AVP_AUTH_REQUEST_TYPE),
@@ -187,6 +193,8 @@ static AA_ANSWER_AVP_RULES: [CommandAvpRule; 36] = [
         AvpCardinality::ZeroOrOne,
     ),
     repeatable(base::AVP_CLASS),
+    forbidden(base::AVP_SESSION_BINDING),
+    forbidden(base::AVP_SESSION_SERVER_FAILOVER),
     repeatable(base::AVP_PROXY_INFO),
     forbidden(base::AVP_DESTINATION_REALM),
     forbidden(base::AVP_DESTINATION_HOST),
@@ -1027,6 +1035,20 @@ impl SwmCorrelatedReAuthExchange {
         self.answer.answer()
     }
 
+    /// Return the explicit RFC 6733 Class replacement from this RAA.
+    ///
+    /// An ordinary answer containing Class returns `Replace`; an ordinary
+    /// answer without Class or a generic E-bit answer returns `Unchanged`.
+    pub fn class_avp_update(
+        &self,
+    ) -> Result<super::SwmClassAvpUpdate, super::SwmSessionStateError> {
+        if self.answer.generic_error {
+            Ok(super::SwmClassAvpUpdate::Unchanged)
+        } else {
+            super::SwmClassAvpUpdate::from_additional_avps(&self.answer.answer.additional_avps)
+        }
+    }
+
     /// Return the identifiers shared by the exchange.
     #[must_use]
     pub const fn transaction(&self) -> SwmDiameterTransaction {
@@ -1307,6 +1329,20 @@ impl SwmCorrelatedAuthorizationExchange {
     #[must_use]
     pub const fn answer(&self) -> &SwmAuthorizationAnswer {
         self.answer.answer()
+    }
+
+    /// Return the explicit RFC 6733 Class replacement from this AAA.
+    ///
+    /// An ordinary answer containing Class returns `Replace`; an ordinary
+    /// answer without Class or a generic E-bit answer returns `Unchanged`.
+    pub fn class_avp_update(
+        &self,
+    ) -> Result<super::SwmClassAvpUpdate, super::SwmSessionStateError> {
+        if self.answer.generic_error {
+            Ok(super::SwmClassAvpUpdate::Unchanged)
+        } else {
+            super::SwmClassAvpUpdate::from_additional_avps(&self.answer.answer.additional_avps)
+        }
     }
 
     /// Borrow the complete AAA APN authorization only after strict correlation.
@@ -2649,6 +2685,10 @@ fn parse_re_auth_answer_parts(
             Ok(())
         },
     )?;
+    super::session_state::validate_class_additional_avps_for_decode(
+        &additional_avps,
+        DIAMETER_HEADER_LEN,
+    )?;
     let result_code =
         require_answer_field(result_code, "SWm RAA requires Result-Code", "7.2.2.4.2")?;
     validate_result_code_decode(result_code, "7.2.2.4.2")?;
@@ -3090,6 +3130,10 @@ fn parse_authorization_answer_parts(
             }
             Ok(())
         },
+    )?;
+    super::session_state::validate_class_additional_avps_for_decode(
+        &additional_avps,
+        DIAMETER_HEADER_LEN,
     )?;
     let generic_error = message.header.flags.is_error();
     if !generic_error && auth_application_id.is_none() {
@@ -3997,6 +4041,7 @@ fn validate_additional_for_encode(
             role.section(),
         ));
     }
+    super::session_state::validate_class_additional_avps_for_encode(avps)?;
     let mut seen = HashSet::new();
     for avp in avps {
         let key = avp.header().key();

@@ -30,6 +30,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Hop-by-Hop and setting T (#394).
 
 ### Changed
+- **SWm authorization-session state projection — `opc-proto-diameter`:**
+  ordinary correlated DEA responses now expose bounded, opaque RFC 6733
+  `Class` replacement state plus Session-Binding and
+  Session-Server-Failover routing directives. Class values retain canonical
+  headers, order, zero-length occurrences, and raw bytes behind redacted typed
+  clone/move transfer into RAR and STR requests; later correlated RAA/AAA
+  answers explicitly distinguish replacement from absence. Correlated routing
+  owns the final authorizing Origin pair, applies the STR Destination-Host
+  requirement to the exact Session-Id, and permits host removal after delivery
+  failure only for the two TRY_AGAIN directives. RFC 6733 §8.18 contradictory
+  binding/failover pairs, unassigned failover values, and non-DEA placement
+  fail closed. Unassigned mandatory-bit Enumerated values cannot enter retained
+  typed state; session storage, routing, retries, and teardown remain
+  consumer-owned (#389, #390).
 - **Directional initial IKEv2 Child-SA NAT-T mapping — `opc-ipsec-xfrm`:**
   adds source-compatible build options that validate exact inbound and
   outbound RFC 3948 ESP-in-UDP templates before projecting them into XFRM SA
