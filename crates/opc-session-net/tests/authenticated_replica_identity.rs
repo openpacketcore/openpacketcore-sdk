@@ -29,7 +29,7 @@ use opc_session_store::{
 };
 use opc_tls::{
     AuthenticatedClientConfig, AuthenticatedServerConfig, TlsConfigBuilder,
-    TlsMaterialAvailability, TlsMaterialEpoch,
+    TlsMaterialAvailability, TlsMaterialEpoch, TlsMaterialReloadReason, TlsMaterialStatus,
 };
 use opc_types::{NetworkFunctionKind, TenantId};
 
@@ -1427,6 +1427,574 @@ async fn continuous_real_mtls_traffic_survives_trust_rotation_and_rejects_remove
         .expect("old server rejection task must finish within the transport bound")
         .expect("old server rejection task");
     handle.abort_and_wait().await;
+}
+
+struct ActiveRotationTraffic {
+    stop: Arc<AtomicBool>,
+    outcome: Arc<RotationTrafficOutcome>,
+    counted: Arc<RotationTrafficBackend>,
+    watch_target_tx: tokio::sync::watch::Sender<Option<u64>>,
+    get_task: tokio::task::JoinHandle<()>,
+    cas_task: tokio::task::JoinHandle<()>,
+    lease_task: tokio::task::JoinHandle<()>,
+    batch_task: tokio::task::JoinHandle<()>,
+    watch_task: tokio::task::JoinHandle<Vec<u64>>,
+}
+
+impl ActiveRotationTraffic {
+    async fn start(backend: &RemoteSessionBackend, counted: Arc<RotationTrafficBackend>) -> Self {
+        let cas_key = rotation_key("cas", 0);
+        let cas_owner = OwnerId::new("rotation-cas-owner").expect("CAS owner");
+        let cas_lease = backend
+            .acquire(&cas_key, cas_owner, Duration::from_secs(300))
+            .await
+            .expect("initial CAS lease");
+        let batch_key = rotation_key("batch", 0);
+        let batch_owner = OwnerId::new("rotation-batch-owner").expect("batch owner");
+        let batch_lease = backend
+            .acquire(&batch_key, batch_owner, Duration::from_secs(300))
+            .await
+            .expect("initial batch lease");
+        assert_eq!(
+            backend
+                .compare_and_set(CompareAndSet {
+                    key: batch_key.clone(),
+                    lease: batch_lease.clone(),
+                    expected_generation: None,
+                    new_record: rotation_record(batch_key.clone(), &batch_lease, 1),
+                })
+                .await,
+            Ok(CompareAndSetResult::Success),
+            "seed the record refreshed by continuous batch traffic"
+        );
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let outcome = Arc::new(RotationTrafficOutcome::default());
+        let get_task = tokio::spawn({
+            let backend = backend.clone();
+            let key = cas_key.clone();
+            let stop = stop.clone();
+            let outcome = outcome.clone();
+            async move {
+                while !stop.load(Ordering::Acquire) {
+                    if backend.get(&key).await.is_err() {
+                        outcome.fail("get");
+                        return;
+                    }
+                    outcome.get.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            }
+        });
+        let cas_task = tokio::spawn({
+            let backend = backend.clone();
+            let key = cas_key.clone();
+            let lease = cas_lease.clone();
+            let stop = stop.clone();
+            let outcome = outcome.clone();
+            async move {
+                let mut expected_generation = None;
+                let mut generation = 1_u64;
+                while !stop.load(Ordering::Acquire) {
+                    let result = backend
+                        .compare_and_set(CompareAndSet {
+                            key: key.clone(),
+                            lease: lease.clone(),
+                            expected_generation,
+                            new_record: rotation_record(key.clone(), &lease, generation),
+                        })
+                        .await;
+                    if !matches!(result, Ok(CompareAndSetResult::Success)) {
+                        outcome.fail("compare_and_set");
+                        return;
+                    }
+                    outcome.compare_and_set.fetch_add(1, Ordering::SeqCst);
+                    expected_generation = Some(Generation::new(generation));
+                    generation = generation.checked_add(1).expect("bounded CAS generation");
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            }
+        });
+        let lease_task = tokio::spawn({
+            let backend = backend.clone();
+            let stop = stop.clone();
+            let outcome = outcome.clone();
+            async move {
+                let mut index = 0_usize;
+                while !stop.load(Ordering::Acquire) {
+                    let key = rotation_key("lease", index);
+                    let owner =
+                        OwnerId::new(format!("rotation-lease-owner-{index}")).expect("lease owner");
+                    let Ok(lease) = backend.acquire(&key, owner, Duration::from_secs(300)).await
+                    else {
+                        outcome.fail("acquire");
+                        return;
+                    };
+                    let Ok(renewed) = backend.renew(&lease, Duration::from_secs(300)).await else {
+                        outcome.fail("renew");
+                        return;
+                    };
+                    if backend.release(renewed).await.is_err() {
+                        outcome.fail("release");
+                        return;
+                    }
+                    outcome.lease_cycle.fetch_add(1, Ordering::SeqCst);
+                    index = index.checked_add(1).expect("bounded lease index");
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            }
+        });
+        let batch_task = tokio::spawn({
+            let backend = backend.clone();
+            let key = batch_key.clone();
+            let lease = batch_lease.clone();
+            let stop = stop.clone();
+            let outcome = outcome.clone();
+            async move {
+                while !stop.load(Ordering::Acquire) {
+                    let result = backend
+                        .batch(vec![
+                            SessionOp::Get { key: key.clone() },
+                            SessionOp::RefreshTtl {
+                                lease: lease.clone(),
+                                ttl: Duration::from_secs(300),
+                            },
+                        ])
+                        .await;
+                    if !matches!(
+                        result.as_deref(),
+                        Ok([
+                            SessionOpResult::Get(Ok(_)),
+                            SessionOpResult::RefreshTtl(Ok(()))
+                        ])
+                    ) {
+                        outcome.fail("batch");
+                        return;
+                    }
+                    outcome.batch.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            }
+        });
+        let (watch_target_tx, mut watch_target_rx) = tokio::sync::watch::channel(None::<u64>);
+        let watch_task = tokio::spawn({
+            let backend = backend.clone();
+            let outcome = outcome.clone();
+            async move {
+                let Ok(mut stream) = backend.watch(1).await else {
+                    outcome.fail("watch_setup");
+                    return Vec::new();
+                };
+                let mut expected = 1_u64;
+                let mut sequences = Vec::new();
+                loop {
+                    tokio::select! {
+                        changed = watch_target_rx.changed() => {
+                            if changed.is_err() {
+                                outcome.fail("watch_target");
+                                return sequences;
+                            }
+                        }
+                        item = stream.next() => {
+                            let Some(Ok(entry)) = item else {
+                                outcome.fail("watch_stream");
+                                return sequences;
+                            };
+                            if entry.sequence != expected {
+                                outcome.fail("watch_sequence");
+                                return sequences;
+                            }
+                            sequences.push(entry.sequence);
+                            outcome.watch.fetch_add(1, Ordering::SeqCst);
+                            expected = expected.checked_add(1).expect("bounded watch sequence");
+                        }
+                    }
+                    if watch_target_rx
+                        .borrow()
+                        .is_some_and(|target| sequences.last().copied() == Some(target))
+                    {
+                        return sequences;
+                    }
+                }
+            }
+        });
+        Self {
+            stop,
+            outcome,
+            counted,
+            watch_target_tx,
+            get_task,
+            cas_task,
+            lease_task,
+            batch_task,
+            watch_task,
+        }
+    }
+
+    async fn assert_progress(&self) {
+        let baseline = self.outcome.snapshot();
+        wait_for_rotation_traffic_after(&self.outcome, baseline).await;
+    }
+
+    async fn finish(self) -> Vec<u64> {
+        self.stop.store(true, Ordering::Release);
+        for task in [
+            self.get_task,
+            self.cas_task,
+            self.lease_task,
+            self.batch_task,
+        ] {
+            tokio::time::timeout(ROTATION_CLEANUP_DEADLINE, task)
+                .await
+                .expect("traffic task must stop within the cleanup scheduling margin")
+                .expect("traffic task join");
+        }
+        self.outcome.assert_no_failures();
+        let final_sequence = self
+            .counted
+            .inner
+            .max_replication_sequence()
+            .await
+            .expect("final replication head");
+        self.watch_target_tx.send_replace(Some(final_sequence));
+        let sequences = tokio::time::timeout(ROTATION_CLEANUP_DEADLINE, self.watch_task)
+            .await
+            .expect("watch must reach the final successor within its cleanup-only margin")
+            .expect("watch task join");
+        self.outcome.assert_no_failures();
+        assert_eq!(
+            sequences,
+            (1..=final_sequence).collect::<Vec<_>>(),
+            "watch continuity must be gap-free and duplicate-free through every retirement"
+        );
+        sequences
+    }
+}
+
+struct IndependentRotationSetup {
+    pki: TestPki,
+    handle: opc_session_net::server::ServerHandle,
+    backend: RemoteSessionBackend,
+    counted: Arc<RotationTrafficBackend>,
+    client_tx: tokio::sync::watch::Sender<Option<opc_identity::IdentityState>>,
+    server_tx: tokio::sync::watch::Sender<Option<opc_identity::IdentityState>>,
+    client_config: AuthenticatedClientConfig,
+    server_config: AuthenticatedServerConfig,
+    resolve_calls: Arc<AtomicUsize>,
+}
+
+async fn start_independent_rotation(cluster: &str, generation: &str) -> IndependentRotationSetup {
+    let pki = TestPki::new();
+    let trust = [pki.ca.as_ref()];
+    let validity = time::Duration::days(1);
+    let (client_tx, client_rx) = tokio::sync::watch::channel(Some(
+        pki.identity_state_with_trust_and_validity(1, &trust, validity),
+    ));
+    let (server_tx, server_rx) = tokio::sync::watch::channel(Some(
+        pki.identity_state_with_trust_and_validity(SERVER_REPLICA, &trust, validity),
+    ));
+    let client_config = TlsConfigBuilder::new(client_rx)
+        .allow_any_trusted_peer()
+        .build_authenticated_client_config()
+        .expect("rotating client config");
+    let server_config = TlsConfigBuilder::new(server_rx)
+        .allow_any_trusted_peer()
+        .build_authenticated_server_config()
+        .expect("rotating server config");
+    let manifest = manifest(cluster, generation);
+    let binding = manifest
+        .bind_local(replica_id(SERVER_REPLICA))
+        .expect("server binding");
+    let reauthentication = SessionReauthenticationControl::new();
+    let counted = Arc::new(RotationTrafficBackend::new());
+    let server = SessionReplicationServer::new(counted.clone(), server_config.clone(), binding)
+        .with_connection_lifecycle(lifecycle_policy())
+        .with_reauthentication_control(reauthentication.clone());
+    let (handle, addr) = server
+        .listen("127.0.0.1:0".parse().expect("listen address"))
+        .await
+        .expect("rotation listener");
+    let resolve_calls = Arc::new(AtomicUsize::new(0));
+    let counted_resolver: RemoteAddrResolver = {
+        let resolve_calls = Arc::clone(&resolve_calls);
+        Arc::new(move || {
+            resolve_calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move { Ok(addr) })
+        })
+    };
+    let backend = RemoteSessionBackend::new_with_resolver(
+        manifest
+            .bind_local(replica_id(1))
+            .expect("rotation client binding")
+            .bind_remote(replica_id(SERVER_REPLICA))
+            .expect("rotation server binding"),
+        counted_resolver,
+        client_config.clone(),
+        Some(ROTATION_OPERATION_DEADLINE),
+    )
+    .with_connection_lifecycle(lifecycle_policy())
+    .with_reauthentication_control(reauthentication);
+    IndependentRotationSetup {
+        pki,
+        handle,
+        backend,
+        counted,
+        client_tx,
+        server_tx,
+        client_config,
+        server_config,
+        resolve_calls,
+    }
+}
+
+async fn wait_for_resolver_calls(calls: &AtomicUsize, minimum: usize) {
+    tokio::time::timeout(ROTATION_OPERATION_DEADLINE, async {
+        loop {
+            if calls.load(Ordering::SeqCst) >= minimum {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("rotation must recycle the pooled and watch connections within the operation bound");
+}
+
+async fn wait_for_material_rejection(
+    status: impl Fn() -> TlsMaterialStatus,
+    epoch: TlsMaterialEpoch,
+    reason: TlsMaterialReloadReason,
+) -> TlsMaterialStatus {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let current = status();
+            if current.epoch() == epoch
+                && current.availability() == TlsMaterialAvailability::RetainingLastGood
+                && current.reason() == Some(reason)
+            {
+                return current;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a rejected reload must retain the last known-good material")
+}
+
+fn assert_status_redaction_safe(status: TlsMaterialStatus) {
+    let debug = format!("{status:?}");
+    assert!(
+        !debug.contains("spiffe://"),
+        "material status leaks workload identity: {debug}"
+    );
+    assert!(
+        !debug.contains("BEGIN"),
+        "material status leaks certificate material: {debug}"
+    );
+}
+
+#[tokio::test]
+async fn independent_client_and_server_leaf_rotation_preserves_active_requests_and_watch() {
+    let setup = start_independent_rotation(
+        "cluster-independent-leaf-rotation",
+        "generation-independent-leaf",
+    )
+    .await;
+    let trust = [setup.pki.ca.as_ref()];
+    let validity = time::Duration::days(1);
+    let traffic = ActiveRotationTraffic::start(&setup.backend, setup.counted.clone()).await;
+    traffic.assert_progress().await;
+    assert_eq!(
+        setup.resolve_calls.load(Ordering::SeqCst),
+        2,
+        "baseline traffic must stage exactly one request lane and one watch lane"
+    );
+
+    // Rotate only the client leaf/key under the unchanged issuer. The server
+    // material never advances, so every redial is the client's own bounded
+    // drain of connections admitted under the superseded leaf.
+    let client_epoch = setup.client_config.material_status().epoch();
+    setup.client_tx.send_replace(Some(
+        setup
+            .pki
+            .identity_state_with_trust_and_validity(1, &trust, validity),
+    ));
+    wait_for_material_epoch_change(|| setup.client_config.material_status(), client_epoch).await;
+    traffic.assert_progress().await;
+    wait_for_resolver_calls(&setup.resolve_calls, 4).await;
+
+    // Rotate only the server leaf/key. The client material never advances, so
+    // the server-side retirement must prove no-dispatch to in-flight callers
+    // and both client lanes must redial and renegotiate.
+    let server_epoch = setup.server_config.material_status().epoch();
+    setup
+        .server_tx
+        .send_replace(Some(setup.pki.identity_state_with_trust_and_validity(
+            SERVER_REPLICA,
+            &trust,
+            validity,
+        )));
+    wait_for_material_epoch_change(|| setup.server_config.material_status(), server_epoch).await;
+    traffic.assert_progress().await;
+    wait_for_resolver_calls(&setup.resolve_calls, 6).await;
+
+    // Membership proofs survive both independent rotations across the DNS
+    // routing alias: the dialed address is loopback while the manifest
+    // endpoint stays the canonical replica hostname.
+    let binding = setup
+        .backend
+        .peer_binding()
+        .expect("authenticated peer binding after independent rotations");
+    assert_eq!(binding.local_replica_id(), &replica_id(1));
+    assert_eq!(binding.remote_replica_id(), &replica_id(SERVER_REPLICA));
+
+    traffic.finish().await;
+    setup.handle.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn rejected_reloads_retain_last_good_material_and_never_interrupt_traffic() {
+    let setup = start_independent_rotation("cluster-rejected-reloads", "generation-rejected").await;
+    let trust = [setup.pki.ca.as_ref()];
+    let validity = time::Duration::days(1);
+    let traffic = ActiveRotationTraffic::start(&setup.backend, setup.counted.clone()).await;
+    traffic.assert_progress().await;
+    assert_eq!(setup.resolve_calls.load(Ordering::SeqCst), 2);
+
+    // A mismatched reload changes the pinned local SPIFFE identity.
+    let client_epoch = setup.client_config.material_status().epoch();
+    setup.client_tx.send_replace(Some(
+        setup
+            .pki
+            .identity_state_with_trust_and_validity(3, &trust, validity),
+    ));
+    assert_status_redaction_safe(
+        wait_for_material_rejection(
+            || setup.client_config.material_status(),
+            client_epoch,
+            TlsMaterialReloadReason::LocalIdentityChanged,
+        )
+        .await,
+    );
+    traffic.assert_progress().await;
+    assert_eq!(
+        setup.resolve_calls.load(Ordering::SeqCst),
+        2,
+        "a rejected client reload must not drain or recycle any connection"
+    );
+
+    // An incomplete reload carries no material at all.
+    setup.client_tx.send_replace(None);
+    assert_status_redaction_safe(
+        wait_for_material_rejection(
+            || setup.client_config.material_status(),
+            client_epoch,
+            TlsMaterialReloadReason::MaterialUnavailable,
+        )
+        .await,
+    );
+    traffic.assert_progress().await;
+
+    // An oversized reload exceeds the fixed trust-bundle count bound.
+    setup
+        .client_tx
+        .send_replace(Some(oversized_bundle_identity_state(&setup.pki)));
+    assert_status_redaction_safe(
+        wait_for_material_rejection(
+            || setup.client_config.material_status(),
+            client_epoch,
+            TlsMaterialReloadReason::MaterialLimitExceeded,
+        )
+        .await,
+    );
+    traffic.assert_progress().await;
+    assert_eq!(setup.resolve_calls.load(Ordering::SeqCst), 2);
+
+    // The listener applies the same discipline to its own reloads.
+    let server_epoch = setup.server_config.material_status().epoch();
+    setup.server_tx.send_replace(Some(
+        setup
+            .pki
+            .identity_state_with_trust_and_validity(3, &trust, validity),
+    ));
+    assert_status_redaction_safe(
+        wait_for_material_rejection(
+            || setup.server_config.material_status(),
+            server_epoch,
+            TlsMaterialReloadReason::LocalIdentityChanged,
+        )
+        .await,
+    );
+    setup.server_tx.send_replace(None);
+    assert_status_redaction_safe(
+        wait_for_material_rejection(
+            || setup.server_config.material_status(),
+            server_epoch,
+            TlsMaterialReloadReason::MaterialUnavailable,
+        )
+        .await,
+    );
+    traffic.assert_progress().await;
+    assert_eq!(
+        setup.resolve_calls.load(Ordering::SeqCst),
+        2,
+        "rejected server reloads must not drain or recycle any connection"
+    );
+
+    // A later coherent reload still rotates: last-known-good retention never
+    // latches the controller into a rejected state.
+    setup.client_tx.send_replace(Some(
+        setup
+            .pki
+            .identity_state_with_trust_and_validity(1, &trust, validity),
+    ));
+    setup
+        .server_tx
+        .send_replace(Some(setup.pki.identity_state_with_trust_and_validity(
+            SERVER_REPLICA,
+            &trust,
+            validity,
+        )));
+    wait_for_material_epoch_change(|| setup.client_config.material_status(), client_epoch).await;
+    wait_for_material_epoch_change(|| setup.server_config.material_status(), server_epoch).await;
+    traffic.assert_progress().await;
+    // Both lanes must recycle at least once; a client redial admitted under
+    // the already-advanced server epoch is not retired a second time.
+    wait_for_resolver_calls(&setup.resolve_calls, 4).await;
+
+    traffic.finish().await;
+    setup.handle.abort_and_wait().await;
+}
+
+fn oversized_bundle_identity_state(pki: &TestPki) -> opc_identity::IdentityState {
+    let mut params = rcgen::CertificateParams::default();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "replica-1");
+    params.subject_alt_names.push(rcgen::SanType::URI(
+        rcgen::string::Ia5String::try_from(replica_spiffe(1)).expect("SPIFFE URI"),
+    ));
+    let now = time::OffsetDateTime::now_utc();
+    params.not_before = now - time::Duration::days(1);
+    params.not_after = now + time::Duration::days(1);
+    let key = rcgen::KeyPair::generate().expect("leaf key");
+    let cert = params.signed_by(&key, &pki.ca).expect("leaf certificate");
+    let certs = parse_certs_pem(&(cert.pem() + &pki.ca.pem())).expect("certificate PEM");
+    let private_key = parse_key_pem(&key.serialize_pem()).expect("private key PEM");
+    let mut trust_bundles = opc_identity::TrustBundleSet::new();
+    trust_bundles.insert(TrustBundle {
+        trust_domain: opc_identity::TrustDomain::new("test-domain").expect("trust domain"),
+        certificates: parse_certs_pem(&pki.ca.pem()).expect("CA PEM"),
+    });
+    for index in 0..opc_tls::MAX_TLS_MATERIAL_TRUST_BUNDLES {
+        let trust_domain =
+            opc_identity::TrustDomain::new(format!("unused-{index}.test")).expect("unused domain");
+        trust_bundles.insert(TrustBundle {
+            trust_domain,
+            certificates: parse_certs_pem(&pki.ca.pem()).expect("CA PEM"),
+        });
+    }
+    build_identity_state(certs, private_key, trust_bundles).expect("identity state")
 }
 
 #[tokio::test]

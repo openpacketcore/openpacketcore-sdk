@@ -8,6 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Independent leaf-rotation and rejected-reload evidence — `opc-session-net`:**
+  extends the seamless credential-rotation qualification for #158 with
+  deterministic in-process mTLS cases. Continuous get/CAS/lease/batch requests
+  and a gap-checked watch stream now survive rotating the client leaf and the
+  server leaf independently under one unchanged issuer, with bounded
+  request/watch-lane recycling and intact canonical-SPIFFE manifest membership
+  proofs across DNS routing aliases after each one-sided rotation. A separate
+  case publishes identity-mismatched, empty, and over-limit reloads to each
+  side under the same traffic and proves last-known-good retention with closed,
+  redaction-safe status reasons, no connection drain, and a later coherent
+  reload still rotating. On the consensus transport, a server-only material
+  epoch retires the listener's accepted lanes and replaces both cached lanes
+  exactly once; a call assigned to a stale lane fails once with the typed
+  no-replay outcome before its retried replacement repeats the complete
+  mutual-TLS and contract-profile negotiation (#158).
 - **Initiator Child-SA rekey response boundary — `opc-proto-ikev2`:**
   composes the existing request-build representation into a retained,
   once-only RFC 7296 response boundary. It correlates the exact old IKE SPI
@@ -29,6 +44,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   partial-success, or replayed terminal responses fail with redaction-safe
   stable diagnostics. Retransmission, collision policy, key/SPI allocation,
   installation, and old-SA retirement remain product-owned (#520).
+=======
+- **Independent leaf-rotation and rejected-reload evidence — `opc-session-net`:**
+  extends the seamless credential-rotation qualification for #158 with
+  deterministic in-process mTLS cases. Continuous get/CAS/lease/batch requests
+  and a gap-checked watch stream now survive rotating the client leaf and the
+  server leaf independently under one unchanged issuer, with bounded
+  request/watch-lane recycling and intact canonical-SPIFFE manifest membership
+  proofs across DNS routing aliases after each one-sided rotation. A separate
+  case publishes identity-mismatched, empty, and over-limit reloads to each
+  side under the same traffic and proves last-known-good retention with closed,
+  redaction-safe status reasons, no connection drain, and a later coherent
+  reload still rotating. On the consensus transport, a server-only material
+  epoch retires the listener's accepted lanes and replaces both cached lanes
+  exactly once; a call assigned to a stale lane fails once with the typed
+  no-replay outcome before its retried replacement repeats the complete
+  mutual-TLS and contract-profile negotiation (#158).
+>>>>>>> 61297f73 (test(session-net): qualify independent leaf rotation and rejected reloads)
 - **Origin-scoped Diameter End-to-End Identifier authority —
   `opc-proto-diameter`:** adds a bounded concurrency-safe RFC 6733 allocator
   with an injectable fallible wall/monotonic clock, exact four-minute
