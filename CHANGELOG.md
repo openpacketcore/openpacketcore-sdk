@@ -678,6 +678,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cannot reopen through a drain alone. The public observations retain only
   minimal typed routing facts and redact addresses, ports, SPIs, marks, and
   interface identities from diagnostics (#483).
+- **Loss-safe pending-request failover transactions — `opc-proto-diameter`:**
+  adds `transaction::PendingRequestTable`, a bounded, executor-neutral
+  pending-request primitive for RFC 6733 §5.1/§5.5.4 origin-node failover.
+  The table owns wire correctness: the first attempt uses a strictly
+  increasing, caller-seeded Hop-by-Hop partition unique on its connection with
+  T clear; every failover or restored retransmission preserves the canonical
+  request AVPs byte-for-byte, keeps the exact original End-to-End identifier
+  and Origin-Host, sets T=1, and draws a fresh Hop-by-Hop identifier unique on
+  the alternate connection. All attempt identifiers are retained so late
+  answers from either path correlate to bounded evidence without re-invoking
+  the application, and exactly one terminal completion is delivered per live
+  transaction with the terminal transition and delivery atomic in one
+  synchronous call. Typed dispositions distinguish failure before write,
+  uncertain/partial write, successful write followed by transport loss, fixed
+  `Destination-Host` with no valid alternate, retry exhaustion, and
+  indeterminate completion. A versioned, explicitly sensitive snapshot/restore
+  form (zeroizing in memory, redacted diagnostics, no plaintext backend)
+  uses exact rollback-fenced `(epoch, revision)` checkpoints, requires
+  persist-before-dispatch for every single-take attempt, retransmits restored
+  pending records with T=1, and rejects stale, uncommitted, or malformed input.
+  A fixed-width `Ready`/`Claimed`/`Acknowledged` delivery record reconciles
+  replayable outcomes before network re-arm and blocks pending-only snapshot
+  advancement until acknowledgement. Exactly-once effects still require an
+  atomic or idempotent caller-owned sink; restored delivery is at-least-once
+  otherwise. Attempt limits, deadlines, peer selection, and alternate
+  routability remain caller policy (#349).
 - **Sealed monotonic outbound ESP counter authority — `opc-ipsec-xfrm`:** a
   namespace-bound Linux actor now binds one durable operation/fence to an
   opaque exact OUT policy plus SA, performs transient constant-time key

@@ -43,6 +43,13 @@
 //! `DiameterRequestFailure::from_parser_error` to safely bind actual missing-
 //! field failures to 5005. CER `Vendor-Specific-Application-Id` mutual-
 //! exclusion failures retain exact received Auth/Acct children for typed 5009.
+//! `transaction` adds the bounded, loss-safe pending-request failover
+//! primitive (RFC 6733 §5.1/§5.5.4): per-connection Hop-by-Hop allocation,
+//! T-bit retransmission with immutable End-to-End/Origin-Host identity,
+//! cross-connection answer correlation with live at-most-once completion,
+//! and a versioned, explicitly sensitive snapshot/restore form with a stable
+//! completion token. Peer selection, deadlines, and routability remain caller
+//! policy; no plaintext persistence backend is provided.
 //!
 //! The crate is experimental and not yet an ADR 0015 conformance claim; see
 //! `CONFORMANCE.md` before treating any fixture or dictionary entry as release
@@ -75,6 +82,8 @@ pub mod error_answer;
 pub mod parser_error;
 #[cfg(feature = "peer")]
 pub mod peer;
+#[cfg(feature = "base")]
+pub mod transaction;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use opc_protocol::{
