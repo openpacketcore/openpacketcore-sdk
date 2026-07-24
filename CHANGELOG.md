@@ -667,6 +667,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   repeatedly interrupted replies remain fail-closed (#436).
 
 ### Added
+- **Authenticated Linux ESP peer observation authority —
+  `opc-ipsec-xfrm`:** adds a namespace-bound production CO-RE monitor for
+  inbound ESP-in-UDP peer-source changes. Exact GETSA admission, final
+  replay-decision and XFRM lifecycle hooks, `SO_NETNS_COOKIE` scope, explicit
+  producer-loss accounting, bounded polling/maps, and owned tracing links form
+  one fail-closed authority. Registration, authenticated rebaseline, and
+  teardown are staged and quiescent; arbitrary caller baselines are not
+  accepted, cancellation leaves publication safely resumable, and overflow
+  cannot reopen through a drain alone. The public observations retain only
+  minimal typed routing facts and redact addresses, ports, SPIs, marks, and
+  interface identities from diagnostics (#483).
 - **Sealed monotonic outbound ESP counter authority — `opc-ipsec-xfrm`:** a
   namespace-bound Linux actor now binds one durable operation/fence to an
   opaque exact OUT policy plus SA, performs transient constant-time key

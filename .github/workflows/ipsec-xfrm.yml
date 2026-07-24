@@ -101,6 +101,7 @@ jobs:
             --test xfrm_auth_only_privileged \
             --test xfrm_dscp_privileged \
             --test xfrm_namespace_bound_privileged \
+            --test xfrm_peer_observation_privileged \
             --test xfrm_relocation_privileged \
             --no-run
 
@@ -191,9 +192,27 @@ jobs:
               cargo test --locked -p opc-ipsec-xfrm --features ikev2 --test xfrm_auth_only_privileged -- --ignored --nocapture
             '
 
+      - name: Run authenticated ESP peer-observation proof
+        run: |
+          set -euo pipefail
+          export CARGO_HOME="${CARGO_HOME:-${HOME}/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-${HOME}/.rustup}"
+          export CARGO_TARGET_DIR="${RUNNER_TEMP}/xfrm-target"
+          sudo env \
+            "PATH=${PATH}" \
+            "CARGO_HOME=${CARGO_HOME}" \
+            "RUSTUP_HOME=${RUSTUP_HOME}" \
+            "CARGO_TARGET_DIR=${CARGO_TARGET_DIR}" \
+            "OPC_XFRM_RUN_PEER_OBSERVATION_PRIVILEGED=1" \
+            "OPC_XFRM_REQUIRE_PEER_OBSERVATION=1" \
+            unshare -n -- bash -euxo pipefail -c '
+              ip link set lo up
+              cargo test --locked -p opc-ipsec-xfrm --test xfrm_peer_observation_privileged -- --ignored --nocapture
+            '
+
   ebpf-object:
-    name: XFRM tc object rebuild
-    runs-on: ubuntu-latest
+    name: XFRM eBPF object rebuild
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - name: Checkout
@@ -210,13 +229,24 @@ jobs:
       - name: Install pinned bpf-linker
         run: cargo install bpf-linker --version 0.10.3 --locked
 
-      - name: Rebuild and compare program/map inventory
+      - name: Install pinned clang and LLVM object tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends clang-18 llvm-18
+
+      # Debug sections vary across checkout hosts. Compare every executable,
+      # map, license, BTF, CO-RE, and functional relocation section instead;
+      # the privileged job separately proves the committed object's behavior.
+      - name: Rebuild and compare functional object
         run: |
           set -euo pipefail
-          committed="${RUNNER_TEMP}/committed-opc-ipsec-xfrm-dscp.bpf.o"
-          cp crates/opc-ipsec-xfrm/bpf/opc-ipsec-xfrm-dscp.bpf.o "${committed}"
+          committed_dscp="${RUNNER_TEMP}/committed-opc-ipsec-xfrm-dscp.bpf.o"
+          committed_observation="${RUNNER_TEMP}/committed-opc-ipsec-xfrm-observation.bpf.o"
+          cp crates/opc-ipsec-xfrm/bpf/opc-ipsec-xfrm-dscp.bpf.o "${committed_dscp}"
+          cp crates/opc-ipsec-xfrm/bpf/opc-ipsec-xfrm-observation.bpf.o "${committed_observation}"
           ./scripts/build-ipsec-xfrm-ebpf.sh
-          rebuilt="crates/opc-ipsec-xfrm-ebpf/target/bpfel-unknown-none/release/opc-ipsec-xfrm-dscp"
+          rebuilt_dscp="crates/opc-ipsec-xfrm-ebpf/target/bpfel-unknown-none/release/opc-ipsec-xfrm-dscp"
+          rebuilt_observation="crates/opc-ipsec-xfrm-ebpf/target/bpfel-unknown-none/release/opc-ipsec-xfrm-observation"
           inventory() {
             readelf -sW "$1" | awk '
               ($4 == "FUNC" || $4 == "OBJECT") {
@@ -225,10 +255,75 @@ jobs:
               }
             ' | sort
           }
-          inventory "${committed}" > committed.inventory
-          inventory "${rebuilt}" > rebuilt.inventory
-          cat rebuilt.inventory
-          diff -u committed.inventory rebuilt.inventory
-          for symbol in opc_xfrm_dscp XFRM_DSCP_CFG; do
-            grep -q " ${symbol}$" committed.inventory
+          inventory "${committed_dscp}" > committed-dscp.inventory
+          inventory "${rebuilt_dscp}" > rebuilt-dscp.inventory
+          inventory "${committed_observation}" > committed-observation.inventory
+          inventory "${rebuilt_observation}" > rebuilt-observation.inventory
+          cat rebuilt-dscp.inventory
+          cat rebuilt-observation.inventory
+          diff -u committed-dscp.inventory rebuilt-dscp.inventory
+          diff -u committed-observation.inventory rebuilt-observation.inventory
+          compare_section() {
+            local label="$1"
+            local section="$2"
+            local committed="$3"
+            local rebuilt="$4"
+            readelf -x "${section}" "${committed}" > "committed-${label}.hex"
+            readelf -x "${section}" "${rebuilt}" > "rebuilt-${label}.hex"
+            diff -u "committed-${label}.hex" "rebuilt-${label}.hex"
+          }
+          for section in \
+            .text \
+            classifier \
+            license \
+            maps \
+            .relclassifier; do
+            compare_section "dscp-$(printf "%s" "${section}" | tr "/." "__")" \
+              "${section}" "${committed_dscp}" "${rebuilt_dscp}"
           done
+          for section in \
+            .text \
+            .rel.text \
+            fentry/__xfrm_state_insert \
+            .relfentry/__xfrm_state_insert \
+            fentry/__xfrm_state_delete \
+            .relfentry/__xfrm_state_delete \
+            fentry/xfrm_state_update \
+            .relfentry/xfrm_state_update \
+            fentry/xfrm_replay_check \
+            .relfentry/xfrm_replay_check \
+            fexit/xfrm_replay_recheck \
+            .relfexit/xfrm_replay_recheck \
+            .maps \
+            license \
+            .BTF \
+            .BTF.ext \
+            .rel.BTF \
+            .rel.BTF.ext; do
+            compare_section \
+              "observation-$(printf "%s" "${section}" | tr "/." "__")" \
+              "${section}" "${committed_observation}" "${rebuilt_observation}"
+          done
+          for symbol in opc_xfrm_dscp XFRM_DSCP_CFG; do
+            grep -q " ${symbol}$" committed-dscp.inventory
+          done
+          for symbol in \
+            opc_xfrm_guard \
+            opc_xfrm_obs \
+            opc_xfrm_insert \
+            opc_xfrm_delete \
+            opc_xfrm_update \
+            XFRM_OBS_REGS \
+            XFRM_OBS_STATE \
+            XFRM_OBS_EVENTS \
+            XFRM_OBS_STATS \
+            XFRM_OBS_SOURCE \
+            XFRM_OBS_LIFE; do
+            grep -q " ${symbol}$" committed-observation.inventory
+          done
+          readelf -SW "${committed_observation}" | grep -q "fentry/__xfrm_state_insert"
+          readelf -SW "${committed_observation}" | grep -q "fentry/__xfrm_state_delete"
+          readelf -SW "${committed_observation}" | grep -q "fentry/xfrm_state_update"
+          readelf -SW "${committed_observation}" | grep -q "fentry/xfrm_replay_check"
+          readelf -SW "${committed_observation}" | grep -q "fexit/xfrm_replay_recheck"
+          readelf -SW "${committed_observation}" | grep -q "\\.BTF\\.ext"

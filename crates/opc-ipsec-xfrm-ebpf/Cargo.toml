@@ -5,7 +5,7 @@ authors = ["OpenPacketCore Contributors"]
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/openpacketcore/openpacketcore-sdk"
-description = "tc eBPF post-transform outer-DSCP companion for opc-ipsec-xfrm"
+description = "eBPF datapath companions for opc-ipsec-xfrm"
 publish = false
 
 [dependencies]

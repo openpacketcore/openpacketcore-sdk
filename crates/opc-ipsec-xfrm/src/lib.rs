@@ -61,6 +61,23 @@
 //!
 //! Raw Linux netlink work stays in [`opc_linux_xfrm_sys`]; this crate is safe
 //! Rust and never performs `unsafe` operations.
+//!
+//! `LinuxEspPeerObservationMonitor` exposes the complementary observation
+//! authority for NAT rebinding: bounded, typed observations when an
+//! established inbound ESP-in-UDP SA starts arriving from a new outer source,
+//! keyed by exact SA identity and direction. An observation is only as strong
+//! as its trust anchor. Stock Linux `XFRM_MSG_MAPPING` fires after integrity
+//! verification but before the final replay decision and has no loss signal,
+//! so it cannot satisfy that contract. The production monitor instead owns a
+//! committed CO-RE source attached to the final replay-decision and XFRM
+//! lifecycle hooks. It admits only an exact GETSA-proven, replay-enabled,
+//! integrity/AEAD-protected, non-offloaded inbound ESP-in-UDP SA, binds scope
+//! to the network namespace, accounts producer loss, and fails closed on
+//! lifecycle or link-authority loss. Registration, authenticated rebaseline,
+//! and teardown use staged, quiescent transactions so cancellation cannot
+//! silently publish an unverified baseline. Observations retain only minimum
+//! routing facts, are bounded per SA with explicit fail-closed overflow,
+//! terminate exactly at teardown, and are value-free in diagnostics.
 
 #![forbid(unsafe_code)]
 
@@ -75,6 +92,7 @@ pub mod linux;
 pub mod mock;
 pub mod model;
 mod namespace;
+mod observation;
 mod outbound_binding;
 pub mod staged;
 pub mod staged_object;
@@ -121,6 +139,16 @@ pub use model::{
     XFRM_AUTH_HMAC_SHA512, XFRM_ENCR_CBC_AES, XFRM_ENCR_NULL,
 };
 pub use namespace::{NamespaceBoundLinuxXfrmBackend, LINUX_XFRM_NAMESPACE_ACTOR_CAPACITY};
+pub use observation::{
+    EspPeerAddressFamily, EspPeerIngestTally, EspPeerObservation, EspPeerObservationEpoch,
+    EspPeerObservationKey, EspPeerObservationLoss, EspPeerObservationRejection,
+    EspPeerObservationSourceTerminal, EspPeerObservationTeardown,
+    DEFAULT_ESP_PEER_OBSERVATION_CAPACITY,
+};
+#[cfg(target_os = "linux")]
+pub use observation::{
+    LinuxEspPeerObservationConfig, LinuxEspPeerObservationHandle, LinuxEspPeerObservationMonitor,
+};
 pub use opc_types::DscpCodepoint;
 pub use outbound_binding::{
     InstalledOutboundSaBinding, OutboundSaBindingError, OutboundSaBindingId,

@@ -515,6 +515,64 @@ and the existing `XfrmProbe` and `SaState` shapes are unchanged, so existing
 backend implementations and struct literals remain source compatible. No
 Cargo feature is required.
 
+## Authenticated ESP peer observations
+
+`LinuxEspPeerObservationMonitor` is the production observation authority
+needed before an RFC 7296 section 2.23 recovery updates an established
+ESP-in-UDP path. It turns kernel-attributed ESP decap events into bounded,
+typed observations keyed by exact SA identity and direction. When an admitted
+inbound SA starts arriving from a new outer source, the consumer drains one
+`EspPeerObservation` containing only the routing facts needed by product
+policy: address family, kernel `skb_iif`, encapsulation source address and
+port, monotonic per-SA generation, and explicit loss status. The monitor
+never applies or infers a relocation.
+
+An observation is only as strong as its trust anchor. The boundary accepts
+solely `EspPeerEventProvenance::PostFinalReplayAccepted` events: the kernel
+ESP decap path verified packet integrity (ICV or AEAD) and reached the
+successful final anti-replay decision on the exact SA named by the event.
+Stock Linux
+`XFRM_MSG_MAPPING` does not meet that contract — it is emitted post-ICV but
+before the final replay recheck (a concurrent duplicate can emit it and still
+lose replay), its `GFP_ATOMIC` producer loss is invisible to receivers, and it
+carries no ingress ifindex, ESP sequence, lookup mark, or XFRM `if_id`. The
+crate therefore ships a committed CO-RE source that attaches to the final
+replay-decision and XFRM lifecycle hooks. Construction loads and attaches that
+source inside the namespace-bound XFRM actor, pins scope with
+`SO_NETNS_COOKIE`, and keeps all provenance-bearing inputs private.
+
+`register_sa` performs exact GETSA admission twice around an initially unarmed
+map publication. It refuses crypt-only, replay-disabled, offloaded, outbound,
+non-ESP-in-UDP, malformed, or changed SAs. Legacy states whose explicit
+direction is absent are admitted only through the inbound ESP/replay path;
+explicit outbound states are refused. Kernel lifecycle changes, tracing-link
+loss, malformed records, torn state, or unaccounted producer loss terminate
+the monitor fail-closed.
+
+Polling is bounded by configuration and periodically revalidates every live SA
+with exact GETSA. The boundary rejects foreign-scope, unknown-SA, cross-SA,
+wrong-direction, family-mismatched, malformed, interface-scope-less,
+stale-cursor, and post-teardown events with value-free labels. Memory and
+kernel maps are bounded. A second distinct source while an observation remains
+pending closes that SA slot; draining alone does not reopen it because the
+kernel may already have suppressed the overflowed tuple.
+
+After the product completes an authenticated relocation, call
+`refresh_current_source` with the live handle. The monitor unpublishes the
+registration, waits for admitted hooks to quiesce, reconciles exact
+cursor/loss counts, proves the new source with two matching GETSA reads, and
+only then arms the new baseline. The API never accepts an arbitrary
+caller-supplied baseline. Cancellation leaves refresh or teardown unpublished
+and resumable; ordinary polling returns an indeterminate-state error until the
+interrupted transaction is resumed. Teardown uses the same quiescent protocol,
+removes all per-SA state, and returns an exact termination record.
+
+The host needs Linux BTF, tracing/eBPF privileges, and the kernel hooks named
+by the committed CO-RE object. Failure to load, verify, attach, or retain every
+required link is fail-closed. `Debug`/`Display` for observation types print
+only labels and non-sensitive metadata—never addresses, ports, SPIs, marks,
+or interface identities.
+
 ## Per-SA output marks
 
 `SaParameters::output_mark` emits the generic Linux
