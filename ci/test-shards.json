@@ -1,0 +1,46 @@
+{
+  "_comment": [
+    "Declarative plan for splitting the workspace test run across CI runners.",
+    "Every shard issues the identical package selection",
+    "(--workspace --exclude opc-persist --all-features) and differs only in",
+    "cargo TARGET filters. Package selection is what drives feature",
+    "unification under resolver = 2, so keeping it identical keeps every",
+    "dependency compiled exactly as the single-job run compiled it: a",
+    "--test/--lib/--doc filter selects which units are built and run, never",
+    "which features they are built with.",
+    "Weights are seconds measured in CI. They only affect balance, never",
+    "coverage; unlisted targets use default_weight."
+  ],
+  "integration_shards": 3,
+  "default_weight": 1.5,
+  "heavy": {
+    "_comment": [
+      "One integration target dominates the run (~784s of the ~1668s total).",
+      "Its long-running fleet tests are named explicitly so they can run on",
+      "separate runners. The 'rest' shard runs the same target with every",
+      "named test skipped, so a newly added test in this file is never lost:",
+      "it lands in 'rest' automatically."
+    ],
+    "target": "qualification_mtls_multiprocess",
+    "shards": [
+      [
+        "three_process_projected_mtls_rotation_core",
+        "five_process_projected_mtls_unavailable_malformed_and_expiry_recovery"
+      ],
+      [
+        "five_process_projected_mtls_rotation_core",
+        "three_process_projected_mtls_unavailable_malformed_and_expiry_recovery"
+      ]
+    ]
+  },
+  "weights": {
+    "qualification_mtls_multiprocess": 784,
+    "consensus_transport": 92,
+    "authenticated_replica_identity": 76,
+    "rotation_fault_matrix": 68,
+    "qualification_multiprocess": 59,
+    "material_epochs": 46,
+    "tls_tcp": 44,
+    "app_dictionaries": 43
+  }
+}
