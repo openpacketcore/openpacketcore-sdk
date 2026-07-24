@@ -60,9 +60,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   identity-mismatched, empty, and over-limit reloads stays inside the
   declared failure budget with typed last-known-good retention, zero
   connection churn, and no mixed or invalid material; and three repeated
-  rotation cycles prove exact per-path handshake accounting (untouched paths
-  never redial), quiet-window reconnect stability, a Linux file-descriptor
-  growth allowance, and zero authentication-failure outcomes. Every campaign
+  rotation cycles prove bounded per-path handshake accounting (every affected
+  path renegotiates, campaign totals capped both below and above, late
+  retirement redials accounted), quiet-window reconnect stability, a Linux
+  file-descriptor growth allowance, and zero authentication-failure outcomes. Every campaign
   emits an `opc.session-net.rotation-fault-evidence.v1` document (phase
   plan digest, pinned lifecycle/timing values, per-phase SLO durations,
   exact canary generation accounting, resource bounds, artifact and trust

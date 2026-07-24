@@ -660,8 +660,10 @@ struct PhaseRecord {
 }
 
 /// The deterministic evidence document every campaign emits and the
-/// independent checker validates. All bounds are asserted live in the test
-/// first; the document only records what the test already proved.
+/// independently implemented checker validates. Campaign-critical bounds are
+/// asserted live in the test; per-phase duration SLOs and the transition
+/// resolver-delta caps are enforced by the checker subprocess, whose
+/// rejection fails the emitting test with no skip path.
 #[derive(Debug)]
 struct CampaignEvidence {
     campaign_id: &'static str,
@@ -2031,11 +2033,16 @@ async fn three_member_repeated_rotation_bounds_case() {
         (Some(before), Some(after)) => Some(after.saturating_sub(before)),
         _ => None,
     };
-    if let Some(growth) = fd_growth {
-        assert!(
+    match fd_growth {
+        Some(growth) => assert!(
             growth <= FD_GROWTH_ALLOWANCE,
             "repeated rotation descriptor growth {growth} exceeds allowance {FD_GROWTH_ALLOWANCE}"
-        );
+        ),
+        // The descriptor bound is measurable only through /proc; record the
+        // degradation loudly so a non-Linux run never reads as full coverage.
+        None => {
+            eprintln!("descriptor-bound check skipped: /proc/self/fd unavailable on this platform")
+        }
     }
     fleet.evidence.fd_growth = fd_growth;
     fleet.record_measured_authentication_failures();
@@ -2193,6 +2200,12 @@ fn three_member_fleet_member_restarts_mid_rotation_and_rejoins_under_overlap_tru
 /// rejection), with every other outcome ignored.
 #[test]
 fn authentication_failure_accounting_counts_both_classes_exactly_once() {
+    // Takes the guard although no fleet is involved: the archive test mutates
+    // the process environment, and concurrent set_var/var_os across threads
+    // is unsound, so every test in this binary serializes on the same lock.
+    let _fleet_test_guard = FLEET_TEST_GUARD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut transport_stats = BTreeMap::new();
     let first = Arc::new(TransportStats::default());
     for (outcome, count) in [
@@ -2229,10 +2242,20 @@ fn archived_evidence_copy_is_owner_only_on_unix() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let archive = tempfile::tempdir().expect("evidence archive directory");
-    // Save/restore any operator-provided value: the fleet campaigns read this
-    // process-global variable for their own archival flow (plan section 7), so
-    // removing it would silently defeat archival for the rest of the process.
-    let prior_evidence_dir = std::env::var_os("OPC_ROTATION_EVIDENCE_DIR");
+    // Restore any operator-provided value even when emit_and_check panics:
+    // the fleet campaigns read this process-global variable for their own
+    // archival flow (plan section 7), so leaving it pointing at a dropped
+    // TempDir would silently misdirect archival for the rest of the process.
+    struct EvidenceDirGuard(Option<std::ffi::OsString>);
+    impl Drop for EvidenceDirGuard {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(value) => std::env::set_var("OPC_ROTATION_EVIDENCE_DIR", value),
+                None => std::env::remove_var("OPC_ROTATION_EVIDENCE_DIR"),
+            }
+        }
+    }
+    let _restore_evidence_dir = EvidenceDirGuard(std::env::var_os("OPC_ROTATION_EVIDENCE_DIR"));
     std::env::set_var("OPC_ROTATION_EVIDENCE_DIR", archive.path());
     let mut evidence =
         CampaignEvidence::new("checker-fixture", "mtls-fault-matrix-3".to_string(), 3);
@@ -2251,10 +2274,6 @@ fn archived_evidence_copy_is_owner_only_on_unix() {
     evidence.phases.push(phase("traffic-after-seed", 2));
     evidence.evidence_bounds_for_fixture();
     evidence.emit_and_check();
-    match prior_evidence_dir {
-        Some(value) => std::env::set_var("OPC_ROTATION_EVIDENCE_DIR", value),
-        None => std::env::remove_var("OPC_ROTATION_EVIDENCE_DIR"),
-    }
     let archived = archive.path().join("checker-fixture-evidence.json");
     #[cfg(unix)]
     {

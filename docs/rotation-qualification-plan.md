@@ -244,7 +244,7 @@ re-validate deterministically.
 | Watches gap-free/duplicate-free; every old-epoch connection drains by the hard deadline | `independent_client_and_server_leaf_rotation_preserves_active_requests_and_watch`; `consensus_server_only_material_rotation_replaces_both_cached_lanes`; drain-window lifecycle assertions; testkit drain discipline |
 | Old-anchor connections cannot be established after removal; no connection survives either peer leaf expiry | Removed-root rejection probes in the merged rotation tests and in the restart campaign; `real_mtls_local_and_peer_leaf_expiry_force_exact_reauthentication`; paused-time lifecycle retirement tests |
 | Rollback procedures executable and tested before and after old-anchor removal | The 13-phase merged rotation tests exercise both rollback paths; runbook section 7.4 procedures |
-| Resource, task, file-descriptor, handshake-rate, and reconnect-backoff bounds under repeated rotations | `three_member_fleet_repeated_rotation_stays_within_handshake_and_descriptor_bounds` (FD ≤ 8, per-transition resolver deltas ≤ 16, per-path campaign totals ≤ 18, final settle quiet window = 0, zero authentication failures); async-task bounds are structural — every fleet runs in its own Tokio runtime and each server task is abort-and-awaited at campaign teardown, so a leaked task fails the campaign; explicit task-count telemetry remains a section-10 gate; testkit traffic/resource campaign (manual long-running gate) |
+| Resource, task, file-descriptor, handshake-rate, and reconnect-backoff bounds under repeated rotations | `three_member_fleet_repeated_rotation_stays_within_handshake_and_descriptor_bounds` (FD ≤ 8, per-transition resolver deltas ≤ 16, per-path campaign totals ≤ 18, final settle quiet window = 0, zero authentication failures); async-task bounds are containment, not detection — every fleet runs in its own Tokio runtime and each registered server task is abort-and-awaited at campaign teardown, so leaked tasks die with the runtime rather than being counted; explicit task-count telemetry remains a section-10 gate; testkit traffic/resource campaign (manual long-running gate) |
 | Metrics/alerts expose only approved fixed labels and distinguish reload rejection, expiry, trust failure, drain overrun, reconnect failure, and durable quorum loss | Runbook section 7.1 contract; testkit observability campaigns; in-process typed distinctions asserted per campaign (section 5) |
 | Evidence records exact artifact digests, configuration, seeds, timestamps, and independent checker provenance | Section 7 of this plan; the checker contract test; testkit digest-bound evidence; signing remains an operator step |
 
@@ -254,8 +254,14 @@ re-validate deterministically.
 cargo test -p opc-session-net --test rotation_fault_matrix
 cargo test -p opc-session-net --test consensus_transport
 python3 scripts/check-session-rotation-fleet-evidence.py \
+  --now-epoch "$(jq .finished_epoch_seconds \
+    "$OPC_ROTATION_EVIDENCE_DIR/three-member-repeated-rotation-bounds-evidence.json")" \
   "$OPC_ROTATION_EVIDENCE_DIR/three-member-repeated-rotation-bounds-evidence.json"
 ```
+
+Archived documents older than the checker's freshness window must supply
+`--now-epoch` (normally the document's own finish timestamp, as above);
+without it the checker rejects them as stale by design.
 
 The fault-matrix campaigns are deterministic in structure and must pass 10
 consecutive runs in CI before a change claiming them lands. The fleet
