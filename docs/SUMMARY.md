@@ -54,6 +54,7 @@
 # Runbooks
 
 [Consensus Operator Runbook](consensus-operator-runbook.md)
+[Session-Net TLS Rotation Qualification Plan](rotation-qualification-plan.md)
 [Session-Store Legacy Fork Recovery](session-store-legacy-recovery.md)
 [Session-Store Stable-ID Migration](session-store-stable-id-migration.md)
 [Session-Store Replication Transaction-ID Migration](session-store-replication-tx-id-migration.md)

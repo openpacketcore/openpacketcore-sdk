@@ -49,6 +49,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   partial-success, or replayed terminal responses fail with redaction-safe
   stable diagnostics. Retransmission, collision policy, key/SPI allocation,
   installation, and old-SA retirement remain product-owned (#520).
+- **Rotation fault-matrix qualification and plan — `opc-session-net` (#164):**
+  adds deterministic in-process 3/5-member quorum-fleet mTLS campaigns for
+  the rotation fault matrix that remained open after the merged forward and
+  rollback rotation evidence. A follower partition and a member listener
+  restart now overlap live rotation phases (survivor leaf rotation, fleet
+  trust-overlap advance, new-root cutover) with continuous acknowledged
+  encrypted-canary traffic, fresh directed handshakes, and durable readiness
+  probes; one unavailable member plus a second member rejecting
+  identity-mismatched, empty, and over-limit reloads stays inside the
+  declared failure budget with typed last-known-good retention, zero
+  connection churn, and no mixed or invalid material; and three repeated
+  rotation cycles prove exact per-path handshake accounting (untouched paths
+  never redial), quiet-window reconnect stability, a Linux file-descriptor
+  growth allowance, and zero authentication-failure outcomes. Every campaign
+  emits an `opc.session-net.rotation-fault-evidence.v1` document (phase
+  plan digest, pinned lifecycle/timing values, per-phase SLO durations,
+  exact canary generation accounting, resource bounds, artifact and trust
+  anchor digests, timestamps) validated by the new independent stdlib
+  checker `scripts/check-session-rotation-fleet-evidence.py`, whose contract
+  test proves tamper-evidence. `docs/rotation-qualification-plan.md` fixes
+  the topology, traffic mix, failure budget, readiness rule, metrics
+  contract, numeric pass/fail SLOs, evidence format, and the
+  acceptance-to-evidence mapping; the deployed/Kubernetes, signed-release,
+  remote-HKMS, and soak gates remain explicitly open.
 - **Origin-scoped Diameter End-to-End Identifier authority —
   `opc-proto-diameter`:** adds a bounded concurrency-safe RFC 6733 allocator
   with an injectable fallible wall/monotonic clock, exact four-minute
