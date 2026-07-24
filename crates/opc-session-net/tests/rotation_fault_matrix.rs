@@ -2229,6 +2229,10 @@ fn archived_evidence_copy_is_owner_only_on_unix() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let archive = tempfile::tempdir().expect("evidence archive directory");
+    // Save/restore any operator-provided value: the fleet campaigns read this
+    // process-global variable for their own archival flow (plan section 7), so
+    // removing it would silently defeat archival for the rest of the process.
+    let prior_evidence_dir = std::env::var_os("OPC_ROTATION_EVIDENCE_DIR");
     std::env::set_var("OPC_ROTATION_EVIDENCE_DIR", archive.path());
     let mut evidence =
         CampaignEvidence::new("checker-fixture", "mtls-fault-matrix-3".to_string(), 3);
@@ -2247,7 +2251,10 @@ fn archived_evidence_copy_is_owner_only_on_unix() {
     evidence.phases.push(phase("traffic-after-seed", 2));
     evidence.evidence_bounds_for_fixture();
     evidence.emit_and_check();
-    std::env::remove_var("OPC_ROTATION_EVIDENCE_DIR");
+    match prior_evidence_dir {
+        Some(value) => std::env::set_var("OPC_ROTATION_EVIDENCE_DIR", value),
+        None => std::env::remove_var("OPC_ROTATION_EVIDENCE_DIR"),
+    }
     let archived = archive.path().join("checker-fixture-evidence.json");
     #[cfg(unix)]
     {
