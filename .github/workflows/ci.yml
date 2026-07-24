@@ -77,8 +77,18 @@ jobs:
         env:
           ACTIONLINT_VERSION: v1.7.12
         run: |
+          set -euo pipefail
           go install "github.com/rhysd/actionlint/cmd/actionlint@${ACTIONLINT_VERSION}"
-          "$(go env GOPATH)/bin/actionlint" .github/workflows/*.yml
+          # actionlint silently drops its shellcheck and pyflakes rules when
+          # those tools are missing, which would leave this step passing while
+          # checking far less than it appears to. Fail instead.
+          "$(go env GOPATH)/bin/actionlint" -verbose .github/workflows/*.yml \
+            2> >(tee actionlint.err >&2)
+          if grep -q 'was disabled' actionlint.err; then
+            grep 'was disabled' actionlint.err
+            echo "::error::actionlint ran with rules disabled; install the missing tools"
+            exit 1
+          fi
 
       # Proves the test plan still partitions every integration-test target
       # exactly once. The shards do not wait on this job -- they run the same
@@ -340,12 +350,27 @@ jobs:
       - name: Test RustCrypto-only DTLS documentation
         run: cargo test --manifest-path vendor/dimpl/Cargo.toml --no-default-features --features rust-crypto --doc
 
+      # These were written as `! rg ...`, which bash exempts from errexit, so
+      # a match printed the offending lines and the step still passed. All
+      # three invariants hold today; they are now actually enforced, and each
+      # reports rather than stopping at the first violation.
       - name: Enforce vendored RFC 6083 source invariants
         run: |
-          ! rg -n '\b(unreachable!|unimplemented!|todo!)' vendor/dimpl/src
-          ! rg -n 'Rfc6083|rfc6083' vendor/dimpl/src/dtls13
-          ! rg -n 'impl Default for Config|Config::default\(\)' \
-            vendor/dimpl/src vendor/dimpl/tests vendor/dimpl/README.md
+          violated=0
+          if rg -n '\b(unreachable!|unimplemented!|todo!)' vendor/dimpl/src; then
+            echo "::error::vendored DTLS source must not panic on unreachable paths"
+            violated=1
+          fi
+          if rg -n 'Rfc6083|rfc6083' vendor/dimpl/src/dtls13; then
+            echo "::error::the DTLS 1.3 path must not reference RFC 6083"
+            violated=1
+          fi
+          if rg -n 'impl Default for Config|Config::default\(\)' \
+            vendor/dimpl/src vendor/dimpl/tests vendor/dimpl/README.md; then
+            echo "::error::Config must be constructed explicitly, never defaulted"
+            violated=1
+          fi
+          exit "${violated}"
 
   session-net-i686:
     name: opc-session-net i686
