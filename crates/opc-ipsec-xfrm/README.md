@@ -515,6 +515,43 @@ and the existing `XfrmProbe` and `SaState` shapes are unchanged, so existing
 backend implementations and struct literals remain source compatible. No
 Cargo feature is required.
 
+## Authenticated ESP peer observations
+
+`EspPeerObservationBoundary` is the observation authority needed before an
+RFC 7296 section 2.23 recovery can update an established ESP-in-UDP path. It
+turns kernel-attributed ESP decap events into bounded, typed observations
+keyed by exact SA identity and direction: when an observed inbound SA starts
+arriving from a new outer source, the consumer drains exactly one
+`EspPeerObservation` retaining only the minimum routing facts (address
+family, ingress interface index, encapsulation source address and port,
+monotonic per-SA generation, and an explicit loss status). After the consumer
+applies its own authenticated path update, `update_current_source` rebases
+the boundary. The boundary never applies or infers a relocation.
+
+An observation is only as strong as its trust anchor. The boundary accepts
+solely `EspPeerEventProvenance::PostFinalReplayAccepted` events: the kernel
+ESP decap path verified packet integrity (ICV or AEAD) and the packet won the
+final anti-replay advance on the exact SA named by the event. Stock Linux
+`XFRM_MSG_MAPPING` does not meet that contract — it is emitted post-ICV but
+before the final replay recheck (a concurrent duplicate can emit it and still
+lose replay), its `GFP_ATOMIC` producer loss is invisible to receivers, and it
+carries no ingress ifindex, ESP sequence, lookup mark, or XFRM `if_id`. The
+crate therefore ships the boundary, the provenance contract
+(`EspPeerObservationSource`), and `ScriptedEspPeerObservationSource` for
+replay of captured or synthetic events, but no stock-kernel event source.
+Registration is refused for crypt-only SAs: post-decrypt delivery without
+integrity is not authentication.
+
+The boundary rejects foreign-scope, unknown-SA, cross-SA, wrong-direction,
+family-mismatched, malformed, interface-scope-less, stale-cursor, and
+post-teardown events with value-free rejection labels. Memory is bounded: one
+outstanding observation per SA (a further distinct source closes the slot
+fail-closed with an explicit `OverflowClosed` status until drained) and a
+capacity-bounded registry. Teardown drains and removes all per-SA state and
+returns an exact termination record. `Debug`/`Display` for every observation
+type print only labels and non-sensitive metadata — never addresses, ports,
+SPIs, marks, or interface identities.
+
 ## Per-SA output marks
 
 `SaParameters::output_mark` emits the generic Linux

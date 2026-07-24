@@ -61,6 +61,20 @@
 //!
 //! Raw Linux netlink work stays in [`opc_linux_xfrm_sys`]; this crate is safe
 //! Rust and never performs `unsafe` operations.
+//!
+//! [`EspPeerObservationBoundary`] exposes the complementary observation
+//! authority for NAT rebinding: bounded, typed observations when an
+//! established inbound ESP-in-UDP SA starts arriving from a new outer source,
+//! keyed by exact SA identity and direction. An observation is only as strong
+//! as its trust anchor: the boundary accepts solely
+//! [`EspPeerEventProvenance::PostFinalReplayAccepted`] events — kernel ESP
+//! decap accepted the packet on the exact SA after integrity verification and
+//! the final anti-replay advance. Stock Linux `XFRM_MSG_MAPPING` does not meet
+//! that contract (it fires post-ICV but pre-final-replay and has no loss
+//! signal), so this crate ships the boundary, the provenance contract, and a
+//! scripted source, but no stock-kernel event source. Observations retain
+//! only minimum routing facts, are bounded per SA with explicit fail-closed
+//! overflow, terminate exactly at teardown, and are value-free in diagnostics.
 
 #![forbid(unsafe_code)]
 
@@ -75,6 +89,7 @@ pub mod linux;
 pub mod mock;
 pub mod model;
 mod namespace;
+pub mod observation;
 mod outbound_binding;
 pub mod staged;
 pub mod staged_object;
@@ -121,6 +136,13 @@ pub use model::{
     XFRM_AUTH_HMAC_SHA512, XFRM_ENCR_CBC_AES, XFRM_ENCR_NULL,
 };
 pub use namespace::{NamespaceBoundLinuxXfrmBackend, LINUX_XFRM_NAMESPACE_ACTOR_CAPACITY};
+pub use observation::{
+    EspPeerAddressFamily, EspPeerEventProvenance, EspPeerIngestOutcome, EspPeerObservation,
+    EspPeerObservationBoundary, EspPeerObservationEvent, EspPeerObservationKey,
+    EspPeerObservationLoss, EspPeerObservationRegistration, EspPeerObservationRejection,
+    EspPeerObservationScope, EspPeerObservationSource, EspPeerObservationTeardown,
+    ScriptedEspPeerObservationSource, DEFAULT_ESP_PEER_OBSERVATION_CAPACITY,
+};
 pub use opc_types::DscpCodepoint;
 pub use outbound_binding::{
     InstalledOutboundSaBinding, OutboundSaBindingError, OutboundSaBindingId,
