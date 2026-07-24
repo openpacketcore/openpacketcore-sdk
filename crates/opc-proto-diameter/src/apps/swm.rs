@@ -61,6 +61,7 @@ use crate::dictionary::{
     ApplicationDefinition, AvpCardinality, AvpDataType, AvpDefinition, AvpFlagRules, AvpKey,
     CommandAvpRule, CommandDefinition, CommandKind, Dictionary, FlagRequirement,
 };
+use crate::end_to_end::{DiameterEndToEndIdentifierError, DiameterEndToEndRequestIdentity};
 use crate::parser_error::DiameterParserError;
 use crate::{
     ApplicationId, AvpCode, AvpHeader, CommandCode, Message, OwnedMessage, RawAvp, VendorId,
@@ -2425,19 +2426,50 @@ pub fn derive_unauthenticated_emergency_msk(imei: &Imei15) -> SwmUnauthenticated
 }
 
 /// Diameter transaction identifiers retained beside parsed typed SWm facts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SwmDiameterTransaction {
     hop_by_hop_identifier: u32,
     end_to_end_identifier: u32,
 }
 
 impl SwmDiameterTransaction {
-    /// Construct the identifiers assigned to one outbound Diameter request.
+    /// Construct raw identifiers assigned to a Diameter transaction.
+    ///
+    /// This unchecked compatibility constructor is required for parsed inbound
+    /// messages and existing raw-ID integrations. New originating request
+    /// paths should allocate with
+    /// [`crate::end_to_end::DiameterEndToEndIdentifierAuthority`] and consume
+    /// the affine identity through the request envelope's
+    /// `for_originating_request` constructor.
     pub const fn new(hop_by_hop_identifier: u32, end_to_end_identifier: u32) -> Self {
         Self {
             hop_by_hop_identifier,
             end_to_end_identifier,
         }
+    }
+
+    /// Consume one origin-matched affine identity into retry-stable SWm state.
+    ///
+    /// The returned transaction may be copied into a retained request envelope.
+    /// Failover helpers replace only its Hop-by-Hop Identifier and preserve
+    /// this End-to-End Identifier. This generic boundary validates the
+    /// caller-supplied Origin-Host claim; SWm callers should prefer each typed
+    /// request envelope's `for_originating_request` constructor, which reads
+    /// the request's Origin-Host itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed, value-free error when `request_origin_host` is invalid
+    /// or does not match the authority that allocated `identity`.
+    pub fn from_end_to_end_identity(
+        hop_by_hop_identifier: u32,
+        request_origin_host: &str,
+        identity: DiameterEndToEndRequestIdentity,
+    ) -> Result<Self, DiameterEndToEndIdentifierError> {
+        Ok(Self::new(
+            hop_by_hop_identifier,
+            identity.into_u32_for_origin_host(request_origin_host)?,
+        ))
     }
 
     fn from_message(message: &Message<'_>) -> Self {
@@ -2455,6 +2487,12 @@ impl SwmDiameterTransaction {
     /// Return the end-to-end duplicate-detection identifier.
     pub const fn end_to_end_identifier(self) -> u32 {
         self.end_to_end_identifier
+    }
+}
+
+impl fmt::Debug for SwmDiameterTransaction {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SwmDiameterTransaction(<redacted>)")
     }
 }
 
@@ -2483,10 +2521,11 @@ pub struct SwmDiameterEapRequestEnvelope {
 }
 
 impl SwmDiameterEapRequestEnvelope {
-    /// Bind outbound DER facts to the identifiers used by their builder.
+    /// Bind outbound DER facts to caller-supplied raw identifiers.
     ///
-    /// The caller must pass these same identifiers to
-    /// [`build_swm_diameter_eap_request`]. Parsed inbound messages should use
+    /// This is an unchecked compatibility path. New originators should use
+    /// [`Self::for_originating_request`], which binds an affine identity to the
+    /// typed request's Origin-Host. Parsed inbound messages should use
     /// [`parse_swm_diameter_eap_request_envelope`] instead.
     pub fn for_outbound(
         request: SwmDiameterEapRequest,
@@ -2503,7 +2542,10 @@ impl SwmDiameterEapRequestEnvelope {
         }
     }
 
-    /// Bind an outbound DER to its authenticated answer connection.
+    /// Bind caller-supplied raw DER identifiers to an answer connection.
+    ///
+    /// This is an unchecked compatibility path. New originators should use
+    /// [`Self::for_originating_request`].
     #[must_use]
     pub fn for_outbound_on(
         request: SwmDiameterEapRequest,
@@ -2519,6 +2561,34 @@ impl SwmDiameterEapRequestEnvelope {
             request,
             proxy_infos: Vec::new(),
         }
+    }
+
+    /// Bind a new DER's affine identity to its typed Origin-Host.
+    ///
+    /// This is the checked originating boundary. It reads `request.origin_host`
+    /// directly, consumes `identity`, and installs the authenticated expected
+    /// answer connection in the same retained envelope.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed, value-free error when the request Origin-Host is
+    /// invalid or does not match the authority that allocated `identity`.
+    pub fn for_originating_request(
+        request: SwmDiameterEapRequest,
+        hop_by_hop_identifier: u32,
+        identity: DiameterEndToEndRequestIdentity,
+        expected_answer_peer: SwmExpectedAnswerPeer,
+    ) -> Result<Self, DiameterEndToEndIdentifierError> {
+        let transaction = SwmDiameterTransaction::from_end_to_end_identity(
+            hop_by_hop_identifier,
+            request.origin_host.as_str(),
+            identity,
+        )?;
+        Ok(Self::for_outbound_on(
+            request,
+            transaction,
+            expected_answer_peer,
+        ))
     }
 
     /// Attach trusted answer-peer evidence before transport dispatch.

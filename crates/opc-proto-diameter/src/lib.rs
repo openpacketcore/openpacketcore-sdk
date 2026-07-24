@@ -10,6 +10,13 @@
 //! initial 3GPP application work. It deliberately does **not** implement product
 //! policy such as realm routing, AAA/HSS behavior, charging decisions, watchdog
 //! thresholds, or peer transport operations.
+//! [`end_to_end`] provides a bounded origin-scoped RFC 6733 End-to-End
+//! Identifier authority with an injectable fallible clock, an exact
+//! four-minute duplicate fence, an affine authority attestation bound to a
+//! redacted Origin-Host scope, and an affine request identity that must match
+//! its originating scope before consumption. Checked SWm envelope constructors
+//! read the typed request Origin-Host directly. Diagnostics do not expose scope
+//! fingerprints or identifier values.
 //! With the `peer` feature, [`peer::PeerSession`] also provides an explicit,
 //! generation-bound RFC 6733 direct or in-band TLS/TCP and DTLS/SCTP readiness
 //! and header-admission boundary. A typed requirement retains both mechanism and
@@ -61,6 +68,7 @@ pub mod avp;
 #[cfg(feature = "base")]
 pub mod base;
 pub mod dictionary;
+pub mod end_to_end;
 #[cfg(feature = "base")]
 pub mod error_answer;
 #[cfg(feature = "base")]

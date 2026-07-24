@@ -12,6 +12,51 @@ dictionaries and typed helpers.
 It does not provide peer transport, realm routing, AAA/HSS/CDF behavior,
 charging decisions, watchdog policy, or a carrier-ready EPC/ePDG product claim.
 
+## Origin-scoped End-to-End Identifier authority
+
+`end_to_end::DiameterEndToEndIdentifierAuthority` is a bounded,
+concurrency-safe RFC 6733 End-to-End Identifier authority. All clones share one
+origin-local state. Allocation deterministically combines the low 12 bits of
+the current UNIX second with a collision-scanned 20-bit sequence and retains an
+exact four-minute monotonic recent-use fence. The default bound is 65,536
+identifiers and the configurable hard limit is 2^20; capacity, clock, rollback,
+and restart-fence failures are typed and value-free. Identifier generation uses
+no RNG or unchecked random fallback.
+
+Construction consumes an affine attestation created by
+`attest_single_origin_owner_with_faithful_clocks(origin_host)`. The factory
+validates the shared nonempty-ASCII DiameterIdentity contract plus an
+authority-specific 1024-byte resource bound, and retains only a
+case-insensitive, domain-separated SHA-256 scope fingerprint. It asserts that
+the previous owner is gone before one live authority takes ownership. Returned
+whole `unix_seconds` observations must be globally nondecreasing across process
+incarnations and, for any two real instants less than 240 seconds apart, differ
+by at most 4095. It also asserts that the monotonic expiry clock cannot advance
+by 240 seconds before at least 240 real seconds have elapsed; lag is
+conservative and permitted. The mandatory next-second quarantine prevents
+reuse from an immediately preceding conforming process incarnation. This
+caller attestation is not durable or distributed coordination. If the
+restart-time assumptions cannot be trusted, use durable non-reuse state/range
+reservation or an independently trusted full 240-second startup quarantine.
+Separately, fleets sharing an Origin-Host must externally lease/fence one owner
+or use distinct Origin-Host values.
+
+Every coherent clock sample advances an internal rollback high-water even when
+allocation later fails due to restart quarantine or capacity. Such failures do
+not mutate the identifier cursor or recent-use fence. Allocation returns a
+non-`Clone`, non-`Copy`, non-`Hash`
+`DiameterEndToEndRequestIdentity`; consume it into the request's retained
+transaction state and reuse that state for retries. Omitting `Hash` prevents a
+caller-controlled hasher from observing the hidden identifier or scope
+fingerprint. Checked SWm `for_originating_request` envelope constructors read
+the typed request's Origin-Host directly, match DiameterIdentity
+case-insensitively, and reject a different authority before exposing the raw
+identifier. The generic identity consumer accepts a caller-supplied
+Origin-Host for non-SWm applications; raw transaction/envelope constructors
+remain unchecked compatibility paths. Authority, attestation, identity,
+transaction, time, and error diagnostics do not expose Origin-Host
+fingerprints or identifier values.
+
 ## Direct and in-band transport-protection readiness boundary
 
 `PeerProtectionRequirement` retains both the transport mechanism and the RFC
@@ -1260,21 +1305,27 @@ representations.
 
 ### SWm Session-Termination
 
-An ePDG creates an outbound STR by binding typed facts to identifiers allocated
-by its live Diameter transport:
+An ePDG creates an outbound STR by consuming one affine End-to-End identity
+from its Origin-Host authority and pairing it with the Hop-by-Hop Identifier
+reserved by the live Diameter transport:
 
 ```rust
 use opc_proto_diameter::apps::swm::{
     build_swm_session_termination_request, SwmDiameterConnectionToken,
-    SwmDiameterTransaction, SwmExpectedAnswerPeer, SwmSessionTerminationRequest,
+    SwmExpectedAnswerPeer, SwmSessionTerminationRequest,
     SwmSessionTerminationRequestEnvelope, SwmTerminationCause,
+};
+use opc_proto_diameter::end_to_end::{
+    DiameterEndToEndIdentifierAuthority, DiameterEndToEndIdentifierError,
 };
 use opc_proto_diameter::OwnedMessage;
 use opc_protocol::{EncodeContext, EncodeError};
 
-fn build_str(
+fn retain_str(
     connection: SwmDiameterConnectionToken,
-) -> Result<OwnedMessage, EncodeError> {
+    authority: &DiameterEndToEndIdentifierAuthority,
+    hop_by_hop_identifier: u32,
+) -> Result<SwmSessionTerminationRequestEnvelope, DiameterEndToEndIdentifierError> {
     let request = SwmSessionTerminationRequest {
         session_id: "session-id-from-the-established-DER".into(),
         origin_host: "epdg.example".into(),
@@ -1287,14 +1338,33 @@ fn build_str(
         route_records: Vec::new(),
         additional_avps: Vec::new(),
     };
-    let pending = SwmSessionTerminationRequestEnvelope::for_outbound(
+    SwmSessionTerminationRequestEnvelope::for_originating_request(
         request,
-        SwmDiameterTransaction::new(0x1020_3040, 0x5060_7080),
+        hop_by_hop_identifier,
+        authority.allocate()?,
         SwmExpectedAnswerPeer::routed(connection),
-    );
-    build_swm_session_termination_request(&pending, EncodeContext::default())
+    )
+}
+
+fn build_str(
+    pending: &SwmSessionTerminationRequestEnvelope,
+) -> Result<OwnedMessage, EncodeError> {
+    build_swm_session_termination_request(pending, EncodeContext::default())
 }
 ```
+
+Requests originated with the same Origin-Host share its authority. The ePDG
+therefore uses one authority for DER, STR, and AAR, while the AAA originator
+uses a separate authority for ASR and RAR.
+The compile-checked
+[`end_to_end_identifier_authority` test](tests/end_to_end_identifier_authority.rs)
+builds all five request families, proves uniqueness within each origin scope,
+proves retry-stable reuse, and proves that an ePDG-scoped identity cannot be
+attached to a typed AAA-origin request.
+
+The older `SwmDiameterTransaction::new` and envelope `for_outbound`
+constructors accept raw identifiers and remain unchecked compatibility paths.
+New originating SWm code should use `for_originating_request`.
 
 The `connection` argument above is allocated by the transport when that exact
 authenticated connection generation opens; it is never a constant or a peer
@@ -1309,8 +1379,9 @@ must reserve that Hop-by-Hop Identifier as unique among pending requests on the
 replacement connection. The transition atomically sets T and replaces both
 hop-local correlation fields without changing the End-to-End Identifier or AVP
 bytes. An ordinary timer retry does not call this transition. Retry timing,
-identifier allocation, connection selection, and pending-request ownership
-remain transport/product responsibilities.
+Hop-by-Hop allocation, connection selection, and pending-request ownership
+remain transport/product responsibilities. End-to-End allocation and the
+recent-use fence belong to the shared origin authority.
 
 A server-side duplicate cache can compare two retained STR envelopes with
 `initial.same_replay_payload(&candidate)`. On top of RFC 6733 duplicate
