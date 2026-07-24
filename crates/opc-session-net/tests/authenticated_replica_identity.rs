@@ -1041,7 +1041,7 @@ async fn wait_for_rotation_traffic_after(outcome: &RotationTrafficOutcome, basel
         }
     })
     .await
-    .expect("every operation family and watch must progress after rotation");
+    .expect("every exercised operation family and watch must progress after rotation");
 }
 
 struct RotationMaterialHarness<'a> {
@@ -1708,7 +1708,7 @@ async fn start_independent_rotation(cluster: &str, generation: &str) -> Independ
     let reauthentication = SessionReauthenticationControl::new();
     let counted = Arc::new(RotationTrafficBackend::new());
     let server = SessionReplicationServer::new(counted.clone(), server_config.clone(), binding)
-        .with_connection_lifecycle(lifecycle_policy())
+        .with_connection_lifecycle(independent_rotation_lifecycle())
         .with_reauthentication_control(reauthentication.clone());
     let (handle, addr) = server
         .listen("127.0.0.1:0".parse().expect("listen address"))
@@ -1732,7 +1732,7 @@ async fn start_independent_rotation(cluster: &str, generation: &str) -> Independ
         client_config.clone(),
         Some(ROTATION_OPERATION_DEADLINE),
     )
-    .with_connection_lifecycle(lifecycle_policy())
+    .with_connection_lifecycle(independent_rotation_lifecycle())
     .with_reauthentication_control(reauthentication);
     IndependentRotationSetup {
         pki,
@@ -1747,17 +1747,65 @@ async fn start_independent_rotation(cluster: &str, generation: &str) -> Independ
     }
 }
 
+// A 500 ms drain window keeps the documented soft-to-hard retirement span
+// observable on a listener-driven rotation without stretching the suite: a
+// retired watch stream is recycled well inside the operation deadline while
+// the retirement machinery, reasons, and bounds stay identical.
+fn independent_rotation_lifecycle() -> ConnectionLifecyclePolicy {
+    ConnectionLifecyclePolicy::try_new(
+        Duration::from_secs(60),
+        Duration::from_millis(500),
+        Duration::from_millis(10),
+        Duration::from_millis(50),
+        Duration::ZERO,
+    )
+    .expect("independent rotation lifecycle policy")
+}
+
 async fn wait_for_resolver_calls(calls: &AtomicUsize, minimum: usize) {
-    tokio::time::timeout(ROTATION_OPERATION_DEADLINE, async {
+    wait_for_resolver_calls_within(calls, minimum, ROTATION_OPERATION_DEADLINE).await;
+}
+
+async fn wait_for_resolver_calls_within(calls: &AtomicUsize, minimum: usize, deadline: Duration) {
+    tokio::time::timeout(deadline, async {
         loop {
             if calls.load(Ordering::SeqCst) >= minimum {
                 return;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(1)).await;
         }
     })
     .await
-    .expect("rotation must recycle the pooled and watch connections within the operation bound");
+    .unwrap_or_else(|_| {
+        panic!(
+            "rotation must recycle the pooled and watch connections within the operation bound: reached {}, expected >= {minimum}",
+            calls.load(Ordering::SeqCst)
+        )
+    });
+}
+
+async fn assert_resolver_calls_stable(calls: &AtomicUsize, expected: usize) {
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        expected,
+        "each rotation must recycle the pooled and watch lanes exactly once"
+    );
+    // A double-recycle regression may trail the settle; the count must hold
+    // exactly across a quiet window with traffic still running.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        expected,
+        "a quiet window after the settle must not dial any lane again"
+    );
+}
+
+fn assert_membership_binding(backend: &RemoteSessionBackend) {
+    let binding = backend
+        .peer_binding()
+        .expect("authenticated peer binding across the routing alias");
+    assert_eq!(binding.local_replica_id(), &replica_id(1));
+    assert_eq!(binding.remote_replica_id(), &replica_id(SERVER_REPLICA));
 }
 
 async fn wait_for_material_rejection(
@@ -1765,7 +1813,7 @@ async fn wait_for_material_rejection(
     epoch: TlsMaterialEpoch,
     reason: TlsMaterialReloadReason,
 ) -> TlsMaterialStatus {
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(ROTATION_OPERATION_DEADLINE, async {
         loop {
             let current = status();
             if current.epoch() == epoch
@@ -1774,7 +1822,7 @@ async fn wait_for_material_rejection(
             {
                 return current;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(1)).await;
         }
     })
     .await
@@ -1822,10 +1870,18 @@ async fn independent_client_and_server_leaf_rotation_preserves_active_requests_a
     wait_for_material_epoch_change(|| setup.client_config.material_status(), client_epoch).await;
     traffic.assert_progress().await;
     wait_for_resolver_calls(&setup.resolve_calls, 4).await;
+    assert_resolver_calls_stable(&setup.resolve_calls, 4).await;
+    // Membership proofs survive the client-side rotation across the DNS
+    // routing alias: the dialed address is loopback while the manifest
+    // endpoint stays the canonical replica hostname.
+    assert_membership_binding(&setup.backend);
 
     // Rotate only the server leaf/key. The client material never advances, so
     // the server-side retirement must prove no-dispatch to in-flight callers
-    // and both client lanes must redial and renegotiate.
+    // and both client lanes must redial and renegotiate. A retired watch
+    // stream is held until the end of the short drain window, so its recycling
+    // bound is the drain window plus reconnect budget rather than the request
+    // lane's prompt no-dispatch proof.
     let server_epoch = setup.server_config.material_status().epoch();
     setup
         .server_tx
@@ -1836,17 +1892,9 @@ async fn independent_client_and_server_leaf_rotation_preserves_active_requests_a
         )));
     wait_for_material_epoch_change(|| setup.server_config.material_status(), server_epoch).await;
     traffic.assert_progress().await;
-    wait_for_resolver_calls(&setup.resolve_calls, 6).await;
-
-    // Membership proofs survive both independent rotations across the DNS
-    // routing alias: the dialed address is loopback while the manifest
-    // endpoint stays the canonical replica hostname.
-    let binding = setup
-        .backend
-        .peer_binding()
-        .expect("authenticated peer binding after independent rotations");
-    assert_eq!(binding.local_replica_id(), &replica_id(1));
-    assert_eq!(binding.remote_replica_id(), &replica_id(SERVER_REPLICA));
+    wait_for_resolver_calls_within(&setup.resolve_calls, 6, ROTATION_CLEANUP_DEADLINE).await;
+    assert_resolver_calls_stable(&setup.resolve_calls, 6).await;
+    assert_membership_binding(&setup.backend);
 
     traffic.finish().await;
     setup.handle.abort_and_wait().await;
@@ -1877,11 +1925,8 @@ async fn rejected_reloads_retain_last_good_material_and_never_interrupt_traffic(
         .await,
     );
     traffic.assert_progress().await;
-    assert_eq!(
-        setup.resolve_calls.load(Ordering::SeqCst),
-        2,
-        "a rejected client reload must not drain or recycle any connection"
-    );
+    traffic.assert_progress().await;
+    assert_resolver_calls_stable(&setup.resolve_calls, 2).await;
 
     // An incomplete reload carries no material at all.
     setup.client_tx.send_replace(None);
@@ -1894,11 +1939,13 @@ async fn rejected_reloads_retain_last_good_material_and_never_interrupt_traffic(
         .await,
     );
     traffic.assert_progress().await;
+    traffic.assert_progress().await;
+    assert_resolver_calls_stable(&setup.resolve_calls, 2).await;
 
     // An oversized reload exceeds the fixed trust-bundle count bound.
     setup
         .client_tx
-        .send_replace(Some(oversized_bundle_identity_state(&setup.pki)));
+        .send_replace(Some(oversized_bundle_identity_state(&setup.pki, 1)));
     assert_status_redaction_safe(
         wait_for_material_rejection(
             || setup.client_config.material_status(),
@@ -1908,7 +1955,8 @@ async fn rejected_reloads_retain_last_good_material_and_never_interrupt_traffic(
         .await,
     );
     traffic.assert_progress().await;
-    assert_eq!(setup.resolve_calls.load(Ordering::SeqCst), 2);
+    traffic.assert_progress().await;
+    assert_resolver_calls_stable(&setup.resolve_calls, 2).await;
 
     // The listener applies the same discipline to its own reloads.
     let server_epoch = setup.server_config.material_status().epoch();
@@ -1934,20 +1982,36 @@ async fn rejected_reloads_retain_last_good_material_and_never_interrupt_traffic(
         )
         .await,
     );
-    traffic.assert_progress().await;
-    assert_eq!(
-        setup.resolve_calls.load(Ordering::SeqCst),
-        2,
-        "rejected server reloads must not drain or recycle any connection"
+    setup
+        .server_tx
+        .send_replace(Some(oversized_bundle_identity_state(
+            &setup.pki,
+            SERVER_REPLICA,
+        )));
+    assert_status_redaction_safe(
+        wait_for_material_rejection(
+            || setup.server_config.material_status(),
+            server_epoch,
+            TlsMaterialReloadReason::MaterialLimitExceeded,
+        )
+        .await,
     );
+    traffic.assert_progress().await;
+    traffic.assert_progress().await;
+    assert_resolver_calls_stable(&setup.resolve_calls, 2).await;
 
     // A later coherent reload still rotates: last-known-good retention never
-    // latches the controller into a rejected state.
+    // latches the controller into a rejected state. Rotate one side at a time
+    // so the lane recycling bound stays exact.
     setup.client_tx.send_replace(Some(
         setup
             .pki
             .identity_state_with_trust_and_validity(1, &trust, validity),
     ));
+    wait_for_material_epoch_change(|| setup.client_config.material_status(), client_epoch).await;
+    traffic.assert_progress().await;
+    wait_for_resolver_calls(&setup.resolve_calls, 4).await;
+    assert_resolver_calls_stable(&setup.resolve_calls, 4).await;
     setup
         .server_tx
         .send_replace(Some(setup.pki.identity_state_with_trust_and_validity(
@@ -1955,24 +2019,22 @@ async fn rejected_reloads_retain_last_good_material_and_never_interrupt_traffic(
             &trust,
             validity,
         )));
-    wait_for_material_epoch_change(|| setup.client_config.material_status(), client_epoch).await;
     wait_for_material_epoch_change(|| setup.server_config.material_status(), server_epoch).await;
     traffic.assert_progress().await;
-    // Both lanes must recycle at least once; a client redial admitted under
-    // the already-advanced server epoch is not retired a second time.
-    wait_for_resolver_calls(&setup.resolve_calls, 4).await;
+    wait_for_resolver_calls_within(&setup.resolve_calls, 6, ROTATION_CLEANUP_DEADLINE).await;
+    assert_resolver_calls_stable(&setup.resolve_calls, 6).await;
 
     traffic.finish().await;
     setup.handle.abort_and_wait().await;
 }
 
-fn oversized_bundle_identity_state(pki: &TestPki) -> opc_identity::IdentityState {
+fn oversized_bundle_identity_state(pki: &TestPki, replica: u16) -> opc_identity::IdentityState {
     let mut params = rcgen::CertificateParams::default();
     params
         .distinguished_name
-        .push(rcgen::DnType::CommonName, "replica-1");
+        .push(rcgen::DnType::CommonName, format!("replica-{replica}"));
     params.subject_alt_names.push(rcgen::SanType::URI(
-        rcgen::string::Ia5String::try_from(replica_spiffe(1)).expect("SPIFFE URI"),
+        rcgen::string::Ia5String::try_from(replica_spiffe(replica)).expect("SPIFFE URI"),
     ));
     let now = time::OffsetDateTime::now_utc();
     params.not_before = now - time::Duration::days(1);

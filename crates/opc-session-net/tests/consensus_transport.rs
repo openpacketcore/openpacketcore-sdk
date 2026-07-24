@@ -2528,13 +2528,16 @@ async fn consensus_server_only_material_rotation_replaces_both_cached_lanes() {
 
     // Rotate only the listener's leaf/key. The client material never advances,
     // so both lane replacements must come from the server retiring its
-    // accepted connections. A call already assigned to a stale lane fails once
-    // with the typed no-replay outcome and leaves its slot empty; the retried
-    // call repeats the complete mutual-TLS and contract-profile negotiation.
+    // accepted connections. A call assigned to a stale lane must surface
+    // exactly one typed no-replay outcome per lane; the transport never
+    // replays it implicitly, and the retried call repeats the complete
+    // mutual-TLS and contract-profile negotiation.
     let previous_epoch = server_config.material_status().epoch();
     server_tx.send_replace(Some(pki.identity_state(SERVER_REPLICA)));
     wait_for_material_epoch_change(|| server_config.material_status(), previous_epoch).await;
 
+    let mut stale_errors = Vec::new();
+    let mut drain_successes = 0_usize;
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let first = peer.call(request_for_family(
@@ -2550,6 +2553,12 @@ async fn consensus_server_only_material_rotation_replaces_both_cached_lanes() {
                 b"drain-overflow".to_vec(),
             ));
             let (first, second) = tokio::join!(first, second);
+            for outcome in [&first, &second] {
+                match outcome {
+                    Ok(_) => drain_successes += 1,
+                    Err(error) => stale_errors.push(*error),
+                }
+            }
             if resolutions.load(Ordering::SeqCst) >= 4 && first.is_ok() && second.is_ok() {
                 return;
             }
@@ -2558,12 +2567,38 @@ async fn consensus_server_only_material_rotation_replaces_both_cached_lanes() {
     })
     .await
     .expect("server-only rotation must replace both cached lanes within the operation bound");
+    assert_eq!(
+        stale_errors.as_slice(),
+        [
+            SessionConsensusPeerError::Unavailable,
+            SessionConsensusPeerError::Unavailable
+        ],
+        "each stale lane must surface exactly one typed no-replay outcome"
+    );
+    assert_eq!(
+        handler.calls.load(Ordering::SeqCst),
+        2 + drain_successes,
+        "every successful drain call must reach the handler exactly once and every failed call zero times"
+    );
 
     assert_consensus_call_pair(&peer, &manifest, b"rotated-primary", b"rotated-overflow").await;
     assert_eq!(
         resolutions.load(Ordering::SeqCst),
         4,
         "one server-only material epoch change must replace both established lanes exactly once"
+    );
+    assert_eq!(
+        handler.calls.load(Ordering::SeqCst),
+        2 + drain_successes + 2
+    );
+
+    // No further lane replacement may trail the settle.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_consensus_call_pair(&peer, &manifest, b"settled-primary", b"settled-overflow").await;
+    assert_eq!(resolutions.load(Ordering::SeqCst), 4);
+    assert_eq!(
+        handler.calls.load(Ordering::SeqCst),
+        2 + drain_successes + 4
     );
 
     handle.abort_and_wait().await;
