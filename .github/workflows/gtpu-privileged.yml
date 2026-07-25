@@ -466,12 +466,33 @@ jobs:
           grep -Fq 'OPC_GTPU_TAG_PROOF_PROVEN' <<< "${load_output}"
           grep -Fq 'OPC_GTPU_LOAD_CAPABILITY_PROVEN' <<< "${load_output}"
 
-          # The suite shells out to ip, tc, nft and wg. iproute2 is present on
-          # the cloud image; the rest are not. No `gtp` module is needed --
-          # this is the tc/eBPF path, not the kernel GTP netdevice.
+          # The suite shells out to ip, tc, nft and wg. iproute2 ships on the
+          # cloud image; nftables and wireguard-tools do not. The guest has no
+          # network on purpose (`restrict=on` above), so resolve and download
+          # the RPMs here -- in a matching el9 container, so dependencies
+          # resolve against the right distribution -- and install them offline
+          # in the guest. No `gtp` module is needed: this is the tc/eBPF path,
+          # not the kernel GTP netdevice.
+          rpm_dir="${RUNNER_TEMP}/el9-rpms"
+          mkdir -p "${rpm_dir}"
+          docker run --rm -v "${rpm_dir}:/out" rockylinux/rockylinux:9 \
+            dnf install -y --downloadonly --downloaddir=/out --resolve \
+              nftables wireguard-tools
+          test -n "$(ls -A "${rpm_dir}")"
+          scp \
+            -i "${key}" \
+            -P 2228 \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            "${rpm_dir}"/*.rpm opc@127.0.0.1:/tmp/
+
           ssh "${ssh_options[@]}" opc@127.0.0.1 '
             set -euo pipefail
-            sudo dnf -y --setopt=install_weak_deps=False install nftables wireguard-tools kmod
+            sudo dnf install -y --disablerepo="*" /tmp/*.rpm
+            command -v nft
+            command -v wg
             sudo modprobe wireguard
             chmod 0755 /tmp/opc-gtpu-el9-datapath
           '
