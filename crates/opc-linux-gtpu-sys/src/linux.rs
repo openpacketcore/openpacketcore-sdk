@@ -194,6 +194,10 @@ impl GtpuUdpSocket {
     pub fn raw_fd(&self) -> i32 {
         self.fd.as_raw_fd()
     }
+
+    pub fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
+    }
 }
 
 pub fn open_netlink_socket(protocol: i32) -> io::Result<NetlinkSocket> {
