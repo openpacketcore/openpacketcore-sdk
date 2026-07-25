@@ -73,10 +73,11 @@ Its values are aggregate and contain no rejected endpoint or session fields.
 - IPv6 extension and checksum processing use bounded `bpf_loop` callbacks.
   The committed classifiers are verifier-loaded on exact Linux 6.8 in CI so
   their complete call chains remain below that kernel's cumulative 512-byte
-  BPF stack limit without reducing checksum coverage. That evidence covers one
-  kernel: because the limit is cumulative over the callback chain, a kernel
-  that exposes `bpf_loop` may still account for it differently, so exposing the
-  helper does not imply this object loads. Other kernels are unqualified rather
+  BPF stack limit without reducing checksum coverage. The RHEL 9 / 5.14 line
+  that Red Hat CoreOS ships for OpenShift 4.18 is gated the same way, because
+  the limit is cumulative over the callback chain and an enterprise backport
+  can account for it differently: exposing `bpf_loop` does not by itself imply
+  this object loads. Kernels outside the gated lines are unqualified rather
   than unsupported, and `opc-gtpu-dataplane`'s
   `probe_committed_classifier_load` establishes the answer on the node.
 - Outer IPv6 is `MaterializedOnly`: GSO and pending

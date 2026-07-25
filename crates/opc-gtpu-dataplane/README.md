@@ -1120,12 +1120,18 @@ offload support.
   only; it cannot detect a verifier rejection of the committed object, so a node
   admitted on that basis can still fail `BPF_PROG_LOAD` with no symptom beyond
   zero forwarding.
-- Kernels outside the 6.8-or-newer profile — including enterprise lines such as
-  the RHEL 9 family's 5.14 kernels, which backport `bpf_loop` — are therefore
-  **unqualified rather than known-good or known-bad**. This repository states no
-  verdict on them, because CI proves the load on exactly one kernel. Do not
-  infer support from a version comparison in either direction: establish it on
-  the node with [`probe_committed_classifier_load`], which attempts the real
+- **The RHEL 9 / 5.14 kernel line is a supported target and is CI-gated.** That
+  is the line Red Hat CoreOS ships for OpenShift 4.18, and it is an enterprise
+  backport rather than a mainline kernel, so helper availability alone would not
+  have settled it. CI loads both committed classifiers on a 5.14 el9 guest on
+  every run, alongside the exact-6.8 gate, and the job asserts the guest really
+  is on 5.14 before trusting the result. The el9 test binary is statically
+  linked so the guest's glibc cannot affect it.
+- Other kernels — outside both the 6.8-or-newer profile and the gated 5.14 line
+  — are **unqualified rather than known-good or known-bad**: this repository
+  states no verdict, because CI proves the load only on the kernels it gates. Do
+  not infer support from a version comparison in either direction. Establish it
+  on the node with [`probe_committed_classifier_load`], which attempts the real
   committed load and answers `Loadable`, `VerifierRejected`, or
   `UnableToAttempt`, attaching nothing and leaving no pinned state behind.
 - The ignored privileged eBPF proof additionally requires the `gtp` and

@@ -121,7 +121,9 @@ fn verify_bpffs(fd: &OwnedFd) -> io::Result<()> {
     if unsafe { libc::fstatfs(fd.as_raw_fd(), &mut status) } < 0 {
         return Err(io::Error::last_os_error());
     }
-    if status.f_type != BPF_FS_MAGIC {
+    // `statfs::f_type` is signed on musl and unsigned on glibc, so widen both
+    // sides into a type that holds either rather than assuming one libc.
+    if i128::from(status.f_type) != i128::from(BPF_FS_MAGIC) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "pin directory is not on bpffs",
