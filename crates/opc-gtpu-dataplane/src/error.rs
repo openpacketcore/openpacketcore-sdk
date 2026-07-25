@@ -199,16 +199,24 @@ impl GtpuError {
     /// Classify a `BPF_PROG_LOAD` failure into a verdict or a refusal.
     ///
     /// `verifier_produced_output` must be true only when the kernel returned a
-    /// non-empty verifier log, which proves the verifier ran. It is the only
-    /// evidence that separates a verifier rejection from an LSM denial, since
-    /// `bpf(2)` reports both as `EACCES`. The log itself is inspected by the
-    /// caller and never retained here.
+    /// non-empty verifier log. It proves the verifier **ran**; it does not
+    /// prove the verifier **rejected**, and the difference matters. The kernel
+    /// prints `processed N insns` on successful verification too, and
+    /// `bpf_prog_load` can still fail afterwards while allocating a program id
+    /// or an fd. A load that verified cleanly and then hit `EMFILE` therefore
+    /// arrives here with a full verifier log, and treating that as a verdict
+    /// would condemn a healthy node for transient fd pressure -- the exact
+    /// failure this split exists to prevent.
     ///
-    /// `E2BIG` and `EINVAL` are verdicts: the kernel evaluated the object and
-    /// will not run it, so reconfiguring the node does not help. An errno
-    /// outside the documented set yields a refusal classified as
-    /// [`ProgramLoadRefusal::Indeterminate`], because condemning a node needs
-    /// positive evidence and an unrecognized errno is not any.
+    /// So verifier output only promotes an errno the verifier itself can
+    /// return. Everything else stays a refusal no matter what the log says.
+    ///
+    /// The classification is deliberately asymmetric: an errno that *could* be
+    /// a verdict but arrives with no verifier output is
+    /// [`ProgramLoadRefusal::Indeterminate`] rather than a verdict, because
+    /// this crate's loader always retries with a log buffer, so a genuine
+    /// verifier failure cannot arrive silent. Condemning a node requires
+    /// positive evidence, and the absence of a log is not any.
     pub(crate) fn program_load_outcome(
         operation: &'static str,
         source: &io::Error,
@@ -220,14 +228,26 @@ impl GtpuError {
         const EACCES: i32 = 13;
         const EINVAL: i32 = 22;
 
-        if verifier_produced_output {
-            return Self::program_load_rejected(operation, source);
-        }
-
         let class = match source.raw_os_error() {
+            // Refused before the verifier: capabilities, the unprivileged-BPF
+            // sysctl, `RLIMIT_MEMLOCK` on kernels that still charge it, or a
+            // BPF-LSM that denies with EPERM. The verifier can also return
+            // EPERM for an unprivileged-only restriction, but that is fixed by
+            // granting the capability on this same node either way.
             Some(EPERM) => ProgramLoadRefusal::Unprivileged,
+            // The verifier's own rejection errnos. Only these may become a
+            // verdict, and only on positive evidence that the verifier spoke.
+            Some(EACCES | E2BIG | EINVAL) if verifier_produced_output => {
+                return Self::program_load_rejected(operation, source);
+            }
+            // EACCES with no verifier output is an LSM denial of
+            // `bpf { prog_load }`, which never reaches the verifier.
             Some(EACCES) => ProgramLoadRefusal::PolicyDenied,
-            Some(E2BIG | EINVAL) => return Self::program_load_rejected(operation, source),
+            // E2BIG and EINVAL also have pre-verifier sources: the instruction
+            // limit is checked before verification and is itself capability
+            // dependent, and a failed program allocation returns EINVAL rather
+            // than ENOMEM, so under a container memory limit this is memory
+            // pressure rather than a bad object.
             _ => ProgramLoadRefusal::Indeterminate,
         };
 
@@ -423,21 +443,78 @@ mod tests {
         assert_eq!(rejected.raw_os_error(), Some(13));
     }
 
-    /// `E2BIG` and `EINVAL` are verdicts: the kernel evaluated the object and
-    /// will not run it, so no amount of node reconfiguration helps.
+    /// `E2BIG` and `EINVAL` are verdicts only on evidence the verifier spoke.
+    /// The loader always retries with a log buffer, so a genuine verifier
+    /// failure cannot arrive silent; a silent one came from somewhere else.
     #[test]
-    fn size_and_validity_errnos_are_verdicts() {
+    fn size_and_validity_errnos_are_verdicts_only_with_verifier_output() {
         for errno in [7, 22] {
-            let error = GtpuError::program_load_outcome(
+            let spoke = GtpuError::program_load_outcome(
+                "ebpf_program_load",
+                &io::Error::from_raw_os_error(errno),
+                true,
+            );
+            assert!(
+                spoke.is_verifier_rejection(),
+                "errno {errno} with verifier output must be a verdict"
+            );
+            assert_eq!(spoke.load_refusal(), None);
+
+            let silent = GtpuError::program_load_outcome(
                 "ebpf_program_load",
                 &io::Error::from_raw_os_error(errno),
                 false,
             );
             assert!(
-                error.is_verifier_rejection(),
-                "errno {errno} must be a verdict"
+                !silent.is_verifier_rejection(),
+                "errno {errno} without verifier output must not condemn the node"
             );
-            assert_eq!(error.load_refusal(), None);
+            assert_eq!(
+                silent.load_refusal(),
+                Some(ProgramLoadRefusal::Indeterminate)
+            );
+        }
+    }
+
+    /// The kernel prints `processed N insns` on *successful* verification too,
+    /// and `bpf_prog_load` can still fail afterwards allocating a program id or
+    /// an fd. A load that verified cleanly and then hit fd or memory pressure
+    /// therefore carries a full verifier log while being entirely
+    /// environmental. Treating the log alone as a verdict would condemn a
+    /// healthy node -- the regression this test pins.
+    #[test]
+    fn post_verifier_environmental_errnos_are_not_verdicts_despite_a_log() {
+        // EMFILE, ENFILE, ENOMEM: all reachable after bpf_check() succeeds.
+        for errno in [24, 23, 12] {
+            let error = GtpuError::program_load_outcome(
+                "ebpf_program_load",
+                &io::Error::from_raw_os_error(errno),
+                true,
+            );
+            assert!(
+                !error.is_verifier_rejection(),
+                "errno {errno} is environmental and must not condemn the node"
+            );
+            assert_eq!(
+                error.load_refusal(),
+                Some(ProgramLoadRefusal::Indeterminate)
+            );
+        }
+    }
+
+    /// EPERM stays a privilege refusal whether or not the verifier spoke: the
+    /// verifier's own unprivileged-only restrictions are fixed by granting the
+    /// capability on this same node, exactly like the pre-verifier case.
+    #[test]
+    fn eperm_is_a_privilege_refusal_regardless_of_verifier_output() {
+        for produced_output in [false, true] {
+            let error = GtpuError::program_load_outcome(
+                "ebpf_program_load",
+                &io::Error::from_raw_os_error(1),
+                produced_output,
+            );
+            assert!(!error.is_verifier_rejection());
+            assert_eq!(error.load_refusal(), Some(ProgramLoadRefusal::Unprivileged));
         }
     }
 

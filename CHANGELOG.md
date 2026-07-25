@@ -112,9 +112,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   two are separated by whether the kernel returned verifier output rather than
   by errno; and because Rust maps both `EPERM` and `EACCES` to
   `ErrorKind::PermissionDenied`, a failure carrying no errno is classified
-  `Indeterminate` rather than guessed. `E2BIG` and `EINVAL` remain verdicts. The
-  verifier log is inspected only to establish that the verifier ran and is still
-  never retained, so the existing redaction properties are unchanged.
+  `Indeterminate` rather than guessed. Verifier output proves the verifier ran,
+  not that it rejected -- the kernel prints `processed N insns` on success too,
+  and a load can still fail afterwards allocating a program id or an fd -- so
+  output only promotes an errno the verifier itself returns (`EACCES`, `E2BIG`,
+  `EINVAL`), and one of those arriving with no output is `Indeterminate` rather
+  than a verdict. The verifier log is inspected only to establish that the
+  verifier ran and is still never retained, so the existing redaction properties
+  are unchanged.
 - **SWm omitted-DEA mobility fallback derives from the DER's offer —
   `opc-proto-diameter`:** when an exact-success DEA omits
   `MIP6-Feature-Vector` and no locally configured mobility mode was attached

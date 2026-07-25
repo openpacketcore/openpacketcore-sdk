@@ -63,14 +63,31 @@ route steering, XFRM policy, deployment defaults, or traffic-readiness policy.
   `GtpuError::is_verifier_rejection` answers that question directly rather than
   asking callers to reimplement the errno rules.
 
-  Two limits are deliberate. `bpf(2)` reports an LSM denial and a verifier
-  rejection with the same `EACCES`, so the two are separated by whether the
-  kernel returned verifier output, not by errno. And Rust maps both `EPERM` and
-  `EACCES` to `ErrorKind::PermissionDenied`, so a failure carrying no errno is
-  classified `Indeterminate` rather than guessed -- condemning a node requires
-  positive evidence. Capability, bpffs, and other I/O failures remain
-  `GtpuError::Io`. The verifier log is inspected only to establish that the
-  verifier ran, and is never retained.
+  Three limits are deliberate, and all three resolve toward *not* condemning a
+  node, because that is the direction that costs capacity:
+
+  - `bpf(2)` reports an LSM denial and a verifier rejection with the same
+    `EACCES`, so the two are separated by whether the kernel returned verifier
+    output, not by errno.
+  - Verifier output proves the verifier **ran**, not that it **rejected**. The
+    kernel prints `processed N insns` on successful verification too, and
+    `bpf_prog_load` can still fail afterwards allocating a program id or an fd.
+    A load that verified cleanly and then hit `EMFILE` therefore carries a full
+    verifier log while being purely environmental. Verifier output only
+    promotes an errno the verifier itself can return (`EACCES`, `E2BIG`,
+    `EINVAL`); anything else stays a refusal regardless of the log.
+  - Conversely, one of those errnos arriving with *no* verifier output is
+    `Indeterminate` rather than a verdict. The loader always retries with a log
+    buffer, so a genuine verifier failure cannot arrive silent -- a silent
+    `EINVAL` is a failed program allocation under a memory limit, and a silent
+    `E2BIG` is the pre-verification instruction-count check, which is itself
+    capability dependent.
+
+  Rust also maps both `EPERM` and `EACCES` to `ErrorKind::PermissionDenied`, so
+  a failure carrying no errno at all is `Indeterminate` rather than guessed.
+  Capability, bpffs, and other I/O failures remain `GtpuError::Io`. The verifier
+  log is inspected only to establish that the verifier ran, and is never
+  retained.
 
 ## Usage
 
