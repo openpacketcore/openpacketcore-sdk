@@ -309,17 +309,18 @@ fn complete_handshake_with_phase(
     panic!("TLS handshake exceeded the bounded exchange");
 }
 
-fn assert_limit_rejection_retains_epoch(controller: &TlsMaterialController, epoch: u64) {
+fn assert_limit_rejection_retains_epoch(
+    controller: &TlsMaterialController,
+    epoch: u64,
+    expected: TlsMaterialReloadReason,
+) {
     let status = controller.status();
     assert_eq!(status.epoch().get(), epoch);
     assert_eq!(
         status.availability(),
         TlsMaterialAvailability::RetainingLastGood
     );
-    assert_eq!(
-        status.reason(),
-        Some(TlsMaterialReloadReason::MaterialLimitExceeded)
-    );
+    assert_eq!(status.reason(), Some(expected));
     let debug = format!("{status:?}");
     assert!(!debug.contains("spiffe://"));
     assert!(!debug.contains("BEGIN"));
@@ -582,7 +583,11 @@ fn controller_rejects_oversized_candidates_and_retains_last_good() {
     source_tx
         .send(Some(oversized_chain))
         .expect("publish oversized chain");
-    assert_limit_rejection_retains_epoch(&controller, 1);
+    assert_limit_rejection_retains_epoch(
+        &controller,
+        1,
+        TlsMaterialReloadReason::MaterialLimitExceeded,
+    );
 
     let mut oversized_key = baseline.clone();
     oversized_key.svid.private_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(vec![
@@ -593,7 +598,11 @@ fn controller_rejects_oversized_candidates_and_retains_last_good() {
     source_tx
         .send(Some(oversized_key))
         .expect("publish oversized key");
-    assert_limit_rejection_retains_epoch(&controller, 1);
+    assert_limit_rejection_retains_epoch(
+        &controller,
+        1,
+        TlsMaterialReloadReason::MaterialLimitExceeded,
+    );
 
     let mut oversized_bundles = baseline.clone();
     for index in 0..MAX_TLS_MATERIAL_TRUST_BUNDLES {
@@ -607,7 +616,11 @@ fn controller_rejects_oversized_candidates_and_retains_last_good() {
     source_tx
         .send(Some(oversized_bundles))
         .expect("publish oversized bundle count");
-    assert_limit_rejection_retains_epoch(&controller, 1);
+    assert_limit_rejection_retains_epoch(
+        &controller,
+        1,
+        TlsMaterialReloadReason::TrustBundleLimitExceeded,
+    );
 
     let mut oversized_anchors = baseline.clone();
     oversized_anchors
@@ -620,7 +633,11 @@ fn controller_rejects_oversized_candidates_and_retains_last_good() {
     source_tx
         .send(Some(oversized_anchors))
         .expect("publish oversized anchor count");
-    assert_limit_rejection_retains_epoch(&controller, 1);
+    assert_limit_rejection_retains_epoch(
+        &controller,
+        1,
+        TlsMaterialReloadReason::TrustBundleLimitExceeded,
+    );
 
     let mut oversized_total = baseline;
     oversized_total
@@ -638,7 +655,14 @@ fn controller_rejects_oversized_candidates_and_retains_last_good() {
     source_tx
         .send(Some(oversized_total))
         .expect("publish oversized aggregate material");
-    assert_limit_rejection_retains_epoch(&controller, 1);
+    // The total-byte bound spans the SVID and the bundles together, so it
+    // genuinely cannot be attributed to either half. It stays the generic
+    // reason rather than being forced onto the bundle.
+    assert_limit_rejection_retains_epoch(
+        &controller,
+        1,
+        TlsMaterialReloadReason::MaterialLimitExceeded,
+    );
 }
 
 #[tokio::test]
@@ -1232,5 +1256,121 @@ fn only_redundantly_presented_roots_bound_local_and_peer_chain_expiry() {
     assert_eq!(
         client_peer.certificate_chain_expires_at(),
         expected_leaf_expiry
+    );
+}
+
+// ---- issue #158 residual: time-driven expiry must republish status ----
+
+/// Expiry is time-driven, but the reconciliation task only ever woke on a
+/// *source* change. With a quiet source, retained material could pass its own
+/// expiry while the published status still read `Ready`, so a readiness
+/// consumer watching the channel saw healthy material that was not.
+///
+/// Handshakes were never affected -- `snapshot()` and `admit()` refresh first,
+/// so expired material could not authenticate a connection. This is about the
+/// signal the crate publishes for readiness being true on its own.
+#[tokio::test]
+async fn status_reports_expiry_without_being_poked() {
+    let ca = test_ca("expiry CA");
+    let now = time::OffsetDateTime::now_utc();
+    // Valid now, expires shortly. Nothing will touch the controller after
+    // construction, so only a time-driven wakeup can move the status.
+    let expiring = material(
+        CLIENT_ID,
+        &ca,
+        Some((
+            now - time::Duration::minutes(1),
+            now + time::Duration::seconds(2),
+        )),
+    );
+    let (_source_tx, source_rx) = watch::channel(Some(expiring.state));
+    let controller = TlsMaterialController::new(source_rx);
+    assert_eq!(
+        controller.status().availability(),
+        TlsMaterialAvailability::Ready,
+        "material must start usable"
+    );
+
+    // Subscribe and then deliberately do NOT call status()/snapshot() again --
+    // observing through the channel is exactly the readiness consumer's view.
+    let mut status_rx = controller.subscribe_status();
+    let expired = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if status_rx.changed().await.is_err() {
+                return None;
+            }
+            let status = *status_rx.borrow_and_update();
+            if status.reason() == Some(TlsMaterialReloadReason::LastGoodExpired) {
+                return Some(status);
+            }
+        }
+    })
+    .await
+    .expect("status must republish on the expiry deadline, not only on a source change")
+    .expect("status channel must stay open");
+
+    assert_eq!(expired.availability(), TlsMaterialAvailability::Unavailable);
+}
+
+// ---- issue #158 residual: trust-bundle rejections are attributable ----
+
+/// A trust-anchor rotation that overruns a bound used to report
+/// `material_limit_exceeded`, indistinguishable from an oversized local SVID,
+/// so an operator could not tell which half of the material was at fault.
+#[test]
+fn trust_bundle_bound_breaches_are_attributed_to_the_bundle() {
+    assert_eq!(
+        TlsMaterialReloadReason::TrustBundleLimitExceeded.as_str(),
+        "trust_bundle_limit_exceeded"
+    );
+    assert_eq!(
+        TlsMaterialReloadReason::InvalidTrustBundle.as_str(),
+        "invalid_trust_bundle"
+    );
+    // The closed reason set stays exhaustively enumerated.
+    assert_eq!(TlsMaterialReloadReason::ALL.len(), 14);
+    for reason in TlsMaterialReloadReason::ALL {
+        assert!(!reason.as_str().is_empty());
+    }
+    // Labels remain unique, or two causes would collapse in a dashboard.
+    let mut labels: Vec<&str> = TlsMaterialReloadReason::ALL
+        .iter()
+        .map(|reason| reason.as_str())
+        .collect();
+    labels.sort_unstable();
+    let count = labels.len();
+    labels.dedup();
+    assert_eq!(labels.len(), count, "reason labels must be unique");
+}
+
+/// The expiry wakeup measures remaining validity on the wall clock but waits on
+/// the runtime clock. Those are the same clock in production; under
+/// `tokio::time::pause()` they are not, and re-arming unconditionally spun the
+/// loop -- burning CPU and fast-forwarding the virtual clock of any test
+/// holding a controller, which silently invalidates that test's own deadlines.
+///
+/// Adversarial review reproduced ~86,000 iterations and ~60 days of virtual
+/// time in 1.5 real seconds. This pins the convergence.
+#[tokio::test(start_paused = true)]
+async fn a_paused_clock_does_not_spin_or_run_the_virtual_clock_away() {
+    let ca = test_ca("paused clock CA");
+    let long_lived = material(CLIENT_ID, &ca, None); // valid ~1 hour
+    let (_source_tx, source_rx) = watch::channel(Some(long_lived.state));
+    let _controller = TlsMaterialController::new(source_rx);
+
+    let started = tokio::time::Instant::now();
+    // Block on genuinely non-timer work so the runtime is idle and free to
+    // auto-advance: this is the shape that exposed the spin.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        let _ = tx.blocking_send(());
+    });
+    let _ = rx.recv().await;
+
+    let virtual_elapsed = tokio::time::Instant::now().duration_since(started);
+    assert!(
+        virtual_elapsed < Duration::from_secs(600),
+        "the reconciliation timer ran the virtual clock away: {virtual_elapsed:?}"
     );
 }

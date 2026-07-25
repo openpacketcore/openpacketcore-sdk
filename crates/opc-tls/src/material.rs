@@ -15,6 +15,7 @@ use rustls_pki_types::CertificateDer;
 use serde::Serialize;
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 use tokio::runtime::Handle;
 use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 use zeroize::Zeroizing;
@@ -96,6 +97,14 @@ pub enum TlsMaterialReloadReason {
     NotYetValidMaterial,
     /// The candidate workload identity was invalid or internally inconsistent.
     InvalidWorkloadIdentity,
+    /// The candidate trust bundles exceeded a fixed bundle, anchor, or byte
+    /// bound. Distinct from [`Self::MaterialLimitExceeded`] so a trust-anchor
+    /// rotation that overruns a bound is attributable to the bundle rather
+    /// than to the local SVID.
+    TrustBundleLimitExceeded,
+    /// A candidate trust bundle was internally inconsistent, such as a bundle
+    /// keyed by a trust domain other than its own.
+    InvalidTrustBundle,
     /// The candidate changed the controller's pinned local SPIFFE identity.
     LocalIdentityChanged,
     /// The last accepted snapshot reached its effective certificate-chain
@@ -107,7 +116,7 @@ pub enum TlsMaterialReloadReason {
 
 impl TlsMaterialReloadReason {
     /// Every closed reason, for exhaustive fixed-cardinality handling.
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 14] = [
         Self::AwaitingInitialMaterial,
         Self::MaterialUnavailable,
         Self::SourceClosed,
@@ -117,6 +126,8 @@ impl TlsMaterialReloadReason {
         Self::ExpiredMaterial,
         Self::NotYetValidMaterial,
         Self::InvalidWorkloadIdentity,
+        Self::TrustBundleLimitExceeded,
+        Self::InvalidTrustBundle,
         Self::LocalIdentityChanged,
         Self::LastGoodExpired,
         Self::EpochExhausted,
@@ -134,6 +145,8 @@ impl TlsMaterialReloadReason {
             Self::ExpiredMaterial => "expired_material",
             Self::NotYetValidMaterial => "not_yet_valid_material",
             Self::InvalidWorkloadIdentity => "invalid_workload_identity",
+            Self::TrustBundleLimitExceeded => "trust_bundle_limit_exceeded",
+            Self::InvalidTrustBundle => "invalid_trust_bundle",
             Self::LocalIdentityChanged => "local_identity_changed",
             Self::LastGoodExpired => "last_good_expired",
             Self::EpochExhausted => "epoch_exhausted",
@@ -360,12 +373,23 @@ impl TlsMaterialController {
     /// controllers remain compatible but never mutate process-wide security
     /// evidence.
     pub fn new(source_rx: watch::Receiver<Option<IdentityState>>) -> Self {
-        Self::new_with_optional_pin(
+        let controller = Self::new_with_optional_pin(
             MaterialSourceReceiver::Generic(source_rx.clone()),
             source_rx,
             None,
             None,
-        )
+        );
+        // Reconcile in the background when a runtime is available, so the
+        // published status reaches expiry on its own rather than only when a
+        // caller happens to ask. Previously only the projected source did
+        // this, which left a generic-source consumer watching a status that
+        // could read `Ready` past the material's own expiry. Outside a runtime
+        // there is nothing to spawn onto and the status stays lazy, which is
+        // the pre-existing behaviour.
+        if let Ok(runtime) = Handle::try_current() {
+            controller.start_reconciliation_task(runtime);
+        }
+        controller
     }
 
     /// Create a controller pinned to one explicit local SPIFFE identity.
@@ -373,12 +397,19 @@ impl TlsMaterialController {
         source_rx: watch::Receiver<Option<IdentityState>>,
         local_spiffe_id: SpiffeId,
     ) -> Self {
-        Self::new_with_optional_pin(
+        let controller = Self::new_with_optional_pin(
             MaterialSourceReceiver::Generic(source_rx.clone()),
             source_rx,
             Some(local_spiffe_id),
             None,
-        )
+        );
+        // Same reconciliation as `new`: a pinned controller's published status
+        // must reach expiry on its own too, or readiness would be truthful for
+        // one constructor and stale for the other.
+        if let Ok(runtime) = Handle::try_current() {
+            controller.start_reconciliation_task(runtime);
+        }
+        controller
     }
 
     /// Claim one projected source as this controller's sole authority.
@@ -449,17 +480,74 @@ impl TlsMaterialController {
         let mut source_changes = self.material_source_receiver();
         let weak = Arc::downgrade(&self.inner);
         let task = runtime.spawn(async move {
+            // Expiry is measured on the wall clock but the wait happens on the
+            // runtime clock. They are the same clock in production. Under
+            // `tokio::time::pause()` they are not: a sleep auto-advances
+            // instantly while the wall clock only creeps forward in real time,
+            // so a timer armed for the remaining validity fires immediately,
+            // finds the material still unexpired, and re-arms -- spinning, and
+            // fast-forwarding the virtual clock of any test holding this
+            // controller until that test's own deadlines are meaningless.
+            //
+            // Checking whether the wall clock advanced does not help, because
+            // it does advance -- just far slower than the virtual one. Instead
+            // bound the number of consecutive wakes that changed nothing. In
+            // production a wake happens at the deadline and does change the
+            // status, so the budget never depletes; a clock jump costs a few
+            // extra wakes and then falls back to source-driven reconciliation,
+            // which is the pre-existing behaviour.
+            let mut unproductive_wakes: u8 = 0;
+            let mut previous_status: Option<TlsMaterialStatus> = None;
             loop {
                 let Some(inner) = weak.upgrade() else {
                     break;
                 };
-                TlsMaterialController { inner }.status();
+                let controller = TlsMaterialController { inner };
+                let status = controller.status();
+                if previous_status.is_some_and(|previous| previous == status) {
+                    unproductive_wakes = unproductive_wakes.saturating_add(1);
+                } else {
+                    unproductive_wakes = 0;
+                }
+                previous_status = Some(status);
+                // Expiry is time-driven, but a source watch only fires when new
+                // material is published. Without this the published status goes
+                // stale: retained last-known-good can pass its own expiry while
+                // the channel still reads `Ready`, so a readiness consumer sees
+                // healthy material that is not. Handshakes were never affected
+                // -- `snapshot()` and `admit()` refresh first -- but the signal
+                // this crate exposes for readiness has to be true on its own.
+                let expiry_wakeup = if unproductive_wakes < MAX_UNPRODUCTIVE_EXPIRY_WAKES {
+                    status
+                        .certificate_chain_expires_at()
+                        .and_then(next_expiry_sleep)
+                } else {
+                    None
+                };
+                drop(controller);
 
-                if source_changes.changed().await.is_err() {
-                    if let Some(inner) = weak.upgrade() {
-                        TlsMaterialController { inner }.status();
+                match expiry_wakeup {
+                    Some(sleep_for) => {
+                        tokio::select! {
+                            changed = source_changes.changed() => {
+                                if changed.is_err() {
+                                    if let Some(inner) = weak.upgrade() {
+                                        TlsMaterialController { inner }.status();
+                                    }
+                                    break;
+                                }
+                            }
+                            () = tokio::time::sleep(sleep_for) => {}
+                        }
                     }
-                    break;
+                    None => {
+                        if source_changes.changed().await.is_err() {
+                            if let Some(inner) = weak.upgrade() {
+                                TlsMaterialController { inner }.status();
+                            }
+                            break;
+                        }
+                    }
                 }
             }
         });
@@ -842,6 +930,30 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Time to sleep before re-publishing status for a chain expiring at `expires_at`.
+///
+/// Returns `None` when the deadline has already passed, so the caller
+/// re-evaluates immediately rather than sleeping. The wait is capped at
+/// [`MAX_EXPIRY_RECHECK`] so a distant expiry still re-publishes periodically
+/// and a clock adjustment cannot strand the task for the whole validity window.
+fn next_expiry_sleep(expires_at: Timestamp) -> Option<Duration> {
+    let now = Timestamp::now_utc();
+    let remaining = *expires_at.as_offset_datetime() - *now.as_offset_datetime();
+    if remaining <= time::Duration::ZERO {
+        return None;
+    }
+    let remaining = Duration::from_secs(u64::try_from(remaining.whole_seconds()).ok()?);
+    Some(remaining.min(MAX_EXPIRY_RECHECK).max(MIN_EXPIRY_RECHECK))
+}
+
+/// Upper bound on how long the reconciliation task sleeps waiting for expiry.
+const MAX_EXPIRY_RECHECK: Duration = Duration::from_secs(60);
+/// Lower bound, so a near-deadline expiry cannot spin the task.
+const MIN_EXPIRY_RECHECK: Duration = Duration::from_millis(250);
+/// Consecutive expiry wakes that changed nothing before the timer is disarmed
+/// and reconciliation falls back to source-driven only.
+const MAX_UNPRODUCTIVE_EXPIRY_WAKES: u8 = 4;
+
 fn expire_locked(
     controller: &mut ControllerState,
     status_tx: &watch::Sender<TlsMaterialStatus>,
@@ -955,6 +1067,8 @@ fn controller_reason_kind(reason: TlsMaterialReloadReason) -> SecurityRotationKi
         | TlsMaterialReloadReason::InvalidCertificateChain
         | TlsMaterialReloadReason::InvalidWorkloadIdentity
         | TlsMaterialReloadReason::EpochExhausted => SecurityRotationKind::TlsMaterial,
+        TlsMaterialReloadReason::TrustBundleLimitExceeded
+        | TlsMaterialReloadReason::InvalidTrustBundle => SecurityRotationKind::TrustBundle,
     }
 }
 
@@ -990,9 +1104,11 @@ fn validate_candidate_chain_temporal_validity(
 fn validate_candidate(
     candidate: &IdentityState,
 ) -> Result<(IdentityState, Timestamp), TlsMaterialReloadReason> {
+    if candidate.trust_bundles.bundles.len() > MAX_TLS_MATERIAL_TRUST_BUNDLES {
+        return Err(TlsMaterialReloadReason::TrustBundleLimitExceeded);
+    }
     if candidate.svid.cert_chain.is_empty()
         || candidate.svid.cert_chain.len() > MAX_TLS_MATERIAL_CHAIN_CERTIFICATES
-        || candidate.trust_bundles.bundles.len() > MAX_TLS_MATERIAL_TRUST_BUNDLES
         || candidate.svid.private_key.secret_der().len() > MAX_TLS_MATERIAL_PRIVATE_KEY_BYTES
     {
         return Err(TlsMaterialReloadReason::MaterialLimitExceeded);
@@ -1017,24 +1133,26 @@ fn validate_candidate(
     for bundle in candidate.trust_bundles.bundles.values() {
         anchor_count = anchor_count
             .checked_add(bundle.certificates.len())
-            .ok_or(TlsMaterialReloadReason::MaterialLimitExceeded)?;
+            .ok_or(TlsMaterialReloadReason::TrustBundleLimitExceeded)?;
         if anchor_count > MAX_TLS_MATERIAL_TRUST_ANCHORS {
-            return Err(TlsMaterialReloadReason::MaterialLimitExceeded);
+            return Err(TlsMaterialReloadReason::TrustBundleLimitExceeded);
         }
         for certificate in &bundle.certificates {
             material_bytes = material_bytes
                 .checked_add(certificate.as_ref().len())
-                .ok_or(TlsMaterialReloadReason::MaterialLimitExceeded)?;
+                .ok_or(TlsMaterialReloadReason::TrustBundleLimitExceeded)?;
         }
     }
     for (domain, bundle) in &candidate.trust_bundles.bundles {
         if domain != &bundle.trust_domain {
-            return Err(TlsMaterialReloadReason::InvalidWorkloadIdentity);
+            // A bundle keyed by a foreign trust domain is a defect in the
+            // bundle, not in this workload's own identity.
+            return Err(TlsMaterialReloadReason::InvalidTrustBundle);
         }
         material_bytes = material_bytes
             .checked_add(domain.as_str().len())
             .and_then(|bytes| bytes.checked_add(bundle.trust_domain.as_str().len()))
-            .ok_or(TlsMaterialReloadReason::MaterialLimitExceeded)?;
+            .ok_or(TlsMaterialReloadReason::TrustBundleLimitExceeded)?;
     }
     validate_material_shape(
         candidate.svid.cert_chain.len(),
@@ -1345,7 +1463,7 @@ mod tests {
 
     #[test]
     fn controller_reasons_use_svid_only_when_the_component_is_provable() {
-        assert_eq!(TlsMaterialReloadReason::ALL.len(), 12);
+        assert_eq!(TlsMaterialReloadReason::ALL.len(), 14);
         for reason in TlsMaterialReloadReason::ALL {
             let expected = match reason {
                 TlsMaterialReloadReason::PrivateKeyMismatch
@@ -1360,6 +1478,11 @@ mod tests {
                 | TlsMaterialReloadReason::InvalidCertificateChain
                 | TlsMaterialReloadReason::InvalidWorkloadIdentity
                 | TlsMaterialReloadReason::EpochExhausted => SecurityRotationKind::TlsMaterial,
+                // Attributable to the trust bundle rather than to this
+                // workload's own SVID, so a trust-anchor rotation is
+                // distinguishable in telemetry from a local credential fault.
+                TlsMaterialReloadReason::TrustBundleLimitExceeded
+                | TlsMaterialReloadReason::InvalidTrustBundle => SecurityRotationKind::TrustBundle,
             };
             assert_eq!(controller_reason_kind(reason), expected, "{reason:?}");
         }

@@ -1129,6 +1129,18 @@ impl std::fmt::Debug for RemoteSessionBackend {
 }
 
 impl RemoteSessionBackend {
+    /// Current redaction-safe health of the credentials this backend
+    /// authenticates with, or `None` when running without TLS.
+    ///
+    /// Mirrors [`crate::RemoteSessionConsensusPeer::credential_health`] so a
+    /// readiness probe reads the same signal whichever transport it holds.
+    #[must_use]
+    pub fn credential_health(&self) -> Option<opc_tls::TlsMaterialStatus> {
+        self.tls_config
+            .as_ref()
+            .map(opc_tls::AuthenticatedClientConfig::material_status)
+    }
+
     /// Create a new mTLS remote backend client.
     ///
     /// `binding` supplies the exact local and remote replica IDs, expected peer

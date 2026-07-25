@@ -138,12 +138,19 @@ evidence (testkit) exercises those counters end to end.
 The in-process campaigns assert the equivalent typed distinctions directly:
 material availability (`Ready` vs `RetainingLastGood`) with the exact reload
 rejection reason (`LocalIdentityChanged`, `MaterialUnavailable`,
-`MaterialLimitExceeded`), typed peer error classes (`Authentication`,
+`TrustBundleLimitExceeded`), typed peer error classes (`Authentication`,
 `Timeout`, `Unavailable`), and per-outcome transport tallies
 (authentication-failure outcomes must be exactly zero). Any fixed-label
 regression in the metric pipeline fails the multi-process campaigns; any
 semantic confusion between the six failure classes fails the in-process
 campaigns.
+
+The over-limit campaign asserts `TrustBundleLimitExceeded` rather than the
+generic `MaterialLimitExceeded`: its candidate overruns the trust-bundle bound,
+and that is attributable to the bundle rather than to the local SVID. The
+generic reason remains correct for a candidate whose SVID chain, private key,
+or aggregate byte total breaches a bound, since the aggregate bound spans both
+halves and cannot be attributed to either.
 
 ## 6. Campaigns and pass/fail SLOs
 

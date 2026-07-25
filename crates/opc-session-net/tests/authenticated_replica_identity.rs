@@ -1970,7 +1970,8 @@ async fn rejected_reloads_retain_last_good_material_and_never_interrupt_traffic(
     traffic.assert_progress().await;
     assert_resolver_calls_stable(&setup.resolve_calls, 2).await;
 
-    // An oversized reload exceeds the fixed trust-bundle count bound.
+    // An oversized reload exceeds the fixed trust-bundle count bound, and is
+    // now attributed to the bundle rather than to the local SVID.
     setup
         .client_tx
         .send_replace(Some(oversized_bundle_identity_state(&setup.pki, 1)));
@@ -1978,7 +1979,7 @@ async fn rejected_reloads_retain_last_good_material_and_never_interrupt_traffic(
         wait_for_material_rejection(
             || setup.client_config.material_status(),
             client_epoch,
-            TlsMaterialReloadReason::MaterialLimitExceeded,
+            TlsMaterialReloadReason::TrustBundleLimitExceeded,
         )
         .await,
     );
@@ -2024,7 +2025,7 @@ async fn rejected_reloads_retain_last_good_material_and_never_interrupt_traffic(
         wait_for_material_rejection(
             || setup.server_config.material_status(),
             server_epoch,
-            TlsMaterialReloadReason::MaterialLimitExceeded,
+            TlsMaterialReloadReason::TrustBundleLimitExceeded,
         )
         .await,
     );
@@ -2524,4 +2525,47 @@ async fn server_revalidates_a_rotated_client_svid_instead_of_resuming_identity()
     ));
 
     handle.abort();
+}
+
+// ---- issue #158 residual: credential health must be readable from the handle ----
+
+/// A CNF readiness probe needs the credential signal without reaching past the
+/// session handle into `opc-tls`. The status was reachable only from the config
+/// the caller happened to still hold; there was no route through the transport.
+///
+/// It must also stay redaction-safe, because readiness output is widely logged.
+#[tokio::test]
+async fn credential_health_is_readable_from_the_peer_handle_and_stays_redacted() {
+    let pki = TestPki::new();
+    let manifest = manifest("cluster-credential-health", "generation-credential-health");
+    let addr: SocketAddr = "127.0.0.1:9".parse().expect("unused address");
+    let config = pki.client_config(1);
+    // Hold the config's own view so the assertion proves the handle routes the
+    // real controller status rather than fabricating one.
+    let direct = config.material_status();
+    let peer = remote(&manifest, 1, SERVER_REPLICA, addr, config);
+
+    let health = peer
+        .credential_health()
+        .expect("a TLS-configured peer must report credential health");
+    assert_eq!(
+        health.epoch(),
+        direct.epoch(),
+        "the handle must report the controller's epoch"
+    );
+    assert_eq!(health.availability(), direct.availability());
+    assert_eq!(health.reason(), direct.reason());
+    assert!(health.epoch().get() >= 1);
+    // Whatever the fixture's state, a configured peer is serving material:
+    // either current, or the retained last known-good.
+    assert!(
+        matches!(
+            health.availability(),
+            TlsMaterialAvailability::Ready | TlsMaterialAvailability::RetainingLastGood
+        ),
+        "a configured peer must be serving material: {health:?}"
+    );
+
+    // Readiness output is logged; it must not carry identity or key material.
+    assert_status_redaction_safe(health);
 }
