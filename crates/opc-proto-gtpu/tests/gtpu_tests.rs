@@ -811,3 +811,41 @@ fn test_regression_raw_preserving_fuzz_inputs() {
         assert_eq!(raw_dst.as_ref(), data);
     }
 }
+
+/// Issue #341 requires that no raw TEID or subscriber payload reaches `Debug`.
+/// The typed control models already redact; the generic frame types derived
+/// `Debug` over `pub teid: u32` and over the payload slice, so `{:?}` on a
+/// decoded G-PDU printed both the tunnel identifier and the user-plane bytes.
+#[test]
+fn generic_frame_debug_leaks_neither_teid_nor_payload() {
+    const TEID: u32 = 0xdead_beef;
+    // A recognisable "subscriber" payload standing in for user-plane bytes.
+    let payload: [u8; 8] = [0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58];
+
+    let mut frame = Vec::new();
+    frame.push(0x30); // version 1, PT=1, no optional fields
+    frame.push(0xff); // G-PDU
+    frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    frame.extend_from_slice(&TEID.to_be_bytes());
+    frame.extend_from_slice(&payload);
+
+    let (_, message) =
+        GtpuMessage::decode(&frame, DecodeContext::default()).expect("a well-formed G-PDU decodes");
+
+    let rendered = format!("{:?} {:?}", message, message.header);
+    assert!(
+        !rendered.contains("3735928559") && !rendered.to_lowercase().contains("deadbeef"),
+        "Debug leaked the TEID: {rendered}"
+    );
+    for octet in payload {
+        assert!(
+            !rendered.contains(&format!("{octet}")),
+            "Debug leaked payload octet {octet}: {rendered}"
+        );
+    }
+    // It must still be useful for diagnosis.
+    assert!(
+        rendered.contains("payload_len"),
+        "Debug must report a length"
+    );
+}

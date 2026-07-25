@@ -9,7 +9,9 @@ use opc_proto_gtpu::{
     GtpuExtensionHeaderRecipient, GtpuExtensionHeaderType, GtpuExtensionHeaderTypeList, GtpuHeader,
     GtpuMessage, GtpuPrivateExtension, GtpuRecoveryTimeStamp,
     GtpuSupportedExtensionHeadersNotification, GtpuTunnelEndpointId, PduSessionContainer,
-    PduSessionContainerError,
+    PduSessionContainerError, GTPU_MESSAGE_ECHO_REQUEST, GTPU_MESSAGE_ECHO_RESPONSE,
+    GTPU_MESSAGE_END_MARKER, GTPU_MESSAGE_ERROR_INDICATION, GTPU_MESSAGE_G_PDU,
+    GTPU_MESSAGE_SUPPORTED_EXTENSION_HEADERS_NOTIFICATION,
 };
 use opc_protocol::{
     BorrowDecode, DecodeContext, DecodeErrorCode, Encode, EncodeContext, UnknownIePolicy,
@@ -1428,4 +1430,54 @@ fn malformed_lengths_limits_and_capacity_are_bounded() {
             .code(),
         &GtpuControlCodecErrorCode::TrailingBytes
     );
+}
+
+/// A transport demultiplexing a receive queue must be able to label and route a
+/// datagram from the typed value it already has, without re-parsing the header.
+#[test]
+fn control_messages_report_their_message_type() {
+    let cases: [(GtpuControlMessage, u8); 5] = [
+        (decode(ECHO_REQUEST), GTPU_MESSAGE_ECHO_REQUEST),
+        (decode(ECHO_RESPONSE), GTPU_MESSAGE_ECHO_RESPONSE),
+        (
+            decode(ERROR_INDICATION_IPV4_WITH_UDP_PORT),
+            GTPU_MESSAGE_ERROR_INDICATION,
+        ),
+        (
+            decode(SUPPORTED_EXTENSION_HEADERS),
+            GTPU_MESSAGE_SUPPORTED_EXTENSION_HEADERS_NOTIFICATION,
+        ),
+        (decode(END_MARKER), GTPU_MESSAGE_END_MARKER),
+    ];
+    for (message, expected) in cases {
+        assert_eq!(message.message_type(), expected, "{message:?}");
+        // The reported type must match the byte actually on the wire.
+        let encoded = encode(&message);
+        assert_eq!(encoded[1], expected, "wire byte disagrees: {message:?}");
+    }
+    // G-PDU is nameable but deliberately not a control message.
+    assert_eq!(GTPU_MESSAGE_G_PDU, 255);
+}
+
+/// Sequence is exposed only where TS 29.281 gives it correlating meaning, so a
+/// caller cannot accidentally correlate on a receiver-ignored field.
+#[test]
+fn only_echo_exposes_a_correlating_sequence_number() {
+    let request = decode(ECHO_REQUEST);
+    let response = decode(ECHO_RESPONSE);
+    assert!(request.sequence_number().is_some());
+    assert!(response.sequence_number().is_some());
+    assert_eq!(request.sequence_number(), response.sequence_number());
+
+    for message in [
+        decode(ERROR_INDICATION_IPV4_WITH_UDP_PORT),
+        decode(SUPPORTED_EXTENSION_HEADERS),
+        decode(END_MARKER),
+    ] {
+        assert_eq!(
+            message.sequence_number(),
+            None,
+            "sequence is receiver-ignored here: {message:?}"
+        );
+    }
 }

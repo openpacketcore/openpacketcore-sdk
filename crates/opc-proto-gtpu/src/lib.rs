@@ -30,7 +30,8 @@ pub use control::{
     GtpuPeerAddress, GtpuPrivateExtension, GtpuRecovery, GtpuRecoveryTimeStamp,
     GtpuSupportedExtensionHeadersNotification, GtpuTunnelEndpointId, GtpuUnknownControlIe,
     GTPU_MESSAGE_ECHO_REQUEST, GTPU_MESSAGE_ECHO_RESPONSE, GTPU_MESSAGE_END_MARKER,
-    GTPU_MESSAGE_ERROR_INDICATION, GTPU_MESSAGE_SUPPORTED_EXTENSION_HEADERS_NOTIFICATION,
+    GTPU_MESSAGE_ERROR_INDICATION, GTPU_MESSAGE_G_PDU,
+    GTPU_MESSAGE_SUPPORTED_EXTENSION_HEADERS_NOTIFICATION,
 };
 
 fn validation_strictness(level: ValidationLevel) -> u8 {
@@ -178,7 +179,7 @@ impl GtpuExtensionHeaderType {
 /// @spec 3GPP TS29281 R18 5.1
 /// @req REQ-3GPP-TS29281-R18-5.1-002
 /// @conformance full
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct GtpuHeader {
     /// GTP-U version (must be 1).
     pub version: u8,
@@ -218,7 +219,7 @@ pub struct GtpuHeader {
 /// @spec 3GPP TS29281 R18 5.1
 /// @req REQ-3GPP-TS29281-R18-5.1-003
 /// @conformance full
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct GtpuMessage<'a> {
     /// Parsed GTP-U header.
     pub header: GtpuHeader,
@@ -270,7 +271,7 @@ impl<'a> GtpuMessage<'a> {
 /// @spec 3GPP TS29281 R18 5.1
 /// @req REQ-3GPP-TS29281-R18-5.1-004
 /// @conformance full
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct OwnedGtpuMessage {
     /// Parsed GTP-U header.
     pub header: GtpuHeader,
@@ -278,6 +279,63 @@ pub struct OwnedGtpuMessage {
     pub raw_extension_headers: Bytes,
     /// GTP-U payload.
     pub payload: Bytes,
+}
+
+impl fmt::Debug for GtpuHeader {
+    /// Structural fields only. The TEID identifies one subscriber's tunnel, so
+    /// it is redacted here exactly as the typed control models redact it; the
+    /// value stays available through the field for callers that need it.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GtpuHeader")
+            .field("version", &self.version)
+            .field("protocol_type", &self.protocol_type)
+            .field("reserved", &self.reserved)
+            .field("ext_hdr_flag", &self.ext_hdr_flag)
+            .field("seq_num_flag", &self.seq_num_flag)
+            .field("npdu_num_flag", &self.npdu_num_flag)
+            .field("message_type", &self.message_type)
+            .field("length", &self.length)
+            .field("teid", &"<redacted>")
+            .field("sequence_number", &self.sequence_number)
+            .field("npdu_number", &self.npdu_number)
+            .field("next_ext_type", &self.next_ext_type)
+            .field("raw_sequence_number", &self.raw_sequence_number)
+            .field("raw_npdu_number", &self.raw_npdu_number)
+            .field("raw_next_ext_type", &self.raw_next_ext_type)
+            .finish()
+    }
+}
+
+impl fmt::Debug for GtpuMessage<'_> {
+    /// Lengths, never bytes: the payload is user-plane subscriber traffic and
+    /// the extension bytes can carry subscriber-correlatable containers.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GtpuMessage")
+            .field("header", &self.header)
+            .field(
+                "raw_extension_headers_len",
+                &self.raw_extension_headers.len(),
+            )
+            .field("payload_len", &self.payload.len())
+            .finish()
+    }
+}
+
+impl fmt::Debug for OwnedGtpuMessage {
+    /// Owned twin of [`GtpuMessage`]'s redaction.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OwnedGtpuMessage")
+            .field("header", &self.header)
+            .field(
+                "raw_extension_headers_len",
+                &self.raw_extension_headers.len(),
+            )
+            .field("payload_len", &self.payload.len())
+            .finish()
+    }
 }
 
 impl OwnedGtpuMessage {

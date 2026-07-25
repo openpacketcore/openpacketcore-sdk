@@ -45,6 +45,13 @@ pub const GTPU_MESSAGE_SUPPORTED_EXTENSION_HEADERS_NOTIFICATION: u8 = 31;
 /// GTP-U End Marker message type.
 pub const GTPU_MESSAGE_END_MARKER: u8 = 254;
 
+/// G-PDU message type (TS 29.281 clause 7.1).
+///
+/// Not a control message, and deliberately not decodable by
+/// [`GtpuControlMessage`]. A transport that demultiplexes a receive queue needs
+/// to name it to route user-plane frames away from the control path.
+pub const GTPU_MESSAGE_G_PDU: u8 = 255;
+
 const IE_RECOVERY: u8 = 14;
 const IE_TEID_DATA_I: u8 = 16;
 const IE_GTPU_PEER_ADDRESS: u8 = 133;
@@ -978,6 +985,41 @@ impl GtpuControlMessage {
             .map_err(|error| framing(error.code().clone(), error.offset()))?;
         let control = Self::from_message(&message, ctx)?;
         Ok((tail, control))
+    }
+
+    /// TS 29.281 message type carried by this control message.
+    ///
+    /// Lets a transport label and route a datagram without re-parsing the
+    /// header it already decoded.
+    #[must_use]
+    pub const fn message_type(&self) -> u8 {
+        match self {
+            Self::EchoRequest(_) => GTPU_MESSAGE_ECHO_REQUEST,
+            Self::EchoResponse(_) => GTPU_MESSAGE_ECHO_RESPONSE,
+            Self::ErrorIndication(_) => GTPU_MESSAGE_ERROR_INDICATION,
+            Self::SupportedExtensionHeadersNotification(_) => {
+                GTPU_MESSAGE_SUPPORTED_EXTENSION_HEADERS_NOTIFICATION
+            }
+            Self::EndMarker(_) => GTPU_MESSAGE_END_MARKER,
+        }
+    }
+
+    /// Sequence number carried in the header, when the message defines one.
+    ///
+    /// `None` for messages whose sequence is receiver-ignored rather than
+    /// meaningful, so a caller cannot accidentally correlate on a field
+    /// TS 29.281 does not give that meaning. Echo Request/Response carry a
+    /// correlating sequence; Error Indication encodes zero and End Marker and
+    /// the notification do not correlate.
+    #[must_use]
+    pub const fn sequence_number(&self) -> Option<u16> {
+        match self {
+            Self::EchoRequest(request) => Some(request.sequence_number()),
+            Self::EchoResponse(response) => Some(response.sequence_number()),
+            Self::ErrorIndication(_)
+            | Self::SupportedExtensionHeadersNotification(_)
+            | Self::EndMarker(_) => None,
+        }
     }
 
     /// Decode exactly one complete GTP-U control datagram.
