@@ -1654,4 +1654,168 @@ mod tests {
             }
         );
     }
+
+    // ---- issue #419: canonical and unambiguous SA lookup marks ----
+
+    #[test]
+    fn a_value_outside_its_mask_is_refused() {
+        // The exact shape the issue names: 0x11 & 0xf0 == 0x10 != 0x11.
+        assert_eq!(
+            XfrmLookupMark::new(0x11, 0xf0),
+            Err(XfrmLookupMarkError::NoncanonicalValue)
+        );
+        // ...and it is refused precisely because it would be unaddressable:
+        // every candidate left-hand side has the low nibble clear.
+        for lookup in 0..=0xff_u32 {
+            assert_ne!(
+                lookup & 0xf0,
+                0x11,
+                "no lookup value can ever select a stored {{0x11, 0xf0}}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_zero_mask_is_refused_so_none_is_the_only_unmarked_form() {
+        assert_eq!(
+            XfrmLookupMark::new(0, 0),
+            Err(XfrmLookupMarkError::ZeroMask)
+        );
+        assert_eq!(
+            XfrmLookupMark::new(7, 0),
+            Err(XfrmLookupMarkError::ZeroMask)
+        );
+    }
+
+    #[test]
+    fn canonical_marks_are_accepted_and_expose_their_pair() {
+        let mark = XfrmLookupMark::new(0x10, 0xf0).expect("canonical");
+        assert_eq!((mark.value(), mark.mask()), (0x10, 0xf0));
+        assert_eq!(
+            mark.wire(),
+            XfrmMark {
+                value: 0x10,
+                mask: 0xf0
+            }
+        );
+        assert!(!mark.is_exact_profile());
+
+        let full = XfrmLookupMark::full(0xdead_beef);
+        assert_eq!((full.value(), full.mask()), (0xdead_beef, u32::MAX));
+        assert!(full.is_exact_profile());
+        // Full-mask construction can never fail, for any value.
+        for value in [0, 1, u32::MAX, 0x8000_0000] {
+            assert_eq!(
+                XfrmLookupMark::new(value, u32::MAX),
+                Ok(XfrmLookupMark::full(value))
+            );
+        }
+    }
+
+    /// The asymmetry the issue documents, locked against the kernel rule.
+    #[test]
+    fn overlapping_canonical_masks_admit_two_states_in_exactly_one_order() {
+        let a = XfrmLookupMark::new(0x10, 0xf0).expect("canonical");
+        let b = XfrmLookupMark::new(0x11, 0xff).expect("canonical");
+
+        // Install A first: B's lookup value 0x11 still selects A, so the
+        // kernel sees a collision and refuses B.
+        assert!(
+            linux_lookup_selects(Some(b), Some(a)),
+            "0x11 & 0xf0 == 0x10, so B collides with an existing A"
+        );
+
+        // Install B first: A's lookup value 0x10 does not select B, so A is
+        // admitted and BOTH states now exist.
+        assert!(
+            !linux_lookup_selects(Some(a), Some(b)),
+            "0x10 & 0xff == 0x10 != 0x11, so A does not collide with B"
+        );
+
+        // In that order, one later lookup selects both: a delete carrying it
+        // removes whichever the kernel walks first.
+        assert!(linux_lookup_selects(Some(b), Some(a)));
+        assert!(linux_lookup_selects(Some(b), Some(b)));
+    }
+
+    /// Why a full-mask *request* is not by itself a proof of exactness.
+    #[test]
+    fn a_full_mask_request_still_selects_a_narrower_stored_mark() {
+        let stored = XfrmLookupMark::new(0x10, 0xf0).expect("canonical");
+        let request = XfrmLookupMark::full(0x11);
+        assert!(
+            linux_lookup_selects(Some(request), Some(stored)),
+            "exactness is a property of the stored set, not of the request"
+        );
+    }
+
+    /// An unmarked object stores {0, 0}, whose predicate matches every value.
+    #[test]
+    fn an_unmarked_object_is_selected_by_every_lookup() {
+        for value in [0, 1, 0x10, 0x11, u32::MAX] {
+            let lookup = XfrmLookupMark::new(value, u32::MAX).expect("canonical");
+            assert!(
+                linux_lookup_selects(Some(lookup), None),
+                "(value & 0) == 0 holds for every value, so an unmarked SA aliases"
+            );
+        }
+        // ...while an unmarked lookup selects only an unmarked object, unless
+        // the stored value happens to be zero.
+        assert!(linux_lookup_selects(None, None));
+        assert!(!linux_lookup_selects(None, Some(XfrmLookupMark::full(1))));
+    }
+
+    #[test]
+    fn distinct_full_mask_marks_have_disjoint_lookup_domains() {
+        let a = XfrmLookupMark::full(0x10);
+        let b = XfrmLookupMark::full(0x11);
+        assert!(linux_lookup_selects(Some(a), Some(a)));
+        assert!(!linux_lookup_selects(Some(a), Some(b)));
+        assert!(!linux_lookup_selects(Some(b), Some(a)));
+    }
+
+    #[test]
+    fn same_mask_disjoint_values_remain_supported() {
+        let a = XfrmLookupMark::new(0x10, 0xf0).expect("canonical");
+        let b = XfrmLookupMark::new(0x20, 0xf0).expect("canonical");
+        assert!(!linux_lookup_selects(Some(a), Some(b)));
+        assert!(!linux_lookup_selects(Some(b), Some(a)));
+    }
+
+    #[test]
+    fn the_exact_profile_admits_unmarked_and_full_mask_only() {
+        assert!(validate_exact_lookup_mark(None, "f").is_ok());
+        assert!(validate_exact_lookup_mark(Some(XfrmLookupMark::full(0x42)), "f").is_ok());
+        let narrow = XfrmLookupMark::new(0x42, 0xff).expect("canonical");
+        assert!(matches!(
+            validate_exact_lookup_mark(Some(narrow), "sa.mark"),
+            Err(XfrmError::InvalidConfig {
+                field: "sa.mark",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn lookup_mark_error_labels_are_stable_and_value_free() {
+        assert_eq!(
+            XfrmLookupMarkError::NoncanonicalValue.as_str(),
+            "xfrm_lookup_mark_noncanonical_value"
+        );
+        assert_eq!(
+            XfrmLookupMarkError::ZeroMask.as_str(),
+            "xfrm_lookup_mark_zero_mask"
+        );
+        let rendered = format!(
+            "{:?} {}",
+            XfrmLookupMarkError::NoncanonicalValue,
+            XfrmLookupMarkError::NoncanonicalValue
+        );
+        for leaked in ["0x11", "0xf0", "17", "240"] {
+            assert!(
+                !rendered.contains(leaked),
+                "error text must carry no values"
+            );
+        }
+    }
 }

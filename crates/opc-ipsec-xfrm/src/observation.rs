@@ -106,7 +106,7 @@ use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::XfrmError;
-use crate::model::{validate_exact_lookup_mark, IpAddress, XfrmDirection, XfrmId, XfrmLookupMark};
+use crate::model::{IpAddress, XfrmDirection, XfrmId, XfrmLookupMark};
 
 #[cfg(target_os = "linux")]
 pub(crate) mod linux;

@@ -2292,6 +2292,65 @@ mod tests {
         assert!(backend.removed_policy_requests().is_empty());
     }
 
+    /// Issue #419: in the insertion order Linux admits both overlapping
+    /// states, a retained removal identity carrying a narrower canonical mask
+    /// cannot name a single object -- its lookup value also selects the other
+    /// state. This boundary must refuse *before* installing, so it neither
+    /// claims an exact recovery nor performs an unproven delete.
+    #[tokio::test]
+    async fn a_narrower_canonical_mask_is_refused_before_anything_is_installed() {
+        let backend = Arc::new(GatedBackend::new());
+        let mut parameters = sa_parameters();
+        // Canonical (0x11 & 0xff == 0x11), but its lookup value also selects a
+        // stored { 0x10, 0xf0 }, which Linux admits alongside it.
+        parameters.mark = Some(XfrmLookupMark::new(0x11, 0xff).expect("canonical"));
+        let staged = XfrmStagedObjectInstall::new(XfrmObjectInstallRequest::Sa(InstallSaRequest {
+            parameters,
+        }));
+        let journal = staged.journal();
+
+        let error = staged
+            .run(backend.clone())
+            .await
+            .expect_err("a mark that cannot name one object must be refused");
+        assert!(matches!(
+            error,
+            XfrmStagedObjectInstallRunError::InstallFailed {
+                source: XfrmError::InvalidConfig {
+                    field: "staged_object.install.mark",
+                    ..
+                },
+                ..
+            }
+        ));
+
+        // The whole point: nothing was issued and nothing is retained, so
+        // there is no residue whose cleanup we would have to over-promise.
+        assert!(backend.operations().is_empty(), "no request may be issued");
+        assert!(!backend.sa_present());
+        assert_eq!(journal.ownership(), XfrmObjectInstallOwnership::NotStarted);
+    }
+
+    /// The unmarked and full-mask forms stay usable: the profile restricts
+    /// what cannot be proven, not marked SAs in general.
+    #[tokio::test]
+    async fn unmarked_and_full_mask_removal_identities_remain_supported() {
+        for mark in [None, Some(XfrmLookupMark::full(0x42))] {
+            let backend = Arc::new(GatedBackend::new());
+            let mut parameters = sa_parameters();
+            parameters.mark = mark;
+            let staged =
+                XfrmStagedObjectInstall::new(XfrmObjectInstallRequest::Sa(InstallSaRequest {
+                    parameters,
+                }));
+            staged
+                .run(backend.clone())
+                .await
+                .expect("exact-profile identities install");
+            assert_eq!(backend.operations(), vec!["install_sa"]);
+        }
+    }
+
     #[tokio::test]
     async fn recovery_removes_only_the_exact_owned_sa() {
         let backend = Arc::new(GatedBackend::new());
