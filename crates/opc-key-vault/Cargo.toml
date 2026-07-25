@@ -28,7 +28,10 @@ tracing = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 thiserror = { workspace = true }
 url = "2.5"
-base64 = "0.23"
+# 0.23 moved `simd-unsafe` into base64's default feature set. This crate
+# handles key material and declares forbid(unsafe_code), so keep the posture
+# 0.22 had and take only `std`.
+base64 = { version = "0.23", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
