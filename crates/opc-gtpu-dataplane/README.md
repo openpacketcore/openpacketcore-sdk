@@ -1135,9 +1135,9 @@ offload support.
   about a node's SELinux policy, container capabilities, in-pod bpffs
   availability, or MTU headroom. Treat it as one necessary condition, not as
   proof the datapath forwards on a given cluster.
-- A loadability verdict here does not override admission policy elsewhere in
-  the SDK: `opc-node-resources` applies its own kernel floor to gateway
-  profiles, and a node must satisfy both.
+- A loadability verdict here is about this object only. It does not speak for
+  whatever node-admission policy a deployment configures, and it is not itself
+  an admission decision.
 - Other kernels — outside both the 6.8-or-newer profile and the gated 5.14 line
   — are **unqualified rather than known-good or known-bad**: this repository
   states no verdict, because CI proves the load only on the kernels it gates. Do
