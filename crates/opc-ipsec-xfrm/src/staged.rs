@@ -31,6 +31,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use crate::model::validate_exact_lookup_mark;
 use crate::{
     outbound_binding::{validate_outbound_request, OutboundSaPolicyExpectation},
     InstalledOutboundSaBinding, NamespaceBoundLinuxXfrmBackend, OutboundSaBindingError,
@@ -1128,6 +1129,28 @@ impl XfrmStagedInstall {
     {
         let runtime = tokio::runtime::Handle::try_current()
             .map_err(|_| XfrmStagedInstallRunError::RuntimeUnavailable)?;
+        // Same reason as `install_sa_policy_with_rollback` and
+        // `XfrmStagedObjectInstall::run`: this journal retains removal
+        // identities minted from these marks, and both the rollback below and
+        // later recovery delete by re-selecting on them without proving the
+        // selection is unique. A narrower canonical mask can also match
+        // another stored object, so a rollback could remove an object this
+        // call never installed. Refuse before touching the kernel.
+        for (mark, field) in [
+            (self.request.sa.parameters.mark, "staged.sa.mark"),
+            (self.request.policy.parameters.mark, "staged.policy.mark"),
+        ] {
+            validate_exact_lookup_mark(mark, field).map_err(|source| {
+                XfrmStagedInstallRunError::Composite {
+                    source: XfrmCompositeInstallError::InstallSaFailed {
+                        source,
+                        outcome: XfrmCompositeOutcome::not_applied(
+                            XfrmCompositeOperation::InstallSa,
+                        ),
+                    },
+                }
+            })?;
+        }
         let guard = RunGuard::begin(self.journal.clone());
         let worker = runtime.spawn(async move {
             let mut guard = guard;
@@ -1260,6 +1283,7 @@ mod tests {
     use tokio::sync::Notify;
 
     use super::*;
+    use crate::model::XfrmLookupMark;
     use crate::{
         AllocateSpiRequest, InstallPolicyRequest, InstallSaRequest, IpAddress, PolicyParameters,
         QuerySaRequest, RekeyPolicyRequest, RekeySaRequest, SaParameters, SaState, SpiAllocation,
@@ -1978,6 +2002,45 @@ mod tests {
         })
         .await
         .expect("supervised worker reaches expected ownership");
+    }
+
+    /// Issue #419. This journal retains rollback identities minted from the
+    /// install marks, and both rollback and recovery delete by re-selecting on
+    /// them. A narrower canonical mask can also select another stored object,
+    /// so the rollback could remove an SA this call never installed -- while
+    /// reporting a clean `rolled_back`.
+    ///
+    /// Adversarial review caught this path being left ungated when its two
+    /// siblings (`install_sa_policy_with_rollback` and
+    /// `XfrmStagedObjectInstall::run`) were gated.
+    #[tokio::test]
+    async fn a_narrower_canonical_mask_is_refused_before_the_kernel_is_touched() {
+        let backend = Arc::new(GatedBackend::new());
+        let mut request = install_request();
+        let narrow = XfrmLookupMark::new(0x10, 0xf0).expect("canonical");
+        request.sa.parameters.mark = Some(narrow);
+        request.policy.parameters.mark = Some(narrow);
+
+        let error = XfrmStagedInstall::new(request)
+            .run(backend.clone())
+            .await
+            .expect_err("a mark that cannot name one object must be refused");
+        assert!(matches!(
+            error,
+            XfrmStagedInstallRunError::Composite {
+                source: XfrmCompositeInstallError::InstallSaFailed {
+                    source: XfrmError::InvalidConfig {
+                        field: "staged.sa.mark",
+                        ..
+                    },
+                    ..
+                }
+            }
+        ));
+        assert!(
+            backend.operations().is_empty(),
+            "no request may reach the kernel"
+        );
     }
 
     #[tokio::test]
