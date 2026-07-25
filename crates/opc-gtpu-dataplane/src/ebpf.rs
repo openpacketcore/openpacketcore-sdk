@@ -13250,15 +13250,27 @@ mod aya_runtime {
     }
 
     /// Map aya program errors to redaction-safe errors. Program-load
-    /// rejections retain a typed failure class, while verifier output and aya
+    /// failures retain a typed failure class, while verifier output and aya
     /// error strings (which can embed implementation details, interface
     /// names, and paths) are dropped.
+    ///
+    /// aya funnels every `BPF_PROG_LOAD` failure into `LoadError` without
+    /// inspecting errno, so a load refused for want of `CAP_BPF` arrives here
+    /// indistinguishable from a verifier rejection unless it is classified.
+    /// The verifier log is read only to establish whether the verifier ran --
+    /// the one signal that separates a rejection from an LSM denial, which
+    /// `bpf(2)` also reports as `EACCES` -- and is then dropped.
     fn program_error(operation: &'static str, error: &ProgramError) -> GtpuError {
         match error {
             ProgramError::AlreadyAttached => GtpuError::AlreadyExists,
-            ProgramError::LoadError { io_error, .. } => {
-                GtpuError::program_load_rejected(operation, io_error)
-            }
+            ProgramError::LoadError {
+                io_error,
+                verifier_log,
+            } => GtpuError::program_load_outcome(
+                operation,
+                io_error,
+                !verifier_log.to_string().trim().is_empty(),
+            ),
             ProgramError::SyscallError(error) => GtpuError::io(
                 operation,
                 io::Error::new(error.io_error.kind(), "ebpf syscall failed"),
@@ -13302,6 +13314,7 @@ mod aya_runtime {
     #[cfg(test)]
     mod race_tests {
         use super::*;
+        use crate::ProgramLoadRefusal;
         use aya_obj::VerifierLog;
 
         #[test]
@@ -13382,6 +13395,84 @@ mod aya_runtime {
                     raw_os_error: Some(13),
                 }
             ));
+            let rendered = format!("{error:?} {error}");
+            assert!(!rendered.contains(canary));
+            assert!(!rendered.contains("subscriber-material"));
+        }
+
+        /// aya reports a load refused for want of `CAP_BPF` through the same
+        /// `LoadError` it uses for a verifier rejection. Before #547 the
+        /// production attach path reported both as `ProgramLoadRejected`,
+        /// telling an operator to abandon a node that only needed a
+        /// capability.
+        #[test]
+        fn unprivileged_load_error_maps_to_a_refusal_not_a_rejection() {
+            let source = ProgramError::LoadError {
+                io_error: io::Error::from_raw_os_error(1),
+                verifier_log: VerifierLog::new(String::new()),
+            };
+
+            let error = program_error("ebpf_program_load", &source);
+            assert!(!error.is_verifier_rejection());
+            assert_eq!(error.load_refusal(), Some(ProgramLoadRefusal::Unprivileged));
+        }
+
+        /// An LSM denial of `bpf { prog_load }` is `EACCES`, the same errno a
+        /// verifier rejection uses. It arrives with no verifier log, which is
+        /// what separates the two on the production path.
+        #[test]
+        fn policy_denied_load_error_is_separated_from_a_verifier_rejection() {
+            let denied = program_error(
+                "ebpf_program_load",
+                &ProgramError::LoadError {
+                    io_error: io::Error::from_raw_os_error(13),
+                    verifier_log: VerifierLog::new(String::new()),
+                },
+            );
+            assert!(!denied.is_verifier_rejection());
+            assert_eq!(
+                denied.load_refusal(),
+                Some(ProgramLoadRefusal::PolicyDenied)
+            );
+
+            // Same errno, but the verifier spoke: this one is a verdict.
+            let rejected = program_error(
+                "ebpf_program_load",
+                &ProgramError::LoadError {
+                    io_error: io::Error::from_raw_os_error(13),
+                    verifier_log: VerifierLog::new("processed 12 insns".to_owned()),
+                },
+            );
+            assert!(rejected.is_verifier_rejection());
+        }
+
+        /// A whitespace-only verifier log is not evidence the verifier ran.
+        #[test]
+        fn blank_verifier_output_does_not_promote_a_refusal_to_a_verdict() {
+            let error = program_error(
+                "ebpf_program_load",
+                &ProgramError::LoadError {
+                    io_error: io::Error::from_raw_os_error(1),
+                    verifier_log: VerifierLog::new("   \n\t ".to_owned()),
+                },
+            );
+            assert!(!error.is_verifier_rejection());
+            assert_eq!(error.load_refusal(), Some(ProgramLoadRefusal::Unprivileged));
+        }
+
+        /// The refusal path must keep the same redaction properties as the
+        /// rejection path: the verifier log never reaches `Debug`/`Display`.
+        #[test]
+        fn refusal_does_not_leak_verifier_output() {
+            let canary = "sensitive-verifier-canary subscriber-material";
+            let error = program_error(
+                "ebpf_program_load",
+                &ProgramError::LoadError {
+                    io_error: io::Error::from_raw_os_error(1),
+                    verifier_log: VerifierLog::new(canary.to_owned()),
+                },
+            );
+
             let rendered = format!("{error:?} {error}");
             assert!(!rendered.contains(canary));
             assert!(!rendered.contains("subscriber-material"));

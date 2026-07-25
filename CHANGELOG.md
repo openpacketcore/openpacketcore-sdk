@@ -96,6 +96,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Hop-by-Hop and setting T (#394).
 
 ### Changed
+- **A refused `BPF_PROG_LOAD` is no longer reported as a verifier rejection —
+  `opc-gtpu-dataplane`:** aya funnels every `bpf(2)` failure at the program-load
+  boundary into one error without inspecting errno, so a load refused for want
+  of `CAP_BPF`/`CAP_PERFMON`, or by an unraised `RLIMIT_MEMLOCK`, arrived
+  indistinguishable from a genuine verifier rejection and was reported as
+  `GtpuError::ProgramLoadRejected`. The two call for opposite operator actions,
+  and conflating them turns a fixable misconfiguration into the permanent
+  exclusion of healthy capacity. Loads that never reached a verdict now surface
+  as the new `GtpuError::ProgramLoadRefused`, carrying a `ProgramLoadRefusal`
+  of `Unprivileged`, `PolicyDenied`, or `Indeterminate`, and
+  `GtpuError::is_verifier_rejection` answers the exclusion question without
+  callers reimplementing the errno rules. Because `bpf(2)` reports an LSM denial
+  of `bpf { prog_load }` with the same `EACCES` a verifier rejection uses, the
+  two are separated by whether the kernel returned verifier output rather than
+  by errno; and because Rust maps both `EPERM` and `EACCES` to
+  `ErrorKind::PermissionDenied`, a failure carrying no errno is classified
+  `Indeterminate` rather than guessed. Verifier output proves the verifier ran,
+  not that it rejected -- the kernel prints `processed N insns` on success too,
+  and a load can still fail afterwards allocating a program id or an fd -- so
+  output only promotes an errno the verifier itself returns (`EACCES`, `E2BIG`,
+  `EINVAL`), and one of those arriving with no output is `Indeterminate` rather
+  than a verdict. The verifier log is inspected only to establish that the
+  verifier ran and is still never retained, so the existing redaction properties
+  are unchanged.
 - **SWm omitted-DEA mobility fallback derives from the DER's offer —
   `opc-proto-diameter`:** when an exact-success DEA omits
   `MIP6-Feature-Vector` and no locally configured mobility mode was attached

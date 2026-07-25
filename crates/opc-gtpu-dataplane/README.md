@@ -45,11 +45,49 @@ route steering, XFRM policy, deployment defaults, or traffic-readiness policy.
   `EbpfGtpuDatapathSnapshot`, `EbpfGtpuDatapathCounters`, `DscpCodepoint`,
   `GtpRole`, `GtpVersion`, `GtpAddressFamily`, and `GTPU_PORT`.
 - `GtpuError` is intentionally redaction-safe; TEIDs and addresses are not
-  emitted by `Debug`/`Display`. Kernel `BPF_PROG_LOAD` rejection is reported as
-  `GtpuError::ProgramLoadRejected`, preserving only its stable operation, I/O
-  kind, and errno. Capability, bpffs, and other I/O failures remain
-  `GtpuError::Io`, so callers can distinguish environment setup from verifier
-  rejection without retaining the verifier log.
+  emitted by `Debug`/`Display`. A `BPF_PROG_LOAD` failure is reported as one of
+  two variants, preserving only its stable operation, I/O kind, and errno:
+  - `GtpuError::ProgramLoadRejected` -- the kernel reached a verdict. This
+    kernel cannot run this object; move the workload or ship a different one.
+  - `GtpuError::ProgramLoadRefused` -- the load was refused before the verifier
+    ran. The node is fine and will accept the program once the environment is
+    fixed. `GtpuError::load_refusal` returns a `ProgramLoadRefusal` saying
+    which: `Unprivileged` (`EPERM` -- `CAP_BPF`/`CAP_PERFMON` or
+    `RLIMIT_MEMLOCK`), `PolicyDenied` (an LSM denied `bpf { prog_load }`), or
+    `Indeterminate`.
+
+  The split exists because aya funnels every `bpf(2)` failure at this boundary
+  into one error without inspecting errno, so a missing capability would
+  otherwise be indistinguishable from a verifier rejection -- and reporting the
+  first as the second permanently excludes healthy capacity.
+  `GtpuError::is_verifier_rejection` answers that question directly rather than
+  asking callers to reimplement the errno rules.
+
+  Three limits are deliberate, and all three resolve toward *not* condemning a
+  node, because that is the direction that costs capacity:
+
+  - `bpf(2)` reports an LSM denial and a verifier rejection with the same
+    `EACCES`, so the two are separated by whether the kernel returned verifier
+    output, not by errno.
+  - Verifier output proves the verifier **ran**, not that it **rejected**. The
+    kernel prints `processed N insns` on successful verification too, and
+    `bpf_prog_load` can still fail afterwards allocating a program id or an fd.
+    A load that verified cleanly and then hit `EMFILE` therefore carries a full
+    verifier log while being purely environmental. Verifier output only
+    promotes an errno the verifier itself can return (`EACCES`, `E2BIG`,
+    `EINVAL`); anything else stays a refusal regardless of the log.
+  - Conversely, one of those errnos arriving with *no* verifier output is
+    `Indeterminate` rather than a verdict. The loader always retries with a log
+    buffer, so a genuine verifier failure cannot arrive silent -- a silent
+    `EINVAL` is a failed program allocation under a memory limit, and a silent
+    `E2BIG` is the pre-verification instruction-count check, which is itself
+    capability dependent.
+
+  Rust also maps both `EPERM` and `EACCES` to `ErrorKind::PermissionDenied`, so
+  a failure carrying no errno at all is `Indeterminate` rather than guessed.
+  Capability, bpffs, and other I/O failures remain `GtpuError::Io`. The verifier
+  log is inspected only to establish that the verifier ran, and is never
+  retained.
 
 ## Usage
 
