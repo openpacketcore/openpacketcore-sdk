@@ -37,7 +37,7 @@ use super::{
     EspPeerObservationSource, EspPeerObservationSourceLoss, EspPeerObservationSourceRecord,
     EspPeerObservationSourceTerminal, EspPeerObservationTeardown,
 };
-use crate::{IpAddress, NamespaceBoundLinuxXfrmBackend, XfrmError, XfrmMark};
+use crate::{IpAddress, NamespaceBoundLinuxXfrmBackend, XfrmError, XfrmLookupMark};
 
 const BPF_NOEXIST: u64 = 1;
 const BPF_EXIST: u64 = 2;
@@ -1801,7 +1801,7 @@ fn common_sa_key(
         ));
     }
     let (family, destination) = common_address(key.id.destination);
-    let (mark_value, mark_mask) = key.mark.map_or((0, 0), |mark| (mark.value, mark.mask));
+    let (mark_value, mark_mask) = key.mark.map_or((0, 0), |mark| (mark.value(), mark.mask()));
     let encoded = EspPeerObservationSaKey {
         net_cookie,
         mark_value,
@@ -1819,13 +1819,14 @@ fn common_sa_key(
 }
 
 fn public_key_from_common(key: EspPeerObservationSaKey) -> Result<EspPeerObservationKey, ()> {
+    // A zero mask is the unmarked identity and must carry a zero value; any
+    // other pair, including one whose value has bits outside its mask, is not
+    // a lookup identity this boundary can honour, so decoding fails closed
+    // rather than inventing a key no request could select.
     let mark = if key.mark_mask == 0 {
         (key.mark_value == 0).then_some(None).ok_or(())?
     } else {
-        Some(XfrmMark {
-            value: key.mark_value,
-            mask: key.mark_mask,
-        })
+        Some(XfrmLookupMark::new(key.mark_value, key.mark_mask).map_err(|_| ())?)
     };
     Ok(EspPeerObservationKey {
         id: crate::XfrmId {
@@ -2007,10 +2008,9 @@ mod tests {
                 spi: 0x1234_5678,
                 protocol: 50,
             },
-            mark: Some(XfrmMark {
-                value: 0x0102_0000,
-                mask: 0xffff_0000,
-            }),
+            mark: Some(
+                XfrmLookupMark::new(0x0102_0000, 0xffff_0000).expect("canonical lookup mark"),
+            ),
             if_id: Some(9),
             direction: XfrmDirection::In,
         }

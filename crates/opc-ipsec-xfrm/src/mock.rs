@@ -13,7 +13,7 @@ use crate::model::{
     PolicyParameters, QuerySaRequest, RekeyPolicyRequest, RekeySaRequest, RelocateSaRequest,
     RemovePolicyRequest, RemoveSaRequest, SaRelocationDirection, SaRelocationEncap,
     SaRelocationIdentity, SaRelocationSelector, SaReplayState, SaState, SaStatistics,
-    SpiAllocation, XfrmAction, XfrmCapability, XfrmDirection, XfrmId, XfrmMark, XfrmMode,
+    SpiAllocation, XfrmAction, XfrmCapability, XfrmDirection, XfrmId, XfrmLookupMark, XfrmMode,
     XfrmProbe, XfrmSelector, XfrmTemplate,
 };
 
@@ -160,7 +160,7 @@ pub enum MockOperation {
         /// Policy direction.
         direction: XfrmDirection,
         /// Optional policy lookup mark.
-        mark: Option<XfrmMark>,
+        mark: Option<XfrmLookupMark>,
     },
     /// Capability probe.
     Probe,
@@ -199,7 +199,7 @@ pub struct MockXfrmBackend {
 /// Allocated SPI identity used to allow the same SPI value to be reused for a
 /// different destination or protocol.
 type AllocatedSpiKey = (IpAddress, u8, u32);
-type SaKey = (IpAddress, u8, u32, Option<XfrmMark>);
+type SaKey = (IpAddress, u8, u32, Option<XfrmLookupMark>);
 
 /// Linux policy lookup identity.
 ///
@@ -213,7 +213,12 @@ type SaKey = (IpAddress, u8, u32, Option<XfrmMark>);
 /// lookup applies the *stored* SA's mask to the incoming value. Overlapping SA
 /// masks are therefore still compared by pair equality below; that gap is
 /// issue #419, not something this key models.
-type PolicyKey = (XfrmSelector, XfrmDirection, Option<XfrmMark>, Option<u32>);
+type PolicyKey = (
+    XfrmSelector,
+    XfrmDirection,
+    Option<XfrmLookupMark>,
+    Option<u32>,
+);
 
 #[derive(Debug, Clone)]
 struct MockSaRecord {
@@ -318,14 +323,14 @@ impl MockXfrmBackend {
 
 /// Collapse the encodings the wire cannot tell apart.
 ///
-/// `append_common_attrs` omits `XFRMA_MARK` and `XFRMA_IF_ID` entirely when
-/// the value is `None`, and the kernel decodes an absent attribute as zero. So
-/// `Some(0)` and `None` produce byte-identical messages and must not be two
-/// identities here.
-fn canonical_mark(mark: Option<XfrmMark>) -> Option<XfrmMark> {
-    mark.filter(|mark| mark.mask != 0)
-}
-
+/// `append_common_attrs` omits `XFRMA_IF_ID` entirely when the value is
+/// `None`, and the kernel decodes an absent attribute as zero, so `Some(0)`
+/// and `None` produce byte-identical messages and must not be two identities
+/// here.
+///
+/// The lookup-mark equivalent is gone: `XfrmLookupMark` cannot hold a zero
+/// mask, so `Some(mark)` never encodes as an absent attribute and there is no
+/// second spelling of the unmarked identity left to collapse.
 fn canonical_if_id(if_id: Option<u32>) -> Option<u32> {
     if_id.filter(|if_id| *if_id != 0)
 }
@@ -334,13 +339,13 @@ fn policy_key(parameters: &PolicyParameters) -> PolicyKey {
     (
         parameters.selector.clone(),
         parameters.direction,
-        canonical_mark(parameters.mark),
+        parameters.mark,
         canonical_if_id(parameters.if_id),
     )
 }
 
-fn sa_key(id: XfrmId, mark: Option<XfrmMark>) -> SaKey {
-    (id.destination, id.protocol, id.spi, canonical_mark(mark))
+fn sa_key(id: XfrmId, mark: Option<XfrmLookupMark>) -> SaKey {
+    (id.destination, id.protocol, id.spi, mark)
 }
 
 fn sa_record_from_parameters(parameters: &crate::model::SaParameters) -> MockSaRecord {
@@ -767,12 +772,7 @@ impl XfrmBackend for MockXfrmBackend {
         // behaviour and not an omission here.
         state
             .policies
-            .remove(&(
-                request.selector,
-                request.direction,
-                canonical_mark(request.mark),
-                None,
-            ))
+            .remove(&(request.selector, request.direction, request.mark, None))
             .ok_or(XfrmError::NotFound)?;
         Ok(())
     }
@@ -803,7 +803,7 @@ mod tests {
     use crate::model::{
         AeadAlgorithm, Algorithm, AuthAlgorithm, IpAddress, KeyMaterial, LifetimeConfig,
         PolicyParameters, SaParameters, XfrmAction, XfrmBackendKind, XfrmCapability, XfrmDirection,
-        XfrmId, XfrmMode, XfrmSelector, XfrmTemplate,
+        XfrmId, XfrmLookupMarkError, XfrmMark, XfrmMode, XfrmSelector, XfrmTemplate,
     };
 
     fn ipv4(a: u8, b: u8, c: u8, d: u8) -> IpAddress {
@@ -1370,10 +1370,11 @@ mod tests {
         params.id.destination = ipv4(192, 0, 2, 20);
         params.request_id = crate::XfrmRequestId::new(7);
         params.encap = Some(crate::UdpEncap::esp_in_udp(4500, 4500));
-        params.mark = Some(XfrmMark {
-            value: 0x1200,
-            mask: 0xff00,
-        });
+        // Relocation names one kernel object, so its lookup mark has to be in
+        // the exact profile: the previous `{ value: 0x1200, mask: 0xff00 }`
+        // fixture is canonical but its lookup domain can overlap another
+        // stored SA's, which `validate_exact_lookup_mark` now rejects.
+        params.mark = Some(XfrmLookupMark::full(0x1200));
         params.if_id = Some(9);
         backend
             .install_sa(InstallSaRequest {
@@ -1642,10 +1643,20 @@ mod tests {
             direction: SaRelocationDirection::OutboundBlockPolicyInstalled,
         };
 
-        let mut zero_mark_mask = base.clone();
-        zero_mark_mask.current.mark = Some(XfrmMark { value: 1, mask: 0 });
+        // The zero-mask pair this used to hand the backend is unrepresentable
+        // now, so that rejection moves to the constructor. The backend rule it
+        // was standing in for still exists for a canonical-but-narrow mask,
+        // whose lookup domain can overlap another stored SA's, so both halves
+        // are asserted rather than one being dropped.
+        assert_eq!(
+            XfrmLookupMark::new(1, 0),
+            Err(XfrmLookupMarkError::ZeroMask)
+        );
+        let mut overlapping_mark_mask = base.clone();
+        overlapping_mark_mask.current.mark =
+            Some(XfrmLookupMark::new(1, 0xff).expect("canonical lookup mark"));
         assert!(matches!(
-            backend.relocate_sa(zero_mark_mask).await,
+            backend.relocate_sa(overlapping_mark_mask).await,
             Err(XfrmError::InvalidConfig {
                 field: "relocation.current.mark",
                 ..
@@ -1740,10 +1751,7 @@ mod tests {
     async fn mock_keeps_marked_and_unmarked_sa_identities_distinct() {
         let backend = MockXfrmBackend::new();
         let mut params = sample_sa_parameters();
-        let mark = XfrmMark {
-            value: 0x42,
-            mask: 0xff,
-        };
+        let mark = XfrmLookupMark::new(0x42, 0xff).expect("canonical lookup mark");
         params.mark = Some(mark);
         backend
             .install_sa(InstallSaRequest {
@@ -1866,10 +1874,7 @@ mod tests {
     #[tokio::test]
     async fn mock_remove_policy_records_operation() {
         let backend = MockXfrmBackend::new();
-        let mark = Some(XfrmMark {
-            value: 0x42,
-            mask: 0xff,
-        });
+        let mark = Some(XfrmLookupMark::new(0x42, 0xff).expect("canonical lookup mark"));
         let request = RemovePolicyRequest {
             selector: sample_selector(),
             direction: XfrmDirection::Out,

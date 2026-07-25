@@ -11,7 +11,8 @@ use crate::namespace::{NamespaceActorBinding, NamespaceBoundLinuxXfrmBackend};
 use crate::{
     IpAddress, LifetimeConfig, PolicyParameters, SaParameters, UdpEncap, XfrmAction,
     XfrmCompositeInstallRequest, XfrmDirection, XfrmError, XfrmId, XfrmInstallCommitError,
-    XfrmMark, XfrmMode, XfrmRequestId, XfrmSelector, XfrmStagedInstallRunError, XfrmTemplate,
+    XfrmLookupMark, XfrmMark, XfrmMode, XfrmRequestId, XfrmSelector, XfrmStagedInstallRunError,
+    XfrmTemplate,
 };
 
 const IPPROTO_ESP: u8 = 50;
@@ -444,7 +445,7 @@ fn fingerprint_sa(parameters: &SaParameters) -> [u8; 32] {
     digest.update(parameters.replay_window.to_be_bytes());
     digest.update([sa_uses_esn(parameters) as u8]);
     hash_encap(&mut digest, parameters.encap);
-    hash_mark(&mut digest, parameters.mark);
+    hash_mark(&mut digest, parameters.mark.map(XfrmLookupMark::wire));
     hash_mark(&mut digest, parameters.output_mark);
     hash_optional_u32(&mut digest, parameters.if_id);
     match parameters.egress_dscp {
@@ -498,7 +499,7 @@ fn fingerprint_policy(parameters: &PolicyParameters) -> [u8; 32] {
     for template in &parameters.templates {
         hash_template(&mut digest, template);
     }
-    hash_mark(&mut digest, parameters.mark);
+    hash_mark(&mut digest, parameters.mark.map(XfrmLookupMark::wire));
     hash_optional_u32(&mut digest, parameters.if_id);
     digest.finalize().into()
 }
@@ -628,10 +629,8 @@ pub(crate) mod tests_support {
 
     pub(crate) fn outbound_request() -> XfrmCompositeInstallRequest {
         let selector = XfrmSelector::new(ipv4([10, 0, 0, 1]), ipv4([10, 0, 0, 2]), 17);
-        let mark = Some(XfrmMark {
-            value: 0x1234_0000,
-            mask: 0xffff_0000,
-        });
+        let mark =
+            Some(XfrmLookupMark::new(0x1234_0000, 0xffff_0000).expect("canonical lookup mark"));
         let request_id = XfrmRequestId::new(77);
         let sa = SaParameters {
             selector: selector.clone(),
@@ -856,10 +855,8 @@ mod tests {
         assert_ne!(validate_outbound_request(&destination).unwrap().id(), id);
 
         let mut mark = base.clone();
-        let replacement = Some(XfrmMark {
-            value: 0x4321_0000,
-            mask: 0xffff_0000,
-        });
+        let replacement =
+            Some(XfrmLookupMark::new(0x4321_0000, 0xffff_0000).expect("canonical lookup mark"));
         mark.sa.parameters.mark = replacement;
         mark.policy.parameters.mark = replacement;
         assert_ne!(validate_outbound_request(&mark).unwrap().id(), id);

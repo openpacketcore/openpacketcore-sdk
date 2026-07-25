@@ -221,16 +221,192 @@ impl UdpEncap {
 
 /// Linux XFRM mark value and mask.
 ///
-/// The same wire shape is used for an SA or policy lookup mark
-/// (`XFRMA_MARK`) and for an SA output mark (`XFRMA_SET_MARK` plus
-/// `XFRMA_SET_MARK_MASK`). The field carrying the value determines which
-/// kernel attribute is emitted.
+/// This is the raw wire shape only. It is the type of an SA **output** mark
+/// (`XFRMA_SET_MARK` plus `XFRMA_SET_MARK_MASK`), where an arbitrary
+/// value/mask pair is meaningful and a zero mask is legal.
+///
+/// A **lookup** mark (`XFRMA_MARK`) is [`XfrmLookupMark`] instead, because the
+/// kernel does not compare lookup marks as pairs and an arbitrary pair is not
+/// a usable identity. Keeping the two roles in separate types is what stops a
+/// canonicality rule meant for lookups from silently restricting output marks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct XfrmMark {
     /// Mark value.
     pub value: u32,
     /// Mark mask.
     pub mask: u32,
+}
+
+/// Why a value/mask pair is not a usable Linux XFRM lookup mark.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum XfrmLookupMarkError {
+    /// The value carries bits outside its own mask.
+    NoncanonicalValue,
+    /// The mask is zero, which is the unmarked identity rather than a mark.
+    ZeroMask,
+}
+
+impl XfrmLookupMarkError {
+    /// Return a stable machine-readable error code.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NoncanonicalValue => "xfrm_lookup_mark_noncanonical_value",
+            Self::ZeroMask => "xfrm_lookup_mark_zero_mask",
+        }
+    }
+}
+
+impl fmt::Display for XfrmLookupMarkError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::error::Error for XfrmLookupMarkError {}
+
+/// A canonical Linux XFRM lookup mark (`XFRMA_MARK`).
+///
+/// # Why this is not a plain value/mask pair
+///
+/// Linux stores the raw pair on the object but looks objects up with a
+/// *masked* value. `xfrm_mark_get` returns `v & m` while `memcpy`ing the raw
+/// pair onto the state, and `__xfrm_state_lookup` selects with
+///
+/// ```text
+/// (incoming_lookup_value & stored.mask) == stored.value
+/// ```
+///
+/// Two consequences follow, and both are why this type exists:
+///
+/// - A stored pair whose value carries bits outside its mask is
+///   **unaddressable**. For `{ value: 0x11, mask: 0xf0 }`, every candidate
+///   left-hand side `(L & 0xf0)` has its low nibble clear and so can never
+///   equal `0x11`. No request can ever select that object again.
+/// - Pair equality is not selection. Distinct canonical marks can still match
+///   the same stored object, so equal `Option<XfrmLookupMark>` values are not
+///   proof that the kernel can select only one object. See
+///   [`Self::is_exact_profile`].
+///
+/// Construction therefore goes through [`Self::new`], which rejects both
+/// unusable shapes, and `None` is the only representation of an unmarked
+/// object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct XfrmLookupMark {
+    value: u32,
+    mask: u32,
+}
+
+impl XfrmLookupMark {
+    /// Build a canonical lookup mark.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`XfrmLookupMarkError::ZeroMask`] when `mask` is zero, because
+    /// the unmarked identity is `None` rather than a zero-mask mark, and
+    /// [`XfrmLookupMarkError::NoncanonicalValue`] when `value & mask != value`,
+    /// because such an object could never be looked up again.
+    pub const fn new(value: u32, mask: u32) -> Result<Self, XfrmLookupMarkError> {
+        if mask == 0 {
+            return Err(XfrmLookupMarkError::ZeroMask);
+        }
+        if value & mask != value {
+            return Err(XfrmLookupMarkError::NoncanonicalValue);
+        }
+        Ok(Self { value, mask })
+    }
+
+    /// Build a full-mask lookup mark, which is canonical for any value.
+    #[must_use]
+    pub const fn full(value: u32) -> Self {
+        Self {
+            value,
+            mask: u32::MAX,
+        }
+    }
+
+    /// Mark value. Always equal to `value & mask`.
+    #[must_use]
+    pub const fn value(self) -> u32 {
+        self.value
+    }
+
+    /// Mark mask. Always nonzero.
+    #[must_use]
+    pub const fn mask(self) -> u32 {
+        self.mask
+    }
+
+    /// The raw pair to encode into `XFRMA_MARK`.
+    #[must_use]
+    pub const fn wire(self) -> XfrmMark {
+        XfrmMark {
+            value: self.value,
+            mask: self.mask,
+        }
+    }
+
+    /// Whether this mark belongs to the non-overlapping exact profile.
+    ///
+    /// Under the kernel predicate, two full-mask marks match a given lookup
+    /// value only when their values are equal, so distinct full-mask marks
+    /// have disjoint lookup domains. Narrower masks do not: canonical
+    /// `{ 0x10, 0xf0 }` and `{ 0x11, 0xff }` both match the lookup value
+    /// `0x11`.
+    ///
+    /// This is a property of the marks compared, not a guarantee about the
+    /// kernel's whole table. A co-resident object with a narrower mask still
+    /// widens the domain, and an unmarked object stores `{ 0, 0 }`, whose
+    /// predicate `(L & 0) == 0` matches *every* lookup value. See the crate
+    /// README for the residual precondition.
+    #[must_use]
+    pub const fn is_exact_profile(self) -> bool {
+        self.mask == u32::MAX
+    }
+}
+
+/// Whether a lookup would select a stored object, per `__xfrm_state_lookup`.
+///
+/// Models `(incoming_lookup_value & stored.mask) == stored.value`, with an
+/// unmarked object taking the kernel's `{ value: 0, mask: 0 }` stored shape
+/// and an unmarked lookup taking the lookup value `0`.
+#[cfg(test)]
+pub(crate) const fn linux_lookup_selects(
+    incoming: Option<XfrmLookupMark>,
+    stored: Option<XfrmLookupMark>,
+) -> bool {
+    let lookup_value = match incoming {
+        // `xfrm_mark_get` returns `v & m`, which equals `v` for a canonical
+        // mark, and `0` when no attribute is present.
+        Some(mark) => mark.value,
+        None => 0,
+    };
+    let (stored_value, stored_mask) = match stored {
+        Some(mark) => (mark.value, mark.mask),
+        None => (0, 0),
+    };
+    lookup_value & stored_mask == stored_value
+}
+
+/// Reject a lookup mark that cannot support an exact single-object identity.
+///
+/// Accepts `None` (unmarked) or a full-mask mark. A narrower canonical mask is
+/// refused *before* any request is issued, because its lookup domain can
+/// overlap another stored object's and the resulting delete would not be the
+/// single-object delete the caller was promised.
+pub(crate) fn validate_exact_lookup_mark(
+    mark: Option<XfrmLookupMark>,
+    field: &'static str,
+) -> Result<(), XfrmError> {
+    match mark {
+        None => Ok(()),
+        Some(mark) if mark.is_exact_profile() => Ok(()),
+        Some(_) => Err(XfrmError::invalid_config(
+            field,
+            "exact identity requires an unmarked object or a full-mask lookup mark",
+        )),
+    }
 }
 
 pub(crate) fn validate_sa_output_mark(output_mark: Option<XfrmMark>) -> Result<(), XfrmError> {
@@ -620,7 +796,7 @@ pub struct SaParameters {
     /// Optional UDP encapsulation template for NAT-T.
     pub encap: Option<UdpEncap>,
     /// Optional packet lookup mark (`XFRMA_MARK`).
-    pub mark: Option<XfrmMark>,
+    pub mark: Option<XfrmLookupMark>,
     /// Optional post-transform packet mark (`XFRMA_SET_MARK`).
     ///
     /// Linux applies the masked value to `skb->mark` after this SA transforms
@@ -664,7 +840,7 @@ pub struct PolicyParameters {
     /// Templates describing SAs that satisfy the policy.
     pub templates: Vec<XfrmTemplate>,
     /// Optional packet mark.
-    pub mark: Option<XfrmMark>,
+    pub mark: Option<XfrmLookupMark>,
     /// Optional XFRM interface identifier.
     pub if_id: Option<u32>,
 }
@@ -741,7 +917,7 @@ pub struct QuerySaRequest {
     /// SPI in host byte order.
     pub spi: u32,
     /// Optional packet mark selecting a marked SA with this identity.
-    pub mark: Option<XfrmMark>,
+    pub mark: Option<XfrmLookupMark>,
 }
 
 impl QuerySaRequest {
@@ -758,7 +934,7 @@ impl QuerySaRequest {
 
     /// Select an SA carrying the supplied Linux XFRM lookup mark.
     #[must_use]
-    pub const fn with_mark(mut self, mark: XfrmMark) -> Self {
+    pub const fn with_mark(mut self, mark: XfrmLookupMark) -> Self {
         self.mark = Some(mark);
         self
     }
@@ -913,7 +1089,7 @@ pub struct SaRelocationIdentity {
     /// Current UDP encapsulation, when configured.
     pub encap: Option<UdpEncap>,
     /// Current packet lookup mark, when configured.
-    pub mark: Option<XfrmMark>,
+    pub mark: Option<XfrmLookupMark>,
     /// Current XFRM interface identifier, when configured.
     pub if_id: Option<u32>,
     /// Current exact post-transform packet mark, when configured.
@@ -1055,12 +1231,12 @@ pub(crate) fn validate_relocate_sa_request(request: &RelocateSaRequest) -> Resul
             "outer addresses must not be unspecified",
         ));
     }
-    if matches!(request.current.mark, Some(XfrmMark { mask: 0, .. })) {
-        return Err(XfrmError::invalid_config(
-            "relocation.current.mark",
-            "lookup-mark mask must be nonzero; use None for an unmarked SA",
-        ));
-    }
+    // Relocation names one kernel object, so its lookup mark must belong to
+    // the exact profile. A zero mask and a noncanonical value are already
+    // unrepresentable in `XfrmLookupMark`; what remains to reject here is a
+    // narrower canonical mask, whose lookup domain can overlap another stored
+    // object's and so cannot identify a single state to migrate.
+    validate_exact_lookup_mark(request.current.mark, "relocation.current.mark")?;
     if request.current.if_id == Some(0) {
         return Err(XfrmError::invalid_config(
             "relocation.current.if_id",
@@ -1155,7 +1331,7 @@ pub struct RemoveSaRequest {
     /// SPI in host byte order.
     pub spi: u32,
     /// Optional packet mark selecting a marked SA with this identity.
-    pub mark: Option<XfrmMark>,
+    pub mark: Option<XfrmLookupMark>,
 }
 
 impl RemoveSaRequest {
@@ -1172,7 +1348,7 @@ impl RemoveSaRequest {
 
     /// Select an SA carrying the supplied Linux XFRM lookup mark.
     #[must_use]
-    pub const fn with_mark(mut self, mark: XfrmMark) -> Self {
+    pub const fn with_mark(mut self, mark: XfrmLookupMark) -> Self {
         self.mark = Some(mark);
         self
     }
@@ -1200,7 +1376,7 @@ pub struct RemovePolicyRequest {
     /// Policy direction.
     pub direction: XfrmDirection,
     /// Optional packet mark selecting a marked policy with this identity.
-    pub mark: Option<XfrmMark>,
+    pub mark: Option<XfrmLookupMark>,
 }
 
 impl RemovePolicyRequest {
@@ -1216,7 +1392,7 @@ impl RemovePolicyRequest {
 
     /// Select a policy carrying the supplied Linux XFRM lookup mark.
     #[must_use]
-    pub const fn with_mark(mut self, mark: XfrmMark) -> Self {
+    pub const fn with_mark(mut self, mark: XfrmLookupMark) -> Self {
         self.mark = Some(mark);
         self
     }

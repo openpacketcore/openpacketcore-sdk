@@ -41,6 +41,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use crate::model::{validate_exact_lookup_mark, XfrmLookupMark};
 use crate::{
     InstallPolicyRequest, InstallSaRequest, RemovePolicyRequest, RemoveSaRequest, XfrmBackend,
     XfrmCompositeOperation, XfrmError, XfrmInstallObject, XfrmResidueClassification,
@@ -131,6 +132,14 @@ pub enum XfrmObjectRemovalRequest {
 }
 
 impl XfrmObjectRemovalRequest {
+    /// The lookup mark this removal will select with.
+    fn lookup_mark(&self) -> Option<XfrmLookupMark> {
+        match self {
+            Self::Sa(request) => request.mark,
+            Self::Policy(request) => request.mark,
+        }
+    }
+
     /// Object kind removed by this request.
     pub const fn object(&self) -> XfrmInstallObject {
         match self {
@@ -1019,6 +1028,21 @@ impl XfrmStagedObjectInstall {
         let runtime = tokio::runtime::Handle::try_current()
             .map_err(|_| XfrmStagedObjectInstallRunError::RuntimeUnavailable)?;
         let install_operation = self.journal.inner.install_operation;
+        // Refuse before installing anything. This journal retains a removal
+        // identity so recovery can delete the object it installed, and that
+        // delete re-selects by lookup mark without proving the selection is
+        // unique. A narrower canonical mask can match another stored object,
+        // so accepting one here would promise an exact recovery this boundary
+        // cannot perform -- and the caller would only find out at recovery
+        // time, with residue already in the kernel.
+        validate_exact_lookup_mark(
+            self.journal.inner.removal.lookup_mark(),
+            "staged_object.install.mark",
+        )
+        .map_err(|source| XfrmStagedObjectInstallRunError::InstallFailed {
+            operation: install_operation,
+            source,
+        })?;
         let guard = RunGuard::begin(self.journal.clone());
         let worker = runtime.spawn(async move {
             let mut guard = guard;
@@ -1084,7 +1108,7 @@ mod tests {
     use crate::{
         AllocateSpiRequest, IpAddress, PolicyParameters, QuerySaRequest, RekeyPolicyRequest,
         RekeySaRequest, SaParameters, SaState, SpiAllocation, XfrmAction, XfrmDirection, XfrmId,
-        XfrmMark, XfrmMode, XfrmProbe, XfrmSelector, XfrmTemplate,
+        XfrmLookupMark, XfrmMode, XfrmProbe, XfrmSelector, XfrmTemplate,
     };
 
     #[derive(Debug, Default)]
@@ -2879,10 +2903,7 @@ mod tests {
 
     #[tokio::test]
     async fn sa_removal_identity_preserves_the_lookup_mark() {
-        let mark = XfrmMark {
-            value: 0x42,
-            mask: 0xffff_ffff,
-        };
+        let mark = XfrmLookupMark::full(0x42);
         let mut request = sa_install_request();
         if let XfrmObjectInstallRequest::Sa(request) = &mut request {
             request.parameters.mark = Some(mark);
@@ -2913,10 +2934,7 @@ mod tests {
 
     #[tokio::test]
     async fn policy_removal_identity_preserves_the_lookup_mark() {
-        let mark = XfrmMark {
-            value: 0x77,
-            mask: 0xffff_ffff,
-        };
+        let mark = XfrmLookupMark::full(0x77);
         let mut request = policy_install_request();
         if let XfrmObjectInstallRequest::Policy(request) = &mut request {
             request.parameters.mark = Some(mark);

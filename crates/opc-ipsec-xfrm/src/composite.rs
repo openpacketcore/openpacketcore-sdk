@@ -2,6 +2,7 @@
 
 use std::{error::Error, fmt};
 
+use crate::model::validate_exact_lookup_mark;
 use crate::{
     InstallPolicyRequest, InstallSaRequest, RekeyPolicyRequest, RekeySaRequest,
     RemovePolicyRequest, RemoveSaRequest, XfrmBackend, XfrmError,
@@ -371,6 +372,25 @@ pub async fn install_sa_policy_with_rollback<B>(
 where
     B: XfrmBackend + ?Sized,
 {
+    // Refuse before installing anything. Both rollback paths below delete by
+    // re-selecting on these lookup marks, and that selection is never proven
+    // unique: a narrower canonical mask can match another stored object, so a
+    // rollback could remove something this call never installed. Rejecting up
+    // front leaves the kernel untouched, which a mid-rollback failure would
+    // not.
+    validate_exact_lookup_mark(request.sa.parameters.mark, "composite.sa.mark").map_err(
+        |source| XfrmCompositeInstallError::InstallSaFailed {
+            source,
+            outcome: XfrmCompositeOutcome::not_applied(XfrmCompositeOperation::InstallSa),
+        },
+    )?;
+    validate_exact_lookup_mark(request.policy.parameters.mark, "composite.policy.mark").map_err(
+        |source| XfrmCompositeInstallError::InstallSaFailed {
+            source,
+            outcome: XfrmCompositeOutcome::not_applied(XfrmCompositeOperation::InstallSa),
+        },
+    )?;
+
     if let Err(source) = backend.install_sa(request.sa.clone()).await {
         let outcome = if matches!(&source, XfrmError::StateIndeterminate { .. }) {
             XfrmCompositeOutcome::indeterminate(XfrmCompositeOperation::InstallSa)

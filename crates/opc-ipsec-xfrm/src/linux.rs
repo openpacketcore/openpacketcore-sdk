@@ -40,8 +40,8 @@ use crate::{
     RekeyPolicyRequest, RekeySaRequest, RelocateSaRequest, RemovePolicyRequest, RemoveSaRequest,
     SaParameters, SaRelocationEncap, SaRelocationIdentity, SaRelocationSelector, SaReplayState,
     SaState, SaStatistics, SpiAllocation, UdpEncap, XfrmAction, XfrmBackend, XfrmBackendKind,
-    XfrmCapability, XfrmDirection, XfrmError, XfrmId, XfrmMark, XfrmMode, XfrmProbe, XfrmRequestId,
-    XfrmSelector, XfrmTemplate, XFRM_AEAD_RFC4106_GCM_AES,
+    XfrmCapability, XfrmDirection, XfrmError, XfrmId, XfrmLookupMark, XfrmMark, XfrmMode,
+    XfrmProbe, XfrmRequestId, XfrmSelector, XfrmTemplate, XFRM_AEAD_RFC4106_GCM_AES,
 };
 
 const NETLINK_HEADER_LEN: usize = 16;
@@ -488,7 +488,7 @@ impl LinuxXfrmBackend {
     async fn query_sa_for_relocation(
         &self,
         id: XfrmId,
-        mark: Option<XfrmMark>,
+        mark: Option<XfrmLookupMark>,
         operation: &'static str,
     ) -> Result<SaRelocationSnapshot, XfrmError> {
         let body = encode_sa_id(id.destination, id.protocol, id.spi, mark)?;
@@ -1626,7 +1626,7 @@ fn encode_sa_id(
     destination: IpAddress,
     protocol: u8,
     spi: u32,
-    mark: Option<XfrmMark>,
+    mark: Option<XfrmLookupMark>,
 ) -> Result<SensitiveBuffer, XfrmError> {
     if spi == 0 {
         return Err(XfrmError::invalid_config("spi", "spi must be nonzero"));
@@ -1813,7 +1813,7 @@ fn encode_policy_info(parameters: &PolicyParameters) -> Result<SensitiveBuffer, 
 fn encode_policy_id(
     selector: &XfrmSelector,
     direction: XfrmDirection,
-    mark: Option<XfrmMark>,
+    mark: Option<XfrmLookupMark>,
 ) -> Result<SensitiveBuffer, XfrmError> {
     validate_selector_family(selector)?;
     let mut out = sensitive_buffer_with_capacity(XFRM_USER_POLICY_ID_LEN);
@@ -2112,16 +2112,22 @@ fn encode_replay_state_esn(replay_state: &SaReplayState) -> Result<SensitiveBuff
     Ok(out)
 }
 
-fn encode_mark(mark: XfrmMark) -> [u8; XFRM_MARK_LEN] {
+/// Encode a lookup mark into `XFRMA_MARK`.
+///
+/// Takes [`XfrmLookupMark`] rather than a raw pair so the canonical invariant
+/// is carried by the type: this is the single chokepoint through which every
+/// lookup mark reaches the kernel, and a noncanonical pair encoded here would
+/// install an object no later request could select.
+fn encode_mark(mark: XfrmLookupMark) -> [u8; XFRM_MARK_LEN] {
     let mut out = [0_u8; XFRM_MARK_LEN];
-    out[..4].copy_from_slice(&mark.value.to_ne_bytes());
-    out[4..].copy_from_slice(&mark.mask.to_ne_bytes());
+    out[..4].copy_from_slice(&mark.value().to_ne_bytes());
+    out[4..].copy_from_slice(&mark.mask().to_ne_bytes());
     out
 }
 
 fn append_common_attrs(
     out: &mut Vec<u8>,
-    mark: Option<XfrmMark>,
+    mark: Option<XfrmLookupMark>,
     if_id: Option<u32>,
 ) -> Result<(), XfrmError> {
     if let Some(mark) = mark {
@@ -2289,9 +2295,10 @@ fn parse_esp_peer_observation_registration(
             operation: OPERATION,
         });
     }
-    if snapshot.identity.mark.is_some_and(|mark| mark.mask == 0)
-        || snapshot.identity.if_id == Some(0)
-    {
+    // A zero-mask or noncanonical lookup mark can no longer reach here:
+    // `parse_lookup_mark_attr` rejects both at the parse boundary. Only the
+    // `if_id` half of this guard remains reachable.
+    if snapshot.identity.if_id == Some(0) {
         return Err(XfrmError::io(
             OPERATION,
             invalid_data("noncanonical SA identity"),
@@ -2345,15 +2352,21 @@ fn parse_esp_peer_observation_registration(
     })
 }
 
-fn observation_mark_selects(requested: Option<XfrmMark>, observed: Option<XfrmMark>) -> bool {
-    match (requested, observed) {
-        (None, None) => true,
-        (Some(requested), Some(observed)) => {
-            requested.mask == observed.mask
-                && requested.value & observed.mask == observed.value & observed.mask
-        }
-        _ => false,
-    }
+/// Whether an observed SA carries exactly the requested lookup identity.
+///
+/// Both sides are canonical by construction, so `value & mask == value` on
+/// each and the old re-masking is redundant: equal masks plus equal masked
+/// values is plain equality. The re-masking previously also hid a
+/// noncanonical observed value, which is now rejected at the parse boundary.
+///
+/// This is an identity comparison, not a claim about kernel selection. Two
+/// distinct canonical marks can still both be selected by one lookup value;
+/// see `XfrmLookupMark::is_exact_profile`.
+fn observation_mark_selects(
+    requested: Option<XfrmLookupMark>,
+    observed: Option<XfrmLookupMark>,
+) -> bool {
+    requested == observed
 }
 
 fn validate_esp_peer_observation_crypto(payload: &[u8]) -> Result<(), XfrmError> {
@@ -3085,11 +3098,17 @@ fn decode_policy_action(action: u8) -> Result<XfrmAction, XfrmError> {
     }
 }
 
+/// Parse `XFRMA_MARK` from a policy or SA readback into a lookup identity.
+///
+/// Fails closed on a pair that is not a usable lookup mark, for the same
+/// reason as `parse_lookup_mark_attr`: a stored object whose value carries
+/// bits outside its mask can never be selected again, so adopting it as an
+/// exact identity would misdescribe what a later removal can address.
 fn parse_exact_mark_attribute(
     payload: &[u8],
     base_len: usize,
     operation: &'static str,
-) -> Result<Option<XfrmMark>, XfrmError> {
+) -> Result<Option<XfrmLookupMark>, XfrmError> {
     let Some(mark) = unique_route_attribute(payload, base_len, XFRMA_MARK, operation)? else {
         return Ok(None);
     };
@@ -3099,10 +3118,11 @@ fn parse_exact_mark_attribute(
             invalid_data("invalid lookup-mark attribute length"),
         ));
     }
-    Ok(Some(XfrmMark {
-        value: read_u32_ne(mark, 0)?,
-        mask: read_u32_ne(mark, 4)?,
-    }))
+    let value = read_u32_ne(mark, 0)?;
+    let mask = read_u32_ne(mark, 4)?;
+    XfrmLookupMark::new(value, mask)
+        .map(Some)
+        .map_err(|_| XfrmError::io(operation, invalid_data("noncanonical SA lookup mark")))
 }
 
 fn parse_exact_if_id_attribute(
@@ -3159,7 +3179,15 @@ fn parse_udp_encap_attr(payload: &[u8]) -> Result<Option<UdpEncap>, XfrmError> {
     }))
 }
 
-fn parse_lookup_mark_attr(payload: &[u8]) -> Result<Option<XfrmMark>, XfrmError> {
+/// Parse `XFRMA_MARK` into a usable lookup identity.
+///
+/// Fails closed when the kernel reports a pair this SDK could never address
+/// again. A state stored with bits outside its mask is unreachable by any
+/// request, so adopting it as an identity would let a later readback or
+/// removal claim to target an object that cannot be selected. Such a state can
+/// exist -- another writer can install one -- so this is a real kernel
+/// condition, not a defensive impossibility.
+fn parse_lookup_mark_attr(payload: &[u8]) -> Result<Option<XfrmLookupMark>, XfrmError> {
     let Some(mark) = find_unique_attr_payload(
         payload,
         XFRM_USER_SA_INFO_LEN,
@@ -3175,10 +3203,11 @@ fn parse_lookup_mark_attr(payload: &[u8]) -> Result<Option<XfrmMark>, XfrmError>
             invalid_data("invalid lookup-mark attribute length"),
         ));
     }
-    Ok(Some(XfrmMark {
-        value: read_u32_ne(mark, 0)?,
-        mask: read_u32_ne(mark, 4)?,
-    }))
+    let value = read_u32_ne(mark, 0)?;
+    let mask = read_u32_ne(mark, 4)?;
+    XfrmLookupMark::new(value, mask)
+        .map(Some)
+        .map_err(|_| XfrmError::io("query_sa", invalid_data("noncanonical SA lookup mark")))
 }
 
 fn parse_if_id_attr(payload: &[u8]) -> Result<Option<u32>, XfrmError> {
@@ -4157,8 +4186,8 @@ mod tests {
     use crate::outbound_binding::validate_outbound_request;
     use crate::{
         AeadAlgorithm, Algorithm, AuthAlgorithm, InstallSaRequest, KeyMaterial,
-        SaRelocationDirection, XfrmCompositeInstallRequest, UDP_ENCAP_ESPINUDP,
-        XFRM_AUTH_HMAC_SHA256, XFRM_ENCR_CBC_AES, XFRM_ENCR_NULL,
+        SaRelocationDirection, XfrmCompositeInstallRequest, XfrmLookupMarkError,
+        UDP_ENCAP_ESPINUDP, XFRM_AUTH_HMAC_SHA256, XFRM_ENCR_CBC_AES, XFRM_ENCR_NULL,
     };
 
     #[derive(Debug, Default, Clone)]
@@ -4420,10 +4449,11 @@ mod tests {
         parameters.source_address = ipv4(192, 0, 2, 10);
         parameters.request_id = XfrmRequestId::new(0x0102_0304);
         parameters.encap = Some(UdpEncap::esp_in_udp(4500, 4500));
-        parameters.mark = Some(XfrmMark {
-            value: 0xaabb_ccdd,
-            mask: 0xffff_0000,
-        });
+        // The value is the fixture's original `0xaabb_ccdd`; only the mask
+        // widens. The old pair `{ 0xaabb_ccdd, 0xffff_0000 }` was noncanonical
+        // and named a state no lookup could ever select, and relocation now
+        // requires the exact profile anyway (`validate_exact_lookup_mark`).
+        parameters.mark = Some(XfrmLookupMark::full(0xaabb_ccdd));
         parameters.output_mark = Some(XfrmMark {
             value: 0x0000_1200,
             mask: 0x0000_ff00,
@@ -4728,10 +4758,8 @@ mod tests {
             KeyMaterial::new(vec![0xef; 36]),
         ));
         parameters.replay_window = MAX_ESN_BITMAP_WORDS_PER_ATTR * 32;
-        parameters.mark = Some(XfrmMark {
-            value: 0x1234_0000,
-            mask: 0xffff_0000,
-        });
+        parameters.mark =
+            Some(XfrmLookupMark::new(0x1234_0000, 0xffff_0000).expect("canonical lookup mark"));
         parameters.if_id = Some(7);
         parameters.output_mark = Some(XfrmMark {
             value: 0x0000_1200,
@@ -4797,7 +4825,7 @@ mod tests {
         assert_eq!(&body[24..28], &[198, 51, 100, 20]);
         assert_eq!(&body[40..44], &[198, 51, 100, 10]);
         assert_eq!(&body[56..60], &0xaabb_ccdd_u32.to_ne_bytes());
-        assert_eq!(&body[60..64], &0xffff_0000_u32.to_ne_bytes());
+        assert_eq!(&body[60..64], &0xffff_ffff_u32.to_ne_bytes());
         assert_eq!(&body[64..68], &[10, 0, 0, 2]);
         assert_eq!(&body[80..84], &[10, 0, 0, 1]);
         assert_eq!(&body[104..106], &AF_INET.to_ne_bytes());
@@ -4895,22 +4923,30 @@ mod tests {
     }
 
     #[test]
-    fn esp_peer_observation_registration_uses_raw_kernel_mark() {
+    fn esp_peer_observation_registration_uses_the_kernel_mark_not_the_requested_one() {
         let parameters = relocation_parameters();
         let body = encode_sa_info(&parameters).unwrap();
         let mut requested = observation_key(&parameters);
-        requested.mark = Some(XfrmMark {
-            value: 0xaabb_1234,
-            mask: 0xffff_0000,
-        });
 
+        // This test used to request `{ 0xaabb_1234, 0xffff_0000 }` -- a pair
+        // that differed from the kernel's stored mark only *outside* the mask
+        // -- to prove the registration adopts the kernel's raw value rather
+        // than the requested one. That pair is noncanonical and no longer
+        // constructible, so the coverage moves to the constructor: the shape is
+        // rejected up front instead of being silently re-masked at comparison
+        // time.
+        assert_eq!(
+            XfrmLookupMark::new(0xaabb_1234, 0xffff_0000),
+            Err(XfrmLookupMarkError::NoncanonicalValue)
+        );
+
+        requested.mark = Some(XfrmLookupMark::full(0xaabb_ccdd));
         let registration = parse_esp_peer_observation_registration(&body, requested).unwrap();
+        // Still the kernel's mark: `key.mark` is read from the parsed body, not
+        // copied from `requested`.
         assert_eq!(registration.key.mark, parameters.mark);
 
-        requested.mark = Some(XfrmMark {
-            value: 0xbbbb_1234,
-            mask: 0xffff_0000,
-        });
+        requested.mark = Some(XfrmLookupMark::full(0xbbbb_1234));
         assert!(matches!(
             parse_esp_peer_observation_registration(&body, requested),
             Err(XfrmError::StateMismatch {
@@ -5450,7 +5486,17 @@ mod tests {
         ));
 
         let mut request = valid.clone();
-        request.current.mark = Some(XfrmMark { value: 7, mask: 0 });
+        // `{ value: 7, mask: 0 }` used to be rejected here; it is now rejected
+        // one layer earlier, by the constructor, so assert it there rather than
+        // lose the case.
+        assert_eq!(
+            XfrmLookupMark::new(7, 0),
+            Err(XfrmLookupMarkError::ZeroMask)
+        );
+        // What `validate_relocate_sa_request` still has to reject is the shape
+        // that remains representable: a canonical but narrower-than-full mask,
+        // whose lookup domain can overlap another stored state's.
+        request.current.mark = Some(XfrmLookupMark::new(7, 0xff).expect("canonical lookup mark"));
         assert!(matches!(
             validate_relocate_sa_request(&request),
             Err(XfrmError::InvalidConfig {
@@ -6074,10 +6120,8 @@ mod tests {
     fn lookup_mark_is_independent_and_disjoint_output_mark_composes_with_dscp() {
         let profile = MarkProfile::new(25, 0xfe00_0000).unwrap();
         let mut parameters = sa_parameters();
-        let lookup_mark = XfrmMark {
-            value: profile.presence_bit(),
-            mask: profile.mask,
-        };
+        let lookup_mark = XfrmLookupMark::new(profile.presence_bit(), profile.mask)
+            .expect("canonical lookup mark");
         let output_mark = XfrmMark {
             value: 0x0001_0000,
             mask: 0x00ff_0000,
@@ -6369,10 +6413,11 @@ mod tests {
     fn encodes_sa_install_with_udp_encap_mark_and_if_id_attrs() {
         let mut params = sa_parameters();
         params.encap = Some(UdpEncap::esp_in_udp(4500, 4500));
-        params.mark = Some(XfrmMark {
-            value: 0x1234_5678,
-            mask: 0xffff_0000,
-        });
+        // Mask preserved; the value is the fixture's `0x1234_5678` reduced to
+        // its own mask, because `{ 0x1234_5678, 0xffff_0000 }` is noncanonical
+        // and could never be looked up again.
+        params.mark =
+            Some(XfrmLookupMark::new(0x1234_0000, 0xffff_0000).expect("canonical lookup mark"));
         params.if_id = Some(7);
 
         let body = encode_sa_info(&params).unwrap();
@@ -6395,10 +6440,7 @@ mod tests {
     #[test]
     fn encodes_policy_with_mark_and_if_id_attrs() {
         let mut params = policy_parameters();
-        params.mark = Some(XfrmMark {
-            value: 0x0000_0042,
-            mask: 0xffff_ffff,
-        });
+        params.mark = Some(XfrmLookupMark::full(0x0000_0042));
         params.if_id = Some(9);
 
         let body = encode_policy_info(&params).unwrap();
@@ -6536,10 +6578,8 @@ mod tests {
     fn encodes_newae_replay_update_with_exact_identity_mark_and_esn_state() {
         let mut params = sa_parameters();
         params.replay_window = 64;
-        params.mark = Some(XfrmMark {
-            value: 0x1234_0000,
-            mask: 0xffff_0000,
-        });
+        params.mark =
+            Some(XfrmLookupMark::new(0x1234_0000, 0xffff_0000).expect("canonical lookup mark"));
         let mut replay = SaReplayState::fresh(64);
         replay.outbound_sequence = 17;
         replay.outbound_sequence_hi = 1;
@@ -6964,10 +7004,7 @@ mod tests {
     async fn marked_policy_removal_encodes_exact_lookup_mark() {
         let transport = CapturingTransport::default();
         let backend = LinuxXfrmBackend::with_transport(transport.clone());
-        let mark = XfrmMark {
-            value: 0x0000_0042,
-            mask: 0x0000_00ff,
-        };
+        let mark = XfrmLookupMark::new(0x0000_0042, 0x0000_00ff).expect("canonical lookup mark");
 
         backend
             .remove_policy(RemovePolicyRequest {
@@ -7100,10 +7137,8 @@ mod tests {
         .unwrap();
         let mut marked = sa_parameters();
         marked.egress_dscp = Some(DscpCodepoint::new(46).unwrap());
-        marked.mark = Some(XfrmMark {
-            value: 0x0000_0042,
-            mask: 0x0000_00ff,
-        });
+        marked.mark =
+            Some(XfrmLookupMark::new(0x0000_0042, 0x0000_00ff).expect("canonical lookup mark"));
 
         assert!(matches!(
             backend
@@ -7137,10 +7172,8 @@ mod tests {
         .unwrap();
         let mut marked = sa_parameters();
         marked.egress_dscp = Some(DscpCodepoint::new(46).unwrap());
-        marked.mark = Some(XfrmMark {
-            value: 0x0000_0042,
-            mask: 0x0000_00ff,
-        });
+        marked.mark =
+            Some(XfrmLookupMark::new(0x0000_0042, 0x0000_00ff).expect("canonical lookup mark"));
         let marked_lookup = marked.mark.unwrap();
 
         assert!(matches!(
@@ -7172,10 +7205,7 @@ mod tests {
         let profile = MarkProfile::new(25, 0xfe00_0000).unwrap();
         let mut requested = sa_parameters();
         requested.egress_dscp = Some(DscpCodepoint::new(46).unwrap());
-        requested.mark = Some(XfrmMark {
-            value: 0x42,
-            mask: 0xff,
-        });
+        requested.mark = Some(XfrmLookupMark::new(0x42, 0xff).expect("canonical lookup mark"));
         let mut returned = requested.clone();
         returned.source_address = ipv4(192, 0, 2, 99);
         let response = encode_sa_info_with_dscp(&returned, Some(profile))
