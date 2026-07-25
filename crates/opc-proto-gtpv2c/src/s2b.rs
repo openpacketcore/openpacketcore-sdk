@@ -451,6 +451,12 @@ pub struct S2bCreateSessionRequest<'a> {
     /// PDN Address Allocation IE carrying both the requested PDN family and
     /// dynamic or static address-allocation values.
     ///
+    /// On S2b this is also where the *requested* PDN type is conveyed. There is
+    /// deliberately no separate PDN Type field: TS 29.274 Table 7.2.1-1 NOTE 1
+    /// states that IE is never sent on S2a/S2b, since the PAA "contains exactly
+    /// the same field", and the table's PAA row makes the ePDG responsible for
+    /// setting it here. A top-level PDN Type IE is rejected at build time.
+    ///
     /// Use the explicit [`PdnAddressAllocation`] constructors rather than
     /// hand-assembling its family-dependent fields.
     pub paa: PdnAddressAllocation,
@@ -960,13 +966,22 @@ pub fn s2b_create_session_request(
         .with_spec_ref(spec_ref())
         .into());
     }
+    // Not an oversight, and not a gap to be filled by a typed field: TS 29.274
+    // Table 7.2.1-1 lists PDN Type as Conditional, but its condition names only
+    // the S4/S11 and S5/S8 interfaces, and NOTE 1 under that table states the
+    // IE "is never sent on the S2a/S2b interface" because "the PAA IE contains
+    // exactly the same field". The same table's PAA row assigns the carrier
+    // explicitly: "The ePDG shall set the PDN type field in the PAA to IPv4, or
+    // IPv6 or IPv4v6 based on the UE request and the subscription record".
+    // So on S2b the requested PDN type travels in PAA, and emitting a separate
+    // PDN Type IE would be the non-conformant choice.
     if request
         .additional_ies
         .iter()
         .any(|ie| ie.ie_type() == IE_TYPE_PDN_TYPE)
     {
         return Err(EncodeError::new(EncodeErrorCode::Structural {
-            reason: "S2b Create Session Request must not contain a top-level PDN Type IE",
+            reason: "S2b Create Session Request must not contain a top-level PDN Type IE: TS 29.274 Table 7.2.1-1 NOTE 1 states it is never sent on S2a/S2b, and the PAA IE carries the requested PDN type",
         })
         .with_spec_ref(spec_ref())
         .into());
