@@ -248,6 +248,13 @@ impl GtpuError {
             // dependent, and a failed program allocation returns EINVAL rather
             // than ENOMEM, so under a container memory limit this is memory
             // pressure rather than a bad object.
+            //
+            // Known cost of drawing the line here: a JIT failure under
+            // CONFIG_BPF_JIT_ALWAYS_ON returns ENOTSUPP after verification and
+            // does mean this kernel will not run this object, but it lands as
+            // Indeterminate. That is the intended direction -- a caller retries
+            // instead of excluding a node -- and in practice a JIT failure for
+            // an already-verified program is an allocation failure.
             _ => ProgramLoadRefusal::Indeterminate,
         };
 
