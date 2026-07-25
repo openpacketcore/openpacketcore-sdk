@@ -35,8 +35,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is `None` for Error Indication, End Marker and the Supported Extension Headers
   Notification. Error Indication and the notification carry a sequence the
   receiver is told to ignore, so exposing it would invite incorrect
-  correlation; End Marker is a different case -- it carries no sequence at all,
-  and this codec rejects one with `InvalidHeaderFlags`.
+  correlation; End Marker is a different case -- TS 29.281 clause 5.1 requires
+  its `S` flag to be `0`, so it carries no *meaningful* sequence, and this codec
+  rejects an End Marker whose `S` flag is set with `InvalidHeaderFlags`. The
+  sequence octets themselves are still present on the wire whenever the `E` flag
+  is set, and such a datagram decodes normally.
 
 ### Changed
 - **Credential-rotation observability closes three residual gaps —

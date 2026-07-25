@@ -286,9 +286,14 @@ impl fmt::Debug for GtpuExtensionHeader<'_> {
     /// a length only. `GtpuMessage`'s own `Debug` reduces the chain to a
     /// length, and the public iterator that hands out these items has to hold
     /// the same line -- otherwise the idiomatic
-    /// `for ext in msg.extensions() { debug!(?ext) }` logs PDU Session
-    /// Container QFI/PPI/RQI, PDCP PDU numbers, and any peer-supplied unknown
+    /// `for ext in msg.extensions() { debug!(?ext) }` logs raw extension
+    /// content, including PDCP PDU numbers and any peer-supplied unknown
     /// extension retained under `UnknownIePolicy::Preserve`.
+    ///
+    /// This covers the *raw* bytes only. [`GtpuExtensionChain`] deliberately
+    /// reports a parsed PDU Session Container, whose QFI/PPI/RQI are QoS
+    /// metadata rather than a subscriber identity; that projection predates
+    /// this redaction and is intentionally still visible.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("GtpuExtensionHeader")
