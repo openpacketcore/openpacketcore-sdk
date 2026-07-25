@@ -486,24 +486,32 @@ jobs:
             sed -i -e "s|^mirrorlist=|#mirrorlist=|" \
                    -e "s|^#baseurl=http://dl.rockylinux.org/\$contentdir|baseurl=https://dl.rockylinux.org/vault/rocky|" \
                    /etc/yum.repos.d/rocky*.repo
-            dnf install -y --releasever=9.4 dnf-plugins-core
+            dnf install -y --releasever=9.4 dnf-plugins-core createrepo_c
             dnf download --releasever=9.4 --resolve --alldeps --destdir=/out \
               nftables wireguard-tools
+            createrepo_c /out
+            chmod -R a+rX /out
           '
-          ls -1 "${rpm_dir}" | head -20
-          test -n "$(ls -A "${rpm_dir}")"
-          scp \
+          test -d "${rpm_dir}/repodata"
+          scp -r \
             -i "${key}" \
             -P 2228 \
             -o BatchMode=yes \
             -o IdentitiesOnly=yes \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
-            "${rpm_dir}"/*.rpm opc@127.0.0.1:/tmp/
+            "${rpm_dir}" opc@127.0.0.1:/tmp/opc-el9-repo
 
+          # Install from a local repo rather than `dnf install /tmp/*.rpm`:
+          # the latter forces every downloaded RPM onto the guest, including
+          # the core packages in the dependency closure, which dnf refuses
+          # because it would have to replace systemd. As a repo, dnf resolves
+          # normally and installs only what this guest is actually missing.
           ssh "${ssh_options[@]}" opc@127.0.0.1 '
             set -euo pipefail
-            sudo dnf install -y --disablerepo="*" /tmp/*.rpm
+            sudo dnf install -y --disablerepo="*" \
+              --repofrompath=opclocal,file:///tmp/opc-el9-repo \
+              --nogpgcheck nftables wireguard-tools
             command -v nft
             command -v wg
             sudo modprobe wireguard
