@@ -203,9 +203,16 @@ type SaKey = (IpAddress, u8, u32, Option<XfrmMark>);
 
 /// Linux policy lookup identity.
 ///
-/// `if_id` belongs here even though it is absent from [`SaKey`]: Linux selects
-/// policies with `xfrm_policy_bysel_ctx`, which compares the interface, while
-/// SA lookup does not treat it as a uniqueness discriminator.
+/// `if_id` belongs here even though it is absent from [`SaKey`]:
+/// `xfrm_policy_insert` compares it, while `__xfrm_state_lookup` matches only
+/// family, SPI, protocol, destination and the mark, so two SAs differing only
+/// by interface collide.
+///
+/// The mark halves differ too, and only the policy half is modelled exactly
+/// here: policy lookup is pair equality (`xfrm_policy_mark_match`), whereas SA
+/// lookup applies the *stored* SA's mask to the incoming value. Overlapping SA
+/// masks are therefore still compared by pair equality below; that gap is
+/// issue #419, not something this key models.
 type PolicyKey = (XfrmSelector, XfrmDirection, Option<XfrmMark>, Option<u32>);
 
 #[derive(Debug, Clone)]
@@ -309,17 +316,31 @@ impl MockXfrmBackend {
     }
 }
 
+/// Collapse the encodings the wire cannot tell apart.
+///
+/// `append_common_attrs` omits `XFRMA_MARK` and `XFRMA_IF_ID` entirely when
+/// the value is `None`, and the kernel decodes an absent attribute as zero. So
+/// `Some(0)` and `None` produce byte-identical messages and must not be two
+/// identities here.
+fn canonical_mark(mark: Option<XfrmMark>) -> Option<XfrmMark> {
+    mark.filter(|mark| mark.mask != 0)
+}
+
+fn canonical_if_id(if_id: Option<u32>) -> Option<u32> {
+    if_id.filter(|if_id| *if_id != 0)
+}
+
 fn policy_key(parameters: &PolicyParameters) -> PolicyKey {
     (
         parameters.selector.clone(),
         parameters.direction,
-        parameters.mark,
-        parameters.if_id,
+        canonical_mark(parameters.mark),
+        canonical_if_id(parameters.if_id),
     )
 }
 
 fn sa_key(id: XfrmId, mark: Option<XfrmMark>) -> SaKey {
-    (id.destination, id.protocol, id.spi, mark)
+    (id.destination, id.protocol, id.spi, canonical_mark(mark))
 }
 
 fn sa_record_from_parameters(parameters: &crate::model::SaParameters) -> MockSaRecord {
@@ -720,9 +741,10 @@ impl XfrmBackend for MockXfrmBackend {
             priority: request.parameters.priority,
             templates: request.parameters.templates.clone(),
         });
-        // XFRM_MSG_UPDPOLICY replaces in place. Missing-policy rekey parity is
-        // tracked separately; this keeps the stored policy in step so a later
-        // install still sees the identity as occupied.
+        // UPDPOLICY is an upsert: xfrm_add_policy passes excl = 0 to
+        // xfrm_policy_insert, so a lookup miss inserts rather than failing.
+        // That is the deliberate opposite of UPDSA, which xfrm_state_update
+        // rejects with -ESRCH, so there is no miss case to reject here.
         let key = policy_key(&request.parameters);
         state.policies.insert(key, request.parameters);
         Ok(())
@@ -745,7 +767,13 @@ impl XfrmBackend for MockXfrmBackend {
         // behaviour and not an omission here.
         state
             .policies
-            .remove(&(request.selector, request.direction, request.mark, None));
+            .remove(&(
+                request.selector,
+                request.direction,
+                canonical_mark(request.mark),
+                None,
+            ))
+            .ok_or(XfrmError::NotFound)?;
         Ok(())
     }
 
@@ -1246,7 +1274,9 @@ mod tests {
             .await
             .unwrap();
         let error = backend
-            .install_policy(InstallPolicyRequest { parameters: scoped })
+            .install_policy(InstallPolicyRequest {
+                parameters: scoped.clone(),
+            })
             .await
             .unwrap_err();
         assert!(matches!(error, XfrmError::AlreadyExists));
@@ -1261,12 +1291,75 @@ mod tests {
             })
             .await
             .unwrap();
+        // The scoped policy must still be there -- asserted, not merely
+        // described, so a removal that dropped every interface scope would
+        // fail here.
+        let error = backend
+            .install_policy(InstallPolicyRequest { parameters: scoped })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, XfrmError::AlreadyExists));
         backend
             .install_policy(InstallPolicyRequest {
                 parameters: unscoped,
             })
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn mock_policy_treats_zero_if_id_and_mark_as_absent() {
+        // XFRMA_IF_ID and XFRMA_MARK are omitted when None, and the kernel
+        // decodes an absent attribute as zero, so Some(0) and None are the
+        // same policy and must stay installable, removable and reinstallable.
+        let backend = MockXfrmBackend::new();
+        let unscoped = sample_policy_parameters();
+        let mut zero_scoped = unscoped.clone();
+        zero_scoped.if_id = Some(0);
+
+        backend
+            .install_policy(InstallPolicyRequest {
+                parameters: zero_scoped.clone(),
+            })
+            .await
+            .unwrap();
+        let error = backend
+            .install_policy(InstallPolicyRequest {
+                parameters: unscoped.clone(),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, XfrmError::AlreadyExists));
+
+        backend
+            .remove_policy(RemovePolicyRequest {
+                selector: unscoped.selector.clone(),
+                direction: unscoped.direction,
+                mark: unscoped.mark,
+            })
+            .await
+            .unwrap();
+        backend
+            .install_policy(InstallPolicyRequest {
+                parameters: zero_scoped,
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn mock_remove_policy_reports_a_missing_policy() {
+        let backend = MockXfrmBackend::new();
+        let params = sample_policy_parameters();
+        let error = backend
+            .remove_policy(RemovePolicyRequest {
+                selector: params.selector.clone(),
+                direction: params.direction,
+                mark: params.mark,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, XfrmError::NotFound));
     }
 
     #[tokio::test]
@@ -1773,20 +1866,32 @@ mod tests {
     #[tokio::test]
     async fn mock_remove_policy_records_operation() {
         let backend = MockXfrmBackend::new();
+        let mark = Some(XfrmMark {
+            value: 0x42,
+            mask: 0xff,
+        });
         let request = RemovePolicyRequest {
             selector: sample_selector(),
             direction: XfrmDirection::Out,
-            mark: Some(XfrmMark {
-                value: 0x42,
-                mask: 0xff,
-            }),
+            mark,
         };
+        // DELPOLICY reports -ENOENT on a miss, so the policy has to exist
+        // first; this previously removed from an empty backend and passed.
+        let mut params = sample_policy_parameters();
+        params.selector = request.selector.clone();
+        params.direction = request.direction;
+        params.mark = mark;
+        params.if_id = None;
+        backend
+            .install_policy(InstallPolicyRequest { parameters: params })
+            .await
+            .unwrap();
         backend.remove_policy(request.clone()).await.unwrap();
 
         let ops = backend.operations();
-        assert_eq!(ops.len(), 1);
+        assert_eq!(ops.len(), 2);
         assert_eq!(
-            ops[0],
+            ops[1],
             MockOperation::RemovePolicy {
                 selector: request.selector,
                 direction: request.direction,
