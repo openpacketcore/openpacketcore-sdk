@@ -1128,13 +1128,15 @@ offload support.
   availability alone would not have settled it. CI boots a digest-pinned Rocky
   9.4 image, asserts the guest is on `5.14.0-427.*el9_4*`, and loads both
   committed classifiers there on every run.
-- **What that gate does and does not establish.** It proves `BPF_PROG_LOAD`
-  succeeds for both classifiers on that kernel. It does **not** exercise
-  attach, forwarding, encap/decap, PMTU or fragment handling on 5.14 — the full
-  privileged datapath suite runs only on the 6.8 runner — and it says nothing
-  about a node's SELinux policy, container capabilities, in-pod bpffs
-  availability, or MTU headroom. Treat it as one necessary condition, not as
-  proof the datapath forwards on a given cluster.
+- **What that gate does and does not establish.** It proves both classifiers
+  pass `BPF_PROG_LOAD`, and it runs the privileged datapath suite on that
+  kernel in a fresh network namespace: attach, encap/decap, PMTU and fragment
+  handling, checksum boundaries, counter aggregation and ownership-safe
+  teardown. It says nothing about a node's SELinux policy for a confined
+  container domain, whether `CAP_BPF` alone suffices (CI runs as root),
+  in-pod bpffs availability under an immutable host, MTU headroom against a
+  given CNI, or coexistence with another tc/eBPF program on the same
+  interface. Treat it as necessary, not sufficient, for a given cluster.
 - A loadability verdict here is about this object only. It does not speak for
   whatever node-admission policy a deployment configures, and it is not itself
   an admission decision.

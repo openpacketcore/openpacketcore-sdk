@@ -268,9 +268,9 @@ jobs:
           grep -Fq 'OPC_GTPU_LOAD_CAPABILITY_PROVEN' <<< "${load_output}"
 
   el9-514-classifier-load:
-    name: RHEL 9 / OpenShift 4.18 classifier load
+    name: RHEL 9 / OpenShift 4.18 datapath
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 75
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -308,6 +308,24 @@ jobs:
             exit 1
           fi
           cp "${test_binary}" "${RUNNER_TEMP}/opc-gtpu-el9-test"
+
+          # The forwarding suite: encap/decap, PMTU, fragments, checksums,
+          # counter aggregation and teardown. Loading proves the verifier
+          # accepts the object; only this proves the datapath moves packets.
+          cargo test --locked -p opc-gtpu-dataplane --test ebpf_gtpu_privileged --no-run \
+            --target x86_64-unknown-linux-musl --message-format=json \
+            > "${RUNNER_TEMP}/gtpu-el9-datapath-build.jsonl"
+          datapath_binary="$(
+            jq -r 'select(.profile.test == true and .target.name == "ebpf_gtpu_privileged") | .executable // empty' \
+              "${RUNNER_TEMP}/gtpu-el9-datapath-build.jsonl" | tail -n 1
+          )"
+          test -n "${datapath_binary}"
+          test -x "${datapath_binary}"
+          if readelf -l "${datapath_binary}" | grep -q 'Requesting program interpreter'; then
+            echo "::error::el9 datapath binary is dynamically linked and will not start on RHEL 9"
+            exit 1
+          fi
+          cp "${datapath_binary}" "${RUNNER_TEMP}/opc-gtpu-el9-datapath"
 
       - name: Load both classifiers on a RHEL 9 kernel
         run: |
@@ -411,6 +429,14 @@ jobs:
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
             "${RUNNER_TEMP}/opc-gtpu-el9-test" opc@127.0.0.1:/tmp/opc-gtpu-el9-test
+          scp \
+            -i "${key}" \
+            -P 2228 \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            "${RUNNER_TEMP}/opc-gtpu-el9-datapath" opc@127.0.0.1:/tmp/opc-gtpu-el9-datapath
 
           # Record the kernel this evidence is about, and assert it is the
           # RHEL 9 line rather than whatever the image happens to ship.
@@ -439,6 +465,28 @@ jobs:
           grep -Fq 'test result: ok. 2 passed; 0 failed;' <<< "${load_output}"
           grep -Fq 'OPC_GTPU_TAG_PROOF_PROVEN' <<< "${load_output}"
           grep -Fq 'OPC_GTPU_LOAD_CAPABILITY_PROVEN' <<< "${load_output}"
+
+          # The suite shells out to ip, tc, nft and wg. iproute2 is present on
+          # the cloud image; the rest are not. No `gtp` module is needed --
+          # this is the tc/eBPF path, not the kernel GTP netdevice.
+          ssh "${ssh_options[@]}" opc@127.0.0.1 '
+            set -euo pipefail
+            sudo dnf -y --setopt=install_weak_deps=False install nftables wireguard-tools kmod
+            sudo modprobe wireguard
+            chmod 0755 /tmp/opc-gtpu-el9-datapath
+          '
+
+          # Same shape as the runner-side job: a fresh network namespace with
+          # loopback up, so the suite cannot disturb the guest's own links.
+          datapath_output="$(
+            ssh "${ssh_options[@]}" opc@127.0.0.1 \
+              'sudo env OPC_GTPU_RUN_PRIVILEGED=1 unshare -n -- bash -euo pipefail -c "ip link set lo up && /tmp/opc-gtpu-el9-datapath --ignored --nocapture"' \
+              2>&1
+          )"
+          printf '%s\n' "${datapath_output}"
+          # Assert a nonzero pass count: `--ignored` with everything filtered
+          # out would otherwise report ok with nothing run.
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed;' <<< "${datapath_output}"
 
   ebpf-object:
     name: eBPF datapath object rebuild
