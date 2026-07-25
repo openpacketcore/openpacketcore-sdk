@@ -406,6 +406,7 @@ pub struct EapAkaPacket<'a> {
     pub(crate) attribute_count: u16,
     pub(crate) unknown_skippable_count: u16,
     pub(crate) kind: EapAkaPacketKind,
+    pub(crate) asserted_identity: Option<&'a [u8]>,
 }
 
 impl<'a> EapAkaPacket<'a> {
@@ -455,6 +456,37 @@ impl<'a> EapAkaPacket<'a> {
     pub const fn kind(&self) -> EapAkaPacketKind {
         self.kind
     }
+
+    /// Return the identity a peer asserted in `AT_IDENTITY`, when present.
+    ///
+    /// The slice is the identity octets up to the Actual Identity Length of
+    /// RFC 4187 clause 10.1, **excluding** the padding that clause requires;
+    /// comparing padding would make two equal identities compare unequal.
+    ///
+    /// This is `Some` only for a packet that actually carried the attribute --
+    /// in practice an `AKA-Identity` response (subtype 5), whose whole purpose
+    /// is to let a peer name a different identity than the one already seen.
+    /// A relaying node that tracks which subscriber an exchange belongs to
+    /// needs the value, not merely the fact that a round happened, to tell
+    /// "asserted the identity I already know" from "asserted a different one".
+    ///
+    /// The value is deliberately absent from `Debug`, which projects its
+    /// length instead, so diagnostics stay redaction-safe.
+    #[must_use]
+    pub const fn asserted_identity(&self) -> Option<&'a [u8]> {
+        self.asserted_identity
+    }
+
+    /// Whether the peer asserted exactly `identity` in `AT_IDENTITY`.
+    ///
+    /// Returns `false` when no `AT_IDENTITY` was present, so a caller that
+    /// must fail closed on an identity change cannot mistake "absent" for
+    /// "unchanged". Compares against the clause 10.1 actual length, so
+    /// padding never participates.
+    #[must_use]
+    pub fn asserted_identity_is(&self, identity: &[u8]) -> bool {
+        self.asserted_identity == Some(identity)
+    }
 }
 
 impl fmt::Debug for EapAkaPacket<'_> {
@@ -469,6 +501,11 @@ impl fmt::Debug for EapAkaPacket<'_> {
             .field("attribute_count", &self.attribute_count)
             .field("unknown_skippable_count", &self.unknown_skippable_count)
             .field("kind", &self.kind)
+            // Length only: the asserted identity is subscriber-correlatable.
+            .field(
+                "asserted_identity_len",
+                &self.asserted_identity.map(<[u8]>::len),
+            )
             .finish()
     }
 }

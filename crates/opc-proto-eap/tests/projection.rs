@@ -265,7 +265,7 @@ fn projects_sync_failure_for_both_methods() {
 }
 
 #[test]
-fn projects_identity_request_and_response_without_identity_value() {
+fn projects_identity_request_and_response_without_leaking_the_identity_value() {
     let request = packet(REQUEST, AKA, 5, &[fixed(17, 1)]);
     assert!(matches!(
         EapAkaPacket::parse(&request)
@@ -287,6 +287,48 @@ fn projects_identity_request_and_response_without_identity_value() {
     let debug = format!("{parsed:?}");
     assert!(!debug.contains("synthetic-user"));
     assert!(!debug.contains("example.invalid"));
+    // The value is retained and reachable; only `Debug` withholds it, and it
+    // projects the length so the attribute is still diagnosable.
+    assert_eq!(
+        parsed.asserted_identity(),
+        Some(b"synthetic-user@example.invalid".as_slice())
+    );
+    assert!(debug.contains("asserted_identity_len: Some(30)"));
+}
+
+/// RFC 4187 clause 10.1 pads the identity to a four-octet boundary. A caller
+/// comparing identities must see the octets up to the Actual Identity Length
+/// and no further, or two equal identities compare unequal.
+#[test]
+fn asserted_identity_excludes_clause_10_1_padding() {
+    // 5 octets of identity pads to 8; the accessor must return 5.
+    let response = packet(RESPONSE, AKA, 5, &[actual_text(14, b"alice")]);
+    let parsed = EapAkaPacket::parse(&response).expect("identity response is valid");
+    let identity = parsed.asserted_identity().expect("AT_IDENTITY is present");
+    assert_eq!(identity, b"alice".as_slice());
+    assert_eq!(identity.len(), 5, "padding must not be returned");
+    assert!(parsed.asserted_identity_is(b"alice"));
+    assert!(!parsed.asserted_identity_is(b"alice\0\0\0"));
+}
+
+/// The distinction the issue turns on: a relaying node must be able to tell
+/// "asserted the identity I already know" from "asserted a different one",
+/// and must not read an absent attribute as agreement.
+#[test]
+fn asserted_identity_distinguishes_same_from_different_and_from_absent() {
+    let response = packet(RESPONSE, AKA_PRIME, 5, &[actual_text(14, b"permanent-id")]);
+    let parsed = EapAkaPacket::parse(&response).expect("identity response is valid");
+    assert!(parsed.asserted_identity_is(b"permanent-id"));
+    assert!(!parsed.asserted_identity_is(b"pseudonym-id"));
+
+    // An Identity *Request* carries no AT_IDENTITY at all.
+    let request = packet(REQUEST, AKA, 5, &[fixed(17, 1)]);
+    let parsed = EapAkaPacket::parse(&request).expect("identity request is valid");
+    assert_eq!(parsed.asserted_identity(), None);
+    assert!(
+        !parsed.asserted_identity_is(b"permanent-id"),
+        "absent must never compare equal, or a caller cannot fail closed"
+    );
 }
 
 #[test]

@@ -8,6 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **The asserted `AT_IDENTITY` value is retained and exposed — `opc-proto-eap`:**
+  the parser recorded only that the attribute was present, dropping the one
+  part of it that carries meaning. `EapAkaPacket::asserted_identity` now
+  returns the octets and `asserted_identity_is` compares against them without
+  handing the value out, both using the RFC 4187 clause 10.1 Actual Identity
+  Length so the padding that clause requires never participates in a
+  comparison. An `AKA-Identity` exchange (subtype 5) exists so a peer can name
+  a different identity than the one already seen, and presence alone cannot
+  separate "asserted the identity I already know" from "asserted a different
+  one" -- so a relaying node could observe that an identity round happened but
+  neither detect a change nor fail closed on one. `asserted_identity_is`
+  returns `false` for an absent attribute, so absence can never be read as
+  agreement. The value stays out of `Debug`, which projects
+  `asserted_identity_len`.
+
 - **Independent leaf-rotation and rejected-reload evidence — `opc-session-net`:**
   extends the seamless credential-rotation qualification for #158 with
   deterministic in-process mTLS cases. Continuous get/CAS/lease/batch requests
