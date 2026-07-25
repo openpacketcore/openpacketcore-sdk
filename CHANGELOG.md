@@ -96,6 +96,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Hop-by-Hop and setting T (#394).
 
 ### Changed
+- **SA and policy lookup marks are a validated type — `opc-ipsec-xfrm`
+  (breaking):** Linux stores an XFRM mark as the raw value/mask pair but looks
+  objects up with a masked value (`xfrm_mark_get` returns `v & m`;
+  `__xfrm_state_lookup` selects with `(incoming & stored.mask) ==
+  stored.value`). A stored pair carrying bits outside its mask is therefore
+  unaddressable forever, and pair equality is not selection. `XfrmMark` could
+  not carry that invariant because it is also the SA output mark, where an
+  arbitrary pair is meaningful and a zero mask is valid. Lookup identity moves
+  to the new `XfrmLookupMark`, whose checked constructor refuses a zero mask
+  (`None` is the unmarked form) and a value outside its mask; `XfrmMark` is
+  unchanged and now means only the output/wire pair, so the compiler keeps the
+  two roles apart. `SaParameters::mark`, `PolicyParameters::mark`,
+  `QuerySaRequest::mark`, `RemoveSaRequest::mark`, `RemovePolicyRequest::mark`,
+  `SaRelocationIdentity::mark`, `EspPeerObservationKey::mark` and the three
+  `with_mark` builders take the new type; every `output_mark` is untouched. The
+  Linux parse boundaries fail closed on a kernel-reported pair that could never
+  be selected again rather than adopting it as an exact identity. Operations
+  that mutate or delete an object they select by mark — staged composite and
+  staged-object installs and their recovery, composite rollback, outbound
+  binding validation, and relocation — now require the exact profile (`None` or
+  a full mask) and are refused before any request is issued, because distinct
+  canonical marks of different widths can alias on one
+  destination/protocol/SPI. Read-only paths that prove identity by readback
+  keep accepting any canonical mark. Two limits are documented rather than
+  claimed away: an unmarked SA stores `{0,0}` and is selected by every lookup
+  value, so unmarked and marked SAs must not share a tuple; and a foreign
+  narrower-masked state installed by another writer still widens the domain.
 - **A refused `BPF_PROG_LOAD` is no longer reported as a verifier rejection —
   `opc-gtpu-dataplane`:** aya funnels every `bpf(2)` failure at the program-load
   boundary into one error without inspecting errno, so a load refused for want

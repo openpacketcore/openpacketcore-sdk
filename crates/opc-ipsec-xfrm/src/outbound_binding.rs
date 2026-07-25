@@ -11,7 +11,8 @@ use crate::namespace::{NamespaceActorBinding, NamespaceBoundLinuxXfrmBackend};
 use crate::{
     IpAddress, LifetimeConfig, PolicyParameters, SaParameters, UdpEncap, XfrmAction,
     XfrmCompositeInstallRequest, XfrmDirection, XfrmError, XfrmId, XfrmInstallCommitError,
-    XfrmMark, XfrmMode, XfrmRequestId, XfrmSelector, XfrmStagedInstallRunError, XfrmTemplate,
+    XfrmLookupMark, XfrmMark, XfrmMode, XfrmRequestId, XfrmSelector, XfrmStagedInstallRunError,
+    XfrmTemplate,
 };
 
 const IPPROTO_ESP: u8 = 50;
@@ -315,8 +316,27 @@ impl fmt::Debug for OutboundSaPolicyFingerprint {
 pub(crate) fn validate_outbound_request(
     request: &XfrmCompositeInstallRequest,
 ) -> Result<OutboundSaPolicyExpectation, OutboundSaBindingError> {
+    // Agree with the gate in `XfrmStagedInstall::run`, which is the only path
+    // that turns this validated pair into an installed binding. Accepting a
+    // mark here that `run` then refuses would make this validator answer a
+    // different question than the one its name implies: whether the pair is an
+    // acceptable exact outbound identity.
     let sa = &request.sa.parameters;
     let policy = &request.policy.parameters;
+
+    // Agree with the gate in `XfrmStagedInstall::run`, the only path that turns
+    // a validated pair into an installed binding. Accepting a mark here that
+    // `run` then refuses would make this validator answer a different question
+    // than its name implies -- whether the pair is an acceptable exact
+    // outbound identity -- and would leave the disagreement to surface only
+    // once a caller tried to install.
+    for mark in [sa.mark, policy.mark] {
+        if mark.is_some_and(|mark| !mark.is_exact_profile()) {
+            return Err(OutboundSaBindingError::invalid(
+                "xfrm_outbound_sa_binding_mark_not_exact_profile",
+            ));
+        }
+    }
 
     if sa.id.protocol != IPPROTO_ESP || sa.id.spi == 0 {
         return Err(OutboundSaBindingError::invalid(
@@ -444,7 +464,7 @@ fn fingerprint_sa(parameters: &SaParameters) -> [u8; 32] {
     digest.update(parameters.replay_window.to_be_bytes());
     digest.update([sa_uses_esn(parameters) as u8]);
     hash_encap(&mut digest, parameters.encap);
-    hash_mark(&mut digest, parameters.mark);
+    hash_mark(&mut digest, parameters.mark.map(XfrmLookupMark::wire));
     hash_mark(&mut digest, parameters.output_mark);
     hash_optional_u32(&mut digest, parameters.if_id);
     match parameters.egress_dscp {
@@ -498,7 +518,7 @@ fn fingerprint_policy(parameters: &PolicyParameters) -> [u8; 32] {
     for template in &parameters.templates {
         hash_template(&mut digest, template);
     }
-    hash_mark(&mut digest, parameters.mark);
+    hash_mark(&mut digest, parameters.mark.map(XfrmLookupMark::wire));
     hash_optional_u32(&mut digest, parameters.if_id);
     digest.finalize().into()
 }
@@ -628,10 +648,9 @@ pub(crate) mod tests_support {
 
     pub(crate) fn outbound_request() -> XfrmCompositeInstallRequest {
         let selector = XfrmSelector::new(ipv4([10, 0, 0, 1]), ipv4([10, 0, 0, 2]), 17);
-        let mark = Some(XfrmMark {
-            value: 0x1234_0000,
-            mask: 0xffff_0000,
-        });
+        // Full mask: the shared fixture must be drivable through
+        // `run_and_commit_outbound_sa_policy`, which requires the exact profile.
+        let mark = Some(XfrmLookupMark::full(0x1234_0000));
         let request_id = XfrmRequestId::new(77);
         let sa = SaParameters {
             selector: selector.clone(),
@@ -688,6 +707,32 @@ mod tests {
     #[test]
     fn exact_outbound_pair_is_accepted() {
         assert!(validate_outbound_request(&outbound_request()).is_ok());
+    }
+
+    /// The validator must answer the same question the install gate asks.
+    /// Adversarial review found it accepting a narrower canonical mask that
+    /// `XfrmStagedInstall::run` -- the only path that turns a validated pair
+    /// into an installed binding -- then refused, so a caller could pass
+    /// validation and still be unable to install.
+    #[test]
+    fn a_narrower_canonical_mask_is_refused_by_the_validator_too() {
+        let narrow = Some(XfrmLookupMark::new(0x1234_0000, 0xffff_0000).expect("canonical"));
+        for (sa_mark, policy_mark) in [(narrow, narrow), (narrow, None), (None, narrow)] {
+            let mut request = outbound_request();
+            request.sa.parameters.mark = sa_mark;
+            request.policy.parameters.mark = policy_mark;
+            assert_eq!(
+                validate_outbound_request(&request).unwrap_err().code(),
+                "xfrm_outbound_sa_binding_mark_not_exact_profile",
+                "validator must refuse what the install gate refuses"
+            );
+        }
+
+        // The exact profile stays accepted on both halves.
+        let mut request = outbound_request();
+        request.sa.parameters.mark = None;
+        request.policy.parameters.mark = None;
+        assert!(validate_outbound_request(&request).is_ok());
     }
 
     #[test]
@@ -856,10 +901,10 @@ mod tests {
         assert_ne!(validate_outbound_request(&destination).unwrap().id(), id);
 
         let mut mark = base.clone();
-        let replacement = Some(XfrmMark {
-            value: 0x4321_0000,
-            mask: 0xffff_0000,
-        });
+        // Full mask, like the base fixture: the property under test is that a
+        // different mark yields a different binding ID, which does not need a
+        // mark the outbound path refuses to install.
+        let replacement = Some(XfrmLookupMark::full(0x4321_0000));
         mark.sa.parameters.mark = replacement;
         mark.policy.parameters.mark = replacement;
         assert_ne!(validate_outbound_request(&mark).unwrap().id(), id);

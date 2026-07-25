@@ -41,6 +41,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use crate::model::{validate_exact_lookup_mark, XfrmLookupMark};
 use crate::{
     InstallPolicyRequest, InstallSaRequest, RemovePolicyRequest, RemoveSaRequest, XfrmBackend,
     XfrmCompositeOperation, XfrmError, XfrmInstallObject, XfrmResidueClassification,
@@ -131,6 +132,14 @@ pub enum XfrmObjectRemovalRequest {
 }
 
 impl XfrmObjectRemovalRequest {
+    /// The lookup mark this removal will select with.
+    fn lookup_mark(&self) -> Option<XfrmLookupMark> {
+        match self {
+            Self::Sa(request) => request.mark,
+            Self::Policy(request) => request.mark,
+        }
+    }
+
     /// Object kind removed by this request.
     pub const fn object(&self) -> XfrmInstallObject {
         match self {
@@ -1019,6 +1028,21 @@ impl XfrmStagedObjectInstall {
         let runtime = tokio::runtime::Handle::try_current()
             .map_err(|_| XfrmStagedObjectInstallRunError::RuntimeUnavailable)?;
         let install_operation = self.journal.inner.install_operation;
+        // Refuse before installing anything. This journal retains a removal
+        // identity so recovery can delete the object it installed, and that
+        // delete re-selects by lookup mark without proving the selection is
+        // unique. A narrower canonical mask can match another stored object,
+        // so accepting one here would promise an exact recovery this boundary
+        // cannot perform -- and the caller would only find out at recovery
+        // time, with residue already in the kernel.
+        validate_exact_lookup_mark(
+            self.journal.inner.removal.lookup_mark(),
+            "staged_object.install.mark",
+        )
+        .map_err(|source| XfrmStagedObjectInstallRunError::InstallFailed {
+            operation: install_operation,
+            source,
+        })?;
         let guard = RunGuard::begin(self.journal.clone());
         let worker = runtime.spawn(async move {
             let mut guard = guard;
@@ -1084,7 +1108,7 @@ mod tests {
     use crate::{
         AllocateSpiRequest, IpAddress, PolicyParameters, QuerySaRequest, RekeyPolicyRequest,
         RekeySaRequest, SaParameters, SaState, SpiAllocation, XfrmAction, XfrmDirection, XfrmId,
-        XfrmMark, XfrmMode, XfrmProbe, XfrmSelector, XfrmTemplate,
+        XfrmLookupMark, XfrmMode, XfrmProbe, XfrmSelector, XfrmTemplate,
     };
 
     #[derive(Debug, Default)]
@@ -2268,6 +2292,65 @@ mod tests {
         assert!(backend.removed_policy_requests().is_empty());
     }
 
+    /// Issue #419: in the insertion order Linux admits both overlapping
+    /// states, a retained removal identity carrying a narrower canonical mask
+    /// cannot name a single object -- its lookup value also selects the other
+    /// state. This boundary must refuse *before* installing, so it neither
+    /// claims an exact recovery nor performs an unproven delete.
+    #[tokio::test]
+    async fn a_narrower_canonical_mask_is_refused_before_anything_is_installed() {
+        let backend = Arc::new(GatedBackend::new());
+        let mut parameters = sa_parameters();
+        // Canonical (0x11 & 0xff == 0x11), but its lookup value also selects a
+        // stored { 0x10, 0xf0 }, which Linux admits alongside it.
+        parameters.mark = Some(XfrmLookupMark::new(0x11, 0xff).expect("canonical"));
+        let staged = XfrmStagedObjectInstall::new(XfrmObjectInstallRequest::Sa(InstallSaRequest {
+            parameters,
+        }));
+        let journal = staged.journal();
+
+        let error = staged
+            .run(backend.clone())
+            .await
+            .expect_err("a mark that cannot name one object must be refused");
+        assert!(matches!(
+            error,
+            XfrmStagedObjectInstallRunError::InstallFailed {
+                source: XfrmError::InvalidConfig {
+                    field: "staged_object.install.mark",
+                    ..
+                },
+                ..
+            }
+        ));
+
+        // The whole point: nothing was issued and nothing is retained, so
+        // there is no residue whose cleanup we would have to over-promise.
+        assert!(backend.operations().is_empty(), "no request may be issued");
+        assert!(!backend.sa_present());
+        assert_eq!(journal.ownership(), XfrmObjectInstallOwnership::NotStarted);
+    }
+
+    /// The unmarked and full-mask forms stay usable: the profile restricts
+    /// what cannot be proven, not marked SAs in general.
+    #[tokio::test]
+    async fn unmarked_and_full_mask_removal_identities_remain_supported() {
+        for mark in [None, Some(XfrmLookupMark::full(0x42))] {
+            let backend = Arc::new(GatedBackend::new());
+            let mut parameters = sa_parameters();
+            parameters.mark = mark;
+            let staged =
+                XfrmStagedObjectInstall::new(XfrmObjectInstallRequest::Sa(InstallSaRequest {
+                    parameters,
+                }));
+            staged
+                .run(backend.clone())
+                .await
+                .expect("exact-profile identities install");
+            assert_eq!(backend.operations(), vec!["install_sa"]);
+        }
+    }
+
     #[tokio::test]
     async fn recovery_removes_only_the_exact_owned_sa() {
         let backend = Arc::new(GatedBackend::new());
@@ -2879,10 +2962,7 @@ mod tests {
 
     #[tokio::test]
     async fn sa_removal_identity_preserves_the_lookup_mark() {
-        let mark = XfrmMark {
-            value: 0x42,
-            mask: 0xffff_ffff,
-        };
+        let mark = XfrmLookupMark::full(0x42);
         let mut request = sa_install_request();
         if let XfrmObjectInstallRequest::Sa(request) = &mut request {
             request.parameters.mark = Some(mark);
@@ -2913,10 +2993,7 @@ mod tests {
 
     #[tokio::test]
     async fn policy_removal_identity_preserves_the_lookup_mark() {
-        let mark = XfrmMark {
-            value: 0x77,
-            mask: 0xffff_ffff,
-        };
+        let mark = XfrmLookupMark::full(0x77);
         let mut request = policy_install_request();
         if let XfrmObjectInstallRequest::Policy(request) = &mut request {
             request.parameters.mark = Some(mark);

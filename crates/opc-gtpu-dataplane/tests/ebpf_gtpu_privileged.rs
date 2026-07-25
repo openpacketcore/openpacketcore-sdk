@@ -105,8 +105,8 @@ use opc_gtpu_ebpf_common::{
 use opc_ipsec_xfrm::{
     Algorithm, AuthAlgorithm, InstallPolicyRequest, InstallSaRequest, IpAddress, KeyMaterial,
     LifetimeConfig, LinuxXfrmBackend, PolicyParameters, SaParameters, UdpEncap, XfrmAction,
-    XfrmBackend, XfrmDirection, XfrmId, XfrmMark, XfrmMode, XfrmRequestId, XfrmSelector,
-    XfrmTemplate,
+    XfrmBackend, XfrmDirection, XfrmId, XfrmLookupMark, XfrmMark, XfrmMode, XfrmRequestId,
+    XfrmSelector, XfrmTemplate,
 };
 
 sockopt_impl!(
@@ -1037,7 +1037,7 @@ fn outbound_sa_parameters() -> SaParameters {
     parameters
 }
 
-fn downlink_sa_parameters(spi: u32, mark: Option<XfrmMark>) -> SaParameters {
+fn downlink_sa_parameters(spi: u32, mark: Option<XfrmLookupMark>) -> SaParameters {
     SaParameters {
         selector: downlink_selector(),
         id: XfrmId {
@@ -1065,7 +1065,7 @@ fn downlink_sa_parameters(spi: u32, mark: Option<XfrmMark>) -> SaParameters {
     }
 }
 
-fn downlink_policy_parameters(spi: u32, mark: XfrmMark) -> PolicyParameters {
+fn downlink_policy_parameters(spi: u32, mark: XfrmLookupMark) -> PolicyParameters {
     PolicyParameters {
         selector: downlink_selector(),
         direction: XfrmDirection::Out,
@@ -1171,14 +1171,8 @@ async fn install_real_marked_inbound_xfrm(
 
 async fn install_real_marked_outbound_xfrm() -> Result<(), opc_ipsec_xfrm::XfrmError> {
     let backend = LinuxXfrmBackend::new();
-    let default_mark = XfrmMark {
-        value: 0,
-        mask: u32::MAX,
-    };
-    let dedicated_mark = XfrmMark {
-        value: MARK_A,
-        mask: u32::MAX,
-    };
+    let default_mark = XfrmLookupMark::full(0);
+    let dedicated_mark = XfrmLookupMark::full(MARK_A);
     for (spi, sa_mark, policy_mark) in [
         (OUTBOUND_SPI_DEFAULT, None, default_mark),
         (OUTBOUND_SPI_A, Some(dedicated_mark), dedicated_mark),

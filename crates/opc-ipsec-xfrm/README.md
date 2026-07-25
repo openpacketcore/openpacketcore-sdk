@@ -402,6 +402,10 @@ use the older `XFRM_MSG_MIGRATE` operation: that operation cannot identify one
 SA by SPI and mark and therefore cannot satisfy this API's exact-identity
 contract.
 
+Identity by mark is narrower than it looks, and the limit is a kernel
+property rather than a choice this crate makes. See
+[Lookup marks and what "exact" can mean](#lookup-marks-and-what-exact-can-mean).
+
 Build the optimistic-concurrency identity from a fresh query instead of
 reconstructing it from remembered configuration:
 
@@ -573,6 +577,60 @@ required link is fail-closed. `Debug`/`Display` for observation types print
 only labels and non-sensitive metadata—never addresses, ports, SPIs, marks,
 or interface identities.
 
+## Lookup marks and what "exact" can mean
+
+An SA or policy lookup mark is [`XfrmLookupMark`], not a raw value/mask pair,
+because Linux does not compare lookup marks as pairs. `xfrm_mark_get` returns
+the incoming lookup value as `value & mask` while storing the raw pair on the
+object, and `__xfrm_state_lookup` selects with
+
+```text
+(incoming_lookup_value & stored.mask) == stored.value
+```
+
+Two consequences drive the API.
+
+**A value carrying bits outside its mask is unaddressable.** For a stored
+`{ value: 0x11, mask: 0xf0 }`, every candidate left-hand side `(L & 0xf0)` has
+its low nibble clear and can never equal `0x11`. `XfrmLookupMark::new` refuses
+that shape, and the Linux parse boundaries refuse it on readback too: a state
+another writer installed that way is reported as an error rather than adopted
+as an identity this crate could later claim to remove. A zero mask is likewise
+refused; `None` is the only unmarked form.
+
+**Distinct canonical marks are not distinct identities.** Canonical
+`{ 0x10, 0xf0 }` and `{ 0x11, 0xff }` overlap asymmetrically on one
+destination/protocol/SPI tuple. Installing `{0x10,0xf0}` first makes
+`{0x11,0xff}` collide, because `0x11 & 0xf0 == 0x10`; installing them in the
+other order admits both, and a later lookup carrying `0x11` then matches both
+stored states. Equal `Option<XfrmLookupMark>` values in Rust are therefore
+**not** proof that a GETSA or DELSA can select only one object.
+
+Because of that, an API that names one object and then mutates or deletes it
+accepts only the **exact profile**: `None`, or a full-mask mark. Distinct
+full-mask marks have disjoint lookup domains, so they cannot alias each other.
+Anything narrower is rejected before a request is issued, by
+`XfrmStagedInstall::run` (and therefore `run_and_commit_outbound_sa_policy`),
+`XfrmStagedObjectInstall::run`, `install_sa_policy_with_rollback`,
+`validate_outbound_request`, and `relocate_sa`. Read-only paths that verify identity by readback --
+`query_sa` and ESP-peer-observation registration -- keep accepting any
+canonical mark, because there a lookup that selected some other overlapping
+state surfaces as a mismatch instead of a silent wrong answer.
+
+Two limits remain, and they are preconditions on the deployment rather than
+guarantees this crate can make:
+
+- The exact profile makes marked-vs-marked aliasing impossible, not
+  marked-vs-unmarked. An unmarked object stores `{ 0, 0 }`, and `(L & 0) == 0`
+  holds for every `L`, so an unmarked SA is selected by *every* lookup value.
+  Linux refuses to add a marked state when an unmarked one already occupies
+  the tuple, but it will admit an unmarked state alongside marked ones. Do not
+  mix unmarked and marked SAs on one destination/protocol/SPI.
+- A foreign state installed by another writer with a narrower mask still
+  widens the lookup domain. Proving otherwise would require dumping the tuple
+  on every removal, which this crate does not do; it fails closed on the
+  request instead.
+
 ## Per-SA output marks
 
 `SaParameters::output_mark` emits the generic Linux
@@ -590,10 +648,15 @@ real inbound ESP, receives the decrypted UDP payload, and observes the masked
 output mark with an `iptables` INPUT counter. This distinguishes datapath
 behavior from netlink state readback alone.
 
-The output mark is independent of `SaParameters::mark`: `mark` emits
-`XFRMA_MARK` and participates in selecting the SA, while `output_mark` changes
-the packet only after that SA runs. For example, a caller can annotate the
-inbound half of an IKEv2 Child SA without changing SA lookup:
+The output mark is independent of `SaParameters::mark`, and the two are
+different Rust types for that reason: `mark` is an
+[`XfrmLookupMark`](#lookup-marks-and-what-exact-can-mean), emits `XFRMA_MARK`
+and participates in selecting the SA, while `output_mark` stays a plain
+`XfrmMark` because it is an arbitrary post-transform value/mask pair -- a zero
+mask is legal there -- and changes the packet only after that SA runs.
+
+For example, a caller can annotate the inbound half of an IKEv2 Child SA
+without changing SA lookup:
 
 ```rust,no_run
 use opc_ipsec_xfrm::{InstallSaRequest, XfrmMark};
@@ -703,11 +766,17 @@ silently ignoring it. `egress_dscp: None` does not require this configuration.
 When `output_mark` is also `None`, the backend emits the exact pre-feature XFRM
 netlink payload.
 
-An SA or policy's optional input/lookup `XfrmMark` is a separate identity
-component from the companion's reserved output-mark window. Use the same mark
-on `SaParameters`, `PolicyParameters`, `QuerySaRequest`, `RemoveSaRequest`, and
-`RemovePolicyRequest`; the Linux and mock backends keep marked and unmarked SA
-identities distinct and Linux applies the mark to exact policy deletion. The
+An SA or policy's optional lookup `XfrmLookupMark` is a separate identity
+component from the companion's reserved output-mark window, and a different
+type from it. Use the same mark on `SaParameters`, `PolicyParameters`,
+`QuerySaRequest`, `RemoveSaRequest`, and `RemovePolicyRequest`.
+
+Marked and unmarked SA identities are **not** unconditionally distinct, and a
+mark does not by itself make a deletion exact: an unmarked object stores
+`{ 0, 0 }`, which the kernel predicate matches for every lookup value. See
+[Lookup marks and what "exact" can mean](#lookup-marks-and-what-exact-can-mean)
+before relying on a mark to separate two objects on one
+destination/protocol/SPI. The
 request constructors target unmarked kernel objects, while `with_mark` selects
 a marked object. Installs carrying any output mark are not reported successful
 until an exact GETSA readback succeeds. If readback fails or any stable returned

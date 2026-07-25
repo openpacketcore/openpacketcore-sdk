@@ -2041,10 +2041,7 @@ mod tests {
             "xfrm_outbound_sa_binding_sa_identity_mismatch"
         );
         let mut wrong_recovery_sa = request.sa.parameters.clone();
-        wrong_recovery_sa.mark = Some(crate::XfrmMark {
-            value: 1,
-            mask: u32::MAX,
-        });
+        wrong_recovery_sa.mark = Some(crate::XfrmLookupMark::full(1));
         let recovery_binding = EspCounterResumeBinding::new(5, 6, authority.id(), 50).unwrap();
         let error = backend
             .recover_committed_outbound_esp_counter(

@@ -30,8 +30,8 @@ use opc_ipsec_xfrm::{
     Algorithm, AuthAlgorithm, DscpCodepoint, InstallPolicyRequest, InstallSaRequest, IpAddress,
     KeyMaterial, LifetimeConfig, LinuxXfrmBackend, LinuxXfrmDscpMarkingConfig, PolicyParameters,
     QuerySaRequest, RekeySaRequest, RemovePolicyRequest, RemoveSaRequest, SaParameters, XfrmAction,
-    XfrmBackend, XfrmCapability, XfrmDirection, XfrmId, XfrmMark, XfrmMode, XfrmSelector,
-    XfrmTemplate,
+    XfrmBackend, XfrmCapability, XfrmDirection, XfrmId, XfrmLookupMark, XfrmMark, XfrmMode,
+    XfrmSelector, XfrmTemplate,
 };
 use opc_ipsec_xfrm_ebpf_common::{MAP_MARK_CONFIG, PROG_EGRESS_DSCP};
 
@@ -47,9 +47,11 @@ const INBOUND_PORT: u16 = 5_001;
 const INBOUND_PAYLOAD: &[u8] = b"opc-xfrm-inbound-output-mark";
 const EXPECTED_MARK_COMMENT: &str = "opc-xfrm-expected-inbound-mark";
 const ZERO_MARK_COMMENT: &str = "opc-xfrm-zero-inbound-mark";
-const MARKED_LOOKUP: XfrmMark = XfrmMark {
-    value: 0x0000_0042,
-    mask: 0x0000_00ff,
+// Canonical but deliberately NOT full-mask: this exercises the legacy,
+// honestly-non-exact lookup path, which still accepts a narrower mask.
+const MARKED_LOOKUP: XfrmLookupMark = match XfrmLookupMark::new(0x0000_0042, 0x0000_00ff) {
+    Ok(mark) => mark,
+    Err(_) => panic!("fixture lookup mark must be canonical"),
 };
 const INBOUND_OUTPUT_MARK: XfrmMark = XfrmMark {
     value: 0x0012_0000,
@@ -259,7 +261,7 @@ fn selector(inner_destination: [u8; 4]) -> XfrmSelector {
 fn sa_parameters(
     inner_destination: [u8; 4],
     spi: u32,
-    mark: Option<XfrmMark>,
+    mark: Option<XfrmLookupMark>,
     egress_dscp: Option<DscpCodepoint>,
 ) -> SaParameters {
     SaParameters {
@@ -334,7 +336,7 @@ fn peer_outbound_policy_parameters(spi: u32) -> PolicyParameters {
 fn policy_parameters(
     inner_destination: [u8; 4],
     spi: u32,
-    mark: Option<XfrmMark>,
+    mark: Option<XfrmLookupMark>,
 ) -> PolicyParameters {
     PolicyParameters {
         selector: selector(inner_destination),
@@ -360,7 +362,7 @@ async fn install_path(
     backend: &LinuxXfrmBackend,
     inner_destination: [u8; 4],
     spi: u32,
-    mark: Option<XfrmMark>,
+    mark: Option<XfrmLookupMark>,
     egress_dscp: Option<DscpCodepoint>,
 ) -> Result<(), opc_ipsec_xfrm::XfrmError> {
     backend
@@ -696,7 +698,7 @@ async fn fixed_outer_dscp_is_visible_on_real_esp_and_survives_adoption(
     // exact legacy value, then prove the DSCP companion preserves it.
     send_protected(INNER_UNMARKED, 0x03, None);
     let legacy_ecn = capture_esp(&capture, UNMARKED_SPI)[1] & 0x03;
-    send_protected(INNER_MARKED, 0x03, Some(MARKED_LOOKUP.value));
+    send_protected(INNER_MARKED, 0x03, Some(MARKED_LOOKUP.value()));
     let marked_header = capture_esp(&capture, MARKED_SPI);
     assert_eq!(marked_header[1] >> 2, 46, "outer DSCP must be EF");
     assert_eq!(
@@ -758,7 +760,7 @@ async fn fixed_outer_dscp_is_visible_on_real_esp_and_survives_adoption(
         Some(ef),
         "marked SA must remain addressable after mandatory rekey readback"
     );
-    send_protected(INNER_MARKED, 0x03, Some(MARKED_LOOKUP.value));
+    send_protected(INNER_MARKED, 0x03, Some(MARKED_LOOKUP.value()));
     assert_eq!(capture_esp(&capture, MARKED_SPI)[1] >> 2, 46);
 
     for (inner_destination, spi) in [(INNER_MARKED, MARKED_SPI), (INNER_UNMARKED, UNMARKED_SPI)] {

@@ -106,7 +106,7 @@ use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::XfrmError;
-use crate::model::{IpAddress, XfrmDirection, XfrmId, XfrmMark};
+use crate::model::{IpAddress, XfrmDirection, XfrmId, XfrmLookupMark};
 
 #[cfg(target_os = "linux")]
 pub(crate) mod linux;
@@ -215,7 +215,7 @@ pub struct EspPeerObservationKey {
     /// the destination and can never be dropped or mixed.
     pub id: XfrmId,
     /// Linux lookup mark selecting a marked SA, when configured.
-    pub mark: Option<XfrmMark>,
+    pub mark: Option<XfrmLookupMark>,
     /// XFRM interface identifier, when configured.
     pub if_id: Option<u32>,
     /// Traffic direction. Only inbound SAs produce decap observations; the
@@ -968,12 +968,13 @@ impl EspPeerObservationBoundary {
                 "SA destination must be specified",
             ));
         }
-        if matches!(registration.key.mark, Some(XfrmMark { mask: 0, .. })) {
-            return Err(XfrmError::invalid_config(
-                "esp_peer_observation.mark",
-                "lookup-mark mask must be nonzero; use None for an unmarked SA",
-            ));
-        }
+        // Deliberately NOT gated on the exact profile. Registration issues a
+        // GETSA and then requires the returned SA's stored identity to equal
+        // the requested one, so a lookup that selected some other overlapping
+        // state is reported as a mismatch rather than silently accepted. The
+        // exact profile is required where a *mutation* selects the object
+        // independently of that proof -- removal and relocation -- not here.
+        // Zero-mask and noncanonical marks are unrepresentable either way.
         if registration.key.if_id == Some(0) {
             return Err(XfrmError::invalid_config(
                 "esp_peer_observation.if_id",
@@ -1367,7 +1368,7 @@ fn observation_key_order(key: &EspPeerObservationKey) -> ObservationKeyOrder {
         octets,
         key.id.spi,
         key.id.protocol,
-        key.mark.map_or((0, 0), |mark| (mark.value, mark.mask)),
+        key.mark.map_or((0, 0), |mark| (mark.value(), mark.mask())),
         key.if_id.unwrap_or(0),
         direction_order(key.direction),
     )
@@ -1376,6 +1377,7 @@ fn observation_key_order(key: &EspPeerObservationKey) -> ObservationKeyOrder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::XfrmLookupMarkError;
 
     // RFC 5737 / RFC 3849 documentation-only fixture addresses.
     const CURRENT: IpAddress = IpAddress::Ipv4([192, 0, 2, 1]);
@@ -1501,10 +1503,7 @@ mod tests {
         );
         // Cross-SA: same SPI under a different lookup mark.
         let mut marked = event(scope, NEW_SOURCE, NEW_PORT, 1);
-        marked.key.mark = Some(XfrmMark {
-            value: 1,
-            mask: u32::MAX,
-        });
+        marked.key.mark = Some(XfrmLookupMark::full(1));
         assert_eq!(
             boundary.ingest_event(marked),
             EspPeerIngestOutcome::Rejected(EspPeerObservationRejection::UnknownSa)
@@ -1830,6 +1829,26 @@ mod tests {
         ));
     }
 
+    /// Registration is read-only and proves identity by readback: the
+    /// GETSA it issues is followed by a check that the returned SA's stored
+    /// identity equals the requested one, so a lookup that selected some other
+    /// overlapping SA is reported as a mismatch rather than accepted.
+    ///
+    /// The exact profile is therefore NOT required here. It is required where
+    /// a mutation selects the object independently of that proof -- removal
+    /// and relocation -- because there the selection is never verified.
+    #[test]
+    fn registration_accepts_a_canonical_narrower_mask() {
+        let mut boundary = EspPeerObservationBoundary::new(EspPeerObservationScope::new());
+        let mut reg = registration();
+        reg.key.direction = XfrmDirection::In;
+        reg.key.mark = Some(XfrmLookupMark::new(1, 0xff).expect("canonical lookup mark"));
+        assert!(
+            boundary.register_sa(reg).is_ok(),
+            "a canonical narrower mask must remain usable for read-only registration"
+        );
+    }
+
     #[test]
     fn registration_rejects_invalid_identities() {
         let scope = EspPeerObservationScope::new();
@@ -1858,13 +1877,16 @@ mod tests {
         reg.key.id.destination = IpAddress::Ipv4([0, 0, 0, 0]);
         expect_invalid(reg, "esp_peer_observation.destination");
         // Mask-0 mark is equivalent to no mark and must be normalized by the
-        // caller, not silently accepted.
-        let mut reg = registration();
-        reg.key.mark = Some(XfrmMark { value: 1, mask: 0 });
-        expect_invalid(reg, "esp_peer_observation.mark");
-        let mut reg = registration();
-        reg.key.mark = Some(XfrmMark { value: 0, mask: 0 });
-        expect_invalid(reg, "esp_peer_observation.mark");
+        // caller, not silently accepted. It is no longer representable at all,
+        // so the coverage moves to the constructor that now refuses it.
+        assert_eq!(
+            XfrmLookupMark::new(1, 0),
+            Err(XfrmLookupMarkError::ZeroMask)
+        );
+        assert_eq!(
+            XfrmLookupMark::new(0, 0),
+            Err(XfrmLookupMarkError::ZeroMask)
+        );
         // if_id 0 is equivalent to unbound.
         let mut reg = registration();
         reg.key.if_id = Some(0);
@@ -1885,10 +1907,7 @@ mod tests {
 
         // Canonical marked/if_id-bound identities register fine.
         let mut marked = registration();
-        marked.key.mark = Some(XfrmMark {
-            value: 1,
-            mask: u32::MAX,
-        });
+        marked.key.mark = Some(XfrmLookupMark::full(1));
         marked.key.if_id = Some(7);
         boundary.register_sa(marked).unwrap();
 
