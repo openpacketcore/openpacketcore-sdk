@@ -73,8 +73,9 @@ Its values are aggregate and contain no rejected endpoint or session fields.
 - IPv6 extension and checksum processing use bounded `bpf_loop` callbacks.
   The committed classifiers are verifier-loaded on exact Linux 6.8 in CI so
   their complete call chains remain below that kernel's cumulative 512-byte
-  BPF stack limit without reducing checksum coverage. The RHEL 9 / 5.14 line
-  that Red Hat CoreOS ships for OpenShift 4.18 is gated the same way, because
+  BPF stack limit without reducing checksum coverage. The RHEL 9.4 `5.14.0-427`
+  line that Red Hat CoreOS ships for OpenShift 4.18 additionally has a
+  verifier-load gate, though not the full privileged datapath suite, because
   the limit is cumulative over the callback chain and an enterprise backport
   can account for it differently: exposing `bpf_loop` does not by itself imply
   this object loads. Kernels outside the gated lines are unqualified rather

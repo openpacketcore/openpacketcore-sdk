@@ -315,13 +315,18 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cloud-image-utils qemu-system-x86 openssh-client
 
-          # Rocky Linux 9 is ABI-equivalent to RHEL 9 and publicly
-          # downloadable, unlike RHEL itself. Its 5.14.0 kernel is the line
-          # RHCOS ships for OpenShift 4.18.
-          image="${RUNNER_TEMP}/rocky9-el9.qcow2"
+          # Rocky Linux 9.4 is ABI-equivalent to RHEL 9.4 and publicly
+          # downloadable, unlike RHEL itself, and 9.4 is the RHEL minor that
+          # RHCOS ships for OpenShift 4.18 -- so this boots the 5.14.0-427
+          # el9_4 kernel line, not merely "some 5.14". Pinned by digest: a
+          # floating `latest` would silently drift onto a newer z-stream and
+          # quietly stop testing the shipping kernel.
+          image="${RUNNER_TEMP}/rocky94-el9.qcow2"
           curl --fail --location --retry 3 \
             --output "${image}" \
-            https://dl.rockylinux.org/pub/rocky/9/images/x86_64/Rocky-9-GenericCloud-Base.latest.x86_64.qcow2
+            https://dl.rockylinux.org/vault/rocky/9.4/images/x86_64/Rocky-9-GenericCloud-Base-9.4-20240609.1.x86_64.qcow2
+          echo "2179864f4fa9799f11c0824c439666c2451d6751450494e20034efd4f3fa0559  ${image}" \
+            | sha256sum -c -
 
           key="${RUNNER_TEMP}/gtpu-el9-key"
           ssh-keygen -q -t ed25519 -N '' -C '' -f "${key}"
@@ -409,10 +414,19 @@ jobs:
 
           # Record the kernel this evidence is about, and assert it is the
           # RHEL 9 line rather than whatever the image happens to ship.
+          # Assert the exact shipping line, not just "5.14": the whole premise
+          # of this gate is that an enterprise backport can account for the
+          # bpf_loop callback chain differently, and that argument applies
+          # between el9 z-streams just as much as between 5.14 and 6.8.
           ssh "${ssh_options[@]}" opc@127.0.0.1 '
             set -euo pipefail
             uname -r
-            test "$(uname -r | cut -d. -f1-2)" = "5.14"
+            grep -q "^ID=\"rocky\"" /etc/os-release
+            case "$(uname -r)" in
+              5.14.0-427.*el9_4*) ;;
+              *) echo "unexpected guest kernel: $(uname -r)"; exit 1 ;;
+            esac
+            systemd-detect-virt | grep -qE "kvm|qemu"
             sudo mountpoint -q /sys/fs/bpf || sudo mount -t bpf bpf /sys/fs/bpf
             chmod 0755 /tmp/opc-gtpu-el9-test
           '

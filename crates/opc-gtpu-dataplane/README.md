@@ -1108,8 +1108,10 @@ offload support.
   IPv6/UDP/GTP-U headers. The current object also uses the bounded `bpf_loop`
   helper (available in mainline Linux 5.17 and newer) to checksum the complete
   declared UDP range and walk IPv6 extension headers without verifier
-  unrolling; the repository's documented production node profile remains
-  Linux 6.8 or newer.
+  unrolling. Linux 6.8 or newer is the profile the full privileged datapath
+  suite runs against; see the gated-kernel bullet below for what is proven on
+  RHEL 9's 5.14 line, and do not read either as a version floor to compare
+  against.
   CI loads both committed classifiers on exact Linux 6.8.0-134 as a verifier
   compatibility gate in addition to running the full privileged datapath suite.
 - Helper availability is not loadability, and the `bpf_loop` note above is not
@@ -1120,13 +1122,22 @@ offload support.
   only; it cannot detect a verifier rejection of the committed object, so a node
   admitted on that basis can still fail `BPF_PROG_LOAD` with no symptom beyond
   zero forwarding.
-- **The RHEL 9 / 5.14 kernel line is a supported target and is CI-gated.** That
-  is the line Red Hat CoreOS ships for OpenShift 4.18, and it is an enterprise
-  backport rather than a mainline kernel, so helper availability alone would not
-  have settled it. CI loads both committed classifiers on a 5.14 el9 guest on
-  every run, alongside the exact-6.8 gate, and the job asserts the guest really
-  is on 5.14 before trusting the result. The el9 test binary is statically
-  linked so the guest's glibc cannot affect it.
+- **The RHEL 9.4 / `5.14.0-427` kernel line is gated for verifier
+  loadability.** That is the line Red Hat CoreOS ships for OpenShift 4.18, and
+  it is an enterprise backport rather than a mainline kernel, so helper
+  availability alone would not have settled it. CI boots a digest-pinned Rocky
+  9.4 image, asserts the guest is on `5.14.0-427.*el9_4*`, and loads both
+  committed classifiers there on every run.
+- **What that gate does and does not establish.** It proves `BPF_PROG_LOAD`
+  succeeds for both classifiers on that kernel. It does **not** exercise
+  attach, forwarding, encap/decap, PMTU or fragment handling on 5.14 — the full
+  privileged datapath suite runs only on the 6.8 runner — and it says nothing
+  about a node's SELinux policy, container capabilities, in-pod bpffs
+  availability, or MTU headroom. Treat it as one necessary condition, not as
+  proof the datapath forwards on a given cluster.
+- A loadability verdict here does not override admission policy elsewhere in
+  the SDK: `opc-node-resources` applies its own kernel floor to gateway
+  profiles, and a node must satisfy both.
 - Other kernels — outside both the 6.8-or-newer profile and the gated 5.14 line
   — are **unqualified rather than known-good or known-bad**: this repository
   states no verdict, because CI proves the load only on the kernels it gates. Do

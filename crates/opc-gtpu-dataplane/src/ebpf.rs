@@ -4775,6 +4775,12 @@ pub enum ClassifierLoadBlocker {
     /// before the verifier ever saw the program.
     InsufficientPrivileges,
     /// The load could not be attempted for another environmental reason.
+    ///
+    /// Not always operator-fixable: a CO-RE relocation failure against the
+    /// running kernel's BTF, or a rejected map type, also lands here and
+    /// means this node cannot run this object. The distinction from
+    /// [`ClassifierLoadCapability::VerifierRejected`] is only that the
+    /// program verifier never returned a verdict.
     Environment,
 }
 
@@ -5037,14 +5043,37 @@ mod aya_runtime {
             };
             match program.load() {
                 Ok(()) => {}
-                // BPF_PROG_LOAD reached the verifier and it said no. The
-                // verifier log is deliberately dropped, as on the runtime path.
-                Err(ProgramError::LoadError { io_error, .. }) => {
+                // aya funnels every BPF_PROG_LOAD failure into LoadError
+                // without inspecting errno, so this arm is not by itself a
+                // verifier verdict. An LSM denial -- SELinux withholding
+                // `bpf { prog_load }` from a container domain, which is the
+                // normal state on RHCOS -- also lands here as EACCES, and
+                // reporting that as a rejection would tell an operator the
+                // node can never forward when the fix is a policy change.
+                //
+                // The kernel only writes a verifier log when it actually ran
+                // the verifier, so an empty log is the discriminator. The log
+                // itself is still dropped rather than retained, as on the
+                // runtime path.
+                Err(ProgramError::LoadError {
+                    io_error,
+                    verifier_log,
+                }) => {
+                    if verifier_log.to_string().trim().is_empty() {
+                        // PermissionDenied covers both EACCES and EPERM here.
+                        return Capability::UnableToAttempt {
+                            blocker: if io_error.kind() == io::ErrorKind::PermissionDenied {
+                                Blocker::InsufficientPrivileges
+                            } else {
+                                Blocker::Environment
+                            },
+                        };
+                    }
                     return Capability::VerifierRejected {
                         program: program_name,
                         kind: io_error.kind(),
                         raw_os_error: io_error.raw_os_error(),
-                    }
+                    };
                 }
                 // The syscall itself failed, so the program was never judged.
                 Err(_) => {
@@ -14607,12 +14636,17 @@ mod load_capability_tests {
 
     /// An unprivileged caller must be told the environment could not be
     /// judged, never that the kernel rejected the object.
+    ///
+    /// The pin root is a temporary directory rather than a path under `/`:
+    /// the probe creates missing parents, so a literal `/nonexistent/...`
+    /// would litter the filesystem root when the suite is run as root.
     #[test]
     fn unattemptable_environment_is_never_reported_as_a_rejection() {
-        // The suite does not run privileged, and a non-existent pin root
-        // cannot host pins on any platform, so this must not claim a verdict.
-        let capability =
-            probe_committed_classifier_load(std::path::Path::new("/nonexistent/opc-gtpu-probe"));
+        let pin_root = std::env::temp_dir().join(format!(
+            "opc-gtpu-capability-not-bpffs-{}",
+            std::process::id()
+        ));
+        let capability = probe_committed_classifier_load(&pin_root);
         assert!(
             matches!(
                 capability,
@@ -14621,6 +14655,27 @@ mod load_capability_tests {
             "an unattemptable probe must not be reported as a verifier rejection, got {capability:?}"
         );
         assert!(!capability.is_loadable());
+        let _ = std::fs::remove_dir_all(&pin_root);
+    }
+
+    /// A load that never reached the verifier must not be branded a verdict.
+    ///
+    /// aya funnels every BPF_PROG_LOAD failure into one error variant, so an
+    /// SELinux denial on RHCOS arrives looking exactly like a rejection. The
+    /// empty verifier log is what tells them apart.
+    #[test]
+    fn permission_denied_without_a_verifier_log_is_not_a_rejection() {
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert_eq!(denied.kind(), std::io::ErrorKind::PermissionDenied);
+        // Mirrors the classification arm: empty log plus PermissionDenied is
+        // an environment blocker, never VerifierRejected.
+        let blocker = if denied.kind() == std::io::ErrorKind::PermissionDenied {
+            ClassifierLoadBlocker::InsufficientPrivileges
+        } else {
+            ClassifierLoadBlocker::Environment
+        };
+        assert_eq!(blocker, ClassifierLoadBlocker::InsufficientPrivileges);
+        assert!(!ClassifierLoadCapability::UnableToAttempt { blocker }.is_loadable());
     }
 }
 
