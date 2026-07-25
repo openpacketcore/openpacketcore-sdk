@@ -26,10 +26,12 @@ differences:
   attributes.
 
 Parsing borrows the supplied packet and allocates nothing. The borrowed bytes
-remain private and have no accessor. Public evidence contains only typed
+remain private and have no raw accessor. Public evidence contains typed
 method/subtype/direction values, numeric protocol codes, booleans, and bounded
-counts. It never exposes identities, RAND, AUTN, AUTS, RES, MAC, IV,
-ciphertext, nonces, keys, realms, addresses, or packet-derived hashes.
+counts, plus exactly one attribute value: the identity a peer asserts in
+`AT_IDENTITY` (see [The asserted identity](#the-asserted-identity)). It never
+exposes RAND, AUTN, AUTS, RES, MAC, IV, ciphertext, nonces, keys, realms,
+addresses, or packet-derived hashes, and no identity reaches `Debug`.
 
 ## Example
 

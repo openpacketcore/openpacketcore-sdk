@@ -393,9 +393,11 @@ pub enum EapAkaPacketKind {
 
 /// Strict borrowed projection of a complete EAP-AKA method packet.
 ///
-/// The source packet is borrowed privately so parsing is allocation-free. No
-/// raw-packet or attribute-value accessor exists. [`Debug`](fmt::Debug)
-/// reports only bounded structural metadata.
+/// The source packet is borrowed privately so parsing is allocation-free. The
+/// only attribute value reachable from this projection is the asserted
+/// identity, through [`Self::asserted_identity`]; there is no raw-packet
+/// accessor and no other attribute-value accessor. [`Debug`](fmt::Debug)
+/// reports only bounded structural metadata, and withholds the identity.
 #[derive(Clone, Copy)]
 pub struct EapAkaPacket<'a> {
     pub(crate) packet: &'a [u8],
