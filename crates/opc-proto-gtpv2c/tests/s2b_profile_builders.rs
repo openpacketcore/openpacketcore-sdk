@@ -325,7 +325,7 @@ fn create_session_request_builder_rejects_pdn_type_in_additional_ies() {
         S2bProfileBuildError::Encode(source) => assert!(matches!(
             source.code(),
             opc_protocol::EncodeErrorCode::Structural {
-                reason: "S2b Create Session Request must not contain a top-level PDN Type IE"
+                reason: "S2b Create Session Request must not contain a top-level PDN Type IE: TS 29.274 Table 7.2.1-1 NOTE 1 states it is never sent on S2a/S2b, and the PAA IE carries the requested PDN type"
             }
         )),
         S2bProfileBuildError::Validate(source) => {

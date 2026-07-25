@@ -341,6 +341,9 @@ let request = S2bCreateSessionRequest {
     sender_f_teid,
     apn,
     selection_mode,
+    // On S2b the requested PDN type travels in PAA. There is no separate PDN
+    // Type IE: TS 29.274 Table 7.2.1-1 NOTE 1 states it is never sent on
+    // S2a/S2b, because PAA "contains exactly the same field".
     paa: PdnAddressAllocation::dynamic_ipv4v6(),
     bearer_context,
     context: S2bCreateSessionContext::default(),
