@@ -1342,3 +1342,35 @@ fn trust_bundle_bound_breaches_are_attributed_to_the_bundle() {
     labels.dedup();
     assert_eq!(labels.len(), count, "reason labels must be unique");
 }
+
+/// The expiry wakeup measures remaining validity on the wall clock but waits on
+/// the runtime clock. Those are the same clock in production; under
+/// `tokio::time::pause()` they are not, and re-arming unconditionally spun the
+/// loop -- burning CPU and fast-forwarding the virtual clock of any test
+/// holding a controller, which silently invalidates that test's own deadlines.
+///
+/// Adversarial review reproduced ~86,000 iterations and ~60 days of virtual
+/// time in 1.5 real seconds. This pins the convergence.
+#[tokio::test(start_paused = true)]
+async fn a_paused_clock_does_not_spin_or_run_the_virtual_clock_away() {
+    let ca = test_ca("paused clock CA");
+    let long_lived = material(CLIENT_ID, &ca, None); // valid ~1 hour
+    let (_source_tx, source_rx) = watch::channel(Some(long_lived.state));
+    let _controller = TlsMaterialController::new(source_rx);
+
+    let started = tokio::time::Instant::now();
+    // Block on genuinely non-timer work so the runtime is idle and free to
+    // auto-advance: this is the shape that exposed the spin.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        let _ = tx.blocking_send(());
+    });
+    let _ = rx.recv().await;
+
+    let virtual_elapsed = tokio::time::Instant::now().duration_since(started);
+    assert!(
+        virtual_elapsed < Duration::from_secs(600),
+        "the reconciliation timer ran the virtual clock away: {virtual_elapsed:?}"
+    );
+}

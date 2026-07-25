@@ -397,12 +397,19 @@ impl TlsMaterialController {
         source_rx: watch::Receiver<Option<IdentityState>>,
         local_spiffe_id: SpiffeId,
     ) -> Self {
-        Self::new_with_optional_pin(
+        let controller = Self::new_with_optional_pin(
             MaterialSourceReceiver::Generic(source_rx.clone()),
             source_rx,
             Some(local_spiffe_id),
             None,
-        )
+        );
+        // Same reconciliation as `new`: a pinned controller's published status
+        // must reach expiry on its own too, or readiness would be truthful for
+        // one constructor and stale for the other.
+        if let Ok(runtime) = Handle::try_current() {
+            controller.start_reconciliation_task(runtime);
+        }
+        controller
     }
 
     /// Claim one projected source as this controller's sole authority.
@@ -473,12 +480,36 @@ impl TlsMaterialController {
         let mut source_changes = self.material_source_receiver();
         let weak = Arc::downgrade(&self.inner);
         let task = runtime.spawn(async move {
+            // Expiry is measured on the wall clock but the wait happens on the
+            // runtime clock. They are the same clock in production. Under
+            // `tokio::time::pause()` they are not: a sleep auto-advances
+            // instantly while the wall clock only creeps forward in real time,
+            // so a timer armed for the remaining validity fires immediately,
+            // finds the material still unexpired, and re-arms -- spinning, and
+            // fast-forwarding the virtual clock of any test holding this
+            // controller until that test's own deadlines are meaningless.
+            //
+            // Checking whether the wall clock advanced does not help, because
+            // it does advance -- just far slower than the virtual one. Instead
+            // bound the number of consecutive wakes that changed nothing. In
+            // production a wake happens at the deadline and does change the
+            // status, so the budget never depletes; a clock jump costs a few
+            // extra wakes and then falls back to source-driven reconciliation,
+            // which is the pre-existing behaviour.
+            let mut unproductive_wakes: u8 = 0;
+            let mut previous_status: Option<TlsMaterialStatus> = None;
             loop {
                 let Some(inner) = weak.upgrade() else {
                     break;
                 };
                 let controller = TlsMaterialController { inner };
                 let status = controller.status();
+                if previous_status.is_some_and(|previous| previous == status) {
+                    unproductive_wakes = unproductive_wakes.saturating_add(1);
+                } else {
+                    unproductive_wakes = 0;
+                }
+                previous_status = Some(status);
                 // Expiry is time-driven, but a source watch only fires when new
                 // material is published. Without this the published status goes
                 // stale: retained last-known-good can pass its own expiry while
@@ -486,9 +517,13 @@ impl TlsMaterialController {
                 // healthy material that is not. Handshakes were never affected
                 // -- `snapshot()` and `admit()` refresh first -- but the signal
                 // this crate exposes for readiness has to be true on its own.
-                let expiry_wakeup = status
-                    .certificate_chain_expires_at()
-                    .and_then(next_expiry_sleep);
+                let expiry_wakeup = if unproductive_wakes < MAX_UNPRODUCTIVE_EXPIRY_WAKES {
+                    status
+                        .certificate_chain_expires_at()
+                        .and_then(next_expiry_sleep)
+                } else {
+                    None
+                };
                 drop(controller);
 
                 match expiry_wakeup {
@@ -915,6 +950,9 @@ fn next_expiry_sleep(expires_at: Timestamp) -> Option<Duration> {
 const MAX_EXPIRY_RECHECK: Duration = Duration::from_secs(60);
 /// Lower bound, so a near-deadline expiry cannot spin the task.
 const MIN_EXPIRY_RECHECK: Duration = Duration::from_millis(250);
+/// Consecutive expiry wakes that changed nothing before the timer is disarmed
+/// and reconciliation falls back to source-driven only.
+const MAX_UNPRODUCTIVE_EXPIRY_WAKES: u8 = 4;
 
 fn expire_locked(
     controller: &mut ControllerState,

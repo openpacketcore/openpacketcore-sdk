@@ -31,6 +31,8 @@ zeroize = { workspace = true }
 
 [dev-dependencies]
 rcgen = { workspace = true }
+# `start_paused` for the reconciliation-timer regression test.
+tokio = { workspace = true, features = ["macros", "rt", "test-util", "time"] }
 
 [lints]
 workspace = true
