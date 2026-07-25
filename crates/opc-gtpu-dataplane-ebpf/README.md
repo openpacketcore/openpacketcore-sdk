@@ -74,12 +74,15 @@ Its values are aggregate and contain no rejected endpoint or session fields.
   The committed classifiers are verifier-loaded on exact Linux 6.8 in CI so
   their complete call chains remain below that kernel's cumulative 512-byte
   BPF stack limit without reducing checksum coverage. The RHEL 9.4 `5.14.0-427`
-  line that Red Hat CoreOS ships for OpenShift 4.18 additionally has a
-  verifier-load gate, though not the full privileged datapath suite, because
-  the limit is cumulative over the callback chain and an enterprise backport
-  can account for it differently: exposing `bpf_loop` does not by itself imply
-  this object loads. Kernels outside the gated lines are unqualified rather
-  than unsupported, and `opc-gtpu-dataplane`'s
+  line that Red Hat CoreOS ships for OpenShift 4.18 is gated the same way and
+  additionally runs the full privileged datapath suite, because the limit is
+  cumulative over the callback chain and an enterprise backport can account for
+  it differently: exposing `bpf_loop` does not by itself imply this object
+  loads, and loading does not by itself imply it forwards. Both gates require
+  the datapath suite to run every test the committed source declares, and to
+  prove it ran rather than reporting itself skipped, so a test that cannot run
+  on el9 fails the gate rather than shrinking it. Kernels outside the gated
+  lines are unqualified rather than unsupported, and `opc-gtpu-dataplane`'s
   `probe_committed_classifier_load` establishes the answer on the node.
 - Outer IPv6 is `MaterializedOnly`: GSO and pending
   `CHECKSUM_PARTIAL` state are rejected before encapsulation. Outer IPv6

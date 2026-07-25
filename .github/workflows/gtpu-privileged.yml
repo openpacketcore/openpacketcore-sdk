@@ -104,6 +104,13 @@ jobs:
           export CARGO_HOME="${CARGO_HOME:-${HOME}/.cargo}"
           export RUSTUP_HOME="${RUSTUP_HOME:-${HOME}/.rustup}"
           export CARGO_TARGET_DIR="${RUNNER_TEMP}/gtpu-target"
+          # The committed source is the authority on how many datapath tests
+          # must run; see the el9 job for why the shipped binary cannot be.
+          datapath_source="crates/opc-gtpu-dataplane/tests/ebpf_gtpu_privileged.rs"
+          expected_tests="$(grep -c '^#\[ignore' "${datapath_source}")"
+          echo "datapath suite expects ${expected_tests} tests from ${datapath_source}"
+          test "${expected_tests}" -gt 0
+          datapath_log="${RUNNER_TEMP}/gtpu-68-datapath.log"
           sudo env \
             "PATH=${PATH}" \
             "CARGO_HOME=${CARGO_HOME}" \
@@ -114,7 +121,18 @@ jobs:
               ip link set lo up
               cargo test --locked -p opc-gtpu-dataplane --test ebpf_gtpu_privileged -- --ignored --nocapture
               cargo test --locked -p opc-gtpu-dataplane --lib program_tag_candidates_match_the_running_kernel -- --ignored --nocapture
-            '
+            ' 2>&1 | tee "${datapath_log}"
+
+          # Every one of these tests returns Ok early when
+          # OPC_GTPU_RUN_PRIVILEGED is unset, and libtest counts a skip as a
+          # pass -- so a green exit code alone proves nothing about whether the
+          # datapath actually ran. Assert the count and the absence of skips,
+          # the same way the el9 job does.
+          if grep -q 'skipping:' "${datapath_log}"; then
+            echo "::error::privileged datapath tests skipped instead of running"
+            exit 1
+          fi
+          grep -Fq "test result: ok. ${expected_tests} passed; 0 failed;" "${datapath_log}"
 
   linux-6-8-classifier-load:
     name: Linux 6.8 committed classifier load
@@ -268,9 +286,9 @@ jobs:
           grep -Fq 'OPC_GTPU_LOAD_CAPABILITY_PROVEN' <<< "${load_output}"
 
   el9-514-classifier-load:
-    name: RHEL 9 / OpenShift 4.18 classifier load
+    name: RHEL 9 / OpenShift 4.18 datapath
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 75
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -303,11 +321,37 @@ jobs:
           # Assert on the property, not on a phrasing: a static binary has no
           # PT_INTERP. `file` calls this "static-pie linked" and `ldd` calls it
           # "statically linked", so matching either string is fragile.
-          if readelf -l "${test_binary}" | grep -q 'Requesting program interpreter'; then
+          # Capture first: inside an `if` condition errexit is suppressed, so a
+          # readelf that failed outright would produce no output and read as
+          # "no interpreter found", i.e. as a pass.
+          test_headers="$(readelf -l "${test_binary}")"
+          if grep -q 'Requesting program interpreter' <<< "${test_headers}"; then
             echo "::error::el9 test binary is dynamically linked and will not start on RHEL 9"
             exit 1
           fi
           cp "${test_binary}" "${RUNNER_TEMP}/opc-gtpu-el9-test"
+
+          # The forwarding suite: encap/decap, PMTU, fragments, checksums,
+          # counter aggregation and teardown. Loading proves the verifier
+          # accepts the object; only this proves the datapath moves packets.
+          cargo test --locked -p opc-gtpu-dataplane --test ebpf_gtpu_privileged --no-run \
+            --target x86_64-unknown-linux-musl --message-format=json \
+            > "${RUNNER_TEMP}/gtpu-el9-datapath-build.jsonl"
+          datapath_binary="$(
+            jq -r 'select(.profile.test == true and .target.name == "ebpf_gtpu_privileged") | .executable // empty' \
+              "${RUNNER_TEMP}/gtpu-el9-datapath-build.jsonl" | tail -n 1
+          )"
+          test -n "${datapath_binary}"
+          test -x "${datapath_binary}"
+          # Capture first: inside an `if` condition errexit is suppressed, so a
+          # readelf that failed outright would produce no output and read as
+          # "no interpreter found", i.e. as a pass.
+          datapath_headers="$(readelf -l "${datapath_binary}")"
+          if grep -q 'Requesting program interpreter' <<< "${datapath_headers}"; then
+            echo "::error::el9 datapath binary is dynamically linked and will not start on RHEL 9"
+            exit 1
+          fi
+          cp "${datapath_binary}" "${RUNNER_TEMP}/opc-gtpu-el9-datapath"
 
       - name: Load both classifiers on a RHEL 9 kernel
         run: |
@@ -411,6 +455,14 @@ jobs:
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
             "${RUNNER_TEMP}/opc-gtpu-el9-test" opc@127.0.0.1:/tmp/opc-gtpu-el9-test
+          scp \
+            -i "${key}" \
+            -P 2228 \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            "${RUNNER_TEMP}/opc-gtpu-el9-datapath" opc@127.0.0.1:/tmp/opc-gtpu-el9-datapath
 
           # Record the kernel this evidence is about, and assert it is the
           # RHEL 9 line rather than whatever the image happens to ship.
@@ -439,6 +491,130 @@ jobs:
           grep -Fq 'test result: ok. 2 passed; 0 failed;' <<< "${load_output}"
           grep -Fq 'OPC_GTPU_TAG_PROOF_PROVEN' <<< "${load_output}"
           grep -Fq 'OPC_GTPU_LOAD_CAPABILITY_PROVEN' <<< "${load_output}"
+
+          # The suite shells out to ip, tc, ethtool, nft, wg and python3.
+          # iproute2, ethtool and python3 ship on the cloud image; nftables and
+          # wireguard-tools do not. The guest has no
+          # network on purpose (`restrict=on` above), so resolve and download
+          # the RPMs here -- in a matching el9 container, so dependencies
+          # resolve against the right distribution -- and install them offline
+          # in the guest. No `gtp` module is needed: this is the tc/eBPF path,
+          # not the kernel GTP netdevice.
+          rpm_dir="${RUNNER_TEMP}/el9-rpms"
+          mkdir -p "${rpm_dir}"
+          # --releasever pins the container's repos to the guest's minor, so
+          # the RPMs cannot depend on a newer glibc than 9.4 ships. `dnf
+          # download --alldeps` is what resolves dependencies here; `install
+          # --downloadonly` would skip anything the container already has.
+          # 9.4 is no longer on the mirrorlist, so point the container's repos
+          # at the vault the guest image itself came from. Without this,
+          # --releasever=9.4 resolves to a 404 mirrorlist.
+          #
+          # wireguard-tools requires systemd-resolved, which the cloud image
+          # does not ship. systemd subpackages are version-locked to each
+          # other, so pulling systemd-resolved in upgrades the whole family --
+          # and any member missing from the local repo would have to be erased
+          # instead, which dnf refuses for protected packages like
+          # systemd-udev. Ask the guest which subpackages it actually has so
+          # the entire set is present and can move together.
+          systemd_pkgs="$(
+            ssh "${ssh_options[@]}" opc@127.0.0.1 \
+              'rpm -qa --qf "%{NAME}\n" "systemd*" | sort -u | tr "\n" " "'
+          )"
+          echo "guest systemd family: ${systemd_pkgs}"
+          test -n "${systemd_pkgs}"
+          docker run --rm -e SYSTEMD_PKGS="${systemd_pkgs}" \
+            -v "${rpm_dir}:/out" rockylinux/rockylinux:9 bash -euo pipefail -c '
+            sed -i -e "s|^mirrorlist=|#mirrorlist=|" \
+                   -e "s|^#baseurl=http://dl.rockylinux.org/\$contentdir|baseurl=https://dl.rockylinux.org/vault/rocky|" \
+                   /etc/yum.repos.d/rocky*.repo
+            dnf install -y --releasever=9.4 dnf-plugins-core createrepo_c
+            dnf download --releasever=9.4 --resolve --alldeps --destdir=/out \
+              nftables wireguard-tools $SYSTEMD_PKGS
+            createrepo_c /out
+            chmod -R a+rX /out
+          '
+          test -d "${rpm_dir}/repodata"
+          scp -r \
+            -i "${key}" \
+            -P 2228 \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            "${rpm_dir}" opc@127.0.0.1:/tmp/opc-el9-repo
+
+          # Install from a local repo rather than `dnf install /tmp/*.rpm`:
+          # the latter forces every downloaded RPM onto the guest, including
+          # the core packages in the dependency closure, which dnf refuses
+          # because it would have to replace systemd. As a repo, dnf resolves
+          # normally and installs only what this guest is actually missing.
+          # Assert both binaries afterwards: the suite shells out to nft and
+          # wg, and a skipped install would otherwise surface as an unrelated
+          # test failure much later.
+          ssh "${ssh_options[@]}" opc@127.0.0.1 '
+            set -euo pipefail
+            sudo dnf install -y --disablerepo="*" \
+              --repofrompath=opclocal,file:///tmp/opc-el9-repo \
+              --nogpgcheck nftables wireguard-tools
+            command -v nft
+            command -v wg
+            # Asserted, not assumed: these ship on the cloud image today, and
+            # the suite fails deep inside a netns if a future image drops them.
+            command -v ethtool
+            command -v python3
+            sudo modprobe wireguard
+            chmod 0755 /tmp/opc-gtpu-el9-datapath
+          '
+
+          # The committed source is the authority on how many datapath tests
+          # must run. Deriving the number from the shipped binary instead
+          # would be circular: anything that drops a test from the binary --
+          # a cfg gate, a feature-default change -- drops it from both sides
+          # of the comparison at once, and the gate would happily prove a
+          # smaller claim. Count the source, then require the binary to agree.
+          datapath_source="crates/opc-gtpu-dataplane/tests/ebpf_gtpu_privileged.rs"
+          expected_tests="$(grep -c '^#\[ignore' "${datapath_source}")"
+          echo "el9 datapath suite expects ${expected_tests} tests from ${datapath_source}"
+          test "${expected_tests}" -gt 0
+          listed_tests="$(
+            ssh "${ssh_options[@]}" opc@127.0.0.1 \
+              '/tmp/opc-gtpu-el9-datapath --ignored --list | grep -c ": test$"'
+          )"
+          if [ "${listed_tests}" != "${expected_tests}" ]; then
+            echo "::error::el9 datapath binary offers ${listed_tests} tests, source declares ${expected_tests}"
+            exit 1
+          fi
+
+          # Same shape as the runner-side job: a fresh network namespace with
+          # loopback up, so the suite cannot disturb the guest's own links.
+          #
+          # Stream to a file rather than capturing into a variable: under
+          # errexit a failing command substitution aborts the step before
+          # anything is printed, so the one run whose output actually matters
+          # -- a datapath failure on the enterprise kernel -- would be the one
+          # that leaves no evidence behind.
+          datapath_log="${RUNNER_TEMP}/el9-datapath.log"
+          if ! ssh "${ssh_options[@]}" opc@127.0.0.1 \
+              'sudo env OPC_GTPU_RUN_PRIVILEGED=1 unshare -n -- bash -euo pipefail -c "ip link set lo up && /tmp/opc-gtpu-el9-datapath --ignored --nocapture"' \
+              > "${datapath_log}" 2>&1; then
+            cat "${datapath_log}"
+            echo "::error::el9 datapath suite failed on the OpenShift 4.18 kernel"
+            exit 1
+          fi
+          cat "${datapath_log}"
+
+          # Every one of these tests returns Ok early when
+          # OPC_GTPU_RUN_PRIVILEGED is unset, and libtest counts a skip as a
+          # pass. Requiring the exact count is therefore not enough on its own:
+          # a suite that skipped its way to green reports the same line. The
+          # load runs above guard this with proof markers; this is the
+          # equivalent for the datapath suite.
+          if grep -q 'skipping:' "${datapath_log}"; then
+            echo "::error::el9 datapath tests skipped instead of running"
+            exit 1
+          fi
+          grep -Fq "test result: ok. ${expected_tests} passed; 0 failed;" "${datapath_log}"
 
   ebpf-object:
     name: eBPF datapath object rebuild
