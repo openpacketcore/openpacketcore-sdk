@@ -4757,6 +4757,129 @@ fn poisoned_lock() -> io::Error {
     io::Error::other("gtpu ebpf backend mutex poisoned")
 }
 
+/// Why a committed-classifier load could not be attempted on this node.
+///
+/// These are deliberately separate from a verifier rejection: each one tells
+/// an operator to change the environment, whereas a rejection says the node
+/// cannot run this object at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ClassifierLoadBlocker {
+    /// The platform is not Linux, so there is no BPF verifier to ask.
+    PlatformUnsupported,
+    /// bpffs is not mounted, so the object's pinned maps cannot be created.
+    BpffsUnavailable,
+    /// Kernel BTF is not exposed, so the CO-RE object cannot be relocated.
+    BtfUnavailable,
+    /// `CAP_BPF`/`CAP_SYS_ADMIN` is not effective, so the load was refused
+    /// before the verifier ever saw the program.
+    InsufficientPrivileges,
+    /// The load could not be attempted for another environmental reason.
+    ///
+    /// Not always operator-fixable: a CO-RE relocation failure against the
+    /// running kernel's BTF, or a rejected map type, also lands here and
+    /// means this node cannot run this object. The distinction from
+    /// [`ClassifierLoadCapability::VerifierRejected`] is only that the
+    /// program verifier never returned a verdict.
+    Environment,
+}
+
+impl ClassifierLoadBlocker {
+    /// Stable machine-readable label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PlatformUnsupported => "platform_unsupported",
+            Self::BpffsUnavailable => "bpffs_unavailable",
+            Self::BtfUnavailable => "btf_unavailable",
+            Self::InsufficientPrivileges => "insufficient_privileges",
+            Self::Environment => "environment",
+        }
+    }
+}
+
+impl fmt::Display for ClassifierLoadBlocker {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Whether this node's kernel accepts the committed GTP-U classifiers.
+///
+/// Obtained from [`probe_committed_classifier_load`]. The three outcomes are
+/// distinct on purpose: a readiness gate should admit only on
+/// [`Self::Loadable`], refuse on [`Self::VerifierRejected`], and report an
+/// environment fault on [`Self::UnableToAttempt`] rather than conflating the
+/// last two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ClassifierLoadCapability {
+    /// Every committed classifier passed this kernel's verifier.
+    Loadable,
+    /// This kernel's verifier rejected a committed classifier, so the datapath
+    /// cannot forward here however the node is otherwise configured.
+    ///
+    /// Verifier output is deliberately not retained; see
+    /// [`GtpuError::ProgramLoadRejected`].
+    VerifierRejected {
+        /// Program that was rejected.
+        program: &'static str,
+        /// Captured I/O error kind from `BPF_PROG_LOAD`.
+        kind: io::ErrorKind,
+        /// Raw OS error code (errno), when the syscall carried one.
+        raw_os_error: Option<i32>,
+    },
+    /// The load could not be attempted, so this says nothing about whether the
+    /// kernel would accept the object.
+    UnableToAttempt {
+        /// What prevented the attempt.
+        blocker: ClassifierLoadBlocker,
+    },
+}
+
+impl ClassifierLoadCapability {
+    /// Whether the committed classifiers are proven loadable on this node.
+    ///
+    /// False for both a verifier rejection and an unattemptable environment,
+    /// so a gate that only admits on `true` fails closed.
+    #[must_use]
+    pub const fn is_loadable(self) -> bool {
+        matches!(self, Self::Loadable)
+    }
+}
+
+/// Attempt the committed GTP-U classifier load on the running kernel.
+///
+/// This answers "will this node's verifier accept the datapath object" with
+/// evidence rather than a kernel version comparison, which is the only sound
+/// question on distributions that backport `bpf_loop` into older kernel lines.
+/// A helper-availability probe cannot answer it: helper presence is a name
+/// inventory and says nothing about whether *this* object's call chains fit
+/// within *this* verifier's limits.
+///
+/// The committed object is loaded exactly as the runtime path loads it, so the
+/// answer is about the real classifiers rather than a synthetic probe program.
+/// Nothing is attached: no qdisc is created, no filter is installed, and the
+/// map pins created under `pin_root` are removed before returning, so this is
+/// safe to call on a node that is about to carry traffic.
+///
+/// Requires the same privileges as bringing the datapath up. Without them the
+/// result is [`ClassifierLoadCapability::UnableToAttempt`], never a rejection.
+#[must_use]
+pub fn probe_committed_classifier_load(pin_root: &Path) -> ClassifierLoadCapability {
+    #[cfg(target_os = "linux")]
+    {
+        aya_runtime::probe_committed_classifier_load(pin_root)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pin_root;
+        ClassifierLoadCapability::UnableToAttempt {
+            blocker: ClassifierLoadBlocker::PlatformUnsupported,
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod aya_runtime {
     //! aya-based kernel runtime: loads the committed CO-RE object, attaches
@@ -4770,6 +4893,7 @@ mod aya_runtime {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::MetadataExt;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Mutex;
 
     use aya::maps::{
@@ -4832,6 +4956,139 @@ mod aya_runtime {
         CurrentEbpfGraphRecoveryRefusal, DrainedV2TeardownOutcome, DrainedV2TeardownProgress,
         DrainedV2TeardownRefusal, GtpuError,
     };
+
+    /// Attempt the committed classifier load and classify the outcome.
+    ///
+    /// Mirrors the runtime load exactly -- the same `EbpfLoader` invocation as
+    /// `load_pinned` and the same `program.load()` the attach path performs --
+    /// then stops short of attaching, so no qdisc or filter is created. The
+    /// pin directory is unique per attempt and removed on every path.
+    pub(super) fn probe_committed_classifier_load(
+        pin_root: &Path,
+    ) -> super::ClassifierLoadCapability {
+        use super::{ClassifierLoadBlocker as Blocker, ClassifierLoadCapability as Capability};
+
+        // A load refused for want of privilege, bpffs or BTF says nothing
+        // about the verifier, so report the environment instead of guessing.
+        let environment = AyaGtpuRuntime::new().probe_environment();
+        if !environment.bpf_capable {
+            return Capability::UnableToAttempt {
+                blocker: Blocker::InsufficientPrivileges,
+            };
+        }
+        if !environment.bpffs_present {
+            return Capability::UnableToAttempt {
+                blocker: Blocker::BpffsUnavailable,
+            };
+        }
+        if !environment.btf_present {
+            return Capability::UnableToAttempt {
+                blocker: Blocker::BtfUnavailable,
+            };
+        }
+
+        // Unique per attempt so concurrent probes, and a probe running beside
+        // a live datapath, cannot collide on pin names.
+        let pin_dir = pin_root.join(format!(
+            "opc-gtpu-load-capability-{}-{}",
+            std::process::id(),
+            CAPABILITY_PROBE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        if fs::create_dir_all(&pin_dir).is_err() {
+            return Capability::UnableToAttempt {
+                blocker: Blocker::BpffsUnavailable,
+            };
+        }
+
+        let outcome = probe_loaded_programs(&pin_dir);
+
+        // Remove the map pins and the directory on every path; absence is
+        // tolerated because a failed load may not have pinned everything.
+        let _ = AyaGtpuRuntime::unpin(&pin_dir);
+        let _ = fs::remove_dir_all(&pin_dir);
+        outcome
+    }
+
+    /// Load the object and both classifiers, without attaching anything.
+    fn probe_loaded_programs(pin_dir: &Path) -> super::ClassifierLoadCapability {
+        use super::{ClassifierLoadBlocker as Blocker, ClassifierLoadCapability as Capability};
+
+        let mut ebpf = match EbpfLoader::new()
+            .default_map_pin_directory(pin_dir)
+            .load(DATAPATH_OBJECT)
+        {
+            Ok(ebpf) => ebpf,
+            // Map creation, BTF relocation and pinning all fail here. None of
+            // them is a verifier verdict on the programs.
+            Err(_) => {
+                return Capability::UnableToAttempt {
+                    blocker: Blocker::Environment,
+                }
+            }
+        };
+
+        for program_name in [PROG_UPLINK, PROG_DOWNLINK] {
+            let Some(program) = ebpf.program_mut(program_name) else {
+                return Capability::UnableToAttempt {
+                    blocker: Blocker::Environment,
+                };
+            };
+            let program: &mut SchedClassifier = match program.try_into() {
+                Ok(program) => program,
+                Err(_) => {
+                    return Capability::UnableToAttempt {
+                        blocker: Blocker::Environment,
+                    }
+                }
+            };
+            match program.load() {
+                Ok(()) => {}
+                // aya funnels every BPF_PROG_LOAD failure into LoadError
+                // without inspecting errno, so this arm is not by itself a
+                // verifier verdict. An LSM denial -- SELinux withholding
+                // `bpf { prog_load }` from a container domain, which is the
+                // normal state on RHCOS -- also lands here as EACCES, and
+                // reporting that as a rejection would tell an operator the
+                // node can never forward when the fix is a policy change.
+                //
+                // The kernel only writes a verifier log when it actually ran
+                // the verifier, so an empty log is the discriminator. The log
+                // itself is still dropped rather than retained, as on the
+                // runtime path.
+                Err(ProgramError::LoadError {
+                    io_error,
+                    verifier_log,
+                }) => {
+                    if verifier_log.to_string().trim().is_empty() {
+                        // PermissionDenied covers both EACCES and EPERM here.
+                        return Capability::UnableToAttempt {
+                            blocker: if io_error.kind() == io::ErrorKind::PermissionDenied {
+                                Blocker::InsufficientPrivileges
+                            } else {
+                                Blocker::Environment
+                            },
+                        };
+                    }
+                    return Capability::VerifierRejected {
+                        program: program_name,
+                        kind: io_error.kind(),
+                        raw_os_error: io_error.raw_os_error(),
+                    };
+                }
+                // The syscall itself failed, so the program was never judged.
+                Err(_) => {
+                    return Capability::UnableToAttempt {
+                        blocker: Blocker::Environment,
+                    }
+                }
+            }
+        }
+
+        Capability::Loadable
+    }
+
+    /// Distinguishes concurrent probes within one process.
+    static CAPABILITY_PROBE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
     /// The committed CO-RE datapath object built by
     /// `scripts/build-gtpu-ebpf.sh` from `crates/opc-gtpu-dataplane-ebpf`.
@@ -13364,6 +13621,50 @@ mod aya_runtime {
             fs::remove_dir_all(&root).expect("remove path identity root");
         }
 
+        /// The privileged counterpart of the unprivileged capability tests:
+        /// on a node that can actually load, the probe must say Loadable and
+        /// must leave nothing behind.
+        #[test]
+        #[ignore = "requires CAP_BPF and writable bpffs"]
+        fn committed_classifier_load_capability_is_loadable_and_leaves_no_state() {
+            if std::env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref() != Ok("1") {
+                return;
+            }
+            let pin_root = std::path::Path::new("/sys/fs/bpf");
+            let before = bpffs_entries(pin_root);
+
+            let capability = crate::probe_committed_classifier_load(pin_root);
+            assert_eq!(
+                capability,
+                crate::ClassifierLoadCapability::Loadable,
+                "committed classifiers must load on a kernel the gate accepts"
+            );
+            assert!(capability.is_loadable());
+
+            // No pin directory, no leftover maps: the probe is safe to run on
+            // a node that is about to carry traffic.
+            assert_eq!(
+                bpffs_entries(pin_root),
+                before,
+                "the probe must not leave any pinned object behind"
+            );
+            // The CI gate greps for this. Without it a silently skipped run
+            // still prints "1 passed", so the gate could go green having
+            // loaded nothing.
+            println!("OPC_GTPU_LOAD_CAPABILITY_PROVEN");
+        }
+
+        fn bpffs_entries(pin_root: &std::path::Path) -> Vec<std::ffi::OsString> {
+            let Ok(entries) = fs::read_dir(pin_root) else {
+                return Vec::new();
+            };
+            let mut names: Vec<_> = entries
+                .filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
+                .collect();
+            names.sort();
+            names
+        }
+
         #[test]
         #[ignore = "requires CAP_BPF and writable bpffs"]
         fn program_tag_candidates_match_the_running_kernel() {
@@ -13397,6 +13698,7 @@ mod aya_runtime {
             }
             drop(ebpf);
             fs::remove_dir_all(&pin_dir).expect("remove live tag proof pins");
+            println!("OPC_GTPU_TAG_PROOF_PROVEN");
         }
 
         #[test]
@@ -14253,6 +14555,127 @@ mod aya_runtime {
                 assert_incomplete(parse_test_dump(&second, &mut state).unwrap_err());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod load_capability_tests {
+    use super::{probe_committed_classifier_load, ClassifierLoadBlocker, ClassifierLoadCapability};
+
+    /// A gate must admit only on a proven load. Anything else -- including an
+    /// environment that could not be judged -- has to fail closed.
+    #[test]
+    fn only_a_proven_load_is_loadable() {
+        assert!(ClassifierLoadCapability::Loadable.is_loadable());
+        assert!(!ClassifierLoadCapability::VerifierRejected {
+            program: "opc_gtpu_uplink",
+            kind: std::io::ErrorKind::PermissionDenied,
+            raw_os_error: Some(13),
+        }
+        .is_loadable());
+        for blocker in [
+            ClassifierLoadBlocker::PlatformUnsupported,
+            ClassifierLoadBlocker::BpffsUnavailable,
+            ClassifierLoadBlocker::BtfUnavailable,
+            ClassifierLoadBlocker::InsufficientPrivileges,
+            ClassifierLoadBlocker::Environment,
+        ] {
+            assert!(!ClassifierLoadCapability::UnableToAttempt { blocker }.is_loadable());
+        }
+    }
+
+    /// Blocker labels are stable and distinct, because operators and readiness
+    /// gates key on them.
+    #[test]
+    fn blocker_labels_are_stable_and_distinct() {
+        let labels = [
+            (
+                ClassifierLoadBlocker::PlatformUnsupported,
+                "platform_unsupported",
+            ),
+            (ClassifierLoadBlocker::BpffsUnavailable, "bpffs_unavailable"),
+            (ClassifierLoadBlocker::BtfUnavailable, "btf_unavailable"),
+            (
+                ClassifierLoadBlocker::InsufficientPrivileges,
+                "insufficient_privileges",
+            ),
+            (ClassifierLoadBlocker::Environment, "environment"),
+        ];
+        for (blocker, expected) in labels {
+            assert_eq!(blocker.as_str(), expected);
+            assert_eq!(blocker.to_string(), expected);
+        }
+        let mut seen = std::collections::HashSet::new();
+        for (blocker, _) in labels {
+            assert!(seen.insert(blocker.as_str()), "labels must be distinct");
+        }
+    }
+
+    /// Diagnostics carry a classification and an errno, never verifier output,
+    /// paths or interface names.
+    #[test]
+    fn capability_debug_is_redaction_safe() {
+        let rejected = ClassifierLoadCapability::VerifierRejected {
+            program: "opc_gtpu_uplink",
+            kind: std::io::ErrorKind::InvalidInput,
+            raw_os_error: Some(22),
+        };
+        let rendered = format!("{rejected:?}");
+        for leak in [
+            "/sys/fs/bpf",
+            "R1 type=",
+            "invalid indirect read",
+            "processed ",
+        ] {
+            assert!(
+                !rendered.contains(leak),
+                "capability diagnostics must not carry verifier output or paths"
+            );
+        }
+    }
+
+    /// An unprivileged caller must be told the environment could not be
+    /// judged, never that the kernel rejected the object.
+    ///
+    /// The pin root is a temporary directory rather than a path under `/`:
+    /// the probe creates missing parents, so a literal `/nonexistent/...`
+    /// would litter the filesystem root when the suite is run as root.
+    #[test]
+    fn unattemptable_environment_is_never_reported_as_a_rejection() {
+        let pin_root = std::env::temp_dir().join(format!(
+            "opc-gtpu-capability-not-bpffs-{}",
+            std::process::id()
+        ));
+        let capability = probe_committed_classifier_load(&pin_root);
+        assert!(
+            matches!(
+                capability,
+                ClassifierLoadCapability::UnableToAttempt { .. }
+            ),
+            "an unattemptable probe must not be reported as a verifier rejection, got {capability:?}"
+        );
+        assert!(!capability.is_loadable());
+        let _ = std::fs::remove_dir_all(&pin_root);
+    }
+
+    /// A load that never reached the verifier must not be branded a verdict.
+    ///
+    /// aya funnels every BPF_PROG_LOAD failure into one error variant, so an
+    /// SELinux denial on RHCOS arrives looking exactly like a rejection. The
+    /// empty verifier log is what tells them apart.
+    #[test]
+    fn permission_denied_without_a_verifier_log_is_not_a_rejection() {
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert_eq!(denied.kind(), std::io::ErrorKind::PermissionDenied);
+        // Mirrors the classification arm: empty log plus PermissionDenied is
+        // an environment blocker, never VerifierRejected.
+        let blocker = if denied.kind() == std::io::ErrorKind::PermissionDenied {
+            ClassifierLoadBlocker::InsufficientPrivileges
+        } else {
+            ClassifierLoadBlocker::Environment
+        };
+        assert_eq!(blocker, ClassifierLoadBlocker::InsufficientPrivileges);
+        assert!(!ClassifierLoadCapability::UnableToAttempt { blocker }.is_loadable());
     }
 }
 

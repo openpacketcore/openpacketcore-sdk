@@ -256,11 +256,189 @@ jobs:
           '
           load_output="$(
             ssh "${ssh_options[@]}" opc@127.0.0.1 \
-              'sudo env OPC_GTPU_RUN_PRIVILEGED=1 /tmp/opc-gtpu-linux68-test --ignored --nocapture program_tag_candidates_match_the_running_kernel' \
+              'sudo env OPC_GTPU_RUN_PRIVILEGED=1 /tmp/opc-gtpu-linux68-test --ignored --nocapture --test-threads=1 program_tag_candidates_match_the_running_kernel committed_classifier_load_capability_is_loadable_and_leaves_no_state' \
               2>&1
           )"
           printf '%s\n' "${load_output}"
-          grep -Fq 'test result: ok. 1 passed; 0 failed;' <<< "${load_output}"
+          grep -Fq 'test result: ok. 2 passed; 0 failed;' <<< "${load_output}"
+          # Both tests return early when OPC_GTPU_RUN_PRIVILEGED is unset, and
+          # a skipped run still reports "passed", so assert the markers each
+          # prints only after a real load.
+          grep -Fq 'OPC_GTPU_TAG_PROOF_PROVEN' <<< "${load_output}"
+          grep -Fq 'OPC_GTPU_LOAD_CAPABILITY_PROVEN' <<< "${load_output}"
+
+  el9-514-classifier-load:
+    name: RHEL 9 / OpenShift 4.18 classifier load
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Cache Rust build output
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: opc-gtpu-el9
+
+      # Statically linked so the guest's glibc is irrelevant. The runner is
+      # Ubuntu and the guest is el9; a default gnu build would not start there.
+      - name: Build committed-object load test for el9
+        run: |
+          set -euo pipefail
+          export CARGO_TARGET_DIR="${RUNNER_TEMP}/gtpu-el9-target"
+          cargo test --locked -p opc-gtpu-dataplane --lib --no-run \
+            --target x86_64-unknown-linux-musl --message-format=json \
+            > "${RUNNER_TEMP}/gtpu-el9-build.jsonl"
+          test_binary="$(
+            jq -r 'select(.profile.test == true and .target.name == "opc_gtpu_dataplane") | .executable // empty' \
+              "${RUNNER_TEMP}/gtpu-el9-build.jsonl" | tail -n 1
+          )"
+          test -n "${test_binary}"
+          test -x "${test_binary}"
+          # Assert on the property, not on a phrasing: a static binary has no
+          # PT_INTERP. `file` calls this "static-pie linked" and `ldd` calls it
+          # "statically linked", so matching either string is fragile.
+          if readelf -l "${test_binary}" | grep -q 'Requesting program interpreter'; then
+            echo "::error::el9 test binary is dynamically linked and will not start on RHEL 9"
+            exit 1
+          fi
+          cp "${test_binary}" "${RUNNER_TEMP}/opc-gtpu-el9-test"
+
+      - name: Load both classifiers on a RHEL 9 kernel
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y cloud-image-utils qemu-system-x86 openssh-client
+
+          # Rocky Linux 9.4 is ABI-equivalent to RHEL 9.4 and publicly
+          # downloadable, unlike RHEL itself, and 9.4 is the RHEL minor that
+          # RHCOS ships for OpenShift 4.18 -- so this boots the 5.14.0-427
+          # el9_4 kernel line, not merely "some 5.14". Pinned by digest: a
+          # floating `latest` would silently drift onto a newer z-stream and
+          # quietly stop testing the shipping kernel.
+          image="${RUNNER_TEMP}/rocky94-el9.qcow2"
+          curl --fail --location --retry 3 \
+            --output "${image}" \
+            https://dl.rockylinux.org/vault/rocky/9.4/images/x86_64/Rocky-9-GenericCloud-Base-9.4-20240609.1.x86_64.qcow2
+          echo "2179864f4fa9799f11c0824c439666c2451d6751450494e20034efd4f3fa0559  ${image}" \
+            | sha256sum -c -
+
+          key="${RUNNER_TEMP}/gtpu-el9-key"
+          ssh-keygen -q -t ed25519 -N '' -C '' -f "${key}"
+          public_key="$(<"${key}.pub")"
+          user_data="${RUNNER_TEMP}/gtpu-el9-user-data"
+          metadata="${RUNNER_TEMP}/gtpu-el9-meta-data"
+          printf '%s\n' \
+            '#cloud-config' \
+            'users:' \
+            '  - name: opc' \
+            '    groups: [adm, wheel]' \
+            '    shell: /bin/bash' \
+            '    sudo: ALL=(ALL) NOPASSWD:ALL' \
+            '    lock_passwd: true' \
+            '    ssh_authorized_keys:' \
+            "      - ${public_key}" \
+            'ssh_pwauth: false' \
+            'disable_root: true' \
+            'package_update: false' > "${user_data}"
+          printf '%s\n' \
+            'instance-id: opc-gtpu-el9' \
+            'local-hostname: opc-gtpu-el9' > "${metadata}"
+          cloud-localds "${RUNNER_TEMP}/gtpu-el9-seed.iso" "${user_data}" "${metadata}"
+
+          pid_file="${RUNNER_TEMP}/gtpu-el9-qemu.pid"
+          cleanup() {
+            if sudo test -s "${pid_file}"; then
+              pid="$(sudo cat "${pid_file}")"
+              sudo kill "${pid}" 2>/dev/null || true
+            fi
+          }
+          trap cleanup EXIT
+
+          if sudo test -c /dev/kvm; then
+            machine='accel=kvm'
+            cpu='host'
+          else
+            machine='accel=tcg'
+            cpu='max'
+          fi
+          sudo qemu-system-x86_64 \
+            -machine "${machine}" \
+            -cpu "${cpu}" \
+            -smp 2 \
+            -m 3072 \
+            -drive "file=${image},format=qcow2,if=virtio,snapshot=on" \
+            -drive "file=${RUNNER_TEMP}/gtpu-el9-seed.iso,format=raw,media=cdrom,readonly=on" \
+            -netdev user,id=net0,restrict=on,hostfwd=tcp:127.0.0.1:2228-:22 \
+            -device virtio-net-pci,netdev=net0 \
+            -display none \
+            -serial "file:${RUNNER_TEMP}/gtpu-el9-serial.log" \
+            -daemonize \
+            -pidfile "${pid_file}"
+
+          ssh_options=(
+            -i "${key}"
+            -p 2228
+            -o BatchMode=yes
+            -o ConnectTimeout=2
+            -o IdentitiesOnly=yes
+            -o StrictHostKeyChecking=no
+            -o UserKnownHostsFile=/dev/null
+          )
+          ready=0
+          for _attempt in $(seq 1 150); do
+            if ssh "${ssh_options[@]}" opc@127.0.0.1 true >/dev/null 2>&1; then
+              ready=1
+              break
+            fi
+            sleep 2
+          done
+          if [[ "${ready}" != 1 ]]; then
+            sudo tail -n 200 "${RUNNER_TEMP}/gtpu-el9-serial.log" || true
+            exit 1
+          fi
+
+          scp \
+            -i "${key}" \
+            -P 2228 \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            "${RUNNER_TEMP}/opc-gtpu-el9-test" opc@127.0.0.1:/tmp/opc-gtpu-el9-test
+
+          # Record the kernel this evidence is about, and assert it is the
+          # RHEL 9 line rather than whatever the image happens to ship.
+          # Assert the exact shipping line, not just "5.14": the whole premise
+          # of this gate is that an enterprise backport can account for the
+          # bpf_loop callback chain differently, and that argument applies
+          # between el9 z-streams just as much as between 5.14 and 6.8.
+          ssh "${ssh_options[@]}" opc@127.0.0.1 '
+            set -euo pipefail
+            uname -r
+            grep -q "^ID=\"rocky\"" /etc/os-release
+            case "$(uname -r)" in
+              5.14.0-427.*el9_4*) ;;
+              *) echo "unexpected guest kernel: $(uname -r)"; exit 1 ;;
+            esac
+            systemd-detect-virt | grep -qE "kvm|qemu"
+            sudo mountpoint -q /sys/fs/bpf || sudo mount -t bpf bpf /sys/fs/bpf
+            chmod 0755 /tmp/opc-gtpu-el9-test
+          '
+          load_output="$(
+            ssh "${ssh_options[@]}" opc@127.0.0.1 \
+              'sudo env OPC_GTPU_RUN_PRIVILEGED=1 /tmp/opc-gtpu-el9-test --ignored --nocapture --test-threads=1 program_tag_candidates_match_the_running_kernel committed_classifier_load_capability_is_loadable_and_leaves_no_state' \
+              2>&1
+          )"
+          printf '%s\n' "${load_output}"
+          grep -Fq 'test result: ok. 2 passed; 0 failed;' <<< "${load_output}"
+          grep -Fq 'OPC_GTPU_TAG_PROOF_PROVEN' <<< "${load_output}"
+          grep -Fq 'OPC_GTPU_LOAD_CAPABILITY_PROVEN' <<< "${load_output}"
 
   ebpf-object:
     name: eBPF datapath object rebuild

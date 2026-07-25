@@ -48,6 +48,7 @@ pub mod unsupported;
 
 pub use backend::GtpuDataplaneBackend;
 pub use ebpf::{
+    probe_committed_classifier_load, ClassifierLoadBlocker, ClassifierLoadCapability,
     EbpfGtpuDatapathCounters, EbpfGtpuDatapathSnapshot, EbpfGtpuDataplaneBackend,
     EbpfGtpuDataplaneBackendConfig, DEFAULT_BPFFS_PIN_ROOT, DEFAULT_TC_PRIORITY,
 };
