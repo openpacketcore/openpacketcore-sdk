@@ -4260,8 +4260,20 @@ fn encode_error(reason: &'static str, section: &'static str) -> EncodeError {
         .with_spec_ref(SpecRef::new("3gpp", "TS29273", section))
 }
 
-// Every retained subscriber identity in these types is a `Sensitive` owner,
-// so each of them -- and each independent clone -- erases those values on drop.
+// Every retained subscriber identity in these types is a `Sensitive` owner, so
+// each of them -- and each independent clone -- erases those values on drop.
+// The claim is scoped to Session-Id and User-Name, matching CONFORMANCE.md;
+// forwarded raw AVP bytes are explicitly a byte-preserving surface and are not
+// covered here or anywhere else in this crate.
+//
+// MAINTENANCE OBLIGATION: these are bare marker impls, so nothing checks them
+// at compile time. A `#[derive(ZeroizeOnDrop)]` would, but it generates a
+// `Drop` requiring every field to be `Zeroize`, which these models cannot
+// satisfy while they legitimately hold redacted routing identities. So adding
+// a new SUBSCRIBER-linked field to any type below obliges you to give it a
+// `Sensitive` owner, or to remove that type from this list. Adding a routing
+// or forwarded-bytes field does not.
+//
 // `SwmAcceptedAuthorizationUpdate` and `SwmPendingAuthorizationUpdate` are
 // deliberately absent: see their type docs.
 impl zeroize::ZeroizeOnDrop for SwmReAuthRequest {}
