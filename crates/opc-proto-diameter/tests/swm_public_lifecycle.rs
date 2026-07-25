@@ -328,13 +328,13 @@ fn complete_swm_lifecycle_uses_only_public_sdk_boundaries() {
 
     let outbound_rar = swm::SwmReAuthRequestEnvelope::for_outbound(
         swm::SwmReAuthRequest {
-            session_id: Redacted::from(SESSION_UPDATE.to_owned()),
+            session_id: Sensitive::from(SESSION_UPDATE.to_owned()),
             origin_host: Redacted::from(AAA_HOST.to_owned()),
             origin_realm: Redacted::from(AAA_REALM.to_owned()),
             destination_realm: Redacted::from(EPDG_REALM.to_owned()),
             destination_host: Redacted::from(EPDG_HOST.to_owned()),
             re_auth_request_type: swm::SwmReAuthRequestType::AuthorizeOnly,
-            user_name: Redacted::from(USER_UPDATE.to_owned()),
+            user_name: Sensitive::from(USER_UPDATE.to_owned()),
             drmp: None,
             route_records: Vec::new(),
             additional_avps: Vec::new(),
@@ -395,12 +395,12 @@ fn complete_swm_lifecycle_uses_only_public_sdk_boundaries() {
     let pending = accepted
         .begin_authorization(
             swm::SwmAuthorizationRequest {
-                session_id: Redacted::from(SESSION_UPDATE.to_owned()),
+                session_id: Sensitive::from(SESSION_UPDATE.to_owned()),
                 origin_host: Redacted::from(EPDG_HOST.to_owned()),
                 origin_realm: Redacted::from(EPDG_REALM.to_owned()),
                 destination_realm: Redacted::from(AAA_REALM.to_owned()),
                 destination_host: Some(Redacted::from(AAA_HOST.to_owned())),
-                user_name: Redacted::from(USER_UPDATE.to_owned()),
+                user_name: Sensitive::from(USER_UPDATE.to_owned()),
                 auth_request_type: AuthRequestType::AuthorizeOnly,
                 authorization_lifetime: Some(600),
                 auth_grace_period: Some(30),

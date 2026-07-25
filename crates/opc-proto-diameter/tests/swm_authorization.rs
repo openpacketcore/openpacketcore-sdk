@@ -11,7 +11,7 @@ use opc_proto_diameter::apps::swm::{
     SwmReAuthRequestEnvelope, SwmReAuthRequestType, SwmReAuthResult,
 };
 use opc_proto_diameter::apps::{self, VENDOR_ID_3GPP};
-use opc_proto_diameter::avp::dictionary::Redacted;
+use opc_proto_diameter::avp::dictionary::{Redacted, Sensitive};
 use opc_proto_diameter::base;
 use opc_proto_diameter::{
     AvpCode, AvpHeader, AvpKey, CommandKind, Message, OwnedMessage, DIAMETER_HEADER_LEN,
@@ -2691,13 +2691,13 @@ fn authorization_diameter_identities_require_ascii_on_decode_and_encode() {
 fn typed_rar_envelope() -> SwmReAuthRequestEnvelope {
     SwmReAuthRequestEnvelope::for_outbound(
         SwmReAuthRequest {
-            session_id: Redacted::from(SESSION.to_owned()),
+            session_id: Sensitive::from(SESSION.to_owned()),
             origin_host: Redacted::from("aaa.private.invalid".to_owned()),
             origin_realm: Redacted::from("private.invalid".to_owned()),
             destination_realm: Redacted::from("access.private.invalid".to_owned()),
             destination_host: Redacted::from("epdg.private.invalid".to_owned()),
             re_auth_request_type: SwmReAuthRequestType::AuthorizeOnly,
-            user_name: Redacted::from(USER.to_owned()),
+            user_name: Sensitive::from(USER.to_owned()),
             drmp: None,
             route_records: Vec::new(),
             additional_avps: Vec::new(),
@@ -2725,12 +2725,12 @@ fn update_sequence_caches_answer_and_rfc_compliant_aar_retry() {
     let mut pending = accepted
         .begin_authorization(
             SwmAuthorizationRequest {
-                session_id: Redacted::from(SESSION.to_owned()),
+                session_id: Sensitive::from(SESSION.to_owned()),
                 origin_host: Redacted::from("epdg.private.invalid".to_owned()),
                 origin_realm: Redacted::from("private.invalid".to_owned()),
                 destination_realm: Redacted::from("aaa.private.invalid".to_owned()),
                 destination_host: None,
-                user_name: Redacted::from(USER.to_owned()),
+                user_name: Sensitive::from(USER.to_owned()),
                 auth_request_type: AuthRequestType::AuthorizeOnly,
                 authorization_lifetime: None,
                 auth_grace_period: None,
@@ -2823,12 +2823,12 @@ fn update_sequence_rejects_non_successful_raa_and_identity_drift() {
         SwmAcceptedAuthorizationUpdate::accept(rar, accepted_answer, EncodeContext::default())
             .expect("successful RAA must commit");
     let drifted = SwmAuthorizationRequest {
-        session_id: Redacted::from("different-session".to_owned()),
+        session_id: Sensitive::from("different-session".to_owned()),
         origin_host: Redacted::from("epdg.private.invalid".to_owned()),
         origin_realm: Redacted::from("private.invalid".to_owned()),
         destination_realm: Redacted::from("aaa.private.invalid".to_owned()),
         destination_host: None,
-        user_name: Redacted::from(USER.to_owned()),
+        user_name: Sensitive::from(USER.to_owned()),
         auth_request_type: AuthRequestType::AuthorizeOnly,
         authorization_lifetime: None,
         auth_grace_period: None,
@@ -2864,4 +2864,80 @@ fn debug_output_redacts_session_user_and_ip() {
     assert!(!envelope_debug.contains(SESSION));
     assert!(!envelope_debug.contains(USER));
     assert!(!envelope_debug.contains("dra.private.invalid"));
+}
+
+// ---- issue #399: zeroizing ownership of retained authorization identities ----
+
+fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+
+/// Every typed model and retained authority whose entire identity surface is
+/// zeroizing carries the contract, so a caller can rely on it rather than
+/// inspecting field types.
+#[test]
+fn authorization_models_and_authorities_zeroize_on_drop() {
+    assert_zeroize_on_drop::<swm::SwmReAuthRequest>();
+    assert_zeroize_on_drop::<swm::SwmReAuthAnswer>();
+    assert_zeroize_on_drop::<swm::SwmAuthorizationRequest>();
+    assert_zeroize_on_drop::<swm::SwmAuthorizationAnswer>();
+    assert_zeroize_on_drop::<swm::SwmReAuthRequestEnvelope>();
+    assert_zeroize_on_drop::<swm::SwmReAuthAnswerEnvelope>();
+    assert_zeroize_on_drop::<swm::SwmAuthorizationRequestEnvelope>();
+    assert_zeroize_on_drop::<swm::SwmAuthorizationAnswerEnvelope>();
+    assert_zeroize_on_drop::<swm::SwmCorrelatedReAuthExchange>();
+    assert_zeroize_on_drop::<swm::SwmCorrelatedAuthorizationExchange>();
+    assert_zeroize_on_drop::<swm::SwmCompletedAuthorizationUpdate>();
+}
+
+/// Cloning a retained authority must produce an independent zeroizing owner,
+/// not a shared one: the whole point is that the ePDG's copy and the SDK's
+/// copy erase on their own drops. Correlation must survive that, so the values
+/// still compare equal while the owners are distinct allocations.
+#[test]
+fn cloned_authorization_identities_are_independent_and_still_correlate() {
+    let rar = typed_rar_envelope();
+    let clone = rar.clone();
+
+    assert_eq!(clone.request().session_id, rar.request().session_id);
+    assert_eq!(clone.request().user_name, rar.request().user_name);
+    assert_ne!(
+        clone.request().session_id.as_ref().as_ptr(),
+        rar.request().session_id.as_ref().as_ptr(),
+        "a clone must own its own allocation, or one drop would erase both"
+    );
+
+    // Diagnostics stay redacted on the sensitive owner, exactly as before.
+    let rendered = format!("{:?} {}", rar.request().session_id, rar.request().user_name);
+    assert!(!rendered.contains(SESSION));
+    assert!(!rendered.contains(USER));
+}
+
+/// Why `SwmAcceptedAuthorizationUpdate` and `SwmPendingAuthorizationUpdate` do
+/// NOT carry `ZeroizeOnDrop`.
+///
+/// They retain an exact committed message for byte-identical replay, and those
+/// retained wire bytes hold the same Session-Id and User-Name as ordinary
+/// plaintext the type cannot erase. This test pins that fact so the marker is
+/// not later added for symmetry: it would assert an erasure guarantee the
+/// retained message does not provide.
+#[test]
+fn committed_replay_bytes_still_carry_the_identity_so_the_marker_is_withheld() {
+    let rar = typed_rar_envelope();
+    let raa = SwmReAuthAnswer::for_request(
+        &rar,
+        SwmReAuthResult::Success,
+        Redacted::from("epdg.private.invalid".to_owned()),
+        Redacted::from("access.private.invalid".to_owned()),
+    );
+    let accepted = SwmAcceptedAuthorizationUpdate::accept(rar, raa, EncodeContext::default())
+        .expect("successful RAA must commit");
+
+    let replayed = encode(&accepted.replay_re_auth_answer());
+    let carries_session_id = replayed
+        .windows(SESSION.len())
+        .any(|window| window == SESSION.as_bytes());
+    assert!(
+        carries_session_id,
+        "the committed replay buffer holds the Session-Id in the clear; that is \
+         precisely why this authority does not claim ZeroizeOnDrop"
+    );
 }

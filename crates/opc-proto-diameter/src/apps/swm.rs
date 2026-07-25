@@ -55,7 +55,7 @@ use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, Zeroizing};
 
 use super::{builder_helpers, VENDOR_ID_3GPP};
-use crate::avp::dictionary::Redacted;
+use crate::avp::dictionary::{Redacted, Sensitive};
 use crate::base;
 use crate::dictionary::{
     ApplicationDefinition, AvpCardinality, AvpDataType, AvpDefinition, AvpFlagRules, AvpKey,

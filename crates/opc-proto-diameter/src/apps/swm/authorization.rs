@@ -19,7 +19,7 @@ use super::lifecycle::{
 use super::{
     append_apn_configuration_avp, append_experimental_result_avp, builder_helpers,
     parse_apn_configuration, parse_experimental_result, ApnConfiguration, AuthRequestType,
-    Redacted, SwmApnConfigurationView, SwmAuthorizedApnConfiguration, SwmDiameterResult,
+    Redacted, Sensitive, SwmApnConfigurationView, SwmAuthorizedApnConfiguration, SwmDiameterResult,
     SwmDiameterTransaction, SwmResultCategory, APPLICATION_ID, AVP_AAR_FLAGS,
     AVP_AUTH_REQUEST_TYPE, AVP_DRMP, AVP_HIGH_PRIORITY_ACCESS_INFO, AVP_LOAD, AVP_OC_OLR,
     AVP_OC_SUPPORTED_FEATURES, AVP_UE_LOCAL_IP_ADDRESS,
@@ -437,7 +437,7 @@ impl SwmReAuthResult {
 #[derive(Clone, PartialEq, Eq)]
 pub struct SwmReAuthRequest {
     /// Session-Id; diagnostic formatting is redacted.
-    pub session_id: Redacted<String>,
+    pub session_id: Sensitive<String>,
     /// Origin-Host; diagnostic formatting is redacted.
     pub origin_host: Redacted<String>,
     /// Origin-Realm; diagnostic formatting is redacted.
@@ -449,7 +449,7 @@ pub struct SwmReAuthRequest {
     /// The request type; SWm authorization updates require AuthorizeOnly.
     pub re_auth_request_type: SwmReAuthRequestType,
     /// Required permanent user identity; diagnostic formatting is redacted.
-    pub user_name: Redacted<String>,
+    pub user_name: Sensitive<String>,
     /// Optional RFC 7944 routing priority.
     pub drmp: Option<SwmRoutingMessagePriority>,
     /// Ordered Route-Record identities; diagnostic formatting is redacted.
@@ -501,7 +501,7 @@ pub struct SwmReAuthAnswer {
     ///
     /// It may be absent only on a received RFC 6733 generic E-bit answer.
     /// Diagnostic formatting is redacted when present.
-    pub session_id: Option<Redacted<String>>,
+    pub session_id: Option<Sensitive<String>>,
     /// Result-Code projection.
     pub result: SwmReAuthResult,
     /// Optional action to take when the Authorization-Lifetime expires.
@@ -520,7 +520,7 @@ pub struct SwmReAuthAnswer {
     /// Permanent user identity copied from the request.
     ///
     /// It may be absent only on a received RFC 6733 generic E-bit answer.
-    pub user_name: Option<Redacted<String>>,
+    pub user_name: Option<Sensitive<String>>,
     /// Optional RFC 7944 routing priority.
     pub drmp: Option<SwmRoutingMessagePriority>,
     /// Ordered, validated extension AVPs.
@@ -579,7 +579,7 @@ impl fmt::Debug for SwmReAuthAnswer {
 #[derive(Clone, PartialEq, Eq)]
 pub struct SwmAuthorizationRequest {
     /// Session-Id; diagnostic formatting is redacted.
-    pub session_id: Redacted<String>,
+    pub session_id: Sensitive<String>,
     /// Origin-Host; diagnostic formatting is redacted.
     pub origin_host: Redacted<String>,
     /// Origin-Realm; diagnostic formatting is redacted.
@@ -589,7 +589,7 @@ pub struct SwmAuthorizationRequest {
     /// Optional Destination-Host; diagnostic formatting is redacted.
     pub destination_host: Option<Redacted<String>>,
     /// Required permanent user identity; diagnostic formatting is redacted.
-    pub user_name: Redacted<String>,
+    pub user_name: Sensitive<String>,
     /// Auth-Request-Type; SWm AAR requires AuthorizeOnly.
     pub auth_request_type: AuthRequestType,
     /// Optional client hint for the maximum authorization lifetime in seconds.
@@ -652,7 +652,7 @@ pub struct SwmAuthorizationAnswer {
     ///
     /// It may be absent only on a received RFC 6733 generic E-bit answer.
     /// Diagnostic formatting is redacted when present.
-    pub session_id: Option<Redacted<String>>,
+    pub session_id: Option<Sensitive<String>>,
     /// Auth-Request-Type; ordinary SWm AAA requires AuthorizeOnly.
     ///
     /// It may be absent only on a received RFC 6733 generic E-bit answer.
@@ -681,7 +681,7 @@ pub struct SwmAuthorizationAnswer {
     /// Required permanent user identity; diagnostic formatting is redacted.
     ///
     /// It may be absent only on a received RFC 6733 generic E-bit answer.
-    pub user_name: Option<Redacted<String>>,
+    pub user_name: Option<Sensitive<String>>,
     /// Optional complete, validated APN subscription projection from the AAA.
     ///
     /// The value retains every modeled and safely preserved APN child. The
@@ -1504,6 +1504,16 @@ fn correlate_common(
 ///
 /// The exact already-built RAA is retained for byte-identical duplicate replay.
 /// Debug output never includes its AVPs.
+///
+/// # Zeroization boundary
+///
+/// Every typed identity this authority reaches is a [`Sensitive`] owner and
+/// erases on drop. The type is deliberately **not** marked
+/// [`zeroize::ZeroizeOnDrop`], because it also retains an exact committed
+/// message for byte-identical replay, and those retained wire bytes hold the
+/// same Session-Id and User-Name as ordinary plaintext that this type cannot
+/// erase. Claiming the marker would assert an erasure guarantee the retained
+/// message does not provide.
 pub struct SwmAcceptedAuthorizationUpdate {
     request: SwmReAuthRequestEnvelope,
     answer: SwmReAuthAnswer,
@@ -1586,6 +1596,16 @@ impl fmt::Debug for SwmAcceptedAuthorizationUpdate {
 /// Pending second step of an SWm authorization-information update.
 ///
 /// Exact committed RAA and AAR messages are retained for retransmission.
+///
+/// # Zeroization boundary
+///
+/// Every typed identity this authority reaches is a [`Sensitive`] owner and
+/// erases on drop. The type is deliberately **not** marked
+/// [`zeroize::ZeroizeOnDrop`], because it also retains an exact committed
+/// message for byte-identical replay, and those retained wire bytes hold the
+/// same Session-Id and User-Name as ordinary plaintext that this type cannot
+/// erase. Claiming the marker would assert an erasure guarantee the retained
+/// message does not provide.
 pub struct SwmPendingAuthorizationUpdate {
     re_auth_transaction: SwmDiameterTransaction,
     re_auth_answer: SwmReAuthAnswer,
@@ -2426,7 +2446,7 @@ fn parse_re_auth_request_parts(
             )?;
             let key = avp.header.key();
             if key == AvpKey::ietf(base::AVP_SESSION_ID) {
-                parse_required_string(&avp, offset, value_offset, &mut session_id)?;
+                parse_sensitive_string(&avp, offset, value_offset, &mut session_id)?;
             } else if key == AvpKey::ietf(base::AVP_ORIGIN_HOST) {
                 parse_required_string(&avp, offset, value_offset, &mut origin_host)?;
             } else if key == AvpKey::ietf(base::AVP_ORIGIN_REALM) {
@@ -2453,7 +2473,7 @@ fn parse_re_auth_request_parts(
                 })?;
                 builder_helpers::set_once(&mut re_auth_request_type, typed, offset, "7.2.2.4.1")?;
             } else if key == AvpKey::ietf(base::AVP_USER_NAME) {
-                parse_required_string(&avp, offset, value_offset, &mut user_name)?;
+                parse_sensitive_string(&avp, offset, value_offset, &mut user_name)?;
             } else if key == AvpKey::ietf(AVP_DRMP) {
                 parse_drmp(&avp, offset, value_offset, &mut drmp)?;
             } else if key == AvpKey::ietf(base::AVP_PROXY_INFO) {
@@ -2606,7 +2626,7 @@ fn parse_re_auth_answer_parts(
         |offset, avp, value_offset| {
             let key = avp.header.key();
             if key == AvpKey::ietf(base::AVP_SESSION_ID) {
-                parse_required_string(&avp, offset, value_offset, &mut session_id)?;
+                parse_sensitive_string(&avp, offset, value_offset, &mut session_id)?;
             } else if key == AvpKey::ietf(base::AVP_RESULT_CODE) {
                 lifecycle::validate_base_definition(&avp, offset)?;
                 let value = builder_helpers::parse_u32_value(avp.value, value_offset, "7.1")?;
@@ -2661,7 +2681,7 @@ fn parse_re_auth_answer_parts(
             } else if key == AvpKey::ietf(base::AVP_ORIGIN_REALM) {
                 parse_required_string(&avp, offset, value_offset, &mut origin_realm)?;
             } else if key == AvpKey::ietf(base::AVP_USER_NAME) {
-                parse_required_string(&avp, offset, value_offset, &mut user_name)?;
+                parse_sensitive_string(&avp, offset, value_offset, &mut user_name)?;
             } else if key == AvpKey::ietf(AVP_DRMP) {
                 parse_drmp(&avp, offset, value_offset, &mut drmp)?;
             } else if key == AvpKey::ietf(base::AVP_PROXY_INFO) {
@@ -2788,7 +2808,7 @@ fn parse_authorization_request_parts(
         |offset, avp, value_offset| {
             let key = avp.header.key();
             if key == AvpKey::ietf(base::AVP_SESSION_ID) {
-                parse_required_string(&avp, offset, value_offset, &mut session_id)?;
+                parse_sensitive_string(&avp, offset, value_offset, &mut session_id)?;
             } else if key == AvpKey::ietf(base::AVP_AUTH_APPLICATION_ID) {
                 lifecycle::validate_base_definition(&avp, offset)?;
                 let value = builder_helpers::parse_u32_value(avp.value, value_offset, "6.8")?;
@@ -2811,7 +2831,7 @@ fn parse_authorization_request_parts(
                     "7.2.2.1.3",
                 )?;
             } else if key == AvpKey::ietf(base::AVP_USER_NAME) {
-                parse_required_string(&avp, offset, value_offset, &mut user_name)?;
+                parse_sensitive_string(&avp, offset, value_offset, &mut user_name)?;
             } else if key == AvpKey::ietf(base::AVP_AUTHORIZATION_LIFETIME) {
                 parse_base_u32(
                     &avp,
@@ -3006,7 +3026,7 @@ fn parse_authorization_answer_parts(
         |offset, avp, value_offset| {
             let key = avp.header.key();
             if key == AvpKey::ietf(base::AVP_SESSION_ID) {
-                parse_required_string(&avp, offset, value_offset, &mut session_id)?;
+                parse_sensitive_string(&avp, offset, value_offset, &mut session_id)?;
             } else if key == AvpKey::ietf(base::AVP_AUTH_APPLICATION_ID) {
                 lifecycle::validate_base_definition(&avp, offset)?;
                 let value = builder_helpers::parse_u32_value(avp.value, value_offset, "6.8")?;
@@ -3091,7 +3111,7 @@ fn parse_authorization_answer_parts(
             } else if key == AvpKey::ietf(base::AVP_ORIGIN_REALM) {
                 parse_required_string(&avp, offset, value_offset, &mut origin_realm)?;
             } else if key == AvpKey::ietf(base::AVP_USER_NAME) {
-                parse_required_string(&avp, offset, value_offset, &mut user_name)?;
+                parse_sensitive_string(&avp, offset, value_offset, &mut user_name)?;
             } else if key == AvpKey::vendor(super::AVP_APN_CONFIGURATION, VENDOR_ID_3GPP) {
                 validate_vendor_definition(&avp, offset)?;
                 let mut retention = super::DiameterEapRetention::default();
@@ -3302,12 +3322,18 @@ where
     )
 }
 
-fn parse_required_string(
+/// Validate and decode one core string AVP without choosing an owner.
+///
+/// Split out so the redacted/zeroizing decision is visible at each call site
+/// rather than hard-wired here. Routing identities and subscriber identities
+/// share every validation step and differ only in ownership, and this was the
+/// single parse path for both, so one wrapper choice here silently decided the
+/// memory-lifetime contract for all four commands.
+fn parse_core_string(
     avp: &RawAvp<'_>,
     offset: usize,
     value_offset: usize,
-    field: &mut Option<Redacted<String>>,
-) -> Result<(), DecodeError> {
+) -> Result<String, DecodeError> {
     lifecycle::validate_base_definition(avp, offset)?;
     let definition = base::dictionary()
         .find_avp(avp.header.key())
@@ -3319,8 +3345,36 @@ fn parse_required_string(
         value_offset,
         "RFC6733",
     )?;
-    let value = builder_helpers::parse_string_value(avp.value, value_offset, "RFC6733")?;
+    builder_helpers::parse_string_value(avp.value, value_offset, "RFC6733")
+}
+
+/// Decode a routing identity (Origin/Destination host or realm).
+///
+/// These are DiameterIdentity routing values, not subscriber identities, so
+/// they keep diagnostics-only redaction.
+fn parse_required_string(
+    avp: &RawAvp<'_>,
+    offset: usize,
+    value_offset: usize,
+    field: &mut Option<Redacted<String>>,
+) -> Result<(), DecodeError> {
+    let value = parse_core_string(avp, offset, value_offset)?;
     builder_helpers::set_once(field, Redacted::from(value), offset, "RFC6733")
+}
+
+/// Decode a subscriber-linked identity (Session-Id or User-Name).
+///
+/// These are retained across the whole peer-initiated reauthorization
+/// procedure, including clones held by the accepted-RAR and pending-AAR
+/// authorities, so every owner zeroizes on drop.
+fn parse_sensitive_string(
+    avp: &RawAvp<'_>,
+    offset: usize,
+    value_offset: usize,
+    field: &mut Option<Sensitive<String>>,
+) -> Result<(), DecodeError> {
+    let value = parse_core_string(avp, offset, value_offset)?;
+    builder_helpers::set_once(field, Sensitive::from(value), offset, "RFC6733")
 }
 
 fn parse_drmp(
@@ -4206,6 +4260,22 @@ fn encode_error(reason: &'static str, section: &'static str) -> EncodeError {
         .with_spec_ref(SpecRef::new("3gpp", "TS29273", section))
 }
 
+// Every retained subscriber identity in these types is a `Sensitive` owner,
+// so each of them -- and each independent clone -- erases those values on drop.
+// `SwmAcceptedAuthorizationUpdate` and `SwmPendingAuthorizationUpdate` are
+// deliberately absent: see their type docs.
+impl zeroize::ZeroizeOnDrop for SwmReAuthRequest {}
+impl zeroize::ZeroizeOnDrop for SwmReAuthAnswer {}
+impl zeroize::ZeroizeOnDrop for SwmAuthorizationRequest {}
+impl zeroize::ZeroizeOnDrop for SwmAuthorizationAnswer {}
+impl zeroize::ZeroizeOnDrop for SwmReAuthRequestEnvelope {}
+impl zeroize::ZeroizeOnDrop for SwmReAuthAnswerEnvelope {}
+impl zeroize::ZeroizeOnDrop for SwmAuthorizationRequestEnvelope {}
+impl zeroize::ZeroizeOnDrop for SwmAuthorizationAnswerEnvelope {}
+impl zeroize::ZeroizeOnDrop for SwmCorrelatedReAuthExchange {}
+impl zeroize::ZeroizeOnDrop for SwmCorrelatedAuthorizationExchange {}
+impl zeroize::ZeroizeOnDrop for SwmCompletedAuthorizationUpdate {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4218,13 +4288,13 @@ mod tests {
             potentially_retransmitted: false,
             expected_answer_peer: None,
             request: SwmReAuthRequest {
-                session_id: Redacted::from("synthetic-session.example"),
+                session_id: Sensitive::from("synthetic-session.example"),
                 origin_host: Redacted::from("origin-host.example"),
                 origin_realm: Redacted::from("origin-realm.example"),
                 destination_realm: Redacted::from("destination-realm.example"),
                 destination_host: Redacted::from("destination-host.example"),
                 re_auth_request_type: SwmReAuthRequestType::AuthorizeOnly,
-                user_name: Redacted::from("synthetic-user@identity.example"),
+                user_name: Sensitive::from("synthetic-user@identity.example"),
                 drmp: None,
                 route_records: Vec::new(),
                 additional_avps: Vec::new(),

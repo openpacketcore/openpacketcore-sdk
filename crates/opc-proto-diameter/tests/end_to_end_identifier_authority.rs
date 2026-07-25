@@ -229,13 +229,13 @@ fn der_str_asr_rar_and_aar_respect_origin_scoped_authorities() {
     assert_eq!(wire(&asr_initial), wire(&asr_retry));
 
     let rar_request = swm::SwmReAuthRequest {
-        session_id: Redacted::from(SESSION_ID.to_owned()),
+        session_id: Sensitive::from(SESSION_ID.to_owned()),
         origin_host: Redacted::from(PEER_HOST.to_owned()),
         origin_realm: Redacted::from(PEER_REALM.to_owned()),
         destination_realm: Redacted::from(ORIGIN_REALM.to_owned()),
         destination_host: Redacted::from(ORIGIN_HOST.to_owned()),
         re_auth_request_type: swm::SwmReAuthRequestType::AuthorizeOnly,
-        user_name: Redacted::from(USER_NAME.to_owned()),
+        user_name: Sensitive::from(USER_NAME.to_owned()),
         drmp: None,
         route_records: Vec::new(),
         additional_avps: Vec::new(),
@@ -258,12 +258,12 @@ fn der_str_asr_rar_and_aar_respect_origin_scoped_authorities() {
     assert_eq!(wire(&rar_initial), wire(&rar_retry));
 
     let aar_request = swm::SwmAuthorizationRequest {
-        session_id: Redacted::from(SESSION_ID.to_owned()),
+        session_id: Sensitive::from(SESSION_ID.to_owned()),
         origin_host: Redacted::from(ORIGIN_HOST.to_owned()),
         origin_realm: Redacted::from(ORIGIN_REALM.to_owned()),
         destination_realm: Redacted::from(PEER_REALM.to_owned()),
         destination_host: Some(Redacted::from(PEER_HOST.to_owned())),
-        user_name: Redacted::from(USER_NAME.to_owned()),
+        user_name: Sensitive::from(USER_NAME.to_owned()),
         auth_request_type: AuthRequestType::AuthorizeOnly,
         authorization_lifetime: None,
         auth_grace_period: None,

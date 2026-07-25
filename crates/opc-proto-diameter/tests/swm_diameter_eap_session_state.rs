@@ -238,13 +238,13 @@ fn encoded_str(request: SwmSessionTerminationRequest) -> Vec<u8> {
 
 fn re_auth_request() -> SwmReAuthRequest {
     SwmReAuthRequest {
-        session_id: Redacted::from(SESSION_ID),
+        session_id: Sensitive::from(SESSION_ID),
         origin_host: Redacted::from(AAA_HOST),
         origin_realm: Redacted::from(AAA_REALM),
         destination_realm: Redacted::from(EPDG_REALM),
         destination_host: Redacted::from(EPDG_HOST),
         re_auth_request_type: SwmReAuthRequestType::AuthorizeOnly,
-        user_name: Redacted::from(USER_NAME),
+        user_name: Sensitive::from(USER_NAME),
         drmp: None,
         route_records: Vec::new(),
         additional_avps: Vec::new(),
