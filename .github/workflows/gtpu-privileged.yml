@@ -544,9 +544,19 @@ jobs:
               2>&1
           )"
           printf '%s\n' "${datapath_output}"
-          # Assert a nonzero pass count: `--ignored` with everything filtered
-          # out would otherwise report ok with nothing run.
-          grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed;' <<< "${datapath_output}"
+          # Assert the count, not just "ok". `--ignored` with everything
+          # filtered out reports ok with nothing run, and a merely nonzero
+          # count would still accept a silently reduced suite -- exactly the
+          # failure this gate exists to catch, since a test that cannot run on
+          # el9 is the finding. Ask the binary itself how many tests `--ignored`
+          # selects, so adding one to the suite cannot quietly lower the bar.
+          expected_tests="$(
+            ssh "${ssh_options[@]}" opc@127.0.0.1 \
+              '/tmp/opc-gtpu-el9-datapath --ignored --list | grep -c ": test$"'
+          )"
+          echo "el9 datapath suite expects ${expected_tests} tests"
+          test "${expected_tests}" -gt 0
+          grep -Fq "test result: ok. ${expected_tests} passed; 0 failed;" <<< "${datapath_output}"
 
   ebpf-object:
     name: eBPF datapath object rebuild
