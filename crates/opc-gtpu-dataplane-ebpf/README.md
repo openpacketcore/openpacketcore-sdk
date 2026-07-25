@@ -73,7 +73,12 @@ Its values are aggregate and contain no rejected endpoint or session fields.
 - IPv6 extension and checksum processing use bounded `bpf_loop` callbacks.
   The committed classifiers are verifier-loaded on exact Linux 6.8 in CI so
   their complete call chains remain below that kernel's cumulative 512-byte
-  BPF stack limit without reducing checksum coverage.
+  BPF stack limit without reducing checksum coverage. That evidence covers one
+  kernel: because the limit is cumulative over the callback chain, a kernel
+  that exposes `bpf_loop` may still account for it differently, so exposing the
+  helper does not imply this object loads. Other kernels are unqualified rather
+  than unsupported, and `opc-gtpu-dataplane`'s
+  `probe_committed_classifier_load` establishes the answer on the node.
 - Outer IPv6 is `MaterializedOnly`: GSO and pending
   `CHECKSUM_PARTIAL` state are rejected before encapsulation. Outer IPv6
   fragment reassembly is not claimed; only atomic Fragment headers are handled

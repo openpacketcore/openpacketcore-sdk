@@ -256,11 +256,16 @@ jobs:
           '
           load_output="$(
             ssh "${ssh_options[@]}" opc@127.0.0.1 \
-              'sudo env OPC_GTPU_RUN_PRIVILEGED=1 /tmp/opc-gtpu-linux68-test --ignored --nocapture program_tag_candidates_match_the_running_kernel' \
+              'sudo env OPC_GTPU_RUN_PRIVILEGED=1 /tmp/opc-gtpu-linux68-test --ignored --nocapture --test-threads=1 program_tag_candidates_match_the_running_kernel committed_classifier_load_capability_is_loadable_and_leaves_no_state' \
               2>&1
           )"
           printf '%s\n' "${load_output}"
-          grep -Fq 'test result: ok. 1 passed; 0 failed;' <<< "${load_output}"
+          grep -Fq 'test result: ok. 2 passed; 0 failed;' <<< "${load_output}"
+          # Both tests return early when OPC_GTPU_RUN_PRIVILEGED is unset, and
+          # a skipped run still reports "passed", so assert the markers each
+          # prints only after a real load.
+          grep -Fq 'OPC_GTPU_TAG_PROOF_PROVEN' <<< "${load_output}"
+          grep -Fq 'OPC_GTPU_LOAD_CAPABILITY_PROVEN' <<< "${load_output}"
 
   ebpf-object:
     name: eBPF datapath object rebuild
