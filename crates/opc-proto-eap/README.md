@@ -26,10 +26,12 @@ differences:
   attributes.
 
 Parsing borrows the supplied packet and allocates nothing. The borrowed bytes
-remain private and have no accessor. Public evidence contains only typed
+remain private and have no raw accessor. Public evidence contains typed
 method/subtype/direction values, numeric protocol codes, booleans, and bounded
-counts. It never exposes identities, RAND, AUTN, AUTS, RES, MAC, IV,
-ciphertext, nonces, keys, realms, addresses, or packet-derived hashes.
+counts, plus exactly one attribute value: the identity a peer asserts in
+`AT_IDENTITY` (see [The asserted identity](#the-asserted-identity)). It never
+exposes RAND, AUTN, AUTS, RES, MAC, IV, ciphertext, nonces, keys, realms,
+addresses, or packet-derived hashes, and no identity reaches `Debug`.
 
 ## Example
 
@@ -80,6 +82,27 @@ EAP method implementation or product. In particular, a structurally complete
 Challenge Response and a structurally protected Success Notification are
 reported as candidates only; callers must not treat them as cryptographically
 verified.
+
+### The asserted identity
+
+`EapAkaPacket::asserted_identity` returns the `AT_IDENTITY` octets a peer
+asserted, and `asserted_identity_is` compares against them without handing the
+value out. Both use the RFC 4187 clause 10.1 Actual Identity Length, so the
+padding that clause requires never participates in a comparison.
+
+This is the one attribute value the crate exposes, because an `AKA-Identity`
+exchange exists precisely so a peer can name a *different* identity than the
+one already seen -- a permanent identity in place of a pseudonym. A relaying
+node that tracks which subscriber an exchange belongs to cannot keep that in
+step from presence alone: presence cannot separate "asserted the identity I
+already know" from "asserted a different one". `asserted_identity_is` returns
+`false` when the attribute is absent, so an absent attribute can never be read
+as agreement.
+
+The value is still withheld from `Debug`, which projects
+`asserted_identity_len` instead, so diagnostics remain redaction-safe. Treat
+the identity as subscriber-correlatable: it is an identifier the peer claims,
+not an authenticated one, and nothing here verifies that claim.
 
 See [CONFORMANCE.md](CONFORMANCE.md) for exact validation and evidence.
 

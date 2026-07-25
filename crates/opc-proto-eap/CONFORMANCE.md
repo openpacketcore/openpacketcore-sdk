@@ -54,18 +54,27 @@ D bit and ignores its receive-side reserved bits.
 ## Evidence surface and privacy
 
 The source slice is a private borrow with no raw accessor. The projection
-exposes direction, identifier, method, subtype, total/unknown counts, and a
-typed packet-kind value. Packet-specific evidence reports only safe numeric or
+exposes direction, identifier, method, subtype, total/unknown counts, a typed
+packet-kind value, and -- as the single deliberate exception -- the identity a
+peer asserted in `AT_IDENTITY` (RFC 4187 clause 10.1), through
+`EapAkaPacket::asserted_identity` and the non-extracting comparison
+`asserted_identity_is`. That exception exists because presence alone cannot
+distinguish an identity a relaying node already knows from a different one, so
+such a node could not fail closed on a change. Both accessors use the Actual
+Identity Length and exclude clause 10.1 padding. The returned value is
+subscriber-correlatable and its handling is the caller's responsibility. Packet-specific evidence reports only safe numeric or
 boolean facts such as KDF number/count, result-indication presence,
 Notification code/phase, ordered bounded KDF identifiers, or paired encryption
 presence. The packet projection intentionally implements no equality trait, so
 it cannot be mistaken for wire identity or replay evidence.
 
-Custom packet `Debug` omits source bytes. Errors retain only numeric lengths,
-offsets, codes, counts, and stable reason enums. No public result or diagnostic
-contains raw Type-Data, raw attribute values, identities, RAND, AUTN, AUTS,
-RES, MAC, IV, ciphertext, keys, nonces, addresses, realms, or packet-derived
-hashes.
+Custom packet `Debug` omits source bytes and projects the asserted identity as
+a length only. Errors retain only numeric lengths, offsets, codes, counts, and
+stable reason enums. No **diagnostic** output contains raw Type-Data, raw
+attribute values, identities, RAND, AUTN, AUTS, RES, MAC, IV, ciphertext, keys,
+nonces, addresses, realms, or packet-derived hashes. No public **result**
+contains any of those either, except the asserted `AT_IDENTITY` value described
+above.
 
 The following remain explicitly outside this crate:
 

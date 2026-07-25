@@ -35,7 +35,7 @@ const AT_RESULT_IND: u8 = 135;
 const AT_BIDDING: u8 = 136;
 
 #[derive(Default)]
-struct Attributes {
+struct Attributes<'a> {
     count: usize,
     unknown_skippable_count: usize,
     rand: bool,
@@ -47,6 +47,10 @@ struct Attributes {
     notification: Option<u16>,
     any_id_req: bool,
     identity: bool,
+    /// AT_IDENTITY octets up to the Actual Identity Length, excluding the
+    /// padding RFC 4187 clause 10.1 requires. A caller comparing identities
+    /// must not compare padding.
+    identity_value: Option<&'a [u8]>,
     fullauth_id_req: bool,
     client_error_code: Option<u16>,
     kdf_input: bool,
@@ -155,6 +159,7 @@ pub(crate) fn parse(packet: &[u8]) -> Result<EapAkaPacket<'_>, EapAkaError> {
         attribute_count: attributes.count as u16,
         unknown_skippable_count: attributes.unknown_skippable_count as u16,
         kind,
+        asserted_identity: attributes.identity_value,
     })
 }
 
@@ -179,10 +184,10 @@ fn validate_direction(code: EapCode, subtype: EapAkaSubtype) -> Result<(), EapAk
 }
 
 #[allow(clippy::too_many_arguments)]
-fn parse_attribute(
-    attributes: &mut Attributes,
+fn parse_attribute<'a>(
+    attributes: &mut Attributes<'a>,
     attribute_type: u8,
-    attribute: &[u8],
+    attribute: &'a [u8],
     offset: usize,
     code: EapCode,
     method: EapAkaMethod,
@@ -245,6 +250,12 @@ fn parse_attribute(
         }
         AT_IDENTITY => {
             validate_actual_text(attribute_type, attribute, false)?;
+            // `validate_actual_text` has already proven the Actual Identity
+            // Length is nonzero, within bounds, and that the attribute is
+            // padded to exactly the length clause 10.1 requires, so this slice
+            // cannot panic and carries no padding.
+            let actual = usize::from(u16::from_be_bytes([attribute[2], attribute[3]]));
+            attributes.identity_value = Some(&attribute[4..4 + actual]);
             set_once(&mut attributes.identity, attribute_type)
         }
         AT_FULLAUTH_ID_REQ => {

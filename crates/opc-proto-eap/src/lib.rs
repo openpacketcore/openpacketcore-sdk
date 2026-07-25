@@ -8,8 +8,13 @@
 //!
 //! Parsing is allocation-free and the source bytes remain private. Public
 //! evidence contains only numeric identifiers, booleans, counts, and typed
-//! enums. Subscriber identities and AKA authentication material are never
-//! exposed through this API or diagnostic formatting.
+//! enums, with one deliberate exception: the identity a peer asserts in
+//! `AT_IDENTITY` is reachable through
+//! [`EapAkaPacket::asserted_identity`](model::EapAkaPacket::asserted_identity),
+//! because a relaying node cannot otherwise tell that the subject of an
+//! exchange changed. That value is subscriber-correlatable and is the caller's
+//! to handle. AKA authentication material is never exposed, and no subscriber
+//! identity -- including that one -- ever reaches diagnostic formatting.
 //!
 //! This crate proves structure only. It does not verify AT_MAC, AUTN, AUTS, or
 //! RES; decrypt AT_ENCR_DATA; correlate KDF re-offers or AT_RESULT_IND across
