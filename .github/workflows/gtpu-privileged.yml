@@ -479,7 +479,13 @@ jobs:
           # the RPMs cannot depend on a newer glibc than 9.4 ships. `dnf
           # download --alldeps` is what resolves dependencies here; `install
           # --downloadonly` would skip anything the container already has.
+          # 9.4 is no longer on the mirrorlist, so point the container's repos
+          # at the vault the guest image itself came from. Without this,
+          # --releasever=9.4 resolves to a 404 mirrorlist.
           docker run --rm -v "${rpm_dir}:/out" rockylinux/rockylinux:9 bash -euo pipefail -c '
+            sed -i -e "s|^mirrorlist=|#mirrorlist=|" \
+                   -e "s|^#baseurl=http://dl.rockylinux.org/\$contentdir|baseurl=https://dl.rockylinux.org/vault/rocky|" \
+                   /etc/yum.repos.d/rocky*.repo
             dnf install -y --releasever=9.4 dnf-plugins-core
             dnf download --releasever=9.4 --resolve --alldeps --destdir=/out \
               nftables wireguard-tools
