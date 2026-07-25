@@ -45,6 +45,13 @@ pub const GTPU_MESSAGE_SUPPORTED_EXTENSION_HEADERS_NOTIFICATION: u8 = 31;
 /// GTP-U End Marker message type.
 pub const GTPU_MESSAGE_END_MARKER: u8 = 254;
 
+/// G-PDU message type (TS 29.281 clause 7.1).
+///
+/// Not a control message, and deliberately not decodable by
+/// [`GtpuControlMessage`]. A transport that demultiplexes a receive queue needs
+/// to name it to route user-plane frames away from the control path.
+pub const GTPU_MESSAGE_G_PDU: u8 = 255;
+
 const IE_RECOVERY: u8 = 14;
 const IE_TEID_DATA_I: u8 = 16;
 const IE_GTPU_PEER_ADDRESS: u8 = 133;
@@ -66,7 +73,15 @@ pub enum GtpuControlCodecErrorCode {
         code: DecodeErrorCode,
     },
     /// The message type is not one of the typed control procedures.
-    UnsupportedMessageType,
+    ///
+    /// Carries the type so a transport can route the frame -- a G-PDU to the
+    /// user plane, an unmodelled control type to its own handling -- without
+    /// decoding the header a second time. Type identifiers are protocol
+    /// metadata, as this enum's contract already states.
+    UnsupportedMessageType {
+        /// TS 29.281 message type that is not a typed control procedure.
+        message_type: u8,
+    },
     /// Bytes followed the one declared GTP-U datagram boundary.
     TrailingBytes,
     /// Header flags violate the selected control procedure.
@@ -152,7 +167,7 @@ impl GtpuControlCodecErrorCode {
     pub const fn as_str(&self) -> &'static str {
         match self {
             Self::Framing { .. } => "gtpu_control_framing",
-            Self::UnsupportedMessageType => "gtpu_control_unsupported_message_type",
+            Self::UnsupportedMessageType { .. } => "gtpu_control_unsupported_message_type",
             Self::TrailingBytes => "gtpu_control_trailing_bytes",
             Self::InvalidHeaderFlags => "gtpu_control_invalid_header_flags",
             Self::InvalidHeaderTeid => "gtpu_control_invalid_header_teid",
@@ -938,7 +953,7 @@ impl ValidatedControlFrame {
                 | GTPU_MESSAGE_END_MARKER
         ) {
             return Err(GtpuControlCodecError::new(
-                GtpuControlCodecErrorCode::UnsupportedMessageType,
+                GtpuControlCodecErrorCode::UnsupportedMessageType { message_type },
                 1,
             ));
         }
@@ -978,6 +993,41 @@ impl GtpuControlMessage {
             .map_err(|error| framing(error.code().clone(), error.offset()))?;
         let control = Self::from_message(&message, ctx)?;
         Ok((tail, control))
+    }
+
+    /// TS 29.281 message type carried by this control message.
+    ///
+    /// Lets a transport label and route a datagram without re-parsing the
+    /// header it already decoded.
+    #[must_use]
+    pub const fn message_type(&self) -> u8 {
+        match self {
+            Self::EchoRequest(_) => GTPU_MESSAGE_ECHO_REQUEST,
+            Self::EchoResponse(_) => GTPU_MESSAGE_ECHO_RESPONSE,
+            Self::ErrorIndication(_) => GTPU_MESSAGE_ERROR_INDICATION,
+            Self::SupportedExtensionHeadersNotification(_) => {
+                GTPU_MESSAGE_SUPPORTED_EXTENSION_HEADERS_NOTIFICATION
+            }
+            Self::EndMarker(_) => GTPU_MESSAGE_END_MARKER,
+        }
+    }
+
+    /// Sequence number carried in the header, when the message defines one.
+    ///
+    /// `None` for messages whose sequence is receiver-ignored rather than
+    /// meaningful, so a caller cannot accidentally correlate on a field
+    /// TS 29.281 does not give that meaning. Echo Request/Response carry a
+    /// correlating sequence; Error Indication encodes zero and End Marker and
+    /// the notification do not correlate.
+    #[must_use]
+    pub const fn sequence_number(&self) -> Option<u16> {
+        match self {
+            Self::EchoRequest(request) => Some(request.sequence_number()),
+            Self::EchoResponse(response) => Some(response.sequence_number()),
+            Self::ErrorIndication(_)
+            | Self::SupportedExtensionHeadersNotification(_)
+            | Self::EndMarker(_) => None,
+        }
     }
 
     /// Decode exactly one complete GTP-U control datagram.
@@ -1117,8 +1167,10 @@ impl GtpuControlMessage {
                     extensions,
                 }))
             }
-            _ => Err(GtpuControlCodecError::new(
-                GtpuControlCodecErrorCode::UnsupportedMessageType,
+            other => Err(GtpuControlCodecError::new(
+                GtpuControlCodecErrorCode::UnsupportedMessageType {
+                    message_type: other,
+                },
                 1,
             )),
         }

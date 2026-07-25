@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Generic GTP-U frame `Debug` no longer prints the TEID or the payload —
+  `opc-proto-gtpu`:** `GtpuHeader`, `GtpuMessage` and `OwnedGtpuMessage` derived
+  `Debug` over `pub teid: u32` and over the payload slice, so `{:?}` on a
+  decoded G-PDU rendered the tunnel identifier and the user-plane bytes in the
+  clear. The typed control models already redacted; the generic frame types were
+  the inconsistency. `Debug` now reports the TEID as `<redacted>` and the
+  extension/payload slices as lengths, keeping every structural field.
+  `GtpuExtensionHeader` is redacted the same way, because the public
+  `extensions()` iterator hands out that item type and would otherwise print the
+  chain bytes the container had just reduced to a length. Field access is
+  unchanged.
+- **`UnsupportedMessageType` carries the message type — `opc-proto-gtpu`
+  (breaking):** the variant was a unit, so a transport rejecting a frame could
+  not tell a G-PDU from an unmodelled control type without decoding the header a
+  second time -- the very parse `GTPU_MESSAGE_G_PDU` exists to avoid. Type
+  identifiers are protocol metadata under this enum's own contract.
+
+### Added
+- **Control-message affordances for a transport boundary — `opc-proto-gtpu`:**
+  `GtpuControlMessage::message_type()` lets a transport label and route a
+  datagram from the typed value it already holds, and `GTPU_MESSAGE_G_PDU` names
+  the user-plane type so a receive queue can be demultiplexed without a second
+  header parse. `GtpuControlMessage::sequence_number()` returns `Some` only for
+  Echo Request/Response, where TS 29.281 gives the field correlating meaning; it
+  is `None` for Error Indication, End Marker and the Supported Extension Headers
+  Notification. Error Indication and the notification carry a sequence the
+  receiver is told to ignore, so exposing it would invite incorrect
+  correlation; End Marker is a different case -- TS 29.281 clause 5.1 requires
+  its `S` flag to be `0`, so it carries no *meaningful* sequence, and this codec
+  rejects an End Marker whose `S` flag is set with `InvalidHeaderFlags`. The
+  sequence octets themselves are still present on the wire whenever the `E` flag
+  is set, and such a datagram decodes normally.
+
 ### Changed
 - **Credential-rotation observability closes three residual gaps —
   `opc-tls`, `opc-session-net` (breaking to the reason enum):** an audit of #158
