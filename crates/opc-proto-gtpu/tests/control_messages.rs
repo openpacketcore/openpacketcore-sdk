@@ -1338,7 +1338,11 @@ fn duplicate_udp_extension_and_wrong_procedure_ie_fail_closed() {
         GtpuControlMessage::decode(&gpdu, DecodeContext::default())
             .expect_err("malformed G-PDU payload must not be parsed as control IEs")
             .code(),
-        &GtpuControlCodecErrorCode::UnsupportedMessageType
+        // The type comes back with the refusal, so a transport can route this
+        // frame to the user plane without decoding the header a second time.
+        &GtpuControlCodecErrorCode::UnsupportedMessageType {
+            message_type: GTPU_MESSAGE_G_PDU
+        }
     );
 }
 

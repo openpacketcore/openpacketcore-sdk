@@ -849,3 +849,39 @@ fn generic_frame_debug_leaks_neither_teid_nor_payload() {
         "Debug must report a length"
     );
 }
+
+/// The container reduces the extension chain to a length, so the item type the
+/// public iterator hands out must hold the same line -- otherwise the idiomatic
+/// `for ext in msg.extensions() { debug!(?ext) }` logs the very bytes the
+/// container just redacted.
+#[test]
+fn extension_header_debug_reports_a_length_not_the_content() {
+    // One extension: type 0x41, one 4-octet unit, recognisable content.
+    let mut frame = Vec::new();
+    frame.push(0x34); // version 1, PT=1, E flag set
+    frame.push(0xff); // G-PDU
+    frame.extend_from_slice(&8_u16.to_be_bytes());
+    frame.extend_from_slice(&0x0000_0001_u32.to_be_bytes());
+    frame.extend_from_slice(&[0x00, 0x00]); // sequence (unused)
+    frame.push(0x00); // N-PDU (unused)
+    frame.push(0x41); // next extension type
+    frame.extend_from_slice(&[0x01, 0xb7, 0xb8, 0x00]); // len=1, content, end
+
+    let (_, message) = GtpuMessage::decode(&frame, DecodeContext::default())
+        .expect("a G-PDU with one extension decodes");
+
+    let mut seen = 0;
+    for extension in message.extensions() {
+        let extension = extension.expect("extension decodes");
+        let rendered = format!("{extension:?}");
+        assert!(
+            !rendered.contains("183") && !rendered.contains("184"),
+            "extension Debug leaked its content: {rendered}"
+        );
+        assert!(rendered.contains("content_len"), "must report a length");
+        // Type identifiers are protocol metadata and stay visible.
+        assert!(rendered.contains("ext_type"));
+        seen += 1;
+    }
+    assert_eq!(seen, 1, "the fixture must actually yield an extension");
+}

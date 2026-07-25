@@ -14,8 +14,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   decoded G-PDU rendered the tunnel identifier and the user-plane bytes in the
   clear. The typed control models already redacted; the generic frame types were
   the inconsistency. `Debug` now reports the TEID as `<redacted>` and the
-  extension/payload slices as lengths, keeping every structural field. Field
-  access is unchanged.
+  extension/payload slices as lengths, keeping every structural field.
+  `GtpuExtensionHeader` is redacted the same way, because the public
+  `extensions()` iterator hands out that item type and would otherwise print the
+  chain bytes the container had just reduced to a length. Field access is
+  unchanged.
+- **`UnsupportedMessageType` carries the message type — `opc-proto-gtpu`
+  (breaking):** the variant was a unit, so a transport rejecting a frame could
+  not tell a G-PDU from an unmodelled control type without decoding the header a
+  second time -- the very parse `GTPU_MESSAGE_G_PDU` exists to avoid. Type
+  identifiers are protocol metadata under this enum's own contract.
 
 ### Added
 - **Control-message affordances for a transport boundary — `opc-proto-gtpu`:**
@@ -25,7 +33,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   header parse. `GtpuControlMessage::sequence_number()` returns `Some` only for
   Echo Request/Response, where TS 29.281 gives the field correlating meaning; it
   is `None` for Error Indication, End Marker and the Supported Extension Headers
-  Notification so a caller cannot correlate on a receiver-ignored field.
+  Notification. Error Indication and the notification carry a sequence the
+  receiver is told to ignore, so exposing it would invite incorrect
+  correlation; End Marker is a different case -- it carries no sequence at all,
+  and this codec rejects one with `InvalidHeaderFlags`.
 
 ### Changed
 - **Credential-rotation observability closes three residual gaps —

@@ -281,6 +281,24 @@ pub struct OwnedGtpuMessage {
     pub payload: Bytes,
 }
 
+impl fmt::Debug for GtpuExtensionHeader<'_> {
+    /// Type identifiers are protocol metadata and are reported; the content is
+    /// a length only. `GtpuMessage`'s own `Debug` reduces the chain to a
+    /// length, and the public iterator that hands out these items has to hold
+    /// the same line -- otherwise the idiomatic
+    /// `for ext in msg.extensions() { debug!(?ext) }` logs PDU Session
+    /// Container QFI/PPI/RQI, PDCP PDU numbers, and any peer-supplied unknown
+    /// extension retained under `UnknownIePolicy::Preserve`.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GtpuExtensionHeader")
+            .field("ext_type", &self.ext_type)
+            .field("content_len", &self.content.len())
+            .field("next_ext_type", &self.next_ext_type)
+            .finish()
+    }
+}
+
 impl fmt::Debug for GtpuHeader {
     /// Structural fields only. The TEID identifies one subscriber's tunnel, so
     /// it is redacted here exactly as the typed control models redact it; the
@@ -404,7 +422,7 @@ fn first_unsupported_required_extension<'a>(
 /// @spec 3GPP TS29281 R18 5.2.1
 /// @req REQ-3GPP-TS29281-R18-5.2.1-003
 /// @conformance full
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct GtpuExtensionHeader<'a> {
     /// Extension header type identifier.
     pub ext_type: u8,

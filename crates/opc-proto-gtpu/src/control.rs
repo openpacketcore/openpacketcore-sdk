@@ -73,7 +73,15 @@ pub enum GtpuControlCodecErrorCode {
         code: DecodeErrorCode,
     },
     /// The message type is not one of the typed control procedures.
-    UnsupportedMessageType,
+    ///
+    /// Carries the type so a transport can route the frame -- a G-PDU to the
+    /// user plane, an unmodelled control type to its own handling -- without
+    /// decoding the header a second time. Type identifiers are protocol
+    /// metadata, as this enum's contract already states.
+    UnsupportedMessageType {
+        /// TS 29.281 message type that is not a typed control procedure.
+        message_type: u8,
+    },
     /// Bytes followed the one declared GTP-U datagram boundary.
     TrailingBytes,
     /// Header flags violate the selected control procedure.
@@ -159,7 +167,7 @@ impl GtpuControlCodecErrorCode {
     pub const fn as_str(&self) -> &'static str {
         match self {
             Self::Framing { .. } => "gtpu_control_framing",
-            Self::UnsupportedMessageType => "gtpu_control_unsupported_message_type",
+            Self::UnsupportedMessageType { .. } => "gtpu_control_unsupported_message_type",
             Self::TrailingBytes => "gtpu_control_trailing_bytes",
             Self::InvalidHeaderFlags => "gtpu_control_invalid_header_flags",
             Self::InvalidHeaderTeid => "gtpu_control_invalid_header_teid",
@@ -945,7 +953,7 @@ impl ValidatedControlFrame {
                 | GTPU_MESSAGE_END_MARKER
         ) {
             return Err(GtpuControlCodecError::new(
-                GtpuControlCodecErrorCode::UnsupportedMessageType,
+                GtpuControlCodecErrorCode::UnsupportedMessageType { message_type },
                 1,
             ));
         }
@@ -1159,8 +1167,10 @@ impl GtpuControlMessage {
                     extensions,
                 }))
             }
-            _ => Err(GtpuControlCodecError::new(
-                GtpuControlCodecErrorCode::UnsupportedMessageType,
+            other => Err(GtpuControlCodecError::new(
+                GtpuControlCodecErrorCode::UnsupportedMessageType {
+                    message_type: other,
+                },
                 1,
             )),
         }
