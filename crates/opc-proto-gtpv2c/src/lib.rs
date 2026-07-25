@@ -27,7 +27,10 @@
 //! cause, procedure-specific NAT ports, and location/timestamp projection.
 //! [`PcoRequest`] can independently encode the empty TS 24.008 container
 //! `0x0012` for P-CSCF reselection support into either opaque PCO transport,
-//! without inferring support from P-CSCF address-family requests.
+//! without inferring support from P-CSCF address-family requests. It also
+//! emits an IPCP (`0x8021`) Configure-Request for the RFC 1877 DNS options,
+//! ahead of the containers as TS 24.008 10.5.6.3 positions it, and
+//! [`PcoAddressConfiguration`] reads the peer's Configure-Nak answer.
 //! Product code remains responsible for deciding when optional policy-owned
 //! values apply and for obtaining them from AAA/HSS or local configuration.
 //! S2b Modify Bearer uses the UE-initiated IPsec tunnel-update profile:
@@ -119,9 +122,10 @@ pub use ie::{
 };
 pub use message::{Message, OwnedMessage};
 pub use pco::{
-    PcoAddressConfiguration, PcoDecodeError, PcoRequest, PCO_CONTAINER_DNS_SERVER_IPV4,
-    PCO_CONTAINER_DNS_SERVER_IPV6, PCO_CONTAINER_P_CSCF_IPV4, PCO_CONTAINER_P_CSCF_IPV6,
-    PCO_CONTAINER_P_CSCF_RESELECTION_SUPPORT, PCO_HEADER_PPP_FOR_IP_PDN, PCO_MAX_CONTAINERS,
+    IpcpDnsRequest, PcoAddressConfiguration, PcoDecodeError, PcoRequest,
+    PCO_CONTAINER_DNS_SERVER_IPV4, PCO_CONTAINER_DNS_SERVER_IPV6, PCO_CONTAINER_P_CSCF_IPV4,
+    PCO_CONTAINER_P_CSCF_IPV6, PCO_CONTAINER_P_CSCF_RESELECTION_SUPPORT, PCO_HEADER_PPP_FOR_IP_PDN,
+    PCO_MAX_CONTAINERS, PCO_PROTOCOL_IPCP,
 };
 #[allow(deprecated)]
 pub use s2b::{

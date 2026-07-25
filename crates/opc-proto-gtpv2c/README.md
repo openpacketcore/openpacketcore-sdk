@@ -94,12 +94,20 @@ control-plane stack.
   zero GBR/MBR fields. Operator-specific QCIs require an explicit
   caller-provided GBR/non-GBR classification.
 - `PcoRequest` and `PcoAddressConfiguration` provide a bounded TS 24.008 inner
-  codec for IPv4/IPv6 DNS and P-CSCF containers while the outer PCO/APCO IE
-  transport remains opaque and byte-preserving.
+  codec for IPv4/IPv6 DNS and P-CSCF containers and for the IPCP (`0x8021`)
+  configuration protocol, while the outer PCO/APCO IE transport remains opaque
+  and byte-preserving.
   `PcoRequest::p_cscf_reselection_support` independently emits the exact empty
   request container `0x0012`; neither P-CSCF address-family flag implies the
   capability. Selected containers are encoded once in ascending identifier
   order, and `PcoRequest::none()` remains byte-empty.
+- `PcoRequest::ipcp_dns` emits an RFC 1332 IPCP Configure-Request carrying the
+  RFC 1877 Primary (129) and Secondary (131) DNS Server Address options, which
+  TS 24.008 10.5.6.3 places in the configuration protocol options list ahead of
+  every container. The decoder reads the peer's Configure-Nak answer into
+  `ipcp_primary_dns`/`ipcp_secondary_dns`. A peer may serve DNS by either
+  mechanism, so prefer `PcoAddressConfiguration::dns_server_ipv4_all`, which
+  merges both sources and drops duplicates.
 - Public profile constructors build profile-valid owned messages:
   `s2b_echo_request`, `s2b_echo_response`,
   `s2b_create_session_request`,
