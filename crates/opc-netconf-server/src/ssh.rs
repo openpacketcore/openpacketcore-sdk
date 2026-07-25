@@ -20,7 +20,7 @@ use opc_runtime::ShutdownToken;
 use opc_types::TenantId;
 use russh::keys::{self, Certificate, PrivateKey, PublicKey};
 use russh::server::{self, Auth, Msg, Session};
-use russh::{Channel, ChannelId, Disconnect, MethodKind, MethodSet, SshId};
+use russh::{Channel, ChannelId, ChannelOpenFailure, Disconnect, MethodKind, MethodSet, SshId};
 use thiserror::Error;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, TryAcquireError};
@@ -867,6 +867,20 @@ fn record_worker_result(
     }
 }
 
+/// Whether an SSH session channel may be opened.
+///
+/// A NETCONF-over-SSH connection carries exactly one session channel, opened
+/// after public-key authentication and before the NETCONF subsystem starts.
+/// Every other combination is refused, so a peer cannot open a second channel
+/// alongside a live session or race one in ahead of authentication.
+const fn admits_session_channel(
+    authenticated: bool,
+    subsystem_started: bool,
+    open_channels: usize,
+) -> bool {
+    authenticated && !subsystem_started && open_channels == 0
+}
+
 #[derive(Debug)]
 struct SshAuthPolicy {
     tenant: TenantId,
@@ -956,19 +970,29 @@ where
         Ok(reject_publickey())
     }
 
+    // russh 0.62 replaced the accepted/rejected boolean with an explicit
+    // reply handle. The admission rule itself is unchanged and lives in
+    // `admits_session_channel`, which is where it can be tested: the handle
+    // cannot be constructed outside russh, so this method cannot.
     async fn channel_open_session(
         &mut self,
         channel: Channel<Msg>,
+        reply: server::ChannelOpenHandle,
         _session: &mut Session,
-    ) -> Result<bool, Self::Error> {
-        if self.principal.is_none()
-            || self.outcome.started.load(Ordering::Relaxed)
-            || !self.channels.is_empty()
-        {
-            return Ok(false);
+    ) -> Result<(), Self::Error> {
+        if !admits_session_channel(
+            self.principal.is_some(),
+            self.outcome.started.load(Ordering::Relaxed),
+            self.channels.len(),
+        ) {
+            reply
+                .reject(ChannelOpenFailure::AdministrativelyProhibited)
+                .await;
+            return Ok(());
         }
         self.channels.insert(channel.id(), channel);
-        Ok(true)
+        reply.accept().await;
+        Ok(())
     }
 
     async fn subsystem_request(
@@ -1064,6 +1088,28 @@ mod tests {
         let path = dir.join("authorized_keys");
         fs::write(&path, contents).expect("write authorized keys");
         path
+    }
+
+    #[test]
+    fn session_channel_admission_requires_auth_and_exclusivity() {
+        // The one accepted combination: authenticated, subsystem not yet
+        // started, no channel already open.
+        assert!(admits_session_channel(true, false, 0));
+
+        // Unauthenticated peers are refused however clean the rest looks.
+        assert!(!admits_session_channel(false, false, 0));
+        assert!(!admits_session_channel(false, true, 0));
+        assert!(!admits_session_channel(false, false, 1));
+
+        // A second channel is refused, which is what keeps a NETCONF
+        // connection to a single session.
+        assert!(!admits_session_channel(true, false, 1));
+        assert!(!admits_session_channel(true, false, 7));
+
+        // Once the subsystem is running no further channel is admitted, so a
+        // late request cannot displace or shadow the live session.
+        assert!(!admits_session_channel(true, true, 0));
+        assert!(!admits_session_channel(true, true, 1));
     }
 
     #[test]
