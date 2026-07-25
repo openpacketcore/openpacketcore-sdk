@@ -610,8 +610,9 @@ Because of that, an API that names one object and then mutates or deletes it
 accepts only the **exact profile**: `None`, or a full-mask mark. Distinct
 full-mask marks have disjoint lookup domains, so they cannot alias each other.
 Anything narrower is rejected before a request is issued, by
-`XfrmStagedObjectInstall::run`, `install_sa_policy_with_rollback`, and
-`relocate_sa`. Read-only paths that verify identity by readback --
+`XfrmStagedInstall::run` (and therefore `run_and_commit_outbound_sa_policy`),
+`XfrmStagedObjectInstall::run`, `install_sa_policy_with_rollback`,
+`validate_outbound_request`, and `relocate_sa`. Read-only paths that verify identity by readback --
 `query_sa` and ESP-peer-observation registration -- keep accepting any
 canonical mark, because there a lookup that selected some other overlapping
 state surfaces as a mismatch instead of a silent wrong answer.
@@ -765,11 +766,17 @@ silently ignoring it. `egress_dscp: None` does not require this configuration.
 When `output_mark` is also `None`, the backend emits the exact pre-feature XFRM
 netlink payload.
 
-An SA or policy's optional input/lookup `XfrmMark` is a separate identity
-component from the companion's reserved output-mark window. Use the same mark
-on `SaParameters`, `PolicyParameters`, `QuerySaRequest`, `RemoveSaRequest`, and
-`RemovePolicyRequest`; the Linux and mock backends keep marked and unmarked SA
-identities distinct and Linux applies the mark to exact policy deletion. The
+An SA or policy's optional lookup `XfrmLookupMark` is a separate identity
+component from the companion's reserved output-mark window, and a different
+type from it. Use the same mark on `SaParameters`, `PolicyParameters`,
+`QuerySaRequest`, `RemoveSaRequest`, and `RemovePolicyRequest`.
+
+Marked and unmarked SA identities are **not** unconditionally distinct, and a
+mark does not by itself make a deletion exact: an unmarked object stores
+`{ 0, 0 }`, which the kernel predicate matches for every lookup value. See
+[Lookup marks and what "exact" can mean](#lookup-marks-and-what-exact-can-mean)
+before relying on a mark to separate two objects on one
+destination/protocol/SPI. The
 request constructors target unmarked kernel objects, while `with_mark` selects
 a marked object. Installs carrying any output mark are not reported successful
 until an exact GETSA readback succeeds. If readback fails or any stable returned

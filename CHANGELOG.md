@@ -113,8 +113,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `with_mark` builders take the new type; every `output_mark` is untouched. The
   Linux parse boundaries fail closed on a kernel-reported pair that could never
   be selected again rather than adopting it as an exact identity. Operations
-  that mutate or delete an object they select by mark — staged-object recovery,
-  composite rollback, and relocation — now require the exact profile (`None` or
+  that mutate or delete an object they select by mark — staged composite and
+  staged-object installs and their recovery, composite rollback, outbound
+  binding validation, and relocation — now require the exact profile (`None` or
   a full mask) and are refused before any request is issued, because distinct
   canonical marks of different widths can alias on one
   destination/protocol/SPI. Read-only paths that prove identity by readback
