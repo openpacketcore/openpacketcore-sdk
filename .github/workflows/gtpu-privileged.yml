@@ -523,6 +523,24 @@ jobs:
           )"
           echo "guest systemd family: ${systemd_pkgs}"
           test -n "${systemd_pkgs}"
+          # Pull before running. An unauthenticated Docker Hub pull times out or
+          # rate-limits often enough on hosted runners that a single attempt
+          # makes this gate flaky, and a flaky gate is worse than no gate: it
+          # trains people to re-run rather than read the failure. Retry the pull
+          # only -- never the RPM resolution below, whose failures are real.
+          pulled=""
+          for attempt in 1 2 3 4 5; do
+            if docker pull --quiet rockylinux/rockylinux:9; then
+              pulled=yes
+              break
+            fi
+            echo "registry pull attempt ${attempt} failed; retrying"
+            sleep $((attempt * 10))
+          done
+          if [ -z "${pulled}" ]; then
+            echo "::error::could not pull the el9 staging image after 5 attempts"
+            exit 1
+          fi
           docker run --rm -e SYSTEMD_PKGS="${systemd_pkgs}" \
             -v "${rpm_dir}:/out" rockylinux/rockylinux:9 bash -euo pipefail -c '
             sed -i -e "s|^mirrorlist=|#mirrorlist=|" \
