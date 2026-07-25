@@ -1296,12 +1296,16 @@ async fn status_reports_expiry_without_being_poked() {
     let mut status_rx = controller.subscribe_status();
     let expired = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
-            if status_rx.changed().await.is_err() {
-                return None;
-            }
+            // Check the CURRENT value before awaiting a change. On a loaded
+            // runner the material can expire between the assertion above and
+            // this subscription, in which case the republish already happened
+            // and `changed()` would wait for a second one that never comes.
             let status = *status_rx.borrow_and_update();
             if status.reason() == Some(TlsMaterialReloadReason::LastGoodExpired) {
                 return Some(status);
+            }
+            if status_rx.changed().await.is_err() {
+                return None;
             }
         }
     })

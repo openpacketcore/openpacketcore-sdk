@@ -942,7 +942,13 @@ fn next_expiry_sleep(expires_at: Timestamp) -> Option<Duration> {
     if remaining <= time::Duration::ZERO {
         return None;
     }
-    let remaining = Duration::from_secs(u64::try_from(remaining.whole_seconds()).ok()?);
+    // Sub-second precision matters: truncating to whole seconds makes every
+    // wake in the final second land early with nothing changed, which burns the
+    // unproductive-wake budget precisely at the deadline the timer exists to
+    // catch. Sleep the real remaining time so one wake lands on expiry.
+    let seconds = u64::try_from(remaining.whole_seconds()).ok()?;
+    let nanos = u32::try_from(remaining.subsec_nanoseconds().max(0)).ok()?;
+    let remaining = Duration::new(seconds, nanos);
     Some(remaining.min(MAX_EXPIRY_RECHECK).max(MIN_EXPIRY_RECHECK))
 }
 
