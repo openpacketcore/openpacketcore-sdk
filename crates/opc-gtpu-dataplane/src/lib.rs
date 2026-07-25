@@ -52,7 +52,7 @@ pub use ebpf::{
     EbpfGtpuDatapathCounters, EbpfGtpuDatapathSnapshot, EbpfGtpuDataplaneBackend,
     EbpfGtpuDataplaneBackendConfig, DEFAULT_BPFFS_PIN_ROOT, DEFAULT_TC_PRIORITY,
 };
-pub use error::GtpuError;
+pub use error::{GtpuError, ProgramLoadRefusal};
 pub use icmp::{build_icmpv4_packet_too_big, build_icmpv6_packet_too_big};
 pub use linux::{LinuxGtpuDataplaneBackend, LinuxGtpuDataplaneBackendConfig};
 pub use mock::{
