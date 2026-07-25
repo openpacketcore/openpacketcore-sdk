@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **SWm authorization-update identities zeroize on drop — `opc-proto-diameter`
+  (breaking):** `SwmReAuthRequest`, `SwmReAuthAnswer`, `SwmAuthorizationRequest`
+  and `SwmAuthorizationAnswer` held `Session-Id` and permanent `User-Name` as
+  `Redacted<String>`, which hides diagnostics but has no zeroize-on-drop
+  contract, so a downstream ePDG retaining RAR authority through RAA and the
+  follow-up AAR/AAA correlation kept ordinary heap copies for the whole
+  procedure even when its own copies were zeroizing. Those eight fields are now
+  `Sensitive<String>`, and the retained request/answer envelopes, correlated
+  exchanges and `SwmCompletedAuthorizationUpdate` carry `ZeroizeOnDrop`, so each
+  independent clone erases them. Origin/destination identities and Route-Record
+  deliberately stay `Redacted<String>` -- they are DiameterIdentity routing
+  values, and Origin-Host is additionally consumed as a correlation authority.
+  `SwmAcceptedAuthorizationUpdate` and `SwmPendingAuthorizationUpdate` do not
+  claim the marker: each retains an exact committed message for byte-identical
+  replay whose wire bytes still hold the identity in the clear, and a test pins
+  that fact so the marker is not later added for symmetry. Wire encoding,
+  bounded parsing and correlation are unchanged; direct struct construction of
+  the four models now needs `Sensitive<String>`, which accepts string literals
+  and owned strings through `.into()`.
+
 ### Added
 - **The asserted `AT_IDENTITY` value is retained and exposed — `opc-proto-eap`:**
   the parser recorded only that the attribute was present, dropping the one

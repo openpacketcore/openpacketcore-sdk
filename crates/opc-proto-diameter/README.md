@@ -889,9 +889,15 @@ Typed helpers distinguish diagnostic redaction from sensitive ownership.
 `avp::dictionary::Redacted<T>` hides `Debug` and `Display` only;
 `avp::dictionary::Sensitive<T>` additionally keeps its owned value in
 zeroizing storage. Each `Sensitive` clone owns independently zeroizing storage.
-STR/STA `Session-Id` and permanent `User-Name` fields use `Sensitive<String>`;
-direct struct construction accepts string literals or owned strings through
-`.into()`. `Sensitive::from_zeroizing` adopts an existing `Zeroizing` owner
+STR/STA and the SWm authorization-update models -- `SwmReAuthRequest`,
+`SwmReAuthAnswer`, `SwmAuthorizationRequest`, `SwmAuthorizationAnswer` -- hold
+`Session-Id` and permanent `User-Name` as `Sensitive<String>`; direct struct
+construction accepts string literals or owned strings through `.into()`.
+Origin/destination identities and Route-Record stay `Redacted<String>`: they
+are DiameterIdentity routing values, and one of them is additionally consumed
+as a correlation authority. The two authorities that retain an exact committed
+message for replay do not claim `ZeroizeOnDrop`, because those retained wire
+bytes still hold the identity in the clear. `Sensitive::from_zeroizing` adopts an existing `Zeroizing` owner
 without copying, and consumers that move a value into longer-lived state can
 call `Sensitive::into_zeroizing` to retain the erasure contract.
 

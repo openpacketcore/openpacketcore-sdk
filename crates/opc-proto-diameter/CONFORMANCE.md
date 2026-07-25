@@ -1557,10 +1557,20 @@ Covered redacted fields:
   Proxy-Info, Error-Message/Error-Reporting-Host, and all additional AVP values.
   Correlation errors expose stable codes rather than either side's values.
 - `SwmReAuthRequest` / `SwmReAuthAnswer` and `SwmAuthorizationRequest` /
-  `SwmAuthorizationAnswer`: session, user, origin/destination, routing, proxy,
-  address, APN, and extension values are redacted. Authorization-Lifetime,
-  Auth-Grace-Period, and Session-Timeout remain available through typed fields,
-  while diagnostics disclose only whether each value is present.
+  `SwmAuthorizationAnswer`: Session-Id and User-Name are both redacted and
+  zeroizing; origin/destination identities, routing, proxy, address, APN, and
+  extension values are redacted. Authorization-Lifetime, Auth-Grace-Period, and
+  Session-Timeout remain available through typed fields, while diagnostics
+  disclose only whether each value is present. The retained authorities for the
+  peer-initiated reauthorization procedure -- the request/answer envelopes, the
+  correlated exchanges, and `SwmCompletedAuthorizationUpdate` -- carry
+  `ZeroizeOnDrop`, so each independent clone erases those two values.
+- `SwmAcceptedAuthorizationUpdate` / `SwmPendingAuthorizationUpdate`: every
+  typed identity they reach is zeroizing, but they deliberately do **not**
+  carry `ZeroizeOnDrop`. Each retains an exact committed message for
+  byte-identical replay, and those retained wire bytes hold the same Session-Id
+  and User-Name as plaintext the type cannot erase. The marker is withheld
+  rather than over-claimed; erasing committed wire caches is out of scope here.
 
 Raw AVP bytes are **not** redacted: the raw layer is intentionally a
 byte-preserving forwarding surface, and redaction is a typed-layer policy.
