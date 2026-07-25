@@ -1,6 +1,6 @@
 //! Deterministic mock XFRM backend for tests and offline development.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -10,11 +10,11 @@ use crate::error::XfrmError;
 use crate::model::{
     validate_relocate_sa_request, validate_sa_output_mark, validate_sa_query, AllocateSpiRequest,
     InstallPolicyRequest, InstallSaRequest, IpAddress, LifetimeConfig, LifetimeCurrent,
-    QuerySaRequest, RekeyPolicyRequest, RekeySaRequest, RelocateSaRequest, RemovePolicyRequest,
-    RemoveSaRequest, SaRelocationDirection, SaRelocationEncap, SaRelocationIdentity,
-    SaRelocationSelector, SaReplayState, SaState, SaStatistics, SpiAllocation, XfrmAction,
-    XfrmCapability, XfrmDirection, XfrmId, XfrmMark, XfrmMode, XfrmProbe, XfrmSelector,
-    XfrmTemplate,
+    PolicyParameters, QuerySaRequest, RekeyPolicyRequest, RekeySaRequest, RelocateSaRequest,
+    RemovePolicyRequest, RemoveSaRequest, SaRelocationDirection, SaRelocationEncap,
+    SaRelocationIdentity, SaRelocationSelector, SaReplayState, SaState, SaStatistics,
+    SpiAllocation, XfrmAction, XfrmCapability, XfrmDirection, XfrmId, XfrmMark, XfrmMode,
+    XfrmProbe, XfrmSelector, XfrmTemplate,
 };
 
 /// One recorded call against the mock backend.
@@ -201,6 +201,13 @@ pub struct MockXfrmBackend {
 type AllocatedSpiKey = (IpAddress, u8, u32);
 type SaKey = (IpAddress, u8, u32, Option<XfrmMark>);
 
+/// Linux policy lookup identity.
+///
+/// `if_id` belongs here even though it is absent from [`SaKey`]: Linux selects
+/// policies with `xfrm_policy_bysel_ctx`, which compares the interface, while
+/// SA lookup does not treat it as a uniqueness discriminator.
+type PolicyKey = (XfrmSelector, XfrmDirection, Option<XfrmMark>, Option<u32>);
+
 #[derive(Debug, Clone)]
 struct MockSaRecord {
     state: SaState,
@@ -213,6 +220,7 @@ struct MockState {
     relocations: Vec<MockSaRelocation>,
     allocated_spis: BTreeSet<AllocatedSpiKey>,
     sas: BTreeMap<SaKey, MockSaRecord>,
+    policies: HashMap<PolicyKey, PolicyParameters>,
     probe_result: XfrmProbe,
     failure: Option<XfrmError>,
 }
@@ -231,6 +239,7 @@ impl MockXfrmBackend {
                 relocations: Vec::new(),
                 allocated_spis: BTreeSet::new(),
                 sas: BTreeMap::new(),
+                policies: HashMap::new(),
                 probe_result,
                 failure: None,
             })),
@@ -298,6 +307,15 @@ impl MockXfrmBackend {
         }
         Ok(())
     }
+}
+
+fn policy_key(parameters: &PolicyParameters) -> PolicyKey {
+    (
+        parameters.selector.clone(),
+        parameters.direction,
+        parameters.mark,
+        parameters.if_id,
+    )
 }
 
 fn sa_key(id: XfrmId, mark: Option<XfrmMark>) -> SaKey {
@@ -454,10 +472,16 @@ impl XfrmBackend for MockXfrmBackend {
             replay_window: request.parameters.replay_window,
             replay_state_present: request.parameters.replay_state.is_some(),
         });
-        state.sas.insert(
-            sa_key(request.parameters.id, request.parameters.mark),
-            sa_record_from_parameters(&request.parameters),
-        );
+        // NLM_F_CREATE | NLM_F_EXCL: a collision leaves the pre-existing SA
+        // untouched and reports EEXIST, so the attempt is recorded above but
+        // no state changes here.
+        let key = sa_key(request.parameters.id, request.parameters.mark);
+        if state.sas.contains_key(&key) {
+            return Err(XfrmError::AlreadyExists);
+        }
+        state
+            .sas
+            .insert(key, sa_record_from_parameters(&request.parameters));
         Ok(())
     }
 
@@ -578,10 +602,16 @@ impl XfrmBackend for MockXfrmBackend {
             replay_window: request.parameters.replay_window,
             replay_state_present: request.parameters.replay_state.is_some(),
         });
-        state.sas.insert(
-            sa_key(request.parameters.id, request.parameters.mark),
-            sa_record_from_parameters(&request.parameters),
-        );
+        // XFRM_MSG_UPDSA carries NLM_F_REPLACE without NLM_F_CREATE, so
+        // xfrm_state_update returns -ESRCH when the lookup misses rather than
+        // creating the SA.
+        let key = sa_key(request.parameters.id, request.parameters.mark);
+        if !state.sas.contains_key(&key) {
+            return Err(XfrmError::NotFound);
+        }
+        state
+            .sas
+            .insert(key, sa_record_from_parameters(&request.parameters));
         Ok(())
     }
 
@@ -667,6 +697,13 @@ impl XfrmBackend for MockXfrmBackend {
             priority: request.parameters.priority,
             templates: request.parameters.templates.clone(),
         });
+        // NLM_F_CREATE | NLM_F_EXCL, as for SAs: a duplicate lookup identity
+        // is refused and the installed policy is left exactly as it was.
+        let key = policy_key(&request.parameters);
+        if state.policies.contains_key(&key) {
+            return Err(XfrmError::AlreadyExists);
+        }
+        state.policies.insert(key, request.parameters);
         Ok(())
     }
 
@@ -683,6 +720,11 @@ impl XfrmBackend for MockXfrmBackend {
             priority: request.parameters.priority,
             templates: request.parameters.templates.clone(),
         });
+        // XFRM_MSG_UPDPOLICY replaces in place. Missing-policy rekey parity is
+        // tracked separately; this keeps the stored policy in step so a later
+        // install still sees the identity as occupied.
+        let key = policy_key(&request.parameters);
+        state.policies.insert(key, request.parameters);
         Ok(())
     }
 
@@ -697,6 +739,13 @@ impl XfrmBackend for MockXfrmBackend {
             direction: request.direction,
             mark: request.mark,
         });
+        // RemovePolicyRequest carries no `if_id`, so this addresses only the
+        // unscoped identity, exactly as a DELPOLICY without XFRMA_IF_ID does.
+        // An interface-scoped policy therefore survives, which is the kernel's
+        // behaviour and not an omission here.
+        state
+            .policies
+            .remove(&(request.selector, request.direction, request.mark, None));
         Ok(())
     }
 
@@ -1016,6 +1065,14 @@ mod tests {
     async fn mock_rekey_sa_records_operation() {
         let backend = MockXfrmBackend::new();
         let params = sample_sa_parameters();
+        // UPDSA is update-only, so the SA has to exist first. This previously
+        // rekeyed an empty backend and passed, which is the defect in #417.
+        backend
+            .install_sa(InstallSaRequest {
+                parameters: params.clone(),
+            })
+            .await
+            .unwrap();
         backend
             .rekey_sa(RekeySaRequest {
                 parameters: params.clone(),
@@ -1024,8 +1081,192 @@ mod tests {
             .unwrap();
 
         let ops = backend.operations();
-        assert_eq!(ops.len(), 1);
-        assert_eq!(ops[0], expected_rekey_sa(&params));
+        assert_eq!(ops.len(), 2);
+        assert_eq!(ops[1], expected_rekey_sa(&params));
+    }
+
+    #[tokio::test]
+    async fn mock_install_sa_preserves_the_colliding_original() {
+        let backend = MockXfrmBackend::new();
+        let params = sample_sa_parameters();
+        backend
+            .install_sa(InstallSaRequest {
+                parameters: params.clone(),
+            })
+            .await
+            .unwrap();
+
+        // Same lookup identity, different non-identity parameters.
+        let mut replacement = params.clone();
+        replacement.replay_window = params.replay_window.wrapping_add(64);
+        replacement.mode = XfrmMode::Transport;
+        let error = backend
+            .install_sa(InstallSaRequest {
+                parameters: replacement,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, XfrmError::AlreadyExists));
+
+        let observed = backend
+            .query_sa(QuerySaRequest {
+                destination: params.id.destination,
+                spi: params.id.spi,
+                protocol: params.id.protocol,
+                mark: params.mark,
+            })
+            .await
+            .unwrap();
+        assert_eq!(observed.replay_window, params.replay_window);
+        assert_eq!(observed.mode, params.mode);
+    }
+
+    #[tokio::test]
+    async fn mock_sa_identity_ignores_if_id_in_both_orders() {
+        // Linux xfrm_state_add does not use if_id to tell two SAs apart, so a
+        // differing interface must not make a colliding tuple installable --
+        // in either insertion order.
+        for (first, second) in [(None, Some(7_u32)), (Some(7_u32), None)] {
+            let backend = MockXfrmBackend::new();
+            let mut params = sample_sa_parameters();
+            params.if_id = first;
+            backend
+                .install_sa(InstallSaRequest {
+                    parameters: params.clone(),
+                })
+                .await
+                .unwrap();
+
+            let mut scoped = params.clone();
+            scoped.if_id = second;
+            let error = backend
+                .install_sa(InstallSaRequest { parameters: scoped })
+                .await
+                .unwrap_err();
+            assert!(matches!(error, XfrmError::AlreadyExists));
+
+            let identity = backend
+                .query_sa_relocation_identity(QuerySaRequest {
+                    destination: params.id.destination,
+                    spi: params.id.spi,
+                    protocol: params.id.protocol,
+                    mark: params.mark,
+                })
+                .await
+                .unwrap();
+            assert_eq!(identity.if_id, first);
+        }
+    }
+
+    #[tokio::test]
+    async fn mock_rekey_sa_rejects_a_missing_sa_without_creating_one() {
+        for if_id in [None, Some(9_u32)] {
+            let backend = MockXfrmBackend::new();
+            let mut params = sample_sa_parameters();
+            params.if_id = if_id;
+            let error = backend
+                .rekey_sa(RekeySaRequest {
+                    parameters: params.clone(),
+                })
+                .await
+                .unwrap_err();
+            assert!(matches!(error, XfrmError::NotFound));
+
+            // The rejected update must not have created the SA.
+            let error = backend
+                .query_sa(QuerySaRequest {
+                    destination: params.id.destination,
+                    spi: params.id.spi,
+                    protocol: params.id.protocol,
+                    mark: params.mark,
+                })
+                .await
+                .unwrap_err();
+            assert!(matches!(error, XfrmError::NotFound));
+        }
+    }
+
+    #[tokio::test]
+    async fn mock_install_policy_preserves_the_colliding_original() {
+        let backend = MockXfrmBackend::new();
+        let params = sample_policy_parameters();
+        backend
+            .install_policy(InstallPolicyRequest {
+                parameters: params.clone(),
+            })
+            .await
+            .unwrap();
+
+        let mut replacement = params.clone();
+        replacement.priority = params.priority.wrapping_add(100);
+        replacement.templates.clear();
+        let error = backend
+            .install_policy(InstallPolicyRequest {
+                parameters: replacement,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, XfrmError::AlreadyExists));
+
+        // Removable exactly once: the duplicate neither replaced nor
+        // duplicated the original.
+        backend
+            .remove_policy(RemovePolicyRequest {
+                selector: params.selector.clone(),
+                direction: params.direction,
+                mark: params.mark,
+            })
+            .await
+            .unwrap();
+        backend
+            .install_policy(InstallPolicyRequest { parameters: params })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn mock_policy_identity_separates_interface_scopes() {
+        // The mirror image of the SA rule: Linux policy lookup does compare
+        // if_id, so the same selector on another interface is a new policy.
+        let backend = MockXfrmBackend::new();
+        let unscoped = sample_policy_parameters();
+        let mut scoped = unscoped.clone();
+        scoped.if_id = Some(11);
+
+        backend
+            .install_policy(InstallPolicyRequest {
+                parameters: unscoped.clone(),
+            })
+            .await
+            .unwrap();
+        backend
+            .install_policy(InstallPolicyRequest {
+                parameters: scoped.clone(),
+            })
+            .await
+            .unwrap();
+        let error = backend
+            .install_policy(InstallPolicyRequest { parameters: scoped })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, XfrmError::AlreadyExists));
+
+        // A removal carries no if_id, so it addresses only the unscoped
+        // policy and the interface-scoped one survives, as on Linux.
+        backend
+            .remove_policy(RemovePolicyRequest {
+                selector: unscoped.selector.clone(),
+                direction: unscoped.direction,
+                mark: unscoped.mark,
+            })
+            .await
+            .unwrap();
+        backend
+            .install_policy(InstallPolicyRequest {
+                parameters: unscoped,
+            })
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
