@@ -475,9 +475,16 @@ jobs:
           # not the kernel GTP netdevice.
           rpm_dir="${RUNNER_TEMP}/el9-rpms"
           mkdir -p "${rpm_dir}"
-          docker run --rm -v "${rpm_dir}:/out" rockylinux/rockylinux:9 \
-            dnf install -y --downloadonly --downloaddir=/out --resolve \
+          # --releasever pins the container's repos to the guest's minor, so
+          # the RPMs cannot depend on a newer glibc than 9.4 ships. `dnf
+          # download --alldeps` is what resolves dependencies here; `install
+          # --downloadonly` would skip anything the container already has.
+          docker run --rm -v "${rpm_dir}:/out" rockylinux/rockylinux:9 bash -euo pipefail -c '
+            dnf install -y --releasever=9.4 dnf-plugins-core
+            dnf download --releasever=9.4 --resolve --alldeps --destdir=/out \
               nftables wireguard-tools
+          '
+          ls -1 "${rpm_dir}" | head -20
           test -n "$(ls -A "${rpm_dir}")"
           scp \
             -i "${key}" \
