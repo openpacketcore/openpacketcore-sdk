@@ -300,7 +300,13 @@ jobs:
           )"
           test -n "${test_binary}"
           test -x "${test_binary}"
-          file "${test_binary}" | grep -Fq 'statically linked'
+          # Assert on the property, not on a phrasing: a static binary has no
+          # PT_INTERP. `file` calls this "static-pie linked" and `ldd` calls it
+          # "statically linked", so matching either string is fragile.
+          if readelf -l "${test_binary}" | grep -q 'Requesting program interpreter'; then
+            echo "::error::el9 test binary is dynamically linked and will not start on RHEL 9"
+            exit 1
+          fi
           cp "${test_binary}" "${RUNNER_TEMP}/opc-gtpu-el9-test"
 
       - name: Load both classifiers on a RHEL 9 kernel
