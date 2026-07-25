@@ -10,19 +10,34 @@ on:
 permissions:
   contents: read
 
+# This workflow now requests ~22 concurrent jobs per run. Without a
+# concurrency group a superseded push keeps its whole fleet running and the
+# replacement run queues behind it, which costs far more wall clock than the
+# sharding saves. Runs on main are never cancelled.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 env:
   CARGO_TERM_COLOR: always
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
   RUST_BACKTRACE: "1"
 
 jobs:
-  rust:
-    name: Rust workspace
+  # The former single "Rust workspace" job ran fmt, clippy, the whole test
+  # suite and the isolated lanes back to back for ~42 minutes, with the test
+  # step alone taking ~34 (451 test binaries executed one after another).
+  # It is now split across runners: the lanes below do the work and the
+  # aggregator job at the end still reports one "Rust workspace" check.
+  # Debug symbols dominate the hosted runner's disk budget for this large
+  # all-target workspace, so every Rust lane keeps them off. CI validates
+  # behavior and diagnostics without retaining symbol tables; release-profile
+  # artifacts are unaffected. These pins are also what keeps each lane's
+  # target directory small enough that no lane needs `cargo clean`.
+  rust-gates:
+    name: Rust gates
     runs-on: ubuntu-latest
-    timeout-minutes: 90
-    # Debug symbols dominate the hosted runner's disk budget for this large
-    # all-target workspace. CI validates behavior and diagnostics without
-    # retaining symbol tables; release-profile artifacts are unaffected.
+    timeout-minutes: 20
     env:
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_DEV_DEBUG: "0"
@@ -39,9 +54,7 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
-          # Do not restore the former debuginfo-heavy target cache into the
-          # bounded hosted runner. Registry and Git dependency caches remain.
-          cache-targets: false
+          shared-key: opc-rust-gates
 
       - name: Check formatting
         run: cargo fmt --all --check
@@ -57,6 +70,161 @@ jobs:
       - name: Run opc-proto-diameter corpus generator self-test
         run: python3 crates/opc-proto-diameter/fuzz/generate_corpus.py self-test
 
+      # A workflow expression error makes GitHub reject the whole file and
+      # produce a run with no jobs at all, which reads as "nothing to see"
+      # rather than as a failure. Lint the workflows so that fails a check.
+      - name: Lint workflow files
+        env:
+          ACTIONLINT_VERSION: v1.7.12
+          PYFLAKES_VERSION: 3.4.0
+        run: |
+          set -euo pipefail
+          go install "github.com/rhysd/actionlint/cmd/actionlint@${ACTIONLINT_VERSION}"
+          # actionlint lints embedded shell with shellcheck and embedded
+          # python with pyflakes, but only if it can execute them. The runner
+          # image ships shellcheck and not pyflakes, so supply pyflakes in a
+          # venv rather than let the rule quietly switch itself off.
+          python3 -m venv /tmp/actionlint-venv
+          /tmp/actionlint-venv/bin/pip install --quiet "pyflakes==${PYFLAKES_VERSION}"
+          export PATH="/tmp/actionlint-venv/bin:${PATH}"
+          # A missing tool is reported only in verbose output, so a run that
+          # checks far less than it appears to still exits 0. Fail instead.
+          "$(go env GOPATH)/bin/actionlint" -verbose .github/workflows/*.yml \
+            2> >(tee actionlint.err >&2)
+          if grep -q 'was disabled' actionlint.err; then
+            grep 'was disabled' actionlint.err
+            echo "::error::actionlint ran with rules disabled; install the missing tools"
+            exit 1
+          fi
+
+      # Proves the test plan still partitions every integration-test target
+      # exactly once. The shards do not wait on this job -- they run the same
+      # check themselves in their precheck step -- so this is the readable
+      # place to see a plan failure, not the thing that gates them.
+      - name: Verify test shard plan
+        run: python3 ci/test-shards.py verify
+
+  rust-clippy:
+    name: Rust clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: opc-rust-clippy
+
+      - name: Run clippy
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+
+  rust-tests:
+    name: Rust tests (${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        # Keep in step with `python3 ci/test-shards.py ids`; the rust-gates
+        # plan check fails the run if the plan itself stops covering
+        # everything, and the aggregator below fails if a shard is dropped.
+        shard: [misc, it-0, it-1, it-2, heavy-0, heavy-1]
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+
+      # Each shard builds only its own test targets, so the tree stays far
+      # below the former single-job peak that forced `cargo clean` between
+      # steps. Debug symbols remain off via CARGO_PROFILE_*_DEBUG above; do
+      # not add a `cargo clean` here, since rust-cache saves in a post-step
+      # and would archive an empty target directory.
+      # Per-shard keys: the legs build different target sets, so one shared
+      # key would make all six race to save the same multi-gigabyte archive
+      # while giving each a worse hit rate than its own. Only main saves:
+      # six archives per pull request would churn the repository's shared
+      # 10 GB cache quota and evict the entries the shards restore from.
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: opc-rust-tests-${{ matrix.shard }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # Every shard issues the identical package selection and differs only
+      # in cargo target filters, so feature unification -- and therefore the
+      # compiled configuration of every dependency -- matches the former
+      # single-job run exactly.
+      # Resolves this shard's named tests before running anything: libtest
+      # exits 0 when a filter matches nothing, so a rename would otherwise
+      # leave a heavy shard green having run nothing.
+      - name: Precheck shard selection
+        run: python3 ci/test-shards.py precheck --shard '${{ matrix.shard }}'
+
+      - name: Run test shard
+        run: |
+          set -euo pipefail
+          python3 ci/test-shards.py plan --shard '${{ matrix.shard }}' > shard-commands.txt
+          test -s shard-commands.txt
+          # The command list is read on fd 3, and each command gets its own
+          # stdin from /dev/null. Reading the list on stdin instead would let
+          # any test that spawns a child with inherited stdin drain the
+          # remaining lines, silently skipping the rest of the shard.
+          while IFS= read -r command <&3; do
+            echo "::group::${command}"
+            if ! eval "${command}" < /dev/null; then
+              echo "::endgroup::"
+              echo "::error::shard '${{ matrix.shard }}' failed: ${command}"
+              exit 1
+            fi
+            echo "::endgroup::"
+          done 3< shard-commands.txt
+
+      # Cheap: the binary is already built on this shard.
+      - name: Verify heavy-target test partition
+        if: matrix.shard == 'misc'
+        run: python3 ci/test-shards.py verify-heavy
+
+  rust-persist:
+    name: Rust opc-persist contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: opc-rust-persist
+
       # Compile this package in isolation before workspace all-feature
       # unification can mask an accidental dependency on test-only hooks.
       - name: Check opc-persist default test contract
@@ -70,32 +238,74 @@ jobs:
             --test security_policy_empirical_tests \
             -- --test-threads=1
 
-      - name: Run clippy
-        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
-
-      - name: Reclaim lint build artifacts
-        # Test binaries are linked in a separate profile. Keeping the complete
-        # all-target Clippy graph beside them can exhaust hosted-runner disk.
-        run: cargo clean
-
-      - name: Run tests
-        run: cargo test --locked --workspace --exclude opc-persist --all-features --quiet -- --test-threads=4
-
-      - name: Reclaim workspace test artifacts
-        run: cargo clean
-
-      - name: Run GTP-U unsupported-platform cfg tests
-        run: RUSTFLAGS="--cfg opc_linux_gtpu_sys_force_unsupported" cargo test --locked -p opc-linux-gtpu-sys -p opc-gtpu-dataplane --no-default-features --quiet
-
-      - name: Reclaim alternate-cfg test artifacts
-        run: cargo clean
-
       # The opc-persist e2e suites drive real consensus subprocess clusters
       # (3-4 nodes plus TCP proxies per test). Running several clusters
       # concurrently oversubscribes shared runners and destabilizes the
       # port-block allocator, so these suites run single-threaded in CI.
       - name: Run consensus e2e tests (serial)
         run: cargo test --locked -p opc-persist --all-features --quiet -- --test-threads=1
+
+  rust-gtpu-cfg:
+    name: Rust GTP-U unsupported-platform cfg
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+
+      # A cfg in RUSTFLAGS refingerprints the whole subtree, so this lane
+      # never shares a target directory with the ordinary test shards.
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: opc-rust-gtpu-cfg
+
+      - name: Run GTP-U unsupported-platform cfg tests
+        run: RUSTFLAGS="--cfg opc_linux_gtpu_sys_force_unsupported" cargo test --locked -p opc-linux-gtpu-sys -p opc-gtpu-dataplane --no-default-features --quiet
+
+  rust:
+    name: Rust workspace
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: always()
+    needs:
+      - rust-gates
+      - rust-clippy
+      - rust-tests
+      - rust-persist
+      - rust-gtpu-cfg
+    steps:
+      # Preserves the single check name the previous monolithic job reported,
+      # so anything watching "Rust workspace" keeps meaning the whole suite.
+      # A skipped or cancelled lane fails here too: only an all-success run
+      # may report success.
+      - name: Require every Rust lane to succeed
+        # Passed through the environment rather than interpolated into the
+        # script, so lane names can never be treated as shell.
+        env:
+          LANE_RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+
+          lanes = json.loads(os.environ["LANE_RESULTS"])
+          for name, lane in sorted(lanes.items()):
+              print(f"{name}: {lane['result']}")
+          failed = sorted(n for n, l in lanes.items() if l["result"] != "success")
+          if failed:
+              print(f"::error::Rust lanes did not succeed: {', '.join(failed)}")
+              sys.exit(1)
+          print(f"all {len(lanes)} Rust lanes succeeded")
+          PY
 
   vendored-dtls:
     name: Audited vendored DTLS
@@ -147,12 +357,27 @@ jobs:
       - name: Test RustCrypto-only DTLS documentation
         run: cargo test --manifest-path vendor/dimpl/Cargo.toml --no-default-features --features rust-crypto --doc
 
+      # These were written as `! rg ...`, which bash exempts from errexit, so
+      # a match printed the offending lines and the step still passed. All
+      # three invariants hold today; they are now actually enforced, and each
+      # reports rather than stopping at the first violation.
       - name: Enforce vendored RFC 6083 source invariants
         run: |
-          ! rg -n '\b(unreachable!|unimplemented!|todo!)' vendor/dimpl/src
-          ! rg -n 'Rfc6083|rfc6083' vendor/dimpl/src/dtls13
-          ! rg -n 'impl Default for Config|Config::default\(\)' \
-            vendor/dimpl/src vendor/dimpl/tests vendor/dimpl/README.md
+          violated=0
+          if rg -n '\b(unreachable!|unimplemented!|todo!)' vendor/dimpl/src; then
+            echo "::error::vendored DTLS source must not panic on unreachable paths"
+            violated=1
+          fi
+          if rg -n 'Rfc6083|rfc6083' vendor/dimpl/src/dtls13; then
+            echo "::error::the DTLS 1.3 path must not reference RFC 6083"
+            violated=1
+          fi
+          if rg -n 'impl Default for Config|Config::default\(\)' \
+            vendor/dimpl/src vendor/dimpl/tests vendor/dimpl/README.md; then
+            echo "::error::Config must be constructed explicitly, never defaulted"
+            violated=1
+          fi
+          exit "${violated}"
 
   session-net-i686:
     name: opc-session-net i686
