@@ -482,13 +482,28 @@ jobs:
           # 9.4 is no longer on the mirrorlist, so point the container's repos
           # at the vault the guest image itself came from. Without this,
           # --releasever=9.4 resolves to a 404 mirrorlist.
-          docker run --rm -v "${rpm_dir}:/out" rockylinux/rockylinux:9 bash -euo pipefail -c '
+          #
+          # wireguard-tools requires systemd-resolved, which the cloud image
+          # does not ship. systemd subpackages are version-locked to each
+          # other, so pulling systemd-resolved in upgrades the whole family --
+          # and any member missing from the local repo would have to be erased
+          # instead, which dnf refuses for protected packages like
+          # systemd-udev. Ask the guest which subpackages it actually has so
+          # the entire set is present and can move together.
+          systemd_pkgs="$(
+            ssh "${ssh_options[@]}" opc@127.0.0.1 \
+              'rpm -qa --qf "%{NAME}\n" "systemd*" | sort -u | tr "\n" " "'
+          )"
+          echo "guest systemd family: ${systemd_pkgs}"
+          test -n "${systemd_pkgs}"
+          docker run --rm -e SYSTEMD_PKGS="${systemd_pkgs}" \
+            -v "${rpm_dir}:/out" rockylinux/rockylinux:9 bash -euo pipefail -c '
             sed -i -e "s|^mirrorlist=|#mirrorlist=|" \
                    -e "s|^#baseurl=http://dl.rockylinux.org/\$contentdir|baseurl=https://dl.rockylinux.org/vault/rocky|" \
                    /etc/yum.repos.d/rocky*.repo
             dnf install -y --releasever=9.4 dnf-plugins-core createrepo_c
             dnf download --releasever=9.4 --resolve --alldeps --destdir=/out \
-              nftables wireguard-tools
+              nftables wireguard-tools $SYSTEMD_PKGS
             createrepo_c /out
             chmod -R a+rX /out
           '
@@ -507,6 +522,9 @@ jobs:
           # the core packages in the dependency closure, which dnf refuses
           # because it would have to replace systemd. As a repo, dnf resolves
           # normally and installs only what this guest is actually missing.
+          # Assert both binaries afterwards: the suite shells out to nft and
+          # wg, and a skipped install would otherwise surface as an unrelated
+          # test failure much later.
           ssh "${ssh_options[@]}" opc@127.0.0.1 '
             set -euo pipefail
             sudo dnf install -y --disablerepo="*" \
