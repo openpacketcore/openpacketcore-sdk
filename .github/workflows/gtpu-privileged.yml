@@ -492,8 +492,9 @@ jobs:
           grep -Fq 'OPC_GTPU_TAG_PROOF_PROVEN' <<< "${load_output}"
           grep -Fq 'OPC_GTPU_LOAD_CAPABILITY_PROVEN' <<< "${load_output}"
 
-          # The suite shells out to ip, tc, nft and wg. iproute2 ships on the
-          # cloud image; nftables and wireguard-tools do not. The guest has no
+          # The suite shells out to ip, tc, ethtool, nft, wg and python3.
+          # iproute2, ethtool and python3 ship on the cloud image; nftables and
+          # wireguard-tools do not. The guest has no
           # network on purpose (`restrict=on` above), so resolve and download
           # the RPMs here -- in a matching el9 container, so dependencies
           # resolve against the right distribution -- and install them offline
@@ -558,6 +559,10 @@ jobs:
               --nogpgcheck nftables wireguard-tools
             command -v nft
             command -v wg
+            # Asserted, not assumed: these ship on the cloud image today, and
+            # the suite fails deep inside a netns if a future image drops them.
+            command -v ethtool
+            command -v python3
             sudo modprobe wireguard
             chmod 0755 /tmp/opc-gtpu-el9-datapath
           '

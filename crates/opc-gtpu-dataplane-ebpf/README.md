@@ -78,10 +78,11 @@ Its values are aggregate and contain no rejected endpoint or session fields.
   additionally runs the full privileged datapath suite, because the limit is
   cumulative over the callback chain and an enterprise backport can account for
   it differently: exposing `bpf_loop` does not by itself imply this object
-  loads, and loading does not by itself imply it forwards. Both gates assert
-  the suite size the binary reports, so a test that cannot run on el9 fails the
-  gate rather than shrinking it. Kernels outside the gated lines are
-  unqualified rather than unsupported, and `opc-gtpu-dataplane`'s
+  loads, and loading does not by itself imply it forwards. Both gates require
+  the datapath suite to run every test the committed source declares, and to
+  prove it ran rather than reporting itself skipped, so a test that cannot run
+  on el9 fails the gate rather than shrinking it. Kernels outside the gated
+  lines are unqualified rather than unsupported, and `opc-gtpu-dataplane`'s
   `probe_committed_classifier_load` establishes the answer on the node.
 - Outer IPv6 is `MaterializedOnly`: GSO and pending
   `CHECKSUM_PARTIAL` state are rejected before encapsulation. Outer IPv6

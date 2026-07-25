@@ -1108,10 +1108,9 @@ offload support.
   IPv6/UDP/GTP-U headers. The current object also uses the bounded `bpf_loop`
   helper (available in mainline Linux 5.17 and newer) to checksum the complete
   declared UDP range and walk IPv6 extension headers without verifier
-  unrolling. Linux 6.8 or newer is the profile the full privileged datapath
-  suite runs against; see the gated-kernel bullet below for what is proven on
-  RHEL 9's 5.14 line, and do not read either as a version floor to compare
-  against.
+  unrolling. The full privileged datapath suite runs against two profiles:
+  Linux 6.8 or newer, and the RHEL 9.4 `5.14.0-427` line described below. Do
+  not read either as a version floor to compare against.
   CI loads both committed classifiers on exact Linux 6.8.0-134 as a verifier
   compatibility gate in addition to running the full privileged datapath suite.
 - Helper availability is not loadability, and the `bpf_loop` note above is not
@@ -1123,11 +1122,12 @@ offload support.
   admitted on that basis can still fail `BPF_PROG_LOAD` with no symptom beyond
   zero forwarding.
 - **The RHEL 9.4 / `5.14.0-427` kernel line is gated for verifier
-  loadability.** That is the line Red Hat CoreOS ships for OpenShift 4.18, and
-  it is an enterprise backport rather than a mainline kernel, so helper
-  availability alone would not have settled it. CI boots a digest-pinned Rocky
-  9.4 image, asserts the guest is on `5.14.0-427.*el9_4*`, and loads both
-  committed classifiers there on every run.
+  loadability and datapath behavior.** That is the line Red Hat CoreOS ships
+  for OpenShift 4.18, and it is an enterprise backport rather than a mainline
+  kernel, so helper availability alone would not have settled it. CI boots a
+  digest-pinned Rocky 9.4 image, asserts the guest is on `5.14.0-427.*el9_4*`,
+  loads both committed classifiers there, and runs the full privileged datapath
+  suite on that kernel on every run.
 - **What that gate does and does not establish.** It proves both classifiers
   pass `BPF_PROG_LOAD`, and it runs the privileged datapath suite on that
   kernel in a fresh network namespace: attach, encap/decap, PMTU and fragment
@@ -1136,7 +1136,10 @@ offload support.
   container domain, whether `CAP_BPF` alone suffices (CI runs as root),
   in-pod bpffs availability under an immutable host, MTU headroom against a
   given CNI, or coexistence with another tc/eBPF program on the same
-  interface. Treat it as necessary, not sufficient, for a given cluster.
+  interface. It also runs one digest-pinned z-build: the guest assertion
+  accepts any `5.14.0-427.*el9_4*`, but an OpenShift 4.18.z node will be on a
+  z-build this gate has never executed. Treat it as necessary, not sufficient,
+  for a given cluster.
 - A loadability verdict here is about this object only. It does not speak for
   whatever node-admission policy a deployment configures, and it is not itself
   an admission decision.
@@ -1147,11 +1150,14 @@ offload support.
   on the node with [`probe_committed_classifier_load`], which attempts the real
   committed load and answers `Loadable`, `VerifierRejected`, or
   `UnableToAttempt`, attaching nothing and leaving no pinned state behind.
-- The ignored privileged eBPF proof additionally requires the `gtp` and
-  `wireguard` kernel modules plus `ip`, `tc`, `ethtool`, `nft`, `wg`, and
-  Python 3. CI preflights and installs these prerequisites. A platform without
-  them is explicitly unavailable for this proof; an ignored or skipped run is
-  not positive datapath evidence.
+- The ignored privileged eBPF proof additionally requires the `wireguard`
+  kernel module plus `ip`, `tc`, `ethtool`, `nft`, `wg`, and Python 3. It does
+  **not** require the `gtp` kernel module: this is the tc/eBPF path, and `gtp`
+  is a prerequisite of the separate netdevice suite only. CI preflights and
+  installs these prerequisites. A platform without them is explicitly
+  unavailable for this proof, and both gates fail rather than pass when a test
+  reports itself skipped, because a skipped run counts as a pass to the test
+  harness and is not positive datapath evidence.
 - eBPF cleanup checks exact BPF program IDs and named pin map IDs, but classic
   tc/bpffs cleanup requires the documented exclusive-writer boundary; it does
   not claim atomic conditional deletion against uncoordinated external writers.
