@@ -8,6 +8,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Credential-rotation observability closes three residual gaps —
+  `opc-tls`, `opc-session-net` (breaking to the reason enum):** an audit of #158
+  against `main` found its atomic-reload, bounded-authentication-age,
+  last-known-good and mandatory-renegotiation requirements already implemented;
+  these are the parts that were genuinely missing.
+  - *Expiry now republishes status on its own.* The reconciliation task woke
+    only on a source change, but expiry is time-driven, so retained material
+    could pass its own expiry while the published status still read `Ready` and
+    a readiness consumer saw healthy material that was not. Handshakes were
+    never affected — `snapshot()` and `admit()` refresh first, so expired
+    material could not authenticate a connection; this is about the signal being
+    true on its own. The task now also wakes on the expiry deadline, and the
+    generic `TlsMaterialController::new` starts that task when a runtime is
+    available, which previously only the projected source did.
+  - *Trust-bundle rejections are attributable.* A trust-anchor rotation that
+    overran a bound reported `material_limit_exceeded`, indistinguishable from
+    an oversized local SVID. `TlsMaterialReloadReason` gains
+    `TrustBundleLimitExceeded` and `InvalidTrustBundle`, both mapped to
+    `SecurityRotationKind::TrustBundle`. A bundle keyed by a foreign trust
+    domain now reports `InvalidTrustBundle` rather than
+    `InvalidWorkloadIdentity`. **`ALL` grows from 12 to 14 and two new
+    low-cardinality metric labels appear**, so exhaustive matchers and dashboards
+    must account for them. The aggregate total-byte bound spans the SVID and the
+    bundles together and genuinely cannot be attributed to either, so it stays
+    `MaterialLimitExceeded` rather than being forced onto the bundle.
+  - *Credential health is readable from the transport.*
+    `RemoteSessionConsensusPeer::credential_health`,
+    `SessionConsensusServer::credential_health` and
+    `RemoteSessionBackend::credential_health` return the redaction-safe
+    `TlsMaterialStatus`, so a CNF readiness probe no longer has to hold the
+    `opc-tls` config itself.
+
+  Deliberately unchanged: `request_reauthentication` stays immediate. The actual
+  rotation path already spreads retirement with per-peer deterministic jitter;
+  an explicit reauthentication is an operator command to prove a
+  current-generation handshake now, and jittering it would leave a cached lane
+  dispatchable during the jitter window. #158 remains open — its 3/5-member
+  fleet evidence belongs to #164 and is not established by in-process tests.
+
+### Changed
 - **SWm authorization-update identities zeroize on drop — `opc-proto-diameter`
   (breaking):** `SwmReAuthRequest`, `SwmReAuthAnswer`, `SwmAuthorizationRequest`
   and `SwmAuthorizationAnswer` held `Session-Id` and permanent `User-Name` as

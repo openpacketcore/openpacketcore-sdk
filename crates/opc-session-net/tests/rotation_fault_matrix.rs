@@ -1898,7 +1898,9 @@ async fn five_member_failure_budget_case() {
         .publish_rejected(
             degraded,
             Some(oversized),
-            TlsMaterialReloadReason::MaterialLimitExceeded,
+            // Attributed to the trust bundle: this candidate overruns the
+            // bundle bound, not a local SVID bound.
+            TlsMaterialReloadReason::TrustBundleLimitExceeded,
             "fault-malformed-over-limit",
         )
         .await;

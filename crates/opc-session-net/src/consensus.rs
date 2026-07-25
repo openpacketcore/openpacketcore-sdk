@@ -1269,6 +1269,25 @@ impl fmt::Debug for RemoteSessionConsensusPeer {
 }
 
 impl RemoteSessionConsensusPeer {
+    /// Current redaction-safe health of the credentials this peer authenticates
+    /// with, or `None` when the peer is running without TLS.
+    ///
+    /// This is the signal a CNF readiness probe should consume during a
+    /// credential or trust-bundle rotation. It reports only epoch,
+    /// availability and a closed reason enum -- never certificate bytes or
+    /// identity text -- so it is safe to surface in health output.
+    ///
+    /// `RetainingLastGood` means a candidate was rejected and the previous
+    /// material is still serving: connections continue, but the rotation did
+    /// not take effect and the reason says why. `Unavailable` means there is
+    /// no usable material and new handshakes will fail.
+    #[must_use]
+    pub fn credential_health(&self) -> Option<opc_tls::TlsMaterialStatus> {
+        self.tls_config
+            .as_ref()
+            .map(opc_tls::AuthenticatedClientConfig::material_status)
+    }
+
     /// Exact authenticated cluster/configuration/epoch scope carried by this
     /// peer. Dynamic peer directories must compare this evidence with the
     /// staged manifest instead of trusting a node ID alone.
@@ -1901,6 +1920,21 @@ impl fmt::Debug for SessionConsensusServer {
 }
 
 impl SessionConsensusServer {
+    /// Current redaction-safe health of the credentials this listener presents,
+    /// or `None` when running without TLS.
+    ///
+    /// The server twin of
+    /// [`RemoteSessionConsensusPeer::credential_health`]. A rotating fleet
+    /// should gate readiness on both: a node whose inbound material is
+    /// `RetainingLastGood` is still serving the previous certificate, which
+    /// matters when the rotation's purpose was to stop presenting it.
+    #[must_use]
+    pub fn credential_health(&self) -> Option<opc_tls::TlsMaterialStatus> {
+        self.tls_config
+            .as_ref()
+            .map(opc_tls::AuthenticatedServerConfig::material_status)
+    }
+
     /// Construct a mutually authenticated consensus-only listener.
     pub fn new(
         handler: Arc<dyn SessionConsensusRpcHandler>,
