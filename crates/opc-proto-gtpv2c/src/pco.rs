@@ -4,7 +4,11 @@
 //! This module adds the bounded inner-container codec needed for DNS and
 //! P-CSCF address relay without changing that raw-preserving transport layer.
 //!
-//! @spec 3GPP TS24008 10.5.6.3
+//! Clause references are to TS 24.008 V20.0.0. The 10.5.6.3 text this module
+//! relies on is unchanged from V13.7.0 through that release, so a bare
+//! `10.5.6.3` elsewhere in the crate resolves to the same wording.
+//!
+//! @spec 3GPP TS24008 V20.0.0 10.5.6.3
 //! @conformance boundary-only
 
 use std::{error::Error, fmt};
@@ -271,25 +275,15 @@ impl PcoRequest {
             return Vec::new();
         }
 
-        let (p_cscf_ipv6, p_cscf_ipv4, p_cscf_reselection_support) = match self.p_cscf {
-            Some(p_cscf) => (
-                p_cscf.addresses.includes_ipv6(),
-                p_cscf.addresses.includes_ipv4(),
-                p_cscf.reselection_support,
-            ),
-            None => (false, false, false),
-        };
-        let requested_count = [
-            p_cscf_ipv6,
-            self.dns_server_ipv6,
-            p_cscf_ipv4,
-            self.dns_server_ipv4,
-            self.ipv4_link_mtu,
-            p_cscf_reselection_support,
-        ]
-        .into_iter()
-        .filter(|requested| *requested)
-        .count();
+        let p_cscf_container_count = self.p_cscf.map_or(0, |p_cscf| {
+            usize::from(p_cscf.addresses.includes_ipv6())
+                + usize::from(p_cscf.addresses.includes_ipv4())
+                + usize::from(p_cscf.reselection_support)
+        });
+        let requested_count = p_cscf_container_count
+            + usize::from(self.dns_server_ipv6)
+            + usize::from(self.dns_server_ipv4)
+            + usize::from(self.ipv4_link_mtu);
         let ipcp_len = if self.ipcp_dns.is_requested() {
             PCO_CONTAINER_HEADER_LEN + usize::from(self.ipcp_dns.contents_len())
         } else {
@@ -305,14 +299,23 @@ impl PcoRequest {
         if self.ipcp_dns.is_requested() {
             encode_ipcp_configure_request(&mut encoded, self.ipcp_dns);
         }
-        if p_cscf_ipv6 {
-            encode_empty_request_container(&mut encoded, PCO_CONTAINER_P_CSCF_IPV6);
+        // Every P-CSCF container is selected by destructuring `self.p_cscf` at
+        // its own emission site. Flattening the option into booleans first
+        // would move the TS 24.008 10.5.6.3 accompaniment rule out of the type
+        // and into the flattening step, where one wrong token reintroduces an
+        // unaccompanied `0x0012`.
+        if let Some(p_cscf) = self.p_cscf {
+            if p_cscf.addresses.includes_ipv6() {
+                encode_empty_request_container(&mut encoded, PCO_CONTAINER_P_CSCF_IPV6);
+            }
         }
         if self.dns_server_ipv6 {
             encode_empty_request_container(&mut encoded, PCO_CONTAINER_DNS_SERVER_IPV6);
         }
-        if p_cscf_ipv4 {
-            encode_empty_request_container(&mut encoded, PCO_CONTAINER_P_CSCF_IPV4);
+        if let Some(p_cscf) = self.p_cscf {
+            if p_cscf.addresses.includes_ipv4() {
+                encode_empty_request_container(&mut encoded, PCO_CONTAINER_P_CSCF_IPV4);
+            }
         }
         if self.dns_server_ipv4 {
             encode_empty_request_container(&mut encoded, PCO_CONTAINER_DNS_SERVER_IPV4);
@@ -321,12 +324,18 @@ impl PcoRequest {
             encode_empty_request_container(&mut encoded, PCO_CONTAINER_IPV4_LINK_MTU);
         }
         // TS 24.008 10.5.6.3 permits this container only alongside a P-CSCF
-        // address request. `p_cscf_reselection_support` is true only when
-        // `self.p_cscf` is `Some`, and every `PcscfAddressRequest` variant
-        // emits at least one of `0x0001`/`0x000c` above, so the accompanying
-        // container is already in `encoded`.
-        if p_cscf_reselection_support {
-            encode_empty_request_container(&mut encoded, PCO_CONTAINER_P_CSCF_RESELECTION_SUPPORT);
+        // address request. Reaching this emission needs `self.p_cscf` to be
+        // `Some`, and every `PcscfAddressRequest` variant made the same two
+        // sites above emit at least one of `0x0001`/`0x000c`, so the
+        // accompanying container is already in `encoded`. Nothing outside
+        // `self.p_cscf` can select this identifier.
+        if let Some(p_cscf) = self.p_cscf {
+            if p_cscf.reselection_support {
+                encode_empty_request_container(
+                    &mut encoded,
+                    PCO_CONTAINER_P_CSCF_RESELECTION_SUPPORT,
+                );
+            }
         }
         encoded
     }

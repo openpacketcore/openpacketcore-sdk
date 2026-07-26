@@ -40,8 +40,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Migration: `p_cscf_ipv4: true` becomes
     `p_cscf: Some(PcscfRequest::addresses(PcscfAddressRequest::Ipv4))`, and
     adding the capability uses `PcscfRequest::with_reselection_support(..)`.
-    `..PcoRequest::none()` and `..Default::default()` are unaffected. Encoded
-    bytes are unchanged for every combination that was already legal.
+    The `..PcoRequest::none()` and `..Default::default()` base expressions
+    still work, but any struct literal setting a P-CSCF field must be updated:
+    the three removed fields no longer exist, so
+    `PcoRequest { p_cscf_ipv4: true, ..PcoRequest::none() }` does not compile.
+    Encoded bytes are unchanged for every combination that was already legal.
 - **IPv4 Link MTU follow-ups -- `opc-proto-gtpv2c`:** adversarial review of the
   container support added in the same unreleased window found two defects.
   - `PcoAddressConfiguration::is_empty()` had silently changed meaning: a value

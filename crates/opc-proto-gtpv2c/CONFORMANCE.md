@@ -3,6 +3,11 @@
 ## Scope
 
 - **Specification family:** 3GPP TS 29.274 (GTPv2-C), Release 18 naming.
+- **Referenced specification:** 3GPP TS 24.008 V20.0.0, clause 10.5.6.3 only,
+  for the PCO inner codec. Every 10.5.6.3 reference in this document is to that
+  version, and the clause text this crate relies on is unchanged from V13.7.0
+  through V20.0.0. The clause 10.5.6.12 TFT references below are
+  `opc-proto-tft`'s boundary and are pinned in that crate.
 - **Crate status:** Experimental S2b-focused typed subset with a raw-preserving
   message/IE shell. `S2b Production Profile v1` is the retained candidate
   identifier for the documented boundary, not a maturity attestation.

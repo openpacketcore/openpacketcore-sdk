@@ -29,9 +29,9 @@
 //! reselection support into either opaque PCO transport. It never infers
 //! support from a P-CSCF address-family request, and 10.5.6.3 permits the
 //! container only alongside one, so [`PcscfRequest`] carries both and the
-//! unaccompanied combination does not compile. It also
-//! emits an IPCP (`0x8021`) Configure-Request for the RFC 1877 DNS options,
-//! ahead of the containers as TS 24.008 10.5.6.3 positions it, and
+//! unaccompanied combination does not compile. [`PcoRequest`] also emits an
+//! IPCP (`0x8021`) Configure-Request for the RFC 1877 DNS options, ahead of
+//! the containers as TS 24.008 10.5.6.3 positions it, and
 //! [`PcoAddressConfiguration`] reads the peer's Configure-Nak answer, and the
 //! IPv4 Link MTU container `0x0010` is carried in both directions.
 //! Product code remains responsible for deciding when optional policy-owned
@@ -50,6 +50,7 @@
 //! Transport admission and rate limits remain caller owned.
 //!
 //! @spec 3GPP TS29274 R18
+//! @spec 3GPP TS24008 V20.0.0 10.5.6.3
 //! @req REQ-3GPP-TS29274-R18-S2B-001
 //! @conformance s2b-subset — see CONFORMANCE.md
 
