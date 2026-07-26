@@ -308,8 +308,11 @@ pub struct PcoAddressConfiguration {
     pub ipcp_secondary_dns: Option<[u8; 4]>,
     /// IPv4 link MTU in octets, from container `0x0010`.
     ///
-    /// `Option` rather than a sentinel: TS 24.008 reserves no "absent" value,
-    /// and zero is not one.
+    /// `Option` rather than a sentinel: TS 24.008 reserves no "absent" value.
+    /// A value below the RFC 791 68-octet minimum is not a usable link MTU and
+    /// is reported as absent rather than passed on, so a caller that applies
+    /// what it asked for cannot blackhole the user plane on two peer-supplied
+    /// octets.
     pub ipv4_link_mtu: Option<u16>,
 }
 
