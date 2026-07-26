@@ -8,10 +8,11 @@ use crate::model::{
 };
 use crate::ownership::SessionOwnershipKey;
 use crate::repin::{
-    OwnershipCleanupCompleteProof, OwnershipFenceGrant, OwnershipFenceRequest,
-    OwnershipRetirementAdmission, OwnershipRetirementFinalization, OwnershipRetirementGrant,
-    OwnershipRetirementRequest, OwnershipRetryProof, OwnershipSnapshot, RePinAuditEvent,
-    RePinSteeringOperationPermit, RePinSteeringUpdate,
+    OwnershipActivationGrant, OwnershipActivationRequest, OwnershipCleanupCompleteProof,
+    OwnershipFenceGrant, OwnershipFenceRequest, OwnershipRetirementAdmission,
+    OwnershipRetirementFinalization, OwnershipRetirementGrant, OwnershipRetirementRequest,
+    OwnershipRetryProof, OwnershipSnapshot, RePinAuditEvent, RePinSteeringOperationPermit,
+    RePinSteeringUpdate,
 };
 use crate::spi::{RekeyRequest, SpiAllocationRequest, SpiKind, TaggedSpi};
 
@@ -270,6 +271,47 @@ pub trait OwnershipFencer: Send + Sync + std::fmt::Debug {
     /// field has changed; checking only the owner/fence is insufficient
     /// because it would trust a stale request after an ABA owner cycle.
     async fn validate_retry_proof(&self, proof: &OwnershipRetryProof) -> Result<(), IpsecLbError>;
+}
+
+/// Authority that publishes the FIRST owner record for a newly established SA.
+///
+/// This is the no-predecessor twin of [`OwnershipFencer`]. It exists because a
+/// receiver-chosen inbound SPI is reachable from the moment the responder
+/// installs the SA, before any ownership transition has occurred, so a
+/// destination-scoped owner map must admit a first publication.
+///
+/// # Safety contract
+///
+/// Implementations MUST mint the activation generation themselves from
+/// authoritative durable state and MUST NOT accept a caller-supplied one. The
+/// minted generation must be strictly above the durable per-key floor,
+/// including a floor left behind by a completed retirement — an absent record
+/// or an empty datapath map is not evidence that a key was never activated.
+/// Activation is a promotion of an existing birth record, never an upsert: a
+/// missing record must fail closed with [`IpsecLbError::NotFound`]. A record
+/// already held by a different owner or committed by a different transition
+/// must fail closed as an ownership conflict rather than being overwritten, and
+/// a retiring record must never be activated.
+#[async_trait]
+pub trait OwnershipActivationAuthority: Send + Sync + std::fmt::Debug {
+    /// Commit the first authoritative owner and generation for one exact key.
+    async fn activate_ownership(
+        &self,
+        request: &OwnershipActivationRequest,
+    ) -> Result<OwnershipActivationGrant, IpsecLbError>;
+
+    /// Recover an activation that may already have committed.
+    ///
+    /// This read-only operation returns the exact committed grant only when the
+    /// authoritative record names the same owner, transition ID, and complete
+    /// activation fingerprint; it returns `None` only when the record is still
+    /// an un-transitioned birth record. Every other state fails closed. This
+    /// makes an identical retry safe after cancellation or an ambiguous write
+    /// without minting a second generation.
+    async fn recover_activation_grant(
+        &self,
+        request: &OwnershipActivationRequest,
+    ) -> Result<Option<OwnershipActivationGrant>, IpsecLbError>;
 }
 
 /// Durable two-phase authority for retiring exact re-pin ownership.

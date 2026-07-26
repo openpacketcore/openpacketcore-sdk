@@ -9537,4 +9537,1444 @@ mod tests {
         assert_eq!(&map_key[1..1 + canonical.len()], canonical.as_slice());
         assert!(map_key[1 + canonical.len()..].iter().all(|byte| *byte == 0));
     }
+
+    // ---------------------------------------------------------------------
+    // First-activation boundary (issue #561).
+    // ---------------------------------------------------------------------
+
+    /// Activation authority that returns one caller-chosen generation.
+    ///
+    /// This exists only to drive the Host publication cut with a specific
+    /// generation. The production authority mints the generation from the
+    /// session store and never accepts one; see `session.rs` for those tests.
+    #[derive(Debug, Clone)]
+    struct FixedActivationAuthority {
+        fence: u64,
+        activations: Arc<AtomicUsize>,
+        /// Once set, a committed grant is replayed by `recover_activation_grant`
+        /// instead of being minted a second time, exactly as the store-backed
+        /// authority behaves for an exact retry.
+        recover_committed: bool,
+        /// Report a failure from the first `activate_ownership` *after* it has
+        /// already committed, so the caller sees a lost acknowledgement rather
+        /// than an uncommitted attempt.
+        commit_then_report_failure: Arc<AtomicBool>,
+        committed: Arc<Mutex<Option<crate::OwnershipActivationGrant>>>,
+    }
+
+    impl FixedActivationAuthority {
+        fn new(fence: u64) -> Self {
+            Self {
+                fence,
+                activations: Arc::new(AtomicUsize::new(0)),
+                recover_committed: false,
+                commit_then_report_failure: Arc::new(AtomicBool::new(false)),
+                committed: Arc::new(Mutex::new(None)),
+            }
+        }
+
+        fn with_committed_recovery(mut self) -> Self {
+            self.recover_committed = true;
+            self
+        }
+
+        /// Commit durably, then fail the first acknowledgement.
+        fn with_lost_commit_acknowledgement(self) -> Self {
+            let authority = self.with_committed_recovery();
+            authority
+                .commit_then_report_failure
+                .store(true, Ordering::SeqCst);
+            authority
+        }
+
+        /// Number of generations this authority was asked to mint.
+        fn activations(&self) -> usize {
+            self.activations.load(Ordering::SeqCst)
+        }
+
+        fn committed(&self) -> Option<crate::OwnershipActivationGrant> {
+            self.committed
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+    }
+
+    #[async_trait]
+    impl crate::OwnershipFencer for FixedActivationAuthority {
+        async fn recover_fence_grant(
+            &self,
+            _request: &crate::OwnershipFenceRequest,
+        ) -> Result<Option<crate::OwnershipFenceGrant>, IpsecLbError> {
+            Err(IpsecLbError::Unsupported)
+        }
+
+        async fn fence_sa_owner(
+            &self,
+            _request: crate::OwnershipFenceRequest,
+        ) -> Result<crate::OwnershipFenceGrant, IpsecLbError> {
+            Err(IpsecLbError::Unsupported)
+        }
+
+        async fn validate_retry_proof(
+            &self,
+            _proof: &crate::OwnershipRetryProof,
+        ) -> Result<(), IpsecLbError> {
+            Err(IpsecLbError::Unsupported)
+        }
+    }
+
+    #[async_trait]
+    impl crate::OwnershipActivationAuthority for FixedActivationAuthority {
+        async fn activate_ownership(
+            &self,
+            request: &crate::OwnershipActivationRequest,
+        ) -> Result<crate::OwnershipActivationGrant, IpsecLbError> {
+            self.activations.fetch_add(1, Ordering::SeqCst);
+            let grant = crate::repin::OwnershipActivationGrant::new(
+                request.clone(),
+                OwnershipFence::new(self.fence).expect("nonzero test fence"),
+            );
+            if self.recover_committed {
+                *self
+                    .committed
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(grant.clone());
+            }
+            if self
+                .commit_then_report_failure
+                .swap(false, Ordering::SeqCst)
+            {
+                return Err(IpsecLbError::ownership_conflict(
+                    "injected activation acknowledgement loss",
+                ));
+            }
+            Ok(grant)
+        }
+
+        async fn recover_activation_grant(
+            &self,
+            request: &crate::OwnershipActivationRequest,
+        ) -> Result<Option<crate::OwnershipActivationGrant>, IpsecLbError> {
+            if !self.recover_committed {
+                return Ok(None);
+            }
+            Ok(self.committed().filter(|grant| grant.request() == request))
+        }
+    }
+
+    /// Real store-backed activation authority that parks the caller *after* the
+    /// durable ownership CAS has committed and before the coordinator can write
+    /// either datapath map.
+    ///
+    /// This is the only window in which a real partial state exists: the store
+    /// record is `Active` while both eBPF maps are still empty.
+    #[derive(Clone)]
+    struct ParkAfterCommitAuthority {
+        inner: Arc<StoreFencer>,
+        park: Arc<AtomicBool>,
+        committed: Arc<tokio::sync::Notify>,
+    }
+
+    impl fmt::Debug for ParkAfterCommitAuthority {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("ParkAfterCommitAuthority")
+        }
+    }
+
+    #[async_trait]
+    impl crate::OwnershipFencer for ParkAfterCommitAuthority {
+        async fn recover_fence_grant(
+            &self,
+            request: &crate::OwnershipFenceRequest,
+        ) -> Result<Option<crate::OwnershipFenceGrant>, IpsecLbError> {
+            self.inner.recover_fence_grant(request).await
+        }
+
+        async fn fence_sa_owner(
+            &self,
+            request: crate::OwnershipFenceRequest,
+        ) -> Result<crate::OwnershipFenceGrant, IpsecLbError> {
+            self.inner.fence_sa_owner(request).await
+        }
+
+        async fn validate_retry_proof(
+            &self,
+            proof: &crate::OwnershipRetryProof,
+        ) -> Result<(), IpsecLbError> {
+            self.inner.validate_retry_proof(proof).await
+        }
+    }
+
+    #[async_trait]
+    impl crate::OwnershipActivationAuthority for ParkAfterCommitAuthority {
+        async fn activate_ownership(
+            &self,
+            request: &crate::OwnershipActivationRequest,
+        ) -> Result<crate::OwnershipActivationGrant, IpsecLbError> {
+            let grant = self.inner.activate_ownership(request).await?;
+            if self.park.load(Ordering::SeqCst) {
+                self.committed.notify_one();
+                // Never resolves: the caller is cancelled here, holding a
+                // committed durable generation and no datapath state.
+                std::future::pending::<()>().await;
+            }
+            Ok(grant)
+        }
+
+        async fn recover_activation_grant(
+            &self,
+            request: &crate::OwnershipActivationRequest,
+        ) -> Result<Option<crate::OwnershipActivationGrant>, IpsecLbError> {
+            self.inner.recover_activation_grant(request).await
+        }
+    }
+
+    /// Authority that hands back a grant for a *different* activation.
+    ///
+    /// The coordinator must not trust the port: publishing this grant would
+    /// install a first owner for the wrong SA identity.
+    #[derive(Debug, Clone)]
+    struct MismatchedGrantActivationAuthority {
+        granted: crate::OwnershipActivationRequest,
+        fence: u64,
+    }
+
+    #[async_trait]
+    impl crate::OwnershipFencer for MismatchedGrantActivationAuthority {
+        async fn recover_fence_grant(
+            &self,
+            _request: &crate::OwnershipFenceRequest,
+        ) -> Result<Option<crate::OwnershipFenceGrant>, IpsecLbError> {
+            Err(IpsecLbError::Unsupported)
+        }
+
+        async fn fence_sa_owner(
+            &self,
+            _request: crate::OwnershipFenceRequest,
+        ) -> Result<crate::OwnershipFenceGrant, IpsecLbError> {
+            Err(IpsecLbError::Unsupported)
+        }
+
+        async fn validate_retry_proof(
+            &self,
+            _proof: &crate::OwnershipRetryProof,
+        ) -> Result<(), IpsecLbError> {
+            Err(IpsecLbError::Unsupported)
+        }
+    }
+
+    #[async_trait]
+    impl crate::OwnershipActivationAuthority for MismatchedGrantActivationAuthority {
+        async fn activate_ownership(
+            &self,
+            _request: &crate::OwnershipActivationRequest,
+        ) -> Result<crate::OwnershipActivationGrant, IpsecLbError> {
+            Ok(crate::repin::OwnershipActivationGrant::new(
+                self.granted.clone(),
+                OwnershipFence::new(self.fence).expect("nonzero test fence"),
+            ))
+        }
+
+        async fn recover_activation_grant(
+            &self,
+            _request: &crate::OwnershipActivationRequest,
+        ) -> Result<Option<crate::OwnershipActivationGrant>, IpsecLbError> {
+            Ok(None)
+        }
+    }
+
+    /// Ownership source whose answer changes between the pre-commit read and
+    /// the post-commit re-read `activate` performs.
+    #[derive(Debug, Clone)]
+    struct ShiftingShardOwnerSource {
+        first: crate::ClusterNode,
+        rest: Option<crate::ClusterNode>,
+        reads: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl crate::OwnershipSource for ShiftingShardOwnerSource {
+        async fn shard_owner(
+            &self,
+            _shard: ShardId,
+        ) -> Result<Option<crate::ClusterNode>, IpsecLbError> {
+            if self.reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Ok(Some(self.first.clone()));
+            }
+            Ok(self.rest.clone())
+        }
+
+        async fn sa_ownership(
+            &self,
+            _sa: crate::SaId,
+        ) -> Result<Option<crate::OwnershipSnapshot>, IpsecLbError> {
+            Ok(None)
+        }
+
+        async fn scoped_sa_ownership(
+            &self,
+            _key: SessionOwnershipKey,
+        ) -> Result<Option<crate::OwnershipSnapshot>, IpsecLbError> {
+            Ok(None)
+        }
+    }
+
+    /// Retirement backend that hands back a permit bound to a foreign key.
+    #[derive(Debug, Clone)]
+    struct ForeignKeyRetirementPermitBackend {
+        foreign: SessionOwnershipKey,
+    }
+
+    #[async_trait]
+    impl RePinSteeringBackend for ForeignKeyRetirementPermitBackend {
+        async fn apply_fenced_repin(
+            &self,
+            _update: RePinSteeringUpdate,
+            permit: RePinSteeringOperationPermit,
+        ) -> Result<RePinSteeringOperationPermit, IpsecLbError> {
+            Ok(permit)
+        }
+    }
+
+    #[async_trait]
+    impl RePinSteeringRetirementBackend for ForeignKeyRetirementPermitBackend {
+        async fn acquire_repin_retirement_permits(
+            &self,
+            ownership_keys: Vec<SessionOwnershipKey>,
+        ) -> Result<Vec<RePinSteeringOperationPermit>, IpsecLbError> {
+            Ok(ownership_keys
+                .into_iter()
+                .map(|_| RePinSteeringOperationPermit::unguarded(self.foreign))
+                .collect())
+        }
+
+        fn arm_repin_retirement_permit(
+            &self,
+            permit: RePinSteeringOperationPermit,
+        ) -> Result<RePinSteeringOperationPermit, IpsecLbError> {
+            Ok(permit)
+        }
+
+        fn release_classified_repin_retirement_permit(
+            &self,
+            _permit: RePinSteeringOperationPermit,
+        ) -> Result<(), IpsecLbError> {
+            Ok(())
+        }
+
+        async fn retire_fenced_repin(
+            &self,
+            _grant: &crate::OwnershipRetirementGrant,
+            permit: RePinSteeringOperationPermit,
+        ) -> Result<RePinSteeringOperationPermit, IpsecLbError> {
+            Ok(permit)
+        }
+    }
+
+    /// Retirement authority that observes whether the Host operation permit is
+    /// still held when finalization runs.
+    #[derive(Clone)]
+    struct PermitObservingRetirementAuthority {
+        backend: HostXdpSteeringBackend,
+        key: SessionOwnershipKey,
+        retirement_fence: u64,
+        permit_held_during_finalize: Arc<AtomicBool>,
+        finalize_calls: Arc<AtomicUsize>,
+    }
+
+    impl fmt::Debug for PermitObservingRetirementAuthority {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("PermitObservingRetirementAuthority")
+        }
+    }
+
+    #[async_trait]
+    impl crate::OwnershipFencer for PermitObservingRetirementAuthority {
+        async fn recover_fence_grant(
+            &self,
+            _request: &crate::OwnershipFenceRequest,
+        ) -> Result<Option<crate::OwnershipFenceGrant>, IpsecLbError> {
+            Err(IpsecLbError::Unsupported)
+        }
+
+        async fn fence_sa_owner(
+            &self,
+            _request: crate::OwnershipFenceRequest,
+        ) -> Result<crate::OwnershipFenceGrant, IpsecLbError> {
+            Err(IpsecLbError::Unsupported)
+        }
+
+        async fn validate_retry_proof(
+            &self,
+            _proof: &crate::OwnershipRetryProof,
+        ) -> Result<(), IpsecLbError> {
+            Err(IpsecLbError::Unsupported)
+        }
+    }
+
+    #[async_trait]
+    impl crate::OwnershipRetirementAuthority for PermitObservingRetirementAuthority {
+        async fn begin_ownership_retirement(
+            &self,
+            request: OwnershipRetirementRequest,
+        ) -> Result<crate::OwnershipRetirementAdmission, IpsecLbError> {
+            Ok(crate::OwnershipRetirementAdmission::Granted(
+                crate::repin::OwnershipRetirementGrant::new(
+                    request,
+                    OwnershipFence::new(self.retirement_fence).expect("nonzero test fence"),
+                ),
+            ))
+        }
+
+        async fn finalize_ownership_retirement(
+            &self,
+            _cleanup: &crate::OwnershipCleanupCompleteProof,
+        ) -> Result<crate::OwnershipRetirementFinalization, IpsecLbError> {
+            self.finalize_calls.fetch_add(1, Ordering::SeqCst);
+            // The stripe gate is exactly what a held permit owns. If the
+            // coordinator released the permit before finalizing, this
+            // acquisition succeeds instead of timing out.
+            let blocked = tokio::time::timeout(
+                std::time::Duration::from_millis(150),
+                self.backend.acquire_repin_permit(self.key),
+            )
+            .await
+            .is_err();
+            self.permit_held_during_finalize
+                .store(blocked, Ordering::SeqCst);
+            Ok(crate::OwnershipRetirementFinalization::Deleted)
+        }
+    }
+
+    fn activation_request(
+        spi: u32,
+        ownership_key: SessionOwnershipKey,
+        transition_id: u128,
+    ) -> crate::OwnershipActivationRequest {
+        crate::OwnershipActivationRequest::new_esp(
+            spi,
+            OwnershipTransitionId::new(transition_id).expect("nonzero"),
+            crate::ClusterNode::new("owner-a"),
+            crate::SteeringRule {
+                shard: ShardId::new(7),
+                owner: ShardId::new(3),
+                key: crate::SteerKey::EspSpi(spi),
+            },
+            ownership_key,
+        )
+        .expect("valid activation request")
+    }
+
+    fn activation_ownership_source() -> MockOwnershipSource {
+        let ownership = MockOwnershipSource::default();
+        ownership.set_shard_owner(ShardId::new(3), crate::ClusterNode::new("owner-a"));
+        ownership
+    }
+
+    fn activation_coordinator(
+        backend: HostXdpSteeringBackend,
+        fence: u64,
+    ) -> RePinCoordinator<
+        HostXdpSteeringBackend,
+        FixedActivationAuthority,
+        MockOwnershipSource,
+        MockRePinAuditSink,
+    > {
+        RePinCoordinator::new(
+            backend,
+            FixedActivationAuthority::new(fence),
+            activation_ownership_source(),
+            MockRePinAuditSink::new(),
+        )
+    }
+
+    #[tokio::test]
+    async fn activation_publishes_the_first_owner_and_fence_for_a_fresh_key() {
+        let runtime = Arc::new(TestRuntime::default());
+        let backend = HostXdpSteeringBackend::with_runtime_and_config(
+            "swu0",
+            runtime.clone(),
+            repin_config(),
+        );
+        backend.attach().await.expect("attach");
+        let key = esp_key(0x5100);
+        let request = activation_request(0x5100, key, 5101);
+
+        // No entry exists for a freshly negotiated SA, so the datapath would
+        // classify its packets SlowPathMiss before activation.
+        assert_eq!(
+            keyed_test_verdict(&runtime, owner_map_key(&key)),
+            XdpVerdict::SlowPathMiss
+        );
+
+        let coordinator = activation_coordinator(backend.clone(), 12);
+        let outcome = coordinator
+            .activate(&request)
+            .await
+            .expect("first activation publishes");
+        assert_eq!(outcome.fence().get(), 12);
+
+        assert_eq!(
+            backend.owner_record(&key).await.expect("readback"),
+            Some((ShardId::new(3), 12))
+        );
+        {
+            let state = runtime.state();
+            assert_eq!(state.key_fences.get(&(7, owner_map_key(&key))), Some(&12));
+        }
+        assert_eq!(
+            keyed_test_verdict(&runtime, owner_map_key(&key)),
+            XdpVerdict::Local
+        );
+    }
+
+    #[tokio::test]
+    async fn activation_exact_retry_is_idempotent() {
+        let runtime = Arc::new(TestRuntime::default());
+        let backend = HostXdpSteeringBackend::with_runtime_and_config(
+            "swu0",
+            runtime.clone(),
+            repin_config(),
+        );
+        backend.attach().await.expect("attach");
+        let key = esp_key(0x5110);
+        let request = activation_request(0x5110, key, 5111);
+        let coordinator = activation_coordinator(backend.clone(), 20);
+
+        for _ in 0..3 {
+            let outcome = coordinator
+                .activate(&request)
+                .await
+                .expect("exact retry converges");
+            assert_eq!(outcome.fence().get(), 20);
+        }
+        assert_eq!(
+            backend.owner_record(&key).await.expect("readback"),
+            Some((ShardId::new(3), 20))
+        );
+        let state = runtime.state();
+        assert_eq!(state.owners.len(), 1);
+        assert_eq!(state.key_fences.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn activation_rejects_a_foreign_routing_domain() {
+        let backend = HostXdpSteeringBackend::with_runtime_and_config(
+            "swu0",
+            Arc::new(TestRuntime::default()),
+            repin_config(),
+        );
+        backend.attach().await.expect("attach");
+        let foreign = SessionOwnershipKey::Esp(EspOwnershipKey::new(
+            DestinationContext::new(IpAddress::V4([203, 0, 113, 7]), RoutingDomainTag::new(9)),
+            EspEncapsulationKind::UdpEncapsulated,
+            EspSpi::new(0x5120).expect("allocatable SPI"),
+        ));
+        let request = activation_request(0x5120, foreign, 5121);
+        let coordinator = activation_coordinator(backend, 30);
+
+        assert_eq!(
+            coordinator.activate(&request).await,
+            Err(IpsecLbError::invalid_config(
+                "ownership.routing_domain",
+                "ownership key routing domain does not match the backend",
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn activation_below_the_datapath_keyed_fence_is_refused() {
+        let runtime = Arc::new(TestRuntime::default());
+        let backend = HostXdpSteeringBackend::with_runtime_and_config(
+            "swu0",
+            runtime.clone(),
+            repin_config(),
+        );
+        backend.attach().await.expect("attach");
+        let key = esp_key(0x5130);
+        let map_key = owner_map_key(&key);
+        {
+            let mut state = runtime.state();
+            state.owners.insert((7, map_key), owner_value(4, 40));
+            state.key_fences.insert((7, map_key), 40);
+        }
+        let request = activation_request(0x5130, key, 5131);
+        let coordinator = activation_coordinator(backend, 39);
+
+        assert_eq!(
+            coordinator.activate(&request).await,
+            Err(IpsecLbError::ownership_conflict(
+                "destination-scoped owner or fence generation cannot regress",
+            ))
+        );
+        let state = runtime.state();
+        assert_eq!(state.owners.get(&(7, map_key)), Some(&owner_value(4, 40)));
+        assert_eq!(state.key_fences.get(&(7, map_key)), Some(&40));
+    }
+
+    #[tokio::test]
+    async fn activation_never_overwrites_a_conflicting_owner_at_the_same_generation() {
+        let runtime = Arc::new(TestRuntime::default());
+        let backend = HostXdpSteeringBackend::with_runtime_and_config(
+            "swu0",
+            runtime.clone(),
+            repin_config(),
+        );
+        backend.attach().await.expect("attach");
+        let key = esp_key(0x5140);
+        let map_key = owner_map_key(&key);
+        {
+            let mut state = runtime.state();
+            state.owners.insert((7, map_key), owner_value(4, 50));
+            state.key_fences.insert((7, map_key), 50);
+        }
+        let request = activation_request(0x5140, key, 5141);
+        let coordinator = activation_coordinator(backend, 50);
+
+        assert_eq!(
+            coordinator.activate(&request).await,
+            Err(IpsecLbError::ownership_conflict(
+                "destination-scoped generation names a different owner",
+            ))
+        );
+        // The conflicting owner survives as the durable retry witness; only the
+        // non-live fence is withdrawn.
+        let state = runtime.state();
+        assert_eq!(state.owners.get(&(7, map_key)), Some(&owner_value(4, 50)));
+        assert!(!state.key_fences.contains_key(&(7, map_key)));
+    }
+
+    #[tokio::test]
+    async fn activation_is_refused_on_a_poisoned_operation_stripe() {
+        let backend = HostXdpSteeringBackend::with_runtime_and_config(
+            "swu0",
+            Arc::new(TestRuntime::default()),
+            repin_config(),
+        );
+        backend.attach().await.expect("attach");
+        let key = esp_key(0x5150);
+        // Poison the stripe exactly as an indeterminate retirement does.
+        let mut permits = backend
+            .acquire_repin_retirement_permits(vec![key])
+            .await
+            .expect("retirement batch acquires");
+        let permit = permits.pop().expect("one permit");
+        drop(backend.arm_repin_retirement_permit(permit).expect("arms"));
+
+        let request = activation_request(0x5150, key, 5151);
+        let coordinator = activation_coordinator(backend, 60);
+        assert_eq!(
+            coordinator.activate(&request).await,
+            Err(IpsecLbError::adapter_contract_violation(
+                "host_xdp_repin_operation_stripe_poisoned",
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_activation_leaves_no_partially_published_state() {
+        let runtime = Arc::new(TestRuntime::default());
+        let backend = HostXdpSteeringBackend::with_runtime_and_config(
+            "swu0",
+            runtime.clone(),
+            repin_config(),
+        );
+        backend.attach().await.expect("attach");
+        let key = esp_key(0x5160);
+        let map_key = owner_map_key(&key);
+        let request = activation_request(0x5160, key, 5161);
+        let coordinator = Arc::new(activation_coordinator(backend.clone(), 70));
+
+        // `spawn` + one `yield_now` + `abort` cancels at the first `Pending`
+        // the activation reaches, which is the `spawn_blocking` boundary inside
+        // `acquire_repin_permit` — before the ownership commit and before any
+        // map write. So every iteration below observes `(None, None)`; the
+        // published arms are retained as fail-closed guards against a future
+        // reordering, not because this loop reaches them.
+        //
+        // The case that can actually leave partial state — cancellation after
+        // the durable ownership CAS commits, with the maps still empty — is
+        // covered separately by
+        // `cancellation_after_the_durable_ownership_commit_converges_on_replay`,
+        // which parks the activation at exactly that point and asserts over the
+        // store record as well as the maps.
+        for _ in 0..8 {
+            let coordinator = Arc::clone(&coordinator);
+            let request = request.clone();
+            let pending = tokio::spawn(async move { coordinator.activate(&request).await });
+            tokio::task::yield_now().await;
+            pending.abort();
+            let _ = pending.await;
+
+            let (owner, fence) = {
+                let state = runtime.state();
+                (
+                    state.owners.get(&(7, map_key)).copied(),
+                    state.key_fences.get(&(7, map_key)).copied(),
+                )
+            };
+            match (owner, fence) {
+                (None, None) => {}
+                (Some(value), None) if value == owner_value(3, 70) => {}
+                (Some(value), Some(70)) if value == owner_value(3, 70) => {}
+                other => panic!("cancellation left torn destination-scoped state: {other:?}"),
+            }
+        }
+
+        // A replay after cancellation still converges to the exact activation.
+        coordinator
+            .activate(&request)
+            .await
+            .expect("replay converges");
+        assert_eq!(
+            backend.owner_record(&key).await.expect("readback"),
+            Some((ShardId::new(3), 70))
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_recovery_owner_witness_is_reactivated_by_an_exact_replay() {
+        let runtime = Arc::new(TestRuntime::default());
+        let backend = HostXdpSteeringBackend::with_runtime_and_config(
+            "swu0",
+            runtime.clone(),
+            repin_config(),
+        );
+        backend.attach().await.expect("attach");
+        let key = esp_key(0x5170);
+        let map_key = owner_map_key(&key);
+        // Restart recovery retains the owner witness and withholds the paired
+        // keyed fence, so the entry is stale and cannot steer.
+        {
+            let mut state = runtime.state();
+            state.owners.insert((7, map_key), owner_value(3, 80));
+        }
+        assert_eq!(
+            keyed_test_verdict(&runtime, map_key),
+            XdpVerdict::SlowPathStale
+        );
+
+        let request = activation_request(0x5170, key, 5171);
+        let coordinator = activation_coordinator(backend.clone(), 80);
+        coordinator
+            .activate(&request)
+            .await
+            .expect("recovered witness re-arms at its committed generation");
+
+        assert_eq!(
+            backend.owner_record(&key).await.expect("readback"),
+            Some((ShardId::new(3), 80))
+        );
+        assert_eq!(keyed_test_verdict(&runtime, map_key), XdpVerdict::Local);
+    }
+
+    // ---------------------------------------------------------------------
+    // Production-adapter activation and retirement composition (#561 review).
+    // ---------------------------------------------------------------------
+
+    fn activation_keyspace() -> crate::session::SessionOwnershipKeyspace {
+        crate::session::SessionOwnershipKeyspace::new(
+            opc_types::TenantId::new("tenant-a").expect("valid tenant"),
+            opc_types::NetworkFunctionKind::new("epdg").expect("valid NF kind"),
+        )
+    }
+
+    type StoreFencer = crate::session::SessionStoreOwnershipFencer<
+        opc_session_store::FakeSessionBackend,
+        crate::session::SessionOwnershipKeyspace,
+    >;
+
+    /// Write the authoritative birth record through the public helper, so this
+    /// test also proves `birth_record` produces a record `activate` accepts.
+    async fn seed_activation_birth_record(
+        store: &opc_session_store::FakeSessionBackend,
+        fencer: &StoreFencer,
+        key: &SessionOwnershipKey,
+        owner: &str,
+    ) {
+        use crate::session::SessionOwnershipKeyResolver;
+        use opc_session_store::{SessionBackend, SessionLeaseManager};
+
+        let session_key = activation_keyspace()
+            .scoped_sa_key(key)
+            .expect("scoped SA key");
+        let lease = store
+            .acquire(
+                &session_key,
+                opc_session_store::OwnerId::new(owner).expect("valid owner"),
+                std::time::Duration::from_secs(60),
+            )
+            .await
+            .expect("birth lease");
+        let record = fencer
+            .birth_record(&session_key, &crate::ClusterNode::new(owner), &lease)
+            .expect("birth record");
+        assert_eq!(
+            store
+                .compare_and_set(opc_session_store::CompareAndSet {
+                    key: session_key,
+                    lease: lease.clone(),
+                    expected_generation: None,
+                    new_record: record,
+                })
+                .await
+                .expect("birth CAS"),
+            opc_session_store::CompareAndSetResult::Success
+        );
+        store.release(lease).await.expect("birth lease release");
+    }
+
+    /// H-1: the paired teardown, driven end to end through the *production*
+    /// Host-XDP steering adapter and the *production* session-store activation
+    /// and retirement authority. Both destination-scoped maps must be absent
+    /// afterwards, observed from the runtime the XDP program reads.
+    #[tokio::test]
+    async fn public_activation_retires_and_leaves_both_host_xdp_maps_absent() {
+        use opc_session_store::SessionBackend;
+
+        let runtime = Arc::new(TestRuntime::default());
+        let backend = HostXdpSteeringBackend::with_runtime_and_config(
+            "swu0",
+            runtime.clone(),
+            repin_config(),
+        );
+        backend.attach().await.expect("attach");
+        let key = esp_key(0x5180);
+        let map_key = owner_map_key(&key);
+        let request = activation_request(0x5180, key, 5181);
+
+        let store = opc_session_store::FakeSessionBackend::new();
+        let fencer =
+            crate::session::SessionStoreOwnershipFencer::new(store.clone(), activation_keyspace());
+        seed_activation_birth_record(&store, &fencer, &key, "owner-a").await;
+
+        let coordinator = RePinCoordinator::new(
+            backend.clone(),
+            fencer,
+            activation_ownership_source(),
+            MockRePinAuditSink::new(),
+        );
+
+        let activated = coordinator
+            .activate(&request)
+            .await
+            .expect("first activation publishes through the production adapter");
+        assert_eq!(
+            backend.owner_record(&key).await.expect("readback"),
+            Some((ShardId::new(3), activated.fence().get())),
+            "the exact owner shard and store-minted generation must be readable"
+        );
+        assert_eq!(keyed_test_verdict(&runtime, map_key), XdpVerdict::Local);
+
+        let retirement = coordinator
+            .retire_activation(&request, activated.fence())
+            .await
+            .expect("activation retires through the production adapter");
+        match retirement {
+            crate::OwnershipActivationRetirement::Finalized(proof) => assert_eq!(
+                proof.disposition(),
+                crate::OwnershipRetirementFinalization::Deleted
+            ),
+            crate::OwnershipActivationRetirement::Superseded(_) => {
+                panic!("a freshly activated key cannot be superseded")
+            }
+        }
+
+        assert_eq!(
+            backend.owner_record(&key).await.expect("readback"),
+            None,
+            "the Host owner map must be empty after retirement"
+        );
+        {
+            let state = runtime.state();
+            assert!(
+                !state.owners.contains_key(&(7, map_key)),
+                "IPSEC_LB_OWNERS must not retain the retired entry"
+            );
+            assert!(
+                !state.key_fences.contains_key(&(7, map_key)),
+                "IPSEC_LB_KEY_FENCES must not retain the retired entry"
+            );
+        }
+        assert_eq!(
+            keyed_test_verdict(&runtime, map_key),
+            XdpVerdict::SlowPathMiss
+        );
+        let scoped = {
+            use crate::session::SessionOwnershipKeyResolver;
+            activation_keyspace()
+                .scoped_sa_key(&key)
+                .expect("scoped SA key")
+        };
+        assert!(
+            store.get(&scoped).await.expect("store read").is_none(),
+            "the durable ownership record must be fenced-deleted"
+        );
+    }
+
+    /// SEC-2: `retire_activation` must refuse a caller whose claimed owner does
+    /// not hold the target shard, exactly as `activate` does.
+    #[tokio::test]
+    async fn retirement_refuses_an_owner_that_does_not_hold_the_target_shard() {
+        let runtime = Arc::new(TestRuntime::default());
+        let backend = HostXdpSteeringBackend::with_runtime_and_config(
+            "swu0",
+            runtime.clone(),
+            repin_config(),
+        );
+        backend.attach().await.expect("attach");
+        let key = esp_key(0x5190);
+        let map_key = owner_map_key(&key);
+        let request = activation_request(0x5190, key, 5191);
+
+        let store = opc_session_store::FakeSessionBackend::new();
+        let fencer =
+            crate::session::SessionStoreOwnershipFencer::new(store.clone(), activation_keyspace());
+        seed_activation_birth_record(&store, &fencer, &key, "owner-a").await;
+
+        let ownership = activation_ownership_source();
+        let coordinator = RePinCoordinator::new(
+            backend.clone(),
+            fencer,
+            ownership.clone(),
+            MockRePinAuditSink::new(),
+        );
+        let activated = coordinator.activate(&request).await.expect("activates");
+
+        // The shard moves to another node. A third party replaying the exact
+        // request must no longer be able to tear the SA down.
+        ownership.set_shard_owner(ShardId::new(3), crate::ClusterNode::new("owner-b"));
+        assert_eq!(
+            coordinator
+                .retire_activation(&request, activated.fence())
+                .await,
+            Err(IpsecLbError::ownership_conflict(
+                "steering target shard is not owned by the activating owner",
+            ))
+        );
+        // Refused before any durable or datapath mutation: the activation is
+        // still live and still steers.
+        assert_eq!(
+            backend.owner_record(&key).await.expect("readback"),
+            Some((ShardId::new(3), activated.fence().get()))
+        );
+        assert_eq!(keyed_test_verdict(&runtime, map_key), XdpVerdict::Local);
+
+        // ... and a shard with no authoritative owner at all is refused too.
+        let orphaned = ShiftingShardOwnerSource {
+            first: crate::ClusterNode::new("owner-a"),
+            rest: None,
+            reads: Arc::new(AtomicUsize::new(1)),
+        };
+        let orphaned_coordinator = RePinCoordinator::new(
+            backend.clone(),
+            crate::session::SessionStoreOwnershipFencer::new(store.clone(), activation_keyspace()),
+            orphaned,
+            MockRePinAuditSink::new(),
+        );
+        assert_eq!(
+            orphaned_coordinator
+                .retire_activation(&request, activated.fence())
+                .await,
+            Err(IpsecLbError::ownership_conflict(
+                "steering target shard has no authoritative owner",
+            ))
+        );
+
+        // The legitimate owner still retires it.
+        ownership.set_shard_owner(ShardId::new(3), crate::ClusterNode::new("owner-a"));
+        coordinator
+            .retire_activation(&request, activated.fence())
+            .await
+            .expect("the real owner still retires its own activation");
+        assert_eq!(backend.owner_record(&key).await.expect("readback"), None);
+    }
+
+    /// M-2: both arms of the activation target-owner gate.
+    #[tokio::test]
+    async fn activation_requires_the_target_shard_to_be_owned_by_the_activating_owner() {
+        let runtime = Arc::new(TestRuntime::default());
+        let backend = HostXdpSteeringBackend::with_runtime_and_config(
+            "swu0",
+            runtime.clone(),
+            repin_config(),
+        );
+        backend.attach().await.expect("attach");
+        let key = esp_key(0x51a0);
+        let map_key = owner_map_key(&key);
+        let request = activation_request(0x51a0, key, 0x51a1);
+
+        let foreign = MockOwnershipSource::default();
+        foreign.set_shard_owner(ShardId::new(3), crate::ClusterNode::new("owner-b"));
+        let coordinator = RePinCoordinator::new(
+            backend.clone(),
+            FixedActivationAuthority::new(90),
+            foreign,
+            MockRePinAuditSink::new(),
+        );
+        assert_eq!(
+            coordinator.activate(&request).await,
+            Err(IpsecLbError::ownership_conflict(
+                "steering target shard is not owned by the activating owner",
+            ))
+        );
+
+        // Absent shard owner: `MockOwnershipSource::default()` returns `None`.
+        let absent = RePinCoordinator::new(
+            backend.clone(),
+            FixedActivationAuthority::new(90),
+            MockOwnershipSource::default(),
+            MockRePinAuditSink::new(),
+        );
+        assert_eq!(
+            absent.activate(&request).await,
+            Err(IpsecLbError::ownership_conflict(
+                "steering target shard has no authoritative owner",
+            ))
+        );
+
+        let state = runtime.state();
+        assert!(!state.owners.contains_key(&(7, map_key)));
+        assert!(!state.key_fences.contains_key(&(7, map_key)));
+    }
+
+    /// M-2: the post-commit re-read of the target shard owner. The pre-commit
+    /// read succeeds and the ownership commit lands, then the shard moves; no
+    /// stale snapshot may reach the datapath publication.
+    #[tokio::test]
+    async fn activation_rechecks_the_target_shard_owner_after_the_ownership_commit() {
+        let runtime = Arc::new(TestRuntime::default());
+        let backend = HostXdpSteeringBackend::with_runtime_and_config(
+            "swu0",
+            runtime.clone(),
+            repin_config(),
+        );
+        backend.attach().await.expect("attach");
+        let key = esp_key(0x51b0);
+        let map_key = owner_map_key(&key);
+        let request = activation_request(0x51b0, key, 0x51b1);
+
+        let authority = FixedActivationAuthority::new(95);
+        let shifting = ShiftingShardOwnerSource {
+            first: crate::ClusterNode::new("owner-a"),
+            rest: Some(crate::ClusterNode::new("owner-b")),
+            reads: Arc::new(AtomicUsize::new(0)),
+        };
+        let reads = Arc::clone(&shifting.reads);
+        let coordinator = RePinCoordinator::new(
+            backend.clone(),
+            authority.clone(),
+            shifting,
+            MockRePinAuditSink::new(),
+        );
+
+        assert_eq!(
+            coordinator.activate(&request).await,
+            Err(IpsecLbError::ownership_conflict(
+                "steering target shard is not owned by the activating owner",
+            ))
+        );
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            2,
+            "the shard owner must be read again after the ownership commit"
+        );
+        assert_eq!(
+            authority.activations(),
+            1,
+            "the ownership commit must already have happened"
+        );
+        let state = runtime.state();
+        assert!(
+            !state.owners.contains_key(&(7, map_key)),
+            "no owner may be published from a stale pre-commit snapshot"
+        );
+        assert!(!state.key_fences.contains_key(&(7, map_key)));
+    }
+
+    /// M-2: the coordinator does not trust the activation authority port.
+    #[tokio::test]
+    async fn activation_rejects_a_grant_issued_for_a_different_request() {
+        let runtime = Arc::new(TestRuntime::default());
+        let backend = HostXdpSteeringBackend::with_runtime_and_config(
+            "swu0",
+            runtime.clone(),
+            repin_config(),
+        );
+        backend.attach().await.expect("attach");
+        let key = esp_key(0x51c0);
+        let map_key = owner_map_key(&key);
+        let request = activation_request(0x51c0, key, 0x51c1);
+        // A grant for a different SA and key entirely.
+        let other = activation_request(0x51c8, esp_key(0x51c8), 0x51c9);
+
+        let coordinator = RePinCoordinator::new(
+            backend.clone(),
+            MismatchedGrantActivationAuthority {
+                granted: other,
+                fence: 100,
+            },
+            activation_ownership_source(),
+            MockRePinAuditSink::new(),
+        );
+        assert_eq!(
+            coordinator.activate(&request).await,
+            Err(IpsecLbError::ownership_conflict(
+                "activation grant does not match the requested SA and owner",
+            ))
+        );
+        let state = runtime.state();
+        assert!(!state.owners.contains_key(&(7, map_key)));
+        assert!(!state.key_fences.contains_key(&(7, map_key)));
+    }
+
+    /// M-2: the retirement permit must be bound to the exact ownership key.
+    #[tokio::test]
+    async fn retirement_rejects_a_permit_bound_to_a_foreign_ownership_key() {
+        let key = esp_key(0x51d0);
+        let request = activation_request(0x51d0, key, 0x51d1);
+        let coordinator = RePinCoordinator::new(
+            ForeignKeyRetirementPermitBackend {
+                foreign: esp_key(0x51d8),
+            },
+            IndeterminateRetirementAuthority,
+            activation_ownership_source(),
+            MockRePinAuditSink::new(),
+        );
+        assert_eq!(
+            coordinator
+                .retire_activation(&request, OwnershipFence::new(7).expect("nonzero"))
+                .await,
+            Err(IpsecLbError::adapter_contract_violation(
+                "repin_retirement_permit_key_mismatch",
+            )),
+            "a foreign-key permit must be refused before the authority is called"
+        );
+    }
+
+    /// M-3: an ambiguous retirement authority result must poison the stripe
+    /// rather than being classified as a safe permit release.
+    #[tokio::test]
+    async fn indeterminate_activation_retirement_is_not_classified_as_safe_permit_release() {
+        let backend = HostXdpSteeringBackend::with_runtime_and_config(
+            "swu0",
+            Arc::new(TestRuntime::default()),
+            repin_config(),
+        );
+        backend.attach().await.expect("attach");
+        let key = esp_key(0x51e0);
+        let request = activation_request(0x51e0, key, 0x51e1);
+        let coordinator = RePinCoordinator::new(
+            backend.clone(),
+            IndeterminateRetirementAuthority,
+            activation_ownership_source(),
+            MockRePinAuditSink::new(),
+        );
+
+        assert_eq!(
+            coordinator
+                .retire_activation(&request, OwnershipFence::new(4).expect("nonzero"))
+                .await,
+            Err(IpsecLbError::OwnershipRetirementIndeterminate)
+        );
+
+        let probe = backend.probe_repin().await.expect("probe completes");
+        assert!(!probe.mutation_ready);
+        assert_eq!(
+            probe.details,
+            Some("Host-XDP re-pin operation state is indeterminate")
+        );
+        assert_eq!(
+            backend.acquire_repin_permit(key).await.err(),
+            Some(IpsecLbError::adapter_contract_violation(
+                "host_xdp_repin_operation_stripe_poisoned",
+            ))
+        );
+    }
+
+    /// M-3: the documented ordering — the operation permit is held across
+    /// finalization, so no concurrent keyed mutation can cross the cleanup cut.
+    #[tokio::test]
+    async fn activation_retirement_holds_the_operation_permit_across_finalization() {
+        let runtime = Arc::new(TestRuntime::default());
+        let backend = HostXdpSteeringBackend::with_runtime_and_config(
+            "swu0",
+            runtime.clone(),
+            repin_config(),
+        );
+        backend.attach().await.expect("attach");
+        let key = esp_key(0x51f0);
+        let map_key = owner_map_key(&key);
+        let request = activation_request(0x51f0, key, 0x51f1);
+
+        // Seed a committed activation directly into the maps at fence 110.
+        apply_keyed_test_update(&backend, &key, ShardId::new(3), 110).expect("seed activation");
+
+        let authority = PermitObservingRetirementAuthority {
+            backend: backend.clone(),
+            key,
+            retirement_fence: 111,
+            permit_held_during_finalize: Arc::new(AtomicBool::new(false)),
+            finalize_calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let held = Arc::clone(&authority.permit_held_during_finalize);
+        let finalize_calls = Arc::clone(&authority.finalize_calls);
+        let coordinator = RePinCoordinator::new(
+            backend.clone(),
+            authority,
+            activation_ownership_source(),
+            MockRePinAuditSink::new(),
+        );
+
+        coordinator
+            .retire_activation(&request, OwnershipFence::new(110).expect("nonzero"))
+            .await
+            .expect("retirement finalizes");
+        assert_eq!(finalize_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            held.load(Ordering::SeqCst),
+            "the operation permit must still be held while finalization runs"
+        );
+        let state = runtime.state();
+        assert!(!state.owners.contains_key(&(7, map_key)));
+        assert!(!state.key_fences.contains_key(&(7, map_key)));
+    }
+
+    /// M-4: a successful activation is audited as its own event kind.
+    #[tokio::test]
+    async fn activation_records_a_distinct_activated_audit_event() {
+        let backend = HostXdpSteeringBackend::with_runtime_and_config(
+            "swu0",
+            Arc::new(TestRuntime::default()),
+            repin_config(),
+        );
+        backend.attach().await.expect("attach");
+        let key = esp_key(0x5200);
+        let request = activation_request(0x5200, key, 0x5201);
+        let audit = MockRePinAuditSink::new();
+        let coordinator = RePinCoordinator::new(
+            backend,
+            FixedActivationAuthority::new(120),
+            activation_ownership_source(),
+            audit.clone(),
+        );
+
+        coordinator.activate(&request).await.expect("activates");
+
+        let events = audit.events();
+        assert_eq!(
+            events.iter().map(|event| event.kind).collect::<Vec<_>>(),
+            vec![
+                crate::RePinAuditEventKind::Attempt,
+                crate::RePinAuditEventKind::Activated,
+            ],
+            "a first activation must be audited as Activated, not SteeringInstalled"
+        );
+        let activated = events.last().expect("activation event");
+        assert_eq!(activated.sa, request.sa());
+        assert_eq!(activated.transition_id, request.transition_id());
+        assert_eq!(activated.fence.map(OwnershipFence::get), Some(120));
+        assert_eq!(&activated.previous_owner, request.owner());
+        assert_eq!(
+            activated.previous_owner, activated.new_owner,
+            "activation takes ownership from nobody"
+        );
+        assert!(!activated.forwarding_proven);
+        assert_eq!(activated.failure_code, None);
+    }
+
+    /// M-5: an exact retry recovers the committed grant instead of minting a
+    /// second generation. The datapath convergence is already covered; this
+    /// asserts the authority is asked to mint exactly once.
+    #[tokio::test]
+    async fn activation_exact_retry_recovers_without_minting_a_second_generation() {
+        let runtime = Arc::new(TestRuntime::default());
+        let backend = HostXdpSteeringBackend::with_runtime_and_config(
+            "swu0",
+            runtime.clone(),
+            repin_config(),
+        );
+        backend.attach().await.expect("attach");
+        let key = esp_key(0x5210);
+        let request = activation_request(0x5210, key, 0x5211);
+        let authority = FixedActivationAuthority::new(130).with_committed_recovery();
+        let coordinator = RePinCoordinator::new(
+            backend.clone(),
+            authority.clone(),
+            activation_ownership_source(),
+            MockRePinAuditSink::new(),
+        );
+
+        for _ in 0..3 {
+            assert_eq!(
+                coordinator
+                    .activate(&request)
+                    .await
+                    .expect("exact retry converges")
+                    .fence()
+                    .get(),
+                130
+            );
+        }
+        assert_eq!(
+            authority.activations(),
+            1,
+            "an exact retry must recover the committed grant, never mint again"
+        );
+        assert_eq!(
+            backend.owner_record(&key).await.expect("readback"),
+            Some((ShardId::new(3), 130))
+        );
+    }
+
+    /// M-1: cancellation *after* the durable ownership CAS commits is the one
+    /// point at which a genuine partial state exists — store `Active`, both
+    /// maps empty. Absence must not read as "never activated", and replaying
+    /// the identical request must converge on the already-committed generation
+    /// rather than minting a second one.
+    #[tokio::test]
+    async fn cancellation_after_the_durable_ownership_commit_converges_on_replay() {
+        use crate::session::SessionOwnershipKeyResolver;
+        use opc_session_store::SessionBackend;
+
+        let runtime = Arc::new(TestRuntime::default());
+        let backend = HostXdpSteeringBackend::with_runtime_and_config(
+            "swu0",
+            runtime.clone(),
+            repin_config(),
+        );
+        backend.attach().await.expect("attach");
+        let key = esp_key(0x5230);
+        let map_key = owner_map_key(&key);
+        let request = activation_request(0x5230, key, 0x5231);
+
+        let store = opc_session_store::FakeSessionBackend::new();
+        let fencer =
+            crate::session::SessionStoreOwnershipFencer::new(store.clone(), activation_keyspace());
+        seed_activation_birth_record(&store, &fencer, &key, "owner-a").await;
+        let scoped = activation_keyspace()
+            .scoped_sa_key(&key)
+            .expect("scoped SA key");
+        let birth_fence = store
+            .get(&scoped)
+            .await
+            .expect("store read")
+            .expect("birth record")
+            .fence;
+
+        let authority = ParkAfterCommitAuthority {
+            inner: Arc::new(fencer),
+            park: Arc::new(AtomicBool::new(true)),
+            committed: Arc::new(tokio::sync::Notify::new()),
+        };
+        let park = Arc::clone(&authority.park);
+        let committed = Arc::clone(&authority.committed);
+        let coordinator = Arc::new(RePinCoordinator::new(
+            backend.clone(),
+            authority,
+            activation_ownership_source(),
+            MockRePinAuditSink::new(),
+        ));
+
+        let pending = {
+            let coordinator = Arc::clone(&coordinator);
+            let request = request.clone();
+            tokio::spawn(async move { coordinator.activate(&request).await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), committed.notified())
+            .await
+            .expect("the ownership CAS commits");
+        pending.abort();
+        let _ = pending.await;
+
+        // The genuine partial state: durable ownership committed, datapath
+        // empty.
+        let committed_record = store
+            .get(&scoped)
+            .await
+            .expect("store read")
+            .expect("the ownership record survives cancellation");
+        assert!(
+            committed_record.fence > birth_fence,
+            "the activation generation must have advanced past the birth fence"
+        );
+        {
+            let state = runtime.state();
+            assert!(
+                !state.owners.contains_key(&(7, map_key)),
+                "a cancelled activation must publish no owner"
+            );
+            assert!(
+                !state.key_fences.contains_key(&(7, map_key)),
+                "a cancelled activation must publish no keyed fence"
+            );
+        }
+        assert_eq!(
+            keyed_test_verdict(&runtime, map_key),
+            XdpVerdict::SlowPathMiss
+        );
+
+        // Replay converges on the committed generation without minting again.
+        park.store(false, Ordering::SeqCst);
+        let outcome = coordinator
+            .activate(&request)
+            .await
+            .expect("the identical replay converges");
+        assert_eq!(outcome.fence().get(), committed_record.fence.get());
+        assert_eq!(
+            backend.owner_record(&key).await.expect("readback"),
+            Some((ShardId::new(3), committed_record.fence.get()))
+        );
+        assert_eq!(keyed_test_verdict(&runtime, map_key), XdpVerdict::Local);
+        let after_replay = store
+            .get(&scoped)
+            .await
+            .expect("store read")
+            .expect("record present");
+        assert_eq!(
+            (after_replay.fence, after_replay.generation),
+            (committed_record.fence, committed_record.generation),
+            "an exact replay must not mint a second durable generation"
+        );
+    }
+
+    /// M-5: a lost commit acknowledgement is recovered rather than reported.
+    #[tokio::test]
+    async fn activation_recovers_a_committed_grant_after_a_lost_acknowledgement() {
+        let runtime = Arc::new(TestRuntime::default());
+        let backend = HostXdpSteeringBackend::with_runtime_and_config(
+            "swu0",
+            runtime.clone(),
+            repin_config(),
+        );
+        backend.attach().await.expect("attach");
+        let key = esp_key(0x5220);
+        let request = activation_request(0x5220, key, 0x5221);
+        let authority = FixedActivationAuthority::new(140).with_lost_commit_acknowledgement();
+        let coordinator = RePinCoordinator::new(
+            backend.clone(),
+            authority.clone(),
+            activation_ownership_source(),
+            MockRePinAuditSink::new(),
+        );
+
+        // `activate_ownership` commits and then reports a failure. The
+        // post-commit recovery arm must find the committed grant and publish
+        // it rather than surfacing the ambiguous error.
+        assert_eq!(
+            coordinator
+                .activate(&request)
+                .await
+                .expect("the committed grant is recovered")
+                .fence()
+                .get(),
+            140
+        );
+        assert_eq!(authority.activations(), 1);
+        assert_eq!(
+            backend.owner_record(&key).await.expect("readback"),
+            Some((ShardId::new(3), 140))
+        );
+    }
 }

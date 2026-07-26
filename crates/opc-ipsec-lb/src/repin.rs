@@ -16,8 +16,8 @@ use crate::failover::{AntiReplayResume, SendIvCounterMode, SendIvForwardJump};
 use crate::model::{ClusterNode, IpAddress, SaId, SteerKey, SteeringRule};
 use crate::ownership::SessionOwnershipKey;
 use crate::ports::{
-    OwnershipFencer, OwnershipRetirementAuthority, OwnershipSource, RePinAuditSink,
-    RePinSteeringBackend, RePinSteeringRetirementBackend,
+    OwnershipActivationAuthority, OwnershipFencer, OwnershipRetirementAuthority, OwnershipSource,
+    RePinAuditSink, RePinSteeringBackend, RePinSteeringRetirementBackend,
 };
 
 /// Monotonic ownership fence token.
@@ -75,6 +75,22 @@ impl OwnershipSnapshot {
 /// Callers generate one non-zero, deployment-unique value before starting a
 /// re-pin and retain it when replaying the same request. A fresh transition,
 /// including a later ABA return to the same owner, MUST use a new value.
+///
+/// # Unpredictability
+///
+/// The value MUST be drawn from a cryptographically secure random source, not
+/// from a counter, timestamp, or any other guessable sequence. Every other
+/// field of a retirement — the SA, the ownership key, the owner
+/// [`ClusterNode`], the [`SteeringRule`], and the active fence — is either a
+/// public protocol value or a small monotonic integer, so this identity is the
+/// only field an unrelated party cannot derive. The retirement boundaries
+/// ([`RePinCoordinator::retire_activation`] and
+/// [`crate::session_repin::SessionRePinCoordinator::retire`]) match a caller's
+/// request against the durable record for *idempotent convergence*, not as an
+/// authorization decision; a guessable transition identity therefore turns
+/// that exact-match replay into a usable per-SA teardown primitive. Deployments
+/// that mint these from a counter are attackable by any party that can reach
+/// the coordinator API.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
 pub struct OwnershipTransitionId(NonZeroU128);
 
@@ -668,6 +684,23 @@ impl RePinSteeringUpdate {
         }
     }
 
+    /// Mint the exact steering update for one authoritative first activation.
+    ///
+    /// This is the activation twin of [`Self::new`]: the owner comes from the
+    /// validated rule and the generation from the store-minted activation
+    /// grant. It stays crate-private so no caller-invented generation can reach
+    /// a steering backend.
+    pub(crate) const fn for_activation(
+        request: &OwnershipActivationRequest,
+        generation: OwnershipFence,
+    ) -> Self {
+        Self {
+            ownership_key: request.ownership_key,
+            rule: request.rule,
+            generation,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) const fn for_test(request: &RePinRequest, generation: OwnershipFence) -> Self {
         Self::new(request, generation)
@@ -752,6 +785,243 @@ impl fmt::Debug for OwnershipFenceGrant {
     }
 }
 
+/// Request to publish the FIRST destination-scoped owner for one SA.
+///
+/// A responder installs an inbound SA — and may receive ESP on its
+/// receiver-chosen SPI — before any ownership transition has occurred. RFC 4303
+/// §2.1 states verbatim: "The SPI is an arbitrary 32-bit value that is used by a
+/// receiver to identify the SA to which an incoming packet is bound." The
+/// destination-scoped owner map must therefore admit a first, no-predecessor
+/// publication for that SPI. (RFC 7296 §1.2 and §2.8 are the IKEv2 events that
+/// produce such an SA — the first Child SA of the initial exchange and each
+/// rekey's new SPI. That is a paraphrase of those sections, not a quotation.)
+///
+/// This request deliberately carries no resume, outbound-IV, counter, or
+/// anti-replay evidence: no prior SA state is being resumed, so there is
+/// nothing to attest. It also carries no predecessor owner or fence, because a
+/// first activation has none. Everything that makes the transition
+/// authoritative — the generation — is minted by the
+/// [`OwnershipActivationAuthority`],
+/// never by the caller.
+#[derive(Clone, PartialEq, Eq)]
+pub struct OwnershipActivationRequest {
+    sa: SaId,
+    ownership_key: SessionOwnershipKey,
+    transition_id: OwnershipTransitionId,
+    owner: ClusterNode,
+    rule: SteeringRule,
+}
+
+impl OwnershipActivationRequest {
+    /// Construct and validate a first-activation request for an ESP Child SA.
+    ///
+    /// `inbound_spi` is the receiver-chosen peer-to-local SPI used for ingress
+    /// ownership and steering. There is no outbound SA binding ID because no
+    /// outbound counter state is being resumed.
+    pub fn new_esp(
+        inbound_spi: u32,
+        transition_id: OwnershipTransitionId,
+        owner: ClusterNode,
+        rule: SteeringRule,
+        ownership_key: SessionOwnershipKey,
+    ) -> Result<Self, IpsecLbError> {
+        let request = Self {
+            sa: SaId::Esp { spi: inbound_spi },
+            ownership_key,
+            transition_id,
+            owner,
+            rule,
+        };
+        validate_activation_request(&request)?;
+        Ok(request)
+    }
+
+    /// Construct and validate a first-activation request for an IKE SA.
+    pub fn new_ike(
+        responder_spi: u64,
+        transition_id: OwnershipTransitionId,
+        owner: ClusterNode,
+        rule: SteeringRule,
+        ownership_key: SessionOwnershipKey,
+    ) -> Result<Self, IpsecLbError> {
+        let request = Self {
+            sa: SaId::Ike { responder_spi },
+            ownership_key,
+            transition_id,
+            owner,
+            rule,
+        };
+        validate_activation_request(&request)?;
+        Ok(request)
+    }
+
+    /// Return the SA receiving its first owner record.
+    #[must_use]
+    pub const fn sa(&self) -> SaId {
+        self.sa
+    }
+
+    /// Return the exact destination-scoped ownership key.
+    #[must_use]
+    pub const fn ownership_key(&self) -> SessionOwnershipKey {
+        self.ownership_key
+    }
+
+    /// Return the stable identity reused only for retries of this activation.
+    #[must_use]
+    pub const fn transition_id(&self) -> OwnershipTransitionId {
+        self.transition_id
+    }
+
+    /// Return the cluster node that must already hold the birth record.
+    #[must_use]
+    pub const fn owner(&self) -> &ClusterNode {
+        &self.owner
+    }
+
+    /// Return the steering rule retained for non-Host-XDP backends.
+    #[must_use]
+    pub const fn rule(&self) -> SteeringRule {
+        self.rule
+    }
+
+    /// Return the datapath owner shard published into the owner map.
+    #[must_use]
+    pub const fn map_owner(&self) -> crate::ShardId {
+        self.rule.owner
+    }
+
+    /// Hash the complete safety-critical activation into a stable fingerprint.
+    ///
+    /// The domain is distinct from every re-pin transition domain, so an
+    /// activation record can never be recovered as a re-pin grant and a re-pin
+    /// record can never be recovered as an activation grant.
+    #[must_use]
+    pub fn activation_fingerprint(&self) -> OwnershipTransitionFingerprint {
+        let mut hasher = Sha256::new();
+        hasher.update(b"opc-ipsec-lb/ownership-activation/v1-destination-scoped");
+        hasher.update(self.transition_id.get().to_be_bytes());
+        hash_sa(&mut hasher, self.sa);
+        hash_bytes(&mut hasher, self.owner.as_str().as_bytes());
+        hasher.update(self.rule.shard.get().to_be_bytes());
+        hasher.update(self.rule.owner.get().to_be_bytes());
+        hash_steer_key(&mut hasher, self.rule.key);
+        hash_bytes(&mut hasher, &self.ownership_key.to_canonical_bytes());
+        OwnershipTransitionFingerprint(hasher.finalize().into())
+    }
+}
+
+impl fmt::Debug for OwnershipActivationRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("OwnershipActivationRequest([redacted])")
+    }
+}
+
+/// Authoritative first-activation generation committed by the ownership store.
+///
+/// Only an activation authority can construct this grant. Its fence is a
+/// projection of the store-minted, per-key monotonic fence token, so it is
+/// strictly above the durable floor retained for that key — including the floor
+/// left behind by a completed retirement.
+#[derive(Clone, PartialEq, Eq)]
+pub struct OwnershipActivationGrant {
+    request: OwnershipActivationRequest,
+    fence: OwnershipFence,
+}
+
+impl OwnershipActivationGrant {
+    pub(crate) const fn new(request: OwnershipActivationRequest, fence: OwnershipFence) -> Self {
+        Self { request, fence }
+    }
+
+    /// Borrow the exact activation this grant authorizes.
+    #[must_use]
+    pub const fn request(&self) -> &OwnershipActivationRequest {
+        &self.request
+    }
+
+    /// Return the committed authoritative activation generation.
+    #[must_use]
+    pub const fn fence(&self) -> OwnershipFence {
+        self.fence
+    }
+}
+
+impl fmt::Debug for OwnershipActivationGrant {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("OwnershipActivationGrant([redacted])")
+    }
+}
+
+/// Typed result of retiring one activation that never underwent a re-pin.
+#[derive(Clone, PartialEq, Eq)]
+pub enum OwnershipActivationRetirement {
+    /// Host owner/fence state was removed and durable ownership was finalized.
+    Finalized(OwnershipRetirementFinalizedProof),
+    /// A strictly newer authoritative record won the key and was left alone.
+    Superseded(OwnershipRetirementSupersededProof),
+}
+
+impl fmt::Debug for OwnershipActivationRetirement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Finalized(proof) => f
+                .debug_struct("OwnershipActivationRetirement::Finalized")
+                .field("disposition", &proof.disposition())
+                .finish(),
+            Self::Superseded(_) => {
+                f.write_str("OwnershipActivationRetirement::Superseded([redacted])")
+            }
+        }
+    }
+}
+
+/// A `Retiring` activation rebuilt from durable state after process loss.
+///
+/// [`RePinCoordinator::retire_activation`] commits a durable `Retiring` record
+/// before it calls steering. A caller that loses the in-memory request between
+/// those two steps cannot replay the retirement, and the key stays refused for
+/// activation forever. This value carries the exact request and `active_fence`
+/// that replay needs, reconstructed by
+/// [`crate::SessionStoreOwnershipFencer::recover_stranded_activation_retirement`]
+/// and verified against the record's own activation fingerprint, so a
+/// mis-supplied steering rule or owner is rejected rather than retired.
+#[derive(Clone, PartialEq, Eq)]
+pub struct StrandedActivationRetirement {
+    request: OwnershipActivationRequest,
+    active_fence: OwnershipFence,
+}
+
+impl StrandedActivationRetirement {
+    pub(crate) const fn new(
+        request: OwnershipActivationRequest,
+        active_fence: OwnershipFence,
+    ) -> Self {
+        Self {
+            request,
+            active_fence,
+        }
+    }
+
+    /// Borrow the exact activation request the stranded retirement replays.
+    #[must_use]
+    pub const fn request(&self) -> &OwnershipActivationRequest {
+        &self.request
+    }
+
+    /// Return the exact committed activation fence the replay must pass.
+    #[must_use]
+    pub const fn active_fence(&self) -> OwnershipFence {
+        self.active_fence
+    }
+}
+
+impl fmt::Debug for StrandedActivationRetirement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("StrandedActivationRetirement([redacted])")
+    }
+}
+
 /// Exact committed activation whose ownership and Host-XDP state may retire.
 ///
 /// Construction is private to [`RePinCoordinator`]. The request binds the full
@@ -777,6 +1047,25 @@ impl OwnershipRetirementRequest {
             owner: request.new_owner.clone(),
             active_fence,
             map_owner: request.rule.owner,
+        }
+    }
+
+    /// Bind the retirement to a committed first activation instead of a re-pin.
+    ///
+    /// The fingerprint comes from the activation domain, so this request can
+    /// only match a store record that the activation boundary committed.
+    pub(crate) fn from_activation(
+        request: &OwnershipActivationRequest,
+        active_fence: OwnershipFence,
+    ) -> Self {
+        Self {
+            sa: request.sa(),
+            ownership_key: request.ownership_key(),
+            transition_id: request.transition_id(),
+            fingerprint: request.activation_fingerprint(),
+            owner: request.owner().clone(),
+            active_fence,
+            map_owner: request.map_owner(),
         }
     }
 
@@ -908,10 +1197,18 @@ impl fmt::Debug for OwnershipRetirementSupersededProof {
 
 /// Opaque durable proof that Host cleanup completed before ownership deletion.
 ///
-/// Only the SDK session journal can construct this proof, and only after its
-/// exact ordered `CleanupComplete` marker is majority-authoritatively stored.
-/// Possessing a retirement grant alone is deliberately insufficient to delete
-/// ownership authority.
+/// There are exactly two producers, both inside the SDK, and possessing a
+/// retirement grant alone is deliberately insufficient to construct one:
+///
+/// * the session journal, for a multi-SA saga, and only after its exact ordered
+///   `CleanupComplete` marker is majority-authoritatively stored — the marker
+///   is what preserves cross-SA ordering across process loss;
+/// * [`RePinCoordinator::retire_activation`], for a single activation that
+///   never re-pinned. There is no cross-SA order to preserve there, so the
+///   coordinator issues the proof directly after the steering backend has
+///   proven both keyed maps absent, while still holding that key's operation
+///   permit. Replaying the identical call after process loss converges,
+///   because the durable record stays `Retiring` and every step is idempotent.
 #[derive(Clone, PartialEq, Eq)]
 pub struct OwnershipCleanupCompleteProof {
     grant: OwnershipRetirementGrant,
@@ -1153,6 +1450,12 @@ pub enum RePinAuditEventKind {
     SteeringInstalled,
     /// Exact destination-scoped steering was durably retired.
     SteeringRetired,
+    /// A first destination-scoped owner was published for a key that had no
+    /// predecessor owner.
+    ///
+    /// Activation events set `previous_owner == new_owner` because no ownership
+    /// was taken from another node.
+    Activated,
     /// Re-pin failed before a verified ownership grant was available.
     ///
     /// Recoverable post-commit failures are returned immediately as
@@ -1253,6 +1556,45 @@ impl RePinAuditEvent {
             fence: Some(grant.retirement_fence()),
             forwarding_proven: false,
             failure_code: None,
+        }
+    }
+
+    fn activation_attempt(request: &OwnershipActivationRequest) -> Self {
+        Self {
+            kind: RePinAuditEventKind::Attempt,
+            sa: request.sa(),
+            transition_id: request.transition_id(),
+            previous_owner: request.owner().clone(),
+            new_owner: request.owner().clone(),
+            fence: None,
+            forwarding_proven: false,
+            failure_code: None,
+        }
+    }
+
+    fn activated(request: &OwnershipActivationRequest, fence: OwnershipFence) -> Self {
+        Self {
+            kind: RePinAuditEventKind::Activated,
+            sa: request.sa(),
+            transition_id: request.transition_id(),
+            previous_owner: request.owner().clone(),
+            new_owner: request.owner().clone(),
+            fence: Some(fence),
+            forwarding_proven: false,
+            failure_code: None,
+        }
+    }
+
+    fn activation_failed(request: &OwnershipActivationRequest, error: &IpsecLbError) -> Self {
+        Self {
+            kind: RePinAuditEventKind::Failed,
+            sa: request.sa(),
+            transition_id: request.transition_id(),
+            previous_owner: request.owner().clone(),
+            new_owner: request.owner().clone(),
+            fence: None,
+            forwarding_proven: false,
+            failure_code: Some(error_code(error)),
         }
     }
 
@@ -1930,6 +2272,249 @@ where
         Ok(RePinOutcome::new(request.sa, grant.fence, request.rule))
     }
 
+    /// Publish the FIRST destination-scoped owner for a newly established SA.
+    ///
+    /// This is the no-predecessor twin of [`Self::repin`]. It exists because a
+    /// responder's inbound SA is reachable on its receiver-chosen SPI from the
+    /// moment it is installed, before any ownership transition has happened, so
+    /// a destination-scoped owner map has to admit a first publication.
+    ///
+    /// # Authority
+    ///
+    /// The caller supplies no generation. The activation authority reads the
+    /// authoritative birth record for the exact
+    /// [`SessionOwnershipKey`] and mints
+    /// the generation from the store's own per-key monotonic fence, which sits
+    /// strictly above the durable floor retained for that key — including the
+    /// floor a completed retirement left behind. Absence from the datapath maps
+    /// is never treated as evidence that a key was never activated.
+    ///
+    /// Activation is **not** an upsert. A key with no authoritative birth
+    /// record fails closed with [`IpsecLbError::NotFound`], so replaying a
+    /// stale request cannot resurrect an SA whose record was retired away.
+    ///
+    /// # Idempotency and cancellation
+    ///
+    /// Repeating the identical request is safe: the authority recovers the
+    /// already-committed grant instead of minting a second generation, and the
+    /// steering backend converges the same owner/generation pair. A cancelled
+    /// call publishes no partial state — Host-XDP retains the operation permit
+    /// inside its blocking mutation and proves exact readback before reporting
+    /// success.
+    pub async fn activate(
+        &self,
+        request: &OwnershipActivationRequest,
+    ) -> Result<RePinOutcome, IpsecLbError>
+    where
+        F: OwnershipActivationAuthority,
+    {
+        validate_activation_request(request)?;
+        // Host-XDP checks its per-key operation stripe for poison both before
+        // and after taking the stripe gate, so an indeterminate earlier
+        // mutation on this key fails activation closed here.
+        let permit = self
+            .steering
+            .acquire_repin_permit(request.ownership_key())
+            .await?;
+        self.validate_activation_target_owner(request).await?;
+
+        let grant = match self.fencer.recover_activation_grant(request).await? {
+            Some(grant) => grant,
+            None => {
+                self.audit
+                    .record_repin(RePinAuditEvent::activation_attempt(request))
+                    .await?;
+                match self.fencer.activate_ownership(request).await {
+                    Ok(grant) => grant,
+                    Err(error) => match self.fencer.recover_activation_grant(request).await {
+                        Ok(Some(grant)) => grant,
+                        Ok(None) => {
+                            record_activation_failure(&self.audit, request, &error).await;
+                            return Err(error);
+                        }
+                        Err(recovery_error) => {
+                            record_activation_failure(&self.audit, request, &recovery_error).await;
+                            return Err(recovery_error);
+                        }
+                    },
+                }
+            }
+        };
+        validate_activation_grant_matches(request, &grant)?;
+        // Repeat the target-shard read after the commit so no stale snapshot
+        // reaches the cancellation-safe datapath publication.
+        self.validate_activation_target_owner(request).await?;
+
+        let permit = self
+            .steering
+            .apply_fenced_repin(
+                RePinSteeringUpdate::for_activation(request, grant.fence()),
+                permit,
+            )
+            .await?;
+        if permit.has_esp_counter_publication_guard() {
+            return Err(IpsecLbError::adapter_contract_violation(
+                "repin_backend_returned_unconsumed_counter_guard",
+            ));
+        }
+        // Retain the operation permit across the final audit write, exactly as
+        // `repin` does, so no other keyed mutation interleaves before the
+        // activation is recorded.
+        self.audit
+            .record_repin(RePinAuditEvent::activated(request, grant.fence()))
+            .await?;
+        drop(permit);
+        Ok(RePinOutcome::new(
+            request.sa(),
+            grant.fence(),
+            request.rule(),
+        ))
+    }
+
+    /// Retire an activation that never underwent a re-pin.
+    ///
+    /// This is the paired teardown boundary for [`Self::activate`], and it
+    /// deliberately reuses the existing durable retirement authority rather
+    /// than introducing a second, weaker removal path. The call therefore
+    /// remains permit-bearing and generation-checked: it acquires the Host
+    /// operation permit first, arms it, requires the authority to match the
+    /// exact active transition, fingerprint, owner, and `active_fence`, and
+    /// only then removes Host state under a strictly higher retirement fence.
+    /// Finalization fenced-deletes the record while the store retains that
+    /// key's fence floor, so the retired generation can never be reused.
+    ///
+    /// The permit is held across every step, including finalization, so a
+    /// concurrent activation for the same key cannot cross the cleanup cut.
+    ///
+    /// Unlike [`crate::session_repin::SessionRePinCoordinator::retire`] this
+    /// boundary is single-key and needs no journal: there is no cross-SA
+    /// ordering to preserve, and every step is individually idempotent, so
+    /// replaying the identical call after process loss converges forward.
+    ///
+    /// # Caller obligation: retain the request until this returns
+    ///
+    /// The first phase commits a durable `Retiring` record before any steering
+    /// call. If the steering call then fails — including because the process
+    /// died — that record stays `Retiring`, and every later
+    /// [`Self::activate`] for the key is refused with
+    /// `OwnershipConflict("ownership record is retiring")`. Only a replay of
+    /// this call with the **exact** original request and `active_fence` clears
+    /// it. Callers MUST therefore keep both durably until this returns, exactly
+    /// as they would for a [`Self::repin`] retry.
+    ///
+    /// After process loss a caller that did not retain them can rebuild both
+    /// from the durable record with
+    /// [`crate::SessionStoreOwnershipFencer::recover_stranded_activation_retirement`],
+    /// which needs only the SA, the ownership key, and the deployment's
+    /// steering rule.
+    ///
+    /// # Authorization
+    ///
+    /// Matching the durable record's transition identity and fingerprint is an
+    /// idempotency check, not an authorization decision. Authorization comes
+    /// from the caller holding an [`OwnershipTransitionId`] that no other party
+    /// can predict, and from the target shard still being owned by the
+    /// retiring owner. See [`OwnershipTransitionId`] for the CSPRNG
+    /// requirement that assumption rests on.
+    ///
+    /// That unpredictability is what authorizes a transition while it is live.
+    /// It stops being a secret worth keeping the moment this call commits the
+    /// durable `Retiring` record: from then on the transition is spent, and the
+    /// identity can do nothing but finish its own teardown. Recovery leans on
+    /// exactly that — `recover_stranded_activation_retirement` hands the
+    /// transition identity back to any caller who can name the SA and its
+    /// ownership key, deliberately, so a replacement process can converge a
+    /// stranded key forward. The disclosure is sound only because it is gated
+    /// on the terminal `Retiring` state; see the security invariant on that
+    /// method, which must never be relaxed to a live record.
+    pub async fn retire_activation(
+        &self,
+        request: &OwnershipActivationRequest,
+        active_fence: OwnershipFence,
+    ) -> Result<OwnershipActivationRetirement, IpsecLbError>
+    where
+        B: RePinSteeringRetirementBackend,
+        F: OwnershipRetirementAuthority,
+    {
+        validate_activation_request(request)?;
+        // Mirror `activate`'s target-owner gate. Retirement is checked before
+        // the permit is acquired because a refusal here leaves nothing to
+        // release and cannot poison the key's operation stripe; the durable
+        // authority remains the serializing decision.
+        self.validate_activation_target_owner(request).await?;
+        let mut permits = self
+            .steering
+            .acquire_repin_retirement_permits(vec![request.ownership_key()])
+            .await?;
+        if permits.len() != 1 {
+            return Err(IpsecLbError::adapter_contract_violation(
+                "repin_retirement_permit_batch_mismatch",
+            ));
+        }
+        let permit = permits.pop().ok_or_else(|| {
+            IpsecLbError::adapter_contract_violation("repin_retirement_permit_batch_mismatch")
+        })?;
+        if permit.ownership_key() != request.ownership_key() {
+            return Err(IpsecLbError::adapter_contract_violation(
+                "repin_retirement_permit_key_mismatch",
+            ));
+        }
+        let permit = self.steering.arm_repin_retirement_permit(permit)?;
+
+        let retirement_request = OwnershipRetirementRequest::from_activation(request, active_fence);
+        let admission = match self
+            .fencer
+            .begin_ownership_retirement(retirement_request)
+            .await
+        {
+            Ok(admission) => admission,
+            Err(error @ IpsecLbError::OwnershipRetirementIndeterminate) => {
+                // Dropping an armed permit poisons the operation stripe; an
+                // ambiguous authority result must never be classified safe.
+                drop(permit);
+                return Err(error);
+            }
+            Err(error) => {
+                self.steering
+                    .release_classified_repin_retirement_permit(permit)?;
+                return Err(error);
+            }
+        };
+        let grant = match admission {
+            OwnershipRetirementAdmission::Granted(grant) => grant,
+            OwnershipRetirementAdmission::Superseded(proof) => {
+                self.steering
+                    .release_classified_repin_retirement_permit(permit)?;
+                return Ok(OwnershipActivationRetirement::Superseded(proof));
+            }
+        };
+
+        let permit = self.steering.retire_fenced_repin(&grant, permit).await?;
+        self.audit
+            .record_repin(RePinAuditEvent::steering_retired(&grant))
+            .await?;
+        let finalized = self
+            .finalize_retirement_cleanup(OwnershipCleanupCompleteProof::new(grant))
+            .await?;
+        drop(permit);
+        Ok(OwnershipActivationRetirement::Finalized(finalized))
+    }
+
+    async fn validate_activation_target_owner(
+        &self,
+        request: &OwnershipActivationRequest,
+    ) -> Result<(), IpsecLbError> {
+        match self.ownership.shard_owner(request.map_owner()).await? {
+            Some(owner) if owner == *request.owner() => Ok(()),
+            Some(_) => Err(IpsecLbError::ownership_conflict(
+                "steering target shard is not owned by the activating owner",
+            )),
+            None => Err(IpsecLbError::ownership_conflict(
+                "steering target shard has no authoritative owner",
+            )),
+        }
+    }
+
     pub(crate) async fn acquire_retirement_permits(
         &self,
         requests: &[RePinRequest],
@@ -2347,6 +2932,21 @@ where
     }
 }
 
+fn validate_activation_grant_matches(
+    request: &OwnershipActivationRequest,
+    grant: &OwnershipActivationGrant,
+) -> Result<(), IpsecLbError> {
+    // Do not trust the authority port blindly: a grant for a different SA,
+    // key, transition, or owner would publish a first owner for the wrong
+    // identity. Reject it before any steering mutation.
+    if grant.request() != request {
+        return Err(IpsecLbError::ownership_conflict(
+            "activation grant does not match the requested SA and owner",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_grant_matches(
     request: &RePinRequest,
     grant: &OwnershipFenceGrant,
@@ -2585,6 +3185,46 @@ pub(crate) fn validate_request(request: &RePinRequest) -> Result<(), IpsecLbErro
     Ok(())
 }
 
+pub(crate) fn validate_activation_request(
+    request: &OwnershipActivationRequest,
+) -> Result<(), IpsecLbError> {
+    validate_sa_identifier(request.sa())?;
+    match (request.sa(), request.rule().key) {
+        (SaId::Esp { spi }, SteerKey::EspSpi(rule_spi)) if spi == rule_spi => {}
+        (SaId::Ike { responder_spi }, SteerKey::IkeResponderSpi(rule_responder_spi))
+            if responder_spi == rule_responder_spi => {}
+        _ => {
+            return Err(IpsecLbError::invalid_config(
+                "rule",
+                "activation steering key must match the activated SA protocol and SPI",
+            ));
+        }
+    }
+    validate_ownership_key_matches_sa(request.sa(), request.ownership_key())?;
+    // Redundant by construction, and deliberately kept: the preceding
+    // `(sa, rule.key)` match and `validate_ownership_key_matches_sa` already
+    // force all three to agree by transitivity, so no input reaches the `_`
+    // arm and no test can kill it. It is a fail-closed backstop against a
+    // future edit that weakens either of those two checks, and it mirrors the
+    // same shape in `validate_request`.
+    match (request.sa(), request.rule().key, request.ownership_key()) {
+        (SaId::Esp { spi }, SteerKey::EspSpi(rule_spi), SessionOwnershipKey::Esp(key))
+            if spi == rule_spi && key.inbound_spi().get() == spi => {}
+        (
+            SaId::Ike { responder_spi },
+            SteerKey::IkeResponderSpi(rule_responder_spi),
+            SessionOwnershipKey::EstablishedIke(key),
+        ) if responder_spi == rule_responder_spi && key.responder_spi().get() == responder_spi => {}
+        _ => {
+            return Err(IpsecLbError::invalid_config(
+                "ownership_key",
+                "destination-scoped ownership key must match the activated SA protocol and SPI",
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_ownership_key_matches_sa(
     sa: SaId,
     ownership_key: SessionOwnershipKey,
@@ -2637,6 +3277,18 @@ async fn record_failure<A>(
         .await;
 }
 
+async fn record_activation_failure<A>(
+    audit: &A,
+    request: &OwnershipActivationRequest,
+    error: &IpsecLbError,
+) where
+    A: RePinAuditSink,
+{
+    let _ = audit
+        .record_repin(RePinAuditEvent::activation_failed(request, error))
+        .await;
+}
+
 fn error_code(error: &IpsecLbError) -> &'static str {
     match error {
         IpsecLbError::InvalidSpiLayout { .. } => "invalid_spi_layout",
@@ -2686,6 +3338,11 @@ mod tests {
         0xd2, 0xc6, 0xe5, 0x4d, 0x11, 0xd9, 0xbe, 0x2a, 0x2e, 0x2f, 0xb5, 0x5c, 0x07, 0x9b, 0x21,
         0xeb, 0xc8, 0x1a, 0x5c, 0x7e, 0x94, 0x78, 0x71, 0xf6, 0x4a, 0x86, 0x36, 0x59, 0x60, 0x9c,
         0x8e, 0x3c,
+    ];
+    const FROZEN_ACTIVATION_V1_FINGERPRINT: [u8; 32] = [
+        0xe0, 0xdb, 0x36, 0x98, 0xf4, 0x42, 0xb7, 0x41, 0xb0, 0x53, 0xc1, 0xd9, 0x6e, 0xe4, 0x34,
+        0x2b, 0x8a, 0xcf, 0x17, 0x81, 0x73, 0x56, 0x33, 0x93, 0x3e, 0x43, 0xa2, 0x0b, 0x85, 0x25,
+        0x9d, 0x3f,
     ];
     const FROZEN_RANDOM_IV_V4_FINGERPRINT: [u8; 32] = [
         0x49, 0x1f, 0x33, 0x17, 0x3a, 0x7d, 0xb0, 0x69, 0x33, 0x32, 0x74, 0x0d, 0x00, 0x07, 0x31,
@@ -3507,5 +4164,314 @@ mod tests {
             outcome.with_forwarding_proof(wrong_sa).unwrap_err(),
             IpsecLbError::ForwardingProofRejected { .. }
         ));
+    }
+
+    // ---------------------------------------------------------------------
+    // First-activation request validation and fingerprint binding (#561).
+    // ---------------------------------------------------------------------
+
+    fn initial_ike_ownership_key() -> SessionOwnershipKey {
+        SessionOwnershipKey::InitialIke(crate::ownership::InitialIkeOwnershipKey::new(
+            DestinationContext::new(IpAddress::V4([192, 0, 2, 10]), RoutingDomainTag::new(7)),
+            crate::ownership::OuterSourceTuple::new(IpAddress::V4([198, 51, 100, 4]), 500),
+            IkeSpi::new(11).unwrap(),
+            crate::ownership::InitialExchangeDiscriminator::new(1).unwrap(),
+        ))
+    }
+
+    fn frozen_activation_request() -> OwnershipActivationRequest {
+        let sa = SaId::Esp { spi: 0x0107 };
+        OwnershipActivationRequest {
+            sa,
+            ownership_key: ownership_key(sa),
+            transition_id: OwnershipTransitionId::new(7).unwrap(),
+            owner: ClusterNode::new("worker-b"),
+            rule: SteeringRule {
+                shard: crate::model::ShardId::new(1),
+                owner: crate::model::ShardId::new(2),
+                key: SteerKey::EspSpi(0x0107),
+            },
+        }
+    }
+
+    #[test]
+    fn activation_fingerprint_preserves_its_frozen_v1_encoding() {
+        // A committed activation record stores this value. Changing the domain
+        // separator or the hashed field set silently orphans every already
+        // committed record, so the encoding is frozen by this constant.
+        assert_eq!(
+            frozen_activation_request()
+                .activation_fingerprint()
+                .as_bytes(),
+            FROZEN_ACTIVATION_V1_FINGERPRINT
+        );
+    }
+
+    #[test]
+    fn activation_fingerprint_binds_every_safety_critical_request_component() {
+        let base = frozen_activation_request();
+        let expected = base.activation_fingerprint();
+        assert_eq!(expected, base.clone().activation_fingerprint());
+
+        let mutations = [
+            OwnershipActivationRequest {
+                sa: SaId::Esp { spi: 0x0108 },
+                ..base.clone()
+            },
+            OwnershipActivationRequest {
+                transition_id: OwnershipTransitionId::new(8).unwrap(),
+                ..base.clone()
+            },
+            OwnershipActivationRequest {
+                owner: ClusterNode::new("worker-y"),
+                ..base.clone()
+            },
+            OwnershipActivationRequest {
+                rule: SteeringRule {
+                    shard: crate::model::ShardId::new(4),
+                    ..base.rule
+                },
+                ..base.clone()
+            },
+            OwnershipActivationRequest {
+                rule: SteeringRule {
+                    owner: crate::model::ShardId::new(3),
+                    ..base.rule
+                },
+                ..base.clone()
+            },
+            OwnershipActivationRequest {
+                rule: SteeringRule {
+                    key: SteerKey::EspSpi(0x0108),
+                    ..base.rule
+                },
+                ..base.clone()
+            },
+            OwnershipActivationRequest {
+                ownership_key: ownership_key(SaId::Esp { spi: 0x0108 }),
+                ..base.clone()
+            },
+        ];
+
+        for mutation in mutations {
+            assert_ne!(expected, mutation.activation_fingerprint());
+        }
+    }
+
+    #[test]
+    fn activation_and_repin_fingerprints_never_collide_for_the_same_transition() {
+        // The rustdoc on `activation_fingerprint` claims an activation record
+        // can never be recovered as a re-pin grant and vice versa. This states
+        // that invariant directly for an otherwise-identical transition.
+        //
+        // It is deliberately over-determined: the two domains also hash
+        // different field sets, so this assertion alone survives a
+        // domain-separator swap. What actually pins each separator is
+        // `activation_fingerprint_preserves_its_frozen_v1_encoding` and its
+        // re-pin twins.
+        let sa = SaId::Esp { spi: 0x0107 };
+        let activation = frozen_activation_request();
+        let repin = frozen_counter_v5_request();
+        assert_eq!(activation.sa, repin.sa);
+        assert_eq!(activation.transition_id, repin.transition_id);
+        assert_eq!(activation.ownership_key, repin.ownership_key);
+        assert_eq!(activation.rule, repin.rule);
+        assert_eq!(activation.owner, repin.new_owner);
+
+        assert_ne!(
+            activation.activation_fingerprint(),
+            repin.ownership_fingerprint()
+        );
+
+        // The IKE twin uses the frozen v4 (non-counter) re-pin domain, so cover
+        // that separator too rather than only the v5 counter one.
+        let ike_activation = OwnershipActivationRequest {
+            sa: SaId::Ike { responder_spi: 7 },
+            ownership_key: ownership_key(SaId::Ike { responder_spi: 7 }),
+            transition_id: OwnershipTransitionId::new(7).unwrap(),
+            owner: ClusterNode::new("worker-b"),
+            rule: SteeringRule {
+                shard: crate::model::ShardId::new(1),
+                owner: crate::model::ShardId::new(2),
+                key: SteerKey::IkeResponderSpi(7),
+            },
+        };
+        assert_ne!(
+            ike_activation.activation_fingerprint(),
+            frozen_random_iv_v4_request().ownership_fingerprint()
+        );
+        assert_ne!(sa, ike_activation.sa);
+    }
+
+    #[test]
+    fn activation_request_rejects_every_incoherent_sa_rule_and_ownership_key() {
+        let esp_key = ownership_key(SaId::Esp { spi: 0x0107 });
+        let ike_key = ownership_key(SaId::Ike { responder_spi: 7 });
+        let transition = OwnershipTransitionId::new(7).unwrap();
+        let owner = ClusterNode::new("worker-b");
+        let esp_rule = |key| SteeringRule {
+            shard: crate::model::ShardId::new(1),
+            owner: crate::model::ShardId::new(2),
+            key,
+        };
+
+        // (label, built request, expected invalid-config field)
+        let esp_cases: [(&str, Result<OwnershipActivationRequest, IpsecLbError>, &str); 5] = [
+            (
+                "ESP SA carrying an IKE steer key",
+                OwnershipActivationRequest::new_esp(
+                    0x0107,
+                    transition,
+                    owner.clone(),
+                    esp_rule(SteerKey::IkeResponderSpi(0x0107)),
+                    esp_key,
+                ),
+                "rule",
+            ),
+            (
+                "ESP SA whose steer key names a different SPI",
+                OwnershipActivationRequest::new_esp(
+                    0x0107,
+                    transition,
+                    owner.clone(),
+                    esp_rule(SteerKey::EspSpi(0x0108)),
+                    esp_key,
+                ),
+                "rule",
+            ),
+            (
+                // 0x0201/0x0202 rather than 0x1/0x2 only because `EspSpi`
+                // refuses the reserved 0..=255 range outright.
+                "ESP SPI 0x0201 with EspSpi(0x0202) in the ownership key",
+                OwnershipActivationRequest::new_esp(
+                    0x0201,
+                    transition,
+                    owner.clone(),
+                    esp_rule(SteerKey::EspSpi(0x0201)),
+                    ownership_key(SaId::Esp { spi: 0x0202 }),
+                ),
+                "ownership_key",
+            ),
+            (
+                "ESP SA carrying an established-IKE ownership key",
+                OwnershipActivationRequest::new_esp(
+                    0x0107,
+                    transition,
+                    owner.clone(),
+                    esp_rule(SteerKey::EspSpi(0x0107)),
+                    ike_key,
+                ),
+                "ownership_key",
+            ),
+            (
+                "ESP SA carrying an initial-IKE ownership key",
+                OwnershipActivationRequest::new_esp(
+                    0x0107,
+                    transition,
+                    owner.clone(),
+                    esp_rule(SteerKey::EspSpi(0x0107)),
+                    initial_ike_ownership_key(),
+                ),
+                "ownership_key",
+            ),
+        ];
+        for (label, built, field) in esp_cases {
+            match built {
+                Err(IpsecLbError::InvalidConfig { field: actual, .. }) => {
+                    assert_eq!(actual, field, "{label}");
+                }
+                other => panic!("{label} must be refused, got {other:?}"),
+            }
+        }
+
+        let ike_cases: [(&str, Result<OwnershipActivationRequest, IpsecLbError>, &str); 3] = [
+            (
+                "IKE SA carrying an ESP steer key",
+                OwnershipActivationRequest::new_ike(
+                    7,
+                    transition,
+                    owner.clone(),
+                    esp_rule(SteerKey::EspSpi(7)),
+                    ike_key,
+                ),
+                "rule",
+            ),
+            (
+                "IKE responder-SPI mismatch between the SA and the steer key",
+                OwnershipActivationRequest::new_ike(
+                    7,
+                    transition,
+                    owner.clone(),
+                    esp_rule(SteerKey::IkeResponderSpi(8)),
+                    ike_key,
+                ),
+                "rule",
+            ),
+            (
+                "IKE responder-SPI mismatch between the SA and the ownership key",
+                OwnershipActivationRequest::new_ike(
+                    9,
+                    transition,
+                    owner.clone(),
+                    esp_rule(SteerKey::IkeResponderSpi(9)),
+                    ike_key,
+                ),
+                "ownership_key",
+            ),
+        ];
+        for (label, built, field) in ike_cases {
+            match built {
+                Err(IpsecLbError::InvalidConfig { field: actual, .. }) => {
+                    assert_eq!(actual, field, "{label}");
+                }
+                other => panic!("{label} must be refused, got {other:?}"),
+            }
+        }
+
+        // A zero SA identifier is refused before any coherence check.
+        assert!(matches!(
+            OwnershipActivationRequest::new_esp(
+                0,
+                transition,
+                owner.clone(),
+                esp_rule(SteerKey::EspSpi(0)),
+                esp_key,
+            ),
+            Err(IpsecLbError::InvalidConfig {
+                field: "sa.spi",
+                ..
+            })
+        ));
+        assert!(matches!(
+            OwnershipActivationRequest::new_ike(
+                0,
+                transition,
+                owner,
+                esp_rule(SteerKey::IkeResponderSpi(0)),
+                ike_key,
+            ),
+            Err(IpsecLbError::InvalidConfig {
+                field: "sa.responder_spi",
+                ..
+            })
+        ));
+
+        // The coherent shapes still build, so the table is not vacuously green.
+        assert!(OwnershipActivationRequest::new_esp(
+            0x0107,
+            transition,
+            ClusterNode::new("worker-b"),
+            esp_rule(SteerKey::EspSpi(0x0107)),
+            esp_key,
+        )
+        .is_ok());
+        assert!(OwnershipActivationRequest::new_ike(
+            7,
+            transition,
+            ClusterNode::new("worker-b"),
+            esp_rule(SteerKey::IkeResponderSpi(7)),
+            ike_key,
+        )
+        .is_ok());
     }
 }

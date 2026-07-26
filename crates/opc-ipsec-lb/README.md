@@ -642,7 +642,21 @@ Prepare every re-pin from `OwnershipSource::sa_ownership`, retaining both the
 authoritative owner and its exact fence in `RePinRequest`. Generate one non-zero,
 deployment-unique `OwnershipTransitionId` for that logical transition and reuse
 it only when retrying the identical request; a later transition, including an
-A→B→A owner cycle, requires a new ID. The coordinator computes a canonical
+A→B→A owner cycle, requires a new ID.
+
+`OwnershipTransitionId` values MUST come from a cryptographically secure random
+source — never a counter, a timestamp, or any other guessable sequence. Every
+other field of a retirement (the SA, the ownership key, the owner
+`ClusterNode`, the `SteeringRule`, and the active fence) is a public protocol
+value or a small monotonic integer, so this identity is the only part an
+unrelated party cannot derive. The retirement boundaries
+(`RePinCoordinator::retire_activation` and `SessionRePinCoordinator::retire`)
+match a replayed request against the durable record for *idempotent
+convergence*, not as an authorization decision. With a predictable transition
+identity that exact-match replay becomes a usable per-SA teardown primitive for
+anyone who can reach the coordinator API.
+
+The coordinator computes a canonical
 SHA-256 fingerprint over the complete safety-critical request and verifies that
 the committed grant matches it. Destination-scoped IKE and non-counter
 requests retain the frozen v4 domain. Counter-based ESP requests use the v5
@@ -655,6 +669,120 @@ Session-store birth records use an empty plaintext metadata payload; successful
 promotions replace it with versioned transition-ID/fingerprint metadata.
 Ownership records with an expiry, an arbitrary payload, or any mismatched
 key/type/owner/fence metadata fail closed.
+
+### Publishing the first owner (attach and rekey)
+
+`RePinCoordinator::repin` moves an SA from one owner to another. It cannot
+publish the *first* owner for an SA this node negotiated itself, because a first
+activation has no predecessor owner, no predecessor fence, and no resumed SA
+state to attest. RFC 4303 §2.1 states verbatim: "The SPI is an arbitrary 32-bit
+value that is used by a receiver to identify the SA to which an incoming packet
+is bound." Inbound ESP can therefore arrive on a receiver-chosen SPI as soon as
+the responder installs the SA, before any ownership transition exists, so the
+destination-scoped owner map has to admit a first publication. (Paraphrase, not
+a quotation: RFC 7296 §1.2 and §2.8 describe the IKEv2 events that create such
+an SA — the first Child SA of the initial exchange, and each rekey's new SPI —
+and §1.4 describes retiring SAs by SPI through INFORMATIONAL Delete payloads.)
+
+Use `RePinCoordinator::activate` for both cases:
+
+1. Create the authoritative session-store birth record for the exact
+   `SessionOwnershipKey`, owned by this node. Activation is a promotion, never
+   an upsert; a missing record fails closed with `NotFound`. Build the record
+   with `SessionStoreOwnershipFencer::birth_record` rather than by hand — it
+   fixes the crate-private ownership state type, `StateClass::AuthoritativeSession`,
+   generation 1, no expiry, and the empty plaintext metadata payload, none of
+   which are nameable from the public API. A hand-rolled record fails closed at
+   `activate` with
+   `InvalidConfig { field: "session_store.state_type", reason: "ownership record state type mismatch" }`.
+   The full sequence, using the same `SessionOwnershipKeyResolver` the fencer
+   was built with:
+
+   ```rust,ignore
+   let key = keyspace.scoped_sa_key(&ownership_key)?;
+   let lease = store.acquire(&key, owner_id, ttl).await?;
+   let record = fencer.birth_record(&key, &cluster_node, &lease)?;
+   store
+       .compare_and_set(CompareAndSet {
+           key,
+           lease: lease.clone(),
+           expected_generation: None, // birth, not overwrite
+           new_record: record,
+       })
+       .await?;
+   store.release(lease).await?;
+   ```
+
+   Shard-owner records use the same call with
+   `SessionOwnershipKeyResolver::shard_key`.
+2. Build an `OwnershipActivationRequest` with `new_esp`/`new_ike`: the exact
+   ownership key, a fresh CSPRNG-drawn `OwnershipTransitionId`, this node's
+   `ClusterNode`, and the steering rule naming the owner shard. There are no
+   resume, outbound-IV, counter, or anti-replay parameters, because nothing is
+   being resumed.
+3. Call `activate`. The `OwnershipActivationAuthority` — implemented by
+   `SessionStoreOwnershipFencer` — mints the generation from the store's own
+   per-key monotonic fence and returns it in an opaque
+   `OwnershipActivationGrant`; the caller never supplies a generation. The
+   coordinator then publishes owner-then-fence through the same
+   `RePinSteeringBackend` permit and fence-last cut that re-pin uses.
+
+Rekey (RFC 7296 §2.8, paraphrased) is the same call: the new Child SA has a
+fresh SPI, therefore a fresh `SessionOwnershipKey`, therefore its own birth
+record and its own activation. An activated key can then be re-pinned normally
+by passing the activation's returned fence as `RePinRequest::previous_fence`.
+
+`activate` has no partial-failure type: it returns a bare `Err`, so a caller
+cannot tell "nothing happened" from "durable ownership committed, datapath not
+published". That is safe because the replay is convergent — **always replay the
+identical request on any error**, and keep replaying until it succeeds. The
+authority recovers the already-committed grant instead of minting a second
+generation, and the steering backend converges on the same owner/generation
+pair. Do not construct a fresh `OwnershipTransitionId` for a retry; that is a
+new transition, and it will be refused.
+
+Retire an activation that never underwent a re-pin with
+`RePinCoordinator::retire_activation`. It first requires the target shard to
+still be owned by the retiring owner, then reuses the durable two-phase
+retirement authority: it holds the Host operation permit across every step,
+requires the authority to match the exact active transition, fingerprint, owner
+and fence, removes Host owner and keyed-fence state under a strictly higher
+retirement fence, and then fenced-deletes the record. A re-pinned session is
+still retired through `SessionRePinCoordinator::retire`.
+
+Matching the durable record is an idempotency check, not an authorization
+decision — see the CSPRNG requirement on `OwnershipTransitionId` above, which
+is what actually keeps a third party from replaying someone else's retirement.
+
+**Retain the activation request and its `active_fence` durably until
+`retire_activation` returns.** Its first phase commits a `Retiring` record
+before it calls steering; if that call fails, or the process dies, the record
+stays `Retiring` and every later `activate` for the key — including with a
+brand-new transition ID — is refused with
+`OwnershipConflict("ownership record is retiring")`. Only a replay with the
+exact original request and fence clears it. A caller that lost them can rebuild
+both from the durable record with
+`SessionStoreOwnershipFencer::recover_stranded_activation_retirement(sa, ownership_key, rule)`,
+which returns `None` when the key is not stranded and verifies the
+reconstruction against the record's own committed activation fingerprint, so a
+wrong steering rule, shard, owner, or SA is refused rather than retired.
+
+The durable ABA barrier is the session store's per-key fence floor, which
+survives that fenced delete. After a completed retirement both eBPF maps and
+the ownership record are empty — which is indistinguishable from "never
+activated" — so absence is never treated as evidence. Replaying the retired
+activation fails closed, and a genuine rebirth of the same SPI receives a
+generation strictly above the retirement fence. Reuse an
+`OwnershipTransitionId` only to retry the identical activation; a later
+activation of the same key requires a new ID.
+
+Host-XDP restart recovery deliberately retains recovered owner entries and
+withholds their keyed fences, so every recovered entry is stale and cannot
+steer. Re-arm it by replaying the identical `OwnershipActivationRequest`: the
+authority recovers the already-committed grant and returns the same generation
+without minting a new one, so the datapath is restored from durable authority
+rather than from map residue. If the record was retired while the process was
+down, that replay fails closed and the stale entry stays inert.
 
 After a store-backed ownership commit, recoverable audit or steering failures
 return a non-cloneable partial for `RePinCoordinator::retry`; callers should
@@ -819,12 +947,16 @@ journal progress without rerunning convergence validation; it is not live
 ownership or steering authority.
 
 Supported SDK ownership changes go through `RePinCoordinator` and fence before
-steering. Host-XDP destination-scoped mode implements only the typed re-pin
-port; its legacy raw steering mutation path is unavailable. A downstream
-adapter that bypasses the permit and mutates an owner record can still create
-post-validation drift without an ownership-fence change and is out of contract.
-Callers must not introduce that escape or treat the session journal alone as
-live ownership/steering authority.
+steering. Host-XDP destination-scoped mode implements only the typed re-pin and
+activation ports; its legacy raw steering mutation path is unavailable, and
+`install_owner`/`remove_owner` stay rejected in that mode. Publishing a first
+owner uses `RePinCoordinator::activate` and retiring one that never re-pinned
+uses `RePinCoordinator::retire_activation`; both mint or check their generation
+against the same durable session-store authority, so neither is an unfenced
+escape. A downstream adapter that bypasses the permit and mutates an owner
+record can still create post-validation drift without an ownership-fence change
+and is out of contract. Callers must not introduce that escape or treat the
+session journal alone as live ownership/steering authority.
 
 Production HA must wire `SessionStoreRePinJournal` to the majority-committed
 session store and wrap that caller-facing backend with

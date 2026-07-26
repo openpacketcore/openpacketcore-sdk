@@ -354,7 +354,18 @@ operation stripe; the private update separately binds target owner and
 authoritative generation.
 Host-XDP destination-scoped mode has no legacy raw `SteeringBackend` mutation
 path; downstream adapters that bypass the permit remain explicitly outside the
-contract because they can drift without advancing an ownership fence.
+contract because they can drift without advancing an ownership fence. The first
+owner record for an SA this node negotiated itself is published through
+`RePinCoordinator::activate` and the `OwnershipActivationAuthority` port, not
+through `install_owner`, which stays rejected in this mode. That boundary takes
+no predecessor owner, predecessor fence, or resume evidence, because a first
+activation has none; it mints the generation from the session store's own
+per-key monotonic fence and refuses a record that is absent, retiring, or held
+by a different owner or transition. `RePinCoordinator::retire_activation` is
+the paired teardown for an activation that never re-pinned. Because the store
+retains a key's fence floor across the fenced delete, a completed retirement can
+never be undone by a replay: absence from the eBPF maps and from the record set
+is not treated as evidence that a key was never activated.
 Its ABI v5 datapath requires an exact non-zero generation match between the
 destination-scoped `IPSEC_LB_OWNERS` entry and `IPSEC_LB_KEY_FENCES` entry.
 Activation clears the keyed fence, stages and reads back the owner while it is
