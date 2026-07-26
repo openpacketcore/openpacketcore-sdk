@@ -2,8 +2,8 @@ use bytes::BytesMut;
 use opc_proto_gtpv2c::{
     decode_typed_ie_sequence, encode_typed_ie_sequence, AdditionalProtocolConfigurationOptions,
     IpcpDnsRequest, PcoAddressConfiguration, PcoDecodeError, PcoRequest,
-    ProtocolConfigurationOptions, TypedIe, TypedIeValue, PCO_CONTAINER_P_CSCF_RESELECTION_SUPPORT,
-    PCO_MAX_CONTAINERS, PCO_PROTOCOL_IPCP,
+    ProtocolConfigurationOptions, TypedIe, TypedIeValue, PCO_CONTAINER_IPV4_LINK_MTU,
+    PCO_CONTAINER_P_CSCF_RESELECTION_SUPPORT, PCO_MAX_CONTAINERS, PCO_PROTOCOL_IPCP,
 };
 use opc_protocol::{DecodeContext, EncodeContext};
 
@@ -17,6 +17,7 @@ fn request_encoder_emits_zero_length_address_containers_in_registry_order() {
         p_cscf_ipv4: true,
         dns_server_ipv4: true,
         p_cscf_reselection_support: false,
+        ipv4_link_mtu: false,
         ipcp_dns: IpcpDnsRequest::none(),
     }
     .encode_request_contents();
@@ -59,6 +60,7 @@ fn reselection_support_orders_after_all_legacy_address_requests() {
         p_cscf_ipv4: true,
         dns_server_ipv4: true,
         p_cscf_reselection_support: true,
+        ipv4_link_mtu: false,
         ipcp_dns: IpcpDnsRequest::none(),
     }
     .encode_request_contents();
@@ -169,6 +171,7 @@ fn pco_request_round_trips_through_opaque_gtpv2c_ie_transport() {
         p_cscf_ipv4: true,
         dns_server_ipv4: true,
         p_cscf_reselection_support: true,
+        ipv4_link_mtu: false,
         ipcp_dns: IpcpDnsRequest::none(),
     }
     .encode_request_contents();
@@ -216,6 +219,7 @@ fn ipcp_configure_request_precedes_containers_and_matches_the_observed_wire() {
         p_cscf_ipv4: true,
         dns_server_ipv4: true,
         p_cscf_reselection_support: false,
+        ipv4_link_mtu: false,
         ipcp_dns: IpcpDnsRequest {
             primary_dns: true,
             secondary_dns: true,
@@ -530,4 +534,97 @@ fn an_ipcp_request_survives_the_apco_transport_used_on_s2b() {
     };
     assert_eq!(round_tripped.value, value);
     assert_eq!(&value[1..4], &[0x80, 0x21, 0x10]);
+}
+
+#[test]
+fn link_mtu_request_is_an_empty_container_ordered_by_identifier() {
+    assert_eq!(PCO_CONTAINER_IPV4_LINK_MTU, 0x0010);
+
+    let mtu_only = PcoRequest {
+        ipv4_link_mtu: true,
+        ..PcoRequest::none()
+    };
+    assert!(mtu_only.is_requested());
+    // TS 24.008 10.5.6.3: MS to network the container is zero-length.
+    assert_eq!(
+        mtu_only.encode_request_contents(),
+        vec![0x80, 0x00, 0x10, 0x00]
+    );
+
+    // 0x0010 sorts after the DNS/P-CSCF containers and before 0x0012.
+    let with_neighbours = PcoRequest {
+        dns_server_ipv4: true,
+        ipv4_link_mtu: true,
+        p_cscf_reselection_support: true,
+        ..PcoRequest::none()
+    };
+    assert_eq!(
+        with_neighbours.encode_request_contents(),
+        vec![0x80, 0x00, 0x0d, 0x00, 0x00, 0x10, 0x00, 0x00, 0x12, 0x00]
+    );
+}
+
+#[test]
+fn network_supplied_link_mtu_decodes_as_two_octets() {
+    // 1358 = 0x054e, the value TS 24.008 NOTE 1 recommends as a maximum for
+    // the sibling non-IP container.
+    let decoded =
+        PcoAddressConfiguration::decode_network_contents(&[0x80, 0x00, 0x10, 0x02, 0x05, 0x4e])
+            .expect("well-formed link MTU");
+    assert_eq!(decoded.ipv4_link_mtu, Some(1358));
+    assert!(!decoded.is_empty());
+    assert!(format!("{decoded:?}").contains("ipv4_link_mtu: Some(1358)"));
+
+    let boundary =
+        PcoAddressConfiguration::decode_network_contents(&[0x80, 0x00, 0x10, 0x02, 0xff, 0xff])
+            .expect("well-formed");
+    assert_eq!(boundary.ipv4_link_mtu, Some(u16::MAX));
+}
+
+#[test]
+fn a_link_mtu_container_of_the_wrong_length_is_ignored_not_rejected() {
+    // TS 24.008 10.5.6.3: "If the length of container identifier contents is
+    // different from two octets, then it shall be ignored by the receiver."
+    // This is deliberately unlike the address containers, which fail closed.
+    for contents in [
+        &[0x80, 0x00, 0x10, 0x00][..],
+        &[0x80, 0x00, 0x10, 0x01, 0x05][..],
+        &[0x80, 0x00, 0x10, 0x03, 0x05, 0x4e, 0x00][..],
+    ] {
+        let decoded = PcoAddressConfiguration::decode_network_contents(contents)
+            .expect("a wrong-length link MTU is ignored, not an error");
+        assert_eq!(decoded.ipv4_link_mtu, None, "contents {contents:02x?}");
+        assert!(decoded.is_empty());
+    }
+
+    // A wrong-length instance must not discard a later well-formed one, and
+    // must not stop the rest of the value being parsed.
+    let decoded = PcoAddressConfiguration::decode_network_contents(&[
+        0x80, 0x00, 0x10, 0x01, 0x05, // ignored
+        0x00, 0x10, 0x02, 0x05, 0xdc, // 1500
+        0x00, 0x0d, 0x04, 8, 8, 8, 8,
+    ])
+    .expect("well-formed");
+    assert_eq!(decoded.ipv4_link_mtu, Some(1500));
+    assert_eq!(decoded.dns_server_ipv4, vec![[8, 8, 8, 8]]);
+}
+
+#[test]
+fn a_repeated_link_mtu_container_keeps_the_first() {
+    let decoded = PcoAddressConfiguration::decode_network_contents(&[
+        0x80, 0x00, 0x10, 0x02, 0x05, 0xdc, // 1500
+        0x00, 0x10, 0x02, 0x02, 0x00, // 512, ignored
+    ])
+    .expect("well-formed");
+    assert_eq!(decoded.ipv4_link_mtu, Some(1500));
+}
+
+#[test]
+fn a_wrong_length_address_container_still_fails_closed() {
+    // The ignore rule is specific to the link MTU: TS 24.008 states no such
+    // rule for the address containers, so those keep rejecting the value.
+    assert_eq!(
+        PcoAddressConfiguration::decode_network_contents(&[0x80, 0x00, 0x0d, 0x03, 8, 8, 8]),
+        Err(PcoDecodeError::InvalidIpv4AddressLength)
+    );
 }
