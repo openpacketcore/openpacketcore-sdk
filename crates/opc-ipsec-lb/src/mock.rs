@@ -876,7 +876,9 @@ mod tests {
             .record_repin(RePinAuditEvent {
                 kind: crate::repin::RePinAuditEventKind::Attempt,
                 sa: SaId::Esp { spi: 9 },
-                transition_id: OwnershipTransitionId::new(1).unwrap(),
+                correlation_id: crate::repin::RePinAuditCorrelationId::for_transition(
+                    OwnershipTransitionId::new(1).unwrap(),
+                ),
                 previous_owner: ClusterNode::new("node-a"),
                 new_owner: ClusterNode::new("node-b"),
                 fence: None,

@@ -192,6 +192,18 @@ pub struct RekeyRequest {
 /// Entropy source for deterministic tests and system-backed production use.
 pub trait EntropySource: Send + Sync + std::fmt::Debug {
     /// Fill bytes with unpredictable material.
+    ///
+    /// On `Ok(())` an implementation MUST have written every byte of `dst`.
+    /// Callers draw key material and transition identities through this port and
+    /// read the whole buffer back, so a short write silently substitutes
+    /// caller-supplied bytes for entropy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IpsecLbError::EntropyUnavailable`] when the source cannot
+    /// produce the requested material. `dst` is then unspecified — an adapter
+    /// may already have copied out stale material before its health test tripped
+    /// — and a caller MUST NOT read it.
     fn fill_bytes(&self, dst: &mut [u8]) -> Result<(), IpsecLbError>;
 }
 

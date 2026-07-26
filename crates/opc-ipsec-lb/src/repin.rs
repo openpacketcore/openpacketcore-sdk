@@ -10,6 +10,7 @@ use opc_ipsec_xfrm::{
     OutboundEspCounterTargetSet, OutboundSaBindingId,
 };
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 use crate::error::IpsecLbError;
 use crate::failover::{AntiReplayResume, SendIvCounterMode, SendIvForwardJump};
@@ -19,6 +20,7 @@ use crate::ports::{
     OwnershipActivationAuthority, OwnershipFencer, OwnershipRetirementAuthority, OwnershipSource,
     RePinAuditSink, RePinSteeringBackend, RePinSteeringRetirementBackend,
 };
+use crate::spi::{EntropySource, SystemEntropy};
 
 /// Monotonic ownership fence token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
@@ -91,11 +93,61 @@ impl OwnershipSnapshot {
 /// that exact-match replay into a usable per-SA teardown primitive. Deployments
 /// that mint these from a counter are attackable by any party that can reach
 /// the coordinator API.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
+///
+/// Use [`OwnershipTransitionId::generate`] rather than drawing the 128 bits by
+/// hand; it is the only constructor that satisfies this requirement by
+/// construction. [`OwnershipTransitionId::new`] exists for callers restoring an
+/// already-minted identity from durable state.
+///
+/// # Secrecy
+///
+/// Unpredictability at mint time is only half of the obligation: the value MUST
+/// also stay secret for as long as the transition is live. It is the sole
+/// authorization factor for
+/// [`RePinCoordinator::retire_activation`] — the other gate,
+/// the target-shard owner read, is derived entirely from fields of the replayed
+/// request and therefore authenticates nothing. Anyone who learns a live
+/// transition identity holds a standing per-SA teardown capability until that
+/// transition is spent.
+///
+/// Treat it exactly like key material:
+///
+/// * **Never log it, export it, or place it in a metric label, trace span, or
+///   audit record.** The audit port deliberately carries a
+///   [`RePinAuditCorrelationId`] instead of this value so that an ordinary
+///   correlation-logging sink cannot become a disclosure path.
+/// * Its [`fmt::Debug`] implementation prints `OwnershipTransitionId([redacted])`
+///   so that neither it nor any container that derives `Debug` can leak it
+///   incidentally. [`OwnershipTransitionId::get`] is the only way to reach the
+///   value, and every call site that uses it is a disclosure decision.
+/// * At rest it must be encrypted. The session-store record that carries it is
+///   plaintext only above the `EncryptingSessionBackend` boundary; production HA
+///   deployments MUST wrap the backend, as the crate README requires.
+///
+/// The disclosure becomes harmless only once the transition is terminally
+/// committed to teardown, which is why
+/// [`crate::SessionStoreOwnershipFencer::recover_stranded_activation_retirement`]
+/// may return it for a `Retiring` record and for no other state.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
 pub struct OwnershipTransitionId(NonZeroU128);
 
+/// Bounded redraws for a CSPRNG that returns the one rejected 128-bit value.
+///
+/// A correct source hits zero with probability 2^-128 per draw, so exhausting
+/// this budget means the entropy source is broken rather than unlucky.
+const MAX_TRANSITION_ID_DRAWS: usize = 8;
+
 impl OwnershipTransitionId {
-    /// Build a non-zero transition identity.
+    /// Build a non-zero transition identity from an already-minted value.
+    ///
+    /// This is the restore path — deserializing a durable record, or rebuilding
+    /// a retained request for a retry. To *mint* a new identity use
+    /// [`Self::generate`], which draws the value from a CSPRNG as this type
+    /// requires.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IpsecLbError::InvalidConfig`] when `value` is zero.
     pub fn new(value: u128) -> Result<Self, IpsecLbError> {
         let Some(value) = NonZeroU128::new(value) else {
             return Err(IpsecLbError::invalid_config(
@@ -106,10 +158,74 @@ impl OwnershipTransitionId {
         Ok(Self(value))
     }
 
+    /// Mint a fresh transition identity from the system CSPRNG.
+    ///
+    /// This is the constructor every caller minting a new transition should
+    /// use: it draws the full 128 bits from the platform's cryptographically
+    /// secure random source, satisfying the unpredictability requirement
+    /// documented on this type without the caller having to remember it.
+    ///
+    /// The result is a secret for as long as the transition is live; see the
+    /// secrecy obligation on this type before storing or emitting it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IpsecLbError::EntropyUnavailable`] when the system random
+    /// source fails, or when it repeatedly yields the single rejected all-zero
+    /// value — either outcome means the source is not usable for key material.
+    pub fn generate() -> Result<Self, IpsecLbError> {
+        Self::generate_from(&SystemEntropy)
+    }
+
+    /// Mint a fresh transition identity from an explicit entropy source.
+    ///
+    /// Deployments that already own a vetted CSPRNG — and tests that need a
+    /// deterministic draw — can supply it here. The source MUST be
+    /// cryptographically secure in production; [`Self::generate`] uses the
+    /// system source and is the right default.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IpsecLbError::EntropyUnavailable`] when `entropy` fails, or
+    /// when it yields the rejected all-zero value on every one of the bounded
+    /// redraws.
+    pub fn generate_from<E>(entropy: &E) -> Result<Self, IpsecLbError>
+    where
+        E: EntropySource + ?Sized,
+    {
+        for _ in 0..MAX_TRANSITION_ID_DRAWS {
+            // Declared inside the loop, and zeroized on the way out: a source
+            // that returns `Ok(())` after writing only part of `dst` would
+            // otherwise let one redraw inherit the previous draw's tail, and
+            // the drawn value is 128 bits of live secret either way.
+            let mut bytes = Zeroizing::new([0_u8; 16]);
+            entropy.fill_bytes(bytes.as_mut_slice())?;
+            if let Some(value) = NonZeroU128::new(u128::from_be_bytes(*bytes)) {
+                return Ok(Self(value));
+            }
+        }
+        Err(IpsecLbError::EntropyUnavailable)
+    }
+
     /// Return the numeric transition identity.
+    ///
+    /// Every call is a deliberate disclosure of a live secret. Use it to bind
+    /// the identity into a fingerprint, a durable encrypted record, or a
+    /// coordinator call — never to log, export, or correlate it. Audit
+    /// correlation is served by [`RePinAuditCorrelationId::for_transition`],
+    /// which is not reversible.
     #[must_use]
     pub const fn get(self) -> u128 {
         self.0.get()
+    }
+}
+
+impl fmt::Debug for OwnershipTransitionId {
+    /// Redact the value: a live transition identity is the sole authorization
+    /// factor for retirement, so it must never reach a log through the `Debug`
+    /// of this type or of any container that derives `Debug` around it.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("OwnershipTransitionId([redacted])")
     }
 }
 
@@ -1464,19 +1580,121 @@ pub enum RePinAuditEventKind {
     Failed,
 }
 
+/// Domain separator for the audit correlation digest.
+///
+/// Keeps the correlation identity from colliding with any other SHA-256 use in
+/// this crate, and versions the preimage so a future change is a new identity
+/// rather than a silent reinterpretation.
+const REPIN_AUDIT_CORRELATION_DOMAIN: &[u8] = b"opc-ipsec-lb/repin-audit-correlation/v1";
+
+/// Non-reversible correlation identity for re-pin audit records.
+///
+/// Every event the coordinator emits for one logical transition carries the same
+/// value, so a sink can group, deduplicate, and follow a transition across
+/// `Attempt` → `Fenced` → `SteeringInstalled` exactly as it could with the raw
+/// [`OwnershipTransitionId`] — but the value confers no capability. It is
+/// `SHA-256(domain || transition_id)`, so it is safe to log, index, and export.
+///
+/// Recovering the transition identity from it would require inverting SHA-256 or
+/// searching the 128-bit preimage space, which is exactly the unpredictability
+/// [`OwnershipTransitionId`] already mandates. That mandate is load-bearing
+/// here, and the residual risk is worth stating in numbers rather than as
+/// "brute-forceable". The preimage is the 39-byte domain plus the 16-byte
+/// identity — 55 bytes, which is exactly one 64-byte SHA-256 block, the
+/// cheapest per-guess cost the primitive admits. At roughly 2 × 10^10
+/// SHA-256/s, one commodity GPU, a deployment that ignores the mandate is
+/// inverted in: under a second for a 32-bit counter; under a minute for a
+/// sequential counter below 2^40; about fifteen seconds for millisecond
+/// timestamps spanning a decade (about 2^38 values). For the two failure modes
+/// [`OwnershipTransitionId`] names — a counter and a timestamp — the search is
+/// seconds of work, not a theoretical weakness.
+///
+/// The domain separator is a compile-time constant with no per-deployment salt,
+/// so one precomputed table inverts every deployment's logs at once. This digest
+/// defends against reversing a correctly minted identity; it is not a defence
+/// against a minting policy that ignores the CSPRNG requirement.
+///
+/// A keyed MAC would remove the offline search entirely, and was still rejected:
+/// an ephemeral key breaks the cross-restart and cross-node correlation this
+/// value exists to provide, and a shared key would have to reach every
+/// coordinator and every sink. [`RePinCoordinator::new`] takes no key, so
+/// adding one is a distribution problem rather than a hashing one. (The crate
+/// does run a rotating keyed MAC where distribution is solved — see
+/// [`crate::IkeCookieGate`] — so the obstacle is the channel, not the
+/// primitive.)
+///
+/// An operator holding the raw identity can compute the correlation identity
+/// with [`Self::for_transition`] to find the matching records; the reverse
+/// direction does not exist by design.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
+pub struct RePinAuditCorrelationId([u8; 32]);
+
+impl RePinAuditCorrelationId {
+    /// Derive the audit correlation identity for a transition.
+    ///
+    /// Deterministic: the same transition always yields the same value, which is
+    /// what makes sink-side deduplication and cross-event correlation work.
+    #[must_use]
+    pub fn for_transition(transition_id: OwnershipTransitionId) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(REPIN_AUDIT_CORRELATION_DOMAIN);
+        hasher.update(transition_id.get().to_be_bytes());
+        Self(hasher.finalize().into())
+    }
+
+    /// Return the correlation digest bytes.
+    #[must_use]
+    pub const fn as_bytes(self) -> [u8; 32] {
+        self.0
+    }
+}
+
+impl fmt::Display for RePinAuditCorrelationId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for RePinAuditCorrelationId {
+    /// Printed in full, deliberately: unlike the transition identity this value
+    /// is not a secret, and a correlation identity that cannot be read from a
+    /// log is useless.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "RePinAuditCorrelationId({self})")
+    }
+}
+
 /// Redaction-safe re-pin audit event.
+///
+/// The non-disclosure guarantee is carried by the *type of each field*, not by
+/// the struct: `correlation_id` cannot hold a transition identity, but every
+/// field here is public, so adding a field of type [`OwnershipTransitionId`]
+/// would reopen the disclosure path for any sink that reads it. The hand-written
+/// [`fmt::Debug`] below would not catch that either — it lists fields
+/// explicitly, and [`OwnershipTransitionId`]'s own `Debug` is redacted, so a new
+/// field would render as `[redacted]` while the field itself still hands the raw
+/// value to a sink. `Debug` was never the only way out.
 #[derive(Clone, PartialEq, Eq)]
 pub struct RePinAuditEvent {
     /// Event kind.
     pub kind: RePinAuditEventKind,
     /// SA being re-pinned.
     pub sa: SaId,
-    /// Stable transition correlation identity.
+    /// Stable, non-reversible transition correlation identity.
+    ///
+    /// This is deliberately **not** the [`OwnershipTransitionId`]. That value
+    /// authorizes retirement while the transition is live, and an audit sink
+    /// that logs its correlation key — the ordinary thing to do with one — would
+    /// turn every reader of that log into a holder of a per-SA teardown
+    /// capability. See [`RePinAuditCorrelationId`].
     ///
     /// This field is not an idempotency key by itself or when paired only with
     /// [`RePinAuditEventKind`]; sinks deduplicate the complete event so distinct
     /// failed attempts retain their failure codes.
-    pub transition_id: OwnershipTransitionId,
+    pub correlation_id: RePinAuditCorrelationId,
     /// Previous owner.
     pub previous_owner: ClusterNode,
     /// New owner.
@@ -1495,7 +1713,7 @@ impl fmt::Debug for RePinAuditEvent {
         f.debug_struct("RePinAuditEvent")
             .field("kind", &self.kind)
             .field("sa", &"[redacted]")
-            .field("transition_id", &"[redacted]")
+            .field("correlation_id", &self.correlation_id)
             .field("previous_owner", &"[redacted]")
             .field("new_owner", &"[redacted]")
             .field("fence_present", &self.fence.is_some())
@@ -1510,7 +1728,7 @@ impl RePinAuditEvent {
         Self {
             kind: RePinAuditEventKind::Attempt,
             sa: request.sa,
-            transition_id: request.transition_id,
+            correlation_id: RePinAuditCorrelationId::for_transition(request.transition_id),
             previous_owner: request.previous_owner.clone(),
             new_owner: request.new_owner.clone(),
             fence: None,
@@ -1523,7 +1741,7 @@ impl RePinAuditEvent {
         Self {
             kind: RePinAuditEventKind::Fenced,
             sa: request.sa,
-            transition_id: request.transition_id,
+            correlation_id: RePinAuditCorrelationId::for_transition(request.transition_id),
             previous_owner: request.previous_owner.clone(),
             new_owner: request.new_owner.clone(),
             fence: Some(fence),
@@ -1536,7 +1754,7 @@ impl RePinAuditEvent {
         Self {
             kind: RePinAuditEventKind::SteeringInstalled,
             sa: request.sa,
-            transition_id: request.transition_id,
+            correlation_id: RePinAuditCorrelationId::for_transition(request.transition_id),
             previous_owner: request.previous_owner.clone(),
             new_owner: request.new_owner.clone(),
             fence: Some(fence),
@@ -1550,7 +1768,7 @@ impl RePinAuditEvent {
         Self {
             kind: RePinAuditEventKind::SteeringRetired,
             sa: request.sa(),
-            transition_id: request.transition_id(),
+            correlation_id: RePinAuditCorrelationId::for_transition(request.transition_id()),
             previous_owner: request.owner().clone(),
             new_owner: request.owner().clone(),
             fence: Some(grant.retirement_fence()),
@@ -1563,7 +1781,7 @@ impl RePinAuditEvent {
         Self {
             kind: RePinAuditEventKind::Attempt,
             sa: request.sa(),
-            transition_id: request.transition_id(),
+            correlation_id: RePinAuditCorrelationId::for_transition(request.transition_id()),
             previous_owner: request.owner().clone(),
             new_owner: request.owner().clone(),
             fence: None,
@@ -1576,7 +1794,7 @@ impl RePinAuditEvent {
         Self {
             kind: RePinAuditEventKind::Activated,
             sa: request.sa(),
-            transition_id: request.transition_id(),
+            correlation_id: RePinAuditCorrelationId::for_transition(request.transition_id()),
             previous_owner: request.owner().clone(),
             new_owner: request.owner().clone(),
             fence: Some(fence),
@@ -1589,7 +1807,7 @@ impl RePinAuditEvent {
         Self {
             kind: RePinAuditEventKind::Failed,
             sa: request.sa(),
-            transition_id: request.transition_id(),
+            correlation_id: RePinAuditCorrelationId::for_transition(request.transition_id()),
             previous_owner: request.owner().clone(),
             new_owner: request.owner().clone(),
             fence: None,
@@ -1602,7 +1820,7 @@ impl RePinAuditEvent {
         Self {
             kind: RePinAuditEventKind::Failed,
             sa: request.sa,
-            transition_id: request.transition_id,
+            correlation_id: RePinAuditCorrelationId::for_transition(request.transition_id),
             previous_owner: request.previous_owner.clone(),
             new_owner: request.new_owner.clone(),
             fence,
@@ -3327,8 +3545,18 @@ mod tests {
         DestinationContext, EspEncapsulationKind, EspOwnershipKey, EspSpi,
         EstablishedIkeOwnershipKey, IkeSpi, RoutingDomainTag,
     };
+    use crate::spi::FixedEntropy;
 
     const FORWARD_JUMP: u64 = crate::failover::MIN_SEND_IV_FORWARD_JUMP;
+    /// A stand-in for a CSPRNG-drawn transition identity. It is deliberately
+    /// wide: the disclosure assertions scan rendered output for its decimal and
+    /// hex forms, and a short value would match hex digest text by chance.
+    const SECRET_TRANSITION_VALUE: u128 = 0x2f81_a4c6_9d05_7e13_b6f2_48ac_15d9_3e00;
+    const FROZEN_AUDIT_CORRELATION_V1: [u8; 32] = [
+        0x0c, 0x19, 0x9b, 0x8a, 0x89, 0xb6, 0x1c, 0xf0, 0x6a, 0x1d, 0x0b, 0xe2, 0xc2, 0xba, 0x84,
+        0x92, 0xb1, 0xb5, 0x63, 0x7e, 0x69, 0x0a, 0xde, 0xba, 0x0b, 0x62, 0xef, 0x35, 0xb1, 0x52,
+        0xa5, 0x9b,
+    ];
     const LEGACY_ESP_COUNTER_V1_FINGERPRINT: [u8; 32] = [
         0x7e, 0xeb, 0x23, 0x71, 0xb3, 0xea, 0xbc, 0x7d, 0x94, 0xf9, 0x2e, 0x41, 0x4c, 0xad, 0x9d,
         0xb3, 0x62, 0x2f, 0x10, 0x78, 0xa3, 0x20, 0x32, 0x8e, 0x81, 0xce, 0x8b, 0xd4, 0x09, 0x56,
@@ -3836,6 +4064,218 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// A live transition identity is the sole authorization factor for
+    /// retirement, so its own `Debug` must not print it — otherwise every
+    /// container that derives `Debug` around it becomes a disclosure path.
+    #[test]
+    fn ownership_transition_id_debug_redacts_the_secret_value() {
+        let id = OwnershipTransitionId::new(SECRET_TRANSITION_VALUE).unwrap();
+        let rendered = format!("{id:?}");
+        assert_eq!(rendered, "OwnershipTransitionId([redacted])");
+        assert!(!rendered.contains(&id.get().to_string()));
+        assert!(!rendered.contains(&format!("{:032x}", id.get())));
+    }
+
+    /// The redaction must survive being nested inside a derived `Debug`, which
+    /// is how the value would actually reach a log.
+    #[test]
+    fn ownership_transition_id_debug_redacts_inside_a_derived_container() {
+        #[derive(Debug)]
+        struct Wrapper {
+            transition_id: OwnershipTransitionId,
+        }
+
+        let id = OwnershipTransitionId::new(SECRET_TRANSITION_VALUE).unwrap();
+        let wrapper = Wrapper { transition_id: id };
+        assert_eq!(wrapper.transition_id, id);
+        let rendered = format!("{wrapper:?}");
+        assert!(rendered.contains("[redacted]"));
+        assert!(!rendered.contains(&id.get().to_string()));
+    }
+
+    #[test]
+    fn ownership_transition_id_generate_draws_distinct_nonzero_values() {
+        let mut drawn = std::collections::BTreeSet::new();
+        for _ in 0..32 {
+            let id = OwnershipTransitionId::generate().expect("system entropy");
+            assert_ne!(id.get(), 0);
+            assert!(drawn.insert(id.get()), "generate repeated a value");
+        }
+    }
+
+    /// Pins the draw width and byte order: the identity must consume all 128
+    /// bits of the source, big-endian.
+    #[test]
+    fn ownership_transition_id_generate_from_consumes_128_big_endian_bits() {
+        let entropy = FixedEntropy::new((1..=16).collect());
+        let id = OwnershipTransitionId::generate_from(&entropy).expect("fixed entropy");
+        assert_eq!(id.get(), 0x0102_0304_0506_0708_090a_0b0c_0d0e_0f10);
+    }
+
+    /// The one rejected value must stay rejected even when the source insists
+    /// on it; a source that only ever yields zero is broken, not unlucky.
+    #[test]
+    fn ownership_transition_id_generate_from_rejects_an_all_zero_source() {
+        let entropy = FixedEntropy::new(vec![0]);
+        assert_eq!(
+            OwnershipTransitionId::generate_from(&entropy).unwrap_err(),
+            IpsecLbError::EntropyUnavailable
+        );
+    }
+
+    /// A source that reports failure without touching `dst` must not be
+    /// mistaken for a usable one.
+    ///
+    /// This case cannot pin the `?` on its own: `FixedEntropy` leaves the buffer
+    /// alone when it errors, so the draw stays all-zero, the non-zero rejection
+    /// burns the whole redraw budget, and `EntropyUnavailable` comes back
+    /// whether the error was propagated or dropped. The companion test below
+    /// supplies the fixture that separates the two.
+    #[test]
+    fn ownership_transition_id_generate_from_propagates_source_failure() {
+        let entropy = FixedEntropy::new(Vec::new());
+        assert_eq!(
+            OwnershipTransitionId::generate_from(&entropy).unwrap_err(),
+            IpsecLbError::EntropyUnavailable
+        );
+    }
+
+    /// A source that writes `dst` and *then* reports failure must still be
+    /// rejected.
+    ///
+    /// This is an ordinary RNG-adapter shape rather than a contrived one: an
+    /// adapter that copies a hardware FIFO out before its health test trips
+    /// hands back stale bytes alongside the error. Dropping that error would
+    /// mint an identity from exactly those bytes -- here the fully predictable
+    /// `0xabab..ab` -- and that identity is both the sole authorization factor
+    /// for `retire_activation` and the only secret in the correlation digest's
+    /// preimage. Only a source that fails *after* writing tells a propagated
+    /// error apart from an expired redraw budget.
+    #[test]
+    fn ownership_transition_id_generate_from_rejects_a_source_that_fails_after_writing() {
+        #[derive(Debug)]
+        struct PoisonedEntropy;
+
+        impl EntropySource for PoisonedEntropy {
+            fn fill_bytes(&self, dst: &mut [u8]) -> Result<(), IpsecLbError> {
+                dst.fill(0xab);
+                Err(IpsecLbError::EntropyUnavailable)
+            }
+        }
+
+        assert_eq!(
+            OwnershipTransitionId::generate_from(&PoisonedEntropy).unwrap_err(),
+            IpsecLbError::EntropyUnavailable
+        );
+    }
+
+    /// Audit sinks persist and index this value, so both halves of it are
+    /// frozen: changing the domain separator or the hashed field set silently
+    /// orphans every already-recorded correlation, and changing the `Display`
+    /// rendering does the same to every record keyed on the rendered string --
+    /// which is the form that actually reaches a log line, and the form the
+    /// README and this type's rustdoc tell operators to compare.
+    ///
+    /// The rendering is asserted against a literal rather than against another
+    /// `Display`, because a `Display`-to-`Display` comparison holds under any
+    /// bijection (hex case) and under truncation. Truncation is the one that
+    /// costs something: cutting the rendering to eight hex characters collides
+    /// two distinct SA transitions in a SIEM at around 10^5 transitions, which
+    /// destroys the grouping guarantee this identity exists to provide.
+    #[test]
+    fn repin_audit_correlation_id_preserves_its_frozen_v1_encoding() {
+        let correlation =
+            RePinAuditCorrelationId::for_transition(OwnershipTransitionId::new(1).unwrap());
+        assert_eq!(correlation.as_bytes(), FROZEN_AUDIT_CORRELATION_V1);
+        assert_eq!(
+            correlation.to_string(),
+            "0c199b8a89b61cf06a1d0be2c2ba8492b1b5637e690adeba0b62ef35b152a59b"
+        );
+    }
+
+    #[test]
+    fn repin_audit_correlation_id_is_stable_and_separates_distinct_transitions() {
+        let first = OwnershipTransitionId::new(SECRET_TRANSITION_VALUE).unwrap();
+        let second = OwnershipTransitionId::new(SECRET_TRANSITION_VALUE + 1).unwrap();
+        assert_eq!(
+            RePinAuditCorrelationId::for_transition(first),
+            RePinAuditCorrelationId::for_transition(first),
+            "correlation must be stable across the events of one transition"
+        );
+        assert_ne!(
+            RePinAuditCorrelationId::for_transition(first),
+            RePinAuditCorrelationId::for_transition(second),
+            "distinct transitions must not share a correlation identity"
+        );
+    }
+
+    /// The correlation identity must be a digest, not a re-encoding: no window
+    /// of it may reproduce the transition identity's bytes.
+    #[test]
+    fn repin_audit_correlation_id_does_not_embed_the_transition_identity() {
+        let id = OwnershipTransitionId::new(SECRET_TRANSITION_VALUE).unwrap();
+        let correlation = RePinAuditCorrelationId::for_transition(id);
+        let raw = id.get().to_be_bytes();
+        let mut reversed = raw;
+        reversed.reverse();
+        for window in correlation.as_bytes().windows(raw.len()) {
+            assert_ne!(window, raw, "correlation identity leaked the raw value");
+            assert_ne!(
+                window, reversed,
+                "correlation identity leaked the raw value"
+            );
+        }
+        assert!(!correlation
+            .to_string()
+            .contains(&format!("{:032x}", id.get())));
+    }
+
+    /// Every coordinator-emitted audit event must correlate to its transition
+    /// without carrying the value that authorizes retiring it. The field's type
+    /// makes that structural — a `RePinAuditCorrelationId` cannot hold an
+    /// `OwnershipTransitionId` — so this pins the derivation and the rendering.
+    #[test]
+    fn repin_audit_events_correlate_without_disclosing_the_transition_identity() {
+        let transition_id = OwnershipTransitionId::new(SECRET_TRANSITION_VALUE).unwrap();
+        let mut request = frozen_counter_v5_request();
+        request.transition_id = transition_id;
+        let mut activation = frozen_activation_request();
+        activation.transition_id = transition_id;
+        let fence = OwnershipFence::new(9).unwrap();
+        let error = IpsecLbError::Unsupported;
+
+        let events = [
+            RePinAuditEvent::attempt(&request),
+            RePinAuditEvent::fenced(&request, fence),
+            RePinAuditEvent::steering_installed(&request, fence),
+            RePinAuditEvent::failed(&request, Some(fence), &error),
+            RePinAuditEvent::activation_attempt(&activation),
+            RePinAuditEvent::activated(&activation, fence),
+            RePinAuditEvent::activation_failed(&activation, &error),
+        ];
+
+        let expected = RePinAuditCorrelationId::for_transition(transition_id);
+        for event in &events {
+            assert_eq!(
+                event.correlation_id, expected,
+                "every event of one transition must share its correlation identity"
+            );
+            let rendered = format!("{event:?}");
+            assert!(
+                !rendered.contains(&SECRET_TRANSITION_VALUE.to_string()),
+                "audit event rendering leaked the raw transition identity"
+            );
+            assert!(
+                !rendered.contains(&format!("{SECRET_TRANSITION_VALUE:032x}")),
+                "audit event rendering leaked the raw transition identity"
+            );
+            assert!(
+                rendered.contains(&expected.to_string()),
+                "audit event rendering must keep the correlation identity readable"
+            );
+        }
     }
 
     #[test]

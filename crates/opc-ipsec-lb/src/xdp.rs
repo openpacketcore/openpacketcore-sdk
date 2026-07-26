@@ -10773,7 +10773,10 @@ mod tests {
         );
         let activated = events.last().expect("activation event");
         assert_eq!(activated.sa, request.sa());
-        assert_eq!(activated.transition_id, request.transition_id());
+        assert_eq!(
+            activated.correlation_id,
+            crate::RePinAuditCorrelationId::for_transition(request.transition_id())
+        );
         assert_eq!(activated.fence.map(OwnershipFence::get), Some(120));
         assert_eq!(&activated.previous_owner, request.owner());
         assert_eq!(

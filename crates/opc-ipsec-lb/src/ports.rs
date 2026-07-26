@@ -347,6 +347,22 @@ pub trait OwnershipRetirementAuthority: Send + Sync + std::fmt::Debug {
 }
 
 /// Audit sink for SA ownership changes and steering re-pins.
+///
+/// # What a sink may emit
+///
+/// [`RePinAuditEvent`] is built to be safe to persist and export: it carries a
+/// non-reversible [`crate::RePinAuditCorrelationId`] rather than the
+/// [`crate::OwnershipTransitionId`] that authorizes retirement, precisely so
+/// that a sink logging its correlation key — the ordinary use of one — cannot
+/// hand a standing per-SA teardown capability to everyone with log-read access.
+/// `sa`, `previous_owner`, and `new_owner` remain operator-visible identifiers;
+/// the event's `Debug` redacts them, and an exporting sink should apply its own
+/// deployment policy to them.
+///
+/// A sink MUST NOT reach around this port to record the raw transition
+/// identity alongside the event. Correlation is one-way by design: an operator
+/// who already holds the raw identity can compute the matching correlation
+/// identity with [`crate::RePinAuditCorrelationId::for_transition`].
 #[async_trait]
 pub trait RePinAuditSink: Send + Sync + std::fmt::Debug {
     /// Record a redaction-safe re-pin audit event.
@@ -355,7 +371,7 @@ pub trait RePinAuditSink: Send + Sync + std::fmt::Debug {
     /// repeat an event after an apply-then-cancel or apply-then-error outcome;
     /// sinks must deduplicate that retry rather than append a second event. The
     /// deduplication identity must cover the complete event: neither the
-    /// transition ID alone nor `(transition_id, kind)` distinguishes separate
+    /// correlation ID alone nor `(correlation_id, kind)` distinguishes separate
     /// failed attempts with different redaction-safe failure codes.
     async fn record_repin(&self, event: RePinAuditEvent) -> Result<(), IpsecLbError>;
 }

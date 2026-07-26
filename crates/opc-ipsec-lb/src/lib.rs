@@ -139,10 +139,11 @@ pub use repin::{
     OwnershipFenceGrant, OwnershipFenceRequest, OwnershipRetirementAdmission,
     OwnershipRetirementFinalization, OwnershipRetirementFinalizedProof, OwnershipRetirementGrant,
     OwnershipRetirementRequest, OwnershipRetirementSupersededProof, OwnershipRetryProof,
-    OwnershipSnapshot, OwnershipTransitionFingerprint, OwnershipTransitionId, RePinAuditEvent,
-    RePinAuditEventKind, RePinCoordinator, RePinError, RePinOutcome, RePinPartialFailure,
-    RePinRequest, RePinRetryStage, RePinSteeringOperationPermit, RePinSteeringUpdate,
-    ResumeKeySource, SameSpiOutboundIvResume, SameSpiResume, StrandedActivationRetirement,
+    OwnershipSnapshot, OwnershipTransitionFingerprint, OwnershipTransitionId,
+    RePinAuditCorrelationId, RePinAuditEvent, RePinAuditEventKind, RePinCoordinator, RePinError,
+    RePinOutcome, RePinPartialFailure, RePinRequest, RePinRetryStage, RePinSteeringOperationPermit,
+    RePinSteeringUpdate, ResumeKeySource, SameSpiOutboundIvResume, SameSpiResume,
+    StrandedActivationRetirement,
 };
 pub use routing::{
     AdvertisedPrefix, AdvertisementLease, AdvertisementSetApplyResult, AdvertisementSetDisposition,
