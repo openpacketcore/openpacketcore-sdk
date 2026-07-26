@@ -38,6 +38,7 @@ use opc_session_store::{
 };
 use opc_tls::{AuthenticatedClientConfig, AuthenticatedServerConfig, TlsConfigBuilder};
 use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
+use tokio::sync::watch;
 
 #[derive(Default)]
 struct CountingUnavailableKeyProvider {
@@ -471,7 +472,10 @@ impl SessionLeaseManager for ReplicationDispatchSpy {
 #[derive(Clone)]
 struct CancellableStallBackend {
     inner: FakeSessionBackend,
-    active: Arc<AtomicUsize>,
+    /// Live count of backend calls parked inside [`CancellableStallBackend::stall`],
+    /// published on a watch channel so tests park on the transition instead of
+    /// keeping their thread runnable against the rest of the test binary.
+    active: Arc<watch::Sender<usize>>,
     get_calls: Arc<AtomicUsize>,
     preflight_calls: Arc<AtomicUsize>,
     preflight_behavior: Arc<AtomicUsize>,
@@ -486,7 +490,7 @@ impl CancellableStallBackend {
     fn new() -> Self {
         Self {
             inner: FakeSessionBackend::new(),
-            active: Arc::new(AtomicUsize::new(0)),
+            active: Arc::new(watch::Sender::new(0)),
             get_calls: Arc::new(AtomicUsize::new(0)),
             preflight_calls: Arc::new(AtomicUsize::new(0)),
             preflight_behavior: Arc::new(AtomicUsize::new(0)),
@@ -499,17 +503,42 @@ impl CancellableStallBackend {
     }
 
     async fn stall(&self) {
-        self.active.fetch_add(1, Ordering::SeqCst);
-        let _active = ActiveOperation(Arc::clone(&self.active));
+        let _active = ActiveOperation::enter(Arc::clone(&self.active));
         std::future::pending::<()>().await;
+    }
+
+    /// Backend calls currently parked inside [`Self::stall`].
+    fn active(&self) -> usize {
+        *self.active.borrow()
+    }
+
+    /// Parks until the live stalled-call count satisfies `predicate`.
+    ///
+    /// `watch::Receiver::wait_for` evaluates `predicate` against the current
+    /// value before it awaits anything, so a state the backend already reached
+    /// resolves immediately. There is no edge to miss and therefore no lost
+    /// wakeup, unlike a `Notify` whose permit must be armed before the trigger.
+    async fn wait_for_active(&self, predicate: impl FnMut(&usize) -> bool) {
+        let mut observed = self.active.subscribe();
+        observed
+            .wait_for(predicate)
+            .await
+            .expect("active-count watch channel closed: stall backend must outlive its waiters");
     }
 }
 
-struct ActiveOperation(Arc<AtomicUsize>);
+struct ActiveOperation(Arc<watch::Sender<usize>>);
+
+impl ActiveOperation {
+    fn enter(active: Arc<watch::Sender<usize>>) -> Self {
+        active.send_modify(|count| *count += 1);
+        Self(active)
+    }
+}
 
 impl Drop for ActiveOperation {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
+        self.0.send_modify(|count| *count -= 1);
     }
 }
 
@@ -1452,7 +1481,7 @@ async fn mtls_backend_deadlines_disconnects_and_shutdown_release_stalled_work() 
         .expect_err("stalled read must reach its backend deadline");
     assert!(matches!(read_error, StoreError::BackendUnavailable(_)));
     assert_eq!(backend.get_calls.load(Ordering::SeqCst), 1);
-    assert_eq!(backend.active.load(Ordering::SeqCst), 0);
+    assert_eq!(backend.active(), 0);
 
     let mutation_error = remote
         .delete_fenced(&lease)
@@ -1464,7 +1493,7 @@ async fn mtls_backend_deadlines_disconnects_and_shutdown_release_stalled_work() 
     );
     assert_eq!(backend.delete_calls.load(Ordering::SeqCst), 1);
     assert_eq!(backend.delete_effects.load(Ordering::SeqCst), 1);
-    assert_eq!(backend.active.load(Ordering::SeqCst), 0);
+    assert_eq!(backend.active(), 0);
     handle.abort_and_wait().await;
 
     let disconnect_server = SessionReplicationServer::new(
@@ -1491,11 +1520,10 @@ async fn mtls_backend_deadlines_disconnects_and_shutdown_release_stalled_work() 
     write_frame(&mut disconnected, &Request::Get { key: key.clone() })
         .await
         .expect("write stalled read");
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while backend.active.load(Ordering::SeqCst) == 0 {
-            tokio::task::yield_now().await;
-        }
-    })
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        backend.wait_for_active(|active| *active > 0),
+    )
     .await
     .expect("backend read starts");
     let readiness = remote_backend(
@@ -1513,11 +1541,10 @@ async fn mtls_backend_deadlines_disconnects_and_shutdown_release_stalled_work() 
         "fresh readiness must fail closed while the read family is exhausted"
     );
     drop(disconnected);
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while backend.active.load(Ordering::SeqCst) != 0 {
-            tokio::task::yield_now().await;
-        }
-    })
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        backend.wait_for_active(|active| *active == 0),
+    )
     .await
     .expect("peer disconnect cancels and releases backend work");
 
@@ -1532,17 +1559,16 @@ async fn mtls_backend_deadlines_disconnects_and_shutdown_release_stalled_work() 
     write_frame(&mut shutdown, &Request::Get { key })
         .await
         .expect("write shutdown-stalled read");
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while backend.active.load(Ordering::SeqCst) == 0 {
-            tokio::task::yield_now().await;
-        }
-    })
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        backend.wait_for_active(|active| *active > 0),
+    )
     .await
     .expect("shutdown backend read starts");
     tokio::time::timeout(Duration::from_secs(1), disconnect_handle.abort_and_wait())
         .await
         .expect("shutdown barrier cancels stalled backend work");
-    assert_eq!(backend.active.load(Ordering::SeqCst), 0);
+    assert_eq!(backend.active(), 0);
     drop(shutdown);
 }
 
@@ -1597,7 +1623,7 @@ async fn remote_preflight_timeout_is_retry_safe_and_never_reaches_key_provider()
         .expect_err("preflight must time out before encryption");
     assert!(matches!(error, StoreError::BackendUnavailable(_)));
     assert_eq!(backend.preflight_calls.load(Ordering::SeqCst), 1);
-    assert_eq!(backend.active.load(Ordering::SeqCst), 0);
+    assert_eq!(backend.active(), 0);
     assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
     assert!(backend
         .inner
