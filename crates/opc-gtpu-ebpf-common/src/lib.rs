@@ -1995,6 +1995,38 @@ mod tests {
 
     use super::*;
 
+    /// Every datapath counter index must be distinct and inside the map.
+    ///
+    /// The indices address a fixed-size pinned per-CPU array, so a collision
+    /// silently merges two unrelated counters and an index at or past
+    /// `COUNTER_SLOTS` writes nothing at all -- both fail as a wrong
+    /// operator-facing number rather than as an error. This matters most when
+    /// the map next grows: the real fix for the uplink redirect counter has to
+    /// add a slot, and this is what catches a reused index or a forgotten
+    /// `COUNTER_SLOTS` bump.
+    #[test]
+    fn datapath_counter_indices_are_distinct_and_within_the_map() {
+        let indices = [
+            COUNTER_UL_ENCAP,
+            COUNTER_UL_FAR_MISS,
+            COUNTER_DL_DECAP,
+            COUNTER_DL_UNKNOWN_TEID,
+            COUNTER_DL_MALFORMED,
+            COUNTER_DL_DST_MISMATCH,
+        ];
+        let mut seen = std::vec::Vec::new();
+        for index in indices {
+            assert!(index < COUNTER_SLOTS, "index {index} is outside the map");
+            assert!(!seen.contains(&index), "index {index} is used twice");
+            seen.push(index);
+        }
+        assert_eq!(
+            seen.len() as u32,
+            COUNTER_SLOTS,
+            "every slot must be claimed, or the map is larger than the counters"
+        );
+    }
+
     fn far() -> UplinkFar {
         UplinkFar {
             peer_ip: [192, 0, 2, 10],
