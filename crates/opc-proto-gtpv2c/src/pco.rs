@@ -32,6 +32,13 @@ pub const PCO_CONTAINER_DNS_SERVER_IPV4: u16 = 0x000d;
 /// by either P-CSCF address-family request.
 pub const PCO_CONTAINER_P_CSCF_RESELECTION_SUPPORT: u16 = 0x0012;
 
+/// IPCP configuration-protocol identifier (RFC 1332).
+///
+/// TS 24.008 10.5.6.3 requires support for this identifier, and places it in
+/// the configuration protocol options list, which precedes the container-based
+/// additional parameters list.
+pub const PCO_PROTOCOL_IPCP: u16 = 0x8021;
+
 /// Maximum number of length-delimited containers decoded from one PCO value.
 ///
 /// This bounds parser work and address-vector growth independently of the
@@ -40,10 +47,84 @@ pub const PCO_MAX_CONTAINERS: usize = 64;
 
 const PCO_CONTAINER_HEADER_LEN: usize = 3;
 
+/// RFC 1661 configuration-packet header: Code, Identifier and a two-octet
+/// Length that counts itself.
+const IPCP_HEADER_LEN: u8 = 4;
+
+/// RFC 1877 DNS option: Type, Length, and a four-octet address.
+const IPCP_DNS_OPTION_LEN: u8 = 6;
+
+const IPCP_CODE_CONFIGURE_REQUEST: u8 = 1;
+const IPCP_CODE_CONFIGURE_NAK: u8 = 3;
+
+/// Primary DNS Server Address option (RFC 1877 §1.1).
+const IPCP_OPTION_PRIMARY_DNS: u8 = 129;
+
+/// Secondary DNS Server Address option (RFC 1877 §1.2).
+const IPCP_OPTION_SECONDARY_DNS: u8 = 131;
+
+/// Request for DNS server addresses via an IPCP Configure-Request.
+///
+/// A peer may serve DNS through the IPCP option exchange instead of, or in
+/// addition to, the `0x000d` container. RFC 1877 §1.1 has the requesting side
+/// send the address as four zero octets, and the peer answer with a
+/// Configure-Nak carrying the real address.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IpcpDnsRequest {
+    /// Request the Primary DNS Server Address option (RFC 1877 type 129).
+    pub primary_dns: bool,
+    /// Request the Secondary DNS Server Address option (RFC 1877 type 131).
+    pub secondary_dns: bool,
+    /// Identifier echoed by the peer in its reply, per RFC 1661 §5.
+    ///
+    /// This is opaque to the encoder; a caller that correlates replies is
+    /// responsible for varying it.
+    pub identifier: u8,
+}
+
+impl IpcpDnsRequest {
+    /// Construct a request selecting no option.
+    #[must_use]
+    pub const fn none() -> Self {
+        Self {
+            primary_dns: false,
+            secondary_dns: false,
+            identifier: 0,
+        }
+    }
+
+    /// Return whether at least one DNS option is selected.
+    ///
+    /// [`Self::identifier`] alone never makes a request; without an option the
+    /// unit would be a Configure-Request carrying nothing to negotiate.
+    #[must_use]
+    pub const fn is_requested(self) -> bool {
+        self.primary_dns || self.secondary_dns
+    }
+
+    /// Length of the IPCP unit contents for the selected options.
+    ///
+    /// Bounded by construction at `4 + 6 + 6 = 16`, so it always fits the
+    /// one-octet unit length that TS 24.008 10.5.6.3 defines.
+    const fn contents_len(self) -> u8 {
+        let mut len = IPCP_HEADER_LEN;
+        if self.primary_dns {
+            len += IPCP_DNS_OPTION_LEN;
+        }
+        if self.secondary_dns {
+            len += IPCP_DNS_OPTION_LEN;
+        }
+        len
+    }
+}
+
 /// Parameters requested in an MS-to-network PCO or APCO.
 ///
-/// Every selected parameter is encoded as a zero-length container. An empty
-/// request encodes to an empty vector so a caller can omit the outer PCO IE.
+/// Container parameters are encoded as zero-length containers. [`Self::ipcp_dns`]
+/// is instead a structured RFC 1332 unit and is emitted ahead of them, because
+/// TS 24.008 10.5.6.3 places the configuration protocol options list before the
+/// additional parameters list. An empty request encodes to an empty vector so a
+/// caller can omit the outer PCO IE.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PcoRequest {
     /// Request P-CSCF IPv6 addresses.
@@ -59,6 +140,12 @@ pub struct PcoRequest {
     /// This emits the independent empty container `0x0012`; the P-CSCF IPv4
     /// and IPv6 address request flags never imply it.
     pub p_cscf_reselection_support: bool,
+    /// Request DNS server addresses through an IPCP Configure-Request.
+    ///
+    /// This is independent of [`Self::dns_server_ipv4`]: a peer may answer
+    /// either mechanism, and asking both ways is what an interoperating
+    /// gateway does.
+    pub ipcp_dns: IpcpDnsRequest,
 }
 
 impl PcoRequest {
@@ -71,6 +158,7 @@ impl PcoRequest {
             p_cscf_ipv4: false,
             dns_server_ipv4: false,
             p_cscf_reselection_support: false,
+            ipcp_dns: IpcpDnsRequest::none(),
         }
     }
 
@@ -82,13 +170,16 @@ impl PcoRequest {
             || self.p_cscf_ipv4
             || self.dns_server_ipv4
             || self.p_cscf_reselection_support
+            || self.ipcp_dns.is_requested()
     }
 
-    /// Encode MS-to-network PCO contents in ascending container-ID order.
+    /// Encode MS-to-network PCO contents.
     ///
-    /// Each selected parameter is represented by its two-octet identifier and
-    /// a zero contents length. When no parameter is selected, this returns an
-    /// empty vector rather than a header-only PCO.
+    /// The IPCP unit comes first when selected, then the requested containers
+    /// in ascending identifier order. Each container parameter is represented
+    /// by its two-octet identifier and a zero contents length. When no
+    /// parameter is selected, this returns an empty vector rather than a
+    /// header-only PCO.
     #[must_use]
     pub fn encode_request_contents(self) -> Vec<u8> {
         if !self.is_requested() {
@@ -105,9 +196,21 @@ impl PcoRequest {
         .into_iter()
         .filter(|requested| *requested)
         .count();
-        let mut encoded =
-            Vec::with_capacity(1 + requested_count.saturating_mul(PCO_CONTAINER_HEADER_LEN));
+        let ipcp_len = if self.ipcp_dns.is_requested() {
+            PCO_CONTAINER_HEADER_LEN + usize::from(self.ipcp_dns.contents_len())
+        } else {
+            0
+        };
+        let mut encoded = Vec::with_capacity(
+            1 + requested_count.saturating_mul(PCO_CONTAINER_HEADER_LEN) + ipcp_len,
+        );
         encoded.push(PCO_HEADER_PPP_FOR_IP_PDN);
+        // TS 24.008 10.5.6.3: the configuration protocol options list occupies
+        // octets 4..w and the additional parameters list w+1..z, so the IPCP
+        // unit is positionally ahead of every container.
+        if self.ipcp_dns.is_requested() {
+            encode_ipcp_configure_request(&mut encoded, self.ipcp_dns);
+        }
         if self.p_cscf_ipv6 {
             encode_empty_request_container(&mut encoded, PCO_CONTAINER_P_CSCF_IPV6);
         }
@@ -132,6 +235,36 @@ fn encode_empty_request_container(encoded: &mut Vec<u8>, identifier: u16) {
     encoded.push(0);
 }
 
+/// Encode the `0x8021` unit carrying an IPCP Configure-Request.
+///
+/// The unit contents is an RFC 1661 packet stripped of its Protocol and
+/// Padding octets, as TS 24.008 10.5.6.3 requires: Code, Identifier, and a
+/// two-octet Length that counts the header plus every option.
+fn encode_ipcp_configure_request(encoded: &mut Vec<u8>, request: IpcpDnsRequest) {
+    let contents_len = request.contents_len();
+    encoded.extend_from_slice(&PCO_PROTOCOL_IPCP.to_be_bytes());
+    encoded.push(contents_len);
+    encoded.push(IPCP_CODE_CONFIGURE_REQUEST);
+    encoded.push(request.identifier);
+    encoded.extend_from_slice(&u16::from(contents_len).to_be_bytes());
+    if request.primary_dns {
+        encode_ipcp_dns_option(encoded, IPCP_OPTION_PRIMARY_DNS);
+    }
+    if request.secondary_dns {
+        encode_ipcp_dns_option(encoded, IPCP_OPTION_SECONDARY_DNS);
+    }
+}
+
+/// Encode one RFC 1877 DNS option requesting a peer-supplied address.
+///
+/// The address is four zero octets: RFC 1877 §1.1 defines that as the signal
+/// for the peer to answer with a Configure-Nak carrying the real address.
+fn encode_ipcp_dns_option(encoded: &mut Vec<u8>, option_type: u8) {
+    encoded.push(option_type);
+    encoded.push(IPCP_DNS_OPTION_LEN);
+    encoded.extend_from_slice(&[0; 4]);
+}
+
 /// DNS and P-CSCF addresses decoded from a network-to-MS PCO.
 ///
 /// Repeated address containers are retained in wire order. Well-formed unknown
@@ -147,16 +280,46 @@ pub struct PcoAddressConfiguration {
     pub p_cscf_ipv4: Vec<[u8; 4]>,
     /// DNS Server IPv4 addresses from container `0x000d`.
     pub dns_server_ipv4: Vec<[u8; 4]>,
+    /// Primary DNS Server Address from an IPCP Configure-Nak (RFC 1877 §1.1).
+    ///
+    /// Held separately from [`Self::dns_server_ipv4`] so the answering
+    /// mechanism stays visible; [`Self::dns_server_ipv4_all`] merges them.
+    pub ipcp_primary_dns: Option<[u8; 4]>,
+    /// Secondary DNS Server Address from an IPCP Configure-Nak (RFC 1877 §1.2).
+    pub ipcp_secondary_dns: Option<[u8; 4]>,
 }
 
 impl PcoAddressConfiguration {
-    /// Return whether no supported address container was present.
+    /// Return whether no supported address was present.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.p_cscf_ipv6.is_empty()
             && self.dns_server_ipv6.is_empty()
             && self.p_cscf_ipv4.is_empty()
             && self.dns_server_ipv4.is_empty()
+            && self.ipcp_primary_dns.is_none()
+            && self.ipcp_secondary_dns.is_none()
+    }
+
+    /// Every IPv4 DNS server address the peer supplied, by either mechanism.
+    ///
+    /// Container addresses come first in wire order, then the IPCP primary and
+    /// secondary addresses, with duplicates dropped. A peer answers through
+    /// whichever mechanism it implements, so a caller that reads only
+    /// [`Self::dns_server_ipv4`] can end up with a session that established
+    /// cleanly and has no usable DNS. Prefer this accessor.
+    #[must_use]
+    pub fn dns_server_ipv4_all(&self) -> Vec<[u8; 4]> {
+        let mut all = self.dns_server_ipv4.clone();
+        for address in [self.ipcp_primary_dns, self.ipcp_secondary_dns]
+            .into_iter()
+            .flatten()
+        {
+            if !all.contains(&address) {
+                all.push(address);
+            }
+        }
+        all
     }
 
     /// Decode network-to-MS PCO contents.
@@ -211,6 +374,7 @@ impl PcoAddressConfiguration {
                 PCO_CONTAINER_DNS_SERVER_IPV4 => {
                     decoded.dns_server_ipv4.push(decode_ipv4_address(contents)?)
                 }
+                PCO_PROTOCOL_IPCP => decode_ipcp_unit(contents, &mut decoded)?,
                 _ => {}
             }
             remaining = &remaining[contents_end..];
@@ -226,8 +390,82 @@ impl fmt::Debug for PcoAddressConfiguration {
             .field("dns_server_ipv6_count", &self.dns_server_ipv6.len())
             .field("p_cscf_ipv4_count", &self.p_cscf_ipv4.len())
             .field("dns_server_ipv4_count", &self.dns_server_ipv4.len())
+            .field("ipcp_primary_dns_present", &self.ipcp_primary_dns.is_some())
+            .field(
+                "ipcp_secondary_dns_present",
+                &self.ipcp_secondary_dns.is_some(),
+            )
             .finish()
     }
+}
+
+/// Decode a `0x8021` unit, recording any peer-supplied DNS address.
+///
+/// Only a Configure-Nak carries addresses: RFC 1661 §5.3 has a Configure-Ack
+/// echo the request's options verbatim, and this crate always requests with
+/// the RFC 1877 all-zero address, so an Ack conveys nothing. Other codes are
+/// accepted and ignored rather than rejected.
+fn decode_ipcp_unit(
+    contents: &[u8],
+    decoded: &mut PcoAddressConfiguration,
+) -> Result<(), PcoDecodeError> {
+    let header_len = usize::from(IPCP_HEADER_LEN);
+    if contents.len() < header_len {
+        return Err(PcoDecodeError::IpcpHeaderTruncated);
+    }
+    let code = contents[0];
+    // contents[1] is the Identifier, which correlates a reply to a request and
+    // carries nothing this decoder interprets.
+    let declared = usize::from(u16::from_be_bytes([contents[2], contents[3]]));
+    if declared < header_len || declared > contents.len() {
+        return Err(PcoDecodeError::IpcpLengthInvalid);
+    }
+    if code != IPCP_CODE_CONFIGURE_NAK {
+        return Ok(());
+    }
+
+    // Each iteration consumes at least two octets of a slice the one-octet
+    // unit length already bounds to 255, so this terminates without a
+    // separate option cap.
+    let mut remaining = &contents[header_len..declared];
+    while !remaining.is_empty() {
+        let (&option_type, rest) = remaining
+            .split_first()
+            .ok_or(PcoDecodeError::IpcpOptionTruncated)?;
+        let (&option_len, _) = rest
+            .split_first()
+            .ok_or(PcoDecodeError::IpcpOptionTruncated)?;
+        let option_len = usize::from(option_len);
+        // RFC 1661 §6: the option Length counts the Type and Length octets.
+        if option_len < 2 || option_len > remaining.len() {
+            return Err(PcoDecodeError::IpcpOptionLengthInvalid);
+        }
+        let data = &remaining[2..option_len];
+        match option_type {
+            IPCP_OPTION_PRIMARY_DNS => {
+                decode_ipcp_dns_option(data, &mut decoded.ipcp_primary_dns)?;
+            }
+            IPCP_OPTION_SECONDARY_DNS => {
+                decode_ipcp_dns_option(data, &mut decoded.ipcp_secondary_dns)?;
+            }
+            _ => {}
+        }
+        remaining = &remaining[option_len..];
+    }
+    Ok(())
+}
+
+/// Record one RFC 1877 DNS address, keeping the first of any duplicate.
+///
+/// An all-zero address is the RFC 1877 request encoding, not a server, so a
+/// peer that echoes it back is treated as having supplied nothing.
+fn decode_ipcp_dns_option(data: &[u8], slot: &mut Option<[u8; 4]>) -> Result<(), PcoDecodeError> {
+    let address =
+        <[u8; 4]>::try_from(data).map_err(|_| PcoDecodeError::IpcpDnsOptionLengthInvalid)?;
+    if address != [0; 4] && slot.is_none() {
+        *slot = Some(address);
+    }
+    Ok(())
 }
 
 fn decode_ipv4_address(contents: &[u8]) -> Result<[u8; 4], PcoDecodeError> {
@@ -255,6 +493,16 @@ pub enum PcoDecodeError {
     InvalidIpv6AddressLength,
     /// The value exceeded [`PCO_MAX_CONTAINERS`].
     TooManyContainers,
+    /// An IPCP unit was shorter than the RFC 1661 four-octet header.
+    IpcpHeaderTruncated,
+    /// An IPCP Length was below the header size or beyond the unit contents.
+    IpcpLengthInvalid,
+    /// An IPCP option header was truncated.
+    IpcpOptionTruncated,
+    /// An IPCP option Length was below two or beyond the remaining options.
+    IpcpOptionLengthInvalid,
+    /// An RFC 1877 DNS option did not carry exactly four address octets.
+    IpcpDnsOptionLengthInvalid,
 }
 
 impl PcoDecodeError {
@@ -269,6 +517,11 @@ impl PcoDecodeError {
             Self::InvalidIpv4AddressLength => "pco_invalid_ipv4_address_length",
             Self::InvalidIpv6AddressLength => "pco_invalid_ipv6_address_length",
             Self::TooManyContainers => "pco_too_many_containers",
+            Self::IpcpHeaderTruncated => "pco_ipcp_header_truncated",
+            Self::IpcpLengthInvalid => "pco_ipcp_length_invalid",
+            Self::IpcpOptionTruncated => "pco_ipcp_option_truncated",
+            Self::IpcpOptionLengthInvalid => "pco_ipcp_option_length_invalid",
+            Self::IpcpDnsOptionLengthInvalid => "pco_ipcp_dns_option_length_invalid",
         }
     }
 }

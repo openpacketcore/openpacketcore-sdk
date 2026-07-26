@@ -322,15 +322,27 @@ coverage.
      support.
    - PCO/APCO and Indication are typed as opaque byte-preserving containers so
      nested or future protocol options/flags are not silently dropped.
-   - The optional TS 24.008 PCO inner codec bounds parsing to 64 containers,
+   - The optional TS 24.008 PCO inner codec bounds parsing to 64 units,
      projects repeated IPv4/IPv6 DNS and P-CSCF addresses in wire order, and
-     safely skips well-formed unknown containers without changing opaque IE
-     round trips. Its MS-to-network request model emits the independent
-     zero-length P-CSCF reselection-support container `0x0012` exactly once
-     when selected, after lower numeric container identifiers. P-CSCF address
-     requests do not imply reselection support; empty and legacy combinations
-     retain their prior bytes. The same inner value can be carried unchanged
-     by PCO or APCO.
+     safely skips well-formed unknown containers and unsupported configuration
+     protocols without changing opaque IE round trips. Its MS-to-network
+     request model emits the independent zero-length P-CSCF
+     reselection-support container `0x0012` exactly once when selected, after
+     lower numeric container identifiers. P-CSCF address requests do not imply
+     reselection support; empty and legacy combinations retain their prior
+     bytes. The same inner value can be carried unchanged by PCO or APCO.
+   - IPCP (`0x8021`) is supported in both directions, as 10.5.6.3 requires.
+     The request model emits an RFC 1332 Configure-Request whose contents is an
+     RFC 1661 packet stripped of its Protocol and Padding octets, carrying the
+     RFC 1877 Primary (129) and Secondary (131) DNS Server Address options with
+     the all-zero address that requests a peer-supplied value. Because the
+     configuration protocol options list occupies octets 4..w and the
+     additional parameters list w+1..z, the unit is encoded ahead of every
+     container. On receive, only a Configure-Nak is read for addresses: a
+     Configure-Ack echoes the request's options verbatim and so conveys no
+     server, and an echoed all-zero address is not treated as one. A malformed
+     unit for this now-supported identifier rejects the whole value, matching
+     how a known container with a bad length is handled.
    - Bearer QoS decodes the fixed 22-octet shape into a typed
      Allocation/Retention Priority, QCI, and 40-bit integer-kbit/s maximum and
      guaranteed bit-rate fields. ARP priority level and spare bits are checked.

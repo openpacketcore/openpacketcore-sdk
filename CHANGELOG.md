@@ -42,6 +42,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is set, and such a datagram decodes normally.
 
 ### Changed
+- **PCO/APCO can request DNS through IPCP — `opc-proto-gtpv2c` (breaking to
+  `PcoRequest` and `PcoAddressConfiguration` struct literals):** `PcoRequest`
+  could only emit zero-length request containers, so an IPCP (`0x8021`)
+  Configuration-Request was unreachable from outside the crate. TS 24.008
+  10.5.6.3 requires support for that identifier, and a peer that serves DNS
+  only through the IPCP option exchange left a caller with a session that
+  established cleanly and had no usable DNS.
+  - *Send.* `PcoRequest::ipcp_dns` emits an RFC 1332 Configure-Request carrying
+    the RFC 1877 Primary (129) and Secondary (131) DNS Server Address options,
+    each with the all-zero address that asks the peer to supply one. The unit
+    contents is an RFC 1661 packet stripped of its Protocol and Padding octets,
+    whose two-octet Length counts itself; requesting both options gives the
+    length-16 unit observed from an interoperating gateway.
+  - *Ordering.* 10.5.6.3 defines two logical lists — the configuration protocol
+    options list in octets 4..w and the additional parameters list in w+1..z —
+    so the IPCP unit is encoded ahead of every container rather than appended.
+  - *Receive.* Emitting a request whose answer is discarded would deliver
+    nothing, so `PcoAddressConfiguration` now decodes the reply into
+    `ipcp_primary_dns` and `ipcp_secondary_dns`. Only a Configure-Nak is read
+    for addresses: RFC 1661 5.3 has a Configure-Ack echo the request's options
+    verbatim, so it conveys no server, and an echoed all-zero address is not
+    treated as one. `dns_server_ipv4_all()` merges the container and IPCP
+    sources and drops duplicates, so a caller cannot silently miss the
+    mechanism its peer chose.
+  - Both structs gain fields, which breaks exhaustive struct literals;
+    `..PcoRequest::none()` and `..Default::default()` are unaffected. Five new
+    `PcoDecodeError` variants report malformed IPCP framing, and a malformed
+    unit for this now-supported identifier rejects the whole value, matching
+    how a known container with a bad length is already handled. `Debug` reports
+    presence, never addresses.
+
 - **Credential-rotation observability closes three residual gaps —
   `opc-tls`, `opc-session-net` (breaking to the reason enum):** an audit of #158
   against `main` found its atomic-reload, bounded-authentication-age,
