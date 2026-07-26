@@ -110,9 +110,9 @@ pub use ownership::{
     OWNERSHIP_KEY_MAX_ENCODED_BYTES,
 };
 pub use ports::{
-    LegacySpiRuleRePinAdapter, OwnershipFencer, OwnershipRetirementAuthority, OwnershipSource,
-    RePinAuditSink, RePinSteeringBackend, RePinSteeringRetirementBackend, SpiAllocator,
-    SteeringBackend, VipAdvertiser,
+    LegacySpiRuleRePinAdapter, OwnershipActivationAuthority, OwnershipFencer,
+    OwnershipRetirementAuthority, OwnershipSource, RePinAuditSink, RePinSteeringBackend,
+    RePinSteeringRetirementBackend, SpiAllocator, SteeringBackend, VipAdvertiser,
 };
 pub use redirect::{
     establish_ingress_redirect_client, establish_ingress_redirect_server,
@@ -134,14 +134,15 @@ pub use redirect::{
     INGRESS_REDIRECT_CONTROL_ALPN,
 };
 pub use repin::{
-    ForwardingProof, IkeRandomIvAttestation, OwnershipCleanupCompleteProof, OwnershipFence,
+    ForwardingProof, IkeRandomIvAttestation, OwnershipActivationGrant, OwnershipActivationRequest,
+    OwnershipActivationRetirement, OwnershipCleanupCompleteProof, OwnershipFence,
     OwnershipFenceGrant, OwnershipFenceRequest, OwnershipRetirementAdmission,
     OwnershipRetirementFinalization, OwnershipRetirementFinalizedProof, OwnershipRetirementGrant,
     OwnershipRetirementRequest, OwnershipRetirementSupersededProof, OwnershipRetryProof,
     OwnershipSnapshot, OwnershipTransitionFingerprint, OwnershipTransitionId, RePinAuditEvent,
     RePinAuditEventKind, RePinCoordinator, RePinError, RePinOutcome, RePinPartialFailure,
     RePinRequest, RePinRetryStage, RePinSteeringOperationPermit, RePinSteeringUpdate,
-    ResumeKeySource, SameSpiOutboundIvResume, SameSpiResume,
+    ResumeKeySource, SameSpiOutboundIvResume, SameSpiResume, StrandedActivationRetirement,
 };
 pub use routing::{
     AdvertisedPrefix, AdvertisementLease, AdvertisementSetApplyResult, AdvertisementSetDisposition,

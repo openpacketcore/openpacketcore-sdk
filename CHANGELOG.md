@@ -7,6 +7,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **First-owner activation for destination-scoped steering — `opc-ipsec-lb`:**
+  in `HostXdpFenceDomain::PerOwnershipKey` the only public owner-map writer was
+  the fenced re-pin coordinator, and a re-pin cannot be formed for a fresh SA --
+  it needs a distinct predecessor owner, a predecessor fence, and same-SPI
+  resume evidence that a newly negotiated SA does not have. A node could
+  therefore steer only SAs it inherited; every SA it negotiated itself had no
+  owner-map entry, so the fast path classified it `SlowPathMiss` and passed it
+  to the local stack, where it was lost on any node that was not the owner.
+  RFC 4303 §2.1 states verbatim: "The SPI is an arbitrary 32-bit value that is
+  used by a receiver to identify the SA to which an incoming packet is bound."
+  The receiver-chosen inbound SPI is therefore live from the moment the
+  responder installs the SA, before any ownership transition exists, so the
+  owner map must admit a first, no-predecessor publication. (Paraphrase, not a
+  quotation: RFC 7296 §1.2 and §2.8 are the IKEv2 events that produce such an
+  SA, and §1.4 retires SAs by SPI through INFORMATIONAL Delete payloads.)
+  `RePinCoordinator::activate` and the new `OwnershipActivationAuthority` port
+  close that gap. The request carries no predecessor and no resume, IV, counter
+  or anti-replay evidence, and no generation: `SessionStoreOwnershipFencer`
+  mints it from the session store's own per-key monotonic fence and returns it
+  in an opaque grant, so no caller-invented generation can reach a datapath.
+  Publication reuses the existing operation permit, fence-last ordering and
+  exact readback. Activation is a promotion, never an upsert -- an absent,
+  retiring, or differently-owned record fails closed. Because the store keeps a
+  key's fence floor across the fenced delete that ends a retirement, an empty
+  owner map plus an empty record set is never read as "never activated", and a
+  retired generation can never be re-minted.
+  `RePinCoordinator::retire_activation` is the paired teardown for an
+  activation that never re-pinned; it holds the Host permit across the whole
+  saga and checks generations through the same durable retirement authority, so
+  `remove_owner`'s prohibition in this mode is no longer terminal.
+  Restart recovery is unchanged and stays inert by design -- recovered owner
+  entries keep their equal-generation conflict-witness role and remain stale --
+  but replaying the identical activation now re-arms them from durable
+  authority instead of from map residue.
+  `retire_activation` additionally requires the target shard to still be owned
+  by the retiring owner, mirroring the gate `activate` already applied.
+  Matching a replayed request against the durable record is an idempotency
+  check and never an authorization decision, so `OwnershipTransitionId` now
+  documents that its value MUST be drawn from a CSPRNG: it is the only field of
+  a retirement an unrelated party cannot derive from public protocol state.
+- **`SessionStoreOwnershipFencer::birth_record` -- `opc-ipsec-lb`:** activation
+  requires an authoritative birth record whose state type is private to this
+  crate, so a caller following the documented steps could not build one and got
+  `InvalidConfig { field: "session_store.state_type" }`. The fencer now builds
+  the exact record -- state type, `AuthoritativeSession` state class,
+  generation 1, no expiry, empty plaintext metadata payload -- for both scoped
+  SA keys and shard-owner keys, leaving the lease and the CAS to the caller.
+  It also rejects a lease held by an owner other than the record's -- a
+  combination the birth CAS was already guaranteed to refuse as `StaleFence` --
+  so the mistake now surfaces where it was made.
+- **`SessionStoreOwnershipFencer::recover_stranded_activation_retirement` and
+  `StrandedActivationRetirement` -- `opc-ipsec-lb`:** `retire_activation`
+  commits a durable `Retiring` record before it calls steering. A steering
+  failure or process loss after that point left the key refusing every later
+  activation forever, because only a replay with the exact original request and
+  `active_fence` clears it and no public API exposed enough to rebuild them.
+  Recovery now reconstructs both from the stored record plus the deployment's
+  own `SteeringRule`, and requires the reconstruction to reproduce the record's
+  committed activation fingerprint, so a wrong rule, shard, owner, or SA fails
+  closed instead of retiring an SA the caller did not name.
+  Recovery deliberately discloses the original caller's `OwnershipTransitionId`,
+  which is sound only because a `Retiring` record's transition is already
+  terminally committed to teardown and therefore spent. The gate is a security
+  boundary: a record in any non-terminal state -- absent, unbound, or `Active`
+  -- returns `Ok(None)` and discloses nothing, and widening that to a live
+  record would make recovery a third-party teardown primitive.
+
+### Changed
+- **`RePinAuditEventKind` gained an `Activated` variant — `opc-ipsec-lb`
+  (breaking for exhaustive matches):** a first activation is now audited
+  distinctly from an ownership transition. Activation events set
+  `previous_owner == new_owner` because no ownership was taken from another
+  node.
+
 ### Fixed
 - **P-CSCF Re-selection support is no longer emittable on its own --
   `opc-proto-gtpv2c` (breaking to `PcoRequest`):** TS 24.008 10.5.6.3 says of
