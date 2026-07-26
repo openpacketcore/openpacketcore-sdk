@@ -25,6 +25,13 @@ pub const PCO_CONTAINER_P_CSCF_IPV4: u16 = 0x000c;
 /// DNS Server IPv4 Address container identifier.
 pub const PCO_CONTAINER_DNS_SERVER_IPV4: u16 = 0x000d;
 
+/// IPv4 Link MTU container identifier.
+///
+/// Direction-dependent, per TS 24.008 Table 10.5.154: MS to network this is
+/// the zero-length IPv4 Link MTU *Request*; network to MS it carries the link
+/// MTU itself as two octets.
+pub const PCO_CONTAINER_IPV4_LINK_MTU: u16 = 0x0010;
+
 /// P-CSCF reselection-support request container identifier.
 ///
 /// In the MS-to-network direction this container has zero-length contents and
@@ -140,6 +147,12 @@ pub struct PcoRequest {
     /// This emits the independent empty container `0x0012`; the P-CSCF IPv4
     /// and IPv6 address request flags never imply it.
     pub p_cscf_reselection_support: bool,
+    /// Request the network-supplied IPv4 Link MTU.
+    ///
+    /// On a tunnelled access the packet the UE emits is carried inside IPsec
+    /// ESP and then GTP-U, so the UE cannot infer the usable MTU from its own
+    /// link. Asking is the only way it learns.
+    pub ipv4_link_mtu: bool,
     /// Request DNS server addresses through an IPCP Configure-Request.
     ///
     /// This is independent of [`Self::dns_server_ipv4`]: a peer may answer
@@ -158,6 +171,7 @@ impl PcoRequest {
             p_cscf_ipv4: false,
             dns_server_ipv4: false,
             p_cscf_reselection_support: false,
+            ipv4_link_mtu: false,
             ipcp_dns: IpcpDnsRequest::none(),
         }
     }
@@ -170,6 +184,7 @@ impl PcoRequest {
             || self.p_cscf_ipv4
             || self.dns_server_ipv4
             || self.p_cscf_reselection_support
+            || self.ipv4_link_mtu
             || self.ipcp_dns.is_requested()
     }
 
@@ -191,6 +206,7 @@ impl PcoRequest {
             self.dns_server_ipv6,
             self.p_cscf_ipv4,
             self.dns_server_ipv4,
+            self.ipv4_link_mtu,
             self.p_cscf_reselection_support,
         ]
         .into_iter()
@@ -222,6 +238,9 @@ impl PcoRequest {
         }
         if self.dns_server_ipv4 {
             encode_empty_request_container(&mut encoded, PCO_CONTAINER_DNS_SERVER_IPV4);
+        }
+        if self.ipv4_link_mtu {
+            encode_empty_request_container(&mut encoded, PCO_CONTAINER_IPV4_LINK_MTU);
         }
         if self.p_cscf_reselection_support {
             encode_empty_request_container(&mut encoded, PCO_CONTAINER_P_CSCF_RESELECTION_SUPPORT);
@@ -287,6 +306,11 @@ pub struct PcoAddressConfiguration {
     pub ipcp_primary_dns: Option<[u8; 4]>,
     /// Secondary DNS Server Address from an IPCP Configure-Nak (RFC 1877 §1.2).
     pub ipcp_secondary_dns: Option<[u8; 4]>,
+    /// IPv4 link MTU in octets, from container `0x0010`.
+    ///
+    /// `Option` rather than a sentinel: TS 24.008 reserves no "absent" value,
+    /// and zero is not one.
+    pub ipv4_link_mtu: Option<u16>,
 }
 
 impl PcoAddressConfiguration {
@@ -299,6 +323,7 @@ impl PcoAddressConfiguration {
             && self.dns_server_ipv4.is_empty()
             && self.ipcp_primary_dns.is_none()
             && self.ipcp_secondary_dns.is_none()
+            && self.ipv4_link_mtu.is_none()
     }
 
     /// Every IPv4 DNS server address the peer supplied, by either mechanism.
@@ -374,6 +399,7 @@ impl PcoAddressConfiguration {
                 PCO_CONTAINER_DNS_SERVER_IPV4 => {
                     decoded.dns_server_ipv4.push(decode_ipv4_address(contents)?)
                 }
+                PCO_CONTAINER_IPV4_LINK_MTU => decode_ipv4_link_mtu(contents, &mut decoded),
                 PCO_PROTOCOL_IPCP => decode_ipcp_unit(contents, &mut decoded)?,
                 _ => {}
             }
@@ -395,6 +421,7 @@ impl fmt::Debug for PcoAddressConfiguration {
                 "ipcp_secondary_dns_present",
                 &self.ipcp_secondary_dns.is_some(),
             )
+            .field("ipv4_link_mtu", &self.ipv4_link_mtu)
             .finish()
     }
 }
@@ -466,6 +493,22 @@ fn decode_ipcp_dns_option(data: &[u8], slot: &mut Option<[u8; 4]>) -> Result<(),
         *slot = Some(address);
     }
     Ok(())
+}
+
+/// Record the IPv4 link MTU, keeping the first of any repeat.
+///
+/// TS 24.008 10.5.6.3 is explicit that a container whose contents length is
+/// not two "shall be ignored by the receiver", so a malformed instance is
+/// skipped rather than rejecting the whole value. That is deliberately unlike
+/// the address containers, for which the specification states no such rule and
+/// this codec fails closed.
+fn decode_ipv4_link_mtu(contents: &[u8], decoded: &mut PcoAddressConfiguration) {
+    let Ok(octets) = <[u8; 2]>::try_from(contents) else {
+        return;
+    };
+    if decoded.ipv4_link_mtu.is_none() {
+        decoded.ipv4_link_mtu = Some(u16::from_be_bytes(octets));
+    }
 }
 
 fn decode_ipv4_address(contents: &[u8]) -> Result<[u8; 4], PcoDecodeError> {

@@ -343,6 +343,14 @@ coverage.
      server, and an echoed all-zero address is not treated as one. A malformed
      unit for this now-supported identifier rejects the whole value, matching
      how a known container with a bad length is handled.
+   - The IPv4 Link MTU container `0x0010` is supported in both directions, with
+     the direction-dependent shape Table 10.5.154 assigns: zero-length request
+     MS to network, two-octet value network to MS. 10.5.6.3 states that a
+     contents length other than two "shall be ignored by the receiver", so that
+     instance is skipped and parsing continues. This is a deliberate exception
+     to the fail-closed rule applied to the address containers, for which the
+     specification states no equivalent instruction. A repeated container keeps
+     the first value.
    - Bearer QoS decodes the fixed 22-octet shape into a typed
      Allocation/Retention Priority, QCI, and 40-bit integer-kbit/s maximum and
      guaranteed bit-rate fields. ARP priority level and spare bits are checked.

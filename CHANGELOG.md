@@ -26,6 +26,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   identifiers are protocol metadata under this enum's own contract.
 
 ### Added
+- **PCO/APCO carries the IPv4 Link MTU container `0x0010` --
+  `opc-proto-gtpv2c` (breaking to `PcoRequest` and `PcoAddressConfiguration`
+  struct literals):** the inner codec modelled four address containers and
+  nothing else, so a caller could neither request the network-supplied link MTU
+  nor read one a peer sent. An unrecognised container is skipped, so the value
+  was never surfaced at any layer.
+  - On a tunnelled access the UE's packet is carried inside IPsec ESP and then
+    GTP-U, adding roughly 70-100 octets it cannot infer from its own link. The
+    resulting failure is uneven in a misleading way: small packets pass and
+    large ones do not, so reachability checks succeed while the first large
+    exchange of a service times out and reads as an application fault.
+  - `PcoRequest::ipv4_link_mtu` emits the zero-length request container, ordered
+    by identifier between `0x000d` and `0x0012`.
+    `PcoAddressConfiguration::ipv4_link_mtu` carries the two-octet reply as
+    `Option<u16>`, since TS 24.008 reserves no "absent" value and zero is not
+    one.
+  - 10.5.6.3 states that a contents length other than two "shall be ignored by
+    the receiver", so a malformed instance is skipped and parsing continues -- a
+    deliberate exception to the fail-closed handling of the address containers,
+    for which the specification states no equivalent rule. A repeated container
+    keeps the first value.
+
 - **Control-message affordances for a transport boundary — `opc-proto-gtpu`:**
   `GtpuControlMessage::message_type()` lets a transport label and route a
   datagram from the typed value it already holds, and `GTPU_MESSAGE_G_PDU` names

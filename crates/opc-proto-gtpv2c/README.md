@@ -108,6 +108,11 @@ control-plane stack.
   `ipcp_primary_dns`/`ipcp_secondary_dns`. A peer may serve DNS by either
   mechanism, so prefer `PcoAddressConfiguration::dns_server_ipv4_all`, which
   merges both sources and drops duplicates.
+- `PcoRequest::ipv4_link_mtu` emits the zero-length IPv4 Link MTU Request
+  container `0x0010`, and `PcoAddressConfiguration::ipv4_link_mtu` carries the
+  two-octet value the network returns under the same identifier. TS 24.008
+  10.5.6.3 requires a wrong-length instance to be *ignored*, so unlike the
+  address containers it is skipped rather than rejecting the whole value.
 - Public profile constructors build profile-valid owned messages:
   `s2b_echo_request`, `s2b_echo_response`,
   `s2b_create_session_request`,
