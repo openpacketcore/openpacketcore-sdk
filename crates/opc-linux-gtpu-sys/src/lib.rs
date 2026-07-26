@@ -64,6 +64,31 @@ impl GtpuUdpSocket {
     pub fn raw_fd(&self) -> i32 {
         self.inner.raw_fd()
     }
+
+    /// Borrow the underlying Linux file descriptor.
+    ///
+    /// The kernel GTP netdevice takes its own reference to this socket from the
+    /// fd *number* passed as `IFLA_GTP_FD1`; the owning handle stays here. This
+    /// crate never sets `IFLA_GTP_CREATE_SOCKETS`, so the netdevice does not
+    /// create a socket of its own and `gtp1u_udp_encap_recv` passes messages
+    /// back up to this socket's ordinary receive queue.
+    ///
+    /// That queue is not a control-only channel. `drivers/net/gtp.c` passes a
+    /// datagram up when it is not a G-PDU, *and* when it is a G-PDU whose TEID
+    /// matches no PDP context — the "No PDP ctx to decap" path, which is
+    /// precisely the TS 29.281 7.3.1 Error Indication trigger. Datagrams
+    /// shorter than the eight-octet GTPv1 header are dropped in-kernel and
+    /// never arrive. A reader must therefore dispatch on the message type
+    /// rather than assume everything here is control traffic.
+    ///
+    /// A borrow rather than the raw number, so a caller reading that queue does
+    /// not have to reconstruct ownership it was never given, and so crates that
+    /// `forbid(unsafe_code)` can use it. Ownership does not transfer.
+    #[cfg(all(target_os = "linux", not(opc_linux_gtpu_sys_force_unsupported)))]
+    #[must_use]
+    pub fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.inner.as_fd()
+    }
 }
 
 /// IP address accepted by the raw GTP-U UDP socket binder.
@@ -581,5 +606,43 @@ mod tests {
         assert_eq!(size_of::<GenericNetlinkHeader>(), 4);
         assert_eq!(size_of::<NetlinkErrorMessage>(), 20);
         assert_eq!(offset_of!(NetlinkErrorMessage, message), 4);
+    }
+}
+
+#[cfg(all(test, target_os = "linux", not(opc_linux_gtpu_sys_force_unsupported)))]
+mod udp_socket_borrow_tests {
+    use super::{open_gtpu_udp_socket, GtpuIpAddress, GtpuUdpBind};
+    use std::os::fd::AsRawFd;
+
+    /// The GTP netdevice takes its own reference from the fd *number*, so the
+    /// owning handle stays with this crate. A borrow lets a caller read the
+    /// socket's receive queue -- where the kernel passes up every non-G-PDU
+    /// message -- without reconstructing ownership it was never given, and
+    /// without needing `unsafe` in a crate that forbids it.
+    #[test]
+    fn borrowed_fd_matches_the_number_handed_to_the_kernel() {
+        let socket = match open_gtpu_udp_socket(GtpuUdpBind {
+            address: GtpuIpAddress::Ipv4([127, 0, 0, 1]),
+            port: 0,
+        }) {
+            Ok(socket) => socket,
+            // Sandboxes without permission to bind are not a failure of this
+            // property. Note that libtest captures stderr from a passing test,
+            // so this marker is only visible under `--nocapture`; the run is
+            // green either way.
+            Err(error) => {
+                eprintln!("skipping: cannot bind a local GTP-U UDP socket: {error}");
+                return;
+            }
+        };
+
+        assert_eq!(
+            socket.as_fd().as_raw_fd(),
+            socket.raw_fd(),
+            "the borrow must name the same descriptor passed as IFLA_GTP_FD1"
+        );
+        // Borrowing must not close or move the descriptor.
+        assert_eq!(socket.as_fd().as_raw_fd(), socket.raw_fd());
+        assert!(socket.raw_fd() >= 0);
     }
 }
