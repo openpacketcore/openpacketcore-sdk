@@ -97,9 +97,14 @@ control-plane stack.
   codec for IPv4/IPv6 DNS and P-CSCF containers and for the IPCP (`0x8021`)
   configuration protocol, while the outer PCO/APCO IE transport remains opaque
   and byte-preserving.
-  `PcoRequest::p_cscf_reselection_support` independently emits the exact empty
-  request container `0x0012`; neither P-CSCF address-family flag implies the
-  capability. Selected containers are encoded once in ascending identifier
+  `PcoRequest::p_cscf` carries the P-CSCF address request and, in
+  `PcscfRequest::reselection_support`, the exact empty request container
+  `0x0012`. Requesting an address never implies the capability, and TS 24.008
+  10.5.6.3 permits `0x0012` "only if a container with P-CSCF IPv4 Address
+  Request or P-CSCF IPv6 Address Request is present", so the two are one value
+  and `PcscfAddressRequest` has no variant selecting neither family: the
+  unaccompanied combination does not compile rather than being rejected at
+  encode time. Selected containers are encoded once in ascending identifier
   order, and `PcoRequest::none()` remains byte-empty.
 - `PcoRequest::ipcp_dns` emits an RFC 1332 IPCP Configure-Request carrying the
   RFC 1877 Primary (129) and Secondary (131) DNS Server Address options, which

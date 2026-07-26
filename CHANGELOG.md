@@ -8,6 +8,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **P-CSCF Re-selection support is no longer emittable on its own --
+  `opc-proto-gtpv2c` (breaking to `PcoRequest`):** TS 24.008 10.5.6.3 says of
+  container `0x0012` that "This PCO parameter may be present only if a
+  container with P-CSCF IPv4 Address Request or P-CSCF IPv6 Address Request is
+  present." The encoder enforced no such condition, so
+  `p_cscf_reselection_support: true` with neither address flag set produced a
+  PCO carrying `00 12 00` alone. A conformance-checking peer then receives a
+  container the specification says may not be there, and the failure lands as a
+  rejected PDN connection at attach rather than as anything a codec test shows.
+  - The rule is now enforced by the type instead of at encode time. The three
+    flat flags `p_cscf_ipv6`, `p_cscf_ipv4` and `p_cscf_reselection_support`
+    are replaced by one `p_cscf: Option<PcscfRequest>`, pairing
+    `reselection_support` with a `PcscfAddressRequest` whose every variant
+    (`Ipv4`, `Ipv6`, `Ipv4AndIpv6`) selects at least one address container.
+    There is no variant for neither family, so the forbidden combination does
+    not compile and `encode_request_contents` stays infallible -- no new error
+    for a caller to handle, and no infallible path left that can emit the
+    violation.
+  - Silently synthesizing the missing address request was rejected: the field's
+    own contract is that an address request never implies reselection support,
+    and inventing the converse would send a container the caller did not ask
+    for.
+  - Receive is unchanged, deliberately. `0012H` is Reserved in the
+    network-to-MS direction, where 10.5.6.3 says a container identifier "not
+    supported by the receiving entity" shall be ignored. The conditional
+    presence rule binds the sender and assigns the receiver no behaviour, so
+    rejecting would discard every DNS and P-CSCF address in the same value over
+    a peer's send-side defect. This is unlike the IPv4 Link MTU wrong-length
+    case, where the specification names the receiver explicitly.
+  - Migration: `p_cscf_ipv4: true` becomes
+    `p_cscf: Some(PcscfRequest::addresses(PcscfAddressRequest::Ipv4))`, and
+    adding the capability uses `PcscfRequest::with_reselection_support(..)`.
+    `..PcoRequest::none()` and `..Default::default()` are unaffected. Encoded
+    bytes are unchanged for every combination that was already legal.
 - **IPv4 Link MTU follow-ups -- `opc-proto-gtpv2c`:** adversarial review of the
   container support added in the same unreleased window found two defects.
   - `PcoAddressConfiguration::is_empty()` had silently changed meaning: a value

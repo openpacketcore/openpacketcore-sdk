@@ -326,11 +326,25 @@ coverage.
      projects repeated IPv4/IPv6 DNS and P-CSCF addresses in wire order, and
      safely skips well-formed unknown containers and unsupported configuration
      protocols without changing opaque IE round trips. Its MS-to-network
-     request model emits the independent zero-length P-CSCF
-     reselection-support container `0x0012` exactly once when selected, after
-     lower numeric container identifiers. P-CSCF address requests do not imply
-     reselection support; empty and legacy combinations retain their prior
-     bytes. The same inner value can be carried unchanged by PCO or APCO.
+     request model emits the zero-length P-CSCF reselection-support container
+     `0x0012` exactly once when selected, after lower numeric container
+     identifiers. A P-CSCF address request does not imply reselection support;
+     empty and legacy combinations retain their prior bytes. The same inner
+     value can be carried unchanged by PCO or APCO.
+   - 10.5.6.3 states of `0x0012` that "This PCO parameter may be present only
+     if a container with P-CSCF IPv4 Address Request or P-CSCF IPv6 Address
+     Request is present." That conditional presence is enforced by the type
+     rather than at encode time: `PcoRequest::p_cscf` is an optional
+     `PcscfRequest` pairing `reselection_support` with a `PcscfAddressRequest`
+     whose every variant selects `0x0001`, `0x000c`, or both, so an
+     unaccompanied `0x0012` is unrepresentable and the encoder stays
+     infallible. On receive the rule has no counterpart: `0012H` is Reserved in
+     the network-to-MS direction, and 10.5.6.3 states that a container
+     identifier "not supported by the receiving entity" shall be ignored, so a
+     decoded instance is skipped rather than rejecting the addresses carried in
+     the same value. The rule binds the sender and assigns the receiver no
+     behavior, unlike the IPv4 Link MTU wrong-length case where the
+     specification names the receiver explicitly.
    - IPCP (`0x8021`) is supported in both directions, as 10.5.6.3 requires.
      The request model emits an RFC 1332 Configure-Request whose contents is an
      RFC 1661 packet stripped of its Protocol and Padding octets, carrying the
