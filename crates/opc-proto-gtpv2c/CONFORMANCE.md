@@ -115,6 +115,12 @@ The profile owns the typed IE families required by the S2b messages above:
   TWAN Identifier Timestamp.
   Their Debug surfaces redact addresses, ports, SSIDs, operator/location
   contents, relay identities, Circuit-ID, and timestamp values.
+- Peer node identity IEs: Node Identifier, carrying the clause 8.107 Node
+  Name/Node Realm Diameter Identity pair. On S2b this is the Table 7.2.1-1
+  3GPP AAA Server Identifier only. Its Debug surface reports subfield lengths
+  and redacts both values, which name operator AAA infrastructure. (Distinct
+  from the Recovery IE listed under node and liveness IEs above, which carries
+  no identity.)
 - Response and policy containers: Cause, Indication, PCO, APCO.
 - Unknown, private, and unsupported future IEs follow the caller's
   `UnknownIePolicy` at every typed sequence scope: `Drop` omits them from the
@@ -323,9 +329,9 @@ coverage.
    - IMSI, Cause, Recovery, APN, Aggregate Maximum Bit Rate, EPS Bearer ID,
      MEI, MSISDN, Indication, Protocol Configuration Options, PDN Address
      Allocation, Bearer QoS, RAT Type, Serving Network, F-TEID, Bearer
-     Context, Charging ID, PDN Type, APN Restriction, Selection Mode, and
-     Additional Protocol Configuration Options have typed decode/encode
-     support.
+     Context, Charging ID, PDN Type, APN Restriction, Selection Mode,
+     Node Identifier, and Additional Protocol Configuration Options have typed
+     decode/encode support.
    - PCO/APCO and Indication are typed as opaque byte-preserving containers so
      nested or future protocol options/flags are not silently dropped.
    - The optional TS 24.008 PCO inner codec bounds parsing to 64 units,
@@ -413,6 +419,64 @@ coverage.
      per clause 7.7.8, ignores receive-side spare flag bits. Canonical encoding
      emits only the understood prefix with spare bits zero; raw-preserving
      message encoding retains accepted extension octets and spare bits.
+   - Node Identifier (clause 8.107) decodes the one-octet-length-prefixed Node
+     Name and Node Realm pair and rejects a declared subfield length that runs
+     past the end of the IE value, or an absent length octet, as `Truncated`.
+     Both subfields stay byte-transparent: clause 8.107 states no charset and
+     delegates to Diameter Identity, whose ASCII constraint binds the sender.
+     Either subfield may be empty, because clause 8.107 requires a non-zero
+     length only for its SGSN Identifier and MME Identifier cases and the
+     encoding carries no discriminator distinguishing them from the 3GPP AAA
+     Server Identifier case this profile receives. As an Extendable IE it
+     ignores the Figure 8.107-1 `(q+1) to (n+4)` octets per clause 8.1;
+     canonical encoding emits only the understood prefix with the IE spare
+     nibble zero, and raw-preserving message encoding retains both. The
+     validated `NodeIdentifier::new` constructor bounds each subfield to the
+     255 octets its length field can express, so encoding is infallible and
+     performs no truncating cast.
+   - Deliberate divergence from clauses 7.7.7 and 7.7.8. Two clauses govern a
+     malformed optional IE and both direct discard-and-continue. Clause 7.7.7
+     is the one that governs a length inconsistency in an Extendable IE and it
+     also names the Cause a conformant stack must use: "If the received value
+     of the Length field and the actual length of the extendable length IE are
+     consistent, but the length is less than the number of fixed octets defined
+     for that IE, preceding the extended field(s), this shall be considered an
+     error, IE shall be discarded and if the IE was received as a Mandatory IE
+     or a verifiable Conditional IE in a Request message, an appropriate error
+     response with Cause IE value set to "Invalid length" together with the
+     type and instance of the offending IE shall be returned to the sender."
+     Clause 7.7.8 directs a receiver of an optional IE to "discard this IE, but
+     shall treat the rest of the message as if this IE was absent and continue
+     processing", and adds that "All semantically incorrect optional
+     information elements in a GTP signalling message shall be treated as not
+     present in the message." This crate is a codec, not a stack, and instead
+     surfaces every malformed typed IE as a `DecodeError` carrying an absolute
+     offset and spec reference, uniformly across Cause, F-TEID, PAA, TWAN
+     Identifier, and Node Identifier. The clause 7.7.7/7.7.8 decision to
+     continue belongs to the caller; `error_response` is the layer at which a
+     caller turns a decode failure into a Cause.
+   - That exception is visible, not consistent. The crate states a contrary
+     selection rule of its own in `pco.rs`: "TS 24.008 10.5.6.3 is explicit
+     that a container whose contents length is not two 'shall be ignored by the
+     receiver', so a malformed instance is skipped rather than rejecting the
+     whole value. That is deliberately unlike the address containers, for which
+     the specification states no such rule and this codec fails closed."
+     Clauses 7.7.7 and 7.7.8 do state such a rule and do name
+     the receiver, so by the crate's own written criterion IE 176 belongs in
+     the skip bucket. It is placed in the fail-closed bucket anyway, for
+     uniformity with the typed-IE layer.
+   - The divergence is not scoped to where Table 7.2.1-1 lists the IE. Typed
+     decode dispatches on IE type alone, and the clause 7.7.9 receive filter
+     runs only at `ValidationLevel::ProcedureAware` on a receive decode. A
+     malformed Node Identifier therefore fails the whole `S2bMessage::decode`
+     at every validation level, in every message type this crate models, at
+     every instance 0-15, and nested inside a Bearer Context. Only at
+     `ProcedureAware` does the instance filter bound the surface to instance 0.
+   - Raw-preserving encoding does not rescue a failed decode. The failure is at
+     decode, so `EncodeContext { raw_preserving: true }` never runs. The
+     lower-level `Message` raw-preserving view stays byte-exact; a caller
+     wanting clause 7.7.8 semantics must decode at the `Message` layer and
+     forgo the S2b typed projection.
    - Top-level and grouped typed IE sequences enforce
      `DecodeContext::duplicate_ie_policy` by IE type and instance.
    - Unsupported/private/future IEs outside the typed subset are omitted,
@@ -534,6 +598,18 @@ coverage.
 
 - A full Release 18 GTPv2-C implementation or a complete S2b IE/procedure
   matrix beyond the typed subset listed above.
+- The non-S2b Node Identifier roles. Clause 8.107 also defines SGSN Identifier,
+  MME Identifier, and SCEF/IWK-SCEF forms, which TS 29.274 lists only in the
+  clause 7.3 S3/S10/S16 mobility tables. This profile models none of those
+  messages, so procedure-aware receive, and the three request builders that
+  gate `additional_ies` on the same disposition, admit Node Identifier at
+  Create Session Request instance 0 only. The response builders gate nothing:
+  they validate under `S2bDecodePurpose::CanonicalBuilder`, which skips the
+  clause 7.7.9 receive filter, so a caller-supplied raw IE 176 still encodes on
+  a response at any instance even though this crate's own procedure-aware
+  receiver discards it. That looseness is pre-existing and applies equally to
+  every other known IE. This profile also does not enforce the non-zero-length
+  rule the SGSN and MME roles carry.
 - Product bearer admission, EBI/TEID/SPI allocation, Child-SA/XFRM/eBPF
   programming, crash-persistent transaction storage, charging/QoS policy, and
   UDP transport remain outside this codec/transaction boundary.

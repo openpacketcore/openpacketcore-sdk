@@ -81,6 +81,115 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   distinctly from an ownership transition. Activation events set
   `previous_owner == new_owner` because no ownership was taken from another
   node.
+- **Node Identifier (IE 176) is a typed, structurally validated receive IE --
+  `opc-proto-gtpv2c` (breaking to `TypedIeValue` and to raw IE 176 emission):**
+  TS 29.274 V18.8.0 Table 8.1-1 assigns type 176 to Node Identifier,
+  "Extendable / 8.107", and Figure 8.107-1 encodes it as a one-octet
+  `Length of Node Name` and Node Name followed by a one-octet
+  `Length of Node Realm` and Node Realm. The crate modelled no such IE, so a
+  peer-supplied Node Identifier decoded as `TypedIeValue::Raw` and its declared
+  subfield lengths were never checked: a Node Name length of `0xff` inside a
+  three-octet value was indistinguishable from a well-formed one at the decode
+  boundary, and any consumer wanting to read the value had to re-parse
+  peer-controlled bytes the crate already walked.
+  - `IE_TYPE_NODE_IDENTIFIER`, `NodeIdentifier`, `NodeIdentifierError`, and
+    `MAX_NODE_IDENTIFIER_FIELD_LEN` are new. `NodeIdentifier` keeps both
+    subfields private behind `NodeIdentifier::new`, which is what bounds them
+    to the 255 octets their one-octet length fields can express; encoding is
+    therefore infallible and performs no truncating cast. A declared subfield
+    length that runs past the end of the IE value, or an absent length octet,
+    is now a `Truncated` decode error rather than an opaque preserved IE.
+  - Both subfields are octets, not `String`. Clause 8.107 states no charset and
+    delegates to Diameter Identity, whose ASCII constraint lives in the
+    Diameter base protocol and binds the sender; a receiver that rejected
+    non-ASCII octets would drop IEs a byte-transparent decoder can surface.
+    `Debug` reports only subfield lengths, because a Diameter Identity names
+    operator AAA infrastructure.
+  - An empty Node Name or Node Realm is accepted, deliberately. Clause 8.107
+    requires a non-zero length only for its SGSN Identifier and MME Identifier
+    cases; the 3GPP AAA Server Identifier case this profile receives carries no
+    such sentence, and the encoding has no discriminator that would let a
+    decoder tell the cases apart. Rejecting an empty subfield would fail closed
+    on conforming S2b traffic.
+  - Trailing octets are ignored, not rejected. Table 8.1-1 marks 176
+    Extendable and Figure 8.107-1 reserves octets `(q+1) to (n+4)` as "present
+    only if explicitly specified", which clause 8.1 requires a legacy receiver
+    to ignore. Canonical encoding emits only the understood Release 18 prefix
+    with the IE spare nibble zeroed; raw-preserving message encoding retains
+    the suffix and the spare nibble byte-exact, as for every other Extendable
+    IE in the crate.
+  - Receive admission follows Table 7.2.1-1, which lists the IE once for this
+    profile: 3GPP AAA Server Identifier, presence O, Create Session Request,
+    top level, instance 0, where NOTE 13 says it "carries the Origin-Host and
+    Origin-Realm included in the DEA message received by the ePDG/TWAN over SWm
+    or STa interface". Exactly one receive rule was added. TS 29.274's other
+    Node Identifier rows are SGSN, MME, SCEF, and IWK-SCEF identifiers in the
+    clause 7.3 S3/S10/S16 mobility tables, which this profile does not model,
+    and Table 7.2.2-1 does not carry the IE at all -- so no rule was added
+    "for symmetry".
+  - Divergence from clauses 7.7.7 and 7.7.8, stated deliberately. Two clauses
+    govern. Clause 7.7.7 covers the length case directly: "If the received
+    value of the Length field and the actual length of the extendable length IE
+    are consistent, but the length is less than the number of fixed octets
+    defined for that IE, preceding the extended field(s), this shall be
+    considered an error, IE shall be discarded and if the IE was received as a
+    Mandatory IE or a verifiable Conditional IE in a Request message, an
+    appropriate error response with Cause IE value set to "Invalid length"
+    together with the type and instance of the offending IE shall be returned
+    to the sender." Clause 7.7.8 covers the optional case: a receiver "shall
+    discard this IE, but shall treat the rest of the message as if this IE was
+    absent and continue processing", and "All semantically incorrect optional
+    information elements in a GTP signalling message shall be treated as not
+    present in the message." Table 7.2.1-1 gives IE 176 presence O, so under
+    both clauses a conformant stack discards the IE and continues; the
+    "Invalid length" error response clause 7.7.7 names is conditioned on the
+    offending IE being Mandatory or verifiable Conditional, which this one is
+    not on this message. This crate instead surfaces a malformed
+    typed IE as a `DecodeError` and lets the caller decide, exactly as it
+    already does for Cause, F-TEID, PAA, and TWAN Identifier. That pre-existing
+    crate-wide contract was kept rather than special-casing one IE.
+    - Note this is *not* what the crate's own written selection rule would
+      pick. `pco.rs` states that a container the specification explicitly tells
+      the receiver to ignore is skipped rather than rejecting the whole value,
+      "deliberately unlike the address containers, for which the specification
+      states no such rule and this codec fails closed". Here the specification
+      does state the rule and does name the receiver, so IE 176 is a
+      deliberate exception to that criterion, taken for uniformity with the
+      typed-IE layer.
+    - Blast radius, measured rather than assumed. Typed decode dispatches on IE
+      type alone, and the clause 7.7.9 receive filter runs only at
+      `ValidationLevel::ProcedureAware`. A malformed IE 176 therefore fails the
+      whole `S2bMessage::decode` at every validation level, in every GTPv2-C
+      message type this crate models, at every instance 0-15, and nested inside
+      a Bearer Context -- not only at the Create Session Request instance-0
+      slot Table 7.2.1-1 lists. In this crate's committed encoder differential
+      (`tests/node_identifier_wire_compatibility.rs`, 7520 points, which
+      exercises `Structural` and `ProcedureAware`), 330 points changed from a
+      successful decode to `Truncated`: 10 at `ProcedureAware` and 320 at
+      `Structural`. Only at `ProcedureAware` does the instance filter bound the
+      surface to instance 0; `tests/node_identifier.rs` pins the rest.
+    - Raw-preserving encoding does not rescue a failed decode: the failure is
+      at decode. The lower-level `Message` view still yields the bytes
+      byte-exact, but `S2bMessage::decode` itself fails, so a caller wanting
+      clause 7.7.8 semantics must decode at the `Message` layer and forgo the
+      S2b typed projection. `error_response` remains the layer at which a
+      caller turns a decode failure into a Cause.
+  - Migration: `TypedIeValue` gains a `NodeIdentifier` variant, so an
+    exhaustive `match` over it must add an arm. More consequentially, admitting
+    176 into the receive grammar also narrows the sender profile, because the
+    three request builders gate caller-supplied `additional_ies` on the same
+    disposition. A hand-rolled raw IE 176 was previously accepted on every S2b
+    request at every instance; it is now accepted only on Create Session
+    Request at instance 0, and `s2b_delete_session_request` and
+    `s2b_ue_ipsec_tunnel_update_request` reject it outright. That is what
+    Table 7.2.1-1 licenses. Encoded bytes are unchanged for every message that
+    did not carry IE 176, and for every well-formed instance-0 Node Identifier
+    whose value ends at the Node Realm and whose IE spare nibble is zero.
+    Canonical re-encoding of an instance-0 Node Identifier that carries
+    later-release extension octets, or a non-zero spare nibble, emits only the
+    understood Release 18 prefix with the spare nibble zeroed, as stated above;
+    raw-preserving encoding is byte-exact in every case a message decodes at
+    all.
 
 ### Fixed
 - **P-CSCF Re-selection support is no longer emittable on its own --

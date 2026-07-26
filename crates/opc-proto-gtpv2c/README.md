@@ -27,6 +27,12 @@ control-plane stack.
   `RanNasCause::ikev2` is fallible. S2b session context and tunnel updates
   additionally use redaction-safe typed `IpAddress`, `PortNumber`, complete
   bounded `TwanIdentifier`, and `TwanIdentifierTimestamp` values.
+  `NodeIdentifier` models the TS 29.274 clause 8.107 Node Name/Node Realm
+  Diameter Identity pair, which S2b carries as the Table 7.2.1-1 3GPP AAA
+  Server Identifier. Its validated `NodeIdentifier::new` bounds each subfield
+  to the 255 octets its one-octet length field can express, so encoding is
+  infallible; decode rejects a subfield length that overruns the IE value, and
+  `Debug` reports only subfield lengths.
   Their Extendable IE decoders retain the
   known Release 18 prefix while raw-preserving message encode retains accepted
   later-release suffixes; canonical encode emits only understood fields and
@@ -291,7 +297,12 @@ PAA carries the requested family. On receive, a conforming request without IE
 Create Session additionally owns MSISDN instance 0, Charging Characteristics
 instance 0, Trace Information instance 0, UE Local IP/UDP instance 0, UE TCP
 Port instance 2, optional Fixed Broadband ePDG IP instance 3, WLAN Location
-instance 1, and WLAN Location Timestamp instance 0. NAT ports require UE Local
+instance 1, WLAN Location Timestamp instance 0, and Node Identifier instance 0.
+Node Identifier is the only Table 7.2.1-1 row for that IE in this profile, so
+procedure-aware receive discards it on every other message and instance, and
+the request builders no longer accept a caller-supplied raw IE 176 outside that
+slot. The response builders gate no `additional_ies` at all, for IE 176 or for
+any other known IE. NAT ports require UE Local
 IP, and the UICC-less emergency identity requires that local IP. Delete Session
 uses UE Local IP/UDP instance 0, UE TCP Port instance 1, WLAN Location and
 Timestamp instance 1, and optional Diameter/IKEv2 RAN/NAS Cause instance 0;

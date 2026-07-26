@@ -235,6 +235,8 @@ pub const IE_TYPE_APCO: u8 = 163;
 pub const IE_TYPE_TWAN_IDENTIFIER: u8 = 169;
 /// GTPv2-C RAN/NAS Cause IE type (TS 29.274 Table 8.1-1).
 pub const IE_TYPE_RAN_NAS_CAUSE: u8 = 172;
+/// GTPv2-C Node Identifier IE type (TS 29.274 Table 8.1-1).
+pub const IE_TYPE_NODE_IDENTIFIER: u8 = 176;
 /// GTPv2-C TWAN Identifier Timestamp IE type (TS 29.274 Table 8.1-1).
 pub const IE_TYPE_TWAN_IDENTIFIER_TIMESTAMP: u8 = 179;
 /// GTPv2-C Overload Control Information IE type (TS 29.274 Table 8.1-1).
@@ -3285,6 +3287,206 @@ impl fmt::Debug for TwanIdentifier {
     }
 }
 
+/// Maximum length of either Node Identifier subfield.
+///
+/// TS 29.274 Figure 8.107-1 gives `Length of Node Name` and `Length of Node
+/// Realm` one octet each, so neither subfield can exceed 255 octets on the
+/// wire. Clause 8.107 states no other maximum.
+pub const MAX_NODE_IDENTIFIER_FIELD_LEN: usize = u8::MAX as usize;
+
+/// Stable validation failure for a typed [`NodeIdentifier`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeIdentifierError {
+    /// Node Name exceeded its one-octet length field.
+    NodeNameTooLong,
+    /// Node Realm exceeded its one-octet length field.
+    NodeRealmTooLong,
+}
+
+impl NodeIdentifierError {
+    /// Return a stable machine-readable validation code.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NodeNameTooLong => "gtpv2c_node_identifier_name_too_long",
+            Self::NodeRealmTooLong => "gtpv2c_node_identifier_realm_too_long",
+        }
+    }
+}
+
+impl fmt::Display for NodeIdentifierError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl std::error::Error for NodeIdentifierError {}
+
+/// Node Identifier IE (type 176).
+///
+/// TS 29.274 clause 8.107 carries a Diameter Identity as a Node Name followed
+/// by a Node Realm, each preceded by its own one-octet length. On S2b the IE
+/// appears only as the 3GPP AAA Server Identifier of TS 29.274 Table 7.2.1-1,
+/// where NOTE 13 assigns it the Origin-Host and Origin-Realm of the DEA the
+/// ePDG/TWAN received over SWm or STa.
+///
+/// Both subfields are kept as octets rather than `String`. Clause 8.107
+/// imposes no charset; it delegates to Diameter Identity, whose ASCII
+/// constraint lives in the Diameter base protocol and binds the sender. A
+/// receiver that rejected non-ASCII octets would drop IEs a byte-transparent
+/// decoder can still surface.
+///
+/// Neither subfield is required to be non-empty. Clause 8.107 states
+/// "neither the Length of Node Name nor the Length of Node Realm shall be
+/// zero" only for its SGSN Identifier and MME Identifier cases; the 3GPP AAA
+/// Server Identifier case this profile receives carries no such sentence, and
+/// the encoding has no discriminator that would let a decoder tell the cases
+/// apart.
+///
+/// Both fields are private so the one-octet bound established by
+/// [`NodeIdentifier::new`] cannot be broken after construction, which is what
+/// makes encoding infallible.
+///
+/// Debug output exposes only subfield lengths because a Diameter Identity
+/// names operator AAA infrastructure.
+///
+/// @spec 3GPP TS29274 R18 8.107
+/// @req REQ-3GPP-TS29274-R18-S2B-IE-NODE-IDENTIFIER-001
+#[derive(Clone, PartialEq, Eq)]
+pub struct NodeIdentifier {
+    name: Vec<u8>,
+    realm: Vec<u8>,
+}
+
+impl NodeIdentifier {
+    /// Construct a Node Identifier from its Node Name and Node Realm octets.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NodeIdentifierError`] when either subfield exceeds
+    /// [`MAX_NODE_IDENTIFIER_FIELD_LEN`], the bound imposed by its one-octet
+    /// wire length field.
+    pub fn new(
+        name: impl Into<Vec<u8>>,
+        realm: impl Into<Vec<u8>>,
+    ) -> Result<Self, NodeIdentifierError> {
+        let name = name.into();
+        let realm = realm.into();
+        if name.len() > MAX_NODE_IDENTIFIER_FIELD_LEN {
+            return Err(NodeIdentifierError::NodeNameTooLong);
+        }
+        if realm.len() > MAX_NODE_IDENTIFIER_FIELD_LEN {
+            return Err(NodeIdentifierError::NodeRealmTooLong);
+        }
+        Ok(Self { name, realm })
+    }
+
+    /// Return the Node Name octets.
+    #[must_use]
+    pub fn name(&self) -> &[u8] {
+        &self.name
+    }
+
+    /// Return the Node Realm octets.
+    #[must_use]
+    pub fn realm(&self) -> &[u8] {
+        &self.realm
+    }
+
+    fn decode_value(value: &[u8], offset: usize) -> Result<Self, DecodeError> {
+        // No separate minimum-length guard: reading each subfield's own length
+        // octet already rejects a value shorter than the two length fields.
+        let mut cursor = 0usize;
+        let name = take_node_identifier_field(value, &mut cursor, offset)?;
+        let realm = take_node_identifier_field(value, &mut cursor, offset)?;
+
+        // Node Identifier is an Extendable IE whose Figure 8.107-1 octets
+        // (q+1) to (n+4) are "present only if explicitly specified". Clause
+        // 8.1 requires a legacy receiver to ignore those unknown octets, so
+        // this Release 18 view stops at Node Realm rather than demanding the
+        // value end there. The enclosing S2b raw-preserving message view
+        // retains the suffix byte-exact.
+
+        // Both subfields came from a one-octet length, so the bound holds by
+        // construction and this cannot fail; it is still routed through the
+        // validating constructor rather than the private fields so decode and
+        // caller construction share one invariant. The unreachable arm is
+        // mapped rather than unwrapped because library code must not panic.
+        Self::new(name, realm).map_err(|error| {
+            DecodeError::new(
+                DecodeErrorCode::InvalidLength {
+                    reason: error.as_str(),
+                },
+                offset,
+            )
+            .with_spec_ref(spec_ref())
+        })
+    }
+
+    fn encode_value(&self, dst: &mut BytesMut) {
+        put_node_identifier_field(&self.name, dst);
+        put_node_identifier_field(&self.realm, dst);
+    }
+}
+
+impl fmt::Debug for NodeIdentifier {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NodeIdentifier")
+            .field("name_len", &self.name.len())
+            .field("name", &"<redacted>")
+            .field("realm_len", &self.realm.len())
+            .field("realm", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Read one one-octet-length-prefixed subfield of TS 29.274 Figure 8.107-1.
+///
+/// A length that runs past the end of the IE value, or an absent length
+/// octet, is the malformed length pair this decoder exists to reject. Both
+/// failures report one offset under one rule: the absolute position of the
+/// subfield's own `Length` octet, which is the octet that is either missing
+/// or declares a length the IE value cannot hold.
+fn take_node_identifier_field(
+    value: &[u8],
+    cursor: &mut usize,
+    offset: usize,
+) -> Result<Vec<u8>, DecodeError> {
+    let length_index = *cursor;
+    let length_offset = checked_add_offset(offset, length_index)?;
+    let truncated =
+        || DecodeError::new(DecodeErrorCode::Truncated, length_offset).with_spec_ref(spec_ref());
+    let length = usize::from(*value.get(length_index).ok_or_else(truncated)?);
+    // Saturating rather than checked: the length octet was just indexed, so
+    // `length_index < value.len()` and neither sum can wrap. A saturated sum
+    // would only make the slice lookup below fail, which is the same
+    // `Truncated` outcome, so no unreachable error arm is carried.
+    let start = length_index.saturating_add(1);
+    let field = value
+        .get(start..)
+        .and_then(|rest| rest.get(..length))
+        .ok_or_else(truncated)?;
+    *cursor = start.saturating_add(length);
+    Ok(field.to_vec())
+}
+
+/// Emit one `Length`/value pair of TS 29.274 Figure 8.107-1.
+fn put_node_identifier_field(field: &[u8], dst: &mut BytesMut) {
+    match u8::try_from(field.len()) {
+        Ok(length) => {
+            dst.put_u8(length);
+            dst.put_slice(field);
+        }
+        // Unreachable: `NodeIdentifier` keeps both fields private and every
+        // construction path validates the one-octet bound. Writing a
+        // truncated length octet would desynchronise every following IE, so
+        // an unrepresentable field is framed as empty rather than as a
+        // length that disagrees with the octets that follow it.
+        Err(_) => dst.put_u8(0),
+    }
+}
+
 /// NTP-era seconds at which a TWAN Identifier was acquired (IE type 179).
 ///
 /// The timestamp value is omitted from Debug because it is subscriber
@@ -3513,6 +3715,8 @@ pub enum TypedIeValue<'a> {
     TwanIdentifier(TwanIdentifier),
     /// RAN/NAS Cause IE (type 172), restricted to S2b cause families.
     RanNasCause(RanNasCause),
+    /// Node Identifier IE (type 176).
+    NodeIdentifier(NodeIdentifier),
     /// TWAN Identifier Timestamp IE (type 179).
     TwanIdentifierTimestamp(TwanIdentifierTimestamp),
     /// Unsupported, unknown, private, or future IE preserved byte-exact.
@@ -3669,6 +3873,9 @@ impl<'a> TypedIe<'a> {
             IE_TYPE_RAN_NAS_CAUSE => {
                 TypedIeValue::RanNasCause(RanNasCause::decode_value(raw.value, value_offset)?)
             }
+            IE_TYPE_NODE_IDENTIFIER => {
+                TypedIeValue::NodeIdentifier(NodeIdentifier::decode_value(raw.value, value_offset)?)
+            }
             IE_TYPE_TWAN_IDENTIFIER_TIMESTAMP => TypedIeValue::TwanIdentifierTimestamp(
                 TwanIdentifierTimestamp::decode_value(raw.value, value_offset)?,
             ),
@@ -3717,6 +3924,7 @@ impl<'a> TypedIe<'a> {
             TypedIeValue::AdditionalProtocolConfigurationOptions(_) => IE_TYPE_APCO,
             TypedIeValue::TwanIdentifier(_) => IE_TYPE_TWAN_IDENTIFIER,
             TypedIeValue::RanNasCause(_) => IE_TYPE_RAN_NAS_CAUSE,
+            TypedIeValue::NodeIdentifier(_) => IE_TYPE_NODE_IDENTIFIER,
             TypedIeValue::TwanIdentifierTimestamp(_) => IE_TYPE_TWAN_IDENTIFIER_TIMESTAMP,
             TypedIeValue::Raw(raw) => raw.ie_type,
         }
@@ -3795,6 +4003,10 @@ impl<'a> TypedIe<'a> {
                 value.encode_value(dst);
                 Ok(())
             }
+            TypedIeValue::NodeIdentifier(value) => {
+                value.encode_value(dst);
+                Ok(())
+            }
             TypedIeValue::TwanIdentifierTimestamp(value) => {
                 value.encode_value(dst);
                 Ok(())
@@ -3855,6 +4067,7 @@ impl fmt::Debug for TypedIeValue<'_> {
                 .finish(),
             Self::TwanIdentifier(value) => f.debug_tuple("TwanIdentifier").field(value).finish(),
             Self::RanNasCause(value) => f.debug_tuple("RanNasCause").field(value).finish(),
+            Self::NodeIdentifier(value) => f.debug_tuple("NodeIdentifier").field(value).finish(),
             Self::TwanIdentifierTimestamp(value) => f
                 .debug_tuple("TwanIdentifierTimestamp")
                 .field(value)
@@ -4158,6 +4371,7 @@ const fn is_supported_typed_ie(ie_type: u8) -> bool {
             | IE_TYPE_APCO
             | IE_TYPE_TWAN_IDENTIFIER
             | IE_TYPE_RAN_NAS_CAUSE
+            | IE_TYPE_NODE_IDENTIFIER
             | IE_TYPE_TWAN_IDENTIFIER_TIMESTAMP
     )
 }
