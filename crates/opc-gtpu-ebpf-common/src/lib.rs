@@ -42,6 +42,7 @@ pub use pmtu::{
     UPLINK_PMTU_VALUE_LEN,
 };
 pub use session::{
+    gtpu_session_config_wire_owns_local_ipv4, gtpu_session_config_wire_owns_local_ipv6,
     gtpu_session_group_authorizes_downlink, gtpu_session_group_authorizes_uplink,
     select_gtpu_session_entry_wire, GtpuSessionAuthorityHeader, GtpuSessionDeviceConfig,
     GtpuSessionDeviceId, GtpuSessionDownlinkKey, GtpuSessionEntry, GtpuSessionEntryWireView,
@@ -301,10 +302,14 @@ pub const PROG_UPLINK: &str = "opc_gtpu_uplink";
 /// tc program name handling downlink (PGW → subscriber) decapsulation.
 pub const PROG_DOWNLINK: &str = "opc_gtpu_downlink";
 
-/// Counter index: uplink packets GTP-U encapsulated.
+/// Counter index: uplink packets for which an outer GTP-U header was
+/// materialized and handed to `bpf_redirect_neigh`. This is submission, not
+/// delivery; pair it with [`COUNTER_UL_REDIRECT_RESOLVED`] to see the outcome.
 pub const COUNTER_UL_ENCAP: u32 = 0;
 /// Counter index: uplink FAR lookup misses. Mark-zero misses pass through;
-/// nonzero misses drop under the complete-mark ownership contract.
+/// nonzero misses drop under the complete-mark ownership contract. The
+/// datapath's own re-emitted outer frames are excluded and counted under
+/// [`COUNTER_UL_REDIRECT_RESOLVED`] instead.
 pub const COUNTER_UL_FAR_MISS: u32 = 1;
 /// Counter index: downlink G-PDUs decapsulated.
 pub const COUNTER_DL_DECAP: u32 = 2;
@@ -315,8 +320,33 @@ pub const COUNTER_DL_MALFORMED: u32 = 4;
 /// Counter index: downlink G-PDUs dropped because the inner destination does
 /// not match the session's UE PAA.
 pub const COUNTER_DL_DST_MISMATCH: u32 = 5;
+/// Counter index: encapsulated uplink frames whose neighbour redirect actually
+/// resolved.
+///
+/// A successful `bpf_redirect_neigh` re-enters the same tc egress hook
+/// (`skb_do_redirect` -> `__bpf_redirect_neigh_v4` -> `bpf_out_neigh_v4` ->
+/// `neigh_output` -> `dev_queue_xmit` -> `sch_handle_egress`); a failed one is
+/// freed before it gets there. Counting the re-emitted outer frame's second
+/// traversal therefore measures the redirect outcome the helper's constant
+/// return value cannot.
+///
+/// It proves the frame cleared FIB and neighbour resolution and reached
+/// `dev_queue_xmit`. It does not prove the peer received it: a later qdisc,
+/// driver, or on-wire loss is still invisible here. An unresolved neighbour
+/// lags rather than reads wrong -- the skb waits in the neighbour's
+/// `arp_queue` and is counted late if resolution succeeds, never if it does
+/// not.
+///
+/// It is also unauthenticated. The discriminator is the frame itself, so any
+/// locally originated packet sourced from the attachment's own S2b-U endpoint
+/// to UDP/2152 with a GTPv1 G-PDU header increments it too, and a co-located
+/// process needs no privilege to send one. Only this counter is affected --
+/// no forwarding decision reads it -- and no in-program tightening can close
+/// it, because every discriminator available here is in-band and therefore
+/// forgeable by a local sender.
+pub const COUNTER_UL_REDIRECT_RESOLVED: u32 = 6;
 /// Number of datapath counters.
-pub const COUNTER_SLOTS: u32 = 6;
+pub const COUNTER_SLOTS: u32 = 7;
 
 /// Binding-drop counter index: no canonical binding exists for the PDR.
 pub const COUNTER_DL_BINDING_INVALID: u32 = 0;
@@ -2000,10 +2030,18 @@ mod tests {
     /// The indices address a fixed-size pinned per-CPU array, so a collision
     /// silently merges two unrelated counters and an index at or past
     /// `COUNTER_SLOTS` writes nothing at all -- both fail as a wrong
-    /// operator-facing number rather than as an error. This matters most when
-    /// the map next grows: the real fix for the uplink redirect counter has to
-    /// add a slot, and this is what catches a reused index or a forgotten
-    /// `COUNTER_SLOTS` bump.
+    /// operator-facing number rather than as an error. This is what caught the
+    /// slot growth when the uplink redirect counter
+    /// ([`COUNTER_UL_REDIRECT_RESOLVED`]) was added, and it is what catches a
+    /// reused index or a forgotten `COUNTER_SLOTS` bump the next time the map
+    /// grows.
+    ///
+    /// Growing `COUNTER_SLOTS` is not only a CI drift-gate refresh. It changes
+    /// `GTPU_COUNTERS.max_entries` in the committed object's `maps` section
+    /// *and* in the pinned map graph, and the loader compares `max_entries` at
+    /// every current-schema pin identity check, so a pin graph retained from a
+    /// build with the old slot count is not this build's graph and is refused
+    /// rather than adopted in place.
     #[test]
     fn datapath_counter_indices_are_distinct_and_within_the_map() {
         let indices = [
@@ -2013,6 +2051,7 @@ mod tests {
             COUNTER_DL_UNKNOWN_TEID,
             COUNTER_DL_MALFORMED,
             COUNTER_DL_DST_MISMATCH,
+            COUNTER_UL_REDIRECT_RESOLVED,
         ];
         let mut seen = std::vec::Vec::new();
         for index in indices {

@@ -8,7 +8,9 @@
 //!   v5 IPv4 maps remain a compatibility fallback only when no grouped index
 //!   owns the selector. A legacy mark-zero FAR miss passes through untouched;
 //!   a nonzero-mark miss is dropped so explicitly classified subscriber
-//!   traffic cannot leak without GTP-U encapsulation.
+//!   traffic cannot leak without GTP-U encapsulation. A successful
+//!   `bpf_redirect_neigh` re-enters this same hook, so the program recognizes
+//!   its own re-emitted outer frame and counts the redirect outcome.
 //! - `opc_gtpu_downlink` (tc ingress): matches UDP/2152 GTPv1-U G-PDUs and
 //!   validates exact IPv4 or IPv6 UDP/GTP-U boundaries and checksums before
 //!   grouped PDR lookup, validates the independent inner IP family, and strips
@@ -47,6 +49,7 @@ use opc_gtpu_ebpf_common::{
     apply_uplink_mtu_policy, build_uplink_encap_with_dscp_and_source_port, classify_gtpu,
     classify_udp_checksum, decide_uplink_pmtu, downlink_frame_end,
     downlink_parse_ipv4_total_length, downlink_parse_payload_offset, downlink_parse_teid,
+    gtpu_session_config_wire_owns_local_ipv4, gtpu_session_config_wire_owns_local_ipv6,
     internet_checksum_sum_is_valid, marked_owner_wire_authorizes_downlink,
     marked_owner_wire_authorizes_uplink, pack_downlink_parse_result,
     pdp_commit_wire_authorized_source_port, pdp_commit_wire_authorizes_downlink,
@@ -61,17 +64,18 @@ use opc_gtpu_ebpf_common::{
     COUNTER_DL_BINDING_SOURCE_PORT_MISMATCH, COUNTER_DL_DECAP, COUNTER_DL_DST_MISMATCH,
     COUNTER_DL_MALFORMED, COUNTER_DL_UNKNOWN_TEID, COUNTER_SLOTS, COUNTER_UL_ENCAP,
     COUNTER_UL_FAR_MISS, COUNTER_UL_MTU_REJECT, COUNTER_UL_PMTU_CORRUPT,
-    DOWNLINK_BINDING_COUNTER_SLOTS, DOWNLINK_ENDPOINT_BINDING_VALUE_LEN, DOWNLINK_PDR_VALUE_LEN,
-    ETH_HDR_LEN, ETH_P_IPV4, ETH_P_IPV6, GTPU_FLAGS_V1_GPDU, GTPU_IPV6_ENCAP_LEN,
-    GTPU_MANDATORY_HDR_LEN, GTPU_MAX_EXT_HEADERS, GTPU_MSG_TYPE_GPDU, GTPU_OPT_LEN,
-    GTPU_SESSION_CONFIG_KEY, GTPU_SESSION_CONFIG_VALUE_LEN, GTPU_SESSION_DOWNLINK_KEY_LEN,
-    GTPU_SESSION_GROUP_ID_LEN, GTPU_SESSION_GROUP_REF_LEN, GTPU_SESSION_GROUP_VALUE_LEN,
-    GTPU_SESSION_SCHEMA_MARKER_LEN, GTPU_SESSION_TRANSACTION_VALUE_LEN,
-    GTPU_SESSION_UPLINK_KEY_LEN, GTPU_UDP_PORT, IPV6_HDR_LEN, IPV6_MAX_EXT_HEADERS,
-    IPV6_MAX_OPTIONS_PER_HEADER, IPV6_NH_DESTINATION_OPTIONS, IPV6_NH_FRAGMENT, IPV6_NH_HOP_BY_HOP,
-    IPV6_NH_NONE, IPV6_NH_ROUTING, IPV6_NH_UDP, MARKED_BEARER_OWNER_VALUE_LEN,
-    MARKED_DOWNLINK_PDR_VALUE_LEN, UPLINK_DSCP_SCHEMA_MARKER_KEY, UPLINK_DSCP_VALUE_LEN,
-    UPLINK_FAR_VALUE_LEN, UPLINK_MARK_KEY_LEN, UPLINK_PMTU_COUNTER_SLOTS, UPLINK_PMTU_VALUE_LEN,
+    COUNTER_UL_REDIRECT_RESOLVED, DOWNLINK_BINDING_COUNTER_SLOTS,
+    DOWNLINK_ENDPOINT_BINDING_VALUE_LEN, DOWNLINK_PDR_VALUE_LEN, ETH_HDR_LEN, ETH_P_IPV4,
+    ETH_P_IPV6, GTPU_FLAGS_V1_GPDU, GTPU_IPV6_ENCAP_LEN, GTPU_MANDATORY_HDR_LEN,
+    GTPU_MAX_EXT_HEADERS, GTPU_MSG_TYPE_GPDU, GTPU_OPT_LEN, GTPU_SESSION_CONFIG_KEY,
+    GTPU_SESSION_CONFIG_VALUE_LEN, GTPU_SESSION_DOWNLINK_KEY_LEN, GTPU_SESSION_GROUP_ID_LEN,
+    GTPU_SESSION_GROUP_REF_LEN, GTPU_SESSION_GROUP_VALUE_LEN, GTPU_SESSION_SCHEMA_MARKER_LEN,
+    GTPU_SESSION_TRANSACTION_VALUE_LEN, GTPU_SESSION_UPLINK_KEY_LEN, GTPU_UDP_PORT,
+    IPV4_MIN_HDR_LEN, IPV6_HDR_LEN, IPV6_MAX_EXT_HEADERS, IPV6_MAX_OPTIONS_PER_HEADER,
+    IPV6_NH_DESTINATION_OPTIONS, IPV6_NH_FRAGMENT, IPV6_NH_HOP_BY_HOP, IPV6_NH_NONE,
+    IPV6_NH_ROUTING, IPV6_NH_UDP, MARKED_BEARER_OWNER_VALUE_LEN, MARKED_DOWNLINK_PDR_VALUE_LEN,
+    UDP_HDR_LEN, UPLINK_DSCP_SCHEMA_MARKER_KEY, UPLINK_DSCP_VALUE_LEN, UPLINK_FAR_VALUE_LEN,
+    UPLINK_MARK_KEY_LEN, UPLINK_PMTU_COUNTER_SLOTS, UPLINK_PMTU_VALUE_LEN,
     UPLINK_SOURCE_PORT_VALUE_LEN,
 };
 #[cfg(test)]
@@ -330,6 +334,148 @@ fn packet_ifindex(ctx: &TcContext) -> u32 {
     // context for the lifetime of this classifier invocation. `ifindex` is a
     // fixed-width read-only field at this boundary.
     unsafe { (*ctx.skb.skb).ifindex }
+}
+
+/// Return whether an outer UDP header at `l4_offset` addresses GTP-U and
+/// carries a GTPv1 G-PDU, the exact envelope both uplink completion sites
+/// stamp.
+///
+/// The message-type check is what keeps locally originated GTP-U control
+/// traffic (echo request/response, error indication) out of the re-entry
+/// counter: those share the port but never the G-PDU type.
+#[inline(always)]
+fn outer_envelope_is_uplink_gpdu(ctx: &TcContext, l4_offset: usize) -> bool {
+    let Ok(destination_port) = ctx.load::<u16>(l4_offset + 2) else {
+        return false;
+    };
+    if u16::from_be(destination_port) != GTPU_UDP_PORT {
+        return false;
+    }
+    let Ok(header) = ctx.load::<[u8; 2]>(l4_offset + UDP_HDR_LEN) else {
+        return false;
+    };
+    header == [GTPU_FLAGS_V1_GPDU, GTPU_MSG_TYPE_GPDU]
+}
+
+/// Return whether `address` is one of this attachment's local S2b-U IPv4
+/// endpoints.
+///
+/// The frozen v5 attachment records it in the single-slot `GTPU_CONFIG`; a
+/// grouped attachment records it in `GTPU_CONFIG6` and leaves `GTPU_CONFIG`
+/// zero. Both are consulted so one program serves either schema.
+#[inline(always)]
+fn local_outer_endpoint_is_ipv4(ctx: &TcContext, address: &[u8; 4]) -> bool {
+    if *address == [0, 0, 0, 0] {
+        return false;
+    }
+    if let Some(config_ptr) = GTPU_CONFIG.get_ptr(0) {
+        // SAFETY: single-slot array value written only by the loader at attach
+        // and read here for the length of this invocation.
+        if unsafe { *config_ptr } == *address {
+            return true;
+        }
+    }
+    let Some(config_ptr) = GTPU_CONFIG6.get_ptr(GTPU_SESSION_CONFIG_KEY) else {
+        return false;
+    };
+    // SAFETY: single-slot array value written only by the loader; borrowed
+    // read-only for this canonicality check.
+    gtpu_session_config_wire_owns_local_ipv4(unsafe { &*config_ptr }, packet_ifindex(ctx), address)
+}
+
+/// Return whether this frame is one of this datapath's own re-emitted outer
+/// GTP-U frames traversing the egress hook a second time.
+///
+/// A successful `bpf_redirect_neigh` re-enters this hook through
+/// `skb_do_redirect` -> `__bpf_redirect_neigh_v4` -> `bpf_out_neigh_v4` ->
+/// `neigh_output` -> `dev_queue_xmit` -> `sch_handle_egress`; a redirect that
+/// finds no usable route is freed before it gets there, and one whose
+/// neighbour never resolves is parked in the neighbour's `arp_queue` and
+/// likewise never reaches this hook. Counting this second traversal is
+/// therefore the redirect outcome, which the helper's constant return value
+/// can never report.
+///
+/// The discriminator is what the frame *is*, never a stamp this program
+/// writes: `skb->mark` is load-bearing production state here and is left
+/// alone. It requires all of
+///
+/// - mark zero, which both completion sites establish before redirecting;
+/// - an outer IPv4 or IPv6 UDP/2152 GTPv1 G-PDU envelope of exactly the shape
+///   this program stamps;
+/// - an outer source that is one of this attachment's own local S2b-U
+///   endpoints: `GTPU_CONFIG` for the frozen v5 schema, `GTPU_CONFIG6` for
+///   grouped attachments, the latter bound to the observed ifindex. Both maps
+///   are reached through a per-interface pin directory, so either schema's
+///   value is already scoped to this attachment.
+///
+/// It cannot false-positive on subscriber traffic, because no provisioned UE
+/// PAA may alias the local outer endpoint: `GtpuSessionEntry::new` and
+/// `entry_wire_is_canonical` reject a grouped entry whose inner PAA aliases
+/// its local outer address, and the frozen v5 path rejects
+/// `pdp.ms_address == device.bind_address` at install and again on read-back.
+/// A first-pass subscriber packet therefore never carries this source, and for
+/// the same reason no FAR or grouped selector could ever have matched it --
+/// so the FAR-miss accounting this replaces was never reporting a real session
+/// lookup failure either. What remains is a locally forged frame that copies
+/// this attachment's own outer source, port and G-PDU header; it inflates an
+/// observability counter and changes no forwarding decision.
+#[inline(never)]
+fn uplink_frame_is_redirect_reentry(ctx: &TcContext, mark: u32, eth_proto: u16) -> bool {
+    if mark != 0 {
+        return false;
+    }
+    match eth_proto {
+        ETH_P_IPV4 => {
+            let Ok(version_ihl) = ctx.load::<u8>(ETH_HDR_LEN) else {
+                return false;
+            };
+            let Ok(protocol) = ctx.load::<u8>(ETH_HDR_LEN + 9) else {
+                return false;
+            };
+            // Both sites emit an option-free header; the MTU policy only ever
+            // stamps DF and never grows the IHL.
+            if version_ihl != 0x45 || protocol != IPV4_PROTO_UDP {
+                return false;
+            }
+            if !outer_envelope_is_uplink_gpdu(ctx, ETH_HDR_LEN + IPV4_MIN_HDR_LEN) {
+                return false;
+            }
+            let Ok(source) = ctx.load::<[u8; 4]>(ETH_HDR_LEN + 12) else {
+                return false;
+            };
+            local_outer_endpoint_is_ipv4(ctx, &source)
+        }
+        ETH_P_IPV6 => {
+            let Ok(version) = ctx.load::<u8>(ETH_HDR_LEN) else {
+                return false;
+            };
+            let Ok(next_header) = ctx.load::<u8>(ETH_HDR_LEN + 6) else {
+                return false;
+            };
+            // The grouped outer-IPv6 encapsulation is the fixed 40-byte header
+            // with UDP directly next; no extension-header walk is needed.
+            if version >> 4 != 6 || next_header != IPV6_NH_UDP {
+                return false;
+            }
+            if !outer_envelope_is_uplink_gpdu(ctx, ETH_HDR_LEN + IPV6_HDR_LEN) {
+                return false;
+            }
+            let Ok(source) = ctx.load::<[u8; 16]>(ETH_HDR_LEN + 8) else {
+                return false;
+            };
+            let Some(config_ptr) = GTPU_CONFIG6.get_ptr(GTPU_SESSION_CONFIG_KEY) else {
+                return false;
+            };
+            // SAFETY: single-slot array value written only by the loader;
+            // borrowed read-only for this canonicality check.
+            gtpu_session_config_wire_owns_local_ipv6(
+                unsafe { &*config_ptr },
+                packet_ifindex(ctx),
+                &source,
+            )
+        }
+        _ => false,
+    }
 }
 
 /// Resolve one grouped uplink selector without ever re-reading its index.
@@ -615,11 +761,16 @@ fn complete_grouped_uplink(ctx: &TcContext, mark: u32, ether_type: u16) -> i32 {
         return TC_ACT_SHOT;
     }
     if mark != 0 {
+        // Clear the bearer mark before redirecting: the re-emitted outer frame
+        // must traverse this hook as mark zero so it is recognized as this
+        // program's own re-entry instead of self-dropping on a marked FAR miss.
         ctx.set_mark(0);
     }
     count(COUNTER_UL_ENCAP);
     // SAFETY: no neighbour parameter pointer is supplied; the helper derives
-    // the route and neighbour from the newly materialized outer IP header.
+    // the route and neighbour from the newly materialized outer IP header. A
+    // redirect that resolves re-enters this egress hook, where
+    // `uplink_frame_is_redirect_reentry` counts COUNTER_UL_REDIRECT_RESOLVED.
     let action = unsafe { bpf_redirect_neigh((*ctx.skb.skb).ifindex, core::ptr::null_mut(), 0, 0) };
     if action == i64::from(TC_ACT_REDIRECT) {
         action as i32
@@ -1528,6 +1679,19 @@ fn try_uplink(ctx: &mut TcContext, mark: u32) -> Result<i32, ()> {
         None if grouped_status == GROUPED_LOOKUP_ERROR => return Ok(TC_ACT_SHOT),
         None => {}
     }
+    if uplink_frame_is_redirect_reentry(ctx, mark, eth_proto) {
+        // One of this program's own encapsulations, back on this hook because
+        // its neighbour redirect actually resolved. This is the only in-program
+        // evidence that an encapsulated frame reached `dev_queue_xmit` instead
+        // of being freed inside `skb_do_redirect`.
+        //
+        // Accounting it here also keeps the frame out of `COUNTER_UL_FAR_MISS`:
+        // the outer source is the local S2b-U address, never a UE PAA, so every
+        // successfully delivered uplink packet used to be reported as a session
+        // lookup failure. Both counters now mean what they say.
+        count(COUNTER_UL_REDIRECT_RESOLVED);
+        return Ok(non_encapsulation_action(mark));
+    }
     if eth_proto != ETH_P_IPV4 {
         return Ok(non_encapsulation_action(mark));
     }
@@ -1725,14 +1889,22 @@ fn try_uplink(ctx: &mut TcContext, mark: u32) -> Result<i32, ()> {
 
     // The frame's L2 destination was resolved for the inner route; the outer
     // destination is the PGW. Re-run FIB/neighbour resolution for the new
-    // outer header. The re-emitted frame traverses this egress hook once
-    // more, misses the FAR (outer src is not a UE PAA), and passes through.
+    // outer header. A redirect that resolves re-enters this egress hook once
+    // more, where `uplink_frame_is_redirect_reentry` recognizes it and counts
+    // COUNTER_UL_REDIRECT_RESOLVED before it passes through.
     // SAFETY: helper takes no pointers when plen == 0.
     let ret = unsafe { bpf_redirect_neigh((*ctx.skb.skb).ifindex, core::ptr::null_mut(), 0, 0) };
-    if mark != 0 && ret != i64::from(TC_ACT_REDIRECT) {
-        Ok(TC_ACT_SHOT as i32)
-    } else {
+    // Fail closed on any non-redirect verdict, symmetrically with
+    // `complete_grouped_uplink`, so no future call shape can return an
+    // unhandled value that `sch_handle_egress` maps to `default: break` and
+    // keeps transmitting with the inner route's L2 destination. Today the
+    // `else` arm is unreachable: `bpf_redirect_neigh` returns TC_ACT_SHOT only
+    // for `(plen && plen < sizeof(*params)) || flags`, and `plen == 0` with
+    // `flags == 0` is exactly the shape that condition can never be true for.
+    if ret == i64::from(TC_ACT_REDIRECT) {
         Ok(ret as i32)
+    } else {
+        Ok(TC_ACT_SHOT as i32)
     }
 }
 

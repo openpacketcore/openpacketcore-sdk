@@ -90,17 +90,18 @@ use opc_gtpu_ebpf_common::{
     COUNTER_DL_BINDING_PEER_MISMATCH, COUNTER_DL_BINDING_SOURCE_PORT_MISMATCH, COUNTER_DL_DECAP,
     COUNTER_DL_DST_MISMATCH, COUNTER_DL_MALFORMED, COUNTER_DL_UNKNOWN_TEID, COUNTER_UL_ENCAP,
     COUNTER_UL_FAR_MISS, COUNTER_UL_MTU_REJECT, COUNTER_UL_PMTU_CORRUPT,
-    DOWNLINK_ENDPOINT_BINDING_VALUE_LEN, DOWNLINK_PDR_VALUE_LEN, ETH_HDR_LEN,
-    GTPU_MANDATORY_HDR_LEN, IPV4_MIN_HDR_LEN, MAP_CONFIG, MAP_CONFIG_IPV6, MAP_COUNTERS,
-    MAP_DOWNLINK_BINDING_COUNTERS, MAP_DOWNLINK_ENDPOINT_BINDING, MAP_DOWNLINK_MARK_PDR,
-    MAP_DOWNLINK_PDR, MAP_MARKED_BEARER_OWNER, MAP_SESSION_DOWNLINK_INDEX, MAP_SESSION_GROUPS,
-    MAP_SESSION_UPLINK_INDEX, MAP_UPLINK_DSCP, MAP_UPLINK_FAR, MAP_UPLINK_MARK_DSCP,
-    MAP_UPLINK_MARK_FAR, MAP_UPLINK_MARK_SOURCE_PORT, MAP_UPLINK_PMTU, MAP_UPLINK_PMTU_COUNTERS,
-    MAP_UPLINK_SOURCE_PORT, MARKED_BEARER_OWNER_VALUE_LEN, MARKED_DOWNLINK_PDR_VALUE_LEN,
-    PROG_DOWNLINK, PROG_UPLINK, UDP_HDR_LEN, UPLINK_BEARER_SCHEMA_MARKER_VALUE,
-    UPLINK_DSCP_SCHEMA_MARKER_KEY, UPLINK_DSCP_SCHEMA_MARKER_VALUE, UPLINK_DSCP_VALUE_LEN,
-    UPLINK_FAR_VALUE_LEN, UPLINK_MARK_KEY_LEN, UPLINK_PMTU_SCHEMA_MARKER_VALUE,
-    UPLINK_PMTU_VALUE_LEN, UPLINK_SOURCE_PORT_VALUE_LEN,
+    COUNTER_UL_REDIRECT_RESOLVED, DOWNLINK_ENDPOINT_BINDING_VALUE_LEN, DOWNLINK_PDR_VALUE_LEN,
+    ETH_HDR_LEN, GTPU_MANDATORY_HDR_LEN, IPV4_MIN_HDR_LEN, MAP_CONFIG, MAP_CONFIG_IPV6,
+    MAP_COUNTERS, MAP_DOWNLINK_BINDING_COUNTERS, MAP_DOWNLINK_ENDPOINT_BINDING,
+    MAP_DOWNLINK_MARK_PDR, MAP_DOWNLINK_PDR, MAP_MARKED_BEARER_OWNER, MAP_SESSION_DOWNLINK_INDEX,
+    MAP_SESSION_GROUPS, MAP_SESSION_UPLINK_INDEX, MAP_UPLINK_DSCP, MAP_UPLINK_FAR,
+    MAP_UPLINK_MARK_DSCP, MAP_UPLINK_MARK_FAR, MAP_UPLINK_MARK_SOURCE_PORT, MAP_UPLINK_PMTU,
+    MAP_UPLINK_PMTU_COUNTERS, MAP_UPLINK_SOURCE_PORT, MARKED_BEARER_OWNER_VALUE_LEN,
+    MARKED_DOWNLINK_PDR_VALUE_LEN, PROG_DOWNLINK, PROG_UPLINK, UDP_HDR_LEN,
+    UPLINK_BEARER_SCHEMA_MARKER_VALUE, UPLINK_DSCP_SCHEMA_MARKER_KEY,
+    UPLINK_DSCP_SCHEMA_MARKER_VALUE, UPLINK_DSCP_VALUE_LEN, UPLINK_FAR_VALUE_LEN,
+    UPLINK_MARK_KEY_LEN, UPLINK_PMTU_SCHEMA_MARKER_VALUE, UPLINK_PMTU_VALUE_LEN,
+    UPLINK_SOURCE_PORT_VALUE_LEN,
 };
 use opc_ipsec_xfrm::{
     Algorithm, AuthAlgorithm, InstallPolicyRequest, InstallSaRequest, IpAddress, KeyMaterial,
@@ -131,6 +132,15 @@ const UE_PAA: Ipv4Addr = Ipv4Addr::new(10, 45, 0, 2);
 const UE_PAA_IPV6: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0x45, 0, 0, 0, 0, 2);
 const REMOTE_HOST: Ipv4Addr = Ipv4Addr::new(8, 8, 8, 8);
 const REMOTE_HOST_IPV6: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0xffff, 0, 0, 0, 0, 8);
+/// Outer destination with no route at all in the harness netns.
+const UNROUTABLE_PGW_IP: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 99);
+/// The prefix covering [`UNROUTABLE_PGW_IP`], used to install a route whose
+/// next hop can never be resolved.
+const UNROUTABLE_PGW_PREFIX: &str = "203.0.113.0/24";
+/// Unassigned address on the S2b-U link; nothing ever answers ARP for it.
+const DEAD_NEXT_HOP: &str = "192.0.2.199";
+/// Datagrams sent per redirect-outcome scenario.
+const REDIRECT_PROBE_PACKETS: u32 = 3;
 const LOCAL_TEID: u32 = 0x1000_0001;
 const PEER_TEID: u32 = 0x2000_0001;
 const MARK_A: u32 = 0x0001_0001;
@@ -3665,6 +3675,10 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
             initial_snapshot.counters.downlink_destination_mismatches,
             COUNTER_DL_DST_MISMATCH,
         ),
+        (
+            initial_snapshot.counters.uplink_redirects_resolved,
+            COUNTER_UL_REDIRECT_RESOLVED,
+        ),
     ] {
         assert_eq!(
             reported,
@@ -5804,6 +5818,22 @@ async fn ebpf_gtpu_grouped_dual_stack_live_contract() -> Result<(), Box<dyn std:
         GROUP_PEER_TEID_V6_INITIAL,
         &v6_uplink_inner,
     );
+    // The PGW has now received the frame, so its neighbour redirect provably
+    // resolved and re-entered this egress hook. Read the counter after that
+    // proof rather than on a timer: outer-IPv6 re-entry is recognized through
+    // the fixed 40-byte header and GTPU_CONFIG6's local endpoint, and a lagging
+    // neighbour resolution would otherwise make the assertion flaky.
+    let v6_uplink_delivered = backend.datapath_snapshot(&device).await?;
+    assert_eq!(
+        v6_uplink_delivered.counters.uplink_redirects_resolved,
+        v6_uplink_before.counters.uplink_redirects_resolved + 1,
+        "a delivered outer-IPv6 uplink must count exactly one resolved redirect: before={v6_uplink_before:?} delivered={v6_uplink_delivered:?}"
+    );
+    assert_eq!(
+        v6_uplink_delivered.counters.uplink_far_misses,
+        v6_uplink_before.counters.uplink_far_misses,
+        "a delivered outer-IPv6 uplink is not a FAR miss: before={v6_uplink_before:?} delivered={v6_uplink_delivered:?}"
+    );
 
     let destination_mac = main_link_address("s2bu");
     let source_mac = net.pgw_link_address("s2bup");
@@ -6659,6 +6689,256 @@ async fn current_graph_recovery_fences_live_owner_and_recovers_after_interface_l
             .recover_orphaned_current_ebpf_graph(request())
             .await?,
         CurrentEbpfGraphRecoveryOutcome::AlreadyAbsent
+    );
+
+    drop(net);
+    Ok(())
+}
+
+/// The redirect-outcome counter must move with real delivery, not with
+/// submission.
+///
+/// `bpf_redirect_neigh` returns `TC_ACT_REDIRECT` unconditionally at this call
+/// shape, so a counter derived from its return value is permanently zero -- the
+/// defect that made an earlier attempt at issue 564 a no-op. What is real is
+/// the re-entry: a redirect that resolves puts the outer frame back on this
+/// same tc egress hook (`skb_do_redirect` -> `__bpf_redirect_neigh_v4` ->
+/// `bpf_out_neigh_v4` -> `neigh_output` -> `dev_queue_xmit` ->
+/// `sch_handle_egress`), and one that does not is `kfree_skb`'d inside
+/// `skb_do_redirect` before it gets there.
+///
+/// This drives real subscriber traffic through the real datapath against three
+/// outer destinations and asserts the distinction end to end:
+///
+/// - on-link and reachable: `uplink_redirects_resolved` rises 1:1 with
+///   `uplink_encapsulated`;
+/// - no route covering the outer destination: `uplink_encapsulated` keeps
+///   rising and `uplink_redirects_resolved` stays flat;
+/// - route present but the next hop never answers ARP: same, and still flat
+///   after the neighbour's solicitation budget is spent, so the signal is a
+///   real failure rather than an early read of a queued skb;
+/// - back to reachable: the counter resumes, proving it was never wedged.
+///
+/// `uplink_far_misses` must stay flat throughout. Before the re-entry was
+/// recognized, the re-emitted frame's outer source (the local S2b-U address,
+/// never a UE PAA) missed the FAR, so that counter rose once per *successfully
+/// delivered* uplink packet and reported a healthy uplink as session-state
+/// corruption.
+#[tokio::test]
+// The serial guard is deliberately held for the entire test body; see
+// PRIVILEGED_TEST_LOCK.
+#[allow(clippy::await_holding_lock)]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn ebpf_gtpu_uplink_redirect_counter_tracks_delivery_not_submission(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref() != Ok("1") {
+        eprintln!("skipping: set OPC_GTPU_RUN_PRIVILEGED=1 inside a fresh privileged netns");
+        return Ok(());
+    }
+
+    let _serial = PRIVILEGED_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let net = TestNet::provision();
+    let backend = EbpfGtpuDataplaneBackend::with_config(EbpfGtpuDataplaneBackendConfig {
+        bpffs_pin_root: net.pin_root.clone(),
+        ..EbpfGtpuDataplaneBackendConfig::default()
+    });
+    let mut request = CreateGtpDeviceRequest::new("s2bu");
+    request.bind_address = IpAddr::V4(EPDG_S2BU_IP);
+    let device = backend.create_device(request).await?;
+    let pin_dir = net.pin_root.join("s2bu");
+
+    let reachable = session_context(device.ifindex);
+    let mut black_holed = session_context(device.ifindex);
+    black_holed.peer_address = IpAddr::V4(UNROUTABLE_PGW_IP);
+    backend.install_pdp_context(reachable.clone()).await?;
+
+    let pgw_socket = in_netns(&net.pgw_ns, || {
+        UdpSocket::bind((PGW_IP, GTPU_PORT)).expect("bind PGW GTP-U socket")
+    });
+    let ue_socket = in_netns(&net.ue_ns, || {
+        UdpSocket::bind((UE_PAA, 5000)).expect("bind UE socket")
+    });
+
+    // Resolve the PGW neighbour before any exact accounting. The very first
+    // redirected frame would otherwise wait in the neighbour's arp_queue and be
+    // counted after resolution completes rather than in this window.
+    let mut buffer = [0_u8; 2048];
+    send_until_received(
+        || {
+            let _ = ue_socket.send_to(b"opc-redirect-warmup", (REMOTE_HOST, 53));
+        },
+        &pgw_socket,
+        &mut buffer,
+    )
+    .expect("warm-up uplink must reach the PGW");
+    drain_datagrams(&pgw_socket);
+
+    // Reachable outer destination: every submission is also a delivery.
+    let reachable_before = backend.datapath_snapshot(&device).await?.counters;
+    for index in 0..REDIRECT_PROBE_PACKETS {
+        ue_socket.send_to(
+            format!("opc-redirect-healthy-{index}").as_bytes(),
+            (REMOTE_HOST, 53),
+        )?;
+    }
+    pgw_socket
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set PGW read timeout");
+    for index in 0..REDIRECT_PROBE_PACKETS {
+        let (len, from) = pgw_socket.recv_from(&mut buffer).unwrap_or_else(|error| {
+            panic!("healthy uplink G-PDU {index} must reach the PGW: {error}")
+        });
+        assert_eq!(from, SocketAddr::from((EPDG_S2BU_IP, GTPU_PORT)));
+        assert!(buffer[..len].ends_with(format!("opc-redirect-healthy-{index}").as_bytes()));
+    }
+    let reachable_after = backend.datapath_snapshot(&device).await?.counters;
+    assert_eq!(
+        reachable_after.uplink_encapsulated,
+        reachable_before.uplink_encapsulated + u64::from(REDIRECT_PROBE_PACKETS),
+        "every subscriber packet must be encapsulated: before={reachable_before:?} after={reachable_after:?}"
+    );
+    assert_eq!(
+        reachable_after.uplink_redirects_resolved,
+        reachable_before.uplink_redirects_resolved + u64::from(REDIRECT_PROBE_PACKETS),
+        "a delivered uplink must count one resolved redirect per encapsulation: before={reachable_before:?} after={reachable_after:?}"
+    );
+    assert_eq!(
+        reachable_after.uplink_far_misses, reachable_before.uplink_far_misses,
+        "a successfully delivered uplink packet is not a FAR miss: before={reachable_before:?} after={reachable_after:?}"
+    );
+    assert_eq!(
+        reachable_after.uplink_redirects_resolved,
+        pinned_counter(&pin_dir, COUNTER_UL_REDIRECT_RESOLVED),
+        "the public snapshot must aggregate the exact pinned redirect counter"
+    );
+
+    // Same session state, same subscriber traffic, unroutable outer
+    // destination. `ip_route_output_flow()` fails inside
+    // `__bpf_redirect_neigh_v4` and the frame is freed before it can re-enter
+    // this hook.
+    backend
+        .remove_pdp_context(RemovePdpContextRequest::from_context(&reachable))
+        .await?;
+    backend.install_pdp_context(black_holed.clone()).await?;
+    let no_route_before = backend.datapath_snapshot(&device).await?.counters;
+    for index in 0..REDIRECT_PROBE_PACKETS {
+        ue_socket.send_to(
+            format!("opc-redirect-no-route-{index}").as_bytes(),
+            (REMOTE_HOST, 53),
+        )?;
+    }
+    expect_no_datagram(&pgw_socket);
+    let no_route_after = backend.datapath_snapshot(&device).await?.counters;
+    assert_eq!(
+        no_route_after.uplink_encapsulated,
+        no_route_before.uplink_encapsulated + u64::from(REDIRECT_PROBE_PACKETS),
+        "a black-holed uplink still encapsulates every packet: before={no_route_before:?} after={no_route_after:?}"
+    );
+    assert_eq!(
+        no_route_after.uplink_redirects_resolved, no_route_before.uplink_redirects_resolved,
+        "a redirect with no route to the outer destination must never count as resolved: before={no_route_before:?} after={no_route_after:?}"
+    );
+    assert_eq!(
+        no_route_after.uplink_far_misses, no_route_before.uplink_far_misses,
+        "a dropped redirect is not a FAR miss either: before={no_route_before:?} after={no_route_after:?}"
+    );
+
+    // A route now exists, but its next hop is unassigned and never answers
+    // ARP. `bpf_out_neigh_v4()` hands the skb to `neigh_output()`, which parks
+    // it in the neighbour's arp_queue; it reaches `dev_queue_xmit` only if
+    // resolution succeeds, so the counter stays flat here rather than
+    // reporting a delivery that never happens.
+    run(
+        "ip",
+        &[
+            "route",
+            "add",
+            UNROUTABLE_PGW_PREFIX,
+            "via",
+            DEAD_NEXT_HOP,
+            "dev",
+            "s2bu",
+        ],
+    );
+    let no_neigh_before = backend.datapath_snapshot(&device).await?.counters;
+    for index in 0..REDIRECT_PROBE_PACKETS {
+        ue_socket.send_to(
+            format!("opc-redirect-no-neigh-{index}").as_bytes(),
+            (REMOTE_HOST, 53),
+        )?;
+    }
+    expect_no_datagram(&pgw_socket);
+    let no_neigh_after = backend.datapath_snapshot(&device).await?.counters;
+    assert_eq!(
+        no_neigh_after.uplink_encapsulated,
+        no_neigh_before.uplink_encapsulated + u64::from(REDIRECT_PROBE_PACKETS),
+        "an unresolvable next hop still encapsulates every packet: before={no_neigh_before:?} after={no_neigh_after:?}"
+    );
+    assert_eq!(
+        no_neigh_after.uplink_redirects_resolved, no_neigh_before.uplink_redirects_resolved,
+        "a redirect whose neighbour never resolves must not count as resolved: before={no_neigh_before:?} after={no_neigh_after:?}"
+    );
+    // Past the neighbour's solicitation budget the queued skbs are gone for
+    // good. Re-reading here separates "permanently unreachable" from "counted
+    // late", which is the one honest ambiguity in this signal.
+    std::thread::sleep(Duration::from_secs(6));
+    let no_neigh_settled = backend.datapath_snapshot(&device).await?.counters;
+    assert_eq!(
+        no_neigh_settled.uplink_redirects_resolved, no_neigh_before.uplink_redirects_resolved,
+        "an unresolvable neighbour must stay flat once its arp_queue is drained: before={no_neigh_before:?} settled={no_neigh_settled:?}"
+    );
+    assert_eq!(
+        no_neigh_settled.uplink_far_misses, no_neigh_before.uplink_far_misses,
+        "queued-then-dropped frames are not FAR misses: before={no_neigh_before:?} settled={no_neigh_settled:?}"
+    );
+
+    // Restore reachability: the counter must resume, not stay wedged at the
+    // value a broken uplink left it at.
+    run(
+        "ip",
+        &[
+            "route",
+            "del",
+            UNROUTABLE_PGW_PREFIX,
+            "via",
+            DEAD_NEXT_HOP,
+            "dev",
+            "s2bu",
+        ],
+    );
+    backend
+        .remove_pdp_context(RemovePdpContextRequest::from_context(&black_holed))
+        .await?;
+    backend.install_pdp_context(reachable).await?;
+    let recovered_before = backend.datapath_snapshot(&device).await?.counters;
+    for index in 0..REDIRECT_PROBE_PACKETS {
+        ue_socket.send_to(
+            format!("opc-redirect-recovered-{index}").as_bytes(),
+            (REMOTE_HOST, 53),
+        )?;
+    }
+    for index in 0..REDIRECT_PROBE_PACKETS {
+        let (len, _) = pgw_socket.recv_from(&mut buffer).unwrap_or_else(|error| {
+            panic!("recovered uplink G-PDU {index} must reach the PGW: {error}")
+        });
+        assert!(buffer[..len].ends_with(format!("opc-redirect-recovered-{index}").as_bytes()));
+    }
+    let recovered_after = backend.datapath_snapshot(&device).await?.counters;
+    assert_eq!(
+        recovered_after.uplink_redirects_resolved,
+        recovered_before.uplink_redirects_resolved + u64::from(REDIRECT_PROBE_PACKETS),
+        "the counter must resume once the outer destination is reachable again: before={recovered_before:?} after={recovered_after:?}"
+    );
+    assert_eq!(
+        recovered_after.uplink_encapsulated,
+        recovered_before.uplink_encapsulated + u64::from(REDIRECT_PROBE_PACKETS),
+        "recovery must not change the encapsulation accounting: before={recovered_before:?} after={recovered_after:?}"
+    );
+    assert_eq!(
+        recovered_after.uplink_far_misses, recovered_before.uplink_far_misses,
+        "recovery must not report FAR misses: before={recovered_before:?} after={recovered_after:?}"
     );
 
     drop(net);

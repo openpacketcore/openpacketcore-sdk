@@ -400,6 +400,56 @@ An all-zero identity-bound snapshot during a claimed GTP-U round trip means the
 traffic did not traverse these exact programs, not that a marked lookup chose
 the default entry.
 
+`uplink_encapsulated` counts encapsulations handed to `bpf_redirect_neigh`, not
+packets the peer received. `bpf_redirect_neigh` only records the target ifindex
+and returns `TC_ACT_REDIRECT`; route and neighbour resolution, and any
+resulting drop, happen later in `skb_do_redirect()` after the classifier has
+already returned. A total uplink outage whose cause sits downstream of the
+classifier -- no route covering the outer destination, no resolvable
+neighbour -- therefore still shows `uplink_encapsulated` rising 1:1 with
+subscriber traffic.
+
+`uplink_redirects_resolved` is the other half, and closes issue number 564. A
+redirect that resolves puts the outer frame back on the same tc egress hook
+(`skb_do_redirect()` -> `__bpf_redirect_neigh_v4()` -> `bpf_out_neigh_v4()` ->
+`neigh_output()` -> `dev_queue_xmit()` -> `sch_handle_egress()`); one that finds
+no usable route is freed before it gets there. The uplink program recognizes its
+own re-emitted outer frame on that second traversal, so -- absent the locally
+originated traffic described below -- this counter rises 1:1 with
+`uplink_encapsulated` on a healthy uplink and stays flat while
+`uplink_encapsulated` keeps rising during a redirect-stage outage. No GPL-only
+helper is involved: the check reads the existing configuration maps and the
+frame's own outer header.
+
+Three limits remain.
+
+- It proves the frame reached `dev_queue_xmit`, not that the peer received it,
+  so corroborate delivery against egress interface counters.
+- An unresolved neighbour lags rather than reads wrong: the skb waits in the
+  neighbour's `arp_queue` and is counted late if resolution eventually
+  succeeds, never if it does not.
+- The counter is unauthenticated. The datapath identifies its own re-emitted
+  frame by what the frame is, so any locally originated packet sourced from
+  this attachment's S2b-U endpoint to UDP/2152 carrying a GTPv1 G-PDU header
+  increments it as well, and an unprivileged co-located process can send one.
+  A noisy or hostile process on the host can therefore inflate this counter
+  while `uplink_encapsulated` stays flat, which is the inverse of the outage
+  signature above -- so a divergence in that direction says to look at the host,
+  not at the uplink. Only observability is affected: no forwarding decision
+  reads this counter, and no subscriber traffic can present that source, since
+  both schemas reject a UE PAA that aliases the local outer endpoint. This is
+  not closable by tightening the check; every discriminator available inside
+  the program is in-band and so forgeable by a local sender.
+
+`uplink_far_misses` no longer counts the datapath's own re-emitted outer
+frames. Their source is the local S2b-U address rather than a UE PAA, so before
+the redirect outcome was recognized this counter rose once per *successfully
+delivered* uplink IPv4 packet and made a healthy uplink read as session-state
+corruption. It remains a miss counter for every other mark-zero IPv4 frame
+leaving the attachment whose source is not a provisioned UE PAA -- locally
+originated traffic from the host included -- so read a nonzero value as a
+prompt to investigate rather than as proof of session-state corruption.
+
 Existing `GtpPdpContext` literals must add `bearer_mark: None` to retain the
 default path, or construct a non-zero `GtpBearerMark` for a dedicated bearer;
 they must also choose an explicit `downlink_source_port_policy` and an explicit
@@ -412,6 +462,12 @@ available only after both exact live tc programs and every exact schema map
 pin have been verified. The mainline Linux `gtp`, mock, and unsupported backends
 report `Missing` and reject marked requests. This API requires no Cargo feature
 and introduces no dependency.
+
+`EbpfGtpuDatapathCounters` gained `uplink_redirects_resolved`. The type is
+deliberately exhaustive, like every other public struct in this module, so any
+struct literal or exhaustive destructuring of it outside this crate must add
+the field. Nothing in-tree constructs it by literal outside the crate, and the
+crate is `publish = false`.
 
 ### DSCP and reconciliation
 

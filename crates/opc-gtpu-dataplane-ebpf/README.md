@@ -47,9 +47,12 @@ The crate exposes tc entry points, not a Rust library API:
   authorized. IPv6 UDP checksums are mandatory.
 
 Map names, counter indexes, program names, and byte layouts are imported from
-`opc-gtpu-ebpf-common`. `GTPU_DL_DROP` is a fixed six-slot per-CPU counter map
-for invalid, family, peer, local, ingress, and source-port binding failures.
-Its values are aggregate and contain no rejected endpoint or session fields.
+`opc-gtpu-ebpf-common`. `GTPU_COUNTERS` is a seven-slot per-CPU map; the
+seventh slot is `COUNTER_UL_REDIRECT_RESOLVED`, described under Status And
+Limits.
+`GTPU_DL_DROP` is a fixed six-slot per-CPU counter map for invalid, family,
+peer, local, ingress, and source-port binding failures. Its values are
+aggregate and contain no rejected endpoint or session fields.
 
 ## Relationships
 
@@ -94,6 +97,59 @@ Its values are aggregate and contain no rejected endpoint or session fields.
   setter but no getter, so the verifier-bound program uses one isolated,
   aligned raw read of `__sk_buff::mark` in addition to its existing raw
   map/helper accesses.
+- `COUNTER_UL_ENCAP` counts encapsulations handed to `bpf_redirect_neigh`, not
+  packets delivered. The helper validates only its own arguments -- it returns
+  `TC_ACT_SHOT` solely for `(plen && plen < sizeof(*params)) || flags` -- then
+  records the target ifindex and returns `TC_ACT_REDIRECT`. Both call sites
+  pass `plen == 0` and `flags == 0`, which is exactly the shape that condition
+  can never hold for, so the helper returns `TC_ACT_REDIRECT` unconditionally
+  and a counter keyed on its *return value* would read zero forever. Both
+  uplink completion sites still fail closed on a non-redirect verdict; that
+  `else` arm is unreachable at the current argument shape and exists only as
+  defensive symmetry, so a future call with a nonzero `plen`/`flags` cannot
+  emit an encapsulated frame still carrying the inner route's L2 destination.
+- The redirect *outcome* is nevertheless observable in-program, and
+  `COUNTER_UL_REDIRECT_RESOLVED` reports it. Route lookup and neighbour
+  resolution happen later in `skb_do_redirect()`, but a redirect that succeeds
+  comes back through this same tc egress hook -- `skb_do_redirect()` ->
+  `__bpf_redirect_neigh_v4()` -> `bpf_out_neigh_v4()` -> `neigh_output()` ->
+  `dev_queue_xmit()` -> `sch_handle_egress()` -- while one that finds no route,
+  or a route type that is neither `RTN_UNICAST` nor `RTN_LOCAL`, is
+  `kfree_skb`'d before it gets there, as is one whose link-layer destination is
+  a multicast address, which `__bpf_redirect_neigh()` rejects before the route
+  lookup. An unresolvable neighbour is *not* in that list; it is the lag case
+  below. The uplink program recognizes its own re-emitted outer frame on that
+  second traversal and counts it. Closing issue 564 therefore needs no
+  `bpf_fib_lookup` and no GPL-only helper: the discriminator uses only
+  `bpf_map_lookup_elem` and `bpf_skb_load_bytes`, both already called here and
+  both `gpl_only = false`, and the signal is unaffected by the IPv4 forwarding
+  sysctl that would have made a `bpf_fib_lookup` status ambiguous.
+- The discriminator is what the frame *is*, never a stamp the program writes:
+  `skb->mark` carries the bearer identity and is left alone. A frame is
+  recognized as re-entry only with mark zero, an outer IPv4 or IPv6 UDP/2152
+  GTPv1 G-PDU envelope of exactly the shape this program stamps, and an outer
+  source that is one of the attachment's own local S2b-U endpoints
+  (`GTPU_CONFIG` for the frozen v5 schema, `GTPU_CONFIG6` for grouped
+  attachments, the latter bound to the observed ifindex). No provisioned
+  subscriber can present that source: both schemas reject a UE PAA that aliases
+  the local outer endpoint, so no FAR or grouped selector could have matched it
+  either. The GTP-U message-type check keeps locally originated echo and error
+  indication traffic out of the counter.
+- Three caveats belong to the counter and are documented on the public field.
+  It proves the frame cleared FIB and neighbour resolution and reached
+  `dev_queue_xmit`; it does not prove the peer received it, so a later qdisc,
+  driver, or on-wire loss is still unobservable here. An unresolved neighbour
+  lags rather than reads wrong: the skb waits in the neighbour's `arp_queue`
+  and is counted late if resolution eventually succeeds, never if it does not.
+  And the counter is unauthenticated: because the discriminator is the frame
+  itself, any locally originated packet sourced from this attachment's own
+  S2b-U endpoint to UDP/2152 with a GTPv1 G-PDU header increments it too, and
+  an unprivileged co-located process can send one. Only the counter is
+  affected -- no forwarding decision reads it -- and tightening cannot close
+  it, because every discriminator available in-program is in-band and so
+  forgeable by a local sender. Stamping `skb->mark` to make the frame
+  self-identifying is refused on separate grounds: that field carries bearer
+  identity and this boundary owns all 32 bits of it.
 - It does not load itself, manage bpffs pins, manage sessions, or implement
   product policy; those live in the userspace backend.
 
