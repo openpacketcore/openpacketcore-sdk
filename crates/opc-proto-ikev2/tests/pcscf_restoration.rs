@@ -947,3 +947,74 @@ fn correlation_rejects_a_reply_read_on_different_types_than_requested() {
         })
     );
 }
+
+#[test]
+fn only_the_registered_or_private_use_code_points_are_available() {
+    // The registered space below 20/21 names unrelated attributes. Emitting a
+    // P-CSCF address on one has the peer read it as that attribute; decoding
+    // on one reads an unrelated attribute as a P-CSCF echo.
+    for squatted in [0u16, 1, 3, 8, 10, 19, 22] {
+        assert_eq!(
+            Ikev2PcscfAttributeTypes::new(squatted, PRIVATE_USE_P_CSCF_IP6),
+            Err(Ikev2PcscfRestorationError::AttributeTypeNotAvailable {
+                attribute_type: squatted,
+                registered: P_CSCF_IP4_ADDRESS,
+            }),
+            "type {squatted} must not be claimable"
+        );
+    }
+    // Unassigned code points are reserved for future expert-review allocation.
+    for unassigned in [23u16, 1_000, 16_383] {
+        assert!(matches!(
+            Ikev2PcscfAttributeTypes::new(PRIVATE_USE_P_CSCF_IP4, unassigned),
+            Err(Ikev2PcscfRestorationError::AttributeTypeNotAvailable { .. })
+        ));
+    }
+    // The pair cannot be transposed onto the other family's registered type.
+    assert!(matches!(
+        Ikev2PcscfAttributeTypes::new(P_CSCF_IP6_ADDRESS, P_CSCF_IP4_ADDRESS),
+        Err(Ikev2PcscfRestorationError::AttributeTypeNotAvailable { .. })
+    ));
+
+    // Both ends of the private-use range, and the registered pair, remain fine.
+    must_ok(Ikev2PcscfAttributeTypes::new(16_384, 32_767));
+    must_ok(Ikev2PcscfAttributeTypes::new(
+        P_CSCF_IP4_ADDRESS,
+        PRIVATE_USE_P_CSCF_IP6,
+    ));
+    must_ok(Ikev2PcscfAttributeTypes::new(
+        P_CSCF_IP4_ADDRESS,
+        P_CSCF_IP6_ADDRESS,
+    ));
+}
+
+#[test]
+fn correlation_ignores_the_type_of_a_family_that_was_never_exchanged() {
+    // IPv4-only exchange on the registered type, but the request also names a
+    // private-use IPv6 type it never sends. A reply decoded with the fully
+    // registered pair is byte-identical to a compliant exchange, so the unsent
+    // IPv6 type must not reject it.
+    let mixed = must_ok(Ikev2PcscfAttributeTypes::new(
+        P_CSCF_IP4_ADDRESS,
+        PRIVATE_USE_P_CSCF_IP6,
+    ));
+    let request = must_ok(build_ikev2_pcscf_restoration_request_with_attribute_types(
+        &[Ikev2PcscfRestorationAddress::Ipv4(Ipv4Addr::new(
+            192, 0, 2, 10,
+        ))],
+        mixed,
+    ));
+    let (first_payload, bytes) =
+        configuration_chain(CONFIGURATION_TYPE_REPLY, &[(P_CSCF_IP4_ADDRESS, &[])]);
+    let response = must_ok(decode_ikev2_pcscf_restoration_response(
+        &response_header(7),
+        first_payload,
+        &bytes,
+    ));
+    must_ok(validate_ikev2_pcscf_restoration_response_correlation(
+        &request_header(7),
+        &response_header(7),
+        &request,
+        &response,
+    ));
+}

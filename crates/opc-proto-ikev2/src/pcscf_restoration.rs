@@ -41,6 +41,15 @@ const IKEV2_NOTIFY_STATUS_TYPES_MIN: u16 = 16_384;
 /// 3GPP limit.
 pub const IKEV2_PCSCF_RESTORATION_MAX_ADDRESSES: usize = DecodeContext::conservative().max_ies;
 
+/// First configuration-attribute type reserved for private use.
+///
+/// RFC 7296 3.15.1 reserves 16384-32767. Everything below is either IANA
+/// registered or awaiting expert review, so a caller may not name it here.
+const IKEV2_CONFIGURATION_ATTRIBUTE_PRIVATE_USE_MIN: u16 = 16_384;
+
+/// Last configuration-attribute type reserved for private use.
+const IKEV2_CONFIGURATION_ATTRIBUTE_PRIVATE_USE_MAX: u16 = 32_767;
+
 /// Largest representable configuration-attribute type.
 ///
 /// RFC 7296 3.15.1 reserves the top bit of the attribute-type field, so a type
@@ -85,19 +94,45 @@ impl Ikev2PcscfAttributeTypes {
 
     /// Construct a caller-chosen pair.
     ///
+    /// Each family accepts either its own RFC 7651 4 registered type or a
+    /// RFC 7296 3.15.1 private-use type. Every other code point is refused:
+    /// the registered space below 20/21 names unrelated attributes such as
+    /// `INTERNAL_IP4_ADDRESS` and `INTERNAL_IP4_DNS`, and emitting a P-CSCF
+    /// address on one of those would have the peer interpret it as that
+    /// attribute instead, while decoding on one would read an unrelated
+    /// attribute as a P-CSCF echo. The unassigned range is reserved for
+    /// future expert-review allocation and is refused for the same reason.
+    ///
+    /// This also forbids naming the *other* family's registered type, so the
+    /// pair cannot be transposed.
+    ///
     /// # Errors
     ///
     /// Returns [`Ikev2PcscfRestorationError::AttributeTypeOutOfRange`] if
-    /// either type sets the reserved bit, and
+    /// either type sets the reserved bit,
+    /// [`Ikev2PcscfRestorationError::AttributeTypeNotAvailable`] if either is
+    /// a registered or unassigned code point this procedure may not claim, and
     /// [`Ikev2PcscfRestorationError::AttributeTypesNotDistinct`] if both
     /// families name the same type, which would make a decoded attribute
     /// ambiguous.
     pub fn new(ipv4: u16, ipv6: u16) -> Result<Self, Ikev2PcscfRestorationError> {
-        for attribute_type in [ipv4, ipv6] {
+        for (attribute_type, registered) in [
+            (ipv4, IKEV2_CONFIGURATION_ATTRIBUTE_P_CSCF_IP4_ADDRESS),
+            (ipv6, IKEV2_CONFIGURATION_ATTRIBUTE_P_CSCF_IP6_ADDRESS),
+        ] {
             if attribute_type > IKEV2_CONFIGURATION_ATTRIBUTE_TYPE_MAX {
                 return Err(Ikev2PcscfRestorationError::AttributeTypeOutOfRange {
                     attribute_type,
                     maximum: IKEV2_CONFIGURATION_ATTRIBUTE_TYPE_MAX,
+                });
+            }
+            let private_use = (IKEV2_CONFIGURATION_ATTRIBUTE_PRIVATE_USE_MIN
+                ..=IKEV2_CONFIGURATION_ATTRIBUTE_PRIVATE_USE_MAX)
+                .contains(&attribute_type);
+            if attribute_type != registered && !private_use {
+                return Err(Ikev2PcscfRestorationError::AttributeTypeNotAvailable {
+                    attribute_type,
+                    registered,
                 });
             }
         }
@@ -355,6 +390,17 @@ pub enum Ikev2PcscfRestorationError {
         /// Largest representable type.
         maximum: u16,
     },
+    /// A configuration-attribute type this procedure may not claim.
+    ///
+    /// Only the family's own RFC 7651 4 registered type or an RFC 7296 3.15.1
+    /// private-use type is available; every other code point is registered to
+    /// an unrelated attribute or reserved for future allocation.
+    AttributeTypeNotAvailable {
+        /// Supplied attribute type.
+        attribute_type: u16,
+        /// The registered type for that family.
+        registered: u16,
+    },
     /// Both address families named the same configuration-attribute type.
     AttributeTypesNotDistinct {
         /// The type supplied for both families.
@@ -456,6 +502,9 @@ impl Ikev2PcscfRestorationError {
             Self::AddressListEmpty => "ikev2_pcscf_restoration_address_list_empty",
             Self::AttributeTypeOutOfRange { .. } => {
                 "ikev2_pcscf_restoration_attribute_type_out_of_range"
+            }
+            Self::AttributeTypeNotAvailable { .. } => {
+                "ikev2_pcscf_restoration_attribute_type_not_available"
             }
             Self::AttributeTypesNotDistinct { .. } => {
                 "ikev2_pcscf_restoration_attribute_types_not_distinct"
@@ -834,7 +883,24 @@ pub fn validate_ikev2_pcscf_restoration_response_correlation(
     {
         return Err(Ikev2PcscfRestorationError::ResponseCorrelationMismatch);
     }
-    if request.attribute_types != response.attribute_types {
+    // Compare only the families this exchange actually carried. Comparing the
+    // whole pair would reject an exchange whose octets are byte-identical to a
+    // compliant one, on the strength of a type for a family that was never
+    // sent or echoed.
+    let families = request.address_families;
+    let ipv4_exchanged = matches!(
+        families,
+        Ikev2PcscfRestorationAddressFamilies::Ipv4
+            | Ikev2PcscfRestorationAddressFamilies::DualStack
+    );
+    let ipv6_exchanged = matches!(
+        families,
+        Ikev2PcscfRestorationAddressFamilies::Ipv6
+            | Ikev2PcscfRestorationAddressFamilies::DualStack
+    );
+    if (ipv4_exchanged && request.attribute_types.ipv4() != response.attribute_types.ipv4())
+        || (ipv6_exchanged && request.attribute_types.ipv6() != response.attribute_types.ipv6())
+    {
         return Err(Ikev2PcscfRestorationError::AttributeTypesMismatch {
             expected: request.attribute_types,
             actual: response.attribute_types,
