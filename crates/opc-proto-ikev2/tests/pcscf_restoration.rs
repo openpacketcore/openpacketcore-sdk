@@ -778,9 +778,10 @@ fn response_header_validation_is_strict_and_errors_are_stable() {
 
 /// The private-use types observed from third-party VoWiFi equipment.
 ///
-/// RFC 7296 3.15.1 reserves 16384-32767. Only 16384's role as the IPv4 P-CSCF
-/// request is observed; 16390's is inferred, which is precisely why the crate
-/// takes the pair from the caller rather than adding two more constants.
+/// Private use is 16384-32767 per the IANA IKEv2 Configuration Payload
+/// Attribute Types registry and RFC 4306 3.15.1. Only 16384's role as the IPv4
+/// P-CSCF request is observed; 16390's is inferred, which is precisely why the
+/// crate takes the pair from the caller rather than adding two more constants.
 const PRIVATE_USE_P_CSCF_IP4: u16 = 16_384;
 const PRIVATE_USE_P_CSCF_IP6: u16 = 16_390;
 
@@ -950,10 +951,11 @@ fn correlation_rejects_a_reply_read_on_different_types_than_requested() {
 
 #[test]
 fn only_the_registered_or_private_use_code_points_are_available() {
-    // The registered space below 20/21 names unrelated attributes. Emitting a
-    // P-CSCF address on one has the peer read it as that attribute; decoding
+    // Registered code points name unrelated attributes -- 1 INTERNAL_IP4_ADDRESS,
+    // 3 INTERNAL_IP4_DNS, 22 FTT_KAT, 23 EXTERNAL_SOURCE_IP4_NAT_INFO. Emitting
+    // a P-CSCF address on one has the peer read it as that attribute; decoding
     // on one reads an unrelated attribute as a P-CSCF echo.
-    for squatted in [0u16, 1, 3, 8, 10, 19, 22] {
+    for squatted in [0u16, 1, 3, 8, 10, 19, 22, 23, 24] {
         assert_eq!(
             Ikev2PcscfAttributeTypes::new(squatted, PRIVATE_USE_P_CSCF_IP6),
             Err(Ikev2PcscfRestorationError::AttributeTypeNotAvailable {
@@ -963,8 +965,9 @@ fn only_the_registered_or_private_use_code_points_are_available() {
             "type {squatted} must not be claimable"
         );
     }
-    // Unassigned code points are reserved for future expert-review allocation.
-    for unassigned in [23u16, 1_000, 16_383] {
+    // Unassigned starts at 30 in the IANA registry and runs to 16383; those
+    // code points are reserved for future allocation.
+    for unassigned in [30u16, 1_000, 16_383] {
         assert!(matches!(
             Ikev2PcscfAttributeTypes::new(PRIVATE_USE_P_CSCF_IP4, unassigned),
             Err(Ikev2PcscfRestorationError::AttributeTypeNotAvailable { .. })

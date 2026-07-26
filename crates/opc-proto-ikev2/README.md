@@ -136,8 +136,8 @@ evidence, or a production ePDG control-plane stack.
   address in exact order, including repeated entries, and encodes its exact RFC
   7651 value. The configuration-attribute types default to the RFC 7651
   registered pair 20/21; `Ikev2PcscfAttributeTypes` lets a caller name a
-  private-use pair instead, for peers that negotiate P-CSCF on RFC 7296
-  §3.15.1 private-use types rather than on 20/21. Each family accepts only its
+  private-use pair instead, for peers that negotiate P-CSCF on private-use
+  types (16384-32767) rather than on 20/21. Each family accepts only its
   own registered type or a private-use type, so the procedure cannot squat on
   an unrelated registered attribute or on an unassigned code point. Its strict opened-reply decoder rejects absent, repeated, or
   valued known P-CSCF attributes while retaining unsupported Configuration

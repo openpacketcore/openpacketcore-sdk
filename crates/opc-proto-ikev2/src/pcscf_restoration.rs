@@ -43,8 +43,11 @@ pub const IKEV2_PCSCF_RESTORATION_MAX_ADDRESSES: usize = DecodeContext::conserva
 
 /// First configuration-attribute type reserved for private use.
 ///
-/// RFC 7296 3.15.1 reserves 16384-32767. Everything below is either IANA
-/// registered or awaiting expert review, so a caller may not name it here.
+/// RFC 4306 3.15.1 states "Values 16384-32767 are for private use among
+/// mutually consenting parties", and the IANA IKEv2 Configuration Payload
+/// Attribute Types registry records the same split. RFC 7296 obsoleted RFC
+/// 4306 and defers the ranges to that registry rather than restating them.
+/// Everything below is registered or unassigned, so a caller may not name it.
 const IKEV2_CONFIGURATION_ATTRIBUTE_PRIVATE_USE_MIN: u16 = 16_384;
 
 /// Last configuration-attribute type reserved for private use.
@@ -53,8 +56,8 @@ const IKEV2_CONFIGURATION_ATTRIBUTE_PRIVATE_USE_MAX: u16 = 32_767;
 /// Largest representable configuration-attribute type.
 ///
 /// RFC 7296 3.15.1 reserves the top bit of the attribute-type field, so a type
-/// is fourteen significant bits plus one; `ike_auth` masks received types with
-/// the same value.
+/// is fifteen significant bits; `ike_auth` masks received types with the same
+/// value.
 const IKEV2_CONFIGURATION_ATTRIBUTE_TYPE_MAX: u16 = 0x7fff;
 
 /// The configuration-attribute types carrying a P-CSCF address.
@@ -62,8 +65,9 @@ const IKEV2_CONFIGURATION_ATTRIBUTE_TYPE_MAX: u16 = 0x7fff;
 /// RFC 7651 4 registers `P_CSCF_IP4_ADDRESS = 20` and `P_CSCF_IP6_ADDRESS =
 /// 21`, and those remain the default. That registration is dated September
 /// 2015 and deployed equipment predates it: RFC 7296 3.15.1 reserves
-/// 16384-32767 for private use, RFC 7651 4 itself notes that "some
-/// implementations" already used private-use values, and peers are observed
+/// 16384-32767 for private use (RFC 4306 3.15.1, and the IANA registry), RFC
+/// 7651 4 itself notes that "some implementations" already used private-use
+/// values, and peers are observed
 /// negotiating P-CSCF on a private-use type with type 20 absent in both
 /// directions.
 ///
@@ -95,7 +99,8 @@ impl Ikev2PcscfAttributeTypes {
     /// Construct a caller-chosen pair.
     ///
     /// Each family accepts either its own RFC 7651 4 registered type or a
-    /// RFC 7296 3.15.1 private-use type. Every other code point is refused:
+    /// private-use type (16384-32767, per the IANA IKEv2 Configuration Payload
+    /// Attribute Types registry and RFC 4306 3.15.1). Every other code point is refused:
     /// the registered space below 20/21 names unrelated attributes such as
     /// `INTERNAL_IP4_ADDRESS` and `INTERNAL_IP4_DNS`, and emitting a P-CSCF
     /// address on one of those would have the peer interpret it as that
@@ -392,9 +397,9 @@ pub enum Ikev2PcscfRestorationError {
     },
     /// A configuration-attribute type this procedure may not claim.
     ///
-    /// Only the family's own RFC 7651 4 registered type or an RFC 7296 3.15.1
-    /// private-use type is available; every other code point is registered to
-    /// an unrelated attribute or reserved for future allocation.
+    /// Only the family's own RFC 7651 4 registered type or a private-use type
+    /// is available; every other code point is registered to an unrelated
+    /// attribute or is unassigned.
     AttributeTypeNotAvailable {
         /// Supplied attribute type.
         attribute_type: u16,
