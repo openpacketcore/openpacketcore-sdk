@@ -26,6 +26,7 @@ pub use crate::header::MessageType;
 use crate::ie::typed::{
     decode_pgw_triggered_request_ie_sequence_with_evidence,
     decode_s2b_receive_ie_sequence_with_evidence, decode_typed_ie_sequence_with_evidence,
+    MalformedOptionalIePolicy,
 };
 use crate::ie::{
     encode_typed_ie_sequence, AccessPointName, AdditionalProtocolConfigurationOptions,
@@ -3547,6 +3548,16 @@ impl<'a> S2bMessage<'a> {
             message_type.as_u8(),
             CREATE_BEARER_REQUEST | UPDATE_BEARER_REQUEST | DELETE_BEARER_REQUEST
         );
+        // TS 29.274 clauses 7.7.7 and 7.7.8 bind "the receiver of a GTP
+        // signalling message": a malformed optional IE is discarded and the
+        // rest of the message is processed. Canonical builder validation is
+        // the sender side of the same codec and keeps rejecting, because the
+        // malformed octets are already in the message being built -- silently
+        // dropping the IE from the typed view would emit them anyway.
+        let malformed_optional = match purpose {
+            S2bDecodePurpose::Receive => MalformedOptionalIePolicy::Discard,
+            S2bDecodePurpose::CanonicalBuilder => MalformedOptionalIePolicy::Reject,
+        };
         let decoded_ies = if is_procedure_aware(ctx.validation_level)
             && matches!(purpose, S2bDecodePurpose::Receive)
         {
@@ -3578,9 +3589,18 @@ impl<'a> S2bMessage<'a> {
                 &repeatable_limit,
             )?
         } else if pgw_triggered_request {
-            decode_pgw_triggered_request_ie_sequence_with_evidence(message.raw_ies, typed_ctx)?
+            decode_pgw_triggered_request_ie_sequence_with_evidence(
+                message.raw_ies,
+                typed_ctx,
+                malformed_optional,
+            )?
         } else {
-            decode_typed_ie_sequence_with_evidence(message.raw_ies, typed_ctx, 0)?
+            decode_typed_ie_sequence_with_evidence(
+                message.raw_ies,
+                typed_ctx,
+                0,
+                malformed_optional,
+            )?
         };
         let view = S2bProcedureMessage {
             header: message.header,

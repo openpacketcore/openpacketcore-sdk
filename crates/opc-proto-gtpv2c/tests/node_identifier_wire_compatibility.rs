@@ -68,14 +68,20 @@ const BLOCK_A_DIGEST: u64 = 10_922_305_812_464_877_325;
 
 /// Digest of the ordered Block B `(label, outcome)` list. This is where the
 /// IE 176 canonical-encode deltas live: spare-nibble zeroing, Extendable
-/// suffix stripping, the clause 7.7.9 instance discard, and the malformed
-/// value rejections. Regenerate under the same discipline as `BLOCK_A_DIGEST`.
-const BLOCK_B_DIGEST: u64 = 18_711_988_404_069_871;
+/// suffix stripping, the clause 7.7.9 instance discard, and the clause 7.7.8
+/// malformed-value discard. Regenerate under the same discipline as
+/// `BLOCK_A_DIGEST`.
+const BLOCK_B_DIGEST: u64 = 3_768_305_719_507_037_689;
 
 /// Injection points whose carrier actually decodes, and whose raw-preserving
 /// re-encode is therefore checkable. Pinned exactly so a change that made most
 /// points fail decode cannot quietly shrink the guard.
-const RAW_PRESERVING_CHECKED_POINTS: usize = 2178;
+///
+/// This rose from 2178 when malformed IE 176 values stopped failing the
+/// decode: 165 raw-preserving points became reachable, which is exactly the
+/// half of the clause 7.7.8 discard that says the untouched octets must still
+/// be there.
+const RAW_PRESERVING_CHECKED_POINTS: usize = 2343;
 
 fn fixture_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
@@ -372,9 +378,9 @@ fn encoder_point_space_is_closed_and_its_outcomes_are_pinned() {
     );
 }
 
-/// The three canonical-encode deltas the CHANGELOG and CONFORMANCE entries
-/// claim, read back out of the harness itself so a harness that stopped
-/// recording real outcomes cannot satisfy them.
+/// The canonical-encode deltas the CHANGELOG and CONFORMANCE entries claim,
+/// read back out of the harness itself so a harness that stopped recording real
+/// outcomes cannot satisfy them.
 #[test]
 fn recorded_outcomes_match_the_documented_canonical_deltas() {
     let points = enumerate_points();
@@ -423,18 +429,51 @@ fn recorded_outcomes_match_the_documented_canonical_deltas() {
         "an unlisted instance survived canonical re-encoding: {unlisted}"
     );
 
-    // A malformed instance-0 value fails the whole decode, which is the
-    // deliberate clause 7.7.8 divergence.
+    // TLIV of the injected malformed IE: type 0xb0, length 0x0008, spare 0 /
+    // instance 0, then a Node Name length of 9 inside an eight-octet value.
+    // One nibble apart from `CANONICAL_IE`, which is the well-formed pair.
+    const MALFORMED_IE: &str = "b000080009616161036f7267";
+
+    // Clause 7.7.8: a malformed *optional* IE is discarded and the rest of the
+    // message is processed as if it was absent. The canonical re-encode is
+    // therefore byte-identical to the same carrier decoded with no IE 176 at
+    // all -- the Block A point for the bare fixture -- which is a far stronger
+    // claim than "the decode returned ok".
+    let malformed_zero = outcome(
+        "B|node_identifier_176|spare0|inst0|name_length_overruns_value|procedure_aware|canonical",
+    );
+    let bare_carrier = outcome(&format!(
+        "A|{INJECTION_CARRIER}|procedure_aware|canonical|s2b"
+    ));
+    assert!(
+        bare_carrier.starts_with("ok:"),
+        "the bare carrier must encode for the comparison to mean anything: {bare_carrier}"
+    );
     assert_eq!(
-        outcome("B|node_identifier_176|spare0|inst0|name_length_overruns_value|procedure_aware|canonical"),
-        "decode_err:Truncated"
+        malformed_zero, bare_carrier,
+        "a malformed instance-0 Node Identifier was not treated as absent"
+    );
+    assert!(
+        !malformed_zero.contains(MALFORMED_IE),
+        "the discarded IE survived canonical re-encoding: {malformed_zero}"
     );
 
-    // The same malformed value at an unlisted instance is discarded first.
+    // The same discard leaves the received octets alone: raw-preserving encode
+    // blits the parsed region, so the malformed IE is still there byte-exact.
+    let preserved = outcome(
+        "B|node_identifier_176|spare0|inst0|name_length_overruns_value|procedure_aware|raw_preserving",
+    );
     assert!(
-        outcome("B|node_identifier_176|spare0|inst5|name_length_overruns_value|procedure_aware|canonical")
-            .starts_with("ok:"),
-        "clause 7.7.9 disposition must precede typing"
+        preserved.contains(MALFORMED_IE),
+        "raw-preserving encode dropped the discarded IE's octets: {preserved}"
+    );
+
+    // The same malformed value at an unlisted instance reaches the same
+    // disposition by the earlier clause 7.7.9 route, before the value is typed.
+    assert_eq!(
+        outcome("B|node_identifier_176|spare0|inst5|name_length_overruns_value|procedure_aware|canonical"),
+        bare_carrier,
+        "clause 7.7.9 disposition must precede typing and reach the same result"
     );
 }
 

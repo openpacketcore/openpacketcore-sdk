@@ -420,8 +420,8 @@ coverage.
      emits only the understood prefix with spare bits zero; raw-preserving
      message encoding retains accepted extension octets and spare bits.
    - Node Identifier (clause 8.107) decodes the one-octet-length-prefixed Node
-     Name and Node Realm pair and rejects a declared subfield length that runs
-     past the end of the IE value, or an absent length octet, as `Truncated`.
+     Name and Node Realm pair and detects a declared subfield length that runs
+     past the end of the IE value, or an absent length octet.
      Both subfields stay byte-transparent: clause 8.107 states no charset and
      delegates to Diameter Identity, whose ASCII constraint binds the sender.
      Either subfield may be empty, because clause 8.107 requires a non-zero
@@ -434,49 +434,58 @@ coverage.
      validated `NodeIdentifier::new` constructor bounds each subfield to the
      255 octets its length field can express, so encoding is infallible and
      performs no truncating cast.
-   - Deliberate divergence from clauses 7.7.7 and 7.7.8. Two clauses govern a
-     malformed optional IE and both direct discard-and-continue. Clause 7.7.7
-     is the one that governs a length inconsistency in an Extendable IE and it
-     also names the Cause a conformant stack must use: "If the received value
-     of the Length field and the actual length of the extendable length IE are
-     consistent, but the length is less than the number of fixed octets defined
-     for that IE, preceding the extended field(s), this shall be considered an
-     error, IE shall be discarded and if the IE was received as a Mandatory IE
-     or a verifiable Conditional IE in a Request message, an appropriate error
-     response with Cause IE value set to "Invalid length" together with the
-     type and instance of the offending IE shall be returned to the sender."
-     Clause 7.7.8 directs a receiver of an optional IE to "discard this IE, but
-     shall treat the rest of the message as if this IE was absent and continue
-     processing", and adds that "All semantically incorrect optional
-     information elements in a GTP signalling message shall be treated as not
-     present in the message." This crate is a codec, not a stack, and instead
-     surfaces every malformed typed IE as a `DecodeError` carrying an absolute
-     offset and spec reference, uniformly across Cause, F-TEID, PAA, TWAN
-     Identifier, and Node Identifier. The clause 7.7.7/7.7.8 decision to
-     continue belongs to the caller; `error_response` is the layer at which a
-     caller turns a decode failure into a Cause.
-   - That exception is visible, not consistent. The crate states a contrary
-     selection rule of its own in `pco.rs`: "TS 24.008 10.5.6.3 is explicit
-     that a container whose contents length is not two 'shall be ignored by the
-     receiver', so a malformed instance is skipped rather than rejecting the
-     whole value. That is deliberately unlike the address containers, for which
-     the specification states no such rule and this codec fails closed."
-     Clauses 7.7.7 and 7.7.8 do state such a rule and do name
-     the receiver, so by the crate's own written criterion IE 176 belongs in
-     the skip bucket. It is placed in the fail-closed bucket anyway, for
-     uniformity with the typed-IE layer.
-   - The divergence is not scoped to where Table 7.2.1-1 lists the IE. Typed
-     decode dispatches on IE type alone, and the clause 7.7.9 receive filter
-     runs only at `ValidationLevel::ProcedureAware` on a receive decode. A
-     malformed Node Identifier therefore fails the whole `S2bMessage::decode`
-     at every validation level, in every message type this crate models, at
-     every instance 0-15, and nested inside a Bearer Context. Only at
-     `ProcedureAware` does the instance filter bound the surface to instance 0.
-   - Raw-preserving encoding does not rescue a failed decode. The failure is at
-     decode, so `EncodeContext { raw_preserving: true }` never runs. The
-     lower-level `Message` raw-preserving view stays byte-exact; a caller
-     wanting clause 7.7.8 semantics must decode at the `Message` layer and
-     forgo the S2b typed projection.
+   - A malformed Node Identifier is discarded, not rejected, per clauses 7.7.7
+     and 7.7.8. Both clauses split receiver behaviour on the IE's *presence*.
+     Clause 7.7.7 governs a length inconsistency in an Extendable IE: "If the
+     received value of the Length field and the actual length of the extendable
+     length IE are consistent, but the length is less than the number of fixed
+     octets defined for that IE, preceding the extended field(s), this shall be
+     considered an error, IE shall be discarded and if the IE was received as a
+     Mandatory IE or a verifiable Conditional IE in a Request message, an
+     appropriate error response with Cause IE value set to "Invalid length"
+     together with the type and instance of the offending IE shall be returned
+     to the sender." Clause 7.7.8 governs the optional case: the receiver
+     "shall discard this IE, but shall treat the rest of the message as if this
+     IE was absent and continue processing", and "All semantically incorrect
+     optional information elements in a GTP signalling message shall be treated
+     as not present in the message." Table 7.2.1-1 lists Node Identifier with
+     presence O, so the receiver rule is discard-and-continue and the "Invalid
+     length" response clause 7.7.7 names is not owed. Cause, F-TEID, PAA, EBI,
+     Bearer Context, and the other typed IEs that are Mandatory or Conditional
+     where this profile receives them continue to fail the decode, which is the
+     same two clauses applied to the other side of the same split;
+     `error_response` remains the layer at which a caller turns such a failure
+     into a Cause.
+   - This is what the crate's own written selection rule picks. `pco.rs`
+     states it: "TS 24.008 10.5.6.3 is explicit that a container whose contents
+     length is not two 'shall be ignored by the receiver', so a malformed
+     instance is skipped rather than rejecting the whole value. That is
+     deliberately unlike the address containers, for which the specification
+     states no such rule and this codec fails closed." Clauses 7.7.7 and 7.7.8
+     do state such a rule and do name the receiver, so IE 176 belongs in the
+     skip bucket and is in it.
+   - The discard is uniform across the decode surface. Typed decode dispatches
+     on IE type alone, so the disposition holds at every validation level
+     (`Structural`, `Strict`, `ProcedureAware`), in every message type this
+     crate models, at every instance 0-15, and nested inside a Bearer Context.
+     At `ProcedureAware` an instance other than 0 is discarded even earlier, by
+     the clause 7.7.9 receive filter, so both routes reach the same result.
+     `Strict` is not an opt-in stricter-than-TS-29.274 mode: it enforces field
+     cardinality and enum ranges, and for an optional IE clause 7.7.8 *is* the
+     range rule and it says discard.
+   - Discard means the IE is absent from the typed view, exactly as for a
+     clause 7.7.9 instance discard, and is not reported through
+     `S2bReceiveDiagnostics` — that surface carries duplicate-IE evidence only,
+     and clause 7.7.8 requires no log for the optional case. The received
+     octets are untouched: the raw-preserving `Message` view and
+     `EncodeContext { raw_preserving: true }` still reproduce the malformed IE
+     byte-exact, which is now observable because the decode succeeds.
+   - The rule is a *receiver* rule and is applied as one. Both clauses open on
+     "the receiver of a GTP signalling message". The canonical builder's
+     sender-side self-check (`S2bDecodePurpose::CanonicalBuilder`) therefore
+     keeps rejecting: a caller-supplied raw IE 176 with a malformed value is a
+     build failure, because the octets are already in the message being built
+     and discarding the IE from the typed view would emit them anyway.
    - Top-level and grouped typed IE sequences enforce
      `DecodeContext::duplicate_ie_policy` by IE type and instance.
    - Unsupported/private/future IEs outside the typed subset are omitted,

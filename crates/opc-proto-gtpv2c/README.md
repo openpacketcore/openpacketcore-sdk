@@ -31,8 +31,13 @@ control-plane stack.
   Diameter Identity pair, which S2b carries as the Table 7.2.1-1 3GPP AAA
   Server Identifier. Its validated `NodeIdentifier::new` bounds each subfield
   to the 255 octets its one-octet length field can express, so encoding is
-  infallible; decode rejects a subfield length that overruns the IE value, and
-  `Debug` reports only subfield lengths.
+  infallible; decode detects a subfield length that overruns the IE value, and
+  `Debug` reports only subfield lengths. Because Table 7.2.1-1 gives the IE
+  presence O, such a value is discarded and the rest of the message is
+  processed as if the IE were absent, per TS 29.274 clauses 7.7.7 and 7.7.8;
+  the received octets stay byte-exact under raw-preserving encode. The request
+  builders' sender-side validation still rejects a caller-supplied raw IE 176
+  whose value is malformed, because those clauses bind the receiver.
   Their Extendable IE decoders retain the
   known Release 18 prefix while raw-preserving message encode retains accepted
   later-release suffixes; canonical encode emits only understood fields and

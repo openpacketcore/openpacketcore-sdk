@@ -98,7 +98,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     to the 255 octets their one-octet length fields can express; encoding is
     therefore infallible and performs no truncating cast. A declared subfield
     length that runs past the end of the IE value, or an absent length octet,
-    is now a `Truncated` decode error rather than an opaque preserved IE.
+    is now detected rather than surfacing as an opaque preserved IE; per
+    clauses 7.7.7 and 7.7.8 the IE is then discarded, as described below.
+    `TypedIe::decode_from_raw`, the single-IE conversion that by contract
+    cannot represent a deliberate omission, still returns `Truncated`.
   - Both subfields are octets, not `String`. Clause 8.107 states no charset and
     delegates to Diameter Identity, whose ASCII constraint lives in the
     Diameter base protocol and binds the sender; a receiver that rejected
@@ -127,53 +130,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     clause 7.3 S3/S10/S16 mobility tables, which this profile does not model,
     and Table 7.2.2-1 does not carry the IE at all -- so no rule was added
     "for symmetry".
-  - Divergence from clauses 7.7.7 and 7.7.8, stated deliberately. Two clauses
-    govern. Clause 7.7.7 covers the length case directly: "If the received
-    value of the Length field and the actual length of the extendable length IE
-    are consistent, but the length is less than the number of fixed octets
-    defined for that IE, preceding the extended field(s), this shall be
-    considered an error, IE shall be discarded and if the IE was received as a
-    Mandatory IE or a verifiable Conditional IE in a Request message, an
-    appropriate error response with Cause IE value set to "Invalid length"
-    together with the type and instance of the offending IE shall be returned
-    to the sender." Clause 7.7.8 covers the optional case: a receiver "shall
-    discard this IE, but shall treat the rest of the message as if this IE was
-    absent and continue processing", and "All semantically incorrect optional
-    information elements in a GTP signalling message shall be treated as not
-    present in the message." Table 7.2.1-1 gives IE 176 presence O, so under
-    both clauses a conformant stack discards the IE and continues; the
-    "Invalid length" error response clause 7.7.7 names is conditioned on the
-    offending IE being Mandatory or verifiable Conditional, which this one is
-    not on this message. This crate instead surfaces a malformed
-    typed IE as a `DecodeError` and lets the caller decide, exactly as it
-    already does for Cause, F-TEID, PAA, and TWAN Identifier. That pre-existing
-    crate-wide contract was kept rather than special-casing one IE.
-    - Note this is *not* what the crate's own written selection rule would
-      pick. `pco.rs` states that a container the specification explicitly tells
-      the receiver to ignore is skipped rather than rejecting the whole value,
-      "deliberately unlike the address containers, for which the specification
-      states no such rule and this codec fails closed". Here the specification
-      does state the rule and does name the receiver, so IE 176 is a
-      deliberate exception to that criterion, taken for uniformity with the
-      typed-IE layer.
-    - Blast radius, measured rather than assumed. Typed decode dispatches on IE
-      type alone, and the clause 7.7.9 receive filter runs only at
-      `ValidationLevel::ProcedureAware`. A malformed IE 176 therefore fails the
-      whole `S2bMessage::decode` at every validation level, in every GTPv2-C
-      message type this crate models, at every instance 0-15, and nested inside
-      a Bearer Context -- not only at the Create Session Request instance-0
-      slot Table 7.2.1-1 lists. In this crate's committed encoder differential
-      (`tests/node_identifier_wire_compatibility.rs`, 7520 points, which
-      exercises `Structural` and `ProcedureAware`), 330 points changed from a
-      successful decode to `Truncated`: 10 at `ProcedureAware` and 320 at
-      `Structural`. Only at `ProcedureAware` does the instance filter bound the
-      surface to instance 0; `tests/node_identifier.rs` pins the rest.
-    - Raw-preserving encoding does not rescue a failed decode: the failure is
-      at decode. The lower-level `Message` view still yields the bytes
-      byte-exact, but `S2bMessage::decode` itself fails, so a caller wanting
-      clause 7.7.8 semantics must decode at the `Message` layer and forgo the
-      S2b typed projection. `error_response` remains the layer at which a
-      caller turns a decode failure into a Cause.
+  - A malformed value is discarded and the rest of the message is processed,
+    per clauses 7.7.7 and 7.7.8. Two clauses govern, and both split receiver
+    behaviour on the IE's *presence*. Clause 7.7.7 covers the length case
+    directly: "If the received value of the Length field and the actual length
+    of the extendable length IE are consistent, but the length is less than the
+    number of fixed octets defined for that IE, preceding the extended
+    field(s), this shall be considered an error, IE shall be discarded and if
+    the IE was received as a Mandatory IE or a verifiable Conditional IE in a
+    Request message, an appropriate error response with Cause IE value set to
+    "Invalid length" together with the type and instance of the offending IE
+    shall be returned to the sender." Clause 7.7.8 covers the optional case: a
+    receiver "shall discard this IE, but shall treat the rest of the message as
+    if this IE was absent and continue processing", and "All semantically
+    incorrect optional information elements in a GTP signalling message shall
+    be treated as not present in the message." Table 7.2.1-1 gives IE 176
+    presence O, so the receiver rule is discard-and-continue, and the "Invalid
+    length" response clause 7.7.7 names is conditioned on the offending IE
+    being Mandatory or verifiable Conditional, which this one is not.
+    - This is what the crate's own written selection rule picks. `pco.rs`
+      states that a container the specification explicitly tells the receiver
+      to ignore is skipped rather than rejecting the whole value, "deliberately
+      unlike the address containers, for which the specification states no such
+      rule and this codec fails closed". Clauses 7.7.7 and 7.7.8 do state the
+      rule and do name the receiver, so IE 176 goes in the skip bucket.
+    - Handling an optional IE differently from a mandatory one is the
+      specification's own rule, not a special case for IE 176. Cause, F-TEID,
+      PAA, EBI, Bearer Context, and the other typed IEs that are Mandatory or
+      Conditional where this profile receives them still fail the whole decode,
+      which is the same two clauses applied to the other side of the split;
+      `error_response` remains the layer at which a caller turns such a failure
+      into a Cause.
+    - The discard is uniform across the decode surface, because typed decode
+      dispatches on IE type alone: it holds at every validation level
+      (`Structural`, `Strict`, `ProcedureAware`), in every GTPv2-C message type
+      this crate models, at every instance 0-15, and nested inside a Bearer
+      Context. At `ProcedureAware` an instance other than 0 is discarded even
+      earlier, by the clause 7.7.9 receive filter, so both routes agree.
+      `Strict` is not an opt-in stricter-than-TS-29.274 mode: it enforces enum
+      ranges and cardinality, and for an optional IE clause 7.7.8 *is* the
+      range rule and it says discard. Two peer-controlled octets in an optional
+      IE therefore no longer cost the whole message.
+    - "Discard" means the IE is absent from the typed view, exactly as for a
+      clause 7.7.9 instance discard, and is not reported through
+      `S2bReceiveDiagnostics`, which carries duplicate-IE evidence only.
+      Clause 7.7.8 requires no log for the optional case.
+    - The received octets are untouched. The raw-preserving `Message` view and
+      `EncodeContext { raw_preserving: true }` still reproduce the malformed IE
+      byte-exact, which is now observable at the S2b layer at all because the
+      decode succeeds. Across the committed 7520-point encoder differential,
+      raw-preserving encoding is byte-identical to the pre-IE-176 crate at
+      every one of its points.
+    - It is a *receiver* rule and is applied as one. Both clauses open on "the
+      receiver of a GTP signalling message", so the builders' sender-side
+      self-check still rejects a caller-supplied raw IE 176 whose value is
+      malformed: those octets are already in the message being built, and
+      dropping the IE from the typed view would emit them anyway.
   - Migration: `TypedIeValue` gains a `NodeIdentifier` variant, so an
     exhaustive `match` over it must add an arm. More consequentially, admitting
     176 into the receive grammar also narrows the sender profile, because the
@@ -190,6 +202,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     understood Release 18 prefix with the spare nibble zeroed, as stated above;
     raw-preserving encoding is byte-exact in every case a message decodes at
     all.
+  - Wire effect, measured. The committed encoder differential
+    (`tests/node_identifier_wire_compatibility.rs`) enumerates 7520 points:
+    480 covering every committed fixture across both decode surfaces, all three
+    validation levels, and both encode modes, plus a 7040-point IE injection
+    grid. Against the crate before this entry, 443 points change, every one of
+    them an IE 176 row and every one of them in canonical encode mode: 165
+    clause 7.7.9 instance discards, 165 clause 7.7.8 malformed-value discards,
+    96 spare-nibble zeroings, and 17 Extendable-suffix strippings. Zero points
+    change in raw-preserving mode and zero change on any committed fixture, so
+    no message that already round-tripped moves on the wire.
 
 ### Fixed
 - **P-CSCF Re-selection support is no longer emittable on its own --
