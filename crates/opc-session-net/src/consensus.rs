@@ -3066,8 +3066,12 @@ mod tests {
 
     use opc_session_store::{
         QuorumReplicaDescriptor, ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain,
-        ReplicaTlsIdentity, SessionConsensusClusterId, SessionConsensusRpcFamily, SessionOp,
-        SessionTopologyTransitionId, SessionTopologyTransitionRequest,
+        ReplicaTlsIdentity, SessionConsensusRpcFamily, SessionOp,
+    };
+    // Used only by the plaintext-transport tests below.
+    #[cfg(feature = "insecure-test")]
+    use opc_session_store::{
+        SessionConsensusClusterId, SessionTopologyTransitionId, SessionTopologyTransitionRequest,
     };
     use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
     use tokio::sync::Notify;
@@ -3096,6 +3100,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "insecure-test")]
     #[derive(Debug)]
     struct CancellationUnsafeQueuedHandler {
         queued: Arc<Notify>,
@@ -3103,6 +3108,7 @@ mod tests {
         core_completed: Arc<Notify>,
     }
 
+    #[cfg(feature = "insecure-test")]
     impl CancellationUnsafeQueuedHandler {
         fn new() -> Self {
             Self {
@@ -3114,6 +3120,7 @@ mod tests {
     }
 
     #[async_trait]
+    #[cfg(feature = "insecure-test")]
     impl SessionConsensusRpcHandler for CancellationUnsafeQueuedHandler {
         async fn handle(
             &self,
@@ -3213,6 +3220,7 @@ mod tests {
         (server, client)
     }
 
+    #[cfg(feature = "insecure-test")]
     fn membership_manifest(epoch: u64, members: &[u16]) -> Arc<SessionReplicationManifest> {
         Arc::new(
             SessionReplicationManifest::try_new_with_epoch(
@@ -3225,6 +3233,7 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "insecure-test")]
     fn membership_transition_request(
         transition_id: SessionTopologyTransitionId,
         expected_epoch: u64,
@@ -3539,6 +3548,7 @@ mod tests {
         assert!(dispatched.is_empty());
     }
 
+    #[cfg(feature = "insecure-test")]
     #[tokio::test(start_paused = true)]
     async fn unproven_cached_lane_does_not_clear_shared_reconnect_cooldown() {
         let (_server_binding, client_binding) = bindings();
@@ -3595,6 +3605,7 @@ mod tests {
         waiting.await.expect("reconnect admission task").succeeded();
     }
 
+    #[cfg(feature = "insecure-test")]
     #[tokio::test(start_paused = true)]
     async fn cached_consensus_lane_honors_material_rotation_jitter_before_retirement() {
         let (_server_binding, client_binding) = bindings();
@@ -3651,6 +3662,7 @@ mod tests {
         assert!(!peer.connection_is_current(&mut connection, tokio::time::Instant::now()));
     }
 
+    #[cfg(feature = "insecure-test")]
     #[tokio::test(start_paused = true)]
     async fn cached_consensus_lane_retires_immediately_for_explicit_reauthentication() {
         let (_server_binding, client_binding) = bindings();
@@ -4682,6 +4694,7 @@ mod tests {
         handle.abort_and_wait().await;
     }
 
+    #[cfg(feature = "insecure-test")]
     #[tokio::test]
     async fn live_server_fences_cached_predecessor_application_calls_at_joint_proof() {
         let current = membership_manifest(1, &[1, 2, 3]);
@@ -4867,6 +4880,7 @@ mod tests {
         handle.abort_and_wait().await;
     }
 
+    #[cfg(feature = "insecure-test")]
     #[tokio::test]
     async fn timed_out_cancellation_unsafe_handler_keeps_old_scope_leased_until_core_completion() {
         let current = membership_manifest(1, &[1, 2, 3]);
