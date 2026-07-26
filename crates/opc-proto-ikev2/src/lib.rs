@@ -270,11 +270,16 @@ pub use payload::{
     RawPayloadIterator, GENERIC_PAYLOAD_HEADER_LEN,
 };
 pub use pcscf_restoration::{
-    build_ikev2_pcscf_restoration_request, decode_ikev2_pcscf_restoration_response,
+    build_ikev2_pcscf_restoration_request,
+    build_ikev2_pcscf_restoration_request_with_attribute_types,
+    decode_ikev2_pcscf_restoration_response,
+    decode_ikev2_pcscf_restoration_response_with_attribute_types,
     decode_ikev2_pcscf_restoration_response_with_context,
-    validate_ikev2_pcscf_restoration_response_correlation, Ikev2PcscfRestorationAddress,
-    Ikev2PcscfRestorationAddressFamilies, Ikev2PcscfRestorationError, Ikev2PcscfRestorationRequest,
-    Ikev2PcscfRestorationResponse, IKEV2_PCSCF_RESTORATION_MAX_ADDRESSES,
+    decode_ikev2_pcscf_restoration_response_with_context_and_attribute_types,
+    validate_ikev2_pcscf_restoration_response_correlation, Ikev2PcscfAttributeTypes,
+    Ikev2PcscfRestorationAddress, Ikev2PcscfRestorationAddressFamilies, Ikev2PcscfRestorationError,
+    Ikev2PcscfRestorationRequest, Ikev2PcscfRestorationResponse,
+    IKEV2_PCSCF_RESTORATION_MAX_ADDRESSES,
 };
 pub use pre_admission::{
     inspect_ikev2_signature_key_pkcs8_der, Ikev2PreAdmissionInspectionError,

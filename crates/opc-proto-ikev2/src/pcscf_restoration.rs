@@ -41,6 +41,87 @@ const IKEV2_NOTIFY_STATUS_TYPES_MIN: u16 = 16_384;
 /// 3GPP limit.
 pub const IKEV2_PCSCF_RESTORATION_MAX_ADDRESSES: usize = DecodeContext::conservative().max_ies;
 
+/// Largest representable configuration-attribute type.
+///
+/// RFC 7296 3.15.1 reserves the top bit of the attribute-type field, so a type
+/// is fourteen significant bits plus one; `ike_auth` masks received types with
+/// the same value.
+const IKEV2_CONFIGURATION_ATTRIBUTE_TYPE_MAX: u16 = 0x7fff;
+
+/// The configuration-attribute types carrying a P-CSCF address.
+///
+/// RFC 7651 4 registers `P_CSCF_IP4_ADDRESS = 20` and `P_CSCF_IP6_ADDRESS =
+/// 21`, and those remain the default. That registration is dated September
+/// 2015 and deployed equipment predates it: RFC 7296 3.15.1 reserves
+/// 16384-32767 for private use, RFC 7651 4 itself notes that "some
+/// implementations" already used private-use values, and peers are observed
+/// negotiating P-CSCF on a private-use type with type 20 absent in both
+/// directions.
+///
+/// A responder that answers a private-use request on type 20 is answering on a
+/// type the asking peer never mentioned, so the pair is caller-supplied rather
+/// than fixed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Ikev2PcscfAttributeTypes {
+    ipv4: u16,
+    ipv6: u16,
+}
+
+impl Default for Ikev2PcscfAttributeTypes {
+    fn default() -> Self {
+        Self::registered()
+    }
+}
+
+impl Ikev2PcscfAttributeTypes {
+    /// The RFC 7651 4 registered pair, 20 and 21.
+    #[must_use]
+    pub const fn registered() -> Self {
+        Self {
+            ipv4: IKEV2_CONFIGURATION_ATTRIBUTE_P_CSCF_IP4_ADDRESS,
+            ipv6: IKEV2_CONFIGURATION_ATTRIBUTE_P_CSCF_IP6_ADDRESS,
+        }
+    }
+
+    /// Construct a caller-chosen pair.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Ikev2PcscfRestorationError::AttributeTypeOutOfRange`] if
+    /// either type sets the reserved bit, and
+    /// [`Ikev2PcscfRestorationError::AttributeTypesNotDistinct`] if both
+    /// families name the same type, which would make a decoded attribute
+    /// ambiguous.
+    pub fn new(ipv4: u16, ipv6: u16) -> Result<Self, Ikev2PcscfRestorationError> {
+        for attribute_type in [ipv4, ipv6] {
+            if attribute_type > IKEV2_CONFIGURATION_ATTRIBUTE_TYPE_MAX {
+                return Err(Ikev2PcscfRestorationError::AttributeTypeOutOfRange {
+                    attribute_type,
+                    maximum: IKEV2_CONFIGURATION_ATTRIBUTE_TYPE_MAX,
+                });
+            }
+        }
+        if ipv4 == ipv6 {
+            return Err(Ikev2PcscfRestorationError::AttributeTypesNotDistinct {
+                attribute_type: ipv4,
+            });
+        }
+        Ok(Self { ipv4, ipv6 })
+    }
+
+    /// Attribute type carrying an IPv4 P-CSCF address.
+    #[must_use]
+    pub const fn ipv4(self) -> u16 {
+        self.ipv4
+    }
+
+    /// Attribute type carrying an IPv6 P-CSCF address.
+    #[must_use]
+    pub const fn ipv6(self) -> u16 {
+        self.ipv6
+    }
+}
+
 /// One typed P-CSCF address to relay in a restoration request.
 ///
 /// `Debug` intentionally reports only the address family. The address remains
@@ -114,6 +195,7 @@ impl Ikev2PcscfRestorationAddressFamilies {
 #[derive(Clone, PartialEq, Eq)]
 pub struct Ikev2PcscfRestorationRequest {
     address_families: Ikev2PcscfRestorationAddressFamilies,
+    attribute_types: Ikev2PcscfAttributeTypes,
     address_count: usize,
     first_payload: PayloadType,
     bytes: Bytes,
@@ -133,6 +215,12 @@ impl Ikev2PcscfRestorationRequest {
     /// First inner payload type to place in the outer `SK` payload header.
     pub const fn first_payload(&self) -> PayloadType {
         self.first_payload
+    }
+
+    /// Configuration-attribute types this request was built on.
+    #[must_use]
+    pub const fn attribute_types(&self) -> Ikev2PcscfAttributeTypes {
+        self.attribute_types
     }
 
     /// Exact generic-payload-chain bytes.
@@ -177,6 +265,7 @@ impl fmt::Debug for Ikev2PcscfRestorationRequest {
 #[derive(Clone, PartialEq, Eq)]
 pub struct Ikev2PcscfRestorationResponse<'a> {
     address_families: Ikev2PcscfRestorationAddressFamilies,
+    attribute_types: Ikev2PcscfAttributeTypes,
     unsupported_configuration_attributes: Vec<Ikev2ConfigurationAttribute<'a>>,
     vendor_ids: Vec<Ikev2VendorIdPayload<'a>>,
     unrecognized_notifies: Vec<Ikev2NotifyPayload<'a>>,
@@ -187,6 +276,15 @@ impl<'a> Ikev2PcscfRestorationResponse<'a> {
     /// Address families echoed by the peer.
     pub const fn address_families(&self) -> Ikev2PcscfRestorationAddressFamilies {
         self.address_families
+    }
+
+    /// Configuration-attribute types the echo was recognized on.
+    ///
+    /// A relaying node should answer on the type it was asked on: a peer that
+    /// requested on a private-use type has no reason to consume a reply
+    /// delivered on the RFC 7651 registered type.
+    pub const fn attribute_types(&self) -> Ikev2PcscfAttributeTypes {
+        self.attribute_types
     }
 
     /// Unsupported `CFG_REPLY` attributes retained under preserve policy.
@@ -250,6 +348,26 @@ impl fmt::Debug for Ikev2PcscfRestorationResponse<'_> {
 pub enum Ikev2PcscfRestorationError {
     /// The request did not contain any P-CSCF addresses.
     AddressListEmpty,
+    /// A configuration-attribute type set the RFC 7296 3.15.1 reserved bit.
+    AttributeTypeOutOfRange {
+        /// Supplied attribute type.
+        attribute_type: u16,
+        /// Largest representable type.
+        maximum: u16,
+    },
+    /// Both address families named the same configuration-attribute type.
+    AttributeTypesNotDistinct {
+        /// The type supplied for both families.
+        attribute_type: u16,
+    },
+    /// The reply echoed the families on different attribute types than the
+    /// request asked on.
+    AttributeTypesMismatch {
+        /// Types the request used.
+        expected: Ikev2PcscfAttributeTypes,
+        /// Types the reply was decoded against.
+        actual: Ikev2PcscfAttributeTypes,
+    },
     /// The request exceeded the SDK resource bound.
     AddressListTooLong {
         /// Supplied address count.
@@ -336,6 +454,15 @@ impl Ikev2PcscfRestorationError {
     pub const fn as_str(&self) -> &'static str {
         match self {
             Self::AddressListEmpty => "ikev2_pcscf_restoration_address_list_empty",
+            Self::AttributeTypeOutOfRange { .. } => {
+                "ikev2_pcscf_restoration_attribute_type_out_of_range"
+            }
+            Self::AttributeTypesNotDistinct { .. } => {
+                "ikev2_pcscf_restoration_attribute_types_not_distinct"
+            }
+            Self::AttributeTypesMismatch { .. } => {
+                "ikev2_pcscf_restoration_attribute_types_mismatch"
+            }
             Self::AddressListTooLong { .. } => "ikev2_pcscf_restoration_address_list_too_long",
             Self::WrongExchangeType { .. } => "ikev2_pcscf_restoration_exchange_type_wrong",
             Self::ResponseFlagMissing => "ikev2_pcscf_restoration_response_flag_missing",
@@ -404,6 +531,29 @@ impl Error for Ikev2PcscfRestorationError {
 pub fn build_ikev2_pcscf_restoration_request(
     addresses: &[Ikev2PcscfRestorationAddress],
 ) -> Result<Ikev2PcscfRestorationRequest, Ikev2PcscfRestorationError> {
+    build_ikev2_pcscf_restoration_request_with_attribute_types(
+        addresses,
+        Ikev2PcscfAttributeTypes::registered(),
+    )
+}
+
+/// Build a P-CSCF restoration request on caller-chosen attribute types.
+///
+/// Identical to [`build_ikev2_pcscf_restoration_request`] except that the
+/// configuration-attribute types are supplied rather than fixed at the RFC 7651
+/// registered pair. Use this to reach a peer that negotiates P-CSCF on a
+/// private-use type; see [`Ikev2PcscfAttributeTypes`].
+///
+/// @spec 3GPP TS 23.380 5.6.5.2; 3GPP TS 24.302 7.4.2.1; IETF RFC 7651 3-4;
+/// IETF RFC 7296 3.15.1
+///
+/// # Errors
+///
+/// Returns the same failures as [`build_ikev2_pcscf_restoration_request`].
+pub fn build_ikev2_pcscf_restoration_request_with_attribute_types(
+    addresses: &[Ikev2PcscfRestorationAddress],
+    attribute_types: Ikev2PcscfAttributeTypes,
+) -> Result<Ikev2PcscfRestorationRequest, Ikev2PcscfRestorationError> {
     if addresses.is_empty() {
         return Err(Ikev2PcscfRestorationError::AddressListEmpty);
     }
@@ -420,11 +570,11 @@ pub fn build_ikev2_pcscf_restoration_request(
         let attribute_type = match address {
             Ikev2PcscfRestorationAddress::Ipv4(_) => {
                 ipv4 = true;
-                IKEV2_CONFIGURATION_ATTRIBUTE_P_CSCF_IP4_ADDRESS
+                attribute_types.ipv4()
             }
             Ikev2PcscfRestorationAddress::Ipv6(_) => {
                 ipv6 = true;
-                IKEV2_CONFIGURATION_ATTRIBUTE_P_CSCF_IP6_ADDRESS
+                attribute_types.ipv6()
             }
         };
         attributes.push(Ikev2ConfigurationAttributeBuild {
@@ -447,6 +597,7 @@ pub fn build_ikev2_pcscf_restoration_request(
         .map_err(Ikev2PcscfRestorationError::Build)?;
     Ok(Ikev2PcscfRestorationRequest {
         address_families,
+        attribute_types,
         address_count: addresses.len(),
         first_payload,
         bytes,
@@ -483,6 +634,37 @@ pub fn decode_ikev2_pcscf_restoration_response<'a>(
     )
 }
 
+/// Decode a P-CSCF restoration `CFG_REPLY` on caller-chosen attribute types.
+///
+/// Identical to [`decode_ikev2_pcscf_restoration_response`] except that the
+/// echoed families are recognized on the supplied pair. An attribute on any
+/// other type is treated as unsupported and retained under the unknown-IE
+/// policy exactly as before, so a reply on the wrong type fails as a missing
+/// family rather than being silently accepted.
+///
+/// @spec IETF RFC 7651 3-4; IETF RFC 7296 3.15.1
+///
+/// # Errors
+///
+/// Returns the same failures as
+/// [`decode_ikev2_pcscf_restoration_response`].
+pub fn decode_ikev2_pcscf_restoration_response_with_attribute_types<'a>(
+    header: &Header,
+    first_payload: PayloadType,
+    cleartext_payloads: &'a [u8],
+    attribute_types: Ikev2PcscfAttributeTypes,
+) -> Result<Ikev2PcscfRestorationResponse<'a>, Ikev2PcscfRestorationError> {
+    let mut context = DecodeContext::conservative();
+    context.unknown_ie_policy = UnknownIePolicy::Preserve;
+    decode_ikev2_pcscf_restoration_response_with_context_and_attribute_types(
+        header,
+        first_payload,
+        cleartext_payloads,
+        context,
+        attribute_types,
+    )
+}
+
 /// Decode a P-CSCF restoration `CFG_REPLY` with explicit parser limits.
 ///
 /// Structural validation is always upgraded to strict. Caller-supplied byte
@@ -502,7 +684,34 @@ pub fn decode_ikev2_pcscf_restoration_response_with_context<'a>(
     header: &Header,
     first_payload: PayloadType,
     cleartext_payloads: &'a [u8],
+    context: DecodeContext,
+) -> Result<Ikev2PcscfRestorationResponse<'a>, Ikev2PcscfRestorationError> {
+    decode_ikev2_pcscf_restoration_response_with_context_and_attribute_types(
+        header,
+        first_payload,
+        cleartext_payloads,
+        context,
+        Ikev2PcscfAttributeTypes::registered(),
+    )
+}
+
+/// Decode a `CFG_REPLY` with explicit parser limits and attribute types.
+///
+/// The union of [`decode_ikev2_pcscf_restoration_response_with_context`] and
+/// [`decode_ikev2_pcscf_restoration_response_with_attribute_types`].
+///
+/// @spec IETF RFC 7651 3-4; IETF RFC 7296 3.15.1
+///
+/// # Errors
+///
+/// Returns the same failures as
+/// [`decode_ikev2_pcscf_restoration_response`].
+pub fn decode_ikev2_pcscf_restoration_response_with_context_and_attribute_types<'a>(
+    header: &Header,
+    first_payload: PayloadType,
+    cleartext_payloads: &'a [u8],
     mut context: DecodeContext,
+    attribute_types: Ikev2PcscfAttributeTypes,
 ) -> Result<Ikev2PcscfRestorationResponse<'a>, Ikev2PcscfRestorationError> {
     validate_response_header(header)?;
     if cleartext_payloads.len() > context.max_message_len {
@@ -578,10 +787,14 @@ pub fn decode_ikev2_pcscf_restoration_response_with_context<'a>(
             actual: configuration.config_type,
         });
     }
-    let (address_families, unsupported_configuration_attributes) =
-        decode_empty_address_families(&configuration.attributes, context.unknown_ie_policy)?;
+    let (address_families, unsupported_configuration_attributes) = decode_empty_address_families(
+        &configuration.attributes,
+        context.unknown_ie_policy,
+        attribute_types,
+    )?;
     Ok(Ikev2PcscfRestorationResponse {
         address_families,
+        attribute_types,
         unsupported_configuration_attributes,
         vendor_ids,
         unrecognized_notifies,
@@ -621,6 +834,12 @@ pub fn validate_ikev2_pcscf_restoration_response_correlation(
     {
         return Err(Ikev2PcscfRestorationError::ResponseCorrelationMismatch);
     }
+    if request.attribute_types != response.attribute_types {
+        return Err(Ikev2PcscfRestorationError::AttributeTypesMismatch {
+            expected: request.attribute_types,
+            actual: response.attribute_types,
+        });
+    }
     if request.address_families != response.address_families {
         return Err(Ikev2PcscfRestorationError::AddressFamiliesMismatch {
             expected: request.address_families,
@@ -633,6 +852,7 @@ pub fn validate_ikev2_pcscf_restoration_response_correlation(
 fn decode_empty_address_families<'a>(
     attributes: &[Ikev2ConfigurationAttribute<'a>],
     unknown_policy: UnknownIePolicy,
+    attribute_types: Ikev2PcscfAttributeTypes,
 ) -> Result<
     (
         Ikev2PcscfRestorationAddressFamilies,
@@ -644,26 +864,25 @@ fn decode_empty_address_families<'a>(
     let mut ipv6 = false;
     let mut unsupported = Vec::new();
     for attribute in attributes {
-        match attribute.attribute_type {
-            IKEV2_CONFIGURATION_ATTRIBUTE_P_CSCF_IP4_ADDRESS => {
-                validate_empty_address_attribute(
-                    attribute,
-                    Ikev2PcscfRestorationAddressFamilies::Ipv4,
-                    &mut ipv4,
-                )?;
-            }
-            IKEV2_CONFIGURATION_ATTRIBUTE_P_CSCF_IP6_ADDRESS => {
-                validate_empty_address_attribute(
-                    attribute,
-                    Ikev2PcscfRestorationAddressFamilies::Ipv6,
-                    &mut ipv6,
-                )?;
-            }
-            _ => preserve_unsupported_configuration_attribute(
+        // The recognized types are runtime values, so this cannot be a match.
+        if attribute.attribute_type == attribute_types.ipv4() {
+            validate_empty_address_attribute(
+                attribute,
+                Ikev2PcscfRestorationAddressFamilies::Ipv4,
+                &mut ipv4,
+            )?;
+        } else if attribute.attribute_type == attribute_types.ipv6() {
+            validate_empty_address_attribute(
+                attribute,
+                Ikev2PcscfRestorationAddressFamilies::Ipv6,
+                &mut ipv6,
+            )?;
+        } else {
+            preserve_unsupported_configuration_attribute(
                 &mut unsupported,
                 *attribute,
                 unknown_policy,
-            ),
+            );
         }
     }
     let families = Ikev2PcscfRestorationAddressFamilies::from_presence(ipv4, ipv6)
