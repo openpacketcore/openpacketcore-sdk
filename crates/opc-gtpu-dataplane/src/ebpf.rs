@@ -109,14 +109,6 @@ pub struct EbpfGtpuDatapathCounters {
     pub uplink_encapsulated: u64,
     /// Uplink packets for which no usable FAR was found.
     pub uplink_far_misses: u64,
-    /// Uplink packets encapsulated but then dropped because neighbour
-    /// redirect failed.
-    ///
-    /// The kernel resolves FIB and neighbour from the newly materialized
-    /// outer header, so this rises for conditions outside the datapath: no
-    /// route covering the outer destination, no neighbour entry and no
-    /// resolution, or the egress interface down.
-    pub uplink_redirect_failures: u64,
     /// Downlink G-PDUs successfully decapsulated.
     pub downlink_decapsulated: u64,
     /// Downlink G-PDUs dropped because their TEID was unknown.
@@ -4935,7 +4927,7 @@ mod aya_runtime {
         COUNTER_DL_BINDING_PEER_MISMATCH, COUNTER_DL_BINDING_SOURCE_PORT_MISMATCH,
         COUNTER_DL_DECAP, COUNTER_DL_DST_MISMATCH, COUNTER_DL_MALFORMED, COUNTER_DL_UNKNOWN_TEID,
         COUNTER_SLOTS, COUNTER_UL_ENCAP, COUNTER_UL_FAR_MISS, COUNTER_UL_MTU_REJECT,
-        COUNTER_UL_PMTU_CORRUPT, COUNTER_UL_REDIRECT_FAIL, DOWNLINK_BINDING_COUNTER_SLOTS,
+        COUNTER_UL_PMTU_CORRUPT, DOWNLINK_BINDING_COUNTER_SLOTS,
         DOWNLINK_ENDPOINT_BINDING_VALUE_LEN, DOWNLINK_PDR_VALUE_LEN, GTPU_SESSION_CONFIG_KEY,
         GTPU_SESSION_CONFIG_VALUE_LEN, GTPU_SESSION_DOWNLINK_KEY_LEN, GTPU_SESSION_GROUP_ID_LEN,
         GTPU_SESSION_GROUP_REF_LEN, GTPU_SESSION_GROUP_VALUE_LEN, GTPU_SESSION_SCHEMA_MARKER_LEN,
@@ -13117,7 +13109,6 @@ mod aya_runtime {
                 counters: EbpfGtpuDatapathCounters {
                     uplink_encapsulated: aggregate(COUNTER_UL_ENCAP)?,
                     uplink_far_misses: aggregate(COUNTER_UL_FAR_MISS)?,
-                    uplink_redirect_failures: aggregate(COUNTER_UL_REDIRECT_FAIL)?,
                     downlink_decapsulated: aggregate(COUNTER_DL_DECAP)?,
                     downlink_unknown_teid: aggregate(COUNTER_DL_UNKNOWN_TEID)?,
                     downlink_malformed: aggregate(COUNTER_DL_MALFORMED)?,
@@ -21021,7 +21012,6 @@ mod tests {
             counters: EbpfGtpuDatapathCounters {
                 uplink_encapsulated: 11,
                 uplink_far_misses: 12,
-                uplink_redirect_failures: 24,
                 downlink_decapsulated: 13,
                 downlink_unknown_teid: 14,
                 downlink_malformed: 15,

@@ -315,17 +315,8 @@ pub const COUNTER_DL_MALFORMED: u32 = 4;
 /// Counter index: downlink G-PDUs dropped because the inner destination does
 /// not match the session's UE PAA.
 pub const COUNTER_DL_DST_MISMATCH: u32 = 5;
-/// Counter index: uplink packets dropped because neighbour redirect failed.
-///
-/// `bpf_redirect_neigh` is called with a null neighbour parameter, so the
-/// kernel resolves FIB and neighbour from the freshly materialized outer
-/// header. That resolution fails for conditions outside this program -- no
-/// route covering the outer destination, no neighbour entry and no
-/// resolution, or the egress interface down -- and those are precisely the
-/// conditions an operator needs to see.
-pub const COUNTER_UL_REDIRECT_FAIL: u32 = 6;
 /// Number of datapath counters.
-pub const COUNTER_SLOTS: u32 = 7;
+pub const COUNTER_SLOTS: u32 = 6;
 
 /// Binding-drop counter index: no canonical binding exists for the PDR.
 pub const COUNTER_DL_BINDING_INVALID: u32 = 0;
@@ -2008,14 +1999,16 @@ mod tests {
     ///
     /// The indices address a fixed-size pinned per-CPU array, so a collision
     /// silently merges two unrelated counters and an index at or past
-    /// `COUNTER_SLOTS` writes nothing at all -- both fail as a wrong number
-    /// rather than as an error.
+    /// `COUNTER_SLOTS` writes nothing at all -- both fail as a wrong
+    /// operator-facing number rather than as an error. This matters most when
+    /// the map next grows: the real fix for the uplink redirect counter has to
+    /// add a slot, and this is what catches a reused index or a forgotten
+    /// `COUNTER_SLOTS` bump.
     #[test]
     fn datapath_counter_indices_are_distinct_and_within_the_map() {
         let indices = [
             COUNTER_UL_ENCAP,
             COUNTER_UL_FAR_MISS,
-            COUNTER_UL_REDIRECT_FAIL,
             COUNTER_DL_DECAP,
             COUNTER_DL_UNKNOWN_TEID,
             COUNTER_DL_MALFORMED,
