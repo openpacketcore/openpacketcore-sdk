@@ -32,11 +32,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the P-CSCF address on any other type without reimplementing the procedure.
   - RFC 7651 is dated September 2015 and deployed VoWiFi equipment predates it.
     RFC 4306 3.15.1 and the IANA registry reserve 16384-32767 for private
-    use, RFC 7651 4 itself
-    notes implementations that already used private-use values, and peers are
-    observed negotiating P-CSCF on a private-use type with type 20 absent in
-    both directions. Answering such a peer on type 20 answers on a type it
-    never mentioned.
+    use. Peers are observed negotiating P-CSCF on a private-use type with type
+    20 absent in both directions; that observation is this project's, taken
+    from the wire, and no RFC endorses it. Answering such a peer on type 20
+    answers on a type it never mentioned.
   - `Ikev2PcscfAttributeTypes` names the pair, defaulting to 20/21 so no
     existing caller changes behaviour. Each family accepts only its own
     registered type or a private-use type (16384-32767).

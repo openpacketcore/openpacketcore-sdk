@@ -62,14 +62,16 @@ const IKEV2_CONFIGURATION_ATTRIBUTE_TYPE_MAX: u16 = 0x7fff;
 
 /// The configuration-attribute types carrying a P-CSCF address.
 ///
-/// RFC 7651 4 registers `P_CSCF_IP4_ADDRESS = 20` and `P_CSCF_IP6_ADDRESS =
-/// 21`, and those remain the default. That registration is dated September
-/// 2015 and deployed equipment predates it: RFC 7296 3.15.1 reserves
-/// 16384-32767 for private use (RFC 4306 3.15.1, and the IANA registry), RFC
-/// 7651 4 itself notes that "some implementations" already used private-use
-/// values, and peers are observed
-/// negotiating P-CSCF on a private-use type with type 20 absent in both
-/// directions.
+/// RFC 7651 defines `P_CSCF_IP4_ADDRESS` in 3 and `P_CSCF_IP6_ADDRESS` in 4,
+/// both recorded as 20 and 21 by its 6 IANA Considerations, and those remain
+/// the default.
+///
+/// That registration is dated September 2015 and deployed equipment predates
+/// it. RFC 4306 3.15.1 reserves 16384-32767 for private use and the IANA IKEv2
+/// Configuration Payload Attribute Types registry records the same split;
+/// peers are observed negotiating P-CSCF on a private-use type with type 20
+/// absent in both directions. That observation is this project's, from the
+/// wire -- no RFC endorses it.
 ///
 /// A responder that answers a private-use request on type 20 is answering on a
 /// type the asking peer never mentioned, so the pair is caller-supplied rather
@@ -98,7 +100,7 @@ impl Ikev2PcscfAttributeTypes {
 
     /// Construct a caller-chosen pair.
     ///
-    /// Each family accepts either its own RFC 7651 4 registered type or a
+    /// Each family accepts either its own RFC 7651 registered type or a
     /// private-use type (16384-32767, per the IANA IKEv2 Configuration Payload
     /// Attribute Types registry and RFC 4306 3.15.1). Every other code point is refused:
     /// the registered space below 20/21 names unrelated attributes such as
@@ -397,7 +399,7 @@ pub enum Ikev2PcscfRestorationError {
     },
     /// A configuration-attribute type this procedure may not claim.
     ///
-    /// Only the family's own RFC 7651 4 registered type or a private-use type
+    /// Only the family's own RFC 7651 registered type or a private-use type
     /// is available; every other code point is registered to an unrelated
     /// attribute or is unassigned.
     AttributeTypeNotAvailable {
