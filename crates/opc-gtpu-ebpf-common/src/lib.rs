@@ -2038,10 +2038,27 @@ mod tests {
     ///
     /// Growing `COUNTER_SLOTS` is not only a CI drift-gate refresh. It changes
     /// `GTPU_COUNTERS.max_entries` in the committed object's `maps` section
-    /// *and* in the pinned map graph, and the loader compares `max_entries` at
-    /// every current-schema pin identity check, so a pin graph retained from a
-    /// build with the old slot count is not this build's graph and is refused
-    /// rather than adopted in place.
+    /// *and* in the pinned map graph, so a deployment that retains its bpffs
+    /// pin directory across the upgrade -- the designed high-availability
+    /// behaviour -- meets the old map with the new program. Nothing about that
+    /// graph looks stale on its own: the loader adopts an existing
+    /// pinned-by-name map by file descriptor without comparing a dimension,
+    /// the bearer schema marker does not change when only a map's shape does,
+    /// and the attach-time pin identity check compares kernel map IDs read
+    /// from the very maps that were adopted.
+    ///
+    /// `opc-gtpu-dataplane` closes that in two places. Before the object is
+    /// loaded, `reconcile_retained_pin_map_abi` rebuilds a counter map whose
+    /// slot count is not this build's -- counters restart at zero, which is the
+    /// intended cost -- on a graph that has already reached the current map
+    /// set, and refuses any other map at a foreign shape, because those pins
+    /// carry the session state a retained graph exists to preserve. Then
+    /// `require_current_pin_map_abi` refuses to bind either program to any pin
+    /// that is not this build's ABI, which is the guarantee that actually
+    /// holds: it covers a graph the first pass is not entitled to reshape, such
+    /// as one still below `OPC-SPORT-v4`. Until that landed, a retained
+    /// pre-growth graph was adopted silently: increments to the slots past its
+    /// end were dropped, and the operator snapshot could not read them at all.
     #[test]
     fn datapath_counter_indices_are_distinct_and_within_the_map() {
         let indices = [

@@ -64,7 +64,7 @@ use nix::libc;
 use nix::{setsockopt_impl, sockopt_impl};
 use opc_gtpu_dataplane::{
     reassembly_commit_authorizes_graph, CreateGtpDeviceEndpointSetRequest, CreateGtpDeviceRequest,
-    CurrentEbpfGraphRecoveryOutcome, CurrentEbpfGraphRecoveryRefusal,
+    CurrentEbpfGraphDrainProof, CurrentEbpfGraphRecoveryOutcome, CurrentEbpfGraphRecoveryRefusal,
     CurrentEbpfGraphRecoveryRequest, CurrentEbpfGraphWriterProof, DrainedV2TeardownOutcome,
     DrainedV2TeardownRefusal, DrainedV2TeardownRequest, DscpCodepoint, EbpfGtpuDataplaneBackend,
     EbpfGtpuDataplaneBackendConfig, GtpBearerMark, GtpDevice, GtpPdpContext, GtpVersion,
@@ -88,8 +88,8 @@ use opc_gtpu_ebpf_common::{
     UplinkFarKey, COUNTER_DL_BINDING_FAMILY_MISMATCH, COUNTER_DL_BINDING_INGRESS_MISMATCH,
     COUNTER_DL_BINDING_INVALID, COUNTER_DL_BINDING_LOCAL_MISMATCH,
     COUNTER_DL_BINDING_PEER_MISMATCH, COUNTER_DL_BINDING_SOURCE_PORT_MISMATCH, COUNTER_DL_DECAP,
-    COUNTER_DL_DST_MISMATCH, COUNTER_DL_MALFORMED, COUNTER_DL_UNKNOWN_TEID, COUNTER_UL_ENCAP,
-    COUNTER_UL_FAR_MISS, COUNTER_UL_MTU_REJECT, COUNTER_UL_PMTU_CORRUPT,
+    COUNTER_DL_DST_MISMATCH, COUNTER_DL_MALFORMED, COUNTER_DL_UNKNOWN_TEID, COUNTER_SLOTS,
+    COUNTER_UL_ENCAP, COUNTER_UL_FAR_MISS, COUNTER_UL_MTU_REJECT, COUNTER_UL_PMTU_CORRUPT,
     COUNTER_UL_REDIRECT_RESOLVED, DOWNLINK_ENDPOINT_BINDING_VALUE_LEN, DOWNLINK_PDR_VALUE_LEN,
     ETH_HDR_LEN, GTPU_MANDATORY_HDR_LEN, IPV4_MIN_HDR_LEN, MAP_CONFIG, MAP_CONFIG_IPV6,
     MAP_COUNTERS, MAP_DOWNLINK_BINDING_COUNTERS, MAP_DOWNLINK_ENDPOINT_BINDING,
@@ -99,9 +99,9 @@ use opc_gtpu_ebpf_common::{
     MAP_UPLINK_PMTU_COUNTERS, MAP_UPLINK_SOURCE_PORT, MARKED_BEARER_OWNER_VALUE_LEN,
     MARKED_DOWNLINK_PDR_VALUE_LEN, PROG_DOWNLINK, PROG_UPLINK, UDP_HDR_LEN,
     UPLINK_BEARER_SCHEMA_MARKER_VALUE, UPLINK_DSCP_SCHEMA_MARKER_KEY,
-    UPLINK_DSCP_SCHEMA_MARKER_VALUE, UPLINK_DSCP_VALUE_LEN, UPLINK_FAR_VALUE_LEN,
-    UPLINK_MARK_KEY_LEN, UPLINK_PMTU_SCHEMA_MARKER_VALUE, UPLINK_PMTU_VALUE_LEN,
-    UPLINK_SOURCE_PORT_VALUE_LEN,
+    UPLINK_DSCP_SCHEMA_MARKER_VALUE, UPLINK_DSCP_VALUE_LEN, UPLINK_ENDPOINT_SCHEMA_MARKER_VALUE,
+    UPLINK_FAR_VALUE_LEN, UPLINK_MARK_KEY_LEN, UPLINK_PMTU_SCHEMA_MARKER_VALUE,
+    UPLINK_PMTU_VALUE_LEN, UPLINK_SOURCE_PORT_VALUE_LEN,
 };
 use opc_ipsec_xfrm::{
     Algorithm, AuthAlgorithm, InstallPolicyRequest, InstallSaRequest, IpAddress, KeyMaterial,
@@ -174,6 +174,13 @@ const IPPROTO_UDP: u8 = 17;
 const IPPROTO_ESP: u8 = 50;
 const FROZEN_V1_OBJECT: &[u8] = include_bytes!("../bpf/opc-gtpu-datapath-v1.bpf.o");
 const FROZEN_V2_OBJECT: &[u8] = include_bytes!("../bpf/opc-gtpu-datapath-v2.bpf.o");
+const CURRENT_OBJECT: &[u8] = include_bytes!("../bpf/opc-gtpu-datapath.bpf.o");
+/// `GTPU_COUNTERS.max_entries` in the datapath object built immediately before
+/// the uplink redirect counter was added (`6778bd53`).
+const PRE_REDIRECT_COUNTER_SLOTS: u32 = 6;
+/// A `GTPU_DOWNLINK_PDR` capacity no build of this datapath ever shipped,
+/// standing in for a retained session map whose shape is not this build's.
+const FOREIGN_DOWNLINK_PDR_ENTRIES: u32 = 1_024;
 const SDK_TC_HANDLE: TcHandle = TcHandle::new(0, 1);
 const LEGACY_V2_OWNER_VALUE_LEN: usize = 20;
 
@@ -874,6 +881,38 @@ fn grouped_device_request(policy: GtpuUplinkMtuPolicy) -> CreateGtpDeviceEndpoin
     request.uplink_mtu_policy = Some(policy);
     CreateGtpDeviceEndpointSetRequest::new(request, grouped_device_id(), grouped_endpoints())
         .expect("canonical grouped device request")
+}
+
+/// A second attachment authority for the same grouped device -- same device
+/// ID, and therefore the same pin namespace, but a different local endpoint
+/// set. This is the grouped equivalent of a second process bound to a
+/// different local address: the pin directory is keyed by the device ID, so a
+/// conflicting *endpoint set* is the shape an ownership conflict actually
+/// takes here.
+fn conflicting_grouped_device_request(
+    policy: GtpuUplinkMtuPolicy,
+) -> CreateGtpDeviceEndpointSetRequest {
+    let mut request = CreateGtpDeviceRequest::new("s2bu");
+    request.uplink_mtu_policy = Some(policy);
+    CreateGtpDeviceEndpointSetRequest::new(
+        request,
+        grouped_device_id(),
+        GtpuLocalEndpointSet::new(
+            IpAddr::V4(EPDG_S2BU_ALT_IP),
+            Some(IpAddr::V6(EPDG_S2BU_IPV6)),
+        )
+        .expect("canonical conflicting dual-stack endpoint authority"),
+    )
+    .expect("canonical conflicting grouped device request")
+}
+
+/// The pin directory the backend derives from a grouped device ID.
+fn grouped_pin_dir(pin_root: &std::path::Path) -> PathBuf {
+    let mut namespace = String::from("v6-");
+    for byte in grouped_device_id().to_bytes() {
+        namespace.push_str(&format!("{byte:02x}"));
+    }
+    pin_root.join(namespace)
 }
 
 fn grouped_entry(
@@ -2951,14 +2990,14 @@ fn drain_datagrams(socket: &UdpSocket) {
         .expect("restore blocking socket mode");
 }
 
-fn attach_frozen_program(ebpf: &mut Ebpf, name: &str, attach_type: TcAttachType) -> u32 {
+fn attach_prior_generation_program(ebpf: &mut Ebpf, name: &str, attach_type: TcAttachType) -> u32 {
     let program: &mut SchedClassifier = ebpf
         .program_mut(name)
-        .expect("frozen program")
+        .expect("prior generation program")
         .try_into()
-        .expect("frozen program is a tc classifier");
-    program.load().expect("load frozen v1 classifier");
-    let program_id = program.info().expect("frozen program info").id();
+        .expect("prior generation program is a tc classifier");
+    program.load().expect("load prior generation classifier");
+    let program_id = program.info().expect("prior generation program info").id();
     let link_id = program
         .attach_with_options(
             "s2bu",
@@ -2969,8 +3008,10 @@ fn attach_frozen_program(ebpf: &mut Ebpf, name: &str, attach_type: TcAttachType)
                 classid: None,
             }),
         )
-        .expect("attach frozen v1 classifier");
-    let link = program.take_link(link_id).expect("own frozen tc link");
+        .expect("attach prior generation classifier");
+    let link = program
+        .take_link(link_id)
+        .expect("own prior generation tc link");
     // Model a prior loader exiting while kernel-owned tc filters and pinned
     // maps survive. Dropping this netlink link would detach the live filter.
     std::mem::forget(link);
@@ -3028,8 +3069,9 @@ fn install_frozen_v1_datapath(pin_dir: &std::path::Path) -> (u32, u32) {
         )
         .expect("seed v1 PDR");
     }
-    let uplink_id = attach_frozen_program(&mut ebpf, PROG_UPLINK, TcAttachType::Egress);
-    let downlink_id = attach_frozen_program(&mut ebpf, PROG_DOWNLINK, TcAttachType::Ingress);
+    let uplink_id = attach_prior_generation_program(&mut ebpf, PROG_UPLINK, TcAttachType::Egress);
+    let downlink_id =
+        attach_prior_generation_program(&mut ebpf, PROG_DOWNLINK, TcAttachType::Ingress);
     drop(ebpf);
     (uplink_id, downlink_id)
 }
@@ -3075,8 +3117,9 @@ fn install_drained_frozen_v2_datapath(pin_dir: &std::path::Path) -> (u32, u32) {
         )
         .expect("seed committed v2 marker");
     }
-    let uplink_id = attach_frozen_program(&mut ebpf, PROG_UPLINK, TcAttachType::Egress);
-    let downlink_id = attach_frozen_program(&mut ebpf, PROG_DOWNLINK, TcAttachType::Ingress);
+    let uplink_id = attach_prior_generation_program(&mut ebpf, PROG_UPLINK, TcAttachType::Egress);
+    let downlink_id =
+        attach_prior_generation_program(&mut ebpf, PROG_DOWNLINK, TcAttachType::Ingress);
     drop(ebpf);
     (uplink_id, downlink_id)
 }
@@ -3183,6 +3226,138 @@ fn pinned_schema_marker(pin_dir: &std::path::Path) -> [u8; UPLINK_FAR_VALUE_LEN]
         .expect("typed pinned FAR");
     far.get(&UPLINK_DSCP_SCHEMA_MARKER_KEY, 0)
         .expect("read pinned schema marker")
+}
+
+/// Regress the durable bearer schema marker to an earlier generation's value,
+/// leaving every pin exactly as it was. Only the marker moves, which is
+/// precisely the difference between a graph a v3-era process left behind and
+/// one this build left behind.
+fn write_pinned_schema_marker(pin_dir: &std::path::Path, value: [u8; UPLINK_FAR_VALUE_LEN]) {
+    let map = Map::from_map_data(
+        MapData::from_pin(pin_dir.join(MAP_UPLINK_FAR)).expect("open pinned FAR for marker write"),
+    )
+    .expect("identify pinned FAR map");
+    let mut far = BpfHashMap::<_, [u8; 4], [u8; UPLINK_FAR_VALUE_LEN]>::try_from(map)
+        .expect("typed pinned FAR");
+    far.insert(UPLINK_DSCP_SCHEMA_MARKER_KEY, value, 0)
+        .expect("write pinned schema marker");
+}
+
+/// Re-pin `GTPU_COUNTERS` at an earlier build's slot count, leaving every
+/// other pin -- and every hook -- untouched.
+fn repin_counters_at(pin_dir: &std::path::Path, slots: u32) {
+    fs::remove_file(pin_dir.join(MAP_COUNTERS)).expect("unpin the current counters map");
+    drop(
+        EbpfLoader::new()
+            .default_map_pin_directory(pin_dir)
+            .map_max_entries(MAP_COUNTERS, slots)
+            .load(CURRENT_OBJECT)
+            .expect("re-pin the retained graph at an earlier counter ABI"),
+    );
+    assert_eq!(
+        pinned_map_entries(pin_dir, MAP_COUNTERS),
+        slots,
+        "the retained graph must carry the requested counter ABI"
+    );
+}
+
+fn pinned_map_entries(pin_dir: &std::path::Path, name: &str) -> u32 {
+    MapInfo::from_pin(pin_dir.join(name))
+        .unwrap_or_else(|error| panic!("open pinned {name}: {error}"))
+        .max_entries()
+}
+
+/// Every pin name in the directory, sorted. What a refusal does to the *shape*
+/// of a retained graph is only visible against the whole set.
+fn pinned_names(pin_dir: &std::path::Path) -> Vec<String> {
+    let mut names = fs::read_dir(pin_dir)
+        .expect("read pin directory")
+        .map(|entry| {
+            entry
+                .expect("pin directory entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect::<Vec<_>>();
+    names.sort();
+    names
+}
+
+/// The four maps introduced after the endpoint-bound v3 schema. A graph a v3
+/// generation left behind does not have them; a current-build load creates
+/// them.
+const POST_V3_MAPS: [&str; 4] = [
+    MAP_UPLINK_SOURCE_PORT,
+    MAP_UPLINK_MARK_SOURCE_PORT,
+    MAP_UPLINK_PMTU,
+    MAP_UPLINK_PMTU_COUNTERS,
+];
+
+/// Regress a current-build graph to the pin *set* a v3 generation leaves
+/// behind, not just its marker.
+///
+/// Rewriting only the marker on a current-build directory leaves all
+/// twenty-one pins in place, which cannot observe what a migration does to a
+/// graph that is genuinely short of four of them.
+fn make_v3_shaped(pin_dir: &std::path::Path) {
+    for name in POST_V3_MAPS {
+        fs::remove_file(pin_dir.join(name))
+            .unwrap_or_else(|error| panic!("unpin post-v3 map {name}: {error}"));
+    }
+}
+
+fn pinned_source_port_entries(pin_dir: &std::path::Path) -> usize {
+    let map = Map::from_map_data(
+        MapData::from_pin(pin_dir.join(MAP_UPLINK_SOURCE_PORT))
+            .expect("open pinned uplink source-port policy"),
+    )
+    .expect("identify pinned uplink source-port policy map");
+    BpfHashMap::<_, [u8; 4], [u8; UPLINK_SOURCE_PORT_VALUE_LEN]>::try_from(map)
+        .expect("typed pinned uplink source-port policy")
+        .iter()
+        .count()
+}
+
+/// Leave behind exactly what a process from before the uplink redirect counter
+/// leaves behind: a pinned map graph whose `GTPU_COUNTERS` still has the old
+/// slot count, and two kernel-owned tc filters bound to that graph.
+///
+/// The pin graphs of `6778bd53` and this build differ in exactly one field:
+/// `GTPU_COUNTERS.max_entries`, 6 -> 7. Every other entry in the committed
+/// object's `maps` section -- name, type, key size, value size, flags and
+/// pinning -- is byte-identical between the two objects, so re-pinning that one
+/// map through the loader's own `max_entries` override reproduces precisely the
+/// bpffs graph an old process leaves behind, without carrying a second copy of
+/// an 800 KiB historical artifact in-tree.
+///
+/// The hooks are re-established from that same load rather than left as the
+/// caller's own generation attached them, because the loader identifies a hook
+/// occupant partly by its map-ID set (`owner_matches_artifact`). A real
+/// pre-growth process leaves filters bound to the very pins it also leaves
+/// behind; a test that swapped the counter pin out from under a still-attached
+/// program would instead be asserting on an artefact of its own seeding.
+///
+/// Nothing else is touched: the FAR/PDR/session pins, the schema marker and the
+/// config the previous generation committed all stay exactly as they were,
+/// because those are the pins high availability actually depends on.
+fn retain_pre_redirect_datapath(pin_dir: &std::path::Path) {
+    run("tc", &["filter", "del", "dev", "s2bu", "egress"]);
+    run("tc", &["filter", "del", "dev", "s2bu", "ingress"]);
+    fs::remove_file(pin_dir.join(MAP_COUNTERS)).expect("unpin the current counters map");
+    let mut ebpf = EbpfLoader::new()
+        .default_map_pin_directory(pin_dir)
+        .map_max_entries(MAP_COUNTERS, PRE_REDIRECT_COUNTER_SLOTS)
+        .load(CURRENT_OBJECT)
+        .expect("re-pin the retained graph at the pre-redirect counter ABI");
+    assert_eq!(
+        pinned_map_entries(pin_dir, MAP_COUNTERS),
+        PRE_REDIRECT_COUNTER_SLOTS,
+        "the retained graph must carry the pre-redirect counter ABI"
+    );
+    attach_prior_generation_program(&mut ebpf, PROG_UPLINK, TcAttachType::Egress);
+    attach_prior_generation_program(&mut ebpf, PROG_DOWNLINK, TcAttachType::Ingress);
+    drop(ebpf);
 }
 
 fn pinned_counter(pin_dir: &std::path::Path, index: u32) -> u64 {
@@ -6939,6 +7114,1402 @@ async fn ebpf_gtpu_uplink_redirect_counter_tracks_delivery_not_submission(
     assert_eq!(
         recovered_after.uplink_far_misses, recovered_before.uplink_far_misses,
         "recovery must not report FAR misses: before={recovered_before:?} after={recovered_after:?}"
+    );
+
+    drop(net);
+    Ok(())
+}
+
+/// A pin graph retained across an upgrade that grew the counter map must never
+/// be adopted at its old ABI.
+///
+/// This is the one path every other privileged test here structurally cannot
+/// reach: they all start from a fresh bpffs, so they only ever exercise a pin
+/// graph this build created itself. Retaining the graph is the whole point of
+/// pinning (see the `ebpf` module docs), and it is what a real upgrade does.
+///
+/// Aya routes each `pinning = ByName` map through
+/// `MapData::create_pinned_by_name`, which on an existing pin returns the
+/// adopted fd without comparing a single dimension against the object's map
+/// definition. Nothing downstream closes that gap on the attach path either:
+/// the bearer schema marker is unchanged by a counter-slot growth, so the
+/// retained graph classifies as the current schema, and the attach-time pin
+/// identity check compares only kernel map IDs -- both sides read the same
+/// adopted map, so they always agree.
+///
+/// The result is silent and operator-visible in the worst way. The 7-slot
+/// program loads fine against a 6-entry `PERCPU_ARRAY`; `GTPU_COUNTERS
+/// .get_ptr_mut(COUNTER_UL_REDIRECT_RESOLVED)` simply returns `None` and the
+/// increment is dropped. `uplink_encapsulated` rises while
+/// `uplink_redirects_resolved` stays at zero -- which this datapath documents
+/// as the signature of a total uplink outage, on a link that is in fact
+/// healthy.
+///
+/// So: bring a generation up, retain its graph at the pre-growth counter ABI,
+/// start this build against it, and require that healthy subscriber traffic
+/// still moves the counter -- while the session state the previous generation
+/// committed survives, because that is what the retained graph is for.
+#[tokio::test]
+// The serial guard is deliberately held for the entire test body; see
+// PRIVILEGED_TEST_LOCK.
+#[allow(clippy::await_holding_lock)]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn ebpf_gtpu_retained_pin_graph_is_never_adopted_at_a_stale_counter_abi(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref() != Ok("1") {
+        eprintln!("skipping: set OPC_GTPU_RUN_PRIVILEGED=1 inside a fresh privileged netns");
+        return Ok(());
+    }
+
+    let _serial = PRIVILEGED_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let net = TestNet::provision();
+    let pin_dir = net.pin_root.join("s2bu");
+
+    // --- Generation 1: the deployment already in service. ---
+    let previous = EbpfGtpuDataplaneBackend::with_config(EbpfGtpuDataplaneBackendConfig {
+        bpffs_pin_root: net.pin_root.clone(),
+        ..EbpfGtpuDataplaneBackendConfig::default()
+    });
+    let mut request = CreateGtpDeviceRequest::new("s2bu");
+    request.bind_address = IpAddr::V4(EPDG_S2BU_IP);
+    let device = previous.create_device(request).await?;
+    let session = session_context(device.ifindex);
+    previous.install_pdp_context(session.clone()).await?;
+    assert_eq!(
+        pinned_map_entries(&pin_dir, MAP_COUNTERS),
+        COUNTER_SLOTS,
+        "a graph this build creates itself must carry this build's counter ABI"
+    );
+
+    // The process exits. bpffs keeps the graph so session state survives the
+    // restart -- that is the designed high-availability behaviour.
+    drop(previous);
+    retain_pre_redirect_datapath(&pin_dir);
+    println!(
+        "retained pin graph: GTPU_COUNTERS max_entries={} (this build indexes {} slots)",
+        pinned_map_entries(&pin_dir, MAP_COUNTERS),
+        COUNTER_SLOTS
+    );
+
+    // --- Generation 2: this build starts against that retained graph. ---
+    let upgraded = EbpfGtpuDataplaneBackend::with_config(EbpfGtpuDataplaneBackendConfig {
+        bpffs_pin_root: net.pin_root.clone(),
+        ..EbpfGtpuDataplaneBackendConfig::default()
+    });
+    let adopted = upgraded.resolve_device("s2bu").await?;
+    assert_eq!(adopted.ifindex, device.ifindex);
+
+    // High availability is the reason the graph was retained at all: the
+    // session the previous generation committed must still be installed, and
+    // the schema marker and bound local address must be untouched.
+    assert_eq!(
+        upgraded
+            .read_pdp_context(PdpContextSelector::LocalTeid(
+                PdpContextLocalTeidSelector::from_context(&session)
+                    .ok_or("local selector requires nonzero ifindex")?,
+            ))
+            .await?,
+        PdpContextReadback::Present(session.clone()),
+        "reconciling a stale counter ABI must not discard live session state"
+    );
+    assert_eq!(
+        pinned_schema_marker(&pin_dir),
+        UPLINK_PMTU_SCHEMA_MARKER_VALUE,
+        "the retained bearer schema must survive the upgrade"
+    );
+    assert_eq!(
+        pinned_config(&pin_dir),
+        EPDG_S2BU_IP.octets(),
+        "the retained device config must survive the upgrade"
+    );
+    assert_eq!(
+        pinned_map_entries(&pin_dir, MAP_COUNTERS),
+        COUNTER_SLOTS,
+        "a counter map narrower than this build's index space must never be \
+         adopted: every write to the slots past its end is silently dropped"
+    );
+
+    // --- Healthy subscriber traffic over the adopted graph. ---
+    let pgw_socket = in_netns(&net.pgw_ns, || {
+        UdpSocket::bind((PGW_IP, GTPU_PORT)).expect("bind PGW GTP-U socket")
+    });
+    let ue_socket = in_netns(&net.ue_ns, || {
+        UdpSocket::bind((UE_PAA, 5000)).expect("bind UE socket")
+    });
+
+    // Resolve the PGW neighbour first: the very first redirected frame would
+    // otherwise sit in the neighbour's arp_queue and be counted outside the
+    // measured window.
+    let mut buffer = [0_u8; 2048];
+    send_until_received(
+        || {
+            let _ = ue_socket.send_to(b"opc-upgrade-warmup", (REMOTE_HOST, 53));
+        },
+        &pgw_socket,
+        &mut buffer,
+    )
+    .expect("uplink must reach the PGW after the upgrade");
+    drain_datagrams(&pgw_socket);
+
+    let before = upgraded.datapath_snapshot(&adopted).await?.counters;
+    for index in 0..REDIRECT_PROBE_PACKETS {
+        ue_socket.send_to(
+            format!("opc-upgrade-healthy-{index}").as_bytes(),
+            (REMOTE_HOST, 53),
+        )?;
+    }
+    pgw_socket
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set PGW read timeout");
+    for index in 0..REDIRECT_PROBE_PACKETS {
+        let (len, from) = pgw_socket
+            .recv_from(&mut buffer)
+            .unwrap_or_else(|error| panic!("uplink G-PDU {index} must reach the PGW: {error}"));
+        assert_eq!(from, SocketAddr::from((EPDG_S2BU_IP, GTPU_PORT)));
+        assert!(buffer[..len].ends_with(format!("opc-upgrade-healthy-{index}").as_bytes()));
+    }
+    let after = upgraded.datapath_snapshot(&adopted).await?.counters;
+    println!("post-upgrade counters before={before:?}");
+    println!("post-upgrade counters after={after:?}");
+
+    assert_eq!(
+        after.uplink_encapsulated,
+        before.uplink_encapsulated + u64::from(REDIRECT_PROBE_PACKETS),
+        "every subscriber packet must still be encapsulated after the upgrade: \
+         before={before:?} after={after:?}"
+    );
+    assert_eq!(
+        after.uplink_redirects_resolved,
+        before.uplink_redirects_resolved + u64::from(REDIRECT_PROBE_PACKETS),
+        "a delivered uplink must count one resolved redirect per encapsulation \
+         after adopting a retained graph too -- a counter flat against a rising \
+         uplink_encapsulated is this datapath's published signature of a total \
+         uplink outage: before={before:?} after={after:?}"
+    );
+    assert_eq!(
+        after.uplink_redirects_resolved,
+        pinned_counter(&pin_dir, COUNTER_UL_REDIRECT_RESOLVED),
+        "the public snapshot must aggregate the exact pinned redirect counter"
+    );
+    assert_eq!(
+        after.uplink_far_misses, before.uplink_far_misses,
+        "a successfully delivered uplink packet is not a FAR miss: \
+         before={before:?} after={after:?}"
+    );
+
+    // --- A state-bearing pin at a foreign ABI is refused, not adopted. ---
+    // Counters are the only pins whose contents this loader is entitled to
+    // discard. A session map whose shape is not this build's is a schema
+    // break, and refusing it must leave every retained pin untouched --
+    // including the counter pins the same pass would otherwise have rebuilt.
+    drop(upgraded);
+    run("tc", &["filter", "del", "dev", "s2bu", "egress"]);
+    run("tc", &["filter", "del", "dev", "s2bu", "ingress"]);
+    for name in [MAP_DOWNLINK_PDR, MAP_COUNTERS, MAP_UPLINK_PMTU_COUNTERS] {
+        fs::remove_file(pin_dir.join(name)).unwrap_or_else(|error| panic!("unpin {name}: {error}"));
+    }
+    drop(
+        EbpfLoader::new()
+            .default_map_pin_directory(&pin_dir)
+            .map_max_entries(MAP_DOWNLINK_PDR, FOREIGN_DOWNLINK_PDR_ENTRIES)
+            .map_max_entries(MAP_COUNTERS, PRE_REDIRECT_COUNTER_SLOTS)
+            .map_max_entries(MAP_UPLINK_PMTU_COUNTERS, 1)
+            .load(CURRENT_OBJECT)
+            .expect("re-pin the graph with a foreign session-map ABI"),
+    );
+
+    let refusing = EbpfGtpuDataplaneBackend::with_config(EbpfGtpuDataplaneBackendConfig {
+        bpffs_pin_root: net.pin_root.clone(),
+        ..EbpfGtpuDataplaneBackendConfig::default()
+    });
+    let refusal = refusing.resolve_device("s2bu").await;
+    assert!(
+        matches!(
+            refusal,
+            Err(GtpuError::Io {
+                operation: "ebpf_pin_map_abi",
+                kind: io::ErrorKind::InvalidData,
+                ..
+            })
+        ),
+        "a session-bearing pin at a foreign ABI must be refused, not adopted: {refusal:?}"
+    );
+    assert_eq!(
+        pinned_map_entries(&pin_dir, MAP_DOWNLINK_PDR),
+        FOREIGN_DOWNLINK_PDR_ENTRIES,
+        "a refused attach must not rewrite the pin it refused"
+    );
+    assert_eq!(
+        pinned_map_entries(&pin_dir, MAP_COUNTERS),
+        PRE_REDIRECT_COUNTER_SLOTS,
+        "a refused attach must not rebuild the counter pins the same pass \
+         would otherwise have reconciled"
+    );
+    assert_eq!(
+        pinned_map_entries(&pin_dir, MAP_UPLINK_PMTU_COUNTERS),
+        1,
+        "a refused attach must not rebuild a counter pin classified before the \
+         pin it refused"
+    );
+    assert_eq!(
+        pinned_schema_marker(&pin_dir),
+        UPLINK_PMTU_SCHEMA_MARKER_VALUE,
+        "a refused attach must leave the retained schema marker alone"
+    );
+
+    drop(net);
+    Ok(())
+}
+
+/// A retained graph that is missing only its counter pins must be restored by
+/// the next attach, never refused forever.
+///
+/// `reconcile_retained_pin_map_abi` unpins a counter map and relies on the load
+/// below it to recreate one at this build's ABI. Between those two points the
+/// pin directory holds twenty of its twenty-one pins, and that window is not
+/// hypothetical: the process can die in it, and `attach` returns immediately
+/// without restoring the pin when `load_pinned` fails over a pre-existing pin
+/// set (memlock, ENOMEM, ENOSPC, a verifier rejection).
+///
+/// `bearer_schema_preflight` runs first on every subsequent attach, so if it
+/// treats a counter pin as a pin whose absence proves durable state loss, the
+/// reconciliation manufactures a state the preflight behind it refuses on every
+/// entry point -- and the only remedy left is deleting the pin directory, which
+/// destroys exactly the sessions the retained graph exists to preserve.
+///
+/// Counter pins carry no durable state; that is the entire premise on which
+/// this loader is allowed to rebuild them at all. So their absence must be
+/// self-healing.
+#[tokio::test]
+// The serial guard is deliberately held for the entire test body; see
+// PRIVILEGED_TEST_LOCK.
+#[allow(clippy::await_holding_lock)]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn ebpf_gtpu_retained_graph_missing_only_counter_pins_is_restored_not_wedged(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref() != Ok("1") {
+        eprintln!("skipping: set OPC_GTPU_RUN_PRIVILEGED=1 inside a fresh privileged netns");
+        return Ok(());
+    }
+
+    let _serial = PRIVILEGED_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let net = TestNet::provision();
+    let pin_dir = net.pin_root.join("s2bu");
+    let config = EbpfGtpuDataplaneBackendConfig {
+        bpffs_pin_root: net.pin_root.clone(),
+        ..EbpfGtpuDataplaneBackendConfig::default()
+    };
+
+    let previous = EbpfGtpuDataplaneBackend::with_config(config.clone());
+    let mut request = CreateGtpDeviceRequest::new("s2bu");
+    request.bind_address = IpAddr::V4(EPDG_S2BU_IP);
+    let device = previous.create_device(request).await?;
+    let session = session_context(device.ifindex);
+    previous.install_pdp_context(session.clone()).await?;
+    drop(previous);
+    run("tc", &["filter", "del", "dev", "s2bu", "egress"]);
+    run("tc", &["filter", "del", "dev", "s2bu", "ingress"]);
+
+    // Exactly what the reconciliation leaves behind between its unpin and the
+    // load recreating the map.
+    let tear = |pin_dir: &std::path::Path| {
+        fs::remove_file(pin_dir.join(MAP_COUNTERS)).expect("unpin the counters map");
+        fs::read_dir(pin_dir).expect("read pin directory").count()
+    };
+    println!("torn state: pins present = {}", tear(&pin_dir));
+
+    let resolver = EbpfGtpuDataplaneBackend::with_config(config.clone());
+    let resolved = resolver.resolve_device("s2bu").await;
+    println!(
+        "REPRO resolve_device after torn state    = {:?}",
+        resolved.as_ref().map(|device| device.ifindex)
+    );
+    let resolved = resolved?;
+    assert_eq!(resolved.ifindex, device.ifindex);
+    assert_eq!(
+        pinned_map_entries(&pin_dir, MAP_COUNTERS),
+        COUNTER_SLOTS,
+        "the restored counter pin must carry this build's ABI"
+    );
+    assert_eq!(
+        resolver
+            .read_pdp_context(PdpContextSelector::LocalTeid(
+                PdpContextLocalTeidSelector::from_context(&session)
+                    .ok_or("local selector requires nonzero ifindex")?,
+            ))
+            .await?,
+        PdpContextReadback::Present(session.clone()),
+        "restoring a counter pin must not disturb live session state"
+    );
+    assert_eq!(
+        pinned_schema_marker(&pin_dir),
+        UPLINK_PMTU_SCHEMA_MARKER_VALUE,
+        "restoring a counter pin must not disturb the durable schema marker"
+    );
+    drop(resolver);
+    run("tc", &["filter", "del", "dev", "s2bu", "egress"]);
+    run("tc", &["filter", "del", "dev", "s2bu", "ingress"]);
+
+    // The same torn directory must also be recoverable through create, which
+    // is the entry point a restarting deployment actually uses.
+    println!("torn state: pins present = {}", tear(&pin_dir));
+    let creator = EbpfGtpuDataplaneBackend::with_config(config.clone());
+    let mut request = CreateGtpDeviceRequest::new("s2bu");
+    request.bind_address = IpAddr::V4(EPDG_S2BU_IP);
+    let created = creator.create_device(request).await;
+    println!(
+        "REPRO create_device after torn state     = {:?}",
+        created.as_ref().map(|device| device.ifindex)
+    );
+    created?;
+    assert_eq!(
+        pinned_map_entries(&pin_dir, MAP_COUNTERS),
+        COUNTER_SLOTS,
+        "create must restore the counter pin at this build's ABI"
+    );
+    assert_eq!(
+        creator
+            .read_pdp_context(PdpContextSelector::LocalTeid(
+                PdpContextLocalTeidSelector::from_context(&session)
+                    .ok_or("local selector requires nonzero ifindex")?,
+            ))
+            .await?,
+        PdpContextReadback::Present(session),
+        "a create that restores a counter pin must not discard sessions"
+    );
+    drop(creator);
+    run("tc", &["filter", "del", "dev", "s2bu", "egress"]);
+    run("tc", &["filter", "del", "dev", "s2bu", "ingress"]);
+
+    // Absence heals; an entry that is not a pin at all must not be read as
+    // absence. The classifier learns each pin's shape through
+    // `symlink_metadata` and `MapInfo::from_pin`, and an unreadable entry
+    // treated as an absent pin would be handed straight to Aya, which creates a
+    // fresh pinned-by-name map -- precisely the concealment of durable state
+    // loss the preflights exist to prevent. bpffs admits directories, so that
+    // state is constructible.
+    fs::remove_file(pin_dir.join(MAP_COUNTERS)).expect("unpin the counters map");
+    fs::create_dir(pin_dir.join(MAP_COUNTERS)).expect("occupy a pin path with a directory");
+    let occupied = EbpfGtpuDataplaneBackend::with_config(config.clone());
+    let refusal = occupied.resolve_device("s2bu").await;
+    println!("REPRO resolve_device with a non-pin at a pin path = {refusal:?}");
+    assert!(
+        matches!(
+            refusal,
+            Err(GtpuError::StateIndeterminate {
+                operation: "ebpf_pin_map_abi"
+            })
+        ),
+        "an entry at a pin path that is not a readable map is indeterminate \
+         state, never an absent pin: {refusal:?}"
+    );
+    drop(occupied);
+    fs::remove_dir(pin_dir.join(MAP_COUNTERS)).expect("clear the occupied pin path");
+
+    drop(net);
+    Ok(())
+}
+
+/// A graph retained from a generation before the current bearer schema must
+/// never have this build's programs bound to a counter map narrower than they
+/// index.
+///
+/// The reconciliation before the load is not entitled to reshape such a graph:
+/// its migration can still refuse after the load, for reasons only the loaded
+/// maps can show, and removing a counter pin before that decision would swap it
+/// out from under the live legacy datapath the refusal deliberately leaves
+/// running. But the object loaded against a legacy graph is always the current
+/// one -- `load_pinned` has no legacy variant -- so without a second check the
+/// migration adopts the old counter map, advances the durable marker to
+/// `OPC-PMTU-v5`, and leaves a graph that claims to be current while
+/// `datapath_snapshot` cannot read a single counter from it.
+///
+/// `require_current_pin_map_abi` is that check, and it runs where the harm
+/// would occur: at the top of `attach_programs`, before either program is
+/// verified and bound, and after every migration decision has been made. So the
+/// migration refuses, having committed nothing -- and the same graph migrates
+/// normally once its counter pin is at this build's ABI, which is what proves
+/// the refusal is about the ABI and not about legacy graphs.
+#[tokio::test]
+// The serial guard is deliberately held for the entire test body; see
+// PRIVILEGED_TEST_LOCK.
+#[allow(clippy::await_holding_lock)]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn ebpf_gtpu_pre_v5_retained_graph_is_never_migrated_at_a_stale_counter_abi(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref() != Ok("1") {
+        eprintln!("skipping: set OPC_GTPU_RUN_PRIVILEGED=1 inside a fresh privileged netns");
+        return Ok(());
+    }
+
+    let _serial = PRIVILEGED_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let net = TestNet::provision();
+    let pin_dir = net.pin_root.join("s2bu");
+    let config = EbpfGtpuDataplaneBackendConfig {
+        bpffs_pin_root: net.pin_root.clone(),
+        ..EbpfGtpuDataplaneBackendConfig::default()
+    };
+
+    let previous = EbpfGtpuDataplaneBackend::with_config(config.clone());
+    let mut request = CreateGtpDeviceRequest::new("s2bu");
+    request.bind_address = IpAddr::V4(EPDG_S2BU_IP);
+    let device = previous.create_device(request).await?;
+    let session = session_context(device.ifindex);
+    previous.install_pdp_context(session.clone()).await?;
+    drop(previous);
+    run("tc", &["filter", "del", "dev", "s2bu", "egress"]);
+    run("tc", &["filter", "del", "dev", "s2bu", "ingress"]);
+
+    // Regress the graph to what an endpoint-bound v3 generation leaves behind:
+    // its durable marker and its counter ABI.
+    write_pinned_schema_marker(&pin_dir, UPLINK_ENDPOINT_SCHEMA_MARKER_VALUE);
+    repin_counters_at(&pin_dir, PRE_REDIRECT_COUNTER_SLOTS);
+    let retained_pdr_id = exact_pinned_map_ids(&pin_dir, &[MAP_DOWNLINK_PDR]);
+    println!(
+        "pre-v5 retained graph: marker={:?} GTPU_COUNTERS max_entries={}",
+        String::from_utf8_lossy(&pinned_schema_marker(&pin_dir)),
+        pinned_map_entries(&pin_dir, MAP_COUNTERS)
+    );
+
+    let refusing = EbpfGtpuDataplaneBackend::with_config(config.clone());
+    let refusal = refusing.resolve_device("s2bu").await;
+    println!("REPRO pre-v5 resolve_device   = {refusal:?}");
+    println!(
+        "REPRO after refusal: marker={:?} max_entries={} (build indexes {})",
+        String::from_utf8_lossy(&pinned_schema_marker(&pin_dir)),
+        pinned_map_entries(&pin_dir, MAP_COUNTERS),
+        COUNTER_SLOTS
+    );
+    assert!(
+        matches!(
+            refusal,
+            Err(GtpuError::Io {
+                operation: "ebpf_program_pin_map_abi",
+                kind: io::ErrorKind::InvalidData,
+                ..
+            })
+        ),
+        "this build's programs must never be bound to a counter map narrower \
+         than they index: {refusal:?}"
+    );
+    assert_eq!(
+        pinned_schema_marker(&pin_dir),
+        UPLINK_ENDPOINT_SCHEMA_MARKER_VALUE,
+        "a refused migration must not advance the durable schema marker"
+    );
+    assert_eq!(
+        pinned_map_entries(&pin_dir, MAP_COUNTERS),
+        PRE_REDIRECT_COUNTER_SLOTS,
+        "a legacy graph's counter pin must not be swapped out from under the \
+         datapath a refused migration leaves in place"
+    );
+    assert_eq!(
+        exact_pinned_map_ids(&pin_dir, &[MAP_DOWNLINK_PDR]),
+        retained_pdr_id,
+        "a refused migration must not rebuild a retained session pin"
+    );
+    assert!(
+        !tc_filters("egress").contains(PROG_UPLINK)
+            && !tc_filters("ingress").contains(PROG_DOWNLINK),
+        "a refused migration must not attach either program"
+    );
+    drop(refusing);
+
+    // Bring the counter pin to this build's ABI -- what draining and
+    // reprovisioning the graph achieves -- and the very same legacy graph
+    // migrates.
+    repin_counters_at(&pin_dir, COUNTER_SLOTS);
+    let upgraded = EbpfGtpuDataplaneBackend::with_config(config.clone());
+    let adopted = upgraded.resolve_device("s2bu").await;
+    println!(
+        "REPRO pre-v5 resolve_device at this build's counter ABI = {:?}",
+        adopted.as_ref().map(|device| device.ifindex)
+    );
+    let adopted = adopted?;
+    let snapshot = upgraded.datapath_snapshot(&adopted).await;
+    println!(
+        "REPRO datapath_snapshot       = {:?}",
+        snapshot.as_ref().map(|snapshot| snapshot.counters)
+    );
+    snapshot?;
+    assert_eq!(
+        pinned_schema_marker(&pin_dir),
+        UPLINK_PMTU_SCHEMA_MARKER_VALUE,
+        "a completed migration must commit the current schema marker"
+    );
+    assert_eq!(
+        upgraded
+            .read_pdp_context(PdpContextSelector::LocalTeid(
+                PdpContextLocalTeidSelector::from_context(&session)
+                    .ok_or("local selector requires nonzero ifindex")?,
+            ))
+            .await?,
+        PdpContextReadback::Present(session),
+        "migrating a legacy graph must not discard live session state"
+    );
+
+    drop(upgraded);
+    drop(net);
+    Ok(())
+}
+
+/// A refused attach must never disconnect a live previous generation from the
+/// counters an operator reads.
+///
+/// The counter reconciliation runs before the load, and the config-ownership
+/// check that refuses a second process bound to a different local address runs
+/// after it. A routine misconfiguration -- two processes, one pin namespace,
+/// different `bind_address` -- therefore rebuilds and re-pins the counter map
+/// and then refuses. The previous generation is still attached and still
+/// forwarding into the old map, which is no longer pinned, so every observer
+/// reads a permanently flat counter on a healthy link: this datapath's
+/// published signature of a total uplink outage.
+///
+/// A refused attach must leave the retained counter pins exactly as it found
+/// them.
+#[tokio::test]
+// The serial guard is deliberately held for the entire test body; see
+// PRIVILEGED_TEST_LOCK.
+#[allow(clippy::await_holding_lock)]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn ebpf_gtpu_refused_attach_leaves_a_live_generation_counting(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref() != Ok("1") {
+        eprintln!("skipping: set OPC_GTPU_RUN_PRIVILEGED=1 inside a fresh privileged netns");
+        return Ok(());
+    }
+
+    let _serial = PRIVILEGED_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let net = TestNet::provision();
+    let pin_dir = net.pin_root.join("s2bu");
+    let config = EbpfGtpuDataplaneBackendConfig {
+        bpffs_pin_root: net.pin_root.clone(),
+        ..EbpfGtpuDataplaneBackendConfig::default()
+    };
+
+    let previous = EbpfGtpuDataplaneBackend::with_config(config.clone());
+    let mut request = CreateGtpDeviceRequest::new("s2bu");
+    request.bind_address = IpAddr::V4(EPDG_S2BU_IP);
+    let device = previous.create_device(request).await?;
+    previous
+        .install_pdp_context(session_context(device.ifindex))
+        .await?;
+    drop(previous);
+    // Generation 1: still attached, still forwarding, at the pre-growth ABI.
+    retain_pre_redirect_datapath(&pin_dir);
+
+    let pgw_socket = in_netns(&net.pgw_ns, || {
+        UdpSocket::bind((PGW_IP, GTPU_PORT)).expect("bind PGW GTP-U socket")
+    });
+    let ue_socket = in_netns(&net.ue_ns, || {
+        UdpSocket::bind((UE_PAA, 5000)).expect("bind UE socket")
+    });
+    let mut buffer = [0_u8; 2048];
+    send_until_received(
+        || {
+            let _ = ue_socket.send_to(b"opc-gen1-serving", (REMOTE_HOST, 53));
+        },
+        &pgw_socket,
+        &mut buffer,
+    )
+    .expect("generation 1 must be forwarding before the refused attach");
+    drain_datagrams(&pgw_socket);
+    let serving_encapsulated = pinned_counter(&pin_dir, COUNTER_UL_ENCAP);
+    println!(
+        "gen1 serving: pinned GTPU_COUNTERS max_entries={}  encap slot={serving_encapsulated}",
+        pinned_map_entries(&pin_dir, MAP_COUNTERS)
+    );
+    assert!(
+        serving_encapsulated > 0,
+        "generation 1 must be counting into the pinned map before the refusal"
+    );
+
+    let intruder = EbpfGtpuDataplaneBackend::with_config(config.clone());
+    let mut conflicting = CreateGtpDeviceRequest::new("s2bu");
+    conflicting.bind_address = IpAddr::V4(EPDG_S2BU_ALT_IP);
+    let refusal = intruder.create_device(conflicting).await;
+    println!("REPRO refused create_device  = {refusal:?}");
+    assert!(
+        matches!(refusal, Err(GtpuError::AlreadyExists)),
+        "a second process bound to a different local address is an ownership \
+         conflict: {refusal:?}"
+    );
+    drop(intruder);
+    println!(
+        "REPRO after refusal: pinned max_entries={}  encap slot={}",
+        pinned_map_entries(&pin_dir, MAP_COUNTERS),
+        pinned_counter(&pin_dir, COUNTER_UL_ENCAP)
+    );
+    println!(
+        "REPRO egress filter still: {}",
+        tc_filters("egress").contains(PROG_UPLINK)
+    );
+
+    assert!(
+        tc_filters("egress").contains(PROG_UPLINK),
+        "a refused attach must leave generation 1's hooks alone"
+    );
+    let before = pinned_counter(&pin_dir, COUNTER_UL_ENCAP);
+    let mut delivered = 0;
+    for index in 0..REDIRECT_PROBE_PACKETS {
+        ue_socket.send_to(
+            format!("opc-gen1-after-refusal-{index}").as_bytes(),
+            (REMOTE_HOST, 53),
+        )?;
+    }
+    pgw_socket
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set PGW read timeout");
+    for _ in 0..REDIRECT_PROBE_PACKETS {
+        if pgw_socket.recv_from(&mut buffer).is_ok() {
+            delivered += 1;
+        }
+    }
+    let after = pinned_counter(&pin_dir, COUNTER_UL_ENCAP);
+    println!(
+        "REPRO traffic after refusal: delivered={delivered}  pinned uplink_encapsulated \
+         {before} -> {after}"
+    );
+
+    assert_eq!(
+        delivered, REDIRECT_PROBE_PACKETS,
+        "generation 1 must still be forwarding after the refusal"
+    );
+    assert_eq!(
+        after,
+        before + u64::from(REDIRECT_PROBE_PACKETS),
+        "a refused attach must leave the live generation's counters readable \
+         at their pin: a flat counter against live traffic is this datapath's \
+         published signature of a total uplink outage"
+    );
+    assert_eq!(
+        pinned_map_entries(&pin_dir, MAP_COUNTERS),
+        PRE_REDIRECT_COUNTER_SLOTS,
+        "a refused attach must not rebuild the retained counter pin"
+    );
+
+    // The published remediation for a graph whose writer is gone must work on
+    // the graph it is published for. A stale counter slot count is exactly the
+    // state that sends an operator here, so recovery must not read it as a
+    // foreign identity and refuse the remedy for the condition it treats.
+    run("tc", &["filter", "del", "dev", "s2bu", "egress"]);
+    run("tc", &["filter", "del", "dev", "s2bu", "ingress"]);
+    let recovery = EbpfGtpuDataplaneBackend::with_config(config.clone());
+    let recovered = recovery
+        .recover_orphaned_current_ebpf_graph(
+            CurrentEbpfGraphRecoveryRequest::new(
+                "s2bu",
+                CurrentEbpfGraphWriterProof::previous_writer_stopped(),
+            )
+            .with_drain_proof(CurrentEbpfGraphDrainProof::sessions_and_traffic_drained())
+            .with_replacement_device(device.clone()),
+        )
+        .await;
+    println!("REPRO recover_orphaned on a stale counter ABI = {recovered:?}");
+    assert_eq!(
+        recovered?,
+        CurrentEbpfGraphRecoveryOutcome::Removed,
+        "a counter map's width is not this graph's identity"
+    );
+    assert!(!pin_dir.exists(), "recovery must remove every pin");
+
+    drop(net);
+    Ok(())
+}
+
+/// What a refused pre-v5 migration actually does to a graph that is genuinely
+/// v3-shaped, and what it takes to move that graph forward afterwards.
+///
+/// `ebpf_gtpu_pre_v5_retained_graph_is_never_migrated_at_a_stale_counter_abi`
+/// regresses a current-build directory's marker and counter ABI but leaves all
+/// twenty-one pins in place, so it cannot see the additive half of a migration
+/// at all. A directory a v3 generation actually left behind is short of the
+/// four maps the source-port-v4 and PMTU-v5 schemas added, and `load_pinned`
+/// runs -- creating and pinning them -- long before `require_current_pin_map_abi`
+/// refuses at the top of `attach_programs`. `materialize_legacy_source_port_policies`
+/// then writes the legacy policy of every retained session into one of them.
+///
+/// So "refused with everything untouched" is not the property. The property is
+/// that everything *load-bearing* is untouched -- the durable marker, the
+/// retained session pins and their kernel identities, and both tc slots -- while
+/// the additive current pins are created and populated. That is the same
+/// distinction `ebpf_gtpu_uplink_and_downlink_round_trip` already draws for the
+/// v1 path ("loading the current object may create its additive empty pins,
+/// which is safe and expected"), and it is what the crate README and changelog
+/// must say.
+///
+/// The remedy matters more than the wording. A counter pin's absence is
+/// self-healing by construction, so unlinking that one pin -- and nothing else
+/// -- lets the very same graph migrate with every session intact. Prescribing a
+/// drained reprovision here would cost an operator every session on a graph one
+/// `rm` recovers.
+#[tokio::test]
+// The serial guard is deliberately held for the entire test body; see
+// PRIVILEGED_TEST_LOCK.
+#[allow(clippy::await_holding_lock)]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn ebpf_gtpu_v3_shaped_retained_graph_refuses_then_heals_without_a_drain(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref() != Ok("1") {
+        eprintln!("skipping: set OPC_GTPU_RUN_PRIVILEGED=1 inside a fresh privileged netns");
+        return Ok(());
+    }
+
+    let _serial = PRIVILEGED_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let net = TestNet::provision();
+    let pin_dir = net.pin_root.join("s2bu");
+    let config = EbpfGtpuDataplaneBackendConfig {
+        bpffs_pin_root: net.pin_root.clone(),
+        ..EbpfGtpuDataplaneBackendConfig::default()
+    };
+
+    let previous = EbpfGtpuDataplaneBackend::with_config(config.clone());
+    let mut request = CreateGtpDeviceRequest::new("s2bu");
+    request.bind_address = IpAddr::V4(EPDG_S2BU_IP);
+    let device = previous.create_device(request).await?;
+    let session = session_context(device.ifindex);
+    previous.install_pdp_context(session.clone()).await?;
+    drop(previous);
+    run("tc", &["filter", "del", "dev", "s2bu", "egress"]);
+    run("tc", &["filter", "del", "dev", "s2bu", "ingress"]);
+
+    // Exactly what a v3 generation leaves behind: its durable marker, its
+    // counter ABI, and its pin set.
+    write_pinned_schema_marker(&pin_dir, UPLINK_ENDPOINT_SCHEMA_MARKER_VALUE);
+    repin_counters_at(&pin_dir, PRE_REDIRECT_COUNTER_SLOTS);
+    make_v3_shaped(&pin_dir);
+
+    let retained_names = pinned_names(&pin_dir);
+    let retained_session_ids = exact_pinned_map_ids(
+        &pin_dir,
+        &[
+            MAP_UPLINK_FAR,
+            MAP_UPLINK_MARK_FAR,
+            MAP_DOWNLINK_PDR,
+            MAP_DOWNLINK_MARK_PDR,
+            MAP_DOWNLINK_ENDPOINT_BINDING,
+            MAP_MARKED_BEARER_OWNER,
+            MAP_CONFIG,
+        ],
+    );
+    let retained_counter_id = exact_pinned_map_ids(&pin_dir, &[MAP_COUNTERS]);
+    println!(
+        "REPRO v3 graph before refusal: {} pins {retained_names:?}",
+        retained_names.len()
+    );
+    assert_eq!(
+        retained_names.len(),
+        17,
+        "a v3-shaped graph is short of the four post-v3 maps: {retained_names:?}"
+    );
+    for name in POST_V3_MAPS {
+        assert!(
+            !retained_names.iter().any(|pinned| pinned == name),
+            "a v3 generation never pinned {name}"
+        );
+    }
+
+    let refusing = EbpfGtpuDataplaneBackend::with_config(config.clone());
+    let refusal = refusing.resolve_device("s2bu").await;
+    println!("REPRO v3-shaped resolve_device = {refusal:?}");
+    assert!(
+        matches!(
+            refusal,
+            Err(GtpuError::Io {
+                operation: "ebpf_program_pin_map_abi",
+                kind: io::ErrorKind::InvalidData,
+                ..
+            })
+        ),
+        "this build's programs must never be bound to a counter map narrower \
+         than they index: {refusal:?}"
+    );
+    drop(refusing);
+
+    // The additive half, stated rather than assumed. `load_pinned` created and
+    // pinned every current map the v3 graph was short of, and the legacy
+    // materialization wrote the retained session's uplink source-port policy
+    // into one of them, all before the refusal.
+    let after_names = pinned_names(&pin_dir);
+    println!(
+        "REPRO v3 graph after refusal: {} pins, added {:?}",
+        after_names.len(),
+        after_names
+            .iter()
+            .filter(|name| !retained_names.contains(name))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        after_names.len(),
+        21,
+        "a refused migration still leaves the current object's additive pins \
+         behind: {after_names:?}"
+    );
+    for name in POST_V3_MAPS {
+        assert!(
+            after_names.iter().any(|pinned| pinned == name),
+            "load_pinned creates and pins {name} before the refusal"
+        );
+    }
+    assert_eq!(
+        pinned_source_port_entries(&pin_dir),
+        1,
+        "the retained session's legacy uplink source-port policy is \
+         materialized into the newly created pin before the refusal"
+    );
+
+    // Everything load-bearing, on the other hand, is exactly as it was.
+    assert_eq!(
+        pinned_schema_marker(&pin_dir),
+        UPLINK_ENDPOINT_SCHEMA_MARKER_VALUE,
+        "a refused migration must not advance the durable schema marker"
+    );
+    assert_eq!(
+        pinned_map_entries(&pin_dir, MAP_COUNTERS),
+        PRE_REDIRECT_COUNTER_SLOTS,
+        "a legacy graph's counter pin must not be swapped out from under the \
+         datapath a refused migration leaves in place"
+    );
+    assert_eq!(
+        exact_pinned_map_ids(&pin_dir, &[MAP_COUNTERS]),
+        retained_counter_id,
+        "nor may it be rebuilt under a new kernel identity"
+    );
+    assert_eq!(
+        exact_pinned_map_ids(
+            &pin_dir,
+            &[
+                MAP_UPLINK_FAR,
+                MAP_UPLINK_MARK_FAR,
+                MAP_DOWNLINK_PDR,
+                MAP_DOWNLINK_MARK_PDR,
+                MAP_DOWNLINK_ENDPOINT_BINDING,
+                MAP_MARKED_BEARER_OWNER,
+                MAP_CONFIG,
+            ],
+        ),
+        retained_session_ids,
+        "a refused migration must not rebuild a single retained session, \
+         bearer or device pin"
+    );
+    assert!(
+        !tc_filters("egress").contains(PROG_UPLINK)
+            && !tc_filters("ingress").contains(PROG_DOWNLINK),
+        "a refused migration must not attach either program"
+    );
+
+    // The published remedy, run exactly as an operator would run it: unlink
+    // the one pin whose absence this datapath guarantees is self-healing, and
+    // nothing else. No drain, no re-signalling, no session loss.
+    fs::remove_file(pin_dir.join(MAP_COUNTERS)).expect("unlink only the counter pin");
+    let healed = EbpfGtpuDataplaneBackend::with_config(config.clone());
+    let adopted = healed.resolve_device("s2bu").await;
+    println!(
+        "REPRO after `rm GTPU_COUNTERS`, resolve_device = {:?}",
+        adopted.as_ref().map(|device| device.ifindex)
+    );
+    let adopted = adopted?;
+    assert_eq!(
+        pinned_map_entries(&pin_dir, MAP_COUNTERS),
+        COUNTER_SLOTS,
+        "the load must recreate the counter pin at this build's ABI"
+    );
+    assert_eq!(
+        pinned_schema_marker(&pin_dir),
+        UPLINK_PMTU_SCHEMA_MARKER_VALUE,
+        "the migration the stale counter ABI refused must now complete"
+    );
+    let snapshot = healed.datapath_snapshot(&adopted).await;
+    println!(
+        "REPRO healed datapath_snapshot = {:?}",
+        snapshot.as_ref().map(|snapshot| snapshot.counters)
+    );
+    snapshot?;
+    assert_eq!(
+        healed
+            .read_pdp_context(PdpContextSelector::LocalTeid(
+                PdpContextLocalTeidSelector::from_context(&session)
+                    .ok_or("local selector requires nonzero ifindex")?,
+            ))
+            .await?,
+        PdpContextReadback::Present(session.clone()),
+        "the non-destructive remedy must preserve every session the drained \
+         reprovision would have destroyed"
+    );
+    drop(healed);
+    run("tc", &["filter", "del", "dev", "s2bu", "egress"]);
+    run("tc", &["filter", "del", "dev", "s2bu", "ingress"]);
+
+    // The same remedy must work through `create_device`, which is the entry
+    // point a restarting deployment actually uses. Put the graph back the way
+    // the v3 generation left it, apply the remedy, and start a new process.
+    write_pinned_schema_marker(&pin_dir, UPLINK_ENDPOINT_SCHEMA_MARKER_VALUE);
+    repin_counters_at(&pin_dir, PRE_REDIRECT_COUNTER_SLOTS);
+    make_v3_shaped(&pin_dir);
+    fs::remove_file(pin_dir.join(MAP_COUNTERS)).expect("unlink only the counter pin");
+    let restarting = EbpfGtpuDataplaneBackend::with_config(config.clone());
+    let mut request = CreateGtpDeviceRequest::new("s2bu");
+    request.bind_address = IpAddr::V4(EPDG_S2BU_IP);
+    let created = restarting.create_device(request).await;
+    println!(
+        "REPRO create_device after the same remedy = {:?}",
+        created.as_ref().map(|device| device.ifindex)
+    );
+    created?;
+    assert_eq!(
+        pinned_map_entries(&pin_dir, MAP_COUNTERS),
+        COUNTER_SLOTS,
+        "create must restore the counter pin at this build's ABI"
+    );
+    assert_eq!(
+        pinned_schema_marker(&pin_dir),
+        UPLINK_PMTU_SCHEMA_MARKER_VALUE,
+        "create must complete the migration the stale counter ABI refused"
+    );
+    assert_eq!(
+        restarting
+            .read_pdp_context(PdpContextSelector::LocalTeid(
+                PdpContextLocalTeidSelector::from_context(&session)
+                    .ok_or("local selector requires nonzero ifindex")?,
+            ))
+            .await?,
+        PdpContextReadback::Present(session),
+        "a restarting deployment must keep every session the remedy preserved"
+    );
+
+    drop(restarting);
+    drop(net);
+    Ok(())
+}
+
+/// A populated endpoint-unbound v1 graph is the case where the drain really is
+/// required, and it is required for a reason the counter ABI cannot reach.
+///
+/// Such a graph cannot be inferred as endpoint-bound, so adoption refuses it in
+/// `ebpf_marked_owner_rebuild` -- after the load, and therefore before
+/// `require_current_pin_map_abi` ever sees the graph. Bringing its counter pin
+/// to this build's ABI changes nothing, which is exactly what distinguishes it
+/// from the v3 case above: there, one `rm` recovers every session; here, no pin
+/// surgery does, and the drained reprovision is the only way forward.
+///
+/// The two remedies are documented side by side, so both are pinned side by
+/// side.
+#[tokio::test]
+// The serial guard is deliberately held for the entire test body; see
+// PRIVILEGED_TEST_LOCK.
+#[allow(clippy::await_holding_lock)]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn ebpf_gtpu_populated_v1_graph_still_requires_a_drain_at_this_counter_abi(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref() != Ok("1") {
+        eprintln!("skipping: set OPC_GTPU_RUN_PRIVILEGED=1 inside a fresh privileged netns");
+        return Ok(());
+    }
+
+    let _serial = PRIVILEGED_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let net = TestNet::provision();
+    let pin_dir = net.pin_root.join("s2bu");
+    let config = EbpfGtpuDataplaneBackendConfig {
+        bpffs_pin_root: net.pin_root.clone(),
+        ..EbpfGtpuDataplaneBackendConfig::default()
+    };
+
+    // Bring the interface and its clsact qdisc up the way a deployment does,
+    // then hand the namespace to a frozen v1 generation.
+    let bootstrap = EbpfGtpuDataplaneBackend::with_config(config.clone());
+    let mut request = CreateGtpDeviceRequest::new("s2bu");
+    request.bind_address = IpAddr::V4(EPDG_S2BU_IP);
+    let device = bootstrap.create_device(request).await?;
+    bootstrap.remove_device(&device).await?;
+    drop(bootstrap);
+    let (v1_uplink_id, v1_downlink_id) = install_frozen_v1_datapath(&pin_dir);
+    // Every retained v1 pin except the counter map, which this test unlinks on
+    // purpose and whose rebuild is the documented self-healing behaviour.
+    let retained_v1_state = exact_pinned_map_ids(
+        &pin_dir,
+        &[
+            MAP_UPLINK_FAR,
+            MAP_UPLINK_DSCP,
+            MAP_DOWNLINK_PDR,
+            MAP_CONFIG,
+        ],
+    );
+    println!(
+        "REPRO populated endpoint-unbound v1: marker={:?} GTPU_COUNTERS max_entries={} \
+         (build indexes {COUNTER_SLOTS})",
+        String::from_utf8_lossy(&pinned_schema_marker(&pin_dir)),
+        pinned_map_entries(&pin_dir, MAP_COUNTERS),
+    );
+    assert_eq!(
+        pinned_map_entries(&pin_dir, MAP_COUNTERS),
+        PRE_REDIRECT_COUNTER_SLOTS,
+        "the frozen v1 object declares the pre-growth counter ABI"
+    );
+
+    let stale = EbpfGtpuDataplaneBackend::with_config(config.clone());
+    let stale_refusal = stale.resolve_device("s2bu").await;
+    println!("REPRO v1 resolve_device at a stale counter ABI = {stale_refusal:?}");
+    assert!(
+        matches!(
+            stale_refusal,
+            Err(GtpuError::StateIndeterminate {
+                operation: "ebpf_marked_owner_rebuild"
+            })
+        ),
+        "a populated endpoint-unbound v1 graph is refused before the ABI check \
+         is reached: {stale_refusal:?}"
+    );
+    drop(stale);
+
+    // The remedy that recovers a v3 graph does not recover this one. The pin
+    // heals -- counter pins always do -- and the refusal is unchanged.
+    fs::remove_file(pin_dir.join(MAP_COUNTERS)).expect("unlink only the counter pin");
+    let healed = EbpfGtpuDataplaneBackend::with_config(config.clone());
+    let healed_refusal = healed.resolve_device("s2bu").await;
+    println!("REPRO v1 resolve_device after `rm GTPU_COUNTERS` = {healed_refusal:?}");
+    assert!(
+        matches!(
+            healed_refusal,
+            Err(GtpuError::StateIndeterminate {
+                operation: "ebpf_marked_owner_rebuild"
+            })
+        ),
+        "no counter-pin surgery makes a populated endpoint-unbound v1 graph \
+         adoptable; only a drained reprovision does: {healed_refusal:?}"
+    );
+    drop(healed);
+    assert_eq!(
+        pinned_map_entries(&pin_dir, MAP_COUNTERS),
+        COUNTER_SLOTS,
+        "the counter pin still heals at this build's ABI, which is precisely \
+         why it is not what refuses this graph"
+    );
+    assert_eq!(
+        pinned_schema_marker(&pin_dir),
+        UPLINK_DSCP_SCHEMA_MARKER_VALUE,
+        "a refused adoption must not advance the durable marker"
+    );
+    assert_eq!(
+        exact_pinned_map_ids(
+            &pin_dir,
+            &[
+                MAP_UPLINK_FAR,
+                MAP_UPLINK_DSCP,
+                MAP_DOWNLINK_PDR,
+                MAP_CONFIG
+            ],
+        ),
+        retained_v1_state,
+        "a refused adoption must not rebuild a retained state-bearing v1 pin"
+    );
+    assert_eq!(tc_program_id("egress"), v1_uplink_id);
+    assert_eq!(tc_program_id("ingress"), v1_downlink_id);
+
+    for direction in ["egress", "ingress"] {
+        run(
+            "tc",
+            &[
+                "filter", "del", "dev", "s2bu", direction, "handle", "0x1", "pref", "50", "bpf",
+            ],
+        );
+    }
+    drop(net);
+    Ok(())
+}
+
+/// Two entry points asking the same question about the same graph must report
+/// the same answer.
+///
+/// The reconciliation answers "do I own this graph?" out of `GTPU_CONFIG`
+/// itself on the `create_device` path. A `GTPU_CONFIG` pin whose shape is not
+/// this build's cannot answer it -- but if ownership is evaluated before the
+/// graph is classified, the typed read fails first and the schema break is
+/// reported as `ebpf_pin_config_read` with `ErrorKind::Other`, while
+/// `resolve_device`, which inherits its configuration and never performs that
+/// read, reports the same graph as `ebpf_pin_map_abi` with
+/// `ErrorKind::InvalidData`. One condition, two operations, two kinds, and
+/// neither the crate README nor an operator matching on the documented contract
+/// would recognise the first.
+///
+/// Classifying the whole graph before evaluating ownership fixes both: the
+/// break is reported as a break wherever it is met, and the removal that
+/// ownership actually gates still runs last and still runs only for the owner.
+#[tokio::test]
+// The serial guard is deliberately held for the entire test body; see
+// PRIVILEGED_TEST_LOCK.
+#[allow(clippy::await_holding_lock)]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn ebpf_gtpu_divergent_config_pin_is_refused_identically_on_every_entry_point(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref() != Ok("1") {
+        eprintln!("skipping: set OPC_GTPU_RUN_PRIVILEGED=1 inside a fresh privileged netns");
+        return Ok(());
+    }
+
+    let _serial = PRIVILEGED_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let net = TestNet::provision();
+    let pin_dir = net.pin_root.join("s2bu");
+    let config = EbpfGtpuDataplaneBackendConfig {
+        bpffs_pin_root: net.pin_root.clone(),
+        ..EbpfGtpuDataplaneBackendConfig::default()
+    };
+
+    let previous = EbpfGtpuDataplaneBackend::with_config(config.clone());
+    let mut request = CreateGtpDeviceRequest::new("s2bu");
+    request.bind_address = IpAddr::V4(EPDG_S2BU_IP);
+    let device = previous.create_device(request).await?;
+    previous
+        .install_pdp_context(session_context(device.ifindex))
+        .await?;
+    drop(previous);
+    run("tc", &["filter", "del", "dev", "s2bu", "egress"]);
+    run("tc", &["filter", "del", "dev", "s2bu", "ingress"]);
+
+    // A `GTPU_CONFIG` pin at a shape this build never declared: a per-CPU
+    // eight-byte array where the specification calls for a one-slot four-byte
+    // array. Nothing in the crate can read a bound address out of it.
+    fs::remove_file(pin_dir.join(MAP_CONFIG)).expect("unpin the current config map");
+    MapData::from_pin(pin_dir.join(MAP_DOWNLINK_BINDING_COUNTERS))
+        .expect("open a donor map of a different shape")
+        .pin(pin_dir.join(MAP_CONFIG))
+        .expect("pin a foreign-shaped GTPU_CONFIG");
+    let divergent = MapInfo::from_pin(pin_dir.join(MAP_CONFIG)).expect("read the divergent pin");
+    println!(
+        "REPRO hand-built GTPU_CONFIG: key_size {} value_size {} (spec 4/4)",
+        divergent.key_size(),
+        divergent.value_size(),
+    );
+    assert_ne!(
+        divergent.value_size(),
+        4,
+        "the divergent pin must not be readable as this build's config map"
+    );
+    let retained_pin_count = pinned_names(&pin_dir).len();
+
+    let creating = EbpfGtpuDataplaneBackend::with_config(config.clone());
+    let mut owner_request = CreateGtpDeviceRequest::new("s2bu");
+    owner_request.bind_address = IpAddr::V4(EPDG_S2BU_IP);
+    let created = creating.create_device(owner_request).await;
+    println!("REPRO create_device  = {created:?}");
+    drop(creating);
+
+    let conflicting = EbpfGtpuDataplaneBackend::with_config(config.clone());
+    let mut intruder_request = CreateGtpDeviceRequest::new("s2bu");
+    intruder_request.bind_address = IpAddr::V4(EPDG_S2BU_ALT_IP);
+    let contested = conflicting.create_device(intruder_request).await;
+    println!("REPRO create_device (conflicting owner) = {contested:?}");
+    drop(conflicting);
+
+    let resolving = EbpfGtpuDataplaneBackend::with_config(config.clone());
+    let resolved = resolving.resolve_device("s2bu").await;
+    println!("REPRO resolve_device = {resolved:?}");
+    drop(resolving);
+
+    // A graph at a foreign ABI is terminal for every process, so the
+    // classification that reports it is deliberately not gated on ownership --
+    // a conflicting attach meets the schema break, not `AlreadyExists`.
+    for (entry_point, outcome) in [
+        ("create_device", created),
+        ("create_device (conflicting owner)", contested),
+        ("resolve_device", resolved),
+    ] {
+        assert!(
+            matches!(
+                outcome,
+                Err(GtpuError::Io {
+                    operation: "ebpf_pin_map_abi",
+                    kind: io::ErrorKind::InvalidData,
+                    ..
+                })
+            ),
+            "{entry_point} must report a divergent GTPU_CONFIG as the schema \
+             break it is, under the operation and kind the crate documents: \
+             {outcome:?}"
+        );
+    }
+
+    // Fail-closed on both, which is what makes the shared contract safe to
+    // publish: the counter pins the same pass would otherwise have rebuilt are
+    // untouched, and nothing was removed.
+    assert_eq!(
+        pinned_map_entries(&pin_dir, MAP_COUNTERS),
+        COUNTER_SLOTS,
+        "a refused attach must not rebuild a counter pin"
+    );
+    assert_eq!(
+        pinned_names(&pin_dir).len(),
+        retained_pin_count,
+        "a refused attach must not remove a pin"
+    );
+
+    drop(net);
+    Ok(())
+}
+
+/// The grouped attach path proves ownership from the pins before it touches
+/// them, exactly as the bound-address path does.
+///
+/// Nothing else in the suite exercises that gate. Every grouped test starts
+/// from a fresh bpffs, so `grouped_schema_preflight` reports `Fresh` and the
+/// recorded-configuration arm the gate is made of is never evaluated against a
+/// retained graph that belongs to somebody else -- forcing it to "this request
+/// matches" survives the whole suite, including the live dual-stack contract.
+///
+/// The harm it guards is the same one the bound-address path guards, and it is
+/// not hypothetical: a grouped generation is still attached and still
+/// forwarding when a second process attaches the same pin namespace with a
+/// different grouped device authority. If the reconciliation believed that
+/// request owned the graph, it would unpin and rebuild the counter map, the
+/// load would recreate it at this build's ABI with a new kernel ID, and only
+/// then would the configuration arbitration refuse with `AlreadyExists`. The
+/// live generation keeps writing to a map that is no longer pinned, so every
+/// observer reads a permanently flat counter on a healthy link: this datapath's
+/// published signature of a total uplink outage.
+#[tokio::test(flavor = "multi_thread")]
+// The serial guard is deliberately held for the entire test body; see
+// PRIVILEGED_TEST_LOCK.
+#[allow(clippy::await_holding_lock)]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn ebpf_gtpu_refused_grouped_attach_leaves_a_live_generation_counting(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref() != Ok("1") {
+        eprintln!("skipping: set OPC_GTPU_RUN_PRIVILEGED=1 inside a fresh privileged netns");
+        return Ok(());
+    }
+
+    let _serial = PRIVILEGED_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let net = TestNet::provision();
+    let pin_dir = grouped_pin_dir(&net.pin_root);
+    let config = EbpfGtpuDataplaneBackendConfig {
+        bpffs_pin_root: net.pin_root.clone(),
+        ..EbpfGtpuDataplaneBackendConfig::default()
+    };
+    let policy = GtpuUplinkMtuPolicy::new(1500, GtpuOuterFragmentPolicy::SignalPacketTooBig)
+        .expect("canonical dual-stack PMTU policy");
+
+    let previous = EbpfGtpuDataplaneBackend::with_config(config.clone());
+    let device = previous
+        .create_device_with_endpoints(grouped_device_request(policy))
+        .await?;
+    assert_eq!(
+        previous
+            .reconcile_pdp_context_group(fresh_grouped_reconcile(initial_grouped_session(
+                device.ifindex
+            )))
+            .await?,
+        GtpuSessionGroupReconcileOutcome::Activated
+    );
+    drop(previous);
+    // Generation 1: still attached, still forwarding, at the pre-growth ABI.
+    retain_pre_redirect_datapath(&pin_dir);
+
+    run("ping", &["-c", "1", "-W", "1", "192.0.2.10"]);
+    let pgw_socket = in_netns(&net.pgw_ns, || {
+        UdpSocket::bind((PGW_IP, GTPU_PORT)).expect("bind PGW GTP-U socket")
+    });
+    let ue_socket = in_netns(&net.ue_ns, || {
+        UdpSocket::bind((UE_PAA, 5600)).expect("bind grouped UE socket")
+    });
+    let mut buffer = [0_u8; 2048];
+    let (_, from) = send_until_received(
+        || {
+            let _ = ue_socket.send_to(b"opc-grouped-gen1-serving", (REMOTE_HOST, 53));
+        },
+        &pgw_socket,
+        &mut buffer,
+    )
+    .expect("grouped generation 1 must be forwarding before the refused attach");
+    assert_eq!(from, SocketAddr::from((EPDG_S2BU_IP, GTPU_PORT)));
+    drain_datagrams(&pgw_socket);
+    let serving_encapsulated = pinned_counter(&pin_dir, COUNTER_UL_ENCAP);
+    let serving_counter_id = exact_pinned_map_ids(&pin_dir, &[MAP_COUNTERS]);
+    println!(
+        "grouped gen1 serving: pinned GTPU_COUNTERS max_entries={} encap slot={serving_encapsulated}",
+        pinned_map_entries(&pin_dir, MAP_COUNTERS)
+    );
+    assert!(
+        serving_encapsulated > 0,
+        "grouped generation 1 must be counting into the pinned map before the refusal"
+    );
+
+    let intruder = EbpfGtpuDataplaneBackend::with_config(config.clone());
+    let refusal = intruder
+        .create_device_with_endpoints(conflicting_grouped_device_request(policy))
+        .await;
+    println!(
+        "REPRO refused grouped create_device_with_endpoints = {:?}",
+        refusal.as_ref().map(|device| device.ifindex)
+    );
+    assert!(
+        matches!(refusal, Err(GtpuError::AlreadyExists)),
+        "a second process claiming the same pin namespace under a different \
+         grouped device authority is an ownership conflict: {refusal:?}"
+    );
+    drop(intruder);
+
+    assert_eq!(
+        pinned_map_entries(&pin_dir, MAP_COUNTERS),
+        PRE_REDIRECT_COUNTER_SLOTS,
+        "a refused grouped attach must not rebuild the retained counter pin"
+    );
+    assert_eq!(
+        exact_pinned_map_ids(&pin_dir, &[MAP_COUNTERS]),
+        serving_counter_id,
+        "a refused grouped attach must leave the live generation's counter map \
+         at its pin, kernel identity included"
+    );
+    assert!(
+        tc_filters("egress").contains(PROG_UPLINK),
+        "a refused grouped attach must leave generation 1's hooks alone"
+    );
+
+    let before = pinned_counter(&pin_dir, COUNTER_UL_ENCAP);
+    let mut delivered = 0;
+    for index in 0..REDIRECT_PROBE_PACKETS {
+        ue_socket.send_to(
+            format!("opc-grouped-gen1-after-refusal-{index}").as_bytes(),
+            (REMOTE_HOST, 53),
+        )?;
+    }
+    pgw_socket
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set PGW read timeout");
+    for _ in 0..REDIRECT_PROBE_PACKETS {
+        if pgw_socket.recv_from(&mut buffer).is_ok() {
+            delivered += 1;
+        }
+    }
+    let after = pinned_counter(&pin_dir, COUNTER_UL_ENCAP);
+    println!(
+        "REPRO grouped traffic after refusal: delivered={delivered} pinned \
+         uplink_encapsulated {before} -> {after}"
+    );
+    assert_eq!(
+        delivered, REDIRECT_PROBE_PACKETS,
+        "grouped generation 1 must still be forwarding after the refusal"
+    );
+    assert_eq!(
+        after,
+        before + u64::from(REDIRECT_PROBE_PACKETS),
+        "a refused grouped attach must leave the live generation's counters \
+         readable at their pin: a flat counter against live traffic is this \
+         datapath's published signature of a total uplink outage"
     );
 
     drop(net);

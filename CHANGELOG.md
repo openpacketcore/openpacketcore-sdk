@@ -296,6 +296,225 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     fixture, so no message that already round-tripped moves on the wire.
 
 ### Fixed
+- **Retained pin graphs were adopted at the wrong map ABI --
+  `opc-gtpu-dataplane`:** growing `COUNTER_SLOTS` from six to seven in the same
+  unreleased window changed `GTPU_COUNTERS.max_entries` in the pinned map graph,
+  and the claim that a graph retained from a build with the old slot count was
+  "refused rather than adopted in place" was false on the normal attach path.
+  Aya routes a `pinning = ByName` map through `MapData::create_pinned_by_name`,
+  which returns the fd of an existing pin without comparing a single dimension;
+  the bearer schema marker does not change when only a map's shape does, so the
+  retained graph still classified as the current schema; and the attach-time pin
+  identity check compares kernel map IDs read from the very maps that were just
+  adopted, so both sides agreed by construction. The only `max_entries`
+  comparison in the crate was reachable solely from the explicit
+  `recover_orphaned_current_ebpf_graph` maintenance API, never from
+  `create_device` or `resolve_device`.
+  - The consequence on the upgrade path -- the designed high-availability
+    behaviour, where bpffs keeps the graph so session state survives a restart
+    -- was worse than a wrong number. The seven-slot program loads fine against
+    an adopted six-entry `PERCPU_ARRAY`, `GTPU_COUNTERS.get_ptr_mut(6)` returns
+    `None`, and every `uplink_redirects_resolved` increment was dropped
+    silently. Reading that slot from userspace fails outright with
+    `KeyNotFound`, so `datapath_snapshot` returned `GtpuError::NotFound` for the
+    whole device and **no** counter was readable. This reintroduced, on the
+    upgrade path only, the permanently-zero counter that was formally reverted
+    as PR #571.
+  - The property is now stated where the harm would occur.
+    `require_current_pin_map_abi` runs at the top of `attach_programs`, before
+    either program is verified and bound and before the durable schema marker
+    can advance, and refuses any pin that is not this build's ABI with
+    `GtpuError::Io { operation: "ebpf_program_pin_map_abi", kind: InvalidData }`.
+    This build's programs are therefore never bound to a foreign-ABI map,
+    whatever the repair pass below did or did not do.
+  - `reconcile_retained_pin_map_abi` is the repair pass. It runs on every
+    `attach`, `attach_grouped` and `adopt` path, after the schema preflights and
+    before the object is loaded, and it reshapes only a graph that has already
+    reached the current map set (`OPC-SPORT-v4` or `OPC-PMTU-v5`). It classifies
+    the whole graph before reading anything out of it and before touching
+    anything; a per-CPU counter map (`GTPU_COUNTERS`, `GTPU_DL_DROP`,
+    `GTPU_PMTU_DROP`) whose only divergence is its slot count is unpinned so the
+    load recreates it at this build's ABI, because those maps hold packet
+    counters and nothing else and no decision reads them back, and every other
+    divergence refuses the attach with
+    `GtpuError::Io { operation: "ebpf_pin_map_abi", kind: InvalidData }`.
+    Classification precedes the ownership question because `create_device`
+    answers that question by reading `GTPU_CONFIG` itself: evaluating ownership
+    first reported a divergent `GTPU_CONFIG` as `ebpf_pin_config_read` with
+    `ErrorKind::Other` there while `resolve_device` reported the same graph as
+    `ebpf_pin_map_abi` with `ErrorKind::InvalidData`, so one condition had two
+    operations and two kinds and neither matched the documented contract. Only
+    the removal is gated on ownership, and it still runs last.
+  - A graph below `OPC-SPORT-v4` is deliberately not reshaped. Such a graph is
+    migrated rather than reshaped, and its migration can still refuse after the
+    load for reasons only the loaded maps can show
+    (`ebpf_marked_owner_rebuild`); unpinning a counter map before that decision
+    swaps it out from under the live legacy datapath that the refusal
+    deliberately leaves running, which is directly observable as a changed
+    `GTPU_COUNTERS` kernel ID after a rejected v1 migration. So nothing is
+    removed, and `require_current_pin_map_abi` refuses the migration instead --
+    every graph created by the frozen v1 object is in this position, since it
+    declares `GTPU_COUNTERS` with six slots against this build's seven (an
+    `OPC-MARK-v2` graph never reaches the check; the schema preflight already
+    refuses it with `ebpf_endpoint_schema`).
+  - That refusal preserves the state the graph is served from, not a
+    byte-identical directory, and the two are worth separating because the
+    remedy depends on it. The refusal is at the top of `attach_programs` and
+    `load_pinned` has already run, so on a graph genuinely short of the maps
+    added after its own schema -- an `OPC-PEER-v3` directory holds seventeen of
+    this build's twenty-one pins -- the load creates and pins the missing four
+    (`GTPU_UL_SPORT`, `GTPU_ULM_SPORT`, `GTPU_PMTU_CFG`, `GTPU_PMTU_DROP`) and
+    `materialize_legacy_source_port_policies` writes every retained session's
+    uplink policy into `GTPU_UL_SPORT` and every marked bearer's into
+    `GTPU_ULM_SPORT`, exactly as the v1 path already documents. Untouched is
+    everything the graph's identity and its sessions rest on: the durable marker
+    stays at `OPC-PEER-v3`, the counter pin keeps both its stale slot count and
+    its kernel ID, and every retained FAR, PDR, endpoint-binding, marked-owner
+    and configuration pin keeps its kernel ID. Neither program is bound, since
+    the refusal is above `attach_programs`, so no tc filter is installed or
+    replaced.
+  - The remedy differs by legacy schema, and only one of them costs sessions.
+    When the counter ABI is the only obstacle -- an `OPC-PEER-v3` graph --
+    unlinking the counter pin and nothing else is sufficient: that is precisely
+    the state this release makes self-healing, so the next attach --
+    `resolve_device` or `create_device`, both proven on this graph -- recreates
+    the pin at this build's ABI, completes the migration, advances the marker to
+    `OPC-PMTU-v5`, and every session survives.
+    No drain, no re-signalling. A *populated endpoint-unbound* `OPC-DSCP-v1`
+    graph is refused in `ebpf_marked_owner_rebuild` after the load, before the
+    ABI check is reached, and unlinking the counter pin changes nothing but the
+    pin; there the drained reprovision populated legacy state already requires
+    is the only way forward, and it does cost every session.
+  - Nothing is unpinned before this process has proven, from the pins, that it
+    owns the graph. `create_device` compares `GTPU_CONFIG` in the pin directory
+    against the requested `bind_address` -- the same comparison it applies to
+    the adopted map further down -- and the grouped endpoint-set path compares
+    the device configuration `grouped_schema_preflight` already read against the
+    requested endpoint set, the grouped pin directory being keyed by device ID.
+    A second process attaching the same pin namespace under either kind of
+    conflicting authority now refuses with `AlreadyExists` having reconciled
+    nothing, so the generation still forwarding keeps writing to the counters an
+    operator reads at their pin. Previously that refused call rebuilt and
+    re-pinned the counter map, permanently disconnecting a healthy,
+    still-forwarding datapath from its published counters -- flat
+    `uplink_encapsulated` against live traffic, which this datapath documents as
+    the signature of a total uplink outage. Only the removal is gated on
+    ownership; classification is not, so a conflicting attach against a graph
+    that is *also* at a foreign ABI reports that schema break rather than
+    `AlreadyExists`, and still unpins nothing.
+  - A pin directory short of a counter pin is no longer a permanent wedge. The
+    repair pass unpins a counter map and relies on the load to recreate it, so a
+    process that dies in that window -- or a `load_pinned` that fails against a
+    pre-existing pin set -- leaves the directory durably short of that entry.
+    The counter pins are therefore no longer on `bearer_schema_preflight`'s
+    required-pin lists, whose purpose is to catch a *durable state* loss Aya
+    would otherwise conceal by recreating the map: the next `create_device` or
+    `resolve_device` restores the pin at this build's ABI and adopts everything
+    else unchanged. No pin whose absence would be durable state loss was
+    relaxed.
+  - `recover_orphaned_current_ebpf_graph` no longer refuses the state it is
+    prescribed for. A counter map's width is not the graph's identity, so
+    `current_named_map_ids`, `current_recorded_pin_count` and
+    `hold_current_map_pins` accept a counter pin whose only divergence is its
+    slot count -- the recorded kernel ID remains the identity throughout.
+    Before this, the documented remedy for a graph left at a stale counter ABI
+    refused it with `IdentityMismatch`, and manual removal of the pin directory
+    was the operator's only recourse.
+  - Hook ownership no longer depends on counter identity. Rebuilding a counter
+    map gives it a new kernel ID, which made the previous generation's still
+    attached tc filter unrecognizable to `owner_matches_artifact` and failed the
+    upgrade with `AlreadyExists`; the only way to install a program with a
+    different map set would have been to detach and re-attach, which is exactly
+    the packet-leak window the replacement path is built to avoid.
+    `authority_map_ids` sets the counter maps aside from that comparison. It
+    recognises them by full shape -- a per-CPU array of `u64` counters carrying
+    one of this datapath's counter map names, at any slot count -- rather than
+    by name alone, and requires both sides to set aside the same counter names,
+    so every session, bearer and device map is still compared exactly and the
+    in-place single-`RTM_NEWTFILTER` replacement still applies. A failure to
+    read a map's info there is now an `ebpf_program_map_identity` I/O error
+    rather than `StateIndeterminate`, which previously suppressed fresh-pin
+    cleanup and leaked a whole pin set on a transient failure during a fresh
+    attach.
+  - One limit is documented rather than hidden. Ownership is proven before the
+    counter pin is rebuilt, but *completion* is not: on a graph this process
+    does own, a refusal after the load -- a corrupt retained PMTU policy, an
+    unreconstructable session index, a foreign occupant of the tc slot -- leaves
+    the previous generation attached to the map that was unpinned, so its
+    counters read flat at their pin until an attach by the rightful owner
+    completes. Session, bearer and device state is untouched throughout and a
+    retry reconciles nothing, because the pin already holds a map at this
+    build's ABI. It is not left open because a restore would be dangerous:
+    holding the previous map open across the reconciliation
+    (`MapData::from_pin` before the unlink) and re-pinning it on failure is a
+    small mechanism, and a restore that itself failed would leave the directory
+    short of a counter pin, which this release makes self-healing. What is
+    missing is somewhere to put it -- `attach` and `attach_grouped` funnel every
+    post-load step through one closure whose result is inspected in a single
+    place, while `adopt` propagates each step with a bare `?` from `load_pinned`
+    to `attach_programs` -- so closing it means restructuring that path. See
+    "Map ABI changes across an upgrade or rollback" in
+    `crates/opc-gtpu-dataplane/README.md`.
+  - Operator effect: an upgrade across a counter-slot change on a current-schema
+    graph now proceeds with no drain, no manual unpin and no outage, preserves
+    all session state, and resets the affected counters to zero once. It is
+    symmetric -- a rollback to a build with a narrower counter map rebuilds it
+    the same way, and a refusal of a session-bearing pin applies in both
+    directions. A build that predates this change adopts a wider retained
+    counter pin silently on attach, which is harmless because every slot it
+    indexes exists, but its `recover_orphaned_current_ebpf_graph` refuses that
+    same graph with `IdentityMismatch`.
+  - Proven on a real kernel by eight privileged tests, each of which fails
+    against the code it guards:
+    `ebpf_gtpu_retained_pin_graph_is_never_adopted_at_a_stale_counter_abi`
+    brings a generation up, retains its graph at the pre-growth counter ABI
+    together with the kernel-owned tc filters bound to it, and requires healthy
+    subscriber traffic to move `uplink_redirects_resolved` in step with
+    `uplink_encapsulated` while the session, schema marker and configuration
+    survive -- then drives the refusal branch and asserts it mutates nothing;
+    `ebpf_gtpu_retained_graph_missing_only_counter_pins_is_restored_not_wedged`
+    tears a counter pin out and requires both `resolve_device` and
+    `create_device` to restore it, then puts a directory at that pin path and
+    requires it to be refused as indeterminate state rather than read as an
+    absent pin;
+    `ebpf_gtpu_pre_v5_retained_graph_is_never_migrated_at_a_stale_counter_abi`
+    requires an `OPC-PEER-v3` graph at the old counter ABI to be refused with
+    its marker, retained pins and hooks untouched, and the same graph to migrate
+    once its counter pin is at this build's ABI;
+    `ebpf_gtpu_v3_shaped_retained_graph_refuses_then_heals_without_a_drain` runs
+    the same refusal against a directory that is genuinely v3-shaped -- seventeen
+    pins, not twenty-one with the marker rewritten -- and pins both halves of
+    what a refusal does: the four post-v3 maps are created and the retained
+    session's legacy source-port policy is materialized into one of them, while
+    the marker, the counter pin's slot count and kernel ID, every retained
+    state-bearing pin's kernel ID and both tc slots are untouched; it then runs
+    the published remedy, unlinking only `GTPU_COUNTERS`, and requires the very
+    same graph to migrate with its session intact through `resolve_device` and,
+    from the same regressed state, through `create_device`;
+    `ebpf_gtpu_populated_v1_graph_still_requires_a_drain_at_this_counter_abi` is
+    the other side of that remedy, requiring a populated endpoint-unbound v1
+    graph to refuse in `ebpf_marked_owner_rebuild` both before and after the
+    counter pin is unlinked;
+    `ebpf_gtpu_divergent_config_pin_is_refused_identically_on_every_entry_point`
+    gives the graph a `GTPU_CONFIG` pin at a shape this build never declared and
+    requires `create_device` and `resolve_device` to report it under the same
+    operation and the same `ErrorKind`;
+    `ebpf_gtpu_refused_attach_leaves_a_live_generation_counting` keeps a
+    generation forwarding at the pre-growth ABI, refuses a second process bound
+    to a different address, and requires the live generation's pinned counters
+    to keep advancing -- then recovers that same graph; and
+    `ebpf_gtpu_refused_grouped_attach_leaves_a_live_generation_counting` does
+    the same for the grouped ownership gate, which no other test reaches because
+    every grouped test starts from a fresh bpffs and so never evaluates the
+    recorded-configuration arm against a retained graph. Every other privileged
+    test in the suite starts from a fresh bpffs and so could never reach the
+    retained-pin path at all. The pin comparison itself is a pure function over
+    the observed map dimensions, so
+    `any_non_slot_count_divergence_refuses_on_every_pin` can vary the map name,
+    type, key size, value size and flags one at a time against every current
+    pin with the slot count held fixed -- the dimensions no kernel-backed test
+    reaches.
+
 - **P-CSCF Re-selection support is no longer emittable on its own --
   `opc-proto-gtpv2c` (breaking to `PcoRequest`):** TS 24.008 10.5.6.3 says of
   container `0x0012` that "This PCO parameter may be present only if a
@@ -412,12 +631,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     test may legitimately want to write as a literal.
   - `COUNTER_SLOTS` grows from six to seven. That changes the committed
     object's `maps` section -- the CI drift gate must be refreshed with it --
-    and also `GTPU_COUNTERS.max_entries` in the pinned map graph, which every
-    current-schema pin identity check compares. A pin graph retained from a
-    build with the old slot count is therefore not this build's graph and is
-    refused rather than adopted in place, so an upgrade cannot reuse one. The
-    counter map is per-CPU and aggregate-only; no consumer reads slots
-    positionally beyond the exported constants.
+    and also `GTPU_COUNTERS.max_entries` in the pinned map graph. This entry
+    originally claimed that a pin graph retained from a build with the old slot
+    count was therefore refused rather than adopted; that was **wrong**, and
+    the loader now reconciles it explicitly. See "Retained pin graphs were
+    adopted at the wrong map ABI" below. The counter map is per-CPU and
+    aggregate-only; no consumer reads slots positionally beyond the exported
+    constants.
 
 - **`uplink_far_misses` no longer reports a healthy uplink as session-state
   corruption -- `opc-gtpu-dataplane`, `opc-gtpu-dataplane-ebpf`:** the

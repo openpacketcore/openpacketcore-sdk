@@ -5494,6 +5494,101 @@ mod aya_runtime {
         },
     ];
 
+    /// Pins whose entire contents are observability counters.
+    ///
+    /// Every other pin in [`CURRENT_MAP_SPECS`] carries session, bearer or
+    /// device state that a retained graph exists to preserve and that this
+    /// process is not entitled to discard. These three carry per-CPU packet
+    /// counters and nothing else: they start at zero on a fresh graph, no
+    /// decision anywhere reads them back, and losing them costs an operator a
+    /// discontinuity in a graph rather than a session. That is what makes them
+    /// -- and only them -- safe to rebuild when a retained graph's slot count
+    /// is not this build's; see `reconcile_retained_pin_map_abi`.
+    const EPHEMERAL_COUNTER_MAPS: [&str; 3] = [
+        MAP_COUNTERS,
+        MAP_DOWNLINK_BINDING_COUNTERS,
+        MAP_UPLINK_PMTU_COUNTERS,
+    ];
+
+    /// Every dimension of a pinned map this loader compares against its own
+    /// specification, lifted away from the kernel so the comparison itself can
+    /// be exercised one field at a time.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct ObservedMapAbi {
+        /// Whether the kernel map's own name is the one this pin path claims.
+        /// A pin path is just a directory entry; the name inside the map is
+        /// what the loader will bind a program to.
+        name_matches: bool,
+        map_type: u32,
+        key_size: u32,
+        value_size: u32,
+        max_entries: u32,
+        map_flags: u32,
+    }
+
+    /// What a retained pin's observed shape means for this build.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum RetainedPinAbi {
+        /// Every dimension is this build's. Adopt it unchanged, which is the
+        /// whole point of retaining the graph.
+        Current,
+        /// A pure counter pin ([`EPHEMERAL_COUNTER_MAPS`]) whose only
+        /// divergence is its slot count. Rebuildable: counters restart at
+        /// zero, which is a discontinuity in a graph and nothing more.
+        CounterSlotDrift,
+        /// Anything else. Session, bearer and device pins are the state a
+        /// retained graph exists to preserve, and a divergence in any other
+        /// dimension -- even on a counter map -- is a schema break this
+        /// process must not paper over.
+        Foreign,
+    }
+
+    /// What a caller can prove, from the pins alone, about its entitlement to
+    /// reshape a retained graph before anything is removed.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum RetainedGraphOwnership {
+        /// The caller inherits whatever the retained graph recorded and has
+        /// nothing of its own to conflict with it. `adopt` is the only such
+        /// path: it reads the bound address out of the graph rather than
+        /// asking for one.
+        Inherited,
+        /// The caller asked to bind this local address. `GTPU_CONFIG` must
+        /// already record it -- the same slot, and the same comparison, that
+        /// `attach` applies to the adopted map further down.
+        BoundLocalAddress([u8; 4]),
+        /// The caller already compared its requested grouped device
+        /// configuration against the one the pins record, in
+        /// `grouped_schema_preflight`, with this result.
+        RecordedDeviceConfig { matches_request: bool },
+    }
+
+    /// Compare one retained pin against this build's specification.
+    ///
+    /// Kept free of kernel and filesystem types on purpose: it is the single
+    /// place that decides whether a retained pin may be adopted, rebuilt or
+    /// must refuse an attach, and every dimension it reads has to be provable
+    /// in isolation.
+    fn classify_retained_pin_abi(
+        observed: &ObservedMapAbi,
+        spec: &CurrentMapSpec,
+    ) -> RetainedPinAbi {
+        let shape_matches = observed.name_matches
+            && observed.map_type == spec.map_type
+            && observed.key_size == spec.key_size
+            && observed.value_size == spec.value_size
+            && observed.map_flags == 0;
+        if !shape_matches {
+            return RetainedPinAbi::Foreign;
+        }
+        if observed.max_entries == spec.max_entries {
+            RetainedPinAbi::Current
+        } else if EPHEMERAL_COUNTER_MAPS.contains(&spec.name) {
+            RetainedPinAbi::CounterSlotDrift
+        } else {
+            RetainedPinAbi::Foreign
+        }
+    }
+
     const CURRENT_RECOVERY_PROOF_LEN: usize = 160;
     const CURRENT_RECOVERY_MAGIC: [u8; 8] = *b"OPCCURR1";
     const CURRENT_RECOVERY_MAP_IDS_OFFSET: usize = 48;
@@ -6585,13 +6680,24 @@ mod aya_runtime {
                     .map_type()
                     .map_err(|_| CurrentIdentityError::Indeterminate)?
                     as u32;
-                if map_type != spec.map_type
-                    || info.name() != kernel_program_name(spec.name)
-                    || info.key_size() != spec.key_size
-                    || info.value_size() != spec.value_size
-                    || info.max_entries() != spec.max_entries
-                    || info.map_flags() != 0
-                {
+                let observed = ObservedMapAbi {
+                    name_matches: info.name() == kernel_program_name(spec.name),
+                    map_type,
+                    key_size: info.key_size(),
+                    value_size: info.value_size(),
+                    max_entries: info.max_entries(),
+                    map_flags: info.map_flags(),
+                };
+                // Recovery exists to remove a graph whose writer is gone, and
+                // that is exactly the condition a stale counter slot count
+                // signals. A counter map's width is not this graph's identity:
+                // refusing to tear a graph down because an observability
+                // counter is a different size would refuse the remedy for the
+                // very state it is prescribed for.
+                if matches!(
+                    classify_retained_pin_abi(&observed, spec),
+                    RetainedPinAbi::Foreign
+                ) {
                     return Err(CurrentIdentityError::Mismatch);
                 }
                 ids[index] = info.id();
@@ -6627,13 +6733,22 @@ mod aya_runtime {
                     .map_type()
                     .map_err(|_| state_indeterminate("ebpf_current_pin_identity"))?
                     as u32;
+                let observed = ObservedMapAbi {
+                    name_matches: info.name() == kernel_program_name(spec.name),
+                    map_type,
+                    key_size: info.key_size(),
+                    value_size: info.value_size(),
+                    max_entries: info.max_entries(),
+                    map_flags: info.map_flags(),
+                };
+                // The recorded kernel ID is the identity here; the shape is a
+                // corroborating check, admitting the same stale counter slot
+                // count `current_named_map_ids` recorded the proof from.
                 if info.id() != record.map_ids[index]
-                    || map_type != spec.map_type
-                    || info.name() != kernel_program_name(spec.name)
-                    || info.key_size() != spec.key_size
-                    || info.value_size() != spec.value_size
-                    || info.max_entries() != spec.max_entries
-                    || info.map_flags() != 0
+                    || matches!(
+                        classify_retained_pin_abi(&observed, spec),
+                        RetainedPinAbi::Foreign
+                    )
                 {
                     return Err(state_indeterminate("ebpf_current_pin_identity"));
                 }
@@ -6941,6 +7056,221 @@ mod aya_runtime {
             Ok(!forwarding_state_present)
         }
 
+        /// Read one retained pin's ABI, or `None` when the pin is absent
+        /// because the load below will create and pin it at this build's ABI.
+        fn observed_pin_abi(
+            path: &Path,
+            spec: &CurrentMapSpec,
+            operation: &'static str,
+        ) -> Result<Option<ObservedMapAbi>, GtpuError> {
+            let metadata = match fs::symlink_metadata(path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(_) => return Err(state_indeterminate(operation)),
+            };
+            if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+                return Err(state_indeterminate(operation));
+            }
+            let info = MapInfo::from_pin(path).map_err(|_| state_indeterminate(operation))?;
+            let map_type = info
+                .map_type()
+                .map_err(|_| state_indeterminate(operation))? as u32;
+            Ok(Some(ObservedMapAbi {
+                name_matches: info.name() == kernel_program_name(spec.name),
+                map_type,
+                key_size: info.key_size(),
+                value_size: info.value_size(),
+                max_entries: info.max_entries(),
+                map_flags: info.map_flags(),
+            }))
+        }
+
+        /// Reconcile a retained pin graph against this build's map ABI before
+        /// Aya can adopt it.
+        ///
+        /// Aya routes every `pinning = ByName` map through
+        /// `MapData::create_pinned_by_name`, which returns the fd of an
+        /// existing pin without comparing a single dimension against the
+        /// object's own map definition. Nothing downstream closes that gap on
+        /// the attach path either: the bearer schema marker does not change
+        /// when only a map's shape does, so a retained graph still classifies
+        /// as the current schema, and the attach-time pin identity check
+        /// compares kernel map IDs read from the very maps that were adopted,
+        /// so both sides agree by construction. A build whose datapath indexes
+        /// more counter slots than the retained map has would therefore run
+        /// against the old map: the verifier bounds the array lookup at
+        /// runtime, `get_ptr_mut` returns `None` for the slots past its end,
+        /// and those increments are silently dropped -- while the userspace
+        /// read of the same slot fails outright and takes the whole operator
+        /// snapshot with it.
+        ///
+        /// This is the *repair* half of closing that gap. It runs before
+        /// `load_pinned`, because adoption is irreversible once Aya holds the
+        /// fd, and after the schema preflights, because they classify the graph
+        /// from the very pins it may remove. `require_current_pin_map_abi` is
+        /// the other half: it runs after the load and refuses whatever this
+        /// pass did not repair, so no program of this build is ever bound to a
+        /// foreign-ABI map whether or not this pass ran.
+        ///
+        /// Two rules govern what it is entitled to do.
+        ///
+        /// Only a graph that has already reached the current map set --
+        /// `SourcePortV4 | PmtuV5`, the same boundary the attach paths use to
+        /// skip legacy materialization -- is reshaped. A graph below it is
+        /// migrated rather than reshaped, and that migration can still refuse
+        /// after the load for reasons only the loaded maps can show
+        /// (`ebpf_marked_owner_rebuild`). Removing a counter pin before that
+        /// decision would swap it out from under the live legacy datapath the
+        /// refusal deliberately leaves running, so a legacy graph is left
+        /// untouched here and refused by `require_current_pin_map_abi` instead.
+        ///
+        /// And nothing is removed until this process has proven it is entitled
+        /// to replace the graph. Retained pins may still serve a live
+        /// prior-generation datapath, and the checks that refuse a conflicting
+        /// owner all run after the load; `ownership` is the same question asked
+        /// from the pins, before anything is touched. Unproven is not an error
+        /// here -- it simply reconciles nothing, leaving the existing checks to
+        /// produce the existing refusal against a graph this pass did not
+        /// disturb, and `require_current_pin_map_abi` to refuse an ABI it
+        /// therefore did not repair. Ownership is evaluated *after* the graph
+        /// is classified, because `BoundLocalAddress` answers it by reading
+        /// `GTPU_CONFIG`: a map whose shape is not this build's cannot answer
+        /// it at all, so the ABI break has to be reported as one rather than as
+        /// whatever the typed read happens to fail with. The removal loop is
+        /// still the last thing to run and is still gated on ownership.
+        ///
+        /// Ownership is proven; completion is not, and that limit is
+        /// deliberate. On a graph this process does own, a refusal after the
+        /// load -- a corrupt retained PMTU policy, an unreconstructable session
+        /// index, a foreign occupant of the tc slot -- leaves the previous
+        /// generation attached to the map this removed, so its counters read
+        /// flat at their pin until an attach by the rightful owner completes.
+        /// Nothing durable moves, and a retry reconciles nothing because the
+        /// pin already holds a map at this build's ABI.
+        ///
+        /// It is not left open because restoring the map would be dangerous.
+        /// Holding it open across the reconciliation (`MapData::from_pin`
+        /// before the unlink) and re-pinning it on failure is a small
+        /// mechanism, and a restore that itself failed would leave the
+        /// directory short of a counter pin -- a state
+        /// `bearer_schema_preflight` already treats as self-healing. What is
+        /// missing is somewhere to put it: `attach` and `attach_grouped` funnel
+        /// every post-load step through one closure whose result is inspected
+        /// in a single place, while `adopt` propagates each step with a bare
+        /// `?` from `load_pinned` to `attach_programs` and so offers no single
+        /// exit to hang a restore off. Closing it means restructuring that
+        /// path; see the crate README.
+        fn reconcile_retained_pin_map_abi(
+            pin_dir: &Path,
+            schema_state: BearerSchemaState,
+            ownership: RetainedGraphOwnership,
+        ) -> Result<(), GtpuError> {
+            if !matches!(
+                schema_state,
+                BearerSchemaState::SourcePortV4 | BearerSchemaState::PmtuV5
+            ) {
+                return Ok(());
+            }
+            // Classify the whole graph first, so a refused attach leaves the
+            // retained pins exactly as it found them -- and so `GTPU_CONFIG`,
+            // which the ownership question below is answered out of, is
+            // classified rather than merely read. A pin whose shape is not
+            // this build's cannot give a trustworthy answer to any question,
+            // and reading one anyway reported the same schema break as a
+            // config-read failure on `create_device` and as an ABI refusal on
+            // `resolve_device`. Classification is not gated on ownership
+            // because an ABI break is terminal for every process, not just the
+            // owner; only the removal below is, and it stays last.
+            let mut rebuild = Vec::new();
+            for spec in &CURRENT_MAP_SPECS {
+                let path = pin_dir.join(spec.name);
+                let Some(observed) = Self::observed_pin_abi(&path, spec, "ebpf_pin_map_abi")?
+                else {
+                    continue;
+                };
+                match classify_retained_pin_abi(&observed, spec) {
+                    RetainedPinAbi::Current => {}
+                    RetainedPinAbi::CounterSlotDrift => rebuild.push(path),
+                    RetainedPinAbi::Foreign => {
+                        return Err(GtpuError::io(
+                            "ebpf_pin_map_abi",
+                            invalid_data("retained GTP-U map pin is not this build's map ABI"),
+                        ))
+                    }
+                }
+            }
+            let owned = match ownership {
+                RetainedGraphOwnership::Inherited => true,
+                RetainedGraphOwnership::BoundLocalAddress(local_ip) => {
+                    Self::pinned_config_read(pin_dir)? == local_ip
+                }
+                RetainedGraphOwnership::RecordedDeviceConfig { matches_request } => matches_request,
+            };
+            if !owned {
+                return Ok(());
+            }
+            // Only slot counts differ, and only counters are at stake.
+            // Unpinning does not disturb a prior generation still serving
+            // traffic: its programs keep the maps they already hold open, and
+            // hook ownership deliberately does not depend on counter identity
+            // (see `authority_map_ids`). The pin directory is briefly short of
+            // these entries, which `bearer_schema_preflight` deliberately
+            // tolerates so the window is self-healing.
+            for path in rebuild {
+                fs::remove_file(&path)
+                    .map_err(|error| GtpuError::io("ebpf_pin_map_abi_unpin", error))?;
+            }
+            Ok(())
+        }
+
+        /// Refuse to bind this build's programs to any map that is not at this
+        /// build's ABI.
+        ///
+        /// `reconcile_retained_pin_map_abi` repairs what it is entitled to
+        /// repair before the load; this is the fail-closed statement of the
+        /// property that actually matters, checked where the harm would occur.
+        /// It runs at the top of `attach_programs`, before either program is
+        /// verified and bound, and therefore also after every migration
+        /// decision the loaded maps are needed to make -- which is what lets a
+        /// legacy graph be refused here without its counter pins having been
+        /// disturbed first.
+        ///
+        /// By this point `load_pinned` has adopted or created every current
+        /// pin and the caller has proven the pinned maps are the held maps, so
+        /// what this reads is what the programs are about to bind to.
+        fn require_current_pin_map_abi(pin_dir: &Path) -> Result<(), GtpuError> {
+            for spec in &CURRENT_MAP_SPECS {
+                let path = pin_dir.join(spec.name);
+                let Some(observed) =
+                    Self::observed_pin_abi(&path, spec, "ebpf_program_pin_map_abi")?
+                else {
+                    continue;
+                };
+                if classify_retained_pin_abi(&observed, spec) != RetainedPinAbi::Current {
+                    return Err(GtpuError::io(
+                        "ebpf_program_pin_map_abi",
+                        invalid_data("GTP-U map pin is not this build's map ABI"),
+                    ));
+                }
+            }
+            Ok(())
+        }
+
+        /// Read the bound local address straight from `GTPU_CONFIG`'s pin,
+        /// without loading the object. Same slot and same type as
+        /// `config_read`, which reads it from the adopted map instead.
+        fn pinned_config_read(pin_dir: &Path) -> Result<[u8; 4], GtpuError> {
+            let map_data = MapData::from_pin(pin_dir.join(MAP_CONFIG))
+                .map_err(|error| map_error("ebpf_pin_config_read", error))?;
+            let map = Map::from_map_data(map_data)
+                .map_err(|error| map_error("ebpf_pin_config_read", error))?;
+            let config = Array::<_, [u8; 4]>::try_from(map)
+                .map_err(|error| map_error("ebpf_pin_config_read", error))?;
+            config
+                .get(&0, 0)
+                .map_err(|error| map_error("ebpf_pin_config_read", error))
+        }
+
         /// Determine which additive map schema this pin set has committed.
         /// The marker lives in the pre-existing FAR map so it remains
         /// available when a required additive pin is accidentally removed.
@@ -7039,14 +7369,20 @@ mod aya_runtime {
                 Err(error) => return Err(map_error("ebpf_bearer_schema", error)),
             };
 
+            // Every pin whose absence proves durable state loss, because Aya
+            // would otherwise create a missing pinned-by-name map and conceal
+            // it. The counter pins are deliberately not on these lists: they
+            // hold observability counters and nothing else, they are the only
+            // pins `reconcile_retained_pin_map_abi` is entitled to remove, and
+            // it removes them precisely so the load below recreates them. A
+            // directory briefly -- or, if that process died in the window,
+            // durably -- short of a counter pin has therefore lost nothing,
+            // and must heal on the next attach rather than refuse forever.
             let required_pins: &[&str] = match state {
                 BearerSchemaState::Fresh => &[],
-                BearerSchemaState::LegacyV0 => &[MAP_DOWNLINK_PDR, MAP_COUNTERS, MAP_CONFIG],
-                BearerSchemaState::V1Uncommitted => {
-                    &[MAP_UPLINK_DSCP, MAP_DOWNLINK_PDR, MAP_COUNTERS, MAP_CONFIG]
-                }
-                BearerSchemaState::DscpV1 => {
-                    &[MAP_UPLINK_DSCP, MAP_DOWNLINK_PDR, MAP_COUNTERS, MAP_CONFIG]
+                BearerSchemaState::LegacyV0 => &[MAP_DOWNLINK_PDR, MAP_CONFIG],
+                BearerSchemaState::V1Uncommitted | BearerSchemaState::DscpV1 => {
+                    &[MAP_UPLINK_DSCP, MAP_DOWNLINK_PDR, MAP_CONFIG]
                 }
                 BearerSchemaState::BearerV2 => &[
                     MAP_UPLINK_DSCP,
@@ -7055,7 +7391,6 @@ mod aya_runtime {
                     MAP_DOWNLINK_PDR,
                     MAP_DOWNLINK_MARK_PDR,
                     MAP_MARKED_BEARER_OWNER,
-                    MAP_COUNTERS,
                     MAP_CONFIG,
                 ],
                 BearerSchemaState::EndpointV3 => &[
@@ -7066,8 +7401,6 @@ mod aya_runtime {
                     MAP_DOWNLINK_MARK_PDR,
                     MAP_DOWNLINK_ENDPOINT_BINDING,
                     MAP_MARKED_BEARER_OWNER,
-                    MAP_COUNTERS,
-                    MAP_DOWNLINK_BINDING_COUNTERS,
                     MAP_CONFIG,
                 ],
                 BearerSchemaState::SourcePortV4 => &[
@@ -7080,8 +7413,6 @@ mod aya_runtime {
                     MAP_DOWNLINK_MARK_PDR,
                     MAP_DOWNLINK_ENDPOINT_BINDING,
                     MAP_MARKED_BEARER_OWNER,
-                    MAP_COUNTERS,
-                    MAP_DOWNLINK_BINDING_COUNTERS,
                     MAP_CONFIG,
                 ],
                 BearerSchemaState::PmtuV5 => &[
@@ -7091,13 +7422,10 @@ mod aya_runtime {
                     MAP_UPLINK_SOURCE_PORT,
                     MAP_UPLINK_MARK_SOURCE_PORT,
                     MAP_UPLINK_PMTU,
-                    MAP_UPLINK_PMTU_COUNTERS,
                     MAP_DOWNLINK_PDR,
                     MAP_DOWNLINK_MARK_PDR,
                     MAP_DOWNLINK_ENDPOINT_BINDING,
                     MAP_MARKED_BEARER_OWNER,
-                    MAP_COUNTERS,
-                    MAP_DOWNLINK_BINDING_COUNTERS,
                     MAP_CONFIG,
                 ],
             };
@@ -8593,13 +8921,22 @@ mod aya_runtime {
                     .map_type()
                     .map_err(|_| state_indeterminate("ebpf_current_pin_identity"))?
                     as u32;
+                let observed = ObservedMapAbi {
+                    name_matches: info.name() == kernel_program_name(spec.name),
+                    map_type,
+                    key_size: info.key_size(),
+                    value_size: info.value_size(),
+                    max_entries: info.max_entries(),
+                    map_flags: info.map_flags(),
+                };
+                // Same rule as `current_named_map_ids`, which recorded these
+                // IDs: the recorded kernel ID is the identity, and a counter
+                // map's width is not part of it.
                 if info.id() != proof.record.map_ids[index]
-                    || map_type != spec.map_type
-                    || info.name() != kernel_program_name(spec.name)
-                    || info.key_size() != spec.key_size
-                    || info.value_size() != spec.value_size
-                    || info.max_entries() != spec.max_entries
-                    || info.map_flags() != 0
+                    || matches!(
+                        classify_retained_pin_abi(&observed, spec),
+                        RetainedPinAbi::Foreign
+                    )
                 {
                     return Err(state_indeterminate("ebpf_current_pin_identity"));
                 }
@@ -9509,6 +9846,10 @@ mod aya_runtime {
             tc_priority: u16,
             schema_state: BearerSchemaState,
         ) -> Result<AttachedDatapath, GtpuError> {
+            // Never verify and bind this build's programs against a map that
+            // is not this build's ABI. Whatever the reconciliation before the
+            // load was entitled to repair, it has repaired by now.
+            Self::require_current_pin_map_abi(pin_dir)?;
             // clsact may already exist (EEXIST); that is fine.
             if let Err(error) = tc::qdisc_add_clsact(interface) {
                 if !is_qdisc_already_present(&error) {
@@ -10029,7 +10370,7 @@ mod aya_runtime {
                     io::Error::new(io::ErrorKind::NotFound, "tc program id is not loaded"),
                 )
             })?;
-        let mut occupant_map_ids = occupant
+        let occupant_map_ids = occupant
             .map_ids()
             .map_err(|error| program_error("ebpf_program_map_ids", &error))?
             .ok_or_else(|| {
@@ -10038,7 +10379,7 @@ mod aya_runtime {
                     invalid_data("kernel did not report occupant map ids"),
                 )
             })?;
-        let mut artifact_map_ids = artifact
+        let artifact_map_ids = artifact
             .map_ids()
             .map_err(|error| program_error("ebpf_program_map_ids", &error))?
             .ok_or_else(|| {
@@ -10047,12 +10388,88 @@ mod aya_runtime {
                     invalid_data("kernel did not report artifact map ids"),
                 )
             })?;
-        occupant_map_ids.sort_unstable();
-        artifact_map_ids.sort_unstable();
         Ok(occupant.name() == artifact.name()
             && occupant.tag() == artifact.tag()
             && occupant.program_type() == artifact.program_type()
-            && occupant_map_ids == artifact_map_ids)
+            && authority_map_ids(&occupant_map_ids)? == authority_map_ids(&artifact_map_ids)?)
+    }
+
+    /// A program's map set split into the maps that carry authority and the
+    /// names of the pure counter maps set aside from the comparison.
+    ///
+    /// The counter names travel with the IDs so a program that simply holds a
+    /// different number of counter maps cannot be made to match by dropping
+    /// them: both sides must set aside the same counters and then agree on
+    /// everything else.
+    #[derive(Debug, PartialEq, Eq)]
+    struct AuthorityMapIds {
+        authority: Vec<u32>,
+        counters: Vec<&'static str>,
+    }
+
+    /// Reduce a program's map-ID set to the maps that carry authority.
+    ///
+    /// Hook ownership asks whether a tc filter is a program of *this* pin
+    /// graph, and the answer must not change because an observability counter
+    /// was rebuilt. `reconcile_retained_pin_map_abi` recreates a retained
+    /// counter map whose slot count is not this build's, which necessarily
+    /// gives it a new kernel ID; comparing raw ID sets would then make the
+    /// previous generation of this very datapath unrecognizable and refuse the
+    /// in-place, leak-free filter replacement the upgrade path depends on.
+    ///
+    /// Setting those IDs aside leaves every session, bearer and device map
+    /// compared exactly as before, so a filter that matches is still a program
+    /// bound to this graph's authoritative state -- which is what the check is
+    /// for. Counter identity is deliberately not part of it.
+    ///
+    /// The occupant is a previous generation's program holding a map this
+    /// process has already unpinned, so its counter maps cannot be recognised
+    /// by the pin graph's own IDs -- they are precisely the IDs no longer in
+    /// it. They are recognised by shape instead: a per-CPU array of `u64`
+    /// counters carrying one of this datapath's counter map names, at any slot
+    /// count, which is exactly the class of map this loader is entitled to
+    /// rebuild. A map merely *named* like a counter but shaped like anything
+    /// else stays in the comparison.
+    fn authority_map_ids(map_ids: &[u32]) -> Result<AuthorityMapIds, GtpuError> {
+        let mut authority = Vec::with_capacity(map_ids.len());
+        let mut counters = Vec::new();
+        for map_id in map_ids {
+            let info = MapInfo::from_id(*map_id)
+                .map_err(|error| map_error("ebpf_program_map_identity", error))?;
+            let map_type = info.map_type().map_err(|_| {
+                GtpuError::io(
+                    "ebpf_program_map_identity",
+                    invalid_data("kernel reported an unknown map type"),
+                )
+            })? as u32;
+            let counter = EPHEMERAL_COUNTER_MAPS.iter().find(|name| {
+                let Some(spec) = CURRENT_MAP_SPECS.iter().find(|spec| spec.name == **name) else {
+                    return false;
+                };
+                let observed = ObservedMapAbi {
+                    name_matches: info.name() == kernel_program_name(spec.name),
+                    map_type,
+                    key_size: info.key_size(),
+                    value_size: info.value_size(),
+                    max_entries: info.max_entries(),
+                    map_flags: info.map_flags(),
+                };
+                !matches!(
+                    classify_retained_pin_abi(&observed, spec),
+                    RetainedPinAbi::Foreign
+                )
+            });
+            match counter {
+                Some(name) => counters.push(*name),
+                None => authority.push(*map_id),
+            }
+        }
+        authority.sort_unstable();
+        counters.sort_unstable();
+        Ok(AuthorityMapIds {
+            authority,
+            counters,
+        })
     }
 
     fn owner_matches_legacy_v2_record(
@@ -10516,6 +10933,11 @@ mod aya_runtime {
                 return Err(state_indeterminate("ebpf_pin_dir_identity"));
             }
             let schema_state = Self::bearer_schema_preflight(&canonical_pin_dir)?;
+            Self::reconcile_retained_pin_map_abi(
+                &canonical_pin_dir,
+                schema_state,
+                RetainedGraphOwnership::BoundLocalAddress(local_ip),
+            )?;
             let mut ebpf = match self.load_pinned(&canonical_pin_dir) {
                 Ok(ebpf) => ebpf,
                 Err(error) if pins_preexisted => return Err(error),
@@ -10699,6 +11121,23 @@ mod aya_runtime {
             }
             let bearer_state = Self::bearer_schema_preflight(&canonical_pin_dir)?;
             let grouped_state = Self::grouped_schema_preflight(&canonical_pin_dir, bearer_state)?;
+            Self::reconcile_retained_pin_map_abi(
+                &canonical_pin_dir,
+                bearer_state,
+                RetainedGraphOwnership::RecordedDeviceConfig {
+                    // `grouped_schema_preflight` read this out of the pins, so
+                    // it is a pre-load answer to the same question the config
+                    // arbitration below asks of the adopted map.
+                    matches_request: match grouped_state {
+                        GroupedSchemaState::Fresh
+                        | GroupedSchemaState::Initializing { config: None } => true,
+                        GroupedSchemaState::Initializing {
+                            config: Some(recorded),
+                        }
+                        | GroupedSchemaState::Retained { config: recorded } => recorded == desired,
+                    },
+                },
+            )?;
             let mut ebpf = match self.load_pinned(&canonical_pin_dir) {
                 Ok(ebpf) => ebpf,
                 Err(error) if pins_preexisted => return Err(error),
@@ -10895,6 +11334,11 @@ mod aya_runtime {
                 return Err(state_indeterminate("ebpf_pin_dir_identity"));
             }
             let schema_state = Self::bearer_schema_preflight(&canonical_pin_dir)?;
+            Self::reconcile_retained_pin_map_abi(
+                &canonical_pin_dir,
+                schema_state,
+                RetainedGraphOwnership::Inherited,
+            )?;
             let mut ebpf = self.load_pinned(&canonical_pin_dir)?;
             let expected_pins = Self::held_map_identity(&ebpf)
                 .map_err(|_| state_indeterminate("ebpf_map_identity"))?;
@@ -13381,6 +13825,171 @@ mod aya_runtime {
         use super::*;
         use crate::ProgramLoadRefusal;
         use aya_obj::VerifierLog;
+
+        /// Only pure per-CPU counter maps may be rebuilt under a retained pin
+        /// graph.
+        ///
+        /// `reconcile_retained_pin_map_abi` unpins a map on this list when a
+        /// retained graph's slot count is not this build's, so a state-bearing
+        /// pin that reached it would silently discard the sessions the graph
+        /// was retained to preserve. Every entry must be a real current pin, a
+        /// `PERCPU_ARRAY` of `u64` counters, and distinct.
+        #[test]
+        fn only_per_cpu_counter_pins_are_rebuildable_across_a_slot_count_change() {
+            let mut seen = Vec::new();
+            for name in EPHEMERAL_COUNTER_MAPS {
+                assert!(
+                    CURRENT_MAP_NAMES.contains(&name),
+                    "{name} is not a current pin"
+                );
+                assert!(!seen.contains(&name), "{name} is listed twice");
+                seen.push(name);
+                let spec = CURRENT_MAP_SPECS
+                    .iter()
+                    .find(|spec| spec.name == name)
+                    .expect("every current pin name has a spec");
+                assert_eq!(
+                    spec.map_type,
+                    bpf_map_type::BPF_MAP_TYPE_PERCPU_ARRAY as u32,
+                    "{name} is not a per-CPU array"
+                );
+                assert_eq!(spec.key_size, 4, "{name} is not indexed by a slot number");
+                assert_eq!(spec.value_size, 8, "{name} does not hold u64 counters");
+            }
+            for spec in CURRENT_MAP_SPECS {
+                if EPHEMERAL_COUNTER_MAPS.contains(&spec.name) {
+                    continue;
+                }
+                assert_ne!(
+                    spec.map_type,
+                    bpf_map_type::BPF_MAP_TYPE_PERCPU_ARRAY as u32,
+                    "{} is a per-CPU array that is not declared rebuildable; \
+                     classify it before its slot count can ever change",
+                    spec.name
+                );
+            }
+        }
+
+        fn observed_from_spec(spec: &CurrentMapSpec) -> ObservedMapAbi {
+            ObservedMapAbi {
+                name_matches: true,
+                map_type: spec.map_type,
+                key_size: spec.key_size,
+                value_size: spec.value_size,
+                max_entries: spec.max_entries,
+                map_flags: 0,
+            }
+        }
+
+        /// A retained pin at exactly this build's ABI is adopted, and a counter
+        /// pin that differs only in slot count is rebuildable.
+        #[test]
+        fn a_retained_pin_is_current_only_at_this_builds_abi() {
+            for spec in &CURRENT_MAP_SPECS {
+                assert_eq!(
+                    classify_retained_pin_abi(&observed_from_spec(spec), spec),
+                    RetainedPinAbi::Current,
+                    "{} at its own specification must be adopted unchanged",
+                    spec.name
+                );
+                let drifted = ObservedMapAbi {
+                    max_entries: spec.max_entries + 1,
+                    ..observed_from_spec(spec)
+                };
+                let expected = if EPHEMERAL_COUNTER_MAPS.contains(&spec.name) {
+                    RetainedPinAbi::CounterSlotDrift
+                } else {
+                    RetainedPinAbi::Foreign
+                };
+                assert_eq!(
+                    classify_retained_pin_abi(&drifted, spec),
+                    expected,
+                    "{} at a foreign slot count",
+                    spec.name
+                );
+            }
+        }
+
+        /// Every dimension other than the slot count is identity, on every pin.
+        ///
+        /// A divergence in the map's own name, type, key size, value size or
+        /// flags is a schema break even when the slot count still matches --
+        /// and even on a counter pin, whose rebuildability is a statement about
+        /// its slot count alone. `max_entries` is the only dimension with a
+        /// second answer, so it is the only one exercised elsewhere; without
+        /// this, the whole comparison could be replaced by `true` and the slot
+        /// count alone and nothing would notice.
+        #[test]
+        fn any_non_slot_count_divergence_refuses_on_every_pin() {
+            for spec in &CURRENT_MAP_SPECS {
+                let base = observed_from_spec(spec);
+                let divergences = [
+                    (
+                        "name",
+                        ObservedMapAbi {
+                            name_matches: false,
+                            ..base
+                        },
+                    ),
+                    (
+                        "map_type",
+                        ObservedMapAbi {
+                            map_type: spec.map_type + 1,
+                            ..base
+                        },
+                    ),
+                    (
+                        "key_size",
+                        ObservedMapAbi {
+                            key_size: spec.key_size + 1,
+                            ..base
+                        },
+                    ),
+                    (
+                        "value_size",
+                        ObservedMapAbi {
+                            value_size: spec.value_size + 1,
+                            ..base
+                        },
+                    ),
+                    (
+                        "map_flags",
+                        ObservedMapAbi {
+                            map_flags: 1,
+                            ..base
+                        },
+                    ),
+                ];
+                for (dimension, observed) in divergences {
+                    assert_eq!(
+                        observed.max_entries, spec.max_entries,
+                        "{dimension} case must hold the slot count fixed"
+                    );
+                    assert_eq!(
+                        classify_retained_pin_abi(&observed, spec),
+                        RetainedPinAbi::Foreign,
+                        "{}: a divergent {dimension} must refuse even at this \
+                         build's slot count",
+                        spec.name
+                    );
+                    // And the same divergence must not become rebuildable just
+                    // because the slot count drifted too.
+                    assert_eq!(
+                        classify_retained_pin_abi(
+                            &ObservedMapAbi {
+                                max_entries: spec.max_entries + 1,
+                                ..observed
+                            },
+                            spec
+                        ),
+                        RetainedPinAbi::Foreign,
+                        "{}: a divergent {dimension} must refuse at a foreign \
+                         slot count too",
+                        spec.name
+                    );
+                }
+            }
+        }
 
         #[test]
         fn current_recovery_record_round_trips_and_rejects_tampering() {
