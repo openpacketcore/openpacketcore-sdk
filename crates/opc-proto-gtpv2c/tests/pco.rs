@@ -8,16 +8,34 @@ use opc_proto_gtpv2c::{
 };
 use opc_protocol::{DecodeContext, EncodeContext};
 
-/// Every P-CSCF request the type can express, and the address containers each
-/// one is required to carry.
-const EVERY_PCSCF_REQUEST: [(PcscfAddressRequest, &[u16]); 3] = [
-    (PcscfAddressRequest::Ipv4, &[PCO_CONTAINER_P_CSCF_IPV4]),
-    (PcscfAddressRequest::Ipv6, &[PCO_CONTAINER_P_CSCF_IPV6]),
-    (
-        PcscfAddressRequest::Ipv4AndIpv6,
-        &[PCO_CONTAINER_P_CSCF_IPV6, PCO_CONTAINER_P_CSCF_IPV4],
-    ),
+/// Every P-CSCF request the type can express.
+///
+/// Hand-maintained, so it carries variants only. The containers each one must
+/// produce come from the exhaustive [`required_p_cscf_containers`] below, where
+/// a variant added to `PcscfAddressRequest` is a compile error -- so the enum
+/// cannot grow without sending a maintainer to this array.
+const EVERY_PCSCF_REQUEST: [PcscfAddressRequest; 3] = [
+    PcscfAddressRequest::Ipv4,
+    PcscfAddressRequest::Ipv6,
+    PcscfAddressRequest::Ipv4AndIpv6,
 ];
+
+/// The address containers a P-CSCF request is required to carry.
+///
+/// Deliberately an exhaustive `match` and not a lookup in
+/// [`EVERY_PCSCF_REQUEST`]: a `PcscfAddressRequest` variant added later stops
+/// this test binary compiling, so it cannot slip through unexercised. That is
+/// the test-side half of the guard the encoder holds in
+/// `PcscfAddressRequest::includes_ipv4`/`includes_ipv6`, and the reason a new
+/// variant selecting neither family cannot silently reintroduce an
+/// unaccompanied `0x0012`.
+fn required_p_cscf_containers(addresses: PcscfAddressRequest) -> &'static [u16] {
+    match addresses {
+        PcscfAddressRequest::Ipv4 => &[PCO_CONTAINER_P_CSCF_IPV4],
+        PcscfAddressRequest::Ipv6 => &[PCO_CONTAINER_P_CSCF_IPV6],
+        PcscfAddressRequest::Ipv4AndIpv6 => &[PCO_CONTAINER_P_CSCF_IPV6, PCO_CONTAINER_P_CSCF_IPV4],
+    }
+}
 
 /// Every IPCP DNS selection, including the identifier octet each one carries.
 ///
@@ -151,8 +169,9 @@ fn reselection_support_is_unrepresentable_without_a_p_cscf_address_request() {
     // `identifier` octet is held fixed, and that octet changes no unit's
     // presence, so no combination outside this domain can reintroduce the
     // standalone container.
-    let mut points = 0usize;
-    for (addresses, expected_p_cscf) in EVERY_PCSCF_REQUEST {
+    let mut points = Vec::new();
+    for addresses in EVERY_PCSCF_REQUEST {
+        let expected_p_cscf = required_p_cscf_containers(addresses);
         for reselection_support in [false, true] {
             for dns_server_ipv6 in [false, true] {
                 for dns_server_ipv4 in [false, true] {
@@ -179,7 +198,7 @@ fn reselection_support_is_unrepresentable_without_a_p_cscf_address_request() {
                                     "{identifier:#06x} missing from {request:?}"
                                 );
                             }
-                            points += 1;
+                            points.push(request);
                         }
                     }
                 }
@@ -202,7 +221,7 @@ fn reselection_support_is_unrepresentable_without_a_p_cscf_address_request() {
                         ipcp_dns,
                     };
                     let encoded = request.encode_request_contents();
-                    points += 1;
+                    points.push(request);
                     if encoded.is_empty() {
                         continue;
                     }
@@ -219,7 +238,22 @@ fn reselection_support_is_unrepresentable_without_a_p_cscf_address_request() {
     // 3 address requests x 2 reselection x 2 dns6 x 2 dns4 x 2 mtu x 4 IPCP,
     // then the same grid without a P-CSCF request. Asserted so a later edit
     // that drops an axis is a failure rather than a silent loss of coverage.
-    assert_eq!(points, 3 * 2 * 2 * 2 * 2 * 4 + 2 * 2 * 2 * 4);
+    assert_eq!(EVERY_PCSCF_REQUEST.len(), 3);
+    assert_eq!(EVERY_IPCP_DNS_REQUEST.len(), 4);
+    assert_eq!(points.len(), 3 * 2 * 2 * 2 * 2 * 4 + 2 * 2 * 2 * 4);
+
+    // The count alone only catches an axis being removed. An axis pinned to a
+    // constant -- `[false, false]` for a boolean, a repeated entry in either
+    // const array -- keeps the product the same while halving what is actually
+    // covered, and would hide an encoder defect on the collapsed value. Every
+    // enumerated request differs from every other in at least one field, so a
+    // collapsed axis is a duplicate and fails here.
+    for (index, request) in points.iter().enumerate() {
+        assert!(
+            !points[..index].contains(request),
+            "duplicate enumerated request {request:?}: an axis has collapsed to a constant"
+        );
+    }
 }
 
 #[test]

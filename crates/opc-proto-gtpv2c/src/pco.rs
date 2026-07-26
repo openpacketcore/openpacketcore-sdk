@@ -139,7 +139,9 @@ impl IpcpDnsRequest {
 ///
 /// Every variant selects at least one address-request container. There is
 /// deliberately no "neither" variant, which is what makes an unaccompanied
-/// [`PcscfRequest::reselection_support`] unrepresentable.
+/// [`PcscfRequest::reselection_support`] unrepresentable. Adding a variant is a
+/// compile error in [`Self::includes_ipv4`] and [`Self::includes_ipv6`], so
+/// that property cannot be lost by an edit that only touches this enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PcscfAddressRequest {
     /// Request P-CSCF IPv4 addresses only: container `0x000c`.
@@ -152,15 +154,32 @@ pub enum PcscfAddressRequest {
 
 impl PcscfAddressRequest {
     /// Return whether container `0x000c` is selected.
+    ///
+    /// Written as an exhaustive `match` rather than a `matches!`, because
+    /// `matches!` would answer `false` for a variant added later. A variant
+    /// answering `false` here and in [`Self::includes_ipv6`] selects neither
+    /// address container, which is what would let [`PcscfRequest`] emit an
+    /// unaccompanied `0x0012` again. This way growing the enum is a compile
+    /// error at both sites instead.
     #[must_use]
     pub const fn includes_ipv4(self) -> bool {
-        matches!(self, Self::Ipv4 | Self::Ipv4AndIpv6)
+        match self {
+            Self::Ipv4 => true,
+            Self::Ipv6 => false,
+            Self::Ipv4AndIpv6 => true,
+        }
     }
 
     /// Return whether container `0x0001` is selected.
+    ///
+    /// Exhaustive for the reason given on [`Self::includes_ipv4`].
     #[must_use]
     pub const fn includes_ipv6(self) -> bool {
-        matches!(self, Self::Ipv6 | Self::Ipv4AndIpv6)
+        match self {
+            Self::Ipv4 => false,
+            Self::Ipv6 => true,
+            Self::Ipv4AndIpv6 => true,
+        }
     }
 }
 
