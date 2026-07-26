@@ -572,7 +572,9 @@ fn network_supplied_link_mtu_decodes_as_two_octets() {
         PcoAddressConfiguration::decode_network_contents(&[0x80, 0x00, 0x10, 0x02, 0x05, 0x4e])
             .expect("well-formed link MTU");
     assert_eq!(decoded.ipv4_link_mtu, Some(1358));
-    assert!(!decoded.is_empty());
+    // is_empty() asks about addresses; an MTU-only value is still empty, so a
+    // caller's configured-DNS fallback still fires.
+    assert!(decoded.is_empty());
     assert!(format!("{decoded:?}").contains("ipv4_link_mtu: Some(1358)"));
 
     let boundary =
@@ -627,4 +629,52 @@ fn a_wrong_length_address_container_still_fails_closed() {
         PcoAddressConfiguration::decode_network_contents(&[0x80, 0x00, 0x0d, 0x03, 8, 8, 8]),
         Err(PcoDecodeError::InvalidIpv4AddressLength)
     );
+}
+
+#[test]
+fn an_unusable_link_mtu_is_not_surfaced() {
+    // RFC 791 requires every internet module to forward a 68-octet datagram,
+    // so nothing below that is a link MTU. Surfacing one lets a caller that
+    // applies it blackhole the user plane.
+    for (mtu, octets) in [
+        (0u16, [0x00, 0x00]),
+        (1, [0x00, 0x01]),
+        (28, [0x00, 0x1c]),
+        (67, [0x00, 0x43]),
+    ] {
+        let decoded = PcoAddressConfiguration::decode_network_contents(&[
+            0x80, 0x00, 0x10, 0x02, octets[0], octets[1],
+        ])
+        .expect("a wrong value is ignored, not an error");
+        assert_eq!(
+            decoded.ipv4_link_mtu, None,
+            "mtu {mtu} must not be surfaced"
+        );
+        assert!(decoded.is_empty());
+    }
+
+    // The RFC 791 minimum itself is usable and must survive.
+    let decoded =
+        PcoAddressConfiguration::decode_network_contents(&[0x80, 0x00, 0x10, 0x02, 0x00, 0x44])
+            .expect("well-formed");
+    assert_eq!(decoded.ipv4_link_mtu, Some(68));
+
+    // An unusable first instance must not shadow a usable later one.
+    let decoded = PcoAddressConfiguration::decode_network_contents(&[
+        0x80, 0x00, 0x10, 0x02, 0x00, 0x00, 0x00, 0x10, 0x02, 0x05, 0xdc,
+    ])
+    .expect("well-formed");
+    assert_eq!(decoded.ipv4_link_mtu, Some(1500));
+}
+
+#[test]
+fn an_mtu_only_value_still_reports_empty_for_the_dns_fallback() {
+    // Regression for the predicate contract: `if cfg.is_empty() { use
+    // configured DNS }` must still fire when the peer sent only an MTU.
+    let decoded =
+        PcoAddressConfiguration::decode_network_contents(&[0x80, 0x00, 0x10, 0x02, 0x05, 0xdc])
+            .expect("well-formed");
+    assert_eq!(decoded.ipv4_link_mtu, Some(1500));
+    assert!(decoded.is_empty());
+    assert!(decoded.dns_server_ipv4_all().is_empty());
 }

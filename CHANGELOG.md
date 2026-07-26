@@ -8,6 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **IPv4 Link MTU follow-ups -- `opc-proto-gtpv2c`:** adversarial review of the
+  container support added in the same unreleased window found two defects.
+  - `PcoAddressConfiguration::is_empty()` had silently changed meaning: a value
+    carrying only a link MTU reported non-empty while the predicate's own
+    documentation still said "no supported address was present". An integrator
+    gating `if cfg.is_empty() { fall back to configured DNS }` would skip that
+    fallback and establish a session with no usable DNS -- the exact failure the
+    container was added to prevent. The predicate is address-only again, and
+    now says so.
+  - The two-octet value was length-checked but never value-checked, so a peer
+    sending `00 00` yielded `Some(0)`, indistinguishable from a real MTU. A
+    caller applying it blackholes the user plane for that session. A value below
+    the RFC 791 68-octet minimum is now skipped like a wrong-length instance,
+    matching the reasoning the sibling IPCP DNS option already applies to an
+    all-zero address.
 - **Generic GTP-U frame `Debug` no longer prints the TEID or the payload —
   `opc-proto-gtpu`:** `GtpuHeader`, `GtpuMessage` and `OwnedGtpuMessage` derived
   `Debug` over `pub teid: u32` and over the payload slice, so `{:?}` on a

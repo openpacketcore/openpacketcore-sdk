@@ -349,8 +349,16 @@ coverage.
      contents length other than two "shall be ignored by the receiver", so that
      instance is skipped and parsing continues. This is a deliberate exception
      to the fail-closed rule applied to the address containers, for which the
-     specification states no equivalent instruction. A repeated container keeps
-     the first value.
+     specification states no equivalent instruction.
+     An instance whose contents length is two but whose value is below the RFC
+     791 68-octet minimum is skipped the same way and reported as absent. That
+     is a second, SDK-owned deviation: 10.5.6.3 instructs ignoring only a wrong
+     *length*, and a length-two `0x0000` is well-formed by its letter. It is
+     taken because a caller that applies a zero or 28-octet link MTU blackholes
+     the user plane for that session, which is the failure the container exists
+     to prevent. The first *usable* value wins, so an unusable instance does
+     not shadow a later usable one; `is_empty()` reports on addresses only, so
+     an MTU-only value is still empty.
    - Bearer QoS decodes the fixed 22-octet shape into a typed
      Allocation/Retention Priority, QCI, and 40-bit integer-kbit/s maximum and
      guaranteed bit-rate fields. ARP priority level and spare bits are checked.

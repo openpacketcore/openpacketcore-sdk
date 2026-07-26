@@ -112,7 +112,13 @@ control-plane stack.
   container `0x0010`, and `PcoAddressConfiguration::ipv4_link_mtu` carries the
   two-octet value the network returns under the same identifier. TS 24.008
   10.5.6.3 requires a wrong-length instance to be *ignored*, so unlike the
-  address containers it is skipped rather than rejecting the whole value.
+  address containers it is skipped rather than rejecting the whole value. An
+  instance whose value is below the RFC 791 68-octet minimum is skipped the
+  same way and reported as absent, because a caller that applies a 0- or
+  28-octet link MTU blackholes the user plane for that session; an unusable
+  instance does not shadow a later usable one. `is_empty()` reports on
+  addresses only, so an MTU-only value is still empty and a caller's
+  configured-DNS fallback still fires.
 - Public profile constructors build profile-valid owned messages:
   `s2b_echo_request`, `s2b_echo_response`,
   `s2b_create_session_request`,

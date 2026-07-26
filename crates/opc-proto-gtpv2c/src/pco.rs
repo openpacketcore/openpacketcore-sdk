@@ -308,13 +308,22 @@ pub struct PcoAddressConfiguration {
     pub ipcp_secondary_dns: Option<[u8; 4]>,
     /// IPv4 link MTU in octets, from container `0x0010`.
     ///
-    /// `Option` rather than a sentinel: TS 24.008 reserves no "absent" value,
-    /// and zero is not one.
+    /// `Option` rather than a sentinel: TS 24.008 reserves no "absent" value.
+    /// A value below the RFC 791 68-octet minimum is not a usable link MTU and
+    /// is reported as absent rather than passed on, so a caller that applies
+    /// what it asked for cannot blackhole the user plane on two peer-supplied
+    /// octets.
     pub ipv4_link_mtu: Option<u16>,
 }
 
 impl PcoAddressConfiguration {
     /// Return whether no supported address was present.
+    ///
+    /// This asks about *addresses* only. A value carrying just an IPv4 link
+    /// MTU is still empty by this predicate, because the common caller uses it
+    /// to decide whether to fall back to configured DNS; reporting non-empty
+    /// for an MTU-only value would skip that fallback and establish a session
+    /// with no usable DNS. Check [`Self::ipv4_link_mtu`] separately.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.p_cscf_ipv6.is_empty()
@@ -323,7 +332,6 @@ impl PcoAddressConfiguration {
             && self.dns_server_ipv4.is_empty()
             && self.ipcp_primary_dns.is_none()
             && self.ipcp_secondary_dns.is_none()
-            && self.ipv4_link_mtu.is_none()
     }
 
     /// Every IPv4 DNS server address the peer supplied, by either mechanism.
@@ -495,6 +503,12 @@ fn decode_ipcp_dns_option(data: &[u8], slot: &mut Option<[u8; 4]>) -> Result<(),
     Ok(())
 }
 
+/// Smallest MTU an IPv4 link can carry.
+///
+/// RFC 791 requires every internet module to forward a 68-octet datagram
+/// without further fragmentation, so nothing below this is a usable link MTU.
+const MIN_IPV4_LINK_MTU: u16 = 68;
+
 /// Record the IPv4 link MTU, keeping the first of any repeat.
 ///
 /// TS 24.008 10.5.6.3 is explicit that a container whose contents length is
@@ -506,8 +520,16 @@ fn decode_ipv4_link_mtu(contents: &[u8], decoded: &mut PcoAddressConfiguration) 
     let Ok(octets) = <[u8; 2]>::try_from(contents) else {
         return;
     };
+    let mtu = u16::from_be_bytes(octets);
+    // A value below the RFC 791 minimum is not an MTU. Surfacing one lets a
+    // caller that applies what it asked for blackhole the whole user plane on
+    // two unvalidated octets, so it is skipped like a wrong-length instance --
+    // the same reasoning the sibling DNS option uses for an all-zero address.
+    if mtu < MIN_IPV4_LINK_MTU {
+        return;
+    }
     if decoded.ipv4_link_mtu.is_none() {
-        decoded.ipv4_link_mtu = Some(u16::from_be_bytes(octets));
+        decoded.ipv4_link_mtu = Some(mtu);
     }
 }
 
