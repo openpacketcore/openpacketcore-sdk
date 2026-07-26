@@ -74,8 +74,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   boundary: a record in any non-terminal state -- absent, unbound, or `Active`
   -- returns `Ok(None)` and discloses nothing, and widening that to a live
   record would make recovery a third-party teardown primitive.
+- **`OwnershipTransitionId::generate` and `generate_from` -- `opc-ipsec-lb`:**
+  the type documents a MUST-be-CSPRNG obligation but offered only
+  `new(u128)`, leaving the integrator to remember to draw 128 bits correctly --
+  the safe path was not the easy one. `generate()` now draws the full 128 bits
+  from the system CSPRNG through the crate's existing `SystemEntropy` source,
+  and `generate_from(&entropy)` accepts a deployment's own `EntropySource`.
+  Both keep the non-zero rejection, redrawing a bounded number of times before
+  reporting `EntropyUnavailable`, because a source that only ever yields the
+  rejected value is broken rather than unlucky. `new` remains the restore path
+  for an already-minted value; the README and rustdoc samples now mint through
+  `generate`.
+- **`RePinAuditCorrelationId` -- `opc-ipsec-lb`:** the non-reversible
+  `SHA-256(domain || transition_id)` correlation identity now carried by
+  `RePinAuditEvent` (see *Changed*), re-exported from the crate root. It is
+  `Copy`, ordered and hashable, exposes the digest through `as_bytes()`, and
+  renders through `Display` as the full 32-byte lowercase hex string -- both the
+  digest and that rendering are frozen by a pinning test, because sinks index
+  the rendered form and operators compare it. `for_transition(id)` is the only
+  constructor, so correlation is one-way by construction. Its rustdoc quantifies
+  the residual risk: the preimage is one 64-byte SHA-256 block, so a deployment
+  that ignores the CSPRNG mandate and mints identities from a counter or a
+  timestamp is inverted in seconds, and the domain separator carries no
+  per-deployment salt.
 
 ### Changed
+- **`RePinAuditEvent` carries a correlation digest, not the live transition
+  secret — `opc-ipsec-lb` (breaking: `transition_id: OwnershipTransitionId` is
+  replaced by `correlation_id: RePinAuditCorrelationId`):** the coordinator
+  emitted the pre-commit `Attempt`/activation-attempt event carrying the raw
+  `OwnershipTransitionId` while the transition was still live and unspent, on a
+  public field documented as a "stable transition correlation identity" that
+  "sinks deduplicate". Logging a correlation key is the ordinary thing for an
+  audit sink to do, and that made a `RePinAuditSink` that writes to a SIEM or
+  log store a disclosure path for the one value that authorizes
+  `RePinCoordinator::retire_activation`: the paired gate,
+  `validate_activation_target_owner`, reads both the shard and the owner out of
+  the replayed request, so it converges a replay rather than authenticating a
+  caller. Anyone with log-read access and reach to the coordinator API held a
+  standing per-SA teardown capability. The event now carries a non-reversible
+  `SHA-256(domain || transition_id)` digest that every event of one transition
+  shares, so dedup, grouping, and cross-event correlation are unchanged while
+  the value confers nothing; the field's type makes it structural, since that
+  field can no longer hold a transition identity at all. The guarantee is
+  per-field and not per-struct: every field is public, so a future field of type
+  `OwnershipTransitionId` would reopen the path, and the hand-written `Debug`
+  would not catch it. An operator holding the raw identity can still find its
+  records with `RePinAuditCorrelationId::for_transition`, and the reverse
+  direction does not exist. The audit event's `Debug` now prints the correlation
+  identity in full where it previously printed `[redacted]`, because the value is
+  no longer sensitive.
+  Migration: `RePinAuditEvent` is not `#[non_exhaustive]` and all its fields are
+  public, so this breaks construction as well as reads. Sinks and tests that read
+  `event.transition_id` must read `event.correlation_id`, and every struct
+  literal building a `RePinAuditEvent` -- test fixtures and fake sinks in
+  particular -- must replace the `transition_id:` initializer with
+  `correlation_id: RePinAuditCorrelationId::for_transition(id)`. No crates.io
+  consumers are affected, as `opc-ipsec-lb` is `publish = false`.
+- **`OwnershipTransitionId` redacts its own `Debug` — `opc-ipsec-lb` (breaking
+  only for code that parsed the rendering):** the containers already redacted
+  it (`RePinRequest` prints `RePinRequest([redacted])`), which is exactly the
+  admission that the value is sensitive, but the type derived `Debug` and so
+  printed the raw value through any container that derived `Debug` around it.
+  It now prints `OwnershipTransitionId([redacted])`. `get()` is unchanged --
+  callers legitimately need the value, and every call site is now the only way
+  to reach it. Its rustdoc states the secrecy obligation alongside the
+  unpredictability one: a value that is unguessable at mint time buys nothing if
+  it is published while the transition is live.
 - **`RePinAuditEventKind` gained an `Activated` variant — `opc-ipsec-lb`
   (breaking for exhaustive matches):** a first activation is now audited
   distinctly from an ownership transition. Activation events set

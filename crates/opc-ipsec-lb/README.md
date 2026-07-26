@@ -558,7 +558,7 @@ IKE counter and random-IV application remain consumer-owned.
 ```rust,ignore
 use std::sync::Arc;
 
-use opc_ipsec_lb::{RePinCoordinator, RePinRequest};
+use opc_ipsec_lb::{OwnershipTransitionId, RePinCoordinator, RePinRequest};
 use opc_ipsec_xfrm::{
     EspCounterResumeApplyRequest, EspCounterResumeBinding,
 };
@@ -570,6 +570,10 @@ let installed = staged_install
     .run_and_commit_outbound_sa_policy(Arc::clone(&xfrm))
     .await?;
 let outbound_sa_binding_id = installed.id();
+
+// One CSPRNG-drawn identity per logical transition. Retain it durably for
+// retries; it is a live secret until the transition is spent, so never log it.
+let transition_id = OwnershipTransitionId::generate()?;
 
 let request = RePinRequest::new_esp(
     inbound_spi,
@@ -639,14 +643,18 @@ recovery and cannot authorize a new fence. Rebuild both bounded sets before
 `resume`.
 
 Prepare every re-pin from `OwnershipSource::sa_ownership`, retaining both the
-authoritative owner and its exact fence in `RePinRequest`. Generate one non-zero,
-deployment-unique `OwnershipTransitionId` for that logical transition and reuse
-it only when retrying the identical request; a later transition, including an
-A→B→A owner cycle, requires a new ID.
+authoritative owner and its exact fence in `RePinRequest`. Mint one
+deployment-unique `OwnershipTransitionId` for that logical transition with
+`OwnershipTransitionId::generate()` and reuse it only when retrying the
+identical request; a later transition, including an A→B→A owner cycle, requires
+a new ID. `OwnershipTransitionId::new` is the restore path — rebuilding a
+retained request, or decoding a durable record — not a minting path.
 
 `OwnershipTransitionId` values MUST come from a cryptographically secure random
-source — never a counter, a timestamp, or any other guessable sequence. Every
-other field of a retirement (the SA, the ownership key, the owner
+source — never a counter, a timestamp, or any other guessable sequence.
+`generate()` draws them from the system CSPRNG and `generate_from(&entropy)`
+accepts a deployment's own vetted source; prefer either to drawing 128 bits by
+hand. Every other field of a retirement (the SA, the ownership key, the owner
 `ClusterNode`, the `SteeringRule`, and the active fence) is a public protocol
 value or a small monotonic integer, so this identity is the only part an
 unrelated party cannot derive. The retirement boundaries
@@ -655,6 +663,27 @@ match a replayed request against the durable record for *idempotent
 convergence*, not as an authorization decision. With a predictable transition
 identity that exact-match replay becomes a usable per-SA teardown primitive for
 anyone who can reach the coordinator API.
+
+**A live transition identity is a secret, not merely an unpredictable value.**
+Unpredictability at mint time buys nothing if the value is published afterwards:
+it is the sole authorization factor for retirement, so anyone who learns it
+holds a standing per-SA teardown capability until that transition is spent.
+Treat it as key material.
+
+* Never log it, export it, or place it in a metric label, trace span, or audit
+  record. Its `Debug` prints `OwnershipTransitionId([redacted])` so neither it
+  nor any type that derives `Debug` around it can leak it incidentally;
+  `OwnershipTransitionId::get()` is the only way to reach the value, and every
+  call site is a deliberate disclosure.
+* Encrypt it at rest. The ownership record that carries it is plaintext only
+  above the `EncryptingSessionBackend` boundary, which production HA
+  deployments must wrap (see *Durable session-level re-pin*).
+* Audit correlation does not need it — see *Audit and observability*.
+
+The disclosure becomes harmless only once the transition is terminally committed
+to teardown, which is why
+`SessionStoreOwnershipFencer::recover_stranded_activation_retirement` returns it
+for a `Retiring` record and for no other state.
 
 The coordinator computes a canonical
 SHA-256 fingerprint over the complete safety-critical request and verifies that
@@ -716,7 +745,7 @@ Use `RePinCoordinator::activate` for both cases:
    Shard-owner records use the same call with
    `SessionOwnershipKeyResolver::shard_key`.
 2. Build an `OwnershipActivationRequest` with `new_esp`/`new_ike`: the exact
-   ownership key, a fresh CSPRNG-drawn `OwnershipTransitionId`, this node's
+   ownership key, a fresh `OwnershipTransitionId::generate()?`, this node's
    `ClusterNode`, and the steering rule naming the owner shard. There are no
    resume, outbound-IV, counter, or anti-replay parameters, because nothing is
    being resumed.
@@ -799,6 +828,63 @@ implementation binds that permit to one backend, exact canonical ownership
 key, and operation stripe; a different backend or key cannot consume it. The
 private `RePinSteeringUpdate` separately binds the target owner shard and
 authoritative generation derived by the coordinator.
+
+### Audit and observability
+
+`RePinAuditEvent` is built to be safe for a sink to persist, index, and export.
+It does **not** carry the `OwnershipTransitionId`. It carries a
+`RePinAuditCorrelationId`, a non-reversible `SHA-256(domain || transition_id)`
+digest that every event of one logical transition shares, so grouping,
+deduplication, and following a transition across `Attempt` → `Fenced` →
+`SteeringInstalled` all work exactly as they would with the raw identity — but
+the value confers no capability.
+
+This is deliberate. The coordinator emits the pre-commit `Attempt` event while
+the transition is still live and unspent, and logging a correlation key is the
+ordinary thing for an audit sink to do. Had that key been the transition
+identity, every reader of the resulting log or SIEM index would hold a standing
+per-SA teardown capability, because `retire_activation` authorizes on holding
+the matching identity and its target-shard check reads both the owner and the
+shard out of the replayed request — it converges a replay, it does not
+authenticate a caller.
+
+Correlation stays one-way. An operator who already holds a transition identity
+can compute the matching records with
+`RePinAuditCorrelationId::for_transition(id)`; there is no reverse direction.
+
+The digest's non-reversibility rests on the same CSPRNG requirement as the
+identity itself, and the residual risk is worth quantifying rather than
+asserting. The preimage is the 39-byte domain separator plus the 16-byte
+identity — 55 bytes, exactly one 64-byte SHA-256 block, the cheapest per-guess
+cost the primitive admits. At roughly 2 × 10^10 SHA-256/s, one commodity GPU:
+
+| Minting policy (all of them violate the mandate) | Search space | Inverted in |
+| --- | --- | --- |
+| 32-bit counter | 2^32 | under a second |
+| Sequential counter below 2^40 | 2^40 | under a minute |
+| Millisecond timestamps over a decade | ~2^38 | ~15 seconds |
+| CSPRNG, as mandated | 2^128 | infeasible |
+
+So for the two failure modes `OwnershipTransitionId` explicitly rules out — a
+counter and a timestamp — inverting the published digest is seconds of work, not
+a theoretical weakness. The domain separator is additionally a compile-time
+constant with no per-deployment salt, so one precomputed table covers every
+deployment's logs at once. Draw transition identities with
+`OwnershipTransitionId::generate()`.
+
+A keyed MAC would remove the offline search entirely and was still rejected: an
+ephemeral key breaks the cross-restart and cross-node correlation the value
+exists to provide, and a shared key would have to reach every coordinator and
+every sink. `RePinCoordinator::new` takes no key, so adding one is a
+distribution problem rather than a hashing one — the crate already runs a
+rotating keyed MAC in `IkeCookieGate`, where that channel exists.
+
+The event's other fields — `sa`, `previous_owner`, `new_owner` — remain
+operator-visible identifiers. The event's `Debug` redacts them and prints the
+correlation identity in full; an exporting sink should apply its own deployment
+redaction policy to the rest. The rendered form is the lowercase, zero-padded,
+full 32-byte hex string and is frozen: sinks index it and operators compare it,
+so it is covered by the same pinning test as the digest bytes.
 
 ### Durable session-level re-pin
 

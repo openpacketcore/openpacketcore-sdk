@@ -4086,6 +4086,23 @@ mod tests {
     }
 
     const SESSION_SA_COUNT: usize = 4;
+    /// Transition identities for the shared harness are drawn wide on purpose.
+    /// `emitted_repin_audit_debug_redacts_session_identifiers_and_fences`
+    /// asserts the raw value never appears in rendered audit output, and that
+    /// rendering now contains hex correlation digests.
+    ///
+    /// Nothing here is flaky: the digests are fixed constants and the rendering
+    /// is deterministic, so any given offset either always passes or always
+    /// fails -- `900` in particular collides with none of the four digests it
+    /// produces. The hazard is that with a short offset that outcome is an
+    /// accident. A three-digit decimal token has roughly a 5.9% chance of
+    /// appearing somewhere in the four 64-character digests the harness
+    /// renders, about 21% that at least one of the four tokens does, so a
+    /// future maintainer who changes the offset or `SESSION_SA_COUNT` has a
+    /// one-in-five chance of landing on a deterministic false positive and
+    /// debugging the digest instead of the redaction. A wide value removes the
+    /// coincidence rather than a flake.
+    const HARNESS_TRANSITION_OFFSET: u128 = 0x2f81_a4c6_9d05_7e13_b6f2_48ac_15d9_3e00;
     static NEXT_TEST_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
 
     #[derive(Debug)]
@@ -5125,7 +5142,7 @@ mod tests {
 
     impl Harness {
         fn new() -> Self {
-            let plan = plan_with(0x44, 700, 900, SESSION_SA_COUNT);
+            let plan = plan_with(0x44, 700, HARNESS_TRANSITION_OFFSET, SESSION_SA_COUNT);
             let steering = MockSteeringBackend::new();
             let inner_fencer = MockOwnershipFencer::new();
             for request in plan.requests() {
@@ -6083,7 +6100,12 @@ mod tests {
         for request in harness.plan.requests() {
             for forbidden in [
                 format!("{:?}", request.sa),
-                format!("{:?}", request.transition_id),
+                // The raw value, not its `Debug` rendering: the transition
+                // identity authorizes retirement while it is live, and this
+                // assertion must still fail if the audit path ever carries it
+                // again in any form a sink could copy into a log.
+                request.transition_id.get().to_string(),
+                format!("{:032x}", request.transition_id.get()),
                 request.previous_owner.as_str().to_owned(),
                 request.new_owner.as_str().to_owned(),
             ] {
