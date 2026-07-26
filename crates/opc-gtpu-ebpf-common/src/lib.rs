@@ -315,8 +315,17 @@ pub const COUNTER_DL_MALFORMED: u32 = 4;
 /// Counter index: downlink G-PDUs dropped because the inner destination does
 /// not match the session's UE PAA.
 pub const COUNTER_DL_DST_MISMATCH: u32 = 5;
+/// Counter index: uplink packets dropped because neighbour redirect failed.
+///
+/// `bpf_redirect_neigh` is called with a null neighbour parameter, so the
+/// kernel resolves FIB and neighbour from the freshly materialized outer
+/// header. That resolution fails for conditions outside this program -- no
+/// route covering the outer destination, no neighbour entry and no
+/// resolution, or the egress interface down -- and those are precisely the
+/// conditions an operator needs to see.
+pub const COUNTER_UL_REDIRECT_FAIL: u32 = 6;
 /// Number of datapath counters.
-pub const COUNTER_SLOTS: u32 = 6;
+pub const COUNTER_SLOTS: u32 = 7;
 
 /// Binding-drop counter index: no canonical binding exists for the PDR.
 pub const COUNTER_DL_BINDING_INVALID: u32 = 0;
@@ -1994,6 +2003,36 @@ mod tests {
     extern crate std;
 
     use super::*;
+
+    /// Every datapath counter index must be distinct and inside the map.
+    ///
+    /// The indices address a fixed-size pinned per-CPU array, so a collision
+    /// silently merges two unrelated counters and an index at or past
+    /// `COUNTER_SLOTS` writes nothing at all -- both fail as a wrong number
+    /// rather than as an error.
+    #[test]
+    fn datapath_counter_indices_are_distinct_and_within_the_map() {
+        let indices = [
+            COUNTER_UL_ENCAP,
+            COUNTER_UL_FAR_MISS,
+            COUNTER_UL_REDIRECT_FAIL,
+            COUNTER_DL_DECAP,
+            COUNTER_DL_UNKNOWN_TEID,
+            COUNTER_DL_MALFORMED,
+            COUNTER_DL_DST_MISMATCH,
+        ];
+        let mut seen = std::vec::Vec::new();
+        for index in indices {
+            assert!(index < COUNTER_SLOTS, "index {index} is outside the map");
+            assert!(!seen.contains(&index), "index {index} is used twice");
+            seen.push(index);
+        }
+        assert_eq!(
+            seen.len() as u32,
+            COUNTER_SLOTS,
+            "every slot must be claimed, or the map is larger than the counters"
+        );
+    }
 
     fn far() -> UplinkFar {
         UplinkFar {

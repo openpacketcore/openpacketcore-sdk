@@ -61,6 +61,7 @@ use opc_gtpu_ebpf_common::{
     COUNTER_DL_BINDING_SOURCE_PORT_MISMATCH, COUNTER_DL_DECAP, COUNTER_DL_DST_MISMATCH,
     COUNTER_DL_MALFORMED, COUNTER_DL_UNKNOWN_TEID, COUNTER_SLOTS, COUNTER_UL_ENCAP,
     COUNTER_UL_FAR_MISS, COUNTER_UL_MTU_REJECT, COUNTER_UL_PMTU_CORRUPT,
+    COUNTER_UL_REDIRECT_FAIL,
     DOWNLINK_BINDING_COUNTER_SLOTS, DOWNLINK_ENDPOINT_BINDING_VALUE_LEN, DOWNLINK_PDR_VALUE_LEN,
     ETH_HDR_LEN, ETH_P_IPV4, ETH_P_IPV6, GTPU_FLAGS_V1_GPDU, GTPU_IPV6_ENCAP_LEN,
     GTPU_MANDATORY_HDR_LEN, GTPU_MAX_EXT_HEADERS, GTPU_MSG_TYPE_GPDU, GTPU_OPT_LEN,
@@ -617,13 +618,17 @@ fn complete_grouped_uplink(ctx: &TcContext, mark: u32, ether_type: u16) -> i32 {
     if mark != 0 {
         ctx.set_mark(0);
     }
-    count(COUNTER_UL_ENCAP);
     // SAFETY: no neighbour parameter pointer is supplied; the helper derives
     // the route and neighbour from the newly materialized outer IP header.
     let action = unsafe { bpf_redirect_neigh((*ctx.skb.skb).ifindex, core::ptr::null_mut(), 0, 0) };
+    // Count the outcome rather than the attempt. Counting the encapsulation
+    // before the redirect reported a success for every packet the redirect
+    // then dropped, so a total uplink outage read as a healthy uplink.
     if action == i64::from(TC_ACT_REDIRECT) {
+        count(COUNTER_UL_ENCAP);
         action as i32
     } else {
+        count(COUNTER_UL_REDIRECT_FAIL);
         TC_ACT_SHOT
     }
 }
@@ -1713,7 +1718,6 @@ fn try_uplink(ctx: &mut TcContext, mark: u32) -> Result<i32, ()> {
         )
         .map_err(|_| ())?;
     ctx.store(ETH_HDR_LEN, &encap, 0).map_err(|_| ())?;
-    count(COUNTER_UL_ENCAP);
 
     if mark != 0 {
         // The complete bearer mark is consumed by the exact marked FAR.
@@ -1729,6 +1733,13 @@ fn try_uplink(ctx: &mut TcContext, mark: u32) -> Result<i32, ()> {
     // more, misses the FAR (outer src is not a UE PAA), and passes through.
     // SAFETY: helper takes no pointers when plen == 0.
     let ret = unsafe { bpf_redirect_neigh((*ctx.skb.skb).ifindex, core::ptr::null_mut(), 0, 0) };
+    // Count the outcome rather than the attempt; see COUNTER_UL_REDIRECT_FAIL.
+    // The action itself is unchanged.
+    if ret == i64::from(TC_ACT_REDIRECT) {
+        count(COUNTER_UL_ENCAP);
+    } else {
+        count(COUNTER_UL_REDIRECT_FAIL);
+    }
     if mark != 0 && ret != i64::from(TC_ACT_REDIRECT) {
         Ok(TC_ACT_SHOT as i32)
     } else {
