@@ -45,6 +45,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     the three removed fields no longer exist, so
     `PcoRequest { p_cscf_ipv4: true, ..PcoRequest::none() }` does not compile.
     Encoded bytes are unchanged for every combination that was already legal.
+- **Stalled-backend test waits park instead of spinning -- `opc-session-net`:**
+  `mtls_backend_deadlines_disconnects_and_shutdown_release_stalled_work` waited
+  for the fake backend's in-flight-call counter to move by polling an atomic in
+  a `tokio::task::yield_now()` loop. The test runs on a `current_thread`
+  runtime, so `yield_now` did hand control to the connection task between
+  polls; the cost was that the waiting thread stayed runnable for the whole
+  wait and so contended with the other libtest threads in the same process.
+  Under the thread oversubscription a whole-workspace `cargo test` run creates,
+  that wait has been observed to miss its one-second budget (#566).
+  `CancellableStallBackend` now publishes the live count on a
+  `tokio::sync::watch` channel and the test parks on `Receiver::wait_for`,
+  which evaluates the predicate against the current value before it awaits
+  anything -- a state the backend already reached still resolves immediately,
+  so removing the spin cannot introduce a lost wakeup. The wait is semantically
+  equivalent to the loop it replaces, and every deadline and assertion is
+  unchanged. Each wait keeps its one-second bound, which stays strictly inside
+  the disconnect server's five-second `with_backend_operation_timeout`: that
+  deadline is the only other mechanism that can release the stalled read, so a
+  bound above it would let the test pass with peer-disconnect cancellation
+  removed from the server entirely. What this establishes is the removal of the
+  waiter's CPU contention, not a fix: a paired, interleaved measurement moved
+  the two converted waits in the favourable direction but not by a margin the
+  sample sizes run can separate from noise, and the test's other failure modes
+  -- among them the `fresh readiness must fail closed` assertion and the 250 ms
+  `with_idle_timeout` that bounds the gap before the request is written -- are
+  untouched by this change. #566 stays open.
 - **IPv4 Link MTU follow-ups -- `opc-proto-gtpv2c`:** adversarial review of the
   container support added in the same unreleased window found two defects.
   - `PcoAddressConfiguration::is_empty()` had silently changed meaning: a value
