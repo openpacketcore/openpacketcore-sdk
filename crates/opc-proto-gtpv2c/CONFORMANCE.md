@@ -470,14 +470,33 @@ coverage.
      crate models, at every instance 0-15, and nested inside a Bearer Context.
      At `ProcedureAware` an instance other than 0 is discarded even earlier, by
      the clause 7.7.9 receive filter, so both routes reach the same result.
-     `Strict` is not an opt-in stricter-than-TS-29.274 mode: it enforces field
-     cardinality and enum ranges, and for an optional IE clause 7.7.8 *is* the
-     range rule and it says discard.
-   - Discard means the IE is absent from the typed view, exactly as for a
-     clause 7.7.9 instance discard, and is not reported through
-     `S2bReceiveDiagnostics` — that surface carries duplicate-IE evidence only,
-     and clause 7.7.8 requires no log for the optional case. The received
-     octets are untouched: the raw-preserving `Message` view and
+     `Strict` is not an opt-in stricter-than-TS-29.274 mode: it enforces "field
+     cardinality, enum ranges, and critical IE rules", and for an optional IE
+     clause 7.7.8 *is* the range rule and it says discard.
+   - Discard means the IE is absent from the typed view *and* from the clause
+     7.7.10 duplicate bookkeeping. "Treat the rest of the message as if this IE
+     was absent" is a statement about the whole remaining decode, not only
+     about the returned sequence: a discarded IE does not occupy its
+     `(type, instance)` slot, so a later well-formed IE at the same key is
+     still decoded and is not counted as a repeat, and repeated malformed IEs
+     at one key are repeated discards rather than a duplicate. This holds under
+     every `DecodeContext::duplicate_ie_policy`, including the `Reject` that
+     `DecodeContext::conservative()` selects. Instance 0 is where it matters,
+     being the only instance Table 7.2.1-1 lists for the 3GPP AAA Server
+     Identifier and therefore the only key at which a spliced malformed IE can
+     collide with a genuine one.
+   - This is close to, but not identical with, a clause 7.7.9 instance discard.
+     The clause 7.7.9 receive filter drops the IE before duplicate handling is
+     reached at all; the clause 7.7.8 discard is applied after it, once the
+     value has been attempted. The two therefore differ in exactly one case:
+     when an interpretable occurrence has already been *retained* at a key, a
+     second occurrence there is a genuine clause 7.7.10 repeat and the caller's
+     `DuplicateIePolicy` governs it — `Reject` fails the message, `First`
+     records `DuplicateIeEvidence`. That evidence describes the repetition,
+     which the received message really contains. A discard at a key nothing has
+     been retained at emits no diagnostic at all, and clause 7.7.8 requires no
+     log for the optional case.
+   - The received octets are untouched: the raw-preserving `Message` view and
      `EncodeContext { raw_preserving: true }` still reproduce the malformed IE
      byte-exact, which is now observable because the decode succeeds.
    - The rule is a *receiver* rule and is applied as one. Both clauses open on

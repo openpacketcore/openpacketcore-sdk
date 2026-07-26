@@ -54,7 +54,7 @@ const INJECTION_CARRIER: &str = "spec/create_session_request_s2b_subset.bin";
 const FIXTURE_CORPUS_LEN: usize = 40;
 const INJECTED_VALUE_CLASSES: usize = 11;
 const BLOCK_A_POINTS: usize = 480;
-const BLOCK_B_POINTS: usize = 7040;
+const BLOCK_B_POINTS: usize = 10_560;
 
 /// Digest of the ordered Block A `(label, outcome)` list: every committed
 /// fixture, decoded and re-encoded across both surfaces, all three validation
@@ -71,17 +71,25 @@ const BLOCK_A_DIGEST: u64 = 10_922_305_812_464_877_325;
 /// suffix stripping, the clause 7.7.9 instance discard, and the clause 7.7.8
 /// malformed-value discard. Regenerate under the same discipline as
 /// `BLOCK_A_DIGEST`.
-const BLOCK_B_DIGEST: u64 = 3_768_305_719_507_037_689;
+///
+/// Block B enumerates all three validation levels. It previously stopped at
+/// two, which left the 96 `Strict` canonical points that IE 176 actually
+/// changes outside the digest: the whole-PR canonical delta is 539 points, of
+/// which only 443 were guarded. `Strict` is the level
+/// `DecodeContext::conservative()` selects, so it was the one level a wire
+/// guard could least afford to skip.
+const BLOCK_B_DIGEST: u64 = 15_588_910_344_812_376_123;
 
 /// Injection points whose carrier actually decodes, and whose raw-preserving
 /// re-encode is therefore checkable. Pinned exactly so a change that made most
 /// points fail decode cannot quietly shrink the guard.
 ///
-/// This rose from 2178 when malformed IE 176 values stopped failing the
-/// decode: 165 raw-preserving points became reachable, which is exactly the
-/// half of the clause 7.7.8 discard that says the untouched octets must still
-/// be there.
-const RAW_PRESERVING_CHECKED_POINTS: usize = 2343;
+/// This is unchanged from the pre-change baseline at `dae1919a`, on the same
+/// three-level grid: typing IE 176 narrowed the set of injected values that
+/// decode at all, and the clause 7.7.8 discard restores it exactly. Every one
+/// of these points re-encodes byte-exact, which is the half of the discard
+/// that says the untouched octets must still be there.
+const RAW_PRESERVING_CHECKED_POINTS: usize = 3079;
 
 fn fixture_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
@@ -263,7 +271,7 @@ fn enumerate_points() -> Vec<(String, String)> {
             for instance in 0u8..16 {
                 for (value_name, value) in &values {
                     let injected = append_ie(&carrier, &tliv(*ie_type, *spare, instance, value));
-                    for (level_name, level) in &LEVELS[..2] {
+                    for (level_name, level) in LEVELS {
                         for (mode_name, raw_preserving) in ENCODE_MODES {
                             points.push((
                                 format!(
@@ -489,7 +497,7 @@ fn raw_preserving_encoding_is_byte_exact_for_every_injected_point() {
             for instance in 0u8..16 {
                 for (_, value) in &values {
                     let injected = append_ie(&carrier, &tliv(*ie_type, *spare, instance, value));
-                    for (_, level) in &LEVELS[..2] {
+                    for (_, level) in LEVELS {
                         let Ok((tail, message)) = S2bMessage::decode(&injected, context(*level))
                         else {
                             continue;

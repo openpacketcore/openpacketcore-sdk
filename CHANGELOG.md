@@ -167,20 +167,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
       this crate models, at every instance 0-15, and nested inside a Bearer
       Context. At `ProcedureAware` an instance other than 0 is discarded even
       earlier, by the clause 7.7.9 receive filter, so both routes agree.
-      `Strict` is not an opt-in stricter-than-TS-29.274 mode: it enforces enum
-      ranges and cardinality, and for an optional IE clause 7.7.8 *is* the
-      range rule and it says discard. Two peer-controlled octets in an optional
-      IE therefore no longer cost the whole message.
-    - "Discard" means the IE is absent from the typed view, exactly as for a
-      clause 7.7.9 instance discard, and is not reported through
-      `S2bReceiveDiagnostics`, which carries duplicate-IE evidence only.
-      Clause 7.7.8 requires no log for the optional case.
+      `Strict` is not an opt-in stricter-than-TS-29.274 mode: it enforces
+      "field cardinality, enum ranges, and critical IE rules", and for an
+      optional IE clause 7.7.8 *is* the range rule and it says discard. Two
+      peer-controlled octets in an optional IE therefore no longer cost the
+      whole message, under every `DuplicateIePolicy` including the `Reject`
+      that `DecodeContext::conservative()` selects for untrusted input.
+    - "Discard" means the IE is absent from the typed view *and* from the
+      clause 7.7.10 duplicate bookkeeping: a discarded IE does not occupy its
+      `(type, instance)` slot, so a later well-formed IE at the same key is
+      still decoded and is not counted as a repeat. Without that, a malformed
+      IE spliced ahead of a genuine 3GPP AAA Server Identifier would suppress
+      it. Two malformed IEs at one key are likewise two discards, not a
+      duplicate.
+      This is close to, but not identical with, a clause 7.7.9 instance
+      discard, which drops the IE before duplicate handling is reached at all.
+      Clause 7.7.8 is applied after it, so once an interpretable occurrence has
+      been *retained* at a key, a second occurrence there is a genuine clause
+      7.7.10 repeat and the caller's `DuplicateIePolicy` governs it — including
+      emitting `DuplicateIeEvidence` under `First`. That evidence describes the
+      repetition, which the wire really contains; a discard at a fresh key adds
+      no diagnostic of any kind, and clause 7.7.8 requires no log.
     - The received octets are untouched. The raw-preserving `Message` view and
       `EncodeContext { raw_preserving: true }` still reproduce the malformed IE
       byte-exact, which is now observable at the S2b layer at all because the
-      decode succeeds. Across the committed 7520-point encoder differential,
-      raw-preserving encoding is byte-identical to the pre-IE-176 crate at
-      every one of its points.
+      decode succeeds. Across the committed 11040-point encoder differential,
+      which enumerates all three validation levels, raw-preserving encoding is
+      byte-identical to the pre-IE-176 crate at every one of its points.
     - It is a *receiver* rule and is applied as one. Both clauses open on "the
       receiver of a GTP signalling message", so the builders' sender-side
       self-check still rejects a caller-supplied raw IE 176 whose value is
@@ -203,15 +216,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     raw-preserving encoding is byte-exact in every case a message decodes at
     all.
   - Wire effect, measured. The committed encoder differential
-    (`tests/node_identifier_wire_compatibility.rs`) enumerates 7520 points:
+    (`tests/node_identifier_wire_compatibility.rs`) enumerates 11040 points:
     480 covering every committed fixture across both decode surfaces, all three
-    validation levels, and both encode modes, plus a 7040-point IE injection
-    grid. Against the crate before this entry, 443 points change, every one of
-    them an IE 176 row and every one of them in canonical encode mode: 165
-    clause 7.7.9 instance discards, 165 clause 7.7.8 malformed-value discards,
-    96 spare-nibble zeroings, and 17 Extendable-suffix strippings. Zero points
-    change in raw-preserving mode and zero change on any committed fixture, so
-    no message that already round-tripped moves on the wire.
+    validation levels, and both encode modes, plus a 10560-point IE injection
+    grid over the type, spare, instance, value, level, and encode-mode axes.
+    Against the crate before this entry, 539 points change. Every one of them
+    is an IE 176 row and every one is in canonical encode mode: 410 where the
+    IE no longer contributes any octet to the re-encode (the clause 7.7.9
+    instance discard and the clause 7.7.8 malformed-value discard) and 129
+    where it is re-encoded with different octets (spare-nibble zeroing and
+    Extendable-suffix stripping). By validation level the split is 272
+    `Structural`, 171 `ProcedureAware`, and 96 `Strict`. Zero points change in
+    raw-preserving mode at any level, and zero change on any committed
+    fixture, so no message that already round-tripped moves on the wire.
 
 ### Fixed
 - **P-CSCF Re-selection support is no longer emittable on its own --

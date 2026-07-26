@@ -3587,6 +3587,7 @@ impl<'a> S2bMessage<'a> {
                 typed_ctx,
                 &filter,
                 &repeatable_limit,
+                malformed_optional,
             )?
         } else if pgw_triggered_request {
             decode_pgw_triggered_request_ie_sequence_with_evidence(

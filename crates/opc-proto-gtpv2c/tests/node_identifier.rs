@@ -17,8 +17,8 @@ use opc_proto_gtpv2c::{
     INTERFACE_TYPE_S2B_EPDG_GTP_C, MAX_NODE_IDENTIFIER_FIELD_LEN,
 };
 use opc_protocol::{
-    BorrowDecode, DecodeContext, DecodeErrorCode, Encode, EncodeContext, SpecRef, UnknownIePolicy,
-    ValidationLevel,
+    BorrowDecode, DecodeContext, DecodeErrorCode, DuplicateIePolicy, Encode, EncodeContext,
+    SpecRef, UnknownIePolicy, ValidationLevel,
 };
 
 const CREATE_SESSION_REQUEST_FIXTURE: &[u8] =
@@ -356,6 +356,152 @@ fn a_malformed_node_identifier_is_discarded_from_the_typed_sequence() {
     }
 }
 
+/// Every duplicate policy `DecodeContext` exposes. Clause 7.7.8 conditions the
+/// discard on nothing but the IE's presence, so a caller's clause 7.7.10
+/// duplicate policy must not change whether a malformed optional IE is
+/// discarded -- only what happens to IEs that were actually retained.
+const DUPLICATE_POLICIES: &[DuplicateIePolicy] = &[
+    DuplicateIePolicy::Reject,
+    DuplicateIePolicy::First,
+    DuplicateIePolicy::Last,
+];
+
+fn duplicate_policy_context(policy: DuplicateIePolicy, level: ValidationLevel) -> DecodeContext {
+    DecodeContext {
+        duplicate_ie_policy: policy,
+        validation_level: level,
+        ..DecodeContext::default()
+    }
+}
+
+/// TS 29.274 clause 7.7.8 requires the rest of the message to be treated "as if
+/// this IE was absent". Absent means absent from the clause 7.7.10 duplicate
+/// bookkeeping too, not merely from the returned sequence: a discarded IE that
+/// still held its `(type, instance)` slot would make the next genuine IE at
+/// that key look like a repeat, and there is no repeat -- the wire carries one
+/// interpretable Node Identifier.
+///
+/// Instance 0 is load-bearing and is what separates this from the discard tests
+/// above, which all put the follower at instance 1 where no key collision is
+/// possible. Instance 0 is the only instance Table 7.2.1-1 lists for the 3GPP
+/// AAA Server Identifier, so it is the only key where a spliced malformed IE
+/// can collide with a real one -- which is exactly what an on-path attacker
+/// would splice.
+///
+/// `DuplicateIePolicy::Reject` is the decisive case: it is what
+/// `DecodeContext::conservative()`, documented as "conservative defaults
+/// suitable for untrusted network input", selects.
+#[test]
+fn a_discarded_node_identifier_does_not_occupy_its_duplicate_slot() {
+    let expected = TypedIe {
+        instance: 0,
+        value: TypedIeValue::NodeIdentifier(
+            NodeIdentifier::new(b"aaa".to_vec(), b"org".to_vec()).expect("follower constructs"),
+        ),
+    };
+
+    for (label, value, _) in MALFORMED_LENGTH_PAIRS {
+        let mut wire = raw_ie(0, value);
+        wire.extend_from_slice(&node_identifier_ie(0, b"aaa", b"org"));
+
+        for policy in DUPLICATE_POLICIES {
+            for level in TYPED_LEVELS {
+                let decoded =
+                    decode_typed_ie_sequence(&wire, duplicate_policy_context(*policy, *level), 0)
+                        .unwrap_or_else(|error| {
+                            panic!(
+                            "{label} under {policy:?}/{level:?} must be discarded, not counted as \
+                             a duplicate: {error:?}"
+                        )
+                        });
+                assert_eq!(
+                    decoded,
+                    vec![expected.clone()],
+                    "{label} under {policy:?}/{level:?} did not leave exactly the well-formed \
+                     Node Identifier behind"
+                );
+            }
+        }
+
+        // The documented untrusted-input preset, asserted by name rather than
+        // by reconstructing its fields, so a change to the preset is caught.
+        let decoded = decode_typed_ie_sequence(&wire, DecodeContext::conservative(), 0)
+            .unwrap_or_else(|error| {
+                panic!("{label} must be discarded under conservative(): {error:?}")
+            });
+        assert_eq!(
+            decoded,
+            vec![expected.clone()],
+            "{label} under conservative()"
+        );
+    }
+}
+
+/// The peer-controlled denial of service clause 7.7.8 exists to remove is not
+/// only reachable with one malformed IE. Two malformed Node Identifiers at the
+/// same key are two discards, not a duplicate: nothing was retained, so there
+/// is nothing for clause 7.7.10 to be about. Without this, `Reject` still
+/// failed the whole message for four peer-supplied octets instead of two.
+#[test]
+fn repeated_malformed_node_identifiers_at_one_key_are_all_discarded() {
+    for (label, value, _) in MALFORMED_LENGTH_PAIRS {
+        let mut wire = raw_ie(0, value);
+        wire.extend_from_slice(&raw_ie(0, value));
+        wire.extend_from_slice(&raw_ie(0, value));
+
+        for policy in DUPLICATE_POLICIES {
+            let decoded = decode_typed_ie_sequence(
+                &wire,
+                duplicate_policy_context(*policy, ValidationLevel::Strict),
+                0,
+            )
+            .unwrap_or_else(|error| {
+                panic!("three copies of {label} under {policy:?} must not fail: {error:?}")
+            });
+            assert!(
+                decoded.is_empty(),
+                "{policy:?} retained something from three malformed IEs: {decoded:?}"
+            );
+        }
+    }
+}
+
+/// The boundary in the other direction. Once an occurrence has been *retained*,
+/// a later one at the same key is a genuine clause 7.7.10 repeat and the
+/// caller's duplicate policy governs it -- clause 7.7.8 discards the malformed
+/// IE from the typed view, it does not erase the retained one's slot. This
+/// pins that the fix above did not turn every duplicate into a silent drop.
+#[test]
+fn a_retained_node_identifier_still_makes_a_later_one_a_duplicate() {
+    let mut wire = node_identifier_ie(0, b"aaa", b"org");
+    wire.extend_from_slice(&raw_ie(0, &[0x09, b'a']));
+    let retained = TypedIe {
+        instance: 0,
+        value: TypedIeValue::NodeIdentifier(
+            NodeIdentifier::new(b"aaa".to_vec(), b"org".to_vec()).expect("first constructs"),
+        ),
+    };
+
+    let strict = ValidationLevel::Strict;
+    let rejected = decode_typed_ie_sequence(
+        &wire,
+        duplicate_policy_context(DuplicateIePolicy::Reject, strict),
+        0,
+    )
+    .expect_err("a second occurrence at a retained key is a clause 7.7.10 repeat");
+    assert_eq!(*rejected.code(), DecodeErrorCode::DuplicateIe);
+
+    for policy in [DuplicateIePolicy::First, DuplicateIePolicy::Last] {
+        let decoded = decode_typed_ie_sequence(&wire, duplicate_policy_context(policy, strict), 0)
+            .unwrap_or_else(|error| panic!("{policy:?} must resolve the repeat: {error:?}"));
+        assert_eq!(
+            decoded,
+            vec![retained.clone()],
+            "{policy:?} did not keep the interpretable occurrence"
+        );
+    }
+}
+
 /// Every validation level this crate exposes for a typed decode. Clause 7.7.8
 /// states one receiver rule and conditions it on nothing but the IE's
 /// presence, so all three must reach the same disposition.
@@ -586,6 +732,51 @@ fn a_discarded_node_identifier_is_still_byte_exact_under_raw_preserving_encode()
     }
 }
 
+/// The S2b receive profile forces `DuplicateIePolicy::First` for clause 7.7.10,
+/// so a discarded IE that kept its key would not fail the message -- it would
+/// fail open: the genuine 3GPP AAA Server Identifier that follows would be
+/// dropped, and `S2bReceiveDiagnostics` would report a duplicate that the wire
+/// does not contain. A caller reading that diagnostic would be told the wrong
+/// cause about a field naming operator AAA infrastructure.
+///
+/// The malformed IE is spliced *ahead* of the genuine one, which is the shape
+/// an on-path attacker would use: six octets in front of the real IE.
+#[test]
+fn a_discarded_node_identifier_neither_suppresses_nor_fabricates_evidence() {
+    let mut injected = raw_ie(0, &[0x09, b'a']);
+    injected.extend_from_slice(&node_identifier_ie(0, b"aaa", b"org"));
+    let message = with_leading_ie(CREATE_SESSION_REQUEST_FIXTURE, &injected);
+
+    let (_, decoded) = S2bMessage::decode_with_diagnostics(&message, procedure_context())
+        .expect("a spliced malformed Node Identifier must not fail the receive");
+
+    let ies = &decoded
+        .message()
+        .as_view()
+        .expect("Create Session Request view")
+        .ies;
+    let found: Vec<&TypedIe<'_>> = ies
+        .iter()
+        .filter(|ie| ie.ie_type() == IE_TYPE_NODE_IDENTIFIER)
+        .collect();
+    assert_eq!(
+        found.len(),
+        1,
+        "the genuine Node Identifier was suppressed by the discarded one"
+    );
+    let TypedIeValue::NodeIdentifier(value) = &found[0].value else {
+        panic!("the surviving Node Identifier is not typed");
+    };
+    assert_eq!(value.name(), b"aaa");
+    assert_eq!(value.realm(), b"org");
+
+    assert!(
+        decoded.diagnostics().is_empty(),
+        "a clause 7.7.8 discard fabricated duplicate evidence: {:?}",
+        decoded.diagnostics()
+    );
+}
+
 /// `UnknownIePolicy` is a separate axis from clause 7.7.8. A malformed IE 176
 /// is a *known* IE with an out-of-range value, not an unknown IE, so `Reject`
 /// -- documented as rejecting "messages containing unknown IEs" -- must not
@@ -643,6 +834,60 @@ fn builders_still_reject_a_malformed_caller_supplied_node_identifier() {
     assert!(
         s2b_create_session_request(request).is_err(),
         "the builder must not emit a malformed Node Identifier"
+    );
+}
+
+/// The sender-side reject boundary must hold one level down as well.
+/// `BearerContext::members` is a public `Vec<TypedIe>`, so a caller can put a
+/// malformed IE 176 inside a grouped IE without going through
+/// `additional_ies`. The nested decode receives the same `IeDecodePolicy` as
+/// the top level, and that is only checkable with a nested case: forcing
+/// `MalformedOptionalIePolicy::Discard` on the nested `BearerContext` call
+/// otherwise leaves the whole suite green, because nothing exercises it.
+#[test]
+fn builders_still_reject_a_malformed_node_identifier_inside_a_bearer_context() {
+    let mut request = create_session_request();
+    request.bearer_context.members.push(TypedIe {
+        instance: 0,
+        value: TypedIeValue::Raw(RawIe {
+            ie_type: IE_TYPE_NODE_IDENTIFIER,
+            instance: 0,
+            spare: 0,
+            value: &[0x09, b'a'],
+        }),
+    });
+    assert!(
+        s2b_create_session_request(request).is_err(),
+        "the builder must not emit a malformed Node Identifier nested in a Bearer Context"
+    );
+}
+
+/// The malformed-value reject is not scoped to the request builders. Every S2b
+/// builder routes through `build_s2b_profile_message`, whose self-check runs
+/// under `S2bDecodePurpose::CanonicalBuilder`, so a response builder rejects
+/// the same octets. Pinned because the README states the boundary as the
+/// builders' rather than the request builders' -- and that sentence is only
+/// true if a response builder really does reject.
+#[test]
+fn response_builders_also_reject_a_malformed_node_identifier() {
+    let built = s2b_delete_session_response(S2bDeleteSessionResponse {
+        sequence_number: 0x01_0206,
+        teid: 0x1122_3344,
+        cause: CauseValue::RequestAccepted,
+        additional_ies: vec![TypedIe {
+            instance: 0,
+            value: TypedIeValue::Raw(RawIe {
+                ie_type: IE_TYPE_NODE_IDENTIFIER,
+                instance: 0,
+                spare: 0,
+                value: &[0x09, b'a'],
+            }),
+        }],
+    });
+    let error = built.expect_err("a response builder must not emit malformed IE 176 octets");
+    assert!(
+        format!("{error:?}").contains("Truncated"),
+        "the response builder rejected for the wrong reason: {error:?}"
     );
 }
 
@@ -988,12 +1233,14 @@ fn builders_admit_a_caller_supplied_node_identifier_only_where_the_table_lists_i
     }
 }
 
-/// Only the request builders gate `additional_ies`. The response builders
-/// validate under `S2bDecodePurpose::CanonicalBuilder`, which skips the clause
-/// 7.7.9 receive filter, so they still emit a raw IE 176 at an instance this
-/// crate's own procedure-aware receiver discards. That looseness is
-/// pre-existing and applies to every known IE; it is pinned here so the README
-/// and CONFORMANCE sentences scoping the claim to request builders stay honest.
+/// Only the request builders gate `additional_ies` by *instance*. The response
+/// builders validate under `S2bDecodePurpose::CanonicalBuilder`, which skips
+/// the clause 7.7.9 receive filter, so they still emit a raw IE 176 at an
+/// instance this crate's own procedure-aware receiver discards. That looseness
+/// is pre-existing and applies to every known IE; it is pinned here so the
+/// README and CONFORMANCE sentences scoping the *instance* claim to request
+/// builders stay honest. The malformed-*value* reject is a separate axis and is
+/// not so scoped -- see the response-builder test below.
 #[test]
 fn response_builders_do_not_gate_a_caller_supplied_node_identifier() {
     let built = s2b_delete_session_response(S2bDeleteSessionResponse {

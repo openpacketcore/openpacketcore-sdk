@@ -34,10 +34,13 @@ control-plane stack.
   infallible; decode detects a subfield length that overruns the IE value, and
   `Debug` reports only subfield lengths. Because Table 7.2.1-1 gives the IE
   presence O, such a value is discarded and the rest of the message is
-  processed as if the IE were absent, per TS 29.274 clauses 7.7.7 and 7.7.8;
-  the received octets stay byte-exact under raw-preserving encode. The request
+  processed as if the IE were absent, per TS 29.274 clauses 7.7.7 and 7.7.8 —
+  absent from the duplicate bookkeeping too, so a malformed IE cannot suppress
+  a well-formed one at the same instance or be reported as a repeat; the
+  received octets stay byte-exact under raw-preserving encode. The S2b
   builders' sender-side validation still rejects a caller-supplied raw IE 176
-  whose value is malformed, because those clauses bind the receiver.
+  whose value is malformed, at the top level and nested inside a Bearer
+  Context, because those clauses bind the receiver.
   Their Extendable IE decoders retain the
   known Release 18 prefix while raw-preserving message encode retains accepted
   later-release suffixes; canonical encode emits only understood fields and
