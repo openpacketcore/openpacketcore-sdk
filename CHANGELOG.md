@@ -71,6 +71,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   -- among them the `fresh readiness must fail closed` assertion and the 250 ms
   `with_idle_timeout` that bounds the gap before the request is written -- are
   untouched by this change. #566 stays open.
+- **A black-holed uplink is now visible from inside the datapath --
+  `opc-gtpu-dataplane`, `opc-gtpu-dataplane-ebpf` (closes issue 564):**
+  `uplink_encapsulated` increments before the neighbour redirect and the
+  failure path incremented nothing, so a total uplink outage caused by an
+  unroutable outer destination showed `uplink_encapsulated` rising 1:1 with
+  subscriber traffic -- a reported success for every dropped packet.
+  - The new `uplink_redirects_resolved` counter reports the outcome. A
+    successful `bpf_redirect_neigh` re-enters the same tc egress hook
+    (`skb_do_redirect()` -> `__bpf_redirect_neigh_v4()` ->
+    `bpf_out_neigh_v4()` -> `neigh_output()` -> `dev_queue_xmit()` ->
+    `sch_handle_egress()`), and one that finds no route, or a route type that
+    is neither `RTN_UNICAST` nor `RTN_LOCAL`, is `kfree_skb`'d before it gets
+    there, as is one whose link-layer destination is multicast, which
+    `__bpf_redirect_neigh()` rejects ahead of the route lookup. The uplink
+    program recognizes its own re-emitted outer frame on that second traversal
+    and counts it, so the two counters rise together on a healthy uplink and
+    the new one stops while `uplink_encapsulated` keeps rising when delivery
+    stops -- subject to the third limit below. Covered by a privileged test
+    that drives real subscriber traffic against reachable, unroutable, and
+    unresolvable-next-hop outer destinations.
+  - The frame is identified by what it is, never by a stamp the program
+    writes: `skb->mark` carries bearer identity and is untouched. Re-entry
+    requires mark zero, an outer IPv4 or IPv6 UDP/2152 GTPv1 G-PDU envelope of
+    exactly the emitted shape, and an outer source that is one of the
+    attachment's own local S2b-U endpoints. No provisioned UE PAA may alias
+    that endpoint under either schema, so subscriber traffic cannot be
+    mistaken for it.
+  - No GPL-only helper and no `bpf_fib_lookup` are involved. The check uses
+    only `bpf_map_lookup_elem` and `bpf_skb_load_bytes`, both already called by
+    this program and both `gpl_only = false`, and the signal does not depend on
+    the egress device's IPv4 forwarding sysctl.
+  - Three limits are documented on the counter. It proves the frame cleared FIB
+    and neighbour resolution and reached `dev_queue_xmit`, not that the peer
+    received it. An unresolved neighbour lags rather than reads wrong, because
+    the skb waits in the neighbour's `arp_queue` and is counted late if
+    resolution eventually succeeds. And the counter is **unauthenticated**:
+    because the datapath recognizes its own frame by what the frame is, any
+    locally originated packet sourced from the attachment's S2b-U endpoint to
+    UDP/2152 with a GTPv1 G-PDU header increments it too, so an unprivileged
+    co-located process can inflate it while `uplink_encapsulated` stays flat.
+    Only observability is affected -- no forwarding decision reads this
+    counter, and no subscriber traffic can present that source -- and it is not
+    closable by tightening, because every discriminator available inside the
+    program is in-band and therefore forgeable by a local sender.
+  - `EbpfGtpuDatapathCounters` gains a public field and is not
+    `#[non_exhaustive]`, so this is **source-breaking** for any out-of-crate
+    struct literal or exhaustive destructuring of that type. The crate is
+    `publish = false` and every construction site is inside it, so nothing
+    in-tree changes; the type is left exhaustive deliberately, matching every
+    other public struct in the module, because it is a report value a consumer
+    test may legitimately want to write as a literal.
+  - `COUNTER_SLOTS` grows from six to seven. That changes the committed
+    object's `maps` section -- the CI drift gate must be refreshed with it --
+    and also `GTPU_COUNTERS.max_entries` in the pinned map graph, which every
+    current-schema pin identity check compares. A pin graph retained from a
+    build with the old slot count is therefore not this build's graph and is
+    refused rather than adopted in place, so an upgrade cannot reuse one. The
+    counter map is per-CPU and aggregate-only; no consumer reads slots
+    positionally beyond the exported constants.
+
+- **`uplink_far_misses` no longer reports a healthy uplink as session-state
+  corruption -- `opc-gtpu-dataplane`, `opc-gtpu-dataplane-ebpf`:** the
+  re-emitted outer frame's source is the local S2b-U address, never a UE PAA,
+  so the FAR lookup missed and the counter incremented once per *successfully
+  delivered* uplink IPv4 packet. An operator reading "FAR misses" read a
+  working uplink as broken session state. The re-emitted frame is now accounted
+  under `uplink_redirects_resolved` instead, so `uplink_far_misses` no longer
+  counts the datapath's own re-emitted G-PDUs. It is unchanged otherwise: any
+  other mark-zero IPv4 frame leaving the attachment whose source is not a
+  provisioned UE PAA still counts here.
+
 - **IPv4 Link MTU follow-ups -- `opc-proto-gtpv2c`:** adversarial review of the
   container support added in the same unreleased window found two defects.
   - `PcoAddressConfiguration::is_empty()` had silently changed meaning: a value
@@ -102,6 +173,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not tell a G-PDU from an unmodelled control type without decoding the header a
   second time -- the very parse `GTPU_MESSAGE_G_PDU` exists to avoid. Type
   identifiers are protocol metadata under this enum's own contract.
+
+### Documented
+- **`uplink_encapsulated` no longer claims delivery --
+  `opc-gtpu-dataplane`, `opc-gtpu-dataplane-ebpf`:** the counter was documented
+  as "uplink packets successfully GTP-U encapsulated", which reads as delivery.
+  It counts encapsulations handed to `bpf_redirect_neigh`. The helper records
+  the target ifindex and returns `TC_ACT_REDIRECT`; route lookup, neighbour
+  resolution and any drop happen later in `skb_do_redirect()` after the
+  classifier has returned. A total uplink outage caused downstream of the
+  classifier still shows `uplink_encapsulated` rising 1:1 with subscriber
+  traffic. The rustdoc and both crate READMEs now state exactly what the
+  counter proves, what it does not, and to read it against
+  `uplink_redirects_resolved`.
+  - A counter derived from the redirect helper's *return value* cannot work:
+    that was attempted, merged, and reverted for reading zero forever, because
+    at `plen == 0` and `flags == 0` the helper can only return
+    `TC_ACT_REDIRECT`. The outcome is observable through the re-emitted frame's
+    second traversal of this hook instead; see the `Fixed` entry above.
+
+- **Both uplink completion sites fail closed on a non-redirect verdict --
+  `opc-gtpu-dataplane-ebpf`:** the IPv4 encapsulation site returned
+  `bpf_redirect_neigh`'s own value straight out of the classifier on the
+  mark-zero path while `complete_grouped_uplink` dropped. The sites are now
+  symmetric.
+  - This has no behavioural effect and fixes no leak. `bpf_redirect_neigh`
+    returns only `TC_ACT_REDIRECT` or `TC_ACT_SHOT` (verified in v6.19
+    `net/core/filter.c` and `kernel-5.14.0-427.el9 net/core/filter.c`), and
+    `TC_ACT_SHOT` is inside the `TC_ACT_*` set that `sch_handle_egress()`
+    already handles explicitly with `kfree_skb_reason(); *ret = NET_XMIT_DROP`.
+    `cls_bpf_exec_opcode()` additionally clamps anything outside
+    `{OK, SHOT, STOLEN, TRAP, REDIRECT, UNSPEC}` to `TC_ACT_UNSPEC` before the
+    verdict reaches that switch. The old code dropped correctly at every
+    `plen`/`flags`.
+  - The retained `else` arm is unreachable today: `plen == 0` with `flags == 0`
+    is exactly the shape for which `(plen && plen < sizeof(*params)) || flags`
+    can never be true. It is defensive symmetry against a future call shape,
+    not a fix.
 
 ### Added
 - **P-CSCF restoration accepts caller-chosen configuration-attribute types --

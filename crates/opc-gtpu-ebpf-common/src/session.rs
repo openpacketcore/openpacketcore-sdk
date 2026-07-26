@@ -2021,6 +2021,39 @@ fn config_authorizes_entry_local(
     }
 }
 
+/// Return whether `address` is this attachment's managed local outer IPv4
+/// endpoint, reading the configuration wire value directly.
+///
+/// The tc datapath uses this to recognize an outer frame it emitted itself.
+/// Only a canonical configuration bound to `observed_ifindex` can authorize an
+/// address, so a stale, half-written, or foreign-device slot never matches.
+#[must_use]
+pub fn gtpu_session_config_wire_owns_local_ipv4(
+    config: &[u8; GTPU_SESSION_CONFIG_VALUE_LEN],
+    observed_ifindex: u32,
+    address: &[u8; 4],
+) -> bool {
+    config[1] & 1 != 0
+        && config[24..28] == address[..]
+        && device_config_wire_is_canonical(config, observed_ifindex)
+}
+
+/// Return whether `address` is this attachment's managed local outer IPv6
+/// endpoint, reading the configuration wire value directly.
+///
+/// The IPv6 counterpart of [`gtpu_session_config_wire_owns_local_ipv4`]; the
+/// same canonicality and attachment binding apply.
+#[must_use]
+pub fn gtpu_session_config_wire_owns_local_ipv6(
+    config: &[u8; GTPU_SESSION_CONFIG_VALUE_LEN],
+    observed_ifindex: u32,
+    address: &[u8; 16],
+) -> bool {
+    config[1] & 2 != 0
+        && config[40..56] == address[..]
+        && device_config_wire_is_canonical(config, observed_ifindex)
+}
+
 /// Select one canonical grouped-session slot without copying it.
 ///
 /// This is the BPF packet-path counterpart to the typed
@@ -2404,6 +2437,93 @@ mod tests {
         assert_eq!(v4_entry().outer_family(), GtpuSessionIpFamily::Ipv6);
         assert_eq!(v6_entry().inner_family(), GtpuSessionIpFamily::Ipv6);
         assert_eq!(v6_entry().outer_family(), GtpuSessionIpFamily::Ipv4);
+    }
+
+    /// The tc uplink hook recognizes its own re-emitted outer frames through
+    /// these two predicates, so a slot that is not canonical, not bound to the
+    /// observed attachment, or does not carry the family at all must never
+    /// authorize an address.
+    #[test]
+    fn configuration_wire_owns_only_its_own_canonical_local_endpoints() {
+        let config = device_config().encode();
+        let ipv4 = [192, 0, 2, 1];
+        let ipv6 = [0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+
+        assert!(gtpu_session_config_wire_owns_local_ipv4(&config, 42, &ipv4));
+        assert!(gtpu_session_config_wire_owns_local_ipv6(&config, 42, &ipv6));
+        // A different address, the peer side of the same session, and the
+        // unspecified address are all foreign.
+        for foreign in [[192, 0, 2, 2], [192, 0, 2, 10], [0, 0, 0, 0]] {
+            assert!(!gtpu_session_config_wire_owns_local_ipv4(
+                &config, 42, &foreign
+            ));
+        }
+        let mut foreign_ipv6 = ipv6;
+        foreign_ipv6[15] = 2;
+        assert!(!gtpu_session_config_wire_owns_local_ipv6(
+            &config,
+            42,
+            &foreign_ipv6
+        ));
+        assert!(!gtpu_session_config_wire_owns_local_ipv6(
+            &config, 42, &[0; 16]
+        ));
+
+        // Another attachment's packets can never match this configuration.
+        assert!(!gtpu_session_config_wire_owns_local_ipv4(
+            &config, 43, &ipv4
+        ));
+        assert!(!gtpu_session_config_wire_owns_local_ipv6(
+            &config, 43, &ipv6
+        ));
+        assert!(!gtpu_session_config_wire_owns_local_ipv4(&config, 0, &ipv4));
+
+        // An unwritten slot owns nothing, and neither does a single-family
+        // attachment for the family it does not carry.
+        let empty = [0_u8; GTPU_SESSION_CONFIG_VALUE_LEN];
+        assert!(!gtpu_session_config_wire_owns_local_ipv4(
+            &empty, 42, &[0; 4]
+        ));
+        assert!(!gtpu_session_config_wire_owns_local_ipv6(
+            &empty, 42, &[0; 16]
+        ));
+        let ipv4_only = GtpuSessionDeviceConfig::new(device_id(), 42, Some(ipv4), None)
+            .unwrap()
+            .encode();
+        assert!(gtpu_session_config_wire_owns_local_ipv4(
+            &ipv4_only, 42, &ipv4
+        ));
+        assert!(!gtpu_session_config_wire_owns_local_ipv6(
+            &ipv4_only, 42, &ipv6
+        ));
+
+        // Every single-byte mutation that breaks canonicality must revoke
+        // ownership rather than silently keep matching on the address bytes.
+        for index in 0..GTPU_SESSION_CONFIG_VALUE_LEN {
+            for delta in [1_u8, 0x80] {
+                let mut mutated = config;
+                mutated[index] = mutated[index].wrapping_add(delta);
+                if mutated == config {
+                    continue;
+                }
+                let decoded = GtpuSessionDeviceConfig::decode(&mutated)
+                    .filter(|decoded| decoded.ingress_ifindex() == 42);
+                assert_eq!(
+                    gtpu_session_config_wire_owns_local_ipv4(&mutated, 42, &ipv4),
+                    decoded
+                        .is_some_and(|decoded| decoded.local_endpoint(GtpuSessionIpFamily::Ipv4)
+                            == Some(GtpuEndpointAddress::Ipv4(ipv4))),
+                    "byte {index} mutation must track canonical decoding"
+                );
+                assert_eq!(
+                    gtpu_session_config_wire_owns_local_ipv6(&mutated, 42, &ipv6),
+                    decoded
+                        .is_some_and(|decoded| decoded.local_endpoint(GtpuSessionIpFamily::Ipv6)
+                            == Some(GtpuEndpointAddress::Ipv6(ipv6))),
+                    "byte {index} mutation must track canonical decoding"
+                );
+            }
+        }
     }
 
     #[test]

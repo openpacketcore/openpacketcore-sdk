@@ -105,9 +105,41 @@ fn ebpf_pmtu_map_state_is_executable(state: UplinkMtuMapState) -> bool {
 /// packet contents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct EbpfGtpuDatapathCounters {
-    /// Uplink packets successfully GTP-U encapsulated.
+    /// Uplink packets for which a GTP-U outer header was materialized and
+    /// handed to `bpf_redirect_neigh`.
+    ///
+    /// This counts encapsulations *submitted for redirect*, not packets
+    /// delivered to the peer. `bpf_redirect_neigh` only records the target
+    /// ifindex and returns `TC_ACT_REDIRECT`; the FIB lookup, the neighbour
+    /// resolution, and any resulting drop all happen afterwards in
+    /// `skb_do_redirect()`, once the classifier has already returned. So an
+    /// uplink that is black-holed downstream -- no route covering the outer
+    /// destination, no resolvable neighbour -- still increments this counter
+    /// once per subscriber packet.
+    ///
+    /// A rising `uplink_encapsulated` therefore proves that session lookup and
+    /// encapsulation are working, and nothing more. Read it against
+    /// [`Self::uplink_redirects_resolved`], which counts the frames that
+    /// actually cleared route and neighbour resolution: absent the locally
+    /// originated traffic that counter's third limit describes, the two rise
+    /// together on a healthy uplink, and the second stops while the first keeps
+    /// rising when the outer destination becomes unreachable.
     pub uplink_encapsulated: u64,
     /// Uplink packets for which no usable FAR was found.
+    ///
+    /// The datapath's own re-emitted outer frames are excluded. Their source
+    /// is the local S2b-U address rather than a UE PAA, so before the redirect
+    /// outcome was recognized this counter rose once per *successfully
+    /// delivered* uplink IPv4 packet and read a healthy uplink as session-state
+    /// corruption.
+    ///
+    /// That is the whole of the change. This is still a miss counter for every
+    /// mark-zero IPv4 frame leaving the S2b-U attachment whose source is not a
+    /// provisioned UE PAA, so locally originated traffic from that host still
+    /// lands here -- GTP-U echo and error indication among it, which the
+    /// re-entry check deliberately excludes from
+    /// [`Self::uplink_redirects_resolved`] by message type. A nonzero value is
+    /// a prompt to look, not by itself proof of session-state corruption.
     pub uplink_far_misses: u64,
     /// Downlink G-PDUs successfully decapsulated.
     pub downlink_decapsulated: u64,
@@ -137,6 +169,38 @@ pub struct EbpfGtpuDatapathCounters {
     /// corrupt. A canary for external writers: nonzero always means non-SDK
     /// mutation of adopted state.
     pub uplink_mtu_policy_corrupt: u64,
+    /// Encapsulated uplink frames whose neighbour redirect actually resolved.
+    ///
+    /// A successful `bpf_redirect_neigh` puts the frame back on the same tc
+    /// egress hook (`skb_do_redirect` -> `__bpf_redirect_neigh_v4` ->
+    /// `bpf_out_neigh_v4` -> `neigh_output` -> `dev_queue_xmit` ->
+    /// `sch_handle_egress`); a redirect that finds no usable route is freed
+    /// before it gets there. The datapath recognizes its own re-emitted outer
+    /// frame on that second traversal, so this counter is the redirect outcome
+    /// that the helper's return value -- a constant `TC_ACT_REDIRECT` at this
+    /// call shape -- can never report.
+    ///
+    /// Three honest limits:
+    ///
+    /// - It proves the frame cleared FIB and neighbour resolution and reached
+    ///   `dev_queue_xmit`. It does not prove the peer received it; a later
+    ///   qdisc, driver, or on-wire loss is still invisible from inside the
+    ///   program.
+    /// - An unresolved neighbour *lags* rather than reads wrong. The skb waits
+    ///   in the neighbour's `arp_queue` and is counted late if resolution
+    ///   eventually succeeds, and never if it does not.
+    /// - It is **unauthenticated**. The discriminator is the frame itself, so
+    ///   any locally originated packet of the same shape -- outer source equal
+    ///   to this attachment's own S2b-U endpoint, UDP/2152, a GTPv1 G-PDU
+    ///   header -- increments it too, and an unprivileged co-located process
+    ///   can send one. Nothing else is affected: no forwarding decision reads
+    ///   this counter. Tightening cannot close it either, because every
+    ///   discriminator available in-program is in-band and so forgeable by a
+    ///   local sender. Trust the value only as far as the host is trusted.
+    ///
+    /// `uplink_encapsulated` rising while this stays flat is the signature of
+    /// a total uplink outage caused downstream of the classifier.
+    pub uplink_redirects_resolved: u64,
 }
 
 /// Identity-bound diagnostic snapshot for one live eBPF GTP-U datapath.
@@ -4927,7 +4991,7 @@ mod aya_runtime {
         COUNTER_DL_BINDING_PEER_MISMATCH, COUNTER_DL_BINDING_SOURCE_PORT_MISMATCH,
         COUNTER_DL_DECAP, COUNTER_DL_DST_MISMATCH, COUNTER_DL_MALFORMED, COUNTER_DL_UNKNOWN_TEID,
         COUNTER_SLOTS, COUNTER_UL_ENCAP, COUNTER_UL_FAR_MISS, COUNTER_UL_MTU_REJECT,
-        COUNTER_UL_PMTU_CORRUPT, DOWNLINK_BINDING_COUNTER_SLOTS,
+        COUNTER_UL_PMTU_CORRUPT, COUNTER_UL_REDIRECT_RESOLVED, DOWNLINK_BINDING_COUNTER_SLOTS,
         DOWNLINK_ENDPOINT_BINDING_VALUE_LEN, DOWNLINK_PDR_VALUE_LEN, GTPU_SESSION_CONFIG_KEY,
         GTPU_SESSION_CONFIG_VALUE_LEN, GTPU_SESSION_DOWNLINK_KEY_LEN, GTPU_SESSION_GROUP_ID_LEN,
         GTPU_SESSION_GROUP_REF_LEN, GTPU_SESSION_GROUP_VALUE_LEN, GTPU_SESSION_SCHEMA_MARKER_LEN,
@@ -13131,6 +13195,7 @@ mod aya_runtime {
                     )?,
                     uplink_mtu_rejected: aggregate_pmtu(COUNTER_UL_MTU_REJECT)?,
                     uplink_mtu_policy_corrupt: aggregate_pmtu(COUNTER_UL_PMTU_CORRUPT)?,
+                    uplink_redirects_resolved: aggregate(COUNTER_UL_REDIRECT_RESOLVED)?,
                 },
             };
             // Repeat the complete proof after the reads so any hook or pin
@@ -21024,6 +21089,7 @@ mod tests {
                 downlink_binding_source_port_mismatches: 22,
                 uplink_mtu_rejected: 23,
                 uplink_mtu_policy_corrupt: 24,
+                uplink_redirects_resolved: 25,
             },
         };
         runtime.state().datapath_snapshot = expected;
