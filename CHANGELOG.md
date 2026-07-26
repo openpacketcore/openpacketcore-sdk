@@ -41,6 +41,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   identifiers are protocol metadata under this enum's own contract.
 
 ### Added
+- **P-CSCF restoration accepts caller-chosen configuration-attribute types --
+  `opc-proto-ikev2`:** the restoration builder and decoder closed over private
+  constants for RFC 7651 types 20 and 21, so a caller could not emit or accept
+  the P-CSCF address on any other type without reimplementing the procedure.
+  - RFC 7651 is dated September 2015 and deployed VoWiFi equipment predates it.
+    RFC 4306 3.15.1 and the IANA registry reserve 16384-32767 for private
+    use. Peers are observed negotiating P-CSCF on a private-use type with type
+    20 absent in both directions; that observation is this project's, taken
+    from the wire, and no RFC endorses it. Answering such a peer on type 20
+    answers on a type it never mentioned.
+  - `Ikev2PcscfAttributeTypes` names the pair, defaulting to 20/21 so no
+    existing caller changes behaviour. Each family accepts only its own
+    registered type or a private-use type (16384-32767).
+    Every other code point is refused: the registered space below names
+    unrelated attributes such as INTERNAL_IP4_ADDRESS and INTERNAL_IP4_DNS, so
+    emitting a P-CSCF address on one would have the peer read it as that
+    attribute and decoding on one would read an unrelated attribute as a
+    P-CSCF echo; the unassigned range awaits expert-review allocation. It also
+    rejects a type that sets the RFC 7296 3.15.1 reserved bit, and a pair whose
+    families share or transpose their types.
+  - `build_ikev2_pcscf_restoration_request_with_attribute_types` and the
+    matching decoder entry points take the pair; the response reports which
+    pair it was recognized on, so a relaying node can echo on the type it was
+    asked on. Correlation now also requires the reply to have been read on the
+    types the request was built on, compared only for the families the
+    exchange actually carried so a byte-identical compliant exchange is not
+    rejected on the strength of an unsent family's type.
+  - The ordinary configuration-payload codec was already type-agnostic; this
+    closes the gap only for the restoration procedure. Nothing widens the
+    reserved range.
 - **PCO/APCO carries the IPv4 Link MTU container `0x0010` --
   `opc-proto-gtpv2c` (breaking to `PcoRequest` and `PcoAddressConfiguration`
   struct literals):** the inner codec modelled four address containers and

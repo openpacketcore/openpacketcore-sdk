@@ -2,14 +2,17 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 use opc_proto_ikev2::{
     build_ike_auth_cleartext_payload_chain, build_ike_auth_configuration_payload,
-    build_ikev2_pcscf_restoration_request, decode_ikev2_pcscf_restoration_response,
+    build_ikev2_pcscf_restoration_request,
+    build_ikev2_pcscf_restoration_request_with_attribute_types,
+    decode_ikev2_pcscf_restoration_response,
+    decode_ikev2_pcscf_restoration_response_with_attribute_types,
     decode_ikev2_pcscf_restoration_response_with_context,
     validate_ikev2_pcscf_restoration_response_correlation, Header, HeaderFlags,
     Ikev2ConfigurationAttributeBuild, Ikev2ConfigurationPayloadBuild, Ikev2IkeAuthPayloadBuild,
-    Ikev2IkeAuthPayloadError, Ikev2NotifyPayloadError, Ikev2PcscfRestorationAddress,
-    Ikev2PcscfRestorationAddressFamilies, Ikev2PcscfRestorationError, Ikev2ValidationProfile,
-    PayloadChain, PayloadType, EXCHANGE_TYPE_CREATE_CHILD_SA, EXCHANGE_TYPE_INFORMATIONAL,
-    IKEV2_PCSCF_RESTORATION_MAX_ADDRESSES,
+    Ikev2IkeAuthPayloadError, Ikev2NotifyPayloadError, Ikev2PcscfAttributeTypes,
+    Ikev2PcscfRestorationAddress, Ikev2PcscfRestorationAddressFamilies, Ikev2PcscfRestorationError,
+    Ikev2ValidationProfile, PayloadChain, PayloadType, EXCHANGE_TYPE_CREATE_CHILD_SA,
+    EXCHANGE_TYPE_INFORMATIONAL, IKEV2_PCSCF_RESTORATION_MAX_ADDRESSES,
 };
 use opc_protocol::{DecodeContext, UnknownIePolicy};
 
@@ -771,4 +774,250 @@ fn response_header_validation_is_strict_and_errors_are_stable() {
         "ikev2_pcscf_restoration_address_value_not_empty"
     );
     assert_eq!(format!("{error}"), error.as_str());
+}
+
+/// The private-use types observed from third-party VoWiFi equipment.
+///
+/// Private use is 16384-32767 per the IANA IKEv2 Configuration Payload
+/// Attribute Types registry and RFC 4306 3.15.1. Only 16384's role as the IPv4
+/// P-CSCF request is observed; 16390's is inferred, which is precisely why the
+/// crate takes the pair from the caller rather than adding two more constants.
+const PRIVATE_USE_P_CSCF_IP4: u16 = 16_384;
+const PRIVATE_USE_P_CSCF_IP6: u16 = 16_390;
+
+#[test]
+fn the_registered_pair_remains_the_default() {
+    let registered = Ikev2PcscfAttributeTypes::registered();
+    assert_eq!(registered.ipv4(), P_CSCF_IP4_ADDRESS);
+    assert_eq!(registered.ipv6(), P_CSCF_IP6_ADDRESS);
+    assert_eq!(Ikev2PcscfAttributeTypes::default(), registered);
+
+    // The fixed-type entry point must keep producing byte-identical requests.
+    let addresses = [Ikev2PcscfRestorationAddress::Ipv4(Ipv4Addr::new(
+        192, 0, 2, 10,
+    ))];
+    let fixed = must_ok(build_ikev2_pcscf_restoration_request(&addresses));
+    let explicit = must_ok(build_ikev2_pcscf_restoration_request_with_attribute_types(
+        &addresses, registered,
+    ));
+    assert_eq!(fixed.bytes(), explicit.bytes());
+    assert_eq!(fixed.attribute_types(), registered);
+}
+
+#[test]
+fn attribute_types_reject_the_reserved_bit_and_an_ambiguous_pair() {
+    // RFC 7296 3.15.1 reserves the top bit; ike_auth masks received types with
+    // 0x7fff, so a type above that could never be matched on the wire.
+    assert_eq!(
+        Ikev2PcscfAttributeTypes::new(0x8000, P_CSCF_IP6_ADDRESS),
+        Err(Ikev2PcscfRestorationError::AttributeTypeOutOfRange {
+            attribute_type: 0x8000,
+            maximum: 0x7fff,
+        })
+    );
+    assert_eq!(
+        Ikev2PcscfAttributeTypes::new(P_CSCF_IP4_ADDRESS, u16::MAX),
+        Err(Ikev2PcscfRestorationError::AttributeTypeOutOfRange {
+            attribute_type: u16::MAX,
+            maximum: 0x7fff,
+        })
+    );
+    // 0x7fff itself is representable, and the whole private-use range fits.
+    must_ok(Ikev2PcscfAttributeTypes::new(0x7fff, 0x7ffe));
+    must_ok(Ikev2PcscfAttributeTypes::new(16_384, 32_767));
+
+    // One type cannot mean both families; a decoded attribute would be
+    // ambiguous and the family projection would silently pick one.
+    assert_eq!(
+        Ikev2PcscfAttributeTypes::new(PRIVATE_USE_P_CSCF_IP4, PRIVATE_USE_P_CSCF_IP4),
+        Err(Ikev2PcscfRestorationError::AttributeTypesNotDistinct {
+            attribute_type: PRIVATE_USE_P_CSCF_IP4,
+        })
+    );
+}
+
+#[test]
+fn a_request_can_be_built_on_private_use_attribute_types() {
+    let types = must_ok(Ikev2PcscfAttributeTypes::new(
+        PRIVATE_USE_P_CSCF_IP4,
+        PRIVATE_USE_P_CSCF_IP6,
+    ));
+    let request = must_ok(build_ikev2_pcscf_restoration_request_with_attribute_types(
+        &[Ikev2PcscfRestorationAddress::Ipv4(Ipv4Addr::new(
+            192, 0, 2, 10,
+        ))],
+        types,
+    ));
+    assert_eq!(request.attribute_types(), types);
+    assert_eq!(
+        request.bytes().as_ref(),
+        &[
+            0x00, 0x00, 0x00, 0x10, // generic CP header
+            0x01, 0x00, 0x00, 0x00, // CFG_REQUEST and reserved bytes
+            0x40, 0x00, 0x00, 0x04, // attribute type 16384, length 4
+            0xc0, 0x00, 0x02, 0x0a, // 192.0.2.10
+        ][..]
+    );
+}
+
+#[test]
+fn a_reply_on_private_use_types_decodes_and_correlates() {
+    let types = must_ok(Ikev2PcscfAttributeTypes::new(
+        PRIVATE_USE_P_CSCF_IP4,
+        PRIVATE_USE_P_CSCF_IP6,
+    ));
+    let request = must_ok(build_ikev2_pcscf_restoration_request_with_attribute_types(
+        &[
+            Ikev2PcscfRestorationAddress::Ipv4(Ipv4Addr::new(192, 0, 2, 10)),
+            Ikev2PcscfRestorationAddress::Ipv6(Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1)),
+        ],
+        types,
+    ));
+    let (first_payload, bytes) = configuration_chain(
+        CONFIGURATION_TYPE_REPLY,
+        &[(PRIVATE_USE_P_CSCF_IP4, &[]), (PRIVATE_USE_P_CSCF_IP6, &[])],
+    );
+    let response = must_ok(
+        decode_ikev2_pcscf_restoration_response_with_attribute_types(
+            &response_header(7),
+            first_payload,
+            &bytes,
+            types,
+        ),
+    );
+    assert_eq!(
+        response.address_families(),
+        Ikev2PcscfRestorationAddressFamilies::DualStack
+    );
+    // A relaying node needs to answer on the type it was asked on.
+    assert_eq!(response.attribute_types(), types);
+    must_ok(validate_ikev2_pcscf_restoration_response_correlation(
+        &request_header(7),
+        &response_header(7),
+        &request,
+        &response,
+    ));
+}
+
+#[test]
+fn a_private_use_reply_is_not_recognized_by_the_registered_decoder() {
+    // The whole point of the caller-supplied pair: a decoder looking for type
+    // 20 must not quietly accept an echo on 16384. It sees an unsupported
+    // attribute and reports the family as missing.
+    let (first_payload, bytes) =
+        configuration_chain(CONFIGURATION_TYPE_REPLY, &[(PRIVATE_USE_P_CSCF_IP4, &[])]);
+    assert_eq!(
+        decode_ikev2_pcscf_restoration_response(&response_header(7), first_payload, &bytes),
+        Err(Ikev2PcscfRestorationError::AddressFamilyMissing)
+    );
+}
+
+#[test]
+fn correlation_rejects_a_reply_read_on_different_types_than_requested() {
+    let private = must_ok(Ikev2PcscfAttributeTypes::new(
+        PRIVATE_USE_P_CSCF_IP4,
+        PRIVATE_USE_P_CSCF_IP6,
+    ));
+    let registered = Ikev2PcscfAttributeTypes::registered();
+    let request = must_ok(build_ikev2_pcscf_restoration_request_with_attribute_types(
+        &[Ikev2PcscfRestorationAddress::Ipv4(Ipv4Addr::new(
+            192, 0, 2, 10,
+        ))],
+        private,
+    ));
+    // A reply that happens to echo the registered type, decoded as such.
+    let (first_payload, bytes) =
+        configuration_chain(CONFIGURATION_TYPE_REPLY, &[(P_CSCF_IP4_ADDRESS, &[])]);
+    let response = must_ok(decode_ikev2_pcscf_restoration_response(
+        &response_header(7),
+        first_payload,
+        &bytes,
+    ));
+    // Families match, so only the type check catches this.
+    assert_eq!(response.address_families(), request.address_families());
+    assert_eq!(
+        validate_ikev2_pcscf_restoration_response_correlation(
+            &request_header(7),
+            &response_header(7),
+            &request,
+            &response,
+        ),
+        Err(Ikev2PcscfRestorationError::AttributeTypesMismatch {
+            expected: private,
+            actual: registered,
+        })
+    );
+}
+
+#[test]
+fn only_the_registered_or_private_use_code_points_are_available() {
+    // Registered code points name unrelated attributes -- 1 INTERNAL_IP4_ADDRESS,
+    // 3 INTERNAL_IP4_DNS, 22 FTT_KAT, 23 EXTERNAL_SOURCE_IP4_NAT_INFO. Emitting
+    // a P-CSCF address on one has the peer read it as that attribute; decoding
+    // on one reads an unrelated attribute as a P-CSCF echo.
+    for squatted in [0u16, 1, 3, 8, 10, 19, 22, 23, 24] {
+        assert_eq!(
+            Ikev2PcscfAttributeTypes::new(squatted, PRIVATE_USE_P_CSCF_IP6),
+            Err(Ikev2PcscfRestorationError::AttributeTypeNotAvailable {
+                attribute_type: squatted,
+                registered: P_CSCF_IP4_ADDRESS,
+            }),
+            "type {squatted} must not be claimable"
+        );
+    }
+    // Unassigned starts at 30 in the IANA registry and runs to 16383; those
+    // code points are reserved for future allocation.
+    for unassigned in [30u16, 1_000, 16_383] {
+        assert!(matches!(
+            Ikev2PcscfAttributeTypes::new(PRIVATE_USE_P_CSCF_IP4, unassigned),
+            Err(Ikev2PcscfRestorationError::AttributeTypeNotAvailable { .. })
+        ));
+    }
+    // The pair cannot be transposed onto the other family's registered type.
+    assert!(matches!(
+        Ikev2PcscfAttributeTypes::new(P_CSCF_IP6_ADDRESS, P_CSCF_IP4_ADDRESS),
+        Err(Ikev2PcscfRestorationError::AttributeTypeNotAvailable { .. })
+    ));
+
+    // Both ends of the private-use range, and the registered pair, remain fine.
+    must_ok(Ikev2PcscfAttributeTypes::new(16_384, 32_767));
+    must_ok(Ikev2PcscfAttributeTypes::new(
+        P_CSCF_IP4_ADDRESS,
+        PRIVATE_USE_P_CSCF_IP6,
+    ));
+    must_ok(Ikev2PcscfAttributeTypes::new(
+        P_CSCF_IP4_ADDRESS,
+        P_CSCF_IP6_ADDRESS,
+    ));
+}
+
+#[test]
+fn correlation_ignores_the_type_of_a_family_that_was_never_exchanged() {
+    // IPv4-only exchange on the registered type, but the request also names a
+    // private-use IPv6 type it never sends. A reply decoded with the fully
+    // registered pair is byte-identical to a compliant exchange, so the unsent
+    // IPv6 type must not reject it.
+    let mixed = must_ok(Ikev2PcscfAttributeTypes::new(
+        P_CSCF_IP4_ADDRESS,
+        PRIVATE_USE_P_CSCF_IP6,
+    ));
+    let request = must_ok(build_ikev2_pcscf_restoration_request_with_attribute_types(
+        &[Ikev2PcscfRestorationAddress::Ipv4(Ipv4Addr::new(
+            192, 0, 2, 10,
+        ))],
+        mixed,
+    ));
+    let (first_payload, bytes) =
+        configuration_chain(CONFIGURATION_TYPE_REPLY, &[(P_CSCF_IP4_ADDRESS, &[])]);
+    let response = must_ok(decode_ikev2_pcscf_restoration_response(
+        &response_header(7),
+        first_payload,
+        &bytes,
+    ));
+    must_ok(validate_ikev2_pcscf_restoration_response_correlation(
+        &request_header(7),
+        &response_header(7),
+        &request,
+        &response,
+    ));
 }
