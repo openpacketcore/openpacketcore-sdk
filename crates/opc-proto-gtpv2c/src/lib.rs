@@ -25,11 +25,13 @@
 //! IKEv2 endpoint is a separate role from the UE endpoint. Delete Session
 //! requires the S2b UE Local IP and supports typed Diameter/IKEv2 release
 //! cause, procedure-specific NAT ports, and location/timestamp projection.
-//! [`PcoRequest`] can independently encode the empty TS 24.008 container
-//! `0x0012` for P-CSCF reselection support into either opaque PCO transport,
-//! without inferring support from P-CSCF address-family requests. It also
-//! emits an IPCP (`0x8021`) Configure-Request for the RFC 1877 DNS options,
-//! ahead of the containers as TS 24.008 10.5.6.3 positions it, and
+//! [`PcoRequest`] can encode the empty TS 24.008 container `0x0012` for P-CSCF
+//! reselection support into either opaque PCO transport. It never infers
+//! support from a P-CSCF address-family request, and 10.5.6.3 permits the
+//! container only alongside one, so [`PcscfRequest`] carries both and the
+//! unaccompanied combination does not compile. [`PcoRequest`] also emits an
+//! IPCP (`0x8021`) Configure-Request for the RFC 1877 DNS options, ahead of
+//! the containers as TS 24.008 10.5.6.3 positions it, and
 //! [`PcoAddressConfiguration`] reads the peer's Configure-Nak answer, and the
 //! IPv4 Link MTU container `0x0010` is carried in both directions.
 //! Product code remains responsible for deciding when optional policy-owned
@@ -48,6 +50,7 @@
 //! Transport admission and rate limits remain caller owned.
 //!
 //! @spec 3GPP TS29274 R18
+//! @spec 3GPP TS24008 V20.0.0 10.5.6.3
 //! @req REQ-3GPP-TS29274-R18-S2B-001
 //! @conformance s2b-subset — see CONFORMANCE.md
 
@@ -123,10 +126,11 @@ pub use ie::{
 };
 pub use message::{Message, OwnedMessage};
 pub use pco::{
-    IpcpDnsRequest, PcoAddressConfiguration, PcoDecodeError, PcoRequest,
-    PCO_CONTAINER_DNS_SERVER_IPV4, PCO_CONTAINER_DNS_SERVER_IPV6, PCO_CONTAINER_IPV4_LINK_MTU,
-    PCO_CONTAINER_P_CSCF_IPV4, PCO_CONTAINER_P_CSCF_IPV6, PCO_CONTAINER_P_CSCF_RESELECTION_SUPPORT,
-    PCO_HEADER_PPP_FOR_IP_PDN, PCO_MAX_CONTAINERS, PCO_PROTOCOL_IPCP,
+    IpcpDnsRequest, PcoAddressConfiguration, PcoDecodeError, PcoRequest, PcscfAddressRequest,
+    PcscfRequest, PCO_CONTAINER_DNS_SERVER_IPV4, PCO_CONTAINER_DNS_SERVER_IPV6,
+    PCO_CONTAINER_IPV4_LINK_MTU, PCO_CONTAINER_P_CSCF_IPV4, PCO_CONTAINER_P_CSCF_IPV6,
+    PCO_CONTAINER_P_CSCF_RESELECTION_SUPPORT, PCO_HEADER_PPP_FOR_IP_PDN, PCO_MAX_CONTAINERS,
+    PCO_PROTOCOL_IPCP,
 };
 #[allow(deprecated)]
 pub use s2b::{

@@ -4,7 +4,11 @@
 //! This module adds the bounded inner-container codec needed for DNS and
 //! P-CSCF address relay without changing that raw-preserving transport layer.
 //!
-//! @spec 3GPP TS24008 10.5.6.3
+//! Clause references are to TS 24.008 V20.0.0. The 10.5.6.3 text this module
+//! relies on is unchanged from V13.7.0 through that release, so a bare
+//! `10.5.6.3` elsewhere in the crate resolves to the same wording.
+//!
+//! @spec 3GPP TS24008 V20.0.0 10.5.6.3
 //! @conformance boundary-only
 
 use std::{error::Error, fmt};
@@ -35,8 +39,14 @@ pub const PCO_CONTAINER_IPV4_LINK_MTU: u16 = 0x0010;
 /// P-CSCF reselection-support request container identifier.
 ///
 /// In the MS-to-network direction this container has zero-length contents and
-/// independently indicates support for P-CSCF reselection. It is not implied
-/// by either P-CSCF address-family request.
+/// indicates support for P-CSCF reselection. It is not implied by either
+/// P-CSCF address-family request, but neither is it independent of them: TS
+/// 24.008 10.5.6.3 says of this container that "This PCO parameter may be
+/// present only if a container with P-CSCF IPv4 Address Request or P-CSCF
+/// IPv6 Address Request is present." [`PcscfRequest`] carries the two
+/// together so an unaccompanied instance cannot be built.
+///
+/// The identifier is Reserved in the network-to-MS direction.
 pub const PCO_CONTAINER_P_CSCF_RESELECTION_SUPPORT: u16 = 0x0012;
 
 /// IPCP configuration-protocol identifier (RFC 1332).
@@ -125,6 +135,96 @@ impl IpcpDnsRequest {
     }
 }
 
+/// P-CSCF address-request containers selected in an MS-to-network PCO.
+///
+/// Every variant selects at least one address-request container. There is
+/// deliberately no "neither" variant, which is what makes an unaccompanied
+/// [`PcscfRequest::reselection_support`] unrepresentable. Adding a variant is a
+/// compile error in [`Self::includes_ipv4`] and [`Self::includes_ipv6`], so
+/// that property cannot be lost by an edit that only touches this enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PcscfAddressRequest {
+    /// Request P-CSCF IPv4 addresses only: container `0x000c`.
+    Ipv4,
+    /// Request P-CSCF IPv6 addresses only: container `0x0001`.
+    Ipv6,
+    /// Request both address families: containers `0x0001` and `0x000c`.
+    Ipv4AndIpv6,
+}
+
+impl PcscfAddressRequest {
+    /// Return whether container `0x000c` is selected.
+    ///
+    /// Written as an exhaustive `match` rather than a `matches!`, because
+    /// `matches!` would answer `false` for a variant added later. A variant
+    /// answering `false` here and in [`Self::includes_ipv6`] selects neither
+    /// address container, which is what would let [`PcscfRequest`] emit an
+    /// unaccompanied `0x0012` again. This way growing the enum is a compile
+    /// error at both sites instead.
+    #[must_use]
+    pub const fn includes_ipv4(self) -> bool {
+        match self {
+            Self::Ipv4 => true,
+            Self::Ipv6 => false,
+            Self::Ipv4AndIpv6 => true,
+        }
+    }
+
+    /// Return whether container `0x0001` is selected.
+    ///
+    /// Exhaustive for the reason given on [`Self::includes_ipv4`].
+    #[must_use]
+    pub const fn includes_ipv6(self) -> bool {
+        match self {
+            Self::Ipv4 => false,
+            Self::Ipv6 => true,
+            Self::Ipv4AndIpv6 => true,
+        }
+    }
+}
+
+/// P-CSCF parameters requested in an MS-to-network PCO or APCO.
+///
+/// TS 24.008 10.5.6.3 binds the re-selection support container to an address
+/// request: "This PCO parameter may be present only if a container with P-CSCF
+/// IPv4 Address Request or P-CSCF IPv6 Address Request is present." Carrying
+/// both in one value is what enforces that rule, so the encoder cannot emit a
+/// container the specification forbids and needs no runtime check to say so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PcscfRequest {
+    /// Address-request containers to emit.
+    pub addresses: PcscfAddressRequest,
+    /// Also emit the empty P-CSCF Re-selection support container `0x0012`.
+    ///
+    /// The implication runs one way only. Selecting an address family never
+    /// sets this: TS 24.008 10.5.6.3 has the container mean that the UE
+    /// supports the TS 24.229 re-selection procedures, which is a separate
+    /// capability from wanting an address. Selecting it without an address
+    /// family is what the specification forbids, and [`Self::addresses`]
+    /// cannot express that.
+    pub reselection_support: bool,
+}
+
+impl PcscfRequest {
+    /// Request P-CSCF addresses without declaring re-selection support.
+    #[must_use]
+    pub const fn addresses(addresses: PcscfAddressRequest) -> Self {
+        Self {
+            addresses,
+            reselection_support: false,
+        }
+    }
+
+    /// Request P-CSCF addresses and declare re-selection support alongside them.
+    #[must_use]
+    pub const fn with_reselection_support(addresses: PcscfAddressRequest) -> Self {
+        Self {
+            addresses,
+            reselection_support: true,
+        }
+    }
+}
+
 /// Parameters requested in an MS-to-network PCO or APCO.
 ///
 /// Container parameters are encoded as zero-length containers. [`Self::ipcp_dns`]
@@ -134,19 +234,16 @@ impl IpcpDnsRequest {
 /// caller can omit the outer PCO IE.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PcoRequest {
-    /// Request P-CSCF IPv6 addresses.
-    pub p_cscf_ipv6: bool,
+    /// P-CSCF address requests and any accompanying re-selection support.
+    ///
+    /// Grouped rather than flat because TS 24.008 10.5.6.3 makes the
+    /// re-selection support container conditional on an address request; see
+    /// [`PcscfRequest`].
+    pub p_cscf: Option<PcscfRequest>,
     /// Request DNS Server IPv6 addresses.
     pub dns_server_ipv6: bool,
-    /// Request P-CSCF IPv4 addresses.
-    pub p_cscf_ipv4: bool,
     /// Request DNS Server IPv4 addresses.
     pub dns_server_ipv4: bool,
-    /// Indicate support for P-CSCF reselection.
-    ///
-    /// This emits the independent empty container `0x0012`; the P-CSCF IPv4
-    /// and IPv6 address request flags never imply it.
-    pub p_cscf_reselection_support: bool,
     /// Request the network-supplied IPv4 Link MTU.
     ///
     /// On a tunnelled access the packet the UE emits is carried inside IPsec
@@ -166,11 +263,9 @@ impl PcoRequest {
     #[must_use]
     pub const fn none() -> Self {
         Self {
-            p_cscf_ipv6: false,
+            p_cscf: None,
             dns_server_ipv6: false,
-            p_cscf_ipv4: false,
             dns_server_ipv4: false,
-            p_cscf_reselection_support: false,
             ipv4_link_mtu: false,
             ipcp_dns: IpcpDnsRequest::none(),
         }
@@ -179,11 +274,9 @@ impl PcoRequest {
     /// Return whether at least one parameter is requested.
     #[must_use]
     pub const fn is_requested(self) -> bool {
-        self.p_cscf_ipv6
+        self.p_cscf.is_some()
             || self.dns_server_ipv6
-            || self.p_cscf_ipv4
             || self.dns_server_ipv4
-            || self.p_cscf_reselection_support
             || self.ipv4_link_mtu
             || self.ipcp_dns.is_requested()
     }
@@ -201,17 +294,15 @@ impl PcoRequest {
             return Vec::new();
         }
 
-        let requested_count = [
-            self.p_cscf_ipv6,
-            self.dns_server_ipv6,
-            self.p_cscf_ipv4,
-            self.dns_server_ipv4,
-            self.ipv4_link_mtu,
-            self.p_cscf_reselection_support,
-        ]
-        .into_iter()
-        .filter(|requested| *requested)
-        .count();
+        let p_cscf_container_count = self.p_cscf.map_or(0, |p_cscf| {
+            usize::from(p_cscf.addresses.includes_ipv6())
+                + usize::from(p_cscf.addresses.includes_ipv4())
+                + usize::from(p_cscf.reselection_support)
+        });
+        let requested_count = p_cscf_container_count
+            + usize::from(self.dns_server_ipv6)
+            + usize::from(self.dns_server_ipv4)
+            + usize::from(self.ipv4_link_mtu);
         let ipcp_len = if self.ipcp_dns.is_requested() {
             PCO_CONTAINER_HEADER_LEN + usize::from(self.ipcp_dns.contents_len())
         } else {
@@ -227,14 +318,23 @@ impl PcoRequest {
         if self.ipcp_dns.is_requested() {
             encode_ipcp_configure_request(&mut encoded, self.ipcp_dns);
         }
-        if self.p_cscf_ipv6 {
-            encode_empty_request_container(&mut encoded, PCO_CONTAINER_P_CSCF_IPV6);
+        // Every P-CSCF container is selected by destructuring `self.p_cscf` at
+        // its own emission site. Flattening the option into booleans first
+        // would move the TS 24.008 10.5.6.3 accompaniment rule out of the type
+        // and into the flattening step, where one wrong token reintroduces an
+        // unaccompanied `0x0012`.
+        if let Some(p_cscf) = self.p_cscf {
+            if p_cscf.addresses.includes_ipv6() {
+                encode_empty_request_container(&mut encoded, PCO_CONTAINER_P_CSCF_IPV6);
+            }
         }
         if self.dns_server_ipv6 {
             encode_empty_request_container(&mut encoded, PCO_CONTAINER_DNS_SERVER_IPV6);
         }
-        if self.p_cscf_ipv4 {
-            encode_empty_request_container(&mut encoded, PCO_CONTAINER_P_CSCF_IPV4);
+        if let Some(p_cscf) = self.p_cscf {
+            if p_cscf.addresses.includes_ipv4() {
+                encode_empty_request_container(&mut encoded, PCO_CONTAINER_P_CSCF_IPV4);
+            }
         }
         if self.dns_server_ipv4 {
             encode_empty_request_container(&mut encoded, PCO_CONTAINER_DNS_SERVER_IPV4);
@@ -242,8 +342,19 @@ impl PcoRequest {
         if self.ipv4_link_mtu {
             encode_empty_request_container(&mut encoded, PCO_CONTAINER_IPV4_LINK_MTU);
         }
-        if self.p_cscf_reselection_support {
-            encode_empty_request_container(&mut encoded, PCO_CONTAINER_P_CSCF_RESELECTION_SUPPORT);
+        // TS 24.008 10.5.6.3 permits this container only alongside a P-CSCF
+        // address request. Reaching this emission needs `self.p_cscf` to be
+        // `Some`, and every `PcscfAddressRequest` variant made the same two
+        // sites above emit at least one of `0x0001`/`0x000c`, so the
+        // accompanying container is already in `encoded`. Nothing outside
+        // `self.p_cscf` can select this identifier.
+        if let Some(p_cscf) = self.p_cscf {
+            if p_cscf.reselection_support {
+                encode_empty_request_container(
+                    &mut encoded,
+                    PCO_CONTAINER_P_CSCF_RESELECTION_SUPPORT,
+                );
+            }
         }
         encoded
     }
@@ -409,6 +520,16 @@ impl PcoAddressConfiguration {
                 }
                 PCO_CONTAINER_IPV4_LINK_MTU => decode_ipv4_link_mtu(contents, &mut decoded),
                 PCO_PROTOCOL_IPCP => decode_ipcp_unit(contents, &mut decoded)?,
+                // Every other identifier, including an unaccompanied
+                // `0x0012`. TS 24.008 10.5.6.3 lists `0012H` as Reserved in
+                // the network-to-MS direction this function decodes, and
+                // states: "If the additional parameters list contains a
+                // container identifier that is not supported by the receiving
+                // entity the corresponding unit shall be ignored." Its
+                // conditional-presence rule constrains the sender and assigns
+                // the receiver no behaviour, so rejecting here would discard
+                // every address in the same value over a peer's send-side
+                // violation.
                 _ => {}
             }
             remaining = &remaining[contents_end..];

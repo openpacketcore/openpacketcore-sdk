@@ -93,13 +93,20 @@ control-plane stack.
   zero-rate directions remain representable. Standardized non-GBR QCIs require
   zero GBR/MBR fields. Operator-specific QCIs require an explicit
   caller-provided GBR/non-GBR classification.
-- `PcoRequest` and `PcoAddressConfiguration` provide a bounded TS 24.008 inner
-  codec for IPv4/IPv6 DNS and P-CSCF containers and for the IPCP (`0x8021`)
-  configuration protocol, while the outer PCO/APCO IE transport remains opaque
-  and byte-preserving.
-  `PcoRequest::p_cscf_reselection_support` independently emits the exact empty
-  request container `0x0012`; neither P-CSCF address-family flag implies the
-  capability. Selected containers are encoded once in ascending identifier
+- `PcoRequest` and `PcoAddressConfiguration` provide a bounded TS 24.008
+  V20.0.0 clause 10.5.6.3 inner codec for IPv4/IPv6 DNS and P-CSCF containers
+  and for the IPCP (`0x8021`) configuration protocol, while the outer PCO/APCO
+  IE transport remains opaque and byte-preserving. Every 10.5.6.3 reference
+  below is to that version, and the clause text this crate relies on is
+  unchanged from V13.7.0 through V20.0.0.
+  `PcoRequest::p_cscf` carries the P-CSCF address request and, in
+  `PcscfRequest::reselection_support`, the exact empty request container
+  `0x0012`. Requesting an address never implies the capability, and TS 24.008
+  10.5.6.3 permits `0x0012` "only if a container with P-CSCF IPv4 Address
+  Request or P-CSCF IPv6 Address Request is present", so the two are one value
+  and `PcscfAddressRequest` has no variant selecting neither family: the
+  unaccompanied combination does not compile rather than being rejected at
+  encode time. Selected containers are encoded once in ascending identifier
   order, and `PcoRequest::none()` remains byte-empty.
 - `PcoRequest::ipcp_dns` emits an RFC 1332 IPCP Configure-Request carrying the
   RFC 1877 Primary (129) and Secondary (131) DNS Server Address options, which

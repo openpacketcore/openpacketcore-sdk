@@ -1,22 +1,100 @@
 use bytes::BytesMut;
 use opc_proto_gtpv2c::{
     decode_typed_ie_sequence, encode_typed_ie_sequence, AdditionalProtocolConfigurationOptions,
-    IpcpDnsRequest, PcoAddressConfiguration, PcoDecodeError, PcoRequest,
-    ProtocolConfigurationOptions, TypedIe, TypedIeValue, PCO_CONTAINER_IPV4_LINK_MTU,
-    PCO_CONTAINER_P_CSCF_RESELECTION_SUPPORT, PCO_MAX_CONTAINERS, PCO_PROTOCOL_IPCP,
+    IpcpDnsRequest, PcoAddressConfiguration, PcoDecodeError, PcoRequest, PcscfAddressRequest,
+    PcscfRequest, ProtocolConfigurationOptions, TypedIe, TypedIeValue, PCO_CONTAINER_IPV4_LINK_MTU,
+    PCO_CONTAINER_P_CSCF_IPV4, PCO_CONTAINER_P_CSCF_IPV6, PCO_CONTAINER_P_CSCF_RESELECTION_SUPPORT,
+    PCO_MAX_CONTAINERS, PCO_PROTOCOL_IPCP,
 };
 use opc_protocol::{DecodeContext, EncodeContext};
+
+/// Every P-CSCF request the type can express.
+///
+/// Hand-maintained, so it carries variants only. The containers each one must
+/// produce come from the exhaustive [`required_p_cscf_containers`] below, where
+/// a variant added to `PcscfAddressRequest` is a compile error -- so the enum
+/// cannot grow without sending a maintainer to this array.
+const EVERY_PCSCF_REQUEST: [PcscfAddressRequest; 3] = [
+    PcscfAddressRequest::Ipv4,
+    PcscfAddressRequest::Ipv6,
+    PcscfAddressRequest::Ipv4AndIpv6,
+];
+
+/// The address containers a P-CSCF request is required to carry.
+///
+/// Deliberately an exhaustive `match` and not a lookup in
+/// [`EVERY_PCSCF_REQUEST`]: a `PcscfAddressRequest` variant added later stops
+/// this test binary compiling, so it cannot slip through unexercised. That is
+/// the test-side half of the guard the encoder holds in
+/// `PcscfAddressRequest::includes_ipv4`/`includes_ipv6`, and the reason a new
+/// variant selecting neither family cannot silently reintroduce an
+/// unaccompanied `0x0012`.
+fn required_p_cscf_containers(addresses: PcscfAddressRequest) -> &'static [u16] {
+    match addresses {
+        PcscfAddressRequest::Ipv4 => &[PCO_CONTAINER_P_CSCF_IPV4],
+        PcscfAddressRequest::Ipv6 => &[PCO_CONTAINER_P_CSCF_IPV6],
+        PcscfAddressRequest::Ipv4AndIpv6 => &[PCO_CONTAINER_P_CSCF_IPV6, PCO_CONTAINER_P_CSCF_IPV4],
+    }
+}
+
+/// Every IPCP DNS selection, including the identifier octet each one carries.
+///
+/// The identifier changes no unit's presence, so it is varied across the cases
+/// rather than enumerated as an axis of its own.
+const EVERY_IPCP_DNS_REQUEST: [IpcpDnsRequest; 4] = [
+    IpcpDnsRequest::none(),
+    IpcpDnsRequest {
+        primary_dns: true,
+        secondary_dns: false,
+        identifier: 0x2a,
+    },
+    IpcpDnsRequest {
+        primary_dns: false,
+        secondary_dns: true,
+        identifier: 0x7f,
+    },
+    IpcpDnsRequest {
+        primary_dns: true,
+        secondary_dns: true,
+        identifier: 0xff,
+    },
+];
+
+/// Collect the identifier of every length-delimited unit in an encoded
+/// MS-to-network request, past the leading configuration-protocol octet.
+///
+/// Malformed input is reported as a named failure rather than an index panic,
+/// so a caller that produces one learns which unit was wrong.
+fn container_identifiers(encoded: &[u8]) -> Vec<u16> {
+    let mut identifiers = Vec::new();
+    let Some((_, mut remaining)) = encoded.split_first() else {
+        panic!("no configuration-protocol octet to skip in {encoded:02x?}");
+    };
+    while remaining.len() >= 3 {
+        let identifier = u16::from_be_bytes([remaining[0], remaining[1]]);
+        let contents_len = usize::from(remaining[2]);
+        identifiers.push(identifier);
+        let Some(rest) = remaining.get(3 + contents_len..) else {
+            panic!(
+                "unit {identifier:#06x} declares {contents_len} contents octets \
+                 but only {} remain in {encoded:02x?}",
+                remaining.len() - 3
+            );
+        };
+        remaining = rest;
+    }
+    assert!(remaining.is_empty(), "trailing octets in {encoded:02x?}");
+    identifiers
+}
 
 #[test]
 fn request_encoder_emits_zero_length_address_containers_in_registry_order() {
     assert!(PcoRequest::none().encode_request_contents().is_empty());
 
     let encoded = PcoRequest {
-        p_cscf_ipv6: true,
+        p_cscf: Some(PcscfRequest::addresses(PcscfAddressRequest::Ipv4AndIpv6)),
         dns_server_ipv6: true,
-        p_cscf_ipv4: true,
         dns_server_ipv4: true,
-        p_cscf_reselection_support: false,
         ipv4_link_mtu: false,
         ipcp_dns: IpcpDnsRequest::none(),
     }
@@ -28,38 +106,164 @@ fn request_encoder_emits_zero_length_address_containers_in_registry_order() {
 }
 
 #[test]
-fn pcscf_reselection_support_is_an_independent_empty_request_container() {
+fn pcscf_reselection_support_accompanies_each_address_request_family() {
     assert_eq!(PCO_CONTAINER_P_CSCF_RESELECTION_SUPPORT, 0x0012);
 
-    let support_only = PcoRequest {
-        p_cscf_reselection_support: true,
-        ..PcoRequest::none()
-    };
-    assert!(support_only.is_requested());
-    assert_eq!(
-        support_only.encode_request_contents(),
-        vec![0x80, 0x00, 0x12, 0x00]
-    );
+    // TS 24.008 10.5.6.3: "This PCO parameter may be present only if a
+    // container with P-CSCF IPv4 Address Request or P-CSCF IPv6 Address
+    // Request is present." Each accompanying form is legal, and 0x0012 is
+    // still never implied by an address request on its own.
+    let cases: [(PcscfAddressRequest, Vec<u8>, Vec<u8>); 3] = [
+        (
+            PcscfAddressRequest::Ipv4,
+            vec![0x80, 0x00, 0x0c, 0x00],
+            vec![0x80, 0x00, 0x0c, 0x00, 0x00, 0x12, 0x00],
+        ),
+        (
+            PcscfAddressRequest::Ipv6,
+            vec![0x80, 0x00, 0x01, 0x00],
+            vec![0x80, 0x00, 0x01, 0x00, 0x00, 0x12, 0x00],
+        ),
+        (
+            PcscfAddressRequest::Ipv4AndIpv6,
+            vec![0x80, 0x00, 0x01, 0x00, 0x00, 0x0c, 0x00],
+            vec![0x80, 0x00, 0x01, 0x00, 0x00, 0x0c, 0x00, 0x00, 0x12, 0x00],
+        ),
+    ];
 
-    let addresses_only = PcoRequest {
-        p_cscf_ipv6: true,
-        p_cscf_ipv4: true,
-        ..PcoRequest::none()
-    };
-    assert_eq!(
-        addresses_only.encode_request_contents(),
-        vec![0x80, 0x00, 0x01, 0x00, 0x00, 0x0c, 0x00]
-    );
+    for (addresses, without_support, with_support) in cases {
+        let addresses_only = PcoRequest {
+            p_cscf: Some(PcscfRequest::addresses(addresses)),
+            ..PcoRequest::none()
+        };
+        assert!(addresses_only.is_requested());
+        assert_eq!(
+            addresses_only.encode_request_contents(),
+            without_support,
+            "{addresses:?} must not imply reselection support"
+        );
+
+        let supported = PcoRequest {
+            p_cscf: Some(PcscfRequest::with_reselection_support(addresses)),
+            ..PcoRequest::none()
+        };
+        assert!(supported.is_requested());
+        assert_eq!(
+            supported.encode_request_contents(),
+            with_support,
+            "{addresses:?} with reselection support"
+        );
+    }
+}
+
+#[test]
+fn reselection_support_is_unrepresentable_without_a_p_cscf_address_request() {
+    // The conditional-presence rule is enforced by the type, so the negative
+    // case is a compile error rather than a runtime rejection: there is no
+    // `PcscfAddressRequest` variant selecting neither family, and
+    // `reselection_support` exists only inside `PcscfRequest`. This enumerates
+    // every combination of every parameter that can select a unit -- both
+    // P-CSCF address families, reselection support, both DNS containers, the
+    // link MTU container, and each IPCP DNS selection -- and proves the
+    // encoder never emits 0x0012 unaccompanied. Nothing but the IPCP
+    // `identifier` octet is held fixed, and that octet changes no unit's
+    // presence, so no combination outside this domain can reintroduce the
+    // standalone container.
+    let mut points = Vec::new();
+    for addresses in EVERY_PCSCF_REQUEST {
+        let expected_p_cscf = required_p_cscf_containers(addresses);
+        for reselection_support in [false, true] {
+            for dns_server_ipv6 in [false, true] {
+                for dns_server_ipv4 in [false, true] {
+                    for ipv4_link_mtu in [false, true] {
+                        for ipcp_dns in EVERY_IPCP_DNS_REQUEST {
+                            let request = PcoRequest {
+                                p_cscf: Some(PcscfRequest {
+                                    addresses,
+                                    reselection_support,
+                                }),
+                                dns_server_ipv6,
+                                dns_server_ipv4,
+                                ipv4_link_mtu,
+                                ipcp_dns,
+                            };
+                            let identifiers =
+                                container_identifiers(&request.encode_request_contents());
+                            let carries_support =
+                                identifiers.contains(&PCO_CONTAINER_P_CSCF_RESELECTION_SUPPORT);
+                            assert_eq!(carries_support, reselection_support, "{request:?}");
+                            for identifier in expected_p_cscf {
+                                assert!(
+                                    identifiers.contains(identifier),
+                                    "{identifier:#06x} missing from {request:?}"
+                                );
+                            }
+                            points.push(request);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // And with no P-CSCF request at all, 0x0012 cannot appear -- including
+    // when the only other selection is an IPCP unit, which is emitted by a
+    // different mechanism and must not drag the container in with it.
+    for dns_server_ipv6 in [false, true] {
+        for dns_server_ipv4 in [false, true] {
+            for ipv4_link_mtu in [false, true] {
+                for ipcp_dns in EVERY_IPCP_DNS_REQUEST {
+                    let request = PcoRequest {
+                        p_cscf: None,
+                        dns_server_ipv6,
+                        dns_server_ipv4,
+                        ipv4_link_mtu,
+                        ipcp_dns,
+                    };
+                    let encoded = request.encode_request_contents();
+                    points.push(request);
+                    if encoded.is_empty() {
+                        continue;
+                    }
+                    let identifiers = container_identifiers(&encoded);
+                    assert!(
+                        !identifiers.contains(&PCO_CONTAINER_P_CSCF_RESELECTION_SUPPORT),
+                        "{request:?} emitted an unaccompanied 0x0012"
+                    );
+                }
+            }
+        }
+    }
+
+    // 3 address requests x 2 reselection x 2 dns6 x 2 dns4 x 2 mtu x 4 IPCP,
+    // then the same grid without a P-CSCF request. Asserted so a later edit
+    // that drops an axis is a failure rather than a silent loss of coverage.
+    assert_eq!(EVERY_PCSCF_REQUEST.len(), 3);
+    assert_eq!(EVERY_IPCP_DNS_REQUEST.len(), 4);
+    assert_eq!(points.len(), 3 * 2 * 2 * 2 * 2 * 4 + 2 * 2 * 2 * 4);
+
+    // The count alone only catches an axis being removed. An axis pinned to a
+    // constant -- `[false, false]` for a boolean, a repeated entry in either
+    // const array -- keeps the product the same while halving what is actually
+    // covered, and would hide an encoder defect on the collapsed value. Every
+    // enumerated request differs from every other in at least one field, so a
+    // collapsed axis is a duplicate and fails here.
+    for (index, request) in points.iter().enumerate() {
+        assert!(
+            !points[..index].contains(request),
+            "duplicate enumerated request {request:?}: an axis has collapsed to a constant"
+        );
+    }
 }
 
 #[test]
 fn reselection_support_orders_after_all_legacy_address_requests() {
     let encoded = PcoRequest {
-        p_cscf_ipv6: true,
+        p_cscf: Some(PcscfRequest::with_reselection_support(
+            PcscfAddressRequest::Ipv4AndIpv6,
+        )),
         dns_server_ipv6: true,
-        p_cscf_ipv4: true,
         dns_server_ipv4: true,
-        p_cscf_reselection_support: true,
         ipv4_link_mtu: false,
         ipcp_dns: IpcpDnsRequest::none(),
     }
@@ -166,11 +370,11 @@ fn network_decoder_enforces_container_count_bound() {
 #[test]
 fn pco_request_round_trips_through_opaque_gtpv2c_ie_transport() {
     let value = PcoRequest {
-        p_cscf_ipv6: false,
+        p_cscf: Some(PcscfRequest::with_reselection_support(
+            PcscfAddressRequest::Ipv4,
+        )),
         dns_server_ipv6: false,
-        p_cscf_ipv4: true,
         dns_server_ipv4: true,
-        p_cscf_reselection_support: true,
         ipv4_link_mtu: false,
         ipcp_dns: IpcpDnsRequest::none(),
     }
@@ -214,11 +418,9 @@ fn pco_request_round_trips_through_opaque_gtpv2c_ie_transport() {
 #[test]
 fn ipcp_configure_request_precedes_containers_and_matches_the_observed_wire() {
     let encoded = PcoRequest {
-        p_cscf_ipv6: true,
+        p_cscf: Some(PcscfRequest::addresses(PcscfAddressRequest::Ipv4AndIpv6)),
         dns_server_ipv6: true,
-        p_cscf_ipv4: true,
         dns_server_ipv4: true,
-        p_cscf_reselection_support: false,
         ipv4_link_mtu: false,
         ipcp_dns: IpcpDnsRequest {
             primary_dns: true,
@@ -551,16 +753,20 @@ fn link_mtu_request_is_an_empty_container_ordered_by_identifier() {
         vec![0x80, 0x00, 0x10, 0x00]
     );
 
-    // 0x0010 sorts after the DNS/P-CSCF containers and before 0x0012.
+    // 0x0010 sorts after the DNS/P-CSCF containers and before 0x0012. The
+    // P-CSCF address request is what makes 0x0012 legal here at all, per TS
+    // 24.008 10.5.6.3, and it extends the ordering assertion by one identifier.
     let with_neighbours = PcoRequest {
+        p_cscf: Some(PcscfRequest::with_reselection_support(
+            PcscfAddressRequest::Ipv4,
+        )),
         dns_server_ipv4: true,
         ipv4_link_mtu: true,
-        p_cscf_reselection_support: true,
         ..PcoRequest::none()
     };
     assert_eq!(
         with_neighbours.encode_request_contents(),
-        vec![0x80, 0x00, 0x0d, 0x00, 0x00, 0x10, 0x00, 0x00, 0x12, 0x00]
+        vec![0x80, 0x00, 0x0c, 0x00, 0x00, 0x0d, 0x00, 0x00, 0x10, 0x00, 0x00, 0x12, 0x00]
     );
 }
 
@@ -619,6 +825,33 @@ fn a_repeated_link_mtu_container_keeps_the_first() {
     ])
     .expect("well-formed");
     assert_eq!(decoded.ipv4_link_mtu, Some(1500));
+}
+
+#[test]
+fn a_received_unaccompanied_reselection_support_container_is_ignored() {
+    // TS 24.008 10.5.6.3 lists 0012H as Reserved in the network-to-MS
+    // direction this decoder models, and states: "If the additional parameters
+    // list contains a container identifier that is not supported by the
+    // receiving entity the corresponding unit shall be ignored." The
+    // conditional-presence rule constrains the sender and assigns the receiver
+    // no behaviour, so a peer that breaks it must not cost the caller the
+    // addresses carried in the same value.
+    let decoded = PcoAddressConfiguration::decode_network_contents(&[
+        0x80, 0x00, 0x12, 0x00, // no 0x0001 or 0x000c anywhere in the value
+        0x00, 0x0d, 0x04, 8, 8, 8, 8,
+    ])
+    .expect("an unsupported container is ignored, not an error");
+    assert_eq!(decoded.dns_server_ipv4, vec![[8, 8, 8, 8]]);
+    assert!(!decoded.is_empty());
+
+    // Accompanied, and with the non-empty contents 10.5.6.3 also says to
+    // ignore: still projects nothing of its own, still not an error.
+    let decoded = PcoAddressConfiguration::decode_network_contents(&[
+        0x80, 0x00, 0x0c, 0x04, 198, 51, 100, 1, //
+        0x00, 0x12, 0x01, 0xff,
+    ])
+    .expect("well-formed framing");
+    assert_eq!(decoded.p_cscf_ipv4, vec![[198, 51, 100, 1]]);
 }
 
 #[test]
