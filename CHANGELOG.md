@@ -8,6 +8,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Uplink no longer counts an encapsulation before the redirect that drops
+  it -- `opc-gtpu-dataplane`, `opc-gtpu-ebpf-common`:** both uplink completion
+  sites incremented `COUNTER_UL_ENCAP` *before* attempting
+  `bpf_redirect_neigh`, and the failure branch incremented nothing. A packet
+  the program dropped was counted as successfully encapsulated and no counter
+  recorded the drop.
+  - The helper is called with a null neighbour parameter and `plen == 0`, so
+    FIB and neighbour resolution are deferred to the kernel using the freshly
+    materialized outer header. That resolution fails for conditions outside the
+    program -- no route covering the outer destination, no neighbour entry and
+    no resolution, or the egress interface down.
+  - The observable behaviour of a total uplink outage was therefore
+    `uplink_encapsulated` rising 1:1 with subscriber traffic, which reads as a
+    healthy uplink. That is worse than no counter: it reported a success for
+    every dropped packet.
+  - Both sites now count the outcome rather than the attempt, and a new
+    `COUNTER_UL_REDIRECT_FAIL` slot is surfaced as
+    `EbpfGtpuDatapathCounters::uplink_redirect_failures`. Drop semantics are
+    unchanged. `COUNTER_SLOTS` grows 6 -> 7, which the current pinned-map spec
+    derives; the frozen legacy-v2 map spec keeps its own historical value.
+
 - **Generic GTP-U frame `Debug` no longer prints the TEID or the payload —
   `opc-proto-gtpu`:** `GtpuHeader`, `GtpuMessage` and `OwnedGtpuMessage` derived
   `Debug` over `pub teid: u32` and over the payload slice, so `{:?}` on a
