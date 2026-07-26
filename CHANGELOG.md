@@ -81,6 +81,154 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   distinctly from an ownership transition. Activation events set
   `previous_owner == new_owner` because no ownership was taken from another
   node.
+- **Node Identifier (IE 176) is a typed, structurally validated receive IE --
+  `opc-proto-gtpv2c` (breaking to `TypedIeValue` and to raw IE 176 emission):**
+  TS 29.274 V18.8.0 Table 8.1-1 assigns type 176 to Node Identifier,
+  "Extendable / 8.107", and Figure 8.107-1 encodes it as a one-octet
+  `Length of Node Name` and Node Name followed by a one-octet
+  `Length of Node Realm` and Node Realm. The crate modelled no such IE, so a
+  peer-supplied Node Identifier decoded as `TypedIeValue::Raw` and its declared
+  subfield lengths were never checked: a Node Name length of `0xff` inside a
+  three-octet value was indistinguishable from a well-formed one at the decode
+  boundary, and any consumer wanting to read the value had to re-parse
+  peer-controlled bytes the crate already walked.
+  - `IE_TYPE_NODE_IDENTIFIER`, `NodeIdentifier`, `NodeIdentifierError`, and
+    `MAX_NODE_IDENTIFIER_FIELD_LEN` are new. `NodeIdentifier` keeps both
+    subfields private behind `NodeIdentifier::new`, which is what bounds them
+    to the 255 octets their one-octet length fields can express; encoding is
+    therefore infallible and performs no truncating cast. A declared subfield
+    length that runs past the end of the IE value, or an absent length octet,
+    is now detected rather than surfacing as an opaque preserved IE; per
+    clauses 7.7.7 and 7.7.8 the IE is then discarded, as described below.
+    `TypedIe::decode_from_raw`, the single-IE conversion that by contract
+    cannot represent a deliberate omission, still returns `Truncated`.
+  - Both subfields are octets, not `String`. Clause 8.107 states no charset and
+    delegates to Diameter Identity, whose ASCII constraint lives in the
+    Diameter base protocol and binds the sender; a receiver that rejected
+    non-ASCII octets would drop IEs a byte-transparent decoder can surface.
+    `Debug` reports only subfield lengths, because a Diameter Identity names
+    operator AAA infrastructure.
+  - An empty Node Name or Node Realm is accepted, deliberately. Clause 8.107
+    requires a non-zero length only for its SGSN Identifier and MME Identifier
+    cases; the 3GPP AAA Server Identifier case this profile receives carries no
+    such sentence, and the encoding has no discriminator that would let a
+    decoder tell the cases apart. Rejecting an empty subfield would fail closed
+    on conforming S2b traffic.
+  - Trailing octets are ignored, not rejected. Table 8.1-1 marks 176
+    Extendable and Figure 8.107-1 reserves octets `(q+1) to (n+4)` as "present
+    only if explicitly specified", which clause 8.1 requires a legacy receiver
+    to ignore. Canonical encoding emits only the understood Release 18 prefix
+    with the IE spare nibble zeroed; raw-preserving message encoding retains
+    the suffix and the spare nibble byte-exact, as for every other Extendable
+    IE in the crate.
+  - Receive admission follows Table 7.2.1-1, which lists the IE once for this
+    profile: 3GPP AAA Server Identifier, presence O, Create Session Request,
+    top level, instance 0, where NOTE 13 says it "carries the Origin-Host and
+    Origin-Realm included in the DEA message received by the ePDG/TWAN over SWm
+    or STa interface". Exactly one receive rule was added. TS 29.274's other
+    Node Identifier rows are SGSN, MME, SCEF, and IWK-SCEF identifiers in the
+    clause 7.3 S3/S10/S16 mobility tables, which this profile does not model,
+    and Table 7.2.2-1 does not carry the IE at all -- so no rule was added
+    "for symmetry".
+  - A malformed value is discarded and the rest of the message is processed,
+    per clauses 7.7.7 and 7.7.8. Two clauses govern, and both split receiver
+    behaviour on the IE's *presence*. Clause 7.7.7 covers the length case
+    directly: "If the received value of the Length field and the actual length
+    of the extendable length IE are consistent, but the length is less than the
+    number of fixed octets defined for that IE, preceding the extended
+    field(s), this shall be considered an error, IE shall be discarded and if
+    the IE was received as a Mandatory IE or a verifiable Conditional IE in a
+    Request message, an appropriate error response with Cause IE value set to
+    "Invalid length" together with the type and instance of the offending IE
+    shall be returned to the sender." Clause 7.7.8 covers the optional case: a
+    receiver "shall discard this IE, but shall treat the rest of the message as
+    if this IE was absent and continue processing", and "All semantically
+    incorrect optional information elements in a GTP signalling message shall
+    be treated as not present in the message." Table 7.2.1-1 gives IE 176
+    presence O, so the receiver rule is discard-and-continue, and the "Invalid
+    length" response clause 7.7.7 names is conditioned on the offending IE
+    being Mandatory or verifiable Conditional, which this one is not.
+    - This is what the crate's own written selection rule picks. `pco.rs`
+      states that a container the specification explicitly tells the receiver
+      to ignore is skipped rather than rejecting the whole value, "deliberately
+      unlike the address containers, for which the specification states no such
+      rule and this codec fails closed". Clauses 7.7.7 and 7.7.8 do state the
+      rule and do name the receiver, so IE 176 goes in the skip bucket.
+    - Handling an optional IE differently from a mandatory one is the
+      specification's own rule, not a special case for IE 176. Cause, F-TEID,
+      PAA, EBI, Bearer Context, and the other typed IEs that are Mandatory or
+      Conditional where this profile receives them still fail the whole decode,
+      which is the same two clauses applied to the other side of the split;
+      `error_response` remains the layer at which a caller turns such a failure
+      into a Cause.
+    - The discard is uniform across the decode surface, because typed decode
+      dispatches on IE type alone: it holds at every validation level
+      (`Structural`, `Strict`, `ProcedureAware`), in every GTPv2-C message type
+      this crate models, at every instance 0-15, and nested inside a Bearer
+      Context. At `ProcedureAware` an instance other than 0 is discarded even
+      earlier, by the clause 7.7.9 receive filter, so both routes agree.
+      `Strict` is not an opt-in stricter-than-TS-29.274 mode: it enforces
+      "field cardinality, enum ranges, and critical IE rules", and for an
+      optional IE clause 7.7.8 *is* the range rule and it says discard. Two
+      peer-controlled octets in an optional IE therefore no longer cost the
+      whole message, under every `DuplicateIePolicy` including the `Reject`
+      that `DecodeContext::conservative()` selects for untrusted input.
+    - "Discard" means the IE is absent from the typed view *and* from the
+      clause 7.7.10 duplicate bookkeeping: a discarded IE does not occupy its
+      `(type, instance)` slot, so a later well-formed IE at the same key is
+      still decoded and is not counted as a repeat. Without that, a malformed
+      IE spliced ahead of a genuine 3GPP AAA Server Identifier would suppress
+      it. Two malformed IEs at one key are likewise two discards, not a
+      duplicate.
+      This is close to, but not identical with, a clause 7.7.9 instance
+      discard, which drops the IE before duplicate handling is reached at all.
+      Clause 7.7.8 is applied after it, so once an interpretable occurrence has
+      been *retained* at a key, a second occurrence there is a genuine clause
+      7.7.10 repeat and the caller's `DuplicateIePolicy` governs it — including
+      emitting `DuplicateIeEvidence` under `First`. That evidence describes the
+      repetition, which the wire really contains; a discard at a fresh key adds
+      no diagnostic of any kind, and clause 7.7.8 requires no log.
+    - The received octets are untouched. The raw-preserving `Message` view and
+      `EncodeContext { raw_preserving: true }` still reproduce the malformed IE
+      byte-exact, which is now observable at the S2b layer at all because the
+      decode succeeds. Across the committed 11040-point encoder differential,
+      which enumerates all three validation levels, raw-preserving encoding is
+      byte-identical to the pre-IE-176 crate at every one of its points.
+    - It is a *receiver* rule and is applied as one. Both clauses open on "the
+      receiver of a GTP signalling message", so the builders' sender-side
+      self-check still rejects a caller-supplied raw IE 176 whose value is
+      malformed: those octets are already in the message being built, and
+      dropping the IE from the typed view would emit them anyway.
+  - Migration: `TypedIeValue` gains a `NodeIdentifier` variant, so an
+    exhaustive `match` over it must add an arm. More consequentially, admitting
+    176 into the receive grammar also narrows the sender profile, because the
+    three request builders gate caller-supplied `additional_ies` on the same
+    disposition. A hand-rolled raw IE 176 was previously accepted on every S2b
+    request at every instance; it is now accepted only on Create Session
+    Request at instance 0, and `s2b_delete_session_request` and
+    `s2b_ue_ipsec_tunnel_update_request` reject it outright. That is what
+    Table 7.2.1-1 licenses. Encoded bytes are unchanged for every message that
+    did not carry IE 176, and for every well-formed instance-0 Node Identifier
+    whose value ends at the Node Realm and whose IE spare nibble is zero.
+    Canonical re-encoding of an instance-0 Node Identifier that carries
+    later-release extension octets, or a non-zero spare nibble, emits only the
+    understood Release 18 prefix with the spare nibble zeroed, as stated above;
+    raw-preserving encoding is byte-exact in every case a message decodes at
+    all.
+  - Wire effect, measured. The committed encoder differential
+    (`tests/node_identifier_wire_compatibility.rs`) enumerates 11040 points:
+    480 covering every committed fixture across both decode surfaces, all three
+    validation levels, and both encode modes, plus a 10560-point IE injection
+    grid over the type, spare, instance, value, level, and encode-mode axes.
+    Against the crate before this entry, 539 points change. Every one of them
+    is an IE 176 row and every one is in canonical encode mode: 410 where the
+    IE no longer contributes any octet to the re-encode (the clause 7.7.9
+    instance discard and the clause 7.7.8 malformed-value discard) and 129
+    where it is re-encoded with different octets (spare-nibble zeroing and
+    Extendable-suffix stripping). By validation level the split is 272
+    `Structural`, 171 `ProcedureAware`, and 96 `Strict`. Zero points change in
+    raw-preserving mode at any level, and zero change on any committed
+    fixture, so no message that already round-tripped moves on the wire.
 
 ### Fixed
 - **P-CSCF Re-selection support is no longer emittable on its own --

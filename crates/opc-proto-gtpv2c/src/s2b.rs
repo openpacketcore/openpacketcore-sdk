@@ -26,6 +26,7 @@ pub use crate::header::MessageType;
 use crate::ie::typed::{
     decode_pgw_triggered_request_ie_sequence_with_evidence,
     decode_s2b_receive_ie_sequence_with_evidence, decode_typed_ie_sequence_with_evidence,
+    MalformedOptionalIePolicy,
 };
 use crate::ie::{
     encode_typed_ie_sequence, AccessPointName, AdditionalProtocolConfigurationOptions,
@@ -37,10 +38,10 @@ use crate::ie::{
     IE_TYPE_BEARER_QOS, IE_TYPE_BEARER_TFT, IE_TYPE_CAUSE, IE_TYPE_CHARGING_CHARACTERISTICS,
     IE_TYPE_CHARGING_ID, IE_TYPE_EBI, IE_TYPE_F_TEID, IE_TYPE_IMSI, IE_TYPE_INDICATION,
     IE_TYPE_IP_ADDRESS, IE_TYPE_LOAD_CONTROL_INFORMATION, IE_TYPE_MEI, IE_TYPE_MSISDN,
-    IE_TYPE_OVERLOAD_CONTROL_INFORMATION, IE_TYPE_PAA, IE_TYPE_PCO, IE_TYPE_PDN_TYPE,
-    IE_TYPE_PGW_CHANGE_INFO, IE_TYPE_PORT_NUMBER, IE_TYPE_RAN_NAS_CAUSE, IE_TYPE_RAT_TYPE,
-    IE_TYPE_RECOVERY, IE_TYPE_SELECTION_MODE, IE_TYPE_SERVING_NETWORK, IE_TYPE_TRACE_INFORMATION,
-    IE_TYPE_TWAN_IDENTIFIER, IE_TYPE_TWAN_IDENTIFIER_TIMESTAMP,
+    IE_TYPE_NODE_IDENTIFIER, IE_TYPE_OVERLOAD_CONTROL_INFORMATION, IE_TYPE_PAA, IE_TYPE_PCO,
+    IE_TYPE_PDN_TYPE, IE_TYPE_PGW_CHANGE_INFO, IE_TYPE_PORT_NUMBER, IE_TYPE_RAN_NAS_CAUSE,
+    IE_TYPE_RAT_TYPE, IE_TYPE_RECOVERY, IE_TYPE_SELECTION_MODE, IE_TYPE_SERVING_NETWORK,
+    IE_TYPE_TRACE_INFORMATION, IE_TYPE_TWAN_IDENTIFIER, IE_TYPE_TWAN_IDENTIFIER_TIMESTAMP,
 };
 use crate::{Message, OwnedMessage};
 
@@ -3547,6 +3548,16 @@ impl<'a> S2bMessage<'a> {
             message_type.as_u8(),
             CREATE_BEARER_REQUEST | UPDATE_BEARER_REQUEST | DELETE_BEARER_REQUEST
         );
+        // TS 29.274 clauses 7.7.7 and 7.7.8 bind "the receiver of a GTP
+        // signalling message": a malformed optional IE is discarded and the
+        // rest of the message is processed. Canonical builder validation is
+        // the sender side of the same codec and keeps rejecting, because the
+        // malformed octets are already in the message being built -- silently
+        // dropping the IE from the typed view would emit them anyway.
+        let malformed_optional = match purpose {
+            S2bDecodePurpose::Receive => MalformedOptionalIePolicy::Discard,
+            S2bDecodePurpose::CanonicalBuilder => MalformedOptionalIePolicy::Reject,
+        };
         let decoded_ies = if is_procedure_aware(ctx.validation_level)
             && matches!(purpose, S2bDecodePurpose::Receive)
         {
@@ -3576,11 +3587,21 @@ impl<'a> S2bMessage<'a> {
                 typed_ctx,
                 &filter,
                 &repeatable_limit,
+                malformed_optional,
             )?
         } else if pgw_triggered_request {
-            decode_pgw_triggered_request_ie_sequence_with_evidence(message.raw_ies, typed_ctx)?
+            decode_pgw_triggered_request_ie_sequence_with_evidence(
+                message.raw_ies,
+                typed_ctx,
+                malformed_optional,
+            )?
         } else {
-            decode_typed_ie_sequence_with_evidence(message.raw_ies, typed_ctx, 0)?
+            decode_typed_ie_sequence_with_evidence(
+                message.raw_ies,
+                typed_ctx,
+                0,
+                malformed_optional,
+            )?
         };
         let view = S2bProcedureMessage {
             header: message.header,
@@ -3846,6 +3867,7 @@ const KNOWN_RECEIVE_IE_TYPES: &[u8] = &[
     IE_TYPE_PORT_NUMBER,
     IE_TYPE_TWAN_IDENTIFIER,
     IE_TYPE_RAN_NAS_CAUSE,
+    IE_TYPE_NODE_IDENTIFIER,
     IE_TYPE_TWAN_IDENTIFIER_TIMESTAMP,
     IE_TYPE_OVERLOAD_CONTROL_INFORMATION,
     IE_TYPE_LOAD_CONTROL_INFORMATION,
@@ -3949,6 +3971,21 @@ const RECEIVE_IE_RULES: &[ReceiveIeRule] = &[
         direction: MessageDirection::Request,
         scope: ReceiveIeScope::TopLevel,
         ie_types: &[IE_TYPE_TWAN_IDENTIFIER_TIMESTAMP],
+        instances: &[0],
+        max_occurrences: ONE,
+    },
+    // Table 7.2.1-1 lists Node Identifier exactly once for this profile, as the
+    // optional 3GPP AAA Server Identifier at instance 0. Every other Node
+    // Identifier row in TS 29.274 carries an SGSN, MME, SCEF, or IWK-SCEF
+    // identifier in the clause 7.3 tables (7.3.1-1, 7.3.2-1, 7.3.5-1, 7.3.6-1,
+    // and 7.3.7-1, plus their nested SCEF PDN-connection tables), which are
+    // S3/S10/S16 mobility messages this profile does not model. No other rule
+    // may admit it, and Table 7.2.2-1 does not carry it at all.
+    ReceiveIeRule {
+        procedure: Procedure::CreateSession,
+        direction: MessageDirection::Request,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[IE_TYPE_NODE_IDENTIFIER],
         instances: &[0],
         max_occurrences: ONE,
     },

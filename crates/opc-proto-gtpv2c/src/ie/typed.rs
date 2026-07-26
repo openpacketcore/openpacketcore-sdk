@@ -137,28 +137,97 @@ pub(crate) struct DecodedIeSequence<'a> {
 type IeDecodeFilter<'f> = &'f dyn Fn(u8, u8, usize, Option<(u8, u8)>) -> bool;
 type IeRepeatableLimit<'f> = &'f dyn Fn(u8, u8, usize, Option<(u8, u8)>) -> Option<usize>;
 
+/// IE types whose malformed value is discarded instead of failing the decode.
+///
+/// TS 29.274 clause 7.7.8: "The receiver of a GTP signalling message including
+/// an optional information element with a Value that is not in the range
+/// defined for this information element value shall discard this IE, but shall
+/// treat the rest of the message as if this IE was absent and continue
+/// processing", and "All semantically incorrect optional information elements
+/// in a GTP signalling message shall be treated as not present in the
+/// message." Clause 7.7.7 reaches the same disposition for a length
+/// inconsistency in an Extendable IE: the IE "shall be discarded" and the
+/// "Invalid length" error response is owed only "if the IE was received as a
+/// Mandatory IE or a verifiable Conditional IE in a Request message".
+///
+/// Membership is decided by *presence*, which is the axis TS 29.274 itself
+/// uses to split receiver behaviour. Node Identifier is presence O on its only
+/// row in this profile (Table 7.2.1-1, 3GPP AAA Server Identifier, Create
+/// Session Request, instance 0). The typed IEs that are Mandatory or
+/// Conditional where this profile receives them keep failing closed, because
+/// for those the same clauses direct a receiver to reject the message and name
+/// the Cause to return.
+const DISCARD_MALFORMED_OPTIONAL_IE_TYPES: &[u8] = &[IE_TYPE_NODE_IDENTIFIER];
+
+/// Whether a decode applies the TS 29.274 clause 7.7.8 receiver rule.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MalformedOptionalIePolicy {
+    /// Receiver profile: discard a malformed optional IE and keep processing.
+    Discard,
+    /// Sender self-validation: a malformed IE the crate is about to put on the
+    /// wire is a build failure. Clauses 7.7.7 and 7.7.8 bind "the receiver of
+    /// a GTP signalling message"; they license nothing on the send path, and
+    /// silently dropping a caller-supplied IE from a message that still
+    /// carries its bytes would emit exactly what clause 8.107 forbids.
+    Reject,
+}
+
 #[derive(Clone, Copy)]
 struct IeDecodePolicy<'p> {
     legacy_pgw_triggered_request: bool,
+    malformed_optional: MalformedOptionalIePolicy,
     filter: Option<IeDecodeFilter<'p>>,
     scoped_repeatable_limit: Option<IeRepeatableLimit<'p>>,
 }
 
 impl<'p> IeDecodePolicy<'p> {
-    const fn legacy(pgw_triggered_request: bool) -> Self {
+    const fn legacy(
+        pgw_triggered_request: bool,
+        malformed_optional: MalformedOptionalIePolicy,
+    ) -> Self {
         Self {
             legacy_pgw_triggered_request: pgw_triggered_request,
+            malformed_optional,
             filter: None,
             scoped_repeatable_limit: None,
         }
     }
 
-    const fn scoped(filter: IeDecodeFilter<'p>, repeatable_limit: IeRepeatableLimit<'p>) -> Self {
+    /// Scoped decode is the procedure-aware sequence path. Clauses 7.7.7 and
+    /// 7.7.8 bind receivers only, so the caller passes the side it is on
+    /// rather than the scoped constructor assuming one: `legacy` already
+    /// threads `malformed_optional`, and a scoped path that hardcoded
+    /// `Discard` would silently license the receiver rule on any future
+    /// sender-side caller.
+    const fn scoped(
+        filter: IeDecodeFilter<'p>,
+        repeatable_limit: IeRepeatableLimit<'p>,
+        malformed_optional: MalformedOptionalIePolicy,
+    ) -> Self {
         Self {
             legacy_pgw_triggered_request: false,
+            malformed_optional,
             filter: Some(filter),
             scoped_repeatable_limit: Some(repeatable_limit),
         }
+    }
+
+    /// Whether `error` from decoding `ie_type` is discarded rather than
+    /// propagated, per TS 29.274 clause 7.7.8.
+    ///
+    /// Clause 7.7.8 scopes the discard to an IE "with a Value that is not in
+    /// the range defined for this information element value", so only a
+    /// failure to interpret the value qualifies. `DecodeErrorCode::Truncated`
+    /// and `InvalidLength` are the two the clause 8.107 value decoder raises;
+    /// `LengthOverflow` is the offset arithmetic guarding the decode, not a
+    /// statement about the received octets, and must still fail the message.
+    fn discards_malformed(&self, ie_type: u8, error: &DecodeError) -> bool {
+        matches!(self.malformed_optional, MalformedOptionalIePolicy::Discard)
+            && DISCARD_MALFORMED_OPTIONAL_IE_TYPES.contains(&ie_type)
+            && matches!(
+                error.code(),
+                DecodeErrorCode::Truncated | DecodeErrorCode::InvalidLength { .. }
+            )
     }
 }
 
@@ -235,6 +304,8 @@ pub const IE_TYPE_APCO: u8 = 163;
 pub const IE_TYPE_TWAN_IDENTIFIER: u8 = 169;
 /// GTPv2-C RAN/NAS Cause IE type (TS 29.274 Table 8.1-1).
 pub const IE_TYPE_RAN_NAS_CAUSE: u8 = 172;
+/// GTPv2-C Node Identifier IE type (TS 29.274 Table 8.1-1).
+pub const IE_TYPE_NODE_IDENTIFIER: u8 = 176;
 /// GTPv2-C TWAN Identifier Timestamp IE type (TS 29.274 Table 8.1-1).
 pub const IE_TYPE_TWAN_IDENTIFIER_TIMESTAMP: u8 = 179;
 /// GTPv2-C Overload Control Information IE type (TS 29.274 Table 8.1-1).
@@ -3285,6 +3356,206 @@ impl fmt::Debug for TwanIdentifier {
     }
 }
 
+/// Maximum length of either Node Identifier subfield.
+///
+/// TS 29.274 Figure 8.107-1 gives `Length of Node Name` and `Length of Node
+/// Realm` one octet each, so neither subfield can exceed 255 octets on the
+/// wire. Clause 8.107 states no other maximum.
+pub const MAX_NODE_IDENTIFIER_FIELD_LEN: usize = u8::MAX as usize;
+
+/// Stable validation failure for a typed [`NodeIdentifier`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeIdentifierError {
+    /// Node Name exceeded its one-octet length field.
+    NodeNameTooLong,
+    /// Node Realm exceeded its one-octet length field.
+    NodeRealmTooLong,
+}
+
+impl NodeIdentifierError {
+    /// Return a stable machine-readable validation code.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NodeNameTooLong => "gtpv2c_node_identifier_name_too_long",
+            Self::NodeRealmTooLong => "gtpv2c_node_identifier_realm_too_long",
+        }
+    }
+}
+
+impl fmt::Display for NodeIdentifierError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl std::error::Error for NodeIdentifierError {}
+
+/// Node Identifier IE (type 176).
+///
+/// TS 29.274 clause 8.107 carries a Diameter Identity as a Node Name followed
+/// by a Node Realm, each preceded by its own one-octet length. On S2b the IE
+/// appears only as the 3GPP AAA Server Identifier of TS 29.274 Table 7.2.1-1,
+/// where NOTE 13 assigns it the Origin-Host and Origin-Realm of the DEA the
+/// ePDG/TWAN received over SWm or STa.
+///
+/// Both subfields are kept as octets rather than `String`. Clause 8.107
+/// imposes no charset; it delegates to Diameter Identity, whose ASCII
+/// constraint lives in the Diameter base protocol and binds the sender. A
+/// receiver that rejected non-ASCII octets would drop IEs a byte-transparent
+/// decoder can still surface.
+///
+/// Neither subfield is required to be non-empty. Clause 8.107 states
+/// "neither the Length of Node Name nor the Length of Node Realm shall be
+/// zero" only for its SGSN Identifier and MME Identifier cases; the 3GPP AAA
+/// Server Identifier case this profile receives carries no such sentence, and
+/// the encoding has no discriminator that would let a decoder tell the cases
+/// apart.
+///
+/// Both fields are private so the one-octet bound established by
+/// [`NodeIdentifier::new`] cannot be broken after construction, which is what
+/// makes encoding infallible.
+///
+/// Debug output exposes only subfield lengths because a Diameter Identity
+/// names operator AAA infrastructure.
+///
+/// @spec 3GPP TS29274 R18 8.107
+/// @req REQ-3GPP-TS29274-R18-S2B-IE-NODE-IDENTIFIER-001
+#[derive(Clone, PartialEq, Eq)]
+pub struct NodeIdentifier {
+    name: Vec<u8>,
+    realm: Vec<u8>,
+}
+
+impl NodeIdentifier {
+    /// Construct a Node Identifier from its Node Name and Node Realm octets.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NodeIdentifierError`] when either subfield exceeds
+    /// [`MAX_NODE_IDENTIFIER_FIELD_LEN`], the bound imposed by its one-octet
+    /// wire length field.
+    pub fn new(
+        name: impl Into<Vec<u8>>,
+        realm: impl Into<Vec<u8>>,
+    ) -> Result<Self, NodeIdentifierError> {
+        let name = name.into();
+        let realm = realm.into();
+        if name.len() > MAX_NODE_IDENTIFIER_FIELD_LEN {
+            return Err(NodeIdentifierError::NodeNameTooLong);
+        }
+        if realm.len() > MAX_NODE_IDENTIFIER_FIELD_LEN {
+            return Err(NodeIdentifierError::NodeRealmTooLong);
+        }
+        Ok(Self { name, realm })
+    }
+
+    /// Return the Node Name octets.
+    #[must_use]
+    pub fn name(&self) -> &[u8] {
+        &self.name
+    }
+
+    /// Return the Node Realm octets.
+    #[must_use]
+    pub fn realm(&self) -> &[u8] {
+        &self.realm
+    }
+
+    fn decode_value(value: &[u8], offset: usize) -> Result<Self, DecodeError> {
+        // No separate minimum-length guard: reading each subfield's own length
+        // octet already rejects a value shorter than the two length fields.
+        let mut cursor = 0usize;
+        let name = take_node_identifier_field(value, &mut cursor, offset)?;
+        let realm = take_node_identifier_field(value, &mut cursor, offset)?;
+
+        // Node Identifier is an Extendable IE whose Figure 8.107-1 octets
+        // (q+1) to (n+4) are "present only if explicitly specified". Clause
+        // 8.1 requires a legacy receiver to ignore those unknown octets, so
+        // this Release 18 view stops at Node Realm rather than demanding the
+        // value end there. The enclosing S2b raw-preserving message view
+        // retains the suffix byte-exact.
+
+        // Both subfields came from a one-octet length, so the bound holds by
+        // construction and this cannot fail; it is still routed through the
+        // validating constructor rather than the private fields so decode and
+        // caller construction share one invariant. The unreachable arm is
+        // mapped rather than unwrapped because library code must not panic.
+        Self::new(name, realm).map_err(|error| {
+            DecodeError::new(
+                DecodeErrorCode::InvalidLength {
+                    reason: error.as_str(),
+                },
+                offset,
+            )
+            .with_spec_ref(spec_ref())
+        })
+    }
+
+    fn encode_value(&self, dst: &mut BytesMut) {
+        put_node_identifier_field(&self.name, dst);
+        put_node_identifier_field(&self.realm, dst);
+    }
+}
+
+impl fmt::Debug for NodeIdentifier {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NodeIdentifier")
+            .field("name_len", &self.name.len())
+            .field("name", &"<redacted>")
+            .field("realm_len", &self.realm.len())
+            .field("realm", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Read one one-octet-length-prefixed subfield of TS 29.274 Figure 8.107-1.
+///
+/// A length that runs past the end of the IE value, or an absent length
+/// octet, is the malformed length pair this decoder exists to reject. Both
+/// failures report one offset under one rule: the absolute position of the
+/// subfield's own `Length` octet, which is the octet that is either missing
+/// or declares a length the IE value cannot hold.
+fn take_node_identifier_field(
+    value: &[u8],
+    cursor: &mut usize,
+    offset: usize,
+) -> Result<Vec<u8>, DecodeError> {
+    let length_index = *cursor;
+    let length_offset = checked_add_offset(offset, length_index)?;
+    let truncated =
+        || DecodeError::new(DecodeErrorCode::Truncated, length_offset).with_spec_ref(spec_ref());
+    let length = usize::from(*value.get(length_index).ok_or_else(truncated)?);
+    // Saturating rather than checked: the length octet was just indexed, so
+    // `length_index < value.len()` and neither sum can wrap. A saturated sum
+    // would only make the slice lookup below fail, which is the same
+    // `Truncated` outcome, so no unreachable error arm is carried.
+    let start = length_index.saturating_add(1);
+    let field = value
+        .get(start..)
+        .and_then(|rest| rest.get(..length))
+        .ok_or_else(truncated)?;
+    *cursor = start.saturating_add(length);
+    Ok(field.to_vec())
+}
+
+/// Emit one `Length`/value pair of TS 29.274 Figure 8.107-1.
+fn put_node_identifier_field(field: &[u8], dst: &mut BytesMut) {
+    match u8::try_from(field.len()) {
+        Ok(length) => {
+            dst.put_u8(length);
+            dst.put_slice(field);
+        }
+        // Unreachable: `NodeIdentifier` keeps both fields private and every
+        // construction path validates the one-octet bound. Writing a
+        // truncated length octet would desynchronise every following IE, so
+        // an unrepresentable field is framed as empty rather than as a
+        // length that disagrees with the octets that follow it.
+        Err(_) => dst.put_u8(0),
+    }
+}
+
 /// NTP-era seconds at which a TWAN Identifier was acquired (IE type 179).
 ///
 /// The timestamp value is omitted from Debug because it is subscriber
@@ -3513,6 +3784,8 @@ pub enum TypedIeValue<'a> {
     TwanIdentifier(TwanIdentifier),
     /// RAN/NAS Cause IE (type 172), restricted to S2b cause families.
     RanNasCause(RanNasCause),
+    /// Node Identifier IE (type 176).
+    NodeIdentifier(NodeIdentifier),
     /// TWAN Identifier Timestamp IE (type 179).
     TwanIdentifierTimestamp(TwanIdentifierTimestamp),
     /// Unsupported, unknown, private, or future IE preserved byte-exact.
@@ -3536,6 +3809,16 @@ impl<'a> TypedIe<'a> {
     ///
     /// Unknown IEs are omitted, retained as [`TypedIeValue::Raw`], or rejected
     /// according to [`DecodeContext::unknown_ie_policy`].
+    ///
+    /// This sequence decoder also applies the TS 29.274 clause 7.7.8 receiver
+    /// rule: a *known* IE whose value cannot be interpreted, and which this
+    /// crate classifies as optional where it receives it, is silently absent
+    /// from the returned sequence instead of failing the decode. Node
+    /// Identifier (IE 176) is currently the only such type. Callers that must
+    /// observe the malformed octets should decode with
+    /// [`RawIeIterator`] or re-encode raw-preserving, both of which still see
+    /// them; callers that need the value-level error should use
+    /// [`Self::decode_from_raw`], which reports it.
     pub fn decode_sequence(input: &'a [u8], ctx: DecodeContext) -> Result<Vec<Self>, DecodeError> {
         decode_typed_ie_sequence(input, ctx, 0)
     }
@@ -3548,9 +3831,11 @@ impl<'a> TypedIe<'a> {
     ///
     /// This single-result conversion cannot represent deliberate omission.
     /// Consequently, an unsupported IE is returned as [`TypedIeValue::Raw`]
-    /// under both [`UnknownIePolicy::Drop`] and [`UnknownIePolicy::Preserve`].
-    /// Use [`Self::decode_sequence`] or [`decode_typed_ie_sequence`] when the
-    /// complete three-way policy must be enforced.
+    /// under both [`UnknownIePolicy::Drop`] and [`UnknownIePolicy::Preserve`],
+    /// and a malformed optional IE is returned as an error rather than as the
+    /// TS 29.274 clause 7.7.8 discard. Use [`Self::decode_sequence`] or
+    /// [`decode_typed_ie_sequence`] when the complete three-way unknown-IE
+    /// policy, or the clause 7.7.8 discard, must be enforced.
     pub fn decode_from_raw(
         raw: RawIe<'a>,
         ctx: DecodeContext,
@@ -3563,7 +3848,7 @@ impl<'a> TypedIe<'a> {
             ctx,
             depth,
             base_offset,
-            IeDecodePolicy::legacy(false),
+            IeDecodePolicy::legacy(false, MalformedOptionalIePolicy::Reject),
             &mut duplicate_evidence,
         )
     }
@@ -3669,6 +3954,9 @@ impl<'a> TypedIe<'a> {
             IE_TYPE_RAN_NAS_CAUSE => {
                 TypedIeValue::RanNasCause(RanNasCause::decode_value(raw.value, value_offset)?)
             }
+            IE_TYPE_NODE_IDENTIFIER => {
+                TypedIeValue::NodeIdentifier(NodeIdentifier::decode_value(raw.value, value_offset)?)
+            }
             IE_TYPE_TWAN_IDENTIFIER_TIMESTAMP => TypedIeValue::TwanIdentifierTimestamp(
                 TwanIdentifierTimestamp::decode_value(raw.value, value_offset)?,
             ),
@@ -3717,6 +4005,7 @@ impl<'a> TypedIe<'a> {
             TypedIeValue::AdditionalProtocolConfigurationOptions(_) => IE_TYPE_APCO,
             TypedIeValue::TwanIdentifier(_) => IE_TYPE_TWAN_IDENTIFIER,
             TypedIeValue::RanNasCause(_) => IE_TYPE_RAN_NAS_CAUSE,
+            TypedIeValue::NodeIdentifier(_) => IE_TYPE_NODE_IDENTIFIER,
             TypedIeValue::TwanIdentifierTimestamp(_) => IE_TYPE_TWAN_IDENTIFIER_TIMESTAMP,
             TypedIeValue::Raw(raw) => raw.ie_type,
         }
@@ -3795,6 +4084,10 @@ impl<'a> TypedIe<'a> {
                 value.encode_value(dst);
                 Ok(())
             }
+            TypedIeValue::NodeIdentifier(value) => {
+                value.encode_value(dst);
+                Ok(())
+            }
             TypedIeValue::TwanIdentifierTimestamp(value) => {
                 value.encode_value(dst);
                 Ok(())
@@ -3855,6 +4148,7 @@ impl fmt::Debug for TypedIeValue<'_> {
                 .finish(),
             Self::TwanIdentifier(value) => f.debug_tuple("TwanIdentifier").field(value).finish(),
             Self::RanNasCause(value) => f.debug_tuple("RanNasCause").field(value).finish(),
+            Self::NodeIdentifier(value) => f.debug_tuple("NodeIdentifier").field(value).finish(),
             Self::TwanIdentifierTimestamp(value) => f
                 .debug_tuple("TwanIdentifierTimestamp")
                 .field(value)
@@ -3909,6 +4203,10 @@ pub fn encode_typed_ie_sequence(
 /// typed sequence; callers that retain the enclosing raw message bytes can
 /// still perform a separate raw-preserving re-encode.
 ///
+/// This is a receive-side helper, so it applies TS 29.274 clause 7.7.8: an
+/// optional IE whose value is malformed is discarded and the remaining IEs are
+/// returned as if that IE had been absent.
+///
 /// @spec 3GPP TS29274 R18 8.2
 /// @req REQ-3GPP-TS29274-R18-S2B-IE-004
 pub fn decode_typed_ie_sequence<'a>(
@@ -3921,7 +4219,7 @@ pub fn decode_typed_ie_sequence<'a>(
         input,
         ctx,
         IeSequencePosition::root(depth),
-        IeDecodePolicy::legacy(false),
+        IeDecodePolicy::legacy(false, MalformedOptionalIePolicy::Discard),
         &mut duplicate_evidence,
     )
 }
@@ -3930,13 +4228,14 @@ pub(crate) fn decode_typed_ie_sequence_with_evidence<'a>(
     input: &'a [u8],
     ctx: DecodeContext,
     depth: usize,
+    malformed_optional: MalformedOptionalIePolicy,
 ) -> Result<DecodedIeSequence<'a>, DecodeError> {
     let mut collector = DuplicateIeCollector::default();
     let ies = decode_typed_ie_sequence_at(
         input,
         ctx,
         IeSequencePosition::root(depth),
-        IeDecodePolicy::legacy(false),
+        IeDecodePolicy::legacy(false, malformed_optional),
         &mut collector,
     )?;
     let (duplicate_evidence, omitted_duplicate_count) = collector.into_parts();
@@ -3956,13 +4255,14 @@ pub(crate) fn decode_typed_ie_sequence_with_evidence<'a>(
 pub(crate) fn decode_pgw_triggered_request_ie_sequence_with_evidence<'a>(
     input: &'a [u8],
     ctx: DecodeContext,
+    malformed_optional: MalformedOptionalIePolicy,
 ) -> Result<DecodedIeSequence<'a>, DecodeError> {
     let mut collector = DuplicateIeCollector::default();
     let ies = decode_typed_ie_sequence_at(
         input,
         ctx,
         IeSequencePosition::root(0),
-        IeDecodePolicy::legacy(true),
+        IeDecodePolicy::legacy(true, malformed_optional),
         &mut collector,
     )?;
     let (duplicate_evidence, omitted_duplicate_count) = collector.into_parts();
@@ -3980,13 +4280,14 @@ pub(crate) fn decode_s2b_receive_ie_sequence_with_evidence<'a>(
     ctx: DecodeContext,
     filter: IeDecodeFilter<'_>,
     scoped_repeatable_limit: IeRepeatableLimit<'_>,
+    malformed_optional: MalformedOptionalIePolicy,
 ) -> Result<DecodedIeSequence<'a>, DecodeError> {
     let mut collector = DuplicateIeCollector::default();
     let ies = decode_typed_ie_sequence_at(
         input,
         ctx,
         IeSequencePosition::root(0),
-        IeDecodePolicy::scoped(filter, scoped_repeatable_limit),
+        IeDecodePolicy::scoped(filter, scoped_repeatable_limit, malformed_optional),
         &mut collector,
     )?;
     let (duplicate_evidence, omitted_duplicate_count) = collector.into_parts();
@@ -4101,18 +4402,46 @@ fn decode_typed_ie_sequence_at<'a>(
                         );
                         continue;
                     }
-                } else {
-                    seen.push((key, offset));
                 }
 
-                let typed = TypedIe::decode_from_raw_with_evidence(
+                let ie_type = raw.ie_type;
+                let typed = match TypedIe::decode_from_raw_with_evidence(
                     raw,
                     ctx,
                     position.depth,
                     offset,
                     policy,
                     duplicate_evidence,
-                )?;
+                ) {
+                    Ok(typed) => typed,
+                    // TS 29.274 clause 7.7.8: a receiver of an optional IE
+                    // whose Value is out of range "shall discard this IE, but
+                    // shall treat the rest of the message as if this IE was
+                    // absent and continue processing". "As if absent" is a
+                    // claim about the whole rest of the decode, not just about
+                    // `ies`: the discarded IE must leave no trace in the
+                    // duplicate bookkeeping either, which is why `seen` is
+                    // written only once a value has actually been retained
+                    // below. A discarded IE that kept its `(type, instance)`
+                    // slot would re-route a later genuine IE at the same key
+                    // into the clause 7.7.10 duplicate machinery -- rejecting
+                    // the message under `DuplicateIePolicy::Reject`, dropping
+                    // the genuine IE under `First`, and in both cases naming a
+                    // cause the wire does not support.
+                    //
+                    // Only the value decode is caught: IE framing errors come
+                    // from the iterator arm below, where the sequence can no
+                    // longer be resynchronised, and only the types clauses
+                    // 7.7.7/7.7.8 put in the optional bucket are eligible.
+                    Err(error) if policy.discards_malformed(ie_type, &error) => continue,
+                    Err(error) => return Err(error),
+                };
+                // Recorded only for an IE that survived its value decode, so a
+                // clause 7.7.8 discard leaves the key free for a later
+                // occurrence exactly as if the octets had never arrived.
+                if first_offset.is_none() {
+                    seen.push((key, offset));
+                }
                 apply_duplicate_policy(
                     &mut ies,
                     typed,
@@ -4158,6 +4487,7 @@ const fn is_supported_typed_ie(ie_type: u8) -> bool {
             | IE_TYPE_APCO
             | IE_TYPE_TWAN_IDENTIFIER
             | IE_TYPE_RAN_NAS_CAUSE
+            | IE_TYPE_NODE_IDENTIFIER
             | IE_TYPE_TWAN_IDENTIFIER_TIMESTAMP
     )
 }
