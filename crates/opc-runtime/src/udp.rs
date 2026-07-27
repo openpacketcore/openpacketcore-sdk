@@ -1057,8 +1057,9 @@ mod tests {
         )
         .expect("fresh datagram socket");
 
-        // Outside `ip vrf exec` this socket is not device-bound at creation,
-        // so `sk->sk_bound_dev_if` is zero here and the capability test is
+        // Unless a cgroup `sock_create` hook device-binds it -- as `ip vrf
+        // exec` does -- this socket is not device-bound at creation, so
+        // `sk->sk_bound_dev_if` is zero here and the capability test is
         // short-circuited on Linux >= 5.7.
         setsockopt(&fd, BindToDevice, &OsString::from("lo"))
             .expect("a socket not device-bound at creation binds to lo");
@@ -1085,8 +1086,9 @@ mod tests {
         // Runs unconditionally: it needs a usable loopback interface, which
         // the non-ignored tests around it already require by binding
         // 127.0.0.1, plus a socket that is not device-bound at creation --
-        // true outside `ip vrf exec` -- so that `sock_bindtoindex_locked()`
-        // short-circuits its `CAP_NET_RAW` test on Linux >= 5.7.
+        // which a cgroup `sock_create` hook such as `ip vrf exec` would
+        // prevent -- so that `sock_bindtoindex_locked()` short-circuits its
+        // `CAP_NET_RAW` test on Linux >= 5.7.
         let options = UdpSocketOptions::default().with_bind_device("lo");
 
         let socket =

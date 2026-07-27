@@ -490,9 +490,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     under `ip vrf exec`, where per `c427bfec18f2` "the socket is bound to an
     interface at creation": a cgroup hook stamps `sk->sk_bound_dev_if` inside
     `socket(2)`, so a socket can already be device-bound before userspace
-    regains control. VRF confinement is a headline deployment for this option,
-    so that is the gated case, not a corner. Claims are scoped to Linux:
-    Android shares `opc-runtime`'s code path but was not verified.
+    regains control. Claims are scoped to Linux: Android shares
+    `opc-runtime`'s code path but was not verified.
   - Tests follow the evidence. `bind_device_missing_or_unprivileged_fails_closed`
     is renamed `bind_device_missing_fails_closed` and now asserts exactly
     `ENODEV` instead of `EPERM || ENODEV`;
