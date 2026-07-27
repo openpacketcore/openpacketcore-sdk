@@ -429,21 +429,19 @@ impl GtpuReassemblySocket {
     /// from positive interface-name lookup plus exact kernel socket-option
     /// readback; no caller-provided ifindex is accepted.
     ///
-    /// `SO_BINDTODEVICE` is applied to a socket this constructor has just
-    /// created, so `sk->sk_bound_dev_if` is still zero and Linux 5.7 and later
-    /// do not run the `CAP_NET_RAW` check for it: `sock_bindtoindex_locked()`
-    /// in `net/core/sock.c` tests
-    /// `sk->sk_bound_dev_if && !ns_capable(net->user_ns, CAP_NET_RAW)`, whose
-    /// first conjunct is false on a fresh socket (relaxed by torvalds/linux
-    /// `c427bfec18f2`, first released in v5.7; the RHEL 9.4 /
-    /// `kernel-5.14.0-427.el9` deployment floor carries that relaxed form).
-    /// Kernels before 5.7 tested `CAP_NET_RAW` unconditionally, and from 5.7
-    /// on re-binding or unbinding a socket that is *already* device-bound
-    /// still requires it in that socket's network namespace -- a path this
-    /// constructor never takes, since it never adopts an existing socket. That
-    /// describes the kernel's own capability check in `net/core/sock.c` and
-    /// nothing else; LSM (for example SELinux) and seccomp policy are out of
-    /// scope.
+    /// Linux 5.7 and later gate `SO_BINDTODEVICE` on the socket's current
+    /// state: `sock_bindtoindex_locked()` in `net/core/sock.c` tests
+    /// `sk->sk_bound_dev_if && !ns_capable(net->user_ns, CAP_NET_RAW)`
+    /// (relaxed by torvalds/linux `c427bfec18f2`, first released in v5.7;
+    /// kernels before 5.7 tested `CAP_NET_RAW` unconditionally, and the
+    /// RHEL 9.4 / `kernel-5.14.0-427.el9` deployment floor carries the
+    /// relaxed form). A socket that is already device-bound when this
+    /// constructor applies the option therefore needs `CAP_NET_RAW` in its
+    /// network namespace -- including under `ip vrf exec`, where per
+    /// `c427bfec18f2` "the socket is bound to an interface at creation".
+    /// That describes the kernel's own capability check in `net/core/sock.c`
+    /// and nothing else; LSM (for example SELinux) and seccomp policy are out
+    /// of scope.
     ///
     /// # Errors
     ///

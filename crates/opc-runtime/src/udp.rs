@@ -843,13 +843,13 @@ mod platform {
 
         #[test]
         fn source_bind_probe_with_unusable_device_is_inconclusive() {
-            // The probe builds a fresh socket, so the device name is resolved
-            // by `sock_setbindtodevice()` before `sock_bindtoindex_locked()`
-            // and its CAP_NET_RAW gate are reached: a name with no device is
-            // ENODEV, not EPERM, whatever the caller's capabilities. ENODEV is
-            // not evidence about source locality, so the probe must stay
-            // inconclusive instead of misreporting `udp_source_not_local`.
-            // Any other failure to apply the device is inconclusive too.
+            // The device name is resolved by `sock_setbindtodevice()` before
+            // `sock_bindtoindex_locked()` and its CAP_NET_RAW gate are
+            // reached: a name with no device is ENODEV, not EPERM, whatever
+            // the caller's capabilities. ENODEV is not evidence about source
+            // locality, so the probe must stay inconclusive instead of
+            // misreporting `udp_source_not_local`. Any other failure to apply
+            // the device is inconclusive too.
             assert_eq!(source_bind_probe(local_source(), Some("opc-nodev0")), None);
         }
     }
@@ -1027,53 +1027,12 @@ mod tests {
         );
     }
 
-    /// Effective capability bitmask of this process, parsed from the `CapEff:`
-    /// line of `/proc/self/status`. `None` when the field is unreadable.
-    #[cfg(target_os = "linux")]
-    fn effective_capabilities() -> Option<u64> {
-        let status = std::fs::read_to_string("/proc/self/status").ok()?;
-        let field = status
-            .lines()
-            .find_map(|line| line.strip_prefix("CapEff:"))?;
-        u64::from_str_radix(field.trim(), 16).ok()
-    }
-
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn fresh_socket_bind_device_is_not_capability_gated() {
-        /// `CAP_NET_RAW` is capability 13, so bit 13 of a capability set.
-        const CAP_NET_RAW_BIT: u64 = 1 << 13;
-
-        // This constructor always applies `SO_BINDTODEVICE` to a socket it has
-        // just created, so `sk->sk_bound_dev_if` is zero and the
-        // `sk->sk_bound_dev_if && !ns_capable(net->user_ns, CAP_NET_RAW)` test
-        // in `sock_bindtoindex_locked()` short-circuits on Linux >= 5.7
-        // (`c427bfec18f2`); the RHEL 9.4 / `kernel-5.14.0-427.el9` floor
-        // carries that relaxed form. The effective set is reported on failure:
-        // when it holds no CAP_NET_RAW this run is a direct observation of the
-        // un-gated path, which is the ordinary case for an unprivileged test
-        // runner. On a pre-5.7 kernel without CAP_NET_RAW this fails with
-        // EPERM, which is the correct signal that the floor moved backwards.
-        let effective = effective_capabilities();
-        let options = UdpSocketOptions::default().with_bind_device("lo");
-
-        let error =
-            bind_udp_socket_with_destination_metadata_and_options(loopback_any_port(), &options)
-                .err();
-
-        assert!(
-            error.is_none(),
-            "fresh-socket SO_BINDTODEVICE must not need CAP_NET_RAW on Linux >= 5.7 \
-             (CapEff {effective:x?}, CAP_NET_RAW held: {}): {error:?}",
-            effective.is_some_and(|caps| caps & CAP_NET_RAW_BIT != 0)
-        );
-    }
-
     #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "requires a Linux >= 5.7 host with `lo` whose process does NOT hold CAP_NET_RAW \
                 in its network namespace (an ordinary unprivileged user; not root, and not a \
-                container running as root); run: cargo test -p opc-runtime --lib \
+                container running as root) and is not confined by `ip vrf exec`, which \
+                device-binds the socket at creation; run: cargo test -p opc-runtime --lib \
                 udp::tests::rebinding_an_already_device_bound_socket_needs_cap_net_raw \
                 -- --ignored"]
     fn rebinding_an_already_device_bound_socket_needs_cap_net_raw() {
@@ -1087,8 +1046,9 @@ mod tests {
         };
 
         // Pins the other half of the contract the rustdoc states. It exercises
-        // the kernel directly because this crate has no way to reach it: every
-        // device bind it performs is on a socket it just created.
+        // the kernel directly because the crate's constructor takes no
+        // caller-supplied socket, so it cannot be handed one that is already
+        // device-bound.
         let fd = socket(
             AddressFamily::Inet,
             SockType::Datagram,
@@ -1097,9 +1057,11 @@ mod tests {
         )
         .expect("fresh datagram socket");
 
-        // `sk->sk_bound_dev_if` is zero here, so the capability test is
+        // Outside `ip vrf exec` this socket is not device-bound at creation,
+        // so `sk->sk_bound_dev_if` is zero here and the capability test is
         // short-circuited on Linux >= 5.7.
-        setsockopt(&fd, BindToDevice, &OsString::from("lo")).expect("fresh socket binds to lo");
+        setsockopt(&fd, BindToDevice, &OsString::from("lo"))
+            .expect("a socket not device-bound at creation binds to lo");
 
         // It is non-zero now, so the same call, and unbinding, are gated on
         // `ns_capable(net->user_ns, CAP_NET_RAW)`. The predicate reads the
@@ -1122,9 +1084,9 @@ mod tests {
     async fn bind_device_loopback_scopes_the_socket() {
         // Runs unconditionally: it needs a usable loopback interface, which
         // the non-ignored tests around it already require by binding
-        // 127.0.0.1, and the fresh-socket device bind is not capability gated
-        // on Linux >= 5.7 (see
-        // `fresh_socket_bind_device_is_not_capability_gated`).
+        // 127.0.0.1, plus a socket that is not device-bound at creation --
+        // true outside `ip vrf exec` -- so that `sock_bindtoindex_locked()`
+        // short-circuits its `CAP_NET_RAW` test on Linux >= 5.7.
         let options = UdpSocketOptions::default().with_bind_device("lo");
 
         let socket =

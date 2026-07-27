@@ -463,7 +463,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   identifiers are protocol metadata under this enum's own contract.
 
 ### Documented
-- **`SO_BINDTODEVICE` no longer claimed to require `CAP_NET_RAW` --
+- **`SO_BINDTODEVICE`'s `CAP_NET_RAW` gate is conditional, not unconditional --
   `opc-runtime`, `opc-gtpu-dataplane`:** two rustdoc comments, both crate
   READMEs and the changelog entry below stated that setting `SO_BINDTODEVICE`
   requires `CAP_NET_RAW` on Linux, and a test comment stated that the kernel
@@ -473,11 +473,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   capability is only consulted for a socket that is *already* device-bound;
   and `sock_setbindtodevice()` resolves the device name with
   `dev_get_by_name_rcu()` and returns `-ENODEV` before that function is
-  reached at all. Both SDK call sites -- `opc-runtime`'s
-  `bind_udp_socket_with_destination_metadata_and_options` (plus its
-  source-locality probe) and `GtpuReassemblySocket::bind` -- apply the option
-  to a socket they have just created, so they take the un-gated path on a
-  kernel >= 5.7 and an unknown device is `ENODEV` at every capability level.
+  reached at all, so an unknown device is `ENODEV` at every capability level.
   - The relaxation is torvalds/linux `c427bfec18f2` ("net: core: enable
     SO_BINDTODEVICE for non-root users"), first released in v5.7. Verified
     verbatim in v5.7, v5.14 and v6.12, and in the CentOS Stream 9
@@ -485,19 +481,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     floor is on the relaxed side. v5.6 carries the unconditional form. The
     lookup-before-capability ordering is present in all five trees.
   - The corrected text keeps the other half of the contract: from 5.7 on, a
-    socket that is already device-bound -- inherited through `ip vrf exec`, or
-    received over a unix socket -- still needs `CAP_NET_RAW` in its network
-    namespace to be re-bound or unbound, and the predicate reads the socket's
-    current state, so even re-binding to the same device is refused. Neither
-    crate reaches that path. Claims are scoped to Linux: Android shares
-    `opc-runtime`'s code path but was not verified.
+    socket that is already device-bound still needs `CAP_NET_RAW` in its
+    network namespace to be re-bound or unbound, and the predicate reads the
+    socket's current state, so even re-binding to the same device is refused.
+    Both SDK call sites -- `opc-runtime`'s
+    `bind_udp_socket_with_destination_metadata_and_options` (plus its
+    source-locality probe) and `GtpuReassemblySocket::bind` -- reach that path
+    under `ip vrf exec`, where per `c427bfec18f2` "the socket is bound to an
+    interface at creation": a cgroup hook stamps `sk->sk_bound_dev_if` inside
+    `socket(2)`, so a socket can already be device-bound before userspace
+    regains control. VRF confinement is a headline deployment for this option,
+    so that is the gated case, not a corner. Claims are scoped to Linux:
+    Android shares `opc-runtime`'s code path but was not verified.
   - Tests follow the evidence. `bind_device_missing_or_unprivileged_fails_closed`
     is renamed `bind_device_missing_fails_closed` and now asserts exactly
     `ENODEV` instead of `EPERM || ENODEV`;
-    `fresh_socket_bind_device_is_not_capability_gated` asserts the un-gated
-    path and reports the process's effective capability set on failure;
     `bind_device_loopback_scopes_the_socket` lost an `#[ignore]` whose stated
-    `CAP_NET_RAW` prerequisite was false; and a new ignored
+    `CAP_NET_RAW` prerequisite was false, and its comment now names the
+    precondition it does rest on -- a socket that is not device-bound at
+    creation; and a new ignored
     `rebinding_an_already_device_bound_socket_needs_cap_net_raw` pins the
     EPERM half, which needs the *absence* of `CAP_NET_RAW`, not privilege.
 
@@ -1803,10 +1805,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   verifies kernel device/address identity around every receive, and accepts a
   zero reassembled `IP_PKTINFO` ifindex only through that kernel-enforced
   identity. The socket also exposes safe `SO_RCVBUF` sizing/readback and has no
-  unbound wrapping path; because it applies `SO_BINDTODEVICE` to a socket it
-  just created, Linux 5.7 and later do not run the `CAP_NET_RAW` check on that
-  step (kernels before 5.7 did, and re-binding or unbinding an already
-  device-bound socket still does).
+  unbound wrapping path.
   Linux also exposes bounded typed `/proc/net/snmp` reassembly stats readback,
   including timeouts and aggregate overlap/resource failures. `GtpuProbe`
   reports `uplink_pmtu_enforcement` and `downlink_outer_fragment_handling`
