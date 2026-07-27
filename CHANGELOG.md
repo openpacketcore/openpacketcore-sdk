@@ -306,10 +306,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the bearer schema marker does not change when only a map's shape does, so the
   retained graph still classified as the current schema; and the attach-time pin
   identity check compares kernel map IDs read from the very maps that were just
-  adopted, so both sides agreed by construction. The only `max_entries`
-  comparison in the crate was reachable solely from the explicit
-  `recover_orphaned_current_ebpf_graph` maintenance API, never from
-  `create_device` or `resolve_device`.
+  adopted, so both sides agreed by construction. Every `max_entries` comparison
+  in the crate sat behind an explicit maintenance API --
+  `recover_orphaned_current_ebpf_graph` for the current schema,
+  `teardown_drained_v2` for the legacy v2 graph -- and none of them was
+  reachable from `create_device` or `resolve_device`.
   - The consequence on the upgrade path -- the designed high-availability
     behaviour, where bpffs keeps the graph so session state survives a restart
     -- was worse than a wrong number. The seven-slot program loads fine against
@@ -353,17 +354,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     deliberately leaves running, which is directly observable as a changed
     `GTPU_COUNTERS` kernel ID after a rejected v1 migration. So nothing is
     removed, and `require_current_pin_map_abi` refuses the migration instead --
-    every graph created by the frozen v1 object is in this position, since it
-    declares `GTPU_COUNTERS` with six slots against this build's seven (an
-    `OPC-MARK-v2` graph never reaches the check; the schema preflight already
-    refuses it with `ebpf_endpoint_schema`).
+    every *empty* graph created by the frozen v1 object is in this position,
+    since it declares `GTPU_COUNTERS` with six slots against this build's seven.
+    A populated endpoint-unbound v1 graph never gets that far: it is refused
+    earlier, in `ebpf_marked_owner_rebuild`. An `OPC-MARK-v2` graph never
+    reaches the check either; the schema preflight already refuses it with
+    `ebpf_endpoint_schema`.
   - That refusal preserves the state the graph is served from, not a
     byte-identical directory, and the two are worth separating because the
     remedy depends on it. The refusal is at the top of `attach_programs` and
     `load_pinned` has already run, so on a graph genuinely short of the maps
-    added after its own schema -- an `OPC-PEER-v3` directory holds seventeen of
-    this build's twenty-one pins -- the load creates and pins the missing four
-    (`GTPU_UL_SPORT`, `GTPU_ULM_SPORT`, `GTPU_PMTU_CFG`, `GTPU_PMTU_DROP`) and
+    added after its own schema -- an `OPC-PEER-v3` directory holds eleven of
+    this build's twenty-one pins -- the load creates and pins the missing ten
+    (`GTPU_UL_SPORT`, `GTPU_ULM_SPORT`, `GTPU_PMTU_CFG` and `GTPU_PMTU_DROP`
+    from the source-port-v4 and PMTU-v5 schemas, and `GTPU_SESSIONS`,
+    `GTPU_UL_INDEX`, `GTPU_DL_INDEX`, `GTPU_SESS_TXN`, `GTPU_CONFIG6` and
+    `GTPU_SCHEMA6` from the grouped-session schema) and
     `materialize_legacy_source_port_policies` writes every retained session's
     uplink policy into `GTPU_UL_SPORT` and every marked bearer's into
     `GTPU_ULM_SPORT`, exactly as the v1 path already documents. Untouched is
@@ -371,8 +377,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     stays at `OPC-PEER-v3`, the counter pin keeps both its stale slot count and
     its kernel ID, and every retained FAR, PDR, endpoint-binding, marked-owner
     and configuration pin keeps its kernel ID. Neither program is bound, since
-    the refusal is above `attach_programs`, so no tc filter is installed or
-    replaced.
+    the refusal is `attach_programs`' own first statement, ahead of the clsact
+    qdisc and both program loads, so no tc filter is installed or replaced.
   - The remedy differs by legacy schema, and only one of them costs sessions.
     When the counter ABI is the only obstacle -- an `OPC-PEER-v3` graph --
     unlinking the counter pin and nothing else is sufficient: that is precisely
@@ -382,26 +388,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `OPC-PMTU-v5`, and every session survives.
     No drain, no re-signalling. A *populated endpoint-unbound* `OPC-DSCP-v1`
     graph is refused in `ebpf_marked_owner_rebuild` after the load, before the
-    ABI check is reached, and unlinking the counter pin changes nothing but the
-    pin; there the drained reprovision populated legacy state already requires
-    is the only way forward, and it does cost every session.
-  - Nothing is unpinned before this process has proven, from the pins, that it
-    owns the graph. `create_device` compares `GTPU_CONFIG` in the pin directory
+    ABI check is reached, and unlinking the counter pin neither clears that
+    refusal nor is free. That refusal is raised before `attach_programs` runs
+    at all, so a prior generation's tc filters are still installed and its
+    programs still hold the retained `GTPU_COUNTERS` map open, and the `rm`
+    takes that map's only name away without stopping anything that writes to
+    it. Counter pins are not on the schema preflight's required-pin lists, so
+    the next attach is admitted anyway and its `load_pinned` pins a fresh
+    zeroed seven-slot map under that name, which the refusal that follows does
+    not remove again -- `resolve_device` propagates it with no cleanup at all,
+    and `create_device`'s fresh-pin cleanup is disabled once the pin directory
+    pre-existed. The counters an operator reads at that pin then sit flat while
+    the still-attached v1 datapath keeps forwarding. There the drained
+    reprovision populated legacy state already
+    requires is the only way forward, and it does cost every session.
+  - Nothing is unpinned on an attach that carries its own authority before that
+    authority has been proven against the pins. `create_device` compares
+    `GTPU_CONFIG` in the pin directory
     against the requested `bind_address` -- the same comparison it applies to
     the adopted map further down -- and the grouped endpoint-set path compares
     the device configuration `grouped_schema_preflight` already read against the
     requested endpoint set, the grouped pin directory being keyed by device ID.
     A second process attaching the same pin namespace under either kind of
-    conflicting authority now refuses with `AlreadyExists` having reconciled
+    conflicting authority refuses with `AlreadyExists` having reconciled
     nothing, so the generation still forwarding keeps writing to the counters an
-    operator reads at their pin. Previously that refused call rebuilt and
-    re-pinned the counter map, permanently disconnecting a healthy,
+    operator reads at their pin. Without that gate the refused call would have
+    rebuilt and re-pinned the counter map, permanently disconnecting a healthy,
     still-forwarding datapath from its published counters -- flat
     `uplink_encapsulated` against live traffic, which this datapath documents as
-    the signature of a total uplink outage. Only the removal is gated on
-    ownership; classification is not, so a conflicting attach against a graph
-    that is *also* at a foreign ABI reports that schema break rather than
-    `AlreadyExists`, and still unpins nothing.
+    the signature of a total uplink outage. `adopt`, and so `resolve_device`,
+    is the deliberate exception: it has no configuration of its own to conflict
+    with, adopts whatever the graph recorded, and therefore passes
+    `RetainedGraphOwnership::Inherited` and always reconciles. Only the removal
+    is gated on ownership; classification is not, so a conflicting attach
+    against a current-map-set graph that is *also* at a foreign ABI reports that
+    schema break rather than `AlreadyExists`, and still unpins nothing. Below
+    `OPC-SPORT-v4` the repair pass classifies nothing, so a conflicting attach
+    there reports `AlreadyExists`.
   - A pin directory short of a counter pin is no longer a permanent wedge. The
     repair pass unpins a counter map and relies on the load to recreate it, so a
     process that dies in that window -- or a `load_pinned` that fails against a
@@ -420,22 +443,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     Before this, the documented remedy for a graph left at a stale counter ABI
     refused it with `IdentityMismatch`, and manual removal of the pin directory
     was the operator's only recourse.
-  - Hook ownership no longer depends on counter identity. Rebuilding a counter
-    map gives it a new kernel ID, which made the previous generation's still
-    attached tc filter unrecognizable to `owner_matches_artifact` and failed the
-    upgrade with `AlreadyExists`; the only way to install a program with a
-    different map set would have been to detach and re-attach, which is exactly
-    the packet-leak window the replacement path is built to avoid.
-    `authority_map_ids` sets the counter maps aside from that comparison. It
-    recognises them by full shape -- a per-CPU array of `u64` counters carrying
-    one of this datapath's counter map names, at any slot count -- rather than
-    by name alone, and requires both sides to set aside the same counter names,
-    so every session, bearer and device map is still compared exactly and the
-    in-place single-`RTM_NEWTFILTER` replacement still applies. A failure to
-    read a map's info there is now an `ebpf_program_map_identity` I/O error
-    rather than `StateIndeterminate`, which previously suppressed fresh-pin
-    cleanup and leaked a whole pin set on a transient failure during a fresh
-    attach.
+  - Hook ownership does not depend on counter identity. Rebuilding a counter map
+    gives it a new kernel ID, which without this would have made the previous
+    generation's still attached tc filter unrecognizable to
+    `owner_matches_artifact` and failed the upgrade with `AlreadyExists`; the
+    only way to install a program with a different map set would have been to
+    detach and re-attach, which is exactly the packet-leak window the
+    replacement path is built to avoid. `authority_map_ids` sets the counter
+    maps aside from that comparison. It recognises them by full shape -- a
+    per-CPU array of `u64` counters carrying one of this datapath's counter map
+    names, at any slot count -- rather than by name alone, and requires both
+    sides to set aside the same counter names, so every session, bearer and
+    device map is still compared exactly and the in-place
+    single-`RTM_NEWTFILTER` replacement still applies to a retained filter
+    running this same datapath program. It is not sufficient on its own:
+    `owner_matches_artifact` still compares the occupant's name, program type
+    and kernel tag, and the tag is a hash of the program's instructions, so an
+    upgrade whose eBPF object changed instructions and whose previous
+    generation's filters are still installed is refused with `AlreadyExists` at
+    `preflight_program_slot` for that reason, independent of counter identity.
+    A failure to read a map's info there is an `ebpf_program_map_identity` I/O
+    error rather than `StateIndeterminate`; reporting it as indeterminate would
+    have suppressed fresh-pin cleanup and leaked a whole pin set on a transient
+    failure during a fresh attach, since `fresh_pin_cleanup_allowed` refuses to
+    clean up behind an indeterminate error.
   - One limit is documented rather than hidden. Ownership is proven before the
     counter pin is rebuilt, but *completion* is not: on a graph this process
     does own, a refusal after the load -- a corrupt retained PMTU policy, an
@@ -456,8 +487,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     "Map ABI changes across an upgrade or rollback" in
     `crates/opc-gtpu-dataplane/README.md`.
   - Operator effect: an upgrade across a counter-slot change on a current-schema
-    graph now proceeds with no drain, no manual unpin and no outage, preserves
-    all session state, and resets the affected counters to zero once. It is
+    graph now proceeds with no drain and no manual unpin, preserves all session
+    state, and resets the affected counters to zero once. The rebuild itself
+    costs no outage; a still-installed previous generation's hooks are replaced
+    in place only when they are running this same datapath program, per the tag
+    comparison above. It is
     symmetric -- a rollback to a build with a narrower counter map rebuilds it
     the same way, and a refusal of a session-bearing pin applies in both
     directions. A build that predates this change adopts a wider retained
@@ -482,9 +516,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     its marker, retained pins and hooks untouched, and the same graph to migrate
     once its counter pin is at this build's ABI;
     `ebpf_gtpu_v3_shaped_retained_graph_refuses_then_heals_without_a_drain` runs
-    the same refusal against a directory that is genuinely v3-shaped -- seventeen
-    pins, not twenty-one with the marker rewritten -- and pins both halves of
-    what a refusal does: the four post-v3 maps are created and the retained
+    the same refusal against a directory short of the four maps the
+    source-port-v4 and PMTU-v5 schemas added -- seventeen pins, not twenty-one
+    with the marker rewritten -- and pins both halves of what a refusal does:
+    those four maps are created and the retained
     session's legacy source-port policy is materialized into one of them, while
     the marker, the counter pin's slot count and kernel ID, every retained
     state-bearing pin's kernel ID and both tc slots are untouched; it then runs
@@ -507,8 +542,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     the same for the grouped ownership gate, which no other test reaches because
     every grouped test starts from a fresh bpffs and so never evaluates the
     recorded-configuration arm against a retained graph. Every other privileged
-    test in the suite starts from a fresh bpffs and so could never reach the
-    retained-pin path at all. The pin comparison itself is a pure function over
+    test that reaches a retained graph at all reaches it through the frozen v1
+    fixture -- `ebpf_gtpu_uplink_and_downlink_round_trip` does, at the
+    pre-growth counter ABI -- and none of them exercises a *current-schema*
+    graph retained at a foreign counter ABI. The pin comparison itself is a
+    pure function over
     the observed map dimensions, so
     `any_non_slot_count_divergence_refuses_on_every_pin` can vary the map name,
     type, key size, value size and flags one at a time against every current

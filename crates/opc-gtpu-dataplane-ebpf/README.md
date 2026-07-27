@@ -57,14 +57,17 @@ aggregate and contain no rejected endpoint or session fields.
 Changing a counter map's slot count changes `max_entries` in this object's
 `maps` section, so the CI drift gate must be refreshed with it -- and it also
 changes the shape of the pinned map, which a deployment retains across an
-upgrade. This program cannot detect that: the verifier bounds an array lookup
-at runtime, so `get_ptr_mut` on a slot past a retained map's end simply returns
+upgrade. This program cannot detect that. The verifier is a load-time check and
+has nothing to say about it; what happens instead is that the array lookup
+returns null for an index past the retained map's end, so `get_ptr_mut` returns
 `None` and the increment is dropped, silently and per packet. Keeping a retained
 graph at the running build's map ABI is therefore the userspace loader's job,
-and `opc-gtpu-dataplane` does it -- rebuilding a counter map whose slot count is
-not the running build's before the object is loaded, and refusing to bind either
-program to any pin whose shape is not the running build's. See "Map ABI changes
-across an upgrade or rollback" in that crate's README.
+and `opc-gtpu-dataplane` does it -- rebuilding, on a graph that has already
+reached the current map set and only once this process has proven it owns it, a
+counter map whose slot count is not the running build's before the object is
+loaded, and refusing to bind either program to any pin whose shape is not the
+running build's. See "Map ABI changes across an upgrade or rollback" in that
+crate's README.
 
 ## Relationships
 

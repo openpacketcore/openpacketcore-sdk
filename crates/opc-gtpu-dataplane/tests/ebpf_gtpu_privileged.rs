@@ -3284,9 +3284,17 @@ fn pinned_names(pin_dir: &std::path::Path) -> Vec<String> {
     names
 }
 
-/// The four maps introduced after the endpoint-bound v3 schema. A graph a v3
-/// generation left behind does not have them; a current-build load creates
-/// them.
+/// The four maps the source-port-v4 and PMTU-v5 schemas added after the
+/// endpoint-bound v3 schema. A graph a v3 generation left behind does not have
+/// them; a current-build load creates them.
+///
+/// It is short of six more -- the grouped-session maps `GTPU_SESSIONS`,
+/// `GTPU_UL_INDEX`, `GTPU_DL_INDEX`, `GTPU_SESS_TXN`, `GTPU_CONFIG6` and
+/// `GTPU_SCHEMA6`, all added after v5 -- so a directory a real v3 generation
+/// left behind holds eleven of this build's twenty-one pins, not seventeen.
+/// Those six are deliberately left in place below: this fixture covers the
+/// additive half of a migration for the bearer maps only, and the grouped half
+/// is an open coverage gap.
 const POST_V3_MAPS: [&str; 4] = [
     MAP_UPLINK_SOURCE_PORT,
     MAP_UPLINK_MARK_SOURCE_PORT,
@@ -3294,12 +3302,13 @@ const POST_V3_MAPS: [&str; 4] = [
     MAP_UPLINK_PMTU_COUNTERS,
 ];
 
-/// Regress a current-build graph to the pin *set* a v3 generation leaves
-/// behind, not just its marker.
+/// Regress a current-build graph toward the pin *set* a v3 generation leaves
+/// behind, not just its marker. See `POST_V3_MAPS` for the half of that set
+/// this does not model.
 ///
 /// Rewriting only the marker on a current-build directory leaves all
 /// twenty-one pins in place, which cannot observe what a migration does to a
-/// graph that is genuinely short of four of them.
+/// graph that is short of any of them.
 fn make_v3_shaped(pin_dir: &std::path::Path) {
     for name in POST_V3_MAPS {
         fs::remove_file(pin_dir.join(name))
@@ -7123,10 +7132,13 @@ async fn ebpf_gtpu_uplink_redirect_counter_tracks_delivery_not_submission(
 /// A pin graph retained across an upgrade that grew the counter map must never
 /// be adopted at its old ABI.
 ///
-/// This is the one path every other privileged test here structurally cannot
-/// reach: they all start from a fresh bpffs, so they only ever exercise a pin
-/// graph this build created itself. Retaining the graph is the whole point of
-/// pinning (see the `ebpf` module docs), and it is what a real upgrade does.
+/// No other privileged test here reaches this path. The ones that see a
+/// retained graph at all see the frozen v1 fixture
+/// (`ebpf_gtpu_uplink_and_downlink_round_trip`); every other one exercises only
+/// a pin graph this build created itself, so none of them meets a
+/// *current-schema* graph retained at a foreign counter ABI. Retaining the
+/// graph is the whole point of pinning (see the `ebpf` module docs), and it is
+/// what a real upgrade does.
 ///
 /// Aya routes each `pinning = ByName` map through
 /// `MapData::create_pinned_by_name`, which on an existing pin returns the
@@ -7825,14 +7837,17 @@ async fn ebpf_gtpu_refused_attach_leaves_a_live_generation_counting(
     Ok(())
 }
 
-/// What a refused pre-v5 migration actually does to a graph that is genuinely
-/// v3-shaped, and what it takes to move that graph forward afterwards.
+/// What a refused pre-v5 migration actually does to a graph short of the
+/// bearer maps added after v3, and what it takes to move that graph forward
+/// afterwards.
 ///
 /// `ebpf_gtpu_pre_v5_retained_graph_is_never_migrated_at_a_stale_counter_abi`
 /// regresses a current-build directory's marker and counter ABI but leaves all
 /// twenty-one pins in place, so it cannot see the additive half of a migration
 /// at all. A directory a v3 generation actually left behind is short of the
-/// four maps the source-port-v4 and PMTU-v5 schemas added, and `load_pinned`
+/// four maps the source-port-v4 and PMTU-v5 schemas added -- and of the six
+/// grouped-session maps added after them, which this fixture does not model;
+/// see `POST_V3_MAPS` -- and `load_pinned`
 /// runs -- creating and pinning them -- long before `require_current_pin_map_abi`
 /// refuses at the top of `attach_programs`. `materialize_legacy_source_port_policies`
 /// then writes the legacy policy of every retained session into one of them.
@@ -7910,7 +7925,8 @@ async fn ebpf_gtpu_v3_shaped_retained_graph_refuses_then_heals_without_a_drain(
     assert_eq!(
         retained_names.len(),
         17,
-        "a v3-shaped graph is short of the four post-v3 maps: {retained_names:?}"
+        "this fixture is short of the four bearer maps added after v3, and of \
+         nothing else: {retained_names:?}"
     );
     for name in POST_V3_MAPS {
         assert!(

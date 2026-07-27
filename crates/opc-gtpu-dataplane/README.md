@@ -800,10 +800,20 @@ set (the `OPC-SPORT-v4` and `OPC-PMTU-v5` schemas), a retained counter pin whose
 slot count is not this build's is unpinned before the load and recreated at the
 current count. For an operator that means:
 
-- **the upgrade proceeds normally.** No drain, no manual unpin, no outage. The
-  previous generation's tc filters are still replaced in place by a single
-  `RTM_NEWTFILTER`, because hook ownership is identity over the maps that carry
-  authority and deliberately excludes counter identity;
+- **the counter rebuild costs the upgrade nothing.** No drain, no manual
+  unpin, no outage on its account. Hook ownership is identity over the maps
+  that carry authority and deliberately excludes counter identity, so a
+  previous generation's still-installed tc filter is not made unrecognizable by
+  the rebuild and is replaced in place by a single `RTM_NEWTFILTER`. Excluding
+  counter identity is necessary but not sufficient: `owner_matches_artifact`
+  still requires the occupant's name, program type and kernel *tag* to equal
+  this build's artifact, and the tag is a hash of the program's instructions.
+  In-place replacement therefore holds when the retained filter is running this
+  same datapath program. An upgrade that also changed the eBPF object's
+  instruction stream and finds the previous generation's filters still
+  installed is refused with `AlreadyExists` at `preflight_program_slot` -- for
+  that reason, not a counter one, and no legacy artifact is offered for a
+  current-schema graph;
 - **session and bearer state is untouched.** FAR, PDR, endpoint binding, marked
   owner, session group, index, transaction and configuration pins are adopted
   exactly as retained, which is the whole point of retaining them;
@@ -873,9 +883,12 @@ of its own to conflict with -- it adopts whatever the graph recorded -- so it is
 always the owner and always reconciles.
 
 Only the *removal* is gated on ownership; the classification above it is not. A
-graph at a foreign ABI is terminal for every process, owner or not, so a
-conflicting attach against one is refused with the `ebpf_pin_map_abi` schema
-break rather than with `AlreadyExists`. Nothing is unpinned either way, and
+graph that has reached the current map set and is at a foreign ABI is terminal
+for every process, owner or not, so a conflicting attach against one is refused
+with the `ebpf_pin_map_abi` schema break rather than with `AlreadyExists`.
+Below `OPC-SPORT-v4` nothing is classified at all, so a conflicting attach there
+still reports `AlreadyExists` and the ABI break surfaces later, inside
+`attach_programs`, and only for the owner. Nothing is unpinned either way, and
 `AlreadyExists` remains what a conflicting attach gets against a graph at this
 build's ABI -- including one whose counter pin has merely drifted a slot, which
 is the case an operator actually meets.
@@ -914,27 +927,32 @@ adopting an `OPC-DSCP-v1` or `OPC-PEER-v3` graph whose counter map is not this
 build's fails with
 `GtpuError::Io { operation: "ebpf_program_pin_map_abi", kind: InvalidData }`,
 before either program is bound and before the durable marker advances. Every
-graph created by the frozen `v1` object is in this position: it declares
-`GTPU_COUNTERS` with six slots and this build indexes seven. An `OPC-MARK-v2`
-graph never reaches the check, because the schema preflight already refuses it
-with `ebpf_endpoint_schema`.
+*empty* graph created by the frozen `v1` object is in this position: it declares
+`GTPU_COUNTERS` with six slots and this build indexes seven. A *populated*
+endpoint-unbound v1 graph is refused earlier still, in
+`ebpf_marked_owner_rebuild`, and never reaches this check -- see the remedy
+below. An `OPC-MARK-v2` graph never reaches it either, because the schema
+preflight already refuses that one with `ebpf_endpoint_schema`.
 
 What that refusal leaves behind is *the state the graph is served from*, not a
 byte-identical directory. The refusal is at the top of `attach_programs`, and
 `load_pinned` has already run: on a graph genuinely short of the maps added
-after its own schema -- an `OPC-PEER-v3` directory holds seventeen of this
-build's twenty-one pins -- the load creates and pins the missing four
-(`GTPU_UL_SPORT`, `GTPU_ULM_SPORT`, `GTPU_PMTU_CFG`, `GTPU_PMTU_DROP`), and the
-legacy source-port materialization ahead of the attach writes every retained
-session's uplink policy into `GTPU_UL_SPORT`, and every marked bearer's into
+after its own schema -- an `OPC-PEER-v3` directory holds eleven of this build's
+twenty-one pins -- the load creates and pins the missing ten, the four the
+source-port-v4 and PMTU-v5 schemas added (`GTPU_UL_SPORT`, `GTPU_ULM_SPORT`,
+`GTPU_PMTU_CFG`, `GTPU_PMTU_DROP`) and the six the grouped-session schema added
+(`GTPU_SESSIONS`, `GTPU_UL_INDEX`, `GTPU_DL_INDEX`, `GTPU_SESS_TXN`,
+`GTPU_CONFIG6`, `GTPU_SCHEMA6`). The legacy source-port materialization ahead
+of the attach then writes every retained session's uplink policy into
+`GTPU_UL_SPORT`, and every marked bearer's into
 `GTPU_ULM_SPORT`. That is additive, and it is the same behaviour the v1 path
 already documents. What the refusal does *not* touch is everything the graph's
 identity and its sessions rest on: the durable schema marker stays at
 `OPC-PEER-v3`, the counter pin keeps both its stale slot count and its kernel
 ID, and every retained FAR, PDR, endpoint-binding, marked-owner and
 configuration pin keeps the kernel ID it had. Neither program is bound, because
-the refusal is above `attach_programs`, so no tc filter is installed or
-replaced.
+the refusal is `attach_programs`' own first statement, ahead of the clsact
+qdisc and both program loads, so no tc filter is installed or replaced.
 
 **The remedy is not the same for both legacy schemas, and only one of them costs
 sessions.**
@@ -950,9 +968,21 @@ sessions.**
 - A *populated endpoint-unbound* `OPC-DSCP-v1` graph is a different problem. It
   cannot be inferred as endpoint-bound, so adoption refuses it in
   `ebpf_marked_owner_rebuild` after the load -- before the ABI check is ever
-  reached -- and unlinking the counter pin changes nothing except healing the
-  pin. Here the drained reprovision above really is the only way forward, and it
-  does cost every session.
+  reached. Unlinking the counter pin does not clear that refusal, and on this
+  graph it is not free either. The refusal is raised before `attach_programs`
+  runs at all, so a prior generation's tc filters are still installed and its
+  programs still hold the retained `GTPU_COUNTERS` map open; the `rm` takes
+  that map's only name away without stopping anything that writes to it.
+  Counter pins are deliberately not on the schema preflight's required-pin
+  lists, so the next attach is admitted anyway and its `load_pinned` creates
+  and pins a fresh zeroed seven-slot map under that name. The refusal that
+  follows does not remove it again: `resolve_device` propagates that refusal
+  with no cleanup at all, and `create_device`'s fresh-pin cleanup is disabled
+  the moment the pin directory pre-existed. From
+  that point the pin, which is the only supported way to read these counters,
+  names a map no attached program is writing to, so it reads flat while the
+  still-attached v1 datapath keeps forwarding. Here the drained reprovision
+  above really is the only way forward, and it does cost every session.
 
 Reach for the drained reprovision when the refusal is not
 `ebpf_program_pin_map_abi`, or when unlinking the counter pin does not clear it.
