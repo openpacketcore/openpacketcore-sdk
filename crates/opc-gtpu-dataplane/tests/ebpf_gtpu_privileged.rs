@@ -8114,9 +8114,13 @@ async fn ebpf_gtpu_v3_shaped_retained_graph_refuses_then_heals_without_a_drain(
 /// Such a graph cannot be inferred as endpoint-bound, so adoption refuses it in
 /// `ebpf_marked_owner_rebuild` -- after the load, and therefore before
 /// `require_current_pin_map_abi` ever sees the graph. Bringing its counter pin
-/// to this build's ABI changes nothing, which is exactly what distinguishes it
-/// from the v3 case above: there, one `rm` recovers every session; here, no pin
-/// surgery does, and the drained reprovision is the only way forward.
+/// to this build's ABI does not clear that refusal, and on this graph it is not
+/// free either: the `rm` takes the retained `GTPU_COUNTERS` map's only name
+/// away from the still-attached v1 programs, and the refused load re-pins a
+/// fresh zeroed map of this build's width under it. That is what distinguishes
+/// this graph from the v3 case above: there, one `rm` recovers every session;
+/// here it recovers none and rebinds the published counter name, so the drained
+/// reprovision is what recovers this graph.
 ///
 /// The two remedies are documented side by side, so both are pinned side by
 /// side.
@@ -8152,7 +8156,8 @@ async fn ebpf_gtpu_populated_v1_graph_still_requires_a_drain_at_this_counter_abi
     drop(bootstrap);
     let (v1_uplink_id, v1_downlink_id) = install_frozen_v1_datapath(&pin_dir);
     // Every retained v1 pin except the counter map, which this test unlinks on
-    // purpose and whose rebuild is the documented self-healing behaviour.
+    // purpose and which the refused load then re-pins as a different, fresh
+    // map, so its kernel ID is deliberately not part of this baseline.
     let retained_v1_state = exact_pinned_map_ids(
         &pin_dir,
         &[
@@ -8189,8 +8194,10 @@ async fn ebpf_gtpu_populated_v1_graph_still_requires_a_drain_at_this_counter_abi
     );
     drop(stale);
 
-    // The remedy that recovers a v3 graph does not recover this one. The pin
-    // heals -- counter pins always do -- and the refusal is unchanged.
+    // The remedy that recovers a v3 graph does not recover this one, and here
+    // it is not free: the refusal is unchanged, the v1 programs stay attached
+    // to the map they already hold, and the refused load re-pins a fresh one
+    // under the name that map used to have.
     fs::remove_file(pin_dir.join(MAP_COUNTERS)).expect("unlink only the counter pin");
     let healed = EbpfGtpuDataplaneBackend::with_config(config.clone());
     let healed_refusal = healed.resolve_device("s2bu").await;
@@ -8209,8 +8216,9 @@ async fn ebpf_gtpu_populated_v1_graph_still_requires_a_drain_at_this_counter_abi
     assert_eq!(
         pinned_map_entries(&pin_dir, MAP_COUNTERS),
         COUNTER_SLOTS,
-        "the counter pin still heals at this build's ABI, which is precisely \
-         why it is not what refuses this graph"
+        "the refused load re-pinned a fresh map at this build's width under \
+         GTPU_COUNTERS, leaving the still-attached v1 programs bound to the \
+         {PRE_REDIRECT_COUNTER_SLOTS}-slot map that name used to hold"
     );
     assert_eq!(
         pinned_schema_marker(&pin_dir),

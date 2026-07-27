@@ -307,10 +307,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retained graph still classified as the current schema; and the attach-time pin
   identity check compares kernel map IDs read from the very maps that were just
   adopted, so both sides agreed by construction. Every `max_entries` comparison
-  in the crate sat behind an explicit maintenance API --
-  `recover_orphaned_current_ebpf_graph` for the current schema,
-  `teardown_drained_v2` for the legacy v2 graph -- and none of them was
-  reachable from `create_device` or `resolve_device`.
+  against a datapath map's declared shape sat behind an explicit maintenance
+  API -- `recover_orphaned_current_ebpf_graph` or `teardown_drained_v2` -- and
+  none of those was reachable from `create_device` or `resolve_device`. A
+  `max_entries` comparison did run on both of those entry points, but against
+  the reconciler's own recovery-proof map, whose fixed one-entry shape
+  `ensure_no_current_recovery_proof` checks on every attach; that map is not a
+  datapath pin and says nothing about `GTPU_COUNTERS`.
   - The consequence on the upgrade path -- the designed high-availability
     behaviour, where bpffs keeps the graph so session state survives a restart
     -- was worse than a wrong number. The seven-slot program loads fine against
@@ -384,13 +387,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     unlinking the counter pin and nothing else is sufficient: that is precisely
     the state this release makes self-healing, so the next attach --
     `resolve_device` or `create_device`, both proven on this graph -- recreates
-    the pin at this build's ABI, completes the migration, advances the marker to
-    `OPC-PMTU-v5`, and every session survives.
-    No drain, no re-signalling. A *populated endpoint-unbound* `OPC-DSCP-v1`
-    graph is refused in `ebpf_marked_owner_rebuild` after the load, before the
-    ABI check is reached, and unlinking the counter pin neither clears that
-    refusal nor is free. That refusal is raised before `attach_programs` runs
-    at all, so a prior generation's tc filters are still installed and its
+    the pin at this build's ABI, completes the migration, advances the marker
+    to `OPC-PMTU-v5`, and every session survives. No drain, no re-signalling. A
+    *populated endpoint-unbound* `OPC-DSCP-v1` graph is refused in
+    `ebpf_marked_owner_rebuild` after the load, before the ABI check is
+    reached, and unlinking the counter pin neither clears that refusal nor is
+    free. That refusal is raised before `attach_programs` runs at all, so
+    nothing the refusing process does installs or replaces a filter; if a prior
+    generation is still serving traffic its filters are still installed and its
     programs still hold the retained `GTPU_COUNTERS` map open, and the `rm`
     takes that map's only name away without stopping anything that writes to
     it. Counter pins are not on the schema preflight's required-pin lists, so
@@ -399,32 +403,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     not remove again -- `resolve_device` propagates it with no cleanup at all,
     and `create_device`'s fresh-pin cleanup is disabled once the pin directory
     pre-existed. The counters an operator reads at that pin then sit flat while
-    the still-attached v1 datapath keeps forwarding. There the drained
-    reprovision populated legacy state already
-    requires is the only way forward, and it does cost every session.
+    the still-attached v1 datapath keeps forwarding. If no generation is
+    attached, the `rm` removes the retained counter map's entry in the pin
+    directory while nothing holds it, and those counter values are not
+    recoverable through this datapath. Either way the drained reprovision
+    populated legacy state already requires is what recovers this graph, and it
+    does cost every session.
   - Nothing is unpinned on an attach that carries its own authority before that
     authority has been proven against the pins. `create_device` compares
-    `GTPU_CONFIG` in the pin directory
-    against the requested `bind_address` -- the same comparison it applies to
-    the adopted map further down -- and the grouped endpoint-set path compares
-    the device configuration `grouped_schema_preflight` already read against the
-    requested endpoint set, the grouped pin directory being keyed by device ID.
-    A second process attaching the same pin namespace under either kind of
-    conflicting authority refuses with `AlreadyExists` having reconciled
-    nothing, so the generation still forwarding keeps writing to the counters an
-    operator reads at their pin. Without that gate the refused call would have
-    rebuilt and re-pinned the counter map, permanently disconnecting a healthy,
-    still-forwarding datapath from its published counters -- flat
-    `uplink_encapsulated` against live traffic, which this datapath documents as
-    the signature of a total uplink outage. `adopt`, and so `resolve_device`,
-    is the deliberate exception: it has no configuration of its own to conflict
-    with, adopts whatever the graph recorded, and therefore passes
-    `RetainedGraphOwnership::Inherited` and always reconciles. Only the removal
-    is gated on ownership; classification is not, so a conflicting attach
-    against a current-map-set graph that is *also* at a foreign ABI reports that
-    schema break rather than `AlreadyExists`, and still unpins nothing. Below
-    `OPC-SPORT-v4` the repair pass classifies nothing, so a conflicting attach
-    there reports `AlreadyExists`.
+    `GTPU_CONFIG` in the pin directory against the requested `bind_address` --
+    the same comparison it applies to the adopted map further down -- and the
+    grouped endpoint-set path compares the device configuration
+    `grouped_schema_preflight` already read against the requested endpoint set,
+    the grouped pin directory being keyed by device ID. A second process
+    attaching the same pin namespace under either kind of conflicting authority
+    refuses with `AlreadyExists` having removed nothing, so on a graph whose
+    counter pin is present the generation still forwarding keeps writing to the
+    counters an operator reads at their pin. Without that gate the refused call
+    would have unpinned and rebuilt the counter map of any drifted graph it was
+    refused on, permanently disconnecting a healthy, still-forwarding datapath
+    from its published counters -- flat `uplink_encapsulated` against live
+    traffic, which this datapath documents as the signature of a total uplink
+    outage. The gate is on the removal, not on the load, so one residual
+    remains: both conflicting paths run `load_pinned` before they arbitrate the
+    configuration, and on a directory already short of its counter pin that
+    load pins a fresh zeroed map under that name before the refusal, which
+    `finish_fresh_attach_failure` then leaves in place because the pin
+    directory pre-existed. No privileged test covers that combination yet.
+    `adopt`, and so `resolve_device`, is the deliberate exception: it has no
+    configuration of its own to conflict with, adopts whatever the graph
+    recorded, and therefore passes `RetainedGraphOwnership::Inherited` and
+    always reconciles. Only the removal is gated on ownership; classification
+    is not, so a conflicting attach against a current-map-set graph that is
+    *also* at a foreign ABI reports that schema break rather than
+    `AlreadyExists`, and still unpins nothing. Below `OPC-SPORT-v4` the repair
+    pass classifies nothing, so a conflicting attach there reports
+    `AlreadyExists`.
   - A pin directory short of a counter pin is no longer a permanent wedge. The
     repair pass unpins a counter map and relies on the load to recreate it, so a
     process that dies in that window -- or a `load_pinned` that fails against a

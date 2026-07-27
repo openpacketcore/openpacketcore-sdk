@@ -867,7 +867,7 @@ one left behind is refused by exactly the same comparison, run against its own
 map specification, so the drained reprovision above is the procedure in both
 directions.
 
-**An attach refused for a conflicting owner changes nothing.** Nothing is
+**An attach refused for a conflicting owner unpins nothing.** Nothing is
 unpinned until the call has proven, from the pin directory, that it is the
 graph's owner: `create_device` compares `GTPU_CONFIG` against the requested
 `bind_address`, the same comparison it applies to the adopted map further down,
@@ -877,10 +877,10 @@ grouped pin directory is keyed by device ID, so a conflicting *endpoint set*
 under the same device ID is the shape an ownership conflict takes there. A
 second process that attaches the same pin namespace under either kind of
 conflicting authority therefore fails with `GtpuError::AlreadyExists` having
-reconciled nothing, and the generation still forwarding keeps writing to the
-counters an operator reads at their pin. `resolve_device` has no configuration
-of its own to conflict with -- it adopts whatever the graph recorded -- so it is
-always the owner and always reconciles.
+removed nothing, so on a graph whose counter pin is present the generation
+still forwarding keeps writing to the counters an operator reads at that pin.
+`resolve_device` has no configuration of its own to conflict with -- it adopts
+whatever the graph recorded -- so it is always the owner and always reconciles.
 
 Only the *removal* is gated on ownership; the classification above it is not. A
 graph that has reached the current map set and is at a foreign ABI is terminal
@@ -893,6 +893,18 @@ still reports `AlreadyExists` and the ABI break surfaces later, inside
 build's ABI -- including one whose counter pin has merely drifted a slot, which
 is the case an operator actually meets.
 
+The *load* is not gated on ownership either, and that is where the one residual
+sits. Both conflicting paths run `load_pinned` before they arbitrate the
+configuration, and `load_pinned` pins every declared map the directory does not
+already hold. On a directory already short of its counter pin -- the state the
+reconciliation window leaves behind if a process dies in it, and the state the
+`OPC-PEER-v3` remedy below asks an operator to create -- the refusing call has
+therefore already pinned a fresh zeroed counter map under that name, and it does
+not remove it again, because `create_device`'s fresh-pin cleanup is disabled
+once the pin directory pre-existed, which it has by definition here. That pin
+reads flat until an attach by the rightful owner completes. No privileged test
+covers this combination yet.
+
 *Scoped limitation.* Ownership is proven; completion is not. On a graph this
 process does own, the counter pin is rebuilt before the object is loaded, and
 every refusal after that point -- a corrupt retained PMTU policy, an
@@ -901,9 +913,13 @@ previous generation attached to the map that was unpinned, so its counters read
 flat at their pin until an attach by the rightful owner completes. Session,
 bearer and device state is untouched throughout, and the pin now holds a map at
 this build's ABI, so a retry reconciles nothing and either completes or fails
-for the same reason as before. An operator seeing flat counters after a *failed*
-upgrade of a graph whose counter ABI drifted should read them from the previous
-generation rather than treat them as an uplink outage.
+for the same reason as before. Flat counters after a *failed* upgrade of a graph
+whose counter ABI drifted are that rebuilt pin, not an uplink outage -- but the
+previous generation's own values are not readable at the pin, which now names
+the rebuilt map, and `datapath_snapshot` will not report them either: it
+re-proves every pinned map ID against the datapath identity it recorded at
+attach, so a device handle recorded before the rebuild returns
+`StateIndeterminate` instead of counters.
 
 The restore itself would not be difficult, and this is not left open because it
 is dangerous: holding the previous map open across the reconciliation
@@ -970,22 +986,28 @@ sessions.**
   `ebpf_marked_owner_rebuild` after the load -- before the ABI check is ever
   reached. Unlinking the counter pin does not clear that refusal, and on this
   graph it is not free either. The refusal is raised before `attach_programs`
-  runs at all, so a prior generation's tc filters are still installed and its
-  programs still hold the retained `GTPU_COUNTERS` map open; the `rm` takes
-  that map's only name away without stopping anything that writes to it.
-  Counter pins are deliberately not on the schema preflight's required-pin
-  lists, so the next attach is admitted anyway and its `load_pinned` creates
-  and pins a fresh zeroed seven-slot map under that name. The refusal that
-  follows does not remove it again: `resolve_device` propagates that refusal
-  with no cleanup at all, and `create_device`'s fresh-pin cleanup is disabled
-  the moment the pin directory pre-existed. From
-  that point the pin, which is the only supported way to read these counters,
-  names a map no attached program is writing to, so it reads flat while the
-  still-attached v1 datapath keeps forwarding. Here the drained reprovision
-  above really is the only way forward, and it does cost every session.
+  runs at all, so nothing the refusing process does installs or replaces a
+  filter; if a prior generation is still serving traffic -- the case the drain
+  exists for -- its filters are still installed and its programs still hold the
+  retained `GTPU_COUNTERS` map open, and the `rm` takes that map's only name
+  away without stopping anything that writes to it. Counter pins are
+  deliberately not on the schema preflight's required-pin lists, so the next
+  attach is admitted anyway and its `load_pinned` creates and pins a fresh
+  zeroed seven-slot map under that name. The refusal that follows does not
+  remove it again: `resolve_device` propagates that refusal with no cleanup at
+  all, and `create_device`'s fresh-pin cleanup is disabled the moment the pin
+  directory pre-existed. From that point the pin names a map no attached
+  program is writing to, so a reader that opens the counters at that path reads
+  flat while the still-attached v1 datapath keeps forwarding. If instead no
+  generation is attached -- the graph's interface is gone and its map graph is
+  all that survives in bpffs -- the `rm` removes the retained counter map's
+  entry in the pin directory while nothing holds it, and those counter values
+  are not recoverable through this datapath. Either way the drained reprovision
+  above is what recovers this graph, and it does cost every session.
 
 Reach for the drained reprovision when the refusal is not
-`ebpf_program_pin_map_abi`, or when unlinking the counter pin does not clear it.
+`ebpf_program_pin_map_abi`, or when the refusal is `ebpf_program_pin_map_abi`
+and unlinking the counter pin does not clear it.
 
 **A pin directory missing only counter pins heals itself.** The reconciliation
 unpins a counter map and relies on the load to recreate it, so between those
