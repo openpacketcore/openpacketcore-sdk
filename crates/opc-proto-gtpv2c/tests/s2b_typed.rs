@@ -1,7 +1,7 @@
 use bytes::BytesMut;
 use opc_proto_gtpv2c::{
     decode_typed_ie_sequence, s2b, CauseValue, FullyQualifiedTeid, Message, MessageType,
-    PdnTypeValue, S2bMessage, TbcdDigits, TypedIe, TypedIeValue, IE_TYPE_APCO,
+    PdnTypeValue, RawIe, S2bMessage, TbcdDigits, TypedIe, TypedIeValue, IE_TYPE_APCO,
     IE_TYPE_BEARER_CONTEXT, IE_TYPE_BEARER_QOS, IE_TYPE_CAUSE, IE_TYPE_EBI, IE_TYPE_F_TEID,
     IE_TYPE_IMSI, IE_TYPE_INDICATION, IE_TYPE_IP_ADDRESS, IE_TYPE_MEI, IE_TYPE_PAA,
     IE_TYPE_PDN_TYPE, IE_TYPE_RECOVERY, INTERFACE_TYPE_S2B_EPDG_GTP_C,
@@ -1828,6 +1828,68 @@ fn strict_nested_bearer_context_member_includes_bearer_value_offset() {
         result,
         Err(error) if matches!(error.code(), DecodeErrorCode::Structural { .. }) && error.offset() == 12
     ));
+}
+
+/// A grouped IE's decode failure names the member that offended, not the
+/// container it was nested in.
+///
+/// TS 29.274 clause 7.7.7 requires an "Invalid length" response to carry "the
+/// type and instance of the offending IE". Both the sequence loop and the
+/// single-IE conversion annotate a value-level failure with the identity they
+/// are holding, so a member failure inside a Bearer Context is annotated twice
+/// on its way out: once by the nested run of the sequence loop, once by the
+/// enclosing surface. `DecodeError::with_offending_ie` is set-if-absent, which
+/// is what makes the first (innermost) attachment the one that survives.
+///
+/// Mutating that guard to an unconditional assignment turns the first
+/// `offending_ie` assertion below red, reporting the Bearer Context identity
+/// `(93, 1)` where `(73, 2)` is required.
+#[test]
+fn a_grouped_ie_failure_names_the_offending_member_not_the_container() {
+    // Bearer Context (93) at instance 1 wrapping an EBI (73) at instance 2
+    // whose two-octet value violates the one-octet EBI length. The nested EBI
+    // header starts at absolute offset 4 and its value at absolute offset 8.
+    const NESTED_EBI: [u8; 6] = [
+        IE_TYPE_EBI,
+        0x00,
+        0x02,
+        0x02, // Instance 2, declaring two value octets.
+        0x05,
+        0x05,
+    ];
+    let mut input = vec![IE_TYPE_BEARER_CONTEXT, 0x00, NESTED_EBI.len() as u8, 0x01];
+    input.extend_from_slice(&NESTED_EBI);
+
+    let sequence_error = decode_typed_ie_sequence(&input, DecodeContext::default(), 0)
+        .expect_err("an over-length nested EBI must fail the sequence decode");
+    assert!(matches!(
+        sequence_error.code(),
+        DecodeErrorCode::InvalidLength { .. }
+    ));
+    assert_eq!(sequence_error.offset(), 8);
+    assert_eq!(
+        sequence_error.offending_ie(),
+        Some((IE_TYPE_EBI, 2)),
+        "decode_typed_ie_sequence named the container rather than the member"
+    );
+
+    let raw_error = TypedIe::decode_from_raw(
+        RawIe {
+            ie_type: IE_TYPE_BEARER_CONTEXT,
+            instance: 1,
+            spare: 0,
+            value: &NESTED_EBI,
+        },
+        DecodeContext::default(),
+        0,
+        0,
+    )
+    .expect_err("an over-length nested EBI must fail the single-IE conversion");
+    assert_eq!(
+        raw_error.offending_ie(),
+        Some((IE_TYPE_EBI, 2)),
+        "TypedIe::decode_from_raw named the container rather than the member"
+    );
 }
 
 #[test]

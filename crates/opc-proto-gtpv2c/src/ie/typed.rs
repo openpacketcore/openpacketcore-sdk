@@ -137,7 +137,13 @@ pub(crate) struct DecodedIeSequence<'a> {
 type IeDecodeFilter<'f> = &'f dyn Fn(u8, u8, usize, Option<(u8, u8)>) -> bool;
 type IeRepeatableLimit<'f> = &'f dyn Fn(u8, u8, usize, Option<(u8, u8)>) -> Option<usize>;
 
-/// IE types whose malformed value is discarded instead of failing the decode.
+/// IE types *eligible* for the TS 29.274 clause 7.7.8 discard of a malformed
+/// value.
+///
+/// Membership is one of the three conditions `IeDecodePolicy::discards_malformed`
+/// requires; the decode's `MalformedOptionalIePolicy` and the error's code
+/// decide whether an eligible IE is actually discarded. This list is therefore
+/// not the disposition, only one input to it.
 ///
 /// TS 29.274 clause 7.7.8: "The receiver of a GTP signalling message including
 /// an optional information element with a Value that is not in the range
@@ -214,11 +220,12 @@ impl<'p> IeDecodePolicy<'p> {
     }
 
     /// Scoped decode is the procedure-aware sequence path. Clauses 7.7.7 and
-    /// 7.7.8 bind receivers only, so the caller passes the side it is on
-    /// rather than the scoped constructor assuming one: `legacy` already
-    /// threads `malformed_optional`, and a scoped path that hardcoded
-    /// `Discard` would silently license the receiver rule on any future
-    /// sender-side caller.
+    /// 7.7.8 condition the discard on the IE's presence under one procedure
+    /// and direction, so the caller passes its profile rather than the scoped
+    /// constructor assuming one: `legacy` already threads
+    /// `malformed_optional`, and a scoped path that hardcoded `Discard` would
+    /// silently license the discard on a future caller that has established no
+    /// such presence.
     const fn scoped(
         filter: IeDecodeFilter<'p>,
         repeatable_limit: IeRepeatableLimit<'p>,
@@ -3842,11 +3849,13 @@ impl<'a> TypedIe<'a> {
     /// owes the sender an "Invalid length" response naming the offending IE's
     /// type and instance, which a discard destroys.
     ///
-    /// Callers that want the clause 7.7.8 discard should decode through
-    /// [`S2bMessage::decode`](crate::S2bMessage::decode), which resolves a
-    /// procedure and direction and selects the S2b receive profile. Callers
-    /// that must observe the malformed octets can use [`RawIeIterator`] or
-    /// re-encode raw-preserving; both still see them.
+    /// Callers that want the clause 7.7.8 discard should decode through the
+    /// S2b receive profile, which resolves a procedure and direction:
+    /// [`S2bMessage::decode`](crate::S2bMessage::decode),
+    /// [`S2bMessage::decode_with_diagnostics`](crate::S2bMessage::decode_with_diagnostics),
+    /// and [`S2bMessage::from_message`](crate::S2bMessage::from_message) all
+    /// select it. Callers that must observe the malformed octets can use
+    /// [`RawIeIterator`] or re-encode raw-preserving; both still see them.
     pub fn decode_sequence(input: &'a [u8], ctx: DecodeContext) -> Result<Vec<Self>, DecodeError> {
         decode_typed_ie_sequence(input, ctx, 0)
     }
@@ -3867,14 +3876,28 @@ impl<'a> TypedIe<'a> {
     /// disposition the sequence decoders reach and for the same reason: this
     /// function resolves no procedure or direction, so it cannot establish the
     /// presence the TS 29.274 clause 7.7.8 discard is conditioned on. The
-    /// discard is applied by
-    /// [`S2bMessage::decode`](crate::S2bMessage::decode) alone.
+    /// discard is applied by the S2b receive profile, which every entry point
+    /// that selects `S2bDecodePurpose::Receive` reaches:
+    /// [`S2bMessage::decode`](crate::S2bMessage::decode),
+    /// [`S2bMessage::decode_with_diagnostics`](crate::S2bMessage::decode_with_diagnostics),
+    /// and [`S2bMessage::from_message`](crate::S2bMessage::from_message).
+    ///
+    /// The returned error carries this IE's type and instance in
+    /// [`DecodeError::offending_ie`], which clause 7.7.7 requires an "Invalid
+    /// length" response to name. For a grouped IE the attachment is
+    /// set-if-absent, so a member that failed its own value decode keeps
+    /// naming itself rather than being relabelled with the container's
+    /// identity.
     pub fn decode_from_raw(
         raw: RawIe<'a>,
         ctx: DecodeContext,
         depth: usize,
         base_offset: usize,
     ) -> Result<Self, DecodeError> {
+        // Captured before `raw` is moved, as the sequence loop does for the
+        // same reason.
+        let ie_type = raw.ie_type;
+        let ie_instance = raw.instance;
         let mut duplicate_evidence = DuplicateIeCollector::default();
         Self::decode_from_raw_with_evidence(
             raw,
@@ -3884,6 +3907,11 @@ impl<'a> TypedIe<'a> {
             IeDecodePolicy::legacy(false, MalformedOptionalIePolicy::Reject),
             &mut duplicate_evidence,
         )
+        // This conversion is handed exactly one IE, so any failure it returns
+        // is attributable to that IE. `with_offending_ie` is set-if-absent, so
+        // a grouped member that annotated itself in the nested sequence run
+        // keeps its own identity rather than the container's.
+        .map_err(|error| error.with_offending_ie(ie_type, ie_instance))
     }
 
     fn decode_from_raw_with_evidence(
@@ -4252,9 +4280,11 @@ pub fn encode_typed_ie_sequence(
 /// presence here would require a procedure and direction the signature does
 /// not carry.
 ///
-/// The clause 7.7.8 discard is applied where presence *is* resolved:
-/// [`S2bMessage::decode`](crate::S2bMessage::decode), which selects the S2b
-/// receive profile.
+/// The clause 7.7.8 discard is applied where presence *is* resolved: the S2b
+/// receive profile, selected by
+/// [`S2bMessage::decode`](crate::S2bMessage::decode),
+/// [`S2bMessage::decode_with_diagnostics`](crate::S2bMessage::decode_with_diagnostics),
+/// and [`S2bMessage::from_message`](crate::S2bMessage::from_message).
 ///
 /// @spec 3GPP TS29274 R18 8.2
 /// @req REQ-3GPP-TS29274-R18-S2B-IE-004
@@ -4616,10 +4646,21 @@ mod tests {
     /// octets, so it must fail the message even for an IE whose profile would
     /// otherwise discard it.
     ///
-    /// Pinned as a unit test because `LengthOverflow` is raised only by
-    /// `checked_add_offset`, which needs a base offset within four of
-    /// `usize::MAX` -- unreachable from any input a public decoder can be
-    /// handed, so no integration test can reach this branch.
+    /// Pinned as a unit test because the excluded combination -- a
+    /// `LengthOverflow` reaching this guard while `Discard` is selected -- has
+    /// no known reachable input. `discards_malformed` returns true only under
+    /// `MalformedOptionalIePolicy::Discard`, which one production site selects
+    /// (`s2b.rs`, for `S2bDecodePurpose::Receive`), and only for a type in
+    /// `DISCARD_MALFORMED_OPTIONAL_IE_TYPES`, today just IE 176. Decoding that
+    /// IE raises `LengthOverflow` only out of `checked_add_offset`, which needs
+    /// an offset within a few octets of `usize::MAX`, and on that path the
+    /// offsets are positions inside an already-bounded message buffer. That
+    /// argument is about this guard's own inputs, not about the crate:
+    /// `LengthOverflow` is *not* confined to `checked_add_offset` in general,
+    /// being constructed directly for header, message, and IE framing
+    /// arithmetic elsewhere, and a public decoder that is handed a large
+    /// `base_offset` argument can reach it. The unit test exercises the guard
+    /// directly rather than resting on the reachability argument at all.
     ///
     /// This is a mutation guard rather than a regression repro: it is green
     /// both before and after the profile-less decoders began failing closed.

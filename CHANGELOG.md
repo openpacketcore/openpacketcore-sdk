@@ -13,14 +13,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `DecodeError::with_offending_ie`. 3GPP TS 29.274 requires an "Invalid length"
   error response to name "the type and instance of the offending IE", and
   until now nothing in a `DecodeError` could supply it, so
-  `Gtpv2cOffendingIe` had to be invented by the caller. GTPv2-C typed sequence
-  decoding annotates every value-level failure, at the top level and inside
-  grouped IEs; the attachment is set-if-absent, so the innermost element that
-  actually offended is the one named rather than its container. Additive and
-  non-breaking: the field is private, `DecodeError::new` is the only
-  constructor, and it defaults to `None`. It stores identity only — a type
-  octet and a four-bit instance, both already in the clear on the wire — so
-  the type's "never stores raw packet bytes" logging guarantee is unchanged.
+  `Gtpv2cOffendingIe` had to be reconstructed by the caller from the wire.
+  GTPv2-C typed IE decoding annotates every value-level failure: the sequence
+  decoders at the top level and inside grouped IEs, and
+  `TypedIe::decode_from_raw` for the single IE it is handed. The attachment is
+  set-if-absent, so the innermost element that actually offended is the one
+  named rather than its container; that guard is pinned by
+  `decode_error_offending_ie_keeps_the_first_identity_attached` in
+  `opc-protocol` and by
+  `a_grouped_ie_failure_names_the_offending_member_not_the_container` in
+  `opc-proto-gtpv2c`. Additive and non-breaking: the field is private,
+  `DecodeError::new` is the only constructor, and it defaults to `None`. It
+  stores identity only — a type octet and a four-bit instance, both already in
+  the clear on the wire — so the type's "never stores raw packet bytes"
+  logging guarantee is unchanged. It is offered to callers rather than consumed
+  internally: the GTPv2-C error-response boundary still takes a caller-built
+  `Gtpv2cOffendingIe` and does not inspect a `DecodeError`, so passing the
+  decoder's identity into it is the caller's step.
 - **First-owner activation for destination-scoped steering — `opc-ipsec-lb`:**
   in `HostXdpFenceDomain::PerOwnershipKey` the only public owner-map writer was
   the fenced re-pin coordinator, and a re-pin cannot be formed for a fresh SA --
@@ -329,11 +338,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   returned by `decode_typed_ie_sequence` or `TypedIe::decode_sequence` now
   surfaces as `Err`. No signature changed, so nothing downstream fails to
   compile -- this note is the only signal callers get. Callers that want the
-  clause 7.7.8 discard must decode through `S2bMessage::decode`, which selects
+  clause 7.7.8 discard must decode through the S2b receive profile --
+  `S2bMessage::decode`, `S2bMessage::decode_with_diagnostics`, or
+  `S2bMessage::from_message` -- each of which selects
   `S2bDecodePurpose::Receive` and has resolved the procedure and direction the
-  rule depends on. The S2b production path is untouched: `s2b.rs` already
-  passed `MalformedOptionalIePolicy` explicitly at all three of its sequence
-  entry points, and the whole S2b test suite passes unchanged.
+  rule depends on.
+
+  The S2b *disposition* is unmoved: `s2b.rs` already passed
+  `MalformedOptionalIePolicy` explicitly at all three of its sequence entry
+  points, so the receive profile still discards and the canonical builder still
+  rejects, and the whole S2b test suite passes unchanged. The S2b error
+  *payload* does change: all three entry points share
+  `decode_typed_ie_sequence_at`, so an S2b value-level decode failure now
+  carries the `offending_ie` identity added under `DecodeError::offending_ie`
+  above, where it previously carried `None`. `DecodeError`'s `Display` is
+  unchanged, so a caller that logs the error or inspects `code`, `offset`, or
+  `spec_ref` sees no difference; a caller comparing whole `DecodeError` values
+  would.
 
   This is a deliberate fail-closed step and not a presence-keyed rule: keying
   the disposition on presence would need a procedure and direction these
@@ -345,11 +366,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reports the offset arithmetic guarding the decode rather than the received
   octets and must fail the message even where a discard is licensed.
 
-  Supersedes, rather than edits, the claim recorded above under
-  "Node Identifier (IE 176) is typed on receive" that the discard is "uniform
-  across the decode surface ... at every validation level": as of this entry
-  that uniformity is scoped to the S2b receive profile, and the axis that
-  selects the discard is the decode entry point, not the validation level.
+  `TypedIe::decode_from_raw` already returned the value-level error and still
+  does; what changed there is that the error now names the IE it was handed in
+  `DecodeError::offending_ie`, so all three profile-less surfaces supply the
+  clause 7.7.7 identity rather than two of them. For a grouped IE the
+  set-if-absent attachment keeps the failing member named, not the container.
+
+  Supersedes, rather than edits, three claims recorded above under
+  "Node Identifier (IE 176) is typed on receive", each of which described the
+  discard as a property of the crate's decode surface rather than of one
+  receive profile:
+
+  - that the discard is "uniform across the decode surface ... at every
+    validation level" -- as of this entry that uniformity is scoped to the S2b
+    receive profile, and the axis that selects the discard is the decode entry
+    point, not the validation level;
+  - that `TypedIe::decode_from_raw` "still returns `Truncated`" where the
+    sequence decoders discard -- that contrast is gone, because the
+    profile-less sequence decoders now return the error too. The entry's
+    surrounding sentence, "per clauses 7.7.7 and 7.7.8 the IE is then
+    discarded", holds on the S2b receive profile and not on the profile-less
+    decoders;
+  - that "'Discard' means the IE is absent from the typed view *and* from the
+    clause 7.7.10 duplicate bookkeeping", stated there without a scope -- the
+    mechanism is unchanged wherever a discard is applied, but as of this entry
+    that is the S2b receive profile only.
 - **P-CSCF Re-selection support is no longer emittable on its own --
   `opc-proto-gtpv2c` (breaking to `PcoRequest`):** TS 24.008 10.5.6.3 says of
   container `0x0012` that "This PCO parameter may be present only if a

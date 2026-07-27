@@ -35,6 +35,67 @@ fn decode_error_can_carry_spec_ref() {
     assert_eq!(spec.table(), Some("5.1-1"));
 }
 
+/// A `DecodeError` carries no offending element until one is attached, and
+/// `with_offending_ie` attaches the identity it is given.
+#[test]
+fn decode_error_offending_ie_is_absent_until_attached() {
+    let err = DecodeError::new(DecodeErrorCode::Truncated, 42);
+    assert_eq!(err.offending_ie(), None);
+
+    let annotated = err.with_offending_ie(73, 2);
+    assert_eq!(annotated.offending_ie(), Some((73, 2)));
+}
+
+/// `with_offending_ie` is set-if-absent: a later call does not overwrite an
+/// identity already attached.
+///
+/// This is the guarantee the accessor's documentation rests on. A decode error
+/// propagates outward through whatever nesting raised it, and each enclosing
+/// container gets a chance to annotate it on the way out. Keeping the first
+/// attachment is what makes the innermost element -- the one that actually
+/// failed to decode -- the one named, instead of whichever container annotated
+/// last. 3GPP TS 29.274 requires an "Invalid length" response to carry "the
+/// type and instance of the offending IE"; naming the container would put an
+/// identity in the Cause IE that is not the element at fault.
+///
+/// Red-first proof: replacing the `is_none()` guard in `with_offending_ie`
+/// with an unconditional assignment turns the `container` assertion below red
+/// (`Some((93, 1))` observed where `Some((73, 2))` is required). Before this
+/// test this crate had no test that so much as mentioned `offending_ie`, so
+/// the guard could be deleted here without anything in `opc-protocol`
+/// noticing.
+#[test]
+fn decode_error_offending_ie_keeps_the_first_identity_attached() {
+    // Inner element: EBI (type 73) at instance 2 fails its value decode.
+    let inner = DecodeError::new(
+        DecodeErrorCode::InvalidLength {
+            reason: "EBI IE must be one octet",
+        },
+        12,
+    )
+    .with_offending_ie(73, 2);
+    assert_eq!(inner.offending_ie(), Some((73, 2)));
+
+    // Enclosing element: Bearer Context (type 93) at instance 1 annotates the
+    // same error as it propagates. The inner identity must survive.
+    let container = inner.clone().with_offending_ie(93, 1);
+    assert_eq!(
+        container.offending_ie(),
+        Some((73, 2)),
+        "an enclosing element must not overwrite the innermost offending identity"
+    );
+
+    // Repeated annotation with the same identity is likewise a no-op, and no
+    // other field is disturbed by the attempt.
+    let twice = container.clone().with_offending_ie(93, 1);
+    assert_eq!(twice, container);
+    assert_eq!(twice.offset(), 12);
+    assert!(matches!(
+        twice.code(),
+        DecodeErrorCode::InvalidLength { .. }
+    ));
+}
+
 #[test]
 fn decode_error_codes_are_stable_and_safe_to_log() {
     // Every variant must be constructible and Display-able without leaking

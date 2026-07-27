@@ -77,9 +77,12 @@ The error-response boundary is deliberately separate from full `Message` and
   map to Cause 69. IE failures encode only the standardized four-octet Type,
   zero Length, and Instance identity in the Cause IE. The offending IE's type
   and instance, which clause 7.7.7 requires an "Invalid length" response to
-  carry, are supplied by the decoder itself through `DecodeError::offending_ie`
-  rather than being reconstructed by the caller; `Gtpv2cOffendingIe::new`
-  validates the four-bit instance bound.
+  carry, are taken from a caller-supplied `Gtpv2cOffendingIe`; this boundary
+  reads no `DecodeError`. `Gtpv2cOffendingIe::new` validates the four-bit
+  instance bound. A caller whose failure came from this crate's typed IE
+  decoders no longer has to reconstruct that identity from the wire: it can
+  read it off `DecodeError::offending_ie` and pass it in. Connecting the two is
+  the caller's step, not this boundary's.
 - An unknown received non-zero session TEID is the only plan input that
   produces Context Not Found with header TEID zero. Applying that failure to a
   legitimate zero-TEID initial request is rejected as conflicting evidence.
@@ -480,23 +483,32 @@ coverage.
      receive filter, so both routes reach the same result. `Strict` is not an
      opt-in stricter-than-TS-29.274 mode: it enforces "field cardinality, enum
      ranges, and critical IE rules", and for an optional IE clause 7.7.8 *is*
-     the range rule and it says discard.
+     the range rule and it says discard. `S2bMessage::decode` is not the only
+     way into the S2b receive profile: `S2bMessage::decode_with_diagnostics`
+     and `S2bMessage::from_message` also select `S2bDecodePurpose::Receive`,
+     and the discard is a property of that purpose, so it is applied
+     identically through all three.
    - The profile-less decoders — `decode_typed_ie_sequence`,
      `TypedIe::decode_sequence`, and `TypedIe::decode_from_raw` — **fail
      closed** instead, at every validation level. They take no procedure, no
      direction, and no message type, so they cannot establish the presence on
      which both clauses condition the discard; and clause 7.7.7 owes the sender
      an "Invalid length" response "together with the type and instance of the
-     offending IE", which a discard destroys. The error they return carries
-     that identity in `DecodeError::offending_ie`, so a caller has exactly what
-     the Cause IE needs. This is deliberately not presence-keyed: keying on
-     presence would require a procedure and direction these signatures do not
-     carry.
-   - On that profile, discard means the IE is absent from the typed view *and*
-     from the clause
-     7.7.10 duplicate bookkeeping. "Treat the rest of the message as if this IE
-     was absent" is a statement about the whole remaining decode, not only
-     about the returned sequence: a discarded IE does not occupy its
+     offending IE", which a discard destroys. The error each of the three
+     returns carries that identity in `DecodeError::offending_ie`, so a caller
+     has exactly what the Cause IE needs; for a grouped IE the identity names
+     the member that failed rather than its container, because the attachment
+     is set-if-absent and the innermost decode annotates first. Reading that
+     identity into a `Gtpv2cOffendingIe` is still the caller's step: the
+     error-response boundary above takes the identity from its caller and does
+     not itself inspect a `DecodeError`. This is deliberately not
+     presence-keyed: keying on presence would require a procedure and direction
+     these signatures do not carry.
+   - On the S2b receive profile, where the discard is applied at all, discard
+     means the IE is absent from the typed view *and* from the clause 7.7.10
+     duplicate bookkeeping. "Treat the rest of the message as if this IE was
+     absent" is a statement about the whole remaining decode, not only about
+     the returned sequence: a discarded IE does not occupy its
      `(type, instance)` slot, so a later well-formed IE at the same key is
      still decoded and is not counted as a repeat, and repeated malformed IEs
      at one key are repeated discards rather than a duplicate. This holds under

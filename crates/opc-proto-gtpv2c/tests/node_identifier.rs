@@ -293,36 +293,52 @@ const MALFORMED_LENGTH_PAIRS: &[(&str, &[u8], usize)] = &[
 ///
 /// The detection is pinned on `TypedIe::decode_from_raw`, the single-IE
 /// conversion whose documented contract is that it cannot represent a
-/// deliberate omission and therefore still returns the error. It is also the
-/// surface the canonical builder's sender-side self-check runs on. The
-/// sequence decoders apply TS 29.274 clause 7.7.8 to the same failure and
-/// discard the IE instead; that is pinned separately below.
+/// deliberate omission and therefore returns the error. It is also the surface
+/// the canonical builder's sender-side self-check runs on. The profile-less
+/// sequence decoders reach the same disposition on the same input and are
+/// pinned by `a_malformed_node_identifier_fails_the_profile_less_sequence_decode`
+/// below; the TS 29.274 clause 7.7.8 discard is pinned on the S2b receive
+/// profile by `every_malformed_length_pair_is_discarded_on_the_s2b_receive_path`.
+///
+/// The error also carries the offending IE's type and instance, which clause
+/// 7.7.7 requires an "Invalid length" response to name. The instance sweep is
+/// what pins that the reported instance is the received one rather than a
+/// constant.
 #[test]
 fn node_identifier_value_decode_reports_the_malformed_length_pair() {
     for (label, value, expected_offset) in MALFORMED_LENGTH_PAIRS {
-        let raw = RawIe {
-            ie_type: IE_TYPE_NODE_IDENTIFIER,
-            instance: 0,
-            spare: 0,
-            value,
-        };
-        let error = TypedIe::decode_from_raw(raw, procedure_context(), 0, 0)
-            .expect_err(&format!("{label} must be detected"));
-        assert!(
-            matches!(error.code(), DecodeErrorCode::Truncated),
-            "{label} produced {:?} rather than Truncated",
-            error.code()
-        );
-        assert_eq!(
-            error.offset(),
-            *expected_offset,
-            "{label} reported the wrong absolute offset"
-        );
-        assert_eq!(
-            error.spec_ref(),
-            Some(&SpecRef::new("3gpp", "TS29274", "8.2")),
-            "{label} dropped the spec reference"
-        );
+        for instance in 0u8..16 {
+            let raw = RawIe {
+                ie_type: IE_TYPE_NODE_IDENTIFIER,
+                instance,
+                spare: 0,
+                value,
+            };
+            let error = TypedIe::decode_from_raw(raw, procedure_context(), 0, 0)
+                .expect_err(&format!("{label} must be detected"));
+            assert!(
+                matches!(error.code(), DecodeErrorCode::Truncated),
+                "{label} produced {:?} rather than Truncated",
+                error.code()
+            );
+            assert_eq!(
+                error.offset(),
+                *expected_offset,
+                "{label} reported the wrong absolute offset"
+            );
+            assert_eq!(
+                error.spec_ref(),
+                Some(&SpecRef::new("3gpp", "TS29274", "8.2")),
+                "{label} dropped the spec reference"
+            );
+
+            // "together with the type and instance of the offending IE".
+            assert_eq!(
+                error.offending_ie(),
+                Some((IE_TYPE_NODE_IDENTIFIER, instance)),
+                "{label} at instance {instance} did not name the offending IE"
+            );
+        }
     }
 }
 
@@ -343,7 +359,10 @@ fn node_identifier_value_decode_reports_the_malformed_length_pair() {
 /// destroy the "type and instance of the offending IE" the clause requires an
 /// error response to carry. They fail closed instead, and hand the caller
 /// exactly the identity the response needs. The clause 7.7.8 discard remains
-/// available where presence *is* resolved: `S2bMessage::decode`, pinned below.
+/// available where presence *is* resolved -- the S2b receive profile, which
+/// `S2bMessage::decode`, `S2bMessage::decode_with_diagnostics`, and
+/// `S2bMessage::from_message` all select -- and is pinned below on
+/// `S2bMessage::decode`.
 ///
 /// The IE framing is deliberately well formed and only the clause 8.107
 /// subfield length pair is inconsistent. A TLIV whose declared Length overruns
