@@ -161,17 +161,31 @@ pub enum EncodeErrorCode {
 #[error("{code} at offset {offset}")]
 pub struct DecodeError {
     code: DecodeErrorCode,
-    offset: usize,
+    /// Stored as `u32` so that `offending_ie` occupies the four bytes this
+    /// field frees rather than growing the struct by a whole 8-byte alignment
+    /// unit. `DecodeError` is returned by every protocol crate in the
+    /// workspace, and at 112 bytes it pushes callers' error enums past
+    /// `clippy::result_large_err`; at 104 it does not. Byte offsets in the
+    /// protocols this type serves are bounded by 16- and 32-bit length fields,
+    /// so the range is never reached in practice, and `new` saturates rather
+    /// than wrapping so a pathological offset cannot report a small wrong one.
+    offset: u32,
     spec_ref: Option<SpecRef>,
     offending_ie: Option<(u8, u8)>,
 }
 
 impl DecodeError {
     /// Create a decode error at the given byte offset.
+    ///
+    /// Offsets at or above `u32::MAX` saturate; see the field comment.
     pub const fn new(code: DecodeErrorCode, offset: usize) -> Self {
         Self {
             code,
-            offset,
+            offset: if offset > u32::MAX as usize {
+                u32::MAX
+            } else {
+                offset as u32
+            },
             spec_ref: None,
             offending_ie: None,
         }
@@ -203,7 +217,7 @@ impl DecodeError {
 
     /// Byte offset in the input where parsing failed.
     pub const fn offset(&self) -> usize {
-        self.offset
+        self.offset as usize
     }
 
     /// Optional specification reference.

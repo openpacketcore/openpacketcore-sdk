@@ -145,3 +145,34 @@ fn decode_error_debug_does_not_contain_payload() {
     assert!(dbg.contains("Truncated"));
     assert!(dbg.contains("offset: 5"));
 }
+
+/// `DecodeError` is returned by every protocol crate in this workspace, so its
+/// size is a cross-crate contract: growing it pushes callers' error enums past
+/// `clippy::result_large_err` and breaks unrelated crates. Adding
+/// `offending_ie` did exactly that until `offset` was narrowed to `u32` to pay
+/// for it. Pin the size so the next field addition fails here, in the crate
+/// that owns the type, rather than as a lint in a crate that merely uses it.
+#[test]
+fn decode_error_size_is_pinned() {
+    assert_eq!(
+        core::mem::size_of::<DecodeError>(),
+        104,
+        "DecodeError changed size; see the `offset` field comment before \
+         adjusting this number -- growing it breaks opc-proto-pfcp and others"
+    );
+}
+
+/// `offset` is stored as `u32`. The protocols this type serves bound offsets
+/// by 16- and 32-bit length fields, so the range is unreachable in practice,
+/// but a saturating conversion means a pathological value reports the maximum
+/// rather than silently wrapping to a small, wrong offset.
+#[test]
+#[cfg(target_pointer_width = "64")]
+fn decode_error_offset_saturates_instead_of_wrapping() {
+    let huge = u32::MAX as usize + 1;
+    let err = DecodeError::new(DecodeErrorCode::Truncated, huge);
+    assert_eq!(err.offset(), u32::MAX as usize);
+
+    let representable = DecodeError::new(DecodeErrorCode::Truncated, 4_294_967_294);
+    assert_eq!(representable.offset(), 4_294_967_294);
+}
