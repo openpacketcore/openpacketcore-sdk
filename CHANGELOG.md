@@ -366,8 +366,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   octets and must fail the message even where a discard is licensed.
 
   `TypedIe::decode_from_raw` already returned the value-level error and still
-  does; what changed there is that the error now names the IE it was handed in
-  `DecodeError::offending_ie`.
+  does; what changed there is that the error now carries an identity in
+  `DecodeError::offending_ie` -- the handed IE's own, or, under the
+  set-if-absent attachment described above, that of a grouped member that
+  named itself first.
 
   Supersedes, rather than edits, claims recorded above under
   "Node Identifier (IE 176) is typed on receive" that described the discard as
