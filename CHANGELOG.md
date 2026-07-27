@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`DecodeError::offending_ie` — `opc-protocol`:** a decode failure can now
+  carry the type and instance of the element it is attributed to, set by
+  `DecodeError::with_offending_ie`. 3GPP TS 29.274 requires an "Invalid length"
+  error response to name "the type and instance of the offending IE", and
+  until now nothing in a `DecodeError` could supply it, so
+  `Gtpv2cOffendingIe` had to be invented by the caller. GTPv2-C typed sequence
+  decoding annotates every value-level failure, at the top level and inside
+  grouped IEs; the attachment is set-if-absent, so the innermost element that
+  actually offended is the one named rather than its container. Additive and
+  non-breaking: the field is private, `DecodeError::new` is the only
+  constructor, and it defaults to `None`. It stores identity only — a type
+  octet and a four-bit instance, both already in the clear on the wire — so
+  the type's "never stores raw packet bytes" logging guarantee is unchanged.
 - **First-owner activation for destination-scoped steering — `opc-ipsec-lb`:**
   in `HostXdpFenceDomain::PerOwnershipKey` the only public owner-map writer was
   the fenced re-pin coordinator, and a re-pin cannot be formed for a fresh SA --
@@ -296,6 +309,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     fixture, so no message that already round-tripped moves on the wire.
 
 ### Fixed
+- **The profile-less typed IE sequence decoders fail closed on a malformed IE
+  value -- `opc-proto-gtpv2c` (BREAKING to `decode_typed_ie_sequence` and
+  `TypedIe::decode_sequence`):** both hardcoded the TS 29.274 clause 7.7.8
+  discard for IE 176 (Node Identifier). Neither takes a procedure, a direction,
+  or a message type, so neither can establish the IE's Table 7.2.x-1
+  *presence* -- and presence is the condition both clauses attach the discard
+  to. Clause 7.7.7, quoted in `crates/opc-proto-gtpv2c/CONFORMANCE.md`, is
+  explicit that the IE "shall be discarded and if the IE was received as a
+  Mandatory IE or a verifiable Conditional IE in a Request message, an
+  appropriate error response with Cause IE value set to "Invalid length"
+  together with the type and instance of the offending IE shall be returned to
+  the sender." Hardcoding one profile's presence judgement into a profile-less
+  exported API silently elided a peer-controlled IE from an SDK consumer's
+  typed view while destroying the very identity the clause requires a response
+  to carry. Both now return the value-level error instead.
+
+  BREAKING: a malformed IE 176 that previously vanished from the sequence
+  returned by `decode_typed_ie_sequence` or `TypedIe::decode_sequence` now
+  surfaces as `Err`. No signature changed, so nothing downstream fails to
+  compile -- this note is the only signal callers get. Callers that want the
+  clause 7.7.8 discard must decode through `S2bMessage::decode`, which selects
+  `S2bDecodePurpose::Receive` and has resolved the procedure and direction the
+  rule depends on. The S2b production path is untouched: `s2b.rs` already
+  passed `MalformedOptionalIePolicy` explicitly at all three of its sequence
+  entry points, and the whole S2b test suite passes unchanged.
+
+  This is a deliberate fail-closed step and not a presence-keyed rule: keying
+  the disposition on presence would need a procedure and direction these
+  signatures do not carry, and is left to separate work.
+
+  The `LengthOverflow` carve-out is unchanged and now has its own guard:
+  `IeDecodePolicy::discards_malformed` still admits only
+  `DecodeErrorCode::Truncated` and `InvalidLength`, because `LengthOverflow`
+  reports the offset arithmetic guarding the decode rather than the received
+  octets and must fail the message even where a discard is licensed.
+
+  Supersedes, rather than edits, the claim recorded above under
+  "Node Identifier (IE 176) is typed on receive" that the discard is "uniform
+  across the decode surface ... at every validation level": as of this entry
+  that uniformity is scoped to the S2b receive profile, and the axis that
+  selects the discard is the decode entry point, not the validation level.
 - **P-CSCF Re-selection support is no longer emittable on its own --
   `opc-proto-gtpv2c` (breaking to `PcoRequest`):** TS 24.008 10.5.6.3 says of
   container `0x0012` that "This PCO parameter may be present only if a

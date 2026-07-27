@@ -149,6 +149,8 @@ pub enum EncodeErrorCode {
 ///
 /// `DecodeError` never stores raw packet bytes. The `offset` field is a
 /// byte position, not a slice, so accidental payload leakage is impossible.
+/// `offending_ie` is an element *identity* -- a type octet and a four-bit
+/// instance, both already in the clear on the wire -- never element content.
 ///
 /// # Note on field visibility
 ///
@@ -161,6 +163,7 @@ pub struct DecodeError {
     code: DecodeErrorCode,
     offset: usize,
     spec_ref: Option<SpecRef>,
+    offending_ie: Option<(u8, u8)>,
 }
 
 impl DecodeError {
@@ -170,12 +173,26 @@ impl DecodeError {
             code,
             offset,
             spec_ref: None,
+            offending_ie: None,
         }
     }
 
     /// Attach a specification reference for evidence traceability.
     pub const fn with_spec_ref(mut self, spec_ref: SpecRef) -> Self {
         self.spec_ref = Some(spec_ref);
+        self
+    }
+
+    /// Attach the offending element's type and instance, if none is attached.
+    ///
+    /// Set-if-absent rather than overwrite, because an error propagates
+    /// outward: a grouped element's member annotates first, and the innermost
+    /// element is the one that actually offended.
+    #[must_use]
+    pub const fn with_offending_ie(mut self, ie_type: u8, instance: u8) -> Self {
+        if self.offending_ie.is_none() {
+            self.offending_ie = Some((ie_type, instance));
+        }
         self
     }
 
@@ -192,6 +209,17 @@ impl DecodeError {
     /// Optional specification reference.
     pub const fn spec_ref(&self) -> Option<&SpecRef> {
         self.spec_ref.as_ref()
+    }
+
+    /// Type and instance of the element the failure was attributed to.
+    ///
+    /// `None` when the decoder that produced the error resolved no single
+    /// offending element, which is the case for framing and envelope errors.
+    /// Protocols whose error responses must name the offending element -- 3GPP
+    /// TS 29.274 requires an "Invalid length" response to carry "the type and
+    /// instance of the offending IE" -- read it from here.
+    pub const fn offending_ie(&self) -> Option<(u8, u8)> {
+        self.offending_ie
     }
 }
 

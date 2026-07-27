@@ -75,7 +75,11 @@ The error-response boundary is deliberately separate from full `Message` and
   and conditional IEs map to Causes 70 and 103; invalid mandatory/conditional
   IE length maps to Cause 67; semantically incorrect mandatory/conditional IEs
   map to Cause 69. IE failures encode only the standardized four-octet Type,
-  zero Length, and Instance identity in the Cause IE.
+  zero Length, and Instance identity in the Cause IE. The offending IE's type
+  and instance, which clause 7.7.7 requires an "Invalid length" response to
+  carry, are supplied by the decoder itself through `DecodeError::offending_ie`
+  rather than being reconstructed by the caller; `Gtpv2cOffendingIe::new`
+  validates the four-bit instance bound.
 - An unknown received non-zero session TEID is the only plan input that
   produces Context Not Found with header TEID zero. Applying that failure to a
   legitimate zero-TEID initial request is rejected as conflicting evidence.
@@ -434,8 +438,11 @@ coverage.
      validated `NodeIdentifier::new` constructor bounds each subfield to the
      255 octets its length field can express, so encoding is infallible and
      performs no truncating cast.
-   - A malformed Node Identifier is discarded, not rejected, per clauses 7.7.7
-     and 7.7.8. Both clauses split receiver behaviour on the IE's *presence*.
+   - On the S2b receive profile, a malformed Node Identifier is discarded, not
+     rejected, per clauses 7.7.7 and 7.7.8. Both clauses split receiver
+     behaviour on the IE's *presence*, which is why the disposition belongs to
+     a profile that has resolved a procedure and direction rather than to the
+     typed decoder as such.
      Clause 7.7.7 governs a length inconsistency in an Extendable IE: "If the
      received value of the Length field and the actual length of the extendable
      length IE are consistent, but the length is less than the number of fixed
@@ -464,16 +471,29 @@ coverage.
      states no such rule and this codec fails closed." Clauses 7.7.7 and 7.7.8
      do state such a rule and do name the receiver, so IE 176 belongs in the
      skip bucket and is in it.
-   - The discard is uniform across the decode surface. Typed decode dispatches
-     on IE type alone, so the disposition holds at every validation level
-     (`Structural`, `Strict`, `ProcedureAware`), in every message type this
-     crate models, at every instance 0-15, and nested inside a Bearer Context.
-     At `ProcedureAware` an instance other than 0 is discarded even earlier, by
-     the clause 7.7.9 receive filter, so both routes reach the same result.
-     `Strict` is not an opt-in stricter-than-TS-29.274 mode: it enforces "field
-     cardinality, enum ranges, and critical IE rules", and for an optional IE
-     clause 7.7.8 *is* the range rule and it says discard.
-   - Discard means the IE is absent from the typed view *and* from the clause
+   - The axis that selects the discard is the **decode entry point**, not the
+     validation level. Within `S2bMessage::decode` the discard is uniform: it
+     holds at every validation level (`Structural`, `Strict`,
+     `ProcedureAware`), in every message type this crate models, at every
+     instance 0-15, and nested inside a Bearer Context. At `ProcedureAware` an
+     instance other than 0 is discarded even earlier, by the clause 7.7.9
+     receive filter, so both routes reach the same result. `Strict` is not an
+     opt-in stricter-than-TS-29.274 mode: it enforces "field cardinality, enum
+     ranges, and critical IE rules", and for an optional IE clause 7.7.8 *is*
+     the range rule and it says discard.
+   - The profile-less decoders — `decode_typed_ie_sequence`,
+     `TypedIe::decode_sequence`, and `TypedIe::decode_from_raw` — **fail
+     closed** instead, at every validation level. They take no procedure, no
+     direction, and no message type, so they cannot establish the presence on
+     which both clauses condition the discard; and clause 7.7.7 owes the sender
+     an "Invalid length" response "together with the type and instance of the
+     offending IE", which a discard destroys. The error they return carries
+     that identity in `DecodeError::offending_ie`, so a caller has exactly what
+     the Cause IE needs. This is deliberately not presence-keyed: keying on
+     presence would require a procedure and direction these signatures do not
+     carry.
+   - On that profile, discard means the IE is absent from the typed view *and*
+     from the clause
      7.7.10 duplicate bookkeeping. "Treat the rest of the message as if this IE
      was absent" is a statement about the whole remaining decode, not only
      about the returned sequence: a discarded IE does not occupy its
@@ -499,14 +519,22 @@ coverage.
    - The received octets are untouched: the raw-preserving `Message` view and
      `EncodeContext { raw_preserving: true }` still reproduce the malformed IE
      byte-exact, which is now observable because the decode succeeds.
-   - The rule is a *receiver* rule and is applied as one. Both clauses open on
-     "the receiver of a GTP signalling message". The canonical builder's
-     sender-side self-check (`S2bDecodePurpose::CanonicalBuilder`) therefore
-     keeps rejecting: a caller-supplied raw IE 176 with a malformed value is a
-     build failure, because the octets are already in the message being built
-     and discarding the IE from the typed view would emit them anyway.
+   - The rule is a *profiled receiver* rule and is applied as one. Both clauses
+     open on "the receiver of a GTP signalling message". The canonical
+     builder's sender-side self-check (`S2bDecodePurpose::CanonicalBuilder`)
+     therefore keeps rejecting: a caller-supplied raw IE 176 with a malformed
+     value is a build failure, because the octets are already in the message
+     being built and discarding the IE from the typed view would emit them
+     anyway. Being a receiver is necessary but not sufficient: a receive-side
+     decoder that has not resolved presence also rejects, for the reasons
+     above, so `MalformedOptionalIePolicy::Reject` is selected on both sides of
+     the wire and its documentation describes the disposition rather than a
+     role.
    - Top-level and grouped typed IE sequences enforce
-     `DecodeContext::duplicate_ie_policy` by IE type and instance.
+     `DecodeContext::duplicate_ie_policy` by IE type and instance. Duplicate
+     detection runs *before* the value decode, so a repeat at a key that
+     already holds a retained IE is resolved on its key alone under every
+     entry point, whether or not its value would have been discarded.
    - Unsupported/private/future IEs outside the typed subset are omitted,
      retained as byte-exact `TypedIeValue::Raw`, or rejected at top-level and
      grouped sequence boundaries according to `UnknownIePolicy`.

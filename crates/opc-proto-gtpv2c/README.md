@@ -32,8 +32,9 @@ control-plane stack.
   Server Identifier. Its validated `NodeIdentifier::new` bounds each subfield
   to the 255 octets its one-octet length field can express, so encoding is
   infallible; decode detects a subfield length that overruns the IE value, and
-  `Debug` reports only subfield lengths. Because Table 7.2.1-1 gives the IE
-  presence O, such a value is discarded and the rest of the message is
+  `Debug` reports only subfield lengths. Under `S2bMessage::decode`, which
+  resolves the procedure and direction and therefore knows Table 7.2.1-1 gives
+  the IE presence O, such a value is discarded and the rest of the message is
   processed as if the IE were absent, per TS 29.274 clauses 7.7.7 and 7.7.8 —
   absent from the duplicate bookkeeping too, so a malformed IE cannot suppress
   a well-formed one at the same instance or be reported as a repeat; the
@@ -52,7 +53,11 @@ control-plane stack.
   the typed view, `Preserve` retains byte-exact `TypedIeValue::Raw` entries,
   and `Reject` fails with `UnknownCriticalIe`. `TypedIe::decode_from_raw`
   necessarily returns one value, so callers needing omission use the sequence
-  API.
+  API. `decode_typed_ie_sequence` and `TypedIe::decode_sequence` resolve no
+  procedure or direction, so they **fail closed** on a malformed typed IE
+  value and report the offending IE's type and instance in
+  `DecodeError::offending_ie`; the clause 7.7.8 discard described above is
+  reached only through `S2bMessage::decode`.
 - `Message<'a>` and `OwnedMessage` provide the raw borrowed/owned message
   shells and implement the shared `opc-protocol` codec traits.
 - `inspect_gtpv2c_request` and `Gtpv2cErrorResponsePlanner` form a separate

@@ -159,16 +159,36 @@ type IeRepeatableLimit<'f> = &'f dyn Fn(u8, u8, usize, Option<(u8, u8)>) -> Opti
 /// the Cause to return.
 const DISCARD_MALFORMED_OPTIONAL_IE_TYPES: &[u8] = &[IE_TYPE_NODE_IDENTIFIER];
 
-/// Whether a decode applies the TS 29.274 clause 7.7.8 receiver rule.
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// Whether a decode applies the TS 29.274 clause 7.7.8 receiver-profile
+/// discard to a malformed optional IE.
+///
+/// This is a property of the caller's *profile*, not merely of its side of the
+/// wire. Both clauses condition the discard on the IE's presence, which is a
+/// Table 7.2.x-1 fact about one procedure and one direction; a decoder that
+/// has not resolved those cannot claim it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum MalformedOptionalIePolicy {
-    /// Receiver profile: discard a malformed optional IE and keep processing.
+    /// S2b receive profile: discard a malformed optional IE and keep
+    /// processing. Selected only by `S2bDecodePurpose::Receive`, which has
+    /// resolved a procedure and a direction and therefore knows the IE's
+    /// Table 7.2.x-1 presence.
     Discard,
-    /// Sender self-validation: a malformed IE the crate is about to put on the
-    /// wire is a build failure. Clauses 7.7.7 and 7.7.8 bind "the receiver of
-    /// a GTP signalling message"; they license nothing on the send path, and
-    /// silently dropping a caller-supplied IE from a message that still
-    /// carries its bytes would emit exactly what clause 8.107 forbids.
+    /// Fail the decode. Two kinds of caller select it, on opposite sides of
+    /// the wire and for different reasons, which is why this documents the
+    /// disposition rather than a single role:
+    ///
+    /// * The canonical builder's sender self-check
+    ///   (`S2bDecodePurpose::CanonicalBuilder`). Clauses 7.7.7 and 7.7.8 bind
+    ///   "the receiver of a GTP signalling message"; they license nothing on
+    ///   the send path, and silently dropping a caller-supplied IE from a
+    ///   message that still carries its bytes would emit exactly what clause
+    ///   8.107 forbids.
+    /// * Every profile-less path: `decode_typed_ie_sequence`,
+    ///   `TypedIe::decode_sequence`, and `TypedIe::decode_from_raw`. They
+    ///   resolve no procedure and no direction, so the presence the discard is
+    ///   conditioned on is not established, and clause 7.7.7 requires the
+    ///   offending IE's type and instance be returned to the sender -- which a
+    ///   discard throws away.
     Reject,
 }
 
@@ -3810,15 +3830,23 @@ impl<'a> TypedIe<'a> {
     /// Unknown IEs are omitted, retained as [`TypedIeValue::Raw`], or rejected
     /// according to [`DecodeContext::unknown_ie_policy`].
     ///
-    /// This sequence decoder also applies the TS 29.274 clause 7.7.8 receiver
-    /// rule: a *known* IE whose value cannot be interpreted, and which this
-    /// crate classifies as optional where it receives it, is silently absent
-    /// from the returned sequence instead of failing the decode. Node
-    /// Identifier (IE 176) is currently the only such type. Callers that must
-    /// observe the malformed octets should decode with
-    /// [`RawIeIterator`] or re-encode raw-preserving, both of which still see
-    /// them; callers that need the value-level error should use
-    /// [`Self::decode_from_raw`], which reports it.
+    /// This sequence decoder **fails closed** on a *known* IE whose value
+    /// cannot be interpreted: the decode returns the value-level error rather
+    /// than omitting the IE, and [`DecodeError::offending_ie`] carries that
+    /// IE's type and instance.
+    ///
+    /// It does not apply the TS 29.274 clause 7.7.8 discard. That rule is
+    /// conditioned on the IE's presence, a Table 7.2.x-1 fact about one
+    /// procedure and one direction, and this function resolves neither -- so
+    /// the condition cannot be established here. Clause 7.7.7 additionally
+    /// owes the sender an "Invalid length" response naming the offending IE's
+    /// type and instance, which a discard destroys.
+    ///
+    /// Callers that want the clause 7.7.8 discard should decode through
+    /// [`S2bMessage::decode`](crate::S2bMessage::decode), which resolves a
+    /// procedure and direction and selects the S2b receive profile. Callers
+    /// that must observe the malformed octets can use [`RawIeIterator`] or
+    /// re-encode raw-preserving; both still see them.
     pub fn decode_sequence(input: &'a [u8], ctx: DecodeContext) -> Result<Vec<Self>, DecodeError> {
         decode_typed_ie_sequence(input, ctx, 0)
     }
@@ -3829,13 +3857,18 @@ impl<'a> TypedIe<'a> {
     /// header within the containing input. It is used so that value-level decode
     /// errors report offsets relative to the message rather than to the IE value.
     ///
-    /// This single-result conversion cannot represent deliberate omission.
-    /// Consequently, an unsupported IE is returned as [`TypedIeValue::Raw`]
-    /// under both [`UnknownIePolicy::Drop`] and [`UnknownIePolicy::Preserve`],
-    /// and a malformed optional IE is returned as an error rather than as the
-    /// TS 29.274 clause 7.7.8 discard. Use [`Self::decode_sequence`] or
-    /// [`decode_typed_ie_sequence`] when the complete three-way unknown-IE
-    /// policy, or the clause 7.7.8 discard, must be enforced.
+    /// This single-result conversion cannot represent deliberate omission, so
+    /// an unsupported IE is returned as [`TypedIeValue::Raw`] under both
+    /// [`UnknownIePolicy::Drop`] and [`UnknownIePolicy::Preserve`]. Use
+    /// [`Self::decode_sequence`] or [`decode_typed_ie_sequence`] when the
+    /// complete three-way unknown-IE policy must be enforced.
+    ///
+    /// A malformed IE value is returned as an error, which is the same
+    /// disposition the sequence decoders reach and for the same reason: this
+    /// function resolves no procedure or direction, so it cannot establish the
+    /// presence the TS 29.274 clause 7.7.8 discard is conditioned on. The
+    /// discard is applied by
+    /// [`S2bMessage::decode`](crate::S2bMessage::decode) alone.
     pub fn decode_from_raw(
         raw: RawIe<'a>,
         ctx: DecodeContext,
@@ -4203,9 +4236,25 @@ pub fn encode_typed_ie_sequence(
 /// typed sequence; callers that retain the enclosing raw message bytes can
 /// still perform a separate raw-preserving re-encode.
 ///
-/// This is a receive-side helper, so it applies TS 29.274 clause 7.7.8: an
-/// optional IE whose value is malformed is discarded and the remaining IEs are
-/// returned as if that IE had been absent.
+/// This decoder **fails closed** on a malformed IE value, and the returned
+/// [`DecodeError`] carries the offending IE's type and instance in
+/// [`DecodeError::offending_ie`].
+///
+/// It does not apply the TS 29.274 clause 7.7.8 discard. Both clauses that
+/// license a discard condition it on the IE's *presence*, which is a Table
+/// 7.2.x-1 fact about one procedure and one direction. This function resolves
+/// no procedure, no direction, and no message type, so it cannot establish
+/// that presence -- and clause 7.7.7 owes the sender an "Invalid length"
+/// response "together with the type and instance of the offending IE", which a
+/// discard destroys. Failing closed is therefore the only disposition this
+/// entry point can justify, and it hands the caller exactly the identity such
+/// a response needs. This is deliberately not presence-keyed: resolving
+/// presence here would require a procedure and direction the signature does
+/// not carry.
+///
+/// The clause 7.7.8 discard is applied where presence *is* resolved:
+/// [`S2bMessage::decode`](crate::S2bMessage::decode), which selects the S2b
+/// receive profile.
 ///
 /// @spec 3GPP TS29274 R18 8.2
 /// @req REQ-3GPP-TS29274-R18-S2B-IE-004
@@ -4219,7 +4268,7 @@ pub fn decode_typed_ie_sequence<'a>(
         input,
         ctx,
         IeSequencePosition::root(depth),
-        IeDecodePolicy::legacy(false, MalformedOptionalIePolicy::Discard),
+        IeDecodePolicy::legacy(false, MalformedOptionalIePolicy::Reject),
         &mut duplicate_evidence,
     )
 }
@@ -4405,6 +4454,7 @@ fn decode_typed_ie_sequence_at<'a>(
                 }
 
                 let ie_type = raw.ie_type;
+                let ie_instance = raw.instance;
                 let typed = match TypedIe::decode_from_raw_with_evidence(
                     raw,
                     ctx,
@@ -4434,7 +4484,15 @@ fn decode_typed_ie_sequence_at<'a>(
                     // longer be resynchronised, and only the types clauses
                     // 7.7.7/7.7.8 put in the optional bucket are eligible.
                     Err(error) if policy.discards_malformed(ie_type, &error) => continue,
-                    Err(error) => return Err(error),
+                    // A value decode that is not discarded fails the sequence,
+                    // and clause 7.7.7 requires the "Invalid length" response
+                    // it may become to carry "the type and instance of the
+                    // offending IE". Attach them here, where both are known.
+                    // `with_offending_ie` is set-if-absent, so a grouped IE's
+                    // member -- annotated by its own nested run of this loop --
+                    // keeps naming the innermost element that actually
+                    // offended rather than being overwritten by its container.
+                    Err(error) => return Err(error.with_offending_ie(ie_type, ie_instance)),
                 };
                 // Recorded only for an IE that survived its value decode, so a
                 // clause 7.7.8 discard leaves the key free for a later
@@ -4551,6 +4609,79 @@ fn legacy_repeatable_limit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `discards_malformed` is the single gate on the clause 7.7.8 discard, and
+    /// `LengthOverflow` is deliberately outside it: it reports the offset
+    /// arithmetic guarding the decode, not a statement about the received
+    /// octets, so it must fail the message even for an IE whose profile would
+    /// otherwise discard it.
+    ///
+    /// Pinned as a unit test because `LengthOverflow` is raised only by
+    /// `checked_add_offset`, which needs a base offset within four of
+    /// `usize::MAX` -- unreachable from any input a public decoder can be
+    /// handed, so no integration test can reach this branch.
+    ///
+    /// This is a mutation guard rather than a regression repro: it is green
+    /// both before and after the profile-less decoders began failing closed.
+    /// Its red-first proof is adding `DecodeErrorCode::LengthOverflow` to the
+    /// `matches!` in `discards_malformed`, which turns the first row below red.
+    /// The `Truncated`/`InvalidLength` rows bound the guard from the other
+    /// side: without them the test would also pass on a decoder that had
+    /// stopped discarding anything at all.
+    #[test]
+    fn length_overflow_is_never_discarded_under_any_malformed_optional_policy() {
+        let cases: &[(MalformedOptionalIePolicy, DecodeErrorCode, bool)] = &[
+            // The guard under test: fatal even where the discard is licensed.
+            (
+                MalformedOptionalIePolicy::Discard,
+                DecodeErrorCode::LengthOverflow,
+                false,
+            ),
+            // The two codes the clause 8.107 value decoder actually raises.
+            (
+                MalformedOptionalIePolicy::Discard,
+                DecodeErrorCode::Truncated,
+                true,
+            ),
+            (
+                MalformedOptionalIePolicy::Discard,
+                DecodeErrorCode::InvalidLength { reason: "test" },
+                true,
+            ),
+            // Reject discards nothing, whatever the code.
+            (
+                MalformedOptionalIePolicy::Reject,
+                DecodeErrorCode::LengthOverflow,
+                false,
+            ),
+            (
+                MalformedOptionalIePolicy::Reject,
+                DecodeErrorCode::Truncated,
+                false,
+            ),
+            (
+                MalformedOptionalIePolicy::Reject,
+                DecodeErrorCode::InvalidLength { reason: "test" },
+                false,
+            ),
+        ];
+
+        for (malformed_optional, code, expected) in cases {
+            let policy = IeDecodePolicy::legacy(false, *malformed_optional);
+            let error = DecodeError::new(code.clone(), 0);
+            assert_eq!(
+                policy.discards_malformed(IE_TYPE_NODE_IDENTIFIER, &error),
+                *expected,
+                "{code:?} under {malformed_optional:?}"
+            );
+            // Membership is the other conjunct: a type outside the discard
+            // list is never discarded, so the guard cannot widen by accident.
+            assert!(
+                !policy.discards_malformed(IE_TYPE_CAUSE, &error),
+                "{code:?} under {malformed_optional:?} discarded a non-member IE type"
+            );
+        }
+    }
 
     fn arp() -> AllocationRetentionPriority {
         let Ok(value) = AllocationRetentionPriority::new(3, true, true) else {

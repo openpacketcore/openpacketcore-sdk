@@ -7,14 +7,15 @@ use bytes::BytesMut;
 use opc_proto_gtpv2c::{
     decode_header, decode_typed_ie_sequence, s2b_create_session_request,
     s2b_delete_session_request, s2b_delete_session_response, s2b_ue_ipsec_tunnel_update_request,
-    AccessPointName, BearerContext, CauseValue, EpsBearerId, FullyQualifiedTeid, IpAddress,
-    Message, NodeIdentifier, NodeIdentifierError, PdnAddressAllocation, PlmnId, RatType,
-    RatTypeValue, RawIe, S2bCreateSessionContext, S2bCreateSessionIdentity,
-    S2bCreateSessionRequest, S2bDeleteSessionContext, S2bDeleteSessionRequest,
-    S2bDeleteSessionResponse, S2bMessage, S2bUeEndpoint, S2bUeIpsecTunnelUpdateEndpoint,
-    S2bUeIpsecTunnelUpdateRequest, SelectionMode, SelectionModeValue, ServingNetwork, TbcdDigits,
-    TypedIe, TypedIeValue, IE_TYPE_F_TEID, IE_TYPE_IMSI, IE_TYPE_NODE_IDENTIFIER,
-    INTERFACE_TYPE_S2B_EPDG_GTP_C, MAX_NODE_IDENTIFIER_FIELD_LEN,
+    AccessPointName, BearerContext, CauseValue, EpsBearerId, FullyQualifiedTeid, Gtpv2cOffendingIe,
+    Gtpv2cProtocolErrorKind, IpAddress, Message, NodeIdentifier, NodeIdentifierError,
+    PdnAddressAllocation, PlmnId, RatType, RatTypeValue, RawIe, S2bCreateSessionContext,
+    S2bCreateSessionIdentity, S2bCreateSessionRequest, S2bDeleteSessionContext,
+    S2bDeleteSessionRequest, S2bDeleteSessionResponse, S2bMessage, S2bUeEndpoint,
+    S2bUeIpsecTunnelUpdateEndpoint, S2bUeIpsecTunnelUpdateRequest, SelectionMode,
+    SelectionModeValue, ServingNetwork, TbcdDigits, TypedIe, TypedIeValue, IE_TYPE_F_TEID,
+    IE_TYPE_IMSI, IE_TYPE_NODE_IDENTIFIER, INTERFACE_TYPE_S2B_EPDG_GTP_C,
+    MAX_NODE_IDENTIFIER_FIELD_LEN,
 };
 use opc_protocol::{
     BorrowDecode, DecodeContext, DecodeErrorCode, DuplicateIePolicy, Encode, EncodeContext,
@@ -325,34 +326,147 @@ fn node_identifier_value_decode_reports_the_malformed_length_pair() {
     }
 }
 
+/// The profile-less sequence decoders fail closed on a malformed IE 176.
+///
+/// Both TS 29.274 clauses that license a discard condition it on the IE's
+/// *presence*, which is a Table 7.2.x-1 fact about one procedure and one
+/// direction. Clause 7.7.7, quoted in this crate's `CONFORMANCE.md`, is
+/// explicit: the IE "shall be discarded and if the IE was received as a
+/// Mandatory IE or a verifiable Conditional IE in a Request message, an
+/// appropriate error response with Cause IE value set to "Invalid length"
+/// together with the type and instance of the offending IE shall be returned
+/// to the sender." Clause 7.7.8 states the optional half.
+///
+/// `decode_typed_ie_sequence` and `TypedIe::decode_sequence` resolve no
+/// procedure, no direction, and no message type. They therefore cannot
+/// establish the presence the discard is conditioned on, and a discard would
+/// destroy the "type and instance of the offending IE" the clause requires an
+/// error response to carry. They fail closed instead, and hand the caller
+/// exactly the identity the response needs. The clause 7.7.8 discard remains
+/// available where presence *is* resolved: `S2bMessage::decode`, pinned below.
+///
+/// The IE framing is deliberately well formed and only the clause 8.107
+/// subfield length pair is inconsistent. A TLIV whose declared Length overruns
+/// the buffer fails in the raw iterator, which already fails closed, and would
+/// not exercise this path at all.
+#[test]
+fn a_malformed_node_identifier_fails_the_profile_less_sequence_decode() {
+    let follower = node_identifier_ie(1, b"aaa", b"org");
+
+    for (label, value, expected_offset) in MALFORMED_LENGTH_PAIRS {
+        for instance in 0u8..16 {
+            let mut wire = raw_ie(instance, value);
+            wire.extend_from_slice(&follower);
+
+            for (surface, decoded) in [
+                (
+                    "decode_typed_ie_sequence",
+                    decode_typed_ie_sequence(&wire, procedure_context(), 0),
+                ),
+                (
+                    "TypedIe::decode_sequence",
+                    TypedIe::decode_sequence(&wire, procedure_context()),
+                ),
+            ] {
+                let error = match decoded {
+                    Ok(ies) => panic!(
+                        "{surface} discarded {label} at instance {instance}, returning {ies:?}, \
+                         instead of failing closed"
+                    ),
+                    Err(error) => error,
+                };
+
+                // The two codes the clause 8.107 value decoder raises. Both
+                // are the "Invalid length" disposition clause 7.7.7 names.
+                assert!(
+                    matches!(
+                        error.code(),
+                        DecodeErrorCode::Truncated | DecodeErrorCode::InvalidLength { .. }
+                    ),
+                    "{surface}: {label} at instance {instance} produced {:?}",
+                    error.code()
+                );
+                assert_eq!(
+                    error.offset(),
+                    *expected_offset,
+                    "{surface}: {label} at instance {instance} reported the wrong offset"
+                );
+                assert_eq!(
+                    error.spec_ref(),
+                    Some(&SpecRef::new("3gpp", "TS29274", "8.2")),
+                    "{surface}: {label} at instance {instance} dropped the spec reference"
+                );
+
+                // "together with the type and instance of the offending IE".
+                assert_eq!(
+                    error.offending_ie(),
+                    Some((IE_TYPE_NODE_IDENTIFIER, instance)),
+                    "{surface}: {label} at instance {instance} did not name the offending IE"
+                );
+
+                // The identity is sufficient to build the response the clause
+                // names, using only public API. That is the whole point of
+                // failing closed rather than discarding: a discard leaves the
+                // caller nothing to put in the Cause IE.
+                let (ie_type, offending_instance) =
+                    error.offending_ie().expect("offending IE identity");
+                let offending = Gtpv2cOffendingIe::new(ie_type, offending_instance)
+                    .expect("a four-bit instance is a valid offending-IE identity");
+                assert_eq!(
+                    Gtpv2cProtocolErrorKind::InvalidIeLength(offending).cause(),
+                    CauseValue::InvalidLength
+                );
+            }
+        }
+    }
+}
+
 /// TS 29.274 clause 7.7.8: "The receiver of a GTP signalling message including
 /// an optional information element with a Value that is not in the range
 /// defined for this information element value shall discard this IE, but shall
 /// treat the rest of the message as if this IE was absent and continue
 /// processing." Node Identifier is presence O on its only row in this profile,
-/// so every malformed length pair is discarded from the typed sequence rather
-/// than failing it. The IE that follows must still decode: "the rest of the
-/// message" is the half of the requirement a bare `is_ok()` would miss.
+/// so every malformed length pair is discarded rather than failing the message.
+///
+/// The discard is pinned on `S2bMessage::decode`, the surface that resolves a
+/// procedure and direction and therefore knows the Table 7.2.1-1 presence the
+/// clause conditions the discard on. The profile-less sequence decoders cannot
+/// establish that presence and fail closed instead, which is pinned above.
+///
+/// This is the *shape* axis of the discard evidence -- every entry in
+/// `MALFORMED_LENGTH_PAIRS`, at the one instance Table 7.2.1-1 lists. The
+/// *instance* axis, all sixteen of them for one shape, is pinned separately by
+/// `a_malformed_node_identifier_is_discarded_and_the_rest_of_the_request_decodes`.
+///
+/// "The rest of the message" is the half of the requirement a bare `is_ok()`
+/// would miss, so the projection is compared against the pristine fixture
+/// rather than merely checked for the absence of IE 176.
 #[test]
-fn a_malformed_node_identifier_is_discarded_from_the_typed_sequence() {
-    let follower = node_identifier_ie(1, b"aaa", b"org");
-    let expected_follower = TypedIe {
-        instance: 1,
-        value: TypedIeValue::NodeIdentifier(
-            NodeIdentifier::new(b"aaa".to_vec(), b"org".to_vec()).expect("follower constructs"),
-        ),
-    };
-
-    for (label, value, _) in MALFORMED_LENGTH_PAIRS {
-        let mut wire = raw_ie(0, value);
-        wire.extend_from_slice(&follower);
-        let decoded = decode_typed_ie_sequence(&wire, procedure_context(), 0)
-            .unwrap_or_else(|error| panic!("{label} must be discarded, not rejected: {error:?}"));
-        assert_eq!(
-            decoded,
-            vec![expected_follower.clone()],
-            "{label} did not leave exactly the following IE behind"
+fn every_malformed_length_pair_is_discarded_on_the_s2b_receive_path() {
+    for level in TYPED_LEVELS {
+        let pristine = typed_ies(CREATE_SESSION_REQUEST_FIXTURE, *level, "the bare fixture");
+        assert!(
+            pristine.len() >= 10,
+            "{level:?} baseline projection is too small to be evidence: {}",
+            pristine.len()
         );
+
+        for (label, value, _) in MALFORMED_LENGTH_PAIRS {
+            // Spliced ahead of every fixture IE, so a discard that also
+            // abandoned the remaining sequence would lose all of them.
+            let message = with_leading_ie(CREATE_SESSION_REQUEST_FIXTURE, &raw_ie(0, value));
+            let decoded = typed_ies(&message, *level, label);
+            assert!(
+                !decoded
+                    .iter()
+                    .any(|ie| ie.ie_type() == IE_TYPE_NODE_IDENTIFIER),
+                "{level:?} surfaced {label}"
+            );
+            assert_eq!(
+                decoded, pristine,
+                "{level:?} did not process the rest of the message as if {label} was absent"
+            );
+        }
     }
 }
 
@@ -391,49 +505,38 @@ fn duplicate_policy_context(policy: DuplicateIePolicy, level: ValidationLevel) -
 /// `DuplicateIePolicy::Reject` is the decisive case: it is what
 /// `DecodeContext::conservative()`, documented as "conservative defaults
 /// suitable for untrusted network input", selects.
+///
+/// Driven through `S2bMessage::decode`, which is where the clause 7.7.8
+/// discard lives now that the profile-less decoders fail closed. At
+/// `ProcedureAware` the S2b receive path selects `DuplicateIePolicy::First`
+/// itself, as clause 7.7.10 is a receiver rule; at `Structural` and `Strict`
+/// the caller's policy is the one in force. The assertion is the same under
+/// all of them: the genuine Node Identifier survives.
 #[test]
 fn a_discarded_node_identifier_does_not_occupy_its_duplicate_slot() {
-    let expected = TypedIe {
-        instance: 0,
-        value: TypedIeValue::NodeIdentifier(
-            NodeIdentifier::new(b"aaa".to_vec(), b"org".to_vec()).expect("follower constructs"),
-        ),
-    };
+    let carrier = built_create_session_request();
 
     for (label, value, _) in MALFORMED_LENGTH_PAIRS {
-        let mut wire = raw_ie(0, value);
-        wire.extend_from_slice(&node_identifier_ie(0, b"aaa", b"org"));
+        // Malformed first, genuine second, both at instance 0: the only key
+        // where a spliced IE can collide with a real one.
+        let mut injected = raw_ie(0, value);
+        injected.extend_from_slice(&node_identifier_ie(0, b"aaa", b"org"));
+        let message = with_leading_ie(&carrier, &injected);
 
         for policy in DUPLICATE_POLICIES {
             for level in TYPED_LEVELS {
+                let what = format!("{label} under {policy:?}/{level:?}");
                 let decoded =
-                    decode_typed_ie_sequence(&wire, duplicate_policy_context(*policy, *level), 0)
-                        .unwrap_or_else(|error| {
-                            panic!(
-                            "{label} under {policy:?}/{level:?} must be discarded, not counted as \
-                             a duplicate: {error:?}"
-                        )
-                        });
-                assert_eq!(
-                    decoded,
-                    vec![expected.clone()],
-                    "{label} under {policy:?}/{level:?} did not leave exactly the well-formed \
-                     Node Identifier behind"
-                );
+                    typed_ies_with(&message, duplicate_policy_context(*policy, *level), &what);
+                assert_surviving_node_identifier(&decoded, &what);
             }
         }
 
         // The documented untrusted-input preset, asserted by name rather than
         // by reconstructing its fields, so a change to the preset is caught.
-        let decoded = decode_typed_ie_sequence(&wire, DecodeContext::conservative(), 0)
-            .unwrap_or_else(|error| {
-                panic!("{label} must be discarded under conservative(): {error:?}")
-            });
-        assert_eq!(
-            decoded,
-            vec![expected.clone()],
-            "{label} under conservative()"
-        );
+        let what = format!("{label} under conservative()");
+        let decoded = typed_ies_with(&message, DecodeContext::conservative(), &what);
+        assert_surviving_node_identifier(&decoded, &what);
     }
 }
 
@@ -445,22 +548,32 @@ fn a_discarded_node_identifier_does_not_occupy_its_duplicate_slot() {
 #[test]
 fn repeated_malformed_node_identifiers_at_one_key_are_all_discarded() {
     for (label, value, _) in MALFORMED_LENGTH_PAIRS {
-        let mut wire = raw_ie(0, value);
-        wire.extend_from_slice(&raw_ie(0, value));
-        wire.extend_from_slice(&raw_ie(0, value));
+        let mut injected = raw_ie(0, value);
+        injected.extend_from_slice(&raw_ie(0, value));
+        injected.extend_from_slice(&raw_ie(0, value));
+        let message = with_leading_ie(CREATE_SESSION_REQUEST_FIXTURE, &injected);
+        let pristine = typed_ies(
+            CREATE_SESSION_REQUEST_FIXTURE,
+            ValidationLevel::Strict,
+            "the bare fixture",
+        );
 
         for policy in DUPLICATE_POLICIES {
-            let decoded = decode_typed_ie_sequence(
-                &wire,
+            let what = format!("three copies of {label} under {policy:?}");
+            let decoded = typed_ies_with(
+                &message,
                 duplicate_policy_context(*policy, ValidationLevel::Strict),
-                0,
-            )
-            .unwrap_or_else(|error| {
-                panic!("three copies of {label} under {policy:?} must not fail: {error:?}")
-            });
+                &what,
+            );
             assert!(
-                decoded.is_empty(),
-                "{policy:?} retained something from three malformed IEs: {decoded:?}"
+                !decoded
+                    .iter()
+                    .any(|ie| ie.ie_type() == IE_TYPE_NODE_IDENTIFIER),
+                "{what}: retained a Node Identifier from three malformed IEs"
+            );
+            assert_eq!(
+                decoded, pristine,
+                "{what}: did not process the rest of the message as if all three were absent"
             );
         }
     }
@@ -470,35 +583,30 @@ fn repeated_malformed_node_identifiers_at_one_key_are_all_discarded() {
 /// a later one at the same key is a genuine clause 7.7.10 repeat and the
 /// caller's duplicate policy governs it -- clause 7.7.8 discards the malformed
 /// IE from the typed view, it does not erase the retained one's slot. This
-/// pins that the fix above did not turn every duplicate into a silent drop.
+/// pins that the discard did not turn every duplicate into a silent drop.
+///
+/// Duplicate detection runs *before* the value decode, so under `Reject` the
+/// repeat fails the message on its key alone and the malformed value is never
+/// reached. That is why this case still reports `DuplicateIe` rather than the
+/// value-level error, on this path and on the profile-less one alike.
 #[test]
 fn a_retained_node_identifier_still_makes_a_later_one_a_duplicate() {
-    let mut wire = node_identifier_ie(0, b"aaa", b"org");
-    wire.extend_from_slice(&raw_ie(0, &[0x09, b'a']));
-    let retained = TypedIe {
-        instance: 0,
-        value: TypedIeValue::NodeIdentifier(
-            NodeIdentifier::new(b"aaa".to_vec(), b"org".to_vec()).expect("first constructs"),
-        ),
-    };
-
+    let mut injected = node_identifier_ie(0, b"aaa", b"org");
+    injected.extend_from_slice(&raw_ie(0, &[0x09, b'a']));
+    let message = with_leading_ie(CREATE_SESSION_REQUEST_FIXTURE, &injected);
     let strict = ValidationLevel::Strict;
-    let rejected = decode_typed_ie_sequence(
-        &wire,
+
+    let rejected = S2bMessage::decode(
+        &message,
         duplicate_policy_context(DuplicateIePolicy::Reject, strict),
-        0,
     )
     .expect_err("a second occurrence at a retained key is a clause 7.7.10 repeat");
     assert_eq!(*rejected.code(), DecodeErrorCode::DuplicateIe);
 
     for policy in [DuplicateIePolicy::First, DuplicateIePolicy::Last] {
-        let decoded = decode_typed_ie_sequence(&wire, duplicate_policy_context(policy, strict), 0)
-            .unwrap_or_else(|error| panic!("{policy:?} must resolve the repeat: {error:?}"));
-        assert_eq!(
-            decoded,
-            vec![retained.clone()],
-            "{policy:?} did not keep the interpretable occurrence"
-        );
+        let what = format!("the repeat under {policy:?}");
+        let decoded = typed_ies_with(&message, duplicate_policy_context(policy, strict), &what);
+        assert_surviving_node_identifier(&decoded, &what);
     }
 }
 
@@ -527,13 +635,58 @@ fn level_context(level: ValidationLevel) -> DecodeContext {
 }
 
 fn typed_ies<'a>(message: &'a [u8], level: ValidationLevel, what: &str) -> Vec<TypedIe<'a>> {
-    let (_, decoded) = S2bMessage::decode(message, level_context(level))
-        .unwrap_or_else(|error| panic!("{level:?} rejected {what}: {error:?}"));
+    typed_ies_with(message, level_context(level), what)
+}
+
+/// The same S2b receive projection under a caller-supplied context, for the
+/// tests whose axis is `DecodeContext` rather than the validation level.
+fn typed_ies_with<'a>(message: &'a [u8], ctx: DecodeContext, what: &str) -> Vec<TypedIe<'a>> {
+    let (_, decoded) = S2bMessage::decode(message, ctx)
+        .unwrap_or_else(|error| panic!("the S2b receive path rejected {what}: {error:?}"));
     decoded
         .as_view()
-        .unwrap_or_else(|| panic!("{level:?} produced no typed view for {what}"))
+        .unwrap_or_else(|| panic!("no typed view for {what}"))
         .ies
         .clone()
+}
+
+/// A Create Session Request carrying only IEs this crate types.
+///
+/// The committed fixture deliberately includes a private IE that
+/// `UnknownIePolicy::Reject` -- and therefore `DecodeContext::conservative()`
+/// -- fails on for reasons that have nothing to do with clause 7.7.8. Building
+/// the carrier from the crate's own builder keeps those two presets on the
+/// axis actually under test.
+fn built_create_session_request() -> Vec<u8> {
+    let built =
+        s2b_create_session_request(create_session_request()).expect("the built request is valid");
+    let mut encoded = BytesMut::new();
+    built
+        .encode(&mut encoded, EncodeContext::default())
+        .expect("built request encodes");
+    encoded.to_vec()
+}
+
+/// Exactly one Node Identifier survived, and it is the interpretable one.
+///
+/// Asserted by value rather than by count alone: a decoder that surfaced the
+/// malformed occupant instead of the genuine IE would satisfy a bare count.
+fn assert_surviving_node_identifier(ies: &[TypedIe<'_>], what: &str) {
+    let found: Vec<&TypedIe<'_>> = ies
+        .iter()
+        .filter(|ie| ie.ie_type() == IE_TYPE_NODE_IDENTIFIER)
+        .collect();
+    assert_eq!(
+        found.len(),
+        1,
+        "{what}: the genuine Node Identifier did not survive alone, got {found:?}"
+    );
+    assert_eq!(found[0].instance, 0, "{what}: wrong instance survived");
+    let TypedIeValue::NodeIdentifier(value) = &found[0].value else {
+        panic!("{what}: the surviving Node Identifier is not typed");
+    };
+    assert_eq!(value.name(), b"aaa", "{what}: wrong Node Name survived");
+    assert_eq!(value.realm(), b"org", "{what}: wrong Node Realm survived");
 }
 
 /// TS 29.274 clause 7.7.8, on an optional IE with an out-of-range Value: the
@@ -780,19 +933,19 @@ fn a_discarded_node_identifier_neither_suppresses_nor_fabricates_evidence() {
 /// `UnknownIePolicy` is a separate axis from clause 7.7.8. A malformed IE 176
 /// is a *known* IE with an out-of-range value, not an unknown IE, so `Reject`
 /// -- documented as rejecting "messages containing unknown IEs" -- must not
-/// turn the clause 7.7.8 discard back into a failure. The sequence is built
-/// from known IEs only, so the sole thing any policy could object to is the
-/// malformed Node Identifier itself.
+/// turn the clause 7.7.8 discard back into a failure.
+///
+/// The genuine Node Identifier is spliced in alongside the malformed one so
+/// each policy has a retained IE to be judged on. The carrier is built rather
+/// than the committed fixture, because that fixture carries a private IE which
+/// `Reject` fails on for reasons unrelated to clause 7.7.8 -- that would test
+/// the carrier, not the rule.
 #[test]
 fn a_malformed_node_identifier_is_discarded_under_every_unknown_ie_policy() {
-    let mut wire = raw_ie(0, &[0x09, b'a']);
-    wire.extend_from_slice(&node_identifier_ie(1, b"aaa", b"org"));
-    let expected = TypedIe {
-        instance: 1,
-        value: TypedIeValue::NodeIdentifier(
-            NodeIdentifier::new(b"aaa".to_vec(), b"org".to_vec()).expect("follower constructs"),
-        ),
-    };
+    let carrier = built_create_session_request();
+    let mut injected = raw_ie(0, &[0x09, b'a']);
+    injected.extend_from_slice(&node_identifier_ie(0, b"aaa", b"org"));
+    let message = with_leading_ie(&carrier, &injected);
 
     for policy in [
         UnknownIePolicy::Drop,
@@ -803,12 +956,19 @@ fn a_malformed_node_identifier_is_discarded_under_every_unknown_ie_policy() {
             unknown_ie_policy: policy,
             ..DecodeContext::default()
         };
-        let decoded = decode_typed_ie_sequence(&wire, ctx, 0)
-            .unwrap_or_else(|error| panic!("{policy:?} rejected a discardable IE: {error:?}"));
+        let what = format!("a malformed Node Identifier under {policy:?}");
+        let decoded = typed_ies_with(&message, ctx, &what);
+        assert_surviving_node_identifier(&decoded, &what);
+
+        let pristine = typed_ies_with(&carrier, ctx, "the bare carrier");
+        let without_node_identifier: Vec<TypedIe<'_>> = decoded
+            .iter()
+            .filter(|ie| ie.ie_type() != IE_TYPE_NODE_IDENTIFIER)
+            .cloned()
+            .collect();
         assert_eq!(
-            decoded,
-            vec![expected.clone()],
-            "{policy:?} did not discard exactly the malformed Node Identifier"
+            without_node_identifier, pristine,
+            "{what}: the rest of the message was not processed as if it was absent"
         );
     }
 }
@@ -1057,9 +1217,15 @@ fn other_s2b_procedures_discard_node_identifier_as_known_unexpected() {
 }
 
 /// Structural decode is not procedure aware, so it types the IE wherever it
-/// appears. This pins that the typed decoder, not the receive grammar, is what
-/// applies clause 7.7.8: a well-formed value surfaces, a malformed one is
-/// discarded, and the surrounding sequence is unchanged in both directions.
+/// appears: a well-formed value surfaces even at an instance the S2b receive
+/// grammar does not list.
+///
+/// The malformed half pins the other side of the same fact. Because this path
+/// is not procedure aware it has resolved no presence, so it does not apply
+/// the clause 7.7.8 discard -- it fails closed and names the offending IE.
+/// The validation level is not the axis that decides this; the entry point is.
+/// `S2bMessage::decode` discards at `Structural` too, which is pinned by
+/// `every_malformed_length_pair_is_discarded_on_the_s2b_receive_path`.
 #[test]
 fn structural_decode_types_node_identifier_outside_the_receive_grammar() {
     let (_, bare) = Message::decode(DELETE_SESSION_REQUEST_FIXTURE, structural_context())
@@ -1085,11 +1251,31 @@ fn structural_decode_types_node_identifier_outside_the_receive_grammar() {
     let malformed = with_extra_ie(DELETE_SESSION_REQUEST_FIXTURE, &raw_ie(4, &[0x09, b'a']));
     let (_, decoded) =
         Message::decode(&malformed, structural_context()).expect("structural decode succeeds");
-    let typed = decode_typed_ie_sequence(decoded.raw_ies, structural_context(), 0)
-        .expect("a malformed Node Identifier is discarded at Structural, not rejected");
+    let error = decode_typed_ie_sequence(decoded.raw_ies, structural_context(), 0).expect_err(
+        "the profile-less decoder cannot establish presence and must fail closed at Structural",
+    );
+    assert!(
+        matches!(
+            error.code(),
+            DecodeErrorCode::Truncated | DecodeErrorCode::InvalidLength { .. }
+        ),
+        "unexpected code {:?}",
+        error.code()
+    );
     assert_eq!(
-        typed, baseline,
-        "Structural must process the rest of the sequence as if the IE was absent"
+        error.offending_ie(),
+        Some((IE_TYPE_NODE_IDENTIFIER, 4)),
+        "the failure did not name the offending IE and instance"
+    );
+
+    // The well-formed baseline is still what the same path returns without the
+    // malformed IE, so the failure above is attributable to that IE alone.
+    let (_, pristine) = Message::decode(DELETE_SESSION_REQUEST_FIXTURE, structural_context())
+        .expect("structural decode succeeds");
+    assert_eq!(
+        decode_typed_ie_sequence(pristine.raw_ies, structural_context(), 0)
+            .expect("the unmodified fixture still decodes"),
+        baseline
     );
 }
 
