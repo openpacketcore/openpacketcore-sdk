@@ -33,8 +33,28 @@
 //!
 //! Raw Linux netlink and socket syscalls stay in [`opc_linux_gtpu_sys`]; this
 //! crate is safe Rust and never performs `unsafe` operations.
+//!
+//! # Platform
+//!
+//! This crate is Linux-only: it raises a `compile_error!` for any `target_os`
+//! other than `"linux"`. Its Linux and eBPF adapters are built on the Linux
+//! `gtp` netdevice, GTP generic netlink, and tc/clsact eBPF interfaces.
 
 #![forbid(unsafe_code)]
+
+// The Linux-only contract is enforced by construction rather than only
+// documented. No CI job in this repository builds any crate for a non-Linux
+// target, so a prose-only statement of this contract would never be
+// re-checked. It regressed that way once already: 0662d729 (#425) added an
+// ungated call to `reassembly::linux_reassembly_bounds`, which is
+// `#[cfg(target_os = "linux")]`.
+#[cfg(not(target_os = "linux"))]
+compile_error!(
+    "opc-gtpu-dataplane supports `target_os = \"linux\"` only. Its Linux and \
+     eBPF adapters are built on the Linux `gtp` netdevice, GTP generic \
+     netlink, and tc/clsact eBPF interfaces. Build this crate for a Linux \
+     target."
+);
 
 pub mod backend;
 pub mod ebpf;

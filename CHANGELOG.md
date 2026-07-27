@@ -99,6 +99,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per-deployment salt.
 
 ### Changed
+- **`opc-gtpu-dataplane` is declared Linux-only and enforces it at compile
+  time:** the crate's Linux-only nature was an implicit contract that no build
+  re-checked, and `0662d729` (#425) broke non-Linux compilation without turning
+  any gate red — it added an ungated call to
+  `reassembly::linux_reassembly_bounds`, which is `#[cfg(target_os = "linux")]`.
+  `src/lib.rs` now carries an unconditional
+  `#[cfg(not(target_os = "linux"))] compile_error!`, so a non-Linux build now
+  reports the contract by name; the pre-existing `E0425` about the
+  configured-out item is still emitted alongside it. Non-Linux compilation is
+  deliberately not restored: the Linux and eBPF adapters are built on the Linux
+  `gtp` netdevice, GTP generic netlink, and tc/clsact eBPF interfaces, and no
+  CI job in this repository builds any crate for a non-Linux target, so a
+  documentation-only statement of the contract would be as unenforced as the
+  implicit one it replaced. `[package.metadata.docs.rs]` pins `default-target`
+  and `targets` to `x86_64-unknown-linux-gnu` in the same change so a
+  documentation build lands on a target where the crate compiles. No public
+  Rust item was added, removed, or changed: `UnsupportedGtpuDataplaneBackend`,
+  `GtpuBackendKind::Unsupported`, `GtpuProbe::unsupported`, and
+  `GtpuError::UnsupportedPlatform` are untouched and keep their runtime
+  meanings, which are not operating-system checks —
+  `LinuxGtpuDataplaneBackend` raises `UnsupportedPlatform` on a running Linux
+  kernel when a netlink socket open returns `io::ErrorKind::Unsupported` or
+  when the `gtp` generic-netlink family lookup returns `NotFound`, and its
+  `probe` still derives `GtpuProbe::platform_supported` from those live socket
+  opens rather than from a `cfg`. The per-item `#[cfg(target_os = "linux")]`
+  gates in `src/` and the `[target.'cfg(target_os = "linux")']` dependency
+  tables are left unchanged; the crate README records that they are now
+  redundant with the `compile_error!` and are not a claim of non-Linux
+  support.
 - **`RePinAuditEvent` carries a correlation digest, not the live transition
   secret — `opc-ipsec-lb` (breaking: `transition_id: OwnershipTransitionId` is
   replaced by `correlation_id: RePinAuditCorrelationId`):** the coordinator

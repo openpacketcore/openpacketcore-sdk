@@ -6,12 +6,21 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "Safe Linux GTP-U dataplane backend model, mock backend, and redaction-safe errors for OpenPacketCore"
+description = "Linux-only safe GTP-U dataplane backend model, mock backend, and redaction-safe errors for OpenPacketCore"
 readme = "README.md"
 documentation = "https://docs.rs/opc-gtpu-dataplane"
 keywords = ["5g", "gtpu", "gtp", "linux", "packet-core"]
 categories = ["network-programming", "os::linux-apis"]
 publish = false
+
+# This crate is Linux-only: `src/lib.rs` raises a `compile_error!` for any
+# `target_os` other than "linux", so a documentation build has to target Linux
+# to compile at all. `publish = false` above means docs.rs does not build this
+# crate today; the pin is recorded here so the constraint travels with the
+# manifest rather than being rediscovered if that ever changes.
+[package.metadata.docs.rs]
+default-target = "x86_64-unknown-linux-gnu"
+targets = ["x86_64-unknown-linux-gnu"]
 
 [dependencies]
 opc-linux-gtpu-sys = { path = "../opc-linux-gtpu-sys", version = "0.2.0" }

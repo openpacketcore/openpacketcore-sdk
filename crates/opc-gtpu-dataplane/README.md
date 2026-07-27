@@ -27,7 +27,7 @@ route steering, XFRM policy, deployment defaults, or traffic-readiness policy.
 - `MockGtpuDataplaneBackend`: deterministic in-memory backend with operation
   capture and failure injection.
 - `UnsupportedGtpuDataplaneBackend`: reports unsupported-platform results while
-  preserving trait-object usage on non-Linux or disabled builds.
+  preserving trait-object usage on disabled builds.
 - Model exports include `CreateGtpDeviceRequest`, `GtpDevice`,
   `GtpPdpContext`, `GtpBearerMark`, `RemovePdpContextRequest`, `Teid`,
   `GtpuProbe`, `GtpuBackendKind`, `GtpuCapability`,
@@ -1190,6 +1190,19 @@ offload support.
 
 ## Status And Limits
 
+- **This crate is Linux-only.** `src/lib.rs` raises a `compile_error!` for any
+  `target_os` other than `"linux"`, so a non-Linux build fails with that
+  message rather than compiling. This is a declared contract, not an
+  incidental limitation: no CI job in this repository builds any crate for a
+  non-Linux target, so nothing would re-check a documentation-only statement of
+  it. The contract had previously been implicit, and 0662d729 (#425) broke
+  non-Linux compilation without turning any gate red.
+  `[package.metadata.docs.rs]` pins the doc target to
+  `x86_64-unknown-linux-gnu` for the same reason.
+- The per-item `#[cfg(target_os = "linux")]` gates still present in `src/`, and
+  the `[target.'cfg(target_os = "linux")']` dependency tables in `Cargo.toml`,
+  are redundant with that `compile_error!` and are retained unchanged. Do not
+  read them as a claim of non-Linux support.
 - This is an unpublished workspace crate (`publish = false`).
 - The userspace crate forbids `unsafe`; raw kernel UAPI work is isolated in
   `opc-linux-gtpu-sys`, while verifier-bound packet/map/helper access and the
