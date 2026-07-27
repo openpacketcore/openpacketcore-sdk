@@ -43,9 +43,7 @@
 #![forbid(unsafe_code)]
 
 // The Linux-only contract is enforced by construction rather than only
-// documented. No CI job in this repository builds any crate for a non-Linux
-// target, so a prose-only statement of this contract would never be
-// re-checked. It regressed that way once already: 0662d729 (#425) added an
+// documented. It regressed that way once already: 0662d729 (#425) added an
 // ungated call to `reassembly::linux_reassembly_bounds`, which is
 // `#[cfg(target_os = "linux")]`.
 #[cfg(not(target_os = "linux"))]

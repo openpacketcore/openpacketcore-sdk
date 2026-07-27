@@ -109,12 +109,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reports the contract by name; the pre-existing `E0425` about the
   configured-out item is still emitted alongside it. Non-Linux compilation is
   deliberately not restored: the Linux and eBPF adapters are built on the Linux
-  `gtp` netdevice, GTP generic netlink, and tc/clsact eBPF interfaces, and no
-  CI job in this repository builds any crate for a non-Linux target, so a
-  documentation-only statement of the contract would be as unenforced as the
-  implicit one it replaced. `[package.metadata.docs.rs]` pins `default-target`
-  and `targets` to `x86_64-unknown-linux-gnu` in the same change so a
-  documentation build lands on a target where the crate compiles. No public
+  `gtp` netdevice, GTP generic netlink, and tc/clsact eBPF interfaces.
+  `[package.metadata.docs.rs]` pins `default-target` and `targets` to
+  `x86_64-unknown-linux-gnu` in the same change so a documentation build lands
+  on a target where the crate compiles. No public
   Rust item was added, removed, or changed: `UnsupportedGtpuDataplaneBackend`,
   `GtpuBackendKind::Unsupported`, `GtpuProbe::unsupported`, and
   `GtpuError::UnsupportedPlatform` are untouched and keep their runtime

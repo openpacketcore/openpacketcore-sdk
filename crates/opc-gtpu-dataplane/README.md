@@ -1193,10 +1193,8 @@ offload support.
 - **This crate is Linux-only.** `src/lib.rs` raises a `compile_error!` for any
   `target_os` other than `"linux"`, so a non-Linux build fails with that
   message rather than compiling. This is a declared contract, not an
-  incidental limitation: no CI job in this repository builds any crate for a
-  non-Linux target, so nothing would re-check a documentation-only statement of
-  it. The contract had previously been implicit, and 0662d729 (#425) broke
-  non-Linux compilation without turning any gate red.
+  incidental limitation: the contract had previously been implicit, and
+  0662d729 (#425) broke non-Linux compilation without turning any gate red.
   `[package.metadata.docs.rs]` pins the doc target to
   `x86_64-unknown-linux-gnu` for the same reason.
 - The per-item `#[cfg(target_os = "linux")]` gates still present in `src/`, and
