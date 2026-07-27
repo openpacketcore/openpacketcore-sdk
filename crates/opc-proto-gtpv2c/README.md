@@ -56,11 +56,10 @@ control-plane stack.
   API. `decode_typed_ie_sequence`, `TypedIe::decode_sequence`, and
   `TypedIe::decode_from_raw` resolve no procedure or direction, so they **fail
   closed** on a malformed typed IE value and report the offending IE's type and
-  instance in `DecodeError::offending_ie`; for a grouped IE that identity names
-  the member that failed rather than its container. The clause 7.7.8 discard
-  described above belongs to the S2b receive profile, which
-  `S2bMessage::decode`, `S2bMessage::decode_with_diagnostics`, and
-  `S2bMessage::from_message` all select.
+  instance in `DecodeError::offending_ie`. The clause 7.7.8 discard described
+  above belongs to the S2b receive profile, which `S2bMessage::decode`,
+  `S2bMessage::decode_with_diagnostics`, and `S2bMessage::from_message` all
+  select.
 - `Message<'a>` and `OwnedMessage` provide the raw borrowed/owned message
   shells and implement the shared `opc-protocol` codec traits.
 - `inspect_gtpv2c_request` and `Gtpv2cErrorResponsePlanner` form a separate

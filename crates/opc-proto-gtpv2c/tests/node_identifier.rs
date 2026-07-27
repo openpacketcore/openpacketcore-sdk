@@ -293,8 +293,7 @@ const MALFORMED_LENGTH_PAIRS: &[(&str, &[u8], usize)] = &[
 ///
 /// The detection is pinned on `TypedIe::decode_from_raw`, the single-IE
 /// conversion whose documented contract is that it cannot represent a
-/// deliberate omission and therefore returns the error. It is also the surface
-/// the canonical builder's sender-side self-check runs on. The profile-less
+/// deliberate omission and therefore returns the error. The profile-less
 /// sequence decoders reach the same disposition on the same input and are
 /// pinned by `a_malformed_node_identifier_fails_the_profile_less_sequence_decode`
 /// below; the TS 29.274 clause 7.7.8 discard is pinned on the S2b receive

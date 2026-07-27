@@ -3876,11 +3876,7 @@ impl<'a> TypedIe<'a> {
     /// disposition the sequence decoders reach and for the same reason: this
     /// function resolves no procedure or direction, so it cannot establish the
     /// presence the TS 29.274 clause 7.7.8 discard is conditioned on. The
-    /// discard is applied by the S2b receive profile, which every entry point
-    /// that selects `S2bDecodePurpose::Receive` reaches:
-    /// [`S2bMessage::decode`](crate::S2bMessage::decode),
-    /// [`S2bMessage::decode_with_diagnostics`](crate::S2bMessage::decode_with_diagnostics),
-    /// and [`S2bMessage::from_message`](crate::S2bMessage::from_message).
+    /// discard is applied by the S2b receive profile.
     ///
     /// The returned error carries this IE's type and instance in
     /// [`DecodeError::offending_ie`], which clause 7.7.7 requires an "Invalid

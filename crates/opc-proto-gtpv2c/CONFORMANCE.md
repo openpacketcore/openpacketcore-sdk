@@ -79,10 +79,10 @@ The error-response boundary is deliberately separate from full `Message` and
   and instance, which clause 7.7.7 requires an "Invalid length" response to
   carry, are taken from a caller-supplied `Gtpv2cOffendingIe`; this boundary
   reads no `DecodeError`. `Gtpv2cOffendingIe::new` validates the four-bit
-  instance bound. A caller whose failure came from this crate's typed IE
-  decoders no longer has to reconstruct that identity from the wire: it can
-  read it off `DecodeError::offending_ie` and pass it in. Connecting the two is
-  the caller's step, not this boundary's.
+  instance bound. A caller whose failure came from a typed IE's own value
+  decode can read that identity off `DecodeError::offending_ie` rather than
+  reconstructing it from the wire. Connecting the two is the caller's step, not
+  this boundary's.
 - An unknown received non-zero session TEID is the only plan input that
   produces Context Not Found with header TEID zero. Applying that failure to a
   legitimate zero-TEID initial request is rejected as conflicting evidence.
@@ -494,16 +494,12 @@ coverage.
      direction, and no message type, so they cannot establish the presence on
      which both clauses condition the discard; and clause 7.7.7 owes the sender
      an "Invalid length" response "together with the type and instance of the
-     offending IE", which a discard destroys. The error each of the three
-     returns carries that identity in `DecodeError::offending_ie`, so a caller
-     has exactly what the Cause IE needs; for a grouped IE the identity names
-     the member that failed rather than its container, because the attachment
-     is set-if-absent and the innermost decode annotates first. Reading that
-     identity into a `Gtpv2cOffendingIe` is still the caller's step: the
-     error-response boundary above takes the identity from its caller and does
-     not itself inspect a `DecodeError`. This is deliberately not
-     presence-keyed: keying on presence would require a procedure and direction
-     these signatures do not carry.
+     offending IE", which a discard destroys. Reading that identity into a
+     `Gtpv2cOffendingIe` is still the caller's step: the error-response
+     boundary above takes the identity from its caller and does not itself
+     inspect a `DecodeError`. This is deliberately not presence-keyed: keying
+     on presence would require a procedure and direction these signatures do
+     not carry.
    - On the S2b receive profile, where the discard is applied at all, discard
      means the IE is absent from the typed view *and* from the clause 7.7.10
      duplicate bookkeeping. "Treat the rest of the message as if this IE was

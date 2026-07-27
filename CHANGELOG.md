@@ -217,24 +217,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     clause 7.3 S3/S10/S16 mobility tables, which this profile does not model,
     and Table 7.2.2-1 does not carry the IE at all -- so no rule was added
     "for symmetry".
-  - A malformed value is discarded and the rest of the message is processed,
-    per clauses 7.7.7 and 7.7.8. Two clauses govern, and both split receiver
-    behaviour on the IE's *presence*. Clause 7.7.7 covers the length case
-    directly: "If the received value of the Length field and the actual length
-    of the extendable length IE are consistent, but the length is less than the
-    number of fixed octets defined for that IE, preceding the extended
-    field(s), this shall be considered an error, IE shall be discarded and if
-    the IE was received as a Mandatory IE or a verifiable Conditional IE in a
-    Request message, an appropriate error response with Cause IE value set to
-    "Invalid length" together with the type and instance of the offending IE
-    shall be returned to the sender." Clause 7.7.8 covers the optional case: a
-    receiver "shall discard this IE, but shall treat the rest of the message as
-    if this IE was absent and continue processing", and "All semantically
-    incorrect optional information elements in a GTP signalling message shall
-    be treated as not present in the message." Table 7.2.1-1 gives IE 176
-    presence O, so the receiver rule is discard-and-continue, and the "Invalid
-    length" response clause 7.7.7 names is conditioned on the offending IE
-    being Mandatory or verifiable Conditional, which this one is not.
+  - On the S2b receive profile, a malformed value is discarded and the rest of
+    the message is processed, per clauses 7.7.7 and 7.7.8. Two clauses govern,
+    and both split receiver behaviour on the IE's *presence*. Clause 7.7.7
+    covers the length case directly: "If the received value of the Length field
+    and the actual length of the extendable length IE are consistent, but the
+    length is less than the number of fixed octets defined for that IE,
+    preceding the extended field(s), this shall be considered an error, IE
+    shall be discarded and if the IE was received as a Mandatory IE or a
+    verifiable Conditional IE in a Request message, an appropriate error
+    response with Cause IE value set to "Invalid length" together with the type
+    and instance of the offending IE shall be returned to the sender." Clause
+    7.7.8 covers the optional case: a receiver "shall discard this IE, but
+    shall treat the rest of the message as if this IE was absent and continue
+    processing", and "All semantically incorrect optional information elements
+    in a GTP signalling message shall be treated as not present in the
+    message." Table 7.2.1-1 gives IE 176 presence O, so the receiver rule is
+    discard-and-continue, and the "Invalid length" response clause 7.7.7 names
+    is conditioned on the offending IE being Mandatory or verifiable
+    Conditional, which this one is not.
     - This is what the crate's own written selection rule picks. `pco.rs`
       states that a container the specification explicitly tells the receiver
       to ignore is skipped rather than rejecting the whole value, "deliberately
@@ -352,9 +353,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `decode_typed_ie_sequence_at`, so an S2b value-level decode failure now
   carries the `offending_ie` identity added under `DecodeError::offending_ie`
   above, where it previously carried `None`. `DecodeError`'s `Display` is
-  unchanged, so a caller that logs the error or inspects `code`, `offset`, or
-  `spec_ref` sees no difference; a caller comparing whole `DecodeError` values
-  would.
+  unchanged.
 
   This is a deliberate fail-closed step and not a presence-keyed rule: keying
   the disposition on presence would need a procedure and direction these
@@ -368,14 +367,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   `TypedIe::decode_from_raw` already returned the value-level error and still
   does; what changed there is that the error now names the IE it was handed in
-  `DecodeError::offending_ie`, so all three profile-less surfaces supply the
-  clause 7.7.7 identity rather than two of them. For a grouped IE the
-  set-if-absent attachment keeps the failing member named, not the container.
+  `DecodeError::offending_ie`.
 
-  Supersedes, rather than edits, three claims recorded above under
-  "Node Identifier (IE 176) is typed on receive", each of which described the
-  discard as a property of the crate's decode surface rather than of one
-  receive profile:
+  Supersedes, rather than edits, claims recorded above under
+  "Node Identifier (IE 176) is typed on receive" that described the discard as
+  a property of the crate's decode surface rather than of one receive profile:
 
   - that the discard is "uniform across the decode surface ... at every
     validation level" -- as of this entry that uniformity is scoped to the S2b
