@@ -68,9 +68,27 @@ pub fn bind_udp_socket_with_destination_metadata(
 /// With [`UdpSocketOptions::bind_device`] set, the socket is created first and
 /// `SO_BINDTODEVICE` is applied before `bind(2)`, scoping the socket to that
 /// network device (for example a VRF) for the whole bind/receive/send
-/// lifecycle. This requires `CAP_NET_RAW` on Linux. On platforms without
-/// `SO_BINDTODEVICE` a configured device fails closed with
-/// [`io::ErrorKind::Unsupported`]; it is never silently ignored. With
+/// lifecycle.
+///
+/// Because the option is always applied to a socket this function has just
+/// created, `sk->sk_bound_dev_if` is still zero at that point, and Linux 5.7
+/// and later do not run the `CAP_NET_RAW` check on that path:
+/// `sock_bindtoindex_locked()` tests
+/// `sk->sk_bound_dev_if && !ns_capable(net->user_ns, CAP_NET_RAW)`, whose
+/// first conjunct is false for a fresh socket (relaxed by torvalds/linux
+/// `c427bfec18f2`, first released in v5.7). The supported deployment floor,
+/// RHEL 9.4 / `kernel-5.14.0-427.el9`, carries that relaxed form. Kernels
+/// before 5.7 tested `CAP_NET_RAW` unconditionally; from 5.7 on, a socket
+/// that is *already* device-bound -- one inherited through `ip vrf exec`, or
+/// received over a unix socket -- still needs `CAP_NET_RAW` in its network
+/// namespace to be re-bound or unbound, a path this function never takes
+/// because it never adopts a caller-supplied socket. This describes the
+/// kernel's own capability check in `net/core/sock.c` and nothing else; LSM
+/// (for example SELinux) and seccomp policy are out of scope. Android, which
+/// shares this code path, was not verified.
+///
+/// On platforms without `SO_BINDTODEVICE` a configured device fails closed
+/// with [`io::ErrorKind::Unsupported`]; it is never silently ignored. With
 /// `bind_device` unset this behaves exactly like
 /// [`bind_udp_socket_with_destination_metadata`].
 ///
@@ -693,8 +711,8 @@ mod platform {
         // probe inherits this socket's `SO_BINDTODEVICE` scope because a
         // VRF-local source is only bindable inside its VRF; probing the
         // default routing instance would misreport it as not local. A probe
-        // that cannot re-apply the device (for example after privileges were
-        // dropped post-bind) stays inconclusive.
+        // that cannot re-apply the device (for example ENODEV once the device
+        // is gone) stays inconclusive.
         local_source.set_port(0);
         let probe = match bind_device {
             Some(device) => bind_udp_socket_to_device(local_source, device).map(drop),
@@ -829,10 +847,13 @@ mod platform {
 
         #[test]
         fn source_bind_probe_with_unusable_device_is_inconclusive() {
-            // The device cannot be applied to the probe socket (missing
-            // device as root: ENODEV; without CAP_NET_RAW: EPERM). Neither
-            // is evidence about source locality, so the probe must stay
+            // The probe builds a fresh socket, so the device name is resolved
+            // by `sock_setbindtodevice()` before `sock_bindtoindex_locked()`
+            // and its CAP_NET_RAW gate are reached: a name with no device is
+            // ENODEV, not EPERM, whatever the caller's capabilities. ENODEV is
+            // not evidence about source locality, so the probe must stay
             // inconclusive instead of misreporting `udp_source_not_local`.
+            // Any other failure to apply the device is inconclusive too.
             assert_eq!(source_bind_probe(local_source(), Some("opc-nodev0")), None);
         }
     }
@@ -988,29 +1009,126 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[tokio::test]
-    async fn bind_device_missing_or_unprivileged_fails_closed() {
-        // `SO_BINDTODEVICE` needs CAP_NET_RAW: without it the kernel returns
-        // EPERM before it even looks the device up; with it a nonexistent
-        // device is ENODEV. Either way the bind must fail instead of silently
-        // falling back to the default routing instance.
+    async fn bind_device_missing_fails_closed() {
+        // `sock_setbindtodevice()` resolves the name with
+        // `dev_get_by_name_rcu()` and returns -ENODEV before it calls
+        // `sock_bindtoindex_locked()`, where the CAP_NET_RAW test lives. A
+        // name with no device is therefore ENODEV at every capability level,
+        // and the bind fails instead of silently falling back to the default
+        // routing instance. Verified in torvalds/linux v5.6, v5.7, v5.14 and
+        // v6.12 and in CentOS Stream 9 `kernel-5.14.0-427.el9`, all
+        // `net/core/sock.c`.
         let options = UdpSocketOptions::default().with_bind_device("opc-nodev0");
 
         let error =
             bind_udp_socket_with_destination_metadata_and_options(loopback_any_port(), &options)
                 .unwrap_err();
 
-        let raw = error.raw_os_error();
+        assert_eq!(
+            error.raw_os_error(),
+            Some(nix::libc::ENODEV),
+            "expected ENODEV from SO_BINDTODEVICE with an unknown device, got {error:?}"
+        );
+    }
+
+    /// Effective capability bitmask of this process, parsed from the `CapEff:`
+    /// line of `/proc/self/status`. `None` when the field is unreadable.
+    #[cfg(target_os = "linux")]
+    fn effective_capabilities() -> Option<u64> {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        let field = status
+            .lines()
+            .find_map(|line| line.strip_prefix("CapEff:"))?;
+        u64::from_str_radix(field.trim(), 16).ok()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn fresh_socket_bind_device_is_not_capability_gated() {
+        /// `CAP_NET_RAW` is capability 13, so bit 13 of a capability set.
+        const CAP_NET_RAW_BIT: u64 = 1 << 13;
+
+        // This constructor always applies `SO_BINDTODEVICE` to a socket it has
+        // just created, so `sk->sk_bound_dev_if` is zero and the
+        // `sk->sk_bound_dev_if && !ns_capable(net->user_ns, CAP_NET_RAW)` test
+        // in `sock_bindtoindex_locked()` short-circuits on Linux >= 5.7
+        // (`c427bfec18f2`); the RHEL 9.4 / `kernel-5.14.0-427.el9` floor
+        // carries that relaxed form. The effective set is reported on failure:
+        // when it holds no CAP_NET_RAW this run is a direct observation of the
+        // un-gated path, which is the ordinary case for an unprivileged test
+        // runner. On a pre-5.7 kernel without CAP_NET_RAW this fails with
+        // EPERM, which is the correct signal that the floor moved backwards.
+        let effective = effective_capabilities();
+        let options = UdpSocketOptions::default().with_bind_device("lo");
+
+        let error =
+            bind_udp_socket_with_destination_metadata_and_options(loopback_any_port(), &options)
+                .err();
+
         assert!(
-            raw == Some(nix::libc::EPERM) || raw == Some(nix::libc::ENODEV),
-            "expected EPERM or ENODEV from SO_BINDTODEVICE, got {error:?}"
+            error.is_none(),
+            "fresh-socket SO_BINDTODEVICE must not need CAP_NET_RAW on Linux >= 5.7 \
+             (CapEff {effective:x?}, CAP_NET_RAW held: {}): {error:?}",
+            effective.is_some_and(|caps| caps & CAP_NET_RAW_BIT != 0)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires a Linux >= 5.7 host with `lo` whose process does NOT hold CAP_NET_RAW \
+                in its network namespace (an ordinary unprivileged user; not root, and not a \
+                container running as root); run: cargo test -p opc-runtime --lib \
+                udp::tests::rebinding_an_already_device_bound_socket_needs_cap_net_raw \
+                -- --ignored"]
+    fn rebinding_an_already_device_bound_socket_needs_cap_net_raw() {
+        use std::ffi::OsString;
+
+        use nix::{
+            errno::Errno,
+            sys::socket::{
+                setsockopt, socket, sockopt::BindToDevice, AddressFamily, SockFlag, SockType,
+            },
+        };
+
+        // Pins the other half of the contract the rustdoc states. It exercises
+        // the kernel directly because this crate has no way to reach it: every
+        // device bind it performs is on a socket it just created.
+        let fd = socket(
+            AddressFamily::Inet,
+            SockType::Datagram,
+            SockFlag::SOCK_CLOEXEC,
+            None,
+        )
+        .expect("fresh datagram socket");
+
+        // `sk->sk_bound_dev_if` is zero here, so the capability test is
+        // short-circuited on Linux >= 5.7.
+        setsockopt(&fd, BindToDevice, &OsString::from("lo")).expect("fresh socket binds to lo");
+
+        // It is non-zero now, so the same call, and unbinding, are gated on
+        // `ns_capable(net->user_ns, CAP_NET_RAW)`. The predicate reads the
+        // socket's current state, not the requested index, so binding to the
+        // same device is refused just like binding to another one.
+        assert_eq!(
+            setsockopt(&fd, BindToDevice, &OsString::from("lo")),
+            Err(Errno::EPERM),
+            "re-binding an already device-bound socket must need CAP_NET_RAW"
+        );
+        assert_eq!(
+            setsockopt(&fd, BindToDevice, &OsString::new()),
+            Err(Errno::EPERM),
+            "unbinding an already device-bound socket must need CAP_NET_RAW"
         );
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[tokio::test]
-    #[ignore = "needs CAP_NET_RAW; run: sudo -E $(command -v cargo) test -p opc-runtime --lib \
-                udp::tests::bind_device_loopback_scopes_the_socket -- --ignored"]
     async fn bind_device_loopback_scopes_the_socket() {
+        // Runs unconditionally: it needs a usable loopback interface, which
+        // the non-ignored tests around it already require by binding
+        // 127.0.0.1, and the fresh-socket device bind is not capability gated
+        // on Linux >= 5.7 (see
+        // `fresh_socket_bind_device_is_not_capability_gated`).
         let options = UdpSocketOptions::default().with_bind_device("lo");
 
         let socket =

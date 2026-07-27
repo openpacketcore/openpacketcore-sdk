@@ -428,8 +428,22 @@ impl GtpuReassemblySocket {
     /// `SO_BINDTODEVICE` is set before `bind(2)`. The returned identity comes
     /// from positive interface-name lookup plus exact kernel socket-option
     /// readback; no caller-provided ifindex is accepted.
-    /// Setting `SO_BINDTODEVICE` requires the process to hold the applicable
-    /// Linux network capability (normally `CAP_NET_RAW`) in this namespace.
+    ///
+    /// `SO_BINDTODEVICE` is applied to a socket this constructor has just
+    /// created, so `sk->sk_bound_dev_if` is still zero and Linux 5.7 and later
+    /// do not run the `CAP_NET_RAW` check for it: `sock_bindtoindex_locked()`
+    /// in `net/core/sock.c` tests
+    /// `sk->sk_bound_dev_if && !ns_capable(net->user_ns, CAP_NET_RAW)`, whose
+    /// first conjunct is false on a fresh socket (relaxed by torvalds/linux
+    /// `c427bfec18f2`, first released in v5.7; the RHEL 9.4 /
+    /// `kernel-5.14.0-427.el9` deployment floor carries that relaxed form).
+    /// Kernels before 5.7 tested `CAP_NET_RAW` unconditionally, and from 5.7
+    /// on re-binding or unbinding a socket that is *already* device-bound
+    /// still requires it in that socket's network namespace -- a path this
+    /// constructor never takes, since it never adopts an existing socket. That
+    /// describes the kernel's own capability check in `net/core/sock.c` and
+    /// nothing else; LSM (for example SELinux) and seccomp policy are out of
+    /// scope.
     ///
     /// # Errors
     ///

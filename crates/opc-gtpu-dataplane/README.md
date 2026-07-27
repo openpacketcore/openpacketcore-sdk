@@ -686,8 +686,20 @@ Provenance comes from the kernel, not configuration:
 `GtpuReassemblySocket::bind` derives the positive ifindex from an interface
 name, applies `SO_BINDTODEVICE` before binding the concrete IPv4 S2b-U address
 on UDP/2152, enables `IP_PKTINFO`, and verifies exact kernel readback. It
-requires the applicable Linux capability (normally `CAP_NET_RAW`) in the
-network namespace. Each receive checks the sealed device/address identity
+applies `SO_BINDTODEVICE` to a socket it has just created, so
+`sk->sk_bound_dev_if` is still zero and Linux 5.7 and later do not run the
+`CAP_NET_RAW` check for it: `sock_bindtoindex_locked()` in `net/core/sock.c`
+tests `sk->sk_bound_dev_if && !ns_capable(net->user_ns, CAP_NET_RAW)`, whose
+first conjunct is false on a fresh socket (relaxed by torvalds/linux
+`c427bfec18f2`, first released in v5.7; the RHEL 9.4 /
+`kernel-5.14.0-427.el9` deployment floor carries that relaxed form). Kernels
+before 5.7 tested `CAP_NET_RAW` unconditionally, and from 5.7 on re-binding or
+unbinding a socket that is *already* device-bound still requires it in the
+socket's network namespace — a path `bind` never takes, since it never adopts
+an existing socket. That describes the kernel's own capability check in
+`net/core/sock.c` and nothing else; LSM (for example SELinux) and seccomp
+policy are out of scope.
+Each receive checks the sealed device/address identity
 both before and after blocking. A positive packet-info ifindex must match; a
 zero ifindex, which some kernels report after reassembly, is accepted only
 through that kernel-enforced sealed socket identity. Truncated payload/control

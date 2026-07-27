@@ -143,11 +143,30 @@ fn bind_in_vrf(bind: SocketAddr) -> io::Result<opc_runtime::UdpDestinationMetada
 
 The device option is default-off. When configured, the runtime validates the
 interface name, applies `SO_BINDTODEVICE` before `bind(2)`, and keeps the same
-scope for source-locality probes used by `send_to_from`. Linux requires
-`CAP_NET_RAW`; unsupported platforms return `io::ErrorKind::Unsupported`
-instead of silently binding in the default routing domain. The original
-`bind_udp_socket_with_destination_metadata` constructor remains unchanged in
-behavior and does not select a device.
+scope for source-locality probes used by `send_to_from`. Unsupported platforms
+return `io::ErrorKind::Unsupported` instead of silently binding in the default
+routing domain. The original `bind_udp_socket_with_destination_metadata`
+constructor remains unchanged in behavior and does not select a device.
+
+Both the listener and the probe apply the option to a socket they have just
+created, so `sk->sk_bound_dev_if` is still zero and Linux 5.7 and later do not
+run the `CAP_NET_RAW` check for it: `sock_bindtoindex_locked()` in
+`net/core/sock.c` tests
+`sk->sk_bound_dev_if && !ns_capable(net->user_ns, CAP_NET_RAW)`, and the first
+conjunct is false on a fresh socket. That relaxation is torvalds/linux
+`c427bfec18f2` ("net: core: enable SO_BINDTODEVICE for non-root users"), first
+released in v5.7, and the supported deployment floor — RHEL 9.4 /
+`kernel-5.14.0-427.el9` — carries it. Two cases still need `CAP_NET_RAW` in
+the socket's network namespace: kernels before 5.7, which tested it
+unconditionally, and, from 5.7 on, re-binding or unbinding a socket that is
+*already* device-bound (one inherited through `ip vrf exec`, or received over
+a unix socket). This crate never reaches the second case because it never
+adopts a caller-supplied socket. An unknown device name is `ENODEV` at every
+capability level, because `sock_setbindtodevice()` resolves the name before
+`sock_bindtoindex_locked()` is called. All of this describes the kernel's own
+capability check in `net/core/sock.c` and nothing else; LSM (for example
+SELinux) and seccomp policy are out of scope. Android, which shares the same
+code path in this crate, was not verified.
 
 ## Relationships
 
