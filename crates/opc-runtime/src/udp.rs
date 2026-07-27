@@ -70,22 +70,18 @@ pub fn bind_udp_socket_with_destination_metadata(
 /// network device (for example a VRF) for the whole bind/receive/send
 /// lifecycle.
 ///
-/// Because the option is always applied to a socket this function has just
-/// created, `sk->sk_bound_dev_if` is still zero at that point, and Linux 5.7
-/// and later do not run the `CAP_NET_RAW` check on that path:
-/// `sock_bindtoindex_locked()` tests
-/// `sk->sk_bound_dev_if && !ns_capable(net->user_ns, CAP_NET_RAW)`, whose
-/// first conjunct is false for a fresh socket (relaxed by torvalds/linux
-/// `c427bfec18f2`, first released in v5.7). The supported deployment floor,
-/// RHEL 9.4 / `kernel-5.14.0-427.el9`, carries that relaxed form. Kernels
-/// before 5.7 tested `CAP_NET_RAW` unconditionally; from 5.7 on, a socket
-/// that is *already* device-bound -- one inherited through `ip vrf exec`, or
-/// received over a unix socket -- still needs `CAP_NET_RAW` in its network
-/// namespace to be re-bound or unbound, a path this function never takes
-/// because it never adopts a caller-supplied socket. This describes the
-/// kernel's own capability check in `net/core/sock.c` and nothing else; LSM
-/// (for example SELinux) and seccomp policy are out of scope. Android, which
-/// shares this code path, was not verified.
+/// Linux 5.7 and later gate `SO_BINDTODEVICE` on the socket's current state:
+/// `net/core/sock.c` tests
+/// `sk->sk_bound_dev_if && !ns_capable(net->user_ns, CAP_NET_RAW)` (relaxed
+/// by torvalds/linux `c427bfec18f2`, first released in v5.7; kernels before
+/// 5.7 tested `CAP_NET_RAW` unconditionally). A socket that is already
+/// device-bound when this function applies the option therefore needs
+/// `CAP_NET_RAW` in its network namespace -- including under `ip vrf exec`,
+/// where per `c427bfec18f2` "the socket is bound to an interface at
+/// creation". This describes the kernel's own capability check in
+/// `net/core/sock.c` and nothing else; LSM (for example SELinux) and seccomp
+/// policy are out of scope. Android, which shares this code path, was not
+/// verified.
 ///
 /// On platforms without `SO_BINDTODEVICE` a configured device fails closed
 /// with [`io::ErrorKind::Unsupported`]; it is never silently ignored. With

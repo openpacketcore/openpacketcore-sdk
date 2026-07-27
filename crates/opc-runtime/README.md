@@ -148,25 +148,20 @@ return `io::ErrorKind::Unsupported` instead of silently binding in the default
 routing domain. The original `bind_udp_socket_with_destination_metadata`
 constructor remains unchanged in behavior and does not select a device.
 
-Both the listener and the probe apply the option to a socket they have just
-created, so `sk->sk_bound_dev_if` is still zero and Linux 5.7 and later do not
-run the `CAP_NET_RAW` check for it: `sock_bindtoindex_locked()` in
+Linux 5.7 and later gate `SO_BINDTODEVICE` on the socket's current state:
 `net/core/sock.c` tests
-`sk->sk_bound_dev_if && !ns_capable(net->user_ns, CAP_NET_RAW)`, and the first
-conjunct is false on a fresh socket. That relaxation is torvalds/linux
-`c427bfec18f2` ("net: core: enable SO_BINDTODEVICE for non-root users"), first
-released in v5.7, and the supported deployment floor — RHEL 9.4 /
-`kernel-5.14.0-427.el9` — carries it. Two cases still need `CAP_NET_RAW` in
-the socket's network namespace: kernels before 5.7, which tested it
-unconditionally, and, from 5.7 on, re-binding or unbinding a socket that is
-*already* device-bound (one inherited through `ip vrf exec`, or received over
-a unix socket). This crate never reaches the second case because it never
-adopts a caller-supplied socket. An unknown device name is `ENODEV` at every
-capability level, because `sock_setbindtodevice()` resolves the name before
-`sock_bindtoindex_locked()` is called. All of this describes the kernel's own
-capability check in `net/core/sock.c` and nothing else; LSM (for example
-SELinux) and seccomp policy are out of scope. Android, which shares the same
-code path in this crate, was not verified.
+`sk->sk_bound_dev_if && !ns_capable(net->user_ns, CAP_NET_RAW)`. That
+relaxation is torvalds/linux `c427bfec18f2` ("net: core: enable
+SO_BINDTODEVICE for non-root users"), first released in v5.7; kernels before
+5.7 tested `CAP_NET_RAW` unconditionally. A socket that is already
+device-bound when the option is applied needs `CAP_NET_RAW` in the socket's
+network namespace — including under `ip vrf exec`, where per `c427bfec18f2`
+"the socket is bound to an interface at creation". An unknown device name is
+`ENODEV` at every capability level, because `sock_setbindtodevice()` resolves
+the name before `sock_bindtoindex_locked()` is called. All of this describes
+the kernel's own capability check in `net/core/sock.c` and nothing else; LSM
+(for example SELinux) and seccomp policy are out of scope. Android, which
+shares the same code path in this crate, was not verified.
 
 ## Relationships
 
