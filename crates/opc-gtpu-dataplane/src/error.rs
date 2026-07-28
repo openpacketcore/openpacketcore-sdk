@@ -188,6 +188,9 @@ impl GtpuError {
     /// Build a redaction-safe eBPF program-load rejection.
     ///
     /// The original I/O message and kernel verifier log are not retained.
+    // Constructed only from `program_load_outcome` and the unit tests, so it
+    // carries that constructor's gate.
+    #[cfg(any(target_os = "linux", test))]
     pub(crate) fn program_load_rejected(operation: &'static str, source: &io::Error) -> Self {
         Self::ProgramLoadRejected {
             operation,
@@ -217,6 +220,9 @@ impl GtpuError {
     /// this crate's loader always retries with a log buffer, so a genuine
     /// verifier failure cannot arrive silent. Condemning a node requires
     /// positive evidence, and the absence of a log is not any.
+    // The BPF program loader that classifies these errnos is Linux-only, so
+    // off Linux the unit tests are this constructor's only callers.
+    #[cfg(any(target_os = "linux", test))]
     pub(crate) fn program_load_outcome(
         operation: &'static str,
         source: &io::Error,
