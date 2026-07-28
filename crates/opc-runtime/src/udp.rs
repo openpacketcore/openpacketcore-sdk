@@ -68,11 +68,38 @@ pub fn bind_udp_socket_with_destination_metadata(
 /// With [`UdpSocketOptions::bind_device`] set, the socket is created first and
 /// `SO_BINDTODEVICE` is applied before `bind(2)`, scoping the socket to that
 /// network device (for example a VRF) for the whole bind/receive/send
-/// lifecycle. This requires `CAP_NET_RAW` on Linux. On platforms without
-/// `SO_BINDTODEVICE` a configured device fails closed with
-/// [`io::ErrorKind::Unsupported`]; it is never silently ignored. With
-/// `bind_device` unset this behaves exactly like
+/// lifecycle. On platforms without `SO_BINDTODEVICE` a configured device fails
+/// closed with [`io::ErrorKind::Unsupported`]; it is never silently ignored.
+/// With `bind_device` unset this behaves exactly like
 /// [`bind_udp_socket_with_destination_metadata`].
+///
+/// # Linux capability contract
+///
+/// The Linux kernel's own check (`sock_bindtoindex_locked()` in
+/// `net/core/sock.c`) is `sk->sk_bound_dev_if && !ns_capable(net->user_ns,
+/// CAP_NET_RAW)`, so it applies only to a socket that is *already*
+/// device-bound:
+///
+/// - A socket that is not yet device-bound is not capability-gated for its
+///   first `SO_BINDTODEVICE`. This holds on upstream mainline since v5.7
+///   (commit `c427bfec18f2`, "net: core: enable SO_BINDTODEVICE for non-root
+///   users"); upstream mainline before v5.7 gates every device bind, in a
+///   function then named `sock_setbindtodevice_locked()`.
+/// - A socket that is already device-bound still needs `CAP_NET_RAW` — in the
+///   user namespace that owns its network namespace, not merely in its network
+///   namespace — to be re-bound, including to the *same* device, or unbound.
+///   That state is reachable at socket creation: a `sock_create` cgroup hook
+///   may write `sk_bound_dev_if` during `socket(2)` (`ip vrf exec` is one such
+///   mechanism), so a freshly created socket is not guaranteed to be unbound.
+/// - On upstream mainline since v5.1 an unknown device name is `ENODEV`
+///   regardless of capabilities, because `sock_setbindtodevice()` resolves the
+///   name before the capability is consulted. Upstream mainline before v5.1
+///   tests the capability first and returns `EPERM` without resolving the name.
+///
+/// This describes the kernel's own capability check only; LSM (for example
+/// SELinux) and seccomp policy are out of scope. The version scope above is a
+/// statement about upstream mainline; distribution and Android kernels backport
+/// independently and are not verified here.
 ///
 /// # Errors
 ///
@@ -693,8 +720,9 @@ mod platform {
         // probe inherits this socket's `SO_BINDTODEVICE` scope because a
         // VRF-local source is only bindable inside its VRF; probing the
         // default routing instance would misreport it as not local. A probe
-        // that cannot re-apply the device (for example after privileges were
-        // dropped post-bind) stays inconclusive.
+        // that cannot re-apply the device (the device disappeared, or the
+        // probe socket was itself device-bound at creation and re-binding it
+        // needs `CAP_NET_RAW`) stays inconclusive.
         local_source.set_port(0);
         let probe = match bind_device {
             Some(device) => bind_udp_socket_to_device(local_source, device).map(drop),
@@ -827,11 +855,15 @@ mod platform {
             assert_eq!(source_bind_probe(doc_source, None), Some(false));
         }
 
+        // Linux-specific: asserts how this kernel's `SO_BINDTODEVICE` errors
+        // are classified. Android shares the code path but is not verified.
+        #[cfg(target_os = "linux")]
         #[test]
         fn source_bind_probe_with_unusable_device_is_inconclusive() {
-            // The device cannot be applied to the probe socket (missing
-            // device as root: ENODEV; without CAP_NET_RAW: EPERM). Neither
-            // is evidence about source locality, so the probe must stay
+            // An unknown device fails whatever the caller's capabilities are:
+            // ENODEV on upstream mainline since v5.1, which resolves the name
+            // before it tests CAP_NET_RAW, and EPERM before that. Neither is
+            // evidence about source locality, so the probe must stay
             // inconclusive instead of misreporting `udp_source_not_local`.
             assert_eq!(source_bind_probe(local_source(), Some("opc-nodev0")), None);
         }
@@ -986,13 +1018,20 @@ mod tests {
             .is_loopback());
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    // The next three cases depend on Linux `SO_BINDTODEVICE` behaviour.
+    // Android shares the code path but is not verified, so they stay
+    // Linux-only rather than claiming a result nobody has observed there.
+
+    #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn bind_device_missing_or_unprivileged_fails_closed() {
-        // `SO_BINDTODEVICE` needs CAP_NET_RAW: without it the kernel returns
-        // EPERM before it even looks the device up; with it a nonexistent
-        // device is ENODEV. Either way the bind must fail instead of silently
-        // falling back to the default routing instance.
+    async fn bind_device_unknown_device_fails_closed() {
+        // On upstream mainline since v5.1 `sock_setbindtodevice()` resolves the
+        // device name before the capability is consulted, so an unknown device
+        // is ENODEV whether or not the caller holds CAP_NET_RAW. EPERM stays
+        // admissible because upstream mainline before v5.1 tests
+        // `ns_capable(net->user_ns, CAP_NET_RAW)` first and never reaches the
+        // lookup. Either way the bind must fail instead of silently falling
+        // back to the default routing instance.
         let options = UdpSocketOptions::default().with_bind_device("opc-nodev0");
 
         let error =
@@ -1006,16 +1045,37 @@ mod tests {
         );
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(target_os = "linux")]
     #[tokio::test]
-    #[ignore = "needs CAP_NET_RAW; run: sudo -E $(command -v cargo) test -p opc-runtime --lib \
-                udp::tests::bind_device_loopback_scopes_the_socket -- --ignored"]
     async fn bind_device_loopback_scopes_the_socket() {
+        // This case proves device scoping, not the capability rule. It holds
+        // only while the socket this call creates is not already device-bound
+        // -- a `sock_create` cgroup hook (`ip vrf exec` is one such mechanism)
+        // can bind it during `socket(2)`, after which CAP_NET_RAW is required
+        // and the outcome would say nothing about scoping. Read the
+        // precondition back from the kernel instead of assuming it.
+        if let Some(reason) = device_bound_at_creation() {
+            skip(&format!(
+                "{reason}, so the unbound-socket precondition of \
+                 bind_device_loopback_scopes_the_socket does not hold"
+            ));
+            return;
+        }
+
         let options = UdpSocketOptions::default().with_bind_device("lo");
 
         let socket =
             bind_udp_socket_with_destination_metadata_and_options(loopback_any_port(), &options)
                 .expect("SO_BINDTODEVICE lo before bind");
+
+        // `bind_device()` only echoes the configured name back, and the bind
+        // address is already loopback, so neither observes the kernel. Read
+        // `SO_BINDTODEVICE` off the socket itself: that is the only assertion
+        // here a regression in `bind_udp_socket_to_device` could fail.
+        let scope =
+            nix::sys::socket::getsockopt(socket.socket(), nix::sys::socket::sockopt::BindToDevice)
+                .expect("SO_BINDTODEVICE readback");
+        assert_eq!(scope, std::ffi::OsString::from("lo"));
 
         assert_eq!(socket.bind_device(), Some("lo"));
         assert!(socket
@@ -1023,6 +1083,97 @@ mod tests {
             .expect("bound local addr")
             .ip()
             .is_loopback());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rebinding_an_already_device_bound_socket_needs_cap_net_raw() {
+        // The other half of the documented contract.
+        // `sock_bindtoindex_locked()` gates on `sk->sk_bound_dev_if &&
+        // !ns_capable(net->user_ns, CAP_NET_RAW)`, so once a socket is
+        // device-bound even a re-bind to the SAME device needs the capability.
+        // Exercised on a bare socket because no SDK entry point re-binds one it
+        // already created; this keeps the documented rule executable rather
+        // than letting the prose drift.
+        use nix::sys::socket::{
+            setsockopt, socket, sockopt::BindToDevice, AddressFamily, SockFlag, SockType,
+        };
+
+        if let Some(reason) = device_bound_at_creation() {
+            skip(&format!(
+                "{reason}, so the socket below arrives already device-bound and neither \
+                 setsockopt would be its first bind"
+            ));
+            return;
+        }
+
+        let sock = socket(
+            AddressFamily::Inet,
+            SockType::Datagram,
+            SockFlag::SOCK_CLOEXEC,
+            None,
+        )
+        .expect("probe socket");
+        let loopback = std::ffi::OsString::from("lo");
+
+        if let Err(errno) = setsockopt(&sock, BindToDevice, &loopback) {
+            // Upstream mainline before v5.7 gates every device bind, so the
+            // first bind can legitimately fail here and the second one would
+            // prove nothing about the already-bound rule.
+            skip(&format!("the first device bind failed with {errno}"));
+            return;
+        }
+
+        match setsockopt(&sock, BindToDevice, &loopback) {
+            Err(nix::errno::Errno::EPERM) => {}
+            Ok(()) => skip(
+                "re-binding an already device-bound socket succeeded, so this process holds \
+                 CAP_NET_RAW in the user namespace owning its network namespace and the case \
+                 cannot discriminate",
+            ),
+            Err(errno) => panic!("expected EPERM re-binding a device-bound socket, got {errno}"),
+        }
+    }
+
+    /// Report an environmental skip on stderr.
+    ///
+    /// libtest captures `eprintln!` and discards it for a case that passes, so
+    /// a skip announced that way is invisible in a default run and the case
+    /// silently counts as proof. Writing to the process stderr the harness does
+    /// not capture keeps it visible.
+    #[cfg(target_os = "linux")]
+    fn skip(reason: &str) {
+        use std::io::Write;
+
+        let _ = writeln!(io::stderr(), "skipping: {reason}");
+    }
+
+    /// Why a freshly created UDP socket cannot serve as an unbound-socket
+    /// precondition, or `None` when it reads back unbound.
+    ///
+    /// A readback error is not a pass: `sock_getbindtodevice()` returns the
+    /// `netdev_get_name()` error when `sk_bound_dev_if` is non-zero but no
+    /// longer resolves, which is itself a device-bound socket.
+    #[cfg(target_os = "linux")]
+    fn device_bound_at_creation() -> Option<String> {
+        use nix::sys::socket::{
+            getsockopt, socket, sockopt::BindToDevice, AddressFamily, SockFlag, SockType,
+        };
+
+        let probe = socket(
+            AddressFamily::Inet,
+            SockType::Datagram,
+            SockFlag::SOCK_CLOEXEC,
+            None,
+        )
+        .expect("probe socket");
+        match getsockopt(&probe, BindToDevice) {
+            Ok(device) if device.is_empty() => None,
+            Ok(device) => Some(format!(
+                "sockets are device-bound at creation (SO_BINDTODEVICE reads back {device:?})"
+            )),
+            Err(errno) => Some(format!("the SO_BINDTODEVICE readback failed with {errno}")),
+        }
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "android")))]

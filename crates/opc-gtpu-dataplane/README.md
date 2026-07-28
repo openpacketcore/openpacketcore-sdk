@@ -685,9 +685,10 @@ with its output bearer mark at most once per reassembled datagram.
 Provenance comes from the kernel, not configuration:
 `GtpuReassemblySocket::bind` derives the positive ifindex from an interface
 name, applies `SO_BINDTODEVICE` before binding the concrete IPv4 S2b-U address
-on UDP/2152, enables `IP_PKTINFO`, and verifies exact kernel readback. It
-requires the applicable Linux capability (normally `CAP_NET_RAW`) in the
-network namespace. Each receive checks the sealed device/address identity
+on UDP/2152, enables `IP_PKTINFO`, and verifies exact kernel readback. See
+[Linux `SO_BINDTODEVICE` capability contract](#linux-so_bindtodevice-capability-contract)
+for what that device bind does and does not require.
+Each receive checks the sealed device/address identity
 both before and after blocking. A positive packet-info ifindex must match; a
 zero ifindex, which some kernels report after reassembly, is accepted only
 through that kernel-enforced sealed socket identity. Truncated payload/control
@@ -736,6 +737,44 @@ strict policy drops an over-MTU encapsulation with only the reject counter
 moving, stamps DF on fitting packets, rejects the host-only fragmentation
 policy without map drift, and routes corrupt policy bytes to the canary
 counter with indeterminate read-back.
+
+### Linux `SO_BINDTODEVICE` capability contract
+
+`GtpuReassemblySocket::bind` applies `SO_BINDTODEVICE` to a socket it has just
+created. The kernel's own check is in `sock_bindtoindex_locked()`
+(`net/core/sock.c`) and reads `sk->sk_bound_dev_if &&
+!ns_capable(net->user_ns, CAP_NET_RAW)`, so it applies only to a socket that is
+*already* device-bound:
+
+- A socket that is **not yet device-bound** is **not** capability-gated for its
+  first `SO_BINDTODEVICE`. That holds on upstream mainline since v5.7 (commit
+  `c427bfec18f2`, "net: core: enable SO_BINDTODEVICE for non-root users");
+  upstream mainline before v5.7 gates every device bind on `CAP_NET_RAW`, in a
+  function then named `sock_setbindtodevice_locked()`. Distribution kernels
+  backport independently of the mainline release, so the mainline version is
+  not a statement about any vendor kernel. Verified separately: the relaxed
+  form is present in the CentOS Stream 9 `net/core/sock.c`, the tree RHEL 9
+  derives from.
+- A socket that **is** already device-bound still requires `CAP_NET_RAW` to be
+  re-bound — including re-bound to the **same** device — or unbound. The
+  capability is evaluated by `ns_capable(net->user_ns, ...)`, that is, in the
+  **user namespace that owns** the socket's network namespace; this is not
+  "`CAP_NET_RAW` in the network namespace".
+- A socket can arrive already device-bound: a `sock_create` cgroup hook may
+  write `sk_bound_dev_if` during `socket(2)` (`ip vrf exec` is one such
+  mechanism), so a freshly created socket is not guaranteed to be unbound.
+- An **unknown interface is rejected before any capability question arises**:
+  `bind` fails its own `if_nametoindex` lookup with `InvalidInput`, so the name
+  never reaches the kernel option at all. Had it reached the kernel, upstream
+  mainline since v5.1 would return `-ENODEV` regardless of capabilities,
+  because `sock_setbindtodevice()` resolves the name before
+  `sock_bindtoindex_locked()` is reached; upstream mainline before v5.1 tests
+  the capability first and returns `-EPERM` without resolving the name.
+
+This describes the kernel's own capability check only. LSM policy (for example
+SELinux) and seccomp policy are out of scope and can deny the call
+independently. The rest of the reassembly consumer's privileged prerequisites
+are unchanged.
 
 ### Pinned-map and live-program migration
 
