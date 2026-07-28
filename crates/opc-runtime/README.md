@@ -143,11 +143,47 @@ fn bind_in_vrf(bind: SocketAddr) -> io::Result<opc_runtime::UdpDestinationMetada
 
 The device option is default-off. When configured, the runtime validates the
 interface name, applies `SO_BINDTODEVICE` before `bind(2)`, and keeps the same
-scope for source-locality probes used by `send_to_from`. Linux requires
-`CAP_NET_RAW`; unsupported platforms return `io::ErrorKind::Unsupported`
-instead of silently binding in the default routing domain. The original
-`bind_udp_socket_with_destination_metadata` constructor remains unchanged in
-behavior and does not select a device.
+scope for source-locality probes used by `send_to_from`. Unsupported platforms
+return `io::ErrorKind::Unsupported` instead of silently binding in the default
+routing domain. The original `bind_udp_socket_with_destination_metadata`
+constructor remains unchanged in behavior and does not select a device.
+
+### Linux `SO_BINDTODEVICE` capability contract
+
+The kernel's own check lives in `sock_bindtoindex_locked()`
+(`net/core/sock.c`) and reads `sk->sk_bound_dev_if &&
+!ns_capable(net->user_ns, CAP_NET_RAW)`, so it applies only to a socket that is
+*already* device-bound:
+
+- A socket that is **not yet device-bound** is **not** capability-gated for its
+  first `SO_BINDTODEVICE`. That holds on upstream mainline since v5.7 (commit
+  `c427bfec18f2`, "net: core: enable SO_BINDTODEVICE for non-root users");
+  upstream mainline before v5.7 gates every device bind on `CAP_NET_RAW`, in a
+  function then named `sock_setbindtodevice_locked()`. Distribution kernels
+  backport independently of the mainline release, so the mainline version is
+  not a statement about any vendor kernel. Verified separately: the relaxed
+  form is present in the CentOS Stream 9 `net/core/sock.c`, the tree RHEL 9
+  derives from.
+- A socket that **is** already device-bound still requires `CAP_NET_RAW` to be
+  re-bound — including re-bound to the **same** device — or unbound. The
+  capability is evaluated by `ns_capable(net->user_ns, ...)`, that is, in the
+  **user namespace that owns** the socket's network namespace; this is not
+  "`CAP_NET_RAW` in the network namespace".
+- A socket can arrive already device-bound: a `sock_create` cgroup hook may
+  write `sk_bound_dev_if` during `socket(2)` (`ip vrf exec` is one such
+  mechanism), so a freshly created socket is not guaranteed to be unbound and
+  userspace may never observe it unbound.
+- On upstream mainline since v5.1 an **unknown device name is `ENODEV`
+  regardless of capabilities**, because `sock_setbindtodevice()` resolves the
+  name and returns `-ENODEV` before `sock_bindtoindex_locked()` is reached.
+  Upstream mainline before v5.1 tests `ns_capable(net->user_ns, CAP_NET_RAW)`
+  first and returns `EPERM` without resolving the name at all.
+
+This describes the kernel's own capability check only. LSM policy (for example
+SELinux) and seccomp policy are out of scope and can deny the call
+independently. Every version scope above is a statement about upstream
+mainline: distribution and Android kernels backport independently of the
+mainline release and are not verified here. Android shares this code path.
 
 ## Relationships
 

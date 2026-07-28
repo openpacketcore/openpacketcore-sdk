@@ -486,6 +486,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   identifiers are protocol metadata under this enum's own contract.
 
 ### Documented
+- **`SO_BINDTODEVICE` is not unconditionally `CAP_NET_RAW`-gated --
+  `opc-runtime`, `opc-gtpu-dataplane` (#589):** the crate docs and READMEs
+  claimed that applying `SO_BINDTODEVICE` "requires `CAP_NET_RAW`". The
+  kernel's own test is `sk->sk_bound_dev_if && !ns_capable(net->user_ns,
+  CAP_NET_RAW)` in `sock_bindtoindex_locked()` (`net/core/sock.c`), so it is
+  reached only for a socket that is *already* device-bound; a socket whose
+  `sk_bound_dev_if` is still zero is not capability-gated for its first device
+  bind. That relaxation is upstream commit `c427bfec18f2` ("net: core: enable
+  SO_BINDTODEVICE for non-root users"), first released in upstream mainline
+  v5.7 -- v5.6 carries the unconditional test, in a function then named
+  `sock_setbindtodevice_locked()`. Vendor kernels backport independently of the
+  mainline release, so every version claim is scoped to upstream mainline and
+  any distribution tree is stated as its own separately verified claim; the
+  relaxed form is present in the CentOS Stream 9 `net/core/sock.c`, the tree
+  RHEL 9 derives from.
+  - The docs also said "in the network namespace". `ns_capable(net->user_ns,
+    ...)` evaluates the capability in the **user namespace that owns** the
+    network namespace, which is a different question; every occurrence is
+    corrected.
+  - Re-binding a socket that is already device-bound still requires
+    `CAP_NET_RAW`, *including* re-binding it to the same device, and a
+    `sock_create` cgroup hook can write `sk_bound_dev_if` during `socket(2)`
+    (`ip vrf exec` is one such mechanism), so that case is reachable for a
+    socket the SDK itself just created. A blanket "does not require
+    `CAP_NET_RAW`" would be as wrong as the claim it replaced. New case
+    `udp::tests::rebinding_an_already_device_bound_socket_needs_cap_net_raw`
+    keeps that half executable instead of prose-only; it skips explicitly when
+    the caller holds the capability, or when the first bind is itself gated.
+  - On upstream mainline since v5.1 an unknown device name is `ENODEV`
+    regardless of capabilities, because `sock_setbindtodevice()` resolves the
+    name before `sock_bindtoindex_locked()` is reached; upstream mainline before
+    v5.1 tests the capability first and returns `EPERM` without resolving the
+    name at all. The `opc-runtime` fail-closed case is renamed
+    `bind_device_unknown_device_fails_closed` to match what it exercises, and
+    its comment attributes the still-admissible `EPERM` to that pre-v5.1
+    ordering rather than to the unprivileged case.
+  - `udp::tests::bind_device_loopback_scopes_the_socket` was `#[ignore]`d for
+    "needs CAP_NET_RAW", which is not true of the unbound socket it creates. It
+    now runs by default and preflights its real precondition instead: it reads
+    `SO_BINDTODEVICE` back from a freshly created socket and skips when the
+    environment device-binds sockets at creation, or when that readback cannot
+    be taken, rather than asserting scoping in a state where the assertion
+    proves nothing. The case now asserts the kernel's own `SO_BINDTODEVICE`
+    readback on the socket under test; the previous assertions only echoed the
+    caller's own configuration back. The skip notice is written straight to
+    process stderr because libtest discards `eprintln!` for a passing case,
+    which would make the skip invisible; note that libtest still counts a
+    skipped case as a pass in the tally.
+  - Android was asserted as unverified in prose while the Linux errno and
+    capability cases were `cfg`-enabled for `target_os = "android"`. Those
+    cases are now `target_os = "linux"` only; Android shares the code path and
+    is still not verified.
+  - This is documentation and test scope only; no runtime behaviour changes.
+    LSM (for example SELinux) and seccomp policy remain out of scope and can
+    deny the call independently of the capability.
+
 - **`uplink_encapsulated` no longer claims delivery --
   `opc-gtpu-dataplane`, `opc-gtpu-dataplane-ebpf`:** the counter was documented
   as "uplink packets successfully GTP-U encapsulated", which reads as delivery.
@@ -1788,7 +1844,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   verifies kernel device/address identity around every receive, and accepts a
   zero reassembled `IP_PKTINFO` ifindex only through that kernel-enforced
   identity. The socket also exposes safe `SO_RCVBUF` sizing/readback and has no
-  unbound wrapping path; creation normally requires Linux `CAP_NET_RAW`.
+  unbound wrapping path; its `SO_BINDTODEVICE` call is capability-gated only
+  when the socket is already device-bound, which the socket it creates normally
+  is not.
   Linux also exposes bounded typed `/proc/net/snmp` reassembly stats readback,
   including timeouts and aggregate overlap/resource failures. `GtpuProbe`
   reports `uplink_pmtu_enforcement` and `downlink_outer_fragment_handling`

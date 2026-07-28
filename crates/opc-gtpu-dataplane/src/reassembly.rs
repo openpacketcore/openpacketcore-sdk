@@ -428,8 +428,26 @@ impl GtpuReassemblySocket {
     /// `SO_BINDTODEVICE` is set before `bind(2)`. The returned identity comes
     /// from positive interface-name lookup plus exact kernel socket-option
     /// readback; no caller-provided ifindex is accepted.
-    /// Setting `SO_BINDTODEVICE` requires the process to hold the applicable
-    /// Linux network capability (normally `CAP_NET_RAW`) in this namespace.
+    ///
+    /// # Linux capability contract
+    ///
+    /// `sock_bindtoindex_locked()` (`net/core/sock.c`) gates on
+    /// `sk->sk_bound_dev_if && !ns_capable(net->user_ns, CAP_NET_RAW)`, so the
+    /// capability is consulted only for a socket that is *already*
+    /// device-bound. The socket this call creates is normally unbound, and on
+    /// upstream mainline since v5.7 (commit `c427bfec18f2`) its first device
+    /// bind is therefore not capability-gated; upstream mainline before v5.7
+    /// gates every device bind, in a function then named
+    /// `sock_setbindtodevice_locked()`. A `sock_create` cgroup hook may
+    /// nonetheless write `sk_bound_dev_if` during `socket(2)` (`ip vrf exec` is
+    /// one such mechanism), and re-binding such a socket -- including to the
+    /// same device -- does require `CAP_NET_RAW` in the user namespace that
+    /// *owns* this network namespace, not merely in this network namespace. An
+    /// unknown interface never reaches the kernel option at all: it fails this
+    /// function's own `if_nametoindex` lookup first. Every version above scopes
+    /// upstream mainline only; distribution kernels backport independently.
+    /// This covers the kernel's own check only; LSM (for example SELinux) and
+    /// seccomp policy are out of scope.
     ///
     /// # Errors
     ///
