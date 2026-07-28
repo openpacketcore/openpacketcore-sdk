@@ -125,10 +125,44 @@ control-plane stack.
 - `PcoRequest::ipcp_dns` emits an RFC 1332 IPCP Configure-Request carrying the
   RFC 1877 Primary (129) and Secondary (131) DNS Server Address options, which
   TS 24.008 10.5.6.3 places in the configuration protocol options list ahead of
-  every container. The decoder reads the peer's Configure-Nak answer into
-  `ipcp_primary_dns`/`ipcp_secondary_dns`. A peer may serve DNS by either
-  mechanism, so prefer `PcoAddressConfiguration::dns_server_ipv4_all`, which
-  merges both sources and drops duplicates.
+  every container. `PcoAddressConfiguration::decode_network_contents_correlated`
+  reads the peer's Configure-Nak answer into
+  `ipcp_primary_dns`/`ipcp_secondary_dns`, but only once the reply is
+  correlated: RFC 1661 5.3 says "On reception of a Configure-Nak, the Identifier
+  field MUST match that of the last transmitted Configure-Request. Invalid
+  packets are silently discarded." Pass `IpcpNakCorrelation::for_request` built
+  from the `IpcpDnsRequest` that was sent. `IpcpNakCorrelation::none` is the
+  `Default`, and the uncorrelated `decode_network_contents` uses it, so that
+  entry point surfaces no IPCP-supplied DNS at all. Every unit dropped on
+  correlation, every unit dropped as malformed or because it appeared after a
+  registered network-to-MS container, and every DNS option skipped as
+  unsolicited is reported through `PcoDecoded::ipcp_discards`, which carries
+  reason codes and unit positions and never an address or an Identifier value.
+  Four drops are deliberately silent and record no entry, as before: a
+  well-formed code other than Configure-Nak, an unknown option type, an echoed
+  RFC 1877 all-zero address, and a repeated option whose slot is already filled.
+- A malformed `0x8021` unit is discarded unit-locally rather than failing the
+  whole PCO/APCO value: RFC 1661's discard unit is the packet, TS 24.008
+  10.5.6.3 maps one `0x8021` unit to one RFC 1661 packet, and the unit's outer
+  container boundary has already been validated, so following P-CSCF and DNS
+  containers are recoverable and survive. Within one unit the disposition is
+  atomic -- an option that parsed before a later malformed one in the same
+  packet is dropped with it. Once any registered network-to-MS container starts
+  the second TS list, including an unsupported, reserved or operator-specific
+  identifier, a later IPCP unit is out of order and is discarded with evidence
+  rather than adopted. Container framing and wrong-length address containers
+  still reject the whole value.
+- `for_request` additionally declines a DNS option this side never solicited.
+  That is engineering judgement and not a specification requirement: RFC 1661
+  5.3 permits a Configure-Nak to append options the peer desires that were not
+  in the Configure-Request, so the unit is kept and only the option is skipped.
+  Use `IpcpNakCorrelation::expecting` for the RFC-permissive reading, which
+  accepts both DNS options.
+- A peer may serve DNS by either mechanism, so prefer
+  `PcoAddressConfiguration::dns_server_ipv4_all`. Container addresses come
+  first, in wire order and with their multiplicity preserved; the IPCP primary
+  and secondary addresses follow, each appended only if the list does not
+  already contain it. The container list itself is never deduplicated.
 - `PcoRequest::ipv4_link_mtu` emits the zero-length IPv4 Link MTU Request
   container `0x0010`, and `PcoAddressConfiguration::ipv4_link_mtu` carries the
   two-octet value the network returns under the same identifier. TS 24.008
