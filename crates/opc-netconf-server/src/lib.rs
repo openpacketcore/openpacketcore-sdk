@@ -105,6 +105,11 @@
 //!   provider-omitted state paths are pruned before XML projection. Malformed
 //!   provider responses with unrequested paths, duplicate paths, or unrequested
 //!   origin metadata fail closed before XML projection.
+//!   Async session paths use `AuditSink::record_async` throughout. Atomic
+//!   `<kill-session>`, `<lock>`, and `<unlock>` hooks reserve the single
+//!   fail-fast gate owned by their shared `SessionRegistry` and complete on a
+//!   cancellation-independent blocking job; a second server sharing that
+//!   registry cannot enqueue another mutex waiter while the hook is admitted.
 //! - An opt-in writer-of-record port for `<edit-config>`, `<edit-data>`,
 //!   `<commit>`, `<get>`, `<get-config>`, and `<get-data>`. It redirects
 //!   followers with `operation-failed` and a bounded namespaced leader hint,
@@ -132,6 +137,10 @@
 //! When a writer-of-record port is configured, the synchronous direct helpers
 //! cannot await it and reject every gated operation. Leader-aware production
 //! traffic must use the async session/listener runners.
+//! Those registry-aware async session, TLS, and SSH runners require
+//! `A: 'static` because an admitted atomic audit hook may outlive its caller
+//! future. The server type, constructor, registry-free helpers, and synchronous
+//! APIs continue to accept non-`'static` audit adapters.
 //!
 //! The raw session-registry controls are intentionally not part of the public
 //! API. Custom transports share a [`SessionRegistry`] by passing it into

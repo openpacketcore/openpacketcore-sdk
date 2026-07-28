@@ -19,6 +19,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+futures-executor = "0.3"
 opc-types = { path = "../opc-types", version = "0.2.0" }
 
 [lints]

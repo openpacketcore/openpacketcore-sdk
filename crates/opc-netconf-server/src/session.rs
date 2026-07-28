@@ -122,7 +122,7 @@ where
     C: OpcConfig,
     B: NetconfConfigBinding<C>,
     P: PolicySource,
-    A: AuditSink,
+    A: AuditSink + 'static,
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let registry = SessionRegistry::new();
@@ -144,17 +144,23 @@ where
     C: OpcConfig,
     B: NetconfConfigBinding<C>,
     P: PolicySource,
-    A: AuditSink,
+    A: AuditSink + 'static,
     S: AsyncRead + AsyncWrite + Unpin,
 {
     config.limits.validate()?;
     let Some(hello_session_id) = session_id_for_hello(session_id) else {
         return Err(SessionError::InvalidSessionId);
     };
-    let mut registration = sessions.register(session_id).map_err(|err| match err {
-        SessionRegistryError::InvalidSessionId => SessionError::InvalidSessionId,
-        SessionRegistryError::DuplicateSessionId => SessionError::DuplicateSessionId,
-    })?;
+    let mut registration = sessions
+        .register_async(session_id)
+        .await
+        .map_err(|err| match err {
+            SessionRegistryError::InvalidSessionId => SessionError::InvalidSessionId,
+            SessionRegistryError::DuplicateSessionId => SessionError::DuplicateSessionId,
+            SessionRegistryError::Unavailable => SessionError::Io(std::io::Error::other(
+                "NETCONF session registry is unavailable",
+            )),
+        })?;
 
     let session_id = registration.session_id();
     let result = AssertUnwindSafe(run_registered_session_loop(
@@ -190,7 +196,7 @@ where
     C: OpcConfig,
     B: NetconfConfigBinding<C>,
     P: PolicySource,
-    A: AuditSink,
+    A: AuditSink + 'static,
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let server_hello = server.server_hello(Some(hello_session_id));

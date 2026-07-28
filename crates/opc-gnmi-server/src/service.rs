@@ -209,6 +209,7 @@ where
                 audit_principal.as_ref(),
                 outcome_for_error(&err),
             )
+            .await
             .err()
             .unwrap_or(err);
             record_rpc_error(
@@ -228,6 +229,7 @@ where
                 audit_principal.as_ref(),
                 outcome_for_error(&err),
             )
+            .await
             .err()
             .unwrap_or(err);
             record_rpc_error(
@@ -245,6 +247,7 @@ where
                 audit_principal.as_ref(),
                 outcome_for_error(&err),
             )
+            .await
             .err()
             .unwrap_or(err);
             record_rpc_error(
@@ -282,7 +285,9 @@ where
             self.server.as_ref(),
             audit_principal.as_ref(),
             AuditOutcome::Success,
-        ) {
+        )
+        .await
+        {
             record_rpc_error(GnmiOperation::Capabilities, err.status(), start.elapsed());
             return Err(status_from_error(err));
         }
@@ -319,6 +324,7 @@ where
                 outcome_for_error(&err),
                 Vec::new(),
             )
+            .await
             .err()
             .unwrap_or(err);
             record_rpc_error(GnmiOperation::Get, final_err.status(), start.elapsed());
@@ -337,12 +343,13 @@ where
                 outcome_for_error(&err),
                 Vec::new(),
             )
+            .await
             .err()
             .unwrap_or(err);
             record_rpc_error(GnmiOperation::Get, final_err.status(), start.elapsed());
             return Err(status_from_error(final_err));
         }
-        match handle_get(&self.server, principal.principal(), request.get_ref()) {
+        match handle_get(&self.server, principal.principal(), request.get_ref()).await {
             Ok(response) => {
                 record_rpc_success(GnmiOperation::Get, start.elapsed());
                 Ok(Response::new(response))
@@ -383,6 +390,7 @@ where
                 outcome_for_error(&err),
                 Vec::new(),
             )
+            .await
             .err()
             .unwrap_or(err);
             record_rpc_error(GnmiOperation::Set, final_err.status(), start.elapsed());
@@ -401,6 +409,7 @@ where
                 outcome_for_error(&err),
                 Vec::new(),
             )
+            .await
             .err()
             .unwrap_or(err);
             record_rpc_error(GnmiOperation::Set, final_err.status(), start.elapsed());
@@ -464,7 +473,7 @@ fn subscribe_response_queue_capacity(limits: &opc_mgmt_limits::MgmtLimits) -> us
     (limits.max_subscriber_queue_bytes / 4096).clamp(1, 1024)
 }
 
-fn record_capabilities_audit<C, B>(
+async fn record_capabilities_audit<C, B>(
     server: &GnmiServer<C, B>,
     principal: Option<&TrustedPrincipal>,
     outcome: AuditOutcome,
@@ -484,6 +493,7 @@ where
         outcome,
         Vec::new(),
     )
+    .await
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -589,7 +599,8 @@ pub const fn code_from_status(status: opc_mgmt_errors::MgmtStatus) -> tonic::Cod
 #[allow(deprecated, clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::future::Future;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use opc_config_bus::{
@@ -887,6 +898,27 @@ mod tests {
         fn record(&self, event: &AuditEvent) -> Result<(), AuditError> {
             self.events.lock().expect("audit mutex").push(event.clone());
             Ok(())
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct AsyncOnlyAudit {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl AuditSink for AsyncOnlyAudit {
+        fn record(&self, _event: &AuditEvent) -> Result<(), AuditError> {
+            panic!("async gNMI dispatch called the synchronous audit path")
+        }
+
+        fn record_async<'a>(
+            &'a self,
+            _event: &'a AuditEvent,
+        ) -> Pin<Box<dyn Future<Output = Result<(), AuditError>> + Send + 'a>> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            })
         }
     }
 
@@ -2317,6 +2349,24 @@ mod tests {
         assert_eq!(events[0].operation, AuditOperation::Capabilities);
         assert_eq!(events[0].outcome, AuditOutcome::Success);
         assert!(events[0].schema_paths.is_empty());
+    }
+
+    #[tokio::test]
+    async fn authenticated_capabilities_uses_async_only_audit_override() {
+        let audit = AsyncOnlyAudit::default();
+        let calls = Arc::clone(&audit.calls);
+        let service =
+            authenticated_service_with_policy_and_audit(allow_all_read_policy(), Arc::new(audit))
+                .await;
+
+        service
+            .capabilities(authenticated_capability_request(gnmi::CapabilityRequest {
+                extension: Vec::new(),
+            }))
+            .await
+            .expect("capabilities");
+
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]

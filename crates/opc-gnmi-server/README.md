@@ -40,6 +40,19 @@ policy source, config JSON renderer, and optional operational-state providers.
 Default config rendering fails closed unless implemented by generated or
 CNF-specific code.
 
+## Async audit acknowledgement
+
+Capabilities, Get, Set, and Subscribe audit through
+`AuditSink::record_async`, including failure paths, so a native durable sink
+can await acknowledgement without parking a Tokio executor thread. The
+compatibility default on `AuditSink` may still block for a legacy sink;
+production sinks that wait for I/O must provide the native override.
+
+Once an async audit future admits its immutable event, cancellation cannot
+retract the append. An error, timeout, or dropped RPC after admission can leave
+the durable outcome unknown; the server never treats that as proof that no
+record was written.
+
 ## HA config authority opt-in
 
 Install one authority port on the server core to make Set and Get requests

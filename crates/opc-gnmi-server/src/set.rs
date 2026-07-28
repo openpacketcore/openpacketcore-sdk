@@ -149,7 +149,8 @@ where
             AuditOperation::Update,
             outcome_for_error(&err),
             Vec::new(),
-        )?;
+        )
+        .await?;
         return Err(err);
     }
     let commit_extension = match parse_set_commit_extension(&request.extension) {
@@ -162,7 +163,8 @@ where
                 AuditOperation::Update,
                 outcome_for_error(&err),
                 Vec::new(),
-            )?;
+            )
+            .await?;
             return Err(err);
         }
     };
@@ -178,7 +180,8 @@ where
                 AuditOperation::Update,
                 outcome_for_error(&err),
                 Vec::new(),
-            )?;
+            )
+            .await?;
             return Err(err);
         }
     }
@@ -205,7 +208,8 @@ where
                     AuditOperation::Update,
                     outcome_for_error(&err),
                     Vec::new(),
-                )?;
+                )
+                .await?;
                 return Err(err);
             }
         };
@@ -232,7 +236,8 @@ where
                 audit_operation,
                 outcome_for_error(&err),
                 audit_paths,
-            )?;
+            )
+            .await?;
             return Err(err);
         }
     };
@@ -249,7 +254,8 @@ where
             audit_operation,
             AuditOutcome::denied_code(AuditReasonCode::ACCESS_DENIED),
             audit_paths,
-        )?;
+        )
+        .await?;
         return Err(GnmiError::PermissionDenied);
     }
 
@@ -269,7 +275,8 @@ where
                 audit_operation,
                 outcome_for_error(&err),
                 audit_paths,
-            )?;
+            )
+            .await?;
             return Err(err);
         }
     };
@@ -301,7 +308,8 @@ where
         audit_operation,
         AuditOutcome::Intent,
         audit_paths.clone(),
-    )?;
+    )
+    .await?;
 
     let start = Instant::now();
     let result = match bus.submit(commit).await {
@@ -315,7 +323,8 @@ where
                 audit_operation,
                 outcome_for_error(&err),
                 audit_paths,
-            )?;
+            )
+            .await?;
             return Err(err);
         }
     };
@@ -330,7 +339,8 @@ where
                 audit_operation,
                 outcome_for_error(&err),
                 audit_paths,
-            )?;
+            )
+            .await?;
             return Err(err);
         }
     };
@@ -341,7 +351,8 @@ where
         audit_operation,
         AuditOutcome::Success,
         audit_paths,
-    )?;
+    )
+    .await?;
 
     Ok(gnmi::SetResponse {
         prefix: None,
@@ -378,7 +389,8 @@ where
                     AuditOperation::Update,
                     outcome_for_error(&err),
                     Vec::new(),
-                )?;
+                )
+                .await?;
                 Err(err)
             }
         }
@@ -394,7 +406,8 @@ where
                     AuditOperation::Update,
                     outcome_for_error(&err),
                     Vec::new(),
-                )?;
+                )
+                .await?;
                 return Err(err);
             }
             submit_commit_confirmed_control(server, principal, request_id, commit_extension)
@@ -455,7 +468,8 @@ where
                 AuditOperation::Update,
                 outcome_for_error(&err),
                 Vec::new(),
-            )?;
+            )
+            .await?;
             return Err(err);
         }
     };
@@ -470,7 +484,8 @@ where
                 AuditOperation::Update,
                 outcome_for_error(&err),
                 Vec::new(),
-            )?;
+            )
+            .await?;
             return Err(err);
         }
     };
@@ -481,7 +496,8 @@ where
         AuditOperation::Update,
         AuditOutcome::Success,
         Vec::new(),
-    )?;
+    )
+    .await?;
 
     Ok(gnmi::SetResponse {
         prefix: None,
@@ -516,7 +532,7 @@ fn set_operation_count(request: &gnmi::SetRequest) -> usize {
         + request.union_replace.len()
 }
 
-fn audit_set_result<C, B>(
+async fn audit_set_result<C, B>(
     server: &GnmiServer<C, B>,
     request_id: RequestId,
     principal: &TrustedPrincipal,
@@ -536,6 +552,7 @@ where
         outcome,
         paths,
     )
+    .await
 }
 
 fn normalize_set_request(

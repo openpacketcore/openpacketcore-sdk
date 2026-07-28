@@ -21,7 +21,7 @@ use crate::{
 };
 
 /// Executes a read-only gNMI Get request.
-pub(crate) fn handle_get<C, B>(
+pub(crate) async fn handle_get<C, B>(
     server: &GnmiServer<C, B>,
     principal: &TrustedPrincipal,
     request: &gnmi::GetRequest,
@@ -46,7 +46,8 @@ where
                     principal,
                     AuditOutcome::denied_code(opc_mgmt_audit::AuditReasonCode::ACCESS_DENIED),
                     result.denied_audit_paths,
-                )?;
+                )
+                .await?;
             }
             record_read_audit(
                 server,
@@ -54,7 +55,8 @@ where
                 principal,
                 AuditOutcome::Success,
                 result.audit_paths,
-            )?;
+            )
+            .await?;
             Ok(result.response)
         }
         Err(err) => {
@@ -65,6 +67,7 @@ where
                 outcome_for_error(&err.error),
                 err.audit_paths,
             )
+            .await
             .err();
             Err(audit_error.unwrap_or(err.error))
         }
@@ -288,7 +291,7 @@ fn empty_get_response() -> gnmi::GetResponse {
     }
 }
 
-fn record_read_audit<C, B>(
+async fn record_read_audit<C, B>(
     server: &GnmiServer<C, B>,
     request_id: RequestId,
     principal: &TrustedPrincipal,
@@ -307,6 +310,7 @@ where
         outcome,
         paths,
     )
+    .await
 }
 
 fn audit_paths_for_entries(

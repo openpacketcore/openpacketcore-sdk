@@ -48,6 +48,29 @@ schema-source lookup, and edit-config candidate construction. Default render and
 edit hooks fail closed unless a generated or CNF-specific binding implements
 them.
 
+## Async audit and registry atomicity
+
+Production async session paths use `AuditSink::record_async` for reads, writes,
+subscription, parsing, validation, schema lookup, and terminal outcomes. Native
+durable sinks therefore await acknowledgement without parking a Tokio executor
+thread. The public registry-free synchronous helpers retain their synchronous
+behavior and accept borrowed sink adapters.
+
+`<kill-session>`, `<lock>`, and `<unlock>` must make one audit-plus-registry
+decision that survives caller cancellation. Their async paths reserve a
+single, fail-fast gate owned by the shared `SessionRegistry`, then run the
+whole synchronous hook on one cancellation-independent blocking job. Dropping the outer RPC
+does not cancel an admitted hook; another server sharing that registry fails
+closed while the gate is occupied rather than adding a mutex waiter.
+`<kill-session>` pins the exact session generation across the audit hook, so
+numeric session-id reuse cannot receive a stale kill signal.
+
+Source migration: only registry-aware async session, TLS, and SSH runner entry
+points now require the audit sink type `A: 'static`, because cancellation-
+independent jobs may outlive the caller future. `ReadOnlyNetconfServer` itself,
+its constructor, registry-free helpers, and synchronous APIs retain non-
+`'static` sink compatibility.
+
 ## HA config authority opt-in
 
 Install the same config authority used by the consensus datastore on the

@@ -2,9 +2,13 @@
 
 use std::collections::HashMap;
 use std::num::NonZeroU32;
-use std::sync::{Arc, Mutex};
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 
-use tokio::sync::watch;
+use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
 /// Maximum NETCONF session id.
 ///
@@ -28,15 +32,94 @@ pub(crate) fn session_id_for_hello(session_id: u64) -> Option<NonZeroU32> {
 ///
 /// The registry stores only session ids and termination signals. It deliberately
 /// does not store principals, peer addresses, or request payloads.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct SessionRegistry {
     inner: Arc<Mutex<RegistryState>>,
+    async_gate: Arc<Semaphore>,
+}
+
+impl Default for SessionRegistry {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(RegistryState::default())),
+            async_gate: Arc::new(Semaphore::new(1)),
+        }
+    }
 }
 
 impl SessionRegistry {
     /// Builds an empty session registry.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Reserves the single cancellation-independent registry worker slot.
+    ///
+    /// Atomic NETCONF operations use fail-fast admission. Ordinary async
+    /// registry calls wait asynchronously before spawning, so there is never
+    /// more than one blocking mutex owner or waiter for a registry, even when
+    /// multiple server instances share it.
+    pub(crate) fn try_acquire_atomic(&self) -> Result<OwnedSemaphorePermit, TryAcquireError> {
+        Arc::clone(&self.async_gate).try_acquire_owned()
+    }
+
+    async fn run_async<R, F>(&self, operation: F) -> Result<R, SessionRegistryError>
+    where
+        R: Send + 'static,
+        F: FnOnce(SessionRegistry) -> R + Send + 'static,
+    {
+        tokio::runtime::Handle::try_current().map_err(|_| SessionRegistryError::Unavailable)?;
+        let permit = Arc::clone(&self.async_gate)
+            .acquire_owned()
+            .await
+            .map_err(|_| SessionRegistryError::Unavailable)?;
+        let registry = self.clone();
+        let task = catch_unwind(AssertUnwindSafe(|| {
+            tokio::task::spawn_blocking(move || {
+                let result = operation(registry);
+                (result, permit)
+            })
+        }))
+        .map_err(|_| SessionRegistryError::Unavailable)?;
+        let (result, permit) = task.await.map_err(|_| SessionRegistryError::Unavailable)?;
+        drop(permit);
+        Ok(result)
+    }
+
+    /// Registers a live session without parking an async executor worker.
+    pub(crate) async fn register_async(
+        &self,
+        session_id: u64,
+    ) -> Result<SessionRegistration, SessionRegistryError> {
+        self.run_async(move |registry| registry.register(session_id))
+            .await?
+    }
+
+    /// Acquires a running write lease without parking an async executor worker.
+    pub(crate) async fn begin_running_write_async(
+        &self,
+        session_id: u64,
+    ) -> Result<RunningWriteResult, SessionRegistryError> {
+        self.run_async(move |registry| registry.begin_running_write(session_id))
+            .await
+    }
+
+    /// Acquires a candidate write lease without parking an async executor worker.
+    pub(crate) async fn begin_candidate_write_async(
+        &self,
+        session_id: u64,
+    ) -> Result<CandidateWriteResult, SessionRegistryError> {
+        self.run_async(move |registry| registry.begin_candidate_write(session_id))
+            .await
+    }
+
+    /// Acquires a startup write lease without parking an async executor worker.
+    pub(crate) async fn begin_startup_write_async(
+        &self,
+        session_id: u64,
+    ) -> Result<StartupWriteResult, SessionRegistryError> {
+        self.run_async(move |registry| registry.begin_startup_write(session_id))
+            .await
     }
 
     /// Registers one live session id until the returned registration is dropped.
@@ -48,8 +131,12 @@ impl SessionRegistry {
             return Err(SessionRegistryError::InvalidSessionId);
         }
         let (kill_tx, kill_rx) = watch::channel(false);
-        let entry = Arc::new(SessionEntry { kill_tx });
+        let entry = Arc::new(SessionEntry {
+            kill_tx,
+            active: AtomicBool::new(true),
+        });
         let mut state = self.inner.lock().unwrap_or_else(|err| err.into_inner());
+        state.prune_inactive();
         if state.sessions.contains_key(&session_id) {
             return Err(SessionRegistryError::DuplicateSessionId);
         }
@@ -65,9 +152,11 @@ impl SessionRegistry {
     /// Requests termination after `before_signal` succeeds.
     ///
     /// The hook is used by the NETCONF server to durably record a success audit
-    /// event before any target session observes the termination signal. It is
-    /// called while the registry map is locked so the target cannot deregister
-    /// between the existence check and the signal.
+    /// event before any target session observes the termination signal. A live
+    /// exact-generation entry is the linearization point: disappearance before
+    /// that check is `NotFound`; disappearance while the hook runs remains
+    /// `Terminated`. A temporary receiver pins that generation across the hook,
+    /// so immediate reuse of the same numeric id cannot receive the old signal.
     pub(crate) fn terminate_after<F, E>(
         &self,
         session_id: u64,
@@ -77,10 +166,11 @@ impl SessionRegistry {
         F: FnOnce() -> Result<(), E>,
     {
         let mut state = self.inner.lock().unwrap_or_else(|err| err.into_inner());
+        state.prune_inactive();
         let Some(entry) = state.sessions.get(&session_id).cloned() else {
             return Ok(KillSessionResult::NotFound);
         };
-        if entry.kill_tx.receiver_count() == 0 {
+        if !entry.active.load(Ordering::Acquire) || entry.kill_tx.receiver_count() == 0 {
             state.sessions.remove(&session_id);
             state.release_running_lock(session_id);
             state.release_running_write(session_id);
@@ -90,19 +180,15 @@ impl SessionRegistry {
             state.release_startup_write(session_id);
             return Ok(KillSessionResult::NotFound);
         }
+        // Pin the exact generation's liveness across audit and signal. The
+        // actual session may concurrently begin Drop, but the post-audit send
+        // cannot be rewritten to NotFound merely because its receiver vanished.
+        let _liveness_pin = entry.kill_tx.subscribe();
         before_signal()?;
-        if entry.kill_tx.send(true).is_ok() {
-            Ok(KillSessionResult::Terminated)
-        } else {
-            state.sessions.remove(&session_id);
-            state.release_running_lock(session_id);
-            state.release_running_write(session_id);
-            state.release_candidate_lock(session_id);
-            state.release_candidate_write(session_id);
-            state.release_startup_lock(session_id);
-            state.release_startup_write(session_id);
-            Ok(KillSessionResult::NotFound)
-        }
+        // The liveness pin makes send infallible with respect to receiver
+        // disappearance. Ignore the result without exposing any stale receiver.
+        let _ = entry.kill_tx.send(true);
+        Ok(KillSessionResult::Terminated)
     }
 
     /// Acquires the global running datastore lock after `before_lock` succeeds.
@@ -115,46 +201,56 @@ impl SessionRegistry {
         F: FnOnce() -> Result<(), E>,
     {
         let mut state = self.inner.lock().unwrap_or_else(|err| err.into_inner());
-        if !state.sessions.contains_key(&session_id) {
+        state.prune_inactive();
+        let Some(session) = state.sessions.get(&session_id).cloned() else {
             return Ok(LockRunningResult::SessionNotRegistered);
-        }
-        if let Some(owner) = state.running_lock {
+        };
+        if let Some(owner) = state.running_lock.as_ref() {
             return Ok(LockRunningResult::Denied {
                 owner_session_id: owner.session_id,
             });
         }
-        if let Some(owner) = state.running_write {
+        if let Some(owner) = state.running_write.as_ref() {
             return Ok(LockRunningResult::Denied {
                 owner_session_id: owner.session_id,
             });
         }
         before_lock()?;
-        state.running_lock = Some(RunningLock { session_id });
+        state.running_lock = Some(RunningLock {
+            session_id,
+            session,
+        });
         Ok(LockRunningResult::Acquired)
     }
 
     /// Acquires a short-lived running datastore write guard.
     pub(crate) fn begin_running_write(&self, session_id: u64) -> RunningWriteResult {
         let mut state = self.inner.lock().unwrap_or_else(|err| err.into_inner());
-        if !state.sessions.contains_key(&session_id) {
+        state.prune_inactive();
+        let Some(session) = state.sessions.get(&session_id).cloned() else {
             return RunningWriteResult::SessionNotRegistered;
-        }
-        if let Some(owner) = state.running_lock {
+        };
+        if let Some(owner) = state.running_lock.as_ref() {
             if owner.session_id != session_id {
                 return RunningWriteResult::Denied {
                     owner_session_id: owner.session_id,
                 };
             }
         }
-        if let Some(owner) = state.running_write {
+        if let Some(owner) = state.running_write.as_ref() {
             return RunningWriteResult::Denied {
                 owner_session_id: owner.session_id,
             };
         }
-        state.running_write = Some(RunningWrite { session_id });
+        let lease = Arc::new(AtomicBool::new(true));
+        state.running_write = Some(RunningWrite {
+            session_id,
+            session,
+            lease: Arc::clone(&lease),
+        });
         RunningWriteResult::Acquired(RunningWriteGuard {
             registry: self.clone(),
-            session_id,
+            lease,
         })
     }
 
@@ -169,10 +265,11 @@ impl SessionRegistry {
         F: FnOnce() -> Result<(), E>,
     {
         let mut state = self.inner.lock().unwrap_or_else(|err| err.into_inner());
+        state.prune_inactive();
         if !state.sessions.contains_key(&session_id) {
             return Ok(UnlockRunningResult::SessionNotRegistered);
         }
-        match state.running_lock {
+        match state.running_lock.as_ref() {
             Some(owner) if owner.session_id == session_id => {
                 before_unlock()?;
                 state.running_lock = None;
@@ -195,46 +292,56 @@ impl SessionRegistry {
         F: FnOnce() -> Result<(), E>,
     {
         let mut state = self.inner.lock().unwrap_or_else(|err| err.into_inner());
-        if !state.sessions.contains_key(&session_id) {
+        state.prune_inactive();
+        let Some(session) = state.sessions.get(&session_id).cloned() else {
             return Ok(LockCandidateResult::SessionNotRegistered);
-        }
-        if let Some(owner) = state.candidate_lock {
+        };
+        if let Some(owner) = state.candidate_lock.as_ref() {
             return Ok(LockCandidateResult::Denied {
                 owner_session_id: owner.session_id,
             });
         }
-        if let Some(owner) = state.candidate_write {
+        if let Some(owner) = state.candidate_write.as_ref() {
             return Ok(LockCandidateResult::Denied {
                 owner_session_id: owner.session_id,
             });
         }
         before_lock()?;
-        state.candidate_lock = Some(CandidateLock { session_id });
+        state.candidate_lock = Some(CandidateLock {
+            session_id,
+            session,
+        });
         Ok(LockCandidateResult::Acquired)
     }
 
     /// Acquires a short-lived candidate datastore write guard.
     pub(crate) fn begin_candidate_write(&self, session_id: u64) -> CandidateWriteResult {
         let mut state = self.inner.lock().unwrap_or_else(|err| err.into_inner());
-        if !state.sessions.contains_key(&session_id) {
+        state.prune_inactive();
+        let Some(session) = state.sessions.get(&session_id).cloned() else {
             return CandidateWriteResult::SessionNotRegistered;
-        }
-        if let Some(owner) = state.candidate_lock {
+        };
+        if let Some(owner) = state.candidate_lock.as_ref() {
             if owner.session_id != session_id {
                 return CandidateWriteResult::Denied {
                     owner_session_id: owner.session_id,
                 };
             }
         }
-        if let Some(owner) = state.candidate_write {
+        if let Some(owner) = state.candidate_write.as_ref() {
             return CandidateWriteResult::Denied {
                 owner_session_id: owner.session_id,
             };
         }
-        state.candidate_write = Some(CandidateWrite { session_id });
+        let lease = Arc::new(AtomicBool::new(true));
+        state.candidate_write = Some(CandidateWrite {
+            session_id,
+            session,
+            lease: Arc::clone(&lease),
+        });
         CandidateWriteResult::Acquired(CandidateWriteGuard {
             registry: self.clone(),
-            session_id,
+            lease,
         })
     }
 
@@ -249,10 +356,11 @@ impl SessionRegistry {
         F: FnOnce() -> Result<(), E>,
     {
         let mut state = self.inner.lock().unwrap_or_else(|err| err.into_inner());
+        state.prune_inactive();
         if !state.sessions.contains_key(&session_id) {
             return Ok(UnlockCandidateResult::SessionNotRegistered);
         }
-        match state.candidate_lock {
+        match state.candidate_lock.as_ref() {
             Some(owner) if owner.session_id == session_id => {
                 before_unlock()?;
                 state.candidate_lock = None;
@@ -275,46 +383,56 @@ impl SessionRegistry {
         F: FnOnce() -> Result<(), E>,
     {
         let mut state = self.inner.lock().unwrap_or_else(|err| err.into_inner());
-        if !state.sessions.contains_key(&session_id) {
+        state.prune_inactive();
+        let Some(session) = state.sessions.get(&session_id).cloned() else {
             return Ok(LockStartupResult::SessionNotRegistered);
-        }
-        if let Some(owner) = state.startup_lock {
+        };
+        if let Some(owner) = state.startup_lock.as_ref() {
             return Ok(LockStartupResult::Denied {
                 owner_session_id: owner.session_id,
             });
         }
-        if let Some(owner) = state.startup_write {
+        if let Some(owner) = state.startup_write.as_ref() {
             return Ok(LockStartupResult::Denied {
                 owner_session_id: owner.session_id,
             });
         }
         before_lock()?;
-        state.startup_lock = Some(StartupLock { session_id });
+        state.startup_lock = Some(StartupLock {
+            session_id,
+            session,
+        });
         Ok(LockStartupResult::Acquired)
     }
 
     /// Acquires a short-lived startup datastore write guard.
     pub(crate) fn begin_startup_write(&self, session_id: u64) -> StartupWriteResult {
         let mut state = self.inner.lock().unwrap_or_else(|err| err.into_inner());
-        if !state.sessions.contains_key(&session_id) {
+        state.prune_inactive();
+        let Some(session) = state.sessions.get(&session_id).cloned() else {
             return StartupWriteResult::SessionNotRegistered;
-        }
-        if let Some(owner) = state.startup_lock {
+        };
+        if let Some(owner) = state.startup_lock.as_ref() {
             if owner.session_id != session_id {
                 return StartupWriteResult::Denied {
                     owner_session_id: owner.session_id,
                 };
             }
         }
-        if let Some(owner) = state.startup_write {
+        if let Some(owner) = state.startup_write.as_ref() {
             return StartupWriteResult::Denied {
                 owner_session_id: owner.session_id,
             };
         }
-        state.startup_write = Some(StartupWrite { session_id });
+        let lease = Arc::new(AtomicBool::new(true));
+        state.startup_write = Some(StartupWrite {
+            session_id,
+            session,
+            lease: Arc::clone(&lease),
+        });
         StartupWriteResult::Acquired(StartupWriteGuard {
             registry: self.clone(),
-            session_id,
+            lease,
         })
     }
 
@@ -329,10 +447,11 @@ impl SessionRegistry {
         F: FnOnce() -> Result<(), E>,
     {
         let mut state = self.inner.lock().unwrap_or_else(|err| err.into_inner());
+        state.prune_inactive();
         if !state.sessions.contains_key(&session_id) {
             return Ok(UnlockStartupResult::SessionNotRegistered);
         }
-        match state.startup_lock {
+        match state.startup_lock.as_ref() {
             Some(owner) if owner.session_id == session_id => {
                 before_unlock()?;
                 state.startup_lock = None;
@@ -346,7 +465,13 @@ impl SessionRegistry {
     }
 
     fn deregister(&self, session_id: u64, entry: &Arc<SessionEntry>) {
-        let mut state = self.inner.lock().unwrap_or_else(|err| err.into_inner());
+        entry.active.store(false, Ordering::Release);
+        let Ok(mut state) = self.inner.try_lock() else {
+            // All entry points lazily reap inactive generations. Drop must
+            // never wait behind an audit hook or park an async runtime thread.
+            return;
+        };
+        state.prune_inactive();
         if state
             .sessions
             .get(&session_id)
@@ -364,65 +489,51 @@ impl SessionRegistry {
 
     #[cfg(test)]
     pub(crate) fn contains_session_for_test(&self, session_id: u64) -> bool {
-        self.inner
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .sessions
-            .contains_key(&session_id)
+        let mut state = self.inner.lock().unwrap_or_else(|err| err.into_inner());
+        state.prune_inactive();
+        state.sessions.contains_key(&session_id)
     }
 
     #[cfg(test)]
     pub(crate) fn running_lock_owner_for_test(&self) -> Option<u64> {
-        self.inner
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .running_lock
-            .map(|lock| lock.session_id)
+        let mut state = self.inner.lock().unwrap_or_else(|err| err.into_inner());
+        state.prune_inactive();
+        state.running_lock.as_ref().map(|lock| lock.session_id)
     }
 
     #[cfg(test)]
     pub(crate) fn running_write_owner_for_test(&self) -> Option<u64> {
-        self.inner
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .running_write
-            .map(|write| write.session_id)
+        let mut state = self.inner.lock().unwrap_or_else(|err| err.into_inner());
+        state.prune_inactive();
+        state.running_write.as_ref().map(|write| write.session_id)
     }
 
     #[cfg(test)]
     pub(crate) fn candidate_lock_owner_for_test(&self) -> Option<u64> {
-        self.inner
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .candidate_lock
-            .map(|lock| lock.session_id)
+        let mut state = self.inner.lock().unwrap_or_else(|err| err.into_inner());
+        state.prune_inactive();
+        state.candidate_lock.as_ref().map(|lock| lock.session_id)
     }
 
     #[cfg(test)]
     pub(crate) fn candidate_write_owner_for_test(&self) -> Option<u64> {
-        self.inner
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .candidate_write
-            .map(|write| write.session_id)
+        let mut state = self.inner.lock().unwrap_or_else(|err| err.into_inner());
+        state.prune_inactive();
+        state.candidate_write.as_ref().map(|write| write.session_id)
     }
 
     #[cfg(test)]
     pub(crate) fn startup_lock_owner_for_test(&self) -> Option<u64> {
-        self.inner
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .startup_lock
-            .map(|lock| lock.session_id)
+        let mut state = self.inner.lock().unwrap_or_else(|err| err.into_inner());
+        state.prune_inactive();
+        state.startup_lock.as_ref().map(|lock| lock.session_id)
     }
 
     #[cfg(test)]
     pub(crate) fn startup_write_owner_for_test(&self) -> Option<u64> {
-        self.inner
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .startup_write
-            .map(|write| write.session_id)
+        let mut state = self.inner.lock().unwrap_or_else(|err| err.into_inner());
+        state.prune_inactive();
+        state.startup_write.as_ref().map(|write| write.session_id)
     }
 }
 
@@ -438,9 +549,51 @@ struct RegistryState {
 }
 
 impl RegistryState {
+    fn prune_inactive(&mut self) {
+        self.sessions
+            .retain(|_, entry| entry.active.load(Ordering::Acquire));
+        if self
+            .running_lock
+            .as_ref()
+            .is_some_and(|owner| !owner.session.active.load(Ordering::Acquire))
+        {
+            self.running_lock = None;
+        }
+        if self
+            .candidate_lock
+            .as_ref()
+            .is_some_and(|owner| !owner.session.active.load(Ordering::Acquire))
+        {
+            self.candidate_lock = None;
+        }
+        if self
+            .startup_lock
+            .as_ref()
+            .is_some_and(|owner| !owner.session.active.load(Ordering::Acquire))
+        {
+            self.startup_lock = None;
+        }
+        if self.running_write.as_ref().is_some_and(|owner| {
+            !owner.session.active.load(Ordering::Acquire) || !owner.lease.load(Ordering::Acquire)
+        }) {
+            self.running_write = None;
+        }
+        if self.candidate_write.as_ref().is_some_and(|owner| {
+            !owner.session.active.load(Ordering::Acquire) || !owner.lease.load(Ordering::Acquire)
+        }) {
+            self.candidate_write = None;
+        }
+        if self.startup_write.as_ref().is_some_and(|owner| {
+            !owner.session.active.load(Ordering::Acquire) || !owner.lease.load(Ordering::Acquire)
+        }) {
+            self.startup_write = None;
+        }
+    }
+
     fn release_running_lock(&mut self, session_id: u64) {
         if self
             .running_lock
+            .as_ref()
             .is_some_and(|lock| lock.session_id == session_id)
         {
             self.running_lock = None;
@@ -450,6 +603,7 @@ impl RegistryState {
     fn release_running_write(&mut self, session_id: u64) {
         if self
             .running_write
+            .as_ref()
             .is_some_and(|write| write.session_id == session_id)
         {
             self.running_write = None;
@@ -459,6 +613,7 @@ impl RegistryState {
     fn release_candidate_lock(&mut self, session_id: u64) {
         if self
             .candidate_lock
+            .as_ref()
             .is_some_and(|lock| lock.session_id == session_id)
         {
             self.candidate_lock = None;
@@ -468,6 +623,7 @@ impl RegistryState {
     fn release_candidate_write(&mut self, session_id: u64) {
         if self
             .candidate_write
+            .as_ref()
             .is_some_and(|write| write.session_id == session_id)
         {
             self.candidate_write = None;
@@ -477,6 +633,7 @@ impl RegistryState {
     fn release_startup_lock(&mut self, session_id: u64) {
         if self
             .startup_lock
+            .as_ref()
             .is_some_and(|lock| lock.session_id == session_id)
         {
             self.startup_lock = None;
@@ -486,6 +643,7 @@ impl RegistryState {
     fn release_startup_write(&mut self, session_id: u64) {
         if self
             .startup_write
+            .as_ref()
             .is_some_and(|write| write.session_id == session_id)
         {
             self.startup_write = None;
@@ -496,86 +654,90 @@ impl RegistryState {
 #[derive(Debug)]
 struct SessionEntry {
     kill_tx: watch::Sender<bool>,
+    active: AtomicBool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 struct RunningLock {
     session_id: u64,
+    session: Arc<SessionEntry>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 struct RunningWrite {
     session_id: u64,
+    session: Arc<SessionEntry>,
+    lease: Arc<AtomicBool>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 struct CandidateLock {
     session_id: u64,
+    session: Arc<SessionEntry>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 struct CandidateWrite {
     session_id: u64,
+    session: Arc<SessionEntry>,
+    lease: Arc<AtomicBool>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 struct StartupLock {
     session_id: u64,
+    session: Arc<SessionEntry>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 struct StartupWrite {
     session_id: u64,
+    session: Arc<SessionEntry>,
+    lease: Arc<AtomicBool>,
 }
 
 /// Drop guard for an in-flight running datastore write.
 pub(crate) struct RunningWriteGuard {
     registry: SessionRegistry,
-    session_id: u64,
+    lease: Arc<AtomicBool>,
 }
 
 impl Drop for RunningWriteGuard {
     fn drop(&mut self) {
-        let mut state = self
-            .registry
-            .inner
-            .lock()
-            .unwrap_or_else(|err| err.into_inner());
-        state.release_running_write(self.session_id);
+        self.lease.store(false, Ordering::Release);
+        if let Ok(mut state) = self.registry.inner.try_lock() {
+            state.prune_inactive();
+        }
     }
 }
 
 /// Drop guard for an in-flight candidate datastore write.
 pub(crate) struct CandidateWriteGuard {
     registry: SessionRegistry,
-    session_id: u64,
+    lease: Arc<AtomicBool>,
 }
 
 /// Drop guard for an in-flight startup datastore write.
 pub(crate) struct StartupWriteGuard {
     registry: SessionRegistry,
-    session_id: u64,
+    lease: Arc<AtomicBool>,
 }
 
 impl Drop for StartupWriteGuard {
     fn drop(&mut self) {
-        let mut state = self
-            .registry
-            .inner
-            .lock()
-            .unwrap_or_else(|err| err.into_inner());
-        state.release_startup_write(self.session_id);
+        self.lease.store(false, Ordering::Release);
+        if let Ok(mut state) = self.registry.inner.try_lock() {
+            state.prune_inactive();
+        }
     }
 }
 
 impl Drop for CandidateWriteGuard {
     fn drop(&mut self) {
-        let mut state = self
-            .registry
-            .inner
-            .lock()
-            .unwrap_or_else(|err| err.into_inner());
-        state.release_candidate_write(self.session_id);
+        self.lease.store(false, Ordering::Release);
+        if let Ok(mut state) = self.registry.inner.try_lock() {
+            state.prune_inactive();
+        }
     }
 }
 
@@ -624,6 +786,8 @@ pub(crate) enum SessionRegistryError {
     InvalidSessionId,
     /// The session id is already registered.
     DuplicateSessionId,
+    /// The bounded async registry worker could not be admitted or completed.
+    Unavailable,
 }
 
 /// Result of a `<kill-session>` termination request.
@@ -830,6 +994,50 @@ mod tests {
     }
 
     #[test]
+    fn inactive_generation_with_live_receiver_is_not_found_before_audit() {
+        let registry = SessionRegistry::new();
+        let registration = registry.register(42).expect("register");
+        // Model Registration::drop after its release-store but before the
+        // receiver field is dropped. A receiver count alone must not revive it.
+        registration.entry.active.store(false, Ordering::Release);
+        let mut audited = false;
+
+        let result = registry.terminate_after(42, || {
+            audited = true;
+            Ok::<(), ()>(())
+        });
+
+        assert_eq!(result, Ok(KillSessionResult::NotFound));
+        assert!(!audited);
+        drop(registration);
+        let replacement = registry.register(42).expect("same-id replacement");
+        assert!(!replacement.is_terminated());
+    }
+
+    #[test]
+    fn disappearance_during_audit_terminates_only_the_exact_generation() {
+        let registry = SessionRegistry::new();
+        let mut old_generation = Some(registry.register(42).expect("register"));
+
+        let result = registry.terminate_after(42, || {
+            drop(old_generation.take());
+            Ok::<(), ()>(())
+        });
+
+        assert_eq!(result, Ok(KillSessionResult::Terminated));
+        let replacement = registry.register(42).expect("same-id replacement");
+        assert!(
+            !replacement.is_terminated(),
+            "old generation's kill signal leaked across id reuse"
+        );
+        assert_eq!(
+            registry.terminate_after(42, || Ok::<(), ()>(())),
+            Ok(KillSessionResult::Terminated)
+        );
+        assert!(replacement.is_terminated());
+    }
+
+    #[test]
     fn stale_entry_without_receiver_is_not_found_without_hook() {
         let registry = SessionRegistry::new();
         let (kill_tx, kill_rx) = watch::channel(false);
@@ -839,7 +1047,13 @@ mod tests {
             .lock()
             .expect("registry mutex")
             .sessions
-            .insert(42, Arc::new(SessionEntry { kill_tx }));
+            .insert(
+                42,
+                Arc::new(SessionEntry {
+                    kill_tx,
+                    active: AtomicBool::new(true),
+                }),
+            );
 
         let result = registry.terminate_after(42, || panic!("hook must not run"));
 

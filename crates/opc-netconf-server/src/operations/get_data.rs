@@ -22,6 +22,7 @@ use crate::filter::{
 use crate::metrics::{
     record_nacm_denials, record_rpc_error, record_rpc_success, NetconfNacmAction, NetconfOperation,
 };
+use crate::operations::{poll_ready, record_audit, AuditMode};
 use crate::xml::{GetDataRequest, NmdaDatastore, WithDefaultsMode};
 
 /// Shared context for handling one `<get-data>` request.
@@ -71,35 +72,82 @@ where
     P: PolicySource,
     A: AuditSink,
 {
+    poll_ready(handle_get_data_inner::<C, B, P, A>(
+        binding,
+        ctx,
+        request,
+        AuditMode::Synchronous,
+    ))
+}
+
+pub(crate) async fn handle_get_data_async<C, B, P, A>(
+    binding: &B,
+    ctx: GetDataContext<'_, C, P, A>,
+    request: &GetDataRequest,
+) -> String
+where
+    C: OpcConfig,
+    B: NetconfConfigBinding<C>,
+    P: PolicySource,
+    A: AuditSink,
+{
+    handle_get_data_inner::<C, B, P, A>(binding, ctx, request, AuditMode::Asynchronous).await
+}
+
+async fn handle_get_data_inner<C, B, P, A>(
+    binding: &B,
+    ctx: GetDataContext<'_, C, P, A>,
+    request: &GetDataRequest,
+    audit_mode: AuditMode,
+) -> String
+where
+    C: OpcConfig,
+    B: NetconfConfigBinding<C>,
+    P: PolicySource,
+    A: AuditSink,
+{
     if !binding.nmda_get_data_supported() {
         return fail(
+            audit_mode,
             &ctx,
             RpcError::operation_not_supported(),
             "operation-not-supported",
             Vec::new(),
-        );
+        )
+        .await;
     }
 
     if request.max_depth_limited || request.origin_filter_present {
         return fail(
+            audit_mode,
             &ctx,
             RpcError::operation_not_supported(),
             "operation-not-supported",
             Vec::new(),
-        );
+        )
+        .await;
     }
 
     if request.with_origin && request.datastore != NmdaDatastore::Operational {
-        return fail(&ctx, RpcError::invalid_value(), "invalid-value", Vec::new());
+        return fail(
+            audit_mode,
+            &ctx,
+            RpcError::invalid_value(),
+            "invalid-value",
+            Vec::new(),
+        )
+        .await;
     }
 
     if request.with_origin {
         return fail(
+            audit_mode,
             &ctx,
             RpcError::operation_not_supported(),
             "operation-not-supported",
             Vec::new(),
-        );
+        )
+        .await;
     }
 
     if request.with_defaults.is_some_and(|mode| {
@@ -109,47 +157,82 @@ where
                 .is_some_and(|cap| cap.supports(mode))
     }) {
         return fail(
+            audit_mode,
             &ctx,
             RpcError::operation_not_supported(),
             "operation-not-supported",
             Vec::new(),
-        );
+        )
+        .await;
     }
 
     match request.datastore {
         NmdaDatastore::Running => {
-            handle_config_datastore(binding, ctx, request, ConfigSource::Running)
+            handle_config_datastore(binding, ctx, request, ConfigSource::Running, audit_mode).await
         }
         NmdaDatastore::Candidate => {
             if !ctx.candidate_supported {
-                return fail(&ctx, RpcError::invalid_value(), "invalid-value", Vec::new());
+                return fail(
+                    audit_mode,
+                    &ctx,
+                    RpcError::invalid_value(),
+                    "invalid-value",
+                    Vec::new(),
+                )
+                .await;
             }
             if ctx.candidate_config.is_none() {
                 return fail(
+                    audit_mode,
                     &ctx,
                     RpcError::operation_failed(),
                     "operation-failed",
                     Vec::new(),
-                );
+                )
+                .await;
             }
-            handle_config_datastore(binding, ctx, request, ConfigSource::Candidate)
+            handle_config_datastore(binding, ctx, request, ConfigSource::Candidate, audit_mode)
+                .await
         }
         NmdaDatastore::Startup => {
             if !ctx.startup_supported {
-                return fail(&ctx, RpcError::invalid_value(), "invalid-value", Vec::new());
+                return fail(
+                    audit_mode,
+                    &ctx,
+                    RpcError::invalid_value(),
+                    "invalid-value",
+                    Vec::new(),
+                )
+                .await;
             }
             if ctx.startup_config.is_none() {
-                return fail(&ctx, RpcError::data_missing(), "data-missing", Vec::new());
+                return fail(
+                    audit_mode,
+                    &ctx,
+                    RpcError::data_missing(),
+                    "data-missing",
+                    Vec::new(),
+                )
+                .await;
             }
-            handle_config_datastore(binding, ctx, request, ConfigSource::Startup)
+            handle_config_datastore(binding, ctx, request, ConfigSource::Startup, audit_mode).await
         }
         NmdaDatastore::Intended => {
             if !binding.nmda_intended_equals_running() {
-                return fail(&ctx, RpcError::invalid_value(), "invalid-value", Vec::new());
+                return fail(
+                    audit_mode,
+                    &ctx,
+                    RpcError::invalid_value(),
+                    "invalid-value",
+                    Vec::new(),
+                )
+                .await;
             }
-            handle_config_datastore(binding, ctx, request, ConfigSource::Running)
+            handle_config_datastore(binding, ctx, request, ConfigSource::Running, audit_mode).await
         }
-        NmdaDatastore::Operational => handle_operational_datastore(binding, ctx, request),
+        NmdaDatastore::Operational => {
+            handle_operational_datastore(binding, ctx, request, audit_mode).await
+        }
     }
 }
 
@@ -164,11 +247,12 @@ enum ConfigSource {
     clippy::expect_used,
     reason = "presence established by the datastore-support check in the same function"
 )]
-fn handle_config_datastore<C, B, P, A>(
+async fn handle_config_datastore<C, B, P, A>(
     binding: &B,
     ctx: GetDataContext<'_, C, P, A>,
     request: &GetDataRequest,
     source: ConfigSource,
+    audit_mode: AuditMode,
 ) -> String
 where
     C: OpcConfig,
@@ -177,20 +261,29 @@ where
     A: AuditSink,
 {
     if request.config_filter == Some(false) {
-        return success(&ctx, Vec::new(), "");
+        return success(audit_mode, &ctx, Vec::new(), "").await;
     }
 
     let registry = binding.schema_registry();
     let config_paths =
         match get_config_paths_with_limits(registry, request.filter.as_ref(), ctx.limits) {
             Ok(paths) => paths,
-            Err(err) => return fail(&ctx, err.rpc_error(), err.audit_reason(), Vec::new()),
+            Err(err) => {
+                return fail(
+                    audit_mode,
+                    &ctx,
+                    err.rpc_error(),
+                    err.audit_reason(),
+                    Vec::new(),
+                )
+                .await
+            }
         };
     if ctx.limits.check_paths(config_paths.len()).is_err() {
-        return fail(&ctx, RpcError::too_big(), "too-big", Vec::new());
+        return fail(audit_mode, &ctx, RpcError::too_big(), "too-big", Vec::new()).await;
     }
     if config_paths.is_empty() {
-        return success(&ctx, Vec::new(), "");
+        return success(audit_mode, &ctx, Vec::new(), "").await;
     }
 
     let decisions = match ctx
@@ -200,11 +293,13 @@ where
         Ok(decisions) => decisions,
         Err(_) => {
             return fail(
+                audit_mode,
                 &ctx,
                 RpcError::resource_denied(),
                 "resource-denied",
                 schema_paths(&config_paths),
             )
+            .await
         }
     };
     let denied_count = decisions
@@ -218,7 +313,7 @@ where
         .filter_map(|(decision, path)| decision.allowed.then_some(path))
         .collect::<Vec<_>>();
     if allowed_paths.is_empty() {
-        return success(&ctx, Vec::new(), "");
+        return success(audit_mode, &ctx, Vec::new(), "").await;
     }
 
     let snapshot =
@@ -243,20 +338,25 @@ where
     };
 
     match rendered {
-        Ok(data_xml) => success(&ctx, schema_paths(&allowed_paths), &data_xml),
-        Err(_) => fail(
-            &ctx,
-            RpcError::operation_failed(),
-            "operation-failed",
-            schema_paths(&allowed_paths),
-        ),
+        Ok(data_xml) => success(audit_mode, &ctx, schema_paths(&allowed_paths), &data_xml).await,
+        Err(_) => {
+            fail(
+                audit_mode,
+                &ctx,
+                RpcError::operation_failed(),
+                "operation-failed",
+                schema_paths(&allowed_paths),
+            )
+            .await
+        }
     }
 }
 
-fn handle_operational_datastore<C, B, P, A>(
+async fn handle_operational_datastore<C, B, P, A>(
     binding: &B,
     ctx: GetDataContext<'_, C, P, A>,
     request: &GetDataRequest,
+    audit_mode: AuditMode,
 ) -> String
 where
     C: OpcConfig,
@@ -266,11 +366,13 @@ where
 {
     if request.with_defaults.is_some() {
         return fail(
+            audit_mode,
             &ctx,
             RpcError::operation_not_supported(),
             "operation-not-supported",
             Vec::new(),
-        );
+        )
+        .await;
     }
 
     let registry = binding.schema_registry();
@@ -282,7 +384,16 @@ where
         ctx.limits,
     ) {
         Ok(paths) => paths,
-        Err(err) => return fail(&ctx, err.rpc_error(), err.audit_reason(), Vec::new()),
+        Err(err) => {
+            return fail(
+                audit_mode,
+                &ctx,
+                err.rpc_error(),
+                err.audit_reason(),
+                Vec::new(),
+            )
+            .await
+        }
     };
     let decisions =
         match ctx
@@ -292,11 +403,13 @@ where
             Ok(decisions) => decisions,
             Err(_) => {
                 return fail(
+                    audit_mode,
                     &ctx,
                     RpcError::resource_denied(),
                     "resource-denied",
                     schema_paths(&selected_paths.data_paths),
                 )
+                .await
             }
         };
     let allowed_paths = decisions
@@ -315,11 +428,13 @@ where
             Ok(decisions) => decisions,
             Err(()) => {
                 return fail(
+                    audit_mode,
                     &ctx,
                     RpcError::resource_denied(),
                     "resource-denied",
                     schema_paths(&selected_paths.yang_library_paths),
                 )
+                .await
             }
         }
     } else {
@@ -334,11 +449,13 @@ where
             Ok(decisions) => decisions,
             Err(()) => {
                 return fail(
+                    audit_mode,
                     &ctx,
                     RpcError::resource_denied(),
                     "resource-denied",
                     schema_paths(&selected_paths.netconf_monitoring_paths),
                 )
+                .await
             }
         }
     } else {
@@ -392,18 +509,20 @@ where
         .saturating_add(allowed_yang_library_paths.len())
         .saturating_add(allowed_netconf_monitoring_paths.len());
     if ctx.limits.check_paths(selected_path_count).is_err() {
-        return fail(&ctx, RpcError::too_big(), "too-big", Vec::new());
+        return fail(audit_mode, &ctx, RpcError::too_big(), "too-big", Vec::new()).await;
     }
 
     let operational = match read_operational(binding, &state_paths) {
         Ok(response) => response,
         Err(()) => {
             return fail(
+                audit_mode,
                 &ctx,
                 RpcError::operation_failed(),
                 "operation-failed",
                 schema_paths(&allowed_paths),
             )
+            .await
         }
     };
     let render_state_paths = state_paths_with_values(&state_paths, &operational);
@@ -434,25 +553,33 @@ where
         }
         Ok(data_xml)
     }) {
-        Ok(data_xml) => success(
-            &ctx,
-            audit_paths(
-                &allowed_paths,
-                &allowed_yang_library_paths,
-                &allowed_netconf_monitoring_paths,
-            ),
-            &data_xml,
-        ),
-        Err(_) => fail(
-            &ctx,
-            RpcError::operation_failed(),
-            "operation-failed",
-            audit_paths(
-                &allowed_paths,
-                &allowed_yang_library_paths,
-                &allowed_netconf_monitoring_paths,
-            ),
-        ),
+        Ok(data_xml) => {
+            success(
+                audit_mode,
+                &ctx,
+                audit_paths(
+                    &allowed_paths,
+                    &allowed_yang_library_paths,
+                    &allowed_netconf_monitoring_paths,
+                ),
+                &data_xml,
+            )
+            .await
+        }
+        Err(_) => {
+            fail(
+                audit_mode,
+                &ctx,
+                RpcError::operation_failed(),
+                "operation-failed",
+                audit_paths(
+                    &allowed_paths,
+                    &allowed_yang_library_paths,
+                    &allowed_netconf_monitoring_paths,
+                ),
+            )
+            .await
+        }
     }
 }
 
@@ -552,7 +679,8 @@ fn has_data_bearing_config_path(
     })
 }
 
-fn success<C, P, A>(
+async fn success<C, P, A>(
+    mode: AuditMode,
     ctx: &GetDataContext<'_, C, P, A>,
     paths: Vec<SchemaNodePath>,
     data_xml: &str,
@@ -563,12 +691,14 @@ where
     A: AuditSink,
 {
     if audit_success(
+        mode,
         ctx.audit,
         ctx.request_id,
         ctx.principal,
         ctx.transport,
         paths,
     )
+    .await
     .is_err()
     {
         record_rpc_error(
@@ -582,7 +712,8 @@ where
     rpc_ok_reply_with_attrs_and_data_ns(ctx.message_id, ctx.reply_attrs, NETCONF_NMDA_NS, data_xml)
 }
 
-fn fail<C, P, A>(
+async fn fail<C, P, A>(
+    mode: AuditMode,
     ctx: &GetDataContext<'_, C, P, A>,
     error: RpcError,
     reason: &'static str,
@@ -594,6 +725,7 @@ where
     A: AuditSink,
 {
     if audit_failure(
+        mode,
         ctx.audit,
         ctx.request_id,
         ctx.principal,
@@ -601,6 +733,7 @@ where
         reason,
         paths,
     )
+    .await
     .is_err()
     {
         record_rpc_error(
@@ -627,14 +760,17 @@ where
     rpc_error_reply_with_attrs(Some(ctx.message_id), ctx.reply_attrs, error)
 }
 
-fn audit_success<A: AuditSink>(
+async fn audit_success<A: AuditSink>(
+    mode: AuditMode,
     audit: &A,
     request_id: RequestId,
     principal: &TrustedPrincipal,
     transport: TransportType,
     paths: Vec<SchemaNodePath>,
 ) -> Result<(), AuditError> {
-    audit.record(
+    record_audit(
+        mode,
+        audit,
         &AuditEvent::new(
             request_id,
             principal,
@@ -644,13 +780,15 @@ fn audit_success<A: AuditSink>(
         )
         .with_paths(paths),
     )
+    .await
 }
 
 #[expect(
     clippy::expect_used,
     reason = "static NETCONF audit reason codes are valid by construction"
 )]
-fn audit_failure<A: AuditSink>(
+async fn audit_failure<A: AuditSink>(
+    mode: AuditMode,
     audit: &A,
     request_id: RequestId,
     principal: &TrustedPrincipal,
@@ -658,7 +796,9 @@ fn audit_failure<A: AuditSink>(
     reason: &'static str,
     paths: Vec<SchemaNodePath>,
 ) -> Result<(), AuditError> {
-    audit.record(
+    record_audit(
+        mode,
+        audit,
         &AuditEvent::new(
             request_id,
             principal,
@@ -668,6 +808,7 @@ fn audit_failure<A: AuditSink>(
         )
         .with_paths(paths),
     )
+    .await
 }
 
 #[expect(

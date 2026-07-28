@@ -1,12 +1,14 @@
 //! Durable, tamper-evident implementation of [`opc_mgmt_audit::AuditSink`].
 //!
-//! [`DurableAuditSink`] bridges the synchronous management audit boundary to
-//! the reference asynchronous [`opc_persist::SqliteBackend`] on one bounded
-//! worker queue. A successful [`opc_mgmt_audit::AuditSink::record`] means the
-//! event, retention update, and authenticated anchor were committed in one
-//! SQLite transaction. Queue pressure is bounded and reported synchronously;
-//! events are never silently dropped or reported successful without a durable
-//! acknowledgement.
+//! [`DurableAuditSink`] serializes management audit work onto one bounded
+//! worker queue backed by the asynchronous [`opc_persist::SqliteBackend`].
+//! Both [`opc_mgmt_audit::AuditSink::record`] and its native
+//! [`opc_mgmt_audit::AuditSink::record_async`] override report success only
+//! after the event, retention update, and authenticated anchor commit in one
+//! SQLite transaction. Queue pressure fails immediately. Cancellation after
+//! async admission cannot retract the append, so timeout, error, or caller drop
+//! can leave its outcome unknown. Verification, querying, and final sink drop
+//! remain bounded synchronous operations.
 //!
 //! Construction performs durable-storage preflight and complete retained-chain
 //! verification before the sink can accept an event. Ephemeral or unsafe
@@ -21,8 +23,10 @@
 
 use std::{
     fmt,
+    future::Future,
     panic::{catch_unwind, AssertUnwindSafe},
     path::PathBuf,
+    pin::Pin,
     sync::{
         atomic::{AtomicU64, Ordering},
         mpsc, Mutex,
@@ -46,17 +50,18 @@ use thiserror::Error;
 
 /// Fixed number of requests admitted ahead of the durable worker.
 ///
-/// A full queue rejects the synchronous caller immediately and therefore
-/// preserves the fail-closed `AuditSink` contract without unbounded memory or
-/// silent loss.
+/// A full queue rejects either sync or async admission immediately, preserving
+/// the fail-closed `AuditSink` contract without unbounded memory or silent loss.
 pub const DURABLE_AUDIT_QUEUE_CAPACITY: usize = 64;
-/// Maximum time a synchronous caller waits for durable acknowledgement.
+/// Maximum time a sync or async caller waits for durable acknowledgement.
 ///
 /// Expiry is a fail-closed, outcome-unknown result: the atomic append may
 /// subsequently commit, but the caller never receives manufactured success.
 pub const DURABLE_AUDIT_ACKNOWLEDGEMENT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Maximum time shutdown waits for queued work and worker teardown.
 pub const DURABLE_AUDIT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(any(test, feature = "testing"))]
+const DURABLE_AUDIT_TESTING_HOLD_MAX_DURATION: Duration = Duration::from_secs(30);
 
 static DURABLE_AUDIT_WORKER_DETACHMENTS: AtomicU64 = AtomicU64::new(0);
 
@@ -152,8 +157,18 @@ impl DurableAuditSink {
         })
     }
 
-    #[cfg(test)]
-    async fn from_backend_with_timeouts(
+    /// Start a sink with caller-selected acknowledgement and shutdown bounds.
+    ///
+    /// This seam is available only with the non-default `testing` feature and
+    /// exists for deterministic timeout and cancellation tests. Both bounds
+    /// are clamped to 30 seconds; zero-duration bounds remain available.
+    ///
+    /// # Warning
+    ///
+    /// Never enable the `testing` feature in production. It intentionally
+    /// exposes worker-stalling behavior for adversarial integration tests.
+    #[cfg(any(test, feature = "testing"))]
+    pub async fn from_backend_with_timeouts(
         backend: SqliteBackend,
         retention: ManagementAuditRetention,
         acknowledgement_timeout: Duration,
@@ -162,10 +177,69 @@ impl DurableAuditSink {
         Self::start(
             backend,
             retention,
-            acknowledgement_timeout,
-            shutdown_timeout,
+            clamp_testing_timeout(acknowledgement_timeout),
+            clamp_testing_timeout(shutdown_timeout),
         )
         .await
+    }
+
+    /// Hold the durable worker after it acknowledges starting.
+    ///
+    /// This deterministic testing seam is available only with the non-default
+    /// `testing` feature. Dropping or explicitly releasing the returned guard
+    /// unblocks the worker. The worker also self-releases after a fixed 30
+    /// seconds, so forgetting the guard cannot wedge it indefinitely. The
+    /// caller-selected start timeout is likewise clamped to 30 seconds.
+    ///
+    /// # Warning
+    ///
+    /// Never enable the `testing` feature in production. This method is an
+    /// intentional denial-of-service seam for controlled tests.
+    #[cfg(any(test, feature = "testing"))]
+    pub async fn hold_worker_for_testing(
+        &self,
+        start_timeout: Duration,
+    ) -> Result<DurableAuditWorkerHold, DurableAuditSinkError> {
+        tokio::runtime::Handle::try_current()
+            .map_err(|_| DurableAuditSinkError::WorkerUnavailable)?;
+        let deadline = tokio::time::Instant::now()
+            .checked_add(clamp_testing_timeout(start_timeout))
+            .ok_or(DurableAuditSinkError::WorkerUnavailable)?;
+        let deadline_wait = catch_unwind(AssertUnwindSafe(|| tokio::time::sleep_until(deadline)))
+            .map_err(|_| DurableAuditSinkError::WorkerUnavailable)?;
+
+        let sender = self
+            .sender
+            .as_ref()
+            .ok_or(DurableAuditSinkError::WorkerUnavailable)?;
+        let (started_sender, started_receiver) = tokio::sync::oneshot::channel();
+        let (release_sender, release_receiver) = mpsc::sync_channel(1);
+        let guard = DurableAuditWorkerHold {
+            release_sender: Some(release_sender),
+        };
+        let (reply_sender, _reply_receiver) = tokio::sync::oneshot::channel();
+        sender
+            .try_send(WorkerRequest {
+                command: WorkerCommand::HoldWithStart {
+                    started_sender,
+                    release_receiver,
+                },
+                reply_sender: WorkerReplySender::Asynchronous(reply_sender),
+            })
+            .map_err(|error| match error {
+                mpsc::TrySendError::Full(_) => DurableAuditSinkError::QueueFull,
+                mpsc::TrySendError::Disconnected(_) => DurableAuditSinkError::WorkerUnavailable,
+            })?;
+
+        tokio::pin!(deadline_wait);
+        tokio::select! {
+            biased;
+            started = started_receiver => {
+                started.map_err(|_| DurableAuditSinkError::WorkerUnavailable)?;
+                Ok(guard)
+            }
+            () = &mut deadline_wait => Err(DurableAuditSinkError::AcknowledgementTimeout),
+        }
     }
 
     /// Re-authenticate every retained link and return its durable boundaries.
@@ -196,7 +270,7 @@ impl DurableAuditSink {
         sender
             .try_send(WorkerRequest {
                 command,
-                reply_sender,
+                reply_sender: WorkerReplySender::Synchronous(reply_sender),
             })
             .map_err(|error| match error {
                 mpsc::TrySendError::Full(_) => DurableAuditSinkError::QueueFull,
@@ -210,12 +284,116 @@ impl DurableAuditSink {
             })?
     }
 
+    async fn request_async(
+        &self,
+        command: WorkerCommand,
+    ) -> Result<WorkerReply, DurableAuditSinkError> {
+        self.request_async_inner(command, None).await
+    }
+
+    async fn request_async_inner(
+        &self,
+        command: WorkerCommand,
+        #[cfg(test)] admitted: Option<tokio::sync::oneshot::Sender<()>>,
+        #[cfg(not(test))] _admitted: Option<()>,
+    ) -> Result<WorkerReply, DurableAuditSinkError> {
+        // A Tokio timer is part of the fail-closed acknowledgement bound.
+        // Prove that both runtime and timer capabilities exist before admitting
+        // the request, so a missing driver cannot strand an admitted append.
+        tokio::runtime::Handle::try_current()
+            .map_err(|_| DurableAuditSinkError::WorkerUnavailable)?;
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.acknowledgement_timeout)
+            .ok_or(DurableAuditSinkError::WorkerUnavailable)?;
+        let deadline_wait = catch_unwind(AssertUnwindSafe(|| tokio::time::sleep_until(deadline)))
+            .map_err(|_| DurableAuditSinkError::WorkerUnavailable)?;
+
+        let sender = self
+            .sender
+            .as_ref()
+            .ok_or(DurableAuditSinkError::WorkerUnavailable)?;
+        let (reply_sender, reply_receiver) = tokio::sync::oneshot::channel();
+        sender
+            .try_send(WorkerRequest {
+                command,
+                reply_sender: WorkerReplySender::Asynchronous(reply_sender),
+            })
+            .map_err(|error| match error {
+                mpsc::TrySendError::Full(_) => DurableAuditSinkError::QueueFull,
+                mpsc::TrySendError::Disconnected(_) => DurableAuditSinkError::WorkerUnavailable,
+            })?;
+        #[cfg(test)]
+        if let Some(admitted) = admitted {
+            let _ = admitted.send(());
+        }
+
+        tokio::pin!(deadline_wait);
+        tokio::select! {
+            // At the deadline boundary, prefer an acknowledgement that is
+            // already available over manufacturing an outcome-unknown error.
+            biased;
+            reply = reply_receiver => {
+                reply.map_err(|_| DurableAuditSinkError::WorkerUnavailable)?
+            }
+            () = &mut deadline_wait => Err(DurableAuditSinkError::AcknowledgementTimeout),
+        }
+    }
+
     #[cfg(test)]
     fn stall_worker(&self, duration: Duration) -> Result<(), DurableAuditSinkError> {
         match self.request(WorkerCommand::Stall(duration))? {
             WorkerReply::Stalled => Ok(()),
             _ => Err(DurableAuditSinkError::WorkerProtocol),
         }
+    }
+
+    #[cfg(test)]
+    async fn record_async_with_admission(
+        &self,
+        event: &AuditEvent,
+        admitted: tokio::sync::oneshot::Sender<()>,
+    ) -> Result<(), AuditError> {
+        let event = convert_event(event).map_err(|_| {
+            AuditError::failed("durable management audit rejected the structured event")
+        })?;
+        map_append_reply(
+            self.request_async_inner(WorkerCommand::Append(event), Some(admitted))
+                .await,
+        )
+    }
+}
+
+#[cfg(any(test, feature = "testing"))]
+fn clamp_testing_timeout(timeout: Duration) -> Duration {
+    timeout.min(DURABLE_AUDIT_TESTING_HOLD_MAX_DURATION)
+}
+
+/// RAII release token returned by
+/// [`DurableAuditSink::hold_worker_for_testing`].
+#[cfg(any(test, feature = "testing"))]
+#[must_use = "dropping the guard releases the durable audit worker"]
+pub struct DurableAuditWorkerHold {
+    release_sender: Option<mpsc::SyncSender<()>>,
+}
+
+#[cfg(any(test, feature = "testing"))]
+impl DurableAuditWorkerHold {
+    /// Release the held worker immediately.
+    pub fn release(mut self) {
+        self.release_inner();
+    }
+
+    fn release_inner(&mut self) {
+        if let Some(sender) = self.release_sender.take() {
+            let _ = sender.try_send(());
+        }
+    }
+}
+
+#[cfg(any(test, feature = "testing"))]
+impl Drop for DurableAuditWorkerHold {
+    fn drop(&mut self) {
+        self.release_inner();
     }
 }
 
@@ -224,33 +402,54 @@ impl AuditSink for DurableAuditSink {
         let event = convert_event(event).map_err(|_| {
             AuditError::failed("durable management audit rejected the structured event")
         })?;
-        match self.request(WorkerCommand::Append(event)) {
-            Ok(WorkerReply::Appended) => Ok(()),
-            Ok(_) => Err(AuditError::unavailable(
-                "durable management audit worker protocol failure",
-            )),
-            Err(DurableAuditSinkError::QueueFull) => Err(AuditError::unavailable(
-                "durable management audit queue is full",
-            )),
-            Err(DurableAuditSinkError::AcknowledgementTimeout) => Err(AuditError::unavailable(
-                "durable management audit outcome is unknown after acknowledgement timeout",
-            )),
-            Err(
-                DurableAuditSinkError::WorkerUnavailable
-                | DurableAuditSinkError::WorkerPanicked
-                | DurableAuditSinkError::WorkerProtocol
-                | DurableAuditSinkError::WorkerStart(_),
-            ) => Err(AuditError::unavailable(
-                "durable management audit worker unavailable",
-            )),
-            Err(
-                DurableAuditSinkError::Backend(_)
-                | DurableAuditSinkError::Store(_)
-                | DurableAuditSinkError::UnsafeStorage,
-            ) => Err(AuditError::failed(
-                "durable management audit persistence failed",
-            )),
-        }
+        map_append_reply(self.request(WorkerCommand::Append(event)))
+    }
+
+    fn record_async<'a>(
+        &'a self,
+        event: &'a AuditEvent,
+    ) -> Pin<Box<dyn Future<Output = Result<(), AuditError>> + Send + 'a>> {
+        let event = match convert_event(event) {
+            Ok(event) => event,
+            Err(_) => {
+                return Box::pin(std::future::ready(Err(AuditError::failed(
+                    "durable management audit rejected the structured event",
+                ))));
+            }
+        };
+        Box::pin(
+            async move { map_append_reply(self.request_async(WorkerCommand::Append(event)).await) },
+        )
+    }
+}
+
+fn map_append_reply(result: Result<WorkerReply, DurableAuditSinkError>) -> Result<(), AuditError> {
+    match result {
+        Ok(WorkerReply::Appended) => Ok(()),
+        Ok(_) => Err(AuditError::unavailable(
+            "durable management audit worker protocol failure",
+        )),
+        Err(DurableAuditSinkError::QueueFull) => Err(AuditError::unavailable(
+            "durable management audit queue is full",
+        )),
+        Err(DurableAuditSinkError::AcknowledgementTimeout) => Err(AuditError::unavailable(
+            "durable management audit outcome is unknown after acknowledgement timeout",
+        )),
+        Err(
+            DurableAuditSinkError::WorkerUnavailable
+            | DurableAuditSinkError::WorkerPanicked
+            | DurableAuditSinkError::WorkerProtocol
+            | DurableAuditSinkError::WorkerStart(_),
+        ) => Err(AuditError::unavailable(
+            "durable management audit worker unavailable",
+        )),
+        Err(
+            DurableAuditSinkError::Backend(_)
+            | DurableAuditSinkError::Store(_)
+            | DurableAuditSinkError::UnsafeStorage,
+        ) => Err(AuditError::failed(
+            "durable management audit persistence failed",
+        )),
     }
 }
 
@@ -273,7 +472,7 @@ impl Drop for DurableAuditSink {
             let (reply_sender, _reply_receiver) = mpsc::sync_channel(1);
             let _ = sender.try_send(WorkerRequest {
                 command: WorkerCommand::Shutdown,
-                reply_sender,
+                reply_sender: WorkerReplySender::Synchronous(reply_sender),
             });
             drop(sender);
         }
@@ -348,7 +547,25 @@ impl fmt::Debug for DurableAuditSinkError {
 
 struct WorkerRequest {
     command: WorkerCommand,
-    reply_sender: mpsc::SyncSender<Result<WorkerReply, DurableAuditSinkError>>,
+    reply_sender: WorkerReplySender,
+}
+
+enum WorkerReplySender {
+    Synchronous(mpsc::SyncSender<Result<WorkerReply, DurableAuditSinkError>>),
+    Asynchronous(tokio::sync::oneshot::Sender<Result<WorkerReply, DurableAuditSinkError>>),
+}
+
+impl WorkerReplySender {
+    fn send(self, reply: Result<WorkerReply, DurableAuditSinkError>) {
+        match self {
+            Self::Synchronous(sender) => {
+                let _ = sender.send(reply);
+            }
+            Self::Asynchronous(sender) => {
+                let _ = sender.send(reply);
+            }
+        }
+    }
 }
 
 enum WorkerCommand {
@@ -358,9 +575,9 @@ enum WorkerCommand {
     Shutdown,
     #[cfg(test)]
     Stall(Duration),
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     HoldWithStart {
-        started_sender: mpsc::SyncSender<()>,
+        started_sender: tokio::sync::oneshot::Sender<()>,
         release_receiver: mpsc::Receiver<()>,
     },
 }
@@ -370,7 +587,7 @@ enum WorkerReply {
     Verified(ManagementAuditVerification),
     Page(ManagementAuditPage),
     Shutdown,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     Stalled,
 }
 
@@ -382,7 +599,7 @@ fn run_worker(
 ) {
     for request in receiver {
         if matches!(request.command, WorkerCommand::Shutdown) {
-            let _ = request.reply_sender.send(Ok(WorkerReply::Shutdown));
+            request.reply_sender.send(Ok(WorkerReply::Shutdown));
             break;
         }
         let result = catch_unwind(AssertUnwindSafe(|| match request.command {
@@ -404,18 +621,18 @@ fn run_worker(
                 thread::sleep(duration);
                 Ok(WorkerReply::Stalled)
             }
-            #[cfg(test)]
+            #[cfg(any(test, feature = "testing"))]
             WorkerCommand::HoldWithStart {
                 started_sender,
                 release_receiver,
             } => {
                 let _ = started_sender.send(());
-                let _ = release_receiver.recv();
+                let _ = release_receiver.recv_timeout(DURABLE_AUDIT_TESTING_HOLD_MAX_DURATION);
                 Ok(WorkerReply::Stalled)
             }
         }))
         .unwrap_or(Err(DurableAuditSinkError::WorkerPanicked));
-        let _ = request.reply_sender.send(result);
+        request.reply_sender.send(result);
     }
 }
 
@@ -477,7 +694,13 @@ fn convert_event(
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::{
+        path::Path,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+    };
 
     use opc_config_model::RequestId;
     use opc_mgmt_audit::{
@@ -1418,22 +1641,10 @@ mod tests {
         .await
         .expect("durable sink");
         let sender = sink.sender.as_ref().expect("worker sender").clone();
-
-        let (started_sender, started_receiver) = mpsc::sync_channel(1);
-        let (release_sender, release_receiver) = mpsc::sync_channel(1);
-        let (stall_reply_sender, stall_reply_receiver) = mpsc::sync_channel(1);
-        assert!(sender
-            .try_send(WorkerRequest {
-                command: WorkerCommand::HoldWithStart {
-                    started_sender,
-                    release_receiver,
-                },
-                reply_sender: stall_reply_sender,
-            })
-            .is_ok());
-        started_receiver
-            .recv_timeout(Duration::from_secs(1))
-            .expect("worker stall started");
+        let hold = sink
+            .hold_worker_for_testing(Duration::from_secs(1))
+            .await
+            .expect("worker hold");
 
         let mut verification_receivers = Vec::with_capacity(DURABLE_AUDIT_QUEUE_CAPACITY);
         for _ in 0..DURABLE_AUDIT_QUEUE_CAPACITY {
@@ -1441,7 +1652,7 @@ mod tests {
             assert!(sender
                 .try_send(WorkerRequest {
                     command: WorkerCommand::Verify,
-                    reply_sender,
+                    reply_sender: WorkerReplySender::Synchronous(reply_sender),
                 })
                 .is_ok());
             verification_receivers.push(reply_receiver);
@@ -1451,15 +1662,13 @@ mod tests {
             .record(&event(AuditOperation::Read, AuditOutcome::Success, 9))
             .expect_err("full queue must reject admission");
         assert!(error.detail().contains("queue is full"));
+        let async_error = sink
+            .record_async(&event(AuditOperation::Read, AuditOutcome::Success, 10))
+            .await
+            .expect_err("full queue must reject async admission");
+        assert_eq!(async_error, error);
 
-        release_sender.send(()).expect("release held worker");
-
-        assert!(matches!(
-            stall_reply_receiver
-                .recv_timeout(Duration::from_secs(1))
-                .expect("stall reply"),
-            Ok(WorkerReply::Stalled)
-        ));
+        hold.release();
         for reply_receiver in verification_receivers {
             assert!(matches!(
                 reply_receiver
@@ -1469,6 +1678,268 @@ mod tests {
             ));
         }
         assert_eq!(sink.verify().expect("worker drained").total_count, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn native_async_record_keeps_current_thread_runtime_live() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let sink = open_sink(&database(&tempdir), 0x51, RETAIN_ALL).await;
+        let hold = sink
+            .hold_worker_for_testing(Duration::from_secs(1))
+            .await
+            .expect("worker hold");
+        let heartbeat = Arc::new(AtomicBool::new(false));
+        let audit_event = event(AuditOperation::Read, AuditOutcome::Success, 11);
+
+        let record = async {
+            sink.record_async(&audit_event)
+                .await
+                .expect("durable async acknowledgement");
+            assert!(
+                heartbeat.load(Ordering::Acquire),
+                "record_async parked the current-thread runtime"
+            );
+        };
+        let release = {
+            let heartbeat = Arc::clone(&heartbeat);
+            async move {
+                tokio::task::yield_now().await;
+                heartbeat.store(true, Ordering::Release);
+                hold.release();
+            }
+        };
+        tokio::join!(record, release);
+
+        assert_eq!(sink.verify().expect("verified async append").total_count, 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancellation_after_admission_does_not_retract_append() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let sink = Arc::new(open_sink(&database(&tempdir), 0x51, RETAIN_ALL).await);
+        let hold = sink
+            .hold_worker_for_testing(Duration::from_secs(1))
+            .await
+            .expect("worker hold");
+        let (admitted_sender, admitted_receiver) = tokio::sync::oneshot::channel();
+        let task_sink = Arc::clone(&sink);
+        let task = tokio::spawn(async move {
+            let audit_event = event(AuditOperation::Update, AuditOutcome::Success, 12);
+            task_sink
+                .record_async_with_admission(&audit_event, admitted_sender)
+                .await
+        });
+
+        admitted_receiver.await.expect("append admitted");
+        task.abort();
+        assert!(task.await.expect_err("cancelled task").is_cancelled());
+        hold.release();
+
+        assert_eq!(
+            sink.verify()
+                .expect("cancelled caller's admitted append persisted")
+                .total_count,
+            1
+        );
+        sink.record_async(&event(AuditOperation::Read, AuditOutcome::Success, 13))
+            .await
+            .expect("worker remains usable after acknowledgement receiver drop");
+        assert_eq!(sink.verify().expect("verified follow-up").total_count, 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn concurrent_async_acknowledgements_are_request_unique() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let sink = Arc::new(open_sink(&database(&tempdir), 0x51, RETAIN_ALL).await);
+        let mut tasks = Vec::new();
+        for suffix in 0..16 {
+            let task_sink = Arc::clone(&sink);
+            tasks.push(tokio::spawn(async move {
+                let audit_event = event(AuditOperation::Read, AuditOutcome::Success, suffix);
+                let request_id = *audit_event.request_id.as_uuid().as_bytes();
+                task_sink
+                    .record_async(&audit_event)
+                    .await
+                    .expect("request-specific acknowledgement");
+                request_id
+            }));
+        }
+        let mut expected = Vec::new();
+        for task in tasks {
+            expected.push(task.await.expect("async record task"));
+        }
+
+        let page = sink
+            .query_page(ManagementAuditPageRequest::try_new(None, 32).expect("page request"))
+            .expect("authenticated page");
+        let actual = page
+            .records()
+            .iter()
+            .map(|record| *record.event().request_id())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(actual.len(), expected.len());
+        assert!(expected
+            .into_iter()
+            .all(|request_id| actual.contains(&request_id)));
+    }
+
+    #[tokio::test]
+    async fn malformed_event_failure_matches_sync_and_async_paths() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let sink = open_sink(&database(&tempdir), 0x51, RETAIN_ALL).await;
+        let mut malformed = event(AuditOperation::Read, AuditOutcome::Success, 14);
+        malformed.tenant = "x".repeat(301);
+
+        let sync_error = sink.record(&malformed).expect_err("sync rejection");
+        let async_error = sink
+            .record_async(&malformed)
+            .await
+            .expect_err("async rejection");
+        assert_eq!(async_error, sync_error);
+        assert_eq!(sink.verify().expect("no malformed records").total_count, 0);
+    }
+
+    #[test]
+    fn async_record_without_tokio_runtime_fails_before_admission() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("bootstrap runtime");
+        let sink = runtime.block_on(open_sink(&database(&tempdir), 0x51, RETAIN_ALL));
+        drop(runtime);
+
+        let audit_event = event(AuditOperation::Read, AuditOutcome::Success, 15);
+        let error = futures_executor::block_on(sink.record_async(&audit_event))
+            .expect_err("missing Tokio runtime must fail closed");
+        assert!(error.detail().contains("worker unavailable"));
+        assert_eq!(
+            sink.verify().expect("request was not admitted").total_count,
+            0
+        );
+    }
+
+    #[test]
+    fn async_record_without_time_driver_fails_before_admission() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let bootstrap = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("bootstrap runtime");
+        let sink = bootstrap.block_on(open_sink(&database(&tempdir), 0x51, RETAIN_ALL));
+        drop(bootstrap);
+        let runtime_without_time = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime without time");
+        let audit_event = event(AuditOperation::Read, AuditOutcome::Success, 16);
+
+        let error = runtime_without_time
+            .block_on(sink.record_async(&audit_event))
+            .expect_err("missing time driver must fail closed");
+        assert!(error.detail().contains("worker unavailable"));
+        assert_eq!(
+            sink.verify().expect("request was not admitted").total_count,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn testing_timeouts_are_clamped_but_zero_is_preserved() {
+        assert_eq!(
+            clamp_testing_timeout(Duration::MAX),
+            DURABLE_AUDIT_TESTING_HOLD_MAX_DURATION
+        );
+        assert_eq!(clamp_testing_timeout(Duration::ZERO), Duration::ZERO);
+
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let backend = SqliteBackend::open_with_audit_key(database(&tempdir), false, 0, key(0x51))
+            .await
+            .expect("durable backend");
+        let sink = DurableAuditSink::from_backend_with_timeouts(
+            backend,
+            ManagementAuditRetention::try_new(RETAIN_ALL).expect("retention"),
+            Duration::MAX,
+            Duration::MAX,
+        )
+        .await
+        .expect("durable sink");
+        assert_eq!(
+            sink.acknowledgement_timeout,
+            DURABLE_AUDIT_TESTING_HOLD_MAX_DURATION
+        );
+        assert_eq!(
+            sink.shutdown_timeout,
+            DURABLE_AUDIT_TESTING_HOLD_MAX_DURATION
+        );
+    }
+
+    #[tokio::test]
+    async fn acknowledgement_timeout_matches_sync_and_async_outcome_unknown_semantics() {
+        let sync_tempdir = tempfile::tempdir().expect("sync tempdir");
+        let sync_path = database(&sync_tempdir);
+        let sync_backend = SqliteBackend::open_with_audit_key(&sync_path, false, 0, key(0x51))
+            .await
+            .expect("sync durable backend");
+        let sync_sink = DurableAuditSink::from_backend_with_timeouts(
+            sync_backend,
+            ManagementAuditRetention::try_new(RETAIN_ALL).expect("retention"),
+            Duration::from_millis(20),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("sync sink");
+        let sync_hold = sync_sink
+            .hold_worker_for_testing(Duration::from_secs(1))
+            .await
+            .expect("sync worker hold");
+        let sync_error = sync_sink
+            .record(&event(AuditOperation::Read, AuditOutcome::Success, 17))
+            .expect_err("sync acknowledgement timeout");
+        sync_hold.release();
+        drop(sync_sink);
+        let sync_reopened = open_sink(&sync_path, 0x51, RETAIN_ALL).await;
+        assert_eq!(
+            sync_reopened
+                .verify()
+                .expect("sync timed-out append eventually persisted")
+                .total_count,
+            1
+        );
+
+        let async_tempdir = tempfile::tempdir().expect("async tempdir");
+        let async_path = database(&async_tempdir);
+        let async_backend = SqliteBackend::open_with_audit_key(&async_path, false, 0, key(0x52))
+            .await
+            .expect("async durable backend");
+        let async_sink = DurableAuditSink::from_backend_with_timeouts(
+            async_backend,
+            ManagementAuditRetention::try_new(RETAIN_ALL).expect("retention"),
+            Duration::from_millis(20),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("async sink");
+        let async_hold = async_sink
+            .hold_worker_for_testing(Duration::from_secs(1))
+            .await
+            .expect("async worker hold");
+        let async_error = async_sink
+            .record_async(&event(AuditOperation::Read, AuditOutcome::Success, 18))
+            .await
+            .expect_err("async acknowledgement timeout");
+        async_hold.release();
+        drop(async_sink);
+        let async_reopened = open_sink(&async_path, 0x52, RETAIN_ALL).await;
+        assert_eq!(
+            async_reopened
+                .verify()
+                .expect("async timed-out append eventually persisted")
+                .total_count,
+            1
+        );
+
+        assert_eq!(async_error, sync_error);
+        assert!(async_error.detail().contains("outcome is unknown"));
     }
 
     #[tokio::test]

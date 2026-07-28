@@ -23,6 +23,8 @@
 
 use std::{
     fmt,
+    future::Future,
+    pin::Pin,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -688,11 +690,40 @@ pub trait AuditSink: Send + Sync {
     /// the success path of a security-relevant operation; callers that are about
     /// to grant access or mutate state must fail closed when this returns `Err`.
     fn record(&self, event: &AuditEvent) -> Result<(), AuditError>;
+
+    /// Records one audit event from an asynchronous caller.
+    ///
+    /// The compatibility default invokes [`Self::record`] when the returned
+    /// future is polled and may therefore block that poll. Existing
+    /// implementations remain source-compatible, but a sink whose synchronous
+    /// method waits on I/O or another thread must override this method before
+    /// it is used on an async executor.
+    ///
+    /// An unpolled future need not persist anything. Once polled, an override
+    /// must either complete or, before first returning
+    /// [`std::task::Poll::Pending`], hand an immutable representation of the
+    /// event to cancellation-independent processing. Dropping the future after
+    /// that admission cannot retract the event. A timeout, error, or dropped
+    /// future after admission can leave the durable outcome unknown, and
+    /// callers must never infer that the event was not persisted.
+    fn record_async<'a>(
+        &'a self,
+        event: &'a AuditEvent,
+    ) -> Pin<Box<dyn Future<Output = Result<(), AuditError>> + Send + 'a>> {
+        Box::pin(async move { self.record(event) })
+    }
 }
 
 impl<T: AuditSink + ?Sized> AuditSink for Arc<T> {
     fn record(&self, event: &AuditEvent) -> Result<(), AuditError> {
         (**self).record(event)
+    }
+
+    fn record_async<'a>(
+        &'a self,
+        event: &'a AuditEvent,
+    ) -> Pin<Box<dyn Future<Output = Result<(), AuditError>> + Send + 'a>> {
+        (**self).record_async(event)
     }
 }
 
@@ -749,7 +780,10 @@ mod tests {
     use super::*;
     use opc_config_model::{AuthStrength, TrustedPrincipal, WorkloadIdentity};
     use opc_types::TenantId;
-    use std::sync::Mutex;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Mutex,
+    };
 
     #[derive(Default)]
     struct CapturingSink {
@@ -768,6 +802,27 @@ mod tests {
             Err(AuditError::unavailable(
                 "sqlite unavailable for tenant acme",
             ))
+        }
+    }
+
+    #[derive(Default)]
+    struct AsyncOnlySink {
+        calls: AtomicUsize,
+    }
+
+    impl AuditSink for AsyncOnlySink {
+        fn record(&self, _event: &AuditEvent) -> Result<(), AuditError> {
+            panic!("Arc forwarding used the blocking compatibility method")
+        }
+
+        fn record_async<'a>(
+            &'a self,
+            _event: &'a AuditEvent,
+        ) -> Pin<Box<dyn Future<Output = Result<(), AuditError>> + Send + 'a>> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                Err(AuditError::failed("asynchronous sentinel"))
+            })
         }
     }
 
@@ -1042,6 +1097,45 @@ mod tests {
             error,
             AuditError::unavailable("sqlite unavailable for tenant acme")
         );
+    }
+
+    #[test]
+    fn async_default_keeps_existing_implementors_dyn_compatible() {
+        let sink = CapturingSink::default();
+        let object: &dyn AuditSink = &sink;
+        let event = AuditEvent::new(
+            RequestId::new(),
+            &principal(),
+            TransportType::Gnmi,
+            AuditOperation::Read,
+            AuditOutcome::Success,
+        );
+
+        futures_executor::block_on(object.record_async(&event))
+            .expect("compatibility default records successfully");
+
+        assert_eq!(sink.events.lock().expect("audit mutex").len(), 1);
+    }
+
+    #[test]
+    fn arc_trait_object_forwards_async_override_without_blocking_fallback() {
+        let concrete = Arc::new(AsyncOnlySink::default());
+        let sink: Arc<dyn AuditSink> = concrete.clone();
+        let event = AuditEvent::new(
+            RequestId::new(),
+            &principal(),
+            TransportType::Gnmi,
+            AuditOperation::Read,
+            AuditOutcome::Success,
+        );
+
+        let error = futures_executor::block_on(<Arc<dyn AuditSink> as AuditSink>::record_async(
+            &sink, &event,
+        ))
+        .expect_err("async sentinel must be forwarded");
+
+        assert_eq!(error, AuditError::failed("asynchronous sentinel"));
+        assert_eq!(concrete.calls.load(Ordering::Relaxed), 1);
     }
 
     #[test]
