@@ -2772,6 +2772,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "opc-egress-fence"
+version = "0.2.0"
+dependencies = [
+ "opc-egress-fence-common",
+ "thiserror 2.0.19",
+]
+
+[[package]]
+name = "opc-egress-fence-common"
+version = "0.2.0"
+
+[[package]]
 name = "opc-evidence"
 version = "0.2.0"
 dependencies = [

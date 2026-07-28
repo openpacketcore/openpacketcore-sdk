@@ -1,0 +1,21 @@
+[package]
+name = "opc-egress-fence"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Lease-bound Linux tc/eBPF egress fencing for OpenPacketCore datagram sockets"
+readme = "README.md"
+documentation = "https://docs.rs/opc-egress-fence"
+keywords = ["ebpf", "fencing", "linux", "network-programming", "high-availability"]
+categories = ["network-programming", "os::linux-apis"]
+publish = false
+
+[dependencies]
+opc-egress-fence-common = { path = "../opc-egress-fence-common", version = "0.2.0" }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

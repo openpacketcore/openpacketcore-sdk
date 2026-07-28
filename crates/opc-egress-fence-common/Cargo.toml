@@ -1,0 +1,19 @@
+[package]
+name = "opc-egress-fence-common"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Shared no-std ABI and decision model for the OpenPacketCore egress fence"
+readme = "README.md"
+documentation = "https://docs.rs/opc-egress-fence-common"
+keywords = ["ebpf", "fencing", "linux", "no-std", "network-programming"]
+categories = ["network-programming", "no-std", "os::linux-apis"]
+publish = false
+
+[dependencies]
+
+[lints]
+workspace = true
