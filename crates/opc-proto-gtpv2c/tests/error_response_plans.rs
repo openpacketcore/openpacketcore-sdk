@@ -619,3 +619,52 @@ fn no_lookup_protocol_type_cannot_express_context_not_found() {
         assert_ne!(error.kind().cause(), CauseValue::ContextNotFound);
     }
 }
+
+/// Knowing which Information Element offended is *necessary but not
+/// sufficient* to decide that a TS 29.274 error response is owed.
+///
+/// Sufficiency additionally needs request-versus-response, the Echo exception,
+/// the message grammar, slot presence and conditional verifiability, and that
+/// decision belongs to `Gtpv2cErrorResponsePlanner`. This crate's own
+/// `plan_request_failure` demonstrates it: each case below carries a perfectly
+/// valid `Gtpv2cOffendingIe`, and in none of the three does the identity reach
+/// the wire.
+#[test]
+fn identity_alone_does_not_owe_an_error_response() {
+    let offending = Gtpv2cOffendingIe::new(3, 0).expect("Recovery identity must be valid");
+    let failure = protocol_failure(
+        Gtpv2cProtocolErrorKind::InvalidIeLength(offending),
+        Gtpv2cProtocolErrorResponseTeid::NoLookup,
+    );
+
+    // Echo whose declared length does not match the datagram: unanswerable,
+    // identity or no identity.
+    let mut echo_length_mismatch = fixture(MALFORMED_ECHO_REQUEST);
+    echo_length_mismatch.push(0xff);
+    assert_eq!(
+        planner().plan(&echo_length_mismatch, failure),
+        Gtpv2cErrorResponseDecision::Unanswerable(Gtpv2cUnanswerableReason::EchoLengthMismatch)
+    );
+
+    // Echo whose length does match: answerable, but the Echo Response carries
+    // no Cause at all, so the planner discards the identity.
+    let echo = response_plan(planner().plan(&fixture(MALFORMED_ECHO_REQUEST), failure));
+    assert_eq!(echo.kind(), Gtpv2cErrorResponseKind::Echo);
+    assert_eq!(echo.cause(), None);
+    assert_eq!(
+        echo.offending_ie(),
+        None,
+        "an Echo Response must not carry an offending-IE field"
+    );
+
+    // Non-Echo request whose length does not match: the planner substitutes
+    // InvalidMessageLength, which names no IE, and drops the supplied identity.
+    let length_mismatch =
+        response_plan(planner().plan(&fixture(LENGTH_MISMATCH_CREATE_SESSION_REQUEST), failure));
+    assert_eq!(length_mismatch.cause(), Some(CauseValue::InvalidLength));
+    assert_eq!(
+        length_mismatch.offending_ie(),
+        None,
+        "a message-length failure must not be attributed to an IE"
+    );
+}

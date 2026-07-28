@@ -138,6 +138,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that ignores the CSPRNG mandate and mints identities from a counter or a
   timestamp is inverted in seconds, and the domain separator carries no
   per-deployment salt.
+- **GTPv2-C decode failures name the offending Information Element —
+  `opc-proto-gtpv2c` (`Gtpv2cDecodeError`, `Message::decode_annotated`,
+  `RawIeIterator::next_annotated`, `validate_ie_region_annotated`):** the
+  framing layer already held an IE's Type and Instance in registers when a
+  complete four-octet TLIV header had been read and the declared value length
+  overran the remaining input, and then discarded them, returning a bare
+  `Truncated`. That identity is now carried out to the caller. A header shorter
+  than four octets names no element, because the Type and Instance octets are
+  by definition not present; the IE-count bound, the depth bound and the offset
+  arithmetic name none either, being statements about the sequence rather than
+  about any element's octets. Absence of identity is normal and expected for
+  those classes. A failure inside a grouped IE names the *member* and reports
+  the enclosing container separately through `enclosing_ie()`, so a Bearer
+  Context member is never presented as a top-level element. Grouping scope is
+  orthogonal to the failure class: the first table below is the top-level case,
+  and *every* class in it additionally reports the container when the failure
+  is raised inside a grouped IE.
+
+  | Failure at top level | `offending_ie()` | `enclosing_ie()` |
+  |---|---|---|
+  | Complete header, declared length overruns | the IE | none |
+  | Strict spare-bit violation | the IE | none |
+  | Leaf value decode failure | the leaf | none |
+  | Unknown critical IE under `Reject` | the unknown IE | none |
+  | Duplicate rejection | the repeated key | none |
+  | IE region ends with fewer than four octets | none | none |
+  | IE-count bound, depth bound, offset arithmetic | none | none |
+
+  | Failure inside a grouped IE | `offending_ie()` | `enclosing_ie()` |
+  |---|---|---|
+  | Any class above, raised on a member | as above, for the member | the container |
+  | Grouped member header shorter than four octets | none | the container |
+
+  Element identity is modelled in the GTPv2-C crate rather than on the shared
+  `opc_protocol::DecodeError` because the shapes genuinely disagree -- PFCP and
+  NGAP key on a `u16`, Diameter on an AVP code plus an optional vendor id where
+  absence and vendor zero are distinct -- and no honest neutral shape exists.
+  `opc-protocol` is unchanged, so `DecodeError::offset()` keeps its full
+  `usize` range and no new `clippy::result_large_err` site is created.
+
+  Naming the offending IE is **necessary but not sufficient** to decide that a
+  TS 29.274 error response is owed. Sufficiency additionally requires
+  request-versus-response, the Echo exception, the message grammar, slot
+  presence and conditional verifiability, and that decision stays with
+  `Gtpv2cErrorResponsePlanner` -- which refuses to answer several inputs
+  carrying a perfectly valid identity. Convert `offending_ie()` into a
+  `Gtpv2cProtocolErrorKind` only when `enclosing_ie()` is `None`: this crate's
+  Cause encoder hardcodes clause 8.4's flags octet to zero, and a zeroed octet
+  asserts a top-level IE, so a grouped member's identity fed through it would
+  name an element that never appeared at top level. Modelling the grouped-IE
+  flag bits is disposition-layer work and is deferred.
 
 ### Changed
 - **Native async management-audit acknowledgement — `opc-mgmt-audit`,
@@ -211,6 +262,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   container-framing fatality; whole-value rejection for a wrong-length address
   container; the IPv4 Link MTU local skip; and the entire encode path,
   `PcoRequest`, `IpcpDnsRequest`, `PcscfRequest` and `PcscfAddressRequest`.
+- **`S2bMessage::decode`, `decode_with_diagnostics` and `from_message` return
+  `Gtpv2cDecodeError` — `opc-proto-gtpv2c` (breaking, API):** the three
+  inherent entry points now return the annotated error. Source-compatible for
+  callers that use `.code()`, `.offset()`, `.spec_ref()`, `?` into a
+  `DecodeError` or `Box<dyn Error>`, `.expect`, or a `Debug`-bounded helper.
+  Breaking for callers that name the error type, and equally for callers that
+  pass the error on to a function whose parameter is `&DecodeError` -- including
+  this crate's own `dedicated_bearer_decode_rejection_cause`, the documented
+  mapping from a Bearer TFT decode failure to its response Cause. Those call
+  sites take `.error()` for a borrow or `DecodeError::from` for an owned value.
+  `BorrowDecode for S2bMessage` is unchanged and still yields `DecodeError`; it
+  delegates to the inherent `decode` and downgrades, so the port and the richer
+  API cannot diverge.
+  `From<Gtpv2cDecodeError> for DecodeError` is a deliberate, lossy downgrade
+  that `?` invokes implicitly -- a new grouped decoder must carry the rich type
+  end to end or its member identity will vanish with no compile error.
+- **The profile-less typed sequence decoders fail closed —
+  `opc-proto-gtpv2c` (breaking, behavioural):** `decode_typed_ie_sequence` and
+  `TypedIe::decode_sequence` now return `Err` for a malformed known optional IE
+  they previously discarded silently (today IE 176 Node Identifier with
+  `Truncated` or `InvalidLength`, the only member of the discard allowlist).
+  The TS 29.274 clause 7.7.8 discard is conditioned on the IE being optional at
+  the slot it arrived in, and both entry points take only `(input, ctx, depth)`
+  and `(input, ctx)` -- no release, interface, procedure or direction -- so
+  neither can establish that condition and neither is entitled to the
+  disposition. The profiled S2b receive path and the canonical builder
+  self-check are unchanged.
+- **Diagnostic — `opc-proto-gtpv2c`:** `Debug` output of the three retyped
+  entry points now includes the offending and enclosing IE fields. `Display` is
+  byte-identical to the inner `DecodeError`'s, so any `{}` rendering -- log
+  line or panic string -- is unchanged. The error *chain* does gain one link:
+  `Error::source()` exposes the inner `DecodeError`, so a reporter that walks
+  and prints the chain (`{:#}` under `anyhow`, for example) now renders that
+  same text a second time. Read `.error()` instead of the chain where a single
+  rendering matters.
+- **Unchanged, stated explicitly — `opc-proto-gtpv2c`:** `opc-protocol` is not
+  touched; `DecodeError::offset()` keeps its full `usize` range; S2b receive
+  disposition at every validation level and the canonical builder self-check
+  are unchanged; `RawIeIterator::Item`, `validate_ie_region`, `RawIe::decode`,
+  `TypedIe::decode_from_raw`, `Message::ies` and every
+  `BorrowDecode`/`OwnedDecode` signature keep their existing types. Known
+  follow-up, declared: the non-`ProcedureAware` S2b receive branches still
+  apply the clause 7.7.8 discard from a type allowlist rather than from a
+  resolved per-IE profile.
 - **`RePinAuditEvent` carries a correlation digest, not the live transition
   secret — `opc-ipsec-lb` (breaking: `transition_id: OwnershipTransitionId` is
   replaced by `correlation_id: RePinAuditCorrelationId`):** the coordinator

@@ -9,8 +9,9 @@ use opc_protocol::{
     EncodeError, EncodeErrorCode, OwnedDecode, SpecRef, ToOwnedPdu,
 };
 
+use crate::decode_error::Gtpv2cDecodeError;
 use crate::header::{decode_header, encode_header, Header, MessageType};
-use crate::ie::{validate_ie_region, RawIeIterator};
+use crate::ie::{validate_ie_region_annotated, RawIeIterator};
 
 fn spec_ref() -> SpecRef {
     SpecRef::new("3gpp", "TS29274", "5.1")
@@ -58,6 +59,70 @@ impl<'a> Message<'a> {
         RawIeIterator::new(self.raw_ies, ctx)
     }
 
+    /// As `<Self as BorrowDecode>::decode`, but a raw IE-region framing error
+    /// names the offending IE whenever a complete four-octet header had been
+    /// read.
+    ///
+    /// The [`BorrowDecode`] impl delegates here and downgrades, so the two can
+    /// never diverge. The port itself cannot carry the annotation: its error
+    /// type is fixed to [`DecodeError`] by design, which is what keeps
+    /// protocol-shaped identity out of the shared crate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Gtpv2cDecodeError`] for a malformed common header, a length
+    /// beyond [`DecodeContext::max_message_len`], a truncated datagram, or any
+    /// raw IE-region violation.
+    ///
+    /// @spec 3GPP TS29274 R18 5.1, 8.2
+    /// @req REQ-3GPP-TS29274-R18-MESSAGE-007
+    /// @conformance s2b-subset
+    pub fn decode_annotated(
+        input: &'a [u8],
+        ctx: DecodeContext,
+    ) -> Result<(&'a [u8], Self), Gtpv2cDecodeError> {
+        let spec = spec_ref();
+        let (_, header) = decode_header(input, ctx)?;
+        let msg_end = 4usize.checked_add(header.length as usize).ok_or_else(|| {
+            DecodeError::new(DecodeErrorCode::LengthOverflow, 2).with_spec_ref(spec.clone())
+        })?;
+
+        if msg_end > ctx.max_message_len {
+            return Err(Gtpv2cDecodeError::new(
+                DecodeError::new(DecodeErrorCode::MessageLengthExceeded, 2).with_spec_ref(spec),
+            ));
+        }
+        if input.len() < msg_end {
+            return Err(Gtpv2cDecodeError::new(
+                DecodeError::new(DecodeErrorCode::Truncated, input.len()).with_spec_ref(spec),
+            ));
+        }
+        if msg_end < header.wire_len() {
+            return Err(Gtpv2cDecodeError::new(
+                DecodeError::new(
+                    DecodeErrorCode::InvalidLength {
+                        reason: "message length shorter than common header",
+                    },
+                    2,
+                )
+                .with_spec_ref(spec),
+            ));
+        }
+
+        let raw_ies = &input[header.wire_len()..msg_end];
+        validate_ie_region_annotated(raw_ies, ctx)?;
+        let tail = &input[msg_end..];
+
+        Ok((
+            tail,
+            Self {
+                header,
+                raw_ies,
+                tail,
+            },
+        ))
+    }
+
     fn encoded_lens(&self) -> Result<(usize, u16), EncodeError> {
         let spec = spec_ref();
         let total_len = self
@@ -84,44 +149,7 @@ impl<'a> BorrowDecode<'a> for Message<'a> {
     /// @req REQ-3GPP-TS29274-R18-MESSAGE-003
     /// @conformance s2b-subset
     fn decode(input: &'a [u8], ctx: DecodeContext) -> DecodeResult<'a, Self> {
-        let spec = spec_ref();
-        let (_, header) = decode_header(input, ctx)?;
-        let msg_end = 4usize.checked_add(header.length as usize).ok_or_else(|| {
-            DecodeError::new(DecodeErrorCode::LengthOverflow, 2).with_spec_ref(spec.clone())
-        })?;
-
-        if msg_end > ctx.max_message_len {
-            return Err(
-                DecodeError::new(DecodeErrorCode::MessageLengthExceeded, 2).with_spec_ref(spec)
-            );
-        }
-        if input.len() < msg_end {
-            return Err(
-                DecodeError::new(DecodeErrorCode::Truncated, input.len()).with_spec_ref(spec)
-            );
-        }
-        if msg_end < header.wire_len() {
-            return Err(DecodeError::new(
-                DecodeErrorCode::InvalidLength {
-                    reason: "message length shorter than common header",
-                },
-                2,
-            )
-            .with_spec_ref(spec));
-        }
-
-        let raw_ies = &input[header.wire_len()..msg_end];
-        validate_ie_region(raw_ies, ctx)?;
-        let tail = &input[msg_end..];
-
-        Ok((
-            tail,
-            Self {
-                header,
-                raw_ies,
-                tail,
-            },
-        ))
+        Self::decode_annotated(input, ctx).map_err(DecodeError::from)
     }
 }
 

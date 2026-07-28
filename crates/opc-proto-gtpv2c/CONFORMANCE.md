@@ -451,8 +451,10 @@ coverage.
      validated `NodeIdentifier::new` constructor bounds each subfield to the
      255 octets its length field can express, so encoding is infallible and
      performs no truncating cast.
-   - A malformed Node Identifier is discarded, not rejected, per clauses 7.7.7
-     and 7.7.8. Both clauses split receiver behaviour on the IE's *presence*.
+   - A malformed Node Identifier is discarded, not rejected, by the *profiled
+     receiver* — `S2bMessage::decode` and `S2bMessage::decode_with_diagnostics`
+     — per clauses 7.7.7 and 7.7.8. Both clauses split receiver behaviour on
+     the IE's *presence*.
      Clause 7.7.7 governs a length inconsistency in an Extendable IE: "If the
      received value of the Length field and the actual length of the extendable
      length IE are consistent, but the length is less than the number of fixed
@@ -481,15 +483,24 @@ coverage.
      states no such rule and this codec fails closed." Clauses 7.7.7 and 7.7.8
      do state such a rule and do name the receiver, so IE 176 belongs in the
      skip bucket and is in it.
-   - The discard is uniform across the decode surface. Typed decode dispatches
-     on IE type alone, so the disposition holds at every validation level
-     (`Structural`, `Strict`, `ProcedureAware`), in every message type this
-     crate models, at every instance 0-15, and nested inside a Bearer Context.
-     At `ProcedureAware` an instance other than 0 is discarded even earlier, by
-     the clause 7.7.9 receive filter, so both routes reach the same result.
-     `Strict` is not an opt-in stricter-than-TS-29.274 mode: it enforces "field
-     cardinality, enum ranges, and critical IE rules", and for an optional IE
-     clause 7.7.8 *is* the range rule and it says discard.
+   - The discard is uniform across the profiled receive path. It holds at every
+     validation level (`Structural`, `Strict`, `ProcedureAware`), in every
+     message type this crate models, at every instance 0-15, and nested inside a
+     Bearer Context. At `ProcedureAware` an instance other than 0 is discarded
+     even earlier, by the clause 7.7.9 receive filter, so both routes reach the
+     same result. `Strict` is not an opt-in stricter-than-TS-29.274 mode: it
+     enforces "field cardinality, enum ranges, and critical IE rules", and for
+     an optional IE clause 7.7.8 *is* the range rule and it says discard.
+   - It is deliberately *not* uniform across the whole decode surface, because
+     the disposition is not a property of the IE type alone. Both clauses
+     condition it on the IE's presence at the slot it arrived in, which is a
+     property of the procedure, the direction and the message grammar. The
+     profile-less entry points `decode_typed_ie_sequence` and
+     `TypedIe::decode_sequence` receive none of those — their whole input is
+     `(input, ctx, depth)` and `(input, ctx)` — so they cannot establish the
+     condition and are not entitled to the disposition. They fail closed and
+     return the error instead. Callers wanting clause 7.7.8 behaviour must go
+     through the profiled receiver above.
    - Discard means the IE is absent from the typed view *and* from the clause
      7.7.10 duplicate bookkeeping. "Treat the rest of the message as if this IE
      was absent" is a statement about the whole remaining decode, not only

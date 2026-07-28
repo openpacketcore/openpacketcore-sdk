@@ -33,13 +33,18 @@ control-plane stack.
   to the 255 octets its one-octet length field can express, so encoding is
   infallible; decode detects a subfield length that overruns the IE value, and
   `Debug` reports only subfield lengths. Because Table 7.2.1-1 gives the IE
-  presence O, such a value is discarded and the rest of the message is
-  processed as if the IE were absent, per TS 29.274 clauses 7.7.7 and 7.7.8 —
+  presence O, the *profiled receiver* — `S2bMessage::decode` and
+  `decode_with_diagnostics` — discards such a value and processes the rest of
+  the message as if the IE were absent, per TS 29.274 clauses 7.7.7 and 7.7.8 —
   absent from the duplicate bookkeeping too, so a malformed IE cannot suppress
   a well-formed one at the same instance or be reported as a repeat; the
-  received octets stay byte-exact under raw-preserving encode. The S2b
-  builders' sender-side validation still rejects a caller-supplied raw IE 176
-  whose value is malformed, at the top level and nested inside a Bearer
+  received octets stay byte-exact under raw-preserving encode. That discard is
+  conditioned on presence, and presence is a property of the procedure, the
+  direction and the message grammar, so a decoder that has resolved none of
+  them is not entitled to it: `decode_typed_ie_sequence` and
+  `TypedIe::decode_sequence` fail closed and return the error instead. The S2b
+  builders' sender-side validation likewise rejects a caller-supplied raw IE
+  176 whose value is malformed, at the top level and nested inside a Bearer
   Context, because those clauses bind the receiver.
   Their Extendable IE decoders retain the
   known Release 18 prefix while raw-preserving message encode retains accepted
@@ -52,9 +57,76 @@ control-plane stack.
   the typed view, `Preserve` retains byte-exact `TypedIeValue::Raw` entries,
   and `Reject` fails with `UnknownCriticalIe`. `TypedIe::decode_from_raw`
   necessarily returns one value, so callers needing omission use the sequence
-  API.
+  API. Neither `decode_typed_ie_sequence` nor `TypedIe::decode_sequence`
+  receives a release, interface, procedure or direction, so neither can
+  establish the IE presence the clause 7.7.8 discard is conditioned on; both
+  fail closed on a malformed known IE.
 - `Message<'a>` and `OwnedMessage` provide the raw borrowed/owned message
   shells and implement the shared `opc-protocol` codec traits.
+- `Gtpv2cDecodeError` names the offending Information Element. It wraps the
+  shared `opc_protocol::DecodeError` — `code()`, `offset()` and `spec_ref()`
+  are unchanged and `Display` is byte-identical — and adds `offending_ie()`
+  and `enclosing_ie()`. Element identity lives in this crate, not the shared
+  one, because the shapes genuinely disagree: GTPv2-C keys on a one-octet Type
+  plus a four-bit Instance, PFCP and NGAP on a `u16`, Diameter on an AVP code
+  plus an optional vendor id. `Message::decode_annotated`,
+  `RawIeIterator::next_annotated`, `validate_ie_region_annotated`,
+  `S2bMessage::decode`, `S2bMessage::decode_with_diagnostics` and
+  `S2bMessage::from_message` return it; the `BorrowDecode`/`OwnedDecode` ports
+  keep `DecodeError`, and the trait impls delegate to the inherent entry points
+  and downgrade so the two cannot diverge.
+
+  Identity is attached by the innermost decode frame that had already read a
+  complete four-octet IE header for the element the error is about. Absence is
+  normal and expected for the classes that have no element to name. The table
+  below states the **top-level** case; grouping scope is orthogonal, and every
+  failure class raised inside a grouped IE additionally reports the container:
+
+  | Failure at top level | `offending_ie()` | `enclosing_ie()` |
+  |---|---|---|
+  | Complete header, declared length overruns | the IE | none |
+  | Strict spare-bit violation | the IE | none |
+  | Leaf value decode failure | the leaf | none |
+  | Unknown critical IE under `Reject` | the unknown IE | none |
+  | Duplicate rejection | the repeated key | none |
+  | IE region ends with fewer than four octets | none | none |
+  | IE-count bound, depth bound, offset arithmetic | none | none |
+
+  | Failure inside a grouped IE | `offending_ie()` | `enclosing_ie()` |
+  |---|---|---|
+  | Any class above, raised on a member | as above, for the member | the container |
+  | Grouped member header shorter than four octets | none | the container |
+
+  The second table is not a special case bolted onto the first: the enclosing
+  identity is attached at the single exit of the scope it describes, so it is
+  set for every error class a nested scope can raise, including the ones that
+  name no offending element at all.
+
+  Naming the offending IE is **necessary but not sufficient** to decide that a
+  TS 29.274 error response is owed. Sufficiency additionally requires
+  request-versus-response, the Echo exception, the message grammar, slot
+  presence and conditional verifiability; that decision stays with
+  `Gtpv2cErrorResponsePlanner`, which refuses to answer several inputs that
+  carry a perfectly valid identity.
+
+  Convert `offending_ie()` into a `Gtpv2cProtocolErrorKind` **only when
+  `enclosing_ie()` is `None`**. The Cause encoder here hardcodes clause 8.4's
+  flags octet to zero, and a zeroed octet asserts a top-level IE; a grouped
+  member's identity fed through it would name an element that never appeared at
+  top level. Modelling the grouped-IE flag bits is disposition-layer work and is
+  out of scope for the decoder. The guard is a caller obligation, not a type
+  invariant: `Gtpv2cProtocolErrorKind::InvalidIeLength` is a public tuple
+  variant, so nothing stops an unguarded construction from an
+  `offending_ie()` that has an enclosing container.
+
+  Contributor note: `From<Gtpv2cDecodeError> for DecodeError` is a deliberate,
+  lossy downgrade that `?` invokes implicitly. A new grouped decoder must carry
+  `Gtpv2cDecodeError` end to end, or its member identity will vanish with no
+  compile error.
+
+  Declared residual: the non-`ProcedureAware` S2b receive branches still select
+  the clause 7.7.8 discard from a type allowlist rather than from a resolved
+  per-IE profile.
 - `inspect_gtpv2c_request` and `Gtpv2cErrorResponsePlanner` form a separate
   zero-allocation error boundary. Inspection retains only a reply-safe fixed
   header envelope; planning returns either an explicit standards-required

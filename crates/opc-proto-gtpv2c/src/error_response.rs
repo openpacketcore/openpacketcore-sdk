@@ -22,6 +22,12 @@ use crate::ie::{encode_typed_ie_sequence, Cause, CauseValue, Recovery, TypedIe, 
 use crate::s2b::{procedure_and_direction, MessageDirection, Procedure};
 use crate::OwnedMessage;
 
+// Element identity is defined one layer down, in `crate::decode_error`, so the
+// decoder can produce it without this disposition module -- which imports
+// `crate::ie` and `crate::s2b` -- becoming a dependency of `crate::ie`. Re-
+// exported here so `error_response::Gtpv2cOffendingIe` keeps resolving.
+pub use crate::decode_error::{Gtpv2cInvalidOffendingIeInstance, Gtpv2cOffendingIe};
+
 /// Largest canonical response produced by this boundary, in octets.
 ///
 /// The bound is a TEID-present 12-octet header plus a 10-octet Cause IE with
@@ -428,73 +434,6 @@ pub fn inspect_gtpv2c_request(input: &[u8]) -> Gtpv2cRequestInspection {
         actual_len: input.len(),
     })
 }
-
-/// Type and four-bit instance of a mandatory or verifiable conditional IE.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Gtpv2cOffendingIe {
-    ie_type: u8,
-    instance: u8,
-}
-
-impl Gtpv2cOffendingIe {
-    /// Validate and construct an offending-IE identity.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Gtpv2cInvalidOffendingIeInstance`] when `instance` is wider
-    /// than the four-bit GTPv2-C IE Instance field.
-    pub const fn new(ie_type: u8, instance: u8) -> Result<Self, Gtpv2cInvalidOffendingIeInstance> {
-        if instance <= 0x0f {
-            Ok(Self { ie_type, instance })
-        } else {
-            Err(Gtpv2cInvalidOffendingIeInstance { instance })
-        }
-    }
-
-    /// IE Type octet.
-    #[must_use]
-    pub const fn ie_type(self) -> u8 {
-        self.ie_type
-    }
-
-    /// Four-bit IE Instance.
-    #[must_use]
-    pub const fn instance(self) -> u8 {
-        self.instance
-    }
-
-    const fn cause_field(self) -> [u8; 4] {
-        [self.ie_type, 0, 0, self.instance]
-    }
-}
-
-/// Error returned for an offending-IE instance wider than four bits.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Gtpv2cInvalidOffendingIeInstance {
-    instance: u8,
-}
-
-impl Gtpv2cInvalidOffendingIeInstance {
-    /// Stable machine-readable error code.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        "gtpv2c_offending_ie_instance_out_of_range"
-    }
-
-    /// Return the rejected instance.
-    #[must_use]
-    pub const fn instance(self) -> u8 {
-        self.instance
-    }
-}
-
-impl fmt::Display for Gtpv2cInvalidOffendingIeInstance {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
-
-impl std::error::Error for Gtpv2cInvalidOffendingIeInstance {}
 
 /// Clause 5.5.2 TEID decision for a protocol-error response.
 ///

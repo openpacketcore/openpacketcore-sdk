@@ -10,6 +10,8 @@ pub mod typed;
 use opc_protocol::{
     DecodeContext, DecodeError, DecodeErrorCode, DecodeResult, EncodeError, SpecRef,
 };
+
+use crate::decode_error::{Gtpv2cDecodeError, Gtpv2cOffendingIe};
 pub use typed::{
     decode_typed_ie_sequence, encode_typed_ie_sequence, AccessPointName,
     AdditionalProtocolConfigurationOptions, AggregateMaximumBitRate, AllocationRetentionPriority,
@@ -70,7 +72,7 @@ pub struct RawIe<'a> {
 impl<'a> RawIe<'a> {
     /// Decode one borrowed raw IE from the front of `input`.
     pub fn decode(input: &'a [u8]) -> DecodeResult<'a, Self> {
-        decode_raw_ie(input, DecodeContext::default(), 0)
+        decode_raw_ie(input, DecodeContext::default(), 0).map_err(DecodeError::from)
     }
 
     /// Return the decoded IE value length in octets.
@@ -216,12 +218,15 @@ impl<'a> RawIeIterator<'a> {
     pub const fn offset(&self) -> usize {
         self.offset
     }
-}
 
-impl<'a> Iterator for RawIeIterator<'a> {
-    type Item = Result<RawIe<'a>, DecodeError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
+    /// As [`Iterator::next`], but a framing error names the offending IE
+    /// whenever a complete four-octet header had been read.
+    ///
+    /// The three errors raised here rather than by the IE decoder -- the
+    /// count overflow, the [`DecodeErrorCode::IeCountExceeded`] bound, and the
+    /// offset arithmetic -- deliberately carry no identity. They are bounds on
+    /// the sequence, not statements about any one element's octets.
+    pub fn next_annotated(&mut self) -> Option<Result<RawIe<'a>, Gtpv2cDecodeError>> {
         if self.stopped || self.remaining.is_empty() {
             return None;
         }
@@ -230,20 +235,18 @@ impl<'a> Iterator for RawIeIterator<'a> {
             Some(count) => count,
             None => {
                 self.stopped = true;
-                return Some(Err(DecodeError::new(
-                    DecodeErrorCode::LengthOverflow,
-                    self.offset,
-                )
-                .with_spec_ref(spec_ref())));
+                return Some(Err(Gtpv2cDecodeError::new(
+                    DecodeError::new(DecodeErrorCode::LengthOverflow, self.offset)
+                        .with_spec_ref(spec_ref()),
+                )));
             }
         };
         if self.count > self.ctx.max_ies {
             self.stopped = true;
-            return Some(Err(DecodeError::new(
-                DecodeErrorCode::IeCountExceeded,
-                self.offset,
-            )
-            .with_spec_ref(spec_ref())));
+            return Some(Err(Gtpv2cDecodeError::new(
+                DecodeError::new(DecodeErrorCode::IeCountExceeded, self.offset)
+                    .with_spec_ref(spec_ref()),
+            )));
         }
 
         match decode_raw_ie(self.remaining, self.ctx, self.offset) {
@@ -257,7 +260,7 @@ impl<'a> Iterator for RawIeIterator<'a> {
                         Ok(offset) => offset,
                         Err(error) => {
                             self.stopped = true;
-                            return Some(Err(error));
+                            return Some(Err(Gtpv2cDecodeError::new(error)));
                         }
                     };
                 self.remaining = tail;
@@ -271,6 +274,15 @@ impl<'a> Iterator for RawIeIterator<'a> {
     }
 }
 
+impl<'a> Iterator for RawIeIterator<'a> {
+    type Item = Result<RawIe<'a>, DecodeError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next_annotated()
+            .map(|item| item.map_err(DecodeError::from))
+    }
+}
+
 /// Validate that `region` is a well-formed sequence of raw GTPv2-C IEs.
 ///
 /// This function does not allocate or type-dispatch. It only enforces TLIV
@@ -280,7 +292,26 @@ impl<'a> Iterator for RawIeIterator<'a> {
 /// @req REQ-3GPP-TS29274-R18-8.2-005
 /// @conformance s2b-subset
 pub fn validate_ie_region(region: &[u8], ctx: DecodeContext) -> Result<(), DecodeError> {
-    for item in RawIeIterator::new(region, ctx) {
+    validate_ie_region_annotated(region, ctx).map_err(DecodeError::from)
+}
+
+/// As [`validate_ie_region`], but a framing error names the offending IE
+/// whenever a complete four-octet header had been read.
+///
+/// # Errors
+///
+/// Returns [`Gtpv2cDecodeError`] for any TLIV boundary, spare-bit, or IE-count
+/// violation in `region`.
+///
+/// @spec 3GPP TS29274 R18 8.2
+/// @req REQ-3GPP-TS29274-R18-8.2-006
+/// @conformance s2b-subset
+pub fn validate_ie_region_annotated(
+    region: &[u8],
+    ctx: DecodeContext,
+) -> Result<(), Gtpv2cDecodeError> {
+    let mut iter = RawIeIterator::new(region, ctx);
+    while let Some(item) = iter.next_annotated() {
         item?;
     }
     Ok(())
@@ -290,16 +321,55 @@ fn decode_raw_ie<'a>(
     input: &'a [u8],
     ctx: DecodeContext,
     base_offset: usize,
-) -> DecodeResult<'a, RawIe<'a>> {
+) -> Result<(&'a [u8], RawIe<'a>), Gtpv2cDecodeError> {
     let spec = spec_ref();
+    // The only exit taken before the header is readable. Type and Instance
+    // live in `input[0]` and `input[3]`, which by definition are not present,
+    // so this error names no element.
     if input.len() < IE_HEADER_LEN {
-        return Err(DecodeError::new(DecodeErrorCode::Truncated, base_offset).with_spec_ref(spec));
+        return Err(Gtpv2cDecodeError::new(
+            DecodeError::new(DecodeErrorCode::Truncated, base_offset).with_spec_ref(spec),
+        ));
     }
 
-    let ie_type = input[0];
-    let length = u16::from_be_bytes([input[1], input[2]]);
-    let spare = (input[3] >> 4) & 0x0f;
-    let instance = input[3] & 0x0f;
+    let header = RawIeHeader {
+        ie_type: input[0],
+        length: u16::from_be_bytes([input[1], input[2]]),
+        spare: (input[3] >> 4) & 0x0f,
+        instance: input[3] & 0x0f,
+    };
+    let offending = Gtpv2cOffendingIe::from_wire(header.ie_type, header.instance);
+
+    // A complete header has been read, so every error raised below is a
+    // statement about this element's octets and names it. Keeping the
+    // unannotated construction inside one helper makes that an invariant of
+    // the split rather than a list of sites that has to be maintained.
+    decode_raw_ie_body(input, ctx, base_offset, spec, header)
+        .map_err(|error| Gtpv2cDecodeError::new(error).annotate_offending(offending))
+}
+
+/// The four octets of a TLIV header, already split into fields.
+#[derive(Clone, Copy)]
+struct RawIeHeader {
+    ie_type: u8,
+    length: u16,
+    spare: u8,
+    instance: u8,
+}
+
+fn decode_raw_ie_body<'a>(
+    input: &'a [u8],
+    ctx: DecodeContext,
+    base_offset: usize,
+    spec: SpecRef,
+    header: RawIeHeader,
+) -> DecodeResult<'a, RawIe<'a>> {
+    let RawIeHeader {
+        ie_type,
+        length,
+        spare,
+        instance,
+    } = header;
     if crate::is_strict(ctx.validation_level) && spare != 0 {
         return Err(DecodeError::new(
             DecodeErrorCode::Structural {

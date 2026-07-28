@@ -356,6 +356,7 @@ jobs:
       - rust-gtpu-cfg
       - rust-gtpu-freebsd
       - rust-gtpu-macos
+      - session-net-i686
     steps:
       # Preserves the single check name the previous monolithic job reported,
       # so anything watching "Rust workspace" keeps meaning the whole suite.
@@ -452,6 +453,10 @@ jobs:
           fi
           exit "${violated}"
 
+  # The job key and display name are deliberately unchanged: the display name is
+  # what a required-status-check rule matches, and renaming it is an operator
+  # action, not a code change. The name now understates the lane, which also
+  # covers opc-protocol and opc-proto-gtpv2c.
   session-net-i686:
     name: opc-session-net i686
     runs-on: ubuntu-24.04
@@ -482,6 +487,13 @@ jobs:
 
       - name: Run opc-session-net tests on i686
         run: cargo test --locked -p opc-session-net --all-features --target i686-unknown-linux-gnu --quiet -- --test-threads=4
+
+      # Widened beyond opc-session-net: opc-protocol is the shared error type
+      # whose layout every protocol crate depends on, and opc-proto-gtpv2c
+      # carries the caller-supplied absolute usize base offsets whose checked
+      # arithmetic is width-sensitive.
+      - name: Run 32-bit portability tests
+        run: cargo test --locked -p opc-protocol -p opc-proto-gtpv2c --all-features --target i686-unknown-linux-gnu --quiet -- --test-threads=4
 
   feature-powerset:
     name: opc-sdk feature powerset
