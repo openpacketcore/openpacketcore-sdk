@@ -577,6 +577,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   codec's configuration-atomicity policy, which TS 24.008 does not require. The
   comment claiming the IPCP Identifier "carries nothing this decoder interprets"
   is deleted.
+- **A cross-generation eBPF datapath upgrade is refused before any mutation --
+  `opc-gtpu-dataplane` (breaking to `EbpfGtpuDatapathSnapshot`):** two distinct
+  upgrade hazards were invisible to the attach path.
+  - A pin graph retained from a build with a narrower `GTPU_COUNTERS` was
+    adopted silently. `max_entries` was compared only on the orphan-recovery
+    path; attach, adopt and grouped attach compared kernel map IDs read from the
+    maps the loader had just adopted, so both sides agreed by construction. A
+    retained 6-slot counter map was therefore bound to a build that indexes 7,
+    and the kernel discards every write to a slot at or past `max_entries` --
+    surfacing as a counter permanently stuck at zero rather than as an error.
+  - A live tc hook from an older program generation could not be replaced at
+    all, because hook replacement requires exact program-tag equality, and the
+    refusal arrived only after the loader had already created pins, written
+    config and materialized policy.
+  Both are now classified before anything changes, using kernel metadata only
+  and binding no value type. Each names its own failure: a pin-ABI divergence
+  raises `GtpuError::Io { operation: "ebpf_pin_map_abi" }`, while a live older
+  hook raises `GtpuError::DatapathGenerationMismatch`. The guards run in a
+  fixed order -- layout, then capacity, then generation -- so the error a
+  caller observes for a graph carrying more than one hazard is predictable.
+  Map *layout* -- type, name, key size, value size, flags -- is checked on
+  every present pin before the schema preflight's typed FAR read, so a foreign
+  map shape is named as a shape mismatch instead of surfacing later as a schema
+  error from an accessor that had already assumed the shape. Map *capacity* is
+  checked separately, on every graph whatever schema marker it carries. Judging
+  only the current marker would leave a graph this build itself creates
+  permanently unusable: migrating a pre-v5 graph advances the marker to v5
+  while the loader adopts the retained counter pin unchanged, so a narrower map
+  would pass the gate on the way in and fail it on every attach afterwards.
+  Refusing before that migration keeps the graph exactly as it was found, so a
+  drained reprovision still resolves it. The cost is stated plainly: an upgrade
+  that grows a counter slot now needs a drained reprovision where it previously
+  succeeded and miscounted. A generation guard then reads the program tag
+  of each hook occupant and compares it against tags derived offline from the
+  frozen objects the crate carries, refusing with the new
+  `GtpuError::DatapathGenerationMismatch { operation, observed, expected }`.
+  The refusal removes no pin, creates no pin, writes no policy or config and
+  replaces no hook, so the documented drained reprovision still works after any
+  number of refused attempts; `create_device`, `resolve_device` and
+  `create_device_with_endpoints` behave identically. The frozen v1 generation
+  passes the guard because the loader carries that object as a replacement
+  artifact and can replace such a hook atomically; the existing empty-graph
+  migration rules continue to judge it.
+  Grouped attachment now excludes live legacy IPv4 authority from the pins
+  before the loader materializes the grouped pins rather than after. With every
+  grouped pin absent the schema preflight reports an initializing state, which
+  says nothing about whether a legacy graph is still live, and acting on that
+  classification must not be what discovers the conflict.
+  `EbpfGtpuDatapathSnapshot` gains `uplink_pmtu_counters_map_id`, closing the
+  one counter map whose values were published without an identity. A rebuilt
+  counter map starts at zero, so on any counter-identity change a consumer must
+  discard prior deltas and re-baseline rather than alert on the step; kernel map
+  IDs are per-boot and recycled, so a baseline persisted across a reboot needs a
+  boot identity alongside the ID. Adding the field is a breaking change to a
+  struct that is not `#[non_exhaustive]`.
+  `crates/opc-gtpu-dataplane/bpf/opc-gtpu-datapath-pre-redirect.bpf.o` is a new
+  frozen artifact, byte-identical to the committed object of the generation
+  before the uplink redirect-outcome counter and provenance-checked in CI the
+  same way the v1 and v2 artifacts are, including an assertion that it is not
+  byte-identical to the current object. Like them it stays private to a
+  parse-only module exposing derived program tags and never raw bytes: an older
+  generation is something to identify and refuse, never to install.
+  Growing `COUNTER_SLOTS` consequently now requires a drained reprovision of a
+  retained current-schema graph where it previously succeeded and miscounted.
 - **P-CSCF Re-selection support is no longer emittable on its own --
   `opc-proto-gtpv2c` (breaking to `PcoRequest`):** TS 24.008 10.5.6.3 says of
   container `0x0012` that "This PCO parameter may be present only if a

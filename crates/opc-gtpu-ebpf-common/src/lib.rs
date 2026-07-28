@@ -2038,10 +2038,28 @@ mod tests {
     ///
     /// Growing `COUNTER_SLOTS` is not only a CI drift-gate refresh. It changes
     /// `GTPU_COUNTERS.max_entries` in the committed object's `maps` section
-    /// *and* in the pinned map graph, and the loader compares `max_entries` at
-    /// every current-schema pin identity check, so a pin graph retained from a
-    /// build with the old slot count is not this build's graph and is refused
-    /// rather than adopted in place.
+    /// *and* in the pinned map graph, so a pin graph retained from a build with
+    /// the old slot count is not this build's graph.
+    ///
+    /// That is not detected by comparing kernel map IDs. The attach, adopt and
+    /// grouped-attach paths read those IDs from the maps the loader has just
+    /// adopted, so both sides agree by construction whatever width the retained
+    /// map has. It is detected by the untyped pin capacity check the loader
+    /// performs before it loads anything, on any graph carrying the current
+    /// committed schema marker. A retained current-schema graph of the old
+    /// width is therefore refused rather than adopted in place, and refused
+    /// before any pin is created, removed or written.
+    ///
+    /// The practical consequence of growing this constant: an upgrade over a
+    /// retained current-schema graph requires a drained reprovision instead of
+    /// succeeding silently. That is deliberate. Adopting in place would leave
+    /// every write to the new highest slot discarded by the kernel, which reads
+    /// as a counter stuck at zero rather than as a failure.
+    ///
+    /// A graph still carrying a pre-v5 marker is judged by the migration paths
+    /// that own it rather than by this check, so it keeps whatever capacity it
+    /// was pinned with. Those graphs are separately required to be empty before
+    /// they can advance.
     #[test]
     fn datapath_counter_indices_are_distinct_and_within_the_map() {
         let indices = [

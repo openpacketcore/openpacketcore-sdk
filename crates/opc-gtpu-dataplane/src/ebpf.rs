@@ -214,6 +214,29 @@ pub struct EbpfGtpuDatapathCounters {
 /// reference `counters_map_id` at both identity checks. The program and map IDs
 /// are kernel-local diagnostic handles and the counters are aggregate-only, so
 /// `Debug` is safe for redacted operational evidence.
+///
+/// # Counter identity and re-baselining
+///
+/// Each counter map ID — `counters_map_id`,
+/// `downlink_binding_counters_map_id` and `uplink_pmtu_counters_map_id` —
+/// identifies the exact kernel map the published counters were read from. A
+/// rebuilt map starts at zero, and it is a different map, so its ID differs
+/// from the one it replaced.
+///
+/// On an identity change, discard prior deltas and re-baseline from the new
+/// value. Do not alert on the step: a consumer that treats these as monotonic
+/// and ignores the identity will read a rebuild as either a negative delta or a
+/// full-value spike, depending on which way it clamps.
+///
+/// An *unchanged* ID is weaker evidence than a changed one and does not prove
+/// no rebuild happened. The kernel allocates map IDs from a reusable space, so
+/// a rebuild can be handed an ID that a freed map previously held. Treat an
+/// unexplained fall toward zero as a rebuild even when the ID is unchanged;
+/// the identity is a positive signal, not a completeness guarantee.
+///
+/// Kernel map IDs are allocated per boot and are recycled. A baseline persisted
+/// across a host reboot may therefore observe the same ID for a different map;
+/// pair the ID with a boot identity if a baseline has to outlive the host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct EbpfGtpuDatapathSnapshot {
     /// Kernel program ID attached at tc egress for uplink encapsulation.
@@ -224,6 +247,12 @@ pub struct EbpfGtpuDatapathSnapshot {
     pub counters_map_id: u32,
     /// Kernel map ID of the exact pinned binding-drop counter map.
     pub downlink_binding_counters_map_id: u32,
+    /// Kernel map ID of the exact pinned uplink MTU-drop counter map.
+    ///
+    /// Published for the same reason as the other two: this map's counters are
+    /// read into the snapshot, so a consumer needs its identity to tell a
+    /// rebuild from a drop to zero.
+    pub uplink_pmtu_counters_map_id: u32,
     /// Per-path counters aggregated across all possible CPUs.
     pub counters: EbpfGtpuDatapathCounters,
 }
@@ -4994,7 +5023,7 @@ mod aya_runtime {
     use std::os::unix::fs::MetadataExt;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::Mutex;
+    use std::sync::{Mutex, OnceLock};
 
     use aya::maps::{
         Array, HashMap as BpfHashMap, IterableMap, Map, MapData, MapError, MapInfo, PerCpuArray,
@@ -5054,7 +5083,8 @@ mod aya_runtime {
     use crate::{
         CurrentEbpfGraphRecoveryOutcome, CurrentEbpfGraphRecoveryProgress,
         CurrentEbpfGraphRecoveryRefusal, DrainedV2TeardownOutcome, DrainedV2TeardownProgress,
-        DrainedV2TeardownRefusal, GtpuError,
+        DrainedV2TeardownRefusal, EbpfDatapathGeneration, EbpfHistoricalDatapathGeneration,
+        GtpuError,
     };
 
     /// Attempt the committed classifier load and classify the outcome.
@@ -5211,6 +5241,15 @@ mod aya_runtime {
         0x30, 0x8f, 0x6f, 0xd5, 0xb4, 0xc6, 0x77, 0xcc, 0x3c, 0x21, 0x25, 0xb1, 0x94, 0x86, 0x04,
         0x64, 0xa5,
     ];
+    const PRE_REDIRECT_DATAPATH_SHA256: [u8; 32] = [
+        0xe4, 0xa4, 0xc9, 0x37, 0x36, 0xb1, 0x46, 0x66, 0x39, 0xfb, 0x52, 0xe4, 0xd4, 0x8b, 0x1c,
+        0xab, 0x45, 0x6e, 0xd4, 0xa0, 0xee, 0xfa, 0x0a, 0xc5, 0xdf, 0x7c, 0xa4, 0x61, 0x77, 0xb2,
+        0xc1, 0x64,
+    ];
+    /// Counter slot count of the generation immediately preceding the uplink
+    /// redirect-outcome counter. The current build indexes `COUNTER_SLOTS`
+    /// slots, so a retained map of this width silently drops the highest slot.
+    const PRE_REDIRECT_COUNTER_SLOTS: u32 = 6;
 
     /// Parse-only authority for the frozen endpoint-unbound bearer-v2 object.
     ///
@@ -5255,6 +5294,73 @@ mod aya_runtime {
                     AyaGtpuRuntime::legacy_v2_artifact_tags_from(DATAPATH_OBJECT),
                     Err(GtpuError::StateIndeterminate {
                         operation: "ebpf_legacy_v2_object_provenance"
+                    })
+                ));
+            }
+        }
+    }
+
+    /// Parse-only authority for the frozen generation immediately preceding the
+    /// uplink redirect-outcome counter.
+    ///
+    /// This object is the byte authority that lets the loader recognise a live
+    /// hook from that generation by program tag. As with the bearer-v2
+    /// artifact, the embedded bytes stay private to this child module so the
+    /// runtime holds no raw-object value it could hand to a loader: an old
+    /// generation is something to identify and refuse, never something to
+    /// install.
+    mod pre_redirect_artifact {
+        use super::{AyaGtpuRuntime, GtpuError, LegacyV2ProgramTags};
+
+        const OBJECT: &[u8] = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/bpf/opc-gtpu-datapath-pre-redirect.bpf.o"
+        ));
+
+        pub(super) fn program_tags() -> Result<(LegacyV2ProgramTags, LegacyV2ProgramTags), GtpuError>
+        {
+            AyaGtpuRuntime::pre_redirect_artifact_tags_from(OBJECT)
+        }
+
+        /// Test-only escape from the module's byte privacy.
+        ///
+        /// Proving that the offline tag equals the tag the running kernel
+        /// computes requires actually loading these bytes. That proof is the
+        /// whole basis of the generation guard, so it has to load the real
+        /// object; nothing on a production path can reach this.
+        #[cfg(test)]
+        pub(super) fn object_for_tag_proof() -> &'static [u8] {
+            OBJECT
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use sha2::{Digest, Sha256};
+
+            use super::super::{
+                AyaGtpuRuntime, GtpuError, DATAPATH_OBJECT, PRE_REDIRECT_DATAPATH_SHA256,
+            };
+            use super::OBJECT;
+
+            #[test]
+            fn pre_redirect_artifact_has_exact_provenance_and_rejects_other_bytes() {
+                assert_eq!(&Sha256::digest(OBJECT)[..], &PRE_REDIRECT_DATAPATH_SHA256);
+
+                let mut tampered = OBJECT.to_vec();
+                tampered[0] ^= 0xff;
+                assert!(matches!(
+                    AyaGtpuRuntime::pre_redirect_artifact_tags_from(&tampered),
+                    Err(GtpuError::StateIndeterminate {
+                        operation: "ebpf_pre_redirect_object_provenance"
+                    })
+                ));
+                // The current object must not be able to masquerade as the
+                // historical one: a fixture that reproduces only a map shape
+                // from the current build proves nothing about a generation.
+                assert!(matches!(
+                    AyaGtpuRuntime::pre_redirect_artifact_tags_from(DATAPATH_OBJECT),
+                    Err(GtpuError::StateIndeterminate {
+                        operation: "ebpf_pre_redirect_object_provenance"
                     })
                 ));
             }
@@ -5662,6 +5768,129 @@ mod aya_runtime {
     struct LegacyV2ProgramTags {
         sha1: u64,
         sha256: u64,
+    }
+
+    /// Offline tag candidates for the datapath generations this build knows by
+    /// name, keyed by hook.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct DatapathGenerationTags {
+        current: (LegacyV2ProgramTags, LegacyV2ProgramTags),
+        legacy_v1: (LegacyV2ProgramTags, LegacyV2ProgramTags),
+        pre_redirect: (LegacyV2ProgramTags, LegacyV2ProgramTags),
+    }
+
+    impl DatapathGenerationTags {
+        /// Name the generation whose uplink or downlink tag the kernel reports.
+        ///
+        /// An SDK-named occupant matching no frozen identity is a generation
+        /// this build cannot reason about. That is a refusal, not a fallback to
+        /// "probably current": an unknown instruction stream cannot be assumed
+        /// to write the maps this build is about to publish.
+        ///
+        /// Each hook is judged on its own tag. A partially completed
+        /// replacement leaves one slot on this build's generation and the other
+        /// on the generation being replaced, and `attach_programs` preserves
+        /// that state deliberately so a retry can converge rather than opening
+        /// an outage. Demanding that both hooks name one generation would
+        /// classify exactly that retryable state as unrecognised and refuse it
+        /// forever, so the governing answer is the least replaceable hook.
+        fn classify(
+            self,
+            uplink_tag: Option<u64>,
+            downlink_tag: Option<u64>,
+        ) -> Option<Generation> {
+            let uplink = uplink_tag.map(|tag| {
+                Self::name_hook(tag, self.current.0, self.legacy_v1.0, self.pre_redirect.0)
+            });
+            let downlink = downlink_tag.map(|tag| {
+                Self::name_hook(tag, self.current.1, self.legacy_v1.1, self.pre_redirect.1)
+            });
+            match (uplink, downlink) {
+                (None, None) => None,
+                (Some(only), None) | (None, Some(only)) => Some(only),
+                (Some(uplink), Some(downlink)) => {
+                    Some(if downlink.refusal_rank() > uplink.refusal_rank() {
+                        downlink
+                    } else {
+                        uplink
+                    })
+                }
+            }
+        }
+
+        /// Name one hook's generation from the tag the kernel reports for it.
+        fn name_hook(
+            tag: u64,
+            current: LegacyV2ProgramTags,
+            legacy_v1: LegacyV2ProgramTags,
+            pre_redirect: LegacyV2ProgramTags,
+        ) -> Generation {
+            if current.contains(tag) {
+                Generation::Current
+            } else if legacy_v1.contains(tag) {
+                Generation::LegacyV1
+            } else if pre_redirect.contains(tag) {
+                Generation::PreRedirect
+            } else {
+                Generation::Unrecognized
+            }
+        }
+    }
+
+    /// A live hook's generation as judged from its kernel program tag.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Generation {
+        Current,
+        /// The frozen pre-bearer-mark generation. Unlike every other
+        /// superseded generation this one has a supported in-place upgrade:
+        /// `attach_programs` loads the same frozen object as a replacement
+        /// artifact, so its hooks can be replaced atomically by tag equality
+        /// against that artifact. It must therefore pass the generation guard
+        /// and be judged by the existing migration path, which also decides
+        /// whether the committed schema permits the upgrade at all.
+        LegacyV1,
+        PreRedirect,
+        Unrecognized,
+    }
+
+    impl Generation {
+        /// Order the generations by how little this build can do with one.
+        ///
+        /// `Current` and `LegacyV1` are replaceable in place, because this
+        /// build carries an artifact whose tag can match the live hook.
+        /// Nothing else is. When the two hooks disagree the higher rank
+        /// decides, so a single unreplaceable hook still refuses the attach
+        /// even when its partner is fine.
+        const fn refusal_rank(self) -> u8 {
+            match self {
+                Self::Current => 0,
+                Self::LegacyV1 => 1,
+                Self::PreRedirect => 2,
+                Self::Unrecognized => 3,
+            }
+        }
+    }
+
+    /// A cached offline tag-derivation failure.
+    ///
+    /// `GtpuError` carries an `io::Error` and cannot be cloned out of a cache,
+    /// but every derivation failure is fully described by its stable operation
+    /// label, so the cache stores that and rebuilds the error per caller.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ObjectTagFailure {
+        Parse(&'static str),
+        Indeterminate(&'static str),
+    }
+
+    impl ObjectTagFailure {
+        fn to_error(self) -> GtpuError {
+            match self {
+                Self::Parse(operation) => {
+                    GtpuError::io(operation, invalid_data("bpf object parse failed"))
+                }
+                Self::Indeterminate(operation) => state_indeterminate(operation),
+            }
+        }
     }
 
     impl LegacyV2ProgramTags {
@@ -6484,6 +6713,52 @@ mod aya_runtime {
             Self::object_program_tags(object)
         }
 
+        /// Derive the tag candidates of the frozen generation that preceded the
+        /// uplink redirect-outcome counter.
+        ///
+        /// The map inventory is the current one: this generation differs from
+        /// the current build by its instruction stream and by the counter map
+        /// width, not by which maps exist. Checking the whole inventory anyway
+        /// keeps the artifact pinned to a single meaning, so a future object
+        /// swapped in under this name cannot quietly become the authority.
+        fn pre_redirect_artifact_tags_from(
+            bytes: &[u8],
+        ) -> Result<(LegacyV2ProgramTags, LegacyV2ProgramTags), GtpuError> {
+            if Sha256::digest(bytes)[..] != PRE_REDIRECT_DATAPATH_SHA256 {
+                return Err(state_indeterminate("ebpf_pre_redirect_object_provenance"));
+            }
+            let object = AyaObject::parse(bytes).map_err(|_| {
+                GtpuError::io(
+                    "ebpf_pre_redirect_object_parse",
+                    invalid_data("pre-redirect bpf object parse failed"),
+                )
+            })?;
+            if object.maps.len() != CURRENT_MAP_SPECS.len() {
+                return Err(state_indeterminate("ebpf_pre_redirect_object_identity"));
+            }
+            for spec in CURRENT_MAP_SPECS {
+                let map = object
+                    .maps
+                    .get(spec.name)
+                    .ok_or_else(|| state_indeterminate("ebpf_pre_redirect_object_identity"))?;
+                let max_entries = if spec.name == MAP_COUNTERS {
+                    PRE_REDIRECT_COUNTER_SLOTS
+                } else {
+                    spec.max_entries
+                };
+                if map.map_type() != spec.map_type
+                    || map.key_size() != spec.key_size
+                    || map.value_size() != spec.value_size
+                    || map.max_entries() != max_entries
+                    || map.map_flags() != 0
+                    || map.pinning() != PinningType::ByName
+                {
+                    return Err(state_indeterminate("ebpf_pre_redirect_object_identity"));
+                }
+            }
+            Self::object_program_tags(object)
+        }
+
         fn object_program_tags(
             mut object: AyaObject,
         ) -> Result<(LegacyV2ProgramTags, LegacyV2ProgramTags), GtpuError> {
@@ -6541,6 +6816,45 @@ mod aya_runtime {
         fn legacy_v2_artifact_tags() -> Result<(LegacyV2ProgramTags, LegacyV2ProgramTags), GtpuError>
         {
             legacy_v2_artifact::program_tags()
+        }
+
+        /// Offline tag candidates for every datapath generation this build can
+        /// name, derived at most once per process.
+        ///
+        /// Deriving a tag relocates BTF against `vmlinux` and rewrites map and
+        /// call references across an 800 KiB object. Repeating that on every
+        /// attach would be an unreasonable cost for an answer that cannot
+        /// change while the process lives: both objects are compiled in.
+        ///
+        /// A derivation failure is cached too. If this build cannot turn its
+        /// own frozen objects into identities, it cannot tell a live current
+        /// hook from a live historical one, and retrying will not change that.
+        fn datapath_generation_tags() -> Result<&'static DatapathGenerationTags, GtpuError> {
+            static TAGS: OnceLock<Result<DatapathGenerationTags, ObjectTagFailure>> =
+                OnceLock::new();
+            TAGS.get_or_init(|| {
+                let current = AyaObject::parse(DATAPATH_OBJECT)
+                    .map_err(|_| ObjectTagFailure::Parse("ebpf_current_object_identity"))
+                    .and_then(|object| {
+                        Self::object_program_tags(object)
+                            .map_err(object_identity_failure("ebpf_current_object_identity"))
+                    })?;
+                let legacy_v1 = AyaObject::parse(LEGACY_V1_DATAPATH_OBJECT)
+                    .map_err(|_| ObjectTagFailure::Parse("ebpf_legacy_object_identity"))
+                    .and_then(|object| {
+                        Self::object_program_tags(object)
+                            .map_err(object_identity_failure("ebpf_legacy_object_identity"))
+                    })?;
+                let pre_redirect = pre_redirect_artifact::program_tags()
+                    .map_err(object_identity_failure("ebpf_pre_redirect_object_identity"))?;
+                Ok(DatapathGenerationTags {
+                    current,
+                    legacy_v1,
+                    pre_redirect,
+                })
+            })
+            .as_ref()
+            .map_err(|failure| failure.to_error())
         }
 
         fn legacy_v2_directory_entries(pin_dir: &Path) -> Result<HashSet<String>, GtpuError> {
@@ -6977,6 +7291,233 @@ mod aya_runtime {
             Ok(!forwarding_state_present)
         }
 
+        fn pin_abi_mismatch(reason: &'static str) -> GtpuError {
+            GtpuError::io("ebpf_pin_map_abi", invalid_data(reason))
+        }
+
+        /// Read one pinned map's kernel metadata, or `None` when the pin is
+        /// absent. Binds no value type and reads no map contents.
+        fn pinned_map_info(pin_dir: &Path, name: &str) -> Result<Option<MapInfo>, GtpuError> {
+            let path = pin_dir.join(name);
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(GtpuError::io("ebpf_pin_map_abi", error)),
+            };
+            if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+                return Err(Self::pin_abi_mismatch(
+                    "pinned GTP-U map is not a bpffs map pin",
+                ));
+            }
+            MapInfo::from_pin(&path)
+                .map(Some)
+                .map_err(|_| Self::pin_abi_mismatch("pinned GTP-U map could not be identified"))
+        }
+
+        /// Reject any present pin whose kernel layout is not the layout this
+        /// build binds a value type to.
+        ///
+        /// This must run before any typed read and before `load_pinned`.
+        /// `MapInfo` answers from kernel metadata alone, so a pin carrying a
+        /// foreign map type, key size or value size is named as the shape
+        /// mismatch it is, rather than surfacing later as a schema error from
+        /// a typed accessor that had already assumed the shape.
+        ///
+        /// Only the dimensions a typed binding depends on are checked here.
+        /// `max_entries` is excluded because it is not one of them: a map of
+        /// the wrong capacity still binds, so it is a separate hazard judged by
+        /// its own guard rather than a shape mismatch. Capacity is not weaker
+        /// for being separate -- it is enforced on every graph.
+        ///
+        /// Note this guard is not a generation test. The v1 and pre-redirect
+        /// generations do share this build's layout for every map they pin, but
+        /// the frozen bearer-v2 generation does not: its owner value is a
+        /// different width, so a retained v2 pin set is named here as the shape
+        /// mismatch it is.
+        ///
+        /// Absent pins are skipped. Whether a partial pin set is legitimate is
+        /// a different question, answered by the schema preflight that follows.
+        fn classify_pinned_map_layout(pin_dir: &Path) -> Result<(), GtpuError> {
+            for spec in CURRENT_MAP_SPECS {
+                let Some(info) = Self::pinned_map_info(pin_dir, spec.name)? else {
+                    continue;
+                };
+                let map_type = info
+                    .map_type()
+                    .map_err(|_| Self::pin_abi_mismatch("pinned GTP-U map reported no map type"))?
+                    as u32;
+                if map_type != spec.map_type
+                    || info.name() != kernel_program_name(spec.name)
+                    || info.key_size() != spec.key_size
+                    || info.value_size() != spec.value_size
+                    || info.map_flags() != 0
+                {
+                    return Err(Self::pin_abi_mismatch(
+                        "pinned GTP-U map has a foreign layout",
+                    ));
+                }
+            }
+            Ok(())
+        }
+
+        /// Reject a graph that claims this build's committed schema while
+        /// carrying a map of a different capacity.
+        ///
+        /// This is the case no typed accessor can see. A counter map retained
+        /// from a build with fewer slots has exactly the key and value type
+        /// this build expects, so every accessor binds to it happily, and the
+        /// kernel silently discards each write to a slot at or past its
+        /// `max_entries`. Adopting it yields a counter that is permanently
+        /// zero -- a wrong operator-facing number rather than an error.
+        ///
+        /// Every retained graph is judged, whatever schema marker it carries,
+        /// and before any typed read or mutation. Judging only the current
+        /// marker would leave a graph this build itself creates permanently
+        /// unusable: migrating a pre-v5 graph advances the marker to v5 while
+        /// the loader adopts the retained counter pin unchanged, so a narrower
+        /// map would pass the gate on the way in and fail it on every attach
+        /// afterwards. Refusing before the migration keeps the graph exactly as
+        /// it was found, so a drained reprovision still resolves it.
+        fn require_current_pin_capacity(pin_dir: &Path) -> Result<(), GtpuError> {
+            for spec in CURRENT_MAP_SPECS {
+                let Some(info) = Self::pinned_map_info(pin_dir, spec.name)? else {
+                    continue;
+                };
+                if info.max_entries() != spec.max_entries {
+                    return Err(Self::pin_abi_mismatch(
+                        "pinned GTP-U map has a foreign slot count",
+                    ));
+                }
+            }
+            Ok(())
+        }
+
+        /// Read the program tag of whatever holds one tc slot, or `None` when
+        /// this build has no generation question to ask about it.
+        ///
+        /// A slot held by something that is not one of this SDK's programs is
+        /// not a generation question: that occupant is left to the existing
+        /// exact-ownership refusal rather than being given a generation name.
+        fn live_hook_program_tag(
+            ifindex: u32,
+            name: &str,
+            attach_type: TcAttachType,
+            tc_priority: u16,
+        ) -> Result<Option<u64>, GtpuError> {
+            let Some(owner) = slot_owner(ifindex, attach_type, tc_priority)? else {
+                return Ok(None);
+            };
+            if owner.name != name {
+                return Ok(None);
+            }
+            let Some(program_id) = owner.program_id else {
+                return Ok(None);
+            };
+            loaded_programs()
+                .find_map(|result| match result {
+                    Ok(info) if info.id() == program_id => Some(Ok(info.tag())),
+                    Ok(_) => None,
+                    Err(error) => Some(Err(program_error("ebpf_generation_identity", &error))),
+                })
+                // The filter dump and the program listing are separate reads.
+                // A program that vanished between them leaves no live
+                // generation to conflict with; the attach path re-observes the
+                // slot before it replaces anything.
+                .transpose()
+        }
+
+        /// Name the generation of the live SDK datapath on this device, if any.
+        ///
+        /// Reads only kernel state: one tc filter dump per hook and the program
+        /// listing. Nothing is created, removed or written.
+        fn classify_live_generation(
+            ifindex: u32,
+            tc_priority: u16,
+        ) -> Result<Option<Generation>, GtpuError> {
+            let uplink = Self::live_hook_program_tag(
+                ifindex,
+                PROG_UPLINK,
+                TcAttachType::Egress,
+                tc_priority,
+            )?;
+            let downlink = Self::live_hook_program_tag(
+                ifindex,
+                PROG_DOWNLINK,
+                TcAttachType::Ingress,
+                tc_priority,
+            )?;
+            if uplink.is_none() && downlink.is_none() {
+                // Nothing of ours is live. Deriving offline tags here would
+                // make an attach onto an empty device depend on BTF being
+                // readable, for an answer with nothing to compare against.
+                return Ok(None);
+            }
+            Ok(Self::datapath_generation_tags()?.classify(uplink, downlink))
+        }
+
+        /// Refuse before any mutation when a live hook runs an older or
+        /// unrecognised generation of the datapath program.
+        ///
+        /// Hook replacement requires exact program-tag equality, so an older
+        /// generation can never be replaced in place: this attach is going to
+        /// fail whatever else happens. Discovering that only at the hook means
+        /// everything ahead of it has already run against a datapath this
+        /// process does not own -- pins materialized for maps the older
+        /// generation never had, and commit-record recovery writing into the
+        /// forwarding maps a live program is reading. Deciding first turns a
+        /// guaranteed failure into one that changed nothing, so the documented
+        /// drained reprovision is still available afterwards, unchanged.
+        ///
+        /// It also keeps any future in-place counter rebuild from being
+        /// reachable here. Unlinking a counter pin and republishing it while an
+        /// unreplaceable hook stays attached would split metrics between the
+        /// map the live program still writes and the map the pin now names,
+        /// and no retry could converge: the pin would be this build's shape
+        /// while the tag still differed.
+        fn require_no_foreign_generation(
+            ifindex: u32,
+            tc_priority: u16,
+            operation: &'static str,
+        ) -> Result<(), GtpuError> {
+            let observed = match Self::classify_live_generation(ifindex, tc_priority)? {
+                // The v1 generation has a supported in-place upgrade; let the
+                // existing migration path judge it, including whether the
+                // committed schema permits the upgrade at all.
+                None | Some(Generation::Current) | Some(Generation::LegacyV1) => return Ok(()),
+                Some(Generation::PreRedirect) => EbpfDatapathGeneration::Historical(
+                    EbpfHistoricalDatapathGeneration::PreUplinkRedirectCounter,
+                ),
+                Some(Generation::Unrecognized) => EbpfDatapathGeneration::Unrecognized,
+            };
+            Err(GtpuError::DatapathGenerationMismatch {
+                operation,
+                observed,
+                expected: EbpfDatapathGeneration::Current,
+            })
+        }
+
+        /// Read the retained IPv4 ownership record straight from its pin.
+        ///
+        /// Answering ownership from the pin lets a conflicting-owner refusal
+        /// happen before the loader publishes any map. An absent pin records no
+        /// owner, so there is nothing to conflict with.
+        fn pinned_config_read(pin_dir: &Path) -> Result<Option<[u8; 4]>, GtpuError> {
+            if !pin_dir
+                .join(MAP_CONFIG)
+                .try_exists()
+                .map_err(|error| GtpuError::io("ebpf_pin_config", error))?
+            {
+                return Ok(None);
+            }
+            let map = Self::current_map(pin_dir, MAP_CONFIG)
+                .map_err(|_| state_indeterminate("ebpf_pin_config"))?;
+            let config = Array::<MapData, [u8; 4]>::try_from(map)
+                .map_err(|error| map_error("ebpf_pin_config", error))?
+                .get(&0, 0)
+                .map_err(|error| map_error("ebpf_pin_config", error))?;
+            Ok(Some(config))
+        }
+
         /// Determine which additive map schema this pin set has committed.
         /// The marker lives in the pre-existing FAR map so it remains
         /// available when a required additive pin is accidentally removed.
@@ -7348,16 +7889,26 @@ mod aya_runtime {
         /// legacy forwarding map must be empty, the legacy config slot must
         /// remain all-zero, and only the recognized userspace schema marker
         /// may occupy the FAR map.
+        ///
+        /// This reads the pins rather than a loaded graph so it can run before
+        /// `load_pinned`. Ownership has to be settled before the loader
+        /// materializes the grouped pins: when every grouped pin is absent the
+        /// schema preflight reports an initializing state, and acting on that
+        /// while live legacy authority still exists would publish grouped
+        /// policy over a graph this attachment does not own. An absent pin
+        /// holds no entries, so it is empty by definition.
         fn require_empty_legacy_authority(
-            ebpf: &Ebpf,
+            pin_dir: &Path,
             bearer_state: BearerSchemaState,
         ) -> Result<(), GtpuError> {
-            let missing =
-                || GtpuError::io("ebpf_grouped_legacy_graph", invalid_data("map missing"));
-            let far = BpfHashMap::<_, [u8; 4], [u8; UPLINK_FAR_VALUE_LEN]>::try_from(
-                ebpf.map(MAP_UPLINK_FAR).ok_or_else(missing)?,
-            )
-            .map_err(|error| map_error("ebpf_grouped_legacy_graph", error))?;
+            let Some(far_map) = Self::legacy_authority_map(pin_dir, MAP_UPLINK_FAR)? else {
+                // No FAR pin means no legacy graph at all. The schema preflight
+                // has already refused any partial pin set that could reach here
+                // with a real legacy graph behind it.
+                return Ok(());
+            };
+            let far = BpfHashMap::<MapData, [u8; 4], [u8; UPLINK_FAR_VALUE_LEN]>::try_from(far_map)
+                .map_err(|error| map_error("ebpf_grouped_legacy_graph", error))?;
             let expected_marker = match bearer_state {
                 BearerSchemaState::Fresh => None,
                 BearerSchemaState::LegacyV0 => None,
@@ -7386,18 +7937,18 @@ mod aya_runtime {
 
             macro_rules! require_empty {
                 ($name:expr, $key:ty, $value:ty) => {{
-                    let map = BpfHashMap::<_, $key, $value>::try_from(
-                        ebpf.map($name).ok_or_else(missing)?,
-                    )
-                    .map_err(|error| map_error("ebpf_grouped_legacy_graph", error))?;
-                    if map
-                        .iter()
-                        .next()
-                        .transpose()
-                        .map_err(|error| map_error("ebpf_grouped_legacy_graph", error))?
-                        .is_some()
-                    {
-                        return Err(GtpuError::AlreadyExists);
+                    if let Some(pinned) = Self::legacy_authority_map(pin_dir, $name)? {
+                        let map = BpfHashMap::<MapData, $key, $value>::try_from(pinned)
+                            .map_err(|error| map_error("ebpf_grouped_legacy_graph", error))?;
+                        if map
+                            .iter()
+                            .next()
+                            .transpose()
+                            .map_err(|error| map_error("ebpf_grouped_legacy_graph", error))?
+                            .is_some()
+                        {
+                            return Err(GtpuError::AlreadyExists);
+                        }
                     }
                 }};
             }
@@ -7438,14 +7989,31 @@ mod aya_runtime {
                 [u8; UPLINK_MARK_KEY_LEN],
                 [u8; MARKED_BEARER_OWNER_VALUE_LEN]
             );
-            let config = Array::<_, [u8; 4]>::try_from(ebpf.map(MAP_CONFIG).ok_or_else(missing)?)
-                .map_err(|error| map_error("ebpf_grouped_legacy_graph", error))?
-                .get(&0, 0)
-                .map_err(|error| map_error("ebpf_grouped_legacy_graph", error))?;
-            if config != [0; 4] {
-                return Err(GtpuError::AlreadyExists);
+            if let Some(pinned) = Self::legacy_authority_map(pin_dir, MAP_CONFIG)? {
+                let config = Array::<MapData, [u8; 4]>::try_from(pinned)
+                    .map_err(|error| map_error("ebpf_grouped_legacy_graph", error))?
+                    .get(&0, 0)
+                    .map_err(|error| map_error("ebpf_grouped_legacy_graph", error))?;
+                if config != [0; 4] {
+                    return Err(GtpuError::AlreadyExists);
+                }
             }
             Ok(())
+        }
+
+        /// Open one pinned legacy-authority map, treating an absent pin as a
+        /// map that cannot hold authority because it does not exist yet.
+        fn legacy_authority_map(pin_dir: &Path, name: &str) -> Result<Option<Map>, GtpuError> {
+            if !pin_dir
+                .join(name)
+                .try_exists()
+                .map_err(|error| GtpuError::io("ebpf_grouped_legacy_graph", error))?
+            {
+                return Ok(None);
+            }
+            Self::current_map(pin_dir, name)
+                .map(Some)
+                .map_err(|_| state_indeterminate("ebpf_grouped_legacy_graph"))
         }
 
         fn write_bearer_schema_marker(ebpf: &mut Ebpf) -> Result<(), GtpuError> {
@@ -9779,6 +10347,22 @@ mod aya_runtime {
         GtpuError::StateIndeterminate { operation }
     }
 
+    /// Re-label an offline tag-derivation failure with the object it came from.
+    ///
+    /// `object_program_tags` reports under the operation names of the artifact
+    /// it was originally written for, which says nothing useful once three
+    /// different objects share it. An operator reading a refusal needs to know
+    /// which frozen object could not be turned into an identity; the shared
+    /// sub-reasons -- unusable BTF, failed relocation, sanitizer modes that
+    /// disagree -- are already excluded for every committed artifact by the
+    /// tag-derivation unit tests, which run in ordinary CI.
+    fn object_identity_failure(label: &'static str) -> impl Fn(GtpuError) -> ObjectTagFailure {
+        move |error| match error {
+            GtpuError::Io { .. } => ObjectTagFailure::Parse(label),
+            _ => ObjectTagFailure::Indeterminate(label),
+        }
+    }
+
     fn mutation_or_indeterminate<T, E>(
         result: Result<T, E>,
         operation: &'static str,
@@ -10546,12 +11130,31 @@ mod aya_runtime {
             let reconciler_ownership = Self::acquire_reconciler_ownership(pin_dir)?;
             Self::ensure_no_current_recovery_proof(&reconciler_ownership)?;
             let pins_preexisted = reconciler_ownership.canonical_pin_dir.is_dir();
+            // From here to the mutation boundary no pin is created, removed or
+            // written and no hook is replaced. The generation check runs first
+            // because it touches no filesystem state at all, not even the pin
+            // directory that `canonical_pin_dir` would create; every later
+            // guard needs a canonical path to read pins from, and in any
+            // scenario those guards can refuse, the directory already exists.
+            Self::require_no_foreign_generation(ifindex, tc_priority, "ebpf_attach")?;
             let canonical_pin_dir =
                 Self::canonical_pin_dir(&reconciler_ownership.canonical_pin_dir)?;
             if canonical_pin_dir != reconciler_ownership.canonical_pin_dir {
                 return Err(state_indeterminate("ebpf_pin_dir_identity"));
             }
+            Self::classify_pinned_map_layout(&canonical_pin_dir)?;
+            Self::require_current_pin_capacity(&canonical_pin_dir)?;
             let schema_state = Self::bearer_schema_preflight(&canonical_pin_dir)?;
+            // Prove ownership from the pins before the loader publishes any
+            // map. The equivalent check below runs against the loaded graph and
+            // is kept, but by then a conflicting owner has already had pins
+            // materialized underneath it.
+            if let Some(recorded) = Self::pinned_config_read(&canonical_pin_dir)? {
+                if recorded != local_ip {
+                    return Err(GtpuError::AlreadyExists);
+                }
+            }
+            // ---- mutation boundary ----
             let mut ebpf = match self.load_pinned(&canonical_pin_dir) {
                 Ok(ebpf) => ebpf,
                 Err(error) if pins_preexisted => return Err(error),
@@ -10728,13 +11331,24 @@ mod aya_runtime {
             let reconciler_ownership = Self::acquire_reconciler_ownership(pin_dir)?;
             Self::ensure_no_current_recovery_proof(&reconciler_ownership)?;
             let pins_preexisted = reconciler_ownership.canonical_pin_dir.is_dir();
+            // Same read-only prologue as `attach`: refuse an older live
+            // generation and a foreign pin ABI before anything is published.
+            Self::require_no_foreign_generation(ifindex, tc_priority, "ebpf_attach_grouped")?;
             let canonical_pin_dir =
                 Self::canonical_pin_dir(&reconciler_ownership.canonical_pin_dir)?;
             if canonical_pin_dir != reconciler_ownership.canonical_pin_dir {
                 return Err(state_indeterminate("ebpf_pin_dir_identity"));
             }
+            Self::classify_pinned_map_layout(&canonical_pin_dir)?;
+            Self::require_current_pin_capacity(&canonical_pin_dir)?;
             let bearer_state = Self::bearer_schema_preflight(&canonical_pin_dir)?;
             let grouped_state = Self::grouped_schema_preflight(&canonical_pin_dir, bearer_state)?;
+            // Exclude live legacy authority before the loader materializes the
+            // grouped pins. With every grouped pin absent the preflight above
+            // reports an initializing state, which says nothing about whether a
+            // legacy IPv4 graph is still live behind the same pin namespace.
+            Self::require_empty_legacy_authority(&canonical_pin_dir, bearer_state)?;
+            // ---- mutation boundary ----
             let mut ebpf = match self.load_pinned(&canonical_pin_dir) {
                 Ok(ebpf) => ebpf,
                 Err(error) if pins_preexisted => return Err(error),
@@ -10760,7 +11374,6 @@ mod aya_runtime {
             }
 
             let provisioned = (|| {
-                Self::require_empty_legacy_authority(&ebpf, bearer_state)?;
                 self.require_canonical_pmtu_slot(&ebpf)?;
 
                 let recorded = match grouped_state {
@@ -10930,7 +11543,15 @@ mod aya_runtime {
             if canonical_pin_dir != reconciler_ownership.canonical_pin_dir {
                 return Err(state_indeterminate("ebpf_pin_dir_identity"));
             }
+            // Adoption takes no ownership input to prove against: it inherits
+            // whatever the pins already record. That makes the generation and
+            // ABI guards the only pre-load protection it has, so they must run
+            // here too rather than being treated as an attach-only concern.
+            Self::require_no_foreign_generation(ifindex, tc_priority, "ebpf_adopt")?;
+            Self::classify_pinned_map_layout(&canonical_pin_dir)?;
+            Self::require_current_pin_capacity(&canonical_pin_dir)?;
             let schema_state = Self::bearer_schema_preflight(&canonical_pin_dir)?;
+            // ---- mutation boundary ----
             let mut ebpf = self.load_pinned(&canonical_pin_dir)?;
             let expected_pins = Self::held_map_identity(&ebpf)
                 .map_err(|_| state_indeterminate("ebpf_map_identity"))?;
@@ -13206,6 +13827,7 @@ mod aya_runtime {
                     .datapath_identity
                     .pins
                     .downlink_binding_counters,
+                uplink_pmtu_counters_map_id: device.datapath_identity.pins.uplink_pmtu_counters,
                 counters: EbpfGtpuDatapathCounters {
                     uplink_encapsulated: aggregate(COUNTER_UL_ENCAP)?,
                     uplink_far_misses: aggregate(COUNTER_UL_FAR_MISS)?,
@@ -13891,6 +14513,185 @@ mod aya_runtime {
             drop(ebpf);
             fs::remove_dir_all(&pin_dir).expect("remove live tag proof pins");
             println!("OPC_GTPU_TAG_PROOF_PROVEN");
+        }
+
+        /// The whole generation guard rests on the two frozen objects having
+        /// genuinely different tags. A fixture that reproduces an old map
+        /// *shape* out of the current object cannot make this assertion, which
+        /// is exactly why it cannot stand in for an old *generation*.
+        #[test]
+        fn pre_redirect_tag_candidates_differ_from_the_current_object() {
+            let tags = AyaGtpuRuntime::datapath_generation_tags()
+                .expect("derive tag candidates for every frozen generation");
+            for (current, historical) in [
+                (tags.current.0, tags.pre_redirect.0),
+                (tags.current.1, tags.pre_redirect.1),
+            ] {
+                assert_ne!(current.sha1, historical.sha1);
+                assert_ne!(current.sha256, historical.sha256);
+                assert!(!current.contains(historical.sha1));
+                assert!(!current.contains(historical.sha256));
+                assert!(!historical.contains(current.sha1));
+                assert!(!historical.contains(current.sha256));
+            }
+        }
+
+        /// Every generation the classifier can name must be separable from
+        /// every other one. Two generations sharing a tag candidate would make
+        /// the guard either refuse a supported upgrade or admit an unsupported
+        /// one, depending on which arm matched first.
+        #[test]
+        fn every_named_generation_has_distinct_tag_candidates() {
+            let tags = AyaGtpuRuntime::datapath_generation_tags()
+                .expect("derive tag candidates for every frozen generation");
+            let generations = [
+                ("current", tags.current),
+                ("legacy_v1", tags.legacy_v1),
+                ("pre_redirect", tags.pre_redirect),
+            ];
+            for (left_name, left) in generations {
+                for (right_name, right) in generations {
+                    if left_name == right_name {
+                        continue;
+                    }
+                    for (left_hook, right_hook) in [(left.0, right.0), (left.1, right.1)] {
+                        assert!(
+                            !left_hook.contains(right_hook.sha1)
+                                && !left_hook.contains(right_hook.sha256),
+                            "{left_name} and {right_name} share a tag candidate"
+                        );
+                    }
+                }
+            }
+        }
+
+        /// Only a hook this build can actually replace may be classified as
+        /// replaceable. Anything else has to be named, because an unknown
+        /// instruction stream cannot be assumed to write the maps this build
+        /// is about to publish.
+        #[test]
+        fn generation_classification_admits_only_replaceable_hooks() {
+            let pair = |base: u64| {
+                (
+                    LegacyV2ProgramTags {
+                        sha1: base,
+                        sha256: base + 1,
+                    },
+                    LegacyV2ProgramTags {
+                        sha1: base + 2,
+                        sha256: base + 3,
+                    },
+                )
+            };
+            let tags = DatapathGenerationTags {
+                current: pair(0x10),
+                legacy_v1: pair(0x20),
+                pre_redirect: pair(0x30),
+            };
+
+            // An empty device has no generation question to answer.
+            assert_eq!(tags.classify(None, None), None);
+
+            // Either kernel tag algorithm is an equally exact match.
+            for (uplink, downlink, expected) in [
+                (0x10, 0x12, Generation::Current),
+                (0x11, 0x13, Generation::Current),
+                (0x20, 0x22, Generation::LegacyV1),
+                (0x30, 0x32, Generation::PreRedirect),
+                (0x31, 0x33, Generation::PreRedirect),
+            ] {
+                assert_eq!(
+                    tags.classify(Some(uplink), Some(downlink)),
+                    Some(expected),
+                    "uplink {uplink:#x} downlink {downlink:#x}"
+                );
+            }
+
+            // One occupied hook is enough to name a generation; the empty slot
+            // constrains nothing.
+            assert_eq!(
+                tags.classify(Some(0x30), None),
+                Some(Generation::PreRedirect)
+            );
+            assert_eq!(
+                tags.classify(None, Some(0x32)),
+                Some(Generation::PreRedirect)
+            );
+
+            // A tag from no known generation is never read as "probably
+            // current".
+            assert_eq!(
+                tags.classify(Some(0x99), Some(0x9a)),
+                Some(Generation::Unrecognized)
+            );
+            // Hooks are judged independently, and the least replaceable one
+            // governs. A pair split across two generations still refuses, but
+            // it is named for the generation that actually blocks the attach
+            // rather than being reported as unrecognised.
+            assert_eq!(
+                tags.classify(Some(0x10), Some(0x32)),
+                Some(Generation::PreRedirect)
+            );
+            assert_eq!(
+                tags.classify(Some(0x30), Some(0x12)),
+                Some(Generation::PreRedirect),
+                "the blocking hook governs whichever slot it occupies"
+            );
+            // A replacement interrupted between the two hooks leaves one slot
+            // on each replaceable generation. Both are replaceable in place, so
+            // the retry that `attach_programs` preserves this state for must
+            // still be admitted; refusing here would wedge it permanently.
+            assert_eq!(
+                tags.classify(Some(0x10), Some(0x22)),
+                Some(Generation::LegacyV1)
+            );
+            assert_eq!(
+                tags.classify(Some(0x20), Some(0x12)),
+                Some(Generation::LegacyV1)
+            );
+            // An unknown hook still governs, whatever its partner is.
+            assert_eq!(
+                tags.classify(Some(0x10), Some(0x99)),
+                Some(Generation::Unrecognized)
+            );
+        }
+
+        #[test]
+        #[ignore = "requires CAP_BPF and writable bpffs"]
+        fn pre_redirect_tag_candidates_match_the_running_kernel() {
+            if std::env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref() != Ok("1") {
+                return;
+            }
+            let pin_dir = std::path::PathBuf::from(format!(
+                "/sys/fs/bpf/opc-gtpu-pre-redirect-tag-proof-{}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&pin_dir).expect("create pre-redirect tag proof pin directory");
+            let tags = AyaGtpuRuntime::datapath_generation_tags()
+                .expect("derive tag candidates for both frozen generations");
+            let mut ebpf = EbpfLoader::new()
+                .default_map_pin_directory(&pin_dir)
+                .load(pre_redirect_artifact::object_for_tag_proof())
+                .expect("load pre-redirect datapath object for live tag proof");
+            for (name, expected) in [
+                (PROG_UPLINK, tags.pre_redirect.0),
+                (PROG_DOWNLINK, tags.pre_redirect.1),
+            ] {
+                let program: &mut SchedClassifier = ebpf
+                    .program_mut(name)
+                    .expect("pre-redirect tc program")
+                    .try_into()
+                    .expect("pre-redirect program is a tc classifier");
+                program.load().expect("load pre-redirect tc program");
+                let live_tag = program.info().expect("read live program info").tag();
+                assert!(
+                    expected.contains(live_tag),
+                    "running-kernel tag must be one exact normalized candidate"
+                );
+            }
+            drop(ebpf);
+            fs::remove_dir_all(&pin_dir).expect("remove pre-redirect tag proof pins");
+            println!("OPC_GTPU_PRE_REDIRECT_TAG_PROOF_PROVEN");
         }
 
         #[test]
@@ -21110,6 +21911,7 @@ mod tests {
             downlink_program_id: 102,
             counters_map_id: 201,
             downlink_binding_counters_map_id: 202,
+            uplink_pmtu_counters_map_id: 203,
             counters: EbpfGtpuDatapathCounters {
                 uplink_encapsulated: 11,
                 uplink_far_misses: 12,

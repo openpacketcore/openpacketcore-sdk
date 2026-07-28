@@ -807,8 +807,13 @@ additive: an all-zero MTU policy slot selects the legacy total-length-only
 behavior, so populated v4 state upgrades in place.
 
 There is no implicit endpoint migration for populated older state. A committed
-v2 pin set is rejected with the redaction-safe `ebpf_endpoint_schema` error and
-requires an explicit traffic drain followed by pin removal and reprovisioning.
+v2 pin set is rejected and requires an explicit traffic drain followed by pin
+removal and reprovisioning. Which redaction-safe error names it depends on how
+far the graph gets: the pre-load map-layout guard described below now sees a v2
+bearer pin first, because that generation's owner value is a different width,
+and names it `ebpf_pin_map_abi`; a v2 graph that reaches the endpoint preflight
+is still named `ebpf_endpoint_schema`. Both refuse before either hook changes,
+and the operator remedy is the same.
 An uncommitted, legacy-v0, or DSCP-v1 graph can advance only when it is empty;
 any retained PDR/FAR without an exact binding is indeterminate and fails before
 either hook changes. The SDK never invents `Any`, derives a peer from an
@@ -1147,8 +1152,114 @@ and application memory are not read through that operation. The userspace
 object is embedded from
 `crates/opc-gtpu-dataplane/bpf/opc-gtpu-datapath.bpf.o`; the frozen v1 object is
 retained only for the exact automatic empty-graph migration proof described
-above, and the frozen v2 object is retained only for the explicit drained
-teardown identity proof. Neither legacy object runs as the current datapath.
+above, the frozen v2 object is retained only for the explicit drained teardown
+identity proof, and the frozen pre-redirect object is retained only to derive
+the program tags described in the next section. None of the three legacy
+objects runs as the current datapath.
+
+#### Map ABI and program generations across an upgrade
+
+Two separate things can differ between the build that published a pin graph and
+the build now trying to attach to it: the shape of the pinned maps, and the
+instruction stream of the programs on the tc hooks. They fail in different
+ways, so the loader classifies both before it changes anything.
+
+**Map layout.** Before the object is loaded, every pin that exists is compared
+against this build's map specification using kernel metadata only -- map type,
+name, key size, value size and flags -- with no value type bound to any of
+them. A divergence fails the attach with
+`GtpuError::Io { operation: "ebpf_pin_map_abi" }`. This runs before the schema
+preflight, which reads the marker out of the FAR map through a typed
+`BpfHashMap` binding: a foreign-shaped FAR pin is therefore named as a shape
+mismatch rather than surfacing as a schema error from an accessor that had
+already assumed the shape.
+
+`max_entries` is not part of that comparison, because a map of the wrong
+capacity still binds: it is a separate hazard with its own guard, not a shape
+mismatch. This layout guard is also not a generation test. The v1 and
+pre-redirect generations do share this build's layout for every map they pin,
+but the frozen bearer-v2 generation does not — its owner value is a different
+width — so a retained v2 pin set is named here as the shape mismatch it is.
+
+**Map capacity.** Capacity is checked separately, on every retained graph
+whatever schema marker it carries, and fails with the same `ebpf_pin_map_abi`
+error before anything is loaded.
+
+Judging only graphs that already carry the current marker would leave a graph
+this build itself creates permanently unusable: migrating a pre-v5 graph
+advances the marker to v5 while the loader adopts the retained counter pin
+unchanged, so a narrower map would pass the gate on the way in and then fail it
+on every attach afterwards, with no path back. Refusing before that migration
+leaves the graph exactly as it was found, so a drained reprovision still
+resolves it. The cost is real and is not hidden: an upgrade that grows a counter
+slot now requires a drained reprovision, where it previously succeeded and
+miscounted.
+
+This is the case nothing else can see. A counter map retained from a build with
+fewer slots has exactly the key and value type this build expects, so every
+typed accessor binds to it happily, and the kernel silently discards each write
+to a slot at or past its `max_entries`. Adopting it produces a counter that is
+permanently zero -- a wrong operator-facing number rather than an error.
+Growing `COUNTER_SLOTS` therefore now makes a retained current-schema graph
+refuse until it is reprovisioned.
+
+A graph still carrying a pre-v5 marker is not judged on capacity here. It is
+routed to the explicit migration or refusal paths described above, which own
+the decision about their own retained state; a pre-v5 graph that advances
+through the empty-graph migration keeps whatever counter capacity it was
+pinned with.
+
+**Program generation.** Replacing a hook in place requires exact program-tag
+equality, because the replacement is a single `RTM_NEWTFILTER` against the
+existing filter rather than a detach followed by an attach. A live hook running
+an older generation can never satisfy that. Before touching anything, the
+loader reads the tag of whatever occupies each hook and compares it against
+tags derived offline from the objects it carries. If the occupant is a
+recognised older generation, or carries an SDK program name whose tag matches
+no generation this build can name, the attach fails with
+`GtpuError::DatapathGenerationMismatch`, naming the observed and expected
+generation.
+
+That refusal removes no pin, creates no pin, writes no policy or config, and
+replaces no hook, and `create_device`, `resolve_device` and
+`create_device_with_endpoints` all behave the same way.
+
+The ordering is the whole point. Such an attach is going to fail whatever else
+happens, so discovering it only at the hook means everything ahead of it has
+already run against a datapath this process does not own: pins materialized for
+maps the older generation never had, and commit-record recovery writing into
+forwarding maps a live program is reading. Deciding first turns a guaranteed
+failure into one that changed nothing.
+
+It is also why no automatic counter rebuild is performed here. Unlinking a
+counter pin and republishing it while an unreplaceable hook stays attached
+would split metrics between the map the live program still writes and the map
+the pin now names, and no retry could converge, because the pin would by then
+be this build's shape while the tag still differed.
+
+The frozen v1 generation is the one exception, and it is not an exception to
+the rule so much as a case the rule does not cover: the loader carries that
+object as a replacement artifact, so a live v1 hook can be replaced atomically
+by tag equality against it. Those hooks pass the generation check and are
+judged by the empty-graph migration rules described above, which independently
+decide whether the committed schema permits the upgrade at all.
+
+There is no automatic live migration across generations. The remedy for a
+refusal is the documented one: drain the device, remove the pins, and
+reprovision. Because the refusal leaves the live datapath exactly as it was
+found, that remedy is still available after any number of refused attempts.
+
+**Counters and re-baselining.** A rebuilt counter map starts at zero.
+`EbpfGtpuDatapathSnapshot` publishes the kernel map ID of every counter map
+whose values it reports -- `counters_map_id`,
+`downlink_binding_counters_map_id` and `uplink_pmtu_counters_map_id` -- and an
+ID changes only when that map is rebuilt. On an identity change, discard prior
+deltas and re-baseline from the new value; do not alert on the step. A consumer
+that treats these counters as monotonic and ignores the identity will read a
+rebuild as either a negative delta or a full-value spike, depending on how it
+clamps. Kernel map IDs are per-boot and are recycled, so a baseline persisted
+across a host reboot may observe the same ID for a different map; pair the ID
+with a boot identity if a baseline has to outlive the host.
 
 ### Grouped dual-stack eBPF contract
 
