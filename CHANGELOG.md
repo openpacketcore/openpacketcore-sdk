@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Bounded managed-device diagnostics — `opc-gtpu-dataplane`:**
+  `EbpfGtpuDataplaneBackend::managed_device_inventory` exposes an SDK-owned,
+  read-only identity view containing only interface name and ifindex. Capture
+  is coherent with device publication/removal, ordered by ifindex, capped by
+  `MAX_EBPF_MANAGED_DEVICE_IDENTITIES`, and reports typed `Complete` or
+  `Truncated` evidence. Exact `(name, ifindex)` matching helpers preserve the
+  stricter identity contract used by `datapath_snapshot`; diagnostic and error
+  formatting remains payload-free.
 - **Shared management audit sinks — `opc-mgmt-audit`:** `Arc<T>` now implements
   `AuditSink` whenever `T` does, including `Arc<dyn AuditSink>`. Applications
   can install one sink allocation in both the gNMI and NETCONF server cores

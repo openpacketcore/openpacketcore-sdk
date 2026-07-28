@@ -73,6 +73,167 @@ use crate::{
 pub const DEFAULT_BPFFS_PIN_ROOT: &str = "/sys/fs/bpf/opc-gtpu";
 /// Default tc filter priority for the datapath programs.
 pub const DEFAULT_TC_PRIORITY: u16 = 50;
+/// Maximum number of managed-device identities returned by one inventory.
+///
+/// The backend always returns the identities with the lowest interface
+/// indexes, in ascending order. Callers must inspect
+/// [`EbpfManagedDeviceInventory::completeness`] before treating absence from
+/// the returned slice as evidence that a device is unmanaged.
+pub const MAX_EBPF_MANAGED_DEVICE_IDENTITIES: usize = 64;
+
+/// Whether a managed-device inventory contains the complete registry.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EbpfManagedDeviceInventoryCompleteness {
+    /// Every managed-device identity is present.
+    Complete,
+    /// More identities existed than the public inventory bound permits.
+    Truncated,
+}
+
+impl EbpfManagedDeviceInventoryCompleteness {
+    /// Return whether identities were omitted by the inventory bound.
+    #[must_use]
+    pub const fn is_truncated(self) -> bool {
+        matches!(self, Self::Truncated)
+    }
+}
+
+impl fmt::Display for EbpfManagedDeviceInventoryCompleteness {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Complete => "complete",
+            Self::Truncated => "truncated",
+        })
+    }
+}
+
+/// Exact public identity of one device managed by an eBPF backend instance.
+///
+/// The identity intentionally contains only the interface name and index. Its
+/// formatting implementations redact both values; consumers that need to
+/// compare an authoritative [`GtpDevice`] should use [`Self::matches_device`].
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct EbpfManagedDeviceIdentity {
+    name: String,
+    ifindex: u32,
+}
+
+impl EbpfManagedDeviceIdentity {
+    /// Return the managed interface name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Return the managed interface index.
+    #[must_use]
+    pub const fn ifindex(&self) -> u32 {
+        self.ifindex
+    }
+
+    /// Return whether both fields exactly match `device`.
+    ///
+    /// A name-only or index-only match is deliberately insufficient: either
+    /// mismatch means the caller does not hold the identity represented by
+    /// this inventory entry.
+    #[must_use]
+    pub fn matches_device(&self, device: &GtpDevice) -> bool {
+        self.ifindex == device.ifindex && self.name == device.name
+    }
+}
+
+impl fmt::Debug for EbpfManagedDeviceIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EbpfManagedDeviceIdentity")
+            .field("interface_identity", &"<redacted>")
+            .finish()
+    }
+}
+
+impl fmt::Display for EbpfManagedDeviceIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("managed eBPF GTP-U device identity")
+    }
+}
+
+/// Bounded, read-only view of the devices managed by one eBPF backend.
+///
+/// Identities are ordered by ascending interface index. The slice contains at
+/// most [`MAX_EBPF_MANAGED_DEVICE_IDENTITIES`] entries and grants no authority
+/// to mutate a device, pinned object, map, program, or session.
+#[derive(Clone, PartialEq, Eq)]
+pub struct EbpfManagedDeviceInventory {
+    identities: Box<[EbpfManagedDeviceIdentity]>,
+    completeness: EbpfManagedDeviceInventoryCompleteness,
+}
+
+impl EbpfManagedDeviceInventory {
+    /// Return the deterministically ordered managed identities.
+    #[must_use]
+    pub fn identities(&self) -> &[EbpfManagedDeviceIdentity] {
+        &self.identities
+    }
+
+    /// Return whether the bounded result is complete or truncated.
+    #[must_use]
+    pub const fn completeness(&self) -> EbpfManagedDeviceInventoryCompleteness {
+        self.completeness
+    }
+
+    /// Return whether identities were omitted by the inventory bound.
+    #[must_use]
+    pub const fn is_truncated(&self) -> bool {
+        self.completeness.is_truncated()
+    }
+
+    /// Return the number of identities in this bounded result.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.identities.len()
+    }
+
+    /// Return whether this inventory contains no identities.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.identities.is_empty()
+    }
+
+    /// Return whether a returned identity exactly matches `device`.
+    ///
+    /// `false` proves that the bounded result does not contain `device`; it
+    /// proves the backend does not manage `device` only when
+    /// [`Self::completeness`] is
+    /// [`EbpfManagedDeviceInventoryCompleteness::Complete`].
+    #[must_use]
+    pub fn contains_device(&self, device: &GtpDevice) -> bool {
+        self.identities
+            .iter()
+            .any(|identity| identity.matches_device(device))
+    }
+}
+
+impl fmt::Debug for EbpfManagedDeviceInventory {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EbpfManagedDeviceInventory")
+            .field("identity_count", &self.identities.len())
+            .field("completeness", &self.completeness)
+            .finish()
+    }
+}
+
+impl fmt::Display for EbpfManagedDeviceInventory {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "managed eBPF GTP-U device inventory ({} identities, {})",
+            self.identities.len(),
+            self.completeness
+        )
+    }
+}
 
 fn require_ebpf_executable_pmtu_policy(
     policy: Option<GtpuUplinkMtuPolicy>,
@@ -1167,6 +1328,26 @@ impl EbpfGtpuDataplaneBackend {
     #[must_use]
     pub fn with_config(config: EbpfGtpuDataplaneBackendConfig) -> Self {
         Self::with_runtime_and_config(Arc::new(aya_runtime::AyaGtpuRuntime::new()), config)
+    }
+
+    /// Capture a bounded, deterministic inventory of managed device identities.
+    ///
+    /// The complete identity registry is observed under the same mutex used by
+    /// device publication and removal. The returned identities are ordered by
+    /// ascending interface index and contain only interface names and indexes.
+    /// This diagnostic read grants no device or datapath mutation authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GtpuError::StateIndeterminate`] with the stable
+    /// `ebpf_managed_device_inventory` operation label when the managed-device
+    /// registry is unavailable. No internal lock or device data is included in
+    /// the error.
+    pub async fn managed_device_inventory(&self) -> Result<EbpfManagedDeviceInventory, GtpuError> {
+        self.run_blocking("ebpf_managed_device_inventory", move |backend| {
+            backend.managed_device_inventory_sync()
+        })
+        .await
     }
 
     /// Read an identity-bound, redaction-safe snapshot for a managed device.
@@ -3165,6 +3346,46 @@ impl EbpfGtpuDataplaneBackend {
             request.drain_proof().is_some(),
             managed_state,
         )
+    }
+
+    fn managed_device_inventory_sync(&self) -> Result<EbpfManagedDeviceInventory, GtpuError> {
+        let devices = self
+            .inner
+            .devices
+            .lock()
+            .map_err(|_| GtpuError::StateIndeterminate {
+                operation: "ebpf_managed_device_inventory",
+            })?;
+        let completeness = if devices.len() > MAX_EBPF_MANAGED_DEVICE_IDENTITIES {
+            EbpfManagedDeviceInventoryCompleteness::Truncated
+        } else {
+            EbpfManagedDeviceInventoryCompleteness::Complete
+        };
+
+        // Keep only the lowest ifindexes while holding the registry lock.
+        // `BTreeMap` gives the public order directly, and popping its last
+        // element bounds temporary cardinality at LIMIT + 1 even if the
+        // private registry is much larger.
+        let mut selected = BTreeMap::new();
+        for (ifindex, managed) in devices.iter() {
+            selected.insert(*ifindex, managed.name.as_str());
+            if selected.len() > MAX_EBPF_MANAGED_DEVICE_IDENTITIES {
+                selected.pop_last();
+            }
+        }
+
+        let identities = selected
+            .into_iter()
+            .map(|(ifindex, name)| EbpfManagedDeviceIdentity {
+                name: name.to_owned(),
+                ifindex,
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Ok(EbpfManagedDeviceInventory {
+            identities,
+            completeness,
+        })
     }
 
     fn datapath_snapshot_sync(
@@ -19512,6 +19733,21 @@ mod tests {
         (backend, runtime)
     }
 
+    fn seed_managed_identity(
+        backend: &EbpfGtpuDataplaneBackend,
+        ifindex: u32,
+        name: impl Into<String>,
+    ) {
+        backend.inner.devices.lock().unwrap().insert(
+            ifindex,
+            ManagedDevice {
+                name: name.into(),
+                local_ip: None,
+                grouped: None,
+            },
+        );
+    }
+
     fn grouped_device_id(value: u8) -> GtpuSessionDeviceId {
         GtpuSessionDeviceId::new([value; GTPU_SESSION_GROUP_ID_LEN]).unwrap()
     }
@@ -22477,17 +22713,220 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn managed_device_inventory_reports_empty_and_exact_one() {
+        let (backend, _runtime) = backend_with_fake();
+        let empty = backend.managed_device_inventory().await.unwrap();
+        assert!(empty.is_empty());
+        assert_eq!(empty.len(), 0);
+        assert_eq!(
+            empty.completeness(),
+            EbpfManagedDeviceInventoryCompleteness::Complete
+        );
+        assert!(!empty.is_truncated());
+
+        let device = backend.create_device(create_request()).await.unwrap();
+        let inventory = backend.managed_device_inventory().await.unwrap();
+        assert_eq!(inventory.len(), 1);
+        let identity = &inventory.identities()[0];
+        assert_eq!(identity.name(), device.name);
+        assert_eq!(identity.ifindex(), device.ifindex);
+        assert!(identity.matches_device(&device));
+        assert!(inventory.contains_device(&device));
+
+        let same_index_different_name = GtpDevice {
+            name: "different-name".to_string(),
+            ifindex: device.ifindex,
+        };
+        let same_name_different_index = GtpDevice {
+            name: device.name.clone(),
+            ifindex: device.ifindex + 1,
+        };
+        assert!(!identity.matches_device(&same_index_different_name));
+        assert!(!identity.matches_device(&same_name_different_index));
+        assert!(!inventory.contains_device(&same_index_different_name));
+        assert!(!inventory.contains_device(&same_name_different_index));
+    }
+
+    #[tokio::test]
+    async fn managed_device_inventory_orders_multiple_and_preserves_name_collisions() {
+        let (backend, _runtime) = backend_with_fake();
+        seed_managed_identity(&backend, 91, "shared-name");
+        seed_managed_identity(&backend, 7, "first-name");
+        seed_managed_identity(&backend, 19, "shared-name");
+
+        let inventory = backend.managed_device_inventory().await.unwrap();
+        assert_eq!(
+            inventory.completeness(),
+            EbpfManagedDeviceInventoryCompleteness::Complete
+        );
+        assert_eq!(
+            inventory
+                .identities()
+                .iter()
+                .map(|identity| (identity.ifindex(), identity.name()))
+                .collect::<Vec<_>>(),
+            vec![(7, "first-name"), (19, "shared-name"), (91, "shared-name")]
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_device_inventory_limit_boundary_and_truncation_are_explicit() {
+        let (backend, _runtime) = backend_with_fake();
+        let maximum = u32::try_from(MAX_EBPF_MANAGED_DEVICE_IDENTITIES).unwrap();
+        for ifindex in (1..=maximum).rev() {
+            seed_managed_identity(&backend, ifindex, format!("gtp{ifindex}"));
+        }
+
+        let expected_ifindexes = (1..=maximum).collect::<Vec<_>>();
+        let exact_limit = backend.managed_device_inventory().await.unwrap();
+        assert_eq!(exact_limit.len(), MAX_EBPF_MANAGED_DEVICE_IDENTITIES);
+        assert_eq!(
+            exact_limit.completeness(),
+            EbpfManagedDeviceInventoryCompleteness::Complete
+        );
+        assert!(!exact_limit.is_truncated());
+        assert_eq!(
+            exact_limit
+                .identities()
+                .iter()
+                .map(EbpfManagedDeviceIdentity::ifindex)
+                .collect::<Vec<_>>(),
+            expected_ifindexes
+        );
+
+        let overflow_ifindex = maximum.checked_add(1).unwrap();
+        seed_managed_identity(&backend, overflow_ifindex, "overflow");
+        let inventory = backend.managed_device_inventory().await.unwrap();
+        assert_eq!(inventory.len(), MAX_EBPF_MANAGED_DEVICE_IDENTITIES);
+        assert_eq!(
+            inventory.completeness(),
+            EbpfManagedDeviceInventoryCompleteness::Truncated
+        );
+        assert!(inventory.is_truncated());
+        assert_eq!(
+            inventory
+                .identities()
+                .iter()
+                .map(EbpfManagedDeviceIdentity::ifindex)
+                .collect::<Vec<_>>(),
+            expected_ifindexes
+        );
+        assert_eq!(
+            backend.managed_device_inventory().await.unwrap(),
+            inventory,
+            "unchanged truncated state must produce the same ordered inventory"
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_device_inventory_reflects_completed_removal() {
+        let (backend, _runtime) = backend_with_fake();
+        let device = backend.create_device(create_request()).await.unwrap();
+        assert!(backend
+            .managed_device_inventory()
+            .await
+            .unwrap()
+            .contains_device(&device));
+
+        backend.remove_device(&device).await.unwrap();
+
+        let inventory = backend.managed_device_inventory().await.unwrap();
+        assert!(inventory.is_empty());
+        assert_eq!(
+            inventory.completeness(),
+            EbpfManagedDeviceInventoryCompleteness::Complete
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_device_inventory_poison_is_stable_and_redaction_safe() {
+        let (backend, _runtime) = backend_with_fake();
+        seed_managed_identity(&backend, 424_242, "never-render-this-device");
+        let poisoner = backend.clone();
+        let thread = std::thread::spawn(move || {
+            let _guard = poisoner.inner.devices.lock().unwrap();
+            panic!("poison managed-device registry for test");
+        });
+        assert!(thread.join().is_err());
+
+        let error = backend.managed_device_inventory().await.unwrap_err();
+        assert!(matches!(
+            error,
+            GtpuError::StateIndeterminate {
+                operation: "ebpf_managed_device_inventory"
+            }
+        ));
+        for rendered in [format!("{error:?}"), error.to_string()] {
+            for secret in [
+                "never-render-this-device",
+                "424242",
+                "mutex poisoned",
+                DEFAULT_BPFFS_PIN_ROOT,
+            ] {
+                assert!(!rendered.contains(secret), "error leaked: {rendered}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_device_inventory_formatting_redacts_identity_values() {
+        let (backend, _runtime) = backend_with_fake();
+        seed_managed_identity(&backend, 424_242, "never-render-this-device");
+        let inventory = backend.managed_device_inventory().await.unwrap();
+        let identity = &inventory.identities()[0];
+
+        assert_eq!(identity.name(), "never-render-this-device");
+        assert_eq!(identity.ifindex(), 424_242);
+        for rendered in [
+            format!("{identity:?}"),
+            identity.to_string(),
+            format!("{inventory:?}"),
+            inventory.to_string(),
+        ] {
+            for secret in ["never-render-this-device", "424242"] {
+                assert!(
+                    !rendered.contains(secret),
+                    "diagnostic formatting leaked: {rendered}"
+                );
+            }
+        }
+        assert_eq!(
+            inventory.completeness().to_string(),
+            "complete",
+            "typed completeness uses a stable payload-free label"
+        );
+    }
+
+    #[tokio::test]
     async fn datapath_snapshot_rejects_unmanaged_or_identity_lost_devices() {
         let (backend, runtime) = backend_with_fake();
         let device = backend.create_device(create_request()).await.unwrap();
-        let unknown = GtpDevice {
+        let wrong_ifindex = GtpDevice {
             name: device.name.clone(),
             ifindex: device.ifindex + 1,
         };
         assert!(matches!(
-            backend.datapath_snapshot(&unknown).await.unwrap_err(),
+            backend.datapath_snapshot(&wrong_ifindex).await.unwrap_err(),
             GtpuError::NotFound
         ));
+        let wrong_name = GtpDevice {
+            name: "different-name".to_string(),
+            ifindex: device.ifindex,
+        };
+        assert!(matches!(
+            backend.datapath_snapshot(&wrong_name).await.unwrap_err(),
+            GtpuError::NotFound
+        ));
+        assert_eq!(
+            runtime
+                .state()
+                .operations
+                .iter()
+                .filter(|operation| **operation == "datapath_snapshot")
+                .count(),
+            0,
+            "either identity mismatch must fail before runtime readback"
+        );
 
         runtime.state().pin_identity_invalid.insert(device.ifindex);
         assert!(matches!(
