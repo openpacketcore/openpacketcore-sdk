@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Shared management audit sinks — `opc-mgmt-audit`:** `Arc<T>` now implements
+  `AuditSink` whenever `T` does, including `Arc<dyn AuditSink>`. Applications
+  can install one sink allocation in both the gNMI and NETCONF server cores
+  without a product-local forwarding newtype; calls and errors are forwarded
+  unchanged.
 - **First-owner activation for destination-scoped steering — `opc-ipsec-lb`:**
   in `HostXdpFenceDomain::PerOwnershipKey` the only public owner-map writer was
   the fenced re-pin coordinator, and a re-pin cannot be formed for a fresh SA --
