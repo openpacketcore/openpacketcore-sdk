@@ -364,11 +364,19 @@ coverage.
      the all-zero address that requests a peer-supplied value. Because the
      configuration protocol options list occupies octets 4..w and the
      additional parameters list w+1..z, the unit is encoded ahead of every
-     container. On receive, only a Configure-Nak is read for addresses: a
-     Configure-Ack echoes the request's options verbatim and so conveys no
-     server, and an echoed all-zero address is not treated as one. A malformed
-     unit for this now-supported identifier rejects the whole value, matching
-     how a known container with a bad length is handled.
+     container. On receive, only a Configure-Nak whose Identifier matches the
+     outstanding Configure-Request is read for addresses, as RFC 1661 5.3
+     requires; the uncorrelated `decode_network_contents` entry point holds no
+     Identifier and so reads none. A Configure-Ack echoes the request's options
+     verbatim and so conveys no server, and an echoed all-zero address is not
+     treated as one. A malformed unit for this identifier is discarded
+     unit-locally and reported through `PcoDecoded::ipcp_discards`, and its
+     sibling containers survive: RFC 1661's discard unit is the packet and
+     10.5.6.3 maps one unit to one such packet, so a fault inside a unit whose
+     outer container boundary already validated does not reach the value. That
+     is unlike a known address container with a bad length, which still rejects
+     the whole value under this codec's configuration-atomicity policy, for
+     which the specification states no receiver disposition.
    - The IPv4 Link MTU container `0x0010` is supported in both directions, with
      the direction-dependent shape Table 10.5.154 assigns: zero-length request
      MS to network, two-octet value network to MS. 10.5.6.3 states that a

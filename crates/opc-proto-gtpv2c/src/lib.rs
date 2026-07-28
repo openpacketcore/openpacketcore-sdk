@@ -32,7 +32,10 @@
 //! unaccompanied combination does not compile. [`PcoRequest`] also emits an
 //! IPCP (`0x8021`) Configure-Request for the RFC 1877 DNS options, ahead of
 //! the containers as TS 24.008 10.5.6.3 positions it, and
-//! [`PcoAddressConfiguration`] reads the peer's Configure-Nak answer, and the
+//! [`PcoAddressConfiguration::decode_network_contents_correlated`] reads the
+//! peer's Configure-Nak answer once [`IpcpNakCorrelation`] correlates it to the
+//! Identifier that was sent, as RFC 1661 5.3 requires; a malformed `0x8021`
+//! unit is discarded on its own and leaves its sibling containers standing. The
 //! IPv4 Link MTU container `0x0010` is carried in both directions.
 //! Product code remains responsible for deciding when optional policy-owned
 //! values apply and for obtaining them from AAA/HSS or local configuration.
@@ -127,11 +130,11 @@ pub use ie::{
 };
 pub use message::{Message, OwnedMessage};
 pub use pco::{
-    IpcpDnsRequest, PcoAddressConfiguration, PcoDecodeError, PcoRequest, PcscfAddressRequest,
-    PcscfRequest, PCO_CONTAINER_DNS_SERVER_IPV4, PCO_CONTAINER_DNS_SERVER_IPV6,
-    PCO_CONTAINER_IPV4_LINK_MTU, PCO_CONTAINER_P_CSCF_IPV4, PCO_CONTAINER_P_CSCF_IPV6,
-    PCO_CONTAINER_P_CSCF_RESELECTION_SUPPORT, PCO_HEADER_PPP_FOR_IP_PDN, PCO_MAX_CONTAINERS,
-    PCO_PROTOCOL_IPCP,
+    IpcpDnsRequest, IpcpNakCorrelation, PcoAddressConfiguration, PcoDecodeError, PcoDecoded,
+    PcoIpcpDiscard, PcoIpcpDiscardReason, PcoRequest, PcscfAddressRequest, PcscfRequest,
+    PCO_CONTAINER_DNS_SERVER_IPV4, PCO_CONTAINER_DNS_SERVER_IPV6, PCO_CONTAINER_IPV4_LINK_MTU,
+    PCO_CONTAINER_P_CSCF_IPV4, PCO_CONTAINER_P_CSCF_IPV6, PCO_CONTAINER_P_CSCF_RESELECTION_SUPPORT,
+    PCO_HEADER_PPP_FOR_IP_PDN, PCO_MAX_CONTAINERS, PCO_PROTOCOL_IPCP,
 };
 #[allow(deprecated)]
 pub use s2b::{

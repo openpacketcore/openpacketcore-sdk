@@ -13,6 +13,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   can install one sink allocation in both the gNMI and NETCONF server cores
   without a product-local forwarding newtype; calls and errors are forwarded
   unchanged.
+- **Correlated IPCP Configure-Nak receive in PCO/APCO — `opc-proto-gtpv2c`:**
+  `IpcpNakCorrelation`, `PcoDecoded`, `PcoIpcpDiscard`, `PcoIpcpDiscardReason`
+  and `PcoAddressConfiguration::decode_network_contents_correlated`. RFC 1661
+  §5.3 states verbatim: "On reception of a Configure-Nak, the Identifier field
+  MUST match that of the last transmitted Configure-Request. Invalid packets are
+  silently discarded." The previous decoder took no expected Identifier and so
+  structurally could not correlate, which let the first non-zero address in any
+  Configure-Nak become the session's DNS answer. The new entry point takes the
+  caller's outstanding-request position and discards a Nak that does not match
+  it. `IpcpNakCorrelation::none` is the `Default` and discards every
+  Configure-Nak, so the fail-closed position is the one a caller reaches by
+  accident; `expecting(identifier)` is the RFC-permissive constructor;
+  `for_request(sent)` correlates against a request this SDK encoded.
+  Every unit dropped on correlation, every unit dropped as malformed, and every
+  DNS option skipped as unsolicited is reported through
+  `PcoDecoded::ipcp_discards` with a reason code and a unit position and never
+  an address or an Identifier value, extending the existing
+  `PcoAddressConfiguration` redaction contract. Four drops stay deliberately
+  silent and record no entry, as before: a well-formed code other than
+  Configure-Nak, an unknown option type, an echoed RFC 1877 all-zero address,
+  and a repeated option whose slot is already filled.
+  `for_request` additionally declines a DNS option this side never solicited.
+  **That filter is engineering judgement, not a specification requirement:** RFC
+  1661 §5.3 permits a Configure-Nak to append Configuration Options the peer
+  desires that were not in the Configure-Request, so the unit is kept and only
+  the option is skipped, reported as `UnsolicitedOption`. Use `expecting` for
+  the permissive reading. It is not an on-path control either — the Identifier
+  is visible on the wire, and `IpcpDnsRequest::identifier` is documented as
+  opaque with nothing obliging a caller to vary it.
 - **First-owner activation for destination-scoped steering — `opc-ipsec-lb`:**
   in `HostXdpFenceDomain::PerOwnershipKey` the only public owner-map writer was
   the fenced re-pin coordinator, and a re-pin cannot be formed for a fresh SA --
@@ -136,6 +165,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   explicitly replace a v1 trail before enabling v2 writes; the SDK does not
   silently reseal it. A v2 anchor whose version tag alone is downgraded fails
   authentication and is not classified as benign legacy data.
+- **A malformed IPCP unit is discarded unit-locally instead of failing the whole
+  PCO/APCO value — `opc-proto-gtpv2c` (breaking, behavioural; no signature
+  changes):** `decode_network_contents` propagated an IPCP fault out of the
+  whole value, destroying P-CSCF and DNS containers that had already parsed.
+  RFC 1661's discard unit is the *packet*, and TS 24.008 10.5.6.3 maps one
+  `0x8021` unit to one RFC 1661 packet stripped of Protocol and Padding; the
+  unit's outer container boundary is validated before its contents are read, so
+  the sibling boundaries are recoverable and the siblings are now kept. Within
+  one unit the disposition is atomic: an option that parsed before a later
+  malformed one in the same packet is dropped with it, which the unit decoder
+  now expresses in its type by returning no `Result` at all and merging only on
+  whole-unit success. `PcoDecodeError::IpcpHeaderTruncated`, `IpcpLengthInvalid`,
+  `IpcpOptionTruncated`, `IpcpOptionLengthInvalid` and
+  `IpcpDnsOptionLengthInvalid` stop being returned from the decode entry points;
+  they remain public, constructible and reachable through
+  `PcoIpcpDiscardReason::Malformed`, and no variant was removed or reordered.
+  **This is a reject-to-accept flip: a caller matching on those five variants
+  will stop seeing them.**
+- **`decode_network_contents` no longer surfaces IPCP-supplied DNS —
+  `opc-proto-gtpv2c` (breaking, behavioural; signature unchanged):** holding no
+  Identifier it cannot satisfy RFC 1661 §5.3, so the fail-closed answer is to
+  supply nothing. `ipcp_primary_dns`/`ipcp_secondary_dns` stay `None`; for a
+  value whose only DNS source was the IPCP reply `is_empty()` reports empty and
+  the caller's configured-DNS fallback fires as that predicate already
+  documents; and `dns_server_ipv4_all()` equals
+  `dns_server_ipv4` under this path. Migration:
+  `decode_network_contents_correlated(value, IpcpNakCorrelation::for_request(sent.ipcp_dns))?.into_configuration()`.
+  The function is deliberately **not** `#[deprecated]`: it stays the correct call
+  for a value that carries only containers.
+  These two changes have opposite signs and are declared as such — the decoder
+  is now **more** permissive about a malformed sibling unit and **less**
+  permissive about an uncorrelated reply. Both move toward RFC 1661 fidelity;
+  neither is simply hardening.
+  Unchanged, stated explicitly: `PcoAddressConfiguration`'s fields, derives and
+  redacting `Debug`; every `PcoDecodeError` variant and its `as_str`;
+  container-framing fatality; whole-value rejection for a wrong-length address
+  container; the IPv4 Link MTU local skip; and the entire encode path,
+  `PcoRequest`, `IpcpDnsRequest`, `PcscfRequest` and `PcscfAddressRequest`.
 - **`RePinAuditEvent` carries a correlation digest, not the live transition
   secret — `opc-ipsec-lb` (breaking: `transition_id: OwnershipTransitionId` is
   replaced by `correlation_id: RePinAuditCorrelationId`):** the coordinator
@@ -385,6 +452,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   orthogonal to the existing
   forced-unavailable Linux backend lane, which exercises a disabled backend on
   Linux rather than a host with no Linux datapath at all.
+- **Documentation corrections in the PCO codec — `opc-proto-gtpv2c`:** the RFC
+  1661 citation on the Configure-Ack option-echo rule said §5.3, which is
+  Configure-Nak; §5.2 is Configure-Ack. `dns_server_ipv4_all` and the crate
+  README claimed the accessor "drops duplicates" generally, but the container
+  list is cloned verbatim and only the two IPCP-sourced addresses are checked
+  against it; the wording now says so, and the behaviour is deliberately
+  unchanged because a repeated address container is something the peer actually
+  sent and collapsing it would destroy that evidence. The
+  `decode_network_contents` contract said "parsing is all-or-nothing" beside a
+  comment that does cite a clause, which read as spec-compelled; whole-value
+  rejection for a wrong-length **address** container is relabelled as this
+  codec's configuration-atomicity policy, which TS 24.008 does not require. The
+  comment claiming the IPCP Identifier "carries nothing this decoder interprets"
+  is deleted.
 - **P-CSCF Re-selection support is no longer emittable on its own --
   `opc-proto-gtpv2c` (breaking to `PcoRequest`):** TS 24.008 10.5.6.3 says of
   container `0x0012` that "This PCO parameter may be present only if a
@@ -732,16 +813,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - *Receive.* Emitting a request whose answer is discarded would deliver
     nothing, so `PcoAddressConfiguration` now decodes the reply into
     `ipcp_primary_dns` and `ipcp_secondary_dns`. Only a Configure-Nak is read
-    for addresses: RFC 1661 5.3 has a Configure-Ack echo the request's options
+    for addresses: RFC 1661 §5.2 has a Configure-Ack echo the request's options
     verbatim, so it conveys no server, and an echoed all-zero address is not
-    treated as one. `dns_server_ipv4_all()` merges the container and IPCP
-    sources and drops duplicates, so a caller cannot silently miss the
-    mechanism its peer chose.
+    treated as one. `dns_server_ipv4_all()` reports both the container and IPCP
+    sources, so a caller cannot silently miss the mechanism its peer chose. Both
+    the correlation requirement and the disposition of a malformed unit are
+    superseded within this same unreleased section; see the correlated-receive
+    entry under Added and the unit-local-discard entry under Changed.
   - Both structs gain fields, which breaks exhaustive struct literals;
     `..PcoRequest::none()` and `..Default::default()` are unaffected. Five new
-    `PcoDecodeError` variants report malformed IPCP framing, and a malformed
-    unit for this now-supported identifier rejects the whole value, matching
-    how a known container with a bad length is already handled. `Debug` reports
+    `PcoDecodeError` variants report malformed IPCP framing. `Debug` reports
     presence, never addresses.
 
 - **Credential-rotation observability closes three residual gaps —

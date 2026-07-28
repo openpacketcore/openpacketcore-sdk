@@ -1527,8 +1527,15 @@ pub struct CreateSessionAcceptedResponseSummary {
     pub paa: Option<PdnAddressAllocation>,
     /// Opaque TS 24.008 PCO contents from top-level PCO IE instance 0.
     ///
-    /// Use [`crate::PcoAddressConfiguration::decode_network_contents`] for the
-    /// bounded DNS/P-CSCF address projection. Keeping the transport value here
+    /// Use
+    /// [`crate::PcoAddressConfiguration::decode_network_contents_correlated`]
+    /// for the bounded DNS/P-CSCF address projection, passing
+    /// [`crate::IpcpNakCorrelation::for_request`] built from the
+    /// [`crate::IpcpDnsRequest`] that went out in the request PCO -- the caller
+    /// that built the request still holds it, and RFC 1661 5.3 makes an IPCP
+    /// Configure-Nak usable only against the Identifier it answers. The
+    /// uncorrelated [`crate::PcoAddressConfiguration::decode_network_contents`]
+    /// surfaces no IPCP-supplied DNS at all. Keeping the transport value here
     /// preserves accepted-bearer summary behavior when optional PCO contents
     /// are malformed or contain protocols the SDK does not decode.
     pub pco: Option<ProtocolConfigurationOptions>,
