@@ -219,6 +219,12 @@ pub enum EbpfDatapathGeneration {
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EbpfHistoricalDatapathGeneration {
+    /// The frozen endpoint-unbound generation from before per-bearer marks.
+    ///
+    /// Its retained counter map is narrower than the current program indexes,
+    /// so it cannot be replaced in place even though this build can identify
+    /// its hook tags exactly.
+    PreBearerMark,
     /// The generation immediately preceding the uplink redirect-outcome
     /// counter, whose counter map carries one slot fewer than this build
     /// indexes.

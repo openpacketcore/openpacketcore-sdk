@@ -170,10 +170,12 @@ pub enum GtpuError {
     /// A live tc hook runs a different generation of the datapath program than
     /// this build attaches.
     ///
-    /// In-place upgrade cannot proceed: hook replacement requires exact
-    /// program-tag equality, which a different generation can never satisfy.
-    /// Retrying cannot help, so the remedy is to drain the device, remove its
-    /// pins, and reprovision.
+    /// In-place upgrade cannot proceed. The normal replacement path accepts
+    /// only the exact current program and map graph; frozen historical objects
+    /// are classification evidence, not replacement authority. A historical
+    /// generation may also retain maps that are too narrow for the current
+    /// program. Retrying cannot help, so the remedy is to drain the device,
+    /// remove its pins, and reprovision.
     ///
     /// The refusal is raised before anything is changed -- no pin removed or
     /// created, no policy or config written, no hook replaced -- so the live

@@ -5226,12 +5226,18 @@ mod aya_runtime {
         env!("CARGO_MANIFEST_DIR"),
         "/bpf/opc-gtpu-datapath.bpf.o"
     ));
-    /// Frozen pre-bearer-mark object used only to prove exact live v1 filter
-    /// ownership during the bounded empty-v1-to-endpoint-v3 pin migration.
+    /// Frozen pre-bearer-mark object used only to identify a live v1
+    /// generation from its exact program tags.
     const LEGACY_V1_DATAPATH_OBJECT: &[u8] = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/bpf/opc-gtpu-datapath-v1.bpf.o"
     ));
+    const LEGACY_V1_DATAPATH_SHA256: [u8; 32] = [
+        0xf3, 0x1c, 0xcc, 0x29, 0x14, 0xf2, 0xfd, 0x61, 0xae, 0x8f, 0x1e, 0x89, 0x2e, 0x9a, 0xc0,
+        0x34, 0x2f, 0x9e, 0x81, 0x35, 0x0a, 0x4a, 0x06, 0x5d, 0x5d, 0x8d, 0xcf, 0xcc, 0x9f, 0x7a,
+        0x94, 0x3f,
+    ];
+    const LEGACY_V1_COUNTER_SLOTS: u32 = 6;
     const LEGACY_V2_OWNER_VALUE_LEN: usize = 20;
     const LEGACY_V2_TEARDOWN_PROOF_MAP: &str = "GTPU_V2_TEARDOWN";
     const LEGACY_V2_TEARDOWN_PROOF_LEN: usize = 96;
@@ -5379,7 +5385,7 @@ mod aya_runtime {
     ];
 
     #[derive(Clone, Copy)]
-    struct LegacyV2MapSpec {
+    struct FrozenMapSpec {
         name: &'static str,
         map_type: u32,
         key_size: u32,
@@ -5387,64 +5393,102 @@ mod aya_runtime {
         max_entries: u32,
     }
 
-    const LEGACY_V2_MAP_SPECS: [LegacyV2MapSpec; 9] = [
-        LegacyV2MapSpec {
+    const LEGACY_V1_MAP_SPECS: [FrozenMapSpec; 5] = [
+        FrozenMapSpec {
+            name: MAP_UPLINK_FAR,
+            map_type: bpf_map_type::BPF_MAP_TYPE_HASH as u32,
+            key_size: 4,
+            value_size: 12,
+            max_entries: 65_536,
+        },
+        FrozenMapSpec {
+            name: MAP_UPLINK_DSCP,
+            map_type: bpf_map_type::BPF_MAP_TYPE_HASH as u32,
+            key_size: 4,
+            value_size: 1,
+            max_entries: 65_536,
+        },
+        FrozenMapSpec {
+            name: MAP_DOWNLINK_PDR,
+            map_type: bpf_map_type::BPF_MAP_TYPE_HASH as u32,
+            key_size: 4,
+            value_size: 4,
+            max_entries: 65_536,
+        },
+        FrozenMapSpec {
+            name: MAP_COUNTERS,
+            map_type: bpf_map_type::BPF_MAP_TYPE_PERCPU_ARRAY as u32,
+            key_size: 4,
+            value_size: 8,
+            max_entries: LEGACY_V1_COUNTER_SLOTS,
+        },
+        FrozenMapSpec {
+            name: MAP_CONFIG,
+            map_type: bpf_map_type::BPF_MAP_TYPE_ARRAY as u32,
+            key_size: 4,
+            value_size: 4,
+            max_entries: 1,
+        },
+    ];
+
+    const LEGACY_V2_MAP_SPECS: [FrozenMapSpec; 9] = [
+        FrozenMapSpec {
             name: MAP_UPLINK_FAR,
             map_type: bpf_map_type::BPF_MAP_TYPE_HASH as u32,
             key_size: 4,
             value_size: UPLINK_FAR_VALUE_LEN as u32,
             max_entries: 65_536,
         },
-        LegacyV2MapSpec {
+        FrozenMapSpec {
             name: MAP_UPLINK_MARK_FAR,
             map_type: bpf_map_type::BPF_MAP_TYPE_HASH as u32,
             key_size: UPLINK_MARK_KEY_LEN as u32,
             value_size: UPLINK_FAR_VALUE_LEN as u32,
             max_entries: 65_536,
         },
-        LegacyV2MapSpec {
+        FrozenMapSpec {
             name: MAP_UPLINK_DSCP,
             map_type: bpf_map_type::BPF_MAP_TYPE_HASH as u32,
             key_size: 4,
             value_size: UPLINK_DSCP_VALUE_LEN as u32,
             max_entries: 65_536,
         },
-        LegacyV2MapSpec {
+        FrozenMapSpec {
             name: MAP_UPLINK_MARK_DSCP,
             map_type: bpf_map_type::BPF_MAP_TYPE_HASH as u32,
             key_size: UPLINK_MARK_KEY_LEN as u32,
             value_size: UPLINK_DSCP_VALUE_LEN as u32,
             max_entries: 65_536,
         },
-        LegacyV2MapSpec {
+        FrozenMapSpec {
             name: MAP_DOWNLINK_PDR,
             map_type: bpf_map_type::BPF_MAP_TYPE_HASH as u32,
             key_size: 4,
             value_size: DOWNLINK_PDR_VALUE_LEN as u32,
             max_entries: 65_536,
         },
-        LegacyV2MapSpec {
+        FrozenMapSpec {
             name: MAP_DOWNLINK_MARK_PDR,
             map_type: bpf_map_type::BPF_MAP_TYPE_HASH as u32,
             key_size: 4,
             value_size: MARKED_DOWNLINK_PDR_VALUE_LEN as u32,
             max_entries: 65_536,
         },
-        LegacyV2MapSpec {
+        FrozenMapSpec {
             name: MAP_MARKED_BEARER_OWNER,
             map_type: bpf_map_type::BPF_MAP_TYPE_HASH as u32,
             key_size: UPLINK_MARK_KEY_LEN as u32,
             value_size: LEGACY_V2_OWNER_VALUE_LEN as u32,
             max_entries: 65_536,
         },
-        LegacyV2MapSpec {
+        FrozenMapSpec {
             name: MAP_COUNTERS,
             map_type: bpf_map_type::BPF_MAP_TYPE_PERCPU_ARRAY as u32,
             key_size: 4,
             value_size: 8,
             max_entries: 6,
         },
-        LegacyV2MapSpec {
+        FrozenMapSpec {
             name: MAP_CONFIG,
             map_type: bpf_map_type::BPF_MAP_TYPE_ARRAY as u32,
             key_size: 4,
@@ -5787,13 +5831,11 @@ mod aya_runtime {
         /// "probably current": an unknown instruction stream cannot be assumed
         /// to write the maps this build is about to publish.
         ///
-        /// Each hook is judged on its own tag. A partially completed
-        /// replacement leaves one slot on this build's generation and the other
-        /// on the generation being replaced, and `attach_programs` preserves
-        /// that state deliberately so a retry can converge rather than opening
-        /// an outage. Demanding that both hooks name one generation would
-        /// classify exactly that retryable state as unrecognised and refuse it
-        /// forever, so the governing answer is the least replaceable hook.
+        /// Each hook is judged on its own tag. A partially completed historical
+        /// replacement can leave one current and one older hook; that mixed
+        /// state is still named for the older generation and refused rather
+        /// than misclassified as current or unrecognised. When both hooks are
+        /// historical, the older named generation governs the diagnostic.
         fn classify(
             self,
             uplink_tag: Option<u64>,
@@ -5841,32 +5883,43 @@ mod aya_runtime {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Generation {
         Current,
-        /// The frozen pre-bearer-mark generation. Unlike every other
-        /// superseded generation this one has a supported in-place upgrade:
-        /// `attach_programs` loads the same frozen object as a replacement
-        /// artifact, so its hooks can be replaced atomically by tag equality
-        /// against that artifact. It must therefore pass the generation guard
-        /// and be judged by the existing migration path, which also decides
-        /// whether the committed schema permits the upgrade at all.
+        /// The frozen pre-bearer-mark generation.
+        ///
+        /// This build can identify its hook tags exactly, but its authentic
+        /// retained graph has a narrower counter map than the current program
+        /// indexes. Replacing the hooks while retaining that map would silently
+        /// lose the newest counter, so this generation requires a drained
+        /// reprovision just like every other superseded generation.
         LegacyV1,
         PreRedirect,
         Unrecognized,
     }
 
     impl Generation {
-        /// Order the generations by how little this build can do with one.
+        /// Order generations by how far they are from this build.
         ///
-        /// `Current` and `LegacyV1` are replaceable in place, because this
-        /// build carries an artifact whose tag can match the live hook.
-        /// Nothing else is. When the two hooks disagree the higher rank
-        /// decides, so a single unreplaceable hook still refuses the attach
-        /// even when its partner is fine.
+        /// When two hooks disagree, the older or unrecognised one governs the
+        /// diagnostic. Every non-current value refuses before mutation.
         const fn refusal_rank(self) -> u8 {
             match self {
                 Self::Current => 0,
-                Self::LegacyV1 => 1,
-                Self::PreRedirect => 2,
+                Self::PreRedirect => 1,
+                Self::LegacyV1 => 2,
                 Self::Unrecognized => 3,
+            }
+        }
+
+        /// Translate a named live generation into the public refusal evidence.
+        const fn refusal(self) -> Option<EbpfDatapathGeneration> {
+            match self {
+                Self::Current => None,
+                Self::LegacyV1 => Some(EbpfDatapathGeneration::Historical(
+                    EbpfHistoricalDatapathGeneration::PreBearerMark,
+                )),
+                Self::PreRedirect => Some(EbpfDatapathGeneration::Historical(
+                    EbpfHistoricalDatapathGeneration::PreUplinkRedirectCounter,
+                )),
+                Self::Unrecognized => Some(EbpfDatapathGeneration::Unrecognized),
             }
         }
     }
@@ -6668,18 +6721,6 @@ mod aya_runtime {
                 })
         }
 
-        fn load_legacy_v1_pinned(&self, pin_dir: &Path) -> Result<Ebpf, GtpuError> {
-            EbpfLoader::new()
-                .default_map_pin_directory(pin_dir)
-                .load(LEGACY_V1_DATAPATH_OBJECT)
-                .map_err(|_| {
-                    GtpuError::io(
-                        "ebpf_legacy_object_load",
-                        invalid_data("legacy bpf object load failed"),
-                    )
-                })
-        }
-
         fn legacy_v2_artifact_tags_from(
             bytes: &[u8],
         ) -> Result<(LegacyV2ProgramTags, LegacyV2ProgramTags), GtpuError> {
@@ -6708,6 +6749,44 @@ mod aya_runtime {
                     || map.pinning() != PinningType::ByName
                 {
                     return Err(state_indeterminate("ebpf_legacy_v2_object_identity"));
+                }
+            }
+            Self::object_program_tags(object)
+        }
+
+        /// Derive tag candidates for the frozen pre-bearer-mark generation.
+        ///
+        /// The object is classification evidence only. Its authentic counter
+        /// map is narrower than the current program indexes, so it is never
+        /// loaded as replacement authority.
+        fn legacy_v1_artifact_tags_from(
+            bytes: &[u8],
+        ) -> Result<(LegacyV2ProgramTags, LegacyV2ProgramTags), GtpuError> {
+            if Sha256::digest(bytes)[..] != LEGACY_V1_DATAPATH_SHA256 {
+                return Err(state_indeterminate("ebpf_legacy_object_provenance"));
+            }
+            let object = AyaObject::parse(bytes).map_err(|_| {
+                GtpuError::io(
+                    "ebpf_legacy_object_parse",
+                    invalid_data("legacy bpf object parse failed"),
+                )
+            })?;
+            if object.maps.len() != LEGACY_V1_MAP_SPECS.len() {
+                return Err(state_indeterminate("ebpf_legacy_object_identity"));
+            }
+            for spec in LEGACY_V1_MAP_SPECS {
+                let map = object
+                    .maps
+                    .get(spec.name)
+                    .ok_or_else(|| state_indeterminate("ebpf_legacy_object_identity"))?;
+                if map.map_type() != spec.map_type
+                    || map.key_size() != spec.key_size
+                    || map.value_size() != spec.value_size
+                    || map.max_entries() != spec.max_entries
+                    || map.map_flags() != 0
+                    || map.pinning() != PinningType::ByName
+                {
+                    return Err(state_indeterminate("ebpf_legacy_object_identity"));
                 }
             }
             Self::object_program_tags(object)
@@ -6839,12 +6918,8 @@ mod aya_runtime {
                         Self::object_program_tags(object)
                             .map_err(object_identity_failure("ebpf_current_object_identity"))
                     })?;
-                let legacy_v1 = AyaObject::parse(LEGACY_V1_DATAPATH_OBJECT)
-                    .map_err(|_| ObjectTagFailure::Parse("ebpf_legacy_object_identity"))
-                    .and_then(|object| {
-                        Self::object_program_tags(object)
-                            .map_err(object_identity_failure("ebpf_legacy_object_identity"))
-                    })?;
+                let legacy_v1 = Self::legacy_v1_artifact_tags_from(LEGACY_V1_DATAPATH_OBJECT)
+                    .map_err(object_identity_failure("ebpf_legacy_object_identity"))?;
                 let pre_redirect = pre_redirect_artifact::program_tags()
                     .map_err(object_identity_failure("ebpf_pre_redirect_object_identity"))?;
                 Ok(DatapathGenerationTags {
@@ -7398,6 +7473,31 @@ mod aya_runtime {
         /// A slot held by something that is not one of this SDK's programs is
         /// not a generation question: that occupant is left to the existing
         /// exact-ownership refusal rather than being given a generation name.
+        fn sdk_hook_program_id(owner: &FilterOwner, name: &str) -> Result<Option<u32>, GtpuError> {
+            if owner.name != name {
+                return Ok(None);
+            }
+            owner
+                .program_id
+                .map(Some)
+                .ok_or_else(|| state_indeterminate("ebpf_generation_identity"))
+        }
+
+        fn required_loaded_program_tag(
+            program_id: u32,
+            programs: impl IntoIterator<Item = Result<(u32, u64), GtpuError>>,
+        ) -> Result<u64, GtpuError> {
+            programs
+                .into_iter()
+                .find_map(|result| match result {
+                    Ok((observed_id, tag)) if observed_id == program_id => Some(Ok(tag)),
+                    Ok(_) => None,
+                    Err(error) => Some(Err(error)),
+                })
+                .transpose()?
+                .ok_or_else(|| state_indeterminate("ebpf_generation_identity"))
+        }
+
         fn live_hook_program_tag(
             ifindex: u32,
             name: &str,
@@ -7407,23 +7507,16 @@ mod aya_runtime {
             let Some(owner) = slot_owner(ifindex, attach_type, tc_priority)? else {
                 return Ok(None);
             };
-            if owner.name != name {
-                return Ok(None);
-            }
-            let Some(program_id) = owner.program_id else {
+            let Some(program_id) = Self::sdk_hook_program_id(&owner, name)? else {
                 return Ok(None);
             };
-            loaded_programs()
-                .find_map(|result| match result {
-                    Ok(info) if info.id() == program_id => Some(Ok(info.tag())),
-                    Ok(_) => None,
-                    Err(error) => Some(Err(program_error("ebpf_generation_identity", &error))),
-                })
-                // The filter dump and the program listing are separate reads.
-                // A program that vanished between them leaves no live
-                // generation to conflict with; the attach path re-observes the
-                // slot before it replaces anything.
-                .transpose()
+            let programs = loaded_programs().map(|result| {
+                result
+                    .map(|info| (info.id(), info.tag()))
+                    .map_err(|error| program_error("ebpf_generation_identity", &error))
+            });
+            let tag = Self::required_loaded_program_tag(program_id, programs)?;
+            Ok(Some(tag))
         }
 
         /// Name the generation of the live SDK datapath on this device, if any.
@@ -7455,8 +7548,8 @@ mod aya_runtime {
             Ok(Self::datapath_generation_tags()?.classify(uplink, downlink))
         }
 
-        /// Refuse before any mutation when a live hook runs an older or
-        /// unrecognised generation of the datapath program.
+        /// Refuse before pin-graph or forwarding-state mutation when a live
+        /// hook runs an older or unrecognised datapath generation.
         ///
         /// Hook replacement requires exact program-tag equality, so an older
         /// generation can never be replaced in place: this attach is going to
@@ -7479,15 +7572,11 @@ mod aya_runtime {
             tc_priority: u16,
             operation: &'static str,
         ) -> Result<(), GtpuError> {
-            let observed = match Self::classify_live_generation(ifindex, tc_priority)? {
-                // The v1 generation has a supported in-place upgrade; let the
-                // existing migration path judge it, including whether the
-                // committed schema permits the upgrade at all.
-                None | Some(Generation::Current) | Some(Generation::LegacyV1) => return Ok(()),
-                Some(Generation::PreRedirect) => EbpfDatapathGeneration::Historical(
-                    EbpfHistoricalDatapathGeneration::PreUplinkRedirectCounter,
-                ),
-                Some(Generation::Unrecognized) => EbpfDatapathGeneration::Unrecognized,
+            let observed = match Self::classify_live_generation(ifindex, tc_priority)?
+                .and_then(Generation::refusal)
+            {
+                None => return Ok(()),
+                Some(observed) => observed,
             };
             Err(GtpuError::DatapathGenerationMismatch {
                 operation,
@@ -10111,7 +10200,6 @@ mod aya_runtime {
             ifindex: u32,
             pin_dir: &Path,
             tc_priority: u16,
-            schema_state: BearerSchemaState,
         ) -> Result<AttachedDatapath, GtpuError> {
             // clsact may already exist (EEXIST); that is fine.
             if let Err(error) = tc::qdisc_add_clsact(interface) {
@@ -10121,38 +10209,7 @@ mod aya_runtime {
             }
             let uplink_artifact = load_program(ebpf, PROG_UPLINK)?;
             let downlink_artifact = load_program(ebpf, PROG_DOWNLINK)?;
-            let mut legacy = if matches!(
-                schema_state,
-                BearerSchemaState::V1Uncommitted | BearerSchemaState::DscpV1
-            ) {
-                Some(self.load_legacy_v1_pinned(pin_dir)?)
-            } else {
-                None
-            };
-            let (legacy_uplink_artifact, legacy_downlink_artifact) = match legacy.as_mut() {
-                Some(legacy) => {
-                    let uplink = load_program(legacy, PROG_UPLINK)?;
-                    let downlink = load_program(legacy, PROG_DOWNLINK)?;
-                    // The migration fixture is trusted only when it resolves
-                    // to the exact retained v1 pin IDs. Extra or swapped maps
-                    // make the prior-generation proof fail closed.
-                    Self::program_identity(
-                        legacy,
-                        pin_dir,
-                        PROG_UPLINK,
-                        &[MAP_UPLINK_FAR, MAP_UPLINK_DSCP, MAP_COUNTERS, MAP_CONFIG],
-                    )?;
-                    Self::program_identity(
-                        legacy,
-                        pin_dir,
-                        PROG_DOWNLINK,
-                        &[MAP_DOWNLINK_PDR, MAP_COUNTERS],
-                    )?;
-                    (Some(uplink), Some(downlink))
-                }
-                None => (None, None),
-            };
-            // Also bind both freshly loaded artifacts to every exact pinned
+            // Bind both freshly loaded current artifacts to every exact pinned
             // map they are expected to use before examining/replacing slots.
             let identity = Self::datapath_identity(ebpf, pin_dir)?;
 
@@ -10165,7 +10222,6 @@ mod aya_runtime {
                 TcAttachType::Egress,
                 tc_priority,
                 &uplink_artifact,
-                legacy_uplink_artifact.as_ref(),
             )?;
             let downlink_slot = preflight_program_slot(
                 ifindex,
@@ -10173,7 +10229,6 @@ mod aya_runtime {
                 TcAttachType::Ingress,
                 tc_priority,
                 &downlink_artifact,
-                legacy_downlink_artifact.as_ref(),
             )?;
             let uplink = attach_loaded_program(
                 ebpf,
@@ -10417,17 +10472,11 @@ mod aya_runtime {
         attach_type: TcAttachType,
         tc_priority: u16,
         artifact: &ProgramInfo,
-        legacy_artifact: Option<&ProgramInfo>,
     ) -> Result<SlotDisposition, GtpuError> {
         match slot_owner(ifindex, attach_type, tc_priority)? {
             None => Ok(SlotDisposition::Empty),
             Some(owner) => {
-                let current_matches = owner_matches_artifact(&owner, name, artifact)?;
-                let legacy_matches = match legacy_artifact {
-                    Some(legacy_artifact) => owner_matches_artifact(&owner, name, legacy_artifact)?,
-                    None => false,
-                };
-                if !current_matches && !legacy_matches {
+                if !owner_matches_artifact(&owner, name, artifact)? {
                     return Err(GtpuError::AlreadyExists);
                 }
                 Ok(SlotDisposition::ReplaceExact {
@@ -11209,7 +11258,6 @@ mod aya_runtime {
                     ifindex,
                     &canonical_pin_dir,
                     tc_priority,
-                    schema_state,
                 )?;
                 if schema_state != BearerSchemaState::PmtuV5 {
                     if let Err(error) = Self::write_bearer_schema_marker(&mut ebpf) {
@@ -11217,7 +11265,7 @@ mod aya_runtime {
                             // Both exact current hooks remain live. Retaining them
                             // with the prior marker is a retryable,
                             // fail-closed migration state; removing them
-                            // would create an outage for the displaced v1
+                            // would create an outage for the pre-existing
                             // datapath.
                             return Err(state_indeterminate("ebpf_schema_marker_commit"));
                         }
@@ -11437,7 +11485,6 @@ mod aya_runtime {
                     ifindex,
                     &canonical_pin_dir,
                     tc_priority,
-                    bearer_state,
                 )?;
                 if bearer_state != BearerSchemaState::PmtuV5 {
                     if let Err(error) = Self::write_bearer_schema_marker(&mut ebpf) {
@@ -11597,7 +11644,6 @@ mod aya_runtime {
                 ifindex,
                 &canonical_pin_dir,
                 tc_priority,
-                schema_state,
             )?;
             if schema_state != BearerSchemaState::PmtuV5 {
                 if let Err(error) = Self::write_bearer_schema_marker(&mut ebpf) {
@@ -14536,6 +14582,52 @@ mod aya_runtime {
             }
         }
 
+        /// The frozen v1 program tags are useful refusal evidence, not
+        /// migration authority: its real counter map cannot satisfy the
+        /// current program's capacity contract.
+        #[test]
+        fn frozen_v1_counter_capacity_requires_drained_reprovision() {
+            assert_eq!(
+                &Sha256::digest(LEGACY_V1_DATAPATH_OBJECT)[..],
+                &LEGACY_V1_DATAPATH_SHA256,
+                "the embedded bytes must match the reviewed v1 artifact"
+            );
+            let object =
+                AyaObject::parse(LEGACY_V1_DATAPATH_OBJECT).expect("parse frozen v1 object");
+            let frozen = object
+                .maps
+                .get(MAP_COUNTERS)
+                .expect("frozen v1 counter map");
+            let current = CURRENT_MAP_SPECS
+                .iter()
+                .find(|spec| spec.name == MAP_COUNTERS)
+                .expect("current counter map specification");
+
+            assert_eq!(
+                frozen.max_entries(),
+                LEGACY_V1_COUNTER_SLOTS,
+                "the fixture must retain the authentic v1 counter width"
+            );
+            assert_eq!(
+                current.max_entries, COUNTER_SLOTS,
+                "the runtime specification must follow the common counter ABI"
+            );
+            assert_ne!(
+                frozen.max_entries(),
+                current.max_entries,
+                "a frozen v1 graph must not be admitted to the current loader"
+            );
+
+            let mut tampered = LEGACY_V1_DATAPATH_OBJECT.to_vec();
+            tampered[0] ^= 0xff;
+            assert!(matches!(
+                AyaGtpuRuntime::legacy_v1_artifact_tags_from(&tampered),
+                Err(GtpuError::StateIndeterminate {
+                    operation: "ebpf_legacy_object_provenance"
+                })
+            ));
+        }
+
         /// Every generation the classifier can name must be separable from
         /// every other one. Two generations sharing a tag candidate would make
         /// the guard either refuse a supported upgrade or admit an unsupported
@@ -14565,12 +14657,46 @@ mod aya_runtime {
             }
         }
 
-        /// Only a hook this build can actually replace may be classified as
-        /// replaceable. Anything else has to be named, because an unknown
-        /// instruction stream cannot be assumed to write the maps this build
-        /// is about to publish.
         #[test]
-        fn generation_classification_admits_only_replaceable_hooks() {
+        fn sdk_named_generation_owner_without_program_id_fails_closed() {
+            let missing_id = FilterOwner {
+                name: PROG_UPLINK.to_owned(),
+                program_id: None,
+            };
+            assert!(matches!(
+                AyaGtpuRuntime::sdk_hook_program_id(&missing_id, PROG_UPLINK),
+                Err(GtpuError::StateIndeterminate {
+                    operation: "ebpf_generation_identity"
+                })
+            ));
+
+            let foreign = FilterOwner {
+                name: "foreign_classifier".to_owned(),
+                program_id: None,
+            };
+            assert_eq!(
+                AyaGtpuRuntime::sdk_hook_program_id(&foreign, PROG_UPLINK)
+                    .expect("a foreign hook is not a generation question"),
+                None
+            );
+        }
+
+        #[test]
+        fn generation_program_id_absent_from_loaded_listing_fails_closed() {
+            let listing = [Ok((17, 0x1111)), Ok((19, 0x2222))];
+            assert!(matches!(
+                AyaGtpuRuntime::required_loaded_program_tag(18, listing),
+                Err(GtpuError::StateIndeterminate {
+                    operation: "ebpf_generation_identity"
+                })
+            ));
+        }
+
+        /// Every hook this build can identify is named. Only current hooks are
+        /// admitted; every older or unknown instruction stream must produce
+        /// explicit refusal evidence before the loader publishes a map.
+        #[test]
+        fn generation_classification_names_every_refusal() {
             let pair = |base: u64| {
                 (
                     LegacyV2ProgramTags {
@@ -14588,6 +14714,24 @@ mod aya_runtime {
                 legacy_v1: pair(0x20),
                 pre_redirect: pair(0x30),
             };
+
+            assert_eq!(Generation::Current.refusal(), None);
+            assert_eq!(
+                Generation::LegacyV1.refusal(),
+                Some(EbpfDatapathGeneration::Historical(
+                    EbpfHistoricalDatapathGeneration::PreBearerMark
+                ))
+            );
+            assert_eq!(
+                Generation::PreRedirect.refusal(),
+                Some(EbpfDatapathGeneration::Historical(
+                    EbpfHistoricalDatapathGeneration::PreUplinkRedirectCounter
+                ))
+            );
+            assert_eq!(
+                Generation::Unrecognized.refusal(),
+                Some(EbpfDatapathGeneration::Unrecognized)
+            );
 
             // An empty device has no generation question to answer.
             assert_eq!(tags.classify(None, None), None);
@@ -14637,16 +14781,22 @@ mod aya_runtime {
                 Some(Generation::PreRedirect),
                 "the blocking hook governs whichever slot it occupies"
             );
-            // A replacement interrupted between the two hooks leaves one slot
-            // on each replaceable generation. Both are replaceable in place, so
-            // the retry that `attach_programs` preserves this state for must
-            // still be admitted; refusing here would wedge it permanently.
+            // A host interrupted while replacing an old datapath can expose
+            // one current and one historical hook. The historical hook governs
+            // the refusal whichever slot it occupies; neither ordering may be
+            // mistaken for an all-current datapath.
             assert_eq!(
                 tags.classify(Some(0x10), Some(0x22)),
                 Some(Generation::LegacyV1)
             );
             assert_eq!(
                 tags.classify(Some(0x20), Some(0x12)),
+                Some(Generation::LegacyV1)
+            );
+            // When both hooks are historical, the older named generation
+            // governs the diagnostic.
+            assert_eq!(
+                tags.classify(Some(0x30), Some(0x22)),
                 Some(Generation::LegacyV1)
             );
             // An unknown hook still governs, whatever its partner is.
@@ -22774,7 +22924,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn uncommitted_v1_and_committed_v1_adopt_to_endpoint_v3() {
+    async fn compatible_empty_v1_schema_state_adopts_to_endpoint_v3() {
+        // The fake runtime models schema state only: its maps already satisfy
+        // the current ABI and it has no historical live hook. Authentic frozen
+        // v1 kernel state is covered by the privileged refusal test instead.
         for v1_marker_committed in [false, true] {
             let (backend, runtime) = backend_with_fake();
             backend.create_device(create_request()).await.unwrap();

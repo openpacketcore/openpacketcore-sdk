@@ -669,7 +669,7 @@ jobs:
       - name: Install pinned bpf-linker
         run: cargo install bpf-linker --version 0.10.3 --locked
 
-      - name: Verify frozen v1 migration authority
+      - name: Verify frozen v1 generation evidence
         run: |
           set -euo pipefail
           frozen="crates/opc-gtpu-dataplane/bpf/opc-gtpu-datapath-v1.bpf.o"
@@ -680,7 +680,7 @@ jobs:
           diff -u <(printf '%s\n' GTPU_CONFIG GTPU_COUNTERS GTPU_DOWNLINK_PDR GTPU_UPLINK_DSCP GTPU_UPLINK_FAR) frozen.maps
           for marked in GTPU_ULM_FAR GTPU_ULM_DSCP GTPU_DLM_PDR GTPU_M_OWNER GTPU_DL_BIND GTPU_DL_DROP; do
             if grep -qx "${marked}" frozen.maps; then
-              echo "frozen v1 authority unexpectedly contains ${marked}" >&2
+              echo "frozen v1 evidence unexpectedly contains ${marked}" >&2
               exit 1
             fi
           done

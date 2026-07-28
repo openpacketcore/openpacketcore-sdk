@@ -181,6 +181,8 @@ const FROZEN_V2_OBJECT: &[u8] = include_bytes!("../bpf/opc-gtpu-datapath-v2.bpf.
 /// program tag, and the tag is the single thing hook replacement compares.
 const FROZEN_PRE_REDIRECT_OBJECT: &[u8] =
     include_bytes!("../bpf/opc-gtpu-datapath-pre-redirect.bpf.o");
+/// `COUNTER_SLOTS` as the frozen v1 generation declared it.
+const LEGACY_V1_COUNTER_SLOTS: u32 = 6;
 /// `COUNTER_SLOTS` as that generation declared it.
 const PRE_REDIRECT_COUNTER_SLOTS: u32 = 6;
 const SDK_TC_HANDLE: TcHandle = TcHandle::new(0, 1);
@@ -3153,11 +3155,15 @@ fn ensure_clsact(interface: &str) {
 /// Every entry name under a pin directory, sorted. An absent directory lists
 /// as empty so a refusal that creates nothing is still comparable.
 fn pin_directory_listing(pin_dir: &std::path::Path) -> Vec<String> {
-    let Ok(entries) = fs::read_dir(pin_dir) else {
-        return Vec::new();
+    let entries = match fs::read_dir(pin_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Vec::new(),
+        Err(error) => panic!("read pin directory {}: {error}", pin_dir.display()),
     };
     let mut names: Vec<String> = entries
-        .filter_map(|entry| entry.ok())
+        .map(|entry| {
+            entry.unwrap_or_else(|error| panic!("read entry under {}: {error}", pin_dir.display()))
+        })
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
         .collect();
     names.sort();
@@ -4548,6 +4554,13 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
     let v1_pin_dir = net.pin_root.join("s2bu");
     let (v1_uplink_id, v1_downlink_id) = install_frozen_v1_datapath(&v1_pin_dir);
     let retained_map_ids = frozen_v1_map_ids(&v1_pin_dir);
+    assert_eq!(
+        pinned_map_abi(&v1_pin_dir, MAP_COUNTERS)
+            .expect("frozen v1 counter map must be pinned")
+            .3,
+        LEGACY_V1_COUNTER_SLOTS,
+        "the frozen v1 fixture must retain its authentic narrow counter map"
+    );
     assert_eq!(pinned_config(&v1_pin_dir), EPDG_S2BU_IP.octets());
     assert_eq!(
         pinned_schema_marker(&v1_pin_dir),
@@ -4556,11 +4569,14 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
     assert_eq!(tc_program_id("egress"), v1_uplink_id);
     assert_eq!(tc_program_id("ingress"), v1_downlink_id);
 
-    // A create request with a different retained local address must fail
-    // before any config, marker, map-ID, or hook mutation. Ownership is now
-    // read from the retained config pin before the object is loaded, so the
-    // refusal also creates none of the current object's additive pins.
+    // The live v1 hooks must be refused before any config, marker, map-ID, or
+    // hook mutation. Their exact tags name the generation, while their
+    // authentic 6-slot counter map proves why it cannot be replaced by the
+    // current 7-slot program.
     let v1_pins_before = pin_directory_listing(&v1_pin_dir);
+    let historical_v1 = opc_gtpu_dataplane::EbpfDatapathGeneration::Historical(
+        opc_gtpu_dataplane::EbpfHistoricalDatapathGeneration::PreBearerMark,
+    );
     let rejected_migration =
         EbpfGtpuDataplaneBackend::with_config(EbpfGtpuDataplaneBackendConfig {
             bpffs_pin_root: net.pin_root.clone(),
@@ -4568,15 +4584,26 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
         });
     let mut conflicting_request = CreateGtpDeviceRequest::new("s2bu");
     conflicting_request.bind_address = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 99));
-    assert!(matches!(
-        rejected_migration.create_device(conflicting_request).await,
-        Err(opc_gtpu_dataplane::GtpuError::AlreadyExists)
-    ));
+    let error = rejected_migration
+        .create_device(conflicting_request)
+        .await
+        .expect_err("a live frozen v1 generation must refuse create_device");
+    assert!(
+        matches!(
+            error,
+            GtpuError::DatapathGenerationMismatch {
+                operation: "ebpf_attach",
+                observed,
+                expected: opc_gtpu_dataplane::EbpfDatapathGeneration::Current,
+            } if observed == historical_v1
+        ),
+        "create_device must name the historical v1 generation, got {error:?}"
+    );
     drop(rejected_migration);
     assert_eq!(
         pin_directory_listing(&v1_pin_dir),
         v1_pins_before,
-        "a conflicting-owner refusal must publish no pin"
+        "a historical-generation refusal must publish no pin"
     );
     assert_eq!(pinned_config(&v1_pin_dir), EPDG_S2BU_IP.octets());
     assert_eq!(
@@ -4619,8 +4646,7 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
     .expect("frozen v1 downlink must survive rejected migration");
     assert_eq!(&buffer[..len], b"opc-v1-downlink");
 
-    // A populated endpoint-unbound v1 graph cannot be inferred as `Any` and
-    // upgraded silently. Adoption must reject it before replacing either
+    // Adoption must make the same generation decision before replacing either
     // live v1 hook or advancing the schema marker. Draining/reprovisioning is
     // the explicit operator-safe migration for these old pins.
     let rejected_endpoint_migration =
@@ -4628,13 +4654,27 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
             bpffs_pin_root: net.pin_root.clone(),
             ..EbpfGtpuDataplaneBackendConfig::default()
         });
-    assert!(matches!(
-        rejected_endpoint_migration.resolve_device("s2bu").await,
-        Err(GtpuError::StateIndeterminate {
-            operation: "ebpf_marked_owner_rebuild"
-        })
-    ));
+    let error = rejected_endpoint_migration
+        .resolve_device("s2bu")
+        .await
+        .expect_err("a live frozen v1 generation must refuse resolve_device");
+    assert!(
+        matches!(
+            error,
+            GtpuError::DatapathGenerationMismatch {
+                operation: "ebpf_adopt",
+                observed,
+                expected: opc_gtpu_dataplane::EbpfDatapathGeneration::Current,
+            } if observed == historical_v1
+        ),
+        "resolve_device must name the historical v1 generation, got {error:?}"
+    );
     drop(rejected_endpoint_migration);
+    assert_eq!(
+        pin_directory_listing(&v1_pin_dir),
+        v1_pins_before,
+        "a historical-generation adoption refusal must publish no pin"
+    );
     assert_eq!(frozen_v1_map_ids(&v1_pin_dir), retained_map_ids);
     assert_eq!(
         pinned_schema_marker(&v1_pin_dir),
@@ -4651,6 +4691,37 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
             ],
         );
     }
+
+    // With the historical hooks drained but the authentic pins retained, the
+    // generation question disappears and the next read-only guard must name
+    // the independent capacity defect. This distinction keeps diagnostics
+    // deterministic without weakening either refusal.
+    let pin_only_before = pin_directory_listing(&v1_pin_dir);
+    let pin_only_v1 = EbpfGtpuDataplaneBackend::with_config(EbpfGtpuDataplaneBackendConfig {
+        bpffs_pin_root: net.pin_root.clone(),
+        ..EbpfGtpuDataplaneBackendConfig::default()
+    });
+    let error = pin_only_v1
+        .resolve_device("s2bu")
+        .await
+        .expect_err("a pin-only frozen v1 graph must refuse its narrow counter map");
+    assert!(
+        matches!(
+            error,
+            GtpuError::Io {
+                operation: "ebpf_pin_map_abi",
+                ..
+            }
+        ),
+        "pin-only v1 state must be named as a map-capacity mismatch, got {error:?}"
+    );
+    drop(pin_only_v1);
+    assert_eq!(pin_directory_listing(&v1_pin_dir), pin_only_before);
+    assert_eq!(frozen_v1_map_ids(&v1_pin_dir), retained_map_ids);
+    assert_eq!(
+        pinned_schema_marker(&v1_pin_dir),
+        UPLINK_DSCP_SCHEMA_MARKER_VALUE
+    );
     fs::remove_dir_all(&v1_pin_dir).expect("drain endpoint-unbound v1 pins");
 
     // --- Explicit drained bearer-v2 teardown before source-port-v4. ---

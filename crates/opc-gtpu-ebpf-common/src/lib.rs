@@ -2045,10 +2045,10 @@ mod tests {
     /// grouped-attach paths read those IDs from the maps the loader has just
     /// adopted, so both sides agree by construction whatever width the retained
     /// map has. It is detected by the untyped pin capacity check the loader
-    /// performs before it loads anything, on any graph carrying the current
-    /// committed schema marker. A retained current-schema graph of the old
-    /// width is therefore refused rather than adopted in place, and refused
-    /// before any pin is created, removed or written.
+    /// performs before it loads anything, on every retained graph regardless
+    /// of schema marker. A graph of the old width is therefore refused rather
+    /// than adopted in place, and refused before any pin is created, removed or
+    /// written.
     ///
     /// The practical consequence of growing this constant: an upgrade over a
     /// retained current-schema graph requires a drained reprovision instead of
@@ -2056,10 +2056,10 @@ mod tests {
     /// every write to the new highest slot discarded by the kernel, which reads
     /// as a counter stuck at zero rather than as a failure.
     ///
-    /// A graph still carrying a pre-v5 marker is judged by the migration paths
-    /// that own it rather than by this check, so it keeps whatever capacity it
-    /// was pinned with. Those graphs are separately required to be empty before
-    /// they can advance.
+    /// This also applies to an otherwise-empty pre-v5 graph. Advancing its
+    /// marker while retaining a narrower counter map would create a
+    /// current-marker graph that can never satisfy this build, so a slot-count
+    /// change requires drained reprovisioning instead of automatic migration.
     #[test]
     fn datapath_counter_indices_are_distinct_and_within_the_map() {
         let indices = [

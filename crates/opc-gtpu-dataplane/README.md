@@ -814,10 +814,14 @@ bearer pin first, because that generation's owner value is a different width,
 and names it `ebpf_pin_map_abi`; a v2 graph that reaches the endpoint preflight
 is still named `ebpf_endpoint_schema`. Both refuse before either hook changes,
 and the operator remedy is the same.
-An uncommitted, legacy-v0, or DSCP-v1 graph can advance only when it is empty;
-any retained PDR/FAR without an exact binding is indeterminate and fails before
-either hook changes. The SDK never invents `Any`, derives a peer from an
-untrusted packet, or labels endpoint-unbound forwarding state production-ready.
+An uncommitted, legacy-v0, or DSCP-v1 schema can advance only when it is empty,
+its retained maps already satisfy the current ABI, and no historical hook is
+live. An authentic frozen-v1 graph has a six-slot counter map and historical
+program tags, so it now requires a drained pin removal and reprovision instead
+of automatic hook replacement. Any retained PDR/FAR without an exact binding
+is indeterminate and fails before either hook changes. The SDK never invents
+`Any`, derives a peer from an untrusted packet, or labels endpoint-unbound
+forwarding state production-ready.
 
 #### Orphaned current-schema graph recovery
 
@@ -1079,23 +1083,22 @@ Rebuilding the historical source with `scripts/build-gtpu-ebpf.sh` is useful
 for program/map inventory review, but exact-byte reproduction is not currently
 supported or claimed.
 
-Empty v0/v1 hook replacement is authorized only by the frozen
-`bpf/opc-gtpu-datapath-v1.bpf.o` fixture. It is the DSCP-generation artifact
-from commit `4fd43cf1465a46b6afa35348b2463fa9c497fce4`, with SHA-256
+The frozen `bpf/opc-gtpu-datapath-v1.bpf.o` fixture is retained only as exact
+generation evidence. It is the DSCP-generation artifact from commit
+`4fd43cf1465a46b6afa35348b2463fa9c497fce4`, with SHA-256
 `f31ccc2914f2fd61ae8f1e892e9ac0342f9e81350a4a065d5d8dcfcc9f7a943f`.
-The loader binds that object to the exact retained old map IDs and compares the
-live program name, type, tag, and complete map-ID set before replacement. The
-fixture is migration authority only; it is never selected as the running current
-datapath. CI verifies its hash and old-only program/map inventory.
+The loader validates that provenance, its old-only map inventory, and its
+six-slot counter map before deriving its program tags. It does not load or
+attach the object as replacement authority: a live matching hook reports the
+named `PreBearerMark` generation and requires a drained reprovision. CI
+independently verifies the hash and old-only program/map inventory.
 
-Classic-tc replacement uses Aya's atomic `attach_to_link` netlink path, not a
-detach-then-attach window. Both hook occupants are proven before either is
-touched. If the second replacement is uncertain, the first exact current hook is
-retained and the exact old/current second hook is left for an idempotent retry;
-the migration returns `StateIndeterminate` instead of creating an empty live
-slot. The same retained, retryable rule applies if schema or runtime-state
-commit fails after replacing an existing datapath. Fresh provisioning still
-rolls back a first hook that it created in an originally empty slot.
+Classic-tc replacement of an exact current hook still uses Aya's atomic
+`attach_to_link` netlink path, not a detach-then-attach window. Both hook
+occupants are proven before either is touched. Fresh provisioning rolls back a
+first hook that it created in an originally empty slot; an exact pre-existing
+current hook is retained if a later schema or runtime-state commit becomes
+indeterminate.
 
 All mutations through clones of one backend are serialized as one
 reconciliation. Cooperating independently constructed backends and processes
@@ -1151,11 +1154,11 @@ and application memory are not read through that operation. The userspace
 `opc-gtpu-dataplane` crate remains entirely safe Rust. Its committed current
 object is embedded from
 `crates/opc-gtpu-dataplane/bpf/opc-gtpu-datapath.bpf.o`; the frozen v1 object is
-retained only for the exact automatic empty-graph migration proof described
-above, the frozen v2 object is retained only for the explicit drained teardown
-identity proof, and the frozen pre-redirect object is retained only to derive
-the program tags described in the next section. None of the three legacy
-objects runs as the current datapath.
+retained only for exact historical-generation evidence, the frozen v2 object is
+retained only for the explicit drained teardown identity proof, and the frozen
+pre-redirect object is retained only to derive the program tags described in
+the next section. None of the three legacy objects runs as the current
+datapath.
 
 #### Map ABI and program generations across an upgrade
 
@@ -1203,20 +1206,22 @@ permanently zero -- a wrong operator-facing number rather than an error.
 Growing `COUNTER_SLOTS` therefore now makes a retained current-schema graph
 refuse until it is reprovisioned.
 
-A graph still carrying a pre-v5 marker is not judged on capacity here. It is
-routed to the explicit migration or refusal paths described above, which own
-the decision about their own retained state; a pre-v5 graph that advances
-through the empty-graph migration keeps whatever counter capacity it was
-pinned with.
+A graph still carrying a pre-v5 marker is judged on capacity too. Otherwise an
+empty-graph migration could advance the marker while retaining a narrower
+counter pin and leave a current-marker graph that can never satisfy this build.
+The frozen v1 and pre-redirect artifacts both carry six-slot counter maps, so
+their authentic retained graphs require drained reprovisioning rather than
+automatic migration.
 
 **Program generation.** Replacing a hook in place requires exact program-tag
 equality, because the replacement is a single `RTM_NEWTFILTER` against the
 existing filter rather than a detach followed by an attach. A live hook running
-an older generation can never satisfy that. Before touching anything, the
-loader reads the tag of whatever occupies each hook and compares it against
-tags derived offline from the objects it carries. If the occupant is a
-recognised older generation, or carries an SDK program name whose tag matches
-no generation this build can name, the attach fails with
+an older generation can never satisfy that. Before pin-graph or
+forwarding-state mutation, the loader reads the tag of each SDK-named hook
+occupant and compares it against tags derived offline from the objects it
+carries. If the occupant is a recognised older generation, or carries an SDK
+program name whose tag matches no generation this build can name, the attach
+fails with
 `GtpuError::DatapathGenerationMismatch`, naming the observed and expected
 generation.
 
@@ -1237,12 +1242,14 @@ would split metrics between the map the live program still writes and the map
 the pin now names, and no retry could converge, because the pin would by then
 be this build's shape while the tag still differed.
 
-The frozen v1 generation is the one exception, and it is not an exception to
-the rule so much as a case the rule does not cover: the loader carries that
-object as a replacement artifact, so a live v1 hook can be replaced atomically
-by tag equality against it. Those hooks pass the generation check and are
-judged by the empty-graph migration rules described above, which independently
-decide whether the committed schema permits the upgrade at all.
+The frozen v1 generation is recognised as
+`EbpfHistoricalDatapathGeneration::PreBearerMark`. Its exact tags improve the
+diagnostic; they do not authorize replacement. A complete live v1 graph is
+therefore rejected by the generation guard before pin-graph or
+forwarding-state mutation and before map ABI or schema reads. If the hooks are
+already absent but the v1 pins remain, the capacity guard names the six-slot
+counter map as `ebpf_pin_map_abi`. Both paths leave the graph untouched and
+require the same drained reprovision.
 
 There is no automatic live migration across generations. The remedy for a
 refusal is the documented one: drain the device, remove the pins, and

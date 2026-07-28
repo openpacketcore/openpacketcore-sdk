@@ -577,7 +577,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   codec's configuration-atomicity policy, which TS 24.008 does not require. The
   comment claiming the IPCP Identifier "carries nothing this decoder interprets"
   is deleted.
-- **A cross-generation eBPF datapath upgrade is refused before any mutation --
+- **A cross-generation eBPF datapath upgrade is refused before pin-graph or
+  forwarding-state mutation --
   `opc-gtpu-dataplane` (breaking to `EbpfGtpuDatapathSnapshot`):** two distinct
   upgrade hazards were invisible to the attach path.
   - A pin graph retained from a build with a narrower `GTPU_COUNTERS` was
@@ -591,12 +592,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     all, because hook replacement requires exact program-tag equality, and the
     refusal arrived only after the loader had already created pins, written
     config and materialized policy.
-  Both are now classified before anything changes, using kernel metadata only
-  and binding no value type. Each names its own failure: a pin-ABI divergence
-  raises `GtpuError::Io { operation: "ebpf_pin_map_abi" }`, while a live older
-  hook raises `GtpuError::DatapathGenerationMismatch`. The guards run in a
-  fixed order -- layout, then capacity, then generation -- so the error a
-  caller observes for a graph carrying more than one hazard is predictable.
+  Both are now classified before pin-graph or forwarding-state mutation, using
+  kernel metadata only and binding no value type. Each names its own failure: a
+  pin-ABI divergence raises
+  `GtpuError::Io { operation: "ebpf_pin_map_abi" }`, while a live older hook
+  raises `GtpuError::DatapathGenerationMismatch`. After the reconciler lease is
+  acquired, the generation guard runs before retained pin-graph inspection;
+  layout and then capacity are checked before any typed schema read. The error
+  a caller observes for a graph carrying more than one hazard is therefore
+  predictable.
   Map *layout* -- type, name, key size, value size, flags -- is checked on
   every present pin before the schema preflight's typed FAR read, so a foreign
   map shape is named as a shape mismatch instead of surfacing later as a schema
@@ -609,17 +613,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Refusing before that migration keeps the graph exactly as it was found, so a
   drained reprovision still resolves it. The cost is stated plainly: an upgrade
   that grows a counter slot now needs a drained reprovision where it previously
-  succeeded and miscounted. A generation guard then reads the program tag
-  of each hook occupant and compares it against tags derived offline from the
+  succeeded and miscounted. The generation guard reads the program tag of each
+  SDK-named hook occupant and compares it against tags derived offline from the
   frozen objects the crate carries, refusing with the new
   `GtpuError::DatapathGenerationMismatch { operation, observed, expected }`.
   The refusal removes no pin, creates no pin, writes no policy or config and
   replaces no hook, so the documented drained reprovision still works after any
   number of refused attempts; `create_device`, `resolve_device` and
   `create_device_with_endpoints` behave identically. The frozen v1 generation
-  passes the guard because the loader carries that object as a replacement
-  artifact and can replace such a hook atomically; the existing empty-graph
-  migration rules continue to judge it.
+  is now named `PreBearerMark` and refused too: its exact six-slot counter map
+  cannot satisfy the seven-slot current program. A complete live v1 graph is
+  rejected by generation before pin-graph or forwarding-state mutation; a
+  pin-only v1 graph is named by the capacity guard. The frozen object is
+  provenance- and inventory-checked classification evidence, never replacement
+  authority.
   Grouped attachment now excludes live legacy IPv4 authority from the pins
   before the loader materializes the grouped pins rather than after. With every
   grouped pin absent the schema preflight reports an initializing state, which
