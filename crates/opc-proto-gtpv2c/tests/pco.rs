@@ -561,13 +561,13 @@ fn a_configure_nak_with_a_stale_identifier_supplies_no_dns() {
     // session's DNS answer.
     let contents = vec![
         0x80, //
-        0x00, 0x0c, 0x04, 198, 51, 100, 1, // sibling P-CSCF IPv4 container
         0x80, 0x21, 0x10, // IPCP unit, contents length 16
         0x03, // Code: Configure-Nak
         0x2b, // Identifier: off by one from the outstanding request
         0x00, 0x10, //
         0x81, 0x06, 8, 8, 8, 8, //
         0x83, 0x06, 1, 1, 1, 1, //
+        0x00, 0x0c, 0x04, 198, 51, 100, 1, // following P-CSCF IPv4 container
         0x00, 0x0d, 0x04, 9, 9, 9, 9, // sibling DNS IPv4 container
     ];
 
@@ -578,7 +578,7 @@ fn a_configure_nak_with_a_stale_identifier_supplies_no_dns() {
         discards[0].reason(),
         PcoIpcpDiscardReason::IdentifierMismatch
     );
-    assert_eq!(discards[0].unit_index(), 1);
+    assert_eq!(discards[0].unit_index(), 0);
     assert_eq!(
         discards[0].reason().as_str(),
         "pco_ipcp_identifier_mismatch"
@@ -587,8 +587,9 @@ fn a_configure_nak_with_a_stale_identifier_supplies_no_dns() {
     let decoded = outcome.into_configuration();
     assert_eq!(decoded.ipcp_primary_dns, None);
     assert_eq!(decoded.ipcp_secondary_dns, None);
-    // The value still decodes, and the containers around the discarded unit
-    // survive: RFC 1661's discard unit is the packet, not the PCO value.
+    // The value still decodes, and the following additional-parameter
+    // containers survive: RFC 1661's discard unit is the packet, not the PCO
+    // value.
     assert_eq!(decoded.p_cscf_ipv4, vec![[198, 51, 100, 1]]);
     assert_eq!(decoded.dns_server_ipv4, vec![[9, 9, 9, 9]]);
     assert_eq!(decoded.dns_server_ipv4_all(), vec![[9, 9, 9, 9]]);
@@ -724,6 +725,47 @@ fn only_a_configure_nak_is_read_for_addresses() {
 }
 
 #[test]
+fn malformed_non_nak_configuration_options_are_reported() {
+    // RFC 1661 codes 1 through 4 all carry a Configuration Options field. Not
+    // adopting addresses from Request, Ack, or Reject must not bypass the
+    // packet-level framing checks that make an invalid packet observable.
+    let cases: &[(u8, &[u8], PcoDecodeError)] = &[
+        (0x01, &[0x81], PcoDecodeError::IpcpOptionTruncated),
+        (0x02, &[0x81, 0x01], PcoDecodeError::IpcpOptionLengthInvalid),
+        (
+            0x04,
+            &[0x81, 0x05, 8, 8, 8],
+            PcoDecodeError::IpcpDnsOptionLengthInvalid,
+        ),
+    ];
+
+    for (code, options, expected) in cases {
+        let declared = u16::try_from(4 + options.len()).expect("fixture length fits");
+        let mut contents = vec![
+            0x80,
+            0x80,
+            0x21,
+            u8::try_from(declared).expect("fixture length fits"),
+            *code,
+            FIXTURE_IDENTIFIER,
+        ];
+        contents.extend_from_slice(&declared.to_be_bytes());
+        contents.extend_from_slice(options);
+
+        let outcome = decode_correlated(&contents);
+        let discards = outcome.ipcp_discards();
+        assert_eq!(discards.len(), 1, "code {code:#04x}: {discards:?}");
+        assert_eq!(
+            discards[0].reason(),
+            PcoIpcpDiscardReason::Malformed(*expected),
+            "code {code:#04x}"
+        );
+        assert_eq!(discards[0].unit_index(), 0, "code {code:#04x}");
+        assert!(outcome.configuration().is_empty(), "code {code:#04x}");
+    }
+}
+
+#[test]
 fn an_echoed_all_zero_address_is_not_treated_as_a_dns_server() {
     let contents = vec![
         0x80, 0x80, 0x21, 0x10, 0x03, 0x2a, 0x00, 0x10, //
@@ -826,14 +868,14 @@ fn a_valid_option_before_a_malformed_one_in_the_same_unit_is_discarded_too() {
 }
 
 #[test]
-fn a_malformed_ipcp_unit_leaves_its_sibling_containers_intact() {
+fn a_malformed_ipcp_unit_leaves_following_containers_intact() {
     // TS 24.008 10.5.6.3 maps one 0x8021 unit to one RFC 1661 packet, and the
     // unit's outer container boundary was validated before its contents were
-    // read, so the siblings on either side are recoverable.
+    // read, so the following additional-parameter containers are recoverable.
     let contents = vec![
         0x80, //
-        0x00, 0x0c, 0x04, 198, 51, 100, 1, // P-CSCF IPv4 container
         0x80, 0x21, 0x04, 0x03, 0x2a, 0x00, 0x40, // Length beyond the unit
+        0x00, 0x0c, 0x04, 198, 51, 100, 1, // P-CSCF IPv4 container
         0x00, 0x0d, 0x04, 8, 8, 8, 8, // DNS Server IPv4 container
     ];
 
@@ -844,12 +886,97 @@ fn a_malformed_ipcp_unit_leaves_its_sibling_containers_intact() {
         discards[0].reason(),
         PcoIpcpDiscardReason::Malformed(PcoDecodeError::IpcpLengthInvalid)
     );
-    assert_eq!(discards[0].unit_index(), 1);
+    assert_eq!(discards[0].unit_index(), 0);
     let decoded = outcome.into_configuration();
     assert_eq!(decoded.p_cscf_ipv4, vec![[198, 51, 100, 1]]);
     assert_eq!(decoded.dns_server_ipv4, vec![[8, 8, 8, 8]]);
     assert_eq!(decoded.ipcp_primary_dns, None);
     assert_eq!(decoded.ipcp_secondary_dns, None);
+}
+
+#[test]
+fn ipcp_after_an_additional_parameter_is_discarded_with_evidence() {
+    // TS 24.008 10.5.6.3 puts the configuration protocol options list before
+    // the additional parameters list. This deliberately invalid ordering must
+    // not let a matching Nak place DNS into the decoded configuration.
+    let contents = vec![
+        0x80, //
+        0x00, 0x0c, 0x04, 198, 51, 100, 1, // starts additional parameters
+        0x80, 0x21, 0x0a, // misplaced IPCP unit
+        0x03, 0x2a, 0x00, 0x0a, //
+        0x81, 0x06, 8, 8, 8, 8, //
+        0x00, 0x0d, 0x04, 9, 9, 9, 9, // later additional parameter
+    ];
+
+    let outcome = decode_correlated(&contents);
+    let discards = outcome.ipcp_discards();
+    assert_eq!(discards.len(), 1, "{discards:?}");
+    assert_eq!(
+        discards[0].reason(),
+        PcoIpcpDiscardReason::AfterAdditionalParameters
+    );
+    assert_eq!(discards[0].unit_index(), 1);
+    assert_eq!(
+        discards[0].reason().as_str(),
+        "pco_ipcp_after_additional_parameters"
+    );
+
+    let decoded = outcome.into_configuration();
+    assert_eq!(decoded.p_cscf_ipv4, vec![[198, 51, 100, 1]]);
+    assert_eq!(decoded.dns_server_ipv4, vec![[9, 9, 9, 9]]);
+    assert_eq!(decoded.ipcp_primary_dns, None);
+    assert_eq!(decoded.ipcp_secondary_dns, None);
+}
+
+#[test]
+fn every_registered_container_class_establishes_the_list_boundary() {
+    // The parser must not equate "container this codec decodes" with
+    // "identifier assigned to the container list." Unsupported, reserved and
+    // operator-specific network-to-MS containers all start the second list.
+    for identifier in [0x0002_u16, 0x0025, 0xff00] {
+        let [high, low] = identifier.to_be_bytes();
+        let contents = vec![
+            0x80, //
+            high, low, 0x00, // empty registered container
+            0x80, 0x21, 0x0a, // misplaced IPCP unit
+            0x03, 0x2a, 0x00, 0x0a, //
+            0x81, 0x06, 8, 8, 8, 8, //
+        ];
+
+        let outcome = decode_correlated(&contents);
+        let discards = outcome.ipcp_discards();
+        assert_eq!(discards.len(), 1, "identifier {identifier:#06x}");
+        assert_eq!(
+            discards[0].reason(),
+            PcoIpcpDiscardReason::AfterAdditionalParameters,
+            "identifier {identifier:#06x}"
+        );
+        assert_eq!(discards[0].unit_index(), 1, "identifier {identifier:#06x}");
+        assert_eq!(
+            outcome.configuration().ipcp_primary_dns,
+            None,
+            "identifier {identifier:#06x}"
+        );
+    }
+}
+
+#[test]
+fn a_configuration_protocol_before_ipcp_does_not_start_the_container_list() {
+    // LCP is a configuration protocol, not an additional-parameter container.
+    // An unsupported but well-framed LCP unit may be skipped without moving
+    // the monotonic list boundary ahead of the following IPCP unit.
+    let contents = vec![
+        0x80, //
+        0xc0, 0x21, 0x04, // LCP unit
+        0x06, 0x01, 0x00, 0x04, // Terminate-Ack
+        0x80, 0x21, 0x0a, // IPCP unit
+        0x03, 0x2a, 0x00, 0x0a, //
+        0x81, 0x06, 8, 8, 8, 8, //
+    ];
+
+    let outcome = decode_correlated(&contents);
+    assert!(outcome.ipcp_discards().is_empty());
+    assert_eq!(outcome.configuration().ipcp_primary_dns, Some([8, 8, 8, 8]));
 }
 
 #[test]

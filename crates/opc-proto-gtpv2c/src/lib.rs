@@ -35,8 +35,9 @@
 //! [`PcoAddressConfiguration::decode_network_contents_correlated`] reads the
 //! peer's Configure-Nak answer once [`IpcpNakCorrelation`] correlates it to the
 //! Identifier that was sent, as RFC 1661 5.3 requires; a malformed `0x8021`
-//! unit is discarded on its own and leaves its sibling containers standing. The
-//! IPv4 Link MTU container `0x0010` is carried in both directions.
+//! unit is discarded on its own and leaves following containers standing, while
+//! IPCP after a registered network-to-MS container is discarded as out of
+//! order. The IPv4 Link MTU container `0x0010` is carried in both directions.
 //! Product code remains responsible for deciding when optional policy-owned
 //! values apply and for obtaining them from AAA/HSS or local configuration.
 //! S2b Modify Bearer uses the UE-initiated IPsec tunnel-update profile:

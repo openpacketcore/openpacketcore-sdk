@@ -26,14 +26,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Configure-Nak, so the fail-closed position is the one a caller reaches by
   accident; `expecting(identifier)` is the RFC-permissive constructor;
   `for_request(sent)` correlates against a request this SDK encoded.
-  Every unit dropped on correlation, every unit dropped as malformed, and every
-  DNS option skipped as unsolicited is reported through
-  `PcoDecoded::ipcp_discards` with a reason code and a unit position and never
-  an address or an Identifier value, extending the existing
-  `PcoAddressConfiguration` redaction contract. Four drops stay deliberately
-  silent and record no entry, as before: a well-formed code other than
-  Configure-Nak, an unknown option type, an echoed RFC 1877 all-zero address,
-  and a repeated option whose slot is already filled.
+  Every unit dropped on correlation, every unit dropped as malformed or because
+  it appeared after a registered network-to-MS container, and every DNS
+  option skipped as unsolicited is reported through `PcoDecoded::ipcp_discards`
+  with a reason code and a unit position and never an address or an Identifier
+  value, extending the existing `PcoAddressConfiguration` redaction contract.
+  The boundary classifier covers unsupported, reserved and operator-specific
+  identifiers from TS 24.008 V20.0.0 Table 10.5.154, not only containers this
+  codec decodes.
+  Four drops stay deliberately silent and record no entry, as before: a
+  well-formed code other than Configure-Nak, an unknown option type, an echoed
+  RFC 1877 all-zero address, and a repeated option whose slot is already filled.
+  Configure-Request, Configure-Ack and Configure-Reject remain DNS-inert, but
+  their Configuration Options framing and known DNS option lengths are
+  syntactically validated before that silent no-op disposition; this does not
+  claim Identifier, Ack equality, Reject subset or PPP response validation.
   `for_request` additionally declines a DNS option this side never solicited.
   **That filter is engineering judgement, not a specification requirement:** RFC
   1661 §5.3 permits a Configure-Nak to append Configuration Options the peer
@@ -168,16 +175,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A malformed IPCP unit is discarded unit-locally instead of failing the whole
   PCO/APCO value — `opc-proto-gtpv2c` (breaking, behavioural; no signature
   changes):** `decode_network_contents` propagated an IPCP fault out of the
-  whole value, destroying P-CSCF and DNS containers that had already parsed.
+  whole value, preventing spec-ordered P-CSCF and DNS containers later in the
+  value from being surfaced.
   RFC 1661's discard unit is the *packet*, and TS 24.008 10.5.6.3 maps one
   `0x8021` unit to one RFC 1661 packet stripped of Protocol and Padding; the
   unit's outer container boundary is validated before its contents are read, so
-  the sibling boundaries are recoverable and the siblings are now kept. Within
-  one unit the disposition is atomic: an option that parsed before a later
-  malformed one in the same packet is dropped with it, which the unit decoder
-  now expresses in its type by returning no `Result` at all and merging only on
-  whole-unit success. `PcoDecodeError::IpcpHeaderTruncated`, `IpcpLengthInvalid`,
-  `IpcpOptionTruncated`, `IpcpOptionLengthInvalid` and
+  following container boundaries are recoverable and those containers are now
+  kept. Within one unit the disposition is atomic: an option that parsed before
+  a later malformed one in the same packet is dropped with it, which the unit
+  decoder now expresses in its type by returning no `Result` at all and merging
+  only on whole-unit success. `PcoDecodeError::IpcpHeaderTruncated`,
+  `IpcpLengthInvalid`, `IpcpOptionTruncated`, `IpcpOptionLengthInvalid` and
   `IpcpDnsOptionLengthInvalid` stop being returned from the decode entry points;
   they remain public, constructible and reachable through
   `PcoIpcpDiscardReason::Malformed`, and no variant was removed or reordered.

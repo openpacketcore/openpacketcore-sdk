@@ -134,7 +134,8 @@ control-plane stack.
   from the `IpcpDnsRequest` that was sent. `IpcpNakCorrelation::none` is the
   `Default`, and the uncorrelated `decode_network_contents` uses it, so that
   entry point surfaces no IPCP-supplied DNS at all. Every unit dropped on
-  correlation, every unit dropped as malformed, and every DNS option skipped as
+  correlation, every unit dropped as malformed or because it appeared after a
+  registered network-to-MS container, and every DNS option skipped as
   unsolicited is reported through `PcoDecoded::ipcp_discards`, which carries
   reason codes and unit positions and never an address or an Identifier value.
   Four drops are deliberately silent and record no entry, as before: a
@@ -143,11 +144,14 @@ control-plane stack.
 - A malformed `0x8021` unit is discarded unit-locally rather than failing the
   whole PCO/APCO value: RFC 1661's discard unit is the packet, TS 24.008
   10.5.6.3 maps one `0x8021` unit to one RFC 1661 packet, and the unit's outer
-  container boundary has already been validated, so the sibling P-CSCF and DNS
+  container boundary has already been validated, so following P-CSCF and DNS
   containers are recoverable and survive. Within one unit the disposition is
   atomic -- an option that parsed before a later malformed one in the same
-  packet is dropped with it. Container framing and wrong-length address
-  containers still reject the whole value.
+  packet is dropped with it. Once any registered network-to-MS container starts
+  the second TS list, including an unsupported, reserved or operator-specific
+  identifier, a later IPCP unit is out of order and is discarded with evidence
+  rather than adopted. Container framing and wrong-length address containers
+  still reject the whole value.
 - `for_request` additionally declines a DNS option this side never solicited.
   That is engineering judgement and not a specification requirement: RFC 1661
   5.3 permits a Configure-Nak to append options the peer desires that were not

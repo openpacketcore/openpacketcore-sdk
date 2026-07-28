@@ -78,13 +78,37 @@ const IPCP_HEADER_LEN: u8 = 4;
 const IPCP_DNS_OPTION_LEN: u8 = 6;
 
 const IPCP_CODE_CONFIGURE_REQUEST: u8 = 1;
+const IPCP_CODE_CONFIGURE_ACK: u8 = 2;
 const IPCP_CODE_CONFIGURE_NAK: u8 = 3;
+const IPCP_CODE_CONFIGURE_REJECT: u8 = 4;
 
 /// Primary DNS Server Address option (RFC 1877 §1.1).
 const IPCP_OPTION_PRIMARY_DNS: u8 = 129;
 
-/// Secondary DNS Server Address option (RFC 1877 §1.2).
+/// Secondary DNS Server Address option (RFC 1877 §1.3).
 const IPCP_OPTION_SECONDARY_DNS: u8 = 131;
+
+/// Return whether a network-to-MS identifier belongs to the container list.
+///
+/// TS 24.008 V20.0.0 Table 10.5.154 assigns these ranges to additional
+/// parameter containers, including table-reserved and operator-specific
+/// values. An unsupported identifier inside the registry still establishes
+/// the second logical list; otherwise a later IPCP unit could be adopted from
+/// outside the configuration protocol options list. Identifiers not assigned
+/// by that table remain ambiguous and do not establish a boundary.
+const fn is_network_to_ms_container_identifier(identifier: u16) -> bool {
+    matches!(
+        identifier,
+        0x0001..=0x002b
+            | 0x0030..=0x0032
+            | 0x0035..=0x0041
+            | 0x0047..=0x004a
+            | 0x0050..=0x0052
+            | 0x0056..=0x0059
+            | 0x0060..=0x0062
+            | 0xff00..=0xffff
+    )
+}
 
 /// Request for DNS server addresses via an IPCP Configure-Request.
 ///
@@ -530,7 +554,7 @@ pub struct PcoAddressConfiguration {
     /// Held separately from [`Self::dns_server_ipv4`] so the answering
     /// mechanism stays visible; [`Self::dns_server_ipv4_all`] merges them.
     pub ipcp_primary_dns: Option<[u8; 4]>,
-    /// Secondary DNS Server Address from an IPCP Configure-Nak (RFC 1877 §1.2).
+    /// Secondary DNS Server Address from an IPCP Configure-Nak (RFC 1877 §1.3).
     pub ipcp_secondary_dns: Option<[u8; 4]>,
     /// IPv4 link MTU in octets, from container `0x0010`.
     ///
@@ -608,8 +632,12 @@ impl PcoAddressConfiguration {
     /// complete value; that is this codec's configuration-atomicity policy and
     /// not a specification requirement, since TS 24.008 states no receiver
     /// disposition for it and a half-applied DNS or P-CSCF set is worse than
-    /// none. Unknown, well-formed length-delimited containers are skipped, and
-    /// a malformed `0x8021` unit is discarded unit-locally.
+    /// none. Unknown, well-formed length-delimited containers are skipped. A
+    /// malformed `0x8021` unit is discarded unit-locally, as is an IPCP unit
+    /// placed after a registered network-to-MS container: TS 24.008 defines
+    /// the configuration protocol options list before the additional
+    /// parameters list, and this decoder does not adopt protocol material after
+    /// that boundary.
     ///
     /// # Errors
     ///
@@ -635,8 +663,8 @@ impl PcoAddressConfiguration {
     /// Returns [`PcoDecodeError`] for an absent or unsupported header,
     /// truncated container framing, a declared length beyond the remaining
     /// input, an invalid fixed address length, or more than
-    /// [`PCO_MAX_CONTAINERS`]. A malformed or uncorrelated `0x8021` unit is
-    /// *not* an error: it is discarded and reported through
+    /// [`PCO_MAX_CONTAINERS`]. A malformed, uncorrelated, or out-of-order
+    /// `0x8021` unit is *not* an error: it is discarded and reported through
     /// [`PcoDecoded::ipcp_discards`].
     pub fn decode_network_contents_correlated(
         value: &[u8],
@@ -650,6 +678,7 @@ impl PcoAddressConfiguration {
         let mut decoded = Self::default();
         let mut discards: Vec<PcoIpcpDiscard> = Vec::new();
         let mut container_count = 0usize;
+        let mut additional_parameters_started = false;
         while !remaining.is_empty() {
             container_count = container_count
                 .checked_add(1)
@@ -670,6 +699,9 @@ impl PcoAddressConfiguration {
                 return Err(PcoDecodeError::ContainerLengthOverrun);
             }
             let contents = &remaining[PCO_CONTAINER_HEADER_LEN..contents_end];
+            if is_network_to_ms_container_identifier(identifier) {
+                additional_parameters_started = true;
+            }
             match identifier {
                 PCO_CONTAINER_P_CSCF_IPV6 => {
                     decoded.p_cscf_ipv6.push(decode_ipv6_address(contents)?)
@@ -687,12 +719,25 @@ impl PcoAddressConfiguration {
                 // RFC 1661 §5.3: "Invalid packets are silently discarded." TS
                 // 24.008 10.5.6.3 maps one 0x8021 unit to one RFC 1661 packet,
                 // and this unit's outer container boundary was already
-                // validated above, so the sibling containers are recoverable
+                // validated above, so following containers are recoverable
                 // and are kept. Contrast the address container arms above,
                 // which fail the whole value under this codec's own
                 // configuration-atomicity policy.
                 PCO_PROTOCOL_IPCP => {
-                    let outcome = decode_ipcp_unit(contents, correlation);
+                    let outcome = if additional_parameters_started {
+                        // TS 24.008 10.5.6.3 defines configuration protocol
+                        // options in octets 4..w and additional parameters in
+                        // w+1..z. Once a registered network-to-MS container
+                        // establishes the second list, a later IPCP unit cannot
+                        // be interpreted as part of the first list. The
+                        // specification gives no receiver disposition for this
+                        // send-side violation, so this codec keeps the
+                        // recoverable containers but fails closed on the
+                        // misplaced protocol material.
+                        IpcpUnitOutcome::discarded(PcoIpcpDiscardReason::AfterAdditionalParameters)
+                    } else {
+                        decode_ipcp_unit(contents, correlation)
+                    };
                     if let Some(unit) = outcome.merge {
                         // First writer across units wins, matching the
                         // within-unit rule in `decode_ipcp_unit`.
@@ -813,6 +858,9 @@ pub enum PcoIpcpDiscardReason {
     /// Whole unit discarded: no Configure-Request was outstanding, so no
     /// Configure-Nak could be correlated.
     NoOutstandingRequest,
+    /// Whole unit discarded: it appeared after a registered network-to-MS
+    /// container, outside the TS 24.008 configuration protocol options list.
+    AfterAdditionalParameters,
     /// Whole unit discarded: malformed. The carried [`PcoDecodeError`] is the
     /// same value the decoder returned for this fault before the disposition
     /// became unit-local.
@@ -829,6 +877,7 @@ impl PcoIpcpDiscardReason {
         match self {
             Self::IdentifierMismatch => "pco_ipcp_identifier_mismatch",
             Self::NoOutstandingRequest => "pco_ipcp_no_outstanding_request",
+            Self::AfterAdditionalParameters => "pco_ipcp_after_additional_parameters",
             Self::Malformed(error) => error.as_str(),
             Self::UnsolicitedOption => "pco_ipcp_unsolicited_option",
         }
@@ -858,7 +907,7 @@ impl fmt::Debug for PcoAddressConfiguration {
 struct IpcpUnitScratch {
     /// Primary DNS Server Address this unit supplied (RFC 1877 §1.1).
     primary_dns: Option<[u8; 4]>,
-    /// Secondary DNS Server Address this unit supplied (RFC 1877 §1.2).
+    /// Secondary DNS Server Address this unit supplied (RFC 1877 §1.3).
     secondary_dns: Option<[u8; 4]>,
 }
 
@@ -892,14 +941,19 @@ impl IpcpUnitOutcome {
 ///
 /// Only a Configure-Nak carries addresses: RFC 1661 §5.2 has a Configure-Ack
 /// echo the request's options verbatim, and this crate always requests with
-/// the RFC 1877 all-zero address, so an Ack conveys nothing. Other codes are
-/// accepted and ignored rather than rejected.
+/// the RFC 1877 all-zero address, so an Ack conveys nothing. Codes 1, 2 and 4
+/// are option-framed configuration packets too, so their framing and the shape
+/// of known DNS options are syntactically validated before their contents are
+/// ignored. Codes outside 1 through 4 do not use the Configuration Options
+/// packet shape this parser can validate and are ignored without applying
+/// option framing.
 ///
-/// Returns no `Result`: RFC 1661 §5.3 discards the offending *packet*, and TS
-/// 24.008 10.5.6.3 maps one `0x8021` unit to one RFC 1661 packet, so no IPCP
-/// fault may reach the enclosing PCO value. Nothing is written to the caller's
-/// accumulator either, so an option that parsed before a later malformed one in
-/// the same packet cannot survive it.
+/// Returns no `Result`: this decoder contains a syntactic fault to one IPCP
+/// packet, and TS 24.008 10.5.6.3 maps one `0x8021` unit to one such packet, so
+/// no IPCP fault reaches the enclosing PCO value. Choosing a PPP response for a
+/// malformed Configure-Request remains outside this projection. Nothing is
+/// written to the caller's accumulator either, so an option that parsed before
+/// a later malformed one in the same packet cannot survive it.
 fn decode_ipcp_unit(contents: &[u8], correlation: IpcpNakCorrelation) -> IpcpUnitOutcome {
     let header_len = usize::from(IPCP_HEADER_LEN);
     if contents.len() < header_len {
@@ -914,6 +968,15 @@ fn decode_ipcp_unit(contents: &[u8], correlation: IpcpNakCorrelation) -> IpcpUni
         return IpcpUnitOutcome::discarded(PcoIpcpDiscardReason::Malformed(
             PcoDecodeError::IpcpLengthInvalid,
         ));
+    }
+    if matches!(
+        code,
+        IPCP_CODE_CONFIGURE_REQUEST | IPCP_CODE_CONFIGURE_ACK | IPCP_CODE_CONFIGURE_REJECT
+    ) {
+        if let Err(error) = validate_ipcp_configuration_options(&contents[header_len..declared]) {
+            return IpcpUnitOutcome::discarded(PcoIpcpDiscardReason::Malformed(error));
+        }
+        return IpcpUnitOutcome::ignored();
     }
     if code != IPCP_CODE_CONFIGURE_NAK {
         return IpcpUnitOutcome::ignored();
@@ -936,24 +999,12 @@ fn decode_ipcp_unit(contents: &[u8], correlation: IpcpNakCorrelation) -> IpcpUni
     // separate option cap.
     let mut remaining = &contents[header_len..declared];
     while !remaining.is_empty() {
-        let Some((&option_type, rest)) = remaining.split_first() else {
-            return IpcpUnitOutcome::discarded(PcoIpcpDiscardReason::Malformed(
-                PcoDecodeError::IpcpOptionTruncated,
-            ));
+        let (option_type, data, rest) = match split_ipcp_configuration_option(remaining) {
+            Ok(option) => option,
+            Err(error) => {
+                return IpcpUnitOutcome::discarded(PcoIpcpDiscardReason::Malformed(error))
+            }
         };
-        let Some((&option_len, _)) = rest.split_first() else {
-            return IpcpUnitOutcome::discarded(PcoIpcpDiscardReason::Malformed(
-                PcoDecodeError::IpcpOptionTruncated,
-            ));
-        };
-        let option_len = usize::from(option_len);
-        // RFC 1661 §6: the option Length counts the Type and Length octets.
-        if option_len < 2 || option_len > remaining.len() {
-            return IpcpUnitOutcome::discarded(PcoIpcpDiscardReason::Malformed(
-                PcoDecodeError::IpcpOptionLengthInvalid,
-            ));
-        }
-        let data = &remaining[2..option_len];
         match option_type {
             IPCP_OPTION_PRIMARY_DNS | IPCP_OPTION_SECONDARY_DNS => {
                 // Whether the packet is invalid is a property of the packet,
@@ -991,12 +1042,58 @@ fn decode_ipcp_unit(contents: &[u8], correlation: IpcpNakCorrelation) -> IpcpUni
             }
             _ => {}
         }
-        remaining = &remaining[option_len..];
+        remaining = rest;
     }
     IpcpUnitOutcome {
         merge: Some(scratch),
         note,
     }
+}
+
+/// Split one RFC 1661 Configuration Option from a packet.
+///
+/// The returned slices borrow the bounded IPCP unit, and each successful call
+/// consumes at least two octets.
+fn split_ipcp_configuration_option(remaining: &[u8]) -> Result<(u8, &[u8], &[u8]), PcoDecodeError> {
+    let Some((&option_type, rest)) = remaining.split_first() else {
+        return Err(PcoDecodeError::IpcpOptionTruncated);
+    };
+    let Some((&option_len, _)) = rest.split_first() else {
+        return Err(PcoDecodeError::IpcpOptionTruncated);
+    };
+    let option_len = usize::from(option_len);
+    // RFC 1661 §6: the option Length counts the Type and Length octets.
+    if option_len < 2 || option_len > remaining.len() {
+        return Err(PcoDecodeError::IpcpOptionLengthInvalid);
+    }
+    Ok((
+        option_type,
+        &remaining[2..option_len],
+        &remaining[option_len..],
+    ))
+}
+
+/// Validate the Configuration Options field of a non-Nak configuration packet.
+///
+/// DNS values are not adopted from these codes, but their option framing is
+/// still checked so syntactically invalid input is reported rather than called
+/// a well-formed ignored packet. Known RFC 1877 options retain their fixed
+/// six-octet shape independent of which configuration code carried them. This
+/// is syntax validation only: Identifier correlation, Configure-Ack equality,
+/// Configure-Reject subset validation and PPP response policy remain outside
+/// this decoder.
+fn validate_ipcp_configuration_options(mut remaining: &[u8]) -> Result<(), PcoDecodeError> {
+    while !remaining.is_empty() {
+        let (option_type, data, rest) = split_ipcp_configuration_option(remaining)?;
+        if matches!(
+            option_type,
+            IPCP_OPTION_PRIMARY_DNS | IPCP_OPTION_SECONDARY_DNS
+        ) {
+            parse_ipcp_dns_option(data)?;
+        }
+        remaining = rest;
+    }
+    Ok(())
 }
 
 /// Parse the data of one RFC 1877 DNS Server Address option.
