@@ -2775,8 +2775,20 @@ dependencies = [
 name = "opc-egress-fence"
 version = "0.2.0"
 dependencies = [
+ "async-trait",
+ "aya",
+ "bytes",
+ "nix",
  "opc-egress-fence-common",
+ "opc-linux-gtpu-sys",
+ "opc-linux-xfrm-sys",
+ "opc-runtime",
+ "opc-session-store",
+ "opc-types",
+ "rustix",
+ "sha2 0.10.9",
  "thiserror 2.0.19",
+ "tokio",
 ]
 
 [[package]]

@@ -1,21 +1,29 @@
 use std::ffi::CString;
 use std::io;
 use std::mem;
+use std::num::NonZeroU64;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
-use crate::{BpfXdpLinkInfo, GtpuIpAddress, GtpuUdpBind};
+use crate::{BpfCgroupProgramAttachment, BpfXdpLinkInfo, GtpuIpAddress, GtpuUdpBind};
 
 const BPF_OBJ_PIN: libc::c_uint = 6;
 const BPF_OBJ_GET: libc::c_uint = 7;
+const BPF_PROG_ATTACH: libc::c_uint = 8;
 const BPF_PROG_GET_FD_BY_ID: libc::c_uint = 13;
 const BPF_OBJ_GET_INFO_BY_FD: libc::c_uint = 15;
+const BPF_PROG_QUERY: libc::c_uint = 16;
+const BPF_MAP_FREEZE: libc::c_uint = 22;
 const BPF_LINK_UPDATE: libc::c_uint = 29;
 const BPF_LINK_GET_FD_BY_ID: libc::c_uint = 30;
 const BPF_PROG_TYPE_XDP: u32 = 6;
 const BPF_LINK_TYPE_XDP: u32 = 6;
+const BPF_PROG_TYPE_CGROUP_SKB: u32 = 8;
+const BPF_CGROUP_INET_EGRESS: u32 = 1;
+const BPF_F_ALLOW_MULTI: u32 = 1 << 1;
 const BPF_F_REPLACE: u32 = 1 << 2;
+const BPF_CGROUP_MAX_PROGS: usize = 64;
 
 #[repr(C)]
 #[derive(Debug, Default)]
@@ -50,6 +58,46 @@ struct BpfLinkUpdateAttr {
     new_program_fd: u32,
     flags: u32,
     old_program_fd: u32,
+}
+
+#[repr(C, align(8))]
+#[derive(Debug, Default)]
+struct BpfProgAttachAttr {
+    target_fd: u32,
+    attach_bpf_fd: u32,
+    attach_type: u32,
+    attach_flags: u32,
+    replace_bpf_fd: u32,
+    relative_fd: u32,
+    expected_revision: u64,
+}
+
+#[repr(C, align(8))]
+#[derive(Debug, Default)]
+struct BpfProgQueryAttr {
+    target_fd: u32,
+    attach_type: u32,
+    query_flags: u32,
+    attach_flags: u32,
+    program_ids: u64,
+    program_count: u32,
+    reserved: u32,
+    program_attach_flags: u64,
+    link_ids: u64,
+    link_attach_flags: u64,
+    revision: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, Default)]
+struct BpfMapFreezeAttr {
+    map_fd: u32,
+}
+
+#[derive(Debug)]
+struct DirectCgroupAttachRequest {
+    command: libc::c_uint,
+    attr: BpfProgAttachAttr,
 }
 
 /// Stable prefix of `struct bpf_link_info` through `xdp.ifindex`.
@@ -97,6 +145,31 @@ const _: () = {
     assert!(mem::offset_of!(BpfLinkUpdateAttr, new_program_fd) == 4);
     assert!(mem::offset_of!(BpfLinkUpdateAttr, flags) == 8);
     assert!(mem::offset_of!(BpfLinkUpdateAttr, old_program_fd) == 12);
+    assert!(mem::size_of::<BpfProgAttachAttr>() == 32);
+    assert!(mem::align_of::<BpfProgAttachAttr>() == 8);
+    assert!(mem::offset_of!(BpfProgAttachAttr, target_fd) == 0);
+    assert!(mem::offset_of!(BpfProgAttachAttr, attach_bpf_fd) == 4);
+    assert!(mem::offset_of!(BpfProgAttachAttr, attach_type) == 8);
+    assert!(mem::offset_of!(BpfProgAttachAttr, attach_flags) == 12);
+    assert!(mem::offset_of!(BpfProgAttachAttr, replace_bpf_fd) == 16);
+    assert!(mem::offset_of!(BpfProgAttachAttr, relative_fd) == 20);
+    assert!(mem::offset_of!(BpfProgAttachAttr, expected_revision) == 24);
+    assert!(mem::size_of::<BpfProgQueryAttr>() == 64);
+    assert!(mem::align_of::<BpfProgQueryAttr>() == 8);
+    assert!(mem::offset_of!(BpfProgQueryAttr, target_fd) == 0);
+    assert!(mem::offset_of!(BpfProgQueryAttr, attach_type) == 4);
+    assert!(mem::offset_of!(BpfProgQueryAttr, query_flags) == 8);
+    assert!(mem::offset_of!(BpfProgQueryAttr, attach_flags) == 12);
+    assert!(mem::offset_of!(BpfProgQueryAttr, program_ids) == 16);
+    assert!(mem::offset_of!(BpfProgQueryAttr, program_count) == 24);
+    assert!(mem::offset_of!(BpfProgQueryAttr, reserved) == 28);
+    assert!(mem::offset_of!(BpfProgQueryAttr, program_attach_flags) == 32);
+    assert!(mem::offset_of!(BpfProgQueryAttr, link_ids) == 40);
+    assert!(mem::offset_of!(BpfProgQueryAttr, link_attach_flags) == 48);
+    assert!(mem::offset_of!(BpfProgQueryAttr, revision) == 56);
+    assert!(mem::size_of::<BpfMapFreezeAttr>() == 4);
+    assert!(mem::align_of::<BpfMapFreezeAttr>() == 4);
+    assert!(mem::offset_of!(BpfMapFreezeAttr, map_fd) == 0);
     assert!(mem::size_of::<BpfXdpLinkInfoRaw>() == 24);
     assert!(mem::align_of::<BpfXdpLinkInfoRaw>() == 8);
     assert!(mem::offset_of!(BpfXdpLinkInfoRaw, link_type) == 0);
@@ -128,6 +201,168 @@ impl NetlinkSocket {
     }
 }
 
+pub fn socket_kernel_identity(socket: BorrowedFd<'_>) -> io::Result<(u64, u64)> {
+    let socket_cookie = socket_u64_option(socket, libc::SO_COOKIE)?;
+    let netns_cookie = socket_u64_option(socket, libc::SO_NETNS_COOKIE)?;
+    Ok((socket_cookie, netns_cookie))
+}
+
+pub fn query_cgroup_skb_egress(
+    cgroup: BorrowedFd<'_>,
+) -> io::Result<(u32, NonZeroU64, Vec<BpfCgroupProgramAttachment>)> {
+    let mut program_ids = [0_u32; BPF_CGROUP_MAX_PROGS];
+    let mut program_attach_flags = [0_u32; BPF_CGROUP_MAX_PROGS];
+    let mut query = BpfProgQueryAttr {
+        target_fd: fd_number(cgroup)?,
+        attach_type: BPF_CGROUP_INET_EGRESS,
+        program_ids: program_ids.as_mut_ptr() as usize as u64,
+        program_count: u32::try_from(program_ids.len())
+            .map_err(|_| io::Error::other("bpf_cgroup_query_capacity"))?,
+        program_attach_flags: program_attach_flags.as_mut_ptr() as usize as u64,
+        ..BpfProgQueryAttr::default()
+    };
+    // SAFETY: `query` is the exact BPF_PROG_QUERY UAPI structure and its
+    // program-id pointer names a live, writable fixed array for the entire
+    // syscall. The cgroup descriptor remains borrowed and live.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_bpf,
+            BPF_PROG_QUERY,
+            &mut query as *mut BpfProgQueryAttr,
+            mem::size_of::<BpfProgQueryAttr>(),
+        )
+    };
+    if result < 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ENOSPC)
+            || usize::try_from(query.program_count).unwrap_or(usize::MAX) > program_ids.len()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bpf_cgroup_query_capacity",
+            ));
+        }
+        return Err(error);
+    }
+    let count = usize::try_from(query.program_count)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bpf_cgroup_query_count"))?;
+    if count > program_ids.len()
+        || program_ids[..count].contains(&0)
+        || program_ids[count..]
+            .iter()
+            .any(|program_id| *program_id != 0)
+        || program_attach_flags[count..]
+            .iter()
+            .any(|flags| *flags != 0)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "bpf_cgroup_query_inventory",
+        ));
+    }
+    let attachments = (0..count)
+        .map(|index| BpfCgroupProgramAttachment {
+            program_id: program_ids[index],
+            program_attach_flags: program_attach_flags[index],
+        })
+        .collect();
+    let revision = NonZeroU64::new(query.revision).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "bpf_cgroup_query_zero_revision")
+    })?;
+    Ok((query.attach_flags, revision, attachments))
+}
+
+pub fn attach_cgroup_skb_egress(
+    cgroup: BorrowedFd<'_>,
+    program: BorrowedFd<'_>,
+    expected_revision: NonZeroU64,
+) -> io::Result<()> {
+    let request =
+        direct_cgroup_attach_request(fd_number(cgroup)?, fd_number(program)?, expected_revision);
+    // SAFETY: `request.attr` is the exact fully initialized BPF_PROG_ATTACH
+    // UAPI structure. Both descriptors remain borrowed and live for the call.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_bpf,
+            request.command,
+            &request.attr as *const BpfProgAttachAttr,
+            mem::size_of::<BpfProgAttachAttr>(),
+        )
+    };
+    if result < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn direct_cgroup_attach_request(
+    target_fd: u32,
+    program_fd: u32,
+    expected_revision: NonZeroU64,
+) -> DirectCgroupAttachRequest {
+    DirectCgroupAttachRequest {
+        command: BPF_PROG_ATTACH,
+        attr: BpfProgAttachAttr {
+            target_fd,
+            attach_bpf_fd: program_fd,
+            attach_type: BPF_CGROUP_INET_EGRESS,
+            attach_flags: BPF_F_ALLOW_MULTI,
+            expected_revision: expected_revision.get(),
+            ..BpfProgAttachAttr::default()
+        },
+    }
+}
+
+pub fn freeze_bpf_map(map: BorrowedFd<'_>) -> io::Result<()> {
+    let freeze = BpfMapFreezeAttr {
+        map_fd: fd_number(map)?,
+    };
+    // SAFETY: `freeze` is the exact initialized BPF_MAP_FREEZE UAPI prefix and
+    // the map descriptor remains borrowed and live for the call.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_bpf,
+            BPF_MAP_FREEZE,
+            &freeze as *const BpfMapFreezeAttr,
+            mem::size_of::<BpfMapFreezeAttr>(),
+        )
+    };
+    if result < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn socket_u64_option(socket: BorrowedFd<'_>, option: libc::c_int) -> io::Result<u64> {
+    let mut value = 0_u64;
+    let mut length = libc::socklen_t::try_from(mem::size_of::<u64>())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "socket_option_width"))?;
+    // SAFETY: `socket` is a live borrowed descriptor, `value` and `length`
+    // point to writable objects for the entire call, and both options return
+    // exactly one `u64` on Linux.
+    let result = unsafe {
+        libc::getsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            option,
+            (&mut value as *mut u64).cast(),
+            &mut length,
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if usize::try_from(length).ok() != Some(mem::size_of::<u64>()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "socket_option_width",
+        ));
+    }
+    Ok(value)
+}
+
 #[derive(Debug)]
 pub struct GtpuUdpSocket {
     fd: OwnedFd,
@@ -145,9 +380,25 @@ pub struct BpfXdpProgram {
     fd: OwnedFd,
 }
 
+#[derive(Debug)]
+pub struct BpfCgroupSkbProgram {
+    fd: OwnedFd,
+}
+
 impl BpfXdpProgram {
     pub fn program_id(&self) -> io::Result<u32> {
         xdp_program_id_from_fd(&self.fd)
+    }
+}
+
+impl BpfCgroupSkbProgram {
+    pub fn info(&self) -> io::Result<(u32, [u8; 8])> {
+        cgroup_skb_program_info_from_fd(&self.fd)
+    }
+
+    pub fn pin_duplicate(&self, path: &Path) -> io::Result<()> {
+        let path = validate_pin_path(path)?;
+        pin_bpf_object(&self.fd, &path)
     }
 }
 
@@ -503,6 +754,38 @@ fn xdp_program_id_from_fd(program_fd: &OwnedFd) -> io::Result<u32> {
     Ok(info.program_id)
 }
 
+fn cgroup_skb_program_info_from_fd(program_fd: &OwnedFd) -> io::Result<(u32, [u8; 8])> {
+    let mut info = BpfProgramInfoRaw::default();
+    let mut info_attr = BpfObjGetInfoByFdAttr {
+        bpf_fd: fd_number(program_fd.as_fd())?,
+        info_len: mem::size_of::<BpfProgramInfoRaw>() as u32,
+        info: (&mut info as *mut BpfProgramInfoRaw) as usize as u64,
+    };
+    // SAFETY: `info_attr` is the exact BPF_OBJ_GET_INFO_BY_FD UAPI layout and
+    // points to a live writable `BpfProgramInfoRaw` for the call duration.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_bpf,
+            BPF_OBJ_GET_INFO_BY_FD,
+            &mut info_attr as *mut BpfObjGetInfoByFdAttr,
+            mem::size_of::<BpfObjGetInfoByFdAttr>(),
+        )
+    };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if info_attr.info_len < mem::size_of::<BpfProgramInfoRaw>() as u32
+        || info.program_type != BPF_PROG_TYPE_CGROUP_SKB
+        || info.program_id == 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "bpf_cgroup_skb_program_identity",
+        ));
+    }
+    Ok((info.program_id, info.tag))
+}
+
 pub fn open_xdp_link_by_id(link_id: u32) -> io::Result<BpfXdpLink> {
     let link = BpfXdpLink {
         fd: open_bpf_link_by_id(link_id)?,
@@ -533,6 +816,19 @@ pub fn open_xdp_program_by_id(program_id: u32) -> io::Result<BpfXdpProgram> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "opened XDP program id does not match the requested object",
+        ));
+    }
+    Ok(program)
+}
+
+pub fn open_cgroup_skb_program_by_id(program_id: u32) -> io::Result<BpfCgroupSkbProgram> {
+    let program = BpfCgroupSkbProgram {
+        fd: open_bpf_object_by_id(BPF_PROG_GET_FD_BY_ID, program_id)?,
+    };
+    if program.info()?.0 != program_id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "bpf_cgroup_skb_program_identity",
         ));
     }
     Ok(program)
@@ -730,6 +1026,21 @@ mod tests {
         assert_eq!(addr.nl_family, libc::AF_NETLINK as libc::sa_family_t);
         assert_eq!(addr.nl_pid, 0);
         assert_eq!(addr.nl_groups, 0);
+    }
+
+    #[test]
+    fn cgroup_egress_attach_is_direct_revision_guarded_and_multi() {
+        let revision = NonZeroU64::new(0x0102_0304_0506_0708).expect("nonzero fixture");
+        let request = direct_cgroup_attach_request(17, 23, revision);
+
+        assert_eq!(request.command, BPF_PROG_ATTACH);
+        assert_eq!(request.attr.target_fd, 17);
+        assert_eq!(request.attr.attach_bpf_fd, 23);
+        assert_eq!(request.attr.attach_type, BPF_CGROUP_INET_EGRESS);
+        assert_eq!(request.attr.attach_flags, BPF_F_ALLOW_MULTI);
+        assert_eq!(request.attr.replace_bpf_fd, 0);
+        assert_eq!(request.attr.relative_fd, 0);
+        assert_eq!(request.attr.expected_revision, revision.get());
     }
 
     #[test]

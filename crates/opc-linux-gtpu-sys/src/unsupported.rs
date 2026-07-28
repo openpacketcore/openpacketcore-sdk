@@ -29,8 +29,23 @@ pub struct BpfXdpProgram {
     _private: (),
 }
 
+#[derive(Debug)]
+pub struct BpfCgroupSkbProgram {
+    _private: (),
+}
+
 impl BpfXdpProgram {
     pub fn program_id(&self) -> io::Result<u32> {
+        Err(unsupported())
+    }
+}
+
+impl BpfCgroupSkbProgram {
+    pub fn info(&self) -> io::Result<(u32, [u8; 8])> {
+        Err(unsupported())
+    }
+
+    pub fn pin_duplicate(&self, _path: &Path) -> io::Result<()> {
         Err(unsupported())
     }
 }
@@ -79,6 +94,36 @@ pub fn ifindex_by_name(_name: &str) -> io::Result<u32> {
     Err(unsupported())
 }
 
+#[cfg(target_os = "linux")]
+pub fn socket_kernel_identity(_socket: std::os::fd::BorrowedFd<'_>) -> io::Result<(u64, u64)> {
+    Err(unsupported())
+}
+
+#[cfg(target_os = "linux")]
+pub fn query_cgroup_skb_egress(
+    _cgroup: std::os::fd::BorrowedFd<'_>,
+) -> io::Result<(
+    u32,
+    std::num::NonZeroU64,
+    Vec<crate::BpfCgroupProgramAttachment>,
+)> {
+    Err(unsupported())
+}
+
+#[cfg(target_os = "linux")]
+pub fn attach_cgroup_skb_egress(
+    _cgroup: std::os::fd::BorrowedFd<'_>,
+    _program: std::os::fd::BorrowedFd<'_>,
+    _expected_revision: std::num::NonZeroU64,
+) -> io::Result<()> {
+    Err(unsupported())
+}
+
+#[cfg(target_os = "linux")]
+pub fn freeze_bpf_map(_map: std::os::fd::BorrowedFd<'_>) -> io::Result<()> {
+    Err(unsupported())
+}
+
 pub fn open_xdp_link_from_pin(_path: &Path) -> io::Result<BpfXdpLink> {
     Err(unsupported())
 }
@@ -88,6 +133,10 @@ pub fn open_xdp_link_by_id(_link_id: u32) -> io::Result<BpfXdpLink> {
 }
 
 pub fn open_xdp_program_by_id(_program_id: u32) -> io::Result<BpfXdpProgram> {
+    Err(unsupported())
+}
+
+pub fn open_cgroup_skb_program_by_id(_program_id: u32) -> io::Result<BpfCgroupSkbProgram> {
     Err(unsupported())
 }
 

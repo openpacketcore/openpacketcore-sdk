@@ -114,6 +114,121 @@ pub struct BpfXdpLinkInfo {
     pub ifindex: u32,
 }
 
+/// One exact program attachment returned by a cgroup-BPF query.
+///
+/// The legacy cgroup query ABI does not report whether a program was attached
+/// directly or through a BPF link. Callers must establish direct-attachment
+/// provenance through the installer that invokes [`attach_cgroup_skb_egress`],
+/// then correlate this program identifier with its staged pinned objects.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct BpfCgroupProgramAttachment {
+    program_id: u32,
+    program_attach_flags: u32,
+}
+
+impl BpfCgroupProgramAttachment {
+    /// Kernel program identifier.
+    #[must_use]
+    pub const fn program_id(self) -> u32 {
+        self.program_id
+    }
+
+    /// Per-program attachment flags returned by the kernel.
+    #[must_use]
+    pub const fn program_attach_flags(self) -> u32 {
+        self.program_attach_flags
+    }
+}
+
+impl std::fmt::Debug for BpfCgroupProgramAttachment {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BpfCgroupProgramAttachment")
+            .field(
+                "program_attach_flags_present",
+                &(self.program_attach_flags != 0),
+            )
+            .finish()
+    }
+}
+
+/// Bounded exact-program inventory for one cgroup attach point.
+///
+/// Program identifiers are kernel object metadata, not packet or subscriber
+/// data. The custom [`std::fmt::Debug`] implementation nevertheless reports
+/// only the count so diagnostics cannot become an accidental topology
+/// inventory.
+#[derive(Clone, PartialEq, Eq)]
+pub struct BpfCgroupProgramQuery {
+    attach_flags: u32,
+    revision: std::num::NonZeroU64,
+    attachments: Vec<BpfCgroupProgramAttachment>,
+}
+
+impl BpfCgroupProgramQuery {
+    /// Attachment flags shared by the queried cgroup program list.
+    #[must_use]
+    pub const fn attach_flags(&self) -> u32 {
+        self.attach_flags
+    }
+
+    /// Kernel attachment-set revision returned with this exact query.
+    #[must_use]
+    pub const fn revision(&self) -> std::num::NonZeroU64 {
+        self.revision
+    }
+
+    /// Exact ordered kernel attachments at the queried attach point.
+    #[must_use]
+    pub fn attachments(&self) -> &[BpfCgroupProgramAttachment] {
+        &self.attachments
+    }
+}
+
+impl std::fmt::Debug for BpfCgroupProgramQuery {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BpfCgroupProgramQuery")
+            .field("attach_flags_present", &(self.attach_flags != 0))
+            .field("revision_verified_nonzero", &true)
+            .field("program_count", &self.attachments.len())
+            .finish()
+    }
+}
+
+/// Redacted full-width kernel cookies for one exact Linux socket.
+///
+/// These values are used to bind BPF map state to one socket and network
+/// namespace. Formatting never emits either value.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct SocketKernelIdentity {
+    socket_cookie: u64,
+    netns_cookie: u64,
+}
+
+#[cfg(target_os = "linux")]
+impl SocketKernelIdentity {
+    /// Nonzero `SO_COOKIE` read from the exact descriptor.
+    #[must_use]
+    pub const fn socket_cookie(self) -> u64 {
+        self.socket_cookie
+    }
+
+    /// Nonzero `SO_NETNS_COOKIE` read from the exact descriptor.
+    #[must_use]
+    pub const fn netns_cookie(self) -> u64 {
+        self.netns_cookie
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Debug for SocketKernelIdentity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SocketKernelIdentity(<redacted>)")
+    }
+}
+
 /// Owned close-on-exec descriptor for one exact XDP BPF-link object.
 ///
 /// Keeping this value alive keeps the unpinned link attached. Dropping the
@@ -129,10 +244,67 @@ pub struct BpfXdpProgram {
     inner: platform::BpfXdpProgram,
 }
 
+/// Owned close-on-exec descriptor for one exact cgroup-skb BPF program.
+///
+/// This descriptor is used only to recover and repin a direct root attachment
+/// after bpffs pin loss. It does not create or own a managed BPF link.
+pub struct BpfCgroupSkbProgram {
+    inner: platform::BpfCgroupSkbProgram,
+}
+
+/// Stable kernel identity of one cgroup-skb BPF program.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct BpfCgroupSkbProgramInfo {
+    program_id: u32,
+    tag: [u8; 8],
+}
+
+impl BpfCgroupSkbProgramInfo {
+    /// Exact live kernel program identifier.
+    #[must_use]
+    pub const fn program_id(self) -> u32 {
+        self.program_id
+    }
+
+    /// Stable kernel program tag over translated instructions.
+    #[must_use]
+    pub const fn tag(self) -> [u8; 8] {
+        self.tag
+    }
+}
+
+impl std::fmt::Debug for BpfCgroupSkbProgramInfo {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("BpfCgroupSkbProgramInfo(<redacted>)")
+    }
+}
+
+impl std::fmt::Debug for BpfCgroupSkbProgram {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("BpfCgroupSkbProgram(<redacted>)")
+    }
+}
+
 impl BpfXdpProgram {
     /// Read the kernel program identifier from this exact descriptor.
     pub fn program_id(&self) -> io::Result<u32> {
         self.inner.program_id()
+    }
+}
+
+impl BpfCgroupSkbProgram {
+    /// Read and validate this exact live program identity.
+    pub fn info(&self) -> io::Result<BpfCgroupSkbProgramInfo> {
+        let (program_id, tag) = self.inner.info()?;
+        Ok(BpfCgroupSkbProgramInfo { program_id, tag })
+    }
+
+    /// Pin another reference to this exact directly attached program.
+    ///
+    /// The destination must not already exist. A failure does not affect the
+    /// root cgroup's direct program reference.
+    pub fn pin_duplicate(&self, path: &Path) -> io::Result<()> {
+        self.inner.pin_duplicate(path)
     }
 }
 
@@ -191,6 +363,92 @@ pub fn ifindex_by_name(name: &str) -> io::Result<u32> {
     platform::ifindex_by_name(name)
 }
 
+/// Read exact nonzero `SO_COOKIE` and `SO_NETNS_COOKIE` values.
+///
+/// # Errors
+///
+/// Returns a value-free operating-system error when either read fails, has an
+/// unexpected width, or returns zero.
+#[cfg(target_os = "linux")]
+pub fn socket_kernel_identity(
+    socket: std::os::fd::BorrowedFd<'_>,
+) -> io::Result<SocketKernelIdentity> {
+    let (socket_cookie, netns_cookie) = platform::socket_kernel_identity(socket)?;
+    if socket_cookie == 0 || netns_cookie == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "socket_kernel_identity_zero",
+        ));
+    }
+    Ok(SocketKernelIdentity {
+        socket_cookie,
+        netns_cookie,
+    })
+}
+
+/// Query the locally attached cgroup-v2 INET-egress programs.
+///
+/// The inventory is hard-bounded to the kernel cgroup-BPF limit of 64
+/// programs. A larger or internally inconsistent result fails closed instead
+/// of returning a truncated list. The returned nonzero revision is the
+/// compare-and-swap token for [`attach_cgroup_skb_egress`].
+///
+/// # Errors
+///
+/// Returns a value-free operating-system error when the descriptor is not a
+/// cgroup-v2 directory, the caller lacks BPF authority, the query is
+/// unsupported, or the kernel reports an invalid or over-capacity inventory.
+#[cfg(target_os = "linux")]
+pub fn query_cgroup_skb_egress(
+    cgroup: std::os::fd::BorrowedFd<'_>,
+) -> io::Result<BpfCgroupProgramQuery> {
+    let (attach_flags, revision, attachments) = platform::query_cgroup_skb_egress(cgroup)?;
+    Ok(BpfCgroupProgramQuery {
+        attach_flags,
+        revision,
+        attachments,
+    })
+}
+
+/// Directly attach one cgroup-skb program to cgroup-v2 INET egress.
+///
+/// This deliberately uses `BPF_PROG_ATTACH` with `BPF_F_ALLOW_MULTI`, not a
+/// BPF link. The cgroup therefore owns a program reference independently of
+/// process descriptors and bpffs pins. `expected_revision` must come from the
+/// exact immediately preceding root query; a concurrent mutation makes the
+/// kernel reject the attach with `ESTALE`. Callers must query and read back
+/// the exact root inventory after attachment.
+///
+/// # Errors
+///
+/// Returns a value-free operating-system error on an invalid descriptor,
+/// incompatible existing attach mode, missing BPF authority, or kernel
+/// rejection.
+#[cfg(target_os = "linux")]
+pub fn attach_cgroup_skb_egress(
+    cgroup: std::os::fd::BorrowedFd<'_>,
+    program: std::os::fd::BorrowedFd<'_>,
+    expected_revision: std::num::NonZeroU64,
+) -> io::Result<()> {
+    platform::attach_cgroup_skb_egress(cgroup, program, expected_revision)
+}
+
+/// Freeze a BPF map against every subsequent syscall-side mutation.
+///
+/// BPF programs that already reference the map retain their verifier-approved
+/// mutation rights. This distinction lets an unattached control program own
+/// authorization transitions while preventing direct userspace writes.
+///
+/// # Errors
+///
+/// Returns a value-free operating-system error when the descriptor is not a
+/// freezable map, the map was already frozen, or the caller lacks BPF
+/// authority.
+#[cfg(target_os = "linux")]
+pub fn freeze_bpf_map(map: std::os::fd::BorrowedFd<'_>) -> io::Result<()> {
+    platform::freeze_bpf_map(map)
+}
+
 /// Open and validate one pinned XDP BPF link as a retained exact descriptor.
 ///
 /// `path` must be absolute and must not contain a NUL byte.
@@ -240,6 +498,19 @@ fn validate_xdp_link_id(link_id: u32) -> io::Result<()> {
 /// Linux gates this operation on effective `CAP_SYS_ADMIN`.
 pub fn open_xdp_program_by_id(program_id: u32) -> io::Result<BpfXdpProgram> {
     platform::open_xdp_program_by_id(program_id).map(|inner| BpfXdpProgram { inner })
+}
+
+/// Open one exact cgroup-skb program by the ID returned from the root query.
+///
+/// This recovery API obtains a plain program descriptor with
+/// `BPF_PROG_GET_FD_BY_ID`; it never creates a BPF link or attachment.
+///
+/// # Errors
+///
+/// Returns a value-free operating-system error for zero/missing IDs, missing
+/// BPF authority, or an object whose type or read-back ID is not exact.
+pub fn open_cgroup_skb_program_by_id(program_id: u32) -> io::Result<BpfCgroupSkbProgram> {
+    platform::open_cgroup_skb_program_by_id(program_id).map(|inner| BpfCgroupSkbProgram { inner })
 }
 
 /// Send one raw netlink message buffer to the kernel.
@@ -570,6 +841,47 @@ mod tests {
         assert_eq!(GTPA_FAMILY, 13);
     }
 
+    #[test]
+    fn cgroup_program_query_debug_is_value_free() {
+        let query = BpfCgroupProgramQuery {
+            attach_flags: 2,
+            revision: std::num::NonZeroU64::new(29).expect("nonzero fixture"),
+            attachments: vec![
+                BpfCgroupProgramAttachment {
+                    program_id: 17,
+                    program_attach_flags: 31,
+                },
+                BpfCgroupProgramAttachment {
+                    program_id: 23,
+                    program_attach_flags: 43,
+                },
+            ],
+        };
+
+        let debug = format!("{query:?}");
+        assert!(debug.contains("program_count: 2"));
+        assert!(!debug.contains("17"));
+        assert!(!debug.contains("23"));
+        assert!(!debug.contains("29"));
+        assert!(!debug.contains("31"));
+        assert!(!debug.contains("37"));
+        assert!(!debug.contains("41"));
+        assert!(!debug.contains("43"));
+    }
+
+    #[test]
+    fn cgroup_program_info_debug_is_value_free() {
+        let info = BpfCgroupSkbProgramInfo {
+            program_id: 17,
+            tag: [23, 29, 31, 37, 41, 43, 47, 53],
+        };
+
+        let debug = format!("{info:?}");
+        for value in ["17", "23", "29", "31", "37", "41", "43", "47", "53"] {
+            assert!(!debug.contains(value));
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn bpf_link_open_rejects_invalid_inputs_before_any_syscall() {
@@ -644,5 +956,25 @@ mod udp_socket_borrow_tests {
         // Borrowing must not close or move the descriptor.
         assert_eq!(socket.as_fd().as_raw_fd(), socket.raw_fd());
         assert!(socket.raw_fd() >= 0);
+    }
+}
+
+#[cfg(all(test, target_os = "linux", not(opc_linux_gtpu_sys_force_unsupported)))]
+mod socket_kernel_identity_tests {
+    use std::{os::fd::AsFd, os::unix::net::UnixDatagram};
+
+    use super::socket_kernel_identity;
+
+    #[test]
+    fn exact_socket_cookies_are_nonzero_and_redacted() {
+        let (left, right) = UnixDatagram::pair().expect("fixture socket pair");
+        let left = socket_kernel_identity(left.as_fd()).expect("left identity");
+        let right = socket_kernel_identity(right.as_fd()).expect("right identity");
+
+        assert_ne!(left.socket_cookie(), 0);
+        assert_ne!(right.socket_cookie(), 0);
+        assert_ne!(left.socket_cookie(), right.socket_cookie());
+        assert_eq!(left.netns_cookie(), right.netns_cookie());
+        assert_eq!(format!("{left:?}"), "SocketKernelIdentity(<redacted>)");
     }
 }

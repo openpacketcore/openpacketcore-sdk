@@ -22,7 +22,7 @@ const MAX_BIND_DEVICE_BYTES: usize = 15;
 /// The struct is `#[non_exhaustive]` so future socket options can be added
 /// without breaking consumers: build it with [`UdpSocketOptions::default`] and
 /// set only the options you need.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct UdpSocketOptions {
     /// Linux or Android network device name the socket is scoped to with
@@ -40,6 +40,15 @@ impl UdpSocketOptions {
     pub fn with_bind_device(mut self, device: impl Into<String>) -> Self {
         self.bind_device = Some(device.into());
         self
+    }
+}
+
+impl fmt::Debug for UdpSocketOptions {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("UdpSocketOptions")
+            .field("bind_device_present", &self.bind_device.is_some())
+            .finish()
     }
 }
 
@@ -539,7 +548,7 @@ mod platform {
     };
 
     use nix::sys::socket::{
-        bind, recvmsg, sendmsg, setsockopt, socket,
+        bind, getsockopt, recvmsg, sendmsg, setsockopt, socket,
         sockopt::{BindToDevice, Ipv4PacketInfo, Ipv6RecvPacketInfo},
         AddressFamily, ControlMessage, ControlMessageOwned, MsgFlags, SockFlag, SockType,
         SockaddrIn, SockaddrIn6, SockaddrStorage,
@@ -564,7 +573,14 @@ mod platform {
         };
         let fd = socket(family, SockType::Datagram, SockFlag::SOCK_CLOEXEC, None)
             .map_err(io::Error::from)?;
-        setsockopt(&fd, BindToDevice, &OsString::from(device)).map_err(io::Error::from)?;
+        let expected = OsString::from(device);
+        setsockopt(&fd, BindToDevice, &expected).map_err(io::Error::from)?;
+        if getsockopt(&fd, BindToDevice).map_err(io::Error::from)? != expected {
+            return Err(udp_error(
+                io::ErrorKind::Other,
+                "udp_bind_device_readback_mismatch",
+            ));
+        }
         match bind_addr {
             SocketAddr::V4(addr) => bind(fd.as_raw_fd(), &SockaddrIn::from(addr)),
             SocketAddr::V6(addr) => bind(fd.as_raw_fd(), &SockaddrIn6::from(addr)),
