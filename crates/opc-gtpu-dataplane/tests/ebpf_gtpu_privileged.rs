@@ -873,6 +873,18 @@ fn grouped_device_id() -> GtpuSessionDeviceId {
     GtpuSessionDeviceId::new([0x34; 16]).expect("nonzero grouped device ID")
 }
 
+fn grouped_pin_directory(pin_root: &std::path::Path, device_id: GtpuSessionDeviceId) -> PathBuf {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let bytes = device_id.to_bytes();
+    let mut namespace = String::with_capacity(3 + bytes.len() * 2);
+    namespace.push_str("v6-");
+    for byte in bytes {
+        namespace.push(char::from(HEX[usize::from(byte >> 4)]));
+        namespace.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    pin_root.join(namespace)
+}
+
 fn grouped_group_id() -> GtpuSessionGroupId {
     GtpuSessionGroupId::new([0x44; 16]).expect("nonzero grouped session ID")
 }
@@ -7942,21 +7954,16 @@ async fn ebpf_gtpu_grouped_attach_refuses_partial_current_hook_graph_before_mate
         bpffs_pin_root: net.pin_root.clone(),
         ..EbpfGtpuDataplaneBackendConfig::default()
     };
-    let pin_dir = net.pin_root.join("s2bu");
+    let device_id = grouped_device_id();
+    let pin_dir = grouped_pin_directory(&net.pin_root, device_id);
 
-    // Both current hooks own this complete pin namespace before the induced
-    // loss: populated FAR and PDR, a non-zero config slot, and both hooks
-    // attached to these exact map IDs.
+    // Both current hooks own this complete grouped pin namespace before the
+    // induced loss. Reusing the same stable device ID below is essential:
+    // grouped attachment is keyed by that ID, not by the interface name.
     let owner = EbpfGtpuDataplaneBackend::with_config(config.clone());
-    let mut create = CreateGtpDeviceRequest::new("s2bu");
-    create.bind_address = IpAddr::V4(EPDG_S2BU_IP);
-    let device = owner.create_device(create).await?;
-    assert_eq!(
-        owner
-            .install_pdp_context_classified(session_context(device.ifindex))
-            .await?,
-        PdpContextInstallOutcome::Installed
-    );
+    owner
+        .create_device_with_endpoints(grouped_device_request(grouped_mtu_policy()))
+        .await?;
 
     // Remove every grouped pin that participates in the current programs.
     // This leaves each live hook's named map graph incomplete. The

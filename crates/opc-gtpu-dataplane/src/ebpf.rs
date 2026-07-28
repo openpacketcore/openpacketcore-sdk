@@ -7182,6 +7182,12 @@ mod aya_runtime {
             Ok(ids)
         }
 
+        /// Resolve the map IDs at one program's exact required pin paths.
+        ///
+        /// Kernel map names and ABI shape are deliberately left to the
+        /// following untyped layout classifier. A permutation of two pins from
+        /// the same live program graph is still proven authority, but must be
+        /// diagnosed as `ebpf_pin_map_abi` before any typed map binding.
         fn required_named_program_map_ids(
             pin_dir: &Path,
             names: &[&str],
@@ -7193,7 +7199,7 @@ mod aya_runtime {
                     Ok(metadata)
                         if !metadata.file_type().is_symlink() && metadata.file_type().is_file() =>
                     {
-                        present.push((name, path));
+                        present.push(path);
                     }
                     Ok(_) => return Err(state_indeterminate("ebpf_generation_identity")),
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -7208,12 +7214,9 @@ mod aya_runtime {
             }
 
             let mut ids = Vec::with_capacity(names.len());
-            for (name, path) in present {
+            for path in present {
                 let info = MapInfo::from_pin(&path)
                     .map_err(|_| state_indeterminate("ebpf_generation_identity"))?;
-                if info.name() != kernel_program_name(name) {
-                    return Err(state_indeterminate("ebpf_generation_identity"));
-                }
                 ids.push(info.id());
             }
             ids.sort_unstable();
