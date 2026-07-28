@@ -6,9 +6,10 @@ The crate is currently source-build-only because its `opc-persist` dependency
 remains behind the repository-wide issue #143 publication gate. That packaging
 status does not weaken the runtime durability contract described below.
 
-The adapter synchronously acknowledges an event only after the reference
-`opc-persist` backend commits the event, retention update, and authenticated
-anchor in one durable transaction. Opening the sink verifies the complete
+The adapter acknowledges both `record` and its native `record_async` override
+only after the reference `opc-persist` backend commits the event, retention
+update, and authenticated anchor in one durable transaction. The async path
+does not park its executor thread. Opening the sink verifies the complete
 retained chain and fails closed on unsafe/ephemeral storage, a wrong audit key,
 or the first broken chain link.
 
@@ -29,7 +30,7 @@ let sink = DurableAuditSink::open(
 .await?;
 
 // Management servers use `&sink` or `Arc<dyn AuditSink>` and fail closed when
-// `record` does not durably acknowledge the event.
+// `record` or `record_async` does not durably acknowledge the event.
 let _sink: &dyn AuditSink = &sink;
 # Ok(())
 # }
@@ -66,12 +67,21 @@ the exceptional orphan-child check, while normal single-writer appends retain
 their constant-work boundary.
 
 The worker admits at most 64 queued operations. A full queue fails immediately,
-and an admitted operation must acknowledge within five seconds. An
+and an admitted sync or async operation must acknowledge within five seconds. An
 acknowledgement timeout is deliberately an outcome-unknown failure: the atomic
 append may commit later, but the sink never reports success without the durable
-acknowledgement. Shutdown also waits at most five seconds; a stalled worker is
+acknowledgement. Dropping an async caller after admission cannot retract the
+queued append and likewise leaves its outcome unknown. Verification, page
+queries, and final sink drop are bounded synchronous APIs. Shutdown waits at
+most five seconds; a stalled worker is
 detached and counted by `durable_audit_worker_detachments()` rather than hanging
 process shutdown.
+
+The default-disabled `testing` Cargo feature exposes deterministic timeout and
+worker-hold seams. Never enable it in production: it intentionally provides a
+compile-time denial-of-service hook for adversarial integration tests. All
+caller-selected testing bounds are clamped to 30 seconds, and a forgotten hold
+guard self-releases within that bound.
 
 The authenticated local anchor detects record alteration, deletion, reordering,
 and an anchor replay that disagrees with the retained rows. It cannot detect a

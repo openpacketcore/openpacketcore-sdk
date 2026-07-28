@@ -104,6 +104,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per-deployment salt.
 
 ### Changed
+- **Native async management-audit acknowledgement — `opc-mgmt-audit`,
+  `opc-mgmt-audit-store`, `opc-gnmi-server`, and `opc-netconf-server`:**
+  `AuditSink` now has an object-safe, source-compatible `record_async` method
+  with explicit first-poll admission and cancellation semantics; `Arc<T>`
+  forwards both methods. `DurableAuditSink` overrides it with a bounded
+  per-request acknowledgement channel and no executor parking. gNMI and
+  NETCONF async production paths now await that method, while NETCONF
+  audit-plus-registry kill/lock/unlock decisions run under one fail-fast gate
+  owned by the shared `SessionRegistry` and survive outer-RPC cancellation.
+  Only registry-aware async NETCONF session/TLS/SSH runners add `A: 'static`;
+  the server type, constructor, registry-free helpers, and synchronous APIs
+  retain borrowed-sink compatibility. The audit-store `testing` feature is
+  default-disabled, must never be enabled in production, and exposes only
+  bounded adversarial worker/time-out seams.
 - **Management audit events now carry authenticated UTC time — `opc-mgmt-audit`,
   `opc-mgmt-audit-store`, and `opc-persist` (breaking public/event and durable
   format change):** `AuditEvent` now includes `AuditInstant`, which records

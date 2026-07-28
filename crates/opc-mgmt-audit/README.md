@@ -11,7 +11,8 @@ failed, and non-config management operations.
 Public API:
 
 - `AuditEvent`, the structured event record.
-- `AuditSink`, the synchronous fail-closed sink trait.
+- `AuditSink`, the fail-closed sink trait with synchronous and asynchronous
+  acknowledgement methods.
 - `TracingAuditSink`, a best-effort sink that emits events through `tracing`.
 - `AuditInstant` and `AuditTimeSource`, the UTC wall-clock observation,
   process-local monotonic sequence, and source attribution.
@@ -33,6 +34,14 @@ let sink: std::sync::Arc<dyn AuditSink> = std::sync::Arc::new(TracingAuditSink);
 `Arc<T>` implements `AuditSink` whenever `T` does, including
 `Arc<dyn AuditSink>`. One sink allocation can therefore be cloned directly
 into both the gNMI and NETCONF server cores.
+
+`AuditSink::record_async` is source-compatible with legacy sinks: its default
+calls `record` and may block the polling executor thread. Production sinks that
+wait for I/O must provide a native override. An unpolled future need not record
+anything; after the first poll admits an immutable event to
+cancellation-independent processing, dropping the future cannot retract it and
+an error, timeout, or caller cancellation can leave the persistence outcome
+unknown.
 
 Audit schema paths are predicate-free and reason codes are bounded
 machine-readable strings. Metric-label helpers sanitize unknown values through

@@ -9,7 +9,7 @@ use crate::GnmiError;
 /// Records one gNMI audit event, mapping sink failures to a generic server
 /// error. Callers must preserve the original client-facing error when audit
 /// succeeds.
-pub(crate) fn record_audit(
+pub(crate) async fn record_audit(
     audit: &dyn AuditSink,
     request_id: RequestId,
     principal: &TrustedPrincipal,
@@ -18,7 +18,7 @@ pub(crate) fn record_audit(
     paths: Vec<SchemaNodePath>,
 ) -> Result<(), GnmiError> {
     audit
-        .record(
+        .record_async(
             &opc_mgmt_audit::AuditEvent::new(
                 request_id,
                 principal,
@@ -28,6 +28,7 @@ pub(crate) fn record_audit(
             )
             .with_paths(paths),
         )
+        .await
         .map_err(|_| GnmiError::schema("gNMI audit sink failed"))
 }
 

@@ -129,7 +129,7 @@ where
     C: OpcConfig,
     B: NetconfConfigBinding<C>,
     P: PolicySource,
-    A: AuditSink,
+    A: AuditSink + 'static,
     IO: AsyncRead + AsyncWrite + Unpin,
 {
     let principal = principal_from_tls_stream(stream, identity_rx)?;
@@ -150,7 +150,7 @@ where
     C: OpcConfig,
     B: NetconfConfigBinding<C>,
     P: PolicySource,
-    A: AuditSink,
+    A: AuditSink + 'static,
     IO: AsyncRead + AsyncWrite + Unpin,
 {
     let principal = principal_from_tls_stream(stream, identity_rx)?;
@@ -177,7 +177,7 @@ where
     C: OpcConfig,
     B: NetconfConfigBinding<C>,
     P: PolicySource,
-    A: AuditSink,
+    A: AuditSink + 'static,
     IO: AsyncRead + AsyncWrite + Unpin,
 {
     validate_ssh_session_context(server, principal)?;
@@ -198,7 +198,7 @@ where
     C: OpcConfig,
     B: NetconfConfigBinding<C>,
     P: PolicySource,
-    A: AuditSink,
+    A: AuditSink + 'static,
     IO: AsyncRead + AsyncWrite + Unpin,
 {
     validate_ssh_session_context(server, principal)?;

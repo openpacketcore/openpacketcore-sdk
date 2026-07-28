@@ -18,6 +18,7 @@ use crate::filter::{get_paths_with_discovery, netconf_monitoring_registry, yang_
 use crate::metrics::{
     record_nacm_denials, record_rpc_error, record_rpc_success, NetconfNacmAction, NetconfOperation,
 };
+use crate::operations::{poll_ready, record_audit, AuditMode};
 use crate::xml::{GetRequest, WithDefaultsMode};
 
 /// Shared context for handling one `<get>` request.
@@ -58,6 +59,40 @@ where
     P: PolicySource,
     A: AuditSink,
 {
+    poll_ready(handle_get_inner::<C, B, P, A>(
+        binding,
+        ctx,
+        request,
+        AuditMode::Synchronous,
+    ))
+}
+
+pub(crate) async fn handle_get_async<C, B, P, A>(
+    binding: &B,
+    ctx: GetContext<'_, P, A>,
+    request: &GetRequest,
+) -> String
+where
+    C: OpcConfig,
+    B: NetconfConfigBinding<C>,
+    P: PolicySource,
+    A: AuditSink,
+{
+    handle_get_inner::<C, B, P, A>(binding, ctx, request, AuditMode::Asynchronous).await
+}
+
+async fn handle_get_inner<C, B, P, A>(
+    binding: &B,
+    ctx: GetContext<'_, P, A>,
+    request: &GetRequest,
+    audit_mode: AuditMode,
+) -> String
+where
+    C: OpcConfig,
+    B: NetconfConfigBinding<C>,
+    P: PolicySource,
+    A: AuditSink,
+{
     let registry = binding.schema_registry();
     let yang_library_capability = binding.yang_library_capability();
     let monitoring_capability = binding.netconf_monitoring_capability();
@@ -71,6 +106,7 @@ where
         }
         Some(_) => {
             if audit_failure(
+                audit_mode,
                 ctx.audit,
                 ctx.request_id,
                 ctx.principal,
@@ -78,6 +114,7 @@ where
                 "operation-not-supported",
                 Vec::new(),
             )
+            .await
             .is_err()
             {
                 record_rpc_error(
@@ -113,6 +150,7 @@ where
             let rpc_error = err.rpc_error();
             let error_tag = rpc_error.classification.tag;
             if audit_failure(
+                audit_mode,
                 ctx.audit,
                 ctx.request_id,
                 ctx.principal,
@@ -120,6 +158,7 @@ where
                 err.audit_reason(),
                 Vec::new(),
             )
+            .await
             .is_err()
             {
                 record_rpc_error(
@@ -145,6 +184,7 @@ where
         .saturating_add(selected_paths.netconf_monitoring_paths.len());
     if ctx.limits.check_paths(selected_path_count).is_err() {
         if audit_failure(
+            audit_mode,
             ctx.audit,
             ctx.request_id,
             ctx.principal,
@@ -152,6 +192,7 @@ where
             "too-big",
             Vec::new(),
         )
+        .await
         .is_err()
         {
             record_rpc_error(
@@ -179,12 +220,14 @@ where
         && selected_paths.netconf_monitoring_paths.is_empty()
     {
         if audit_success(
+            audit_mode,
             ctx.audit,
             ctx.request_id,
             ctx.principal,
             ctx.transport,
             Vec::new(),
         )
+        .await
         .is_err()
         {
             record_rpc_error(
@@ -207,6 +250,7 @@ where
             Ok(decisions) => decisions,
             Err(_) => {
                 if audit_failure(
+                    audit_mode,
                     ctx.audit,
                     ctx.request_id,
                     ctx.principal,
@@ -214,6 +258,7 @@ where
                     "resource-denied",
                     schema_paths(&selected_paths.data_paths),
                 )
+                .await
                 .is_err()
                 {
                     record_rpc_error(
@@ -256,6 +301,7 @@ where
         Ok(decisions) => decisions,
         Err(()) => {
             if audit_failure(
+                audit_mode,
                 ctx.audit,
                 ctx.request_id,
                 ctx.principal,
@@ -263,6 +309,7 @@ where
                 "resource-denied",
                 schema_paths(&selected_paths.yang_library_paths),
             )
+            .await
             .is_err()
             {
                 record_rpc_error(
@@ -299,6 +346,7 @@ where
         Ok(decisions) => decisions,
         Err(()) => {
             if audit_failure(
+                audit_mode,
                 ctx.audit,
                 ctx.request_id,
                 ctx.principal,
@@ -306,6 +354,7 @@ where
                 "resource-denied",
                 schema_paths(&selected_paths.netconf_monitoring_paths),
             )
+            .await
             .is_err()
             {
                 record_rpc_error(
@@ -367,6 +416,7 @@ where
         Ok(response) => response,
         Err(()) => {
             if audit_failure(
+                audit_mode,
                 ctx.audit,
                 ctx.request_id,
                 ctx.principal,
@@ -374,6 +424,7 @@ where
                 "operation-failed",
                 schema_paths(&allowed_paths),
             )
+            .await
             .is_err()
             {
                 record_rpc_error(
@@ -441,6 +492,7 @@ where
     }) {
         Ok(data_xml) => {
             if audit_success(
+                audit_mode,
                 ctx.audit,
                 ctx.request_id,
                 ctx.principal,
@@ -451,6 +503,7 @@ where
                     &allowed_netconf_monitoring_paths,
                 ),
             )
+            .await
             .is_err()
             {
                 record_rpc_error(
@@ -466,6 +519,7 @@ where
         }
         Err(_) => {
             if audit_failure(
+                audit_mode,
                 ctx.audit,
                 ctx.request_id,
                 ctx.principal,
@@ -477,6 +531,7 @@ where
                     &allowed_netconf_monitoring_paths,
                 ),
             )
+            .await
             .is_err()
             {
                 record_rpc_error(
@@ -652,14 +707,17 @@ fn has_data_bearing_config_path(
     })
 }
 
-fn audit_success<A: AuditSink>(
+async fn audit_success<A: AuditSink>(
+    mode: AuditMode,
     audit: &A,
     request_id: RequestId,
     principal: &TrustedPrincipal,
     transport: TransportType,
     paths: Vec<SchemaNodePath>,
 ) -> Result<(), AuditError> {
-    audit.record(
+    record_audit(
+        mode,
+        audit,
         &AuditEvent::new(
             request_id,
             principal,
@@ -669,13 +727,15 @@ fn audit_success<A: AuditSink>(
         )
         .with_paths(paths),
     )
+    .await
 }
 
 #[expect(
     clippy::expect_used,
     reason = "static NETCONF audit reason codes are valid by construction"
 )]
-fn audit_failure<A: AuditSink>(
+async fn audit_failure<A: AuditSink>(
+    mode: AuditMode,
     audit: &A,
     request_id: RequestId,
     principal: &TrustedPrincipal,
@@ -683,7 +743,9 @@ fn audit_failure<A: AuditSink>(
     reason: &'static str,
     paths: Vec<SchemaNodePath>,
 ) -> Result<(), AuditError> {
-    audit.record(
+    record_audit(
+        mode,
+        audit,
         &AuditEvent::new(
             request_id,
             principal,
@@ -693,6 +755,7 @@ fn audit_failure<A: AuditSink>(
         )
         .with_paths(paths),
     )
+    .await
 }
 
 #[expect(

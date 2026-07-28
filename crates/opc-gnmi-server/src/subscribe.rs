@@ -56,7 +56,8 @@ where
                 &principal,
                 outcome_for_error(&err),
                 Vec::new(),
-            )?;
+            )
+            .await?;
             return Err(err);
         }
         Err(_) => {
@@ -67,7 +68,8 @@ where
                 &principal,
                 outcome_for_error(&err),
                 Vec::new(),
-            )?;
+            )
+            .await?;
             return Err(err);
         }
     };
@@ -82,7 +84,8 @@ where
             &principal,
             outcome_for_error(&err),
             Vec::new(),
-        )?;
+        )
+        .await?;
         return Err(err);
     }
     let plan = match SubscribePlan::from_first_request(server.as_ref(), first) {
@@ -94,7 +97,8 @@ where
                 &principal,
                 outcome_for_error(&err),
                 Vec::new(),
-            )?;
+            )
+            .await?;
             return Err(err);
         }
     };
@@ -104,7 +108,8 @@ where
         &principal,
         AuditOutcome::Success,
         plan.audit_paths.clone(),
-    )?;
+    )
+    .await?;
     let _guard = active_stream(plan.metric_mode());
 
     match plan.mode {
@@ -170,7 +175,8 @@ where
                 &principal,
                 outcome_for_error(&err),
                 plan.audit_paths.clone(),
-            )?;
+            )
+            .await?;
             return Err(err);
         }
         match request.request {
@@ -202,7 +208,8 @@ where
                     &principal,
                     outcome_for_error(&err),
                     plan.audit_paths.clone(),
-                )?;
+                )
+                .await?;
                 return Err(err);
             }
             None => {
@@ -213,7 +220,8 @@ where
                     &principal,
                     outcome_for_error(&err),
                     plan.audit_paths.clone(),
-                )?;
+                )
+                .await?;
                 return Err(err);
             }
         }
@@ -303,7 +311,8 @@ where
                         &principal,
                         outcome_for_error(&err),
                         plan.audit_paths.clone(),
-                    )?;
+                    )
+                    .await?;
                     return Err(err);
                 }
                 match request.request {
@@ -315,7 +324,8 @@ where
                             &principal,
                             outcome_for_error(&err),
                             plan.audit_paths.clone(),
-                        )?;
+                        )
+                        .await?;
                         return Err(err);
                     }
                     Some(gnmi::subscribe_request::Request::Subscribe(_)) => {
@@ -326,7 +336,8 @@ where
                             &principal,
                             outcome_for_error(&err),
                             plan.audit_paths.clone(),
-                        )?;
+                        )
+                        .await?;
                         return Err(err);
                     }
                     None => {
@@ -337,7 +348,8 @@ where
                             &principal,
                             outcome_for_error(&err),
                             plan.audit_paths.clone(),
-                        )?;
+                        )
+                        .await?;
                         return Err(err);
                     }
                 }
@@ -536,7 +548,8 @@ where
             principal,
             AuditOutcome::denied_code(opc_mgmt_audit::AuditReasonCode::ACCESS_DENIED),
             schema_paths_for_schema([node.path])?,
-        )?;
+        )
+        .await?;
         return Ok(true);
     }
 
@@ -576,7 +589,7 @@ where
     Ok(true)
 }
 
-fn audit_subscribe_result<C, B>(
+async fn audit_subscribe_result<C, B>(
     server: &GnmiServer<C, B>,
     request_id: RequestId,
     principal: &TrustedPrincipal,
@@ -595,6 +608,7 @@ where
         outcome,
         paths,
     )
+    .await
 }
 
 async fn send_sync(
