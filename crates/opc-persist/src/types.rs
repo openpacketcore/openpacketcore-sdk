@@ -511,17 +511,20 @@ impl fmt::Debug for AuditKey {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub(crate) enum AuditChainDomain {
-    /// One management-plane audit event under the v1 durable schema.
-    ManagementEventV1,
-    /// The v1 management-plane retention/high-water anchor.
+    /// Legacy v1 management-plane retention/high-water anchor domain.
     ManagementAnchorV1,
+    /// One management-plane audit event under the v2 durable schema.
+    ManagementEventV2,
+    /// The v2 management-plane retention/high-water anchor.
+    ManagementAnchorV2,
 }
 
 impl AuditChainDomain {
     const fn as_bytes(self) -> &'static [u8] {
         match self {
-            Self::ManagementEventV1 => b"openpacketcore/management-audit/event/v1\0",
             Self::ManagementAnchorV1 => b"openpacketcore/management-audit/anchor/v1\0",
+            Self::ManagementEventV2 => b"openpacketcore/management-audit/event/v2\0",
+            Self::ManagementAnchorV2 => b"openpacketcore/management-audit/anchor/v2\0",
         }
     }
 }
@@ -537,6 +540,8 @@ impl AuditChainDomain {
 pub(crate) enum AuditChainField<'a> {
     /// Unsigned 64-bit integer in network byte order.
     U64(u64),
+    /// Signed 64-bit integer in network byte order.
+    I64(i64),
     /// Length-prefixed arbitrary bytes.
     Bytes(&'a [u8]),
     /// Length-prefixed UTF-8 text.
@@ -551,6 +556,7 @@ impl fmt::Debug for AuditChainField<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::U64(value) => formatter.debug_tuple("U64").field(value).finish(),
+            Self::I64(value) => formatter.debug_tuple("I64").field(value).finish(),
             Self::Bytes(value) => formatter
                 .debug_struct("Bytes")
                 .field("byte_len", &value.len())
@@ -594,6 +600,7 @@ pub(crate) fn calculate_audit_chain_hmac(
     for field in fields {
         let field_len = match field {
             AuditChainField::U64(_) => 1 + std::mem::size_of::<u64>(),
+            AuditChainField::I64(_) => 1 + std::mem::size_of::<i64>(),
             AuditChainField::Bytes(bytes) => checked_variable_audit_field_len(bytes.len(), false)?,
             AuditChainField::Text(text) => checked_variable_audit_field_len(text.len(), false)?,
             AuditChainField::OptionalText(Some(text)) => {
@@ -619,6 +626,10 @@ pub(crate) fn calculate_audit_chain_hmac(
         match field {
             AuditChainField::U64(value) => {
                 input.push(1);
+                input.extend_from_slice(&value.to_be_bytes());
+            }
+            AuditChainField::I64(value) => {
+                input.push(6);
                 input.extend_from_slice(&value.to_be_bytes());
             }
             AuditChainField::Bytes(bytes) => {

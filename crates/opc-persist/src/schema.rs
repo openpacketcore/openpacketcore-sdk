@@ -17,7 +17,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current schema version. Bump this and add a migration step to evolve the schema.
-pub const SCHEMA_VERSION: &str = "1.10.0";
+pub const SCHEMA_VERSION: &str = "1.11.0";
 /// Cap SQLite lock waits on async runtime workers.
 pub const SQLITE_BUSY_TIMEOUT_MS: u32 = 100;
 
@@ -106,6 +106,10 @@ pub fn initialize_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
             tx_id TEXT NULL CHECK(tx_id IS NULL OR length(CAST(tx_id AS BLOB)) BETWEEN 1 AND 128),
             previous_hash BLOB NOT NULL CHECK(length(previous_hash) = 32),
             entry_hmac BLOB NOT NULL CHECK(length(entry_hmac) = 32),
+            occurred_at_utc_seconds INTEGER NOT NULL,
+            occurred_at_nanosecond INTEGER NOT NULL CHECK(occurred_at_nanosecond BETWEEN 0 AND 999999999),
+            occurred_at_monotonic_sequence INTEGER NOT NULL CHECK(occurred_at_monotonic_sequence BETWEEN 0 AND 9223372036854775807),
+            occurred_at_time_source TEXT NOT NULL CHECK(occurred_at_time_source IN ('node-clock', 'synchronised-node-clock')),
             CHECK(
                 (outcome IN ('intent', 'success') AND reason IS NULL)
                 OR (outcome IN ('denied', 'failed') AND reason IS NOT NULL)
@@ -121,7 +125,7 @@ pub fn initialize_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
 
         CREATE TABLE IF NOT EXISTS management_audit_anchor (
             id INTEGER PRIMARY KEY CHECK(id = 1),
-            format_version INTEGER NOT NULL CHECK(format_version = 1),
+            format_version INTEGER NOT NULL CHECK(format_version IN (1, 2)),
             retention_max_records INTEGER NOT NULL CHECK(retention_max_records BETWEEN 1 AND 1000000),
             key_epoch INTEGER NOT NULL CHECK(key_epoch > 0),
             total_count INTEGER NOT NULL CHECK(total_count >= 0),
@@ -585,6 +589,75 @@ pub fn run_migrations(conn: &Connection, from_version: &str) -> Result<(), rusql
             "#,
         )?;
         current = "1.10.0".to_string();
+    }
+    if current == "1.10.0" {
+        // Retain v1 rows exactly as written: NULL means the timestamp did not
+        // exist in that authenticated format. V2 construction and append paths
+        // always supply all four typed values; fresh schemas additionally
+        // enforce NOT NULL at the SQLite boundary.
+        let tx = conn.unchecked_transaction()?;
+        if !table_has_column(&tx, "management_audit_event", "occurred_at_utc_seconds")? {
+            tx.execute(
+                "ALTER TABLE management_audit_event ADD COLUMN occurred_at_utc_seconds INTEGER NULL",
+                [],
+            )?;
+        }
+        if !table_has_column(&tx, "management_audit_event", "occurred_at_nanosecond")? {
+            tx.execute(
+                "ALTER TABLE management_audit_event ADD COLUMN occurred_at_nanosecond INTEGER NULL CHECK(occurred_at_nanosecond IS NULL OR occurred_at_nanosecond BETWEEN 0 AND 999999999)",
+                [],
+            )?;
+        }
+        if !table_has_column(
+            &tx,
+            "management_audit_event",
+            "occurred_at_monotonic_sequence",
+        )? {
+            tx.execute(
+                "ALTER TABLE management_audit_event ADD COLUMN occurred_at_monotonic_sequence INTEGER NULL CHECK(occurred_at_monotonic_sequence IS NULL OR occurred_at_monotonic_sequence BETWEEN 0 AND 9223372036854775807)",
+                [],
+            )?;
+        }
+        if !table_has_column(&tx, "management_audit_event", "occurred_at_time_source")? {
+            tx.execute(
+                "ALTER TABLE management_audit_event ADD COLUMN occurred_at_time_source TEXT NULL CHECK(occurred_at_time_source IS NULL OR occurred_at_time_source IN ('node-clock', 'synchronised-node-clock'))",
+                [],
+            )?;
+        }
+        // Rebuild the format constraint without rewriting an authenticated v1
+        // anchor. Keeping version 1 representable lets the management-audit
+        // layer return its explicit compatibility error before any v2 append.
+        tx.execute_batch(
+            r#"
+            ALTER TABLE management_audit_anchor RENAME TO management_audit_anchor_before_v2;
+            CREATE TABLE management_audit_anchor (
+                id INTEGER PRIMARY KEY CHECK(id = 1),
+                format_version INTEGER NOT NULL CHECK(format_version IN (1, 2)),
+                retention_max_records INTEGER NOT NULL CHECK(retention_max_records BETWEEN 1 AND 1000000),
+                key_epoch INTEGER NOT NULL CHECK(key_epoch > 0),
+                total_count INTEGER NOT NULL CHECK(total_count >= 0),
+                retained_count INTEGER NOT NULL CHECK(retained_count >= 0 AND retained_count <= retention_max_records),
+                low_water_sequence INTEGER NOT NULL CHECK(low_water_sequence >= 0),
+                low_water_hash BLOB NOT NULL CHECK(length(low_water_hash) = 32),
+                terminal_sequence INTEGER NULL CHECK(terminal_sequence IS NULL OR terminal_sequence >= 0),
+                terminal_hash BLOB NOT NULL CHECK(length(terminal_hash) = 32),
+                anchor_hmac BLOB NOT NULL CHECK(length(anchor_hmac) = 32),
+                CHECK(total_count = low_water_sequence + retained_count),
+                CHECK(
+                    (total_count = 0 AND retained_count = 0 AND low_water_sequence = 0 AND terminal_sequence IS NULL)
+                    OR (total_count > 0 AND retained_count > 0 AND terminal_sequence = total_count - 1)
+                )
+            );
+            INSERT INTO management_audit_anchor
+                (id, format_version, retention_max_records, key_epoch, total_count, retained_count, low_water_sequence, low_water_hash, terminal_sequence, terminal_hash, anchor_hmac)
+            SELECT
+                id, format_version, retention_max_records, key_epoch, total_count, retained_count, low_water_sequence, low_water_hash, terminal_sequence, terminal_hash, anchor_hmac
+            FROM management_audit_anchor_before_v2;
+            DROP TABLE management_audit_anchor_before_v2;
+            "#,
+        )?;
+        tx.commit()?;
+        current = "1.11.0".to_string();
     }
 
     let _ = current;
