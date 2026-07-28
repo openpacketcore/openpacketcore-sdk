@@ -40,8 +40,8 @@ use crate::error::{
     RpcError, RpcReplyAttributes,
 };
 use crate::metrics::{
-    record_notification, record_rpc_error, record_rpc_success, NetconfNotificationOutcome,
-    NetconfOperation,
+    record_notification, record_rpc_error, record_rpc_success, record_terminal_audit_failure,
+    NetconfNotificationOutcome, NetconfOperation,
 };
 use crate::operations::get::{handle_get, GetContext};
 use crate::operations::get_config::{handle_get_config, GetConfigContext};
@@ -3236,7 +3236,7 @@ where
 
         let bus = self.binding.config_bus();
         let snapshot = bus.current_snapshot();
-        if let Some(candidate) = candidate.as_ref() {
+        let changed_paths = if let Some(candidate) = candidate.as_ref() {
             if candidate.base_version != snapshot.version {
                 return self.exec_failure_reply(
                     &context,
@@ -3286,7 +3286,10 @@ where
                     );
                 }
             }
-        }
+            changed_paths
+        } else {
+            Vec::new()
+        };
         let timeout = confirmed_commit_timeout(request);
         let mode = if request.confirmed {
             CommitMode::CommitConfirmed { timeout }
@@ -3297,6 +3300,7 @@ where
             .as_ref()
             .map(|candidate| candidate.base_version)
             .unwrap_or(snapshot.version);
+        let audit_paths = self.schema_paths_for_changed_paths(&changed_paths, NETCONF_COMMIT_PATH);
         let candidate_config = candidate.map(|candidate| candidate.config);
         let commit_request = CommitRequest::new(
             context.request_id,
@@ -3307,9 +3311,30 @@ where
             mode,
             now + Duration::from_secs(30),
             candidate_config,
-            Vec::new(),
+            changed_paths,
         )
         .with_base_version(base_version);
+
+        let intent_event = AuditEvent::new(
+            context.request_id,
+            context.principal,
+            self.transport,
+            AuditOperation::Update,
+            AuditOutcome::Intent,
+        )
+        .with_paths(audit_paths.clone());
+        if commit_audit_failed(&self.audit, &intent_event) {
+            record_rpc_error(
+                NetconfOperation::Commit,
+                NetconfErrorTag::OperationFailed,
+                context.started.elapsed(),
+            );
+            return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                Some(context.message_id),
+                context.reply_attrs,
+                RpcError::operation_failed(),
+            ));
+        }
 
         match bus.submit(commit_request).await {
             Ok(result) => {
@@ -3328,7 +3353,7 @@ where
                         .replace(PendingConfirmedCommit {
                             owner_session_id: current_session_id,
                             persist,
-                            deadline: now + timeout,
+                            deadline: Instant::now() + timeout,
                         });
                 } else if result.status == opc_config_model::CommitStatus::Committed {
                     self.confirmed_commit
@@ -3336,43 +3361,75 @@ where
                         .unwrap_or_else(|err| err.into_inner())
                         .clear();
                 }
-                let paths =
-                    self.schema_paths_for_changed_paths(&result.changed_paths, NETCONF_COMMIT_PATH);
-                if self
-                    .audit
-                    .record(
-                        &AuditEvent::new(
-                            context.request_id,
-                            context.principal,
-                            self.transport,
-                            AuditOperation::Update,
-                            AuditOutcome::Success,
-                        )
-                        .with_paths(paths),
-                    )
-                    .is_err()
-                {
-                    record_rpc_error(
-                        NetconfOperation::Commit,
-                        NetconfErrorTag::OperationFailed,
-                        context.started.elapsed(),
+                let terminal_event = AuditEvent::new(
+                    context.request_id,
+                    context.principal,
+                    self.transport,
+                    AuditOperation::Update,
+                    AuditOutcome::Success,
+                )
+                .with_paths(audit_paths);
+                let terminal_audit_failed =
+                    match terminal_event.with_tx_id(result.tx_id.to_string()) {
+                        Ok(event) => commit_audit_failed(&self.audit, &event),
+                        Err(_) => true,
+                    };
+                if terminal_audit_failed {
+                    record_terminal_audit_failure();
+                    tracing::error!(
+                        target: "opc_netconf_server",
+                        audit_phase = "terminal",
+                        "NETCONF commit applied but terminal audit record failed"
                     );
-                    return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
-                        Some(context.message_id),
-                        context.reply_attrs,
-                        RpcError::operation_failed(),
-                    ));
                 }
                 self.committed_revision_success_reply(&context, NetconfOperation::Commit, &result)
             }
-            Err(error) => self.exec_failure_reply(
-                &context,
-                NetconfOperation::Commit,
-                NETCONF_COMMIT_PATH,
-                audit_failed(error.code.as_str()),
-                rpc_error_for_commit_error(error.code),
-            ),
+            Err(error) => self.commit_bus_failure_reply(&context, audit_paths, error.code),
         }
+    }
+
+    fn commit_bus_failure_reply(
+        &self,
+        context: &RpcExecContext<'_>,
+        audit_paths: Vec<SchemaNodePath>,
+        code: CommitErrorCode,
+    ) -> RpcHandlingResult {
+        let terminal_event = AuditEvent::new(
+            context.request_id,
+            context.principal,
+            self.transport,
+            AuditOperation::Update,
+            audit_failed(code.as_str()),
+        )
+        .with_paths(audit_paths);
+        if commit_audit_failed(&self.audit, &terminal_event) {
+            match code {
+                CommitErrorCode::OutcomeUnknown => tracing::error!(
+                    target: "opc_netconf_server",
+                    audit_phase = "terminal",
+                    commit_outcome = "unknown",
+                    "NETCONF commit outcome is unknown and its terminal audit record also failed"
+                ),
+                _ => tracing::error!(
+                    target: "opc_netconf_server",
+                    audit_phase = "terminal",
+                    commit_outcome = "failed",
+                    "NETCONF commit failed and its terminal audit record also failed"
+                ),
+            }
+        }
+
+        let rpc_error = rpc_error_for_commit_error(code);
+        record_rpc_error(
+            NetconfOperation::Commit,
+            rpc_error.classification.tag,
+            context.started.elapsed(),
+        );
+        RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+            Some(context.message_id),
+            context.reply_attrs,
+            rpc_error,
+        ))
     }
 
     async fn handle_cancel_commit(
@@ -4598,23 +4655,21 @@ where
         result: &CommitResult,
     ) -> RpcHandlingResult {
         let reply = if self.committed_revision_responses_enabled() {
-            let Some(revision) = result.committed_revision else {
-                record_rpc_error(
-                    operation,
-                    NetconfErrorTag::OperationFailed,
-                    context.started.elapsed(),
-                );
-                return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
-                    Some(context.message_id),
+            match result.committed_revision {
+                Some(revision) => rpc_ok_committed_revision_reply_with_attrs(
+                    context.message_id,
                     context.reply_attrs,
-                    RpcError::operation_failed(),
-                ));
-            };
-            rpc_ok_committed_revision_reply_with_attrs(
-                context.message_id,
-                context.reply_attrs,
-                revision,
-            )
+                    revision,
+                ),
+                None => {
+                    tracing::error!(
+                        target: "opc_netconf_server",
+                        response_extension = "committed-revision",
+                        "NETCONF commit succeeded without its configured revision receipt"
+                    );
+                    rpc_ok_empty_reply_with_attrs(context.message_id, context.reply_attrs)
+                }
+            }
         } else {
             rpc_ok_empty_reply_with_attrs(context.message_id, context.reply_attrs)
         };
@@ -5767,6 +5822,13 @@ where
     }
 }
 
+fn commit_audit_failed<A: AuditSink>(audit: &A, event: &AuditEvent) -> bool {
+    match panic::catch_unwind(AssertUnwindSafe(|| audit.record(event))) {
+        Ok(Ok(())) => false,
+        Ok(Err(_)) | Err(_) => true,
+    }
+}
+
 fn confirmed_commit_timeout(request: &XmlCommitRequest) -> Duration {
     Duration::from_secs(u64::from(
         request
@@ -6027,6 +6089,45 @@ mod tests {
         );
         assert!(persist_failed.contains("<error-tag>operation-failed</error-tag>"));
         assert!(!persist_failed.contains("<error-app-tag>"));
+    }
+
+    #[tokio::test]
+    async fn terminal_audit_failure_does_not_mask_outcome_unknown_reply() {
+        let audit = AttemptingFailingAudit::default();
+        let (server, _bus, audit) = generated_edit_server_with_audit(audit).await;
+        let principal = principal();
+        let reply_attrs = RpcReplyAttributes::default();
+        let request_id = RequestId::new();
+        let context = RpcExecContext {
+            request_id,
+            principal: &principal,
+            message_id: "outcome-unknown",
+            reply_attrs: &reply_attrs,
+            started: Instant::now(),
+        };
+        let audit_paths = vec![schema_node_path("/sys:system/sys:hostname")];
+
+        let reply = server.commit_bus_failure_reply(
+            &context,
+            audit_paths.clone(),
+            CommitErrorCode::OutcomeUnknown,
+        );
+
+        assert!(reply
+            .reply_xml
+            .contains("<error-tag>operation-failed</error-tag>"));
+        assert!(reply
+            .reply_xml
+            .contains("<error-app-tag>outcome-unknown</error-app-tag>"));
+        assert!(!reply.reply_xml.contains("secret-admin"));
+        assert!(!reply.reply_xml.contains("/sys:system"));
+
+        let attempts = audit.attempts.lock().expect("audit attempts mutex");
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].request_id, request_id);
+        assert_eq!(attempts[0].operation, AuditOperation::Update);
+        assert_eq!(attempts[0].outcome, audit_failed("outcome_unknown"));
+        assert_eq!(attempts[0].schema_paths, audit_paths);
     }
 
     #[derive(Clone)]
@@ -7259,6 +7360,137 @@ mod tests {
     impl AuditSink for CapturingAudit {
         fn record(&self, event: &AuditEvent) -> Result<(), AuditError> {
             self.events.lock().expect("audit mutex").push(event.clone());
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum CommitAuditFailure {
+        IntentError,
+        IntentPanic,
+        TerminalError,
+        TerminalPanic,
+    }
+
+    impl CommitAuditFailure {
+        const fn is_intent(self) -> bool {
+            matches!(self, Self::IntentError | Self::IntentPanic)
+        }
+
+        const fn is_terminal(self) -> bool {
+            matches!(self, Self::TerminalError | Self::TerminalPanic)
+        }
+
+        const fn panics(self) -> bool {
+            matches!(self, Self::IntentPanic | Self::TerminalPanic)
+        }
+    }
+
+    #[derive(Clone)]
+    struct ScriptedCommitAudit {
+        failure: Arc<Mutex<Option<CommitAuditFailure>>>,
+        attempts: Arc<Mutex<Vec<AuditEvent>>>,
+        accepted_intents: Arc<Mutex<HashSet<RequestId>>>,
+    }
+
+    impl ScriptedCommitAudit {
+        fn new(failure: CommitAuditFailure) -> Self {
+            Self {
+                failure: Arc::new(Mutex::new(Some(failure))),
+                attempts: Arc::new(Mutex::new(Vec::new())),
+                accepted_intents: Arc::new(Mutex::new(HashSet::new())),
+            }
+        }
+
+        fn take_failure(
+            &self,
+            predicate: impl FnOnce(CommitAuditFailure) -> bool,
+        ) -> Option<CommitAuditFailure> {
+            let mut failure = self.failure.lock().expect("audit failure mutex");
+            if failure.is_some_and(predicate) {
+                failure.take()
+            } else {
+                None
+            }
+        }
+    }
+
+    impl AuditSink for ScriptedCommitAudit {
+        fn record(&self, event: &AuditEvent) -> Result<(), AuditError> {
+            self.attempts
+                .lock()
+                .expect("audit attempts mutex")
+                .push(event.clone());
+
+            if event.outcome == AuditOutcome::Intent {
+                if let Some(failure) = self.take_failure(CommitAuditFailure::is_intent) {
+                    if failure.panics() {
+                        panic!("scripted audit sink panic");
+                    }
+                    return Err(AuditError::failed(
+                        "audit detail contains /sys:system/sys:user[sys:name='secret-admin']",
+                    ));
+                }
+                self.accepted_intents
+                    .lock()
+                    .expect("accepted intents mutex")
+                    .insert(event.request_id);
+                return Ok(());
+            }
+
+            if event.outcome == AuditOutcome::Success
+                && self
+                    .accepted_intents
+                    .lock()
+                    .expect("accepted intents mutex")
+                    .remove(&event.request_id)
+            {
+                if let Some(failure) = self.take_failure(CommitAuditFailure::is_terminal) {
+                    if failure.panics() {
+                        panic!("scripted audit sink panic");
+                    }
+                    return Err(AuditError::failed(
+                        "audit detail contains /sys:system/sys:user[sys:name='secret-admin']",
+                    ));
+                }
+            }
+
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct AttemptingFailingAudit {
+        attempts: Arc<Mutex<Vec<AuditEvent>>>,
+    }
+
+    impl AuditSink for AttemptingFailingAudit {
+        fn record(&self, event: &AuditEvent) -> Result<(), AuditError> {
+            self.attempts
+                .lock()
+                .expect("audit attempts mutex")
+                .push(event.clone());
+            Err(AuditError::failed(
+                "audit detail contains /sys:system/sys:user[sys:name='secret-admin']",
+            ))
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct SlowFirstIntentAudit {
+        delayed: Arc<AtomicBool>,
+        events: Arc<Mutex<Vec<AuditEvent>>>,
+    }
+
+    impl AuditSink for SlowFirstIntentAudit {
+        fn record(&self, event: &AuditEvent) -> Result<(), AuditError> {
+            self.events
+                .lock()
+                .expect("audit events mutex")
+                .push(event.clone());
+            if event.outcome == AuditOutcome::Intent && !self.delayed.swap(true, Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1_100));
+            }
             Ok(())
         }
     }
@@ -13312,6 +13544,54 @@ mod tests {
         (server, bus, audit)
     }
 
+    async fn generated_edit_server_with_audit<A>(
+        audit: A,
+    ) -> (
+        ReadOnlyNetconfServer<DemoConfig, GeneratedEditBinding, FixedPolicy, A>,
+        Arc<ConfigBus<DemoConfig>>,
+        A,
+    )
+    where
+        A: AuditSink + Clone,
+    {
+        let store = Arc::new(MockManagedDatastore::new());
+        store
+            .seed(StoredConfig::new(
+                opc_types::TxId::new(),
+                ConfigVersion::new(1),
+                principal(),
+                RequestSource::Northbound,
+                DemoConfig {
+                    hostname: "amf-1".to_string(),
+                    secret: "do-not-leak".to_string(),
+                },
+            ))
+            .await;
+        let bus = Arc::new(
+            ConfigBus::restore_or_new_dev_only(
+                DemoConfig {
+                    hostname: "fallback".to_string(),
+                    secret: "fallback-secret".to_string(),
+                },
+                Arc::clone(&store),
+            )
+            .await
+            .expect("bus"),
+        );
+        let binding = GeneratedEditBinding {
+            bus: Arc::clone(&bus),
+            startup: None,
+        };
+        let server = ReadOnlyNetconfServer::new(
+            binding,
+            FixedPolicy(policy_allow_system_but_deny_secret()),
+            audit.clone(),
+            TransportType::NetconfTls,
+        )
+        .expect("server");
+        (server, bus, audit)
+    }
+
     async fn generated_edit_server_with_startup_fixture() -> (
         ReadOnlyNetconfServer<DemoConfig, GeneratedEditBinding, FixedPolicy, CapturingAudit>,
         Arc<ConfigBus<DemoConfig>>,
@@ -13640,6 +13920,41 @@ mod tests {
                 ConfigAuthorityOperation::Write
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn known_success_without_revision_receipt_is_not_reported_as_failure() {
+        let authority = Arc::new(ScriptedConfigAuthority::fixed(
+            ConfigAuthorityOutcome::LocalAuthority,
+        ));
+        let (server, _bus, _inner, _audit) = generated_edit_authority_fixture(authority).await;
+        let principal = principal();
+        let reply_attrs = RpcReplyAttributes::default();
+        let context = RpcExecContext {
+            request_id: RequestId::new(),
+            principal: &principal,
+            message_id: "missing-receipt",
+            reply_attrs: &reply_attrs,
+            started: Instant::now(),
+        };
+        let result = CommitResult {
+            tx_id: opc_types::TxId::new(),
+            base_version: ConfigVersion::new(1),
+            new_version: Some(ConfigVersion::new(2)),
+            status: opc_config_model::CommitStatus::Committed,
+            changed_paths: vec![YangPath::new("/sys:system/sys:hostname").expect("hostname path")],
+            committed_revision: None,
+            apply_plan: None,
+        };
+        let successes_before = netconf_rpc_requests("commit", "success");
+
+        let reply =
+            server.committed_revision_success_reply(&context, NetconfOperation::Commit, &result);
+
+        assert!(reply.reply_xml.contains("<ok/>"), "{}", reply.reply_xml);
+        assert!(!reply.reply_xml.contains("<rpc-error>"));
+        assert!(!reply.reply_xml.contains("<committed-revision"));
+        assert!(netconf_rpc_requests("commit", "success") > successes_before);
     }
 
     #[tokio::test]
@@ -14494,9 +14809,10 @@ mod tests {
             running.reply_xml
         );
 
+        let commit_request_id = RequestId::new();
         let committed = server
             .handle_rpc_for_session_async(
-                RequestId::new(),
+                commit_request_id,
                 &principal(),
                 &commit_rpc(),
                 &MgmtLimits::default(),
@@ -14512,10 +14828,332 @@ mod tests {
         assert_eq!(bus.current_snapshot().config.hostname, "amf-2");
 
         let events = audit.events.lock().expect("audit mutex");
-        assert!(events
+        let commit_events = events
             .iter()
-            .any(|event| event.operation == AuditOperation::Update
-                && event.outcome == AuditOutcome::Success));
+            .filter(|event| event.request_id == commit_request_id)
+            .collect::<Vec<_>>();
+        assert_eq!(commit_events.len(), 2);
+        assert_eq!(commit_events[0].operation, AuditOperation::Update);
+        assert_eq!(commit_events[0].outcome, AuditOutcome::Intent);
+        assert_eq!(commit_events[1].operation, AuditOperation::Update);
+        assert_eq!(commit_events[1].outcome, AuditOutcome::Success);
+        assert_eq!(
+            commit_events[0].schema_paths,
+            vec![schema_node_path("/sys:system/sys:hostname")]
+        );
+        assert_eq!(commit_events[1].schema_paths, commit_events[0].schema_paths);
+        assert_eq!(commit_events[1].principal, commit_events[0].principal);
+        assert_eq!(commit_events[1].transport, commit_events[0].transport);
+        assert_eq!(commit_events[0].transport, TransportType::NetconfTls);
+        assert!(commit_events[0].tx_id.is_none());
+        assert!(commit_events[1].tx_id.is_some());
+    }
+
+    #[tokio::test]
+    async fn commit_intent_audit_failure_preserves_running_and_candidate() {
+        for failure in [
+            CommitAuditFailure::IntentError,
+            CommitAuditFailure::IntentPanic,
+        ] {
+            let audit = ScriptedCommitAudit::new(failure);
+            let (server, bus, audit) = generated_edit_server_with_audit(audit).await;
+            let registry = SessionRegistry::new();
+            let _registration = registry.register(1).expect("register session 1");
+
+            let edit = edit_config_rpc_to(
+                "candidate",
+                r#"<sys:system xmlns:sys="urn:opc:demo"><sys:hostname>amf-2</sys:hostname></sys:system>"#,
+                "merge",
+            );
+            let staged = server
+                .handle_rpc_for_session_async(
+                    RequestId::new(),
+                    &principal(),
+                    &edit,
+                    &MgmtLimits::default(),
+                    1,
+                    &registry,
+                )
+                .await;
+            assert!(staged.reply_xml.contains("<ok/>"), "{}", staged.reply_xml);
+            assert_eq!(bus.current_snapshot().config.hostname, "amf-1");
+
+            let commit_request_id = RequestId::new();
+            let rejected = server
+                .handle_rpc_for_session_async(
+                    commit_request_id,
+                    &principal(),
+                    &commit_rpc(),
+                    &MgmtLimits::default(),
+                    1,
+                    &registry,
+                )
+                .await;
+
+            assert!(
+                rejected
+                    .reply_xml
+                    .contains("<error-tag>operation-failed</error-tag>"),
+                "{failure:?}: {}",
+                rejected.reply_xml
+            );
+            assert!(!rejected.reply_xml.contains("<ok/>"));
+            assert!(!rejected.reply_xml.contains("secret-admin"));
+            assert!(!rejected.reply_xml.contains("/sys:system"));
+            assert_eq!(bus.current_snapshot().config.hostname, "amf-1");
+            let candidate = server
+                .candidate
+                .lock()
+                .expect("candidate mutex")
+                .snapshot()
+                .expect("candidate remains staged");
+            assert_eq!(candidate.config.hostname, "amf-2");
+            assert_eq!(candidate.base_version, ConfigVersion::new(1));
+            assert!(server
+                .confirmed_commit
+                .lock()
+                .expect("confirmed commit mutex")
+                .pending
+                .is_none());
+            assert_eq!(registry.candidate_write_owner_for_test(), None);
+            assert_eq!(registry.running_write_owner_for_test(), None);
+
+            {
+                let attempts = audit.attempts.lock().expect("audit attempts mutex");
+                let commit_attempts = attempts
+                    .iter()
+                    .filter(|event| event.request_id == commit_request_id)
+                    .collect::<Vec<_>>();
+                assert_eq!(commit_attempts.len(), 1);
+                assert_eq!(commit_attempts[0].operation, AuditOperation::Update);
+                assert_eq!(commit_attempts[0].outcome, AuditOutcome::Intent);
+                assert_eq!(
+                    commit_attempts[0].schema_paths,
+                    vec![schema_node_path("/sys:system/sys:hostname")]
+                );
+                assert_eq!(commit_attempts[0].transport, TransportType::NetconfTls);
+                assert!(commit_attempts[0].tx_id.is_none());
+            }
+
+            let retry_request_id = RequestId::new();
+            let retried = server
+                .handle_rpc_for_session_async(
+                    retry_request_id,
+                    &principal(),
+                    &commit_rpc(),
+                    &MgmtLimits::default(),
+                    1,
+                    &registry,
+                )
+                .await;
+            assert!(
+                retried.reply_xml.contains("<ok/>"),
+                "{failure:?}: {}",
+                retried.reply_xml
+            );
+            assert_eq!(bus.current_snapshot().config.hostname, "amf-2");
+            assert!(server
+                .candidate
+                .lock()
+                .expect("candidate mutex")
+                .snapshot()
+                .is_none());
+
+            let attempts = audit.attempts.lock().expect("audit attempts mutex");
+            let retry_attempts = attempts
+                .iter()
+                .filter(|event| event.request_id == retry_request_id)
+                .collect::<Vec<_>>();
+            assert_eq!(retry_attempts.len(), 2);
+            assert_eq!(retry_attempts[0].outcome, AuditOutcome::Intent);
+            assert_eq!(retry_attempts[1].outcome, AuditOutcome::Success);
+            assert_eq!(retry_attempts[0].operation, AuditOperation::Update);
+            assert_eq!(retry_attempts[1].operation, AuditOperation::Update);
+            assert_eq!(
+                retry_attempts[1].schema_paths,
+                retry_attempts[0].schema_paths
+            );
+            assert_eq!(retry_attempts[1].principal, retry_attempts[0].principal);
+            assert_eq!(retry_attempts[1].transport, retry_attempts[0].transport);
+            assert!(retry_attempts[0].tx_id.is_none());
+            assert!(retry_attempts[1].tx_id.is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_audit_failure_after_applied_commit_returns_success_and_signals_loss() {
+        for failure in [
+            CommitAuditFailure::TerminalError,
+            CommitAuditFailure::TerminalPanic,
+        ] {
+            let audit = ScriptedCommitAudit::new(failure);
+            let (server, bus, audit) = generated_edit_server_with_audit(audit).await;
+            let registry = SessionRegistry::new();
+            let _registration = registry.register(1).expect("register session 1");
+
+            let edit = edit_config_rpc_to(
+                "candidate",
+                r#"<sys:system xmlns:sys="urn:opc:demo"><sys:hostname>amf-2</sys:hostname></sys:system>"#,
+                "merge",
+            );
+            let staged = server
+                .handle_rpc_for_session_async(
+                    RequestId::new(),
+                    &principal(),
+                    &edit,
+                    &MgmtLimits::default(),
+                    1,
+                    &registry,
+                )
+                .await;
+            assert!(staged.reply_xml.contains("<ok/>"), "{}", staged.reply_xml);
+
+            let terminal_failures_before = METRICS
+                .netconf_terminal_audit_failures_total
+                .load(Ordering::Relaxed);
+            let successes_before = netconf_rpc_requests("commit", "success");
+            let commit_request_id = RequestId::new();
+            let committed = server
+                .handle_rpc_for_session_async(
+                    commit_request_id,
+                    &principal(),
+                    &commit_rpc(),
+                    &MgmtLimits::default(),
+                    1,
+                    &registry,
+                )
+                .await;
+
+            assert!(
+                committed.reply_xml.contains("<ok/>"),
+                "{failure:?}: {}",
+                committed.reply_xml
+            );
+            assert!(!committed.reply_xml.contains("<rpc-error>"));
+            assert!(!committed.reply_xml.contains("secret-admin"));
+            assert!(!committed.reply_xml.contains("/sys:system"));
+            assert_eq!(bus.current_snapshot().config.hostname, "amf-2");
+            assert!(
+                server
+                    .candidate
+                    .lock()
+                    .expect("candidate mutex")
+                    .snapshot()
+                    .is_none(),
+                "an applied commit must discard the staged candidate"
+            );
+            assert!(netconf_rpc_requests("commit", "success") > successes_before);
+            assert!(
+                METRICS
+                    .netconf_terminal_audit_failures_total
+                    .load(Ordering::Relaxed)
+                    > terminal_failures_before
+            );
+            let exported = opc_redaction::metrics::export_prometheus_text();
+            assert!(exported.contains("opc_netconf_terminal_audit_failures_total "));
+            assert!(!exported.contains("opc_netconf_terminal_audit_failures_total{"));
+            assert!(!exported.contains("secret-admin"));
+
+            let attempts = audit.attempts.lock().expect("audit attempts mutex");
+            let commit_attempts = attempts
+                .iter()
+                .filter(|event| event.request_id == commit_request_id)
+                .collect::<Vec<_>>();
+            assert_eq!(commit_attempts.len(), 2);
+            assert_eq!(commit_attempts[0].operation, AuditOperation::Update);
+            assert_eq!(commit_attempts[0].outcome, AuditOutcome::Intent);
+            assert_eq!(commit_attempts[1].operation, AuditOperation::Update);
+            assert_eq!(commit_attempts[1].outcome, AuditOutcome::Success);
+            assert_eq!(
+                commit_attempts[1].schema_paths,
+                commit_attempts[0].schema_paths
+            );
+            assert_eq!(commit_attempts[1].principal, commit_attempts[0].principal);
+            assert_eq!(commit_attempts[1].transport, commit_attempts[0].transport);
+            assert!(commit_attempts[0].tx_id.is_none());
+            assert!(commit_attempts[1].tx_id.is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn slow_intent_does_not_consume_confirmed_commit_window() {
+        let audit = SlowFirstIntentAudit::default();
+        let (server, bus, audit) = generated_edit_server_with_audit(audit).await;
+        let registry = SessionRegistry::new();
+        let _registration = registry.register(1).expect("register session 1");
+
+        let edit = edit_config_rpc_to(
+            "candidate",
+            r#"<sys:system xmlns:sys="urn:opc:demo"><sys:hostname>amf-2</sys:hostname></sys:system>"#,
+            "merge",
+        );
+        let staged = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &edit,
+                &MgmtLimits::default(),
+                1,
+                &registry,
+            )
+            .await;
+        assert!(staged.reply_xml.contains("<ok/>"), "{}", staged.reply_xml);
+
+        let confirmed_request_id = RequestId::new();
+        let confirmed = server
+            .handle_rpc_for_session_async(
+                confirmed_request_id,
+                &principal(),
+                &confirmed_commit_rpc(1),
+                &MgmtLimits::default(),
+                1,
+                &registry,
+            )
+            .await;
+        assert!(
+            confirmed.reply_xml.contains("<ok/>"),
+            "{}",
+            confirmed.reply_xml
+        );
+        assert_eq!(bus.current_snapshot().config.hostname, "amf-2");
+
+        let confirmation_request_id = RequestId::new();
+        let confirmation = server
+            .handle_rpc_for_session_async(
+                confirmation_request_id,
+                &principal(),
+                &commit_rpc(),
+                &MgmtLimits::default(),
+                1,
+                &registry,
+            )
+            .await;
+        assert!(
+            confirmation.reply_xml.contains("<ok/>"),
+            "{}",
+            confirmation.reply_xml
+        );
+
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        assert_eq!(
+            bus.current_snapshot().config.hostname,
+            "amf-2",
+            "confirmation must reach the bus instead of becoming a local no-op"
+        );
+
+        let events = audit.events.lock().expect("audit events mutex");
+        for request_id in [confirmed_request_id, confirmation_request_id] {
+            let commit_events = events
+                .iter()
+                .filter(|event| event.request_id == request_id)
+                .collect::<Vec<_>>();
+            assert_eq!(commit_events.len(), 2);
+            assert_eq!(commit_events[0].operation, AuditOperation::Update);
+            assert_eq!(commit_events[0].outcome, AuditOutcome::Intent);
+            assert_eq!(commit_events[1].operation, AuditOperation::Update);
+            assert_eq!(commit_events[1].outcome, AuditOutcome::Success);
+            assert_eq!(commit_events[1].schema_paths, commit_events[0].schema_paths);
+        }
     }
 
     #[tokio::test]

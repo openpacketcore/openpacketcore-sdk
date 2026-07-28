@@ -1232,6 +1232,7 @@ pub struct SdkMetrics {
     pub netconf_locks_active: Mutex<HashMap<String, i64>>,
     pub netconf_notifications_total: Mutex<HashMap<(String, String), u64>>,
     pub netconf_nacm_denials_total: Mutex<HashMap<String, u64>>,
+    pub netconf_terminal_audit_failures_total: AtomicU64,
 }
 
 impl SdkMetrics {
@@ -1395,6 +1396,7 @@ impl SdkMetrics {
             netconf_locks_active: Mutex::new(HashMap::new()),
             netconf_notifications_total: Mutex::new(HashMap::new()),
             netconf_nacm_denials_total: Mutex::new(HashMap::new()),
+            netconf_terminal_audit_failures_total: AtomicU64::new(0),
         }
     }
 
@@ -1678,6 +1680,8 @@ impl SdkMetrics {
                 m.clear();
             }
         }
+        self.netconf_terminal_audit_failures_total
+            .store(0, Ordering::Relaxed);
     }
 }
 
@@ -3200,6 +3204,16 @@ pub fn export_prometheus_text() -> String {
         "Total NETCONF NACM denials by action",
         &METRICS.netconf_nacm_denials_total,
         "action",
+    );
+    let terminal_audit_failures = METRICS
+        .netconf_terminal_audit_failures_total
+        .load(Ordering::Relaxed);
+    write_metric(
+        &mut out,
+        "opc_netconf_terminal_audit_failures_total",
+        "counter",
+        "Total terminal audit writes that failed after a NETCONF commit was applied",
+        terminal_audit_failures as f64,
     );
 
     out

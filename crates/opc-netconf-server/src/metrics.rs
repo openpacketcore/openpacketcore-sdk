@@ -1,5 +1,6 @@
 //! NETCONF metrics recorders backed by the shared SDK registry.
 
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use opc_mgmt_errors::NetconfErrorTag;
@@ -130,6 +131,18 @@ pub(crate) fn record_rpc_error(
     increment_rpc_request(operation, OUTCOME_FAILURE);
     increment_rpc_error(operation, error_tag);
     observe_rpc_latency(operation, elapsed);
+}
+
+/// Records loss of a terminal audit event after a commit was applied.
+///
+/// The counter deliberately has no labels: audit content and request identity
+/// must not escape through the metrics surface.
+pub(crate) fn record_terminal_audit_failure() {
+    let _ = METRICS.netconf_terminal_audit_failures_total.fetch_update(
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+        |current| Some(current.saturating_add(1)),
+    );
 }
 
 /// Records read NACM denials filtered from a NETCONF response.
@@ -291,6 +304,26 @@ mod tests {
         let exported = export_prometheus_text();
         assert!(exported
             .contains("opc_netconf_notifications_total{stream=\"NETCONF\",outcome=\"success\"}"));
+    }
+
+    #[test]
+    fn terminal_audit_failure_is_a_label_free_saturating_counter() {
+        let before = METRICS
+            .netconf_terminal_audit_failures_total
+            .load(Ordering::Relaxed);
+
+        record_terminal_audit_failure();
+
+        assert!(
+            METRICS
+                .netconf_terminal_audit_failures_total
+                .load(Ordering::Relaxed)
+                > before
+        );
+        let exported = export_prometheus_text();
+        assert!(exported.contains("# TYPE opc_netconf_terminal_audit_failures_total counter\n"));
+        assert!(exported.contains("opc_netconf_terminal_audit_failures_total "));
+        assert!(!exported.contains("opc_netconf_terminal_audit_failures_total{"));
     }
 
     #[test]

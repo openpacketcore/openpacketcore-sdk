@@ -319,6 +319,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     fixture, so no message that already round-tripped moves on the wire.
 
 ### Fixed
+- **NETCONF candidate commits now fail closed before mutation without lying
+  after a known success — `opc-netconf-server`:** `<commit>` records a
+  path-scoped `AuditOutcome::Intent` before config-bus submission, so an audit
+  error or contained sink unwind leaves running unchanged, preserves the
+  candidate and returns `operation-failed`. A successful submission attempts a
+  same-request, same-path terminal `Success` carrying the transaction ID. If
+  that terminal write fails, the applied commit still returns success while a
+  value-free `ERROR` and label-free
+  `opc_netconf_terminal_audit_failures_total` counter make the loss loud.
+  Config-bus failures likewise attempt an `Update` terminal record without
+  letting a second audit failure mask their original RPC tag or
+  `outcome-unknown` app-tag. Confirmed-commit bookkeeping now starts its local
+  timeout after submission, so a slow intent sink cannot consume the rollback
+  window before the change is applied. Finally, a known successful commit
+  missing a configured revision receipt emits a value-free error and returns
+  plain `<ok/>` instead of reclassifying an applied write as
+  `operation-failed`.
 - **P-CSCF Re-selection support is no longer emittable on its own --
   `opc-proto-gtpv2c` (breaking to `PcoRequest`):** TS 24.008 10.5.6.3 says of
   container `0x0012` that "This PCO parameter may be present only if a
