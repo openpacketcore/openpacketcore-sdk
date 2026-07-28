@@ -30,6 +30,10 @@ use opc_mgmt_audit::{AuditSink, TracingAuditSink};
 let sink: std::sync::Arc<dyn AuditSink> = std::sync::Arc::new(TracingAuditSink);
 ```
 
+`Arc<T>` implements `AuditSink` whenever `T` does, including
+`Arc<dyn AuditSink>`. One sink allocation can therefore be cloned directly
+into both the gNMI and NETCONF server cores.
+
 Audit schema paths are predicate-free and reason codes are bounded
 machine-readable strings. Metric-label helpers sanitize unknown values through
 the redaction helpers used elsewhere in the SDK.

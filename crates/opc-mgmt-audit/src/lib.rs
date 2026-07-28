@@ -23,7 +23,10 @@
 
 use std::{
     fmt,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -687,6 +690,12 @@ pub trait AuditSink: Send + Sync {
     fn record(&self, event: &AuditEvent) -> Result<(), AuditError>;
 }
 
+impl<T: AuditSink + ?Sized> AuditSink for Arc<T> {
+    fn record(&self, event: &AuditEvent) -> Result<(), AuditError> {
+        (**self).record(event)
+    }
+}
+
 /// An [`AuditSink`] that emits a structured event on the `opc_mgmt_audit`
 /// tracing target.
 ///
@@ -1013,6 +1022,26 @@ mod tests {
             FailingSink.record(&event),
             Err(AuditError::Unavailable { .. })
         ));
+    }
+
+    #[test]
+    fn arc_trait_object_forwards_errors_unchanged() {
+        let sink: Arc<dyn AuditSink> = Arc::new(FailingSink);
+        let event = AuditEvent::new(
+            RequestId::new(),
+            &principal(),
+            TransportType::Gnmi,
+            AuditOperation::Read,
+            AuditOutcome::failed_code(AuditReasonCode::OPERATION_FAILED),
+        );
+
+        let error = <Arc<dyn AuditSink> as AuditSink>::record(&sink, &event)
+            .expect_err("failing sink error must be forwarded");
+
+        assert_eq!(
+            error,
+            AuditError::unavailable("sqlite unavailable for tenant acme")
+        );
     }
 
     #[test]

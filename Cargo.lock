@@ -2821,6 +2821,7 @@ dependencies = [
  "opc-mgmt-transport",
  "opc-nacm",
  "opc-nacm-config",
+ "opc-netconf-server",
  "opc-redaction",
  "opc-runtime",
  "opc-tls",
