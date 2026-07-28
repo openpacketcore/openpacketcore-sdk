@@ -91,8 +91,11 @@ committed revision:
 The hash exactly matches the persisted plaintext-envelope digest, including
 bound request/replay metadata; it is not a config-only equality hash.
 Construction rejects a datastore that cannot attest new commit digests. A
-replay of a pre-digest legacy record still has no revision and the response
-fails closed until an explicitly reconciled new durable write exists.
+replay of a pre-digest legacy record still has no revision; because that replay
+is already a known durable success, the response is plain `<ok/>` plus a
+value-free internal error signal rather than a fabricated extension or a
+misleading `operation-failed`. An explicitly reconciled new durable write is
+required before clients can again rely on the revision extension.
 
 For the concrete consensus adapter, the local config bus's `{tx_id, version}`
 must also equal the canonical state-machine head. An empty canonical store may
@@ -112,6 +115,38 @@ and `RpcErrorInfo` values retain their prior `Copy` behavior and exhaustive
 shape; the runtime leader hint is rendered through a private response path.
 Code constructing `CommitResult` literals must initialize its new optional
 `committed_revision` field.
+
+## Candidate commit audit ordering
+
+The candidate `<commit>` path records an `AuditOutcome::Intent` update with
+the pending change's predicate-free schema paths before submitting to the
+config bus. If that write fails, the RPC returns `operation-failed` while
+running and the staged candidate remain unchanged. A successful submission
+then attempts a terminal update with the same request identity and schema
+paths; a success terminal also carries the committed transaction ID.
+
+Once the config bus has returned a known success, an audit sink failure cannot
+truthfully turn that applied commit into an `operation-failed` reply. The server
+therefore returns success and emits both a constant, value-free `ERROR` event
+and the label-free
+`opc_netconf_terminal_audit_failures_total` counter. Neither signal includes
+the audit error, request ID, principal, transaction ID, or schema paths. A
+configured committed-revision response that is unexpectedly missing its
+receipt follows the same truthfulness rule: the server emits a value-free
+`ERROR` and returns plain `<ok/>` without fabricating a revision extension.
+
+If the config bus itself returns an error, the server attempts a terminal
+failed update but preserves the original RPC classification even when that
+audit attempt fails. In particular, `OutcomeUnknown` retains its
+`outcome-unknown` app-tag because it requires authoritative reconciliation,
+not a blind retry.
+
+The commit boundary contains unwinding from an `AuditSink` so a sink panic
+cannot reverse these reply semantics. A sink panic remains a trait-contract
+violation: Rust invokes the process panic hook before unwinding can be caught,
+so sink implementations must never place sensitive content in panic payloads.
+This contract describes candidate `<commit>`; it does not claim identical
+ordering for every NETCONF operation.
 
 ## Relationships
 
