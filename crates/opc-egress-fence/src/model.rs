@@ -321,6 +321,22 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_before_authority_terminal_closes_initial_registration() {
+        let mut model = model();
+        model.register_closed(OLD_COOKIE).expect("registration");
+
+        model.close(OLD_COOKIE).expect("initial-state close");
+
+        let entry = model.entry(OLD_COOKIE).expect("terminal tombstone");
+        assert!(entry.is_terminal());
+        assert_eq!(entry.durable_fence_token(), 0);
+        assert_eq!(
+            model.verdict(&packet(OLD_COOKIE), 1),
+            FenceVerdict::DropClosed
+        );
+    }
+
+    #[test]
     fn invalid_attachment_identity_drops_even_unrelated_unmarked_packet() {
         let mut model = model();
         model.set_attachment_identity_valid(false);

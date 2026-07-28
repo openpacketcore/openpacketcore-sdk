@@ -629,10 +629,7 @@ impl ControlCommand {
                     && expected_epoch != 0
             }
             ControlOperation::Close => {
-                socket_cookie != 0
-                    && durable_fence_token != 0
-                    && deadline_boot_ns == 0
-                    && expected_epoch != 0
+                socket_cookie != 0 && deadline_boot_ns == 0 && expected_epoch != 0
             }
             ControlOperation::Reclaim => {
                 socket_cookie != 0 && deadline_boot_ns == 0 && expected_epoch != 0
@@ -678,6 +675,10 @@ impl ControlCommand {
     }
 
     /// Durable per-resource fencing token.
+    ///
+    /// A Close command may carry zero only when the kernel entry is exactly
+    /// InitialClosed with token zero. The kernel independently rejects a zero
+    /// token for Active or TerminalClosed entries.
     #[must_use]
     pub const fn durable_fence_token(self) -> u64 {
         self.durable_fence_token
@@ -1244,9 +1245,11 @@ mod tests {
             .expect("canonical refresh");
         let close = ControlCommand::new(ControlOperation::Close, 7, 11, 13, 9, 0, 1)
             .expect("canonical close");
+        let close_initial = ControlCommand::new(ControlOperation::Close, 7, 11, 13, 0, 0, 1)
+            .expect("canonical initial-state close");
         let reclaim = ControlCommand::new(ControlOperation::Reclaim, 7, 11, 13, 0, 0, 1)
             .expect("canonical initial-state reclaim");
-        for command in [publish, activate, refresh, close, reclaim] {
+        for command in [publish, activate, refresh, close, close_initial, reclaim] {
             assert_eq!(ControlCommand::decode(&command.encode()), Some(command));
         }
 
@@ -1265,7 +1268,6 @@ mod tests {
         }
 
         assert!(ControlCommand::new(ControlOperation::Close, 7, 11, 0, 9, 0, 1).is_none());
-        assert!(ControlCommand::new(ControlOperation::Close, 7, 11, 13, 0, 0, 1).is_none());
         assert!(ControlCommand::new(ControlOperation::Close, 7, 11, 13, 9, 10, 1).is_none());
         assert!(ControlCommand::new(ControlOperation::Close, 7, 11, 13, 9, 0, 0).is_none());
 
