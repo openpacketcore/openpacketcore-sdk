@@ -1,12 +1,10 @@
 use std::collections::BTreeMap;
 
 use opc_egress_fence_common::{
-    decide_egress, FenceEntryState, PacketEndpointDisposition, EGRESS_FENCE_INITIAL_COOKIE_EPOCH,
-    EGRESS_FENCE_MARK_MASK,
+    decide_egress, FenceAuthoritySnapshot, FenceEntryState, PacketEndpointDisposition,
+    PacketFenceContext, EGRESS_FENCE_INITIAL_COOKIE_EPOCH,
 };
-pub(crate) use opc_egress_fence_common::{
-    FenceEntry, FenceVerdict, ProtectedEndpoint, EGRESS_FENCE_MARK_VALUE,
-};
+pub(crate) use opc_egress_fence_common::{FenceEntry, FenceMark, FenceVerdict, ProtectedEndpoint};
 
 #[derive(Clone, Copy)]
 pub(crate) struct DatapathPacket {
@@ -57,11 +55,13 @@ pub(crate) enum ModelError {
     EpochMismatch,
     EpochExhausted,
     StaleDurableFence,
+    ZeroDurableFence,
     UnknownCookie,
 }
 
 pub(crate) struct EgressFenceModel {
     endpoint: ProtectedEndpoint,
+    mark: FenceMark,
     capacity: usize,
     current_durable_fence_token: u64,
     entries: BTreeMap<u64, FenceEntry>,
@@ -69,9 +69,10 @@ pub(crate) struct EgressFenceModel {
 }
 
 impl EgressFenceModel {
-    pub(crate) fn new(endpoint: ProtectedEndpoint, capacity: usize) -> Self {
+    pub(crate) fn new(endpoint: ProtectedEndpoint, mark: FenceMark, capacity: usize) -> Self {
         Self {
             endpoint,
+            mark,
             capacity,
             current_durable_fence_token: 0,
             entries: BTreeMap::new(),
@@ -84,6 +85,17 @@ impl EgressFenceModel {
             return Err(ModelError::Capacity);
         }
         self.entries.insert(cookie, FenceEntry::initial_closed());
+        Ok(())
+    }
+
+    pub(crate) fn publish_token(&mut self, durable_fence_token: u64) -> Result<(), ModelError> {
+        if durable_fence_token == 0 {
+            return Err(ModelError::ZeroDurableFence);
+        }
+        if durable_fence_token < self.current_durable_fence_token {
+            return Err(ModelError::StaleDurableFence);
+        }
+        self.current_durable_fence_token = durable_fence_token;
         Ok(())
     }
 
@@ -113,7 +125,7 @@ impl EgressFenceModel {
         if now_boot_ns >= deadline_boot_ns {
             return Err(ModelError::DeadlineElapsed);
         }
-        if durable_fence_token < self.current_durable_fence_token {
+        if durable_fence_token != self.current_durable_fence_token {
             return Err(ModelError::StaleDurableFence);
         }
         let next_epoch = expected_epoch
@@ -121,7 +133,6 @@ impl EgressFenceModel {
             .ok_or(ModelError::EpochExhausted)?;
         let next_entry = FenceEntry::active(durable_fence_token, deadline_boot_ns, next_epoch)
             .ok_or(ModelError::ClosedActivation)?;
-        self.current_durable_fence_token = durable_fence_token;
         self.entries.insert(cookie, next_entry);
         Ok(())
     }
@@ -161,13 +172,18 @@ impl EgressFenceModel {
 
     pub(crate) fn verdict(&self, packet: &DatapathPacket, now_boot_ns: u64) -> FenceVerdict {
         decide_egress(
-            self.attachment_identity_valid,
-            packet.disposition(self.endpoint),
-            packet.mark,
-            packet.socket_cookie,
-            self.entries.get(&packet.socket_cookie).copied(),
-            self.current_durable_fence_token,
-            now_boot_ns,
+            PacketFenceContext::new(
+                self.attachment_identity_valid,
+                packet.disposition(self.endpoint),
+                self.mark,
+                packet.mark,
+                packet.socket_cookie,
+            ),
+            FenceAuthoritySnapshot::new(
+                self.entries.get(&packet.socket_cookie).copied(),
+                self.current_durable_fence_token,
+                now_boot_ns,
+            ),
         )
     }
 
@@ -193,6 +209,7 @@ mod tests {
 
     const OLD_COOKIE: u64 = 11;
     const NEW_COOKIE: u64 = 12;
+    const MARK_BIT: u32 = 1 << 17;
 
     fn endpoint() -> ProtectedEndpoint {
         ProtectedEndpoint::ipv4([192, 0, 2, 20], 2123)
@@ -200,17 +217,27 @@ mod tests {
     }
 
     fn packet(cookie: u64) -> DatapathPacket {
-        DatapathPacket::marked_udp(EGRESS_FENCE_MARK_VALUE | 7, cookie, [192, 0, 2, 20], 2123)
+        DatapathPacket::marked_udp(MARK_BIT | 7, cookie, [192, 0, 2, 20], 2123)
+    }
+
+    fn model() -> EgressFenceModel {
+        EgressFenceModel::new(
+            endpoint(),
+            FenceMark::new(MARK_BIT).expect("single-bit fixture"),
+            4,
+        )
     }
 
     #[test]
     fn higher_successor_token_immediately_stales_old_cookie() {
-        let mut model = EgressFenceModel::new(endpoint(), 4);
+        let mut model = model();
         model.register_closed(OLD_COOKIE).expect("old registration");
+        model.publish_token(8).expect("old publication");
         model
             .activate(OLD_COOKIE, 8, 100, EGRESS_FENCE_INITIAL_COOKIE_EPOCH, 1)
             .expect("old activation");
         model.register_closed(NEW_COOKIE).expect("new registration");
+        model.publish_token(9).expect("successor publication");
         model
             .activate(NEW_COOKIE, 9, 200, EGRESS_FENCE_INITIAL_COOKIE_EPOCH, 2)
             .expect("new activation");
@@ -224,9 +251,10 @@ mod tests {
 
     #[test]
     fn delayed_old_token_cannot_regress_monotonic_current_fence() {
-        let mut model = EgressFenceModel::new(endpoint(), 4);
+        let mut model = model();
         model.register_closed(OLD_COOKIE).expect("old registration");
         model.register_closed(NEW_COOKIE).expect("new registration");
+        model.publish_token(9).expect("successor publication");
         model
             .activate(NEW_COOKIE, 9, 200, EGRESS_FENCE_INITIAL_COOKIE_EPOCH, 2)
             .expect("new activation");
@@ -241,12 +269,14 @@ mod tests {
 
     #[test]
     fn cleanup_removes_only_superseded_tokens_and_never_active_current() {
-        let mut model = EgressFenceModel::new(endpoint(), 4);
+        let mut model = model();
         model.register_closed(OLD_COOKIE).expect("old registration");
+        model.publish_token(8).expect("old publication");
         model
             .activate(OLD_COOKIE, 8, 100, EGRESS_FENCE_INITIAL_COOKIE_EPOCH, 1)
             .expect("old activation");
         model.register_closed(NEW_COOKIE).expect("new registration");
+        model.publish_token(9).expect("successor publication");
         model
             .activate(NEW_COOKIE, 9, 200, EGRESS_FENCE_INITIAL_COOKIE_EPOCH, 2)
             .expect("new activation");
@@ -258,9 +288,10 @@ mod tests {
 
     #[test]
     fn cleanup_reclaims_closed_and_expired_current_without_evicting_live_current() {
-        let mut model = EgressFenceModel::new(endpoint(), 4);
+        let mut model = model();
         model.register_closed(OLD_COOKIE).expect("old registration");
         model.register_closed(NEW_COOKIE).expect("new registration");
+        model.publish_token(8).expect("publication");
         model
             .activate(OLD_COOKIE, 8, 10, EGRESS_FENCE_INITIAL_COOKIE_EPOCH, 1)
             .expect("old activation");
@@ -275,8 +306,9 @@ mod tests {
 
     #[test]
     fn explicit_close_immediately_blocks_a_live_cookie() {
-        let mut model = EgressFenceModel::new(endpoint(), 4);
+        let mut model = model();
         model.register_closed(OLD_COOKIE).expect("registration");
+        model.publish_token(8).expect("publication");
         model
             .activate(OLD_COOKIE, 8, 100, EGRESS_FENCE_INITIAL_COOKIE_EPOCH, 1)
             .expect("activation");
@@ -290,7 +322,7 @@ mod tests {
 
     #[test]
     fn invalid_attachment_identity_drops_even_unrelated_unmarked_packet() {
-        let mut model = EgressFenceModel::new(endpoint(), 4);
+        let mut model = model();
         model.set_attachment_identity_valid(false);
         let unrelated = DatapathPacket::unmarked_udp(99, [198, 51, 100, 40], 9999);
 
@@ -299,9 +331,10 @@ mod tests {
 
     #[test]
     fn mark_mask_preserves_unowned_routing_bits() {
-        let marked = EGRESS_FENCE_MARK_VALUE | !EGRESS_FENCE_MARK_MASK;
-        let mut model = EgressFenceModel::new(endpoint(), 4);
+        let marked = MARK_BIT | !MARK_BIT;
+        let mut model = model();
         model.register_closed(OLD_COOKIE).expect("registration");
+        model.publish_token(8).expect("publication");
         model
             .activate(OLD_COOKIE, 8, 100, EGRESS_FENCE_INITIAL_COOKIE_EPOCH, 1)
             .expect("activation");
@@ -312,8 +345,9 @@ mod tests {
 
     #[test]
     fn delayed_same_token_refresh_cannot_reopen_after_terminal_close() {
-        let mut model = EgressFenceModel::new(endpoint(), 4);
+        let mut model = model();
         model.register_closed(OLD_COOKIE).expect("registration");
+        model.publish_token(8).expect("publication");
         model
             .activate(OLD_COOKIE, 8, 100, EGRESS_FENCE_INITIAL_COOKIE_EPOCH, 1)
             .expect("activation");
@@ -336,8 +370,9 @@ mod tests {
 
     #[test]
     fn cleanup_retains_current_terminal_tombstone_until_token_advances() {
-        let mut model = EgressFenceModel::new(endpoint(), 4);
+        let mut model = model();
         model.register_closed(OLD_COOKIE).expect("old registration");
+        model.publish_token(8).expect("old publication");
         model
             .activate(OLD_COOKIE, 8, 100, EGRESS_FENCE_INITIAL_COOKIE_EPOCH, 1)
             .expect("old activation");
@@ -347,10 +382,35 @@ mod tests {
         assert!(model.entry(OLD_COOKIE).expect("retained").is_terminal());
 
         model.register_closed(NEW_COOKIE).expect("new registration");
+        model.publish_token(9).expect("successor publication");
         model
             .activate(NEW_COOKIE, 9, 200, EGRESS_FENCE_INITIAL_COOKIE_EPOCH, 3)
             .expect("successor activation");
         assert_eq!(model.cleanup_reclaimable(4), 1);
         assert!(model.entry(OLD_COOKIE).is_none());
+    }
+
+    #[test]
+    fn publication_is_separate_monotonic_and_crash_before_activation_is_closed() {
+        let mut model = model();
+        model.register_closed(OLD_COOKIE).expect("old registration");
+        model.publish_token(8).expect("old publication");
+        model
+            .activate(OLD_COOKIE, 8, 100, EGRESS_FENCE_INITIAL_COOKIE_EPOCH, 1)
+            .expect("old activation");
+        model.register_closed(NEW_COOKIE).expect("new registration");
+
+        model.publish_token(9).expect("successor publication");
+
+        assert_eq!(
+            model.verdict(&packet(OLD_COOKIE), 2),
+            FenceVerdict::DropStaleToken
+        );
+        assert_eq!(
+            model.verdict(&packet(NEW_COOKIE), 2),
+            FenceVerdict::DropClosed
+        );
+        assert_eq!(model.publish_token(8), Err(ModelError::StaleDurableFence));
+        assert_eq!(model.current_durable_fence_token(), 9);
     }
 }

@@ -15,16 +15,8 @@ mod packet;
 
 pub use packet::{classify_ethernet_udp_source, PacketEndpointDisposition};
 
-/// ABI version encoded into every configuration and cookie entry.
-pub const EGRESS_FENCE_ABI_VERSION: u16 = 1;
-/// Reserved packet-mark bit identifying traffic in the fence domain.
-///
-/// Every other bit remains available to routing, XFRM, and downstream tc
-/// policy. The classifier clears this bit after a successful fence decision
-/// before continuing to later filters.
-pub const EGRESS_FENCE_MARK_MASK: u32 = 0x0100_0000;
-/// Required value within [`EGRESS_FENCE_MARK_MASK`].
-pub const EGRESS_FENCE_MARK_VALUE: u32 = EGRESS_FENCE_MARK_MASK;
+/// ABI version encoded into every configuration and control command.
+pub const EGRESS_FENCE_ABI_VERSION: u16 = 2;
 /// Maximum cookie entries in the non-LRU kernel hash map.
 pub const EGRESS_FENCE_MAX_COOKIE_ENTRIES: u32 = 4_096;
 /// Frozen tc classifier program name.
@@ -104,6 +96,59 @@ pub const CONTROL_RESULT_STATE_MISMATCH: u32 = 7;
 pub const CONTROL_RESULT_MAP_ERROR: u32 = 8;
 /// Entry was not safely reclaimable.
 pub const CONTROL_RESULT_NOT_RECLAIMABLE: u32 = 9;
+
+/// One centrally allocated packet-mark bit owned by a fence attachment.
+///
+/// There is deliberately no SDK-global bit choice: products can have XFRM,
+/// routing, or dataplane mark domains at any position. Product admission must
+/// select one bit disjoint from every other owner and persist that choice in
+/// [`FenceConfig`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct FenceMark {
+    bit: u32,
+}
+
+impl FenceMark {
+    /// Construct an exact single-bit mark domain.
+    #[must_use]
+    pub const fn new(bit: u32) -> Option<Self> {
+        if bit.count_ones() == 1 {
+            Some(Self { bit })
+        } else {
+            None
+        }
+    }
+
+    /// Owned mark mask and required value.
+    #[must_use]
+    pub const fn bit(self) -> u32 {
+        self.bit
+    }
+
+    /// Whether this mark is present on a packet.
+    #[must_use]
+    pub const fn is_present(self, packet_mark: u32) -> bool {
+        packet_mark & self.bit == self.bit
+    }
+
+    /// Clear only this fence-owned bit.
+    #[must_use]
+    pub const fn clear(self, packet_mark: u32) -> u32 {
+        packet_mark & !self.bit
+    }
+
+    /// Whether another mark mask overlaps this owned bit.
+    #[must_use]
+    pub const fn overlaps(self, other_mask: u32) -> bool {
+        self.bit & other_mask != 0
+    }
+}
+
+impl fmt::Debug for FenceMark {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("FenceMark(<redacted>)")
+    }
+}
 
 /// Exact local UDP source endpoint protected by one fence attachment.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -216,6 +261,7 @@ impl fmt::Debug for ProtectedEndpoint {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct FenceConfig {
     endpoint: ProtectedEndpoint,
+    mark: FenceMark,
     ifindex: u32,
     netns_cookie: u64,
     capacity: u32,
@@ -226,6 +272,7 @@ impl FenceConfig {
     #[must_use]
     pub const fn new(
         endpoint: ProtectedEndpoint,
+        mark: FenceMark,
         ifindex: u32,
         netns_cookie: u64,
         capacity: u32,
@@ -239,6 +286,7 @@ impl FenceConfig {
         } else {
             Some(Self {
                 endpoint,
+                mark,
                 ifindex,
                 netns_cookie,
                 capacity,
@@ -250,6 +298,12 @@ impl FenceConfig {
     #[must_use]
     pub const fn endpoint(self) -> ProtectedEndpoint {
         self.endpoint
+    }
+
+    /// Centrally allocated single-bit mark domain.
+    #[must_use]
+    pub const fn mark(self) -> FenceMark {
+        self.mark
     }
 
     /// Exact attach-interface index.
@@ -281,8 +335,8 @@ impl FenceConfig {
         let version = EGRESS_FENCE_ABI_VERSION.to_le_bytes();
         encoded[4] = version[0];
         encoded[5] = version[1];
-        let mark_value = EGRESS_FENCE_MARK_VALUE.to_le_bytes();
-        let mark_mask = EGRESS_FENCE_MARK_MASK.to_le_bytes();
+        let mark_value = self.mark.bit().to_le_bytes();
+        let mark_mask = self.mark.bit().to_le_bytes();
         encoded[8] = mark_value[0];
         encoded[9] = mark_value[1];
         encoded[10] = mark_value[2];
@@ -339,10 +393,6 @@ impl FenceConfig {
             || encoded[3] != CONFIG_MAGIC[3]
             || u16::from_le_bytes([encoded[4], encoded[5]]) != EGRESS_FENCE_ABI_VERSION
             || encoded[7] != 0
-            || u32::from_le_bytes([encoded[8], encoded[9], encoded[10], encoded[11]])
-                != EGRESS_FENCE_MARK_VALUE
-            || u32::from_le_bytes([encoded[12], encoded[13], encoded[14], encoded[15]])
-                != EGRESS_FENCE_MARK_MASK
             || encoded[18] != 0
             || encoded[19] != 0
             || encoded[52] != 0
@@ -353,6 +403,15 @@ impl FenceConfig {
             return None;
         }
         let port = u16::from_be_bytes([encoded[16], encoded[17]]);
+        let mark_value = u32::from_le_bytes([encoded[8], encoded[9], encoded[10], encoded[11]]);
+        let mark_mask = u32::from_le_bytes([encoded[12], encoded[13], encoded[14], encoded[15]]);
+        if mark_value != mark_mask {
+            return None;
+        }
+        let mark = match FenceMark::new(mark_mask) {
+            Some(mark) => mark,
+            None => return None,
+        };
         let ifindex = u32::from_le_bytes([encoded[20], encoded[21], encoded[22], encoded[23]]);
         let netns_cookie = u64::from_le_bytes([
             encoded[24],
@@ -394,7 +453,7 @@ impl FenceConfig {
         } else {
             return None;
         };
-        Self::new(endpoint, ifindex, netns_cookie, capacity)
+        Self::new(endpoint, mark, ifindex, netns_cookie, capacity)
     }
 }
 
@@ -403,6 +462,7 @@ impl fmt::Debug for FenceConfig {
         formatter
             .debug_struct("FenceConfig")
             .field("endpoint", &self.endpoint)
+            .field("mark", &self.mark)
             .field("attachment_identity", &"<redacted>")
             .field("capacity", &self.capacity)
             .finish()
@@ -555,7 +615,30 @@ impl ControlCommand {
         deadline_boot_ns: u64,
         expected_epoch: u64,
     ) -> Option<Self> {
-        if ifindex == 0 || netns_cookie == 0 {
+        let fields_are_canonical = match operation {
+            ControlOperation::PublishToken => {
+                socket_cookie == 0
+                    && durable_fence_token != 0
+                    && deadline_boot_ns == 0
+                    && expected_epoch == 0
+            }
+            ControlOperation::Activate | ControlOperation::Refresh => {
+                socket_cookie != 0
+                    && durable_fence_token != 0
+                    && deadline_boot_ns != 0
+                    && expected_epoch != 0
+            }
+            ControlOperation::Close => {
+                socket_cookie != 0
+                    && durable_fence_token != 0
+                    && deadline_boot_ns == 0
+                    && expected_epoch != 0
+            }
+            ControlOperation::Reclaim => {
+                socket_cookie != 0 && deadline_boot_ns == 0 && expected_epoch != 0
+            }
+        };
+        if ifindex == 0 || netns_cookie == 0 || !fields_are_canonical {
             None
         } else {
             Some(Self {
@@ -693,10 +776,12 @@ pub enum FenceEntryState {
 
 /// Canonical state for one registered socket cookie.
 ///
-/// The first four encoded bytes are reserved for the kernel's `bpf_spin_lock`
-/// and read as zero through `BPF_F_LOCK`. Every transition after initial
-/// registration is executed by the frozen control program while holding that
-/// lock.
+/// The first four encoded bytes are reserved and must remain zero. The cookie
+/// map deliberately has no per-entry spinlock: the classifier and control
+/// program look up all required map pointers first, then serialize every
+/// cookie read or transition with the single lock in the current-token map.
+/// That global lock makes token publication and cookie inspection one ordered
+/// domain without unsupported nested BPF locks.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct FenceEntry {
     state: FenceEntryState,
@@ -814,7 +899,8 @@ impl FenceEntry {
         encoded
     }
 
-    /// Decode an exact canonical map value.
+    /// Decode an exact canonical map value read while the global current-token
+    /// lock is held.
     #[must_use]
     pub const fn decode(encoded: &[u8; EGRESS_FENCE_COOKIE_VALUE_LEN]) -> Option<Self> {
         if encoded[0] != 0 || encoded[1] != 0 || encoded[2] != 0 || encoded[3] != 0 {
@@ -927,6 +1013,87 @@ impl FenceVerdict {
     }
 }
 
+/// Packet-side inputs to one classifier decision.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct PacketFenceContext {
+    attachment_identity_valid: bool,
+    endpoint_disposition: PacketEndpointDisposition,
+    fence_mark: FenceMark,
+    packet_mark: u32,
+    socket_cookie: u64,
+}
+
+impl PacketFenceContext {
+    /// Build packet-side decision context.
+    #[must_use]
+    pub const fn new(
+        attachment_identity_valid: bool,
+        endpoint_disposition: PacketEndpointDisposition,
+        fence_mark: FenceMark,
+        packet_mark: u32,
+        socket_cookie: u64,
+    ) -> Self {
+        Self {
+            attachment_identity_valid,
+            endpoint_disposition,
+            fence_mark,
+            packet_mark,
+            socket_cookie,
+        }
+    }
+}
+
+impl fmt::Debug for PacketFenceContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PacketFenceContext")
+            .field("attachment_identity_valid", &self.attachment_identity_valid)
+            .field("endpoint_disposition", &self.endpoint_disposition)
+            .field("fence_mark", &self.fence_mark)
+            .field("socket_cookie_present", &(self.socket_cookie != 0))
+            .finish()
+    }
+}
+
+/// Globally serialized authority snapshot for one classifier decision.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct FenceAuthoritySnapshot {
+    entry: Option<FenceEntry>,
+    current_durable_fence_token: u64,
+    now_boot_ns: u64,
+}
+
+impl FenceAuthoritySnapshot {
+    /// Build an authority snapshot copied while the global current-token lock
+    /// is held.
+    #[must_use]
+    pub const fn new(
+        entry: Option<FenceEntry>,
+        current_durable_fence_token: u64,
+        now_boot_ns: u64,
+    ) -> Self {
+        Self {
+            entry,
+            current_durable_fence_token,
+            now_boot_ns,
+        }
+    }
+}
+
+impl fmt::Debug for FenceAuthoritySnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FenceAuthoritySnapshot")
+            .field("entry_present", &self.entry.is_some())
+            .field(
+                "current_durable_fence_token_present",
+                &(self.current_durable_fence_token != 0),
+            )
+            .field("clock_present", &(self.now_boot_ns != 0))
+            .finish()
+    }
+}
+
 /// Apply the fail-closed fence decision after packet endpoint parsing.
 ///
 /// `endpoint_matches` means the packet is UDP sourced from the configured
@@ -934,40 +1101,35 @@ impl FenceVerdict {
 /// a marked packet is always in-domain even if endpoint parsing failed.
 #[must_use]
 pub const fn decide_egress(
-    attachment_identity_valid: bool,
-    endpoint_disposition: PacketEndpointDisposition,
-    packet_mark: u32,
-    socket_cookie: u64,
-    entry: Option<FenceEntry>,
-    current_durable_fence_token: u64,
-    now_boot_ns: u64,
+    packet: PacketFenceContext,
+    authority: FenceAuthoritySnapshot,
 ) -> FenceVerdict {
-    if !attachment_identity_valid {
+    if !packet.attachment_identity_valid {
         return FenceVerdict::DropMalformed;
     }
-    let marked = packet_mark & EGRESS_FENCE_MARK_MASK == EGRESS_FENCE_MARK_VALUE;
+    let marked = packet.fence_mark.is_present(packet.packet_mark);
     if !marked {
-        return match endpoint_disposition {
+        return match packet.endpoint_disposition {
             PacketEndpointDisposition::Protected => FenceVerdict::DropUnmarked,
             PacketEndpointDisposition::Unrelated => FenceVerdict::PassUnrelated,
             PacketEndpointDisposition::Indeterminate => FenceVerdict::DropMalformed,
         };
     }
-    if socket_cookie == 0 {
+    if packet.socket_cookie == 0 {
         return FenceVerdict::DropCookieZero;
     }
-    let Some(entry) = entry else {
+    let Some(entry) = authority.entry else {
         return FenceVerdict::DropMissing;
     };
     if !matches!(entry.state(), FenceEntryState::Active) {
         return FenceVerdict::DropClosed;
     }
-    if current_durable_fence_token == 0
-        || entry.durable_fence_token() != current_durable_fence_token
+    if authority.current_durable_fence_token == 0
+        || entry.durable_fence_token() != authority.current_durable_fence_token
     {
         return FenceVerdict::DropStaleToken;
     }
-    if now_boot_ns >= entry.deadline_boot_ns() {
+    if authority.now_boot_ns >= entry.deadline_boot_ns() {
         return FenceVerdict::DropExpired;
     }
     FenceVerdict::Allow
@@ -1015,13 +1177,16 @@ const fn get_u64<const N: usize>(encoded: &[u8; N], offset: usize) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use super::*;
 
     #[test]
     fn config_and_cookie_encodings_are_canonical() {
         let endpoint = ProtectedEndpoint::ipv4([192, 0, 2, 10], 2123)
             .expect("documentation address is a usable fixture");
-        let config = FenceConfig::new(endpoint, 7, 11, 64).expect("canonical fixture");
+        let mark = FenceMark::new(1 << 17).expect("single-bit fixture");
+        let config = FenceConfig::new(endpoint, mark, 7, 11, 64).expect("canonical fixture");
         assert_eq!(FenceConfig::decode(&config.encode()), Some(config));
 
         let closed = FenceEntry::terminal_closed(9, 3).expect("nonzero terminal epoch");
@@ -1044,15 +1209,110 @@ mod tests {
         let active = FenceEntry::active(9, 10, 2).expect("nonzero active fixture");
         assert_eq!(
             decide_egress(
-                true,
-                PacketEndpointDisposition::Protected,
-                EGRESS_FENCE_MARK_VALUE,
-                11,
-                Some(active),
-                9,
-                10,
+                PacketFenceContext::new(
+                    true,
+                    PacketEndpointDisposition::Protected,
+                    FenceMark::new(1 << 17).expect("single-bit fixture"),
+                    1 << 17,
+                    11,
+                ),
+                FenceAuthoritySnapshot::new(Some(active), 9, 10),
             ),
             FenceVerdict::DropExpired
         );
+    }
+
+    #[test]
+    fn fence_mark_is_single_bit_and_reports_overlap_without_exposing_value() {
+        let mark = FenceMark::new(1 << 17).expect("single-bit fixture");
+        assert!(mark.is_present((1 << 17) | 7));
+        assert_eq!(mark.clear((1 << 17) | 7), 7);
+        assert!(mark.overlaps(0x0003_f000));
+        assert!(!mark.overlaps(0xfe00_0000));
+        assert!(FenceMark::new(0).is_none());
+        assert!(FenceMark::new(3).is_none());
+        assert_eq!(std::format!("{mark:?}"), "FenceMark(<redacted>)");
+    }
+
+    #[test]
+    fn control_command_operations_reject_every_noncanonical_field_shape() {
+        let publish = ControlCommand::new(ControlOperation::PublishToken, 7, 11, 0, 9, 0, 0)
+            .expect("canonical publication");
+        let activate = ControlCommand::new(ControlOperation::Activate, 7, 11, 13, 9, 10, 1)
+            .expect("canonical activation");
+        let refresh = ControlCommand::new(ControlOperation::Refresh, 7, 11, 13, 9, 10, 1)
+            .expect("canonical refresh");
+        let close = ControlCommand::new(ControlOperation::Close, 7, 11, 13, 9, 0, 1)
+            .expect("canonical close");
+        let reclaim = ControlCommand::new(ControlOperation::Reclaim, 7, 11, 13, 0, 0, 1)
+            .expect("canonical initial-state reclaim");
+        for command in [publish, activate, refresh, close, reclaim] {
+            assert_eq!(ControlCommand::decode(&command.encode()), Some(command));
+        }
+
+        assert!(ControlCommand::new(ControlOperation::PublishToken, 0, 11, 0, 9, 0, 0).is_none());
+        assert!(ControlCommand::new(ControlOperation::PublishToken, 7, 0, 0, 9, 0, 0).is_none());
+        assert!(ControlCommand::new(ControlOperation::PublishToken, 7, 11, 13, 9, 0, 0).is_none());
+        assert!(ControlCommand::new(ControlOperation::PublishToken, 7, 11, 0, 0, 0, 0).is_none());
+        assert!(ControlCommand::new(ControlOperation::PublishToken, 7, 11, 0, 9, 10, 0).is_none());
+        assert!(ControlCommand::new(ControlOperation::PublishToken, 7, 11, 0, 9, 0, 1).is_none());
+
+        for operation in [ControlOperation::Activate, ControlOperation::Refresh] {
+            assert!(ControlCommand::new(operation, 7, 11, 0, 9, 10, 1).is_none());
+            assert!(ControlCommand::new(operation, 7, 11, 13, 0, 10, 1).is_none());
+            assert!(ControlCommand::new(operation, 7, 11, 13, 9, 0, 1).is_none());
+            assert!(ControlCommand::new(operation, 7, 11, 13, 9, 10, 0).is_none());
+        }
+
+        assert!(ControlCommand::new(ControlOperation::Close, 7, 11, 0, 9, 0, 1).is_none());
+        assert!(ControlCommand::new(ControlOperation::Close, 7, 11, 13, 0, 0, 1).is_none());
+        assert!(ControlCommand::new(ControlOperation::Close, 7, 11, 13, 9, 10, 1).is_none());
+        assert!(ControlCommand::new(ControlOperation::Close, 7, 11, 13, 9, 0, 0).is_none());
+
+        assert!(ControlCommand::new(ControlOperation::Reclaim, 7, 11, 0, 0, 0, 1).is_none());
+        assert!(ControlCommand::new(ControlOperation::Reclaim, 7, 11, 13, 0, 10, 1).is_none());
+        assert!(ControlCommand::new(ControlOperation::Reclaim, 7, 11, 13, 0, 0, 0).is_none());
+    }
+
+    #[test]
+    fn encoded_control_field_mutations_fail_canonical_decode() {
+        let activate = ControlCommand::new(ControlOperation::Activate, 7, 11, 13, 9, 10, 1)
+            .expect("canonical activation")
+            .encode();
+        for offset in [0, 4, 6, 8, 16, 24, 32, 40, 48] {
+            let mut mutated = activate;
+            mutated[offset] = 0;
+            assert!(
+                ControlCommand::decode(&mutated).is_none(),
+                "offset {offset} must be canonical"
+            );
+        }
+        for offset in [7, 12, 56] {
+            let mut mutated = activate;
+            mutated[offset] = 1;
+            assert!(
+                ControlCommand::decode(&mutated).is_none(),
+                "reserved offset {offset} must be zero"
+            );
+        }
+
+        let publish = ControlCommand::new(ControlOperation::PublishToken, 7, 11, 0, 9, 0, 0)
+            .expect("canonical publication")
+            .encode();
+        for offset in [24, 40, 48] {
+            let mut mutated = publish;
+            mutated[offset] = 1;
+            assert!(
+                ControlCommand::decode(&mutated).is_none(),
+                "publication offset {offset} must remain zero"
+            );
+        }
+
+        let close = ControlCommand::new(ControlOperation::Close, 7, 11, 13, 9, 0, 1)
+            .expect("canonical close")
+            .encode();
+        let mut close_with_deadline = close;
+        close_with_deadline[40] = 1;
+        assert!(ControlCommand::decode(&close_with_deadline).is_none());
     }
 }
