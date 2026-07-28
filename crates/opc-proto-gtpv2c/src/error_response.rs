@@ -12,8 +12,9 @@ use core::fmt;
 use core::num::NonZeroU32;
 
 use bytes::{Bytes, BytesMut};
-use opc_protocol::{Encode, EncodeContext, EncodeError, EncodeErrorCode, SpecRef};
+use opc_protocol::{DecodeErrorCode, Encode, EncodeContext, EncodeError, EncodeErrorCode, SpecRef};
 
+use crate::decode_error::Gtpv2cDecodeError;
 use crate::header::{
     Header, MessagePriority, MessageType, GTPV2C_VERSION, HEADER_LEN_WITHOUT_TEID,
     HEADER_LEN_WITH_TEID, MAX_SEQUENCE_NUMBER,
@@ -21,6 +22,12 @@ use crate::header::{
 use crate::ie::{encode_typed_ie_sequence, Cause, CauseValue, Recovery, TypedIe, TypedIeValue};
 use crate::s2b::{procedure_and_direction, MessageDirection, Procedure};
 use crate::OwnedMessage;
+
+// Element identity is defined one layer down, in `crate::decode_error`, so the
+// decoder can produce it without this disposition module -- which imports
+// `crate::ie` and `crate::s2b` -- becoming a dependency of `crate::ie`. Re-
+// exported here so `error_response::Gtpv2cOffendingIe` keeps resolving.
+pub use crate::decode_error::{Gtpv2cInvalidOffendingIeInstance, Gtpv2cOffendingIe};
 
 /// Largest canonical response produced by this boundary, in octets.
 ///
@@ -429,73 +436,6 @@ pub fn inspect_gtpv2c_request(input: &[u8]) -> Gtpv2cRequestInspection {
     })
 }
 
-/// Type and four-bit instance of a mandatory or verifiable conditional IE.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Gtpv2cOffendingIe {
-    ie_type: u8,
-    instance: u8,
-}
-
-impl Gtpv2cOffendingIe {
-    /// Validate and construct an offending-IE identity.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Gtpv2cInvalidOffendingIeInstance`] when `instance` is wider
-    /// than the four-bit GTPv2-C IE Instance field.
-    pub const fn new(ie_type: u8, instance: u8) -> Result<Self, Gtpv2cInvalidOffendingIeInstance> {
-        if instance <= 0x0f {
-            Ok(Self { ie_type, instance })
-        } else {
-            Err(Gtpv2cInvalidOffendingIeInstance { instance })
-        }
-    }
-
-    /// IE Type octet.
-    #[must_use]
-    pub const fn ie_type(self) -> u8 {
-        self.ie_type
-    }
-
-    /// Four-bit IE Instance.
-    #[must_use]
-    pub const fn instance(self) -> u8 {
-        self.instance
-    }
-
-    const fn cause_field(self) -> [u8; 4] {
-        [self.ie_type, 0, 0, self.instance]
-    }
-}
-
-/// Error returned for an offending-IE instance wider than four bits.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Gtpv2cInvalidOffendingIeInstance {
-    instance: u8,
-}
-
-impl Gtpv2cInvalidOffendingIeInstance {
-    /// Stable machine-readable error code.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        "gtpv2c_offending_ie_instance_out_of_range"
-    }
-
-    /// Return the rejected instance.
-    #[must_use]
-    pub const fn instance(self) -> u8 {
-        self.instance
-    }
-}
-
-impl fmt::Display for Gtpv2cInvalidOffendingIeInstance {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
-
-impl std::error::Error for Gtpv2cInvalidOffendingIeInstance {}
-
 /// Clause 5.5.2 TEID decision for a protocol-error response.
 ///
 /// Context Not Found is deliberately not represented here. That cause uses
@@ -666,6 +606,49 @@ impl Gtpv2cErrorResponsePlanner {
         }
     }
 
+    /// Plan an Invalid Length response from checked decoder evidence.
+    ///
+    /// This is the safe bridge between [`Gtpv2cDecodeError`] and the public
+    /// protocol-error planning surface. It returns `None` unless `failure` is
+    /// length-shaped and identifies an IE proven to be at message top level.
+    /// In particular, a grouped member is refused even when
+    /// [`Gtpv2cDecodeError::offending_ie`] can name it: this crate does not yet
+    /// encode the grouped-IE Cause flags, and emitting that member with the
+    /// current zero flags octet would falsely claim that it appeared at message
+    /// top level.
+    ///
+    /// A returned [`Gtpv2cErrorResponseDecision`] still applies the normal
+    /// fixed-header request, Echo and message-length checks. Before calling
+    /// this method, the caller must additionally have resolved from the message
+    /// grammar that the top-level slot is Mandatory or verifiable Conditional;
+    /// decoder identity alone cannot establish that presence condition.
+    ///
+    /// `input` must be the exact datagram whose message decode produced
+    /// `failure`. The type system cannot authenticate that association: callers
+    /// must not combine evidence from another packet or from a standalone IE
+    /// subregion with this request. Generic subregion decoders deliberately
+    /// retain unknown scope, but that is not a substitute for preserving the
+    /// datagram/evidence pairing at the transport boundary.
+    ///
+    /// `response_teid` remains an explicit clause 5.5.2 decision. The planner
+    /// never performs a session lookup.
+    #[must_use]
+    pub fn plan_invalid_ie_length_from_decode(
+        &self,
+        input: &[u8],
+        failure: &Gtpv2cDecodeError,
+        response_teid: Gtpv2cProtocolErrorResponseTeid,
+    ) -> Option<Gtpv2cErrorResponseDecision> {
+        let offending_ie = top_level_invalid_ie_length(failure)?;
+        Some(self.plan(
+            input,
+            Gtpv2cRequestFailure::Protocol(Gtpv2cProtocolError::new(
+                Gtpv2cProtocolErrorKind::InvalidIeLength(offending_ie),
+                response_teid,
+            )),
+        ))
+    }
+
     /// Build message type 3 from a proven higher-version envelope.
     ///
     /// This entry point deliberately takes no request-failure argument. The
@@ -767,6 +750,17 @@ impl Gtpv2cErrorResponsePlanner {
                 ))
             }
         }
+    }
+}
+
+fn top_level_invalid_ie_length(failure: &Gtpv2cDecodeError) -> Option<Gtpv2cOffendingIe> {
+    if matches!(
+        failure.code(),
+        DecodeErrorCode::Truncated | DecodeErrorCode::InvalidLength { .. }
+    ) {
+        failure.top_level_offending_ie()
+    } else {
+        None
     }
 }
 
@@ -1195,5 +1189,34 @@ impl<T> fmt::Debug for Gtpv2cPlannedSend<T> {
             .field("plan", &self.plan)
             .field("send_tuple", &self.send_tuple)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use opc_protocol::{DecodeError, DecodeErrorCode};
+
+    use super::*;
+
+    fn positively_scoped_failure(code: DecodeErrorCode) -> Gtpv2cDecodeError {
+        Gtpv2cDecodeError::new(DecodeError::new(code, 0))
+            .annotate_offending(Gtpv2cOffendingIe::from_wire(71, 0))
+            .mark_message_top_level()
+    }
+
+    #[test]
+    fn invalid_ie_length_bridge_code_gate_is_exact() {
+        let invalid_length =
+            positively_scoped_failure(DecodeErrorCode::InvalidLength { reason: "test" });
+        assert_eq!(
+            top_level_invalid_ie_length(&invalid_length),
+            invalid_length.top_level_offending_ie()
+        );
+
+        let non_length = positively_scoped_failure(DecodeErrorCode::Structural { reason: "test" });
+        assert_eq!(top_level_invalid_ie_length(&non_length), None);
+
+        let arithmetic = positively_scoped_failure(DecodeErrorCode::LengthOverflow);
+        assert_eq!(top_level_invalid_ie_length(&arithmetic), None);
     }
 }

@@ -16,6 +16,7 @@ use opc_protocol::{
     EncodeErrorCode, SpecRef, UnknownIePolicy,
 };
 
+use crate::decode_error::{Gtpv2cDecodeError, Gtpv2cOffendingIe};
 use crate::ie::{RawIe, RawIeIterator, IE_HEADER_LEN};
 
 /// Maximum number of distinct duplicate-IE keys retained in receive diagnostics.
@@ -160,15 +161,33 @@ type IeRepeatableLimit<'f> = &'f dyn Fn(u8, u8, usize, Option<(u8, u8)>) -> Opti
 const DISCARD_MALFORMED_OPTIONAL_IE_TYPES: &[u8] = &[IE_TYPE_NODE_IDENTIFIER];
 
 /// Whether a decode applies the TS 29.274 clause 7.7.8 receiver rule.
+///
+/// The axis is *does this frame hold a receiver profile*, not sender versus
+/// receiver. The clause 7.7.8 discard is conditioned on the IE being optional
+/// **at the slot it was received in**, which is a property of the procedure,
+/// the direction and the message grammar. A frame that has not resolved those
+/// cannot establish the condition, so it is not entitled to the disposition.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MalformedOptionalIePolicy {
-    /// Receiver profile: discard a malformed optional IE and keep processing.
+    /// Licensed only where the caller has resolved a receiver profile and can
+    /// therefore establish that the IE is presence-Optional at this slot:
+    /// discard the malformed IE and keep processing the rest of the message.
+    ///
+    /// The crate does not yet meet that bar everywhere it selects this
+    /// variant. `s2b` picks it from the decode purpose alone, so the
+    /// non-procedure-aware receive branches reach it without consulting the
+    /// receive disposition table, and presence there rests on
+    /// [`DISCARD_MALFORMED_OPTIONAL_IE_TYPES`] rather than on a resolved per-IE
+    /// profile. That gap is a declared residual, recorded at the selection site
+    /// in `s2b`; a new entry in that allowlist inherits it.
     Discard,
-    /// Sender self-validation: a malformed IE the crate is about to put on the
-    /// wire is a build failure. Clauses 7.7.7 and 7.7.8 bind "the receiver of
-    /// a GTP signalling message"; they license nothing on the send path, and
-    /// silently dropping a caller-supplied IE from a message that still
-    /// carries its bytes would emit exactly what clause 8.107 forbids.
+    /// The fail-closed default. Used for sender self-validation -- a malformed
+    /// IE the crate is about to put on the wire is a build failure, because
+    /// clauses 7.7.7 and 7.7.8 bind "the receiver of a GTP signalling message"
+    /// and license nothing on the send path, and silently dropping a
+    /// caller-supplied IE from a message that still carries its bytes would
+    /// emit exactly what clause 8.107 forbids -- and equally for any frame
+    /// that holds no receiver profile and so cannot resolve presence.
     Reject,
 }
 
@@ -221,7 +240,7 @@ impl<'p> IeDecodePolicy<'p> {
     /// and `InvalidLength` are the two the clause 8.107 value decoder raises;
     /// `LengthOverflow` is the offset arithmetic guarding the decode, not a
     /// statement about the received octets, and must still fail the message.
-    fn discards_malformed(&self, ie_type: u8, error: &DecodeError) -> bool {
+    fn discards_malformed(&self, ie_type: u8, error: &Gtpv2cDecodeError) -> bool {
         matches!(self.malformed_optional, MalformedOptionalIePolicy::Discard)
             && DISCARD_MALFORMED_OPTIONAL_IE_TYPES.contains(&ie_type)
             && matches!(
@@ -2482,6 +2501,11 @@ impl<'a> BearerContext<'a> {
     /// the four-octet TLIV header). It is passed through to nested decoders so
     /// that errors inside grouped members report offsets relative to the
     /// message rather than to the grouped value.
+    ///
+    /// The rich error type is load-bearing here rather than incidental: the
+    /// nested sequence names the failing member, and downgrading to
+    /// [`DecodeError`] at this frame would erase that identity silently on the
+    /// way back out.
     fn decode_value(
         value: &'a [u8],
         ctx: DecodeContext,
@@ -2490,12 +2514,12 @@ impl<'a> BearerContext<'a> {
         instance: u8,
         policy: IeDecodePolicy<'_>,
         duplicate_evidence: &mut DuplicateIeCollector,
-    ) -> Result<Self, DecodeError> {
+    ) -> Result<Self, Gtpv2cDecodeError> {
         if depth.saturating_add(1) > ctx.max_depth {
-            return Err(
+            return Err(Gtpv2cDecodeError::new(
                 DecodeError::new(DecodeErrorCode::DepthExceeded, base_offset)
                     .with_spec_ref(spec_ref()),
-            );
+            ));
         }
         Ok(Self {
             members: decode_typed_ie_sequence_at(
@@ -3810,15 +3834,15 @@ impl<'a> TypedIe<'a> {
     /// Unknown IEs are omitted, retained as [`TypedIeValue::Raw`], or rejected
     /// according to [`DecodeContext::unknown_ie_policy`].
     ///
-    /// This sequence decoder also applies the TS 29.274 clause 7.7.8 receiver
-    /// rule: a *known* IE whose value cannot be interpreted, and which this
-    /// crate classifies as optional where it receives it, is silently absent
-    /// from the returned sequence instead of failing the decode. Node
-    /// Identifier (IE 176) is currently the only such type. Callers that must
-    /// observe the malformed octets should decode with
-    /// [`RawIeIterator`] or re-encode raw-preserving, both of which still see
-    /// them; callers that need the value-level error should use
-    /// [`Self::decode_from_raw`], which reports it.
+    /// This sequence decoder does **not** apply the TS 29.274 clause 7.7.8
+    /// receiver discard, and fails closed instead: a *known* IE whose value
+    /// cannot be interpreted returns an error. The clause conditions the
+    /// discard on the IE being optional at the slot it arrived in, and this
+    /// entry point receives no release, interface, procedure or direction, so
+    /// it cannot establish that condition for any slot. The profiled receive
+    /// path, [`crate::S2bMessage::decode`] under
+    /// [`opc_protocol::ValidationLevel::ProcedureAware`], resolves presence and
+    /// still discards.
     pub fn decode_sequence(input: &'a [u8], ctx: DecodeContext) -> Result<Vec<Self>, DecodeError> {
         decode_typed_ie_sequence(input, ctx, 0)
     }
@@ -3831,11 +3855,9 @@ impl<'a> TypedIe<'a> {
     ///
     /// This single-result conversion cannot represent deliberate omission.
     /// Consequently, an unsupported IE is returned as [`TypedIeValue::Raw`]
-    /// under both [`UnknownIePolicy::Drop`] and [`UnknownIePolicy::Preserve`],
-    /// and a malformed optional IE is returned as an error rather than as the
-    /// TS 29.274 clause 7.7.8 discard. Use [`Self::decode_sequence`] or
-    /// [`decode_typed_ie_sequence`] when the complete three-way unknown-IE
-    /// policy, or the clause 7.7.8 discard, must be enforced.
+    /// under both [`UnknownIePolicy::Drop`] and [`UnknownIePolicy::Preserve`].
+    /// Use [`Self::decode_sequence`] or [`decode_typed_ie_sequence`] when the
+    /// complete three-way unknown-IE policy must be enforced.
     pub fn decode_from_raw(
         raw: RawIe<'a>,
         ctx: DecodeContext,
@@ -3851,6 +3873,7 @@ impl<'a> TypedIe<'a> {
             IeDecodePolicy::legacy(false, MalformedOptionalIePolicy::Reject),
             &mut duplicate_evidence,
         )
+        .map_err(DecodeError::from)
     }
 
     fn decode_from_raw_with_evidence(
@@ -3860,8 +3883,46 @@ impl<'a> TypedIe<'a> {
         base_offset: usize,
         policy: IeDecodePolicy<'_>,
         duplicate_evidence: &mut DuplicateIeCollector,
-    ) -> Result<Self, DecodeError> {
+    ) -> Result<Self, Gtpv2cDecodeError> {
         let value_offset = checked_add_offset(base_offset, IE_HEADER_LEN)?;
+        // The single value-dispatch chokepoint, so one `map_err` covers every
+        // typed value decoder. Bearer Context is excluded: its value decode
+        // recurses, so an error from inside already names the member (or, for a
+        // member header too short to read, honestly names nothing). Annotating
+        // here would overwrite a real member identity's absence with the
+        // container's, asserting a top-level element that clause 8.4's zeroed
+        // Cause flags octet would then misreport.
+        let value = Self::decode_value_from_raw(
+            &raw,
+            ctx,
+            depth,
+            base_offset,
+            value_offset,
+            policy,
+            duplicate_evidence,
+        )
+        .map_err(|failure| {
+            if raw.ie_type == IE_TYPE_BEARER_CONTEXT {
+                failure
+            } else {
+                failure.annotate_offending_if_absent(raw.ie_type, raw.instance)
+            }
+        })?;
+        Ok(Self {
+            instance: raw.instance,
+            value,
+        })
+    }
+
+    fn decode_value_from_raw(
+        raw: &RawIe<'a>,
+        ctx: DecodeContext,
+        depth: usize,
+        base_offset: usize,
+        value_offset: usize,
+        policy: IeDecodePolicy<'_>,
+        duplicate_evidence: &mut DuplicateIeCollector,
+    ) -> Result<TypedIeValue<'a>, Gtpv2cDecodeError> {
         let value = match raw.ie_type {
             IE_TYPE_IMSI => TypedIeValue::Imsi(TbcdDigits::decode_value(raw.value, value_offset)?),
             IE_TYPE_CAUSE => TypedIeValue::Cause(Cause::decode_value(raw.value, value_offset)?),
@@ -3961,17 +4022,14 @@ impl<'a> TypedIe<'a> {
                 TwanIdentifierTimestamp::decode_value(raw.value, value_offset)?,
             ),
             _ if matches!(ctx.unknown_ie_policy, UnknownIePolicy::Reject) => {
-                return Err(
+                return Err(Gtpv2cDecodeError::new(
                     DecodeError::new(DecodeErrorCode::UnknownCriticalIe, base_offset)
                         .with_spec_ref(spec_ref()),
-                );
+                ));
             }
             _ => TypedIeValue::Raw(raw.clone()),
         };
-        Ok(Self {
-            instance: raw.instance,
-            value,
-        })
+        Ok(value)
     }
 
     /// Return the IE type code for this typed value.
@@ -4203,9 +4261,13 @@ pub fn encode_typed_ie_sequence(
 /// typed sequence; callers that retain the enclosing raw message bytes can
 /// still perform a separate raw-preserving re-encode.
 ///
-/// This is a receive-side helper, so it applies TS 29.274 clause 7.7.8: an
-/// optional IE whose value is malformed is discarded and the remaining IEs are
-/// returned as if that IE had been absent.
+/// This entry point takes only `(input, ctx, depth)`. It has no release,
+/// interface, procedure or direction, so it cannot establish whether a given
+/// IE is presence-Optional at the slot it is looking at. The TS 29.274 clause
+/// 7.7.8 discard is conditioned on exactly that, so this decoder is not
+/// entitled to it and **fails closed**: a known IE whose value cannot be
+/// interpreted returns an error rather than being silently dropped. The
+/// profiled receive path resolves presence and still discards.
 ///
 /// @spec 3GPP TS29274 R18 8.2
 /// @req REQ-3GPP-TS29274-R18-S2B-IE-004
@@ -4219,9 +4281,10 @@ pub fn decode_typed_ie_sequence<'a>(
         input,
         ctx,
         IeSequencePosition::root(depth),
-        IeDecodePolicy::legacy(false, MalformedOptionalIePolicy::Discard),
+        IeDecodePolicy::legacy(false, MalformedOptionalIePolicy::Reject),
         &mut duplicate_evidence,
     )
+    .map_err(DecodeError::from)
 }
 
 pub(crate) fn decode_typed_ie_sequence_with_evidence<'a>(
@@ -4229,7 +4292,7 @@ pub(crate) fn decode_typed_ie_sequence_with_evidence<'a>(
     ctx: DecodeContext,
     depth: usize,
     malformed_optional: MalformedOptionalIePolicy,
-) -> Result<DecodedIeSequence<'a>, DecodeError> {
+) -> Result<DecodedIeSequence<'a>, Gtpv2cDecodeError> {
     let mut collector = DuplicateIeCollector::default();
     let ies = decode_typed_ie_sequence_at(
         input,
@@ -4256,7 +4319,7 @@ pub(crate) fn decode_pgw_triggered_request_ie_sequence_with_evidence<'a>(
     input: &'a [u8],
     ctx: DecodeContext,
     malformed_optional: MalformedOptionalIePolicy,
-) -> Result<DecodedIeSequence<'a>, DecodeError> {
+) -> Result<DecodedIeSequence<'a>, Gtpv2cDecodeError> {
     let mut collector = DuplicateIeCollector::default();
     let ies = decode_typed_ie_sequence_at(
         input,
@@ -4281,7 +4344,7 @@ pub(crate) fn decode_s2b_receive_ie_sequence_with_evidence<'a>(
     filter: IeDecodeFilter<'_>,
     scoped_repeatable_limit: IeRepeatableLimit<'_>,
     malformed_optional: MalformedOptionalIePolicy,
-) -> Result<DecodedIeSequence<'a>, DecodeError> {
+) -> Result<DecodedIeSequence<'a>, Gtpv2cDecodeError> {
     let mut collector = DuplicateIeCollector::default();
     let ies = decode_typed_ie_sequence_at(
         input,
@@ -4313,19 +4376,42 @@ fn decode_typed_ie_sequence_at<'a>(
     position: IeSequencePosition,
     policy: IeDecodePolicy<'_>,
     duplicate_evidence: &mut DuplicateIeCollector,
-) -> Result<Vec<TypedIe<'a>>, DecodeError> {
+) -> Result<Vec<TypedIe<'a>>, Gtpv2cDecodeError> {
+    // Grouping scope is attached at the single exit of the scope it describes,
+    // so no error path inside can miss it. It is reported separately from the
+    // offending IE because this crate's Cause encoder zeroes clause 8.4's flags
+    // octet, and a zeroed octet asserts a top-level element. This exit records
+    // positive Grouped scope independently of whether the container identity
+    // itself is representable. Absence of an enclosing identity is not proof
+    // of message-top-level scope; only the outer message frame can positively
+    // establish that, and disposition uses the checked projection.
+    decode_typed_ie_sequence_at_inner(input, ctx, position, policy, duplicate_evidence).map_err(
+        |failure| match position.parent_ie {
+            Some((ie_type, instance)) => failure.annotate_enclosing_if_absent(ie_type, instance),
+            None => failure,
+        },
+    )
+}
+
+fn decode_typed_ie_sequence_at_inner<'a>(
+    input: &'a [u8],
+    ctx: DecodeContext,
+    position: IeSequencePosition,
+    policy: IeDecodePolicy<'_>,
+    duplicate_evidence: &mut DuplicateIeCollector,
+) -> Result<Vec<TypedIe<'a>>, Gtpv2cDecodeError> {
     if position.depth > ctx.max_depth {
-        return Err(
+        return Err(Gtpv2cDecodeError::new(
             DecodeError::new(DecodeErrorCode::DepthExceeded, position.base_offset)
                 .with_spec_ref(spec_ref()),
-        );
+        ));
     }
     let mut ies: Vec<TypedIe<'a>> = Vec::new();
     let mut seen = Vec::new();
     let mut iter = RawIeIterator::new_at_offset(input, ctx, position.base_offset);
     loop {
         let offset = iter.offset();
-        match iter.next() {
+        match iter.next_annotated() {
             Some(Ok(raw)) => {
                 if policy.filter.is_some_and(|filter| {
                     !filter(
@@ -4368,8 +4454,16 @@ fn decode_typed_ie_sequence_at<'a>(
                     if repeatable_limit.is_none() {
                         match ctx.duplicate_ie_policy {
                             DuplicateIePolicy::Reject => {
-                                return Err(DecodeError::new(DecodeErrorCode::DuplicateIe, offset)
-                                    .with_spec_ref(spec_ref()));
+                                // `raw`'s header is fully parsed and the error
+                                // is about that element's octets, so it names
+                                // the repeated key rather than nothing.
+                                return Err(Gtpv2cDecodeError::new(
+                                    DecodeError::new(DecodeErrorCode::DuplicateIe, offset)
+                                        .with_spec_ref(spec_ref()),
+                                )
+                                .annotate_offending(
+                                    Gtpv2cOffendingIe::from_wire(raw.ie_type, raw.instance),
+                                ));
                             }
                             DuplicateIePolicy::First => {
                                 duplicate_evidence.record(

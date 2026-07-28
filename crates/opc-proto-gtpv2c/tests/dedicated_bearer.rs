@@ -1098,7 +1098,7 @@ fn malformed_bearer_tft_decode_maps_syntax_and_filter_causes() {
         let bytes = raw_create_request_with_members(members);
         let error = S2bMessage::decode(&bytes, procedure_context())
             .expect_err("malformed Bearer TFT must fail during typed decode");
-        dedicated_bearer_decode_rejection_cause(&error)
+        dedicated_bearer_decode_rejection_cause(error.error())
     };
 
     assert_eq!(

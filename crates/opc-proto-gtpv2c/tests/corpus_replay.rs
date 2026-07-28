@@ -10,7 +10,7 @@ use opc_proto_gtpv2c::{
     decode_typed_ie_sequence, validate_ie_region, Message, OwnedMessage, RawIeIterator, S2bMessage,
 };
 use opc_protocol::{
-    BorrowDecode, DecodeContext, DecodeErrorCode, Encode, EncodeContext, OwnedDecode,
+    BorrowDecode, DecodeContext, DecodeError, DecodeErrorCode, Encode, EncodeContext, OwnedDecode,
     ValidationLevel,
 };
 use std::collections::BTreeMap;
@@ -660,7 +660,9 @@ fn assert_s2b_profile_error(
 ) {
     assert_error_code(
         path,
-        S2bMessage::decode(data, procedure_context()).map(|(_tail, _message)| ()),
+        S2bMessage::decode(data, procedure_context())
+            .map(|(_tail, _message)| ())
+            .map_err(DecodeError::from),
         expected,
         expectation,
     );

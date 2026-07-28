@@ -53,6 +53,24 @@
 //! unsupported-version planning independent of decode-failure evidence.
 //! Transport admission and rate limits remain caller owned.
 //!
+//! GTPv2-C decode failures carry element identity through
+//! [`Gtpv2cDecodeError`]. Identity is attached by the innermost decode frame
+//! that had already read a complete four-octet IE header *for the element the
+//! error is about*: a header shorter than four octets names nothing, because
+//! the Type and Instance octets are not present, and an IE-count bound, a depth
+//! bound and offset arithmetic name nothing either, being statements about the
+//! sequence rather than about any one element's octets. A failure inside a
+//! grouped IE reports the enclosing container separately, so a member's
+//! identity is never mistaken for a top-level one. Naming the offending IE is
+//! necessary but not sufficient to decide that an error response is owed; that
+//! decision stays with [`Gtpv2cErrorResponsePlanner`]. Its
+//! [`Gtpv2cErrorResponsePlanner::plan_invalid_ie_length_from_decode`] bridge
+//! accepts only length-shaped evidence whose offending IE is proven to be at
+//! message top level. [`Message::decode_annotated`] and typed
+//! [`S2bMessage::decode`] establish that scope; generic IE-region decoders do
+//! not. The bridge refuses both unknown and grouped scope while grouped Cause
+//! flag bits are not modelled.
+//!
 //! @spec 3GPP TS29274 R18
 //! @spec 3GPP TS24008 V20.0.0 10.5.6.3
 //! @req REQ-3GPP-TS29274-R18-S2B-001
@@ -68,6 +86,7 @@ pub(crate) const fn is_strict(level: ValidationLevel) -> bool {
     )
 }
 
+mod decode_error;
 pub mod dedicated_bearer;
 pub mod error_response;
 pub mod header;
@@ -77,6 +96,7 @@ pub mod pco;
 pub mod s2b;
 pub mod triggered;
 
+pub use decode_error::Gtpv2cDecodeError;
 pub use dedicated_bearer::{
     correlate_create_bearer_response, correlate_delete_bearer_response,
     correlate_update_bearer_response, dedicated_bearer_decode_rejection_cause,
@@ -107,16 +127,16 @@ pub use header::{
     GTPV2C_VERSION, MAX_MESSAGE_PRIORITY,
 };
 pub use ie::{
-    decode_typed_ie_sequence, encode_typed_ie_sequence, validate_ie_region, AccessPointName,
-    AdditionalProtocolConfigurationOptions, AggregateMaximumBitRate, AllocationRetentionPriority,
-    ApnRestriction, BearerContext, BearerQos, BearerQosResourceType, BearerQosValidationError,
-    Cause, CauseValue, ChargingCharacteristics, ChargingId, DuplicateIeEvidence, EpsBearerId,
-    FullyQualifiedTeid, Ikev2ErrorNotifyType, Ikev2ErrorNotifyTypeError, Indication, IpAddress,
-    NodeIdentifier, NodeIdentifierError, OwnedRawIe, PdnAddressAllocation,
-    PdnAddressAllocationError, PdnType, PdnTypeValue, PlmnId, PortNumber,
-    ProtocolConfigurationOptions, RanNasCause, RatType, RatTypeValue, RawIe, RawIeIterator,
-    Recovery, SelectionMode, SelectionModeValue, ServingNetwork, SessionTraceDepth, TbcdDigits,
-    TraceInformation, TwanIdentifier, TwanIdentifierError, TwanIdentifierTimestamp,
+    decode_typed_ie_sequence, encode_typed_ie_sequence, validate_ie_region,
+    validate_ie_region_annotated, AccessPointName, AdditionalProtocolConfigurationOptions,
+    AggregateMaximumBitRate, AllocationRetentionPriority, ApnRestriction, BearerContext, BearerQos,
+    BearerQosResourceType, BearerQosValidationError, Cause, CauseValue, ChargingCharacteristics,
+    ChargingId, DuplicateIeEvidence, EpsBearerId, FullyQualifiedTeid, Ikev2ErrorNotifyType,
+    Ikev2ErrorNotifyTypeError, Indication, IpAddress, NodeIdentifier, NodeIdentifierError,
+    OwnedRawIe, PdnAddressAllocation, PdnAddressAllocationError, PdnType, PdnTypeValue, PlmnId,
+    PortNumber, ProtocolConfigurationOptions, RanNasCause, RatType, RatTypeValue, RawIe,
+    RawIeIterator, Recovery, SelectionMode, SelectionModeValue, ServingNetwork, SessionTraceDepth,
+    TbcdDigits, TraceInformation, TwanIdentifier, TwanIdentifierError, TwanIdentifierTimestamp,
     TwanLogicalAccessId, TwanRelayIdentity, TypedIe, TypedIeValue, IE_HEADER_LEN, IE_TYPE_AMBR,
     IE_TYPE_APCO, IE_TYPE_APN, IE_TYPE_APN_RESTRICTION, IE_TYPE_BEARER_CONTEXT, IE_TYPE_BEARER_QOS,
     IE_TYPE_BEARER_TFT, IE_TYPE_CAUSE, IE_TYPE_CHARGING_CHARACTERISTICS, IE_TYPE_CHARGING_ID,

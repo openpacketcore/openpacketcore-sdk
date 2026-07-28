@@ -17,6 +17,7 @@ use opc_protocol::{
     Encode, EncodeContext, EncodeError, EncodeErrorCode, SpecRef, ValidationLevel,
 };
 
+use crate::decode_error::Gtpv2cDecodeError;
 use crate::dedicated_bearer::{
     MAX_PGW_APN_LOAD_CONTROL_INFORMATION_IES as MAX_APN_LOAD_CONTROL_ENTRIES,
     MAX_PGW_OVERLOAD_CONTROL_INFORMATION_IES as MAX_PGW_OVERLOAD_CONTROL_ENTRIES,
@@ -3506,8 +3507,26 @@ impl fmt::Debug for S2bMessage<'_> {
 
 impl<'a> S2bMessage<'a> {
     /// Decode a typed S2b view from a GTPv2-C byte slice.
-    pub fn decode(input: &'a [u8], ctx: DecodeContext) -> DecodeResult<'a, Self> {
-        <Self as BorrowDecode<'a>>::decode(input, ctx)
+    ///
+    /// A framing or value error names the offending Information Element
+    /// whenever a complete four-octet IE header for it had been read; see
+    /// [`Gtpv2cDecodeError`]. Typed failures at this message frame receive
+    /// positive message-top-level scope unless a grouped decoder has already
+    /// established nesting. The [`BorrowDecode`] impl delegates here and
+    /// downgrades to [`DecodeError`], because a protocol-neutral port cannot
+    /// carry a GTPv2-C-shaped annotation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Gtpv2cDecodeError`] when the datagram is not a well-formed
+    /// GTPv2-C message or its S2b typed projection fails.
+    pub fn decode(
+        input: &'a [u8],
+        ctx: DecodeContext,
+    ) -> Result<(&'a [u8], Self), Gtpv2cDecodeError> {
+        let (tail, message) = Message::decode_annotated(input, ctx)?;
+        let view = Self::from_message(message, ctx)?;
+        Ok((tail, view))
     }
 
     /// Decode an S2b message with bounded duplicate-IE evidence.
@@ -3516,17 +3535,30 @@ impl<'a> S2bMessage<'a> {
     /// receiver profile: the first singleton occurrence is retained and later
     /// occurrences are ignored. Canonical builders use a separate strict
     /// validation path and continue rejecting duplicate singleton input.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Gtpv2cDecodeError`], naming the offending Information Element
+    /// where one had been identified.
     pub fn decode_with_diagnostics(
         input: &'a [u8],
         ctx: DecodeContext,
-    ) -> DecodeResult<'a, S2bDecodedMessage<'a>> {
-        let (tail, message) = Message::decode(input, ctx)?;
+    ) -> Result<(&'a [u8], S2bDecodedMessage<'a>), Gtpv2cDecodeError> {
+        let (tail, message) = Message::decode_annotated(input, ctx)?;
         let decoded = Self::from_message_with_purpose(message, ctx, S2bDecodePurpose::Receive)?;
         Ok((tail, decoded))
     }
 
     /// Convert a decoded raw [`Message`] into a typed S2b view when possible.
-    pub fn from_message(message: Message<'a>, ctx: DecodeContext) -> Result<Self, DecodeError> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Gtpv2cDecodeError`], naming the offending Information Element
+    /// where one had been identified.
+    pub fn from_message(
+        message: Message<'a>,
+        ctx: DecodeContext,
+    ) -> Result<Self, Gtpv2cDecodeError> {
         Self::from_message_with_purpose(message, ctx, S2bDecodePurpose::Receive)
             .map(S2bDecodedMessage::into_message)
     }
@@ -3535,7 +3567,7 @@ impl<'a> S2bMessage<'a> {
         message: Message<'a>,
         ctx: DecodeContext,
         purpose: S2bDecodePurpose,
-    ) -> Result<S2bDecodedMessage<'a>, DecodeError> {
+    ) -> Result<S2bDecodedMessage<'a>, Gtpv2cDecodeError> {
         let message_type = message.message_type();
         let Some((procedure, direction)) = procedure_and_direction(message_type) else {
             return Ok(S2bDecodedMessage {
@@ -3561,6 +3593,14 @@ impl<'a> S2bMessage<'a> {
         // the sender side of the same codec and keeps rejecting, because the
         // malformed octets are already in the message being built -- silently
         // dropping the IE from the typed view would emit them anyway.
+        //
+        // Declared residual: `Discard` is selected from `purpose` alone. The
+        // two non-`ProcedureAware` branches below know the procedure and the
+        // direction but never consult `receive_ie_disposition`, so on those
+        // paths presence rests on the type allowlist in `ie::typed` rather than
+        // on a resolved per-IE profile. Deliberately unchanged in this cut:
+        // failing closed at the default validation level would turn two
+        // peer-controlled octets into a dropped session.
         let malformed_optional = match purpose {
             S2bDecodePurpose::Receive => MalformedOptionalIePolicy::Discard,
             S2bDecodePurpose::CanonicalBuilder => MalformedOptionalIePolicy::Reject,
@@ -3595,21 +3635,22 @@ impl<'a> S2bMessage<'a> {
                 &filter,
                 &repeatable_limit,
                 malformed_optional,
-            )?
+            )
         } else if pgw_triggered_request {
             decode_pgw_triggered_request_ie_sequence_with_evidence(
                 message.raw_ies,
                 typed_ctx,
                 malformed_optional,
-            )?
+            )
         } else {
             decode_typed_ie_sequence_with_evidence(
                 message.raw_ies,
                 typed_ctx,
                 0,
                 malformed_optional,
-            )?
-        };
+            )
+        }
+        .map_err(Gtpv2cDecodeError::mark_message_top_level)?;
         let view = S2bProcedureMessage {
             header: message.header,
             procedure,
@@ -3761,10 +3802,11 @@ pub fn decode_create_session_response_summary(
 
 impl<'a> BorrowDecode<'a> for S2bMessage<'a> {
     /// Decode a typed S2b message view, preserving raw fallback messages.
+    ///
+    /// Delegates to the inherent [`S2bMessage::decode`] and downgrades, so the
+    /// port and the richer inherent API can never diverge.
     fn decode(input: &'a [u8], ctx: DecodeContext) -> DecodeResult<'a, Self> {
-        let (tail, message) = Message::decode(input, ctx)?;
-        let view = Self::from_message(message, ctx)?;
-        Ok((tail, view))
+        Self::decode(input, ctx).map_err(DecodeError::from)
     }
 }
 
