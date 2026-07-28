@@ -32,11 +32,14 @@ use std::{
 };
 
 use opc_config_model::TransportType;
-use opc_mgmt_audit::{AuditError, AuditEvent, AuditOperation, AuditOutcome, AuditSink};
+use opc_mgmt_audit::{
+    AuditError, AuditEvent, AuditOperation, AuditOutcome, AuditSink, AuditTimeSource,
+};
 use opc_persist::{
-    AuditKey, ConfigStore, ManagementAuditEventRecord, ManagementAuditOperationCode,
-    ManagementAuditOutcomeCode, ManagementAuditPage, ManagementAuditPageRequest,
-    ManagementAuditRetention, ManagementAuditStoreError, ManagementAuditTransportCode,
+    AuditKey, ConfigStore, ManagementAuditEventRecord, ManagementAuditInstant,
+    ManagementAuditOperationCode, ManagementAuditOutcomeCode, ManagementAuditPage,
+    ManagementAuditPageRequest, ManagementAuditRecordError, ManagementAuditRetention,
+    ManagementAuditStoreError, ManagementAuditTimeSourceCode, ManagementAuditTransportCode,
     ManagementAuditVerification, PersistError, SqliteBackend,
 };
 use thiserror::Error;
@@ -419,6 +422,19 @@ fn run_worker(
 fn convert_event(
     event: &AuditEvent,
 ) -> Result<ManagementAuditEventRecord, opc_persist::ManagementAuditRecordError> {
+    let time_source = match event.occurred_at.source() {
+        AuditTimeSource::NodeClock => ManagementAuditTimeSourceCode::NodeClock,
+        AuditTimeSource::SynchronisedNodeClock => {
+            ManagementAuditTimeSourceCode::SynchronisedNodeClock
+        }
+    };
+    let occurred_at = ManagementAuditInstant::try_new(
+        event.occurred_at.utc_seconds(),
+        event.occurred_at.nanosecond(),
+        event.occurred_at.monotonic_sequence(),
+        time_source,
+    )
+    .map_err(|_| ManagementAuditRecordError::Timestamp)?;
     let transport = match event.transport {
         TransportType::Gnmi => ManagementAuditTransportCode::Gnmi,
         TransportType::NetconfSsh => ManagementAuditTransportCode::NetconfSsh,
@@ -447,6 +463,7 @@ fn convert_event(
     };
     ManagementAuditEventRecord::try_new(
         *event.request_id.as_uuid().as_bytes(),
+        occurred_at,
         event.tenant.as_str(),
         event.principal.as_str(),
         transport,
@@ -463,7 +480,9 @@ mod tests {
     use std::path::Path;
 
     use opc_config_model::RequestId;
-    use opc_mgmt_audit::{AuditReasonCode, AuditTxId, SchemaNodePath};
+    use opc_mgmt_audit::{
+        AuditInstant, AuditReasonCode, AuditTimeSource, AuditTxId, SchemaNodePath,
+    };
     use opc_persist::{
         ManagementAuditCursorError, ManagementAuditPageRequest, ManagementAuditStoreError,
         ManagementAuditVerificationFailure,
@@ -482,6 +501,17 @@ mod tests {
     fn event(operation: AuditOperation, outcome: AuditOutcome, suffix: u8) -> AuditEvent {
         AuditEvent {
             request_id: RequestId::new(),
+            occurred_at: AuditInstant::try_from_parts(
+                1_700_000_000 + i64::from(suffix),
+                u32::from(suffix),
+                u64::from(suffix) + 1,
+                if suffix.is_multiple_of(2) {
+                    AuditTimeSource::NodeClock
+                } else {
+                    AuditTimeSource::SynchronisedNodeClock
+                },
+            )
+            .expect("audit instant"),
             tenant: "tenant-a".to_string(),
             principal: format!("user:operator-{suffix}"),
             transport: TransportType::Gnmi,
@@ -590,6 +620,14 @@ mod tests {
         assert_eq!(
             page.records()[0].event().schema_paths(),
             &["/ietf-system:system".to_string()]
+        );
+        let occurred_at = page.records()[0].event().occurred_at();
+        assert_eq!(occurred_at.utc_seconds(), 1_700_000_001);
+        assert_eq!(occurred_at.nanosecond(), 1);
+        assert_eq!(occurred_at.monotonic_sequence(), 2);
+        assert_eq!(
+            occurred_at.source(),
+            ManagementAuditTimeSourceCode::SynchronisedNodeClock
         );
         drop(sink);
 
@@ -768,6 +806,26 @@ mod tests {
             (
                 "request-id",
                 "UPDATE management_audit_event SET request_id = zeroblob(16) WHERE sequence = 1",
+                ManagementAuditVerificationFailure::RecordAuthentication,
+            ),
+            (
+                "occurred-at-utc-seconds",
+                "UPDATE management_audit_event SET occurred_at_utc_seconds = occurred_at_utc_seconds + 1 WHERE sequence = 1",
+                ManagementAuditVerificationFailure::RecordAuthentication,
+            ),
+            (
+                "occurred-at-nanosecond",
+                "UPDATE management_audit_event SET occurred_at_nanosecond = occurred_at_nanosecond + 1 WHERE sequence = 1",
+                ManagementAuditVerificationFailure::RecordAuthentication,
+            ),
+            (
+                "occurred-at-monotonic-sequence",
+                "UPDATE management_audit_event SET occurred_at_monotonic_sequence = occurred_at_monotonic_sequence + 1 WHERE sequence = 1",
+                ManagementAuditVerificationFailure::RecordAuthentication,
+            ),
+            (
+                "occurred-at-time-source",
+                "UPDATE management_audit_event SET occurred_at_time_source = 'node-clock' WHERE sequence = 1",
                 ManagementAuditVerificationFailure::RecordAuthentication,
             ),
             (
@@ -1080,6 +1138,36 @@ mod tests {
                 Some(1),
             ),
             (
+                "blob-as-utc-seconds",
+                "UPDATE management_audit_event SET occurred_at_utc_seconds = x'01' WHERE sequence = 1",
+                ManagementAuditVerificationFailure::MalformedRecord,
+                Some(1),
+            ),
+            (
+                "nanosecond-out-of-range",
+                "UPDATE management_audit_event SET occurred_at_nanosecond = 1000000000 WHERE sequence = 1",
+                ManagementAuditVerificationFailure::MalformedRecord,
+                Some(1),
+            ),
+            (
+                "negative-monotonic-sequence",
+                "UPDATE management_audit_event SET occurred_at_monotonic_sequence = -1 WHERE sequence = 1",
+                ManagementAuditVerificationFailure::MalformedRecord,
+                Some(1),
+            ),
+            (
+                "blob-as-time-source",
+                "UPDATE management_audit_event SET occurred_at_time_source = x'6e6f64652d636c6f636b' WHERE sequence = 1",
+                ManagementAuditVerificationFailure::MalformedRecord,
+                Some(1),
+            ),
+            (
+                "unknown-time-source",
+                "UPDATE management_audit_event SET occurred_at_time_source = 'unknown-clock' WHERE sequence = 1",
+                ManagementAuditVerificationFailure::MalformedRecord,
+                Some(1),
+            ),
+            (
                 "text-as-event-hash",
                 "UPDATE management_audit_event SET previous_hash = CAST(zeroblob(32) AS TEXT) WHERE sequence = 1",
                 ManagementAuditVerificationFailure::MalformedRecord,
@@ -1124,6 +1212,12 @@ mod tests {
             (
                 "text-as-anchor-hash",
                 "UPDATE management_audit_anchor SET terminal_hash = CAST(zeroblob(32) AS TEXT) WHERE id = 1",
+                ManagementAuditVerificationFailure::MalformedAnchor,
+                None,
+            ),
+            (
+                "blob-as-anchor-format-version",
+                "UPDATE management_audit_anchor SET format_version = x'01' WHERE id = 1",
                 ManagementAuditVerificationFailure::MalformedAnchor,
                 None,
             ),
@@ -1406,6 +1500,10 @@ mod tests {
                 "tx_id",
                 "previous_hash",
                 "entry_hmac",
+                "occurred_at_utc_seconds",
+                "occurred_at_nanosecond",
+                "occurred_at_monotonic_sequence",
+                "occurred_at_time_source",
             ]
         );
 
@@ -1421,5 +1519,49 @@ mod tests {
             path_columns,
             vec!["event_sequence", "path_index", "schema_path"]
         );
+
+        let persisted_time: (String, i64, String, i64, String, i64, String, String) = connection
+            .query_row(
+                "SELECT typeof(occurred_at_utc_seconds), occurred_at_utc_seconds, \
+                        typeof(occurred_at_nanosecond), occurred_at_nanosecond, \
+                        typeof(occurred_at_monotonic_sequence), occurred_at_monotonic_sequence, \
+                        typeof(occurred_at_time_source), occurred_at_time_source \
+                 FROM management_audit_event WHERE sequence = 0",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                },
+            )
+            .expect("persisted time fields");
+        assert_eq!(
+            persisted_time,
+            (
+                "integer".to_string(),
+                1_700_000_000,
+                "integer".to_string(),
+                0,
+                "integer".to_string(),
+                1,
+                "text".to_string(),
+                "node-clock".to_string(),
+            )
+        );
+        let format_version: i64 = connection
+            .query_row(
+                "SELECT format_version FROM management_audit_anchor WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("format version");
+        assert_eq!(format_version, 2);
     }
 }

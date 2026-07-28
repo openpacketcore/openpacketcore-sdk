@@ -24,6 +24,7 @@
 use std::{
     fmt,
     sync::atomic::{AtomicU64, Ordering},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use opc_config_model::{RequestId, TransportType, TrustedPrincipal, WorkloadIdentity};
@@ -32,12 +33,182 @@ use thiserror::Error;
 
 const MAX_AUDIT_REASON_CODE_LEN: usize = 64;
 const MAX_AUDIT_TX_ID_LEN: usize = 128;
+const NANOS_PER_SECOND: i128 = 1_000_000_000;
+/// Largest monotonic sequence representable by the durable SQLite profile.
+pub const MAX_AUDIT_MONOTONIC_SEQUENCE: u64 = i64::MAX as u64;
 static TRACING_AUDIT_EVENTS_DROPPED: AtomicU64 = AtomicU64::new(0);
+static AUDIT_MONOTONIC_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Number of events the tracing audit sink could not emit because its tracing
 /// target was disabled.
 pub fn tracing_audit_events_dropped() -> u64 {
     TRACING_AUDIT_EVENTS_DROPPED.load(Ordering::Relaxed)
+}
+
+/// Authority that supplied an audit event's UTC wall-clock timestamp.
+///
+/// The default is deliberately [`Self::NodeClock`]. A caller may claim
+/// [`Self::SynchronisedNodeClock`] only when it has independent evidence that
+/// the node clock is actively disciplined; the SDK does not manufacture that
+/// assurance from a successful clock read.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum AuditTimeSource {
+    /// Node wall clock with no synchronisation assurance.
+    #[default]
+    NodeClock,
+    /// Node wall clock while a synchronisation source was disciplined.
+    SynchronisedNodeClock,
+}
+
+impl AuditTimeSource {
+    /// Stable lowercase source code.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NodeClock => "node-clock",
+            Self::SynchronisedNodeClock => "synchronised-node-clock",
+        }
+    }
+}
+
+/// UTC wall-clock time plus a process-local monotonic ordering sequence.
+///
+/// RFC 003 §11.3 requires UTC audit timestamps and recommends pairing wall
+/// clock with a monotonic sequence. `utc_seconds` is signed seconds from the
+/// Unix epoch, so pre-epoch instants are unambiguous; `nanosecond` is the
+/// canonical non-negative fractional second. The sequence is nondecreasing and
+/// saturates at [`MAX_AUDIT_MONOTONIC_SEQUENCE`] instead of wrapping. Once
+/// saturated it no longer supplies a unique tiebreak; consumers must not infer
+/// strict order from equal terminal sequence values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AuditInstant {
+    utc_seconds: i64,
+    nanosecond: u32,
+    monotonic_sequence: u64,
+    source: AuditTimeSource,
+}
+
+impl AuditInstant {
+    /// Read the node clock without claiming synchronisation.
+    ///
+    /// Clock reads are infallible at this boundary. Host times outside the
+    /// signed durable range saturate to the nearest representable UTC instant.
+    pub fn now() -> Self {
+        Self::from_system_time(SystemTime::now(), AuditTimeSource::NodeClock)
+    }
+
+    /// Read the node clock with an explicit source attribution.
+    ///
+    /// Passing [`AuditTimeSource::SynchronisedNodeClock`] is an assurance by
+    /// the caller and must be backed by its clock-discipline authority.
+    pub fn now_with_source(source: AuditTimeSource) -> Self {
+        Self::from_system_time(SystemTime::now(), source)
+    }
+
+    /// Convert a wall-clock reading with an explicit source attribution.
+    ///
+    /// This is useful for adapters with an injectable clock. It allocates a
+    /// fresh process-local monotonic sequence and never fails.
+    pub fn from_system_time(time: SystemTime, source: AuditTimeSource) -> Self {
+        let (utc_seconds, nanosecond) = utc_parts(time);
+        Self {
+            utc_seconds,
+            nanosecond,
+            monotonic_sequence: next_audit_monotonic_sequence(),
+            source,
+        }
+    }
+
+    /// Reconstruct an instant from authenticated durable parts.
+    pub fn try_from_parts(
+        utc_seconds: i64,
+        nanosecond: u32,
+        monotonic_sequence: u64,
+        source: AuditTimeSource,
+    ) -> Result<Self, AuditInstantError> {
+        if nanosecond >= NANOS_PER_SECOND as u32 {
+            return Err(AuditInstantError::Nanosecond);
+        }
+        if monotonic_sequence > MAX_AUDIT_MONOTONIC_SEQUENCE {
+            return Err(AuditInstantError::MonotonicSequence);
+        }
+        Ok(Self {
+            utc_seconds,
+            nanosecond,
+            monotonic_sequence,
+            source,
+        })
+    }
+
+    /// Signed whole UTC seconds from the Unix epoch.
+    pub const fn utc_seconds(self) -> i64 {
+        self.utc_seconds
+    }
+
+    /// Canonical fractional nanosecond in `0..1_000_000_000`.
+    pub const fn nanosecond(self) -> u32 {
+        self.nanosecond
+    }
+
+    /// Process-local nondecreasing ordering sequence.
+    ///
+    /// Equal values at [`MAX_AUDIT_MONOTONIC_SEQUENCE`] indicate exhaustion,
+    /// not simultaneous events or a strict ordering.
+    pub const fn monotonic_sequence(self) -> u64 {
+        self.monotonic_sequence
+    }
+
+    /// Wall-clock source attribution.
+    pub const fn source(self) -> AuditTimeSource {
+        self.source
+    }
+}
+
+/// Invalid authenticated audit-time parts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum AuditInstantError {
+    /// Fractional nanosecond was outside its canonical range.
+    #[error("audit timestamp nanosecond is outside its canonical range")]
+    Nanosecond,
+    /// Monotonic sequence exceeded the durable signed-integer range.
+    #[error("audit monotonic sequence exceeds its durable range")]
+    MonotonicSequence,
+}
+
+fn utc_parts(time: SystemTime) -> (i64, u32) {
+    let unix_nanoseconds = match time.duration_since(UNIX_EPOCH) {
+        Ok(duration) => {
+            i128::from(duration.as_secs()) * NANOS_PER_SECOND + i128::from(duration.subsec_nanos())
+        }
+        Err(error) => {
+            let duration = error.duration();
+            -(i128::from(duration.as_secs()) * NANOS_PER_SECOND
+                + i128::from(duration.subsec_nanos()))
+        }
+    };
+    let minimum = i128::from(i64::MIN) * NANOS_PER_SECOND;
+    let maximum = i128::from(i64::MAX) * NANOS_PER_SECOND + (NANOS_PER_SECOND - 1);
+    let bounded = unix_nanoseconds.clamp(minimum, maximum);
+    (
+        bounded.div_euclid(NANOS_PER_SECOND) as i64,
+        bounded.rem_euclid(NANOS_PER_SECOND) as u32,
+    )
+}
+
+const fn advance_audit_monotonic_sequence(current: u64) -> u64 {
+    if current >= MAX_AUDIT_MONOTONIC_SEQUENCE {
+        MAX_AUDIT_MONOTONIC_SEQUENCE
+    } else {
+        current + 1
+    }
+}
+
+fn next_audit_monotonic_sequence() -> u64 {
+    match AUDIT_MONOTONIC_SEQUENCE.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        Some(advance_audit_monotonic_sequence(current))
+    }) {
+        Ok(previous) => advance_audit_monotonic_sequence(previous),
+        Err(current) => current,
+    }
 }
 
 /// The management operation being audited.
@@ -444,6 +615,10 @@ pub fn label_safe_transport(transport: TransportType) -> String {
 pub struct AuditEvent {
     /// Northbound request correlation id.
     pub request_id: RequestId,
+    /// UTC decision time, monotonic tiebreak, and clock-source attribution.
+    ///
+    /// Durable sinks authenticate every component of this value.
+    pub occurred_at: AuditInstant,
     /// Tenant the principal belongs to.
     pub tenant: String,
     /// Principal descriptor (e.g. SPIFFE id). Audit legitimately names the
@@ -472,6 +647,7 @@ impl AuditEvent {
     ) -> Self {
         Self {
             request_id,
+            occurred_at: AuditInstant::now(),
             tenant: principal.tenant.to_string(),
             principal: principal_descriptor(principal),
             transport,
@@ -485,6 +661,13 @@ impl AuditEvent {
     /// Attaches the touched schema-node paths (predicate-free).
     pub fn with_paths(mut self, paths: impl IntoIterator<Item = SchemaNodePath>) -> Self {
         self.schema_paths = paths.into_iter().collect();
+        self
+    }
+
+    /// Replaces the default node-clock observation with an explicitly sourced
+    /// audit instant.
+    pub fn with_occurred_at(mut self, occurred_at: AuditInstant) -> Self {
+        self.occurred_at = occurred_at;
         self
     }
 
@@ -534,6 +717,10 @@ impl AuditSink for TracingAuditSink {
         tracing::info!(
             target: "opc_mgmt_audit",
             request_id = %event.request_id,
+            occurred_at_utc_seconds = event.occurred_at.utc_seconds(),
+            occurred_at_nanosecond = event.occurred_at.nanosecond(),
+            occurred_at_monotonic_sequence = event.occurred_at.monotonic_sequence(),
+            occurred_at_time_source = event.occurred_at.source().as_str(),
             tenant = %event.tenant,
             principal = %event.principal,
             transport = transport_code(event.transport),
@@ -585,6 +772,66 @@ mod tests {
 
     fn schema_path(value: &str) -> SchemaNodePath {
         SchemaNodePath::new(value).expect("schema path")
+    }
+
+    #[test]
+    fn audit_instants_are_canonical_for_pre_epoch_time_and_default_to_node_clock() {
+        let instant = AuditInstant::from_system_time(
+            UNIX_EPOCH - std::time::Duration::from_nanos(1),
+            AuditTimeSource::NodeClock,
+        );
+        assert_eq!(instant.utc_seconds(), -1);
+        assert_eq!(instant.nanosecond(), 999_999_999);
+        assert_eq!(instant.source(), AuditTimeSource::NodeClock);
+
+        let event = AuditEvent::new(
+            RequestId::new(),
+            &principal(),
+            TransportType::Internal,
+            AuditOperation::Read,
+            AuditOutcome::Success,
+        );
+        assert_eq!(event.occurred_at.source(), AuditTimeSource::NodeClock);
+    }
+
+    #[test]
+    fn audit_instant_parts_reject_noncanonical_or_unpersistable_values() {
+        assert_eq!(
+            AuditInstant::try_from_parts(0, 1_000_000_000, 1, AuditTimeSource::NodeClock),
+            Err(AuditInstantError::Nanosecond)
+        );
+        assert_eq!(
+            AuditInstant::try_from_parts(
+                0,
+                0,
+                MAX_AUDIT_MONOTONIC_SEQUENCE + 1,
+                AuditTimeSource::NodeClock,
+            ),
+            Err(AuditInstantError::MonotonicSequence)
+        );
+        assert_eq!(
+            advance_audit_monotonic_sequence(MAX_AUDIT_MONOTONIC_SEQUENCE),
+            MAX_AUDIT_MONOTONIC_SEQUENCE
+        );
+    }
+
+    #[test]
+    fn concurrent_audit_instants_receive_unique_monotonic_sequences() {
+        let mut workers = Vec::new();
+        for _ in 0..32 {
+            workers.push(std::thread::spawn(|| {
+                AuditInstant::now().monotonic_sequence()
+            }));
+        }
+        let mut sequences = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("audit clock worker"))
+            .collect::<Vec<_>>();
+        sequences.sort_unstable();
+        assert!(
+            sequences.windows(2).all(|pair| pair[0] < pair[1]),
+            "non-saturated concurrent allocations must be unique"
+        );
     }
 
     #[test]

@@ -37,11 +37,20 @@ let _sink: &dyn AuditSink = &sink;
 # fn load_audit_key_from_kms() -> [u8; 32] { [7; 32] }
 ```
 
-Only the existing structured audit fields are persisted: request id, tenant,
-principal, stable transport/operation/outcome/reason codes, predicate-free
-schema paths, and an optional bounded transaction id. Request values, payloads,
-list-key predicates, and free-form backend error text are never accepted by the
-durable schema.
+Only structured audit fields are persisted: request id; signed UTC epoch
+seconds and fractional nanosecond; process-local monotonic sequence; explicit
+node-clock source; tenant; principal; stable
+transport/operation/outcome/reason codes; predicate-free schema paths; and an
+optional bounded transaction id. Every time component is inside the v2 HMAC
+field stream. This follows RFC 003 §11.3's UTC wall-clock plus monotonic-sequence
+contract. Request values, payloads, list-key predicates, and free-form backend
+error text are never accepted by the durable schema.
+
+Format v1 anchors are authenticated before the adapter reports a typed
+incompatible-format error. The timestamp-free v1 record stream is not presented
+as verified or silently assigned invented timestamps. Mutating only a v2
+format tag to v1 fails anchor authentication instead of masquerading as a
+legacy trail.
 
 Retained records are retrieved through bounded, absolute-sequence pages. A
 cursor below the authenticated low-water mark returns a typed pruned-cursor

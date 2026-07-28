@@ -1,8 +1,9 @@
 mod persist_common;
 
 use opc_persist::{
-    AuditKey, ConfigStore, ManagementAuditEventRecord, ManagementAuditOperationCode,
-    ManagementAuditOutcomeCode, ManagementAuditRetention, ManagementAuditTransportCode,
+    AuditKey, ConfigStore, ManagementAuditEventRecord, ManagementAuditInstant,
+    ManagementAuditOperationCode, ManagementAuditOutcomeCode, ManagementAuditRetention,
+    ManagementAuditStoreError, ManagementAuditTimeSourceCode, ManagementAuditTransportCode,
     MockConfigStore, PersistErrorKind, SqliteBackend,
 };
 use opc_types::{Timestamp, TxId};
@@ -70,7 +71,7 @@ async fn open_migrates_schema_version_1_0_0_to_alarm_audit_schema() {
         .query_row("SELECT COUNT(*) FROM alarm_audit", [], |row| row.get(0))
         .expect("query migrated alarm audit table");
 
-    assert_eq!(sdk_version, "1.10.0");
+    assert_eq!(sdk_version, "1.11.0");
     assert_ne!(schema_digest, "legacy-digest");
     assert_eq!(alarm_audit_count, 1);
 }
@@ -117,7 +118,7 @@ async fn open_migrates_schema_version_1_4_0_to_current_schema() {
         )
         .expect("read migrated schema digest");
 
-    assert_eq!(sdk_version, "1.10.0");
+    assert_eq!(sdk_version, "1.11.0");
     assert_ne!(schema_digest, "legacy-digest-1-4");
 }
 
@@ -156,6 +157,13 @@ async fn open_migrates_schema_version_1_9_0_to_management_audit_schema() {
 
     let event = ManagementAuditEventRecord::try_new(
         [0x29; 16],
+        ManagementAuditInstant::try_new(
+            1_700_000_000,
+            42,
+            1,
+            ManagementAuditTimeSourceCode::NodeClock,
+        )
+        .expect("management audit instant"),
         "tenant-a",
         "user:operator-a",
         ManagementAuditTransportCode::Gnmi,
@@ -199,8 +207,197 @@ async fn open_migrates_schema_version_1_9_0_to_management_audit_schema() {
             |row| row.get(0),
         )
         .expect("query management audit tables");
-    assert_eq!(sdk_version, "1.10.0");
+    let persisted_time: (String, String, String, String) = conn
+        .query_row(
+            "SELECT typeof(occurred_at_utc_seconds), typeof(occurred_at_nanosecond), \
+                    typeof(occurred_at_monotonic_sequence), typeof(occurred_at_time_source) \
+             FROM management_audit_event WHERE sequence = 0",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("query migrated management audit timestamp");
+    assert_eq!(sdk_version, "1.11.0");
     assert_eq!(management_table_count, 3);
+    assert_eq!(
+        persisted_time,
+        (
+            "integer".to_string(),
+            "integer".to_string(),
+            "integer".to_string(),
+            "text".to_string(),
+        ),
+        "v2 append after a migration must persist all typed time fields"
+    );
+}
+
+#[tokio::test]
+async fn migration_preserves_timestamp_free_v1_rows_and_reports_compatibility() {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let db_path = temp_dir.path().join("management_audit_v1.db");
+
+    {
+        let conn = rusqlite::Connection::open(&db_path).expect("open v1 database");
+        conn.execute_batch(
+            r#"
+            CREATE TABLE schema_version (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                schema_digest TEXT NOT NULL,
+                sdk_version TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            INSERT INTO schema_version (id, schema_digest, sdk_version, created_at)
+            VALUES (1, 'v1-management-audit-digest', '1.10.0', '2026-07-01T00:00:00Z');
+
+            CREATE TABLE management_audit_event (
+                sequence INTEGER PRIMARY KEY CHECK(sequence >= 0),
+                request_id BLOB NOT NULL CHECK(length(request_id) = 16),
+                tenant TEXT NOT NULL,
+                principal TEXT NOT NULL,
+                transport TEXT NOT NULL,
+                operation TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                reason TEXT NULL,
+                schema_path_count INTEGER NOT NULL,
+                tx_id TEXT NULL,
+                previous_hash BLOB NOT NULL CHECK(length(previous_hash) = 32),
+                entry_hmac BLOB NOT NULL CHECK(length(entry_hmac) = 32)
+            );
+            CREATE TABLE management_audit_schema_path (
+                event_sequence INTEGER NOT NULL REFERENCES management_audit_event(sequence) ON DELETE CASCADE,
+                path_index INTEGER NOT NULL,
+                schema_path TEXT NOT NULL,
+                PRIMARY KEY(event_sequence, path_index)
+            );
+            CREATE TABLE management_audit_anchor (
+                id INTEGER PRIMARY KEY CHECK(id = 1),
+                format_version INTEGER NOT NULL CHECK(format_version = 1),
+                retention_max_records INTEGER NOT NULL,
+                key_epoch INTEGER NOT NULL,
+                total_count INTEGER NOT NULL,
+                retained_count INTEGER NOT NULL,
+                low_water_sequence INTEGER NOT NULL,
+                low_water_hash BLOB NOT NULL CHECK(length(low_water_hash) = 32),
+                terminal_sequence INTEGER NULL,
+                terminal_hash BLOB NOT NULL CHECK(length(terminal_hash) = 32),
+                anchor_hmac BLOB NOT NULL CHECK(length(anchor_hmac) = 32)
+            );
+
+            INSERT INTO management_audit_event
+                (sequence, request_id, tenant, principal, transport, operation, outcome, reason, schema_path_count, tx_id, previous_hash, entry_hmac)
+            VALUES
+                (0, X'01010101010101010101010101010101', 'tenant-a', 'user:operator-a', 'gnmi', 'read', 'success', NULL, 0, NULL, zeroblob(32), X'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA');
+            INSERT INTO management_audit_anchor
+                (id, format_version, retention_max_records, key_epoch, total_count, retained_count, low_water_sequence, low_water_hash, terminal_sequence, terminal_hash, anchor_hmac)
+            VALUES
+                (1, 1, 8, 1, 1, 1, 0, zeroblob(32), 0, X'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', X'C58C0208F638612FDCC78BF710A2420A00B69A47D054AB07A4C56B7125706409');
+            "#,
+        )
+        .expect("seed authenticated v1 management audit chain");
+    }
+
+    let backend = SqliteBackend::open_with_audit_key(
+        &db_path,
+        true,
+        0,
+        AuditKey::new([0x33; 32]).expect("audit key"),
+    )
+    .await
+    .expect("migrate v1 database schema");
+    let error = backend
+        .verify_management_audit()
+        .await
+        .expect_err("public verification must reject the v1 field stream");
+    match error {
+        ManagementAuditStoreError::IncompatibleFormat(format) => {
+            assert_eq!(format.expected(), 2);
+            assert_eq!(format.found(), 1);
+        }
+        other => panic!("unexpected v1 verification error: {other:?}"),
+    }
+    let configure_error = backend
+        .configure_management_audit(ManagementAuditRetention::try_new(8).expect("retention"))
+        .await
+        .expect_err("v1 field stream must require explicit operator handling");
+    match configure_error {
+        ManagementAuditStoreError::IncompatibleFormat(format) => {
+            assert_eq!(format.expected(), 2);
+            assert_eq!(format.found(), 1);
+        }
+        other => panic!("unexpected v1 open error: {other:?}"),
+    }
+    drop(backend);
+
+    let conn = rusqlite::Connection::open(&db_path).expect("inspect migrated v1 database");
+    let sdk_version: String = conn
+        .query_row(
+            "SELECT sdk_version FROM schema_version WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("schema version");
+    assert_eq!(sdk_version, "1.11.0");
+    let timestamp_storage: (String, String, String, String) = conn
+        .query_row(
+            "SELECT typeof(occurred_at_utc_seconds), typeof(occurred_at_nanosecond), \
+                    typeof(occurred_at_monotonic_sequence), typeof(occurred_at_time_source) \
+             FROM management_audit_event WHERE sequence = 0",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("legacy timestamp representation");
+    assert_eq!(
+        timestamp_storage,
+        (
+            "null".to_string(),
+            "null".to_string(),
+            "null".to_string(),
+            "null".to_string(),
+        ),
+        "migration must not invent an unauthenticated event time"
+    );
+    let event_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM management_audit_event", [], |row| {
+            row.get(0)
+        })
+        .expect("legacy event count");
+    let (request_id, previous_hash, entry_hmac): (Vec<u8>, Vec<u8>, Vec<u8>) = conn
+        .query_row(
+            "SELECT request_id, previous_hash, entry_hmac FROM management_audit_event WHERE sequence = 0",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("legacy event bytes");
+    assert_eq!(event_count, 1);
+    assert_eq!(request_id, vec![0x01; 16]);
+    assert_eq!(previous_hash, vec![0x00; 32]);
+    assert_eq!(entry_hmac, vec![0xAA; 32]);
+
+    let (format, total, retained, terminal_hash, anchor_hmac): (i64, i64, i64, Vec<u8>, Vec<u8>) =
+        conn.query_row(
+            "SELECT format_version, total_count, retained_count, terminal_hash, anchor_hmac \
+             FROM management_audit_anchor WHERE id = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .expect("legacy anchor bytes");
+    assert_eq!((format, total, retained), (1, 1, 1));
+    assert_eq!(terminal_hash, vec![0xAA; 32]);
+    assert_eq!(
+        anchor_hmac,
+        vec![
+            0xC5, 0x8C, 0x02, 0x08, 0xF6, 0x38, 0x61, 0x2F, 0xDC, 0xC7, 0x8B, 0xF7, 0x10, 0xA2,
+            0x42, 0x0A, 0x00, 0xB6, 0x9A, 0x47, 0xD0, 0x54, 0xAB, 0x07, 0xA4, 0xC5, 0x6B, 0x71,
+            0x25, 0x70, 0x64, 0x09,
+        ]
+    );
 }
 
 #[tokio::test]

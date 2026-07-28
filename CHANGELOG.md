@@ -99,6 +99,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per-deployment salt.
 
 ### Changed
+- **Management audit events now carry authenticated UTC time — `opc-mgmt-audit`,
+  `opc-mgmt-audit-store`, and `opc-persist` (breaking public/event and durable
+  format change):** `AuditEvent` now includes `AuditInstant`, which records
+  signed UTC epoch seconds, a canonical fractional nanosecond, a process-local
+  nondecreasing monotonic sequence, and an explicit `AuditTimeSource`.
+  `AuditEvent::new` honestly defaults to an unattested `NodeClock`;
+  `SynchronisedNodeClock` must be supplied explicitly by an adapter with clock
+  discipline evidence. The durable SQLite record exposes all four components
+  to verifiers and authenticates them under new management-event/anchor v2
+  HMAC domains, satisfying RFC 003 §11.3's wall-clock plus monotonic-sequence
+  contract. The sequence saturates without wrapping and equal saturated values
+  are not a strict tiebreak. Existing v1 chains are intentionally not rewritten
+  or assigned fabricated timestamps: schema migration preserves their new
+  columns as `NULL`, authenticates the v1 anchor, and returns the distinct
+  `ManagementAuditStoreError::IncompatibleFormat`. Operators must archive or
+  explicitly replace a v1 trail before enabling v2 writes; the SDK does not
+  silently reseal it. A v2 anchor whose version tag alone is downgraded fails
+  authentication and is not classified as benign legacy data.
 - **`RePinAuditEvent` carries a correlation digest, not the live transition
   secret — `opc-ipsec-lb` (breaking: `transition_id: OwnershipTransitionId` is
   replaced by `correlation_id: RePinAuditCorrelationId`):** the coordinator

@@ -374,6 +374,7 @@ impl SqliteBackend {
             | (Some("1.8.0"), _)
             | (Some("1.8.1"), _)
             | (Some("1.9.0"), _)
+            | (Some("1.10.0"), _)
             | (None, _) => {
                 if let Some(from_version) = current_version.as_deref() {
                     schema::run_migrations(&conn, from_version)

@@ -10,7 +10,7 @@ use crate::error::PersistError;
 use crate::types::{calculate_audit_chain_hmac, AuditChainDomain, AuditChainField, AuditKey};
 
 /// Durable management-audit record/anchor schema version.
-pub const MANAGEMENT_AUDIT_FORMAT_VERSION: u64 = 1;
+pub const MANAGEMENT_AUDIT_FORMAT_VERSION: u64 = 2;
 /// Maximum supported retained-record cap.
 pub const MANAGEMENT_AUDIT_MAX_RETAINED_RECORDS: u64 = 1_000_000;
 /// Maximum tenant field size in UTF-8 bytes.
@@ -32,6 +32,7 @@ pub const MANAGEMENT_AUDIT_MAX_PAGE_RECORDS: u32 = 256;
 
 const ZERO_HASH: [u8; 32] = [0; 32];
 const MANAGEMENT_AUDIT_MAX_STABLE_CODE_BYTES: usize = 32;
+const MANAGEMENT_AUDIT_MAX_MONOTONIC_SEQUENCE: u64 = i64::MAX as u64;
 
 /// Validated count-based retention policy for the durable management trail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,6 +106,100 @@ impl ManagementAuditTransportCode {
             _ => None,
         }
     }
+}
+
+/// Stable persisted authority for a management audit event's UTC wall clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagementAuditTimeSourceCode {
+    /// Node wall clock with no synchronisation assurance.
+    NodeClock,
+    /// Node wall clock while a synchronisation source was disciplined.
+    SynchronisedNodeClock,
+}
+
+impl ManagementAuditTimeSourceCode {
+    /// Stable lowercase durable code.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NodeClock => "node-clock",
+            Self::SynchronisedNodeClock => "synchronised-node-clock",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "node-clock" => Some(Self::NodeClock),
+            "synchronised-node-clock" => Some(Self::SynchronisedNodeClock),
+            _ => None,
+        }
+    }
+}
+
+/// Authenticated UTC wall time and process-local monotonic sequence.
+///
+/// This is the verifier-visible durable counterpart to the management audit
+/// domain's instant. Signed epoch seconds preserve pre-1970 values without
+/// unsigned reinterpretation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ManagementAuditInstant {
+    utc_seconds: i64,
+    nanosecond: u32,
+    monotonic_sequence: u64,
+    source: ManagementAuditTimeSourceCode,
+}
+
+impl ManagementAuditInstant {
+    /// Validate durable UTC timestamp parts and source attribution.
+    pub fn try_new(
+        utc_seconds: i64,
+        nanosecond: u32,
+        monotonic_sequence: u64,
+        source: ManagementAuditTimeSourceCode,
+    ) -> Result<Self, ManagementAuditInstantError> {
+        if nanosecond >= 1_000_000_000 {
+            return Err(ManagementAuditInstantError::Nanosecond);
+        }
+        if monotonic_sequence > MANAGEMENT_AUDIT_MAX_MONOTONIC_SEQUENCE {
+            return Err(ManagementAuditInstantError::MonotonicSequence);
+        }
+        Ok(Self {
+            utc_seconds,
+            nanosecond,
+            monotonic_sequence,
+            source,
+        })
+    }
+
+    /// Signed whole UTC seconds from the Unix epoch.
+    pub const fn utc_seconds(self) -> i64 {
+        self.utc_seconds
+    }
+
+    /// Canonical fractional nanosecond in `0..1_000_000_000`.
+    pub const fn nanosecond(self) -> u32 {
+        self.nanosecond
+    }
+
+    /// Process-local monotonic ordering sequence recorded with the wall clock.
+    pub const fn monotonic_sequence(self) -> u64 {
+        self.monotonic_sequence
+    }
+
+    /// Persisted wall-clock source attribution.
+    pub const fn source(self) -> ManagementAuditTimeSourceCode {
+        self.source
+    }
+}
+
+/// Invalid durable management-audit time parts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ManagementAuditInstantError {
+    /// Fractional nanosecond was outside its canonical range.
+    #[error("management audit timestamp nanosecond is outside its canonical range")]
+    Nanosecond,
+    /// Monotonic sequence exceeded SQLite's non-negative integer range.
+    #[error("management audit monotonic sequence exceeds its durable range")]
+    MonotonicSequence,
 }
 
 /// Stable persisted management-operation code.
@@ -213,6 +308,7 @@ impl ManagementAuditOutcomeCode {
 #[derive(Clone, PartialEq, Eq)]
 pub struct ManagementAuditEventRecord {
     request_id: [u8; 16],
+    occurred_at: ManagementAuditInstant,
     tenant: String,
     principal: String,
     transport: ManagementAuditTransportCode,
@@ -228,6 +324,7 @@ impl ManagementAuditEventRecord {
     #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         request_id: [u8; 16],
+        occurred_at: ManagementAuditInstant,
         tenant: impl AsRef<str>,
         principal: impl AsRef<str>,
         transport: ManagementAuditTransportCode,
@@ -283,6 +380,7 @@ impl ManagementAuditEventRecord {
 
         Ok(Self {
             request_id,
+            occurred_at,
             tenant: tenant.to_owned(),
             principal: principal.to_owned(),
             transport,
@@ -297,6 +395,11 @@ impl ManagementAuditEventRecord {
     /// Exact request UUID bytes.
     pub const fn request_id(&self) -> &[u8; 16] {
         &self.request_id
+    }
+
+    /// Authenticated UTC wall time, monotonic sequence, and source attribution.
+    pub const fn occurred_at(&self) -> ManagementAuditInstant {
+        self.occurred_at
     }
 
     /// Tenant text from the trusted management principal.
@@ -345,6 +448,7 @@ impl fmt::Debug for ManagementAuditEventRecord {
         formatter
             .debug_struct("ManagementAuditEventRecord")
             .field("request_id", &"<redacted>")
+            .field("occurred_at", &self.occurred_at)
             .field("tenant", &"<redacted>")
             .field("principal", &"<redacted>")
             .field("transport", &self.transport)
@@ -360,6 +464,9 @@ impl fmt::Debug for ManagementAuditEventRecord {
 /// Invalid payload-free management-audit record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ManagementAuditRecordError {
+    /// UTC timestamp parts could not be represented by the durable profile.
+    #[error("management audit timestamp is invalid")]
+    Timestamp,
     /// A required field was empty or exceeded its byte bound.
     #[error("management audit required field is invalid")]
     RequiredField,
@@ -559,6 +666,38 @@ pub enum ManagementAuditCursorError {
     },
 }
 
+/// A durable management-audit chain uses a known but incompatible format.
+///
+/// This is intentionally distinct from
+/// [`ManagementAuditVerificationError`]: a v1 anchor is authenticated before
+/// this error is returned, but its timestamp-free record stream is not
+/// interpreted or presented as verified by the v2 reader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("management audit format version {found} is incompatible; version {expected} is required")]
+pub struct ManagementAuditFormatError {
+    expected: u64,
+    found: u64,
+}
+
+impl ManagementAuditFormatError {
+    fn new(found: u64) -> Self {
+        Self {
+            expected: MANAGEMENT_AUDIT_FORMAT_VERSION,
+            found,
+        }
+    }
+
+    /// Format version required by this SDK.
+    pub const fn expected(&self) -> u64 {
+        self.expected
+    }
+
+    /// Format version found in the durable anchor.
+    pub const fn found(&self) -> u64 {
+        self.found
+    }
+}
+
 /// One bounded page returned only after complete chain authentication.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ManagementAuditPage {
@@ -662,6 +801,9 @@ pub enum ManagementAuditStoreError {
     /// SQLite/preflight/storage failure.
     #[error(transparent)]
     Persistence(#[from] PersistError),
+    /// The trail predates or otherwise differs from the supported field stream.
+    #[error(transparent)]
+    IncompatibleFormat(#[from] ManagementAuditFormatError),
     /// Authenticated-chain verification failure.
     #[error(transparent)]
     Verification(#[from] ManagementAuditVerificationError),
@@ -674,6 +816,7 @@ impl fmt::Debug for ManagementAuditStoreError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let class = match self {
             Self::Persistence(_) => "Persistence",
+            Self::IncompatibleFormat(_) => "IncompatibleFormat",
             Self::Verification(_) => "Verification",
             Self::Cursor(_) => "Cursor",
         };
@@ -718,11 +861,28 @@ impl AnchorState {
     }
 
     fn calculate_hmac(&self, audit_key: &AuditKey) -> Result<[u8; 32], PersistError> {
+        self.calculate_hmac_for(
+            audit_key,
+            MANAGEMENT_AUDIT_FORMAT_VERSION,
+            AuditChainDomain::ManagementAnchorV2,
+        )
+    }
+
+    fn calculate_legacy_v1_hmac(&self, audit_key: &AuditKey) -> Result<[u8; 32], PersistError> {
+        self.calculate_hmac_for(audit_key, 1, AuditChainDomain::ManagementAnchorV1)
+    }
+
+    fn calculate_hmac_for(
+        &self,
+        audit_key: &AuditKey,
+        format_version: u64,
+        domain: AuditChainDomain,
+    ) -> Result<[u8; 32], PersistError> {
         calculate_audit_chain_hmac(
             audit_key,
-            AuditChainDomain::ManagementAnchorV1,
+            domain,
             &[
-                AuditChainField::U64(MANAGEMENT_AUDIT_FORMAT_VERSION),
+                AuditChainField::U64(format_version),
                 AuditChainField::U64(self.key_epoch),
                 AuditChainField::U64(self.retention_max_records),
                 AuditChainField::U64(self.total_count),
@@ -955,11 +1115,15 @@ fn calculate_event_hmac(
     event: &ManagementAuditEventRecord,
     previous_hash: &[u8; 32],
 ) -> Result<[u8; 32], PersistError> {
-    let mut fields = Vec::with_capacity(12 + event.schema_paths.len());
+    let mut fields = Vec::with_capacity(16 + event.schema_paths.len());
     fields.extend([
         AuditChainField::U64(MANAGEMENT_AUDIT_FORMAT_VERSION),
         AuditChainField::U64(sequence),
         AuditChainField::Bytes(&event.request_id),
+        AuditChainField::I64(event.occurred_at.utc_seconds()),
+        AuditChainField::U64(u64::from(event.occurred_at.nanosecond())),
+        AuditChainField::U64(event.occurred_at.monotonic_sequence()),
+        AuditChainField::Text(event.occurred_at.source().as_str()),
         AuditChainField::Text(&event.tenant),
         AuditChainField::Text(&event.principal),
         AuditChainField::Text(event.transport.as_str()),
@@ -978,12 +1142,16 @@ fn calculate_event_hmac(
         AuditChainField::OptionalText(event.tx_id.as_deref()),
         AuditChainField::Hash(previous_hash),
     ]);
-    calculate_audit_chain_hmac(audit_key, AuditChainDomain::ManagementEventV1, &fields)
+    calculate_audit_chain_hmac(audit_key, AuditChainDomain::ManagementEventV2, &fields)
 }
 
 struct RawManagementAuditRow {
     sequence: u64,
     request_id: [u8; 16],
+    occurred_at_utc_seconds: i64,
+    occurred_at_nanosecond: u32,
+    occurred_at_monotonic_sequence: u64,
+    occurred_at_time_source: String,
     tenant: String,
     principal: String,
     transport: String,
@@ -1052,6 +1220,17 @@ fn read_record_blob<const N: usize>(
     }
 }
 
+fn read_record_integer(
+    row: &rusqlite::Row<'_>,
+    index: usize,
+    sequence: u64,
+) -> Result<i64, ManagementAuditStoreError> {
+    match row.get_ref(index).map_err(PersistError::from)? {
+        ValueRef::Integer(value) => Ok(value),
+        _ => Err(malformed_record(Some(sequence))),
+    }
+}
+
 fn read_raw_record(
     row: &rusqlite::Row<'_>,
     expected_sequence: u64,
@@ -1075,10 +1254,27 @@ fn read_raw_record(
     if path_count > MANAGEMENT_AUDIT_MAX_SCHEMA_PATHS {
         return Err(malformed_record(Some(sequence)));
     }
+    let raw_nanosecond = read_record_integer(row, 13, sequence)?;
+    let occurred_at_nanosecond = u32::try_from(raw_nanosecond)
+        .ok()
+        .filter(|value| *value < 1_000_000_000)
+        .ok_or_else(|| malformed_record(Some(sequence)))?;
+    let raw_monotonic_sequence = read_record_integer(row, 14, sequence)?;
+    let occurred_at_monotonic_sequence =
+        u64::try_from(raw_monotonic_sequence).map_err(|_| malformed_record(Some(sequence)))?;
 
     Ok(RawManagementAuditRow {
         sequence,
         request_id: read_record_blob(row, 1, sequence)?,
+        occurred_at_utc_seconds: read_record_integer(row, 12, sequence)?,
+        occurred_at_nanosecond,
+        occurred_at_monotonic_sequence,
+        occurred_at_time_source: read_record_text(
+            row,
+            15,
+            MANAGEMENT_AUDIT_MAX_STABLE_CODE_BYTES,
+            sequence,
+        )?,
         tenant: read_record_text(row, 2, MANAGEMENT_AUDIT_MAX_TENANT_BYTES, sequence)?,
         principal: read_record_text(row, 3, MANAGEMENT_AUDIT_MAX_PRINCIPAL_BYTES, sequence)?,
         transport: read_record_text(row, 4, MANAGEMENT_AUDIT_MAX_STABLE_CODE_BYTES, sequence)?,
@@ -1100,6 +1296,10 @@ fn decode_record(
     let RawManagementAuditRow {
         sequence,
         request_id,
+        occurred_at_utc_seconds,
+        occurred_at_nanosecond,
+        occurred_at_monotonic_sequence,
+        occurred_at_time_source,
         tenant,
         principal,
         transport,
@@ -1133,8 +1333,18 @@ fn decode_record(
     let transport = ManagementAuditTransportCode::parse(&transport).ok_or_else(malformed)?;
     let operation = ManagementAuditOperationCode::parse(&operation).ok_or_else(malformed)?;
     let outcome = ManagementAuditOutcomeCode::parse(&outcome).ok_or_else(malformed)?;
+    let occurred_at_source =
+        ManagementAuditTimeSourceCode::parse(&occurred_at_time_source).ok_or_else(malformed)?;
+    let occurred_at = ManagementAuditInstant::try_new(
+        occurred_at_utc_seconds,
+        occurred_at_nanosecond,
+        occurred_at_monotonic_sequence,
+        occurred_at_source,
+    )
+    .map_err(|_| malformed())?;
     let event = ManagementAuditEventRecord::try_new(
         request_id,
+        occurred_at,
         tenant,
         principal,
         transport,
@@ -1204,7 +1414,7 @@ fn verify_chain(
     conn: &Connection,
     audit_key: &AuditKey,
 ) -> Result<Option<(AnchorState, ManagementAuditVerification)>, ManagementAuditStoreError> {
-    let Some(anchor) = load_anchor(conn)? else {
+    let Some(anchor) = load_anchor(conn, audit_key)? else {
         let event_exists: bool = conn
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM management_audit_event LIMIT 1)",
@@ -1233,7 +1443,7 @@ fn verify_chain(
 
     let mut statement = conn
         .prepare(
-            "SELECT sequence, request_id, tenant, principal, transport, operation, outcome, reason, schema_path_count, tx_id, previous_hash, entry_hmac \
+            "SELECT sequence, request_id, tenant, principal, transport, operation, outcome, reason, schema_path_count, tx_id, previous_hash, entry_hmac, occurred_at_utc_seconds, occurred_at_nanosecond, occurred_at_monotonic_sequence, occurred_at_time_source \
              FROM management_audit_event ORDER BY sequence ASC",
         )
         .map_err(PersistError::from)?;
@@ -1299,7 +1509,7 @@ fn load_append_anchor(
     audit_key: &AuditKey,
     check_external_orphans: bool,
 ) -> Result<Option<AnchorState>, ManagementAuditStoreError> {
-    let Some(anchor) = load_anchor(conn)? else {
+    let Some(anchor) = load_anchor(conn, audit_key)? else {
         return Ok(None);
     };
     anchor.validate(audit_key)?;
@@ -1433,7 +1643,7 @@ fn load_record_at(
     let sqlite_sequence = to_sqlite_integer(sequence)?;
     let mut statement = conn
         .prepare(
-            "SELECT sequence, request_id, tenant, principal, transport, operation, outcome, reason, schema_path_count, tx_id, previous_hash, entry_hmac \
+            "SELECT sequence, request_id, tenant, principal, transport, operation, outcome, reason, schema_path_count, tx_id, previous_hash, entry_hmac, occurred_at_utc_seconds, occurred_at_nanosecond, occurred_at_monotonic_sequence, occurred_at_time_source \
              FROM management_audit_event WHERE sequence = ?1",
         )
         .map_err(PersistError::from)?;
@@ -1454,7 +1664,7 @@ fn load_record_page(
 ) -> Result<Vec<StoredManagementAuditRecord>, ManagementAuditStoreError> {
     let mut statement = conn
         .prepare(
-            "SELECT sequence, request_id, tenant, principal, transport, operation, outcome, reason, schema_path_count, tx_id, previous_hash, entry_hmac \
+            "SELECT sequence, request_id, tenant, principal, transport, operation, outcome, reason, schema_path_count, tx_id, previous_hash, entry_hmac, occurred_at_utc_seconds, occurred_at_nanosecond, occurred_at_monotonic_sequence, occurred_at_time_source \
              FROM management_audit_event WHERE sequence >= ?1 ORDER BY sequence ASC LIMIT ?2",
         )
         .map_err(PersistError::from)?;
@@ -1590,7 +1800,10 @@ fn read_anchor_blob<const N: usize>(
     }
 }
 
-fn load_anchor(conn: &Connection) -> Result<Option<AnchorState>, ManagementAuditStoreError> {
+fn load_anchor(
+    conn: &Connection,
+    audit_key: &AuditKey,
+) -> Result<Option<AnchorState>, ManagementAuditStoreError> {
     let mut statement = conn
         .prepare(
             "SELECT format_version, retention_max_records, key_epoch, total_count, retained_count, low_water_sequence, low_water_hash, terminal_sequence, terminal_hash, anchor_hmac \
@@ -1601,10 +1814,8 @@ fn load_anchor(conn: &Connection) -> Result<Option<AnchorState>, ManagementAudit
     let Some(row) = rows.next().map_err(PersistError::from)? else {
         return Ok(None);
     };
-    if read_anchor_integer(row, 0)? != MANAGEMENT_AUDIT_FORMAT_VERSION {
-        return Err(malformed_anchor());
-    }
-    Ok(Some(AnchorState {
+    let format_version = read_anchor_integer(row, 0)?;
+    let anchor = AnchorState {
         retention_max_records: read_anchor_integer(row, 1)?,
         key_epoch: read_anchor_integer(row, 2)?,
         total_count: read_anchor_integer(row, 3)?,
@@ -1614,7 +1825,24 @@ fn load_anchor(conn: &Connection) -> Result<Option<AnchorState>, ManagementAudit
         terminal_sequence: read_optional_anchor_integer(row, 7)?,
         terminal_hash: read_anchor_blob(row, 8)?,
         anchor_hmac: read_anchor_blob(row, 9)?,
-    }))
+    };
+    if format_version == MANAGEMENT_AUDIT_FORMAT_VERSION {
+        return Ok(Some(anchor));
+    }
+    if format_version == 1
+        && anchor.key_epoch == audit_key.epoch()
+        && anchor.calculate_legacy_v1_hmac(audit_key).ok() == Some(anchor.anchor_hmac)
+    {
+        // This authenticates only the v1 anchor's provenance. It is not a v1
+        // record-chain integrity verdict; this SDK deliberately declines to
+        // interpret the older, timestamp-free event stream.
+        return Err(ManagementAuditFormatError::new(format_version).into());
+    }
+    Err(ManagementAuditVerificationError::new(
+        ManagementAuditVerificationFailure::AnchorAuthentication,
+        None,
+    )
+    .into())
 }
 
 fn insert_event(
@@ -1630,10 +1858,16 @@ fn insert_event(
     let path_count = i64::try_from(event.schema_paths.len()).map_err(|_| {
         PersistError::constraint_violation("management audit path count is outside SQLite range")
     })?;
+    let monotonic_sequence =
+        i64::try_from(event.occurred_at.monotonic_sequence()).map_err(|_| {
+            PersistError::constraint_violation(
+                "management audit monotonic sequence is outside SQLite range",
+            )
+        })?;
     conn.execute(
         "INSERT INTO management_audit_event \
-         (sequence, request_id, tenant, principal, transport, operation, outcome, reason, schema_path_count, tx_id, previous_hash, entry_hmac) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+         (sequence, request_id, tenant, principal, transport, operation, outcome, reason, schema_path_count, tx_id, previous_hash, entry_hmac, occurred_at_utc_seconds, occurred_at_nanosecond, occurred_at_monotonic_sequence, occurred_at_time_source) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
         rusqlite::params![
             sequence,
             &event.request_id[..],
@@ -1647,6 +1881,10 @@ fn insert_event(
             event.tx_id.as_deref(),
             &previous_hash[..],
             &entry_hmac[..],
+            event.occurred_at.utc_seconds(),
+            i64::from(event.occurred_at.nanosecond()),
+            monotonic_sequence,
+            event.occurred_at.source().as_str(),
         ],
     )
     .map_err(PersistError::from)?;
@@ -1784,9 +2022,20 @@ fn fixed_bytes<const N: usize>(bytes: &[u8]) -> Option<[u8; N]> {
 mod tests {
     use super::*;
 
+    fn instant(sequence: u64) -> ManagementAuditInstant {
+        ManagementAuditInstant::try_new(
+            -1,
+            999_999_999,
+            sequence,
+            ManagementAuditTimeSourceCode::NodeClock,
+        )
+        .expect("valid management audit instant")
+    }
+
     fn event(request_id: u8) -> ManagementAuditEventRecord {
         ManagementAuditEventRecord::try_new(
             [request_id; 16],
+            instant(u64::from(request_id)),
             "tenant-a",
             "operator-a",
             ManagementAuditTransportCode::Gnmi,
@@ -1803,6 +2052,7 @@ mod tests {
     fn record_constructor_rejects_payload_shaped_fields() {
         let result = ManagementAuditEventRecord::try_new(
             [1; 16],
+            instant(1),
             "tenant-a",
             "operator",
             ManagementAuditTransportCode::Gnmi,
@@ -1816,6 +2066,7 @@ mod tests {
 
         let path_result = ManagementAuditEventRecord::try_new(
             [1; 16],
+            instant(1),
             "tenant-a",
             "operator",
             ManagementAuditTransportCode::Gnmi,
@@ -1832,6 +2083,7 @@ mod tests {
     fn record_constructor_stops_an_unbounded_path_iterator_at_the_fixed_cap() {
         let result = ManagementAuditEventRecord::try_new(
             [1; 16],
+            instant(1),
             "tenant-a",
             "operator",
             ManagementAuditTransportCode::Gnmi,
@@ -1842,6 +2094,28 @@ mod tests {
             None::<String>,
         );
         assert_eq!(result, Err(ManagementAuditRecordError::TooManyPaths));
+    }
+
+    #[test]
+    fn durable_instant_rejects_out_of_range_parts() {
+        assert_eq!(
+            ManagementAuditInstant::try_new(
+                0,
+                1_000_000_000,
+                1,
+                ManagementAuditTimeSourceCode::NodeClock,
+            ),
+            Err(ManagementAuditInstantError::Nanosecond)
+        );
+        assert_eq!(
+            ManagementAuditInstant::try_new(
+                0,
+                0,
+                MANAGEMENT_AUDIT_MAX_MONOTONIC_SEQUENCE + 1,
+                ManagementAuditTimeSourceCode::NodeClock,
+            ),
+            Err(ManagementAuditInstantError::MonotonicSequence)
+        );
     }
 
     #[test]
@@ -1860,6 +2134,79 @@ mod tests {
                 None,
             ))
         );
+    }
+
+    #[test]
+    fn v2_event_hmac_has_a_fixed_independent_vector() {
+        let key = AuditKey::new([0x44; 32]).expect("audit key");
+        let previous_hash = [0x11; 32];
+        let hmac = calculate_event_hmac(&key, 7, &event(1), &previous_hash).expect("event HMAC");
+        assert_eq!(
+            hmac,
+            [
+                0x0e, 0x6b, 0x9e, 0x1d, 0x34, 0x8e, 0xea, 0x96, 0x8b, 0x93, 0xf4, 0xc3, 0x68, 0xec,
+                0xf1, 0x2e, 0x4d, 0x1e, 0x10, 0xc1, 0xcd, 0x86, 0x45, 0xf0, 0x42, 0xd5, 0x24, 0xbd,
+                0x38, 0x4f, 0xc5, 0xa3,
+            ]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn authenticated_v1_anchor_is_compatibility_but_v2_downgrade_is_tamper() {
+        let retention = ManagementAuditRetention::try_new(8).expect("retention");
+        let legacy_backend = SqliteBackend::in_memory_for_test()
+            .await
+            .expect("legacy backend");
+        legacy_backend
+            .configure_management_audit(retention)
+            .await
+            .expect("configure legacy candidate");
+        {
+            let conn = legacy_backend.conn().lock_owned().await;
+            let anchor = load_anchor(&conn, legacy_backend.audit_key())
+                .expect("load v2 anchor")
+                .expect("anchor");
+            let legacy_hmac = anchor
+                .calculate_legacy_v1_hmac(legacy_backend.audit_key())
+                .expect("legacy anchor HMAC");
+            conn.execute(
+                "UPDATE management_audit_anchor SET format_version = 1, anchor_hmac = ?1 WHERE id = 1",
+                [&legacy_hmac[..]],
+            )
+            .expect("install authenticated v1 anchor");
+        }
+        match legacy_backend.verify_management_audit().await {
+            Err(ManagementAuditStoreError::IncompatibleFormat(error)) => {
+                assert_eq!(error.expected(), 2);
+                assert_eq!(error.found(), 1);
+            }
+            other => panic!("unexpected authenticated v1 result: {other:?}"),
+        }
+
+        let downgraded_backend = SqliteBackend::in_memory_for_test()
+            .await
+            .expect("downgrade backend");
+        downgraded_backend
+            .configure_management_audit(retention)
+            .await
+            .expect("configure v2 anchor");
+        {
+            let conn = downgraded_backend.conn().lock_owned().await;
+            conn.execute(
+                "UPDATE management_audit_anchor SET format_version = 1 WHERE id = 1",
+                [],
+            )
+            .expect("downgrade only version tag");
+        }
+        match downgraded_backend.verify_management_audit().await {
+            Err(ManagementAuditStoreError::Verification(error)) => {
+                assert_eq!(
+                    error.failure(),
+                    ManagementAuditVerificationFailure::AnchorAuthentication
+                );
+            }
+            other => panic!("unexpected v2 downgrade result: {other:?}"),
+        }
     }
 
     #[test]

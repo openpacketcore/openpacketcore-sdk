@@ -129,11 +129,12 @@ pub use consensus::{
 };
 pub use error::{PersistError, PersistErrorKind};
 pub use management_audit::{
-    ManagementAuditCursorError, ManagementAuditEventRecord, ManagementAuditOperationCode,
+    ManagementAuditCursorError, ManagementAuditEventRecord, ManagementAuditFormatError,
+    ManagementAuditInstant, ManagementAuditInstantError, ManagementAuditOperationCode,
     ManagementAuditOutcomeCode, ManagementAuditPage, ManagementAuditPageRequest,
     ManagementAuditPageRequestError, ManagementAuditRecordError, ManagementAuditRetention,
-    ManagementAuditRetentionError, ManagementAuditStoreError, ManagementAuditTransportCode,
-    ManagementAuditVerification, ManagementAuditVerificationError,
+    ManagementAuditRetentionError, ManagementAuditStoreError, ManagementAuditTimeSourceCode,
+    ManagementAuditTransportCode, ManagementAuditVerification, ManagementAuditVerificationError,
     ManagementAuditVerificationFailure, StoredManagementAuditRecord,
     MANAGEMENT_AUDIT_FORMAT_VERSION, MANAGEMENT_AUDIT_MAX_EVENT_BYTES,
     MANAGEMENT_AUDIT_MAX_PAGE_RECORDS, MANAGEMENT_AUDIT_MAX_PRINCIPAL_BYTES,

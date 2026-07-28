@@ -13,6 +13,8 @@ Public API:
 - `AuditEvent`, the structured event record.
 - `AuditSink`, the synchronous fail-closed sink trait.
 - `TracingAuditSink`, a best-effort sink that emits events through `tracing`.
+- `AuditInstant` and `AuditTimeSource`, the UTC wall-clock observation,
+  process-local monotonic sequence, and source attribution.
 - `AuditOperation`, `AuditOutcome`, `AuditReasonCode`, `AuditTxId`, and
   `SchemaNodePath`.
 - Label-safe helpers: `label_safe_transport`, `label_safe_outcome`, and
@@ -31,6 +33,15 @@ let sink: std::sync::Arc<dyn AuditSink> = std::sync::Arc::new(TracingAuditSink);
 Audit schema paths are predicate-free and reason codes are bounded
 machine-readable strings. Metric-label helpers sanitize unknown values through
 the redaction helpers used elsewhere in the SDK.
+
+`AuditEvent::new` records the node clock as UTC Unix seconds plus a canonical
+fractional nanosecond and defaults its source to `NodeClock`. A caller must
+explicitly supply `SynchronisedNodeClock` and is responsible for the truth of
+that assurance. The process-local monotonic sequence saturates rather than
+wrapping; equal saturated values do not establish strict order. This implements
+the wall-clock plus monotonic-sequence contract in RFC 003 §11.3, and callers
+must not make security decisions from wall clock alone where monotonic ordering
+is required.
 
 ## Relationships
 
@@ -54,10 +65,12 @@ Production note:
 
 ## Durable Adapter
 
-`opc-mgmt-audit-store` persists only this crate's existing structured fields.
-It adds authenticated chaining, bounded retention/query pages, restart
-verification, production storage preflight, and bounded worker acknowledgement
-without moving storage dependencies into this core contract crate.
+`opc-mgmt-audit-store` persists the UTC time, monotonic sequence, source tag,
+and the rest of this crate's structured fields inside the authenticated v2
+field stream. It adds authenticated chaining, bounded retention/query pages,
+restart verification, production storage preflight, and bounded worker
+acknowledgement without moving storage dependencies into this core contract
+crate.
 
 ## Verification
 
