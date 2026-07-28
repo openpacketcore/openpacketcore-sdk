@@ -88,6 +88,9 @@ fn require_ebpf_executable_pmtu_policy(
     Ok(())
 }
 
+// Off Linux the only callers are the unit tests: the map readers that consult
+// this predicate live in the kernel runtime module, which is Linux-gated.
+#[cfg(any(target_os = "linux", test))]
 fn ebpf_pmtu_map_state_is_executable(state: UplinkMtuMapState) -> bool {
     match state {
         UplinkMtuMapState::Unset => true,
@@ -260,6 +263,9 @@ pub(crate) struct EbpfEnvironment {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EbpfAttachmentDisposition {
+    // Only a real tc attach reports a freshly created filter, so off Linux
+    // this variant is produced by the fake runtimes in the unit tests alone.
+    #[cfg(any(target_os = "linux", test))]
     Fresh,
     Retained,
 }
@@ -1210,6 +1216,9 @@ impl EbpfGtpuDataplaneBackend {
         .await
     }
 
+    // The only non-test constructor that reaches this is `with_config`, which
+    // needs the aya kernel runtime and is therefore Linux-gated.
+    #[cfg(any(target_os = "linux", test))]
     pub(crate) fn with_runtime_and_config(
         runtime: Arc<dyn EbpfGtpuRuntime>,
         config: EbpfGtpuDataplaneBackendConfig,
@@ -4569,17 +4578,44 @@ impl EbpfGtpuDataplaneBackend {
             // consumer can receive them on a concrete S2b-U address. Outer
             // IPv6 fragment handling is reported separately and remains
             // unsupported.
-            downlink_outer_fragment_handling: if has_legacy_ipv4_downlink_attachment
-                && endpoint_binding_datapath_usable
-            {
-                GtpuDownlinkFragmentContract::KernelReassemblyHandoff {
-                    bounds: crate::reassembly::linux_reassembly_bounds(),
-                }
-            } else {
-                GtpuDownlinkFragmentContract::Unsupported
-            },
+            downlink_outer_fragment_handling: downlink_outer_fragment_contract(
+                has_legacy_ipv4_downlink_attachment && endpoint_binding_datapath_usable,
+            ),
             details,
         }
+    }
+}
+
+/// Report the outer IPv4 downlink fragment contract for this build target.
+///
+/// The handoff is a Linux-only contract: the tc program passes outer IPv4
+/// fragments to the kernel's `ipfrag` stack, which reassembles them under
+/// `net.ipv4.ipfrag_*` accounting and delivers one datagram to the SDK
+/// consumer's socket, provided the operator runs that consumer -- see
+/// [`GtpuDownlinkFragmentContract`] for the authoritative statement of the
+/// contract and its completeness condition. A target without that stack has
+/// nothing to hand off to,
+/// so it reports `Unsupported` even where the datapath state would otherwise
+/// qualify. It must not report a handoff carrying `bounds: None`, which is the
+/// distinct statement "the Linux limits could not be read" and presumes the
+/// very stack that is absent here.
+fn downlink_outer_fragment_contract(
+    kernel_handoff_datapath_ready: bool,
+) -> GtpuDownlinkFragmentContract {
+    #[cfg(target_os = "linux")]
+    {
+        if kernel_handoff_datapath_ready {
+            GtpuDownlinkFragmentContract::KernelReassemblyHandoff {
+                bounds: crate::reassembly::linux_reassembly_bounds(),
+            }
+        } else {
+            GtpuDownlinkFragmentContract::Unsupported
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = kernel_handoff_datapath_ready;
+        GtpuDownlinkFragmentContract::Unsupported
     }
 }
 
@@ -23421,6 +23457,46 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn downlink_fragment_contract_reports_kernel_handoff_only_on_linux() {
+        assert_eq!(
+            downlink_outer_fragment_contract(false),
+            GtpuDownlinkFragmentContract::Unsupported
+        );
+
+        // `KernelReassemblyHandoff { bounds: None }` says the Linux ipfrag
+        // limits could not be read, which still asserts that a Linux
+        // reassembly stack is receiving the fragments. A target without one
+        // must say `Unsupported` instead of borrowing that vocabulary, so the
+        // ready datapath state is not enough to produce a handoff off Linux.
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(
+            downlink_outer_fragment_contract(true),
+            GtpuDownlinkFragmentContract::Unsupported
+        );
+        #[cfg(target_os = "linux")]
+        {
+            let contract = downlink_outer_fragment_contract(true);
+            // Asserted against the variant rather than against a second call
+            // to `linux_reassembly_bounds`, which would restate the
+            // implementation and let a `bounds: None` regression survive on
+            // any host whose ipfrag sysctls are unreadable.
+            let GtpuDownlinkFragmentContract::KernelReassemblyHandoff { bounds } = contract else {
+                panic!("Linux must report a kernel reassembly handoff, got {contract:?}");
+            };
+            // The bounds are read from the live sysctls, so only demand them
+            // where the kernel actually exposes both files.
+            if std::path::Path::new("/proc/sys/net/ipv4/ipfrag_high_thresh").exists()
+                && std::path::Path::new("/proc/sys/net/ipv4/ipfrag_time").exists()
+            {
+                assert!(
+                    bounds.is_some(),
+                    "readable ipfrag sysctls must yield reassembly bounds"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn probe_transitions_from_unprovisioned_unknown_to_attached_available() {
         let ready = EbpfGtpuDataplaneBackend::with_runtime(Arc::new(FakeRuntime::new()));
@@ -23435,10 +23511,18 @@ mod tests {
         assert!(probe.btf_present);
         assert!(probe.mutation_ready);
         assert_eq!(probe.egress_dscp_marking, GtpuCapability::Available);
+        #[cfg(target_os = "linux")]
         assert!(matches!(
             probe.downlink_outer_fragment_handling,
             GtpuDownlinkFragmentContract::KernelReassemblyHandoff { .. }
         ));
+        // A fake runtime reports a fully capable environment on any host, but
+        // the kernel stack the handoff hands off to exists only on Linux.
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(
+            probe.downlink_outer_fragment_handling,
+            GtpuDownlinkFragmentContract::Unsupported
+        );
         assert!(!probe.gtp_module_present);
 
         for missing in ["bpffs", "btf", "net_admin", "bpf"] {

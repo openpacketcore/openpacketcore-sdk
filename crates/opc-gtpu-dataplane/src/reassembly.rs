@@ -48,12 +48,19 @@ use std::fmt;
 use std::net::Ipv4Addr;
 
 use opc_gtpu_ebpf_common::{
-    parse_gtpu_tpdu, DownlinkBindingMismatch, DownlinkEndpointBinding, GtpuReassemblyBounds,
-    MarkedBearerOwner, MarkedDownlinkPdr, PdpContextCommit, UplinkFar, UplinkFarKey,
-    MAX_REASSEMBLED_GTPU_LEN,
+    parse_gtpu_tpdu, DownlinkBindingMismatch, DownlinkEndpointBinding, MarkedBearerOwner,
+    MarkedDownlinkPdr, PdpContextCommit, UplinkFar, UplinkFarKey, MAX_REASSEMBLED_GTPU_LEN,
 };
 
-use crate::model::{GtpBearerMark, GTPU_PORT};
+use crate::model::GtpBearerMark;
+
+// The reassembly bounds type and the GTP-U service port are referenced only by
+// the sysctl and socket surfaces below, which are themselves Linux-only, so
+// their imports carry the same gate instead of an `allow(unused_imports)`.
+#[cfg(target_os = "linux")]
+use crate::model::GTPU_PORT;
+#[cfg(target_os = "linux")]
+use opc_gtpu_ebpf_common::GtpuReassemblyBounds;
 
 /// Read the live per-netns IPv4 reassembly bounds for capability reporting.
 ///
@@ -339,6 +346,9 @@ pub struct DownlinkOuterProvenance {
 impl DownlinkOuterProvenance {
     /// Construct one canonical provenance. Unspecified addresses and a zero
     /// ifindex cannot authorize anything and return `None`.
+    // Provenance is minted from an `IP_PKTINFO` control message on the
+    // Linux-gated receive path; off Linux only the unit tests build one.
+    #[cfg(any(target_os = "linux", test))]
     #[must_use]
     pub(crate) fn new(
         peer_address: Ipv4Addr,

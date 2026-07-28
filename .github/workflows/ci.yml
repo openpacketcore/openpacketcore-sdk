@@ -10,7 +10,8 @@ on:
 permissions:
   contents: read
 
-# This workflow now requests ~22 concurrent jobs per run. Without a
+# This workflow now requests ~24 concurrent jobs per run (19 jobs, one of
+# which expands to a 6-way shard matrix). Without a
 # concurrency group a superseded push keeps its whole fleet running and the
 # replacement run queues behind it, which costs far more wall clock than the
 # sharding saves. Runs on main are never cancelled.
@@ -272,6 +273,76 @@ jobs:
       - name: Run GTP-U unsupported-platform cfg tests
         run: RUSTFLAGS="--cfg opc_linux_gtpu_sys_force_unsupported" cargo test --locked -p opc-linux-gtpu-sys -p opc-gtpu-dataplane --no-default-features --quiet
 
+  # `rust-gtpu-cfg` above forces the Linux backend unavailable; these two lanes
+  # cover the orthogonal axis of host portability. `opc-gtpu-dataplane` ships a
+  # portable model, a mock backend and an unsupported-platform backend, so it
+  # must keep compiling where there is no Linux kernel datapath at all. The
+  # cross lint catches cfg leaks cheaply but cannot run a FreeBSD binary; the
+  # macOS lane is a real non-Linux host, the class the issue reports, and is
+  # the only place the crate's off-Linux unit assertions actually execute.
+  rust-gtpu-freebsd:
+    name: Rust GTP-U dataplane FreeBSD target
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Add the FreeBSD target
+        run: rustup target add x86_64-unknown-freebsd
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: opc-rust-gtpu-freebsd
+
+      # Linted, not merely checked: half of the regression this lane guards was
+      # two imports left with no non-Linux user, and `cargo check` exits 0 on a
+      # warning. A FreeBSD binary cannot execute on this runner, so the lane
+      # proves compilation only; the macOS lane below runs the tests.
+      - name: Lint opc-gtpu-dataplane for FreeBSD
+        run: cargo clippy --locked -p opc-gtpu-dataplane --all-targets --target x86_64-unknown-freebsd -- -D warnings
+
+  rust-gtpu-macos:
+    name: Rust GTP-U dataplane macOS host
+    runs-on: macos-latest
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: opc-rust-gtpu-macos
+
+      - name: Lint opc-gtpu-dataplane on macOS
+        run: cargo clippy --locked -p opc-gtpu-dataplane --all-targets -- -D warnings
+
+      # The only lane that executes the crate on a non-Linux host, so it is the
+      # only place the off-Linux fragment-contract assertion actually runs
+      # rather than merely compiling.
+      - name: Run opc-gtpu-dataplane unit tests on macOS
+        run: cargo test --locked -p opc-gtpu-dataplane --lib
+
   rust:
     name: Rust workspace
     runs-on: ubuntu-latest
@@ -283,6 +354,8 @@ jobs:
       - rust-tests
       - rust-persist
       - rust-gtpu-cfg
+      - rust-gtpu-freebsd
+      - rust-gtpu-macos
     steps:
       # Preserves the single check name the previous monolithic job reported,
       # so anything watching "Rust workspace" keeps meaning the whole suite.

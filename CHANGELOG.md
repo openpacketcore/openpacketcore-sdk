@@ -336,6 +336,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   missing a configured revision receipt emits a value-free error and returns
   plain `<ok/>` instead of reclassifying an applied write as
   `operation-failed`.
+- **`opc-gtpu-dataplane` compiles for non-Linux targets again (#586):** the
+  eBPF backend's probe filled `downlink_outer_fragment_handling` with an
+  unconditional call to `crate::reassembly::linux_reassembly_bounds`, but that
+  function is `#[cfg(target_os = "linux")]`. Every other target failed with
+  `cannot find function linux_reassembly_bounds in module crate::reassembly`,
+  and the same module left `GtpuReassemblyBounds` and `GTPU_PORT` imported
+  where nothing used them, which a `-D warnings` lane turns into two more
+  errors. That took the crate's portable surface down with it -- the model
+  types, `MockGtpuDataplaneBackend`, the redaction-safe errors, and
+  `UnsupportedGtpuDataplaneBackend`, which the crate README documents as
+  preserving trait-object usage on non-Linux or disabled builds. The crate is
+  in the default `crates/*` workspace graph, so the failure also surfaced in
+  any workspace-wide check on a non-Linux host; other workspace members have
+  their own non-Linux gaps and are out of scope here. The probe field now goes
+  through a small helper split on `target_os = "linux"`, matching
+  `probe_committed_classifier_load`, and the Linux-only imports and helpers
+  carry the same gate as the code that uses them. Off Linux the field reports
+  `GtpuDownlinkFragmentContract::Unsupported` and never
+  `KernelReassemblyHandoff { bounds: None }`: `bounds: None` says the kernel's
+  `net.ipv4.ipfrag_*` limits could not be read and still asserts that a Linux
+  reassembly stack is receiving the fragments, which a target without one does
+  not have. Linux behaviour is unchanged -- the Linux branch evaluates the same
+  expression, and the existing Linux probe assertions still run unchanged on
+  Linux, having gained a `cfg` so that a non-Linux host asserts the
+  `Unsupported` answer instead. Two CI lanes hold the line off Linux, both
+  `--all-targets`, both linted with `-D warnings` so the unused-import half of
+  this regression fails them too, and both required by the aggregate
+  `Rust workspace` gate: an `x86_64-unknown-freebsd` cross lint, which cannot
+  execute a FreeBSD binary and so proves compilation only, and a `macos-latest`
+  host lane, which also runs the crate's unit tests and is therefore the one
+  place the off-Linux contract assertion executes rather than merely compiling.
+  Integration and privileged suites remain Linux-only. The lanes are
+  orthogonal to the existing
+  forced-unavailable Linux backend lane, which exercises a disabled backend on
+  Linux rather than a host with no Linux datapath at all.
 - **P-CSCF Re-selection support is no longer emittable on its own --
   `opc-proto-gtpv2c` (breaking to `PcoRequest`):** TS 24.008 10.5.6.3 says of
   container `0x0012` that "This PCO parameter may be present only if a
