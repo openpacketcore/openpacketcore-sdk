@@ -23,7 +23,10 @@ route steering, XFRM policy, deployment defaults, or traffic-readiness policy.
   uplink-capable access-gateway roles where the mainline `gtp` netdevice cannot
   select PDP context by inner source address. Its `datapath_snapshot` method
   returns identity-bound aggregate counters from the exact live programs and
-  pinned map.
+  pinned map. `managed_device_inventory` returns a mutex-coherent view, ordered
+  by ifindex, of only the managed interface names and indexes, bounded by
+  `MAX_EBPF_MANAGED_DEVICE_IDENTITIES`; typed completeness tells callers when
+  absence from that view is inconclusive.
 - `MockGtpuDataplaneBackend`: deterministic in-memory backend with operation
   capture and failure injection.
 - `UnsupportedGtpuDataplaneBackend`: reports unsupported-platform results while
@@ -43,7 +46,10 @@ route steering, XFRM policy, deployment defaults, or traffic-readiness policy.
   `GtpuSessionGroup`, `GtpuSessionGroupReconcileRequest`,
   `GtpuSessionSelectorProvenance`, and `GtpuSessionSelectorReuseProof`,
   `EbpfGtpuDatapathSnapshot`, `EbpfGtpuDatapathCounters`, `DscpCodepoint`,
-  `GtpRole`, `GtpVersion`, `GtpAddressFamily`, and `GTPU_PORT`.
+  `EbpfManagedDeviceIdentity`, `EbpfManagedDeviceInventory`,
+  `EbpfManagedDeviceInventoryCompleteness`,
+  `MAX_EBPF_MANAGED_DEVICE_IDENTITIES`, `GtpRole`, `GtpVersion`,
+  `GtpAddressFamily`, and `GTPU_PORT`.
 - `GtpuError` is intentionally redaction-safe; TEIDs and addresses are not
   emitted by `Debug`/`Display`. A `BPF_PROG_LOAD` failure is reported as one of
   two variants, preserving only its stable operation, I/O kind, and errno:
