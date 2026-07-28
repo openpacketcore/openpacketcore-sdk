@@ -807,12 +807,21 @@ additive: an all-zero MTU policy slot selects the legacy total-length-only
 behavior, so populated v4 state upgrades in place.
 
 There is no implicit endpoint migration for populated older state. A committed
-v2 pin set is rejected with the redaction-safe `ebpf_endpoint_schema` error and
-requires an explicit traffic drain followed by pin removal and reprovisioning.
-An uncommitted, legacy-v0, or DSCP-v1 graph can advance only when it is empty;
-any retained PDR/FAR without an exact binding is indeterminate and fails before
-either hook changes. The SDK never invents `Any`, derives a peer from an
-untrusted packet, or labels endpoint-unbound forwarding state production-ready.
+v2 pin set is rejected and requires an explicit traffic drain followed by pin
+removal and reprovisioning. Which redaction-safe error names it depends on how
+far the graph gets: the pre-load map-layout guard described below now sees a v2
+bearer pin first, because that generation's owner value is a different width,
+and names it `ebpf_pin_map_abi`; a v2 graph that reaches the endpoint preflight
+is still named `ebpf_endpoint_schema`. Both refuse before either hook changes,
+and the operator remedy is the same.
+An uncommitted, legacy-v0, or DSCP-v1 schema can advance only when it is empty,
+its retained maps already satisfy the current ABI, and no historical hook is
+live. An authentic frozen-v1 graph has a six-slot counter map and historical
+program tags, so it now requires a drained pin removal and reprovision instead
+of automatic hook replacement. Any retained PDR/FAR without an exact binding
+is indeterminate and fails before either hook changes. The SDK never invents
+`Any`, derives a peer from an untrusted packet, or labels endpoint-unbound
+forwarding state production-ready.
 
 #### Orphaned current-schema graph recovery
 
@@ -1074,23 +1083,22 @@ Rebuilding the historical source with `scripts/build-gtpu-ebpf.sh` is useful
 for program/map inventory review, but exact-byte reproduction is not currently
 supported or claimed.
 
-Empty v0/v1 hook replacement is authorized only by the frozen
-`bpf/opc-gtpu-datapath-v1.bpf.o` fixture. It is the DSCP-generation artifact
-from commit `4fd43cf1465a46b6afa35348b2463fa9c497fce4`, with SHA-256
+The frozen `bpf/opc-gtpu-datapath-v1.bpf.o` fixture is retained only as exact
+generation evidence. It is the DSCP-generation artifact from commit
+`4fd43cf1465a46b6afa35348b2463fa9c497fce4`, with SHA-256
 `f31ccc2914f2fd61ae8f1e892e9ac0342f9e81350a4a065d5d8dcfcc9f7a943f`.
-The loader binds that object to the exact retained old map IDs and compares the
-live program name, type, tag, and complete map-ID set before replacement. The
-fixture is migration authority only; it is never selected as the running current
-datapath. CI verifies its hash and old-only program/map inventory.
+The loader validates that provenance, its old-only map inventory, and its
+six-slot counter map before deriving its program tags. It does not load or
+attach the object as replacement authority: a live matching hook reports the
+named `PreBearerMark` generation and requires a drained reprovision. CI
+independently verifies the hash and old-only program/map inventory.
 
-Classic-tc replacement uses Aya's atomic `attach_to_link` netlink path, not a
-detach-then-attach window. Both hook occupants are proven before either is
-touched. If the second replacement is uncertain, the first exact current hook is
-retained and the exact old/current second hook is left for an idempotent retry;
-the migration returns `StateIndeterminate` instead of creating an empty live
-slot. The same retained, retryable rule applies if schema or runtime-state
-commit fails after replacing an existing datapath. Fresh provisioning still
-rolls back a first hook that it created in an originally empty slot.
+Classic-tc replacement of an exact current hook still uses Aya's atomic
+`attach_to_link` netlink path, not a detach-then-attach window. Both hook
+occupants are proven before either is touched. Fresh provisioning rolls back a
+first hook that it created in an originally empty slot; an exact pre-existing
+current hook is retained if a later schema or runtime-state commit becomes
+indeterminate.
 
 All mutations through clones of one backend are serialized as one
 reconciliation. Cooperating independently constructed backends and processes
@@ -1146,9 +1154,142 @@ and application memory are not read through that operation. The userspace
 `opc-gtpu-dataplane` crate remains entirely safe Rust. Its committed current
 object is embedded from
 `crates/opc-gtpu-dataplane/bpf/opc-gtpu-datapath.bpf.o`; the frozen v1 object is
-retained only for the exact automatic empty-graph migration proof described
-above, and the frozen v2 object is retained only for the explicit drained
-teardown identity proof. Neither legacy object runs as the current datapath.
+retained only for exact historical-generation evidence, the frozen v2 object is
+retained only for the explicit drained teardown identity proof, and the frozen
+pre-redirect object is retained only to derive the program tags described in
+the next section. None of the three legacy objects runs as the current
+datapath.
+
+#### Map ABI and program generations across an upgrade
+
+Two separate things can differ between the build that published a pin graph and
+the build now trying to attach to it: the shape of the pinned maps, and the
+instruction stream of the programs on the tc hooks. They fail in different
+ways, so the loader classifies both before it changes anything.
+
+**Map layout.** Before the object is loaded, every pin that exists is compared
+against this build's map specification using kernel metadata only -- map type,
+name, key size, value size and flags -- with no value type bound to any of
+them. A divergence fails the attach with
+`GtpuError::Io { operation: "ebpf_pin_map_abi" }`. This runs before the schema
+preflight, which reads the marker out of the FAR map through a typed
+`BpfHashMap` binding: a foreign-shaped FAR pin is therefore named as a shape
+mismatch rather than surfacing as a schema error from an accessor that had
+already assumed the shape.
+
+`max_entries` is not part of that comparison, because a map of the wrong
+capacity still binds: it is a separate hazard with its own guard, not a shape
+mismatch. This layout guard is also not a generation test. The v1 and
+pre-redirect generations do share this build's layout for every map they pin,
+but the frozen bearer-v2 generation does not — its owner value is a different
+width — so a retained v2 pin set is named here as the shape mismatch it is.
+
+**Map capacity.** Capacity is checked separately, on every retained graph
+whatever schema marker it carries, and fails with the same `ebpf_pin_map_abi`
+error before anything is loaded.
+
+Judging only graphs that already carry the current marker would leave a graph
+this build itself creates permanently unusable: migrating a pre-v5 graph
+advances the marker to v5 while the loader adopts the retained counter pin
+unchanged, so a narrower map would pass the gate on the way in and then fail it
+on every attach afterwards, with no path back. Refusing before that migration
+leaves the graph exactly as it was found, so a drained reprovision still
+resolves it. The cost is real and is not hidden: an upgrade that grows a counter
+slot now requires a drained reprovision, where it previously succeeded and
+miscounted.
+
+This is the case nothing else can see. A counter map retained from a build with
+fewer slots has exactly the key and value type this build expects, so every
+typed accessor binds to it happily, and the kernel silently discards each write
+to a slot at or past its `max_entries`. Adopting it produces a counter that is
+permanently zero -- a wrong operator-facing number rather than an error.
+Growing `COUNTER_SLOTS` therefore now makes a retained current-schema graph
+refuse until it is reprovisioned.
+
+A graph still carrying a pre-v5 marker is judged on capacity too. Otherwise an
+empty-graph migration could advance the marker while retaining a narrower
+counter pin and leave a current-marker graph that can never satisfy this build.
+The frozen v1 and pre-redirect artifacts both carry six-slot counter maps, so
+their authentic retained graphs require drained reprovisioning rather than
+automatic migration.
+
+**Program generation and graph identity.** Replacing a hook in place requires
+exact program-tag equality, because the replacement is a single
+`RTM_NEWTFILTER` against the existing filter rather than a detach followed by
+an attach. A live hook running an older generation can never satisfy that.
+Before pin-graph or forwarding-state mutation, the loader completes both
+clsact ingress and egress filter dumps and inventories every SDK-named
+occupant on either hook at any protocol, priority, handle or chain. Each
+occupant retains that complete placement identity, so an off-slot duplicate
+cannot hide behind an empty or current configured slot.
+
+Each tc program ID is then correlated with one unambiguous entry from a
+complete loaded-program listing. Its tag is compared against tags derived
+offline from the objects this build carries. A recognised historical
+generation, or an SDK-named program whose tag matches no generation this build
+can name, fails with `GtpuError::DatapathGenerationMismatch`, naming the
+observed and expected generation. Positive historical or unrecognised evidence
+takes precedence over every current-generation placement or pin-graph
+conflict, so dump order cannot change the refusal.
+
+When all observed SDK programs are current, each must be the sole instance of
+its ingress or egress SDK program role and occupy its configured parent,
+Ethernet protocol, priority, handle and default chain. An extra or misplaced
+current program returns `GtpuError::AlreadyExists`. A current program whose
+exact required pin paths are all conclusively absent does too: creating new pin
+names cannot prove ownership of maps already bound to a live program.
+
+For each exactly placed current program, the loader reads its complete kernel
+map-ID set and independently opens every exact required named pin for that
+program. The two complete, duplicate-free ID sets must be equal before any map
+value is read through a typed binding. A complete but different graph returns
+`GtpuError::AlreadyExists`. Any missing or ambiguous program identity,
+incomplete loaded-program listing, nonempty proper subset of the required pins,
+or unreadable named pin graph returns `GtpuError::StateIndeterminate` with
+operation `ebpf_generation_identity`.
+
+That refusal removes no pin, creates no pin, writes no policy or config, and
+replaces no hook, and `create_device`, `resolve_device` and
+`create_device_with_endpoints` all behave the same way.
+
+The ordering is the whole point. Such an attach is going to fail whatever else
+happens, so discovering it only at the hook means everything ahead of it has
+already run against a datapath this process does not own: pins materialized for
+maps the older generation never had, and commit-record recovery writing into
+forwarding maps a live program is reading. Deciding first turns a guaranteed
+failure into one that changed nothing.
+
+It is also why no automatic counter rebuild is performed here. Unlinking a
+counter pin and republishing it while an unreplaceable hook stays attached
+would split metrics between the map the live program still writes and the map
+the pin now names, and no retry could converge, because the pin would by then
+be this build's shape while the tag still differed.
+
+The frozen v1 generation is recognised as
+`EbpfHistoricalDatapathGeneration::PreBearerMark`. Its exact tags improve the
+diagnostic; they do not authorize replacement. A complete live v1 graph is
+therefore rejected by the generation guard before pin-graph or
+forwarding-state mutation and before map ABI or schema reads. If the hooks are
+already absent but the v1 pins remain, the capacity guard names the six-slot
+counter map as `ebpf_pin_map_abi`. Both paths leave the graph untouched and
+require the same drained reprovision.
+
+There is no automatic live migration across generations. The remedy for a
+refusal is the documented one: drain the device, remove the pins, and
+reprovision. Because the refusal leaves the live datapath exactly as it was
+found, that remedy is still available after any number of refused attempts.
+
+**Counters and re-baselining.** A rebuilt counter map starts at zero.
+`EbpfGtpuDatapathSnapshot` publishes the kernel map ID of every counter map
+whose values it reports -- `counters_map_id`,
+`downlink_binding_counters_map_id` and `uplink_pmtu_counters_map_id` -- and an
+ID changes only when that map is rebuilt. On an identity change, discard prior
+deltas and re-baseline from the new value; do not alert on the step. A consumer
+that treats these counters as monotonic and ignores the identity will read a
+rebuild as either a negative delta or a full-value spike, depending on how it
+clamps. Kernel map IDs are per-boot and are recycled, so a baseline persisted
+across a host reboot may observe the same ID for a different map; pair the ID
+with a boot identity if a baseline has to outlive the host.
 
 ### Grouped dual-stack eBPF contract
 

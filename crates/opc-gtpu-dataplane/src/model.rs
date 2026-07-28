@@ -189,6 +189,48 @@ impl CurrentEbpfGraphDrainProof {
     }
 }
 
+/// Which build of the eBPF datapath program a live tc hook is running.
+///
+/// A hook is judged by the program tag the kernel computed for it, compared
+/// against tags derived offline from the objects this build carries. The
+/// judgement is about the instruction stream, not about map shape: two builds
+/// can agree on every map and still be different generations.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EbpfDatapathGeneration {
+    /// The generation this build itself would attach.
+    Current,
+    /// A named generation older than this build's.
+    Historical(EbpfHistoricalDatapathGeneration),
+    /// A hook carrying an SDK program name whose tag matches no generation
+    /// this build can name. Its behaviour is unknown, so it is never treated
+    /// as compatible.
+    ///
+    /// This is broader than "foreign". Only the generations listed in
+    /// [`EbpfHistoricalDatapathGeneration`] are named, so a superseded
+    /// generation this build embeds for other purposes but does not yet carry
+    /// as a tag candidate — the frozen bearer-v2 datapath among them — also
+    /// reports here. The refusal is identical either way, so what that costs is
+    /// operator evidence rather than safety.
+    Unrecognized,
+}
+
+/// A superseded datapath generation this build can still recognise on a hook.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EbpfHistoricalDatapathGeneration {
+    /// The frozen endpoint-unbound generation from before per-bearer marks.
+    ///
+    /// Its retained counter map is narrower than the current program indexes,
+    /// so it cannot be replaced in place even though this build can identify
+    /// its hook tags exactly.
+    PreBearerMark,
+    /// The generation immediately preceding the uplink redirect-outcome
+    /// counter, whose counter map carries one slot fewer than this build
+    /// indexes.
+    PreUplinkRedirectCounter,
+}
+
 /// Request to recover one orphaned current-schema eBPF pin graph.
 ///
 /// `pin_namespace` selects the stable directory below the configured bpffs

@@ -120,7 +120,10 @@ jobs:
             unshare -n -- bash -euxo pipefail -c '
               ip link set lo up
               cargo test --locked -p opc-gtpu-dataplane --test ebpf_gtpu_privileged -- --ignored --nocapture
-              cargo test --locked -p opc-gtpu-dataplane --lib program_tag_candidates_match_the_running_kernel -- --ignored --nocapture
+              # Both filters go after `--`: cargo accepts only one positional
+              # TESTNAME, so naming two before it is a hard argument error,
+              # while libtest itself takes any number.
+              cargo test --locked -p opc-gtpu-dataplane --lib -- --ignored --nocapture program_tag_candidates_match_the_running_kernel pre_redirect_tag_candidates_match_the_running_kernel
             ' 2>&1 | tee "${datapath_log}"
 
           # Every one of these tests returns Ok early when
@@ -133,6 +136,15 @@ jobs:
             exit 1
           fi
           grep -Fq "test result: ok. ${expected_tests} passed; 0 failed;" "${datapath_log}"
+          grep -Fq 'OPC_GTPU_OFF_SLOT_GENERATION_GUARD_PROVEN' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_WRONG_CURRENT_GRAPH_GUARD_PROVEN' "${datapath_log}"
+
+          # The two lib tag proofs return Ok early without printing `skipping:`
+          # when the environment is not privileged, so the skip check above
+          # cannot see them. Require the markers each one emits only on the
+          # path that actually compared a kernel tag, as the QEMU jobs do.
+          grep -Fq 'OPC_GTPU_TAG_PROOF_PROVEN' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_PRE_REDIRECT_TAG_PROOF_PROVEN' "${datapath_log}"
 
   linux-6-8-classifier-load:
     name: Linux 6.8 committed classifier load
@@ -274,15 +286,16 @@ jobs:
           '
           load_output="$(
             ssh "${ssh_options[@]}" opc@127.0.0.1 \
-              'sudo env OPC_GTPU_RUN_PRIVILEGED=1 /tmp/opc-gtpu-linux68-test --ignored --nocapture --test-threads=1 program_tag_candidates_match_the_running_kernel committed_classifier_load_capability_is_loadable_and_leaves_no_state' \
+              'sudo env OPC_GTPU_RUN_PRIVILEGED=1 /tmp/opc-gtpu-linux68-test --ignored --nocapture --test-threads=1 program_tag_candidates_match_the_running_kernel pre_redirect_tag_candidates_match_the_running_kernel committed_classifier_load_capability_is_loadable_and_leaves_no_state' \
               2>&1
           )"
           printf '%s\n' "${load_output}"
-          grep -Fq 'test result: ok. 2 passed; 0 failed;' <<< "${load_output}"
-          # Both tests return early when OPC_GTPU_RUN_PRIVILEGED is unset, and
-          # a skipped run still reports "passed", so assert the markers each
-          # prints only after a real load.
+          grep -Fq 'test result: ok. 3 passed; 0 failed;' <<< "${load_output}"
+          # Every one of these tests returns early when
+          # OPC_GTPU_RUN_PRIVILEGED is unset, and a skipped run still reports
+          # "passed", so assert the markers each prints only after a real load.
           grep -Fq 'OPC_GTPU_TAG_PROOF_PROVEN' <<< "${load_output}"
+          grep -Fq 'OPC_GTPU_PRE_REDIRECT_TAG_PROOF_PROVEN' <<< "${load_output}"
           grep -Fq 'OPC_GTPU_LOAD_CAPABILITY_PROVEN' <<< "${load_output}"
 
   el9-514-classifier-load:
@@ -484,12 +497,13 @@ jobs:
           '
           load_output="$(
             ssh "${ssh_options[@]}" opc@127.0.0.1 \
-              'sudo env OPC_GTPU_RUN_PRIVILEGED=1 /tmp/opc-gtpu-el9-test --ignored --nocapture --test-threads=1 program_tag_candidates_match_the_running_kernel committed_classifier_load_capability_is_loadable_and_leaves_no_state' \
+              'sudo env OPC_GTPU_RUN_PRIVILEGED=1 /tmp/opc-gtpu-el9-test --ignored --nocapture --test-threads=1 program_tag_candidates_match_the_running_kernel pre_redirect_tag_candidates_match_the_running_kernel committed_classifier_load_capability_is_loadable_and_leaves_no_state' \
               2>&1
           )"
           printf '%s\n' "${load_output}"
-          grep -Fq 'test result: ok. 2 passed; 0 failed;' <<< "${load_output}"
+          grep -Fq 'test result: ok. 3 passed; 0 failed;' <<< "${load_output}"
           grep -Fq 'OPC_GTPU_TAG_PROOF_PROVEN' <<< "${load_output}"
+          grep -Fq 'OPC_GTPU_PRE_REDIRECT_TAG_PROOF_PROVEN' <<< "${load_output}"
           grep -Fq 'OPC_GTPU_LOAD_CAPABILITY_PROVEN' <<< "${load_output}"
 
           # The suite shells out to ip, tc, ethtool, nft, wg and python3.
@@ -633,6 +647,8 @@ jobs:
             exit 1
           fi
           grep -Fq "test result: ok. ${expected_tests} passed; 0 failed;" "${datapath_log}"
+          grep -Fq 'OPC_GTPU_OFF_SLOT_GENERATION_GUARD_PROVEN' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_WRONG_CURRENT_GRAPH_GUARD_PROVEN' "${datapath_log}"
 
   ebpf-object:
     name: eBPF datapath object rebuild
@@ -657,7 +673,7 @@ jobs:
       - name: Install pinned bpf-linker
         run: cargo install bpf-linker --version 0.10.3 --locked
 
-      - name: Verify frozen v1 migration authority
+      - name: Verify frozen v1 generation evidence
         run: |
           set -euo pipefail
           frozen="crates/opc-gtpu-dataplane/bpf/opc-gtpu-datapath-v1.bpf.o"
@@ -668,7 +684,7 @@ jobs:
           diff -u <(printf '%s\n' GTPU_CONFIG GTPU_COUNTERS GTPU_DOWNLINK_PDR GTPU_UPLINK_DSCP GTPU_UPLINK_FAR) frozen.maps
           for marked in GTPU_ULM_FAR GTPU_ULM_DSCP GTPU_DLM_PDR GTPU_M_OWNER GTPU_DL_BIND GTPU_DL_DROP; do
             if grep -qx "${marked}" frozen.maps; then
-              echo "frozen v1 authority unexpectedly contains ${marked}" >&2
+              echo "frozen v1 evidence unexpectedly contains ${marked}" >&2
               exit 1
             fi
           done
@@ -705,6 +721,34 @@ jobs:
           diff -u frozen-v2.programs rebuilt-v2.programs
           diff -u frozen-v2.maps rebuilt-v2.maps
           git worktree remove --force "${historical_worktree}"
+
+      - name: Verify frozen pre-redirect generation authority
+        run: |
+          set -euo pipefail
+          source_commit="6778bd533761872626885c414c709763dae8fd7c"
+          object_path="crates/opc-gtpu-dataplane/bpf/opc-gtpu-datapath-pre-redirect.bpf.o"
+          current_path="crates/opc-gtpu-dataplane/bpf/opc-gtpu-datapath.bpf.o"
+          echo "e4a4c93736b1466639fb52e4d48b1cab456ed4a0eefa0ac5df7ca46177b2c164  ${object_path}" | sha256sum -c -
+          # This exact historical Git blob is the Apache-2.0-licensed byte
+          # authority for the generation immediately before the uplink
+          # redirect-outcome counter was added.
+          git cat-file blob "${source_commit}:${current_path}" > "${RUNNER_TEMP}/pre-redirect.bpf.o"
+          cmp "${object_path}" "${RUNNER_TEMP}/pre-redirect.bpf.o"
+          readelf -sW "${object_path}" | awk '$4 == "FUNC" && $8 ~ /^opc_gtpu_/ {print $8}' | sort > pre-redirect.programs
+          readelf -sW "${object_path}" | awk '$4 == "OBJECT" && $8 ~ /^GTPU_/ {print $8}' | sort > pre-redirect.maps
+          diff -u <(printf '%s\n' opc_gtpu_downlink opc_gtpu_uplink) pre-redirect.programs
+          # Same map inventory as the current object. This generation differs by
+          # its instruction stream and by GTPU_COUNTERS width, not by map set,
+          # which is exactly why a fixture built from the current object could
+          # imitate its shape while proving nothing about its identity.
+          diff -u <(readelf -sW "${current_path}" | awk '$4 == "OBJECT" && $8 ~ /^GTPU_/ {print $8}' | sort) pre-redirect.maps
+          # The whole guard rests on these being different programs. Byte
+          # equality with the current object would make the historical-upgrade
+          # tests vacuous while still passing.
+          if cmp -s "${object_path}" "${current_path}"; then
+            echo "::error::the frozen pre-redirect object is byte-identical to the current object"
+            exit 1
+          fi
 
       # Rebuild the datapath object from source with the pinned toolchain and
       # fail on functional drift against the committed artifact. Whole-object

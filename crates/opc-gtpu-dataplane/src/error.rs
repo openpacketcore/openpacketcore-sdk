@@ -9,6 +9,8 @@ use std::io;
 
 use thiserror::Error;
 
+use crate::model::EbpfDatapathGeneration;
+
 /// Why a `BPF_PROG_LOAD` was refused before the kernel's verifier reached a
 /// verdict on the program.
 ///
@@ -164,6 +166,29 @@ pub enum GtpuError {
     StateIndeterminate {
         /// Stable operation label.
         operation: &'static str,
+    },
+    /// A live tc hook runs a different generation of the datapath program than
+    /// this build attaches.
+    ///
+    /// In-place upgrade cannot proceed. The normal replacement path accepts
+    /// only the exact current program and map graph; frozen historical objects
+    /// are classification evidence, not replacement authority. A historical
+    /// generation may also retain maps that are too narrow for the current
+    /// program. Retrying cannot help, so the remedy is to drain the device,
+    /// remove its pins, and reprovision.
+    ///
+    /// The refusal is raised before anything is changed -- no pin removed or
+    /// created, no policy or config written, no hook replaced -- so the live
+    /// datapath is left exactly as it was found and that remedy stays
+    /// available after any number of refused attempts.
+    #[error("GTP-U {operation} found a live datapath program from a different generation")]
+    DatapathGenerationMismatch {
+        /// Stable operation label.
+        operation: &'static str,
+        /// The generation the live hook is running.
+        observed: EbpfDatapathGeneration,
+        /// The generation this build attaches.
+        expected: EbpfDatapathGeneration,
     },
 }
 
