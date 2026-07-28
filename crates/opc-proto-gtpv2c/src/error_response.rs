@@ -12,8 +12,9 @@ use core::fmt;
 use core::num::NonZeroU32;
 
 use bytes::{Bytes, BytesMut};
-use opc_protocol::{Encode, EncodeContext, EncodeError, EncodeErrorCode, SpecRef};
+use opc_protocol::{DecodeErrorCode, Encode, EncodeContext, EncodeError, EncodeErrorCode, SpecRef};
 
+use crate::decode_error::Gtpv2cDecodeError;
 use crate::header::{
     Header, MessagePriority, MessageType, GTPV2C_VERSION, HEADER_LEN_WITHOUT_TEID,
     HEADER_LEN_WITH_TEID, MAX_SEQUENCE_NUMBER,
@@ -605,6 +606,49 @@ impl Gtpv2cErrorResponsePlanner {
         }
     }
 
+    /// Plan an Invalid Length response from checked decoder evidence.
+    ///
+    /// This is the safe bridge between [`Gtpv2cDecodeError`] and the public
+    /// protocol-error planning surface. It returns `None` unless `failure` is
+    /// length-shaped and identifies an IE proven to be at message top level.
+    /// In particular, a grouped member is refused even when
+    /// [`Gtpv2cDecodeError::offending_ie`] can name it: this crate does not yet
+    /// encode the grouped-IE Cause flags, and emitting that member with the
+    /// current zero flags octet would falsely claim that it appeared at message
+    /// top level.
+    ///
+    /// A returned [`Gtpv2cErrorResponseDecision`] still applies the normal
+    /// fixed-header request, Echo and message-length checks. Before calling
+    /// this method, the caller must additionally have resolved from the message
+    /// grammar that the top-level slot is Mandatory or verifiable Conditional;
+    /// decoder identity alone cannot establish that presence condition.
+    ///
+    /// `input` must be the exact datagram whose message decode produced
+    /// `failure`. The type system cannot authenticate that association: callers
+    /// must not combine evidence from another packet or from a standalone IE
+    /// subregion with this request. Generic subregion decoders deliberately
+    /// retain unknown scope, but that is not a substitute for preserving the
+    /// datagram/evidence pairing at the transport boundary.
+    ///
+    /// `response_teid` remains an explicit clause 5.5.2 decision. The planner
+    /// never performs a session lookup.
+    #[must_use]
+    pub fn plan_invalid_ie_length_from_decode(
+        &self,
+        input: &[u8],
+        failure: &Gtpv2cDecodeError,
+        response_teid: Gtpv2cProtocolErrorResponseTeid,
+    ) -> Option<Gtpv2cErrorResponseDecision> {
+        let offending_ie = top_level_invalid_ie_length(failure)?;
+        Some(self.plan(
+            input,
+            Gtpv2cRequestFailure::Protocol(Gtpv2cProtocolError::new(
+                Gtpv2cProtocolErrorKind::InvalidIeLength(offending_ie),
+                response_teid,
+            )),
+        ))
+    }
+
     /// Build message type 3 from a proven higher-version envelope.
     ///
     /// This entry point deliberately takes no request-failure argument. The
@@ -706,6 +750,17 @@ impl Gtpv2cErrorResponsePlanner {
                 ))
             }
         }
+    }
+}
+
+fn top_level_invalid_ie_length(failure: &Gtpv2cDecodeError) -> Option<Gtpv2cOffendingIe> {
+    if matches!(
+        failure.code(),
+        DecodeErrorCode::Truncated | DecodeErrorCode::InvalidLength { .. }
+    ) {
+        failure.top_level_offending_ie()
+    } else {
+        None
     }
 }
 
@@ -1134,5 +1189,34 @@ impl<T> fmt::Debug for Gtpv2cPlannedSend<T> {
             .field("plan", &self.plan)
             .field("send_tuple", &self.send_tuple)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use opc_protocol::{DecodeError, DecodeErrorCode};
+
+    use super::*;
+
+    fn positively_scoped_failure(code: DecodeErrorCode) -> Gtpv2cDecodeError {
+        Gtpv2cDecodeError::new(DecodeError::new(code, 0))
+            .annotate_offending(Gtpv2cOffendingIe::from_wire(71, 0))
+            .mark_message_top_level()
+    }
+
+    #[test]
+    fn invalid_ie_length_bridge_code_gate_is_exact() {
+        let invalid_length =
+            positively_scoped_failure(DecodeErrorCode::InvalidLength { reason: "test" });
+        assert_eq!(
+            top_level_invalid_ie_length(&invalid_length),
+            invalid_length.top_level_offending_ie()
+        );
+
+        let non_length = positively_scoped_failure(DecodeErrorCode::Structural { reason: "test" });
+        assert_eq!(top_level_invalid_ie_length(&non_length), None);
+
+        let arithmetic = positively_scoped_failure(DecodeErrorCode::LengthOverflow);
+        assert_eq!(top_level_invalid_ie_length(&arithmetic), None);
     }
 }

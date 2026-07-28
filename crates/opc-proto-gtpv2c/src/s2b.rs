@@ -3510,7 +3510,9 @@ impl<'a> S2bMessage<'a> {
     ///
     /// A framing or value error names the offending Information Element
     /// whenever a complete four-octet IE header for it had been read; see
-    /// [`Gtpv2cDecodeError`]. The [`BorrowDecode`] impl delegates here and
+    /// [`Gtpv2cDecodeError`]. Typed failures at this message frame receive
+    /// positive message-top-level scope unless a grouped decoder has already
+    /// established nesting. The [`BorrowDecode`] impl delegates here and
     /// downgrades to [`DecodeError`], because a protocol-neutral port cannot
     /// carry a GTPv2-C-shaped annotation.
     ///
@@ -3633,21 +3635,22 @@ impl<'a> S2bMessage<'a> {
                 &filter,
                 &repeatable_limit,
                 malformed_optional,
-            )?
+            )
         } else if pgw_triggered_request {
             decode_pgw_triggered_request_ie_sequence_with_evidence(
                 message.raw_ies,
                 typed_ctx,
                 malformed_optional,
-            )?
+            )
         } else {
             decode_typed_ie_sequence_with_evidence(
                 message.raw_ies,
                 typed_ctx,
                 0,
                 malformed_optional,
-            )?
-        };
+            )
+        }
+        .map_err(Gtpv2cDecodeError::mark_message_top_level)?;
         let view = S2bProcedureMessage {
             header: message.header,
             procedure,

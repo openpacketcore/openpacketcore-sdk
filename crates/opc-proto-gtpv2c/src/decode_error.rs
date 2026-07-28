@@ -18,6 +18,24 @@ use core::fmt;
 
 use opc_protocol::{DecodeError, DecodeErrorCode, SpecRef};
 
+/// Decoder-held evidence for the wire scope in which an IE failure arose.
+///
+/// Private by design: callers receive only the checked
+/// [`Gtpv2cDecodeError::top_level_offending_ie`] projection. In particular,
+/// absence of a grouped-container identity is not allowed to become proof of
+/// message-top-level scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IeScopeEvidence {
+    /// The decode entry point did not know whether its input was a complete
+    /// message IE region or an arbitrary subregion.
+    Unknown,
+    /// The message decoder positively established that the IE was in the
+    /// message's top-level IE region.
+    MessageTopLevel,
+    /// A grouped decoder positively established that the failure was nested.
+    Grouped,
+}
+
 /// Type and four-bit Instance of a GTPv2-C Information Element.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Gtpv2cOffendingIe {
@@ -113,6 +131,7 @@ pub struct Gtpv2cDecodeError {
     error: DecodeError,
     offending_ie: Option<Gtpv2cOffendingIe>,
     enclosing_ie: Option<Gtpv2cOffendingIe>,
+    ie_scope: IeScopeEvidence,
 }
 
 // clippy::result_large_err's default large-error-threshold is 128 bytes and the
@@ -133,6 +152,7 @@ impl Gtpv2cDecodeError {
             error,
             offending_ie: None,
             enclosing_ie: None,
+            ie_scope: IeScopeEvidence::Unknown,
         }
     }
 
@@ -167,11 +187,13 @@ impl Gtpv2cDecodeError {
     ///
     /// Identity is attached by the innermost decode frame that had already read
     /// a complete four-octet header for the element the error is about.
-    /// Framing, count, depth and offset-arithmetic errors raised before such a
-    /// header name no element; inside a grouped IE the enclosing container is
-    /// reported separately by [`Self::enclosing_ie`], and at top level such an
-    /// error carries no identity at all. **Absence of identity is normal and
-    /// expected for those classes.**
+    /// A framing error raised before such a header names no element. IE-count,
+    /// depth and offset-arithmetic errors name no element wherever they are
+    /// raised, because they describe sequence bookkeeping rather than received
+    /// IE octets. Inside a grouped IE the enclosing container is reported
+    /// separately by [`Self::enclosing_ie`], and at top level such an error
+    /// carries no identity at all. **Absence of identity is normal and expected
+    /// for those classes.**
     ///
     /// Knowing the offending Type and Instance is *necessary but not
     /// sufficient* to decide that a TS 29.274 error response is owed.
@@ -186,20 +208,55 @@ impl Gtpv2cDecodeError {
         self.offending_ie
     }
 
+    /// Return the offending IE only when the decoder positively proved it was
+    /// at message top level.
+    ///
+    /// This is the checked projection for disposition code. In particular, it
+    /// returns `None` both for a malformed member of a grouped IE and for an
+    /// error produced by [`crate::RawIeIterator`] or
+    /// [`crate::validate_ie_region_annotated`] directly. Those generic
+    /// subregion decoders do not know whether their input came from message
+    /// top level or from inside a group; absence of an enclosing identity is
+    /// therefore not proof of top-level scope.
+    ///
+    /// The Cause encoder currently emits a zero flags octet, which represents
+    /// top-level scope, so callers must not bypass this projection when
+    /// deriving a Cause offending-IE field.
+    /// [`crate::Gtpv2cErrorResponsePlanner::plan_invalid_ie_length_from_decode`]
+    /// carries this check through response planning.
+    #[must_use]
+    pub const fn top_level_offending_ie(&self) -> Option<Gtpv2cOffendingIe> {
+        match self.ie_scope {
+            IeScopeEvidence::MessageTopLevel => self.offending_ie,
+            IeScopeEvidence::Unknown | IeScopeEvidence::Grouped => None,
+        }
+    }
+
     /// Type and four-bit Instance of the grouped IE the offending element was
     /// nested in, when it was nested.
     ///
-    /// [`Self::offending_ie`] may be converted into a
-    /// [`crate::Gtpv2cProtocolErrorKind::InvalidIeLength`] **only when this
-    /// returns `None`**. The Cause IE encoder in this crate zeroes the flags
-    /// octet, and a zeroed flags octet asserts that the offending IE was at
-    /// message top level; feeding a grouped member's identity through it would
-    /// name a top-level IE that never appeared at top level. Modelling the
-    /// grouped-IE flag bits is disposition-layer work and is out of scope for
-    /// the decoder.
+    /// The raw pair remains available for diagnostics. Disposition code should
+    /// use [`Self::top_level_offending_ie`] or
+    /// [`crate::Gtpv2cErrorResponsePlanner::plan_invalid_ie_length_from_decode`].
+    /// Both refuse Unknown or Grouped scope rather than feeding an unproven or
+    /// member identity into the current Cause encoder, whose zero flags octet
+    /// represents message-top-level scope. Modelling the grouped-IE flag bits
+    /// remains disposition-layer work.
     #[must_use]
     pub const fn enclosing_ie(&self) -> Option<Gtpv2cOffendingIe> {
         self.enclosing_ie
+    }
+
+    /// Record positive evidence that this failure arose in the message's
+    /// top-level IE region.
+    ///
+    /// Grouped evidence wins: an outer message frame must not erase scope
+    /// already established by a nested decoder.
+    pub(crate) fn mark_message_top_level(mut self) -> Self {
+        if matches!(self.ie_scope, IeScopeEvidence::Unknown) {
+            self.ie_scope = IeScopeEvidence::MessageTopLevel;
+        }
+        self
     }
 
     /// Discard the GTPv2-C annotation and return the shared decode error.
@@ -240,6 +297,9 @@ impl Gtpv2cDecodeError {
     /// the grouped container's instance also originates in a caller-writable
     /// [`crate::RawIe`] field.
     pub(crate) fn annotate_enclosing_if_absent(mut self, ie_type: u8, instance: u8) -> Self {
+        // Scope evidence does not depend on whether a caller-constructed
+        // RawIe supplied a representable four-bit container Instance.
+        self.ie_scope = IeScopeEvidence::Grouped;
         if self.enclosing_ie.is_none() {
             self.enclosing_ie = Gtpv2cOffendingIe::new(ie_type, instance).ok();
         }
@@ -312,6 +372,24 @@ mod tests {
             .annotate_enclosing_if_absent(93, 0x10);
         assert_eq!(annotated.offending_ie(), None);
         assert_eq!(annotated.enclosing_ie(), None);
+    }
+
+    #[test]
+    fn grouped_scope_survives_an_unrepresentable_container_identity() {
+        let inner = DecodeError::new(DecodeErrorCode::Truncated, 0);
+        let annotated = Gtpv2cDecodeError::new(inner)
+            .annotate_offending_if_absent(176, 0)
+            .annotate_enclosing_if_absent(93, 0x10);
+        assert_eq!(
+            annotated.offending_ie(),
+            Some(Gtpv2cOffendingIe::from_wire(176, 0))
+        );
+        assert_eq!(annotated.enclosing_ie(), None);
+        assert_eq!(
+            annotated.top_level_offending_ie(),
+            None,
+            "failure to represent the container must not erase grouped scope"
+        );
     }
 
     #[test]

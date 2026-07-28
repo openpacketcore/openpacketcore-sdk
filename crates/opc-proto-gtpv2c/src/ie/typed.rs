@@ -4380,9 +4380,11 @@ fn decode_typed_ie_sequence_at<'a>(
     // Grouping scope is attached at the single exit of the scope it describes,
     // so no error path inside can miss it. It is reported separately from the
     // offending IE because this crate's Cause encoder zeroes clause 8.4's flags
-    // octet, and a zeroed octet asserts a top-level element: a grouped member's
-    // identity is only safe to turn into a Cause once the caller has seen that
-    // there is no enclosing container.
+    // octet, and a zeroed octet asserts a top-level element. This exit records
+    // positive Grouped scope independently of whether the container identity
+    // itself is representable. Absence of an enclosing identity is not proof
+    // of message-top-level scope; only the outer message frame can positively
+    // establish that, and disposition uses the checked projection.
     decode_typed_ie_sequence_at_inner(input, ctx, position, policy, duplicate_evidence).map_err(
         |failure| match position.parent_ie {
             Some((ie_type, instance)) => failure.annotate_enclosing_if_absent(ie_type, instance),

@@ -102,6 +102,11 @@ fn overrun_after_a_complete_header_names_the_offending_ie() {
     assert_eq!(via_region.offset(), 0);
     assert_eq!(via_region.offending_ie(), Some(expected));
     assert_eq!(via_region.enclosing_ie(), None);
+    assert_eq!(
+        via_region.top_level_offending_ie(),
+        None,
+        "a standalone IE region does not prove message-top-level scope"
+    );
 
     let mut iter = RawIeIterator::new(&region, DecodeContext::default());
     let via_iterator = iter
@@ -109,16 +114,19 @@ fn overrun_after_a_complete_header_names_the_offending_ie() {
         .expect("the iterator yields the failure")
         .expect_err("the overrunning IE must fail");
     assert_eq!(via_iterator.offending_ie(), Some(expected));
+    assert_eq!(via_iterator.top_level_offending_ie(), None);
 
     let wire = message(&region);
     let via_message = Message::decode_annotated(&wire, DecodeContext::default())
         .expect_err("the raw IE region pre-validation must fail");
     assert_eq!(via_message.offending_ie(), Some(expected));
     assert_eq!(via_message.enclosing_ie(), None);
+    assert_eq!(via_message.top_level_offending_ie(), Some(expected));
 
     let via_s2b = S2bMessage::decode(&wire, DecodeContext::default())
         .expect_err("the typed S2b decode must fail");
     assert_eq!(via_s2b.offending_ie(), Some(expected));
+    assert_eq!(via_s2b.top_level_offending_ie(), Some(expected));
 
     let via_diagnostics = S2bMessage::decode_with_diagnostics(&wire, DecodeContext::default())
         .expect_err("the diagnostic decode must fail");
@@ -204,6 +212,11 @@ fn a_grouped_member_value_error_names_the_member_and_its_container() {
     assert_eq!(
         error.enclosing_ie(),
         Some(identity(IE_TYPE_BEARER_CONTEXT, 1))
+    );
+    assert_eq!(
+        error.top_level_offending_ie(),
+        None,
+        "a grouped member must not project as a top-level offender"
     );
 }
 
@@ -448,6 +461,27 @@ fn an_offset_above_u32_max_is_reported_exactly() {
     );
 }
 
+/// Offset arithmetic is sequence-coordinate bookkeeping, not evidence that an
+/// IE's received octets are malformed. A complete header is available here,
+/// but computing the strict spare-bit field's absolute offset overflows, so
+/// the failure must not inherit the header's identity.
+#[test]
+fn offset_arithmetic_overflow_names_no_offending_ie() {
+    let mut region = ie(IE_TYPE_NODE_IDENTIFIER, 3, &[]);
+    region[3] |= 0x10;
+    let mut iter = RawIeIterator::new_at_offset(&region, strict(), usize::MAX);
+
+    let error = iter
+        .next_annotated()
+        .expect("the iterator yields the arithmetic failure")
+        .expect_err("the absolute spare-bit offset must overflow");
+    assert!(matches!(error.code(), DecodeErrorCode::LengthOverflow));
+    assert_eq!(error.offset(), usize::MAX);
+    assert_eq!(error.offending_ie(), None);
+    assert_eq!(error.enclosing_ie(), None);
+    assert_eq!(error.top_level_offending_ie(), None);
+}
+
 /// The over-claim guard for TS 29.274 clause 8.4.
 ///
 /// This crate's Cause encoder hardcodes the flags octet to zero (see
@@ -456,13 +490,10 @@ fn an_offset_above_u32_max_is_reported_exactly() {
 /// through it would name an element that never appeared at top level -- here,
 /// IE 2, when the message's top level carries only IE 93.
 ///
-/// The contract is therefore that `offending_ie()` may be converted into a
-/// Cause only when `enclosing_ie()` is `None`. That is a documented caller
-/// obligation, not a type invariant: `Gtpv2cProtocolErrorKind::InvalidIeLength`
-/// is a public tuple variant, so the unguarded construction is expressible.
-/// What this test pins is that the decoder supplies the evidence needed to
-/// honour the obligation -- both halves of the pair are present and the
-/// unguarded reading really would be false on this input.
+/// `top_level_offending_ie()` is the checked projection used by the response
+/// planner bridge. What this test pins is that the raw diagnostic evidence
+/// remains available while the disposition projection refuses the grouped
+/// member, whose unguarded reading really would be false on this input.
 #[test]
 fn naming_the_offending_ie_does_not_name_a_top_level_ie_when_it_was_nested() {
     let member = ie_with_declared_length(IE_TYPE_CAUSE, 0, 16, &[0xaa, 0xbb]);
@@ -472,13 +503,9 @@ fn naming_the_offending_ie_does_not_name_a_top_level_ie_when_it_was_nested() {
     assert!(error.offending_ie().is_some());
     assert!(error.enclosing_ie().is_some());
 
-    // The only sound conversion, written out. On this input the guard refuses,
-    // so no Cause naming a top-level IE 2 can be built from it.
-    let cause_identity = error
-        .enclosing_ie()
-        .is_none()
-        .then(|| error.offending_ie())
-        .flatten();
+    // The checked conversion refuses, so no Cause naming a top-level IE 2 can
+    // be built from the decoder evidence through the supported bridge.
+    let cause_identity = error.top_level_offending_ie();
     assert_eq!(
         cause_identity, None,
         "a grouped member's identity escaped the enclosing-IE guard"

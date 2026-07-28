@@ -61,7 +61,9 @@ impl<'a> Message<'a> {
 
     /// As `<Self as BorrowDecode>::decode`, but a raw IE-region framing error
     /// names the offending IE whenever a complete four-octet header had been
-    /// read.
+    /// read. Because this frame owns the common-header Length boundary, it also
+    /// records positive message-top-level scope for those IE-region errors;
+    /// generic raw-region entry points cannot make that claim.
     ///
     /// The [`BorrowDecode`] impl delegates here and downgrades, so the two can
     /// never diverge. The port itself cannot carry the annotation: its error
@@ -110,7 +112,8 @@ impl<'a> Message<'a> {
         }
 
         let raw_ies = &input[header.wire_len()..msg_end];
-        validate_ie_region_annotated(raw_ies, ctx)?;
+        validate_ie_region_annotated(raw_ies, ctx)
+            .map_err(Gtpv2cDecodeError::mark_message_top_level)?;
         let tail = &input[msg_end..];
 
         Ok((

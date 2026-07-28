@@ -66,15 +66,24 @@ control-plane stack.
 - `Gtpv2cDecodeError` names the offending Information Element. It wraps the
   shared `opc_protocol::DecodeError` — `code()`, `offset()` and `spec_ref()`
   are unchanged and `Display` is byte-identical — and adds `offending_ie()`
-  and `enclosing_ie()`. Element identity lives in this crate, not the shared
-  one, because the shapes genuinely disagree: GTPv2-C keys on a one-octet Type
-  plus a four-bit Instance, PFCP and NGAP on a `u16`, Diameter on an AVP code
-  plus an optional vendor id. `Message::decode_annotated`,
+  and `enclosing_ie()` for diagnostics plus `top_level_offending_ie()` as the
+  checked disposition projection. Element identity lives in this crate, not
+  the shared one, because the shapes genuinely disagree: GTPv2-C keys on a
+  one-octet Type plus a four-bit Instance, PFCP and NGAP on a `u16`, Diameter
+  on an AVP code plus an optional vendor id. `Message::decode_annotated`,
   `RawIeIterator::next_annotated`, `validate_ie_region_annotated`,
   `S2bMessage::decode`, `S2bMessage::decode_with_diagnostics` and
   `S2bMessage::from_message` return it; the `BorrowDecode`/`OwnedDecode` ports
   keep `DecodeError`, and the trait impls delegate to the inherent entry points
   and downgrade so the two cannot diverge.
+
+  Scope is positive evidence, not an inference from missing metadata. Internally
+  it is tracked as Unknown, Message Top Level, or Grouped.
+  `RawIeIterator::next_annotated` and `validate_ie_region_annotated` accept
+  arbitrary regions, so they leave scope Unknown even when they can name an IE.
+  `Message::decode_annotated` and typed `S2bMessage` decode explicitly establish
+  Message Top Level, while grouped decode establishes Grouped independently of
+  whether a caller-constructed container Instance can be represented.
 
   Identity is attached by the innermost decode frame that had already read a
   complete four-octet IE header for the element the error is about. Absence is
@@ -109,15 +118,18 @@ control-plane stack.
   `Gtpv2cErrorResponsePlanner`, which refuses to answer several inputs that
   carry a perfectly valid identity.
 
-  Convert `offending_ie()` into a `Gtpv2cProtocolErrorKind` **only when
-  `enclosing_ie()` is `None`**. The Cause encoder here hardcodes clause 8.4's
-  flags octet to zero, and a zeroed octet asserts a top-level IE; a grouped
-  member's identity fed through it would name an element that never appeared at
-  top level. Modelling the grouped-IE flag bits is disposition-layer work and is
-  out of scope for the decoder. The guard is a caller obligation, not a type
-  invariant: `Gtpv2cProtocolErrorKind::InvalidIeLength` is a public tuple
-  variant, so nothing stops an unguarded construction from an
-  `offending_ie()` that has an enclosing container.
+  Use `top_level_offending_ie()` instead of manually combining the two raw
+  diagnostic accessors. For Invalid Length responses,
+  `Gtpv2cErrorResponsePlanner::plan_invalid_ie_length_from_decode` carries that
+  checked projection through request inspection and planning. It returns
+  `None` for Unknown or Grouped scope rather than feeding an unproven/member
+  identity into the Cause encoder, whose zero flags octet asserts
+  message-top-level scope. The caller must still resolve from the message
+  grammar that the slot was Mandatory or verifiable Conditional, and must pass
+  the exact datagram whose message decode produced the error; the API cannot
+  authenticate a packet/error association. Existing public tuple variants
+  remain available for independently established failure evidence, but should
+  not be constructed directly from `offending_ie()`.
 
   Contributor note: `From<Gtpv2cDecodeError> for DecodeError` is a deliberate,
   lossy downgrade that `?` invokes implicitly. A new grouped decoder must carry
@@ -131,6 +143,11 @@ control-plane stack.
   zero-allocation error boundary. Inspection retains only a reply-safe fixed
   header envelope; planning returns either an explicit standards-required
   discard or a bounded Version Not Supported, Echo, or ordinary S2b response.
+  `plan_invalid_ie_length_from_decode` is the checked bridge from decoder
+  evidence: it accepts only a length-shaped top-level failure and refuses a
+  generic region's Unknown scope or a grouped member while grouped Cause flags
+  are not modelled. Its input must be the exact datagram that produced the
+  decode error.
   Ordinary protocol failures require a caller-owned non-zero remote TEID or an
   explicit no-lookup TEID-zero choice. An unknown received non-zero TEID is a
   separate type that alone can produce Context Not Found; applying it to a

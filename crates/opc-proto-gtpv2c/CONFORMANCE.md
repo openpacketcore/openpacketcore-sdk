@@ -76,6 +76,15 @@ The error-response boundary is deliberately separate from full `Message` and
   IE length maps to Cause 67; semantically incorrect mandatory/conditional IEs
   map to Cause 69. IE failures encode only the standardized four-octet Type,
   zero Length, and Instance identity in the Cause IE.
+- `Gtpv2cDecodeError::top_level_offending_ie` is the checked scope projection.
+  `Gtpv2cErrorResponsePlanner::plan_invalid_ie_length_from_decode` accepts only
+  length-shaped evidence carrying that top-level identity, then applies the
+  normal request, Echo and message-length checks. It returns no plan for a
+  standalone region whose scope is Unknown or for a grouped member because
+  grouped Cause flags are not yet modelled; it never emits either under the
+  zero flags octet. The caller still resolves from the message grammar that the
+  slot is Mandatory or verifiable Conditional and must preserve the exact
+  datagram/decode-error association.
 - An unknown received non-zero session TEID is the only plan input that
   produces Context Not Found with header TEID zero. Applying that failure to a
   legitimate zero-TEID initial request is rejected as conflicting evidence.

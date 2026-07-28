@@ -63,7 +63,13 @@
 //! grouped IE reports the enclosing container separately, so a member's
 //! identity is never mistaken for a top-level one. Naming the offending IE is
 //! necessary but not sufficient to decide that an error response is owed; that
-//! decision stays with [`Gtpv2cErrorResponsePlanner`].
+//! decision stays with [`Gtpv2cErrorResponsePlanner`]. Its
+//! [`Gtpv2cErrorResponsePlanner::plan_invalid_ie_length_from_decode`] bridge
+//! accepts only length-shaped evidence whose offending IE is proven to be at
+//! message top level. [`Message::decode_annotated`] and typed
+//! [`S2bMessage::decode`] establish that scope; generic IE-region decoders do
+//! not. The bridge refuses both unknown and grouped scope while grouped Cause
+//! flag bits are not modelled.
 //!
 //! @spec 3GPP TS29274 R18
 //! @spec 3GPP TS24008 V20.0.0 10.5.6.3

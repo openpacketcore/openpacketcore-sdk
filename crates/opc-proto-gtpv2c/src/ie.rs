@@ -222,6 +222,13 @@ impl<'a> RawIeIterator<'a> {
     /// As [`Iterator::next`], but a framing error names the offending IE
     /// whenever a complete four-octet header had been read.
     ///
+    /// This generic iterator does not know whether `region` is a message-top-
+    /// level IE region or a grouped subregion. Its errors therefore carry
+    /// unknown scope, and
+    /// [`Gtpv2cDecodeError::top_level_offending_ie`](crate::Gtpv2cDecodeError::top_level_offending_ie)
+    /// returns `None` even when [`Gtpv2cDecodeError::offending_ie`] can name the
+    /// element.
+    ///
     /// The three errors raised here rather than by the IE decoder -- the
     /// count overflow, the [`DecodeErrorCode::IeCountExceeded`] bound, and the
     /// offset arithmetic -- deliberately carry no identity. They are bounds on
@@ -298,6 +305,11 @@ pub fn validate_ie_region(region: &[u8], ctx: DecodeContext) -> Result<(), Decod
 /// As [`validate_ie_region`], but a framing error names the offending IE
 /// whenever a complete four-octet header had been read.
 ///
+/// This generic validator does not know whether `region` is message-top-level
+/// or grouped. Its errors retain unknown scope; use
+/// [`crate::Message::decode_annotated`] when positive top-level evidence is
+/// required for response disposition.
+///
 /// # Errors
 ///
 /// Returns [`Gtpv2cDecodeError`] for any TLIV boundary, spare-bit, or IE-count
@@ -340,11 +352,20 @@ fn decode_raw_ie<'a>(
     };
     let offending = Gtpv2cOffendingIe::from_wire(header.ie_type, header.instance);
 
-    // A complete header has been read, so every error raised below is a
-    // statement about this element's octets and names it. Keeping the
-    // unannotated construction inside one helper makes that an invariant of
-    // the split rather than a list of sites that has to be maintained.
-    decode_raw_ie_body(input, ctx, base_offset, spec, header)
+    // Resolve the only body offset that can overflow before entering the
+    // identity-annotated wire-validation frame. That overflow describes a
+    // caller-supplied sequence coordinate, not the received IE. Keeping the
+    // provenance at this construction site avoids suppressing some unrelated
+    // future LengthOverflow that really is about an IE's declared octets.
+    let spare_violation_offset = if crate::is_strict(ctx.validation_level) && header.spare != 0 {
+        Some(checked_offset(base_offset, 3).map_err(Gtpv2cDecodeError::new)?)
+    } else {
+        None
+    };
+
+    // Every error raised inside the body frame is now a statement about this
+    // element's received octets and names it.
+    decode_raw_ie_body(input, base_offset, spec, header, spare_violation_offset)
         .map_err(|error| Gtpv2cDecodeError::new(error).annotate_offending(offending))
 }
 
@@ -359,10 +380,10 @@ struct RawIeHeader {
 
 fn decode_raw_ie_body<'a>(
     input: &'a [u8],
-    ctx: DecodeContext,
     base_offset: usize,
     spec: SpecRef,
     header: RawIeHeader,
+    spare_violation_offset: Option<usize>,
 ) -> DecodeResult<'a, RawIe<'a>> {
     let RawIeHeader {
         ie_type,
@@ -370,12 +391,12 @@ fn decode_raw_ie_body<'a>(
         spare,
         instance,
     } = header;
-    if crate::is_strict(ctx.validation_level) && spare != 0 {
+    if let Some(spare_violation_offset) = spare_violation_offset {
         return Err(DecodeError::new(
             DecodeErrorCode::Structural {
                 reason: "IE spare bits must be zero",
             },
-            checked_offset(base_offset, 3)?,
+            spare_violation_offset,
         )
         .with_spec_ref(spec));
     }

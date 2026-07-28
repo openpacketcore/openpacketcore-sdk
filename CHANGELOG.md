@@ -183,12 +183,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   request-versus-response, the Echo exception, the message grammar, slot
   presence and conditional verifiability, and that decision stays with
   `Gtpv2cErrorResponsePlanner` -- which refuses to answer several inputs
-  carrying a perfectly valid identity. Convert `offending_ie()` into a
-  `Gtpv2cProtocolErrorKind` only when `enclosing_ie()` is `None`: this crate's
-  Cause encoder hardcodes clause 8.4's flags octet to zero, and a zeroed octet
-  asserts a top-level IE, so a grouped member's identity fed through it would
-  name an element that never appeared at top level. Modelling the grouped-IE
-  flag bits is disposition-layer work and is deferred.
+  carrying a perfectly valid identity. `top_level_offending_ie()` is the
+  checked disposition projection, and
+  `Gtpv2cErrorResponsePlanner::plan_invalid_ie_length_from_decode` carries it
+  through request inspection and planning. The bridge accepts only a
+  length-shaped failure with a proven message-top-level identity and returns
+  `None` for either Unknown or Grouped scope. Generic raw IE-region entry
+  points leave scope Unknown; `Message::decode_annotated` and typed S2b decode
+  positively establish Message Top Level; grouped decode records Grouped even
+  when the container identity itself is unrepresentable. This crate's Cause
+  encoder hardcodes clause 8.4's flags octet to zero, so encoding unknown or
+  grouped evidence would make a top-level claim the decoder did not prove. The
+  caller still resolves Mandatory or verifiable Conditional presence from the
+  message grammar and must pass the exact datagram whose decode produced the
+  error. Modelling grouped-IE flag bits remains deferred.
 
 ### Changed
 - **Native async management-audit acknowledgement — `opc-mgmt-audit`,

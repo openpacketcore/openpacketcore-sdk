@@ -2,15 +2,17 @@ use std::num::NonZeroU32;
 
 use bytes::BytesMut;
 use opc_proto_gtpv2c::{
-    inspect_gtpv2c_request, CauseValue, Gtpv2cErrorResponseDecision, Gtpv2cErrorResponseKind,
-    Gtpv2cErrorResponsePlan, Gtpv2cErrorResponsePlanner, Gtpv2cOffendingIe, Gtpv2cProtocolError,
-    Gtpv2cProtocolErrorKind, Gtpv2cProtocolErrorResponseTeid, Gtpv2cReceivedPeerMetadata,
-    Gtpv2cReceivedTeid, Gtpv2cRequestFailure, Gtpv2cRequestInspection, Gtpv2cSequenceNumber,
-    Gtpv2cUnanswerableReason, Message, MessageType, Recovery, S2bMessage,
+    inspect_gtpv2c_request, validate_ie_region_annotated, CauseValue, Gtpv2cErrorResponseDecision,
+    Gtpv2cErrorResponseKind, Gtpv2cErrorResponsePlan, Gtpv2cErrorResponsePlanner,
+    Gtpv2cOffendingIe, Gtpv2cProtocolError, Gtpv2cProtocolErrorKind,
+    Gtpv2cProtocolErrorResponseTeid, Gtpv2cReceivedPeerMetadata, Gtpv2cReceivedTeid,
+    Gtpv2cRequestFailure, Gtpv2cRequestInspection, Gtpv2cSequenceNumber, Gtpv2cUnanswerableReason,
+    Message, MessageType, Recovery, S2bMessage, IE_TYPE_APN, IE_TYPE_BEARER_CONTEXT, IE_TYPE_CAUSE,
     MAX_GTPV2C_ERROR_RESPONSE_WIRE_LEN,
 };
 use opc_protocol::{
-    BorrowDecode, DecodeContext, Encode, EncodeContext, EncodeErrorCode, ValidationLevel,
+    BorrowDecode, DecodeContext, DecodeErrorCode, Encode, EncodeContext, EncodeErrorCode,
+    ValidationLevel,
 };
 
 const UNSUPPORTED_VERSION_REQUEST: &str =
@@ -382,6 +384,186 @@ fn invalid_mandatory_ie_length_includes_offending_identity() {
     assert_eq!(
         encode(&plan),
         fixture(INVALID_IE_LENGTH_MODIFY_BEARER_RESPONSE)
+    );
+}
+
+/// The checked decoder-to-planner bridge carries a proven top-level identity
+/// through to the encoded Cause IE. The caller has independently resolved the
+/// Bearer Context slot in this Modify Bearer Request as Mandatory; the bridge
+/// is responsible for the remaining mechanical invariants: a length-shaped
+/// decode error, top-level scope, request eligibility and bounded encoding.
+#[test]
+fn top_level_decode_evidence_plans_and_encodes_the_offending_ie() {
+    let mut request = fixture(INVALID_IE_LENGTH_MODIFY_BEARER_REQUEST);
+    // The fixture carries a complete top-level Bearer Context whose declared
+    // value length originally matches its two value octets. Declare four
+    // instead while leaving the enclosing message Length exact, so raw IE
+    // framing -- not common-header inspection -- raises the failure.
+    request[14] = 4;
+
+    let failure = S2bMessage::decode(&request, DecodeContext::default())
+        .expect_err("the top-level IE declaration must overrun the message");
+    let offending =
+        Gtpv2cOffendingIe::new(IE_TYPE_BEARER_CONTEXT, 0).expect("wire instance is valid");
+    assert!(matches!(failure.code(), DecodeErrorCode::Truncated));
+    assert_eq!(failure.offending_ie(), Some(offending));
+    assert_eq!(failure.enclosing_ie(), None);
+    assert_eq!(failure.top_level_offending_ie(), Some(offending));
+
+    let decision = planner()
+        .plan_invalid_ie_length_from_decode(&request, &failure, remote(0x5566_7788))
+        .expect("top-level Invalid Length evidence is representable");
+    let plan = response_plan(decision);
+    assert_eq!(plan.cause(), Some(CauseValue::InvalidLength));
+    assert_eq!(plan.offending_ie(), Some(offending));
+    assert_eq!(
+        encode(&plan),
+        fixture(INVALID_IE_LENGTH_MODIFY_BEARER_RESPONSE),
+        "the encoded Cause must carry zero top-level flags and IE 93/instance 0"
+    );
+}
+
+/// A standalone IE region can be a message-top-level region or a grouped
+/// subregion; successful header parsing cannot distinguish them. Pairing that
+/// scope-unknown error with a full request must not fabricate top-level
+/// evidence. Decoding the exact same IE bytes through the actual message frame
+/// supplies positive top-level evidence and unlocks the checked bridge.
+#[test]
+fn standalone_subregion_evidence_cannot_be_rebound_as_message_top_level() {
+    let mut request = fixture(INVALID_IE_LENGTH_MODIFY_BEARER_REQUEST);
+    request[14] = 4;
+    let expected =
+        Gtpv2cOffendingIe::new(IE_TYPE_BEARER_CONTEXT, 0).expect("wire instance is valid");
+
+    let subregion_failure = validate_ie_region_annotated(&request[12..], DecodeContext::default())
+        .expect_err("the standalone region contains the overrunning IE");
+    assert_eq!(subregion_failure.offending_ie(), Some(expected));
+    assert_eq!(subregion_failure.enclosing_ie(), None);
+    assert_eq!(
+        subregion_failure.top_level_offending_ie(),
+        None,
+        "absence of an enclosing identity must not prove top-level scope"
+    );
+    assert!(
+        planner()
+            .plan_invalid_ie_length_from_decode(&request, &subregion_failure, remote(0x5566_7788),)
+            .is_none(),
+        "scope-unknown evidence must not be rebound to an arbitrary request"
+    );
+
+    let message_failure = Message::decode_annotated(&request, DecodeContext::default())
+        .expect_err("the message frame must see the same overrunning IE");
+    assert_eq!(message_failure.offending_ie(), Some(expected));
+    assert_eq!(message_failure.top_level_offending_ie(), Some(expected));
+    assert!(
+        planner()
+            .plan_invalid_ie_length_from_decode(&request, &message_failure, remote(0x5566_7788),)
+            .is_some(),
+        "the actual message frame supplies positive top-level evidence"
+    );
+}
+
+/// The public bridge admits an actual positively scoped `InvalidLength`, while
+/// refusing a positively scoped non-length error even though both identify the
+/// same top-level mandatory APN slot.
+#[test]
+fn decoder_bridge_public_code_gate_accepts_only_length_errors() {
+    let mut request = vec![0x48, MessageType::CreateSessionRequest.as_u8(), 0, 12];
+    request.extend_from_slice(&0u32.to_be_bytes());
+    request.extend_from_slice(&[0x01, 0x02, 0x03, 0]);
+    request.extend_from_slice(&[IE_TYPE_APN, 0, 0, 0]);
+
+    let invalid_length = S2bMessage::decode(&request, DecodeContext::default())
+        .expect_err("an empty APN value must fail");
+    assert!(matches!(
+        invalid_length.code(),
+        DecodeErrorCode::InvalidLength { .. }
+    ));
+    assert!(invalid_length.top_level_offending_ie().is_some());
+    assert!(
+        planner()
+            .plan_invalid_ie_length_from_decode(
+                &request,
+                &invalid_length,
+                Gtpv2cProtocolErrorResponseTeid::NoLookup,
+            )
+            .is_some(),
+        "positively scoped InvalidLength evidence must pass the code gate"
+    );
+
+    // The same complete top-level IE header with a non-zero spare nibble is a
+    // Structural failure, not Invalid Length.
+    request[15] = 0x10;
+    let non_length = S2bMessage::decode(
+        &request,
+        DecodeContext {
+            validation_level: ValidationLevel::Strict,
+            ..DecodeContext::default()
+        },
+    )
+    .expect_err("strict decode must reject the IE spare nibble");
+    assert!(matches!(
+        non_length.code(),
+        DecodeErrorCode::Structural { .. }
+    ));
+    assert!(non_length.top_level_offending_ie().is_some());
+    assert!(
+        planner()
+            .plan_invalid_ie_length_from_decode(
+                &request,
+                &non_length,
+                Gtpv2cProtocolErrorResponseTeid::NoLookup,
+            )
+            .is_none(),
+        "positive scope must not bypass the Invalid Length code gate"
+    );
+}
+
+/// A complete malformed member header supplies an offending identity, but the
+/// identity is scoped inside a Bearer Context. The checked bridge must refuse
+/// it because the current Cause encoder cannot represent grouped scope; no
+/// response plan and therefore no response bytes may be produced from that
+/// evidence.
+#[test]
+fn grouped_decode_evidence_is_refused_and_emits_no_response() {
+    let member = [IE_TYPE_CAUSE, 0, 16, 0, 0xaa, 0xbb];
+    let member_len = u16::try_from(member.len()).expect("test member fits an IE Length field");
+    let mut grouped = vec![IE_TYPE_BEARER_CONTEXT];
+    grouped.extend_from_slice(&member_len.to_be_bytes());
+    grouped.push(0);
+    grouped.extend_from_slice(&member);
+
+    let body_len = u16::try_from(8 + grouped.len()).expect("test request fits GTP Length");
+    let mut request = vec![0x48, MessageType::ModifyBearerRequest.as_u8()];
+    request.extend_from_slice(&body_len.to_be_bytes());
+    request.extend_from_slice(&0x0102_0304u32.to_be_bytes());
+    request.extend_from_slice(&[0x22, 0x33, 0x44, 0]);
+    request.extend_from_slice(&grouped);
+
+    let failure = S2bMessage::decode(&request, DecodeContext::default())
+        .expect_err("the grouped member declaration must overrun its container");
+    assert!(matches!(failure.code(), DecodeErrorCode::Truncated));
+    assert_eq!(
+        failure.offending_ie(),
+        Some(Gtpv2cOffendingIe::new(IE_TYPE_CAUSE, 0).expect("wire instance is valid"))
+    );
+    assert_eq!(
+        failure.enclosing_ie(),
+        Some(Gtpv2cOffendingIe::new(IE_TYPE_BEARER_CONTEXT, 0).expect("wire instance is valid"))
+    );
+    assert_eq!(failure.top_level_offending_ie(), None);
+
+    let encoded = planner()
+        .plan_invalid_ie_length_from_decode(
+            &request,
+            &failure,
+            Gtpv2cProtocolErrorResponseTeid::NoLookup,
+        )
+        .map(|decision| encode(&response_plan(decision)))
+        .unwrap_or_default();
+    assert!(
+        encoded.is_empty(),
+        "grouped evidence must not produce a zero-flags top-level Cause"
     );
 }
 
