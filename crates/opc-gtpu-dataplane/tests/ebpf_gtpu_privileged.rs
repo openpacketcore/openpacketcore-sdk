@@ -88,8 +88,8 @@ use opc_gtpu_ebpf_common::{
     UplinkFarKey, COUNTER_DL_BINDING_FAMILY_MISMATCH, COUNTER_DL_BINDING_INGRESS_MISMATCH,
     COUNTER_DL_BINDING_INVALID, COUNTER_DL_BINDING_LOCAL_MISMATCH,
     COUNTER_DL_BINDING_PEER_MISMATCH, COUNTER_DL_BINDING_SOURCE_PORT_MISMATCH, COUNTER_DL_DECAP,
-    COUNTER_DL_DST_MISMATCH, COUNTER_DL_MALFORMED, COUNTER_DL_UNKNOWN_TEID, COUNTER_UL_ENCAP,
-    COUNTER_UL_FAR_MISS, COUNTER_UL_MTU_REJECT, COUNTER_UL_PMTU_CORRUPT,
+    COUNTER_DL_DST_MISMATCH, COUNTER_DL_MALFORMED, COUNTER_DL_UNKNOWN_TEID, COUNTER_SLOTS,
+    COUNTER_UL_ENCAP, COUNTER_UL_FAR_MISS, COUNTER_UL_MTU_REJECT, COUNTER_UL_PMTU_CORRUPT,
     COUNTER_UL_REDIRECT_RESOLVED, DOWNLINK_ENDPOINT_BINDING_VALUE_LEN, DOWNLINK_PDR_VALUE_LEN,
     ETH_HDR_LEN, GTPU_MANDATORY_HDR_LEN, IPV4_MIN_HDR_LEN, MAP_CONFIG, MAP_CONFIG_IPV6,
     MAP_COUNTERS, MAP_DOWNLINK_BINDING_COUNTERS, MAP_DOWNLINK_ENDPOINT_BINDING,
@@ -172,6 +172,7 @@ const XFRM_DOWNLINK_SOURCE_PORT: u16 = 53;
 const XFRM_DOWNLINK_DESTINATION_PORT: u16 = 5005;
 const IPPROTO_UDP: u8 = 17;
 const IPPROTO_ESP: u8 = 50;
+const CURRENT_DATAPATH_OBJECT: &[u8] = include_bytes!("../bpf/opc-gtpu-datapath.bpf.o");
 const FROZEN_V1_OBJECT: &[u8] = include_bytes!("../bpf/opc-gtpu-datapath-v1.bpf.o");
 const FROZEN_V2_OBJECT: &[u8] = include_bytes!("../bpf/opc-gtpu-datapath-v2.bpf.o");
 /// The generation immediately before the uplink redirect-outcome counter.
@@ -186,6 +187,7 @@ const LEGACY_V1_COUNTER_SLOTS: u32 = 6;
 /// `COUNTER_SLOTS` as that generation declared it.
 const PRE_REDIRECT_COUNTER_SLOTS: u32 = 6;
 const SDK_TC_HANDLE: TcHandle = TcHandle::new(0, 1);
+const OFF_SLOT_TC_HANDLE: TcHandle = TcHandle::new(0, 2);
 const LEGACY_V2_OWNER_VALUE_LEN: usize = 20;
 
 fn run(program: &str, args: &[&str]) {
@@ -2968,6 +2970,16 @@ fn drain_datagrams(socket: &UdpSocket) {
 }
 
 fn attach_frozen_program(ebpf: &mut Ebpf, name: &str, attach_type: TcAttachType) -> u32 {
+    attach_frozen_program_at(ebpf, name, attach_type, 50, SDK_TC_HANDLE)
+}
+
+fn attach_frozen_program_at(
+    ebpf: &mut Ebpf,
+    name: &str,
+    attach_type: TcAttachType,
+    priority: u16,
+    handle: TcHandle,
+) -> u32 {
     let program: &mut SchedClassifier = ebpf
         .program_mut(name)
         .expect("frozen program")
@@ -2980,8 +2992,8 @@ fn attach_frozen_program(ebpf: &mut Ebpf, name: &str, attach_type: TcAttachType)
             "s2bu",
             attach_type,
             TcAttachOptions::Netlink(NlOptions {
-                priority: 50,
-                handle: SDK_TC_HANDLE,
+                priority,
+                handle,
                 classid: None,
             }),
         )
@@ -3132,6 +3144,57 @@ fn install_pre_redirect_generation(pin_dir: &std::path::Path) -> (u32, u32) {
     let downlink_id = attach_frozen_program(&mut ebpf, PROG_DOWNLINK, TcAttachType::Ingress);
     drop(ebpf);
     (uplink_id, downlink_id)
+}
+
+/// Leave one authentic historical SDK hook outside the slot managed by the
+/// current loader while publishing maps whose capacity matches this build.
+///
+/// The counter override deliberately removes map-width drift from the
+/// scenario. Detection therefore has to come from the program instruction
+/// stream found in the complete tc filter inventory, not the desired slot or
+/// a later pin ABI check.
+fn install_off_slot_pre_redirect_generation_with_current_capacity(
+    pin_dir: &std::path::Path,
+) -> u32 {
+    ensure_clsact("s2bu");
+    fs::create_dir_all(pin_dir).expect("create off-slot pre-redirect pin directory");
+    let mut ebpf = EbpfLoader::new()
+        .map_max_entries(MAP_COUNTERS, COUNTER_SLOTS)
+        .default_map_pin_directory(pin_dir)
+        .load(FROZEN_PRE_REDIRECT_OBJECT)
+        .expect("load current-capacity pre-redirect object");
+    {
+        let map = ebpf
+            .map_mut(MAP_CONFIG)
+            .expect("off-slot pre-redirect config map");
+        let mut config =
+            Array::<_, [u8; 4]>::try_from(map).expect("typed off-slot pre-redirect config");
+        config
+            .set(0, EPDG_S2BU_IP.octets(), 0)
+            .expect("seed off-slot pre-redirect config");
+    }
+    {
+        let map = ebpf
+            .map_mut(MAP_UPLINK_FAR)
+            .expect("off-slot pre-redirect FAR map");
+        let mut far = BpfHashMap::<_, [u8; 4], [u8; UPLINK_FAR_VALUE_LEN]>::try_from(map)
+            .expect("typed off-slot pre-redirect FAR");
+        far.insert(
+            UPLINK_DSCP_SCHEMA_MARKER_KEY,
+            UPLINK_PMTU_SCHEMA_MARKER_VALUE,
+            0,
+        )
+        .expect("seed committed off-slot pre-redirect marker");
+    }
+    let uplink_id = attach_frozen_program_at(
+        &mut ebpf,
+        PROG_UPLINK,
+        TcAttachType::Egress,
+        51,
+        OFF_SLOT_TC_HANDLE,
+    );
+    drop(ebpf);
+    uplink_id
 }
 
 /// Make the clsact qdisc present so a fixture standing in for a prior loader
@@ -5082,9 +5145,10 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
         ],
     );
 
-    // Once a pin set carries durable schema evidence, loss of the additive
-    // map is corruption, not a one-time legacy migration. Adoption must fail
-    // before Aya can silently recreate an empty pinned-by-name map.
+    // Both current hooks still derive authority from this exact pin graph.
+    // Losing one required pin makes that hook-to-graph identity incomplete,
+    // so the generation-identity fence must refuse before schema preflight or
+    // Aya can silently recreate an empty pinned-by-name map.
     let owner = EbpfGtpuDataplaneBackend::with_config(EbpfGtpuDataplaneBackendConfig {
         bpffs_pin_root: net.pin_root.clone(),
         ..EbpfGtpuDataplaneBackendConfig::default()
@@ -5102,14 +5166,13 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
     });
     assert!(matches!(
         after_loss.resolve_device("s2bu").await,
-        Err(opc_gtpu_dataplane::GtpuError::Io {
-            operation: "ebpf_bearer_schema",
-            ..
+        Err(opc_gtpu_dataplane::GtpuError::StateIndeterminate {
+            operation: "ebpf_generation_identity"
         })
     ));
     assert!(
         !dscp_pin.exists(),
-        "failed adoption must not recreate the missing DSCP pin"
+        "the current-hook authority fence must not recreate the missing DSCP pin"
     );
 
     drop(net);
@@ -7368,6 +7431,369 @@ async fn ebpf_gtpu_live_historical_generation_refuses_every_attach_without_mutat
 // PRIVILEGED_TEST_LOCK.
 #[allow(clippy::await_holding_lock)]
 #[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn ebpf_gtpu_off_slot_historical_generation_refuses_before_mutation(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref() != Ok("1") {
+        eprintln!("skipping: set OPC_GTPU_RUN_PRIVILEGED=1 inside a fresh privileged netns");
+        return Ok(());
+    }
+
+    let _serial = PRIVILEGED_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let net = TestNet::provision();
+    let config = EbpfGtpuDataplaneBackendConfig {
+        bpffs_pin_root: net.pin_root.clone(),
+        ..EbpfGtpuDataplaneBackendConfig::default()
+    };
+    let pin_dir = net.pin_root.join("s2bu");
+
+    let historical_id = install_off_slot_pre_redirect_generation_with_current_capacity(&pin_dir);
+    let counters_before =
+        pinned_map_abi(&pin_dir, MAP_COUNTERS).expect("off-slot counter map must be pinned");
+    assert_eq!(
+        counters_before.3, COUNTER_SLOTS,
+        "the fixture must be capacity-compatible with this build"
+    );
+
+    let pins_before = pin_directory_listing(&pin_dir);
+    let pinned_map_ids = |names: &[String]| {
+        names
+            .iter()
+            .map(|name| {
+                (
+                    name.clone(),
+                    MapInfo::from_pin(pin_dir.join(name))
+                        .unwrap_or_else(|error| panic!("open retained {name}: {error}"))
+                        .id(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let map_ids_before = pinned_map_ids(&pins_before);
+    let config_before = pinned_config(&pin_dir);
+    let marker_before = pinned_schema_marker(&pin_dir);
+    let egress_before = tc_filters("egress");
+    let ingress_before = tc_filters("ingress");
+    let program_map_ids_before = attached_program_map_ids("egress");
+
+    assert!(
+        egress_before.contains("pref 51")
+            && egress_before.contains("handle 0x2")
+            && egress_before.contains(PROG_UPLINK)
+            && egress_before.contains(&format!("id {historical_id}")),
+        "the authentic historical uplink must occupy priority 51/handle 2: {egress_before}"
+    );
+    assert!(
+        !egress_before.contains("pref 50") && !ingress_before.contains(PROG_DOWNLINK),
+        "the SDK's desired ingress and egress slots must both be empty"
+    );
+
+    let backend = EbpfGtpuDataplaneBackend::with_config(config);
+    let mut request = CreateGtpDeviceRequest::new("s2bu");
+    request.bind_address = IpAddr::V4(EPDG_S2BU_IP);
+    let error = backend
+        .create_device(request)
+        .await
+        .expect_err("an off-slot historical SDK hook must refuse attachment");
+    assert!(
+        matches!(
+            error,
+            GtpuError::DatapathGenerationMismatch {
+                operation: "ebpf_attach",
+                observed: opc_gtpu_dataplane::EbpfDatapathGeneration::Historical(
+                    opc_gtpu_dataplane::EbpfHistoricalDatapathGeneration::PreUplinkRedirectCounter
+                ),
+                expected: opc_gtpu_dataplane::EbpfDatapathGeneration::Current,
+            }
+        ),
+        "the instruction stream, not the compatible map width, must govern refusal: {error:?}"
+    );
+    drop(backend);
+
+    assert_eq!(
+        pin_directory_listing(&pin_dir),
+        pins_before,
+        "refusal must not add, remove, or rename a pin"
+    );
+    assert_eq!(
+        pinned_map_ids(&pins_before),
+        map_ids_before,
+        "refusal must replace no pinned map"
+    );
+    assert_eq!(
+        pinned_map_abi(&pin_dir, MAP_COUNTERS),
+        Some(counters_before),
+        "refusal must preserve the current-capacity counter map"
+    );
+    assert_eq!(
+        pinned_config(&pin_dir),
+        config_before,
+        "refusal must not rewrite retained configuration"
+    );
+    assert_eq!(
+        pinned_schema_marker(&pin_dir),
+        marker_before,
+        "refusal must not advance the durable schema marker"
+    );
+    assert_eq!(
+        attached_program_map_ids("egress"),
+        program_map_ids_before,
+        "refusal must not rebind the historical program to another map graph"
+    );
+    assert_eq!(
+        tc_filters("egress"),
+        egress_before,
+        "refusal must not replace or add an egress hook"
+    );
+    assert_eq!(
+        tc_filters("ingress"),
+        ingress_before,
+        "refusal must not publish the missing ingress hook"
+    );
+
+    run(
+        "tc",
+        &[
+            "filter", "del", "dev", "s2bu", "egress", "handle", "0x2", "pref", "51", "bpf",
+        ],
+    );
+    println!("OPC_GTPU_OFF_SLOT_GENERATION_GUARD_PROVEN");
+    drop(net);
+    Ok(())
+}
+
+#[tokio::test]
+// The serial guard is deliberately held for the entire test body; see
+// PRIVILEGED_TEST_LOCK.
+#[allow(clippy::await_holding_lock)]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn ebpf_gtpu_exact_current_hooks_refuse_a_different_complete_current_pin_graph(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref() != Ok("1") {
+        eprintln!("skipping: set OPC_GTPU_RUN_PRIVILEGED=1 inside a fresh privileged netns");
+        return Ok(());
+    }
+
+    let _serial = PRIVILEGED_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let net = TestNet::provision();
+    let root_a = net.pin_root.join("current-graph-a");
+    let root_b = net.pin_root.join("current-graph-b");
+    let pin_dir_b = root_b.join("s2bu");
+
+    // Root A publishes the current programs and their first complete graph.
+    // Dropping the loader models a restart while tc retains both hooks.
+    let owner = EbpfGtpuDataplaneBackend::with_config(EbpfGtpuDataplaneBackendConfig {
+        bpffs_pin_root: root_a.clone(),
+        ..EbpfGtpuDataplaneBackendConfig::default()
+    });
+    let mut create = CreateGtpDeviceRequest::new("s2bu");
+    create.bind_address = IpAddr::V4(EPDG_S2BU_IP);
+    owner.create_device(create).await?;
+    drop(owner);
+
+    let egress_before = tc_filters("egress");
+    let ingress_before = tc_filters("ingress");
+    let uplink_maps_before = attached_program_map_ids("egress");
+    let downlink_maps_before = attached_program_map_ids("ingress");
+    assert!(
+        egress_before.contains(PROG_UPLINK) && ingress_before.contains("opc_gtpu_downli"),
+        "root A must leave both current hooks live"
+    );
+
+    // Load the committed current object under root B but attach no program.
+    // Its complete map set therefore has the right current ABI and different
+    // kernel IDs from the maps already referenced by the live hooks.
+    fs::create_dir_all(&pin_dir_b).expect("create alternate current pin directory");
+    let mut alternate = EbpfLoader::new()
+        .default_map_pin_directory(&pin_dir_b)
+        .load(CURRENT_DATAPATH_OBJECT)
+        .expect("load committed current object for alternate graph");
+    {
+        let map = alternate
+            .map_mut(MAP_CONFIG)
+            .expect("alternate current config map");
+        let mut config = Array::<_, [u8; 4]>::try_from(map).expect("typed alternate config");
+        config
+            .set(0, EPDG_S2BU_IP.octets(), 0)
+            .expect("seed alternate current config");
+    }
+    let alternate_marker = [0xA5; UPLINK_FAR_VALUE_LEN];
+    assert_ne!(alternate_marker, UPLINK_PMTU_SCHEMA_MARKER_VALUE);
+    {
+        let map = alternate
+            .map_mut(MAP_UPLINK_FAR)
+            .expect("alternate current FAR map");
+        let mut far = BpfHashMap::<_, [u8; 4], [u8; UPLINK_FAR_VALUE_LEN]>::try_from(map)
+            .expect("typed alternate FAR");
+        far.insert(UPLINK_DSCP_SCHEMA_MARKER_KEY, alternate_marker, 0)
+            .expect("seed alternate schema canary");
+    }
+    drop(alternate);
+
+    let current_pin_names = [
+        MAP_UPLINK_FAR,
+        MAP_UPLINK_MARK_FAR,
+        MAP_UPLINK_DSCP,
+        MAP_UPLINK_MARK_DSCP,
+        MAP_UPLINK_SOURCE_PORT,
+        MAP_UPLINK_MARK_SOURCE_PORT,
+        MAP_UPLINK_PMTU,
+        MAP_UPLINK_PMTU_COUNTERS,
+        MAP_DOWNLINK_PDR,
+        MAP_DOWNLINK_MARK_PDR,
+        MAP_DOWNLINK_ENDPOINT_BINDING,
+        MAP_MARKED_BEARER_OWNER,
+        MAP_COUNTERS,
+        MAP_DOWNLINK_BINDING_COUNTERS,
+        MAP_CONFIG,
+        MAP_SESSION_GROUPS,
+        MAP_SESSION_UPLINK_INDEX,
+        MAP_SESSION_DOWNLINK_INDEX,
+        MAP_SESSION_TRANSACTIONS,
+        MAP_CONFIG_IPV6,
+        MAP_SESSION_SCHEMA,
+    ];
+    let pins_before = pin_directory_listing(&pin_dir_b);
+    assert_eq!(
+        pins_before.len(),
+        current_pin_names.len(),
+        "the alternate current object must publish every current map"
+    );
+    for name in current_pin_names {
+        assert!(
+            pins_before.iter().any(|present| present == name),
+            "the alternate current graph must contain {name}"
+        );
+    }
+    let map_ids_before = pins_before
+        .iter()
+        .map(|name| {
+            (
+                name.clone(),
+                MapInfo::from_pin(pin_dir_b.join(name))
+                    .unwrap_or_else(|error| panic!("open alternate {name}: {error}"))
+                    .id(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let config_before = pinned_config(&pin_dir_b);
+    let marker_before = pinned_schema_marker(&pin_dir_b);
+    assert_eq!(config_before, EPDG_S2BU_IP.octets());
+    assert_eq!(marker_before, alternate_marker);
+
+    let alternate_uplink_maps = exact_pinned_map_ids(
+        &pin_dir_b,
+        &[
+            MAP_UPLINK_FAR,
+            MAP_UPLINK_MARK_FAR,
+            MAP_UPLINK_DSCP,
+            MAP_UPLINK_MARK_DSCP,
+            MAP_UPLINK_SOURCE_PORT,
+            MAP_UPLINK_MARK_SOURCE_PORT,
+            MAP_UPLINK_PMTU,
+            MAP_UPLINK_PMTU_COUNTERS,
+            MAP_DOWNLINK_PDR,
+            MAP_DOWNLINK_MARK_PDR,
+            MAP_DOWNLINK_ENDPOINT_BINDING,
+            MAP_MARKED_BEARER_OWNER,
+            MAP_COUNTERS,
+            MAP_CONFIG,
+            MAP_SESSION_GROUPS,
+            MAP_SESSION_UPLINK_INDEX,
+            MAP_CONFIG_IPV6,
+        ],
+    );
+    let alternate_downlink_maps = exact_pinned_map_ids(
+        &pin_dir_b,
+        &[
+            MAP_DOWNLINK_PDR,
+            MAP_DOWNLINK_MARK_PDR,
+            MAP_DOWNLINK_ENDPOINT_BINDING,
+            MAP_UPLINK_FAR,
+            MAP_UPLINK_MARK_FAR,
+            MAP_UPLINK_DSCP,
+            MAP_UPLINK_MARK_DSCP,
+            MAP_UPLINK_SOURCE_PORT,
+            MAP_UPLINK_MARK_SOURCE_PORT,
+            MAP_MARKED_BEARER_OWNER,
+            MAP_COUNTERS,
+            MAP_DOWNLINK_BINDING_COUNTERS,
+            MAP_SESSION_GROUPS,
+            MAP_SESSION_DOWNLINK_INDEX,
+            MAP_CONFIG_IPV6,
+        ],
+    );
+    assert_ne!(uplink_maps_before, alternate_uplink_maps);
+    assert_ne!(downlink_maps_before, alternate_downlink_maps);
+
+    // The map-ID conflict must dominate even the deliberately invalid schema
+    // canary. Reaching typed schema preflight would produce a different error.
+    let contender = EbpfGtpuDataplaneBackend::with_config(EbpfGtpuDataplaneBackendConfig {
+        bpffs_pin_root: root_b.clone(),
+        ..EbpfGtpuDataplaneBackendConfig::default()
+    });
+    let mut conflicting = CreateGtpDeviceRequest::new("s2bu");
+    conflicting.bind_address = IpAddr::V4(EPDG_S2BU_IP);
+    let error = contender
+        .create_device(conflicting)
+        .await
+        .expect_err("live current hooks must refuse a different complete current map graph");
+    assert!(
+        matches!(error, GtpuError::AlreadyExists),
+        "a complete wrong current graph must be an ownership conflict, got {error:?}"
+    );
+    drop(contender);
+
+    assert_eq!(pin_directory_listing(&pin_dir_b), pins_before);
+    assert_eq!(
+        pins_before
+            .iter()
+            .map(|name| {
+                (
+                    name.clone(),
+                    MapInfo::from_pin(pin_dir_b.join(name))
+                        .unwrap_or_else(|error| panic!("reopen alternate {name}: {error}"))
+                        .id(),
+                )
+            })
+            .collect::<Vec<_>>(),
+        map_ids_before,
+        "the ownership refusal must replace no alternate pinned map"
+    );
+    assert_eq!(pinned_config(&pin_dir_b), config_before);
+    assert_eq!(
+        pinned_schema_marker(&pin_dir_b),
+        marker_before,
+        "the ownership fence must run before typed schema access"
+    );
+    assert_eq!(tc_filters("egress"), egress_before);
+    assert_eq!(tc_filters("ingress"), ingress_before);
+    assert_eq!(attached_program_map_ids("egress"), uplink_maps_before);
+    assert_eq!(attached_program_map_ids("ingress"), downlink_maps_before);
+
+    for direction in ["egress", "ingress"] {
+        run(
+            "tc",
+            &[
+                "filter", "del", "dev", "s2bu", direction, "handle", "0x1", "pref", "50", "bpf",
+            ],
+        );
+    }
+    fs::remove_dir_all(&root_a).expect("remove root-A current graph");
+    fs::remove_dir_all(&root_b).expect("remove root-B current graph");
+    println!("OPC_GTPU_WRONG_CURRENT_GRAPH_GUARD_PROVEN");
+    drop(net);
+    Ok(())
+}
+
+#[tokio::test]
+// The serial guard is deliberately held for the entire test body; see
+// PRIVILEGED_TEST_LOCK.
+#[allow(clippy::await_holding_lock)]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
 async fn ebpf_gtpu_foreign_pin_abi_is_refused_before_any_typed_read(
 ) -> Result<(), Box<dyn std::error::Error>> {
     if env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref() != Ok("1") {
@@ -7501,7 +7927,7 @@ async fn ebpf_gtpu_foreign_pin_abi_is_refused_before_any_typed_read(
 // PRIVILEGED_TEST_LOCK.
 #[allow(clippy::await_holding_lock)]
 #[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
-async fn ebpf_gtpu_grouped_attach_excludes_legacy_authority_before_materializing_pins(
+async fn ebpf_gtpu_grouped_attach_refuses_partial_current_hook_graph_before_materializing_pins(
 ) -> Result<(), Box<dyn std::error::Error>> {
     if env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref() != Ok("1") {
         eprintln!("skipping: set OPC_GTPU_RUN_PRIVILEGED=1 inside a fresh privileged netns");
@@ -7518,8 +7944,9 @@ async fn ebpf_gtpu_grouped_attach_excludes_legacy_authority_before_materializing
     };
     let pin_dir = net.pin_root.join("s2bu");
 
-    // A live IPv4 datapath owns this pin namespace: populated FAR and PDR, a
-    // non-zero config slot, and both current hooks attached.
+    // Both current hooks own this complete pin namespace before the induced
+    // loss: populated FAR and PDR, a non-zero config slot, and both hooks
+    // attached to these exact map IDs.
     let owner = EbpfGtpuDataplaneBackend::with_config(config.clone());
     let mut create = CreateGtpDeviceRequest::new("s2bu");
     create.bind_address = IpAddr::V4(EPDG_S2BU_IP);
@@ -7531,10 +7958,11 @@ async fn ebpf_gtpu_grouped_attach_excludes_legacy_authority_before_materializing
         PdpContextInstallOutcome::Installed
     );
 
-    // Remove every grouped pin so the grouped schema preflight reports an
-    // initializing state. That classification says nothing about whether
-    // legacy authority is live, and acting on it must not be what discovers
-    // the conflict.
+    // Remove every grouped pin that participates in the current programs.
+    // This leaves each live hook's named map graph incomplete. The
+    // generation-identity fence must discover that partial authority before
+    // grouped schema preflight can reinterpret the missing pins as an
+    // initializing state.
     let grouped_pins = [
         MAP_SESSION_GROUPS,
         MAP_SESSION_UPLINK_INDEX,
@@ -7562,15 +7990,20 @@ async fn ebpf_gtpu_grouped_attach_excludes_legacy_authority_before_materializing
     let error = grouping
         .create_device_with_endpoints(grouped_device_request(grouped_mtu_policy()))
         .await
-        .expect_err("live legacy authority must refuse a grouped attachment");
+        .expect_err("a partial live current-hook graph must refuse grouped attachment");
     assert!(
-        matches!(error, GtpuError::AlreadyExists),
-        "live legacy authority must surface as AlreadyExists, got {error:?}"
+        matches!(
+            error,
+            GtpuError::StateIndeterminate {
+                operation: "ebpf_generation_identity"
+            }
+        ),
+        "partial current-hook authority must be indeterminate, got {error:?}"
     );
     drop(grouping);
 
-    // The refusal must have happened before the loader could republish the
-    // grouped pins it had just been told were absent.
+    // The current-hook authority refusal must precede any loader attempt to
+    // republish the grouped pins it was just told were absent.
     for name in grouped_pins {
         assert!(
             !pin_dir.join(name).exists(),

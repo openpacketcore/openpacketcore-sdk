@@ -5521,6 +5521,44 @@ mod aya_runtime {
         MAP_SESSION_SCHEMA,
     ];
 
+    const CURRENT_UPLINK_PROGRAM_MAP_NAMES: [&str; 17] = [
+        MAP_UPLINK_FAR,
+        MAP_UPLINK_MARK_FAR,
+        MAP_UPLINK_DSCP,
+        MAP_UPLINK_MARK_DSCP,
+        MAP_UPLINK_SOURCE_PORT,
+        MAP_UPLINK_MARK_SOURCE_PORT,
+        MAP_UPLINK_PMTU,
+        MAP_UPLINK_PMTU_COUNTERS,
+        MAP_DOWNLINK_PDR,
+        MAP_DOWNLINK_MARK_PDR,
+        MAP_DOWNLINK_ENDPOINT_BINDING,
+        MAP_MARKED_BEARER_OWNER,
+        MAP_COUNTERS,
+        MAP_CONFIG,
+        MAP_SESSION_GROUPS,
+        MAP_SESSION_UPLINK_INDEX,
+        MAP_CONFIG_IPV6,
+    ];
+
+    const CURRENT_DOWNLINK_PROGRAM_MAP_NAMES: [&str; 15] = [
+        MAP_DOWNLINK_PDR,
+        MAP_DOWNLINK_MARK_PDR,
+        MAP_DOWNLINK_ENDPOINT_BINDING,
+        MAP_UPLINK_FAR,
+        MAP_UPLINK_MARK_FAR,
+        MAP_UPLINK_DSCP,
+        MAP_UPLINK_MARK_DSCP,
+        MAP_UPLINK_SOURCE_PORT,
+        MAP_UPLINK_MARK_SOURCE_PORT,
+        MAP_MARKED_BEARER_OWNER,
+        MAP_COUNTERS,
+        MAP_DOWNLINK_BINDING_COUNTERS,
+        MAP_SESSION_GROUPS,
+        MAP_SESSION_DOWNLINK_INDEX,
+        MAP_CONFIG_IPV6,
+    ];
+
     #[derive(Clone, Copy)]
     struct CurrentMapSpec {
         name: &'static str,
@@ -5824,40 +5862,60 @@ mod aya_runtime {
     }
 
     impl DatapathGenerationTags {
-        /// Name the generation whose uplink or downlink tag the kernel reports.
+        /// Name the strictest generation represented by every SDK-named tc
+        /// occupant on the device.
         ///
-        /// An SDK-named occupant matching no frozen identity is a generation
-        /// this build cannot reason about. That is a refusal, not a fallback to
-        /// "probably current": an unknown instruction stream cannot be assumed
-        /// to write the maps this build is about to publish.
-        ///
-        /// Each hook is judged on its own tag. A partially completed historical
-        /// replacement can leave one current and one older hook; that mixed
-        /// state is still named for the older generation and refused rather
-        /// than misclassified as current or unrecognised. When both hooks are
-        /// historical, the older named generation governs the diagnostic.
-        fn classify(
+        /// Program IDs are the only trustworthy bridge between a tc dump and
+        /// the loaded-program listing. Missing or ambiguous IDs make an
+        /// otherwise-current inventory indeterminate. A positively identified
+        /// older or unrecognised program is still authoritative refusal
+        /// evidence, however, and must not be hidden by an unrelated current
+        /// duplicate.
+        fn classify_occupants(
             self,
-            uplink_tag: Option<u64>,
-            downlink_tag: Option<u64>,
-        ) -> Option<Generation> {
-            let uplink = uplink_tag.map(|tag| {
-                Self::name_hook(tag, self.current.0, self.legacy_v1.0, self.pre_redirect.0)
-            });
-            let downlink = downlink_tag.map(|tag| {
-                Self::name_hook(tag, self.current.1, self.legacy_v1.1, self.pre_redirect.1)
-            });
-            match (uplink, downlink) {
-                (None, None) => None,
-                (Some(only), None) | (None, Some(only)) => Some(only),
-                (Some(uplink), Some(downlink)) => {
-                    Some(if downlink.refusal_rank() > uplink.refusal_rank() {
-                        downlink
-                    } else {
-                        uplink
-                    })
+            occupants: &[SdkProgramOccupant],
+            loaded_program_tags: &[(u32, u64)],
+        ) -> Result<Option<Generation>, GenerationIdentityEvidenceError> {
+            let mut observed: Option<Generation> = None;
+            let mut identity_missing = false;
+            for occupant in occupants {
+                let Some(program_id) = occupant.program_id else {
+                    identity_missing = true;
+                    continue;
+                };
+                let mut matches = loaded_program_tags
+                    .iter()
+                    .filter(|(loaded_id, _)| *loaded_id == program_id);
+                let Some((_, tag)) = matches.next() else {
+                    identity_missing = true;
+                    continue;
+                };
+                if matches.next().is_some() {
+                    identity_missing = true;
+                    continue;
                 }
+                let generation = match occupant.program {
+                    SdkDatapathProgram::Uplink => {
+                        Self::name_hook(*tag, self.current.0, self.legacy_v1.0, self.pre_redirect.0)
+                    }
+                    SdkDatapathProgram::Downlink => {
+                        Self::name_hook(*tag, self.current.1, self.legacy_v1.1, self.pre_redirect.1)
+                    }
+                };
+                observed = Some(match observed {
+                    Some(previous) if previous.refusal_rank() >= generation.refusal_rank() => {
+                        previous
+                    }
+                    _ => generation,
+                });
             }
+            if observed.is_some_and(|generation| generation != Generation::Current) {
+                return Ok(observed);
+            }
+            if identity_missing {
+                return Err(GenerationIdentityEvidenceError);
+            }
+            Ok(observed)
         }
 
         /// Name one hook's generation from the tag the kernel reports for it.
@@ -5923,6 +5981,9 @@ mod aya_runtime {
             }
         }
     }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct GenerationIdentityEvidenceError;
 
     /// A cached offline tag-derivation failure.
     ///
@@ -6556,6 +6617,103 @@ mod aya_runtime {
         program_id: Option<u32>,
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    enum SdkDatapathProgram {
+        Uplink,
+        Downlink,
+    }
+
+    impl SdkDatapathProgram {
+        fn from_filter_name(name: &str) -> Option<Self> {
+            let name = name.as_bytes();
+            if name == PROG_UPLINK.as_bytes() || name == kernel_program_name(PROG_UPLINK) {
+                Some(Self::Uplink)
+            } else if name == PROG_DOWNLINK.as_bytes() || name == kernel_program_name(PROG_DOWNLINK)
+            {
+                Some(Self::Downlink)
+            } else {
+                None
+            }
+        }
+
+        const fn name(self) -> &'static str {
+            match self {
+                Self::Uplink => PROG_UPLINK,
+                Self::Downlink => PROG_DOWNLINK,
+            }
+        }
+
+        const fn expected_parent(self) -> u32 {
+            match self {
+                Self::Uplink => sys::TC_H_CLSACT_EGRESS,
+                Self::Downlink => sys::TC_H_CLSACT_INGRESS,
+            }
+        }
+    }
+
+    /// One SDK-named BPF filter from a complete tc dump. Position and protocol
+    /// are retained so current duplicates cannot hide outside the configured
+    /// exact slot.
+    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+    struct SdkProgramOccupant {
+        program: SdkDatapathProgram,
+        parent: u32,
+        chain: u32,
+        protocol: u16,
+        priority: u16,
+        handle: u32,
+        program_id: Option<u32>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct CurrentSdkProgram {
+        occupant: SdkProgramOccupant,
+        map_ids: Vec<u32>,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct CurrentProgramGraphConflict;
+
+    /// Require every current SDK program to occupy its one canonical tc slot.
+    /// A second instance of either hook is a conflict even when both point at
+    /// the same kernel program ID.
+    fn validate_current_program_placement(
+        occupants: &[SdkProgramOccupant],
+        tc_priority: u16,
+    ) -> Result<(), CurrentProgramGraphConflict> {
+        let mut uplink_seen = false;
+        let mut downlink_seen = false;
+        for occupant in occupants {
+            let seen = match occupant.program {
+                SdkDatapathProgram::Uplink => &mut uplink_seen,
+                SdkDatapathProgram::Downlink => &mut downlink_seen,
+            };
+            if *seen
+                || occupant.parent != occupant.program.expected_parent()
+                || occupant.chain != 0
+                || occupant.protocol != TC_PROTOCOL_ALL
+                || occupant.priority != tc_priority
+                || occupant.handle != u32::from(TC_HANDLE)
+            {
+                return Err(CurrentProgramGraphConflict);
+            }
+            *seen = true;
+        }
+        Ok(())
+    }
+
+    /// Require each current hook's complete kernel map-ID set to equal the IDs
+    /// named by its exact required pin paths.
+    fn validate_current_program_map_graph(
+        program: &CurrentSdkProgram,
+        named: Option<&[u32]>,
+    ) -> Result<(), CurrentProgramGraphConflict> {
+        if named != Some(program.map_ids.as_slice()) {
+            return Err(CurrentProgramGraphConflict);
+        }
+        Ok(())
+    }
+
     impl AyaGtpuRuntime {
         pub(super) fn new() -> Self {
             Self::default()
@@ -7024,6 +7182,47 @@ mod aya_runtime {
             Ok(ids)
         }
 
+        fn required_named_program_map_ids(
+            pin_dir: &Path,
+            names: &[&str],
+        ) -> Result<Option<Vec<u32>>, GtpuError> {
+            let mut present = Vec::with_capacity(names.len());
+            for name in names {
+                let path = pin_dir.join(name);
+                match fs::symlink_metadata(&path) {
+                    Ok(metadata)
+                        if !metadata.file_type().is_symlink() && metadata.file_type().is_file() =>
+                    {
+                        present.push((name, path));
+                    }
+                    Ok(_) => return Err(state_indeterminate("ebpf_generation_identity")),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(_) => return Err(state_indeterminate("ebpf_generation_identity")),
+                }
+            }
+            if present.is_empty() {
+                return Ok(None);
+            }
+            if present.len() != names.len() {
+                return Err(state_indeterminate("ebpf_generation_identity"));
+            }
+
+            let mut ids = Vec::with_capacity(names.len());
+            for (name, path) in present {
+                let info = MapInfo::from_pin(&path)
+                    .map_err(|_| state_indeterminate("ebpf_generation_identity"))?;
+                if info.name() != kernel_program_name(name) {
+                    return Err(state_indeterminate("ebpf_generation_identity"));
+                }
+                ids.push(info.id());
+            }
+            ids.sort_unstable();
+            if ids.windows(2).any(|pair| pair[0] == pair[1]) {
+                return Err(state_indeterminate("ebpf_generation_identity"));
+            }
+            Ok(Some(ids))
+        }
+
         fn current_recorded_pin_count(
             pin_dir: &Path,
             record: CurrentRecoveryRecord,
@@ -7467,89 +7666,27 @@ mod aya_runtime {
             Ok(())
         }
 
-        /// Read the program tag of whatever holds one tc slot, or `None` when
-        /// this build has no generation question to ask about it.
-        ///
-        /// A slot held by something that is not one of this SDK's programs is
-        /// not a generation question: that occupant is left to the existing
-        /// exact-ownership refusal rather than being given a generation name.
-        fn sdk_hook_program_id(owner: &FilterOwner, name: &str) -> Result<Option<u32>, GtpuError> {
-            if owner.name != name {
-                return Ok(None);
-            }
-            owner
-                .program_id
-                .map(Some)
-                .ok_or_else(|| state_indeterminate("ebpf_generation_identity"))
-        }
-
-        fn required_loaded_program_tag(
-            program_id: u32,
-            programs: impl IntoIterator<Item = Result<(u32, u64), GtpuError>>,
-        ) -> Result<u64, GtpuError> {
-            programs
-                .into_iter()
-                .find_map(|result| match result {
-                    Ok((observed_id, tag)) if observed_id == program_id => Some(Ok(tag)),
-                    Ok(_) => None,
-                    Err(error) => Some(Err(error)),
-                })
-                .transpose()?
-                .ok_or_else(|| state_indeterminate("ebpf_generation_identity"))
-        }
-
-        fn live_hook_program_tag(
-            ifindex: u32,
-            name: &str,
-            attach_type: TcAttachType,
-            tc_priority: u16,
-        ) -> Result<Option<u64>, GtpuError> {
-            let Some(owner) = slot_owner(ifindex, attach_type, tc_priority)? else {
-                return Ok(None);
-            };
-            let Some(program_id) = Self::sdk_hook_program_id(&owner, name)? else {
-                return Ok(None);
-            };
-            let programs = loaded_programs().map(|result| {
-                result
-                    .map(|info| (info.id(), info.tag()))
-                    .map_err(|error| program_error("ebpf_generation_identity", &error))
-            });
-            let tag = Self::required_loaded_program_tag(program_id, programs)?;
-            Ok(Some(tag))
-        }
-
-        /// Name the generation of the live SDK datapath on this device, if any.
-        ///
-        /// Reads only kernel state: one tc filter dump per hook and the program
-        /// listing. Nothing is created, removed or written.
-        fn classify_live_generation(
+        /// Inventory every SDK-named program attached to either clsact hook.
+        /// The all-protocol dumps retain placement evidence for the later
+        /// current-graph check; foreign-named programs remain the exact-slot
+        /// ownership guard's concern.
+        fn live_sdk_programs(
             ifindex: u32,
             tc_priority: u16,
-        ) -> Result<Option<Generation>, GtpuError> {
-            let uplink = Self::live_hook_program_tag(
+        ) -> Result<Vec<SdkProgramOccupant>, GtpuError> {
+            let mut occupants = sdk_filter_occupants(ifindex, TcAttachType::Ingress, tc_priority)?;
+            occupants.extend(sdk_filter_occupants(
                 ifindex,
-                PROG_UPLINK,
                 TcAttachType::Egress,
                 tc_priority,
-            )?;
-            let downlink = Self::live_hook_program_tag(
-                ifindex,
-                PROG_DOWNLINK,
-                TcAttachType::Ingress,
-                tc_priority,
-            )?;
-            if uplink.is_none() && downlink.is_none() {
-                // Nothing of ours is live. Deriving offline tags here would
-                // make an attach onto an empty device depend on BTF being
-                // readable, for an answer with nothing to compare against.
-                return Ok(None);
-            }
-            Ok(Self::datapath_generation_tags()?.classify(uplink, downlink))
+            )?);
+            occupants.sort_unstable();
+            Ok(occupants)
         }
 
-        /// Refuse before pin-graph or forwarding-state mutation when a live
-        /// hook runs an older or unrecognised datapath generation.
+        /// Refuse before pin-graph or forwarding-state mutation unless every
+        /// SDK-named filter on the device is a current program with complete
+        /// kernel identity evidence.
         ///
         /// Hook replacement requires exact program-tag equality, so an older
         /// generation can never be replaced in place: this attach is going to
@@ -7571,18 +7708,84 @@ mod aya_runtime {
             ifindex: u32,
             tc_priority: u16,
             operation: &'static str,
+            pins_preexisted: bool,
+        ) -> Result<Vec<CurrentSdkProgram>, GtpuError> {
+            let occupants = Self::live_sdk_programs(ifindex, tc_priority)?;
+            if occupants.is_empty() {
+                // Do not make an empty device depend on offline BTF/tag
+                // derivation or global program-listing permissions.
+                return Ok(Vec::new());
+            }
+            let loaded = loaded_programs()
+                .map(|result| result.map_err(|_| state_indeterminate("ebpf_generation_identity")))
+                .collect::<Result<Vec<_>, _>>()?;
+            let loaded_tags = loaded
+                .iter()
+                .map(|program| (program.id(), program.tag()))
+                .collect::<Vec<_>>();
+            let generation = Self::datapath_generation_tags()?
+                .classify_occupants(&occupants, &loaded_tags)
+                .map_err(|_| state_indeterminate("ebpf_generation_identity"))?;
+            if let Some(observed) = generation.and_then(Generation::refusal) {
+                return Err(GtpuError::DatapathGenerationMismatch {
+                    operation,
+                    observed,
+                    expected: EbpfDatapathGeneration::Current,
+                });
+            }
+            validate_current_program_placement(&occupants, tc_priority)
+                .map_err(|_| GtpuError::AlreadyExists)?;
+            if !pins_preexisted {
+                // A current hook without a retained pin namespace is somebody
+                // else's graph; publishing pins cannot establish ownership.
+                return Err(GtpuError::AlreadyExists);
+            }
+
+            let mut current = Vec::with_capacity(occupants.len());
+            for occupant in occupants {
+                let program_id = occupant
+                    .program_id
+                    .ok_or_else(|| state_indeterminate("ebpf_generation_identity"))?;
+                let mut matches = loaded.iter().filter(|program| program.id() == program_id);
+                let program = matches
+                    .next()
+                    .ok_or_else(|| state_indeterminate("ebpf_generation_identity"))?;
+                if matches.next().is_some()
+                    || program.name() != kernel_program_name(occupant.program.name())
+                    || program.program_type() != bpf_prog_type::BPF_PROG_TYPE_SCHED_CLS
+                {
+                    return Err(state_indeterminate("ebpf_generation_identity"));
+                }
+                let mut map_ids = program
+                    .map_ids()
+                    .map_err(|_| state_indeterminate("ebpf_generation_identity"))?
+                    .ok_or_else(|| state_indeterminate("ebpf_generation_identity"))?;
+                map_ids.sort_unstable();
+                if map_ids.windows(2).any(|pair| pair[0] == pair[1]) {
+                    return Err(state_indeterminate("ebpf_generation_identity"));
+                }
+                current.push(CurrentSdkProgram { occupant, map_ids });
+            }
+            Ok(current)
+        }
+
+        fn require_current_program_pin_graph(
+            programs: &[CurrentSdkProgram],
+            pin_dir: &Path,
         ) -> Result<(), GtpuError> {
-            let observed = match Self::classify_live_generation(ifindex, tc_priority)?
-                .and_then(Generation::refusal)
-            {
-                None => return Ok(()),
-                Some(observed) => observed,
-            };
-            Err(GtpuError::DatapathGenerationMismatch {
-                operation,
-                observed,
-                expected: EbpfDatapathGeneration::Current,
-            })
+            if programs.is_empty() {
+                return Ok(());
+            }
+            for program in programs {
+                let names: &[&str] = match program.occupant.program {
+                    SdkDatapathProgram::Uplink => &CURRENT_UPLINK_PROGRAM_MAP_NAMES,
+                    SdkDatapathProgram::Downlink => &CURRENT_DOWNLINK_PROGRAM_MAP_NAMES,
+                };
+                let named = Self::required_named_program_map_ids(pin_dir, names)?;
+                validate_current_program_map_graph(program, named.as_deref())
+                    .map_err(|_| GtpuError::AlreadyExists)?;
+            }
+            Ok(())
         }
 
         /// Read the retained IPv4 ownership record straight from its pin.
@@ -8948,47 +9151,13 @@ mod aya_runtime {
                     ebpf,
                     pin_dir,
                     PROG_UPLINK,
-                    &[
-                        MAP_UPLINK_FAR,
-                        MAP_UPLINK_MARK_FAR,
-                        MAP_UPLINK_DSCP,
-                        MAP_UPLINK_MARK_DSCP,
-                        MAP_UPLINK_SOURCE_PORT,
-                        MAP_UPLINK_MARK_SOURCE_PORT,
-                        MAP_UPLINK_PMTU,
-                        MAP_UPLINK_PMTU_COUNTERS,
-                        MAP_DOWNLINK_PDR,
-                        MAP_DOWNLINK_MARK_PDR,
-                        MAP_DOWNLINK_ENDPOINT_BINDING,
-                        MAP_MARKED_BEARER_OWNER,
-                        MAP_COUNTERS,
-                        MAP_CONFIG,
-                        MAP_SESSION_GROUPS,
-                        MAP_SESSION_UPLINK_INDEX,
-                        MAP_CONFIG_IPV6,
-                    ],
+                    &CURRENT_UPLINK_PROGRAM_MAP_NAMES,
                 )?,
                 downlink: Self::program_identity(
                     ebpf,
                     pin_dir,
                     PROG_DOWNLINK,
-                    &[
-                        MAP_DOWNLINK_PDR,
-                        MAP_DOWNLINK_MARK_PDR,
-                        MAP_DOWNLINK_ENDPOINT_BINDING,
-                        MAP_UPLINK_FAR,
-                        MAP_UPLINK_MARK_FAR,
-                        MAP_UPLINK_DSCP,
-                        MAP_UPLINK_MARK_DSCP,
-                        MAP_UPLINK_SOURCE_PORT,
-                        MAP_UPLINK_MARK_SOURCE_PORT,
-                        MAP_MARKED_BEARER_OWNER,
-                        MAP_COUNTERS,
-                        MAP_DOWNLINK_BINDING_COUNTERS,
-                        MAP_SESSION_GROUPS,
-                        MAP_SESSION_DOWNLINK_INDEX,
-                        MAP_CONFIG_IPV6,
-                    ],
+                    &CURRENT_DOWNLINK_PROGRAM_MAP_NAMES,
                 )?,
                 pins: Self::pinned_map_identity(pin_dir)?,
             })
@@ -10805,6 +10974,8 @@ mod aya_runtime {
     // `tc` stores the Ethernet protocol in network byte order in the low half
     // of `tcm_info`. Aya attaches every SDK classifier with ETH_P_ALL.
     const TC_PROTOCOL_ALL: u16 = 3_u16.to_be();
+    // Linux UAPI `TCA_CHAIN`; absence means the default chain (zero).
+    const TCA_CHAIN: u16 = 11;
 
     /// Return the owner of the tc filter occupying our exact
     /// (hook, priority, handle) slot, or `None` only after a complete dump
@@ -10836,6 +11007,39 @@ mod aya_runtime {
         tc_priority: u16,
         legacy_v2_scan: LegacyV2ProgramScan<'_>,
     ) -> Result<TfilterDumpState, GtpuError> {
+        filter_dump(
+            ifindex,
+            attach_type,
+            tc_priority,
+            Some(TC_PROTOCOL_ALL),
+            legacy_v2_scan,
+        )
+    }
+
+    /// Inventory every SDK-named filter on one clsact hook, independent of
+    /// protocol, priority, or handle.
+    fn sdk_filter_occupants(
+        ifindex: u32,
+        attach_type: TcAttachType,
+        tc_priority: u16,
+    ) -> Result<Vec<SdkProgramOccupant>, GtpuError> {
+        filter_dump(
+            ifindex,
+            attach_type,
+            tc_priority,
+            None,
+            LegacyV2ProgramScan::Disabled,
+        )
+        .map(|state| state.sdk_programs)
+    }
+
+    fn filter_dump(
+        ifindex: u32,
+        attach_type: TcAttachType,
+        tc_priority: u16,
+        protocol: Option<u16>,
+        legacy_v2_scan: LegacyV2ProgramScan<'_>,
+    ) -> Result<TfilterDumpState, GtpuError> {
         const DUMP_SEQUENCE: u32 = 1;
         let socket = sys::open_route_netlink_socket()
             .map_err(|error| GtpuError::io("tc_filter_dump", error))?;
@@ -10857,7 +11061,7 @@ mod aya_runtime {
         request.extend_from_slice(&0_u32.to_ne_bytes()); // tcm_handle: all
         let parent = clsact_parent(attach_type);
         request.extend_from_slice(&parent.to_ne_bytes());
-        request.extend_from_slice(&u32::from(TC_PROTOCOL_ALL).to_ne_bytes());
+        request.extend_from_slice(&u32::from(protocol.unwrap_or(0)).to_ne_bytes());
 
         sys::send_message(&socket, &request)
             .map_err(|error| GtpuError::io("tc_filter_dump", error))?;
@@ -10894,7 +11098,7 @@ mod aya_runtime {
                     port_id: local_port_id,
                     ifindex,
                     parent,
-                    protocol: TC_PROTOCOL_ALL,
+                    protocol,
                     legacy_v2_scan,
                 },
                 &mut state,
@@ -10928,6 +11132,7 @@ mod aya_runtime {
     #[derive(Default)]
     struct TfilterDumpState {
         owner: Option<FilterOwner>,
+        sdk_programs: Vec<SdkProgramOccupant>,
         unexpected_legacy_v2_program_seen: bool,
     }
 
@@ -10944,7 +11149,7 @@ mod aya_runtime {
         port_id: u32,
         ifindex: i32,
         parent: u32,
-        protocol: u16,
+        protocol: Option<u16>,
         legacy_v2_scan: LegacyV2ProgramScan<'a>,
     }
 
@@ -10954,6 +11159,18 @@ mod aya_runtime {
                 return Err(state_indeterminate("ebpf_tc_filter_dump"));
             }
             self.owner = Some(owner);
+            Ok(())
+        }
+
+        fn observe_sdk_program(&mut self, program: SdkProgramOccupant) -> Result<(), GtpuError> {
+            // This is a boundary over attacker-controlled netlink state. A
+            // finite inventory prevents a hostile filter fan-out from turning
+            // one reconciliation attempt into unbounded allocation.
+            const MAX_SDK_PROGRAMS_PER_HOOK: usize = 64;
+            if self.sdk_programs.len() == MAX_SDK_PROGRAMS_PER_HOOK {
+                return Err(state_indeterminate("ebpf_generation_identity"));
+            }
+            self.sdk_programs.push(program);
             Ok(())
         }
     }
@@ -11043,13 +11260,37 @@ mod aya_runtime {
                     if family != 0
                         || response_ifindex != expected.ifindex
                         || parent != expected.parent
-                        || protocol != expected.protocol
+                        || expected
+                            .protocol
+                            .is_some_and(|expected_protocol| protocol != expected_protocol)
                     {
                         return Err(incomplete());
                     }
-                    let owner = bpf_filter_owner(&datagram[body + TCMSG..offset + length]);
+                    let attributes = &datagram[body + TCMSG..offset + length];
+                    let chain = match find_attribute(attributes, TCA_CHAIN) {
+                        None => 0,
+                        Some(value) if value.len() == 4 => {
+                            u32::from_ne_bytes([value[0], value[1], value[2], value[3]])
+                        }
+                        Some(_) => return Err(malformed()),
+                    };
+                    let owner = bpf_filter_owner(attributes);
                     if let Some(owner) = &owner {
                         let name = owner.name.as_bytes();
+                        if expected.protocol.is_none() {
+                            if let Some(program) = SdkDatapathProgram::from_filter_name(&owner.name)
+                            {
+                                state.observe_sdk_program(SdkProgramOccupant {
+                                    program,
+                                    parent,
+                                    chain,
+                                    protocol,
+                                    priority,
+                                    handle,
+                                    program_id: owner.program_id,
+                                })?;
+                            }
+                        }
                         let is_legacy_v2_name = [PROG_UPLINK, PROG_DOWNLINK]
                             .into_iter()
                             .any(|candidate| name == kernel_program_name(candidate));
@@ -11066,7 +11307,10 @@ mod aya_runtime {
                             state.unexpected_legacy_v2_program_seen = true;
                         }
                     }
-                    if handle == u32::from(TC_HANDLE) && priority == tc_priority {
+                    if expected.protocol == Some(protocol)
+                        && handle == u32::from(TC_HANDLE)
+                        && priority == tc_priority
+                    {
                         if let Some(owner) = owner {
                             state.observe_owner(owner)?;
                         } else {
@@ -11185,12 +11429,18 @@ mod aya_runtime {
             // directory that `canonical_pin_dir` would create; every later
             // guard needs a canonical path to read pins from, and in any
             // scenario those guards can refuse, the directory already exists.
-            Self::require_no_foreign_generation(ifindex, tc_priority, "ebpf_attach")?;
+            let current_programs = Self::require_no_foreign_generation(
+                ifindex,
+                tc_priority,
+                "ebpf_attach",
+                pins_preexisted,
+            )?;
             let canonical_pin_dir =
                 Self::canonical_pin_dir(&reconciler_ownership.canonical_pin_dir)?;
             if canonical_pin_dir != reconciler_ownership.canonical_pin_dir {
                 return Err(state_indeterminate("ebpf_pin_dir_identity"));
             }
+            Self::require_current_program_pin_graph(&current_programs, &canonical_pin_dir)?;
             Self::classify_pinned_map_layout(&canonical_pin_dir)?;
             Self::require_current_pin_capacity(&canonical_pin_dir)?;
             let schema_state = Self::bearer_schema_preflight(&canonical_pin_dir)?;
@@ -11381,12 +11631,18 @@ mod aya_runtime {
             let pins_preexisted = reconciler_ownership.canonical_pin_dir.is_dir();
             // Same read-only prologue as `attach`: refuse an older live
             // generation and a foreign pin ABI before anything is published.
-            Self::require_no_foreign_generation(ifindex, tc_priority, "ebpf_attach_grouped")?;
+            let current_programs = Self::require_no_foreign_generation(
+                ifindex,
+                tc_priority,
+                "ebpf_attach_grouped",
+                pins_preexisted,
+            )?;
             let canonical_pin_dir =
                 Self::canonical_pin_dir(&reconciler_ownership.canonical_pin_dir)?;
             if canonical_pin_dir != reconciler_ownership.canonical_pin_dir {
                 return Err(state_indeterminate("ebpf_pin_dir_identity"));
             }
+            Self::require_current_program_pin_graph(&current_programs, &canonical_pin_dir)?;
             Self::classify_pinned_map_layout(&canonical_pin_dir)?;
             Self::require_current_pin_capacity(&canonical_pin_dir)?;
             let bearer_state = Self::bearer_schema_preflight(&canonical_pin_dir)?;
@@ -11594,7 +11850,9 @@ mod aya_runtime {
             // whatever the pins already record. That makes the generation and
             // ABI guards the only pre-load protection it has, so they must run
             // here too rather than being treated as an attach-only concern.
-            Self::require_no_foreign_generation(ifindex, tc_priority, "ebpf_adopt")?;
+            let current_programs =
+                Self::require_no_foreign_generation(ifindex, tc_priority, "ebpf_adopt", true)?;
+            Self::require_current_program_pin_graph(&current_programs, &canonical_pin_dir)?;
             Self::classify_pinned_map_layout(&canonical_pin_dir)?;
             Self::require_current_pin_capacity(&canonical_pin_dir)?;
             let schema_state = Self::bearer_schema_preflight(&canonical_pin_dir)?;
@@ -14657,46 +14915,7 @@ mod aya_runtime {
             }
         }
 
-        #[test]
-        fn sdk_named_generation_owner_without_program_id_fails_closed() {
-            let missing_id = FilterOwner {
-                name: PROG_UPLINK.to_owned(),
-                program_id: None,
-            };
-            assert!(matches!(
-                AyaGtpuRuntime::sdk_hook_program_id(&missing_id, PROG_UPLINK),
-                Err(GtpuError::StateIndeterminate {
-                    operation: "ebpf_generation_identity"
-                })
-            ));
-
-            let foreign = FilterOwner {
-                name: "foreign_classifier".to_owned(),
-                program_id: None,
-            };
-            assert_eq!(
-                AyaGtpuRuntime::sdk_hook_program_id(&foreign, PROG_UPLINK)
-                    .expect("a foreign hook is not a generation question"),
-                None
-            );
-        }
-
-        #[test]
-        fn generation_program_id_absent_from_loaded_listing_fails_closed() {
-            let listing = [Ok((17, 0x1111)), Ok((19, 0x2222))];
-            assert!(matches!(
-                AyaGtpuRuntime::required_loaded_program_tag(18, listing),
-                Err(GtpuError::StateIndeterminate {
-                    operation: "ebpf_generation_identity"
-                })
-            ));
-        }
-
-        /// Every hook this build can identify is named. Only current hooks are
-        /// admitted; every older or unknown instruction stream must produce
-        /// explicit refusal evidence before the loader publishes a map.
-        #[test]
-        fn generation_classification_names_every_refusal() {
+        fn synthetic_generation_tags() -> DatapathGenerationTags {
             let pair = |base: u64| {
                 (
                     LegacyV2ProgramTags {
@@ -14709,11 +14928,63 @@ mod aya_runtime {
                     },
                 )
             };
-            let tags = DatapathGenerationTags {
+            DatapathGenerationTags {
                 current: pair(0x10),
                 legacy_v1: pair(0x20),
                 pre_redirect: pair(0x30),
-            };
+            }
+        }
+
+        fn synthetic_occupant(
+            program: SdkDatapathProgram,
+            program_id: Option<u32>,
+        ) -> SdkProgramOccupant {
+            SdkProgramOccupant {
+                program,
+                parent: program.expected_parent(),
+                chain: 0,
+                protocol: TC_PROTOCOL_ALL,
+                priority: crate::ebpf::DEFAULT_TC_PRIORITY,
+                handle: u32::from(TC_HANDLE),
+                program_id,
+            }
+        }
+
+        #[test]
+        fn sdk_named_generation_owner_without_program_id_fails_closed() {
+            let missing_id = synthetic_occupant(SdkDatapathProgram::Uplink, None);
+            assert_eq!(
+                synthetic_generation_tags().classify_occupants(&[missing_id], &[(17, 0x10)]),
+                Err(GenerationIdentityEvidenceError)
+            );
+            assert_eq!(
+                SdkDatapathProgram::from_filter_name("foreign_classifier"),
+                None,
+                "a foreign hook is not a generation question"
+            );
+        }
+
+        #[test]
+        fn generation_program_id_absent_from_loaded_listing_fails_closed() {
+            let occupant = synthetic_occupant(SdkDatapathProgram::Uplink, Some(18));
+            let tags = synthetic_generation_tags();
+            assert_eq!(
+                tags.classify_occupants(std::slice::from_ref(&occupant), &[(17, 0x10), (19, 0x11)]),
+                Err(GenerationIdentityEvidenceError)
+            );
+            assert_eq!(
+                tags.classify_occupants(&[occupant], &[(18, 0x10), (18, 0x10)]),
+                Err(GenerationIdentityEvidenceError),
+                "duplicate listing evidence is ambiguous"
+            );
+        }
+
+        /// Every hook this build can identify is named. Only current hooks are
+        /// admitted; every older or unknown instruction stream must produce
+        /// explicit refusal evidence before the loader publishes a map.
+        #[test]
+        fn generation_classification_names_every_refusal() {
+            let tags = synthetic_generation_tags();
 
             assert_eq!(Generation::Current.refusal(), None);
             assert_eq!(
@@ -14733,76 +15004,126 @@ mod aya_runtime {
                 Some(EbpfDatapathGeneration::Unrecognized)
             );
 
-            // An empty device has no generation question to answer.
-            assert_eq!(tags.classify(None, None), None);
+            assert_eq!(tags.classify_occupants(&[], &[]), Ok(None));
 
-            // Either kernel tag algorithm is an equally exact match.
-            for (uplink, downlink, expected) in [
+            let uplink = synthetic_occupant(SdkDatapathProgram::Uplink, Some(1));
+            let downlink = synthetic_occupant(SdkDatapathProgram::Downlink, Some(2));
+            for (uplink_tag, downlink_tag, expected) in [
                 (0x10, 0x12, Generation::Current),
                 (0x11, 0x13, Generation::Current),
                 (0x20, 0x22, Generation::LegacyV1),
                 (0x30, 0x32, Generation::PreRedirect),
                 (0x31, 0x33, Generation::PreRedirect),
+                (0x10, 0x32, Generation::PreRedirect),
+                (0x30, 0x22, Generation::LegacyV1),
+                (0x10, 0x99, Generation::Unrecognized),
             ] {
                 assert_eq!(
-                    tags.classify(Some(uplink), Some(downlink)),
-                    Some(expected),
-                    "uplink {uplink:#x} downlink {downlink:#x}"
+                    tags.classify_occupants(
+                        &[uplink.clone(), downlink.clone()],
+                        &[(1, uplink_tag), (2, downlink_tag)]
+                    ),
+                    Ok(Some(expected)),
+                    "uplink {uplink_tag:#x} downlink {downlink_tag:#x}"
                 );
             }
 
-            // One occupied hook is enough to name a generation; the empty slot
-            // constrains nothing.
+            // A single occupied hook is sufficient evidence.
             assert_eq!(
-                tags.classify(Some(0x30), None),
-                Some(Generation::PreRedirect)
+                tags.classify_occupants(&[uplink], &[(1, 0x30)]),
+                Ok(Some(Generation::PreRedirect))
+            );
+        }
+
+        #[test]
+        fn multiple_sdk_occupants_are_classified_deterministically() {
+            let tags = synthetic_generation_tags();
+            let current = synthetic_occupant(SdkDatapathProgram::Uplink, Some(1));
+            let historical = synthetic_occupant(SdkDatapathProgram::Downlink, Some(2));
+            let unknown = synthetic_occupant(SdkDatapathProgram::Uplink, Some(3));
+            let listing = [(1, 0x10), (2, 0x32), (3, 0x99)];
+
+            for occupants in [
+                vec![current.clone(), historical.clone(), unknown.clone()],
+                vec![unknown.clone(), current.clone(), historical.clone()],
+                vec![historical.clone(), unknown.clone(), current.clone()],
+            ] {
+                assert_eq!(
+                    tags.classify_occupants(&occupants, &listing),
+                    Ok(Some(Generation::Unrecognized)),
+                    "the strictest refusal must not depend on dump ordering"
+                );
+            }
+
+            let missing = synthetic_occupant(SdkDatapathProgram::Uplink, None);
+            assert_eq!(
+                tags.classify_occupants(&[missing, historical], &listing),
+                Ok(Some(Generation::PreRedirect)),
+                "positive historical evidence must dominate a current-placement question"
+            );
+        }
+
+        #[test]
+        fn current_duplicates_and_wrong_map_graphs_are_conflicts() {
+            let priority = crate::ebpf::DEFAULT_TC_PRIORITY;
+            let uplink = CurrentSdkProgram {
+                occupant: synthetic_occupant(SdkDatapathProgram::Uplink, Some(1)),
+                map_ids: vec![1, 2],
+            };
+            let downlink = CurrentSdkProgram {
+                occupant: synthetic_occupant(SdkDatapathProgram::Downlink, Some(2)),
+                map_ids: vec![2, 3],
+            };
+            assert_eq!(
+                validate_current_program_placement(
+                    &[uplink.occupant.clone(), downlink.occupant.clone()],
+                    priority
+                ),
+                Ok(())
             );
             assert_eq!(
-                tags.classify(None, Some(0x32)),
-                Some(Generation::PreRedirect)
+                validate_current_program_map_graph(&uplink, Some(&[1, 2])),
+                Ok(())
+            );
+            assert_eq!(
+                validate_current_program_map_graph(&downlink, Some(&[2, 3])),
+                Ok(())
             );
 
-            // A tag from no known generation is never read as "probably
-            // current".
+            let mut extra = uplink.occupant.clone();
+            extra.priority += 1;
+            for programs in [
+                vec![
+                    uplink.occupant.clone(),
+                    extra.clone(),
+                    downlink.occupant.clone(),
+                ],
+                vec![downlink.occupant.clone(), extra, uplink.occupant.clone()],
+            ] {
+                assert_eq!(
+                    validate_current_program_placement(&programs, priority),
+                    Err(CurrentProgramGraphConflict),
+                    "a duplicate outside the desired slot must conflict in any order"
+                );
+            }
+            let mut nondefault_chain = downlink.occupant.clone();
+            nondefault_chain.chain = 1;
             assert_eq!(
-                tags.classify(Some(0x99), Some(0x9a)),
-                Some(Generation::Unrecognized)
+                validate_current_program_placement(
+                    &[uplink.occupant.clone(), nondefault_chain],
+                    priority
+                ),
+                Err(CurrentProgramGraphConflict)
             );
-            // Hooks are judged independently, and the least replaceable one
-            // governs. A pair split across two generations still refuses, but
-            // it is named for the generation that actually blocks the attach
-            // rather than being reported as unrecognised.
+
             assert_eq!(
-                tags.classify(Some(0x10), Some(0x32)),
-                Some(Generation::PreRedirect)
+                validate_current_program_map_graph(&uplink, Some(&[1, 9])),
+                Err(CurrentProgramGraphConflict)
             );
             assert_eq!(
-                tags.classify(Some(0x30), Some(0x12)),
-                Some(Generation::PreRedirect),
-                "the blocking hook governs whichever slot it occupies"
-            );
-            // A host interrupted while replacing an old datapath can expose
-            // one current and one historical hook. The historical hook governs
-            // the refusal whichever slot it occupies; neither ordering may be
-            // mistaken for an all-current datapath.
-            assert_eq!(
-                tags.classify(Some(0x10), Some(0x22)),
-                Some(Generation::LegacyV1)
-            );
-            assert_eq!(
-                tags.classify(Some(0x20), Some(0x12)),
-                Some(Generation::LegacyV1)
-            );
-            // When both hooks are historical, the older named generation
-            // governs the diagnostic.
-            assert_eq!(
-                tags.classify(Some(0x30), Some(0x22)),
-                Some(Generation::LegacyV1)
-            );
-            // An unknown hook still governs, whatever its partner is.
-            assert_eq!(
-                tags.classify(Some(0x10), Some(0x99)),
-                Some(Generation::Unrecognized)
+                validate_current_program_map_graph(&uplink, None),
+                Err(CurrentProgramGraphConflict),
+                "a current hook without a named graph is already owned elsewhere"
             );
         }
 
@@ -15301,7 +15622,7 @@ mod aya_runtime {
                     port_id: TEST_DUMP_PORT_ID,
                     ifindex: TEST_DUMP_IFINDEX,
                     parent: TEST_DUMP_PARENT,
-                    protocol: TC_PROTOCOL_ALL,
+                    protocol: Some(TC_PROTOCOL_ALL),
                     legacy_v2_scan: LegacyV2ProgramScan::Disabled,
                 },
                 state,
@@ -15334,6 +15655,68 @@ mod aya_runtime {
             let owner = state.owner.expect("exact-slot owner");
             assert_eq!(owner.name, "<non-bpf-filter>");
             assert_eq!(owner.program_id, None);
+        }
+
+        #[test]
+        fn all_protocol_dump_records_sdk_programs_outside_the_exact_slot() {
+            const ALT_HANDLE: u32 = 2;
+            const ALT_PRIORITY: u16 = crate::ebpf::DEFAULT_TC_PRIORITY + 1;
+            const ALT_PROTOCOL: u16 = 0x0800_u16.to_be();
+            const ALT_CHAIN: u32 = 7;
+
+            let mut message = filter_dump_message(
+                sys::NLM_F_MULTI,
+                TEST_DUMP_SEQUENCE,
+                TEST_DUMP_PORT_ID,
+                Some((PROG_DOWNLINK, 73)),
+            );
+            const NETLINK_HEADER: usize = 16;
+            message[NETLINK_HEADER + 8..NETLINK_HEADER + 12]
+                .copy_from_slice(&ALT_HANDLE.to_ne_bytes());
+            message[NETLINK_HEADER + 16..NETLINK_HEADER + 20].copy_from_slice(
+                &((u32::from(ALT_PRIORITY) << 16) | u32::from(ALT_PROTOCOL)).to_ne_bytes(),
+            );
+            let length =
+                u32::from_ne_bytes(message[..4].try_into().expect("netlink message length"))
+                    as usize;
+            message.truncate(length);
+            message.extend_from_slice(&dump_attribute(TCA_CHAIN, &ALT_CHAIN.to_ne_bytes()));
+            let length = u32::try_from(message.len()).expect("bounded netlink message");
+            message[..4].copy_from_slice(&length.to_ne_bytes());
+            let mut state = TfilterDumpState::default();
+            assert!(matches!(
+                parse_tfilter_dump(
+                    &message,
+                    crate::ebpf::DEFAULT_TC_PRIORITY,
+                    TfilterDumpExpectation {
+                        sequence: TEST_DUMP_SEQUENCE,
+                        port_id: TEST_DUMP_PORT_ID,
+                        ifindex: TEST_DUMP_IFINDEX,
+                        parent: TEST_DUMP_PARENT,
+                        protocol: None,
+                        legacy_v2_scan: LegacyV2ProgramScan::Disabled,
+                    },
+                    &mut state,
+                )
+                .unwrap(),
+                DumpOutcome::More
+            ));
+            assert_eq!(
+                state.owner, None,
+                "inventory dumps do not prove exact ownership"
+            );
+            assert_eq!(
+                state.sdk_programs,
+                vec![SdkProgramOccupant {
+                    program: SdkDatapathProgram::Downlink,
+                    parent: TEST_DUMP_PARENT,
+                    chain: ALT_CHAIN,
+                    protocol: ALT_PROTOCOL,
+                    priority: ALT_PRIORITY,
+                    handle: ALT_HANDLE,
+                    program_id: Some(73),
+                }]
+            );
         }
 
         #[test]
@@ -15527,7 +15910,7 @@ mod aya_runtime {
                             port_id: TEST_DUMP_PORT_ID,
                             ifindex: TEST_DUMP_IFINDEX,
                             parent: TEST_DUMP_PARENT,
-                            protocol: TC_PROTOCOL_ALL,
+                            protocol: Some(TC_PROTOCOL_ALL),
                             legacy_v2_scan: LegacyV2ProgramScan::AllowExact(expected_name),
                         },
                         &mut state,
@@ -15561,7 +15944,7 @@ mod aya_runtime {
                             port_id: TEST_DUMP_PORT_ID,
                             ifindex: TEST_DUMP_IFINDEX,
                             parent: TEST_DUMP_PARENT,
-                            protocol: TC_PROTOCOL_ALL,
+                            protocol: Some(TC_PROTOCOL_ALL),
                             legacy_v2_scan: LegacyV2ProgramScan::AllowExact(expected_name),
                         },
                         &mut state,
@@ -15613,7 +15996,7 @@ mod aya_runtime {
                             port_id: TEST_DUMP_PORT_ID,
                             ifindex: TEST_DUMP_IFINDEX,
                             parent: TEST_DUMP_PARENT,
-                            protocol: TC_PROTOCOL_ALL,
+                            protocol: Some(TC_PROTOCOL_ALL),
                             legacy_v2_scan: LegacyV2ProgramScan::AllowExact(PROG_UPLINK),
                         },
                         &mut state,
@@ -15661,7 +16044,7 @@ mod aya_runtime {
                             port_id: TEST_DUMP_PORT_ID,
                             ifindex: TEST_DUMP_IFINDEX,
                             parent: TEST_DUMP_PARENT,
-                            protocol: TC_PROTOCOL_ALL,
+                            protocol: Some(TC_PROTOCOL_ALL),
                             legacy_v2_scan: LegacyV2ProgramScan::RequireAbsent,
                         },
                         &mut state,

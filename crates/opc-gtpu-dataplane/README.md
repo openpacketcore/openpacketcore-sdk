@@ -1213,17 +1213,40 @@ The frozen v1 and pre-redirect artifacts both carry six-slot counter maps, so
 their authentic retained graphs require drained reprovisioning rather than
 automatic migration.
 
-**Program generation.** Replacing a hook in place requires exact program-tag
-equality, because the replacement is a single `RTM_NEWTFILTER` against the
-existing filter rather than a detach followed by an attach. A live hook running
-an older generation can never satisfy that. Before pin-graph or
-forwarding-state mutation, the loader reads the tag of each SDK-named hook
-occupant and compares it against tags derived offline from the objects it
-carries. If the occupant is a recognised older generation, or carries an SDK
-program name whose tag matches no generation this build can name, the attach
-fails with
-`GtpuError::DatapathGenerationMismatch`, naming the observed and expected
-generation.
+**Program generation and graph identity.** Replacing a hook in place requires
+exact program-tag equality, because the replacement is a single
+`RTM_NEWTFILTER` against the existing filter rather than a detach followed by
+an attach. A live hook running an older generation can never satisfy that.
+Before pin-graph or forwarding-state mutation, the loader completes both
+clsact ingress and egress filter dumps and inventories every SDK-named
+occupant on either hook at any protocol, priority, handle or chain. Each
+occupant retains that complete placement identity, so an off-slot duplicate
+cannot hide behind an empty or current configured slot.
+
+Each tc program ID is then correlated with one unambiguous entry from a
+complete loaded-program listing. Its tag is compared against tags derived
+offline from the objects this build carries. A recognised historical
+generation, or an SDK-named program whose tag matches no generation this build
+can name, fails with `GtpuError::DatapathGenerationMismatch`, naming the
+observed and expected generation. Positive historical or unrecognised evidence
+takes precedence over every current-generation placement or pin-graph
+conflict, so dump order cannot change the refusal.
+
+When all observed SDK programs are current, each must be the sole instance of
+its ingress or egress SDK program role and occupy its configured parent,
+Ethernet protocol, priority, handle and default chain. An extra or misplaced
+current program returns `GtpuError::AlreadyExists`. A current program whose
+exact required pin paths are all conclusively absent does too: creating new pin
+names cannot prove ownership of maps already bound to a live program.
+
+For each exactly placed current program, the loader reads its complete kernel
+map-ID set and independently opens every exact required named pin for that
+program. The two complete, duplicate-free ID sets must be equal before any map
+value is read through a typed binding. A complete but different graph returns
+`GtpuError::AlreadyExists`. Any missing or ambiguous program identity,
+incomplete loaded-program listing, nonempty proper subset of the required pins,
+or unreadable named pin graph returns `GtpuError::StateIndeterminate` with
+operation `ebpf_generation_identity`.
 
 That refusal removes no pin, creates no pin, writes no policy or config, and
 replaces no hook, and `create_device`, `resolve_device` and

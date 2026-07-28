@@ -613,10 +613,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Refusing before that migration keeps the graph exactly as it was found, so a
   drained reprovision still resolves it. The cost is stated plainly: an upgrade
   that grows a counter slot now needs a drained reprovision where it previously
-  succeeded and miscounted. The generation guard reads the program tag of each
-  SDK-named hook occupant and compares it against tags derived offline from the
-  frozen objects the crate carries, refusing with the new
-  `GtpuError::DatapathGenerationMismatch { operation, observed, expected }`.
+  succeeded and miscounted. The generation guard completes both clsact ingress
+  and egress filter dumps and inventories every SDK-named occupant on either
+  hook at any protocol, priority, handle or chain. It correlates each tc
+  program ID with a complete loaded-program listing and compares the resulting
+  tags against tags derived offline from the frozen objects the crate carries.
+  A recognised historical or unrecognised generation refuses with
+  `GtpuError::DatapathGenerationMismatch { operation, observed, expected }`;
+  that positive refusal evidence takes precedence over every
+  current-generation placement or pin-graph conflict. If every occupant is
+  current, each must be the sole instance of its SDK program role in the
+  configured protocol/priority/handle/default-chain slot. An extra or misplaced
+  current occupant, a current occupant whose exact required pin paths are all
+  conclusively absent, or a complete named graph whose map IDs differ from that
+  program's complete kernel map-ID set returns `GtpuError::AlreadyExists`.
+  Any missing or ambiguous program identity, incomplete loaded-program listing,
+  nonempty proper subset of required pins, or unreadable named pin graph returns
+  `GtpuError::StateIndeterminate` with operation
+  `ebpf_generation_identity`. For an admitted exact-slot current program, the
+  complete program map-ID set must equal the IDs opened from its exact required
+  named pins before any map value is read through a typed binding.
   The refusal removes no pin, creates no pin, writes no policy or config and
   replaces no hook, so the documented drained reprovision still works after any
   number of refused attempts; `create_device`, `resolve_device` and
