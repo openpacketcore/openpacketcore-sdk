@@ -37,7 +37,11 @@
 //! Identifier that was sent, as RFC 1661 5.3 requires; a malformed `0x8021`
 //! unit is discarded on its own and leaves following containers standing, while
 //! IPCP after a registered network-to-MS container is discarded as out of
-//! order. The IPv4 Link MTU container `0x0010` is carried in both directions.
+//! order. [`PcoAddressConfiguration::validate_network_contents_ipcp_syntax`]
+//! is the separate allocation-free, Identifier-free gate that checks every
+//! bounded IPCP packet, including units those configuration-use rules discard,
+//! and returns no address or packet material. The IPv4 Link MTU container
+//! `0x0010` is carried in both directions.
 //! Product code remains responsible for deciding when optional policy-owned
 //! values apply and for obtaining them from AAA/HSS or local configuration.
 //! S2b Modify Bearer uses the UE-initiated IPsec tunnel-update profile:

@@ -8,6 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Bounded IPCP syntax validation in PCO/APCO — `opc-proto-gtpv2c`:**
+  `PcoAddressConfiguration::validate_network_contents_ipcp_syntax` traverses
+  the same bounded PCO framing cursor as address decode and checks the RFC 1661
+  header and applicable Configuration Option framing of every `0x8021` unit.
+  It therefore reports the existing exact `PcoDecodeError` even when an
+  uncorrelated Configure-Nak or a Nak after the additional-parameters boundary
+  would be discarded before its body is inspected for configuration use. The
+  allocation-free result is only `()`, never an Identifier, address, or packet
+  byte. Syntax success does not weaken correlation or list ordering:
+  `NoOutstandingRequest`, `IdentifierMismatch`, and
+  `AfterAdditionalParameters` retain their existing precedence, and no
+  IPCP-supplied DNS is adopted. Parsing remains capped at 64 one-octet-length
+  units; Configuration codes 1 through 4 validate options, other codes validate
+  only their common header/Length, and RFC 1661 padding outside the declared
+  packet Length stays outside validation.
 - **Opaque SWm Class replay on access-client RAA — `opc-proto-diameter`:**
   `SwmClassAvps` can now clone or move retained ordered RFC 6733 Class state
   into a typed `SwmReAuthAnswer`, replacing only existing IETF Class

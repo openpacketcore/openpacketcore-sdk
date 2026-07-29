@@ -661,6 +661,326 @@ fn the_uncorrelated_entry_point_never_surfaces_ipcp_dns() {
 }
 
 #[test]
+fn syntax_validation_reaches_naks_hidden_by_configuration_disposition() {
+    // One Configure-Nak whose option Length is below RFC 1661's two-octet
+    // minimum. The configuration decoder must preserve its historical
+    // correlation/order precedence, while the separate validator must inspect
+    // the packet body without needing an Identifier.
+    let malformed_unit = [
+        0x80, 0x21, 0x06, // IPCP unit, contents length 6
+        0x03, 0x5a, 0x00, 0x06, // Configure-Nak, Identifier, packet Length
+        0x81, 0x01, // invalid Configuration Option Length
+    ];
+
+    let mut uncorrelated = vec![0x80];
+    uncorrelated.extend_from_slice(&malformed_unit);
+    assert_eq!(
+        PcoAddressConfiguration::validate_network_contents_ipcp_syntax(&uncorrelated),
+        Err(PcoDecodeError::IpcpOptionLengthInvalid)
+    );
+    let decoded = PcoAddressConfiguration::decode_network_contents_correlated(
+        &uncorrelated,
+        IpcpNakCorrelation::none(),
+    )
+    .expect("an uncorrelated Nak remains a unit-local discard");
+    assert_eq!(
+        decoded.ipcp_discards()[0].reason(),
+        PcoIpcpDiscardReason::NoOutstandingRequest
+    );
+    assert!(decoded.configuration().is_empty());
+
+    let stale = PcoAddressConfiguration::decode_network_contents_correlated(
+        &uncorrelated,
+        IpcpNakCorrelation::expecting(0x59),
+    )
+    .expect("a stale Nak remains a unit-local discard");
+    assert_eq!(
+        stale.ipcp_discards()[0].reason(),
+        PcoIpcpDiscardReason::IdentifierMismatch
+    );
+    assert!(stale.configuration().is_empty());
+
+    let mut out_of_order = vec![
+        0x80, //
+        0x00, 0x02, 0x00, // registered additional-parameters container
+    ];
+    out_of_order.extend_from_slice(&malformed_unit);
+    assert_eq!(
+        PcoAddressConfiguration::validate_network_contents_ipcp_syntax(&out_of_order),
+        Err(PcoDecodeError::IpcpOptionLengthInvalid)
+    );
+    let decoded = PcoAddressConfiguration::decode_network_contents_correlated(
+        &out_of_order,
+        IpcpNakCorrelation::expecting(0x5a),
+    )
+    .expect("an out-of-order Nak remains a unit-local discard");
+    assert_eq!(
+        decoded.ipcp_discards()[0].reason(),
+        PcoIpcpDiscardReason::AfterAdditionalParameters
+    );
+    assert!(decoded.configuration().is_empty());
+}
+
+#[test]
+fn syntax_validation_returns_every_existing_ipcp_error_class_exactly() {
+    let cases: &[(&[u8], PcoDecodeError)] = &[
+        (
+            &[0x80, 0x80, 0x21, 0x02, 0xaa, 0xbb],
+            PcoDecodeError::IpcpHeaderTruncated,
+        ),
+        (
+            &[0x80, 0x80, 0x21, 0x04, 0x03, 0x5a, 0x00, 0x03],
+            PcoDecodeError::IpcpLengthInvalid,
+        ),
+        (
+            &[0x80, 0x80, 0x21, 0x05, 0x03, 0x5a, 0x00, 0x05, 0x81],
+            PcoDecodeError::IpcpOptionTruncated,
+        ),
+        (
+            &[0x80, 0x80, 0x21, 0x06, 0x03, 0x5a, 0x00, 0x06, 0x81, 0x01],
+            PcoDecodeError::IpcpOptionLengthInvalid,
+        ),
+        (
+            &[
+                0x80, 0x80, 0x21, 0x09, 0x03, 0x5a, 0x00, 0x09, 0x81, 0x05, 203, 0, 113,
+            ],
+            PcoDecodeError::IpcpDnsOptionLengthInvalid,
+        ),
+    ];
+
+    for (contents, expected) in cases {
+        assert_eq!(
+            PcoAddressConfiguration::validate_network_contents_ipcp_syntax(contents),
+            Err(*expected),
+            "contents {contents:02x?}"
+        );
+    }
+
+    // All four RFC 1661 configuration codes use Configuration Option framing.
+    for code in 0x01..=0x04 {
+        let contents = [0x80, 0x80, 0x21, 0x06, code, 0x5a, 0x00, 0x06, 0x81, 0x01];
+        assert_eq!(
+            PcoAddressConfiguration::validate_network_contents_ipcp_syntax(&contents),
+            Err(PcoDecodeError::IpcpOptionLengthInvalid),
+            "code {code:#04x}"
+        );
+    }
+}
+
+#[test]
+fn syntax_validation_shares_outer_framing_and_traverses_every_unit() {
+    let framing_cases: &[(&[u8], PcoDecodeError)] = &[
+        (&[], PcoDecodeError::Empty),
+        (&[0x00], PcoDecodeError::UnsupportedHeader),
+        (&[0x81], PcoDecodeError::UnsupportedHeader),
+        (
+            &[0x80, 0x80, 0x21],
+            PcoDecodeError::ContainerHeaderTruncated,
+        ),
+        (
+            &[0x80, 0x80, 0x21, 0x05, 0x01, 0x5a, 0x00, 0x04],
+            PcoDecodeError::ContainerLengthOverrun,
+        ),
+    ];
+    for (contents, expected) in framing_cases {
+        assert_eq!(
+            PcoAddressConfiguration::validate_network_contents_ipcp_syntax(contents),
+            Err(*expected),
+            "contents {contents:02x?}"
+        );
+    }
+
+    let good_then_bad = [
+        0x80, //
+        0x80, 0x21, 0x04, 0x01, 0x5a, 0x00, 0x04, // valid empty Request
+        0x80, 0x21, 0x06, 0x03, 0x5a, 0x00, 0x06, 0x81, 0x01, // malformed Nak
+    ];
+    assert_eq!(
+        PcoAddressConfiguration::validate_network_contents_ipcp_syntax(&good_then_bad),
+        Err(PcoDecodeError::IpcpOptionLengthInvalid),
+        "validation must continue past an earlier well-formed IPCP unit"
+    );
+}
+
+#[test]
+fn syntax_validation_keeps_well_formed_uncorrelated_and_out_of_order_naks_dns_inert() {
+    let nak = [
+        0x80, 0x21, 0x10, // IPCP unit, contents length 16
+        0x03, 0x5a, 0x00, 0x10, // Configure-Nak and packet header
+        0x81, 0x06, 203, 0, 113, 53, // Primary DNS
+        0x83, 0x06, 198, 51, 100, 53, // Secondary DNS
+    ];
+
+    let mut uncorrelated = vec![0x80];
+    uncorrelated.extend_from_slice(&nak);
+    let validation = PcoAddressConfiguration::validate_network_contents_ipcp_syntax(&uncorrelated);
+    assert_eq!(validation, Ok(()));
+    assert_eq!(format!("{validation:?}"), "Ok(())");
+    let decoded = PcoAddressConfiguration::decode_network_contents_correlated(
+        &uncorrelated,
+        IpcpNakCorrelation::none(),
+    )
+    .expect("a well-formed uncorrelated Nak is discarded");
+    assert_eq!(
+        decoded.ipcp_discards()[0].reason(),
+        PcoIpcpDiscardReason::NoOutstandingRequest
+    );
+    assert_eq!(decoded.configuration().ipcp_primary_dns, None);
+    assert_eq!(decoded.configuration().ipcp_secondary_dns, None);
+
+    let mut out_of_order = vec![0x80, 0x00, 0x02, 0x00];
+    out_of_order.extend_from_slice(&nak);
+    assert_eq!(
+        PcoAddressConfiguration::validate_network_contents_ipcp_syntax(&out_of_order),
+        Ok(())
+    );
+    let decoded = PcoAddressConfiguration::decode_network_contents_correlated(
+        &out_of_order,
+        IpcpNakCorrelation::expecting(0x5a),
+    )
+    .expect("a well-formed out-of-order Nak is discarded");
+    assert_eq!(
+        decoded.ipcp_discards()[0].reason(),
+        PcoIpcpDiscardReason::AfterAdditionalParameters
+    );
+    assert_eq!(decoded.configuration().ipcp_primary_dns, None);
+    assert_eq!(decoded.configuration().ipcp_secondary_dns, None);
+}
+
+#[test]
+fn syntax_validation_errors_are_payload_free_in_debug_and_display() {
+    // A valid DNS option carries conspicuous address octets before the trailing
+    // malformed option. Neither those bytes nor Identifier 0x5a may enter the
+    // returned error.
+    let contents = [
+        0x80, 0x80, 0x21, 0x0c, //
+        0x03, 0x5a, 0x00, 0x0c, //
+        0x81, 0x06, 203, 0, 113, 53, //
+        0x83, 0x01,
+    ];
+    let error = PcoAddressConfiguration::validate_network_contents_ipcp_syntax(&contents)
+        .expect_err("the trailing option has an invalid Length");
+
+    assert_eq!(format!("{error:?}"), "IpcpOptionLengthInvalid");
+    assert_eq!(error.to_string(), "pco_ipcp_option_length_invalid");
+    assert!(std::error::Error::source(&error).is_none());
+}
+
+#[test]
+fn syntax_validation_is_identical_for_opaque_pco_and_apco_transport() {
+    let value = vec![
+        0x80, 0x80, 0x21, 0x06, //
+        0x03, 0x5a, 0x00, 0x06, //
+        0x81, 0x01,
+    ];
+    let pco = ProtocolConfigurationOptions {
+        value: value.clone(),
+    };
+    let apco = AdditionalProtocolConfigurationOptions { value };
+
+    for contents in [&pco.value, &apco.value] {
+        assert_eq!(
+            PcoAddressConfiguration::validate_network_contents_ipcp_syntax(contents),
+            Err(PcoDecodeError::IpcpOptionLengthInvalid)
+        );
+    }
+}
+
+#[test]
+fn syntax_validation_uses_declared_packet_boundaries_only() {
+    // RFC 1661 padding is outside the packet's declared Length. These padding
+    // octets look like a malformed Configuration Option but are not one.
+    let padded = [
+        0x80, 0x80, 0x21, 0x06, //
+        0x03, 0x5a, 0x00, 0x04, //
+        0x81, 0x01,
+    ];
+    assert_eq!(
+        PcoAddressConfiguration::validate_network_contents_ipcp_syntax(&padded),
+        Ok(())
+    );
+
+    // Code 5 is Terminate-Request. Its Data is not a Configuration Options
+    // field, though its common header and declared Length are still checked.
+    let terminate_request = [
+        0x80, 0x80, 0x21, 0x06, //
+        0x05, 0x5a, 0x00, 0x06, //
+        0x81, 0x01,
+    ];
+    assert_eq!(
+        PcoAddressConfiguration::validate_network_contents_ipcp_syntax(&terminate_request),
+        Ok(())
+    );
+    let bad_terminate_length = [
+        0x80, 0x80, 0x21, 0x04, //
+        0x05, 0x5a, 0x00, 0x40,
+    ];
+    assert_eq!(
+        PcoAddressConfiguration::validate_network_contents_ipcp_syntax(&bad_terminate_length),
+        Err(PcoDecodeError::IpcpLengthInvalid)
+    );
+
+    // Syntax-only validation ignores non-IPCP payload semantics, so a
+    // wrong-length address container cannot mask a later malformed IPCP unit.
+    let address_then_ipcp = [
+        0x80, //
+        0x00, 0x0d, 0x03, 8, 8, 8, //
+        0x80, 0x21, 0x06, 0x03, 0x5a, 0x00, 0x06, 0x81, 0x01,
+    ];
+    assert_eq!(
+        PcoAddressConfiguration::validate_network_contents_ipcp_syntax(&address_then_ipcp),
+        Err(PcoDecodeError::IpcpOptionLengthInvalid)
+    );
+}
+
+#[test]
+fn syntax_validation_enforces_the_shared_deterministic_work_limit() {
+    // Fill the one-octet IPCP unit length exactly: 124 two-octet unknown
+    // options plus one three-octet unknown option make 125 bounded iterations.
+    let mut packet = vec![0x01, 0x5a, 0x00, 0xff];
+    for _ in 0..124 {
+        packet.extend_from_slice(&[0x03, 0x02]);
+    }
+    packet.extend_from_slice(&[0x02, 0x03, 0x00]);
+    assert_eq!(packet.len(), usize::from(u8::MAX));
+
+    let mut unit = vec![0x80, 0x21, u8::MAX];
+    unit.extend_from_slice(&packet);
+    let mut contents = vec![0x80];
+    for _ in 0..PCO_MAX_CONTAINERS {
+        contents.extend_from_slice(&unit);
+    }
+    assert_eq!(
+        PcoAddressConfiguration::validate_network_contents_ipcp_syntax(&contents),
+        Ok(()),
+        "exactly PCO_MAX_CONTAINERS maximal units must fit"
+    );
+
+    contents.extend_from_slice(&unit);
+    assert_eq!(
+        PcoAddressConfiguration::validate_network_contents_ipcp_syntax(&contents),
+        Err(PcoDecodeError::TooManyContainers),
+        "the sixty-fifth unit must be rejected before unbounded work"
+    );
+
+    // The cap counts every length-delimited unit, not only the IPCP packets
+    // whose bodies this operation interprets.
+    let mut non_ipcp_contents = vec![0x80];
+    for _ in 0..PCO_MAX_CONTAINERS {
+        non_ipcp_contents.extend_from_slice(&[0x00, 0xff, 0x00]);
+    }
+    assert_eq!(
+        PcoAddressConfiguration::validate_network_contents_ipcp_syntax(&non_ipcp_contents),
+        Ok(())
+    );
+    non_ipcp_contents.extend_from_slice(&[0x00, 0xff, 0x00]);
+    assert_eq!(
+        PcoAddressConfiguration::validate_network_contents_ipcp_syntax(&non_ipcp_contents),
+        Err(PcoDecodeError::TooManyContainers)
+    );
+}
+
+#[test]
 fn an_unsolicited_dns_option_is_skipped_without_discarding_the_unit() {
     // RFC 1661 5.3 permits a Configure-Nak to append Configuration Options the
     // peer desires that were not in the Configure-Request, so the unit stays

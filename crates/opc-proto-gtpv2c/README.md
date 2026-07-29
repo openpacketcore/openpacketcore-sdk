@@ -230,6 +230,19 @@ control-plane stack.
   Four drops are deliberately silent and record no entry, as before: a
   well-formed code other than Configure-Nak, an unknown option type, an echoed
   RFC 1877 all-zero address, and a repeated option whose slot is already filled.
+- `PcoAddressConfiguration::validate_network_contents_ipcp_syntax` is the
+  allocation-free syntax-only boundary for a caller that holds no Identifier.
+  It uses the same PCO framing cursor and 64-unit cap as configuration decode,
+  but checks every `0x8021` packet before any correlation or list-order
+  disposition could hide its body. RFC 1661 Codes 1 through 4 have generic
+  Configuration Option framing and the fixed lengths of known RFC 1877 DNS
+  options checked; other codes still have their common header and declared
+  Length checked, and padding outside that Length is not treated as packet
+  data. It returns only `()` or the existing exact `PcoDecodeError`, never an
+  Identifier, DNS value, or packet bytes. Syntax success does not make a Nak
+  eligible for configuration use: uncorrelated Naks remain
+  `NoOutstandingRequest`, and IPCP after the additional-parameters boundary
+  remains `AfterAdditionalParameters`.
 - A malformed `0x8021` unit is discarded unit-locally rather than failing the
   whole PCO/APCO value: RFC 1661's discard unit is the packet, TS 24.008
   10.5.6.3 maps one `0x8021` unit to one RFC 1661 packet, and the unit's outer
