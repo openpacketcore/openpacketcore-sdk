@@ -14,6 +14,10 @@ use opc_ipsec_lb::{
 };
 
 static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(1);
+// `Command` closes CLOEXEC descriptors at exec, not at fork. Serializing the
+// spawn-heavy parent cases prevents one parallel test's pre-exec child from
+// transiently retaining another test's fragment ownership lock.
+static PROCESS_SPAWN_TEST_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 const HELPER: &str = env!("CARGO_BIN_EXE_opc-bird-supervisor");
 
 struct Fixture {
@@ -235,6 +239,7 @@ fn supervised_parent_entrypoint() {
 
 #[tokio::test]
 async fn guard_drop_terminates_the_owned_bird_process() {
+    let _spawn_test_guard = PROCESS_SPAWN_TEST_GUARD.lock().await;
     let fixture = Fixture::new("guard-drop");
     let adapter = BirdControlSocketAdapter::spawn_supervised(
         fixture.adapter_config(),
@@ -253,6 +258,7 @@ async fn guard_drop_terminates_the_owned_bird_process() {
 
 #[tokio::test]
 async fn unexpected_bird_exit_invalidates_admission_and_probe() {
+    let _spawn_test_guard = PROCESS_SPAWN_TEST_GUARD.lock().await;
     let fixture = Fixture::new("unexpected-exit");
     let adapter = BirdControlSocketAdapter::spawn_supervised(
         fixture.adapter_config(),
@@ -280,6 +286,7 @@ async fn unexpected_bird_exit_invalidates_admission_and_probe() {
 
 #[tokio::test]
 async fn non_socket_control_path_fails_before_helper_spawn() {
+    let _spawn_test_guard = PROCESS_SPAWN_TEST_GUARD.lock().await;
     let fixture = Fixture::new("non-socket-path");
     std::fs::write(&fixture.socket, b"stale").unwrap();
 
@@ -295,6 +302,7 @@ async fn non_socket_control_path_fails_before_helper_spawn() {
 
 #[tokio::test]
 async fn active_control_socket_is_never_unlinked_or_replaced() {
+    let _spawn_test_guard = PROCESS_SPAWN_TEST_GUARD.lock().await;
     let fixture = Fixture::new("active-socket");
     let listener = UnixListener::bind(&fixture.socket).unwrap();
 
@@ -312,6 +320,7 @@ async fn active_control_socket_is_never_unlinked_or_replaced() {
 
 #[tokio::test]
 async fn dead_owned_control_socket_is_reclaimed_before_spawn() {
+    let _spawn_test_guard = PROCESS_SPAWN_TEST_GUARD.lock().await;
     let fixture = Fixture::new("dead-socket");
     // The parent test process runs other spawn-heavy tests concurrently. If
     // it owns this listener, any child between fork and exec can transiently
@@ -349,6 +358,7 @@ async fn dead_owned_control_socket_is_reclaimed_before_spawn() {
 
 #[tokio::test]
 async fn stale_owned_fragments_are_removed_before_the_child_can_start() {
+    let _spawn_test_guard = PROCESS_SPAWN_TEST_GUARD.lock().await;
     let fixture = Fixture::new("pre-spawn-fragment-cleanup");
     let stale = fixture
         .root
@@ -376,6 +386,7 @@ async fn stale_owned_fragments_are_removed_before_the_child_can_start() {
 
 #[tokio::test]
 async fn failed_startup_known_absence_fail_stops_the_owned_bird_process() {
+    let _spawn_test_guard = PROCESS_SPAWN_TEST_GUARD.lock().await;
     let fixture = Fixture::new("known-absence-fail-stop");
     let adapter = BirdControlSocketAdapter::spawn_supervised(
         fixture.adapter_config(),
@@ -400,6 +411,7 @@ async fn failed_startup_known_absence_fail_stops_the_owned_bird_process() {
 
 #[tokio::test]
 async fn malformed_owned_fragment_prevents_child_launch() {
+    let _spawn_test_guard = PROCESS_SPAWN_TEST_GUARD.lock().await;
     let fixture = Fixture::new("pre-spawn-malformed-fragment");
     let stale = fixture
         .root
@@ -422,6 +434,7 @@ async fn malformed_owned_fragment_prevents_child_launch() {
 
 #[tokio::test]
 async fn crashed_child_restarts_after_dead_socket_cleanup() {
+    let _spawn_test_guard = PROCESS_SPAWN_TEST_GUARD.lock().await;
     let fixture = Fixture::new("crash-restart");
     let adapter = BirdControlSocketAdapter::spawn_supervised(
         fixture.adapter_config(),
@@ -485,6 +498,7 @@ fn process_config_rejects_unbounded_or_credential_changing_inputs() {
 
 #[tokio::test]
 async fn abrupt_service_process_death_kills_bird_without_drop() {
+    let _spawn_test_guard = PROCESS_SPAWN_TEST_GUARD.lock().await;
     let fixture = Fixture::new("process-death");
     let status = Command::new(std::env::current_exe().unwrap())
         .arg("--ignored")
@@ -507,6 +521,7 @@ async fn abrupt_service_process_death_kills_bird_without_drop() {
 
 #[tokio::test]
 async fn spawning_thread_death_triggers_helper_parent_death_signal() {
+    let _spawn_test_guard = PROCESS_SPAWN_TEST_GUARD.lock().await;
     let fixture = Fixture::new("thread-death");
     let helper = PathBuf::from(HELPER);
     let bird = fixture.bird_wrapper.clone();
@@ -566,6 +581,7 @@ async fn spawning_thread_death_triggers_helper_parent_death_signal() {
 
 #[test]
 fn helper_rejects_a_parent_pid_mismatch_before_handshake() {
+    let _spawn_test_guard = PROCESS_SPAWN_TEST_GUARD.blocking_lock();
     let fixture = Fixture::new("wrong-parent");
     let wrong_parent = rustix::process::getpid().as_raw_pid().saturating_add(1);
     let status = Command::new(HELPER)
@@ -587,6 +603,7 @@ fn helper_rejects_a_parent_pid_mismatch_before_handshake() {
 
 #[test]
 fn helper_rejects_an_unknown_handshake_version_before_exec() {
+    let _spawn_test_guard = PROCESS_SPAWN_TEST_GUARD.blocking_lock();
     let fixture = Fixture::new("wrong-handshake-version");
     let parent = rustix::process::getpid().as_raw_pid().to_string();
     let mut child = Command::new(HELPER)
