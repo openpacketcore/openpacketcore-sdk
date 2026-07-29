@@ -1,0 +1,44 @@
+[package]
+name = "opc-egress-fence-ebpf"
+version = "0.2.0"
+authors = ["OpenPacketCore Contributors"]
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/openpacketcore/openpacketcore-sdk"
+description = "cgroup-skb eBPF kernel datapath for opc-egress-fence"
+publish = false
+
+[features]
+default = ["production"]
+production = []
+fault-inject-delete = []
+mutation-bypass-gate = []
+mutation-bypass-deadline = []
+
+[dependencies]
+aya-ebpf = "0.2.1"
+aya-ebpf-bindings = "0.2.0"
+opc-egress-fence-common = { path = "../opc-egress-fence-common" }
+
+[[bin]]
+name = "opc-egress-fence"
+path = "src/main.rs"
+
+# Standalone workspace: this crate targets bpfel-unknown-none and is excluded
+# from the SDK host workspace on purpose.
+[workspace]
+default-members = ["."]
+members = [".", "oracle"]
+resolver = "2"
+
+[profile.release]
+debug = 2
+codegen-units = 1
+lto = true
+panic = "abort"
+opt-level = 3
+
+[profile.dev]
+panic = "abort"
+opt-level = 3
+debug = 2

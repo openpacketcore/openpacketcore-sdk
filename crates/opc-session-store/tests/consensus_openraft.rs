@@ -1931,7 +1931,13 @@ async fn writes_leases_and_cas_converge_with_linearizable_reads() {
 
 #[tokio::test]
 async fn cold_start_concurrent_mutations_share_one_gap_free_committed_sequence() {
-    let cluster = TestCluster::start().await;
+    // This proof qualifies concurrent mutation ordering, not a sub-second
+    // formation deadline. Use the production operation budget so unrelated
+    // heavyweight tests cannot exhaust cluster formation under the parallel
+    // workspace harness before the ordering proof begins.
+    let cluster =
+        TestCluster::start_with_operation_timeout(DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT)
+            .await;
     let keys = [
         session_key(b"cold-start-a"),
         session_key(b"cold-start-b"),

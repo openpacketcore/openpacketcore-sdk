@@ -1,0 +1,19 @@
+[package]
+name = "opc-egress-fence-object-oracle"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+aya = "0.14.0"
+libc = "0.2"
+opc-linux-gtpu-sys = { path = "../../opc-linux-gtpu-sys" }
+
+[[bin]]
+name = "opc-egress-fence-object-oracle"
+path = "src/main.rs"
+
+[[bin]]
+name = "opc-egress-fence-privileged-detector"
+path = "src/bin/privileged_detector.rs"

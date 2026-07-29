@@ -1,7 +1,23 @@
 use std::io;
 use std::path::Path;
+use std::time::Duration;
 
 use crate::{BpfXdpLinkInfo, GtpuUdpBind};
+
+#[derive(Debug)]
+pub struct BootTimeTimer {
+    _private: (),
+}
+
+impl BootTimeTimer {
+    pub fn new(_duration: Duration) -> io::Result<Self> {
+        Err(unsupported())
+    }
+
+    pub fn consume_expirations(&self) -> io::Result<u64> {
+        Err(unsupported())
+    }
+}
 
 #[derive(Debug)]
 pub struct NetlinkSocket {
@@ -79,6 +95,63 @@ pub fn ifindex_by_name(_name: &str) -> io::Result<u32> {
     Err(unsupported())
 }
 
+#[cfg(target_os = "linux")]
+pub fn socket_kernel_identity(_socket: std::os::fd::BorrowedFd<'_>) -> io::Result<u64> {
+    Err(unsupported())
+}
+
+#[cfg(target_os = "linux")]
+pub fn verify_udp_fence_socket_options(
+    _socket: std::os::fd::BorrowedFd<'_>,
+    _ipv6: bool,
+) -> io::Result<()> {
+    Err(unsupported())
+}
+
+#[cfg(target_os = "linux")]
+pub fn query_cgroup_skb_egress(
+    _cgroup: std::os::fd::BorrowedFd<'_>,
+) -> io::Result<(u32, u64, Vec<crate::BpfCgroupProgramAttachment>)> {
+    Err(unsupported())
+}
+
+#[cfg(target_os = "linux")]
+pub fn probe_cgroup_revision_uapi(_cgroup: std::os::fd::BorrowedFd<'_>) -> io::Result<()> {
+    Err(unsupported())
+}
+
+#[cfg(target_os = "linux")]
+pub fn attach_cgroup_skb_egress(
+    _cgroup: std::os::fd::BorrowedFd<'_>,
+    _program: std::os::fd::BorrowedFd<'_>,
+    _expected_revision: u64,
+) -> io::Result<()> {
+    Err(unsupported())
+}
+
+#[cfg(target_os = "linux")]
+pub fn detach_cgroup_skb_egress(
+    _cgroup: std::os::fd::BorrowedFd<'_>,
+    _program: std::os::fd::BorrowedFd<'_>,
+    _expected_revision: u64,
+) -> io::Result<()> {
+    Err(unsupported())
+}
+
+pub fn clock_gettime_boottime_ns() -> io::Result<u64> {
+    Err(unsupported())
+}
+
+#[cfg(target_os = "linux")]
+pub fn freeze_bpf_map(_map: std::os::fd::BorrowedFd<'_>) -> io::Result<()> {
+    Err(unsupported())
+}
+
+#[cfg(target_os = "linux")]
+pub fn verify_bpf_map_frozen(_map: std::os::fd::BorrowedFd<'_>) -> io::Result<()> {
+    Err(unsupported())
+}
+
 pub fn open_xdp_link_from_pin(_path: &Path) -> io::Result<BpfXdpLink> {
     Err(unsupported())
 }
@@ -110,5 +183,9 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+
+        let timer_error =
+            BootTimeTimer::new(Duration::from_secs(1)).expect_err("unsupported boot-time timer");
+        assert_eq!(timer_error.kind(), io::ErrorKind::Unsupported);
     }
 }

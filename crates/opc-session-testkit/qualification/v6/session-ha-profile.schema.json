@@ -52,8 +52,8 @@
         "openraft_rev": { "const": "f607e636406b16bd0ad7925dbb631da1b7a4cd96" },
         "affected_workspace_crates": {
           "type": "array",
-          "minItems": 28,
-          "maxItems": 28,
+          "minItems": 29,
+          "maxItems": 29,
           "uniqueItems": true,
           "items": {
             "enum": [
@@ -66,6 +66,7 @@
               "opc-config-bus",
               "opc-config-bus-consensus",
               "opc-consensus",
+              "opc-egress-fence",
               "opc-gnmi-server",
               "opc-ipsec-lb",
               "opc-mgmt-audit-store",

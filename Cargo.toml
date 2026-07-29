@@ -8,6 +8,7 @@ members = [
 # build graph. See scripts/build-gtpu-ebpf.sh and scripts/build-ipsec-lb-ebpf.sh.
 exclude = [
     "crates/opc-gtpu-dataplane-ebpf",
+    "crates/opc-egress-fence-ebpf",
     "crates/opc-ipsec-lb-ebpf",
     "crates/opc-ipsec-xfrm-ebpf",
     # The audited DTLS fork retains its upstream standalone workspace so its

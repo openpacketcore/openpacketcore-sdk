@@ -22,6 +22,7 @@
       "opc-config-bus",
       "opc-config-bus-consensus",
       "opc-consensus",
+      "opc-egress-fence",
       "opc-gnmi-server",
       "opc-ipsec-lb",
       "opc-mgmt-audit-store",

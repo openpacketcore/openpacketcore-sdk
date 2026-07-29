@@ -1410,6 +1410,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "opc-linux-gtpu-sys"
+version = "0.2.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "opc-mgmt-audit"
 version = "0.2.0"
 dependencies = [
@@ -1458,6 +1465,7 @@ dependencies = [
  "nix",
  "num_cpus",
  "opc-alarm",
+ "opc-linux-gtpu-sys",
  "opc-redaction",
  "serde",
  "serde_json",

@@ -2772,6 +2772,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "opc-egress-fence"
+version = "0.2.0"
+dependencies = [
+ "async-trait",
+ "aya",
+ "aya-obj",
+ "bytes",
+ "nix",
+ "opc-egress-fence-common",
+ "opc-linux-gtpu-sys",
+ "opc-linux-xfrm-sys",
+ "opc-runtime",
+ "opc-session-store",
+ "opc-types",
+ "rand 0.10.2",
+ "rustix",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.19",
+ "tokio",
+]
+
+[[package]]
+name = "opc-egress-fence-common"
+version = "0.2.0"
+
+[[package]]
 name = "opc-evidence"
 version = "0.2.0"
 dependencies = [
@@ -3417,6 +3444,7 @@ dependencies = [
  "num_cpus",
  "opc-alarm",
  "opc-crypto-provider",
+ "opc-linux-gtpu-sys",
  "opc-observability",
  "opc-redaction",
  "opc-sbi",
