@@ -3861,21 +3861,7 @@ mod tests {
     #[tokio::test]
     async fn cached_receipt_never_outlives_acknowledged_epoch_authentication() {
         let profile = test_profile();
-        let (first_session, mut second_session) = test_sessions(profile);
-        let hard_deadline = Instant::now()
-            .checked_add(Duration::from_millis(250))
-            .unwrap_or_else(|| panic!("valid near expiry"));
-        {
-            let session = Arc::get_mut(&mut second_session)
-                .unwrap_or_else(|| panic!("unshared second session"));
-            let state = session
-                .epochs
-                .get_mut()
-                .unwrap_or_else(|_| panic!("epoch state"));
-            let epoch = Arc::get_mut(&mut state.current)
-                .unwrap_or_else(|| panic!("unshared current epoch"));
-            epoch.hard_authenticated_deadline = hard_deadline;
-        }
+        let (first_session, second_session) = test_sessions(profile);
         let (record, namespace, clock) = ownership_record("owner-b").await;
         let generation = record.generation();
         let first_cache = ownership_cache(record.clone(), namespace.clone(), clock.clone());
@@ -3920,7 +3906,15 @@ mod tests {
             .ok()
             .and_then(|frame| frame.clone())
             .unwrap_or_else(|| panic!("captured authenticated data"));
-        tokio::time::sleep_until(tokio::time::Instant::from_std(hard_deadline)).await;
+        {
+            let mut state = second_session
+                .epochs
+                .write()
+                .unwrap_or_else(|_| panic!("epoch state"));
+            let epoch = Arc::get_mut(&mut state.current)
+                .unwrap_or_else(|| panic!("unshared current epoch"));
+            epoch.hard_authenticated_deadline = Instant::now();
+        }
         first_datagram
             .send(&captured)
             .await
