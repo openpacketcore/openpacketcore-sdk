@@ -15,8 +15,10 @@ use opc_protocol::{
 use std::{collections::HashSet, error::Error, fmt, net::IpAddr, net::Ipv6Addr};
 
 use super::{
-    builder_helpers, lifecycle::SwmAdditionalAvp, DiameterEapRetention, Redacted,
-    SwmDiameterEapAnswer, SwmDiameterEapRequest, SwmDiameterEapRequestEnvelope, SwmDiameterResult,
+    builder_helpers,
+    lifecycle::{self, SwmAdditionalAvp},
+    DiameterEapRetention, Redacted, SwmDiameterEapAnswer, SwmDiameterEapRequest,
+    SwmDiameterEapRequestEnvelope, SwmDiameterResult,
 };
 use crate::{base, AvpCode, AvpHeader, RawAvp};
 
@@ -159,6 +161,19 @@ impl SwmMipHomeAgentHost {
     #[must_use]
     pub fn extension_count(&self) -> usize {
         self.additional_avps.len()
+    }
+
+    fn has_same_exact_value(&self, other: &Self) -> bool {
+        self.destination_realm == other.destination_realm
+            && self.destination_host == other.destination_host
+            && lifecycle::additional_avp_sequences_match(
+                &self.additional_avps,
+                &other.additional_avps,
+            )
+    }
+
+    fn contains_ietf_class_avp(&self) -> bool {
+        lifecycle::contains_ietf_class_avp(&self.additional_avps)
     }
 }
 
@@ -304,6 +319,29 @@ impl SwmMip6AgentInfo {
     pub fn extension_count(&self) -> usize {
         self.additional_avps.len()
     }
+
+    fn has_same_exact_value(&self, other: &Self) -> bool {
+        let home_agent_host_matches = match (&self.home_agent_host, &other.home_agent_host) {
+            (Some(left), Some(right)) => left.has_same_exact_value(right),
+            (None, None) => true,
+            _ => false,
+        };
+        self.home_agent_addresses == other.home_agent_addresses
+            && home_agent_host_matches
+            && self.home_link_prefix == other.home_link_prefix
+            && lifecycle::additional_avp_sequences_match(
+                &self.additional_avps,
+                &other.additional_avps,
+            )
+    }
+
+    fn contains_ietf_class_avp(&self) -> bool {
+        lifecycle::contains_ietf_class_avp(&self.additional_avps)
+            || self
+                .home_agent_host
+                .as_ref()
+                .is_some_and(SwmMipHomeAgentHost::contains_ietf_class_avp)
+    }
 }
 
 impl fmt::Debug for SwmMip6AgentInfo {
@@ -343,6 +381,19 @@ impl SwmEmergencyInfo {
     #[must_use]
     pub fn extension_count(&self) -> usize {
         self.additional_avps.len()
+    }
+
+    fn has_same_exact_value(&self, other: &Self) -> bool {
+        self.pdn_gateway.has_same_exact_value(&other.pdn_gateway)
+            && lifecycle::additional_avp_sequences_match(
+                &self.additional_avps,
+                &other.additional_avps,
+            )
+    }
+
+    fn contains_ietf_class_avp(&self) -> bool {
+        lifecycle::contains_ietf_class_avp(&self.additional_avps)
+            || self.pdn_gateway.contains_ietf_class_avp()
     }
 }
 
@@ -386,6 +437,36 @@ impl SwmDeaGatewayContext {
     pub const fn is_empty(&self) -> bool {
         self.chained_s2b_s8_serving_gateway.is_none() && self.emergency_info.is_none()
     }
+
+    pub(super) fn has_same_exact_value(&self, other: &Self) -> bool {
+        if self.contains_ietf_class_avp() || other.contains_ietf_class_avp() {
+            return false;
+        }
+        let serving_gateway_matches = match (
+            &self.chained_s2b_s8_serving_gateway,
+            &other.chained_s2b_s8_serving_gateway,
+        ) {
+            (Some(left), Some(right)) => left.has_same_exact_value(right),
+            (None, None) => true,
+            _ => false,
+        };
+        let emergency_info_matches = match (&self.emergency_info, &other.emergency_info) {
+            (Some(left), Some(right)) => left.has_same_exact_value(right),
+            (None, None) => true,
+            _ => false,
+        };
+        serving_gateway_matches && emergency_info_matches
+    }
+
+    pub(super) fn contains_ietf_class_avp(&self) -> bool {
+        self.chained_s2b_s8_serving_gateway
+            .as_ref()
+            .is_some_and(SwmMip6AgentInfo::contains_ietf_class_avp)
+            || self
+                .emergency_info
+                .as_ref()
+                .is_some_and(SwmEmergencyInfo::contains_ietf_class_avp)
+    }
 }
 
 impl fmt::Debug for SwmDeaGatewayContext {
@@ -415,7 +496,7 @@ impl SwmDeaRequestBinding {
 
     fn matches(&self, request: &SwmDiameterEapRequestEnvelope) -> bool {
         self.request.transaction() == request.transaction()
-            && self.request.same_replay_payload(request)
+            && self.request.compare_replay_payload(request).is_same()
     }
 }
 

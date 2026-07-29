@@ -2703,12 +2703,46 @@ impl SwmDiameterEapRequestEnvelope {
     /// End-to-End, P, typed request facts, trusted local mobility context,
     /// Route-Record, extensions, and exact ordered Proxy-Info bytes are
     /// included.
+    ///
+    /// Exact public preflight is deliberately unavailable if either typed DER
+    /// recursively contains an IETF Class AVP in its retained top-level or
+    /// grouped extensions. In that case this returns
+    /// [`SwmReplayPayloadComparison::OpaqueClassUncomparable`] before comparing
+    /// retained bytes. Consumers must fail closed and use committed,
+    /// transport-owned wire state rather than a digest or candidate comparator.
+    #[must_use]
+    pub fn compare_replay_payload(&self, other: &Self) -> SwmReplayPayloadComparison {
+        if self.request.contains_ietf_class_avp() || other.request.contains_ietf_class_avp() {
+            return SwmReplayPayloadComparison::OpaqueClassUncomparable;
+        }
+        if self.has_same_replay_payload_exact(other) {
+            SwmReplayPayloadComparison::Same
+        } else {
+            SwmReplayPayloadComparison::Different
+        }
+    }
+
+    /// Return whether `other` carries the same publicly comparable DER replay
+    /// payload.
+    ///
+    /// This source-compatible boolean delegates to
+    /// [`Self::compare_replay_payload`] and returns `true` only for
+    /// [`SwmReplayPayloadComparison::Same`]. It therefore returns `false` for
+    /// both different payloads and Class-bearing, deliberately uncomparable
+    /// payloads.
     #[must_use]
     pub fn same_replay_payload(&self, other: &Self) -> bool {
+        self.compare_replay_payload(other).is_same()
+    }
+
+    fn has_same_replay_payload_exact(&self, other: &Self) -> bool {
+        if self.request.contains_ietf_class_avp() || other.request.contains_ietf_class_avp() {
+            return false;
+        }
         self.transaction.end_to_end_identifier() == other.transaction.end_to_end_identifier()
             && self.proxiable == other.proxiable
             && self.locally_configured_mobility_mode == other.locally_configured_mobility_mode
-            && self.request == other.request
+            && self.request.has_same_replay_fields(&other.request)
             && lifecycle::additional_avp_sequences_match(&self.proxy_infos, &other.proxy_infos)
     }
 
@@ -3415,6 +3449,11 @@ impl SwmEmergencyAuthorizationEvidence {
     }
 
     /// Verify the IMSI-to-IMEI recovery sequence defined by TS 33.402 §13.3.
+    ///
+    /// Class-free retained top-level and grouped extensions are compared
+    /// byte-exactly. If either DER recursively contains IETF Class, verification
+    /// returns [`SwmEmergencyAuthorizationError::RetryRequestMismatch`] before
+    /// comparing opaque candidate bytes.
     pub fn verify_after_identity_recovery(
         initial_exchange: SwmCorrelatedDiameterEapExchange,
         retry_exchange: SwmCorrelatedDiameterEapExchange,
@@ -3785,6 +3824,20 @@ impl SwmSupportedFeatureList {
     const fn identity(&self) -> (VendorId, u32) {
         (self.vendor_id, self.feature_list_id)
     }
+
+    fn has_same_exact_value(&self, other: &Self) -> bool {
+        self.vendor_id == other.vendor_id
+            && self.feature_list_id == other.feature_list_id
+            && self.feature_list == other.feature_list
+            && lifecycle::additional_avp_sequences_match(
+                &self.additional_avps,
+                &other.additional_avps,
+            )
+    }
+
+    fn contains_ietf_class_avp(&self) -> bool {
+        lifecycle::contains_ietf_class_avp(&self.additional_avps)
+    }
 }
 
 impl fmt::Debug for SwmSupportedFeatureList {
@@ -3849,6 +3902,14 @@ impl SwmRequestedSupportedFeatures {
 
     const fn mandatory(&self) -> bool {
         matches!(self.requirement, SwmSupportedFeaturesRequirement::Required)
+    }
+
+    fn has_same_exact_value(&self, other: &Self) -> bool {
+        self.requirement == other.requirement && self.features.has_same_exact_value(&other.features)
+    }
+
+    fn contains_ietf_class_avp(&self) -> bool {
+        self.features.contains_ietf_class_avp()
     }
 }
 
@@ -4157,6 +4218,19 @@ impl SwmQosProfileTemplate {
     pub fn additional_avps(&self) -> &[SwmAdditionalAvp] {
         &self.additional_avps
     }
+
+    fn has_same_exact_value(&self, other: &Self) -> bool {
+        self.vendor_id == other.vendor_id
+            && self.profile_id == other.profile_id
+            && lifecycle::additional_avp_sequences_match(
+                &self.additional_avps,
+                &other.additional_avps,
+            )
+    }
+
+    fn contains_ietf_class_avp(&self) -> bool {
+        lifecycle::contains_ietf_class_avp(&self.additional_avps)
+    }
 }
 
 impl fmt::Debug for SwmQosProfileTemplate {
@@ -4197,6 +4271,27 @@ impl SwmQosCapability {
     #[must_use]
     pub fn additional_avps(&self) -> &[SwmAdditionalAvp] {
         &self.additional_avps
+    }
+
+    fn has_same_exact_value(&self, other: &Self) -> bool {
+        self.profiles.len() == other.profiles.len()
+            && self
+                .profiles
+                .iter()
+                .zip(&other.profiles)
+                .all(|(left, right)| left.has_same_exact_value(right))
+            && lifecycle::additional_avp_sequences_match(
+                &self.additional_avps,
+                &other.additional_avps,
+            )
+    }
+
+    fn contains_ietf_class_avp(&self) -> bool {
+        lifecycle::contains_ietf_class_avp(&self.additional_avps)
+            || self
+                .profiles
+                .iter()
+                .any(SwmQosProfileTemplate::contains_ietf_class_avp)
     }
 }
 
@@ -5049,7 +5144,9 @@ impl SwmDiameterEapExtensionMetadata {
 /// requests use [`Default::default`], while the DER parser alone can populate
 /// entries. Callers may inspect copy-only, redaction-safe metadata through
 /// [`Self::metadata`] and may clone a parsed collection when rebuilding that
-/// endpoint message.
+/// endpoint message. Equality likewise observes only retained AVP metadata;
+/// use [`SwmDiameterEapRequestEnvelope::compare_replay_payload`] for checked
+/// duplicate preflight.
 /// Typed rebuilding canonicalizes retained extensions to the trailing command
 /// wildcard; use [`Message`] directly when an exact relay/proxy byte stream is
 /// required.
@@ -5087,6 +5184,14 @@ impl SwmDiameterEapRequestExtensions {
 
     fn retained_avps(&self) -> &[SwmAdditionalAvp] {
         &self.avps
+    }
+
+    fn has_same_exact_value(&self, other: &Self) -> bool {
+        lifecycle::additional_avp_sequences_match(&self.avps, &other.avps)
+    }
+
+    fn contains_ietf_class_avp(&self) -> bool {
+        lifecycle::contains_ietf_class_avp(&self.avps)
     }
 }
 
@@ -5253,8 +5358,17 @@ struct SwmDiameterEapAgentErrorRequestBinding {
     request_digest: Zeroizing<[u8; 32]>,
 }
 
+const SWM_AGENT_ERROR_OPAQUE_CLASS_BINDING_REASON: &str =
+    "SWm agent delivery failure cannot bind a DER containing opaque Class";
+
 impl SwmDiameterEapAgentErrorRequestBinding {
     fn for_request(request: &SwmDiameterEapRequestEnvelope) -> Result<Self, EncodeError> {
+        if request.request.contains_ietf_class_avp() {
+            return Err(encode_structural_error(
+                SWM_AGENT_ERROR_OPAQUE_CLASS_BINDING_REASON,
+                "7.1.3",
+            ));
+        }
         let mut flags = builder_helpers::app_request_flags();
         if request.potentially_retransmitted {
             flags = crate::CommandFlags::from_bits(
@@ -5371,7 +5485,9 @@ impl SwmDiameterEapGenericErrorAnswer {
     /// [`SwmDiameterEapAgentDeliveryFailure::UnableToDeliver`] and
     /// [`SwmDiameterEapAgentDeliveryFailure::TooBusy`] are representable. The
     /// latter is rejected unless the retained DER contains `Destination-Host`,
-    /// as required by RFC 6733 section 7.1.3.
+    /// as required by RFC 6733 section 7.1.3. A recursively Class-bearing DER
+    /// is also rejected before canonical digest construction because exposing
+    /// a request-candidate digest comparison would reveal opaque Class bytes.
     pub fn new_agent_delivery_failure_for(
         request: &SwmDiameterEapRequestEnvelope,
         failure: SwmDiameterEapAgentDeliveryFailure,
@@ -5887,6 +6003,68 @@ impl std::fmt::Debug for SwmDiameterEapAnswer {
 }
 
 impl SwmDiameterEapRequest {
+    fn contains_ietf_class_avp(&self) -> bool {
+        self.extensions.contains_ietf_class_avp()
+            || self
+                .qos_capability
+                .as_ref()
+                .is_some_and(SwmQosCapability::contains_ietf_class_avp)
+            || self
+                .supported_features
+                .iter()
+                .any(SwmRequestedSupportedFeatures::contains_ietf_class_avp)
+            || self
+                .oc_supported_features
+                .as_ref()
+                .is_some_and(SwmOcSupportedFeatures::contains_ietf_class_avp)
+    }
+
+    fn has_same_replay_fields(&self, other: &Self) -> bool {
+        let qos_capability_matches = match (&self.qos_capability, &other.qos_capability) {
+            (Some(left), Some(right)) => left.has_same_exact_value(right),
+            (None, None) => true,
+            _ => false,
+        };
+        let supported_features_match = self.supported_features.len()
+            == other.supported_features.len()
+            && self
+                .supported_features
+                .iter()
+                .zip(&other.supported_features)
+                .all(|(left, right)| left.has_same_exact_value(right));
+        let oc_supported_features_match =
+            match (&self.oc_supported_features, &other.oc_supported_features) {
+                (Some(left), Some(right)) => left.has_same_exact_value(right),
+                (None, None) => true,
+                _ => false,
+            };
+
+        self.session_id == other.session_id
+            && self.auth_application_id == other.auth_application_id
+            && self.origin_host == other.origin_host
+            && self.origin_realm == other.origin_realm
+            && self.destination_realm == other.destination_realm
+            && self.destination_host == other.destination_host
+            && self.user_name == other.user_name
+            && self.rat_type == other.rat_type
+            && self.service_selection == other.service_selection
+            && self.mip6_feature_vector == other.mip6_feature_vector
+            && qos_capability_matches
+            && self.visited_network_identifier == other.visited_network_identifier
+            && self.aaa_failure_indication == other.aaa_failure_indication
+            && supported_features_match
+            && self.ue_local_ip_address == other.ue_local_ip_address
+            && oc_supported_features_match
+            && self.auth_request_type == other.auth_request_type
+            && self.eap_payload == other.eap_payload
+            && self.emergency_services == other.emergency_services
+            && self.terminal_information == other.terminal_information
+            && self.high_priority_access_info == other.high_priority_access_info
+            && self.state_avps == other.state_avps
+            && self.route_records == other.route_records
+            && self.extensions.has_same_exact_value(&other.extensions)
+    }
+
     /// Project the DER EAP-Payload as strict EAP-AKA/AKA-prime evidence.
     ///
     /// This opt-in operation leaves generic Diameter-EAP handling unchanged.
@@ -8162,20 +8340,34 @@ pub fn build_swm_diameter_eap_answer_for(
     build_swm_diameter_eap_answer_for_validated(request, answer, ctx)
 }
 
+const SWM_DEA_OPAQUE_CLASS_GATEWAY_CONTEXT_REASON: &str =
+    "SWm DEA request-bound gateway context cannot contain opaque Class";
+
 /// Build a SWm DEA with standards-conditioned serving/emergency gateway
 /// context bound to one exact retained DER.
 ///
 /// The typed context constructor records whether the caller is asserting a
 /// chained S2b-S8 serving gateway or HSS-derived authenticated non-roaming
 /// emergency gateway. This builder verifies the exact DER binding and exact
-/// base `DIAMETER_SUCCESS` before emitting either AVP.
+/// base `DIAMETER_SUCCESS` before emitting either AVP. Class-free retained
+/// gateway children are compared byte-exactly; a Class-bearing retained
+/// gateway context fails closed before candidate value comparison.
 pub fn build_swm_diameter_eap_answer_for_with_gateway_context(
     request: &SwmDiameterEapRequestEnvelope,
     answer: &SwmDiameterEapAnswer,
     gateway_context: &SwmRequestBoundDeaGatewayContext,
     ctx: EncodeContext,
 ) -> Result<OwnedMessage, EncodeError> {
-    if !answer.gateway_context().is_empty() && answer.gateway_context() != gateway_context.context()
+    if gateway_context.context().contains_ietf_class_avp() {
+        return Err(encode_structural_error(
+            SWM_DEA_OPAQUE_CLASS_GATEWAY_CONTEXT_REASON,
+            "7.1.2.1.2",
+        ));
+    }
+    if !answer.gateway_context().is_empty()
+        && !answer
+            .gateway_context()
+            .has_same_exact_value(gateway_context.context())
     {
         return Err(encode_structural_error(
             "SWm DEA parsed and request-bound gateway contexts differ",
@@ -11224,6 +11416,33 @@ fn retry_preserves_initial_request(
     initial_request: &SwmDiameterEapRequest,
     retry_request: &SwmDiameterEapRequest,
 ) -> bool {
+    if initial_request.contains_ietf_class_avp() || retry_request.contains_ietf_class_avp() {
+        return false;
+    }
+    let qos_capability_matches = match (
+        &initial_request.qos_capability,
+        &retry_request.qos_capability,
+    ) {
+        (Some(left), Some(right)) => left.has_same_exact_value(right),
+        (None, None) => true,
+        _ => false,
+    };
+    let supported_features_match = initial_request.supported_features.len()
+        == retry_request.supported_features.len()
+        && initial_request
+            .supported_features
+            .iter()
+            .zip(&retry_request.supported_features)
+            .all(|(left, right)| left.has_same_exact_value(right));
+    let oc_supported_features_match = match (
+        &initial_request.oc_supported_features,
+        &retry_request.oc_supported_features,
+    ) {
+        (Some(left), Some(right)) => left.has_same_exact_value(right),
+        (None, None) => true,
+        _ => false,
+    };
+
     initial_request.auth_application_id == retry_request.auth_application_id
         && initial_request.origin_host == retry_request.origin_host
         && initial_request.origin_realm == retry_request.origin_realm
@@ -11232,18 +11451,21 @@ fn retry_preserves_initial_request(
         && initial_request.rat_type == retry_request.rat_type
         && initial_request.service_selection == retry_request.service_selection
         && initial_request.mip6_feature_vector == retry_request.mip6_feature_vector
-        && initial_request.qos_capability == retry_request.qos_capability
+        && qos_capability_matches
         && initial_request.visited_network_identifier == retry_request.visited_network_identifier
         && initial_request.aaa_failure_indication == retry_request.aaa_failure_indication
-        && initial_request.supported_features == retry_request.supported_features
+        && supported_features_match
         && initial_request.ue_local_ip_address == retry_request.ue_local_ip_address
-        && initial_request.oc_supported_features == retry_request.oc_supported_features
+        && oc_supported_features_match
         && initial_request.auth_request_type == retry_request.auth_request_type
         && initial_request.eap_payload == retry_request.eap_payload
         && initial_request.emergency_services == retry_request.emergency_services
         && initial_request.high_priority_access_info == retry_request.high_priority_access_info
         && initial_request.state_avps == retry_request.state_avps
-        && initial_request.extensions == retry_request.extensions
+        && lifecycle::additional_avp_sequences_match(
+            initial_request.extensions.retained_avps(),
+            retry_request.extensions.retained_avps(),
+        )
 }
 
 fn verify_final_emergency_answer(

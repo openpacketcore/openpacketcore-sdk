@@ -8,12 +8,13 @@
 
 use bytes::{Bytes, BytesMut};
 use opc_proto_diameter::apps::swm::{
-    self, SwmAdditionalAvp, SwmClassAvpUpdate, SwmCorrelatedDiameterEapResponse,
+    self, AuthRequestType, SwmAdditionalAvp, SwmAuthorizationRequest,
+    SwmAuthorizationRequestEnvelope, SwmClassAvpUpdate, SwmCorrelatedDiameterEapResponse,
     SwmDestinationHostRequirement, SwmDiameterConnectionToken, SwmDiameterTransaction,
-    SwmExpectedAnswerPeer, SwmReAuthRequest, SwmReAuthRequestEnvelope, SwmReAuthRequestType,
-    SwmSessionBinding, SwmSessionServerFailover, SwmSessionServerFailoverPolicy,
-    SwmSessionStateErrorCode, SwmSessionTerminationRequest, SwmSessionTerminationRequestEnvelope,
-    SwmTerminationCause,
+    SwmExpectedAnswerPeer, SwmReAuthAnswer, SwmReAuthRequest, SwmReAuthRequestEnvelope,
+    SwmReAuthRequestType, SwmReAuthResult, SwmSessionBinding, SwmSessionServerFailover,
+    SwmSessionServerFailoverPolicy, SwmSessionStateErrorCode, SwmSessionTerminationRequest,
+    SwmSessionTerminationRequestEnvelope, SwmTerminationCause,
 };
 use opc_proto_diameter::avp::dictionary::{Redacted, Sensitive};
 use opc_proto_diameter::dictionary::AvpKey;
@@ -188,6 +189,27 @@ fn answer_wire(extras: &[Vec<u8>]) -> Vec<u8> {
     )
 }
 
+fn re_auth_answer_wire(extras: &[Vec<u8>]) -> Vec<u8> {
+    let mut avps = vec![
+        mandatory_avp(base::AVP_SESSION_ID, SESSION_ID.as_bytes()),
+        mandatory_avp(
+            base::AVP_RESULT_CODE,
+            &base::RESULT_CODE_DIAMETER_SUCCESS.to_be_bytes(),
+        ),
+        mandatory_avp(base::AVP_ORIGIN_HOST, EPDG_HOST.as_bytes()),
+        mandatory_avp(base::AVP_ORIGIN_REALM, EPDG_REALM.as_bytes()),
+        mandatory_avp(base::AVP_USER_NAME, USER_NAME.as_bytes()),
+    ];
+    avps.extend_from_slice(extras);
+    message_wire(
+        swm::COMMAND_RE_AUTH,
+        CommandFlags::answer(true, false),
+        HOP_BY_HOP + 2,
+        END_TO_END + 2,
+        avps,
+    )
+}
+
 fn bound_request() -> swm::SwmDiameterEapRequestEnvelope {
     swm::parse_swm_diameter_eap_request_envelope(&decode(&request_wire()), typed_context())
         .expect("independent DER fixture")
@@ -263,6 +285,59 @@ fn encoded_rar(request: SwmReAuthRequest) -> Vec<u8> {
     )
 }
 
+fn inbound_re_auth_request(request: SwmReAuthRequest) -> SwmReAuthRequestEnvelope {
+    swm::parse_swm_re_auth_request_envelope(&decode(&encoded_rar(request)), typed_context())
+        .expect("typed RAR parses at the access-client boundary")
+}
+
+fn re_auth_answer(request: &SwmReAuthRequestEnvelope) -> SwmReAuthAnswer {
+    SwmReAuthAnswer::for_request(
+        request,
+        SwmReAuthResult::Success,
+        Redacted::from(EPDG_HOST),
+        Redacted::from(EPDG_REALM),
+    )
+}
+
+fn encoded_raa(request: &SwmReAuthRequestEnvelope, answer: &SwmReAuthAnswer) -> Vec<u8> {
+    encode(
+        &swm::build_swm_re_auth_answer(request, answer, EncodeContext::default())
+            .expect("typed RAA builds"),
+    )
+}
+
+fn authorization_request() -> SwmAuthorizationRequest {
+    SwmAuthorizationRequest {
+        session_id: Sensitive::from(SESSION_ID),
+        origin_host: Redacted::from(EPDG_HOST),
+        origin_realm: Redacted::from(EPDG_REALM),
+        destination_realm: Redacted::from(AAA_REALM),
+        destination_host: None,
+        user_name: Sensitive::from(USER_NAME),
+        auth_request_type: AuthRequestType::AuthorizeOnly,
+        authorization_lifetime: None,
+        auth_grace_period: None,
+        aar_flags: None,
+        ue_local_ip_address: None,
+        high_priority_access_info: None,
+        drmp: None,
+        route_records: Vec::new(),
+        additional_avps: Vec::new(),
+    }
+}
+
+fn encoded_aar(request: SwmAuthorizationRequest) -> Vec<u8> {
+    let envelope = SwmAuthorizationRequestEnvelope::for_outbound(
+        request,
+        SwmDiameterTransaction::new(AUTH_HOP_BY_HOP, AUTH_END_TO_END),
+        SwmExpectedAnswerPeer::routed(CONNECTION),
+    );
+    encode(
+        &swm::build_swm_authorization_request(&envelope, EncodeContext::default())
+            .expect("typed AAR builds"),
+    )
+}
+
 fn class_values(wire: &[u8]) -> Vec<Vec<u8>> {
     decode(wire)
         .avps(framing_context())
@@ -278,20 +353,32 @@ fn class_values(wire: &[u8]) -> Vec<Vec<u8>> {
         .collect()
 }
 
-fn ietf_avp_values(wire: &[u8], code: AvpCode) -> Vec<Vec<u8>> {
+fn avp_values(wire: &[u8], key: AvpKey) -> Vec<Vec<u8>> {
     decode(wire)
         .avps(framing_context())
         .filter_map(|avp| {
             let avp = avp.expect("framed AVP");
-            (avp.header.key() == AvpKey::ietf(code)).then(|| avp.value.to_vec())
+            (avp.header.key() == key).then(|| avp.value.to_vec())
         })
         .collect()
+}
+
+fn ietf_avp_values(wire: &[u8], code: AvpCode) -> Vec<Vec<u8>> {
+    avp_values(wire, AvpKey::ietf(code))
 }
 
 fn bounded_answer_error(extras: &[Vec<u8>]) -> DecodeError {
     let wire = answer_wire(extras);
     let error = swm::parse_swm_diameter_eap_answer(&decode(&wire), typed_context())
         .expect_err("hostile authorization-session state must fail");
+    assert!(error.offset() <= wire.len());
+    error
+}
+
+fn bounded_re_auth_answer_error(extras: &[Vec<u8>]) -> DecodeError {
+    let wire = re_auth_answer_wire(extras);
+    let error = swm::parse_swm_re_auth_answer(&decode(&wire), typed_context())
+        .expect_err("hostile RAA authorization-session state must fail");
     assert!(error.offset() <= wire.len());
     error
 }
@@ -332,7 +419,55 @@ fn independent_dea_class_fixtures_cover_absent_order_and_empty_values() {
 }
 
 #[test]
-fn correlated_class_state_clones_and_moves_byte_exactly_into_str_and_rar() {
+fn public_equality_cannot_distinguish_same_shape_class_or_raa_extension_values() {
+    let left_classes = swm::SwmClassAvps::try_from_values(vec![
+        b"class-alpha".to_vec(),
+        Vec::new(),
+        b"second-one".to_vec(),
+    ])
+    .expect("bounded left Class fixture");
+    let right_classes = swm::SwmClassAvps::try_from_values(vec![
+        b"class-bravo".to_vec(),
+        Vec::new(),
+        b"second-two".to_vec(),
+    ])
+    .expect("bounded right Class fixture");
+    assert_eq!(
+        left_classes, right_classes,
+        "public Class equality must not act as a chosen-value oracle"
+    );
+
+    let inbound_rar = inbound_re_auth_request(re_auth_request());
+    let mut left_answer = re_auth_answer(&inbound_rar);
+    let mut right_answer = left_answer.clone();
+    left_answer.additional_avps.push(
+        SwmAdditionalAvp::new(
+            AvpHeader::ietf(AvpCode::new(60_910), false),
+            b"extension-alpha".to_vec(),
+            EncodeContext::default(),
+        )
+        .expect("bounded left RAA extension"),
+    );
+    right_answer.additional_avps.push(
+        SwmAdditionalAvp::new(
+            AvpHeader::ietf(AvpCode::new(60_910), false),
+            b"extension-bravo".to_vec(),
+            EncodeContext::default(),
+        )
+        .expect("bounded right RAA extension"),
+    );
+    assert_eq!(
+        left_answer.additional_avps, right_answer.additional_avps,
+        "public additional-AVP equality must ignore same-shape opaque bytes"
+    );
+    assert_eq!(
+        left_answer, right_answer,
+        "derived RAA equality must not restore an opaque-value oracle"
+    );
+}
+
+#[test]
+fn correlated_class_state_clones_and_moves_byte_exactly_into_str_rar_and_raa() {
     let expected = vec![
         b"first-opaque-class".to_vec(),
         Vec::new(),
@@ -367,6 +502,28 @@ fn correlated_class_state_clones_and_moves_byte_exactly_into_str_and_rar() {
         .expect("Class state moves into STR");
     assert_eq!(class_values(&encoded_str(moved_str)), expected);
 
+    let inbound_rar = inbound_re_auth_request(re_auth_request());
+    let mut cloned_raa = re_auth_answer(&inbound_rar);
+    replacement
+        .clone_into_re_auth_answer(&mut cloned_raa)
+        .expect("Class state clones into access-client RAA");
+    assert_eq!(
+        class_values(&encoded_raa(&inbound_rar, &cloned_raa)),
+        expected
+    );
+
+    let SwmClassAvpUpdate::Replace(moved) = update.clone() else {
+        panic!("Class update must be replacement");
+    };
+    let mut moved_raa = re_auth_answer(&inbound_rar);
+    moved
+        .move_into_re_auth_answer(&mut moved_raa)
+        .expect("Class state moves into access-client RAA");
+    assert_eq!(
+        class_values(&encoded_raa(&inbound_rar, &moved_raa)),
+        expected
+    );
+
     let SwmClassAvpUpdate::Replace(moved) = update else {
         panic!("Class update must be replacement");
     };
@@ -375,6 +532,84 @@ fn correlated_class_state_clones_and_moves_byte_exactly_into_str_and_rar() {
         .move_into_re_auth_request(&mut moved_rar)
         .expect("Class state moves into RAR");
     assert_eq!(class_values(&encoded_rar(moved_rar)), expected);
+}
+
+#[test]
+fn public_class_fixtures_follow_dea_rar_raa_then_class_free_aar_aaa_sequence() {
+    let fixtures = [
+        Vec::<Vec<u8>>::new(),
+        vec![b"one".to_vec()],
+        vec![b"first".to_vec(), b"second".to_vec()],
+        vec![Vec::new()],
+    ];
+
+    for expected in fixtures {
+        let extras = expected
+            .iter()
+            .map(|value| class_avp(value))
+            .collect::<Vec<_>>();
+        let retained = correlated_answer(&extras).class_avp_update();
+
+        let mut rar = re_auth_request();
+        if let Some(classes) = retained.replacement() {
+            classes
+                .clone_into_re_auth_request(&mut rar)
+                .expect("server RAR accepts retained Class state");
+        }
+        let rar_wire = encoded_rar(rar);
+        assert_eq!(class_values(&rar_wire), expected);
+
+        let inbound_rar =
+            swm::parse_swm_re_auth_request_envelope(&decode(&rar_wire), typed_context())
+                .expect("access client parses the server-initiated RAR");
+        let mut raa = re_auth_answer(&inbound_rar);
+        if let Some(classes) = retained.replacement() {
+            classes
+                .clone_into_re_auth_answer(&mut raa)
+                .expect("access client replays retained Class state on RAA");
+        }
+        let raa_wire = encoded_raa(&inbound_rar, &raa);
+        assert_eq!(class_values(&raa_wire), expected);
+        let parsed_raa = swm::parse_swm_re_auth_answer(&decode(&raa_wire), typed_context())
+            .expect("server parses the access-client RAA");
+        assert_eq!(
+            encode(
+                &swm::build_swm_re_auth_answer(
+                    &inbound_rar,
+                    &parsed_raa,
+                    EncodeContext::default(),
+                )
+                .expect("parsed RAA rebuilds")
+            ),
+            raa_wire
+        );
+
+        let aar_wire = encoded_aar(authorization_request());
+        assert_eq!(
+            aar_wire,
+            authorization_request_wire(),
+            "Class replay on RAA must not alter the following legacy AAR bytes"
+        );
+        assert!(
+            class_values(&aar_wire).is_empty(),
+            "the explicitly forbidden AAR role must remain Class-free"
+        );
+
+        let later_update = correlated_authorization_answer(&extras)
+            .class_avp_update()
+            .expect("following correlated AAA yields bounded Class state");
+        if expected.is_empty() {
+            assert!(later_update.is_unchanged());
+        } else {
+            let mut str_request = session_termination_request();
+            later_update
+                .replacement()
+                .expect("AAA Class occurrence replaces retained state")
+                .clone_into_session_termination_request(&mut str_request)
+                .expect("replacement remains byte-exact after the full exchange");
+            assert_eq!(class_values(&encoded_str(str_request)), expected);
+        }
+    }
 }
 
 #[test]
@@ -421,6 +656,185 @@ fn class_count_aggregate_headers_and_lengths_fail_closed_at_bounds() {
     let error = Message::decode(&malformed_wire, typed_context())
         .expect_err("malformed Class header length fails during bounded framing");
     assert!(error.offset() <= malformed_wire.len());
+}
+
+#[test]
+fn selected_raa_class_leg_enforces_count_bytes_headers_vendor_and_framing_bounds() {
+    let exact_count = (0..swm::MAX_SWM_CLASS_AVPS)
+        .map(|_| class_avp(&[]))
+        .collect::<Vec<_>>();
+    swm::parse_swm_re_auth_answer(&decode(&re_auth_answer_wire(&exact_count)), typed_context())
+        .expect("RAA accepts the exact Class occurrence bound");
+
+    let excessive_count = (0..=swm::MAX_SWM_CLASS_AVPS)
+        .map(|_| class_avp(&[]))
+        .collect::<Vec<_>>();
+    let error = bounded_re_auth_answer_error(&excessive_count);
+    assert_eq!(error.code(), &DecodeErrorCode::IeCountExceeded);
+
+    let exact_bytes = [class_avp(&vec![0xa5; swm::MAX_SWM_CLASS_VALUE_BYTES])];
+    swm::parse_swm_re_auth_answer(&decode(&re_auth_answer_wire(&exact_bytes)), typed_context())
+        .expect("RAA accepts the exact aggregate Class byte bound");
+
+    let excessive_bytes = [class_avp(&vec![0xa5; swm::MAX_SWM_CLASS_VALUE_BYTES + 1])];
+    let error = bounded_re_auth_answer_error(&excessive_bytes);
+    assert!(matches!(error.code(), DecodeErrorCode::Structural { .. }));
+
+    for invalid in [
+        raw_avp(base::AVP_CLASS, 0, None, CLASS_SENTINEL),
+        raw_avp(
+            base::AVP_CLASS,
+            AvpFlags::MANDATORY | AvpFlags::PROTECTED,
+            None,
+            CLASS_SENTINEL,
+        ),
+        raw_avp(
+            base::AVP_CLASS,
+            AvpFlags::VENDOR | AvpFlags::MANDATORY,
+            Some(opc_proto_diameter::apps::VENDOR_ID_3GPP),
+            CLASS_SENTINEL,
+        ),
+    ] {
+        let error = bounded_re_auth_answer_error(&[invalid]);
+        let diagnostics = format!("{error:?}\n{error}");
+        assert!(
+            !diagnostics.contains(std::str::from_utf8(CLASS_SENTINEL).expect("ASCII sentinel")),
+            "RAA Class rejection diagnostics must not expose opaque bytes"
+        );
+    }
+
+    let mut invalid_length = class_avp(CLASS_SENTINEL);
+    invalid_length[5..8].copy_from_slice(&7_u32.to_be_bytes()[1..]);
+    let malformed_wire = re_auth_answer_wire(&[invalid_length]);
+    let error = Message::decode(&malformed_wire, typed_context())
+        .expect_err("malformed RAA Class length fails during bounded framing");
+    assert!(error.offset() <= malformed_wire.len());
+}
+
+#[test]
+fn raa_class_replacement_is_atomic_and_preserves_foreign_vendor_code_25() {
+    const FOREIGN_VENDOR: VendorId = VendorId::new(42_424);
+    const UNRELATED_CODE: AvpCode = AvpCode::new(60_900);
+
+    let classes = swm::SwmClassAvps::try_from_values(vec![
+        b"replacement-one".to_vec(),
+        Vec::new(),
+        b"replacement-three".to_vec(),
+    ])
+    .expect("bounded trusted Class fixture");
+    let inbound_rar = inbound_re_auth_request(re_auth_request());
+    let mut answer = re_auth_answer(&inbound_rar);
+    answer.additional_avps = vec![
+        SwmAdditionalAvp::new(
+            AvpHeader::ietf(base::AVP_CLASS, true),
+            b"superseded-ietf-class".to_vec(),
+            EncodeContext::default(),
+        )
+        .expect("canonical prior IETF Class"),
+        SwmAdditionalAvp::new(
+            AvpHeader::vendor(base::AVP_CLASS, FOREIGN_VENDOR, false),
+            b"foreign-vendor-code-25".to_vec(),
+            EncodeContext::default(),
+        )
+        .expect("foreign-vendor code collision"),
+        SwmAdditionalAvp::new(
+            AvpHeader::ietf(UNRELATED_CODE, false),
+            b"unrelated-extension".to_vec(),
+            EncodeContext::default(),
+        )
+        .expect("unrelated optional extension"),
+    ];
+
+    classes
+        .clone_into_re_auth_answer(&mut answer)
+        .expect("bounded Class set replaces only IETF Class");
+    let wire = encoded_raa(&inbound_rar, &answer);
+    assert_eq!(
+        class_values(&wire),
+        vec![
+            b"replacement-one".to_vec(),
+            Vec::new(),
+            b"replacement-three".to_vec()
+        ]
+    );
+    assert_eq!(
+        avp_values(&wire, AvpKey::vendor(base::AVP_CLASS, FOREIGN_VENDOR)),
+        vec![b"foreign-vendor-code-25".to_vec()]
+    );
+    assert_eq!(
+        ietf_avp_values(&wire, UNRELATED_CODE),
+        vec![b"unrelated-extension".to_vec()]
+    );
+
+    let mut full_answer = re_auth_answer(&inbound_rar);
+    full_answer.additional_avps = (0..swm::MAX_SWM_CLASS_AVPS)
+        .map(|index| {
+            let code = 61_000_u32
+                .checked_add(u32::try_from(index).expect("test index fits u32"))
+                .expect("test AVP code fits u32");
+            SwmAdditionalAvp::new(
+                AvpHeader::ietf(AvpCode::new(code), false),
+                vec![u8::try_from(index).expect("test index fits u8")],
+                EncodeContext::default(),
+            )
+            .expect("bounded unrelated extension")
+        })
+        .collect();
+    let before = full_answer.additional_avps.clone();
+    let before_wire = encoded_raa(&inbound_rar, &full_answer);
+    let error = classes
+        .clone_into_re_auth_answer(&mut full_answer)
+        .expect_err("replacement exceeding RAA additional capacity fails");
+    assert_eq!(
+        error.code(),
+        SwmSessionStateErrorCode::AdditionalAvpCapacityExceeded
+    );
+    assert_eq!(
+        full_answer.additional_avps, before,
+        "metadata must remain unchanged after capacity failure"
+    );
+    assert_eq!(
+        encoded_raa(&inbound_rar, &full_answer),
+        before_wire,
+        "capacity failure must preserve every unrelated RAA extension byte"
+    );
+}
+
+#[test]
+fn empty_class_transfer_preserves_raa_bytes_and_aar_injection_stays_value_free() {
+    let baseline_str = encoded_str(session_termination_request());
+    let mut str_with_empty_transfer = session_termination_request();
+    swm::SwmClassAvps::default()
+        .clone_into_session_termination_request(&mut str_with_empty_transfer)
+        .expect("empty Class set is a no-op for STR");
+    assert_eq!(
+        encoded_str(str_with_empty_transfer),
+        baseline_str,
+        "no retained Class must keep legacy STR bytes unchanged"
+    );
+
+    let inbound_rar = inbound_re_auth_request(re_auth_request());
+    let baseline = re_auth_answer(&inbound_rar);
+    let baseline_wire = encoded_raa(&inbound_rar, &baseline);
+    let mut with_empty_transfer = baseline;
+    swm::SwmClassAvps::default()
+        .clone_into_re_auth_answer(&mut with_empty_transfer)
+        .expect("empty Class set is a no-op");
+    assert_eq!(
+        encoded_raa(&inbound_rar, &with_empty_transfer),
+        baseline_wire,
+        "no retained Class must keep legacy RAA bytes unchanged"
+    );
+
+    let hostile_aar =
+        wire_with_trailing_avp(&authorization_request_wire(), class_avp(CLASS_SENTINEL));
+    let error = swm::parse_swm_authorization_request(&decode(&hostile_aar), typed_context())
+        .expect_err("Class remains forbidden on the following AAR");
+    let diagnostics = format!("{error:?}\n{error}");
+    assert!(
+        !diagnostics.contains(std::str::from_utf8(CLASS_SENTINEL).expect("ASCII sentinel")),
+        "wrong-role rejection must not expose Class or message bytes"
+    );
 }
 
 #[test]

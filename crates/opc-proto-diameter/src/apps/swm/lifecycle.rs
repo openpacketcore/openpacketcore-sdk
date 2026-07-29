@@ -55,6 +55,33 @@ pub const AVP_LOAD_TYPE: AvpCode = AvpCode::new(651);
 /// Load-Value AVP code (RFC 8583 section 7.3).
 pub const AVP_LOAD_VALUE: AvpCode = AvpCode::new(652);
 
+/// Redaction-safe result of comparing typed duplicate-request payloads.
+///
+/// Exact public duplicate preflight is deliberately unavailable when either
+/// request contains an IETF `Class` AVP. Comparing a caller-supplied candidate
+/// with retained Class bytes would expose a chosen-value oracle. Consumers
+/// must fail closed for [`Self::OpaqueClassUncomparable`] and use committed,
+/// transport-owned wire state for duplicate handling; a public digest or
+/// candidate comparator would recreate the same oracle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum SwmReplayPayloadComparison {
+    /// Every publicly comparable replay fact is identical.
+    Same,
+    /// At least one publicly comparable replay fact differs.
+    Different,
+    /// Either request contains opaque IETF Class state.
+    OpaqueClassUncomparable,
+}
+
+impl SwmReplayPayloadComparison {
+    /// Return whether the payloads are exactly equal and publicly comparable.
+    #[must_use]
+    pub const fn is_same(self) -> bool {
+        matches!(self, Self::Same)
+    }
+}
+
 /// RFC 7683 loss-abatement algorithm bit.
 pub const SWM_OC_LOSS_ALGORITHM: u64 = 1;
 const OC_VALIDITY_DURATION_MAX: u32 = 86_400;
@@ -160,6 +187,15 @@ impl SwmOcSupportedFeatures {
     /// Return the number of preserved unknown optional grouped children.
     pub fn extension_count(&self) -> usize {
         self.additional_avps.len()
+    }
+
+    pub(super) fn has_same_exact_value(&self, other: &Self) -> bool {
+        self.feature_vector == other.feature_vector
+            && additional_avp_sequences_match(&self.additional_avps, &other.additional_avps)
+    }
+
+    pub(super) fn contains_ietf_class_avp(&self) -> bool {
+        contains_ietf_class_avp(&self.additional_avps)
     }
 }
 
@@ -953,7 +989,13 @@ impl SwmSessionTerminationResult {
 /// `Display`. [`Self::new`] is the explicit raw-value intake boundary; the
 /// STR/STA builders still reject command-core duplicates, wrong-role AVPs,
 /// invalid flag combinations, and untrusted repeatability.
-#[derive(Clone, PartialEq, Eq)]
+///
+/// Public equality compares only redaction-safe AVP metadata: code, Vendor-Id,
+/// flags, and value length. It deliberately does not compare opaque value
+/// bytes, so equality cannot be used as a chosen-value oracle. Class-free
+/// internal bindings use a separate byte-exact comparison; public candidate
+/// replay comparison fails closed when IETF Class is present.
+#[derive(Clone)]
 pub struct SwmAdditionalAvp {
     header: AvpHeader,
     value: Bytes,
@@ -1030,12 +1072,26 @@ impl SwmAdditionalAvp {
     }
 
     fn has_same_replay_value(&self, other: &Self) -> bool {
+        // Header length is derived during encoding. Exact retained-payload
+        // matching therefore compares semantic header fields plus every value
+        // byte, but not the cached/received length field.
         self.header.code == other.header.code
             && self.header.flags == other.header.flags
             && self.header.vendor_id == other.header.vendor_id
             && self.value == other.value
     }
 }
+
+impl PartialEq for SwmAdditionalAvp {
+    fn eq(&self, other: &Self) -> bool {
+        self.header.code == other.header.code
+            && self.header.flags == other.header.flags
+            && self.header.vendor_id == other.header.vendor_id
+            && self.value.len() == other.value.len()
+    }
+}
+
+impl Eq for SwmAdditionalAvp {}
 
 pub(super) fn additional_avp_sequences_match(
     left: &[SwmAdditionalAvp],
@@ -1046,6 +1102,11 @@ pub(super) fn additional_avp_sequences_match(
             .iter()
             .zip(right)
             .all(|(left, right)| left.has_same_replay_value(right))
+}
+
+pub(super) fn contains_ietf_class_avp(avps: &[SwmAdditionalAvp]) -> bool {
+    avps.iter()
+        .any(|avp| avp.header().key() == AvpKey::ietf(base::AVP_CLASS))
 }
 
 impl fmt::Debug for SwmAdditionalAvp {
@@ -1574,7 +1635,7 @@ impl SwmSessionTerminationRequestEnvelope {
         self.proxy_infos.len()
     }
 
-    /// Return whether `other` carries the same immutable STR replay payload.
+    /// Compare the immutable STR replay payload with `other`.
     ///
     /// RFC 6733 sections 3 and 5.5.4 define duplicate identity and the
     /// hop-local fields that may change during failover. This SDK operation
@@ -1585,11 +1646,39 @@ impl SwmSessionTerminationRequestEnvelope {
     /// expected-answer peer binding. Derived AVP length fields are also ignored
     /// because encoding computes them from the retained value.
     ///
-    /// The result is only a boolean and exposes no retained AVP value. Active
-    /// session ownership, duplicate-cache lifetime, and replay disposition
-    /// remain consumer policy.
+    /// Exact public preflight is deliberately unavailable if either request
+    /// contains IETF Class. In that case this returns
+    /// [`SwmReplayPayloadComparison::OpaqueClassUncomparable`] before comparing
+    /// retained bytes. Consumers must fail closed and use committed,
+    /// transport-owned wire state rather than a digest or candidate comparator.
+    #[must_use]
+    pub fn compare_replay_payload(&self, other: &Self) -> SwmReplayPayloadComparison {
+        if contains_ietf_class_avp(&self.request.additional_avps)
+            || contains_ietf_class_avp(&other.request.additional_avps)
+        {
+            return SwmReplayPayloadComparison::OpaqueClassUncomparable;
+        }
+        if self.has_same_replay_payload_exact(other) {
+            SwmReplayPayloadComparison::Same
+        } else {
+            SwmReplayPayloadComparison::Different
+        }
+    }
+
+    /// Return whether `other` carries the same publicly comparable STR replay
+    /// payload.
+    ///
+    /// This source-compatible boolean delegates to
+    /// [`Self::compare_replay_payload`] and returns `true` only for
+    /// [`SwmReplayPayloadComparison::Same`]. It therefore returns `false` for
+    /// both different payloads and Class-bearing, deliberately uncomparable
+    /// payloads.
     #[must_use]
     pub fn same_replay_payload(&self, other: &Self) -> bool {
+        self.compare_replay_payload(other).is_same()
+    }
+
+    fn has_same_replay_payload_exact(&self, other: &Self) -> bool {
         self.transaction.end_to_end_identifier() == other.transaction.end_to_end_identifier()
             && self.proxiable == other.proxiable
             && self.request.has_same_replay_fields(&other.request)
@@ -1620,7 +1709,7 @@ impl SwmSessionTerminationRequestEnvelope {
                 return Err(SwmSessionTerminationCorrelationError::SessionMismatch);
             }
         }
-        if self.proxy_infos != answer.proxy_infos {
+        if !additional_avp_sequences_match(&self.proxy_infos, &answer.proxy_infos) {
             return Err(SwmSessionTerminationCorrelationError::ProxyInfoMismatch);
         }
         validate_correlated_overload_control(
@@ -2175,7 +2264,7 @@ impl SwmAbortSessionRequestEnvelope {
         self.proxy_infos.len()
     }
 
-    /// Return whether `other` carries the same immutable ASR replay payload.
+    /// Compare the immutable ASR replay payload with `other`.
     ///
     /// RFC 6733 sections 3 and 5.5.4 define duplicate identity and the
     /// hop-local fields that may change during failover. This SDK operation
@@ -2186,11 +2275,39 @@ impl SwmAbortSessionRequestEnvelope {
     /// expected-answer peer binding. Derived AVP length fields are also ignored
     /// because encoding computes them from the retained value.
     ///
-    /// The result is only a boolean and exposes no retained AVP value. Active
-    /// session ownership, duplicate-cache lifetime, and replay disposition
-    /// remain consumer policy.
+    /// Exact public preflight is deliberately unavailable if either request
+    /// contains IETF Class. In that case this returns
+    /// [`SwmReplayPayloadComparison::OpaqueClassUncomparable`] before comparing
+    /// retained bytes. Consumers must fail closed and use committed,
+    /// transport-owned wire state rather than a digest or candidate comparator.
+    #[must_use]
+    pub fn compare_replay_payload(&self, other: &Self) -> SwmReplayPayloadComparison {
+        if contains_ietf_class_avp(&self.request.additional_avps)
+            || contains_ietf_class_avp(&other.request.additional_avps)
+        {
+            return SwmReplayPayloadComparison::OpaqueClassUncomparable;
+        }
+        if self.has_same_replay_payload_exact(other) {
+            SwmReplayPayloadComparison::Same
+        } else {
+            SwmReplayPayloadComparison::Different
+        }
+    }
+
+    /// Return whether `other` carries the same publicly comparable ASR replay
+    /// payload.
+    ///
+    /// This source-compatible boolean delegates to
+    /// [`Self::compare_replay_payload`] and returns `true` only for
+    /// [`SwmReplayPayloadComparison::Same`]. It therefore returns `false` for
+    /// both different payloads and Class-bearing, deliberately uncomparable
+    /// payloads.
     #[must_use]
     pub fn same_replay_payload(&self, other: &Self) -> bool {
+        self.compare_replay_payload(other).is_same()
+    }
+
+    fn has_same_replay_payload_exact(&self, other: &Self) -> bool {
         self.transaction.end_to_end_identifier() == other.transaction.end_to_end_identifier()
             && self.proxiable == other.proxiable
             && self.request.has_same_replay_fields(&other.request)
@@ -2279,7 +2396,7 @@ impl SwmAbortSessionRequestEnvelope {
                 return Err(SwmAbortSessionCorrelationError::UserNameMismatch);
             }
         }
-        if self.proxy_infos != answer.proxy_infos {
+        if !additional_avp_sequences_match(&self.proxy_infos, &answer.proxy_infos) {
             return Err(SwmAbortSessionCorrelationError::ProxyInfoMismatch);
         }
         validate_abort_correlated_overload_control(
