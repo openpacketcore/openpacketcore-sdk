@@ -1,19 +1,203 @@
 //! Canonical immutable identity manifest for one root-cgroup fence generation.
 
-use std::{collections::BTreeSet, num::NonZeroU64};
+use std::collections::BTreeSet;
 
 use crate::root_inventory::RootInventory;
+use opc_egress_fence_common::{
+    EGRESS_FENCE_CONFIG_MAP_NAME, EGRESS_FENCE_CONFIG_VALUE_LEN, EGRESS_FENCE_CONTROL_PROGRAM_NAME,
+    EGRESS_FENCE_COOKIE_KEY_LEN, EGRESS_FENCE_COOKIE_MAP_NAME, EGRESS_FENCE_COOKIE_VALUE_LEN,
+    EGRESS_FENCE_COUNTER_MAP_NAME, EGRESS_FENCE_COUNTER_SLOTS, EGRESS_FENCE_CURRENT_MAP_NAME,
+    EGRESS_FENCE_CURRENT_VALUE_LEN, EGRESS_FENCE_INSPECT_PROGRAM_NAME, EGRESS_FENCE_LOCK_MAP_NAME,
+    EGRESS_FENCE_MAX_COOKIE_ENTRIES, EGRESS_FENCE_MUTATION_MAP_NAME, EGRESS_FENCE_PROGRAM_NAME,
+};
 
 pub(crate) const INSTALL_MANIFEST_BYTES: usize = 2_048;
 pub(crate) const INSTALL_PROGRAM_COUNT: usize = 3;
+/// Shared maps loaded from the committed eBPF object.
+pub(crate) const OBJECT_MAP_COUNT: usize = 6;
+/// Six shared object maps plus the installer-created frozen manifest map.
 pub(crate) const INSTALL_MAP_COUNT: usize = 7;
-pub(crate) const MAX_PROGRAM_MAPS: usize = INSTALL_MAP_COUNT;
+pub(crate) const MAX_PROGRAM_MAPS: usize = OBJECT_MAP_COUNT;
 const MAX_ROOT_PROGRAMS: usize = 64;
 const OBJECT_NAME_BYTES: usize = 16;
 const MANIFEST_MAGIC: [u8; 8] = *b"OPCFM001";
-const MANIFEST_VERSION: u32 = 1;
+const MANIFEST_VERSION: u32 = 3;
 const BPF_F_ALLOW_MULTI: u32 = 1 << 1;
-const ENCODED_FIELDS_BYTES: usize = 1_112;
+const BPF_PROG_TYPE_SCHED_CLS: u32 = 3;
+const BPF_PROG_TYPE_CGROUP_SKB: u32 = 8;
+const BPF_MAP_TYPE_HASH: u32 = 1;
+const BPF_MAP_TYPE_ARRAY: u32 = 2;
+const BPF_MAP_TYPE_PERCPU_ARRAY: u32 = 6;
+pub(crate) const MANIFEST_MAP_NAME: &str = "OPC_FENCE_MAN";
+const ENCODED_FIELDS_BYTES: usize = 1_128;
+
+/// Exact maps whose syscall-side mutation is disabled with `BPF_MAP_FREEZE`.
+///
+/// `OPC_FENCE_LOCK` is intentionally absent. Linux rejects `BPF_MAP_FREEZE`
+/// for BTF maps whose values contain special fields such as `bpf_spin_lock`.
+/// Its exact schema, kernel identity, program references, and initial zero
+/// value remain mandatory admission evidence.
+pub(crate) const USERSPACE_FROZEN_MAP_NAMES: [&str; INSTALL_MAP_COUNT - 1] = [
+    EGRESS_FENCE_COOKIE_MAP_NAME,
+    EGRESS_FENCE_CONFIG_MAP_NAME,
+    EGRESS_FENCE_COUNTER_MAP_NAME,
+    EGRESS_FENCE_CURRENT_MAP_NAME,
+    EGRESS_FENCE_MUTATION_MAP_NAME,
+    MANIFEST_MAP_NAME,
+];
+
+/// Exact bounded set of names allowed inside one generation directory.
+pub(crate) const INSTALL_PIN_OBJECT_NAMES: [&str; INSTALL_PROGRAM_COUNT + INSTALL_MAP_COUNT] = [
+    EGRESS_FENCE_PROGRAM_NAME,
+    EGRESS_FENCE_CONTROL_PROGRAM_NAME,
+    EGRESS_FENCE_INSPECT_PROGRAM_NAME,
+    EGRESS_FENCE_COOKIE_MAP_NAME,
+    EGRESS_FENCE_CONFIG_MAP_NAME,
+    EGRESS_FENCE_COUNTER_MAP_NAME,
+    EGRESS_FENCE_CURRENT_MAP_NAME,
+    EGRESS_FENCE_LOCK_MAP_NAME,
+    EGRESS_FENCE_MUTATION_MAP_NAME,
+    MANIFEST_MAP_NAME,
+];
+
+#[derive(Clone, Copy)]
+struct ProgramSchema {
+    name: &'static str,
+    program_type: u32,
+    map_mask: u8,
+}
+
+const PROGRAM_SCHEMAS: [ProgramSchema; INSTALL_PROGRAM_COUNT] = [
+    ProgramSchema {
+        name: EGRESS_FENCE_PROGRAM_NAME,
+        program_type: BPF_PROG_TYPE_CGROUP_SKB,
+        map_mask: 0b01_1111,
+    },
+    ProgramSchema {
+        name: EGRESS_FENCE_CONTROL_PROGRAM_NAME,
+        program_type: BPF_PROG_TYPE_SCHED_CLS,
+        map_mask: 0b11_1011,
+    },
+    ProgramSchema {
+        name: EGRESS_FENCE_INSPECT_PROGRAM_NAME,
+        program_type: BPF_PROG_TYPE_SCHED_CLS,
+        map_mask: 0b11_1011,
+    },
+];
+
+#[derive(Clone, Copy)]
+struct MapSchema {
+    name: &'static str,
+    map_type: u32,
+    key_size: u32,
+    value_size: u32,
+    max_entries: u32,
+    map_flags: u32,
+    freeze_policy: MapFreezePolicy,
+}
+
+const MAP_SCHEMAS: [MapSchema; INSTALL_MAP_COUNT] = [
+    MapSchema {
+        name: EGRESS_FENCE_COOKIE_MAP_NAME,
+        map_type: BPF_MAP_TYPE_HASH,
+        key_size: EGRESS_FENCE_COOKIE_KEY_LEN as u32,
+        value_size: EGRESS_FENCE_COOKIE_VALUE_LEN as u32,
+        max_entries: EGRESS_FENCE_MAX_COOKIE_ENTRIES,
+        map_flags: 0,
+        freeze_policy: MapFreezePolicy::Required,
+    },
+    MapSchema {
+        name: EGRESS_FENCE_CONFIG_MAP_NAME,
+        map_type: BPF_MAP_TYPE_ARRAY,
+        key_size: 4,
+        value_size: EGRESS_FENCE_CONFIG_VALUE_LEN as u32,
+        max_entries: 1,
+        map_flags: 0,
+        freeze_policy: MapFreezePolicy::Required,
+    },
+    MapSchema {
+        name: EGRESS_FENCE_COUNTER_MAP_NAME,
+        map_type: BPF_MAP_TYPE_PERCPU_ARRAY,
+        key_size: 4,
+        value_size: 8,
+        max_entries: EGRESS_FENCE_COUNTER_SLOTS,
+        map_flags: 0,
+        freeze_policy: MapFreezePolicy::Required,
+    },
+    MapSchema {
+        name: EGRESS_FENCE_CURRENT_MAP_NAME,
+        map_type: BPF_MAP_TYPE_ARRAY,
+        key_size: 4,
+        value_size: EGRESS_FENCE_CURRENT_VALUE_LEN as u32,
+        max_entries: 1,
+        map_flags: 0,
+        freeze_policy: MapFreezePolicy::Required,
+    },
+    MapSchema {
+        name: EGRESS_FENCE_LOCK_MAP_NAME,
+        map_type: BPF_MAP_TYPE_ARRAY,
+        key_size: 4,
+        value_size: 4,
+        max_entries: 1,
+        map_flags: 0,
+        freeze_policy: MapFreezePolicy::KernelUnsupportedSpecialField,
+    },
+    MapSchema {
+        name: EGRESS_FENCE_MUTATION_MAP_NAME,
+        map_type: BPF_MAP_TYPE_ARRAY,
+        key_size: 4,
+        value_size: 16,
+        max_entries: 1,
+        map_flags: 0,
+        freeze_policy: MapFreezePolicy::Required,
+    },
+    MapSchema {
+        name: MANIFEST_MAP_NAME,
+        map_type: BPF_MAP_TYPE_ARRAY,
+        key_size: 4,
+        value_size: INSTALL_MANIFEST_BYTES as u32,
+        max_entries: 1,
+        map_flags: 0,
+        freeze_policy: MapFreezePolicy::Required,
+    },
+];
+
+/// Syscall-side freeze requirement persisted for every manifest map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MapFreezePolicy {
+    /// Linux rejects `BPF_MAP_FREEZE` because the BTF value has a special
+    /// kernel-managed field. This policy is valid only for `OPC_FENCE_LOCK`.
+    KernelUnsupportedSpecialField = 0,
+    /// Installation must freeze the map and every integrity check must prove
+    /// the live kernel map still reports frozen.
+    Required = 1,
+}
+
+impl MapFreezePolicy {
+    pub(crate) fn for_map_name(name: &str) -> Result<Self, ManifestError> {
+        MAP_SCHEMAS
+            .iter()
+            .find(|schema| schema.name == name)
+            .map(|schema| schema.freeze_policy)
+            .ok_or(ManifestError::Invalid)
+    }
+
+    pub(crate) const fn requires_userspace_freeze(self) -> bool {
+        matches!(self, Self::Required)
+    }
+
+    const fn encode(self) -> u32 {
+        self as u32
+    }
+
+    fn decode(encoded: u32) -> Result<Self, ManifestError> {
+        match encoded {
+            0 => Ok(Self::KernelUnsupportedSpecialField),
+            1 => Ok(Self::Required),
+            _ => Err(ManifestError::Invalid),
+        }
+    }
+}
 
 /// Stable 128-bit nonce naming one complete pin generation.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -59,6 +243,7 @@ pub(crate) struct ManifestMap {
     pub(crate) value_size: u32,
     pub(crate) max_entries: u32,
     pub(crate) map_flags: u32,
+    pub(crate) freeze_policy: MapFreezePolicy,
 }
 
 /// Canonical NUL-padded Linux BPF object name.
@@ -120,8 +305,8 @@ pub(crate) struct InstallManifest {
     pub(crate) generation_id: InstallGenerationId,
     pub(crate) artifact_digest: [u8; 32],
     pub(crate) config_digest: [u8; 32],
-    pub(crate) pre_revision: NonZeroU64,
-    pub(crate) post_revision: NonZeroU64,
+    pub(crate) pre_revision: u64,
+    pub(crate) post_revision: u64,
     pub(crate) pre_attach_flags: u32,
     pub(crate) post_attach_flags: u32,
     pub(crate) pre_program_ids: [u32; MAX_ROOT_PROGRAMS],
@@ -138,7 +323,7 @@ impl InstallManifest {
         artifact_digest: [u8; 32],
         config_digest: [u8; 32],
         before: &RootInventory,
-        post_revision: NonZeroU64,
+        post_revision: u64,
         programs: [ManifestProgram; INSTALL_PROGRAM_COUNT],
         maps: [ManifestMap; INSTALL_MAP_COUNT],
     ) -> Result<Self, ManifestError> {
@@ -176,8 +361,8 @@ impl InstallManifest {
         writer.bytes(&self.generation_id.bytes())?;
         writer.bytes(&self.artifact_digest)?;
         writer.bytes(&self.config_digest)?;
-        writer.u64(self.pre_revision.get())?;
-        writer.u64(self.post_revision.get())?;
+        writer.u64(self.pre_revision)?;
+        writer.u64(self.post_revision)?;
         writer.u32(self.pre_attach_flags)?;
         writer.u32(self.post_attach_flags)?;
         writer.u32(self.pre_program_count)?;
@@ -205,6 +390,7 @@ impl InstallManifest {
             writer.u32(map.value_size)?;
             writer.u32(map.max_entries)?;
             writer.u32(map.map_flags)?;
+            writer.u32(map.freeze_policy.encode())?;
         }
         if writer.position() != ENCODED_FIELDS_BYTES {
             return Err(ManifestError::Invalid);
@@ -220,8 +406,8 @@ impl InstallManifest {
         let generation_id = InstallGenerationId::new(reader.array::<16>()?)?;
         let artifact_digest = reader.array::<32>()?;
         let config_digest = reader.array::<32>()?;
-        let pre_revision = NonZeroU64::new(reader.u64()?).ok_or(ManifestError::Invalid)?;
-        let post_revision = NonZeroU64::new(reader.u64()?).ok_or(ManifestError::Invalid)?;
+        let pre_revision = reader.u64()?;
+        let post_revision = reader.u64()?;
         let pre_attach_flags = reader.u32()?;
         let post_attach_flags = reader.u32()?;
         let pre_program_count = reader.u32()?;
@@ -256,6 +442,7 @@ impl InstallManifest {
             map.value_size = reader.u32()?;
             map.max_entries = reader.u32()?;
             map.map_flags = reader.u32()?;
+            map.freeze_policy = MapFreezePolicy::decode(reader.u32()?)?;
         }
         if reader.position() != ENCODED_FIELDS_BYTES
             || encoded[ENCODED_FIELDS_BYTES..]
@@ -287,64 +474,114 @@ impl InstallManifest {
             usize::try_from(self.pre_program_count).map_err(|_| ManifestError::Invalid)?;
         if self.artifact_digest.iter().all(|byte| *byte == 0)
             || self.config_digest.iter().all(|byte| *byte == 0)
-            || pre_count >= MAX_ROOT_PROGRAMS
-            || self.pre_program_ids[..pre_count].contains(&0)
-            || self.pre_program_ids[pre_count..].iter().any(|id| *id != 0)
-            || self.pre_program_attach_flags[pre_count..]
+            || pre_count != 0
+            || self.pre_program_ids.iter().any(|id| *id != 0)
+            || self
+                .pre_program_attach_flags
                 .iter()
                 .any(|flags| *flags != 0)
-            || self.post_revision.get() != self.pre_revision.get().checked_add(1).unwrap_or(0)
+            || self.post_revision != self.pre_revision.checked_add(1).unwrap_or(0)
+            || self.pre_attach_flags != 0
             || self.post_attach_flags != BPF_F_ALLOW_MULTI
-        {
-            return Err(ManifestError::Invalid);
-        }
-        let expected_pre_flags = if pre_count == 0 { 0 } else { BPF_F_ALLOW_MULTI };
-        if self.pre_attach_flags != expected_pre_flags
-            || self.pre_program_attach_flags[..pre_count]
-                .iter()
-                .any(|flags| *flags != expected_pre_flags)
         {
             return Err(ManifestError::Invalid);
         }
 
         let mut program_ids = BTreeSet::new();
-        let mut program_names = BTreeSet::new();
         let mut map_ids = BTreeSet::new();
-        let mut map_names = BTreeSet::new();
-        for map in &self.maps {
+        for (map, schema) in self.maps.iter().zip(MAP_SCHEMAS) {
             if map.id == 0
-                || map.map_type == 0
-                || map.key_size == 0
-                || map.value_size == 0
-                || map.max_entries == 0
+                || map.name.as_str() != schema.name
+                || map.map_type != schema.map_type
+                || map.key_size != schema.key_size
+                || map.value_size != schema.value_size
+                || map.max_entries != schema.max_entries
+                || map.map_flags != schema.map_flags
+                || map.freeze_policy != schema.freeze_policy
                 || !map_ids.insert(map.id)
-                || !map_names.insert(map.name)
             {
                 return Err(ManifestError::Invalid);
             }
         }
-        for program in &self.programs {
+        let frozen_map_names = self
+            .maps
+            .iter()
+            .filter(|map| map.freeze_policy.requires_userspace_freeze())
+            .map(|map| map.name.as_str())
+            .collect::<BTreeSet<_>>();
+        if frozen_map_names != USERSPACE_FROZEN_MAP_NAMES.into_iter().collect() {
+            return Err(ManifestError::Invalid);
+        }
+        let shared_map_ids = self.maps[..OBJECT_MAP_COUNT]
+            .iter()
+            .map(|map| map.id)
+            .collect::<BTreeSet<_>>();
+        let manifest_map_id = self.maps[OBJECT_MAP_COUNT].id;
+        for ((program, schema), index) in self
+            .programs
+            .iter()
+            .zip(PROGRAM_SCHEMAS)
+            .zip(0..INSTALL_PROGRAM_COUNT)
+        {
             let count = usize::try_from(program.map_count).map_err(|_| ManifestError::Invalid)?;
+            let expected_map_ids = expected_program_map_ids(index, &self.maps);
+            let actual_map_ids = program.map_ids[..count.min(MAX_PROGRAM_MAPS)]
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>();
             if program.id == 0
-                || program.program_type == 0
+                || program.name.as_str() != schema.name
+                || program.program_type != schema.program_type
                 || program.tag == 0
-                || count == 0
+                || count
+                    != usize::try_from(schema.map_mask.count_ones())
+                        .map_err(|_| ManifestError::Invalid)?
                 || count > MAX_PROGRAM_MAPS
                 || program.map_ids[..count].contains(&0)
                 || program.map_ids[count..].iter().any(|id| *id != 0)
-                || program.map_ids[..count]
-                    .iter()
-                    .any(|map_id| !map_ids.contains(map_id))
+                || actual_map_ids.len() != count
+                || actual_map_ids != expected_map_ids
+                || !actual_map_ids.is_subset(&shared_map_ids)
+                || actual_map_ids.contains(&manifest_map_id)
                 || !program_ids.insert(program.id)
-                || !program_names.insert(program.name)
             {
                 return Err(ManifestError::Invalid);
             }
         }
-        if self.pre_program_ids[..pre_count].contains(&self.programs[0].id) {
-            return Err(ManifestError::Invalid);
-        }
         Ok(())
+    }
+
+    /// Validate the live root inventory against this generation's persisted
+    /// exact pre-attachment provenance.
+    ///
+    /// A prepared generation is recoverable only while the root still matches
+    /// the inventory captured before direct attachment. This comparison keeps
+    /// the full persisted representation even though the current protocol
+    /// admits only an empty pre-attachment program list.
+    pub(crate) fn validates_root_pre_attach(&self, observed: &RootInventory) -> bool {
+        if self.validate().is_err() {
+            return false;
+        }
+        let Ok(count) = usize::try_from(self.pre_program_count) else {
+            return false;
+        };
+        let Some(expected_program_ids) = self.pre_program_ids.get(..count) else {
+            return false;
+        };
+        let Some(expected_program_flags) = self.pre_program_attach_flags.get(..count) else {
+            return false;
+        };
+        observed.revision() == self.pre_revision
+            && observed.attach_flags() == self.pre_attach_flags
+            && observed.program_ids() == expected_program_ids
+            && observed.program_attach_flags() == expected_program_flags
+    }
+
+    /// Validate the live root inventory against this generation's persisted
+    /// direct-attachment provenance.
+    pub(crate) fn validates_root_adoption(&self, observed: &RootInventory) -> bool {
+        self.validate().is_ok()
+            && observed.matches_trusted_direct_attachment(self.post_revision, self.programs[0].id)
     }
 }
 
@@ -355,8 +592,9 @@ impl std::fmt::Debug for InstallManifest {
             .field("generation_present", &true)
             .field("program_count", &INSTALL_PROGRAM_COUNT)
             .field("map_count", &INSTALL_MAP_COUNT)
+            .field("object_map_count", &OBJECT_MAP_COUNT)
             .field("pre_program_count", &self.pre_program_count)
-            .field("revisions_verified_nonzero", &true)
+            .field("revisions_verified", &true)
             .finish()
     }
 }
@@ -390,7 +628,22 @@ const fn empty_map() -> ManifestMap {
         value_size: 0,
         max_entries: 0,
         map_flags: 0,
+        freeze_policy: MapFreezePolicy::KernelUnsupportedSpecialField,
     }
+}
+
+fn expected_program_map_ids(
+    program_index: usize,
+    maps: &[ManifestMap; INSTALL_MAP_COUNT],
+) -> BTreeSet<u32> {
+    let mut expected = BTreeSet::new();
+    let mask = PROGRAM_SCHEMAS[program_index].map_mask;
+    for (index, map) in maps[..OBJECT_MAP_COUNT].iter().enumerate() {
+        if mask & (1_u8 << index) != 0 {
+            expected.insert(map.id);
+        }
+    }
+    expected
 }
 
 struct ManifestWriter<'a> {
@@ -476,35 +729,53 @@ mod tests {
     use super::*;
     use crate::root_inventory::RootInventory;
 
-    fn manifest() -> InstallManifest {
-        let before = RootInventory::fixture(41, vec![3, 5, 7]);
-        let maps = std::array::from_fn(|index| ManifestMap {
-            name: KernelObjectName::new(&format!("map_{index}")).expect("map name"),
-            id: 101 + index as u32,
-            map_type: 2 + index as u32,
-            key_size: 4,
-            value_size: 40 + index as u32,
-            max_entries: 1 + index as u32,
-            map_flags: index as u32,
-        });
-        let programs = std::array::from_fn(|index| {
-            let program_map_ids =
-                std::array::from_fn::<u32, MAX_PROGRAM_MAPS, _>(|map| 101 + map as u32);
-            ManifestProgram {
-                name: KernelObjectName::new(&format!("prog_{index}")).expect("program name"),
-                id: 201 + index as u32,
-                program_type: 8,
-                tag: 301 + index as u64,
-                map_ids: program_map_ids,
-                map_count: INSTALL_MAP_COUNT as u32,
+    fn maps() -> [ManifestMap; INSTALL_MAP_COUNT] {
+        std::array::from_fn(|index| {
+            let schema = MAP_SCHEMAS[index];
+            ManifestMap {
+                name: KernelObjectName::new(schema.name).expect("stable map name"),
+                id: 101 + index as u32,
+                map_type: schema.map_type,
+                key_size: schema.key_size,
+                value_size: schema.value_size,
+                max_entries: schema.max_entries,
+                map_flags: schema.map_flags,
+                freeze_policy: schema.freeze_policy,
             }
-        });
+        })
+    }
+
+    fn programs(
+        maps: &[ManifestMap; INSTALL_MAP_COUNT],
+    ) -> [ManifestProgram; INSTALL_PROGRAM_COUNT] {
+        std::array::from_fn(|index| {
+            let schema = PROGRAM_SCHEMAS[index];
+            let expected = expected_program_map_ids(index, maps);
+            let mut map_ids = [0_u32; MAX_PROGRAM_MAPS];
+            let mut ids = expected.into_iter().collect::<Vec<_>>();
+            ids.reverse();
+            map_ids[..ids.len()].copy_from_slice(&ids);
+            ManifestProgram {
+                name: KernelObjectName::new(schema.name).expect("stable program name"),
+                id: 201 + index as u32,
+                program_type: schema.program_type,
+                tag: 301 + index as u64,
+                map_ids,
+                map_count: u32::try_from(ids.len()).expect("small map count"),
+            }
+        })
+    }
+
+    fn manifest() -> InstallManifest {
+        let before = RootInventory::fixture(0, vec![]);
+        let maps = maps();
+        let programs = programs(&maps);
         InstallManifest::new(
             InstallGenerationId::new([9_u8; 16]).expect("generation"),
             [11_u8; 32],
             [13_u8; 32],
             &before,
-            NonZeroU64::new(42).expect("post revision"),
+            1,
             programs,
             maps,
         )
@@ -522,10 +793,26 @@ mod tests {
     }
 
     #[test]
+    fn syscall_freeze_policy_is_exact_and_excludes_only_the_btf_lock_map() {
+        let expected = manifest();
+        let frozen = expected
+            .maps
+            .iter()
+            .filter(|map| map.freeze_policy.requires_userspace_freeze())
+            .map(|map| map.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(frozen, USERSPACE_FROZEN_MAP_NAMES);
+        assert_eq!(
+            MapFreezePolicy::for_map_name(EGRESS_FENCE_LOCK_MAP_NAME),
+            Ok(MapFreezePolicy::KernelUnsupportedSpecialField)
+        );
+    }
+
+    #[test]
     fn corrupt_header_identity_and_padding_fail_closed() {
         let expected = manifest();
         let encoded = expected.encode().expect("encode");
-        for offset in [0, 8, 92, 100, 108, 116, 120, 124, 640, 832] {
+        for offset in [0, 8, 92, 100, 108, 112, 116, 120, 124, 640, 820, 836] {
             let mut mutated = encoded;
             mutated[offset] ^= 0x80;
             assert_eq!(
@@ -534,16 +821,141 @@ mod tests {
                 "offset {offset}"
             );
         }
-        for offset in [12, 28, 60, 128, 664, 868] {
+        for offset in [12, 28, 60, 656] {
             let mut mutated = encoded;
             mutated[offset] ^= 1;
-            let decoded = InstallManifest::decode(&mutated).expect("canonical identity mutation");
+            let decoded = InstallManifest::decode(&mutated).unwrap_or_else(|error| {
+                panic!("canonical identity mutation at {offset}: {error:?}")
+            });
             assert_ne!(decoded, expected, "offset {offset}");
         }
         let mut mutated = encoded;
         mutated[INSTALL_MANIFEST_BYTES - 1] = 1;
         assert_eq!(
             InstallManifest::decode(&mutated),
+            Err(ManifestError::Invalid)
+        );
+    }
+
+    #[test]
+    fn program_map_freeze_and_manifest_schemas_reject_every_drift_class() {
+        let expected = manifest();
+        let mut mutations = Vec::new();
+
+        let mut mutation = expected.clone();
+        mutation.programs[0].name =
+            KernelObjectName::new("opc_wrong_gate").expect("valid wrong name");
+        mutations.push(mutation);
+
+        let mut mutation = expected.clone();
+        mutation.programs[1].program_type = BPF_PROG_TYPE_CGROUP_SKB;
+        mutations.push(mutation);
+
+        let mut mutation = expected.clone();
+        mutation.programs[2].map_ids[0] = mutation.maps[OBJECT_MAP_COUNT].id;
+        mutations.push(mutation);
+
+        let mut mutation = expected.clone();
+        mutation.programs[0].map_count -= 1;
+        mutations.push(mutation);
+
+        let mut mutation = expected.clone();
+        mutation.maps[0].name = KernelObjectName::new("OPC_FENCE_BAD").expect("valid wrong name");
+        mutations.push(mutation);
+
+        let mut mutation = expected.clone();
+        mutation.maps[1].value_size += 1;
+        mutations.push(mutation);
+
+        let mut mutation = expected.clone();
+        mutation.maps[OBJECT_MAP_COUNT].map_type = BPF_MAP_TYPE_HASH;
+        mutations.push(mutation);
+
+        let mut mutation = expected.clone();
+        mutation.maps[OBJECT_MAP_COUNT].max_entries = 2;
+        mutations.push(mutation);
+
+        let mut mutation = expected.clone();
+        mutation.maps[OBJECT_MAP_COUNT].id = mutation.maps[0].id;
+        mutations.push(mutation);
+
+        let mut mutation = expected.clone();
+        mutation.maps[0].freeze_policy = MapFreezePolicy::KernelUnsupportedSpecialField;
+        mutations.push(mutation);
+
+        let mut mutation = expected.clone();
+        mutation.maps[4].freeze_policy = MapFreezePolicy::Required;
+        mutations.push(mutation);
+
+        for mutation in mutations {
+            assert_eq!(mutation.encode(), Err(ManifestError::Invalid));
+        }
+    }
+
+    #[test]
+    fn manifest_records_exact_direct_revision_provenance_for_adoption() {
+        let manifest = manifest();
+        assert_eq!(manifest.pre_revision, 0);
+        assert_eq!(manifest.post_revision, 1);
+        assert!(manifest.validates_root_pre_attach(&RootInventory::fixture(0, vec![])));
+        assert!(manifest
+            .validates_root_adoption(&RootInventory::fixture(1, vec![manifest.programs[0].id])));
+
+        for foreign_or_stale in [
+            RootInventory::fixture(1, vec![]),
+            RootInventory::fixture(0, vec![manifest.programs[0].id]),
+        ] {
+            assert!(!manifest.validates_root_pre_attach(&foreign_or_stale));
+        }
+        for foreign_or_stale in [
+            RootInventory::fixture(0, vec![manifest.programs[0].id]),
+            RootInventory::fixture(2, vec![manifest.programs[0].id]),
+            RootInventory::fixture(1, vec![]),
+            RootInventory::fixture(1, vec![manifest.programs[1].id]),
+            RootInventory::fixture(1, vec![manifest.programs[0].id, manifest.programs[1].id]),
+        ] {
+            assert!(!manifest.validates_root_adoption(&foreign_or_stale));
+        }
+
+        let mut corrupt = manifest.clone();
+        corrupt.pre_attach_flags = BPF_F_ALLOW_MULTI;
+        assert!(!corrupt.validates_root_pre_attach(&RootInventory::fixture(0, vec![])));
+    }
+
+    #[test]
+    fn prepared_recovery_accepts_exact_nonzero_empty_pre_revision() {
+        let before = RootInventory::fixture(41, vec![]);
+        let maps = maps();
+        let manifest = InstallManifest::new(
+            InstallGenerationId::new([9_u8; 16]).expect("generation"),
+            [11_u8; 32],
+            [13_u8; 32],
+            &before,
+            42,
+            programs(&maps),
+            maps,
+        )
+        .expect("manifest");
+
+        assert!(manifest.validates_root_pre_attach(&before));
+        assert!(!manifest.validates_root_pre_attach(&RootInventory::fixture(40, vec![])));
+        assert!(!manifest.validates_root_pre_attach(&RootInventory::fixture(42, vec![])));
+    }
+
+    #[test]
+    fn foreign_pre_attachment_cannot_be_encoded_as_direct_provenance() {
+        let before = RootInventory::fixture(41, vec![99]);
+        let maps = maps();
+        assert_eq!(
+            InstallManifest::new(
+                InstallGenerationId::new([9_u8; 16]).expect("generation"),
+                [11_u8; 32],
+                [13_u8; 32],
+                &before,
+                42,
+                programs(&maps),
+                maps,
+            ),
             Err(ManifestError::Invalid)
         );
     }
@@ -572,10 +984,11 @@ mod tests {
     fn manifest_debug_redacts_all_kernel_identities() {
         let manifest = manifest();
         let debug = format!("{manifest:?}");
-        for fragment in ["201", "101", "41", "42", "prog_0", "map_0"] {
+        for fragment in ["201", "101", "opc_egress_gate", "OPC_FENCE_CKS"] {
             assert!(!debug.contains(fragment));
         }
         assert!(debug.contains("program_count: 3"));
         assert!(debug.contains("map_count: 7"));
+        assert!(debug.contains("object_map_count: 6"));
     }
 }

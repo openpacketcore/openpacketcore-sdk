@@ -1,0 +1,373 @@
+name: Egress fence
+
+on:
+  pull_request:
+    paths:
+      - "crates/opc-egress-fence/**"
+      - "crates/opc-egress-fence-common/**"
+      - "crates/opc-egress-fence-ebpf/**"
+      - "crates/opc-linux-gtpu-sys/**"
+      - "crates/opc-linux-xfrm-sys/**"
+      - "crates/opc-runtime/**"
+      - "crates/opc-session-store/**"
+      - "crates/opc-session-testkit/qualification/v6/session-ha-profile.json"
+      - "crates/opc-session-testkit/qualification/v6/session-ha-profile.schema.json"
+      - "crates/opc-session-testkit/tests/qualification_profile.rs"
+      - "scripts/build-egress-fence-ebpf.sh"
+      - "scripts/publish-order.py"
+      - ".github/workflows/egress-fence.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  push:
+    branches:
+      - main
+    paths:
+      - "crates/opc-egress-fence/**"
+      - "crates/opc-egress-fence-common/**"
+      - "crates/opc-egress-fence-ebpf/**"
+      - "crates/opc-linux-gtpu-sys/**"
+      - "crates/opc-linux-xfrm-sys/**"
+      - "crates/opc-runtime/**"
+      - "crates/opc-session-store/**"
+      - "crates/opc-session-testkit/qualification/v6/session-ha-profile.json"
+      - "crates/opc-session-testkit/qualification/v6/session-ha-profile.schema.json"
+      - "crates/opc-session-testkit/tests/qualification_profile.rs"
+      - "scripts/build-egress-fence-ebpf.sh"
+      - "scripts/publish-order.py"
+      - ".github/workflows/egress-fence.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  root-cgroup-egress:
+    name: Root-cgroup egress fence
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+          targets: aarch64-apple-darwin
+
+      - name: Install pinned eBPF Rust
+        run: |
+          set -euo pipefail
+          rustup toolchain install nightly-2026-06-22 \
+            --profile minimal \
+            --component rust-src \
+            --component clippy \
+            --component rustfmt
+
+      - name: Cache Rust build output
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            crates/opc-egress-fence-ebpf
+
+      - name: Install pinned kernel build tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y bpftool iproute2 llvm
+          cargo install bpf-linker --version 0.10.3 --locked
+
+      - name: Gate host sources
+        run: |
+          set -euo pipefail
+          export CARGO_TARGET_DIR="${RUNNER_TEMP}/egress-fence-host-target"
+          cargo fmt --all --check
+          git diff --check
+          cargo clippy --locked \
+            -p opc-egress-fence \
+            -p opc-egress-fence-common \
+            -p opc-linux-gtpu-sys \
+            -p opc-linux-xfrm-sys \
+            -p opc-runtime \
+            -p opc-session-store \
+            --all-targets \
+            --all-features \
+            -- \
+            -D warnings
+          cargo clippy --locked \
+            -p opc-runtime \
+            --lib \
+            --all-features \
+            --target aarch64-apple-darwin \
+            -- \
+            -D warnings
+          cargo test --locked \
+            -p opc-egress-fence \
+            -p opc-egress-fence-common \
+            -p opc-linux-gtpu-sys \
+            -p opc-linux-xfrm-sys \
+            -p opc-runtime \
+            -p opc-session-store \
+            --all-features \
+            --quiet \
+            -- \
+            --test-threads=4
+          cargo test --locked \
+            -p opc-session-testkit \
+            --test qualification_profile \
+            --quiet \
+            -- \
+            --test-threads=1
+          RUSTDOCFLAGS="-D warnings" cargo doc --locked \
+            -p opc-egress-fence \
+            -p opc-egress-fence-common \
+            -p opc-linux-gtpu-sys \
+            -p opc-linux-xfrm-sys \
+            -p opc-runtime \
+            -p opc-session-store \
+            --all-features \
+            --no-deps
+
+      - name: Gate every eBPF feature surface
+        run: |
+          set -euo pipefail
+          cargo +nightly-2026-06-22 fmt \
+            --manifest-path crates/opc-egress-fence-ebpf/Cargo.toml \
+            --all \
+            -- \
+            --check
+          export CARGO_TARGET_DIR="${RUNNER_TEMP}/egress-fence-ebpf-clippy"
+          export RUSTFLAGS="-C linker=bpf-linker -C link-arg=--btf"
+          cd crates/opc-egress-fence-ebpf
+          cargo +nightly-2026-06-22 clippy --locked \
+            --package opc-egress-fence-ebpf \
+            -- \
+            -D warnings
+          cargo +nightly-2026-06-22 clippy --locked \
+            --package opc-egress-fence-ebpf \
+            --features fault-inject-delete \
+            -- \
+            -D warnings
+          cargo +nightly-2026-06-22 clippy --locked \
+            --package opc-egress-fence-ebpf \
+            --features mutation-bypass-deadline \
+            -- \
+            -D warnings
+          cargo +nightly-2026-06-22 clippy --locked \
+            --package opc-egress-fence-ebpf \
+            --no-default-features \
+            --features mutation-bypass-gate \
+            -- \
+            -D warnings
+
+      - name: Rebuild production and test-only objects
+        run: |
+          set -euo pipefail
+          committed="${RUNNER_TEMP}/egress-fence-committed.bpf.o"
+          production="${RUNNER_TEMP}/egress-fence-production.bpf.o"
+          fault="${RUNNER_TEMP}/egress-fence-fault.bpf.o"
+          deadline="${RUNNER_TEMP}/egress-fence-deadline-mutation.bpf.o"
+          gate="${RUNNER_TEMP}/egress-fence-gate-mutation.bpf.o"
+          cp crates/opc-egress-fence/bpf/opc-egress-fence.bpf.o "${committed}"
+
+          OPC_EBPF_ARTIFACT="${production}" \
+          OPC_EBPF_EXPECTED_ARTIFACT="${committed}" \
+          OPC_EBPF_TARGET_DIR="${RUNNER_TEMP}/egress-fence-production-a" \
+          OPC_EBPF_COMPARISON_TARGET_DIR="${RUNNER_TEMP}/egress-fence-production-b" \
+            ./scripts/build-egress-fence-ebpf.sh
+          OPC_EBPF_FEATURES=fault-inject-delete \
+          OPC_EBPF_ARTIFACT="${fault}" \
+          OPC_EBPF_TARGET_DIR="${RUNNER_TEMP}/egress-fence-fault-a" \
+          OPC_EBPF_COMPARISON_TARGET_DIR="${RUNNER_TEMP}/egress-fence-fault-b" \
+            ./scripts/build-egress-fence-ebpf.sh
+          OPC_EBPF_FEATURES=mutation-bypass-deadline \
+          OPC_EBPF_ARTIFACT="${deadline}" \
+          OPC_EBPF_TARGET_DIR="${RUNNER_TEMP}/egress-fence-deadline-a" \
+          OPC_EBPF_COMPARISON_TARGET_DIR="${RUNNER_TEMP}/egress-fence-deadline-b" \
+            ./scripts/build-egress-fence-ebpf.sh
+          OPC_EBPF_FEATURES=mutation-bypass-gate \
+          OPC_EBPF_ARTIFACT="${gate}" \
+          OPC_EBPF_TARGET_DIR="${RUNNER_TEMP}/egress-fence-gate-a" \
+          OPC_EBPF_COMPARISON_TARGET_DIR="${RUNNER_TEMP}/egress-fence-gate-b" \
+            ./scripts/build-egress-fence-ebpf.sh
+
+      - name: Build and gate independent host oracles
+        run: |
+          set -euo pipefail
+          host_target="$(rustc -vV | awk '/^host:/ { print $2 }')"
+          export CARGO_TARGET_DIR="${RUNNER_TEMP}/egress-fence-oracle-target"
+          cargo test --locked \
+            --manifest-path crates/opc-egress-fence-ebpf/Cargo.toml \
+            --package opc-egress-fence-object-oracle \
+            --bins \
+            --target "${host_target}"
+          cargo build --locked \
+            --manifest-path crates/opc-egress-fence-ebpf/Cargo.toml \
+            --package opc-egress-fence-object-oracle \
+            --bins \
+            --target "${host_target}"
+          cargo clippy --locked \
+            --manifest-path crates/opc-egress-fence-ebpf/Cargo.toml \
+            --package opc-egress-fence-object-oracle \
+            --bins \
+            --target "${host_target}" \
+            -- \
+            -D warnings
+          oracle="${CARGO_TARGET_DIR}/${host_target}/debug/opc-egress-fence-object-oracle"
+          crates/opc-egress-fence-ebpf/oracle/scripts/check-oracle-redaction.sh "${oracle}"
+
+      - name: Require the revision-aware host kernel
+        run: |
+          set -euo pipefail
+          kernel="$(uname -r)"
+          numeric="${kernel%%-*}"
+          major="${numeric%%.*}"
+          remainder="${numeric#*.}"
+          minor="${remainder%%.*}"
+          if [[ ! "${major}" =~ ^[0-9]+$ || ! "${minor}" =~ ^[0-9]+$ ]]; then
+            printf '%s\n' "egress-fence CI: DEFECTIVE (kernel revision UAPI unavailable)"
+            exit 2
+          fi
+          if (( major < 6 || (major == 6 && minor < 17) )); then
+            printf '%s\n' "egress-fence CI: DEFECTIVE (kernel revision UAPI unavailable)"
+            exit 2
+          fi
+          if [[ "$(stat --file-system --format=%T /sys/fs/cgroup)" != "cgroup2fs" ]]; then
+            printf '%s\n' "egress-fence CI: DEFECTIVE (true cgroup-v2 root unavailable)"
+            exit 2
+          fi
+          if ! mountpoint --quiet /sys/fs/bpf; then
+            sudo mount -t bpf bpf /sys/fs/bpf
+          fi
+
+      - name: Run actual-object, cleanup-fault, and mutation oracles
+        run: |
+          set -euo pipefail
+          host_target="$(rustc -vV | awk '/^host:/ { print $2 }')"
+          oracle="${RUNNER_TEMP}/egress-fence-oracle-target/${host_target}/debug/opc-egress-fence-object-oracle"
+          production="${RUNNER_TEMP}/egress-fence-committed.bpf.o"
+          fault="${RUNNER_TEMP}/egress-fence-fault.bpf.o"
+          deadline="${RUNNER_TEMP}/egress-fence-deadline-mutation.bpf.o"
+          gate="${RUNNER_TEMP}/egress-fence-gate-mutation.bpf.o"
+
+          sudo env "PATH=${PATH}" "${oracle}" --pressure "${production}"
+          sudo env "PATH=${PATH}" "${oracle}" --fault-delete "${fault}"
+          OPC_EGRESS_FENCE_PRODUCTION_OBJECT="${production}" \
+          OPC_EGRESS_FENCE_DEADLINE_MUTATION_OBJECT="${deadline}" \
+          OPC_EGRESS_FENCE_GATE_MUTATION_OBJECT="${gate}" \
+          OPC_EGRESS_FENCE_DETECTOR_TARGET_DIR="${RUNNER_TEMP}/egress-fence-detector-target" \
+            crates/opc-egress-fence-ebpf/oracle/scripts/run-privileged-detector.sh
+
+      - name: Run the production installer and adoption proof
+        run: |
+          set -euo pipefail
+          export CARGO_TARGET_DIR="${RUNNER_TEMP}/egress-fence-host-target"
+          build_log="${RUNNER_TEMP}/egress-fence-privileged-build.jsonl"
+          cargo test --locked \
+            -p opc-egress-fence \
+            --lib \
+            --no-run \
+            --message-format=json \
+            > "${build_log}"
+          test_binary="$(
+            jq -r '
+              select(
+                .profile.test == true
+                and .target.name == "opc_egress_fence"
+              )
+              | .executable // empty
+            ' "${build_log}" \
+              | tail -n 1
+          )"
+          test -n "${test_binary}"
+          test -x "${test_binary}"
+          test_name="linux_backend::privileged_tests::production_backend_fresh_expiry_adoption_and_prepared_recovery"
+          test_inventory="$(
+            "${test_binary}" \
+              "${test_name}" \
+              --exact \
+              --ignored \
+              --list \
+              --format terse
+          )"
+          if [[ "${test_inventory}" != "${test_name}: test" ]]; then
+            printf '%s\n' "egress-fence CI: DEFECTIVE (privileged test unavailable)"
+            exit 2
+          fi
+          sudo env "RUST_BACKTRACE=1" \
+            "${test_binary}" \
+            "${test_name}" \
+            --exact \
+            --ignored \
+            --nocapture
+
+      - name: Require complete privileged cleanup
+        if: always()
+        run: |
+          set -euo pipefail
+          attachments="$(sudo bpftool cgroup show /sys/fs/cgroup 2>/dev/null)"
+          if [[ -n "${attachments}" ]]; then
+            printf '%s\n' "egress-fence CI: DEFECTIVE (root attachment remained)"
+            exit 2
+          fi
+          if sudo find /sys/fs/bpf \
+            -maxdepth 1 \
+            -name 'opc-egress-fence-*' \
+            -print \
+            -quit \
+            | grep -q .
+          then
+            printf '%s\n' "egress-fence CI: DEFECTIVE (pin inventory remained)"
+            exit 2
+          fi
+          if sudo findmnt \
+            --raw \
+            --noheadings \
+            --output TARGET \
+            --types bpf \
+            | awk '
+                /^\/run\/opc-egress-fence-detector-bpffs-[0-9]+$/ {
+                  found = 1
+                }
+                END { exit !found }
+              '
+          then
+            printf '%s\n' "egress-fence CI: DEFECTIVE (private BPF mount remained)"
+            exit 2
+          fi
+          if sudo find /run \
+            -mindepth 1 \
+            -maxdepth 1 \
+            -type d \
+            -name 'opc-egress-fence-detector-bpffs-*' \
+            -print \
+            -quit \
+            | grep -q .
+          then
+            printf '%s\n' "egress-fence CI: DEFECTIVE (private pin directory remained)"
+            exit 2
+          fi
+          netns_inventory="$(sudo ip netns list)"
+          if awk '$1 ~ /^oef[rs]/ { found = 1 } END { exit !found }' \
+            <<< "${netns_inventory}"; then
+            printf '%s\n' "egress-fence CI: DEFECTIVE (network namespace remained)"
+            exit 2
+          fi
+          if sudo find /sys/class/net \
+            -mindepth 1 \
+            -maxdepth 1 \
+            -printf '%f\n' \
+            | grep -Eq '^e[rs][on][0-9a-f]+$'
+          then
+            printf '%s\n' "egress-fence CI: DEFECTIVE (host veth remained)"
+            exit 2
+          fi
+          printf '%s\n' "egress-fence CI cleanup: PASS"

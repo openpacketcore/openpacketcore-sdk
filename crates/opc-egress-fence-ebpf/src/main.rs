@@ -11,8 +11,22 @@
 //! require CURRENT to be unchanged before dereferencing the entry.
 //! `bpf_ktime_get_boot_ns` is read only after unlocking.
 
-#![no_std]
-#![no_main]
+#![cfg_attr(not(test), no_std)]
+#![cfg_attr(not(test), no_main)]
+
+#[cfg(all(feature = "production", feature = "mutation-bypass-gate"))]
+compile_error!("production and mutation-bypass-gate are mutually exclusive");
+#[cfg(all(
+    feature = "mutation-bypass-gate",
+    any(feature = "mutation-bypass-deadline", feature = "fault-inject-delete")
+))]
+compile_error!("mutation-bypass-gate cannot be combined with another test feature");
+#[cfg(all(feature = "mutation-bypass-deadline", not(feature = "production")))]
+compile_error!("mutation-bypass-deadline requires the production gate");
+#[cfg(all(feature = "mutation-bypass-deadline", feature = "fault-inject-delete"))]
+compile_error!("mutation-bypass-deadline and fault-inject-delete are mutually exclusive");
+#[cfg(not(any(feature = "production", feature = "mutation-bypass-gate")))]
+compile_error!("select either production or the explicit mutation-bypass-gate test build");
 
 use aya_ebpf::{
     bindings::{bpf_spin_lock as BpfSpinLock, BPF_NOEXIST},
@@ -25,21 +39,20 @@ use aya_ebpf::{
     programs::{SkBuffContext, TcContext},
 };
 use opc_egress_fence_common::{
-    decide_egress, ControlCommand, ControlOperation, CurrentFenceToken, FenceAuthoritySnapshot,
-    FenceEntry, FenceEntryState, FenceVerdict, PacketEndpointDisposition, PacketFenceContext,
-    CONTROL_RESULT_APPLIED, CONTROL_RESULT_COOKIE_MISSING,
-    CONTROL_RESULT_DEADLINE_ELAPSED, CONTROL_RESULT_EPOCH_MISMATCH, CONTROL_RESULT_INVALID,
-    CONTROL_RESULT_MAP_ERROR, CONTROL_RESULT_NOT_RECLAIMABLE, CONTROL_RESULT_STALE_TOKEN,
-    CONTROL_RESULT_STATE_MISMATCH, CONTROL_RESULT_TERMINAL, COOKIE_CONTROL_ACTIVE,
-    COOKIE_CONTROL_INITIAL_CLOSED, COOKIE_CONTROL_RECLAIMING, COOKIE_CONTROL_TERMINAL_CLOSED,
-    CURRENT_LIFECYCLE_OPEN_CONTROL, CURRENT_RETIREMENT_CLOSED_CONTROL, EGRESS_FENCE_ABI_VERSION,
-    EGRESS_FENCE_CONFIG_VALUE_LEN, EGRESS_FENCE_CONTROL_COMMAND_LEN, EGRESS_FENCE_COOKIE_KEY_LEN,
-    EGRESS_FENCE_COOKIE_VALUE_LEN, EGRESS_FENCE_COUNTER_SLOTS, EGRESS_FENCE_CURRENT_VALUE_LEN,
-    EGRESS_FENCE_INITIAL_COOKIE_EPOCH, EGRESS_FENCE_INSPECT_BUFFER_LEN,
+    decide_egress, evaluate_refresh_deadlines, ControlCommand, ControlOperation, CurrentFenceToken,
+    FenceAuthoritySnapshot, FenceEntry, FenceEntryState, FenceVerdict, PacketEndpointDisposition,
+    PacketFenceContext, RefreshDeadlineDecision, CONTROL_RESULT_APPLIED,
+    CONTROL_RESULT_COOKIE_MISSING, CONTROL_RESULT_DEADLINE_ELAPSED, CONTROL_RESULT_EPOCH_MISMATCH,
+    CONTROL_RESULT_INVALID, CONTROL_RESULT_MAP_ERROR, CONTROL_RESULT_NOT_RECLAIMABLE,
+    CONTROL_RESULT_STALE_TOKEN, CONTROL_RESULT_STATE_MISMATCH, CONTROL_RESULT_TERMINAL,
+    COOKIE_CONTROL_ACTIVE, COOKIE_CONTROL_INITIAL_CLOSED, COOKIE_CONTROL_RECLAIMING,
+    COOKIE_CONTROL_TERMINAL_CLOSED, CURRENT_LIFECYCLE_OPEN_CONTROL,
+    CURRENT_RETIREMENT_CLOSED_CONTROL, EGRESS_FENCE_ABI_VERSION, EGRESS_FENCE_CONFIG_VALUE_LEN,
+    EGRESS_FENCE_CONTROL_COMMAND_LEN, EGRESS_FENCE_COOKIE_KEY_LEN, EGRESS_FENCE_COOKIE_VALUE_LEN,
+    EGRESS_FENCE_COUNTER_SLOTS, EGRESS_FENCE_CURRENT_VALUE_LEN, EGRESS_FENCE_INITIAL_COOKIE_EPOCH,
+    EGRESS_FENCE_INSPECT_BUFFER_LEN, EGRESS_FENCE_MAX_COOKIE_ENTRIES,
     EGRESS_FENCE_MAX_GATE_LIFETIME_NS,
 };
-#[cfg(not(feature = "tiny-map"))]
-use opc_egress_fence_common::EGRESS_FENCE_MAX_COOKIE_ENTRIES;
 
 const CONFIG_KEY: u32 = 0;
 const CURRENT_KEY: u32 = 0;
@@ -48,7 +61,7 @@ const CONTROL_HEADER_FIXED: u64 =
     u32::from_le_bytes(*b"OEC1") as u64 | (EGRESS_FENCE_ABI_VERSION as u64) << 32;
 const IPV4_MIN_HEADER_LEN: usize = 20;
 const IPV4_PROTOCOL_UDP: u8 = 17;
-const IPV4_FRAGMENT_MASK: u16 = 0x3fff;
+const IPV4_AMBIGUOUS_FRAGMENT_MASK: u16 = 0xbfff;
 const IPV6_HEADER_LEN: usize = 40;
 const IPV6_NEXT_HEADER_HOP_BY_HOP: u8 = 0;
 const IPV6_NEXT_HEADER_ROUTING: u8 = 43;
@@ -70,10 +83,7 @@ const CGROUP_DROP: i32 = 0;
 const CGROUP_ALLOW: i32 = 1;
 const LAST_REFRESHABLE_EPOCH: u64 = u64::MAX - 2;
 const BPF_EEXIST: i32 = -17;
-#[cfg(not(feature = "tiny-map"))]
 const KERNEL_MAX_COOKIE_ENTRIES: usize = EGRESS_FENCE_MAX_COOKIE_ENTRIES as usize;
-#[cfg(feature = "tiny-map")]
-const KERNEL_MAX_COOKIE_ENTRIES: usize = 2;
 
 /// BTF-visible value containing only the shared synchronization primitive.
 #[repr(C)]
@@ -100,7 +110,7 @@ struct MutationMapValue {
     in_flight_claim: u64,
 }
 
-/// BTF-visible configuration value matching the fixed 64-byte wire ABI.
+/// BTF-visible configuration value matching the fixed 40-byte wire ABI.
 ///
 /// Keeping the verifier-facing value typed avoids copying the complete map
 /// value onto the BPF stack before validation.
@@ -246,6 +256,17 @@ fn classify(ctx: &SkBuffContext) -> i32 {
 
     let socket_endpoint_matches = socket_endpoint_matches(ctx, config.endpoint);
     let packet_endpoint_disposition = classify_endpoint(ctx, config.endpoint);
+    #[cfg(feature = "mutation-bypass-gate")]
+    if socket_endpoint_matches
+        || matches!(
+            packet_endpoint_disposition,
+            PacketEndpointDisposition::Protected
+        )
+    {
+        // Deliberate RED-only mutation. The build script refuses to place this
+        // object at the production artifact path.
+        return CGROUP_ALLOW;
+    }
     match packet_endpoint_disposition {
         PacketEndpointDisposition::Unrelated if !socket_endpoint_matches => return CGROUP_ALLOW,
         PacketEndpointDisposition::Indeterminate => {
@@ -295,16 +316,16 @@ fn classify(ctx: &SkBuffContext) -> i32 {
         return CGROUP_DROP;
     }
     let key = cookie_key(socket_cookie, current.durable_fence_token());
-    let Some(entry_ptr) = OPC_FENCE_CKS.get_ptr_mut(&key) else {
+    let Some(entry_ptr) = OPC_FENCE_CKS.get_ptr_mut(key) else {
         count(opc_egress_fence_common::COUNTER_COOKIE_MISSING);
         return CGROUP_DROP;
     };
 
-    // Revalidate CURRENT under the same lock while copying the entry. A
-    // Publish, Close, or Reclaim in either lookup window can therefore cause
-    // only a conservative drop. The composite key plus the locked structural
-    // mutation generation prevents the preallocated hash-map storage from
-    // being confused with a successor lifecycle after recycling.
+    // Revalidate the exact monotonic CURRENT value under the same lock while
+    // copying the entry. A Publish, Close, or Reclaim in either lookup window
+    // can therefore cause only a conservative drop. The composite key and
+    // redundant entry identity reject recycled storage; the map-value pointer
+    // itself remains alive under the BPF map helper's RCU lifetime guarantee.
     // SAFETY: both pointers are live map values for this invocation. Every
     // production entry mutation is serialized by the lock-only map.
     let (entry, current_unchanged) = unsafe {
@@ -327,8 +348,13 @@ fn classify(ctx: &SkBuffContext) -> i32 {
     // Read suspend-aware time after the locked authority snapshot. A refresh
     // racing after the snapshot can cause only a conservative drop; an
     // expired deadline can never be admitted using a pre-contention clock.
+    #[cfg(not(feature = "mutation-bypass-deadline"))]
     // SAFETY: this scalar helper has no pointer preconditions.
     let now_boot_ns = unsafe { bpf_ktime_get_boot_ns() };
+    #[cfg(feature = "mutation-bypass-deadline")]
+    // Deliberate RED-only mutation: retain exact cookie/token enforcement but
+    // remove the classifier's live BOOTTIME deadline observation.
+    let now_boot_ns = 0;
     let verdict = decide_egress(
         PacketFenceContext::new(
             true,
@@ -390,23 +416,27 @@ fn control(ctx: &TcContext) -> u32 {
             result
         };
     }
+    if matches!(command.operation(), ControlOperation::Refresh) {
+        return refresh(lock_ptr, current_ptr, mutation_ptr, command);
+    }
 
     let Some(mutation_generation) = snapshot_mutation_generation(lock_ptr, mutation_ptr) else {
         return CONTROL_RESULT_MAP_ERROR;
     };
     let key = cookie_key(command.socket_cookie(), command.durable_fence_token());
-    let entry_ptr = OPC_FENCE_CKS.get_ptr_mut(&key);
+    let entry_ptr = OPC_FENCE_CKS.get_ptr_mut(key);
     if entry_ptr.is_none() {
         return CONTROL_RESULT_COOKIE_MISSING;
     }
 
     let now_boot_ns = match command.operation() {
-        ControlOperation::Activate | ControlOperation::Refresh => {
+        ControlOperation::Activate => {
             // SAFETY: this scalar helper has no pointer preconditions and runs
             // before acquiring the BPF spinlock.
             unsafe { bpf_ktime_get_boot_ns() }
         }
-        ControlOperation::PublishLifecycle
+        ControlOperation::Refresh
+        | ControlOperation::PublishLifecycle
         | ControlOperation::PublishRetirement
         | ControlOperation::Register
         | ControlOperation::Close
@@ -432,10 +462,7 @@ fn control(ctx: &TcContext) -> u32 {
     if result != CONTROL_RESULT_APPLIED {
         return result;
     }
-    if matches!(
-        command.operation(),
-        ControlOperation::Activate | ControlOperation::Refresh
-    ) {
+    if matches!(command.operation(), ControlOperation::Activate) {
         // A second BOOTTIME read detects an operation that crossed its
         // absolute deadline. The classifier independently checks the same
         // deadline after every locked snapshot, so no packet can escape
@@ -506,7 +533,7 @@ fn inspect(
     let entry_ptr = if command.socket_cookie() == 0 {
         None
     } else {
-        OPC_FENCE_CKS.get_ptr_mut(&key)
+        OPC_FENCE_CKS.get_ptr_mut(key)
     };
 
     let mut output = InspectionOutput {
@@ -615,7 +642,7 @@ fn publish_retirement(
         current.registered_socket_cookie(),
         current.durable_fence_token(),
     );
-    let Some(entry_ptr) = OPC_FENCE_CKS.get_ptr_mut(&key) else {
+    let Some(entry_ptr) = OPC_FENCE_CKS.get_ptr_mut(key) else {
         return CONTROL_RESULT_COOKIE_MISSING;
     };
     // Final CURRENT/mutation checks precede the retained hash-pointer
@@ -670,12 +697,12 @@ fn register(
         deadline_boot_ns: 0,
         control_epoch: EGRESS_FENCE_INITIAL_COOKIE_EPOCH,
     };
-    let insert_status = match OPC_FENCE_CKS.insert(&key, &initial, BPF_NOEXIST as u64) {
+    let insert_status = match OPC_FENCE_CKS.insert(key, initial, BPF_NOEXIST as u64) {
         Ok(()) => 0,
         Err(BPF_EEXIST) => 1,
         Err(_) => 2,
     };
-    let entry_ptr = OPC_FENCE_CKS.get_ptr_mut(&key);
+    let entry_ptr = OPC_FENCE_CKS.get_ptr_mut(key);
 
     // Phase two always commits the reserved generation and clears the claim,
     // including helper error and missing-readback paths. Entry dereference is
@@ -694,6 +721,135 @@ fn register(
         bpf_spin_unlock(&mut (*lock_ptr).lock);
         result
     }
+}
+
+/// Refresh an active entry through a fail-closed two-phase clock observation.
+///
+/// The entry is changed to RECLAIMING under the global mutation claim before
+/// BOOTTIME is read. It therefore cannot authorize traffic, and no competing
+/// lifecycle operation can alter it, while a contended refresh determines
+/// whether the prior deadline is still live. The BOOTTIME observation is the
+/// refresh linearization point.
+#[inline(never)]
+fn refresh(
+    lock_ptr: *mut LockMapValue,
+    current_ptr: *mut CurrentMapValue,
+    mutation_ptr: *mut MutationMapValue,
+    command: ControlCommand,
+) -> u32 {
+    let (precheck, generation, claim) = unsafe {
+        bpf_spin_lock(&mut (*lock_ptr).lock);
+        let (result, generation, claim) =
+            reserve_refresh_locked(current_ptr, mutation_ptr, command);
+        bpf_spin_unlock(&mut (*lock_ptr).lock);
+        (result, generation, claim)
+    };
+    if precheck != CONTROL_RESULT_APPLIED {
+        return precheck;
+    }
+
+    let key = cookie_key(command.socket_cookie(), command.durable_fence_token());
+    let entry_ptr = OPC_FENCE_CKS.get_ptr_mut(key);
+    let (phase_one, prior_deadline) = unsafe {
+        bpf_spin_lock(&mut (*lock_ptr).lock);
+        let owns_claim = mutation_claim_matches(&*mutation_ptr, generation, claim);
+        let (result, deadline) = if !owns_claim {
+            (CONTROL_RESULT_MAP_ERROR, 0)
+        } else if let Some(entry_ptr) = entry_ptr {
+            prepare_refresh_locked(&mut *entry_ptr, command)
+        } else {
+            (CONTROL_RESULT_COOKIE_MISSING, 0)
+        };
+        if owns_claim && result != CONTROL_RESULT_APPLIED {
+            commit_mutation_locked(&mut *mutation_ptr, claim);
+        }
+        bpf_spin_unlock(&mut (*lock_ptr).lock);
+        (result, deadline)
+    };
+    if phase_one != CONTROL_RESULT_APPLIED {
+        return phase_one;
+    }
+
+    // SAFETY: scalar helper with no pointer preconditions. The entry is
+    // already closed and the global mutation claim excludes every competing
+    // lifecycle transition.
+    let observed_at = unsafe { bpf_ktime_get_boot_ns() };
+    let phase_two = unsafe {
+        bpf_spin_lock(&mut (*lock_ptr).lock);
+        let owns_claim = mutation_claim_matches(&*mutation_ptr, generation, claim);
+        let result = if !owns_claim {
+            CONTROL_RESULT_MAP_ERROR
+        } else if let Some(entry_ptr) = entry_ptr {
+            complete_refresh_locked(
+                current_ptr,
+                &mut *entry_ptr,
+                command,
+                prior_deadline,
+                observed_at,
+            )
+        } else {
+            CONTROL_RESULT_COOKIE_MISSING
+        };
+        if owns_claim && result != CONTROL_RESULT_APPLIED {
+            commit_mutation_locked(&mut *mutation_ptr, claim);
+        }
+        bpf_spin_unlock(&mut (*lock_ptr).lock);
+        result
+    };
+    if phase_two != CONTROL_RESULT_APPLIED {
+        return phase_two;
+    }
+
+    // Read BOOTTIME again before publishing ACTIVE. The entry remains
+    // RECLAIMING and the mutation claim remains live after phase two, so no
+    // packet or successor control operation can observe renewed authority
+    // before this completion observation proves both the prior and requested
+    // deadlines are still live.
+    // SAFETY: the production path is a scalar helper with no pointer
+    // preconditions; the fault build additionally accesses its test-only map.
+    let completed_at = unsafe { refresh_completion_observation(prior_deadline) };
+    unsafe {
+        bpf_spin_lock(&mut (*lock_ptr).lock);
+        let owns_claim = mutation_claim_matches(&*mutation_ptr, generation, claim);
+        let result = if !owns_claim {
+            CONTROL_RESULT_MAP_ERROR
+        } else {
+            let result = finalize_refresh_locked(
+                current_ptr,
+                entry_ptr,
+                command,
+                prior_deadline,
+                completed_at,
+            );
+            commit_mutation_locked(&mut *mutation_ptr, claim);
+            result
+        };
+        bpf_spin_unlock(&mut (*lock_ptr).lock);
+        result
+    }
+}
+
+#[inline(always)]
+unsafe fn refresh_completion_observation(prior_deadline: u64) -> u64 {
+    // SAFETY: scalar helper with no pointer preconditions.
+    let observed_at = unsafe { bpf_ktime_get_boot_ns() };
+    #[cfg(feature = "fault-inject-delete")]
+    {
+        // Deterministic actual-object oracle hook: slot zero forces the final
+        // observation to equality with the prior deadline, independently of
+        // the delete-failure hook in slot one.
+        if let Some(fault) = OPC_FENCE_FLT.get_ptr_mut(0) {
+            if unsafe { *fault } != 0 {
+                unsafe {
+                    *fault = 0;
+                }
+                return prior_deadline;
+            }
+        }
+    }
+    #[cfg(not(feature = "fault-inject-delete"))]
+    let _ = prior_deadline;
+    observed_at
 }
 
 #[inline(always)]
@@ -748,7 +904,7 @@ fn reclaim(
     }
 
     let key = cookie_key(command.socket_cookie(), command.durable_fence_token());
-    let entry_ptr = OPC_FENCE_CKS.get_ptr_mut(&key);
+    let entry_ptr = OPC_FENCE_CKS.get_ptr_mut(key);
     let result = unsafe {
         bpf_spin_lock(&mut (*lock_ptr).lock);
         let owns_claim = mutation_claim_matches(&*mutation_ptr, generation, claim);
@@ -858,10 +1014,26 @@ unsafe fn reserve_reclaim_locked(
     let Some(current) = decode_current(unsafe { &*current_ptr }) else {
         return (CONTROL_RESULT_INVALID, 0, 0);
     };
-    if !current.is_retirement_closed()
-        || current.durable_fence_token() <= command.durable_fence_token()
-    {
+    if current.durable_fence_token() <= command.durable_fence_token() {
         return (CONTROL_RESULT_NOT_RECLAIMABLE, 0, 0);
+    }
+    reserve_mutation_locked(unsafe { &mut *mutation_ptr })
+}
+
+#[inline(always)]
+unsafe fn reserve_refresh_locked(
+    current_ptr: *mut CurrentMapValue,
+    mutation_ptr: *mut MutationMapValue,
+    command: ControlCommand,
+) -> (u32, u64, u64) {
+    let Some(current) = decode_current(unsafe { &*current_ptr }) else {
+        return (CONTROL_RESULT_INVALID, 0, 0);
+    };
+    if !current.is_lifecycle_open()
+        || current.registered_socket_cookie() != command.socket_cookie()
+        || command.durable_fence_token() != current.durable_fence_token()
+    {
+        return (CONTROL_RESULT_STALE_TOKEN, 0, 0);
     }
     reserve_mutation_locked(unsafe { &mut *mutation_ptr })
 }
@@ -1043,12 +1215,7 @@ unsafe fn apply_control_locked(
             };
             activate_locked(unsafe { &mut *entry_ptr }, current, command, now_boot_ns)
         }
-        ControlOperation::Refresh => {
-            let Some(entry_ptr) = entry_ptr else {
-                return CONTROL_RESULT_COOKIE_MISSING;
-            };
-            refresh_locked(unsafe { &mut *entry_ptr }, current, command, now_boot_ns)
-        }
+        ControlOperation::Refresh => CONTROL_RESULT_INVALID,
         ControlOperation::Close => {
             let Some(entry_ptr) = entry_ptr else {
                 return CONTROL_RESULT_COOKIE_MISSING;
@@ -1108,57 +1275,145 @@ fn activate_locked(
 }
 
 #[inline(always)]
-fn refresh_locked(
-    entry: &mut CookieMapValue,
-    current: CurrentFenceToken,
-    command: ControlCommand,
-    now_boot_ns: u64,
-) -> u32 {
+fn prepare_refresh_locked(entry: &mut CookieMapValue, command: ControlCommand) -> (u32, u64) {
     let Some(decoded) = decode_entry(
         entry,
         cookie_key(command.socket_cookie(), command.durable_fence_token()),
     ) else {
-        return CONTROL_RESULT_INVALID;
+        return (CONTROL_RESULT_INVALID, 0);
     };
     if decoded.control_epoch() != command.expected_epoch() {
-        return CONTROL_RESULT_EPOCH_MISMATCH;
-    }
-    if !current.is_lifecycle_open()
-        || current.registered_socket_cookie() != command.socket_cookie()
-        || command.durable_fence_token() != current.durable_fence_token()
-        || decoded.durable_fence_token() != current.durable_fence_token()
-    {
-        return CONTROL_RESULT_STALE_TOKEN;
+        return (CONTROL_RESULT_EPOCH_MISMATCH, 0);
     }
     if matches!(
         decoded.state(),
         FenceEntryState::TerminalClosed | FenceEntryState::Reclaiming
     ) {
-        return CONTROL_RESULT_TERMINAL;
+        return (CONTROL_RESULT_TERMINAL, 0);
     }
     if !matches!(decoded.state(), FenceEntryState::Active) {
-        return CONTROL_RESULT_STATE_MISMATCH;
-    }
-    if deadline_elapsed(now_boot_ns, decoded.deadline_boot_ns())
-        || !deadline_within_gate_lifetime(now_boot_ns, command.deadline_boot_ns())
-    {
-        return CONTROL_RESULT_DEADLINE_ELAPSED;
-    }
-    if command.deadline_boot_ns() < decoded.deadline_boot_ns() {
-        return CONTROL_RESULT_STATE_MISMATCH;
+        return (CONTROL_RESULT_STATE_MISMATCH, 0);
     }
     if decoded.control_epoch() > LAST_REFRESHABLE_EPOCH {
-        return CONTROL_RESULT_INVALID;
+        return (CONTROL_RESULT_INVALID, 0);
     }
-    let next_epoch = decoded.control_epoch() + 1;
-    write_active(
-        entry,
-        command.socket_cookie(),
-        command.durable_fence_token(),
-        command.deadline_boot_ns(),
-        next_epoch,
-    );
-    CONTROL_RESULT_APPLIED
+    entry.control = COOKIE_CONTROL_RECLAIMING;
+    entry.deadline_boot_ns = 0;
+    (CONTROL_RESULT_APPLIED, decoded.deadline_boot_ns())
+}
+
+#[inline(always)]
+unsafe fn complete_refresh_locked(
+    current_ptr: *mut CurrentMapValue,
+    entry: &mut CookieMapValue,
+    command: ControlCommand,
+    prior_deadline: u64,
+    observed_at: u64,
+) -> u32 {
+    let Some(current) = decode_current(unsafe { &*current_ptr }) else {
+        return CONTROL_RESULT_INVALID;
+    };
+    if !current.is_lifecycle_open()
+        || current.registered_socket_cookie() != command.socket_cookie()
+        || command.durable_fence_token() != current.durable_fence_token()
+        || entry.reserved != 0
+        || entry.control != COOKIE_CONTROL_RECLAIMING
+        || entry.socket_cookie != command.socket_cookie()
+        || entry.durable_fence_token != command.durable_fence_token()
+        || entry.deadline_boot_ns != 0
+        || entry.control_epoch != command.expected_epoch()
+    {
+        return CONTROL_RESULT_MAP_ERROR;
+    }
+    let next_epoch = command.expected_epoch() + 1;
+    match evaluate_refresh_deadlines(observed_at, prior_deadline, command.deadline_boot_ns()) {
+        // Keep the entry RECLAIMING until the post-phase BOOTTIME observation
+        // has also proved that the old authorization did not expire during
+        // this invocation.
+        RefreshDeadlineDecision::Apply => CONTROL_RESULT_APPLIED,
+        RefreshDeadlineDecision::PriorExpired => {
+            write_terminal(
+                entry,
+                command.socket_cookie(),
+                command.durable_fence_token(),
+                next_epoch,
+            );
+            CONTROL_RESULT_DEADLINE_ELAPSED
+        }
+        RefreshDeadlineDecision::RequestedDeadlineInvalid => {
+            write_active(
+                entry,
+                command.socket_cookie(),
+                command.durable_fence_token(),
+                prior_deadline,
+                command.expected_epoch(),
+            );
+            CONTROL_RESULT_DEADLINE_ELAPSED
+        }
+        RefreshDeadlineDecision::DeadlineRegressed => {
+            write_active(
+                entry,
+                command.socket_cookie(),
+                command.durable_fence_token(),
+                prior_deadline,
+                command.expected_epoch(),
+            );
+            CONTROL_RESULT_STATE_MISMATCH
+        }
+    }
+}
+
+#[inline(always)]
+unsafe fn finalize_refresh_locked(
+    current_ptr: *mut CurrentMapValue,
+    entry_ptr: Option<*mut CookieMapValue>,
+    command: ControlCommand,
+    prior_deadline: u64,
+    completed_at: u64,
+) -> u32 {
+    let Some(current) = decode_current(unsafe { &*current_ptr }) else {
+        return CONTROL_RESULT_INVALID;
+    };
+    if !current.is_lifecycle_open()
+        || current.registered_socket_cookie() != command.socket_cookie()
+        || command.durable_fence_token() != current.durable_fence_token()
+    {
+        return CONTROL_RESULT_MAP_ERROR;
+    }
+    let Some(entry_ptr) = entry_ptr else {
+        return CONTROL_RESULT_COOKIE_MISSING;
+    };
+    let entry = unsafe { &mut *entry_ptr };
+    if entry.reserved != 0
+        || entry.control != COOKIE_CONTROL_RECLAIMING
+        || entry.socket_cookie != command.socket_cookie()
+        || entry.durable_fence_token != command.durable_fence_token()
+        || entry.deadline_boot_ns != 0
+        || entry.control_epoch != command.expected_epoch()
+    {
+        return CONTROL_RESULT_MAP_ERROR;
+    }
+    let Some(next_epoch) = command.expected_epoch().checked_add(1) else {
+        return CONTROL_RESULT_INVALID;
+    };
+    if completed_at >= prior_deadline || completed_at >= command.deadline_boot_ns() {
+        write_terminal(
+            entry,
+            command.socket_cookie(),
+            command.durable_fence_token(),
+            next_epoch,
+        );
+        CONTROL_RESULT_DEADLINE_ELAPSED
+    } else {
+        write_active(
+            entry,
+            command.socket_cookie(),
+            command.durable_fence_token(),
+            command.deadline_boot_ns(),
+            next_epoch,
+        );
+        CONTROL_RESULT_APPLIED
+    }
 }
 
 #[inline(always)]
@@ -1213,28 +1468,26 @@ fn reclaim_locked(
     if command.durable_fence_token() != decoded.durable_fence_token() {
         return CONTROL_RESULT_STALE_TOKEN;
     }
-    // Even a terminal exact-CURRENT entry cannot be deleted: a classifier may
-    // already hold its value pointer between composite lookup and final
-    // CURRENT revalidation. The host first durably allocates and publishes a
-    // strictly higher retirement token, then proves sender/fd death and
-    // reclaims the predecessor. This makes every permitted delete stale to
-    // CURRENT before the helper can recycle map storage.
-    if !current.is_retirement_closed()
-        || current.durable_fence_token() <= command.durable_fence_token()
-    {
+    // An exact-CURRENT entry cannot be deleted: a classifier may already hold
+    // its value pointer between composite lookup and final CURRENT
+    // revalidation. Any canonical strictly higher CURRENT token is the global
+    // fencing linearization point and makes this composite key permanently
+    // non-authoritative, even if the old fd remains open. The global mutation
+    // claim excludes concurrent publication/registration/reclaim while the
+    // helper can recycle map storage.
+    if current.durable_fence_token() <= command.durable_fence_token() {
         return CONTROL_RESULT_NOT_RECLAIMABLE;
     }
-    // Expiry or token supersession alone does not prove fd death. The host may
-    // request deletion only after sealed terminal readback, sender stop/join,
-    // exclusive fd close, and higher-token publication/readback.
-    let reclaimable = matches!(
-        decoded.state(),
-        FenceEntryState::TerminalClosed | FenceEntryState::Reclaiming
-    );
-    if !reclaimable {
-        return CONTROL_RESULT_NOT_RECLAIMABLE;
-    }
+    // Every decoded state is canonical and fail-closed after CURRENT
+    // supersession. Publish the complete retryable deletion state before
+    // invoking the hash delete helper: Active must not retain its deadline,
+    // and InitialClosed legitimately retains epoch one.
     entry.control = COOKIE_CONTROL_RECLAIMING;
+    entry.reserved = 0;
+    entry.socket_cookie = command.socket_cookie();
+    entry.durable_fence_token = command.durable_fence_token();
+    entry.deadline_boot_ns = 0;
+    entry.control_epoch = command.expected_epoch();
     CONTROL_RESULT_APPLIED
 }
 
@@ -1332,7 +1585,7 @@ fn load_config() -> Option<KernelConfig> {
         || value.reserved0 != 0
         || value.reserved1 != [0; 2]
         || value.root_cgroup_id == 0
-        || value.capacity as usize != KERNEL_MAX_COOKIE_ENTRIES
+        || value.capacity != EGRESS_FENCE_MAX_COOKIE_ENTRIES
     {
         return None;
     }
@@ -1392,7 +1645,8 @@ fn load_config() -> Option<KernelConfig> {
                 && value.address[9] == 0
                 && value.address[10] == 0xff
                 && value.address[11] == 0xff;
-            if address_is_zero || value.address[0] == 0xff || ipv4_mapped {
+            let link_local = value.address[0] == 0xfe && value.address[1] & 0xc0 == 0x80;
+            if address_is_zero || value.address[0] == 0xff || ipv4_mapped || link_local {
                 return None;
             }
         }
@@ -1474,11 +1728,6 @@ const fn cookie_key(socket_cookie: u64, durable_fence_token: u64) -> CookieMapKe
 #[inline(always)]
 const fn socket_cookie_identity(cookie: u64) -> u64 {
     cookie
-}
-
-#[inline(always)]
-const fn deadline_elapsed(now_boot_ns: u64, deadline_boot_ns: u64) -> bool {
-    now_boot_ns >= deadline_boot_ns
 }
 
 #[inline(always)]
@@ -1573,10 +1822,7 @@ const fn network_order_word(bytes: [u8; 4]) -> u32 {
 }
 
 #[inline(always)]
-fn classify_endpoint(
-    ctx: &SkBuffContext,
-    endpoint: KernelEndpoint,
-) -> PacketEndpointDisposition {
+fn classify_endpoint(ctx: &SkBuffContext, endpoint: KernelEndpoint) -> PacketEndpointDisposition {
     let Ok(first) = ctx.load::<u8>(0) else {
         return PacketEndpointDisposition::Indeterminate;
     };
@@ -1625,9 +1871,9 @@ fn classify_ipv4(
         return PacketEndpointDisposition::Unrelated;
     }
     let fragment = u16::from_be_bytes([header[6], header[7]]);
-    // DF is harmless, but either MF or a nonzero offset means UDP cannot be
-    // classified from this skb in isolation.
-    if fragment & IPV4_FRAGMENT_MASK != 0 {
+    // DF is harmless. The reserved flag, MF, or a nonzero offset means UDP
+    // cannot be classified from this skb in isolation.
+    if fragment & IPV4_AMBIGUOUS_FRAGMENT_MASK != 0 {
         return PacketEndpointDisposition::Indeterminate;
     }
     let Some(udp_offset) = offset.checked_add(header_len) else {
@@ -1780,6 +2026,16 @@ fn count(slot: u32) {
     }
 }
 
+#[cfg(not(test))]
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
+    loop {}
+}
+
+#[unsafe(link_section = "license")]
+#[unsafe(no_mangle)]
+static LICENSE: [u8; 13] = *b"Dual MIT/GPL\0";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1788,13 +2044,6 @@ mod tests {
     fn high_cookie_bits_are_never_truncated() {
         let cookie = 0xa5a5_5a5a_0102_0304;
         assert_eq!(socket_cookie_identity(cookie), cookie);
-    }
-
-    #[test]
-    fn deadline_equality_is_elapsed() {
-        assert!(!deadline_elapsed(99, 100));
-        assert!(deadline_elapsed(100, 100));
-        assert!(deadline_elapsed(101, 100));
     }
 
     #[test]
@@ -1807,13 +2056,3 @@ mod tests {
         assert!(!deadline_within_gate_lifetime(u64::MAX, 1));
     }
 }
-
-#[cfg(not(test))]
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
-    loop {}
-}
-
-#[unsafe(link_section = "license")]
-#[unsafe(no_mangle)]
-static LICENSE: [u8; 13] = *b"Dual MIT/GPL\0";

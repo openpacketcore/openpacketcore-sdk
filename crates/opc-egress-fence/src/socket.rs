@@ -2,6 +2,12 @@
 
 use std::{cell::Cell, fmt, io, net::SocketAddr};
 
+#[cfg(test)]
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+
 use opc_runtime::{
     UdpDestinationMetadataSocket, UdpDestinationMetadataSupport, UdpReceivedDatagram,
 };
@@ -9,6 +15,7 @@ use opc_session_store::{LeaseGuard, OwnerId, SessionKey};
 
 use crate::lifecycle::{
     EgressFenceLeaseAuthority, FenceError, LeaseBoundFence, LeaseFenceError, LeaseFenceTiming,
+    RenewalWait,
 };
 
 /// UDP socket whose only send path is protected by the lease-bound kernel
@@ -32,11 +39,18 @@ use crate::lifecycle::{
 /// and constructing any alternate sender for the protected local endpoint are
 /// forbidden. Linux does not promise eternal `SO_COOKIE` non-reuse; safe
 /// tombstone reclamation therefore depends on this wrapper's exclusive fd
-/// ownership and close-before-reclaim ordering.
+/// ownership and close-before-reclaim ordering. Admission requires an
+/// unconnected exact bind with `SO_REUSEADDR`, `SO_REUSEPORT`, `FREEBIND`, and
+/// `TRANSPARENT` disabled; IPv6 additionally requires `IPV6_V6ONLY`.
+/// A production loader must create and immediately consume the socket because
+/// Linux has no race-free API that proves a file description was never
+/// duplicated before admission.
 pub struct FencedUdpSocket {
     socket: Option<UdpDestinationMetadataSocket>,
     fence: LeaseBoundFence,
     protected_local_endpoint: SocketAddr,
+    #[cfg(test)]
+    send_barrier: Option<Arc<TestSendBarrier>>,
     // A fenced socket is movable into its one guardian, but cannot be shared
     // through Arc or references between concurrent tasks.
     _guardian_exclusive: Cell<()>,
@@ -49,6 +63,7 @@ impl FencedUdpSocket {
         protected_local_endpoint: SocketAddr,
     ) -> Result<Self, FenceError> {
         if !valid_protected_local_endpoint(protected_local_endpoint)
+            || !exclusive_unconnected_socket(&socket)
             || socket
                 .local_addr()
                 .map_or(true, |actual| actual != protected_local_endpoint)
@@ -59,6 +74,8 @@ impl FencedUdpSocket {
             socket: Some(socket),
             fence,
             protected_local_endpoint,
+            #[cfg(test)]
+            send_barrier: None,
             _guardian_exclusive: Cell::new(()),
         })
     }
@@ -104,33 +121,31 @@ impl FencedUdpSocket {
         self.live_socket()?.recv_from_with_destination(buffer).await
     }
 
-    /// Send one datagram from an exact local source.
+    /// Send one datagram from the immutable protected local source.
     ///
-    /// A userspace-active state only permits the syscall. The requested source
-    /// must equal the exact protected bind endpoint; packet-info may not
-    /// override it. The root cgroup gate still independently requires the
-    /// full-width socket cookie, current durable token, attachment identity,
-    /// and BOOTTIME deadline.
+    /// A userspace-active state only permits the syscall. Callers cannot supply
+    /// or override the packet-info source. The root cgroup gate still
+    /// independently requires the full-width socket cookie, current durable
+    /// token, attachment identity, and BOOTTIME deadline.
     ///
     /// # Errors
     ///
     /// Returns a value-free `PermissionDenied` error before activation or
     /// after terminal closure, otherwise the runtime socket's send error.
-    pub(crate) async fn send_to_from(
-        &mut self,
-        buffer: &[u8],
-        peer: SocketAddr,
-        local_source: SocketAddr,
-    ) -> io::Result<usize> {
-        require_exact_local_source(self.protected_local_endpoint, local_source)?;
-        if !self.fence.is_active() {
+    pub(crate) async fn send_to(&mut self, buffer: &[u8], peer: SocketAddr) -> io::Result<usize> {
+        if self.fence.preflight_send().is_err() {
+            self.close_socket();
             return Err(socket_error(
                 io::ErrorKind::PermissionDenied,
-                "egress_fence_not_active",
+                "egress_fence_send_preflight",
             ));
         }
+        #[cfg(test)]
+        if let Some(barrier) = self.send_barrier.as_ref() {
+            barrier.pause().await;
+        }
         self.live_socket()?
-            .send_to_from(buffer, peer, local_source)
+            .send_to_from(buffer, peer, self.protected_local_endpoint)
             .await
     }
 
@@ -180,6 +195,35 @@ impl FencedUdpSocket {
         result
     }
 
+    /// Build an owned suspend-aware wait for this socket's next safe renewal
+    /// point.
+    ///
+    /// The wait is derived from the operation-start-based kernel deadline, not
+    /// from userspace completion time. It therefore becomes immediately ready
+    /// after a near-budget acquisition and reports expiry after a suspend that
+    /// crosses the kernel deadline.
+    pub(crate) fn renewal_wait(
+        &mut self,
+        timing: LeaseFenceTiming,
+    ) -> Result<RenewalWait, FenceError> {
+        self.fence.renewal_wait(timing)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_send_barrier(&mut self, barrier: Arc<TestSendBarrier>) {
+        self.send_barrier = Some(barrier);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_drop_private_mutation_program_fd(&self) -> Result<(), FenceError> {
+        self.fence.test_drop_private_mutation_program_fd()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_drop_private_view_program_fd(&self) -> Result<(), FenceError> {
+        self.fence.test_drop_private_view_program_fd()
+    }
+
     /// Close/read back the kernel gate, close the socket fd, publish the
     /// pre-reserved retirement token, reclaim the now-noncurrent tuple, then
     /// release durable authority.
@@ -222,6 +266,45 @@ impl FencedUdpSocket {
 
     fn close_socket(&mut self) {
         drop(self.socket.take());
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct TestSendBarrier {
+    entered: AtomicBool,
+    released: AtomicBool,
+    entered_notification: tokio::sync::Notify,
+    release_notification: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl TestSendBarrier {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            entered: AtomicBool::new(false),
+            released: AtomicBool::new(false),
+            entered_notification: tokio::sync::Notify::new(),
+            release_notification: tokio::sync::Notify::new(),
+        })
+    }
+
+    async fn pause(&self) {
+        self.entered.store(true, Ordering::Release);
+        self.entered_notification.notify_waiters();
+        while !self.released.load(Ordering::Acquire) {
+            self.release_notification.notified().await;
+        }
+    }
+
+    pub(crate) async fn wait_until_entered(&self) {
+        while !self.entered.load(Ordering::Acquire) {
+            self.entered_notification.notified().await;
+        }
+    }
+
+    pub(crate) fn release(&self) {
+        self.released.store(true, Ordering::Release);
+        self.release_notification.notify_waiters();
     }
 }
 
@@ -331,14 +414,15 @@ fn socket_error(kind: io::ErrorKind, code: &'static str) -> io::Error {
     io::Error::new(kind, code)
 }
 
-fn require_exact_local_source(expected: SocketAddr, requested: SocketAddr) -> io::Result<()> {
-    if requested != expected {
-        return Err(socket_error(
-            io::ErrorKind::InvalidInput,
-            "egress_fence_local_source",
-        ));
+fn exclusive_unconnected_socket(socket: &UdpDestinationMetadataSocket) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        socket.verify_fence_admission().is_ok()
     }
-    Ok(())
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
 }
 
 fn valid_protected_local_endpoint(endpoint: SocketAddr) -> bool {
@@ -346,35 +430,23 @@ fn valid_protected_local_endpoint(endpoint: SocketAddr) -> bool {
         return false;
     }
     match endpoint {
-        SocketAddr::V4(_) => true,
-        SocketAddr::V6(address) => address.ip().to_ipv4_mapped().is_none(),
+        SocketAddr::V4(address) => !address.ip().is_broadcast(),
+        SocketAddr::V6(address) => {
+            address.ip().to_ipv4_mapped().is_none()
+                && !address.ip().is_unicast_link_local()
+                && address.scope_id() == 0
+                && address.flowinfo() == 0
+        }
     }
 }
 
 #[cfg(test)]
 mod source_contract_tests {
     use super::*;
-    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
+    use std::net::{Ipv4Addr, SocketAddrV4, SocketAddrV6};
 
     #[test]
-    fn packet_info_cannot_override_protected_bind_endpoint() {
-        let protected = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 41), 31_337));
-        assert!(require_exact_local_source(protected, protected).is_ok());
-
-        for requested in [
-            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 42), 31_337)),
-            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 41), 31_338)),
-            SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 31_337, 0, 0)),
-        ] {
-            let error = require_exact_local_source(protected, requested)
-                .expect_err("alternate source must fail before send");
-            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-            assert_eq!(error.to_string(), "egress_fence_local_source");
-        }
-    }
-
-    #[test]
-    fn protected_endpoint_must_be_nonzero_unicast_and_not_mapped() {
+    fn protected_endpoint_must_be_canonical_nonzero_unicast() {
         let valid_v4 = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 41), 31_337));
         let valid_v6 = SocketAddr::V6(SocketAddrV6::new(
             "2001:db8:0:7::41".parse().expect("documentation IPv6"),
@@ -389,14 +461,45 @@ mod source_contract_tests {
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 31_337)),
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 41), 0)),
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(224, 0, 0, 1), 31_337)),
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::BROADCAST, 31_337)),
             SocketAddr::V6(SocketAddrV6::new(
                 "::ffff:192.0.2.41".parse().expect("mapped fixture"),
                 31_337,
                 0,
                 0,
             )),
+            SocketAddr::V6(SocketAddrV6::new(
+                "fe80::41".parse().expect("link-local fixture"),
+                31_337,
+                0,
+                7,
+            )),
+            SocketAddr::V6(SocketAddrV6::new(
+                "2001:db8:0:7::41".parse().expect("scoped global fixture"),
+                31_337,
+                0,
+                7,
+            )),
+            SocketAddr::V6(SocketAddrV6::new(
+                "2001:db8:0:7::41".parse().expect("flow-labelled fixture"),
+                31_337,
+                1,
+                0,
+            )),
         ] {
             assert!(!valid_protected_local_endpoint(invalid));
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn runtime_bind_is_exclusive_and_exposes_no_raw_send_surface() {
+        use opc_runtime::bind_udp_socket_with_destination_metadata;
+
+        let exclusive = bind_udp_socket_with_destination_metadata(
+            "127.0.0.1:0".parse().expect("loopback fixture"),
+        )
+        .expect("exclusive bound socket");
+        assert!(exclusive_unconnected_socket(&exclusive));
     }
 }

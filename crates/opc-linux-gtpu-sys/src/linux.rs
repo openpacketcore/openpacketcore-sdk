@@ -1,16 +1,17 @@
 use std::ffi::CString;
-use std::io;
+use std::io::{self, Read};
 use std::mem;
-use std::num::NonZeroU64;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
+use std::time::Duration;
 
 use crate::{BpfCgroupProgramAttachment, BpfXdpLinkInfo, GtpuIpAddress, GtpuUdpBind};
 
 const BPF_OBJ_PIN: libc::c_uint = 6;
 const BPF_OBJ_GET: libc::c_uint = 7;
 const BPF_PROG_ATTACH: libc::c_uint = 8;
+const BPF_PROG_DETACH: libc::c_uint = 9;
 const BPF_PROG_GET_FD_BY_ID: libc::c_uint = 13;
 const BPF_OBJ_GET_INFO_BY_FD: libc::c_uint = 15;
 const BPF_PROG_QUERY: libc::c_uint = 16;
@@ -19,11 +20,48 @@ const BPF_LINK_UPDATE: libc::c_uint = 29;
 const BPF_LINK_GET_FD_BY_ID: libc::c_uint = 30;
 const BPF_PROG_TYPE_XDP: u32 = 6;
 const BPF_LINK_TYPE_XDP: u32 = 6;
-const BPF_PROG_TYPE_CGROUP_SKB: u32 = 8;
 const BPF_CGROUP_INET_EGRESS: u32 = 1;
 const BPF_F_ALLOW_MULTI: u32 = 1 << 1;
 const BPF_F_REPLACE: u32 = 1 << 2;
 const BPF_CGROUP_MAX_PROGS: usize = 64;
+const CGROUP_REVISION_PROBE_SENTINEL: u64 = u64::MAX;
+const NANOS_PER_SECOND: u64 = 1_000_000_000;
+const MAX_BPF_FDINFO_BYTES: u64 = 16_384;
+
+pub struct BootTimeTimer {
+    fd: OwnedFd,
+}
+
+impl BootTimeTimer {
+    pub fn new(duration: Duration) -> io::Result<Self> {
+        let specification = relative_timer_specification(duration)?;
+        // SAFETY: `timerfd_create` has no pointer arguments. The returned
+        // descriptor is checked before ownership is constructed.
+        let raw_fd = unsafe {
+            libc::timerfd_create(libc::CLOCK_BOOTTIME, libc::TFD_NONBLOCK | libc::TFD_CLOEXEC)
+        };
+        if raw_fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `timerfd_create` returned this fresh descriptor and no other
+        // owner has been constructed for it.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+        set_relative_timer(fd.as_raw_fd(), &specification)?;
+        Ok(Self { fd })
+    }
+
+    pub fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
+    }
+
+    pub fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.fd.as_raw_fd()
+    }
+
+    pub fn consume_expirations(&self) -> io::Result<u64> {
+        read_timer_expirations(self.fd.as_raw_fd())
+    }
+}
 
 #[repr(C)]
 #[derive(Debug, Default)]
@@ -95,7 +133,7 @@ struct BpfMapFreezeAttr {
 }
 
 #[derive(Debug)]
-struct DirectCgroupAttachRequest {
+struct DirectCgroupProgramRequest {
     command: libc::c_uint,
     attr: BpfProgAttachAttr,
 }
@@ -201,15 +239,47 @@ impl NetlinkSocket {
     }
 }
 
-pub fn socket_kernel_identity(socket: BorrowedFd<'_>) -> io::Result<(u64, u64)> {
-    let socket_cookie = socket_u64_option(socket, libc::SO_COOKIE)?;
-    let netns_cookie = socket_u64_option(socket, libc::SO_NETNS_COOKIE)?;
-    Ok((socket_cookie, netns_cookie))
+pub fn socket_kernel_identity(socket: BorrowedFd<'_>) -> io::Result<u64> {
+    socket_u64_option(socket, libc::SO_COOKIE)
+}
+
+pub fn verify_udp_fence_socket_options(socket: BorrowedFd<'_>, ipv6: bool) -> io::Result<()> {
+    let (level, freebind, transparent) = if ipv6 {
+        (
+            libc::IPPROTO_IPV6,
+            libc::IPV6_FREEBIND,
+            libc::IPV6_TRANSPARENT,
+        )
+    } else {
+        (libc::IPPROTO_IP, libc::IP_FREEBIND, libc::IP_TRANSPARENT)
+    };
+    let ipv6_only = ipv6
+        .then(|| socket_i32_option(socket, libc::IPPROTO_IPV6, libc::IPV6_V6ONLY))
+        .transpose()?;
+    validate_udp_fence_option_values(
+        socket_i32_option(socket, level, freebind)?,
+        socket_i32_option(socket, level, transparent)?,
+        ipv6_only,
+    )
+}
+
+fn validate_udp_fence_option_values(
+    freebind: i32,
+    transparent: i32,
+    ipv6_only: Option<i32>,
+) -> io::Result<()> {
+    if freebind != 0 || transparent != 0 || ipv6_only.is_some_and(|value| value != 1) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "udp_fence_socket_options",
+        ));
+    }
+    Ok(())
 }
 
 pub fn query_cgroup_skb_egress(
     cgroup: BorrowedFd<'_>,
-) -> io::Result<(u32, NonZeroU64, Vec<BpfCgroupProgramAttachment>)> {
+) -> io::Result<(u32, u64, Vec<BpfCgroupProgramAttachment>)> {
     let mut program_ids = [0_u32; BPF_CGROUP_MAX_PROGS];
     let mut program_attach_flags = [0_u32; BPF_CGROUP_MAX_PROGS];
     let mut query = BpfProgQueryAttr {
@@ -219,6 +289,7 @@ pub fn query_cgroup_skb_egress(
         program_count: u32::try_from(program_ids.len())
             .map_err(|_| io::Error::other("bpf_cgroup_query_capacity"))?,
         program_attach_flags: program_attach_flags.as_mut_ptr() as usize as u64,
+        revision: CGROUP_REVISION_PROBE_SENTINEL,
         ..BpfProgQueryAttr::default()
     };
     // SAFETY: `query` is the exact BPF_PROG_QUERY UAPI structure and its
@@ -266,19 +337,41 @@ pub fn query_cgroup_skb_egress(
             program_attach_flags: program_attach_flags[index],
         })
         .collect();
-    let revision = NonZeroU64::new(query.revision).ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidData, "bpf_cgroup_query_zero_revision")
-    })?;
-    Ok((query.attach_flags, revision, attachments))
+    validate_cgroup_revision_probe(query.revision)?;
+    Ok((query.attach_flags, query.revision, attachments))
+}
+
+pub fn probe_cgroup_revision_uapi(cgroup: BorrowedFd<'_>) -> io::Result<()> {
+    let mut query = cgroup_revision_probe_request(fd_number(cgroup)?);
+    // SAFETY: `query` is the exact BPF_PROG_QUERY UAPI structure, contains no
+    // user pointers for this count-only request, and the cgroup descriptor
+    // remains borrowed and live for the call.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_bpf,
+            BPF_PROG_QUERY,
+            &mut query as *mut BpfProgQueryAttr,
+            mem::size_of::<BpfProgQueryAttr>(),
+        )
+    };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    validate_cgroup_revision_probe(query.revision)
 }
 
 pub fn attach_cgroup_skb_egress(
     cgroup: BorrowedFd<'_>,
     program: BorrowedFd<'_>,
-    expected_revision: NonZeroU64,
+    expected_revision: u64,
 ) -> io::Result<()> {
-    let request =
-        direct_cgroup_attach_request(fd_number(cgroup)?, fd_number(program)?, expected_revision);
+    probe_cgroup_revision_uapi(cgroup)?;
+    let request = direct_cgroup_program_request(
+        BPF_PROG_ATTACH,
+        fd_number(cgroup)?,
+        fd_number(program)?,
+        expected_revision,
+    );
     // SAFETY: `request.attr` is the exact fully initialized BPF_PROG_ATTACH
     // UAPI structure. Both descriptors remain borrowed and live for the call.
     let result = unsafe {
@@ -296,22 +389,185 @@ pub fn attach_cgroup_skb_egress(
     }
 }
 
-fn direct_cgroup_attach_request(
+pub fn detach_cgroup_skb_egress(
+    cgroup: BorrowedFd<'_>,
+    program: BorrowedFd<'_>,
+    expected_revision: u64,
+) -> io::Result<()> {
+    if expected_revision == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "bpf_cgroup_detach_revision",
+        ));
+    }
+    probe_cgroup_revision_uapi(cgroup)?;
+    let request = direct_cgroup_program_request(
+        BPF_PROG_DETACH,
+        fd_number(cgroup)?,
+        fd_number(program)?,
+        expected_revision,
+    );
+    // SAFETY: `request.attr` is the exact fully initialized BPF_PROG_DETACH
+    // UAPI structure. Both descriptors remain borrowed and live for the call.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_bpf,
+            request.command,
+            &request.attr as *const BpfProgAttachAttr,
+            mem::size_of::<BpfProgAttachAttr>(),
+        )
+    };
+    if result < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn direct_cgroup_program_request(
+    command: libc::c_uint,
     target_fd: u32,
     program_fd: u32,
-    expected_revision: NonZeroU64,
-) -> DirectCgroupAttachRequest {
-    DirectCgroupAttachRequest {
-        command: BPF_PROG_ATTACH,
+    expected_revision: u64,
+) -> DirectCgroupProgramRequest {
+    DirectCgroupProgramRequest {
+        command,
         attr: BpfProgAttachAttr {
             target_fd,
             attach_bpf_fd: program_fd,
             attach_type: BPF_CGROUP_INET_EGRESS,
-            attach_flags: BPF_F_ALLOW_MULTI,
-            expected_revision: expected_revision.get(),
+            attach_flags: if command == BPF_PROG_ATTACH {
+                BPF_F_ALLOW_MULTI
+            } else {
+                0
+            },
+            expected_revision,
             ..BpfProgAttachAttr::default()
         },
     }
+}
+
+fn cgroup_revision_probe_request(target_fd: u32) -> BpfProgQueryAttr {
+    BpfProgQueryAttr {
+        target_fd,
+        attach_type: BPF_CGROUP_INET_EGRESS,
+        revision: CGROUP_REVISION_PROBE_SENTINEL,
+        ..BpfProgQueryAttr::default()
+    }
+}
+
+fn validate_cgroup_revision_probe(revision: u64) -> io::Result<()> {
+    if revision == CGROUP_REVISION_PROBE_SENTINEL {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "bpf_cgroup_revision_uapi",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+pub fn clock_gettime_boottime_ns() -> io::Result<u64> {
+    let mut value = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `value` points to writable, correctly aligned `timespec`
+    // storage for the duration of this read-only clock operation.
+    let result = unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut value) };
+    if result != 0 {
+        let error = io::Error::last_os_error();
+        return Err(io::Error::new(error.kind(), "clock_gettime_boottime"));
+    }
+    timespec_to_nanoseconds(value.tv_sec, value.tv_nsec)
+}
+
+fn relative_timer_specification(duration: Duration) -> io::Result<libc::itimerspec> {
+    if duration.is_zero() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "timerfd_boottime",
+        ));
+    }
+    let seconds = libc::time_t::try_from(duration.as_secs())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "timerfd_boottime"))?;
+    // `Duration` guarantees this is below one billion, which fits every
+    // supported Linux `c_long`.
+    let nanoseconds = duration.subsec_nanos() as libc::c_long;
+    Ok(libc::itimerspec {
+        it_interval: libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        },
+        it_value: libc::timespec {
+            tv_sec: seconds,
+            tv_nsec: nanoseconds,
+        },
+    })
+}
+
+fn set_relative_timer(
+    raw_fd: std::os::fd::RawFd,
+    specification: &libc::itimerspec,
+) -> io::Result<()> {
+    loop {
+        let result = {
+            // SAFETY: `specification` is a fully initialized relative one-shot
+            // timer value, the old-value pointer is null, and callers keep the
+            // descriptor live for the duration of the syscall.
+            unsafe { libc::timerfd_settime(raw_fd, 0, specification, std::ptr::null_mut()) }
+        };
+        if result == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+fn read_timer_expirations(raw_fd: std::os::fd::RawFd) -> io::Result<u64> {
+    loop {
+        let mut expirations = 0_u64;
+        // SAFETY: `expirations` is writable and correctly aligned for exactly
+        // one timerfd expiration counter, and callers keep the descriptor live
+        // for the duration of the nonblocking read.
+        let result = unsafe {
+            libc::read(
+                raw_fd,
+                (&mut expirations as *mut u64).cast::<libc::c_void>(),
+                mem::size_of_val(&expirations),
+            )
+        };
+        if result < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if result as usize != mem::size_of_val(&expirations) || expirations == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "timerfd_boottime",
+            ));
+        }
+        return Ok(expirations);
+    }
+}
+
+fn timespec_to_nanoseconds(seconds: libc::time_t, nanoseconds: libc::c_long) -> io::Result<u64> {
+    let seconds = u64::try_from(seconds)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "clock_gettime_boottime"))?;
+    let nanoseconds = u64::try_from(nanoseconds)
+        .ok()
+        .filter(|value| *value < NANOS_PER_SECOND)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "clock_gettime_boottime"))?;
+    seconds
+        .checked_mul(NANOS_PER_SECOND)
+        .and_then(|value| value.checked_add(nanoseconds))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "clock_gettime_boottime"))
 }
 
 pub fn freeze_bpf_map(map: BorrowedFd<'_>) -> io::Result<()> {
@@ -333,6 +589,71 @@ pub fn freeze_bpf_map(map: BorrowedFd<'_>) -> io::Result<()> {
     } else {
         Ok(())
     }
+}
+
+pub fn verify_bpf_map_frozen(map: BorrowedFd<'_>) -> io::Result<()> {
+    let raw_fd = fd_number(map)?;
+    let path = format!("/proc/self/fdinfo/{raw_fd}");
+    let file = std::fs::File::open(path)?;
+    let mut contents = Vec::new();
+    file.take(MAX_BPF_FDINFO_BYTES + 1)
+        .read_to_end(&mut contents)?;
+    if u64::try_from(contents.len())
+        .ok()
+        .is_none_or(|length| length > MAX_BPF_FDINFO_BYTES)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "bpf_map_fdinfo_bound",
+        ));
+    }
+    validate_bpf_map_fdinfo(&contents)
+}
+
+fn validate_bpf_map_fdinfo(contents: &[u8]) -> io::Result<()> {
+    let text = std::str::from_utf8(contents)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bpf_map_fdinfo_encoding"))?;
+    let mut frozen = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("frozen:\t"));
+    if frozen.next() != Some("1") || frozen.next().is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "bpf_map_not_frozen",
+        ));
+    }
+    Ok(())
+}
+
+fn socket_i32_option(
+    socket: BorrowedFd<'_>,
+    level: libc::c_int,
+    option: libc::c_int,
+) -> io::Result<i32> {
+    let mut value = 0_i32;
+    let mut length = libc::socklen_t::try_from(mem::size_of::<i32>())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "socket_option_width"))?;
+    // SAFETY: `socket` remains live and borrowed, while `value` and `length`
+    // are exact writable objects for the entire `getsockopt` call.
+    let result = unsafe {
+        libc::getsockopt(
+            socket.as_raw_fd(),
+            level,
+            option,
+            (&mut value as *mut i32).cast(),
+            &mut length,
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if usize::try_from(length).ok() != Some(mem::size_of::<i32>()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "socket_option_width",
+        ));
+    }
+    Ok(value)
 }
 
 fn socket_u64_option(socket: BorrowedFd<'_>, option: libc::c_int) -> io::Result<u64> {
@@ -380,25 +701,9 @@ pub struct BpfXdpProgram {
     fd: OwnedFd,
 }
 
-#[derive(Debug)]
-pub struct BpfCgroupSkbProgram {
-    fd: OwnedFd,
-}
-
 impl BpfXdpProgram {
     pub fn program_id(&self) -> io::Result<u32> {
         xdp_program_id_from_fd(&self.fd)
-    }
-}
-
-impl BpfCgroupSkbProgram {
-    pub fn info(&self) -> io::Result<(u32, [u8; 8])> {
-        cgroup_skb_program_info_from_fd(&self.fd)
-    }
-
-    pub fn pin_duplicate(&self, path: &Path) -> io::Result<()> {
-        let path = validate_pin_path(path)?;
-        pin_bpf_object(&self.fd, &path)
     }
 }
 
@@ -754,38 +1059,6 @@ fn xdp_program_id_from_fd(program_fd: &OwnedFd) -> io::Result<u32> {
     Ok(info.program_id)
 }
 
-fn cgroup_skb_program_info_from_fd(program_fd: &OwnedFd) -> io::Result<(u32, [u8; 8])> {
-    let mut info = BpfProgramInfoRaw::default();
-    let mut info_attr = BpfObjGetInfoByFdAttr {
-        bpf_fd: fd_number(program_fd.as_fd())?,
-        info_len: mem::size_of::<BpfProgramInfoRaw>() as u32,
-        info: (&mut info as *mut BpfProgramInfoRaw) as usize as u64,
-    };
-    // SAFETY: `info_attr` is the exact BPF_OBJ_GET_INFO_BY_FD UAPI layout and
-    // points to a live writable `BpfProgramInfoRaw` for the call duration.
-    let result = unsafe {
-        libc::syscall(
-            libc::SYS_bpf,
-            BPF_OBJ_GET_INFO_BY_FD,
-            &mut info_attr as *mut BpfObjGetInfoByFdAttr,
-            mem::size_of::<BpfObjGetInfoByFdAttr>(),
-        )
-    };
-    if result < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if info_attr.info_len < mem::size_of::<BpfProgramInfoRaw>() as u32
-        || info.program_type != BPF_PROG_TYPE_CGROUP_SKB
-        || info.program_id == 0
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "bpf_cgroup_skb_program_identity",
-        ));
-    }
-    Ok((info.program_id, info.tag))
-}
-
 pub fn open_xdp_link_by_id(link_id: u32) -> io::Result<BpfXdpLink> {
     let link = BpfXdpLink {
         fd: open_bpf_link_by_id(link_id)?,
@@ -816,19 +1089,6 @@ pub fn open_xdp_program_by_id(program_id: u32) -> io::Result<BpfXdpProgram> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "opened XDP program id does not match the requested object",
-        ));
-    }
-    Ok(program)
-}
-
-pub fn open_cgroup_skb_program_by_id(program_id: u32) -> io::Result<BpfCgroupSkbProgram> {
-    let program = BpfCgroupSkbProgram {
-        fd: open_bpf_object_by_id(BPF_PROG_GET_FD_BY_ID, program_id)?,
-    };
-    if program.info()?.0 != program_id {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "bpf_cgroup_skb_program_identity",
         ));
     }
     Ok(program)
@@ -1030,8 +1290,8 @@ mod tests {
 
     #[test]
     fn cgroup_egress_attach_is_direct_revision_guarded_and_multi() {
-        let revision = NonZeroU64::new(0x0102_0304_0506_0708).expect("nonzero fixture");
-        let request = direct_cgroup_attach_request(17, 23, revision);
+        let revision = 0x0102_0304_0506_0708;
+        let request = direct_cgroup_program_request(BPF_PROG_ATTACH, 17, 23, revision);
 
         assert_eq!(request.command, BPF_PROG_ATTACH);
         assert_eq!(request.attr.target_fd, 17);
@@ -1040,7 +1300,190 @@ mod tests {
         assert_eq!(request.attr.attach_flags, BPF_F_ALLOW_MULTI);
         assert_eq!(request.attr.replace_bpf_fd, 0);
         assert_eq!(request.attr.relative_fd, 0);
-        assert_eq!(request.attr.expected_revision, revision.get());
+        assert_eq!(request.attr.expected_revision, revision);
+    }
+
+    #[test]
+    fn cgroup_egress_pristine_attach_preserves_explicit_zero_revision() {
+        let request = direct_cgroup_program_request(BPF_PROG_ATTACH, 17, 23, 0);
+
+        assert_eq!(request.attr.attach_flags, BPF_F_ALLOW_MULTI);
+        assert_eq!(request.attr.expected_revision, 0);
+    }
+
+    #[test]
+    fn cgroup_egress_detach_targets_one_exact_program_with_revision() {
+        let request = direct_cgroup_program_request(BPF_PROG_DETACH, 17, 23, 41);
+
+        assert_eq!(request.command, BPF_PROG_DETACH);
+        assert_eq!(request.attr.target_fd, 17);
+        assert_eq!(request.attr.attach_bpf_fd, 23);
+        assert_eq!(request.attr.attach_type, BPF_CGROUP_INET_EGRESS);
+        assert_eq!(request.attr.attach_flags, 0);
+        assert_eq!(request.attr.replace_bpf_fd, 0);
+        assert_eq!(request.attr.relative_fd, 0);
+        assert_eq!(request.attr.expected_revision, 41);
+    }
+
+    #[test]
+    fn cgroup_revision_probe_requires_kernel_overwrite() {
+        let request = cgroup_revision_probe_request(17);
+        assert_eq!(request.target_fd, 17);
+        assert_eq!(request.attach_type, BPF_CGROUP_INET_EGRESS);
+        assert_eq!(request.program_count, 0);
+        assert_eq!(request.program_ids, 0);
+        assert_eq!(request.revision, CGROUP_REVISION_PROBE_SENTINEL);
+
+        let error = validate_cgroup_revision_probe(CGROUP_REVISION_PROBE_SENTINEL)
+            .expect_err("unchanged sentinel");
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        assert_eq!(error.to_string(), "bpf_cgroup_revision_uapi");
+        assert!(validate_cgroup_revision_probe(0).is_ok());
+        assert!(validate_cgroup_revision_probe(41).is_ok());
+    }
+
+    #[test]
+    fn boottime_timespec_conversion_is_checked() {
+        assert_eq!(timespec_to_nanoseconds(0, 0).expect("epoch"), 0);
+        assert_eq!(
+            timespec_to_nanoseconds(7, 123).expect("ordinary time"),
+            7_000_000_123
+        );
+        for (seconds, nanoseconds) in [(-1, 0), (0, -1), (0, 1_000_000_000)] {
+            let error =
+                timespec_to_nanoseconds(seconds, nanoseconds).expect_err("invalid timespec");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(error.to_string(), "clock_gettime_boottime");
+        }
+        if let Ok(seconds) = libc::time_t::try_from(u64::MAX / NANOS_PER_SECOND + 1) {
+            let error = timespec_to_nanoseconds(seconds, 0).expect_err("overflowing timespec");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(error.to_string(), "clock_gettime_boottime");
+        }
+    }
+
+    #[test]
+    fn live_boottime_read_is_nonzero_and_fallible() {
+        let now = clock_gettime_boottime_ns().expect("CLOCK_BOOTTIME is supported on Linux");
+        assert_ne!(now, 0);
+    }
+
+    #[test]
+    fn relative_boottime_timer_conversion_rejects_zero_and_overflow() {
+        let specification =
+            relative_timer_specification(Duration::new(7, 123)).expect("ordinary duration");
+        assert_eq!(specification.it_interval.tv_sec, 0);
+        assert_eq!(specification.it_interval.tv_nsec, 0);
+        assert_eq!(specification.it_value.tv_sec, 7);
+        assert_eq!(specification.it_value.tv_nsec, 123);
+
+        let error = relative_timer_specification(Duration::ZERO).expect_err("zero disarms timerfd");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(error.to_string(), "timerfd_boottime");
+
+        if libc::time_t::try_from(u64::MAX).is_err() {
+            let error = relative_timer_specification(Duration::new(u64::MAX, 999_999_999))
+                .expect_err("seconds exceed time_t");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(error.to_string(), "timerfd_boottime");
+        }
+    }
+
+    #[test]
+    fn fenced_udp_option_values_require_strict_family_safe_defaults() {
+        assert!(validate_udp_fence_option_values(0, 0, None).is_ok());
+        assert!(validate_udp_fence_option_values(0, 0, Some(1)).is_ok());
+        for (freebind, transparent, ipv6_only) in [
+            (1, 0, None),
+            (0, 1, None),
+            (1, 1, Some(1)),
+            (0, 0, Some(0)),
+            (0, 0, Some(2)),
+        ] {
+            let error = validate_udp_fence_option_values(freebind, transparent, ipv6_only)
+                .expect_err("unsafe socket option");
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert_eq!(error.to_string(), "udp_fence_socket_options");
+        }
+    }
+
+    #[test]
+    fn frozen_map_fdinfo_requires_one_exact_frozen_field() {
+        assert!(
+            validate_bpf_map_fdinfo(b"pos:\t0\nflags:\t02000002\nmap_type:\t2\nfrozen:\t1\n")
+                .is_ok()
+        );
+        for invalid in [
+            b"map_type:\t2\n".as_slice(),
+            b"map_type:\t2\nfrozen:\t0\n".as_slice(),
+            b"map_type:\t2\nfrozen:\t2\n".as_slice(),
+            b"map_type:\t2\nfrozen:\t1\nfrozen:\t1\n".as_slice(),
+            b"map_type:\t2\nfrozen: 1\n".as_slice(),
+            &[0xff][..],
+        ] {
+            assert_eq!(
+                validate_bpf_map_fdinfo(invalid)
+                    .expect_err("ambiguous or unfrozen fdinfo")
+                    .kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_timer_descriptor_errors_without_memory_unsafety() {
+        let specification =
+            relative_timer_specification(Duration::from_nanos(1)).expect("duration");
+        let arm_error = set_relative_timer(-1, &specification).expect_err("invalid arm descriptor");
+        assert_eq!(arm_error.raw_os_error(), Some(libc::EBADF));
+        let read_error = read_timer_expirations(-1).expect_err("invalid read descriptor");
+        assert_eq!(read_error.raw_os_error(), Some(libc::EBADF));
+    }
+
+    #[test]
+    fn live_boottime_timer_is_nonblocking_close_on_exec_and_redacted() {
+        let timer = match crate::BootTimeTimer::new(Duration::from_millis(1)) {
+            Ok(timer) => timer,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::PermissionDenied | io::ErrorKind::Unsupported
+                ) =>
+            {
+                eprintln!("skipping: CLOCK_BOOTTIME timerfd unavailable");
+                return;
+            }
+            Err(error) => panic!("unexpected boot-time timer error: {error}"),
+        };
+        assert_eq!(format!("{timer:?}"), "BootTimeTimer(<redacted>)");
+        // SAFETY: `timer` owns a live descriptor and these `fcntl` commands do
+        // not consume it or require pointer arguments.
+        let status_flags = unsafe { libc::fcntl(timer.as_raw_fd(), libc::F_GETFL) };
+        // SAFETY: as above, `F_GETFD` only reads descriptor flags.
+        let descriptor_flags = unsafe { libc::fcntl(timer.as_raw_fd(), libc::F_GETFD) };
+        assert_ne!(status_flags & libc::O_NONBLOCK, 0);
+        assert_ne!(descriptor_flags & libc::FD_CLOEXEC, 0);
+
+        let mut poll_descriptor = libc::pollfd {
+            fd: timer.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `poll_descriptor` is one initialized element and remains
+        // writable for the bounded call.
+        let ready = unsafe { libc::poll(&mut poll_descriptor, 1, 1_000) };
+        assert_eq!(ready, 1, "boot-time timer did not become readable");
+        assert_ne!(poll_descriptor.revents & libc::POLLIN, 0);
+        assert_eq!(timer.consume_expirations().expect("expiration"), 1);
+        let error = timer
+            .consume_expirations()
+            .expect_err("one-shot timer was consumed");
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(error.to_string(), "boot_time_timer");
+
+        let zero = crate::BootTimeTimer::new(Duration::ZERO).expect_err("zero duration");
+        assert_eq!(zero.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(zero.to_string(), "boot_time_timer");
     }
 
     #[test]

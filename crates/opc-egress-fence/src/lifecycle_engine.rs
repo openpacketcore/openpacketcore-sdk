@@ -16,14 +16,14 @@ pub enum LeaseFenceError<E> {
         /// Authority-specific failure, never formatted by this crate.
         error: E,
         /// Exact unreleased guard that must remain fenced until resolved.
-        lease: LeaseGuard,
+        lease: Box<LeaseGuard>,
     },
     /// Local validation failed after a guard was returned.
     FenceWithLease {
         /// Value-free local failure.
         error: FenceError,
         /// Exact unreleased guard that must remain fenced until resolved.
-        lease: LeaseGuard,
+        lease: Box<LeaseGuard>,
     },
 }
 
@@ -42,7 +42,7 @@ impl<E> LeaseFenceError<E> {
         match self {
             Self::Authority(_) | Self::Fence(_) => None,
             Self::AuthorityWithLease { lease, .. } | Self::FenceWithLease { lease, .. } => {
-                Some(lease)
+                Some(*lease)
             }
         }
     }
@@ -100,6 +100,7 @@ struct LeaseBinding {
     socket_lifecycle_token: NonZeroU64,
     retirement_lifecycle_token: NonZeroU64,
     credential_id: u64,
+    durable_expiry_boot_ns: u64,
 }
 
 impl LeaseBinding {
@@ -107,6 +108,7 @@ impl LeaseBinding {
         guard: &LeaseGuard,
         socket_lifecycle_token: NonZeroU64,
         retirement_lifecycle_token: NonZeroU64,
+        durable_expiry_boot_ns: u64,
     ) -> Self {
         Self {
             key: guard.key().clone(),
@@ -115,6 +117,7 @@ impl LeaseBinding {
             socket_lifecycle_token,
             retirement_lifecycle_token,
             credential_id: guard.credential_id(),
+            durable_expiry_boot_ns,
         }
     }
 
@@ -132,9 +135,60 @@ impl fmt::Debug for LeaseBinding {
     }
 }
 
-enum ActivationPath {
-    Immediate,
-    Delayed(Duration),
+/// Owned suspend-aware wait for the next safe renewal point.
+pub(crate) struct RenewalWait {
+    clock: Arc<dyn BootClock>,
+    observations: Arc<BootObservationTracker>,
+    target_boot_ns: u64,
+    deadline_boot_ns: u64,
+    poll_interval: Duration,
+    last_observed_boot_ns: u64,
+}
+
+impl RenewalWait {
+    pub(crate) async fn wait(mut self) -> Result<(), FenceError> {
+        loop {
+            if self.last_observed_boot_ns >= self.deadline_boot_ns {
+                return Err(FenceError::GateExpired);
+            }
+            if self.last_observed_boot_ns >= self.target_boot_ns {
+                return Ok(());
+            }
+            let remaining = self.target_boot_ns - self.last_observed_boot_ns;
+            let duration = cmp::min(self.poll_interval, Duration::from_nanos(remaining));
+            self.clock
+                .wait_poll(duration)
+                .await
+                .map_err(map_kernel_failure)?;
+            let observed = self.clock.now_boot_ns().map_err(map_kernel_failure)?;
+            self.observations.observe(observed)?;
+            self.last_observed_boot_ns = observed;
+        }
+    }
+}
+
+struct BootObservationTracker {
+    last_observed_boot_ns: std::sync::Mutex<Option<u64>>,
+}
+
+impl BootObservationTracker {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            last_observed_boot_ns: std::sync::Mutex::new(None),
+        })
+    }
+
+    fn observe(&self, observed: u64) -> Result<(), FenceError> {
+        let mut last = self
+            .last_observed_boot_ns
+            .lock()
+            .map_err(|_| FenceError::ClockUnavailable)?;
+        if last.is_some_and(|prior| observed < prior) {
+            return Err(FenceError::ClockUnavailable);
+        }
+        *last = Some(observed);
+        Ok(())
+    }
 }
 
 /// One socket's lease-bound kernel gate.
@@ -153,6 +207,7 @@ pub(crate) struct LeaseBoundFence {
     registered: bool,
     binding: Option<LeaseBinding>,
     active_deadline_boot_ns: u64,
+    observations: Arc<BootObservationTracker>,
     terminal: bool,
     close_verified: bool,
     reclaimed: bool,
@@ -192,6 +247,7 @@ impl LeaseBoundFence {
             registered: false,
             binding: None,
             active_deadline_boot_ns: 0,
+            observations: BootObservationTracker::new(),
             terminal: false,
             close_verified: false,
             reclaimed: false,
@@ -201,6 +257,58 @@ impl LeaseBoundFence {
     #[must_use]
     pub(crate) fn is_active(&self) -> bool {
         self.binding.is_some() && !self.terminal
+    }
+
+    pub(crate) fn preflight_send(&mut self) -> Result<(), FenceError> {
+        let result = self.preflight_send_exact();
+        if result.is_err() {
+            let _ = self.terminal_close();
+        }
+        result
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_drop_private_mutation_program_fd(&self) -> Result<(), FenceError> {
+        self.kernel
+            .test_drop_private_mutation_program_fd()
+            .map_err(map_kernel_failure)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_drop_private_view_program_fd(&self) -> Result<(), FenceError> {
+        self.kernel
+            .test_drop_private_view_program_fd()
+            .map_err(map_kernel_failure)
+    }
+
+    pub(crate) fn renewal_wait(
+        &mut self,
+        timing: LeaseFenceTiming,
+    ) -> Result<RenewalWait, FenceError> {
+        if !self.is_active() || self.active_deadline_boot_ns == 0 {
+            return Err(FenceError::TerminalClosed);
+        }
+        let active_lifetime_ns = timing.active_gate_lifetime_ns()?;
+        let operation_start = self
+            .active_deadline_boot_ns
+            .checked_sub(active_lifetime_ns)
+            .ok_or(FenceError::KernelReadback)?;
+        let target_boot_ns = operation_start
+            .checked_add(active_lifetime_ns / 2)
+            .ok_or(FenceError::DeadlineOverflow)?;
+        let observed = self.observe_boot_time()?;
+        if observed >= self.active_deadline_boot_ns {
+            let _ = self.terminal_close();
+            return Err(FenceError::GateExpired);
+        }
+        Ok(RenewalWait {
+            clock: Arc::clone(&self.clock),
+            observations: Arc::clone(&self.observations),
+            target_boot_ns,
+            deadline_boot_ns: self.active_deadline_boot_ns,
+            poll_interval: timing.boot_poll_interval(),
+            last_observed_boot_ns: observed,
+        })
     }
 
     pub(crate) async fn acquire<A>(
@@ -218,6 +326,7 @@ impl LeaseBoundFence {
         }
         let mut pending = PendingTransition::new(self);
         let acquisition_start = pending.now().map_err(LeaseFenceError::Fence)?;
+        let expected_owner = owner.clone();
         let grant = authority
             .acquire(
                 key,
@@ -228,63 +337,49 @@ impl LeaseBoundFence {
             )
             .await
             .map_err(LeaseFenceError::Authority)?;
-        let (
-            mut guard,
-            lifecycle_token,
-            retirement_lifecycle_token,
-            prior,
-            durable_record_generation,
-        ) = grant.into_parts();
+        let (guard, lifecycle_token, retirement_lifecycle_token, prior, durable_record_generation) =
+            grant.into_parts();
+        let guard_interval_ns =
+            match validate_acquired_guard(key, &expected_owner, &guard, timing.ttl()) {
+                Ok(interval) => interval,
+                Err(error) => return Err(fence_with_lease(error, guard)),
+            };
+        let durable_expiry_boot_ns = match acquisition_start.checked_add(guard_interval_ns) {
+            Some(deadline) => deadline,
+            None => return Err(fence_with_lease(FenceError::LeaseContinuity, guard)),
+        };
         if let Err(error) =
             validate_lifecycle_token_pair(lifecycle_token, retirement_lifecycle_token)
         {
             return Err(fence_with_lease(error, guard));
         }
-        let acquisition_completion = match pending.now_not_before(acquisition_start) {
-            Ok(now) => now,
-            Err(error) => return Err(fence_with_lease(error, guard)),
-        };
-        let activation_path = match pending.activation_path(
+        if let Err(error) = pending.now_not_before(acquisition_start) {
+            return Err(fence_with_lease(error, guard));
+        }
+        if let Err(error) = pending.activation_path(
             lifecycle_token,
             retirement_lifecycle_token,
             prior,
             durable_record_generation,
             timing.active_gate_lifetime(),
         ) {
-            Ok(path) => path,
-            Err(error) => return Err(fence_with_lease(error, guard)),
-        };
-        let operation_start = match activation_path {
-            ActivationPath::Immediate => acquisition_start,
-            ActivationPath::Delayed(delay) => {
-                guard = pending
-                    .supervise_closed_wait(authority, guard, acquisition_completion, delay, timing)
-                    .await?;
-                let renewal_start = match pending.now() {
-                    Ok(now) => now,
-                    Err(error) => return Err(fence_with_lease(error, guard)),
-                };
-                let renewed = match authority.renew(&guard, timing.ttl()).await {
-                    Ok(renewed) => renewed,
-                    Err(error) => return Err(authority_with_lease(error, guard)),
-                };
-                if let Err(error) = validate_guard_continuity(&guard, &renewed) {
-                    return Err(fence_with_lease(error, guard));
-                }
-                guard = renewed;
-                renewal_start
-            }
-        };
+            return Err(fence_with_lease(error, guard));
+        }
+        let operation_start = acquisition_start;
         let deadline = match timing.deadline_from(operation_start) {
             Ok(deadline) => deadline,
             Err(error) => return Err(fence_with_lease(error, guard)),
         };
+        if deadline > durable_expiry_boot_ns {
+            return Err(fence_with_lease(FenceError::LeaseContinuity, guard));
+        }
         if let Err(error) = pending.publish_register_activate(
             &guard,
             lifecycle_token,
             retirement_lifecycle_token,
             deadline,
             operation_start,
+            durable_expiry_boot_ns,
         ) {
             return Err(fence_with_lease(error, guard));
         }
@@ -309,14 +404,15 @@ impl LeaseBoundFence {
         if self.terminal {
             return Err(fence_with_lease(FenceError::TerminalClosed, current));
         }
-        if !self
+        let Some(prior_durable_expiry_boot_ns) = self
             .binding
             .as_ref()
-            .is_some_and(|binding| binding.matches(&current))
-        {
+            .filter(|binding| binding.matches(&current))
+            .map(|binding| binding.durable_expiry_boot_ns)
+        else {
             let _ = self.terminal_close();
             return Err(fence_with_lease(FenceError::LeaseContinuity, current));
-        }
+        };
         let mut pending = PendingTransition::new(self);
         let operation_start = match pending.now() {
             Ok(now) => now,
@@ -330,10 +426,22 @@ impl LeaseBoundFence {
             Ok(renewed) => renewed,
             Err(error) => return Err(authority_with_lease(error, current)),
         };
-        if let Err(error) = validate_guard_continuity(&current, &renewed) {
-            return Err(fence_with_lease(error, current));
+        let expiry_extension_ns = match validate_guard_continuity(&current, &renewed, timing.ttl())
+        {
+            Ok(extension) => extension,
+            Err(error) => return Err(fence_with_lease(error, renewed)),
+        };
+        let durable_expiry_boot_ns =
+            match prior_durable_expiry_boot_ns.checked_add(expiry_extension_ns) {
+                Some(deadline) => deadline,
+                None => return Err(fence_with_lease(FenceError::LeaseContinuity, renewed)),
+            };
+        if deadline > durable_expiry_boot_ns {
+            return Err(fence_with_lease(FenceError::LeaseContinuity, renewed));
         }
-        if let Err(error) = pending.refresh(&renewed, deadline, operation_start) {
+        if let Err(error) =
+            pending.refresh(&renewed, deadline, operation_start, durable_expiry_boot_ns)
+        {
             return Err(fence_with_lease(error, renewed));
         }
         pending.disarm();
@@ -347,8 +455,8 @@ impl LeaseBoundFence {
         prior: DurablePriorFenceState,
         durable_record_generation: NonZeroU64,
         current_gate_lifetime: Duration,
-    ) -> Result<ActivationPath, FenceError> {
-        let current_gate_ns = validate_prior_gate_lifetime(current_gate_lifetime)?;
+    ) -> Result<(), FenceError> {
+        validate_prior_gate_lifetime(current_gate_lifetime)?;
         validate_lifecycle_token_pair(lifecycle_token, retirement_lifecycle_token)?;
         let current = self.inspect_current()?;
         validate_current(current)?;
@@ -363,13 +471,12 @@ impl LeaseBoundFence {
                     return Err(FenceError::InvalidPriorEvidence);
                 }
                 match self.identity.inventory {
-                    AttachmentInventory::InstalledUnderRevisionGuard => {
+                    AttachmentInventory::InstalledClosedWithExactReadback
+                    | AttachmentInventory::AdoptedNeverActivated => {
                         require_current(current, KernelCurrentPhase::Uninitialized, 0, 0)?;
-                        Ok(ActivationPath::Immediate)
+                        Ok(())
                     }
-                    AttachmentInventory::AdoptedExact => {
-                        Ok(ActivationPath::Delayed(max_gate_lifetime()))
-                    }
+                    AttachmentInventory::AdoptedExact => Err(FenceError::InvalidPriorEvidence),
                 }
             }
             DurablePriorFenceKind::VerifiedTerminal {
@@ -394,14 +501,16 @@ impl LeaseBoundFence {
                         prior_retirement_token.get(),
                         0,
                     )?;
-                    Ok(ActivationPath::Immediate)
-                } else if self.identity.inventory
-                    == AttachmentInventory::InstalledUnderRevisionGuard
-                {
+                    Ok(())
+                } else if matches!(
+                    self.identity.inventory,
+                    AttachmentInventory::InstalledClosedWithExactReadback
+                        | AttachmentInventory::AdoptedNeverActivated
+                ) {
                     require_current(current, KernelCurrentPhase::Uninitialized, 0, 0)?;
-                    Ok(ActivationPath::Immediate)
+                    Ok(())
                 } else {
-                    Ok(ActivationPath::Delayed(max_gate_lifetime()))
+                    Err(FenceError::InvalidPriorEvidence)
                 }
             }
             DurablePriorFenceKind::LastAttachment {
@@ -418,20 +527,21 @@ impl LeaseBoundFence {
                 }
                 validate_lifecycle_token_pair(prior_socket_token, prior_retirement_token)?;
                 if attachment == self.identity.durable {
-                    if self.identity.inventory != AttachmentInventory::AdoptedExact {
+                    if !matches!(
+                        self.identity.inventory,
+                        AttachmentInventory::AdoptedExact
+                            | AttachmentInventory::AdoptedNeverActivated
+                    ) {
                         return Err(FenceError::InvalidPriorEvidence);
                     }
                     require_current_not_after_prior(current, prior_retirement_token)?;
-                    Ok(ActivationPath::Immediate)
+                    Ok(())
                 } else {
-                    let prior_ns = validate_prior_gate_lifetime(gate_lifetime)?;
-                    Ok(ActivationPath::Delayed(Duration::from_nanos(cmp::max(
-                        prior_ns,
-                        current_gate_ns,
-                    ))))
+                    validate_prior_gate_lifetime(gate_lifetime)?;
+                    Err(FenceError::InvalidPriorEvidence)
                 }
             }
-            DurablePriorFenceKind::Unknown => Ok(ActivationPath::Delayed(max_gate_lifetime())),
+            DurablePriorFenceKind::Unknown => Err(FenceError::InvalidPriorEvidence),
         }
     }
 
@@ -457,9 +567,12 @@ impl LeaseBoundFence {
             self.socket_cookie,
         )?;
         let terminal = inspection.entry.ok_or(FenceError::KernelReadback)?;
-        if terminal.state != KernelEntryState::TerminalClosed
-            || terminal.control_epoch != self.control_epoch
-        {
+        if !terminal_entry_matches(
+            terminal,
+            self.socket_cookie,
+            binding.socket_lifecycle_token,
+            self.control_epoch,
+        ) {
             return Err(FenceError::KernelReadback);
         }
         Ok(PendingTerminalClosure {
@@ -500,7 +613,14 @@ impl LeaseBoundFence {
             pending.socket_lifecycle_token.get(),
             self.socket_cookie,
         )?;
-        if before_retirement.entry.is_none() {
+        if !before_retirement.entry.is_some_and(|entry| {
+            terminal_entry_matches(
+                entry,
+                self.socket_cookie,
+                pending.socket_lifecycle_token,
+                pending.control_epoch.get(),
+            )
+        }) {
             return Err(FenceError::KernelReadback);
         }
         let publish = self
@@ -510,7 +630,14 @@ impl LeaseBoundFence {
         if retired.current.lifecycle_token != pending.retirement_lifecycle_token.get()
             || retired.current.phase != KernelCurrentPhase::RetirementClosed
             || retired.current.registered_socket_cookie != 0
-            || retired.entry.is_none()
+            || !retired.entry.is_some_and(|entry| {
+                terminal_entry_matches(
+                    entry,
+                    self.socket_cookie,
+                    pending.socket_lifecycle_token,
+                    pending.control_epoch.get(),
+                )
+            })
         {
             return Err(match publish {
                 Ok(_) => FenceError::KernelReadback,
@@ -573,6 +700,9 @@ impl LeaseBoundFence {
             self.close_verified = true;
             return Ok(());
         }
+        if current.state == KernelEntryState::Reclaiming {
+            return Err(FenceError::KernelReadback);
+        }
         if current.control_epoch != self.control_epoch {
             return Err(FenceError::KernelReadback);
         }
@@ -619,8 +749,12 @@ impl LeaseBoundFence {
         retirement_lifecycle_token: NonZeroU64,
         deadline_boot_ns: u64,
         operation_start_boot_ns: u64,
+        durable_expiry_boot_ns: u64,
     ) -> Result<(), FenceError> {
         self.verify_operation_budget(deadline_boot_ns, operation_start_boot_ns)?;
+        if deadline_boot_ns > durable_expiry_boot_ns {
+            return Err(FenceError::LeaseContinuity);
+        }
         validate_lifecycle_token_pair(lifecycle_token, retirement_lifecycle_token)?;
         if self.registered
             || self.socket_lifecycle_token.is_some()
@@ -645,6 +779,15 @@ impl LeaseBoundFence {
                 Err(failure) => map_kernel_failure(failure),
             });
         }
+        self.kernel
+            .cleanup_superseded(self.identity, lifecycle_token.get())
+            .map_err(map_kernel_failure)?;
+        require_current(
+            self.inspect_current()?,
+            KernelCurrentPhase::LifecycleOpen,
+            lifecycle_token.get(),
+            0,
+        )?;
         self.socket_lifecycle_token = Some(lifecycle_token);
         self.retirement_lifecycle_token = Some(retirement_lifecycle_token);
 
@@ -656,7 +799,7 @@ impl LeaseBoundFence {
             .is_some_and(|entry| initial_entry_matches(entry, self.socket_cookie, lifecycle_token))
         {
             self.registered = true;
-            self.control_epoch = INITIAL_CONTROL_EPOCH;
+            self.control_epoch = EGRESS_FENCE_INITIAL_COOKIE_EPOCH;
         }
         let registered = self.inspect_exact(lifecycle_token)?;
         if registered
@@ -664,7 +807,7 @@ impl LeaseBoundFence {
             .is_some_and(|entry| initial_entry_matches(entry, self.socket_cookie, lifecycle_token))
         {
             self.registered = true;
-            self.control_epoch = INITIAL_CONTROL_EPOCH;
+            self.control_epoch = EGRESS_FENCE_INITIAL_COOKIE_EPOCH;
         } else {
             return Err(match register {
                 Ok(_) => FenceError::KernelReadback,
@@ -714,6 +857,7 @@ impl LeaseBoundFence {
             guard,
             lifecycle_token,
             retirement_lifecycle_token,
+            durable_expiry_boot_ns,
         ));
         self.active_deadline_boot_ns = deadline_boot_ns;
         Ok(())
@@ -724,6 +868,7 @@ impl LeaseBoundFence {
         renewed: &LeaseGuard,
         deadline_boot_ns: u64,
         operation_start_boot_ns: u64,
+        durable_expiry_boot_ns: u64,
     ) -> Result<(), FenceError> {
         self.verify_operation_budget(deadline_boot_ns, operation_start_boot_ns)?;
         let Some(binding) = self
@@ -734,6 +879,11 @@ impl LeaseBoundFence {
         else {
             return Err(FenceError::LeaseContinuity);
         };
+        if durable_expiry_boot_ns <= binding.durable_expiry_boot_ns
+            || deadline_boot_ns > durable_expiry_boot_ns
+        {
+            return Err(FenceError::LeaseContinuity);
+        }
         let before_refresh = self.inspect_exact(binding.socket_lifecycle_token)?;
         require_current(
             before_refresh.current,
@@ -741,7 +891,15 @@ impl LeaseBoundFence {
             binding.socket_lifecycle_token.get(),
             self.socket_cookie,
         )?;
-        if before_refresh.entry.is_none() {
+        if !before_refresh.entry.is_some_and(|entry| {
+            active_entry_matches(
+                entry,
+                self.socket_cookie,
+                binding.socket_lifecycle_token,
+                self.active_deadline_boot_ns,
+                self.control_epoch,
+            )
+        }) {
             return Err(FenceError::KernelReadback);
         }
         let expected_epoch = self
@@ -780,26 +938,24 @@ impl LeaseBoundFence {
             renewed,
             binding.socket_lifecycle_token,
             binding.retirement_lifecycle_token,
+            durable_expiry_boot_ns,
         ));
         self.active_deadline_boot_ns = deadline_boot_ns;
         Ok(())
     }
 
     fn verify_operation_budget(
-        &self,
+        &mut self,
         deadline_boot_ns: u64,
         operation_start_boot_ns: u64,
     ) -> Result<(), FenceError> {
         let requested_lifetime = deadline_boot_ns
             .checked_sub(operation_start_boot_ns)
             .ok_or(FenceError::DeadlineOverflow)?;
-        if requested_lifetime == 0 || requested_lifetime > MAX_GATE_LIFETIME_NS {
+        if requested_lifetime == 0 || requested_lifetime > EGRESS_FENCE_MAX_GATE_LIFETIME_NS {
             return Err(FenceError::InvalidTiming);
         }
-        let completion = self
-            .clock
-            .now_boot_ns()
-            .map_err(|_| FenceError::ClockUnavailable)?;
+        let completion = self.observe_boot_time()?;
         if completion < operation_start_boot_ns {
             return Err(FenceError::ClockUnavailable);
         }
@@ -807,6 +963,49 @@ impl LeaseBoundFence {
             return Err(FenceError::OperationOverBudget);
         }
         Ok(())
+    }
+
+    fn preflight_send_exact(&mut self) -> Result<(), FenceError> {
+        if self.terminal {
+            return Err(FenceError::TerminalClosed);
+        }
+        let binding = self
+            .binding
+            .as_ref()
+            .cloned()
+            .ok_or(FenceError::TerminalClosed)?;
+        let now = self.observe_boot_time()?;
+        let inspection = self.inspect_exact(binding.socket_lifecycle_token)?;
+        require_current(
+            inspection.current,
+            KernelCurrentPhase::LifecycleOpen,
+            binding.socket_lifecycle_token.get(),
+            self.socket_cookie,
+        )?;
+        if !inspection.entry.is_some_and(|entry| {
+            active_entry_matches(
+                entry,
+                self.socket_cookie,
+                binding.socket_lifecycle_token,
+                self.active_deadline_boot_ns,
+                self.control_epoch,
+            )
+        }) {
+            return Err(FenceError::KernelReadback);
+        }
+        if now >= self.active_deadline_boot_ns {
+            return Err(FenceError::GateExpired);
+        }
+        Ok(())
+    }
+
+    fn observe_boot_time(&mut self) -> Result<u64, FenceError> {
+        let now = self
+            .clock
+            .now_boot_ns()
+            .map_err(|_| FenceError::ClockUnavailable)?;
+        self.observations.observe(now)?;
+        Ok(now)
     }
 
     fn socket_lifecycle_token_or_error(&self) -> Result<NonZeroU64, FenceError> {
@@ -860,7 +1059,35 @@ fn initial_entry_matches(
         && entry.socket_cookie == socket_cookie
         && entry.lifecycle_token == lifecycle_token.get()
         && entry.deadline_boot_ns == 0
-        && entry.control_epoch == INITIAL_CONTROL_EPOCH
+        && entry.control_epoch == EGRESS_FENCE_INITIAL_COOKIE_EPOCH
+}
+
+fn terminal_entry_matches(
+    entry: KernelFenceEntry,
+    socket_cookie: u64,
+    lifecycle_token: NonZeroU64,
+    control_epoch: u64,
+) -> bool {
+    entry.state == KernelEntryState::TerminalClosed
+        && entry.socket_cookie == socket_cookie
+        && entry.lifecycle_token == lifecycle_token.get()
+        && entry.deadline_boot_ns == 0
+        && entry.control_epoch == control_epoch
+}
+
+fn active_entry_matches(
+    entry: KernelFenceEntry,
+    socket_cookie: u64,
+    lifecycle_token: NonZeroU64,
+    deadline_boot_ns: u64,
+    control_epoch: u64,
+) -> bool {
+    entry.state == KernelEntryState::Active
+        && entry.socket_cookie == socket_cookie
+        && entry.lifecycle_token == lifecycle_token.get()
+        && entry.deadline_boot_ns == deadline_boot_ns
+        && deadline_boot_ns != 0
+        && entry.control_epoch == control_epoch
 }
 
 fn verify_entry_identity(
@@ -929,16 +1156,81 @@ fn validate_current(current: KernelCurrentFence) -> Result<(), FenceError> {
     }
 }
 
-fn validate_guard_continuity(current: &LeaseGuard, renewed: &LeaseGuard) -> Result<(), FenceError> {
+fn validate_guard_continuity(
+    current: &LeaseGuard,
+    renewed: &LeaseGuard,
+    requested_ttl: Duration,
+) -> Result<u64, FenceError> {
     if current.key() == renewed.key()
         && current.owner() == renewed.owner()
+        && current.fence().get() != 0
         && current.fence() == renewed.fence()
+        && current.credential_id() != 0
         && current.credential_id() == renewed.credential_id()
+        && renewed.acquired_at() >= current.acquired_at()
+        && renewed.expires_at() > renewed.acquired_at()
+        && renewed.expires_at() > current.expires_at()
     {
-        Ok(())
+        validate_guard_interval(renewed, requested_ttl)?;
+        exact_timestamp_delta_ns(
+            renewed
+                .expires_at()
+                .as_offset_datetime()
+                .unix_timestamp_nanos(),
+            current
+                .expires_at()
+                .as_offset_datetime()
+                .unix_timestamp_nanos(),
+        )
     } else {
         Err(FenceError::LeaseContinuity)
     }
+}
+
+fn validate_acquired_guard(
+    expected_key: &SessionKey,
+    expected_owner: &OwnerId,
+    guard: &LeaseGuard,
+    requested_ttl: Duration,
+) -> Result<u64, FenceError> {
+    if guard.key() == expected_key
+        && guard.owner() == expected_owner
+        && guard.fence().get() != 0
+        && guard.credential_id() != 0
+        && guard.expires_at() > guard.acquired_at()
+    {
+        validate_guard_interval(guard, requested_ttl)
+    } else {
+        Err(FenceError::LeaseContinuity)
+    }
+}
+
+fn validate_guard_interval(guard: &LeaseGuard, requested_ttl: Duration) -> Result<u64, FenceError> {
+    let minimum_expiry =
+        opc_session_store::checked_session_deadline(guard.acquired_at(), requested_ttl)
+            .map_err(|_| FenceError::LeaseContinuity)?;
+    if guard.expires_at() < minimum_expiry {
+        return Err(FenceError::LeaseContinuity);
+    }
+    exact_timestamp_delta_ns(
+        guard
+            .expires_at()
+            .as_offset_datetime()
+            .unix_timestamp_nanos(),
+        guard
+            .acquired_at()
+            .as_offset_datetime()
+            .unix_timestamp_nanos(),
+    )
+}
+
+fn exact_timestamp_delta_ns(later_ns: i128, earlier_ns: i128) -> Result<u64, FenceError> {
+    let delta_ns = later_ns
+        .checked_sub(earlier_ns)
+        .and_then(|delta| u64::try_from(delta).ok())
+        .filter(|delta| *delta != 0)
+        .ok_or(FenceError::LeaseContinuity)?;
+    Ok(delta_ns)
 }
 
 fn map_kernel_failure(failure: KernelFailure) -> FenceError {
@@ -950,11 +1242,17 @@ fn map_kernel_failure(failure: KernelFailure) -> FenceError {
 }
 
 fn authority_with_lease<E>(error: E, lease: LeaseGuard) -> LeaseFenceError<E> {
-    LeaseFenceError::AuthorityWithLease { error, lease }
+    LeaseFenceError::AuthorityWithLease {
+        error,
+        lease: Box::new(lease),
+    }
 }
 
 fn fence_with_lease<E>(error: FenceError, lease: LeaseGuard) -> LeaseFenceError<E> {
-    LeaseFenceError::FenceWithLease { error, lease }
+    LeaseFenceError::FenceWithLease {
+        error,
+        lease: Box::new(lease),
+    }
 }
 
 struct PendingTransition<'a> {
@@ -967,14 +1265,11 @@ impl<'a> PendingTransition<'a> {
         Self { fence, armed: true }
     }
 
-    fn now(&self) -> Result<u64, FenceError> {
-        self.fence
-            .clock
-            .now_boot_ns()
-            .map_err(|_| FenceError::ClockUnavailable)
+    fn now(&mut self) -> Result<u64, FenceError> {
+        self.fence.observe_boot_time()
     }
 
-    fn now_not_before(&self, prior: u64) -> Result<u64, FenceError> {
+    fn now_not_before(&mut self, prior: u64) -> Result<u64, FenceError> {
         let now = self.now()?;
         if now < prior {
             Err(FenceError::ClockUnavailable)
@@ -990,7 +1285,7 @@ impl<'a> PendingTransition<'a> {
         prior: DurablePriorFenceState,
         durable_record_generation: NonZeroU64,
         current_gate_lifetime: Duration,
-    ) -> Result<ActivationPath, FenceError> {
+    ) -> Result<(), FenceError> {
         self.fence.activation_path(
             lifecycle_token,
             retirement_lifecycle_token,
@@ -1000,86 +1295,6 @@ impl<'a> PendingTransition<'a> {
         )
     }
 
-    async fn supervise_closed_wait<A>(
-        &mut self,
-        authority: &A,
-        mut guard: LeaseGuard,
-        wait_start_boot_ns: u64,
-        delay: Duration,
-        timing: LeaseFenceTiming,
-    ) -> Result<LeaseGuard, LeaseFenceError<A::Error>>
-    where
-        A: EgressFenceLeaseAuthority + ?Sized,
-    {
-        let delay_ns = match validate_prior_gate_lifetime(delay) {
-            Ok(delay_ns) => delay_ns,
-            Err(error) => return Err(fence_with_lease(error, guard)),
-        };
-        let target = match wait_start_boot_ns.checked_add(delay_ns) {
-            Some(target) => target,
-            None => return Err(fence_with_lease(FenceError::DeadlineOverflow, guard)),
-        };
-        let renew_interval_ns = match u64::try_from(timing.closed_renew_interval().as_nanos()) {
-            Ok(interval) if interval != 0 => interval,
-            _ => return Err(fence_with_lease(FenceError::InvalidTiming, guard)),
-        };
-        let mut next_renew = match wait_start_boot_ns.checked_add(renew_interval_ns) {
-            Some(next_renew) => next_renew,
-            None => return Err(fence_with_lease(FenceError::DeadlineOverflow, guard)),
-        };
-        let mut last_observed = wait_start_boot_ns;
-
-        loop {
-            let now = match self.now_not_before(last_observed) {
-                Ok(now) => now,
-                Err(error) => return Err(fence_with_lease(error, guard)),
-            };
-            last_observed = now;
-            if now >= target {
-                return Ok(guard);
-            }
-            if now >= next_renew {
-                let renewed = match authority.renew(&guard, timing.ttl()).await {
-                    Ok(renewed) => renewed,
-                    Err(error) => return Err(authority_with_lease(error, guard)),
-                };
-                if let Err(error) = validate_guard_continuity(&guard, &renewed) {
-                    return Err(fence_with_lease(error, guard));
-                }
-                guard = renewed;
-                let completion = match self.now_not_before(now) {
-                    Ok(completion) => completion,
-                    Err(error) => return Err(fence_with_lease(error, guard)),
-                };
-                last_observed = completion;
-                next_renew = match completion.checked_add(renew_interval_ns) {
-                    Some(next_renew) => next_renew,
-                    None => {
-                        return Err(fence_with_lease(FenceError::DeadlineOverflow, guard));
-                    }
-                };
-                continue;
-            }
-            let until_target = target - now;
-            let until_renew = next_renew - now;
-            let configured_poll_ns =
-                u64::try_from(timing.boot_poll_interval().as_nanos()).unwrap_or(u64::MAX);
-            let poll_ns = cmp::max(
-                1,
-                cmp::min(cmp::min(until_target, until_renew), configured_poll_ns),
-            );
-            if self
-                .fence
-                .clock
-                .wait_poll(Duration::from_nanos(poll_ns))
-                .await
-                .is_err()
-            {
-                return Err(fence_with_lease(FenceError::ClockUnavailable, guard));
-            }
-        }
-    }
-
     fn publish_register_activate(
         &mut self,
         guard: &LeaseGuard,
@@ -1087,6 +1302,7 @@ impl<'a> PendingTransition<'a> {
         retirement_lifecycle_token: NonZeroU64,
         deadline_boot_ns: u64,
         operation_start_boot_ns: u64,
+        durable_expiry_boot_ns: u64,
     ) -> Result<(), FenceError> {
         self.fence.publish_register_activate(
             guard,
@@ -1094,6 +1310,7 @@ impl<'a> PendingTransition<'a> {
             retirement_lifecycle_token,
             deadline_boot_ns,
             operation_start_boot_ns,
+            durable_expiry_boot_ns,
         )
     }
 
@@ -1102,9 +1319,14 @@ impl<'a> PendingTransition<'a> {
         renewed: &LeaseGuard,
         deadline_boot_ns: u64,
         operation_start_boot_ns: u64,
+        durable_expiry_boot_ns: u64,
     ) -> Result<(), FenceError> {
-        self.fence
-            .refresh_verified(renewed, deadline_boot_ns, operation_start_boot_ns)
+        self.fence.refresh_verified(
+            renewed,
+            deadline_boot_ns,
+            operation_start_boot_ns,
+            durable_expiry_boot_ns,
+        )
     }
 
     fn disarm(&mut self) {

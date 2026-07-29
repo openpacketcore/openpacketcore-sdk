@@ -2,7 +2,9 @@ use crate::ProtectedEndpoint;
 
 const IPV4_MIN_HEADER_LEN: usize = 20;
 const IPV4_PROTOCOL_UDP: u8 = 17;
-const IPV4_FRAGMENT_MASK: u16 = 0x3fff;
+// The reserved flag, MF, and a nonzero fragment offset all make the UDP
+// source tuple ambiguous. DF is the only permitted flag.
+const IPV4_AMBIGUOUS_FRAGMENT_MASK: u16 = 0xbfff;
 const IPV6_HEADER_LEN: usize = 40;
 const IPV6_NEXT_HEADER_HOP_BY_HOP: u8 = 0;
 const IPV6_NEXT_HEADER_TCP: u8 = 6;
@@ -84,7 +86,7 @@ fn classify_ipv4(packet: &[u8], endpoint: ProtectedEndpoint) -> PacketEndpointDi
     let Some(fragment) = read_u16_be(packet, 6) else {
         return PacketEndpointDisposition::Indeterminate;
     };
-    if fragment & IPV4_FRAGMENT_MASK != 0 {
+    if fragment & IPV4_AMBIGUOUS_FRAGMENT_MASK != 0 {
         return PacketEndpointDisposition::Indeterminate;
     }
     if header_len.saturating_add(UDP_HEADER_LEN) > total_len {
@@ -259,7 +261,7 @@ mod tests {
 
     #[test]
     fn protected_ipv4_fragments_are_indeterminate() {
-        for fragment in [1, 0x2000] {
+        for fragment in [1, 0x2000, 0x8000] {
             assert_eq!(
                 classify_l3_udp_source(
                     &ipv4_udp([192, 0, 2, 37], 0x1235, 5, fragment),
@@ -268,6 +270,14 @@ mod tests {
                 PacketEndpointDisposition::Indeterminate
             );
         }
+    }
+
+    #[test]
+    fn ipv4_dont_fragment_flag_preserves_exact_classification() {
+        assert_eq!(
+            classify_l3_udp_source(&ipv4_udp([192, 0, 2, 37], 0x1235, 5, 0x4000), IPV4_ENDPOINT,),
+            PacketEndpointDisposition::Protected
+        );
     }
 
     #[test]

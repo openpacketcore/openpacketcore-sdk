@@ -8,6 +8,7 @@ use std::error::Error;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd};
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 use std::sync::{Arc, Barrier};
 
 use aya::maps::{Array, Map, MapData};
@@ -36,8 +37,9 @@ const CURRENT_LEN: usize = 24;
 const MUTATION_LEN: usize = 16;
 const ROOT_CGROUP_ID: u64 = 1;
 const PRODUCTION_CAPACITY: u32 = 4_096;
-const TINY_CAPACITY: u32 = 2;
 const MAX_GATE_LIFETIME_NS: u64 = 300_000_000_000;
+const ORACLE_DEFECTIVE: &str =
+    "egress-fence independent object oracle: DEFECTIVE (object validation failed)";
 
 const OP_PUBLISH_LIFECYCLE: u8 = 1;
 const OP_REGISTER: u8 = 2;
@@ -101,20 +103,20 @@ struct Command {
     epoch: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct Current {
     control: u32,
     token: u64,
     cookie: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct Mutation {
     generation: u64,
     claim: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct Entry {
     control: u32,
     cookie: u64,
@@ -123,7 +125,7 @@ struct Entry {
     epoch: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct Snapshot {
     current: Current,
     mutation: Mutation,
@@ -142,7 +144,26 @@ struct Lab {
     root_cgroup_id: u64,
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
+fn main() -> ExitCode {
+    std::panic::set_hook(Box::new(|_| {}));
+    match std::panic::catch_unwind(run) {
+        Ok(Ok(())) => ExitCode::SUCCESS,
+        Ok(Err(error)) => {
+            println!("{}", redacted_failure_line(error.as_ref()));
+            ExitCode::from(2)
+        }
+        Err(_) => {
+            println!("{ORACLE_DEFECTIVE}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn redacted_failure_line(_error: &dyn Error) -> &'static str {
+    ORACLE_DEFECTIVE
+}
+
+fn run() -> Result<(), Box<dyn Error>> {
     let (object, options) = parse_args()?;
 
     let ipv4 = config_ipv4(options.capacity);
@@ -153,6 +174,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut lab = Lab::load(&object, ipv4, options)?;
     lab.verify_program_separation()?;
     lab.verify_control_lifecycle(options.fault_delete)?;
+    lab.verify_expired_refresh()?;
+    lab.verify_refresh_completion_crossing(options.fault_delete)?;
+    lab.verify_stale_reclaim_states(options.fault_delete)?;
     lab.verify_ipv4_l3_gate()?;
     if options.pressure {
         lab.verify_capacity_pressure(options.capacity)?;
@@ -168,37 +192,35 @@ fn main() -> Result<(), Box<dyn Error>> {
     verify_test_run_contract_mutations()?;
 
     println!(
-        "egress-fence independent object oracle: PASS (capacity={}, pressure={}, fault_delete={})",
-        options.capacity, options.pressure, options.fault_delete
+        "egress-fence independent object oracle: PASS (pressure={}, fault_delete={})",
+        options.pressure, options.fault_delete
     );
     Ok(())
 }
 
 fn parse_args() -> Result<(PathBuf, Options), Box<dyn Error>> {
-    let mut capacity = PRODUCTION_CAPACITY;
     let mut pressure = false;
     let mut fault_delete = false;
     let mut object = None;
     for argument in std::env::args_os().skip(1) {
         match argument.to_str() {
-            Some("--tiny") => capacity = TINY_CAPACITY,
             Some("--pressure") => pressure = true,
             Some("--fault-delete") => fault_delete = true,
             Some(value) if value.starts_with('-') => {
-                return Err(format!("unknown oracle option: {value}").into());
+                return Err(io::Error::other("unknown oracle option").into());
             }
             _ if object.is_none() => object = Some(PathBuf::from(argument)),
             _ => return Err("multiple object paths supplied".into()),
         }
     }
     let object = object.ok_or(
-        "usage: opc-egress-fence-object-oracle [--tiny] [--pressure] \
+        "usage: opc-egress-fence-object-oracle [--pressure] \
          [--fault-delete] OBJECT",
     )?;
     Ok((
         object,
         Options {
-            capacity,
+            capacity: PRODUCTION_CAPACITY,
             pressure,
             fault_delete,
         },
@@ -350,7 +372,8 @@ impl Lab {
                 let barrier = Arc::clone(&barrier);
                 handles.push(scope.spawn(move || {
                     barrier.wait();
-                    let run = run_sched(control, &input).map_err(|error| error.to_string())?;
+                    let run = run_sched(control, &input)
+                        .map_err(|_| "racing control TEST_RUN failed".to_owned())?;
                     if run.data_size_out != COMMAND_LEN as u32
                         || run.ctx_size_out != 0
                         || run.output != input
@@ -641,7 +664,7 @@ impl Lab {
             expect(
                 first_reclaim,
                 RESULT_MAP_ERROR,
-                "faulted delete did not report unknown outcome",
+                "faulted stale delete did not report unknown outcome",
             )?;
             let recovering = self.view(COOKIE, TOKEN)?;
             ensure(
@@ -654,7 +677,7 @@ impl Lab {
                         epoch: 4,
                     })
                     && recovering.mutation.claim == 0,
-                "view did not recover exact RECLAIMING state",
+                "stale delete did not retain exact RECLAIMING state",
             )?;
             expect(
                 self.control(Command {
@@ -665,10 +688,10 @@ impl Lab {
                     epoch: 4,
                 })?,
                 RESULT_APPLIED,
-                "reclaim retry",
+                "stale RECLAIMING retry",
             )?;
         } else {
-            expect(first_reclaim, RESULT_APPLIED, "reclaim")?;
+            expect(first_reclaim, RESULT_APPLIED, "stale terminal reclaim")?;
         }
 
         let reclaimed = self.view(COOKIE, TOKEN)?;
@@ -686,8 +709,458 @@ impl Lab {
         Ok(())
     }
 
+    fn verify_expired_refresh(&self) -> Result<(), Box<dyn Error>> {
+        const COOKIE: u64 = 0xb6d4_8fa2_3579_ce01;
+        const TOKEN: u64 = 73;
+
+        expect(
+            self.control(Command {
+                operation: OP_PUBLISH_LIFECYCLE,
+                cookie: 0,
+                token: TOKEN,
+                deadline: 0,
+                epoch: 0,
+            })?,
+            RESULT_APPLIED,
+            "expiry lifecycle publish",
+        )?;
+        expect(
+            self.control(Command {
+                operation: OP_REGISTER,
+                cookie: COOKIE,
+                token: TOKEN,
+                deadline: 0,
+                epoch: 0,
+            })?,
+            RESULT_APPLIED,
+            "expiry registration",
+        )?;
+        let prior_deadline = checked_add(boottime_ns()?, 10_000_000)?;
+        expect(
+            self.control(Command {
+                operation: OP_ACTIVATE,
+                cookie: COOKIE,
+                token: TOKEN,
+                deadline: prior_deadline,
+                epoch: 1,
+            })?,
+            RESULT_APPLIED,
+            "expiry activation",
+        )?;
+        while boottime_ns()? < prior_deadline {
+            std::hint::spin_loop();
+        }
+        let requested_deadline = checked_add(boottime_ns()?, 1_000_000_000)?;
+        expect(
+            self.control(Command {
+                operation: OP_REFRESH,
+                cookie: COOKIE,
+                token: TOKEN,
+                deadline: requested_deadline,
+                epoch: 2,
+            })?,
+            RESULT_DEADLINE_ELAPSED,
+            "expired refresh",
+        )?;
+        let snapshot = self.view(COOKIE, TOKEN)?;
+        ensure(
+            snapshot.entry
+                == Some(Entry {
+                    control: COOKIE_TERMINAL,
+                    cookie: COOKIE,
+                    token: TOKEN,
+                    deadline: 0,
+                    epoch: 3,
+                })
+                && snapshot.mutation.claim == 0,
+            "expired refresh did not leave a terminal entry",
+        )?;
+        expect(
+            self.control(Command {
+                operation: OP_PUBLISH_RETIREMENT,
+                cookie: 0,
+                token: TOKEN + 1,
+                deadline: 0,
+                epoch: 0,
+            })?,
+            RESULT_APPLIED,
+            "expiry retirement",
+        )?;
+        expect(
+            self.control(Command {
+                operation: OP_RECLAIM,
+                cookie: COOKIE,
+                token: TOKEN,
+                deadline: 0,
+                epoch: 3,
+            })?,
+            RESULT_APPLIED,
+            "expiry reclaim",
+        )
+    }
+
+    fn verify_refresh_completion_crossing(
+        &mut self,
+        fault_delete: bool,
+    ) -> Result<(), Box<dyn Error>> {
+        if !fault_delete {
+            return Ok(());
+        }
+
+        const COOKIE: u64 = 0xc1a7_4d93_68be_250f;
+        const TOKEN: u64 = 75;
+        expect(
+            self.control(Command {
+                operation: OP_PUBLISH_LIFECYCLE,
+                cookie: 0,
+                token: TOKEN,
+                deadline: 0,
+                epoch: 0,
+            })?,
+            RESULT_APPLIED,
+            "completion-crossing lifecycle publish",
+        )?;
+        expect(
+            self.control(Command {
+                operation: OP_REGISTER,
+                cookie: COOKIE,
+                token: TOKEN,
+                deadline: 0,
+                epoch: 0,
+            })?,
+            RESULT_APPLIED,
+            "completion-crossing register",
+        )?;
+        let prior_deadline = checked_add(boottime_ns()?, 30_000_000_000)?;
+        expect(
+            self.control(Command {
+                operation: OP_ACTIVATE,
+                cookie: COOKIE,
+                token: TOKEN,
+                deadline: prior_deadline,
+                epoch: 1,
+            })?,
+            RESULT_APPLIED,
+            "completion-crossing activate",
+        )?;
+        let requested_deadline = checked_add(prior_deadline, 30_000_000_000)?;
+        self.arm_refresh_completion_fault()?;
+        expect(
+            self.control(Command {
+                operation: OP_REFRESH,
+                cookie: COOKIE,
+                token: TOKEN,
+                deadline: requested_deadline,
+                epoch: 2,
+            })?,
+            RESULT_DEADLINE_ELAPSED,
+            "old-only completion crossing",
+        )?;
+        let terminal = self.view(COOKIE, TOKEN)?;
+        ensure(
+            terminal.current
+                == Current {
+                    control: CURRENT_OPEN,
+                    token: TOKEN,
+                    cookie: COOKIE,
+                }
+                && terminal.entry
+                    == Some(Entry {
+                        control: COOKIE_TERMINAL,
+                        cookie: COOKIE,
+                        token: TOKEN,
+                        deadline: 0,
+                        epoch: 3,
+                    })
+                && terminal.mutation.claim == 0,
+            "old-only completion crossing did not terminalize",
+        )?;
+        expect(
+            self.control(Command {
+                operation: OP_PUBLISH_RETIREMENT,
+                cookie: 0,
+                token: TOKEN + 1,
+                deadline: 0,
+                epoch: 0,
+            })?,
+            RESULT_APPLIED,
+            "completion-crossing retirement",
+        )?;
+        expect(
+            self.control(Command {
+                operation: OP_RECLAIM,
+                cookie: COOKIE,
+                token: TOKEN,
+                deadline: 0,
+                epoch: 3,
+            })?,
+            RESULT_APPLIED,
+            "completion-crossing reclaim",
+        )
+    }
+
+    fn verify_stale_reclaim_states(&mut self, fault_delete: bool) -> Result<(), Box<dyn Error>> {
+        const INITIAL_COOKIE: u64 = 0xc7e5_90b3_468a_df12;
+        const ACTIVE_COOKIE: u64 = 0xd8f6_a1c4_579b_e023;
+        const TERMINAL_COOKIE: u64 = 0xe907_b2d5_68ac_f134;
+        const INITIAL_TOKEN: u64 = 81;
+        const ACTIVE_TOKEN: u64 = 83;
+        const TERMINAL_TOKEN: u64 = 85;
+        const SUCCESSOR_TOKEN: u64 = 87;
+
+        expect(
+            self.control(Command {
+                operation: OP_PUBLISH_LIFECYCLE,
+                cookie: 0,
+                token: INITIAL_TOKEN,
+                deadline: 0,
+                epoch: 0,
+            })?,
+            RESULT_APPLIED,
+            "stale-initial lifecycle publish",
+        )?;
+        expect(
+            self.control(Command {
+                operation: OP_REGISTER,
+                cookie: INITIAL_COOKIE,
+                token: INITIAL_TOKEN,
+                deadline: 0,
+                epoch: 0,
+            })?,
+            RESULT_APPLIED,
+            "stale-initial register",
+        )?;
+        expect(
+            self.control(Command {
+                operation: OP_RECLAIM,
+                cookie: INITIAL_COOKIE,
+                token: INITIAL_TOKEN,
+                deadline: 0,
+                epoch: 1,
+            })?,
+            RESULT_NOT_RECLAIMABLE,
+            "non-stale initial reclaim",
+        )?;
+        expect(
+            self.control(Command {
+                operation: OP_PUBLISH_LIFECYCLE,
+                cookie: 0,
+                token: ACTIVE_TOKEN,
+                deadline: 0,
+                epoch: 0,
+            })?,
+            RESULT_APPLIED,
+            "stale-initial successor publish",
+        )?;
+        expect(
+            self.control(Command {
+                operation: OP_RECLAIM,
+                cookie: INITIAL_COOKIE,
+                token: INITIAL_TOKEN,
+                deadline: 0,
+                epoch: 2,
+            })?,
+            RESULT_EPOCH_MISMATCH,
+            "stale-initial exact epoch",
+        )?;
+        expect(
+            self.control(Command {
+                operation: OP_RECLAIM,
+                cookie: INITIAL_COOKIE,
+                token: INITIAL_TOKEN,
+                deadline: 0,
+                epoch: 1,
+            })?,
+            RESULT_APPLIED,
+            "stale-initial reclaim",
+        )?;
+        ensure(
+            self.view(INITIAL_COOKIE, INITIAL_TOKEN)?.entry.is_none(),
+            "stale-initial entry survived reclaim",
+        )?;
+
+        expect(
+            self.control(Command {
+                operation: OP_REGISTER,
+                cookie: ACTIVE_COOKIE,
+                token: ACTIVE_TOKEN,
+                deadline: 0,
+                epoch: 0,
+            })?,
+            RESULT_APPLIED,
+            "stale-active register",
+        )?;
+        expect(
+            self.control(Command {
+                operation: OP_ACTIVATE,
+                cookie: ACTIVE_COOKIE,
+                token: ACTIVE_TOKEN,
+                deadline: checked_add(boottime_ns()?, 30_000_000_000)?,
+                epoch: 1,
+            })?,
+            RESULT_APPLIED,
+            "stale-active activate",
+        )?;
+        expect(
+            self.control(Command {
+                operation: OP_RECLAIM,
+                cookie: ACTIVE_COOKIE,
+                token: ACTIVE_TOKEN,
+                deadline: 0,
+                epoch: 2,
+            })?,
+            RESULT_NOT_RECLAIMABLE,
+            "non-stale active reclaim",
+        )?;
+        expect(
+            self.control(Command {
+                operation: OP_PUBLISH_LIFECYCLE,
+                cookie: 0,
+                token: TERMINAL_TOKEN,
+                deadline: 0,
+                epoch: 0,
+            })?,
+            RESULT_APPLIED,
+            "stale-active successor publish",
+        )?;
+        if fault_delete {
+            self.arm_delete_fault()?;
+        }
+        let active_reclaim = self.control(Command {
+            operation: OP_RECLAIM,
+            cookie: ACTIVE_COOKIE,
+            token: ACTIVE_TOKEN,
+            deadline: 0,
+            epoch: 2,
+        })?;
+        if fault_delete {
+            expect(
+                active_reclaim,
+                RESULT_MAP_ERROR,
+                "faulted stale-active delete did not report unknown outcome",
+            )?;
+            let recovering = self.view(ACTIVE_COOKIE, ACTIVE_TOKEN)?;
+            ensure(
+                recovering.current
+                    == Current {
+                        control: CURRENT_OPEN,
+                        token: TERMINAL_TOKEN,
+                        cookie: 0,
+                    }
+                    && recovering.entry
+                        == Some(Entry {
+                            control: COOKIE_RECLAIMING,
+                            cookie: ACTIVE_COOKIE,
+                            token: ACTIVE_TOKEN,
+                            deadline: 0,
+                            epoch: 2,
+                        })
+                    && recovering.mutation.claim == 0,
+                "stale-active fault did not retain canonical RECLAIMING state",
+            )?;
+            expect(
+                self.control(Command {
+                    operation: OP_RECLAIM,
+                    cookie: ACTIVE_COOKIE,
+                    token: ACTIVE_TOKEN,
+                    deadline: 0,
+                    epoch: 2,
+                })?,
+                RESULT_APPLIED,
+                "stale-active RECLAIMING retry",
+            )?;
+        } else {
+            expect(active_reclaim, RESULT_APPLIED, "stale-active reclaim")?;
+        }
+        ensure(
+            self.view(ACTIVE_COOKIE, ACTIVE_TOKEN)?.entry.is_none(),
+            "stale-active entry survived reclaim",
+        )?;
+
+        expect(
+            self.control(Command {
+                operation: OP_REGISTER,
+                cookie: TERMINAL_COOKIE,
+                token: TERMINAL_TOKEN,
+                deadline: 0,
+                epoch: 0,
+            })?,
+            RESULT_APPLIED,
+            "stale-terminal register",
+        )?;
+        expect(
+            self.control(Command {
+                operation: OP_CLOSE,
+                cookie: TERMINAL_COOKIE,
+                token: TERMINAL_TOKEN,
+                deadline: 0,
+                epoch: 1,
+            })?,
+            RESULT_APPLIED,
+            "stale-terminal close",
+        )?;
+        expect(
+            self.control(Command {
+                operation: OP_PUBLISH_LIFECYCLE,
+                cookie: 0,
+                token: SUCCESSOR_TOKEN,
+                deadline: 0,
+                epoch: 0,
+            })?,
+            RESULT_APPLIED,
+            "stale-terminal successor publish",
+        )?;
+        expect(
+            self.control(Command {
+                operation: OP_RECLAIM,
+                cookie: TERMINAL_COOKIE,
+                token: TERMINAL_TOKEN,
+                deadline: 0,
+                epoch: 2,
+            })?,
+            RESULT_APPLIED,
+            "stale-terminal reclaim",
+        )?;
+        let snapshot = self.view(TERMINAL_COOKIE, TERMINAL_TOKEN)?;
+        ensure(
+            snapshot.current
+                == Current {
+                    control: CURRENT_OPEN,
+                    token: SUCCESSOR_TOKEN,
+                    cookie: 0,
+                }
+                && snapshot.entry.is_none()
+                && snapshot.mutation.claim == 0,
+            "stale-state cleanup left ambiguous authority",
+        )
+    }
+
+    fn arm_delete_fault(&mut self) -> Result<(), Box<dyn Error>> {
+        let map = self
+            .ebpf
+            .map_mut(MAP_FAULT)
+            .ok_or("delete-fault map absent")?;
+        let mut faults: Array<_, u32> = Array::try_from(map)?;
+        faults.set(1, 0, 0)?;
+        Ok(())
+    }
+
+    fn arm_refresh_completion_fault(&mut self) -> Result<(), Box<dyn Error>> {
+        let map = self
+            .ebpf
+            .map_mut(MAP_FAULT)
+            .ok_or("refresh-fault map absent")?;
+        let mut faults: Array<_, u32> = Array::try_from(map)?;
+        faults.set(0, 1, 0)?;
+        Ok(())
+    }
+
     fn verify_ipv4_l3_gate(&self) -> Result<(), Box<dyn Error>> {
-        expect(self.gate(&ipv4_udp(IPV4_PROTECTED, PROTECTED_PORT, 5, 0))?, 0, "IPv4 protected")?;
+        expect(
+            self.gate(&ipv4_udp(IPV4_PROTECTED, PROTECTED_PORT, 5, 0))?,
+            0,
+            "IPv4 protected",
+        )?;
         expect(
             self.gate(&ipv4_udp(IPV4_UNRELATED, PROTECTED_PORT, 5, 0))?,
             1,
@@ -718,6 +1191,11 @@ impl Lab {
             0,
             "IPv4 noninitial fragment ambiguity",
         )?;
+        expect(
+            self.gate(&ipv4_udp(IPV4_PROTECTED, PROTECTED_PORT, 5, 0x8000))?,
+            0,
+            "IPv4 reserved-fragment ambiguity",
+        )?;
         expect(self.gate(&[])?, 0, "empty L3 packet")?;
         expect(self.gate(&[0x45, 0, 0, 20])?, 0, "truncated IPv4")?;
 
@@ -733,32 +1211,17 @@ impl Lab {
 
     fn verify_ipv6_l3_gate(&self) -> Result<(), Box<dyn Error>> {
         expect(
-            self.gate(&ipv6_udp(
-                IPV6_PROTECTED,
-                PROTECTED_PORT,
-                17,
-                &[],
-            ))?,
+            self.gate(&ipv6_udp(IPV6_PROTECTED, PROTECTED_PORT, 17, &[]))?,
             0,
             "IPv6 protected",
         )?;
         expect(
-            self.gate(&ipv6_udp(
-                IPV6_UNRELATED,
-                PROTECTED_PORT,
-                17,
-                &[],
-            ))?,
+            self.gate(&ipv6_udp(IPV6_UNRELATED, PROTECTED_PORT, 17, &[]))?,
             1,
             "IPv6 unrelated source",
         )?;
         expect(
-            self.gate(&ipv6_udp(
-                IPV6_PROTECTED,
-                UNRELATED_PORT,
-                17,
-                &[],
-            ))?,
+            self.gate(&ipv6_udp(IPV6_PROTECTED, UNRELATED_PORT, 17, &[]))?,
             1,
             "IPv6 unrelated UDP port",
         )?;
@@ -781,23 +1244,13 @@ impl Lab {
         )?;
         let atomic = ipv6_fragment(17, 0);
         expect(
-            self.gate(&ipv6_udp(
-                IPV6_PROTECTED,
-                PROTECTED_PORT,
-                44,
-                &atomic,
-            ))?,
+            self.gate(&ipv6_udp(IPV6_PROTECTED, PROTECTED_PORT, 44, &atomic))?,
             0,
             "IPv6 atomic fragment",
         )?;
         let fragmented = ipv6_fragment(17, 1);
         expect(
-            self.gate(&ipv6_udp(
-                IPV6_PROTECTED,
-                PROTECTED_PORT,
-                44,
-                &fragmented,
-            ))?,
+            self.gate(&ipv6_udp(IPV6_PROTECTED, PROTECTED_PORT, 44, &fragmented))?,
             0,
             "IPv6 fragmented ambiguity",
         )?;
@@ -810,23 +1263,88 @@ impl Lab {
         // exceeds the independently specified traversal bound.
         too_many[4 * 8] = 17;
         expect(
-            self.gate(&ipv6_udp(
-                IPV6_PROTECTED,
-                PROTECTED_PORT,
-                60,
-                &too_many,
-            ))?,
+            self.gate(&ipv6_udp(IPV6_PROTECTED, PROTECTED_PORT, 60, &too_many))?,
             0,
             "IPv6 extension ambiguity",
         )
     }
 
     fn verify_capacity_pressure(&mut self, capacity: u32) -> Result<(), Box<dyn Error>> {
-        ensure(capacity == TINY_CAPACITY, "pressure oracle requires tiny map object")?;
-        let base_cookie = 0x8100_0000_0000_1000_u64;
+        ensure(
+            capacity == PRODUCTION_CAPACITY,
+            "pressure oracle requires production map capacity",
+        )?;
+
+        // Cycle more unique crash-abandoned initial entries than the frozen
+        // map capacity. Each strictly higher lifecycle stales its predecessor,
+        // and exact reclamation must keep occupancy bounded.
+        let cleanup_rounds = capacity + 1;
+        let cleanup_start_token = 101_u64;
+        let cleanup_base_cookie = 0x8100_0000_0000_1000_u64;
+        for index in 0..cleanup_rounds {
+            let token = u64::from(index) * 2 + cleanup_start_token;
+            let cookie = cleanup_base_cookie + u64::from(index);
+            expect(
+                self.control(Command {
+                    operation: OP_PUBLISH_LIFECYCLE,
+                    cookie: 0,
+                    token,
+                    deadline: 0,
+                    epoch: 0,
+                })?,
+                RESULT_APPLIED,
+                "cleanup-pressure lifecycle publish",
+            )?;
+            expect(
+                self.control(Command {
+                    operation: OP_REGISTER,
+                    cookie,
+                    token,
+                    deadline: 0,
+                    epoch: 0,
+                })?,
+                RESULT_APPLIED,
+                "cleanup-pressure register",
+            )?;
+            expect(
+                self.control(Command {
+                    operation: OP_PUBLISH_LIFECYCLE,
+                    cookie: 0,
+                    token: token + 2,
+                    deadline: 0,
+                    epoch: 0,
+                })?,
+                RESULT_APPLIED,
+                "cleanup-pressure successor publish",
+            )?;
+            expect(
+                self.control(Command {
+                    operation: OP_RECLAIM,
+                    cookie,
+                    token,
+                    deadline: 0,
+                    epoch: 1,
+                })?,
+                RESULT_APPLIED,
+                "cleanup-pressure stale reclaim",
+            )?;
+        }
+        let last_cleanup_token = cleanup_start_token + (u64::from(cleanup_rounds) - 1) * 2;
+        let last_cleanup_cookie = cleanup_base_cookie + (u64::from(cleanup_rounds) - 1);
+        let cleanup_snapshot = self.view(last_cleanup_cookie, last_cleanup_token)?;
+        ensure(
+            cleanup_snapshot.entry.is_none() && cleanup_snapshot.mutation.claim == 0,
+            "cleanup pressure left an entry or mutation claim",
+        )?;
+
+        // Separately retain one terminal predecessor per slot to prove that a
+        // genuinely full production map still rejects a successor registration
+        // without leaving ambiguous CURRENT ownership.
+        let fill_start_token = cleanup_start_token + u64::from(cleanup_rounds) * 2 + 2;
+        let fill_base_cookie = 0x8200_0000_0000_1000_u64;
         for index in 0..capacity {
-            let token = u64::from(index) * 2 + 101;
-            let cookie = base_cookie + u64::from(index);
+            let token = u64::from(index) * 2 + fill_start_token;
+            let cookie = fill_base_cookie + u64::from(index);
             expect(
                 self.control(Command {
                     operation: OP_PUBLISH_LIFECYCLE,
@@ -872,8 +1390,8 @@ impl Lab {
                 "pressure retirement",
             )?;
         }
-        let token = u64::from(capacity) * 2 + 101;
-        let cookie = base_cookie + u64::from(capacity);
+        let token = u64::from(capacity) * 2 + fill_start_token;
+        let cookie = fill_base_cookie + u64::from(capacity);
         expect(
             self.control(Command {
                 operation: OP_PUBLISH_LIFECYCLE,
@@ -910,9 +1428,7 @@ impl Lab {
         let input = command_bytes(self.root_cgroup_id, command);
         let run = self.run_control_raw(&input)?;
         ensure(
-            run.data_size_out == COMMAND_LEN as u32
-                && run.ctx_size_out == 0
-                && run.output == input,
+            run.data_size_out == COMMAND_LEN as u32 && run.ctx_size_out == 0 && run.output == input,
             "control TEST_RUN shape changed",
         )?;
         Ok(run.return_value)
@@ -960,12 +1476,7 @@ impl Lab {
         })?;
         ensure(
             result.data_size_out == input.len() as u32 && result.ctx_size_out == 0,
-            &format!(
-                "gate TEST_RUN packet shape changed: in={}, data_out={}, ctx_out={}",
-                input.len(),
-                result.data_size_out,
-                result.ctx_size_out
-            ),
+            "gate TEST_RUN packet shape changed",
         )?;
         ensure(
             result.return_value == 0 || result.return_value == 1,
@@ -991,7 +1502,6 @@ impl Lab {
             .try_into()?;
         run_sched(view, input)
     }
-
 }
 
 fn test_run_skb_envelope(packet: &[u8]) -> Vec<u8> {
@@ -1146,7 +1656,7 @@ fn freeze_map(map: &Map) -> Result<(), Box<dyn Error>> {
 fn verify_config_mutations(object: &Path, options: Options) -> Result<(), Box<dyn Error>> {
     let valid = config_ipv4(options.capacity);
     let unrelated = ipv4_udp(IPV4_UNRELATED, UNRELATED_PORT, 5, 0);
-    let mutations: [ConfigMutation; 10] = [
+    let mutations: [ConfigMutation; 11] = [
         ("magic", |value| value[0] ^= 1),
         ("version", |value| value[4] ^= 1),
         ("family", |value| value[6] = 5),
@@ -1154,6 +1664,9 @@ fn verify_config_mutations(object: &Path, options: Options) -> Result<(), Box<dy
         ("reserved1-first", |value| value[10] = 1),
         ("reserved1-second", |value| value[11] = 1),
         ("capacity", |value| put_u32_le(value, 12, 0)),
+        ("alternate-capacity", |value| {
+            put_u32_le(value, 12, PRODUCTION_CAPACITY - 1)
+        }),
         ("root", |value| put_u64_le(value, 16, 0)),
         ("ipv4-tail", |value| value[39] = 1),
         ("port-zero", |value| {
@@ -1189,6 +1702,20 @@ fn verify_config_mutations(object: &Path, options: Options) -> Result<(), Box<dy
     mapped[36..40].copy_from_slice(&IPV4_PROTECTED);
     let lab = Lab::load(object, mapped, options)?;
     expect(lab.gate(&unrelated)?, 0, "IPv4-mapped IPv6 CONFIG")?;
+
+    let mut link_local = config_ipv6(options.capacity);
+    link_local[24..40].fill(0);
+    link_local[24] = 0xfe;
+    link_local[25] = 0x80;
+    link_local[39] = 1;
+    let lab = Lab::load(object, link_local, options)?;
+    expect(lab.gate(&unrelated)?, 0, "scoped IPv6 CONFIG")?;
+    link_local[25] = 0xbf;
+    let lab = Lab::load(object, link_local, options)?;
+    expect(lab.gate(&unrelated)?, 0, "upper scoped IPv6 CONFIG")?;
+    link_local[25] = 0xc0;
+    let lab = Lab::load(object, link_local, options)?;
+    expect(lab.gate(&unrelated)?, 1, "adjacent unscoped IPv6 CONFIG")?;
 
     // CONFIG stores the port as two network-order bytes. Swapping them is a
     // different valid endpoint, so the original tuple must become unrelated.
@@ -1305,9 +1832,7 @@ fn decode_snapshot(value: &[u8]) -> Result<Snapshot, Box<dyn Error>> {
             token: 0,
             cookie: 0,
         }
-        || current.control == CURRENT_OPEN
-            && current.token != 0
-            && current.token & 1 == 1
+        || current.control == CURRENT_OPEN && current.token != 0 && current.token & 1 == 1
         || current.control == CURRENT_CLOSED
             && current.token != 0
             && current.token & 1 == 0
@@ -1344,7 +1869,7 @@ fn decode_snapshot(value: &[u8]) -> Result<Snapshot, Box<dyn Error>> {
             && match entry.control {
                 COOKIE_INITIAL => entry.deadline == 0 && entry.epoch == 1,
                 COOKIE_ACTIVE => entry.deadline != 0 && entry.epoch > 1,
-                COOKIE_TERMINAL | COOKIE_RECLAIMING => entry.deadline == 0 && entry.epoch > 1,
+                COOKIE_TERMINAL | COOKIE_RECLAIMING => entry.deadline == 0 && entry.epoch != 0,
                 _ => false,
             };
         ensure(entry_is_canonical, "entry canonical form")?;
@@ -1454,11 +1979,7 @@ fn checked_add(left: u64, right: u64) -> Result<u64, Box<dyn Error>> {
         .ok_or_else(|| io::Error::other("deadline overflow").into())
 }
 
-fn expect(
-    actual: u32,
-    expected: u32,
-    label: &str,
-) -> Result<(), Box<dyn Error>> {
+fn expect(actual: u32, expected: u32, label: &str) -> Result<(), Box<dyn Error>> {
     ensure(
         actual == expected,
         &format!("{label}: expected {expected}, got {actual}"),
@@ -1513,4 +2034,20 @@ fn get_u64_le(value: &[u8], offset: usize) -> u64 {
         value[offset + 6],
         value[offset + 7],
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn top_level_failure_erases_error_and_path_content() {
+        let sensitive = "/must-not-appear/private/object.bpf.o";
+        let error = io::Error::other(sensitive);
+        let line = redacted_failure_line(&error);
+
+        assert_eq!(line, ORACLE_DEFECTIVE);
+        assert!(!line.contains(sensitive));
+        assert!(!line.contains('/'));
+    }
 }

@@ -9,8 +9,11 @@ description = "cgroup-skb eBPF kernel datapath for opc-egress-fence"
 publish = false
 
 [features]
+default = ["production"]
+production = []
 fault-inject-delete = []
-tiny-map = []
+mutation-bypass-gate = []
+mutation-bypass-deadline = []
 
 [dependencies]
 aya-ebpf = "0.2.1"

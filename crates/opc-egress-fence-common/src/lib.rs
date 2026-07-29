@@ -24,23 +24,27 @@ pub const EGRESS_FENCE_MAX_COOKIE_ENTRIES: u32 = 4_096;
 /// This is a safety ceiling rather than a recommended lease TTL. Products
 /// should normally configure a substantially shorter lifetime.
 pub const EGRESS_FENCE_MAX_GATE_LIFETIME_NS: u64 = 300_000_000_000;
-/// Frozen cgroup-skb egress program name.
+/// Stable cgroup-skb egress program ABI name.
 pub const EGRESS_FENCE_PROGRAM_NAME: &str = "opc_egress_gate";
-/// Frozen cookie map name.
+/// Stable syscall-frozen cookie map ABI name.
 pub const EGRESS_FENCE_COOKIE_MAP_NAME: &str = "OPC_FENCE_CKS";
-/// Frozen configuration map name.
+/// Stable syscall-frozen configuration map ABI name.
 pub const EGRESS_FENCE_CONFIG_MAP_NAME: &str = "OPC_FENCE_CFG";
-/// Frozen per-CPU counter map name.
+/// Stable syscall-frozen per-CPU counter map ABI name.
 pub const EGRESS_FENCE_COUNTER_MAP_NAME: &str = "OPC_FENCE_CTR";
-/// Frozen monotonic-current-fence map name.
+/// Stable syscall-frozen monotonic-current-fence map ABI name.
 pub const EGRESS_FENCE_CURRENT_MAP_NAME: &str = "OPC_FENCE_CUR";
-/// Frozen shared BTF spin-lock map name.
+/// Stable shared BTF spin-lock map ABI name.
+///
+/// Linux rejects `BPF_MAP_FREEZE` for maps containing special BTF fields such
+/// as `bpf_spin_lock`, so installers must not claim this map is syscall-frozen.
+/// Its exact schema and initial zero value remain part of admission.
 pub const EGRESS_FENCE_LOCK_MAP_NAME: &str = "OPC_FENCE_LOCK";
-/// Frozen structural-mutation authority map name.
+/// Stable syscall-frozen structural-mutation authority map ABI name.
 pub const EGRESS_FENCE_MUTATION_MAP_NAME: &str = "OPC_FENCE_MUT";
-/// Frozen control-program name used through `BPF_PROG_TEST_RUN`.
+/// Stable control-program ABI name used through `BPF_PROG_TEST_RUN`.
 pub const EGRESS_FENCE_CONTROL_PROGRAM_NAME: &str = "opc_fence_ctl";
-/// Frozen synchronized read-only Inspect program name.
+/// Stable synchronized read-only inspect-program ABI name.
 pub const EGRESS_FENCE_INSPECT_PROGRAM_NAME: &str = "opc_fence_view";
 /// Encoded configuration value width.
 pub const EGRESS_FENCE_CONFIG_VALUE_LEN: usize = 40;
@@ -117,10 +121,47 @@ pub const CONTROL_RESULT_MAP_ERROR: u32 = 8;
 /// Entry was not safely reclaimable.
 pub const CONTROL_RESULT_NOT_RECLAIMABLE: u32 = 9;
 
+/// Fail-closed outcome of the post-contention refresh clock observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshDeadlineDecision {
+    /// The prior deadline remains live and the requested deadline is canonical.
+    Apply,
+    /// The prior deadline elapsed before the refresh won mutation authority.
+    PriorExpired,
+    /// The requested deadline is elapsed or exceeds the frozen lifetime bound.
+    RequestedDeadlineInvalid,
+    /// The requested deadline would shorten the live authorization.
+    DeadlineRegressed,
+}
+
+/// Evaluate refresh deadlines at the BOOTTIME observation taken only after the
+/// kernel entry has been made fail-closed under mutation authority.
+#[must_use]
+pub const fn evaluate_refresh_deadlines(
+    observed_at_boot_ns: u64,
+    prior_deadline_boot_ns: u64,
+    requested_deadline_boot_ns: u64,
+) -> RefreshDeadlineDecision {
+    if observed_at_boot_ns >= prior_deadline_boot_ns {
+        RefreshDeadlineDecision::PriorExpired
+    } else if requested_deadline_boot_ns <= observed_at_boot_ns
+        || requested_deadline_boot_ns - observed_at_boot_ns > EGRESS_FENCE_MAX_GATE_LIFETIME_NS
+    {
+        RefreshDeadlineDecision::RequestedDeadlineInvalid
+    } else if requested_deadline_boot_ns < prior_deadline_boot_ns {
+        RefreshDeadlineDecision::DeadlineRegressed
+    } else {
+        RefreshDeadlineDecision::Apply
+    }
+}
+
 /// Exact local UDP source endpoint protected by one fence attachment.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ProtectedEndpoint {
-    /// IPv4 address and nonzero UDP source port.
+    /// ABI-level IPv4 address candidate and nonzero UDP source port.
+    ///
+    /// The Linux installer separately proves the local prefix and canonical
+    /// interface-broadcast metadata needed to establish exact unicast use.
     Ipv4 {
         /// Network-order address octets.
         address: [u8; 4],
@@ -137,7 +178,11 @@ pub enum ProtectedEndpoint {
 }
 
 impl ProtectedEndpoint {
-    /// Construct an IPv4 endpoint when the address and port are usable.
+    /// Construct an ABI-level IPv4 candidate when address and port are usable.
+    ///
+    /// This dependency-free type has no interface prefix information. The
+    /// Linux installer must complete subnet-number and directed-broadcast
+    /// rejection before admitting the endpoint.
     #[must_use]
     pub const fn ipv4(address: [u8; 4], port: u16) -> Option<Self> {
         if port == 0
@@ -171,7 +216,8 @@ impl ProtectedEndpoint {
             && address[9] == 0
             && address[10] == 0xff
             && address[11] == 0xff;
-        if port == 0 || !nonzero || address[0] == 0xff || ipv4_mapped {
+        let link_local = address[0] == 0xfe && address[1] & 0xc0 == 0x80;
+        if port == 0 || !nonzero || address[0] == 0xff || ipv4_mapped || link_local {
             None
         } else {
             Some(Self::Ipv6 { address, port })
@@ -252,7 +298,7 @@ impl FenceConfig {
         root_cgroup_id: u64,
         capacity: u32,
     ) -> Option<Self> {
-        if root_cgroup_id == 0 || capacity == 0 || capacity > EGRESS_FENCE_MAX_COOKIE_ENTRIES {
+        if root_cgroup_id == 0 || capacity != EGRESS_FENCE_MAX_COOKIE_ENTRIES {
             None
         } else {
             Some(Self {
@@ -275,7 +321,10 @@ impl FenceConfig {
         self.root_cgroup_id
     }
 
-    /// Product admission bound within the fixed kernel-map capacity.
+    /// Frozen production kernel-map capacity.
+    ///
+    /// A different value identifies an incompatible configuration rather than
+    /// a tunable runtime limit.
     #[must_use]
     pub const fn capacity(self) -> u32 {
         self.capacity
@@ -653,7 +702,7 @@ impl fmt::Debug for FenceMutationAuthority {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("FenceMutationAuthority")
-            .field("generation", &self.generation)
+            .field("generation_present", &(self.generation != 0))
             .field("mutation_in_flight", &(self.in_flight_claim != 0))
             .finish()
     }
@@ -673,8 +722,8 @@ pub enum ControlOperation {
     Refresh = 4,
     /// Irreversibly close a cookie.
     Close = 5,
-    /// Delete an exact terminal entry after durable publication of a strictly
-    /// higher retirement token and host proof that every socket fd is dead.
+    /// Delete an exact entry after durable publication of any strictly higher
+    /// canonical CURRENT token makes the predecessor non-authoritative.
     Reclaim = 6,
     /// Return one synchronized CURRENT/mutation/optional-entry snapshot.
     Inspect = 7,
@@ -698,7 +747,7 @@ impl ControlOperation {
     }
 }
 
-/// Value-free command sent to the unattached tc control program.
+/// Value-free command sent to the unattached sched-cls control program.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct ControlCommand {
     operation: ControlOperation,
@@ -1657,7 +1706,7 @@ mod tests {
     use super::*;
 
     const ROOT_CGROUP_ID: u64 = 1;
-    const CAPACITY: u32 = 64;
+    const CAPACITY: u32 = EGRESS_FENCE_MAX_COOKIE_ENTRIES;
     const COOKIE: u64 = 13;
     const TOKEN: u64 = 9;
 
@@ -1742,7 +1791,7 @@ mod tests {
         let config =
             FenceConfig::new(ipv4_endpoint(), ROOT_CGROUP_ID, CAPACITY).expect("canonical fixture");
         let encoded = config.encode();
-        for offset in [0, 4, 6, 12, 16] {
+        for offset in [0, 4, 6, 13, 16] {
             let mut mutated = encoded;
             mutated[offset] = 0;
             assert!(
@@ -1758,6 +1807,16 @@ mod tests {
                 "reserved/IPv4-tail byte {offset} must be zero"
             );
         }
+        assert!(
+            FenceConfig::new(ipv4_endpoint(), ROOT_CGROUP_ID, CAPACITY - 1).is_none(),
+            "production capacity is frozen"
+        );
+        let mut wrong_capacity = encoded;
+        wrong_capacity[12..16].copy_from_slice(&(CAPACITY - 1).to_le_bytes());
+        assert!(
+            FenceConfig::decode(&wrong_capacity).is_none(),
+            "encoded capacity must equal the production map capacity"
+        );
         let mut wrong_family = encoded;
         wrong_family[6] = 5;
         assert!(FenceConfig::decode(&wrong_family).is_none());
@@ -1788,6 +1847,48 @@ mod tests {
         mapped_v6[11] = 0xff;
         mapped_v6[12..16].copy_from_slice(&[192, 0, 2, 10]);
         assert!(ProtectedEndpoint::ipv6(mapped_v6, 2_123).is_none());
+        let mut link_local_v6 = [0_u8; 16];
+        link_local_v6[0] = 0xfe;
+        link_local_v6[1] = 0x80;
+        link_local_v6[15] = 1;
+        assert!(
+            ProtectedEndpoint::ipv6(link_local_v6, 2_123).is_none(),
+            "link-local endpoints require scope identity absent from this ABI"
+        );
+        link_local_v6[1] = 0xbf;
+        assert!(ProtectedEndpoint::ipv6(link_local_v6, 2_123).is_none());
+        link_local_v6[1] = 0xc0;
+        assert!(
+            ProtectedEndpoint::ipv6(link_local_v6, 2_123).is_some(),
+            "the rejection is exactly fe80::/10"
+        );
+
+        let global_v6 = ProtectedEndpoint::ipv6(
+            [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+            2_123,
+        )
+        .expect("global documentation endpoint");
+        let mut encoded_v6 = FenceConfig::new(global_v6, ROOT_CGROUP_ID, CAPACITY)
+            .expect("canonical IPv6 configuration")
+            .encode();
+        encoded_v6[24..40].fill(0);
+        encoded_v6[24] = 0xfe;
+        encoded_v6[25] = 0x80;
+        encoded_v6[39] = 1;
+        assert!(
+            FenceConfig::decode(&encoded_v6).is_none(),
+            "decoding rejects scoped IPv6 endpoints"
+        );
+        encoded_v6[25] = 0xbf;
+        assert!(
+            FenceConfig::decode(&encoded_v6).is_none(),
+            "decoding rejects the upper edge of the scoped range"
+        );
+        encoded_v6[25] = 0xc0;
+        assert!(
+            FenceConfig::decode(&encoded_v6).is_some(),
+            "decoding accepts the adjacent unscoped range"
+        );
     }
 
     #[test]
@@ -1846,6 +1947,32 @@ mod tests {
                 FenceAuthoritySnapshot::new(Some(active), TOKEN, COOKIE, 10),
             ),
             FenceVerdict::DropExpired
+        );
+    }
+
+    #[test]
+    fn refresh_clock_observations_cannot_resurrect_an_expired_entry() {
+        assert_eq!(
+            evaluate_refresh_deadlines(99, 100, 200),
+            RefreshDeadlineDecision::Apply,
+            "phase-two observation still precedes the old deadline"
+        );
+        assert_eq!(
+            evaluate_refresh_deadlines(100, 100, 200),
+            RefreshDeadlineDecision::PriorExpired,
+            "old-only crossing at final completion is terminal"
+        );
+        assert_eq!(
+            evaluate_refresh_deadlines(99, 100, 99),
+            RefreshDeadlineDecision::RequestedDeadlineInvalid
+        );
+        assert_eq!(
+            evaluate_refresh_deadlines(99, 100, 99 + EGRESS_FENCE_MAX_GATE_LIFETIME_NS + 1),
+            RefreshDeadlineDecision::RequestedDeadlineInvalid
+        );
+        assert_eq!(
+            evaluate_refresh_deadlines(50, 100, 99),
+            RefreshDeadlineDecision::DeadlineRegressed
         );
     }
 

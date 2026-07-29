@@ -3,13 +3,12 @@
 use std::{cmp, fmt, num::NonZeroU64, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
+use opc_egress_fence_common::{
+    EGRESS_FENCE_INITIAL_COOKIE_EPOCH, EGRESS_FENCE_MAX_GATE_LIFETIME_NS,
+};
 use opc_session_store::{LeaseGuard, OwnerId, SessionKey};
 
-// This is the frozen common-ABI ceiling assigned to the eBPF implementation
-// lane. Import the common constant when that lane is integrated.
-pub(crate) const MAX_GATE_LIFETIME_NS: u64 = 300_000_000_000;
 const DEFAULT_BOOT_POLL_INTERVAL: Duration = Duration::from_millis(100);
-const INITIAL_CONTROL_EPOCH: u64 = 1;
 const ATTACHMENT_IDENTITY_MAGIC: [u8; 4] = *b"OFA1";
 const ATTACHMENT_IDENTITY_LEN: usize = 36;
 
@@ -101,9 +100,16 @@ pub(crate) enum AttachmentInventory {
     /// Exact committed objects and root inventory were adopted after complete
     /// live readback.
     AdoptedExact,
-    /// One complete prepared generation was atomically published, attached
-    /// under an exact revision guard, read back, and committed by this process.
-    InstalledUnderRevisionGuard,
+    /// An exact committed generation was adopted after proving that no kernel
+    /// lifecycle mutation had ever occurred.
+    ///
+    /// This is narrower than generic adoption: `CURRENT`, the cookie map,
+    /// mutation authority, and lock all retain their canonical initial values.
+    AdoptedNeverActivated,
+    /// One complete prepared generation was attached while already closed,
+    /// verified by exact post-attach root readback, and committed by this
+    /// process.
+    InstalledClosedWithExactReadback,
 }
 
 /// Exact root-cgroup generation identity.
@@ -132,15 +138,27 @@ pub(crate) enum KernelEntryState {
     InitialClosed,
     Active,
     TerminalClosed,
+    Reclaiming,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct KernelFenceEntry {
     pub(crate) state: KernelEntryState,
     pub(crate) socket_cookie: u64,
     pub(crate) lifecycle_token: u64,
     pub(crate) deadline_boot_ns: u64,
     pub(crate) control_epoch: u64,
+}
+
+impl fmt::Debug for KernelFenceEntry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("KernelFenceEntry")
+            .field("state", &self.state)
+            .field("identity", &"<redacted>")
+            .field("deadline_present", &(self.deadline_boot_ns != 0))
+            .finish()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -150,17 +168,38 @@ pub(crate) enum KernelCurrentPhase {
     RetirementClosed,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct KernelCurrentFence {
     pub(crate) phase: KernelCurrentPhase,
     pub(crate) lifecycle_token: u64,
     pub(crate) registered_socket_cookie: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+impl fmt::Debug for KernelCurrentFence {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("KernelCurrentFence")
+            .field("phase", &self.phase)
+            .field("identity", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct KernelInspection {
     pub(crate) current: KernelCurrentFence,
     pub(crate) entry: Option<KernelFenceEntry>,
+}
+
+impl fmt::Debug for KernelInspection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("KernelInspection")
+            .field("current_phase", &self.current.phase)
+            .field("entry_present", &self.entry.is_some())
+            .field("values", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Suspend-aware boot clock used by both deterministic tests and Linux.
@@ -177,6 +216,24 @@ pub(crate) trait BootClock: Send + Sync {
 
 /// Exact, readback-verifying kernel control boundary.
 pub(crate) trait KernelControl: Send + Sync {
+    /// Drop the private mutation-program descriptor retained by a concrete
+    /// kernel adapter.
+    ///
+    /// This fault-injection boundary exists only in crate test builds. The
+    /// default rejects injection so model controls cannot accidentally claim
+    /// production descriptor-loss coverage.
+    #[cfg(test)]
+    fn test_drop_private_mutation_program_fd(&self) -> Result<(), KernelFailure> {
+        Err(KernelFailure::Readback)
+    }
+
+    /// Drop the private synchronized-view descriptor retained by a concrete
+    /// kernel adapter.
+    #[cfg(test)]
+    fn test_drop_private_view_program_fd(&self) -> Result<(), KernelFailure> {
+        Err(KernelFailure::Readback)
+    }
+
     fn inspect(
         &self,
         identity: AttachmentIdentity,
@@ -188,6 +245,18 @@ pub(crate) trait KernelControl: Send + Sync {
         identity: AttachmentIdentity,
         lifecycle_token: u64,
     ) -> Result<KernelCurrentFence, KernelFailure>;
+
+    /// Reclaim every bounded, canonical cookie entry made permanently stale
+    /// by `lifecycle_token`.
+    ///
+    /// Implementations must enumerate no more than the frozen cookie-map
+    /// capacity and may delete only entries whose lifecycle token is strictly
+    /// lower than the exact live `CURRENT` token.
+    fn cleanup_superseded(
+        &self,
+        identity: AttachmentIdentity,
+        lifecycle_token: u64,
+    ) -> Result<(), KernelFailure>;
 
     fn publish_retirement(
         &self,
@@ -254,9 +323,8 @@ impl LeaseFenceTiming {
     /// represented by the kernel's nanosecond clock.
     ///
     /// The active kernel lifetime (`ttl - safety_margin`) may not exceed the
-    /// frozen SDK/kernel ceiling. Takeover delay is not derived from the new
-    /// TTL: durable prior state supplies the actual preceding bound, and
-    /// unknown state waits the full ceiling.
+    /// frozen SDK/kernel ceiling. A timed delay is never accepted as a
+    /// substitute for exact prior-attachment or terminal-closure evidence.
     pub fn new(ttl: Duration, safety_margin: Duration) -> Result<Self, FenceError> {
         if ttl.is_zero()
             || safety_margin.is_zero()
@@ -267,7 +335,7 @@ impl LeaseFenceTiming {
             return Err(FenceError::InvalidTiming);
         }
         let timing = Self { ttl, safety_margin };
-        if timing.active_gate_lifetime_ns()? > MAX_GATE_LIFETIME_NS {
+        if timing.active_gate_lifetime_ns()? > EGRESS_FENCE_MAX_GATE_LIFETIME_NS {
             return Err(FenceError::InvalidTiming);
         }
         Ok(timing)
@@ -309,12 +377,11 @@ impl LeaseFenceTiming {
         u64::try_from(budget.as_nanos()).map_err(|_| FenceError::DeadlineOverflow)
     }
 
-    fn closed_renew_interval(self) -> Duration {
-        self.ttl / 2
-    }
-
     fn boot_poll_interval(self) -> Duration {
-        cmp::min(DEFAULT_BOOT_POLL_INTERVAL, self.ttl / 4)
+        cmp::max(
+            Duration::from_nanos(1),
+            cmp::min(DEFAULT_BOOT_POLL_INTERVAL, self.ttl / 4),
+        )
     }
 }
 
@@ -432,15 +499,15 @@ impl DurablePriorFenceState {
         })
     }
 
-    /// Treat only prior attachment evidence as unknown under one continuous
-    /// durable authority namespace.
+    /// Record that prior attachment evidence is unknown under an otherwise
+    /// continuous durable authority namespace.
     ///
-    /// This always forces the frozen maximum delay. It is invalid when the
-    /// authority namespace, external root, or epoch credentials are missing,
-    /// replaced, split, or unproved: those conditions must make acquisition
-    /// fail closed and must not return a grant. In particular, loss of state
-    /// after an immutable external `ever_initialized` bit became true cannot
-    /// be recovered with this variant or a timed wait.
+    /// The SDK rejects activation from this state. A timed wait cannot prove
+    /// continuous kernel attachment, exact endpoint configuration, or closure
+    /// of a predecessor socket. It is also invalid when the authority
+    /// namespace, external root, or epoch credentials are missing, replaced,
+    /// split, or unproved: those conditions must fail before returning a
+    /// grant.
     #[must_use]
     pub const fn attachment_unknown_under_continuous_authority() -> Self {
         Self {
@@ -615,10 +682,28 @@ impl fmt::Debug for PendingTerminalClosure {
 /// immutable external `ever_initialized` bit became true must fail closed;
 /// neither a fresh-install claim nor a 300-second wait repairs those states.
 ///
-/// Unknown prior *attachment* evidence under a verified continuous authority
-/// uses [`DurablePriorFenceState::attachment_unknown_under_continuous_authority`].
-/// Implementations must preserve key, owner, fence token and credential across
-/// renewal.
+/// Unknown prior *attachment* evidence may be represented with
+/// [`DurablePriorFenceState::attachment_unknown_under_continuous_authority`],
+/// but the SDK rejects activation until an operator supplies exact recoverable
+/// evidence.
+/// Every acquired guard must carry a nonzero fence token and nonzero credential
+/// identifier. Implementations must preserve key, owner, fence token and
+/// credential across renewal. A successful renewal must be linearized under
+/// the same authority epoch, must preserve or advance
+/// [`LeaseGuard::acquired_at`], must return a positive guard interval, must
+/// extend [`LeaseGuard::expires_at`], and must guarantee the requested `ttl`
+/// from a point no earlier than operation start.
+/// Adapter conformance tests must exercise delayed completions and reject
+/// unchanged, stale, shortened, or internally inconsistent guards. The SDK
+/// derives its BOOTTIME kernel deadline as
+/// `operation_start + ttl - safety_margin`. It independently validates the
+/// reported acquisition interval, initializes a conservative BOOTTIME durable
+/// expiry bound, and advances that bound on renewal only by the exact positive
+/// `expires_at` extension. A kernel deadline beyond that bound is rejected.
+/// This metadata proof is a fail-closed SDK defense, not adapter conformance:
+/// a smaller contract violation that remains hidden inside the safety margin
+/// may still fit the bound and must be rejected by the authority adapter's own
+/// conformance suite.
 ///
 /// The same transaction must reserve and persist a consecutive, nonwrapping
 /// token pair `(socket T, retirement R)` where `T` is odd and `R = T + 1` is
@@ -649,7 +734,7 @@ pub trait EgressFenceLeaseAuthority: Send + Sync {
         current_gate_lifetime: Duration,
     ) -> Result<FenceLeaseGrant, Self::Error>;
 
-    /// Renew an existing exact guard.
+    /// Renew an existing exact guard and strictly advance its durable expiry.
     async fn renew(&self, lease: &LeaseGuard, ttl: Duration) -> Result<LeaseGuard, Self::Error>;
 
     /// Persist irreversible terminal state, then release exact authority.
@@ -674,6 +759,8 @@ pub enum FenceError {
     ClockUnavailable,
     /// The lease operation consumed the safe activation budget.
     OperationOverBudget,
+    /// The active kernel deadline had elapsed before a protected send.
+    GateExpired,
     /// Returned guard changed key, owner, token, or credential unexpectedly.
     LeaseContinuity,
     /// Kernel mutation failed or its outcome remained ambiguous.
@@ -692,6 +779,7 @@ impl FenceError {
             Self::DeadlineOverflow => "egress_fence_deadline_overflow",
             Self::ClockUnavailable => "egress_fence_clock_unavailable",
             Self::OperationOverBudget => "egress_fence_operation_over_budget",
+            Self::GateExpired => "egress_fence_gate_expired",
             Self::LeaseContinuity => "egress_fence_lease_continuity",
             Self::KernelMutation => "egress_fence_kernel_mutation",
             Self::KernelReadback => "egress_fence_kernel_readback",
@@ -709,7 +797,9 @@ impl fmt::Display for FenceError {
 impl std::error::Error for FenceError {}
 
 fn validate_prior_gate_lifetime(gate_lifetime: Duration) -> Result<u64, FenceError> {
-    if gate_lifetime.is_zero() || gate_lifetime.as_nanos() > u128::from(MAX_GATE_LIFETIME_NS) {
+    if gate_lifetime.is_zero()
+        || gate_lifetime.as_nanos() > u128::from(EGRESS_FENCE_MAX_GATE_LIFETIME_NS)
+    {
         return Err(FenceError::InvalidPriorEvidence);
     }
     u64::try_from(gate_lifetime.as_nanos()).map_err(|_| FenceError::InvalidPriorEvidence)
@@ -728,12 +818,8 @@ fn validate_lifecycle_token_pair(
     }
 }
 
-const fn max_gate_lifetime() -> Duration {
-    Duration::from_nanos(MAX_GATE_LIFETIME_NS)
-}
-
 #[path = "lifecycle_engine.rs"]
 mod lifecycle_engine;
 
-pub(crate) use lifecycle_engine::LeaseBoundFence;
 pub use lifecycle_engine::LeaseFenceError;
+pub(crate) use lifecycle_engine::{LeaseBoundFence, RenewalWait};

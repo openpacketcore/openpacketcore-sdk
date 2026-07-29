@@ -57,6 +57,7 @@ FROZEN_SESSION_HA_V2_SOURCE_BUILD_ONLY = {
 }
 POST_V2_SOURCE_BUILD_ONLY_ADDITIONS = {
     "opc-config-bus-consensus",
+    "opc-egress-fence",
     "opc-mgmt-audit-store",
 }
 SOURCE_BUILD_ONLY = (

@@ -4,6 +4,8 @@
 //! datagram's concrete local destination address is part of protocol evidence
 //! and must also be selected as the source of the corresponding reply.
 
+#[cfg(target_os = "linux")]
+use std::os::fd::AsFd;
 use std::{
     fmt, io,
     net::{IpAddr, SocketAddr},
@@ -32,6 +34,14 @@ pub struct UdpSocketOptions {
     /// configured device makes binding fail closed with
     /// [`io::ErrorKind::Unsupported`].
     pub bind_device: Option<String>,
+    /// Require `IPV6_V6ONLY` before binding an IPv6 socket.
+    ///
+    /// The default is false, preserving the ordinary runtime UDP surface.
+    /// The egress-fence installer enables this option so an IPv4-mapped send
+    /// cannot bypass an exact IPv6 protected endpoint. It has no effect for an
+    /// IPv4 bind. Non-Linux platforms may reject an enabled value when they
+    /// cannot prove the setting.
+    pub ipv6_only: bool,
 }
 
 impl UdpSocketOptions {
@@ -41,6 +51,13 @@ impl UdpSocketOptions {
         self.bind_device = Some(device.into());
         self
     }
+
+    /// Return these options with strict IPv6-only binding enabled.
+    #[must_use]
+    pub const fn with_ipv6_only(mut self) -> Self {
+        self.ipv6_only = true;
+        self
+    }
 }
 
 impl fmt::Debug for UdpSocketOptions {
@@ -48,6 +65,7 @@ impl fmt::Debug for UdpSocketOptions {
         formatter
             .debug_struct("UdpSocketOptions")
             .field("bind_device_present", &self.bind_device.is_some())
+            .field("ipv6_only", &self.ipv6_only)
             .finish()
     }
 }
@@ -64,8 +82,8 @@ impl fmt::Debug for UdpSocketOptions {
 ///
 /// # Errors
 ///
-/// Returns [`io::Error`] when binding, configuring, or converting the socket
-/// fails.
+/// Returns [`io::Error`] when no Tokio runtime is entered, the entered runtime
+/// has no I/O driver, or binding, configuring, or converting the socket fails.
 pub fn bind_udp_socket_with_destination_metadata(
     bind_addr: SocketAddr,
 ) -> io::Result<UdpDestinationMetadataSocket> {
@@ -115,8 +133,10 @@ pub fn bind_udp_socket_with_destination_metadata(
 /// Returns [`io::ErrorKind::InvalidInput`] for an empty, over-long
 /// (more than 15 bytes), or NUL-containing device name,
 /// [`io::ErrorKind::Unsupported`] for a device on a platform without
-/// `SO_BINDTODEVICE`, and any operating-system error from socket creation,
-/// device binding, address binding, configuration, or conversion.
+/// `SO_BINDTODEVICE`, a value-free error when no Tokio runtime is entered or
+/// the entered runtime has no I/O driver, and any operating-system error from
+/// socket creation, device binding, address binding, configuration, or
+/// conversion.
 pub fn bind_udp_socket_with_destination_metadata_and_options(
     bind_addr: SocketAddr,
     options: &UdpSocketOptions,
@@ -124,13 +144,21 @@ pub fn bind_udp_socket_with_destination_metadata_and_options(
     if let Some(device) = options.bind_device.as_deref() {
         validate_bind_device(device)?;
     }
-    let socket = match options.bind_device.as_deref() {
-        Some(device) => platform::bind_udp_socket_to_device(bind_addr, device)?,
-        None => std::net::UdpSocket::bind(bind_addr)?,
-    };
+    // `tokio::net::UdpSocket::from_std` panics when no thread-local runtime is
+    // entered, and also when a runtime is entered without its I/O driver.
+    // `Handle::try_current` proves only the first property. Reject it before
+    // binding when possible, then contain the second Tokio boundary so this
+    // public Result-returning API never propagates either panic. If conversion
+    // unwinds, the moved standard socket is naturally dropped by unwinding.
+    tokio::runtime::Handle::try_current()
+        .map_err(|_| udp_error(io::ErrorKind::Other, "udp_runtime_unavailable"))?;
+    let socket =
+        platform::bind_udp_socket(bind_addr, options.bind_device.as_deref(), options.ipv6_only)?;
     socket.set_nonblocking(true)?;
     let support = platform::enable_destination_metadata(&socket)?;
-    let socket = UdpSocket::from_std(socket)?;
+    let socket =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| UdpSocket::from_std(socket)))
+            .map_err(|_| udp_error(io::ErrorKind::Other, "udp_runtime_io_unavailable"))??;
     Ok(UdpDestinationMetadataSocket {
         socket,
         support,
@@ -178,11 +206,21 @@ pub async fn recv_udp_datagram_with_destination(
 }
 
 /// UDP socket wrapper that receives datagrams with destination metadata.
-#[derive(Debug)]
 pub struct UdpDestinationMetadataSocket {
     socket: UdpSocket,
     support: UdpDestinationMetadataSupport,
     bind_device: Option<String>,
+}
+
+impl fmt::Debug for UdpDestinationMetadataSocket {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("UdpDestinationMetadataSocket")
+            .field("support", &self.support)
+            .field("bind_device_present", &self.bind_device.is_some())
+            .field("socket", &"<redacted>")
+            .finish()
+    }
 }
 
 impl UdpDestinationMetadataSocket {
@@ -209,9 +247,98 @@ impl UdpDestinationMetadataSocket {
     }
 
     /// Return the wrapped Tokio UDP socket.
+    ///
+    /// This is the ordinary, unfenced runtime surface. Opting into
+    /// `opc-egress-fence` consumes a socket created inside that crate before
+    /// exposing its fenced guardian controls, so this accessor does not create
+    /// an alternate path from a `FencedUdpSocket`.
     #[must_use]
     pub const fn socket(&self) -> &UdpSocket {
         &self.socket
+    }
+
+    /// Read the full-width Linux socket cookie without exposing a descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Returns a value-free operating-system error when the cookie cannot be
+    /// read exactly or is zero.
+    #[cfg(target_os = "linux")]
+    pub fn socket_kernel_identity(&self) -> io::Result<opc_linux_gtpu_sys::SocketKernelIdentity> {
+        opc_linux_gtpu_sys::socket_kernel_identity(self.socket.as_fd())
+    }
+
+    /// Prove the socket is unconnected and neither address- nor port-reusable.
+    ///
+    /// This is a narrow admission readback for exclusive fenced ownership. It
+    /// intentionally exposes no descriptor: a borrowed descriptor would let
+    /// callers duplicate it or create an alternate send path.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable, value-free error when the peer state cannot be read,
+    /// the socket is connected, a reuse option cannot be read, or either
+    /// `SO_REUSEADDR` or `SO_REUSEPORT` is enabled.
+    #[cfg(target_os = "linux")]
+    pub fn verify_exclusive_unconnected(&self) -> io::Result<()> {
+        use nix::sys::socket::{
+            getsockopt,
+            sockopt::{ReuseAddr, ReusePort},
+        };
+
+        match self.socket.peer_addr() {
+            Err(error) if error.kind() == io::ErrorKind::NotConnected => {}
+            Ok(_) => {
+                return Err(udp_error(
+                    io::ErrorKind::PermissionDenied,
+                    "udp_socket_connected",
+                ));
+            }
+            Err(_) => {
+                return Err(udp_error(io::ErrorKind::Other, "udp_socket_peer_readback"));
+            }
+        }
+        let reuse_addr = getsockopt(&self.socket, ReuseAddr)
+            .map_err(|_| udp_error(io::ErrorKind::Other, "udp_reuse_addr_readback"))?;
+        let reuse_port = getsockopt(&self.socket, ReusePort)
+            .map_err(|_| udp_error(io::ErrorKind::Other, "udp_reuse_port_readback"))?;
+        if reuse_addr || reuse_port {
+            return Err(udp_error(
+                io::ErrorKind::PermissionDenied,
+                "udp_socket_reusable",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Prove all admission properties required by the Linux egress fence.
+    ///
+    /// This combines unconnected/exclusive ownership with exact readback of
+    /// `FREEBIND`, `TRANSPARENT`, and (for IPv6) `IPV6_V6ONLY`. No descriptor
+    /// is exposed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable, value-free error when any readback fails or an unsafe
+    /// option is enabled.
+    #[cfg(target_os = "linux")]
+    pub fn verify_fence_admission(&self) -> io::Result<()> {
+        use nix::sys::socket::{getsockopt, sockopt::BindToDevice};
+
+        self.verify_exclusive_unconnected()?;
+        let bound_device = getsockopt(&self.socket, BindToDevice)
+            .map_err(|_| udp_error(io::ErrorKind::Other, "udp_bind_device_readback"))?;
+        if !bound_device.is_empty() {
+            return Err(udp_error(
+                io::ErrorKind::PermissionDenied,
+                "udp_socket_device_bound",
+            ));
+        }
+        let ipv6 = self
+            .local_addr()
+            .map_err(|_| udp_error(io::ErrorKind::Other, "udp_local_addr_readback"))?
+            .is_ipv6();
+        opc_linux_gtpu_sys::verify_udp_fence_socket_options(self.socket.as_fd(), ipv6)
     }
 
     /// Receive one UDP datagram into `buffer`.
@@ -549,7 +676,7 @@ mod platform {
 
     use nix::sys::socket::{
         bind, getsockopt, recvmsg, sendmsg, setsockopt, socket,
-        sockopt::{BindToDevice, Ipv4PacketInfo, Ipv6RecvPacketInfo},
+        sockopt::{BindToDevice, Ipv4PacketInfo, Ipv6RecvPacketInfo, Ipv6V6Only},
         AddressFamily, ControlMessage, ControlMessageOwned, MsgFlags, SockFlag, SockType,
         SockaddrIn, SockaddrIn6, SockaddrStorage,
     };
@@ -561,11 +688,10 @@ mod platform {
         UdpReceivedDatagram,
     };
 
-    /// Create a UDP socket scoped to `device` with `SO_BINDTODEVICE` applied
-    /// before `bind(2)`, matching the option's pre-bind requirement.
-    pub(super) fn bind_udp_socket_to_device(
+    pub(super) fn bind_udp_socket(
         bind_addr: SocketAddr,
-        device: &str,
+        device: Option<&str>,
+        ipv6_only: bool,
     ) -> io::Result<std::net::UdpSocket> {
         let family = match bind_addr {
             SocketAddr::V4(_) => AddressFamily::Inet,
@@ -573,13 +699,24 @@ mod platform {
         };
         let fd = socket(family, SockType::Datagram, SockFlag::SOCK_CLOEXEC, None)
             .map_err(io::Error::from)?;
-        let expected = OsString::from(device);
-        setsockopt(&fd, BindToDevice, &expected).map_err(io::Error::from)?;
-        if getsockopt(&fd, BindToDevice).map_err(io::Error::from)? != expected {
-            return Err(udp_error(
-                io::ErrorKind::Other,
-                "udp_bind_device_readback_mismatch",
-            ));
+        if let Some(device) = device {
+            let expected = OsString::from(device);
+            setsockopt(&fd, BindToDevice, &expected).map_err(io::Error::from)?;
+            if getsockopt(&fd, BindToDevice).map_err(io::Error::from)? != expected {
+                return Err(udp_error(
+                    io::ErrorKind::Other,
+                    "udp_bind_device_readback_mismatch",
+                ));
+            }
+        }
+        if bind_addr.is_ipv6() && ipv6_only {
+            setsockopt(&fd, Ipv6V6Only, &true).map_err(io::Error::from)?;
+            if !getsockopt(&fd, Ipv6V6Only).map_err(io::Error::from)? {
+                return Err(udp_error(
+                    io::ErrorKind::Other,
+                    "udp_ipv6_only_readback_mismatch",
+                ));
+            }
         }
         match bind_addr {
             SocketAddr::V4(addr) => bind(fd.as_raw_fd(), &SockaddrIn::from(addr)),
@@ -587,6 +724,15 @@ mod platform {
         }
         .map_err(io::Error::from)?;
         Ok(std::net::UdpSocket::from(fd))
+    }
+
+    /// Create a UDP socket scoped to `device` with `SO_BINDTODEVICE` applied
+    /// before `bind(2)`, matching the option's pre-bind requirement.
+    pub(super) fn bind_udp_socket_to_device(
+        bind_addr: SocketAddr,
+        device: &str,
+    ) -> io::Result<std::net::UdpSocket> {
+        bind_udp_socket(bind_addr, Some(device), false)
     }
 
     pub(super) fn enable_destination_metadata(
@@ -897,17 +1043,18 @@ mod platform {
         UdpDestinationMetadataSupport, UdpLocalDestinationUnavailableReason, UdpReceivedDatagram,
     };
 
-    pub(super) fn bind_udp_socket_to_device(
-        _bind_addr: SocketAddr,
-        _device: &str,
+    pub(super) fn bind_udp_socket(
+        bind_addr: SocketAddr,
+        device: Option<&str>,
+        ipv6_only: bool,
     ) -> io::Result<std::net::UdpSocket> {
-        // `SO_BINDTODEVICE` does not exist here. Fail closed instead of
-        // binding in the default routing instance and silently dropping the
-        // requested device scope.
-        Err(udp_error(
-            io::ErrorKind::Unsupported,
-            "udp_bind_device_unsupported",
-        ))
+        if device.is_some() || ipv6_only {
+            return Err(udp_error(
+                io::ErrorKind::Unsupported,
+                "udp_bind_option_unsupported",
+            ));
+        }
+        std::net::UdpSocket::bind(bind_addr)
     }
 
     pub(super) fn enable_destination_metadata(
@@ -997,6 +1144,39 @@ mod tests {
         assert!(validate_bind_device("vrf-test").is_ok());
         // 15 bytes: the longest legal device name.
         assert!(validate_bind_device("eth-test-012345").is_ok());
+    }
+
+    #[test]
+    fn bind_without_an_entered_runtime_returns_a_value_free_error() {
+        let error = bind_udp_socket_with_destination_metadata_and_options(
+            loopback_any_port(),
+            &UdpSocketOptions::default(),
+        )
+        .expect_err("a Tokio runtime is required");
+
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(error.to_string(), "udp_runtime_unavailable");
+    }
+
+    #[test]
+    fn entered_runtime_without_io_returns_an_error_and_drops_the_descriptor() {
+        let probe = std::net::UdpSocket::bind(loopback_any_port()).expect("reserve endpoint");
+        let endpoint = probe.local_addr().expect("reserved endpoint");
+        drop(probe);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime without I/O");
+        let _entered = runtime.enter();
+
+        let error = bind_udp_socket_with_destination_metadata_and_options(
+            endpoint,
+            &UdpSocketOptions::default(),
+        )
+        .expect_err("an entered runtime without I/O must fail closed");
+
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(error.to_string(), "udp_runtime_io_unavailable");
+        std::net::UdpSocket::bind(endpoint).expect("failed conversion must close its descriptor");
     }
 
     #[tokio::test]
@@ -1089,7 +1269,7 @@ mod tests {
         // `SO_BINDTODEVICE` off the socket itself: that is the only assertion
         // here a regression in `bind_udp_socket_to_device` could fail.
         let scope =
-            nix::sys::socket::getsockopt(socket.socket(), nix::sys::socket::sockopt::BindToDevice)
+            nix::sys::socket::getsockopt(&socket.socket, nix::sys::socket::sockopt::BindToDevice)
                 .expect("SO_BINDTODEVICE readback");
         assert_eq!(scope, std::ffi::OsString::from("lo"));
 
@@ -1185,10 +1365,8 @@ mod tests {
         .expect("probe socket");
         match getsockopt(&probe, BindToDevice) {
             Ok(device) if device.is_empty() => None,
-            Ok(device) => Some(format!(
-                "sockets are device-bound at creation (SO_BINDTODEVICE reads back {device:?})"
-            )),
-            Err(errno) => Some(format!("the SO_BINDTODEVICE readback failed with {errno}")),
+            Ok(_) => Some("sockets are device-bound at creation".to_owned()),
+            Err(_) => Some("the SO_BINDTODEVICE readback failed".to_owned()),
         }
     }
 
@@ -1262,5 +1440,32 @@ mod tests {
         assert!(!debug.contains("198.51.100.20"));
         assert!(debug.contains("bytes"));
         assert!(debug.contains("local_destination"));
+    }
+
+    #[tokio::test]
+    async fn socket_debug_and_kernel_identity_are_redaction_safe() {
+        let socket =
+            bind_udp_socket_with_destination_metadata(loopback_any_port()).expect("runtime bind");
+        let local = socket.local_addr().expect("bound local endpoint");
+        let debug = format!("{socket:?}");
+
+        assert!(debug.contains("socket: \"<redacted>\""));
+        assert!(!debug.contains(&local.ip().to_string()));
+        assert!(!debug.contains(&local.port().to_string()));
+        #[cfg(target_os = "linux")]
+        {
+            socket
+                .verify_exclusive_unconnected()
+                .expect("exclusive socket readback");
+            assert_eq!(
+                format!(
+                    "{:?}",
+                    socket
+                        .socket_kernel_identity()
+                        .expect("full-width socket identity")
+                ),
+                "SocketKernelIdentity(<redacted>)"
+            );
+        }
     }
 }

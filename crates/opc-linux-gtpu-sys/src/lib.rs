@@ -1,11 +1,15 @@
-//! Narrow Linux GTP-U rtnetlink, generic-netlink, and selected BPF-link UAPI
+//! Narrow Linux GTP-U, socket-identity, suspend-aware time, and BPF UAPI
 //! boundary.
 //!
 //! This crate owns raw Linux socket syscalls and selected UAPI constants needed
-//! by safe dataplane backends. Its BPF surface is limited to pinning a duplicate
-//! reference to an existing link during an explicit upgrade handoff. It
-//! deliberately does not implement GTP-U packet encoding, PDP lifecycle policy,
-//! route steering, XFRM policy, or product deployment defaults.
+//! by safe protocol-neutral dataplane backends. Its BPF surface includes exact
+//! XDP-link inspection/handoff and direct root-cgroup `cgroup_skb/egress`
+//! query, revision-aware closed-first attach, and exact revision-guarded
+//! detach. It also exposes full-width socket cookies, strict fenced-UDP option
+//! readback, map freeze/readback, and fallible `CLOCK_BOOTTIME` primitives. It
+//! deliberately does not implement packet encoding, subscriber lifecycle
+//! policy, route steering, XFRM policy, lease authority, or product deployment
+//! defaults.
 
 #![allow(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -31,6 +35,71 @@ use unsupported as platform;
 pub const NETLINK_ROUTE: i32 = 0;
 /// Linux netlink protocol number for generic netlink.
 pub const NETLINK_GENERIC: i32 = 16;
+
+/// One nonblocking, close-on-exec relative `CLOCK_BOOTTIME` timer.
+///
+/// Linux `CLOCK_BOOTTIME` advances across system suspend, so readiness is not
+/// deferred until a full monotonic interval elapses after resume. The timer is
+/// one-shot and owns its descriptor. Formatting never emits the descriptor or
+/// armed duration.
+pub struct BootTimeTimer {
+    inner: platform::BootTimeTimer,
+}
+
+impl BootTimeTimer {
+    /// Create and arm a one-shot relative boot-time timer.
+    ///
+    /// # Errors
+    ///
+    /// Returns a value-free error when `duration` is zero or cannot be
+    /// represented by the kernel time ABI, timer creation or arming fails, or
+    /// this platform does not support Linux boot-time timerfds.
+    pub fn new(duration: std::time::Duration) -> io::Result<Self> {
+        platform::BootTimeTimer::new(duration)
+            .map(|inner| Self { inner })
+            .map_err(redact_boot_time_timer_error)
+    }
+
+    /// Consume one readable timerfd expiration counter.
+    ///
+    /// This nonblocking operation returns [`io::ErrorKind::WouldBlock`] until
+    /// the timer expires. Tokio callers can use it inside
+    /// `AsyncFdReadyGuard::try_io` after waiting for readable readiness.
+    ///
+    /// # Errors
+    ///
+    /// Returns a value-free error when the timer is not ready or the kernel
+    /// does not return one complete nonzero expiration counter.
+    pub fn consume_expirations(&self) -> io::Result<u64> {
+        self.inner
+            .consume_expirations()
+            .map_err(redact_boot_time_timer_error)
+    }
+}
+
+impl std::fmt::Debug for BootTimeTimer {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("BootTimeTimer(<redacted>)")
+    }
+}
+
+#[cfg(all(target_os = "linux", not(opc_linux_gtpu_sys_force_unsupported)))]
+impl std::os::fd::AsFd for BootTimeTimer {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.inner.as_fd()
+    }
+}
+
+#[cfg(all(target_os = "linux", not(opc_linux_gtpu_sys_force_unsupported)))]
+impl std::os::fd::AsRawFd for BootTimeTimer {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.inner.as_raw_fd()
+    }
+}
+
+fn redact_boot_time_timer_error(error: io::Error) -> io::Error {
+    io::Error::new(error.kind(), "boot_time_timer")
+}
 
 /// Netlink close-on-exec/nonblocking socket.
 #[derive(Debug)]
@@ -161,7 +230,7 @@ impl std::fmt::Debug for BpfCgroupProgramAttachment {
 #[derive(Clone, PartialEq, Eq)]
 pub struct BpfCgroupProgramQuery {
     attach_flags: u32,
-    revision: std::num::NonZeroU64,
+    revision: u64,
     attachments: Vec<BpfCgroupProgramAttachment>,
 }
 
@@ -174,7 +243,7 @@ impl BpfCgroupProgramQuery {
 
     /// Kernel attachment-set revision returned with this exact query.
     #[must_use]
-    pub const fn revision(&self) -> std::num::NonZeroU64 {
+    pub const fn revision(&self) -> u64 {
         self.revision
     }
 
@@ -190,21 +259,20 @@ impl std::fmt::Debug for BpfCgroupProgramQuery {
         formatter
             .debug_struct("BpfCgroupProgramQuery")
             .field("attach_flags_present", &(self.attach_flags != 0))
-            .field("revision_verified_nonzero", &true)
+            .field("revision_verified", &true)
             .field("program_count", &self.attachments.len())
             .finish()
     }
 }
 
-/// Redacted full-width kernel cookies for one exact Linux socket.
+/// Redacted full-width kernel cookie for one exact Linux socket.
 ///
-/// These values are used to bind BPF map state to one socket and network
-/// namespace. Formatting never emits either value.
+/// This value binds BPF map state to the exact socket. Formatting never emits
+/// the value.
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct SocketKernelIdentity {
     socket_cookie: u64,
-    netns_cookie: u64,
 }
 
 #[cfg(target_os = "linux")]
@@ -213,12 +281,6 @@ impl SocketKernelIdentity {
     #[must_use]
     pub const fn socket_cookie(self) -> u64 {
         self.socket_cookie
-    }
-
-    /// Nonzero `SO_NETNS_COOKIE` read from the exact descriptor.
-    #[must_use]
-    pub const fn netns_cookie(self) -> u64 {
-        self.netns_cookie
     }
 }
 
@@ -244,67 +306,10 @@ pub struct BpfXdpProgram {
     inner: platform::BpfXdpProgram,
 }
 
-/// Owned close-on-exec descriptor for one exact cgroup-skb BPF program.
-///
-/// This descriptor is used only to recover and repin a direct root attachment
-/// after bpffs pin loss. It does not create or own a managed BPF link.
-pub struct BpfCgroupSkbProgram {
-    inner: platform::BpfCgroupSkbProgram,
-}
-
-/// Stable kernel identity of one cgroup-skb BPF program.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub struct BpfCgroupSkbProgramInfo {
-    program_id: u32,
-    tag: [u8; 8],
-}
-
-impl BpfCgroupSkbProgramInfo {
-    /// Exact live kernel program identifier.
-    #[must_use]
-    pub const fn program_id(self) -> u32 {
-        self.program_id
-    }
-
-    /// Stable kernel program tag over translated instructions.
-    #[must_use]
-    pub const fn tag(self) -> [u8; 8] {
-        self.tag
-    }
-}
-
-impl std::fmt::Debug for BpfCgroupSkbProgramInfo {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("BpfCgroupSkbProgramInfo(<redacted>)")
-    }
-}
-
-impl std::fmt::Debug for BpfCgroupSkbProgram {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("BpfCgroupSkbProgram(<redacted>)")
-    }
-}
-
 impl BpfXdpProgram {
     /// Read the kernel program identifier from this exact descriptor.
     pub fn program_id(&self) -> io::Result<u32> {
         self.inner.program_id()
-    }
-}
-
-impl BpfCgroupSkbProgram {
-    /// Read and validate this exact live program identity.
-    pub fn info(&self) -> io::Result<BpfCgroupSkbProgramInfo> {
-        let (program_id, tag) = self.inner.info()?;
-        Ok(BpfCgroupSkbProgramInfo { program_id, tag })
-    }
-
-    /// Pin another reference to this exact directly attached program.
-    ///
-    /// The destination must not already exist. A failure does not affect the
-    /// root cgroup's direct program reference.
-    pub fn pin_duplicate(&self, path: &Path) -> io::Result<()> {
-        self.inner.pin_duplicate(path)
     }
 }
 
@@ -363,35 +368,55 @@ pub fn ifindex_by_name(name: &str) -> io::Result<u32> {
     platform::ifindex_by_name(name)
 }
 
-/// Read exact nonzero `SO_COOKIE` and `SO_NETNS_COOKIE` values.
+/// Read the exact nonzero full-width `SO_COOKIE`.
 ///
 /// # Errors
 ///
-/// Returns a value-free operating-system error when either read fails, has an
+/// Returns a value-free operating-system error when the read fails, has an
 /// unexpected width, or returns zero.
 #[cfg(target_os = "linux")]
 pub fn socket_kernel_identity(
     socket: std::os::fd::BorrowedFd<'_>,
 ) -> io::Result<SocketKernelIdentity> {
-    let (socket_cookie, netns_cookie) = platform::socket_kernel_identity(socket)?;
-    if socket_cookie == 0 || netns_cookie == 0 {
+    let socket_cookie = platform::socket_kernel_identity(socket)?;
+    if socket_cookie == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "socket_kernel_identity_zero",
         ));
     }
-    Ok(SocketKernelIdentity {
-        socket_cookie,
-        netns_cookie,
-    })
+    Ok(SocketKernelIdentity { socket_cookie })
+}
+
+/// Prove socket options required for exclusive fenced UDP ownership.
+///
+/// `ipv6` must match the exact local endpoint family. IPv4 admission requires
+/// both `IP_FREEBIND` and `IP_TRANSPARENT` to be disabled. IPv6 admission
+/// additionally requires `IPV6_V6ONLY`, preventing an alternate IPv4-mapped
+/// send path from bypassing an IPv6 protected endpoint.
+///
+/// # Errors
+///
+/// Returns a value-free error when any option cannot be read exactly or an
+/// unsafe option is enabled.
+#[cfg(target_os = "linux")]
+pub fn verify_udp_fence_socket_options(
+    socket: std::os::fd::BorrowedFd<'_>,
+    ipv6: bool,
+) -> io::Result<()> {
+    platform::verify_udp_fence_socket_options(socket, ipv6)
+        .map_err(|error| io::Error::new(error.kind(), "udp_fence_socket_options"))
 }
 
 /// Query the locally attached cgroup-v2 INET-egress programs.
 ///
 /// The inventory is hard-bounded to the kernel cgroup-BPF limit of 64
 /// programs. A larger or internally inconsistent result fails closed instead
-/// of returning a truncated list. The returned nonzero revision is the
-/// compare-and-swap token for [`attach_cgroup_skb_egress`].
+/// of returning a truncated list. Revision zero is the valid initial value for
+/// an attachment point that has never been mutated. The implementation uses a
+/// nonzero input sentinel and requires the cgroup revision UAPI to overwrite
+/// it, so a pre-v6.17 cgroup query implementation that ignores this field
+/// cannot be mistaken for a pristine attachment point.
 ///
 /// # Errors
 ///
@@ -410,14 +435,33 @@ pub fn query_cgroup_skb_egress(
     })
 }
 
+/// Prove that cgroup program-list revisions are implemented by this kernel.
+///
+/// This is a side-effect-free count-only `BPF_PROG_QUERY`. It is intentionally
+/// independent of the returned revision value: zero is valid for a pristine
+/// attachment point. Callers may use it as an explicit admission probe, while
+/// [`query_cgroup_skb_egress`] and the mutation wrappers also enforce the same
+/// probe internally.
+///
+/// # Errors
+///
+/// Returns a value-free operating-system error when the query is denied,
+/// malformed, or the kernel leaves the revision sentinel unchanged.
+#[cfg(target_os = "linux")]
+pub fn probe_cgroup_revision_uapi(cgroup: std::os::fd::BorrowedFd<'_>) -> io::Result<()> {
+    platform::probe_cgroup_revision_uapi(cgroup)
+}
+
 /// Directly attach one cgroup-skb program to cgroup-v2 INET egress.
 ///
 /// This deliberately uses `BPF_PROG_ATTACH` with `BPF_F_ALLOW_MULTI`, not a
 /// BPF link. The cgroup therefore owns a program reference independently of
 /// process descriptors and bpffs pins. `expected_revision` must come from the
-/// exact immediately preceding root query; a concurrent mutation makes the
-/// kernel reject the attach with `ESTALE`. Callers must query and read back
-/// the exact root inventory after attachment.
+/// exact immediately preceding root query. A nonzero revision provides a
+/// kernel compare-and-swap guard; zero is the valid pristine value but cannot
+/// enable that kernel guard, so callers must attach a closed gate first and
+/// require an exact revision-one, single-program readback. The runtime revision
+/// probe is enforced before mutation.
 ///
 /// # Errors
 ///
@@ -428,9 +472,44 @@ pub fn query_cgroup_skb_egress(
 pub fn attach_cgroup_skb_egress(
     cgroup: std::os::fd::BorrowedFd<'_>,
     program: std::os::fd::BorrowedFd<'_>,
-    expected_revision: std::num::NonZeroU64,
+    expected_revision: u64,
 ) -> io::Result<()> {
     platform::attach_cgroup_skb_egress(cgroup, program, expected_revision)
+}
+
+/// Detach one exact directly attached cgroup-skb INET-egress program.
+///
+/// This wrapper never requests a broad detach: `program` is always passed as
+/// the exact target program and `expected_revision` must be nonzero. A
+/// concurrent attachment-list mutation is rejected by the kernel with
+/// `ESTALE`. The runtime revision probe is enforced before mutation.
+///
+/// # Errors
+///
+/// Returns a value-free operating-system error for a zero revision, invalid
+/// descriptors, unsupported revision UAPI, missing authority, a non-attached
+/// exact program, or a concurrent revision change.
+#[cfg(target_os = "linux")]
+pub fn detach_cgroup_skb_egress(
+    cgroup: std::os::fd::BorrowedFd<'_>,
+    program: std::os::fd::BorrowedFd<'_>,
+    expected_revision: u64,
+) -> io::Result<()> {
+    platform::detach_cgroup_skb_egress(cgroup, program, expected_revision)
+}
+
+/// Read suspend-aware Linux `CLOCK_BOOTTIME` in nanoseconds.
+///
+/// Unlike fixed-clock convenience APIs, this preserves the fallible
+/// `clock_gettime(2)` boundary and rejects negative, non-canonical, or
+/// overflowing `timespec` values.
+///
+/// # Errors
+///
+/// Returns a value-free operating-system error when the clock read or checked
+/// nanosecond conversion fails.
+pub fn clock_gettime_boottime_ns() -> io::Result<u64> {
+    platform::clock_gettime_boottime_ns()
 }
 
 /// Freeze a BPF map against every subsequent syscall-side mutation.
@@ -447,6 +526,22 @@ pub fn attach_cgroup_skb_egress(
 #[cfg(target_os = "linux")]
 pub fn freeze_bpf_map(map: std::os::fd::BorrowedFd<'_>) -> io::Result<()> {
     platform::freeze_bpf_map(map)
+}
+
+/// Prove that one exact BPF map is frozen against syscall-side mutation.
+///
+/// Linux does not expose the frozen bit in `bpf_map_info`, but does expose the
+/// immutable `frozen` field for a live map descriptor in proc fdinfo. This
+/// helper performs a bounded, exact parse and requires the value to be one.
+///
+/// # Errors
+///
+/// Returns a value-free error when proc fdinfo is unavailable, malformed,
+/// over-bound, ambiguous, or reports an unfrozen object.
+#[cfg(target_os = "linux")]
+pub fn verify_bpf_map_frozen(map: std::os::fd::BorrowedFd<'_>) -> io::Result<()> {
+    platform::verify_bpf_map_frozen(map)
+        .map_err(|error| io::Error::new(error.kind(), "bpf_map_frozen"))
 }
 
 /// Open and validate one pinned XDP BPF link as a retained exact descriptor.
@@ -498,19 +593,6 @@ fn validate_xdp_link_id(link_id: u32) -> io::Result<()> {
 /// Linux gates this operation on effective `CAP_SYS_ADMIN`.
 pub fn open_xdp_program_by_id(program_id: u32) -> io::Result<BpfXdpProgram> {
     platform::open_xdp_program_by_id(program_id).map(|inner| BpfXdpProgram { inner })
-}
-
-/// Open one exact cgroup-skb program by the ID returned from the root query.
-///
-/// This recovery API obtains a plain program descriptor with
-/// `BPF_PROG_GET_FD_BY_ID`; it never creates a BPF link or attachment.
-///
-/// # Errors
-///
-/// Returns a value-free operating-system error for zero/missing IDs, missing
-/// BPF authority, or an object whose type or read-back ID is not exact.
-pub fn open_cgroup_skb_program_by_id(program_id: u32) -> io::Result<BpfCgroupSkbProgram> {
-    platform::open_cgroup_skb_program_by_id(program_id).map(|inner| BpfCgroupSkbProgram { inner })
 }
 
 /// Send one raw netlink message buffer to the kernel.
@@ -845,7 +927,7 @@ mod tests {
     fn cgroup_program_query_debug_is_value_free() {
         let query = BpfCgroupProgramQuery {
             attach_flags: 2,
-            revision: std::num::NonZeroU64::new(29).expect("nonzero fixture"),
+            revision: 29,
             attachments: vec![
                 BpfCgroupProgramAttachment {
                     program_id: 17,
@@ -867,19 +949,6 @@ mod tests {
         assert!(!debug.contains("37"));
         assert!(!debug.contains("41"));
         assert!(!debug.contains("43"));
-    }
-
-    #[test]
-    fn cgroup_program_info_debug_is_value_free() {
-        let info = BpfCgroupSkbProgramInfo {
-            program_id: 17,
-            tag: [23, 29, 31, 37, 41, 43, 47, 53],
-        };
-
-        let debug = format!("{info:?}");
-        for value in ["17", "23", "29", "31", "37", "41", "43", "47", "53"] {
-            assert!(!debug.contains(value));
-        }
     }
 
     #[cfg(target_os = "linux")]
@@ -974,7 +1043,6 @@ mod socket_kernel_identity_tests {
         assert_ne!(left.socket_cookie(), 0);
         assert_ne!(right.socket_cookie(), 0);
         assert_ne!(left.socket_cookie(), right.socket_cookie());
-        assert_eq!(left.netns_cookie(), right.netns_cookie());
         assert_eq!(format!("{left:?}"), "SocketKernelIdentity(<redacted>)");
     }
 }

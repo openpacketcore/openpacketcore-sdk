@@ -43,7 +43,7 @@ const MTLS_CANDIDATE_REMAINING_ACCEPTANCE: [&str; 7] = [
     "bounded_drain_and_reconnect_evidence",
     "platform_and_soak_matrix",
 ];
-const CURRENT_SOURCE_BUILD_ONLY: [&str; 28] = [
+const CURRENT_SOURCE_BUILD_ONLY: [&str; 29] = [
     "opc-alarm",
     "opc-alarm-k8s",
     "opc-alarm-testkit",
@@ -53,6 +53,7 @@ const CURRENT_SOURCE_BUILD_ONLY: [&str; 28] = [
     "opc-config-bus",
     "opc-config-bus-consensus",
     "opc-consensus",
+    "opc-egress-fence",
     "opc-gnmi-server",
     "opc-ipsec-lb",
     "opc-mgmt-audit-store",

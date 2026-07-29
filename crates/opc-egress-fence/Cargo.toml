@@ -6,7 +6,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "Lease-bound Linux tc/eBPF egress fencing for OpenPacketCore datagram sockets"
+description = "Lease-bound Linux root-cgroup egress fencing for OpenPacketCore datagram sockets"
 readme = "README.md"
 documentation = "https://docs.rs/opc-egress-fence"
 keywords = ["ebpf", "fencing", "linux", "network-programming", "high-availability"]
@@ -16,6 +16,7 @@ publish = false
 [dependencies]
 async-trait = { workspace = true }
 aya = { version = "0.14" }
+aya-obj = { version = "0.3" }
 nix = { workspace = true, features = ["net", "socket"] }
 opc-egress-fence-common = { path = "../opc-egress-fence-common", version = "0.2.0" }
 opc-linux-gtpu-sys = { path = "../opc-linux-gtpu-sys", version = "0.2.0" }
@@ -34,4 +35,5 @@ workspace = true
 [dev-dependencies]
 bytes = { workspace = true }
 opc-types = { path = "../opc-types", version = "0.2.0" }
+serde_json = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "sync", "test-util"] }

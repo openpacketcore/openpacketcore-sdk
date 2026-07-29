@@ -253,6 +253,14 @@ version = "0.1.0"
 dependencies = [
  "aya",
  "libc",
+ "opc-linux-gtpu-sys",
+]
+
+[[package]]
+name = "opc-linux-gtpu-sys"
+version = "0.2.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

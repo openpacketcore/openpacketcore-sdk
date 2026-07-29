@@ -8,3 +8,12 @@ publish = false
 [dependencies]
 aya = "0.14.0"
 libc = "0.2"
+opc-linux-gtpu-sys = { path = "../../opc-linux-gtpu-sys" }
+
+[[bin]]
+name = "opc-egress-fence-object-oracle"
+path = "src/main.rs"
+
+[[bin]]
+name = "opc-egress-fence-privileged-detector"
+path = "src/bin/privileged_detector.rs"
