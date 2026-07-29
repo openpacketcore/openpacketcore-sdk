@@ -534,6 +534,75 @@ fn encode_ipcp_dns_option(encoded: &mut Vec<u8>, option_type: u8) {
     encoded.extend_from_slice(&[0; 4]);
 }
 
+/// One length-delimited PCO unit produced by [`PcoUnitCursor`].
+///
+/// This stays private because the public syntax-validation boundary must not
+/// expose packet bytes.
+struct PcoUnit<'a> {
+    identifier: u16,
+    contents: &'a [u8],
+    index: u8,
+}
+
+/// Shared bounded framing cursor for network-to-MS PCO contents.
+///
+/// Both address decoding and syntax-only IPCP validation use this cursor, so
+/// the header checks, length arithmetic and [`PCO_MAX_CONTAINERS`] work limit
+/// cannot drift between the two public entry points.
+struct PcoUnitCursor<'a> {
+    remaining: &'a [u8],
+    unit_count: usize,
+}
+
+impl<'a> PcoUnitCursor<'a> {
+    fn new(value: &'a [u8]) -> Result<Self, PcoDecodeError> {
+        let (&header, remaining) = value.split_first().ok_or(PcoDecodeError::Empty)?;
+        if header != PCO_HEADER_PPP_FOR_IP_PDN {
+            return Err(PcoDecodeError::UnsupportedHeader);
+        }
+        Ok(Self {
+            remaining,
+            unit_count: 0,
+        })
+    }
+
+    fn next_unit(&mut self) -> Result<Option<PcoUnit<'a>>, PcoDecodeError> {
+        if self.remaining.is_empty() {
+            return Ok(None);
+        }
+        self.unit_count = self
+            .unit_count
+            .checked_add(1)
+            .ok_or(PcoDecodeError::TooManyContainers)?;
+        if self.unit_count > PCO_MAX_CONTAINERS {
+            return Err(PcoDecodeError::TooManyContainers);
+        }
+
+        let remaining = self.remaining;
+        if remaining.len() < PCO_CONTAINER_HEADER_LEN {
+            return Err(PcoDecodeError::ContainerHeaderTruncated);
+        }
+        let identifier = u16::from_be_bytes([remaining[0], remaining[1]]);
+        let contents_len = usize::from(remaining[2]);
+        let contents_end = PCO_CONTAINER_HEADER_LEN
+            .checked_add(contents_len)
+            .ok_or(PcoDecodeError::ContainerLengthOverrun)?;
+        if contents_end > remaining.len() {
+            return Err(PcoDecodeError::ContainerLengthOverrun);
+        }
+
+        let index =
+            u8::try_from(self.unit_count - 1).map_err(|_| PcoDecodeError::TooManyContainers)?;
+        let contents = &remaining[PCO_CONTAINER_HEADER_LEN..contents_end];
+        self.remaining = &remaining[contents_end..];
+        Ok(Some(PcoUnit {
+            identifier,
+            contents,
+            index,
+        }))
+    }
+}
+
 /// DNS and P-CSCF addresses decoded from a network-to-MS PCO.
 ///
 /// Repeated address containers are retained in wire order. Well-formed unknown
@@ -612,6 +681,44 @@ impl PcoAddressConfiguration {
         all
     }
 
+    /// Validate the syntax of every IPCP unit in network-to-MS PCO contents.
+    ///
+    /// This is a syntax-only boundary for callers that do not hold an
+    /// outstanding IPCP Identifier. It applies the same PCO header, unit
+    /// framing, and [`PCO_MAX_CONTAINERS`] work limit as
+    /// [`Self::decode_network_contents_correlated`], then validates the RFC
+    /// 1661 header of every `0x8021` unit. Codes 1 through 4 additionally have
+    /// every Configuration Option boundary and known RFC 1877 DNS option
+    /// length checked, including Configure-Naks that are uncorrelated or appear
+    /// after the TS 24.008 additional-parameters boundary.
+    ///
+    /// Success carries only `()`. The operation does not accept a correlation
+    /// value, adopt an IPCP DNS address, or expose an Identifier, address, or
+    /// packet bytes. It does not make a packet eligible for configuration use;
+    /// callers that want to adopt a correlated answer must separately use
+    /// [`Self::decode_network_contents_correlated`].
+    ///
+    /// This validates outer PCO framing and IPCP packet syntax only. Contents
+    /// of non-IPCP units, including fixed address-container lengths, remain the
+    /// address decoder's responsibility.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first exact [`PcoDecodeError`] produced by the shared PCO
+    /// framing cursor or by IPCP header/Configuration Option validation.
+    ///
+    /// @spec 3GPP TS24008 V20.0.0 10.5.6.3
+    /// @spec RFC1661 5,6
+    pub fn validate_network_contents_ipcp_syntax(value: &[u8]) -> Result<(), PcoDecodeError> {
+        let mut units = PcoUnitCursor::new(value)?;
+        while let Some(unit) = units.next_unit()? {
+            if unit.identifier == PCO_PROTOCOL_IPCP {
+                validate_ipcp_unit_syntax(unit.contents)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Decode network-to-MS PCO contents without correlating IPCP replies.
     ///
     /// Equivalent to [`Self::decode_network_contents_correlated`] with
@@ -670,52 +777,28 @@ impl PcoAddressConfiguration {
         value: &[u8],
         correlation: IpcpNakCorrelation,
     ) -> Result<PcoDecoded, PcoDecodeError> {
-        let (&header, mut remaining) = value.split_first().ok_or(PcoDecodeError::Empty)?;
-        if header != PCO_HEADER_PPP_FOR_IP_PDN {
-            return Err(PcoDecodeError::UnsupportedHeader);
-        }
-
+        let mut units = PcoUnitCursor::new(value)?;
         let mut decoded = Self::default();
         let mut discards: Vec<PcoIpcpDiscard> = Vec::new();
-        let mut container_count = 0usize;
         let mut additional_parameters_started = false;
-        while !remaining.is_empty() {
-            container_count = container_count
-                .checked_add(1)
-                .ok_or(PcoDecodeError::TooManyContainers)?;
-            if container_count > PCO_MAX_CONTAINERS {
-                return Err(PcoDecodeError::TooManyContainers);
-            }
-            if remaining.len() < PCO_CONTAINER_HEADER_LEN {
-                return Err(PcoDecodeError::ContainerHeaderTruncated);
-            }
-
-            let identifier = u16::from_be_bytes([remaining[0], remaining[1]]);
-            let contents_len = usize::from(remaining[2]);
-            let contents_end = PCO_CONTAINER_HEADER_LEN
-                .checked_add(contents_len)
-                .ok_or(PcoDecodeError::ContainerLengthOverrun)?;
-            if contents_end > remaining.len() {
-                return Err(PcoDecodeError::ContainerLengthOverrun);
-            }
-            let contents = &remaining[PCO_CONTAINER_HEADER_LEN..contents_end];
-            if is_network_to_ms_container_identifier(identifier) {
+        while let Some(unit) = units.next_unit()? {
+            if is_network_to_ms_container_identifier(unit.identifier) {
                 additional_parameters_started = true;
             }
-            match identifier {
-                PCO_CONTAINER_P_CSCF_IPV6 => {
-                    decoded.p_cscf_ipv6.push(decode_ipv6_address(contents)?)
-                }
-                PCO_CONTAINER_DNS_SERVER_IPV6 => {
-                    decoded.dns_server_ipv6.push(decode_ipv6_address(contents)?)
-                }
-                PCO_CONTAINER_P_CSCF_IPV4 => {
-                    decoded.p_cscf_ipv4.push(decode_ipv4_address(contents)?)
-                }
-                PCO_CONTAINER_DNS_SERVER_IPV4 => {
-                    decoded.dns_server_ipv4.push(decode_ipv4_address(contents)?)
-                }
-                PCO_CONTAINER_IPV4_LINK_MTU => decode_ipv4_link_mtu(contents, &mut decoded),
+            match unit.identifier {
+                PCO_CONTAINER_P_CSCF_IPV6 => decoded
+                    .p_cscf_ipv6
+                    .push(decode_ipv6_address(unit.contents)?),
+                PCO_CONTAINER_DNS_SERVER_IPV6 => decoded
+                    .dns_server_ipv6
+                    .push(decode_ipv6_address(unit.contents)?),
+                PCO_CONTAINER_P_CSCF_IPV4 => decoded
+                    .p_cscf_ipv4
+                    .push(decode_ipv4_address(unit.contents)?),
+                PCO_CONTAINER_DNS_SERVER_IPV4 => decoded
+                    .dns_server_ipv4
+                    .push(decode_ipv4_address(unit.contents)?),
+                PCO_CONTAINER_IPV4_LINK_MTU => decode_ipv4_link_mtu(unit.contents, &mut decoded),
                 // RFC 1661 §5.3: "Invalid packets are silently discarded." TS
                 // 24.008 10.5.6.3 maps one 0x8021 unit to one RFC 1661 packet,
                 // and this unit's outer container boundary was already
@@ -736,7 +819,7 @@ impl PcoAddressConfiguration {
                         // misplaced protocol material.
                         IpcpUnitOutcome::discarded(PcoIpcpDiscardReason::AfterAdditionalParameters)
                     } else {
-                        decode_ipcp_unit(contents, correlation)
+                        decode_ipcp_unit(unit.contents, correlation)
                     };
                     if let Some(unit) = outcome.merge {
                         // First writer across units wins, matching the
@@ -749,12 +832,9 @@ impl PcoAddressConfiguration {
                         }
                     }
                     if let Some(reason) = outcome.note {
-                        // `container_count` is 1-based here and was bounded by
-                        // PCO_MAX_CONTAINERS above, which the const assertion
-                        // beside that constant pins to <= u8::MAX.
                         discards.push(PcoIpcpDiscard {
                             reason,
-                            unit_index: (container_count - 1) as u8,
+                            unit_index: unit.index,
                         });
                     }
                 }
@@ -770,7 +850,6 @@ impl PcoAddressConfiguration {
                 // violation.
                 _ => {}
             }
-            remaining = &remaining[contents_end..];
         }
         Ok(PcoDecoded {
             configuration: decoded,
@@ -937,6 +1016,52 @@ impl IpcpUnitOutcome {
     }
 }
 
+/// Header projection for one bounded IPCP packet.
+///
+/// Deliberately has no `Debug` implementation: the Identifier and borrowed
+/// option bytes are parser-internal and must not become diagnostic material.
+struct ParsedIpcpPacket<'a> {
+    code: u8,
+    identifier: u8,
+    configuration_options: &'a [u8],
+}
+
+/// Parse the common RFC 1661 packet header and select its declared body.
+///
+/// Bytes past the declared Length are padding and remain outside the projected
+/// body. The enclosing PCO unit length bounds both this slice and all later
+/// option work.
+fn parse_ipcp_packet(contents: &[u8]) -> Result<ParsedIpcpPacket<'_>, PcoDecodeError> {
+    let header_len = usize::from(IPCP_HEADER_LEN);
+    if contents.len() < header_len {
+        return Err(PcoDecodeError::IpcpHeaderTruncated);
+    }
+    let declared = usize::from(u16::from_be_bytes([contents[2], contents[3]]));
+    if declared < header_len || declared > contents.len() {
+        return Err(PcoDecodeError::IpcpLengthInvalid);
+    }
+    Ok(ParsedIpcpPacket {
+        code: contents[0],
+        identifier: contents[1],
+        configuration_options: &contents[header_len..declared],
+    })
+}
+
+/// Validate one IPCP unit without correlating or adopting its contents.
+fn validate_ipcp_unit_syntax(contents: &[u8]) -> Result<(), PcoDecodeError> {
+    let packet = parse_ipcp_packet(contents)?;
+    if matches!(
+        packet.code,
+        IPCP_CODE_CONFIGURE_REQUEST
+            | IPCP_CODE_CONFIGURE_ACK
+            | IPCP_CODE_CONFIGURE_NAK
+            | IPCP_CODE_CONFIGURE_REJECT
+    ) {
+        validate_ipcp_configuration_options(packet.configuration_options)?;
+    }
+    Ok(())
+}
+
 /// Decode one `0x8021` unit, reporting any peer-supplied DNS address.
 ///
 /// Only a Configure-Nak carries addresses: RFC 1661 §5.2 has a Configure-Ack
@@ -955,30 +1080,20 @@ impl IpcpUnitOutcome {
 /// written to the caller's accumulator either, so an option that parsed before
 /// a later malformed one in the same packet cannot survive it.
 fn decode_ipcp_unit(contents: &[u8], correlation: IpcpNakCorrelation) -> IpcpUnitOutcome {
-    let header_len = usize::from(IPCP_HEADER_LEN);
-    if contents.len() < header_len {
-        return IpcpUnitOutcome::discarded(PcoIpcpDiscardReason::Malformed(
-            PcoDecodeError::IpcpHeaderTruncated,
-        ));
-    }
-    let code = contents[0];
-    let identifier = contents[1];
-    let declared = usize::from(u16::from_be_bytes([contents[2], contents[3]]));
-    if declared < header_len || declared > contents.len() {
-        return IpcpUnitOutcome::discarded(PcoIpcpDiscardReason::Malformed(
-            PcoDecodeError::IpcpLengthInvalid,
-        ));
-    }
+    let packet = match parse_ipcp_packet(contents) {
+        Ok(packet) => packet,
+        Err(error) => return IpcpUnitOutcome::discarded(PcoIpcpDiscardReason::Malformed(error)),
+    };
     if matches!(
-        code,
+        packet.code,
         IPCP_CODE_CONFIGURE_REQUEST | IPCP_CODE_CONFIGURE_ACK | IPCP_CODE_CONFIGURE_REJECT
     ) {
-        if let Err(error) = validate_ipcp_configuration_options(&contents[header_len..declared]) {
+        if let Err(error) = validate_ipcp_configuration_options(packet.configuration_options) {
             return IpcpUnitOutcome::discarded(PcoIpcpDiscardReason::Malformed(error));
         }
         return IpcpUnitOutcome::ignored();
     }
-    if code != IPCP_CODE_CONFIGURE_NAK {
+    if packet.code != IPCP_CODE_CONFIGURE_NAK {
         return IpcpUnitOutcome::ignored();
     }
     // RFC 1661 §5.3: "On reception of a Configure-Nak, the Identifier field
@@ -988,7 +1103,7 @@ fn decode_ipcp_unit(contents: &[u8], correlation: IpcpNakCorrelation) -> IpcpUni
     if !correlation.is_outstanding() {
         return IpcpUnitOutcome::discarded(PcoIpcpDiscardReason::NoOutstandingRequest);
     }
-    if !correlation.accepts_identifier(identifier) {
+    if !correlation.accepts_identifier(packet.identifier) {
         return IpcpUnitOutcome::discarded(PcoIpcpDiscardReason::IdentifierMismatch);
     }
 
@@ -997,7 +1112,7 @@ fn decode_ipcp_unit(contents: &[u8], correlation: IpcpNakCorrelation) -> IpcpUni
     // Each iteration consumes at least two octets of a slice the one-octet
     // unit length already bounds to 255, so this terminates without a
     // separate option cap.
-    let mut remaining = &contents[header_len..declared];
+    let mut remaining = packet.configuration_options;
     while !remaining.is_empty() {
         let (option_type, data, rest) = match split_ipcp_configuration_option(remaining) {
             Ok(option) => option,
@@ -1073,13 +1188,13 @@ fn split_ipcp_configuration_option(remaining: &[u8]) -> Result<(u8, &[u8], &[u8]
     ))
 }
 
-/// Validate the Configuration Options field of a non-Nak configuration packet.
+/// Validate the Configuration Options field of one configuration packet.
 ///
-/// DNS values are not adopted from these codes, but their option framing is
-/// still checked so syntactically invalid input is reported rather than called
-/// a well-formed ignored packet. Known RFC 1877 options retain their fixed
-/// six-octet shape independent of which configuration code carried them. This
-/// is syntax validation only: Identifier correlation, Configure-Ack equality,
+/// DNS values are not adopted by this helper, but their option framing is
+/// checked so syntactically invalid input is reported rather than called a
+/// well-formed packet. Known RFC 1877 options retain their fixed six-octet
+/// shape independent of which configuration code carried them. This is syntax
+/// validation only: Identifier correlation, Configure-Ack equality,
 /// Configure-Reject subset validation and PPP response policy remain outside
 /// this decoder.
 fn validate_ipcp_configuration_options(mut remaining: &[u8]) -> Result<(), PcoDecodeError> {
