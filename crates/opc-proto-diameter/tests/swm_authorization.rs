@@ -482,9 +482,90 @@ fn rar_replay_payload_matches_public_build_parse_roundtrip() {
 
     assert!(outbound.same_replay_payload(&restored));
     assert!(restored.same_replay_payload(&outbound));
-    assert_ne!(
+    assert_eq!(
         outbound, restored,
-        "derived AVP lengths are not payload facts"
+        "public equality ignores derived wire length while retaining exposed metadata"
+    );
+}
+
+#[test]
+fn rar_replay_preflight_is_class_uncomparable_but_other_avps_remain_exact() {
+    let with_additional = |header, value: &[u8]| {
+        let mut request = typed_rar_envelope().request().clone();
+        request.additional_avps =
+            vec![
+                SwmAdditionalAvp::new(header, value.to_vec(), EncodeContext::default())
+                    .expect("synthetic replay candidate must frame"),
+            ];
+        SwmReAuthRequestEnvelope::for_outbound(
+            request,
+            SwmDiameterTransaction::new(HOP_RAR, END_RAR),
+            expected_re_auth_peer(CONNECTION_A),
+        )
+    };
+
+    let retained = with_additional(
+        AvpHeader::ietf(base::AVP_CLASS, true),
+        b"opaque-class-alpha",
+    );
+    let matching = with_additional(
+        AvpHeader::ietf(base::AVP_CLASS, true),
+        b"opaque-class-alpha",
+    );
+    let nonmatching = with_additional(
+        AvpHeader::ietf(base::AVP_CLASS, true),
+        b"opaque-class-bravo",
+    );
+    for candidate in [&matching, &nonmatching] {
+        assert_eq!(
+            retained.compare_replay_payload(candidate),
+            swm::SwmReplayPayloadComparison::OpaqueClassUncomparable
+        );
+        assert!(!retained.same_replay_payload(candidate));
+    }
+
+    let malformed_flags = with_additional(
+        AvpHeader::ietf(base::AVP_CLASS, false),
+        b"opaque-class-alpha",
+    );
+    assert_eq!(
+        typed_rar_envelope().compare_replay_payload(&malformed_flags),
+        swm::SwmReplayPayloadComparison::OpaqueClassUncomparable,
+        "IETF Class must guard before canonical flag validation"
+    );
+
+    let vendor_retained = with_additional(
+        AvpHeader::vendor(base::AVP_CLASS, VENDOR_ID_3GPP, false),
+        b"vendor-class-alpha",
+    );
+    let vendor_matching = with_additional(
+        AvpHeader::vendor(base::AVP_CLASS, VENDOR_ID_3GPP, false),
+        b"vendor-class-alpha",
+    );
+    let vendor_nonmatching = with_additional(
+        AvpHeader::vendor(base::AVP_CLASS, VENDOR_ID_3GPP, false),
+        b"vendor-class-bravo",
+    );
+    assert_eq!(
+        vendor_retained.compare_replay_payload(&vendor_matching),
+        swm::SwmReplayPayloadComparison::Same
+    );
+    assert!(vendor_retained.same_replay_payload(&vendor_matching));
+    assert_eq!(
+        vendor_retained, vendor_nonmatching,
+        "public equality remains value-blind for vendor-specific code 25"
+    );
+    assert_eq!(
+        vendor_retained.compare_replay_payload(&vendor_nonmatching),
+        swm::SwmReplayPayloadComparison::Different,
+        "vendor-specific code 25 is not IETF Class and remains exactly comparable"
+    );
+    assert!(!vendor_retained.same_replay_payload(&vendor_nonmatching));
+
+    let class_free = typed_rar_envelope();
+    assert_eq!(
+        class_free.compare_replay_payload(&class_free.clone()),
+        swm::SwmReplayPayloadComparison::Same
     );
 }
 
@@ -601,12 +682,17 @@ fn rar_replay_payload_preserves_proxy_route_and_retained_avp_identity_and_order(
     assert!(!initial.same_replay_payload(&changed(reordered_route)));
 
     let mut changed_extension_value = initial_avps.clone();
-    changed_extension_value[12] = avp(
-        AvpCode::new(UNKNOWN),
-        0x00,
-        b"changed-rar-extension.example",
+    changed_extension_value[12] = avp(AvpCode::new(UNKNOWN), 0x00, b"rar-extension-two.example");
+    let changed_extension_value = changed(changed_extension_value);
+    assert_eq!(
+        initial.request(),
+        changed_extension_value.request(),
+        "public request equality must not expose same-length extension bytes"
     );
-    assert!(!initial.same_replay_payload(&changed(changed_extension_value)));
+    assert!(
+        !initial.same_replay_payload(&changed_extension_value),
+        "private replay correlation must remain byte-exact"
+    );
 
     let mut changed_extension_code = initial_avps.clone();
     changed_extension_code[12] = avp(AvpCode::new(UNKNOWN + 2), 0x00, EXTENSION_VALUE);
@@ -2443,6 +2529,37 @@ fn role_forbidden_additional_avps_fail_on_decode_and_encode() {
         "RFC 4005 AAR Class occurrence zero",
         &AuthorizationFixture::Aar.wire(aar_with_class),
         DecodeContext::default(),
+    );
+
+    const OUTBOUND_AAR_CLASS_SENTINEL: &[u8] = b"outbound-aar-class-private";
+    let parsed = parsed_authorization_request(&aar_wire(0xc0));
+    let mut outbound_request = parsed.request().clone();
+    outbound_request.additional_avps.push(
+        SwmAdditionalAvp::new(
+            AvpHeader::ietf(base::AVP_CLASS, true),
+            OUTBOUND_AAR_CLASS_SENTINEL.to_vec(),
+            EncodeContext::default(),
+        )
+        .expect("canonical outbound Class test AVP must frame"),
+    );
+    let outbound = swm::SwmAuthorizationRequestEnvelope::for_outbound(
+        outbound_request,
+        SwmDiameterTransaction::new(HOP_AAR, END_AAR),
+        expected_authorization_peer(CONNECTION_A),
+    );
+    let error = swm::build_swm_authorization_request(&outbound, EncodeContext::default())
+        .expect_err("AAR encode must reject RFC 4005 Class occurrence zero");
+    assert_eq!(
+        error.code(),
+        &EncodeErrorCode::Structural {
+            reason: "SWm authorization additional AVP is invalid for this command role",
+        }
+    );
+    let diagnostics = format!("{error:?}\n{error}");
+    assert!(
+        !diagnostics
+            .contains(std::str::from_utf8(OUTBOUND_AAR_CLASS_SENTINEL).expect("ASCII sentinel")),
+        "outbound AAR Class rejection must remain value-free"
     );
 
     for fixture in [AuthorizationFixture::Rar, AuthorizationFixture::Aar] {

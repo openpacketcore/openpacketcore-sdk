@@ -14,7 +14,7 @@ use std::{collections::HashSet, error::Error, fmt, net::IpAddr};
 
 use super::lifecycle::{
     self, SwmAdditionalAvp, SwmDiameterConnectionToken, SwmExpectedAnswerPeer,
-    SwmRoutingMessagePriority, ValueValidationPurpose,
+    SwmReplayPayloadComparison, SwmRoutingMessagePriority, ValueValidationPurpose,
 };
 use super::{
     append_apn_configuration_avp, append_experimental_result_avp, builder_helpers,
@@ -888,7 +888,7 @@ impl SwmReAuthRequestEnvelope {
         self.proxy_infos.len()
     }
 
-    /// Return whether `other` carries the same immutable RAR replay payload.
+    /// Compare the immutable RAR replay payload with `other`.
     ///
     /// RFC 6733 sections 3 and 5.5.4 define duplicate identity and the
     /// hop-local fields that may change during failover. This SDK operation
@@ -899,11 +899,39 @@ impl SwmReAuthRequestEnvelope {
     /// expected-answer peer binding. Derived AVP length fields are also ignored
     /// because encoding computes them from the retained value.
     ///
-    /// The result is only a boolean and exposes no retained AVP value. Active
-    /// session ownership, duplicate-cache lifetime, and replay disposition
-    /// remain consumer policy.
+    /// Exact public preflight is deliberately unavailable if either request
+    /// contains IETF Class. In that case this returns
+    /// [`SwmReplayPayloadComparison::OpaqueClassUncomparable`] before comparing
+    /// retained bytes. Consumers must fail closed and use committed,
+    /// transport-owned wire state rather than a digest or candidate comparator.
+    #[must_use]
+    pub fn compare_replay_payload(&self, other: &Self) -> SwmReplayPayloadComparison {
+        if lifecycle::contains_ietf_class_avp(&self.request.additional_avps)
+            || lifecycle::contains_ietf_class_avp(&other.request.additional_avps)
+        {
+            return SwmReplayPayloadComparison::OpaqueClassUncomparable;
+        }
+        if self.has_same_replay_payload_exact(other) {
+            SwmReplayPayloadComparison::Same
+        } else {
+            SwmReplayPayloadComparison::Different
+        }
+    }
+
+    /// Return whether `other` carries the same publicly comparable RAR replay
+    /// payload.
+    ///
+    /// This source-compatible boolean delegates to
+    /// [`Self::compare_replay_payload`] and returns `true` only for
+    /// [`SwmReplayPayloadComparison::Same`]. It therefore returns `false` for
+    /// both different payloads and Class-bearing, deliberately uncomparable
+    /// payloads.
     #[must_use]
     pub fn same_replay_payload(&self, other: &Self) -> bool {
+        self.compare_replay_payload(other).is_same()
+    }
+
+    fn has_same_replay_payload_exact(&self, other: &Self) -> bool {
         self.transaction.end_to_end_identifier() == other.transaction.end_to_end_identifier()
             && self.proxiable == other.proxiable
             && self.request.has_same_replay_fields(&other.request)
@@ -1489,7 +1517,7 @@ fn correlate_common(
     {
         return Err(SwmAuthorizationCorrelationError::PeerIdentityMismatch);
     }
-    if request.proxy_infos != answer.proxy_infos {
+    if !lifecycle::additional_avp_sequences_match(request.proxy_infos, answer.proxy_infos) {
         return Err(SwmAuthorizationCorrelationError::ProxyInfoMismatch);
     }
     lifecycle::validate_offered_overload_control(

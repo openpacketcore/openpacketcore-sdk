@@ -10,7 +10,7 @@ use opc_proto_diameter::{
 };
 use opc_protocol::{
     BorrowDecode, DecodeContext, DecodeError, DuplicateIePolicy, Encode, EncodeContext,
-    UnknownIePolicy,
+    EncodeErrorCode, UnknownIePolicy,
 };
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::num::NonZeroU64;
@@ -649,6 +649,190 @@ fn unknown_optional_children_round_trip_but_unknown_mandatory_and_shared_budget_
         .chain((0..64).map(|index| raw_avp(AvpCode::new(63_000 + index), 0, None, b"x")))
         .collect();
     assert!(parse(&answer_wire(base::RESULT_CODE_DIAMETER_SUCCESS, &top_level)).is_err());
+}
+
+#[test]
+fn gateway_context_binding_is_exact_but_class_bearing_context_is_uncomparable() {
+    const CONTEXT_MISMATCH_REASON: &str =
+        "SWm DEA parsed and request-bound gateway contexts differ";
+    const OPAQUE_CLASS_CONTEXT_REASON: &str =
+        "SWm DEA request-bound gateway context cannot contain opaque Class";
+    const UNKNOWN_GATEWAY_CHILD: AvpCode = AvpCode::new(64_100);
+    let extension_alpha = b"gateway-extension-alpha";
+    let extension_bravo = b"gateway-extension-bravo";
+    assert_eq!(extension_alpha.len(), extension_bravo.len());
+
+    enum Site {
+        Agent,
+        HomeAgentHost,
+    }
+
+    let agent_for = |site: &Site, code, value: &[u8]| {
+        let extension = raw_avp(code, 0, None, value);
+        match site {
+            Site::Agent => {
+                let address = raw_avp(
+                    swm::AVP_MIP_HOME_AGENT_ADDRESS,
+                    AvpFlags::MANDATORY,
+                    None,
+                    &address_value("192.0.2.10".parse().expect("synthetic IPv4")),
+                );
+                agent_info(AvpFlags::MANDATORY, &[address, extension])
+            }
+            Site::HomeAgentHost => {
+                let host_value = [
+                    raw_avp(
+                        base::AVP_DESTINATION_REALM,
+                        AvpFlags::MANDATORY,
+                        None,
+                        PRIVATE_HA_REALM.as_bytes(),
+                    ),
+                    raw_avp(
+                        base::AVP_DESTINATION_HOST,
+                        AvpFlags::MANDATORY,
+                        None,
+                        PRIVATE_HA_HOST.as_bytes(),
+                    ),
+                    extension,
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+                let host = raw_avp(
+                    swm::AVP_MIP_HOME_AGENT_HOST,
+                    AvpFlags::MANDATORY,
+                    None,
+                    &host_value,
+                );
+                agent_info(AvpFlags::MANDATORY, &[host])
+            }
+        }
+    };
+    let parsed_answer_for = |agent| {
+        parse(&answer_wire(base::RESULT_CODE_DIAMETER_SUCCESS, &[agent]))
+            .expect("synthetic gateway extension must parse")
+    };
+    let transaction = swm::SwmDiameterTransaction::new(HOP_BY_HOP, END_TO_END);
+    let request =
+        swm::SwmDiameterEapRequestEnvelope::for_outbound(sample_request(false), transaction);
+
+    for site in [Site::Agent, Site::HomeAgentHost] {
+        let retained = parsed_answer_for(agent_for(&site, UNKNOWN_GATEWAY_CHILD, extension_alpha));
+        let changed = parsed_answer_for(agent_for(&site, UNKNOWN_GATEWAY_CHILD, extension_bravo));
+        assert_eq!(
+            retained.gateway_context(),
+            changed.gateway_context(),
+            "public gateway equality exposes retained metadata only"
+        );
+        let gateway = retained
+            .gateway_context()
+            .chained_s2b_s8_serving_gateway()
+            .expect("retained serving gateway")
+            .clone();
+        let bound = swm::SwmRequestBoundDeaGatewayContext::chained_s2b_s8(&request, gateway);
+        swm::build_swm_diameter_eap_answer_for_with_gateway_context(
+            &request,
+            &retained,
+            &bound,
+            EncodeContext::default(),
+        )
+        .expect("matching Class-free retained gateway context");
+        let mismatch = swm::build_swm_diameter_eap_answer_for_with_gateway_context(
+            &request,
+            &changed,
+            &bound,
+            EncodeContext::default(),
+        )
+        .expect_err("same-shape gateway extension drift must be exact");
+        assert_eq!(
+            mismatch.code(),
+            &EncodeErrorCode::Structural {
+                reason: CONTEXT_MISMATCH_REASON,
+            }
+        );
+
+        let class_retained = parsed_answer_for(agent_for(&site, base::AVP_CLASS, extension_alpha));
+        let class_changed = parsed_answer_for(agent_for(&site, base::AVP_CLASS, extension_bravo));
+        assert_eq!(
+            class_retained.gateway_context(),
+            class_changed.gateway_context(),
+            "Class values remain opaque through public gateway equality"
+        );
+        let class_retained_gateway = class_retained
+            .gateway_context()
+            .chained_s2b_s8_serving_gateway()
+            .expect("Class-bearing retained serving gateway")
+            .clone();
+        let class_changed_gateway = class_changed
+            .gateway_context()
+            .chained_s2b_s8_serving_gateway()
+            .expect("changed Class-bearing retained serving gateway")
+            .clone();
+        let class_bound = swm::SwmRequestBoundDeaGatewayContext::chained_s2b_s8(
+            &request,
+            class_retained_gateway.clone(),
+        );
+        for candidate in [&class_retained, &class_changed] {
+            let error = swm::build_swm_diameter_eap_answer_for_with_gateway_context(
+                &request,
+                candidate,
+                &class_bound,
+                EncodeContext::default(),
+            )
+            .expect_err("Class-bearing gateway contexts must fail without byte comparison");
+            assert_eq!(
+                error.code(),
+                &EncodeErrorCode::Structural {
+                    reason: OPAQUE_CLASS_CONTEXT_REASON,
+                }
+            );
+            let diagnostic = format!("{error:?} {error}");
+            for secret in [extension_alpha.as_slice(), extension_bravo.as_slice()] {
+                assert!(
+                    !diagnostic
+                        .as_bytes()
+                        .windows(secret.len())
+                        .any(|part| part == secret),
+                    "gateway mismatch diagnostics must remain value-free"
+                );
+            }
+        }
+
+        let empty_answer = sample_answer();
+        let mut empty_diagnostics = Vec::new();
+        for class_gateway in [class_retained_gateway, class_changed_gateway] {
+            let class_bound =
+                swm::SwmRequestBoundDeaGatewayContext::chained_s2b_s8(&request, class_gateway);
+            let error = swm::build_swm_diameter_eap_answer_for_with_gateway_context(
+                &request,
+                &empty_answer,
+                &class_bound,
+                EncodeContext::default(),
+            )
+            .expect_err("an empty answer must not bypass the Class-bearing gateway-context guard");
+            assert_eq!(
+                error.code(),
+                &EncodeErrorCode::Structural {
+                    reason: OPAQUE_CLASS_CONTEXT_REASON,
+                }
+            );
+            let diagnostic = format!("{error:?} {error}");
+            for secret in [extension_alpha.as_slice(), extension_bravo.as_slice()] {
+                assert!(
+                    !diagnostic
+                        .as_bytes()
+                        .windows(secret.len())
+                        .any(|part| part == secret),
+                    "empty-answer gateway rejection diagnostics must remain value-free"
+                );
+            }
+            empty_diagnostics.push(diagnostic);
+        }
+        assert_eq!(
+            empty_diagnostics[0], empty_diagnostics[1],
+            "matching and nonmatching Class values must fail identically"
+        );
+    }
 }
 
 #[test]

@@ -10,8 +10,8 @@ use opc_protocol::{DecodeError, DecodeErrorCode, EncodeContext, EncodeError, Spe
 use std::{error::Error, fmt};
 
 use super::{
-    builder_helpers, lifecycle, Redacted, SwmAdditionalAvp, SwmDiameterEapAnswer, SwmReAuthRequest,
-    SwmSessionTerminationRequest,
+    builder_helpers, lifecycle, Redacted, SwmAdditionalAvp, SwmDiameterEapAnswer, SwmReAuthAnswer,
+    SwmReAuthRequest, SwmSessionTerminationRequest,
 };
 use crate::avp::dictionary::Sensitive;
 use crate::base;
@@ -42,7 +42,8 @@ pub enum SwmSessionStateErrorCode {
     ClassValueBytesExceeded,
     /// A Class AVP did not use the canonical RFC 6733 base header.
     InvalidClassAvp,
-    /// Replacing Class values would exceed a request's additional-AVP bound.
+    /// Replacing Class values would exceed a typed message's additional-AVP
+    /// bound.
     AdditionalAvpCapacityExceeded,
     /// A routing directive was applied to a different Diameter session.
     SessionMismatch,
@@ -104,8 +105,14 @@ impl Error for SwmSessionStateError {}
 /// Values and raw headers are private and never appear in `Debug` or
 /// `Display`. Use [`Self::try_from_values`] at a trusted origination boundary,
 /// or obtain a replacement through a correlated authorization answer. The
-/// clone/move helpers replace any existing IETF Class AVPs in a typed request
+/// clone/move helpers replace any existing IETF Class AVPs in a typed message
 /// while preserving every other additional AVP.
+///
+/// Equality compares only redaction-safe Class metadata, including occurrence
+/// order and value lengths; it deliberately cannot distinguish different
+/// opaque bytes of the same shape. Public replay preflight returns
+/// `OpaqueClassUncomparable`; exact retransmission uses already committed wire
+/// state rather than comparing a caller-supplied Class candidate.
 #[derive(Default, Clone, PartialEq, Eq)]
 pub struct SwmClassAvps {
     avps: Vec<SwmAdditionalAvp>,
@@ -173,6 +180,29 @@ impl SwmClassAvps {
         request: &mut SwmReAuthRequest,
     ) -> Result<(), SwmSessionStateError> {
         replace_class_avps(&mut request.additional_avps, self.avps)
+    }
+
+    /// Clone this Class set into a typed RAA, replacing its prior Class AVPs.
+    ///
+    /// RFC 4005 section 3.4 and RFC 7155 section 3.4 explicitly place
+    /// repeated Class on this access-client-originated leg. TS 29.273 sections
+    /// 7.1.2.5.1 and 7.2.2.4.2 select that RAA before the subsequent SWm AAR,
+    /// which retains the zero-occurrence rule from those specifications.
+    pub fn clone_into_re_auth_answer(
+        &self,
+        answer: &mut SwmReAuthAnswer,
+    ) -> Result<(), SwmSessionStateError> {
+        replace_class_avps(&mut answer.additional_avps, self.avps.clone())
+    }
+
+    /// Move this Class set into a typed RAA, replacing its prior Class AVPs.
+    ///
+    /// This is the consuming form of [`Self::clone_into_re_auth_answer`].
+    pub fn move_into_re_auth_answer(
+        self,
+        answer: &mut SwmReAuthAnswer,
+    ) -> Result<(), SwmSessionStateError> {
+        replace_class_avps(&mut answer.additional_avps, self.avps)
     }
 
     fn push_originated(&mut self, value: Vec<u8>) -> Result<(), SwmSessionStateError> {

@@ -2,20 +2,21 @@
 
 use bytes::{Bytes, BytesMut};
 use opc_proto_diameter::apps::swm::{
-    self, AuthRequestType, SwmAaaFailureIndication, SwmDiameterEapAnswer,
-    SwmDiameterEapAnswerEnvelope, SwmDiameterEapRequest, SwmDiameterEapRequestEnvelope,
-    SwmDiameterResult, SwmDiameterTransaction, SwmEmergencyAuthorizationError,
-    SwmEmergencyAuthorizationEvidence, SwmEmergencyServices, SwmHighPriorityAccessInfo,
-    SwmQosCapability, SwmQosProfileTemplate, SwmTerminalInformation, SwmVisitedNetworkIdentifier,
-    AVP_AUTH_REQUEST_TYPE, AVP_EAP_PAYLOAD,
+    self, AuthRequestType, SwmAaaFailureIndication, SwmDiameterEapAgentDeliveryFailure,
+    SwmDiameterEapAnswer, SwmDiameterEapAnswerEnvelope, SwmDiameterEapRequest,
+    SwmDiameterEapRequestEnvelope, SwmDiameterResult, SwmDiameterTransaction,
+    SwmEmergencyAuthorizationError, SwmEmergencyAuthorizationEvidence, SwmEmergencyServices,
+    SwmHighPriorityAccessInfo, SwmMip6AgentInfo, SwmQosCapability, SwmQosProfileTemplate,
+    SwmTerminalInformation, SwmVisitedNetworkIdentifier, AVP_AUTH_REQUEST_TYPE, AVP_EAP_PAYLOAD,
 };
+use opc_proto_diameter::apps::VENDOR_ID_3GPP;
 use opc_proto_diameter::base;
 use opc_proto_diameter::{
     AvpCode, AvpFlags, CommandFlags, Header, Message, OwnedMessage, VendorId,
 };
 use opc_protocol::{
     BorrowDecode, DecodeContext, DecodeError, DecodeErrorCode, DuplicateIePolicy, Encode,
-    EncodeContext, UnknownIePolicy,
+    EncodeContext, EncodeErrorCode, UnknownIePolicy,
 };
 use opc_types::{Imei, Imei15};
 
@@ -168,6 +169,109 @@ fn fixture(role: Role, extensions: &[Vec<u8>]) -> (Vec<u8>, usize) {
         .encode(&mut wire, EncodeContext::default())
         .expect("synthetic fixture must encode");
     (wire.to_vec(), first_extension_offset)
+}
+
+fn parsed_request_envelope(
+    extensions: &[Vec<u8>],
+    ctx: DecodeContext,
+) -> SwmDiameterEapRequestEnvelope {
+    let (wire, _) = fixture(Role::Request, extensions);
+    swm::parse_swm_diameter_eap_request_envelope(&decode_fixture(&wire), ctx)
+        .expect("synthetic DER extensions must parse")
+}
+
+fn qos_profile_with_extension(code: AvpCode, flags: u8, value: &[u8]) -> Vec<u8> {
+    let mut profile = raw_avp(
+        base::AVP_VENDOR_ID,
+        AvpFlags::MANDATORY,
+        None,
+        &0_u32.to_be_bytes(),
+    );
+    profile.extend_from_slice(&raw_avp(
+        swm::AVP_QOS_PROFILE_ID,
+        AvpFlags::MANDATORY,
+        None,
+        &0_u32.to_be_bytes(),
+    ));
+    profile.extend_from_slice(&raw_avp(code, flags, None, value));
+    raw_avp(
+        swm::AVP_QOS_PROFILE_TEMPLATE,
+        AvpFlags::MANDATORY,
+        None,
+        &profile,
+    )
+}
+
+fn qos_capability_with_profile_extension(code: AvpCode, flags: u8, value: &[u8]) -> Vec<u8> {
+    let profile = qos_profile_with_extension(code, flags, value);
+    raw_avp(swm::AVP_QOS_CAPABILITY, AvpFlags::MANDATORY, None, &profile)
+}
+
+fn qos_capability_with_extension(code: AvpCode, flags: u8, value: &[u8]) -> Vec<u8> {
+    let mut capability = qos_profile_with_extension(UNKNOWN_CODE, 0, b"profile-stable");
+    capability.extend_from_slice(&raw_avp(code, flags, None, value));
+    raw_avp(
+        swm::AVP_QOS_CAPABILITY,
+        AvpFlags::MANDATORY,
+        None,
+        &capability,
+    )
+}
+
+fn qos_capability_with_nested_extensions(
+    profile_extension_value: &[u8],
+    capability_extension_value: &[u8],
+) -> Vec<u8> {
+    let mut capability = qos_profile_with_extension(UNKNOWN_CODE, 0, profile_extension_value);
+    capability.extend_from_slice(&raw_avp(
+        OTHER_UNKNOWN_CODE,
+        0,
+        None,
+        capability_extension_value,
+    ));
+    raw_avp(
+        swm::AVP_QOS_CAPABILITY,
+        AvpFlags::MANDATORY,
+        None,
+        &capability,
+    )
+}
+
+fn supported_features_with_extension(code: AvpCode, flags: u8, value: &[u8]) -> Vec<u8> {
+    let mut features = raw_avp(
+        base::AVP_VENDOR_ID,
+        AvpFlags::MANDATORY,
+        None,
+        &VENDOR_ID_3GPP.get().to_be_bytes(),
+    );
+    features.extend_from_slice(&raw_avp(
+        swm::AVP_FEATURE_LIST_ID,
+        AvpFlags::VENDOR,
+        Some(VENDOR_ID_3GPP),
+        &1_u32.to_be_bytes(),
+    ));
+    features.extend_from_slice(&raw_avp(
+        swm::AVP_FEATURE_LIST,
+        AvpFlags::VENDOR,
+        Some(VENDOR_ID_3GPP),
+        &0_u32.to_be_bytes(),
+    ));
+    features.extend_from_slice(&raw_avp(code, flags, None, value));
+    raw_avp(
+        swm::AVP_SUPPORTED_FEATURES,
+        AvpFlags::VENDOR,
+        Some(VENDOR_ID_3GPP),
+        &features,
+    )
+}
+
+fn oc_supported_features_with_extension(code: AvpCode, flags: u8, value: &[u8]) -> Vec<u8> {
+    raw_avp(
+        swm::AVP_OC_SUPPORTED_FEATURES,
+        0,
+        None,
+        &raw_avp(code, flags, None, value),
+    )
 }
 
 fn decode_fixture(wire: &[u8]) -> Message<'_> {
@@ -573,6 +677,202 @@ fn empty_sealed_collections_preserve_the_prior_der_and_dea_bytes() {
 }
 
 #[test]
+fn der_replay_and_request_binding_reject_same_shape_top_level_extension_drift() {
+    let preserve = context(UnknownIePolicy::Preserve, DuplicateIePolicy::Last);
+    let parse_envelope = |value: &[u8]| {
+        let extension = raw_avp(UNKNOWN_CODE, 0, None, value);
+        let (wire, _) = fixture(Role::Request, &[extension]);
+        swm::parse_swm_diameter_eap_request_envelope(&decode_fixture(&wire), preserve)
+            .expect("DER with one retained extension")
+    };
+    let retained = parse_envelope(b"der-extension-alpha");
+    let changed = parse_envelope(b"der-extension-bravo");
+    assert_eq!(
+        retained, changed,
+        "public metadata equality must not expose same-shape extension bytes"
+    );
+    assert!(
+        !retained.same_replay_payload(&changed),
+        "DER replay must use the private exact retained-extension comparator"
+    );
+
+    let gateway = SwmMip6AgentInfo::new(
+        vec!["192.0.2.10".parse().expect("synthetic IPv4 address")],
+        None,
+        None,
+    )
+    .expect("synthetic serving gateway");
+    let bound = swm::SwmRequestBoundDeaGatewayContext::chained_s2b_s8(&retained, gateway);
+    let (answer_wire, _) = fixture(Role::Answer, &[]);
+    let answer = swm::parse_swm_diameter_eap_answer(&decode_fixture(&answer_wire), preserve)
+        .expect("synthetic success DEA");
+    swm::build_swm_diameter_eap_answer_for_with_gateway_context(
+        &changed,
+        &answer,
+        &bound,
+        EncodeContext::default(),
+    )
+    .expect_err("request binding must reject same-length retained extension drift");
+}
+
+#[test]
+fn der_class_is_uncomparable_at_every_reachable_retained_extension_depth() {
+    const CLASS_BINDING_REASON: &str =
+        "SWm agent delivery failure cannot bind a DER containing opaque Class";
+    let preserve = context(UnknownIePolicy::Preserve, DuplicateIePolicy::Last);
+    let class_alpha = b"opaque-class-alpha";
+    let class_bravo = b"opaque-class-bravo";
+    assert_eq!(class_alpha.len(), class_bravo.len());
+
+    let cases = [
+        (
+            "top-level",
+            raw_avp(base::AVP_CLASS, 0, None, class_alpha),
+            raw_avp(base::AVP_CLASS, 0, None, class_bravo),
+        ),
+        (
+            "top-level protected and M-clear",
+            raw_avp(base::AVP_CLASS, AvpFlags::PROTECTED, None, class_alpha),
+            raw_avp(base::AVP_CLASS, AvpFlags::PROTECTED, None, class_bravo),
+        ),
+        (
+            "QoS-Capability",
+            qos_capability_with_extension(base::AVP_CLASS, 0, class_alpha),
+            qos_capability_with_extension(base::AVP_CLASS, 0, class_bravo),
+        ),
+        (
+            "QoS-Profile-Template",
+            qos_capability_with_profile_extension(base::AVP_CLASS, 0, class_alpha),
+            qos_capability_with_profile_extension(base::AVP_CLASS, 0, class_bravo),
+        ),
+        (
+            "Supported-Features",
+            supported_features_with_extension(base::AVP_CLASS, 0, class_alpha),
+            supported_features_with_extension(base::AVP_CLASS, 0, class_bravo),
+        ),
+        (
+            "OC-Supported-Features",
+            oc_supported_features_with_extension(base::AVP_CLASS, 0, class_alpha),
+            oc_supported_features_with_extension(base::AVP_CLASS, 0, class_bravo),
+        ),
+    ];
+
+    for (site, retained_extension, changed_extension) in cases {
+        let retained = parsed_request_envelope(std::slice::from_ref(&retained_extension), preserve);
+        let matching = parsed_request_envelope(&[retained_extension], preserve);
+        let changed = parsed_request_envelope(&[changed_extension], preserve);
+        assert_eq!(
+            retained, changed,
+            "{site} public equality must remain opaque and metadata-only"
+        );
+        for candidate in [&matching, &changed] {
+            assert_eq!(
+                retained.compare_replay_payload(candidate),
+                swm::SwmReplayPayloadComparison::OpaqueClassUncomparable,
+                "{site} must guard before comparing Class bytes"
+            );
+            assert!(
+                !retained.same_replay_payload(candidate),
+                "{site} boolean compatibility API must fail closed"
+            );
+        }
+    }
+
+    let top_level_alpha =
+        parsed_request_envelope(&[raw_avp(base::AVP_CLASS, 0, None, class_alpha)], preserve);
+    let top_level_bravo =
+        parsed_request_envelope(&[raw_avp(base::AVP_CLASS, 0, None, class_bravo)], preserve);
+    for request in [&top_level_alpha, &top_level_bravo] {
+        let error = swm::SwmDiameterEapGenericErrorAnswer::new_agent_delivery_failure_for(
+            request,
+            SwmDiameterEapAgentDeliveryFailure::UnableToDeliver,
+            "dra.synthetic.example".to_owned(),
+            "routing.synthetic.example".to_owned(),
+        )
+        .expect_err("Class-bearing DER must not enter a public digest binding");
+        assert_eq!(
+            error.code(),
+            &EncodeErrorCode::Structural {
+                reason: CLASS_BINDING_REASON,
+            }
+        );
+        let diagnostic = format!("{error:?} {error}");
+        for secret in [class_alpha.as_slice(), class_bravo.as_slice()] {
+            assert!(
+                !diagnostic
+                    .as_bytes()
+                    .windows(secret.len())
+                    .any(|part| part == secret),
+                "binding diagnostics must stay value-free"
+            );
+        }
+    }
+}
+
+#[test]
+fn der_class_free_nested_extensions_remain_exact_for_replay_and_binding() {
+    let preserve = context(UnknownIePolicy::Preserve, DuplicateIePolicy::Last);
+    let extension_alpha = b"nested-extension-alpha";
+    let extension_bravo = b"nested-extension-bravo";
+    assert_eq!(extension_alpha.len(), extension_bravo.len());
+    let cases = [
+        (
+            "QoS-Capability",
+            qos_capability_with_extension(OTHER_UNKNOWN_CODE, 0, extension_alpha),
+            qos_capability_with_extension(OTHER_UNKNOWN_CODE, 0, extension_bravo),
+        ),
+        (
+            "QoS-Profile-Template",
+            qos_capability_with_profile_extension(UNKNOWN_CODE, 0, extension_alpha),
+            qos_capability_with_profile_extension(UNKNOWN_CODE, 0, extension_bravo),
+        ),
+        (
+            "Supported-Features",
+            supported_features_with_extension(UNKNOWN_CODE, 0, extension_alpha),
+            supported_features_with_extension(UNKNOWN_CODE, 0, extension_bravo),
+        ),
+        (
+            "OC-Supported-Features",
+            oc_supported_features_with_extension(UNKNOWN_CODE, 0, extension_alpha),
+            oc_supported_features_with_extension(UNKNOWN_CODE, 0, extension_bravo),
+        ),
+    ];
+    let (answer_wire, _) = fixture(Role::Answer, &[]);
+    let answer = swm::parse_swm_diameter_eap_answer(&decode_fixture(&answer_wire), preserve)
+        .expect("synthetic success DEA");
+
+    for (site, retained_extension, changed_extension) in cases {
+        let retained = parsed_request_envelope(&[retained_extension], preserve);
+        let changed = parsed_request_envelope(&[changed_extension], preserve);
+        assert_eq!(
+            retained, changed,
+            "{site} public equality deliberately exposes metadata only"
+        );
+        assert_eq!(
+            retained.compare_replay_payload(&changed),
+            swm::SwmReplayPayloadComparison::Different,
+            "{site} replay binding must compare retained bytes exactly"
+        );
+        assert!(!retained.same_replay_payload(&changed));
+
+        let gateway = SwmMip6AgentInfo::new(
+            vec!["192.0.2.10".parse().expect("synthetic IPv4 address")],
+            None,
+            None,
+        )
+        .expect("synthetic serving gateway");
+        let bound = swm::SwmRequestBoundDeaGatewayContext::chained_s2b_s8(&retained, gateway);
+        swm::build_swm_diameter_eap_answer_for_with_gateway_context(
+            &changed,
+            &answer,
+            &bound,
+            EncodeContext::default(),
+        )
+        .expect_err("{site} request binding must reject same-shape retained-byte drift");
+    }
+}
+
+#[test]
 fn emergency_retry_preserves_extensions_and_all_non_terminal_access_context() {
     let imei = Imei15::new("490154203237518").expect("synthetic valid IMEI");
     let initial_identity = "0234150999999999@sos.nai.epc.mnc015.mcc234.3gppnetwork.org";
@@ -587,6 +887,36 @@ fn emergency_retry_preserves_extensions_and_all_non_terminal_access_context() {
         .expect("bounded synthetic EAP identity")
         .into();
     initial.emergency_services = Some(SwmEmergencyServices::emergency_indication());
+    let qos_profile_alpha = b"qos-profile-alpha";
+    let qos_profile_bravo = b"qos-profile-bravo";
+    let qos_capability_alpha = b"qos-capability-alpha";
+    let qos_capability_bravo = b"qos-capability-bravo";
+    let supported_alpha = b"supported-child-alpha";
+    let supported_bravo = b"supported-child-bravo";
+    let oc_alpha = b"oc-feature-child-alpha";
+    let oc_bravo = b"oc-feature-child-bravo";
+    for (alpha, bravo) in [
+        (qos_profile_alpha.as_slice(), qos_profile_bravo.as_slice()),
+        (
+            qos_capability_alpha.as_slice(),
+            qos_capability_bravo.as_slice(),
+        ),
+        (supported_alpha.as_slice(), supported_bravo.as_slice()),
+        (oc_alpha.as_slice(), oc_bravo.as_slice()),
+    ] {
+        assert_eq!(alpha.len(), bravo.len());
+    }
+    let nested_initial = parsed_request_envelope(
+        &[
+            qos_capability_with_nested_extensions(qos_profile_alpha, qos_capability_alpha),
+            supported_features_with_extension(UNKNOWN_CODE, 0, supported_alpha),
+            oc_supported_features_with_extension(UNKNOWN_CODE, 0, oc_alpha),
+        ],
+        preserve,
+    );
+    initial.qos_capability = nested_initial.request().qos_capability.clone();
+    initial.supported_features = nested_initial.request().supported_features.clone();
+    initial.oc_supported_features = nested_initial.request().oc_supported_features.clone();
 
     let (answer_wire, _) = fixture(Role::Answer, &[]);
     let mut identity_answer =
@@ -622,9 +952,9 @@ fn emergency_retry_preserves_extensions_and_all_non_terminal_access_context() {
         software_version: None,
     });
 
-    let verify = |retry: &SwmDiameterEapRequest| {
+    let verify = |initial_request: &SwmDiameterEapRequest, retry: &SwmDiameterEapRequest| {
         let initial_exchange = SwmDiameterEapRequestEnvelope::for_outbound(
-            initial.clone(),
+            initial_request.clone(),
             SwmDiameterTransaction::new(1, 2),
         )
         .correlate_answer(SwmDiameterEapAnswerEnvelope::for_outbound(
@@ -646,10 +976,15 @@ fn emergency_retry_preserves_extensions_and_all_non_terminal_access_context() {
         )
     };
 
-    verify(&valid_retry).expect("adding only Terminal-Information preserves retry identity");
+    verify(&initial, &valid_retry)
+        .expect("adding only Terminal-Information preserves retry identity");
 
     enum Mutation {
         QosCapability,
+        QosCapabilityExtension,
+        QosProfileExtension,
+        SupportedFeaturesExtension,
+        OcSupportedFeaturesExtension,
         VisitedNetworkIdentifier,
         AaaFailureIndication,
         HighPriorityAccessInfo,
@@ -662,9 +997,57 @@ fn emergency_retry_preserves_extensions_and_all_non_terminal_access_context() {
         swm::parse_swm_diameter_eap_request(&decode_fixture(&changed_wire), preserve)
             .expect("second parser-populated extension collection")
             .extensions;
+    let qos_capability_changed = parsed_request_envelope(
+        &[qos_capability_with_nested_extensions(
+            qos_profile_alpha,
+            qos_capability_bravo,
+        )],
+        preserve,
+    )
+    .request()
+    .qos_capability
+    .clone()
+    .expect("parser-populated QoS capability");
+    let qos_profile_changed = parsed_request_envelope(
+        &[qos_capability_with_nested_extensions(
+            qos_profile_bravo,
+            qos_capability_alpha,
+        )],
+        preserve,
+    )
+    .request()
+    .qos_capability
+    .clone()
+    .expect("parser-populated QoS capability");
+    let supported_features_changed = parsed_request_envelope(
+        &[supported_features_with_extension(
+            UNKNOWN_CODE,
+            0,
+            supported_bravo,
+        )],
+        preserve,
+    )
+    .request()
+    .supported_features
+    .clone();
+    let oc_supported_features_changed = parsed_request_envelope(
+        &[oc_supported_features_with_extension(
+            UNKNOWN_CODE,
+            0,
+            oc_bravo,
+        )],
+        preserve,
+    )
+    .request()
+    .oc_supported_features
+    .clone();
 
     for mutation in [
         Mutation::QosCapability,
+        Mutation::QosCapabilityExtension,
+        Mutation::QosProfileExtension,
+        Mutation::SupportedFeaturesExtension,
+        Mutation::OcSupportedFeaturesExtension,
         Mutation::VisitedNetworkIdentifier,
         Mutation::AaaFailureIndication,
         Mutation::HighPriorityAccessInfo,
@@ -677,6 +1060,18 @@ fn emergency_retry_preserves_extensions_and_all_non_terminal_access_context() {
                     SwmQosCapability::new(vec![SwmQosProfileTemplate::ietf_diameter()])
                         .expect("one synthetic QoS profile"),
                 );
+            }
+            Mutation::QosCapabilityExtension => {
+                changed.qos_capability = Some(qos_capability_changed.clone());
+            }
+            Mutation::QosProfileExtension => {
+                changed.qos_capability = Some(qos_profile_changed.clone());
+            }
+            Mutation::SupportedFeaturesExtension => {
+                changed.supported_features = supported_features_changed.clone();
+            }
+            Mutation::OcSupportedFeaturesExtension => {
+                changed.oc_supported_features = oc_supported_features_changed.clone();
             }
             Mutation::VisitedNetworkIdentifier => {
                 changed.visited_network_identifier = Some(
@@ -695,7 +1090,31 @@ fn emergency_retry_preserves_extensions_and_all_non_terminal_access_context() {
             }
         }
         assert_eq!(
-            verify(&changed).expect_err("retry context mutation must fail closed"),
+            verify(&initial, &changed).expect_err("retry context mutation must fail closed"),
+            SwmEmergencyAuthorizationError::RetryRequestMismatch
+        );
+    }
+
+    let class_alpha = raw_avp(base::AVP_CLASS, 0, None, b"opaque-class-alpha");
+    let class_bravo = raw_avp(base::AVP_CLASS, 0, None, b"opaque-class-bravo");
+    let class_alpha = parsed_request_envelope(&[class_alpha], preserve)
+        .request()
+        .extensions
+        .clone();
+    let class_bravo = parsed_request_envelope(&[class_bravo], preserve)
+        .request()
+        .extensions
+        .clone();
+    let mut class_initial = initial.clone();
+    class_initial.extensions = class_alpha.clone();
+    let mut class_matching_retry = valid_retry.clone();
+    class_matching_retry.extensions = class_alpha;
+    let mut class_nonmatching_retry = valid_retry;
+    class_nonmatching_retry.extensions = class_bravo;
+    for retry in [&class_matching_retry, &class_nonmatching_retry] {
+        assert_eq!(
+            verify(&class_initial, retry)
+                .expect_err("Class-bearing emergency retries must fail without byte comparison"),
             SwmEmergencyAuthorizationError::RetryRequestMismatch
         );
     }

@@ -1417,8 +1417,25 @@ it never erases prior consumer-owned state. One or more occurrences produce
 exchanges expose the same explicit replacement operation for later
 authorization updates. `SwmClassAvps` caps one session at 128 occurrences and
 4096 aggregate value octets, preserves order and canonical headers, and
-supports clone or move replacement into typed RAR and STR requests without
-exposing opaque values through diagnostics.
+supports clone or move replacement into typed RAR, RAA, and STR messages
+without exposing opaque values through diagnostics or public equality.
+Equality observes only redaction-safe metadata such as occurrence shape and
+value lengths. `SwmReAuthRequestEnvelope`,
+`SwmSessionTerminationRequestEnvelope`, `SwmAbortSessionRequestEnvelope`, and
+`SwmDiameterEapRequestEnvelope` expose an additive tri-state
+`compare_replay_payload`: Class-free candidates are compared exactly, while
+any recursively retained IETF Class produces `OpaqueClassUncomparable` before
+value bytes are compared. The older `same_replay_payload` delegates to that
+result and returns `false` for the opaque case. Duplicate handling for such a
+request must use already committed, transport-owned wire state; publishing a
+digest or exact candidate comparator would recreate the value oracle.
+Class-free Proxy-Info, DER QoS/profile, Supported-Features, overload-control,
+gateway, and emergency-retry bindings remain byte-exact internally.
+
+For a server-initiated authorization update, the access client replays
+retained Class state on RAA. The following AAR remains Class-free: RFC 4005
+section 3.4 and RFC 7155 section 3.4 explicitly permit repeated Class on RAA,
+while their AAR occurrence tables explicitly assign Class cardinality zero.
 
 The routing projection owns the correlated DEA's final Origin-Host and
 Origin-Realm, not a DRA or transport peer identity. An absent Session-Binding
@@ -1522,14 +1539,17 @@ remain transport/product responsibilities. End-to-End allocation and the
 recent-use fence belong to the shared origin authority.
 
 A server-side duplicate cache can compare two retained STR envelopes with
-`initial.same_replay_payload(&candidate)`. On top of RFC 6733 duplicate
-identity, the redaction-safe SDK guard requires the same End-to-End Identifier,
-P bit, typed request facts, ordered Route-Record and extension AVPs, and exact
-ordered Proxy-Info chain. It ignores the Hop-by-Hop Identifier, T bit, and
-authenticated expected-answer peer binding that may change across failover.
-It also ignores only the derived length within each retained AVP header, since
-the encoder recomputes that field from the value. The operation neither exposes
-raw AVP values nor decides duplicate-cache lifetime or active-session ownership.
+`initial.compare_replay_payload(&candidate)`. For Class-free requests, the
+redaction-safe SDK guard returns `Same` or `Different` from the End-to-End
+Identifier, P bit, typed request facts, ordered Route-Record and extension
+AVPs, and exact ordered Proxy-Info chain. It ignores the Hop-by-Hop Identifier,
+T bit, authenticated expected-answer peer binding, and encoder-derived AVP
+length. If either request contains IETF Class, it returns
+`OpaqueClassUncomparable` before comparing retained candidate bytes. The
+source-compatible `same_replay_payload` returns false for both `Different` and
+the opaque result. Replay of an already accepted Class-bearing duplicate must
+use committed transport-owned wire state; a public digest or candidate
+comparator would recreate the value oracle.
 
 `SwmExpectedAnswerPeer::routed(connection)` accepts the final logical Origin
 behind a DRA/proxy/relay while still requiring the exact authenticated
@@ -1662,16 +1682,20 @@ is only for a queued, unacknowledged ASR resend after link failover or equivalen
 recovery, not an ordinary timer retry.
 
 A server-side duplicate cache can call
-`initial.same_replay_payload(&candidate)` before replaying a committed ASA.
-The redaction-safe boolean requires the same End-to-End Identifier, P bit,
-typed ASR facts (including exact optional `Auth-Session-State` presence),
-ordered Route-Record and retained extension AVPs, and exact ordered Proxy-Info
-chain. It ignores only Hop-by-Hop, T, and the authenticated expected-answer
-peer binding; retained AVP code, flags, Vendor-Id, and value remain exact while
-their encoder-derived length is normalized. RFC 6733 and the SWm ASR grammar
-define no dedicated Abort-Cause field: an abort-cause-like deployment extension
-is retained and compared in `additional_avps`. Cache lifetime, live-session
-authority, and replay disposition remain product policy.
+`initial.compare_replay_payload(&candidate)` before replaying a committed ASA.
+For Class-free requests, the redaction-safe operation returns `Same` or
+`Different` from the End-to-End Identifier, P bit, typed ASR facts (including
+exact optional `Auth-Session-State` presence), ordered Route-Record and
+retained extension AVPs, and exact ordered Proxy-Info chain. It ignores
+Hop-by-Hop, T, authenticated expected-answer peer binding, and encoder-derived
+AVP length. If either request contains IETF Class, it returns
+`OpaqueClassUncomparable` before comparing retained candidate bytes;
+`same_replay_payload` returns false for that result as well as for `Different`.
+Replay of an already accepted Class-bearing duplicate uses committed
+transport-owned wire state, not a public digest or candidate comparator.
+RFC 6733 and the SWm ASR grammar define no dedicated Abort-Cause field; cache
+lifetime, live-session authority, and replay disposition remain product
+policy.
 
 Ordinary E-clear ASAs require Session-Id and correlate it exactly. A received
 generic E-bit answer may omit Session-Id under RFC 6733's error-answer grammar,
@@ -1826,13 +1850,17 @@ lifetime, retry timers, session mutation, and when an accepted RAA advances to
 AAR.
 
 Before replaying that committed RAA, a server-side duplicate cache can use
-`initial.same_replay_payload(&candidate)`. The RAR operation applies the same
-redaction-safe contract as ASR/STR: it requires the End-to-End Identifier, P,
-every typed RAR fact (including `Re-Auth-Request-Type`), exact ordered
-Route-Record, retained extension AVPs, and Proxy-Info, while ignoring only
-Hop-by-Hop, T, and expected-answer peer binding. Retained AVP length is
-normalized because the encoder derives it; code, flags, Vendor-Id, order, and
-value are not. It does not choose cache policy or mutate authorization state.
+`initial.compare_replay_payload(&candidate)`. For Class-free RARs, the
+redaction-safe operation returns `Same` or `Different` from the End-to-End
+Identifier, P, every typed RAR fact (including `Re-Auth-Request-Type`), exact
+ordered Route-Record, retained extension AVPs, and Proxy-Info, while ignoring
+Hop-by-Hop, T, expected-answer peer binding, and encoder-derived AVP length. If
+either request contains IETF Class, it returns `OpaqueClassUncomparable`
+before comparing retained candidate bytes; `same_replay_payload` returns false
+for that result as well as for `Different`. Replay of an already accepted
+Class-bearing duplicate uses committed transport-owned wire state, not a
+public digest or candidate comparator. The operation does not choose cache
+policy or mutate authorization state.
 
 RAR requires `AUTHORIZE_ONLY`, exact Session-Id/User-Name, and the addressed
 Destination-Host used by the procedure. AAR/AAA require
@@ -1849,6 +1877,13 @@ preserve repeated Reply-Message values in their redaction-safe extension
 collections; RAR declares Reply-Message as a singleton. A protocol-error-class
 experimental result is rejected on origination because RFC 6733's E-bit
 grammar requires a base Result-Code.
+Retained RFC 6733 Class state is transferred opaquely into the access client's
+RAA with `SwmClassAvps::clone_into_re_auth_answer` or
+`move_into_re_auth_answer`; existing IETF Class occurrences are replaced in
+order while unrelated extensions remain intact. AAR deliberately remains a
+wrong role for Class. Its generic TS 29.273 extension wildcard and the
+base-AVP support language do not expressly override the named Class
+zero-occurrence rule in RFC 4005 section 10.1 and RFC 7155 section 5.1.
 RAA and AAR expose singleton RFC 6733 `Authorization-Lifetime` and
 `Auth-Grace-Period` values in seconds; AAA exposes both plus the singleton
 TS 29.273 `Session-Timeout`. RAR forbids all three, and `Session-Timeout` is

@@ -8,6 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Opaque SWm Class replay on access-client RAA — `opc-proto-diameter`:**
+  `SwmClassAvps` can now clone or move retained ordered RFC 6733 Class state
+  into a typed `SwmReAuthAnswer`, replacing only existing IETF Class
+  occurrences while preserving unrelated extensions. The following AAR
+  remains Class-free: RFC 4005/7155 explicitly permit repeated Class on RAA
+  and assign it cardinality zero on AAR. Count, aggregate-byte, canonical
+  header, redaction, and atomic-capacity bounds apply unchanged. Public
+  equality for every opaque retained AVP compares redaction-safe metadata
+  only. Additive RAR, STR, ASR, and DER replay comparison now distinguishes
+  `Same`, `Different`, and `OpaqueClassUncomparable`; the compatibility
+  boolean returns `false` for the latter. Class-free security bindings retain
+  private byte-exact comparison, while Class-bearing candidate comparison,
+  emergency retry, gateway matching, and agent-delivery digest binding fail
+  closed without examining candidate value bytes.
 - **Bounded managed-device diagnostics — `opc-gtpu-dataplane`:**
   `EbpfGtpuDataplaneBackend::managed_device_inventory` exposes an SDK-owned,
   read-only identity view containing only interface name and ifindex. Capture

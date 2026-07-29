@@ -220,6 +220,28 @@ fn asr_wire(auth_session_state: Option<u32>) -> Vec<u8> {
     wire_message(0xc0, HOP_BY_HOP, END_TO_END, asr_avps(auth_session_state))
 }
 
+fn class_free_asr_avps(auth_session_state: Option<u32>) -> Vec<Vec<u8>> {
+    asr_avps(auth_session_state)
+        .into_iter()
+        .filter(|avp| {
+            u32::from_be_bytes(
+                avp[..4]
+                    .try_into()
+                    .expect("synthetic AVP always has a code"),
+            ) != base::AVP_CLASS.get()
+        })
+        .collect()
+}
+
+fn class_free_asr_wire(auth_session_state: Option<u32>) -> Vec<u8> {
+    wire_message(
+        0xc0,
+        HOP_BY_HOP,
+        END_TO_END,
+        class_free_asr_avps(auth_session_state),
+    )
+}
+
 fn asa_wire(result_code: u32, flags: u8) -> Vec<u8> {
     wire_message(flags, HOP_BY_HOP, END_TO_END, asa_avps(result_code))
 }
@@ -465,8 +487,8 @@ fn retransmission_t_bit_is_retained_and_outbound_failover_resend_is_explicit() {
 
 #[test]
 fn asr_replay_payload_accepts_only_retransmission_authorized_envelope_changes() {
-    let initial =
-        parsed_asr(&asr_wire(Some(0))).with_expected_answer_peer(expected_epdg(EPDG_CONNECTION));
+    let initial = parsed_asr(&class_free_asr_wire(Some(0)))
+        .with_expected_answer_peer(expected_epdg(EPDG_CONNECTION));
 
     let mut failover = initial.clone();
     failover.mark_for_failover_retransmission(
@@ -481,7 +503,7 @@ fn asr_replay_payload_accepts_only_retransmission_authorized_envelope_changes() 
         0xc0,
         HOP_BY_HOP.wrapping_add(1),
         END_TO_END,
-        asr_avps(Some(0)),
+        class_free_asr_avps(Some(0)),
     ))
     .with_expected_answer_peer(expected_epdg(EPDG_CONNECTION));
     assert!(initial.same_replay_payload(&changed_hop));
@@ -491,13 +513,13 @@ fn asr_replay_payload_accepts_only_retransmission_authorized_envelope_changes() 
         0xd0,
         HOP_BY_HOP,
         END_TO_END,
-        asr_avps(Some(0)),
+        class_free_asr_avps(Some(0)),
     ))
     .with_expected_answer_peer(expected_epdg(EPDG_CONNECTION));
     assert!(initial.same_replay_payload(&changed_t));
     assert_ne!(initial, changed_t);
 
-    let changed_binding = parsed_asr(&asr_wire(Some(0)))
+    let changed_binding = parsed_asr(&class_free_asr_wire(Some(0)))
         .with_expected_answer_peer(expected_epdg(EPDG_CONNECTION + 1));
     assert!(initial.same_replay_payload(&changed_binding));
     assert_ne!(initial, changed_binding);
@@ -506,7 +528,7 @@ fn asr_replay_payload_accepts_only_retransmission_authorized_envelope_changes() 
         0xc0,
         HOP_BY_HOP,
         END_TO_END.wrapping_add(1),
-        asr_avps(Some(0)),
+        class_free_asr_avps(Some(0)),
     ))
     .with_expected_answer_peer(expected_epdg(EPDG_CONNECTION));
     assert!(!initial.same_replay_payload(&changed_end_to_end));
@@ -533,9 +555,83 @@ fn asr_replay_payload_matches_public_build_parse_roundtrip() {
 
     assert!(outbound.same_replay_payload(&restored));
     assert!(restored.same_replay_payload(&outbound));
-    assert_ne!(
+    assert_eq!(
         outbound, restored,
-        "derived AVP lengths are not payload facts"
+        "public equality ignores derived wire length while retaining exposed metadata"
+    );
+}
+
+#[test]
+fn asr_replay_preflight_is_class_uncomparable_but_other_avps_remain_exact() {
+    let with_additional = |header, value: &[u8]| {
+        let mut request = parsed_asr(&asr_wire(Some(0))).request().clone();
+        request.additional_avps =
+            vec![
+                SwmAdditionalAvp::new(header, value.to_vec(), EncodeContext::default())
+                    .expect("synthetic replay candidate must frame"),
+            ];
+        SwmAbortSessionRequestEnvelope::for_outbound(
+            request,
+            SwmDiameterTransaction::new(HOP_BY_HOP, END_TO_END),
+            expected_epdg(EPDG_CONNECTION),
+        )
+    };
+
+    let retained = with_additional(
+        AvpHeader::ietf(base::AVP_CLASS, true),
+        b"opaque-class-alpha",
+    );
+    let matching = with_additional(
+        AvpHeader::ietf(base::AVP_CLASS, true),
+        b"opaque-class-alpha",
+    );
+    let nonmatching = with_additional(
+        AvpHeader::ietf(base::AVP_CLASS, true),
+        b"opaque-class-bravo",
+    );
+    for candidate in [&matching, &nonmatching] {
+        assert_eq!(
+            retained.compare_replay_payload(candidate),
+            swm::SwmReplayPayloadComparison::OpaqueClassUncomparable
+        );
+        assert!(!retained.same_replay_payload(candidate));
+    }
+
+    let malformed_flags = with_additional(
+        AvpHeader::ietf(base::AVP_CLASS, false),
+        b"opaque-class-alpha",
+    );
+    assert_eq!(
+        parsed_asr(&asr_wire(Some(0))).compare_replay_payload(&malformed_flags),
+        swm::SwmReplayPayloadComparison::OpaqueClassUncomparable
+    );
+
+    let vendor_retained = with_additional(
+        AvpHeader::vendor(base::AVP_CLASS, apps::VENDOR_ID_3GPP, false),
+        b"vendor-class-alpha",
+    );
+    let vendor_matching = with_additional(
+        AvpHeader::vendor(base::AVP_CLASS, apps::VENDOR_ID_3GPP, false),
+        b"vendor-class-alpha",
+    );
+    let vendor_nonmatching = with_additional(
+        AvpHeader::vendor(base::AVP_CLASS, apps::VENDOR_ID_3GPP, false),
+        b"vendor-class-bravo",
+    );
+    assert_eq!(
+        vendor_retained.compare_replay_payload(&vendor_matching),
+        swm::SwmReplayPayloadComparison::Same
+    );
+    assert_eq!(
+        vendor_retained.compare_replay_payload(&vendor_nonmatching),
+        swm::SwmReplayPayloadComparison::Different
+    );
+    assert!(!vendor_retained.same_replay_payload(&vendor_nonmatching));
+
+    let class_free = parsed_asr(&class_free_asr_wire(Some(0)));
+    assert_eq!(
+        class_free.compare_replay_payload(&class_free.clone()),
+        swm::SwmReplayPayloadComparison::Same
     );
 }
 
