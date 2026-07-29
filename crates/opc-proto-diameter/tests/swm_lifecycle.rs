@@ -1242,7 +1242,10 @@ fn str_replay_payload_matches_outbound_build_parse_roundtrip() {
         .with_expected_answer_peer(SwmExpectedAnswerPeer::routed(CONNECTION_A));
 
     assert!(outbound.same_replay_payload(&restored));
-    assert_ne!(outbound, restored);
+    assert_eq!(
+        outbound, restored,
+        "public equality ignores derived wire length while retaining exposed metadata"
+    );
 
     let candidate = |header, value: &[u8]| {
         let mut changed = request.clone();
@@ -1283,9 +1286,87 @@ fn str_replay_payload_matches_outbound_build_parse_roundtrip() {
 
     let changed_value = candidate(
         AvpHeader::vendor(EXTENSION_CODE, EXTENSION_VENDOR, false),
-        b"changed-synthetic-extension-value",
+        b"synthetic-extension-vxlue",
+    );
+    assert_eq!(
+        outbound, changed_value,
+        "public equality must not expose same-length extension bytes"
     );
     assert!(!outbound.same_replay_payload(&changed_value));
+}
+
+#[test]
+fn str_replay_preflight_is_class_uncomparable_but_other_avps_remain_exact() {
+    let with_additional = |header, value: &[u8]| {
+        let mut request = parsed_request_envelope(&str_wire()).request().clone();
+        request.additional_avps =
+            vec![
+                SwmAdditionalAvp::new(header, value.to_vec(), EncodeContext::default())
+                    .expect("synthetic replay candidate must frame"),
+            ];
+        SwmSessionTerminationRequestEnvelope::for_outbound(
+            request,
+            SwmDiameterTransaction::new(HOP_BY_HOP, END_TO_END),
+            SwmExpectedAnswerPeer::routed(CONNECTION_A),
+        )
+    };
+
+    let retained = with_additional(
+        AvpHeader::ietf(base::AVP_CLASS, true),
+        b"opaque-class-alpha",
+    );
+    let matching = with_additional(
+        AvpHeader::ietf(base::AVP_CLASS, true),
+        b"opaque-class-alpha",
+    );
+    let nonmatching = with_additional(
+        AvpHeader::ietf(base::AVP_CLASS, true),
+        b"opaque-class-bravo",
+    );
+    for candidate in [&matching, &nonmatching] {
+        assert_eq!(
+            retained.compare_replay_payload(candidate),
+            swm::SwmReplayPayloadComparison::OpaqueClassUncomparable
+        );
+        assert!(!retained.same_replay_payload(candidate));
+    }
+
+    let malformed_flags = with_additional(
+        AvpHeader::ietf(base::AVP_CLASS, false),
+        b"opaque-class-alpha",
+    );
+    assert_eq!(
+        parsed_request_envelope(&str_wire()).compare_replay_payload(&malformed_flags),
+        swm::SwmReplayPayloadComparison::OpaqueClassUncomparable
+    );
+
+    let vendor_retained = with_additional(
+        AvpHeader::vendor(base::AVP_CLASS, apps::VENDOR_ID_3GPP, false),
+        b"vendor-class-alpha",
+    );
+    let vendor_matching = with_additional(
+        AvpHeader::vendor(base::AVP_CLASS, apps::VENDOR_ID_3GPP, false),
+        b"vendor-class-alpha",
+    );
+    let vendor_nonmatching = with_additional(
+        AvpHeader::vendor(base::AVP_CLASS, apps::VENDOR_ID_3GPP, false),
+        b"vendor-class-bravo",
+    );
+    assert_eq!(
+        vendor_retained.compare_replay_payload(&vendor_matching),
+        swm::SwmReplayPayloadComparison::Same
+    );
+    assert_eq!(
+        vendor_retained.compare_replay_payload(&vendor_nonmatching),
+        swm::SwmReplayPayloadComparison::Different
+    );
+    assert!(!vendor_retained.same_replay_payload(&vendor_nonmatching));
+
+    let class_free = parsed_request_envelope(&str_wire());
+    assert_eq!(
+        class_free.compare_replay_payload(&class_free.clone()),
+        swm::SwmReplayPayloadComparison::Same
+    );
 }
 
 #[test]

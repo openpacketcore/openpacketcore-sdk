@@ -1101,7 +1101,7 @@ actions remain unchanged.
 
 | AVP | Wire contract | Typed projection and action boundary | Evidence |
 |:----|:--------------|:-------------------------------------|:---------|
-| `Class` | IETF 25, OctetString, V/P clear, M set, repeated; empty values valid | `SwmClassAvps` retains canonical headers, exact value bytes, and wire order behind a redacted opaque API. The independent typed limit is 128 occurrences and 4096 aggregate value octets. `SwmClassAvpUpdate::{Unchanged, Replace}` preserves the RFC 6733 §8.20 distinction between absence and replacement. Clone/move helpers replace Class values in typed RAR/STR additional AVPs without downstream raw reconstruction. | Independent zero/one/multiple/zero-length DEA fixtures; exact STR transfer; count/aggregate/header/vendor/flag/length failures; redaction; correlated RAA/AAA replacement and absent-update tests. |
+| `Class` | IETF 25, OctetString, V/P clear, M set, repeated; empty values valid | `SwmClassAvps` retains canonical headers, exact value bytes, and wire order behind a redacted opaque API. Public equality for all opaque retained AVPs compares redaction-safe metadata only and cannot distinguish same-shape candidate bytes. Public RAR/STR/ASR/DER replay preflight returns `OpaqueClassUncomparable` before comparing bytes if either candidate recursively contains IETF Class; its compatibility boolean returns false. Class-free internal security bindings remain byte-exact. The independent typed limit is 128 occurrences and 4096 aggregate value octets. `SwmClassAvpUpdate::{Unchanged, Replace}` preserves the RFC 6733 §8.20 distinction between absence and replacement. Clone/move helpers replace Class values in typed RAR/RAA/STR additional AVPs without downstream raw reconstruction. | Independent zero/one/multiple/zero-length DEA fixtures; exact RAR/RAA/STR transfer; full RAR/RAA then Class-free AAR followed by AAA replacement/absence; matching/nonmatching and malformed-flag Class preflight for RAR/STR/ASR/DER; vendor-specific code 25; exact Class-free top-level and nested DER/gateway bindings; emergency retry and agent-delivery fail-closed tests; count/aggregate/header/vendor/flag/length failures; atomic capacity failure; redaction; correlated RAA/AAA replacement and absent-update tests. |
 | `Session-Binding` | IETF 270, Unsigned32, V/P clear, M set, singleton; unknown bits retained | `SwmSessionBinding` projects the defined RE_AUTH, STR, and ACCOUNTING bits as required/prohibited Destination-Host facts. Absence applies the RFC default with all three requirements clear/required. Raw DEA exposes presence only; actionable values require `SwmCorrelatedDiameterEapResponse::authorization_session_routing`. | STR-bit set/clear, unknown-bit, duplicate, width, flags, vendor, and RFC §8.18 cross-field fixtures. |
 | `Session-Server-Failover` | IETF 271, Enumerated width, V/P clear, M set, singleton | All four RFC 6733 §8.18 values are typed. Unassigned values fail closed with bounded, value-free decode diagnostics and cannot enter typed routing state. Absence is effective `REFUSE_SERVICE`; only TRY_AGAIN and TRY_AGAIN_ALLOW_SERVICE permit preparing a hostless STR retry. The AVP is rejected when all three defined Session-Binding bits are set. | Absent/all-four-assigned/unassigned-boundary fixtures, singleton/type/header failures, contradictory decode/setter failures, non-DEA parse/build rejection, and delivery-action tests. |
 
@@ -1113,6 +1113,69 @@ omits Destination-Host according to the STR bit. A request dispatched through
 a DRA therefore never substitutes the authenticated transport-agent identity
 for the final server identity. Host, realm, session, raw Class values, and raw
 routing values are absent from `Debug`, `Display`, and errors.
+
+##### Opaque equality and duplicate-preflight boundary
+
+`SwmAdditionalAvp::PartialEq` compares only code, Vendor-Id, flags, and value
+length for every retained opaque AVP. Consequently, derived model equality is
+safe for diagnostics and structural assertions but is not a transaction,
+cache, authorization, or correlation predicate.
+
+RAR, STR, ASR, and DER envelopes provide
+`SwmReplayPayloadComparison::{Same, Different, OpaqueClassUncomparable}`. The
+IETF `(vendor absent, code 25)` identity selects the opaque result regardless
+of flags; vendor-specific code 25 remains ordinary exactly comparable data.
+DER scanning includes sealed top-level extensions and retained children of
+QoS-Capability, QoS-Profile-Template, Supported-Features, and
+OC-Supported-Features. Proxy-Info is compared exactly as one retained routing
+AVP and is not recursively inspected as application extension data.
+
+For Class-free requests, private comparators preserve exact retained-value
+semantics for duplicate caches, ordered Proxy-Info correlation, DER request
+bindings, nested access context, gateway context, and emergency identity
+recovery. A Class-bearing candidate instead fails closed before byte
+comparison. Agent-delivery-failure answers also refuse to create a canonical
+request digest for a recursively Class-bearing DER. Exact retransmission of an
+already committed opaque request or answer uses the transport-owned
+`OwnedMessage`; no public digest or candidate comparator is exposed.
+
+##### Class replay precedence in server-initiated re-authorization
+
+The access-client replay leg is RAA, not the following AAR. This decision was
+made from the following exact public standards artifacts:
+
+| Artifact | Sections read | SHA-256 |
+|:---------|:--------------|:--------|
+| [RFC 6733 canonical text](https://www.rfc-editor.org/rfc/rfc6733.txt) | §§8.3.2 and 8.20 (with §§1.1 and 3.2 for CCF interpretation) | `b0117adedd43f9f44e444f64cd7360709c351aa27ea288d9c664c2800da8fa26` |
+| [RFC 4005 canonical text](https://www.rfc-editor.org/rfc/rfc4005.txt) | §§3.4 and 10.1 | `fcca15c171fea9347301ebb71c330db4fe3ff00d999a1af754b7d8bf8de273db` |
+| [RFC 7155 canonical text](https://www.rfc-editor.org/rfc/rfc7155.txt) | §§3.4 and 5.1 | `f100a5a47def22bda012369e8926f5d17c57b9a73a0fe4daeac16bb01b272cd5` |
+| [3GPP TS 29.273 V18.6.0 PDF](https://www.etsi.org/deliver/etsi_ts/129200_129299/129273/18.06.00_60/ts_129273v180600p.pdf) | §§7.1.2.5.1, 7.2.2.1.3, 7.2.2.4.2, and 7.2.3.1 | `63f400f82807f1622cb29930bcf8133b8f9f77676cf942463549503acc0d04e9` |
+
+The TS PDF was read through `pdftotext -layout`; the exact derived text had
+SHA-256
+`bbbbdf136390afb9b0b073eb83ae7bd3ce00fed40cefab750879e58e52baac57`.
+The PDF remains the normative artifact; the derived digest records the
+layout-preserving bytes used for this review.
+
+RFC 6733 §8.20 requires retained Class occurrences on subsequent
+re-authorization messages, and §8.3.2 requires a successful RAA to be followed
+by an application-specific authentication and/or authorization message.
+TS 29.273 §7.1.2.5.1 specializes that sequence as RAR/RAA followed by AAR/AAA.
+RFC 4005 §3.4, retained by RFC 7155 §3.4, explicitly permits repeated Class on
+the client-originated RAA. TS 29.273 §7.2.2.4.2 gives that SWm leg the RAA
+direction and an RFC 4005-based CCF ending in `*[ AVP ]`. In contrast,
+RFC 4005 §10.1 and RFC 7155 §5.1 explicitly assign Class cardinality zero in
+AAR. TS 29.273 §7.2.2.1.3 ends its SWm AAR CCF with the same generic
+`*[ AVP ]`, and §7.2.3.1 requires support for RFC 6733 base AVPs, but neither
+clause names Class in AAR or expressly overrides that zero-occurrence rule.
+The named prohibition therefore controls over an inference from the wildcard
+and support language.
+
+`SwmClassAvps::{clone,move}_into_re_auth_answer` implements that selected RAA
+leg. RAA remains syntactically compatible with its existing repeated-Class
+command definition, while AAR remains fail-closed for Class. A later correlated
+AAA with Class replaces the retained set; one without Class leaves it
+unchanged.
 
 RFC 6733 §8.18 permits Session-Server-Failover only when Session-Binding is
 absent or at least one defined binding bit is zero. Decode, public originated
@@ -1165,15 +1228,19 @@ Identifier and performs a one-way transition that sets T while preserving the
 End-to-End Identifier and AVP bytes. An answer arriving on the old connection,
 or using the old Hop-by-Hop Identifier on the replacement connection, then
 fails correlation. Ordinary timer retries do not set T.
-`same_replay_payload` adds a stricter typed-payload guard on top of RFC 6733
-duplicate identity. It gives a server-side duplicate cache a redaction-safe
-boolean comparison over the End-to-End Identifier, P bit, every typed request
-fact, ordered Route-Record and extension AVPs, and the exact ordered Proxy-Info
-chain. It ignores the Hop-by-Hop Identifier, T bit, and authenticated
-expected-answer peer binding that may legitimately change across failover. For
-retained AVPs it ignores only the derived header length, which encoding
-recomputes from the value; code, flags, Vendor-Id, and value must match. The
-operation does not expose a digest, raw AVP bytes, or retained values.
+`compare_replay_payload` adds a stricter typed-payload guard on top of RFC 6733
+duplicate identity. For Class-free STRs, it returns `Same` or `Different` from
+a byte-exact comparison of the End-to-End Identifier, P bit, every typed
+request fact, ordered Route-Record and extension AVPs, and the exact ordered
+Proxy-Info chain. It ignores the Hop-by-Hop Identifier, T bit, authenticated
+expected-answer peer binding, and encoder-derived AVP length that may
+legitimately change or be recomputed across failover. If either request
+contains IETF Class, it instead returns `OpaqueClassUncomparable` before
+comparing retained candidate bytes. The source-compatible
+`same_replay_payload` returns true only for `Same`, so it returns false for
+both `Different` and the opaque case. Exact replay of an already accepted
+Class-bearing duplicate must use committed transport-owned wire state rather
+than a public digest or candidate comparator.
 `build_swm_session_termination_answer` can answer only that
 envelope and copies all correlation material and Proxy-Info in wire order.
 `correlate_answer` consumes independently parsed request/answer envelopes and
@@ -1313,16 +1380,20 @@ realm matching is ASCII case-insensitive. An answer arriving on the old
 connection, or using the old Hop-by-Hop Identifier on the replacement
 connection, fails closed.
 
-`SwmAbortSessionRequestEnvelope::same_replay_payload` provides the stricter
-typed-payload preflight needed before a duplicate cache reuses a committed ASA.
-It requires the End-to-End Identifier, P, every typed request field, exact
+`SwmAbortSessionRequestEnvelope::compare_replay_payload` provides the stricter
+typed-payload preflight used before a duplicate cache reuses a committed ASA.
+For Class-free ASRs, it returns `Same` or `Different` from a byte-exact
+comparison of the End-to-End Identifier, P, every typed request field, exact
 optional-field presence, ordered Route-Record/additional AVPs, and the raw
 ordered Proxy-Info chain. It ignores Hop-by-Hop, T, expected-answer peer
-binding, and only the derived retained-AVP length; retained code, flags,
-Vendor-Id, and value stay exact. The standardized SWm ASR grammar has no
-dedicated Abort-Cause field. `Auth-Session-State` is compared exactly, and any
-abort-cause-like deployment extension remains an opaque additional AVP whose
-header, value, and order are compared without exposing them.
+binding, and only the derived retained-AVP length. If either request contains
+IETF Class, it returns `OpaqueClassUncomparable` before comparing retained
+candidate bytes; `same_replay_payload` returns false for that result as well as
+for `Different`. Exact replay of an already accepted Class-bearing duplicate
+uses committed transport-owned wire state. The standardized SWm ASR grammar
+has no dedicated Abort-Cause field. `Auth-Session-State` remains exact for
+Class-free comparison, and any abort-cause-like deployment extension remains
+an opaque additional AVP.
 
 For the same typed ASA, T-clear and same-Hop T-set duplicates rebuild
 byte-identical answer bytes. A failover duplicate with a newly allocated
@@ -1436,14 +1507,18 @@ replay and repeated AAR retrieval are byte-identical within each state.
 Duplicate detection, retry timers, cache lifetime, session lookup, and policy
 mutation remain downstream responsibilities.
 
-`SwmReAuthRequestEnvelope::same_replay_payload` gives a server-side duplicate
-cache the corresponding RAR preflight. It requires the End-to-End Identifier,
-P, every typed request fact including Re-Auth-Request-Type, ordered
-Route-Record/additional AVPs, and the exact Proxy-Info chain. Hop-by-Hop, T,
-expected-answer peer binding, and encoder-derived retained-AVP length are the
-only exclusions; code, flags, Vendor-Id, value, and ordering remain exact. The
-boolean result and diagnostics expose none of those retained values, and the
-operation owns no cache or authorization policy.
+`SwmReAuthRequestEnvelope::compare_replay_payload` gives a server-side
+duplicate cache the corresponding RAR preflight. For Class-free RARs, it
+returns `Same` or `Different` from a byte-exact comparison of the End-to-End
+Identifier, P, every typed request fact including Re-Auth-Request-Type,
+ordered Route-Record/additional AVPs, and the exact Proxy-Info chain.
+Hop-by-Hop, T, expected-answer peer binding, and encoder-derived retained-AVP
+length are excluded. If either request contains IETF Class, it returns
+`OpaqueClassUncomparable` before comparing retained candidate bytes;
+`same_replay_payload` returns false for that result as well as for
+`Different`. Exact replay of an already accepted Class-bearing duplicate uses
+committed transport-owned wire state, not a public digest or candidate
+comparator. The operation owns no cache or authorization policy.
 
 Both exchanges correlate the authenticated connection generation, Hop-by-Hop
 and End-to-End identifiers, P, every present Session-Id/User-Name, the ordered
