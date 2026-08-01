@@ -137,28 +137,14 @@ pub(crate) struct DecodedIeSequence<'a> {
 
 type IeDecodeFilter<'f> = &'f dyn Fn(u8, u8, usize, Option<(u8, u8)>) -> bool;
 type IeRepeatableLimit<'f> = &'f dyn Fn(u8, u8, usize, Option<(u8, u8)>) -> Option<usize>;
-
-/// IE types whose malformed value is discarded instead of failing the decode.
+/// Resolves whether the IE at an arrival slot is presence-Optional.
 ///
-/// TS 29.274 clause 7.7.8: "The receiver of a GTP signalling message including
-/// an optional information element with a Value that is not in the range
-/// defined for this information element value shall discard this IE, but shall
-/// treat the rest of the message as if this IE was absent and continue
-/// processing", and "All semantically incorrect optional information elements
-/// in a GTP signalling message shall be treated as not present in the
-/// message." Clause 7.7.7 reaches the same disposition for a length
-/// inconsistency in an Extendable IE: the IE "shall be discarded" and the
-/// "Invalid length" error response is owed only "if the IE was received as a
-/// Mandatory IE or a verifiable Conditional IE in a Request message".
-///
-/// Membership is decided by *presence*, which is the axis TS 29.274 itself
-/// uses to split receiver behaviour. Node Identifier is presence O on its only
-/// row in this profile (Table 7.2.1-1, 3GPP AAA Server Identifier, Create
-/// Session Request, instance 0). The typed IEs that are Mandatory or
-/// Conditional where this profile receives them keep failing closed, because
-/// for those the same clauses direct a receiver to reject the message and name
-/// the Cause to return.
-const DISCARD_MALFORMED_OPTIONAL_IE_TYPES: &[u8] = &[IE_TYPE_NODE_IDENTIFIER];
+/// Arguments mirror [`IeDecodeFilter`]: `(ie_type, instance, depth, parent_ie)`.
+/// TS 29.274 clauses 7.7.7 and 7.7.8 split receiver behaviour on *presence*,
+/// which is a property of the procedure, the direction and the message grammar
+/// rather than of the IE type alone, so the discard gate consults a resolver
+/// the profiled receiver supplies instead of a type allowlist.
+type IePresenceResolver<'f> = &'f dyn Fn(u8, u8, usize, Option<(u8, u8)>) -> bool;
 
 /// Whether a decode applies the TS 29.274 clause 7.7.8 receiver rule.
 ///
@@ -173,13 +159,11 @@ pub(crate) enum MalformedOptionalIePolicy {
     /// therefore establish that the IE is presence-Optional at this slot:
     /// discard the malformed IE and keep processing the rest of the message.
     ///
-    /// The crate does not yet meet that bar everywhere it selects this
-    /// variant. `s2b` picks it from the decode purpose alone, so the
-    /// non-procedure-aware receive branches reach it without consulting the
-    /// receive disposition table, and presence there rests on
-    /// [`DISCARD_MALFORMED_OPTIONAL_IE_TYPES`] rather than on a resolved per-IE
-    /// profile. That gap is a declared residual, recorded at the selection site
-    /// in `s2b`; a new entry in that allowlist inherits it.
+    /// Selecting this variant is necessary but not sufficient: the discard gate
+    /// in [`IeDecodePolicy::discards_malformed`] additionally requires a
+    /// presence resolver that reports the arrival slot as Optional. A caller
+    /// that selects `Discard` without supplying a resolver (or whose resolver
+    /// reports Mandatory, Conditional or unresolvable) still fails closed.
     Discard,
     /// The fail-closed default. Used for sender self-validation -- a malformed
     /// IE the crate is about to put on the wire is a build failure, because
@@ -197,18 +181,21 @@ struct IeDecodePolicy<'p> {
     malformed_optional: MalformedOptionalIePolicy,
     filter: Option<IeDecodeFilter<'p>>,
     scoped_repeatable_limit: Option<IeRepeatableLimit<'p>>,
+    slot_is_optional: Option<IePresenceResolver<'p>>,
 }
 
 impl<'p> IeDecodePolicy<'p> {
     const fn legacy(
         pgw_triggered_request: bool,
         malformed_optional: MalformedOptionalIePolicy,
+        slot_is_optional: Option<IePresenceResolver<'p>>,
     ) -> Self {
         Self {
             legacy_pgw_triggered_request: pgw_triggered_request,
             malformed_optional,
             filter: None,
             scoped_repeatable_limit: None,
+            slot_is_optional,
         }
     }
 
@@ -222,30 +209,64 @@ impl<'p> IeDecodePolicy<'p> {
         filter: IeDecodeFilter<'p>,
         repeatable_limit: IeRepeatableLimit<'p>,
         malformed_optional: MalformedOptionalIePolicy,
+        slot_is_optional: Option<IePresenceResolver<'p>>,
     ) -> Self {
         Self {
             legacy_pgw_triggered_request: false,
             malformed_optional,
             filter: Some(filter),
             scoped_repeatable_limit: Some(repeatable_limit),
+            slot_is_optional,
         }
     }
 
-    /// Whether `error` from decoding `ie_type` is discarded rather than
-    /// propagated, per TS 29.274 clause 7.7.8.
+    /// Whether `error` from decoding the IE at `(ie_type, instance, depth,
+    /// parent_ie)` is discarded rather than propagated, per TS 29.274 clause
+    /// 7.7.8.
+    ///
+    /// The clause conditions the discard on the IE being presence-Optional *at
+    /// the slot it arrived in*, so both gates must pass: the frame holds a
+    /// receiver profile ([`MalformedOptionalIePolicy::Discard`]) and the
+    /// profile's resolver reports the slot as Optional. A frame with no
+    /// resolver cannot establish presence and fails closed.
     ///
     /// Clause 7.7.8 scopes the discard to an IE "with a Value that is not in
     /// the range defined for this information element value", so only a
-    /// failure to interpret the value qualifies. `DecodeErrorCode::Truncated`
-    /// and `InvalidLength` are the two the clause 8.107 value decoder raises;
-    /// `LengthOverflow` is the offset arithmetic guarding the decode, not a
-    /// statement about the received octets, and must still fail the message.
-    fn discards_malformed(&self, ie_type: u8, error: &Gtpv2cDecodeError) -> bool {
+    /// failure to interpret the value qualifies. This arm catches value-decode
+    /// errors only -- IE framing errors arrive through the iterator arm below,
+    /// where the sequence can no longer be resynchronised -- so the qualifying
+    /// codes are the ones a value decoder raises for an out-of-range value:
+    /// `Truncated` and `InvalidLength` (the clause 8.107 decoders), plus
+    /// `Structural`, which is how the value decoders that run a sub-codec (the
+    /// Bearer TFT via TS 24.008) and the semantic range checks report a value
+    /// that is syntactically or semantically out of range. `LengthOverflow` is
+    /// the offset arithmetic guarding the decode, not a statement about the
+    /// received octets, and must still fail the message.
+    ///
+    /// Admitting `Structural` rests on an invariant of the value decoders a
+    /// presence-O slot can reach: they raise it only for a received value that
+    /// is syntactically or semantically out of range -- a clause 7.7.8 fault --
+    /// never for an internal invariant or a resource limit (`DepthExceeded` and
+    /// `LengthOverflow` stay excluded above). A future value decoder added to a
+    /// presence-O slot must preserve that distinction, or an internal fault
+    /// there would be silently discarded instead of failing the message.
+    fn discards_malformed(
+        &self,
+        ie_type: u8,
+        instance: u8,
+        depth: usize,
+        parent_ie: Option<(u8, u8)>,
+        error: &Gtpv2cDecodeError,
+    ) -> bool {
         matches!(self.malformed_optional, MalformedOptionalIePolicy::Discard)
-            && DISCARD_MALFORMED_OPTIONAL_IE_TYPES.contains(&ie_type)
+            && self
+                .slot_is_optional
+                .is_some_and(|resolve| resolve(ie_type, instance, depth, parent_ie))
             && matches!(
                 error.code(),
-                DecodeErrorCode::Truncated | DecodeErrorCode::InvalidLength { .. }
+                DecodeErrorCode::Truncated
+                    | DecodeErrorCode::InvalidLength { .. }
+                    | DecodeErrorCode::Structural { .. }
             )
     }
 }
@@ -3870,7 +3891,7 @@ impl<'a> TypedIe<'a> {
             ctx,
             depth,
             base_offset,
-            IeDecodePolicy::legacy(false, MalformedOptionalIePolicy::Reject),
+            IeDecodePolicy::legacy(false, MalformedOptionalIePolicy::Reject, None),
             &mut duplicate_evidence,
         )
         .map_err(DecodeError::from)
@@ -4281,7 +4302,7 @@ pub fn decode_typed_ie_sequence<'a>(
         input,
         ctx,
         IeSequencePosition::root(depth),
-        IeDecodePolicy::legacy(false, MalformedOptionalIePolicy::Reject),
+        IeDecodePolicy::legacy(false, MalformedOptionalIePolicy::Reject, None),
         &mut duplicate_evidence,
     )
     .map_err(DecodeError::from)
@@ -4292,13 +4313,14 @@ pub(crate) fn decode_typed_ie_sequence_with_evidence<'a>(
     ctx: DecodeContext,
     depth: usize,
     malformed_optional: MalformedOptionalIePolicy,
+    slot_is_optional: Option<IePresenceResolver<'_>>,
 ) -> Result<DecodedIeSequence<'a>, Gtpv2cDecodeError> {
     let mut collector = DuplicateIeCollector::default();
     let ies = decode_typed_ie_sequence_at(
         input,
         ctx,
         IeSequencePosition::root(depth),
-        IeDecodePolicy::legacy(false, malformed_optional),
+        IeDecodePolicy::legacy(false, malformed_optional, slot_is_optional),
         &mut collector,
     )?;
     let (duplicate_evidence, omitted_duplicate_count) = collector.into_parts();
@@ -4319,13 +4341,14 @@ pub(crate) fn decode_pgw_triggered_request_ie_sequence_with_evidence<'a>(
     input: &'a [u8],
     ctx: DecodeContext,
     malformed_optional: MalformedOptionalIePolicy,
+    slot_is_optional: Option<IePresenceResolver<'_>>,
 ) -> Result<DecodedIeSequence<'a>, Gtpv2cDecodeError> {
     let mut collector = DuplicateIeCollector::default();
     let ies = decode_typed_ie_sequence_at(
         input,
         ctx,
         IeSequencePosition::root(0),
-        IeDecodePolicy::legacy(true, malformed_optional),
+        IeDecodePolicy::legacy(true, malformed_optional, slot_is_optional),
         &mut collector,
     )?;
     let (duplicate_evidence, omitted_duplicate_count) = collector.into_parts();
@@ -4344,13 +4367,19 @@ pub(crate) fn decode_s2b_receive_ie_sequence_with_evidence<'a>(
     filter: IeDecodeFilter<'_>,
     scoped_repeatable_limit: IeRepeatableLimit<'_>,
     malformed_optional: MalformedOptionalIePolicy,
+    slot_is_optional: Option<IePresenceResolver<'_>>,
 ) -> Result<DecodedIeSequence<'a>, Gtpv2cDecodeError> {
     let mut collector = DuplicateIeCollector::default();
     let ies = decode_typed_ie_sequence_at(
         input,
         ctx,
         IeSequencePosition::root(0),
-        IeDecodePolicy::scoped(filter, scoped_repeatable_limit, malformed_optional),
+        IeDecodePolicy::scoped(
+            filter,
+            scoped_repeatable_limit,
+            malformed_optional,
+            slot_is_optional,
+        ),
         &mut collector,
     )?;
     let (duplicate_evidence, omitted_duplicate_count) = collector.into_parts();
@@ -4499,6 +4528,7 @@ fn decode_typed_ie_sequence_at_inner<'a>(
                 }
 
                 let ie_type = raw.ie_type;
+                let instance = raw.instance;
                 let typed = match TypedIe::decode_from_raw_with_evidence(
                     raw,
                     ctx,
@@ -4523,11 +4553,27 @@ fn decode_typed_ie_sequence_at_inner<'a>(
                     // the genuine IE under `First`, and in both cases naming a
                     // cause the wire does not support.
                     //
-                    // Only the value decode is caught: IE framing errors come
-                    // from the iterator arm below, where the sequence can no
-                    // longer be resynchronised, and only the types clauses
-                    // 7.7.7/7.7.8 put in the optional bucket are eligible.
-                    Err(error) if policy.discards_malformed(ie_type, &error) => continue,
+                    // Only the value decode is caught: an IE framing fault at
+                    // this level comes from the iterator arm below, where this
+                    // sequence can no longer be resynchronised and must fail.
+                    // A nested framing fault inside a grouped IE instead
+                    // surfaces one level up as the group's own value-decode
+                    // error, so an Optional group is discarded together with
+                    // its malformed member while the enclosing sequence stays
+                    // resynchronisable. Only the slots clauses 7.7.7/7.7.8 put
+                    // in the optional bucket -- resolved by presence, not by
+                    // type -- are eligible.
+                    Err(error)
+                        if policy.discards_malformed(
+                            ie_type,
+                            instance,
+                            position.depth,
+                            position.parent_ie,
+                            &error,
+                        ) =>
+                    {
+                        continue;
+                    }
                     Err(error) => return Err(error),
                 };
                 // Recorded only for an IE that survived its value decode, so a

@@ -473,10 +473,13 @@ coverage.
      validated `NodeIdentifier::new` constructor bounds each subfield to the
      255 octets its length field can express, so encoding is infallible and
      performs no truncating cast.
-   - A malformed Node Identifier is discarded, not rejected, by the *profiled
+   - A malformed typed IE is discarded, not rejected, by the *profiled
      receiver* — `S2bMessage::decode` and `S2bMessage::decode_with_diagnostics`
-     — per clauses 7.7.7 and 7.7.8. Both clauses split receiver behaviour on
-     the IE's *presence*.
+     — **iff the receiver resolves the IE's presence at the arrival slot as
+     Optional**, per clauses 7.7.7 and 7.7.8. Both clauses split receiver
+     behaviour on the IE's *presence*, not its type, so the discard is keyed on
+     `(procedure, direction, scope, ie_type, instance)` resolved from the S2b
+     receive grammar rather than on an IE-type allowlist.
      Clause 7.7.7 governs a length inconsistency in an Extendable IE: "If the
      received value of the Length field and the actual length of the extendable
      length IE are consistent, but the length is less than the number of fixed
@@ -489,30 +492,74 @@ coverage.
      "shall discard this IE, but shall treat the rest of the message as if this
      IE was absent and continue processing", and "All semantically incorrect
      optional information elements in a GTP signalling message shall be treated
-     as not present in the message." Table 7.2.1-1 lists Node Identifier with
-     presence O, so the receiver rule is discard-and-continue and the "Invalid
-     length" response clause 7.7.7 names is not owed. Cause, F-TEID, PAA, EBI,
-     Bearer Context, and the other typed IEs that are Mandatory or Conditional
-     where this profile receives them continue to fail the decode, which is the
-     same two clauses applied to the other side of the same split;
-     `error_response` remains the layer at which a caller turns such a failure
-     into a Cause.
-   - This is what the crate's own written selection rule picks. `pco.rs`
-     states it: "TS 24.008 10.5.6.3 is explicit that a container whose contents
-     length is not two 'shall be ignored by the receiver', so a malformed
-     instance is skipped rather than rejecting the whole value. That is
-     deliberately unlike the address containers, for which the specification
-     states no such rule and this codec fails closed." Clauses 7.7.7 and 7.7.8
-     do state such a rule and do name the receiver, so IE 176 belongs in the
-     skip bucket and is in it.
-   - The discard is uniform across the profiled receive path. It holds at every
-     validation level (`Structural`, `Strict`, `ProcedureAware`), in every
-     message type this crate models, at every instance 0-15, and nested inside a
-     Bearer Context. At `ProcedureAware` an instance other than 0 is discarded
-     even earlier, by the clause 7.7.9 receive filter, so both routes reach the
-     same result. `Strict` is not an opt-in stricter-than-TS-29.274 mode: it
-     enforces "field cardinality, enum ranges, and critical IE rules", and for
-     an optional IE clause 7.7.8 *is* the range rule and it says discard.
+     as not present in the message."
+   - The presence-O slots the profiled receiver discards, each verified against
+     the presence columns of TS 29.274 V18.8.0: IP Address instance 3 (ePDG IP
+     Address) and Bearer TFT inside the Bearer Context of the Create Session
+     Request (Table 7.2.1-1); PCO at the top level and inside the Bearer
+     Context of the Create Bearer Request (Tables 7.2.3-1 and 7.2.3-2); Bearer
+     Context instance 0 — the "Failed Bearer Contexts" IE — of the Delete
+     Bearer Request (Table 7.2.9.2-1); and Sender F-TEID instance 0 of the
+     Delete Session Request (Table 7.2.9.1-1). Node Identifier (clause 8.107)
+     is folded into the same model: Table 7.2.1-1 lists it with presence O on
+     its only S2b row (the 3GPP AAA Server Identifier) and it is never M or CO
+     anywhere the profile admits it, so it resolves Optional uniformly.
+   - Presence varies by slot, which is why the key is the slot and not the IE
+     type. In the Create Session Request, IP Address instance 0 is the UE Local
+     IP Address, which Table 7.2.1-1 carries as both CO and O (the O row is the
+     PGW-C/SMF-change restoration case); the receiver conservatively fails
+     closed on it — the CO row alone entitles it to the error response, and
+     failing closed is never the dangerous direction — while instance 3 is the
+     ePDG IP Address, presence O. Bearer TFT is O inside the Create Session
+     Request Bearer Context (Table 7.2.1-1) but **M** inside the Create Bearer
+     Request Bearer Context (Table 7.2.3-2); PCO is O in the Create Bearer
+     Request (Tables 7.2.3-1, 7.2.3-2) but C/CO in the Delete Session Request
+     (Table 7.2.9.1-1). A malformed IE at a Mandatory or Conditional slot — and
+     any slot whose presence the receiver cannot resolve — fails the whole
+     decode, which is the same two clauses applied to the other side of the
+     same split; `error_response` remains the layer at which a caller turns
+     such a failure into a Cause.
+   - The Sender F-TEID decision is deliberate. Table 7.2.9.1-1 carries three
+     interface-conditioned rows for F-TEID instance 0 of the Delete Session
+     Request: O (S4/S11), O (S5/S8 and S2a/S2b), and CO (S5/S8 SGW
+     hanging-context cleanup). On the S2b profile the applicable row is the
+     second, presence O; the CO row is SGW/S5-S8-specific. The malformed Sender
+     F-TEID is therefore discarded on S2b.
+   - A malformed Conditional IE fails closed. Clause 7.7.7 owes the error
+     response for a "verifiable Conditional IE"; where verifiability is
+     uncertain, failing closed is the safe conformant choice. The discarded
+     slots above are pure O, not CO.
+   - The discard can diverge by validation level for a malformed IE the grammar
+     does not admit inside an Optional group. At `Structural`/`Strict` there is
+     no clause 7.7.9 filter, so a malformed non-admitted member fails the
+     group's value decode and clause 7.7.8 discards the whole Optional group;
+     at `ProcedureAware` the clause 7.7.9 filter drops the non-admitted member
+     before its value is read, so the group decodes empty and is retained. Both
+     are the two clauses applied as written; a consumer changing level can see
+     an empty Optional grouped IE appear or disappear, but no IE the procedure
+     requires is lost either way.
+   - Residual, deliberately scoped: the presence-O table covers the Request
+     slots issue #585 names, so a malformed Optional IE in a *Response* still
+     fails closed (for example APCO instance 0 is presence O in the Create
+     Session Response, Table 7.2.2-1, yet a malformed one rejects the whole
+     response). Clause 7.7.8 is message-direction-agnostic, so this is a
+     conformance gap rather than the intended disposition; it is pre-existing
+     rather than a regression, it fails closed (the safe direction), and the
+     forced-error-response denial-of-service shape clause 7.7.8 guards against
+     is Request-specific, so the DoS-closure claim above holds. Extending the
+     presence table to the Response grammars is a follow-up.
+   - The discard is uniform across the profiled receive path. The profiled
+     receiver owns `(procedure, direction)` and the grammar at every validation
+     level, so it resolves presence and discards at all three (`Structural`,
+     `Strict`, `ProcedureAware`) — closing the peer-controlled denial of
+     service at the default level rather than only under `ProcedureAware`. It
+     holds in every message type this crate models and nested inside a Bearer
+     Context. At `ProcedureAware` an IE at a slot the grammar does not admit is
+     discarded even earlier, by the clause 7.7.9 receive filter, so both routes
+     reach the same result. `Strict` is not an opt-in stricter-than-TS-29.274
+     mode: it enforces "field cardinality, enum ranges, and critical IE rules",
+     and for an optional IE clause 7.7.8 *is* the range rule and it says
+     discard.
    - It is deliberately *not* uniform across the whole decode surface, because
      the disposition is not a property of the IE type alone. Both clauses
      condition it on the IE's presence at the slot it arrived in, which is a
