@@ -43,8 +43,9 @@ use std::{
 
 use crate::model::{validate_exact_lookup_mark, XfrmLookupMark};
 use crate::{
-    InstallPolicyRequest, InstallSaRequest, RemovePolicyRequest, RemoveSaRequest, XfrmBackend,
-    XfrmCompositeOperation, XfrmError, XfrmInstallObject, XfrmResidueClassification,
+    ExactRemovePolicyRequest, InstallPolicyRequest, InstallSaRequest, RemovePolicyRequest,
+    RemoveSaRequest, XfrmBackend, XfrmCompositeOperation, XfrmError, XfrmInstallObject,
+    XfrmResidueClassification,
 };
 
 /// Typed single-object XFRM install request.
@@ -88,7 +89,7 @@ impl XfrmObjectInstallRequest {
     /// The derivation matches the composite rollback requests: the SA removal
     /// selects the exact destination/protocol/SPI plus lookup mark, and the
     /// policy removal selects the exact selector/direction plus lookup mark.
-    fn removal(&self) -> XfrmObjectRemovalRequest {
+    pub(crate) fn removal(&self) -> XfrmObjectRemovalRequest {
         match self {
             Self::Sa(request) => {
                 let parameters = &request.parameters;
@@ -101,12 +102,26 @@ impl XfrmObjectInstallRequest {
             }
             Self::Policy(request) => {
                 let parameters = &request.parameters;
-                XfrmObjectRemovalRequest::Policy(RemovePolicyRequest {
+                let removal = RemovePolicyRequest {
                     selector: parameters.selector.clone(),
                     direction: parameters.direction,
                     mark: parameters.mark,
-                })
+                };
+                XfrmObjectRemovalRequest::Policy(removal)
             }
+        }
+    }
+
+    pub(crate) const fn policy_if_id(&self) -> Option<u32> {
+        match self {
+            Self::Sa(_) => None,
+            // Linux interprets both an omitted XFRMA_IF_ID and an encoded
+            // zero value as the unscoped identity. Preserve that established
+            // canonicalization for exact recovery.
+            Self::Policy(request) => match request.parameters.if_id {
+                Some(if_id) if if_id != 0 => Some(if_id),
+                _ => None,
+            },
         }
     }
 }
@@ -133,7 +148,7 @@ pub enum XfrmObjectRemovalRequest {
 
 impl XfrmObjectRemovalRequest {
     /// The lookup mark this removal will select with.
-    fn lookup_mark(&self) -> Option<XfrmLookupMark> {
+    pub(crate) fn lookup_mark(&self) -> Option<XfrmLookupMark> {
         match self {
             Self::Sa(request) => request.mark,
             Self::Policy(request) => request.mark,
@@ -261,6 +276,7 @@ impl fmt::Debug for XfrmObjectInstallRecoveryClassification {
 #[derive(Clone)]
 pub struct XfrmObjectInstallRecoveryPlan {
     candidate: Option<XfrmObjectRemovalRequest>,
+    policy_if_id: Option<u32>,
     indeterminate: Option<XfrmCompositeOperation>,
     supervision_lost: bool,
     generation: Arc<()>,
@@ -275,6 +291,18 @@ impl XfrmObjectInstallRecoveryPlan {
     /// Exact removal candidate, when one remains.
     pub const fn candidate(&self) -> Option<&XfrmObjectRemovalRequest> {
         self.candidate.as_ref()
+    }
+
+    /// Nonzero Linux XFRM interface scope of a policy candidate.
+    ///
+    /// This additive accessor keeps the established two-variant
+    /// [`XfrmObjectRemovalRequest`] source-compatible while allowing
+    /// privileged classification code to distinguish an interface-scoped
+    /// policy from an otherwise identical unscoped policy. `None` means the
+    /// candidate is an SA or an unscoped policy; zero is canonicalized to
+    /// `None` to match Linux identity semantics.
+    pub const fn policy_if_id(&self) -> Option<u32> {
+        self.policy_if_id
     }
 
     /// Operation whose final result was not observed, when any.
@@ -313,6 +341,7 @@ impl fmt::Debug for XfrmObjectInstallRecoveryPlan {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("XfrmObjectInstallRecoveryPlan")
             .field("candidate_present", &self.candidate.is_some())
+            .field("policy_interface_scoped", &self.policy_if_id.is_some())
             .field("indeterminate_operation", &self.indeterminate)
             .field("supervision_lost", &self.supervision_lost)
             .finish_non_exhaustive()
@@ -322,6 +351,7 @@ impl fmt::Debug for XfrmObjectInstallRecoveryPlan {
 impl PartialEq for XfrmObjectInstallRecoveryPlan {
     fn eq(&self, other: &Self) -> bool {
         self.candidate == other.candidate
+            && self.policy_if_id == other.policy_if_id
             && self.indeterminate == other.indeterminate
             && self.supervision_lost == other.supervision_lost
             && Arc::ptr_eq(&self.generation, &other.generation)
@@ -606,6 +636,9 @@ impl JournalState {
         let terminal = self.committed || self.recovered;
         XfrmObjectInstallRecoveryPlan {
             candidate: (!terminal && self.possible).then(|| inner.removal.clone()),
+            policy_if_id: (!terminal && self.possible)
+                .then_some(inner.policy_if_id)
+                .flatten(),
             indeterminate: if terminal { None } else { self.uncertainty },
             supervision_lost: !terminal
                 && (self.runner_supervision_lost || self.recovery_supervision_lost),
@@ -619,6 +652,7 @@ struct JournalInner {
     install_operation: XfrmCompositeOperation,
     remove_operation: XfrmCompositeOperation,
     removal: XfrmObjectRemovalRequest,
+    policy_if_id: Option<u32>,
     state: Mutex<JournalState>,
 }
 
@@ -646,6 +680,7 @@ impl XfrmObjectInstallJournal {
         install_operation: XfrmCompositeOperation,
         remove_operation: XfrmCompositeOperation,
         removal: XfrmObjectRemovalRequest,
+        policy_if_id: Option<u32>,
     ) -> Self {
         Self {
             inner: Arc::new(JournalInner {
@@ -653,6 +688,7 @@ impl XfrmObjectInstallJournal {
                 install_operation,
                 remove_operation,
                 removal,
+                policy_if_id,
                 state: Mutex::new(JournalState::new()),
             }),
         }
@@ -830,7 +866,17 @@ impl XfrmObjectInstallJournal {
                                 backend.remove_sa(request).await
                             }
                             XfrmObjectRemovalRequest::Policy(request) => {
-                                backend.remove_policy(request).await
+                                match self.inner.policy_if_id {
+                                    Some(if_id) => {
+                                        backend
+                                            .remove_policy_exact(
+                                                ExactRemovePolicyRequest::new(request)
+                                                    .with_if_id(if_id),
+                                            )
+                                            .await
+                                    }
+                                    None => backend.remove_policy(request).await,
+                                }
                             }
                         };
                         match removal {
@@ -988,6 +1034,7 @@ impl XfrmStagedObjectInstall {
             request.install_operation(),
             request.remove_operation(),
             request.removal(),
+            request.policy_if_id(),
         );
         Self { request, journal }
     }
@@ -1106,9 +1153,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        AllocateSpiRequest, IpAddress, PolicyParameters, QuerySaRequest, RekeyPolicyRequest,
-        RekeySaRequest, SaParameters, SaState, SpiAllocation, XfrmAction, XfrmDirection, XfrmId,
-        XfrmLookupMark, XfrmMode, XfrmProbe, XfrmSelector, XfrmTemplate,
+        AllocateSpiRequest, IpAddress, MockXfrmBackend, PolicyParameters, QuerySaRequest,
+        RekeyPolicyRequest, RekeySaRequest, SaParameters, SaState, SpiAllocation, XfrmAction,
+        XfrmDirection, XfrmId, XfrmLookupMark, XfrmMode, XfrmProbe, XfrmSelector, XfrmTemplate,
     };
 
     #[derive(Debug, Default)]
@@ -3020,6 +3067,95 @@ mod tests {
             .await
             .expect("owned classification removes the exact marked policy");
         assert_eq!(backend.removed_policy_requests(), vec![expected]);
+    }
+
+    #[tokio::test]
+    async fn scoped_policy_recovery_preserves_if_id_and_leaves_unscoped_twin() {
+        let backend = Arc::new(MockXfrmBackend::new());
+        let unscoped = policy_parameters();
+        backend
+            .install_policy(InstallPolicyRequest {
+                parameters: unscoped.clone(),
+            })
+            .await
+            .expect("unscoped foreign policy installs");
+
+        let mut scoped = unscoped.clone();
+        scoped.if_id = Some(616);
+        let staged =
+            XfrmStagedObjectInstall::new(XfrmObjectInstallRequest::Policy(InstallPolicyRequest {
+                parameters: scoped,
+            }));
+        let journal = staged.journal();
+        staged
+            .run(backend.clone())
+            .await
+            .expect("scoped owned policy installs");
+
+        let plan = journal.recovery_plan();
+        let expected = ExactRemovePolicyRequest::new(RemovePolicyRequest::new(
+            unscoped.selector.clone(),
+            unscoped.direction,
+        ))
+        .with_if_id(616);
+        assert_eq!(
+            plan.candidate(),
+            Some(&XfrmObjectRemovalRequest::Policy(
+                expected.request().clone()
+            ))
+        );
+        assert_eq!(plan.policy_if_id(), Some(616));
+        journal
+            .recover(
+                backend.clone(),
+                classify(&plan, XfrmResidueClassification::Owned),
+            )
+            .await
+            .expect("owned scoped policy is removed exactly");
+
+        backend
+            .remove_policy(RemovePolicyRequest::new(
+                unscoped.selector,
+                unscoped.direction,
+            ))
+            .await
+            .expect("unscoped foreign twin survives exact recovery");
+    }
+
+    #[tokio::test]
+    async fn zero_policy_if_id_recovery_uses_the_installed_unscoped_identity() {
+        let backend = Arc::new(MockXfrmBackend::new());
+        let mut parameters = policy_parameters();
+        parameters.if_id = Some(0);
+        let removal = RemovePolicyRequest::new(parameters.selector.clone(), parameters.direction);
+        let staged =
+            XfrmStagedObjectInstall::new(XfrmObjectInstallRequest::Policy(InstallPolicyRequest {
+                parameters,
+            }));
+        let journal = staged.journal();
+
+        staged
+            .run(backend.clone())
+            .await
+            .expect("zero interface id installs as an unscoped policy");
+        let plan = journal.recovery_plan();
+        assert_eq!(
+            plan.candidate(),
+            Some(&XfrmObjectRemovalRequest::Policy(removal.clone()))
+        );
+        assert_eq!(plan.policy_if_id(), None);
+
+        journal
+            .recover(
+                backend.clone(),
+                classify(&plan, XfrmResidueClassification::Owned),
+            )
+            .await
+            .expect("the canonical unscoped policy remains recoverable");
+        assert!(matches!(
+            backend.remove_policy(removal).await,
+            Err(XfrmError::NotFound)
+        ));
     }
 
     /// Poll a future to completion without any Tokio runtime context.

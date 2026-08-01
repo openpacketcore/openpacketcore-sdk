@@ -8,6 +8,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Durable staged-object ownership recovery — `opc-ipsec-xfrm`:**
+  `LinuxXfrmBackend::bind_current_network_namespace_with_object_recovery` now
+  authenticates and permanently leases `XfrmObjectInstallRecoveryStore` on the
+  namespace actor before returning a mutation-capable backend, which can then
+  run, finalize, or recover SA-only and policy-only create-exclusive installs
+  across process loss. The
+  fixed-size durable records retain only opaque correlation, object kind,
+  namespace/writer incarnation, product generation, writer epoch, outcome,
+  and independent proof-keyed fingerprints of the exact deletion identity and
+  complete install request; request values and key material are never persisted
+  or rendered. A terminal `AlreadyExists` is durable
+  `NoMutation` and cannot authorize removal. Missing, malformed, duplicated,
+  stale, wrong-key, wrong-request, wrong-namespace, and wrong-incarnation state
+  fails closed. Because Linux deletion has no owner/generation condition, an
+  unresolved acquired/removal record gates every later cooperating actor
+  mutation; exact interface-scoped policy recovery also performs `GETPOLICY`
+  scope proof before `DELPOLICY`. Atomic file publication, durable global
+  epochs, cancellation-safe actor completion, mock SA/policy outcomes, and
+  kill/restart namespace detectors cover the crash-ordering contract.
 - **Bounded IPCP syntax validation in PCO/APCO — `opc-proto-gtpv2c`:**
   `PcoAddressConfiguration::validate_network_contents_ipcp_syntax` traverses
   the same bounded PCO framing cursor as address decode and checks the RFC 1661

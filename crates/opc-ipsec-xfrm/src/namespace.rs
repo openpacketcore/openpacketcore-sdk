@@ -4,9 +4,25 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Instant;
 
+#[cfg(unix)]
+use std::error::Error;
+#[cfg(unix)]
+use std::path::PathBuf;
+
 use async_trait::async_trait;
+#[cfg(target_os = "linux")]
+use nix::libc;
+#[cfg(target_os = "linux")]
+use nix::sys::socket::{getsockopt, socket, AddressFamily, SockFlag, SockType};
+#[cfg(target_os = "linux")]
+use nix::{getsockopt_impl, sockopt_impl};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::counter_resume::{
+    map_backend_error, CounterRecoveryActorRequest, CounterResumeActorRequest,
+    EspCounterReceiptRegistry,
+};
+use crate::model::validate_exact_remove_policy_request;
 #[cfg(target_os = "linux")]
 use crate::observation::linux::LinuxEspPeerObservationKernelSource;
 #[cfg(target_os = "linux")]
@@ -14,21 +30,32 @@ use crate::observation::{
     EspPeerObservationKey, EspPeerObservationRegistration, LinuxEspPeerObservationConfig,
     LinuxEspPeerObservationMonitor,
 };
+#[cfg(unix)]
 use crate::{
-    counter_resume::{
-        map_backend_error, CounterRecoveryActorRequest, CounterResumeActorRequest,
-        EspCounterReceiptRegistry,
+    durable_install::{
+        finalize_durable_object_install as finalize_object_install,
+        recover_durable_object_install as recover_object_install,
+        run_durable_object_install as run_object_install, XfrmObjectInstallDurableOutcome,
+        XfrmObjectInstallRestartOutcome,
     },
+    durable_object::{
+        XfrmObjectInstallDurableError, XfrmObjectInstallDurablePhase,
+        XfrmObjectInstallOperationGeneration, XfrmObjectInstallOperationId,
+        XfrmObjectInstallRecoveryStore, XfrmObjectRecoveryProofKey,
+    },
+    XfrmObjectInstallRequest,
+};
+use crate::{
     outbound_binding::{validate_outbound_request, OutboundSaPolicyExpectation},
     AppliedEspCounterReceipt, EspCounterProofRequirement, EspCounterResumeApplyRequest,
     EspCounterResumeBinding, EspCounterResumeError, EspCounterResumeRecoveryRequest,
     InstalledOutboundSaBinding, OutboundSaBindingError, OutboundSaBindingId,
 };
 use crate::{
-    AllocateSpiRequest, InstallPolicyRequest, InstallSaRequest, LinuxXfrmBackend, QuerySaRequest,
-    RekeyPolicyRequest, RekeySaRequest, RelocateSaRequest, RemovePolicyRequest, RemoveSaRequest,
-    SaParameters, SaRelocationIdentity, SaState, SpiAllocation, XfrmBackend, XfrmCapability,
-    XfrmCompositeInstallRequest, XfrmError, XfrmProbe,
+    AllocateSpiRequest, ExactRemovePolicyRequest, InstallPolicyRequest, InstallSaRequest,
+    LinuxXfrmBackend, QuerySaRequest, RekeyPolicyRequest, RekeySaRequest, RelocateSaRequest,
+    RemovePolicyRequest, RemoveSaRequest, SaParameters, SaRelocationIdentity, SaState,
+    SpiAllocation, XfrmBackend, XfrmCapability, XfrmCompositeInstallRequest, XfrmError, XfrmProbe,
 };
 
 /// Maximum number of admitted Linux XFRM operations waiting for the dedicated
@@ -38,10 +65,77 @@ use crate::{
 /// backpressure into unbounded SDK memory growth.
 pub const LINUX_XFRM_NAMESPACE_ACTOR_CAPACITY: usize = 64;
 
+#[cfg(target_os = "linux")]
+sockopt_impl!(
+    DurableNetworkNamespaceCookie,
+    GetOnly,
+    libc::SOL_SOCKET,
+    libc::SO_NETNS_COOKIE,
+    u64
+);
+
+/// Failure while atomically binding a namespace actor and durable recovery
+/// store before any mutation-capable backend handle becomes visible.
+#[cfg(unix)]
+#[non_exhaustive]
+pub enum XfrmObjectRecoveryBindError {
+    /// The Linux namespace actor could not be captured, spawned, or prepared.
+    Backend {
+        /// Redaction-safe backend failure.
+        source: XfrmError,
+    },
+    /// The durable recovery store could not be authenticated and leased.
+    Store {
+        /// Value-free durable-store failure.
+        source: XfrmObjectInstallDurableError,
+    },
+}
+
+#[cfg(unix)]
+impl XfrmObjectRecoveryBindError {
+    /// Stable, value-free error label.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Backend { .. } => "xfrm_object_recovery_bind_backend",
+            Self::Store { .. } => "xfrm_object_recovery_bind_store",
+        }
+    }
+}
+
+#[cfg(unix)]
+impl fmt::Debug for XfrmObjectRecoveryBindError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("XfrmObjectRecoveryBindError")
+            .field("code", &self.as_str())
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(unix)]
+impl fmt::Display for XfrmObjectRecoveryBindError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[cfg(unix)]
+impl Error for XfrmObjectRecoveryBindError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Backend { source } => Some(source),
+            Self::Store { source } => Some(source),
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct NetworkNamespaceBinding {
     device: u64,
     inode: u64,
+    cookie: Option<u64>,
+    boot_id: Option<[u8; 16]>,
 }
 
 /// Process-local identity of one exact namespace actor.
@@ -85,6 +179,22 @@ impl fmt::Debug for NamespaceActorBinding {
 }
 
 impl NetworkNamespaceBinding {
+    #[cfg(unix)]
+    fn durable_bytes(self) -> Result<[u8; 40], XfrmObjectInstallDurableError> {
+        let cookie = self
+            .cookie
+            .ok_or(XfrmObjectInstallDurableError::WrongBinding)?;
+        let boot_id = self
+            .boot_id
+            .ok_or(XfrmObjectInstallDurableError::WrongBinding)?;
+        let mut bytes = [0_u8; 40];
+        bytes[..8].copy_from_slice(&self.device.to_be_bytes());
+        bytes[8..16].copy_from_slice(&self.inode.to_be_bytes());
+        bytes[16..24].copy_from_slice(&cookie.to_be_bytes());
+        bytes[24..].copy_from_slice(&boot_id);
+        Ok(bytes)
+    }
+
     #[cfg(target_os = "linux")]
     pub(crate) fn capture() -> Result<Self, XfrmError> {
         use std::os::unix::fs::MetadataExt;
@@ -94,6 +204,8 @@ impl NetworkNamespaceBinding {
         Ok(Self {
             device: metadata.dev(),
             inode: metadata.ino(),
+            cookie: capture_network_namespace_cookie(),
+            boot_id: capture_boot_id(),
         })
     }
 
@@ -114,7 +226,68 @@ impl NetworkNamespaceBinding {
 
     #[cfg(test)]
     pub(crate) const fn for_test(device: u64, inode: u64) -> Self {
-        Self { device, inode }
+        Self {
+            device,
+            inode,
+            cookie: Some(if device ^ inode == 0 {
+                1
+            } else {
+                device ^ inode
+            }),
+            boot_id: Some([0x42; 16]),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn capture_network_namespace_cookie() -> Option<u64> {
+    let socket = socket(
+        AddressFamily::Inet,
+        SockType::Datagram,
+        SockFlag::SOCK_CLOEXEC,
+        None,
+    )
+    .ok()?;
+    getsockopt(&socket, DurableNetworkNamespaceCookie)
+        .ok()
+        .filter(|cookie| *cookie != 0)
+}
+
+#[cfg(target_os = "linux")]
+fn capture_boot_id() -> Option<[u8; 16]> {
+    let encoded = std::fs::read("/proc/sys/kernel/random/boot_id").ok()?;
+    let mut hexadecimal = [0_u8; 32];
+    let mut length = 0_usize;
+    for byte in encoded {
+        if byte == b'-' || byte == b'\n' || byte == b'\r' {
+            continue;
+        }
+        if length == hexadecimal.len() || !byte.is_ascii_hexdigit() {
+            return None;
+        }
+        hexadecimal[length] = byte;
+        length += 1;
+    }
+    if length != hexadecimal.len() {
+        return None;
+    }
+    let mut boot_id = [0_u8; 16];
+    for (output, pair) in boot_id.iter_mut().zip(hexadecimal.chunks_exact(2)) {
+        *output = (namespace_hex_nibble(pair[0])? << 4) | namespace_hex_nibble(pair[1])?;
+    }
+    if boot_id.iter().all(|byte| *byte == 0) {
+        return None;
+    }
+    Some(boot_id)
+}
+
+#[cfg(target_os = "linux")]
+fn namespace_hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -168,6 +341,22 @@ pub(crate) fn bind_current_network_namespace(
     bind_with_capacity(backend, LINUX_XFRM_NAMESPACE_ACTOR_CAPACITY)
 }
 
+#[cfg(unix)]
+fn bind_with_capacity(
+    backend: LinuxXfrmBackend,
+    capacity: usize,
+) -> Result<NamespaceBoundLinuxXfrmBackend, XfrmError> {
+    bind_with_capacity_and_recovery(backend, capacity, None)
+        .map(|(backend, _)| backend)
+        .map_err(|error| match error {
+            XfrmObjectRecoveryBindError::Backend { source } => source,
+            // No store was requested, so this variant is unreachable without
+            // an internal protocol defect. Keep the legacy API value-free.
+            XfrmObjectRecoveryBindError::Store { .. } => XfrmError::Unavailable,
+        })
+}
+
+#[cfg(not(unix))]
 fn bind_with_capacity(
     backend: LinuxXfrmBackend,
     capacity: usize,
@@ -203,6 +392,143 @@ fn bind_with_capacity(
     })
 }
 
+#[cfg(unix)]
+pub(crate) fn bind_current_network_namespace_with_object_recovery(
+    backend: LinuxXfrmBackend,
+    path: PathBuf,
+    proof_key: XfrmObjectRecoveryProofKey,
+) -> Result<
+    (
+        NamespaceBoundLinuxXfrmBackend,
+        XfrmObjectInstallRecoveryStore,
+    ),
+    XfrmObjectRecoveryBindError,
+> {
+    let (backend, store) = bind_with_capacity_and_recovery(
+        backend,
+        LINUX_XFRM_NAMESPACE_ACTOR_CAPACITY,
+        Some((path, proof_key)),
+    )?;
+    let store = store.ok_or(XfrmObjectRecoveryBindError::Store {
+        source: XfrmObjectInstallDurableError::WrongBinding,
+    })?;
+    Ok((backend, store))
+}
+
+#[cfg(unix)]
+fn bind_with_capacity_and_recovery(
+    backend: LinuxXfrmBackend,
+    capacity: usize,
+    recovery: Option<(PathBuf, XfrmObjectRecoveryProofKey)>,
+) -> Result<
+    (
+        NamespaceBoundLinuxXfrmBackend,
+        Option<XfrmObjectInstallRecoveryStore>,
+    ),
+    XfrmObjectRecoveryBindError,
+> {
+    let binding = NetworkNamespaceBinding::capture()
+        .map_err(|source| XfrmObjectRecoveryBindError::Backend { source })?;
+    let actor_binding = NamespaceActorBinding::new(binding);
+    let backend = backend.for_namespace_actor(binding);
+    let (sender, receiver) = mpsc::channel(capacity);
+    let (startup_sender, startup_receiver) = std::sync::mpsc::sync_channel(1);
+
+    let worker = std::thread::Builder::new()
+        .name(String::from("opc-xfrm-netns"))
+        .spawn({
+            let actor_binding = actor_binding.clone();
+            move || run_actor(backend, actor_binding, receiver, startup_sender, recovery)
+        })
+        .map_err(|error| XfrmObjectRecoveryBindError::Backend {
+            source: XfrmError::io("network_namespace_actor_spawn", error),
+        })?;
+
+    let startup = startup_receiver
+        .recv()
+        .map_err(|_| XfrmObjectRecoveryBindError::Backend {
+            source: XfrmError::Unavailable,
+        })?;
+    // A JoinHandle detaches on drop. The channel lifetime is authoritative:
+    // closing the final sender makes the actor drain and then exit, without a
+    // potentially blocking Drop implementation.
+    drop(worker);
+    let store = startup?;
+
+    Ok((
+        NamespaceBoundLinuxXfrmBackend {
+            inner: Arc::new(NamespaceBoundLinuxXfrmBackendInner {
+                sender,
+                actor_binding,
+            }),
+        },
+        store,
+    ))
+}
+
+#[cfg(unix)]
+fn run_actor(
+    backend: LinuxXfrmBackend,
+    actor_binding: NamespaceActorBinding,
+    mut receiver: mpsc::Receiver<NamespaceCommand>,
+    startup: std::sync::mpsc::SyncSender<
+        Result<Option<XfrmObjectInstallRecoveryStore>, XfrmObjectRecoveryBindError>,
+    >,
+    recovery: Option<(PathBuf, XfrmObjectRecoveryProofKey)>,
+) {
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            let _ = startup.send(Err(XfrmObjectRecoveryBindError::Backend {
+                source: XfrmError::io("network_namespace_actor_runtime", error),
+            }));
+            return;
+        }
+    };
+
+    if let Err(error) = backend.prepare_namespace_actor() {
+        let _ = startup.send(Err(XfrmObjectRecoveryBindError::Backend { source: error }));
+        return;
+    }
+
+    let mut state = NamespaceActorState::new(actor_binding);
+    let store = match recovery {
+        Some((path, proof_key)) => {
+            let namespace_binding = match state.actor_binding.namespace().durable_bytes() {
+                Ok(binding) => binding,
+                Err(source) => {
+                    let _ = startup.send(Err(XfrmObjectRecoveryBindError::Store { source }));
+                    return;
+                }
+            };
+            match XfrmObjectInstallRecoveryStore::open_bound(&path, proof_key, namespace_binding) {
+                Ok(store) => {
+                    state.object_recovery_store = Some(store.clone());
+                    Some(store)
+                }
+                Err(source) => {
+                    let _ = startup.send(Err(XfrmObjectRecoveryBindError::Store { source }));
+                    return;
+                }
+            }
+        }
+        None => None,
+    };
+    if startup.send(Ok(store)).is_err() {
+        return;
+    }
+
+    runtime.block_on(async move {
+        while let Some(command) = receiver.recv().await {
+            command.execute(&backend, &mut state).await;
+        }
+    });
+}
+
+#[cfg(not(unix))]
 fn run_actor(
     backend: LinuxXfrmBackend,
     actor_binding: NamespaceActorBinding,
@@ -239,6 +565,8 @@ fn run_actor(
 struct NamespaceActorState {
     actor_binding: NamespaceActorBinding,
     counter_receipts: EspCounterReceiptRegistry,
+    #[cfg(unix)]
+    object_recovery_store: Option<XfrmObjectInstallRecoveryStore>,
 }
 
 impl NamespaceActorState {
@@ -246,11 +574,35 @@ impl NamespaceActorState {
         Self {
             actor_binding,
             counter_receipts: EspCounterReceiptRegistry::default(),
+            #[cfg(unix)]
+            object_recovery_store: None,
         }
     }
 
     fn invalidate_counter_receipts(&mut self) {
         self.counter_receipts.invalidate_all();
+    }
+
+    #[cfg(unix)]
+    fn require_object_recovery_store(
+        &self,
+        supplied: &XfrmObjectInstallRecoveryStore,
+    ) -> Result<(), XfrmObjectInstallDurableError> {
+        match &self.object_recovery_store {
+            Some(bound) if bound.is_same_instance(supplied) => Ok(()),
+            _ => Err(XfrmObjectInstallDurableError::WrongBinding),
+        }
+    }
+
+    fn admit_xfrm_mutation(&mut self) -> Result<(), XfrmError> {
+        #[cfg(unix)]
+        if let Some(store) = &self.object_recovery_store {
+            store
+                .advance_writer_epoch()
+                .map_err(|_| XfrmError::Unavailable)?;
+        }
+        self.invalidate_counter_receipts();
+        Ok(())
     }
 }
 
@@ -278,6 +630,78 @@ impl NamespaceBoundLinuxXfrmBackend {
 
     pub(crate) fn namespace_actor_binding(&self) -> NamespaceActorBinding {
         self.inner.actor_binding.clone()
+    }
+
+    /// Run one create-exclusive object install with durable crash recovery.
+    ///
+    /// The returned terminal outcome is published durably before it becomes
+    /// visible to the caller. An acquired outcome blocks all later cooperating
+    /// namespace mutations until it is explicitly finalized or recovered.
+    #[cfg(unix)]
+    pub async fn run_durable_object_install(
+        &self,
+        store: &XfrmObjectInstallRecoveryStore,
+        operation_id: XfrmObjectInstallOperationId,
+        operation_generation: XfrmObjectInstallOperationGeneration,
+        request: XfrmObjectInstallRequest,
+    ) -> Result<XfrmObjectInstallDurableOutcome, XfrmObjectInstallDurableError> {
+        let operation = DurableObjectOperation {
+            store: store.clone(),
+            operation_id,
+            operation_generation,
+            request,
+        };
+        self.dispatch_durable(|reply| {
+            NamespaceCommand::RunDurableObjectInstall(Box::new(operation), reply)
+        })
+        .await
+    }
+
+    /// Surrender durable cleanup authority after the product has adopted an
+    /// acquired object, or retire an explicit no-mutation result.
+    #[cfg(unix)]
+    pub async fn finalize_durable_object_install(
+        &self,
+        store: &XfrmObjectInstallRecoveryStore,
+        operation_id: XfrmObjectInstallOperationId,
+        operation_generation: XfrmObjectInstallOperationGeneration,
+        request: XfrmObjectInstallRequest,
+    ) -> Result<XfrmObjectInstallDurablePhase, XfrmObjectInstallDurableError> {
+        let operation = DurableObjectOperation {
+            store: store.clone(),
+            operation_id,
+            operation_generation,
+            request,
+        };
+        self.dispatch_durable(|reply| {
+            NamespaceCommand::FinalizeDurableObjectInstall(Box::new(operation), reply)
+        })
+        .await
+    }
+
+    /// Reconcile one retained durable operation after process loss.
+    ///
+    /// Only an authenticated, epoch-current acquired record authorizes exact
+    /// deletion. Prepared, explicit no-mutation, indeterminate, stale,
+    /// malformed, and mismatched records never authorize deletion.
+    #[cfg(unix)]
+    pub async fn recover_durable_object_install(
+        &self,
+        store: &XfrmObjectInstallRecoveryStore,
+        operation_id: XfrmObjectInstallOperationId,
+        operation_generation: XfrmObjectInstallOperationGeneration,
+        request: XfrmObjectInstallRequest,
+    ) -> Result<XfrmObjectInstallRestartOutcome, XfrmObjectInstallDurableError> {
+        let operation = DurableObjectOperation {
+            store: store.clone(),
+            operation_id,
+            operation_generation,
+            request,
+        };
+        self.dispatch_durable(|reply| {
+            NamespaceCommand::RecoverDurableObjectInstall(Box::new(operation), reply)
+        })
+        .await
     }
 
     /// Load and attach the production CO-RE ESP peer observation source in
@@ -331,6 +755,28 @@ impl NamespaceBoundLinuxXfrmBackend {
         // succeeds, the command is synchronously owned by the draining actor.
         permit.send(command(reply_sender));
         reply_receiver.await.map_err(|_| lost_reply.error())?
+    }
+
+    #[cfg(unix)]
+    async fn dispatch_durable<T>(
+        &self,
+        command: impl FnOnce(
+            oneshot::Sender<Result<T, XfrmObjectInstallDurableError>>,
+        ) -> NamespaceCommand,
+    ) -> Result<T, XfrmObjectInstallDurableError> {
+        let permit = self
+            .inner
+            .sender
+            .reserve()
+            .await
+            .map_err(|_| XfrmObjectInstallDurableError::Storage)?;
+        let (reply_sender, reply_receiver) = oneshot::channel();
+        // No await is permitted between admission and send. Once reserved,
+        // the draining actor owns completion even if this future is dropped.
+        permit.send(command(reply_sender));
+        reply_receiver
+            .await
+            .map_err(|_| XfrmObjectInstallDurableError::Storage)?
     }
 
     async fn dispatch_outbound_binding(
@@ -547,7 +993,30 @@ impl NamespaceBoundLinuxXfrmBackend {
     }
 }
 
+#[cfg(unix)]
+struct DurableObjectOperation {
+    store: XfrmObjectInstallRecoveryStore,
+    operation_id: XfrmObjectInstallOperationId,
+    operation_generation: XfrmObjectInstallOperationGeneration,
+    request: XfrmObjectInstallRequest,
+}
+
 enum NamespaceCommand {
+    #[cfg(unix)]
+    RunDurableObjectInstall(
+        Box<DurableObjectOperation>,
+        oneshot::Sender<Result<XfrmObjectInstallDurableOutcome, XfrmObjectInstallDurableError>>,
+    ),
+    #[cfg(unix)]
+    FinalizeDurableObjectInstall(
+        Box<DurableObjectOperation>,
+        oneshot::Sender<Result<XfrmObjectInstallDurablePhase, XfrmObjectInstallDurableError>>,
+    ),
+    #[cfg(unix)]
+    RecoverDurableObjectInstall(
+        Box<DurableObjectOperation>,
+        oneshot::Sender<Result<XfrmObjectInstallRestartOutcome, XfrmObjectInstallDurableError>>,
+    ),
     AllocateSpi(
         AllocateSpiRequest,
         oneshot::Sender<Result<SpiAllocation, XfrmError>>,
@@ -574,6 +1043,10 @@ enum NamespaceCommand {
     InstallPolicy(InstallPolicyRequest, oneshot::Sender<Result<(), XfrmError>>),
     RekeyPolicy(RekeyPolicyRequest, oneshot::Sender<Result<(), XfrmError>>),
     RemovePolicy(RemovePolicyRequest, oneshot::Sender<Result<(), XfrmError>>),
+    RemovePolicyExact(
+        ExactRemovePolicyRequest,
+        oneshot::Sender<Result<(), XfrmError>>,
+    ),
     ValidateOutboundBinding(
         Box<OutboundBindingValidation>,
         oneshot::Sender<Result<(), OutboundSaBindingError>>,
@@ -609,13 +1082,69 @@ impl NamespaceCommand {
         }
 
         match self {
+            #[cfg(unix)]
+            Self::RunDurableObjectInstall(operation, reply) => {
+                let result = match state.require_object_recovery_store(&operation.store) {
+                    Ok(()) => {
+                        state.invalidate_counter_receipts();
+                        run_object_install(
+                            &operation.store,
+                            operation.operation_id,
+                            operation.operation_generation,
+                            &operation.request,
+                            backend,
+                        )
+                        .await
+                    }
+                    Err(error) => Err(error),
+                };
+                let _ = reply.send(result);
+            }
+            #[cfg(unix)]
+            Self::FinalizeDurableObjectInstall(operation, reply) => {
+                let result = state
+                    .require_object_recovery_store(&operation.store)
+                    .and_then(|()| {
+                        finalize_object_install(
+                            &operation.store,
+                            operation.operation_id,
+                            operation.operation_generation,
+                            &operation.request,
+                        )
+                    });
+                let _ = reply.send(result);
+            }
+            #[cfg(unix)]
+            Self::RecoverDurableObjectInstall(operation, reply) => {
+                let result = match state.require_object_recovery_store(&operation.store) {
+                    Ok(()) => {
+                        state.invalidate_counter_receipts();
+                        recover_object_install(
+                            &operation.store,
+                            operation.operation_id,
+                            operation.operation_generation,
+                            &operation.request,
+                            backend,
+                        )
+                        .await
+                    }
+                    Err(error) => Err(error),
+                };
+                let _ = reply.send(result);
+            }
             Self::AllocateSpi(request, reply) => {
-                state.invalidate_counter_receipts();
-                let _ = reply.send(backend.allocate_spi(request).await);
+                let result = match state.admit_xfrm_mutation() {
+                    Ok(()) => backend.allocate_spi(request).await,
+                    Err(error) => Err(error),
+                };
+                let _ = reply.send(result);
             }
             Self::InstallSa(request, reply) => {
-                state.invalidate_counter_receipts();
-                let _ = reply.send(backend.install_sa(request).await);
+                let result = match state.admit_xfrm_mutation() {
+                    Ok(()) => backend.install_sa(request).await,
+                    Err(error) => Err(error),
+                };
+                let _ = reply.send(result);
             }
             Self::QuerySa(request, reply) => {
                 let _ = reply.send(backend.query_sa(request).await);
@@ -632,28 +1161,53 @@ impl NamespaceCommand {
                 let _ = reply.send(LinuxEspPeerObservationKernelSource::load(config));
             }
             Self::RekeySa(request, reply) => {
-                state.invalidate_counter_receipts();
-                let _ = reply.send(backend.rekey_sa(request).await);
+                let result = match state.admit_xfrm_mutation() {
+                    Ok(()) => backend.rekey_sa(request).await,
+                    Err(error) => Err(error),
+                };
+                let _ = reply.send(result);
             }
             Self::RelocateSa(request, reply) => {
-                state.invalidate_counter_receipts();
-                let _ = reply.send(backend.relocate_sa(request).await);
+                let result = match state.admit_xfrm_mutation() {
+                    Ok(()) => backend.relocate_sa(request).await,
+                    Err(error) => Err(error),
+                };
+                let _ = reply.send(result);
             }
             Self::RemoveSa(request, reply) => {
-                state.invalidate_counter_receipts();
-                let _ = reply.send(backend.remove_sa(request).await);
+                let result = match state.admit_xfrm_mutation() {
+                    Ok(()) => backend.remove_sa(request).await,
+                    Err(error) => Err(error),
+                };
+                let _ = reply.send(result);
             }
             Self::InstallPolicy(request, reply) => {
-                state.invalidate_counter_receipts();
-                let _ = reply.send(backend.install_policy(request).await);
+                let result = match state.admit_xfrm_mutation() {
+                    Ok(()) => backend.install_policy(request).await,
+                    Err(error) => Err(error),
+                };
+                let _ = reply.send(result);
             }
             Self::RekeyPolicy(request, reply) => {
-                state.invalidate_counter_receipts();
-                let _ = reply.send(backend.rekey_policy(request).await);
+                let result = match state.admit_xfrm_mutation() {
+                    Ok(()) => backend.rekey_policy(request).await,
+                    Err(error) => Err(error),
+                };
+                let _ = reply.send(result);
             }
             Self::RemovePolicy(request, reply) => {
-                state.invalidate_counter_receipts();
-                let _ = reply.send(backend.remove_policy(request).await);
+                let result = match state.admit_xfrm_mutation() {
+                    Ok(()) => backend.remove_policy(request).await,
+                    Err(error) => Err(error),
+                };
+                let _ = reply.send(result);
+            }
+            Self::RemovePolicyExact(request, reply) => {
+                let result = match state.admit_xfrm_mutation() {
+                    Ok(()) => backend.remove_policy_exact(request).await,
+                    Err(error) => Err(error),
+                };
+                let _ = reply.send(result);
             }
             Self::ValidateOutboundBinding(validation, reply) => {
                 let _ = reply.send(
@@ -666,12 +1220,16 @@ impl NamespaceCommand {
                 );
             }
             Self::ApplyOutboundEspCounter(request, reply) => {
-                let _ = reply.send(
-                    state
-                        .counter_receipts
-                        .apply(backend, &state.actor_binding, *request)
-                        .await,
-                );
+                let result = match state.admit_xfrm_mutation() {
+                    Ok(()) => {
+                        state
+                            .counter_receipts
+                            .apply(backend, &state.actor_binding, *request)
+                            .await
+                    }
+                    Err(error) => Err(map_backend_error(error)),
+                };
+                let _ = reply.send(result);
             }
             Self::RecoverCommittedOutboundEspCounter(request, reply) => {
                 let _ = reply.send(
@@ -720,6 +1278,18 @@ impl NamespaceCommand {
 
     fn send_error(self, error: XfrmError) {
         match self {
+            #[cfg(unix)]
+            Self::RunDurableObjectInstall(_, reply) => {
+                let _ = reply.send(Err(XfrmObjectInstallDurableError::WrongBinding));
+            }
+            #[cfg(unix)]
+            Self::FinalizeDurableObjectInstall(_, reply) => {
+                let _ = reply.send(Err(XfrmObjectInstallDurableError::WrongBinding));
+            }
+            #[cfg(unix)]
+            Self::RecoverDurableObjectInstall(_, reply) => {
+                let _ = reply.send(Err(XfrmObjectInstallDurableError::WrongBinding));
+            }
             Self::AllocateSpi(_, reply) => {
                 let _ = reply.send(Err(error));
             }
@@ -729,7 +1299,8 @@ impl NamespaceCommand {
             | Self::RemoveSa(_, reply)
             | Self::InstallPolicy(_, reply)
             | Self::RekeyPolicy(_, reply)
-            | Self::RemovePolicy(_, reply) => {
+            | Self::RemovePolicy(_, reply)
+            | Self::RemovePolicyExact(_, reply) => {
                 let _ = reply.send(Err(error));
             }
             Self::QuerySa(_, reply) => {
@@ -847,6 +1418,17 @@ impl XfrmBackend for NamespaceBoundLinuxXfrmBackend {
         .await
     }
 
+    async fn remove_policy_exact(
+        &self,
+        request: ExactRemovePolicyRequest,
+    ) -> Result<(), XfrmError> {
+        validate_exact_remove_policy_request(&request)?;
+        self.dispatch(LostReply::Mutation("remove_policy_exact"), |reply| {
+            NamespaceCommand::RemovePolicyExact(request, reply)
+        })
+        .await
+    }
+
     async fn probe(&self) -> Result<XfrmProbe, XfrmError> {
         self.dispatch(LostReply::ReadOnly, NamespaceCommand::Probe)
             .await
@@ -869,6 +1451,11 @@ mod tests {
     use std::thread::ThreadId;
     use std::time::{Duration, Instant};
 
+    #[cfg(unix)]
+    use std::fs;
+    #[cfg(unix)]
+    use std::path::{Path, PathBuf};
+
     use zeroize::Zeroizing;
 
     use super::*;
@@ -882,8 +1469,8 @@ mod tests {
         Algorithm, AuthAlgorithm, DscpCodepoint, EspCounterResumeProofSet, IpAddress, KeyMaterial,
         LifetimeConfig, PolicyParameters, SaParameters, SaRelocationDirection, SaRelocationEncap,
         SaRelocationSelector, SaReplayState, XfrmAction, XfrmBackendKind, XfrmDirection, XfrmId,
-        XfrmInstallOwnership, XfrmMode, XfrmRequestId, XfrmSelector, XfrmStagedInstall,
-        XfrmTemplate,
+        XfrmInstallOwnership, XfrmLookupMark, XfrmMode, XfrmRequestId, XfrmSelector,
+        XfrmStagedInstall, XfrmTemplate,
     };
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -906,6 +1493,8 @@ mod tests {
                 binding: NetworkNamespaceBinding::capture().unwrap_or(NetworkNamespaceBinding {
                     device: 0,
                     inode: 0,
+                    cookie: None,
+                    boot_id: None,
                 }),
             };
             self.records
@@ -945,6 +1534,76 @@ mod tests {
                 algorithms: XfrmCapability::PermissionDenied,
                 egress_dscp_marking: XfrmCapability::Missing,
                 details: Some("namespace actor test transport"),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[derive(Debug, Clone, Default)]
+    struct RecordingSuccessTransport {
+        operations: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    #[cfg(unix)]
+    impl RecordingSuccessTransport {
+        fn operations(&self) -> Vec<&'static str> {
+            self.operations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+    }
+
+    #[cfg(unix)]
+    impl LinuxXfrmTransport for RecordingSuccessTransport {
+        fn transact(
+            &self,
+            operation: &'static str,
+            _operation_class: crate::linux::NetlinkOperationClass,
+            _request: &[u8],
+            _expected_sequence: u32,
+            _config: LinuxXfrmBackendConfig,
+        ) -> Result<Option<SensitiveBuffer>, XfrmError> {
+            self.operations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(operation);
+            Ok(None)
+        }
+
+        fn probe(&self, _config: LinuxXfrmBackendConfig) -> XfrmProbe {
+            XfrmProbe::unsupported()
+        }
+    }
+
+    #[cfg(unix)]
+    struct DurableTestRoot(PathBuf);
+
+    #[cfg(unix)]
+    impl DurableTestRoot {
+        fn new() -> Self {
+            let operation = XfrmObjectInstallOperationId::generate().unwrap();
+            let encoded = operation
+                .to_bytes()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            let path = std::env::temp_dir().join(format!("opc-xfrm-namespace-test-{encoded}"));
+            assert!(path.is_absolute());
+            assert!(!path.exists());
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for DurableTestRoot {
+        fn drop(&mut self) {
+            if self.0.is_dir() {
+                fs::remove_dir_all(&self.0).unwrap();
             }
         }
     }
@@ -1138,13 +1797,25 @@ mod tests {
             })
             .await;
         let _ = backend
-            .remove_policy(RemovePolicyRequest::new(policy.selector, policy.direction))
+            .remove_policy(RemovePolicyRequest::new(
+                policy.selector.clone(),
+                policy.direction,
+            ))
+            .await;
+        let _ = backend
+            .remove_policy_exact(
+                ExactRemovePolicyRequest::new(RemovePolicyRequest::new(
+                    policy.selector,
+                    policy.direction,
+                ))
+                .with_if_id(7),
+            )
             .await;
         let _ = backend.probe().await;
         let _ = backend.sa_relocation_capability().await;
 
         let records = transport.records();
-        assert_eq!(records.len(), 12);
+        assert_eq!(records.len(), 13);
         assert!(records
             .iter()
             .all(|record| record.binding == expected_binding));
@@ -1167,10 +1838,179 @@ mod tests {
                 "install_policy",
                 "rekey_policy",
                 "remove_policy",
+                "remove_policy_exact_preflight",
                 "probe",
                 "probe",
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn exact_policy_removal_rejects_zero_before_namespace_dispatch() {
+        let transport = RecordingUnavailableTransport::default();
+        let backend = LinuxXfrmBackend::with_transport(transport.clone())
+            .bind_current_network_namespace()
+            .unwrap();
+        let policy = policy_parameters();
+
+        let error = backend
+            .remove_policy_exact(
+                ExactRemovePolicyRequest::new(RemovePolicyRequest::new(
+                    policy.selector,
+                    policy.direction,
+                ))
+                .with_if_id(0),
+            )
+            .await
+            .expect_err("zero interface scope must fail before actor admission");
+
+        assert!(matches!(
+            error,
+            XfrmError::InvalidConfig {
+                field: "policy.if_id",
+                ..
+            }
+        ));
+        assert!(transport.records().is_empty());
+    }
+
+    #[tokio::test]
+    async fn exact_policy_removal_rejects_narrow_mark_before_namespace_dispatch() {
+        let transport = RecordingUnavailableTransport::default();
+        let backend = LinuxXfrmBackend::with_transport(transport.clone())
+            .bind_current_network_namespace()
+            .unwrap();
+        let policy = policy_parameters();
+        let narrow = XfrmLookupMark::new(0x10, 0xf0).unwrap();
+
+        let error = backend
+            .remove_policy_exact(ExactRemovePolicyRequest::new(
+                RemovePolicyRequest::new(policy.selector, policy.direction).with_mark(narrow),
+            ))
+            .await
+            .expect_err("narrow lookup mark must fail before actor admission");
+
+        assert!(matches!(
+            error,
+            XfrmError::InvalidConfig {
+                field: "policy.mark",
+                ..
+            }
+        ));
+        assert!(transport.records().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_store_is_atomically_attached_before_backend_is_returned() {
+        let root = DurableTestRoot::new();
+        let (backend, store) =
+            LinuxXfrmBackend::with_transport(RecordingUnavailableTransport::default())
+                .bind_current_network_namespace_with_object_recovery(
+                    root.path().to_path_buf(),
+                    XfrmObjectRecoveryProofKey::new([0x61; 32]).unwrap(),
+                )
+                .unwrap();
+        assert!(store.advance_writer_epoch().is_ok());
+
+        let error = LinuxXfrmBackend::with_transport(RecordingUnavailableTransport::default())
+            .bind_current_network_namespace_with_object_recovery(
+                root.path().to_path_buf(),
+                XfrmObjectRecoveryProofKey::new([0x61; 32]).unwrap(),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            XfrmObjectRecoveryBindError::Store {
+                source: XfrmObjectInstallDurableError::StoreBusy
+            }
+        ));
+        drop(store);
+        drop(backend);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn acquired_authority_blocks_public_sa_and_policy_commands_before_transport() {
+        let root = DurableTestRoot::new();
+        let transport = RecordingSuccessTransport::default();
+        let (backend, store) = LinuxXfrmBackend::with_transport(transport.clone())
+            .bind_current_network_namespace_with_object_recovery(
+                root.path().to_path_buf(),
+                XfrmObjectRecoveryProofKey::new([0x62; 32]).unwrap(),
+            )
+            .unwrap();
+        let operation_id = XfrmObjectInstallOperationId::generate().unwrap();
+        let operation_generation = XfrmObjectInstallOperationGeneration::new(1).unwrap();
+        let request = XfrmObjectInstallRequest::Sa(InstallSaRequest {
+            parameters: sa_parameters(),
+        });
+
+        let outcome = backend
+            .run_durable_object_install(&store, operation_id, operation_generation, request)
+            .await
+            .unwrap();
+        assert_eq!(outcome.as_str(), "acquired");
+        assert_eq!(transport.operations(), vec!["install_sa"]);
+
+        assert!(matches!(
+            backend.remove_sa(remove_request()).await,
+            Err(XfrmError::Unavailable)
+        ));
+        assert!(matches!(
+            backend
+                .install_policy(InstallPolicyRequest {
+                    parameters: policy_parameters(),
+                })
+                .await,
+            Err(XfrmError::Unavailable)
+        ));
+        assert_eq!(transport.operations(), vec!["install_sa"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn acquired_durable_authority_blocks_actor_mutation_admission() {
+        let root = DurableTestRoot::new();
+        let binding = NetworkNamespaceBinding::capture().unwrap();
+        let mut state = NamespaceActorState::new(NamespaceActorBinding::new(binding));
+        let store = XfrmObjectInstallRecoveryStore::open_bound(
+            root.path(),
+            XfrmObjectRecoveryProofKey::new([0x63; 32]).unwrap(),
+            binding.durable_bytes().unwrap(),
+        )
+        .unwrap();
+        state.object_recovery_store = Some(store.clone());
+        let operation = XfrmObjectInstallOperationId::generate().unwrap();
+        let generation = XfrmObjectInstallOperationGeneration::new(1).unwrap();
+        let prepared = store
+            .prepare(
+                operation,
+                generation,
+                crate::XfrmInstallObject::Sa,
+                crate::durable_object::DurableObjectFingerprints::repeated(0x64),
+            )
+            .unwrap();
+        let issuing = store
+            .transition(
+                &prepared,
+                XfrmObjectInstallDurablePhase::Prepared,
+                XfrmObjectInstallDurablePhase::Issuing,
+            )
+            .unwrap();
+        let issuing = store.handle_for_record(&issuing).unwrap();
+        store
+            .transition(
+                &issuing,
+                XfrmObjectInstallDurablePhase::Issuing,
+                XfrmObjectInstallDurablePhase::Acquired,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            state.admit_xfrm_mutation(),
+            Err(XfrmError::Unavailable)
+        ));
     }
 
     fn backend_from_sender(
@@ -1991,6 +2831,7 @@ mod tests {
             NamespaceActorBinding::new(NetworkNamespaceBinding {
                 device: current.device.wrapping_add(1),
                 inode: current.inode.wrapping_add(1),
+                ..current
             }),
             validate_outbound_request(&request).unwrap(),
         );
@@ -2463,6 +3304,8 @@ mod tests {
         let binding = NetworkNamespaceBinding {
             device: 1_234_567_890,
             inode: 9_876_543_210,
+            cookie: Some(8_765_432_109),
+            boot_id: Some([0x67; 16]),
         };
         let binding_debug = format!("{binding:?}");
         assert!(!binding_debug.contains("1234567890"));
@@ -2487,6 +3330,7 @@ mod tests {
         let mismatched = NetworkNamespaceBinding {
             device: current.device.wrapping_add(1),
             inode: current.inode.wrapping_add(1),
+            ..current
         };
         let error = mismatched.ensure_current().unwrap_err();
         let debug = format!("{error:?}");

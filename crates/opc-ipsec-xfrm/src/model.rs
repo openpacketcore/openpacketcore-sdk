@@ -1398,6 +1398,99 @@ impl RemovePolicyRequest {
     }
 }
 
+/// Request to remove one policy including its Linux XFRM interface scope.
+///
+/// [`RemovePolicyRequest`] remains unchanged for source compatibility and
+/// continues to address only an unscoped policy. This wrapper adds the
+/// optional `XFRMA_IF_ID` needed when recovery must name an interface-scoped
+/// policy without confusing it with an otherwise identical unscoped policy.
+/// Its lookup mark must be absent or full-mask; a narrower canonical mark has
+/// an overlapping Linux lookup domain and is rejected before dispatch.
+/// A scoped backend first proves that the kernel returned this exact interface
+/// ID, then performs Linux's unconditional deletion. Callers must hold
+/// namespace-wide XFRM writer exclusion across that complete operation because
+/// the UAPI has no owner- or generation-conditional delete.
+///
+/// Debug output is deliberately redacted because the nested request contains
+/// traffic selectors and packet marks.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct ExactRemovePolicyRequest {
+    /// Established policy removal identity.
+    request: RemovePolicyRequest,
+    /// Optional nonzero Linux XFRM interface identifier.
+    if_id: Option<u32>,
+}
+
+impl ExactRemovePolicyRequest {
+    /// Build an exact removal request for an unscoped policy.
+    #[must_use]
+    pub const fn new(request: RemovePolicyRequest) -> Self {
+        Self {
+            request,
+            if_id: None,
+        }
+    }
+
+    /// Select the policy carrying the supplied Linux XFRM interface ID.
+    ///
+    /// A zero value is rejected by [`crate::XfrmBackend::remove_policy_exact`]
+    /// before the backend performs an operation. Use an unscoped request when
+    /// no interface ID is present.
+    #[must_use]
+    pub const fn with_if_id(mut self, if_id: u32) -> Self {
+        self.if_id = Some(if_id);
+        self
+    }
+
+    /// Select an optional Linux XFRM interface ID.
+    ///
+    /// A present zero value is rejected by
+    /// [`crate::XfrmBackend::remove_policy_exact`] before the backend performs
+    /// an operation.
+    #[must_use]
+    pub const fn with_optional_if_id(mut self, if_id: Option<u32>) -> Self {
+        self.if_id = if_id;
+        self
+    }
+
+    /// Borrow the established policy removal identity.
+    #[must_use]
+    pub const fn request(&self) -> &RemovePolicyRequest {
+        &self.request
+    }
+
+    /// Consume this wrapper and return the established removal identity.
+    #[must_use]
+    pub fn into_request(self) -> RemovePolicyRequest {
+        self.request
+    }
+
+    /// Return the optional Linux XFRM interface ID.
+    #[must_use]
+    pub const fn if_id(&self) -> Option<u32> {
+        self.if_id
+    }
+}
+
+impl fmt::Debug for ExactRemovePolicyRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ExactRemovePolicyRequest(<redacted>)")
+    }
+}
+
+pub(crate) fn validate_exact_remove_policy_request(
+    request: &ExactRemovePolicyRequest,
+) -> Result<(), XfrmError> {
+    validate_exact_lookup_mark(request.request().mark, "policy.mark")?;
+    if request.if_id() == Some(0) {
+        return Err(XfrmError::invalid_config(
+            "policy.if_id",
+            "interface identifier must be nonzero; use None when absent",
+        ));
+    }
+    Ok(())
+}
+
 /// Kind of XFRM backend implementation.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -1478,6 +1571,51 @@ impl XfrmProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exact_policy_removal_debug_redacts_identity() {
+        let removal = RemovePolicyRequest::new(
+            XfrmSelector::new(
+                IpAddress::Ipv4([10, 61, 62, 63]),
+                IpAddress::Ipv4([10, 64, 65, 66]),
+                50,
+            ),
+            XfrmDirection::Out,
+        );
+        let request =
+            ExactRemovePolicyRequest::new(removal.clone()).with_optional_if_id(Some(616_616));
+
+        assert_eq!(
+            format!("{request:?}"),
+            "ExactRemovePolicyRequest(<redacted>)"
+        );
+        assert_eq!(request.request(), &removal);
+        assert_eq!(request.if_id(), Some(616_616));
+        assert_eq!(request.into_request(), removal);
+    }
+
+    #[test]
+    fn exact_policy_removal_rejects_overlapping_lookup_profile() {
+        let narrow = XfrmLookupMark::new(0x10, 0xf0).unwrap();
+        let request = ExactRemovePolicyRequest::new(
+            RemovePolicyRequest::new(
+                XfrmSelector::new(
+                    IpAddress::Ipv4([10, 0, 0, 1]),
+                    IpAddress::Ipv4([10, 0, 0, 2]),
+                    17,
+                ),
+                XfrmDirection::Out,
+            )
+            .with_mark(narrow),
+        );
+        assert!(matches!(
+            validate_exact_remove_policy_request(&request),
+            Err(XfrmError::InvalidConfig {
+                field: "policy.mark",
+                ..
+            })
+        ));
+    }
 
     #[test]
     fn key_material_debug_redacts_content() {

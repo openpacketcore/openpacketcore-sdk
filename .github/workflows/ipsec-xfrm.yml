@@ -101,6 +101,7 @@ jobs:
             --test xfrm_auth_only_privileged \
             --test xfrm_dscp_privileged \
             --test xfrm_namespace_bound_privileged \
+            --test xfrm_object_recovery_privileged \
             --test xfrm_peer_observation_privileged \
             --test xfrm_relocation_privileged \
             --no-run
@@ -140,6 +141,38 @@ jobs:
             "CARGO_TARGET_DIR=${CARGO_TARGET_DIR}" \
             "OPC_XFRM_RUN_NAMESPACE_PRIVILEGED=1" \
             "${test_binary}" --ignored --nocapture
+
+      - name: Run durable staged-object process-loss recovery proof
+        run: |
+          set -euo pipefail
+          export CARGO_HOME="${CARGO_HOME:-${HOME}/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-${HOME}/.rustup}"
+          export CARGO_TARGET_DIR="${RUNNER_TEMP}/xfrm-target"
+          test_binary="$(
+            cargo test --locked -p opc-ipsec-xfrm \
+              --test xfrm_object_recovery_privileged \
+              --no-run \
+              --message-format=json \
+            | python3 -c '
+          import json
+          import sys
+
+          executables = [
+              event.get("executable")
+              for line in sys.stdin
+              if (event := json.loads(line)).get("reason") == "compiler-artifact"
+              and event.get("target", {}).get("name") == "xfrm_object_recovery_privileged"
+              and event.get("executable")
+          ]
+          if len(executables) != 1:
+              raise SystemExit("expected exactly one object-recovery privileged test executable")
+          print(executables[0])
+          '
+          )"
+          sudo env \
+            "PATH=${PATH}" \
+            "OPC_XFRM_RUN_OBJECT_RECOVERY_PRIVILEGED=1" \
+            "${test_binary}" --ignored --nocapture --test-threads=1
 
       - name: Run real XFRM output-mark and tc datapath proof
         run: |

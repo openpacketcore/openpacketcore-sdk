@@ -1,0 +1,1230 @@
+//! Privileged, real-process detectors for durable single-object XFRM recovery.
+
+#![cfg(target_os = "linux")]
+
+use std::env;
+use std::fs::{self, DirBuilder, File, OpenOptions};
+use std::io::{self, Read, Seek, Write};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::process::ExitStatusExt;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
+
+use hmac::{Hmac, Mac};
+use opc_ipsec_xfrm::{
+    Algorithm, AuthAlgorithm, InstallPolicyRequest, InstallSaRequest, IpAddress, KeyMaterial,
+    LifetimeConfig, LinuxXfrmBackend, NamespaceBoundLinuxXfrmBackend, PolicyParameters,
+    QuerySaRequest, RemoveSaRequest, SaParameters, XfrmAction, XfrmBackend, XfrmDirection,
+    XfrmError, XfrmId, XfrmMode, XfrmObjectInstallDurableError, XfrmObjectInstallDurableOutcome,
+    XfrmObjectInstallDurablePhase, XfrmObjectInstallOperationGeneration,
+    XfrmObjectInstallOperationId, XfrmObjectInstallRecoveryHandle, XfrmObjectInstallRecoveryStore,
+    XfrmObjectInstallRequest, XfrmObjectInstallRestartOutcome, XfrmObjectRecoveryBindError,
+    XfrmObjectRecoveryProofKey, XfrmRequestId, XfrmSelector, XfrmTemplate,
+    XFRM_OBJECT_INSTALL_RECOVERY_HANDLE_BYTES,
+};
+use sha2::{Digest, Sha256};
+
+const RUN_PRIVILEGED_ENV: &str = "OPC_XFRM_RUN_OBJECT_RECOVERY_PRIVILEGED";
+const CHILD_ROLE_ENV: &str = "OPC_XFRM_OBJECT_RECOVERY_CHILD_ROLE";
+const CHILD_ROOT_ENV: &str = "OPC_XFRM_OBJECT_RECOVERY_CHILD_ROOT";
+const CHILD_TOKEN_ENV: &str = "OPC_XFRM_OBJECT_RECOVERY_CHILD_TOKEN";
+const CHILD_TEST_NAME: &str = "xfrm_object_recovery_privileged_child";
+const RESOURCE_PREFIX: &str = "opc-xfrm-616-";
+const PROVISION_ATTEMPTS: usize = 32;
+const CHILD_READY_TIMEOUT: Duration = Duration::from_secs(15);
+const CHILD_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
+const CHILD_FAILSAFE_TIMEOUT: Duration = Duration::from_secs(30);
+const IPPROTO_ESP: u8 = 50;
+const IPPROTO_UDP: u8 = 17;
+const TEST_SPI: u32 = 0x6160_0001;
+const POLICY_IF_ID_OWNED: u32 = 61_601;
+const POLICY_IF_ID_NEIGHBOR: u32 = 61_602;
+const ROLE_HARNESS_SIGKILL: &str = "harness-sigkill";
+const ROLE_SA_ACQUIRED: &str = "sa-acquired";
+const ROLE_SA_NO_MUTATION: &str = "sa-no-mutation";
+const ROLE_POLICY_ACQUIRED: &str = "policy-acquired";
+
+const RECORD_BODY_BYTES: usize = 176;
+const ACTOR_INCARNATION_RANGE: std::ops::Range<usize> = 64..80;
+const RECORD_AUTH_DOMAIN: &[u8] = b"opc-xfrm-object-record-v1\0";
+
+type HmacSha256 = Hmac<Sha256>;
+
+type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+fn privileged_enabled() -> bool {
+    if env::var(RUN_PRIVILEGED_ENV).as_deref() == Ok("1") {
+        true
+    } else {
+        eprintln!("skipping: set {RUN_PRIVILEGED_ENV}=1 on a privileged Linux host");
+        false
+    }
+}
+
+fn ip(value: [u8; 4]) -> IpAddress {
+    IpAddress::Ipv4(value)
+}
+
+fn sa_parameters() -> SaParameters {
+    SaParameters {
+        selector: XfrmSelector::new(ip([10, 61, 6, 1]), ip([10, 61, 6, 2]), IPPROTO_UDP),
+        id: XfrmId {
+            destination: ip([192, 0, 2, 62]),
+            spi: TEST_SPI,
+            protocol: IPPROTO_ESP,
+        },
+        source_address: ip([192, 0, 2, 61]),
+        request_id: XfrmRequestId::new(616),
+        auth: Some((
+            AuthAlgorithm::hmac_sha256(128),
+            KeyMaterial::new(vec![0x61; 32]),
+        )),
+        crypt: Some((Algorithm::null(), KeyMaterial::new(Vec::new()))),
+        aead: None,
+        mode: XfrmMode::Tunnel,
+        lifetime: LifetimeConfig::default(),
+        replay_window: 32,
+        replay_state: None,
+        encap: None,
+        mark: None,
+        output_mark: None,
+        if_id: None,
+        egress_dscp: None,
+    }
+}
+
+fn sa_install_request() -> InstallSaRequest {
+    InstallSaRequest {
+        parameters: sa_parameters(),
+    }
+}
+
+fn sa_object_request() -> XfrmObjectInstallRequest {
+    XfrmObjectInstallRequest::Sa(sa_install_request())
+}
+
+fn sa_query_request() -> QuerySaRequest {
+    let id = sa_parameters().id;
+    QuerySaRequest::new(id.destination, id.protocol, id.spi)
+}
+
+fn sa_remove_request() -> RemoveSaRequest {
+    let id = sa_parameters().id;
+    RemoveSaRequest {
+        destination: id.destination,
+        protocol: id.protocol,
+        spi: id.spi,
+        mark: None,
+    }
+}
+
+fn policy_install_request(if_id: u32) -> InstallPolicyRequest {
+    let sa = sa_parameters();
+    InstallPolicyRequest {
+        parameters: PolicyParameters {
+            selector: sa.selector,
+            direction: XfrmDirection::Out,
+            action: XfrmAction::Allow,
+            priority: 616,
+            templates: vec![XfrmTemplate {
+                id: sa.id,
+                source_address: sa.source_address,
+                request_id: sa.request_id,
+                mode: sa.mode,
+            }],
+            mark: None,
+            if_id: Some(if_id),
+        },
+    }
+}
+
+fn policy_object_request(if_id: u32) -> XfrmObjectInstallRequest {
+    XfrmObjectInstallRequest::Policy(policy_install_request(if_id))
+}
+
+fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("build privileged test runtime")
+        .block_on(future)
+}
+
+fn derived_secret(token: &str, domain: &[u8]) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(domain);
+    digest.update(token.as_bytes());
+    digest.finalize().into()
+}
+
+fn proof_key_bytes(token: &str) -> [u8; 32] {
+    let mut bytes = derived_secret(token, b"opc-xfrm-616-proof-key\0");
+    if bytes.iter().all(|byte| *byte == 0) {
+        bytes[0] = 1;
+    }
+    bytes
+}
+
+fn proof_key(token: &str) -> Result<XfrmObjectRecoveryProofKey, XfrmObjectInstallDurableError> {
+    XfrmObjectRecoveryProofKey::new(proof_key_bytes(token))
+}
+
+fn operation_id(
+    token: &str,
+) -> Result<XfrmObjectInstallOperationId, XfrmObjectInstallDurableError> {
+    let digest = derived_secret(token, b"opc-xfrm-616-operation-id\0");
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    if bytes.iter().all(|byte| *byte == 0) {
+        bytes[0] = 1;
+    }
+    XfrmObjectInstallOperationId::from_bytes(bytes)
+}
+
+fn operation_generation() -> XfrmObjectInstallOperationGeneration {
+    XfrmObjectInstallOperationGeneration::new(1).expect("nonzero test operation generation")
+}
+
+fn bind_namespace(namespace: &str) -> TestResult<Arc<NamespaceBoundLinuxXfrmBackend>> {
+    let namespace = namespace.to_owned();
+    thread::spawn(move || -> TestResult<Arc<NamespaceBoundLinuxXfrmBackend>> {
+        let namespace_file = File::open(PathBuf::from("/run/netns").join(namespace))?;
+        nix::sched::setns(namespace_file, nix::sched::CloneFlags::CLONE_NEWNET)?;
+        Ok(Arc::new(
+            LinuxXfrmBackend::new().bind_current_network_namespace()?,
+        ))
+    })
+    .join()
+    .map_err(|_| io::Error::other("namespace binding worker panicked"))?
+}
+
+fn try_bind_namespace_with_recovery(
+    namespace: &str,
+    store_path: PathBuf,
+    token: &str,
+) -> TestResult<
+    Result<
+        (
+            Arc<NamespaceBoundLinuxXfrmBackend>,
+            XfrmObjectInstallRecoveryStore,
+        ),
+        XfrmObjectRecoveryBindError,
+    >,
+> {
+    let namespace = namespace.to_owned();
+    let token = token.to_owned();
+    thread::spawn(move || -> TestResult<_> {
+        let namespace_file = File::open(PathBuf::from("/run/netns").join(namespace))?;
+        nix::sched::setns(namespace_file, nix::sched::CloneFlags::CLONE_NEWNET)?;
+        Ok(LinuxXfrmBackend::new()
+            .bind_current_network_namespace_with_object_recovery(store_path, proof_key(&token)?)
+            .map(|(backend, store)| (Arc::new(backend), store)))
+    })
+    .join()
+    .map_err(|_| io::Error::other("namespace recovery binding worker panicked"))?
+}
+
+fn bind_namespace_with_recovery(
+    namespace: &str,
+    fixture: &PrivilegedFixture,
+) -> TestResult<(
+    Arc<NamespaceBoundLinuxXfrmBackend>,
+    XfrmObjectInstallRecoveryStore,
+)> {
+    Ok(try_bind_namespace_with_recovery(
+        namespace,
+        fixture.store_path(),
+        &fixture.token,
+    )??)
+}
+
+fn assert_sa_presence(
+    backend: &NamespaceBoundLinuxXfrmBackend,
+    expected_present: bool,
+) -> TestResult {
+    match block_on(backend.query_sa(sa_query_request())) {
+        Ok(state) => {
+            if !expected_present {
+                return Err(io::Error::other("unexpected matching SA remained").into());
+            }
+            let expected = sa_parameters();
+            if state.id != expected.id
+                || state.selector != expected.selector
+                || state.source_address != expected.source_address
+                || state.request_id != expected.request_id
+                || state.mode != expected.mode
+            {
+                return Err(io::Error::other("matching SA readback was not exact").into());
+            }
+            Ok(())
+        }
+        Err(XfrmError::NotFound) if !expected_present => Ok(()),
+        Err(XfrmError::NotFound) => Err(io::Error::other("expected matching SA was absent").into()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn policy_if_id_count(namespace: &str, if_id: u32) -> TestResult<usize> {
+    let output = run_ip(&[
+        "netns", "exec", namespace, "ip", "-j", "xfrm", "policy", "list",
+    ])?;
+    if !output.status.success() {
+        return Err(command_error("list namespace XFRM policies", &output).into());
+    }
+    let listing = String::from_utf8(output.stdout)?;
+    // Some supported iproute2 builds ignore `-j` for `ip xfrm` and render
+    // `if_id` as hexadecimal text. Normalizing punctuation makes both that
+    // form and JSON's numeric/string forms use the same bounded token parser.
+    let normalized: String = listing
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '_' {
+                character
+            } else {
+                ' '
+            }
+        })
+        .collect();
+    let mut count = 0_usize;
+    let mut tokens = normalized.split_ascii_whitespace();
+    while let Some(token) = tokens.next() {
+        if token != "if_id" {
+            continue;
+        }
+        let encoded = tokens
+            .next()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "if_id value is missing"))?;
+        let value = match encoded.strip_prefix("0x") {
+            Some(hex) => u32::from_str_radix(hex, 16),
+            None => encoded.parse(),
+        }
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "if_id value is malformed"))?;
+        if value == if_id {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+fn random_token() -> io::Result<String> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut random = [0_u8; 16];
+    File::open("/dev/urandom")?.read_exact(&mut random)?;
+    let mut token = String::with_capacity(random.len() * 2);
+    for byte in random {
+        token.push(char::from(HEX[usize::from(byte >> 4)]));
+        token.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    Ok(token)
+}
+
+fn path_exists(path: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn run_ip(args: &[&str]) -> io::Result<Output> {
+    Command::new("ip")
+        .args(args)
+        .env("LC_ALL", "C")
+        .stdin(Stdio::null())
+        .output()
+}
+
+fn command_error(operation: &'static str, output: &Output) -> io::Error {
+    let diagnostics = String::from_utf8_lossy(&output.stderr);
+    io::Error::other(format!(
+        "{operation} failed with status {}: {}",
+        output.status,
+        diagnostics.trim()
+    ))
+}
+
+fn record_first_error(slot: &mut Option<io::Error>, error: io::Error) {
+    if slot.is_none() {
+        *slot = Some(error);
+    }
+}
+
+fn remove_owned_namespace(name: &str) -> io::Result<()> {
+    let path = PathBuf::from("/run/netns").join(name);
+    if !path_exists(&path)? {
+        return Ok(());
+    }
+    let output = run_ip(&["netns", "del", name])?;
+    if !output.status.success() && path_exists(&path)? {
+        return Err(command_error("delete owned network namespace", &output));
+    }
+    if path_exists(&path)? {
+        return Err(io::Error::other(
+            "owned network namespace remained after deletion",
+        ));
+    }
+    Ok(())
+}
+
+struct PrivilegedFixture {
+    token: String,
+    root: PathBuf,
+    claim: PathBuf,
+    namespaces: Vec<String>,
+    cleaned: bool,
+}
+
+impl PrivilegedFixture {
+    fn provision() -> io::Result<Self> {
+        let temporary_root = env::temp_dir();
+        for _ in 0..PROVISION_ATTEMPTS {
+            let token = random_token()?;
+            let stem = format!("{RESOURCE_PREFIX}{token}");
+            let claim = temporary_root.join(format!(".{stem}.claim"));
+            let mut claim_file = match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&claim)
+            {
+                Ok(file) => file,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            };
+            if let Err(error) = claim_file
+                .write_all(std::process::id().to_string().as_bytes())
+                .and_then(|()| claim_file.sync_all())
+            {
+                let _ = fs::remove_file(&claim);
+                return Err(error);
+            }
+
+            let root = temporary_root.join(&stem);
+            match DirBuilder::new().mode(0o700).create(&root) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    fs::remove_file(&claim)?;
+                    continue;
+                }
+                Err(error) => {
+                    let _ = fs::remove_file(&claim);
+                    return Err(error);
+                }
+            }
+            let coordination = root.join("coordination");
+            if let Err(error) = DirBuilder::new().mode(0o700).create(&coordination) {
+                let _ = fs::remove_dir(&root);
+                let _ = fs::remove_file(&claim);
+                return Err(error);
+            }
+
+            let mut candidate = Self {
+                token,
+                root,
+                claim,
+                namespaces: Vec::with_capacity(2),
+                cleaned: false,
+            };
+            let mut collision = false;
+            for suffix in ["a", "b"] {
+                let name = format!("opc616-{}-{suffix}", candidate.token);
+                let namespace_path = PathBuf::from("/run/netns").join(&name);
+                if path_exists(&namespace_path)? {
+                    collision = true;
+                    break;
+                }
+                let output = run_ip(&["netns", "add", &name])?;
+                if output.status.success() {
+                    candidate.namespaces.push(name);
+                } else if path_exists(&namespace_path)? {
+                    // Creation did not establish ownership. Leave the path
+                    // untouched and retry with a fresh random identity.
+                    collision = true;
+                    break;
+                } else {
+                    return Err(command_error(
+                        "create collision-free network namespace",
+                        &output,
+                    ));
+                }
+            }
+
+            if collision {
+                candidate.cleanup()?;
+                continue;
+            }
+
+            return Ok(candidate);
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not claim a collision-free privileged test identity",
+        ))
+    }
+
+    fn namespace_a(&self) -> &str {
+        &self.namespaces[0]
+    }
+
+    fn namespace_b(&self) -> &str {
+        &self.namespaces[1]
+    }
+
+    fn store_path(&self) -> PathBuf {
+        self.root.join("store")
+    }
+
+    fn ready_path(&self, role: &str) -> PathBuf {
+        self.root.join("coordination").join(format!("{role}.ready"))
+    }
+
+    fn handle_path(&self, role: &str) -> PathBuf {
+        self.root
+            .join("coordination")
+            .join(format!("{role}.handle"))
+    }
+
+    fn readiness_bytes(&self, role: &str, child_pid: u32) -> Vec<u8> {
+        format!("{}:{role}:{child_pid}:ready\n", self.token).into_bytes()
+    }
+
+    fn child_command(&self, namespace: &str, role: &str) -> io::Result<Command> {
+        let executable = env::current_exe()?;
+        let mut command = Command::new("ip");
+        command
+            .arg("netns")
+            .arg("exec")
+            .arg(namespace)
+            .arg(executable)
+            .args([
+                "--exact",
+                CHILD_TEST_NAME,
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD_ROLE_ENV, role)
+            .env(CHILD_ROOT_ENV, &self.root)
+            .env(CHILD_TOKEN_ENV, &self.token)
+            .env("LC_ALL", "C")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        Ok(command)
+    }
+
+    fn cleanup(mut self) -> io::Result<()> {
+        let mut first_error = None;
+        cleanup_owned_resources(
+            &mut self.namespaces,
+            &self.root,
+            &self.claim,
+            &mut first_error,
+        );
+        self.cleaned = first_error.is_none()
+            && !path_exists(&self.root)?
+            && !path_exists(&self.claim)?
+            && self.namespaces.is_empty();
+        if !self.cleaned && first_error.is_none() {
+            first_error = Some(io::Error::other(
+                "privileged fixture cleanup assertions failed",
+            ));
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for PrivilegedFixture {
+    fn drop(&mut self) {
+        if self.cleaned {
+            return;
+        }
+        let mut first_error = None;
+        cleanup_owned_resources(
+            &mut self.namespaces,
+            &self.root,
+            &self.claim,
+            &mut first_error,
+        );
+        self.cleaned = true;
+    }
+}
+
+fn cleanup_owned_resources(
+    namespaces: &mut Vec<String>,
+    root: &Path,
+    claim: &Path,
+    first_error: &mut Option<io::Error>,
+) {
+    let owned_names = std::mem::take(namespaces);
+    for name in owned_names.into_iter().rev() {
+        if let Err(error) = remove_owned_namespace(&name) {
+            namespaces.push(name);
+            record_first_error(first_error, error);
+        }
+    }
+
+    if let Err(error) = fs::remove_dir_all(root) {
+        if error.kind() != io::ErrorKind::NotFound {
+            record_first_error(first_error, error);
+        }
+    }
+    let root_removed = match path_exists(root) {
+        Ok(false) => true,
+        Ok(true) => {
+            record_first_error(
+                first_error,
+                io::Error::other("owned store root remained after cleanup"),
+            );
+            false
+        }
+        Err(error) => {
+            record_first_error(first_error, error);
+            false
+        }
+    };
+
+    // Keep the exclusive claim if either namespace or the store root could
+    // not be retired. A future random collision must never reinterpret those
+    // leftovers as newly owned resources.
+    if !namespaces.is_empty() || !root_removed {
+        return;
+    }
+
+    if let Err(error) = fs::remove_file(claim) {
+        if error.kind() != io::ErrorKind::NotFound {
+            record_first_error(first_error, error);
+        }
+    }
+    match path_exists(claim) {
+        Ok(false) => {}
+        Ok(true) => record_first_error(
+            first_error,
+            io::Error::other("owned resource claim remained after cleanup"),
+        ),
+        Err(error) => record_first_error(first_error, error),
+    }
+}
+
+fn publish_readiness(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    File::open(
+        path.parent()
+            .ok_or_else(|| io::Error::other("readiness path has no parent"))?,
+    )?
+    .sync_all()
+}
+
+fn read_recovery_handle(path: &Path) -> io::Result<XfrmObjectInstallRecoveryHandle> {
+    let bytes = fs::read(path)?;
+    let encoded: [u8; XFRM_OBJECT_INSTALL_RECOVERY_HANDLE_BYTES] = bytes
+        .try_into()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid recovery handle size"))?;
+    Ok(XfrmObjectInstallRecoveryHandle::from_bytes(encoded))
+}
+
+fn authenticated_wrong_incarnation_record(
+    mut encoded: [u8; XFRM_OBJECT_INSTALL_RECOVERY_HANDLE_BYTES],
+    key: &[u8; 32],
+) -> TestResult<[u8; XFRM_OBJECT_INSTALL_RECOVERY_HANDLE_BYTES]> {
+    let original = encoded[ACTOR_INCARNATION_RANGE].to_vec();
+    encoded[ACTOR_INCARNATION_RANGE].fill(0x5a);
+    if original == encoded[ACTOR_INCARNATION_RANGE] {
+        encoded[ACTOR_INCARNATION_RANGE].fill(0xa5);
+    }
+    let mut mac = HmacSha256::new_from_slice(key)
+        .map_err(|_| io::Error::other("construct recovery-record authenticator"))?;
+    mac.update(RECORD_AUTH_DOMAIN);
+    mac.update(&encoded[..RECORD_BODY_BYTES]);
+    encoded[RECORD_BODY_BYTES..].copy_from_slice(&mac.finalize().into_bytes());
+    Ok(encoded)
+}
+
+fn poison_acquired_record_incarnation(store_root: &Path, key: &[u8; 32]) -> TestResult {
+    let mut acquired = Vec::new();
+    for entry in fs::read_dir(store_root)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name
+            .to_str()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "non-UTF-8 store entry"))?;
+        if name.starts_with("acquired-") {
+            acquired.push(entry.path());
+        }
+    }
+    if acquired.len() != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "expected exactly one acquired durable record",
+        )
+        .into());
+    }
+    let record_path = acquired
+        .pop()
+        .ok_or_else(|| io::Error::other("acquired durable record disappeared"))?;
+    let path_metadata = fs::symlink_metadata(&record_path)?;
+    if !path_metadata.file_type().is_file()
+        || path_metadata.mode() & 0o7777 != 0o600
+        || path_metadata.nlink() != 1
+        || path_metadata.len() != XFRM_OBJECT_INSTALL_RECOVERY_HANDLE_BYTES as u64
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "acquired durable record metadata is invalid",
+        )
+        .into());
+    }
+
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW)
+        .open(&record_path)?;
+    let descriptor_metadata = file.metadata()?;
+    if descriptor_metadata.dev() != path_metadata.dev()
+        || descriptor_metadata.ino() != path_metadata.ino()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "acquired durable record identity changed while opening",
+        )
+        .into());
+    }
+    let mut encoded = [0_u8; XFRM_OBJECT_INSTALL_RECOVERY_HANDLE_BYTES];
+    file.read_exact(&mut encoded)?;
+    let poisoned = authenticated_wrong_incarnation_record(encoded, key)?;
+    file.rewind()?;
+    file.write_all(&poisoned)?;
+    file.sync_all()?;
+
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW)
+        .open(store_root)?;
+    directory.sync_all()?;
+    let final_metadata = file.metadata()?;
+    if !final_metadata.file_type().is_file()
+        || final_metadata.mode() & 0o7777 != 0o600
+        || final_metadata.nlink() != 1
+        || final_metadata.len() != XFRM_OBJECT_INSTALL_RECOVERY_HANDLE_BYTES as u64
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "poisoned durable record metadata changed",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn durable_child_request(role: &str) -> TestResult<XfrmObjectInstallRequest> {
+    match role {
+        ROLE_SA_ACQUIRED | ROLE_SA_NO_MUTATION => Ok(sa_object_request()),
+        ROLE_POLICY_ACQUIRED => Ok(policy_object_request(POLICY_IF_ID_OWNED)),
+        _ => Err(io::Error::new(io::ErrorKind::InvalidInput, "unknown durable child role").into()),
+    }
+}
+
+fn run_durable_crash_child(role: &str, root: &Path, token: &str) -> TestResult {
+    let (backend, store) = LinuxXfrmBackend::new()
+        .bind_current_network_namespace_with_object_recovery(
+            root.join("store"),
+            proof_key(token)?,
+        )?;
+    let outcome = block_on(backend.run_durable_object_install(
+        &store,
+        operation_id(token)?,
+        operation_generation(),
+        durable_child_request(role)?,
+    ))?;
+    let expected = match role {
+        ROLE_SA_ACQUIRED | ROLE_POLICY_ACQUIRED => {
+            matches!(&outcome, XfrmObjectInstallDurableOutcome::Acquired(_))
+        }
+        ROLE_SA_NO_MUTATION => {
+            matches!(&outcome, XfrmObjectInstallDurableOutcome::NoMutation(_))
+        }
+        _ => false,
+    };
+    if !expected {
+        return Err(io::Error::other("durable child observed an unexpected outcome").into());
+    }
+
+    let handle_path = root.join("coordination").join(format!("{role}.handle"));
+    publish_readiness(&handle_path, &outcome.handle().to_bytes())?;
+    let ready_path = root.join("coordination").join(format!("{role}.ready"));
+    let evidence = format!("{token}:{role}:{}:ready\n", std::process::id());
+    publish_readiness(&ready_path, evidence.as_bytes())?;
+    child_wait_for_sigkill()
+}
+
+struct TestChild {
+    child: Option<Child>,
+}
+
+impl TestChild {
+    fn spawn(mut command: Command) -> io::Result<Self> {
+        Ok(Self {
+            child: Some(command.spawn()?),
+        })
+    }
+
+    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        self.child
+            .as_mut()
+            .ok_or_else(|| io::Error::other("child was already reaped"))?
+            .try_wait()
+    }
+
+    fn id(&self) -> io::Result<u32> {
+        self.child
+            .as_ref()
+            .map(Child::id)
+            .ok_or_else(|| io::Error::other("child was already reaped"))
+    }
+
+    fn wait_for_readiness(&mut self, path: &Path, expected: &[u8]) -> io::Result<()> {
+        let deadline = Instant::now() + CHILD_READY_TIMEOUT;
+        loop {
+            match fs::read(path) {
+                Ok(actual) if actual == expected => return Ok(()),
+                Ok(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "child published malformed readiness evidence",
+                    ));
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            if let Some(status) = self.try_wait()? {
+                return Err(io::Error::other(format!(
+                    "child exited before readiness with status {status}"
+                )));
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "child readiness deadline elapsed",
+                ));
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn kill_and_reap(mut self) -> io::Result<Output> {
+        let child = self
+            .child
+            .as_mut()
+            .ok_or_else(|| io::Error::other("child was already reaped"))?;
+        child.kill()?;
+        wait_for_exit(child, CHILD_EXIT_TIMEOUT)?;
+        self.child
+            .take()
+            .ok_or_else(|| io::Error::other("child was already reaped"))?
+            .wait_with_output()
+    }
+}
+
+impl Drop for TestChild {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            if child.try_wait().ok().flatten().is_none() {
+                let _ = child.kill();
+                let _ = wait_for_exit(&mut child, CHILD_EXIT_TIMEOUT);
+            }
+            let _ = child.wait();
+        }
+    }
+}
+
+fn wait_for_exit(child: &mut Child, timeout: Duration) -> io::Result<ExitStatus> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "child exit deadline elapsed",
+            ));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn assert_sigkill(output: &Output) -> io::Result<()> {
+    if output.status.signal() == Some(nix::libc::SIGKILL) {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "child did not terminate via SIGKILL: status {}",
+            output.status
+        )))
+    }
+}
+
+fn crash_durable_operation(
+    fixture: &PrivilegedFixture,
+    namespace: &str,
+    role: &str,
+) -> TestResult<XfrmObjectInstallRecoveryHandle> {
+    let ready_path = fixture.ready_path(role);
+    let handle_path = fixture.handle_path(role);
+    let mut child = TestChild::spawn(fixture.child_command(namespace, role)?)?;
+    let ready_bytes = fixture.readiness_bytes(role, child.id()?);
+    child.wait_for_readiness(&ready_path, &ready_bytes)?;
+    let output = child.kill_and_reap()?;
+    assert_sigkill(&output)?;
+    Ok(read_recovery_handle(&handle_path)?)
+}
+
+fn child_context() -> io::Result<Option<(String, PathBuf, String)>> {
+    let Some(role) = env::var_os(CHILD_ROLE_ENV) else {
+        return Ok(None);
+    };
+    let role = role
+        .into_string()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "non-UTF-8 child role"))?;
+    let root = PathBuf::from(
+        env::var_os(CHILD_ROOT_ENV)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing child root"))?,
+    );
+    let token = env::var(CHILD_TOKEN_ENV)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "missing child token"))?;
+    Ok(Some((role, root, token)))
+}
+
+fn child_wait_for_sigkill() -> ! {
+    thread::sleep(CHILD_FAILSAFE_TIMEOUT);
+    panic!("privileged recovery child was not killed by its parent")
+}
+
+#[test]
+#[ignore = "child role launched only by the privileged parent detector"]
+fn xfrm_object_recovery_privileged_child() -> TestResult {
+    let Some((role, root, token)) = child_context()? else {
+        return Ok(());
+    };
+    match role.as_str() {
+        ROLE_HARNESS_SIGKILL => {
+            let ready = root.join("coordination").join(format!("{role}.ready"));
+            let evidence = format!("{token}:{role}:{}:ready\n", std::process::id());
+            publish_readiness(&ready, evidence.as_bytes())?;
+            child_wait_for_sigkill()
+        }
+        ROLE_SA_ACQUIRED | ROLE_SA_NO_MUTATION | ROLE_POLICY_ACQUIRED => {
+            run_durable_crash_child(&role, &root, &token)
+        }
+        _ => Err(io::Error::new(io::ErrorKind::InvalidInput, "unknown child role").into()),
+    }
+}
+
+#[test]
+#[ignore = "requires root, CAP_SYS_ADMIN/CAP_NET_ADMIN, iproute2, and named netns support"]
+fn collision_safe_sigkill_harness_preserves_parent_owned_cleanup() -> TestResult {
+    if !privileged_enabled() {
+        return Ok(());
+    }
+
+    let fixture = PrivilegedFixture::provision()?;
+    assert_ne!(fixture.namespace_a(), fixture.namespace_b());
+    assert!(
+        !path_exists(&fixture.store_path())?,
+        "the durable API must exclusively create its own store"
+    );
+
+    let backend_a = bind_namespace(fixture.namespace_a())?;
+    let backend_b = bind_namespace(fixture.namespace_b())?;
+    let XfrmObjectInstallRequest::Sa(sa) = sa_object_request() else {
+        return Err(io::Error::other("SA fixture changed object kind").into());
+    };
+    block_on(backend_a.install_sa(sa))?;
+    assert_sa_presence(&backend_a, true)?;
+    assert_sa_presence(&backend_b, false)?;
+
+    for if_id in [POLICY_IF_ID_OWNED, POLICY_IF_ID_NEIGHBOR] {
+        let XfrmObjectInstallRequest::Policy(policy) = policy_object_request(if_id) else {
+            return Err(io::Error::other("policy fixture changed object kind").into());
+        };
+        block_on(backend_a.install_policy(policy))?;
+        assert_eq!(policy_if_id_count(fixture.namespace_a(), if_id)?, 1);
+        assert_eq!(policy_if_id_count(fixture.namespace_b(), if_id)?, 0);
+    }
+
+    let role = ROLE_HARNESS_SIGKILL;
+    let ready_path = fixture.ready_path(role);
+    let mut child = TestChild::spawn(fixture.child_command(fixture.namespace_a(), role)?)?;
+    let ready_bytes = fixture.readiness_bytes(role, child.id()?);
+    child.wait_for_readiness(&ready_path, &ready_bytes)?;
+    let output = child.kill_and_reap()?;
+    assert_sigkill(&output)?;
+
+    drop(backend_a);
+    drop(backend_b);
+    fixture.cleanup()?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires root, CAP_SYS_ADMIN/CAP_NET_ADMIN, iproute2, and named netns support"]
+fn acquired_sa_is_recovered_after_real_process_loss() -> TestResult {
+    if !privileged_enabled() {
+        return Ok(());
+    }
+
+    let fixture = PrivilegedFixture::provision()?;
+    let handle = crash_durable_operation(&fixture, fixture.namespace_a(), ROLE_SA_ACQUIRED)?;
+    let (backend, store) = bind_namespace_with_recovery(fixture.namespace_a(), &fixture)?;
+    assert_sa_presence(&backend, true)?;
+    assert_eq!(
+        store.inspect(&handle)?,
+        XfrmObjectInstallDurablePhase::Acquired
+    );
+    let blocked = block_on(backend.remove_sa(sa_remove_request()))
+        .expect_err("atomic restart binding must activate the retained cleanup gate");
+    assert!(matches!(blocked, XfrmError::Unavailable));
+    assert_sa_presence(&backend, true)?;
+
+    let outcome = block_on(backend.recover_durable_object_install(
+        &store,
+        operation_id(&fixture.token)?,
+        operation_generation(),
+        sa_object_request(),
+    ))?;
+    assert!(matches!(
+        outcome,
+        XfrmObjectInstallRestartOutcome::OwnedResidueRetired
+    ));
+    assert_sa_presence(&backend, false)?;
+
+    drop(store);
+    drop(backend);
+    fixture.cleanup()?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires root, CAP_SYS_ADMIN/CAP_NET_ADMIN, iproute2, and named netns support"]
+fn already_exists_crash_never_removes_preexisting_sa() -> TestResult {
+    if !privileged_enabled() {
+        return Ok(());
+    }
+
+    let fixture = PrivilegedFixture::provision()?;
+    let preinstaller = bind_namespace(fixture.namespace_a())?;
+    block_on(preinstaller.install_sa(sa_install_request()))?;
+    assert_sa_presence(&preinstaller, true)?;
+    drop(preinstaller);
+
+    let handle = crash_durable_operation(&fixture, fixture.namespace_a(), ROLE_SA_NO_MUTATION)?;
+    let (backend, store) = bind_namespace_with_recovery(fixture.namespace_a(), &fixture)?;
+    assert_eq!(
+        store.inspect(&handle)?,
+        XfrmObjectInstallDurablePhase::NoMutation
+    );
+
+    let outcome = block_on(backend.recover_durable_object_install(
+        &store,
+        operation_id(&fixture.token)?,
+        operation_generation(),
+        sa_object_request(),
+    ))?;
+    assert!(matches!(
+        outcome,
+        XfrmObjectInstallRestartOutcome::NoMutation
+    ));
+    // A recovery implementation that substitutes matching readback for the
+    // authenticated NoMutation result would delete this foreign SA.
+    assert_sa_presence(&backend, true)?;
+
+    drop(store);
+    drop(backend);
+    fixture.cleanup()?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires root, CAP_SYS_ADMIN/CAP_NET_ADMIN, iproute2, and named netns support"]
+fn stale_receipt_cannot_remove_same_identity_replacement() -> TestResult {
+    if !privileged_enabled() {
+        return Ok(());
+    }
+
+    let fixture = PrivilegedFixture::provision()?;
+    let handle = crash_durable_operation(&fixture, fixture.namespace_a(), ROLE_SA_ACQUIRED)?;
+    let (backend, store) = bind_namespace_with_recovery(fixture.namespace_a(), &fixture)?;
+    assert_eq!(
+        store.inspect(&handle)?,
+        XfrmObjectInstallDurablePhase::Acquired
+    );
+
+    let phase = block_on(backend.finalize_durable_object_install(
+        &store,
+        operation_id(&fixture.token)?,
+        operation_generation(),
+        sa_object_request(),
+    ))?;
+    assert_eq!(phase, XfrmObjectInstallDurablePhase::Committed);
+    assert_sa_presence(&backend, true)?;
+
+    // Both ordinary mutations pass through the bound namespace actor. It
+    // advances the durable writer epoch before deleting the old object and
+    // before installing its exact same-identity replacement.
+    block_on(backend.remove_sa(sa_remove_request()))?;
+    assert_sa_presence(&backend, false)?;
+    block_on(backend.install_sa(sa_install_request()))?;
+    assert_sa_presence(&backend, true)?;
+
+    let error = block_on(backend.recover_durable_object_install(
+        &store,
+        operation_id(&fixture.token)?,
+        operation_generation(),
+        sa_object_request(),
+    ))
+    .expect_err("retired receipt must not recover a same-identity replacement");
+    assert!(matches!(
+        error,
+        XfrmObjectInstallDurableError::NotFound | XfrmObjectInstallDurableError::Stale
+    ));
+    // Without current-phase/generation validation, matching readback would
+    // make the replacement indistinguishable and this assertion would fail.
+    assert_sa_presence(&backend, true)?;
+
+    drop(store);
+    drop(backend);
+    fixture.cleanup()?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires root, CAP_SYS_ADMIN/CAP_NET_ADMIN, iproute2, and named netns support"]
+fn wrong_namespace_and_durable_writer_incarnation_fail_closed() -> TestResult {
+    if !privileged_enabled() {
+        return Ok(());
+    }
+
+    let fixture = PrivilegedFixture::provision()?;
+    let foreign_backend = bind_namespace(fixture.namespace_b())?;
+    block_on(foreign_backend.install_sa(sa_install_request()))?;
+    assert_sa_presence(&foreign_backend, true)?;
+    drop(foreign_backend);
+
+    let handle = crash_durable_operation(&fixture, fixture.namespace_a(), ROLE_SA_ACQUIRED)?;
+    let wrong_binding = try_bind_namespace_with_recovery(
+        fixture.namespace_b(),
+        fixture.store_path(),
+        &fixture.token,
+    )?
+    .expect_err("store from another namespace must be rejected");
+    assert!(matches!(
+        wrong_binding,
+        XfrmObjectRecoveryBindError::Store {
+            source: XfrmObjectInstallDurableError::WrongBinding
+        }
+    ));
+    // The object is deliberately identical. Omitting namespace validation
+    // would let matching readback authorize deletion in namespace B.
+    let wrong_namespace = bind_namespace(fixture.namespace_b())?;
+    assert_sa_presence(&wrong_namespace, true)?;
+    drop(wrong_namespace);
+
+    let (backend, store) = bind_namespace_with_recovery(fixture.namespace_a(), &fixture)?;
+    assert_eq!(
+        store.inspect(&handle)?,
+        XfrmObjectInstallDurablePhase::Acquired
+    );
+    poison_acquired_record_incarnation(&fixture.store_path(), &proof_key_bytes(&fixture.token))?;
+    let wrong_incarnation = block_on(backend.recover_durable_object_install(
+        &store,
+        operation_id(&fixture.token)?,
+        operation_generation(),
+        sa_object_request(),
+    ))
+    .expect_err("authenticated record from another writer incarnation must be rejected");
+    assert_eq!(
+        wrong_incarnation,
+        XfrmObjectInstallDurableError::WrongIncarnation
+    );
+    // A correctly authenticated but wrong durable-writer incarnation must
+    // still perform no backend operation.
+    assert_sa_presence(&backend, true)?;
+    let foreign_backend = bind_namespace(fixture.namespace_b())?;
+    assert_sa_presence(&foreign_backend, true)?;
+
+    drop(foreign_backend);
+    drop(store);
+    drop(backend);
+    fixture.cleanup()?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires root, CAP_SYS_ADMIN/CAP_NET_ADMIN, iproute2, and named netns support"]
+fn scoped_policy_recovery_removes_only_the_owned_if_id() -> TestResult {
+    if !privileged_enabled() {
+        return Ok(());
+    }
+
+    let fixture = PrivilegedFixture::provision()?;
+    let preinstaller = bind_namespace(fixture.namespace_a())?;
+    block_on(preinstaller.install_policy(policy_install_request(POLICY_IF_ID_NEIGHBOR)))?;
+    assert_eq!(
+        policy_if_id_count(fixture.namespace_a(), POLICY_IF_ID_NEIGHBOR)?,
+        1
+    );
+    drop(preinstaller);
+
+    let handle = crash_durable_operation(&fixture, fixture.namespace_a(), ROLE_POLICY_ACQUIRED)?;
+    assert_eq!(
+        policy_if_id_count(fixture.namespace_a(), POLICY_IF_ID_OWNED)?,
+        1
+    );
+    assert_eq!(
+        policy_if_id_count(fixture.namespace_a(), POLICY_IF_ID_NEIGHBOR)?,
+        1
+    );
+
+    let (backend, store) = bind_namespace_with_recovery(fixture.namespace_a(), &fixture)?;
+    assert_eq!(
+        store.inspect(&handle)?,
+        XfrmObjectInstallDurablePhase::Acquired
+    );
+    let outcome = block_on(backend.recover_durable_object_install(
+        &store,
+        operation_id(&fixture.token)?,
+        operation_generation(),
+        policy_object_request(POLICY_IF_ID_OWNED),
+    ))?;
+    assert!(matches!(
+        outcome,
+        XfrmObjectInstallRestartOutcome::OwnedResidueRetired
+    ));
+    assert_eq!(
+        policy_if_id_count(fixture.namespace_a(), POLICY_IF_ID_OWNED)?,
+        0
+    );
+    // Dropping if_id from the fingerprint or delete request would either
+    // leave the owned policy behind or target its identical neighbor.
+    assert_eq!(
+        policy_if_id_count(fixture.namespace_a(), POLICY_IF_ID_NEIGHBOR)?,
+        1
+    );
+
+    drop(store);
+    drop(backend);
+    fixture.cleanup()?;
+    Ok(())
+}
