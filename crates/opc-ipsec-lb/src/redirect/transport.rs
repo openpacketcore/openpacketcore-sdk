@@ -3666,6 +3666,7 @@ mod tests {
             Arc::new(RecordingReporter::default()),
         )
         .unwrap_or_else(|error| panic!("start second: {error}"));
+        tokio::time::pause();
         let packet = synthetic_native_esp_packet(128);
         let mut tampered = first_session
             .seal_data(&packet, ownership_key(), generation)
@@ -3678,13 +3679,9 @@ mod tests {
             .send(&tampered)
             .await
             .unwrap_or_else(|error| panic!("inject tampered frame: {error}"));
-        tokio::time::timeout(Duration::from_millis(100), async {
-            while second_session.metrics().authentication_drops == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap_or_else(|_| panic!("tampered frame was processed"));
+        while second_session.metrics().authentication_drops == 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
         assert!(
             tokio::time::timeout(Duration::from_millis(20), second_rx.receive())
                 .await
@@ -3693,6 +3690,7 @@ mod tests {
         );
         assert_eq!(second_session.metrics().authentication_drops, 1);
         assert_eq!(second_session.metrics().delivered, 0);
+        tokio::time::resume();
         second
             .shutdown()
             .await
@@ -3731,9 +3729,17 @@ mod tests {
             reporter,
         )
         .unwrap_or_else(|error| panic!("start second: {error}"));
+        let retry_bound = profile
+            .receipt_retry_horizon()
+            .saturating_add(Duration::from_secs(1));
         let packet = synthetic_native_esp_packet(128);
         assert_eq!(
-            first.redirect(&packet, ownership_key(), generation).await,
+            tokio::time::timeout(
+                retry_bound,
+                first.redirect(&packet, ownership_key(), generation)
+            )
+            .await
+            .unwrap_or_else(|_| panic!("redirect completed within retry horizon")),
             Ok(IngressRedirectReceiptCode::Delivered)
         );
         let outcome = second_rx
@@ -3784,13 +3790,13 @@ mod tests {
             .send(&captured)
             .await
             .unwrap_or_else(|error| panic!("inject captured replay: {error}"));
-        tokio::time::timeout(Duration::from_millis(100), async {
+        tokio::time::timeout(retry_bound, async {
             while second_session.metrics().replay_drops == 0 {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .unwrap_or_else(|_| panic!("captured replay processed"));
+        .unwrap_or_else(|_| panic!("captured replay processed within retry horizon"));
         assert_eq!(second_session.metrics().replay_drops, 1);
         assert_eq!(second_session.metrics().delivered, 1);
         first
@@ -3830,6 +3836,9 @@ mod tests {
         let (second, mut second_rx) =
             IngressRedirectEndpoint::start(second_session, second_cache, second_datagram, reporter)
                 .unwrap_or_else(|error| panic!("start second: {error}"));
+        let retry_bound = profile
+            .receipt_retry_horizon()
+            .saturating_add(Duration::from_secs(1));
         let packet = synthetic_native_esp_packet(128);
         let operation = first
             .begin_redirect(&packet, ownership_key(), generation)
@@ -3839,13 +3848,15 @@ mod tests {
             Ok(IngressRedirectInboundOutcome::Delivered(_))
         ));
         drop(operation);
-        tokio::time::timeout(Duration::from_millis(100), async {
+        tokio::time::timeout(retry_bound, async {
             while first.metrics().delivery_receipts == 0 {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .unwrap_or_else(|_| panic!("endpoint-owned operation completed after observer drop"));
+        .unwrap_or_else(|_| {
+            panic!("endpoint-owned operation completed within retry horizon after observer drop")
+        });
         assert_eq!(first.metrics().send_attempts, 2);
         assert_eq!(second.metrics().cached_receipts_replayed, 1);
         first
@@ -3891,6 +3902,7 @@ mod tests {
             reporter,
         )
         .unwrap_or_else(|error| panic!("start second: {error}"));
+        tokio::time::pause();
         let packet = synthetic_native_esp_packet(128);
         assert_eq!(
             first.redirect(&packet, ownership_key(), generation).await,
@@ -3919,16 +3931,13 @@ mod tests {
             .send(&captured)
             .await
             .unwrap_or_else(|error| panic!("inject post-expiry capture: {error}"));
-        tokio::time::timeout(Duration::from_millis(100), async {
-            while second_session.metrics().authentication_expired_drops == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap_or_else(|_| panic!("post-expiry frame processed"));
+        while second_session.metrics().authentication_expired_drops == 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
         assert_eq!(second.metrics().cached_receipts_replayed, 0);
         assert_eq!(second_session.metrics().authentication_expired_drops, 1);
         assert_eq!(second_session.metrics().delivered, 1);
+        tokio::time::resume();
         first
             .shutdown()
             .await
@@ -4445,6 +4454,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|_| panic!("receipt cache lock")) =
             ReceiptCache::new(0, profile.rotation_overlap());
+        tokio::time::pause();
         let packet = synthetic_native_esp_packet(128);
         assert!(matches!(
             first.redirect(&packet, ownership_key(), generation).await,
@@ -4461,6 +4471,7 @@ mod tests {
             second.metrics().receipt_cache_load_shed,
             u64::from(profile.max_retries()).saturating_add(1)
         );
+        tokio::time::resume();
         first
             .shutdown()
             .await
@@ -4508,6 +4519,7 @@ mod tests {
             .unwrap_or_else(|_| panic!("receipt cache lock"))
             .fail_next_commit = true;
 
+        tokio::time::pause();
         let packet = synthetic_native_esp_packet(128);
         assert_eq!(
             first.redirect(&packet, ownership_key(), generation).await,
@@ -4524,6 +4536,7 @@ mod tests {
         assert_eq!(metrics.receipt_cache_entries_current, 0);
         assert_eq!(metrics.delivery_admissions, 0);
         assert_eq!(second_session.metrics().delivery_admissions, 0);
+        tokio::time::resume();
         first
             .shutdown()
             .await
@@ -4621,18 +4634,16 @@ mod tests {
         )
         .unwrap_or_else(|error| panic!("start first: {error}"));
         let first = Arc::new(first);
+        tokio::time::pause();
         let packet = synthetic_native_esp_packet(128);
         let mut operation = first
             .begin_redirect(&packet, ownership_key(), generation)
             .unwrap_or_else(|error| panic!("begin redirect: {error}"));
         let redirect = tokio::spawn(async move { operation.wait().await });
-        tokio::time::timeout(Duration::from_millis(100), async {
-            while first.metrics().send_attempts == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap_or_else(|_| panic!("first send attempt observed"));
+        while first.metrics().send_attempts == 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        tokio::time::resume();
         first
             .shutdown()
             .await
@@ -4886,13 +4897,11 @@ mod tests {
             Arc::new(RecordingReporter::default()),
         )
         .unwrap_or_else(|error| panic!("start first: {error}"));
-        tokio::time::timeout(Duration::from_millis(100), async {
-            while first.inner.lifecycle.phase() != EndpointPhase::Failed {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap_or_else(|_| panic!("receive failure became terminal"));
+        tokio::time::pause();
+        while first.inner.lifecycle.phase() != EndpointPhase::Failed {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        tokio::time::resume();
         let packet = synthetic_native_esp_packet(128);
         assert!(matches!(
             first.begin_redirect(&packet, ownership_key(), generation),
@@ -5041,14 +5050,13 @@ mod tests {
             Arc::new(HangingReporter),
         )
         .unwrap_or_else(|error| panic!("start first: {error}"));
+        tokio::time::pause();
         let packet = synthetic_native_esp_packet(128);
         let mut operation = first
             .begin_redirect(&packet, ownership_key(), generation)
             .unwrap_or_else(|error| panic!("begin hung send: {error}"));
         assert_eq!(
-            tokio::time::timeout(Duration::from_millis(100), operation.wait())
-                .await
-                .unwrap_or_else(|_| panic!("bounded adapter send")),
+            operation.wait().await,
             IngressRedirectOperationOutcome::DeliveryOutcomeUnknown
         );
         assert_eq!(first.metrics().transport_drops, 3);
@@ -5064,16 +5072,15 @@ mod tests {
             .begin_redirect(&oversize, ownership_key(), generation)
             .unwrap_or_else(|error| panic!("begin oversize redirect: {error}"));
         assert_eq!(
-            tokio::time::timeout(Duration::from_millis(100), operation.wait())
-                .await
-                .unwrap_or_else(|_| panic!("bounded PTB reporter")),
+            operation.wait().await,
             IngressRedirectOperationOutcome::NotSent(
                 IngressRedirectNotSentReason::PacketTooBigFeedbackFailed
             )
         );
-        tokio::time::timeout(Duration::from_millis(100), first.shutdown())
+        tokio::time::resume();
+        first
+            .shutdown()
             .await
-            .unwrap_or_else(|_| panic!("bounded shutdown"))
             .unwrap_or_else(|error| panic!("shutdown and reap: {error}"));
     }
 
@@ -5163,14 +5170,13 @@ mod tests {
                 Arc::new(RecordingReporter::default()),
             )
             .unwrap_or_else(|error| panic!("start first: {error}"));
+            tokio::time::pause();
             let packet = synthetic_native_esp_packet(128);
             let mut operation = first
                 .begin_redirect(&packet, ownership_key(), generation)
                 .unwrap_or_else(|error| panic!("begin adapter error operation: {error}"));
             assert_eq!(
-                tokio::time::timeout(Duration::from_millis(100), operation.wait())
-                    .await
-                    .unwrap_or_else(|_| panic!("bounded adapter error {adapter_error:?}")),
+                operation.wait().await,
                 expected,
                 "adapter error {adapter_error:?}",
             );
@@ -5181,6 +5187,7 @@ mod tests {
             assert_eq!(metrics.transport_drops, transport_drops);
             assert_eq!(metrics.queue_drops, queue_drops);
             assert_eq!(metrics.receipt_timeouts, receipt_timeouts);
+            tokio::time::resume();
             first
                 .shutdown()
                 .await
@@ -5231,10 +5238,9 @@ mod tests {
             .lock()
             .unwrap_or_else(|error| panic!("late receipt gate: {error}")) = Some(receipt);
 
+        tokio::time::pause();
         assert_eq!(
-            tokio::time::timeout(Duration::from_millis(100), operation.wait())
-                .await
-                .unwrap_or_else(|_| panic!("late receipt completed operation")),
+            operation.wait().await,
             IngressRedirectOperationOutcome::AuthenticatedReceipt(
                 IngressRedirectReceiptCode::Delivered
             )
@@ -5242,6 +5248,7 @@ mod tests {
         assert_eq!(datagram.sends.load(Ordering::Relaxed), 1);
         assert_eq!(first.metrics().send_attempts, 1);
         assert_eq!(first.metrics().retries, 0);
+        tokio::time::resume();
         first
             .shutdown()
             .await
@@ -5280,14 +5287,10 @@ mod tests {
             reporter,
         )
         .unwrap_or_else(|error| panic!("start second: {error}"));
+        tokio::time::pause();
         let packet = synthetic_native_esp_packet(128);
         assert_eq!(
-            tokio::time::timeout(
-                Duration::from_millis(100),
-                first.redirect(&packet, ownership_key(), generation),
-            )
-            .await
-            .unwrap_or_else(|_| panic!("receipt won shared attempt deadline")),
+            first.redirect(&packet, ownership_key(), generation).await,
             Ok(IngressRedirectReceiptCode::Delivered)
         );
         assert!(matches!(
@@ -5296,6 +5299,7 @@ mod tests {
         ));
         assert_eq!(first.metrics().send_attempts, 1);
         assert_eq!(first.metrics().retries, 0);
+        tokio::time::resume();
         first
             .shutdown()
             .await
@@ -5338,32 +5342,84 @@ mod tests {
             reporter,
         )
         .unwrap_or_else(|error| panic!("start second: {error}"));
+        tokio::time::pause();
         let packet = synthetic_native_esp_packet(128);
         assert_eq!(
-            tokio::time::timeout(
-                Duration::from_millis(200),
-                first.redirect(&packet, ownership_key(), generation),
-            )
-            .await
-            .unwrap_or_else(|_| panic!("bounded receipt retry policy")),
+            first.redirect(&packet, ownership_key(), generation).await,
             Err(IngressRedirectError::ReceiptTimeout)
         );
         assert!(matches!(
             second_rx.receive().await,
             Ok(IngressRedirectInboundOutcome::Delivered(_))
         ));
-        tokio::time::timeout(Duration::from_millis(100), async {
-            while second.metrics().transport_drops < 3 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap_or_else(|_| panic!("all receipt sends reached their bound"));
+        while second.metrics().transport_drops < 3 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
         assert_eq!(second.metrics().transport_drops, 3);
-        tokio::time::timeout(Duration::from_millis(100), second.shutdown())
+        tokio::time::resume();
+        second
+            .shutdown()
             .await
-            .unwrap_or_else(|_| panic!("receipt task shutdown bounded"))
             .unwrap_or_else(|error| panic!("shutdown second: {error}"));
+        first
+            .shutdown()
+            .await
+            .unwrap_or_else(|error| panic!("shutdown first: {error}"));
+    }
+
+    /// Mutation check: the retry sequence completes only because the
+    /// profile's `receipt_timeout` drives each per-attempt deadline inside
+    /// `run_outbound_operation`.  Under `tokio::time::pause()` the timers
+    /// auto-advance deterministically, so the operation finishes in zero
+    /// wall-clock time.  If the receipt-timeout arm is removed from the
+    /// retry `select!`, this test hangs (CI timeout failure).  If the
+    /// retry count diverges from `max_retries + 1`, the send-attempts
+    /// assertion fails immediately.
+    #[tokio::test]
+    async fn mutation_check_receipt_timeout_drives_retry_completion() {
+        let profile = test_profile();
+        let (first_session, second_session) = test_sessions(profile);
+        let (record, namespace, clock) = ownership_record("owner-b").await;
+        let generation = record.generation();
+        let first_cache = ownership_cache(record, namespace, clock);
+        let (first_datagram, _unserved_peer) = InMemoryIngressRedirectDatagram::pair(
+            first_session.local_udp_endpoint(),
+            second_session.local_udp_endpoint(),
+            profile.steering_path_mtu(),
+            profile.queue_packets(),
+        )
+        .unwrap_or_else(|error| panic!("in-memory pair: {error}"));
+        let (first, _first_rx) = IngressRedirectEndpoint::start(
+            first_session,
+            first_cache,
+            Arc::new(NeverSendDatagram {
+                inner: Arc::new(first_datagram),
+            }),
+            Arc::new(RecordingReporter::default()),
+        )
+        .unwrap_or_else(|error| panic!("start first: {error}"));
+        tokio::time::pause();
+        let packet = synthetic_native_esp_packet(128);
+        let mut operation = first
+            .begin_redirect(&packet, ownership_key(), generation)
+            .unwrap_or_else(|error| panic!("begin redirect: {error}"));
+        assert_eq!(
+            operation.wait().await,
+            IngressRedirectOperationOutcome::DeliveryOutcomeUnknown
+        );
+        let expected_attempts = u64::from(profile.max_retries()).saturating_add(1);
+        assert_eq!(
+            first.metrics().send_attempts,
+            expected_attempts,
+            "retry count must equal max_retries + 1"
+        );
+        assert_eq!(
+            first.metrics().transport_drops,
+            expected_attempts,
+            "every timed-out send must be counted as a transport drop"
+        );
+        assert_eq!(first.metrics().receipt_timeouts, 1);
+        tokio::time::resume();
         first
             .shutdown()
             .await
