@@ -733,18 +733,9 @@ impl PcoAddressConfiguration {
     /// it sent, and should call [`Self::decode_network_contents_correlated`]
     /// with [`IpcpNakCorrelation::for_request`].
     ///
-    /// Malformed container framing rejects the complete value, because with a
-    /// bad container boundary no sibling boundary is recoverable. A known
-    /// address container carrying the wrong fixed length also rejects the
-    /// complete value; that is this codec's configuration-atomicity policy and
-    /// not a specification requirement, since TS 24.008 states no receiver
-    /// disposition for it and a half-applied DNS or P-CSCF set is worse than
-    /// none. Unknown, well-formed length-delimited containers are skipped. A
-    /// malformed `0x8021` unit is discarded unit-locally, as is an IPCP unit
-    /// placed after a registered network-to-MS container: TS 24.008 defines
-    /// the configuration protocol options list before the additional
-    /// parameters list, and this decoder does not adopt protocol material after
-    /// that boundary.
+    /// Per-container failure dispositions are documented in the
+    /// [per-container failure policy](Self::decode_network_contents_correlated#per-container-failure-policy)
+    /// table on [`Self::decode_network_contents_correlated`].
     ///
     /// # Errors
     ///
@@ -764,6 +755,24 @@ impl PcoAddressConfiguration {
     /// Configure-Requests; see [`IpcpNakCorrelation`] for what each constructor
     /// admits. Whole-value dispositions are as documented on
     /// [`Self::decode_network_contents`].
+    ///
+    /// # Per-container failure policy
+    ///
+    /// Each adopted container class has an explicit, documented disposition for
+    /// malformed contents. The asymmetry between classes is deliberate and
+    /// forms part of this codec's stable contract:
+    ///
+    /// | Container | Malformed disposition | Basis |
+    /// |-----------|----------------------|-------|
+    /// | P-CSCF / DNS address (`0x0001`, `0x0003`, `0x000c`, `0x000d`) | **Whole-value rejection** | Configuration-atomicity policy (codec decision, not spec-mandated). TS 24.008 states no receiver disposition for a wrong-length address container; a half-applied DNS or P-CSCF set is worse than none. |
+    /// | IPv4 Link MTU (`0x0010`) | **Ignored** (unit skipped) | TS 24.008 §10.5.6.3: "If the length of container identifier contents is different from two octets, then it shall be ignored by the receiver." |
+    /// | IPCP (`0x8021`) | **Unit-local discard** (siblings survive) | RFC 1661 §5.3: "Invalid packets are silently discarded." TS 24.008 maps one `0x8021` unit to one RFC 1661 packet, and the outer container boundary is validated before contents are read, so following containers are recoverable. |
+    /// | Unknown / unsupported | **Skipped** | TS 24.008 §10.5.6.3: "the corresponding unit shall be ignored." |
+    ///
+    /// Malformed *framing* (truncated header, declared length beyond the
+    /// remaining input) always rejects the whole value regardless of container
+    /// class, because no sibling boundary is recoverable once the framing is
+    /// corrupt.
     ///
     /// # Errors
     ///
@@ -786,6 +795,10 @@ impl PcoAddressConfiguration {
                 additional_parameters_started = true;
             }
             match unit.identifier {
+                // Failure policy: whole-value rejection (configuration-
+                // atomicity). A wrong-length address container is not an
+                // accident of `?` placement; it is the documented contract
+                // in the per-container failure policy table above.
                 PCO_CONTAINER_P_CSCF_IPV6 => decoded
                     .p_cscf_ipv6
                     .push(decode_ipv6_address(unit.contents)?),
@@ -798,14 +811,14 @@ impl PcoAddressConfiguration {
                 PCO_CONTAINER_DNS_SERVER_IPV4 => decoded
                     .dns_server_ipv4
                     .push(decode_ipv4_address(unit.contents)?),
+                // Failure policy: ignored (TS 24.008 §10.5.6.3 mandates the
+                // receiver ignore a wrong-length instance).
                 PCO_CONTAINER_IPV4_LINK_MTU => decode_ipv4_link_mtu(unit.contents, &mut decoded),
-                // RFC 1661 §5.3: "Invalid packets are silently discarded." TS
-                // 24.008 10.5.6.3 maps one 0x8021 unit to one RFC 1661 packet,
-                // and this unit's outer container boundary was already
-                // validated above, so following containers are recoverable
-                // and are kept. Contrast the address container arms above,
-                // which fail the whole value under this codec's own
-                // configuration-atomicity policy.
+                // Failure policy: unit-local discard (RFC 1661 §5.3: "Invalid
+                // packets are silently discarded"). The outer container
+                // boundary was validated above, so following containers are
+                // recoverable. Contrast the address arms above, which reject
+                // the whole value under configuration-atomicity policy.
                 PCO_PROTOCOL_IPCP => {
                     let outcome = if additional_parameters_started {
                         // TS 24.008 10.5.6.3 defines configuration protocol
@@ -838,16 +851,13 @@ impl PcoAddressConfiguration {
                         });
                     }
                 }
-                // Every other identifier, including an unaccompanied
-                // `0x0012`. TS 24.008 10.5.6.3 lists `0012H` as Reserved in
-                // the network-to-MS direction this function decodes, and
-                // states: "If the additional parameters list contains a
-                // container identifier that is not supported by the receiving
-                // entity the corresponding unit shall be ignored." Its
-                // conditional-presence rule constrains the sender and assigns
-                // the receiver no behaviour, so rejecting here would discard
-                // every address in the same value over a peer's send-side
-                // violation.
+                // Failure policy: skipped (TS 24.008 §10.5.6.3: "the
+                // corresponding unit shall be ignored"). Includes an
+                // unaccompanied `0x0012`, which is Reserved in the
+                // network-to-MS direction. Its conditional-presence rule
+                // constrains the sender and assigns the receiver no behaviour,
+                // so rejecting here would discard every address in the same
+                // value over a peer's send-side violation.
                 _ => {}
             }
         }
