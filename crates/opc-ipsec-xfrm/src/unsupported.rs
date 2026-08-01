@@ -5,9 +5,9 @@ use async_trait::async_trait;
 use crate::backend::XfrmBackend;
 use crate::error::XfrmError;
 use crate::model::{
-    AllocateSpiRequest, InstallPolicyRequest, InstallSaRequest, QuerySaRequest, RekeyPolicyRequest,
-    RekeySaRequest, RelocateSaRequest, RemovePolicyRequest, RemoveSaRequest, SaRelocationIdentity,
-    SaState, SpiAllocation, XfrmProbe,
+    AllocateSpiRequest, ExactRemovePolicyRequest, InstallPolicyRequest, InstallSaRequest,
+    QuerySaRequest, RekeyPolicyRequest, RekeySaRequest, RelocateSaRequest, RemovePolicyRequest,
+    RemoveSaRequest, SaRelocationIdentity, SaState, SpiAllocation, XfrmProbe,
 };
 
 /// XFRM backend that reports [`XfrmError::UnsupportedPlatform`] for every
@@ -70,6 +70,13 @@ impl XfrmBackend for UnsupportedXfrmBackend {
         Err(XfrmError::UnsupportedPlatform)
     }
 
+    async fn remove_policy_exact(
+        &self,
+        _request: ExactRemovePolicyRequest,
+    ) -> Result<(), XfrmError> {
+        Err(XfrmError::UnsupportedPlatform)
+    }
+
     async fn probe(&self) -> Result<XfrmProbe, XfrmError> {
         Ok(XfrmProbe::unsupported())
     }
@@ -78,7 +85,10 @@ impl XfrmBackend for UnsupportedXfrmBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{IpAddress, XfrmBackendKind, XfrmCapability};
+    use crate::model::{
+        IpAddress, RemovePolicyRequest, XfrmBackendKind, XfrmCapability, XfrmDirection,
+        XfrmSelector,
+    };
 
     #[tokio::test]
     async fn unsupported_backend_returns_unsupported_platform_for_all_ops() {
@@ -105,5 +115,31 @@ mod tests {
             backend.sa_relocation_capability().await.unwrap(),
             XfrmCapability::Missing
         );
+    }
+
+    #[tokio::test]
+    async fn unsupported_exact_policy_removal_fails_closed() {
+        let backend = UnsupportedXfrmBackend::new();
+        let removal = RemovePolicyRequest::new(
+            XfrmSelector::new(
+                IpAddress::Ipv4([10, 0, 0, 1]),
+                IpAddress::Ipv4([10, 0, 0, 2]),
+                50,
+            ),
+            XfrmDirection::Out,
+        );
+
+        assert!(matches!(
+            backend
+                .remove_policy_exact(ExactRemovePolicyRequest::new(removal.clone()))
+                .await,
+            Err(XfrmError::UnsupportedPlatform)
+        ));
+        assert!(matches!(
+            backend
+                .remove_policy_exact(ExactRemovePolicyRequest::new(removal).with_if_id(7))
+                .await,
+            Err(XfrmError::UnsupportedPlatform)
+        ));
     }
 }

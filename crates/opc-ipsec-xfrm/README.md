@@ -99,6 +99,16 @@ closes the queue and lets the detached actor drain without blocking `Drop`.
   result requires explicit `Owned`/`Absent`/`Foreign` classification under
   caller-held writer exclusion before any removal, and worker loss
   permanently disables in-process commit and recovery.
+- `LinuxXfrmBackend::bind_current_network_namespace_with_object_recovery`
+  exposes a durable single-object boundary for restart recovery. It opens and
+  authenticates `XfrmObjectInstallRecoveryStore` on the namespace actor before
+  returning any mutation-capable backend handle. The store keeps value-free
+  operation records under a permanent filesystem lease, while
+  `run_durable_object_install`,
+  `finalize_durable_object_install`, and `recover_durable_object_install`
+  serialize the corresponding kernel mutation through the namespace actor.
+  This boundary supplements rather than changes the process-local
+  `XfrmStagedObjectInstall` cancellation and classification API.
 - `InstalledOutboundSaBinding` is an opaque, unforgeable direction authority
   for one exact ESP SA and its sole outbound allow-policy. The only fresh mint
   is `XfrmStagedInstall::run_and_commit_outbound_sa_policy`, after both kernel
@@ -114,6 +124,96 @@ closes the queue and lets the detached actor drain without blocking `Drop`.
   `Ikev2ChildSaXfrmOptions` can carry one shared request ID and exact
   directional initial NAT-T templates without changing the established public
   request struct.
+
+## Durable staged-object restart recovery
+
+Use the durable namespace-bound API when the consumer can stop after an SA-only
+or policy-only install completes but before it records the terminal result. The
+consumer must durably retain the full install request, a generated
+`XfrmObjectInstallOperationId`, a nonzero product generation, the store
+location, and the stable proof-key reference before it submits the operation.
+The store itself persists no address, selector, SPI, mark, interface ID, or key
+material: it contains only authenticated opaque correlation, object kind,
+phase, incarnation, epoch, and independent proof-keyed fingerprints of the
+exact deletion identity and complete install request. Even SA algorithm/key
+bytes are only streamed into the request HMAC and are never persisted.
+
+On every initial start and restart, first call
+`LinuxXfrmBackend::bind_current_network_namespace_with_object_recovery` after
+selecting the target namespace. Store authentication, namespace binding, and
+the permanent lease complete on the actor thread before the method returns the
+backend/store pair. There is deliberately no later asynchronous attachment API:
+it could not prove that this or a prior actor had not already mutated the
+namespace outside the retained epoch.
+
+The required ordering after that atomic bind is:
+
+1. Persist the consumer's poll-admitted record and operation correlation.
+2. Call `run_durable_object_install`. It publishes `Prepared` before actor
+   mutation admission, then durably publishes `Acquired`, `NoMutation`, or
+   `Indeterminate` before returning that outcome.
+3. Durably record the consumer decision. If an acquired object is adopted,
+   call `finalize_durable_object_install` only after that adoption is durable.
+   Finalization surrenders cleanup authority and leaves the object installed.
+4. After restart, consult the consumer record. Finalize an adoption that was
+   already committed; otherwise call `recover_durable_object_install` with the
+   exact retained operation ID, generation, and request. Recovery retires a
+   definitive no-mutation result without removal and removes only residue with
+   authenticated, current `Acquired` authority.
+
+Once admitted, dropping the observing future does not cancel actor work. A
+retry uses the same operation ID, generation, and request; inventing new
+correlation is not reconciliation. A crash while an install is merely
+`Issuing`, including after a kernel acknowledgement but before terminal record
+publication, is deliberately indeterminate and authorizes no deletion. Missing,
+malformed, duplicated, unauthenticated, stale, wrong-request,
+wrong-namespace, or wrong-incarnation state likewise fails closed. An
+`AlreadyExists` acknowledgement becomes durable `NoMutation` and never
+authorizes removal.
+
+Linux has no owner- or generation-conditional `DELSA` or `DELPOLICY`. The
+store therefore implements a cooperating-writer protocol: an unresolved
+`Acquired` or `RemovalAdmitted` record blocks every later mutation admitted by
+that namespace actor, including ordinary `XfrmBackend` operations, until it is
+finalized or recovered. Entering `Issuing` and every independent actor mutation
+burns a durable global writer epoch. `Acquired` already holds the writer gate,
+so publishing `RemovalAdmitted` stays at that current epoch before deletion and
+has no ambiguous half-advanced epoch crash cut. A scoped policy recovery
+additionally proves the exact
+nonzero `XFRMA_IF_ID` with `GETPOLICY` before deletion. These guarantees do not
+exclude another raw-netlink socket, another namespace actor with a different
+store, or packet/product activity outside this protocol. A deployment must use
+one store and one cooperating writer domain for all XFRM identity mutations in
+the namespace; violating that exclusion can let an unconditional delete race a
+same-identity replacement.
+
+As with the process-local staged-object boundary, a durable SA or policy
+removal identity may be unmarked or use only a full-mask lookup mark. A narrow
+mark is rejected before either store publication or backend mutation because
+Linux mark selection is overlap- and insertion-order-sensitive.
+
+The store root must be an absolute path under a trusted parent, owned by the
+effective user, and exactly mode `0700`; record files are mode `0600`. The
+256-bit proof key must come from durable secret configuration, remain stable
+across restart, and never be reconstructed from operation data. Use a local
+filesystem that provides reliable `flock`, `rename(..., RENAME_NOREPLACE)`, and
+file/directory `fsync` semantics. The namespace seal covers nsfs device/inode,
+Linux `SO_NETNS_COOKIE`, and kernel boot identity so a destroyed namespace or
+reboot cannot adopt old authority through inode reuse. The actor holds the root
+lease for its entire lifetime, and the atomic constructor attaches exactly one
+store before exposing the actor. Public handles,
+outcomes, errors, and diagnostics are value-free; a handle is correlation, not
+standalone deletion authority.
+
+The leased root is trusted authoritative, non-rollback storage for this runtime
+crash contract. Do not restore, snapshot-rollback, or copy back an earlier
+complete set of authenticated control, epoch, and operation files, and do not
+allow the same UID or an administrator to rewrite that trusted root. An HMAC
+and a monotonic epoch inside the same directory detect forgery and stale records
+relative to the live inventory, but cannot detect a coherent rollback of the
+directory itself. Deployments where such storage rollback is possible must add
+an independent product monotonic witness outside that rollback domain and must
+not recover until it matches; otherwise unconditional deletion is unsafe.
 
 ## Opaque outbound-SA binding
 

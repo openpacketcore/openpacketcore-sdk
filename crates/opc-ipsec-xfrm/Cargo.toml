@@ -23,11 +23,14 @@ opc-ipsec-xfrm-ebpf-common = { path = "../opc-ipsec-xfrm-ebpf-common", version =
 opc-types = { path = "../opc-types", version = "0.2.0" }
 opc-proto-ikev2 = { path = "../opc-proto-ikev2", version = "0.2.0", optional = true }
 async-trait = { workspace = true }
+rand = { workspace = true }
 subtle = { workspace = true }
 sha2 = { workspace = true }
+sha2-zeroize = { workspace = true }
 thiserror = { workspace = true }
 zeroize = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync", "time"] }
+rustix = { version = "1", features = ["fs", "process"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 aya = { version = "0.14" }
@@ -35,6 +38,7 @@ nix = { workspace = true, features = ["net", "socket"] }
 opc-linux-gtpu-sys = { path = "../opc-linux-gtpu-sys", version = "0.2.0" }
 
 [dev-dependencies]
+hmac = { workspace = true }
 opc-crypto-provider = { path = "../opc-crypto-provider", version = "0.2.0" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
 

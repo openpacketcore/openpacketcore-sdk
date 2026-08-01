@@ -7,6 +7,9 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(unix)]
+use std::path::PathBuf;
+
 use async_trait::async_trait;
 use opc_ipsec_xfrm_ebpf_common::{MarkProfile, IPPROTO_ESP};
 use opc_linux_xfrm_sys::{
@@ -25,9 +28,14 @@ use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 use crate::dscp::{production_runtime, LinuxXfrmDscpMarkingConfig, XfrmDscpRuntime};
+#[cfg(unix)]
+use crate::durable_object::{XfrmObjectInstallRecoveryStore, XfrmObjectRecoveryProofKey};
 use crate::model::{
-    sa_uses_esn, validate_relocate_sa_request, validate_sa_output_mark, validate_sa_query,
+    sa_uses_esn, validate_exact_remove_policy_request, validate_relocate_sa_request,
+    validate_sa_output_mark, validate_sa_query, ExactRemovePolicyRequest,
 };
+#[cfg(unix)]
+use crate::namespace::XfrmObjectRecoveryBindError;
 use crate::namespace::{self, NamespaceBoundLinuxXfrmBackend, NetworkNamespaceBinding};
 use crate::observation::{EspPeerObservationKey, EspPeerObservationRegistration};
 use crate::outbound_binding::{
@@ -80,6 +88,7 @@ const RELOCATION_CAPABILITY_AVAILABLE: u8 = 1;
 const RELOCATION_CAPABILITY_MISSING: u8 = 2;
 const SA_RELOCATION_PROBE_SPI: u32 = 0xffff_fffe;
 const XFRM_KEY_READBACK_REDACTED: &str = "xfrm_key_readback_redacted";
+const EXACT_POLICY_REMOVAL_PREFLIGHT: &str = "remove_policy_exact_preflight";
 
 pub(crate) type SensitiveBuffer = Zeroizing<Vec<u8>>;
 
@@ -294,6 +303,29 @@ impl LinuxXfrmBackend {
         self,
     ) -> Result<NamespaceBoundLinuxXfrmBackend, XfrmError> {
         namespace::bind_current_network_namespace(self)
+    }
+
+    /// Bind to the calling thread's current network namespace and attach its
+    /// durable staged-object recovery store atomically.
+    ///
+    /// Store authentication and the permanent lease complete on the actor
+    /// thread before any mutation-capable backend handle is returned. Durable
+    /// recovery users must use this constructor on every process start so an
+    /// ordinary SDK mutation cannot occur before the retained writer epoch and
+    /// cleanup authority are active.
+    #[cfg(unix)]
+    pub fn bind_current_network_namespace_with_object_recovery(
+        self,
+        path: PathBuf,
+        proof_key: XfrmObjectRecoveryProofKey,
+    ) -> Result<
+        (
+            NamespaceBoundLinuxXfrmBackend,
+            XfrmObjectInstallRecoveryStore,
+        ),
+        XfrmObjectRecoveryBindError,
+    > {
+        namespace::bind_current_network_namespace_with_object_recovery(self, path, proof_key)
     }
 
     pub(crate) fn for_namespace_actor(self, binding: NetworkNamespaceBinding) -> Self {
@@ -973,9 +1005,55 @@ impl XfrmBackend for LinuxXfrmBackend {
     }
 
     async fn remove_policy(&self, request: RemovePolicyRequest) -> Result<(), XfrmError> {
-        let body = encode_policy_id(&request.selector, request.direction, request.mark)?;
+        let body = encode_policy_id(&request.selector, request.direction, request.mark, None)?;
         self.run_ack(
             "remove_policy",
+            XFRM_MSG_DELPOLICY,
+            NLM_F_REQUEST | NLM_F_ACK,
+            body,
+        )
+        .await
+    }
+
+    async fn remove_policy_exact(
+        &self,
+        request: ExactRemovePolicyRequest,
+    ) -> Result<(), XfrmError> {
+        validate_exact_remove_policy_request(&request)?;
+        let Some(if_id) = request.if_id() else {
+            return self.remove_policy(request.into_request()).await;
+        };
+        let removal = request.request();
+        let preflight = encode_policy_id(
+            &removal.selector,
+            removal.direction,
+            removal.mark,
+            Some(if_id),
+        )?;
+        let response = self
+            .transact_blocking(
+                EXACT_POLICY_REMOVAL_PREFLIGHT,
+                XFRM_MSG_GETPOLICY,
+                NLM_F_REQUEST | NLM_F_ACK,
+                preflight,
+            )
+            .await?
+            .ok_or_else(|| {
+                XfrmError::io(
+                    EXACT_POLICY_REMOVAL_PREFLIGHT,
+                    invalid_data("missing getpolicy preflight response"),
+                )
+            })?;
+        validate_exact_policy_removal_preflight(&response, removal, if_id)?;
+
+        let body = encode_policy_id(
+            &removal.selector,
+            removal.direction,
+            removal.mark,
+            Some(if_id),
+        )?;
+        self.run_ack(
+            "remove_policy_exact",
             XFRM_MSG_DELPOLICY,
             NLM_F_REQUEST | NLM_F_ACK,
             body,
@@ -1814,6 +1892,7 @@ fn encode_policy_id(
     selector: &XfrmSelector,
     direction: XfrmDirection,
     mark: Option<XfrmLookupMark>,
+    if_id: Option<u32>,
 ) -> Result<SensitiveBuffer, XfrmError> {
     validate_selector_family(selector)?;
     let mut out = sensitive_buffer_with_capacity(XFRM_USER_POLICY_ID_LEN);
@@ -1821,7 +1900,7 @@ fn encode_policy_id(
     push_u32_ne(&mut out, 0);
     push_u8(&mut out, encode_direction(direction));
     out.resize(XFRM_USER_POLICY_ID_LEN, 0);
-    append_common_attrs(&mut out, mark, None)?;
+    append_common_attrs(&mut out, mark, if_id)?;
     Ok(out)
 }
 
@@ -3044,6 +3123,85 @@ fn parse_policy_state(payload: &[u8]) -> Result<PolicyState, XfrmError> {
             if_id,
         },
     })
+}
+
+/// Prove that `GETPOLICY` honored a scoped lookup before unconditional delete.
+///
+/// Linux before v4.19 silently ignores the then-unknown `XFRMA_IF_ID`
+/// attribute. Such a kernel can return an otherwise identical unscoped policy
+/// for this query, so the returned nonzero interface ID is capability evidence
+/// as well as part of the exact deletion identity.
+fn validate_exact_policy_removal_preflight(
+    payload: &[u8],
+    requested: &RemovePolicyRequest,
+    requested_if_id: u32,
+) -> Result<(), XfrmError> {
+    if payload.len() < XFRM_USER_POLICY_INFO_LEN {
+        return Err(XfrmError::io(
+            EXACT_POLICY_REMOVAL_PREFLIGHT,
+            invalid_data("short getpolicy preflight response"),
+        ));
+    }
+    validate_allowed_route_attributes(
+        payload,
+        XFRM_USER_POLICY_INFO_LEN,
+        &[
+            XFRMA_TMPL,
+            XFRMA_POLICY_TYPE,
+            XFRMA_MARK,
+            XFRMA_IF_ID,
+            XFRMA_OFFLOAD_DEV,
+        ],
+        EXACT_POLICY_REMOVAL_PREFLIGHT,
+    )?;
+
+    let mut expected_selector = sensitive_buffer_with_capacity(XFRM_SELECTOR_LEN);
+    encode_selector(&mut expected_selector, &requested.selector)?;
+    if payload.get(..XFRM_SELECTOR_LEN) != Some(expected_selector.as_slice())
+        || payload[160] != encode_direction(requested.direction)
+    {
+        return Err(XfrmError::StateMismatch {
+            operation: EXACT_POLICY_REMOVAL_PREFLIGHT,
+        });
+    }
+
+    let observed_mark = parse_exact_mark_attribute(
+        payload,
+        XFRM_USER_POLICY_INFO_LEN,
+        EXACT_POLICY_REMOVAL_PREFLIGHT,
+    )?;
+    if observed_mark != requested.mark {
+        return Err(XfrmError::StateMismatch {
+            operation: EXACT_POLICY_REMOVAL_PREFLIGHT,
+        });
+    }
+
+    if let Some(policy_type) = unique_route_attribute(
+        payload,
+        XFRM_USER_POLICY_INFO_LEN,
+        XFRMA_POLICY_TYPE,
+        EXACT_POLICY_REMOVAL_PREFLIGHT,
+    )? {
+        if policy_type != [XFRM_POLICY_TYPE_MAIN, 0, 0, 0, 0, 0] {
+            return Err(XfrmError::StateMismatch {
+                operation: EXACT_POLICY_REMOVAL_PREFLIGHT,
+            });
+        }
+    }
+
+    match parse_exact_if_id_attribute(
+        payload,
+        XFRM_USER_POLICY_INFO_LEN,
+        EXACT_POLICY_REMOVAL_PREFLIGHT,
+    )? {
+        Some(observed) if observed == requested_if_id => Ok(()),
+        None | Some(0) => Err(XfrmError::UnsupportedFeature {
+            feature: "exact_scoped_policy_removal",
+        }),
+        Some(_) => Err(XfrmError::StateMismatch {
+            operation: EXACT_POLICY_REMOVAL_PREFLIGHT,
+        }),
+    }
 }
 
 fn decode_exact_template(payload: &[u8]) -> Result<XfrmTemplate, XfrmError> {
@@ -6454,6 +6612,21 @@ mod tests {
     }
 
     #[test]
+    fn encodes_exact_policy_removal_with_if_id_attr() {
+        let body = encode_policy_id(
+            &selector(),
+            XfrmDirection::Out,
+            Some(XfrmLookupMark::full(0x0000_0042)),
+            Some(9),
+        )
+        .unwrap();
+
+        let if_id = route_attr_payload_from(&body, XFRM_USER_POLICY_ID_LEN, XFRMA_IF_ID)
+            .expect("policy removal if_id attr");
+        assert_eq!(if_id, &9_u32.to_ne_bytes());
+    }
+
+    #[test]
     fn rejects_aead_name_in_crypt_slot() {
         let mut params = sa_parameters();
         params.auth = None;
@@ -7026,6 +7199,158 @@ mod tests {
             ),
             Some(encode_mark(mark).as_slice())
         );
+    }
+
+    #[tokio::test]
+    async fn exact_policy_removal_preflights_interface_scope_then_deletes() {
+        let mark = XfrmLookupMark::full(0x0000_0042);
+        let mut returned = policy_parameters();
+        returned.mark = Some(mark);
+        returned.if_id = Some(9);
+        let transport = ScriptedTransport::new(vec![
+            Ok(Some(encode_policy_info(&returned).unwrap().to_vec())),
+            Ok(None),
+        ]);
+        let backend = LinuxXfrmBackend::with_transport(transport.clone());
+
+        backend
+            .remove_policy_exact(
+                ExactRemovePolicyRequest::new(
+                    RemovePolicyRequest::new(selector(), XfrmDirection::Out).with_mark(mark),
+                )
+                .with_if_id(9),
+            )
+            .await
+            .unwrap();
+
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(netlink_message_type(&requests[0]), XFRM_MSG_GETPOLICY);
+        assert_eq!(netlink_message_type(&requests[1]), XFRM_MSG_DELPOLICY);
+        for request in &requests {
+            assert_eq!(
+                route_attr_payload_from(netlink_body(request), XFRM_USER_POLICY_ID_LEN, XFRMA_MARK,),
+                Some(encode_mark(mark).as_slice())
+            );
+            assert_eq!(
+                route_attr_payload_from(
+                    netlink_body(request),
+                    XFRM_USER_POLICY_ID_LEN,
+                    XFRMA_IF_ID,
+                ),
+                Some(9_u32.to_ne_bytes().as_slice())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_policy_removal_rejects_missing_if_id_readback_before_delete() {
+        let returned = policy_parameters();
+        let transport = ScriptedTransport::new(vec![Ok(Some(
+            encode_policy_info(&returned).unwrap().to_vec(),
+        ))]);
+        let backend = LinuxXfrmBackend::with_transport(transport.clone());
+
+        let error = backend
+            .remove_policy_exact(
+                ExactRemovePolicyRequest::new(RemovePolicyRequest::new(
+                    selector(),
+                    XfrmDirection::Out,
+                ))
+                .with_if_id(9),
+            )
+            .await
+            .expect_err("an ignored interface-id attribute must fail closed");
+
+        assert!(matches!(
+            error,
+            XfrmError::UnsupportedFeature {
+                feature: "exact_scoped_policy_removal"
+            }
+        ));
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(netlink_message_type(&requests[0]), XFRM_MSG_GETPOLICY);
+    }
+
+    #[tokio::test]
+    async fn exact_policy_removal_rejects_wrong_if_id_readback_before_delete() {
+        let mut returned = policy_parameters();
+        returned.if_id = Some(10);
+        let transport = ScriptedTransport::new(vec![Ok(Some(
+            encode_policy_info(&returned).unwrap().to_vec(),
+        ))]);
+        let backend = LinuxXfrmBackend::with_transport(transport.clone());
+
+        let error = backend
+            .remove_policy_exact(
+                ExactRemovePolicyRequest::new(RemovePolicyRequest::new(
+                    selector(),
+                    XfrmDirection::Out,
+                ))
+                .with_if_id(9),
+            )
+            .await
+            .expect_err("a different interface scope must fail closed");
+
+        assert!(matches!(
+            error,
+            XfrmError::StateMismatch {
+                operation: EXACT_POLICY_REMOVAL_PREFLIGHT
+            }
+        ));
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(netlink_message_type(&requests[0]), XFRM_MSG_GETPOLICY);
+    }
+
+    #[tokio::test]
+    async fn exact_policy_removal_rejects_zero_if_id_before_transport() {
+        let transport = CapturingTransport::default();
+        let backend = LinuxXfrmBackend::with_transport(transport.clone());
+
+        let error = backend
+            .remove_policy_exact(
+                ExactRemovePolicyRequest::new(RemovePolicyRequest::new(
+                    selector(),
+                    XfrmDirection::Out,
+                ))
+                .with_if_id(0),
+            )
+            .await
+            .expect_err("zero if_id must fail before netlink");
+
+        assert!(matches!(
+            error,
+            XfrmError::InvalidConfig {
+                field: "policy.if_id",
+                ..
+            }
+        ));
+        assert!(transport.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn exact_policy_removal_rejects_narrow_mark_before_transport() {
+        let transport = CapturingTransport::default();
+        let backend = LinuxXfrmBackend::with_transport(transport.clone());
+        let narrow = XfrmLookupMark::new(0x10, 0xf0).unwrap();
+
+        let error = backend
+            .remove_policy_exact(ExactRemovePolicyRequest::new(
+                RemovePolicyRequest::new(selector(), XfrmDirection::Out).with_mark(narrow),
+            ))
+            .await
+            .expect_err("narrow lookup mark must fail before netlink");
+
+        assert!(matches!(
+            error,
+            XfrmError::InvalidConfig {
+                field: "policy.mark",
+                ..
+            }
+        ));
+        assert!(transport.requests().is_empty());
     }
 
     #[tokio::test]

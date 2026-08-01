@@ -44,6 +44,26 @@
 //! during encoding. This guarantee covers the transient userspace UAPI copy;
 //! kernel key custody remains platform-owned.
 //!
+//! For single-object work whose consumer bookkeeping must survive process
+//! loss, `LinuxXfrmBackend::bind_current_network_namespace_with_object_recovery`
+//! authenticates and permanently leases one `XfrmObjectInstallRecoveryStore`
+//! on the namespace actor before returning any mutation-capable backend handle.
+//! `NamespaceBoundLinuxXfrmBackend::run_durable_object_install`
+//! persists intent before mutation admission and persists a definitive
+//! acquisition, definitive no-mutation, or indeterminate outcome before it
+//! returns. The consumer finalizes only after its adoption decision is durable;
+//! otherwise restart recovery removes residue solely from authenticated,
+//! epoch-current acquisition authority. Linux has no conditional SA/policy
+//! delete, so unresolved cleanup authority blocks every later cooperating
+//! actor mutation. Deployments must exclude all raw or independently stored
+//! XFRM writers in that namespace and keep the proof key in durable secret
+//! configuration. Store records retain independent keyed fingerprints of the
+//! deletion identity and complete install request, but no request identity
+//! values or key material; public diagnostics remain value-free. The leased
+//! root is trusted authoritative non-rollback storage under the documented
+//! POSIX crash model. A deployment whose storage can restore an older complete
+//! authenticated snapshot needs an external monotonic witness.
+//!
 //! Same-SPI successor activation uses
 //! [`NamespaceBoundLinuxXfrmBackend::apply_and_read_back_outbound_esp_counter`].
 //! The sealed actor validates the opaque outbound binding, reads the kernel's
@@ -85,6 +105,10 @@ pub mod backend;
 pub mod composite;
 mod counter_resume;
 mod dscp;
+#[cfg(unix)]
+mod durable_install;
+#[cfg(unix)]
+mod durable_object;
 pub mod error;
 #[cfg(feature = "ikev2")]
 pub mod ikev2;
@@ -116,6 +140,15 @@ pub use counter_resume::{
 pub use dscp::{
     LinuxXfrmDscpMarkingConfig, DEFAULT_XFRM_DSCP_BPFFS_PIN_ROOT, DEFAULT_XFRM_DSCP_TC_PRIORITY,
 };
+#[cfg(unix)]
+pub use durable_install::{XfrmObjectInstallDurableOutcome, XfrmObjectInstallRestartOutcome};
+#[cfg(unix)]
+pub use durable_object::{
+    XfrmObjectInstallDurableError, XfrmObjectInstallDurablePhase,
+    XfrmObjectInstallOperationGeneration, XfrmObjectInstallOperationId,
+    XfrmObjectInstallRecoveryHandle, XfrmObjectInstallRecoveryStore, XfrmObjectRecoveryProofKey,
+    XFRM_OBJECT_INSTALL_RECOVERY_HANDLE_BYTES,
+};
 pub use error::XfrmError;
 #[cfg(feature = "ikev2")]
 pub use ikev2::{
@@ -128,17 +161,19 @@ pub use ikev2::{
 pub use linux::{LinuxXfrmBackend, LinuxXfrmBackendConfig};
 pub use mock::{MockOperation, MockSaRelocation, MockXfrmBackend};
 pub use model::{
-    AeadAlgorithm, Algorithm, AllocateSpiRequest, AuthAlgorithm, InstallPolicyRequest,
-    InstallSaRequest, IpAddress, KeyMaterial, LifetimeConfig, LifetimeCurrent, PolicyParameters,
-    QuerySaRequest, RekeyPolicyRequest, RekeySaRequest, RelocateSaRequest, RemovePolicyRequest,
-    RemoveSaRequest, SaParameters, SaRelocationDirection, SaRelocationEncap, SaRelocationIdentity,
-    SaRelocationSelector, SaReplayState, SaState, SaStatistics, SpiAllocation, UdpEncap,
-    UdpEncapError, XfrmAction, XfrmBackendKind, XfrmCapability, XfrmDirection, XfrmId,
-    XfrmLookupMark, XfrmLookupMarkError, XfrmMark, XfrmMode, XfrmProbe, XfrmRequestId,
-    XfrmSelector, XfrmTemplate, UDP_ENCAP_ESPINUDP, XFRM_AEAD_RFC4106_GCM_AES, XFRM_AUTH_HMAC_SHA1,
-    XFRM_AUTH_HMAC_SHA256, XFRM_AUTH_HMAC_SHA384, XFRM_AUTH_HMAC_SHA512, XFRM_ENCR_CBC_AES,
-    XFRM_ENCR_NULL,
+    AeadAlgorithm, Algorithm, AllocateSpiRequest, AuthAlgorithm, ExactRemovePolicyRequest,
+    InstallPolicyRequest, InstallSaRequest, IpAddress, KeyMaterial, LifetimeConfig,
+    LifetimeCurrent, PolicyParameters, QuerySaRequest, RekeyPolicyRequest, RekeySaRequest,
+    RelocateSaRequest, RemovePolicyRequest, RemoveSaRequest, SaParameters, SaRelocationDirection,
+    SaRelocationEncap, SaRelocationIdentity, SaRelocationSelector, SaReplayState, SaState,
+    SaStatistics, SpiAllocation, UdpEncap, UdpEncapError, XfrmAction, XfrmBackendKind,
+    XfrmCapability, XfrmDirection, XfrmId, XfrmLookupMark, XfrmLookupMarkError, XfrmMark, XfrmMode,
+    XfrmProbe, XfrmRequestId, XfrmSelector, XfrmTemplate, UDP_ENCAP_ESPINUDP,
+    XFRM_AEAD_RFC4106_GCM_AES, XFRM_AUTH_HMAC_SHA1, XFRM_AUTH_HMAC_SHA256, XFRM_AUTH_HMAC_SHA384,
+    XFRM_AUTH_HMAC_SHA512, XFRM_ENCR_CBC_AES, XFRM_ENCR_NULL,
 };
+#[cfg(unix)]
+pub use namespace::XfrmObjectRecoveryBindError;
 pub use namespace::{NamespaceBoundLinuxXfrmBackend, LINUX_XFRM_NAMESPACE_ACTOR_CAPACITY};
 pub use observation::{
     EspPeerAddressFamily, EspPeerIngestTally, EspPeerObservation, EspPeerObservationEpoch,

@@ -8,13 +8,13 @@ use async_trait::async_trait;
 use crate::backend::XfrmBackend;
 use crate::error::XfrmError;
 use crate::model::{
-    validate_relocate_sa_request, validate_sa_output_mark, validate_sa_query, AllocateSpiRequest,
-    InstallPolicyRequest, InstallSaRequest, IpAddress, LifetimeConfig, LifetimeCurrent,
-    PolicyParameters, QuerySaRequest, RekeyPolicyRequest, RekeySaRequest, RelocateSaRequest,
-    RemovePolicyRequest, RemoveSaRequest, SaRelocationDirection, SaRelocationEncap,
-    SaRelocationIdentity, SaRelocationSelector, SaReplayState, SaState, SaStatistics,
-    SpiAllocation, XfrmAction, XfrmCapability, XfrmDirection, XfrmId, XfrmLookupMark, XfrmMode,
-    XfrmProbe, XfrmSelector, XfrmTemplate,
+    validate_exact_remove_policy_request, validate_relocate_sa_request, validate_sa_output_mark,
+    validate_sa_query, AllocateSpiRequest, ExactRemovePolicyRequest, InstallPolicyRequest,
+    InstallSaRequest, IpAddress, LifetimeConfig, LifetimeCurrent, PolicyParameters, QuerySaRequest,
+    RekeyPolicyRequest, RekeySaRequest, RelocateSaRequest, RemovePolicyRequest, RemoveSaRequest,
+    SaRelocationDirection, SaRelocationEncap, SaRelocationIdentity, SaRelocationSelector,
+    SaReplayState, SaState, SaStatistics, SpiAllocation, XfrmAction, XfrmCapability, XfrmDirection,
+    XfrmId, XfrmLookupMark, XfrmMode, XfrmProbe, XfrmSelector, XfrmTemplate,
 };
 
 /// One recorded call against the mock backend.
@@ -777,6 +777,30 @@ impl XfrmBackend for MockXfrmBackend {
         Ok(())
     }
 
+    async fn remove_policy_exact(
+        &self,
+        request: ExactRemovePolicyRequest,
+    ) -> Result<(), XfrmError> {
+        validate_exact_remove_policy_request(&request)?;
+        let if_id = request.if_id();
+        let removal = request.into_request();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self::check_failure(&state)?;
+        state.operations.push(MockOperation::RemovePolicy {
+            selector: removal.selector.clone(),
+            direction: removal.direction,
+            mark: removal.mark,
+        });
+        state
+            .policies
+            .remove(&(removal.selector, removal.direction, removal.mark, if_id))
+            .ok_or(XfrmError::NotFound)?;
+        Ok(())
+    }
+
     async fn probe(&self) -> Result<XfrmProbe, XfrmError> {
         let mut state = self
             .state
@@ -1305,6 +1329,96 @@ mod tests {
             })
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn mock_exact_policy_removal_does_not_confuse_scoped_and_unscoped_policies() {
+        let backend = MockXfrmBackend::new();
+        let unscoped = sample_policy_parameters();
+        let mut scoped = unscoped.clone();
+        scoped.if_id = Some(11);
+
+        for parameters in [unscoped.clone(), scoped.clone()] {
+            backend
+                .install_policy(InstallPolicyRequest { parameters })
+                .await
+                .unwrap();
+        }
+
+        let removal = RemovePolicyRequest::new(unscoped.selector.clone(), unscoped.direction);
+        backend
+            .remove_policy_exact(ExactRemovePolicyRequest::new(removal.clone()).with_if_id(11))
+            .await
+            .unwrap();
+
+        // The unscoped twin must survive the scoped removal.
+        backend.remove_policy(removal).await.unwrap();
+        // The removed scoped identity must now be available for installation.
+        backend
+            .install_policy(InstallPolicyRequest { parameters: scoped })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn mock_exact_policy_removal_rejects_zero_if_id_before_operation() {
+        let backend = MockXfrmBackend::new();
+        let unscoped = sample_policy_parameters();
+        backend
+            .install_policy(InstallPolicyRequest {
+                parameters: unscoped.clone(),
+            })
+            .await
+            .unwrap();
+        backend.clear_operations();
+
+        let removal = RemovePolicyRequest::new(unscoped.selector, unscoped.direction);
+        let error = backend
+            .remove_policy_exact(ExactRemovePolicyRequest::new(removal.clone()).with_if_id(0))
+            .await
+            .expect_err("zero if_id must fail closed");
+
+        assert!(matches!(
+            error,
+            XfrmError::InvalidConfig {
+                field: "policy.if_id",
+                ..
+            }
+        ));
+        assert!(backend.operations().is_empty());
+        backend.remove_policy(removal).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn mock_exact_policy_removal_rejects_narrow_mark_before_operation() {
+        let backend = MockXfrmBackend::new();
+        let unscoped = sample_policy_parameters();
+        backend
+            .install_policy(InstallPolicyRequest {
+                parameters: unscoped.clone(),
+            })
+            .await
+            .unwrap();
+        backend.clear_operations();
+
+        let narrow = XfrmLookupMark::new(0x10, 0xf0).unwrap();
+        let removal = RemovePolicyRequest::new(unscoped.selector, unscoped.direction);
+        let error = backend
+            .remove_policy_exact(ExactRemovePolicyRequest::new(
+                removal.clone().with_mark(narrow),
+            ))
+            .await
+            .expect_err("narrow lookup mark must fail closed");
+
+        assert!(matches!(
+            error,
+            XfrmError::InvalidConfig {
+                field: "policy.mark",
+                ..
+            }
+        ));
+        assert!(backend.operations().is_empty());
+        backend.remove_policy(removal).await.unwrap();
     }
 
     #[tokio::test]

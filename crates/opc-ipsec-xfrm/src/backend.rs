@@ -3,9 +3,10 @@
 use async_trait::async_trait;
 
 use crate::model::{
-    AllocateSpiRequest, InstallPolicyRequest, InstallSaRequest, QuerySaRequest, RekeyPolicyRequest,
-    RekeySaRequest, RelocateSaRequest, RemovePolicyRequest, RemoveSaRequest, SaRelocationIdentity,
-    SaState, SpiAllocation, XfrmCapability, XfrmProbe,
+    validate_exact_remove_policy_request, AllocateSpiRequest, ExactRemovePolicyRequest,
+    InstallPolicyRequest, InstallSaRequest, QuerySaRequest, RekeyPolicyRequest, RekeySaRequest,
+    RelocateSaRequest, RemovePolicyRequest, RemoveSaRequest, SaRelocationIdentity, SaState,
+    SpiAllocation, XfrmCapability, XfrmProbe,
 };
 use crate::XfrmError;
 
@@ -94,6 +95,34 @@ pub trait XfrmBackend: Send + Sync + std::fmt::Debug {
 
     /// Remove a Security Policy.
     async fn remove_policy(&self, request: RemovePolicyRequest) -> Result<(), XfrmError>;
+
+    /// Remove one exactly interface-scoped Security Policy.
+    ///
+    /// The default keeps existing backend implementations source-compatible.
+    /// It delegates an unscoped request to [`Self::remove_policy`] and fails
+    /// closed for a scoped request because the established method cannot carry
+    /// `XFRMA_IF_ID`. Backends must override this method to advertise and
+    /// implement scoped deletion. A scoped implementation must prove through
+    /// exact policy readback that the platform recognized the requested
+    /// interface ID before issuing an unconditional delete; older Linux
+    /// kernels silently ignore unknown netlink attributes.
+    ///
+    /// Linux has no owner- or generation-conditional policy deletion. Callers
+    /// must therefore hold namespace-wide XFRM writer exclusion across the
+    /// complete readback-and-delete future. The namespace actor serializes SDK
+    /// operations on that actor, but it cannot exclude unrelated writers.
+    async fn remove_policy_exact(
+        &self,
+        request: ExactRemovePolicyRequest,
+    ) -> Result<(), XfrmError> {
+        validate_exact_remove_policy_request(&request)?;
+        if request.if_id().is_some() {
+            return Err(XfrmError::UnsupportedFeature {
+                feature: "exact_scoped_policy_removal",
+            });
+        }
+        self.remove_policy(request.into_request()).await
+    }
 
     /// Probe backend capability and reachability.
     async fn probe(&self) -> Result<XfrmProbe, XfrmError>;
