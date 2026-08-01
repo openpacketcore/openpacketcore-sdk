@@ -734,8 +734,8 @@ impl PcoAddressConfiguration {
     /// with [`IpcpNakCorrelation::for_request`].
     ///
     /// Per-container failure dispositions are documented in the
-    /// [per-container failure policy](Self::decode_network_contents_correlated#per-container-failure-policy)
-    /// table on [`Self::decode_network_contents_correlated`].
+    /// "Per-container failure policy" section on
+    /// [`Self::decode_network_contents_correlated`].
     ///
     /// # Errors
     ///
