@@ -408,23 +408,10 @@ fn pinned_program_and_map_ids(pin_root: &std::path::Path) -> (u32, u32) {
 fn capture_esp(capture: &OwnedFd, expected_spi: u32) -> Vec<u8> {
     let mut frame = vec![0_u8; 65_536];
     loop {
-        let length = recv(capture.as_raw_fd(), &mut frame, MsgFlags::empty()).unwrap_or_else(
-            |error| {
-                let state = Command::new("ip")
-                    .args(["-s", "xfrm", "state"])
-                    .output()
-                    .expect("inspect XFRM state after capture timeout");
-                let policy = Command::new("ip")
-                    .args(["-s", "xfrm", "policy"])
-                    .output()
-                    .expect("inspect XFRM policy after capture timeout");
-                panic!(
-                    "receive outer ESP frame with SPI {expected_spi:#010x} before timeout: {error}; state:\n{}\npolicy:\n{}",
-                    String::from_utf8_lossy(&state.stdout),
-                    String::from_utf8_lossy(&policy.stdout)
-                );
-            },
-        );
+        let length =
+            recv(capture.as_raw_fd(), &mut frame, MsgFlags::empty()).unwrap_or_else(|error| {
+                panic!("receive expected outer ESP frame before timeout: {error}");
+            });
         if length < 14 + 20 || frame[12..14] != [0x08, 0x00] {
             continue;
         }
@@ -718,7 +705,40 @@ async fn fixed_outer_dscp_is_visible_on_real_esp_and_survives_adoption(
     let filters_before_adoption = tc_filters();
     let ids_before_adoption = pinned_program_and_map_ids(&net.pin_root);
     assert!(filters_before_adoption.contains(PROG_EGRESS_DSCP));
-    let restarted = LinuxXfrmBackend::with_dscp_marking(config)?;
+    let restarted = LinuxXfrmBackend::with_deferred_dscp_marking(config)?;
+    assert_eq!(tc_filters(), filters_before_adoption);
+    assert_eq!(
+        pinned_program_and_map_ids(&net.pin_root),
+        ids_before_adoption
+    );
+    let restarted = restarted.bind_current_network_namespace()?;
+    assert_eq!(tc_filters(), filters_before_adoption);
+    assert_eq!(
+        pinned_program_and_map_ids(&net.pin_root),
+        ids_before_adoption
+    );
+    assert_eq!(
+        restarted.probe().await?.egress_dscp_marking,
+        XfrmCapability::Unknown,
+        "effect-free binding must not inherit DSCP capability authority"
+    );
+    let preactivation_rekey =
+        sa_parameters(INNER_MARKED, MARKED_SPI, Some(MARKED_LOOKUP), Some(ef));
+    assert!(matches!(
+        restarted
+            .rekey_sa(RekeySaRequest {
+                parameters: preactivation_rekey,
+            })
+            .await,
+        Err(opc_ipsec_xfrm::XfrmError::Unavailable)
+    ));
+    assert_eq!(tc_filters(), filters_before_adoption);
+    assert_eq!(
+        pinned_program_and_map_ids(&net.pin_root),
+        ids_before_adoption
+    );
+
+    restarted.activate_dscp_marking().await?;
     drop(backend);
     let filters_after_adoption = tc_filters();
     assert_eq!(

@@ -8,6 +8,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Deferred namespace-bound fixed-DSCP activation — `opc-ipsec-xfrm`:**
+  `LinuxXfrmBackend::with_deferred_dscp_marking` and its custom-config variant
+  validate and retain marking configuration without loading, pinning,
+  attaching, adopting, or changing tc/eBPF state. Namespace binding, including
+  atomic durable-recovery-store binding, preserves that zero-effect boundary
+  so consumers can reconcile authenticated `Prepared` state while external
+  egress authority remains closed. The same
+  `NamespaceBoundLinuxXfrmBackend` then activates the companion through its
+  serialized actor. Every DSCP-bearing SA mutation, including durable install
+  admission, relocation, and outbound replay-counter updates, fails before
+  XFRM mutation until activation succeeds. A clean durable rejection returns
+  its exact affine retry authority while retaining `Prepared` state. Failed or
+  cancelled activation cannot publish readiness, clean failures can be retried
+  on the same actor, success is idempotent, and capability remains
+  unadvertised until both actor-local activation and existing exact
+  marked-GETSA readback gates are satisfied.
 - **Durable staged-object ownership recovery — `opc-ipsec-xfrm`:**
   `LinuxXfrmBackend::bind_current_network_namespace_with_object_recovery` now
   authenticates and permanently leases `XfrmObjectInstallRecoveryStore` on the

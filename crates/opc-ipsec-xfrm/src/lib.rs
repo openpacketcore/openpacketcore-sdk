@@ -23,6 +23,17 @@
 //! deployment policy. [`LinuxXfrmBackend::bind_current_network_namespace`]
 //! can pin backend execution to the calling thread's already-selected network
 //! namespace without exposing its filesystem identity.
+//! Fixed-DSCP users that must recover durable state before opening external
+//! egress authority can use [`LinuxXfrmBackend::with_deferred_dscp_marking`].
+//! That constructor validates and retains configuration without loading,
+//! pinning, attaching, adopting, or changing tc/eBPF state; namespace binding,
+//! including atomic durable-store binding, preserves the same effect-free
+//! boundary. [`NamespaceBoundLinuxXfrmBackend::activate_dscp_marking`] later
+//! performs activation on that exact actor. Until success is deliverable,
+//! every DSCP-bearing SA mutation fails closed while durable recovery and
+//! unmarked operations remain available. A clean deferred rejection of a
+//! prepared durable SA returns its exact authority through
+//! [`XfrmObjectInstallRunError::into_retry_authority`].
 //!
 //! [`XfrmStagedInstall::run_and_commit_outbound_sa_policy`] issues an opaque,
 //! key-free [`InstalledOutboundSaBinding`] only after an exact ESP SA plus sole
@@ -179,7 +190,9 @@ pub use model::{
 };
 pub use namespace::{NamespaceBoundLinuxXfrmBackend, LINUX_XFRM_NAMESPACE_ACTOR_CAPACITY};
 #[cfg(unix)]
-pub use namespace::{XfrmObjectInstallAdmissionAuthority, XfrmObjectRecoveryBindError};
+pub use namespace::{
+    XfrmObjectInstallAdmissionAuthority, XfrmObjectInstallRunError, XfrmObjectRecoveryBindError,
+};
 pub use observation::{
     EspPeerAddressFamily, EspPeerIngestTally, EspPeerObservation, EspPeerObservationEpoch,
     EspPeerObservationKey, EspPeerObservationLoss, EspPeerObservationRejection,
