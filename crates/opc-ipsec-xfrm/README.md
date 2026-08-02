@@ -160,6 +160,9 @@ The required ordering after that atomic bind is:
    authority exactly once, durably publishes `Issuing`, and only then admits
    the actor-serialized backend effect. The method durably publishes
    `Acquired`, `NoMutation`, or `Indeterminate` before returning its outcome.
+   The sole pre-consumption exception is a deferred DSCP activation gate: its
+   typed error returns the same authenticated authority and retains
+   `Prepared`, so activation can be followed by an exact retry.
 4. Durably record the consumer decision. If an acquired object is adopted,
    call `finalize_durable_object_install` only after that adoption is durable.
    Finalization surrenders cleanup authority and leaves the object installed.
@@ -848,6 +851,48 @@ let backend = LinuxXfrmBackend::with_dscp_marking(marking)?;
 # Ok::<(), opc_ipsec_xfrm::XfrmError>(())
 ```
 
+When another external egress authority must become active before the
+companion, retain the same validated configuration without effects and
+activate it later on the namespace actor:
+
+```rust,no_run
+use opc_ipsec_xfrm::{LinuxXfrmBackend, LinuxXfrmDscpMarkingConfig};
+
+# async fn example() -> Result<(), opc_ipsec_xfrm::XfrmError> {
+let marking = LinuxXfrmDscpMarkingConfig::new([String::from("swu0")], 25)?;
+
+// Validation and retention only: no eBPF load/pin, tc creation/attachment,
+// or live companion adoption occurs here or during namespace binding.
+let backend = LinuxXfrmBackend::with_deferred_dscp_marking(marking)?
+    .bind_current_network_namespace()?;
+
+// Establish the external egress authority here.
+backend.activate_dscp_marking().await?;
+# Ok(())
+# }
+```
+
+`with_config_and_deferred_dscp_marking` provides the same boundary with a
+custom `LinuxXfrmBackendConfig`. Binding through
+`bind_current_network_namespace_with_object_recovery` likewise opens and
+returns the authenticated durable store without loading, pinning, attaching,
+adopting, or otherwise changing tc/eBPF DSCP state. That path must be ordered
+as durable reconciliation, external egress-authority activation, and then
+`activate_dscp_marking`. Before actor-local activation succeeds, every
+DSCP-bearing SA mutation—including install, rekey, relocation, durable install
+admission, and outbound replay-counter update—fails before XFRM mutation;
+unmarked operations and durable preparation/finalization/recovery remain
+available. A clean durable-admission rejection returns the original authority
+through `XfrmObjectInstallRunError::into_retry_authority`, leaving its record
+at `Prepared` for retry after activation.
+
+Activation is serialized with those operations on the same namespace actor
+and is idempotent after success. A failed attempt does not publish readiness
+and may be retried after the caller establishes that the failure was clean. If
+an activation observer is cancelled before success can be delivered, runtime
+state from that attempt is not readiness authority: marked mutations remain
+closed until a later activation revalidates or adopts it successfully.
+
 The pin root must be a normalized child of `/sys/fs/bpf`. Interface names,
 the tc priority/handle, and the exact seven-bit mask are validated. The CNF
 must reserve the chosen mark window against every output-mark producer and
@@ -860,14 +905,16 @@ caller still prevents their packet values from accidentally encoding a token
 on an interface where that companion runs. Fixed DSCP is accepted only for
 tunnel-mode ESP SAs.
 
-Construction eagerly attaches or adopts the exact owned tc slot. Every marked
-install/rekey revalidates the live map and filter before sending netlink. The
-netlink filter is deliberately kernel-owned rather than loader-owned, so an
-old process dropping its Aya handles cannot remove a slot already adopted by
-its replacement. Adoption requires the live tc program ID, pinned program ID,
-pinned config-map ID/profile, and the embedded SDK artifact's kernel program
-tag/type/name to match exactly. A stale pre-upgrade or foreign classifier fails
-closed without detaching or replacing the live filter.
+The existing `with_dscp_marking` constructors eagerly attach or adopt the exact
+owned tc slot; the distinct deferred constructors do so only during explicit
+actor-local activation. Every marked install/rekey revalidates the live map and
+filter before sending netlink. The netlink filter is deliberately kernel-owned
+rather than loader-owned, so an old process dropping its Aya handles cannot
+remove a slot already adopted by its replacement. Adoption requires the live
+tc program ID, pinned program ID, pinned config-map ID/profile, and the embedded
+SDK artifact's kernel program tag/type/name to match exactly. A stale
+pre-upgrade or foreign classifier fails closed without detaching or replacing
+the live filter.
 
 Classifier upgrades are intentionally drain-and-replace, not in-place: stop
 all SDK writers for the namespace, drain/remove every marked SA and traffic
@@ -877,11 +924,13 @@ again. Network-namespace teardown performs that cleanup naturally. Never
 delete the pin or live filter while marked SAs can still emit traffic; this
 implementation does not claim an atomic program-upgrade mechanism.
 
-The probe reports `egress_dscp_marking = Unknown` until exact marked GETSA
-readback proves the stable redaction-safe SA fields and both `XFRMA_SET_MARK`
-attributes; a NEWSA/UPDSA ACK alone is never attribute proof because an older
-kernel may ignore unknown attributes. The ACK linearizes kernel acceptance of
-that request, while the later GETSA observes current state. GETSA deliberately
+The deferred probe does not consult runtime capability before activation and
+reports `egress_dscp_marking = Unknown`. After eager readiness or explicit
+activation, it remains `Unknown` until exact marked GETSA readback proves the
+stable redaction-safe SA fields and both `XFRMA_SET_MARK` attributes; a
+NEWSA/UPDSA ACK alone is never attribute proof because an older kernel may
+ignore unknown attributes. The ACK linearizes kernel acceptance of that
+request, while the later GETSA observes current state. GETSA deliberately
 excludes key material, so it cannot prove cryptographic ownership or exclude a
 later same-identity UPDSA from another writer. The CNF must serialize
 namespace-wide XFRM SA and policy identity mutations and rollback: Linux

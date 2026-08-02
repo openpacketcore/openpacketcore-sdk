@@ -347,6 +347,112 @@ impl fmt::Debug for XfrmObjectInstallAdmissionAuthority {
     }
 }
 
+/// Value-free failure while admitting one prepared durable object install.
+///
+/// A DSCP-bearing SA rejected only because deferred activation is still
+/// closed returns the original affine authority through
+/// [`Self::into_retry_authority`]. No durable phase or writer epoch has
+/// changed, so the caller may activate the same namespace actor and retry that
+/// exact authority. Every other failure consumes the authority under the
+/// durable protocol's existing fail-closed recovery contract.
+#[cfg(unix)]
+pub struct XfrmObjectInstallRunError {
+    kind: XfrmObjectInstallRunErrorKind,
+}
+
+#[cfg(unix)]
+enum XfrmObjectInstallRunErrorKind {
+    Durable(XfrmObjectInstallDurableError),
+    DscpActivationRequired(Box<XfrmObjectInstallAdmissionAuthority>),
+}
+
+#[cfg(unix)]
+impl XfrmObjectInstallRunError {
+    const DSCP_ACTIVATION_REQUIRED: &'static str = "xfrm_object_install_dscp_activation_required";
+
+    fn dscp_activation_required(authority: Box<XfrmObjectInstallAdmissionAuthority>) -> Self {
+        Self {
+            kind: XfrmObjectInstallRunErrorKind::DscpActivationRequired(authority),
+        }
+    }
+
+    /// Stable, value-free error label.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match &self.kind {
+            XfrmObjectInstallRunErrorKind::Durable(error) => error.as_str(),
+            XfrmObjectInstallRunErrorKind::DscpActivationRequired(_) => {
+                Self::DSCP_ACTIVATION_REQUIRED
+            }
+        }
+    }
+
+    /// Return the underlying durable-protocol error, when this was not a
+    /// clean deferred-activation rejection.
+    #[must_use]
+    pub const fn durable_error(&self) -> Option<XfrmObjectInstallDurableError> {
+        match &self.kind {
+            XfrmObjectInstallRunErrorKind::Durable(error) => Some(*error),
+            XfrmObjectInstallRunErrorKind::DscpActivationRequired(_) => None,
+        }
+    }
+
+    /// Recover retry authority from a proved pre-effect DSCP activation gate.
+    ///
+    /// `None` means the error follows the ordinary durable recovery contract
+    /// and no authority may be replayed.
+    #[must_use]
+    pub fn into_retry_authority(self) -> Option<XfrmObjectInstallAdmissionAuthority> {
+        match self.kind {
+            XfrmObjectInstallRunErrorKind::DscpActivationRequired(authority) => Some(*authority),
+            XfrmObjectInstallRunErrorKind::Durable(_) => None,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl From<XfrmObjectInstallDurableError> for XfrmObjectInstallRunError {
+    fn from(error: XfrmObjectInstallDurableError) -> Self {
+        Self {
+            kind: XfrmObjectInstallRunErrorKind::Durable(error),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl PartialEq<XfrmObjectInstallDurableError> for XfrmObjectInstallRunError {
+    fn eq(&self, other: &XfrmObjectInstallDurableError) -> bool {
+        self.durable_error() == Some(*other)
+    }
+}
+
+#[cfg(unix)]
+impl fmt::Debug for XfrmObjectInstallRunError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("XfrmObjectInstallRunError")
+            .field("code", &self.as_str())
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(unix)]
+impl fmt::Display for XfrmObjectInstallRunError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[cfg(unix)]
+impl Error for XfrmObjectInstallRunError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match &self.kind {
+            XfrmObjectInstallRunErrorKind::Durable(error) => Some(error),
+            XfrmObjectInstallRunErrorKind::DscpActivationRequired(_) => None,
+        }
+    }
+}
+
 /// Linux XFRM backend pinned to the network namespace of the thread that
 /// created it.
 ///
@@ -749,6 +855,49 @@ impl NamespaceBoundLinuxXfrmBackend {
         self.inner.actor_binding.clone()
     }
 
+    /// Activate retained fixed-DSCP configuration on this namespace actor.
+    ///
+    /// Deferred construction and namespace binding perform no DSCP runtime
+    /// effects. This method serially loads/adopts and attaches the companion
+    /// on the same actor that owns XFRM and durable-recovery operations. A
+    /// successful activation is idempotent: later calls return success without
+    /// repeating runtime activation. Failure does not publish readiness, so a
+    /// proved-clean failure can be retried on this same backend.
+    ///
+    /// Cancellation before the actor can deliver success also leaves the
+    /// readiness gate closed. Runtime state created by an interrupted attempt
+    /// is never treated as authority; a later call must revalidate or adopt it
+    /// before DSCP-bearing SA mutations are admitted.
+    pub async fn activate_dscp_marking(&self) -> Result<(), XfrmError> {
+        let permit = self
+            .inner
+            .sender
+            .reserve()
+            .await
+            .map_err(|_| XfrmError::Unavailable)?;
+        let (reply_sender, reply_receiver) = oneshot::channel();
+        let (observed_sender, observed_receiver) = oneshot::channel();
+        permit.send(NamespaceCommand::ActivateDscpMarking {
+            reply: reply_sender,
+            observed: observed_receiver,
+        });
+        reply_receiver
+            .await
+            .map_err(|_| XfrmError::StateIndeterminate {
+                operation: "activate_dscp_marking",
+            })??;
+        // There is deliberately no await between observing success and
+        // acknowledging it. The actor retains its FIFO slot until this send,
+        // so a cancelled observer cannot publish readiness and a later marked
+        // mutation cannot overtake publication.
+        observed_sender
+            .send(())
+            .map_err(|_| XfrmError::StateIndeterminate {
+                operation: "activate_dscp_marking",
+            })?;
+        Ok(())
+    }
+
     /// Durably prepare one create-exclusive object install without admitting
     /// its backend effect.
     ///
@@ -779,6 +928,11 @@ impl NamespaceBoundLinuxXfrmBackend {
 
     /// Consume prepared authority and run its actor-serialized external effect.
     ///
+    /// A deferred DSCP activation gate is checked before authority or durable
+    /// state is consumed. [`XfrmObjectInstallRunError::into_retry_authority`]
+    /// returns that exact authority so the caller can activate this actor and
+    /// retry without reminting admission.
+    ///
     /// The exact current `Prepared` record is authenticated and transitioned
     /// durably to `Issuing` before the backend is invoked. The authority is
     /// consumed even when admission fails closed; callers reconcile retained
@@ -790,14 +944,22 @@ impl NamespaceBoundLinuxXfrmBackend {
     pub async fn run_durable_object_install(
         &self,
         authority: XfrmObjectInstallAdmissionAuthority,
-    ) -> Result<XfrmObjectInstallDurableOutcome, XfrmObjectInstallDurableError> {
+    ) -> Result<XfrmObjectInstallDurableOutcome, XfrmObjectInstallRunError> {
         if authority.actor_binding != self.inner.actor_binding {
-            return Err(XfrmObjectInstallDurableError::WrongBinding);
+            return Err(XfrmObjectInstallDurableError::WrongBinding.into());
         }
-        self.dispatch_durable(|reply| {
-            NamespaceCommand::RunDurableObjectInstall(Box::new(authority), reply)
-        })
-        .await
+        let permit =
+            self.inner.sender.reserve().await.map_err(|_| {
+                XfrmObjectInstallRunError::from(XfrmObjectInstallDurableError::Storage)
+            })?;
+        let (reply_sender, reply_receiver) = oneshot::channel();
+        permit.send(NamespaceCommand::RunDurableObjectInstall(
+            Box::new(authority),
+            reply_sender,
+        ));
+        reply_receiver
+            .await
+            .map_err(|_| XfrmObjectInstallRunError::from(XfrmObjectInstallDurableError::Storage))?
     }
 
     /// Surrender durable cleanup authority after the product has adopted an
@@ -1153,7 +1315,7 @@ enum NamespaceCommand {
     #[cfg(unix)]
     RunDurableObjectInstall(
         Box<XfrmObjectInstallAdmissionAuthority>,
-        oneshot::Sender<Result<XfrmObjectInstallDurableOutcome, XfrmObjectInstallDurableError>>,
+        oneshot::Sender<Result<XfrmObjectInstallDurableOutcome, XfrmObjectInstallRunError>>,
     ),
     #[cfg(unix)]
     FinalizeDurableObjectInstall(
@@ -1165,6 +1327,10 @@ enum NamespaceCommand {
         Box<DurableObjectOperation>,
         oneshot::Sender<Result<XfrmObjectInstallRestartOutcome, XfrmObjectInstallDurableError>>,
     ),
+    ActivateDscpMarking {
+        reply: oneshot::Sender<Result<(), XfrmError>>,
+        observed: oneshot::Receiver<()>,
+    },
     AllocateSpi(
         AllocateSpiRequest,
         oneshot::Sender<Result<SpiAllocation, XfrmError>>,
@@ -1266,9 +1432,28 @@ impl NamespaceCommand {
                             authority.operation.operation_generation,
                             &authority.operation.request,
                         )
-                    })
-                    .and_then(|()| state.consume_object_install_admission(&authority));
-                let result = match validation {
+                    });
+                if let Err(error) = validation {
+                    let _ = reply.send(Err(error.into()));
+                    return;
+                }
+                let activation_required = match &authority.operation.request {
+                    XfrmObjectInstallRequest::Sa(request) => matches!(
+                        backend.ensure_dscp_mutation_activated(&request.parameters),
+                        Err(XfrmError::Unavailable)
+                    ),
+                    XfrmObjectInstallRequest::Policy(_) => false,
+                };
+                if activation_required {
+                    // This is a proved pre-effect rejection. Keep the durable
+                    // record at Prepared and return the exact affine authority
+                    // so the caller can activate this actor and retry it.
+                    let _ = reply.send(Err(XfrmObjectInstallRunError::dscp_activation_required(
+                        authority,
+                    )));
+                    return;
+                }
+                let result = match state.consume_object_install_admission(&authority) {
                     Ok(()) => {
                         state.invalidate_counter_receipts();
                         run_object_install(
@@ -1283,7 +1468,7 @@ impl NamespaceCommand {
                     }
                     Err(error) => Err(error),
                 };
-                let _ = reply.send(result);
+                let _ = reply.send(result.map_err(XfrmObjectInstallRunError::from));
             }
             #[cfg(unix)]
             Self::FinalizeDurableObjectInstall(operation, reply) => {
@@ -1333,6 +1518,26 @@ impl NamespaceCommand {
                 };
                 let _ = reply.send(result);
             }
+            Self::ActivateDscpMarking { reply, observed } => {
+                let was_ready = backend.dscp_activation_is_ready();
+                match if was_ready {
+                    Ok(())
+                } else {
+                    backend.prepare_dscp_activation()
+                } {
+                    Ok(()) => {
+                        // A successful send alone does not prove that the
+                        // observer polled the reply. Hold the actor's FIFO slot
+                        // until the public future acknowledges observation.
+                        if reply.send(Ok(())).is_ok() && observed.await.is_ok() && !was_ready {
+                            backend.publish_dscp_activation();
+                        }
+                    }
+                    Err(error) => {
+                        let _ = reply.send(Err(error));
+                    }
+                }
+            }
             Self::AllocateSpi(request, reply) => {
                 let result = match state.admit_xfrm_mutation() {
                     Ok(()) => backend.allocate_spi(request).await,
@@ -1341,7 +1546,10 @@ impl NamespaceCommand {
                 let _ = reply.send(result);
             }
             Self::InstallSa(request, reply) => {
-                let result = match state.admit_xfrm_mutation() {
+                let result = match backend
+                    .ensure_dscp_mutation_activated(&request.parameters)
+                    .and_then(|()| state.admit_xfrm_mutation())
+                {
                     Ok(()) => backend.install_sa(request).await,
                     Err(error) => Err(error),
                 };
@@ -1362,14 +1570,20 @@ impl NamespaceCommand {
                 let _ = reply.send(LinuxEspPeerObservationKernelSource::load(config));
             }
             Self::RekeySa(request, reply) => {
-                let result = match state.admit_xfrm_mutation() {
+                let result = match backend
+                    .ensure_dscp_mutation_activated(&request.parameters)
+                    .and_then(|()| state.admit_xfrm_mutation())
+                {
                     Ok(()) => backend.rekey_sa(request).await,
                     Err(error) => Err(error),
                 };
                 let _ = reply.send(result);
             }
             Self::RelocateSa(request, reply) => {
-                let result = match state.admit_xfrm_mutation() {
+                let result = match backend
+                    .ensure_dscp_relocation_activated(&request)
+                    .and_then(|()| state.admit_xfrm_mutation())
+                {
                     Ok(()) => backend.relocate_sa(request).await,
                     Err(error) => Err(error),
                 };
@@ -1421,7 +1635,10 @@ impl NamespaceCommand {
                 );
             }
             Self::ApplyOutboundEspCounter(request, reply) => {
-                let result = match state.admit_xfrm_mutation() {
+                let result = match backend
+                    .ensure_dscp_mutation_activated(request.parameters())
+                    .and_then(|()| state.admit_xfrm_mutation())
+                {
                     Ok(()) => {
                         state
                             .counter_receipts
@@ -1485,7 +1702,7 @@ impl NamespaceCommand {
             }
             #[cfg(unix)]
             Self::RunDurableObjectInstall(_, reply) => {
-                let _ = reply.send(Err(XfrmObjectInstallDurableError::WrongBinding));
+                let _ = reply.send(Err(XfrmObjectInstallDurableError::WrongBinding.into()));
             }
             #[cfg(unix)]
             Self::FinalizeDurableObjectInstall(_, reply) => {
@@ -1494,6 +1711,9 @@ impl NamespaceCommand {
             #[cfg(unix)]
             Self::RecoverDurableObjectInstall(_, reply) => {
                 let _ = reply.send(Err(XfrmObjectInstallDurableError::WrongBinding));
+            }
+            Self::ActivateDscpMarking { reply, .. } => {
+                let _ = reply.send(Err(error));
             }
             Self::AllocateSpi(_, reply) => {
                 let _ = reply.send(Err(error));
@@ -4113,6 +4333,98 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct DeferredDscpRuntimeState {
+        records: Mutex<Vec<(ThreadId, NetworkNamespaceBinding)>>,
+        outcomes: Mutex<VecDeque<Result<(), XfrmError>>>,
+        blocker: Option<Arc<BlockingState>>,
+        capability_calls: AtomicUsize,
+    }
+
+    #[derive(Debug, Clone)]
+    struct DeferredDscpRuntime {
+        state: Arc<DeferredDscpRuntimeState>,
+    }
+
+    impl DeferredDscpRuntime {
+        fn with_outcomes(outcomes: impl IntoIterator<Item = Result<(), XfrmError>>) -> Self {
+            Self {
+                state: Arc::new(DeferredDscpRuntimeState {
+                    records: Mutex::new(Vec::new()),
+                    outcomes: Mutex::new(outcomes.into_iter().collect()),
+                    blocker: None,
+                    capability_calls: AtomicUsize::new(0),
+                }),
+            }
+        }
+
+        fn blocking(blocker: Arc<BlockingState>) -> Self {
+            Self {
+                state: Arc::new(DeferredDscpRuntimeState {
+                    records: Mutex::new(Vec::new()),
+                    outcomes: Mutex::new(VecDeque::new()),
+                    blocker: Some(blocker),
+                    capability_calls: AtomicUsize::new(0),
+                }),
+            }
+        }
+
+        fn records(&self) -> Vec<(ThreadId, NetworkNamespaceBinding)> {
+            self.state
+                .records
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+
+        fn capability_calls(&self) -> usize {
+            self.state.capability_calls.load(Ordering::Acquire)
+        }
+    }
+
+    impl XfrmDscpRuntime for DeferredDscpRuntime {
+        fn fresh_namespace_runtime(&self) -> Arc<dyn XfrmDscpRuntime> {
+            Arc::new(self.clone())
+        }
+
+        fn ensure_ready(&self, _config: &LinuxXfrmDscpMarkingConfig) -> Result<(), XfrmError> {
+            self.state
+                .records
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push((
+                    std::thread::current().id(),
+                    NetworkNamespaceBinding::capture()?,
+                ));
+            if let Some(blocker) = &self.state.blocker {
+                let call = blocker.calls.fetch_add(1, Ordering::AcqRel);
+                if call == 0 {
+                    let mut guard = blocker
+                        .lock
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    while !blocker.released.load(Ordering::Acquire) {
+                        guard = blocker
+                            .wake
+                            .wait(guard)
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    }
+                }
+            }
+            self.state
+                .outcomes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .pop_front()
+                .unwrap_or(Ok(()))
+        }
+
+        fn capability(&self, _config: &LinuxXfrmDscpMarkingConfig) -> XfrmCapability {
+            self.state.capability_calls.fetch_add(1, Ordering::AcqRel);
+            XfrmCapability::Available
+        }
+    }
+
     #[derive(Debug, Clone, Copy)]
     struct SuccessfulTransport;
 
@@ -4164,6 +4476,357 @@ mod tests {
         assert!(records
             .iter()
             .all(|(_, observed_binding)| *observed_binding == binding));
+    }
+
+    #[tokio::test]
+    async fn deferred_dscp_activation_is_actor_local_idempotent_and_capability_gated() {
+        let config = LinuxXfrmDscpMarkingConfig::new([String::from("lo")], 25).unwrap();
+        let mut marked = sa_parameters();
+        marked.egress_dscp = Some(DscpCodepoint::new(46).unwrap());
+        let readback = crate::linux::test_dscp_sa_readback_body(&marked, &config).unwrap();
+        let transport = BindingTransport::new([Ok(None), Ok(Some(readback))]);
+        let runtime = DeferredDscpRuntime::with_outcomes([]);
+        let backend = LinuxXfrmBackend::with_transport_and_deferred_dscp_runtime(
+            transport.clone(),
+            config.clone(),
+            runtime.clone(),
+        )
+        .unwrap();
+
+        assert!(
+            runtime.records().is_empty(),
+            "construction must be effect-free"
+        );
+        let caller_thread = std::thread::current().id();
+        let binding = NetworkNamespaceBinding::capture().unwrap();
+        let backend = backend.bind_current_network_namespace().unwrap();
+        assert!(runtime.records().is_empty(), "binding must be effect-free");
+        assert_eq!(
+            backend.probe().await.unwrap().egress_dscp_marking,
+            XfrmCapability::Unknown
+        );
+        assert_eq!(runtime.capability_calls(), 0);
+
+        assert!(matches!(
+            backend
+                .install_sa(InstallSaRequest {
+                    parameters: marked.clone(),
+                })
+                .await,
+            Err(XfrmError::Unavailable)
+        ));
+        assert!(transport.operations().is_empty());
+        assert!(runtime.records().is_empty());
+
+        let mut relocation = relocation_request();
+        let profile = config.profile().unwrap();
+        relocation.current.output_mark = Some(crate::XfrmMark {
+            value: profile.encode_token(46).unwrap(),
+            mask: profile.mask,
+        });
+        assert!(matches!(
+            backend.relocate_sa(relocation).await,
+            Err(XfrmError::Unavailable)
+        ));
+
+        let mut counter_install = outbound_install_request();
+        counter_install.sa.parameters.egress_dscp = Some(DscpCodepoint::new(46).unwrap());
+        let counter_authority = counter_binding(&backend, &counter_install);
+        let counter_apply = counter_request(&counter_authority, &counter_install, 0x624, 1, 100);
+        let counter_error = backend
+            .apply_and_read_back_outbound_esp_counter(
+                &counter_authority,
+                counter_authority.id(),
+                counter_apply,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(counter_error.code(), "esp_counter_backend_unavailable");
+        assert!(transport.operations().is_empty());
+        assert!(runtime.records().is_empty());
+
+        backend.activate_dscp_marking().await.unwrap();
+        backend.activate_dscp_marking().await.unwrap();
+        let activation_records = runtime.records();
+        assert_eq!(activation_records.len(), 1);
+        assert_ne!(activation_records[0].0, caller_thread);
+        assert_eq!(activation_records[0].1, binding);
+        assert_eq!(
+            backend.probe().await.unwrap().egress_dscp_marking,
+            XfrmCapability::Unknown,
+            "runtime readiness alone is not XFRM attribute proof"
+        );
+
+        backend
+            .install_sa(InstallSaRequest { parameters: marked })
+            .await
+            .unwrap();
+        let records = runtime.records();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].0, records[1].0);
+        assert!(records
+            .iter()
+            .all(|(_, observed_binding)| *observed_binding == binding));
+        assert_eq!(
+            transport.operations(),
+            vec!["install_sa", "install_sa_dscp_readback"]
+        );
+        assert_eq!(
+            backend.probe().await.unwrap().egress_dscp_marking,
+            XfrmCapability::Available
+        );
+    }
+
+    #[tokio::test]
+    async fn clean_deferred_dscp_activation_failure_is_closed_and_retryable() {
+        let config = LinuxXfrmDscpMarkingConfig::new([String::from("lo")], 25).unwrap();
+        let runtime = DeferredDscpRuntime::with_outcomes([Err(XfrmError::Unavailable), Ok(())]);
+        let backend = LinuxXfrmBackend::with_transport_and_deferred_dscp_runtime(
+            SuccessfulTransport,
+            config,
+            runtime.clone(),
+        )
+        .unwrap()
+        .bind_current_network_namespace()
+        .unwrap();
+
+        assert!(matches!(
+            backend.activate_dscp_marking().await,
+            Err(XfrmError::Unavailable)
+        ));
+        assert_eq!(
+            backend.probe().await.unwrap().egress_dscp_marking,
+            XfrmCapability::Unknown
+        );
+        assert_eq!(runtime.capability_calls(), 0);
+        let mut marked = sa_parameters();
+        marked.egress_dscp = Some(DscpCodepoint::new(46).unwrap());
+        assert!(matches!(
+            backend
+                .install_sa(InstallSaRequest { parameters: marked })
+                .await,
+            Err(XfrmError::Unavailable)
+        ));
+
+        backend.activate_dscp_marking().await.unwrap();
+        backend.activate_dscp_marking().await.unwrap();
+        let records = runtime.records();
+        assert_eq!(records.len(), 2, "successful activation is published once");
+        assert_eq!(records[0].0, records[1].0, "retry stays on the same actor");
+        assert_eq!(records[0].1, records[1].1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_deferred_dscp_activation_cannot_publish_readiness() {
+        let blocker = Arc::new(BlockingState::new());
+        let runtime = DeferredDscpRuntime::blocking(Arc::clone(&blocker));
+        let config = LinuxXfrmDscpMarkingConfig::new([String::from("lo")], 25).unwrap();
+        let transport = BindingTransport::new(std::iter::empty::<BindingResponse>());
+        let backend = LinuxXfrmBackend::with_transport_and_deferred_dscp_runtime(
+            transport.clone(),
+            config,
+            runtime.clone(),
+        )
+        .unwrap()
+        .bind_current_network_namespace()
+        .unwrap();
+
+        let observer = tokio::spawn({
+            let backend = backend.clone();
+            async move { backend.activate_dscp_marking().await }
+        });
+        wait_until(|| blocker.calls.load(Ordering::Acquire) == 1).await;
+        observer.abort();
+        let _ = observer.await;
+        blocker.release();
+
+        // Probe is actor-serialized behind the cancelled activation and thus
+        // also proves that its runtime call has returned.
+        assert_eq!(
+            backend.probe().await.unwrap().egress_dscp_marking,
+            XfrmCapability::Unknown
+        );
+        assert_eq!(runtime.capability_calls(), 0);
+        let mut marked = sa_parameters();
+        marked.egress_dscp = Some(DscpCodepoint::new(46).unwrap());
+        assert!(matches!(
+            backend
+                .install_sa(InstallSaRequest { parameters: marked })
+                .await,
+            Err(XfrmError::Unavailable)
+        ));
+        assert!(transport.operations().is_empty());
+
+        backend.activate_dscp_marking().await.unwrap();
+        assert_eq!(runtime.records().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn unobserved_successful_activation_reply_cannot_publish_readiness() {
+        let runtime = DeferredDscpRuntime::with_outcomes([]);
+        let config = LinuxXfrmDscpMarkingConfig::new([String::from("lo")], 25).unwrap();
+        let transport = BindingTransport::new(std::iter::empty::<BindingResponse>());
+        let backend = LinuxXfrmBackend::with_transport_and_deferred_dscp_runtime(
+            transport.clone(),
+            config,
+            runtime.clone(),
+        )
+        .unwrap()
+        .bind_current_network_namespace()
+        .unwrap();
+
+        let permit = backend.inner.sender.reserve().await.unwrap();
+        let (reply_sender, reply_receiver) = oneshot::channel();
+        let (observed_sender, observed_receiver) = oneshot::channel();
+        permit.send(NamespaceCommand::ActivateDscpMarking {
+            reply: reply_sender,
+            observed: observed_receiver,
+        });
+        assert!(reply_receiver.await.unwrap().is_ok());
+        // This is the protocol cut reached when the public observer is
+        // cancelled after delivery but before it can acknowledge observation.
+        drop(observed_sender);
+
+        assert_eq!(
+            backend.probe().await.unwrap().egress_dscp_marking,
+            XfrmCapability::Unknown
+        );
+        let mut marked = sa_parameters();
+        marked.egress_dscp = Some(DscpCodepoint::new(46).unwrap());
+        assert!(matches!(
+            backend
+                .install_sa(InstallSaRequest { parameters: marked })
+                .await,
+            Err(XfrmError::Unavailable)
+        ));
+        assert!(transport.operations().is_empty());
+        assert_eq!(runtime.records().len(), 1);
+
+        backend.activate_dscp_marking().await.unwrap();
+        assert_eq!(runtime.records().len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn deferred_binding_keeps_durable_recovery_available_without_dscp_effects() {
+        let root = DurableTestRoot::new();
+        let runtime = DeferredDscpRuntime::with_outcomes([]);
+        let config = LinuxXfrmDscpMarkingConfig::new([String::from("lo")], 25).unwrap();
+        let mut parameters = sa_parameters();
+        parameters.egress_dscp = Some(DscpCodepoint::new(46).unwrap());
+        let readback = crate::linux::test_dscp_sa_readback_body(&parameters, &config).unwrap();
+        let transport = BindingTransport::new([Ok(None), Ok(Some(readback))]);
+        let (backend, store) = LinuxXfrmBackend::with_transport_and_deferred_dscp_runtime(
+            transport.clone(),
+            config,
+            runtime.clone(),
+        )
+        .unwrap()
+        .bind_current_network_namespace_with_object_recovery(
+            root.path().to_path_buf(),
+            XfrmObjectRecoveryProofKey::new([0x75; 32]).unwrap(),
+        )
+        .unwrap();
+        assert!(runtime.records().is_empty());
+
+        let operation_id = XfrmObjectInstallOperationId::generate().unwrap();
+        let generation = XfrmObjectInstallOperationGeneration::new(1).unwrap();
+        let request = XfrmObjectInstallRequest::Sa(InstallSaRequest { parameters });
+        let authority = backend
+            .prepare_durable_object_install(&store, operation_id, generation, request.clone())
+            .await
+            .unwrap();
+        drop(authority);
+        assert!(matches!(
+            backend
+                .recover_durable_object_install(&store, operation_id, generation, request)
+                .await
+                .unwrap(),
+            XfrmObjectInstallRestartOutcome::NoMutation
+        ));
+
+        let mut parameters = sa_parameters();
+        parameters.egress_dscp = Some(DscpCodepoint::new(46).unwrap());
+        let request = XfrmObjectInstallRequest::Sa(InstallSaRequest { parameters });
+        let authority = backend
+            .prepare_durable_object_install(&store, operation_id, generation, request.clone())
+            .await
+            .unwrap();
+        let mut invalid_unmarked = sa_parameters();
+        invalid_unmarked.id.spi = 0;
+        assert!(matches!(
+            backend
+                .install_sa(InstallSaRequest {
+                    parameters: invalid_unmarked,
+                })
+                .await,
+            Err(XfrmError::InvalidConfig { .. })
+        ));
+        let stale = backend
+            .run_durable_object_install(authority)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            stale.durable_error(),
+            Some(XfrmObjectInstallDurableError::Stale)
+        );
+        assert!(stale.into_retry_authority().is_none());
+        assert!(matches!(
+            backend
+                .recover_durable_object_install(&store, operation_id, generation, request.clone(),)
+                .await
+                .unwrap(),
+            XfrmObjectInstallRestartOutcome::NoMutation
+        ));
+        assert!(transport.operations().is_empty());
+
+        let authority = backend
+            .prepare_durable_object_install(&store, operation_id, generation, request.clone())
+            .await
+            .unwrap();
+        let error = backend
+            .run_durable_object_install(authority)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.as_str(),
+            "xfrm_object_install_dscp_activation_required"
+        );
+        assert_eq!(
+            format!("{error:?}"),
+            "XfrmObjectInstallRunError { code: \"xfrm_object_install_dscp_activation_required\", .. }"
+        );
+        assert_eq!(
+            durable_object_install_phase(&store, operation_id, generation, &request).unwrap(),
+            XfrmObjectInstallDurablePhase::Prepared
+        );
+        let authority = error
+            .into_retry_authority()
+            .expect("clean activation gate returns exact retry authority");
+        assert!(runtime.records().is_empty());
+        assert!(transport.operations().is_empty());
+        assert_eq!(
+            backend.probe().await.unwrap().egress_dscp_marking,
+            XfrmCapability::Unknown
+        );
+        assert_eq!(runtime.capability_calls(), 0);
+
+        backend.activate_dscp_marking().await.unwrap();
+        assert!(matches!(
+            backend.run_durable_object_install(authority).await.unwrap(),
+            XfrmObjectInstallDurableOutcome::Acquired(_)
+        ));
+        assert_eq!(
+            transport.operations(),
+            vec!["install_sa", "install_sa_dscp_readback"]
+        );
+        assert_eq!(
+            backend
+                .finalize_durable_object_install(&store, operation_id, generation, request)
+                .await
+                .unwrap(),
+            XfrmObjectInstallDurablePhase::Committed
+        );
     }
 
     #[test]

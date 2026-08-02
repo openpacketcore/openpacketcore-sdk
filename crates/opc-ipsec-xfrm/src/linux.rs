@@ -147,6 +147,8 @@ struct LinuxXfrmBackendInner {
     config: LinuxXfrmBackendConfig,
     dscp_config: Option<LinuxXfrmDscpMarkingConfig>,
     dscp_runtime: Arc<dyn XfrmDscpRuntime>,
+    dscp_activation_deferred: bool,
+    dscp_activation_ready: AtomicBool,
     dscp_xfrm_attributes_verified: AtomicBool,
     sa_relocation_capability: AtomicU8,
     namespace_binding: Option<NetworkNamespaceBinding>,
@@ -195,6 +197,8 @@ impl LinuxXfrmBackend {
                 config,
                 dscp_config: None,
                 dscp_runtime: production_runtime(),
+                dscp_activation_deferred: false,
+                dscp_activation_ready: AtomicBool::new(false),
                 dscp_xfrm_attributes_verified: AtomicBool::new(false),
                 sa_relocation_capability: AtomicU8::new(RELOCATION_CAPABILITY_UNKNOWN),
                 namespace_binding: None,
@@ -226,6 +230,65 @@ impl LinuxXfrmBackend {
                 config,
                 dscp_config: Some(dscp_config),
                 dscp_runtime: runtime,
+                dscp_activation_deferred: false,
+                dscp_activation_ready: AtomicBool::new(true),
+                dscp_xfrm_attributes_verified: AtomicBool::new(false),
+                sa_relocation_capability: AtomicU8::new(RELOCATION_CAPABILITY_UNKNOWN),
+                namespace_binding: None,
+            }),
+        })
+    }
+
+    /// Create a backend that retains validated fixed-DSCP configuration for
+    /// later namespace-bound activation.
+    ///
+    /// This constructor is explicitly effect-free with respect to the DSCP
+    /// runtime: it does not load or pin eBPF objects, create tc state, attach
+    /// programs, or adopt existing programs. The retained companion remains
+    /// fail-closed until [`NamespaceBoundLinuxXfrmBackend::activate_dscp_marking`]
+    /// succeeds on the bound namespace actor. Unmarked XFRM operations and
+    /// durable recovery remain available before activation.
+    pub fn with_deferred_dscp_marking(
+        dscp_config: LinuxXfrmDscpMarkingConfig,
+    ) -> Result<Self, XfrmError> {
+        Self::with_config_and_deferred_dscp_marking(LinuxXfrmBackendConfig::default(), dscp_config)
+    }
+
+    /// Create a custom-config backend with effect-free deferred fixed-DSCP
+    /// activation.
+    ///
+    /// Only validation and in-memory retention occur here. Binding the
+    /// backend, including binding with durable object recovery, also leaves
+    /// tc/eBPF state untouched. Activation is available only through the
+    /// returned namespace-bound backend.
+    pub fn with_config_and_deferred_dscp_marking(
+        config: LinuxXfrmBackendConfig,
+        dscp_config: LinuxXfrmDscpMarkingConfig,
+    ) -> Result<Self, XfrmError> {
+        Self::with_deferred_dscp_components(
+            Arc::new(NetlinkXfrmTransport),
+            config,
+            dscp_config,
+            production_runtime(),
+        )
+    }
+
+    fn with_deferred_dscp_components(
+        transport: Arc<dyn LinuxXfrmTransport>,
+        config: LinuxXfrmBackendConfig,
+        dscp_config: LinuxXfrmDscpMarkingConfig,
+        dscp_runtime: Arc<dyn XfrmDscpRuntime>,
+    ) -> Result<Self, XfrmError> {
+        dscp_config.validate()?;
+        Ok(Self {
+            inner: Arc::new(LinuxXfrmBackendInner {
+                transport,
+                next_sequence: AtomicU32::new(1),
+                config,
+                dscp_config: Some(dscp_config),
+                dscp_runtime,
+                dscp_activation_deferred: true,
+                dscp_activation_ready: AtomicBool::new(false),
                 dscp_xfrm_attributes_verified: AtomicBool::new(false),
                 sa_relocation_capability: AtomicU8::new(RELOCATION_CAPABILITY_UNKNOWN),
                 namespace_binding: None,
@@ -249,6 +312,8 @@ impl LinuxXfrmBackend {
                 },
                 dscp_config: None,
                 dscp_runtime: production_runtime(),
+                dscp_activation_deferred: false,
+                dscp_activation_ready: AtomicBool::new(false),
                 dscp_xfrm_attributes_verified: AtomicBool::new(false),
                 sa_relocation_capability: AtomicU8::new(RELOCATION_CAPABILITY_UNKNOWN),
                 namespace_binding: None,
@@ -279,11 +344,35 @@ impl LinuxXfrmBackend {
                 },
                 dscp_config: Some(dscp_config),
                 dscp_runtime: Arc::new(dscp_runtime),
+                dscp_activation_deferred: false,
+                dscp_activation_ready: AtomicBool::new(true),
                 dscp_xfrm_attributes_verified: AtomicBool::new(false),
                 sa_relocation_capability: AtomicU8::new(RELOCATION_CAPABILITY_UNKNOWN),
                 namespace_binding: None,
             }),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_transport_and_deferred_dscp_runtime<T, R>(
+        transport: T,
+        dscp_config: LinuxXfrmDscpMarkingConfig,
+        dscp_runtime: R,
+    ) -> Result<Self, XfrmError>
+    where
+        T: LinuxXfrmTransport + 'static,
+        R: XfrmDscpRuntime + 'static,
+    {
+        Self::with_deferred_dscp_components(
+            Arc::new(transport),
+            LinuxXfrmBackendConfig {
+                receive_attempts: 1,
+                receive_buffer_len: 4096,
+                retry_delay: Duration::ZERO,
+            },
+            dscp_config,
+            Arc::new(dscp_runtime),
+        )
     }
 
     /// Bind this backend to the calling thread's current Linux network
@@ -337,6 +426,10 @@ impl LinuxXfrmBackend {
                 config: inner.config,
                 dscp_config: inner.dscp_config.clone(),
                 dscp_runtime: inner.dscp_runtime.fresh_namespace_runtime(),
+                dscp_activation_deferred: inner.dscp_activation_deferred,
+                // A newly created runtime has no namespace-local readiness
+                // authority, even when the source backend was eagerly ready.
+                dscp_activation_ready: AtomicBool::new(false),
                 // Both observations were made through the source backend's
                 // execution context. They are not authority in a newly bound
                 // namespace, even when the underlying kernel is shared.
@@ -349,13 +442,49 @@ impl LinuxXfrmBackend {
 
     pub(crate) fn prepare_namespace_actor(&self) -> Result<(), XfrmError> {
         self.ensure_namespace_binding()?;
-        if let Some(config) = &self.inner.dscp_config {
-            // DSCP program/map adoption is namespace-scoped too. Repeat the
-            // identity check immediately before entering that runtime.
-            self.ensure_namespace_binding()?;
-            self.inner.dscp_runtime.ensure_ready(config)?;
+        if !self.inner.dscp_activation_deferred {
+            if let Some(config) = &self.inner.dscp_config {
+                // DSCP program/map adoption is namespace-scoped too. Repeat
+                // the identity check immediately before entering that
+                // runtime.
+                self.ensure_namespace_binding()?;
+                self.inner.dscp_runtime.ensure_ready(config)?;
+                self.inner
+                    .dscp_activation_ready
+                    .store(true, Ordering::Release);
+            }
         }
         Ok(())
+    }
+
+    pub(crate) fn dscp_activation_is_ready(&self) -> bool {
+        self.inner.dscp_activation_ready.load(Ordering::Acquire)
+    }
+
+    /// Perform activation effects without publishing mutation readiness.
+    ///
+    /// Publication is deliberately owned by the namespace command so a lost
+    /// activation observer cannot admit a later DSCP-bearing SA mutation.
+    pub(crate) fn prepare_dscp_activation(&self) -> Result<(), XfrmError> {
+        self.ensure_namespace_binding()?;
+        let config = self
+            .inner
+            .dscp_config
+            .as_ref()
+            .ok_or(XfrmError::UnsupportedFeature {
+                feature: "fixed_outer_dscp",
+            })?;
+        if self.dscp_activation_is_ready() {
+            return Ok(());
+        }
+        self.ensure_namespace_binding()?;
+        self.inner.dscp_runtime.ensure_ready(config)
+    }
+
+    pub(crate) fn publish_dscp_activation(&self) {
+        self.inner
+            .dscp_activation_ready
+            .store(true, Ordering::Release);
     }
 
     pub(crate) fn verify_namespace_actor(&self) -> Result<(), XfrmError> {
@@ -369,10 +498,53 @@ impl LinuxXfrmBackend {
         }
     }
 
+    pub(crate) fn ensure_dscp_mutation_activated(
+        &self,
+        parameters: &SaParameters,
+    ) -> Result<(), XfrmError> {
+        if parameters.egress_dscp.is_none() {
+            return Ok(());
+        }
+        if self.inner.dscp_config.is_none() {
+            return Err(XfrmError::UnsupportedFeature {
+                feature: "fixed_outer_dscp",
+            });
+        }
+        if !self.dscp_activation_is_ready() {
+            return Err(XfrmError::Unavailable);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn ensure_dscp_relocation_activated(
+        &self,
+        request: &RelocateSaRequest,
+    ) -> Result<(), XfrmError> {
+        let (Some(config), Some(output_mark)) =
+            (&self.inner.dscp_config, request.current.output_mark)
+        else {
+            return Ok(());
+        };
+        let profile = config.profile()?;
+        if output_mark.mask & profile.mask != profile.mask
+            || !matches!(
+                profile.decode_token(output_mark.value),
+                opc_ipsec_xfrm_ebpf_common::MarkToken::Dscp(_)
+            )
+        {
+            return Ok(());
+        }
+        if !self.dscp_activation_is_ready() {
+            return Err(XfrmError::Unavailable);
+        }
+        Ok(())
+    }
+
     fn prepare_dscp(&self, parameters: &SaParameters) -> Result<Option<MarkProfile>, XfrmError> {
         let Some(dscp) = parameters.egress_dscp else {
             return Ok(None);
         };
+        self.ensure_dscp_mutation_activated(parameters)?;
         let config = self
             .inner
             .dscp_config
@@ -614,6 +786,7 @@ impl LinuxXfrmBackend {
         parameters: &SaParameters,
         replay_state: &SaReplayState,
     ) -> Result<(), XfrmError> {
+        self.ensure_dscp_mutation_activated(parameters)?;
         let body = encode_sa_replay_update(parameters, replay_state)?;
         self.run_ack(
             "update_outbound_sa_replay_state",
@@ -927,6 +1100,7 @@ impl XfrmBackend for LinuxXfrmBackend {
     }
 
     async fn relocate_sa(&self, request: RelocateSaRequest) -> Result<(), XfrmError> {
+        self.ensure_dscp_relocation_activated(&request)?;
         validate_relocate_sa_request(&request)?;
         let before = self
             .query_sa_for_relocation(
@@ -1069,6 +1243,9 @@ impl XfrmBackend for LinuxXfrmBackend {
                 .dscp_config
                 .as_ref()
                 .map_or(XfrmCapability::Missing, |config| {
+                    if !self.dscp_activation_is_ready() {
+                        return XfrmCapability::Unknown;
+                    }
                     let companion = self.inner.dscp_runtime.capability(config);
                     if companion == XfrmCapability::Available
                         && !self
@@ -4336,6 +4513,14 @@ pub(crate) fn test_outbound_binding_readback_bodies(
 }
 
 #[cfg(test)]
+pub(crate) fn test_dscp_sa_readback_body(
+    parameters: &SaParameters,
+    config: &LinuxXfrmDscpMarkingConfig,
+) -> Result<SensitiveBuffer, XfrmError> {
+    encode_sa_info_with_dscp(parameters, Some(config.profile()?))
+}
+
+#[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
@@ -4474,6 +4659,7 @@ mod tests {
     #[derive(Debug)]
     struct FakeDscpRuntimeState {
         ensure_calls: usize,
+        capability_calls: usize,
         ready: bool,
         capability: XfrmCapability,
     }
@@ -4483,6 +4669,7 @@ mod tests {
             Self {
                 state: Arc::new(Mutex::new(FakeDscpRuntimeState {
                     ensure_calls: 0,
+                    capability_calls: 0,
                     ready: true,
                     capability: XfrmCapability::Available,
                 })),
@@ -4506,6 +4693,13 @@ mod tests {
             state.ready = false;
             state.capability = XfrmCapability::Missing;
         }
+
+        fn capability_calls(&self) -> usize {
+            self.state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .capability_calls
+        }
     }
 
     impl XfrmDscpRuntime for FakeDscpRuntime {
@@ -4527,10 +4721,12 @@ mod tests {
         }
 
         fn capability(&self, _config: &LinuxXfrmDscpMarkingConfig) -> XfrmCapability {
-            self.state
+            let mut state = self
+                .state
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .capability
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.capability_calls += 1;
+            state.capability
         }
     }
 
@@ -7351,6 +7547,57 @@ mod tests {
             }
         ));
         assert!(transport.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn deferred_dscp_construction_and_preactivation_are_effect_free() {
+        let transport = CapturingTransport::default();
+        let runtime = FakeDscpRuntime::default();
+        let backend = LinuxXfrmBackend::with_transport_and_deferred_dscp_runtime(
+            transport.clone(),
+            dscp_config(),
+            runtime.clone(),
+        )
+        .unwrap();
+
+        assert_eq!(runtime.ensure_calls(), 0);
+        assert_eq!(
+            backend.probe().await.unwrap().egress_dscp_marking,
+            XfrmCapability::Unknown
+        );
+        assert_eq!(
+            runtime.capability_calls(),
+            0,
+            "an inactive retained configuration is not capability authority"
+        );
+
+        let mut marked = sa_parameters();
+        marked.egress_dscp = Some(DscpCodepoint::new(46).unwrap());
+        assert!(matches!(
+            backend
+                .install_sa(InstallSaRequest {
+                    parameters: marked.clone(),
+                })
+                .await,
+            Err(XfrmError::Unavailable)
+        ));
+        assert!(matches!(
+            backend
+                .rekey_sa(RekeySaRequest { parameters: marked })
+                .await,
+            Err(XfrmError::Unavailable)
+        ));
+        assert!(transport.requests().is_empty());
+        assert_eq!(runtime.ensure_calls(), 0);
+
+        backend
+            .install_sa(InstallSaRequest {
+                parameters: sa_parameters(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(transport.requests().len(), 1);
+        assert_eq!(runtime.ensure_calls(), 0);
     }
 
     #[tokio::test]
