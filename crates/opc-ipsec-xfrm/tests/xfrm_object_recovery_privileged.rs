@@ -46,6 +46,10 @@ const ROLE_HARNESS_SIGKILL: &str = "harness-sigkill";
 const ROLE_SA_ACQUIRED: &str = "sa-acquired";
 const ROLE_SA_NO_MUTATION: &str = "sa-no-mutation";
 const ROLE_POLICY_ACQUIRED: &str = "policy-acquired";
+const ROLE_SA_PREPARED_BEFORE_ADMISSION: &str = "sa-prepared-before-admission-621";
+const ROLE_SA_PREPARED_POLL_ADMITTED: &str = "sa-prepared-poll-admitted-621";
+const ROLE_POLICY_PREPARED_BEFORE_ADMISSION: &str = "policy-prepared-before-admission-621";
+const ROLE_POLICY_PREPARED_POLL_ADMITTED: &str = "policy-prepared-poll-admitted-621";
 
 const RECORD_BODY_BYTES: usize = 176;
 const ACTOR_INCARNATION_RANGE: std::ops::Range<usize> = 64..80;
@@ -486,8 +490,18 @@ impl PrivilegedFixture {
             .join(format!("{role}.handle"))
     }
 
+    fn poll_admitted_path(&self, role: &str) -> PathBuf {
+        self.root
+            .join("coordination")
+            .join(format!("{role}.poll-admitted"))
+    }
+
     fn readiness_bytes(&self, role: &str, child_pid: u32) -> Vec<u8> {
         format!("{}:{role}:{child_pid}:ready\n", self.token).into_bytes()
+    }
+
+    fn poll_admitted_bytes(&self, role: &str, child_pid: u32) -> Vec<u8> {
+        format!("{}:{role}:{child_pid}:PollAdmitted\n", self.token).into_bytes()
     }
 
     fn child_command(&self, namespace: &str, role: &str) -> io::Result<Command> {
@@ -730,8 +744,13 @@ fn poison_acquired_record_incarnation(store_root: &Path, key: &[u8; 32]) -> Test
 
 fn durable_child_request(role: &str) -> TestResult<XfrmObjectInstallRequest> {
     match role {
-        ROLE_SA_ACQUIRED | ROLE_SA_NO_MUTATION => Ok(sa_object_request()),
-        ROLE_POLICY_ACQUIRED => Ok(policy_object_request(POLICY_IF_ID_OWNED)),
+        ROLE_SA_ACQUIRED
+        | ROLE_SA_NO_MUTATION
+        | ROLE_SA_PREPARED_BEFORE_ADMISSION
+        | ROLE_SA_PREPARED_POLL_ADMITTED => Ok(sa_object_request()),
+        ROLE_POLICY_ACQUIRED
+        | ROLE_POLICY_PREPARED_BEFORE_ADMISSION
+        | ROLE_POLICY_PREPARED_POLL_ADMITTED => Ok(policy_object_request(POLICY_IF_ID_OWNED)),
         _ => Err(io::Error::new(io::ErrorKind::InvalidInput, "unknown durable child role").into()),
     }
 }
@@ -742,12 +761,13 @@ fn run_durable_crash_child(role: &str, root: &Path, token: &str) -> TestResult {
             root.join("store"),
             proof_key(token)?,
         )?;
-    let outcome = block_on(backend.run_durable_object_install(
+    let authority = block_on(backend.prepare_durable_object_install(
         &store,
         operation_id(token)?,
         operation_generation(),
         durable_child_request(role)?,
     ))?;
+    let outcome = block_on(backend.run_durable_object_install(authority))?;
     let expected = match role {
         ROLE_SA_ACQUIRED | ROLE_POLICY_ACQUIRED => {
             matches!(&outcome, XfrmObjectInstallDurableOutcome::Acquired(_))
@@ -763,6 +783,41 @@ fn run_durable_crash_child(role: &str, root: &Path, token: &str) -> TestResult {
 
     let handle_path = root.join("coordination").join(format!("{role}.handle"));
     publish_readiness(&handle_path, &outcome.handle().to_bytes())?;
+    let ready_path = root.join("coordination").join(format!("{role}.ready"));
+    let evidence = format!("{token}:{role}:{}:ready\n", std::process::id());
+    publish_readiness(&ready_path, evidence.as_bytes())?;
+    child_wait_for_sigkill()
+}
+
+fn prepared_role_has_poll_admission(role: &str) -> TestResult<bool> {
+    match role {
+        ROLE_SA_PREPARED_BEFORE_ADMISSION | ROLE_POLICY_PREPARED_BEFORE_ADMISSION => Ok(false),
+        ROLE_SA_PREPARED_POLL_ADMITTED | ROLE_POLICY_PREPARED_POLL_ADMITTED => Ok(true),
+        _ => Err(io::Error::new(io::ErrorKind::InvalidInput, "unknown prepared child role").into()),
+    }
+}
+
+fn run_prepared_crash_child(role: &str, root: &Path, token: &str) -> TestResult {
+    let (backend, store) = LinuxXfrmBackend::new()
+        .bind_current_network_namespace_with_object_recovery(
+            root.join("store"),
+            proof_key(token)?,
+        )?;
+    let _authority = block_on(backend.prepare_durable_object_install(
+        &store,
+        operation_id(token)?,
+        operation_generation(),
+        durable_child_request(role)?,
+    ))?;
+
+    if prepared_role_has_poll_admission(role)? {
+        let poll_admitted_path = root
+            .join("coordination")
+            .join(format!("{role}.poll-admitted"));
+        let evidence = format!("{token}:{role}:{}:PollAdmitted\n", std::process::id());
+        publish_readiness(&poll_admitted_path, evidence.as_bytes())?;
+    }
+
     let ready_path = root.join("coordination").join(format!("{role}.ready"));
     let evidence = format!("{token}:{role}:{}:ready\n", std::process::id());
     publish_readiness(&ready_path, evidence.as_bytes())?;
@@ -891,6 +946,57 @@ fn crash_durable_operation(
     Ok(read_recovery_handle(&handle_path)?)
 }
 
+fn crash_prepared_operation(
+    fixture: &PrivilegedFixture,
+    namespace: &str,
+    role: &str,
+    expect_poll_admitted: bool,
+) -> TestResult {
+    let ready_path = fixture.ready_path(role);
+    let poll_admitted_path = fixture.poll_admitted_path(role);
+    if poll_admitted_path.starts_with(fixture.store_path()) {
+        return Err(io::Error::other("consumer admission marker overlaps the SDK store").into());
+    }
+    if path_exists(&ready_path)? || path_exists(&poll_admitted_path)? {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "prepared-cut coordination evidence already exists",
+        )
+        .into());
+    }
+
+    let mut child = TestChild::spawn(fixture.child_command(namespace, role)?)?;
+    let child_pid = child.id()?;
+    let ready_bytes = fixture.readiness_bytes(role, child_pid);
+    let poll_admitted_bytes = fixture.poll_admitted_bytes(role, child_pid);
+    child.wait_for_readiness(&ready_path, &ready_bytes)?;
+    if expect_poll_admitted {
+        if fs::read(&poll_admitted_path)? != poll_admitted_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "child published malformed consumer admission evidence",
+            )
+            .into());
+        }
+    } else if path_exists(&poll_admitted_path)? {
+        return Err(io::Error::other(
+            "consumer admission marker was published before the admission cut",
+        )
+        .into());
+    }
+
+    let output = child.kill_and_reap()?;
+    assert_sigkill(&output)?;
+    if expect_poll_admitted && fs::read(&poll_admitted_path)? != poll_admitted_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "durable consumer admission evidence did not survive SIGKILL",
+        )
+        .into());
+    }
+    Ok(())
+}
+
 fn child_context() -> io::Result<Option<(String, PathBuf, String)>> {
     let Some(role) = env::var_os(CHILD_ROLE_ENV) else {
         return Ok(None);
@@ -928,6 +1034,10 @@ fn xfrm_object_recovery_privileged_child() -> TestResult {
         ROLE_SA_ACQUIRED | ROLE_SA_NO_MUTATION | ROLE_POLICY_ACQUIRED => {
             run_durable_crash_child(&role, &root, &token)
         }
+        ROLE_SA_PREPARED_BEFORE_ADMISSION
+        | ROLE_SA_PREPARED_POLL_ADMITTED
+        | ROLE_POLICY_PREPARED_BEFORE_ADMISSION
+        | ROLE_POLICY_PREPARED_POLL_ADMITTED => run_prepared_crash_child(&role, &root, &token),
         _ => Err(io::Error::new(io::ErrorKind::InvalidInput, "unknown child role").into()),
     }
 }
@@ -976,6 +1086,165 @@ fn collision_safe_sigkill_harness_preserves_parent_owned_cleanup() -> TestResult
     drop(backend_b);
     fixture.cleanup()?;
     Ok(())
+}
+
+fn prepared_sa_cut_recovers_no_mutation(role: &str, poll_admitted: bool) -> TestResult {
+    if !privileged_enabled() {
+        return Ok(());
+    }
+
+    let fixture = PrivilegedFixture::provision()?;
+    assert!(
+        !path_exists(&fixture.store_path())?,
+        "the durable API must exclusively create its own store"
+    );
+
+    // Keep an identical object in the foreign namespace so the detector also
+    // crosses the namespace-actor/backend boundary. Recovery in namespace A
+    // must leave both the absent target and the namespace-B object unchanged.
+    let foreign_backend = bind_namespace(fixture.namespace_b())?;
+    block_on(foreign_backend.install_sa(sa_install_request()))?;
+    assert_sa_presence(&foreign_backend, true)?;
+    drop(foreign_backend);
+    let before = bind_namespace(fixture.namespace_a())?;
+    assert_sa_presence(&before, false)?;
+    drop(before);
+
+    crash_prepared_operation(&fixture, fixture.namespace_a(), role, poll_admitted)?;
+
+    // The child has been killed and reaped with the requested object still
+    // absent. If the opaque authority were bypassed and issue had started,
+    // this assertion would turn the detector red before recovery could hide
+    // the acquired residue. Install a same-identity non-cooperating object
+    // after the cut so Prepared recovery must also prove zero deletion.
+    let replacement = bind_namespace(fixture.namespace_a())?;
+    assert_sa_presence(&replacement, false)?;
+    block_on(replacement.install_sa(sa_install_request()))?;
+    assert_sa_presence(&replacement, true)?;
+    drop(replacement);
+
+    let (backend, store) = bind_namespace_with_recovery(fixture.namespace_a(), &fixture)?;
+    assert_sa_presence(&backend, true)?;
+    let outcome = block_on(backend.recover_durable_object_install(
+        &store,
+        operation_id(&fixture.token)?,
+        operation_generation(),
+        sa_object_request(),
+    ))?;
+    assert!(matches!(
+        outcome,
+        XfrmObjectInstallRestartOutcome::NoMutation
+    ));
+    assert_sa_presence(&backend, true)?;
+    let foreign_backend = bind_namespace(fixture.namespace_b())?;
+    assert_sa_presence(&foreign_backend, true)?;
+
+    drop(foreign_backend);
+    drop(store);
+    drop(backend);
+    fixture.cleanup()?;
+    Ok(())
+}
+
+fn prepared_policy_cut_recovers_no_mutation(role: &str, poll_admitted: bool) -> TestResult {
+    if !privileged_enabled() {
+        return Ok(());
+    }
+
+    let fixture = PrivilegedFixture::provision()?;
+    assert!(
+        !path_exists(&fixture.store_path())?,
+        "the durable API must exclusively create its own store"
+    );
+
+    // A same-shape neighbor in namespace A and an exact object in namespace B
+    // make an accidental backend call observable without placing the requested
+    // policy in namespace A before the Prepared cut.
+    let neighbor_backend = bind_namespace(fixture.namespace_a())?;
+    block_on(neighbor_backend.install_policy(policy_install_request(POLICY_IF_ID_NEIGHBOR)))?;
+    drop(neighbor_backend);
+    let foreign_backend = bind_namespace(fixture.namespace_b())?;
+    block_on(foreign_backend.install_policy(policy_install_request(POLICY_IF_ID_OWNED)))?;
+    drop(foreign_backend);
+    assert_eq!(
+        policy_if_id_count(fixture.namespace_a(), POLICY_IF_ID_OWNED)?,
+        0
+    );
+    assert_eq!(
+        policy_if_id_count(fixture.namespace_a(), POLICY_IF_ID_NEIGHBOR)?,
+        1
+    );
+    assert_eq!(
+        policy_if_id_count(fixture.namespace_b(), POLICY_IF_ID_OWNED)?,
+        1
+    );
+
+    crash_prepared_operation(&fixture, fixture.namespace_a(), role, poll_admitted)?;
+
+    assert_eq!(
+        policy_if_id_count(fixture.namespace_a(), POLICY_IF_ID_OWNED)?,
+        0
+    );
+    let replacement = bind_namespace(fixture.namespace_a())?;
+    block_on(replacement.install_policy(policy_install_request(POLICY_IF_ID_OWNED)))?;
+    drop(replacement);
+    assert_eq!(
+        policy_if_id_count(fixture.namespace_a(), POLICY_IF_ID_OWNED)?,
+        1
+    );
+
+    let (backend, store) = bind_namespace_with_recovery(fixture.namespace_a(), &fixture)?;
+    let outcome = block_on(backend.recover_durable_object_install(
+        &store,
+        operation_id(&fixture.token)?,
+        operation_generation(),
+        policy_object_request(POLICY_IF_ID_OWNED),
+    ))?;
+    assert!(matches!(
+        outcome,
+        XfrmObjectInstallRestartOutcome::NoMutation
+    ));
+    assert_eq!(
+        policy_if_id_count(fixture.namespace_a(), POLICY_IF_ID_OWNED)?,
+        1
+    );
+    assert_eq!(
+        policy_if_id_count(fixture.namespace_a(), POLICY_IF_ID_NEIGHBOR)?,
+        1
+    );
+    assert_eq!(
+        policy_if_id_count(fixture.namespace_b(), POLICY_IF_ID_OWNED)?,
+        1
+    );
+
+    drop(store);
+    drop(backend);
+    fixture.cleanup()?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires root, CAP_SYS_ADMIN/CAP_NET_ADMIN, iproute2, and named netns support"]
+fn prepared_sa_before_consumer_admission_recovers_no_mutation() -> TestResult {
+    prepared_sa_cut_recovers_no_mutation(ROLE_SA_PREPARED_BEFORE_ADMISSION, false)
+}
+
+#[test]
+#[ignore = "requires root, CAP_SYS_ADMIN/CAP_NET_ADMIN, iproute2, and named netns support"]
+fn poll_admitted_prepared_sa_recovers_no_mutation_after_sigkill() -> TestResult {
+    prepared_sa_cut_recovers_no_mutation(ROLE_SA_PREPARED_POLL_ADMITTED, true)
+}
+
+#[test]
+#[ignore = "requires root, CAP_SYS_ADMIN/CAP_NET_ADMIN, iproute2, and named netns support"]
+fn prepared_policy_before_consumer_admission_recovers_no_mutation() -> TestResult {
+    prepared_policy_cut_recovers_no_mutation(ROLE_POLICY_PREPARED_BEFORE_ADMISSION, false)
+}
+
+#[test]
+#[ignore = "requires root, CAP_SYS_ADMIN/CAP_NET_ADMIN, iproute2, and named netns support"]
+fn poll_admitted_prepared_policy_recovers_no_mutation_after_sigkill() -> TestResult {
+    prepared_policy_cut_recovers_no_mutation(ROLE_POLICY_PREPARED_POLL_ADMITTED, true)
 }
 
 #[test]

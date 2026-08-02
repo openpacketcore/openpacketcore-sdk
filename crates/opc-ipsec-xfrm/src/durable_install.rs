@@ -126,8 +126,59 @@ impl fmt::Debug for XfrmObjectInstallRestartOutcome {
     }
 }
 
-pub(crate) async fn run_durable_object_install<B>(
+pub(crate) fn prepare_durable_object_install(
     store: &XfrmObjectInstallRecoveryStore,
+    operation_id: XfrmObjectInstallOperationId,
+    operation_generation: XfrmObjectInstallOperationGeneration,
+    request: &XfrmObjectInstallRequest,
+) -> Result<XfrmObjectInstallRecoveryHandle, XfrmObjectInstallDurableError> {
+    let fingerprints = store.fingerprints_for_request(request)?;
+    store.prepare(
+        operation_id,
+        operation_generation,
+        request.object(),
+        fingerprints,
+    )
+}
+
+pub(crate) fn durable_object_install_phase(
+    store: &XfrmObjectInstallRecoveryStore,
+    operation_id: XfrmObjectInstallOperationId,
+    operation_generation: XfrmObjectInstallOperationGeneration,
+    request: &XfrmObjectInstallRequest,
+) -> Result<XfrmObjectInstallDurablePhase, XfrmObjectInstallDurableError> {
+    let fingerprints = store.fingerprints_for_request(request)?;
+    store
+        .restore(
+            operation_id,
+            operation_generation,
+            request.object(),
+            fingerprints,
+        )
+        .map(|record| record.phase)
+}
+
+pub(crate) fn validate_durable_object_install_admission(
+    store: &XfrmObjectInstallRecoveryStore,
+    prepared: &XfrmObjectInstallRecoveryHandle,
+    operation_id: XfrmObjectInstallOperationId,
+    operation_generation: XfrmObjectInstallOperationGeneration,
+    request: &XfrmObjectInstallRequest,
+) -> Result<(), XfrmObjectInstallDurableError> {
+    let fingerprints = store.fingerprints_for_request(request)?;
+    let record = store.restore_handle(prepared, request.object(), fingerprints)?;
+    if record.operation_id != operation_id
+        || record.operation_generation != operation_generation
+        || record.phase != XfrmObjectInstallDurablePhase::Prepared
+    {
+        return Err(XfrmObjectInstallDurableError::WrongBinding);
+    }
+    Ok(())
+}
+
+pub(crate) async fn issue_durable_object_install<B>(
+    store: &XfrmObjectInstallRecoveryStore,
+    prepared: &XfrmObjectInstallRecoveryHandle,
     operation_id: XfrmObjectInstallOperationId,
     operation_generation: XfrmObjectInstallOperationGeneration,
     request: &XfrmObjectInstallRequest,
@@ -136,51 +187,16 @@ pub(crate) async fn run_durable_object_install<B>(
 where
     B: XfrmBackend + ?Sized,
 {
-    let fingerprints = store.fingerprints_for_request(request)?;
-    let prepared = match store.restore(
+    validate_durable_object_install_admission(
+        store,
+        prepared,
         operation_id,
         operation_generation,
-        request.object(),
-        fingerprints,
-    ) {
-        Ok(record) => match record.phase {
-            XfrmObjectInstallDurablePhase::Prepared => record,
-            XfrmObjectInstallDurablePhase::Acquired => {
-                return Ok(XfrmObjectInstallDurableOutcome::Acquired(
-                    store.handle_for_record(&record)?,
-                ));
-            }
-            XfrmObjectInstallDurablePhase::NoMutation => {
-                return Ok(XfrmObjectInstallDurableOutcome::NoMutation(
-                    store.handle_for_record(&record)?,
-                ));
-            }
-            XfrmObjectInstallDurablePhase::Issuing
-            | XfrmObjectInstallDurablePhase::Indeterminate
-            | XfrmObjectInstallDurablePhase::RemovalAdmitted => {
-                return Ok(XfrmObjectInstallDurableOutcome::Indeterminate {
-                    handle: store.handle_for_record(&record)?,
-                    source: None,
-                });
-            }
-            XfrmObjectInstallDurablePhase::Retired | XfrmObjectInstallDurablePhase::Committed => {
-                return Err(XfrmObjectInstallDurableError::InvalidTransition);
-            }
-        },
-        Err(XfrmObjectInstallDurableError::NotFound) => {
-            let handle = store.prepare(
-                operation_id,
-                operation_generation,
-                request.object(),
-                fingerprints,
-            )?;
-            store.restore_handle(&handle, request.object(), fingerprints)?
-        }
-        Err(error) => return Err(error),
-    };
+        request,
+    )?;
 
     let issuing = store.transition(
-        &store.handle_for_record(&prepared)?,
+        prepared,
         XfrmObjectInstallDurablePhase::Prepared,
         XfrmObjectInstallDurablePhase::Issuing,
     )?;
@@ -503,6 +519,26 @@ mod tests {
         ));
     }
 
+    async fn run_durable_object_install(
+        store: &XfrmObjectInstallRecoveryStore,
+        operation_id: XfrmObjectInstallOperationId,
+        operation_generation: XfrmObjectInstallOperationGeneration,
+        request: &XfrmObjectInstallRequest,
+        backend: &MockXfrmBackend,
+    ) -> Result<XfrmObjectInstallDurableOutcome, XfrmObjectInstallDurableError> {
+        let prepared =
+            prepare_durable_object_install(store, operation_id, operation_generation, request)?;
+        issue_durable_object_install(
+            store,
+            &prepared,
+            operation_id,
+            operation_generation,
+            request,
+            backend,
+        )
+        .await
+    }
+
     #[tokio::test]
     async fn acquired_sa_and_policy_are_exactly_removed_after_restart() {
         for (case, request) in [(0x11, sa_request()), (0x12, policy_request(None))] {
@@ -688,48 +724,49 @@ mod tests {
 
     #[tokio::test]
     async fn crash_in_issuing_after_a_successful_mutation_never_deletes() {
-        let root = TestRoot::new();
-        let backend = MockXfrmBackend::new();
-        let request = sa_request();
-        let operation_id = operation(0x41);
-        let operation_generation = generation(4);
-        let store = open_store(&root);
-        let fingerprints = store.fingerprints_for_request(&request).unwrap();
-        let prepared = store
-            .prepare(
-                operation_id,
-                operation_generation,
-                request.object(),
-                fingerprints,
-            )
-            .unwrap();
-        store
-            .transition(
-                &prepared,
-                XfrmObjectInstallDurablePhase::Prepared,
-                XfrmObjectInstallDurablePhase::Issuing,
-            )
-            .unwrap();
-        install(&backend, &request).await.unwrap();
-        drop(store);
+        for (case, request) in [(0x41, sa_request()), (0x42, policy_request(None))] {
+            let root = TestRoot::new();
+            let backend = MockXfrmBackend::new();
+            let operation_id = operation(case);
+            let operation_generation = generation(4);
+            let store = open_store(&root);
+            let fingerprints = store.fingerprints_for_request(&request).unwrap();
+            let prepared = store
+                .prepare(
+                    operation_id,
+                    operation_generation,
+                    request.object(),
+                    fingerprints,
+                )
+                .unwrap();
+            store
+                .transition(
+                    &prepared,
+                    XfrmObjectInstallDurablePhase::Prepared,
+                    XfrmObjectInstallDurablePhase::Issuing,
+                )
+                .unwrap();
+            install(&backend, &request).await.unwrap();
+            drop(store);
 
-        backend.clear_operations();
-        let reopened = open_store(&root);
-        assert_eq!(
-            recover_durable_object_install(
-                &reopened,
-                operation_id,
-                operation_generation,
-                &request,
-                &backend,
-            )
-            .await
-            .unwrap()
-            .as_str(),
-            "indeterminate"
-        );
-        assert_no_removal(&backend);
-        assert_present(&backend, &request).await;
+            backend.clear_operations();
+            let reopened = open_store(&root);
+            assert_eq!(
+                recover_durable_object_install(
+                    &reopened,
+                    operation_id,
+                    operation_generation,
+                    &request,
+                    &backend,
+                )
+                .await
+                .unwrap()
+                .as_str(),
+                "indeterminate"
+            );
+            assert_no_removal(&backend);
+            assert_present(&backend, &request).await;
+        }
     }
 
     #[tokio::test]

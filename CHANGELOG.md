@@ -11,9 +11,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Durable staged-object ownership recovery — `opc-ipsec-xfrm`:**
   `LinuxXfrmBackend::bind_current_network_namespace_with_object_recovery` now
   authenticates and permanently leases `XfrmObjectInstallRecoveryStore` on the
-  namespace actor before returning a mutation-capable backend, which can then
-  run, finalize, or recover SA-only and policy-only create-exclusive installs
-  across process loss. The
+  namespace actor before returning a mutation-capable backend. SA-only and
+  policy-only create-exclusive installs now expose a durable pre-effect split:
+  `prepare_durable_object_install` publishes authenticated `Prepared` truth and
+  returns a non-cloneable authority; only
+  `run_durable_object_install(authority)` can consume that exact actor-, store-,
+  correlation-, generation-, and request-bound authority and admit the external
+  effect. This closes the crash cut between a consumer's durable poll admission
+  and the SDK method's first poll. A retained `Prepared` operation recovers as
+  authoritative no-mutation without deletion, while duplicated, replayed,
+  stale, or mismatched authority fails before the backend. The
   fixed-size durable records retain only opaque correlation, object kind,
   namespace/writer incarnation, product generation, writer epoch, outcome,
   and independent proof-keyed fingerprints of the exact deletion identity and

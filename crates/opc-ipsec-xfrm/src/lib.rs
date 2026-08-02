@@ -48,21 +48,26 @@
 //! loss, `LinuxXfrmBackend::bind_current_network_namespace_with_object_recovery`
 //! authenticates and permanently leases one `XfrmObjectInstallRecoveryStore`
 //! on the namespace actor before returning any mutation-capable backend handle.
-//! `NamespaceBoundLinuxXfrmBackend::run_durable_object_install`
-//! persists intent before mutation admission and persists a definitive
-//! acquisition, definitive no-mutation, or indeterminate outcome before it
-//! returns. The consumer finalizes only after its adoption decision is durable;
-//! otherwise restart recovery removes residue solely from authenticated,
-//! epoch-current acquisition authority. Linux has no conditional SA/policy
-//! delete, so unresolved cleanup authority blocks every later cooperating
-//! actor mutation. Deployments must exclude all raw or independently stored
-//! XFRM writers in that namespace and keep the proof key in durable secret
-//! configuration. Store records retain independent keyed fingerprints of the
-//! deletion identity and complete install request, but no request identity
-//! values or key material; public diagnostics remain value-free. The leased
-//! root is trusted authoritative non-rollback storage under the documented
-//! POSIX crash model. A deployment whose storage can restore an older complete
-//! authenticated snapshot needs an external monotonic witness.
+//! `NamespaceBoundLinuxXfrmBackend::prepare_durable_object_install` persists
+//! authenticated `Prepared` truth and returns an affine, process-local
+//! [`XfrmObjectInstallAdmissionAuthority`] before any effect is admitted. The
+//! consumer first durably records poll admission, then
+//! `NamespaceBoundLinuxXfrmBackend::run_durable_object_install` consumes that
+//! exact actor-, store-, correlation-, generation-, and request-bound authority
+//! and persists `Issuing` before invoking the backend. The consumer finalizes
+//! only after its adoption decision is durable; otherwise restart recovery
+//! treats `Prepared` as authoritative no-mutation and removes residue solely
+//! from authenticated, epoch-current acquisition authority. Linux has no
+//! conditional SA/policy delete, so unresolved cleanup authority blocks every
+//! later cooperating actor mutation. Deployments must exclude all raw or
+//! independently stored XFRM writers in that namespace and keep the proof key
+//! in durable secret configuration. Store records retain independent keyed
+//! fingerprints of the deletion identity and complete install request, but no
+//! request identity values or key material; public diagnostics remain
+//! value-free. The leased root is trusted authoritative non-rollback storage
+//! under the documented POSIX crash model. A deployment whose storage can
+//! restore an older complete authenticated snapshot needs an external
+//! monotonic witness.
 //!
 //! Same-SPI successor activation uses
 //! [`NamespaceBoundLinuxXfrmBackend::apply_and_read_back_outbound_esp_counter`].
@@ -172,9 +177,9 @@ pub use model::{
     XFRM_AEAD_RFC4106_GCM_AES, XFRM_AUTH_HMAC_SHA1, XFRM_AUTH_HMAC_SHA256, XFRM_AUTH_HMAC_SHA384,
     XFRM_AUTH_HMAC_SHA512, XFRM_ENCR_CBC_AES, XFRM_ENCR_NULL,
 };
-#[cfg(unix)]
-pub use namespace::XfrmObjectRecoveryBindError;
 pub use namespace::{NamespaceBoundLinuxXfrmBackend, LINUX_XFRM_NAMESPACE_ACTOR_CAPACITY};
+#[cfg(unix)]
+pub use namespace::{XfrmObjectInstallAdmissionAuthority, XfrmObjectRecoveryBindError};
 pub use observation::{
     EspPeerAddressFamily, EspPeerIngestTally, EspPeerObservation, EspPeerObservationEpoch,
     EspPeerObservationKey, EspPeerObservationLoss, EspPeerObservationRejection,

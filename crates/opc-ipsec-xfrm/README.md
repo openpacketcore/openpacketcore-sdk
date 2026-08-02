@@ -104,9 +104,11 @@ closes the queue and lets the detached actor drain without blocking `Drop`.
   authenticates `XfrmObjectInstallRecoveryStore` on the namespace actor before
   returning any mutation-capable backend handle. The store keeps value-free
   operation records under a permanent filesystem lease, while
-  `run_durable_object_install`,
+  `prepare_durable_object_install`, `run_durable_object_install`,
   `finalize_durable_object_install`, and `recover_durable_object_install`
-  serialize the corresponding kernel mutation through the namespace actor.
+  serialize preparation, effect admission, and recovery through the namespace
+  actor. Running the effect requires consuming the opaque authority returned by
+  preparation; there is no combined prepare-and-effect entrypoint.
   This boundary supplements rather than changes the process-local
   `XfrmStagedObjectInstall` cancellation and classification API.
 - `InstalledOutboundSaBinding` is an opaque, unforgeable direction authority
@@ -148,35 +150,59 @@ namespace outside the retained epoch.
 
 The required ordering after that atomic bind is:
 
-1. Persist the consumer's poll-admitted record and operation correlation.
-2. Call `run_durable_object_install`. It publishes `Prepared` before actor
-   mutation admission, then durably publishes `Acquired`, `NoMutation`, or
-   `Indeterminate` before returning that outcome.
-3. Durably record the consumer decision. If an acquired object is adopted,
+1. Call `prepare_durable_object_install` with the retained operation ID,
+   generation, and complete request. It durably publishes authenticated
+   `Prepared` truth and returns a non-cloneable
+   `XfrmObjectInstallAdmissionAuthority`. No backend effect has been admitted
+   when this call returns.
+2. Durably commit the consumer's poll-admitted transition.
+3. Pass the authority to `run_durable_object_install`. This consumes the
+   authority exactly once, durably publishes `Issuing`, and only then admits
+   the actor-serialized backend effect. The method durably publishes
+   `Acquired`, `NoMutation`, or `Indeterminate` before returning its outcome.
+4. Durably record the consumer decision. If an acquired object is adopted,
    call `finalize_durable_object_install` only after that adoption is durable.
    Finalization surrenders cleanup authority and leaves the object installed.
-4. After restart, consult the consumer record. Finalize an adoption that was
+5. After restart, consult the consumer record. Finalize an adoption that was
    already committed; otherwise call `recover_durable_object_install` with the
    exact retained operation ID, generation, and request. Recovery retires a
    definitive no-mutation result without removal and removes only residue with
    authenticated, current `Acquired` authority.
 
-Once admitted, dropping the observing future does not cancel actor work. A
-retry uses the same operation ID, generation, and request; inventing new
-correlation is not reconciliation. A crash while an install is merely
-`Issuing`, including after a kernel acknowledgement but before terminal record
-publication, is deliberately indeterminate and authorizes no deletion. Missing,
-malformed, duplicated, unauthenticated, stale, wrong-request,
-wrong-namespace, or wrong-incarnation state likewise fails closed. An
-`AlreadyExists` acknowledgement becomes durable `NoMutation` and never
-authorizes removal.
+A crash after preparation, whether before or after the consumer commits poll
+admission, leaves authenticated `Prepared` truth. Restart recovery retires that
+record as authoritative no-mutation and performs no `DELSA` or `DELPOLICY`.
+Dropping an unsubmitted authority has the same recovery result. While
+registered, a live authority intentionally blocks same-process retirement;
+dropping it, losing the process, or losing a preparation reply leaves the
+durable record recoverable. An independently admitted actor mutation
+invalidates every prepared authority before its backend effect. Once the run
+command is admitted to the actor, dropping the observing future does not cancel
+its work.
+
+The authority is process-local, non-serializable, and bound to the exact open
+store, namespace actor, operation ID, generation, and complete request. A
+duplicate preparation, replay, stale phase, wrong request, wrong store, or
+presentation to another actor fails before the backend. Each new preparation
+receives a fresh live actor seal, so retiring and recreating the same durable
+correlation cannot revive an old admission authority. Missing, malformed,
+duplicated, unauthenticated, wrong-namespace, or wrong-incarnation state
+remains fail-closed. Callers reconcile a lost run result from the durable
+record; they do not invent new correlation or bypass the authority boundary.
+
+A crash after durable `Issuing`, including before the syscall or after a kernel
+acknowledgement but before terminal record publication, is deliberately
+indeterminate and authorizes no deletion. An `AlreadyExists` acknowledgement
+becomes durable `NoMutation` and never authorizes removal.
 
 Linux has no owner- or generation-conditional `DELSA` or `DELPOLICY`. The
 store therefore implements a cooperating-writer protocol: an unresolved
 `Acquired` or `RemovalAdmitted` record blocks every later mutation admitted by
 that namespace actor, including ordinary `XfrmBackend` operations, until it is
 finalized or recovered. Entering `Issuing` and every independent actor mutation
-burns a durable global writer epoch. `Acquired` already holds the writer gate,
+burns a durable global writer epoch. Prepared authority remains actor-local and
+one-shot; the current-epoch deletion check continues to apply only to
+`Acquired` and `RemovalAdmitted`. `Acquired` already holds the writer gate,
 so publishing `RemovalAdmitted` stays at that current epoch before deletion and
 has no ambiguous half-advanced epoch crash cut. A scoped policy recovery
 additionally proves the exact
