@@ -490,10 +490,12 @@ pub(crate) enum EbpfCleanupOnlyAdoption {
         /// (fenced) during adoption; false when both hooks were already absent.
         hooks_fenced: bool,
     },
-    /// No retained graph exists and the interface hook slots are
-    /// authoritatively empty. Nothing was manufactured to prove absence.
+    /// No retained graph exists, the reserved hook slots are empty, and the
+    /// all-placement SDK hook inventory is empty. Nothing was manufactured to
+    /// prove absence.
     Absent,
-    /// Adoption was refused before the retained graph was mutated.
+    /// Adoption authority was not granted. An indeterminate refusal can follow
+    /// a partially completed hook fence and therefore requires re-observation.
     Refused(RetainedGraphCleanupRefusal),
 }
 
@@ -6668,6 +6670,12 @@ mod aya_runtime {
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum CleanupOnlyPinGraph {
+        Absent,
+        Current { local_ip: [u8; 4] },
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum CurrentProgramReference {
         Absent,
         ExactSdkProgram,
@@ -7785,6 +7793,26 @@ mod aya_runtime {
                 .collect()
         }
 
+        fn classify_current_map_observation_error(error: MapError) -> CurrentIdentityError {
+            match error {
+                // BPF_OBJ_GET can open a different pinned BPF object, but the
+                // subsequent map-info query rejects it with EINVAL. That is
+                // durable wrong-object evidence, not a retryable read failure.
+                MapError::InvalidMapType { .. } => CurrentIdentityError::Mismatch,
+                MapError::SyscallError(ref error)
+                    if error.io_error.kind() == io::ErrorKind::InvalidInput =>
+                {
+                    CurrentIdentityError::Mismatch
+                }
+                MapError::IoError(ref error) if error.kind() == io::ErrorKind::InvalidInput => {
+                    CurrentIdentityError::Mismatch
+                }
+                // Permission, interruption, disappearance after inventory,
+                // and kernel observation errors retain retryable taxonomy.
+                _ => CurrentIdentityError::Indeterminate,
+            }
+        }
+
         fn current_named_map_ids(
             pin_dir: &Path,
         ) -> Result<[u32; CURRENT_MAP_NAMES.len()], CurrentIdentityError> {
@@ -7805,10 +7833,10 @@ mod aya_runtime {
                     return Err(CurrentIdentityError::Mismatch);
                 }
                 let info = MapInfo::from_pin(pin_dir.join(spec.name))
-                    .map_err(|_| CurrentIdentityError::Indeterminate)?;
+                    .map_err(Self::classify_current_map_observation_error)?;
                 let map_type = info
                     .map_type()
-                    .map_err(|_| CurrentIdentityError::Indeterminate)?
+                    .map_err(Self::classify_current_map_observation_error)?
                     as u32;
                 if map_type != spec.map_type
                     || info.name() != kernel_program_name(spec.name)
@@ -8453,6 +8481,68 @@ mod aya_runtime {
                 .get(&0, 0)
                 .map_err(|error| map_error("ebpf_pin_config", error))?;
             Ok(Some(config))
+        }
+
+        /// Classify the retained cleanup graph without binding any typed map
+        /// until the complete current pin set and every map ABI have been
+        /// proven. Cleanup-only recovery is intentionally not a migration
+        /// path: an older, partial, or malformed schema is a deterministic
+        /// structural refusal and must remain untouched.
+        fn cleanup_only_pin_graph_preflight(
+            pin_dir: &Path,
+        ) -> Result<CleanupOnlyPinGraph, RetainedGraphCleanupRefusal> {
+            let entries = Self::current_directory_entries(pin_dir)
+                .map_err(|_| RetainedGraphCleanupRefusal::IndeterminateState)?;
+            if entries.is_empty() {
+                return Ok(CleanupOnlyPinGraph::Absent);
+            }
+            if entries
+                .iter()
+                .any(|entry| !CURRENT_MAP_NAMES.contains(&entry.as_str()))
+            {
+                return Err(RetainedGraphCleanupRefusal::IdentityMismatch);
+            }
+            if entries.len() != CURRENT_MAP_NAMES.len()
+                || CURRENT_MAP_NAMES
+                    .iter()
+                    .any(|name| !entries.contains(*name))
+            {
+                return Err(RetainedGraphCleanupRefusal::NotCurrentSchema);
+            }
+
+            // This metadata-only pass proves map type, key/value widths,
+            // capacity, flags, kernel name, and that every path is a real pin.
+            // Only after it succeeds may the typed schema/config readers run.
+            match Self::current_named_map_ids(pin_dir) {
+                Ok(_) => {}
+                Err(CurrentIdentityError::Mismatch) => {
+                    return Err(RetainedGraphCleanupRefusal::NotCurrentSchema);
+                }
+                Err(CurrentIdentityError::Indeterminate) => {
+                    return Err(RetainedGraphCleanupRefusal::IndeterminateState);
+                }
+            }
+
+            // The current-graph observer requires the exact PMTU-v5 marker,
+            // canonical grouped-schema state, executable PMTU state, and
+            // structurally readable current maps. It is read-only.
+            match Self::current_graph_forwarding_populated(pin_dir) {
+                Ok(_) => {}
+                Err(CurrentIdentityError::Mismatch) => {
+                    return Err(RetainedGraphCleanupRefusal::NotCurrentSchema);
+                }
+                Err(CurrentIdentityError::Indeterminate) => {
+                    return Err(RetainedGraphCleanupRefusal::IndeterminateState);
+                }
+            }
+
+            let local_ip = Self::pinned_config_read(pin_dir)
+                .map_err(|_| RetainedGraphCleanupRefusal::IndeterminateState)?
+                .ok_or(RetainedGraphCleanupRefusal::NotCurrentSchema)?;
+            if local_ip == [0; 4] {
+                return Err(RetainedGraphCleanupRefusal::NotCurrentSchema);
+            }
+            Ok(CleanupOnlyPinGraph::Current { local_ip })
         }
 
         /// Determine which additive map schema this pin set has committed.
@@ -12066,6 +12156,17 @@ mod aya_runtime {
             Ok(uplink.is_none() && downlink.is_none())
         }
 
+        /// Prove that an absent pin graph has no surviving SDK forwarding
+        /// hook at any placement and no occupant in either reserved slot.
+        /// Checking only the configured priority would let an off-slot stale
+        /// SDK program forward while acquisition reported `Absent`.
+        fn cleanup_only_absence_proven(ifindex: u32, tc_priority: u16) -> Result<bool, GtpuError> {
+            if !Self::live_sdk_programs(ifindex, tc_priority)?.is_empty() {
+                return Ok(false);
+            }
+            Self::cleanup_only_hook_slots_empty(ifindex, tc_priority)
+        }
+
         /// Detach every retained live hook this graph owns, disabling
         /// forwarding. Each slot is re-verified immediately before deletion; a
         /// replacement observed at that point fails closed without mutation.
@@ -12717,11 +12818,11 @@ mod aya_runtime {
                 }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
                     // No retained pin namespace. Absence is proven only once
-                    // both hook slots are authoritatively empty; a live hook
-                    // with no retained pins is a foreign/orphaned occupant,
-                    // never absence, and nothing is manufactured to prove
-                    // either.
-                    return if Self::cleanup_only_hook_slots_empty(ifindex, tc_priority)? {
+                    // both reserved slots and the all-placement SDK hook
+                    // inventory are authoritatively empty. A live off-slot
+                    // hook with no retained pins is orphaned state, never
+                    // absence, and nothing is manufactured to prove either.
+                    return if Self::cleanup_only_absence_proven(ifindex, tc_priority)? {
                         Ok(EbpfCleanupOnlyAdoption::Absent)
                     } else {
                         Ok(EbpfCleanupOnlyAdoption::Refused(
@@ -12736,23 +12837,28 @@ mod aya_runtime {
             if canonical_pin_dir != reconciler_ownership.canonical_pin_dir {
                 return Err(state_indeterminate("ebpf_pin_dir_identity"));
             }
-            // Validate the configured local endpoint identity straight from the
-            // retained config pin before loading, fencing, or mutating. A pin
-            // that records a different endpoint belongs to another endpoint; a
-            // missing ownership record is structural damage, not a foreign
-            // endpoint, and is classified for repair rather than failover.
-            match Self::pinned_config_read(&canonical_pin_dir)? {
-                Some(recorded) if recorded == expected_local_ip => {}
-                Some(_) => {
-                    return Ok(EbpfCleanupOnlyAdoption::Refused(
-                        RetainedGraphCleanupRefusal::LocalEndpointMismatch,
-                    ));
+            // A complete metadata/schema pass precedes every typed endpoint
+            // read and every possible load/fence mutation. Cleanup acquisition
+            // accepts only this build's exact current graph and never upgrades
+            // an older or partial retained schema.
+            let recorded_local_ip = match Self::cleanup_only_pin_graph_preflight(&canonical_pin_dir)
+            {
+                Ok(CleanupOnlyPinGraph::Absent) => {
+                    return if Self::cleanup_only_absence_proven(ifindex, tc_priority)? {
+                        Ok(EbpfCleanupOnlyAdoption::Absent)
+                    } else {
+                        Ok(EbpfCleanupOnlyAdoption::Refused(
+                            RetainedGraphCleanupRefusal::IdentityMismatch,
+                        ))
+                    };
                 }
-                None => {
-                    return Ok(EbpfCleanupOnlyAdoption::Refused(
-                        RetainedGraphCleanupRefusal::IdentityMismatch,
-                    ));
-                }
+                Ok(CleanupOnlyPinGraph::Current { local_ip }) => local_ip,
+                Err(refusal) => return Ok(EbpfCleanupOnlyAdoption::Refused(refusal)),
+            };
+            if recorded_local_ip != expected_local_ip {
+                return Ok(EbpfCleanupOnlyAdoption::Refused(
+                    RetainedGraphCleanupRefusal::LocalEndpointMismatch,
+                ));
             }
             // Generation and ABI guards run before any load/fence mutation.
             let current_programs = match Self::require_no_foreign_generation(
@@ -12770,28 +12876,19 @@ mod aya_runtime {
                 }
                 Err(error) => return Err(error),
             };
-            if Self::require_current_program_pin_graph(&current_programs, &canonical_pin_dir)
-                .is_err()
-            {
-                return Ok(EbpfCleanupOnlyAdoption::Refused(
-                    RetainedGraphCleanupRefusal::IdentityMismatch,
-                ));
-            }
-            if Self::classify_pinned_map_layout(&canonical_pin_dir).is_err()
-                || Self::require_current_pin_capacity(&canonical_pin_dir).is_err()
-            {
-                return Ok(EbpfCleanupOnlyAdoption::Refused(
-                    RetainedGraphCleanupRefusal::NotCurrentSchema,
-                ));
-            }
-            let schema_state = match Self::bearer_schema_preflight(&canonical_pin_dir) {
-                Ok(state) => state,
-                Err(_) => {
+            match Self::require_current_program_pin_graph(&current_programs, &canonical_pin_dir) {
+                Ok(()) => {}
+                Err(GtpuError::AlreadyExists) => {
                     return Ok(EbpfCleanupOnlyAdoption::Refused(
-                        RetainedGraphCleanupRefusal::NotCurrentSchema,
+                        RetainedGraphCleanupRefusal::IdentityMismatch,
                     ));
                 }
-            };
+                Err(_) => {
+                    return Ok(EbpfCleanupOnlyAdoption::Refused(
+                        RetainedGraphCleanupRefusal::IndeterminateState,
+                    ));
+                }
+            }
             // ---- mutation boundary ----
             let mut ebpf = self.load_pinned(&canonical_pin_dir)?;
             let expected_pins = Self::held_map_identity(&ebpf)
@@ -12810,19 +12907,8 @@ mod aya_runtime {
                     Err(refusal) => return Ok(refusal),
                 };
             self.require_canonical_pmtu_slot(&ebpf)?;
-            let indexes = if matches!(
-                schema_state,
-                BearerSchemaState::SourcePortV4 | BearerSchemaState::PmtuV5
-            ) {
-                Self::recover_incomplete_pdp_commits(&mut ebpf, expected_local_ip, ifindex)?;
-                Self::pdp_host_indexes(&ebpf, expected_local_ip, ifindex, true)?
-            } else {
-                let pre_v4_indexes =
-                    Self::pdp_host_indexes(&ebpf, expected_local_ip, ifindex, false)?;
-                Self::materialize_legacy_source_port_policies(&mut ebpf, &pre_v4_indexes)?;
-                Self::recover_incomplete_pdp_commits(&mut ebpf, expected_local_ip, ifindex)?;
-                Self::pdp_host_indexes(&ebpf, expected_local_ip, ifindex, true)?
-            };
+            Self::recover_incomplete_pdp_commits(&mut ebpf, expected_local_ip, ifindex)?;
+            let indexes = Self::pdp_host_indexes(&ebpf, expected_local_ip, ifindex, true)?;
             // Load both programs so their kernel identity can be proven while
             // forwarding stays fenced. Activation later attaches these same
             // already-loaded programs without reloading them.
@@ -12877,6 +12963,9 @@ mod aya_runtime {
                 return Err(GtpuError::AlreadyExists);
             }
             let schema_state = Self::bearer_schema_preflight(&device.pin_dir)?;
+            if schema_state != BearerSchemaState::PmtuV5 {
+                return Err(state_indeterminate("ebpf_cleanup_schema"));
+            }
             let attached = self.attach_programs(
                 &mut device.ebpf,
                 interface,
@@ -12884,25 +12973,6 @@ mod aya_runtime {
                 &device.pin_dir,
                 tc_priority,
             )?;
-            if schema_state != BearerSchemaState::PmtuV5 {
-                if let Err(error) = Self::write_bearer_schema_marker(&mut device.ebpf) {
-                    if attached.replaced_existing {
-                        return Err(state_indeterminate("ebpf_schema_marker_commit"));
-                    }
-                    let rollback = detach_datapath_if_current(
-                        attached.links,
-                        &attached.identity,
-                        ifindex,
-                        tc_priority,
-                    );
-                    return Err(error_after_rollback(
-                        error,
-                        rollback,
-                        false,
-                        "ebpf_tc_attach_rollback",
-                    ));
-                }
-            }
             device.datapath_identity = attached.identity;
             device.links = Some(attached.links);
             device.cleanup_only = false;
@@ -17264,6 +17334,8 @@ mod tests {
         downlink_filter_pin_dir: HashMap<u32, PathBuf>,
         uplink_filter_foreign: HashSet<u32>,
         downlink_filter_foreign: HashSet<u32>,
+        // Current SDK forwarding hooks at a non-reserved tc placement.
+        off_slot_sdk_hooks: HashSet<u32>,
         legacy_v2_extra_hooks: HashSet<(u32, FakeLegacyV2Hook, FakeLegacyV2Program)>,
         pin_identity_invalid: HashSet<u32>,
         v2_schema_identity_invalid: HashSet<u32>,
@@ -18681,9 +18753,10 @@ mod tests {
                 || state.empty_pin_dirs.contains(pin_dir);
             if !retained {
                 // No retained graph. Absence is proven only when both hook
-                // slots are empty; otherwise a live hook is a mismatch.
+                // slots and the all-placement SDK inventory are empty.
                 let hooks_empty = !state.uplink_filter_ready.contains(&ifindex)
-                    && !state.downlink_filter_ready.contains(&ifindex);
+                    && !state.downlink_filter_ready.contains(&ifindex)
+                    && !state.off_slot_sdk_hooks.contains(&ifindex);
                 return Ok(if hooks_empty {
                     EbpfCleanupOnlyAdoption::Absent
                 } else {
@@ -18694,15 +18767,64 @@ mod tests {
                 // An empty pin namespace records no provisioning; treat it as
                 // absent once the hook slots are empty.
                 let hooks_empty = !state.uplink_filter_ready.contains(&ifindex)
-                    && !state.downlink_filter_ready.contains(&ifindex);
+                    && !state.downlink_filter_ready.contains(&ifindex)
+                    && !state.off_slot_sdk_hooks.contains(&ifindex);
                 return Ok(if hooks_empty {
                     EbpfCleanupOnlyAdoption::Absent
                 } else {
                     EbpfCleanupOnlyAdoption::Refused(RetainedGraphCleanupRefusal::IdentityMismatch)
                 });
             }
-            // Validate the configured local endpoint identity before mutation.
+            Self::fail_if_requested(&mut state, "adopt_cleanup_only_preflight")?;
+            if state.v2_teardown_proof.contains(pin_dir)
+                || state
+                    .current_graphs
+                    .get(pin_dir)
+                    .is_some_and(|graph| graph.proof_committed)
+            {
+                return Ok(EbpfCleanupOnlyAdoption::Refused(
+                    RetainedGraphCleanupRefusal::IndeterminateState,
+                ));
+            }
+            // Cleanup-only adoption accepts the exact current graph only. It
+            // must never manufacture additive maps or promote an older marker.
+            let current_schema_ready = state.schema.get(pin_dir) == Some(&FakeSchema::PmtuV5)
+                && state.dscp_map_ready.contains(&ifindex)
+                && state.marked_far_map_ready.contains(&ifindex)
+                && state.marked_dscp_map_ready.contains(&ifindex)
+                && state.sport_map_ready.contains(&ifindex)
+                && state.marked_sport_map_ready.contains(&ifindex)
+                && state.pmtu_map_ready.contains(&ifindex)
+                && state.pmtu_counters_map_ready.contains(&ifindex)
+                && state.marked_pdr_map_ready.contains(&ifindex)
+                && state.marked_owner_map_ready.contains(&ifindex)
+                && state.downlink_binding_map_ready.contains(&ifindex)
+                && state.downlink_binding_counters_map_ready.contains(&ifindex)
+                && state.pmtu_policy.get(&ifindex).is_some_and(|value| {
+                    ebpf_pmtu_map_state_is_executable(GtpuUplinkMtuPolicy::decode_map_value(value))
+                });
+            if !current_schema_ready {
+                return Ok(EbpfCleanupOnlyAdoption::Refused(
+                    RetainedGraphCleanupRefusal::NotCurrentSchema,
+                ));
+            }
+            if state.uplink_filter_foreign.contains(&ifindex)
+                || state.downlink_filter_foreign.contains(&ifindex)
+                || state.off_slot_sdk_hooks.contains(&ifindex)
+                || state.pin_identity_invalid.contains(&ifindex)
+            {
+                return Ok(EbpfCleanupOnlyAdoption::Refused(
+                    RetainedGraphCleanupRefusal::IdentityMismatch,
+                ));
+            }
+            // Validate the configured local endpoint identity only after the
+            // complete current schema is proven and before any mutation.
             match state.pinned_config.get(pin_dir) {
+                Some(recorded) if *recorded == [0; 4] => {
+                    return Ok(EbpfCleanupOnlyAdoption::Refused(
+                        RetainedGraphCleanupRefusal::NotCurrentSchema,
+                    ));
+                }
                 Some(recorded) if *recorded == expected_local_ip => {}
                 Some(_) => {
                     return Ok(EbpfCleanupOnlyAdoption::Refused(
@@ -18714,14 +18836,6 @@ mod tests {
                         RetainedGraphCleanupRefusal::IdentityMismatch,
                     ));
                 }
-            }
-            if state.uplink_filter_foreign.contains(&ifindex)
-                || state.downlink_filter_foreign.contains(&ifindex)
-                || state.pin_identity_invalid.contains(&ifindex)
-            {
-                return Ok(EbpfCleanupOnlyAdoption::Refused(
-                    RetainedGraphCleanupRefusal::IdentityMismatch,
-                ));
             }
             Self::fail_if_requested(&mut state, "adopt_cleanup_only_load")?;
             Self::crash_if_requested(&mut state, "adopt_cleanup_only_load");
@@ -18741,25 +18855,7 @@ mod tests {
                     tc_priority,
                 },
             );
-            state.dscp_map_ready.insert(ifindex);
-            state.marked_far_map_ready.insert(ifindex);
-            state.marked_dscp_map_ready.insert(ifindex);
-            state.sport_map_ready.insert(ifindex);
-            state.marked_sport_map_ready.insert(ifindex);
-            state.marked_pdr_map_ready.insert(ifindex);
-            state.marked_owner_map_ready.insert(ifindex);
-            state.downlink_binding_map_ready.insert(ifindex);
-            state.downlink_binding_counters_map_ready.insert(ifindex);
-            state.pmtu_map_ready.insert(ifindex);
-            state.pmtu_counters_map_ready.insert(ifindex);
             state.cleanup_only.insert(ifindex);
-            state
-                .pmtu_policy
-                .entry(ifindex)
-                .or_insert([0; UPLINK_PMTU_VALUE_LEN]);
-            state
-                .schema
-                .insert(pin_dir.to_path_buf(), FakeSchema::PmtuV5);
             Ok(EbpfCleanupOnlyAdoption::Adopted {
                 local_ip: expected_local_ip,
                 hooks_fenced,
@@ -26591,6 +26687,162 @@ mod tests {
             .pinned_config
             .contains_key(&backend.pin_dir("s2bu")));
         assert!(!runtime.state().attached.contains_key(&S2BU_IFINDEX));
+    }
+
+    #[tokio::test]
+    async fn cleanup_only_recovery_classifies_existing_empty_namespace_as_absent() {
+        let runtime = Arc::new(FakeRuntime::new());
+        let backend = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
+        let pin_dir = backend.pin_dir("s2bu");
+        runtime.state().empty_pin_dirs.insert(pin_dir.clone());
+
+        assert_eq!(
+            backend
+                .acquire_cleanup_only_recovery(cleanup_request(
+                    Ipv4Addr::new(192, 0, 2, 1),
+                    S2BU_IFINDEX,
+                ))
+                .await
+                .unwrap(),
+            RetainedGraphCleanupClassification::AlreadyAbsent
+        );
+        assert!(runtime.state().empty_pin_dirs.contains(&pin_dir));
+        assert!(!runtime.state().attached.contains_key(&S2BU_IFINDEX));
+    }
+
+    #[tokio::test]
+    async fn cleanup_only_recovery_refuses_absence_with_off_slot_sdk_hook() {
+        let runtime = Arc::new(FakeRuntime::new());
+        let backend = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
+        runtime.state().off_slot_sdk_hooks.insert(S2BU_IFINDEX);
+
+        let classification = backend
+            .acquire_cleanup_only_recovery(cleanup_request(
+                Ipv4Addr::new(192, 0, 2, 1),
+                S2BU_IFINDEX,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            classification,
+            RetainedGraphCleanupClassification::Refused(
+                RetainedGraphCleanupRefusal::IdentityMismatch
+            )
+        );
+        assert!(runtime.state().off_slot_sdk_hooks.contains(&S2BU_IFINDEX));
+        assert!(!runtime.state().attached.contains_key(&S2BU_IFINDEX));
+    }
+
+    #[tokio::test]
+    async fn cleanup_only_recovery_refuses_legacy_schema_without_migration() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let pin_dir = backend.pin_dir("s2bu");
+        simulate_process_loss(&runtime, false);
+        runtime
+            .state()
+            .schema
+            .insert(pin_dir.clone(), FakeSchema::SourcePortV4);
+
+        let recovered = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
+        let classification = recovered
+            .acquire_cleanup_only_recovery(cleanup_request(
+                Ipv4Addr::new(192, 0, 2, 1),
+                S2BU_IFINDEX,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            classification,
+            RetainedGraphCleanupClassification::Refused(
+                RetainedGraphCleanupRefusal::NotCurrentSchema
+            )
+        );
+        let state = runtime.state();
+        assert_eq!(state.schema.get(&pin_dir), Some(&FakeSchema::SourcePortV4));
+        assert!(state.uplink_filter_ready.contains(&S2BU_IFINDEX));
+        assert!(state.downlink_filter_ready.contains(&S2BU_IFINDEX));
+        assert!(!state.cleanup_only.contains(&S2BU_IFINDEX));
+    }
+
+    #[tokio::test]
+    async fn cleanup_only_recovery_refuses_partial_current_pin_set_without_repair() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        simulate_process_loss(&runtime, false);
+        runtime.state().pmtu_map_ready.remove(&S2BU_IFINDEX);
+
+        let recovered = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
+        let classification = recovered
+            .acquire_cleanup_only_recovery(cleanup_request(
+                Ipv4Addr::new(192, 0, 2, 1),
+                S2BU_IFINDEX,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            classification,
+            RetainedGraphCleanupClassification::Refused(
+                RetainedGraphCleanupRefusal::NotCurrentSchema
+            )
+        );
+        let state = runtime.state();
+        assert!(!state.pmtu_map_ready.contains(&S2BU_IFINDEX));
+        assert!(state.uplink_filter_ready.contains(&S2BU_IFINDEX));
+        assert!(!state.cleanup_only.contains(&S2BU_IFINDEX));
+    }
+
+    #[tokio::test]
+    async fn cleanup_only_recovery_classifies_zero_config_as_structural() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let pin_dir = backend.pin_dir("s2bu");
+        simulate_process_loss(&runtime, false);
+        runtime.state().pinned_config.insert(pin_dir, [0; 4]);
+
+        let recovered = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
+        let classification = recovered
+            .acquire_cleanup_only_recovery(cleanup_request(
+                Ipv4Addr::new(192, 0, 2, 1),
+                S2BU_IFINDEX,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            classification,
+            RetainedGraphCleanupClassification::Refused(
+                RetainedGraphCleanupRefusal::NotCurrentSchema
+            )
+        );
+        assert!(runtime.state().uplink_filter_ready.contains(&S2BU_IFINDEX));
+    }
+
+    #[tokio::test]
+    async fn cleanup_only_recovery_preserves_transient_preflight_taxonomy() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        simulate_process_loss(&runtime, false);
+        runtime.fail_in_order(["adopt_cleanup_only_preflight"]);
+
+        let recovered = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
+        let classification = recovered
+            .acquire_cleanup_only_recovery(cleanup_request(
+                Ipv4Addr::new(192, 0, 2, 1),
+                S2BU_IFINDEX,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            classification,
+            RetainedGraphCleanupClassification::Refused(
+                RetainedGraphCleanupRefusal::IndeterminateState
+            )
+        );
+        assert!(matches!(
+            classification,
+            RetainedGraphCleanupClassification::Refused(reason) if reason.is_retryable()
+        ));
+        assert!(runtime.state().uplink_filter_ready.contains(&S2BU_IFINDEX));
     }
 
     #[tokio::test]

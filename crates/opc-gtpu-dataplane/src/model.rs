@@ -452,12 +452,14 @@ impl fmt::Debug for RetainedGraphCleanupRequest {
     }
 }
 
-/// Stable reason cleanup-only recovery authority was refused before the
-/// retained graph was mutated.
+/// Stable reason cleanup-only recovery authority was refused.
 ///
 /// Variants deliberately separate ownership/configuration conflicts,
 /// retryable indeterminate evidence, and structural repairs so a consumer can
 /// choose between retrying, failing over, or escalating to maintenance.
+/// Identity, configuration, and schema refusals are established before graph
+/// mutation. `IndeterminateState` can instead follow a partially completed
+/// forwarding fence; callers must re-observe by retrying the exact request.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RetainedGraphCleanupRefusal {
@@ -515,7 +517,10 @@ pub enum RetainedGraphCleanupClassification {
     /// hooks are authoritatively empty. Nothing was manufactured to prove
     /// absence.
     AlreadyAbsent,
-    /// Authority was refused before the retained graph was mutated.
+    /// Cleanup authority was not granted. Identity, configuration, and schema
+    /// refusals leave the retained graph untouched. A retryable indeterminate
+    /// refusal can follow a partially completed hook fence, so the caller must
+    /// re-observe kernel state by retrying the exact request.
     Refused(RetainedGraphCleanupRefusal),
 }
 

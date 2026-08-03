@@ -15,15 +15,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reactivating the stale graph. Unlike ordinary device creation/resolution it
   never attaches or reattaches the forwarding hooks before cleanup is complete,
   and unlike orphaned-graph recovery it never deletes the graph. The expected
-  interface identity and the configured local endpoint identity are both
-  validated from the retained pins before any mutation, and a mismatch is
-  refused with the graph untouched. Acquisition returns an affine, supervised
+  interface name/ifindex identity is re-proved and the complete current pin
+  ABI/schema is validated before the retained CONFIG endpoint is read; identity,
+  configuration, and structural conflicts are refused before graph mutation.
+  Older or partial schemas are never migrated or repaired through this path.
+  Acquisition returns an affine, supervised
   completion handle whose blocking worker converges the graph state under the
   host-global namespace lease and operation lock even if the observing future is
   dropped, so a retry never overlaps the same graph. While authority is held the
   ordinary classified readback and `remove_pdp_context_exact` boundaries operate
-  against a cleanup-safe datapath posture (exact-or-absent hooks) while
-  forwarding stays disabled, and installation remains fenced.
+  only while both forwarding hooks are authoritatively absent. Their
+  capabilities are reported independently from classified installation;
+  installation, non-exact removal, and unrelated datapath mutations remain
+  denied throughout cleanup-only mode.
   `activate_cleanup_recovery` is the sole explicit step that reattaches the
   forwarding hooks and returns the device to normal management. Acquisition
   classifies a provably absent graph, ownership/configuration conflicts,

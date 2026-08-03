@@ -957,22 +957,28 @@ recovery:
   deletes the graph and requires the interface to still resolve to the expected
   ifindex.
 
-Before granting authority the backend validates, in order and before any
-mutation: the expected interface identity (the name must still resolve to the
-requested ifindex), and the configured local endpoint identity (the retained
-config pin must record exactly the caller's configured local S2b-U address). A
-mismatch is refused with the graph untouched. Acquisition then acquires the same
-host-global namespace lease and runs the same current-schema pin/ABI/schema
-validation as ordinary adoption, fences any retained live hook it owns (each
-slot re-verified immediately before deletion), and recovers interrupted commit
-records — all with forwarding disabled.
+Before granting authority the backend proves the expected name/ifindex pair,
+then performs a complete read-only inventory and ABI/capacity validation of all
+21 current map pins before binding CONFIG or any other typed map. Only the exact
+current PMTU-v5 graph is accepted: cleanup acquisition never creates a missing
+pin, migrates an older schema, or advances a schema marker. A canonical nonzero
+endpoint is then compared with the caller's configured local S2b-U address.
+Identity, configuration, and structural refusals happen before graph mutation.
+Acquisition holds the host-global namespace lease, fences any retained live
+hook it owns, and recovers interrupted current-schema commit records with
+forwarding disabled. If a later fencing step becomes indeterminate after an
+earlier hook was detached, no authority is granted and the exact request must be
+retried to re-observe and converge the fence.
 
 While authority is held, the ordinary
 `GtpuDataplaneBackend::read_pdp_context` and
 `GtpuDataplaneBackend::remove_pdp_context_exact` boundaries operate against a
-cleanup-safe datapath posture (every named pin still identifies the held map and
-each tc slot is exact-or-absent; removal only reduces reachability, so an absent
-hook is safe and a foreign one is not), while installation stays fenced.
+cleanup-safe datapath posture: every named pin still identifies the held map and
+both forwarding hooks are authoritatively absent. Classified installation,
+ordinary non-exact removal, and unrelated datapath mutation remain denied in
+cleanup-only mode even if a hook reappears out of band. Reconciliation
+capabilities therefore advertise exact readback and exact removal independently
+from classified installation, which remains unavailable while fenced.
 `activate_cleanup_recovery` is the sole explicit step that reattaches the
 forwarding hooks and returns the device to normal management.
 
