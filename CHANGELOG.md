@@ -739,6 +739,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     fixture, so no message that already round-tripped moves on the wire.
 
 ### Fixed
+- **Prevent shutdown log amplification — `opc-runtime` (#633):**
+  `ShutdownToken::request_shutdown` and `ShutdownToken::cancel` no longer emit
+  a tracing event on every invocation. They now return a closed, value-free
+  `ShutdownDisposition` (`Initiated` / `AlreadyRequested`) naming whether the
+  invocation won the token's single effective `Running` → `Draining`
+  transition, and stay silent otherwise. The supervisor owns the initiation
+  record: the first non-`Immediate` `Supervisor::shutdown_all` of a
+  supervisor emits exactly one aggregate `shutdown requested` event, decided
+  by a linearized supervisor-level gate rather than token dispositions — so
+  the record survives the runtime pre-initiating the global token or every
+  task token being requested upstream, and concurrent or repeat aggregate
+  drains announce nothing further, regardless of task count (previously one
+  global request event plus two request events per task).
+  `Supervisor::shutdown_task` records only when it initiates the task
+  shutdown. `DrainGuard::transition` likewise records only effective phase
+  advances. Watch publication also stays monotonic when concurrent phase
+  publishers complete out of order, so subscribers cannot regress to a stale
+  phase. Subscriber wakeups, drain ordering, and all drain timeouts are
+  preserved.
 - **NETCONF candidate commits now fail closed before mutation without lying
   after a known success — `opc-netconf-server`:** `<commit>` records a
   path-scoped `AuditOutcome::Intent` before config-bus submission, so an audit
