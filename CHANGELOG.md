@@ -8,6 +8,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Cleanup-only retained eBPF recovery authority — `opc-gtpu-dataplane`:**
+  `EbpfGtpuDataplaneBackend::acquire_cleanup_only_recovery` takes ownership of
+  the exact retained current-schema pin graph after process loss and fences the
+  forwarding tc hooks, so stale PDP contexts can be reconciled without
+  reactivating the stale graph. Unlike ordinary device creation/resolution it
+  never attaches or reattaches the forwarding hooks before cleanup is complete,
+  and unlike orphaned-graph recovery it never deletes the graph. The expected
+  interface identity and the configured local endpoint identity are both
+  validated from the retained pins before any mutation, and a mismatch is
+  refused with the graph untouched. Acquisition returns an affine, supervised
+  completion handle whose blocking worker converges the graph state under the
+  host-global namespace lease and operation lock even if the observing future is
+  dropped, so a retry never overlaps the same graph. While authority is held the
+  ordinary classified readback and `remove_pdp_context_exact` boundaries operate
+  against a cleanup-safe datapath posture (exact-or-absent hooks) while
+  forwarding stays disabled, and installation remains fenced.
+  `activate_cleanup_recovery` is the sole explicit step that reattaches the
+  forwarding hooks and returns the device to normal management. Acquisition
+  classifies a provably absent graph, ownership/configuration conflicts,
+  retryable indeterminate evidence, and structural repairs distinctly, and the
+  request, handle, and all diagnostics remain redaction-safe.
 - **Deferred namespace-bound fixed-DSCP activation — `opc-ipsec-xfrm`:**
   `LinuxXfrmBackend::with_deferred_dscp_marking` and its custom-config variant
   validate and retain marking configuration without loading, pinning,

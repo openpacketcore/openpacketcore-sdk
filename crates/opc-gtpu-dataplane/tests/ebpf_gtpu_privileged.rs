@@ -79,7 +79,8 @@ use opc_gtpu_dataplane::{
     GtpuUplinkSourcePortPolicy, GtpuV2DrainProof, PdpContextIndeterminateReason,
     PdpContextInstallOutcome, PdpContextLocalTeidSelector, PdpContextReadback,
     PdpContextRemovalOutcome, PdpContextSelector, PdpContextSelectorOccupancy,
-    PdpContextUplinkSelector, RemovePdpContextRequest, Teid,
+    PdpContextUplinkSelector, RemovePdpContextRequest, RetainedGraphCleanupClassification,
+    RetainedGraphCleanupRefusal, RetainedGraphCleanupRequest, Teid,
 };
 use opc_gtpu_ebpf_common::{
     internet_checksum, ipv4_header_checksum, udp_ipv4_checksum, udp_ipv6_checksum,
@@ -6966,6 +6967,137 @@ async fn current_graph_recovery_fences_live_owner_and_recovers_after_interface_l
             .recover_orphaned_current_ebpf_graph(request())
             .await?,
         CurrentEbpfGraphRecoveryOutcome::AlreadyAbsent
+    );
+
+    drop(net);
+    Ok(())
+}
+
+/// Cleanup-only recovery takes ownership of the exact retained graph, fences
+/// the live forwarding hooks so the stale graph stops forwarding, lets the
+/// consumer read back and remove the stale PDP context while forwarding stays
+/// disabled, and only reattaches forwarding on the explicit activation step.
+///
+/// This models process loss: the owner backend is dropped (its kernel-owned tc
+/// links and bpffs pins survive), and a fresh backend instance must reconcile
+/// the durable GTP-U state without reactivating the stale graph.
+#[tokio::test]
+// The serial guard is deliberately held for the entire test body; see
+// PRIVILEGED_TEST_LOCK.
+#[allow(clippy::await_holding_lock)]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn cleanup_only_recovery_fences_forwarding_and_removes_stale_contexts(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref() != Ok("1") {
+        eprintln!("skipping: set OPC_GTPU_RUN_PRIVILEGED=1 inside a fresh privileged netns");
+        return Ok(());
+    }
+
+    let _serial = PRIVILEGED_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let net = TestNet::provision();
+    let config = EbpfGtpuDataplaneBackendConfig {
+        bpffs_pin_root: net.pin_root.clone(),
+        ..EbpfGtpuDataplaneBackendConfig::default()
+    };
+
+    // Provision a live graph with a stale PDP context through the normal path.
+    let owner = EbpfGtpuDataplaneBackend::with_config(config.clone());
+    let mut create = CreateGtpDeviceRequest::new("s2bu");
+    create.bind_address = IpAddr::V4(EPDG_S2BU_IP);
+    let device = owner.create_device(create).await?;
+    let stale = session_context(device.ifindex);
+    assert_eq!(
+        owner.install_pdp_context_classified(stale.clone()).await?,
+        PdpContextInstallOutcome::Installed
+    );
+    let pin_dir = net.pin_root.join("s2bu");
+
+    // Process loss: the owner drops; its kernel-owned hooks and pins survive.
+    drop(owner);
+    let recovered = EbpfGtpuDataplaneBackend::with_config(config.clone());
+
+    // A wrong local endpoint identity is refused before mutating the graph.
+    let wrong_endpoint = RetainedGraphCleanupRequest::new(
+        device.clone(),
+        Ipv4Addr::new(198, 51, 100, 9),
+        CurrentEbpfGraphWriterProof::previous_writer_stopped(),
+    );
+    assert_eq!(
+        recovered
+            .acquire_cleanup_only_recovery(wrong_endpoint)
+            .await?,
+        RetainedGraphCleanupClassification::Refused(
+            RetainedGraphCleanupRefusal::LocalEndpointMismatch
+        ),
+        "a local-endpoint mismatch must fail before mutation"
+    );
+    assert!(
+        pin_dir.is_dir(),
+        "a refused acquisition must preserve every pin"
+    );
+
+    // Acquire cleanup-only authority with the exact retained identity. This
+    // fences the retained live hooks, so the stale graph stops forwarding.
+    let request = RetainedGraphCleanupRequest::new(
+        device.clone(),
+        EPDG_S2BU_IP,
+        CurrentEbpfGraphWriterProof::previous_writer_stopped(),
+    );
+    assert_eq!(
+        recovered.acquire_cleanup_only_recovery(request).await?,
+        RetainedGraphCleanupClassification::Acquired
+    );
+    // Idempotent re-acquisition observes the converged state.
+    let request = RetainedGraphCleanupRequest::new(
+        device.clone(),
+        EPDG_S2BU_IP,
+        CurrentEbpfGraphWriterProof::previous_writer_stopped(),
+    );
+    assert_eq!(
+        recovered.acquire_cleanup_only_recovery(request).await?,
+        RetainedGraphCleanupClassification::Acquired
+    );
+
+    // Installation stays fenced while forwarding is disabled. This can only
+    // hold if the retained hooks were really detached: the install gate
+    // requires live exact hooks, so a still-live hook would let the install
+    // through. It therefore proves fencing on the real kernel, not merely the
+    // cleanup-safe readback posture.
+    assert_eq!(
+        recovered
+            .install_pdp_context_classified(stale.clone())
+            .await?,
+        PdpContextInstallOutcome::Indeterminate(
+            PdpContextIndeterminateReason::AuthorityUnavailable
+        )
+    );
+
+    // While forwarding stays disabled, the stale context reads back exactly and
+    // is removed by the exact-removal boundary.
+    let selector = PdpContextSelector::LocalTeid(
+        PdpContextLocalTeidSelector::from_context(&stale).expect("local TEID selector"),
+    );
+    assert_eq!(
+        recovered.read_pdp_context(selector.clone()).await?,
+        PdpContextReadback::Present(stale.clone())
+    );
+    assert_eq!(
+        recovered.remove_pdp_context_exact(stale.clone()).await?,
+        PdpContextRemovalOutcome::Removed
+    );
+    assert_eq!(
+        recovered.read_pdp_context(selector).await?,
+        PdpContextReadback::Absent
+    );
+
+    // Explicit activation is the sole step that reattaches forwarding; after it
+    // the normal classified-install path works again.
+    recovered.activate_cleanup_recovery(&device).await?;
+    assert_eq!(
+        recovered.install_pdp_context_classified(stale).await?,
+        PdpContextInstallOutcome::Installed
     );
 
     drop(net);
