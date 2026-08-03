@@ -8,6 +8,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Exact Linux PDP restart recovery authority — `opc-gtpu-dataplane`:**
+  `with_pdp_recovery_root` now returns `Result` and binds one validated absolute,
+  non-rebindable authority root shared by all backend clones. Every cooperating
+  create/remove, ordinary install/remove, classified-install, and restart-
+  recovery writer uses the same topology-then-device `flock` hierarchy where a
+  live device exists; creation holds the stronger topology lease through
+  publication. Callers
+  mint a cryptographically unpredictable, non-reusable `PdpDeviceIncarnation`,
+  durably persist it before the create effect, and provision through
+  `create_recoverable_device`, which proves the requested name absent and
+  reconciles ambiguous create acknowledgements before publishing a verified
+  link; recovery then proves the durable name and ifindex
+  plus the live kernel `IFLA_IFALIAS` incarnation under both locks before a
+  stable dual-axis `GETPDP` can authorize unconditional `DELPDP`. Unknown or
+  flagged `GETPDP` attributes fail closed. Removal outcomes distinguish
+  `Removed`, idempotent `AlreadyAbsent`, untouched `Conflict`, retryable
+  `Indeterminate`, and structural `RepairRequired`; a detached blocking worker
+  retains authority to completion, so retries are fenced and re-read converged
+  state. Linux's trait `remove_pdp_context_exact(GtpPdpContext)` remains
+  `UnsupportedFeature` with `exact_removal: Missing` because it carries no
+  incarnation; callers use the authority-bearing `recover_pdp_context_exact`
+  trait API (also exposed on the concrete Linux backend) and query its separate
+  `pdp_restart_recovery_capability`. All
+  cooperating processes must share the trusted, stable root and ancestors;
+  uncoordinated privileged writers or principals controlling that namespace
+  are outside the supported safety model. Request and outcome diagnostics
+  redact TEID, address, and device-identity values.
 - **Cleanup-only retained eBPF recovery authority — `opc-gtpu-dataplane`:**
   `EbpfGtpuDataplaneBackend::acquire_cleanup_only_recovery` takes ownership of
   the exact retained current-schema pin graph after process loss and fences the

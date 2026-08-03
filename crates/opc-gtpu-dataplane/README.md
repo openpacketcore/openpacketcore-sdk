@@ -209,22 +209,123 @@ same authority and confirms both selector axes absent afterward.
 
 The Linux `gtp` adapter uses response-required generic-netlink `GETPDP` queries
 for both axes and requires two identical bounded observations. It validates the
-outer generic-family message type, the kernel's historical family-ID-in-command
-reply quirk (or a future canonical `GETPDP` command), every known attribute,
-MS/PAA-family consistency, selector correlation, and the complete returned
-identity. `GTPA_FAMILY` describes only the inner MS/PAA lookup key; the outer
-peer family follows the GTP device's UDP socket and may differ. Current kernels
-may omit `GTPA_FAMILY`; one unambiguous MS/PAA attribute still determines its
-family independently of the required peer attribute. Linux currently stores an
-IPv6 MS/PAA as a canonical `/64` prefix. A kernel that cannot perform the
-requested family lookup fails closed rather than reporting absence. Mainline
-Linux exposes unconditional `DELPDP` but no compare-delete primitive or
-cross-process writer lease, so `remove_pdp_context_exact` is intentionally
-unsupported there.
+kernel origin of every ACK and readback datagram, the outer generic-family
+message type, the kernel's historical family-ID-in-command reply quirk (or a
+future canonical `GETPDP` command), every known attribute, MS/PAA-family
+consistency, selector correlation, and the complete returned identity.
+`GTPA_FAMILY` describes only the inner MS/PAA lookup key; the outer peer family
+follows the GTP device's UDP socket and may differ. Current kernels may omit
+`GTPA_FAMILY`; one unambiguous MS/PAA attribute still determines its family
+independently of the required peer attribute. Linux currently stores an IPv6
+MS/PAA as a canonical `/64` prefix. A kernel that cannot perform the requested
+family lookup fails closed rather than reporting absence. Mainline Linux
+exposes unconditional `DELPDP` but no compare-delete primitive, so exact removal
+is built on a cross-process recovery authority instead; see the next section.
 
-Readback/classified-install/exact-removal capabilities are reported separately
-through `pdp_context_reconciliation_capabilities`; they are not inferred from
-packet-processing fields in `GtpuProbe`. The mock implements the full stateful
+### Linux PDP restart recovery authority
+
+`LinuxGtpuDataplaneBackend::recover_pdp_context_exact` is the supported
+durable-reconciliation primitive for the process-loss case: the kernel-GTP PDP
+context and the GTP device that owns it both survive the writer, and an
+ePDG-style consumer must prove either exact removal or exact absence of a
+durable descriptor before protocol egress. Mainline Linux has no atomic
+compare-delete, so the SDK supplies the missing cross-process writer authority
+and the authoritative readback that together make exact removal safe.
+
+Bind the authority before exposing the backend or creating a recoverable
+device:
+
+```rust
+let backend = LinuxGtpuDataplaneBackend::new()
+    .with_pdp_recovery_root("/var/lib/my-service/gtp-recovery")?;
+```
+
+`with_pdp_recovery_root` returns `Result`, validates an absolute non-root path,
+and records one non-rebindable root in state shared by every existing and future
+backend clone. Repeating the same binding is allowed; attempting to bind a
+different root fails. Every cooperating process that can write the same GTP
+devices must bind the same root. Once it is bound, device creation/removal,
+ordinary PDP installation/removal, classified installation, and restart
+recovery all acquire cross-process `flock` authority. Topology mutations take
+the topology lease; operations against a live device then take its per-device
+lease in that fixed order. This fences replacement as well as PDP mutation
+rather than protecting only the final recovery transaction.
+
+The root, every ancestor, and the filesystem providing `flock` are trusted,
+stable security infrastructure. Do not use a path whose components can be
+renamed, replaced, or pre-created by an untrusted principal, such as an
+unhardened world-writable `/tmp`. A privileged writer that mutates GTP state
+without these locks, or a principal that controls the root or its ancestors, is
+outside the supported coordination model; the SDK makes no safety or liveness
+claim in their presence.
+
+For each new kernel device incarnation, generate a cryptographically
+unpredictable, nonzero `PdpDeviceIncarnation` and durably persist it with the
+device's recovery descriptors before performing the create effect. Never reuse
+an incarnation. Create the device through
+`create_recoverable_device(request, incarnation)`, which stamps and verifies the
+incarnation in the kernel link's `IFLA_IFALIAS` while holding topology
+authority. It first proves the requested name absent, and reconciles an
+ambiguous create acknowledgement before publishing the verified link. Process
+loss before the method returns can leave an unstamped link; exact recovery
+classifies that as structural repair and never treats it as owned PDP state.
+Ordinary `create_device` does not establish the identity needed for later exact
+restart recovery.
+
+Build `PdpRestartRecoveryRequest` from the durably recorded device name and
+ifindex, incarnation, complete expected PDP context, and
+`PdpRestartRecoveryProof::previous_writer_stopped()`. Under the topology and
+per-device locks, `recover_pdp_context_exact` proves that the name still
+resolves to the expected ifindex and that the live kernel `IFLA_IFALIAS`
+contains the expected incarnation. A replaced, renamed, unstamped, or removed
+device returns `RepairRequired(DeviceIdentityChanged)` without touching its PDP
+state. A concurrent lock owner returns retryable
+`Indeterminate(AuthorityUnavailable)`.
+
+After proving the device incarnation, recovery takes stable `GETPDP` readbacks
+on both selector axes before admitting the unconditional `DELPDP`. Unknown
+attributes and any flagged attribute type in a `GETPDP` reply fail closed as
+structurally unrepresentable state; they are never ignored to authorize a
+delete. Recovery then classifies:
+
+- `Removed` — the resident context matched the complete expected identity, an
+  admitted `DELPDP` ran, and the post-mutation readback proves both axes absent.
+- `AlreadyAbsent` — both selector axes were already authoritatively absent; no
+  mutation occurred. Re-running after a confirmed removal is idempotent.
+- `Conflict(_)` — valid resident state occupies a selector but differs from the
+  expected identity; it is never touched. Diagnostics carry only occupied axes
+  and differing field names, never values.
+- `Indeterminate(_)` — state changed during observation, evidence was incomplete,
+  or the final mutation could not be confirmed; retry the exact request.
+- `RepairRequired(_)` — a structural precondition (for example a stale device
+  identity) failed closed; retrying the identical request cannot succeed without
+  repair.
+
+The kernel API still cannot compare-and-delete, so the admission boundary is the
+authoritative dual-axis readback immediately before `DELPDP`, held under the
+two-level authority. Dropping the returned future does not cancel its detached
+blocking worker: the worker retains both locks until the transaction finishes.
+A concurrent retry is therefore fenced (and may report authority unavailable),
+and a later retry re-reads the converged state, making confirmed removal
+idempotent as `AlreadyAbsent`. Process exit releases `flock`, allowing the next
+retry to reclassify state safely.
+
+The trait method
+`GtpuDataplaneBackend::remove_pdp_context_exact(GtpPdpContext)` remains
+`UnsupportedFeature` on Linux, and its `exact_removal` capability remains
+`Missing`, even when a recovery root is bound. Its request has no durable device
+incarnation and therefore cannot authorize restart cleanup. Linux callers must
+use the authority-bearing
+`GtpuDataplaneBackend::recover_pdp_context_exact(PdpRestartRecoveryRequest)`
+method, which is also exposed on the concrete Linux backend; without a bound
+root, that method is also unsupported. `Debug` output for the request and every
+outcome redacts TEIDs, addresses, and device identity.
+
+Readback/classified-install/generationless-exact-removal capabilities are
+reported through `pdp_context_reconciliation_capabilities`; authority-bearing
+Linux restart recovery is reported separately through
+`pdp_restart_recovery_capability`. They are not inferred from packet-processing
+fields in `GtpuProbe`. The mock implements the full stateful
 contract for default and marked contexts, exposes `MockPdpContextFault` for
 corrupt, transitional, and changing-readback tests, and records the additive
 calls separately through `pdp_context_reconciliation_operations`. The original

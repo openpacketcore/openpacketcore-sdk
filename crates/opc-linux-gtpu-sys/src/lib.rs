@@ -702,6 +702,8 @@ pub const IFF_UP: u32 = 0x1;
 
 /// Link attribute: interface name.
 pub const IFLA_IFNAME: u16 = 3;
+/// Link attribute: interface alias.
+pub const IFLA_IFALIAS: u16 = 20;
 /// Link attribute: link information nest.
 pub const IFLA_LINKINFO: u16 = 18;
 /// Link-info attribute: device kind string.
@@ -901,6 +903,7 @@ mod tests {
         assert_eq!(AF_INET, 2);
         assert_eq!(AF_INET6, 10);
         assert_eq!(IFLA_IFNAME, 3);
+        assert_eq!(IFLA_IFALIAS, 20);
         assert_eq!(IFLA_LINKINFO, 18);
         assert_eq!(IFLA_INFO_KIND, 1);
         assert_eq!(IFLA_INFO_DATA, 2);

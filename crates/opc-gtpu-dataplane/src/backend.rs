@@ -6,11 +6,12 @@ use std::io;
 use crate::model::{
     CreateGtpDeviceEndpointSetRequest, CreateGtpDeviceRequest, CurrentEbpfGraphRecoveryOutcome,
     CurrentEbpfGraphRecoveryRequest, DrainedV2TeardownOutcome, DrainedV2TeardownRequest, GtpDevice,
-    GtpPdpContext, GtpuIpFamilyCapabilities, GtpuProbe, GtpuSessionAttachmentSelector,
-    GtpuSessionGroup, GtpuSessionGroupReadback, GtpuSessionGroupReconcileOutcome,
-    GtpuSessionGroupReconcileRequest, GtpuSessionGroupRemovalOutcome, GtpuSessionGroupSelector,
-    PdpContextInstallOutcome, PdpContextReadback, PdpContextReconciliationCapabilities,
-    PdpContextRemovalOutcome, PdpContextSelector, RemovePdpContextRequest,
+    GtpPdpContext, GtpuCapability, GtpuIpFamilyCapabilities, GtpuProbe,
+    GtpuSessionAttachmentSelector, GtpuSessionGroup, GtpuSessionGroupReadback,
+    GtpuSessionGroupReconcileOutcome, GtpuSessionGroupReconcileRequest,
+    GtpuSessionGroupRemovalOutcome, GtpuSessionGroupSelector, PdpContextInstallOutcome,
+    PdpContextReadback, PdpContextReconciliationCapabilities, PdpContextRemovalOutcome,
+    PdpContextSelector, PdpRestartRecoveryRequest, RemovePdpContextRequest,
 };
 use crate::GtpuError;
 
@@ -140,6 +141,22 @@ pub trait GtpuDataplaneBackend: Send + Sync + std::fmt::Debug {
         })
     }
 
+    /// Reconcile one durable PDP descriptor after its previous writer stops.
+    ///
+    /// Unlike [`Self::remove_pdp_context_exact`], this request carries the
+    /// expected device identity, a non-reusable device incarnation, and the
+    /// prior-writer stop attestation required to acquire restart authority.
+    /// Implementations that cannot prove those values against authoritative
+    /// live state under an exclusive writer boundary remain unsupported.
+    async fn recover_pdp_context_exact(
+        &self,
+        _request: PdpRestartRecoveryRequest,
+    ) -> Result<PdpContextRemovalOutcome, GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "pdp_restart_recovery_authority",
+        })
+    }
+
     /// Read one complete grouped session by stable group and device identity.
     ///
     /// Implementations revalidate the full selector/index graph, group
@@ -211,6 +228,12 @@ pub trait GtpuDataplaneBackend: Send + Sync + std::fmt::Debug {
     /// [`GtpuProbe`].
     fn pdp_context_reconciliation_capabilities(&self) -> PdpContextReconciliationCapabilities {
         PdpContextReconciliationCapabilities::unsupported()
+    }
+
+    /// Report support for the authority-bearing durable restart-recovery
+    /// request independently of generationless exact removal.
+    fn pdp_restart_recovery_capability(&self) -> GtpuCapability {
+        GtpuCapability::Missing
     }
 
     /// Inspect independently qualified grouped address-family capabilities for
@@ -303,6 +326,10 @@ mod tests {
         assert_eq!(
             backend.pdp_context_reconciliation_capabilities(),
             PdpContextReconciliationCapabilities::unsupported()
+        );
+        assert_eq!(
+            backend.pdp_restart_recovery_capability(),
+            GtpuCapability::Missing
         );
         let group_id = crate::GtpuSessionGroupId::new([1; 16]).unwrap();
         let device_id = crate::GtpuSessionDeviceId::new([2; 16]).unwrap();
