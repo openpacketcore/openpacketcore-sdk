@@ -100,9 +100,9 @@ use opc_gtpu_ebpf_common::{
     MAP_UPLINK_MARK_SOURCE_PORT, MAP_UPLINK_PMTU, MAP_UPLINK_PMTU_COUNTERS, MAP_UPLINK_SOURCE_PORT,
     MARKED_BEARER_OWNER_VALUE_LEN, MARKED_DOWNLINK_PDR_VALUE_LEN, PROG_DOWNLINK, PROG_UPLINK,
     UDP_HDR_LEN, UPLINK_BEARER_SCHEMA_MARKER_VALUE, UPLINK_DSCP_SCHEMA_MARKER_KEY,
-    UPLINK_DSCP_SCHEMA_MARKER_VALUE, UPLINK_DSCP_VALUE_LEN, UPLINK_FAR_VALUE_LEN,
-    UPLINK_MARK_KEY_LEN, UPLINK_PMTU_SCHEMA_MARKER_VALUE, UPLINK_PMTU_VALUE_LEN,
-    UPLINK_SOURCE_PORT_VALUE_LEN,
+    UPLINK_DSCP_SCHEMA_MARKER_VALUE, UPLINK_DSCP_VALUE_LEN, UPLINK_ENDPOINT_SCHEMA_MARKER_VALUE,
+    UPLINK_FAR_VALUE_LEN, UPLINK_MARK_KEY_LEN, UPLINK_PMTU_SCHEMA_MARKER_VALUE,
+    UPLINK_PMTU_VALUE_LEN, UPLINK_SOURCE_PORT_VALUE_LEN,
 };
 use opc_ipsec_xfrm::{
     Algorithm, AuthAlgorithm, InstallPolicyRequest, InstallSaRequest, IpAddress, KeyMaterial,
@@ -3210,6 +3210,25 @@ fn install_off_slot_pre_redirect_generation_with_current_capacity(
     uplink_id
 }
 
+/// Leave one current SDK uplink program outside the managed tc slot without
+/// publishing any map pins. This is the exact orphan shape for which an empty
+/// desired slot is insufficient evidence that the datapath is absent.
+fn install_off_slot_current_uplink_without_pins() -> u32 {
+    ensure_clsact("s2bu");
+    let mut ebpf = EbpfLoader::new()
+        .load(CURRENT_DATAPATH_OBJECT)
+        .expect("load current object without pinning maps");
+    let uplink_id = attach_frozen_program_at(
+        &mut ebpf,
+        PROG_UPLINK,
+        TcAttachType::Egress,
+        51,
+        OFF_SLOT_TC_HANDLE,
+    );
+    drop(ebpf);
+    uplink_id
+}
+
 /// Make the clsact qdisc present so a fixture standing in for a prior loader
 /// can attach where the SDK would.
 ///
@@ -3389,6 +3408,28 @@ fn pinned_schema_marker(pin_dir: &std::path::Path) -> [u8; UPLINK_FAR_VALUE_LEN]
         .expect("typed pinned FAR");
     far.get(&UPLINK_DSCP_SCHEMA_MARKER_KEY, 0)
         .expect("read pinned schema marker")
+}
+
+fn replace_pinned_schema_marker(pin_dir: &std::path::Path, marker: [u8; UPLINK_FAR_VALUE_LEN]) {
+    let map = Map::from_map_data(
+        MapData::from_pin(pin_dir.join(MAP_UPLINK_FAR)).expect("open pinned FAR"),
+    )
+    .expect("identify pinned FAR map");
+    let mut far = BpfHashMap::<_, [u8; 4], [u8; UPLINK_FAR_VALUE_LEN]>::try_from(map)
+        .expect("typed pinned FAR");
+    far.insert(UPLINK_DSCP_SCHEMA_MARKER_KEY, marker, 0)
+        .expect("replace pinned schema marker");
+}
+
+fn pinned_default_commit(pin_dir: &std::path::Path) -> Option<[u8; UPLINK_SOURCE_PORT_VALUE_LEN]> {
+    let map = Map::from_map_data(
+        MapData::from_pin(pin_dir.join(MAP_UPLINK_SOURCE_PORT))
+            .expect("open pinned source-port map"),
+    )
+    .expect("identify pinned source-port map");
+    let commits = BpfHashMap::<_, [u8; 4], [u8; UPLINK_SOURCE_PORT_VALUE_LEN]>::try_from(map)
+        .expect("typed pinned source-port map");
+    commits.get(&UE_PAA.octets(), 0).ok()
 }
 
 fn pinned_counter(pin_dir: &std::path::Path, index: u32) -> u64 {
@@ -6973,6 +7014,234 @@ async fn current_graph_recovery_fences_live_owner_and_recovers_after_interface_l
     Ok(())
 }
 
+/// An SDK-named current program at a noncanonical tc preference is live
+/// forwarding state even when no retained pin namespace exists. Cleanup-only
+/// acquisition must inspect the complete hook inventory before reporting
+/// absence, and the refusal must not detach or replace the orphan.
+#[tokio::test]
+// The serial guard is deliberately held for the entire test body; see
+// PRIVILEGED_TEST_LOCK.
+#[allow(clippy::await_holding_lock)]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn cleanup_only_absence_rejects_off_slot_current_hook_without_pins(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref() != Ok("1") {
+        eprintln!("skipping: set OPC_GTPU_RUN_PRIVILEGED=1 inside a fresh privileged netns");
+        return Ok(());
+    }
+
+    let _serial = PRIVILEGED_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let net = TestNet::provision();
+    let current_uplink_id = install_off_slot_current_uplink_without_pins();
+    let egress_before = tc_filters("egress");
+    let ingress_before = tc_filters("ingress");
+    assert!(
+        egress_before.contains("pref 51")
+            && egress_before.contains("handle 0x2")
+            && egress_before.contains(PROG_UPLINK)
+            && egress_before.contains(&format!("id {current_uplink_id}")),
+        "the current SDK uplink must occupy only the alternate slot: {egress_before}"
+    );
+    assert!(
+        !egress_before.contains("pref 50") && !ingress_before.contains(PROG_DOWNLINK),
+        "both configured SDK slots must start empty"
+    );
+
+    let device = GtpDevice {
+        name: "s2bu".to_string(),
+        ifindex: nix::net::if_::if_nametoindex("s2bu")?,
+    };
+    for (case_name, pin_root, create_empty_namespace) in [
+        ("absent", net.pin_root.join("cleanup-absent"), false),
+        ("empty", net.pin_root.join("cleanup-empty"), true),
+    ] {
+        fs::create_dir_all(&pin_root).expect("create cleanup-only case root");
+        let pin_dir = pin_root.join("s2bu");
+        if create_empty_namespace {
+            fs::create_dir(&pin_dir).expect("create empty cleanup-only pin namespace");
+        } else {
+            assert!(
+                !pin_dir.exists(),
+                "absent case must start without a namespace"
+            );
+        }
+
+        let backend = EbpfGtpuDataplaneBackend::with_config(EbpfGtpuDataplaneBackendConfig {
+            bpffs_pin_root: pin_root,
+            ..EbpfGtpuDataplaneBackendConfig::default()
+        });
+        let request = RetainedGraphCleanupRequest::new(
+            device.clone(),
+            EPDG_S2BU_IP,
+            CurrentEbpfGraphWriterProof::previous_writer_stopped(),
+        );
+        assert_eq!(
+            backend.acquire_cleanup_only_recovery(request).await?,
+            RetainedGraphCleanupClassification::Refused(
+                RetainedGraphCleanupRefusal::IdentityMismatch
+            ),
+            "{case_name} pins plus an off-slot SDK hook are not absence"
+        );
+        drop(backend);
+
+        assert_eq!(
+            tc_filters("egress"),
+            egress_before,
+            "{case_name} refusal must preserve the off-slot uplink"
+        );
+        assert_eq!(
+            tc_filters("ingress"),
+            ingress_before,
+            "{case_name} refusal must publish no downlink"
+        );
+        if create_empty_namespace {
+            assert!(pin_dir.is_dir(), "empty namespace must survive refusal");
+            assert!(
+                pin_directory_listing(&pin_dir).is_empty(),
+                "empty namespace must remain empty"
+            );
+        } else {
+            assert!(
+                !pin_dir.exists(),
+                "absence classification must not manufacture a pin namespace"
+            );
+        }
+    }
+
+    run(
+        "tc",
+        &[
+            "filter", "del", "dev", "s2bu", "egress", "handle", "0x2", "pref", "51", "bpf",
+        ],
+    );
+    println!("OPC_GTPU_CLEANUP_OFF_SLOT_ABSENCE_GUARD_PROVEN");
+    drop(net);
+    Ok(())
+}
+
+/// Cleanup-only recovery is a current-schema operation, not a migration path.
+/// A complete retained endpoint-v3 graph must be refused before its source-port
+/// commit is materialized or either live hook is fenced.
+#[tokio::test]
+// The serial guard is deliberately held for the entire test body; see
+// PRIVILEGED_TEST_LOCK.
+#[allow(clippy::await_holding_lock)]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn cleanup_only_recovery_refuses_older_schema_before_mutation(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref() != Ok("1") {
+        eprintln!("skipping: set OPC_GTPU_RUN_PRIVILEGED=1 inside a fresh privileged netns");
+        return Ok(());
+    }
+
+    let _serial = PRIVILEGED_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let net = TestNet::provision();
+    let config = EbpfGtpuDataplaneBackendConfig {
+        bpffs_pin_root: net.pin_root.clone(),
+        ..EbpfGtpuDataplaneBackendConfig::default()
+    };
+    let owner = EbpfGtpuDataplaneBackend::with_config(config.clone());
+    let mut create = CreateGtpDeviceRequest::new("s2bu");
+    create.bind_address = IpAddr::V4(EPDG_S2BU_IP);
+    let device = owner.create_device(create).await?;
+    let stale = session_context(device.ifindex);
+    assert_eq!(
+        owner.install_pdp_context_classified(stale).await?,
+        PdpContextInstallOutcome::Installed
+    );
+    let pin_dir = net.pin_root.join("s2bu");
+    drop(owner);
+
+    // Model the last valid schema before additive source-port commits. The
+    // current object supplies a complete, current-ABI pin graph, while the
+    // marker and absent commit carry the older durable contract.
+    let removed_commit = take_pinned_source_port(&pin_dir);
+    assert!(
+        PdpContextCommit::decode(&removed_commit).is_valid(),
+        "the removed current commit must be canonical"
+    );
+    replace_pinned_schema_marker(&pin_dir, UPLINK_ENDPOINT_SCHEMA_MARKER_VALUE);
+    assert_eq!(pinned_default_commit(&pin_dir), None);
+
+    let pins_before = pin_directory_listing(&pin_dir);
+    let map_ids_before = pins_before
+        .iter()
+        .map(|name| {
+            (
+                name.clone(),
+                MapInfo::from_pin(pin_dir.join(name))
+                    .unwrap_or_else(|error| panic!("open retained {name}: {error}"))
+                    .id(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let config_before = pinned_config(&pin_dir);
+    let egress_before = tc_filters("egress");
+    let ingress_before = tc_filters("ingress");
+    let uplink_maps_before = attached_program_map_ids("egress");
+    let downlink_maps_before = attached_program_map_ids("ingress");
+    assert!(
+        egress_before.contains(PROG_UPLINK) && ingress_before.contains("opc_gtpu_downli"),
+        "the retained older graph must start with both forwarding hooks live"
+    );
+
+    let recovered = EbpfGtpuDataplaneBackend::with_config(config);
+    let request = RetainedGraphCleanupRequest::new(
+        device,
+        EPDG_S2BU_IP,
+        CurrentEbpfGraphWriterProof::previous_writer_stopped(),
+    );
+    assert_eq!(
+        recovered.acquire_cleanup_only_recovery(request).await?,
+        RetainedGraphCleanupClassification::Refused(RetainedGraphCleanupRefusal::NotCurrentSchema)
+    );
+    drop(recovered);
+
+    assert_eq!(
+        pin_directory_listing(&pin_dir),
+        pins_before,
+        "schema refusal must add or remove no pin"
+    );
+    assert_eq!(
+        pins_before
+            .iter()
+            .map(|name| {
+                (
+                    name.clone(),
+                    MapInfo::from_pin(pin_dir.join(name))
+                        .unwrap_or_else(|error| panic!("reopen retained {name}: {error}"))
+                        .id(),
+                )
+            })
+            .collect::<Vec<_>>(),
+        map_ids_before,
+        "schema refusal must replace no map"
+    );
+    assert_eq!(pinned_config(&pin_dir), config_before);
+    assert_eq!(
+        pinned_schema_marker(&pin_dir),
+        UPLINK_ENDPOINT_SCHEMA_MARKER_VALUE,
+        "schema refusal must not advance the durable marker"
+    );
+    assert_eq!(
+        pinned_default_commit(&pin_dir),
+        None,
+        "schema refusal must not materialize a source-port commit"
+    );
+    assert_eq!(tc_filters("egress"), egress_before);
+    assert_eq!(tc_filters("ingress"), ingress_before);
+    assert_eq!(attached_program_map_ids("egress"), uplink_maps_before);
+    assert_eq!(attached_program_map_ids("ingress"), downlink_maps_before);
+
+    println!("OPC_GTPU_CLEANUP_CURRENT_SCHEMA_GUARD_PROVEN");
+    drop(net);
+    Ok(())
+}
+
 /// Cleanup-only recovery takes ownership of the exact retained graph, fences
 /// the live forwarding hooks so the stale graph stops forwarding, lets the
 /// consumer read back and remove the stale PDP context while forwarding stays
@@ -7049,6 +7318,13 @@ async fn cleanup_only_recovery_fences_forwarding_and_removes_stale_contexts(
         recovered.acquire_cleanup_only_recovery(request).await?,
         RetainedGraphCleanupClassification::Acquired
     );
+    for direction in ["egress", "ingress"] {
+        let filters = tc_filters(direction);
+        assert!(
+            !filters.contains("opc_gtpu"),
+            "cleanup-only acquisition must remove the SDK forwarding hook from {direction}: {filters}"
+        );
+    }
     // Idempotent re-acquisition observes the converged state.
     let request = RetainedGraphCleanupRequest::new(
         device.clone(),
@@ -7060,11 +7336,9 @@ async fn cleanup_only_recovery_fences_forwarding_and_removes_stale_contexts(
         RetainedGraphCleanupClassification::Acquired
     );
 
-    // Installation stays fenced while forwarding is disabled. This can only
-    // hold if the retained hooks were really detached: the install gate
-    // requires live exact hooks, so a still-live hook would let the install
-    // through. It therefore proves fencing on the real kernel, not merely the
-    // cleanup-safe readback posture.
+    // Installation stays fenced while forwarding is disabled. The tc
+    // inventory above proves the kernel hook state directly; this assertion
+    // independently proves the cleanup-only authorization boundary.
     assert_eq!(
         recovered
             .install_pdp_context_classified(stale.clone())
