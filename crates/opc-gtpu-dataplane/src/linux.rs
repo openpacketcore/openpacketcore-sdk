@@ -4,23 +4,23 @@ use std::collections::HashMap;
 use std::fmt;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use opc_linux_gtpu_sys::{
     align_to_netlink, ifindex_by_name as linux_ifindex_by_name, open_generic_netlink_socket,
-    open_gtpu_udp_socket, open_route_netlink_socket, receive_message, send_message, GtpuIpAddress,
-    GtpuUdpBind, GtpuUdpSocket, AF_INET, AF_INET6, CTRL_ATTR_FAMILY_ID, CTRL_ATTR_FAMILY_NAME,
-    CTRL_CMD_GETFAMILY, CTRL_VERSION, GENL_ID_CTRL, GTPA_FAMILY, GTPA_I_TEI, GTPA_LINK,
-    GTPA_MS_ADDR6, GTPA_MS_ADDRESS, GTPA_O_TEI, GTPA_PEER_ADDR6, GTPA_PEER_ADDRESS, GTPA_VERSION,
-    GTP_CMD_DELPDP, GTP_CMD_GETPDP, GTP_CMD_NEWPDP, GTP_GENL_NAME, GTP_GENL_VERSION, GTP_ROLE_GGSN,
-    GTP_ROLE_SGSN, GTP_V1, IFF_UP, IFLA_GTP_FD1, IFLA_GTP_LOCAL, IFLA_GTP_LOCAL6,
-    IFLA_GTP_PDP_HASHSIZE, IFLA_GTP_ROLE, IFLA_IFNAME, IFLA_INFO_DATA, IFLA_INFO_KIND,
-    IFLA_LINKINFO, NLMSG_DONE, NLMSG_ERROR, NLMSG_NOOP, NLM_F_ACK, NLM_F_CREATE, NLM_F_EXCL,
-    NLM_F_REQUEST, RTM_DELLINK, RTM_NEWLINK,
+    open_gtpu_udp_socket, open_route_netlink_socket, receive_kernel_message, send_message,
+    GtpuIpAddress, GtpuUdpBind, GtpuUdpSocket, AF_INET, AF_INET6, AF_UNSPEC, CTRL_ATTR_FAMILY_ID,
+    CTRL_ATTR_FAMILY_NAME, CTRL_CMD_GETFAMILY, CTRL_VERSION, GENL_ID_CTRL, GTPA_FAMILY, GTPA_I_TEI,
+    GTPA_LINK, GTPA_MS_ADDR6, GTPA_MS_ADDRESS, GTPA_O_TEI, GTPA_PEER_ADDR6, GTPA_PEER_ADDRESS,
+    GTPA_VERSION, GTP_CMD_DELPDP, GTP_CMD_GETPDP, GTP_CMD_NEWPDP, GTP_GENL_NAME, GTP_GENL_VERSION,
+    GTP_ROLE_GGSN, GTP_ROLE_SGSN, GTP_V1, IFF_UP, IFLA_GTP_FD1, IFLA_GTP_LOCAL, IFLA_GTP_LOCAL6,
+    IFLA_GTP_PDP_HASHSIZE, IFLA_GTP_ROLE, IFLA_IFALIAS, IFLA_IFNAME, IFLA_INFO_DATA,
+    IFLA_INFO_KIND, IFLA_LINKINFO, NLMSG_DONE, NLMSG_ERROR, NLMSG_NOOP, NLM_F_ACK, NLM_F_CREATE,
+    NLM_F_EXCL, NLM_F_REQUEST, RTM_DELLINK, RTM_GETLINK, RTM_NEWLINK,
 };
 
 use crate::backend::error_proves_no_requested_mutation;
@@ -31,7 +31,7 @@ use crate::{
     GtpuProbe, PdpContextIndeterminateReason, PdpContextInstallOutcome,
     PdpContextLocalTeidSelector, PdpContextReadback, PdpContextReconciliationCapabilities,
     PdpContextRemovalOutcome, PdpContextRepairReason, PdpContextSelector, PdpContextUplinkSelector,
-    PdpRestartRecoveryRequest, RemovePdpContextRequest, Teid, GTPU_PORT,
+    PdpDeviceIncarnation, PdpRestartRecoveryRequest, RemovePdpContextRequest, Teid, GTPU_PORT,
 };
 
 const NETLINK_HEADER_LEN: usize = 16;
@@ -42,6 +42,8 @@ const IFNAMSIZ: usize = 16;
 const CAP_NET_ADMIN: u32 = 12;
 const ENOENT: i32 = 2;
 const ESRCH: i32 = 3;
+const PDP_TOPOLOGY_LEASE_NAME: &str = "pdp-recovery-topology.lock";
+const PDP_DEVICE_ALIAS_PREFIX: &str = "opc-pdp-recovery-v1:";
 
 /// Runtime behavior for the safe Linux GTP-U backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,7 +88,7 @@ struct LinuxGtpuDataplaneBackendInner {
     ///
     /// `None` until [`LinuxGtpuDataplaneBackend::with_pdp_recovery_root`]
     /// binds one; exact restart recovery stays unsupported until it is set.
-    pdp_recovery_root: Option<PathBuf>,
+    pdp_recovery_root: OnceLock<PathBuf>,
 }
 
 impl fmt::Debug for LinuxGtpuDataplaneBackend {
@@ -120,7 +122,7 @@ impl LinuxGtpuDataplaneBackend {
                 pdp_operation_lock: Mutex::new(()),
                 device_sockets: Mutex::new(HashMap::new()),
                 config,
-                pdp_recovery_root: None,
+                pdp_recovery_root: OnceLock::new(),
             }),
         }
     }
@@ -128,42 +130,75 @@ impl LinuxGtpuDataplaneBackend {
     /// Bind the durable directory that anchors cross-process PDP
     /// restart-recovery leases.
     ///
-    /// Exact restart recovery (`remove_pdp_context_exact` and
-    /// [`Self::recover_pdp_context_exact`]) is unsupported until a recovery
-    /// root is bound. The root must be a durable directory shared by every
-    /// process that may reconcile the same GTP device; the backend creates a
-    /// per-device lease file beneath it.
+    /// [`Self::recover_pdp_context_exact`] is unsupported until a recovery
+    /// root is bound. The generationless trait method
+    /// [`GtpuDataplaneBackend::remove_pdp_context_exact`] remains unsupported
+    /// even after binding. The root must be a durable directory shared by
+    /// every process that may mutate the same GTP devices; the backend creates
+    /// permanent topology and per-device lease files beneath it.
     ///
-    /// Bind exactly once at construction, before cloning the backend. This
-    /// builder consumes `self` and returns a backend with a fresh in-process
-    /// operation lock and device-socket registry (the transport and
-    /// configuration are carried over). Continuing to use a pre-rebind clone
-    /// against the same device therefore bypasses the in-process serialization
-    /// of the rebound handle; the cross-process lease still guards exact
-    /// removal, but ordinary install/remove/read on the two handles are no
-    /// longer serialized together.
+    /// The path must be absolute and free of parent-directory components so
+    /// every process resolves one authority namespace. Bind it before any
+    /// operation on any cooperating backend instance. Binding is
+    /// shared by every existing and future clone of this backend and cannot be
+    /// changed to a different root. Every cooperating SDK, operator, and
+    /// maintenance writer of the bound GTP devices must bind the same root;
+    /// uncoordinated privileged mutation is outside the supported model.
     ///
-    /// The root is trusted security surface: it must not be writable or
-    /// pre-creatable by an untrusted principal. A hostile process that can
-    /// create or replace files beneath it can deny recovery (by holding the
-    /// lease or planting a symlink/directory at a lease path, which fails
-    /// closed) but can never force deletion of non-matching state, because
-    /// every removal still requires the authoritative dual-axis readback to
-    /// match the expected identity. Avoid a world-writable location such as an
-    /// unhardened shared `/tmp`.
-    #[must_use]
-    pub fn with_pdp_recovery_root(self, root: impl Into<PathBuf>) -> Self {
-        let prior = &*self.inner;
-        Self {
-            inner: Arc::new(LinuxGtpuDataplaneBackendInner {
-                transport: Arc::clone(&prior.transport),
-                next_sequence: AtomicU32::new(prior.next_sequence.load(Ordering::Relaxed)),
-                pdp_operation_lock: Mutex::new(()),
-                device_sockets: Mutex::new(HashMap::new()),
-                config: prior.config,
-                pdp_recovery_root: Some(root.into()),
-            }),
+    /// The root and its ancestors are trusted security surface: they must have
+    /// stable identity and must not be writable or pre-creatable by an
+    /// untrusted principal. The supported safety model does not include an
+    /// actor that can replace authority files/directories or mutate links and
+    /// PDP contexts outside this shared writer boundary. Avoid a world-writable
+    /// location such as an unhardened shared `/tmp`.
+    pub fn with_pdp_recovery_root(self, root: impl Into<PathBuf>) -> Result<Self, GtpuError> {
+        let root = root.into();
+        validate_pdp_recovery_root(&root)?;
+        // Serialize the authority transition with every operation on all
+        // existing clones. Once this returns, a clone cannot still be running
+        // an operation admitted before the shared root became visible.
+        {
+            let _operation = self.pdp_operation_guard()?;
+            if let Some(bound) = self.inner.pdp_recovery_root.get() {
+                if bound != &root {
+                    return Err(GtpuError::invalid_config(
+                        "pdp_recovery.root",
+                        "recovery root is already bound to a different path",
+                    ));
+                }
+            } else if self.inner.pdp_recovery_root.set(root).is_err() {
+                return Err(GtpuError::invalid_config(
+                    "pdp_recovery.root",
+                    "recovery root binding failed",
+                ));
+            }
         }
+        Ok(self)
+    }
+
+    /// Create a Linux GTP device whose durable restart identity is bound to
+    /// kernel-observable link metadata.
+    ///
+    /// The caller must generate and durably commit `incarnation` before this
+    /// effect, then persist it beside every
+    /// [`PdpRestartRecoveryRequest`] for the device. The recovery root must
+    /// already be bound. Creation holds the shared topology authority and
+    /// first proves the requested name absent. It stamps and verifies the
+    /// incarnation in `IFLA_IFALIAS` before publishing the device; an
+    /// ambiguous create acknowledgement is reconciled under that same
+    /// authority. Exact restart recovery later proves the alias together with
+    /// the device name and ifindex. Process loss before this method returns
+    /// can leave an unpublished, unstamped link, which recovery reports as
+    /// structural repair rather than treating it as owned PDP state.
+    pub async fn create_recoverable_device(
+        &self,
+        request: CreateGtpDeviceRequest,
+        incarnation: PdpDeviceIncarnation,
+    ) -> Result<GtpDevice, GtpuError> {
+        self.run_blocking("create_recoverable_device", move |backend| {
+            backend.create_device_with_incarnation_sync(request, Some(incarnation))
+        })
+        .await
     }
 
     #[cfg(test)]
@@ -182,7 +217,7 @@ impl LinuxGtpuDataplaneBackend {
                     receive_buffer_len: 4096,
                     retry_delay: Duration::ZERO,
                 },
-                pdp_recovery_root: None,
+                pdp_recovery_root: OnceLock::new(),
             }),
         }
     }
@@ -201,6 +236,33 @@ impl LinuxGtpuDataplaneBackend {
             .pdp_operation_lock
             .lock()
             .map_err(|_| GtpuError::io("pdp_context_reconciliation", poisoned_lock()))
+    }
+
+    fn bound_pdp_recovery_root(&self) -> Option<&Path> {
+        self.inner.pdp_recovery_root.get().map(PathBuf::as_path)
+    }
+
+    fn acquire_optional_pdp_topology_writer_lease(
+        &self,
+    ) -> Result<Option<PdpRecoveryLease>, GtpuError> {
+        let Some(root) = self.bound_pdp_recovery_root() else {
+            return Ok(None);
+        };
+        acquire_pdp_topology_lease(root)
+            .map(Some)
+            .map_err(map_pdp_writer_lease_error)
+    }
+
+    fn acquire_optional_pdp_device_writer_lease(
+        &self,
+        ifindex: u32,
+    ) -> Result<Option<PdpRecoveryLease>, GtpuError> {
+        let Some(root) = self.bound_pdp_recovery_root() else {
+            return Ok(None);
+        };
+        acquire_pdp_recovery_lease(root, ifindex)
+            .map(Some)
+            .map_err(map_pdp_writer_lease_error)
     }
 
     fn route_transact(
@@ -279,25 +341,129 @@ impl LinuxGtpuDataplaneBackend {
     }
 
     fn create_device_sync(&self, request: CreateGtpDeviceRequest) -> Result<GtpDevice, GtpuError> {
+        self.create_device_with_incarnation_sync(request, None)
+    }
+
+    fn create_device_with_incarnation_sync(
+        &self,
+        request: CreateGtpDeviceRequest,
+        incarnation: Option<PdpDeviceIncarnation>,
+    ) -> Result<GtpDevice, GtpuError> {
         validate_create_device_request(&request)?;
+        let _operation = self.pdp_operation_guard()?;
+        if incarnation.is_some() && self.bound_pdp_recovery_root().is_none() {
+            return Err(GtpuError::UnsupportedFeature {
+                feature: "pdp_restart_recovery_authority",
+            });
+        }
+        let _topology_lease = self.acquire_optional_pdp_topology_writer_lease()?;
+        if incarnation.is_some() {
+            // Establish absence while the shared topology authority is held.
+            // That makes a link which appears after an ambiguous create ACK
+            // attributable to this request within the supported cooperating-
+            // writer model, so it is safe to finish stamping and verifying it.
+            match self.inner.transport.ifindex_by_name(&request.name) {
+                Err(GtpuError::NotFound) => {}
+                Ok(_) => return Err(GtpuError::AlreadyExists),
+                Err(error) => return Err(error),
+            }
+        }
         let socket = self.inner.transport.open_gtpu_socket(
             request.bind_address,
             request.bind_port,
             "gtpu_udp_bind",
         )?;
         let body = encode_create_device_request(&request, socket.raw_fd())?;
-        let _ = self.route_transact(
+        let create_result = self.route_transact(
             "create_device",
             RTM_NEWLINK,
             NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
             body,
-        )?;
-        let ifindex = self.ifindex_by_name_after_create(&request.name)?;
-        self.retain_device_socket(ifindex, socket)?;
-        Ok(GtpDevice {
+        );
+        let create_was_ambiguous = match create_result {
+            Ok(_) => false,
+            Err(error) if incarnation.is_none() || error_proves_no_requested_mutation(&error) => {
+                return Err(error);
+            }
+            Err(_) => true,
+        };
+        let ifindex = match self.ifindex_by_name_after_create(&request.name) {
+            Ok(ifindex) => ifindex,
+            Err(_error) if create_was_ambiguous => {
+                return Err(GtpuError::StateIndeterminate {
+                    operation: "recoverable_device_provision",
+                });
+            }
+            Err(error) => return Err(error),
+        };
+        let device = GtpDevice {
             name: request.name,
             ifindex,
-        })
+        };
+        // Creation retains the stronger topology authority through identity
+        // publication. Every supported device/PDP writer acquires topology
+        // before a per-device lease, so no cooperating writer can observe or
+        // mutate this new link until its incarnation has been verified.
+        if let Some(incarnation) = incarnation {
+            let stamp_result = self.stamp_and_verify_pdp_device_incarnation(&device, incarnation);
+            if let Err(stamp_error) = stamp_result {
+                let cleanup = self.remove_unpublished_device_sync(&device);
+                return match cleanup {
+                    Ok(()) => Err(stamp_error),
+                    Err(_) => Err(GtpuError::StateIndeterminate {
+                        operation: "recoverable_device_provision",
+                    }),
+                };
+            }
+        }
+        if let Err(retain_error) = self.retain_device_socket(ifindex, socket) {
+            if incarnation.is_some() && self.remove_unpublished_device_sync(&device).is_err() {
+                return Err(GtpuError::StateIndeterminate {
+                    operation: "recoverable_device_provision",
+                });
+            }
+            return Err(retain_error);
+        }
+        Ok(device)
+    }
+
+    fn stamp_and_verify_pdp_device_incarnation(
+        &self,
+        device: &GtpDevice,
+        incarnation: PdpDeviceIncarnation,
+    ) -> Result<(), GtpuError> {
+        let body = encode_set_device_alias_request(device, incarnation)?;
+        let stamp_error = match self.route_transact(
+            "pdp_device_identity_stamp",
+            RTM_NEWLINK,
+            NLM_F_REQUEST | NLM_F_ACK,
+            body,
+        ) {
+            Ok(_) => None,
+            Err(error) if error_proves_no_requested_mutation(&error) => return Err(error),
+            Err(error) => Some(error),
+        };
+        let expected = encode_pdp_device_alias(incarnation);
+        match self.inner.transport.device_alias(device, self.inner.config) {
+            Ok(Some(alias)) if alias == expected.as_bytes() => Ok(()),
+            Ok(_) => Err(stamp_error.unwrap_or(GtpuError::StateIndeterminate {
+                operation: "recoverable_device_identity_stamp",
+            })),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn remove_unpublished_device_sync(&self, device: &GtpDevice) -> Result<(), GtpuError> {
+        let body = encode_remove_device_request(device)?;
+        match self.route_transact(
+            "recoverable_device_provision_rollback",
+            RTM_DELLINK,
+            NLM_F_REQUEST | NLM_F_ACK,
+            body,
+        ) {
+            Ok(_) | Err(GtpuError::NotFound) => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     fn resolve_device_sync(&self, name: String) -> Result<GtpDevice, GtpuError> {
@@ -309,6 +475,18 @@ impl LinuxGtpuDataplaneBackend {
 
     fn remove_device_sync(&self, device: GtpDevice) -> Result<(), GtpuError> {
         validate_device(&device)?;
+        let _operation = self.pdp_operation_guard()?;
+        let _topology_lease = self.acquire_optional_pdp_topology_writer_lease()?;
+        let _device_lease = self.acquire_optional_pdp_device_writer_lease(device.ifindex)?;
+        match self.inner.transport.ifindex_by_name(&device.name) {
+            Ok(ifindex) if ifindex == device.ifindex => {}
+            Ok(_) | Err(GtpuError::NotFound) => {
+                return Err(GtpuError::StateIndeterminate {
+                    operation: "remove_device_identity_changed",
+                });
+            }
+            Err(error) => return Err(error),
+        }
         let body = encode_remove_device_request(&device)?;
         let _ = self.route_transact(
             "remove_device",
@@ -365,6 +543,8 @@ impl LinuxGtpuDataplaneBackend {
     fn install_pdp_context_sync(&self, request: GtpPdpContext) -> Result<(), GtpuError> {
         let _operation = self.pdp_operation_guard()?;
         validate_pdp_context(&request)?;
+        let _topology_lease = self.acquire_optional_pdp_topology_writer_lease()?;
+        let _device_lease = self.acquire_optional_pdp_device_writer_lease(request.link_ifindex)?;
         let family_id = self
             .resolve_gtp_family_id()
             .map_err(map_family_lookup_error)?;
@@ -389,6 +569,8 @@ impl LinuxGtpuDataplaneBackend {
     fn remove_pdp_context_sync(&self, request: RemovePdpContextRequest) -> Result<(), GtpuError> {
         let _operation = self.pdp_operation_guard()?;
         validate_remove_pdp_context_request(&request)?;
+        let _topology_lease = self.acquire_optional_pdp_topology_writer_lease()?;
+        let _device_lease = self.acquire_optional_pdp_device_writer_lease(request.link_ifindex)?;
         let family_id = self
             .resolve_gtp_family_id()
             .map_err(map_family_lookup_error)?;
@@ -485,6 +667,20 @@ impl LinuxGtpuDataplaneBackend {
     ) -> Result<PdpContextInstallOutcome, GtpuError> {
         validate_pdp_context(&request)?;
         let _operation = self.pdp_operation_guard()?;
+        let acquire_writer_authority = || {
+            let topology = self.acquire_optional_pdp_topology_writer_lease()?;
+            let device = self.acquire_optional_pdp_device_writer_lease(request.link_ifindex)?;
+            Ok::<_, GtpuError>((topology, device))
+        };
+        let (_topology_lease, _device_lease) = match acquire_writer_authority() {
+            Ok(authority) => authority,
+            Err(GtpuError::RetryRequired { .. }) => {
+                return Ok(PdpContextInstallOutcome::Indeterminate(
+                    PdpContextIndeterminateReason::AuthorityUnavailable,
+                ));
+            }
+            Err(error) => return Err(error),
+        };
         let family_id = self
             .resolve_gtp_family_id()
             .map_err(map_family_lookup_error)?;
@@ -560,40 +756,15 @@ impl LinuxGtpuDataplaneBackend {
 }
 
 impl LinuxGtpuDataplaneBackend {
-    /// Exact PDP-context removal backed by cross-process restart-recovery
-    /// authority.
-    ///
-    /// Requires a recovery root bound via [`Self::with_pdp_recovery_root`];
-    /// without one this stays [`GtpuError::UnsupportedFeature`]. Under the
-    /// per-device lease it stably reads both selector axes, classifies, and
-    /// only issues `DELPDP` when the resident context matches the expected
-    /// complete identity, then re-reads both axes so the outcome reflects the
-    /// authoritative post-mutation state.
-    ///
-    /// Dropping the returned future does not cancel the blocking worker: the
-    /// transaction runs to completion under the lease, so a retry never
-    /// overlaps an admitted delete and instead re-reads the converged kernel
-    /// state.
+    /// The trait request lacks durable device-incarnation identity and cannot
+    /// safely authorize Linux restart cleanup.
     fn remove_pdp_context_exact_recovery_sync(
         &self,
-        expected: GtpPdpContext,
+        _expected: GtpPdpContext,
     ) -> Result<PdpContextRemovalOutcome, GtpuError> {
-        validate_pdp_context(&expected)?;
-        let _operation = self.pdp_operation_guard()?;
-        let root = self.pdp_recovery_root_or_unsupported()?;
-        let family_id = self
-            .resolve_gtp_family_id()
-            .map_err(map_family_lookup_error)?;
-        let _lease = match acquire_pdp_recovery_lease(&root, expected.link_ifindex) {
-            Ok(lease) => lease,
-            Err(GtpuError::AlreadyExists) => {
-                return Ok(PdpContextRemovalOutcome::Indeterminate(
-                    PdpContextIndeterminateReason::AuthorityUnavailable,
-                ));
-            }
-            Err(error) => return Err(error),
-        };
-        self.remove_pdp_context_exact_locked(family_id, &expected)
+        Err(GtpuError::UnsupportedFeature {
+            feature: "pdp_context_exact_removal",
+        })
     }
 
     /// Acquire exact restart-recovery authority over one durable PDP context
@@ -603,10 +774,11 @@ impl LinuxGtpuDataplaneBackend {
     /// uses after process loss: the kernel-GTP PDP context and its GTP device
     /// survive the writer, and the consumer must prove either exact removal or
     /// exact absence of the descriptor before protocol egress. Before any
-    /// mutation the expected device identity is proven (the device name must
-    /// still resolve to the expected ifindex) and a cross-process lease for
-    /// the device is acquired, so a concurrent reconciler cannot overlap the
-    /// transaction and a replaced device fails closed without touching state.
+    /// mutation it acquires the shared topology then per-device authorities
+    /// and proves the expected device name, ifindex, and kernel-bound
+    /// incarnation. A concurrent cooperating writer cannot overlap the
+    /// transaction, and a completed device replacement fails closed without
+    /// touching resident state.
     ///
     /// Like [`GtpuDataplaneBackend::remove_pdp_context_exact`], the blocking
     /// worker runs to completion even if the returned future is dropped.
@@ -636,12 +808,42 @@ impl LinuxGtpuDataplaneBackend {
         }
         let _operation = self.pdp_operation_guard()?;
         let root = self.pdp_recovery_root_or_unsupported()?;
-        // Prove the expected device identity before any mutation. A name that
-        // no longer resolves to the expected ifindex means the device was
-        // replaced, renamed, or removed; the durable descriptor is stale and
-        // must be reprovisioned, never used to delete foreign state.
+        let _topology_lease = match acquire_pdp_topology_lease(&root) {
+            Ok(lease) => lease,
+            Err(GtpuError::AlreadyExists) => {
+                return Ok(PdpContextRemovalOutcome::Indeterminate(
+                    PdpContextIndeterminateReason::AuthorityUnavailable,
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+        let _device_lease = match acquire_pdp_recovery_lease(&root, device.ifindex) {
+            Ok(lease) => lease,
+            Err(GtpuError::AlreadyExists) => {
+                return Ok(PdpContextRemovalOutcome::Indeterminate(
+                    PdpContextIndeterminateReason::AuthorityUnavailable,
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+        // Prove the complete device incarnation only after both authorities
+        // are held. Name and ifindex alone are reusable after link deletion.
         match self.inner.transport.ifindex_by_name(&device.name) {
             Ok(ifindex) if ifindex == device.ifindex => {}
+            Ok(_) | Err(GtpuError::NotFound) => {
+                return Ok(PdpContextRemovalOutcome::RepairRequired(
+                    PdpContextRepairReason::DeviceIdentityChanged,
+                ));
+            }
+            Err(error) => return Err(error),
+        }
+        let expected_alias = encode_pdp_device_alias(request.incarnation());
+        match self
+            .inner
+            .transport
+            .device_alias(&device, self.inner.config)
+        {
+            Ok(Some(alias)) if alias == expected_alias.as_bytes() => {}
             Ok(_) | Err(GtpuError::NotFound) => {
                 return Ok(PdpContextRemovalOutcome::RepairRequired(
                     PdpContextRepairReason::DeviceIdentityChanged,
@@ -652,24 +854,16 @@ impl LinuxGtpuDataplaneBackend {
         let family_id = self
             .resolve_gtp_family_id()
             .map_err(map_family_lookup_error)?;
-        let _lease = match acquire_pdp_recovery_lease(&root, device.ifindex) {
-            Ok(lease) => lease,
-            Err(GtpuError::AlreadyExists) => {
-                return Ok(PdpContextRemovalOutcome::Indeterminate(
-                    PdpContextIndeterminateReason::AuthorityUnavailable,
-                ));
-            }
-            Err(error) => return Err(error),
-        };
         self.remove_pdp_context_exact_locked(family_id, &expected)
     }
 
     fn pdp_recovery_root_or_unsupported(&self) -> Result<PathBuf, GtpuError> {
         self.inner
             .pdp_recovery_root
-            .clone()
+            .get()
+            .cloned()
             .ok_or(GtpuError::UnsupportedFeature {
-                feature: "pdp_context_exact_removal",
+                feature: "pdp_restart_recovery_authority",
             })
     }
 
@@ -769,10 +963,23 @@ impl Drop for PdpRecoveryLease {
 
 #[cfg(target_os = "linux")]
 fn acquire_pdp_recovery_lease(root: &Path, ifindex: u32) -> Result<PdpRecoveryLease, GtpuError> {
+    acquire_pdp_recovery_named_lease(root, &format!("pdp-recovery-{ifindex}.lock"))
+}
+
+#[cfg(target_os = "linux")]
+fn acquire_pdp_topology_lease(root: &Path) -> Result<PdpRecoveryLease, GtpuError> {
+    acquire_pdp_recovery_named_lease(root, PDP_TOPOLOGY_LEASE_NAME)
+}
+
+#[cfg(target_os = "linux")]
+fn acquire_pdp_recovery_named_lease(
+    root: &Path,
+    lease_name: &str,
+) -> Result<PdpRecoveryLease, GtpuError> {
     use std::os::unix::fs::MetadataExt;
     std::fs::create_dir_all(root)
         .map_err(|error| GtpuError::io("pdp_recovery_root_create", error))?;
-    let lock_path = root.join(format!("pdp-recovery-{ifindex}.lock"));
+    let lock_path = root.join(lease_name);
     let file = rustix::fs::open(
         &lock_path,
         rustix::fs::OFlags::RDONLY
@@ -817,6 +1024,11 @@ fn acquire_pdp_recovery_lease(_root: &Path, _ifindex: u32) -> Result<PdpRecovery
     // against, so the lease is vacuously held. Actual mutation still requires
     // the Linux-only netlink transport, which fails closed on this platform,
     // so a vacuous lease admits no real removal here.
+    Ok(PdpRecoveryLease { _lock: None })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn acquire_pdp_topology_lease(_root: &Path) -> Result<PdpRecoveryLease, GtpuError> {
     Ok(PdpRecoveryLease { _lock: None })
 }
 
@@ -889,6 +1101,13 @@ impl GtpuDataplaneBackend for LinuxGtpuDataplaneBackend {
         .await
     }
 
+    async fn recover_pdp_context_exact(
+        &self,
+        request: PdpRestartRecoveryRequest,
+    ) -> Result<PdpContextRemovalOutcome, GtpuError> {
+        LinuxGtpuDataplaneBackend::recover_pdp_context_exact(self, request).await
+    }
+
     fn pdp_context_reconciliation_capabilities(&self) -> PdpContextReconciliationCapabilities {
         let probe = self.inner.transport.probe(self.inner.config);
         let readback = if !probe.platform_supported || !probe.gtp_module_present {
@@ -909,21 +1128,22 @@ impl GtpuDataplaneBackend for LinuxGtpuDataplaneBackend {
             } else {
                 GtpuCapability::Missing
             },
-            exact_removal: if self.inner.pdp_recovery_root.is_none() {
-                GtpuCapability::Missing
-            } else if matches!(readback, GtpuCapability::Available) {
-                // Exact removal is a generic-netlink readback + DELPDP
-                // transaction; it needs the same netlink/gtp/CAP_NET_ADMIN
-                // authority as readback but, unlike datapath installation, no
-                // GTP-U UDP socket, so it is gated on readback rather than the
-                // full mutation_ready conjunction (whose UDP-bind probe can be
-                // transiently false when the GTP-U port is held elsewhere).
-                GtpuCapability::Available
-            } else if matches!(readback, GtpuCapability::PermissionDenied) {
-                GtpuCapability::PermissionDenied
-            } else {
-                GtpuCapability::Missing
-            },
+            // The trait request carries only a context. Linux exact restart
+            // removal additionally requires a durable device incarnation, so
+            // callers must use `recover_pdp_context_exact` instead.
+            exact_removal: GtpuCapability::Missing,
+        }
+    }
+
+    fn pdp_restart_recovery_capability(&self) -> GtpuCapability {
+        if self.bound_pdp_recovery_root().is_none() {
+            return GtpuCapability::Missing;
+        }
+        match self.pdp_context_reconciliation_capabilities().readback {
+            GtpuCapability::Available => GtpuCapability::Available,
+            GtpuCapability::PermissionDenied => GtpuCapability::PermissionDenied,
+            GtpuCapability::Unknown => GtpuCapability::Unknown,
+            GtpuCapability::Missing => GtpuCapability::Missing,
         }
     }
 
@@ -984,6 +1204,13 @@ trait LinuxGtpuTransport: Send + Sync + fmt::Debug {
 
     fn ifindex_by_name(&self, name: &str) -> Result<u32, GtpuError>;
 
+    /// Return the unwrapped `IFLA_IFALIAS` bytes for the exact live link.
+    fn device_alias(
+        &self,
+        device: &GtpDevice,
+        config: LinuxGtpuDataplaneBackendConfig,
+    ) -> Result<Option<Vec<u8>>, GtpuError>;
+
     fn probe(&self, config: LinuxGtpuDataplaneBackendConfig) -> GtpuProbe;
 }
 
@@ -1016,10 +1243,18 @@ impl LinuxGtpuTransport for NetlinkGtpuTransport {
 
         let mut buffer = vec![0_u8; config.receive_buffer_len];
         for _ in 0..config.receive_attempts {
-            match receive_message(&socket, &mut buffer) {
+            match receive_kernel_message(&socket, &mut buffer) {
                 Ok(0) => {}
                 Ok(len) => {
-                    let expected_payload_type = read_u16_ne(request, 4)?;
+                    let request_type = read_u16_ne(request, 4)?;
+                    // RTM_GETLINK replies carry RTM_NEWLINK payloads. Other
+                    // route and generic-netlink transactions in this backend
+                    // reply with their request family/type.
+                    let expected_payload_type = if request_type == RTM_GETLINK {
+                        RTM_NEWLINK
+                    } else {
+                        request_type
+                    };
                     return parse_netlink_response(
                         &buffer[..len],
                         expected_sequence,
@@ -1063,6 +1298,32 @@ impl LinuxGtpuTransport for NetlinkGtpuTransport {
             io::ErrorKind::NotFound => GtpuError::NotFound,
             _ => GtpuError::io("ifindex_lookup", error),
         })
+    }
+
+    fn device_alias(
+        &self,
+        device: &GtpDevice,
+        config: LinuxGtpuDataplaneBackendConfig,
+    ) -> Result<Option<Vec<u8>>, GtpuError> {
+        const IDENTITY_QUERY_SEQUENCE: u32 = 1;
+        let body = encode_get_device_request(device.ifindex)?;
+        let request =
+            encode_netlink_message(RTM_GETLINK, NLM_F_REQUEST, IDENTITY_QUERY_SEQUENCE, &body)?;
+        let response = self
+            .transact(
+                NetlinkProtocol::Route,
+                "pdp_device_identity_read",
+                &request,
+                IDENTITY_QUERY_SEQUENCE,
+                config,
+            )?
+            .ok_or_else(|| {
+                GtpuError::io(
+                    "pdp_device_identity_read",
+                    invalid_data("missing link identity response"),
+                )
+            })?;
+        parse_device_alias_response(&response, device)
     }
 
     fn probe(&self, config: LinuxGtpuDataplaneBackendConfig) -> GtpuProbe {
@@ -1172,6 +1433,41 @@ fn map_family_lookup_error(error: GtpuError) -> GtpuError {
         GtpuError::NotFound => GtpuError::UnsupportedPlatform,
         other => other,
     }
+}
+
+fn map_pdp_writer_lease_error(error: GtpuError) -> GtpuError {
+    if matches!(error, GtpuError::AlreadyExists) {
+        GtpuError::RetryRequired {
+            operation: "pdp_writer_authority",
+        }
+    } else {
+        error
+    }
+}
+
+fn validate_pdp_recovery_root(root: &Path) -> Result<(), GtpuError> {
+    if !root.is_absolute() {
+        return Err(GtpuError::invalid_config(
+            "pdp_recovery.root",
+            "recovery root must be an absolute path",
+        ));
+    }
+    if root
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(GtpuError::invalid_config(
+            "pdp_recovery.root",
+            "recovery root must not contain parent-directory components",
+        ));
+    }
+    if root.parent().is_none() {
+        return Err(GtpuError::invalid_config(
+            "pdp_recovery.root",
+            "recovery root must not be the filesystem root",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_create_device_request(request: &CreateGtpDeviceRequest) -> Result<(), GtpuError> {
@@ -1385,6 +1681,34 @@ fn encode_create_device_request(
     Ok(out)
 }
 
+fn encode_set_device_alias_request(
+    device: &GtpDevice,
+    incarnation: PdpDeviceIncarnation,
+) -> Result<Vec<u8>, GtpuError> {
+    let mut out = encode_get_device_request(device.ifindex)?;
+    append_attr_string(
+        &mut out,
+        IFLA_IFALIAS,
+        &encode_pdp_device_alias(incarnation),
+    )?;
+    Ok(out)
+}
+
+fn encode_get_device_request(ifindex: u32) -> Result<Vec<u8>, GtpuError> {
+    let mut out = Vec::with_capacity(IF_INFO_MESSAGE_LEN);
+    push_u8(&mut out, AF_UNSPEC);
+    push_u8(&mut out, 0);
+    push_u16_ne(&mut out, 0);
+    push_i32_ne(
+        &mut out,
+        ifindex_i32(ifindex, "pdp_recovery.device_ifindex")?,
+    );
+    push_u32_ne(&mut out, 0);
+    push_u32_ne(&mut out, 0);
+    debug_assert_eq!(out.len(), IF_INFO_MESSAGE_LEN);
+    Ok(out)
+}
+
 fn encode_remove_device_request(device: &GtpDevice) -> Result<Vec<u8>, GtpuError> {
     let mut out = Vec::with_capacity(IF_INFO_MESSAGE_LEN);
     push_u8(&mut out, AF_INET);
@@ -1526,7 +1850,11 @@ fn parse_pdp_context_response(
             return Err(invalid("trailing generic netlink bytes"));
         }
         let length = usize::from(read_u16_ne(body, offset)?);
-        let attribute_type = read_u16_ne(body, offset + 2)? & 0x3fff;
+        let raw_attribute_type = read_u16_ne(body, offset + 2)?;
+        if raw_attribute_type & !0x3fff != 0 {
+            return Err(invalid("flagged PDP attribute"));
+        }
+        let attribute_type = raw_attribute_type;
         if length < ROUTE_ATTRIBUTE_HEADER_LEN {
             return Err(invalid("invalid PDP attribute length"));
         }
@@ -1555,7 +1883,7 @@ fn parse_pdp_context_response(
             GTPA_PEER_ADDR6 => Some(&mut attributes.peer_ipv6),
             GTPA_I_TEI => Some(&mut attributes.local_teid),
             GTPA_O_TEI => Some(&mut attributes.peer_teid),
-            _ => None,
+            _ => return Err(invalid("unknown PDP attribute")),
         };
         if let Some(slot) = slot {
             if slot.replace(payload).is_some() {
@@ -1903,6 +2231,86 @@ fn parse_generic_family_id(body: &[u8]) -> Result<u16, GtpuError> {
     Err(GtpuError::NotFound)
 }
 
+fn parse_device_alias_response(
+    body: &[u8],
+    expected: &GtpDevice,
+) -> Result<Option<Vec<u8>>, GtpuError> {
+    let invalid = |reason| GtpuError::io("pdp_device_identity_read", invalid_data(reason));
+    if body.len() < IF_INFO_MESSAGE_LEN {
+        return Err(invalid("short link identity response"));
+    }
+    let index = i32::from_ne_bytes(
+        body[4..8]
+            .try_into()
+            .map_err(|_| invalid("short link ifindex"))?,
+    );
+    if index != ifindex_i32(expected.ifindex, "pdp_recovery.device_ifindex")? {
+        return Err(invalid("link identity ifindex mismatch"));
+    }
+
+    let mut offset = IF_INFO_MESSAGE_LEN;
+    let mut name = None;
+    let mut alias = None;
+    while offset < body.len() {
+        if body.len() - offset < ROUTE_ATTRIBUTE_HEADER_LEN {
+            return Err(invalid("trailing link identity bytes"));
+        }
+        let length = usize::from(read_u16_ne(body, offset)?);
+        let raw_attribute_type = read_u16_ne(body, offset + 2)?;
+        if length < ROUTE_ATTRIBUTE_HEADER_LEN || offset + length > body.len() {
+            return Err(invalid("invalid link identity attribute"));
+        }
+        let attribute_type = raw_attribute_type & 0x3fff;
+        let aligned_end = offset
+            .checked_add(
+                align_to_netlink(length)
+                    .ok_or_else(|| invalid("link identity attribute alignment overflow"))?,
+            )
+            .ok_or_else(|| invalid("link identity attribute alignment overflow"))?;
+        if aligned_end > body.len() {
+            return Err(invalid("truncated aligned link identity attribute"));
+        }
+        let payload = &body[offset + ROUTE_ATTRIBUTE_HEADER_LEN..offset + length];
+        let slot = match attribute_type {
+            IFLA_IFNAME => Some(&mut name),
+            IFLA_IFALIAS => Some(&mut alias),
+            _ => None,
+        };
+        if let Some(slot) = slot {
+            if raw_attribute_type != attribute_type {
+                return Err(invalid("flagged link identity attribute"));
+            }
+            let value = parse_nul_terminated_link_attribute(payload)?;
+            if slot.replace(value.to_vec()).is_some() {
+                return Err(invalid("duplicate link identity attribute"));
+            }
+        }
+        offset = aligned_end;
+    }
+
+    let name = name.ok_or_else(|| invalid("missing link name attribute"))?;
+    if name != expected.name.as_bytes() {
+        return Err(invalid("link identity name mismatch"));
+    }
+    Ok(alias)
+}
+
+fn parse_nul_terminated_link_attribute(payload: &[u8]) -> Result<&[u8], GtpuError> {
+    let Some(value) = payload.strip_suffix(&[0]) else {
+        return Err(GtpuError::io(
+            "pdp_device_identity_read",
+            invalid_data("unterminated link string attribute"),
+        ));
+    };
+    if value.contains(&0) {
+        return Err(GtpuError::io(
+            "pdp_device_identity_read",
+            invalid_data("embedded NUL in link string attribute"),
+        ));
+    }
+    Ok(value)
+}
+
 fn effective_cap_net_admin() -> Result<bool, GtpuError> {
     let status = std::fs::read_to_string("/proc/self/status")
         .map_err(|error| GtpuError::io("capability_probe", error))?;
@@ -1924,6 +2332,18 @@ fn encode_role(role: GtpRole) -> u32 {
         GtpRole::Ggsn => GTP_ROLE_GGSN,
         GtpRole::Sgsn => GTP_ROLE_SGSN,
     }
+}
+
+fn encode_pdp_device_alias(incarnation: PdpDeviceIncarnation) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let bytes = incarnation.to_bytes();
+    let mut alias = String::with_capacity(PDP_DEVICE_ALIAS_PREFIX.len() + bytes.len() * 2);
+    alias.push_str(PDP_DEVICE_ALIAS_PREFIX);
+    for byte in bytes {
+        alias.push(char::from(HEX[usize::from(byte >> 4)]));
+        alias.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    alias
 }
 
 fn encode_version(version: GtpVersion) -> u32 {
@@ -2054,6 +2474,46 @@ mod tests {
         }
     }
 
+    struct ResponseLatchReleaseGuard(Option<Arc<ResponseLatch>>);
+
+    impl ResponseLatchReleaseGuard {
+        fn new(latch: Arc<ResponseLatch>) -> Self {
+            Self(Some(latch))
+        }
+
+        fn release_now(&mut self) {
+            if let Some(latch) = self.0.take() {
+                latch.release();
+            }
+        }
+    }
+
+    impl Drop for ResponseLatchReleaseGuard {
+        fn drop(&mut self) {
+            self.release_now();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    struct ChildProcessGuard(Option<std::process::Child>);
+
+    #[cfg(target_os = "linux")]
+    impl ChildProcessGuard {
+        fn new(child: std::process::Child) -> Self {
+            Self(Some(child))
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for ChildProcessGuard {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.0.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
     impl fmt::Debug for ResponseLatch {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             f.debug_struct("ResponseLatch").finish_non_exhaustive()
@@ -2077,9 +2537,17 @@ mod tests {
     struct CapturingTransport {
         requests: Arc<Mutex<Vec<CapturedRequest>>>,
         responses: ResponseQueue,
+        ifindex_responses: Arc<Mutex<VecDeque<IfindexResponse>>>,
         probe: GtpuProbe,
         socket_fd: i32,
         ifindex: u32,
+        device_alias: Option<Vec<u8>>,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum IfindexResponse {
+        Found(u32),
+        NotFound,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2095,6 +2563,7 @@ mod tests {
             Self {
                 requests: Arc::new(Mutex::new(Vec::new())),
                 responses: Arc::new(Mutex::new(VecDeque::new())),
+                ifindex_responses: Arc::new(Mutex::new(VecDeque::new())),
                 probe: GtpuProbe {
                     kind: GtpuBackendKind::LinuxKernel,
                     platform_supported: true,
@@ -2114,6 +2583,7 @@ mod tests {
                 },
                 socket_fd: 9,
                 ifindex: 42,
+                device_alias: Some(encode_pdp_device_alias(test_device_incarnation()).into_bytes()),
             }
         }
 
@@ -2139,6 +2609,13 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .push_back(QueuedResponse::Latched { latch, response });
+        }
+
+        fn push_ifindex_response(&self, response: IfindexResponse) {
+            self.ifindex_responses
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push_back(response);
         }
 
         fn requests(&self) -> Vec<CapturedRequest> {
@@ -2212,7 +2689,24 @@ mod tests {
         }
 
         fn ifindex_by_name(&self, _name: &str) -> Result<u32, GtpuError> {
-            Ok(self.ifindex)
+            match self
+                .ifindex_responses
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .pop_front()
+            {
+                Some(IfindexResponse::Found(ifindex)) => Ok(ifindex),
+                Some(IfindexResponse::NotFound) => Err(GtpuError::NotFound),
+                None => Ok(self.ifindex),
+            }
+        }
+
+        fn device_alias(
+            &self,
+            _device: &GtpDevice,
+            _config: LinuxGtpuDataplaneBackendConfig,
+        ) -> Result<Option<Vec<u8>>, GtpuError> {
+            Ok(self.device_alias.clone())
         }
 
         fn probe(&self, _config: LinuxGtpuDataplaneBackendConfig) -> GtpuProbe {
@@ -2222,6 +2716,10 @@ mod tests {
 
     fn teid(value: u32) -> Teid {
         Teid::new(value).unwrap()
+    }
+
+    fn test_device_incarnation() -> PdpDeviceIncarnation {
+        PdpDeviceIncarnation::from_bytes([0xa5; 16]).unwrap()
     }
 
     fn pdp_context() -> GtpPdpContext {
@@ -2405,6 +2903,28 @@ mod tests {
         );
         assert_eq!(attr_u32(info_data, IFLA_GTP_ROLE), GTP_ROLE_GGSN);
         assert!(attr_payload(info_data, IFLA_GTP_LOCAL).is_none());
+        assert!(attr_payload_from(&body, IF_INFO_MESSAGE_LEN, IFLA_IFALIAS).is_none());
+    }
+
+    #[test]
+    fn encodes_recoverable_device_incarnation_stamp_in_kernel_alias() {
+        let device = GtpDevice {
+            name: "gtp0".to_string(),
+            ifindex: 42,
+        };
+        let incarnation = test_device_incarnation();
+        let body = encode_set_device_alias_request(&device, incarnation).unwrap();
+        let mut expected = encode_pdp_device_alias(incarnation).into_bytes();
+        expected.push(0);
+
+        assert_eq!(
+            attr_payload_from(&body, IF_INFO_MESSAGE_LEN, IFLA_IFALIAS),
+            Some(expected.as_slice())
+        );
+        assert_eq!(
+            i32::from_ne_bytes(body[4..8].try_into().unwrap()),
+            device.ifindex as i32
+        );
     }
 
     #[test]
@@ -2738,17 +3258,27 @@ mod tests {
     }
 
     #[test]
-    fn pdp_readback_decoder_allows_well_formed_extension_and_kernel_command_quirk() {
+    fn pdp_readback_decoder_rejects_unmodeled_attributes_and_allows_kernel_command_quirk() {
         let context = pdp_context();
         let selector =
             PdpContextSelector::Uplink(PdpContextUplinkSelector::from_context(&context).unwrap());
         let mut body = pdp_response(&context, false);
         body[0] = 31;
-        append_attr(&mut body, 0x3ffe, &[1, 2, 3]).unwrap();
         assert_eq!(
             parse_pdp_context_response(&body, &selector, 31).unwrap(),
             context
         );
+
+        let mut unknown = body.clone();
+        append_attr(&mut unknown, 0x3ffe, &[1, 2, 3]).unwrap();
+        assert!(parse_pdp_context_response(&unknown, &selector, 31).is_err());
+
+        let mut flagged = body.clone();
+        let flagged_link = (GTPA_LINK | 0x8000).to_ne_bytes();
+        flagged[GENERIC_NETLINK_HEADER_LEN + 2..GENERIC_NETLINK_HEADER_LEN + 4]
+            .copy_from_slice(&flagged_link);
+        assert!(parse_pdp_context_response(&flagged, &selector, 31).is_err());
+
         body[0] = GTP_CMD_NEWPDP;
         assert!(parse_pdp_context_response(&body, &selector, 31).is_err());
     }
@@ -2774,6 +3304,36 @@ mod tests {
         assert_eq!(err.io_kind(), Some(io::ErrorKind::InvalidData));
     }
 
+    #[test]
+    fn parses_exact_link_identity_alias_and_rejects_identity_drift() {
+        let device = GtpDevice {
+            name: "gtp0".to_string(),
+            ifindex: 42,
+        };
+        let alias = encode_pdp_device_alias(test_device_incarnation());
+        let mut body = encode_get_device_request(device.ifindex).unwrap();
+        append_attr_string(&mut body, IFLA_IFNAME, &device.name).unwrap();
+        append_attr_string(&mut body, IFLA_IFALIAS, &alias).unwrap();
+
+        assert_eq!(
+            parse_device_alias_response(&body, &device).unwrap(),
+            Some(alias.as_bytes().to_vec())
+        );
+
+        let replaced = GtpDevice {
+            name: device.name.clone(),
+            ifindex: device.ifindex + 1,
+        };
+        assert!(parse_device_alias_response(&body, &replaced).is_err());
+
+        let mut flagged = body;
+        let alias_offset = IF_INFO_MESSAGE_LEN
+            + align_to_netlink(ROUTE_ATTRIBUTE_HEADER_LEN + device.name.len() + 1).unwrap();
+        let flagged_type = (IFLA_IFALIAS | 0x8000).to_ne_bytes();
+        flagged[alias_offset + 2..alias_offset + 4].copy_from_slice(&flagged_type);
+        assert!(parse_device_alias_response(&flagged, &device).is_err());
+    }
+
     #[tokio::test]
     async fn linux_backend_create_device_uses_route_netlink_and_returns_ifindex() {
         let transport = CapturingTransport::new();
@@ -2794,6 +3354,162 @@ mod tests {
         let linkinfo = attr_payload_from(body, IF_INFO_MESSAGE_LEN, IFLA_LINKINFO).unwrap();
         let info_data = attr_payload(linkinfo, IFLA_INFO_DATA).unwrap();
         assert_eq!(attr_u32(info_data, IFLA_GTP_FD1), 9);
+    }
+
+    #[tokio::test]
+    async fn linux_recoverable_device_reconciles_alias_ack_loss_before_publication() {
+        let root = unique_recovery_root("create-recoverable-ack-loss");
+        let transport = CapturingTransport::new();
+        transport.push_ifindex_response(IfindexResponse::NotFound);
+        transport.push_response(Ok(None));
+        transport.push_response(Err(GtpuError::io(
+            "netlink_ack",
+            io::Error::new(io::ErrorKind::TimedOut, "redacted"),
+        )));
+        let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
+            .with_pdp_recovery_root(root.clone())
+            .unwrap();
+
+        let device = backend
+            .create_recoverable_device(
+                CreateGtpDeviceRequest::new("gtp0"),
+                test_device_incarnation(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(device.ifindex, 42);
+        assert_eq!(retained_socket_count(&backend), 1);
+        assert_eq!(
+            transport
+                .requests()
+                .iter()
+                .map(|request| request.operation)
+                .collect::<Vec<_>>(),
+            vec!["create_device", "pdp_device_identity_stamp"]
+        );
+        drop(backend);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn linux_recoverable_device_reconciles_create_ack_loss_before_publication() {
+        let root = unique_recovery_root("create-recoverable-create-ack-loss");
+        let transport = CapturingTransport::new();
+        transport.push_ifindex_response(IfindexResponse::NotFound);
+        transport.push_ifindex_response(IfindexResponse::Found(42));
+        transport.push_response(Err(GtpuError::io(
+            "netlink_ack",
+            io::Error::new(io::ErrorKind::TimedOut, "redacted"),
+        )));
+        transport.push_response(Ok(None));
+        let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
+            .with_pdp_recovery_root(root.clone())
+            .unwrap();
+
+        let device = backend
+            .create_recoverable_device(
+                CreateGtpDeviceRequest::new("gtp0"),
+                test_device_incarnation(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(device.ifindex, 42);
+        assert_eq!(retained_socket_count(&backend), 1);
+        assert_eq!(
+            transport
+                .requests()
+                .iter()
+                .map(|request| request.operation)
+                .collect::<Vec<_>>(),
+            vec!["create_device", "pdp_device_identity_stamp"]
+        );
+        drop(backend);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn linux_recoverable_device_refuses_preexisting_name_before_effect() {
+        let root = unique_recovery_root("create-recoverable-preexisting");
+        let transport = CapturingTransport::new();
+        let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
+            .with_pdp_recovery_root(root.clone())
+            .unwrap();
+
+        assert!(matches!(
+            backend
+                .create_recoverable_device(
+                    CreateGtpDeviceRequest::new("gtp0"),
+                    test_device_incarnation(),
+                )
+                .await
+                .unwrap_err(),
+            GtpuError::AlreadyExists
+        ));
+        assert_eq!(retained_socket_count(&backend), 0);
+        assert!(transport.requests().is_empty());
+        drop(backend);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn linux_recoverable_device_rolls_back_unverified_alias() {
+        let root = unique_recovery_root("create-recoverable-alias-mismatch");
+        let mut transport = CapturingTransport::new();
+        transport.device_alias = None;
+        transport.push_ifindex_response(IfindexResponse::NotFound);
+        let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
+            .with_pdp_recovery_root(root.clone())
+            .unwrap();
+
+        assert!(matches!(
+            backend
+                .create_recoverable_device(
+                    CreateGtpDeviceRequest::new("gtp0"),
+                    test_device_incarnation(),
+                )
+                .await
+                .unwrap_err(),
+            GtpuError::StateIndeterminate {
+                operation: "recoverable_device_identity_stamp"
+            }
+        ));
+        assert_eq!(retained_socket_count(&backend), 0);
+        assert_eq!(
+            transport
+                .requests()
+                .iter()
+                .map(|request| request.operation)
+                .collect::<Vec<_>>(),
+            vec![
+                "create_device",
+                "pdp_device_identity_stamp",
+                "recoverable_device_provision_rollback"
+            ]
+        );
+        drop(backend);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn linux_recoverable_device_requires_authority_before_effect() {
+        let transport = CapturingTransport::new();
+        let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone());
+
+        assert!(matches!(
+            backend
+                .create_recoverable_device(
+                    CreateGtpDeviceRequest::new("gtp0"),
+                    test_device_incarnation(),
+                )
+                .await
+                .unwrap_err(),
+            GtpuError::UnsupportedFeature {
+                feature: "pdp_restart_recovery_authority"
+            }
+        ));
+        assert!(transport.requests().is_empty());
     }
 
     #[tokio::test]
@@ -3203,6 +3919,10 @@ mod tests {
                 exact_removal: GtpuCapability::Missing,
             }
         );
+        assert_eq!(
+            backend.pdp_restart_recovery_capability(),
+            GtpuCapability::Missing
+        );
 
         let mut unavailable_transport = CapturingTransport::new();
         unavailable_transport.probe.mutation_ready = false;
@@ -3249,6 +3969,7 @@ mod tests {
                 name: "gtp0".to_string(),
                 ifindex: context.link_ifindex,
             },
+            test_device_incarnation(),
             context,
             PdpRestartRecoveryProof::previous_writer_stopped(),
         )
@@ -3272,10 +3993,11 @@ mod tests {
         transport.push_response(Ok(None));
         push_absent_readback(&transport);
         let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
-            .with_pdp_recovery_root(unique_recovery_root("removed"));
+            .with_pdp_recovery_root(unique_recovery_root("removed"))
+            .unwrap();
 
         let outcome = backend
-            .remove_pdp_context_exact(context.clone())
+            .recover_pdp_context_exact(recovery_request(context.clone()))
             .await
             .unwrap();
 
@@ -3295,10 +4017,11 @@ mod tests {
         push_family_lookup(&transport);
         push_absent_readback(&transport);
         let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
-            .with_pdp_recovery_root(unique_recovery_root("absent"));
+            .with_pdp_recovery_root(unique_recovery_root("absent"))
+            .unwrap();
 
         let outcome = backend
-            .remove_pdp_context_exact(pdp_context())
+            .recover_pdp_context_exact(recovery_request(pdp_context()))
             .await
             .unwrap();
 
@@ -3315,9 +4038,13 @@ mod tests {
         push_family_lookup(&transport);
         push_exact_readback(&transport, &foreign);
         let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
-            .with_pdp_recovery_root(unique_recovery_root("conflict"));
+            .with_pdp_recovery_root(unique_recovery_root("conflict"))
+            .unwrap();
 
-        let outcome = backend.remove_pdp_context_exact(desired).await.unwrap();
+        let outcome = backend
+            .recover_pdp_context_exact(recovery_request(desired))
+            .await
+            .unwrap();
 
         let conflict = match outcome {
             PdpContextRemovalOutcome::Conflict(conflict) => conflict,
@@ -3341,9 +4068,13 @@ mod tests {
         push_absent(&transport);
         push_absent(&transport);
         let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
-            .with_pdp_recovery_root(unique_recovery_root("changed"));
+            .with_pdp_recovery_root(unique_recovery_root("changed"))
+            .unwrap();
 
-        let outcome = backend.remove_pdp_context_exact(context).await.unwrap();
+        let outcome = backend
+            .recover_pdp_context_exact(recovery_request(context))
+            .await
+            .unwrap();
 
         assert_eq!(
             outcome,
@@ -3364,9 +4095,13 @@ mod tests {
         transport.push_response(Ok(None));
         push_exact_readback(&transport, &context);
         let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
-            .with_pdp_recovery_root(unique_recovery_root("confirm-present"));
+            .with_pdp_recovery_root(unique_recovery_root("confirm-present"))
+            .unwrap();
 
-        let outcome = backend.remove_pdp_context_exact(context).await.unwrap();
+        let outcome = backend
+            .recover_pdp_context_exact(recovery_request(context))
+            .await
+            .unwrap();
 
         assert_eq!(
             outcome,
@@ -3401,9 +4136,13 @@ mod tests {
         )));
         push_absent_readback(&transport);
         let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
-            .with_pdp_recovery_root(unique_recovery_root("ack-loss-absent"));
+            .with_pdp_recovery_root(unique_recovery_root("ack-loss-absent"))
+            .unwrap();
 
-        let outcome = backend.remove_pdp_context_exact(context).await.unwrap();
+        let outcome = backend
+            .recover_pdp_context_exact(recovery_request(context))
+            .await
+            .unwrap();
 
         assert_eq!(outcome, PdpContextRemovalOutcome::Removed);
         assert_eq!(
@@ -3430,9 +4169,13 @@ mod tests {
         )));
         push_exact_readback(&transport, &context);
         let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
-            .with_pdp_recovery_root(unique_recovery_root("ack-loss-present"));
+            .with_pdp_recovery_root(unique_recovery_root("ack-loss-present"))
+            .unwrap();
 
-        let outcome = backend.remove_pdp_context_exact(context).await.unwrap();
+        let outcome = backend
+            .recover_pdp_context_exact(recovery_request(context))
+            .await
+            .unwrap();
 
         assert_eq!(
             outcome,
@@ -3456,9 +4199,13 @@ mod tests {
             io::Error::new(io::ErrorKind::PermissionDenied, "redacted"),
         )));
         let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
-            .with_pdp_recovery_root(unique_recovery_root("definitive-error"));
+            .with_pdp_recovery_root(unique_recovery_root("definitive-error"))
+            .unwrap();
 
-        let error = backend.remove_pdp_context_exact(context).await.unwrap_err();
+        let error = backend
+            .recover_pdp_context_exact(recovery_request(context))
+            .await
+            .unwrap_err();
 
         assert!(matches!(
             error,
@@ -3491,15 +4238,23 @@ mod tests {
         let transport = CapturingTransport::new();
         let context = pdp_context();
         let latch = Arc::new(ResponseLatch::new());
+        let mut latch_guard = ResponseLatchReleaseGuard::new(latch.clone());
+        let root = unique_recovery_root("drop-at-admission");
         push_family_lookup(&transport);
         push_exact_readback(&transport, &context);
         transport.push_latched_response(latch.clone(), Ok(None));
         push_absent_readback(&transport);
         let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
-            .with_pdp_recovery_root(unique_recovery_root("drop-at-admission"));
+            .with_pdp_recovery_root(root.clone())
+            .unwrap();
 
         // Move the owned backend into the task so the future is 'static.
-        let handle = tokio::spawn(async move { backend.remove_pdp_context_exact(context).await });
+        let worker_context = context.clone();
+        let handle = tokio::spawn(async move {
+            backend
+                .recover_pdp_context_exact(recovery_request(worker_context))
+                .await
+        });
 
         // Wait until the worker admits the delete and blocks on the latch.
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -3528,9 +4283,42 @@ mod tests {
             .expect_err("the aborted recovery future must not complete");
         assert!(join_error.is_cancelled());
 
-        // The worker is still blocked on the latch; release it and let the
-        // transaction converge.
-        latch.release();
+        // An independent backend using the same authority root cannot overlap
+        // either through restart recovery or through an ordinary supported
+        // mutation while the detached worker is latched after DELPDP.
+        let retry_backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
+            .with_pdp_recovery_root(root.clone())
+            .unwrap();
+        assert_eq!(
+            retry_backend
+                .recover_pdp_context_exact(recovery_request(context.clone()))
+                .await
+                .unwrap(),
+            PdpContextRemovalOutcome::Indeterminate(
+                PdpContextIndeterminateReason::AuthorityUnavailable
+            )
+        );
+        assert!(matches!(
+            retry_backend
+                .install_pdp_context(context.clone())
+                .await
+                .unwrap_err(),
+            GtpuError::RetryRequired {
+                operation: "pdp_writer_authority"
+            }
+        ));
+        assert_eq!(
+            transport
+                .requests()
+                .iter()
+                .filter(|request| request.operation == "remove_pdp_context_exact")
+                .count(),
+            1
+        );
+
+        // Release the original worker and let its post-mutation observation
+        // converge. The guard also releases on any earlier assertion panic.
+        latch_guard.release_now();
 
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
@@ -3544,6 +4332,36 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
 
+        // Seeing the last request in the capture log precedes function return
+        // by a few instructions. Prove that the detached worker has actually
+        // released topology authority before testing the durable retry.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match acquire_pdp_topology_lease(&root) {
+                Ok(lease) => {
+                    drop(lease);
+                    break;
+                }
+                Err(GtpuError::AlreadyExists) => {}
+                Err(error) => panic!("unexpected authority probe failure: {error}"),
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the detached worker did not release recovery authority"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        push_family_lookup(&transport);
+        push_absent_readback(&transport);
+        assert_eq!(
+            retry_backend
+                .recover_pdp_context_exact(recovery_request(context))
+                .await
+                .unwrap(),
+            PdpContextRemovalOutcome::AlreadyAbsent
+        );
+
         let requests = transport.requests();
         // Exactly one admitted delete: no overlapping or duplicated DELPDP.
         assert_eq!(
@@ -3553,13 +4371,14 @@ mod tests {
                 .count(),
             1
         );
-        // Both the pre-readback and the post-mutation confirmation ran.
+        // Both the original pre/post readbacks and the successful idempotent
+        // retry readback ran.
         assert_eq!(
             requests
                 .iter()
                 .filter(|request| request.operation == "read_pdp_context")
                 .count(),
-            8
+            12
         );
     }
 
@@ -3574,9 +4393,13 @@ mod tests {
         transport.push_response(Ok(None));
         push_absent_readback(&transport);
         let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
-            .with_pdp_recovery_root(unique_recovery_root("ipv6"));
+            .with_pdp_recovery_root(unique_recovery_root("ipv6"))
+            .unwrap();
 
-        let outcome = backend.remove_pdp_context_exact(context).await.unwrap();
+        let outcome = backend
+            .recover_pdp_context_exact(recovery_request(context))
+            .await
+            .unwrap();
 
         assert_eq!(outcome, PdpContextRemovalOutcome::Removed);
         let deletes: Vec<_> = transport
@@ -3595,24 +4418,28 @@ mod tests {
 
     #[tokio::test]
     async fn linux_recovery_maps_missing_gtp_family_to_unsupported_platform() {
-        // The trait-level exact removal surfaces an unsupported kernel as a
-        // structural error, distinct from retryable indeterminate outcomes.
+        // The trait-level request can never carry the required durable device
+        // incarnation, regardless of recovery-root or kernel availability.
         let transport = CapturingTransport::with_response(Err(GtpuError::NotFound));
         let backend = LinuxGtpuDataplaneBackend::with_transport(transport)
-            .with_pdp_recovery_root(unique_recovery_root("unsupported-trait"));
+            .with_pdp_recovery_root(unique_recovery_root("unsupported-trait"))
+            .unwrap();
         assert!(matches!(
             backend
                 .remove_pdp_context_exact(pdp_context())
                 .await
                 .unwrap_err(),
-            GtpuError::UnsupportedPlatform
+            GtpuError::UnsupportedFeature {
+                feature: "pdp_context_exact_removal"
+            }
         ));
 
         // The restart primitive proves the device identity first, then maps a
         // missing GTP generic-netlink family the same way.
         let transport = CapturingTransport::with_response(Err(GtpuError::NotFound));
         let backend = LinuxGtpuDataplaneBackend::with_transport(transport)
-            .with_pdp_recovery_root(unique_recovery_root("unsupported-recover"));
+            .with_pdp_recovery_root(unique_recovery_root("unsupported-recover"))
+            .unwrap();
         assert!(matches!(
             backend
                 .recover_pdp_context_exact(recovery_request(pdp_context()))
@@ -3631,10 +4458,38 @@ mod tests {
         push_family_lookup(&transport);
         transport.push_response(Ok(Some(vec![0u8; 2])));
         let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
-            .with_pdp_recovery_root(unique_recovery_root("malformed"));
+            .with_pdp_recovery_root(unique_recovery_root("malformed"))
+            .unwrap();
 
         let error = backend
-            .remove_pdp_context_exact(pdp_context())
+            .recover_pdp_context_exact(recovery_request(pdp_context()))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            GtpuError::Io {
+                kind: io::ErrorKind::InvalidData,
+                ..
+            }
+        ));
+        assert_no_exact_delete(&transport.requests());
+    }
+
+    #[tokio::test]
+    async fn linux_exact_removal_rejects_unmodeled_readback_before_mutation() {
+        let transport = CapturingTransport::new();
+        let context = pdp_context();
+        push_family_lookup(&transport);
+        let mut response = pdp_response(&context, false);
+        append_attr_u32_ne(&mut response, 0x3ffe, 7).unwrap();
+        transport.push_response(Ok(Some(response)));
+        let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
+            .with_pdp_recovery_root(unique_recovery_root("unmodeled-readback"))
+            .unwrap();
+
+        let error = backend
+            .recover_pdp_context_exact(recovery_request(context))
             .await
             .unwrap_err();
 
@@ -3661,9 +4516,13 @@ mod tests {
         push_present(&transport, &context);
         push_absent(&transport);
         let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
-            .with_pdp_recovery_root(unique_recovery_root("single-axis"));
+            .with_pdp_recovery_root(unique_recovery_root("single-axis"))
+            .unwrap();
 
-        let outcome = backend.remove_pdp_context_exact(context).await.unwrap();
+        let outcome = backend
+            .recover_pdp_context_exact(recovery_request(context))
+            .await
+            .unwrap();
 
         assert_eq!(
             outcome,
@@ -3681,7 +4540,8 @@ mod tests {
         transport.push_response(Ok(None));
         push_absent_readback(&transport);
         let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
-            .with_pdp_recovery_root(unique_recovery_root("recover-removed"));
+            .with_pdp_recovery_root(unique_recovery_root("recover-removed"))
+            .unwrap();
 
         let outcome = backend
             .recover_pdp_context_exact(recovery_request(context))
@@ -3699,7 +4559,30 @@ mod tests {
         transport.ifindex = 99;
         let request = recovery_request(pdp_context());
         let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
-            .with_pdp_recovery_root(unique_recovery_root("recover-replaced"));
+            .with_pdp_recovery_root(unique_recovery_root("recover-replaced"))
+            .unwrap();
+
+        let outcome = backend.recover_pdp_context_exact(request).await.unwrap();
+
+        assert_eq!(
+            outcome,
+            PdpContextRemovalOutcome::RepairRequired(PdpContextRepairReason::DeviceIdentityChanged)
+        );
+        assert!(transport.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn linux_restart_recovery_refuses_same_name_and_ifindex_with_new_incarnation() {
+        let mut transport = CapturingTransport::new();
+        // Linux permits explicit ifindex reuse. The name and ifindex therefore
+        // still match, but the replacement's kernel-bound incarnation does
+        // not, so no PDP read or mutation is authorized.
+        let replacement = PdpDeviceIncarnation::from_bytes([0x5a; 16]).unwrap();
+        transport.device_alias = Some(encode_pdp_device_alias(replacement).into_bytes());
+        let request = recovery_request(pdp_context());
+        let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
+            .with_pdp_recovery_root(unique_recovery_root("recover-incarnation-replaced"))
+            .unwrap();
 
         let outcome = backend.recover_pdp_context_exact(request).await.unwrap();
 
@@ -3719,11 +4602,13 @@ mod tests {
                 name: "gtp0".to_string(),
                 ifindex: context.link_ifindex + 1,
             },
+            test_device_incarnation(),
             context,
             PdpRestartRecoveryProof::previous_writer_stopped(),
         );
         let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
-            .with_pdp_recovery_root(unique_recovery_root("recover-mismatch"));
+            .with_pdp_recovery_root(unique_recovery_root("recover-mismatch"))
+            .unwrap();
 
         let error = backend
             .recover_pdp_context_exact(request)
@@ -3735,14 +4620,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn linux_capabilities_report_exact_removal_with_bound_recovery_root() {
+    async fn linux_trait_capability_does_not_advertise_generationless_exact_removal() {
         let transport = CapturingTransport::new();
         let backend = LinuxGtpuDataplaneBackend::with_transport(transport)
-            .with_pdp_recovery_root(unique_recovery_root("caps"));
+            .with_pdp_recovery_root(unique_recovery_root("caps"))
+            .unwrap();
         assert_eq!(
             backend
                 .pdp_context_reconciliation_capabilities()
                 .exact_removal,
+            GtpuCapability::Missing
+        );
+        assert_eq!(
+            backend.pdp_restart_recovery_capability(),
             GtpuCapability::Available
         );
     }
@@ -3775,10 +4665,11 @@ mod tests {
         let transport = CapturingTransport::new();
         push_family_lookup(&transport);
         let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
-            .with_pdp_recovery_root(root);
+            .with_pdp_recovery_root(root)
+            .unwrap();
 
         let outcome = backend
-            .remove_pdp_context_exact(pdp_context())
+            .recover_pdp_context_exact(recovery_request(pdp_context()))
             .await
             .unwrap();
 
@@ -3790,6 +4681,84 @@ mod tests {
         );
         assert_no_exact_delete(&transport.requests());
         drop(held);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linux_bound_mutation_paths_share_one_writer_authority() {
+        let root = unique_recovery_root("writer-domain");
+        let context = pdp_context();
+        let transport = CapturingTransport::new();
+        let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
+            .with_pdp_recovery_root(root.clone())
+            .unwrap();
+
+        let device_lease = acquire_pdp_recovery_lease(&root, context.link_ifindex).unwrap();
+        assert!(matches!(
+            backend
+                .install_pdp_context(context.clone())
+                .await
+                .unwrap_err(),
+            GtpuError::RetryRequired {
+                operation: "pdp_writer_authority"
+            }
+        ));
+        assert!(matches!(
+            backend
+                .remove_pdp_context(RemovePdpContextRequest::from_context(&context))
+                .await
+                .unwrap_err(),
+            GtpuError::RetryRequired {
+                operation: "pdp_writer_authority"
+            }
+        ));
+        assert_eq!(
+            backend
+                .install_pdp_context_classified(context.clone())
+                .await
+                .unwrap(),
+            PdpContextInstallOutcome::Indeterminate(
+                PdpContextIndeterminateReason::AuthorityUnavailable
+            )
+        );
+        assert!(matches!(
+            backend
+                .remove_device(&GtpDevice {
+                    name: "gtp0".to_string(),
+                    ifindex: context.link_ifindex,
+                })
+                .await
+                .unwrap_err(),
+            GtpuError::RetryRequired {
+                operation: "pdp_writer_authority"
+            }
+        ));
+        assert!(transport.requests().is_empty());
+        drop(device_lease);
+
+        let topology_lease = acquire_pdp_topology_lease(&root).unwrap();
+        assert!(matches!(
+            backend
+                .create_device(CreateGtpDeviceRequest::new("gtp-new"))
+                .await
+                .unwrap_err(),
+            GtpuError::RetryRequired {
+                operation: "pdp_writer_authority"
+            }
+        ));
+        assert_eq!(
+            backend
+                .recover_pdp_context_exact(recovery_request(context))
+                .await
+                .unwrap(),
+            PdpContextRemovalOutcome::Indeterminate(
+                PdpContextIndeterminateReason::AuthorityUnavailable
+            )
+        );
+        assert!(transport.requests().is_empty());
+        drop(topology_lease);
+        drop(backend);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// Child entry for the cross-process lease test: hold an exclusive flock
@@ -3829,7 +4798,7 @@ mod tests {
         let ready_path = root.join("child-ready");
 
         let exe = std::env::current_exe().expect("current test binary");
-        let mut child = std::process::Command::new(exe)
+        let child = std::process::Command::new(exe)
             // Substring filter (no `--exact`): libtest's exact match would
             // require the full `linux::tests::` module path.
             .arg("linux_exact_removal_cross_process_lease_excludes")
@@ -3838,6 +4807,7 @@ mod tests {
             .env("OPC_GTPU_627_LEASE_READY", &ready_path)
             .spawn()
             .expect("spawn lease-holding child");
+        let child = ChildProcessGuard::new(child);
 
         // Parent role: while the child holds the lease from another process,
         // exact recovery must be refused as retryable authority-unavailable.
@@ -3855,9 +4825,10 @@ mod tests {
             let transport = CapturingTransport::new();
             push_family_lookup(&transport);
             let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
-                .with_pdp_recovery_root(root.clone());
+                .with_pdp_recovery_root(root.clone())
+                .unwrap();
             let outcome = backend
-                .remove_pdp_context_exact(pdp_context())
+                .recover_pdp_context_exact(recovery_request(pdp_context()))
                 .await
                 .unwrap();
             assert_eq!(
@@ -3870,8 +4841,7 @@ mod tests {
         }
         .await;
 
-        let _ = child.kill();
-        let _ = child.wait();
+        drop(child);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -3894,6 +4864,29 @@ mod tests {
         assert!(validate_interface_name("abcdefghijklmnop", "device.name").is_err());
         assert!(validate_interface_name("bad\0name", "device.name").is_err());
         assert!(validate_ifindex(0, "device.ifindex").is_err());
+    }
+
+    #[test]
+    fn recovery_root_binding_is_absolute_shared_and_non_rebindable() {
+        let backend = LinuxGtpuDataplaneBackend::with_transport(CapturingTransport::new());
+        let clone = backend.clone();
+        assert!(clone
+            .clone()
+            .with_pdp_recovery_root(PathBuf::from("relative-root"))
+            .is_err());
+        assert!(clone
+            .clone()
+            .with_pdp_recovery_root(PathBuf::from("/"))
+            .is_err());
+
+        let root = unique_recovery_root("shared-root");
+        let bound = clone.with_pdp_recovery_root(root.clone()).unwrap();
+        assert_eq!(backend.bound_pdp_recovery_root(), Some(root.as_path()));
+        assert!(backend
+            .clone()
+            .with_pdp_recovery_root(unique_recovery_root("other-root"))
+            .is_err());
+        assert!(bound.with_pdp_recovery_root(root).is_ok());
     }
 
     #[test]

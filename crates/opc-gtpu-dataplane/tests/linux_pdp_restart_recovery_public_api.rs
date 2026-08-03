@@ -7,15 +7,16 @@
 use std::path::PathBuf;
 
 use opc_gtpu_dataplane::{
-    GtpDevice, GtpPdpContext, GtpuError, LinuxGtpuDataplaneBackend, PdpContextIndeterminateReason,
-    PdpContextRemovalOutcome, PdpContextRepairReason, PdpRestartRecoveryProof,
-    PdpRestartRecoveryRequest,
+    GtpDevice, GtpPdpContext, GtpuDataplaneBackend, GtpuError, LinuxGtpuDataplaneBackend,
+    PdpContextIndeterminateReason, PdpContextRemovalOutcome, PdpContextRepairReason,
+    PdpDeviceIncarnation, PdpRestartRecoveryProof, PdpRestartRecoveryRequest,
 };
 
 fn assert_send_sync<T: Send + Sync>() {}
 
 fn assert_recovery_request_accessors(request: &PdpRestartRecoveryRequest) {
     let _: &GtpDevice = request.device();
+    let _: PdpDeviceIncarnation = request.incarnation();
     let _: &GtpPdpContext = request.expected();
     let _: PdpRestartRecoveryProof = request.writer_proof();
 }
@@ -30,10 +31,19 @@ async fn recover_returns_classified_removal_outcome(
     backend.recover_pdp_context_exact(request).await
 }
 
+#[allow(dead_code)]
+async fn trait_object_recovery_carries_incarnation_authority(
+    backend: &dyn GtpuDataplaneBackend,
+    request: PdpRestartRecoveryRequest,
+) -> Result<PdpContextRemovalOutcome, GtpuError> {
+    backend.recover_pdp_context_exact(request).await
+}
+
 #[test]
 fn linux_pdp_restart_recovery_surface_is_public_and_typed() {
     assert_send_sync::<PdpRestartRecoveryRequest>();
     assert_send_sync::<PdpRestartRecoveryProof>();
+    assert_send_sync::<PdpDeviceIncarnation>();
     assert_send_sync::<LinuxGtpuDataplaneBackend>();
 
     // Repair reasons and removal outcomes are typed, value-free, and copyable.
@@ -51,7 +61,10 @@ fn linux_pdp_restart_recovery_surface_is_public_and_typed() {
     let _ = format!("{repair:?} {indeterminate:?}");
 
     // Construction-time recovery-root binding is public.
-    let _bind: fn(LinuxGtpuDataplaneBackend, PathBuf) -> LinuxGtpuDataplaneBackend =
+    let _bind: fn(
+        LinuxGtpuDataplaneBackend,
+        PathBuf,
+    ) -> Result<LinuxGtpuDataplaneBackend, GtpuError> =
         |backend, root| backend.with_pdp_recovery_root(root);
 
     let _accessors: fn(&PdpRestartRecoveryRequest) = assert_recovery_request_accessors;
@@ -64,6 +77,7 @@ fn linux_pdp_restart_recovery_request_is_redaction_safe() {
             name: "gtp0".to_string(),
             ifindex: 7,
         },
+        PdpDeviceIncarnation::from_bytes([0xa5; 16]).unwrap(),
         GtpPdpContext {
             local_teid: opc_gtpu_dataplane::Teid::new(0x1122_3344).unwrap(),
             peer_teid: opc_gtpu_dataplane::Teid::new(0x5566_7788).unwrap(),

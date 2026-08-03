@@ -7,8 +7,8 @@ use opc_gtpu_dataplane::{
     CreateGtpDeviceRequest, GtpDevice, GtpPdpContext, GtpVersion, GtpuCapability,
     GtpuDataplaneBackend, LinuxGtpuDataplaneBackend, PdpContextInstallOutcome,
     PdpContextLocalTeidSelector, PdpContextReadback, PdpContextRemovalOutcome, PdpContextSelector,
-    PdpContextSelectorOccupancy, PdpContextUplinkSelector, PdpRestartRecoveryProof,
-    PdpRestartRecoveryRequest, RemovePdpContextRequest, Teid,
+    PdpContextSelectorOccupancy, PdpContextUplinkSelector, PdpDeviceIncarnation,
+    PdpRestartRecoveryProof, PdpRestartRecoveryRequest, RemovePdpContextRequest, Teid,
 };
 
 #[tokio::test]
@@ -223,6 +223,7 @@ fn privileged_recovery_context(device: &GtpDevice) -> Result<GtpPdpContext, &'st
 
 fn privileged_recovery_request(
     device: &GtpDevice,
+    incarnation: PdpDeviceIncarnation,
     context: GtpPdpContext,
 ) -> PdpRestartRecoveryRequest {
     PdpRestartRecoveryRequest::new(
@@ -230,6 +231,7 @@ fn privileged_recovery_request(
             name: device.name.clone(),
             ifindex: device.ifindex,
         },
+        incarnation,
         context,
         PdpRestartRecoveryProof::previous_writer_stopped(),
     )
@@ -245,28 +247,37 @@ async fn restart_recovery_removes_exact_pdp_and_is_idempotent_in_current_netns(
     }
 
     let recovery_root = privileged_recovery_root();
-    let backend = LinuxGtpuDataplaneBackend::new().with_pdp_recovery_root(recovery_root.clone());
+    let backend = LinuxGtpuDataplaneBackend::new().with_pdp_recovery_root(recovery_root.clone())?;
+    let incarnation = PdpDeviceIncarnation::from_bytes([0xa5; 16])
+        .ok_or("privileged fixture incarnation must be nonzero")?;
     let name = format!("gr{}", std::process::id() % 10_000);
     let mut create = CreateGtpDeviceRequest::new(name.clone());
     // Keep this independently runnable alongside the established fixtures,
     // which own the default GTP-U port and 32_152 in the same namespace.
     create.bind_port = 32_153;
-    let device = backend.create_device(create).await?;
+    let device = backend
+        .create_recoverable_device(create, incarnation)
+        .await?;
     let context = privileged_recovery_context(&device)?;
 
     let result = async {
-        // Exact removal is now authoritative once a recovery root is bound.
+        // Generationless trait removal stays unsupported even with a root;
+        // the Linux restart API carries the required device incarnation.
         assert_eq!(
             backend
                 .pdp_context_reconciliation_capabilities()
                 .exact_removal,
-            GtpuCapability::Available
+            GtpuCapability::Missing
         );
 
         // Removing a context that is not present is proven without mutation.
         assert_eq!(
             backend
-                .recover_pdp_context_exact(privileged_recovery_request(&device, context.clone()))
+                .recover_pdp_context_exact(privileged_recovery_request(
+                    &device,
+                    incarnation,
+                    context.clone(),
+                ))
                 .await?,
             PdpContextRemovalOutcome::AlreadyAbsent
         );
@@ -276,7 +287,11 @@ async fn restart_recovery_removes_exact_pdp_and_is_idempotent_in_current_netns(
         // The exact resident context is removed under recovery authority.
         assert_eq!(
             backend
-                .recover_pdp_context_exact(privileged_recovery_request(&device, context.clone()))
+                .recover_pdp_context_exact(privileged_recovery_request(
+                    &device,
+                    incarnation,
+                    context.clone(),
+                ))
                 .await?,
             PdpContextRemovalOutcome::Removed
         );
@@ -284,15 +299,34 @@ async fn restart_recovery_removes_exact_pdp_and_is_idempotent_in_current_netns(
         // A confirmed removal is idempotent: re-running proves exact absence.
         assert_eq!(
             backend
-                .recover_pdp_context_exact(privileged_recovery_request(&device, context.clone()))
+                .recover_pdp_context_exact(privileged_recovery_request(
+                    &device,
+                    incarnation,
+                    context.clone(),
+                ))
                 .await?,
             PdpContextRemovalOutcome::AlreadyAbsent
         );
 
-        // The trait-level exact removal path shares the same authority.
+        // The generationless trait request cannot authorize Linux deletion.
         backend.install_pdp_context(context.clone()).await?;
+        assert!(matches!(
+            backend
+                .remove_pdp_context_exact(context.clone())
+                .await
+                .unwrap_err(),
+            opc_gtpu_dataplane::GtpuError::UnsupportedFeature {
+                feature: "pdp_context_exact_removal"
+            }
+        ));
         assert_eq!(
-            backend.remove_pdp_context_exact(context.clone()).await?,
+            backend
+                .recover_pdp_context_exact(privileged_recovery_request(
+                    &device,
+                    incarnation,
+                    context.clone(),
+                ))
+                .await?,
             PdpContextRemovalOutcome::Removed
         );
 
@@ -301,7 +335,7 @@ async fn restart_recovery_removes_exact_pdp_and_is_idempotent_in_current_netns(
         let mut foreign = context.clone();
         foreign.peer_teid = Teid::new(0x2400_0999).ok_or("foreign TEID must be nonzero")?;
         let conflict = backend
-            .recover_pdp_context_exact(privileged_recovery_request(&device, foreign))
+            .recover_pdp_context_exact(privileged_recovery_request(&device, incarnation, foreign))
             .await?;
         assert!(
             matches!(conflict, PdpContextRemovalOutcome::Conflict(_)),

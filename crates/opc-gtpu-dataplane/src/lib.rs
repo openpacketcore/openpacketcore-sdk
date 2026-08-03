@@ -84,9 +84,9 @@ pub use model::{
     PdpContextLocalTeidSelector, PdpContextMismatchField, PdpContextReadback,
     PdpContextReconciliationCapabilities, PdpContextRemovalOutcome, PdpContextRepairReason,
     PdpContextSelector, PdpContextSelectorOccupancy, PdpContextUplinkIdentity,
-    PdpContextUplinkSelector, PdpRestartRecoveryProof, PdpRestartRecoveryRequest,
-    RemovePdpContextRequest, RetainedGraphCleanupClassification, RetainedGraphCleanupRefusal,
-    RetainedGraphCleanupRequest, Teid, GTPU_PORT,
+    PdpContextUplinkSelector, PdpDeviceIncarnation, PdpRestartRecoveryProof,
+    PdpRestartRecoveryRequest, RemovePdpContextRequest, RetainedGraphCleanupClassification,
+    RetainedGraphCleanupRefusal, RetainedGraphCleanupRequest, Teid, GTPU_PORT,
 };
 pub use opc_types::DscpCodepoint;
 #[cfg(target_os = "linux")]

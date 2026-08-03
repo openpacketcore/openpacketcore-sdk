@@ -2015,9 +2015,9 @@ pub enum PdpContextInstallOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PdpContextRepairReason {
     /// The expected GTP device identity no longer matches the durable
-    /// descriptor: the device name no longer resolves to the expected ifindex
-    /// (the device was replaced, renamed, or removed). The resident state was
-    /// left untouched and the descriptor must be reprovisioned.
+    /// descriptor: its name, ifindex, or kernel-bound incarnation changed (the
+    /// device was replaced, renamed, or removed). The resident state was left
+    /// untouched and the descriptor must be reprovisioned.
     DeviceIdentityChanged,
 }
 
@@ -2036,6 +2036,42 @@ pub enum PdpContextRemovalOutcome {
     /// A structural precondition failed closed before any mutation; retrying
     /// the identical request cannot succeed without repair.
     RepairRequired(PdpContextRepairReason),
+}
+
+/// Opaque, non-reusable identity of one Linux GTP device incarnation.
+///
+/// Callers must generate this identity with a cryptographically secure random
+/// number generator before creating the device, durably persist it with every
+/// recovery descriptor for that device, and never reuse it for another device
+/// incarnation. The all-zero value is reserved so omitted or uninitialized
+/// identity cannot silently authorize recovery.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PdpDeviceIncarnation([u8; 16]);
+
+impl PdpDeviceIncarnation {
+    /// Decode a persisted device-incarnation identity.
+    ///
+    /// Returns `None` for the reserved all-zero value.
+    #[must_use]
+    pub fn from_bytes(bytes: [u8; 16]) -> Option<Self> {
+        if bytes.iter().all(|byte| *byte == 0) {
+            None
+        } else {
+            Some(Self(bytes))
+        }
+    }
+
+    /// Return the exact fixed-width representation for durable persistence.
+    #[must_use]
+    pub const fn to_bytes(self) -> [u8; 16] {
+        self.0
+    }
+}
+
+impl fmt::Debug for PdpDeviceIncarnation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PdpDeviceIncarnation(<redacted>)")
+    }
 }
 
 /// Explicit caller attestation that the process which previously owned a
@@ -2066,11 +2102,13 @@ impl PdpRestartRecoveryProof {
 /// owns it) survive the writer, and the consumer must prove either exact
 /// removal or exact absence of the descriptor before protocol egress. The
 /// request binds the complete expected identity — the device identity
-/// (`device`) plus both selector axes and full context (`expected`) — so a
-/// resident context is only ever removed when it matches exactly.
+/// (`device`), its non-reusable incarnation (`incarnation`), and both selector
+/// axes and full context (`expected`) — so a resident context is only ever
+/// removed when it matches exactly.
 #[derive(Clone, PartialEq, Eq)]
 pub struct PdpRestartRecoveryRequest {
     device: GtpDevice,
+    incarnation: PdpDeviceIncarnation,
     expected: GtpPdpContext,
     writer_proof: PdpRestartRecoveryProof,
 }
@@ -2079,17 +2117,21 @@ impl PdpRestartRecoveryRequest {
     /// Build a restart-recovery request for one exact durable PDP context.
     ///
     /// `device` is the expected GTP device identity (name and ifindex) that
-    /// the durable descriptor records. `expected` is the complete expected
-    /// PDP context (both selector axes and every identity field).
-    /// `writer_proof` attests that the prior writer has stopped.
+    /// the durable descriptor records. `incarnation` is the cryptographically
+    /// unpredictable, durably persisted identity minted before that device was
+    /// created and never reused. `expected` is the complete expected PDP
+    /// context (both selector axes and every identity field). `writer_proof`
+    /// attests that the prior writer has stopped.
     #[must_use]
     pub const fn new(
         device: GtpDevice,
+        incarnation: PdpDeviceIncarnation,
         expected: GtpPdpContext,
         writer_proof: PdpRestartRecoveryProof,
     ) -> Self {
         Self {
             device,
+            incarnation,
             expected,
             writer_proof,
         }
@@ -2099,6 +2141,12 @@ impl PdpRestartRecoveryRequest {
     #[must_use]
     pub const fn device(&self) -> &GtpDevice {
         &self.device
+    }
+
+    /// Return the non-reusable identity of the expected device incarnation.
+    #[must_use]
+    pub const fn incarnation(&self) -> PdpDeviceIncarnation {
+        self.incarnation
     }
 
     /// Return the complete expected PDP context identity.
@@ -2118,6 +2166,7 @@ impl fmt::Debug for PdpRestartRecoveryRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PdpRestartRecoveryRequest")
             .field("device", &"<redacted-device-identity>")
+            .field("incarnation", &"<redacted-device-incarnation>")
             .field("expected", &"<redacted-pdp-context>")
             .field("writer_proof", &self.writer_proof)
             .finish()
@@ -2756,6 +2805,64 @@ mod tests {
         assert_eq!(remove.local_teid, ctx.local_teid);
         assert_eq!(remove.link_ifindex, 9);
         assert_eq!(remove.address_family, GtpAddressFamily::Ipv6);
+    }
+
+    #[test]
+    fn pdp_device_incarnation_rejects_zero() {
+        assert_eq!(PdpDeviceIncarnation::from_bytes([0; 16]), None);
+    }
+
+    #[test]
+    fn pdp_device_incarnation_round_trips_persisted_bytes() {
+        let bytes = [0xa5; 16];
+        let incarnation = PdpDeviceIncarnation::from_bytes(bytes).unwrap();
+
+        assert_eq!(incarnation.to_bytes(), bytes);
+    }
+
+    #[test]
+    fn pdp_device_incarnation_debug_is_redacted() {
+        let incarnation = PdpDeviceIncarnation::from_bytes([0xa5; 16]).unwrap();
+
+        assert_eq!(
+            format!("{incarnation:?}"),
+            "PdpDeviceIncarnation(<redacted>)"
+        );
+    }
+
+    #[test]
+    fn pdp_restart_recovery_request_binds_incarnation_and_redacts_identity() {
+        let device = GtpDevice {
+            name: "tenant-sensitive-gtp".to_string(),
+            ifindex: 41,
+        };
+        let incarnation = PdpDeviceIncarnation::from_bytes([0xa5; 16]).unwrap();
+        let expected = reconciliation_context();
+        let writer_proof = PdpRestartRecoveryProof::previous_writer_stopped();
+        let request = PdpRestartRecoveryRequest::new(
+            device.clone(),
+            incarnation,
+            expected.clone(),
+            writer_proof,
+        );
+
+        assert_eq!(request.device(), &device);
+        assert_eq!(request.incarnation(), incarnation);
+        assert_eq!(request.expected(), &expected);
+        assert_eq!(request.writer_proof(), writer_proof);
+
+        let debug = format!("{request:?}");
+        for sensitive in [
+            "tenant-sensitive-gtp",
+            "10.23.0.2",
+            "192.0.2.10",
+            "12345678",
+            "87654321",
+            "[165, 165",
+        ] {
+            assert!(!debug.contains(sensitive));
+        }
+        assert!(debug.contains("<redacted-device-incarnation>"));
     }
 
     #[test]
