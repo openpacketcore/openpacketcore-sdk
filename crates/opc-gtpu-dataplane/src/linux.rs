@@ -42,6 +42,7 @@ const IFNAMSIZ: usize = 16;
 const CAP_NET_ADMIN: u32 = 12;
 const ENOENT: i32 = 2;
 const ESRCH: i32 = 3;
+#[cfg(target_os = "linux")]
 const PDP_TOPOLOGY_LEASE_NAME: &str = "pdp-recovery-topology.lock";
 const PDP_DEVICE_ALIAS_PREFIX: &str = "opc-pdp-recovery-v1:";
 
