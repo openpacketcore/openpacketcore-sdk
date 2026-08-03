@@ -85,6 +85,33 @@
 //! can restore an older complete authenticated snapshot needs an external
 //! monotonic witness.
 //!
+//! Exact SA relocation receives the same durable, crash-recoverable boundary
+//! through a separate self-contained store family.
+//! `LinuxXfrmBackend::bind_current_network_namespace_with_sa_relocation_recovery`
+//! (or the combined object-and-relocation constructor) authenticates and
+//! permanently leases one `XfrmSaRelocationRecoveryStore` on the same
+//! namespace actor before any mutation-capable handle is returned.
+//! `NamespaceBoundLinuxXfrmBackend::prepare_sa_relocation` persists
+//! authenticated `Prepared` truth and returns an affine
+//! [`XfrmSaRelocationAdmissionAuthority`];
+//! `NamespaceBoundLinuxXfrmBackend::run_durable_sa_relocation` witnesses the
+//! old and target identities as a durable pre-effect proof, persists
+//! `Issuing`, and only then admits the single `relocate_sa` effect,
+//! publishing `Relocated`, `NoMutation`, or `Indeterminate` before returning.
+//! There is no finalize/adoption call: a terminal `Relocated` record is the
+//! durable proof that the consumer continues on the new addresses. After
+//! process loss, `NamespaceBoundLinuxXfrmBackend::recover_durable_sa_relocation`
+//! classifies unresolved records from their proof plus fresh exact readbacks
+//! and deletes only a proved owned residue through the exact target deletion
+//! identity; prepared records retire as authoritative no-mutation, terminal
+//! proof is returned idempotently, and unreadable, stale-epoch, or
+//! inconsistent records stay fail-closed. Every unresolved relocation phase,
+//! including `Prepared`, gates all later cooperating mutations in the
+//! namespace, and the install and relocation stores gate each other. Relocation
+//! records use an independent format with no compatibility path, migration
+//! bridge, or unconditional-delete escape hatch; their diagnostics remain
+//! value-free like the install boundary.
+//!
 //! Same-SPI successor activation uses
 //! [`NamespaceBoundLinuxXfrmBackend::apply_and_read_back_outbound_esp_counter`].
 //! The sealed actor validates the opaque outbound binding, reads the kernel's
@@ -130,6 +157,10 @@ mod dscp;
 mod durable_install;
 #[cfg(unix)]
 mod durable_object;
+#[cfg(unix)]
+mod durable_relocation;
+#[cfg(unix)]
+mod durable_relocation_flow;
 pub mod error;
 #[cfg(feature = "ikev2")]
 pub mod ikev2;
@@ -170,6 +201,15 @@ pub use durable_object::{
     XfrmObjectInstallRecoveryHandle, XfrmObjectInstallRecoveryStore, XfrmObjectRecoveryProofKey,
     XFRM_OBJECT_INSTALL_RECOVERY_HANDLE_BYTES,
 };
+#[cfg(unix)]
+pub use durable_relocation::{
+    XfrmSaRelocationDurableError, XfrmSaRelocationDurablePhase,
+    XfrmSaRelocationOperationGeneration, XfrmSaRelocationOperationId,
+    XfrmSaRelocationRecoveryHandle, XfrmSaRelocationRecoveryProofKey,
+    XfrmSaRelocationRecoveryStore, XFRM_SA_RELOCATION_RECOVERY_HANDLE_BYTES,
+};
+#[cfg(unix)]
+pub use durable_relocation_flow::{XfrmSaRelocationDurableOutcome, XfrmSaRelocationRestartOutcome};
 pub use error::XfrmError;
 #[cfg(feature = "ikev2")]
 pub use ikev2::{
@@ -197,6 +237,7 @@ pub use namespace::{NamespaceBoundLinuxXfrmBackend, LINUX_XFRM_NAMESPACE_ACTOR_C
 #[cfg(unix)]
 pub use namespace::{
     XfrmObjectInstallAdmissionAuthority, XfrmObjectInstallRunError, XfrmObjectRecoveryBindError,
+    XfrmSaRelocationAdmissionAuthority, XfrmSaRelocationRunError,
 };
 pub use observation::{
     EspPeerAddressFamily, EspPeerIngestTally, EspPeerObservation, EspPeerObservationEpoch,

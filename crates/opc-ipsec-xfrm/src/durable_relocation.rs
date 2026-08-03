@@ -1,10 +1,10 @@
-//! Durable, authenticated authority records for staged single-object recovery.
+//! Durable, authenticated authority records for SA relocation recovery.
 //!
 //! This module deliberately stores only opaque correlation values and keyed
 //! fingerprints. It never serializes an XFRM request, key material, packet
 //! mark, SPI, selector, or address. A decoded record is correlation data, not
 //! cleanup authority: callers must validate it through
-//! [`XfrmObjectInstallRecoveryStore`] while holding that store's permanent
+//! [`XfrmSaRelocationRecoveryStore`] while holding that store's permanent
 //! cross-process lease.
 
 #[cfg(target_os = "linux")]
@@ -36,32 +36,36 @@ use rustix::fs::{
 #[cfg(target_os = "linux")]
 use rustix::fs::{renameat_with, RenameFlags};
 
-use crate::model::validate_exact_lookup_mark;
-use crate::{
-    IpAddress, LifetimeConfig, RemovePolicyRequest, RemoveSaRequest, SaReplayState, UdpEncap,
-    XfrmAction, XfrmDirection, XfrmId, XfrmInstallObject, XfrmLookupMark, XfrmMark, XfrmMode,
-    XfrmObjectInstallRequest, XfrmObjectRemovalRequest, XfrmRequestId, XfrmSelector, XfrmTemplate,
+use crate::model::{
+    validate_exact_lookup_mark, RelocateSaRequest, SaRelocationDirection, SaRelocationEncap,
+    SaRelocationSelector,
 };
+use crate::{IpAddress, UdpEncap, XfrmId, XfrmLookupMark, XfrmMark, XfrmMode, XfrmRequestId};
 
-/// Exact byte length of a persisted recovery handle and durable record.
-pub const XFRM_OBJECT_INSTALL_RECOVERY_HANDLE_BYTES: usize = 208;
+/// Exact byte length of a persisted relocation recovery handle and durable
+/// record.
+pub const XFRM_SA_RELOCATION_RECOVERY_HANDLE_BYTES: usize = 208;
 
 const RECORD_BODY_BYTES: usize = 176;
 const AUTH_TAG_BYTES: usize = 32;
-const RECORD_MAGIC: [u8; 8] = *b"OPCXOBJ1";
-const RECORD_VERSION: u16 = 2;
-const RECORD_AUTH_DOMAIN: &[u8] = b"opc-xfrm-object-record-v1\0";
-const INSTALL_REQUEST_AUTH_DOMAIN: &[u8] = b"opc-xfrm-object-install-request-v1\0";
+const RECORD_MAGIC: [u8; 8] = *b"OPCXRLC1";
+const RECORD_VERSION: u16 = 1;
+const RECORD_AUTH_DOMAIN: &[u8] = b"opc-xfrm-relocation-record-v1\0";
+const RELOCATION_REQUEST_AUTH_DOMAIN: &[u8] = b"opc-xfrm-relocation-request-v1\0";
+const DELETION_IDENTITY_AUTH_DOMAIN: &[u8] = b"opc-xfrm-relocation-deletion-identity-v1\0";
+const NAMESPACE_AUTH_DOMAIN: &[u8] = b"opc-xfrm-relocation-namespace-v1\0";
 const CONTROL_BYTES: usize = 128;
 const CONTROL_BODY_BYTES: usize = CONTROL_BYTES - AUTH_TAG_BYTES;
-const CONTROL_MAGIC: [u8; 8] = *b"OPCXCTL1";
-const CONTROL_AUTH_DOMAIN: &[u8] = b"opc-xfrm-object-control-v1\0";
+// Family-distinct control/epoch magics: an open against another durable
+// family's root must fail control-record validation, never adopt it.
+const CONTROL_MAGIC: [u8; 8] = *b"OPCXRCT1";
+const CONTROL_AUTH_DOMAIN: &[u8] = b"opc-xfrm-relocation-control-v1\0";
 const CONTROL_NAME: &str = "control";
-const TEMPORARY_PREFIX: &str = ".opc-xfrm-object-pending-";
+const TEMPORARY_PREFIX: &str = ".opc-xfrm-relocation-pending-";
 const EPOCH_BYTES: usize = 80;
 const EPOCH_BODY_BYTES: usize = EPOCH_BYTES - AUTH_TAG_BYTES;
-const EPOCH_MAGIC: [u8; 8] = *b"OPCXEPC1";
-const EPOCH_AUTH_DOMAIN: &[u8] = b"opc-xfrm-object-epoch-v1\0";
+const EPOCH_MAGIC: [u8; 8] = *b"OPCXREP1";
+const EPOCH_AUTH_DOMAIN: &[u8] = b"opc-xfrm-relocation-epoch-v1\0";
 const MAX_STORE_ENTRIES: usize = 64;
 const MAX_ACTIVE_RECORDS: usize = MAX_STORE_ENTRIES - 3;
 const MAX_STORE_PATH_BYTES: usize = 4096;
@@ -111,21 +115,21 @@ impl ZeroizingHmacSha256 {
     }
 }
 
-/// Secret proof key used to authenticate staged-object recovery state.
+/// Secret proof key used to authenticate SA relocation recovery state.
 ///
 /// The key is supplied by the product's durable secret configuration and must
 /// remain stable across a process restart. `Debug` and `Display` are redacted,
 /// and the bytes are zeroized when the value is dropped.
-pub struct XfrmObjectRecoveryProofKey([u8; AUTH_TAG_BYTES]);
+pub struct XfrmSaRelocationRecoveryProofKey([u8; AUTH_TAG_BYTES]);
 
-impl XfrmObjectRecoveryProofKey {
+impl XfrmSaRelocationRecoveryProofKey {
     /// Construct a proof key from exactly 256 bits of secret material.
     ///
     /// An all-zero key is rejected so an omitted secret cannot silently create
     /// forgeable recovery authority.
-    pub fn new(bytes: [u8; AUTH_TAG_BYTES]) -> Result<Self, XfrmObjectInstallDurableError> {
+    pub fn new(bytes: [u8; AUTH_TAG_BYTES]) -> Result<Self, XfrmSaRelocationDurableError> {
         if bytes.iter().all(|byte| *byte == 0) {
-            return Err(XfrmObjectInstallDurableError::InvalidProofKey);
+            return Err(XfrmSaRelocationDurableError::InvalidProofKey);
         }
         Ok(Self(bytes))
     }
@@ -135,48 +139,48 @@ impl XfrmObjectRecoveryProofKey {
     }
 }
 
-impl Clone for XfrmObjectRecoveryProofKey {
+impl Clone for XfrmSaRelocationRecoveryProofKey {
     fn clone(&self) -> Self {
         Self(self.0)
     }
 }
 
-impl Drop for XfrmObjectRecoveryProofKey {
+impl Drop for XfrmSaRelocationRecoveryProofKey {
     fn drop(&mut self) {
         self.0.zeroize();
     }
 }
 
-impl fmt::Debug for XfrmObjectRecoveryProofKey {
+impl fmt::Debug for XfrmSaRelocationRecoveryProofKey {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("XfrmObjectRecoveryProofKey(<redacted>)")
+        formatter.write_str("XfrmSaRelocationRecoveryProofKey(<redacted>)")
     }
 }
 
-impl fmt::Display for XfrmObjectRecoveryProofKey {
+impl fmt::Display for XfrmSaRelocationRecoveryProofKey {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("<redacted>")
     }
 }
 
-/// Opaque, randomly generated identity of one staged install operation.
+/// Opaque, randomly generated identity of one durable SA relocation operation.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct XfrmObjectInstallOperationId([u8; 16]);
+pub struct XfrmSaRelocationOperationId([u8; 16]);
 
-impl XfrmObjectInstallOperationId {
+impl XfrmSaRelocationOperationId {
     /// Generate a nonzero operation identity using the operating system RNG.
-    pub fn generate() -> Result<Self, XfrmObjectInstallDurableError> {
+    pub fn generate() -> Result<Self, XfrmSaRelocationDurableError> {
         let mut bytes = [0_u8; 16];
         SysRng
             .try_fill_bytes(&mut bytes)
-            .map_err(|_| XfrmObjectInstallDurableError::EntropyUnavailable)?;
+            .map_err(|_| XfrmSaRelocationDurableError::EntropyUnavailable)?;
         Self::from_bytes(bytes)
     }
 
     /// Decode an opaque operation identity, rejecting the reserved zero value.
-    pub fn from_bytes(bytes: [u8; 16]) -> Result<Self, XfrmObjectInstallDurableError> {
+    pub fn from_bytes(bytes: [u8; 16]) -> Result<Self, XfrmSaRelocationDurableError> {
         if bytes.iter().all(|byte| *byte == 0) {
-            return Err(XfrmObjectInstallDurableError::Malformed);
+            return Err(XfrmSaRelocationDurableError::Malformed);
         }
         Ok(Self(bytes))
     }
@@ -187,23 +191,23 @@ impl XfrmObjectInstallOperationId {
     }
 }
 
-impl fmt::Debug for XfrmObjectInstallOperationId {
+impl fmt::Debug for XfrmSaRelocationOperationId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("XfrmObjectInstallOperationId(<redacted>)")
+        formatter.write_str("XfrmSaRelocationOperationId(<redacted>)")
     }
 }
 
-impl fmt::Display for XfrmObjectInstallOperationId {
+impl fmt::Display for XfrmSaRelocationOperationId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("<redacted>")
     }
 }
 
-/// Nonzero product generation for one staged install operation.
+/// Nonzero product generation for one durable SA relocation operation.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct XfrmObjectInstallOperationGeneration(NonZeroU64);
+pub struct XfrmSaRelocationOperationGeneration(NonZeroU64);
 
-impl XfrmObjectInstallOperationGeneration {
+impl XfrmSaRelocationOperationGeneration {
     /// Construct a nonzero operation generation.
     pub const fn new(value: u64) -> Option<Self> {
         match NonZeroU64::new(value) {
@@ -218,52 +222,58 @@ impl XfrmObjectInstallOperationGeneration {
     }
 }
 
-impl fmt::Debug for XfrmObjectInstallOperationGeneration {
+impl fmt::Debug for XfrmSaRelocationOperationGeneration {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("XfrmObjectInstallOperationGeneration(<redacted>)")
+        formatter.write_str("XfrmSaRelocationOperationGeneration(<redacted>)")
     }
 }
 
-impl fmt::Display for XfrmObjectInstallOperationGeneration {
+impl fmt::Display for XfrmSaRelocationOperationGeneration {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("<redacted>")
     }
 }
 
-/// Durable state of a staged single-object install.
+/// Durable state of one exact SA relocation.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum XfrmObjectInstallDurablePhase {
+pub enum XfrmSaRelocationDurablePhase {
     /// Intent is durable and no backend mutation has been admitted.
+    ///
+    /// Unlike the staged-object install boundary, a prepared relocation
+    /// reserves the namespace-wide writer gate until it is recovered or
+    /// admitted: an unreconciled MOBIKE-style transaction fences cooperating
+    /// writers.
     Prepared,
-    /// The writer epoch was advanced before issuing the install.
+    /// The writer epoch was advanced before issuing the relocation.
     Issuing,
-    /// Linux acknowledged that this operation acquired the object.
-    Acquired,
-    /// A pre-effect conflict or create-exclusive collision proved no mutation.
+    /// The relocation completed and durable terminal proof was published.
+    Relocated,
+    /// The relocation provably made no mutation.
     NoMutation,
-    /// The backend result cannot safely prove ownership or absence.
+    /// The backend result cannot safely prove relocation or absence.
     Indeterminate,
+    /// Fresh exact readback proved that neither the current nor target SA is
+    /// present, without claiming that the relocation made no mutation.
+    StateAbsent,
     /// Recovery authority was validated and fenced before deletion.
     RemovalAdmitted,
     /// Recovery completed and no cleanup authority remains.
     Retired,
-    /// The product adopted the object and cleanup authority was surrendered.
-    Committed,
 }
 
-impl XfrmObjectInstallDurablePhase {
+impl XfrmSaRelocationDurablePhase {
     /// Stable, value-free phase label.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Prepared => "prepared",
             Self::Issuing => "issuing",
-            Self::Acquired => "acquired",
+            Self::Relocated => "relocated",
             Self::NoMutation => "no_mutation",
             Self::Indeterminate => "indeterminate",
+            Self::StateAbsent => "state_absent",
             Self::RemovalAdmitted => "removal_admitted",
             Self::Retired => "retired",
-            Self::Committed => "committed",
         }
     }
 
@@ -271,26 +281,26 @@ impl XfrmObjectInstallDurablePhase {
         match self {
             Self::Prepared => 1,
             Self::Issuing => 2,
-            Self::Acquired => 3,
+            Self::Relocated => 3,
             Self::NoMutation => 4,
             Self::Indeterminate => 5,
             Self::RemovalAdmitted => 6,
             Self::Retired => 7,
-            Self::Committed => 8,
+            Self::StateAbsent => 8,
         }
     }
 
-    fn from_code(code: u8) -> Result<Self, XfrmObjectInstallDurableError> {
+    fn from_code(code: u8) -> Result<Self, XfrmSaRelocationDurableError> {
         match code {
             1 => Ok(Self::Prepared),
             2 => Ok(Self::Issuing),
-            3 => Ok(Self::Acquired),
+            3 => Ok(Self::Relocated),
             4 => Ok(Self::NoMutation),
             5 => Ok(Self::Indeterminate),
             6 => Ok(Self::RemovalAdmitted),
             7 => Ok(Self::Retired),
-            8 => Ok(Self::Committed),
-            _ => Err(XfrmObjectInstallDurableError::Malformed),
+            8 => Ok(Self::StateAbsent),
+            _ => Err(XfrmSaRelocationDurableError::Malformed),
         }
     }
 
@@ -299,70 +309,83 @@ impl XfrmObjectInstallDurablePhase {
             (self, next),
             (Self::Prepared, Self::Issuing)
                 | (Self::Prepared, Self::Retired)
-                | (Self::Issuing, Self::Acquired)
+                | (Self::Issuing, Self::Relocated)
                 | (Self::Issuing, Self::NoMutation)
                 | (Self::Issuing, Self::Indeterminate)
+                | (Self::Issuing, Self::StateAbsent)
                 | (Self::Issuing, Self::RemovalAdmitted)
                 | (Self::Indeterminate, Self::NoMutation)
+                | (Self::Indeterminate, Self::StateAbsent)
                 | (Self::Indeterminate, Self::RemovalAdmitted)
-                | (Self::Acquired, Self::RemovalAdmitted)
-                | (Self::Acquired, Self::Committed)
+                | (Self::Relocated, Self::Retired)
                 | (Self::NoMutation, Self::Retired)
                 | (Self::RemovalAdmitted, Self::Retired)
         )
     }
+
+    /// Whether this phase keeps the namespace-wide writer gate closed.
+    ///
+    /// Every unresolved relocation phase gates cooperating writers, including
+    /// `Prepared`: a prepared-but-unrecovered relocation reserves the
+    /// namespace until it is reconciled.
+    pub(crate) const fn is_unresolved_writer_authority(self) -> bool {
+        matches!(
+            self,
+            Self::Prepared | Self::Issuing | Self::Indeterminate | Self::RemovalAdmitted
+        )
+    }
 }
 
-/// Durable pre-effect proof witnessed before possible backend install
-/// admission.
+/// Durable pre-effect proof witnessed before a relocation effect is admitted.
 ///
 /// Immediately before the `Prepared -> Issuing` transition, the namespace
-/// actor performs an exact readback of the deletion identity and embeds the
-/// observed presence in the record. After process loss, combining this proof
-/// with a fresh exact readback distinguishes a provably-owned residue from a
-/// foreign or absent object without relying on retained intent alone.
+/// actor performs exact readbacks of the current and target SA identities and
+/// embeds the witnessed target disposition in the record. After process loss,
+/// combining this proof with fresh exact readbacks classifies old/new kernel
+/// state without relying on retained intent alone.
 ///
 /// This type is crate-internal: it never appears in a public signature and is
 /// only observable through the recovery outcome it authorizes.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum XfrmObjectInstallPreEffectProof {
-    /// The exact deletion identity was absent immediately before possible
-    /// effect admission.
-    Absent = 1,
-    /// The exact deletion identity was already present, so the install effect
-    /// was not admitted.
-    Conflict = 2,
+pub(crate) enum XfrmSaRelocationPreEffectProof {
+    /// The relocated target identity differs from the current identity and
+    /// was absent when the effect was admitted.
+    TargetAbsent = 1,
+    /// The relocated target identity equals the current identity (an
+    /// encapsulation and/or source-only change), and that exact identity was
+    /// present when the effect was admitted.
+    SameIdentityWitnessed = 2,
 }
 
-impl XfrmObjectInstallPreEffectProof {
+impl XfrmSaRelocationPreEffectProof {
     /// Stable, value-free proof label.
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
-            Self::Absent => "absent",
-            Self::Conflict => "conflict",
+            Self::TargetAbsent => "target_absent",
+            Self::SameIdentityWitnessed => "same_identity_witnessed",
         }
     }
 
     const fn code(self) -> u8 {
         match self {
-            Self::Absent => 1,
-            Self::Conflict => 2,
+            Self::TargetAbsent => 1,
+            Self::SameIdentityWitnessed => 2,
         }
     }
 
-    fn from_code(code: u8) -> Result<Self, XfrmObjectInstallDurableError> {
+    fn from_code(code: u8) -> Result<Self, XfrmSaRelocationDurableError> {
         match code {
-            1 => Ok(Self::Absent),
-            2 => Ok(Self::Conflict),
-            _ => Err(XfrmObjectInstallDurableError::Malformed),
+            1 => Ok(Self::TargetAbsent),
+            2 => Ok(Self::SameIdentityWitnessed),
+            _ => Err(XfrmSaRelocationDurableError::Malformed),
         }
     }
 }
 
-impl fmt::Debug for XfrmObjectInstallPreEffectProof {
+impl fmt::Debug for XfrmSaRelocationPreEffectProof {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_tuple("XfrmObjectInstallPreEffectProof")
+            .debug_tuple("XfrmSaRelocationPreEffectProof")
             .field(&self.as_str())
             .finish()
     }
@@ -374,38 +397,38 @@ impl fmt::Debug for XfrmObjectInstallPreEffectProof {
 /// must authenticate it, find exactly one matching current record, and validate
 /// namespace, incarnation, generation, epoch, and phase.
 #[derive(Clone, PartialEq, Eq)]
-pub struct XfrmObjectInstallRecoveryHandle([u8; XFRM_OBJECT_INSTALL_RECOVERY_HANDLE_BYTES]);
+pub struct XfrmSaRelocationRecoveryHandle([u8; XFRM_SA_RELOCATION_RECOVERY_HANDLE_BYTES]);
 
-impl XfrmObjectInstallRecoveryHandle {
+impl XfrmSaRelocationRecoveryHandle {
     /// Decode fixed-size opaque bytes without treating them as authority.
     #[must_use]
-    pub const fn from_bytes(bytes: [u8; XFRM_OBJECT_INSTALL_RECOVERY_HANDLE_BYTES]) -> Self {
+    pub const fn from_bytes(bytes: [u8; XFRM_SA_RELOCATION_RECOVERY_HANDLE_BYTES]) -> Self {
         Self(bytes)
     }
 
     /// Return fixed-size opaque bytes for durable application storage.
     #[must_use]
-    pub const fn to_bytes(&self) -> [u8; XFRM_OBJECT_INSTALL_RECOVERY_HANDLE_BYTES] {
+    pub const fn to_bytes(&self) -> [u8; XFRM_SA_RELOCATION_RECOVERY_HANDLE_BYTES] {
         self.0
     }
 }
 
-impl fmt::Debug for XfrmObjectInstallRecoveryHandle {
+impl fmt::Debug for XfrmSaRelocationRecoveryHandle {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("XfrmObjectInstallRecoveryHandle(<redacted>)")
+        formatter.write_str("XfrmSaRelocationRecoveryHandle(<redacted>)")
     }
 }
 
-impl fmt::Display for XfrmObjectInstallRecoveryHandle {
+impl fmt::Display for XfrmSaRelocationRecoveryHandle {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("<redacted>")
     }
 }
 
-/// Value-free durable recovery failure.
+/// Value-free durable relocation recovery failure.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum XfrmObjectInstallDurableError {
+pub enum XfrmSaRelocationDurableError {
     /// The proof key is the reserved all-zero value.
     InvalidProofKey,
     /// The operating-system random source was unavailable.
@@ -438,93 +461,78 @@ pub enum XfrmObjectInstallDurableError {
     CapacityExceeded,
 }
 
-impl XfrmObjectInstallDurableError {
+impl XfrmSaRelocationDurableError {
     /// Stable machine-readable, value-free error code.
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::InvalidProofKey => "xfrm_object_recovery_invalid_proof_key",
-            Self::EntropyUnavailable => "xfrm_object_recovery_entropy_unavailable",
-            Self::InvalidStoreRoot => "xfrm_object_recovery_invalid_store_root",
-            Self::StoreBusy => "xfrm_object_recovery_store_busy",
-            Self::Storage => "xfrm_object_recovery_storage",
-            Self::Malformed => "xfrm_object_recovery_malformed",
-            Self::AuthenticationFailed => "xfrm_object_recovery_authentication_failed",
-            Self::Duplicate => "xfrm_object_recovery_duplicate",
-            Self::WrongBinding => "xfrm_object_recovery_wrong_binding",
-            Self::WrongIncarnation => "xfrm_object_recovery_wrong_incarnation",
-            Self::Stale => "xfrm_object_recovery_stale",
-            Self::InvalidTransition => "xfrm_object_recovery_invalid_transition",
-            Self::NonExactRemovalIdentity => "xfrm_object_recovery_non_exact_removal_identity",
-            Self::NotFound => "xfrm_object_recovery_not_found",
-            Self::CapacityExceeded => "xfrm_object_recovery_capacity_exceeded",
+            Self::InvalidProofKey => "xfrm_sa_relocation_recovery_invalid_proof_key",
+            Self::EntropyUnavailable => "xfrm_sa_relocation_recovery_entropy_unavailable",
+            Self::InvalidStoreRoot => "xfrm_sa_relocation_recovery_invalid_store_root",
+            Self::StoreBusy => "xfrm_sa_relocation_recovery_store_busy",
+            Self::Storage => "xfrm_sa_relocation_recovery_storage",
+            Self::Malformed => "xfrm_sa_relocation_recovery_malformed",
+            Self::AuthenticationFailed => "xfrm_sa_relocation_recovery_authentication_failed",
+            Self::Duplicate => "xfrm_sa_relocation_recovery_duplicate",
+            Self::WrongBinding => "xfrm_sa_relocation_recovery_wrong_binding",
+            Self::WrongIncarnation => "xfrm_sa_relocation_recovery_wrong_incarnation",
+            Self::Stale => "xfrm_sa_relocation_recovery_stale",
+            Self::InvalidTransition => "xfrm_sa_relocation_recovery_invalid_transition",
+            Self::NonExactRemovalIdentity => {
+                "xfrm_sa_relocation_recovery_non_exact_removal_identity"
+            }
+            Self::NotFound => "xfrm_sa_relocation_recovery_not_found",
+            Self::CapacityExceeded => "xfrm_sa_relocation_recovery_capacity_exceeded",
         }
     }
 }
 
-impl fmt::Display for XfrmObjectInstallDurableError {
+impl fmt::Display for XfrmSaRelocationDurableError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.as_str())
     }
 }
 
-impl Error for XfrmObjectInstallDurableError {}
+impl Error for XfrmSaRelocationDurableError {}
 
 #[derive(Clone, PartialEq, Eq)]
-pub(crate) struct DurableObjectRecord {
-    pub(crate) phase: XfrmObjectInstallDurablePhase,
-    pub(crate) object: XfrmInstallObject,
-    pub(crate) pre_effect_proof: Option<XfrmObjectInstallPreEffectProof>,
+pub(crate) struct DurableRelocationRecord {
+    pub(crate) phase: XfrmSaRelocationDurablePhase,
+    pub(crate) pre_effect_proof: Option<XfrmSaRelocationPreEffectProof>,
     pub(crate) store_incarnation: [u8; 16],
     pub(crate) namespace_seal: [u8; 32],
     pub(crate) actor_incarnation: [u8; 16],
-    pub(crate) operation_id: XfrmObjectInstallOperationId,
-    pub(crate) operation_generation: XfrmObjectInstallOperationGeneration,
+    pub(crate) operation_id: XfrmSaRelocationOperationId,
+    pub(crate) operation_generation: XfrmSaRelocationOperationGeneration,
     pub(crate) writer_epoch: NonZeroU64,
     pub(crate) deletion_identity_fingerprint: [u8; 32],
-    pub(crate) install_request_fingerprint: [u8; 32],
+    pub(crate) relocation_request_fingerprint: [u8; 32],
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) struct DurableObjectFingerprints {
-    deletion_identity: [u8; 32],
-    install_request: [u8; 32],
+pub(crate) struct DurableRelocationFingerprints {
+    pub(crate) deletion_identity: [u8; 32],
+    pub(crate) relocation_request: [u8; 32],
 }
 
-impl DurableObjectFingerprints {
-    #[cfg(test)]
-    pub(crate) fn repeated(byte: u8) -> Self {
-        Self {
-            deletion_identity: [byte; 32],
-            install_request: [byte.wrapping_add(1); 32],
-        }
-    }
-}
-
-impl fmt::Debug for DurableObjectRecord {
+impl fmt::Debug for DurableRelocationRecord {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("DurableObjectRecord")
+            .debug_struct("DurableRelocationRecord")
             .field("phase", &self.phase)
-            .field("object", &self.object.as_str())
             .finish_non_exhaustive()
     }
 }
 
-impl DurableObjectRecord {
+impl DurableRelocationRecord {
     pub(crate) fn encode(
         &self,
-        key: &XfrmObjectRecoveryProofKey,
-    ) -> Result<[u8; XFRM_OBJECT_INSTALL_RECOVERY_HANDLE_BYTES], XfrmObjectInstallDurableError>
-    {
+        key: &XfrmSaRelocationRecoveryProofKey,
+    ) -> Result<[u8; XFRM_SA_RELOCATION_RECOVERY_HANDLE_BYTES], XfrmSaRelocationDurableError> {
         validate_record(self)?;
-        let mut encoded = [0_u8; XFRM_OBJECT_INSTALL_RECOVERY_HANDLE_BYTES];
+        let mut encoded = [0_u8; XFRM_SA_RELOCATION_RECOVERY_HANDLE_BYTES];
         encoded[0..8].copy_from_slice(&RECORD_MAGIC);
         encoded[8..10].copy_from_slice(&RECORD_VERSION.to_be_bytes());
         encoded[10] = self.phase.code();
-        encoded[11] = match self.object {
-            XfrmInstallObject::Sa => 1,
-            XfrmInstallObject::Policy => 2,
-        };
         encoded[12] = self.pre_effect_proof.map_or(0, |proof| proof.code());
         encoded[16..32].copy_from_slice(&self.store_incarnation);
         encoded[32..64].copy_from_slice(&self.namespace_seal);
@@ -533,50 +541,45 @@ impl DurableObjectRecord {
         encoded[96..104].copy_from_slice(&self.operation_generation.get().to_be_bytes());
         encoded[104..112].copy_from_slice(&self.writer_epoch.get().to_be_bytes());
         encoded[112..144].copy_from_slice(&self.deletion_identity_fingerprint);
-        encoded[144..176].copy_from_slice(&self.install_request_fingerprint);
+        encoded[144..176].copy_from_slice(&self.relocation_request_fingerprint);
         let tag = authenticate(key, &encoded[..RECORD_BODY_BYTES])?;
         encoded[RECORD_BODY_BYTES..].copy_from_slice(&tag);
         Ok(encoded)
     }
 
     pub(crate) fn decode(
-        encoded: &[u8; XFRM_OBJECT_INSTALL_RECOVERY_HANDLE_BYTES],
-        key: &XfrmObjectRecoveryProofKey,
-    ) -> Result<Self, XfrmObjectInstallDurableError> {
+        encoded: &[u8; XFRM_SA_RELOCATION_RECOVERY_HANDLE_BYTES],
+        key: &XfrmSaRelocationRecoveryProofKey,
+    ) -> Result<Self, XfrmSaRelocationDurableError> {
         if encoded[0..8] != RECORD_MAGIC
             || encoded[8..10] != RECORD_VERSION.to_be_bytes()
+            || encoded[11] != 0
             || encoded[13..16] != [0_u8; 3]
         {
-            return Err(XfrmObjectInstallDurableError::Malformed);
+            return Err(XfrmSaRelocationDurableError::Malformed);
         }
         let pre_effect_proof = match encoded[12] {
             0 => None,
-            code => Some(XfrmObjectInstallPreEffectProof::from_code(code)?),
+            code => Some(XfrmSaRelocationPreEffectProof::from_code(code)?),
         };
         verify_authentication(
             key,
             &encoded[..RECORD_BODY_BYTES],
             &encoded[RECORD_BODY_BYTES..],
         )?;
-        let object = match encoded[11] {
-            1 => XfrmInstallObject::Sa,
-            2 => XfrmInstallObject::Policy,
-            _ => return Err(XfrmObjectInstallDurableError::Malformed),
-        };
         let record = Self {
-            phase: XfrmObjectInstallDurablePhase::from_code(encoded[10])?,
-            object,
+            phase: XfrmSaRelocationDurablePhase::from_code(encoded[10])?,
             pre_effect_proof,
             store_incarnation: array_at(encoded, 16),
             namespace_seal: array_at(encoded, 32),
             actor_incarnation: array_at(encoded, 64),
-            operation_id: XfrmObjectInstallOperationId::from_bytes(array_at(encoded, 80))?,
-            operation_generation: XfrmObjectInstallOperationGeneration::new(u64_at(encoded, 96))
-                .ok_or(XfrmObjectInstallDurableError::Malformed)?,
+            operation_id: XfrmSaRelocationOperationId::from_bytes(array_at(encoded, 80))?,
+            operation_generation: XfrmSaRelocationOperationGeneration::new(u64_at(encoded, 96))
+                .ok_or(XfrmSaRelocationDurableError::Malformed)?,
             writer_epoch: NonZeroU64::new(u64_at(encoded, 104))
-                .ok_or(XfrmObjectInstallDurableError::Malformed)?,
+                .ok_or(XfrmSaRelocationDurableError::Malformed)?,
             deletion_identity_fingerprint: array_at(encoded, 112),
-            install_request_fingerprint: array_at(encoded, 144),
+            relocation_request_fingerprint: array_at(encoded, 144),
         };
         validate_record(&record)?;
         Ok(record)
@@ -584,13 +587,13 @@ impl DurableObjectRecord {
 
     pub(crate) fn handle(
         &self,
-        key: &XfrmObjectRecoveryProofKey,
-    ) -> Result<XfrmObjectInstallRecoveryHandle, XfrmObjectInstallDurableError> {
-        Ok(XfrmObjectInstallRecoveryHandle(self.encode(key)?))
+        key: &XfrmSaRelocationRecoveryProofKey,
+    ) -> Result<XfrmSaRelocationRecoveryHandle, XfrmSaRelocationDurableError> {
+        Ok(XfrmSaRelocationRecoveryHandle(self.encode(key)?))
     }
 }
 
-fn validate_record(record: &DurableObjectRecord) -> Result<(), XfrmObjectInstallDurableError> {
+fn validate_record(record: &DurableRelocationRecord) -> Result<(), XfrmSaRelocationDurableError> {
     if record.store_incarnation.iter().all(|byte| *byte == 0)
         || record.namespace_seal.iter().all(|byte| *byte == 0)
         || record.actor_incarnation.iter().all(|byte| *byte == 0)
@@ -599,11 +602,11 @@ fn validate_record(record: &DurableObjectRecord) -> Result<(), XfrmObjectInstall
             .iter()
             .all(|byte| *byte == 0)
         || record
-            .install_request_fingerprint
+            .relocation_request_fingerprint
             .iter()
             .all(|byte| *byte == 0)
     {
-        return Err(XfrmObjectInstallDurableError::Malformed);
+        return Err(XfrmSaRelocationDurableError::Malformed);
     }
     // The pre-effect proof is witnessed exactly at the `Prepared -> Issuing`
     // transition and preserved by every subsequent transition. A `Prepared`
@@ -612,18 +615,18 @@ fn validate_record(record: &DurableObjectRecord) -> Result<(), XfrmObjectInstall
     // not depending on whether it retired through an effect-possible phase.
     let proof_required = matches!(
         record.phase,
-        XfrmObjectInstallDurablePhase::Issuing
-            | XfrmObjectInstallDurablePhase::Acquired
-            | XfrmObjectInstallDurablePhase::NoMutation
-            | XfrmObjectInstallDurablePhase::Indeterminate
-            | XfrmObjectInstallDurablePhase::RemovalAdmitted
-            | XfrmObjectInstallDurablePhase::Committed
+        XfrmSaRelocationDurablePhase::Issuing
+            | XfrmSaRelocationDurablePhase::Relocated
+            | XfrmSaRelocationDurablePhase::NoMutation
+            | XfrmSaRelocationDurablePhase::Indeterminate
+            | XfrmSaRelocationDurablePhase::StateAbsent
+            | XfrmSaRelocationDurablePhase::RemovalAdmitted
     );
-    let proof_forbidden = record.phase == XfrmObjectInstallDurablePhase::Prepared;
+    let proof_forbidden = record.phase == XfrmSaRelocationDurablePhase::Prepared;
     if (proof_required && record.pre_effect_proof.is_none())
         || (proof_forbidden && record.pre_effect_proof.is_some())
     {
-        return Err(XfrmObjectInstallDurableError::Malformed);
+        return Err(XfrmSaRelocationDurableError::Malformed);
     }
     Ok(())
 }
@@ -633,31 +636,31 @@ fn fingerprints_equal(left: &[u8; 32], right: &[u8; 32]) -> bool {
 }
 
 fn record_matches_fingerprints(
-    record: &DurableObjectRecord,
-    fingerprints: DurableObjectFingerprints,
+    record: &DurableRelocationRecord,
+    fingerprints: DurableRelocationFingerprints,
 ) -> bool {
     bool::from(
         record
             .deletion_identity_fingerprint
             .ct_eq(&fingerprints.deletion_identity)
             & record
-                .install_request_fingerprint
-                .ct_eq(&fingerprints.install_request),
+                .relocation_request_fingerprint
+                .ct_eq(&fingerprints.relocation_request),
     )
 }
 
 fn authenticate(
-    key: &XfrmObjectRecoveryProofKey,
+    key: &XfrmSaRelocationRecoveryProofKey,
     body: &[u8],
-) -> Result<[u8; AUTH_TAG_BYTES], XfrmObjectInstallDurableError> {
+) -> Result<[u8; AUTH_TAG_BYTES], XfrmSaRelocationDurableError> {
     authenticate_domain(key, RECORD_AUTH_DOMAIN, body)
 }
 
 fn authenticate_domain(
-    key: &XfrmObjectRecoveryProofKey,
+    key: &XfrmSaRelocationRecoveryProofKey,
     domain: &[u8],
     body: &[u8],
-) -> Result<[u8; AUTH_TAG_BYTES], XfrmObjectInstallDurableError> {
+) -> Result<[u8; AUTH_TAG_BYTES], XfrmSaRelocationDurableError> {
     let mut mac = HmacSha256::new(key.bytes());
     mac.update(domain);
     mac.update(body);
@@ -665,26 +668,26 @@ fn authenticate_domain(
 }
 
 fn verify_authentication(
-    key: &XfrmObjectRecoveryProofKey,
+    key: &XfrmSaRelocationRecoveryProofKey,
     body: &[u8],
     tag: &[u8],
-) -> Result<(), XfrmObjectInstallDurableError> {
+) -> Result<(), XfrmSaRelocationDurableError> {
     verify_authentication_domain(key, RECORD_AUTH_DOMAIN, body, tag)
 }
 
 fn verify_authentication_domain(
-    key: &XfrmObjectRecoveryProofKey,
+    key: &XfrmSaRelocationRecoveryProofKey,
     domain: &[u8],
     body: &[u8],
     tag: &[u8],
-) -> Result<(), XfrmObjectInstallDurableError> {
+) -> Result<(), XfrmSaRelocationDurableError> {
     let mut mac = HmacSha256::new(key.bytes());
     mac.update(domain);
     mac.update(body);
     if bool::from(mac.finalize().as_slice().ct_eq(tag)) {
         Ok(())
     } else {
-        Err(XfrmObjectInstallDurableError::AuthenticationFailed)
+        Err(XfrmSaRelocationDurableError::AuthenticationFailed)
     }
 }
 
@@ -698,7 +701,7 @@ fn u64_at(bytes: &[u8], start: usize) -> u64 {
     u64::from_be_bytes(array_at(bytes, start))
 }
 
-/// Descriptor-anchored, permanently leased recovery store.
+/// Descriptor-anchored, permanently leased relocation recovery store.
 ///
 /// The store owns an exclusive `flock` on the originally opened root directory
 /// for its entire lifetime. Every operation reopens the visible path with
@@ -715,7 +718,7 @@ fn u64_at(bytes: &[u8], start: usize) -> u64 {
 /// incarnation; it is not regenerated on every open. A live authority from a
 /// different root/store incarnation cannot validate against this lease.
 #[derive(Clone)]
-pub struct XfrmObjectInstallRecoveryStore {
+pub struct XfrmSaRelocationRecoveryStore {
     inner: Arc<StoreInner>,
 }
 
@@ -726,7 +729,7 @@ struct StoreInner {
     root_inode: u64,
     root_owner: u32,
     owner_process_id: u32,
-    proof_key: XfrmObjectRecoveryProofKey,
+    proof_key: XfrmSaRelocationRecoveryProofKey,
     control: ControlRecord,
     process_lock: Mutex<()>,
 }
@@ -751,15 +754,15 @@ struct ControlRecord {
 impl ControlRecord {
     fn encode(
         self,
-        key: &XfrmObjectRecoveryProofKey,
-    ) -> Result<[u8; CONTROL_BYTES], XfrmObjectInstallDurableError> {
+        key: &XfrmSaRelocationRecoveryProofKey,
+    ) -> Result<[u8; CONTROL_BYTES], XfrmSaRelocationDurableError> {
         if self.store_incarnation.iter().all(|byte| *byte == 0)
             || self.namespace_seal.iter().all(|byte| *byte == 0)
             || self.actor_incarnation.iter().all(|byte| *byte == 0)
             || self.root_device == 0
             || self.root_inode == 0
         {
-            return Err(XfrmObjectInstallDurableError::Malformed);
+            return Err(XfrmSaRelocationDurableError::Malformed);
         }
         let mut encoded = [0_u8; CONTROL_BYTES];
         encoded[0..8].copy_from_slice(&CONTROL_MAGIC);
@@ -776,13 +779,16 @@ impl ControlRecord {
 
     fn decode(
         encoded: &[u8; CONTROL_BYTES],
-        key: &XfrmObjectRecoveryProofKey,
-    ) -> Result<Self, XfrmObjectInstallDurableError> {
+        key: &XfrmSaRelocationRecoveryProofKey,
+    ) -> Result<Self, XfrmSaRelocationDurableError> {
         if encoded[0..8] != CONTROL_MAGIC
             || encoded[8..10] != RECORD_VERSION.to_be_bytes()
             || encoded[10..16] != [0_u8; 6]
+            || encoded[96..CONTROL_BODY_BYTES]
+                .iter()
+                .any(|byte| *byte != 0)
         {
-            return Err(XfrmObjectInstallDurableError::Malformed);
+            return Err(XfrmSaRelocationDurableError::Malformed);
         }
         verify_authentication_domain(
             key,
@@ -803,7 +809,7 @@ impl ControlRecord {
             || control.root_device == 0
             || control.root_inode == 0
         {
-            return Err(XfrmObjectInstallDurableError::Malformed);
+            return Err(XfrmSaRelocationDurableError::Malformed);
         }
         Ok(control)
     }
@@ -818,8 +824,8 @@ struct EpochRecord {
 impl EpochRecord {
     fn encode(
         self,
-        key: &XfrmObjectRecoveryProofKey,
-    ) -> Result<[u8; EPOCH_BYTES], XfrmObjectInstallDurableError> {
+        key: &XfrmSaRelocationRecoveryProofKey,
+    ) -> Result<[u8; EPOCH_BYTES], XfrmSaRelocationDurableError> {
         let mut encoded = [0_u8; EPOCH_BYTES];
         encoded[0..8].copy_from_slice(&EPOCH_MAGIC);
         encoded[8..10].copy_from_slice(&RECORD_VERSION.to_be_bytes());
@@ -832,14 +838,14 @@ impl EpochRecord {
 
     fn decode(
         encoded: &[u8; EPOCH_BYTES],
-        key: &XfrmObjectRecoveryProofKey,
-    ) -> Result<Self, XfrmObjectInstallDurableError> {
+        key: &XfrmSaRelocationRecoveryProofKey,
+    ) -> Result<Self, XfrmSaRelocationDurableError> {
         if encoded[0..8] != EPOCH_MAGIC
             || encoded[8..10] != RECORD_VERSION.to_be_bytes()
             || encoded[10..16] != [0_u8; 6]
             || encoded[40..EPOCH_BODY_BYTES].iter().any(|byte| *byte != 0)
         {
-            return Err(XfrmObjectInstallDurableError::Malformed);
+            return Err(XfrmSaRelocationDurableError::Malformed);
         }
         verify_authentication_domain(
             key,
@@ -849,9 +855,9 @@ impl EpochRecord {
         )?;
         let store_incarnation = array_at(encoded, 16);
         let epoch =
-            NonZeroU64::new(u64_at(encoded, 32)).ok_or(XfrmObjectInstallDurableError::Malformed)?;
+            NonZeroU64::new(u64_at(encoded, 32)).ok_or(XfrmSaRelocationDurableError::Malformed)?;
         if store_incarnation.iter().all(|byte| *byte == 0) {
-            return Err(XfrmObjectInstallDurableError::Malformed);
+            return Err(XfrmSaRelocationDurableError::Malformed);
         }
         Ok(Self {
             store_incarnation,
@@ -871,41 +877,41 @@ struct Inventory {
     epoch: NonZeroU64,
 }
 
-type NamedDurableRecord = (String, DurableObjectRecord);
+type NamedDurableRecord = (String, DurableRelocationRecord);
 type ReconciledOperationRecords = (Vec<NamedDurableRecord>, Vec<String>);
 
 impl Inventory {
     fn has_unresolved_writer_authority(&self) -> bool {
-        self.records.iter().any(|(_, record)| {
-            matches!(
-                record.phase,
-                XfrmObjectInstallDurablePhase::Issuing
-                    | XfrmObjectInstallDurablePhase::Indeterminate
-                    | XfrmObjectInstallDurablePhase::Acquired
-                    | XfrmObjectInstallDurablePhase::RemovalAdmitted
-            )
+        self.records
+            .iter()
+            .any(|(_, record)| record.phase.is_unresolved_writer_authority())
+    }
+
+    fn has_unresolved_writer_authority_excluding(&self, excluded_name: &str) -> bool {
+        self.records.iter().any(|(name, record)| {
+            name != excluded_name && record.phase.is_unresolved_writer_authority()
         })
     }
 
     fn current_for(
         &self,
-        operation_id: XfrmObjectInstallOperationId,
-        generation: XfrmObjectInstallOperationGeneration,
-    ) -> Result<(&str, &DurableObjectRecord), XfrmObjectInstallDurableError> {
+        operation_id: XfrmSaRelocationOperationId,
+        generation: XfrmSaRelocationOperationGeneration,
+    ) -> Result<(&str, &DurableRelocationRecord), XfrmSaRelocationDurableError> {
         let mut matches = self.records.iter().filter(|(_, record)| {
             record.operation_id == operation_id && record.operation_generation == generation
         });
         let Some((name, record)) = matches.next() else {
-            return Err(XfrmObjectInstallDurableError::NotFound);
+            return Err(XfrmSaRelocationDurableError::NotFound);
         };
         if matches.next().is_some() {
-            return Err(XfrmObjectInstallDurableError::Duplicate);
+            return Err(XfrmSaRelocationDurableError::Duplicate);
         }
         Ok((name, record))
     }
 }
 
-impl XfrmObjectInstallRecoveryStore {
+impl XfrmSaRelocationRecoveryStore {
     /// Open or initialize a store through a namespace-bound backend.
     ///
     /// The root path must be absolute. If absent, it is created with mode
@@ -917,11 +923,11 @@ impl XfrmObjectInstallRecoveryStore {
     /// supplied by the sealed namespace actor.
     pub(crate) fn open_bound(
         path: &Path,
-        proof_key: XfrmObjectRecoveryProofKey,
+        proof_key: XfrmSaRelocationRecoveryProofKey,
         namespace_binding: [u8; 40],
-    ) -> Result<Self, XfrmObjectInstallDurableError> {
+    ) -> Result<Self, XfrmSaRelocationDurableError> {
         if !valid_store_path(path) {
-            return Err(XfrmObjectInstallDurableError::InvalidStoreRoot);
+            return Err(XfrmSaRelocationDurableError::InvalidStoreRoot);
         }
         create_root_if_absent(path)?;
         let descriptor = open(
@@ -930,15 +936,15 @@ impl XfrmObjectInstallRecoveryStore {
             Mode::empty(),
         )
         .map_err(map_root_open_error)?;
-        let metadata = fstat(&descriptor).map_err(|_| XfrmObjectInstallDurableError::Storage)?;
+        let metadata = fstat(&descriptor).map_err(|_| XfrmSaRelocationDurableError::Storage)?;
         validate_root_metadata(&metadata)?;
         let root_device = stat_device(&metadata)?;
         let root_inode = stat_inode(&metadata)?;
         flock(&descriptor, FlockOperation::NonBlockingLockExclusive).map_err(|error| {
             if error == rustix::io::Errno::WOULDBLOCK {
-                XfrmObjectInstallDurableError::StoreBusy
+                XfrmSaRelocationDurableError::StoreBusy
             } else {
-                XfrmObjectInstallDurableError::Storage
+                XfrmSaRelocationDurableError::Storage
             }
         })?;
         // Synchronize the containing directory even on reopen. This both
@@ -973,37 +979,37 @@ impl XfrmObjectInstallRecoveryStore {
         Ok(store)
     }
 
-    /// Persist a prepared operation before any backend mutation is admitted.
+    /// Persist a prepared relocation before any backend mutation is admitted.
     ///
     /// The fingerprints must be independent opaque, proof-keyed digests of
-    /// the exact kernel deletion identity and complete install request. A
+    /// the exact kernel deletion identity and complete relocation request. A
     /// duplicate active deletion identity is rejected globally. Any unresolved
-    /// `Issuing`, `Indeterminate`, `Acquired`, or `RemovalAdmitted` authority
+    /// `Prepared`, `Issuing`, `Indeterminate`, or `RemovalAdmitted` record
     /// blocks preparation so consumer bookkeeping/recovery remains ordered
     /// before every later cooperating writer.
+    ///
+    /// The exact operation-identity and active-deletion-identity duplicate
+    /// checks run before the unresolved-record gate, so replaying the exact
+    /// same operation and generation reports [`XfrmSaRelocationDurableError::Duplicate`]
+    /// even while that very record keeps the writer gate closed; a distinct
+    /// operation still reports [`XfrmSaRelocationDurableError::InvalidTransition`]
+    /// from the gate.
     pub(crate) fn prepare(
         &self,
-        operation_id: XfrmObjectInstallOperationId,
-        operation_generation: XfrmObjectInstallOperationGeneration,
-        object: XfrmInstallObject,
-        fingerprints: DurableObjectFingerprints,
-    ) -> Result<XfrmObjectInstallRecoveryHandle, XfrmObjectInstallDurableError> {
+        operation_id: XfrmSaRelocationOperationId,
+        operation_generation: XfrmSaRelocationOperationGeneration,
+        fingerprints: DurableRelocationFingerprints,
+    ) -> Result<XfrmSaRelocationRecoveryHandle, XfrmSaRelocationDurableError> {
         let lease = self.lease()?;
         let mut inventory = lease.inventory()?;
         if lease.prune_terminal_records(&inventory)? {
             inventory = lease.inventory()?;
         }
-        if inventory.has_unresolved_writer_authority() {
-            return Err(XfrmObjectInstallDurableError::InvalidTransition);
-        }
-        if inventory.records.len() >= MAX_ACTIVE_RECORDS {
-            return Err(XfrmObjectInstallDurableError::CapacityExceeded);
-        }
         if inventory.records.iter().any(|(_, record)| {
             record.operation_id == operation_id
                 && record.operation_generation == operation_generation
         }) {
-            return Err(XfrmObjectInstallDurableError::Duplicate);
+            return Err(XfrmSaRelocationDurableError::Duplicate);
         }
         if inventory.records.iter().any(|(_, record)| {
             fingerprints_equal(
@@ -1011,15 +1017,23 @@ impl XfrmObjectInstallRecoveryStore {
                 &fingerprints.deletion_identity,
             ) && !matches!(
                 record.phase,
-                XfrmObjectInstallDurablePhase::Retired | XfrmObjectInstallDurablePhase::Committed
+                XfrmSaRelocationDurablePhase::NoMutation
+                    | XfrmSaRelocationDurablePhase::Relocated
+                    | XfrmSaRelocationDurablePhase::StateAbsent
+                    | XfrmSaRelocationDurablePhase::Retired
             )
         }) {
-            return Err(XfrmObjectInstallDurableError::Duplicate);
+            return Err(XfrmSaRelocationDurableError::Duplicate);
+        }
+        if inventory.has_unresolved_writer_authority() {
+            return Err(XfrmSaRelocationDurableError::InvalidTransition);
+        }
+        if inventory.records.len() >= MAX_ACTIVE_RECORDS {
+            return Err(XfrmSaRelocationDurableError::CapacityExceeded);
         }
         let epoch = lease.current_epoch(&inventory)?;
-        let record = DurableObjectRecord {
-            phase: XfrmObjectInstallDurablePhase::Prepared,
-            object,
+        let record = DurableRelocationRecord {
+            phase: XfrmSaRelocationDurablePhase::Prepared,
             pre_effect_proof: None,
             store_incarnation: lease.store.control.store_incarnation,
             namespace_seal: lease.store.control.namespace_seal,
@@ -1028,61 +1042,62 @@ impl XfrmObjectInstallRecoveryStore {
             operation_generation,
             writer_epoch: epoch,
             deletion_identity_fingerprint: fingerprints.deletion_identity,
-            install_request_fingerprint: fingerprints.install_request,
+            relocation_request_fingerprint: fingerprints.relocation_request,
         };
         lease.publish_record(&record)?;
         record.handle(&lease.store.proof_key)
     }
 
     /// Compute independent keyed fingerprints of the exact removal identity
-    /// and complete install request without persisting either plaintext.
+    /// and complete relocation request without persisting either plaintext.
     pub(crate) fn fingerprints_for_request(
         &self,
-        request: &XfrmObjectInstallRequest,
-    ) -> Result<DurableObjectFingerprints, XfrmObjectInstallDurableError> {
-        let removal = request.removal();
-        validate_exact_lookup_mark(removal.lookup_mark(), "durable_object.install.mark")
-            .map_err(|_| XfrmObjectInstallDurableError::NonExactRemovalIdentity)?;
+        request: &RelocateSaRequest,
+    ) -> Result<DurableRelocationFingerprints, XfrmSaRelocationDurableError> {
+        validate_exact_lookup_mark(request.current.mark, "relocation.current.mark")
+            .map_err(|_| XfrmSaRelocationDurableError::NonExactRemovalIdentity)?;
         let lease = self.lease()?;
         let mut canonical = Zeroizing::new([0_u8; 64]);
-        let length = encode_deletion_identity(&removal, request.policy_if_id(), &mut canonical)?;
+        let length = encode_deletion_identity(request, &mut canonical);
         let deletion_identity = authenticate_domain(
             &lease.store.proof_key,
-            b"opc-xfrm-object-deletion-identity-v1\0",
+            DELETION_IDENTITY_AUTH_DOMAIN,
             &canonical[..length],
         )?;
-        let install_request = authenticate_install_request(&lease.store.proof_key, request)?;
-        Ok(DurableObjectFingerprints {
+        let relocation_request = authenticate_relocation_request(&lease.store.proof_key, request)?;
+        Ok(DurableRelocationFingerprints {
             deletion_identity,
-            install_request,
+            relocation_request,
         })
-    }
-
-    #[cfg(test)]
-    fn deletion_identity_fingerprint_with_policy_if_id(
-        &self,
-        removal: &XfrmObjectRemovalRequest,
-        policy_if_id: Option<u32>,
-    ) -> Result<[u8; 32], XfrmObjectInstallDurableError> {
-        validate_exact_lookup_mark(removal.lookup_mark(), "durable_object.install.mark")
-            .map_err(|_| XfrmObjectInstallDurableError::NonExactRemovalIdentity)?;
-        let lease = self.lease()?;
-        let mut canonical = Zeroizing::new([0_u8; 64]);
-        let length = encode_deletion_identity(removal, policy_if_id, &mut canonical)?;
-        authenticate_domain(
-            &lease.store.proof_key,
-            b"opc-xfrm-object-deletion-identity-v1\0",
-            &canonical[..length],
-        )
     }
 
     /// Inspect the authenticated current phase for a retained handle.
     ///
     /// The result is diagnostic state only and never cleanup authority.
+    ///
+    /// # Lease contention with the namespace actor
+    ///
+    /// Every store operation, including this read, holds the store's
+    /// process-local non-reentrant try-lock lease for its duration. The
+    /// namespace actor operates on a clone of this same open store, so an
+    /// `inspect` (or the crate-internal phase observation helper) held
+    /// concurrently with an in-flight admitted run contends for that one
+    /// lease. The actor's next lease acquisition then fails
+    /// [`XfrmSaRelocationDurableError::StoreBusy`] and the admitted run
+    /// aborts at that acquisition. Nothing beyond the contended step
+    /// happens; durable phase and backend effects already published before
+    /// it stand. If the contention lands on the terminal transition, for
+    /// example, the record remains `Issuing` and recovery reconciles it
+    /// through the pre-effect proof. Every such rejection is fail-closed
+    /// and retryable: recovery of the retained record followed by
+    /// re-preparation converges to the same operation. This is the
+    /// identical convention used by the released install store, whose
+    /// direct same-process reads contend the same way. Keep direct reads
+    /// short and outside admitted runs.
     pub fn inspect(
         &self,
-        handle: &XfrmObjectInstallRecoveryHandle,
-    ) -> Result<XfrmObjectInstallDurablePhase, XfrmObjectInstallDurableError> {
+        handle: &XfrmSaRelocationRecoveryHandle,
+    ) -> Result<XfrmSaRelocationDurablePhase, XfrmSaRelocationDurableError> {
         let lease = self.lease()?;
         let inventory = lease.inventory()?;
         Ok(lease.current_from_handle(&inventory, handle)?.1.phase)
@@ -1094,25 +1109,21 @@ impl XfrmObjectInstallRecoveryStore {
     /// the returned sealed record to bind a private live capability.
     pub(crate) fn restore(
         &self,
-        operation_id: XfrmObjectInstallOperationId,
-        operation_generation: XfrmObjectInstallOperationGeneration,
-        object: XfrmInstallObject,
-        fingerprints: DurableObjectFingerprints,
-    ) -> Result<DurableObjectRecord, XfrmObjectInstallDurableError> {
+        operation_id: XfrmSaRelocationOperationId,
+        operation_generation: XfrmSaRelocationOperationGeneration,
+        fingerprints: DurableRelocationFingerprints,
+    ) -> Result<DurableRelocationRecord, XfrmSaRelocationDurableError> {
         let lease = self.lease()?;
         let inventory = lease.inventory()?;
         let (_, record) = inventory.current_for(operation_id, operation_generation)?;
         lease.validate_record_binding(record)?;
-        if record.object != object || !record_matches_fingerprints(record, fingerprints) {
-            return Err(XfrmObjectInstallDurableError::WrongBinding);
+        if !record_matches_fingerprints(record, fingerprints) {
+            return Err(XfrmSaRelocationDurableError::WrongBinding);
         }
-        if matches!(
-            record.phase,
-            XfrmObjectInstallDurablePhase::Acquired
-                | XfrmObjectInstallDurablePhase::RemovalAdmitted
-        ) && record.writer_epoch != lease.current_epoch(&inventory)?
+        if record.phase == XfrmSaRelocationDurablePhase::RemovalAdmitted
+            && record.writer_epoch != lease.current_epoch(&inventory)?
         {
-            return Err(XfrmObjectInstallDurableError::Stale);
+            return Err(XfrmSaRelocationDurableError::Stale);
         }
         Ok(record.clone())
     }
@@ -1124,23 +1135,19 @@ impl XfrmObjectInstallRecoveryStore {
     /// transition is stale and cannot drive another transition.
     pub(crate) fn restore_handle(
         &self,
-        handle: &XfrmObjectInstallRecoveryHandle,
-        object: XfrmInstallObject,
-        fingerprints: DurableObjectFingerprints,
-    ) -> Result<DurableObjectRecord, XfrmObjectInstallDurableError> {
+        handle: &XfrmSaRelocationRecoveryHandle,
+        fingerprints: DurableRelocationFingerprints,
+    ) -> Result<DurableRelocationRecord, XfrmSaRelocationDurableError> {
         let lease = self.lease()?;
         let inventory = lease.inventory()?;
         let (_, record) = lease.current_from_handle(&inventory, handle)?;
-        if record.object != object || !record_matches_fingerprints(record, fingerprints) {
-            return Err(XfrmObjectInstallDurableError::WrongBinding);
+        if !record_matches_fingerprints(record, fingerprints) {
+            return Err(XfrmSaRelocationDurableError::WrongBinding);
         }
-        if matches!(
-            record.phase,
-            XfrmObjectInstallDurablePhase::Acquired
-                | XfrmObjectInstallDurablePhase::RemovalAdmitted
-        ) && record.writer_epoch != lease.current_epoch(&inventory)?
+        if record.phase == XfrmSaRelocationDurablePhase::RemovalAdmitted
+            && record.writer_epoch != lease.current_epoch(&inventory)?
         {
-            return Err(XfrmObjectInstallDurableError::Stale);
+            return Err(XfrmSaRelocationDurableError::Stale);
         }
         Ok(record.clone())
     }
@@ -1148,8 +1155,8 @@ impl XfrmObjectInstallRecoveryStore {
     /// Encode a live actor-validated record as an authenticated current handle.
     pub(crate) fn handle_for_record(
         &self,
-        record: &DurableObjectRecord,
-    ) -> Result<XfrmObjectInstallRecoveryHandle, XfrmObjectInstallDurableError> {
+        record: &DurableRelocationRecord,
+    ) -> Result<XfrmSaRelocationRecoveryHandle, XfrmSaRelocationDurableError> {
         let lease = self.lease()?;
         lease.validate_record_binding(record)?;
         record.handle(&lease.store.proof_key)
@@ -1162,51 +1169,50 @@ impl XfrmObjectInstallRecoveryStore {
     /// phase is published, and it is the sole transition that consumes a
     /// pre-effect proof: `pre_effect_proof` must be `Some` exactly for
     /// `Prepared -> Issuing` and `None` for every other transition, which
-    /// preserves the current record's proof. `Acquired` already excludes every
-    /// cooperating writer, so `RemovalAdmitted` is published at that same
-    /// current epoch; this avoids an ambiguous half-advanced epoch crash cut
-    /// before deletion.
+    /// preserves the current record's proof. The entering-`Issuing` gate
+    /// recheck excludes the transitioning record itself, so the sole
+    /// unresolved `Prepared` record can advance; every other unresolved
+    /// record still rejects the transition. `RemovalAdmitted` already holds
+    /// the writer gate, so it is published at that same current epoch before
+    /// deletion and has no ambiguous half-advanced epoch crash cut.
     pub(crate) fn transition(
         &self,
-        handle: &XfrmObjectInstallRecoveryHandle,
-        expected: XfrmObjectInstallDurablePhase,
-        next: XfrmObjectInstallDurablePhase,
-        pre_effect_proof: Option<XfrmObjectInstallPreEffectProof>,
-    ) -> Result<DurableObjectRecord, XfrmObjectInstallDurableError> {
+        handle: &XfrmSaRelocationRecoveryHandle,
+        expected: XfrmSaRelocationDurablePhase,
+        next: XfrmSaRelocationDurablePhase,
+        pre_effect_proof: Option<XfrmSaRelocationPreEffectProof>,
+    ) -> Result<DurableRelocationRecord, XfrmSaRelocationDurableError> {
         if !expected.permits(next) {
-            return Err(XfrmObjectInstallDurableError::InvalidTransition);
+            return Err(XfrmSaRelocationDurableError::InvalidTransition);
         }
-        let entering_issuing = expected == XfrmObjectInstallDurablePhase::Prepared
-            && next == XfrmObjectInstallDurablePhase::Issuing;
+        let entering_issuing = expected == XfrmSaRelocationDurablePhase::Prepared
+            && next == XfrmSaRelocationDurablePhase::Issuing;
         if entering_issuing != pre_effect_proof.is_some() {
-            return Err(XfrmObjectInstallDurableError::InvalidTransition);
+            return Err(XfrmSaRelocationDurableError::InvalidTransition);
         }
         let lease = self.lease()?;
         let inventory = lease.inventory()?;
         let (old_name, current) = lease.current_from_handle(&inventory, handle)?;
         if current.phase != expected {
-            return Err(XfrmObjectInstallDurableError::InvalidTransition);
+            return Err(XfrmSaRelocationDurableError::InvalidTransition);
         }
-        if next == XfrmObjectInstallDurablePhase::Issuing
-            && inventory.has_unresolved_writer_authority()
+        if next == XfrmSaRelocationDurablePhase::Issuing
+            && inventory.has_unresolved_writer_authority_excluding(old_name)
         {
-            return Err(XfrmObjectInstallDurableError::InvalidTransition);
+            return Err(XfrmSaRelocationDurableError::InvalidTransition);
         }
         let current_epoch = lease.current_epoch(&inventory)?;
-        if matches!(
-            expected,
-            XfrmObjectInstallDurablePhase::Acquired
-                | XfrmObjectInstallDurablePhase::RemovalAdmitted
-        ) && current.writer_epoch != current_epoch
+        if expected == XfrmSaRelocationDurablePhase::RemovalAdmitted
+            && current.writer_epoch != current_epoch
         {
-            return Err(XfrmObjectInstallDurableError::Stale);
+            return Err(XfrmSaRelocationDurableError::Stale);
         }
-        let writer_epoch = if next == XfrmObjectInstallDurablePhase::Issuing {
+        let writer_epoch = if next == XfrmSaRelocationDurablePhase::Issuing {
             lease.advance_epoch(&inventory)?
         } else {
             current.writer_epoch
         };
-        let next_record = DurableObjectRecord {
+        let next_record = DurableRelocationRecord {
             phase: next,
             writer_epoch,
             pre_effect_proof: if entering_issuing {
@@ -1221,51 +1227,37 @@ impl XfrmObjectInstallRecoveryStore {
         Ok(next_record)
     }
 
-    /// Report whether any record keeps the writer gate closed, without
-    /// mutating the store.
-    ///
-    /// The namespace actor uses this predicate for the cross-family
-    /// cooperating-writer gate: an unresolved `Issuing`, `Indeterminate`,
-    /// `Acquired`, or `RemovalAdmitted` record fences every cooperating SA
-    /// relocation admission until it is finalized or recovered.
-    pub(crate) fn has_unresolved_writer_authority(
-        &self,
-    ) -> Result<bool, XfrmObjectInstallDurableError> {
-        let lease = self.lease()?;
-        let inventory = lease.inventory()?;
-        Ok(inventory.records.iter().any(|(_, record)| {
-            matches!(
-                record.phase,
-                XfrmObjectInstallDurablePhase::Issuing
-                    | XfrmObjectInstallDurablePhase::Indeterminate
-                    | XfrmObjectInstallDurablePhase::Acquired
-                    | XfrmObjectInstallDurablePhase::RemovalAdmitted
-            )
-        }))
-    }
-
     /// Burn a fresh global epoch before an independently issued XFRM mutation.
     ///
-    /// The actor calls this for every mutation outside the staged-object flow;
-    /// even a later backend failure burns its epoch. The call is rejected while
-    /// any `Issuing`, `Indeterminate`, `Acquired`, or `RemovalAdmitted`
-    /// authority remains unresolved, so no cooperating replacement can race
-    /// consumer bookkeeping or cleanup.
-    pub(crate) fn advance_writer_epoch(&self) -> Result<NonZeroU64, XfrmObjectInstallDurableError> {
+    /// The actor calls this for every mutation outside the durable relocation
+    /// flow; even a later backend failure burns its epoch. The call is
+    /// rejected while any `Prepared`, `Issuing`, `Indeterminate`, or
+    /// `RemovalAdmitted` record remains unresolved, so no cooperating
+    /// replacement can race consumer bookkeeping or cleanup.
+    pub(crate) fn advance_writer_epoch(&self) -> Result<NonZeroU64, XfrmSaRelocationDurableError> {
         let lease = self.lease()?;
         let mut inventory = lease.inventory()?;
         if lease.prune_terminal_records(&inventory)? {
             inventory = lease.inventory()?;
         }
         if inventory.has_unresolved_writer_authority() {
-            return Err(XfrmObjectInstallDurableError::InvalidTransition);
+            return Err(XfrmSaRelocationDurableError::InvalidTransition);
         }
         lease.advance_epoch(&inventory)
     }
 
-    /// True only for clones sharing this exact open store lease.
-    pub(crate) fn is_same_instance(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.inner, &other.inner)
+    /// Report whether any record keeps the writer gate closed, without
+    /// mutating the store.
+    ///
+    /// The namespace actor uses this predicate for the cross-family
+    /// cooperating-writer gate: an unresolved relocation record fences every
+    /// cooperating install admission, and vice versa.
+    pub(crate) fn has_unresolved_writer_authority(
+        &self,
+    ) -> Result<bool, XfrmSaRelocationDurableError> {
+        let lease = self.lease()?;
+        let inventory = lease.inventory()?;
+        Ok(inventory.has_unresolved_writer_authority())
     }
 
     /// Report whether a restored record's writer epoch equals the store's
@@ -1277,25 +1269,30 @@ impl XfrmObjectInstallRecoveryStore {
     /// ordering guarantee and must be classified for repair, never deletion.
     pub(crate) fn record_writer_epoch_is_current(
         &self,
-        record: &DurableObjectRecord,
-    ) -> Result<bool, XfrmObjectInstallDurableError> {
+        record: &DurableRelocationRecord,
+    ) -> Result<bool, XfrmSaRelocationDurableError> {
         let lease = self.lease()?;
         let inventory = lease.inventory()?;
         lease.validate_record_binding(record)?;
         Ok(record.writer_epoch == lease.current_epoch(&inventory)?)
     }
 
-    fn lease(&self) -> Result<StoreLease<'_>, XfrmObjectInstallDurableError> {
+    /// True only for clones sharing this exact open store lease.
+    pub(crate) fn is_same_instance(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    fn lease(&self) -> Result<StoreLease<'_>, XfrmSaRelocationDurableError> {
         if self.inner.owner_process_id == 0 || self.inner.owner_process_id != std::process::id() {
-            return Err(XfrmObjectInstallDurableError::WrongIncarnation);
+            return Err(XfrmSaRelocationDurableError::WrongIncarnation);
         }
         let process_guard = self
             .inner
             .process_lock
             .try_lock()
             .map_err(|error| match error {
-                TryLockError::WouldBlock => XfrmObjectInstallDurableError::StoreBusy,
-                TryLockError::Poisoned(_) => XfrmObjectInstallDurableError::Storage,
+                TryLockError::WouldBlock => XfrmSaRelocationDurableError::StoreBusy,
+                TryLockError::Poisoned(_) => XfrmSaRelocationDurableError::Storage,
             })?;
         verify_visible_identity(&self.inner)?;
         Ok(StoreLease {
@@ -1305,64 +1302,64 @@ impl XfrmObjectInstallRecoveryStore {
     }
 }
 
-impl fmt::Debug for XfrmObjectInstallRecoveryStore {
+impl fmt::Debug for XfrmSaRelocationRecoveryStore {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("XfrmObjectInstallRecoveryStore(<redacted>)")
+        formatter.write_str("XfrmSaRelocationRecoveryStore(<redacted>)")
     }
 }
 
 impl StoreLease<'_> {
-    fn inventory(&self) -> Result<Inventory, XfrmObjectInstallDurableError> {
+    fn inventory(&self) -> Result<Inventory, XfrmSaRelocationDurableError> {
         verify_visible_identity(self.store)?;
         let mut control_count = 0_usize;
         let mut epochs = Vec::new();
         let mut records = Vec::new();
         let mut seen_names = BTreeMap::<String, ()>::new();
         let directory = Dir::read_from(&self.store.descriptor)
-            .map_err(|_| XfrmObjectInstallDurableError::Storage)?;
+            .map_err(|_| XfrmSaRelocationDurableError::Storage)?;
         for entry in directory {
-            let entry = entry.map_err(|_| XfrmObjectInstallDurableError::Storage)?;
+            let entry = entry.map_err(|_| XfrmSaRelocationDurableError::Storage)?;
             let raw_name = entry.file_name().to_bytes();
             if raw_name == b"." || raw_name == b".." {
                 continue;
             }
             if seen_names.len() >= MAX_STORE_ENTRIES {
-                return Err(XfrmObjectInstallDurableError::Malformed);
+                return Err(XfrmSaRelocationDurableError::Malformed);
             }
             let name = std::str::from_utf8(raw_name)
-                .map_err(|_| XfrmObjectInstallDurableError::Malformed)?
+                .map_err(|_| XfrmSaRelocationDurableError::Malformed)?
                 .to_owned();
             if seen_names.insert(name.clone(), ()).is_some() {
-                return Err(XfrmObjectInstallDurableError::Duplicate);
+                return Err(XfrmSaRelocationDurableError::Duplicate);
             }
             if name == CONTROL_NAME {
                 control_count += 1;
                 let encoded = read_fixed_file::<CONTROL_BYTES>(self.store, &name)?;
                 let control = ControlRecord::decode(&encoded, &self.store.proof_key)?;
                 if control != self.store.control {
-                    return Err(XfrmObjectInstallDurableError::WrongBinding);
+                    return Err(XfrmSaRelocationDurableError::WrongBinding);
                 }
                 continue;
             }
             if name.starts_with("epoch-") {
                 let expected_epoch =
-                    parse_epoch_name(&name).ok_or(XfrmObjectInstallDurableError::Malformed)?;
+                    parse_epoch_name(&name).ok_or(XfrmSaRelocationDurableError::Malformed)?;
                 let encoded = read_fixed_file::<EPOCH_BYTES>(self.store, &name)?;
                 let decoded = EpochRecord::decode(&encoded, &self.store.proof_key)?;
                 if decoded.store_incarnation != self.store.control.store_incarnation {
-                    return Err(XfrmObjectInstallDurableError::WrongBinding);
+                    return Err(XfrmSaRelocationDurableError::WrongBinding);
                 }
                 if decoded.epoch != expected_epoch || name != epoch_name(decoded.epoch) {
-                    return Err(XfrmObjectInstallDurableError::Malformed);
+                    return Err(XfrmSaRelocationDurableError::Malformed);
                 }
                 epochs.push((name, decoded));
                 continue;
             }
             let parsed = parse_record_name(OsStr::from_bytes(raw_name))
-                .ok_or(XfrmObjectInstallDurableError::Malformed)?;
+                .ok_or(XfrmSaRelocationDurableError::Malformed)?;
             let encoded =
-                read_fixed_file::<XFRM_OBJECT_INSTALL_RECOVERY_HANDLE_BYTES>(self.store, &name)?;
-            let record = DurableObjectRecord::decode(&encoded, &self.store.proof_key)?;
+                read_fixed_file::<XFRM_SA_RELOCATION_RECOVERY_HANDLE_BYTES>(self.store, &name)?;
+            let record = DurableRelocationRecord::decode(&encoded, &self.store.proof_key)?;
             if parsed
                 != (
                     record.phase,
@@ -1371,16 +1368,16 @@ impl StoreLease<'_> {
                 )
                 || name != record_name(&record)
             {
-                return Err(XfrmObjectInstallDurableError::Malformed);
+                return Err(XfrmSaRelocationDurableError::Malformed);
             }
             self.validate_record_binding(&record)?;
             records.push((name, record));
         }
         if control_count != 1 {
             return Err(if control_count > 1 {
-                XfrmObjectInstallDurableError::Duplicate
+                XfrmSaRelocationDurableError::Duplicate
             } else {
-                XfrmObjectInstallDurableError::Malformed
+                XfrmSaRelocationDurableError::Malformed
             });
         }
         // Decide every recovery action before removing any entry. Arbitrary
@@ -1390,7 +1387,7 @@ impl StoreLease<'_> {
         let (epoch_name, epoch, obsolete_epoch) = classify_epoch_records(epochs)?;
         let (records, obsolete_records) = classify_operation_records(records, epoch)?;
         validate_unique_active_deletion_identities(&records)?;
-        validate_single_cleanup_authority(&records)?;
+        validate_single_unresolved_authority(&records)?;
         if let Some(name) = obsolete_epoch {
             self.remove_epoch(&name)?;
         }
@@ -1406,15 +1403,15 @@ impl StoreLease<'_> {
 
     fn validate_record_binding(
         &self,
-        record: &DurableObjectRecord,
-    ) -> Result<(), XfrmObjectInstallDurableError> {
+        record: &DurableRelocationRecord,
+    ) -> Result<(), XfrmSaRelocationDurableError> {
         if record.store_incarnation != self.store.control.store_incarnation
             || record.namespace_seal != self.store.control.namespace_seal
         {
-            return Err(XfrmObjectInstallDurableError::WrongBinding);
+            return Err(XfrmSaRelocationDurableError::WrongBinding);
         }
         if record.actor_incarnation != self.store.control.actor_incarnation {
-            return Err(XfrmObjectInstallDurableError::WrongIncarnation);
+            return Err(XfrmSaRelocationDurableError::WrongIncarnation);
         }
         Ok(())
     }
@@ -1422,14 +1419,13 @@ impl StoreLease<'_> {
     fn current_from_handle<'a>(
         &self,
         inventory: &'a Inventory,
-        handle: &XfrmObjectInstallRecoveryHandle,
-    ) -> Result<(&'a str, &'a DurableObjectRecord), XfrmObjectInstallDurableError> {
-        let correlation = DurableObjectRecord::decode(&handle.0, &self.store.proof_key)?;
+        handle: &XfrmSaRelocationRecoveryHandle,
+    ) -> Result<(&'a str, &'a DurableRelocationRecord), XfrmSaRelocationDurableError> {
+        let correlation = DurableRelocationRecord::decode(&handle.0, &self.store.proof_key)?;
         self.validate_record_binding(&correlation)?;
         let (name, current) =
             inventory.current_for(correlation.operation_id, correlation.operation_generation)?;
-        if current.object != correlation.object
-            || current.store_incarnation != correlation.store_incarnation
+        if current.store_incarnation != correlation.store_incarnation
             || current.namespace_seal != correlation.namespace_seal
             || current.actor_incarnation != correlation.actor_incarnation
             || !fingerprints_equal(
@@ -1437,14 +1433,14 @@ impl StoreLease<'_> {
                 &correlation.deletion_identity_fingerprint,
             )
             || !fingerprints_equal(
-                &current.install_request_fingerprint,
-                &correlation.install_request_fingerprint,
+                &current.relocation_request_fingerprint,
+                &correlation.relocation_request_fingerprint,
             )
         {
-            return Err(XfrmObjectInstallDurableError::WrongBinding);
+            return Err(XfrmSaRelocationDurableError::WrongBinding);
         }
         if current.phase != correlation.phase || current.writer_epoch != correlation.writer_epoch {
-            return Err(XfrmObjectInstallDurableError::Stale);
+            return Err(XfrmSaRelocationDurableError::Stale);
         }
         Ok((name, current))
     }
@@ -1452,14 +1448,14 @@ impl StoreLease<'_> {
     fn current_epoch(
         &self,
         inventory: &Inventory,
-    ) -> Result<NonZeroU64, XfrmObjectInstallDurableError> {
+    ) -> Result<NonZeroU64, XfrmSaRelocationDurableError> {
         Ok(inventory.epoch)
     }
 
     fn publish_record(
         &self,
-        record: &DurableObjectRecord,
-    ) -> Result<(), XfrmObjectInstallDurableError> {
+        record: &DurableRelocationRecord,
+    ) -> Result<(), XfrmSaRelocationDurableError> {
         self.validate_record_binding(record)?;
         let name = record_name(record);
         let bytes = record.encode(&self.store.proof_key)?;
@@ -1469,13 +1465,13 @@ impl StoreLease<'_> {
     fn advance_epoch(
         &self,
         inventory: &Inventory,
-    ) -> Result<NonZeroU64, XfrmObjectInstallDurableError> {
+    ) -> Result<NonZeroU64, XfrmSaRelocationDurableError> {
         let epoch = inventory
             .epoch
             .get()
             .checked_add(1)
             .and_then(NonZeroU64::new)
-            .ok_or(XfrmObjectInstallDurableError::Stale)?;
+            .ok_or(XfrmSaRelocationDurableError::Stale)?;
         let record = EpochRecord {
             store_incarnation: self.store.control.store_incarnation,
             epoch,
@@ -1493,15 +1489,17 @@ impl StoreLease<'_> {
     fn prune_terminal_records(
         &self,
         inventory: &Inventory,
-    ) -> Result<bool, XfrmObjectInstallDurableError> {
+    ) -> Result<bool, XfrmSaRelocationDurableError> {
         let names = inventory
             .records
             .iter()
             .filter(|(_, record)| {
                 matches!(
                     record.phase,
-                    XfrmObjectInstallDurablePhase::Retired
-                        | XfrmObjectInstallDurablePhase::Committed
+                    XfrmSaRelocationDurablePhase::NoMutation
+                        | XfrmSaRelocationDurablePhase::Relocated
+                        | XfrmSaRelocationDurablePhase::StateAbsent
+                        | XfrmSaRelocationDurablePhase::Retired
                 )
             })
             .map(|(name, _)| name.clone())
@@ -1512,32 +1510,32 @@ impl StoreLease<'_> {
         Ok(!names.is_empty())
     }
 
-    fn remove_epoch(&self, name: &str) -> Result<(), XfrmObjectInstallDurableError> {
-        parse_epoch_name(name).ok_or(XfrmObjectInstallDurableError::Malformed)?;
+    fn remove_epoch(&self, name: &str) -> Result<(), XfrmSaRelocationDurableError> {
+        parse_epoch_name(name).ok_or(XfrmSaRelocationDurableError::Malformed)?;
         unlinkat(self.store.descriptor.as_fd(), name, AtFlags::empty())
-            .map_err(|_| XfrmObjectInstallDurableError::Storage)?;
-        fsync(&self.store.descriptor).map_err(|_| XfrmObjectInstallDurableError::Storage)?;
+            .map_err(|_| XfrmSaRelocationDurableError::Storage)?;
+        fsync(&self.store.descriptor).map_err(|_| XfrmSaRelocationDurableError::Storage)?;
         Ok(())
     }
 
-    fn remove_record(&self, name: &str) -> Result<(), XfrmObjectInstallDurableError> {
+    fn remove_record(&self, name: &str) -> Result<(), XfrmSaRelocationDurableError> {
         validate_record_name(OsStr::new(name))?;
         unlinkat(self.store.descriptor.as_fd(), name, AtFlags::empty())
-            .map_err(|_| XfrmObjectInstallDurableError::Storage)?;
-        fsync(&self.store.descriptor).map_err(|_| XfrmObjectInstallDurableError::Storage)?;
+            .map_err(|_| XfrmSaRelocationDurableError::Storage)?;
+        fsync(&self.store.descriptor).map_err(|_| XfrmSaRelocationDurableError::Storage)?;
         Ok(())
     }
 }
 
 fn classify_epoch_records(
     mut epochs: Vec<(String, EpochRecord)>,
-) -> Result<(String, NonZeroU64, Option<String>), XfrmObjectInstallDurableError> {
+) -> Result<(String, NonZeroU64, Option<String>), XfrmSaRelocationDurableError> {
     match epochs.len() {
-        0 => Err(XfrmObjectInstallDurableError::Malformed),
+        0 => Err(XfrmSaRelocationDurableError::Malformed),
         1 => {
             let (name, record) = epochs
                 .pop()
-                .ok_or(XfrmObjectInstallDurableError::Malformed)?;
+                .ok_or(XfrmSaRelocationDurableError::Malformed)?;
             Ok((name, record.epoch, None))
         }
         2 => {
@@ -1547,18 +1545,18 @@ fn classify_epoch_records(
             if lower.store_incarnation != upper.store_incarnation
                 || lower.epoch.get().checked_add(1) != Some(upper.epoch.get())
             {
-                return Err(XfrmObjectInstallDurableError::Duplicate);
+                return Err(XfrmSaRelocationDurableError::Duplicate);
             }
             Ok((upper_name, upper.epoch, Some(lower_name)))
         }
-        _ => Err(XfrmObjectInstallDurableError::Duplicate),
+        _ => Err(XfrmSaRelocationDurableError::Duplicate),
     }
 }
 
 fn classify_operation_records(
     records: Vec<NamedDurableRecord>,
     current_epoch: NonZeroU64,
-) -> Result<ReconciledOperationRecords, XfrmObjectInstallDurableError> {
+) -> Result<ReconciledOperationRecords, XfrmSaRelocationDurableError> {
     let mut groups = BTreeMap::<([u8; 16], u64), Vec<NamedDurableRecord>>::new();
     for entry in records {
         groups
@@ -1570,30 +1568,22 @@ fn classify_operation_records(
     let mut obsolete = Vec::new();
     for mut group in groups.into_values() {
         match group.len() {
-            1 => current.push(
-                group
-                    .pop()
-                    .ok_or(XfrmObjectInstallDurableError::Malformed)?,
-            ),
+            1 => current.push(group.pop().ok_or(XfrmSaRelocationDurableError::Malformed)?),
             2 => {
-                let right = group
-                    .pop()
-                    .ok_or(XfrmObjectInstallDurableError::Duplicate)?;
-                let left = group
-                    .pop()
-                    .ok_or(XfrmObjectInstallDurableError::Duplicate)?;
+                let right = group.pop().ok_or(XfrmSaRelocationDurableError::Duplicate)?;
+                let left = group.pop().ok_or(XfrmSaRelocationDurableError::Duplicate)?;
                 let (old, next) =
                     if is_exact_publication_successor(&left.1, &right.1, current_epoch) {
                         (left, right)
                     } else if is_exact_publication_successor(&right.1, &left.1, current_epoch) {
                         (right, left)
                     } else {
-                        return Err(XfrmObjectInstallDurableError::Duplicate);
+                        return Err(XfrmSaRelocationDurableError::Duplicate);
                     };
                 obsolete.push(old.0);
                 current.push(next);
             }
-            _ => return Err(XfrmObjectInstallDurableError::Duplicate),
+            _ => return Err(XfrmSaRelocationDurableError::Duplicate),
         }
     }
     Ok((current, obsolete))
@@ -1601,59 +1591,59 @@ fn classify_operation_records(
 
 fn validate_unique_active_deletion_identities(
     records: &[NamedDurableRecord],
-) -> Result<(), XfrmObjectInstallDurableError> {
+) -> Result<(), XfrmSaRelocationDurableError> {
     for (index, (_, left)) in records.iter().enumerate() {
         if matches!(
             left.phase,
-            XfrmObjectInstallDurablePhase::Retired | XfrmObjectInstallDurablePhase::Committed
+            XfrmSaRelocationDurablePhase::NoMutation
+                | XfrmSaRelocationDurablePhase::Relocated
+                | XfrmSaRelocationDurablePhase::StateAbsent
+                | XfrmSaRelocationDurablePhase::Retired
         ) {
             continue;
         }
         if records[index + 1..].iter().any(|(_, right)| {
             !matches!(
                 right.phase,
-                XfrmObjectInstallDurablePhase::Retired | XfrmObjectInstallDurablePhase::Committed
+                XfrmSaRelocationDurablePhase::NoMutation
+                    | XfrmSaRelocationDurablePhase::Relocated
+                    | XfrmSaRelocationDurablePhase::StateAbsent
+                    | XfrmSaRelocationDurablePhase::Retired
             ) && fingerprints_equal(
                 &left.deletion_identity_fingerprint,
                 &right.deletion_identity_fingerprint,
             )
         }) {
-            return Err(XfrmObjectInstallDurableError::Duplicate);
+            return Err(XfrmSaRelocationDurableError::Duplicate);
         }
     }
     Ok(())
 }
 
-fn validate_single_cleanup_authority(
+fn validate_single_unresolved_authority(
     records: &[NamedDurableRecord],
-) -> Result<(), XfrmObjectInstallDurableError> {
+) -> Result<(), XfrmSaRelocationDurableError> {
+    // Because preparation is rejected while any record is unresolved and the
+    // entering-`Issuing` transition re-checks the gate, one store can
+    // legitimately hold at most one unresolved relocation authority.
     if records
         .iter()
-        .filter(|(_, record)| {
-            matches!(
-                record.phase,
-                XfrmObjectInstallDurablePhase::Issuing
-                    | XfrmObjectInstallDurablePhase::Indeterminate
-                    | XfrmObjectInstallDurablePhase::Acquired
-                    | XfrmObjectInstallDurablePhase::RemovalAdmitted
-            )
-        })
+        .filter(|(_, record)| record.phase.is_unresolved_writer_authority())
         .take(2)
         .count()
         > 1
     {
-        return Err(XfrmObjectInstallDurableError::Duplicate);
+        return Err(XfrmSaRelocationDurableError::Duplicate);
     }
     Ok(())
 }
 
 fn is_exact_publication_successor(
-    old: &DurableObjectRecord,
-    next: &DurableObjectRecord,
+    old: &DurableRelocationRecord,
+    next: &DurableRelocationRecord,
     current_epoch: NonZeroU64,
 ) -> bool {
     if !old.phase.permits(next.phase)
-        || old.object != next.object
         || old.store_incarnation != next.store_incarnation
         || old.namespace_seal != next.namespace_seal
         || old.actor_incarnation != next.actor_incarnation
@@ -1664,8 +1654,8 @@ fn is_exact_publication_successor(
             &next.deletion_identity_fingerprint,
         )
         || !fingerprints_equal(
-            &old.install_request_fingerprint,
-            &next.install_request_fingerprint,
+            &old.relocation_request_fingerprint,
+            &next.relocation_request_fingerprint,
         )
     {
         return false;
@@ -1673,8 +1663,8 @@ fn is_exact_publication_successor(
     // Only `Prepared -> Issuing` witnesses the pre-effect proof; every other
     // transition preserves it. A successor that invents or drops a proof on
     // any other edge is not an exact publication of this state machine.
-    let entering_issuing = old.phase == XfrmObjectInstallDurablePhase::Prepared
-        && next.phase == XfrmObjectInstallDurablePhase::Issuing;
+    let entering_issuing = old.phase == XfrmSaRelocationDurablePhase::Prepared
+        && next.phase == XfrmSaRelocationDurablePhase::Issuing;
     let proof_ok = if entering_issuing {
         old.pre_effect_proof.is_none() && next.pre_effect_proof.is_some()
     } else {
@@ -1683,20 +1673,20 @@ fn is_exact_publication_successor(
     if !proof_ok {
         return false;
     }
-    if next.phase == XfrmObjectInstallDurablePhase::Issuing {
+    if next.phase == XfrmSaRelocationDurablePhase::Issuing {
         next.writer_epoch == current_epoch && next.writer_epoch > old.writer_epoch
     } else {
         next.writer_epoch == old.writer_epoch
     }
 }
 
-fn create_root_if_absent(path: &Path) -> Result<(), XfrmObjectInstallDurableError> {
+fn create_root_if_absent(path: &Path) -> Result<(), XfrmSaRelocationDurableError> {
     let mut builder = std::fs::DirBuilder::new();
     builder.mode(DIRECTORY_MODE);
     match builder.create(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
-        Err(_) => Err(XfrmObjectInstallDurableError::Storage),
+        Err(_) => Err(XfrmSaRelocationDurableError::Storage),
     }
 }
 
@@ -1711,16 +1701,13 @@ fn valid_store_path(path: &Path) -> bool {
             .all(|component| matches!(component, Component::RootDir | Component::Normal(_)))
 }
 
-fn sync_store_root_parent(
-    path: &Path,
-    root: &OwnedFd,
-) -> Result<(), XfrmObjectInstallDurableError> {
+fn sync_store_root_parent(path: &Path, root: &OwnedFd) -> Result<(), XfrmSaRelocationDurableError> {
     let parent = path
         .parent()
-        .ok_or(XfrmObjectInstallDurableError::InvalidStoreRoot)?;
+        .ok_or(XfrmSaRelocationDurableError::InvalidStoreRoot)?;
     let child_name = path
         .file_name()
-        .ok_or(XfrmObjectInstallDurableError::InvalidStoreRoot)?;
+        .ok_or(XfrmSaRelocationDurableError::InvalidStoreRoot)?;
     let parent_descriptor = open(
         parent,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
@@ -1728,14 +1715,14 @@ fn sync_store_root_parent(
     )
     .map_err(map_root_open_error)?;
     let parent_metadata =
-        fstat(&parent_descriptor).map_err(|_| XfrmObjectInstallDurableError::Storage)?;
+        fstat(&parent_descriptor).map_err(|_| XfrmSaRelocationDurableError::Storage)?;
     let parent_is_untrusted_writable =
         parent_metadata.st_mode & 0o022 != 0 && parent_metadata.st_mode & 0o1000 == 0;
     if !FileType::from_raw_mode(parent_metadata.st_mode).is_dir()
         || parent_metadata.st_nlink == 0
         || parent_is_untrusted_writable
     {
-        return Err(XfrmObjectInstallDurableError::InvalidStoreRoot);
+        return Err(XfrmSaRelocationDurableError::InvalidStoreRoot);
     }
 
     let reopened = openat(
@@ -1745,40 +1732,38 @@ fn sync_store_root_parent(
         Mode::empty(),
     )
     .map_err(map_root_open_error)?;
-    let expected = fstat(root).map_err(|_| XfrmObjectInstallDurableError::Storage)?;
-    let observed = fstat(&reopened).map_err(|_| XfrmObjectInstallDurableError::Storage)?;
+    let expected = fstat(root).map_err(|_| XfrmSaRelocationDurableError::Storage)?;
+    let observed = fstat(&reopened).map_err(|_| XfrmSaRelocationDurableError::Storage)?;
     validate_root_metadata(&observed)?;
     if expected.st_dev != observed.st_dev || expected.st_ino != observed.st_ino {
-        return Err(XfrmObjectInstallDurableError::InvalidStoreRoot);
+        return Err(XfrmSaRelocationDurableError::InvalidStoreRoot);
     }
-    fsync(&parent_descriptor).map_err(|_| XfrmObjectInstallDurableError::Storage)
+    fsync(&parent_descriptor).map_err(|_| XfrmSaRelocationDurableError::Storage)
 }
 
-fn validate_root_metadata(
-    metadata: &rustix::fs::Stat,
-) -> Result<(), XfrmObjectInstallDurableError> {
+fn validate_root_metadata(metadata: &rustix::fs::Stat) -> Result<(), XfrmSaRelocationDurableError> {
     if !FileType::from_raw_mode(metadata.st_mode).is_dir()
         || metadata.st_uid != rustix::process::geteuid().as_raw()
         || metadata.st_mode.store_permissions() != DIRECTORY_MODE
         || metadata.st_nlink == 0
     {
-        return Err(XfrmObjectInstallDurableError::InvalidStoreRoot);
+        return Err(XfrmSaRelocationDurableError::InvalidStoreRoot);
     }
     Ok(())
 }
 
-fn stat_device(metadata: &rustix::fs::Stat) -> Result<u64, XfrmObjectInstallDurableError> {
+fn stat_device(metadata: &rustix::fs::Stat) -> Result<u64, XfrmSaRelocationDurableError> {
     metadata
         .st_dev
         .store_identity()
-        .ok_or(XfrmObjectInstallDurableError::InvalidStoreRoot)
+        .ok_or(XfrmSaRelocationDurableError::InvalidStoreRoot)
 }
 
-fn stat_inode(metadata: &rustix::fs::Stat) -> Result<u64, XfrmObjectInstallDurableError> {
+fn stat_inode(metadata: &rustix::fs::Stat) -> Result<u64, XfrmSaRelocationDurableError> {
     metadata
         .st_ino
         .store_identity()
-        .ok_or(XfrmObjectInstallDurableError::InvalidStoreRoot)
+        .ok_or(XfrmSaRelocationDurableError::InvalidStoreRoot)
 }
 
 trait StoreIdentityValue {
@@ -1825,17 +1810,17 @@ impl StoreModeValue for u16 {
     }
 }
 
-fn map_root_open_error(error: rustix::io::Errno) -> XfrmObjectInstallDurableError {
+fn map_root_open_error(error: rustix::io::Errno) -> XfrmSaRelocationDurableError {
     if matches!(error, rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR) {
-        XfrmObjectInstallDurableError::InvalidStoreRoot
+        XfrmSaRelocationDurableError::InvalidStoreRoot
     } else {
-        XfrmObjectInstallDurableError::Storage
+        XfrmSaRelocationDurableError::Storage
     }
 }
 
-fn verify_visible_identity(store: &StoreInner) -> Result<(), XfrmObjectInstallDurableError> {
+fn verify_visible_identity(store: &StoreInner) -> Result<(), XfrmSaRelocationDurableError> {
     if store.owner_process_id != std::process::id() {
-        return Err(XfrmObjectInstallDurableError::WrongIncarnation);
+        return Err(XfrmSaRelocationDurableError::WrongIncarnation);
     }
     let visible = open(
         &store.visible_path,
@@ -1843,13 +1828,13 @@ fn verify_visible_identity(store: &StoreInner) -> Result<(), XfrmObjectInstallDu
         Mode::empty(),
     )
     .map_err(map_root_open_error)?;
-    let metadata = fstat(&visible).map_err(|_| XfrmObjectInstallDurableError::Storage)?;
+    let metadata = fstat(&visible).map_err(|_| XfrmSaRelocationDurableError::Storage)?;
     validate_root_metadata(&metadata)?;
     if stat_device(&metadata)? != store.root_device
         || stat_inode(&metadata)? != store.root_inode
         || metadata.st_uid != store.root_owner
     {
-        return Err(XfrmObjectInstallDurableError::InvalidStoreRoot);
+        return Err(XfrmSaRelocationDurableError::InvalidStoreRoot);
     }
     Ok(())
 }
@@ -1857,7 +1842,7 @@ fn verify_visible_identity(store: &StoreInner) -> Result<(), XfrmObjectInstallDu
 fn initialize_or_load_control(
     store: &StoreInner,
     namespace_seal: [u8; 32],
-) -> Result<ControlRecord, XfrmObjectInstallDurableError> {
+) -> Result<ControlRecord, XfrmSaRelocationDurableError> {
     verify_visible_identity(store)?;
     cleanup_interrupted_publications(store)?;
     let names = scan_raw_names(store)?;
@@ -1872,7 +1857,7 @@ fn initialize_or_load_control(
         publish_new_file(store, CONTROL_NAME, &control.encode(&store.proof_key)?)?;
         let epoch = EpochRecord {
             store_incarnation: control.store_incarnation,
-            epoch: NonZeroU64::new(1).ok_or(XfrmObjectInstallDurableError::Malformed)?,
+            epoch: NonZeroU64::new(1).ok_or(XfrmSaRelocationDurableError::Malformed)?,
         };
         publish_new_file(
             store,
@@ -1882,7 +1867,7 @@ fn initialize_or_load_control(
         return Ok(control);
     }
     if !names.iter().any(|name| name == CONTROL_NAME) {
-        return Err(XfrmObjectInstallDurableError::Malformed);
+        return Err(XfrmSaRelocationDurableError::Malformed);
     }
     let encoded = read_fixed_file::<CONTROL_BYTES>(store, CONTROL_NAME)?;
     let control = ControlRecord::decode(&encoded, &store.proof_key)?;
@@ -1890,7 +1875,7 @@ fn initialize_or_load_control(
         || control.root_device != store.root_device
         || control.root_inode != store.root_inode
     {
-        return Err(XfrmObjectInstallDurableError::WrongBinding);
+        return Err(XfrmSaRelocationDurableError::WrongBinding);
     }
     // First initialization publishes `control` before epoch 1. A process loss
     // between those two fsyncs leaves this one exact, authenticated safe
@@ -1900,7 +1885,7 @@ fn initialize_or_load_control(
     if names.len() == 1 {
         let epoch = EpochRecord {
             store_incarnation: control.store_incarnation,
-            epoch: NonZeroU64::new(1).ok_or(XfrmObjectInstallDurableError::Malformed)?,
+            epoch: NonZeroU64::new(1).ok_or(XfrmSaRelocationDurableError::Malformed)?,
         };
         publish_new_file(
             store,
@@ -1911,22 +1896,22 @@ fn initialize_or_load_control(
     Ok(control)
 }
 
-fn scan_raw_names(store: &StoreInner) -> Result<Vec<String>, XfrmObjectInstallDurableError> {
+fn scan_raw_names(store: &StoreInner) -> Result<Vec<String>, XfrmSaRelocationDurableError> {
     let directory =
-        Dir::read_from(&store.descriptor).map_err(|_| XfrmObjectInstallDurableError::Storage)?;
+        Dir::read_from(&store.descriptor).map_err(|_| XfrmSaRelocationDurableError::Storage)?;
     let mut names = Vec::new();
     for entry in directory {
-        let entry = entry.map_err(|_| XfrmObjectInstallDurableError::Storage)?;
+        let entry = entry.map_err(|_| XfrmSaRelocationDurableError::Storage)?;
         let name = entry.file_name().to_bytes();
         if name == b"." || name == b".." {
             continue;
         }
         if names.len() >= MAX_STORE_ENTRIES {
-            return Err(XfrmObjectInstallDurableError::Malformed);
+            return Err(XfrmSaRelocationDurableError::Malformed);
         }
         names.push(
             std::str::from_utf8(name)
-                .map_err(|_| XfrmObjectInstallDurableError::Malformed)?
+                .map_err(|_| XfrmSaRelocationDurableError::Malformed)?
                 .to_owned(),
         );
     }
@@ -1938,7 +1923,7 @@ fn scan_raw_names(store: &StoreInner) -> Result<Vec<String>, XfrmObjectInstallDu
 /// fail-closed; the store root is a trusted, permanently leased directory.
 fn cleanup_interrupted_publications(
     store: &StoreInner,
-) -> Result<(), XfrmObjectInstallDurableError> {
+) -> Result<(), XfrmSaRelocationDurableError> {
     let names = scan_raw_names(store)?;
     let mut removed = false;
     for name in names {
@@ -1951,24 +1936,24 @@ fn cleanup_interrupted_publications(
             OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
         )
-        .map_err(|_| XfrmObjectInstallDurableError::Malformed)?;
-        let metadata = fstat(&descriptor).map_err(|_| XfrmObjectInstallDurableError::Storage)?;
+        .map_err(|_| XfrmSaRelocationDurableError::Malformed)?;
+        let metadata = fstat(&descriptor).map_err(|_| XfrmSaRelocationDurableError::Storage)?;
         if !FileType::from_raw_mode(metadata.st_mode).is_file()
             || stat_device(&metadata)? != store.root_device
             || metadata.st_uid != store.root_owner
             || metadata.st_mode.store_permissions() != FILE_MODE
             || metadata.st_nlink != 1
             || metadata.st_size < 0
-            || metadata.st_size > XFRM_OBJECT_INSTALL_RECOVERY_HANDLE_BYTES as i64
+            || metadata.st_size > XFRM_SA_RELOCATION_RECOVERY_HANDLE_BYTES as i64
         {
-            return Err(XfrmObjectInstallDurableError::Malformed);
+            return Err(XfrmSaRelocationDurableError::Malformed);
         }
         unlinkat(store.descriptor.as_fd(), name.as_str(), AtFlags::empty())
-            .map_err(|_| XfrmObjectInstallDurableError::Storage)?;
+            .map_err(|_| XfrmSaRelocationDurableError::Storage)?;
         removed = true;
     }
     if removed {
-        fsync(&store.descriptor).map_err(|_| XfrmObjectInstallDurableError::Storage)?;
+        fsync(&store.descriptor).map_err(|_| XfrmSaRelocationDurableError::Storage)?;
     }
     Ok(())
 }
@@ -1976,26 +1961,26 @@ fn cleanup_interrupted_publications(
 fn read_fixed_file<const N: usize>(
     store: &StoreInner,
     name: &str,
-) -> Result<[u8; N], XfrmObjectInstallDurableError> {
+) -> Result<[u8; N], XfrmSaRelocationDurableError> {
     let descriptor = openat(
         store.descriptor.as_fd(),
         name,
         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     )
-    .map_err(|_| XfrmObjectInstallDurableError::Malformed)?;
+    .map_err(|_| XfrmSaRelocationDurableError::Malformed)?;
     validate_file_metadata(store, &descriptor, N)?;
     let mut file = std::fs::File::from(descriptor);
     let mut bytes = [0_u8; N];
     file.read_exact(&mut bytes)
-        .map_err(|_| XfrmObjectInstallDurableError::Malformed)?;
+        .map_err(|_| XfrmSaRelocationDurableError::Malformed)?;
     let mut trailing = [0_u8; 1];
     if file
         .read(&mut trailing)
-        .map_err(|_| XfrmObjectInstallDurableError::Storage)?
+        .map_err(|_| XfrmSaRelocationDurableError::Storage)?
         != 0
     {
-        return Err(XfrmObjectInstallDurableError::Malformed);
+        return Err(XfrmSaRelocationDurableError::Malformed);
     }
     Ok(bytes)
 }
@@ -2004,8 +1989,8 @@ fn validate_file_metadata(
     store: &StoreInner,
     descriptor: &OwnedFd,
     expected_size: usize,
-) -> Result<(), XfrmObjectInstallDurableError> {
-    let metadata = fstat(descriptor).map_err(|_| XfrmObjectInstallDurableError::Storage)?;
+) -> Result<(), XfrmSaRelocationDurableError> {
+    let metadata = fstat(descriptor).map_err(|_| XfrmSaRelocationDurableError::Storage)?;
     if !FileType::from_raw_mode(metadata.st_mode).is_file()
         || stat_device(&metadata)? != store.root_device
         || metadata.st_uid != store.root_owner
@@ -2013,7 +1998,7 @@ fn validate_file_metadata(
         || metadata.st_nlink != 1
         || metadata.st_size != expected_size as i64
     {
-        return Err(XfrmObjectInstallDurableError::Malformed);
+        return Err(XfrmSaRelocationDurableError::Malformed);
     }
     Ok(())
 }
@@ -2022,7 +2007,7 @@ fn publish_new_file(
     store: &StoreInner,
     target: &str,
     bytes: &[u8],
-) -> Result<(), XfrmObjectInstallDurableError> {
+) -> Result<(), XfrmSaRelocationDurableError> {
     #[cfg(not(target_os = "linux"))]
     {
         // The public atomic constructor is unavailable before this point on a
@@ -2030,7 +2015,7 @@ fn publish_new_file(
         // unsupported backend buildable without pretending that another OS
         // provides Linux renameat2(RENAME_NOREPLACE) crash semantics.
         let _ = (store, target, bytes);
-        Err(XfrmObjectInstallDurableError::Storage)
+        Err(XfrmSaRelocationDurableError::Storage)
     }
 
     #[cfg(target_os = "linux")]
@@ -2046,7 +2031,7 @@ fn publish_new_file(
             ) {
                 Ok(descriptor) => descriptor,
                 Err(error) if error == rustix::io::Errno::EXIST => continue,
-                Err(_) => return Err(XfrmObjectInstallDurableError::Storage),
+                Err(_) => return Err(XfrmSaRelocationDurableError::Storage),
             };
             let mut file = std::fs::File::from(descriptor);
             if file.write_all(bytes).is_err() || file.sync_all().is_err() {
@@ -2055,10 +2040,10 @@ fn publish_new_file(
                     temporary.as_str(),
                     AtFlags::empty(),
                 );
-                return Err(XfrmObjectInstallDurableError::Storage);
+                return Err(XfrmSaRelocationDurableError::Storage);
             }
             let staged_metadata =
-                fstat(&file).map_err(|_| XfrmObjectInstallDurableError::Storage)?;
+                fstat(&file).map_err(|_| XfrmSaRelocationDurableError::Storage)?;
             if !FileType::from_raw_mode(staged_metadata.st_mode).is_file()
                 || staged_metadata.st_dev != store.root_device
                 || staged_metadata.st_uid != store.root_owner
@@ -2071,7 +2056,7 @@ fn publish_new_file(
                     temporary.as_str(),
                     AtFlags::empty(),
                 );
-                return Err(XfrmObjectInstallDurableError::Storage);
+                return Err(XfrmSaRelocationDurableError::Storage);
             }
             match renameat_with(
                 store.descriptor.as_fd(),
@@ -2081,21 +2066,21 @@ fn publish_new_file(
                 RenameFlags::NOREPLACE,
             ) {
                 Ok(()) => {
-                    fsync(&store.descriptor).map_err(|_| XfrmObjectInstallDurableError::Storage)?;
+                    fsync(&store.descriptor).map_err(|_| XfrmSaRelocationDurableError::Storage)?;
                     let reopened = openat(
                         store.descriptor.as_fd(),
                         target,
                         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                         Mode::empty(),
                     )
-                    .map_err(|_| XfrmObjectInstallDurableError::Storage)?;
+                    .map_err(|_| XfrmSaRelocationDurableError::Storage)?;
                     validate_file_metadata(store, &reopened, bytes.len())?;
                     let published_metadata =
-                        fstat(&reopened).map_err(|_| XfrmObjectInstallDurableError::Storage)?;
+                        fstat(&reopened).map_err(|_| XfrmSaRelocationDurableError::Storage)?;
                     if published_metadata.st_dev != staged_metadata.st_dev
                         || published_metadata.st_ino != staged_metadata.st_ino
                     {
-                        return Err(XfrmObjectInstallDurableError::Storage);
+                        return Err(XfrmSaRelocationDurableError::Storage);
                     }
                     return Ok(());
                 }
@@ -2107,32 +2092,32 @@ fn publish_new_file(
                     );
                     let _ = fsync(&store.descriptor);
                     return Err(if error == rustix::io::Errno::EXIST {
-                        XfrmObjectInstallDurableError::Duplicate
+                        XfrmSaRelocationDurableError::Duplicate
                     } else {
-                        XfrmObjectInstallDurableError::Storage
+                        XfrmSaRelocationDurableError::Storage
                     });
                 }
             }
         }
-        Err(XfrmObjectInstallDurableError::EntropyUnavailable)
+        Err(XfrmSaRelocationDurableError::EntropyUnavailable)
     }
 }
 
-fn random_nonzero_16() -> Result<[u8; 16], XfrmObjectInstallDurableError> {
+fn random_nonzero_16() -> Result<[u8; 16], XfrmSaRelocationDurableError> {
     for _ in 0..CREATE_ATTEMPTS {
         let mut bytes = [0_u8; 16];
         SysRng
             .try_fill_bytes(&mut bytes)
-            .map_err(|_| XfrmObjectInstallDurableError::EntropyUnavailable)?;
+            .map_err(|_| XfrmSaRelocationDurableError::EntropyUnavailable)?;
         if bytes.iter().any(|byte| *byte != 0) {
             return Ok(bytes);
         }
     }
-    Err(XfrmObjectInstallDurableError::EntropyUnavailable)
+    Err(XfrmSaRelocationDurableError::EntropyUnavailable)
 }
 
 #[cfg(target_os = "linux")]
-fn temporary_name() -> Result<String, XfrmObjectInstallDurableError> {
+fn temporary_name() -> Result<String, XfrmSaRelocationDurableError> {
     Ok(format!(
         "{TEMPORARY_PREFIX}{}",
         encode_hex(&random_nonzero_16()?)
@@ -2163,97 +2148,33 @@ fn parse_epoch_name(name: &str) -> Option<NonZeroU64> {
 }
 
 fn namespace_seal(
-    key: &XfrmObjectRecoveryProofKey,
+    key: &XfrmSaRelocationRecoveryProofKey,
     binding: [u8; 40],
-) -> Result<[u8; 32], XfrmObjectInstallDurableError> {
-    authenticate_domain(key, b"opc-xfrm-object-namespace-v1\0", &binding)
+) -> Result<[u8; 32], XfrmSaRelocationDurableError> {
+    authenticate_domain(key, NAMESPACE_AUTH_DOMAIN, &binding)
 }
 
-fn authenticate_install_request(
-    key: &XfrmObjectRecoveryProofKey,
-    request: &XfrmObjectInstallRequest,
-) -> Result<[u8; AUTH_TAG_BYTES], XfrmObjectInstallDurableError> {
+fn authenticate_relocation_request(
+    key: &XfrmSaRelocationRecoveryProofKey,
+    request: &RelocateSaRequest,
+) -> Result<[u8; AUTH_TAG_BYTES], XfrmSaRelocationDurableError> {
     let mut mac = HmacSha256::new(key.bytes());
-    mac.update(INSTALL_REQUEST_AUTH_DOMAIN);
-    match request {
-        XfrmObjectInstallRequest::Sa(request) => {
-            mac_u8(&mut mac, 1);
-            let parameters = &request.parameters;
-            mac_selector(&mut mac, &parameters.selector);
-            mac_id(&mut mac, parameters.id);
-            mac_ip_address(&mut mac, parameters.source_address);
-            mac_request_id(&mut mac, parameters.request_id);
-            match &parameters.auth {
-                Some((algorithm, key)) => {
-                    mac_u8(&mut mac, 1);
-                    mac_bytes(&mut mac, algorithm.name.as_bytes())?;
-                    mac_u32(&mut mac, algorithm.truncation_len_bits);
-                    mac_bytes(&mut mac, key.as_bytes())?;
-                }
-                None => mac_u8(&mut mac, 0),
-            }
-            match &parameters.crypt {
-                Some((algorithm, key)) => {
-                    mac_u8(&mut mac, 1);
-                    mac_bytes(&mut mac, algorithm.name.as_bytes())?;
-                    mac_bytes(&mut mac, key.as_bytes())?;
-                }
-                None => mac_u8(&mut mac, 0),
-            }
-            match &parameters.aead {
-                Some((algorithm, key)) => {
-                    mac_u8(&mut mac, 1);
-                    mac_bytes(&mut mac, algorithm.name.as_bytes())?;
-                    mac_u32(&mut mac, algorithm.icv_len_bits);
-                    mac_bytes(&mut mac, key.as_bytes())?;
-                }
-                None => mac_u8(&mut mac, 0),
-            }
-            mac_mode(&mut mac, parameters.mode);
-            mac_lifetime(&mut mac, parameters.lifetime);
-            mac_u32(&mut mac, parameters.replay_window);
-            mac_replay_state(&mut mac, parameters.replay_state.as_ref())?;
-            mac_encap(&mut mac, parameters.encap);
-            mac_lookup_mark(&mut mac, parameters.mark);
-            mac_output_mark(&mut mac, parameters.output_mark);
-            mac_optional_u32(&mut mac, parameters.if_id);
-            match parameters.egress_dscp {
-                Some(dscp) => {
-                    mac_u8(&mut mac, 1);
-                    mac_u8(&mut mac, dscp.get());
-                }
-                None => mac_u8(&mut mac, 0),
-            }
-        }
-        XfrmObjectInstallRequest::Policy(request) => {
-            mac_u8(&mut mac, 2);
-            let parameters = &request.parameters;
-            mac_selector(&mut mac, &parameters.selector);
-            mac_direction(&mut mac, parameters.direction);
-            mac_action(&mut mac, parameters.action);
-            mac_u32(&mut mac, parameters.priority);
-            mac_u64(
-                &mut mac,
-                u64::try_from(parameters.templates.len())
-                    .map_err(|_| XfrmObjectInstallDurableError::CapacityExceeded)?,
-            );
-            for template in &parameters.templates {
-                mac_template(&mut mac, *template);
-            }
-            mac_lookup_mark(&mut mac, parameters.mark);
-            mac_optional_u32(&mut mac, parameters.if_id);
-        }
-    }
+    mac.update(RELOCATION_REQUEST_AUTH_DOMAIN);
+    let current = &request.current;
+    mac_sa_relocation_selector(&mut mac, &current.selector);
+    mac_id(&mut mac, current.id);
+    mac_ip_address(&mut mac, current.source_address);
+    mac_request_id(&mut mac, current.request_id);
+    mac_mode(&mut mac, current.mode);
+    mac_encap(&mut mac, current.encap);
+    mac_lookup_mark(&mut mac, current.mark);
+    mac_optional_u32(&mut mac, current.if_id);
+    mac_output_mark(&mut mac, current.output_mark);
+    mac_ip_address(&mut mac, request.new_source_address);
+    mac_ip_address(&mut mac, request.new_destination);
+    mac_relocation_encap_action(&mut mac, request.encap);
+    mac_relocation_direction(&mut mac, request.direction);
     Ok(*mac.finalize())
-}
-
-fn mac_bytes(mac: &mut HmacSha256, bytes: &[u8]) -> Result<(), XfrmObjectInstallDurableError> {
-    mac_u64(
-        mac,
-        u64::try_from(bytes.len()).map_err(|_| XfrmObjectInstallDurableError::CapacityExceeded)?,
-    );
-    mac.update(bytes);
-    Ok(())
 }
 
 fn mac_u8(mac: &mut HmacSha256, value: u8) {
@@ -2268,7 +2189,7 @@ fn mac_u32(mac: &mut HmacSha256, value: u32) {
     mac.update(&value.to_be_bytes());
 }
 
-fn mac_u64(mac: &mut HmacSha256, value: u64) {
+fn mac_i32(mac: &mut HmacSha256, value: i32) {
     mac.update(&value.to_be_bytes());
 }
 
@@ -2285,14 +2206,18 @@ fn mac_ip_address(mac: &mut HmacSha256, address: IpAddress) {
     }
 }
 
-fn mac_selector(mac: &mut HmacSha256, selector: &XfrmSelector) {
+fn mac_sa_relocation_selector(mac: &mut HmacSha256, selector: &SaRelocationSelector) {
     mac_ip_address(mac, selector.source);
     mac_ip_address(mac, selector.destination);
     mac_u16(mac, selector.source_port);
+    mac_u16(mac, selector.source_port_mask);
     mac_u16(mac, selector.destination_port);
+    mac_u16(mac, selector.destination_port_mask);
     mac_u8(mac, selector.protocol);
     mac_u8(mac, selector.source_prefix_len);
     mac_u8(mac, selector.destination_prefix_len);
+    mac_i32(mac, selector.ifindex);
+    mac_u32(mac, selector.user_id);
 }
 
 fn mac_id(mac: &mut HmacSha256, id: XfrmId) {
@@ -2324,62 +2249,6 @@ fn mac_mode(mac: &mut HmacSha256, mode: XfrmMode) {
             XfrmMode::Beet => 3,
         },
     );
-}
-
-fn mac_direction(mac: &mut HmacSha256, direction: XfrmDirection) {
-    mac_u8(
-        mac,
-        match direction {
-            XfrmDirection::In => 1,
-            XfrmDirection::Out => 2,
-            XfrmDirection::Forward => 3,
-        },
-    );
-}
-
-fn mac_action(mac: &mut HmacSha256, action: XfrmAction) {
-    mac_u8(
-        mac,
-        match action {
-            XfrmAction::Allow => 1,
-            XfrmAction::Block => 2,
-        },
-    );
-}
-
-fn mac_lifetime(mac: &mut HmacSha256, lifetime: LifetimeConfig) {
-    mac_u64(mac, lifetime.soft_byte_limit);
-    mac_u64(mac, lifetime.hard_byte_limit);
-    mac_u64(mac, lifetime.soft_packet_limit);
-    mac_u64(mac, lifetime.hard_packet_limit);
-    mac_u64(mac, lifetime.soft_add_expires_seconds);
-    mac_u64(mac, lifetime.hard_add_expires_seconds);
-}
-
-fn mac_replay_state(
-    mac: &mut HmacSha256,
-    state: Option<&SaReplayState>,
-) -> Result<(), XfrmObjectInstallDurableError> {
-    let Some(state) = state else {
-        mac_u8(mac, 0);
-        return Ok(());
-    };
-    mac_u8(mac, 1);
-    mac_u8(mac, u8::from(state.esn));
-    mac_u32(mac, state.outbound_sequence);
-    mac_u32(mac, state.inbound_sequence);
-    mac_u32(mac, state.outbound_sequence_hi);
-    mac_u32(mac, state.inbound_sequence_hi);
-    mac_u32(mac, state.replay_window);
-    mac_u64(
-        mac,
-        u64::try_from(state.bitmap.len())
-            .map_err(|_| XfrmObjectInstallDurableError::CapacityExceeded)?,
-    );
-    for word in &state.bitmap {
-        mac_u32(mac, *word);
-    }
-    Ok(())
 }
 
 fn mac_encap(mac: &mut HmacSha256, encap: Option<UdpEncap>) {
@@ -2416,86 +2285,41 @@ fn mac_output_mark(mac: &mut HmacSha256, mark: Option<XfrmMark>) {
     }
 }
 
-fn mac_template(mac: &mut HmacSha256, template: XfrmTemplate) {
-    mac_id(mac, template.id);
-    mac_ip_address(mac, template.source_address);
-    mac_request_id(mac, template.request_id);
-    mac_mode(mac, template.mode);
+fn mac_relocation_encap_action(mac: &mut HmacSha256, encap: SaRelocationEncap) {
+    match encap {
+        SaRelocationEncap::Preserve => mac_u8(mac, 0),
+        SaRelocationEncap::Set(encap) => {
+            mac_u8(mac, 1);
+            mac_u16(mac, encap.encap_type);
+            mac_u16(mac, encap.source_port);
+            mac_u16(mac, encap.destination_port);
+        }
+        SaRelocationEncap::Remove => mac_u8(mac, 2),
+    }
 }
 
-fn encode_deletion_identity(
-    removal: &XfrmObjectRemovalRequest,
-    policy_if_id: Option<u32>,
-    output: &mut [u8; 64],
-) -> Result<usize, XfrmObjectInstallDurableError> {
+fn mac_relocation_direction(mac: &mut HmacSha256, direction: SaRelocationDirection) {
+    mac_u8(
+        mac,
+        match direction {
+            SaRelocationDirection::Inbound => 1,
+            SaRelocationDirection::OutboundBlockPolicyInstalled => 2,
+        },
+    );
+}
+
+/// Encode the exact unconditional deletion identity of one relocation: the
+/// target SA destination, protocol, SPI, and lookup mark.
+fn encode_deletion_identity(request: &RelocateSaRequest, output: &mut [u8; 64]) -> usize {
     let mut cursor = 0_usize;
-    match removal {
-        XfrmObjectRemovalRequest::Sa(request) => {
-            if policy_if_id.is_some() {
-                return Err(XfrmObjectInstallDurableError::Malformed);
-            }
-            output[cursor] = 1;
-            cursor += 1;
-            encode_sa_identity(request, output, &mut cursor);
-        }
-        XfrmObjectRemovalRequest::Policy(request) => {
-            output[cursor] = 2;
-            cursor += 1;
-            encode_policy_identity(request, policy_if_id, output, &mut cursor)?;
-        }
-    }
-    Ok(cursor)
-}
-
-fn encode_sa_identity(request: &RemoveSaRequest, output: &mut [u8; 64], cursor: &mut usize) {
-    encode_ip_address(request.destination, output, cursor);
-    output[*cursor] = request.protocol;
-    *cursor += 1;
-    push_bytes(output, cursor, &request.spi.to_be_bytes());
-    encode_mark(request.mark, output, cursor);
-}
-
-fn encode_policy_identity(
-    request: &RemovePolicyRequest,
-    if_id: Option<u32>,
-    output: &mut [u8; 64],
-    cursor: &mut usize,
-) -> Result<(), XfrmObjectInstallDurableError> {
-    encode_selector(&request.selector, output, cursor);
-    output[*cursor] = match request.direction {
-        XfrmDirection::In => 1,
-        XfrmDirection::Out => 2,
-        XfrmDirection::Forward => 3,
-    };
-    *cursor += 1;
-    encode_mark(request.mark, output, cursor);
-    match if_id {
-        Some(value) if value != 0 => {
-            output[*cursor] = 1;
-            *cursor += 1;
-            push_bytes(output, cursor, &value.to_be_bytes());
-        }
-        Some(_) => return Err(XfrmObjectInstallDurableError::Malformed),
-        None => {
-            output[*cursor] = 0;
-            *cursor += 1;
-            push_bytes(output, cursor, &[0; 4]);
-        }
-    }
-    Ok(())
-}
-
-fn encode_selector(selector: &XfrmSelector, output: &mut [u8; 64], cursor: &mut usize) {
-    encode_ip_address(selector.source, output, cursor);
-    encode_ip_address(selector.destination, output, cursor);
-    push_bytes(output, cursor, &selector.source_port.to_be_bytes());
-    push_bytes(output, cursor, &selector.destination_port.to_be_bytes());
-    output[*cursor] = selector.protocol;
-    *cursor += 1;
-    output[*cursor] = selector.source_prefix_len;
-    *cursor += 1;
-    output[*cursor] = selector.destination_prefix_len;
-    *cursor += 1;
+    output[cursor] = 1;
+    cursor += 1;
+    encode_ip_address(request.new_destination, output, &mut cursor);
+    output[cursor] = request.current.id.protocol;
+    cursor += 1;
+    push_bytes(output, &mut cursor, &request.current.id.spi.to_be_bytes());
+    encode_mark(request.current.mark, output, &mut cursor);
+    cursor
 }
 
 fn encode_ip_address(address: IpAddress, output: &mut [u8; 64], cursor: &mut usize) {
@@ -2514,7 +2338,7 @@ fn encode_ip_address(address: IpAddress, output: &mut [u8; 64], cursor: &mut usi
     }
 }
 
-fn encode_mark(mark: Option<crate::XfrmLookupMark>, output: &mut [u8; 64], cursor: &mut usize) {
+fn encode_mark(mark: Option<XfrmLookupMark>, output: &mut [u8; 64], cursor: &mut usize) {
     match mark {
         Some(mark) => {
             output[*cursor] = 1;
@@ -2536,7 +2360,7 @@ fn push_bytes(output: &mut [u8; 64], cursor: &mut usize, bytes: &[u8]) {
     *cursor = end;
 }
 
-fn record_name(record: &DurableObjectRecord) -> String {
+fn record_name(record: &DurableRelocationRecord) -> String {
     format!(
         "{}-{}-{:016x}",
         record.phase.as_str(),
@@ -2545,38 +2369,38 @@ fn record_name(record: &DurableObjectRecord) -> String {
     )
 }
 
-fn validate_record_name(name: &OsStr) -> Result<(), XfrmObjectInstallDurableError> {
+fn validate_record_name(name: &OsStr) -> Result<(), XfrmSaRelocationDurableError> {
     parse_record_name(name)
         .map(|_| ())
-        .ok_or(XfrmObjectInstallDurableError::Malformed)
+        .ok_or(XfrmSaRelocationDurableError::Malformed)
 }
 
 fn parse_record_name(
     name: &OsStr,
 ) -> Option<(
-    XfrmObjectInstallDurablePhase,
-    XfrmObjectInstallOperationId,
-    XfrmObjectInstallOperationGeneration,
+    XfrmSaRelocationDurablePhase,
+    XfrmSaRelocationOperationId,
+    XfrmSaRelocationOperationGeneration,
 )> {
     let text = name.to_str()?;
     let mut components = text.rsplitn(3, '-');
     let generation = u64::from_str_radix(components.next()?, 16).ok()?;
     let operation = decode_hex_16(components.next()?)?;
     let phase = match components.next()? {
-        "prepared" => XfrmObjectInstallDurablePhase::Prepared,
-        "issuing" => XfrmObjectInstallDurablePhase::Issuing,
-        "acquired" => XfrmObjectInstallDurablePhase::Acquired,
-        "no_mutation" => XfrmObjectInstallDurablePhase::NoMutation,
-        "indeterminate" => XfrmObjectInstallDurablePhase::Indeterminate,
-        "removal_admitted" => XfrmObjectInstallDurablePhase::RemovalAdmitted,
-        "retired" => XfrmObjectInstallDurablePhase::Retired,
-        "committed" => XfrmObjectInstallDurablePhase::Committed,
+        "prepared" => XfrmSaRelocationDurablePhase::Prepared,
+        "issuing" => XfrmSaRelocationDurablePhase::Issuing,
+        "relocated" => XfrmSaRelocationDurablePhase::Relocated,
+        "no_mutation" => XfrmSaRelocationDurablePhase::NoMutation,
+        "indeterminate" => XfrmSaRelocationDurablePhase::Indeterminate,
+        "state_absent" => XfrmSaRelocationDurablePhase::StateAbsent,
+        "removal_admitted" => XfrmSaRelocationDurablePhase::RemovalAdmitted,
+        "retired" => XfrmSaRelocationDurablePhase::Retired,
         _ => return None,
     };
     Some((
         phase,
-        XfrmObjectInstallOperationId::from_bytes(operation).ok()?,
-        XfrmObjectInstallOperationGeneration::new(generation)?,
+        XfrmSaRelocationOperationId::from_bytes(operation).ok()?,
+        XfrmSaRelocationOperationGeneration::new(generation)?,
     ))
 }
 
@@ -2620,7 +2444,10 @@ mod tests {
 
     use rustix::fs::{mkfifoat, CWD};
 
-    use crate::{IpAddress, RemovePolicyRequest, RemoveSaRequest, XfrmLookupMark, XfrmSelector};
+    use crate::{
+        IpAddress, SaRelocationIdentity, SaRelocationSelector, XfrmId, XfrmLookupMark, XfrmMark,
+        XfrmMode, XfrmRequestId, XfrmSelector,
+    };
 
     use super::*;
 
@@ -2628,9 +2455,9 @@ mod tests {
 
     impl TestRoot {
         fn new() -> Self {
-            let identity = XfrmObjectInstallOperationId::generate().unwrap();
+            let identity = XfrmSaRelocationOperationId::generate().unwrap();
             let path = std::env::temp_dir().join(format!(
-                "opc-xfrm-durable-object-test-{}",
+                "opc-xfrm-durable-relocation-test-{}",
                 encode_hex(&identity.to_bytes())
             ));
             Self(path)
@@ -2649,59 +2476,64 @@ mod tests {
         }
     }
 
-    fn key(byte: u8) -> XfrmObjectRecoveryProofKey {
-        XfrmObjectRecoveryProofKey::new([byte; 32]).unwrap()
+    fn key(byte: u8) -> XfrmSaRelocationRecoveryProofKey {
+        XfrmSaRelocationRecoveryProofKey::new([byte; 32]).unwrap()
     }
 
-    fn record(phase: XfrmObjectInstallDurablePhase) -> DurableObjectRecord {
-        DurableObjectRecord {
-            phase,
-            object: XfrmInstallObject::Policy,
-            pre_effect_proof: valid_proof_for(phase),
-            store_incarnation: [1; 16],
-            namespace_seal: [2; 32],
-            actor_incarnation: [3; 16],
-            operation_id: XfrmObjectInstallOperationId::from_bytes([4; 16]).unwrap(),
-            operation_generation: XfrmObjectInstallOperationGeneration::new(5).unwrap(),
-            writer_epoch: NonZeroU64::new(6).unwrap(),
-            deletion_identity_fingerprint: [7; 32],
-            install_request_fingerprint: [8; 32],
+    fn fingerprints(byte: u8) -> DurableRelocationFingerprints {
+        DurableRelocationFingerprints {
+            deletion_identity: [byte; 32],
+            relocation_request: [byte.wrapping_add(1); 32],
         }
     }
 
     fn valid_proof_for(
-        phase: XfrmObjectInstallDurablePhase,
-    ) -> Option<XfrmObjectInstallPreEffectProof> {
+        phase: XfrmSaRelocationDurablePhase,
+    ) -> Option<XfrmSaRelocationPreEffectProof> {
         match phase {
-            XfrmObjectInstallDurablePhase::Prepared => None,
-            XfrmObjectInstallDurablePhase::Retired => None,
-            _ => Some(XfrmObjectInstallPreEffectProof::Absent),
+            XfrmSaRelocationDurablePhase::Prepared | XfrmSaRelocationDurablePhase::Retired => None,
+            _ => Some(XfrmSaRelocationPreEffectProof::TargetAbsent),
         }
     }
 
-    fn store(root: &TestRoot) -> XfrmObjectInstallRecoveryStore {
-        XfrmObjectInstallRecoveryStore::open_bound(root.path(), key(9), [0x42; 40]).unwrap()
+    fn record(phase: XfrmSaRelocationDurablePhase) -> DurableRelocationRecord {
+        DurableRelocationRecord {
+            phase,
+            pre_effect_proof: valid_proof_for(phase),
+            store_incarnation: [1; 16],
+            namespace_seal: [2; 32],
+            actor_incarnation: [3; 16],
+            operation_id: XfrmSaRelocationOperationId::from_bytes([4; 16]).unwrap(),
+            operation_generation: XfrmSaRelocationOperationGeneration::new(5).unwrap(),
+            writer_epoch: NonZeroU64::new(6).unwrap(),
+            deletion_identity_fingerprint: [7; 32],
+            relocation_request_fingerprint: [8; 32],
+        }
+    }
+
+    fn store(root: &TestRoot) -> XfrmSaRelocationRecoveryStore {
+        XfrmSaRelocationRecoveryStore::open_bound(root.path(), key(9), [0x42; 40]).unwrap()
     }
 
     fn proof_for(
-        expected: XfrmObjectInstallDurablePhase,
-        next: XfrmObjectInstallDurablePhase,
-    ) -> Option<XfrmObjectInstallPreEffectProof> {
-        if expected == XfrmObjectInstallDurablePhase::Prepared
-            && next == XfrmObjectInstallDurablePhase::Issuing
+        expected: XfrmSaRelocationDurablePhase,
+        next: XfrmSaRelocationDurablePhase,
+    ) -> Option<XfrmSaRelocationPreEffectProof> {
+        if expected == XfrmSaRelocationDurablePhase::Prepared
+            && next == XfrmSaRelocationDurablePhase::Issuing
         {
-            Some(XfrmObjectInstallPreEffectProof::Absent)
+            Some(XfrmSaRelocationPreEffectProof::TargetAbsent)
         } else {
             None
         }
     }
 
     fn next_handle(
-        store: &XfrmObjectInstallRecoveryStore,
-        current: &XfrmObjectInstallRecoveryHandle,
-        expected: XfrmObjectInstallDurablePhase,
-        next: XfrmObjectInstallDurablePhase,
-    ) -> XfrmObjectInstallRecoveryHandle {
+        store: &XfrmSaRelocationRecoveryStore,
+        current: &XfrmSaRelocationRecoveryHandle,
+        expected: XfrmSaRelocationDurablePhase,
+        next: XfrmSaRelocationDurablePhase,
+    ) -> XfrmSaRelocationRecoveryHandle {
         store
             .transition(current, expected, next, proof_for(expected, next))
             .unwrap()
@@ -2709,30 +2541,67 @@ mod tests {
             .unwrap()
     }
 
+    fn ipv4(a: u8, b: u8, c: u8, d: u8) -> IpAddress {
+        IpAddress::Ipv4([a, b, c, d])
+    }
+
+    fn current_identity(encap: Option<UdpEncap>) -> SaRelocationIdentity {
+        SaRelocationIdentity {
+            selector: SaRelocationSelector::from_selector(&XfrmSelector::new(
+                ipv4(10, 62, 9, 1),
+                ipv4(10, 62, 9, 2),
+                17,
+            )),
+            id: XfrmId {
+                destination: ipv4(192, 0, 2, 62),
+                spi: 0x6290_0001,
+                protocol: 50,
+            },
+            source_address: ipv4(192, 0, 2, 61),
+            request_id: XfrmRequestId::new(629),
+            mode: XfrmMode::Tunnel,
+            encap,
+            mark: Some(XfrmLookupMark::full(0x6290)),
+            if_id: Some(6),
+            output_mark: Some(XfrmMark {
+                value: 0x0000_0629,
+                mask: 0x0000_ffff,
+            }),
+        }
+    }
+
+    fn relocation_request() -> RelocateSaRequest {
+        RelocateSaRequest {
+            current: current_identity(Some(UdpEncap::esp_in_udp(4500, 4500))),
+            new_source_address: ipv4(198, 51, 100, 10),
+            new_destination: ipv4(198, 51, 100, 20),
+            encap: SaRelocationEncap::Set(UdpEncap::esp_in_udp(4500, 62_000)),
+            direction: SaRelocationDirection::Inbound,
+        }
+    }
+
     #[test]
-    fn record_codec_round_trips_every_phase_and_object() {
+    fn record_codec_round_trips_every_phase_and_proof() {
         for phase in [
-            XfrmObjectInstallDurablePhase::Prepared,
-            XfrmObjectInstallDurablePhase::Issuing,
-            XfrmObjectInstallDurablePhase::Acquired,
-            XfrmObjectInstallDurablePhase::NoMutation,
-            XfrmObjectInstallDurablePhase::Indeterminate,
-            XfrmObjectInstallDurablePhase::RemovalAdmitted,
-            XfrmObjectInstallDurablePhase::Retired,
-            XfrmObjectInstallDurablePhase::Committed,
+            XfrmSaRelocationDurablePhase::Prepared,
+            XfrmSaRelocationDurablePhase::Issuing,
+            XfrmSaRelocationDurablePhase::Relocated,
+            XfrmSaRelocationDurablePhase::NoMutation,
+            XfrmSaRelocationDurablePhase::Indeterminate,
+            XfrmSaRelocationDurablePhase::StateAbsent,
+            XfrmSaRelocationDurablePhase::RemovalAdmitted,
+            XfrmSaRelocationDurablePhase::Retired,
         ] {
-            for object in [XfrmInstallObject::Sa, XfrmInstallObject::Policy] {
-                let mut expected = record(phase);
-                expected.object = object;
-                let encoded = expected.encode(&key(9)).unwrap();
-                assert_eq!(encoded.len(), XFRM_OBJECT_INSTALL_RECOVERY_HANDLE_BYTES);
-                assert_eq!(
-                    DurableObjectRecord::decode(&encoded, &key(9)).unwrap(),
-                    expected
-                );
-                let handle = XfrmObjectInstallRecoveryHandle::from_bytes(encoded);
-                assert_eq!(handle.to_bytes(), encoded);
-            }
+            let mut expected = record(phase);
+            expected.pre_effect_proof = valid_proof_for(phase);
+            let encoded = expected.encode(&key(9)).unwrap();
+            assert_eq!(encoded.len(), XFRM_SA_RELOCATION_RECOVERY_HANDLE_BYTES);
+            assert_eq!(
+                DurableRelocationRecord::decode(&encoded, &key(9)).unwrap(),
+                expected
+            );
+            let handle = XfrmSaRelocationRecoveryHandle::from_bytes(encoded);
+            assert_eq!(handle.to_bytes(), encoded);
         }
     }
 
@@ -2756,49 +2625,51 @@ mod tests {
 
     #[test]
     fn tampering_and_wrong_key_fail_authentication() {
-        let encoded = record(XfrmObjectInstallDurablePhase::Acquired)
+        let encoded = record(XfrmSaRelocationDurablePhase::Issuing)
             .encode(&key(9))
             .unwrap();
         assert_eq!(
-            DurableObjectRecord::decode(&encoded, &key(8)),
-            Err(XfrmObjectInstallDurableError::AuthenticationFailed)
+            DurableRelocationRecord::decode(&encoded, &key(8)),
+            Err(XfrmSaRelocationDurableError::AuthenticationFailed)
         );
-        for index in [10, 16, 47, 80, 103, 111, 143, 175] {
+        for index in [10, 12, 16, 47, 80, 103, 111, 143, 175] {
             let mut tampered = encoded;
             tampered[index] ^= 0x80;
-            assert!(DurableObjectRecord::decode(&tampered, &key(9)).is_err());
+            assert!(DurableRelocationRecord::decode(&tampered, &key(9)).is_err());
         }
     }
 
     #[test]
     fn reserved_and_zero_fields_fail_closed() {
         assert!(matches!(
-            XfrmObjectRecoveryProofKey::new([0; 32]),
-            Err(XfrmObjectInstallDurableError::InvalidProofKey)
+            XfrmSaRelocationRecoveryProofKey::new([0; 32]),
+            Err(XfrmSaRelocationDurableError::InvalidProofKey)
         ));
-        let valid = record(XfrmObjectInstallDurablePhase::Prepared)
+        let valid = record(XfrmSaRelocationDurablePhase::Prepared)
             .encode(&key(9))
             .unwrap();
-        // Bytes 13..16 remain reserved and must stay zero.
-        let mut reserved = valid;
-        reserved[13] = 1;
-        assert_eq!(
-            DurableObjectRecord::decode(&reserved, &key(9)),
-            Err(XfrmObjectInstallDurableError::Malformed)
-        );
-        let mut invalid = record(XfrmObjectInstallDurablePhase::Prepared);
+        // Bytes 11 and 13..16 remain reserved and must stay zero.
+        for index in [11, 13, 14, 15] {
+            let mut reserved = valid;
+            reserved[index] = 1;
+            assert_eq!(
+                DurableRelocationRecord::decode(&reserved, &key(9)),
+                Err(XfrmSaRelocationDurableError::Malformed)
+            );
+        }
+        let mut invalid = record(XfrmSaRelocationDurablePhase::Prepared);
         invalid.store_incarnation = [0; 16];
         assert_eq!(
             invalid.encode(&key(9)),
-            Err(XfrmObjectInstallDurableError::Malformed)
+            Err(XfrmSaRelocationDurableError::Malformed)
         );
     }
 
     #[test]
     fn all_public_diagnostics_are_value_free() {
-        let operation = XfrmObjectInstallOperationId::from_bytes([0xab; 16]).unwrap();
-        let generation = XfrmObjectInstallOperationGeneration::new(0xfeed_beef).unwrap();
-        let handle = record(XfrmObjectInstallDurablePhase::Acquired)
+        let operation = XfrmSaRelocationOperationId::from_bytes([0xab; 16]).unwrap();
+        let generation = XfrmSaRelocationOperationGeneration::new(0xfeed_beef).unwrap();
+        let handle = record(XfrmSaRelocationDurablePhase::Relocated)
             .handle(&key(9))
             .unwrap();
         for rendered in [
@@ -2809,39 +2680,57 @@ mod tests {
         ] {
             assert!(!rendered.contains("abab"));
             assert!(!rendered.contains("feed"));
+            // The module fixtures carry encapsulation ports; no diagnostic
+            // may leak them.
+            assert!(!rendered.contains("4500"));
+            assert!(!rendered.contains("62000"));
         }
         for error in [
-            XfrmObjectInstallDurableError::AuthenticationFailed,
-            XfrmObjectInstallDurableError::Duplicate,
-            XfrmObjectInstallDurableError::WrongBinding,
-            XfrmObjectInstallDurableError::Stale,
+            XfrmSaRelocationDurableError::AuthenticationFailed,
+            XfrmSaRelocationDurableError::Duplicate,
+            XfrmSaRelocationDurableError::WrongBinding,
+            XfrmSaRelocationDurableError::Stale,
         ] {
-            assert!(error.to_string().starts_with("xfrm_object_recovery_"));
+            assert!(error
+                .to_string()
+                .starts_with("xfrm_sa_relocation_recovery_"));
         }
     }
 
     #[test]
     fn state_machine_rejects_unsafe_edges() {
         assert!(
-            XfrmObjectInstallDurablePhase::Prepared.permits(XfrmObjectInstallDurablePhase::Issuing)
+            XfrmSaRelocationDurablePhase::Prepared.permits(XfrmSaRelocationDurablePhase::Issuing)
         );
-        assert!(XfrmObjectInstallDurablePhase::Acquired
-            .permits(XfrmObjectInstallDurablePhase::RemovalAdmitted));
-        // Recovery edges that prove-and-retire an unresolved record.
-        assert!(XfrmObjectInstallDurablePhase::Issuing
-            .permits(XfrmObjectInstallDurablePhase::RemovalAdmitted));
-        assert!(XfrmObjectInstallDurablePhase::Indeterminate
-            .permits(XfrmObjectInstallDurablePhase::RemovalAdmitted));
-        assert!(XfrmObjectInstallDurablePhase::Indeterminate
-            .permits(XfrmObjectInstallDurablePhase::NoMutation));
+        assert!(XfrmSaRelocationDurablePhase::Issuing
+            .permits(XfrmSaRelocationDurablePhase::RemovalAdmitted));
+        assert!(XfrmSaRelocationDurablePhase::Indeterminate
+            .permits(XfrmSaRelocationDurablePhase::RemovalAdmitted));
+        assert!(XfrmSaRelocationDurablePhase::Indeterminate
+            .permits(XfrmSaRelocationDurablePhase::NoMutation));
+        assert!(XfrmSaRelocationDurablePhase::Issuing
+            .permits(XfrmSaRelocationDurablePhase::StateAbsent));
+        assert!(XfrmSaRelocationDurablePhase::Indeterminate
+            .permits(XfrmSaRelocationDurablePhase::StateAbsent));
+        assert!(
+            XfrmSaRelocationDurablePhase::Relocated.permits(XfrmSaRelocationDurablePhase::Retired)
+        );
         // An unresolved record may never retire directly without a verdict.
         assert!(
-            !XfrmObjectInstallDurablePhase::Issuing.permits(XfrmObjectInstallDurablePhase::Retired)
+            !XfrmSaRelocationDurablePhase::Issuing.permits(XfrmSaRelocationDurablePhase::Retired)
         );
-        assert!(!XfrmObjectInstallDurablePhase::Indeterminate
-            .permits(XfrmObjectInstallDurablePhase::Retired));
-        assert!(!XfrmObjectInstallDurablePhase::NoMutation
-            .permits(XfrmObjectInstallDurablePhase::RemovalAdmitted));
+        assert!(!XfrmSaRelocationDurablePhase::Indeterminate
+            .permits(XfrmSaRelocationDurablePhase::Retired));
+        // Terminal proof never reopens deletion authority.
+        assert!(!XfrmSaRelocationDurablePhase::Relocated
+            .permits(XfrmSaRelocationDurablePhase::RemovalAdmitted));
+        assert!(!XfrmSaRelocationDurablePhase::NoMutation
+            .permits(XfrmSaRelocationDurablePhase::RemovalAdmitted));
+        assert!(!XfrmSaRelocationDurablePhase::StateAbsent
+            .permits(XfrmSaRelocationDurablePhase::RemovalAdmitted));
+        assert!(
+            !XfrmSaRelocationDurablePhase::Retired.permits(XfrmSaRelocationDurablePhase::Prepared)
+        );
     }
 
     #[test]
@@ -2849,19 +2738,14 @@ mod tests {
         let root = TestRoot::new();
         let first = store(&root);
         let incarnation = first.inner.control.actor_incarnation;
-        let operation = XfrmObjectInstallOperationId::generate().unwrap();
-        let generation = XfrmObjectInstallOperationGeneration::new(1).unwrap();
+        let operation = XfrmSaRelocationOperationId::generate().unwrap();
+        let generation = XfrmSaRelocationOperationGeneration::new(1).unwrap();
         let handle = first
-            .prepare(
-                operation,
-                generation,
-                XfrmInstallObject::Sa,
-                DurableObjectFingerprints::repeated(0x55),
-            )
+            .prepare(operation, generation, fingerprints(0x55))
             .unwrap();
         assert_eq!(
             first.inspect(&handle),
-            Ok(XfrmObjectInstallDurablePhase::Prepared)
+            Ok(XfrmSaRelocationDurablePhase::Prepared)
         );
         drop(first);
 
@@ -2869,52 +2753,59 @@ mod tests {
         assert_eq!(reopened.inner.control.actor_incarnation, incarnation);
         assert_eq!(
             reopened.inspect(&handle),
-            Ok(XfrmObjectInstallDurablePhase::Prepared)
+            Ok(XfrmSaRelocationDurablePhase::Prepared)
+        );
+        assert_eq!(
+            reopened
+                .restore(operation, generation, fingerprints(0x55))
+                .unwrap()
+                .phase,
+            XfrmSaRelocationDurablePhase::Prepared
         );
         assert_eq!(
             reopened.restore(
                 operation,
-                generation,
-                XfrmInstallObject::Sa,
-                DurableObjectFingerprints::repeated(0x55),
+                XfrmSaRelocationOperationGeneration::new(2).unwrap(),
+                fingerprints(0x55),
             ),
-            Ok(reopened
-                .lease()
-                .unwrap()
-                .inventory()
-                .unwrap()
-                .current_for(operation, generation)
-                .unwrap()
-                .1
-                .clone())
+            Err(XfrmSaRelocationDurableError::NotFound)
         );
         assert_eq!(
-            reopened.restore(
-                operation,
-                XfrmObjectInstallOperationGeneration::new(2).unwrap(),
-                XfrmInstallObject::Sa,
-                DurableObjectFingerprints::repeated(0x55),
-            ),
-            Err(XfrmObjectInstallDurableError::NotFound)
+            reopened.restore(operation, generation, fingerprints(0x56)),
+            Err(XfrmSaRelocationDurableError::WrongBinding)
         );
-        assert_eq!(
-            reopened.restore(
-                operation,
-                generation,
-                XfrmInstallObject::Sa,
-                DurableObjectFingerprints::repeated(0x56),
-            ),
-            Err(XfrmObjectInstallDurableError::WrongBinding)
-        );
+        // A prepared relocation gates the store: a second preparation with a
+        // distinct deletion identity is still rejected until recovery.
         assert_eq!(
             reopened.prepare(
-                XfrmObjectInstallOperationId::generate().unwrap(),
+                XfrmSaRelocationOperationId::generate().unwrap(),
                 generation,
-                XfrmInstallObject::Sa,
-                DurableObjectFingerprints::repeated(0x55),
+                fingerprints(0x57),
             ),
-            Err(XfrmObjectInstallDurableError::Duplicate)
+            Err(XfrmSaRelocationDurableError::InvalidTransition)
         );
+        // Recovery retirement reopens the gate; the terminal record remains
+        // inspectable until terminal compaction prunes it.
+        let retired = reopened
+            .transition(
+                &handle,
+                XfrmSaRelocationDurablePhase::Prepared,
+                XfrmSaRelocationDurablePhase::Retired,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            reopened
+                .restore(operation, generation, fingerprints(0x55))
+                .unwrap()
+                .phase,
+            XfrmSaRelocationDurablePhase::Retired
+        );
+        let _ = retired;
+        // Terminal compaction prunes the retired record during preparation.
+        assert!(reopened
+            .prepare(operation, generation, fingerprints(0x55))
+            .is_ok());
     }
 
     #[test]
@@ -2922,14 +2813,11 @@ mod tests {
         let root = TestRoot::new();
         let first = store(&root);
         assert_eq!(
-            XfrmObjectInstallRecoveryStore::open_bound(root.path(), key(9), [0x42; 40])
-                .unwrap_err(),
-            XfrmObjectInstallDurableError::StoreBusy
+            XfrmSaRelocationRecoveryStore::open_bound(root.path(), key(9), [0x42; 40]).unwrap_err(),
+            XfrmSaRelocationDurableError::StoreBusy
         );
         drop(first);
-        assert!(
-            XfrmObjectInstallRecoveryStore::open_bound(root.path(), key(9), [0x42; 40]).is_ok()
-        );
+        assert!(XfrmSaRelocationRecoveryStore::open_bound(root.path(), key(9), [0x42; 40]).is_ok());
     }
 
     #[test]
@@ -2955,9 +2843,12 @@ mod tests {
         let root = TestRoot::new();
         let initial = store(&root);
         drop(initial);
+
+        // Model SIGKILL after a partial staging-file write and sync but before
+        // the atomic rename. No publisher-side error cleanup can run then.
         let pending = root
             .path()
-            .join(".opc-xfrm-object-pending-1234567890abcdef1234567890abcdef");
+            .join(".opc-xfrm-relocation-pending-1234567890abcdef1234567890abcdef");
         fs::write(&pending, [0xa5; 17]).unwrap();
         fs::set_permissions(&pending, fs::Permissions::from_mode(FILE_MODE)).unwrap();
         std::fs::File::open(&pending).unwrap().sync_all().unwrap();
@@ -2978,7 +2869,7 @@ mod tests {
         fs::set_permissions(root.path(), fs::Permissions::from_mode(DIRECTORY_MODE)).unwrap();
         let pending = root
             .path()
-            .join(".opc-xfrm-object-pending-abcdef1234567890abcdef1234567890");
+            .join(".opc-xfrm-relocation-pending-abcdef1234567890abcdef1234567890");
         fs::write(&pending, [0x5a; 9]).unwrap();
         fs::set_permissions(&pending, fs::Permissions::from_mode(FILE_MODE)).unwrap();
         std::fs::File::open(&pending).unwrap().sync_all().unwrap();
@@ -3001,12 +2892,12 @@ mod tests {
         drop(initial);
         let pending = root
             .path()
-            .join(".opc-xfrm-object-pending-fedcba0987654321fedcba0987654321");
+            .join(".opc-xfrm-relocation-pending-fedcba0987654321fedcba0987654321");
         symlink(root.path().join(CONTROL_NAME), &pending).unwrap();
 
         assert!(matches!(
-            XfrmObjectInstallRecoveryStore::open_bound(root.path(), key(9), [0x42; 40]),
-            Err(XfrmObjectInstallDurableError::Malformed)
+            XfrmSaRelocationRecoveryStore::open_bound(root.path(), key(9), [0x42; 40]),
+            Err(XfrmSaRelocationDurableError::Malformed)
         ));
         assert!(pending.symlink_metadata().is_ok());
     }
@@ -3018,12 +2909,12 @@ mod tests {
         drop(initial);
         let pending = root
             .path()
-            .join(".opc-xfrm-object-pending-0123456789abcdef0123456789abcdef");
+            .join(".opc-xfrm-relocation-pending-0123456789abcdef0123456789abcdef");
         mkfifoat(CWD, &pending, Mode::from_raw_mode(FILE_MODE)).unwrap();
 
         assert!(matches!(
-            XfrmObjectInstallRecoveryStore::open_bound(root.path(), key(9), [0x42; 40]),
-            Err(XfrmObjectInstallDurableError::Malformed)
+            XfrmSaRelocationRecoveryStore::open_bound(root.path(), key(9), [0x42; 40]),
+            Err(XfrmSaRelocationDurableError::Malformed)
         ));
         assert!(pending.symlink_metadata().is_ok());
     }
@@ -3036,20 +2927,19 @@ mod tests {
         assert_eq!(operation.len(), 32);
         let name = format!("prepared-{operation}-0000000000000001");
         fs::write(
-            root.path().join(name),
-            [0_u8; XFRM_OBJECT_INSTALL_RECOVERY_HANDLE_BYTES],
+            root.path().join(&name),
+            [0_u8; XFRM_SA_RELOCATION_RECOVERY_HANDLE_BYTES],
         )
         .unwrap();
         fs::set_permissions(
-            root.path()
-                .join(format!("prepared-{operation}-0000000000000001")),
+            root.path().join(&name),
             fs::Permissions::from_mode(FILE_MODE),
         )
         .unwrap();
 
         assert_eq!(
             store.advance_writer_epoch(),
-            Err(XfrmObjectInstallDurableError::Malformed)
+            Err(XfrmSaRelocationDurableError::Malformed)
         );
     }
 
@@ -3059,17 +2949,24 @@ mod tests {
         let store = store(&root);
         let prepared = store
             .prepare(
-                XfrmObjectInstallOperationId::from_bytes([0x41; 16]).unwrap(),
-                XfrmObjectInstallOperationGeneration::new(1).unwrap(),
-                XfrmInstallObject::Sa,
-                DurableObjectFingerprints::repeated(0x71),
+                XfrmSaRelocationOperationId::from_bytes([0x41; 16]).unwrap(),
+                XfrmSaRelocationOperationGeneration::new(1).unwrap(),
+                fingerprints(0x71),
             )
             .unwrap();
+        // Forge a second unresolved record that repeats the first operation's
+        // deletion identity fingerprint under a distinct operation identity.
+        let _ = prepared;
         let lease = store.lease().unwrap();
         let inventory = lease.inventory().unwrap();
-        let (_, first) = lease.current_from_handle(&inventory, &prepared).unwrap();
-        let duplicate = DurableObjectRecord {
-            operation_id: XfrmObjectInstallOperationId::from_bytes([0x42; 16]).unwrap(),
+        let (_, first) = inventory
+            .current_for(
+                XfrmSaRelocationOperationId::from_bytes([0x41; 16]).unwrap(),
+                XfrmSaRelocationOperationGeneration::new(1).unwrap(),
+            )
+            .unwrap();
+        let duplicate = DurableRelocationRecord {
+            operation_id: XfrmSaRelocationOperationId::from_bytes([0x42; 16]).unwrap(),
             ..first.clone()
         };
         lease.publish_record(&duplicate).unwrap();
@@ -3077,41 +2974,34 @@ mod tests {
 
         assert_eq!(
             store.advance_writer_epoch(),
-            Err(XfrmObjectInstallDurableError::Duplicate)
+            Err(XfrmSaRelocationDurableError::Duplicate)
         );
     }
 
     #[test]
-    fn multiple_cleanup_authorities_with_distinct_identities_fail_closed() {
+    fn multiple_unresolved_authorities_with_distinct_identities_fail_closed() {
         let root = TestRoot::new();
         let store = store(&root);
         let prepared = store
             .prepare(
-                XfrmObjectInstallOperationId::from_bytes([0x51; 16]).unwrap(),
-                XfrmObjectInstallOperationGeneration::new(1).unwrap(),
-                XfrmInstallObject::Sa,
-                DurableObjectFingerprints::repeated(0x81),
+                XfrmSaRelocationOperationId::from_bytes([0x51; 16]).unwrap(),
+                XfrmSaRelocationOperationGeneration::new(1).unwrap(),
+                fingerprints(0x81),
             )
             .unwrap();
         let issuing = next_handle(
             &store,
             &prepared,
-            XfrmObjectInstallDurablePhase::Prepared,
-            XfrmObjectInstallDurablePhase::Issuing,
-        );
-        let acquired = next_handle(
-            &store,
-            &issuing,
-            XfrmObjectInstallDurablePhase::Issuing,
-            XfrmObjectInstallDurablePhase::Acquired,
+            XfrmSaRelocationDurablePhase::Prepared,
+            XfrmSaRelocationDurablePhase::Issuing,
         );
         let lease = store.lease().unwrap();
         let inventory = lease.inventory().unwrap();
-        let (_, first) = lease.current_from_handle(&inventory, &acquired).unwrap();
-        let second = DurableObjectRecord {
-            operation_id: XfrmObjectInstallOperationId::from_bytes([0x52; 16]).unwrap(),
+        let (_, first) = lease.current_from_handle(&inventory, &issuing).unwrap();
+        let second = DurableRelocationRecord {
+            operation_id: XfrmSaRelocationOperationId::from_bytes([0x52; 16]).unwrap(),
             deletion_identity_fingerprint: [0x91; 32],
-            install_request_fingerprint: [0x92; 32],
+            relocation_request_fingerprint: [0x92; 32],
             ..first.clone()
         };
         lease.publish_record(&second).unwrap();
@@ -3119,7 +3009,7 @@ mod tests {
 
         assert_eq!(
             store.advance_writer_epoch(),
-            Err(XfrmObjectInstallDurableError::Duplicate)
+            Err(XfrmSaRelocationDurableError::Duplicate)
         );
     }
 
@@ -3129,137 +3019,145 @@ mod tests {
         let store = store(&root);
         let prepared = store
             .prepare(
-                XfrmObjectInstallOperationId::generate().unwrap(),
-                XfrmObjectInstallOperationGeneration::new(1).unwrap(),
-                XfrmInstallObject::Policy,
-                DurableObjectFingerprints::repeated(0x31),
+                XfrmSaRelocationOperationId::generate().unwrap(),
+                XfrmSaRelocationOperationGeneration::new(1).unwrap(),
+                fingerprints(0x31),
             )
             .unwrap();
         let issuing = next_handle(
             &store,
             &prepared,
-            XfrmObjectInstallDurablePhase::Prepared,
-            XfrmObjectInstallDurablePhase::Issuing,
+            XfrmSaRelocationDurablePhase::Prepared,
+            XfrmSaRelocationDurablePhase::Issuing,
         );
         assert_eq!(
             store.transition(
                 &prepared,
-                XfrmObjectInstallDurablePhase::Prepared,
-                XfrmObjectInstallDurablePhase::Issuing,
+                XfrmSaRelocationDurablePhase::Prepared,
+                XfrmSaRelocationDurablePhase::Issuing,
                 proof_for(
-                    XfrmObjectInstallDurablePhase::Prepared,
-                    XfrmObjectInstallDurablePhase::Issuing
+                    XfrmSaRelocationDurablePhase::Prepared,
+                    XfrmSaRelocationDurablePhase::Issuing
                 ),
             ),
-            Err(XfrmObjectInstallDurableError::Stale)
+            Err(XfrmSaRelocationDurableError::Stale)
         );
-        let acquired = next_handle(
+        let relocated = next_handle(
             &store,
             &issuing,
-            XfrmObjectInstallDurablePhase::Issuing,
-            XfrmObjectInstallDurablePhase::Acquired,
+            XfrmSaRelocationDurablePhase::Issuing,
+            XfrmSaRelocationDurablePhase::Relocated,
         );
         assert_eq!(
-            store.inspect(&acquired),
-            Ok(XfrmObjectInstallDurablePhase::Acquired)
+            store.inspect(&relocated),
+            Ok(XfrmSaRelocationDurablePhase::Relocated)
         );
         assert_eq!(
             store.inspect(&issuing),
-            Err(XfrmObjectInstallDurableError::Stale)
+            Err(XfrmSaRelocationDurableError::Stale)
         );
     }
 
     #[test]
-    fn acquired_authority_blocks_queued_and_new_writers_until_resolution() {
+    fn prepared_relocation_gates_every_writer_until_retired() {
         let root = TestRoot::new();
         let store = store(&root);
-        let operation_a = XfrmObjectInstallOperationId::generate().unwrap();
-        let generation = XfrmObjectInstallOperationGeneration::new(1).unwrap();
+        let operation_a = XfrmSaRelocationOperationId::generate().unwrap();
+        let generation = XfrmSaRelocationOperationGeneration::new(1).unwrap();
         let prepared_a = store
-            .prepare(
-                operation_a,
-                generation,
-                XfrmInstallObject::Sa,
-                DurableObjectFingerprints::repeated(0xa1),
-            )
+            .prepare(operation_a, generation, fingerprints(0xa1))
             .unwrap();
-        // Prepare B before A becomes unresolved writer authority, so a queued
-        // second operation exists to be gated once A advances.
-        let operation_b = XfrmObjectInstallOperationId::generate().unwrap();
-        let prepared_b = store
-            .prepare(
-                operation_b,
-                generation,
-                XfrmInstallObject::Policy,
-                DurableObjectFingerprints::repeated(0xb2),
-            )
-            .unwrap();
-        let issuing_a = next_handle(
-            &store,
-            &prepared_a,
-            XfrmObjectInstallDurablePhase::Prepared,
-            XfrmObjectInstallDurablePhase::Issuing,
-        );
-        // While A is Issuing, B is already prepared but may not be admitted.
-        assert_eq!(
-            store.transition(
-                &prepared_b,
-                XfrmObjectInstallDurablePhase::Prepared,
-                XfrmObjectInstallDurablePhase::Issuing,
-                proof_for(
-                    XfrmObjectInstallDurablePhase::Prepared,
-                    XfrmObjectInstallDurablePhase::Issuing
-                ),
-            ),
-            Err(XfrmObjectInstallDurableError::InvalidTransition)
-        );
-        let acquired_a = next_handle(
-            &store,
-            &issuing_a,
-            XfrmObjectInstallDurablePhase::Issuing,
-            XfrmObjectInstallDurablePhase::Acquired,
-        );
-        assert_eq!(
-            store.transition(
-                &prepared_b,
-                XfrmObjectInstallDurablePhase::Prepared,
-                XfrmObjectInstallDurablePhase::Issuing,
-                proof_for(
-                    XfrmObjectInstallDurablePhase::Prepared,
-                    XfrmObjectInstallDurablePhase::Issuing
-                ),
-            ),
-            Err(XfrmObjectInstallDurableError::InvalidTransition)
-        );
+        // While A stays Prepared, no other operation may prepare, no writer
+        // epoch may advance, and A's own admission remains the sole path.
         assert_eq!(
             store.prepare(
-                XfrmObjectInstallOperationId::generate().unwrap(),
+                XfrmSaRelocationOperationId::generate().unwrap(),
                 generation,
-                XfrmInstallObject::Policy,
-                DurableObjectFingerprints::repeated(0xb3),
+                fingerprints(0xb2),
             ),
-            Err(XfrmObjectInstallDurableError::InvalidTransition)
+            Err(XfrmSaRelocationDurableError::InvalidTransition)
         );
         assert_eq!(
             store.advance_writer_epoch(),
-            Err(XfrmObjectInstallDurableError::InvalidTransition)
+            Err(XfrmSaRelocationDurableError::InvalidTransition)
         );
-        assert!(store
-            .restore(
-                operation_a,
+        assert!(store.has_unresolved_writer_authority().unwrap());
+        // The sole prepared record can still advance to Issuing: the gate
+        // recheck excludes the transitioning record itself.
+        let issuing_a = next_handle(
+            &store,
+            &prepared_a,
+            XfrmSaRelocationDurablePhase::Prepared,
+            XfrmSaRelocationDurablePhase::Issuing,
+        );
+        assert_eq!(
+            store.prepare(
+                XfrmSaRelocationOperationId::generate().unwrap(),
                 generation,
-                XfrmInstallObject::Sa,
-                DurableObjectFingerprints::repeated(0xa1),
-            )
-            .is_ok());
+                fingerprints(0xb3),
+            ),
+            Err(XfrmSaRelocationDurableError::InvalidTransition)
+        );
+        // Retiring through the no-mutation verdict reopens the gate.
+        let no_mutation = next_handle(
+            &store,
+            &issuing_a,
+            XfrmSaRelocationDurablePhase::Issuing,
+            XfrmSaRelocationDurablePhase::NoMutation,
+        );
+        let _retired = next_handle(
+            &store,
+            &no_mutation,
+            XfrmSaRelocationDurablePhase::NoMutation,
+            XfrmSaRelocationDurablePhase::Retired,
+        );
+        assert!(!store.has_unresolved_writer_authority().unwrap());
+        assert!(store.advance_writer_epoch().is_ok());
         assert!(store
-            .transition(
-                &acquired_a,
-                XfrmObjectInstallDurablePhase::Acquired,
-                XfrmObjectInstallDurablePhase::RemovalAdmitted,
-                None,
+            .prepare(
+                XfrmSaRelocationOperationId::generate().unwrap(),
+                generation,
+                fingerprints(0xb3),
             )
             .is_ok());
+    }
+
+    #[test]
+    fn exact_duplicate_prepare_reports_duplicate_even_while_that_record_gates() {
+        let root = TestRoot::new();
+        let store = store(&root);
+        let operation = XfrmSaRelocationOperationId::generate().unwrap();
+        let generation = XfrmSaRelocationOperationGeneration::new(1).unwrap();
+        store
+            .prepare(operation, generation, fingerprints(0xc1))
+            .unwrap();
+        assert!(store.has_unresolved_writer_authority().unwrap());
+        // Replaying the exact operation and generation reports the duplicate
+        // even though that same Prepared record keeps the writer gate closed.
+        assert_eq!(
+            store.prepare(operation, generation, fingerprints(0xc1)),
+            Err(XfrmSaRelocationDurableError::Duplicate)
+        );
+        // The same holds for a distinct operation repeating the active
+        // deletion identity while the record gates.
+        assert_eq!(
+            store.prepare(
+                XfrmSaRelocationOperationId::generate().unwrap(),
+                generation,
+                fingerprints(0xc1),
+            ),
+            Err(XfrmSaRelocationDurableError::Duplicate)
+        );
+        // A distinct operation with a distinct identity still fails at the
+        // unresolved-record gate, not at the duplicate checks.
+        assert_eq!(
+            store.prepare(
+                XfrmSaRelocationOperationId::generate().unwrap(),
+                generation,
+                fingerprints(0xc2),
+            ),
+            Err(XfrmSaRelocationDurableError::InvalidTransition)
+        );
     }
 
     #[test]
@@ -3268,10 +3166,10 @@ mod tests {
         fs::create_dir(parent.path()).unwrap();
         fs::set_permissions(parent.path(), fs::Permissions::from_mode(DIRECTORY_MODE)).unwrap();
         let root = parent.path().join("store");
-        let store = XfrmObjectInstallRecoveryStore::open_bound(&root, key(9), [0x42; 40]).unwrap();
+        let store = XfrmSaRelocationRecoveryStore::open_bound(&root, key(9), [0x42; 40]).unwrap();
         assert!(root.is_dir());
         drop(store);
-        assert!(XfrmObjectInstallRecoveryStore::open_bound(&root, key(9), [0x42; 40]).is_ok());
+        assert!(XfrmSaRelocationRecoveryStore::open_bound(&root, key(9), [0x42; 40]).is_ok());
 
         let actual_parent = parent.path().join("actual");
         fs::create_dir(&actual_parent).unwrap();
@@ -3279,13 +3177,13 @@ mod tests {
         let linked_parent = parent.path().join("linked");
         symlink(&actual_parent, &linked_parent).unwrap();
         assert_eq!(
-            XfrmObjectInstallRecoveryStore::open_bound(
+            XfrmSaRelocationRecoveryStore::open_bound(
                 &linked_parent.join("store"),
                 key(9),
                 [0x42; 40],
             )
             .unwrap_err(),
-            XfrmObjectInstallDurableError::InvalidStoreRoot
+            XfrmSaRelocationDurableError::InvalidStoreRoot
         );
     }
 
@@ -3295,10 +3193,9 @@ mod tests {
         let record_store = store(&root);
         let handle = record_store
             .prepare(
-                XfrmObjectInstallOperationId::from_bytes([0xab; 16]).unwrap(),
-                XfrmObjectInstallOperationGeneration::new(1).unwrap(),
-                XfrmInstallObject::Sa,
-                DurableObjectFingerprints::repeated(0x45),
+                XfrmSaRelocationOperationId::from_bytes([0xab; 16]).unwrap(),
+                XfrmSaRelocationOperationGeneration::new(1).unwrap(),
+                fingerprints(0x45),
             )
             .unwrap();
         let lease = record_store.lease().unwrap();
@@ -3311,7 +3208,7 @@ mod tests {
         fs::rename(root.path().join(canonical), root.path().join(noncanonical)).unwrap();
         assert_eq!(
             record_store.inspect(&handle),
-            Err(XfrmObjectInstallDurableError::Malformed)
+            Err(XfrmSaRelocationDurableError::Malformed)
         );
 
         let epoch_root = TestRoot::new();
@@ -3329,112 +3226,93 @@ mod tests {
         .unwrap();
         assert_eq!(
             epoch_store.advance_writer_epoch(),
-            Err(XfrmObjectInstallDurableError::Malformed)
+            Err(XfrmSaRelocationDurableError::Malformed)
         );
     }
 
     #[test]
-    fn forged_later_epoch_stales_acquired_authority_fail_closed() {
+    fn forged_later_epoch_stales_removal_authority_fail_closed() {
         let root = TestRoot::new();
         let store = store(&root);
-        let operation = XfrmObjectInstallOperationId::generate().unwrap();
-        let generation = XfrmObjectInstallOperationGeneration::new(1).unwrap();
+        let operation = XfrmSaRelocationOperationId::generate().unwrap();
+        let generation = XfrmSaRelocationOperationGeneration::new(1).unwrap();
         let prepared = store
-            .prepare(
-                operation,
-                generation,
-                XfrmInstallObject::Sa,
-                DurableObjectFingerprints::repeated(0xa4),
-            )
+            .prepare(operation, generation, fingerprints(0xa4))
             .unwrap();
         let issuing = next_handle(
             &store,
             &prepared,
-            XfrmObjectInstallDurablePhase::Prepared,
-            XfrmObjectInstallDurablePhase::Issuing,
+            XfrmSaRelocationDurablePhase::Prepared,
+            XfrmSaRelocationDurablePhase::Issuing,
         );
-        let acquired = next_handle(
+        let issuing_record = store
+            .restore(operation, generation, fingerprints(0xa4))
+            .unwrap();
+        let admitted = next_handle(
             &store,
             &issuing,
-            XfrmObjectInstallDurablePhase::Issuing,
-            XfrmObjectInstallDurablePhase::Acquired,
+            XfrmSaRelocationDurablePhase::Issuing,
+            XfrmSaRelocationDurablePhase::RemovalAdmitted,
         );
         let lease = store.lease().unwrap();
         let inventory = lease.inventory().unwrap();
         lease.advance_epoch(&inventory).unwrap();
         drop(lease);
         assert_eq!(
-            store.restore(
-                operation,
-                generation,
-                XfrmInstallObject::Sa,
-                DurableObjectFingerprints::repeated(0xa4),
-            ),
-            Err(XfrmObjectInstallDurableError::Stale)
+            store.restore(operation, generation, fingerprints(0xa4)),
+            Err(XfrmSaRelocationDurableError::Stale)
         );
         assert_eq!(
             store.transition(
-                &acquired,
-                XfrmObjectInstallDurablePhase::Acquired,
-                XfrmObjectInstallDurablePhase::RemovalAdmitted,
+                &admitted,
+                XfrmSaRelocationDurablePhase::RemovalAdmitted,
+                XfrmSaRelocationDurablePhase::Retired,
                 None,
             ),
-            Err(XfrmObjectInstallDurableError::Stale)
+            Err(XfrmSaRelocationDurableError::Stale)
         );
+        assert!(!store
+            .record_writer_epoch_is_current(&issuing_record)
+            .unwrap());
     }
 
     #[test]
     fn removal_admitted_blocks_later_writer_until_retired() {
         let root = TestRoot::new();
         let store = store(&root);
-        let operation = XfrmObjectInstallOperationId::generate().unwrap();
-        let generation = XfrmObjectInstallOperationGeneration::new(1).unwrap();
+        let operation = XfrmSaRelocationOperationId::generate().unwrap();
+        let generation = XfrmSaRelocationOperationGeneration::new(1).unwrap();
         let prepared = store
-            .prepare(
-                operation,
-                generation,
-                XfrmInstallObject::Sa,
-                DurableObjectFingerprints::repeated(0xc3),
-            )
+            .prepare(operation, generation, fingerprints(0xc3))
             .unwrap();
         let issuing = next_handle(
             &store,
             &prepared,
-            XfrmObjectInstallDurablePhase::Prepared,
-            XfrmObjectInstallDurablePhase::Issuing,
-        );
-        let acquired = next_handle(
-            &store,
-            &issuing,
-            XfrmObjectInstallDurablePhase::Issuing,
-            XfrmObjectInstallDurablePhase::Acquired,
+            XfrmSaRelocationDurablePhase::Prepared,
+            XfrmSaRelocationDurablePhase::Issuing,
         );
         let admitted = next_handle(
             &store,
-            &acquired,
-            XfrmObjectInstallDurablePhase::Acquired,
-            XfrmObjectInstallDurablePhase::RemovalAdmitted,
+            &issuing,
+            XfrmSaRelocationDurablePhase::Issuing,
+            XfrmSaRelocationDurablePhase::RemovalAdmitted,
         );
         assert_eq!(
             store.advance_writer_epoch(),
-            Err(XfrmObjectInstallDurableError::InvalidTransition)
+            Err(XfrmSaRelocationDurableError::InvalidTransition)
         );
         assert!(store
-            .restore(
-                operation,
-                generation,
-                XfrmInstallObject::Sa,
-                DurableObjectFingerprints::repeated(0xc3),
-            )
+            .restore(operation, generation, fingerprints(0xc3))
             .is_ok());
         assert!(store
             .transition(
                 &admitted,
-                XfrmObjectInstallDurablePhase::RemovalAdmitted,
-                XfrmObjectInstallDurablePhase::Retired,
+                XfrmSaRelocationDurablePhase::RemovalAdmitted,
+                XfrmSaRelocationDurablePhase::Retired,
                 None,
             )
             .is_ok());
+        assert!(store.advance_writer_epoch().is_ok());
     }
 
     #[test]
@@ -3444,36 +3322,34 @@ mod tests {
         for index in 1_u64..=(MAX_STORE_ENTRIES as u64 * 2 + 1) {
             let mut operation = [0_u8; 16];
             operation[8..].copy_from_slice(&index.to_be_bytes());
-            let operation = XfrmObjectInstallOperationId::from_bytes(operation).unwrap();
-            let generation = XfrmObjectInstallOperationGeneration::new(index).unwrap();
+            let operation = XfrmSaRelocationOperationId::from_bytes(operation).unwrap();
+            let generation = XfrmSaRelocationOperationGeneration::new(index).unwrap();
             let mut deletion_identity = [0_u8; 32];
             deletion_identity[24..].copy_from_slice(&index.to_be_bytes());
-            let mut install_request = [0xff_u8; 32];
-            install_request[24..].copy_from_slice(&index.to_be_bytes());
-            let fingerprints = DurableObjectFingerprints {
+            let mut relocation_request = [0xff_u8; 32];
+            relocation_request[24..].copy_from_slice(&index.to_be_bytes());
+            let fingerprints = DurableRelocationFingerprints {
                 deletion_identity,
-                install_request,
+                relocation_request,
             };
-            let prepared = store
-                .prepare(operation, generation, XfrmInstallObject::Sa, fingerprints)
-                .unwrap();
+            let prepared = store.prepare(operation, generation, fingerprints).unwrap();
             let issuing = next_handle(
                 &store,
                 &prepared,
-                XfrmObjectInstallDurablePhase::Prepared,
-                XfrmObjectInstallDurablePhase::Issuing,
+                XfrmSaRelocationDurablePhase::Prepared,
+                XfrmSaRelocationDurablePhase::Issuing,
             );
             let no_mutation = next_handle(
                 &store,
                 &issuing,
-                XfrmObjectInstallDurablePhase::Issuing,
-                XfrmObjectInstallDurablePhase::NoMutation,
+                XfrmSaRelocationDurablePhase::Issuing,
+                XfrmSaRelocationDurablePhase::NoMutation,
             );
             let _retired = next_handle(
                 &store,
                 &no_mutation,
-                XfrmObjectInstallDurablePhase::NoMutation,
-                XfrmObjectInstallDurablePhase::Retired,
+                XfrmSaRelocationDurablePhase::NoMutation,
+                XfrmSaRelocationDurablePhase::Retired,
             );
         }
         for _ in 0..(MAX_STORE_ENTRIES * 2 + 1) {
@@ -3483,43 +3359,80 @@ mod tests {
     }
 
     #[test]
+    fn bounded_inventory_rejects_unbounded_publication() {
+        // Every unresolved relocation phase gates preparation, so capacity is
+        // enforced structurally by the bounded inventory scan rather than by
+        // accumulating 61 live records through the API: 63 forged records
+        // plus control and epoch exceed the 64-entry bound.
+        let root = TestRoot::new();
+        let store = store(&root);
+        let lease = store.lease().unwrap();
+        let epoch = lease.current_epoch(&lease.inventory().unwrap()).unwrap();
+        for index in 1_u64..=63 {
+            let mut operation = [0_u8; 16];
+            operation[8..].copy_from_slice(&index.to_be_bytes());
+            let mut deletion_identity = [0x10_u8; 32];
+            deletion_identity[24..].copy_from_slice(&index.to_be_bytes());
+            let mut relocation_request = [0x20_u8; 32];
+            relocation_request[24..].copy_from_slice(&index.to_be_bytes());
+            let record = DurableRelocationRecord {
+                phase: XfrmSaRelocationDurablePhase::Prepared,
+                pre_effect_proof: None,
+                store_incarnation: store.inner.control.store_incarnation,
+                namespace_seal: store.inner.control.namespace_seal,
+                actor_incarnation: store.inner.control.actor_incarnation,
+                operation_id: XfrmSaRelocationOperationId::from_bytes(operation).unwrap(),
+                operation_generation: XfrmSaRelocationOperationGeneration::new(1).unwrap(),
+                writer_epoch: epoch,
+                deletion_identity_fingerprint: deletion_identity,
+                relocation_request_fingerprint: relocation_request,
+            };
+            lease.publish_record(&record).unwrap();
+        }
+        drop(lease);
+        assert_eq!(
+            store.advance_writer_epoch(),
+            Err(XfrmSaRelocationDurableError::Malformed)
+        );
+    }
+
+    #[test]
     fn conflicting_adjacent_phase_residue_is_fail_closed() {
         let root = TestRoot::new();
         let store = store(&root);
         let prepared = store
             .prepare(
-                XfrmObjectInstallOperationId::generate().unwrap(),
-                XfrmObjectInstallOperationGeneration::new(1).unwrap(),
-                XfrmInstallObject::Sa,
-                DurableObjectFingerprints::repeated(0x77),
+                XfrmSaRelocationOperationId::generate().unwrap(),
+                XfrmSaRelocationOperationGeneration::new(1).unwrap(),
+                fingerprints(0x77),
             )
             .unwrap();
         let lease = store.lease().unwrap();
         let inventory = lease.inventory().unwrap();
         let (_, current) = lease.current_from_handle(&inventory, &prepared).unwrap();
-        let next = DurableObjectRecord {
-            phase: XfrmObjectInstallDurablePhase::Issuing,
+        let next = DurableRelocationRecord {
+            phase: XfrmSaRelocationDurablePhase::Issuing,
             writer_epoch: NonZeroU64::new(inventory.epoch.get() + 1).unwrap(),
-            pre_effect_proof: Some(XfrmObjectInstallPreEffectProof::Absent),
+            pre_effect_proof: Some(XfrmSaRelocationPreEffectProof::TargetAbsent),
             ..current.clone()
         };
         lease.publish_record(&next).unwrap();
         drop(lease);
         assert_eq!(
             store.inspect(&prepared),
-            Err(XfrmObjectInstallDurableError::Duplicate)
+            Err(XfrmSaRelocationDurableError::Duplicate)
         );
         assert_eq!(
             store.transition(
                 &prepared,
-                XfrmObjectInstallDurablePhase::Prepared,
-                XfrmObjectInstallDurablePhase::Issuing,
+                XfrmSaRelocationDurablePhase::Prepared,
+                XfrmSaRelocationDurablePhase::Issuing,
                 proof_for(
-                    XfrmObjectInstallDurablePhase::Prepared,
-                    XfrmObjectInstallDurablePhase::Issuing
+                    XfrmSaRelocationDurablePhase::Prepared,
+                    XfrmSaRelocationDurablePhase::Issuing
                 ),
             ),
-            Err(XfrmObjectInstallDurableError::Duplicate)
+            Err(XfrmSaRelocationDurableError::Duplicate)
         );
     }
 
@@ -3527,62 +3440,65 @@ mod tests {
     fn every_exact_adjacent_phase_publication_residue_self_heals() {
         for (old_phase, next_phase) in [
             (
-                XfrmObjectInstallDurablePhase::Prepared,
-                XfrmObjectInstallDurablePhase::Issuing,
+                XfrmSaRelocationDurablePhase::Prepared,
+                XfrmSaRelocationDurablePhase::Issuing,
             ),
             (
-                XfrmObjectInstallDurablePhase::Prepared,
-                XfrmObjectInstallDurablePhase::Retired,
+                XfrmSaRelocationDurablePhase::Prepared,
+                XfrmSaRelocationDurablePhase::Retired,
             ),
             (
-                XfrmObjectInstallDurablePhase::Issuing,
-                XfrmObjectInstallDurablePhase::Acquired,
+                XfrmSaRelocationDurablePhase::Issuing,
+                XfrmSaRelocationDurablePhase::Relocated,
             ),
             (
-                XfrmObjectInstallDurablePhase::Issuing,
-                XfrmObjectInstallDurablePhase::NoMutation,
+                XfrmSaRelocationDurablePhase::Issuing,
+                XfrmSaRelocationDurablePhase::NoMutation,
             ),
             (
-                XfrmObjectInstallDurablePhase::Issuing,
-                XfrmObjectInstallDurablePhase::Indeterminate,
+                XfrmSaRelocationDurablePhase::Issuing,
+                XfrmSaRelocationDurablePhase::Indeterminate,
             ),
             (
-                XfrmObjectInstallDurablePhase::Issuing,
-                XfrmObjectInstallDurablePhase::RemovalAdmitted,
+                XfrmSaRelocationDurablePhase::Issuing,
+                XfrmSaRelocationDurablePhase::StateAbsent,
             ),
             (
-                XfrmObjectInstallDurablePhase::Indeterminate,
-                XfrmObjectInstallDurablePhase::NoMutation,
+                XfrmSaRelocationDurablePhase::Issuing,
+                XfrmSaRelocationDurablePhase::RemovalAdmitted,
             ),
             (
-                XfrmObjectInstallDurablePhase::Indeterminate,
-                XfrmObjectInstallDurablePhase::RemovalAdmitted,
+                XfrmSaRelocationDurablePhase::Indeterminate,
+                XfrmSaRelocationDurablePhase::NoMutation,
             ),
             (
-                XfrmObjectInstallDurablePhase::Acquired,
-                XfrmObjectInstallDurablePhase::RemovalAdmitted,
+                XfrmSaRelocationDurablePhase::Indeterminate,
+                XfrmSaRelocationDurablePhase::StateAbsent,
             ),
             (
-                XfrmObjectInstallDurablePhase::Acquired,
-                XfrmObjectInstallDurablePhase::Committed,
+                XfrmSaRelocationDurablePhase::Indeterminate,
+                XfrmSaRelocationDurablePhase::RemovalAdmitted,
             ),
             (
-                XfrmObjectInstallDurablePhase::NoMutation,
-                XfrmObjectInstallDurablePhase::Retired,
+                XfrmSaRelocationDurablePhase::Relocated,
+                XfrmSaRelocationDurablePhase::Retired,
             ),
             (
-                XfrmObjectInstallDurablePhase::RemovalAdmitted,
-                XfrmObjectInstallDurablePhase::Retired,
+                XfrmSaRelocationDurablePhase::NoMutation,
+                XfrmSaRelocationDurablePhase::Retired,
+            ),
+            (
+                XfrmSaRelocationDurablePhase::RemovalAdmitted,
+                XfrmSaRelocationDurablePhase::Retired,
             ),
         ] {
             let root = TestRoot::new();
             let store = store(&root);
             let prepared = store
                 .prepare(
-                    XfrmObjectInstallOperationId::generate().unwrap(),
-                    XfrmObjectInstallOperationGeneration::new(1).unwrap(),
-                    XfrmInstallObject::Sa,
-                    DurableObjectFingerprints::repeated(0xd1),
+                    XfrmSaRelocationOperationId::generate().unwrap(),
+                    XfrmSaRelocationOperationGeneration::new(1).unwrap(),
+                    fingerprints(0xd1),
                 )
                 .unwrap();
             let lease = store.lease().unwrap();
@@ -3593,25 +3509,25 @@ mod tests {
             let mut old = prepared_record.clone();
             old.phase = old_phase;
             old.pre_effect_proof = valid_proof_for(old_phase);
-            if old_phase != XfrmObjectInstallDurablePhase::Prepared {
+            if old_phase != XfrmSaRelocationDurablePhase::Prepared {
                 lease.remove_record(&prepared_name).unwrap();
                 lease.publish_record(&old).unwrap();
             }
             let inventory = lease.inventory().unwrap();
             let old_name = record_name(&old);
-            let entering_issuing = old_phase == XfrmObjectInstallDurablePhase::Prepared
-                && next_phase == XfrmObjectInstallDurablePhase::Issuing;
+            let entering_issuing = old_phase == XfrmSaRelocationDurablePhase::Prepared
+                && next_phase == XfrmSaRelocationDurablePhase::Issuing;
             let next_proof = if entering_issuing {
-                Some(XfrmObjectInstallPreEffectProof::Absent)
+                Some(XfrmSaRelocationPreEffectProof::TargetAbsent)
             } else {
                 old.pre_effect_proof
             };
-            let mut next = DurableObjectRecord {
+            let mut next = DurableRelocationRecord {
                 phase: next_phase,
                 pre_effect_proof: next_proof,
                 ..old.clone()
             };
-            if next_phase == XfrmObjectInstallDurablePhase::Issuing {
+            if next_phase == XfrmSaRelocationDurablePhase::Issuing {
                 next.writer_epoch = lease.advance_epoch(&inventory).unwrap();
             }
             lease.publish_record(&next).unwrap();
@@ -3657,10 +3573,9 @@ mod tests {
         let store = store(&root);
         let handle = store
             .prepare(
-                XfrmObjectInstallOperationId::generate().unwrap(),
-                XfrmObjectInstallOperationGeneration::new(1).unwrap(),
-                XfrmInstallObject::Policy,
-                DurableObjectFingerprints::repeated(0x88),
+                XfrmSaRelocationOperationId::generate().unwrap(),
+                XfrmSaRelocationOperationGeneration::new(1).unwrap(),
+                fingerprints(0x88),
             )
             .unwrap();
         let lease = store.lease().unwrap();
@@ -3675,7 +3590,7 @@ mod tests {
         drop(lease);
         assert_eq!(
             store.inspect(&handle),
-            Err(XfrmObjectInstallDurableError::WrongIncarnation)
+            Err(XfrmSaRelocationDurableError::WrongIncarnation)
         );
     }
 
@@ -3685,14 +3600,12 @@ mod tests {
         let initial_store = store(&root);
         drop(initial_store);
         assert_eq!(
-            XfrmObjectInstallRecoveryStore::open_bound(root.path(), key(8), [0x42; 40])
-                .unwrap_err(),
-            XfrmObjectInstallDurableError::AuthenticationFailed
+            XfrmSaRelocationRecoveryStore::open_bound(root.path(), key(8), [0x42; 40]).unwrap_err(),
+            XfrmSaRelocationDurableError::AuthenticationFailed
         );
         assert_eq!(
-            XfrmObjectInstallRecoveryStore::open_bound(root.path(), key(9), [0x43; 40])
-                .unwrap_err(),
-            XfrmObjectInstallDurableError::WrongBinding
+            XfrmSaRelocationRecoveryStore::open_bound(root.path(), key(9), [0x43; 40]).unwrap_err(),
+            XfrmSaRelocationDurableError::WrongBinding
         );
 
         let copied = TestRoot::new();
@@ -3703,146 +3616,153 @@ mod tests {
             fs::copy(entry.path(), copied.path().join(entry.file_name())).unwrap();
         }
         assert_eq!(
-            XfrmObjectInstallRecoveryStore::open_bound(copied.path(), key(9), [0x42; 40])
+            XfrmSaRelocationRecoveryStore::open_bound(copied.path(), key(9), [0x42; 40])
                 .unwrap_err(),
-            XfrmObjectInstallDurableError::WrongBinding
+            XfrmSaRelocationDurableError::WrongBinding
         );
 
         let reopened = store(&root);
         fs::write(root.path().join("unknown"), b"poison").unwrap();
         assert_eq!(
             reopened.advance_writer_epoch(),
-            Err(XfrmObjectInstallDurableError::Malformed)
+            Err(XfrmSaRelocationDurableError::Malformed)
         );
     }
 
     #[test]
-    fn relocation_family_store_root_rejects_install_open_fail_closed() {
+    fn install_family_store_root_rejects_relocation_open_fail_closed() {
         let root = TestRoot::new();
-        let relocation_store =
-            crate::durable_relocation::XfrmSaRelocationRecoveryStore::open_bound(
-                root.path(),
-                crate::durable_relocation::XfrmSaRelocationRecoveryProofKey::new([9; 32]).unwrap(),
-                [0x42; 40],
-            )
-            .unwrap();
-        drop(relocation_store);
-        // The dropped relocation store's root passes ownership, mode, and
-        // flock validation on reopen; the rejection must come from
-        // control-record validation, where the relocation family's distinct
-        // control magic fails `ControlRecord::decode` before authentication
-        // is even attempted.
+        let install_store = crate::durable_object::XfrmObjectInstallRecoveryStore::open_bound(
+            root.path(),
+            crate::durable_object::XfrmObjectRecoveryProofKey::new([9; 32]).unwrap(),
+            [0x42; 40],
+        )
+        .unwrap();
+        drop(install_store);
+        // The dropped install store's root passes ownership, mode, and flock
+        // validation on reopen; the rejection must come from control-record
+        // validation, where the install family's distinct control magic fails
+        // `ControlRecord::decode` before authentication is even attempted.
         assert_eq!(
-            XfrmObjectInstallRecoveryStore::open_bound(root.path(), key(9), [0x42; 40])
-                .unwrap_err(),
-            XfrmObjectInstallDurableError::Malformed
+            XfrmSaRelocationRecoveryStore::open_bound(root.path(), key(9), [0x42; 40]).unwrap_err(),
+            XfrmSaRelocationDurableError::Malformed
         );
     }
 
     #[test]
-    fn deletion_fingerprint_covers_sa_and_scoped_policy_identity() {
+    fn deletion_fingerprint_covers_target_sa_identity() {
         let root = TestRoot::new();
         let store = store(&root);
-        let sa = XfrmObjectRemovalRequest::Sa(RemoveSaRequest {
-            destination: IpAddress::Ipv4([10, 0, 0, 1]),
-            protocol: 50,
-            spi: 7,
-            mark: Some(XfrmLookupMark::full(11)),
-        });
-        let mut changed_sa = sa.clone();
-        if let XfrmObjectRemovalRequest::Sa(request) = &mut changed_sa {
-            request.spi += 1;
-        }
+        let base = relocation_request();
+        let base_fingerprint = store.fingerprints_for_request(&base).unwrap();
+
+        let mut changed_destination = base.clone();
+        changed_destination.new_destination = ipv4(198, 51, 100, 21);
         assert_ne!(
+            base_fingerprint.deletion_identity,
             store
-                .deletion_identity_fingerprint_with_policy_if_id(&sa, None)
-                .unwrap(),
-            store
-                .deletion_identity_fingerprint_with_policy_if_id(&changed_sa, None)
+                .fingerprints_for_request(&changed_destination)
                 .unwrap()
+                .deletion_identity
         );
 
-        let policy = XfrmObjectRemovalRequest::Policy(RemovePolicyRequest {
-            selector: XfrmSelector::new(IpAddress::Ipv6([1; 16]), IpAddress::Ipv6([2; 16]), 17),
-            direction: XfrmDirection::Out,
-            mark: Some(XfrmLookupMark::full(12)),
-        });
-        let unscoped = store
-            .deletion_identity_fingerprint_with_policy_if_id(&policy, None)
-            .unwrap();
-        let scoped = store
-            .deletion_identity_fingerprint_with_policy_if_id(&policy, Some(9))
-            .unwrap();
-        let other_scope = store
-            .deletion_identity_fingerprint_with_policy_if_id(&policy, Some(10))
-            .unwrap();
-        assert_ne!(unscoped, scoped);
-        assert_ne!(scoped, other_scope);
-        assert_eq!(
-            store.deletion_identity_fingerprint_with_policy_if_id(&sa, Some(9)),
-            Err(XfrmObjectInstallDurableError::Malformed)
+        let mut changed_spi = base.clone();
+        changed_spi.current.id.spi += 1;
+        assert_ne!(
+            base_fingerprint.deletion_identity,
+            store
+                .fingerprints_for_request(&changed_spi)
+                .unwrap()
+                .deletion_identity
         );
-    }
 
-    #[test]
-    fn record_version_one_fails_closed_after_format_bump() {
-        let encoded = record(XfrmObjectInstallDurablePhase::Acquired)
-            .encode(&key(9))
-            .unwrap();
-        let mut v1 = encoded;
-        v1[8..10].copy_from_slice(&1_u16.to_be_bytes());
-        assert_eq!(
-            DurableObjectRecord::decode(&v1, &key(9)),
-            Err(XfrmObjectInstallDurableError::Malformed)
+        let mut changed_mark = base.clone();
+        changed_mark.current.mark = Some(XfrmLookupMark::full(0x6291));
+        assert_ne!(
+            base_fingerprint.deletion_identity,
+            store
+                .fingerprints_for_request(&changed_mark)
+                .unwrap()
+                .deletion_identity
         );
+
+        // Every retained request field changes the request fingerprint.
+        let mut changed_source = base.clone();
+        changed_source.new_source_address = ipv4(198, 51, 100, 11);
+        assert_ne!(
+            base_fingerprint.relocation_request,
+            store
+                .fingerprints_for_request(&changed_source)
+                .unwrap()
+                .relocation_request
+        );
+        let mut changed_direction = base.clone();
+        changed_direction.direction = SaRelocationDirection::OutboundBlockPolicyInstalled;
+        assert_ne!(
+            base_fingerprint.relocation_request,
+            store
+                .fingerprints_for_request(&changed_direction)
+                .unwrap()
+                .relocation_request
+        );
+        let mut changed_selector = base.clone();
+        changed_selector.current.selector.user_id = 1;
+        assert_ne!(
+            base_fingerprint.relocation_request,
+            store
+                .fingerprints_for_request(&changed_selector)
+                .unwrap()
+                .relocation_request
+        );
+
+        // A narrow lookup mark cannot produce an exact removal identity.
+        let mut narrow_mark = base.clone();
+        narrow_mark.current.mark = Some(XfrmLookupMark::new(0x6290_0000, 0xffff_0000).unwrap());
+        assert!(matches!(
+            store.fingerprints_for_request(&narrow_mark),
+            Err(XfrmSaRelocationDurableError::NonExactRemovalIdentity)
+        ));
     }
 
     #[test]
     fn proof_encoding_rules_fail_closed() {
         // Unknown proof codes are malformed.
-        let valid = record(XfrmObjectInstallDurablePhase::Issuing)
+        let valid = record(XfrmSaRelocationDurablePhase::Issuing)
             .encode(&key(9))
             .unwrap();
         let mut bad_code = valid;
         bad_code[12] = 3;
         assert_eq!(
-            DurableObjectRecord::decode(&bad_code, &key(9)),
-            Err(XfrmObjectInstallDurableError::Malformed)
-        );
-        // A trailing reserved byte must stay zero.
-        let mut bad_reserved = valid;
-        bad_reserved[13] = 1;
-        assert_eq!(
-            DurableObjectRecord::decode(&bad_reserved, &key(9)),
-            Err(XfrmObjectInstallDurableError::Malformed)
+            DurableRelocationRecord::decode(&bad_code, &key(9)),
+            Err(XfrmSaRelocationDurableError::Malformed)
         );
         // Prepared must not carry a proof.
-        let mut prepared_with_proof = record(XfrmObjectInstallDurablePhase::Prepared);
-        prepared_with_proof.pre_effect_proof = Some(XfrmObjectInstallPreEffectProof::Absent);
+        let mut prepared_with_proof = record(XfrmSaRelocationDurablePhase::Prepared);
+        prepared_with_proof.pre_effect_proof = Some(XfrmSaRelocationPreEffectProof::TargetAbsent);
         assert_eq!(
             prepared_with_proof.encode(&key(9)),
-            Err(XfrmObjectInstallDurableError::Malformed)
+            Err(XfrmSaRelocationDurableError::Malformed)
         );
         // An effect-possible record must carry a proof.
-        let mut issuing_without_proof = record(XfrmObjectInstallDurablePhase::Issuing);
+        let mut issuing_without_proof = record(XfrmSaRelocationDurablePhase::Issuing);
         issuing_without_proof.pre_effect_proof = None;
         assert_eq!(
             issuing_without_proof.encode(&key(9)),
-            Err(XfrmObjectInstallDurableError::Malformed)
+            Err(XfrmSaRelocationDurableError::Malformed)
         );
     }
 
     #[test]
     fn proof_round_trips_both_witnesses() {
         for proof in [
-            XfrmObjectInstallPreEffectProof::Absent,
-            XfrmObjectInstallPreEffectProof::Conflict,
+            XfrmSaRelocationPreEffectProof::TargetAbsent,
+            XfrmSaRelocationPreEffectProof::SameIdentityWitnessed,
         ] {
-            let mut expected = record(XfrmObjectInstallDurablePhase::Issuing);
+            let mut expected = record(XfrmSaRelocationDurablePhase::Issuing);
             expected.pre_effect_proof = Some(proof);
             let encoded = expected.encode(&key(9)).unwrap();
             assert_eq!(
-                DurableObjectRecord::decode(&encoded, &key(9)).unwrap(),
+                DurableRelocationRecord::decode(&encoded, &key(9)).unwrap(),
                 expected
             );
         }
@@ -3854,188 +3774,165 @@ mod tests {
         let store = store(&root);
         let prepared = store
             .prepare(
-                XfrmObjectInstallOperationId::generate().unwrap(),
-                XfrmObjectInstallOperationGeneration::new(1).unwrap(),
-                XfrmInstallObject::Sa,
-                DurableObjectFingerprints::repeated(0x61),
+                XfrmSaRelocationOperationId::generate().unwrap(),
+                XfrmSaRelocationOperationGeneration::new(1).unwrap(),
+                fingerprints(0x61),
             )
             .unwrap();
         // Missing proof for Prepared -> Issuing is rejected.
         assert_eq!(
             store.transition(
                 &prepared,
-                XfrmObjectInstallDurablePhase::Prepared,
-                XfrmObjectInstallDurablePhase::Issuing,
+                XfrmSaRelocationDurablePhase::Prepared,
+                XfrmSaRelocationDurablePhase::Issuing,
                 None,
             ),
-            Err(XfrmObjectInstallDurableError::InvalidTransition)
+            Err(XfrmSaRelocationDurableError::InvalidTransition)
         );
         let issuing = store
             .transition(
                 &prepared,
-                XfrmObjectInstallDurablePhase::Prepared,
-                XfrmObjectInstallDurablePhase::Issuing,
-                Some(XfrmObjectInstallPreEffectProof::Absent),
+                XfrmSaRelocationDurablePhase::Prepared,
+                XfrmSaRelocationDurablePhase::Issuing,
+                Some(XfrmSaRelocationPreEffectProof::TargetAbsent),
             )
             .unwrap();
         assert_eq!(
             issuing.pre_effect_proof,
-            Some(XfrmObjectInstallPreEffectProof::Absent)
+            Some(XfrmSaRelocationPreEffectProof::TargetAbsent)
         );
         // A supplied proof on any non-issuing transition is rejected.
         let issuing_handle = issuing.handle(&store.inner.proof_key).unwrap();
         assert_eq!(
             store.transition(
                 &issuing_handle,
-                XfrmObjectInstallDurablePhase::Issuing,
-                XfrmObjectInstallDurablePhase::Acquired,
-                Some(XfrmObjectInstallPreEffectProof::Conflict),
+                XfrmSaRelocationDurablePhase::Issuing,
+                XfrmSaRelocationDurablePhase::Relocated,
+                Some(XfrmSaRelocationPreEffectProof::SameIdentityWitnessed),
             ),
-            Err(XfrmObjectInstallDurableError::InvalidTransition)
+            Err(XfrmSaRelocationDurableError::InvalidTransition)
         );
         // The accepted transition preserves the witnessed proof.
-        let acquired = store
+        let relocated = store
             .transition(
                 &issuing_handle,
-                XfrmObjectInstallDurablePhase::Issuing,
-                XfrmObjectInstallDurablePhase::Acquired,
+                XfrmSaRelocationDurablePhase::Issuing,
+                XfrmSaRelocationDurablePhase::Relocated,
                 None,
             )
             .unwrap();
         assert_eq!(
-            acquired.pre_effect_proof,
-            Some(XfrmObjectInstallPreEffectProof::Absent)
+            relocated.pre_effect_proof,
+            Some(XfrmSaRelocationPreEffectProof::TargetAbsent)
         );
     }
 
     #[test]
-    fn unresolved_issuing_gates_prepare_and_writer_epoch_until_retired() {
+    fn unresolved_phases_gate_prepare_and_writer_epoch_until_retired() {
         for unresolved_phase in [
-            XfrmObjectInstallDurablePhase::Issuing,
-            XfrmObjectInstallDurablePhase::Indeterminate,
+            XfrmSaRelocationDurablePhase::Prepared,
+            XfrmSaRelocationDurablePhase::Issuing,
+            XfrmSaRelocationDurablePhase::Indeterminate,
+            XfrmSaRelocationDurablePhase::RemovalAdmitted,
         ] {
             let root = TestRoot::new();
             let store = store(&root);
-            let operation = XfrmObjectInstallOperationId::generate().unwrap();
-            let generation = XfrmObjectInstallOperationGeneration::new(1).unwrap();
+            let operation = XfrmSaRelocationOperationId::generate().unwrap();
+            let generation = XfrmSaRelocationOperationGeneration::new(1).unwrap();
             let prepared = store
-                .prepare(
-                    operation,
-                    generation,
-                    XfrmInstallObject::Sa,
-                    DurableObjectFingerprints::repeated(0x62),
-                )
+                .prepare(operation, generation, fingerprints(0x62))
                 .unwrap();
-            let issuing = next_handle(
-                &store,
-                &prepared,
-                XfrmObjectInstallDurablePhase::Prepared,
-                XfrmObjectInstallDurablePhase::Issuing,
-            );
-            let unresolved_handle = if unresolved_phase == XfrmObjectInstallDurablePhase::Issuing {
-                issuing.clone()
+            let unresolved_handle = if unresolved_phase == XfrmSaRelocationDurablePhase::Prepared {
+                prepared.clone()
             } else {
-                next_handle(
+                let issuing = next_handle(
                     &store,
-                    &issuing,
-                    XfrmObjectInstallDurablePhase::Issuing,
-                    XfrmObjectInstallDurablePhase::Indeterminate,
-                )
+                    &prepared,
+                    XfrmSaRelocationDurablePhase::Prepared,
+                    XfrmSaRelocationDurablePhase::Issuing,
+                );
+                if unresolved_phase == XfrmSaRelocationDurablePhase::Issuing {
+                    issuing.clone()
+                } else {
+                    next_handle(
+                        &store,
+                        &issuing,
+                        XfrmSaRelocationDurablePhase::Issuing,
+                        unresolved_phase,
+                    )
+                }
             };
+            assert!(store.has_unresolved_writer_authority().unwrap());
             assert_eq!(
                 store.prepare(
-                    XfrmObjectInstallOperationId::generate().unwrap(),
+                    XfrmSaRelocationOperationId::generate().unwrap(),
                     generation,
-                    XfrmInstallObject::Policy,
-                    DurableObjectFingerprints::repeated(0x63),
+                    fingerprints(0x63),
                 ),
-                Err(XfrmObjectInstallDurableError::InvalidTransition)
+                Err(XfrmSaRelocationDurableError::InvalidTransition)
             );
             assert_eq!(
                 store.advance_writer_epoch(),
-                Err(XfrmObjectInstallDurableError::InvalidTransition)
+                Err(XfrmSaRelocationDurableError::InvalidTransition)
             );
-            // Retire the unresolved record through a no-mutation verdict and
-            // confirm the gate reopens.
-            let no_mutation = next_handle(
-                &store,
-                &unresolved_handle,
-                unresolved_phase,
-                XfrmObjectInstallDurablePhase::NoMutation,
-            );
-            let _retired = next_handle(
-                &store,
-                &no_mutation,
-                XfrmObjectInstallDurablePhase::NoMutation,
-                XfrmObjectInstallDurablePhase::Retired,
-            );
+            // Retire the unresolved record through a no-mutation or removal
+            // verdict and confirm the gate reopens.
+            let retired = match unresolved_phase {
+                XfrmSaRelocationDurablePhase::Prepared => next_handle(
+                    &store,
+                    &unresolved_handle,
+                    unresolved_phase,
+                    XfrmSaRelocationDurablePhase::Retired,
+                ),
+                XfrmSaRelocationDurablePhase::RemovalAdmitted => next_handle(
+                    &store,
+                    &unresolved_handle,
+                    unresolved_phase,
+                    XfrmSaRelocationDurablePhase::Retired,
+                ),
+                _ => {
+                    let no_mutation = next_handle(
+                        &store,
+                        &unresolved_handle,
+                        unresolved_phase,
+                        XfrmSaRelocationDurablePhase::NoMutation,
+                    );
+                    next_handle(
+                        &store,
+                        &no_mutation,
+                        XfrmSaRelocationDurablePhase::NoMutation,
+                        XfrmSaRelocationDurablePhase::Retired,
+                    )
+                }
+            };
+            let _ = retired;
+            assert!(!store.has_unresolved_writer_authority().unwrap());
             assert!(store.advance_writer_epoch().is_ok());
             assert!(store
                 .prepare(
-                    XfrmObjectInstallOperationId::generate().unwrap(),
+                    XfrmSaRelocationOperationId::generate().unwrap(),
                     generation,
-                    XfrmInstallObject::Policy,
-                    DurableObjectFingerprints::repeated(0x63),
+                    fingerprints(0x63),
                 )
                 .is_ok());
         }
     }
 
     #[test]
-    fn duplicate_issuing_authorities_fail_closed() {
-        let root = TestRoot::new();
-        let store = store(&root);
-        let prepared = store
-            .prepare(
-                XfrmObjectInstallOperationId::from_bytes([0x64; 16]).unwrap(),
-                XfrmObjectInstallOperationGeneration::new(1).unwrap(),
-                XfrmInstallObject::Sa,
-                DurableObjectFingerprints::repeated(0x65),
-            )
-            .unwrap();
-        let issuing = next_handle(
-            &store,
-            &prepared,
-            XfrmObjectInstallDurablePhase::Prepared,
-            XfrmObjectInstallDurablePhase::Issuing,
-        );
-        let lease = store.lease().unwrap();
-        let inventory = lease.inventory().unwrap();
-        let (_, first) = lease.current_from_handle(&inventory, &issuing).unwrap();
-        let second = DurableObjectRecord {
-            operation_id: XfrmObjectInstallOperationId::from_bytes([0x66; 16]).unwrap(),
-            deletion_identity_fingerprint: [0x67; 32],
-            install_request_fingerprint: [0x68; 32],
-            ..first.clone()
-        };
-        lease.publish_record(&second).unwrap();
-        drop(lease);
-        assert_eq!(
-            store.advance_writer_epoch(),
-            Err(XfrmObjectInstallDurableError::Duplicate)
-        );
-    }
-
-    #[test]
     fn epoch_currency_predicate_tracks_writer_epoch_advances() {
         let root = TestRoot::new();
         let store = store(&root);
-        let operation = XfrmObjectInstallOperationId::generate().unwrap();
-        let generation = XfrmObjectInstallOperationGeneration::new(1).unwrap();
+        let operation = XfrmSaRelocationOperationId::generate().unwrap();
+        let generation = XfrmSaRelocationOperationGeneration::new(1).unwrap();
         let prepared = store
-            .prepare(
-                operation,
-                generation,
-                XfrmInstallObject::Sa,
-                DurableObjectFingerprints::repeated(0x69),
-            )
+            .prepare(operation, generation, fingerprints(0x69))
             .unwrap();
         let issuing = store
             .transition(
                 &prepared,
-                XfrmObjectInstallDurablePhase::Prepared,
-                XfrmObjectInstallDurablePhase::Issuing,
-                Some(XfrmObjectInstallPreEffectProof::Absent),
+                XfrmSaRelocationDurablePhase::Prepared,
+                XfrmSaRelocationDurablePhase::Issuing,
+                Some(XfrmSaRelocationPreEffectProof::TargetAbsent),
             )
             .unwrap();
         assert!(store.record_writer_epoch_is_current(&issuing).unwrap());
@@ -4048,6 +3945,38 @@ mod tests {
         assert!(!store.record_writer_epoch_is_current(&issuing).unwrap());
     }
 
+    /// Build the flow-level test request used by the durable-anomaly recovery
+    /// detectors below.
+    fn flow_relocation_request() -> RelocateSaRequest {
+        use crate::{SaRelocationIdentity, SaRelocationSelector, XfrmSelector};
+        let current = SaRelocationIdentity {
+            selector: SaRelocationSelector::from_selector(&XfrmSelector::new(
+                IpAddress::Ipv4([10, 62, 9, 1]),
+                IpAddress::Ipv4([10, 62, 9, 2]),
+                17,
+            )),
+            id: XfrmId {
+                destination: IpAddress::Ipv4([192, 0, 2, 62]),
+                spi: 0x6290_0001,
+                protocol: 50,
+            },
+            source_address: IpAddress::Ipv4([192, 0, 2, 61]),
+            request_id: XfrmRequestId::new(629),
+            mode: XfrmMode::Tunnel,
+            encap: Some(UdpEncap::esp_in_udp(4500, 4500)),
+            mark: Some(XfrmLookupMark::full(0x6290)),
+            if_id: Some(9),
+            output_mark: None,
+        };
+        RelocateSaRequest {
+            current,
+            new_source_address: IpAddress::Ipv4([198, 51, 100, 10]),
+            new_destination: IpAddress::Ipv4([198, 51, 100, 20]),
+            encap: SaRelocationEncap::Set(UdpEncap::esp_in_udp(4500, 62_000)),
+            direction: SaRelocationDirection::Inbound,
+        }
+    }
+
     #[tokio::test]
     async fn stale_epoch_under_unresolved_record_recovers_repair_required() {
         // A durable anomaly that advances the epoch underneath an unresolved
@@ -4055,19 +3984,17 @@ mod tests {
         // to delete and classify the record for repair, keeping it gating.
         let root = TestRoot::new();
         let store = store(&root);
-        let operation = XfrmObjectInstallOperationId::generate().unwrap();
-        let generation = XfrmObjectInstallOperationGeneration::new(1).unwrap();
-        let request = crate::durable_install::tests_sa_request_for_repair();
+        let operation = XfrmSaRelocationOperationId::generate().unwrap();
+        let generation = XfrmSaRelocationOperationGeneration::new(1).unwrap();
+        let request = flow_relocation_request();
         let fingerprints = store.fingerprints_for_request(&request).unwrap();
-        let prepared = store
-            .prepare(operation, generation, request.object(), fingerprints)
-            .unwrap();
+        let prepared = store.prepare(operation, generation, fingerprints).unwrap();
         store
             .transition(
                 &prepared,
-                XfrmObjectInstallDurablePhase::Prepared,
-                XfrmObjectInstallDurablePhase::Issuing,
-                Some(XfrmObjectInstallPreEffectProof::Absent),
+                XfrmSaRelocationDurablePhase::Prepared,
+                XfrmSaRelocationDurablePhase::Issuing,
+                Some(XfrmSaRelocationPreEffectProof::TargetAbsent),
             )
             .unwrap();
         let lease = store.lease().unwrap();
@@ -4076,7 +4003,7 @@ mod tests {
         drop(lease);
 
         let backend = crate::MockXfrmBackend::new();
-        let outcome = crate::durable_install::recover_durable_object_install(
+        let outcome = crate::durable_relocation_flow::recover_durable_sa_relocation(
             &store, operation, generation, &request, &backend,
         )
         .await
@@ -4085,7 +4012,53 @@ mod tests {
         // The record remains unresolved and keeps gating writers.
         assert_eq!(
             store.advance_writer_epoch(),
-            Err(XfrmObjectInstallDurableError::InvalidTransition)
+            Err(XfrmSaRelocationDurableError::InvalidTransition)
         );
+        assert!(backend.operations().is_empty());
+    }
+
+    #[tokio::test]
+    async fn removed_proof_under_unresolved_record_fails_closed() {
+        // Tampering that removes the pre-effect proof from an effect-possible
+        // record is re-authenticated below so the detector reacts to the
+        // missing proof itself, not to a broken tag. Record decode enforces
+        // phase/proof consistency, so the store refuses to read the record at
+        // all and recovery performs no deletion.
+        let root = TestRoot::new();
+        let store = store(&root);
+        let operation = XfrmSaRelocationOperationId::generate().unwrap();
+        let generation = XfrmSaRelocationOperationGeneration::new(1).unwrap();
+        let request = flow_relocation_request();
+        let fingerprints = store.fingerprints_for_request(&request).unwrap();
+        let prepared = store.prepare(operation, generation, fingerprints).unwrap();
+        let issuing = store
+            .transition(
+                &prepared,
+                XfrmSaRelocationDurablePhase::Prepared,
+                XfrmSaRelocationDurablePhase::Issuing,
+                Some(XfrmSaRelocationPreEffectProof::TargetAbsent),
+            )
+            .unwrap();
+        let record_file = root.path().join(record_name(&issuing));
+        let _ = issuing;
+
+        // Rewrite the durable record file with the proof byte zeroed and a
+        // fresh authentication tag.
+        let mut encoded = fs::read(&record_file).unwrap();
+        encoded[12] = 0;
+        let tag = authenticate_domain(&key(9), RECORD_AUTH_DOMAIN, &encoded[..RECORD_BODY_BYTES])
+            .unwrap();
+        encoded[RECORD_BODY_BYTES..].copy_from_slice(&tag);
+        fs::write(&record_file, &encoded).unwrap();
+
+        let backend = crate::MockXfrmBackend::new();
+        assert!(matches!(
+            crate::durable_relocation_flow::recover_durable_sa_relocation(
+                &store, operation, generation, &request, &backend,
+            )
+            .await,
+            Err(XfrmSaRelocationDurableError::Malformed)
+        ));
+        assert!(backend.operations().is_empty());
     }
 }

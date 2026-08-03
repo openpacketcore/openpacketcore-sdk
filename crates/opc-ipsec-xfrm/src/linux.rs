@@ -30,6 +30,8 @@ use zeroize::Zeroizing;
 use crate::dscp::{production_runtime, LinuxXfrmDscpMarkingConfig, XfrmDscpRuntime};
 #[cfg(unix)]
 use crate::durable_object::{XfrmObjectInstallRecoveryStore, XfrmObjectRecoveryProofKey};
+#[cfg(unix)]
+use crate::durable_relocation::{XfrmSaRelocationRecoveryProofKey, XfrmSaRelocationRecoveryStore};
 use crate::model::{
     sa_uses_esn, validate_exact_remove_policy_request, validate_policy_query,
     validate_relocate_sa_request, validate_sa_output_mark, validate_sa_query,
@@ -417,6 +419,62 @@ impl LinuxXfrmBackend {
         XfrmObjectRecoveryBindError,
     > {
         namespace::bind_current_network_namespace_with_object_recovery(self, path, proof_key)
+    }
+
+    /// Bind to the calling thread's current network namespace and attach its
+    /// durable SA relocation recovery store atomically.
+    ///
+    /// Store authentication and the permanent lease complete on the actor
+    /// thread before any mutation-capable backend handle is returned. Durable
+    /// relocation recovery users must use this constructor on every process
+    /// start so an ordinary SDK mutation cannot occur before the retained
+    /// writer epoch and relocation authority are active.
+    #[cfg(unix)]
+    pub fn bind_current_network_namespace_with_sa_relocation_recovery(
+        self,
+        path: PathBuf,
+        proof_key: XfrmSaRelocationRecoveryProofKey,
+    ) -> Result<
+        (
+            NamespaceBoundLinuxXfrmBackend,
+            XfrmSaRelocationRecoveryStore,
+        ),
+        XfrmObjectRecoveryBindError,
+    > {
+        namespace::bind_current_network_namespace_with_sa_relocation_recovery(self, path, proof_key)
+    }
+
+    /// Bind to the calling thread's current network namespace and attach both
+    /// the durable staged-object recovery store and the durable SA relocation
+    /// recovery store atomically.
+    ///
+    /// Consumers such as an ePDG that run durable installs and durable
+    /// relocations under one namespace actor must bind both stores before any
+    /// mutation-capable handle becomes visible, so the cross-family
+    /// cooperating-writer gate is active from the first operation. The two
+    /// stores must use distinct leased roots.
+    #[cfg(unix)]
+    pub fn bind_current_network_namespace_with_object_and_sa_relocation_recovery(
+        self,
+        object_path: PathBuf,
+        object_proof_key: XfrmObjectRecoveryProofKey,
+        relocation_path: PathBuf,
+        relocation_proof_key: XfrmSaRelocationRecoveryProofKey,
+    ) -> Result<
+        (
+            NamespaceBoundLinuxXfrmBackend,
+            XfrmObjectInstallRecoveryStore,
+            XfrmSaRelocationRecoveryStore,
+        ),
+        XfrmObjectRecoveryBindError,
+    > {
+        namespace::bind_current_network_namespace_with_object_and_sa_relocation_recovery(
+            self,
+            object_path,
+            object_proof_key,
+            relocation_path,
+            relocation_proof_key,
+        )
     }
 
     pub(crate) fn for_namespace_actor(self, binding: NetworkNamespaceBinding) -> Self {
@@ -4572,6 +4630,17 @@ pub(crate) fn test_dscp_sa_readback_body(
     config: &LinuxXfrmDscpMarkingConfig,
 ) -> Result<SensitiveBuffer, XfrmError> {
     encode_sa_info_with_dscp(parameters, Some(config.profile()?))
+}
+
+/// Test-only helper: encode one GETSA relocation readback body and derive
+/// the exact [`SaRelocationIdentity`] it parses to.
+#[cfg(test)]
+pub(crate) fn test_sa_relocation_readback(
+    parameters: &SaParameters,
+) -> Result<(Vec<u8>, SaRelocationIdentity), XfrmError> {
+    let body = encode_sa_info(parameters)?;
+    let snapshot = parse_sa_relocation_snapshot(&body)?;
+    Ok((body.to_vec(), snapshot.identity))
 }
 
 #[cfg(test)]

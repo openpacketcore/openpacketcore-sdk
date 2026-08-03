@@ -146,6 +146,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   scope proof before `DELPOLICY`. Atomic file publication, durable global
   epochs, cancellation-safe actor completion, mock SA/policy outcomes, and
   kill/restart namespace detectors cover the crash-ordering contract.
+- **Durable SA relocation recovery — `opc-ipsec-xfrm`:**
+  `LinuxXfrmBackend::bind_current_network_namespace_with_sa_relocation_recovery`
+  and the combined
+  `bind_current_network_namespace_with_object_and_sa_relocation_recovery`
+  authenticate and permanently lease a self-contained
+  `XfrmSaRelocationRecoveryStore` on the namespace actor before returning a
+  mutation-capable backend, so an ordinary SDK mutation can never precede the
+  retained relocation writer epoch. Exact SA relocations now expose the same
+  durable pre-effect split as staged-object installs: `prepare_sa_relocation`
+  publishes authenticated `Prepared` truth and returns a non-cloneable
+  `XfrmSaRelocationAdmissionAuthority`; `run_durable_sa_relocation` witnesses
+  the old and target identities through exact `GETSA` readbacks, embeds the
+  witnessed target disposition (`TargetAbsent` for a changed XfrmId,
+  `SameIdentityWitnessed` for encapsulation/source-only relocation at an
+  unchanged XfrmId, mirroring RFC 4301 §4.1 SAD identity and RFC 4555
+  §1.1/§1.2/§3.8 move-not-copy semantics) as a durable pre-effect proof in
+  the authenticated record, persists `Issuing`, and only then admits the
+  single `relocate_sa` MIGRATE effect, publishing `Relocated`, `NoMutation`,
+  or `Indeterminate` before returning. Proved deterministic pre-effect
+  rejections — a deferred DSCP gate, a present target identity, and an
+  untrustworthy readback — return the exact affine authority with `Prepared`
+  retained; a mismatching current state consumes it under a value-free label.
+  There is no finalize/adoption call: a terminal `Relocated` record is the
+  durable proof that the consumer continues on the new addresses. After
+  process loss, `recover_durable_sa_relocation` classifies unresolved
+  `Issuing`/`Indeterminate` records from their proof plus fresh exact
+  readbacks — intact old state retires as no-mutation, absent current/target
+  state publishes the distinct terminal `StateAbsent` outcome without
+  claiming no mutation, and an unpublished owned move is removed through the
+  exact target deletion identity after `RemovalAdmitted`; foreign or ambiguous
+  state authorizes no deletion, and stale-epoch or missing/inconsistent-proof
+  records stay fail-closed for repair — while prepared records retire as
+  authoritative no-mutation and terminal proof is returned idempotently.
+  Every unresolved relocation phase, including `Prepared`, gates all later
+  cooperating mutations in the namespace. Effect-capable install and
+  relocation records gate each other, and every admitted mutation advances
+  both durable writer epochs. Durable runs and effect-capable recovery
+  cross-fence older prepared authority before kernel access. Reopen also
+  removes only strictly validated, family-specific staging residue left by
+  process death before atomic rename; unsafe lookalikes stay fail-closed.
+  Fixed-size relocation records (`OPCXRLC1`, format
+  version 1 with the proof byte present from version 1, and family-distinct
+  `OPCXRCT1`/`OPCXREP1` control/epoch file magics so an open against another
+  durable family's root fails closed) retain only opaque
+  correlation, phase, proof code, incarnation, epoch, and independent
+  proof-keyed fingerprints of the deletion identity and complete relocation
+  request; no address, selector, SPI, mark, encap port, namespace identity,
+  request body, or operation identity is rendered. Privileged
+  process-loss detectors cover prepared cuts, issuing cuts before and after
+  the MIGRATE effect for inbound, outbound-block-policy, and same-XfrmId
+  encapsulation relocations, foreign-state injection, and wrong-namespace
+  binding; there is no compatibility path, migration bridge, or
+  unconditional-delete escape hatch.
 - **Bounded IPCP syntax validation in PCO/APCO — `opc-proto-gtpv2c`:**
   `PcoAddressConfiguration::validate_network_contents_ipcp_syntax` traverses
   the same bounded PCO framing cursor as address decode and checks the RFC 1661

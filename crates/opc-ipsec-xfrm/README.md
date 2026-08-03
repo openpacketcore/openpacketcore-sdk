@@ -278,6 +278,143 @@ directory itself. Deployments where such storage rollback is possible must add
 an independent product monotonic witness outside that rollback domain and must
 not recover until it matches; otherwise unconditional deletion is unsafe.
 
+## Durable SA relocation restart recovery
+
+`relocate_sa` is not blindly idempotent after process loss: a crash around the
+single `XFRM_MSG_MIGRATE_STATE` effect can leave kernel state that readback
+can observe but not own, while the outbound block policy (consumer-owned) and
+the namespace-wide writer exclusion must stay fenced until reconciliation.
+MOBIKE makes this a first-class restart case: UPDATE_SA_ADDRESSES changes only
+the outer tunnel-header addresses and UDP-encapsulation port (RFC 4555 §1.1,
+§3.3), one address pair exists per SA at a time so kernel migration is a move,
+not a copy (RFC 4555 §1.2), NAT rebinding may change "IP address and/or port"
+so encapsulation-only same-XfrmId relocation is expected (RFC 4555 §3.8),
+and the initiator detects and recovers from failures, so fail-closed
+cleanup of an unproven move is spec-consistent (RFC 4555 §3.11). Because the
+Linux SAD identity is destination/SPI/protocol (RFC 4301 §4.1; plus lookup
+mark on Linux), an address-changing relocation changes the XfrmId while an
+encapsulation-only relocation does not; the durable boundary witnesses both
+cases. NAT-T context follows RFC 3948.
+
+`LinuxXfrmBackend::bind_current_network_namespace_with_sa_relocation_recovery`
+(or the combined
+`bind_current_network_namespace_with_object_and_sa_relocation_recovery` for
+consumers that also run durable installs) authenticates and permanently leases
+one `XfrmSaRelocationRecoveryStore` on the namespace actor before any
+mutation-capable handle is returned. The store is a separate self-contained
+record family (`OPCXRLC1`, format version 1 with the pre-effect proof byte
+present from version 1); it shares no records or compatibility path with the
+staged-object store.
+
+The required ordering after that atomic bind is:
+
+1. Call `prepare_sa_relocation` with the retained operation ID, generation,
+   and complete `RelocateSaRequest`. It durably publishes authenticated
+   `Prepared` truth and returns a non-cloneable
+   `XfrmSaRelocationAdmissionAuthority`. No backend effect has been admitted
+   when this call returns.
+2. Durably commit the consumer's poll-admitted transition.
+3. Pass the authority to `run_durable_sa_relocation`. After the deferred-DSCP
+   gate, the actor performs exact `GETSA` readbacks of the old and target
+   identities and embeds the witnessed target disposition as a durable
+   pre-effect proof in the same authenticated record, publishes `Issuing`,
+   and only then admits the single `relocate_sa` effect. The method durably
+   publishes `Relocated`, `NoMutation`, or `Indeterminate` before returning
+   its outcome. Pre-consumption rejections return the same authenticated
+   authority and retain `Prepared` for an exact retry when they are proved
+   and deterministic: a deferred DSCP activation gate, a present target
+   identity (`xfrm_sa_relocation_target_conflict`), and an untrustworthy
+   readback (`xfrm_sa_relocation_pre_effect_readback_failed`). A mismatching
+   current state consumes the authority
+   (`xfrm_sa_relocation_current_state_mismatch`); the retained `Prepared`
+   record recovers as authoritative no-mutation.
+4. Durably record the consumer decision. There is no finalize/adoption call:
+   a terminal `Relocated` record is the durable proof that the consumer
+   continues on the new addresses.
+5. After restart, call `recover_durable_sa_relocation` with the exact
+   retained operation ID, generation, and request.
+
+The pre-effect proof is witnessed immediately before `Prepared -> Issuing`:
+
+| Relocation shape | Proof | Meaning |
+| --- | --- | --- |
+| changed XfrmId (address change) | `TargetAbsent` | the distinct target identity was absent when the effect was admitted |
+| unchanged XfrmId (encap/source only) | `SameIdentityWitnessed` | the shared identity matched the bound current identity when the effect was admitted |
+
+Recovery of an unresolved `Issuing`/`Indeterminate` record revalidates the
+binding, requires a current writer epoch and a proof consistent with the bound
+request, and classifies fresh exact readbacks. With `OLD-INTACT` meaning the
+old identity is present exactly matching the bound current identity, and
+`TARGET-RELOCATED` meaning the target identity matches the bound current
+identity with the relocated destination, new source, and resulting
+encapsulation:
+
+Different identities (`TargetAbsent`):
+
+| Old readback | Target readback | Verdict | Recovery outcome | Deletion |
+| --- | --- | --- | --- | --- |
+| intact | absent | effect provably never happened | `no_mutation` (retired) | none |
+| intact | present (any) | atomic move cannot duplicate | `foreign_untouched` | none |
+| absent | TARGET-RELOCATED | move happened, never published | `owned_residue_retired` | exact `DELSA` of the target identity |
+| absent | foreign/present-other | foreign | `foreign_untouched` | none |
+| absent | absent | foreign removal/expiry; mutation history is unknown | `state_absent` | none |
+| foreign | any | foreign | `foreign_untouched` | none |
+| unreadable | any unreadable | retryable; record unchanged | `indeterminate` | none |
+| stale epoch / missing or inconsistent proof | durable anomaly | `repair_required`, record keeps gating | none |
+
+Same identity (`SameIdentityWitnessed`), one readback of the shared identity:
+
+| Readback | Verdict | Recovery outcome | Deletion |
+| --- | --- | --- | --- |
+| matches bound current | never happened | `no_mutation` (retired) | none |
+| matches relocation expectation | happened | `owned_residue_retired` | exact `DELSA` of the same identity |
+| matches neither | foreign | `foreign_untouched` | none |
+| absent | foreign removal/expiry; mutation history is unknown | `state_absent` | none |
+| unreadable | retryable; record unchanged | `indeterminate` | none |
+
+Recovery deletes only through the exact target deletion identity
+(new destination, SPI, protocol, and lookup mark) after publishing
+`RemovalAdmitted`; a failed removal stays `removal_pending` and retryable
+across restart. Recovery is idempotent after a record retires, returns terminal
+`Relocated` or `StateAbsent` proof without ever deleting after terminal
+publication, and a retryable outcome leaves the record gating until it
+converges. `StateAbsent` is intentionally distinct from `NoMutation`: absence
+cannot prove whether the move happened before external removal or expiry.
+Terminal idempotence holds only until the next cooperating write prunes the
+terminal record; once pruned, restore fails `NotFound`.
+
+Linux has no owner- or generation-conditional `DELSA`. The store therefore
+implements a cooperating-writer protocol: every unresolved relocation phase —
+`Prepared`, `Issuing`, `Indeterminate`, and `RemovalAdmitted` — blocks every
+later cooperating mutation admitted by that namespace actor, including
+ordinary `XfrmBackend` operations and new preparation, until recovery retires
+the record. A prepared-but-unrecovered relocation reserves the namespace: the
+relocation fencing holds while recovery authority and protocol egress remain
+fenced. Entering `Issuing` and every independent actor mutation burns a
+durable global writer epoch. Relocation `Prepared` and every effect-capable
+record in either family gate the other family. Object `Prepared` is
+metadata-only and may coexist with a prepared relocation; a relocation run
+advances the object epoch and invalidates all older object admissions before
+kernel access. Every object run is first gated by unresolved relocation
+authority and advances the relocation epoch before kernel access. Each
+admitted mutation advances both epochs.
+Metadata-only recovery remains the escape from its own gate. A recovery phase
+that may issue exact cleanup also respects the other durable family's gate and
+advances that family's epoch before kernel access. These guarantees do not
+exclude another raw-netlink socket, another namespace actor with a different
+store, or packet/product activity outside this protocol; a deployment must use
+one cooperating writer domain for all XFRM identity mutations in the namespace.
+
+Relocation records carry only opaque operation correlation, phase, proof code,
+incarnation, epoch, and independent proof-keyed fingerprints of the exact
+deletion identity and complete relocation request. No address, selector, SPI,
+mark, encap port, namespace identity, request body, or operation identity is
+rendered; handles, outcomes, errors, and diagnostics are value-free. The
+store root, proof-key, lease, and non-rollback obligations match the durable
+staged-object boundary. Relocation records use format version 1 with the
+pre-effect proof byte present from version 1; there is no compatibility path,
+migration bridge, legacy fallback, or unconditional-delete escape hatch.
+
 ## Opaque outbound-SA binding
 
 Use the binding-returning staged path when later work must prove that an SA is
