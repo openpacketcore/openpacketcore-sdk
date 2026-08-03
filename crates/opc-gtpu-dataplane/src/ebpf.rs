@@ -12135,7 +12135,7 @@ mod aya_runtime {
                     "tc netlink mutation timeout",
                 ));
             }
-            let length = match sys::receive_message(socket, &mut buffer) {
+            let length = match sys::receive_kernel_message(socket, &mut buffer) {
                 Ok(0) => continue,
                 Ok(length) => length,
                 Err(error)
@@ -12534,7 +12534,7 @@ mod aya_runtime {
                     io::Error::new(io::ErrorKind::TimedOut, "tc dump timeout"),
                 ));
             }
-            let length = match sys::receive_message(&socket, &mut buffer) {
+            let length = match sys::receive_kernel_message(&socket, &mut buffer) {
                 Ok(0) => continue,
                 Ok(length) => length,
                 Err(error)
@@ -14497,10 +14497,10 @@ mod aya_runtime {
                     .map_err(|_| GtpuError::io("ebpf_detach", super::poisoned_lock()))?;
                 let loaded = devices.get(&ifindex).ok_or(GtpuError::NotFound)?;
                 if !Self::loaded_datapath_is_current(ifindex, loaded) {
-                    // Leave in-process ownership and pins intact. Dropping the
-                    // backend is safe because its tc links are ManuallyDrop;
-                    // a foreign/replacement occupant observed here is not
-                    // detached.
+                    // Leave in-process ownership and pins intact. Aya-created
+                    // links are ManuallyDrop and numeric link descriptors have
+                    // no detaching destructor, so a foreign/replacement
+                    // occupant observed here is not detached.
                     return Err(GtpuError::AlreadyExists);
                 }
                 devices.remove(&ifindex)
