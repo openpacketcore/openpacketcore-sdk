@@ -92,7 +92,25 @@ pub(crate) struct DuplicateIeCollector {
     omitted_count: u32,
 }
 
+#[derive(Clone, Copy)]
+struct DuplicateIeCheckpoint {
+    entries_len: usize,
+    omitted_count: u32,
+}
+
 impl DuplicateIeCollector {
+    fn checkpoint(&self) -> DuplicateIeCheckpoint {
+        DuplicateIeCheckpoint {
+            entries_len: self.entries.len(),
+            omitted_count: self.omitted_count,
+        }
+    }
+
+    fn rollback(&mut self, checkpoint: DuplicateIeCheckpoint) {
+        self.entries.truncate(checkpoint.entries_len);
+        self.omitted_count = checkpoint.omitted_count;
+    }
+
     fn record(
         &mut self,
         ie_type: u8,
@@ -236,12 +254,13 @@ impl<'p> IeDecodePolicy<'p> {
     /// errors only -- IE framing errors arrive through the iterator arm below,
     /// where the sequence can no longer be resynchronised -- so the qualifying
     /// codes are the ones a value decoder raises for an out-of-range value:
-    /// `Truncated` and `InvalidLength` (the clause 8.107 decoders), plus
+    /// `Truncated` and `InvalidLength` (the clause 8.107 decoders),
+    /// `InvalidEnumValue` for a value outside a defined enumeration, plus
     /// `Structural`, which is how the value decoders that run a sub-codec (the
-    /// Bearer TFT via TS 24.008) and the semantic range checks report a value
-    /// that is syntactically or semantically out of range. `LengthOverflow` is
-    /// the offset arithmetic guarding the decode, not a statement about the
-    /// received octets, and must still fail the message.
+    /// Bearer TFT via TS 24.008) and the remaining semantic range checks report
+    /// a value that is syntactically or semantically out of range.
+    /// `LengthOverflow` is offset arithmetic guarding the decode, not a
+    /// statement about the received octets, and must still fail the message.
     ///
     /// Admitting `Structural` rests on an invariant of the value decoders a
     /// presence-O slot can reach: they raise it only for a received value that
@@ -266,6 +285,7 @@ impl<'p> IeDecodePolicy<'p> {
                 error.code(),
                 DecodeErrorCode::Truncated
                     | DecodeErrorCode::InvalidLength { .. }
+                    | DecodeErrorCode::InvalidEnumValue { .. }
                     | DecodeErrorCode::Structural { .. }
             )
     }
@@ -4529,6 +4549,16 @@ fn decode_typed_ie_sequence_at_inner<'a>(
 
                 let ie_type = raw.ie_type;
                 let instance = raw.instance;
+                // A grouped value decodes recursively with this collector. If
+                // the group is later discarded under clause 7.7.8, nested
+                // duplicate evidence is no more observable than the group's
+                // typed members: the whole IE must behave as if absent. The
+                // checkpoint also restores a saturated omitted count. Evidence
+                // keys carry the nested sequence's absolute scope offset, so a
+                // recursive decode cannot mutate an entry that predates this
+                // candidate; truncating entries created since the checkpoint
+                // is therefore a complete rollback.
+                let duplicate_checkpoint = duplicate_evidence.checkpoint();
                 let typed = match TypedIe::decode_from_raw_with_evidence(
                     raw,
                     ctx,
@@ -4572,6 +4602,7 @@ fn decode_typed_ie_sequence_at_inner<'a>(
                             &error,
                         ) =>
                     {
+                        duplicate_evidence.rollback(duplicate_checkpoint);
                         continue;
                     }
                     Err(error) => return Err(error),

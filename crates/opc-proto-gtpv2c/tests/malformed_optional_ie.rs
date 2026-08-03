@@ -10,17 +10,24 @@
 //! presence-O slots; Mandatory, Conditional and unresolvable slots fail closed.
 //!
 //! The optional slots under test, verified against the presence columns of
-//! TS 29.274 V18.8.0:
+//! TS 29.274 V18.8.0. The Bearer TFT, PCO and Failed Bearer Context rows are
+//! interface-qualified compatibility rows already admitted by this crate's
+//! receive grammar; their conditions name S4/S11 or S5/S8/S11 rather than
+//! S2b. The remaining rows apply directly to S2b:
 //! - IP Address (74), Create Session Request top level, instance 3 (ePDG IP),
 //!   Table 7.2.1-1. Instance 0 is UE Local IP Address, presence CO.
+//! - Node Identifier (176), Create Session Request top level, instance 0,
+//!   Table 7.2.1-1.
+//! - APCO (163), Create Session Response top level, instance 0,
+//!   Table 7.2.2-1.
 //! - Bearer TFT (84), Create Session Request Bearer Context, instance 0,
-//!   Table 7.2.1-1. The same IE is Mandatory in the Create Bearer Request
-//!   Bearer Context, Table 7.2.3-2.
+//!   Table 7.2.1-1 (S4/S11 compatibility row). The same IE is Mandatory in the
+//!   Create Bearer Request Bearer Context, Table 7.2.3-2.
 //! - PCO (78), Create Bearer Request top level and Bearer Context, instance 0,
-//!   Tables 7.2.3-1 and 7.2.3-2. In the Delete Session Request PCO is C/CO,
-//!   Table 7.2.9.1-1.
+//!   Tables 7.2.3-1 and 7.2.3-2 (S5/S8 and S4/S11 compatibility rows). In the
+//!   Delete Session Request PCO is C/CO, Table 7.2.9.1-1.
 //! - Bearer Context (93), Delete Bearer Request top level, instance 0 ("Failed
-//!   Bearer Contexts"), Table 7.2.9.2-1.
+//!   Bearer Contexts"), Table 7.2.9.2-1 (S5/S8 and S11 compatibility row).
 //! - F-TEID (87), Delete Session Request top level, instance 0 (Sender
 //!   F-TEID), Table 7.2.9.1-1: presence O on the S2b row.
 
@@ -28,13 +35,17 @@ use bytes::BytesMut;
 use opc_proto_gtpv2c::{
     decode_typed_ie_sequence, s2b_delete_session_request, EpsBearerId, IpAddress, RawIe,
     S2bDeleteSessionContext, S2bDeleteSessionRequest, S2bMessage, S2bUeEndpoint, TypedIe,
-    TypedIeValue, IE_TYPE_BEARER_CONTEXT, IE_TYPE_BEARER_TFT, IE_TYPE_EBI, IE_TYPE_F_TEID,
-    IE_TYPE_IP_ADDRESS, IE_TYPE_PCO,
+    TypedIeValue, IE_TYPE_APCO, IE_TYPE_BEARER_CONTEXT, IE_TYPE_BEARER_TFT, IE_TYPE_CAUSE,
+    IE_TYPE_EBI, IE_TYPE_F_TEID, IE_TYPE_IP_ADDRESS, IE_TYPE_PCO, IE_TYPE_RAN_NAS_CAUSE,
 };
-use opc_protocol::{DecodeContext, DecodeErrorCode, Encode, EncodeContext, ValidationLevel};
+use opc_protocol::{
+    DecodeContext, DecodeErrorCode, DuplicateIePolicy, Encode, EncodeContext, ValidationLevel,
+};
 
 const CREATE_SESSION_REQUEST_FIXTURE: &[u8] =
     include_bytes!("fixtures/spec/create_session_request_s2b_subset.bin");
+const CREATE_SESSION_RESPONSE_FIXTURE: &[u8] =
+    include_bytes!("fixtures/spec/create_session_response_s2b_subset.bin");
 const CREATE_BEARER_REQUEST_FIXTURE: &[u8] =
     include_bytes!("fixtures/spec/create_bearer_request_s2b.bin");
 const DELETE_BEARER_REQUEST_FIXTURE: &[u8] =
@@ -43,9 +54,10 @@ const DELETE_SESSION_REQUEST_FIXTURE: &[u8] =
     include_bytes!("fixtures/spec/delete_session_request_linked_ebi.bin");
 
 /// Every validation level this crate exposes for a typed decode. The profiled
-/// receiver owns `(procedure, direction)` and the grammar at all three, so
+/// receiver owns `(procedure, direction)` and the grammar at all four, so
 /// clauses 7.7.7/7.7.8 reach the same presence-keyed disposition at each.
 const TYPED_LEVELS: &[ValidationLevel] = &[
+    ValidationLevel::HeaderOnly,
     ValidationLevel::Structural,
     ValidationLevel::Strict,
     ValidationLevel::ProcedureAware,
@@ -203,6 +215,38 @@ fn a_malformed_epdg_ip_address_is_discarded_and_the_rest_of_the_request_decodes(
         assert_eq!(
             decoded, pristine,
             "{what} disturbed the rest of the message"
+        );
+    }
+}
+
+/// TS 29.274 Table 7.2.2-1 gives APCO presence O at instance 0 of the Create
+/// Session Response on S2b. Clause 7.7.8 is direction-agnostic, so a malformed
+/// response IE receives the same absent-and-continue disposition as a request
+/// IE rather than poisoning an otherwise usable response.
+#[test]
+fn a_malformed_apco_in_a_create_session_response_is_discarded() {
+    // APCO wraps a protocol-configuration container and requires at least its
+    // configuration octet.
+    let malformed = raw_ie_bytes(IE_TYPE_APCO, 0, &[]);
+
+    for level in TYPED_LEVELS {
+        let pristine = typed_ies(CREATE_SESSION_RESPONSE_FIXTURE, *level, "the bare response");
+        assert!(
+            pristine.len() >= 3,
+            "{level:?} response baseline is too small to be evidence"
+        );
+        let message = with_leading_ie(CREATE_SESSION_RESPONSE_FIXTURE, &malformed);
+        let what = format!("a malformed response APCO under {level:?}");
+        let decoded = typed_ies(&message, *level, &what);
+        assert!(
+            !decoded
+                .iter()
+                .any(|ie| ie.ie_type() == IE_TYPE_APCO && ie.instance == 0),
+            "{what} surfaced"
+        );
+        assert_eq!(
+            decoded, pristine,
+            "{what} disturbed the rest of the response"
         );
     }
 }
@@ -379,6 +423,61 @@ fn a_malformed_failed_bearer_context_in_a_delete_bearer_request_is_discarded() {
             "{what} disturbed the rest of the message"
         );
     }
+}
+
+/// Clause 7.7.8 covers semantically incorrect values as well as bad lengths.
+/// `InvalidEnumValue` is the direct error category for a defined enumeration
+/// whose received value is out of range, so it must be eligible at an Optional
+/// slot. This malformed RAN/NAS Cause sits inside the Optional Failed Bearer
+/// Context and reaches the value decoder at the non-procedure-aware levels.
+#[test]
+fn an_invalid_enum_inside_an_optional_group_discards_the_group() {
+    // Protocol type occupies the high nibble. Fifteen is neither Diameter (0)
+    // nor IKEv2 (1), while the remaining two octets make the value complete.
+    let member = raw_ie_bytes(IE_TYPE_RAN_NAS_CAUSE, 0, &[0xf0, 0x00, 0x01]);
+    let malformed = raw_ie_bytes(IE_TYPE_BEARER_CONTEXT, 0, &member);
+
+    let error = decode_typed_ie_sequence(&malformed, level_context(ValidationLevel::Structural), 0)
+        .expect_err("the profile-less decoder must expose the invalid enumeration");
+    assert!(
+        matches!(
+            error.code(),
+            DecodeErrorCode::InvalidEnumValue {
+                field: "s2b_ran_nas_cause_protocol_type",
+                value: 15,
+            }
+        ),
+        "the malformed member surfaced as {:?}, not InvalidEnumValue",
+        error.code()
+    );
+
+    for level in [
+        ValidationLevel::HeaderOnly,
+        ValidationLevel::Structural,
+        ValidationLevel::Strict,
+    ] {
+        let pristine = typed_ies(DELETE_BEARER_REQUEST_FIXTURE, level, "the bare fixture");
+        let message = with_leading_ie(DELETE_BEARER_REQUEST_FIXTURE, &malformed);
+        let what = format!("an invalid enum in an Optional group under {level:?}");
+        let decoded = typed_ies(&message, level, &what);
+        assert_eq!(
+            decoded, pristine,
+            "{what} was not treated as if the whole group were absent"
+        );
+    }
+
+    // ProcedureAware applies clause 7.7.9 first: RAN/NAS Cause is not admitted
+    // in this subordinate table, so its invalid value is never interpreted.
+    let message = with_leading_ie(DELETE_BEARER_REQUEST_FIXTURE, &malformed);
+    let decoded = typed_ies(
+        &message,
+        ValidationLevel::ProcedureAware,
+        "the procedure-filtered invalid enum carrier",
+    );
+    assert!(
+        !contains_type_anywhere(&decoded, IE_TYPE_RAN_NAS_CAUSE),
+        "ProcedureAware surfaced the filtered malformed member"
+    );
 }
 
 /// TS 29.274 Table 7.2.9.1-1 carries three interface-conditioned rows for
@@ -607,6 +706,54 @@ fn a_discarded_optional_ie_leaves_no_duplicate_bookkeeping_trace() {
         "a clause 7.7.8 discard fabricated duplicate evidence: {:?}",
         decoded.diagnostics()
     );
+}
+
+/// Nested duplicate evidence belongs to its enclosing grouped IE. If a later
+/// malformed member makes an Optional group disappear under clause 7.7.8, the
+/// group's bounded evidence and saturated omitted count must disappear with
+/// it. Otherwise diagnostics would describe members absent from the decoded
+/// message and could falsely imply peer repetition at a retained scope.
+#[test]
+fn a_discarded_optional_group_rolls_back_nested_duplicate_diagnostics() {
+    let mut members = Vec::new();
+    // Sixty-five distinct repeated raw keys fill the 64-entry evidence bound
+    // and increment omitted_duplicate_count. Each first occurrence is valid;
+    // each second is ignored by First before value interpretation.
+    for ordinal in 0u8..65 {
+        let ie_type = 200 + ordinal / 16;
+        let instance = ordinal % 16;
+        let member = raw_ie_bytes(ie_type, instance, &[]);
+        members.extend_from_slice(&member);
+        members.extend_from_slice(&member);
+    }
+    // A final zero-length Cause makes the containing Optional Bearer Context
+    // malformed after all duplicate diagnostics have been collected.
+    members.extend_from_slice(&raw_ie_bytes(IE_TYPE_CAUSE, 0, &[]));
+    let malformed_group = raw_ie_bytes(IE_TYPE_BEARER_CONTEXT, 0, &members);
+    let message = with_leading_ie(DELETE_BEARER_REQUEST_FIXTURE, &malformed_group);
+    let ctx = DecodeContext {
+        duplicate_ie_policy: DuplicateIePolicy::First,
+        validation_level: ValidationLevel::Structural,
+        ..DecodeContext::default()
+    };
+
+    let (_, pristine) = S2bMessage::decode_with_diagnostics(DELETE_BEARER_REQUEST_FIXTURE, ctx)
+        .expect("the bare fixture decodes");
+    assert!(pristine.diagnostics().is_empty());
+
+    let (_, decoded) = S2bMessage::decode_with_diagnostics(&message, ctx)
+        .expect("the malformed Optional group is discarded");
+    assert_eq!(
+        decoded.message().as_view().expect("typed view").ies,
+        pristine.message().as_view().expect("typed view").ies,
+        "the discarded group changed the typed projection"
+    );
+    assert!(
+        decoded.diagnostics().is_empty(),
+        "the discarded group leaked nested diagnostics: {:?}",
+        decoded.diagnostics()
+    );
+    assert_eq!(decoded.diagnostics().omitted_duplicate_count(), 0);
 }
 
 /// Clause 7.7.8 discards the IE from the typed view but says nothing about the
