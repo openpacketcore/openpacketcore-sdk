@@ -23,7 +23,7 @@ use opc_ipsec_xfrm::{
     IpAddress, KeyMaterial, LifetimeConfig, LinuxXfrmBackend, NamespaceBoundLinuxXfrmBackend,
     PolicyParameters, QuerySaRequest, RelocateSaRequest, RemovePolicyRequest, RemoveSaRequest,
     SaParameters, SaRelocationDirection, SaRelocationEncap, SaRelocationIdentity, UdpEncap,
-    XfrmAction, XfrmBackend, XfrmDirection, XfrmError, XfrmId, XfrmMode,
+    XfrmAction, XfrmBackend, XfrmCapability, XfrmDirection, XfrmError, XfrmId, XfrmMode,
     XfrmObjectRecoveryBindError, XfrmRequestId, XfrmSaRelocationDurableError,
     XfrmSaRelocationOperationGeneration, XfrmSaRelocationOperationId,
     XfrmSaRelocationRecoveryProofKey, XfrmSaRelocationRecoveryStore,
@@ -544,6 +544,7 @@ fn inject_foreign_target_sa(namespace: &str, spi: u32) -> TestResult {
         "xfrm",
         "state",
         "add",
+        "dst",
         "198.51.100.20",
         "proto",
         "esp",
@@ -970,6 +971,7 @@ fn run_sa_relocation_crash_child(role: &str, root: &Path, token: &str) -> TestRe
 
     let current = block_on(backend.query_sa_relocation_identity(query_at(old_destination(), spi)))?;
     let request = role_relocation_request(role, current)?;
+    let target_query = query_at(request.new_destination, spi);
 
     if role == ROLE_PREPARED_CUT {
         let _authority = block_on(backend.prepare_sa_relocation(
@@ -979,16 +981,23 @@ fn run_sa_relocation_crash_child(role: &str, root: &Path, token: &str) -> TestRe
             request,
         ))?;
     } else {
+        let admit_effect = issuing_cut_admits_effect(role);
         let authority = block_on(backend.prepare_sa_relocation(
             &store,
             operation_id(token)?,
             operation_generation(),
             request,
         ))?;
-        block_on(backend.detector_cut_prepared_sa_relocation_issuing(
-            authority,
-            issuing_cut_admits_effect(role),
-        ))?;
+        block_on(backend.detector_cut_prepared_sa_relocation_issuing(authority, admit_effect))?;
+        if admit_effect {
+            // The cut seam intentionally ignores the effect result to model a
+            // crash before terminal publication. A silently failed migration
+            // would make the parent misread the crash window, so surface it
+            // here instead of publishing readiness.
+            if block_on(backend.query_sa_relocation_identity(target_query)).is_err() {
+                return Err(io::Error::other("relocation effect did not reach the kernel").into());
+            }
+        }
     }
 
     let ready_path = root.join("coordination").join(format!("{role}.ready"));
@@ -1065,6 +1074,20 @@ fn sa_relocation_recovery_detector(
         "the durable API must exclusively create its own store"
     );
     let spi = role_spi(role)?;
+
+    // After-effect detectors require the real exact single-SA migration UAPI.
+    // Probe it inside the target namespace first and skip cleanly on kernels
+    // without it, exactly like the capability-gated relocation proof.
+    if issuing_cut_admits_effect(role) {
+        let probe = bind_namespace(fixture.namespace_a())?;
+        let capability = block_on(probe.sa_relocation_capability())?;
+        drop(probe);
+        if !matches!(capability, XfrmCapability::Available) {
+            eprintln!("skipping {role}: kernel does not expose the exact single-SA migration UAPI");
+            fixture.cleanup()?;
+            return Ok(());
+        }
+    }
 
     // Keep an identical object in the foreign namespace so recovery in
     // namespace A is also crossed against the namespace boundary.
@@ -1168,13 +1191,18 @@ fn sa_relocation_recovery_detector(
     ));
 
     // Recovery retired the record, so the gate reopens. Prove admission with
-    // a clean same-identity mutation and leave the namespace clean.
+    // clean same-identity mutations and leave the namespace clean.
     if role == ROLE_OUTBOUND_ISSUING_CUT_AFTER_EFFECT {
         // The consumer-owned block policy must have survived recovery; the
         // reopened gate now admits its exact removal.
         assert_eq!(block_policy_count(fixture.namespace_a())?, 1);
         block_on(backend.remove_policy_exact(block_policy_removal(spi)))?;
         assert_eq!(block_policy_count(fixture.namespace_a())?, 0);
+    }
+    if matches!(expected_outcome, "no_mutation" | "foreign_untouched") {
+        // The recovery deliberately left the old SA alive; retire it through
+        // the reopened gate before the clean admission proof below.
+        block_on(backend.remove_sa(removal_at(old_destination(), spi)))?;
     }
     block_on(backend.install_sa(sa_install_request(spi, role_encap(role)?)))?;
     block_on(backend.remove_sa(removal_at(old_destination(), spi)))?;
