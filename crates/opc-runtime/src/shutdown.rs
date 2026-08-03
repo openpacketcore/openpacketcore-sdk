@@ -41,10 +41,36 @@ pub trait DrainHook: Send + Sync {
     async fn on_drain(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 }
 
+/// Closed outcome of a shutdown request on one [`ShutdownToken`].
+///
+/// The disposition is value-free by design: it carries no task payload, peer,
+/// subscriber, address, key, packet, mutation, or descriptor data — only
+/// whether the calling invocation performed the first effective transition.
+/// Callers that own shutdown observability use it to record one initiation
+/// per effective transition instead of one log event per API call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ShutdownDisposition {
+    /// This invocation won the token's initiation gate: it performed the
+    /// cancellation-flag transition that every shutdown request shares, and
+    /// the phase advances to `Draining` with it unless the phase was already
+    /// advanced past `Draining` through a separate phase transition.
+    Initiated,
+    /// Shutdown had already been requested on the token; this invocation
+    /// performed no new initiation.
+    AlreadyRequested,
+}
+
 /// Shutdown token for propagating termination signals through the CNF.
 ///
 /// This is a lightweight cancellation primitive inspired by `CancellationToken`
 /// from `tokio-util`. It propagates SIGTERM-style graceful drain signals.
+///
+/// Shutdown request state is monotonic and idempotent: a token has exactly one
+/// effective initiation, and [`ShutdownToken::request_shutdown`] /
+/// [`ShutdownToken::cancel`] report it through [`ShutdownDisposition`]. Both
+/// methods are deliberately silent — they emit no tracing events — so repeated
+/// or concurrent invocations cannot amplify shutdown logs; the caller that
+/// owns the initiation record decides whether to emit one.
 #[derive(Debug, Clone)]
 pub struct ShutdownToken {
     inner: Arc<ShutdownInner>,
@@ -116,24 +142,51 @@ impl ShutdownToken {
     }
 
     /// Request graceful shutdown.
-    pub fn request_shutdown(&self) {
-        self.inner.cancelled.store(true, Ordering::SeqCst);
-        self.advance_phase(ShutdownPhase::Draining);
-        tracing::info!("shutdown requested");
+    ///
+    /// Idempotent and monotonic: only the invocation that wins the token's
+    /// initiation gate returns [`ShutdownDisposition::Initiated`]; every
+    /// later or racing invocation returns
+    /// [`ShutdownDisposition::AlreadyRequested`] and performs no new
+    /// initiation (the phase advance it still performs is itself idempotent).
+    /// This method emits no tracing events, so repeated and concurrent
+    /// invocations across token clones cannot amplify shutdown logs; callers
+    /// that own the initiation record inspect the returned disposition
+    /// instead.
+    pub fn request_shutdown(&self) -> ShutdownDisposition {
+        self.initiate_drain()
     }
 
     /// Cancel — request termination via the standard drain sequence.
     ///
+    /// Shares one initiation gate with [`ShutdownToken::request_shutdown`]:
+    /// racing the two methods yields exactly one
+    /// [`ShutdownDisposition::Initiated`] in total. Like `request_shutdown`,
+    /// this method is silent and reports the transition through the returned
+    /// disposition.
+    ///
     /// The monotonic phase invariant prevents skipping directly to `Stopped`.
-    pub fn cancel(&self) {
-        self.inner.cancelled.store(true, Ordering::SeqCst);
-        self.advance_phase(ShutdownPhase::Draining);
-        tracing::warn!("shutdown cancellation requested");
+    pub fn cancel(&self) -> ShutdownDisposition {
+        self.initiate_drain()
     }
 
     /// Advance the observable shutdown phase monotonically.
     pub(crate) fn transition_phase(&self, new_phase: ShutdownPhase) {
         self.advance_phase(new_phase);
+    }
+
+    /// Flip the cancellation flag exactly once and advance to `Draining`.
+    fn initiate_drain(&self) -> ShutdownDisposition {
+        let initiated = self
+            .inner
+            .cancelled
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok();
+        self.advance_phase(ShutdownPhase::Draining);
+        if initiated {
+            ShutdownDisposition::Initiated
+        } else {
+            ShutdownDisposition::AlreadyRequested
+        }
     }
 
     /// Get a future that completes when shutdown is requested.
@@ -182,12 +235,16 @@ impl ShutdownToken {
         self.inner.phase_tx.subscribe()
     }
 
-    fn advance_phase(&self, new_phase: ShutdownPhase) -> ShutdownPhase {
+    fn advance_phase(&self, new_phase: ShutdownPhase) -> PhaseAdvance {
         loop {
             let current_raw = self.inner.phase.load(Ordering::SeqCst);
             let current_phase = ShutdownPhase::from_u8(current_raw);
             if current_phase >= new_phase {
-                return current_phase;
+                return PhaseAdvance {
+                    prior: current_phase,
+                    actual: current_phase,
+                    advanced: false,
+                };
             }
 
             if self
@@ -206,10 +263,24 @@ impl ShutdownToken {
                 if actual > new_phase {
                     self.inner.phase_tx.send_replace(actual);
                 }
-                return actual;
+                return PhaseAdvance {
+                    prior: current_phase,
+                    actual,
+                    advanced: true,
+                };
             }
         }
     }
+}
+
+/// Outcome of a single phase-advance attempt on a shutdown token.
+struct PhaseAdvance {
+    /// Phase observed immediately before the attempt.
+    prior: ShutdownPhase,
+    /// Phase the token is at after the attempt.
+    actual: ShutdownPhase,
+    /// True only when this attempt moved the phase strictly forward.
+    advanced: bool,
 }
 
 impl Default for ShutdownToken {
@@ -254,10 +325,15 @@ impl DrainGuard {
     }
 
     /// Transition to a new drain phase.
+    ///
+    /// The transition event is emitted only when the token actually advances,
+    /// so repeated or backwards transition requests do not amplify logs.
     pub fn transition(&mut self, new_phase: ShutdownPhase) {
-        tracing::debug!(from = %self.phase, to = %new_phase, "drain phase transition");
+        let advance = self.token.advance_phase(new_phase);
         self.phase = new_phase;
-        self.token.transition_phase(new_phase);
+        if advance.advanced {
+            tracing::debug!(from = %advance.prior, to = %advance.actual, "drain phase transition");
+        }
     }
 
     /// Check if shutdown is requested.
@@ -524,5 +600,136 @@ mod tests {
 
         guard.transition(ShutdownPhase::Stopped);
         assert_eq!(guard.phase(), ShutdownPhase::Stopped);
+    }
+
+    #[test]
+    fn request_shutdown_initiates_once_and_is_idempotent() {
+        let token = ShutdownToken::new();
+
+        assert_eq!(token.request_shutdown(), ShutdownDisposition::Initiated);
+        assert!(token.is_shutdown_requested());
+        assert_eq!(*token.subscribe().borrow(), ShutdownPhase::Draining);
+
+        for _ in 0..4 {
+            assert_eq!(
+                token.request_shutdown(),
+                ShutdownDisposition::AlreadyRequested
+            );
+        }
+        assert_eq!(*token.subscribe().borrow(), ShutdownPhase::Draining);
+    }
+
+    #[test]
+    fn cancel_then_request_shutdown_share_one_initiation() {
+        let token = ShutdownToken::new();
+
+        assert_eq!(token.cancel(), ShutdownDisposition::Initiated);
+        assert_eq!(
+            token.request_shutdown(),
+            ShutdownDisposition::AlreadyRequested
+        );
+        assert_eq!(*token.subscribe().borrow(), ShutdownPhase::Draining);
+    }
+
+    #[test]
+    fn request_shutdown_then_cancel_share_one_initiation() {
+        let token = ShutdownToken::new();
+
+        assert_eq!(token.request_shutdown(), ShutdownDisposition::Initiated);
+        assert_eq!(token.cancel(), ShutdownDisposition::AlreadyRequested);
+        assert_eq!(*token.subscribe().borrow(), ShutdownPhase::Draining);
+    }
+
+    #[test]
+    fn repeated_requests_after_later_phase_do_not_move_phase_backwards() {
+        let token = ShutdownToken::new();
+
+        assert_eq!(token.request_shutdown(), ShutdownDisposition::Initiated);
+        token.transition_phase(ShutdownPhase::Stopped);
+
+        assert_eq!(
+            token.request_shutdown(),
+            ShutdownDisposition::AlreadyRequested
+        );
+        assert_eq!(token.cancel(), ShutdownDisposition::AlreadyRequested);
+        assert_eq!(*token.subscribe().borrow(), ShutdownPhase::Stopped);
+    }
+
+    #[test]
+    fn concurrent_request_and_cancel_yield_one_initiation() {
+        let token = ShutdownToken::new();
+        let initiated = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        std::thread::scope(|scope| {
+            for thread in 0..8 {
+                let token = token.clone();
+                let initiated = Arc::clone(&initiated);
+                scope.spawn(move || {
+                    for iteration in 0..200 {
+                        let disposition = if (thread + iteration) % 2 == 0 {
+                            token.request_shutdown()
+                        } else {
+                            token.cancel()
+                        };
+                        if disposition == ShutdownDisposition::Initiated {
+                            initiated.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+                });
+            }
+        });
+
+        assert_eq!(
+            initiated.load(Ordering::SeqCst),
+            1,
+            "exactly one invocation may win the effective transition"
+        );
+        assert!(token.is_shutdown_requested());
+        assert_eq!(*token.subscribe().borrow(), ShutdownPhase::Draining);
+    }
+
+    #[test]
+    fn concurrent_requests_keep_phase_sequence_monotonic() {
+        let token = ShutdownToken::new();
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let watcher = {
+            let mut rx = token.subscribe();
+            let observed = Arc::clone(&observed);
+            std::thread::spawn(move || loop {
+                // `borrow_and_update` is level-triggered: every read sees the
+                // latest phase, so the observed sequence can drop values but
+                // never reorder or regress them.
+                let phase = *rx.borrow_and_update();
+                observed
+                    .lock()
+                    .expect("observer holds the lock")
+                    .push(phase);
+                if phase == ShutdownPhase::Stopped {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            })
+        };
+
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let token = token.clone();
+                scope.spawn(move || {
+                    for _ in 0..200 {
+                        token.request_shutdown();
+                    }
+                });
+            }
+        });
+        token.transition_phase(ShutdownPhase::Stopped);
+
+        watcher.join().expect("observer thread must finish");
+        let sequence = observed.lock().expect("observer holds the lock");
+        assert!(
+            sequence.windows(2).all(|pair| pair[0] <= pair[1]),
+            "phase sequence must never move backwards: {sequence:?}"
+        );
+        assert_eq!(sequence.last().copied(), Some(ShutdownPhase::Stopped));
     }
 }

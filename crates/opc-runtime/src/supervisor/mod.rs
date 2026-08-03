@@ -11,7 +11,7 @@ use futures_util::FutureExt;
 use opc_alarm::SharedAlarmManager;
 use std::collections::hash_map::RandomState;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{watch, RwLock};
@@ -81,6 +81,7 @@ pub(crate) struct SupervisorRuntimeCtx {
     pub(crate) fatal_failure_error: Arc<RwLock<Option<FatalTaskFailure>>>,
     pub(crate) degrade_count: Arc<AtomicU32>,
     pub(crate) shutdown: ShutdownToken,
+    pub(crate) shutdown_announced: Arc<AtomicBool>,
     pub(crate) jitter_source: RandomState,
     pub(crate) clock: Arc<dyn Clock>,
     pub(crate) state_tx: watch::Sender<()>,
@@ -91,6 +92,10 @@ pub(crate) struct SupervisorRuntimeCtx {
 pub struct Supervisor {
     pub(crate) profile: RuntimeProfile,
     pub(crate) shutdown: ShutdownToken,
+    /// Linearized gate for the aggregate shutdown initiation record: the
+    /// first non-`Immediate` aggregate drain flips it and owns the record.
+    /// Shared through `Clone` so clones of one supervisor announce once.
+    pub(crate) shutdown_announced: Arc<AtomicBool>,
     pub(crate) tasks: Arc<RwLock<HashMap<TaskName, TaskState>>>,
     pub(crate) fatal_failure: Arc<RwLock<bool>>,
     pub(crate) fatal_failure_error: Arc<RwLock<Option<FatalTaskFailure>>>,
@@ -115,6 +120,7 @@ impl Clone for Supervisor {
         Self {
             profile: self.profile.clone(),
             shutdown: self.shutdown.clone(),
+            shutdown_announced: self.shutdown_announced.clone(),
             tasks: self.tasks.clone(),
             fatal_failure: self.fatal_failure.clone(),
             fatal_failure_error: self.fatal_failure_error.clone(),
@@ -187,6 +193,7 @@ impl Supervisor {
         Self {
             profile,
             shutdown,
+            shutdown_announced: Arc::new(AtomicBool::new(false)),
             tasks: Arc::new(RwLock::new(HashMap::new())),
             fatal_failure: Arc::new(RwLock::new(false)),
             fatal_failure_error: Arc::new(RwLock::new(None)),
@@ -226,6 +233,7 @@ impl Supervisor {
             fatal_failure_error: self.fatal_failure_error.clone(),
             degrade_count: self.degrade_count.clone(),
             shutdown: self.shutdown.clone(),
+            shutdown_announced: self.shutdown_announced.clone(),
             jitter_source: self.jitter_source.clone(),
             clock: self.clock.clone(),
             state_tx: self.state_tx.clone(),
@@ -408,11 +416,22 @@ impl Supervisor {
     }
 
     /// Stop all supervised tasks gracefully.
+    ///
+    /// The first non-`Immediate` aggregate drain of this supervisor emits one
+    /// aggregate `shutdown requested` initiation record (value-free: only the
+    /// task count), even when the shutdown token or every task token was
+    /// already requested upstream. Repeat and concurrent aggregate drains
+    /// announce nothing further; `shutdown_task` records separately when it
+    /// initiates a task shutdown on its own.
     pub async fn shutdown_all(&self, policy: ShutdownPolicy) {
         shutdown::shutdown_all_impl(self, policy).await;
     }
 
     /// Shutdown a specific task.
+    ///
+    /// Emits a `shutdown requested` initiation record only when this call
+    /// initiates the task's shutdown token; a task already requested by an
+    /// aggregate drain (or a prior standalone shutdown) adds no record.
     pub async fn shutdown_task(&self, name: &TaskName, policy: ShutdownPolicy) {
         shutdown::shutdown_task_impl(self, name, policy).await;
     }
@@ -605,6 +624,7 @@ impl Supervisor {
                     let sup = Supervisor {
                         profile: ctx.profile.clone(),
                         shutdown: ctx.shutdown.clone(),
+                        shutdown_announced: ctx.shutdown_announced.clone(),
                         tasks: ctx.tasks.clone(),
                         fatal_failure: ctx.fatal_failure.clone(),
                         fatal_failure_error: ctx.fatal_failure_error.clone(),
