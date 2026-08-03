@@ -17,8 +17,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and unlike orphaned-graph recovery it never deletes the graph. The expected
   interface name/ifindex identity is re-proved and the complete current pin
   ABI/schema is validated before the retained CONFIG endpoint is read; identity,
-  configuration, and structural conflicts are refused before graph mutation.
-  Older or partial schemas are never migrated or repaired through this path.
+  configuration, and retained pin/config/schema conflicts are refused before
+  graph mutation. The independent grouped CONFIG6/SCHEMA6 authority must be
+  all-zero and all four grouped hashes empty; initialized, populated, or
+  malformed grouped state is refused as `NotCurrentSchema`. Older or partial
+  schemas are never migrated or repaired through this path. Stable malformed
+  legacy PDP content found after the forwarding safety fence is likewise
+  structural, while kernel/map observation and mutation failures remain
+  retryable indeterminate state.
   Acquisition returns an affine, supervised
   completion handle whose blocking worker converges the graph state under the
   host-global namespace lease and operation lock even if the observing future is

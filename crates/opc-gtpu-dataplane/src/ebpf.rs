@@ -514,6 +514,25 @@ impl fmt::Debug for EbpfCleanupOnlyAdoption {
     }
 }
 
+/// Classify deterministic retained-content failures without collapsing
+/// observation or mutation I/O into structural damage.
+///
+/// These two operation labels are emitted only by local invariant closures
+/// after typed map access succeeds. Every kernel/map access failure remains an
+/// ordinary error and is surfaced by cleanup acquisition as retryable
+/// indeterminate state.
+#[cfg(any(target_os = "linux", test))]
+fn cleanup_only_content_failure(error: GtpuError) -> Result<EbpfCleanupOnlyAdoption, GtpuError> {
+    match error {
+        GtpuError::StateIndeterminate {
+            operation: "ebpf_pdp_recovery" | "ebpf_marked_owner_rebuild",
+        } => Ok(EbpfCleanupOnlyAdoption::Refused(
+            RetainedGraphCleanupRefusal::NotCurrentSchema,
+        )),
+        error => Err(error),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CurrentRecoveryManagedState {
     Clear,
@@ -6747,6 +6766,32 @@ mod aya_runtime {
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum CurrentGroupedAuthority {
+        Uninitialized,
+        Initialized { populated: bool },
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct CurrentGraphPopulation {
+        legacy_populated: bool,
+        grouped: CurrentGroupedAuthority,
+    }
+
+    impl CurrentGraphPopulation {
+        fn forwarding_populated(self) -> bool {
+            self.legacy_populated
+                || matches!(
+                    self.grouped,
+                    CurrentGroupedAuthority::Initialized { populated: true }
+                )
+        }
+
+        fn cleanup_only_compatible(self) -> bool {
+            self.grouped == CurrentGroupedAuthority::Uninitialized
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum CleanupOnlyPinGraph {
         Absent,
         Current { local_ip: [u8; 4] },
@@ -8052,9 +8097,9 @@ mod aya_runtime {
             Map::from_map_data(data).map_err(|_| CurrentIdentityError::Indeterminate)
         }
 
-        fn current_graph_forwarding_populated(
+        fn current_graph_population(
             pin_dir: &Path,
-        ) -> Result<bool, CurrentIdentityError> {
+        ) -> Result<CurrentGraphPopulation, CurrentIdentityError> {
             let mut legacy_populated = false;
             let far = BpfHashMap::<MapData, [u8; 4], [u8; UPLINK_FAR_VALUE_LEN]>::try_from(
                 Self::current_map(pin_dir, MAP_UPLINK_FAR)?,
@@ -8205,15 +8250,34 @@ mod aya_runtime {
             .map_err(|_| CurrentIdentityError::Mismatch)?
             .get(&GTPU_SESSION_CONFIG_KEY, 0)
             .map_err(|_| CurrentIdentityError::Indeterminate)?;
-            let grouped_uninitialized = config_ipv6 == [0; GTPU_SESSION_CONFIG_VALUE_LEN]
-                && schema == [0; GTPU_SESSION_SCHEMA_MARKER_LEN];
-            let grouped_initialized = schema == GTPU_SESSION_SCHEMA_MARKER_VALUE
+            let grouped = if config_ipv6 == [0; GTPU_SESSION_CONFIG_VALUE_LEN]
+                && schema == [0; GTPU_SESSION_SCHEMA_MARKER_LEN]
+            {
+                if grouped_populated {
+                    return Err(CurrentIdentityError::Mismatch);
+                }
+                CurrentGroupedAuthority::Uninitialized
+            } else if schema == GTPU_SESSION_SCHEMA_MARKER_VALUE
                 && GtpuSessionDeviceConfig::decode(&config_ipv6)
-                    .is_some_and(|decoded| decoded.encode() == config_ipv6);
-            if !grouped_initialized && (grouped_populated || !grouped_uninitialized) {
+                    .is_some_and(|decoded| decoded.encode() == config_ipv6)
+            {
+                CurrentGroupedAuthority::Initialized {
+                    populated: grouped_populated,
+                }
+            } else {
                 return Err(CurrentIdentityError::Mismatch);
-            }
-            Ok(legacy_populated || grouped_populated)
+            };
+            Ok(CurrentGraphPopulation {
+                legacy_populated,
+                grouped,
+            })
+        }
+
+        fn current_graph_forwarding_populated(
+            pin_dir: &Path,
+        ) -> Result<bool, CurrentIdentityError> {
+            Self::current_graph_population(pin_dir)
+                .map(CurrentGraphPopulation::forwarding_populated)
         }
 
         fn legacy_v2_recorded_pin_count(
@@ -8631,10 +8695,17 @@ mod aya_runtime {
             }
 
             // The current-graph observer requires the exact PMTU-v5 marker,
-            // canonical grouped-schema state, executable PMTU state, and
-            // structurally readable current maps. It is read-only.
-            match Self::current_graph_forwarding_populated(pin_dir) {
-                Ok(_) => {}
+            // executable PMTU state, and structurally readable current maps.
+            // This IPv4 cleanup authority additionally requires the
+            // independent grouped CONFIG6/SCHEMA6 authority to remain
+            // uninitialized and all four grouped hashes to be empty. A valid
+            // grouped attachment is still a different writer domain, not
+            // cleanup authority this legacy request may silently discard.
+            match Self::current_graph_population(pin_dir) {
+                Ok(population) if population.cleanup_only_compatible() => {}
+                Ok(_) => {
+                    return Err(RetainedGraphCleanupRefusal::NotCurrentSchema);
+                }
                 Err(CurrentIdentityError::Mismatch) => {
                     return Err(RetainedGraphCleanupRefusal::NotCurrentSchema);
                 }
@@ -13615,8 +13686,15 @@ mod aya_runtime {
                     Err(refusal) => return Ok(refusal),
                 };
             self.require_canonical_pmtu_slot(&ebpf)?;
-            Self::recover_incomplete_pdp_commits(&mut ebpf, expected_local_ip, ifindex)?;
-            let indexes = Self::pdp_host_indexes(&ebpf, expected_local_ip, ifindex, true)?;
+            if let Err(error) =
+                Self::recover_incomplete_pdp_commits(&mut ebpf, expected_local_ip, ifindex)
+            {
+                return super::cleanup_only_content_failure(error);
+            }
+            let indexes = match Self::pdp_host_indexes(&ebpf, expected_local_ip, ifindex, true) {
+                Ok(indexes) => indexes,
+                Err(error) => return super::cleanup_only_content_failure(error),
+            };
             // Load both programs so their kernel identity can be proven while
             // forwarding stays fenced. Activation later attaches these same
             // already-loaded programs without reloading them.
@@ -18438,11 +18516,15 @@ mod tests {
     #[derive(Clone, PartialEq, Eq)]
     struct FakeGroupedPublicationSnapshot {
         attached: HashMap<u32, FakeAttachment>,
+        pinned_config: HashMap<PathBuf, [u8; 4]>,
         pinned_grouped_config: HashMap<PathBuf, [u8; GTPU_SESSION_CONFIG_VALUE_LEN]>,
         grouped_schema_ready: HashSet<PathBuf>,
         grouped_map_ready: HashSet<u32>,
+        uplink_filter_ready: HashSet<u32>,
+        downlink_filter_ready: HashSet<u32>,
         uplink_filter_pin_dir: HashMap<u32, PathBuf>,
         downlink_filter_pin_dir: HashMap<u32, PathBuf>,
+        cleanup_only: HashSet<u32>,
         session_groups:
             HashMap<(u32, [u8; GTPU_SESSION_GROUP_ID_LEN]), [u8; GTPU_SESSION_GROUP_VALUE_LEN]>,
         session_uplink_index:
@@ -18453,6 +18535,19 @@ mod tests {
             (u32, [u8; GTPU_SESSION_GROUP_ID_LEN]),
             [u8; GTPU_SESSION_TRANSACTION_VALUE_LEN],
         >,
+        far: HashMap<(u32, [u8; 4]), [u8; UPLINK_FAR_VALUE_LEN]>,
+        marked_far: HashMap<(u32, [u8; UPLINK_MARK_KEY_LEN]), [u8; UPLINK_FAR_VALUE_LEN]>,
+        dscp: HashMap<(u32, [u8; 4]), [u8; UPLINK_DSCP_VALUE_LEN]>,
+        marked_dscp: HashMap<(u32, [u8; UPLINK_MARK_KEY_LEN]), [u8; UPLINK_DSCP_VALUE_LEN]>,
+        sport: HashMap<(u32, [u8; 4]), [u8; UPLINK_SOURCE_PORT_VALUE_LEN]>,
+        marked_sport: HashMap<(u32, [u8; UPLINK_MARK_KEY_LEN]), [u8; UPLINK_SOURCE_PORT_VALUE_LEN]>,
+        pdr: HashMap<(u32, [u8; 4]), [u8; DOWNLINK_PDR_VALUE_LEN]>,
+        marked_pdr: HashMap<(u32, [u8; 4]), [u8; MARKED_DOWNLINK_PDR_VALUE_LEN]>,
+        downlink_binding: HashMap<(u32, [u8; 4]), [u8; DOWNLINK_ENDPOINT_BINDING_VALUE_LEN]>,
+        marked_owner:
+            HashMap<(u32, [u8; UPLINK_MARK_KEY_LEN]), [u8; MARKED_BEARER_OWNER_VALUE_LEN]>,
+        marked_owner_by_teid: HashMap<(u32, [u8; 4]), [u8; UPLINK_MARK_KEY_LEN]>,
+        default_teid_by_ue: HashMap<(u32, [u8; 4]), [u8; 4]>,
         pmtu_policy: HashMap<u32, [u8; UPLINK_PMTU_VALUE_LEN]>,
         schema: HashMap<PathBuf, FakeSchema>,
     }
@@ -18461,15 +18556,31 @@ mod tests {
         fn capture(state: &FakeState) -> Self {
             Self {
                 attached: state.attached.clone(),
+                pinned_config: state.pinned_config.clone(),
                 pinned_grouped_config: state.pinned_grouped_config.clone(),
                 grouped_schema_ready: state.grouped_schema_ready.clone(),
                 grouped_map_ready: state.grouped_map_ready.clone(),
+                uplink_filter_ready: state.uplink_filter_ready.clone(),
+                downlink_filter_ready: state.downlink_filter_ready.clone(),
                 uplink_filter_pin_dir: state.uplink_filter_pin_dir.clone(),
                 downlink_filter_pin_dir: state.downlink_filter_pin_dir.clone(),
+                cleanup_only: state.cleanup_only.clone(),
                 session_groups: state.session_groups.clone(),
                 session_uplink_index: state.session_uplink_index.clone(),
                 session_downlink_index: state.session_downlink_index.clone(),
                 session_transactions: state.session_transactions.clone(),
+                far: state.far.clone(),
+                marked_far: state.marked_far.clone(),
+                dscp: state.dscp.clone(),
+                marked_dscp: state.marked_dscp.clone(),
+                sport: state.sport.clone(),
+                marked_sport: state.marked_sport.clone(),
+                pdr: state.pdr.clone(),
+                marked_pdr: state.marked_pdr.clone(),
+                downlink_binding: state.downlink_binding.clone(),
+                marked_owner: state.marked_owner.clone(),
+                marked_owner_by_teid: state.marked_owner_by_teid.clone(),
+                default_teid_by_ue: state.default_teid_by_ue.clone(),
                 pmtu_policy: state.pmtu_policy.clone(),
                 schema: state.schema.clone(),
             }
@@ -19821,6 +19932,32 @@ mod tests {
                     RetainedGraphCleanupRefusal::NotCurrentSchema,
                 ));
             }
+            let grouped_populated = state
+                .session_groups
+                .keys()
+                .any(|(index, _)| *index == ifindex)
+                || state
+                    .session_uplink_index
+                    .keys()
+                    .any(|(index, _)| *index == ifindex)
+                || state
+                    .session_downlink_index
+                    .keys()
+                    .any(|(index, _)| *index == ifindex)
+                || state
+                    .session_transactions
+                    .keys()
+                    .any(|(index, _)| *index == ifindex);
+            let grouped_config_zero = state
+                .pinned_grouped_config
+                .get(pin_dir)
+                .is_none_or(|config| *config == [0; GTPU_SESSION_CONFIG_VALUE_LEN]);
+            let grouped_schema_zero = !state.grouped_schema_ready.contains(pin_dir);
+            if !grouped_config_zero || !grouped_schema_zero || grouped_populated {
+                return Ok(EbpfCleanupOnlyAdoption::Refused(
+                    RetainedGraphCleanupRefusal::NotCurrentSchema,
+                ));
+            }
             if state.uplink_filter_foreign.contains(&ifindex)
                 || state.downlink_filter_foreign.contains(&ifindex)
                 || state.off_slot_sdk_hooks.contains(&ifindex)
@@ -19858,8 +19995,16 @@ mod tests {
                 | state.downlink_filter_ready.remove(&ifindex);
             state.uplink_filter_pin_dir.remove(&ifindex);
             state.downlink_filter_pin_dir.remove(&ifindex);
-            Self::recover_incomplete_pdp_commits(&mut state, ifindex, expected_local_ip)?;
-            Self::rebuild_owner_index(&mut state, ifindex, expected_local_ip, true)?;
+            if let Err(error) =
+                Self::recover_incomplete_pdp_commits(&mut state, ifindex, expected_local_ip)
+            {
+                return cleanup_only_content_failure(error);
+            }
+            if let Err(error) =
+                Self::rebuild_owner_index(&mut state, ifindex, expected_local_ip, true)
+            {
+                return cleanup_only_content_failure(error);
+            }
             state.attached.insert(
                 ifindex,
                 FakeAttachment {
@@ -27982,6 +28127,127 @@ mod tests {
         assert!(!state.pmtu_map_ready.contains(&S2BU_IFINDEX));
         assert!(state.uplink_filter_ready.contains(&S2BU_IFINDEX));
         assert!(!state.cleanup_only.contains(&S2BU_IFINDEX));
+    }
+
+    #[tokio::test]
+    async fn cleanup_only_recovery_refuses_grouped_authority_without_mutation() {
+        for case in ["config", "schema", "population"] {
+            let (backend, runtime) = backend_with_fake();
+            backend.create_device(create_request()).await.unwrap();
+            let pin_dir = backend.pin_dir("s2bu");
+            simulate_process_loss(&runtime, false);
+            {
+                let mut state = runtime.state();
+                match case {
+                    "config" => {
+                        let endpoints =
+                            GtpuLocalEndpointSet::new(IpAddr::V6(ipv6_local()), None).unwrap();
+                        let config =
+                            grouped_device_config(grouped_device_id(0x61), S2BU_IFINDEX, endpoints)
+                                .unwrap()
+                                .encode();
+                        state.pinned_grouped_config.insert(pin_dir.clone(), config);
+                    }
+                    "schema" => {
+                        state.grouped_schema_ready.insert(pin_dir.clone());
+                    }
+                    "population" => {
+                        state.session_groups.insert(
+                            (S2BU_IFINDEX, [0x62; GTPU_SESSION_GROUP_ID_LEN]),
+                            [0x63; GTPU_SESSION_GROUP_VALUE_LEN],
+                        );
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            let before = FakeGroupedPublicationSnapshot::capture(&runtime.state());
+
+            let recovered = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
+            assert_eq!(
+                recovered
+                    .acquire_cleanup_only_recovery(cleanup_request(
+                        Ipv4Addr::new(192, 0, 2, 1),
+                        S2BU_IFINDEX,
+                    ))
+                    .await
+                    .unwrap(),
+                RetainedGraphCleanupClassification::Refused(
+                    RetainedGraphCleanupRefusal::NotCurrentSchema
+                ),
+                "case={case}"
+            );
+
+            let after = FakeGroupedPublicationSnapshot::capture(&runtime.state());
+            assert!(after == before, "case={case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_only_recovery_classifies_malformed_legacy_content_after_fencing() {
+        let (backend, runtime) = backend_with_fake();
+        let installed = create_device_with_context(&backend).await;
+        simulate_process_loss(&runtime, false);
+        let IpAddr::V4(ue_ip) = installed.ms_address else {
+            panic!("test context must use an IPv4 UE address");
+        };
+        runtime
+            .state()
+            .dscp
+            .insert((S2BU_IFINDEX, ue_ip.octets()), [0xff]);
+        let before = FakeGroupedPublicationSnapshot::capture(&runtime.state());
+
+        let recovered = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
+        assert_eq!(
+            recovered
+                .acquire_cleanup_only_recovery(cleanup_request(
+                    Ipv4Addr::new(192, 0, 2, 1),
+                    S2BU_IFINDEX,
+                ))
+                .await
+                .unwrap(),
+            RetainedGraphCleanupClassification::Refused(
+                RetainedGraphCleanupRefusal::NotCurrentSchema
+            )
+        );
+
+        // Malformed legacy content is classified only after the forwarding
+        // safety fence. No map, ownership index, or cleanup authority is
+        // changed; the two hook observations and their pin bindings are the
+        // only expected delta.
+        let mut expected = before;
+        expected.uplink_filter_ready.remove(&S2BU_IFINDEX);
+        expected.downlink_filter_ready.remove(&S2BU_IFINDEX);
+        expected.uplink_filter_pin_dir.remove(&S2BU_IFINDEX);
+        expected.downlink_filter_pin_dir.remove(&S2BU_IFINDEX);
+        let after = FakeGroupedPublicationSnapshot::capture(&runtime.state());
+        assert!(after == expected);
+    }
+
+    #[test]
+    fn cleanup_only_content_failure_preserves_structural_and_transient_taxonomy() {
+        for operation in ["ebpf_pdp_recovery", "ebpf_marked_owner_rebuild"] {
+            assert!(matches!(
+                cleanup_only_content_failure(GtpuError::StateIndeterminate { operation }),
+                Ok(EbpfCleanupOnlyAdoption::Refused(
+                    RetainedGraphCleanupRefusal::NotCurrentSchema
+                ))
+            ));
+        }
+        assert!(matches!(
+            cleanup_only_content_failure(GtpuError::io(
+                "ebpf_marked_owner_rebuild",
+                io::Error::other("injected observation failure"),
+            )),
+            Err(GtpuError::Io { .. })
+        ));
+        assert!(matches!(
+            cleanup_only_content_failure(GtpuError::StateIndeterminate {
+                operation: "ebpf_map_identity",
+            }),
+            Err(GtpuError::StateIndeterminate {
+                operation: "ebpf_map_identity"
+            })
+        ));
     }
 
     #[tokio::test]

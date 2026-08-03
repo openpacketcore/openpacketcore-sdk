@@ -962,13 +962,20 @@ then performs a complete read-only inventory and ABI/capacity validation of all
 21 current map pins before binding CONFIG or any other typed map. Only the exact
 current PMTU-v5 graph is accepted: cleanup acquisition never creates a missing
 pin, migrates an older schema, or advances a schema marker. A canonical nonzero
-endpoint is then compared with the caller's configured local S2b-U address.
-Identity, configuration, and structural refusals happen before graph mutation.
-Acquisition holds the host-global namespace lease, fences any retained live
-hook it owns, and recovers interrupted current-schema commit records with
-forwarding disabled. If a later fencing step becomes indeterminate after an
-earlier hook was detached, no authority is granted and the exact request must be
-retried to re-observe and converge the fence.
+endpoint is then compared with the caller's configured local S2b-U address. The
+independent grouped authority must still be uninitialized: `GTPU_CONFIG6` and
+`GTPU_SCHEMA6` must both be all-zero and all four grouped hash maps must be
+empty. A committed, populated, or malformed grouped state is refused as
+`NotCurrentSchema`; this legacy IPv4 recovery path never adopts grouped
+authority. Identity and retained pin/config/schema structural refusals happen
+before graph mutation. Acquisition then holds the host-global namespace lease,
+fences any retained live hook it owns, and recovers interrupted current-schema
+commit records with forwarding disabled. Stable malformed legacy PDP content
+found during that recovery is also `NotCurrentSchema`, but may be diagnosed only
+after the safety fence or partial recovery; kernel/map observation and mutation
+failures remain retryable `IndeterminateState`. If a later fencing step becomes
+indeterminate after an earlier hook was detached, no authority is granted and
+the exact request must be retried to re-observe and converge the fence.
 
 While authority is held, the ordinary
 `GtpuDataplaneBackend::read_pdp_context` and
@@ -1057,7 +1064,8 @@ subscriber values.
 Cleanup-only authority is retained until explicit activation or until the
 backend is dropped; dropping the handle alone never reattaches forwarding and
 never releases the fence. Grouped (dual-stack) attachments are not covered by
-this legacy IPv4 primitive.
+this legacy IPv4 primitive and are explicitly refused when their independent
+authority is initialized or populated.
 
 #### Drained v2 teardown for current-schema reprovisioning
 
