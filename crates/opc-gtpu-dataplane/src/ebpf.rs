@@ -18339,6 +18339,7 @@ mod tests {
     use std::collections::{HashMap, HashSet, VecDeque};
     use std::hash::Hash;
     use std::net::Ipv6Addr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Barrier, Mutex};
 
     use opc_gtpu_ebpf_common::default_bearer_graph_is_valid;
@@ -18360,6 +18361,8 @@ mod tests {
         ifindexes: HashMap<String, u32>,
         state: Mutex<FakeState>,
         environment: EbpfEnvironment,
+        cleanup_only_adoption_pause: Mutex<Option<(Arc<Barrier>, Arc<Barrier>)>>,
+        cleanup_only_adoption_entries: AtomicUsize,
     }
 
     impl fmt::Debug for FakeRuntime {
@@ -18619,6 +18622,8 @@ mod tests {
                     net_admin_capable: true,
                     bpf_capable: true,
                 },
+                cleanup_only_adoption_pause: Mutex::new(None),
+                cleanup_only_adoption_entries: AtomicUsize::new(0),
             }
         }
 
@@ -18633,6 +18638,22 @@ mod tests {
             self.state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+
+        fn pause_next_cleanup_only_adoption(&self) -> (Arc<Barrier>, Arc<Barrier>) {
+            let started = Arc::new(Barrier::new(2));
+            let release = Arc::new(Barrier::new(2));
+            let mut pause = self
+                .cleanup_only_adoption_pause
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert!(pause.is_none(), "only one fake cleanup pause may be armed");
+            *pause = Some((started.clone(), release.clone()));
+            (started, release)
+        }
+
+        fn cleanup_only_adoption_entries(&self) -> usize {
+            self.cleanup_only_adoption_entries.load(Ordering::SeqCst)
         }
 
         fn fail_in_order(&self, operations: impl IntoIterator<Item = &'static str>) {
@@ -19865,6 +19886,17 @@ mod tests {
             tc_priority: u16,
             expected_local_ip: [u8; 4],
         ) -> Result<EbpfCleanupOnlyAdoption, GtpuError> {
+            self.cleanup_only_adoption_entries
+                .fetch_add(1, Ordering::SeqCst);
+            let pause = self
+                .cleanup_only_adoption_pause
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            if let Some((started, release)) = pause {
+                started.wait();
+                release.wait();
+            }
             let mut state = self.state();
             state.operations.push("adopt_cleanup_only");
             if state.attached.contains_key(&ifindex) {
@@ -28400,43 +28432,65 @@ mod tests {
         simulate_process_loss(&runtime, false);
 
         let recovered = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
-        let make_request = || cleanup_request(Ipv4Addr::new(192, 0, 2, 1), S2BU_IFINDEX);
-        // Start the acquisition, then cancel the observing future almost
-        // immediately. The owned blocking worker is spawned on first poll and
-        // must still converge the graph, so a retry observes the converged
-        // state instead of overlapping a second mutation.
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_nanos(1),
-            recovered.acquire_cleanup_only_recovery(make_request()),
-        )
-        .await;
-        let mut converged = false;
-        for _ in 0..200 {
-            if recovered
-                .inner
-                .devices
-                .lock()
-                .unwrap()
-                .get(&S2BU_IFINDEX)
-                .is_some_and(|device| device.cleanup_only)
-            {
-                converged = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-        assert!(
-            converged,
-            "the supervised worker must converge the graph even after the observer is dropped"
-        );
-        // The retry observes the converged cleanup-managed state rather than
-        // overlapping a second mutation.
-        assert_eq!(
-            recovered
-                .acquire_cleanup_only_recovery(make_request())
+        let request = cleanup_request(Ipv4Addr::new(192, 0, 2, 1), S2BU_IFINDEX);
+        let (started, release) = runtime.pause_next_cleanup_only_adoption();
+
+        // Poll the affine handle until its owned blocking worker is inside the
+        // runtime, then abort only the observing task. This deterministically
+        // proves observer cancellation instead of relying on a scheduler race.
+        let first_backend = recovered.clone();
+        let first_request = request.clone();
+        let first_observer = tokio::spawn(async move {
+            first_backend
+                .acquire_cleanup_only_recovery(first_request)
                 .await
-                .unwrap(),
-            RetainedGraphCleanupClassification::Acquired
+        });
+        tokio::task::spawn_blocking(move || {
+            started.wait();
+        })
+        .await
+        .unwrap();
+        first_observer.abort();
+        let observer_cancelled = first_observer
+            .await
+            .is_err_and(|error| error.is_cancelled());
+
+        // Launch the exact retry while the first worker still owns the backend
+        // operation lock. It must remain pending and must not enter a second
+        // runtime adoption before the original transaction is released.
+        let retry_backend = recovered.clone();
+        let mut retry =
+            tokio::spawn(async move { retry_backend.acquire_cleanup_only_recovery(request).await });
+        let early_retry =
+            tokio::time::timeout(std::time::Duration::from_millis(25), &mut retry).await;
+        let retry_was_pending = early_retry.is_err();
+        let entries_before_release = runtime.cleanup_only_adoption_entries();
+
+        tokio::task::spawn_blocking(move || {
+            release.wait();
+        })
+        .await
+        .unwrap();
+        let retry_result = match early_retry {
+            Ok(result) => result,
+            Err(_) => tokio::time::timeout(std::time::Duration::from_secs(5), retry)
+                .await
+                .expect("retry must observe converged cleanup state"),
+        };
+        let classification = retry_result
+            .expect("retry observer task must not fail")
+            .expect("retry acquisition must complete");
+        assert!(observer_cancelled, "the first observer must be cancelled");
+        assert!(
+            retry_was_pending,
+            "overlapping retry must wait for the owned acquisition worker"
+        );
+        assert_eq!(entries_before_release, 1);
+        assert_eq!(classification, RetainedGraphCleanupClassification::Acquired);
+        assert_eq!(
+            runtime.cleanup_only_adoption_entries(),
+            1,
+            "idempotent retry must not execute a second runtime adoption"
         );
     }
 

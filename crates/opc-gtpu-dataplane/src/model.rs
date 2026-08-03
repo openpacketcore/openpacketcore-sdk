@@ -457,9 +457,12 @@ impl fmt::Debug for RetainedGraphCleanupRequest {
 /// Variants deliberately separate ownership/configuration conflicts,
 /// retryable indeterminate evidence, and structural repairs so a consumer can
 /// choose between retrying, failing over, or escalating to maintenance.
-/// Identity, configuration, and schema refusals are established before graph
-/// mutation. `IndeterminateState` can instead follow a partially completed
-/// forwarding fence; callers must re-observe by retrying the exact request.
+/// Interface/configuration and retained pin/schema preflight refusals are
+/// established before graph mutation. A structural content refusal can follow
+/// the forwarding safety fence or exact reduction of a recoverable interrupted
+/// commit, and `IndeterminateState` can follow a partially completed fence or
+/// uncertain map operation. Callers must not infer an untouched graph from the
+/// reason alone.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RetainedGraphCleanupRefusal {
@@ -478,8 +481,11 @@ pub enum RetainedGraphCleanupRefusal {
     /// a prior acquisition is still completing. Retryable once the owner
     /// releases the namespace.
     ActiveOwner,
-    /// The graph is not the exact current schema supported by this SDK build.
-    /// Structural repair (drained reprovisioning or migration) is required.
+    /// The graph is not the exact current schema supported by this SDK build,
+    /// carries unsupported grouped authority, or contains stable malformed
+    /// PDP state. Structural repair (drained reprovisioning or migration) is
+    /// required. Malformed PDP state can be diagnosed after safety fencing or
+    /// exact interrupted-commit reduction.
     NotCurrentSchema,
     /// A pin, loaded program, or tc hook is foreign, replaced, or no longer
     /// has the exact SDK-owned identity. Structural repair is required.
@@ -517,10 +523,11 @@ pub enum RetainedGraphCleanupClassification {
     /// hook slots are empty, and no SDK forwarding hook exists at another tc
     /// placement. Nothing was manufactured to prove absence.
     AlreadyAbsent,
-    /// Cleanup authority was not granted. Identity, configuration, and schema
-    /// refusals leave the retained graph untouched. A retryable indeterminate
-    /// refusal can follow a partially completed hook fence, so the caller must
-    /// re-observe kernel state by retrying the exact request.
+    /// Cleanup authority was not granted. Preflight conflicts leave the graph
+    /// untouched, but a refusal discovered during fencing or interrupted-
+    /// commit recovery can follow safe hook removal or exact map reduction.
+    /// No refusal reattaches forwarding. Callers must re-observe kernel state
+    /// before deciding whether to retry or enter structural maintenance.
     Refused(RetainedGraphCleanupRefusal),
 }
 
