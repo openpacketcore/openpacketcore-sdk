@@ -1073,12 +1073,16 @@ impl XfrmSaRelocationRecoveryStore {
     /// concurrently with an in-flight admitted run contends for that one
     /// lease. The actor's next lease acquisition then fails
     /// [`XfrmSaRelocationDurableError::StoreBusy`] and the admitted run
-    /// aborts after admission without any durable phase change or backend
-    /// effect. That rejection is fail-closed and retryable: recovery of the
-    /// retained record followed by re-preparation converges to the same
-    /// operation. This is the identical convention used by the released
-    /// install store, whose direct same-process reads contend the same way.
-    /// Keep direct reads short and outside admitted runs.
+    /// aborts at that acquisition. Nothing beyond the contended step
+    /// happens; durable phase and backend effects already published before
+    /// it stand. If the contention lands on the terminal transition, for
+    /// example, the record remains `Issuing` and recovery reconciles it
+    /// through the pre-effect proof. Every such rejection is fail-closed
+    /// and retryable: recovery of the retained record followed by
+    /// re-preparation converges to the same operation. This is the
+    /// identical convention used by the released install store, whose
+    /// direct same-process reads contend the same way. Keep direct reads
+    /// short and outside admitted runs.
     pub fn inspect(
         &self,
         handle: &XfrmSaRelocationRecoveryHandle,
