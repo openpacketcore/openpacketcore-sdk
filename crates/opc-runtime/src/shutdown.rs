@@ -235,10 +235,26 @@ impl ShutdownToken {
         self.inner.phase_tx.subscribe()
     }
 
+    fn current_phase(&self) -> ShutdownPhase {
+        ShutdownPhase::from_u8(self.inner.phase.load(Ordering::SeqCst))
+    }
+
+    /// Publish a phase without allowing an older publisher to regress the
+    /// watch value after a newer atomic transition has completed.
+    fn publish_phase(&self, phase: ShutdownPhase) {
+        self.inner.phase_tx.send_if_modified(|published| {
+            if *published < phase {
+                *published = phase;
+                true
+            } else {
+                false
+            }
+        });
+    }
+
     fn advance_phase(&self, new_phase: ShutdownPhase) -> PhaseAdvance {
         loop {
-            let current_raw = self.inner.phase.load(Ordering::SeqCst);
-            let current_phase = ShutdownPhase::from_u8(current_raw);
+            let current_phase = self.current_phase();
             if current_phase >= new_phase {
                 return PhaseAdvance {
                     prior: current_phase,
@@ -251,18 +267,19 @@ impl ShutdownToken {
                 .inner
                 .phase
                 .compare_exchange(
-                    current_raw,
+                    current_phase.as_u8(),
                     new_phase.as_u8(),
                     Ordering::SeqCst,
                     Ordering::SeqCst,
                 )
                 .is_ok()
             {
-                self.inner.phase_tx.send_replace(new_phase);
-                let actual = ShutdownPhase::from_u8(self.inner.phase.load(Ordering::SeqCst));
-                if actual > new_phase {
-                    self.inner.phase_tx.send_replace(actual);
-                }
+                self.publish_phase(new_phase);
+                // A racing transition may already have advanced the atomic
+                // phase again but not published it yet. Help publish that
+                // latest observation while preserving watch monotonicity.
+                let actual = self.current_phase();
+                self.publish_phase(actual);
                 return PhaseAdvance {
                     prior: current_phase,
                     actual,
@@ -318,10 +335,8 @@ pub struct DrainGuard {
 impl DrainGuard {
     /// Create a new drain guard.
     pub fn new(token: ShutdownToken) -> Self {
-        Self {
-            token,
-            phase: ShutdownPhase::Running,
-        }
+        let phase = token.current_phase();
+        Self { token, phase }
     }
 
     /// Transition to a new drain phase.
@@ -330,9 +345,11 @@ impl DrainGuard {
     /// so repeated or backwards transition requests do not amplify logs.
     pub fn transition(&mut self, new_phase: ShutdownPhase) {
         let advance = self.token.advance_phase(new_phase);
-        self.phase = new_phase;
+        self.phase = advance.actual;
         if advance.advanced {
-            tracing::debug!(from = %advance.prior, to = %advance.actual, "drain phase transition");
+            // Attribute only the phase this invocation actually won. A racing
+            // publisher may already have moved `actual` farther forward.
+            tracing::debug!(from = %advance.prior, to = %new_phase, "drain phase transition");
         }
     }
 
@@ -600,6 +617,32 @@ mod tests {
 
         guard.transition(ShutdownPhase::Stopped);
         assert_eq!(guard.phase(), ShutdownPhase::Stopped);
+    }
+
+    #[test]
+    fn stale_phase_publication_cannot_regress_subscribers() {
+        let token = ShutdownToken::new();
+        token.transition_phase(ShutdownPhase::Stopped);
+        let mut subscriber = token.subscribe();
+        assert_eq!(*subscriber.borrow_and_update(), ShutdownPhase::Stopped);
+
+        // Model a lower-phase publisher that won an earlier atomic CAS but
+        // completed its watch publication after the Stopped publisher.
+        token.publish_phase(ShutdownPhase::Draining);
+
+        assert_eq!(*subscriber.borrow(), ShutdownPhase::Stopped);
+        assert!(matches!(subscriber.has_changed(), Ok(false)));
+    }
+
+    #[test]
+    fn drain_guard_reflects_the_tokens_monotonic_phase() {
+        let token = ShutdownToken::new();
+        token.transition_phase(ShutdownPhase::ProtocolDraining);
+        let mut guard = DrainGuard::new(token);
+        assert_eq!(guard.phase(), ShutdownPhase::ProtocolDraining);
+
+        guard.transition(ShutdownPhase::Draining);
+        assert_eq!(guard.phase(), ShutdownPhase::ProtocolDraining);
     }
 
     #[test]

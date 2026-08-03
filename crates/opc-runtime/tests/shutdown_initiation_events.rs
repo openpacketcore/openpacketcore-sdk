@@ -659,6 +659,11 @@ fn drain_guard_records_only_effective_transitions() {
         guard.transition(ShutdownPhase::Draining); // effective
         guard.transition(ShutdownPhase::Draining); // repeat: no transition
         guard.transition(ShutdownPhase::Running); // backwards: ignored
+        assert_eq!(
+            guard.phase(),
+            ShutdownPhase::Draining,
+            "the guard's observable phase must not regress"
+        );
         guard.transition(ShutdownPhase::Stopped); // effective
 
         let events = recorder.events_with_message(DRAIN_TRANSITION_EVENT);

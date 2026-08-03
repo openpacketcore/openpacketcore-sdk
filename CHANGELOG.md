@@ -754,8 +754,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   global request event plus two request events per task).
   `Supervisor::shutdown_task` records only when it initiates the task
   shutdown. `DrainGuard::transition` likewise records only effective phase
-  advances. Phase publication, subscriber wakeups, drain ordering, and all
-  drain timeouts are unchanged.
+  advances. Watch publication also stays monotonic when concurrent phase
+  publishers complete out of order, so subscribers cannot regress to a stale
+  phase. Subscriber wakeups, drain ordering, and all drain timeouts are
+  preserved.
 - **NETCONF candidate commits now fail closed before mutation without lying
   after a known success — `opc-netconf-server`:** `<commit>` records a
   path-scoped `AuditOutcome::Intent` before config-bus submission, so an audit
