@@ -935,6 +935,138 @@ maintenance window must therefore still exclude out-of-band bpffs and tc
 mutation. Product-owned writer shutdown, session drain, traffic gating,
 finalizer retry policy, and replacement provisioning remain downstream.
 
+#### Cleanup-only retained graph recovery authority
+
+`EbpfGtpuDataplaneBackend::acquire_cleanup_only_recovery` is the supported
+durable-reconciliation primitive for the complementary process-loss case: the
+original writer is gone but the interface (and therefore its ifindex) and the
+retained pin graph both survive. It takes ownership of the exact retained
+current-schema graph and fences the forwarding tc hooks so the consumer can
+read back and remove stale PDP contexts without reactivating the stale graph.
+Product code must not manipulate those pins or hooks directly.
+
+This primitive occupies the gap between the ordinary lifecycle and orphaned
+recovery:
+
+- `create_device`/`resolve_device` both reach program attachment, so they
+  re-enable forwarding the instant retained entries exist — before the consumer
+  has had a chance to remove stale contexts. Cleanup-only acquisition never
+  attaches or reattaches the forwarding hooks before cleanup is complete.
+- `recover_orphaned_current_ebpf_graph` deletes the whole graph and requires
+  the old interface namespace to be gone. Cleanup-only acquisition never
+  deletes the graph and requires the interface to still resolve to the expected
+  ifindex.
+
+Before granting authority the backend proves the expected name/ifindex pair,
+then performs a complete read-only inventory and ABI/capacity validation of all
+21 current map pins before binding CONFIG or any other typed map. Only the exact
+current PMTU-v5 graph is accepted: cleanup acquisition never creates a missing
+pin, migrates an older schema, or advances a schema marker. A canonical nonzero
+endpoint is then compared with the caller's configured local S2b-U address. The
+independent grouped authority must still be uninitialized: `GTPU_CONFIG6` and
+`GTPU_SCHEMA6` must both be all-zero and all four grouped hash maps must be
+empty. A committed, populated, or malformed grouped state is refused as
+`NotCurrentSchema`; this legacy IPv4 recovery path never adopts grouped
+authority. Identity and retained pin/config/schema structural refusals happen
+before graph mutation. Acquisition then holds the host-global namespace lease,
+fences any retained live hook it owns, and recovers interrupted current-schema
+commit records with forwarding disabled. Stable malformed legacy PDP content
+found during that recovery is also `NotCurrentSchema`, but may be diagnosed only
+after the safety fence or partial recovery; kernel/map observation and mutation
+failures remain retryable `IndeterminateState`. If a later fencing step becomes
+indeterminate after an earlier hook was detached, no authority is granted and
+the exact request must be retried to re-observe and converge the fence.
+
+While authority is held, the ordinary
+`GtpuDataplaneBackend::read_pdp_context` and
+`GtpuDataplaneBackend::remove_pdp_context_exact` boundaries operate against a
+cleanup-safe datapath posture: every named pin still identifies the held map and
+both forwarding hooks are authoritatively absent. Classified installation,
+ordinary non-exact removal, and unrelated datapath mutation remain denied in
+cleanup-only mode even if a hook reappears out of band. Reconciliation
+capabilities therefore advertise exact readback and exact removal independently
+from classified installation, which remains unavailable while fenced.
+`activate_cleanup_recovery` is the sole explicit step that reattaches the
+forwarding hooks and returns the device to normal management.
+
+Acquisition returns an affine, supervised completion handle. Awaiting it drives
+the bounded acquisition on an owned blocking worker; dropping the observing
+future cannot cancel that worker, which converges the graph state under the
+namespace lease and operation lock regardless. A retry therefore never overlaps
+the same graph: it either observes the converged cleanup-managed state
+(idempotently `Acquired`) or is refused while the prior acquisition still holds
+the lease. An unexpected panic in the acquisition is caught and reported as
+retryable `IndeterminateState` so the handle never hangs; the affected backend
+then fails closed while its operation lock is poisoned, and recovery proceeds
+on a fresh backend instance, which re-validates from kernel state.
+
+```rust,no_run
+use opc_gtpu_dataplane::{
+    CurrentEbpfGraphWriterProof, EbpfGtpuDataplaneBackend, GtpDevice, GtpPdpContext,
+    PdpContextLocalTeidSelector, PdpContextReadback, PdpContextRemovalOutcome,
+    PdpContextSelector, RetainedGraphCleanupClassification, RetainedGraphCleanupRequest,
+};
+use std::net::Ipv4Addr;
+
+# async fn reconcile(
+#     backend: &EbpfGtpuDataplaneBackend,
+#     device: GtpDevice,
+#     local_endpoint: Ipv4Addr,
+#     stale: GtpPdpContext,
+# ) -> Result<(), Box<dyn std::error::Error>> {
+let request = RetainedGraphCleanupRequest::new(
+    device.clone(),
+    local_endpoint,
+    CurrentEbpfGraphWriterProof::previous_writer_stopped(),
+);
+loop {
+    match backend.acquire_cleanup_only_recovery(request.clone()).await? {
+        RetainedGraphCleanupClassification::Acquired => break,
+        RetainedGraphCleanupClassification::AlreadyAbsent => return Ok(()),
+        RetainedGraphCleanupClassification::Refused(reason) if reason.is_retryable() => {
+            // Back off and retry the exact request.
+        }
+        RetainedGraphCleanupClassification::Refused(reason) => {
+            return Err(std::io::Error::other(format!(
+                "cleanup-only recovery refused: {reason:?}",
+            ))
+            .into());
+        }
+        _ => return Err(std::io::Error::other("unknown cleanup outcome").into()),
+    }
+}
+
+// Forwarding stays disabled while stale contexts are reconciled.
+let selector = PdpContextSelector::LocalTeid(
+    PdpContextLocalTeidSelector::from_context(&stale).expect("local TEID selector"),
+);
+if backend.read_pdp_context(selector).await? == PdpContextReadback::Present(stale.clone()) {
+    assert_eq!(
+        backend.remove_pdp_context_exact(stale).await?,
+        PdpContextRemovalOutcome::Removed
+    );
+}
+
+// The sole step that reattaches forwarding.
+backend.activate_cleanup_recovery(&device).await?;
+# Ok(())
+# }
+```
+
+Refusals deliberately separate ownership/configuration conflicts
+(`InterfaceIdentityChanged`, `LocalEndpointMismatch`, `ManagedAttachment`),
+retryable indeterminate evidence (`ActiveOwner`, `IndeterminateState`), and
+structural repairs (`NotCurrentSchema`, `IdentityMismatch`); `is_retryable`
+reports which are safe to retry with the exact request. The request, the
+completion handle, and every diagnostic redact interface, endpoint, TEID, and
+subscriber values.
+
+Cleanup-only authority is retained until explicit activation or until the
+backend is dropped; dropping the handle alone never reattaches forwarding and
+never releases the fence. Grouped (dual-stack) attachments are not covered by
+this legacy IPv4 primitive and are explicitly refused when their independent
+authority is initialized or populated.
+
 #### Drained v2 teardown for current-schema reprovisioning
 
 `GtpuDataplaneBackend::teardown_drained_v2` is the only supported SDK path for

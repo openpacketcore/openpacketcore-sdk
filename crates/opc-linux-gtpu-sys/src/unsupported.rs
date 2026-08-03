@@ -172,6 +172,10 @@ pub fn receive_message(_socket: &NetlinkSocket, _buffer: &mut [u8]) -> io::Resul
     Err(unsupported())
 }
 
+pub fn receive_kernel_message(_socket: &NetlinkSocket, _buffer: &mut [u8]) -> io::Result<usize> {
+    Err(unsupported())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

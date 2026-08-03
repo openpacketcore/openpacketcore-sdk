@@ -79,29 +79,38 @@ use opc_gtpu_dataplane::{
     GtpuUplinkSourcePortPolicy, GtpuV2DrainProof, PdpContextIndeterminateReason,
     PdpContextInstallOutcome, PdpContextLocalTeidSelector, PdpContextReadback,
     PdpContextRemovalOutcome, PdpContextSelector, PdpContextSelectorOccupancy,
-    PdpContextUplinkSelector, RemovePdpContextRequest, Teid,
+    PdpContextUplinkSelector, RemovePdpContextRequest, RetainedGraphCleanupClassification,
+    RetainedGraphCleanupRefusal, RetainedGraphCleanupRequest, Teid,
 };
 use opc_gtpu_ebpf_common::{
     internet_checksum, ipv4_header_checksum, udp_ipv4_checksum, udp_ipv6_checksum,
     udp_ipv6_checksum_is_valid, DownlinkEndpointBinding, DownlinkPdr, GtpuEndpointAddress,
-    MarkedBearerOwner, MarkedBearerOwnerPhase, MarkedDownlinkPdr, PdpContextCommit, UplinkFar,
-    UplinkFarKey, COUNTER_DL_BINDING_FAMILY_MISMATCH, COUNTER_DL_BINDING_INGRESS_MISMATCH,
+    GtpuSessionDeviceConfig, GtpuSessionDownlinkKey, GtpuSessionEntry as EbpfSessionEntry,
+    GtpuSessionGeneration, GtpuSessionGroupRecord, GtpuSessionGroupRef, GtpuSessionIndexCandidate,
+    GtpuSessionPaa, GtpuSessionUplinkKey, MarkedBearerOwner, MarkedBearerOwnerPhase,
+    MarkedDownlinkPdr, PdpContextCommit, UplinkFar, UplinkFarKey,
+    COUNTER_DL_BINDING_FAMILY_MISMATCH, COUNTER_DL_BINDING_INGRESS_MISMATCH,
     COUNTER_DL_BINDING_INVALID, COUNTER_DL_BINDING_LOCAL_MISMATCH,
     COUNTER_DL_BINDING_PEER_MISMATCH, COUNTER_DL_BINDING_SOURCE_PORT_MISMATCH, COUNTER_DL_DECAP,
     COUNTER_DL_DST_MISMATCH, COUNTER_DL_MALFORMED, COUNTER_DL_UNKNOWN_TEID, COUNTER_SLOTS,
     COUNTER_UL_ENCAP, COUNTER_UL_FAR_MISS, COUNTER_UL_MTU_REJECT, COUNTER_UL_PMTU_CORRUPT,
-    COUNTER_UL_REDIRECT_RESOLVED, DOWNLINK_ENDPOINT_BINDING_VALUE_LEN, DOWNLINK_PDR_VALUE_LEN,
-    ETH_HDR_LEN, GTPU_MANDATORY_HDR_LEN, IPV4_MIN_HDR_LEN, MAP_CONFIG, MAP_CONFIG_IPV6,
-    MAP_COUNTERS, MAP_DOWNLINK_BINDING_COUNTERS, MAP_DOWNLINK_ENDPOINT_BINDING,
+    COUNTER_UL_REDIRECT_RESOLVED, DOWNLINK_BINDING_COUNTER_SLOTS,
+    DOWNLINK_ENDPOINT_BINDING_VALUE_LEN, DOWNLINK_PDR_VALUE_LEN, ETH_HDR_LEN,
+    GTPU_MANDATORY_HDR_LEN, GTPU_SESSION_CONFIG_KEY, GTPU_SESSION_CONFIG_VALUE_LEN,
+    GTPU_SESSION_DOWNLINK_KEY_LEN, GTPU_SESSION_GROUP_ID_LEN, GTPU_SESSION_GROUP_REF_LEN,
+    GTPU_SESSION_GROUP_VALUE_LEN, GTPU_SESSION_IPV4_SLOT, GTPU_SESSION_IPV6_SLOT,
+    GTPU_SESSION_SCHEMA_MARKER_LEN, GTPU_SESSION_SCHEMA_MARKER_VALUE,
+    GTPU_SESSION_TRANSACTION_VALUE_LEN, GTPU_SESSION_UPLINK_KEY_LEN, IPV4_MIN_HDR_LEN, MAP_CONFIG,
+    MAP_CONFIG_IPV6, MAP_COUNTERS, MAP_DOWNLINK_BINDING_COUNTERS, MAP_DOWNLINK_ENDPOINT_BINDING,
     MAP_DOWNLINK_MARK_PDR, MAP_DOWNLINK_PDR, MAP_MARKED_BEARER_OWNER, MAP_SESSION_DOWNLINK_INDEX,
     MAP_SESSION_GROUPS, MAP_SESSION_SCHEMA, MAP_SESSION_TRANSACTIONS, MAP_SESSION_UPLINK_INDEX,
     MAP_UPLINK_DSCP, MAP_UPLINK_FAR, MAP_UPLINK_MARK_DSCP, MAP_UPLINK_MARK_FAR,
     MAP_UPLINK_MARK_SOURCE_PORT, MAP_UPLINK_PMTU, MAP_UPLINK_PMTU_COUNTERS, MAP_UPLINK_SOURCE_PORT,
     MARKED_BEARER_OWNER_VALUE_LEN, MARKED_DOWNLINK_PDR_VALUE_LEN, PROG_DOWNLINK, PROG_UPLINK,
     UDP_HDR_LEN, UPLINK_BEARER_SCHEMA_MARKER_VALUE, UPLINK_DSCP_SCHEMA_MARKER_KEY,
-    UPLINK_DSCP_SCHEMA_MARKER_VALUE, UPLINK_DSCP_VALUE_LEN, UPLINK_FAR_VALUE_LEN,
-    UPLINK_MARK_KEY_LEN, UPLINK_PMTU_SCHEMA_MARKER_VALUE, UPLINK_PMTU_VALUE_LEN,
-    UPLINK_SOURCE_PORT_VALUE_LEN,
+    UPLINK_DSCP_SCHEMA_MARKER_VALUE, UPLINK_DSCP_VALUE_LEN, UPLINK_ENDPOINT_SCHEMA_MARKER_VALUE,
+    UPLINK_FAR_VALUE_LEN, UPLINK_MARK_KEY_LEN, UPLINK_PMTU_COUNTER_SLOTS,
+    UPLINK_PMTU_SCHEMA_MARKER_VALUE, UPLINK_PMTU_VALUE_LEN, UPLINK_SOURCE_PORT_VALUE_LEN,
 };
 use opc_ipsec_xfrm::{
     Algorithm, AuthAlgorithm, InstallPolicyRequest, InstallSaRequest, IpAddress, KeyMaterial,
@@ -175,6 +184,29 @@ const IPPROTO_ESP: u8 = 50;
 const CURRENT_DATAPATH_OBJECT: &[u8] = include_bytes!("../bpf/opc-gtpu-datapath.bpf.o");
 const FROZEN_V1_OBJECT: &[u8] = include_bytes!("../bpf/opc-gtpu-datapath-v1.bpf.o");
 const FROZEN_V2_OBJECT: &[u8] = include_bytes!("../bpf/opc-gtpu-datapath-v2.bpf.o");
+const CURRENT_PIN_NAMES: [&str; 21] = [
+    MAP_UPLINK_FAR,
+    MAP_UPLINK_MARK_FAR,
+    MAP_UPLINK_DSCP,
+    MAP_UPLINK_MARK_DSCP,
+    MAP_UPLINK_SOURCE_PORT,
+    MAP_UPLINK_MARK_SOURCE_PORT,
+    MAP_UPLINK_PMTU,
+    MAP_UPLINK_PMTU_COUNTERS,
+    MAP_DOWNLINK_PDR,
+    MAP_DOWNLINK_MARK_PDR,
+    MAP_DOWNLINK_ENDPOINT_BINDING,
+    MAP_MARKED_BEARER_OWNER,
+    MAP_COUNTERS,
+    MAP_DOWNLINK_BINDING_COUNTERS,
+    MAP_CONFIG,
+    MAP_SESSION_GROUPS,
+    MAP_SESSION_UPLINK_INDEX,
+    MAP_SESSION_DOWNLINK_INDEX,
+    MAP_SESSION_TRANSACTIONS,
+    MAP_CONFIG_IPV6,
+    MAP_SESSION_SCHEMA,
+];
 /// The generation immediately before the uplink redirect-outcome counter.
 ///
 /// This is the real historical object, not the current object reshaped to look
@@ -3209,6 +3241,25 @@ fn install_off_slot_pre_redirect_generation_with_current_capacity(
     uplink_id
 }
 
+/// Leave one current SDK uplink program outside the managed tc slot without
+/// publishing any map pins. This is the exact orphan shape for which an empty
+/// desired slot is insufficient evidence that the datapath is absent.
+fn install_off_slot_current_uplink_without_pins() -> u32 {
+    ensure_clsact("s2bu");
+    let mut ebpf = EbpfLoader::new()
+        .load(CURRENT_DATAPATH_OBJECT)
+        .expect("load current object without pinning maps");
+    let uplink_id = attach_frozen_program_at(
+        &mut ebpf,
+        PROG_UPLINK,
+        TcAttachType::Egress,
+        51,
+        OFF_SLOT_TC_HANDLE,
+    );
+    drop(ebpf);
+    uplink_id
+}
+
 /// Make the clsact qdisc present so a fixture standing in for a prior loader
 /// can attach where the SDK would.
 ///
@@ -3254,6 +3305,356 @@ fn pinned_map_abi(pin_dir: &std::path::Path, name: &str) -> Option<(u32, u32, u3
         info.value_size(),
         info.max_entries(),
     ))
+}
+
+fn pinned_hash_entries<const KEY_LEN: usize, const VALUE_LEN: usize>(
+    pin_dir: &std::path::Path,
+    name: &str,
+) -> Vec<([u8; KEY_LEN], [u8; VALUE_LEN])> {
+    let map = Map::from_map_data(
+        MapData::from_pin(pin_dir.join(name))
+            .unwrap_or_else(|error| panic!("open pinned {name}: {error}")),
+    )
+    .unwrap_or_else(|error| panic!("identify pinned {name}: {error}"));
+    let hash = BpfHashMap::<_, [u8; KEY_LEN], [u8; VALUE_LEN]>::try_from(map)
+        .unwrap_or_else(|error| panic!("type pinned {name}: {error}"));
+    let mut entries = hash
+        .iter()
+        .map(|entry| entry.unwrap_or_else(|error| panic!("read pinned {name}: {error}")))
+        .collect::<Vec<_>>();
+    entries.sort_unstable_by_key(|entry| entry.0);
+    entries
+}
+
+fn pinned_array_values<const VALUE_LEN: usize>(
+    pin_dir: &std::path::Path,
+    name: &str,
+    slots: u32,
+) -> Vec<[u8; VALUE_LEN]> {
+    let map = Map::from_map_data(
+        MapData::from_pin(pin_dir.join(name))
+            .unwrap_or_else(|error| panic!("open pinned {name}: {error}")),
+    )
+    .unwrap_or_else(|error| panic!("identify pinned {name}: {error}"));
+    let array = Array::<_, [u8; VALUE_LEN]>::try_from(map)
+        .unwrap_or_else(|error| panic!("type pinned {name}: {error}"));
+    (0..slots)
+        .map(|index| {
+            array
+                .get(&index, 0)
+                .unwrap_or_else(|error| panic!("read pinned {name}[{index}]: {error}"))
+        })
+        .collect()
+}
+
+fn pinned_per_cpu_u64_values(pin_dir: &std::path::Path, name: &str, slots: u32) -> Vec<Vec<u64>> {
+    let map = Map::from_map_data(
+        MapData::from_pin(pin_dir.join(name))
+            .unwrap_or_else(|error| panic!("open pinned {name}: {error}")),
+    )
+    .unwrap_or_else(|error| panic!("identify pinned {name}: {error}"));
+    let array = PerCpuArray::<_, u64>::try_from(map)
+        .unwrap_or_else(|error| panic!("type pinned {name}: {error}"));
+    (0..slots)
+        .map(|index| {
+            array
+                .get(&index, 0)
+                .unwrap_or_else(|error| panic!("read pinned {name}[{index}]: {error}"))
+                .iter()
+                .copied()
+                .collect()
+        })
+        .collect()
+}
+
+/// Exact byte-for-byte state of every map in the current 21-pin graph.
+///
+/// This intentionally has no `Debug` implementation: assertion failures must
+/// not print subscriber addresses, TEIDs, or grouped routing authority.
+#[derive(PartialEq, Eq)]
+struct CurrentMapContents {
+    uplink_far: Vec<([u8; 4], [u8; UPLINK_FAR_VALUE_LEN])>,
+    uplink_mark_far: Vec<([u8; UPLINK_MARK_KEY_LEN], [u8; UPLINK_FAR_VALUE_LEN])>,
+    uplink_dscp: Vec<([u8; 4], [u8; UPLINK_DSCP_VALUE_LEN])>,
+    uplink_mark_dscp: Vec<([u8; UPLINK_MARK_KEY_LEN], [u8; UPLINK_DSCP_VALUE_LEN])>,
+    uplink_source_port: Vec<([u8; 4], [u8; UPLINK_SOURCE_PORT_VALUE_LEN])>,
+    uplink_mark_source_port: Vec<(
+        [u8; UPLINK_MARK_KEY_LEN],
+        [u8; UPLINK_SOURCE_PORT_VALUE_LEN],
+    )>,
+    uplink_pmtu: Vec<[u8; UPLINK_PMTU_VALUE_LEN]>,
+    uplink_pmtu_counters: Vec<Vec<u64>>,
+    downlink_pdr: Vec<([u8; 4], [u8; DOWNLINK_PDR_VALUE_LEN])>,
+    downlink_mark_pdr: Vec<([u8; 4], [u8; MARKED_DOWNLINK_PDR_VALUE_LEN])>,
+    downlink_endpoint_binding: Vec<([u8; 4], [u8; DOWNLINK_ENDPOINT_BINDING_VALUE_LEN])>,
+    marked_bearer_owner: Vec<(
+        [u8; UPLINK_MARK_KEY_LEN],
+        [u8; MARKED_BEARER_OWNER_VALUE_LEN],
+    )>,
+    counters: Vec<Vec<u64>>,
+    downlink_binding_counters: Vec<Vec<u64>>,
+    config: Vec<[u8; 4]>,
+    session_groups: Vec<(
+        [u8; GTPU_SESSION_GROUP_ID_LEN],
+        [u8; GTPU_SESSION_GROUP_VALUE_LEN],
+    )>,
+    session_uplink_index: Vec<(
+        [u8; GTPU_SESSION_UPLINK_KEY_LEN],
+        [u8; GTPU_SESSION_GROUP_REF_LEN],
+    )>,
+    session_downlink_index: Vec<(
+        [u8; GTPU_SESSION_DOWNLINK_KEY_LEN],
+        [u8; GTPU_SESSION_GROUP_REF_LEN],
+    )>,
+    session_transactions: Vec<(
+        [u8; GTPU_SESSION_GROUP_ID_LEN],
+        [u8; GTPU_SESSION_TRANSACTION_VALUE_LEN],
+    )>,
+    config_ipv6: Vec<[u8; GTPU_SESSION_CONFIG_VALUE_LEN]>,
+    session_schema: Vec<[u8; GTPU_SESSION_SCHEMA_MARKER_LEN]>,
+}
+
+fn current_map_contents(pin_dir: &std::path::Path) -> CurrentMapContents {
+    CurrentMapContents {
+        uplink_far: pinned_hash_entries(pin_dir, MAP_UPLINK_FAR),
+        uplink_mark_far: pinned_hash_entries(pin_dir, MAP_UPLINK_MARK_FAR),
+        uplink_dscp: pinned_hash_entries(pin_dir, MAP_UPLINK_DSCP),
+        uplink_mark_dscp: pinned_hash_entries(pin_dir, MAP_UPLINK_MARK_DSCP),
+        uplink_source_port: pinned_hash_entries(pin_dir, MAP_UPLINK_SOURCE_PORT),
+        uplink_mark_source_port: pinned_hash_entries(pin_dir, MAP_UPLINK_MARK_SOURCE_PORT),
+        uplink_pmtu: pinned_array_values(pin_dir, MAP_UPLINK_PMTU, 1),
+        uplink_pmtu_counters: pinned_per_cpu_u64_values(
+            pin_dir,
+            MAP_UPLINK_PMTU_COUNTERS,
+            UPLINK_PMTU_COUNTER_SLOTS,
+        ),
+        downlink_pdr: pinned_hash_entries(pin_dir, MAP_DOWNLINK_PDR),
+        downlink_mark_pdr: pinned_hash_entries(pin_dir, MAP_DOWNLINK_MARK_PDR),
+        downlink_endpoint_binding: pinned_hash_entries(pin_dir, MAP_DOWNLINK_ENDPOINT_BINDING),
+        marked_bearer_owner: pinned_hash_entries(pin_dir, MAP_MARKED_BEARER_OWNER),
+        counters: pinned_per_cpu_u64_values(pin_dir, MAP_COUNTERS, COUNTER_SLOTS),
+        downlink_binding_counters: pinned_per_cpu_u64_values(
+            pin_dir,
+            MAP_DOWNLINK_BINDING_COUNTERS,
+            DOWNLINK_BINDING_COUNTER_SLOTS,
+        ),
+        config: pinned_array_values(pin_dir, MAP_CONFIG, 1),
+        session_groups: pinned_hash_entries(pin_dir, MAP_SESSION_GROUPS),
+        session_uplink_index: pinned_hash_entries(pin_dir, MAP_SESSION_UPLINK_INDEX),
+        session_downlink_index: pinned_hash_entries(pin_dir, MAP_SESSION_DOWNLINK_INDEX),
+        session_transactions: pinned_hash_entries(pin_dir, MAP_SESSION_TRANSACTIONS),
+        config_ipv6: pinned_array_values(pin_dir, MAP_CONFIG_IPV6, 1),
+        session_schema: pinned_array_values(pin_dir, MAP_SESSION_SCHEMA, 1),
+    }
+}
+
+/// Exact retained pin graph, including path-to-kernel-ID association and all
+/// map bytes. This also has no `Debug` implementation for redaction safety.
+#[derive(PartialEq, Eq)]
+struct CurrentPinGraphSnapshot {
+    pins: Vec<String>,
+    map_ids: Vec<(String, u32)>,
+    contents: CurrentMapContents,
+}
+
+fn current_pin_graph_snapshot(pin_dir: &std::path::Path) -> CurrentPinGraphSnapshot {
+    let pins = pin_directory_listing(pin_dir);
+    let mut expected = CURRENT_PIN_NAMES.map(str::to_owned).to_vec();
+    expected.sort_unstable();
+    assert_eq!(
+        pins, expected,
+        "fixture must retain the exact current 21-pin graph"
+    );
+    let map_ids = pins
+        .iter()
+        .map(|name| {
+            (
+                name.clone(),
+                MapInfo::from_pin(pin_dir.join(name))
+                    .unwrap_or_else(|error| panic!("open retained {name}: {error}"))
+                    .id(),
+            )
+        })
+        .collect();
+    CurrentPinGraphSnapshot {
+        pins,
+        map_ids,
+        contents: current_map_contents(pin_dir),
+    }
+}
+
+#[derive(PartialEq, Eq)]
+struct CurrentHookSnapshot {
+    egress: String,
+    ingress: String,
+    uplink_map_ids: Vec<u32>,
+    downlink_map_ids: Vec<u32>,
+}
+
+fn current_hook_snapshot() -> CurrentHookSnapshot {
+    let egress = tc_filters("egress");
+    let ingress = tc_filters("ingress");
+    assert!(
+        egress.contains(PROG_UPLINK) && ingress.contains("opc_gtpu_downli"),
+        "fixture must start with both current SDK hooks"
+    );
+    CurrentHookSnapshot {
+        egress,
+        ingress,
+        uplink_map_ids: attached_program_map_ids("egress"),
+        downlink_map_ids: attached_program_map_ids("ingress"),
+    }
+}
+
+/// Publish canonical, committed grouped state into an already-current graph.
+/// The enclosing graph deliberately retains its matching nonzero legacy
+/// `CONFIG`, creating the mixed stable state cleanup-only recovery cannot own.
+fn seed_committed_grouped_state(pin_dir: &std::path::Path, ifindex: u32) {
+    let config = GtpuSessionDeviceConfig::new(
+        grouped_device_id(),
+        ifindex,
+        Some(EPDG_S2BU_IP.octets()),
+        Some(EPDG_S2BU_IPV6.octets()),
+    )
+    .expect("canonical grouped device config")
+    .encode();
+    {
+        let map = Map::from_map_data(
+            MapData::from_pin(pin_dir.join(MAP_CONFIG_IPV6)).expect("open grouped config pin"),
+        )
+        .expect("identify grouped config map");
+        let mut array = Array::<_, [u8; GTPU_SESSION_CONFIG_VALUE_LEN]>::try_from(map)
+            .expect("typed grouped config map");
+        array
+            .set(GTPU_SESSION_CONFIG_KEY, config, 0)
+            .expect("seed grouped config");
+    }
+    {
+        let map = Map::from_map_data(
+            MapData::from_pin(pin_dir.join(MAP_SESSION_SCHEMA)).expect("open grouped schema pin"),
+        )
+        .expect("identify grouped schema map");
+        let mut array = Array::<_, [u8; GTPU_SESSION_SCHEMA_MARKER_LEN]>::try_from(map)
+            .expect("typed grouped schema map");
+        array
+            .set(GTPU_SESSION_CONFIG_KEY, GTPU_SESSION_SCHEMA_MARKER_VALUE, 0)
+            .expect("commit grouped schema");
+    }
+
+    let ipv4 = EbpfSessionEntry::new(
+        GtpuSessionPaa::from_full_paa(GtpuEndpointAddress::Ipv4(UE_PAA.octets()))
+            .expect("canonical grouped IPv4 PAA"),
+        GtpuEndpointAddress::Ipv4(PGW_IP.octets()),
+        GtpuEndpointAddress::Ipv4(EPDG_S2BU_IP.octets()),
+        GROUP_LOCAL_TEID_V4_INITIAL.to_be_bytes(),
+        GROUP_PEER_TEID_V4_INITIAL.to_be_bytes(),
+        [0; 4],
+        None,
+        GtpuSourcePortPolicy::Exact(GTPU_PORT),
+        GtpuUplinkSourcePortPolicy::LegacyServicePort,
+    )
+    .expect("canonical grouped IPv4 entry");
+    let ipv6 = EbpfSessionEntry::new(
+        GtpuSessionPaa::from_full_paa(GtpuEndpointAddress::Ipv6(UE_PAA_IPV6.octets()))
+            .expect("canonical grouped IPv6 PAA"),
+        GtpuEndpointAddress::Ipv6(PGW_IPV6.octets()),
+        GtpuEndpointAddress::Ipv6(EPDG_S2BU_IPV6.octets()),
+        GROUP_LOCAL_TEID_V6_INITIAL.to_be_bytes(),
+        GROUP_PEER_TEID_V6_INITIAL.to_be_bytes(),
+        [0; 4],
+        None,
+        GtpuSourcePortPolicy::Exact(GTPU_PORT),
+        GtpuUplinkSourcePortPolicy::LegacyServicePort,
+    )
+    .expect("canonical grouped IPv6 entry");
+    let authority = GtpuSessionGroupRecord::active(
+        grouped_group_id(),
+        grouped_device_id(),
+        GtpuSessionGeneration::INITIAL,
+        Some(ipv4),
+        Some(ipv6),
+    )
+    .expect("canonical committed dual-stack group");
+    {
+        let map = Map::from_map_data(
+            MapData::from_pin(pin_dir.join(MAP_SESSION_GROUPS))
+                .expect("open grouped authority pin"),
+        )
+        .expect("identify grouped authority map");
+        let mut groups = BpfHashMap::<
+            _,
+            [u8; GTPU_SESSION_GROUP_ID_LEN],
+            [u8; GTPU_SESSION_GROUP_VALUE_LEN],
+        >::try_from(map)
+        .expect("typed grouped authority map");
+        groups
+            .insert(grouped_group_id().to_bytes(), authority.encode(), 0)
+            .expect("seed committed grouped authority");
+    }
+
+    let indexed = [
+        (GTPU_SESSION_IPV4_SLOT, ipv4),
+        (GTPU_SESSION_IPV6_SLOT, ipv6),
+    ];
+    {
+        let map = Map::from_map_data(
+            MapData::from_pin(pin_dir.join(MAP_SESSION_UPLINK_INDEX))
+                .expect("open grouped uplink-index pin"),
+        )
+        .expect("identify grouped uplink-index map");
+        let mut index = BpfHashMap::<
+            _,
+            [u8; GTPU_SESSION_UPLINK_KEY_LEN],
+            [u8; GTPU_SESSION_GROUP_REF_LEN],
+        >::try_from(map)
+        .expect("typed grouped uplink-index map");
+        for (slot, entry) in indexed {
+            let candidate = GtpuSessionIndexCandidate::new(GtpuSessionGeneration::INITIAL, slot)
+                .expect("canonical grouped index slot");
+            index
+                .insert(
+                    GtpuSessionUplinkKey::from_entry(entry).encode(),
+                    GtpuSessionGroupRef::single(grouped_group_id(), candidate).encode(),
+                    0,
+                )
+                .expect("seed grouped uplink index");
+        }
+    }
+    {
+        let map = Map::from_map_data(
+            MapData::from_pin(pin_dir.join(MAP_SESSION_DOWNLINK_INDEX))
+                .expect("open grouped downlink-index pin"),
+        )
+        .expect("identify grouped downlink-index map");
+        let mut index = BpfHashMap::<
+            _,
+            [u8; GTPU_SESSION_DOWNLINK_KEY_LEN],
+            [u8; GTPU_SESSION_GROUP_REF_LEN],
+        >::try_from(map)
+        .expect("typed grouped downlink-index map");
+        for (slot, entry) in indexed {
+            let candidate = GtpuSessionIndexCandidate::new(GtpuSessionGeneration::INITIAL, slot)
+                .expect("canonical grouped index slot");
+            index
+                .insert(
+                    GtpuSessionDownlinkKey::from_entry(entry).encode(),
+                    GtpuSessionGroupRef::single(grouped_group_id(), candidate).encode(),
+                    0,
+                )
+                .expect("seed grouped downlink index");
+        }
+    }
+}
+
+fn seed_malformed_default_dscp(pin_dir: &std::path::Path) {
+    let map = Map::from_map_data(
+        MapData::from_pin(pin_dir.join(MAP_UPLINK_DSCP)).expect("open pinned default DSCP"),
+    )
+    .expect("identify pinned default DSCP map");
+    let mut dscp = BpfHashMap::<_, [u8; 4], [u8; UPLINK_DSCP_VALUE_LEN]>::try_from(map)
+        .expect("typed pinned default DSCP map");
+    dscp.insert(UE_PAA.octets(), [0xff; UPLINK_DSCP_VALUE_LEN], 0)
+        .expect("seed malformed default DSCP");
 }
 
 fn install_drained_frozen_v2_datapath(pin_dir: &std::path::Path) -> (u32, u32) {
@@ -3388,6 +3789,28 @@ fn pinned_schema_marker(pin_dir: &std::path::Path) -> [u8; UPLINK_FAR_VALUE_LEN]
         .expect("typed pinned FAR");
     far.get(&UPLINK_DSCP_SCHEMA_MARKER_KEY, 0)
         .expect("read pinned schema marker")
+}
+
+fn replace_pinned_schema_marker(pin_dir: &std::path::Path, marker: [u8; UPLINK_FAR_VALUE_LEN]) {
+    let map = Map::from_map_data(
+        MapData::from_pin(pin_dir.join(MAP_UPLINK_FAR)).expect("open pinned FAR"),
+    )
+    .expect("identify pinned FAR map");
+    let mut far = BpfHashMap::<_, [u8; 4], [u8; UPLINK_FAR_VALUE_LEN]>::try_from(map)
+        .expect("typed pinned FAR");
+    far.insert(UPLINK_DSCP_SCHEMA_MARKER_KEY, marker, 0)
+        .expect("replace pinned schema marker");
+}
+
+fn pinned_default_commit(pin_dir: &std::path::Path) -> Option<[u8; UPLINK_SOURCE_PORT_VALUE_LEN]> {
+    let map = Map::from_map_data(
+        MapData::from_pin(pin_dir.join(MAP_UPLINK_SOURCE_PORT))
+            .expect("open pinned source-port map"),
+    )
+    .expect("identify pinned source-port map");
+    let commits = BpfHashMap::<_, [u8; 4], [u8; UPLINK_SOURCE_PORT_VALUE_LEN]>::try_from(map)
+        .expect("typed pinned source-port map");
+    commits.get(&UE_PAA.octets(), 0).ok()
 }
 
 fn pinned_counter(pin_dir: &std::path::Path, index: u32) -> u64 {
@@ -6966,6 +7389,514 @@ async fn current_graph_recovery_fences_live_owner_and_recovers_after_interface_l
             .recover_orphaned_current_ebpf_graph(request())
             .await?,
         CurrentEbpfGraphRecoveryOutcome::AlreadyAbsent
+    );
+
+    drop(net);
+    Ok(())
+}
+
+/// An SDK-named current program at a noncanonical tc preference is live
+/// forwarding state even when no retained pin namespace exists. Cleanup-only
+/// acquisition must inspect the complete hook inventory before reporting
+/// absence, and the refusal must not detach or replace the orphan.
+#[tokio::test]
+// The serial guard is deliberately held for the entire test body; see
+// PRIVILEGED_TEST_LOCK.
+#[allow(clippy::await_holding_lock)]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn cleanup_only_absence_rejects_off_slot_current_hook_without_pins(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref() != Ok("1") {
+        eprintln!("skipping: set OPC_GTPU_RUN_PRIVILEGED=1 inside a fresh privileged netns");
+        return Ok(());
+    }
+
+    let _serial = PRIVILEGED_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let net = TestNet::provision();
+    let current_uplink_id = install_off_slot_current_uplink_without_pins();
+    let egress_before = tc_filters("egress");
+    let ingress_before = tc_filters("ingress");
+    assert!(
+        egress_before.contains("pref 51")
+            && egress_before.contains("handle 0x2")
+            && egress_before.contains(PROG_UPLINK)
+            && egress_before.contains(&format!("id {current_uplink_id}")),
+        "the current SDK uplink must occupy only the alternate slot: {egress_before}"
+    );
+    assert!(
+        !egress_before.contains("pref 50") && !ingress_before.contains(PROG_DOWNLINK),
+        "both configured SDK slots must start empty"
+    );
+
+    let device = GtpDevice {
+        name: "s2bu".to_string(),
+        ifindex: nix::net::if_::if_nametoindex("s2bu")?,
+    };
+    for (case_name, pin_root, create_empty_namespace) in [
+        ("absent", net.pin_root.join("cleanup-absent"), false),
+        ("empty", net.pin_root.join("cleanup-empty"), true),
+    ] {
+        fs::create_dir_all(&pin_root).expect("create cleanup-only case root");
+        let pin_dir = pin_root.join("s2bu");
+        if create_empty_namespace {
+            fs::create_dir(&pin_dir).expect("create empty cleanup-only pin namespace");
+        } else {
+            assert!(
+                !pin_dir.exists(),
+                "absent case must start without a namespace"
+            );
+        }
+
+        let backend = EbpfGtpuDataplaneBackend::with_config(EbpfGtpuDataplaneBackendConfig {
+            bpffs_pin_root: pin_root,
+            ..EbpfGtpuDataplaneBackendConfig::default()
+        });
+        let request = RetainedGraphCleanupRequest::new(
+            device.clone(),
+            EPDG_S2BU_IP,
+            CurrentEbpfGraphWriterProof::previous_writer_stopped(),
+        );
+        assert_eq!(
+            backend.acquire_cleanup_only_recovery(request).await?,
+            RetainedGraphCleanupClassification::Refused(
+                RetainedGraphCleanupRefusal::IdentityMismatch
+            ),
+            "{case_name} pins plus an off-slot SDK hook are not absence"
+        );
+        drop(backend);
+
+        assert_eq!(
+            tc_filters("egress"),
+            egress_before,
+            "{case_name} refusal must preserve the off-slot uplink"
+        );
+        assert_eq!(
+            tc_filters("ingress"),
+            ingress_before,
+            "{case_name} refusal must publish no downlink"
+        );
+        if create_empty_namespace {
+            assert!(pin_dir.is_dir(), "empty namespace must survive refusal");
+            assert!(
+                pin_directory_listing(&pin_dir).is_empty(),
+                "empty namespace must remain empty"
+            );
+        } else {
+            assert!(
+                !pin_dir.exists(),
+                "absence classification must not manufacture a pin namespace"
+            );
+        }
+    }
+
+    run(
+        "tc",
+        &[
+            "filter", "del", "dev", "s2bu", "egress", "handle", "0x2", "pref", "51", "bpf",
+        ],
+    );
+    println!("OPC_GTPU_CLEANUP_OFF_SLOT_ABSENCE_GUARD_PROVEN");
+    drop(net);
+    Ok(())
+}
+
+/// Cleanup-only recovery is a current-schema operation, not a migration path.
+/// A complete retained endpoint-v3 graph must be refused before its source-port
+/// commit is materialized or either live hook is fenced.
+#[tokio::test]
+// The serial guard is deliberately held for the entire test body; see
+// PRIVILEGED_TEST_LOCK.
+#[allow(clippy::await_holding_lock)]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn cleanup_only_recovery_refuses_older_schema_before_mutation(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref() != Ok("1") {
+        eprintln!("skipping: set OPC_GTPU_RUN_PRIVILEGED=1 inside a fresh privileged netns");
+        return Ok(());
+    }
+
+    let _serial = PRIVILEGED_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let net = TestNet::provision();
+    let config = EbpfGtpuDataplaneBackendConfig {
+        bpffs_pin_root: net.pin_root.clone(),
+        ..EbpfGtpuDataplaneBackendConfig::default()
+    };
+    let owner = EbpfGtpuDataplaneBackend::with_config(config.clone());
+    let mut create = CreateGtpDeviceRequest::new("s2bu");
+    create.bind_address = IpAddr::V4(EPDG_S2BU_IP);
+    let device = owner.create_device(create).await?;
+    let stale = session_context(device.ifindex);
+    assert_eq!(
+        owner.install_pdp_context_classified(stale).await?,
+        PdpContextInstallOutcome::Installed
+    );
+    let pin_dir = net.pin_root.join("s2bu");
+    drop(owner);
+
+    // Model the last valid schema before additive source-port commits. The
+    // current object supplies a complete, current-ABI pin graph, while the
+    // marker and absent commit carry the older durable contract.
+    let removed_commit = take_pinned_source_port(&pin_dir);
+    assert!(
+        PdpContextCommit::decode(&removed_commit).is_valid(),
+        "the removed current commit must be canonical"
+    );
+    replace_pinned_schema_marker(&pin_dir, UPLINK_ENDPOINT_SCHEMA_MARKER_VALUE);
+    assert_eq!(pinned_default_commit(&pin_dir), None);
+
+    let pins_before = pin_directory_listing(&pin_dir);
+    let map_ids_before = pins_before
+        .iter()
+        .map(|name| {
+            (
+                name.clone(),
+                MapInfo::from_pin(pin_dir.join(name))
+                    .unwrap_or_else(|error| panic!("open retained {name}: {error}"))
+                    .id(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let config_before = pinned_config(&pin_dir);
+    let egress_before = tc_filters("egress");
+    let ingress_before = tc_filters("ingress");
+    let uplink_maps_before = attached_program_map_ids("egress");
+    let downlink_maps_before = attached_program_map_ids("ingress");
+    assert!(
+        egress_before.contains(PROG_UPLINK) && ingress_before.contains("opc_gtpu_downli"),
+        "the retained older graph must start with both forwarding hooks live"
+    );
+
+    let recovered = EbpfGtpuDataplaneBackend::with_config(config);
+    let request = RetainedGraphCleanupRequest::new(
+        device,
+        EPDG_S2BU_IP,
+        CurrentEbpfGraphWriterProof::previous_writer_stopped(),
+    );
+    assert_eq!(
+        recovered.acquire_cleanup_only_recovery(request).await?,
+        RetainedGraphCleanupClassification::Refused(RetainedGraphCleanupRefusal::NotCurrentSchema)
+    );
+    drop(recovered);
+
+    assert_eq!(
+        pin_directory_listing(&pin_dir),
+        pins_before,
+        "schema refusal must add or remove no pin"
+    );
+    assert_eq!(
+        pins_before
+            .iter()
+            .map(|name| {
+                (
+                    name.clone(),
+                    MapInfo::from_pin(pin_dir.join(name))
+                        .unwrap_or_else(|error| panic!("reopen retained {name}: {error}"))
+                        .id(),
+                )
+            })
+            .collect::<Vec<_>>(),
+        map_ids_before,
+        "schema refusal must replace no map"
+    );
+    assert_eq!(pinned_config(&pin_dir), config_before);
+    assert_eq!(
+        pinned_schema_marker(&pin_dir),
+        UPLINK_ENDPOINT_SCHEMA_MARKER_VALUE,
+        "schema refusal must not advance the durable marker"
+    );
+    assert_eq!(
+        pinned_default_commit(&pin_dir),
+        None,
+        "schema refusal must not materialize a source-port commit"
+    );
+    assert_eq!(tc_filters("egress"), egress_before);
+    assert_eq!(tc_filters("ingress"), ingress_before);
+    assert_eq!(attached_program_map_ids("egress"), uplink_maps_before);
+    assert_eq!(attached_program_map_ids("ingress"), downlink_maps_before);
+
+    println!("OPC_GTPU_CLEANUP_CURRENT_SCHEMA_GUARD_PROVEN");
+    drop(net);
+    Ok(())
+}
+
+/// Cleanup-only recovery exposes only the legacy PDP-context cleanup surface.
+/// A retained graph that also carries a canonical committed grouped authority
+/// is therefore outside that authority even when all 21 pins have this build's
+/// exact ABI and the legacy IPv4 endpoint matches the request. The refusal
+/// must happen before either forwarding hook or any grouped byte is changed.
+#[tokio::test]
+// The serial guard is deliberately held for the entire test body; see
+// PRIVILEGED_TEST_LOCK.
+#[allow(clippy::await_holding_lock)]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn cleanup_only_recovery_refuses_committed_grouped_state_before_mutation(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref() != Ok("1") {
+        eprintln!("skipping: set OPC_GTPU_RUN_PRIVILEGED=1 inside a fresh privileged netns");
+        return Ok(());
+    }
+
+    let _serial = PRIVILEGED_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let net = TestNet::provision();
+    let config = EbpfGtpuDataplaneBackendConfig {
+        bpffs_pin_root: net.pin_root.clone(),
+        ..EbpfGtpuDataplaneBackendConfig::default()
+    };
+    let owner = EbpfGtpuDataplaneBackend::with_config(config.clone());
+    let mut create = CreateGtpDeviceRequest::new("s2bu");
+    create.bind_address = IpAddr::V4(EPDG_S2BU_IP);
+    let device = owner.create_device(create).await?;
+    let pin_dir = net.pin_root.join("s2bu");
+    assert!(
+        pinned_config(&pin_dir) == EPDG_S2BU_IP.octets(),
+        "fixture must retain the matching nonzero legacy endpoint"
+    );
+
+    seed_committed_grouped_state(&pin_dir, device.ifindex);
+    let pins_before = current_pin_graph_snapshot(&pin_dir);
+    let hooks_before = current_hook_snapshot();
+    drop(owner);
+
+    let recovered = EbpfGtpuDataplaneBackend::with_config(config);
+    let request = RetainedGraphCleanupRequest::new(
+        device,
+        EPDG_S2BU_IP,
+        CurrentEbpfGraphWriterProof::previous_writer_stopped(),
+    );
+    let classification = recovered.acquire_cleanup_only_recovery(request).await?;
+    assert_eq!(
+        classification,
+        RetainedGraphCleanupClassification::Refused(RetainedGraphCleanupRefusal::NotCurrentSchema),
+        "cleanup-only authority must reject every initialized grouped graph"
+    );
+    drop(recovered);
+
+    assert!(
+        current_pin_graph_snapshot(&pin_dir) == pins_before,
+        "grouped-state refusal must preserve every pin, map ID, and map byte"
+    );
+    assert!(
+        current_hook_snapshot() == hooks_before,
+        "grouped-state refusal must run before fencing either current hook"
+    );
+
+    println!("OPC_GTPU_CLEANUP_GROUPED_STATE_GUARD_PROVEN");
+    drop(net);
+    Ok(())
+}
+
+/// Stable-map contents are untrusted retained state. An active legacy context
+/// with an out-of-range DSCP byte must be classified structurally, never
+/// adopted as cleanup authority. Safety fencing may already have removed both
+/// hooks when semantic validation discovers the corruption, but no pin or map
+/// byte may be repaired, migrated, or discarded.
+#[tokio::test]
+// The serial guard is deliberately held for the entire test body; see
+// PRIVILEGED_TEST_LOCK.
+#[allow(clippy::await_holding_lock)]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn cleanup_only_recovery_refuses_malformed_legacy_state_without_map_mutation(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref() != Ok("1") {
+        eprintln!("skipping: set OPC_GTPU_RUN_PRIVILEGED=1 inside a fresh privileged netns");
+        return Ok(());
+    }
+
+    let _serial = PRIVILEGED_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let net = TestNet::provision();
+    let config = EbpfGtpuDataplaneBackendConfig {
+        bpffs_pin_root: net.pin_root.clone(),
+        ..EbpfGtpuDataplaneBackendConfig::default()
+    };
+    let owner = EbpfGtpuDataplaneBackend::with_config(config.clone());
+    let mut create = CreateGtpDeviceRequest::new("s2bu");
+    create.bind_address = IpAddr::V4(EPDG_S2BU_IP);
+    let device = owner.create_device(create).await?;
+    assert_eq!(
+        owner
+            .install_pdp_context_classified(session_context(device.ifindex))
+            .await?,
+        PdpContextInstallOutcome::Installed
+    );
+    let pin_dir = net.pin_root.join("s2bu");
+    seed_malformed_default_dscp(&pin_dir);
+    let pins_before = current_pin_graph_snapshot(&pin_dir);
+    let hooks_before = current_hook_snapshot();
+    drop(owner);
+
+    let recovered = EbpfGtpuDataplaneBackend::with_config(config);
+    let request = RetainedGraphCleanupRequest::new(
+        device,
+        EPDG_S2BU_IP,
+        CurrentEbpfGraphWriterProof::previous_writer_stopped(),
+    );
+    let classification = recovered.acquire_cleanup_only_recovery(request).await?;
+    drop(recovered);
+
+    assert!(
+        current_pin_graph_snapshot(&pin_dir) == pins_before,
+        "malformed-state refusal must preserve every pin, map ID, and map byte"
+    );
+    let egress_after = tc_filters("egress");
+    let ingress_after = tc_filters("ingress");
+    let hooks_unchanged = egress_after == hooks_before.egress
+        && ingress_after == hooks_before.ingress
+        && attached_program_map_ids("egress") == hooks_before.uplink_map_ids
+        && attached_program_map_ids("ingress") == hooks_before.downlink_map_ids;
+    let hooks_fenced = !egress_after.contains("opc_gtpu") && !ingress_after.contains("opc_gtpu");
+    assert!(
+        hooks_unchanged || hooks_fenced,
+        "malformed-state handling must either precede fencing or remove both hooks"
+    );
+    assert_eq!(
+        classification,
+        RetainedGraphCleanupClassification::Refused(RetainedGraphCleanupRefusal::NotCurrentSchema),
+        "malformed stable contents are a deterministic structural refusal"
+    );
+
+    println!("OPC_GTPU_CLEANUP_MALFORMED_STATE_GUARD_PROVEN");
+    drop(net);
+    Ok(())
+}
+
+/// Cleanup-only recovery takes ownership of the exact retained graph, fences
+/// the live forwarding hooks so the stale graph stops forwarding, lets the
+/// consumer read back and remove the stale PDP context while forwarding stays
+/// disabled, and only reattaches forwarding on the explicit activation step.
+///
+/// This models process loss: the owner backend is dropped (its kernel-owned tc
+/// links and bpffs pins survive), and a fresh backend instance must reconcile
+/// the durable GTP-U state without reactivating the stale graph.
+#[tokio::test]
+// The serial guard is deliberately held for the entire test body; see
+// PRIVILEGED_TEST_LOCK.
+#[allow(clippy::await_holding_lock)]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn cleanup_only_recovery_fences_forwarding_and_removes_stale_contexts(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref() != Ok("1") {
+        eprintln!("skipping: set OPC_GTPU_RUN_PRIVILEGED=1 inside a fresh privileged netns");
+        return Ok(());
+    }
+
+    let _serial = PRIVILEGED_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let net = TestNet::provision();
+    let config = EbpfGtpuDataplaneBackendConfig {
+        bpffs_pin_root: net.pin_root.clone(),
+        ..EbpfGtpuDataplaneBackendConfig::default()
+    };
+
+    // Provision a live graph with a stale PDP context through the normal path.
+    let owner = EbpfGtpuDataplaneBackend::with_config(config.clone());
+    let mut create = CreateGtpDeviceRequest::new("s2bu");
+    create.bind_address = IpAddr::V4(EPDG_S2BU_IP);
+    let device = owner.create_device(create).await?;
+    let stale = session_context(device.ifindex);
+    assert_eq!(
+        owner.install_pdp_context_classified(stale.clone()).await?,
+        PdpContextInstallOutcome::Installed
+    );
+    let pin_dir = net.pin_root.join("s2bu");
+
+    // Process loss: the owner drops; its kernel-owned hooks and pins survive.
+    drop(owner);
+    let recovered = EbpfGtpuDataplaneBackend::with_config(config.clone());
+
+    // A wrong local endpoint identity is refused before mutating the graph.
+    let wrong_endpoint = RetainedGraphCleanupRequest::new(
+        device.clone(),
+        Ipv4Addr::new(198, 51, 100, 9),
+        CurrentEbpfGraphWriterProof::previous_writer_stopped(),
+    );
+    assert_eq!(
+        recovered
+            .acquire_cleanup_only_recovery(wrong_endpoint)
+            .await?,
+        RetainedGraphCleanupClassification::Refused(
+            RetainedGraphCleanupRefusal::LocalEndpointMismatch
+        ),
+        "a local-endpoint mismatch must fail before mutation"
+    );
+    assert!(
+        pin_dir.is_dir(),
+        "a refused acquisition must preserve every pin"
+    );
+
+    // Acquire cleanup-only authority with the exact retained identity. This
+    // fences the retained live hooks, so the stale graph stops forwarding.
+    let request = RetainedGraphCleanupRequest::new(
+        device.clone(),
+        EPDG_S2BU_IP,
+        CurrentEbpfGraphWriterProof::previous_writer_stopped(),
+    );
+    assert_eq!(
+        recovered.acquire_cleanup_only_recovery(request).await?,
+        RetainedGraphCleanupClassification::Acquired
+    );
+    for direction in ["egress", "ingress"] {
+        let filters = tc_filters(direction);
+        assert!(
+            !filters.contains("opc_gtpu"),
+            "cleanup-only acquisition must remove the SDK forwarding hook from {direction}: {filters}"
+        );
+    }
+    // Idempotent re-acquisition observes the converged state.
+    let request = RetainedGraphCleanupRequest::new(
+        device.clone(),
+        EPDG_S2BU_IP,
+        CurrentEbpfGraphWriterProof::previous_writer_stopped(),
+    );
+    assert_eq!(
+        recovered.acquire_cleanup_only_recovery(request).await?,
+        RetainedGraphCleanupClassification::Acquired
+    );
+
+    // Installation stays fenced while forwarding is disabled. The tc
+    // inventory above proves the kernel hook state directly; this assertion
+    // independently proves the cleanup-only authorization boundary.
+    assert_eq!(
+        recovered
+            .install_pdp_context_classified(stale.clone())
+            .await?,
+        PdpContextInstallOutcome::Indeterminate(
+            PdpContextIndeterminateReason::AuthorityUnavailable
+        )
+    );
+
+    // While forwarding stays disabled, the stale context reads back exactly and
+    // is removed by the exact-removal boundary.
+    let selector = PdpContextSelector::LocalTeid(
+        PdpContextLocalTeidSelector::from_context(&stale).expect("local TEID selector"),
+    );
+    assert_eq!(
+        recovered.read_pdp_context(selector.clone()).await?,
+        PdpContextReadback::Present(stale.clone())
+    );
+    assert_eq!(
+        recovered.remove_pdp_context_exact(stale.clone()).await?,
+        PdpContextRemovalOutcome::Removed
+    );
+    assert_eq!(
+        recovered.read_pdp_context(selector).await?,
+        PdpContextReadback::Absent
+    );
+
+    // Explicit activation is the sole step that reattaches forwarding; after it
+    // the normal classified-install path works again.
+    recovered.activate_cleanup_recovery(&device).await?;
+    assert_eq!(
+        recovered.install_pdp_context_classified(stale).await?,
+        PdpContextInstallOutcome::Installed
     );
 
     drop(net);

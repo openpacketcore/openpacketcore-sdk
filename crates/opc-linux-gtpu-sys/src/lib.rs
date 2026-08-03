@@ -614,6 +614,18 @@ pub fn receive_message(socket: &NetlinkSocket, buffer: &mut [u8]) -> io::Result<
     platform::receive_message(&socket.inner, buffer)
 }
 
+/// Receive one raw unicast netlink datagram and authenticate its kernel sender.
+///
+/// Unlike [`receive_message`], this boundary retains and validates the source
+/// `sockaddr_nl`. It rejects user-space peers even if their payload forges the
+/// expected netlink sequence and port-id fields. Authoritative ACK, echo, and
+/// dump consumers should use this function.
+///
+/// The same truncation guarantee as [`receive_message`] applies.
+pub fn receive_kernel_message(socket: &NetlinkSocket, buffer: &mut [u8]) -> io::Result<usize> {
+    platform::receive_kernel_message(&socket.inner, buffer)
+}
+
 /// Netlink request flag.
 pub const NLM_F_REQUEST: u16 = 0x0001;
 /// Netlink multipart response flag.

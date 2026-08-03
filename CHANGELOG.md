@@ -8,6 +8,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Cleanup-only retained eBPF recovery authority — `opc-gtpu-dataplane`:**
+  `EbpfGtpuDataplaneBackend::acquire_cleanup_only_recovery` takes ownership of
+  the exact retained current-schema pin graph after process loss and fences the
+  forwarding tc hooks, so stale PDP contexts can be reconciled without
+  reactivating the stale graph. Unlike ordinary device creation/resolution it
+  never attaches or reattaches the forwarding hooks before cleanup is complete,
+  and unlike orphaned-graph recovery it never deletes the graph. The expected
+  interface name/ifindex identity is re-proved and the complete current pin
+  ABI/schema is validated before the retained CONFIG endpoint is read; identity,
+  configuration, and retained pin/config/schema conflicts are refused before
+  graph mutation. The independent grouped CONFIG6/SCHEMA6 authority must be
+  all-zero and all four grouped hashes empty; initialized, populated, or
+  malformed grouped state is refused as `NotCurrentSchema`. Older or partial
+  schemas are never migrated or repaired through this path. Stable malformed
+  legacy PDP content found after the forwarding safety fence is likewise
+  structural, while kernel/map observation and mutation failures remain
+  retryable indeterminate state.
+  Acquisition returns an affine, supervised
+  completion handle whose blocking worker converges the graph state under the
+  host-global namespace lease and operation lock even if the observing future is
+  dropped, so a retry never overlaps the same graph. While authority is held the
+  ordinary classified readback and `remove_pdp_context_exact` boundaries operate
+  only while both forwarding hooks are authoritatively absent. Their
+  capabilities are reported independently from classified installation;
+  installation, non-exact removal, and unrelated datapath mutations remain
+  denied throughout cleanup-only mode.
+  `activate_cleanup_recovery` is the sole explicit step that reattaches the
+  forwarding hooks and returns the device to normal management. Acquisition
+  classifies a provably absent graph, ownership/configuration conflicts,
+  retryable indeterminate evidence, and structural repairs distinctly, and the
+  request, handle, and all diagnostics remain redaction-safe.
 - **Deferred namespace-bound fixed-DSCP activation — `opc-ipsec-xfrm`:**
   `LinuxXfrmBackend::with_deferred_dscp_marking` and its custom-config variant
   validate and retain marking configuration without loading, pinning,

@@ -377,6 +377,160 @@ pub enum CurrentEbpfGraphRecoveryOutcome {
     Partial(CurrentEbpfGraphRecoveryProgress),
 }
 
+/// Request to acquire cleanup-only recovery authority over a retained
+/// current-schema eBPF graph.
+///
+/// This is the durable-reconciliation primitive an ePDG-style consumer uses
+/// after process loss: it takes ownership of the exact retained pin graph and
+/// fences forwarding so stale PDP contexts can be read back and removed
+/// without reactivating the stale graph. Unlike
+/// [`CurrentEbpfGraphRecoveryRequest`] it never deletes the graph, and unlike
+/// ordinary device creation/resolution it never attaches or reattaches the tc
+/// forwarding hooks before cleanup is complete.
+///
+/// The pin namespace is the interface name in `device`; the configured pin
+/// root is supplied by the backend. The expected interface identity
+/// (`device`) and the configured local endpoint identity (`local_endpoint`)
+/// are both validated before any mutation. The prior-writer attestation is
+/// intentionally separate from any drain attestation: cleanup-only authority
+/// never removes the graph or its retained forwarding entries wholesale, so a
+/// drain proof is not required to acquire it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RetainedGraphCleanupRequest {
+    device: GtpDevice,
+    local_endpoint: Ipv4Addr,
+    writer_proof: CurrentEbpfGraphWriterProof,
+}
+
+impl RetainedGraphCleanupRequest {
+    /// Build a cleanup-authority request for one exact retained graph.
+    ///
+    /// `device` is the expected interface identity (name and ifindex) of the
+    /// attachment that owns the retained pin namespace. `local_endpoint` is
+    /// the configured local S2b-U IPv4 the graph is expected to record.
+    /// `writer_proof` attests that the process which previously owned the
+    /// graph has stopped.
+    #[must_use]
+    pub const fn new(
+        device: GtpDevice,
+        local_endpoint: Ipv4Addr,
+        writer_proof: CurrentEbpfGraphWriterProof,
+    ) -> Self {
+        Self {
+            device,
+            local_endpoint,
+            writer_proof,
+        }
+    }
+
+    /// Return the expected interface identity of the retained graph.
+    #[must_use]
+    pub const fn device(&self) -> &GtpDevice {
+        &self.device
+    }
+
+    /// Return the expected configured local endpoint identity.
+    #[must_use]
+    pub const fn local_endpoint(&self) -> Ipv4Addr {
+        self.local_endpoint
+    }
+
+    /// Return the prior-writer stop attestation.
+    #[must_use]
+    pub const fn writer_proof(&self) -> CurrentEbpfGraphWriterProof {
+        self.writer_proof
+    }
+}
+
+impl fmt::Debug for RetainedGraphCleanupRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RetainedGraphCleanupRequest")
+            .field("device", &"<redacted-interface-identity>")
+            .field("local_endpoint", &"<redacted-local-endpoint>")
+            .field("writer_proof", &self.writer_proof)
+            .finish()
+    }
+}
+
+/// Stable reason cleanup-only recovery authority was refused.
+///
+/// Variants deliberately separate ownership/configuration conflicts,
+/// retryable indeterminate evidence, and structural repairs so a consumer can
+/// choose between retrying, failing over, or escalating to maintenance.
+/// Interface/configuration and retained pin/schema preflight refusals are
+/// established before graph mutation. A structural content refusal can follow
+/// the forwarding safety fence or exact reduction of a recoverable interrupted
+/// commit, and `IndeterminateState` can follow a partially completed fence or
+/// uncertain map operation. Callers must not infer an untouched graph from the
+/// reason alone.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RetainedGraphCleanupRefusal {
+    /// The interface name no longer resolves to the expected ifindex. The
+    /// caller's expected interface identity is stale; this is a conflict, not
+    /// a retryable state.
+    InterfaceIdentityChanged,
+    /// The retained graph records a different local endpoint than the one the
+    /// caller configured. Ownership/configuration conflict; the graph belongs
+    /// to a different endpoint and is never mutated.
+    LocalEndpointMismatch,
+    /// This backend instance already manages the attachment through the
+    /// ordinary device lifecycle or an existing cleanup authority.
+    ManagedAttachment,
+    /// Another process holds the host-global lease for this pin namespace, or
+    /// a prior acquisition is still completing. Retryable once the owner
+    /// releases the namespace.
+    ActiveOwner,
+    /// The graph is not the exact current schema supported by this SDK build,
+    /// carries unsupported grouped authority, or contains stable malformed
+    /// PDP state. Structural repair (drained reprovisioning or migration) is
+    /// required. Malformed PDP state can be diagnosed after safety fencing or
+    /// exact interrupted-commit reduction.
+    NotCurrentSchema,
+    /// A pin, loaded program, or tc hook is foreign, replaced, or no longer
+    /// has the exact SDK-owned identity. Structural repair is required.
+    IdentityMismatch,
+    /// Complete, stable kernel state or mutation authority could not be
+    /// established. Retryable; the caller should re-run the exact request.
+    IndeterminateState,
+}
+
+impl RetainedGraphCleanupRefusal {
+    /// Return whether the refusal is safe to retry with the exact request.
+    ///
+    /// Retryable refusals represent transient ownership or observation races,
+    /// not conflicts or structural damage.
+    #[must_use]
+    pub const fn is_retryable(self) -> bool {
+        matches!(self, Self::ActiveOwner | Self::IndeterminateState)
+    }
+}
+
+/// Classified result of acquiring cleanup-only recovery authority over a
+/// retained current-schema eBPF graph.
+///
+/// `Acquired` is delivered through the supervised completion handle returned
+/// by the backend; the handle is affine and its blocking worker converges the
+/// graph state even if the observing future is dropped.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RetainedGraphCleanupClassification {
+    /// Cleanup authority was acquired. Both forwarding hooks are
+    /// authoritatively absent; exact readback and removal are now permitted
+    /// while forwarding stays disabled.
+    Acquired,
+    /// No retained graph exists for the requested namespace, both reserved
+    /// hook slots are empty, and no SDK forwarding hook exists at another tc
+    /// placement. Nothing was manufactured to prove absence.
+    AlreadyAbsent,
+    /// Cleanup authority was not granted. Preflight conflicts leave the graph
+    /// untouched, but a refusal discovered during fencing or interrupted-
+    /// commit recovery can follow safe hook removal or exact map reduction.
+    /// No refusal reattaches forwarding. Callers must re-observe kernel state
+    /// before deciding whether to retry or enter structural maintenance.
+    Refused(RetainedGraphCleanupRefusal),
+}
+
 /// Explicit caller attestation required before removing a drained legacy v2
 /// eBPF pin graph.
 ///
